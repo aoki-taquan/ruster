@@ -80,12 +80,12 @@ impl<'a, T, const N: usize> Iterator for ArrayVecIter<'a, T, N> {
     type Item = &'a T;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.index < self.array_vec.len {
-            let item = &self.array_vec.data[self.index];
-            self.index += 1;
-            // Some(item)
-        } else {
-            None
+        match self.array_vec.get(self.index) {
+            Some(value) => {
+                self.index += 1;
+                Some(value)
+            }
+            None => None,
         }
     }
 }
