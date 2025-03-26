@@ -1,3 +1,5 @@
+#![cfg(feature = "arp")]
+
 // RFC 826 から引用
 // 16.bit: (ar$hrd) Hardware address space (e.g., Ethernet,
 //                  Packet Radio Net.)

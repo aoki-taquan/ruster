@@ -4,3 +4,63 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[features]
+default = [
+    'arp',
+    'default_ethernet',
+    'default_ipv4',
+    'default_ipv6',
+    'default_tcp',
+    'default_udp',
+    'ethernet',
+    'ethernet_options',
+    'vlan',
+    'ipv4',
+    'ipv4_options',
+    'icmp',
+    'ipv6',
+    'ipv6_options',
+    'icmpv6',
+    'tcp',
+    'tcp_options',
+    'udp',
+    'udp_options',
+]
+default_ethernet = ['ethernet']
+default_ipv4 = ['ipv4']
+default_icmp = ['icmp']
+default_ipv6 = ['ipv6']
+default_icmpv6 = ['icmpv6']
+default_tcp = ['tcp']
+default_udp = ['udp']
+
+#arp
+arp = []
+
+# ethernet
+ethernet = []
+ethernet_options = ['ethernet']
+vlan = ['ethernet', 'ethernet_options']
+
+# ipv4
+ipv4 = []
+ipv4_options = ['ipv4']
+
+# icmp
+icmp = ['ipv4']
+
+# ipv6
+ipv6 = []
+ipv6_options = ['ipv6']
+
+# icmpv6
+icmpv6 = ['ipv6']
+
+# tcp
+tcp = []
+tcp_options = ['tcp']
+
+# udp
+udp = []
+udp_options = ['udp']
