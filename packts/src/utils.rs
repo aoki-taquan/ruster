@@ -101,3 +101,7 @@ impl<'a, T, const N: usize> IntoIterator for &'a ArrayVec<T, N> {
         }
     }
 }
+
+pub trait Len {
+    fn len(&self) -> usize;
+}
