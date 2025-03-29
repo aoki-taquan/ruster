@@ -470,6 +470,7 @@ dependencies = [
  "aya-ebpf-bindings",
  "aya-log-ebpf",
  "myapp-common",
+ "packts",
  "which",
 ]
 

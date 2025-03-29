@@ -12,12 +12,12 @@ use crate::utils::ArrayVec;
 const ETH_MAX_HEDER_NUM: usize = 1;
 
 pub struct RawEthFrame<'a> {
-    pub base_header: EthBaseHeader,
+    pub base_header: &'a EthBaseHeader,
     pub option_header_payload: &'a [u8],
 }
 
 pub struct EthFrame<'a> {
-    pub base_header: EthBaseHeader,
+    pub base_header: &'a EthBaseHeader,
     #[cfg(feature = "ethernet_options")]
     pub option_header: ArrayVec<EthOptionHeader, ETH_MAX_HEDER_NUM>,
     pub payload: &'a [u8],
@@ -67,7 +67,7 @@ pub struct EthBaseHeader {
     type_or_length_field: u16,
 }
 
-pub const ETH_HEADER_SIZE: usize = 14;
+pub const ETH_BASE_HEADER_SIZE: usize = 14;
 
 impl EthBaseHeader {
     #[inline(always)]

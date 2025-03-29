@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 myapp-common = { path = "../myapp-common" }
+packts={path="../packts",features=["ethernet","arp"]}
 
 aya-ebpf = { workspace = true }
 aya-log-ebpf = { workspace = true }
