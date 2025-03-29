@@ -6,12 +6,13 @@ use aya_log_ebpf::info;
 
 #[xdp]
 pub fn myapp(ctx: XdpContext) -> u32 {
-    todo!()
-}
+    let start = ctx.data();
+    let end = ctx.data_end();
 
-fn try_myapp(ctx: XdpContext) -> Result<u32, u32> {
-    info!(&ctx, "received a packet");
-    Ok(xdp_action::XDP_PASS)
+    if end - start < ETH_BASE_HEADER_SIZE {
+    }
+
+    XDP_DROP
 }
 
 #[cfg(not(test))]
