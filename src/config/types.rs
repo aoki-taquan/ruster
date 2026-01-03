@@ -130,7 +130,7 @@ pub struct StaticRouteLock {
 }
 
 impl ConfigLock {
-    pub fn from_config(config: &Config) -> Self {
+    pub fn from_config(config: &Config, source_hash: String) -> Self {
         let interfaces = config
             .interfaces
             .iter()
@@ -174,13 +174,160 @@ impl ConfigLock {
             nat_type: "napt".to_string(),
         });
 
+        // Generate static routes with defaults filled in
+        let static_routes: Vec<StaticRouteLock> = config
+            .routing
+            .static_routes
+            .iter()
+            .map(|route| StaticRouteLock {
+                destination: route.destination.clone(),
+                gateway: route.gateway.clone(),
+                interface: route.interface.clone().unwrap_or_default(),
+                source: "config".to_string(),
+            })
+            .collect();
+
+        // Add implicit routes for directly connected networks
+        let mut all_routes = static_routes;
+        for (name, iface) in &config.interfaces {
+            if let Some(ref addr) = iface.address {
+                // Extract network from address (e.g., "192.168.1.1/24" -> "192.168.1.0/24")
+                if let Some(network) = extract_network(addr) {
+                    all_routes.push(StaticRouteLock {
+                        destination: network,
+                        gateway: "direct".to_string(),
+                        interface: name.clone(),
+                        source: "auto".to_string(),
+                    });
+                }
+            }
+        }
+
         ConfigLock {
             generated_at: chrono::Utc::now().to_rfc3339(),
-            source_hash: "TODO".to_string(),
+            source_hash,
             interfaces,
             dhcp,
             nat,
-            routing: RoutingLock::default(),
+            routing: RoutingLock {
+                static_routes: all_routes,
+            },
         }
+    }
+}
+
+/// Extract network address from CIDR notation (e.g., "192.168.1.1/24" -> "192.168.1.0/24")
+fn extract_network(cidr: &str) -> Option<String> {
+    let parts: Vec<&str> = cidr.split('/').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let addr: std::net::Ipv4Addr = parts[0].parse().ok()?;
+    let prefix_len: u8 = parts[1].parse().ok()?;
+
+    if prefix_len > 32 {
+        return None;
+    }
+
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        !0u32 << (32 - prefix_len)
+    };
+
+    let network_bits = u32::from(addr) & mask;
+    let network_addr = std::net::Ipv4Addr::from(network_bits);
+
+    Some(format!("{}/{}", network_addr, prefix_len))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_network_24() {
+        assert_eq!(
+            extract_network("192.168.1.100/24"),
+            Some("192.168.1.0/24".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_network_16() {
+        assert_eq!(
+            extract_network("10.1.2.3/16"),
+            Some("10.1.0.0/16".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_network_32() {
+        assert_eq!(
+            extract_network("192.168.1.1/32"),
+            Some("192.168.1.1/32".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_network_0() {
+        assert_eq!(
+            extract_network("192.168.1.1/0"),
+            Some("0.0.0.0/0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_network_invalid_no_prefix() {
+        assert_eq!(extract_network("192.168.1.1"), None);
+    }
+
+    #[test]
+    fn test_extract_network_invalid_prefix() {
+        assert_eq!(extract_network("192.168.1.1/33"), None);
+    }
+
+    #[test]
+    fn test_extract_network_invalid_addr() {
+        assert_eq!(extract_network("invalid/24"), None);
+    }
+
+    #[test]
+    fn test_config_lock_from_config() {
+        let mut interfaces = HashMap::new();
+        interfaces.insert(
+            "eth0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Lan,
+                addressing: Addressing::Static,
+                address: Some("192.168.1.1/24".to_string()),
+                mtu: None,
+            },
+        );
+
+        let config = Config {
+            interfaces,
+            dhcp: HashMap::new(),
+            nat: None,
+            routing: RoutingConfig::default(),
+        };
+
+        let lock = ConfigLock::from_config(&config, "testhash".to_string());
+
+        assert_eq!(lock.source_hash, "testhash");
+        assert_eq!(lock.interfaces.len(), 1);
+
+        let eth0 = &lock.interfaces["eth0"];
+        assert_eq!(eth0.role, "lan");
+        assert_eq!(eth0.mtu, 1500); // default
+        assert_eq!(eth0.mac, "auto");
+
+        // Should have auto-generated connected route
+        assert_eq!(lock.routing.static_routes.len(), 1);
+        let route = &lock.routing.static_routes[0];
+        assert_eq!(route.destination, "192.168.1.0/24");
+        assert_eq!(route.gateway, "direct");
+        assert_eq!(route.source, "auto");
     }
 }
