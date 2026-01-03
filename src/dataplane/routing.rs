@@ -1,9 +1,14 @@
 //! Routing table
+//!
+//! Implements static routing with longest prefix match (LPM).
+//! Supports connected routes (auto-generated) and static routes (from config).
 
+use crate::config::{InterfaceConfig, RoutingConfig, StaticRoute};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
 /// Route entry
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Route {
     /// Destination network
     pub destination: Ipv4Addr,
@@ -93,11 +98,104 @@ impl RoutingTable {
     pub fn is_empty(&self) -> bool {
         self.routes.is_empty()
     }
+
+    /// Remove all routes from a specific source
+    pub fn remove_by_source(&mut self, source: RouteSource) {
+        self.routes.retain(|r| r.source != source);
+    }
+
+    /// Load static routes from config
+    pub fn load_static_routes(&mut self, config: &RoutingConfig) {
+        for static_route in &config.static_routes {
+            if let Some(route) = parse_static_route(static_route) {
+                self.add(route);
+            }
+        }
+    }
+
+    /// Generate connected routes from interface configurations
+    ///
+    /// For each interface with a static IP address, creates a connected route
+    /// for the directly attached network.
+    pub fn add_connected_routes(&mut self, interfaces: &HashMap<String, InterfaceConfig>) {
+        for (name, iface) in interfaces {
+            if let Some(ref addr_str) = iface.address {
+                if let Some(route) = parse_connected_route(name, addr_str) {
+                    self.add(route);
+                }
+            }
+        }
+    }
+}
+
+/// Parse a static route from config
+fn parse_static_route(config: &StaticRoute) -> Option<Route> {
+    let (destination, prefix_len) = parse_cidr(&config.destination)?;
+    let gateway: Ipv4Addr = config.gateway.parse().ok()?;
+
+    // For static routes, interface can be determined by gateway lookup
+    // or specified explicitly in config
+    let interface = config.interface.clone().unwrap_or_default();
+
+    Some(Route {
+        destination,
+        prefix_len,
+        next_hop: Some(gateway),
+        interface,
+        metric: 100, // Default metric for static routes
+        source: RouteSource::Static,
+    })
+}
+
+/// Parse a connected route from interface address
+fn parse_connected_route(interface_name: &str, addr_str: &str) -> Option<Route> {
+    let (ip, prefix_len) = parse_cidr(addr_str)?;
+
+    // Calculate network address from IP and prefix
+    let network = network_address(ip, prefix_len);
+
+    Some(Route {
+        destination: network,
+        prefix_len,
+        next_hop: None, // Connected routes have no next-hop
+        interface: interface_name.to_string(),
+        metric: 0, // Connected routes have lowest metric
+        source: RouteSource::Connected,
+    })
+}
+
+/// Parse CIDR notation (e.g., "192.168.1.0/24" or "192.168.1.1/24")
+fn parse_cidr(cidr: &str) -> Option<(Ipv4Addr, u8)> {
+    let parts: Vec<&str> = cidr.split('/').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let ip: Ipv4Addr = parts[0].parse().ok()?;
+    let prefix_len: u8 = parts[1].parse().ok()?;
+
+    if prefix_len > 32 {
+        return None;
+    }
+
+    Some((ip, prefix_len))
+}
+
+/// Calculate network address from IP and prefix length
+fn network_address(ip: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
+    let ip_bits = u32::from(ip);
+    let mask = if prefix_len == 0 {
+        0
+    } else {
+        !0u32 << (32 - prefix_len)
+    };
+    Ipv4Addr::from(ip_bits & mask)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Addressing, InterfaceConfig, InterfaceRole};
 
     #[test]
     fn test_longest_prefix_match() {
@@ -132,5 +230,261 @@ mod tests {
         let route = table.lookup(Ipv4Addr::new(8, 8, 8, 8));
         assert!(route.is_some());
         assert_eq!(route.unwrap().prefix_len, 0);
+    }
+
+    #[test]
+    fn test_parse_cidr() {
+        // Valid CIDR
+        let (ip, prefix) = parse_cidr("192.168.1.0/24").unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 0));
+        assert_eq!(prefix, 24);
+
+        // Valid CIDR with host address
+        let (ip, prefix) = parse_cidr("10.0.0.1/8").unwrap();
+        assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(prefix, 8);
+
+        // Default route
+        let (ip, prefix) = parse_cidr("0.0.0.0/0").unwrap();
+        assert_eq!(ip, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(prefix, 0);
+
+        // Host route
+        let (ip, prefix) = parse_cidr("192.168.1.1/32").unwrap();
+        assert_eq!(ip, Ipv4Addr::new(192, 168, 1, 1));
+        assert_eq!(prefix, 32);
+
+        // Invalid: no prefix
+        assert!(parse_cidr("192.168.1.0").is_none());
+
+        // Invalid: bad IP
+        assert!(parse_cidr("999.168.1.0/24").is_none());
+
+        // Invalid: prefix too large
+        assert!(parse_cidr("192.168.1.0/33").is_none());
+    }
+
+    #[test]
+    fn test_network_address() {
+        // /24 network
+        assert_eq!(
+            network_address(Ipv4Addr::new(192, 168, 1, 100), 24),
+            Ipv4Addr::new(192, 168, 1, 0)
+        );
+
+        // /16 network
+        assert_eq!(
+            network_address(Ipv4Addr::new(172, 16, 50, 100), 16),
+            Ipv4Addr::new(172, 16, 0, 0)
+        );
+
+        // /8 network
+        assert_eq!(
+            network_address(Ipv4Addr::new(10, 1, 2, 3), 8),
+            Ipv4Addr::new(10, 0, 0, 0)
+        );
+
+        // /32 host route
+        assert_eq!(
+            network_address(Ipv4Addr::new(192, 168, 1, 1), 32),
+            Ipv4Addr::new(192, 168, 1, 1)
+        );
+
+        // /0 default
+        assert_eq!(
+            network_address(Ipv4Addr::new(8, 8, 8, 8), 0),
+            Ipv4Addr::UNSPECIFIED
+        );
+
+        // /30 point-to-point
+        assert_eq!(
+            network_address(Ipv4Addr::new(192, 168, 1, 5), 30),
+            Ipv4Addr::new(192, 168, 1, 4)
+        );
+    }
+
+    #[test]
+    fn test_parse_static_route() {
+        let config = StaticRoute {
+            destination: "0.0.0.0/0".to_string(),
+            gateway: "192.168.1.1".to_string(),
+            interface: Some("eth0".to_string()),
+        };
+
+        let route = parse_static_route(&config).unwrap();
+        assert_eq!(route.destination, Ipv4Addr::UNSPECIFIED);
+        assert_eq!(route.prefix_len, 0);
+        assert_eq!(route.next_hop, Some(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(route.interface, "eth0");
+        assert_eq!(route.source, RouteSource::Static);
+    }
+
+    #[test]
+    fn test_parse_static_route_no_interface() {
+        let config = StaticRoute {
+            destination: "10.0.0.0/8".to_string(),
+            gateway: "192.168.1.254".to_string(),
+            interface: None,
+        };
+
+        let route = parse_static_route(&config).unwrap();
+        assert_eq!(route.destination, Ipv4Addr::new(10, 0, 0, 0));
+        assert_eq!(route.prefix_len, 8);
+        assert_eq!(route.next_hop, Some(Ipv4Addr::new(192, 168, 1, 254)));
+        assert!(route.interface.is_empty());
+    }
+
+    #[test]
+    fn test_parse_connected_route() {
+        let route = parse_connected_route("eth0", "192.168.1.1/24").unwrap();
+
+        assert_eq!(route.destination, Ipv4Addr::new(192, 168, 1, 0));
+        assert_eq!(route.prefix_len, 24);
+        assert_eq!(route.next_hop, None);
+        assert_eq!(route.interface, "eth0");
+        assert_eq!(route.metric, 0);
+        assert_eq!(route.source, RouteSource::Connected);
+    }
+
+    #[test]
+    fn test_add_connected_routes() {
+        let mut table = RoutingTable::new();
+        let mut interfaces = HashMap::new();
+
+        interfaces.insert(
+            "eth0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Lan,
+                addressing: Addressing::Static,
+                address: Some("192.168.1.1/24".to_string()),
+                mtu: None,
+            },
+        );
+        interfaces.insert(
+            "eth1".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Wan,
+                addressing: Addressing::Static,
+                address: Some("10.0.0.1/8".to_string()),
+                mtu: None,
+            },
+        );
+
+        table.add_connected_routes(&interfaces);
+
+        assert_eq!(table.len(), 2);
+
+        // Lookup should work for both networks
+        let route = table.lookup(Ipv4Addr::new(192, 168, 1, 100));
+        assert!(route.is_some());
+        assert_eq!(route.unwrap().interface, "eth0");
+
+        let route = table.lookup(Ipv4Addr::new(10, 1, 2, 3));
+        assert!(route.is_some());
+        assert_eq!(route.unwrap().interface, "eth1");
+    }
+
+    #[test]
+    fn test_load_static_routes() {
+        let mut table = RoutingTable::new();
+        let config = RoutingConfig {
+            static_routes: vec![
+                StaticRoute {
+                    destination: "0.0.0.0/0".to_string(),
+                    gateway: "192.168.1.1".to_string(),
+                    interface: Some("eth0".to_string()),
+                },
+                StaticRoute {
+                    destination: "172.16.0.0/12".to_string(),
+                    gateway: "192.168.1.254".to_string(),
+                    interface: None,
+                },
+            ],
+        };
+
+        table.load_static_routes(&config);
+
+        assert_eq!(table.len(), 2);
+
+        // Default route
+        let route = table.lookup(Ipv4Addr::new(8, 8, 8, 8));
+        assert!(route.is_some());
+        assert_eq!(route.unwrap().prefix_len, 0);
+
+        // 172.16.0.0/12 route
+        let route = table.lookup(Ipv4Addr::new(172, 20, 1, 1));
+        assert!(route.is_some());
+        assert_eq!(route.unwrap().prefix_len, 12);
+    }
+
+    #[test]
+    fn test_remove_by_source() {
+        let mut table = RoutingTable::new();
+
+        table.add(Route {
+            destination: Ipv4Addr::new(192, 168, 1, 0),
+            prefix_len: 24,
+            next_hop: None,
+            interface: "eth0".to_string(),
+            metric: 0,
+            source: RouteSource::Connected,
+        });
+
+        table.add(Route {
+            destination: Ipv4Addr::new(0, 0, 0, 0),
+            prefix_len: 0,
+            next_hop: Some(Ipv4Addr::new(192, 168, 1, 1)),
+            interface: "eth0".to_string(),
+            metric: 100,
+            source: RouteSource::Static,
+        });
+
+        assert_eq!(table.len(), 2);
+
+        // Remove static routes
+        table.remove_by_source(RouteSource::Static);
+        assert_eq!(table.len(), 1);
+
+        // Only connected route should remain
+        let route = table.lookup(Ipv4Addr::new(192, 168, 1, 100));
+        assert!(route.is_some());
+        assert_eq!(route.unwrap().source, RouteSource::Connected);
+
+        // No default route anymore
+        let route = table.lookup(Ipv4Addr::new(8, 8, 8, 8));
+        assert!(route.is_none());
+    }
+
+    #[test]
+    fn test_connected_route_preferred_over_static() {
+        let mut table = RoutingTable::new();
+
+        // Add static route for a network
+        table.add(Route {
+            destination: Ipv4Addr::new(192, 168, 1, 0),
+            prefix_len: 24,
+            next_hop: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            interface: "eth1".to_string(),
+            metric: 100,
+            source: RouteSource::Static,
+        });
+
+        // Add connected route for the same network (should replace)
+        table.add(Route {
+            destination: Ipv4Addr::new(192, 168, 1, 0),
+            prefix_len: 24,
+            next_hop: None,
+            interface: "eth0".to_string(),
+            metric: 0,
+            source: RouteSource::Connected,
+        });
+
+        // Should only have one route
+        assert_eq!(table.len(), 1);
+
+        // Should be the connected route
+        let route = table.lookup(Ipv4Addr::new(192, 168, 1, 100)).unwrap();
+        assert_eq!(route.source, RouteSource::Connected);
+        assert_eq!(route.interface, "eth0");
     }
 }
