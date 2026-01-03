@@ -121,4 +121,104 @@ mod tests {
         assert_eq!(found_mac, mac);
         assert_eq!(state, ArpState::Reachable);
     }
+
+    #[test]
+    fn test_lookup_nonexistent() {
+        let table = ArpTable::new(Duration::from_secs(30), Duration::from_secs(120));
+        let ip = Ipv4Addr::new(192, 168, 1, 1);
+        assert!(table.lookup(&ip).is_none());
+    }
+
+    #[test]
+    fn test_mark_incomplete() {
+        let mut table = ArpTable::new(Duration::from_secs(30), Duration::from_secs(120));
+        let ip = Ipv4Addr::new(192, 168, 1, 1);
+
+        table.mark_incomplete(ip);
+
+        let result = table.lookup(&ip);
+        assert!(result.is_some());
+        let (mac, state) = result.unwrap();
+        assert_eq!(mac, MacAddr::ZERO);
+        assert_eq!(state, ArpState::Incomplete);
+    }
+
+    #[test]
+    fn test_update_incomplete_to_reachable() {
+        let mut table = ArpTable::new(Duration::from_secs(30), Duration::from_secs(120));
+        let ip = Ipv4Addr::new(192, 168, 1, 1);
+        let mac = MacAddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+
+        table.mark_incomplete(ip);
+        table.insert(ip, mac);
+
+        let result = table.lookup(&ip);
+        assert!(result.is_some());
+        let (found_mac, state) = result.unwrap();
+        assert_eq!(found_mac, mac);
+        assert_eq!(state, ArpState::Reachable);
+    }
+
+    #[test]
+    fn test_multiple_entries() {
+        let mut table = ArpTable::new(Duration::from_secs(30), Duration::from_secs(120));
+
+        let entries = [
+            (
+                Ipv4Addr::new(192, 168, 1, 1),
+                MacAddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+            ),
+            (
+                Ipv4Addr::new(192, 168, 1, 2),
+                MacAddr([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
+            ),
+            (
+                Ipv4Addr::new(192, 168, 1, 3),
+                MacAddr([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]),
+            ),
+        ];
+
+        for (ip, mac) in &entries {
+            table.insert(*ip, *mac);
+        }
+
+        assert_eq!(table.len(), 3);
+
+        for (ip, mac) in &entries {
+            let result = table.lookup(ip);
+            assert!(result.is_some());
+            assert_eq!(result.unwrap().0, *mac);
+        }
+    }
+
+    #[test]
+    fn test_len_and_is_empty() {
+        let mut table = ArpTable::new(Duration::from_secs(30), Duration::from_secs(120));
+        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
+
+        table.insert(Ipv4Addr::new(192, 168, 1, 1), MacAddr([0x00; 6]));
+        assert!(!table.is_empty());
+        assert_eq!(table.len(), 1);
+    }
+
+    #[test]
+    fn test_get_stale_entries_incomplete() {
+        let mut table = ArpTable::new(Duration::from_secs(30), Duration::from_secs(120));
+        let ip1 = Ipv4Addr::new(192, 168, 1, 1);
+        let ip2 = Ipv4Addr::new(192, 168, 1, 2);
+
+        table.mark_incomplete(ip1);
+        table.insert(ip2, MacAddr([0xaa; 6]));
+
+        let stale = table.get_stale_entries();
+        assert_eq!(stale.len(), 1);
+        assert!(stale.contains(&ip1));
+    }
+
+    #[test]
+    fn test_default() {
+        let table = ArpTable::default();
+        assert!(table.is_empty());
+    }
 }
