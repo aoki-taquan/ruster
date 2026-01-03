@@ -1,10 +1,16 @@
-# Ruster test configuration
+# Ruster E2E test configuration
+#
+# Topology:
+#   client (10.0.1.2) -- eth1 -- ruster -- eth2 -- server (10.0.2.2)
 
 [interfaces.eth1]
-addresses = ["10.0.1.1/24"]
+role = "lan"
+addressing = "static"
+address = "10.0.1.1/24"
 
 [interfaces.eth2]
-addresses = ["10.0.2.1/24"]
+role = "lan"
+addressing = "static"
+address = "10.0.2.1/24"
 
-[routing]
-static_routes = []
+# No static routes needed - connected routes auto-generated from interface addresses
