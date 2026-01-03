@@ -14,6 +14,7 @@ pub enum IcmpType {
     Redirect = 5,
     EchoRequest = 8,
     TimeExceeded = 11,
+    ParameterProblem = 12,
 }
 
 impl IcmpType {
@@ -24,6 +25,7 @@ impl IcmpType {
             5 => Some(IcmpType::Redirect),
             8 => Some(IcmpType::EchoRequest),
             11 => Some(IcmpType::TimeExceeded),
+            12 => Some(IcmpType::ParameterProblem),
             _ => None,
         }
     }
@@ -67,6 +69,16 @@ pub mod time_exceeded {
     pub const TTL_EXCEEDED: u8 = 0;
     /// Fragment reassembly time exceeded
     pub const FRAGMENT_REASSEMBLY: u8 = 1;
+}
+
+/// Parameter Problem codes (RFC 792)
+pub mod parameter_problem {
+    /// Pointer indicates the error
+    pub const POINTER_ERROR: u8 = 0;
+    /// Missing required option
+    pub const MISSING_OPTION: u8 = 1;
+    /// Bad length
+    pub const BAD_LENGTH: u8 = 2;
 }
 
 /// Parsed ICMP message
@@ -271,6 +283,51 @@ pub fn build_time_exceeded(code: u8, original_header: &[u8], original_payload: &
     packet
 }
 
+/// Build a Parameter Problem message
+///
+/// # Arguments
+/// * `code` - The parameter problem code (see `parameter_problem` module)
+/// * `pointer` - Byte offset in the original IP header where the error was detected
+/// * `original_header` - The original IP header that caused the error
+/// * `original_payload` - The first 8 bytes of the original datagram payload
+///
+/// Returns the complete ICMP message
+pub fn build_parameter_problem(
+    code: u8,
+    pointer: u8,
+    original_header: &[u8],
+    original_payload: &[u8],
+) -> Vec<u8> {
+    // ICMP Parameter Problem format:
+    // Type (1) + Code (1) + Checksum (2) + Pointer (1) + Unused (3) + Original IP header + 8 bytes
+    let payload_len = original_payload.len().min(8);
+    let total_len = 8 + original_header.len() + payload_len;
+    let mut packet = vec![0u8; total_len];
+
+    // Type: Parameter Problem (12)
+    packet[0] = IcmpType::ParameterProblem as u8;
+    // Code
+    packet[1] = code;
+    // Checksum: will be calculated later
+    packet[2] = 0;
+    packet[3] = 0;
+    // Pointer: byte offset where the error was detected
+    packet[4] = pointer;
+    // Bytes 5-7 are unused (already zero)
+
+    // Copy original IP header
+    packet[8..8 + original_header.len()].copy_from_slice(original_header);
+
+    // Copy first 8 bytes of original payload
+    packet[8 + original_header.len()..].copy_from_slice(&original_payload[..payload_len]);
+
+    // Calculate checksum
+    let checksum = icmp_checksum(&packet);
+    packet[2..4].copy_from_slice(&checksum.to_be_bytes());
+
+    packet
+}
+
 /// Builder for ICMP Echo Request packets
 #[derive(Debug, Clone)]
 pub struct EchoRequestBuilder {
@@ -361,6 +418,7 @@ mod tests {
         assert_eq!(IcmpType::from_u8(5), Some(IcmpType::Redirect));
         assert_eq!(IcmpType::from_u8(8), Some(IcmpType::EchoRequest));
         assert_eq!(IcmpType::from_u8(11), Some(IcmpType::TimeExceeded));
+        assert_eq!(IcmpType::from_u8(12), Some(IcmpType::ParameterProblem));
         assert_eq!(IcmpType::from_u8(99), None);
     }
 
@@ -672,6 +730,64 @@ mod tests {
     fn test_time_exceeded_codes() {
         assert_eq!(time_exceeded::TTL_EXCEEDED, 0);
         assert_eq!(time_exceeded::FRAGMENT_REASSEMBLY, 1);
+    }
+
+    #[test]
+    fn test_parameter_problem_codes() {
+        assert_eq!(parameter_problem::POINTER_ERROR, 0);
+        assert_eq!(parameter_problem::MISSING_OPTION, 1);
+        assert_eq!(parameter_problem::BAD_LENGTH, 2);
+    }
+
+    // ==================== build_parameter_problem tests ====================
+
+    #[test]
+    fn test_build_parameter_problem_pointer_error() {
+        let ip_header = make_ip_header();
+        let original_payload = [1, 2, 3, 4, 5, 6, 7, 8];
+        let pointer = 9u8; // Pointing to protocol field
+
+        let packet = build_parameter_problem(
+            parameter_problem::POINTER_ERROR,
+            pointer,
+            &ip_header,
+            &original_payload,
+        );
+
+        let parsed = IcmpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.icmp_type(), IcmpType::ParameterProblem as u8);
+        assert_eq!(parsed.code(), parameter_problem::POINTER_ERROR);
+        assert!(parsed.validate_checksum());
+
+        // Check pointer is in byte 4
+        let raw = parsed.as_bytes();
+        assert_eq!(raw[4], pointer);
+
+        // Check that original datagram is included
+        let original = parsed.original_datagram();
+        assert_eq!(&original[..20], ip_header.as_slice());
+        assert_eq!(&original[20..28], &original_payload);
+    }
+
+    #[test]
+    fn test_build_parameter_problem_bad_length() {
+        let ip_header = make_ip_header();
+        let original_payload = [0u8; 8];
+        let pointer = 2u8; // Pointing to total length field
+
+        let packet = build_parameter_problem(
+            parameter_problem::BAD_LENGTH,
+            pointer,
+            &ip_header,
+            &original_payload,
+        );
+
+        let parsed = IcmpPacket::parse(&packet).unwrap();
+        assert_eq!(parsed.code(), parameter_problem::BAD_LENGTH);
+        assert!(parsed.validate_checksum());
+
+        let raw = parsed.as_bytes();
+        assert_eq!(raw[4], pointer);
     }
 
     // ==================== Edge cases ====================
