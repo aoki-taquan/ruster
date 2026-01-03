@@ -1,0 +1,10 @@
+# ruster configuration
+# Interface names match containerlab veth endpoints
+
+[interfaces.ruster-eth1]
+mode = "switchport"
+native_vlan = 1
+
+[interfaces.ruster-eth2]
+mode = "switchport"
+native_vlan = 1

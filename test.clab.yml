@@ -1,0 +1,30 @@
+# Containerlab topology for ruster L2 switch testing
+#
+# Topology:
+#   host1 (eth1) <---> (eth1) ruster (eth2) <---> (eth1) host2
+#
+# ruster runs on the host and bridges traffic between host1 and host2
+
+name: ruster-test
+
+topology:
+  nodes:
+    host1:
+      kind: linux
+      image: alpine:latest
+      exec:
+        - ip addr add 10.0.0.1/24 dev eth1
+        - ip link set eth1 up
+
+    host2:
+      kind: linux
+      image: alpine:latest
+      exec:
+        - ip addr add 10.0.0.2/24 dev eth1
+        - ip link set eth1 up
+
+  links:
+    # host1.eth1 connects to veth pair (host side will be used by ruster)
+    - endpoints: ["host1:eth1", "host:ruster-eth1"]
+    # host2.eth1 connects to veth pair (host side will be used by ruster)
+    - endpoints: ["host2:eth1", "host:ruster-eth2"]
