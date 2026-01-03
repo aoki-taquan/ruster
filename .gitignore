@@ -2,3 +2,5 @@
 Cargo.lock
 clab-*/
 *.log
+.claude/*
+!.claude/skills/
