@@ -65,8 +65,8 @@ impl ArpPacket {
         }
 
         let operation = u16::from_be_bytes([buffer[6], buffer[7]]);
-        let operation =
-            ArpOp::from_u16(operation).ok_or_else(|| Error::Parse("invalid ARP operation".into()))?;
+        let operation = ArpOp::from_u16(operation)
+            .ok_or_else(|| Error::Parse("invalid ARP operation".into()))?;
 
         let sender_mac = MacAddr(buffer[8..14].try_into().unwrap());
         let sender_ip = Ipv4Addr::new(buffer[14], buffer[15], buffer[16], buffer[17]);

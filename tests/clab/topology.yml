@@ -1,0 +1,34 @@
+name: ruster-test
+
+topology:
+  nodes:
+    # Device Under Test - ruster router
+    ruster:
+      kind: linux
+      image: debian:bookworm-slim
+      binds:
+        - ../../target/release/ruster:/usr/local/bin/ruster:ro
+        - ./config.toml:/etc/ruster/config.toml:ro
+      exec:
+        - ip addr add 10.0.1.1/24 dev eth1
+        - ip addr add 10.0.2.1/24 dev eth2
+
+    # Client host
+    client:
+      kind: linux
+      image: debian:bookworm-slim
+      exec:
+        - ip addr add 10.0.1.2/24 dev eth1
+        - ip route add 10.0.2.0/24 via 10.0.1.1
+
+    # Server host
+    server:
+      kind: linux
+      image: debian:bookworm-slim
+      exec:
+        - ip addr add 10.0.2.2/24 dev eth1
+        - ip route add 10.0.1.0/24 via 10.0.2.1
+
+  links:
+    - endpoints: ["ruster:eth1", "client:eth1"]
+    - endpoints: ["ruster:eth2", "server:eth1"]

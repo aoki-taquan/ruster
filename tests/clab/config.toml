@@ -1,0 +1,10 @@
+# Ruster test configuration
+
+[interfaces.eth1]
+addresses = ["10.0.1.1/24"]
+
+[interfaces.eth2]
+addresses = ["10.0.2.1/24"]
+
+[routing]
+static_routes = []
