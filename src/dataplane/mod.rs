@@ -10,6 +10,6 @@ mod routing;
 
 pub use arp_processor::{process_arp, ArpAction, ArpPendingQueue};
 pub use arp_table::{ArpState, ArpTable};
-pub use fdb::Fdb;
+pub use fdb::{Fdb, L2ForwardAction, PortId, DEFAULT_AGING_TIME_SECS, DEFAULT_VLAN};
 pub use forwarder::{ForwardAction, Forwarder, InterfaceInfo};
 pub use routing::{Route, RouteSource, RoutingTable};
