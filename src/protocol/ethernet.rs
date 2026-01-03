@@ -24,7 +24,8 @@ impl<'a> Frame<'a> {
         }
 
         let ethertype_offset = 12;
-        let ethertype = u16::from_be_bytes([buffer[ethertype_offset], buffer[ethertype_offset + 1]]);
+        let ethertype =
+            u16::from_be_bytes([buffer[ethertype_offset], buffer[ethertype_offset + 1]]);
 
         let (vlan_tag, payload_offset) = if ethertype == EtherType::Vlan as u16 {
             if buffer.len() < 18 {
@@ -92,7 +93,8 @@ impl FrameBuilder {
     }
 
     pub fn vlan_tag(mut self, tag: VlanTag) -> Self {
-        self.buffer.extend_from_slice(&(EtherType::Vlan as u16).to_be_bytes());
+        self.buffer
+            .extend_from_slice(&(EtherType::Vlan as u16).to_be_bytes());
         self.buffer.extend_from_slice(&tag.to_bytes());
         self
     }
