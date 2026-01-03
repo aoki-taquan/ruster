@@ -52,10 +52,7 @@ impl Fdb {
 
     /// Lookup a MAC address
     pub fn lookup(&self, mac: &MacAddr, vlan: u16) -> Option<PortId> {
-        self.tables
-            .get(&vlan)?
-            .get(mac)
-            .map(|entry| entry.port)
+        self.tables.get(&vlan)?.get(mac).map(|entry| entry.port)
     }
 
     /// Remove aged-out entries

@@ -82,9 +82,8 @@ impl VlanTag {
     }
 
     pub fn to_bytes(&self) -> [u8; 2] {
-        let value = ((self.pcp as u16 & 0x07) << 13)
-            | ((self.dei as u16) << 12)
-            | (self.vid & 0x0FFF);
+        let value =
+            ((self.pcp as u16 & 0x07) << 13) | ((self.dei as u16) << 12) | (self.vid & 0x0FFF);
         value.to_be_bytes()
     }
 
