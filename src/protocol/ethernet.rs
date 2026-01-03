@@ -119,3 +119,171 @@ impl Default for FrameBuilder {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_simple_frame() -> Vec<u8> {
+        let mut frame = Vec::new();
+        // dst MAC: 00:11:22:33:44:55
+        frame.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        // src MAC: 66:77:88:99:aa:bb
+        frame.extend_from_slice(&[0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb]);
+        // EtherType: IPv4 (0x0800)
+        frame.extend_from_slice(&[0x08, 0x00]);
+        // Payload
+        frame.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
+        frame
+    }
+
+    fn make_vlan_frame() -> Vec<u8> {
+        let mut frame = Vec::new();
+        // dst MAC
+        frame.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        // src MAC
+        frame.extend_from_slice(&[0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb]);
+        // EtherType: VLAN (0x8100)
+        frame.extend_from_slice(&[0x81, 0x00]);
+        // VLAN tag: VID=100, PCP=0, DEI=0
+        frame.extend_from_slice(&[0x00, 0x64]);
+        // Inner EtherType: IPv4
+        frame.extend_from_slice(&[0x08, 0x00]);
+        // Payload
+        frame.extend_from_slice(&[0xca, 0xfe]);
+        frame
+    }
+
+    #[test]
+    fn test_frame_parse_simple() {
+        let data = make_simple_frame();
+        let frame = Frame::parse(&data).unwrap();
+
+        assert_eq!(
+            frame.dst_mac(),
+            MacAddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
+        );
+        assert_eq!(
+            frame.src_mac(),
+            MacAddr([0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb])
+        );
+        assert_eq!(frame.ethertype(), EtherType::Ipv4 as u16);
+        assert!(frame.vlan_tag().is_none());
+        assert_eq!(frame.payload(), &[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn test_frame_parse_vlan() {
+        let data = make_vlan_frame();
+        let frame = Frame::parse(&data).unwrap();
+
+        assert_eq!(
+            frame.dst_mac(),
+            MacAddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
+        );
+        assert_eq!(
+            frame.src_mac(),
+            MacAddr([0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb])
+        );
+        assert_eq!(frame.ethertype(), EtherType::Ipv4 as u16);
+
+        let vlan = frame.vlan_tag().unwrap();
+        assert_eq!(vlan.vid, 100);
+        assert_eq!(vlan.pcp, 0);
+        assert!(!vlan.dei);
+
+        assert_eq!(frame.payload(), &[0xca, 0xfe]);
+    }
+
+    #[test]
+    fn test_frame_parse_too_short() {
+        let short_data = vec![0u8; 13]; // Less than MIN_FRAME_SIZE
+        assert!(Frame::parse(&short_data).is_err());
+    }
+
+    #[test]
+    fn test_frame_parse_vlan_too_short() {
+        let mut data = vec![0u8; 14];
+        // Set EtherType to VLAN
+        data[12] = 0x81;
+        data[13] = 0x00;
+        assert!(Frame::parse(&data).is_err());
+    }
+
+    #[test]
+    fn test_frame_as_bytes() {
+        let data = make_simple_frame();
+        let frame = Frame::parse(&data).unwrap();
+        assert_eq!(frame.as_bytes(), &data[..]);
+    }
+
+    #[test]
+    fn test_frame_builder_simple() {
+        let dst = MacAddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        let src = MacAddr([0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb]);
+        let payload = [0xde, 0xad, 0xbe, 0xef];
+
+        let frame = FrameBuilder::new()
+            .dst_mac(dst)
+            .src_mac(src)
+            .ethertype(EtherType::Ipv4 as u16)
+            .payload(&payload)
+            .build();
+
+        assert_eq!(frame, make_simple_frame());
+    }
+
+    #[test]
+    fn test_frame_builder_with_vlan() {
+        let dst = MacAddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        let src = MacAddr([0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb]);
+        let payload = [0xca, 0xfe];
+
+        let frame = FrameBuilder::new()
+            .dst_mac(dst)
+            .src_mac(src)
+            .vlan_tag(VlanTag::new(100))
+            .ethertype(EtherType::Ipv4 as u16)
+            .payload(&payload)
+            .build();
+
+        assert_eq!(frame, make_vlan_frame());
+    }
+
+    #[test]
+    fn test_frame_builder_default() {
+        let builder = FrameBuilder::default();
+        assert_eq!(builder.build(), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn test_frame_roundtrip() {
+        let original = make_simple_frame();
+        let frame = Frame::parse(&original).unwrap();
+
+        let rebuilt = FrameBuilder::new()
+            .dst_mac(frame.dst_mac())
+            .src_mac(frame.src_mac())
+            .ethertype(frame.ethertype())
+            .payload(frame.payload())
+            .build();
+
+        assert_eq!(rebuilt, original);
+    }
+
+    #[test]
+    fn test_frame_roundtrip_vlan() {
+        let original = make_vlan_frame();
+        let frame = Frame::parse(&original).unwrap();
+
+        let rebuilt = FrameBuilder::new()
+            .dst_mac(frame.dst_mac())
+            .src_mac(frame.src_mac())
+            .vlan_tag(frame.vlan_tag().unwrap())
+            .ethertype(frame.ethertype())
+            .payload(frame.payload())
+            .build();
+
+        assert_eq!(rebuilt, original);
+    }
+}
