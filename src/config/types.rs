@@ -78,7 +78,7 @@ pub struct StaticRoute {
 // ============================================================================
 
 /// Generated lock file with all defaults filled in
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigLock {
     pub generated_at: String,
     pub source_hash: String,
@@ -88,7 +88,7 @@ pub struct ConfigLock {
     pub routing: RoutingLock,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterfaceLock {
     pub role: String,
     pub addressing: String,
@@ -98,7 +98,7 @@ pub struct InterfaceLock {
     pub duplex: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DhcpLock {
     pub interface: String,
     pub range: (Ipv4Addr, Ipv4Addr),
@@ -108,7 +108,7 @@ pub struct DhcpLock {
     pub domain: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NatLock {
     pub enabled: bool,
     pub wan: String,
@@ -116,12 +116,12 @@ pub struct NatLock {
     pub nat_type: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoutingLock {
     pub static_routes: Vec<StaticRouteLock>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StaticRouteLock {
     pub destination: String,
     pub gateway: String,
