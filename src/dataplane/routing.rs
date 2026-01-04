@@ -358,6 +358,8 @@ mod tests {
                 addressing: Addressing::Static,
                 address: Some("192.168.1.1/24".to_string()),
                 mtu: None,
+                vlan_mode: None,
+                vlan_config: None,
             },
         );
         interfaces.insert(
@@ -367,6 +369,8 @@ mod tests {
                 addressing: Addressing::Static,
                 address: Some("10.0.0.1/8".to_string()),
                 mtu: None,
+                vlan_mode: None,
+                vlan_config: None,
             },
         );
 
