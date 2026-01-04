@@ -17,7 +17,11 @@ allowed-tools: Bash(git:*), Bash(gh:*)
 5. `gh pr create` でPR作成
 6. PR URLを表示
 7. 少し待ってから `gh pr checks <PR番号>` でCIステータスを確認
-8. 全てpassしたらユーザーに報告。pendingなら待って再確認。failなら原因を調査
+8. 全てpassしたら:
+   - `gh issue edit <number> --remove-label wip` でwipラベルを削除
+   - ユーザーに報告
+9. pendingなら待って再確認
+10. failなら原因を調査
 
 ## CI確認の流れ
 
@@ -29,7 +33,7 @@ sleep 20
 gh pr checks <PR番号>
 ```
 
-- **pass**: マージ可能
+- **pass**: wipラベル削除、マージ可能
 - **pending**: しばらく待って再確認
 - **fail**: `gh run view <run_id> --log-failed` で原因調査、修正してpush
 
@@ -45,4 +49,5 @@ gh pr checks <PR番号>
 - Issue #4 にリンクしたPRを作成
 - `Closes #4` がbodyに含まれる
 - PR URLを表示
-- CIステータスを表示
+- CIステータスを確認
+- 全てpass: wipラベル削除、マージ準備完了を報告
