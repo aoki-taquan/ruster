@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
 libc = "0.2"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
