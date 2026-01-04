@@ -1,0 +1,21 @@
+# シンプルなルータ設定例
+#
+# トポロジ:
+#   10.0.1.0/24 -- [eth1] ruster [eth2] -- 10.0.2.0/24
+
+[interfaces.eth1]
+role = "lan"
+addressing = "static"
+address = "10.0.1.1/24"
+
+[interfaces.eth2]
+role = "lan"
+addressing = "static"
+address = "10.0.2.1/24"
+
+# 静的ルートはインターフェースアドレスから自動生成されるため不要
+# 手動で追加する場合:
+# [[routing.static_routes]]
+# destination = "172.16.0.0/16"
+# gateway = "10.0.1.254"
+# interface = "eth1"

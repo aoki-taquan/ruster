@@ -1,0 +1,23 @@
+# 家庭用ルータ設定例
+#
+# トポロジ:
+#   Internet -- [eth0 WAN] ruster [eth1 LAN] -- 192.168.1.0/24
+
+[interfaces.eth0]
+role = "wan"
+addressing = "dhcp"
+
+[interfaces.eth1]
+role = "lan"
+addressing = "static"
+address = "192.168.1.1/24"
+
+[dhcp.lan]
+range = ["192.168.1.100", "192.168.1.200"]
+gateway = "192.168.1.1"
+dns = ["8.8.8.8", "8.8.4.4"]
+
+[nat]
+enabled = true
+wan = "eth0"
+lan = ["eth1"]
