@@ -24,6 +24,8 @@ pub struct InterfaceConfig {
     pub addressing: Addressing,
     pub address: Option<String>,
     pub mtu: Option<u16>,
+    pub vlan_mode: Option<VlanMode>,
+    pub vlan_config: Option<VlanConfig>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -41,6 +43,20 @@ pub enum Addressing {
     Static,
     Dhcp,
     Pppoe,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum VlanMode {
+    Access,
+    Trunk,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct VlanConfig {
+    pub native_vlan: Option<u16>,
+    pub access_vlan: Option<u16>,
+    pub allowed_vlans: Option<Vec<u16>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,6 +112,15 @@ pub struct InterfaceLock {
     pub mtu: u16,
     pub mac: String,
     pub duplex: String,
+    pub vlan_mode: Option<String>,
+    pub vlan_config: Option<VlanLockConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VlanLockConfig {
+    pub native_vlan: u16,
+    pub access_vlan: Option<u16>,
+    pub allowed_vlans: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +160,17 @@ impl ConfigLock {
             .interfaces
             .iter()
             .map(|(name, iface)| {
+                let vlan_mode = iface.vlan_mode.map(|m| match m {
+                    VlanMode::Access => "access".to_string(),
+                    VlanMode::Trunk => "trunk".to_string(),
+                });
+
+                let vlan_config = iface.vlan_config.as_ref().map(|cfg| VlanLockConfig {
+                    native_vlan: cfg.native_vlan.unwrap_or(1),
+                    access_vlan: cfg.access_vlan,
+                    allowed_vlans: cfg.allowed_vlans.clone().unwrap_or_default(),
+                });
+
                 (
                     name.clone(),
                     InterfaceLock {
@@ -144,6 +180,8 @@ impl ConfigLock {
                         mtu: iface.mtu.unwrap_or(1500),
                         mac: "auto".to_string(),
                         duplex: "auto".to_string(),
+                        vlan_mode,
+                        vlan_config,
                     },
                 )
             })
@@ -303,6 +341,8 @@ mod tests {
                 addressing: Addressing::Static,
                 address: Some("192.168.1.1/24".to_string()),
                 mtu: None,
+                vlan_mode: None,
+                vlan_config: None,
             },
         );
 
@@ -322,6 +362,8 @@ mod tests {
         assert_eq!(eth0.role, "lan");
         assert_eq!(eth0.mtu, 1500); // default
         assert_eq!(eth0.mac, "auto");
+        assert!(eth0.vlan_mode.is_none());
+        assert!(eth0.vlan_config.is_none());
 
         // Should have auto-generated connected route
         assert_eq!(lock.routing.static_routes.len(), 1);
@@ -329,5 +371,77 @@ mod tests {
         assert_eq!(route.destination, "192.168.1.0/24");
         assert_eq!(route.gateway, "direct");
         assert_eq!(route.source, "auto");
+    }
+
+    #[test]
+    fn test_config_lock_with_vlan_access() {
+        let mut interfaces = HashMap::new();
+        interfaces.insert(
+            "eth0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Lan,
+                addressing: Addressing::Static,
+                address: Some("192.168.1.1/24".to_string()),
+                mtu: None,
+                vlan_mode: Some(VlanMode::Access),
+                vlan_config: Some(VlanConfig {
+                    native_vlan: Some(1),
+                    access_vlan: Some(10),
+                    allowed_vlans: None,
+                }),
+            },
+        );
+
+        let config = Config {
+            interfaces,
+            dhcp: HashMap::new(),
+            nat: None,
+            routing: RoutingConfig::default(),
+        };
+
+        let lock = ConfigLock::from_config(&config, "testhash".to_string());
+        let eth0 = &lock.interfaces["eth0"];
+
+        assert_eq!(eth0.vlan_mode, Some("access".to_string()));
+        let vlan_cfg = eth0.vlan_config.as_ref().unwrap();
+        assert_eq!(vlan_cfg.native_vlan, 1);
+        assert_eq!(vlan_cfg.access_vlan, Some(10));
+        assert!(vlan_cfg.allowed_vlans.is_empty());
+    }
+
+    #[test]
+    fn test_config_lock_with_vlan_trunk() {
+        let mut interfaces = HashMap::new();
+        interfaces.insert(
+            "eth0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Trunk,
+                addressing: Addressing::Static,
+                address: None,
+                mtu: None,
+                vlan_mode: Some(VlanMode::Trunk),
+                vlan_config: Some(VlanConfig {
+                    native_vlan: Some(1),
+                    access_vlan: None,
+                    allowed_vlans: Some(vec![1, 10, 20]),
+                }),
+            },
+        );
+
+        let config = Config {
+            interfaces,
+            dhcp: HashMap::new(),
+            nat: None,
+            routing: RoutingConfig::default(),
+        };
+
+        let lock = ConfigLock::from_config(&config, "testhash".to_string());
+        let eth0 = &lock.interfaces["eth0"];
+
+        assert_eq!(eth0.vlan_mode, Some("trunk".to_string()));
+        let vlan_cfg = eth0.vlan_config.as_ref().unwrap();
+        assert_eq!(vlan_cfg.native_vlan, 1);
+        assert_eq!(vlan_cfg.access_vlan, None);
+        assert_eq!(vlan_cfg.allowed_vlans, vec![1, 10, 20]);
     }
 }

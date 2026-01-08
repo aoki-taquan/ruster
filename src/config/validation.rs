@@ -1,6 +1,6 @@
 //! Configuration validation
 
-use super::{Config, InterfaceRole};
+use super::{Config, InterfaceRole, VlanMode};
 
 #[derive(Debug, Clone)]
 pub struct ValidationResult {
@@ -49,6 +49,7 @@ pub fn validate(config: &Config) -> ValidationResult {
     let mut result = ValidationResult::new();
 
     validate_interfaces(config, &mut result);
+    validate_vlan(config, &mut result);
     validate_dhcp(config, &mut result);
     validate_nat(config, &mut result);
     validate_routing(config, &mut result);
@@ -82,6 +83,87 @@ fn validate_interfaces(config: &Config, result: &mut ValidationResult) {
                     "interfaces.{}: WAN interface with static addressing requires address",
                     name
                 ));
+            }
+        }
+    }
+}
+
+fn validate_vlan(config: &Config, result: &mut ValidationResult) {
+    for (name, iface) in &config.interfaces {
+        let Some(mode) = &iface.vlan_mode else {
+            continue;
+        };
+
+        let vlan_cfg = iface.vlan_config.as_ref();
+
+        // Helper to check VLAN ID range (1-4094)
+        let check_vid = |vid: u16, field: &str| -> Option<String> {
+            if vid == 0 || vid > 4094 {
+                Some(format!(
+                    "interfaces.{}: {} {} is invalid (must be 1-4094)",
+                    name, field, vid
+                ))
+            } else {
+                None
+            }
+        };
+
+        // Check VLAN ID ranges
+        if let Some(cfg) = vlan_cfg {
+            if let Some(vid) = cfg.native_vlan {
+                if let Some(err) = check_vid(vid, "native_vlan") {
+                    result.error(err);
+                }
+            }
+            if let Some(vid) = cfg.access_vlan {
+                if let Some(err) = check_vid(vid, "access_vlan") {
+                    result.error(err);
+                }
+            }
+            if let Some(vlans) = &cfg.allowed_vlans {
+                for vid in vlans {
+                    if let Some(err) = check_vid(*vid, "allowed_vlans entry") {
+                        result.error(err);
+                    }
+                }
+            }
+        }
+
+        // Access mode: access_vlan required
+        if *mode == VlanMode::Access {
+            let has_access_vlan = vlan_cfg
+                .map(|cfg| cfg.access_vlan.is_some())
+                .unwrap_or(false);
+            if !has_access_vlan {
+                result.error(format!(
+                    "interfaces.{}: access mode requires access_vlan",
+                    name
+                ));
+            }
+        }
+
+        // Trunk mode: allowed_vlans required
+        if *mode == VlanMode::Trunk {
+            let has_allowed_vlans = vlan_cfg
+                .map(|cfg| cfg.allowed_vlans.is_some())
+                .unwrap_or(false);
+            if !has_allowed_vlans {
+                result.error(format!(
+                    "interfaces.{}: trunk mode requires allowed_vlans",
+                    name
+                ));
+            }
+
+            // Check native_vlan is in allowed_vlans
+            if let Some(cfg) = vlan_cfg {
+                if let (Some(native), Some(allowed)) = (cfg.native_vlan, &cfg.allowed_vlans) {
+                    if !allowed.contains(&native) {
+                        result.warn(format!(
+                            "interfaces.{}: native_vlan {} is not in allowed_vlans",
+                            name, native
+                        ));
+                    }
+                }
             }
         }
     }
@@ -187,7 +269,7 @@ mod tests {
     use super::*;
     use crate::config::{
         Addressing, DhcpConfig, InterfaceConfig, InterfaceRole, NatConfig, RoutingConfig,
-        StaticRoute,
+        StaticRoute, VlanConfig, VlanMode,
     };
     use std::collections::HashMap;
     use std::net::Ipv4Addr;
@@ -219,6 +301,8 @@ mod tests {
                 addressing: Addressing::Static,
                 address: None, // Missing!
                 mtu: Some(1500),
+                vlan_mode: None,
+                vlan_config: None,
             },
         );
         let result = validate(&config);
@@ -239,6 +323,8 @@ mod tests {
                 addressing: Addressing::Static,
                 address: None, // Missing!
                 mtu: Some(1500),
+                vlan_mode: None,
+                vlan_config: None,
             },
         );
         let result = validate(&config);
@@ -259,6 +345,8 @@ mod tests {
                 addressing: Addressing::Dhcp,
                 address: None, // OK for DHCP
                 mtu: Some(1500),
+                vlan_mode: None,
+                vlan_config: None,
             },
         );
         let result = validate(&config);
@@ -275,6 +363,8 @@ mod tests {
                 addressing: Addressing::Static,
                 address: Some("192.168.1.1/24".to_string()),
                 mtu: None, // Will warn
+                vlan_mode: None,
+                vlan_config: None,
             },
         );
         let result = validate(&config);
@@ -328,6 +418,8 @@ mod tests {
                 addressing: Addressing::Static,
                 address: Some("192.168.1.1/24".to_string()),
                 mtu: Some(1500),
+                vlan_mode: None,
+                vlan_config: None,
             },
         );
         config.nat = Some(NatConfig {
@@ -370,5 +462,175 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("missing prefix length")));
+    }
+
+    // VLAN validation tests
+
+    #[test]
+    fn test_vlan_access_valid() {
+        let mut config = make_config();
+        config.interfaces.insert(
+            "eth0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Lan,
+                addressing: Addressing::Static,
+                address: Some("192.168.1.1/24".to_string()),
+                mtu: Some(1500),
+                vlan_mode: Some(VlanMode::Access),
+                vlan_config: Some(VlanConfig {
+                    native_vlan: Some(1),
+                    access_vlan: Some(10),
+                    allowed_vlans: None,
+                }),
+            },
+        );
+        let result = validate(&config);
+        assert!(!result.has_errors());
+    }
+
+    #[test]
+    fn test_vlan_trunk_valid() {
+        let mut config = make_config();
+        config.interfaces.insert(
+            "eth0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Trunk,
+                addressing: Addressing::Static,
+                address: None,
+                mtu: Some(1500),
+                vlan_mode: Some(VlanMode::Trunk),
+                vlan_config: Some(VlanConfig {
+                    native_vlan: Some(1),
+                    access_vlan: None,
+                    allowed_vlans: Some(vec![1, 10, 20]),
+                }),
+            },
+        );
+        let result = validate(&config);
+        assert!(!result.has_errors());
+    }
+
+    #[test]
+    fn test_vlan_invalid_vid_zero() {
+        let mut config = make_config();
+        config.interfaces.insert(
+            "eth0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Lan,
+                addressing: Addressing::Static,
+                address: Some("192.168.1.1/24".to_string()),
+                mtu: Some(1500),
+                vlan_mode: Some(VlanMode::Access),
+                vlan_config: Some(VlanConfig {
+                    native_vlan: Some(0), // Invalid!
+                    access_vlan: Some(10),
+                    allowed_vlans: None,
+                }),
+            },
+        );
+        let result = validate(&config);
+        assert!(result.has_errors());
+        assert!(result.errors.iter().any(|e| e.contains("native_vlan 0")));
+    }
+
+    #[test]
+    fn test_vlan_invalid_vid_4095() {
+        let mut config = make_config();
+        config.interfaces.insert(
+            "eth0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Lan,
+                addressing: Addressing::Static,
+                address: Some("192.168.1.1/24".to_string()),
+                mtu: Some(1500),
+                vlan_mode: Some(VlanMode::Access),
+                vlan_config: Some(VlanConfig {
+                    native_vlan: Some(1),
+                    access_vlan: Some(4095), // Invalid!
+                    allowed_vlans: None,
+                }),
+            },
+        );
+        let result = validate(&config);
+        assert!(result.has_errors());
+        assert!(result.errors.iter().any(|e| e.contains("access_vlan 4095")));
+    }
+
+    #[test]
+    fn test_vlan_access_missing_access_vlan() {
+        let mut config = make_config();
+        config.interfaces.insert(
+            "eth0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Lan,
+                addressing: Addressing::Static,
+                address: Some("192.168.1.1/24".to_string()),
+                mtu: Some(1500),
+                vlan_mode: Some(VlanMode::Access),
+                vlan_config: Some(VlanConfig {
+                    native_vlan: Some(1),
+                    access_vlan: None, // Missing!
+                    allowed_vlans: None,
+                }),
+            },
+        );
+        let result = validate(&config);
+        assert!(result.has_errors());
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("access mode requires access_vlan")));
+    }
+
+    #[test]
+    fn test_vlan_trunk_missing_allowed_vlans() {
+        let mut config = make_config();
+        config.interfaces.insert(
+            "eth0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Trunk,
+                addressing: Addressing::Static,
+                address: None,
+                mtu: Some(1500),
+                vlan_mode: Some(VlanMode::Trunk),
+                vlan_config: Some(VlanConfig {
+                    native_vlan: Some(1),
+                    access_vlan: None,
+                    allowed_vlans: None, // Missing!
+                }),
+            },
+        );
+        let result = validate(&config);
+        assert!(result.has_errors());
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("trunk mode requires allowed_vlans")));
+    }
+
+    #[test]
+    fn test_vlan_trunk_native_not_in_allowed() {
+        let mut config = make_config();
+        config.interfaces.insert(
+            "eth0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Trunk,
+                addressing: Addressing::Static,
+                address: None,
+                mtu: Some(1500),
+                vlan_mode: Some(VlanMode::Trunk),
+                vlan_config: Some(VlanConfig {
+                    native_vlan: Some(100), // Not in allowed_vlans
+                    access_vlan: None,
+                    allowed_vlans: Some(vec![1, 10, 20]),
+                }),
+            },
+        );
+        let result = validate(&config);
+        assert!(!result.has_errors()); // Warning, not error
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.contains("native_vlan 100 is not in allowed_vlans")));
     }
 }
