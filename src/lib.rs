@@ -8,5 +8,6 @@ pub mod config;
 pub mod dataplane;
 pub mod error;
 pub mod protocol;
+pub mod telemetry;
 
 pub use error::{Error, Result};
