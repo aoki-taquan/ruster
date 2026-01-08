@@ -328,6 +328,98 @@ pub fn build_parameter_problem(
     packet
 }
 
+/// Mutable ICMP packet for NAPT modifications (RFC 5508)
+///
+/// Used to modify ICMP Echo Request/Reply identifier for NAT traversal.
+#[derive(Debug, Clone)]
+pub struct IcmpMutablePacket {
+    buffer: Vec<u8>,
+}
+
+impl IcmpMutablePacket {
+    /// Create from raw bytes (copies the data)
+    pub fn from_bytes(data: &[u8]) -> Result<Self> {
+        if data.len() < ICMP_HEADER_SIZE {
+            return Err(Error::Parse("ICMP packet too short".into()));
+        }
+
+        Ok(Self {
+            buffer: data.to_vec(),
+        })
+    }
+
+    /// ICMP type
+    pub fn icmp_type(&self) -> u8 {
+        self.buffer[0]
+    }
+
+    /// ICMP code
+    pub fn code(&self) -> u8 {
+        self.buffer[1]
+    }
+
+    /// Get identifier (for Echo Request/Reply)
+    pub fn identifier(&self) -> u16 {
+        u16::from_be_bytes([self.buffer[4], self.buffer[5]])
+    }
+
+    /// Set identifier and update checksum (for NAPT)
+    pub fn set_identifier(&mut self, id: u16) {
+        self.buffer[4..6].copy_from_slice(&id.to_be_bytes());
+        self.update_checksum();
+    }
+
+    /// Get sequence number (for Echo Request/Reply)
+    pub fn sequence(&self) -> u16 {
+        u16::from_be_bytes([self.buffer[6], self.buffer[7]])
+    }
+
+    /// Get checksum
+    pub fn checksum(&self) -> u16 {
+        u16::from_be_bytes([self.buffer[2], self.buffer[3]])
+    }
+
+    /// Update checksum
+    pub fn update_checksum(&mut self) {
+        // Zero out checksum field
+        self.buffer[2] = 0;
+        self.buffer[3] = 0;
+
+        let sum = icmp_checksum(&self.buffer);
+        self.buffer[2..4].copy_from_slice(&sum.to_be_bytes());
+    }
+
+    /// Check if this is an Echo Request
+    pub fn is_echo_request(&self) -> bool {
+        self.icmp_type() == IcmpType::EchoRequest as u8
+    }
+
+    /// Check if this is an Echo Reply
+    pub fn is_echo_reply(&self) -> bool {
+        self.icmp_type() == IcmpType::EchoReply as u8
+    }
+
+    /// Check if this is an Echo (Request or Reply) - NAPT can translate these
+    pub fn is_echo(&self) -> bool {
+        self.is_echo_request() || self.is_echo_reply()
+    }
+
+    /// Consume and return the buffer
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.buffer
+    }
+
+    /// Get reference to buffer
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    /// Validate checksum
+    pub fn validate_checksum(&self) -> bool {
+        icmp_checksum(&self.buffer) == 0
+    }
+}
+
 /// Builder for ICMP Echo Request packets
 #[derive(Debug, Clone)]
 pub struct EchoRequestBuilder {
@@ -814,5 +906,78 @@ mod tests {
         assert!(parsed.validate_checksum());
         // Only IP header should be in original datagram
         assert_eq!(parsed.original_datagram().len(), 20);
+    }
+
+    // ==================== IcmpMutablePacket tests ====================
+
+    #[test]
+    fn test_icmp_mutable_from_bytes() {
+        let request = make_echo_request(0x1234, 0x0001, b"test");
+        let pkt = IcmpMutablePacket::from_bytes(&request).unwrap();
+
+        assert_eq!(pkt.icmp_type(), IcmpType::EchoRequest as u8);
+        assert_eq!(pkt.code(), 0);
+        assert_eq!(pkt.identifier(), 0x1234);
+        assert_eq!(pkt.sequence(), 0x0001);
+        assert!(pkt.validate_checksum());
+    }
+
+    #[test]
+    fn test_icmp_mutable_from_bytes_too_short() {
+        let short = vec![0u8; 7];
+        assert!(IcmpMutablePacket::from_bytes(&short).is_err());
+    }
+
+    #[test]
+    fn test_icmp_mutable_set_identifier() {
+        let request = make_echo_request(0x1234, 0x0001, b"test");
+        let mut pkt = IcmpMutablePacket::from_bytes(&request).unwrap();
+
+        assert_eq!(pkt.identifier(), 0x1234);
+        pkt.set_identifier(0x5678);
+        assert_eq!(pkt.identifier(), 0x5678);
+
+        // Checksum should still be valid
+        assert!(pkt.validate_checksum());
+    }
+
+    #[test]
+    fn test_icmp_mutable_is_echo() {
+        let request = make_echo_request(0x1234, 0x0001, &[]);
+        let pkt = IcmpMutablePacket::from_bytes(&request).unwrap();
+        assert!(pkt.is_echo_request());
+        assert!(pkt.is_echo());
+        assert!(!pkt.is_echo_reply());
+
+        // Create echo reply
+        let reply = build_echo_reply(&request).unwrap();
+        let pkt_reply = IcmpMutablePacket::from_bytes(&reply).unwrap();
+        assert!(pkt_reply.is_echo_reply());
+        assert!(pkt_reply.is_echo());
+        assert!(!pkt_reply.is_echo_request());
+    }
+
+    #[test]
+    fn test_icmp_mutable_into_bytes() {
+        let request = make_echo_request(0x1234, 0x0001, b"data");
+        let pkt = IcmpMutablePacket::from_bytes(&request).unwrap();
+        let bytes = pkt.into_bytes();
+        assert_eq!(bytes, request);
+    }
+
+    #[test]
+    fn test_icmp_mutable_roundtrip_modification() {
+        // Simulate NAPT: change identifier, verify checksum
+        let original = make_echo_request(0x1000, 0x0001, b"ping");
+        let mut pkt = IcmpMutablePacket::from_bytes(&original).unwrap();
+
+        // NAT changes the identifier
+        pkt.set_identifier(0x2000);
+
+        // Verify the modified packet is valid
+        let modified = pkt.into_bytes();
+        let verified = IcmpMutablePacket::from_bytes(&modified).unwrap();
+        assert_eq!(verified.identifier(), 0x2000);
+        assert!(verified.validate_checksum());
     }
 }
