@@ -30,10 +30,10 @@ impl ValidationResult {
 
     pub fn print_diagnostics(&self) {
         for warning in &self.warnings {
-            println!("[WARN] {}", warning);
+            eprintln!("[WARN] {}", warning);
         }
         for error in &self.errors {
-            println!("[ERROR] {}", error);
+            eprintln!("[ERROR] {}", error);
         }
     }
 }
@@ -276,6 +276,7 @@ mod tests {
 
     fn make_config() -> Config {
         Config {
+            logging: None,
             interfaces: HashMap::new(),
             dhcp: HashMap::new(),
             nat: None,
