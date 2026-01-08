@@ -93,7 +93,8 @@ pub fn process_neighbor_advertisement(
                 // or if MAC address is the same
                 use crate::dataplane::NeighborState;
 
-                if na.override_flag || state == NeighborState::Incomplete || current_mac == new_mac {
+                if na.override_flag || state == NeighborState::Incomplete || current_mac == new_mac
+                {
                     table.insert_with_router_flag(target, new_mac, na.router_flag);
                     NdpAction::TableUpdated
                 } else {
