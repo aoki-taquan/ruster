@@ -932,7 +932,7 @@ mod tests {
 
         let external_port = match out_result {
             NaptResult::Translated { ref packet } => {
-                let tcp = TcpPacket::from_bytes(&Ipv4Packet::from_bytes(packet).unwrap().payload())
+                let tcp = TcpPacket::from_bytes(Ipv4Packet::from_bytes(packet).unwrap().payload())
                     .unwrap();
                 tcp.src_port()
             }
