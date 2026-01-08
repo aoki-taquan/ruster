@@ -6,7 +6,7 @@
 use crate::capture::AfPacketSocket;
 use crate::dataplane::{
     process_arp, ArpAction, ArpPendingQueue, ArpTable, Fdb, ForwardAction, Forwarder,
-    InterfaceInfo, RoutingTable,
+    InterfaceInfo, NaptProcessor, NaptResult, RoutingTable,
 };
 use crate::protocol::arp::ArpPacket;
 use crate::protocol::ethernet::{Frame, FrameBuilder};
@@ -73,6 +73,10 @@ pub struct Router {
     forwarder: Forwarder,
     /// Next port ID to assign
     next_port_id: PortId,
+    /// NAPT processor (optional)
+    napt: Option<NaptProcessor>,
+    /// WAN interface name (for NAPT)
+    wan_interface: Option<String>,
 }
 
 impl Router {
@@ -91,7 +95,34 @@ impl Router {
             arp_pending: ArpPendingQueue::new(ARP_QUEUE_MAX_PER_IP, ARP_QUEUE_MAX_AGE_SECS),
             forwarder: Forwarder::new(),
             next_port_id: 1,
+            napt: None,
+            wan_interface: None,
         }
+    }
+
+    /// Enable NAPT (IPマスカレード)
+    ///
+    /// # Arguments
+    /// * `wan_interface` - WAN interface name
+    /// * `external_ip` - External IP address (WAN IP)
+    pub fn enable_napt(&mut self, wan_interface: String, external_ip: Ipv4Addr) {
+        debug!(
+            "Enabling NAPT on {} with external IP {}",
+            wan_interface, external_ip
+        );
+        self.wan_interface = Some(wan_interface.clone());
+        self.napt = Some(NaptProcessor::new(wan_interface, external_ip));
+    }
+
+    /// Disable NAPT
+    pub fn disable_napt(&mut self) {
+        self.napt = None;
+        self.wan_interface = None;
+    }
+
+    /// Check if NAPT is enabled
+    pub fn is_napt_enabled(&self) -> bool {
+        self.napt.is_some()
     }
 
     /// Add an interface to the router
@@ -330,8 +361,12 @@ impl Router {
         ingress_iface: &str,
         payload: &[u8],
     ) -> Option<Vec<(String, Vec<u8>)>> {
+        // Apply NAPT if enabled
+        let (packet_to_forward, is_inbound_nat) = self.apply_napt_if_needed(ingress_iface, payload);
+        let packet_to_forward = packet_to_forward?;
+
         let action = self.forwarder.forward(
-            payload,
+            &packet_to_forward,
             &self.routing_table,
             &self.arp_table,
             &mut self.arp_pending,
@@ -343,12 +378,19 @@ impl Router {
                 next_hop_mac,
                 packet,
             } => {
+                // Apply outbound NAPT (SNAT) if forwarding to WAN
+                let final_packet = if !is_inbound_nat {
+                    self.apply_outbound_napt_if_needed(&interface, &packet)
+                } else {
+                    packet
+                };
+
                 let iface = self.interfaces.get(&interface)?;
                 let frame = FrameBuilder::new()
                     .src_mac(iface.mac_addr)
                     .dst_mac(next_hop_mac)
                     .ethertype(EtherType::Ipv4 as u16)
-                    .payload(&packet)
+                    .payload(&final_packet)
                     .build();
 
                 debug!(
@@ -375,7 +417,8 @@ impl Router {
             }
             ForwardAction::Local => {
                 // Packet is for us - handle locally (e.g., ICMP)
-                self.handle_local_packet(ingress_iface, payload)
+                // For inbound NAT, this means packet is destined for WAN IP but no mapping
+                self.handle_local_packet(ingress_iface, &packet_to_forward)
             }
             ForwardAction::TtlExpired { src_addr, .. } => {
                 debug!("TTL expired for packet from {}", src_addr);
@@ -391,6 +434,73 @@ impl Router {
                 trace!("Packet dropped");
                 None
             }
+        }
+    }
+
+    /// Apply NAPT for inbound traffic (DNAT) if needed
+    ///
+    /// Returns (packet, is_inbound_nat)
+    fn apply_napt_if_needed(
+        &mut self,
+        ingress_iface: &str,
+        payload: &[u8],
+    ) -> (Option<Vec<u8>>, bool) {
+        // Check if NAPT is enabled and packet is from WAN
+        let is_from_wan = self
+            .wan_interface
+            .as_ref()
+            .is_some_and(|wan| wan == ingress_iface);
+
+        if !is_from_wan {
+            return (Some(payload.to_vec()), false);
+        }
+
+        // Apply inbound NAPT (DNAT)
+        if let Some(ref mut napt) = self.napt {
+            match napt.process_inbound(payload) {
+                NaptResult::Translated { packet } => {
+                    trace!("NAPT: Inbound packet translated");
+                    (Some(packet), true)
+                }
+                NaptResult::PassThrough => {
+                    // Not destined for our external IP
+                    (Some(payload.to_vec()), false)
+                }
+                NaptResult::NoMapping => {
+                    // Destined for our external IP but no mapping - treat as local
+                    trace!("NAPT: No mapping for inbound packet");
+                    (Some(payload.to_vec()), false)
+                }
+                NaptResult::Unsupported | NaptResult::Error(_) => (Some(payload.to_vec()), false),
+            }
+        } else {
+            (Some(payload.to_vec()), false)
+        }
+    }
+
+    /// Apply NAPT for outbound traffic (SNAT) if forwarding to WAN
+    fn apply_outbound_napt_if_needed(&mut self, egress_iface: &str, packet: &[u8]) -> Vec<u8> {
+        // Check if NAPT is enabled and packet is going to WAN
+        let is_to_wan = self
+            .wan_interface
+            .as_ref()
+            .is_some_and(|wan| wan == egress_iface);
+
+        if !is_to_wan {
+            return packet.to_vec();
+        }
+
+        // Apply outbound NAPT (SNAT)
+        if let Some(ref mut napt) = self.napt {
+            match napt.process_outbound(packet) {
+                NaptResult::Translated { packet: translated } => {
+                    trace!("NAPT: Outbound packet translated");
+                    translated
+                }
+                _ => packet.to_vec(),
+            }
+        } else {
+            packet.to_vec()
         }
     }
 
@@ -447,11 +557,16 @@ impl Router {
         None
     }
 
-    /// Run aging for FDB and ARP tables
+    /// Run aging for FDB, ARP, and NAPT tables
     pub fn run_aging(&mut self) {
         self.fdb.age_out();
         self.arp_table.refresh_states();
         self.arp_pending.expire_old();
+
+        // Run NAPT maintenance if enabled
+        if let Some(ref mut napt) = self.napt {
+            napt.run_maintenance();
+        }
     }
 
     /// Create an aging timer interval
