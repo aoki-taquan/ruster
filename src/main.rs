@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use ruster::config;
+use ruster::telemetry::{init_logging, MetricsRegistry};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing::info;
 
 #[derive(Parser)]
@@ -47,7 +49,8 @@ enum ConfigAction {
 }
 
 fn main() {
-    tracing_subscriber::fmt::init();
+    // Initialize logging (RUST_LOG env var takes priority)
+    init_logging(None);
 
     let cli = Cli::parse();
 
@@ -107,7 +110,9 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
     let rt = Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
 
     rt.block_on(async move {
-        let mut router = Router::new();
+        // Initialize metrics registry
+        let metrics = Arc::new(MetricsRegistry::new());
+        let mut router = Router::new(metrics.clone());
 
         // Configure interfaces from lock file
         for (name, iface_lock) in &lock.interfaces {

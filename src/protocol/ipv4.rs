@@ -268,6 +268,18 @@ impl Ipv4Packet {
         )
     }
 
+    /// Set source address and update checksum (for NAPT)
+    pub fn set_src_addr(&mut self, addr: Ipv4Addr) {
+        self.buffer[12..16].copy_from_slice(&addr.octets());
+        self.update_checksum();
+    }
+
+    /// Set destination address and update checksum (for NAPT)
+    pub fn set_dst_addr(&mut self, addr: Ipv4Addr) {
+        self.buffer[16..20].copy_from_slice(&addr.octets());
+        self.update_checksum();
+    }
+
     /// Get protocol number
     pub fn protocol(&self) -> u8 {
         self.buffer[9]

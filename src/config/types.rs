@@ -8,6 +8,8 @@ use std::net::Ipv4Addr;
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    pub logging: Option<LoggingConfig>,
+    #[serde(default)]
     pub interfaces: HashMap<String, InterfaceConfig>,
     #[serde(default)]
     pub dhcp: HashMap<String, DhcpConfig>,
@@ -15,6 +17,25 @@ pub struct Config {
     pub nat: Option<NatConfig>,
     #[serde(default)]
     pub routing: RoutingConfig,
+}
+
+/// Logging configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct LoggingConfig {
+    /// Log level: error, warn, info, debug, trace
+    #[serde(default = "default_log_level")]
+    pub level: String,
+    /// Output format: pretty, compact, json
+    #[serde(default = "default_log_format")]
+    pub format: String,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+fn default_log_format() -> String {
+    "pretty".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,10 +119,19 @@ pub struct StaticRoute {
 pub struct ConfigLock {
     pub generated_at: String,
     pub source_hash: String,
+    #[serde(default)]
+    pub logging: LoggingLock,
     pub interfaces: HashMap<String, InterfaceLock>,
     pub dhcp: HashMap<String, DhcpLock>,
     pub nat: Option<NatLock>,
     pub routing: RoutingLock,
+}
+
+/// Logging configuration in lock file (with defaults filled in)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LoggingLock {
+    pub level: String,
+    pub format: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,9 +271,22 @@ impl ConfigLock {
             }
         }
 
+        let logging = config
+            .logging
+            .as_ref()
+            .map(|l| LoggingLock {
+                level: l.level.clone(),
+                format: l.format.clone(),
+            })
+            .unwrap_or_else(|| LoggingLock {
+                level: default_log_level(),
+                format: default_log_format(),
+            });
+
         ConfigLock {
             generated_at: chrono::Utc::now().to_rfc3339(),
             source_hash,
+            logging,
             interfaces,
             dhcp,
             nat,
@@ -347,6 +390,7 @@ mod tests {
         );
 
         let config = Config {
+            logging: None,
             interfaces,
             dhcp: HashMap::new(),
             nat: None,
@@ -356,6 +400,8 @@ mod tests {
         let lock = ConfigLock::from_config(&config, "testhash".to_string());
 
         assert_eq!(lock.source_hash, "testhash");
+        assert_eq!(lock.logging.level, "info");
+        assert_eq!(lock.logging.format, "pretty");
         assert_eq!(lock.interfaces.len(), 1);
 
         let eth0 = &lock.interfaces["eth0"];
@@ -393,6 +439,7 @@ mod tests {
         );
 
         let config = Config {
+            logging: None,
             interfaces,
             dhcp: HashMap::new(),
             nat: None,
@@ -429,6 +476,7 @@ mod tests {
         );
 
         let config = Config {
+            logging: None,
             interfaces,
             dhcp: HashMap::new(),
             nat: None,

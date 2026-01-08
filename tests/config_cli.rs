@@ -57,8 +57,8 @@ addressing = "static"
             .expect("Failed to execute command");
 
         assert!(!output.status.success());
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("LAN interface requires static address"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("LAN interface requires static address"));
     }
 
     #[test]
@@ -88,9 +88,9 @@ lan = ["eth99"]  # eth99 doesn't exist
             .expect("Failed to execute command");
 
         assert!(!output.status.success());
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("eth99"));
-        assert!(stdout.contains("not defined"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("eth99"));
+        assert!(stderr.contains("not defined"));
     }
 
     #[test]
@@ -117,9 +117,9 @@ address = "192.168.1.1/24"
             .expect("Failed to execute command");
 
         assert!(output.status.success());
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(stdout.contains("[WARN]"));
-        assert!(stdout.contains("mtu not specified"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("[WARN]"));
+        assert!(stderr.contains("mtu not specified"));
     }
 }
 
