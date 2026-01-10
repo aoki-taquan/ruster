@@ -1,0 +1,46 @@
+# IPv6 Test Topology
+#
+# Topology:
+#   client --- [eth1] ruster [eth2] --- server
+#
+# IPv6 addressing:
+#   - client: SLAAC or 2001:db8:1::2/64
+#   - ruster eth1: 2001:db8:1::1/64
+#   - ruster eth2: 2001:db8:2::1/64
+#   - server: 2001:db8:2::2/64
+
+name: ruster-ipv6-test
+
+topology:
+  nodes:
+    # Device Under Test - ruster router
+    ruster:
+      kind: linux
+      image: alpine:3.19
+      binds:
+        - ../../../target/release/ruster:/usr/local/bin/ruster:ro
+        - ./config.toml:/etc/ruster/config.toml:ro
+      exec:
+        - sysctl -w net.ipv6.conf.all.forwarding=1
+        - ip -6 addr add 2001:db8:1::1/64 dev eth1
+        - ip -6 addr add 2001:db8:2::1/64 dev eth2
+
+    # Client host
+    client:
+      kind: linux
+      image: alpine:3.19
+      exec:
+        - ip -6 addr add 2001:db8:1::2/64 dev eth1
+        - ip -6 route add 2001:db8:2::/64 via 2001:db8:1::1
+
+    # Server host
+    server:
+      kind: linux
+      image: alpine:3.19
+      exec:
+        - ip -6 addr add 2001:db8:2::2/64 dev eth1
+        - ip -6 route add 2001:db8:1::/64 via 2001:db8:2::1
+
+  links:
+    - endpoints: ["ruster:eth1", "client:eth1"]
+    - endpoints: ["ruster:eth2", "server:eth1"]
