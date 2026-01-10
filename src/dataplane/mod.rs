@@ -18,6 +18,8 @@ mod ndp_processor;
 mod neighbor_table;
 mod pbr;
 mod pppoe_client;
+mod ra_client;
+mod ra_server;
 mod router;
 mod routing;
 
@@ -42,6 +44,12 @@ pub use ndp_processor::{
 pub use neighbor_table::{NeighborState, NeighborTable};
 pub use pbr::{PacketKey, PolicyAction, PolicyMatch, PolicyResult, PolicyRouter, PolicyRule};
 pub use pppoe_client::{PppoeClient, PppoeClientAction, PppoeClientState, PppoeSession, PPPOE_MTU};
+pub use ra_client::{
+    LearnedPrefix, LearnedRouter, RaClient, RaClientAction, RaClientInterface, RaClientState,
+};
+pub use ra_server::{
+    AdvertisedPrefix, RaServer, RaServerAction, RaServerConfig, RaServerInterface,
+};
 pub use router::{Interface, Router};
 pub use routing::{network_address, LookupResult, Route, RouteSource, RoutingSystem, RoutingTable};
 

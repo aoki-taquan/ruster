@@ -9,7 +9,8 @@ use crate::dataplane::{
     Dhcp6ClientAction, DhcpAction, DhcpClient, DhcpClientAction, DhcpPoolConfig, DhcpServer,
     DnsAction, DnsForwarder, DnsForwarderConfig, Fdb, FilterContext, FilterIpAddr, ForwardAction,
     Forwarder, InterfaceInfo, NaptProcessor, NaptResult, PacketFilter, PppoeClient,
-    PppoeClientAction, Route, RouteSource, RoutingSystem, StatefulFirewall,
+    PppoeClientAction, RaClient, RaClientAction, RaServer, RaServerAction, RaServerConfig, Route,
+    RouteSource, RoutingSystem, StatefulFirewall,
 };
 use crate::protocol::arp::ArpPacket;
 use crate::protocol::ethernet::{Frame, FrameBuilder};
@@ -100,6 +101,10 @@ pub struct Router {
     dns_forwarder: Option<DnsForwarder>,
     /// PPPoE clients for interfaces with addressing=pppoe
     pppoe_clients: HashMap<String, PppoeClient>,
+    /// RA client for WAN interfaces (optional)
+    ra_client: Option<RaClient>,
+    /// RA server for LAN interfaces (optional)
+    ra_server: Option<RaServer>,
     /// Metrics registry for statistics
     metrics: Arc<MetricsRegistry>,
 }
@@ -129,6 +134,8 @@ impl Router {
             dhcp_clients: HashMap::new(),
             dns_forwarder: None,
             pppoe_clients: HashMap::new(),
+            ra_client: None,
+            ra_server: None,
             metrics,
         }
     }
@@ -270,6 +277,91 @@ impl Router {
         self.dhcp6_client.as_mut()
     }
 
+    // ===== RA Client Methods =====
+
+    /// Enable RA client on an interface (WAN side)
+    ///
+    /// # Arguments
+    /// * `interface` - Interface name to enable RA client on
+    pub fn enable_ra_client(&mut self, interface: &str) -> Vec<RaClientAction> {
+        let iface = match self.interfaces.get(interface) {
+            Some(i) => i,
+            None => {
+                warn!("Cannot enable RA client: interface {} not found", interface);
+                return vec![];
+            }
+        };
+
+        let mac = iface.mac_addr;
+        debug!("Enabling RA client on {}", interface);
+
+        let client = self.ra_client.get_or_insert_with(RaClient::new);
+        client.add_interface(interface.to_string(), &mac)
+    }
+
+    /// Disable RA client on an interface
+    pub fn disable_ra_client(&mut self, interface: &str) -> Vec<RaClientAction> {
+        if let Some(ref mut client) = self.ra_client {
+            return client.remove_interface(interface);
+        }
+        vec![]
+    }
+
+    /// Check if RA client is enabled on an interface
+    pub fn is_ra_client_enabled(&self, interface: &str) -> bool {
+        self.ra_client
+            .as_ref()
+            .is_some_and(|c| c.is_enabled(interface))
+    }
+
+    /// Get RA client reference
+    pub fn ra_client(&self) -> Option<&RaClient> {
+        self.ra_client.as_ref()
+    }
+
+    // ===== RA Server Methods =====
+
+    /// Enable RA server on an interface (LAN side)
+    ///
+    /// # Arguments
+    /// * `config` - RA server configuration
+    pub fn enable_ra_server(&mut self, config: RaServerConfig) -> RaServerAction {
+        let interface = &config.interface;
+        let iface = match self.interfaces.get(interface) {
+            Some(i) => i,
+            None => {
+                warn!("Cannot enable RA server: interface {} not found", interface);
+                return RaServerAction::None;
+            }
+        };
+
+        let mac = iface.mac_addr;
+        debug!("Enabling RA server on {}", interface);
+
+        let server = self.ra_server.get_or_insert_with(RaServer::new);
+        server.add_interface(config, &mac)
+    }
+
+    /// Disable RA server on an interface
+    pub fn disable_ra_server(&mut self, interface: &str) -> RaServerAction {
+        if let Some(ref mut server) = self.ra_server {
+            return server.remove_interface(interface);
+        }
+        RaServerAction::None
+    }
+
+    /// Check if RA server is enabled on an interface
+    pub fn is_ra_server_enabled(&self, interface: &str) -> bool {
+        self.ra_server
+            .as_ref()
+            .is_some_and(|s| s.is_enabled(interface))
+    }
+
+    /// Get RA server reference
+    pub fn ra_server(&self) -> Option<&RaServer> {
+        self.ra_server.as_ref()
+    }
+
     // ===== DHCP Client Methods =====
 
     /// Enable DHCP client on an interface to obtain IP address
@@ -363,6 +455,164 @@ impl Router {
             }
             DhcpClientAction::None => vec![],
         }
+    }
+
+    /// Execute RA client actions
+    fn execute_ra_client_actions(
+        &mut self,
+        actions: Vec<RaClientAction>,
+    ) -> Vec<(String, Vec<u8>)> {
+        use crate::protocol::ipv6::Ipv6Builder;
+
+        let mut to_send = Vec::new();
+
+        for action in actions {
+            match action {
+                RaClientAction::SendRs { interface, packet } => {
+                    let iface = match self.interfaces.get(&interface) {
+                        Some(i) => i,
+                        None => continue,
+                    };
+
+                    // Source: link-local address
+                    let src_ip = self.get_link_local(&iface.mac_addr);
+                    // Destination: all-routers multicast
+                    let dst_ip = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
+                    let dst_mac = MacAddr([0x33, 0x33, 0x00, 0x00, 0x00, 0x02]);
+
+                    // Build IPv6 packet
+                    let ip_packet = Ipv6Builder::new()
+                        .hop_limit(255)
+                        .src_addr(src_ip)
+                        .dst_addr(dst_ip)
+                        .next_header(58) // ICMPv6
+                        .payload(&packet)
+                        .build();
+
+                    // Build Ethernet frame
+                    let frame = FrameBuilder::new()
+                        .src_mac(iface.mac_addr)
+                        .dst_mac(dst_mac)
+                        .ethertype(EtherType::Ipv6 as u16)
+                        .payload(&ip_packet)
+                        .build();
+
+                    to_send.push((interface, frame));
+                }
+                RaClientAction::PrefixAcquired {
+                    interface,
+                    prefix: _,
+                    address,
+                    router: _,
+                    dns_servers: _,
+                } => {
+                    // Add the acquired address to the interface
+                    if let Some(iface) = self.interfaces.get_mut(&interface) {
+                        if !iface.ipv6_addrs.contains(&address) {
+                            iface.ipv6_addrs.push(address);
+                            debug!(
+                                interface = %interface,
+                                address = %address,
+                                "SLAAC: Added IPv6 address"
+                            );
+                        }
+                    }
+                }
+                RaClientAction::PrefixExpired { interface, address } => {
+                    // Remove the expired address from the interface
+                    if let Some(iface) = self.interfaces.get_mut(&interface) {
+                        iface.ipv6_addrs.retain(|a| *a != address);
+                        debug!(
+                            interface = %interface,
+                            address = %address,
+                            "SLAAC: Removed expired IPv6 address"
+                        );
+                    }
+                }
+                RaClientAction::DefaultRouterUpdate {
+                    interface: _,
+                    router,
+                    lifetime: _,
+                } => {
+                    // TODO: Update IPv6 routing table with default router
+                    trace!(
+                        router = ?router,
+                        "Default router updated"
+                    );
+                }
+                RaClientAction::None => {}
+            }
+        }
+
+        to_send
+    }
+
+    /// Execute RA server actions
+    fn execute_ra_server_actions(
+        &mut self,
+        actions: Vec<RaServerAction>,
+    ) -> Vec<(String, Vec<u8>)> {
+        use crate::protocol::ipv6::Ipv6Builder;
+
+        let mut to_send = Vec::new();
+
+        for action in actions {
+            match action {
+                RaServerAction::SendRa {
+                    interface,
+                    packet,
+                    dst_ip,
+                    dst_mac,
+                } => {
+                    let iface = match self.interfaces.get(&interface) {
+                        Some(i) => i,
+                        None => continue,
+                    };
+
+                    // Source: link-local address
+                    let src_ip = self.get_link_local(&iface.mac_addr);
+
+                    // Build IPv6 packet
+                    let ip_packet = Ipv6Builder::new()
+                        .hop_limit(255)
+                        .src_addr(src_ip)
+                        .dst_addr(dst_ip)
+                        .next_header(58) // ICMPv6
+                        .payload(&packet)
+                        .build();
+
+                    // Build Ethernet frame
+                    let frame = FrameBuilder::new()
+                        .src_mac(iface.mac_addr)
+                        .dst_mac(dst_mac)
+                        .ethertype(EtherType::Ipv6 as u16)
+                        .payload(&ip_packet)
+                        .build();
+
+                    to_send.push((interface, frame));
+                }
+                RaServerAction::None => {}
+            }
+        }
+
+        to_send
+    }
+
+    /// Generate link-local address from MAC using EUI-64
+    fn get_link_local(&self, mac: &MacAddr) -> Ipv6Addr {
+        let m = &mac.0;
+        let eui64: [u8; 8] = [m[0] ^ 0x02, m[1], m[2], 0xff, 0xfe, m[3], m[4], m[5]];
+
+        Ipv6Addr::new(
+            0xfe80,
+            0,
+            0,
+            0,
+            u16::from_be_bytes([eui64[0], eui64[1]]),
+            u16::from_be_bytes([eui64[2], eui64[3]]),
+            u16::from_be_bytes([eui64[4], eui64[5]]),
+            u16::from_be_bytes([eui64[6], eui64[7]]),
+        )
     }
 
     /// Configure interface with DHCP-obtained IP
@@ -1498,8 +1748,22 @@ impl Router {
             // TODO: Process DHCPv6 client actions (send packets, update addresses)
         }
 
-        // Tick DHCP clients and collect packets to send
+        // Collect packets to send
         let mut to_send = Vec::new();
+
+        // Run RA client maintenance if enabled
+        if let Some(ref mut ra_client) = self.ra_client {
+            let actions = ra_client.run_maintenance();
+            to_send.extend(self.execute_ra_client_actions(actions));
+        }
+
+        // Run RA server maintenance if enabled
+        if let Some(ref mut ra_server) = self.ra_server {
+            let actions = ra_server.run_maintenance();
+            to_send.extend(self.execute_ra_server_actions(actions));
+        }
+
+        // Tick DHCP clients
         let client_interfaces: Vec<String> = self.dhcp_clients.keys().cloned().collect();
         for iface_name in client_interfaces {
             if let Some(client) = self.dhcp_clients.get_mut(&iface_name) {

@@ -91,6 +91,7 @@ pub enum NdpOptionType {
     PrefixInformation = 3,
     RedirectedHeader = 4,
     Mtu = 5,
+    Rdnss = 25,
 }
 
 impl NdpOptionType {
@@ -101,6 +102,7 @@ impl NdpOptionType {
             3 => Some(NdpOptionType::PrefixInformation),
             4 => Some(NdpOptionType::RedirectedHeader),
             5 => Some(NdpOptionType::Mtu),
+            25 => Some(NdpOptionType::Rdnss),
             _ => None,
         }
     }
@@ -395,6 +397,425 @@ impl NeighborAdvertisement {
             target_link_addr: Some(target_link_addr),
         }
     }
+}
+
+/// Prefix Information option (RFC 4861 Section 4.6.2)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixInformation {
+    pub prefix_length: u8,
+    pub on_link_flag: bool,
+    pub autonomous_flag: bool,
+    pub valid_lifetime: u32,
+    pub preferred_lifetime: u32,
+    pub prefix: Ipv6Addr,
+}
+
+/// Prefix Information option size (32 bytes including type and length)
+pub const PREFIX_INFO_SIZE: usize = 32;
+
+impl PrefixInformation {
+    /// Parse from option data (including type and length bytes)
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        if data.len() < PREFIX_INFO_SIZE {
+            return Err(Error::Parse("Prefix Information option too short".into()));
+        }
+
+        // Type must be 3, Length must be 4 (32 bytes / 8)
+        if data[0] != NdpOptionType::PrefixInformation as u8 || data[1] != 4 {
+            return Err(Error::Parse("Invalid Prefix Information option".into()));
+        }
+
+        let prefix_length = data[2];
+        let flags = data[3];
+        let on_link_flag = (flags & 0x80) != 0;
+        let autonomous_flag = (flags & 0x40) != 0;
+        let valid_lifetime = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+        let preferred_lifetime = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+        // Bytes 12-15 are reserved
+        let prefix_bytes: [u8; 16] = data[16..32].try_into().unwrap();
+        let prefix = Ipv6Addr::from(prefix_bytes);
+
+        Ok(Self {
+            prefix_length,
+            on_link_flag,
+            autonomous_flag,
+            valid_lifetime,
+            preferred_lifetime,
+            prefix,
+        })
+    }
+
+    /// Serialize to bytes (32 bytes)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = vec![0u8; PREFIX_INFO_SIZE];
+
+        buf[0] = NdpOptionType::PrefixInformation as u8;
+        buf[1] = 4; // Length in 8-byte units
+        buf[2] = self.prefix_length;
+
+        let mut flags: u8 = 0;
+        if self.on_link_flag {
+            flags |= 0x80;
+        }
+        if self.autonomous_flag {
+            flags |= 0x40;
+        }
+        buf[3] = flags;
+
+        buf[4..8].copy_from_slice(&self.valid_lifetime.to_be_bytes());
+        buf[8..12].copy_from_slice(&self.preferred_lifetime.to_be_bytes());
+        // Bytes 12-15 reserved (already zero)
+        buf[16..32].copy_from_slice(&self.prefix.octets());
+
+        buf
+    }
+
+    /// Create a new Prefix Information option
+    pub fn new(
+        prefix: Ipv6Addr,
+        prefix_length: u8,
+        on_link_flag: bool,
+        autonomous_flag: bool,
+        valid_lifetime: u32,
+        preferred_lifetime: u32,
+    ) -> Self {
+        Self {
+            prefix_length,
+            on_link_flag,
+            autonomous_flag,
+            valid_lifetime,
+            preferred_lifetime,
+            prefix,
+        }
+    }
+}
+
+/// Router Solicitation message (RFC 4861 Section 4.1)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouterSolicitation {
+    pub source_link_addr: Option<MacAddr>,
+}
+
+impl RouterSolicitation {
+    /// Parse from ICMPv6 body (after type/code/checksum)
+    pub fn parse(buffer: &[u8]) -> Result<Self> {
+        // Minimum: 4 bytes reserved
+        if buffer.len() < 4 {
+            return Err(Error::Parse("Router Solicitation too short".into()));
+        }
+
+        // Parse options (after 4 reserved bytes)
+        let source_link_addr = if buffer.len() > 4 {
+            parse_link_layer_option(&buffer[4..], NdpOptionType::SourceLinkLayerAddress)
+        } else {
+            None
+        };
+
+        Ok(Self { source_link_addr })
+    }
+
+    /// Build RS message bytes (ICMPv6 payload, without IPv6 header)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let option_len = if self.source_link_addr.is_some() {
+            8
+        } else {
+            0
+        };
+        let mut buf = vec![0u8; 8 + option_len]; // 4 header + 4 reserved + options
+
+        // Type
+        buf[0] = Icmpv6Type::RouterSolicitation as u8;
+        // Code
+        buf[1] = 0;
+        // Checksum (placeholder)
+        buf[2] = 0;
+        buf[3] = 0;
+        // Reserved (bytes 4-7, already zero)
+
+        // Source Link-Layer Address option
+        if let Some(mac) = &self.source_link_addr {
+            buf[8] = NdpOptionType::SourceLinkLayerAddress as u8;
+            buf[9] = 1; // Length in units of 8 bytes
+            buf[10..16].copy_from_slice(&mac.0);
+        }
+
+        buf
+    }
+
+    /// Create a new RS
+    pub fn new(source_link_addr: Option<MacAddr>) -> Self {
+        Self { source_link_addr }
+    }
+}
+
+/// Router Advertisement message (RFC 4861 Section 4.2)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouterAdvertisement {
+    pub cur_hop_limit: u8,
+    pub managed_flag: bool,
+    pub other_flag: bool,
+    pub router_lifetime: u16,
+    pub reachable_time: u32,
+    pub retrans_timer: u32,
+    pub source_link_addr: Option<MacAddr>,
+    pub mtu: Option<u32>,
+    pub prefixes: Vec<PrefixInformation>,
+    pub rdnss: Vec<Ipv6Addr>,
+    pub rdnss_lifetime: u32,
+}
+
+impl RouterAdvertisement {
+    /// Parse from ICMPv6 body (after type/code/checksum)
+    pub fn parse(buffer: &[u8]) -> Result<Self> {
+        // Minimum: 12 bytes (cur_hop_limit, flags, router_lifetime, reachable_time, retrans_timer)
+        if buffer.len() < 12 {
+            return Err(Error::Parse("Router Advertisement too short".into()));
+        }
+
+        let cur_hop_limit = buffer[0];
+        let flags = buffer[1];
+        let managed_flag = (flags & 0x80) != 0;
+        let other_flag = (flags & 0x40) != 0;
+        let router_lifetime = u16::from_be_bytes([buffer[2], buffer[3]]);
+        let reachable_time = u32::from_be_bytes([buffer[4], buffer[5], buffer[6], buffer[7]]);
+        let retrans_timer = u32::from_be_bytes([buffer[8], buffer[9], buffer[10], buffer[11]]);
+
+        // Parse options
+        let options = &buffer[12..];
+        let (source_link_addr, mtu, prefixes, rdnss, rdnss_lifetime) = parse_ra_options(options);
+
+        Ok(Self {
+            cur_hop_limit,
+            managed_flag,
+            other_flag,
+            router_lifetime,
+            reachable_time,
+            retrans_timer,
+            source_link_addr,
+            mtu,
+            prefixes,
+            rdnss,
+            rdnss_lifetime,
+        })
+    }
+
+    /// Build RA message bytes (ICMPv6 payload, without IPv6 header)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        // Calculate total size
+        let slla_len = if self.source_link_addr.is_some() {
+            8
+        } else {
+            0
+        };
+        let mtu_len = if self.mtu.is_some() { 8 } else { 0 };
+        let prefix_len = self.prefixes.len() * PREFIX_INFO_SIZE;
+        let rdnss_len = if self.rdnss.is_empty() {
+            0
+        } else {
+            8 + self.rdnss.len() * 16
+        };
+        let total = 16 + slla_len + mtu_len + prefix_len + rdnss_len;
+
+        let mut buf = vec![0u8; total];
+
+        // Type
+        buf[0] = Icmpv6Type::RouterAdvertisement as u8;
+        // Code
+        buf[1] = 0;
+        // Checksum (placeholder)
+        buf[2] = 0;
+        buf[3] = 0;
+        // Cur Hop Limit
+        buf[4] = self.cur_hop_limit;
+        // Flags
+        let mut flags: u8 = 0;
+        if self.managed_flag {
+            flags |= 0x80;
+        }
+        if self.other_flag {
+            flags |= 0x40;
+        }
+        buf[5] = flags;
+        // Router Lifetime
+        buf[6..8].copy_from_slice(&self.router_lifetime.to_be_bytes());
+        // Reachable Time
+        buf[8..12].copy_from_slice(&self.reachable_time.to_be_bytes());
+        // Retrans Timer
+        buf[12..16].copy_from_slice(&self.retrans_timer.to_be_bytes());
+
+        let mut offset = 16;
+
+        // Source Link-Layer Address option
+        if let Some(mac) = &self.source_link_addr {
+            buf[offset] = NdpOptionType::SourceLinkLayerAddress as u8;
+            buf[offset + 1] = 1;
+            buf[offset + 2..offset + 8].copy_from_slice(&mac.0);
+            offset += 8;
+        }
+
+        // MTU option
+        if let Some(mtu) = self.mtu {
+            buf[offset] = NdpOptionType::Mtu as u8;
+            buf[offset + 1] = 1;
+            // Reserved 2 bytes (already zero)
+            buf[offset + 4..offset + 8].copy_from_slice(&mtu.to_be_bytes());
+            offset += 8;
+        }
+
+        // Prefix Information options
+        for prefix in &self.prefixes {
+            let prefix_bytes = prefix.to_bytes();
+            buf[offset..offset + PREFIX_INFO_SIZE].copy_from_slice(&prefix_bytes);
+            offset += PREFIX_INFO_SIZE;
+        }
+
+        // RDNSS option (RFC 8106)
+        if !self.rdnss.is_empty() {
+            buf[offset] = NdpOptionType::Rdnss as u8;
+            let rdnss_opt_len = 1 + self.rdnss.len() * 2; // in 8-byte units
+            buf[offset + 1] = rdnss_opt_len as u8;
+            // Reserved 2 bytes (already zero)
+            buf[offset + 4..offset + 8].copy_from_slice(&self.rdnss_lifetime.to_be_bytes());
+            let mut addr_offset = offset + 8;
+            for addr in &self.rdnss {
+                buf[addr_offset..addr_offset + 16].copy_from_slice(&addr.octets());
+                addr_offset += 16;
+            }
+        }
+
+        buf
+    }
+
+    /// Create a new RA
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        cur_hop_limit: u8,
+        managed_flag: bool,
+        other_flag: bool,
+        router_lifetime: u16,
+        reachable_time: u32,
+        retrans_timer: u32,
+    ) -> Self {
+        Self {
+            cur_hop_limit,
+            managed_flag,
+            other_flag,
+            router_lifetime,
+            reachable_time,
+            retrans_timer,
+            source_link_addr: None,
+            mtu: None,
+            prefixes: Vec::new(),
+            rdnss: Vec::new(),
+            rdnss_lifetime: 0,
+        }
+    }
+
+    /// Set source link-layer address
+    pub fn with_source_link_addr(mut self, mac: MacAddr) -> Self {
+        self.source_link_addr = Some(mac);
+        self
+    }
+
+    /// Set MTU
+    pub fn with_mtu(mut self, mtu: u32) -> Self {
+        self.mtu = Some(mtu);
+        self
+    }
+
+    /// Add a prefix
+    pub fn with_prefix(mut self, prefix: PrefixInformation) -> Self {
+        self.prefixes.push(prefix);
+        self
+    }
+
+    /// Set RDNSS (DNS servers)
+    pub fn with_rdnss(mut self, servers: Vec<Ipv6Addr>, lifetime: u32) -> Self {
+        self.rdnss = servers;
+        self.rdnss_lifetime = lifetime;
+        self
+    }
+}
+
+/// Parse RA options
+fn parse_ra_options(
+    options: &[u8],
+) -> (
+    Option<MacAddr>,
+    Option<u32>,
+    Vec<PrefixInformation>,
+    Vec<Ipv6Addr>,
+    u32,
+) {
+    let mut source_link_addr = None;
+    let mut mtu = None;
+    let mut prefixes = Vec::new();
+    let mut rdnss = Vec::new();
+    let mut rdnss_lifetime = 0u32;
+
+    let mut offset = 0;
+    while offset + 2 <= options.len() {
+        let opt_type = options[offset];
+        let opt_len = options[offset + 1] as usize * 8;
+
+        if opt_len == 0 || offset + opt_len > options.len() {
+            break;
+        }
+
+        match opt_type {
+            1 => {
+                // Source Link-Layer Address
+                if opt_len >= 8 {
+                    let mac_bytes: [u8; 6] = options[offset + 2..offset + 8].try_into().unwrap();
+                    source_link_addr = Some(MacAddr(mac_bytes));
+                }
+            }
+            5 => {
+                // MTU
+                if opt_len >= 8 {
+                    mtu = Some(u32::from_be_bytes([
+                        options[offset + 4],
+                        options[offset + 5],
+                        options[offset + 6],
+                        options[offset + 7],
+                    ]));
+                }
+            }
+            3 => {
+                // Prefix Information
+                if opt_len >= PREFIX_INFO_SIZE {
+                    if let Ok(prefix) = PrefixInformation::parse(&options[offset..offset + opt_len])
+                    {
+                        prefixes.push(prefix);
+                    }
+                }
+            }
+            25 => {
+                // RDNSS (RFC 8106)
+                if opt_len >= 24 {
+                    rdnss_lifetime = u32::from_be_bytes([
+                        options[offset + 4],
+                        options[offset + 5],
+                        options[offset + 6],
+                        options[offset + 7],
+                    ]);
+                    // Each address is 16 bytes, starting at offset + 8
+                    let num_addrs = (opt_len - 8) / 16;
+                    for i in 0..num_addrs {
+                        let addr_start = offset + 8 + i * 16;
+                        let addr_bytes: [u8; 16] =
+                            options[addr_start..addr_start + 16].try_into().unwrap();
+                        rdnss.push(Ipv6Addr::from(addr_bytes));
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        offset += opt_len;
+    }
+
+    (source_link_addr, mtu, prefixes, rdnss, rdnss_lifetime)
 }
 
 /// Parse link-layer address option from NDP options
@@ -1499,5 +1920,338 @@ mod tests {
         let parsed = Icmpv6Packet::parse(&request).unwrap();
         assert_eq!(parsed.payload().len(), 1000);
         assert!(validate_checksum(&src, &dst, &request));
+    }
+
+    // ==================== Router Solicitation tests ====================
+
+    #[test]
+    fn test_rs_parse_minimal() {
+        // Minimal RS: 4 reserved bytes only
+        let data = vec![0u8; 4];
+        let rs = RouterSolicitation::parse(&data).unwrap();
+        assert!(rs.source_link_addr.is_none());
+    }
+
+    #[test]
+    fn test_rs_parse_with_slla() {
+        // RS with Source Link-Layer Address option
+        let mut data = vec![0u8; 12];
+        // Reserved 4 bytes, already zero
+        // SLLA option
+        data[4] = 1; // Type
+        data[5] = 1; // Length
+        data[6..12].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+
+        let rs = RouterSolicitation::parse(&data).unwrap();
+        assert_eq!(
+            rs.source_link_addr,
+            Some(MacAddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]))
+        );
+    }
+
+    #[test]
+    fn test_rs_parse_too_short() {
+        let short = vec![0u8; 3];
+        assert!(RouterSolicitation::parse(&short).is_err());
+    }
+
+    #[test]
+    fn test_rs_to_bytes_minimal() {
+        let rs = RouterSolicitation::new(None);
+        let bytes = rs.to_bytes();
+
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(bytes[0], Icmpv6Type::RouterSolicitation as u8);
+        assert_eq!(bytes[1], 0);
+    }
+
+    #[test]
+    fn test_rs_to_bytes_with_slla() {
+        let rs = RouterSolicitation::new(Some(MacAddr([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])));
+        let bytes = rs.to_bytes();
+
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(bytes[0], Icmpv6Type::RouterSolicitation as u8);
+        assert_eq!(bytes[8], 1); // SLLA type
+        assert_eq!(bytes[9], 1); // Length
+        assert_eq!(&bytes[10..16], &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    }
+
+    #[test]
+    fn test_rs_roundtrip() {
+        let original = RouterSolicitation::new(Some(MacAddr([0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc])));
+        let bytes = original.to_bytes();
+        let parsed = RouterSolicitation::parse(&bytes[4..]).unwrap(); // Skip ICMPv6 header
+
+        assert_eq!(parsed.source_link_addr, original.source_link_addr);
+    }
+
+    // ==================== Router Advertisement tests ====================
+
+    #[test]
+    fn test_ra_parse_minimal() {
+        // Minimal RA: 12 bytes (cur_hop_limit, flags, router_lifetime, reachable_time, retrans_timer)
+        let mut data = vec![0u8; 12];
+        data[0] = 64; // cur_hop_limit
+        data[1] = 0xC0; // M=1, O=1
+        data[2..4].copy_from_slice(&1800u16.to_be_bytes()); // router_lifetime
+        data[4..8].copy_from_slice(&30000u32.to_be_bytes()); // reachable_time
+        data[8..12].copy_from_slice(&1000u32.to_be_bytes()); // retrans_timer
+
+        let ra = RouterAdvertisement::parse(&data).unwrap();
+
+        assert_eq!(ra.cur_hop_limit, 64);
+        assert!(ra.managed_flag);
+        assert!(ra.other_flag);
+        assert_eq!(ra.router_lifetime, 1800);
+        assert_eq!(ra.reachable_time, 30000);
+        assert_eq!(ra.retrans_timer, 1000);
+        assert!(ra.source_link_addr.is_none());
+        assert!(ra.mtu.is_none());
+        assert!(ra.prefixes.is_empty());
+        assert!(ra.rdnss.is_empty());
+    }
+
+    #[test]
+    fn test_ra_parse_with_options() {
+        let mut data = vec![0u8; 12 + 8 + 8 + 32]; // header + SLLA + MTU + Prefix
+
+        // Header
+        data[0] = 64;
+        data[1] = 0x40; // O=1
+
+        // SLLA option
+        data[12] = 1; // Type
+        data[13] = 1; // Length
+        data[14..20].copy_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+
+        // MTU option
+        data[20] = 5; // Type
+        data[21] = 1; // Length
+        data[24..28].copy_from_slice(&1500u32.to_be_bytes());
+
+        // Prefix Information
+        data[28] = 3; // Type
+        data[29] = 4; // Length (32 bytes / 8)
+        data[30] = 64; // Prefix length
+        data[31] = 0xC0; // L=1, A=1
+        data[32..36].copy_from_slice(&2592000u32.to_be_bytes()); // Valid lifetime
+        data[36..40].copy_from_slice(&604800u32.to_be_bytes()); // Preferred lifetime
+                                                                // Reserved 4 bytes (40-43)
+        data[44..60].copy_from_slice(&"2001:db8::".parse::<Ipv6Addr>().unwrap().octets());
+
+        let ra = RouterAdvertisement::parse(&data).unwrap();
+
+        assert_eq!(
+            ra.source_link_addr,
+            Some(MacAddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]))
+        );
+        assert_eq!(ra.mtu, Some(1500));
+        assert_eq!(ra.prefixes.len(), 1);
+        assert_eq!(ra.prefixes[0].prefix_length, 64);
+        assert!(ra.prefixes[0].on_link_flag);
+        assert!(ra.prefixes[0].autonomous_flag);
+    }
+
+    #[test]
+    fn test_ra_parse_with_rdnss() {
+        let mut data = vec![0u8; 12 + 24]; // header + RDNSS with 1 address
+
+        // Header
+        data[0] = 64;
+
+        // RDNSS option
+        data[12] = 25; // Type
+        data[13] = 3; // Length (24 bytes / 8)
+        data[16..20].copy_from_slice(&3600u32.to_be_bytes()); // Lifetime
+        data[20..36].copy_from_slice(&"2001:4860:4860::8888".parse::<Ipv6Addr>().unwrap().octets());
+
+        let ra = RouterAdvertisement::parse(&data).unwrap();
+
+        assert_eq!(ra.rdnss.len(), 1);
+        assert_eq!(
+            ra.rdnss[0],
+            "2001:4860:4860::8888".parse::<Ipv6Addr>().unwrap()
+        );
+        assert_eq!(ra.rdnss_lifetime, 3600);
+    }
+
+    #[test]
+    fn test_ra_parse_too_short() {
+        let short = vec![0u8; 11];
+        assert!(RouterAdvertisement::parse(&short).is_err());
+    }
+
+    #[test]
+    fn test_ra_to_bytes_minimal() {
+        let ra = RouterAdvertisement::new(64, false, true, 1800, 0, 0);
+        let bytes = ra.to_bytes();
+
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(bytes[0], Icmpv6Type::RouterAdvertisement as u8);
+        assert_eq!(bytes[1], 0); // Code
+        assert_eq!(bytes[4], 64); // cur_hop_limit
+        assert_eq!(bytes[5], 0x40); // O=1
+        assert_eq!(u16::from_be_bytes([bytes[6], bytes[7]]), 1800);
+    }
+
+    #[test]
+    fn test_ra_to_bytes_full() {
+        let prefix = PrefixInformation::new(
+            "2001:db8::".parse().unwrap(),
+            64,
+            true,
+            true,
+            2592000,
+            604800,
+        );
+
+        let ra = RouterAdvertisement::new(64, true, true, 1800, 30000, 1000)
+            .with_source_link_addr(MacAddr([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]))
+            .with_mtu(1500)
+            .with_prefix(prefix)
+            .with_rdnss(vec!["2001:4860:4860::8888".parse().unwrap()], 3600);
+
+        let bytes = ra.to_bytes();
+
+        // 16 (header) + 8 (SLLA) + 8 (MTU) + 32 (prefix) + 24 (RDNSS)
+        assert_eq!(bytes.len(), 88);
+        assert_eq!(bytes[0], Icmpv6Type::RouterAdvertisement as u8);
+        assert_eq!(bytes[5], 0xC0); // M=1, O=1
+    }
+
+    #[test]
+    fn test_ra_roundtrip() {
+        let prefix = PrefixInformation::new(
+            "2001:db8:1::".parse().unwrap(),
+            64,
+            true,
+            true,
+            2592000,
+            604800,
+        );
+
+        let original = RouterAdvertisement::new(64, false, true, 1800, 30000, 1000)
+            .with_source_link_addr(MacAddr([0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc]))
+            .with_mtu(1280)
+            .with_prefix(prefix);
+
+        let bytes = original.to_bytes();
+        let parsed = RouterAdvertisement::parse(&bytes[4..]).unwrap(); // Skip ICMPv6 header
+
+        assert_eq!(parsed.cur_hop_limit, original.cur_hop_limit);
+        assert_eq!(parsed.managed_flag, original.managed_flag);
+        assert_eq!(parsed.other_flag, original.other_flag);
+        assert_eq!(parsed.router_lifetime, original.router_lifetime);
+        assert_eq!(parsed.source_link_addr, original.source_link_addr);
+        assert_eq!(parsed.mtu, original.mtu);
+        assert_eq!(parsed.prefixes.len(), 1);
+        assert_eq!(parsed.prefixes[0].prefix_length, 64);
+    }
+
+    // ==================== Prefix Information tests ====================
+
+    #[test]
+    fn test_prefix_info_parse() {
+        let mut data = vec![0u8; 32];
+        data[0] = 3; // Type
+        data[1] = 4; // Length
+        data[2] = 64; // Prefix length
+        data[3] = 0xC0; // L=1, A=1
+        data[4..8].copy_from_slice(&2592000u32.to_be_bytes());
+        data[8..12].copy_from_slice(&604800u32.to_be_bytes());
+        data[16..32].copy_from_slice(&"2001:db8::".parse::<Ipv6Addr>().unwrap().octets());
+
+        let prefix = PrefixInformation::parse(&data).unwrap();
+
+        assert_eq!(prefix.prefix_length, 64);
+        assert!(prefix.on_link_flag);
+        assert!(prefix.autonomous_flag);
+        assert_eq!(prefix.valid_lifetime, 2592000);
+        assert_eq!(prefix.preferred_lifetime, 604800);
+        assert_eq!(prefix.prefix, "2001:db8::".parse::<Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn test_prefix_info_to_bytes() {
+        let prefix = PrefixInformation::new(
+            "2001:db8:abcd::".parse().unwrap(),
+            48,
+            true,
+            false,
+            1000000,
+            500000,
+        );
+
+        let bytes = prefix.to_bytes();
+
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(bytes[0], 3); // Type
+        assert_eq!(bytes[1], 4); // Length
+        assert_eq!(bytes[2], 48); // Prefix length
+        assert_eq!(bytes[3], 0x80); // L=1, A=0
+    }
+
+    #[test]
+    fn test_prefix_info_roundtrip() {
+        let original = PrefixInformation::new(
+            "fd00:1234::".parse().unwrap(),
+            64,
+            false,
+            true,
+            86400,
+            43200,
+        );
+
+        let bytes = original.to_bytes();
+        let parsed = PrefixInformation::parse(&bytes).unwrap();
+
+        assert_eq!(parsed.prefix_length, original.prefix_length);
+        assert_eq!(parsed.on_link_flag, original.on_link_flag);
+        assert_eq!(parsed.autonomous_flag, original.autonomous_flag);
+        assert_eq!(parsed.valid_lifetime, original.valid_lifetime);
+        assert_eq!(parsed.preferred_lifetime, original.preferred_lifetime);
+        assert_eq!(parsed.prefix, original.prefix);
+    }
+
+    #[test]
+    fn test_prefix_info_parse_too_short() {
+        let short = vec![0u8; 31];
+        assert!(PrefixInformation::parse(&short).is_err());
+    }
+
+    #[test]
+    fn test_prefix_info_parse_invalid_type() {
+        let mut data = vec![0u8; 32];
+        data[0] = 4; // Wrong type
+        data[1] = 4;
+        assert!(PrefixInformation::parse(&data).is_err());
+    }
+
+    // ==================== RS/RA checksum tests ====================
+
+    #[test]
+    fn test_rs_checksum() {
+        let src: Ipv6Addr = "fe80::1".parse().unwrap();
+        let dst: Ipv6Addr = "ff02::2".parse().unwrap(); // All-routers
+
+        let rs = RouterSolicitation::new(Some(MacAddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])));
+        let mut bytes = rs.to_bytes();
+        set_checksum(&mut bytes, &src, &dst);
+
+        assert!(validate_checksum(&src, &dst, &bytes));
+    }
+
+    #[test]
+    fn test_ra_checksum() {
+        let src: Ipv6Addr = "fe80::1".parse().unwrap();
+        let dst: Ipv6Addr = "ff02::1".parse().unwrap(); // All-nodes
+
+        let ra = RouterAdvertisement::new(64, false, false, 1800, 0, 0)
+            .with_source_link_addr(MacAddr([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+        let mut bytes = ra.to_bytes();
+        set_checksum(&mut bytes, &src, &dst);
+
+        assert!(validate_checksum(&src, &dst, &bytes));
     }
 }
