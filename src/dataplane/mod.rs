@@ -5,6 +5,7 @@
 mod arp_processor;
 mod arp_table;
 mod conntrack;
+mod dhcp_client;
 mod dhcp_server;
 mod fdb;
 mod filter;
@@ -19,6 +20,7 @@ mod routing;
 
 pub use arp_processor::{process_arp, ArpAction, ArpPendingQueue};
 pub use arp_table::{ArpState, ArpTable};
+pub use dhcp_client::{DhcpClient, DhcpClientAction, DhcpClientState, DhcpLease};
 pub use dhcp_server::{DhcpAction, DhcpPool, DhcpPoolConfig, DhcpServer, LeaseEntry, LeaseState};
 pub use fdb::Fdb;
 pub use filter::{
@@ -33,7 +35,7 @@ pub use ndp_processor::{
 pub use neighbor_table::{NeighborState, NeighborTable};
 pub use pbr::{PacketKey, PolicyAction, PolicyMatch, PolicyResult, PolicyRouter, PolicyRule};
 pub use router::{Interface, Router};
-pub use routing::{LookupResult, Route, RouteSource, RoutingSystem, RoutingTable};
+pub use routing::{network_address, LookupResult, Route, RouteSource, RoutingSystem, RoutingTable};
 
 // SPI (Stateful Packet Inspection)
 pub use conntrack::{ConnEntry, ConnKey, ConnProtocol, ConnState, ConnTrackTable};

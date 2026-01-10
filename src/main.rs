@@ -114,10 +114,17 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
         let metrics = Arc::new(MetricsRegistry::new());
         let mut router = Router::new(metrics.clone());
 
+        // Track interfaces that need DHCP client
+        let mut dhcp_client_interfaces: Vec<String> = Vec::new();
+
         // Configure interfaces from lock file
         for (name, iface_lock) in &lock.interfaces {
-            // Parse address if present
-            let (ip_addr, prefix_len) = if let Some(ref addr) = iface_lock.address {
+            // Parse address if present (skip for DHCP addressing)
+            let (ip_addr, prefix_len) = if iface_lock.addressing == "dhcp" {
+                // DHCP interface: no static IP
+                dhcp_client_interfaces.push(name.clone());
+                (None, None)
+            } else if let Some(ref addr) = iface_lock.address {
                 parse_cidr(addr)?
             } else {
                 (None, None)
@@ -140,11 +147,12 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
 
             router.add_interface(name.clone(), socket, mac_addr, ip_addr, prefix_len);
             info!(
-                "  {} configured: MAC={}, IP={:?}/{}",
+                "  {} configured: MAC={}, IP={:?}/{}, addressing={}",
                 name,
                 mac_addr,
                 ip_addr,
-                prefix_len.unwrap_or(0)
+                prefix_len.unwrap_or(0),
+                iface_lock.addressing
             );
         }
 
@@ -215,6 +223,20 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
             }
         }
 
+        // Enable DHCP clients for interfaces with addressing=dhcp
+        for iface_name in &dhcp_client_interfaces {
+            info!("Starting DHCP client on {}...", iface_name);
+            let packets = router.enable_dhcp_client(iface_name);
+            // Send initial DHCP DISCOVER packets
+            for (out_iface, frame) in packets {
+                if let Some(iface) = router.get_interface_mut(&out_iface) {
+                    if let Err(e) = iface.socket.send(&frame).await {
+                        warn!("Failed to send DHCP DISCOVER on {}: {}", out_iface, e);
+                    }
+                }
+            }
+        }
+
         info!("Router started, processing packets...");
 
         // Create aging timer
@@ -236,7 +258,15 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
         loop {
             tokio::select! {
                 _ = aging_timer.tick() => {
-                    router.run_aging();
+                    // Run aging and send any DHCP client packets
+                    let to_send = router.run_aging();
+                    for (out_iface, frame) in to_send {
+                        if let Some(iface) = router.get_interface_mut(&out_iface) {
+                            if let Err(e) = iface.socket.send(&frame).await {
+                                warn!("Failed to send DHCP packet on {}: {}", out_iface, e);
+                            }
+                        }
+                    }
                 }
                 result = async {
                     // Receive packet from the first interface
