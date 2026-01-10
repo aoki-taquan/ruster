@@ -7,7 +7,7 @@ use crate::capture::AfPacketSocket;
 use crate::dataplane::{
     process_arp, Action, ArpAction, ArpPendingQueue, ArpTable, Chain, Fdb, FilterContext,
     FilterIpAddr, ForwardAction, Forwarder, InterfaceInfo, NaptProcessor, NaptResult, PacketFilter,
-    RoutingSystem,
+    RoutingSystem, StatefulFirewall,
 };
 use crate::protocol::arp::ArpPacket;
 use crate::protocol::ethernet::{Frame, FrameBuilder};
@@ -83,6 +83,8 @@ pub struct Router {
     wan_interface: Option<String>,
     /// Packet filter (optional)
     filter: Option<PacketFilter>,
+    /// Stateful firewall (optional)
+    firewall: Option<StatefulFirewall>,
     /// Metrics registry for statistics
     metrics: Arc<MetricsRegistry>,
 }
@@ -106,6 +108,7 @@ impl Router {
             napt: None,
             wan_interface: None,
             filter: None,
+            firewall: None,
             metrics,
         }
     }
@@ -148,6 +151,28 @@ impl Router {
     /// Check if NAPT is enabled
     pub fn is_napt_enabled(&self) -> bool {
         self.napt.is_some()
+    }
+
+    /// Enable stateful firewall (SPI)
+    ///
+    /// # Arguments
+    /// * `wan_interfaces` - WAN interface names where SPI is applied
+    pub fn enable_firewall(&mut self, wan_interfaces: Vec<String>) {
+        debug!(
+            "Enabling stateful firewall for WAN interfaces: {:?}",
+            wan_interfaces
+        );
+        self.firewall = Some(StatefulFirewall::new(wan_interfaces));
+    }
+
+    /// Disable stateful firewall
+    pub fn disable_firewall(&mut self) {
+        self.firewall = None;
+    }
+
+    /// Check if stateful firewall is enabled
+    pub fn is_firewall_enabled(&self) -> bool {
+        self.firewall.is_some()
     }
 
     /// Add an interface to the router
@@ -404,6 +429,19 @@ impl Router {
         ingress_iface: &str,
         payload: &[u8],
     ) -> Option<Vec<(String, Vec<u8>)>> {
+        // Stateful firewall inspection (before NAPT)
+        if let Some(ref firewall) = self.firewall {
+            use crate::dataplane::FirewallVerdict;
+            match firewall.inspect(payload, ingress_iface) {
+                FirewallVerdict::Accept => {}
+                FirewallVerdict::Drop => {
+                    self.metrics.packets_dropped.inc();
+                    trace!("Firewall: dropped inbound packet from {}", ingress_iface);
+                    return None;
+                }
+            }
+        }
+
         // Apply NAPT if enabled
         let (packet_to_forward, is_inbound_nat) = self.apply_napt_if_needed(ingress_iface, payload);
         let packet_to_forward = packet_to_forward?;
@@ -447,6 +485,11 @@ impl Router {
                 } else {
                     packet
                 };
+
+                // Track connection for stateful firewall
+                if let Some(ref mut firewall) = self.firewall {
+                    firewall.track(payload, ingress_iface);
+                }
 
                 let iface = self.interfaces.get(&interface)?;
                 let frame = FrameBuilder::new()
@@ -716,7 +759,7 @@ impl Router {
         (None, None)
     }
 
-    /// Run aging for FDB, ARP, and NAPT tables
+    /// Run aging for FDB, ARP, NAPT, and firewall tables
     pub fn run_aging(&mut self) {
         self.fdb.age_out();
         self.arp_table.refresh_states();
@@ -725,6 +768,11 @@ impl Router {
         // Run NAPT maintenance if enabled
         if let Some(ref mut napt) = self.napt {
             napt.run_maintenance();
+        }
+
+        // Run firewall maintenance if enabled
+        if let Some(ref mut firewall) = self.firewall {
+            firewall.run_maintenance();
         }
 
         // Update table size metrics

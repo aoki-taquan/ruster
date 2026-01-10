@@ -159,6 +159,32 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
             }
         }
 
+        // Enable NAPT if configured
+        if let Some(ref nat) = lock.nat {
+            if nat.enabled {
+                // Get WAN interface IP
+                if let Some(wan_iface) = lock.interfaces.get(&nat.wan) {
+                    if let Some(ref addr) = wan_iface.address {
+                        if let (Some(ip), _) = parse_cidr(addr)? {
+                            router.enable_napt(nat.wan.clone(), ip);
+                            info!("NAPT enabled: WAN={}, external IP={}", nat.wan, ip);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Enable stateful firewall if configured
+        if let Some(ref firewall) = lock.firewall {
+            if firewall.enabled {
+                router.enable_firewall(firewall.wan_interfaces.clone());
+                info!(
+                    "Stateful firewall enabled for WAN interfaces: {:?}",
+                    firewall.wan_interfaces
+                );
+            }
+        }
+
         // Configure packet filter if enabled
         if let Some(ref filter_lock) = lock.filtering {
             if filter_lock.enabled {
