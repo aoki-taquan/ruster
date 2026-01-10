@@ -1,6 +1,6 @@
 //! E2E tests using containerlab
 //!
-//! Run with: cargo test --test e2e -- --ignored
+//! Run with: cargo test --test e2e --features e2e -- --test-threads=1
 //!
 //! Prerequisites:
 //! - containerlab installed
@@ -31,7 +31,7 @@ fn topology_path() -> PathBuf {
 /// This test verifies that hosts can reach ruster's directly connected interfaces.
 /// Does NOT require ruster's packet processing - uses Linux kernel networking.
 #[test]
-#[ignore] // Requires containerlab and sudo
+#[cfg_attr(not(feature = "e2e"), ignore)]
 fn test_ping_connectivity() {
     let topo = Topology::deploy(topology_path()).expect("Failed to deploy topology");
 
@@ -77,7 +77,7 @@ fn test_ping_connectivity() {
 /// 2. Disable kernel IP forwarding
 /// 3. Verify traffic flows through ruster
 #[test]
-#[ignore] // Requires containerlab, sudo, and ruster implementation
+#[cfg_attr(not(feature = "e2e"), ignore)]
 fn test_routing_through_ruster() {
     let topo = Topology::deploy(topology_path()).expect("Failed to deploy topology");
 
@@ -104,7 +104,7 @@ fn test_routing_through_ruster() {
 
 /// Test ARP resolution works correctly
 #[test]
-#[ignore] // Requires containerlab and sudo
+#[cfg_attr(not(feature = "e2e"), ignore)]
 fn test_arp_resolution() {
     let topo = Topology::deploy(topology_path()).expect("Failed to deploy topology");
 
@@ -124,7 +124,7 @@ fn test_arp_resolution() {
 
 /// Test ICMP echo reply (ping response)
 #[test]
-#[ignore] // Requires containerlab and sudo
+#[cfg_attr(not(feature = "e2e"), ignore)]
 fn test_icmp_echo_reply() {
     let topo = Topology::deploy(topology_path()).expect("Failed to deploy topology");
 

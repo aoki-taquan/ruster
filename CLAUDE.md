@@ -16,7 +16,7 @@ cargo fmt
 cargo clippy
 
 # E2Eテスト（Docker/Containerlab必要）
-cargo test --test e2e -- --ignored --test-threads=1
+cargo test --test e2e --features e2e -- --test-threads=1
 ```
 
 ## プロジェクト構造

@@ -81,7 +81,7 @@ fn wait_for_dhcp(topo: &Topology, node: &str, interface: &str, timeout_secs: u64
 
 /// Test: ruster WAN interface obtains IP via DHCP from ISP
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "e2e"), ignore)]
 fn test_wan_dhcp_acquisition() {
     let topo = Topology::deploy(home_router_topology()).expect("Failed to deploy topology");
 
@@ -109,7 +109,7 @@ fn test_wan_dhcp_acquisition() {
 
 /// Test: ruster can reach ISP gateway after DHCP
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "e2e"), ignore)]
 fn test_wan_dhcp_gateway_reachable() {
     let topo = Topology::deploy(home_router_topology()).expect("Failed to deploy topology");
 
@@ -135,7 +135,7 @@ fn test_wan_dhcp_gateway_reachable() {
 
 /// Test: LAN client obtains IP from ruster DHCP server
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "e2e"), ignore)]
 fn test_dhcp_server_lan_client() {
     let topo = Topology::deploy(home_router_topology()).expect("Failed to deploy topology");
 
@@ -162,7 +162,7 @@ fn test_dhcp_server_lan_client() {
 
 /// Test: Client receives correct gateway and DNS from DHCP
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "e2e"), ignore)]
 fn test_dhcp_server_options() {
     let topo = Topology::deploy(home_router_topology()).expect("Failed to deploy topology");
 
@@ -195,7 +195,7 @@ fn test_dhcp_server_options() {
 
 /// Test: LAN client can reach internet server through NAT
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "e2e"), ignore)]
 fn test_nat_outbound_connectivity() {
     let topo = Topology::deploy(home_router_topology()).expect("Failed to deploy topology");
 
@@ -238,7 +238,7 @@ fn test_nat_outbound_connectivity() {
 
 /// Test: DNS forwarder responds to client queries
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "e2e"), ignore)]
 fn test_dns_forwarder_responds() {
     let topo = Topology::deploy(home_router_topology()).expect("Failed to deploy topology");
 
@@ -275,7 +275,7 @@ fn test_dns_forwarder_responds() {
 
 /// Test: Complete home router scenario with DHCP WAN
 #[test]
-#[ignore]
+#[cfg_attr(not(feature = "e2e"), ignore)]
 fn test_home_router_full_scenario() {
     let topo = Topology::deploy(home_router_topology()).expect("Failed to deploy topology");
 
