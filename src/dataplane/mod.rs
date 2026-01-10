@@ -5,6 +5,7 @@
 mod arp_processor;
 mod arp_table;
 mod conntrack;
+mod dhcp_server;
 mod fdb;
 mod filter;
 mod firewall;
@@ -18,6 +19,7 @@ mod routing;
 
 pub use arp_processor::{process_arp, ArpAction, ArpPendingQueue};
 pub use arp_table::{ArpState, ArpTable};
+pub use dhcp_server::{DhcpAction, DhcpPool, DhcpPoolConfig, DhcpServer, LeaseEntry, LeaseState};
 pub use fdb::Fdb;
 pub use filter::{
     icmpv6_type, protocol, Action, Chain, FilterContext, FilterRule, IpAddr as FilterIpAddr,
