@@ -2,6 +2,10 @@
 
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Global counter for unique topology names
+static TOPOLOGY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Containerlab topology wrapper
 pub struct Topology {
@@ -10,9 +14,10 @@ pub struct Topology {
 }
 
 impl Topology {
-    /// Generate a unique suffix for the topology name (PID-based)
+    /// Generate a unique suffix for the topology name (PID + counter based)
     fn generate_unique_suffix() -> String {
-        format!("{}", std::process::id())
+        let count = TOPOLOGY_COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("{}-{}", std::process::id(), count)
     }
 
     /// Deploy a containerlab topology with a unique name
@@ -34,7 +39,7 @@ impl Topology {
             .map(|s| s.trim().to_string())
             .ok_or("Could not find topology name")?;
 
-        // Generate unique topology name with PID suffix
+        // Generate unique topology name with PID + counter suffix
         let suffix = Self::generate_unique_suffix();
         let name = format!("{}-{}", base_name, suffix);
 
