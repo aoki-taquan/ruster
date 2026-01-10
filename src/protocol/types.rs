@@ -127,6 +127,8 @@ pub enum EtherType {
     Arp = 0x0806,
     Vlan = 0x8100,
     Ipv6 = 0x86DD,
+    PppoeDiscovery = 0x8863,
+    PppoeSession = 0x8864,
 }
 
 impl EtherType {
@@ -136,6 +138,8 @@ impl EtherType {
             0x0806 => Some(EtherType::Arp),
             0x8100 => Some(EtherType::Vlan),
             0x86DD => Some(EtherType::Ipv6),
+            0x8863 => Some(EtherType::PppoeDiscovery),
+            0x8864 => Some(EtherType::PppoeSession),
             _ => None,
         }
     }

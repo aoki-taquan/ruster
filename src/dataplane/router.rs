@@ -8,13 +8,14 @@ use crate::dataplane::{
     network_address, process_arp, Action, ArpAction, ArpPendingQueue, ArpTable, Chain, Dhcp6Client,
     Dhcp6ClientAction, DhcpAction, DhcpClient, DhcpClientAction, DhcpPoolConfig, DhcpServer,
     DnsAction, DnsForwarder, DnsForwarderConfig, Fdb, FilterContext, FilterIpAddr, ForwardAction,
-    Forwarder, InterfaceInfo, NaptProcessor, NaptResult, PacketFilter, Route, RouteSource,
-    RoutingSystem, StatefulFirewall,
+    Forwarder, InterfaceInfo, NaptProcessor, NaptResult, PacketFilter, PppoeClient,
+    PppoeClientAction, Route, RouteSource, RoutingSystem, StatefulFirewall,
 };
 use crate::protocol::arp::ArpPacket;
 use crate::protocol::ethernet::{Frame, FrameBuilder};
 use crate::protocol::icmp::{build_echo_reply, IcmpType};
 use crate::protocol::ipv4::Ipv4Header;
+use crate::protocol::pppoe::PppoeFrame;
 use crate::protocol::types::EtherType;
 use crate::protocol::MacAddr;
 use crate::telemetry::MetricsRegistry;
@@ -97,6 +98,8 @@ pub struct Router {
     dhcp_clients: HashMap<String, DhcpClient>,
     /// DNS forwarder (optional)
     dns_forwarder: Option<DnsForwarder>,
+    /// PPPoE clients for interfaces with addressing=pppoe
+    pppoe_clients: HashMap<String, PppoeClient>,
     /// Metrics registry for statistics
     metrics: Arc<MetricsRegistry>,
 }
@@ -125,6 +128,7 @@ impl Router {
             dhcp6_client: None,
             dhcp_clients: HashMap::new(),
             dns_forwarder: None,
+            pppoe_clients: HashMap::new(),
             metrics,
         }
     }
@@ -443,6 +447,171 @@ impl Router {
     /// Check if DNS forwarder is enabled
     pub fn is_dns_forwarder_enabled(&self) -> bool {
         self.dns_forwarder.is_some()
+    }
+
+    // ===== PPPoE Client Methods =====
+
+    /// Enable PPPoE client on an interface
+    pub fn enable_pppoe_client(
+        &mut self,
+        interface: &str,
+        username: String,
+        password: String,
+        service_name: Option<String>,
+    ) -> Vec<(String, Vec<u8>)> {
+        let mac_addr = match self.interfaces.get(interface) {
+            Some(iface) => iface.mac_addr,
+            None => {
+                warn!("PPPoE client: interface {} not found", interface);
+                return vec![];
+            }
+        };
+
+        debug!("Enabling PPPoE client on {}", interface);
+        let mut client = PppoeClient::new(
+            interface.to_string(),
+            mac_addr,
+            username,
+            password,
+            service_name,
+        );
+        let action = client.start();
+        self.pppoe_clients.insert(interface.to_string(), client);
+
+        self.execute_pppoe_client_action(action)
+    }
+
+    /// Disable PPPoE client on an interface
+    pub fn disable_pppoe_client(&mut self, interface: &str) -> Vec<(String, Vec<u8>)> {
+        if let Some(mut client) = self.pppoe_clients.remove(interface) {
+            let action = client.terminate();
+            return self.execute_pppoe_client_action(action);
+        }
+        vec![]
+    }
+
+    /// Check if PPPoE client is enabled for an interface
+    pub fn is_pppoe_client_enabled(&self, interface: &str) -> bool {
+        self.pppoe_clients.contains_key(interface)
+    }
+
+    /// Execute a PPPoE client action
+    fn execute_pppoe_client_action(&mut self, action: PppoeClientAction) -> Vec<(String, Vec<u8>)> {
+        match action {
+            PppoeClientAction::SendDiscovery { interface, packet } => {
+                vec![(interface, packet)]
+            }
+            PppoeClientAction::SendSession { interface, packet } => {
+                vec![(interface, packet)]
+            }
+            PppoeClientAction::ConfigureInterface {
+                interface,
+                ip_addr,
+                peer_ip,
+                dns_servers: _,
+            } => {
+                self.configure_pppoe_interface(&interface, ip_addr, peer_ip);
+                vec![]
+            }
+            PppoeClientAction::DeconfigureInterface { interface } => {
+                self.deconfigure_pppoe_interface(&interface);
+                vec![]
+            }
+            PppoeClientAction::SessionTerminated { interface, reason } => {
+                debug!("PPPoE session terminated on {}: {}", interface, reason);
+                vec![]
+            }
+            PppoeClientAction::None => vec![],
+        }
+    }
+
+    /// Configure interface with PPPoE-obtained IP
+    fn configure_pppoe_interface(&mut self, interface: &str, ip_addr: Ipv4Addr, peer_ip: Ipv4Addr) {
+        // Update interface IP
+        if let Some(iface) = self.interfaces.get_mut(interface) {
+            iface.ip_addr = Some(ip_addr);
+            // Point-to-point link, /32 prefix
+            iface.prefix_len = Some(32);
+
+            // Update forwarder
+            self.forwarder.add_interface(
+                interface.to_string(),
+                InterfaceInfo {
+                    ip_addr,
+                    mac_addr: iface.mac_addr,
+                    prefix_len: 32,
+                },
+            );
+        }
+
+        // Add host route to peer
+        self.routing_system.main_table_mut().add(Route {
+            destination: peer_ip,
+            prefix_len: 32,
+            next_hop: None,
+            interface: interface.to_string(),
+            metric: 0,
+            source: RouteSource::Connected,
+        });
+
+        // Add default route via PPPoE peer
+        self.routing_system.main_table_mut().add(Route {
+            destination: Ipv4Addr::UNSPECIFIED,
+            prefix_len: 0,
+            next_hop: Some(peer_ip),
+            interface: interface.to_string(),
+            metric: 10,
+            source: RouteSource::Connected,
+        });
+
+        debug!(
+            "PPPoE interface {} configured: IP={}, peer={}",
+            interface, ip_addr, peer_ip
+        );
+    }
+
+    /// Remove PPPoE configuration from interface
+    fn deconfigure_pppoe_interface(&mut self, interface: &str) {
+        // Remove routes learned via this interface
+        self.routing_system
+            .main_table_mut()
+            .remove_by_interface(interface);
+
+        // Clear interface IP
+        if let Some(iface) = self.interfaces.get_mut(interface) {
+            iface.ip_addr = None;
+            iface.prefix_len = None;
+        }
+
+        // Remove from forwarder
+        self.forwarder.remove_interface(interface);
+    }
+
+    /// Handle PPPoE Discovery packet (EtherType 0x8863)
+    pub fn handle_pppoe_discovery(
+        &mut self,
+        ingress_iface: &str,
+        src_mac: MacAddr,
+        payload: &[u8],
+    ) -> Option<Vec<(String, Vec<u8>)>> {
+        let pppoe = PppoeFrame::parse(payload).ok()?;
+        let client = self.pppoe_clients.get_mut(ingress_iface)?;
+
+        let action = client.process_discovery(src_mac, &pppoe);
+        Some(self.execute_pppoe_client_action(action))
+    }
+
+    /// Handle PPPoE Session packet (EtherType 0x8864)
+    pub fn handle_pppoe_session(
+        &mut self,
+        ingress_iface: &str,
+        payload: &[u8],
+    ) -> Option<Vec<(String, Vec<u8>)>> {
+        let pppoe = PppoeFrame::parse(payload).ok()?;
+        let client = self.pppoe_clients.get_mut(ingress_iface)?;
+
+        let action = client.process_session(&pppoe);
+        Some(self.execute_pppoe_client_action(action))
     }
 
     /// Add an interface to the router
@@ -1336,6 +1505,15 @@ impl Router {
             if let Some(client) = self.dhcp_clients.get_mut(&iface_name) {
                 let action = client.tick();
                 to_send.extend(self.execute_dhcp_client_action(action));
+            }
+        }
+
+        // Tick PPPoE clients and collect packets to send
+        let pppoe_interfaces: Vec<String> = self.pppoe_clients.keys().cloned().collect();
+        for iface_name in pppoe_interfaces {
+            if let Some(client) = self.pppoe_clients.get_mut(&iface_name) {
+                let action = client.tick();
+                to_send.extend(self.execute_pppoe_client_action(action));
             }
         }
 
