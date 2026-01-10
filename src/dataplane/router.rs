@@ -5,9 +5,9 @@
 
 use crate::capture::AfPacketSocket;
 use crate::dataplane::{
-    process_arp, Action, ArpAction, ArpPendingQueue, ArpTable, Chain, Fdb, FilterContext,
-    FilterIpAddr, ForwardAction, Forwarder, InterfaceInfo, NaptProcessor, NaptResult, PacketFilter,
-    RoutingSystem, StatefulFirewall,
+    process_arp, Action, ArpAction, ArpPendingQueue, ArpTable, Chain, DhcpAction, DhcpPoolConfig,
+    DhcpServer, Fdb, FilterContext, FilterIpAddr, ForwardAction, Forwarder, InterfaceInfo,
+    NaptProcessor, NaptResult, PacketFilter, RoutingSystem, StatefulFirewall,
 };
 use crate::protocol::arp::ArpPacket;
 use crate::protocol::ethernet::{Frame, FrameBuilder};
@@ -85,6 +85,8 @@ pub struct Router {
     filter: Option<PacketFilter>,
     /// Stateful firewall (optional)
     firewall: Option<StatefulFirewall>,
+    /// DHCP server (optional)
+    dhcp_server: Option<DhcpServer>,
     /// Metrics registry for statistics
     metrics: Arc<MetricsRegistry>,
 }
@@ -109,6 +111,7 @@ impl Router {
             wan_interface: None,
             filter: None,
             firewall: None,
+            dhcp_server: None,
             metrics,
         }
     }
@@ -173,6 +176,33 @@ impl Router {
     /// Check if stateful firewall is enabled
     pub fn is_firewall_enabled(&self) -> bool {
         self.firewall.is_some()
+    }
+
+    /// Enable DHCP server for an interface
+    ///
+    /// # Arguments
+    /// * `config` - DHCP pool configuration
+    pub fn enable_dhcp(&mut self, config: DhcpPoolConfig) {
+        debug!(
+            "Enabling DHCP on {} with range {} - {}",
+            config.interface, config.range_start, config.range_end
+        );
+        let server = self.dhcp_server.get_or_insert_with(DhcpServer::new);
+        server.add_pool(config);
+    }
+
+    /// Disable DHCP server for an interface
+    pub fn disable_dhcp(&mut self, interface: &str) {
+        if let Some(ref mut server) = self.dhcp_server {
+            server.remove_pool(interface);
+        }
+    }
+
+    /// Check if DHCP is enabled for an interface
+    pub fn is_dhcp_enabled(&self, interface: &str) -> bool {
+        self.dhcp_server
+            .as_ref()
+            .is_some_and(|s| s.has_pool(interface))
     }
 
     /// Add an interface to the router
@@ -639,39 +669,110 @@ impl Router {
         ingress_iface: &str,
         payload: &[u8],
     ) -> Option<Vec<(String, Vec<u8>)>> {
+        use crate::protocol::dhcp::DHCP_SERVER_PORT;
         use crate::protocol::icmp::IcmpPacket;
         use crate::protocol::ipv4::{Ipv4Builder, Ipv4Header};
+        use crate::protocol::udp::UdpHeader;
 
         let ip_header = Ipv4Header::parse(payload).ok()?;
         let ip_payload = ip_header.payload();
 
-        // Check if ICMP
-        if ip_header.protocol() != 1 {
-            return None;
+        match ip_header.protocol() {
+            1 => {
+                // ICMP
+                let icmp = IcmpPacket::parse(ip_payload).ok()?;
+
+                // Handle echo request (ping)
+                if icmp.icmp_type() == IcmpType::EchoRequest as u8 {
+                    let iface = self.interfaces.get(ingress_iface)?;
+                    let local_ip = iface.ip_addr?;
+
+                    // Build ICMP echo reply from the request
+                    let icmp_reply = build_echo_reply(icmp.as_bytes()).ok()?;
+
+                    // Build IPv4 packet
+                    let ip_packet = Ipv4Builder::new()
+                        .src_addr(local_ip)
+                        .dst_addr(ip_header.src_addr())
+                        .ttl(64)
+                        .protocol(1) // ICMP
+                        .payload(&icmp_reply)
+                        .build();
+
+                    // Lookup MAC for reply
+                    if let Some((dst_mac, _)) = self.arp_table.lookup(&ip_header.src_addr()) {
+                        self.metrics.icmp_echo_replies.inc();
+                        let frame = FrameBuilder::new()
+                            .src_mac(iface.mac_addr)
+                            .dst_mac(dst_mac)
+                            .ethertype(EtherType::Ipv4 as u16)
+                            .payload(&ip_packet)
+                            .build();
+
+                        debug!("Sending ICMP echo reply to {}", ip_header.src_addr());
+                        return Some(vec![(iface.name.clone(), frame)]);
+                    }
+                }
+                None
+            }
+            17 => {
+                // UDP
+                let udp = UdpHeader::parse(ip_payload).ok()?;
+
+                if udp.dst_port() == DHCP_SERVER_PORT {
+                    // DHCP request
+                    self.handle_dhcp(ingress_iface, udp.payload())
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
+    }
 
-        let icmp = IcmpPacket::parse(ip_payload).ok()?;
+    /// Handle DHCP request
+    fn handle_dhcp(
+        &mut self,
+        ingress_iface: &str,
+        dhcp_payload: &[u8],
+    ) -> Option<Vec<(String, Vec<u8>)>> {
+        use crate::protocol::dhcp::DHCP_CLIENT_PORT;
+        use crate::protocol::ipv4::Ipv4Builder;
+        use crate::protocol::udp::UdpBuilder;
 
-        // Handle echo request (ping)
-        if icmp.icmp_type() == IcmpType::EchoRequest as u8 {
-            let iface = self.interfaces.get(ingress_iface)?;
-            let local_ip = iface.ip_addr?;
+        let dhcp_server = self.dhcp_server.as_mut()?;
+        let iface = self.interfaces.get(ingress_iface)?;
+        let server_ip = iface.ip_addr?;
 
-            // Build ICMP echo reply from the request
-            let icmp_reply = build_echo_reply(icmp.as_bytes()).ok()?;
+        let action = dhcp_server.process_dhcp(ingress_iface, server_ip, dhcp_payload);
 
-            // Build IPv4 packet
-            let ip_packet = Ipv4Builder::new()
-                .src_addr(local_ip)
-                .dst_addr(ip_header.src_addr())
-                .ttl(64)
-                .protocol(1) // ICMP
-                .payload(&icmp_reply)
-                .build();
+        match action {
+            DhcpAction::Reply {
+                interface,
+                packet,
+                dst_ip,
+                dst_mac,
+            } => {
+                let iface = self.interfaces.get(&interface)?;
+                let src_ip = iface.ip_addr?;
 
-            // Lookup MAC for reply
-            if let Some((dst_mac, _)) = self.arp_table.lookup(&ip_header.src_addr()) {
-                self.metrics.icmp_echo_replies.inc();
+                // Build UDP packet
+                let udp_packet = UdpBuilder::new()
+                    .src_port(crate::protocol::dhcp::DHCP_SERVER_PORT)
+                    .dst_port(DHCP_CLIENT_PORT)
+                    .payload(&packet)
+                    .build(src_ip, dst_ip);
+
+                // Build IPv4 packet
+                let ip_packet = Ipv4Builder::new()
+                    .src_addr(src_ip)
+                    .dst_addr(dst_ip)
+                    .ttl(64)
+                    .protocol(17) // UDP
+                    .payload(&udp_packet)
+                    .build();
+
+                // Build Ethernet frame
                 let frame = FrameBuilder::new()
                     .src_mac(iface.mac_addr)
                     .dst_mac(dst_mac)
@@ -679,12 +780,11 @@ impl Router {
                     .payload(&ip_packet)
                     .build();
 
-                debug!("Sending ICMP echo reply to {}", ip_header.src_addr());
-                return Some(vec![(iface.name.clone(), frame)]);
+                debug!("Sending DHCP reply to {} via {}", dst_ip, interface);
+                Some(vec![(interface, frame)])
             }
+            DhcpAction::None => None,
         }
-
-        None
     }
 
     /// Apply packet filter and record metrics
@@ -759,7 +859,7 @@ impl Router {
         (None, None)
     }
 
-    /// Run aging for FDB, ARP, NAPT, and firewall tables
+    /// Run aging for FDB, ARP, NAPT, firewall, and DHCP tables
     pub fn run_aging(&mut self) {
         self.fdb.age_out();
         self.arp_table.refresh_states();
@@ -773,6 +873,11 @@ impl Router {
         // Run firewall maintenance if enabled
         if let Some(ref mut firewall) = self.firewall {
             firewall.run_maintenance();
+        }
+
+        // Run DHCP maintenance if enabled
+        if let Some(ref mut dhcp) = self.dhcp_server {
+            dhcp.run_maintenance();
         }
 
         // Update table size metrics

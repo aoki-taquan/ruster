@@ -148,6 +148,61 @@ impl UdpPacket {
     }
 }
 
+/// UDP packet builder for creating new UDP datagrams
+#[derive(Debug, Clone, Default)]
+pub struct UdpBuilder {
+    src_port: u16,
+    dst_port: u16,
+    payload: Vec<u8>,
+}
+
+impl UdpBuilder {
+    /// Create a new UDP builder
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set source port
+    pub fn src_port(mut self, port: u16) -> Self {
+        self.src_port = port;
+        self
+    }
+
+    /// Set destination port
+    pub fn dst_port(mut self, port: u16) -> Self {
+        self.dst_port = port;
+        self
+    }
+
+    /// Set payload
+    pub fn payload(mut self, data: &[u8]) -> Self {
+        self.payload = data.to_vec();
+        self
+    }
+
+    /// Build the UDP datagram with checksum
+    pub fn build(self, src_ip: Ipv4Addr, dst_ip: Ipv4Addr) -> Vec<u8> {
+        let length = (HEADER_SIZE + self.payload.len()) as u16;
+        let mut buffer = vec![0u8; HEADER_SIZE + self.payload.len()];
+
+        // Header
+        buffer[0..2].copy_from_slice(&self.src_port.to_be_bytes());
+        buffer[2..4].copy_from_slice(&self.dst_port.to_be_bytes());
+        buffer[4..6].copy_from_slice(&length.to_be_bytes());
+        // Checksum placeholder (offset 6-7) is already 0
+
+        // Payload
+        buffer[HEADER_SIZE..].copy_from_slice(&self.payload);
+
+        // Calculate checksum
+        let sum = udp_checksum(src_ip, dst_ip, &buffer);
+        let sum = if sum == 0 { 0xFFFF } else { sum };
+        buffer[6..8].copy_from_slice(&sum.to_be_bytes());
+
+        buffer
+    }
+}
+
 /// Calculate UDP checksum with pseudo-header (RFC 768)
 ///
 /// Pseudo-header:

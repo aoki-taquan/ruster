@@ -3,6 +3,7 @@
 //! All L2+ protocols are implemented from scratch for learning purposes.
 
 pub mod arp;
+pub mod dhcp;
 pub mod ethernet;
 pub mod icmp;
 pub mod icmpv6;
