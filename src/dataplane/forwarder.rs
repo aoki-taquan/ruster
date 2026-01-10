@@ -3,9 +3,13 @@
 //! Handles IPv4 packet forwarding with routing table lookup,
 //! next-hop resolution via ARP, and TTL handling.
 
-use crate::dataplane::{ArpPendingQueue, ArpState, ArpTable, RoutingTable};
+use crate::dataplane::pbr::PacketKey;
+use crate::dataplane::routing::LookupResult;
+use crate::dataplane::{ArpPendingQueue, ArpState, ArpTable, RoutingSystem, RoutingTable};
 use crate::protocol::arp::ArpPacket;
 use crate::protocol::ipv4::Ipv4Packet;
+use crate::protocol::tcp::TcpHeader;
+use crate::protocol::udp::UdpHeader;
 use crate::protocol::MacAddr;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -146,6 +150,182 @@ impl Forwarder {
         let next_hop_ip = route.next_hop.unwrap_or(dst_addr);
 
         // Resolve next-hop MAC via ARP
+        match arp_table.lookup(&next_hop_ip) {
+            Some((mac, ArpState::Reachable)) => {
+                // We have the MAC, forward the packet
+                ForwardAction::Forward {
+                    interface: out_interface,
+                    next_hop_mac: mac,
+                    packet: ip_packet.into_bytes(),
+                }
+            }
+            Some((_, ArpState::Stale)) | Some((_, ArpState::Incomplete)) | None => {
+                // Need to resolve MAC via ARP
+                // Queue the packet
+                let packet_bytes = ip_packet.into_bytes();
+                if !pending_queue.enqueue(next_hop_ip, packet_bytes) {
+                    return ForwardAction::Dropped;
+                }
+
+                // Generate ARP request
+                let arp_request =
+                    ArpPacket::request(iface_info.mac_addr, iface_info.ip_addr, next_hop_ip);
+
+                ForwardAction::ArpRequest {
+                    interface: out_interface,
+                    target_ip: next_hop_ip,
+                    request: arp_request,
+                }
+            }
+        }
+    }
+
+    /// Forward an IPv4 packet with policy-based routing support
+    ///
+    /// # Arguments
+    /// * `packet_data` - Raw IPv4 packet bytes
+    /// * `ingress_interface` - Name of interface packet arrived on
+    /// * `routing_system` - Routing system with policy support
+    /// * `arp_table` - ARP table for MAC resolution
+    /// * `pending_queue` - Queue for packets awaiting ARP resolution
+    ///
+    /// # Returns
+    /// ForwardAction indicating what to do with the packet
+    pub fn forward_with_policy(
+        &self,
+        packet_data: &[u8],
+        ingress_interface: &str,
+        routing_system: &RoutingSystem,
+        arp_table: &ArpTable,
+        pending_queue: &mut ArpPendingQueue,
+    ) -> ForwardAction {
+        // Parse IPv4 packet
+        let mut ip_packet = match Ipv4Packet::from_bytes(packet_data) {
+            Ok(pkt) => pkt,
+            Err(_) => return ForwardAction::Dropped,
+        };
+
+        let dst_addr = ip_packet.dst_addr();
+
+        // Check if packet is for us
+        if self.is_local(dst_addr) {
+            return ForwardAction::Local;
+        }
+
+        // Decrement TTL
+        if !ip_packet.decrement_ttl() {
+            return ForwardAction::TtlExpired {
+                src_addr: ip_packet.src_addr(),
+                original_packet: packet_data.to_vec(),
+            };
+        }
+
+        // Build packet key for policy matching
+        let packet_key = self.build_packet_key(&ip_packet, ingress_interface);
+
+        // Lookup with policy
+        let lookup_result = routing_system.lookup_with_policy(&packet_key);
+
+        match lookup_result {
+            LookupResult::Drop => ForwardAction::Dropped,
+            LookupResult::NoRoute => ForwardAction::NoRoute { dst_addr },
+            LookupResult::Route {
+                next_hop,
+                interface,
+            } => {
+                // Resolve the output interface
+                let out_interface = if interface.is_empty() {
+                    // Route doesn't specify interface, find it from next-hop
+                    self.find_interface_for_ip(next_hop.unwrap_or(dst_addr))
+                } else {
+                    Some(interface)
+                };
+
+                let out_interface = match out_interface {
+                    Some(iface) => iface,
+                    None => return ForwardAction::NoRoute { dst_addr },
+                };
+
+                // Get our interface info
+                let iface_info = match self.interfaces.get(&out_interface) {
+                    Some(info) => info,
+                    None => return ForwardAction::NoRoute { dst_addr },
+                };
+
+                // Determine next-hop IP for ARP resolution
+                let next_hop_ip = next_hop.unwrap_or(dst_addr);
+
+                // Resolve next-hop MAC via ARP
+                self.resolve_and_forward(
+                    ip_packet,
+                    out_interface,
+                    iface_info,
+                    next_hop_ip,
+                    arp_table,
+                    pending_queue,
+                )
+            }
+        }
+    }
+
+    /// Build a PacketKey for policy matching
+    fn build_packet_key(&self, packet: &Ipv4Packet, ingress: &str) -> PacketKey {
+        let (src_port, dst_port) = self.extract_ports(packet);
+
+        PacketKey {
+            src_ip: packet.src_addr(),
+            dst_ip: packet.dst_addr(),
+            protocol: packet.protocol(),
+            src_port,
+            dst_port,
+            ingress_interface: ingress.to_string(),
+        }
+    }
+
+    /// Extract L4 ports from TCP/UDP packets
+    fn extract_ports(&self, packet: &Ipv4Packet) -> (Option<u16>, Option<u16>) {
+        let payload = packet.payload();
+        match packet.protocol() {
+            6 => {
+                // TCP
+                if let Ok(tcp) = TcpHeader::parse(payload) {
+                    (Some(tcp.src_port()), Some(tcp.dst_port()))
+                } else {
+                    (None, None)
+                }
+            }
+            17 => {
+                // UDP
+                if let Ok(udp) = UdpHeader::parse(payload) {
+                    (Some(udp.src_port()), Some(udp.dst_port()))
+                } else {
+                    (None, None)
+                }
+            }
+            _ => (None, None),
+        }
+    }
+
+    /// Find interface that can reach a given IP (by checking connected networks)
+    fn find_interface_for_ip(&self, ip: Ipv4Addr) -> Option<String> {
+        for (name, info) in &self.interfaces {
+            if is_in_network(ip, info.ip_addr, info.prefix_len) {
+                return Some(name.clone());
+            }
+        }
+        None
+    }
+
+    /// Resolve next-hop MAC and forward or queue packet
+    fn resolve_and_forward(
+        &self,
+        ip_packet: Ipv4Packet,
+        out_interface: String,
+        iface_info: &InterfaceInfo,
+        next_hop_ip: Ipv4Addr,
+        arp_table: &ArpTable,
+        pending_queue: &mut ArpPendingQueue,
+    ) -> ForwardAction {
         match arp_table.lookup(&next_hop_ip) {
             Some((mac, ArpState::Reachable)) => {
                 // We have the MAC, forward the packet

@@ -2,8 +2,10 @@
 //!
 //! Implements static routing with longest prefix match (LPM).
 //! Supports connected routes (auto-generated) and static routes (from config).
+//! Supports policy-based routing (PBR) with multiple routing tables.
 
 use crate::config::{InterfaceConfig, RoutingConfig, StaticRoute};
+use crate::dataplane::pbr::{PacketKey, PolicyResult, PolicyRouter};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
@@ -190,6 +192,149 @@ fn network_address(ip: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
         !0u32 << (32 - prefix_len)
     };
     Ipv4Addr::from(ip_bits & mask)
+}
+
+// ============================================================================
+// Routing System with Policy-Based Routing
+// ============================================================================
+
+/// Result of a routing lookup
+#[derive(Debug, Clone)]
+pub enum LookupResult {
+    /// Route found
+    Route {
+        next_hop: Option<Ipv4Addr>,
+        interface: String,
+    },
+    /// Drop the packet
+    Drop,
+    /// No route found
+    NoRoute,
+}
+
+/// Routing system with policy-based routing support
+#[derive(Debug)]
+pub struct RoutingSystem {
+    /// Main routing table (table 0 / default)
+    main_table: RoutingTable,
+    /// Additional named tables
+    tables: HashMap<u32, RoutingTable>,
+    /// Policy router
+    policy: PolicyRouter,
+}
+
+impl Default for RoutingSystem {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RoutingSystem {
+    pub fn new() -> Self {
+        Self {
+            main_table: RoutingTable::new(),
+            tables: HashMap::new(),
+            policy: PolicyRouter::new(),
+        }
+    }
+
+    /// Get reference to the main routing table
+    pub fn main_table(&self) -> &RoutingTable {
+        &self.main_table
+    }
+
+    /// Get mutable reference to the main routing table
+    pub fn main_table_mut(&mut self) -> &mut RoutingTable {
+        &mut self.main_table
+    }
+
+    /// Get reference to the policy router
+    pub fn policy(&self) -> &PolicyRouter {
+        &self.policy
+    }
+
+    /// Get mutable reference to the policy router
+    pub fn policy_mut(&mut self) -> &mut PolicyRouter {
+        &mut self.policy
+    }
+
+    /// Add a routing table with the given ID
+    pub fn add_table(&mut self, table_id: u32, table: RoutingTable) {
+        self.tables.insert(table_id, table);
+    }
+
+    /// Get a routing table by ID (None for main table)
+    pub fn get_table(&self, table_id: u32) -> Option<&RoutingTable> {
+        if table_id == 0 {
+            Some(&self.main_table)
+        } else {
+            self.tables.get(&table_id)
+        }
+    }
+
+    /// Get a mutable routing table by ID
+    pub fn get_table_mut(&mut self, table_id: u32) -> Option<&mut RoutingTable> {
+        if table_id == 0 {
+            Some(&mut self.main_table)
+        } else {
+            self.tables.get_mut(&table_id)
+        }
+    }
+
+    /// Lookup with policy evaluation
+    ///
+    /// First evaluates policy rules, then falls back to main routing table.
+    pub fn lookup_with_policy(&self, key: &PacketKey) -> LookupResult {
+        // 1. Evaluate policy rules first
+        match self.policy.evaluate(key) {
+            PolicyResult::Route {
+                next_hop,
+                interface,
+            } => {
+                // Policy specifies exact route
+                LookupResult::Route {
+                    next_hop,
+                    interface: interface.unwrap_or_default(),
+                }
+            }
+            PolicyResult::TableLookup { table_id } => {
+                // Use alternate table
+                let table = self.tables.get(&table_id).unwrap_or(&self.main_table);
+                self.table_lookup(table, key.dst_ip)
+            }
+            PolicyResult::Drop => LookupResult::Drop,
+            PolicyResult::UseDefault => {
+                // Fall through to main table
+                self.table_lookup(&self.main_table, key.dst_ip)
+            }
+        }
+    }
+
+    /// Simple lookup using only destination IP (no policy)
+    pub fn lookup(&self, dst_ip: Ipv4Addr) -> LookupResult {
+        self.table_lookup(&self.main_table, dst_ip)
+    }
+
+    /// Lookup in a specific table
+    fn table_lookup(&self, table: &RoutingTable, dst: Ipv4Addr) -> LookupResult {
+        match table.lookup(dst) {
+            Some(route) => LookupResult::Route {
+                next_hop: route.next_hop,
+                interface: route.interface.clone(),
+            },
+            None => LookupResult::NoRoute,
+        }
+    }
+
+    /// Load static routes into main table
+    pub fn load_static_routes(&mut self, config: &RoutingConfig) {
+        self.main_table.load_static_routes(config);
+    }
+
+    /// Add connected routes to main table
+    pub fn add_connected_routes(&mut self, interfaces: &HashMap<String, InterfaceConfig>) {
+        self.main_table.add_connected_routes(interfaces);
+    }
 }
 
 #[cfg(test)]
@@ -404,6 +549,8 @@ mod tests {
                     interface: None,
                 },
             ],
+            policy: Vec::new(),
+            tables: Vec::new(),
         };
 
         table.load_static_routes(&config);

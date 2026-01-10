@@ -9,6 +9,7 @@ mod forwarder;
 mod napt;
 mod ndp_processor;
 mod neighbor_table;
+mod pbr;
 mod router;
 mod routing;
 
@@ -21,5 +22,6 @@ pub use ndp_processor::{
     process_neighbor_advertisement, process_neighbor_solicitation, NdpAction, NdpPendingQueue,
 };
 pub use neighbor_table::{NeighborState, NeighborTable};
+pub use pbr::{PacketKey, PolicyAction, PolicyMatch, PolicyResult, PolicyRouter, PolicyRule};
 pub use router::{Interface, Router};
-pub use routing::{Route, RouteSource, RoutingTable};
+pub use routing::{LookupResult, Route, RouteSource, RoutingSystem, RoutingTable};

@@ -1,6 +1,7 @@
 //! Configuration validation
 
-use super::{Config, InterfaceRole, VlanMode};
+use super::{Config, InterfaceRole, PolicyActionConfig, VlanMode};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct ValidationResult {
@@ -53,6 +54,8 @@ pub fn validate(config: &Config) -> ValidationResult {
     validate_dhcp(config, &mut result);
     validate_nat(config, &mut result);
     validate_routing(config, &mut result);
+    validate_policy(config, &mut result);
+    validate_routing_tables(config, &mut result);
 
     result
 }
@@ -260,6 +263,160 @@ fn validate_routing(config: &Config, result: &mut ValidationResult) {
                 "routing.static[{}]: destination '{}' missing prefix length",
                 i, route.destination
             ));
+        }
+    }
+}
+
+fn validate_policy(config: &Config, result: &mut ValidationResult) {
+    let mut seen_priorities: HashSet<u32> = HashSet::new();
+
+    for (i, rule) in config.routing.policy.iter().enumerate() {
+        let rule_id = rule
+            .name
+            .as_deref()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("policy[{}]", i));
+
+        // Check priority uniqueness (warning, not error)
+        if !seen_priorities.insert(rule.priority) {
+            result.warn(format!(
+                "routing.{}: duplicate priority {} (evaluation order may be undefined)",
+                rule_id, rule.priority
+            ));
+        }
+
+        // Validate match conditions
+        if let Some(ref src) = rule.match_config.src_ip {
+            if !src.contains('/') {
+                result.error(format!(
+                    "routing.{}: src_ip '{}' must be in CIDR notation",
+                    rule_id, src
+                ));
+            }
+        }
+
+        if let Some(ref dst) = rule.match_config.dst_ip {
+            if !dst.contains('/') {
+                result.error(format!(
+                    "routing.{}: dst_ip '{}' must be in CIDR notation",
+                    rule_id, dst
+                ));
+            }
+        }
+
+        // Port ranges require protocol
+        if (rule.match_config.src_port.is_some() || rule.match_config.dst_port.is_some())
+            && rule.match_config.protocol.is_none()
+        {
+            result.error(format!(
+                "routing.{}: port match requires protocol (tcp/udp)",
+                rule_id
+            ));
+        }
+
+        // Protocol must be tcp/udp for port matching
+        if let Some(ref proto) = rule.match_config.protocol {
+            let proto_lower = proto.to_lowercase();
+            let has_port_match =
+                rule.match_config.src_port.is_some() || rule.match_config.dst_port.is_some();
+            let is_tcp_or_udp = proto_lower == "tcp"
+                || proto_lower == "udp"
+                || proto_lower == "6"
+                || proto_lower == "17";
+
+            if has_port_match && !is_tcp_or_udp {
+                result.error(format!(
+                    "routing.{}: port match only valid for tcp/udp",
+                    rule_id
+                ));
+            }
+        }
+
+        // Validate action
+        match &rule.action {
+            PolicyActionConfig::RouteVia {
+                next_hop,
+                interface,
+            } => {
+                // Validate next_hop is valid IP
+                if next_hop.parse::<std::net::Ipv4Addr>().is_err() {
+                    result.error(format!(
+                        "routing.{}: invalid next_hop '{}'",
+                        rule_id, next_hop
+                    ));
+                }
+                // Validate interface exists if specified
+                if let Some(ref iface) = interface {
+                    if !config.interfaces.contains_key(iface) {
+                        result.error(format!(
+                            "routing.{}: interface '{}' not defined",
+                            rule_id, iface
+                        ));
+                    }
+                }
+            }
+            PolicyActionConfig::RouteInterface { interface } => {
+                if !config.interfaces.contains_key(interface) {
+                    result.error(format!(
+                        "routing.{}: interface '{}' not defined",
+                        rule_id, interface
+                    ));
+                }
+            }
+            PolicyActionConfig::UseTable { table_id } => {
+                // Validate table exists
+                if !config.routing.tables.iter().any(|t| t.id == *table_id) {
+                    result.error(format!(
+                        "routing.{}: table {} not defined",
+                        rule_id, table_id
+                    ));
+                }
+            }
+            PolicyActionConfig::Drop | PolicyActionConfig::UseDefault => {}
+        }
+
+        // Validate ingress interface
+        if let Some(ref iface) = rule.match_config.ingress_interface {
+            if !config.interfaces.contains_key(iface) {
+                result.error(format!(
+                    "routing.{}: ingress_interface '{}' not defined",
+                    rule_id, iface
+                ));
+            }
+        }
+    }
+}
+
+fn validate_routing_tables(config: &Config, result: &mut ValidationResult) {
+    let mut seen_ids: HashSet<u32> = HashSet::new();
+
+    for table in &config.routing.tables {
+        if !seen_ids.insert(table.id) {
+            result.error(format!("routing.tables: duplicate table_id {}", table.id));
+        }
+
+        // Table 0 is reserved for main
+        if table.id == 0 {
+            result.error("routing.tables: table_id 0 is reserved for main table".to_string());
+        }
+
+        // Validate routes within table
+        for (i, route) in table.routes.iter().enumerate() {
+            if !route.destination.contains('/') {
+                result.warn(format!(
+                    "routing.tables[{}].routes[{}]: destination '{}' missing prefix",
+                    table.id, i, route.destination
+                ));
+            }
+
+            if let Some(ref iface) = route.interface {
+                if !config.interfaces.contains_key(iface) {
+                    result.error(format!(
+                        "routing.tables[{}].routes[{}]: interface '{}' not defined",
+                        table.id, i, iface
+                    ));
+                }
+            }
         }
     }
 }
