@@ -14,6 +14,8 @@ pub struct Config {
     #[serde(default)]
     pub dhcp: HashMap<String, DhcpConfig>,
     #[serde(default)]
+    pub pppoe: HashMap<String, PppoeConfig>,
+    #[serde(default)]
     pub nat: Option<NatConfig>,
     #[serde(default)]
     pub firewall: Option<FirewallConfig>,
@@ -107,6 +109,17 @@ pub struct DhcpConfig {
     #[serde(default)]
     pub dns: Vec<Ipv4Addr>,
     pub lease_time: Option<u32>,
+}
+
+/// PPPoE client configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct PppoeConfig {
+    /// PPPoE username
+    pub username: String,
+    /// PPPoE password
+    pub password: String,
+    /// Service name (optional, empty means any)
+    pub service_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -290,6 +303,8 @@ pub struct ConfigLock {
     pub logging: LoggingLock,
     pub interfaces: HashMap<String, InterfaceLock>,
     pub dhcp: HashMap<String, DhcpLock>,
+    #[serde(default)]
+    pub pppoe: HashMap<String, PppoeLock>,
     pub nat: Option<NatLock>,
     pub firewall: Option<FirewallLock>,
     pub routing: RoutingLock,
@@ -342,6 +357,14 @@ pub struct DhcpLock {
     pub dns: Vec<Ipv4Addr>,
     pub lease_time: u32,
     pub domain: String,
+}
+
+/// PPPoE client configuration in lock file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PppoeLock {
+    pub username: String,
+    pub password: String,
+    pub service_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -527,6 +550,21 @@ impl ConfigLock {
             })
             .collect();
 
+        let pppoe = config
+            .pppoe
+            .iter()
+            .map(|(name, pppoe_cfg)| {
+                (
+                    name.clone(),
+                    PppoeLock {
+                        username: pppoe_cfg.username.clone(),
+                        password: pppoe_cfg.password.clone(),
+                        service_name: pppoe_cfg.service_name.clone(),
+                    },
+                )
+            })
+            .collect();
+
         let nat = config.nat.as_ref().map(|n| NatLock {
             enabled: n.enabled,
             wan: n.wan.clone(),
@@ -688,6 +726,7 @@ impl ConfigLock {
             logging,
             interfaces,
             dhcp,
+            pppoe,
             nat,
             firewall,
             routing: RoutingLock {
@@ -798,6 +837,7 @@ mod tests {
             logging: None,
             interfaces,
             dhcp: HashMap::new(),
+            pppoe: HashMap::new(),
             nat: None,
             firewall: None,
             routing: RoutingConfig::default(),
@@ -851,6 +891,7 @@ mod tests {
             logging: None,
             interfaces,
             dhcp: HashMap::new(),
+            pppoe: HashMap::new(),
             nat: None,
             firewall: None,
             routing: RoutingConfig::default(),
@@ -892,6 +933,7 @@ mod tests {
             logging: None,
             interfaces,
             dhcp: HashMap::new(),
+            pppoe: HashMap::new(),
             nat: None,
             firewall: None,
             routing: RoutingConfig::default(),

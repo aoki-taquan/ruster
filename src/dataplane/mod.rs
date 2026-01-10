@@ -17,6 +17,7 @@ mod napt;
 mod ndp_processor;
 mod neighbor_table;
 mod pbr;
+mod pppoe_client;
 mod router;
 mod routing;
 
@@ -40,6 +41,7 @@ pub use ndp_processor::{
 };
 pub use neighbor_table::{NeighborState, NeighborTable};
 pub use pbr::{PacketKey, PolicyAction, PolicyMatch, PolicyResult, PolicyRouter, PolicyRule};
+pub use pppoe_client::{PppoeClient, PppoeClientAction, PppoeClientState, PppoeSession, PPPOE_MTU};
 pub use router::{Interface, Router};
 pub use routing::{network_address, LookupResult, Route, RouteSource, RoutingSystem, RoutingTable};
 

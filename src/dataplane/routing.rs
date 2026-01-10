@@ -106,6 +106,11 @@ impl RoutingTable {
         self.routes.retain(|r| r.source != source);
     }
 
+    /// Remove all routes using a specific interface
+    pub fn remove_by_interface(&mut self, interface: &str) {
+        self.routes.retain(|r| r.interface != interface);
+    }
+
     /// Load static routes from config
     pub fn load_static_routes(&mut self, config: &RoutingConfig) {
         for static_route in &config.static_routes {

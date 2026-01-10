@@ -486,6 +486,7 @@ mod tests {
             logging: None,
             interfaces: HashMap::new(),
             dhcp: HashMap::new(),
+            pppoe: HashMap::new(),
             nat: None,
             firewall: None,
             routing: RoutingConfig::default(),
