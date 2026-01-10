@@ -4,7 +4,9 @@
 
 mod arp_processor;
 mod arp_table;
+mod conntrack;
 mod fdb;
+mod firewall;
 mod forwarder;
 mod napt;
 mod ndp_processor;
@@ -23,3 +25,7 @@ pub use ndp_processor::{
 pub use neighbor_table::{NeighborState, NeighborTable};
 pub use router::{Interface, Router};
 pub use routing::{Route, RouteSource, RoutingTable};
+
+// SPI (Stateful Packet Inspection)
+pub use conntrack::{ConnEntry, ConnKey, ConnProtocol, ConnState, ConnTrackTable};
+pub use firewall::{FirewallVerdict, StatefulFirewall};
