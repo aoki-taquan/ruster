@@ -6,15 +6,17 @@
 use crate::capture::AfPacketSocket;
 use crate::dataplane::{
     network_address, process_arp, Action, ArpAction, ArpPendingQueue, ArpTable, Chain, Dhcp6Client,
-    Dhcp6ClientAction, DhcpAction, DhcpClient, DhcpClientAction, DhcpPoolConfig, DhcpServer, Fdb,
-    FilterContext, FilterIpAddr, ForwardAction, Forwarder, InterfaceInfo, NaptProcessor,
-    NaptResult, PacketFilter, RaClient, RaClientAction, RaServer, RaServerAction, RaServerConfig,
-    Route, RouteSource, RoutingSystem, StatefulFirewall,
+    Dhcp6ClientAction, DhcpAction, DhcpClient, DhcpClientAction, DhcpPoolConfig, DhcpServer,
+    DnsAction, DnsForwarder, DnsForwarderConfig, Fdb, FilterContext, FilterIpAddr, ForwardAction,
+    Forwarder, InterfaceInfo, NaptProcessor, NaptResult, PacketFilter, PppoeClient,
+    PppoeClientAction, RaClient, RaClientAction, RaServer, RaServerAction, RaServerConfig, Route,
+    RouteSource, RoutingSystem, StatefulFirewall,
 };
 use crate::protocol::arp::ArpPacket;
 use crate::protocol::ethernet::{Frame, FrameBuilder};
 use crate::protocol::icmp::{build_echo_reply, IcmpType};
 use crate::protocol::ipv4::Ipv4Header;
+use crate::protocol::pppoe::PppoeFrame;
 use crate::protocol::types::EtherType;
 use crate::protocol::MacAddr;
 use crate::telemetry::MetricsRegistry;
@@ -95,6 +97,10 @@ pub struct Router {
     dhcp6_client: Option<Dhcp6Client>,
     /// DHCP clients for interfaces with addressing=dhcp
     dhcp_clients: HashMap<String, DhcpClient>,
+    /// DNS forwarder (optional)
+    dns_forwarder: Option<DnsForwarder>,
+    /// PPPoE clients for interfaces with addressing=pppoe
+    pppoe_clients: HashMap<String, PppoeClient>,
     /// RA client for WAN interfaces (optional)
     ra_client: Option<RaClient>,
     /// RA server for LAN interfaces (optional)
@@ -126,6 +132,8 @@ impl Router {
             dhcp_server: None,
             dhcp6_client: None,
             dhcp_clients: HashMap::new(),
+            dns_forwarder: None,
+            pppoe_clients: HashMap::new(),
             ra_client: None,
             ra_server: None,
             metrics,
@@ -672,6 +680,190 @@ impl Router {
         self.forwarder.remove_interface(interface);
     }
 
+    // ===== DNS Forwarder Methods =====
+
+    /// Enable DNS forwarder
+    ///
+    /// # Arguments
+    /// * `config` - DNS forwarder configuration
+    pub fn enable_dns_forwarder(&mut self, config: DnsForwarderConfig) {
+        debug!(
+            "Enabling DNS forwarder with {} upstream servers",
+            config.upstream_servers.len()
+        );
+        self.dns_forwarder = Some(DnsForwarder::new(config));
+    }
+
+    /// Check if DNS forwarder is enabled
+    pub fn is_dns_forwarder_enabled(&self) -> bool {
+        self.dns_forwarder.is_some()
+    }
+
+    // ===== PPPoE Client Methods =====
+
+    /// Enable PPPoE client on an interface
+    pub fn enable_pppoe_client(
+        &mut self,
+        interface: &str,
+        username: String,
+        password: String,
+        service_name: Option<String>,
+    ) -> Vec<(String, Vec<u8>)> {
+        let mac_addr = match self.interfaces.get(interface) {
+            Some(iface) => iface.mac_addr,
+            None => {
+                warn!("PPPoE client: interface {} not found", interface);
+                return vec![];
+            }
+        };
+
+        debug!("Enabling PPPoE client on {}", interface);
+        let mut client = PppoeClient::new(
+            interface.to_string(),
+            mac_addr,
+            username,
+            password,
+            service_name,
+        );
+        let action = client.start();
+        self.pppoe_clients.insert(interface.to_string(), client);
+
+        self.execute_pppoe_client_action(action)
+    }
+
+    /// Disable PPPoE client on an interface
+    pub fn disable_pppoe_client(&mut self, interface: &str) -> Vec<(String, Vec<u8>)> {
+        if let Some(mut client) = self.pppoe_clients.remove(interface) {
+            let action = client.terminate();
+            return self.execute_pppoe_client_action(action);
+        }
+        vec![]
+    }
+
+    /// Check if PPPoE client is enabled for an interface
+    pub fn is_pppoe_client_enabled(&self, interface: &str) -> bool {
+        self.pppoe_clients.contains_key(interface)
+    }
+
+    /// Execute a PPPoE client action
+    fn execute_pppoe_client_action(&mut self, action: PppoeClientAction) -> Vec<(String, Vec<u8>)> {
+        match action {
+            PppoeClientAction::SendDiscovery { interface, packet } => {
+                vec![(interface, packet)]
+            }
+            PppoeClientAction::SendSession { interface, packet } => {
+                vec![(interface, packet)]
+            }
+            PppoeClientAction::ConfigureInterface {
+                interface,
+                ip_addr,
+                peer_ip,
+                dns_servers: _,
+            } => {
+                self.configure_pppoe_interface(&interface, ip_addr, peer_ip);
+                vec![]
+            }
+            PppoeClientAction::DeconfigureInterface { interface } => {
+                self.deconfigure_pppoe_interface(&interface);
+                vec![]
+            }
+            PppoeClientAction::SessionTerminated { interface, reason } => {
+                debug!("PPPoE session terminated on {}: {}", interface, reason);
+                vec![]
+            }
+            PppoeClientAction::None => vec![],
+        }
+    }
+
+    /// Configure interface with PPPoE-obtained IP
+    fn configure_pppoe_interface(&mut self, interface: &str, ip_addr: Ipv4Addr, peer_ip: Ipv4Addr) {
+        // Update interface IP
+        if let Some(iface) = self.interfaces.get_mut(interface) {
+            iface.ip_addr = Some(ip_addr);
+            // Point-to-point link, /32 prefix
+            iface.prefix_len = Some(32);
+
+            // Update forwarder
+            self.forwarder.add_interface(
+                interface.to_string(),
+                InterfaceInfo {
+                    ip_addr,
+                    mac_addr: iface.mac_addr,
+                    prefix_len: 32,
+                },
+            );
+        }
+
+        // Add host route to peer
+        self.routing_system.main_table_mut().add(Route {
+            destination: peer_ip,
+            prefix_len: 32,
+            next_hop: None,
+            interface: interface.to_string(),
+            metric: 0,
+            source: RouteSource::Connected,
+        });
+
+        // Add default route via PPPoE peer
+        self.routing_system.main_table_mut().add(Route {
+            destination: Ipv4Addr::UNSPECIFIED,
+            prefix_len: 0,
+            next_hop: Some(peer_ip),
+            interface: interface.to_string(),
+            metric: 10,
+            source: RouteSource::Connected,
+        });
+
+        debug!(
+            "PPPoE interface {} configured: IP={}, peer={}",
+            interface, ip_addr, peer_ip
+        );
+    }
+
+    /// Remove PPPoE configuration from interface
+    fn deconfigure_pppoe_interface(&mut self, interface: &str) {
+        // Remove routes learned via this interface
+        self.routing_system
+            .main_table_mut()
+            .remove_by_interface(interface);
+
+        // Clear interface IP
+        if let Some(iface) = self.interfaces.get_mut(interface) {
+            iface.ip_addr = None;
+            iface.prefix_len = None;
+        }
+
+        // Remove from forwarder
+        self.forwarder.remove_interface(interface);
+    }
+
+    /// Handle PPPoE Discovery packet (EtherType 0x8863)
+    pub fn handle_pppoe_discovery(
+        &mut self,
+        ingress_iface: &str,
+        src_mac: MacAddr,
+        payload: &[u8],
+    ) -> Option<Vec<(String, Vec<u8>)>> {
+        let pppoe = PppoeFrame::parse(payload).ok()?;
+        let client = self.pppoe_clients.get_mut(ingress_iface)?;
+
+        let action = client.process_discovery(src_mac, &pppoe);
+        Some(self.execute_pppoe_client_action(action))
+    }
+
+    /// Handle PPPoE Session packet (EtherType 0x8864)
+    pub fn handle_pppoe_session(
+        &mut self,
+        ingress_iface: &str,
+        payload: &[u8],
+    ) -> Option<Vec<(String, Vec<u8>)>> {
+        let pppoe = PppoeFrame::parse(payload).ok()?;
+        let client = self.pppoe_clients.get_mut(ingress_iface)?;
+
+        let action = client.process_session(&pppoe);
+        Some(self.execute_pppoe_client_action(action))
+    }
+
     /// Add an interface to the router
     pub fn add_interface(
         &mut self,
@@ -1186,6 +1378,8 @@ impl Router {
             17 => {
                 // UDP
                 use crate::protocol::dhcp::DHCP_CLIENT_PORT;
+                use crate::protocol::dns::DNS_PORT;
+
                 let udp = UdpHeader::parse(ip_payload).ok()?;
 
                 match udp.dst_port() {
@@ -1196,6 +1390,15 @@ impl Router {
                     p if p == DHCP_CLIENT_PORT => {
                         // DHCP response (to client)
                         self.handle_dhcp_client_response(ingress_iface, udp.payload())
+                    }
+                    p if p == DNS_PORT => {
+                        // DNS query
+                        self.handle_dns_query(
+                            ingress_iface,
+                            ip_header.src_addr(),
+                            udp.src_port(),
+                            udp.payload(),
+                        )
                     }
                     _ => None,
                 }
@@ -1275,6 +1478,174 @@ impl Router {
             None
         } else {
             Some(packets)
+        }
+    }
+
+    /// Handle DNS query
+    fn handle_dns_query(
+        &mut self,
+        ingress_iface: &str,
+        client_ip: Ipv4Addr,
+        client_port: u16,
+        dns_payload: &[u8],
+    ) -> Option<Vec<(String, Vec<u8>)>> {
+        use crate::protocol::dns::DNS_PORT;
+        use crate::protocol::ipv4::Ipv4Builder;
+        use crate::protocol::udp::UdpBuilder;
+
+        let dns_forwarder = self.dns_forwarder.as_mut()?;
+        let action =
+            dns_forwarder.process_query(ingress_iface, client_ip, client_port, dns_payload);
+
+        match action {
+            DnsAction::Reply {
+                interface,
+                packet,
+                dst_ip,
+                dst_port,
+            } => {
+                let iface = self.interfaces.get(&interface)?;
+                let src_ip = iface.ip_addr?;
+
+                // Build UDP packet
+                let udp_packet = UdpBuilder::new()
+                    .src_port(DNS_PORT)
+                    .dst_port(dst_port)
+                    .payload(&packet)
+                    .build(src_ip, dst_ip);
+
+                // Build IPv4 packet
+                let ip_packet = Ipv4Builder::new()
+                    .src_addr(src_ip)
+                    .dst_addr(dst_ip)
+                    .ttl(64)
+                    .protocol(17) // UDP
+                    .payload(&udp_packet)
+                    .build();
+
+                // Lookup MAC for reply
+                if let Some((dst_mac, _)) = self.arp_table.lookup(&dst_ip) {
+                    let frame = FrameBuilder::new()
+                        .src_mac(iface.mac_addr)
+                        .dst_mac(dst_mac)
+                        .ethertype(EtherType::Ipv4 as u16)
+                        .payload(&ip_packet)
+                        .build();
+
+                    debug!("Sending DNS reply to {}:{}", dst_ip, dst_port);
+                    Some(vec![(interface, frame)])
+                } else {
+                    // Need ARP resolution - queue the packet
+                    debug!("DNS reply needs ARP resolution for {}", dst_ip);
+                    None
+                }
+            }
+            DnsAction::Forward {
+                upstream,
+                packet,
+                original_id: _,
+            } => {
+                // Forward query to upstream DNS server
+                // This requires sending a packet to the upstream DNS server
+                // For now, we need to build the packet and send it via WAN interface
+                let wan_iface = self.wan_interface.as_ref()?;
+                let iface = self.interfaces.get(wan_iface)?;
+                let src_ip = iface.ip_addr?;
+
+                // Build UDP packet for upstream
+                let udp_packet = UdpBuilder::new()
+                    .src_port(DNS_PORT) // Use DNS port as source
+                    .dst_port(DNS_PORT)
+                    .payload(&packet)
+                    .build(src_ip, upstream);
+
+                // Build IPv4 packet
+                let ip_packet = Ipv4Builder::new()
+                    .src_addr(src_ip)
+                    .dst_addr(upstream)
+                    .ttl(64)
+                    .protocol(17) // UDP
+                    .payload(&udp_packet)
+                    .build();
+
+                // Lookup MAC for upstream (via default gateway if needed)
+                // For now, use ARP table directly
+                if let Some((dst_mac, _)) = self.arp_table.lookup(&upstream) {
+                    let frame = FrameBuilder::new()
+                        .src_mac(iface.mac_addr)
+                        .dst_mac(dst_mac)
+                        .ethertype(EtherType::Ipv4 as u16)
+                        .payload(&ip_packet)
+                        .build();
+
+                    debug!("Forwarding DNS query to upstream {}", upstream);
+                    Some(vec![(wan_iface.clone(), frame)])
+                } else {
+                    // Need routing/ARP for upstream - use normal forwarding path
+                    debug!("DNS forward needs ARP resolution for upstream {}", upstream);
+                    None
+                }
+            }
+            DnsAction::None => None,
+        }
+    }
+
+    /// Handle DNS response from upstream
+    pub fn handle_dns_response(
+        &mut self,
+        upstream_ip: Ipv4Addr,
+        dns_payload: &[u8],
+    ) -> Option<Vec<(String, Vec<u8>)>> {
+        use crate::protocol::dns::DNS_PORT;
+        use crate::protocol::ipv4::Ipv4Builder;
+        use crate::protocol::udp::UdpBuilder;
+
+        let dns_forwarder = self.dns_forwarder.as_mut()?;
+        let action = dns_forwarder.process_response(upstream_ip, dns_payload);
+
+        match action {
+            DnsAction::Reply {
+                interface,
+                packet,
+                dst_ip,
+                dst_port,
+            } => {
+                let iface = self.interfaces.get(&interface)?;
+                let src_ip = iface.ip_addr?;
+
+                // Build UDP packet
+                let udp_packet = UdpBuilder::new()
+                    .src_port(DNS_PORT)
+                    .dst_port(dst_port)
+                    .payload(&packet)
+                    .build(src_ip, dst_ip);
+
+                // Build IPv4 packet
+                let ip_packet = Ipv4Builder::new()
+                    .src_addr(src_ip)
+                    .dst_addr(dst_ip)
+                    .ttl(64)
+                    .protocol(17) // UDP
+                    .payload(&udp_packet)
+                    .build();
+
+                // Lookup MAC for reply
+                if let Some((dst_mac, _)) = self.arp_table.lookup(&dst_ip) {
+                    let frame = FrameBuilder::new()
+                        .src_mac(iface.mac_addr)
+                        .dst_mac(dst_mac)
+                        .ethertype(EtherType::Ipv4 as u16)
+                        .payload(&ip_packet)
+                        .build();
+
+                    debug!("Sending DNS response to {}:{}", dst_ip, dst_port);
+                    Some(vec![(interface, frame)])
+                } else {
+                    debug!("DNS response needs ARP resolution for {}", dst_ip);
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
@@ -1398,6 +1769,15 @@ impl Router {
             if let Some(client) = self.dhcp_clients.get_mut(&iface_name) {
                 let action = client.tick();
                 to_send.extend(self.execute_dhcp_client_action(action));
+            }
+        }
+
+        // Tick PPPoE clients and collect packets to send
+        let pppoe_interfaces: Vec<String> = self.pppoe_clients.keys().cloned().collect();
+        for iface_name in pppoe_interfaces {
+            if let Some(client) = self.pppoe_clients.get_mut(&iface_name) {
+                let action = client.tick();
+                to_send.extend(self.execute_pppoe_client_action(action));
             }
         }
 

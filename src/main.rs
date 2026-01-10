@@ -114,15 +114,20 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
         let metrics = Arc::new(MetricsRegistry::new());
         let mut router = Router::new(metrics.clone());
 
-        // Track interfaces that need DHCP client
+        // Track interfaces that need DHCP or PPPoE client
         let mut dhcp_client_interfaces: Vec<String> = Vec::new();
+        let mut pppoe_client_interfaces: Vec<String> = Vec::new();
 
         // Configure interfaces from lock file
         for (name, iface_lock) in &lock.interfaces {
-            // Parse address if present (skip for DHCP addressing)
+            // Parse address if present (skip for DHCP/PPPoE addressing)
             let (ip_addr, prefix_len) = if iface_lock.addressing == "dhcp" {
                 // DHCP interface: no static IP
                 dhcp_client_interfaces.push(name.clone());
+                (None, None)
+            } else if iface_lock.addressing == "pppoe" {
+                // PPPoE interface: no static IP
+                pppoe_client_interfaces.push(name.clone());
                 (None, None)
             } else if let Some(ref addr) = iface_lock.address {
                 parse_cidr(addr)?
@@ -234,6 +239,54 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
                         warn!("Failed to send DHCP DISCOVER on {}: {}", out_iface, e);
                     }
                 }
+            }
+        }
+
+        // Enable DNS forwarder if configured
+        if let Some(ref dns_lock) = lock.dns_forwarder {
+            if dns_lock.enabled {
+                use ruster::dataplane::DnsForwarderConfig;
+
+                let config = DnsForwarderConfig {
+                    upstream_servers: dns_lock.upstream.clone(),
+                    cache_size: dns_lock.cache_size,
+                    query_timeout_secs: dns_lock.query_timeout,
+                    negative_cache_ttl: 60,
+                };
+
+                router.enable_dns_forwarder(config);
+                info!(
+                    "DNS forwarder enabled with {} upstream servers, cache_size={}",
+                    dns_lock.upstream.len(),
+                    dns_lock.cache_size
+                );
+            }
+        }
+
+        // Enable PPPoE clients for interfaces with addressing=pppoe
+        for iface_name in &pppoe_client_interfaces {
+            // Get PPPoE config from lock file
+            if let Some(pppoe_config) = lock.pppoe.get(iface_name) {
+                info!("Starting PPPoE client on {}...", iface_name);
+                let packets = router.enable_pppoe_client(
+                    iface_name,
+                    pppoe_config.username.clone(),
+                    pppoe_config.password.clone(),
+                    pppoe_config.service_name.clone(),
+                );
+                // Send initial PADI packets
+                for (out_iface, frame) in packets {
+                    if let Some(iface) = router.get_interface_mut(&out_iface) {
+                        if let Err(e) = iface.socket.send(&frame).await {
+                            warn!("Failed to send PPPoE PADI on {}: {}", out_iface, e);
+                        }
+                    }
+                }
+            } else {
+                warn!(
+                    "Interface {} has addressing=pppoe but no [pppoe.{}] section in config",
+                    iface_name, iface_name
+                );
             }
         }
 

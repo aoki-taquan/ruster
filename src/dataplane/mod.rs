@@ -8,6 +8,7 @@ mod conntrack;
 mod dhcp6_client;
 mod dhcp_client;
 mod dhcp_server;
+mod dns_forwarder;
 mod fdb;
 mod filter;
 mod firewall;
@@ -16,6 +17,7 @@ mod napt;
 mod ndp_processor;
 mod neighbor_table;
 mod pbr;
+mod pppoe_client;
 mod ra_client;
 mod ra_server;
 mod router;
@@ -28,6 +30,7 @@ pub use dhcp6_client::{
 };
 pub use dhcp_client::{DhcpClient, DhcpClientAction, DhcpClientState, DhcpLease};
 pub use dhcp_server::{DhcpAction, DhcpPool, DhcpPoolConfig, DhcpServer, LeaseEntry, LeaseState};
+pub use dns_forwarder::{DnsAction, DnsForwarder, DnsForwarderConfig, PendingQuery};
 pub use fdb::Fdb;
 pub use filter::{
     icmpv6_type, protocol, Action, Chain, FilterContext, FilterRule, IpAddr as FilterIpAddr,
@@ -40,6 +43,7 @@ pub use ndp_processor::{
 };
 pub use neighbor_table::{NeighborState, NeighborTable};
 pub use pbr::{PacketKey, PolicyAction, PolicyMatch, PolicyResult, PolicyRouter, PolicyRule};
+pub use pppoe_client::{PppoeClient, PppoeClientAction, PppoeClientState, PppoeSession, PPPOE_MTU};
 pub use ra_client::{
     LearnedPrefix, LearnedRouter, RaClient, RaClientAction, RaClientInterface, RaClientState,
 };
