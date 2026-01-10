@@ -16,7 +16,7 @@ cargo fmt
 cargo clippy
 
 # E2Eテスト（Docker/Containerlab必要）
-cargo test --test e2e --features e2e -- --test-threads=1
+cargo test --test e2e --features e2e
 ```
 
 ## プロジェクト構造
@@ -79,7 +79,7 @@ cd ~/ruster-1 && claude
 - **ユニットテスト**: プロトコルパース、ルーティングテーブル等
 - **E2Eテスト**: Containerlabを使用。Dockerが必要。`tests/e2e/`以下に配置
 
-E2Eテストはシングルスレッド実行が必要（`--test-threads=1`）
+E2Eテストは動的トポロジー名により並列実行可能
 
 ## 注意事項
 

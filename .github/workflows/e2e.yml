@@ -36,7 +36,7 @@ jobs:
 
       - name: Run E2E tests
         run: |
-          cargo test --test e2e --features e2e -- --test-threads=1 2>&1 || echo "E2E tests failed (expected until main loop is implemented)"
+          cargo test --test e2e --features e2e 2>&1 || echo "E2E tests failed (expected until main loop is implemented)"
 
       - name: Show test results
         if: always()

@@ -1,11 +1,10 @@
 //! E2E tests using containerlab
 //!
-//! Run with: cargo test --test e2e --features e2e -- --test-threads=1
+//! Run with: cargo test --test e2e --features e2e
 //!
 //! Prerequisites:
-//! - containerlab installed
-//! - sudo access
-//! - docker running
+//! - containerlab installed (requires sudo)
+//! - docker running (user should be in docker group)
 //!
 //! Topology:
 //! ```text

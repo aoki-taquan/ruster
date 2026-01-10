@@ -10,7 +10,12 @@ pub struct Topology {
 }
 
 impl Topology {
-    /// Deploy a containerlab topology
+    /// Generate a unique suffix for the topology name (PID-based)
+    fn generate_unique_suffix() -> String {
+        format!("{}", std::process::id())
+    }
+
+    /// Deploy a containerlab topology with a unique name
     pub fn deploy(topology_file: impl AsRef<Path>) -> Result<Self, String> {
         let topology_file = topology_file.as_ref();
         let topology_path = topology_file
@@ -22,20 +27,26 @@ impl Topology {
         let content =
             std::fs::read_to_string(topology_file).map_err(|e| format!("Read error: {}", e))?;
 
-        let name = content
+        let base_name = content
             .lines()
             .find(|l| l.starts_with("name:"))
             .and_then(|l| l.split(':').nth(1))
             .map(|s| s.trim().to_string())
             .ok_or("Could not find topology name")?;
 
-        // Deploy topology
+        // Generate unique topology name with PID suffix
+        let suffix = Self::generate_unique_suffix();
+        let name = format!("{}-{}", base_name, suffix);
+
+        // Deploy topology with unique name
         let output = Command::new("sudo")
             .args([
                 "containerlab",
                 "deploy",
                 "-t",
                 &topology_path,
+                "--name",
+                &name,
                 "--reconfigure",
             ])
             .output()
@@ -57,8 +68,9 @@ impl Topology {
     /// Execute a command in a container
     pub fn exec(&self, node: &str, cmd: &str) -> Output {
         let container_name = format!("clab-{}-{}", self.name, node);
-        Command::new("sudo")
-            .args(["docker", "exec", &container_name, "sh", "-c", cmd])
+        // No sudo needed for docker commands when user is in docker group
+        Command::new("docker")
+            .args(["exec", &container_name, "sh", "-c", cmd])
             .output()
             .expect("Failed to execute docker command")
     }
@@ -78,6 +90,8 @@ impl Topology {
                 "destroy",
                 "-t",
                 &self.topology_file,
+                "--name",
+                &self.name,
                 "--cleanup",
             ])
             .output();
