@@ -14,8 +14,6 @@ jobs:
   e2e:
     name: Containerlab E2E
     runs-on: ubuntu-latest
-    # E2E tests are currently expected to fail until ruster main loop is implemented
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -31,15 +29,7 @@ jobs:
           bash -c "$(curl -sL https://get.containerlab.dev)"
 
       - name: Pull container images
-        run: |
-          docker pull debian:bookworm-slim
+        run: docker pull alpine:3.19
 
       - name: Run E2E tests
-        run: |
-          cargo test --test e2e --features e2e 2>&1 || echo "E2E tests failed (expected until main loop is implemented)"
-
-      - name: Show test results
-        if: always()
-        run: |
-          echo "Note: E2E tests require ruster main loop to be implemented."
-          echo "Current status: Infrastructure ready, waiting for packet processing loop."
+        run: cargo test --test e2e --features e2e
