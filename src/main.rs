@@ -93,7 +93,7 @@ fn main() {
 
 fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
     use ruster::capture::AfPacketSocket;
-    use ruster::dataplane::Router;
+    use ruster::dataplane::{Action, PacketFilter, Router};
     use ruster::protocol::MacAddr;
     use tokio::runtime::Runtime;
     use tracing::{debug, error, warn};
@@ -156,6 +156,36 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
                     "Added route: {} via {} ({})",
                     route_lock.destination, route_lock.gateway, route_lock.source
                 );
+            }
+        }
+
+        // Configure packet filter if enabled
+        if let Some(ref filter_lock) = lock.filtering {
+            if filter_lock.enabled {
+                let default_action = match filter_lock.default_action.as_str() {
+                    "drop" => Action::Drop,
+                    "reject" => Action::Reject,
+                    _ => Action::Accept,
+                };
+
+                let mut filter = PacketFilter::new(default_action);
+
+                for rule_lock in &filter_lock.rules {
+                    if let Some(rule) = parse_filter_rule(rule_lock) {
+                        filter.add_rule(rule);
+                        debug!(
+                            "Added filter rule: chain={}, action={:?}, priority={}",
+                            rule_lock.chain, rule_lock.action, rule_lock.priority
+                        );
+                    }
+                }
+
+                info!(
+                    "Packet filter enabled with {} rules (default: {})",
+                    filter.rule_count(),
+                    filter_lock.default_action
+                );
+                router.set_filter(filter);
             }
         }
 
@@ -277,6 +307,67 @@ fn parse_route(route_lock: &config::StaticRouteLock) -> Option<ruster::dataplane
         metric: 0,
         source,
     })
+}
+
+fn parse_filter_rule(rule_lock: &config::FilterRuleLock) -> Option<ruster::dataplane::FilterRule> {
+    use ruster::dataplane::{protocol, Action, Chain, FilterRule, IpCidr, PortRange};
+
+    // Parse chain
+    let chain = match rule_lock.chain.as_str() {
+        "input" => Chain::Input,
+        "output" => Chain::Output,
+        "forward" => Chain::Forward,
+        _ => return None,
+    };
+
+    // Parse action
+    let action = match rule_lock.action.as_str() {
+        "accept" => Action::Accept,
+        "drop" => Action::Drop,
+        "reject" => Action::Reject,
+        _ => return None,
+    };
+
+    // Create base rule
+    let mut rule = FilterRule::new(chain, action);
+    rule.priority = rule_lock.priority;
+
+    // Parse protocol
+    if let Some(ref proto) = rule_lock.protocol {
+        rule.protocol = Some(match proto.as_str() {
+            "icmp" => protocol::ICMP,
+            "icmpv6" => protocol::ICMPV6,
+            "tcp" => protocol::TCP,
+            "udp" => protocol::UDP,
+            _ => proto.parse().ok()?,
+        });
+    }
+
+    // Parse source IP
+    if let Some(ref src) = rule_lock.src_ip {
+        rule.src_ip = IpCidr::parse(src);
+    }
+
+    // Parse destination IP
+    if let Some(ref dst) = rule_lock.dst_ip {
+        rule.dst_ip = IpCidr::parse(dst);
+    }
+
+    // Parse source port
+    if let Some(ref port) = rule_lock.src_port {
+        rule.src_port = PortRange::parse(port);
+    }
+
+    // Parse destination port
+    if let Some(ref port) = rule_lock.dst_port {
+        rule.dst_port = PortRange::parse(port);
+    }
+
+    // Set interfaces
+    rule.in_interface = rule_lock.in_interface.clone();
+    rule.out_interface = rule_lock.out_interface.clone();
+
+    Some(rule)
 }
 
 fn cmd_config_generate(config_path: &PathBuf, output_path: &PathBuf) -> Result<(), String> {

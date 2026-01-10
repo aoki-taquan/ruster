@@ -438,6 +438,7 @@ mod tests {
             dhcp: HashMap::new(),
             nat: None,
             routing: RoutingConfig::default(),
+            filtering: None,
         }
     }
 

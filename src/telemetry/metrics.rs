@@ -108,6 +108,14 @@ pub struct MetricsRegistry {
     /// Number of ICMP echo replies sent.
     pub icmp_echo_replies: Counter,
 
+    // Filtering metrics
+    /// Number of packets accepted by filter.
+    pub filter_accepted: Counter,
+    /// Number of packets dropped by filter.
+    pub filter_dropped: Counter,
+    /// Number of packets rejected by filter.
+    pub filter_rejected: Counter,
+
     // Table size gauges (using AtomicU64 for gauges)
     /// Current number of ARP table entries.
     pub arp_table_size: AtomicU64,
@@ -184,6 +192,9 @@ impl MetricsRegistry {
             ("packets_forwarded".into(), self.packets_forwarded.get()),
             ("packets_dropped".into(), self.packets_dropped.get()),
             ("icmp_echo_replies".into(), self.icmp_echo_replies.get()),
+            ("filter_accepted".into(), self.filter_accepted.get()),
+            ("filter_dropped".into(), self.filter_dropped.get()),
+            ("filter_rejected".into(), self.filter_rejected.get()),
             (
                 "arp_table_size".into(),
                 self.arp_table_size.load(Ordering::Relaxed),
