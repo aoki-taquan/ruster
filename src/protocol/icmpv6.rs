@@ -46,6 +46,42 @@ impl Icmpv6Type {
     }
 }
 
+/// Destination Unreachable codes (RFC 4443)
+pub mod dest_unreachable {
+    /// No route to destination
+    pub const NO_ROUTE: u8 = 0;
+    /// Communication with destination administratively prohibited
+    pub const ADMIN_PROHIBITED: u8 = 1;
+    /// Beyond scope of source address
+    pub const BEYOND_SCOPE: u8 = 2;
+    /// Address unreachable
+    pub const ADDRESS_UNREACHABLE: u8 = 3;
+    /// Port unreachable
+    pub const PORT_UNREACHABLE: u8 = 4;
+    /// Source address failed ingress/egress policy
+    pub const FAILED_POLICY: u8 = 5;
+    /// Reject route to destination
+    pub const REJECT_ROUTE: u8 = 6;
+}
+
+/// Time Exceeded codes (RFC 4443)
+pub mod time_exceeded {
+    /// Hop limit exceeded in transit
+    pub const HOP_LIMIT_EXCEEDED: u8 = 0;
+    /// Fragment reassembly time exceeded
+    pub const FRAGMENT_REASSEMBLY: u8 = 1;
+}
+
+/// Parameter Problem codes (RFC 4443)
+pub mod parameter_problem {
+    /// Erroneous header field encountered
+    pub const ERRONEOUS_HEADER: u8 = 0;
+    /// Unrecognized Next Header type encountered
+    pub const UNRECOGNIZED_NEXT_HEADER: u8 = 1;
+    /// Unrecognized IPv6 option encountered
+    pub const UNRECOGNIZED_OPTION: u8 = 2;
+}
+
 /// NDP option types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -108,6 +144,76 @@ impl<'a> Icmpv6Packet<'a> {
     /// Raw packet bytes
     pub fn as_bytes(&self) -> &[u8] {
         self.buffer
+    }
+
+    /// Get identifier (for Echo Request/Reply)
+    pub fn identifier(&self) -> u16 {
+        if self.buffer.len() >= 6 {
+            u16::from_be_bytes([self.buffer[4], self.buffer[5]])
+        } else {
+            0
+        }
+    }
+
+    /// Get sequence number (for Echo Request/Reply)
+    pub fn sequence(&self) -> u16 {
+        if self.buffer.len() >= 8 {
+            u16::from_be_bytes([self.buffer[6], self.buffer[7]])
+        } else {
+            0
+        }
+    }
+
+    /// Get MTU (for Packet Too Big)
+    pub fn mtu(&self) -> u32 {
+        if self.buffer.len() >= 8 {
+            u32::from_be_bytes([
+                self.buffer[4],
+                self.buffer[5],
+                self.buffer[6],
+                self.buffer[7],
+            ])
+        } else {
+            0
+        }
+    }
+
+    /// Get payload (for Echo Request/Reply, after identifier and sequence)
+    pub fn payload(&self) -> &[u8] {
+        if self.buffer.len() > 8 {
+            &self.buffer[8..]
+        } else {
+            &[]
+        }
+    }
+
+    /// Check if this is an Echo Request
+    pub fn is_echo_request(&self) -> bool {
+        self.msg_type() == Icmpv6Type::EchoRequest as u8
+    }
+
+    /// Check if this is an Echo Reply
+    pub fn is_echo_reply(&self) -> bool {
+        self.msg_type() == Icmpv6Type::EchoReply as u8
+    }
+
+    /// Check if this is an error message (type < 128)
+    pub fn is_error(&self) -> bool {
+        self.msg_type() < 128
+    }
+
+    /// Get the typed ICMPv6 message type
+    pub fn message_type(&self) -> Option<Icmpv6Type> {
+        Icmpv6Type::from_u8(self.msg_type())
+    }
+
+    /// For error messages: get the original packet data
+    pub fn original_packet(&self) -> &[u8] {
+        if self.buffer.len() > 8 {
+            &self.buffer[8..]
+        } else {
+            &[]
+        }
     }
 }
 
@@ -410,6 +516,244 @@ pub fn validate_checksum(src_addr: &Ipv6Addr, dst_addr: &Ipv6Addr, icmpv6_data: 
     }
 
     sum == 0xFFFF
+}
+
+/// ICMPv6 Echo header size (type + code + checksum + identifier + sequence)
+pub const ECHO_HEADER_SIZE: usize = 8;
+
+/// Build an ICMPv6 Echo Reply from an Echo Request
+///
+/// Takes the raw ICMPv6 Echo Request bytes and returns Echo Reply bytes.
+/// Checksum must be calculated separately with set_checksum().
+pub fn build_echo_reply(request: &[u8]) -> Result<Vec<u8>> {
+    if request.len() < ECHO_HEADER_SIZE {
+        return Err(Error::Parse("ICMPv6 Echo Request too short".into()));
+    }
+
+    let mut reply = request.to_vec();
+
+    // Change type from Echo Request (128) to Echo Reply (129)
+    reply[0] = Icmpv6Type::EchoReply as u8;
+
+    // Clear checksum field (will be recalculated with set_checksum)
+    reply[2] = 0;
+    reply[3] = 0;
+
+    Ok(reply)
+}
+
+/// Build an ICMPv6 Destination Unreachable message (type 1)
+///
+/// # Arguments
+/// * `code` - The unreachable code (see `dest_unreachable` module)
+/// * `src_addr` - Source IPv6 address (for checksum calculation)
+/// * `dst_addr` - Destination IPv6 address (for checksum calculation)
+/// * `original_packet` - The original IPv6 packet that caused the error
+///
+/// Returns the complete ICMPv6 message with checksum set
+pub fn build_destination_unreachable(
+    code: u8,
+    src_addr: &Ipv6Addr,
+    dst_addr: &Ipv6Addr,
+    original_packet: &[u8],
+) -> Vec<u8> {
+    // ICMPv6 Destination Unreachable format:
+    // Type (1) + Code (1) + Checksum (2) + Unused (4) + As much of invoking packet as possible
+    // RFC 4443: should not exceed minimum IPv6 MTU (1280)
+    let max_original = 1280 - 40 - 8; // MTU - IPv6 header - ICMPv6 header
+    let original_len = original_packet.len().min(max_original);
+    let total_len = 8 + original_len;
+    let mut packet = vec![0u8; total_len];
+
+    // Type: Destination Unreachable (1)
+    packet[0] = Icmpv6Type::DestinationUnreachable as u8;
+    // Code
+    packet[1] = code;
+    // Checksum: will be calculated later
+    packet[2] = 0;
+    packet[3] = 0;
+    // Unused (4 bytes, already zero)
+
+    // Copy original packet
+    packet[8..8 + original_len].copy_from_slice(&original_packet[..original_len]);
+
+    // Calculate and set checksum
+    set_checksum(&mut packet, src_addr, dst_addr);
+
+    packet
+}
+
+/// Build an ICMPv6 Packet Too Big message (type 2)
+///
+/// # Arguments
+/// * `mtu` - The Maximum Transmission Unit of the next-hop link
+/// * `src_addr` - Source IPv6 address (for checksum calculation)
+/// * `dst_addr` - Destination IPv6 address (for checksum calculation)
+/// * `original_packet` - The original IPv6 packet that caused the error
+///
+/// Returns the complete ICMPv6 message with checksum set
+pub fn build_packet_too_big(
+    mtu: u32,
+    src_addr: &Ipv6Addr,
+    dst_addr: &Ipv6Addr,
+    original_packet: &[u8],
+) -> Vec<u8> {
+    // ICMPv6 Packet Too Big format:
+    // Type (1) + Code (1) + Checksum (2) + MTU (4) + As much of invoking packet as possible
+    let max_original = 1280 - 40 - 8;
+    let original_len = original_packet.len().min(max_original);
+    let total_len = 8 + original_len;
+    let mut packet = vec![0u8; total_len];
+
+    // Type: Packet Too Big (2)
+    packet[0] = Icmpv6Type::PacketTooBig as u8;
+    // Code: 0
+    packet[1] = 0;
+    // Checksum: will be calculated later
+    packet[2] = 0;
+    packet[3] = 0;
+    // MTU (4 bytes)
+    packet[4..8].copy_from_slice(&mtu.to_be_bytes());
+
+    // Copy original packet
+    packet[8..8 + original_len].copy_from_slice(&original_packet[..original_len]);
+
+    // Calculate and set checksum
+    set_checksum(&mut packet, src_addr, dst_addr);
+
+    packet
+}
+
+/// Build an ICMPv6 Time Exceeded message (type 3)
+///
+/// # Arguments
+/// * `code` - The time exceeded code (see `time_exceeded` module)
+/// * `src_addr` - Source IPv6 address (for checksum calculation)
+/// * `dst_addr` - Destination IPv6 address (for checksum calculation)
+/// * `original_packet` - The original IPv6 packet that caused the error
+///
+/// Returns the complete ICMPv6 message with checksum set
+pub fn build_time_exceeded(
+    code: u8,
+    src_addr: &Ipv6Addr,
+    dst_addr: &Ipv6Addr,
+    original_packet: &[u8],
+) -> Vec<u8> {
+    // ICMPv6 Time Exceeded format:
+    // Type (1) + Code (1) + Checksum (2) + Unused (4) + As much of invoking packet as possible
+    let max_original = 1280 - 40 - 8;
+    let original_len = original_packet.len().min(max_original);
+    let total_len = 8 + original_len;
+    let mut packet = vec![0u8; total_len];
+
+    // Type: Time Exceeded (3)
+    packet[0] = Icmpv6Type::TimeExceeded as u8;
+    // Code
+    packet[1] = code;
+    // Checksum: will be calculated later
+    packet[2] = 0;
+    packet[3] = 0;
+    // Unused (4 bytes, already zero)
+
+    // Copy original packet
+    packet[8..8 + original_len].copy_from_slice(&original_packet[..original_len]);
+
+    // Calculate and set checksum
+    set_checksum(&mut packet, src_addr, dst_addr);
+
+    packet
+}
+
+/// Build an ICMPv6 Parameter Problem message (type 4)
+///
+/// # Arguments
+/// * `code` - The parameter problem code (see `parameter_problem` module)
+/// * `pointer` - Byte offset in the original packet where the error was detected
+/// * `src_addr` - Source IPv6 address (for checksum calculation)
+/// * `dst_addr` - Destination IPv6 address (for checksum calculation)
+/// * `original_packet` - The original IPv6 packet that caused the error
+///
+/// Returns the complete ICMPv6 message with checksum set
+pub fn build_parameter_problem(
+    code: u8,
+    pointer: u32,
+    src_addr: &Ipv6Addr,
+    dst_addr: &Ipv6Addr,
+    original_packet: &[u8],
+) -> Vec<u8> {
+    // ICMPv6 Parameter Problem format:
+    // Type (1) + Code (1) + Checksum (2) + Pointer (4) + As much of invoking packet as possible
+    let max_original = 1280 - 40 - 8;
+    let original_len = original_packet.len().min(max_original);
+    let total_len = 8 + original_len;
+    let mut packet = vec![0u8; total_len];
+
+    // Type: Parameter Problem (4)
+    packet[0] = Icmpv6Type::ParameterProblem as u8;
+    // Code
+    packet[1] = code;
+    // Checksum: will be calculated later
+    packet[2] = 0;
+    packet[3] = 0;
+    // Pointer (4 bytes)
+    packet[4..8].copy_from_slice(&pointer.to_be_bytes());
+
+    // Copy original packet
+    packet[8..8 + original_len].copy_from_slice(&original_packet[..original_len]);
+
+    // Calculate and set checksum
+    set_checksum(&mut packet, src_addr, dst_addr);
+
+    packet
+}
+
+/// Builder for ICMPv6 Echo Request packets
+#[derive(Debug, Clone)]
+pub struct EchoRequestBuilder {
+    identifier: u16,
+    sequence: u16,
+    payload: Vec<u8>,
+}
+
+impl EchoRequestBuilder {
+    /// Create a new Echo Request builder
+    pub fn new(identifier: u16, sequence: u16) -> Self {
+        Self {
+            identifier,
+            sequence,
+            payload: Vec::new(),
+        }
+    }
+
+    /// Set the payload data
+    pub fn payload(mut self, data: &[u8]) -> Self {
+        self.payload = data.to_vec();
+        self
+    }
+
+    /// Build the ICMPv6 Echo Request packet (without checksum)
+    ///
+    /// Call set_checksum() on the result to set the checksum
+    pub fn build(self) -> Vec<u8> {
+        let total_len = ECHO_HEADER_SIZE + self.payload.len();
+        let mut packet = vec![0u8; total_len];
+
+        // Type: Echo Request (128)
+        packet[0] = Icmpv6Type::EchoRequest as u8;
+        // Code: 0
+        packet[1] = 0;
+        // Checksum: placeholder (will be set by set_checksum)
+        packet[2] = 0;
+        packet[3] = 0;
+        // Identifier
+        packet[4..6].copy_from_slice(&self.identifier.to_be_bytes());
+        // Sequence number
+        packet[6..8].copy_from_slice(&self.sequence.to_be_bytes());
+        // Payload
+        packet[8..].copy_from_slice(&self.payload);
+
+        packet
+    }
 }
 
 #[cfg(test)]
@@ -751,5 +1095,409 @@ mod tests {
         ];
         let result = parse_link_layer_option(&options, NdpOptionType::TargetLinkLayerAddress);
         assert_eq!(result, Some(MacAddr([0x11, 0x22, 0x33, 0x44, 0x55, 0x66])));
+    }
+
+    // ==================== Code constants tests ====================
+
+    #[test]
+    fn test_dest_unreachable_codes() {
+        assert_eq!(dest_unreachable::NO_ROUTE, 0);
+        assert_eq!(dest_unreachable::ADMIN_PROHIBITED, 1);
+        assert_eq!(dest_unreachable::BEYOND_SCOPE, 2);
+        assert_eq!(dest_unreachable::ADDRESS_UNREACHABLE, 3);
+        assert_eq!(dest_unreachable::PORT_UNREACHABLE, 4);
+        assert_eq!(dest_unreachable::FAILED_POLICY, 5);
+        assert_eq!(dest_unreachable::REJECT_ROUTE, 6);
+    }
+
+    #[test]
+    fn test_time_exceeded_codes() {
+        assert_eq!(time_exceeded::HOP_LIMIT_EXCEEDED, 0);
+        assert_eq!(time_exceeded::FRAGMENT_REASSEMBLY, 1);
+    }
+
+    #[test]
+    fn test_parameter_problem_codes() {
+        assert_eq!(parameter_problem::ERRONEOUS_HEADER, 0);
+        assert_eq!(parameter_problem::UNRECOGNIZED_NEXT_HEADER, 1);
+        assert_eq!(parameter_problem::UNRECOGNIZED_OPTION, 2);
+    }
+
+    // ==================== Icmpv6Packet helper methods tests ====================
+
+    fn make_echo_request(id: u16, seq: u16, payload: &[u8]) -> Vec<u8> {
+        let mut packet = vec![0u8; 8 + payload.len()];
+        packet[0] = Icmpv6Type::EchoRequest as u8;
+        packet[1] = 0;
+        packet[4..6].copy_from_slice(&id.to_be_bytes());
+        packet[6..8].copy_from_slice(&seq.to_be_bytes());
+        packet[8..].copy_from_slice(payload);
+        packet
+    }
+
+    #[test]
+    fn test_icmpv6_packet_identifier() {
+        let data = make_echo_request(0x1234, 0x0001, b"hello");
+        let pkt = Icmpv6Packet::parse(&data).unwrap();
+        assert_eq!(pkt.identifier(), 0x1234);
+    }
+
+    #[test]
+    fn test_icmpv6_packet_sequence() {
+        let data = make_echo_request(0x1234, 0x5678, b"test");
+        let pkt = Icmpv6Packet::parse(&data).unwrap();
+        assert_eq!(pkt.sequence(), 0x5678);
+    }
+
+    #[test]
+    fn test_icmpv6_packet_payload() {
+        let data = make_echo_request(0x1234, 0x0001, b"payload");
+        let pkt = Icmpv6Packet::parse(&data).unwrap();
+        assert_eq!(pkt.payload(), b"payload");
+    }
+
+    #[test]
+    fn test_icmpv6_packet_mtu() {
+        // Packet Too Big with MTU = 1280
+        let mut data = vec![0u8; 8];
+        data[0] = Icmpv6Type::PacketTooBig as u8;
+        data[4..8].copy_from_slice(&1280u32.to_be_bytes());
+        let pkt = Icmpv6Packet::parse(&data).unwrap();
+        assert_eq!(pkt.mtu(), 1280);
+    }
+
+    #[test]
+    fn test_icmpv6_packet_is_echo_request() {
+        let data = make_echo_request(0, 0, &[]);
+        let pkt = Icmpv6Packet::parse(&data).unwrap();
+        assert!(pkt.is_echo_request());
+        assert!(!pkt.is_echo_reply());
+    }
+
+    #[test]
+    fn test_icmpv6_packet_is_echo_reply() {
+        let mut data = make_echo_request(0, 0, &[]);
+        data[0] = Icmpv6Type::EchoReply as u8;
+        let pkt = Icmpv6Packet::parse(&data).unwrap();
+        assert!(pkt.is_echo_reply());
+        assert!(!pkt.is_echo_request());
+    }
+
+    #[test]
+    fn test_icmpv6_packet_is_error() {
+        // Error messages (type < 128)
+        let mut data = vec![0u8; 8];
+        data[0] = Icmpv6Type::DestinationUnreachable as u8;
+        let pkt = Icmpv6Packet::parse(&data).unwrap();
+        assert!(pkt.is_error());
+
+        // Informational messages (type >= 128)
+        data[0] = Icmpv6Type::EchoRequest as u8;
+        let pkt = Icmpv6Packet::parse(&data).unwrap();
+        assert!(!pkt.is_error());
+    }
+
+    #[test]
+    fn test_icmpv6_packet_message_type() {
+        let data = make_echo_request(0, 0, &[]);
+        let pkt = Icmpv6Packet::parse(&data).unwrap();
+        assert_eq!(pkt.message_type(), Some(Icmpv6Type::EchoRequest));
+    }
+
+    // ==================== Echo Request/Reply tests ====================
+
+    #[test]
+    fn test_echo_request_builder_basic() {
+        let packet = EchoRequestBuilder::new(0x1234, 0x0001).build();
+
+        let parsed = Icmpv6Packet::parse(&packet).unwrap();
+        assert_eq!(parsed.msg_type(), Icmpv6Type::EchoRequest as u8);
+        assert_eq!(parsed.code(), 0);
+        assert_eq!(parsed.identifier(), 0x1234);
+        assert_eq!(parsed.sequence(), 0x0001);
+        assert!(parsed.payload().is_empty());
+    }
+
+    #[test]
+    fn test_echo_request_builder_with_payload() {
+        let payload = b"ping test data";
+        let packet = EchoRequestBuilder::new(0xABCD, 0x0005)
+            .payload(payload)
+            .build();
+
+        let parsed = Icmpv6Packet::parse(&packet).unwrap();
+        assert_eq!(parsed.identifier(), 0xABCD);
+        assert_eq!(parsed.sequence(), 0x0005);
+        assert_eq!(parsed.payload(), payload);
+    }
+
+    #[test]
+    fn test_echo_request_builder_with_checksum() {
+        let src: Ipv6Addr = "fe80::1".parse().unwrap();
+        let dst: Ipv6Addr = "fe80::2".parse().unwrap();
+
+        let mut packet = EchoRequestBuilder::new(0x1234, 0x0001)
+            .payload(b"test")
+            .build();
+        set_checksum(&mut packet, &src, &dst);
+
+        assert!(validate_checksum(&src, &dst, &packet));
+    }
+
+    #[test]
+    fn test_build_echo_reply() {
+        let src: Ipv6Addr = "fe80::1".parse().unwrap();
+        let dst: Ipv6Addr = "fe80::2".parse().unwrap();
+
+        let mut request = EchoRequestBuilder::new(0x1234, 0x0001)
+            .payload(b"hello")
+            .build();
+        set_checksum(&mut request, &src, &dst);
+
+        let mut reply = build_echo_reply(&request).unwrap();
+        // Set checksum with swapped addresses (reply goes back)
+        set_checksum(&mut reply, &dst, &src);
+
+        let parsed = Icmpv6Packet::parse(&reply).unwrap();
+        assert_eq!(parsed.msg_type(), Icmpv6Type::EchoReply as u8);
+        assert_eq!(parsed.identifier(), 0x1234);
+        assert_eq!(parsed.sequence(), 0x0001);
+        assert_eq!(parsed.payload(), b"hello");
+        assert!(validate_checksum(&dst, &src, &reply));
+    }
+
+    #[test]
+    fn test_build_echo_reply_too_short() {
+        let short = vec![0u8; 7];
+        assert!(build_echo_reply(&short).is_err());
+    }
+
+    #[test]
+    fn test_echo_roundtrip() {
+        let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst: Ipv6Addr = "2001:db8::2".parse().unwrap();
+
+        let mut request = EchoRequestBuilder::new(0x5678, 0x000A)
+            .payload(b"roundtrip test")
+            .build();
+        set_checksum(&mut request, &src, &dst);
+
+        let mut reply = build_echo_reply(&request).unwrap();
+        set_checksum(&mut reply, &dst, &src);
+
+        let parsed_reply = Icmpv6Packet::parse(&reply).unwrap();
+        assert!(parsed_reply.is_echo_reply());
+        assert_eq!(parsed_reply.identifier(), 0x5678);
+        assert_eq!(parsed_reply.sequence(), 0x000A);
+        assert_eq!(parsed_reply.payload(), b"roundtrip test");
+        assert!(validate_checksum(&dst, &src, &reply));
+    }
+
+    // ==================== Destination Unreachable tests ====================
+
+    fn make_ipv6_packet() -> Vec<u8> {
+        // Minimal IPv6 header (40 bytes) + 8 bytes payload
+        let mut packet = vec![0u8; 48];
+        packet[0] = 0x60; // Version 6
+        packet[4] = 0; // Payload length high
+        packet[5] = 8; // Payload length low
+        packet[6] = 58; // Next header: ICMPv6
+        packet[7] = 64; // Hop limit
+                        // Source: 2001:db8::1
+        packet[8..24].copy_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+        // Dest: 2001:db8::2
+        packet[24..40].copy_from_slice(&"2001:db8::2".parse::<Ipv6Addr>().unwrap().octets());
+        // Payload
+        packet[40..48].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        packet
+    }
+
+    #[test]
+    fn test_build_destination_unreachable_no_route() {
+        let src: Ipv6Addr = "fe80::1".parse().unwrap();
+        let dst: Ipv6Addr = "fe80::2".parse().unwrap();
+        let original = make_ipv6_packet();
+
+        let packet =
+            build_destination_unreachable(dest_unreachable::NO_ROUTE, &src, &dst, &original);
+
+        let parsed = Icmpv6Packet::parse(&packet).unwrap();
+        assert_eq!(parsed.msg_type(), Icmpv6Type::DestinationUnreachable as u8);
+        assert_eq!(parsed.code(), dest_unreachable::NO_ROUTE);
+        assert!(parsed.is_error());
+        assert!(validate_checksum(&src, &dst, &packet));
+
+        // Check original packet is included
+        assert_eq!(parsed.original_packet(), &original[..]);
+    }
+
+    #[test]
+    fn test_build_destination_unreachable_port() {
+        let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let original = make_ipv6_packet();
+
+        let packet = build_destination_unreachable(
+            dest_unreachable::PORT_UNREACHABLE,
+            &src,
+            &dst,
+            &original,
+        );
+
+        let parsed = Icmpv6Packet::parse(&packet).unwrap();
+        assert_eq!(parsed.code(), dest_unreachable::PORT_UNREACHABLE);
+        assert!(validate_checksum(&src, &dst, &packet));
+    }
+
+    #[test]
+    fn test_build_destination_unreachable_truncates_large_original() {
+        let src: Ipv6Addr = "fe80::1".parse().unwrap();
+        let dst: Ipv6Addr = "fe80::2".parse().unwrap();
+        let original = vec![0u8; 2000]; // Large packet
+
+        let packet =
+            build_destination_unreachable(dest_unreachable::NO_ROUTE, &src, &dst, &original);
+
+        // Max size: 1280 - 40 - 8 = 1232 bytes of original
+        assert_eq!(packet.len(), 8 + 1232);
+        assert!(validate_checksum(&src, &dst, &packet));
+    }
+
+    // ==================== Packet Too Big tests ====================
+
+    #[test]
+    fn test_build_packet_too_big() {
+        let src: Ipv6Addr = "fe80::1".parse().unwrap();
+        let dst: Ipv6Addr = "fe80::2".parse().unwrap();
+        let original = make_ipv6_packet();
+        let mtu = 1280u32;
+
+        let packet = build_packet_too_big(mtu, &src, &dst, &original);
+
+        let parsed = Icmpv6Packet::parse(&packet).unwrap();
+        assert_eq!(parsed.msg_type(), Icmpv6Type::PacketTooBig as u8);
+        assert_eq!(parsed.code(), 0); // Always 0 for Packet Too Big
+        assert_eq!(parsed.mtu(), mtu);
+        assert!(parsed.is_error());
+        assert!(validate_checksum(&src, &dst, &packet));
+    }
+
+    #[test]
+    fn test_build_packet_too_big_with_different_mtu() {
+        let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let original = vec![0u8; 40];
+
+        let packet = build_packet_too_big(1500, &src, &dst, &original);
+
+        let parsed = Icmpv6Packet::parse(&packet).unwrap();
+        assert_eq!(parsed.mtu(), 1500);
+        assert!(validate_checksum(&src, &dst, &packet));
+    }
+
+    // ==================== Time Exceeded tests ====================
+
+    #[test]
+    fn test_build_time_exceeded_hop_limit() {
+        let src: Ipv6Addr = "fe80::1".parse().unwrap();
+        let dst: Ipv6Addr = "fe80::2".parse().unwrap();
+        let original = make_ipv6_packet();
+
+        let packet = build_time_exceeded(time_exceeded::HOP_LIMIT_EXCEEDED, &src, &dst, &original);
+
+        let parsed = Icmpv6Packet::parse(&packet).unwrap();
+        assert_eq!(parsed.msg_type(), Icmpv6Type::TimeExceeded as u8);
+        assert_eq!(parsed.code(), time_exceeded::HOP_LIMIT_EXCEEDED);
+        assert!(parsed.is_error());
+        assert!(validate_checksum(&src, &dst, &packet));
+    }
+
+    #[test]
+    fn test_build_time_exceeded_fragment_reassembly() {
+        let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let original = make_ipv6_packet();
+
+        let packet = build_time_exceeded(time_exceeded::FRAGMENT_REASSEMBLY, &src, &dst, &original);
+
+        let parsed = Icmpv6Packet::parse(&packet).unwrap();
+        assert_eq!(parsed.code(), time_exceeded::FRAGMENT_REASSEMBLY);
+        assert!(validate_checksum(&src, &dst, &packet));
+    }
+
+    // ==================== Parameter Problem tests ====================
+
+    #[test]
+    fn test_build_parameter_problem_erroneous_header() {
+        let src: Ipv6Addr = "fe80::1".parse().unwrap();
+        let dst: Ipv6Addr = "fe80::2".parse().unwrap();
+        let original = make_ipv6_packet();
+        let pointer = 6u32; // Pointing to next header field
+
+        let packet = build_parameter_problem(
+            parameter_problem::ERRONEOUS_HEADER,
+            pointer,
+            &src,
+            &dst,
+            &original,
+        );
+
+        let parsed = Icmpv6Packet::parse(&packet).unwrap();
+        assert_eq!(parsed.msg_type(), Icmpv6Type::ParameterProblem as u8);
+        assert_eq!(parsed.code(), parameter_problem::ERRONEOUS_HEADER);
+        assert!(parsed.is_error());
+        assert!(validate_checksum(&src, &dst, &packet));
+
+        // Check pointer (stored in MTU field position for Parameter Problem)
+        let raw = parsed.as_bytes();
+        let stored_pointer = u32::from_be_bytes([raw[4], raw[5], raw[6], raw[7]]);
+        assert_eq!(stored_pointer, pointer);
+    }
+
+    #[test]
+    fn test_build_parameter_problem_unrecognized_next_header() {
+        let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let dst: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let original = make_ipv6_packet();
+
+        let packet = build_parameter_problem(
+            parameter_problem::UNRECOGNIZED_NEXT_HEADER,
+            40,
+            &src,
+            &dst,
+            &original,
+        );
+
+        let parsed = Icmpv6Packet::parse(&packet).unwrap();
+        assert_eq!(parsed.code(), parameter_problem::UNRECOGNIZED_NEXT_HEADER);
+        assert!(validate_checksum(&src, &dst, &packet));
+    }
+
+    // ==================== Edge cases ====================
+
+    #[test]
+    fn test_empty_original_packet() {
+        let src: Ipv6Addr = "fe80::1".parse().unwrap();
+        let dst: Ipv6Addr = "fe80::2".parse().unwrap();
+        let original: [u8; 0] = [];
+
+        let packet = build_time_exceeded(time_exceeded::HOP_LIMIT_EXCEEDED, &src, &dst, &original);
+
+        assert_eq!(packet.len(), 8); // Just the ICMPv6 header
+        assert!(validate_checksum(&src, &dst, &packet));
+    }
+
+    #[test]
+    fn test_large_payload_echo() {
+        let src: Ipv6Addr = "fe80::1".parse().unwrap();
+        let dst: Ipv6Addr = "fe80::2".parse().unwrap();
+        let payload = vec![0xAA; 1000];
+
+        let mut request = EchoRequestBuilder::new(1, 1).payload(&payload).build();
+        set_checksum(&mut request, &src, &dst);
+
+        let parsed = Icmpv6Packet::parse(&request).unwrap();
+        assert_eq!(parsed.payload().len(), 1000);
+        assert!(validate_checksum(&src, &dst, &request));
     }
 }
