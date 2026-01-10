@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub nat: Option<NatConfig>,
     #[serde(default)]
+    pub firewall: Option<FirewallConfig>,
+    #[serde(default)]
     pub routing: RoutingConfig,
 }
 
@@ -94,6 +96,16 @@ pub struct NatConfig {
     pub enabled: bool,
     pub wan: String,
     pub lan: Vec<String>,
+}
+
+/// Stateful Firewall (SPI) configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct FirewallConfig {
+    pub enabled: bool,
+    /// WAN interfaces where SPI is applied.
+    /// If not specified, uses NAT's wan interface.
+    #[serde(default)]
+    pub wan_interfaces: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -185,6 +197,7 @@ pub struct ConfigLock {
     pub interfaces: HashMap<String, InterfaceLock>,
     pub dhcp: HashMap<String, DhcpLock>,
     pub nat: Option<NatLock>,
+    pub firewall: Option<FirewallLock>,
     pub routing: RoutingLock,
 }
 
@@ -230,6 +243,12 @@ pub struct NatLock {
     pub wan: String,
     pub lan: Vec<String>,
     pub nat_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FirewallLock {
+    pub enabled: bool,
+    pub wan_interfaces: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -363,6 +382,22 @@ impl ConfigLock {
             nat_type: "napt".to_string(),
         });
 
+        // Generate firewall config
+        let firewall = config.firewall.as_ref().map(|f| {
+            let wan_interfaces = f.wan_interfaces.clone().unwrap_or_else(|| {
+                // Default to NAT's wan interface if not specified
+                config
+                    .nat
+                    .as_ref()
+                    .map(|n| vec![n.wan.clone()])
+                    .unwrap_or_default()
+            });
+            FirewallLock {
+                enabled: f.enabled,
+                wan_interfaces,
+            }
+        });
+
         // Generate static routes with defaults filled in
         let static_routes: Vec<StaticRouteLock> = config
             .routing
@@ -472,6 +507,7 @@ impl ConfigLock {
             interfaces,
             dhcp,
             nat,
+            firewall,
             routing: RoutingLock {
                 static_routes: all_routes,
                 policy,
@@ -578,6 +614,7 @@ mod tests {
             interfaces,
             dhcp: HashMap::new(),
             nat: None,
+            firewall: None,
             routing: RoutingConfig::default(),
         };
 
@@ -627,6 +664,7 @@ mod tests {
             interfaces,
             dhcp: HashMap::new(),
             nat: None,
+            firewall: None,
             routing: RoutingConfig::default(),
         };
 
@@ -664,6 +702,7 @@ mod tests {
             interfaces,
             dhcp: HashMap::new(),
             nat: None,
+            firewall: None,
             routing: RoutingConfig::default(),
         };
 

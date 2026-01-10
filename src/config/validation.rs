@@ -437,6 +437,7 @@ mod tests {
             interfaces: HashMap::new(),
             dhcp: HashMap::new(),
             nat: None,
+            firewall: None,
             routing: RoutingConfig::default(),
         }
     }
