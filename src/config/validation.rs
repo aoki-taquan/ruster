@@ -439,6 +439,7 @@ mod tests {
             nat: None,
             firewall: None,
             routing: RoutingConfig::default(),
+            filtering: None,
         }
     }
 

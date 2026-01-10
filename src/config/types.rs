@@ -19,6 +19,8 @@ pub struct Config {
     pub firewall: Option<FirewallConfig>,
     #[serde(default)]
     pub routing: RoutingConfig,
+    #[serde(default)]
+    pub filtering: Option<FilteringConfig>,
 }
 
 /// Logging configuration
@@ -183,6 +185,59 @@ pub struct RoutingTableConfig {
     pub routes: Vec<StaticRoute>,
 }
 
+/// Packet filtering configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct FilteringConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Default action: "accept" or "drop"
+    #[serde(default = "default_accept")]
+    pub default_action: String,
+    #[serde(default)]
+    pub rules: Vec<FilterRuleConfig>,
+}
+
+fn default_accept() -> String {
+    "accept".to_string()
+}
+
+/// Filter rule from configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct FilterRuleConfig {
+    /// Chain: "input", "output", "forward"
+    pub chain: String,
+    /// Protocol: "icmp", "icmpv6", "tcp", "udp", or number
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// Source IP/CIDR (IPv4 or IPv6)
+    #[serde(default)]
+    pub src_ip: Option<String>,
+    /// Destination IP/CIDR (IPv4 or IPv6)
+    #[serde(default)]
+    pub dst_ip: Option<String>,
+    /// Source port or range: "80" or "1024-65535"
+    #[serde(default)]
+    pub src_port: Option<String>,
+    /// Destination port or range: "80" or "1024-65535"
+    #[serde(default)]
+    pub dst_port: Option<String>,
+    /// Input interface name
+    #[serde(default)]
+    pub in_interface: Option<String>,
+    /// Output interface name
+    #[serde(default)]
+    pub out_interface: Option<String>,
+    /// Action: "accept", "drop", "reject"
+    pub action: String,
+    /// Priority (lower = higher priority)
+    #[serde(default = "default_priority")]
+    pub priority: u32,
+}
+
+fn default_priority() -> u32 {
+    1000
+}
+
 // ============================================================================
 // Lock file types (generated, includes all defaults)
 // ============================================================================
@@ -199,6 +254,8 @@ pub struct ConfigLock {
     pub nat: Option<NatLock>,
     pub firewall: Option<FirewallLock>,
     pub routing: RoutingLock,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filtering: Option<FilteringLock>,
 }
 
 /// Logging configuration in lock file (with defaults filled in)
@@ -322,6 +379,36 @@ pub struct RoutingTableLock {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub routes: Vec<StaticRouteLock>,
+}
+
+/// Filtering configuration in lock file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilteringLock {
+    pub enabled: bool,
+    pub default_action: String,
+    pub rules: Vec<FilterRuleLock>,
+}
+
+/// Filter rule in lock file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FilterRuleLock {
+    pub chain: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_port: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_port: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_interface: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub out_interface: Option<String>,
+    pub action: String,
+    pub priority: u32,
 }
 
 impl ConfigLock {
@@ -500,6 +587,28 @@ impl ConfigLock {
             })
             .collect();
 
+        // Generate filtering lock
+        let filtering = config.filtering.as_ref().map(|f| FilteringLock {
+            enabled: f.enabled,
+            default_action: f.default_action.clone(),
+            rules: f
+                .rules
+                .iter()
+                .map(|rule| FilterRuleLock {
+                    chain: rule.chain.clone(),
+                    protocol: rule.protocol.clone(),
+                    src_ip: rule.src_ip.clone(),
+                    dst_ip: rule.dst_ip.clone(),
+                    src_port: rule.src_port.clone(),
+                    dst_port: rule.dst_port.clone(),
+                    in_interface: rule.in_interface.clone(),
+                    out_interface: rule.out_interface.clone(),
+                    action: rule.action.clone(),
+                    priority: rule.priority,
+                })
+                .collect(),
+        });
+
         ConfigLock {
             generated_at: chrono::Utc::now().to_rfc3339(),
             source_hash,
@@ -513,6 +622,7 @@ impl ConfigLock {
                 policy,
                 tables,
             },
+            filtering,
         }
     }
 }
@@ -616,6 +726,7 @@ mod tests {
             nat: None,
             firewall: None,
             routing: RoutingConfig::default(),
+            filtering: None,
         };
 
         let lock = ConfigLock::from_config(&config, "testhash".to_string());
@@ -666,6 +777,7 @@ mod tests {
             nat: None,
             firewall: None,
             routing: RoutingConfig::default(),
+            filtering: None,
         };
 
         let lock = ConfigLock::from_config(&config, "testhash".to_string());
@@ -704,6 +816,7 @@ mod tests {
             nat: None,
             firewall: None,
             routing: RoutingConfig::default(),
+            filtering: None,
         };
 
         let lock = ConfigLock::from_config(&config, "testhash".to_string());

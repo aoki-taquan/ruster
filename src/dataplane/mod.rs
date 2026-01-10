@@ -6,6 +6,7 @@ mod arp_processor;
 mod arp_table;
 mod conntrack;
 mod fdb;
+mod filter;
 mod firewall;
 mod forwarder;
 mod napt;
@@ -18,6 +19,10 @@ mod routing;
 pub use arp_processor::{process_arp, ArpAction, ArpPendingQueue};
 pub use arp_table::{ArpState, ArpTable};
 pub use fdb::Fdb;
+pub use filter::{
+    icmpv6_type, protocol, Action, Chain, FilterContext, FilterRule, IpAddr as FilterIpAddr,
+    IpCidr, Ipv4Cidr, Ipv6Cidr, PacketFilter, PortRange,
+};
 pub use forwarder::{ForwardAction, Forwarder, InterfaceInfo};
 pub use napt::{NaptProcessor, NaptProtocol, NaptResult, NaptTable};
 pub use ndp_processor::{

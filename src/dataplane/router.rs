@@ -5,12 +5,14 @@
 
 use crate::capture::AfPacketSocket;
 use crate::dataplane::{
-    process_arp, ArpAction, ArpPendingQueue, ArpTable, Fdb, ForwardAction, Forwarder,
-    InterfaceInfo, NaptProcessor, NaptResult, RoutingSystem, StatefulFirewall,
+    process_arp, Action, ArpAction, ArpPendingQueue, ArpTable, Chain, Fdb, FilterContext,
+    FilterIpAddr, ForwardAction, Forwarder, InterfaceInfo, NaptProcessor, NaptResult, PacketFilter,
+    RoutingSystem, StatefulFirewall,
 };
 use crate::protocol::arp::ArpPacket;
 use crate::protocol::ethernet::{Frame, FrameBuilder};
 use crate::protocol::icmp::{build_echo_reply, IcmpType};
+use crate::protocol::ipv4::Ipv4Header;
 use crate::protocol::types::EtherType;
 use crate::protocol::MacAddr;
 use crate::telemetry::MetricsRegistry;
@@ -79,6 +81,8 @@ pub struct Router {
     napt: Option<NaptProcessor>,
     /// WAN interface name (for NAPT)
     wan_interface: Option<String>,
+    /// Packet filter (optional)
+    filter: Option<PacketFilter>,
     /// Stateful firewall (optional)
     firewall: Option<StatefulFirewall>,
     /// Metrics registry for statistics
@@ -103,9 +107,20 @@ impl Router {
             next_port_id: 1,
             napt: None,
             wan_interface: None,
+            filter: None,
             firewall: None,
             metrics,
         }
+    }
+
+    /// Set the packet filter
+    pub fn set_filter(&mut self, filter: PacketFilter) {
+        self.filter = Some(filter);
+    }
+
+    /// Get the packet filter
+    pub fn filter(&self) -> Option<&PacketFilter> {
+        self.filter.as_ref()
     }
 
     /// Get a reference to the metrics registry
@@ -445,6 +460,24 @@ impl Router {
                 next_hop_mac,
                 packet,
             } => {
+                // Apply FORWARD chain filter before forwarding
+                if let Ok(ip) = Ipv4Header::parse(&packet) {
+                    let (src_port, dst_port) = self.extract_ports(&packet, ip.protocol());
+                    if self.apply_filter(
+                        Chain::Forward,
+                        FilterIpAddr::V4(ip.src_addr()),
+                        FilterIpAddr::V4(ip.dst_addr()),
+                        ip.protocol(),
+                        src_port,
+                        dst_port,
+                        Some(ingress_iface),
+                        Some(&interface),
+                    ) {
+                        self.metrics.packets_dropped.inc();
+                        return None;
+                    }
+                }
+
                 self.metrics.packets_forwarded.inc();
                 // Apply outbound NAPT (SNAT) if forwarding to WAN
                 let final_packet = if !is_inbound_nat {
@@ -490,6 +523,25 @@ impl Router {
                 Some(vec![(interface, frame)])
             }
             ForwardAction::Local => {
+                // Apply INPUT chain filter before handling locally
+                if let Ok(ip) = Ipv4Header::parse(&packet_to_forward) {
+                    let (src_port, dst_port) =
+                        self.extract_ports(&packet_to_forward, ip.protocol());
+                    if self.apply_filter(
+                        Chain::Input,
+                        FilterIpAddr::V4(ip.src_addr()),
+                        FilterIpAddr::V4(ip.dst_addr()),
+                        ip.protocol(),
+                        src_port,
+                        dst_port,
+                        Some(ingress_iface),
+                        None,
+                    ) {
+                        self.metrics.packets_dropped.inc();
+                        return None;
+                    }
+                }
+
                 // Packet is for us - handle locally (e.g., ICMP)
                 // For inbound NAT, this means packet is destined for WAN IP but no mapping
                 self.handle_local_packet(ingress_iface, &packet_to_forward)
@@ -633,6 +685,78 @@ impl Router {
         }
 
         None
+    }
+
+    /// Apply packet filter and record metrics
+    ///
+    /// Returns true if the packet should be dropped
+    #[allow(clippy::too_many_arguments)]
+    fn apply_filter(
+        &self,
+        chain: Chain,
+        src_ip: FilterIpAddr,
+        dst_ip: FilterIpAddr,
+        protocol: u8,
+        src_port: Option<u16>,
+        dst_port: Option<u16>,
+        in_interface: Option<&str>,
+        out_interface: Option<&str>,
+    ) -> bool {
+        let filter = match &self.filter {
+            Some(f) => f,
+            None => return false, // No filter, accept all
+        };
+
+        let ctx = FilterContext {
+            chain,
+            src_ip,
+            dst_ip,
+            protocol,
+            src_port,
+            dst_port,
+            in_interface,
+            out_interface,
+        };
+
+        match filter.evaluate(&ctx) {
+            Action::Accept => {
+                self.metrics.filter_accepted.inc();
+                false
+            }
+            Action::Drop => {
+                self.metrics.filter_dropped.inc();
+                trace!("Filter dropped packet: {:?}", ctx);
+                true
+            }
+            Action::Reject => {
+                self.metrics.filter_rejected.inc();
+                trace!("Filter rejected packet: {:?}", ctx);
+                true
+            }
+        }
+    }
+
+    /// Extract L4 ports from IPv4 packet
+    fn extract_ports(&self, payload: &[u8], protocol: u8) -> (Option<u16>, Option<u16>) {
+        use crate::dataplane::protocol::{TCP, UDP};
+
+        if protocol != TCP && protocol != UDP {
+            return (None, None);
+        }
+
+        // L4 header starts after IP header
+        if let Ok(ip) = Ipv4Header::parse(payload) {
+            let l4_offset = ip.header_len();
+            let l4_payload = &payload[l4_offset..];
+
+            if l4_payload.len() >= 4 {
+                let src_port = u16::from_be_bytes([l4_payload[0], l4_payload[1]]);
+                let dst_port = u16::from_be_bytes([l4_payload[2], l4_payload[3]]);
+                return (Some(src_port), Some(dst_port));
+            }
+        }
+
+        (None, None)
     }
 
     /// Run aging for FDB, ARP, NAPT, and firewall tables
