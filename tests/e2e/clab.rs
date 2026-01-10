@@ -1,6 +1,6 @@
 //! Containerlab test helpers
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -11,6 +11,7 @@ static TOPOLOGY_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct Topology {
     name: String,
     topology_file: String,
+    temp_file: Option<PathBuf>,
 }
 
 impl Topology {
@@ -20,15 +21,14 @@ impl Topology {
         format!("{}-{}", std::process::id(), count)
     }
 
-    /// Deploy a containerlab topology with a unique name
+    /// Deploy a containerlab topology with a unique name and network
     pub fn deploy(topology_file: impl AsRef<Path>) -> Result<Self, String> {
         let topology_file = topology_file.as_ref();
-        let topology_path = topology_file
-            .to_str()
-            .ok_or("Invalid topology path")?
-            .to_string();
+        let topology_dir = topology_file
+            .parent()
+            .ok_or("Could not get topology directory")?;
 
-        // Read topology name from file
+        // Read topology content
         let content =
             std::fs::read_to_string(topology_file).map_err(|e| format!("Read error: {}", e))?;
 
@@ -39,9 +39,26 @@ impl Topology {
             .map(|s| s.trim().to_string())
             .ok_or("Could not find topology name")?;
 
-        // Generate unique topology name with PID + counter suffix
+        // Generate unique suffix for topology name and network
         let suffix = Self::generate_unique_suffix();
         let name = format!("{}-{}", base_name, suffix);
+
+        // Create temp topology file with unique mgmt network name
+        let mgmt_section = format!(
+            "\nmgmt:\n  network: clab-{}\n  ipv4-subnet: 172.100.{}.0/24\n",
+            suffix,
+            TOPOLOGY_COUNTER.load(Ordering::SeqCst) % 200
+        );
+        let modified_content = format!("{}{}", content.trim_end(), mgmt_section);
+
+        let temp_file_path = topology_dir.join(format!(".topology-{}.yml", suffix));
+        std::fs::write(&temp_file_path, &modified_content)
+            .map_err(|e| format!("Failed to write temp file: {}", e))?;
+
+        let temp_topology_path = temp_file_path
+            .to_str()
+            .ok_or("Invalid temp topology path")?
+            .to_string();
 
         // Deploy topology with unique name
         let output = Command::new("sudo")
@@ -49,7 +66,7 @@ impl Topology {
                 "containerlab",
                 "deploy",
                 "-t",
-                &topology_path,
+                &temp_topology_path,
                 "--name",
                 &name,
                 "--reconfigure",
@@ -58,6 +75,8 @@ impl Topology {
             .map_err(|e| format!("Failed to run containerlab: {}", e))?;
 
         if !output.status.success() {
+            // Clean up temp file on failure
+            let _ = std::fs::remove_file(&temp_file_path);
             return Err(format!(
                 "containerlab deploy failed: {}",
                 String::from_utf8_lossy(&output.stderr)
@@ -66,7 +85,8 @@ impl Topology {
 
         Ok(Self {
             name,
-            topology_file: topology_path,
+            topology_file: temp_topology_path,
+            temp_file: Some(temp_file_path),
         })
     }
 
@@ -87,8 +107,8 @@ impl Topology {
         output.status.success()
     }
 
-    /// Destroy the topology
-    pub fn destroy(&self) {
+    /// Destroy the topology and clean up temp files
+    pub fn destroy(&mut self) {
         let _ = Command::new("sudo")
             .args([
                 "containerlab",
@@ -100,6 +120,12 @@ impl Topology {
                 "--cleanup",
             ])
             .output();
+
+        // Clean up temp topology file
+        if let Some(ref temp_file) = self.temp_file {
+            let _ = std::fs::remove_file(temp_file);
+        }
+        self.temp_file = None;
     }
 }
 
