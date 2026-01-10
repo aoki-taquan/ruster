@@ -1,0 +1,30 @@
+# Home Router Configuration for E2E Tests
+#
+# Topology:
+#   Internet -- [eth1 WAN] ruster [eth2 LAN] -- 192.168.1.0/24
+# Note: eth0 is reserved by containerlab for Docker bridge
+
+[interfaces.eth1]
+role = "wan"
+addressing = "dhcp"
+
+[interfaces.eth2]
+role = "lan"
+addressing = "static"
+address = "192.168.1.1/24"
+
+[dhcp.lan]
+range = ["192.168.1.100", "192.168.1.200"]
+gateway = "192.168.1.1"
+dns = ["192.168.1.1"]
+lease_time = 3600
+
+[dns_forwarder]
+enabled = true
+upstream = ["10.0.0.1"]
+cache_size = 100
+
+[nat]
+enabled = true
+wan = "eth1"
+lan = ["eth2"]

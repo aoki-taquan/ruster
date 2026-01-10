@@ -1,0 +1,64 @@
+# Home Router Test Topology
+#
+# Topology:
+#   ISP Network (10.0.0.0/24) --- [eth1 WAN] ruster [eth2 LAN] --- Client (192.168.1.0/24)
+#                            \
+#                             --- Server (203.0.113.2)
+#
+# ISP provides DHCP for WAN, ruster provides DHCP for LAN
+# Note: eth0 is reserved by containerlab for Docker bridge, so we use eth1/eth2
+
+name: ruster-home-router
+
+topology:
+  nodes:
+    # ISP router with DHCP server (simulates ISP gateway)
+    isp:
+      kind: linux
+      image: alpine:3.19
+      binds:
+        - ./isp-dnsmasq.conf:/etc/dnsmasq.d/isp.conf:ro
+      exec:
+        - apk add --no-cache dnsmasq
+        - ip addr add 10.0.0.1/24 dev eth1
+        - ip addr add 203.0.113.1/24 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+        - dnsmasq
+
+    # Internet server (simulates external host)
+    server:
+      kind: linux
+      image: alpine:3.19
+      exec:
+        - ip addr add 203.0.113.2/24 dev eth1
+        - ip route del default || true
+        - ip route add default via 203.0.113.1
+
+    # Device Under Test - ruster router
+    ruster:
+      kind: linux
+      image: alpine:3.19
+      binds:
+        - ../../../target/release/ruster:/usr/local/bin/ruster:ro
+        - ./config.toml:/etc/ruster/config.toml:ro
+        - ./ruster-dnsmasq.conf:/etc/dnsmasq.d/lan.conf:ro
+      exec:
+        - apk add --no-cache dnsmasq iptables bind-tools
+        - sysctl -w net.ipv4.ip_forward=1
+        - ip addr add 192.168.1.1/24 dev eth2
+        - dnsmasq
+
+    # LAN client
+    client:
+      kind: linux
+      image: alpine:3.19
+      exec:
+        - apk add --no-cache bind-tools curl
+
+  links:
+    # WAN: ISP <-> ruster
+    - endpoints: ["isp:eth1", "ruster:eth1"]
+    # ISP internal: ISP <-> server
+    - endpoints: ["isp:eth2", "server:eth1"]
+    # LAN: ruster <-> client
+    - endpoints: ["ruster:eth2", "client:eth1"]

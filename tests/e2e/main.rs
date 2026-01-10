@@ -17,6 +17,7 @@
 //! ```
 
 mod clab;
+mod home_router;
 
 use clab::Topology;
 use std::path::PathBuf;
