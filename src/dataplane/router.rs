@@ -5,9 +5,10 @@
 
 use crate::capture::AfPacketSocket;
 use crate::dataplane::{
-    process_arp, Action, ArpAction, ArpPendingQueue, ArpTable, Chain, DhcpAction, DhcpPoolConfig,
-    DhcpServer, Fdb, FilterContext, FilterIpAddr, ForwardAction, Forwarder, InterfaceInfo,
-    NaptProcessor, NaptResult, PacketFilter, RoutingSystem, StatefulFirewall,
+    network_address, process_arp, Action, ArpAction, ArpPendingQueue, ArpTable, Chain, DhcpAction,
+    DhcpClient, DhcpClientAction, DhcpPoolConfig, DhcpServer, Fdb, FilterContext, FilterIpAddr,
+    ForwardAction, Forwarder, InterfaceInfo, NaptProcessor, NaptResult, PacketFilter, Route,
+    RouteSource, RoutingSystem, StatefulFirewall,
 };
 use crate::protocol::arp::ArpPacket;
 use crate::protocol::ethernet::{Frame, FrameBuilder};
@@ -87,6 +88,8 @@ pub struct Router {
     firewall: Option<StatefulFirewall>,
     /// DHCP server (optional)
     dhcp_server: Option<DhcpServer>,
+    /// DHCP clients for interfaces with addressing=dhcp
+    dhcp_clients: HashMap<String, DhcpClient>,
     /// Metrics registry for statistics
     metrics: Arc<MetricsRegistry>,
 }
@@ -112,6 +115,7 @@ impl Router {
             filter: None,
             firewall: None,
             dhcp_server: None,
+            dhcp_clients: HashMap::new(),
             metrics,
         }
     }
@@ -203,6 +207,166 @@ impl Router {
         self.dhcp_server
             .as_ref()
             .is_some_and(|s| s.has_pool(interface))
+    }
+
+    // ===== DHCP Client Methods =====
+
+    /// Enable DHCP client on an interface to obtain IP address
+    pub fn enable_dhcp_client(&mut self, interface: &str) -> Vec<(String, Vec<u8>)> {
+        let mac_addr = match self.interfaces.get(interface) {
+            Some(iface) => iface.mac_addr,
+            None => {
+                warn!("DHCP client: interface {} not found", interface);
+                return vec![];
+            }
+        };
+
+        debug!("Enabling DHCP client on {}", interface);
+        let mut client = DhcpClient::new(interface.to_string(), mac_addr);
+        let action = client.start();
+        self.dhcp_clients.insert(interface.to_string(), client);
+
+        self.execute_dhcp_client_action(action)
+    }
+
+    /// Disable DHCP client on an interface
+    pub fn disable_dhcp_client(&mut self, interface: &str) {
+        self.dhcp_clients.remove(interface);
+    }
+
+    /// Check if DHCP client is enabled for an interface
+    pub fn is_dhcp_client_enabled(&self, interface: &str) -> bool {
+        self.dhcp_clients.contains_key(interface)
+    }
+
+    /// Execute a DHCP client action
+    fn execute_dhcp_client_action(&mut self, action: DhcpClientAction) -> Vec<(String, Vec<u8>)> {
+        use crate::protocol::dhcp::{DHCP_CLIENT_PORT, DHCP_SERVER_PORT};
+        use crate::protocol::ipv4::Ipv4Builder;
+        use crate::protocol::udp::UdpBuilder;
+
+        match action {
+            DhcpClientAction::SendPacket {
+                interface,
+                packet,
+                dst_ip,
+                dst_mac,
+            } => {
+                let iface = match self.interfaces.get(&interface) {
+                    Some(i) => i,
+                    None => return vec![],
+                };
+
+                // Source IP is 0.0.0.0 if we don't have an IP yet
+                let src_ip = iface.ip_addr.unwrap_or(Ipv4Addr::UNSPECIFIED);
+
+                // Build UDP packet
+                let udp_packet = UdpBuilder::new()
+                    .src_port(DHCP_CLIENT_PORT)
+                    .dst_port(DHCP_SERVER_PORT)
+                    .payload(&packet)
+                    .build(src_ip, dst_ip);
+
+                // Build IP packet
+                let ip_packet = Ipv4Builder::new()
+                    .src_addr(src_ip)
+                    .dst_addr(dst_ip)
+                    .ttl(64)
+                    .protocol(17) // UDP
+                    .payload(&udp_packet)
+                    .build();
+
+                // Build Ethernet frame
+                let frame = FrameBuilder::new()
+                    .src_mac(iface.mac_addr)
+                    .dst_mac(dst_mac)
+                    .ethertype(EtherType::Ipv4 as u16)
+                    .payload(&ip_packet)
+                    .build();
+
+                vec![(interface, frame)]
+            }
+            DhcpClientAction::ConfigureInterface {
+                interface,
+                ip_addr,
+                prefix_len,
+                gateway,
+                dns_servers: _,
+            } => {
+                self.configure_dhcp_interface(&interface, ip_addr, prefix_len, gateway);
+                vec![]
+            }
+            DhcpClientAction::DeconfigureInterface { interface } => {
+                self.deconfigure_dhcp_interface(&interface);
+                vec![]
+            }
+            DhcpClientAction::None => vec![],
+        }
+    }
+
+    /// Configure interface with DHCP-obtained IP
+    fn configure_dhcp_interface(
+        &mut self,
+        interface: &str,
+        ip_addr: Ipv4Addr,
+        prefix_len: u8,
+        gateway: Option<Ipv4Addr>,
+    ) {
+        // Update interface IP
+        if let Some(iface) = self.interfaces.get_mut(interface) {
+            iface.ip_addr = Some(ip_addr);
+            iface.prefix_len = Some(prefix_len);
+
+            // Update forwarder
+            self.forwarder.add_interface(
+                interface.to_string(),
+                InterfaceInfo {
+                    ip_addr,
+                    mac_addr: iface.mac_addr,
+                    prefix_len,
+                },
+            );
+        }
+
+        // Add connected route for the network
+        let network = network_address(ip_addr, prefix_len);
+        self.routing_system.main_table_mut().add(Route {
+            destination: network,
+            prefix_len,
+            next_hop: None,
+            interface: interface.to_string(),
+            metric: 0,
+            source: RouteSource::Dhcp,
+        });
+
+        // Add default route via gateway if provided
+        if let Some(gw) = gateway {
+            self.routing_system.main_table_mut().add(Route {
+                destination: Ipv4Addr::UNSPECIFIED,
+                prefix_len: 0,
+                next_hop: Some(gw),
+                interface: interface.to_string(),
+                metric: 10,
+                source: RouteSource::Dhcp,
+            });
+        }
+    }
+
+    /// Remove DHCP configuration from interface
+    fn deconfigure_dhcp_interface(&mut self, interface: &str) {
+        // Remove DHCP-learned routes
+        self.routing_system
+            .main_table_mut()
+            .remove_by_source(RouteSource::Dhcp);
+
+        // Clear interface IP
+        if let Some(iface) = self.interfaces.get_mut(interface) {
+            iface.ip_addr = None;
+            iface.prefix_len = None;
+        }
+
+        // Remove from forwarder
+        self.forwarder.remove_interface(interface);
     }
 
     /// Add an interface to the router
@@ -717,13 +881,19 @@ impl Router {
             }
             17 => {
                 // UDP
+                use crate::protocol::dhcp::DHCP_CLIENT_PORT;
                 let udp = UdpHeader::parse(ip_payload).ok()?;
 
-                if udp.dst_port() == DHCP_SERVER_PORT {
-                    // DHCP request
-                    self.handle_dhcp(ingress_iface, udp.payload())
-                } else {
-                    None
+                match udp.dst_port() {
+                    p if p == DHCP_SERVER_PORT => {
+                        // DHCP request (to server)
+                        self.handle_dhcp(ingress_iface, udp.payload())
+                    }
+                    p if p == DHCP_CLIENT_PORT => {
+                        // DHCP response (to client)
+                        self.handle_dhcp_client_response(ingress_iface, udp.payload())
+                    }
+                    _ => None,
                 }
             }
             _ => None,
@@ -784,6 +954,23 @@ impl Router {
                 Some(vec![(interface, frame)])
             }
             DhcpAction::None => None,
+        }
+    }
+
+    /// Handle DHCP client response (OFFER, ACK, NAK)
+    fn handle_dhcp_client_response(
+        &mut self,
+        ingress_iface: &str,
+        dhcp_payload: &[u8],
+    ) -> Option<Vec<(String, Vec<u8>)>> {
+        let client = self.dhcp_clients.get_mut(ingress_iface)?;
+        let action = client.process_response(dhcp_payload);
+        let packets = self.execute_dhcp_client_action(action);
+
+        if packets.is_empty() {
+            None
+        } else {
+            Some(packets)
         }
     }
 
@@ -860,7 +1047,7 @@ impl Router {
     }
 
     /// Run aging for FDB, ARP, NAPT, firewall, and DHCP tables
-    pub fn run_aging(&mut self) {
+    pub fn run_aging(&mut self) -> Vec<(String, Vec<u8>)> {
         self.fdb.age_out();
         self.arp_table.refresh_states();
         self.arp_pending.expire_old();
@@ -875,9 +1062,19 @@ impl Router {
             firewall.run_maintenance();
         }
 
-        // Run DHCP maintenance if enabled
+        // Run DHCP server maintenance if enabled
         if let Some(ref mut dhcp) = self.dhcp_server {
             dhcp.run_maintenance();
+        }
+
+        // Tick DHCP clients and collect packets to send
+        let mut to_send = Vec::new();
+        let client_interfaces: Vec<String> = self.dhcp_clients.keys().cloned().collect();
+        for iface_name in client_interfaces {
+            if let Some(client) = self.dhcp_clients.get_mut(&iface_name) {
+                let action = client.tick();
+                to_send.extend(self.execute_dhcp_client_action(action));
+            }
         }
 
         // Update table size metrics
@@ -885,6 +1082,8 @@ impl Router {
         self.metrics.set_arp_table_size(self.arp_table.len());
         self.metrics
             .set_route_count(self.routing_system.main_table().len());
+
+        to_send
     }
 
     /// Create an aging timer interval

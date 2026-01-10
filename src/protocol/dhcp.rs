@@ -318,6 +318,45 @@ impl<'a> DhcpHeader<'a> {
             pos: 0,
         }
     }
+
+    // ===== Client-specific parsing helpers =====
+
+    /// Find option and parse as Ipv4Addr
+    pub fn find_option_ip(&self, code: u8) -> Option<Ipv4Addr> {
+        self.find_option(code).and_then(|data| {
+            if data.len() >= 4 {
+                Some(Ipv4Addr::new(data[0], data[1], data[2], data[3]))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Find option and parse as list of Ipv4Addr
+    pub fn find_option_ip_list(&self, code: u8) -> Option<Vec<Ipv4Addr>> {
+        self.find_option(code).map(|data| {
+            data.chunks(4)
+                .filter_map(|chunk| {
+                    if chunk.len() == 4 {
+                        Some(Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+    }
+
+    /// Find option and parse as u32
+    pub fn find_option_u32(&self, code: u8) -> Option<u32> {
+        self.find_option(code).and_then(|data| {
+            if data.len() >= 4 {
+                Some(u32::from_be_bytes([data[0], data[1], data[2], data[3]]))
+            } else {
+                None
+            }
+        })
+    }
 }
 
 /// Iterator over DHCP options
@@ -506,6 +545,56 @@ impl DhcpBuilder {
     /// Set domain name (Option 15)
     pub fn domain_name(mut self, domain: &str) -> Self {
         self.add_option(options::DOMAIN_NAME, domain.as_bytes());
+        self
+    }
+
+    // ===== Client-specific methods =====
+
+    /// Set operation code (for client: BootpOp::Request)
+    pub fn op(mut self, op: BootpOp) -> Self {
+        self.op = op as u8;
+        self
+    }
+
+    /// Set transaction ID
+    pub fn xid(mut self, xid: u32) -> Self {
+        self.xid = xid;
+        self
+    }
+
+    /// Set flags (bit 15 = broadcast)
+    pub fn flags(mut self, flags: u16) -> Self {
+        self.flags = flags;
+        self
+    }
+
+    /// Set client IP address (ciaddr) - used during renewal
+    pub fn ciaddr(mut self, ip: Ipv4Addr) -> Self {
+        self.ciaddr = ip;
+        self
+    }
+
+    /// Set client hardware address (chaddr)
+    pub fn chaddr(mut self, mac: &[u8; 6]) -> Self {
+        self.chaddr[..6].copy_from_slice(mac);
+        self
+    }
+
+    /// Set requested IP address (Option 50)
+    pub fn requested_ip(mut self, ip: Ipv4Addr) -> Self {
+        self.add_option(options::REQUESTED_IP, &ip.octets());
+        self
+    }
+
+    /// Set parameter request list (Option 55)
+    pub fn parameter_request_list(mut self, params: &[u8]) -> Self {
+        self.add_option(options::PARAMETER_REQUEST, params);
+        self
+    }
+
+    /// Set hostname (Option 12)
+    pub fn hostname(mut self, name: &str) -> Self {
+        self.add_option(options::HOSTNAME, name.as_bytes());
         self
     }
 
