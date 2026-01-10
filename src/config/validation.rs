@@ -57,6 +57,7 @@ pub fn validate(config: &Config) -> ValidationResult {
     validate_routing(config, &mut result);
     validate_policy(config, &mut result);
     validate_routing_tables(config, &mut result);
+    validate_dns_forwarder(config, &mut result);
 
     result
 }
@@ -445,6 +446,31 @@ fn validate_routing_tables(config: &Config, result: &mut ValidationResult) {
     }
 }
 
+fn validate_dns_forwarder(config: &Config, result: &mut ValidationResult) {
+    let Some(dns) = &config.dns_forwarder else {
+        return;
+    };
+
+    // Upstream servers required when enabled
+    if dns.enabled && dns.upstream.is_empty() {
+        result.error("dns_forwarder: upstream servers required when enabled".to_string());
+    }
+
+    // Warn about cache size extremes
+    if dns.cache_size == 0 {
+        result.warn("dns_forwarder: cache_size is 0, caching disabled".to_string());
+    } else if dns.cache_size > 100000 {
+        result.warn("dns_forwarder: cache_size very large, may use significant memory".to_string());
+    }
+
+    // Query timeout validation
+    if dns.query_timeout == 0 {
+        result.error("dns_forwarder: query_timeout must be greater than 0".to_string());
+    } else if dns.query_timeout > 30 {
+        result.warn("dns_forwarder: query_timeout > 30s may cause slow DNS resolution".to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -464,6 +490,7 @@ mod tests {
             firewall: None,
             routing: RoutingConfig::default(),
             filtering: None,
+            dns_forwarder: None,
         }
     }
 

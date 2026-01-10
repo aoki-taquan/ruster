@@ -21,6 +21,8 @@ pub struct Config {
     pub routing: RoutingConfig,
     #[serde(default)]
     pub filtering: Option<FilteringConfig>,
+    #[serde(default)]
+    pub dns_forwarder: Option<DnsForwarderConfig>,
 }
 
 /// Logging configuration
@@ -122,6 +124,29 @@ pub struct FirewallConfig {
     /// If not specified, uses NAT's wan interface.
     #[serde(default)]
     pub wan_interfaces: Option<Vec<String>>,
+}
+
+/// DNS Forwarder configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct DnsForwarderConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Upstream DNS servers (e.g., ["8.8.8.8", "1.1.1.1"])
+    pub upstream: Vec<Ipv4Addr>,
+    /// Maximum cache entries (default: 1000)
+    #[serde(default = "default_cache_size")]
+    pub cache_size: usize,
+    /// Query timeout in seconds (default: 5)
+    #[serde(default = "default_query_timeout")]
+    pub query_timeout: u64,
+}
+
+fn default_cache_size() -> usize {
+    1000
+}
+
+fn default_query_timeout() -> u64 {
+    5
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -270,6 +295,8 @@ pub struct ConfigLock {
     pub routing: RoutingLock,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filtering: Option<FilteringLock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_forwarder: Option<DnsForwarderLock>,
 }
 
 /// Logging configuration in lock file (with defaults filled in)
@@ -432,6 +459,15 @@ pub struct FilterRuleLock {
     pub out_interface: Option<String>,
     pub action: String,
     pub priority: u32,
+}
+
+/// DNS Forwarder configuration in lock file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DnsForwarderLock {
+    pub enabled: bool,
+    pub upstream: Vec<Ipv4Addr>,
+    pub cache_size: usize,
+    pub query_timeout: u64,
 }
 
 impl ConfigLock {
@@ -638,6 +674,14 @@ impl ConfigLock {
                 .collect(),
         });
 
+        // Generate DNS forwarder lock
+        let dns_forwarder = config.dns_forwarder.as_ref().map(|d| DnsForwarderLock {
+            enabled: d.enabled,
+            upstream: d.upstream.clone(),
+            cache_size: d.cache_size,
+            query_timeout: d.query_timeout,
+        });
+
         ConfigLock {
             generated_at: chrono::Utc::now().to_rfc3339(),
             source_hash,
@@ -652,6 +696,7 @@ impl ConfigLock {
                 tables,
             },
             filtering,
+            dns_forwarder,
         }
     }
 }
@@ -757,6 +802,7 @@ mod tests {
             firewall: None,
             routing: RoutingConfig::default(),
             filtering: None,
+            dns_forwarder: None,
         };
 
         let lock = ConfigLock::from_config(&config, "testhash".to_string());
@@ -809,6 +855,7 @@ mod tests {
             firewall: None,
             routing: RoutingConfig::default(),
             filtering: None,
+            dns_forwarder: None,
         };
 
         let lock = ConfigLock::from_config(&config, "testhash".to_string());
@@ -849,6 +896,7 @@ mod tests {
             firewall: None,
             routing: RoutingConfig::default(),
             filtering: None,
+            dns_forwarder: None,
         };
 
         let lock = ConfigLock::from_config(&config, "testhash".to_string());

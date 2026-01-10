@@ -8,6 +8,7 @@ mod conntrack;
 mod dhcp6_client;
 mod dhcp_client;
 mod dhcp_server;
+mod dns_forwarder;
 mod fdb;
 mod filter;
 mod firewall;
@@ -26,6 +27,7 @@ pub use dhcp6_client::{
 };
 pub use dhcp_client::{DhcpClient, DhcpClientAction, DhcpClientState, DhcpLease};
 pub use dhcp_server::{DhcpAction, DhcpPool, DhcpPoolConfig, DhcpServer, LeaseEntry, LeaseState};
+pub use dns_forwarder::{DnsAction, DnsForwarder, DnsForwarderConfig, PendingQuery};
 pub use fdb::Fdb;
 pub use filter::{
     icmpv6_type, protocol, Action, Chain, FilterContext, FilterRule, IpAddr as FilterIpAddr,

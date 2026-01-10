@@ -237,6 +237,27 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
             }
         }
 
+        // Enable DNS forwarder if configured
+        if let Some(ref dns_lock) = lock.dns_forwarder {
+            if dns_lock.enabled {
+                use ruster::dataplane::DnsForwarderConfig;
+
+                let config = DnsForwarderConfig {
+                    upstream_servers: dns_lock.upstream.clone(),
+                    cache_size: dns_lock.cache_size,
+                    query_timeout_secs: dns_lock.query_timeout,
+                    negative_cache_ttl: 60,
+                };
+
+                router.enable_dns_forwarder(config);
+                info!(
+                    "DNS forwarder enabled with {} upstream servers, cache_size={}",
+                    dns_lock.upstream.len(),
+                    dns_lock.cache_size
+                );
+            }
+        }
+
         info!("Router started, processing packets...");
 
         // Create aging timer

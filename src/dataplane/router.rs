@@ -6,9 +6,10 @@
 use crate::capture::AfPacketSocket;
 use crate::dataplane::{
     network_address, process_arp, Action, ArpAction, ArpPendingQueue, ArpTable, Chain, Dhcp6Client,
-    Dhcp6ClientAction, DhcpAction, DhcpClient, DhcpClientAction, DhcpPoolConfig, DhcpServer, Fdb,
-    FilterContext, FilterIpAddr, ForwardAction, Forwarder, InterfaceInfo, NaptProcessor,
-    NaptResult, PacketFilter, Route, RouteSource, RoutingSystem, StatefulFirewall,
+    Dhcp6ClientAction, DhcpAction, DhcpClient, DhcpClientAction, DhcpPoolConfig, DhcpServer,
+    DnsAction, DnsForwarder, DnsForwarderConfig, Fdb, FilterContext, FilterIpAddr, ForwardAction,
+    Forwarder, InterfaceInfo, NaptProcessor, NaptResult, PacketFilter, Route, RouteSource,
+    RoutingSystem, StatefulFirewall,
 };
 use crate::protocol::arp::ArpPacket;
 use crate::protocol::ethernet::{Frame, FrameBuilder};
@@ -94,6 +95,8 @@ pub struct Router {
     dhcp6_client: Option<Dhcp6Client>,
     /// DHCP clients for interfaces with addressing=dhcp
     dhcp_clients: HashMap<String, DhcpClient>,
+    /// DNS forwarder (optional)
+    dns_forwarder: Option<DnsForwarder>,
     /// Metrics registry for statistics
     metrics: Arc<MetricsRegistry>,
 }
@@ -121,6 +124,7 @@ impl Router {
             dhcp_server: None,
             dhcp6_client: None,
             dhcp_clients: HashMap::new(),
+            dns_forwarder: None,
             metrics,
         }
     }
@@ -420,6 +424,25 @@ impl Router {
 
         // Remove from forwarder
         self.forwarder.remove_interface(interface);
+    }
+
+    // ===== DNS Forwarder Methods =====
+
+    /// Enable DNS forwarder
+    ///
+    /// # Arguments
+    /// * `config` - DNS forwarder configuration
+    pub fn enable_dns_forwarder(&mut self, config: DnsForwarderConfig) {
+        debug!(
+            "Enabling DNS forwarder with {} upstream servers",
+            config.upstream_servers.len()
+        );
+        self.dns_forwarder = Some(DnsForwarder::new(config));
+    }
+
+    /// Check if DNS forwarder is enabled
+    pub fn is_dns_forwarder_enabled(&self) -> bool {
+        self.dns_forwarder.is_some()
     }
 
     /// Add an interface to the router
@@ -936,6 +959,8 @@ impl Router {
             17 => {
                 // UDP
                 use crate::protocol::dhcp::DHCP_CLIENT_PORT;
+                use crate::protocol::dns::DNS_PORT;
+
                 let udp = UdpHeader::parse(ip_payload).ok()?;
 
                 match udp.dst_port() {
@@ -946,6 +971,15 @@ impl Router {
                     p if p == DHCP_CLIENT_PORT => {
                         // DHCP response (to client)
                         self.handle_dhcp_client_response(ingress_iface, udp.payload())
+                    }
+                    p if p == DNS_PORT => {
+                        // DNS query
+                        self.handle_dns_query(
+                            ingress_iface,
+                            ip_header.src_addr(),
+                            udp.src_port(),
+                            udp.payload(),
+                        )
                     }
                     _ => None,
                 }
@@ -1025,6 +1059,174 @@ impl Router {
             None
         } else {
             Some(packets)
+        }
+    }
+
+    /// Handle DNS query
+    fn handle_dns_query(
+        &mut self,
+        ingress_iface: &str,
+        client_ip: Ipv4Addr,
+        client_port: u16,
+        dns_payload: &[u8],
+    ) -> Option<Vec<(String, Vec<u8>)>> {
+        use crate::protocol::dns::DNS_PORT;
+        use crate::protocol::ipv4::Ipv4Builder;
+        use crate::protocol::udp::UdpBuilder;
+
+        let dns_forwarder = self.dns_forwarder.as_mut()?;
+        let action =
+            dns_forwarder.process_query(ingress_iface, client_ip, client_port, dns_payload);
+
+        match action {
+            DnsAction::Reply {
+                interface,
+                packet,
+                dst_ip,
+                dst_port,
+            } => {
+                let iface = self.interfaces.get(&interface)?;
+                let src_ip = iface.ip_addr?;
+
+                // Build UDP packet
+                let udp_packet = UdpBuilder::new()
+                    .src_port(DNS_PORT)
+                    .dst_port(dst_port)
+                    .payload(&packet)
+                    .build(src_ip, dst_ip);
+
+                // Build IPv4 packet
+                let ip_packet = Ipv4Builder::new()
+                    .src_addr(src_ip)
+                    .dst_addr(dst_ip)
+                    .ttl(64)
+                    .protocol(17) // UDP
+                    .payload(&udp_packet)
+                    .build();
+
+                // Lookup MAC for reply
+                if let Some((dst_mac, _)) = self.arp_table.lookup(&dst_ip) {
+                    let frame = FrameBuilder::new()
+                        .src_mac(iface.mac_addr)
+                        .dst_mac(dst_mac)
+                        .ethertype(EtherType::Ipv4 as u16)
+                        .payload(&ip_packet)
+                        .build();
+
+                    debug!("Sending DNS reply to {}:{}", dst_ip, dst_port);
+                    Some(vec![(interface, frame)])
+                } else {
+                    // Need ARP resolution - queue the packet
+                    debug!("DNS reply needs ARP resolution for {}", dst_ip);
+                    None
+                }
+            }
+            DnsAction::Forward {
+                upstream,
+                packet,
+                original_id: _,
+            } => {
+                // Forward query to upstream DNS server
+                // This requires sending a packet to the upstream DNS server
+                // For now, we need to build the packet and send it via WAN interface
+                let wan_iface = self.wan_interface.as_ref()?;
+                let iface = self.interfaces.get(wan_iface)?;
+                let src_ip = iface.ip_addr?;
+
+                // Build UDP packet for upstream
+                let udp_packet = UdpBuilder::new()
+                    .src_port(DNS_PORT) // Use DNS port as source
+                    .dst_port(DNS_PORT)
+                    .payload(&packet)
+                    .build(src_ip, upstream);
+
+                // Build IPv4 packet
+                let ip_packet = Ipv4Builder::new()
+                    .src_addr(src_ip)
+                    .dst_addr(upstream)
+                    .ttl(64)
+                    .protocol(17) // UDP
+                    .payload(&udp_packet)
+                    .build();
+
+                // Lookup MAC for upstream (via default gateway if needed)
+                // For now, use ARP table directly
+                if let Some((dst_mac, _)) = self.arp_table.lookup(&upstream) {
+                    let frame = FrameBuilder::new()
+                        .src_mac(iface.mac_addr)
+                        .dst_mac(dst_mac)
+                        .ethertype(EtherType::Ipv4 as u16)
+                        .payload(&ip_packet)
+                        .build();
+
+                    debug!("Forwarding DNS query to upstream {}", upstream);
+                    Some(vec![(wan_iface.clone(), frame)])
+                } else {
+                    // Need routing/ARP for upstream - use normal forwarding path
+                    debug!("DNS forward needs ARP resolution for upstream {}", upstream);
+                    None
+                }
+            }
+            DnsAction::None => None,
+        }
+    }
+
+    /// Handle DNS response from upstream
+    pub fn handle_dns_response(
+        &mut self,
+        upstream_ip: Ipv4Addr,
+        dns_payload: &[u8],
+    ) -> Option<Vec<(String, Vec<u8>)>> {
+        use crate::protocol::dns::DNS_PORT;
+        use crate::protocol::ipv4::Ipv4Builder;
+        use crate::protocol::udp::UdpBuilder;
+
+        let dns_forwarder = self.dns_forwarder.as_mut()?;
+        let action = dns_forwarder.process_response(upstream_ip, dns_payload);
+
+        match action {
+            DnsAction::Reply {
+                interface,
+                packet,
+                dst_ip,
+                dst_port,
+            } => {
+                let iface = self.interfaces.get(&interface)?;
+                let src_ip = iface.ip_addr?;
+
+                // Build UDP packet
+                let udp_packet = UdpBuilder::new()
+                    .src_port(DNS_PORT)
+                    .dst_port(dst_port)
+                    .payload(&packet)
+                    .build(src_ip, dst_ip);
+
+                // Build IPv4 packet
+                let ip_packet = Ipv4Builder::new()
+                    .src_addr(src_ip)
+                    .dst_addr(dst_ip)
+                    .ttl(64)
+                    .protocol(17) // UDP
+                    .payload(&udp_packet)
+                    .build();
+
+                // Lookup MAC for reply
+                if let Some((dst_mac, _)) = self.arp_table.lookup(&dst_ip) {
+                    let frame = FrameBuilder::new()
+                        .src_mac(iface.mac_addr)
+                        .dst_mac(dst_mac)
+                        .ethertype(EtherType::Ipv4 as u16)
+                        .payload(&ip_packet)
+                        .build();
+
+                    debug!("Sending DNS response to {}:{}", dst_ip, dst_port);
+                    Some(vec![(interface, frame)])
+                } else {
+                    debug!("DNS response needs ARP resolution for {}", dst_ip);
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
