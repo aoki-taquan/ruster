@@ -51,6 +51,20 @@ pub struct InterfaceConfig {
     pub mtu: Option<u16>,
     pub vlan_mode: Option<VlanMode>,
     pub vlan_config: Option<VlanConfig>,
+    /// DHCPv6 client configuration
+    #[serde(default)]
+    pub dhcp6: Option<Dhcp6ClientConfig>,
+}
+
+/// DHCPv6 client configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct Dhcp6ClientConfig {
+    /// Enable DHCPv6 client
+    #[serde(default)]
+    pub enabled: bool,
+    /// Use rapid commit (2-message exchange)
+    #[serde(default = "default_true")]
+    pub rapid_commit: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -275,6 +289,15 @@ pub struct InterfaceLock {
     pub duplex: String,
     pub vlan_mode: Option<String>,
     pub vlan_config: Option<VlanLockConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dhcp6: Option<Dhcp6ClientLock>,
+}
+
+/// DHCPv6 client configuration in lock file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Dhcp6ClientLock {
+    pub enabled: bool,
+    pub rapid_commit: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,6 +451,11 @@ impl ConfigLock {
                     allowed_vlans: cfg.allowed_vlans.clone().unwrap_or_default(),
                 });
 
+                let dhcp6 = iface.dhcp6.as_ref().map(|d| Dhcp6ClientLock {
+                    enabled: d.enabled,
+                    rapid_commit: d.rapid_commit,
+                });
+
                 (
                     name.clone(),
                     InterfaceLock {
@@ -439,6 +467,7 @@ impl ConfigLock {
                         duplex: "auto".to_string(),
                         vlan_mode,
                         vlan_config,
+                        dhcp6,
                     },
                 )
             })
@@ -716,6 +745,7 @@ mod tests {
                 mtu: None,
                 vlan_mode: None,
                 vlan_config: None,
+                dhcp6: None,
             },
         );
 
@@ -767,6 +797,7 @@ mod tests {
                     access_vlan: Some(10),
                     allowed_vlans: None,
                 }),
+                dhcp6: None,
             },
         );
 
@@ -806,6 +837,7 @@ mod tests {
                     access_vlan: None,
                     allowed_vlans: Some(vec![1, 10, 20]),
                 }),
+                dhcp6: None,
             },
         );
 

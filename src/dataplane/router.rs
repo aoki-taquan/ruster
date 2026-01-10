@@ -5,9 +5,10 @@
 
 use crate::capture::AfPacketSocket;
 use crate::dataplane::{
-    process_arp, Action, ArpAction, ArpPendingQueue, ArpTable, Chain, DhcpAction, DhcpPoolConfig,
-    DhcpServer, Fdb, FilterContext, FilterIpAddr, ForwardAction, Forwarder, InterfaceInfo,
-    NaptProcessor, NaptResult, PacketFilter, RoutingSystem, StatefulFirewall,
+    process_arp, Action, ArpAction, ArpPendingQueue, ArpTable, Chain, Dhcp6Client,
+    Dhcp6ClientAction, DhcpAction, DhcpPoolConfig, DhcpServer, Fdb, FilterContext, FilterIpAddr,
+    ForwardAction, Forwarder, InterfaceInfo, NaptProcessor, NaptResult, PacketFilter,
+    RoutingSystem, StatefulFirewall,
 };
 use crate::protocol::arp::ArpPacket;
 use crate::protocol::ethernet::{Frame, FrameBuilder};
@@ -17,7 +18,7 @@ use crate::protocol::types::EtherType;
 use crate::protocol::MacAddr;
 use crate::telemetry::MetricsRegistry;
 use std::collections::{HashMap, HashSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::{interval, Interval};
@@ -53,6 +54,8 @@ pub struct Interface {
     pub ip_addr: Option<Ipv4Addr>,
     /// Prefix length (if configured)
     pub prefix_len: Option<u8>,
+    /// IPv6 addresses (if configured)
+    pub ipv6_addrs: Vec<Ipv6Addr>,
     /// Port ID for FDB
     pub port_id: PortId,
 }
@@ -87,6 +90,8 @@ pub struct Router {
     firewall: Option<StatefulFirewall>,
     /// DHCP server (optional)
     dhcp_server: Option<DhcpServer>,
+    /// DHCPv6 client (optional)
+    dhcp6_client: Option<Dhcp6Client>,
     /// Metrics registry for statistics
     metrics: Arc<MetricsRegistry>,
 }
@@ -112,6 +117,7 @@ impl Router {
             filter: None,
             firewall: None,
             dhcp_server: None,
+            dhcp6_client: None,
             metrics,
         }
     }
@@ -205,6 +211,52 @@ impl Router {
             .is_some_and(|s| s.has_pool(interface))
     }
 
+    /// Enable DHCPv6 client for an interface
+    ///
+    /// # Arguments
+    /// * `interface` - Interface name to enable DHCPv6 client on
+    pub fn enable_dhcp6(&mut self, interface: &str) -> Vec<Dhcp6ClientAction> {
+        let iface = match self.interfaces.get(interface) {
+            Some(i) => i,
+            None => {
+                warn!("Cannot enable DHCPv6: interface {} not found", interface);
+                return vec![];
+            }
+        };
+
+        let mac = iface.mac_addr;
+        debug!("Enabling DHCPv6 client on {}", interface);
+
+        let client = self.dhcp6_client.get_or_insert_with(Dhcp6Client::new);
+        client.add_interface(interface.to_string(), &mac);
+        client.start(interface)
+    }
+
+    /// Disable DHCPv6 client for an interface
+    pub fn disable_dhcp6(&mut self, interface: &str) -> Vec<Dhcp6ClientAction> {
+        if let Some(ref mut client) = self.dhcp6_client {
+            return client.remove_interface(interface);
+        }
+        vec![]
+    }
+
+    /// Check if DHCPv6 client is enabled for an interface
+    pub fn is_dhcp6_enabled(&self, interface: &str) -> bool {
+        self.dhcp6_client
+            .as_ref()
+            .is_some_and(|c| c.has_interface(interface))
+    }
+
+    /// Get DHCPv6 client reference
+    pub fn dhcp6_client(&self) -> Option<&Dhcp6Client> {
+        self.dhcp6_client.as_ref()
+    }
+
+    /// Get mutable DHCPv6 client reference
+    pub fn dhcp6_client_mut(&mut self) -> Option<&mut Dhcp6Client> {
+        self.dhcp6_client.as_mut()
+    }
+
     /// Add an interface to the router
     pub fn add_interface(
         &mut self,
@@ -244,6 +296,7 @@ impl Router {
                 mac_addr,
                 ip_addr,
                 prefix_len,
+                ipv6_addrs: Vec::new(),
                 port_id,
             },
         );
@@ -878,6 +931,12 @@ impl Router {
         // Run DHCP maintenance if enabled
         if let Some(ref mut dhcp) = self.dhcp_server {
             dhcp.run_maintenance();
+        }
+
+        // Run DHCPv6 client maintenance if enabled
+        if let Some(ref mut dhcp6) = self.dhcp6_client {
+            let _actions = dhcp6.run_maintenance();
+            // TODO: Process DHCPv6 client actions (send packets, update addresses)
         }
 
         // Update table size metrics

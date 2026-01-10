@@ -505,6 +505,7 @@ mod tests {
                 mtu: None,
                 vlan_mode: None,
                 vlan_config: None,
+                dhcp6: None,
             },
         );
         interfaces.insert(
@@ -516,6 +517,7 @@ mod tests {
                 mtu: None,
                 vlan_mode: None,
                 vlan_config: None,
+                dhcp6: None,
             },
         );
 

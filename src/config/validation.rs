@@ -52,6 +52,7 @@ pub fn validate(config: &Config) -> ValidationResult {
     validate_interfaces(config, &mut result);
     validate_vlan(config, &mut result);
     validate_dhcp(config, &mut result);
+    validate_dhcp6(config, &mut result);
     validate_nat(config, &mut result);
     validate_routing(config, &mut result);
     validate_policy(config, &mut result);
@@ -206,6 +207,29 @@ fn validate_dhcp(config: &Config, result: &mut ValidationResult) {
                 name, dhcp.range.0, dhcp.range.1
             ));
         }
+    }
+}
+
+fn validate_dhcp6(config: &Config, result: &mut ValidationResult) {
+    for (name, iface) in &config.interfaces {
+        let Some(dhcp6) = &iface.dhcp6 else {
+            continue;
+        };
+
+        if !dhcp6.enabled {
+            continue;
+        }
+
+        // DHCPv6 client is typically used on WAN interfaces
+        if iface.role != InterfaceRole::Wan {
+            result.warn(format!(
+                "interfaces.{}: DHCPv6 client enabled on non-WAN interface",
+                name
+            ));
+        }
+
+        // DHCPv6 client requires the interface to exist (already validated)
+        // No additional validation needed for rapid_commit as it's a simple boolean
     }
 }
 
@@ -425,8 +449,8 @@ fn validate_routing_tables(config: &Config, result: &mut ValidationResult) {
 mod tests {
     use super::*;
     use crate::config::{
-        Addressing, DhcpConfig, InterfaceConfig, InterfaceRole, NatConfig, RoutingConfig,
-        StaticRoute, VlanConfig, VlanMode,
+        Addressing, Dhcp6ClientConfig, DhcpConfig, InterfaceConfig, InterfaceRole, NatConfig,
+        RoutingConfig, StaticRoute, VlanConfig, VlanMode,
     };
     use std::collections::HashMap;
     use std::net::Ipv4Addr;
@@ -463,6 +487,7 @@ mod tests {
                 mtu: Some(1500),
                 vlan_mode: None,
                 vlan_config: None,
+                dhcp6: None,
             },
         );
         let result = validate(&config);
@@ -485,6 +510,7 @@ mod tests {
                 mtu: Some(1500),
                 vlan_mode: None,
                 vlan_config: None,
+                dhcp6: None,
             },
         );
         let result = validate(&config);
@@ -507,6 +533,7 @@ mod tests {
                 mtu: Some(1500),
                 vlan_mode: None,
                 vlan_config: None,
+                dhcp6: None,
             },
         );
         let result = validate(&config);
@@ -525,6 +552,7 @@ mod tests {
                 mtu: None, // Will warn
                 vlan_mode: None,
                 vlan_config: None,
+                dhcp6: None,
             },
         );
         let result = validate(&config);
@@ -580,6 +608,7 @@ mod tests {
                 mtu: Some(1500),
                 vlan_mode: None,
                 vlan_config: None,
+                dhcp6: None,
             },
         );
         config.nat = Some(NatConfig {
@@ -642,6 +671,7 @@ mod tests {
                     access_vlan: Some(10),
                     allowed_vlans: None,
                 }),
+                dhcp6: None,
             },
         );
         let result = validate(&config);
@@ -664,6 +694,7 @@ mod tests {
                     access_vlan: None,
                     allowed_vlans: Some(vec![1, 10, 20]),
                 }),
+                dhcp6: None,
             },
         );
         let result = validate(&config);
@@ -686,6 +717,7 @@ mod tests {
                     access_vlan: Some(10),
                     allowed_vlans: None,
                 }),
+                dhcp6: None,
             },
         );
         let result = validate(&config);
@@ -709,6 +741,7 @@ mod tests {
                     access_vlan: Some(4095), // Invalid!
                     allowed_vlans: None,
                 }),
+                dhcp6: None,
             },
         );
         let result = validate(&config);
@@ -732,6 +765,7 @@ mod tests {
                     access_vlan: None, // Missing!
                     allowed_vlans: None,
                 }),
+                dhcp6: None,
             },
         );
         let result = validate(&config);
@@ -758,6 +792,7 @@ mod tests {
                     access_vlan: None,
                     allowed_vlans: None, // Missing!
                 }),
+                dhcp6: None,
             },
         );
         let result = validate(&config);
@@ -784,6 +819,7 @@ mod tests {
                     access_vlan: None,
                     allowed_vlans: Some(vec![1, 10, 20]),
                 }),
+                dhcp6: None,
             },
         );
         let result = validate(&config);
@@ -792,5 +828,82 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("native_vlan 100 is not in allowed_vlans")));
+    }
+
+    // DHCPv6 validation tests
+
+    #[test]
+    fn test_dhcp6_wan_no_warning() {
+        let mut config = make_config();
+        config.interfaces.insert(
+            "eth0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Wan,
+                addressing: Addressing::Dhcp,
+                address: None,
+                mtu: Some(1500),
+                vlan_mode: None,
+                vlan_config: None,
+                dhcp6: Some(Dhcp6ClientConfig {
+                    enabled: true,
+                    rapid_commit: true,
+                }),
+            },
+        );
+        let result = validate(&config);
+        assert!(!result.has_errors());
+        // No warning for DHCPv6 on WAN
+        assert!(!result.warnings.iter().any(|w| w.contains("DHCPv6 client")));
+    }
+
+    #[test]
+    fn test_dhcp6_lan_warning() {
+        let mut config = make_config();
+        config.interfaces.insert(
+            "eth0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Lan,
+                addressing: Addressing::Static,
+                address: Some("192.168.1.1/24".to_string()),
+                mtu: Some(1500),
+                vlan_mode: None,
+                vlan_config: None,
+                dhcp6: Some(Dhcp6ClientConfig {
+                    enabled: true,
+                    rapid_commit: false,
+                }),
+            },
+        );
+        let result = validate(&config);
+        assert!(!result.has_errors());
+        // Warning for DHCPv6 on non-WAN interface
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.contains("DHCPv6 client enabled on non-WAN interface")));
+    }
+
+    #[test]
+    fn test_dhcp6_disabled_no_warning() {
+        let mut config = make_config();
+        config.interfaces.insert(
+            "eth0".to_string(),
+            InterfaceConfig {
+                role: InterfaceRole::Lan,
+                addressing: Addressing::Static,
+                address: Some("192.168.1.1/24".to_string()),
+                mtu: Some(1500),
+                vlan_mode: None,
+                vlan_config: None,
+                dhcp6: Some(Dhcp6ClientConfig {
+                    enabled: false, // Disabled
+                    rapid_commit: true,
+                }),
+            },
+        );
+        let result = validate(&config);
+        assert!(!result.has_errors());
+        // No warning when DHCPv6 is disabled
+        assert!(!result.warnings.iter().any(|w| w.contains("DHCPv6 client")));
     }
 }

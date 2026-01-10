@@ -5,6 +5,7 @@
 mod arp_processor;
 mod arp_table;
 mod conntrack;
+mod dhcp6_client;
 mod dhcp_server;
 mod fdb;
 mod filter;
@@ -19,6 +20,9 @@ mod routing;
 
 pub use arp_processor::{process_arp, ArpAction, ArpPendingQueue};
 pub use arp_table::{ArpState, ArpTable};
+pub use dhcp6_client::{
+    Dhcp6Client, Dhcp6ClientAction, Dhcp6ClientInterface, Dhcp6Lease, Dhcp6State, LeaseAddress,
+};
 pub use dhcp_server::{DhcpAction, DhcpPool, DhcpPoolConfig, DhcpServer, LeaseEntry, LeaseState};
 pub use fdb::Fdb;
 pub use filter::{
