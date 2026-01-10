@@ -121,6 +121,7 @@ impl Dhcp6Lease {
 
 /// Received ADVERTISE message info
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields reserved for future use
 struct ReceivedAdvertise {
     server_duid: Duid,
     preference: u8,
@@ -970,7 +971,7 @@ impl Dhcp6Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::dhcpv6::{Dhcp6Builder, Dhcp6MessageType, Duid};
+    use crate::protocol::dhcpv6::{Dhcp6MessageType, Duid};
 
     fn make_mac() -> MacAddr {
         MacAddr([0x00, 0x11, 0x22, 0x33, 0x44, 0x55])
