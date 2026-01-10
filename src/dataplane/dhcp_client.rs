@@ -253,19 +253,14 @@ impl DhcpClient {
             (DhcpClientState::Selecting, DhcpMessageType::Offer) => self.handle_offer(&msg),
             (DhcpClientState::Requesting, DhcpMessageType::Ack) => self.handle_ack(&msg),
             (DhcpClientState::Requesting, DhcpMessageType::Nak) => self.handle_nak(),
-            (
-                DhcpClientState::Renewing | DhcpClientState::Rebinding,
-                DhcpMessageType::Ack,
-            ) => self.handle_renew_ack(&msg),
-            (
-                DhcpClientState::Renewing | DhcpClientState::Rebinding,
-                DhcpMessageType::Nak,
-            ) => self.handle_nak(),
+            (DhcpClientState::Renewing | DhcpClientState::Rebinding, DhcpMessageType::Ack) => {
+                self.handle_renew_ack(&msg)
+            }
+            (DhcpClientState::Renewing | DhcpClientState::Rebinding, DhcpMessageType::Nak) => {
+                self.handle_nak()
+            }
             _ => {
-                debug!(
-                    "DHCP: Unexpected {:?} in state {:?}",
-                    msg_type, self.state
-                );
+                debug!("DHCP: Unexpected {:?} in state {:?}", msg_type, self.state);
                 DhcpClientAction::None
             }
         }
@@ -396,9 +391,7 @@ impl DhcpClient {
 
         let server_id = msg.server_id().unwrap_or(Ipv4Addr::UNSPECIFIED);
 
-        let lease_time = msg
-            .find_option_u32(options::LEASE_TIME)
-            .unwrap_or(86400); // Default 24 hours
+        let lease_time = msg.find_option_u32(options::LEASE_TIME).unwrap_or(86400); // Default 24 hours
 
         let renewal_time = msg
             .find_option_u32(options::RENEWAL_TIME)
@@ -424,7 +417,10 @@ impl DhcpClient {
 
     /// Handle DHCP NAK - restart discovery
     fn handle_nak(&mut self) -> DhcpClientAction {
-        warn!("DHCP: Received NAK on {}, restarting discovery", self.interface);
+        warn!(
+            "DHCP: Received NAK on {}, restarting discovery",
+            self.interface
+        );
         self.lease = None;
         self.start()
     }
@@ -693,9 +689,7 @@ mod tests {
         let action = client.start();
 
         match action {
-            DhcpClientAction::SendPacket {
-                dst_ip, packet, ..
-            } => {
+            DhcpClientAction::SendPacket { dst_ip, packet, .. } => {
                 assert_eq!(dst_ip, Ipv4Addr::BROADCAST);
                 let dhcp = DhcpHeader::parse(&packet).unwrap();
                 assert_eq!(dhcp.message_type(), Some(DhcpMessageType::Discover));
@@ -847,7 +841,11 @@ mod tests {
         client.start();
         let xid = client.xid;
 
-        let offer = make_offer(xid, Ipv4Addr::new(192, 168, 1, 100), Ipv4Addr::new(192, 168, 1, 1));
+        let offer = make_offer(
+            xid,
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 1),
+        );
         let action = client.process_response(&offer);
 
         match action {
@@ -868,7 +866,11 @@ mod tests {
         let xid = client.xid;
 
         // Simulate OFFER
-        let offer = make_offer(xid, Ipv4Addr::new(192, 168, 1, 100), Ipv4Addr::new(192, 168, 1, 1));
+        let offer = make_offer(
+            xid,
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 1),
+        );
         client.process_response(&offer);
 
         // Simulate ACK
@@ -883,7 +885,12 @@ mod tests {
         let action = client.process_response(&ack);
 
         match action {
-            DhcpClientAction::ConfigureInterface { ip_addr, prefix_len, gateway, .. } => {
+            DhcpClientAction::ConfigureInterface {
+                ip_addr,
+                prefix_len,
+                gateway,
+                ..
+            } => {
                 assert_eq!(ip_addr, Ipv4Addr::new(192, 168, 1, 100));
                 assert_eq!(prefix_len, 24);
                 assert_eq!(gateway, Some(Ipv4Addr::new(192, 168, 1, 1)));
@@ -901,7 +908,11 @@ mod tests {
         client.start();
         let xid = client.xid;
 
-        let offer = make_offer(xid, Ipv4Addr::new(192, 168, 1, 100), Ipv4Addr::new(192, 168, 1, 1));
+        let offer = make_offer(
+            xid,
+            Ipv4Addr::new(192, 168, 1, 100),
+            Ipv4Addr::new(192, 168, 1, 1),
+        );
         client.process_response(&offer);
 
         let nak = make_nak(xid);
