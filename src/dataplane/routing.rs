@@ -184,7 +184,7 @@ fn parse_cidr(cidr: &str) -> Option<(Ipv4Addr, u8)> {
 }
 
 /// Calculate network address from IP and prefix length
-fn network_address(ip: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
+pub fn network_address(ip: Ipv4Addr, prefix_len: u8) -> Ipv4Addr {
     let ip_bits = u32::from(ip);
     let mask = if prefix_len == 0 {
         0
