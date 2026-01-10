@@ -112,6 +112,10 @@ pub struct FirewallConfig {
 pub struct RoutingConfig {
     #[serde(default)]
     pub static_routes: Vec<StaticRoute>,
+    #[serde(default)]
+    pub policy: Vec<PolicyRuleConfig>,
+    #[serde(default)]
+    pub tables: Vec<RoutingTableConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -120,6 +124,63 @@ pub struct StaticRoute {
     pub gateway: String,
     #[serde(default)]
     pub interface: Option<String>,
+}
+
+/// Policy rule from configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct PolicyRuleConfig {
+    pub name: Option<String>,
+    pub priority: u32,
+    #[serde(rename = "match", default)]
+    pub match_config: PolicyMatchConfig,
+    pub action: PolicyActionConfig,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Policy match conditions from configuration
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PolicyMatchConfig {
+    pub src_ip: Option<String>,
+    pub dst_ip: Option<String>,
+    /// Protocol: "tcp", "udp", "icmp", or number
+    pub protocol: Option<String>,
+    /// Port or range: "80" or "1024-65535"
+    pub src_port: Option<String>,
+    /// Port or range: "80" or "1024-65535"
+    pub dst_port: Option<String>,
+    pub ingress_interface: Option<String>,
+}
+
+/// Policy action from configuration
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PolicyActionConfig {
+    RouteVia {
+        next_hop: String,
+        interface: Option<String>,
+    },
+    RouteInterface {
+        interface: String,
+    },
+    UseTable {
+        table_id: u32,
+    },
+    Drop,
+    UseDefault,
+}
+
+/// Named routing table configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoutingTableConfig {
+    pub id: u32,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub routes: Vec<StaticRoute>,
 }
 
 // ============================================================================
@@ -193,6 +254,10 @@ pub struct FirewallLock {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RoutingLock {
     pub static_routes: Vec<StaticRouteLock>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy: Vec<PolicyRuleLock>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<RoutingTableLock>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +266,62 @@ pub struct StaticRouteLock {
     pub gateway: String,
     pub interface: String,
     pub source: String,
+}
+
+/// Policy rule in lock file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyRuleLock {
+    pub name: String,
+    pub priority: u32,
+    pub enabled: bool,
+    #[serde(rename = "match")]
+    pub match_lock: PolicyMatchLock,
+    pub action: PolicyActionLock,
+}
+
+/// Policy match conditions in lock file
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PolicyMatchLock {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_ip: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub src_port: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dst_port: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ingress_interface: Option<String>,
+}
+
+/// Policy action in lock file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PolicyActionLock {
+    RouteVia {
+        next_hop: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        interface: Option<String>,
+    },
+    RouteInterface {
+        interface: String,
+    },
+    UseTable {
+        table_id: u32,
+    },
+    Drop,
+    UseDefault,
+}
+
+/// Routing table in lock file
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingTableLock {
+    pub id: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    pub routes: Vec<StaticRouteLock>,
 }
 
 impl ConfigLock {
@@ -318,6 +439,67 @@ impl ConfigLock {
                 format: default_log_format(),
             });
 
+        // Generate policy rules lock
+        let policy: Vec<PolicyRuleLock> = config
+            .routing
+            .policy
+            .iter()
+            .enumerate()
+            .map(|(i, rule)| PolicyRuleLock {
+                name: rule.name.clone().unwrap_or_else(|| format!("policy-{}", i)),
+                priority: rule.priority,
+                enabled: rule.enabled,
+                match_lock: PolicyMatchLock {
+                    src_ip: rule.match_config.src_ip.clone(),
+                    dst_ip: rule.match_config.dst_ip.clone(),
+                    protocol: rule.match_config.protocol.clone(),
+                    src_port: rule.match_config.src_port.clone(),
+                    dst_port: rule.match_config.dst_port.clone(),
+                    ingress_interface: rule.match_config.ingress_interface.clone(),
+                },
+                action: match &rule.action {
+                    PolicyActionConfig::RouteVia {
+                        next_hop,
+                        interface,
+                    } => PolicyActionLock::RouteVia {
+                        next_hop: next_hop.clone(),
+                        interface: interface.clone(),
+                    },
+                    PolicyActionConfig::RouteInterface { interface } => {
+                        PolicyActionLock::RouteInterface {
+                            interface: interface.clone(),
+                        }
+                    }
+                    PolicyActionConfig::UseTable { table_id } => PolicyActionLock::UseTable {
+                        table_id: *table_id,
+                    },
+                    PolicyActionConfig::Drop => PolicyActionLock::Drop,
+                    PolicyActionConfig::UseDefault => PolicyActionLock::UseDefault,
+                },
+            })
+            .collect();
+
+        // Generate routing tables lock
+        let tables: Vec<RoutingTableLock> = config
+            .routing
+            .tables
+            .iter()
+            .map(|table| RoutingTableLock {
+                id: table.id,
+                name: table.name.clone(),
+                routes: table
+                    .routes
+                    .iter()
+                    .map(|route| StaticRouteLock {
+                        destination: route.destination.clone(),
+                        gateway: route.gateway.clone(),
+                        interface: route.interface.clone().unwrap_or_default(),
+                        source: "config".to_string(),
+                    })
+                    .collect(),
+            })
+            .collect();
+
         ConfigLock {
             generated_at: chrono::Utc::now().to_rfc3339(),
             source_hash,
@@ -328,6 +510,8 @@ impl ConfigLock {
             firewall,
             routing: RoutingLock {
                 static_routes: all_routes,
+                policy,
+                tables,
             },
         }
     }

@@ -6,7 +6,7 @@
 use crate::capture::AfPacketSocket;
 use crate::dataplane::{
     process_arp, ArpAction, ArpPendingQueue, ArpTable, Fdb, ForwardAction, Forwarder,
-    InterfaceInfo, NaptProcessor, NaptResult, RoutingTable, StatefulFirewall,
+    InterfaceInfo, NaptProcessor, NaptResult, RoutingSystem, StatefulFirewall,
 };
 use crate::protocol::arp::ArpPacket;
 use crate::protocol::ethernet::{Frame, FrameBuilder};
@@ -65,8 +65,8 @@ pub struct Router {
     all_ports: HashSet<PortId>,
     /// L2 forwarding database
     fdb: Fdb,
-    /// IP routing table
-    routing_table: RoutingTable,
+    /// IP routing system with policy-based routing support
+    routing_system: RoutingSystem,
     /// ARP table
     arp_table: ArpTable,
     /// Pending packets waiting for ARP resolution
@@ -93,7 +93,7 @@ impl Router {
             port_to_name: HashMap::new(),
             all_ports: HashSet::new(),
             fdb: Fdb::new(Duration::from_secs(FDB_AGING_SECS)),
-            routing_table: RoutingTable::new(),
+            routing_system: RoutingSystem::new(),
             arp_table: ArpTable::new(
                 Duration::from_secs(ARP_REACHABLE_SECS),
                 Duration::from_secs(ARP_STALE_SECS),
@@ -209,7 +209,17 @@ impl Router {
 
     /// Add a static route
     pub fn add_route(&mut self, route: crate::dataplane::Route) {
-        self.routing_table.add(route);
+        self.routing_system.main_table_mut().add(route);
+    }
+
+    /// Get mutable reference to the routing system
+    pub fn routing_system_mut(&mut self) -> &mut RoutingSystem {
+        &mut self.routing_system
+    }
+
+    /// Get reference to the routing system
+    pub fn routing_system(&self) -> &RoutingSystem {
+        &self.routing_system
     }
 
     /// Get interface by name
@@ -421,9 +431,10 @@ impl Router {
         let (packet_to_forward, is_inbound_nat) = self.apply_napt_if_needed(ingress_iface, payload);
         let packet_to_forward = packet_to_forward?;
 
-        let action = self.forwarder.forward(
+        let action = self.forwarder.forward_with_policy(
             &packet_to_forward,
-            &self.routing_table,
+            ingress_iface,
+            &self.routing_system,
             &self.arp_table,
             &mut self.arp_pending,
         );
@@ -643,7 +654,8 @@ impl Router {
         // Update table size metrics
         self.metrics.set_fdb_table_size(self.fdb.len());
         self.metrics.set_arp_table_size(self.arp_table.len());
-        self.metrics.set_route_count(self.routing_table.len());
+        self.metrics
+            .set_route_count(self.routing_system.main_table().len());
     }
 
     /// Create an aging timer interval
