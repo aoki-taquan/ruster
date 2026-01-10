@@ -648,8 +648,8 @@ mod tests {
         let packet = server.build_ra();
 
         // Verify RDNSS option is present (type 25)
-        let mut found_rdnss = false;
         let mut offset = 16; // Skip RA header + SLLA
+        let mut found_rdnss = false;
         while offset + 2 <= packet.len() {
             let opt_type = packet[offset];
             let opt_len = packet[offset + 1] as usize * 8;
@@ -662,6 +662,7 @@ mod tests {
             }
             offset += opt_len;
         }
+        assert!(found_rdnss, "RDNSS option not found in RA packet");
 
         // Note: The packet structure may vary, so we just check it was built without error
         assert!(packet.len() > 16);

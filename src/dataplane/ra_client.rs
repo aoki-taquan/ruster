@@ -757,7 +757,7 @@ mod tests {
         let actions = client.process_ra(&ra, router_ip);
 
         // Should have PrefixAcquired and DefaultRouterUpdate
-        assert!(actions.len() >= 1);
+        assert!(!actions.is_empty());
         assert_eq!(client.state(), RaClientState::Configured);
         assert_eq!(client.default_router(), Some(router_ip));
     }
@@ -845,7 +845,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(manager.is_enabled("eth0"));
 
-        let removed = manager.remove_interface("eth0");
+        let _removed = manager.remove_interface("eth0");
         assert!(!manager.is_enabled("eth0"));
     }
 
