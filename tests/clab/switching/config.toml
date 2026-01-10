@@ -1,0 +1,11 @@
+# L2 switching test configuration
+# Bridge mode - no IP addresses on ports
+
+[interfaces.eth1]
+role = "lan"
+
+[interfaces.eth2]
+role = "lan"
+
+[interfaces.eth3]
+role = "lan"
