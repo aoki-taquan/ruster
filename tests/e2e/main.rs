@@ -70,36 +70,62 @@ fn test_ping_connectivity() {
 
 /// Test L3 forwarding through ruster
 ///
-/// This test requires ruster to be running and processing packets.
-/// Currently uses Linux kernel IP forwarding as a baseline.
-///
-/// Once ruster's main loop is implemented, this should:
-/// 1. Start ruster in the container
-/// 2. Disable kernel IP forwarding
-/// 3. Verify traffic flows through ruster
+/// This test verifies that ruster (not Linux kernel) handles packet forwarding.
+/// Kernel IP forwarding is disabled and ruster processes packets in userspace.
 #[test]
 #[cfg_attr(not(feature = "e2e"), ignore)]
 fn test_routing_through_ruster() {
     let topo = Topology::deploy(topology_path()).expect("Failed to deploy topology");
 
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // Ensure kernel forwarding is disabled
+    topo.disable_kernel_forwarding();
 
-    // Currently relies on Linux kernel forwarding
-    // TODO: Once ruster main loop is implemented:
-    //   1. topo.exec("ruster", "sysctl -w net.ipv4.ip_forward=0")
-    //   2. topo.exec("ruster", "/usr/local/bin/ruster &")
-    //   3. Verify packets go through ruster, not kernel
+    // Generate config.lock from config.toml
+    let output = topo.generate_config();
+    assert!(
+        output.status.success(),
+        "Failed to generate config.lock: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Start ruster
+    assert!(topo.start_ruster(), "Failed to start ruster");
+
+    // Wait for ruster to initialize and ARP tables to populate
+    std::thread::sleep(std::time::Duration::from_secs(3));
 
     // Test: Client can reach server through ruster
     assert!(
-        topo.ping("client", "10.0.2.2", 3),
+        topo.ping("client", "10.0.2.2", 5),
         "Client should be able to ping server (10.0.2.2) through ruster"
     );
 
     // Test: Server can reach client through ruster
     assert!(
-        topo.ping("server", "10.0.1.2", 3),
+        topo.ping("server", "10.0.1.2", 5),
         "Server should be able to ping client (10.0.1.2) through ruster"
+    );
+}
+
+/// Test that kernel forwarding is truly disabled
+///
+/// This test verifies that without ruster running, packets are NOT forwarded.
+/// This confirms that our tests are actually testing ruster, not the kernel.
+#[test]
+#[cfg_attr(not(feature = "e2e"), ignore)]
+fn test_kernel_forwarding_disabled() {
+    let topo = Topology::deploy(topology_path()).expect("Failed to deploy topology");
+
+    // Ensure kernel forwarding is disabled
+    topo.disable_kernel_forwarding();
+
+    // Do NOT start ruster - we want to verify kernel doesn't forward
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Without ruster, packets should NOT be forwarded
+    assert!(
+        !topo.ping("client", "10.0.2.2", 3),
+        "Packets should NOT be forwarded when kernel forwarding is disabled and ruster is not running"
     );
 }
 
