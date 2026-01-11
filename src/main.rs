@@ -91,11 +91,50 @@ fn main() {
     }
 }
 
+/// Task that handles packet I/O for a single interface
+async fn interface_task(
+    iface_name: String,
+    mut socket: ruster::capture::AfPacketSocket,
+    packet_tx: tokio::sync::mpsc::Sender<(String, Vec<u8>)>,
+    mut send_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    use tracing::warn;
+
+    let mut buf = vec![0u8; 2048];
+
+    loop {
+        tokio::select! {
+            result = socket.recv(&mut buf) => {
+                match result {
+                    Ok(rx_info) => {
+                        let packet_data = buf[..rx_info.len].to_vec();
+                        if packet_tx.send((iface_name.clone(), packet_data)).await.is_err() {
+                            break; // Main loop closed
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Receive error on {}: {}", iface_name, e);
+                    }
+                }
+            }
+            Some(packet) = send_rx.recv() => {
+                if let Err(e) = socket.send(&packet).await {
+                    warn!("Send error on {}: {}", iface_name, e);
+                }
+            }
+        }
+    }
+
+    tracing::info!("Interface task for {} shutting down", iface_name);
+}
+
 fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
     use ruster::capture::AfPacketSocket;
     use ruster::dataplane::{Action, PacketFilter, Router};
     use ruster::protocol::MacAddr;
+    use std::collections::HashMap;
     use tokio::runtime::Runtime;
+    use tokio::sync::mpsc;
     use tracing::{debug, error, warn};
 
     info!("Loading {}...", lock_path.display());
@@ -117,6 +156,9 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
         // Track interfaces that need DHCP or PPPoE client
         let mut dhcp_client_interfaces: Vec<String> = Vec::new();
         let mut pppoe_client_interfaces: Vec<String> = Vec::new();
+
+        // Store sockets separately for external management
+        let mut sockets: HashMap<String, AfPacketSocket> = HashMap::new();
 
         // Configure interfaces from lock file
         for (name, iface_lock) in &lock.interfaces {
@@ -150,7 +192,11 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
                 )
             })?;
 
-            router.add_interface(name.clone(), socket, mac_addr, ip_addr, prefix_len);
+            // Store socket separately
+            sockets.insert(name.clone(), socket);
+
+            // Add interface metadata to router (without socket)
+            router.add_interface_without_socket(name.clone(), mac_addr, ip_addr, prefix_len);
             info!(
                 "  {} configured: MAC={}, IP={:?}/{}, addressing={}",
                 name,
@@ -228,18 +274,14 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
             }
         }
 
+        // Collect initial packets to send (DHCP DISCOVER, PPPoE PADI)
+        let mut initial_packets: Vec<(String, Vec<u8>)> = Vec::new();
+
         // Enable DHCP clients for interfaces with addressing=dhcp
         for iface_name in &dhcp_client_interfaces {
             info!("Starting DHCP client on {}...", iface_name);
             let packets = router.enable_dhcp_client(iface_name);
-            // Send initial DHCP DISCOVER packets
-            for (out_iface, frame) in packets {
-                if let Some(iface) = router.get_interface_mut(&out_iface) {
-                    if let Err(e) = iface.socket.send(&frame).await {
-                        warn!("Failed to send DHCP DISCOVER on {}: {}", out_iface, e);
-                    }
-                }
-            }
+            initial_packets.extend(packets);
         }
 
         // Enable DNS forwarder if configured
@@ -274,14 +316,7 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
                     pppoe_config.password.clone(),
                     pppoe_config.service_name.clone(),
                 );
-                // Send initial PADI packets
-                for (out_iface, frame) in packets {
-                    if let Some(iface) = router.get_interface_mut(&out_iface) {
-                        if let Err(e) = iface.socket.send(&frame).await {
-                            warn!("Failed to send PPPoE PADI on {}: {}", out_iface, e);
-                        }
-                    }
-                }
+                initial_packets.extend(packets);
             } else {
                 warn!(
                     "Interface {} has addressing=pppoe but no [pppoe.{}] section in config",
@@ -290,65 +325,79 @@ fn cmd_run(lock_path: &PathBuf) -> Result<(), String> {
             }
         }
 
-        info!("Router started, processing packets...");
+        // Check if we have any interfaces
+        if sockets.is_empty() {
+            return Err("No interfaces configured".to_string());
+        }
+
+        // Setup channels for multi-interface communication
+        let (rx_tx, mut rx_rx) = mpsc::channel::<(String, Vec<u8>)>(256);
+        let mut send_txs: HashMap<String, mpsc::Sender<Vec<u8>>> = HashMap::new();
+
+        // Spawn interface tasks
+        for (iface_name, socket) in sockets {
+            let (send_tx, send_rx) = mpsc::channel::<Vec<u8>>(64);
+            send_txs.insert(iface_name.clone(), send_tx);
+            let packet_tx = rx_tx.clone();
+            tokio::spawn(interface_task(iface_name, socket, packet_tx, send_rx));
+        }
+        drop(rx_tx); // Drop original sender so channel closes when all tasks end
+
+        info!(
+            "Router started, processing packets on {} interfaces...",
+            send_txs.len()
+        );
+
+        // Send initial packets (DHCP DISCOVER, PPPoE PADI)
+        for (out_iface, frame) in initial_packets {
+            if let Some(tx) = send_txs.get(&out_iface) {
+                if let Err(e) = tx.send(frame).await {
+                    warn!("Failed to send initial packet on {}: {}", out_iface, e);
+                }
+            }
+        }
 
         // Create aging timer
         let mut aging_timer = Router::aging_interval();
 
-        // Main loop
-        let interface_names: Vec<String> = router.interface_names();
-
-        if interface_names.is_empty() {
-            return Err("No interfaces configured".to_string());
-        }
-
-        // For simplicity, handle one interface at a time
-        // TODO: Use tokio::select! for multi-interface support
-        let iface_name = interface_names[0].clone();
-
-        let mut buf = vec![0u8; 2048];
-
+        // Main loop - handles all interfaces via channels
         loop {
             tokio::select! {
                 _ = aging_timer.tick() => {
-                    // Run aging and send any DHCP client packets
+                    // Run aging and send any DHCP/PPPoE client packets
                     let to_send = router.run_aging();
                     for (out_iface, frame) in to_send {
-                        if let Some(iface) = router.get_interface_mut(&out_iface) {
-                            if let Err(e) = iface.socket.send(&frame).await {
-                                warn!("Failed to send DHCP packet on {}: {}", out_iface, e);
+                        if let Some(tx) = send_txs.get(&out_iface) {
+                            if let Err(e) = tx.send(frame).await {
+                                warn!("Failed to send aging packet on {}: {}", out_iface, e);
                             }
                         }
                     }
                 }
-                result = async {
-                    // Receive packet from the first interface
-                    if let Some(iface) = router.get_interface_mut(&iface_name) {
-                        iface.socket.recv(&mut buf).await
-                    } else {
-                        Err(ruster::Error::InterfaceNotFound { name: iface_name.clone() })
-                    }
-                } => {
-                    match result {
-                        Ok(rx_info) => {
-                            let packet = &buf[..rx_info.len];
-                            let to_send = router.process_packet(&iface_name, packet);
+                received = rx_rx.recv() => {
+                    match received {
+                        Some((iface_name, packet)) => {
+                            let to_send = router.process_packet(&iface_name, &packet);
 
                             for (out_iface, frame) in to_send {
-                                if let Some(iface) = router.get_interface_mut(&out_iface) {
-                                    if let Err(e) = iface.socket.send(&frame).await {
+                                if let Some(tx) = send_txs.get(&out_iface) {
+                                    if let Err(e) = tx.send(frame).await {
                                         warn!("Failed to send on {}: {}", out_iface, e);
                                     }
                                 }
                             }
                         }
-                        Err(e) => {
-                            error!("Receive error: {}", e);
+                        None => {
+                            // All interface tasks have ended
+                            error!("All interface receivers closed");
+                            break;
                         }
                     }
                 }
             }
         }
+
+        Ok(())
     })
 }
 

@@ -47,8 +47,8 @@ pub type PortId = u32;
 
 /// Interface with its socket and metadata
 pub struct Interface {
-    /// The raw socket for packet I/O
-    pub socket: AfPacketSocket,
+    /// The raw socket for packet I/O (None when managed externally)
+    pub socket: Option<AfPacketSocket>,
     /// Interface name
     pub name: String,
     /// MAC address
@@ -898,7 +898,7 @@ impl Router {
         self.interfaces.insert(
             name.clone(),
             Interface {
-                socket,
+                socket: Some(socket),
                 name,
                 mac_addr,
                 ip_addr,
@@ -909,6 +909,53 @@ impl Router {
         );
 
         debug!("Added interface with port_id={}", port_id);
+        port_id
+    }
+
+    /// Add an interface without socket (socket managed externally)
+    pub fn add_interface_without_socket(
+        &mut self,
+        name: String,
+        mac_addr: MacAddr,
+        ip_addr: Option<Ipv4Addr>,
+        prefix_len: Option<u8>,
+    ) -> PortId {
+        let port_id = self.next_port_id;
+        self.next_port_id += 1;
+
+        // Register interface for metrics
+        self.metrics.register_interface(&name);
+
+        // Track port for flooding
+        self.all_ports.insert(port_id);
+
+        // Register with L3 forwarder if IP configured
+        if let (Some(ip), Some(prefix)) = (ip_addr, prefix_len) {
+            self.forwarder.add_interface(
+                name.clone(),
+                InterfaceInfo {
+                    ip_addr: ip,
+                    mac_addr,
+                    prefix_len: prefix,
+                },
+            );
+        }
+
+        self.port_to_name.insert(port_id, name.clone());
+        self.interfaces.insert(
+            name.clone(),
+            Interface {
+                socket: None,
+                name,
+                mac_addr,
+                ip_addr,
+                prefix_len,
+                ipv6_addrs: Vec::new(),
+                port_id,
+            },
+        );
+
+        debug!("Added interface without socket with port_id={}", port_id);
         port_id
     }
 
