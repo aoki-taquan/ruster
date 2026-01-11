@@ -124,6 +124,34 @@ src/
 3. **外部ライブラリ非依存**: ネットワーク処理部分（パケット解析、ルーティング）は独自実装
 4. **設定の透明性**: lockファイルによる完全な設定可視化
 
+## ロードマップ
+
+### Phase 1: 家庭用ルータ相当 (現在)
+
+- [x] Ethernet, ARP, IPv4, IPv6, ICMP
+- [x] 静的ルーティング、ポリシーベースルーティング
+- [x] NAPT、ファイアウォール
+- [x] DHCPv4/v6クライアント・サーバー
+- [x] DNSフォワーダー
+- [x] PPPoEクライアント
+- [ ] VLAN (IEEE 802.1Q)
+
+### Phase 2: 社内ネットワーク向け
+
+- [ ] OSPF / OSPFv3
+- [ ] BGP-4
+- [ ] VRRP、BFD
+- [ ] 802.1X認証、RADIUS
+- [ ] QoS (DiffServ)
+- [ ] STP/RSTP、LACP
+
+### Phase 3: DC向け
+
+- [ ] VXLAN、EVPN
+- [ ] BGP Route Reflector
+- [ ] IS-IS、Segment Routing、MPLS
+- [ ] IGMP、PIM-SM
+
 ## テスト
 
 ### ユニットテスト
