@@ -17,6 +17,8 @@
 
 mod clab;
 mod home_router;
+mod ipv6;
+mod switching;
 
 use clab::Topology;
 use std::path::PathBuf;
@@ -143,5 +145,121 @@ fn test_icmp_echo_reply() {
     assert!(
         ping_output.contains("0% packet loss") || ping_output.contains("0.0% packet loss"),
         "Should have 0% packet loss"
+    );
+}
+
+// ============================================================================
+// Static Routing Tests
+// ============================================================================
+
+/// Test connected routes are working
+///
+/// Verifies that directly connected networks are reachable.
+/// These routes are auto-generated from interface addresses.
+#[test]
+#[cfg_attr(not(feature = "e2e"), ignore)]
+fn test_connected_routes() {
+    let topo = Topology::deploy(topology_path()).expect("Failed to deploy topology");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Verify ruster has connected routes for both interfaces
+    let output = topo.exec("ruster", "ip route show");
+    let route_output = String::from_utf8_lossy(&output.stdout);
+
+    // Should have routes for 10.0.1.0/24 and 10.0.2.0/24
+    assert!(
+        route_output.contains("10.0.1.0/24"),
+        "ruster should have connected route for 10.0.1.0/24, got: {}",
+        route_output
+    );
+    assert!(
+        route_output.contains("10.0.2.0/24"),
+        "ruster should have connected route for 10.0.2.0/24, got: {}",
+        route_output
+    );
+}
+
+/// Test route table entries on ruster
+///
+/// Verifies that the routing table has correct entries for packet forwarding.
+#[test]
+#[cfg_attr(not(feature = "e2e"), ignore)]
+fn test_routing_table_entries() {
+    let topo = Topology::deploy(topology_path()).expect("Failed to deploy topology");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Check routing table on ruster
+    let output = topo.exec("ruster", "ip route show table main");
+    let route_output = String::from_utf8_lossy(&output.stdout);
+
+    // Routes should be associated with correct interfaces
+    assert!(
+        route_output.contains("10.0.1.0/24") && route_output.contains("eth1"),
+        "Route to 10.0.1.0/24 should be via eth1, got: {}",
+        route_output
+    );
+    assert!(
+        route_output.contains("10.0.2.0/24") && route_output.contains("eth2"),
+        "Route to 10.0.2.0/24 should be via eth2, got: {}",
+        route_output
+    );
+}
+
+/// Test multi-hop routing
+///
+/// Verifies that packets traverse the correct path through multiple hops.
+#[test]
+#[cfg_attr(not(feature = "e2e"), ignore)]
+fn test_multi_hop_routing() {
+    let topo = Topology::deploy(topology_path()).expect("Failed to deploy topology");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Use traceroute to verify the path
+    let output = topo.exec("client", "traceroute -n -m 3 -w 2 10.0.2.2");
+    let traceroute_output = String::from_utf8_lossy(&output.stdout);
+
+    // The path should go through ruster (10.0.1.1)
+    assert!(
+        traceroute_output.contains("10.0.1.1") || traceroute_output.contains("10.0.2.1"),
+        "Traffic should pass through ruster, got: {}",
+        traceroute_output
+    );
+}
+
+/// Test bidirectional routing symmetry
+///
+/// Verifies that routing works correctly in both directions.
+#[test]
+#[cfg_attr(not(feature = "e2e"), ignore)]
+fn test_bidirectional_routing() {
+    let topo = Topology::deploy(topology_path()).expect("Failed to deploy topology");
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Test client -> server
+    let output = topo.exec("client", "ping -c 3 -W 2 10.0.2.2");
+    assert!(
+        output.status.success(),
+        "Client -> Server routing should work"
+    );
+
+    // Test server -> client
+    let output = topo.exec("server", "ping -c 3 -W 2 10.0.1.2");
+    assert!(
+        output.status.success(),
+        "Server -> Client routing should work"
+    );
+
+    // Verify both hosts can reach ruster's interfaces
+    assert!(
+        topo.ping("client", "10.0.2.1", 2),
+        "Client should reach ruster's eth2 interface"
+    );
+    assert!(
+        topo.ping("server", "10.0.1.1", 2),
+        "Server should reach ruster's eth1 interface"
     );
 }
