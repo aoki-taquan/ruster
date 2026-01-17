@@ -140,6 +140,7 @@ impl Topology {
     }
 
     /// Stop ruster daemon
+    #[allow(dead_code)]
     pub fn stop_ruster(&self) {
         self.exec("ruster", "pkill -f 'ruster run' || true");
     }
