@@ -3,14 +3,16 @@ name: ruster-test
 topology:
   nodes:
     # Device Under Test - ruster router
+    # Using netshoot for glibc compatibility and network tools
     ruster:
       kind: linux
-      image: alpine:3.19
+      image: nicolaka/netshoot
       binds:
         - ../../target/release/ruster:/usr/local/bin/ruster:ro
         - ./config.toml:/etc/ruster/config.toml:ro
       exec:
-        - sysctl -w net.ipv4.ip_forward=1
+        # Note: kernel IP forwarding is disabled by default
+        # ruster handles all packet forwarding in userspace
         - ip addr add 10.0.1.1/24 dev eth1
         - ip addr add 10.0.2.1/24 dev eth2
 

@@ -107,6 +107,44 @@ impl Topology {
         output.status.success()
     }
 
+    /// Generate config.lock from config.toml in ruster container
+    pub fn generate_config(&self) -> Output {
+        self.exec(
+            "ruster",
+            "/usr/local/bin/ruster config generate -c /etc/ruster/config.toml -o /etc/ruster/config.lock",
+        )
+    }
+
+    /// Disable Linux kernel IP forwarding on ruster node
+    pub fn disable_kernel_forwarding(&self) {
+        self.exec("ruster", "sysctl -w net.ipv4.ip_forward=0");
+        self.exec("ruster", "sysctl -w net.ipv6.conf.all.forwarding=0");
+    }
+
+    /// Start ruster daemon in background
+    /// Returns true if ruster process is running
+    pub fn start_ruster(&self) -> bool {
+        // Start ruster in background using nohup
+        self.exec(
+            "ruster",
+            "nohup /usr/local/bin/ruster run -c /etc/ruster/config.lock > /tmp/ruster.log 2>&1 &",
+        );
+
+        // Wait for startup
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        // Check if process is running
+        self.exec("ruster", "pgrep -f 'ruster run'")
+            .status
+            .success()
+    }
+
+    /// Stop ruster daemon
+    #[allow(dead_code)]
+    pub fn stop_ruster(&self) {
+        self.exec("ruster", "pkill -f 'ruster run' || true");
+    }
+
     /// Destroy the topology and clean up temp files
     pub fn destroy(&mut self) {
         let _ = Command::new("sudo")

@@ -143,12 +143,43 @@ impl AfPacketSocket {
 
     /// Send a packet (async)
     pub async fn send(&mut self, buf: &[u8]) -> Result<usize> {
+        // Minimum Ethernet header (14 bytes) required
+        if buf.len() < 14 {
+            return Err(Error::InvalidPacket("Packet too short".to_string()));
+        }
+
+        // Get destination MAC address (first 6 bytes)
+        let mut sll_addr = [0u8; 8];
+        sll_addr[..6].copy_from_slice(&buf[0..6]);
+
+        // Get EtherType (bytes 12-13, network byte order)
+        let protocol = u16::from_be_bytes([buf[12], buf[13]]);
+
+        let sockaddr = libc::sockaddr_ll {
+            sll_family: libc::AF_PACKET as u16,
+            sll_protocol: protocol.to_be(),
+            sll_ifindex: self.ifindex,
+            sll_hatype: 0,
+            sll_pkttype: 0,
+            sll_halen: 6,
+            sll_addr,
+        };
+
         loop {
             let mut guard = self.async_fd.writable_mut().await.map_err(Error::Io)?;
 
             match guard.try_io(|inner| {
                 let fd = *inner.get_ref();
-                let n = unsafe { libc::send(fd, buf.as_ptr() as *const _, buf.len(), 0) };
+                let n = unsafe {
+                    libc::sendto(
+                        fd,
+                        buf.as_ptr() as *const _,
+                        buf.len(),
+                        0,
+                        &sockaddr as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_ll>() as u32,
+                    )
+                };
                 if n < 0 {
                     Err(std::io::Error::last_os_error())
                 } else {

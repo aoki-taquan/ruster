@@ -13,6 +13,9 @@ pub enum Error {
 
     #[error("interface {name} not found")]
     InterfaceNotFound { name: String },
+
+    #[error("invalid packet: {0}")]
+    InvalidPacket(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

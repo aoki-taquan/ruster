@@ -431,8 +431,8 @@ impl Router {
 
                 // Build Ethernet frame
                 let frame = FrameBuilder::new()
-                    .src_mac(iface.mac_addr)
                     .dst_mac(dst_mac)
+                    .src_mac(iface.mac_addr)
                     .ethertype(EtherType::Ipv4 as u16)
                     .payload(&ip_packet)
                     .build();
@@ -491,8 +491,8 @@ impl Router {
 
                     // Build Ethernet frame
                     let frame = FrameBuilder::new()
-                        .src_mac(iface.mac_addr)
                         .dst_mac(dst_mac)
+                        .src_mac(iface.mac_addr)
                         .ethertype(EtherType::Ipv6 as u16)
                         .payload(&ip_packet)
                         .build();
@@ -583,8 +583,8 @@ impl Router {
 
                     // Build Ethernet frame
                     let frame = FrameBuilder::new()
-                        .src_mac(iface.mac_addr)
                         .dst_mac(dst_mac)
+                        .src_mac(iface.mac_addr)
                         .ethertype(EtherType::Ipv6 as u16)
                         .payload(&ip_packet)
                         .build();
@@ -1123,8 +1123,8 @@ impl Router {
                 self.metrics.arp_replies_sent.inc();
                 // Build Ethernet frame for ARP reply
                 let frame = FrameBuilder::new()
-                    .src_mac(local_mac)
                     .dst_mac(reply.target_mac)
+                    .src_mac(local_mac)
                     .ethertype(EtherType::Arp as u16)
                     .payload(&reply.to_bytes())
                     .build();
@@ -1144,8 +1144,8 @@ impl Router {
                     let mut results = Vec::new();
                     for ip_packet in pending {
                         let frame = FrameBuilder::new()
-                            .src_mac(local_mac)
                             .dst_mac(arp.sender_mac)
+                            .src_mac(local_mac)
                             .ethertype(EtherType::Ipv4 as u16)
                             .payload(&ip_packet)
                             .build();
@@ -1230,8 +1230,8 @@ impl Router {
 
                 let iface = self.interfaces.get(&interface)?;
                 let frame = FrameBuilder::new()
-                    .src_mac(iface.mac_addr)
                     .dst_mac(next_hop_mac)
+                    .src_mac(iface.mac_addr)
                     .ethertype(EtherType::Ipv4 as u16)
                     .payload(&final_packet)
                     .build();
@@ -1250,8 +1250,8 @@ impl Router {
                 self.metrics.arp_requests_sent.inc();
                 let iface = self.interfaces.get(&interface)?;
                 let frame = FrameBuilder::new()
-                    .src_mac(iface.mac_addr)
                     .dst_mac(MacAddr::BROADCAST)
+                    .src_mac(iface.mac_addr)
                     .ethertype(EtherType::Arp as u16)
                     .payload(&request.to_bytes())
                     .build();
@@ -1410,8 +1410,8 @@ impl Router {
                     if let Some((dst_mac, _)) = self.arp_table.lookup(&ip_header.src_addr()) {
                         self.metrics.icmp_echo_replies.inc();
                         let frame = FrameBuilder::new()
-                            .src_mac(iface.mac_addr)
                             .dst_mac(dst_mac)
+                            .src_mac(iface.mac_addr)
                             .ethertype(EtherType::Ipv4 as u16)
                             .payload(&ip_packet)
                             .build();
@@ -1498,8 +1498,8 @@ impl Router {
 
                 // Build Ethernet frame
                 let frame = FrameBuilder::new()
-                    .src_mac(iface.mac_addr)
                     .dst_mac(dst_mac)
+                    .src_mac(iface.mac_addr)
                     .ethertype(EtherType::Ipv4 as u16)
                     .payload(&ip_packet)
                     .build();
@@ -1573,8 +1573,8 @@ impl Router {
                 // Lookup MAC for reply
                 if let Some((dst_mac, _)) = self.arp_table.lookup(&dst_ip) {
                     let frame = FrameBuilder::new()
-                        .src_mac(iface.mac_addr)
                         .dst_mac(dst_mac)
+                        .src_mac(iface.mac_addr)
                         .ethertype(EtherType::Ipv4 as u16)
                         .payload(&ip_packet)
                         .build();
@@ -1619,8 +1619,8 @@ impl Router {
                 // For now, use ARP table directly
                 if let Some((dst_mac, _)) = self.arp_table.lookup(&upstream) {
                     let frame = FrameBuilder::new()
-                        .src_mac(iface.mac_addr)
                         .dst_mac(dst_mac)
+                        .src_mac(iface.mac_addr)
                         .ethertype(EtherType::Ipv4 as u16)
                         .payload(&ip_packet)
                         .build();
@@ -1679,8 +1679,8 @@ impl Router {
                 // Lookup MAC for reply
                 if let Some((dst_mac, _)) = self.arp_table.lookup(&dst_ip) {
                     let frame = FrameBuilder::new()
-                        .src_mac(iface.mac_addr)
                         .dst_mac(dst_mac)
+                        .src_mac(iface.mac_addr)
                         .ethertype(EtherType::Ipv4 as u16)
                         .payload(&ip_packet)
                         .build();
