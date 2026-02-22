@@ -1,3 +1,5 @@
+pub mod dpdk;
+
 #[derive(Debug, Default)]
 pub struct Dataplane;
 
