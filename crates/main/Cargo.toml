@@ -1,0 +1,13 @@
+[package]
+name = "ruster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+ruster-config = { path = "../config" }
+ruster-control = { path = "../control" }
+ruster-dataplane = { path = "../dataplane" }
+ruster-observe = { path = "../observe" }

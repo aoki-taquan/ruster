@@ -1,0 +1,68 @@
+name: Implementation Task
+description: v0.1 実装タスク Issue
+title: "[I-XXX] "
+labels: ["implementation"]
+body:
+  - type: input
+    id: issue-id
+    attributes:
+      label: Issue ID
+      description: "Issue 識別子 (例: I-005)"
+      placeholder: "I-XXX"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: milestone
+    attributes:
+      label: Milestone
+      options:
+        - "M1: Bootstrap & Config"
+        - "M2: L2/L3 Dataplane"
+        - "M3: NAT/FW"
+        - "M4: Operations & Testing"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: Priority
+      options:
+        - P0 (Must have)
+        - P1 (Should have)
+    validations:
+      required: true
+
+  - type: textarea
+    id: purpose
+    attributes:
+      label: Purpose
+      description: この Issue で何を達成するか
+    validations:
+      required: true
+
+  - type: textarea
+    id: implementation
+    attributes:
+      label: Implementation
+      description: 実装内容の詳細
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance-criteria
+    attributes:
+      label: Acceptance Criteria
+      description: 受け入れ条件（チェックリスト形式推奨）
+    validations:
+      required: true
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: 依存する Issue 番号（なければ「なし」）
+      placeholder: "I-001, I-002"
+    validations:
+      required: false

@@ -1,0 +1,14 @@
+name: RFC Deviation Check
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  rfc-check:
+    name: RFC-DEVIATION validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check RFC-DEVIATION comments
+        run: bash scripts/check-rfc-deviation.sh
