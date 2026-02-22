@@ -1,12 +1,9 @@
 use anyhow::Result;
-use ruster_config::RouterConfig;
 use ruster_dataplane::Dataplane;
 use ruster_observe::Counters;
 
 fn main() -> Result<()> {
-    let config = RouterConfig {
-        hostname: "ruster-lab".to_string(),
-    };
+    let config = ruster_config::load_from_file("router.toml.example")?;
     ruster_control::validate(&config)?;
 
     let dataplane = Dataplane::new();
@@ -15,6 +12,6 @@ fn main() -> Result<()> {
     let mut counters = Counters::default();
     counters.inc_drop();
 
-    println!("ruster bootstrap ok: hostname={}", config.hostname);
+    println!("ruster bootstrap ok: hostname={}", config.meta.hostname);
     Ok(())
 }
