@@ -78,14 +78,14 @@ pub enum ConnState {
 
 // ── Structs ──
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MetaConfig {
     pub schema: String,
     pub hostname: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataplaneConfig {
     pub backend: String,
@@ -95,7 +95,7 @@ pub struct DataplaneConfig {
     pub tx_queue_size: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InterfaceConfig {
     pub name: String,
@@ -109,14 +109,14 @@ pub struct InterfaceConfig {
     pub l2_domain: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BridgeDomain {
     pub name: String,
     pub members: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct L2Config {
     pub mac_table_max_entries: u32,
@@ -126,7 +126,7 @@ pub struct L2Config {
     pub bridge_domains: Vec<BridgeDomain>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StaticRoute {
     pub prefix: String,
@@ -135,13 +135,13 @@ pub struct StaticRoute {
     pub metric: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
     pub ipv4_static_routes: Vec<StaticRoute>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PortForward {
     pub name: String,
@@ -151,7 +151,7 @@ pub struct PortForward {
     pub internal_port: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NatConfig {
     pub enabled: bool,
@@ -166,7 +166,7 @@ pub struct NatConfig {
     pub port_forwards: Vec<PortForward>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FirewallRule {
     pub name: String,
@@ -178,7 +178,7 @@ pub struct FirewallRule {
     pub state: Vec<ConnState>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FirewallConfig {
     pub enabled: bool,
@@ -189,7 +189,7 @@ pub struct FirewallConfig {
     pub rules: Vec<FirewallRule>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouterConfig {
     pub meta: MetaConfig,

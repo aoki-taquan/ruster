@@ -7,4 +7,6 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+thiserror.workspace = true
+toml.workspace = true
 ruster-config = { path = "../config" }
