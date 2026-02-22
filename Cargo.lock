@@ -85,6 +85,9 @@ dependencies = [
 [[package]]
 name = "ruster-dataplane"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "ruster-observe"

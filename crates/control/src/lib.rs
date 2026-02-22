@@ -7,7 +7,7 @@ pub struct PlanResult {
 }
 
 pub fn validate(config: &RouterConfig) -> Result<()> {
-    if config.hostname.trim().is_empty() {
+    if config.meta.hostname.trim().is_empty() {
         bail!("hostname must not be empty");
     }
     Ok(())
