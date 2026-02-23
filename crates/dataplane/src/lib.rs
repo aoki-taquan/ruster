@@ -1,4 +1,5 @@
 pub mod dpdk;
+pub mod l2;
 pub mod packet;
 
 #[derive(Debug, Default)]
