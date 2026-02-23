@@ -23,6 +23,8 @@ pub fn validate(config: &RouterConfig) -> Result<(), Vec<ValidationError>> {
     check_nat_external_if(config, &mut errors);
     check_nat_requires_firewall(config, &mut errors);
     check_firewall_rule_states(config, &mut errors);
+    check_ipv4_addrs(config, &mut errors);
+    check_route_addresses(config, &mut errors);
 
     if errors.is_empty() {
         Ok(())
@@ -128,4 +130,64 @@ fn check_firewall_rule_states(config: &RouterConfig, errors: &mut Vec<Validation
             });
         }
     }
+}
+
+/// Validate that every `ipv4_addrs` entry on each interface is a valid CIDR
+/// string (e.g. "192.168.1.1/24").
+fn check_ipv4_addrs(config: &RouterConfig, errors: &mut Vec<ValidationError>) {
+    for iface in &config.interfaces {
+        for (i, addr) in iface.ipv4_addrs.iter().enumerate() {
+            if !is_valid_cidr(addr) {
+                errors.push(ValidationError {
+                    field: format!("interfaces[name={}].ipv4_addrs[{}]", iface.name, i),
+                    reason: format!("invalid CIDR address '{}'", addr),
+                });
+            }
+        }
+    }
+}
+
+/// Validate that every static route has a valid CIDR prefix and a valid IPv4
+/// next-hop address.
+fn check_route_addresses(config: &RouterConfig, errors: &mut Vec<ValidationError>) {
+    for route in &config.routing.ipv4_static_routes {
+        if !is_valid_cidr(&route.prefix) {
+            errors.push(ValidationError {
+                field: format!("routing.ipv4_static_routes[prefix={}].prefix", route.prefix),
+                reason: format!("invalid CIDR prefix '{}'", route.prefix),
+            });
+        }
+        if !is_valid_ipv4(&route.next_hop) {
+            errors.push(ValidationError {
+                field: format!(
+                    "routing.ipv4_static_routes[prefix={}].next_hop",
+                    route.prefix
+                ),
+                reason: format!("invalid IPv4 address '{}'", route.next_hop),
+            });
+        }
+    }
+}
+
+/// Check whether a string is a valid IPv4 address (e.g. "192.168.1.1").
+fn is_valid_ipv4(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() != 4 {
+        return false;
+    }
+    parts.iter().all(|p| p.parse::<u8>().is_ok())
+}
+
+/// Check whether a string is a valid IPv4 CIDR notation (e.g. "192.168.1.0/24").
+fn is_valid_cidr(s: &str) -> bool {
+    let Some((ip_str, len_str)) = s.split_once('/') else {
+        return false;
+    };
+    if !is_valid_ipv4(ip_str) {
+        return false;
+    }
+    let Ok(prefix_len) = len_str.parse::<u8>() else {
+        return false;
+    };
+    prefix_len <= 32
 }

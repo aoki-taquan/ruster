@@ -82,6 +82,10 @@ impl L3Engine {
     pub fn from_config(routing_config: &RoutingConfig, interfaces: &[InterfaceConfig]) -> Self {
         let route_table = RouteTable::from_config(routing_config);
 
+        // NOTE: Config validation (ruster-config validate) ensures all
+        // ipv4_addrs entries are well-formed CIDR strings before they reach
+        // here. filter_map is retained as a defence-in-depth measure; any
+        // parse failure at this stage indicates a logic bug.
         let local_ips: HashSet<[u8; 4]> = interfaces
             .iter()
             .flat_map(|iface| {
