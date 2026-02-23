@@ -1,4 +1,5 @@
 pub mod dpdk;
+pub mod packet;
 
 #[derive(Debug, Default)]
 pub struct Dataplane;
