@@ -4,12 +4,59 @@
 //! configuration and performs longest-prefix-match lookups for L3
 //! forwarding decisions.
 //!
+//! # Validated-input contract
+//!
+//! [`RouteTable::from_config`] expects that all route entries have already
+//! been validated by the config layer (`ruster-config` validate).  If any
+//! entry cannot be parsed, `from_config` returns an error listing every
+//! invalid entry instead of silently dropping them.  Callers that want to
+//! guarantee success should run config validation first.
+//!
 //! RFC-REF: RFC 791 Section 3.2
 //! "The internet modules use the addresses carried in the internet header
 //! to select the next gateway (or destination host) to which the datagram
 //! should be forwarded."
 
+use std::fmt;
+
 use ruster_config::model::RoutingConfig;
+
+/// Error describing a single invalid route entry encountered during
+/// [`RouteTable::from_config`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteError {
+    /// Zero-based index of the entry in the config list.
+    pub index: usize,
+    /// The kind of parse failure.
+    pub kind: RouteErrorKind,
+    /// The raw string value that failed to parse.
+    pub raw_value: String,
+}
+
+/// What went wrong when parsing a route entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RouteErrorKind {
+    /// The prefix string (e.g. "192.168.1.0/24") could not be parsed.
+    InvalidPrefix,
+    /// The next-hop address string could not be parsed as an IPv4 address.
+    InvalidNextHop,
+}
+
+impl fmt::Display for RouteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let field = match &self.kind {
+            RouteErrorKind::InvalidPrefix => "prefix",
+            RouteErrorKind::InvalidNextHop => "next_hop",
+        };
+        write!(
+            f,
+            "route[{}]: invalid {} \"{}\"",
+            self.index, field, self.raw_value
+        )
+    }
+}
+
+impl std::error::Error for RouteError {}
 
 /// A single route entry in the routing table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,26 +88,57 @@ impl RouteTable {
     ///
     /// Parses each static route's prefix string (e.g. "192.168.1.0/24")
     /// and next-hop address, then sorts entries for LPM lookup.
-    pub fn from_config(routing_config: &RoutingConfig) -> Self {
-        // NOTE: Config validation (ruster-config validate) ensures all prefix
-        // and next_hop strings are well-formed before they reach here.
-        // filter_map is retained as a defence-in-depth measure; any parse
-        // failure at this stage indicates a logic bug.
-        let mut entries: Vec<RouteEntry> = routing_config
-            .ipv4_static_routes
-            .iter()
-            .filter_map(|sr| {
-                let (prefix, prefix_len) = parse_prefix(&sr.prefix)?;
-                let next_hop = parse_ipv4_addr(&sr.next_hop)?;
-                Some(RouteEntry {
+    ///
+    /// # Errors
+    ///
+    /// Returns **all** [`RouteError`]s found across every entry.  If any
+    /// entry is invalid the entire call fails so that callers are never
+    /// left with a silently incomplete routing table.
+    ///
+    /// # Validated-input contract
+    ///
+    /// Callers that run config validation via `ruster-config` before
+    /// reaching this point can expect `from_config` to always succeed.
+    /// The `Result` return type exists to surface bugs or direct
+    /// (unvalidated) usage clearly.
+    pub fn from_config(routing_config: &RoutingConfig) -> Result<Self, Vec<RouteError>> {
+        let mut entries: Vec<RouteEntry> =
+            Vec::with_capacity(routing_config.ipv4_static_routes.len());
+        let mut errors: Vec<RouteError> = Vec::new();
+
+        for (index, sr) in routing_config.ipv4_static_routes.iter().enumerate() {
+            let prefix_result = parse_prefix(&sr.prefix);
+            let next_hop_result = parse_ipv4_addr(&sr.next_hop);
+
+            if prefix_result.is_none() {
+                errors.push(RouteError {
+                    index,
+                    kind: RouteErrorKind::InvalidPrefix,
+                    raw_value: sr.prefix.clone(),
+                });
+            }
+            if next_hop_result.is_none() {
+                errors.push(RouteError {
+                    index,
+                    kind: RouteErrorKind::InvalidNextHop,
+                    raw_value: sr.next_hop.clone(),
+                });
+            }
+
+            if let (Some((prefix, prefix_len)), Some(next_hop)) = (prefix_result, next_hop_result) {
+                entries.push(RouteEntry {
                     prefix,
                     prefix_len,
                     next_hop,
                     out_ifname: sr.out_if.clone(),
                     metric: sr.metric,
-                })
-            })
-            .collect();
+                });
+            }
+        }
+
+        if !errors.is_empty() {
+            return Err(errors);
+        }
 
         // Sort by prefix_len descending (longest first), then metric ascending.
         entries.sort_by(|a, b| {
@@ -69,7 +147,7 @@ impl RouteTable {
                 .then(a.metric.cmp(&b.metric))
         });
 
-        Self { entries }
+        Ok(Self { entries })
     }
 
     /// Create an empty route table.
@@ -260,13 +338,13 @@ mod tests {
 
     #[test]
     fn from_config_parses_routes() {
-        let table = RouteTable::from_config(&make_routing_config());
+        let table = RouteTable::from_config(&make_routing_config()).unwrap();
         assert_eq!(table.len(), 3);
     }
 
     #[test]
     fn from_config_sorted_by_prefix_len_desc() {
-        let table = RouteTable::from_config(&make_routing_config());
+        let table = RouteTable::from_config(&make_routing_config()).unwrap();
         // /25, /24, /0
         assert_eq!(table.entries[0].prefix_len, 25);
         assert_eq!(table.entries[1].prefix_len, 24);
@@ -274,7 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn from_config_skips_invalid() {
+    fn from_config_rejects_invalid_entries() {
         let config = RoutingConfig {
             ipv4_static_routes: vec![
                 StaticRoute {
@@ -291,15 +369,42 @@ mod tests {
                 },
             ],
         };
-        let table = RouteTable::from_config(&config);
-        assert_eq!(table.len(), 1);
+        let err = RouteTable::from_config(&config).unwrap_err();
+        assert_eq!(err.len(), 1);
+        assert_eq!(err[0].index, 0);
+        assert_eq!(err[0].kind, RouteErrorKind::InvalidPrefix);
+        assert_eq!(err[0].raw_value, "invalid/24");
+    }
+
+    #[test]
+    fn from_config_collects_all_errors() {
+        let config = RoutingConfig {
+            ipv4_static_routes: vec![
+                StaticRoute {
+                    prefix: "bad/99".to_string(),
+                    next_hop: "also_bad".to_string(),
+                    out_if: "wan0".to_string(),
+                    metric: 100,
+                },
+                StaticRoute {
+                    prefix: "10.0.0.0/8".to_string(),
+                    next_hop: "not_an_ip".to_string(),
+                    out_if: "wan0".to_string(),
+                    metric: 50,
+                },
+            ],
+        };
+        let err = RouteTable::from_config(&config).unwrap_err();
+        // Entry 0: invalid prefix AND invalid next_hop (2 errors).
+        // Entry 1: valid prefix, invalid next_hop (1 error).
+        assert_eq!(err.len(), 3);
     }
 
     // ── LPM lookup tests ──────────────────────────────────────────────
 
     #[test]
     fn lookup_longest_match_wins() {
-        let table = RouteTable::from_config(&make_routing_config());
+        let table = RouteTable::from_config(&make_routing_config()).unwrap();
 
         // 192.168.1.200 matches both /25 and /24; /25 should win.
         let result = table.lookup(&[192, 168, 1, 200]);
@@ -311,7 +416,7 @@ mod tests {
 
     #[test]
     fn lookup_shorter_prefix_when_longer_does_not_match() {
-        let table = RouteTable::from_config(&make_routing_config());
+        let table = RouteTable::from_config(&make_routing_config()).unwrap();
 
         // 192.168.1.10 matches /24 but not /25 (128..255 range).
         let result = table.lookup(&[192, 168, 1, 10]);
@@ -323,7 +428,7 @@ mod tests {
 
     #[test]
     fn lookup_default_route() {
-        let table = RouteTable::from_config(&make_routing_config());
+        let table = RouteTable::from_config(&make_routing_config()).unwrap();
 
         // 8.8.8.8 matches only the default route.
         let result = table.lookup(&[8, 8, 8, 8]);
@@ -350,7 +455,7 @@ mod tests {
                 metric: 10,
             }],
         };
-        let table = RouteTable::from_config(&config);
+        let table = RouteTable::from_config(&config).unwrap();
 
         // 10.0.0.1 does not match 192.168.1.0/24.
         assert!(table.lookup(&[10, 0, 0, 1]).is_none());
@@ -376,7 +481,7 @@ mod tests {
                 },
             ],
         };
-        let table = RouteTable::from_config(&config);
+        let table = RouteTable::from_config(&config).unwrap();
         let result = table.lookup(&[10, 1, 2, 3]).unwrap();
         assert_eq!(result.metric, 100);
         assert_eq!(result.next_hop, [10, 0, 0, 1]);
