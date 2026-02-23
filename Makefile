@@ -1,6 +1,7 @@
 .PHONY: build test clippy fmt fmt-check check doc ci clean
 .PHONY: worktree-start worktree-clean worktree-list
 .PHONY: team-start team-stop
+.PHONY: clab-deploy clab-test clab-destroy clab-e2e
 
 # ── Build ──────────────────────────────────────────────
 
@@ -78,3 +79,16 @@ team-stop:
 	else \
 		echo "No session 'ruster-team' found."; \
 	fi
+
+# ── Containerlab E2E ──────────────────────────────────
+
+clab-deploy:
+	cd tests/containerlab && sudo containerlab deploy --topo topology.yml
+
+clab-test: clab-deploy
+	cd tests/containerlab && bash scripts/run-all.sh
+
+clab-destroy:
+	cd tests/containerlab && sudo containerlab destroy --topo topology.yml
+
+clab-e2e: clab-test clab-destroy

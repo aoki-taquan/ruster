@@ -1,0 +1,78 @@
+# ruster E2E test configuration
+#
+# Minimal 2-interface topology for containerlab testing.
+#
+#   lan-host (192.168.1.100) --[eth1]-- ruster --[eth2]-- wan-host (10.0.0.100)
+#                                 192.168.1.1    10.0.0.1
+
+[meta]
+schema = "ruster/v0.1"
+hostname = "ruster-e2e"
+
+[dataplane]
+backend = "dpdk"
+lcore_list = "0-1"
+memory_mb = 512
+rx_queue_size = 256
+tx_queue_size = 256
+
+[[interfaces]]
+name = "lan0"
+port_id = 0
+role = "lan"
+admin_up = true
+mtu = 1500
+mac = "02:00:00:00:01:01"
+ipv4_addrs = ["192.168.1.1/24"]
+zone = "lan"
+l2_domain = "bd-lan"
+
+[[interfaces]]
+name = "wan0"
+port_id = 1
+role = "wan"
+admin_up = true
+mtu = 1500
+mac = "02:00:00:00:02:01"
+ipv4_addrs = ["10.0.0.1/24"]
+zone = "wan"
+l2_domain = "bd-wan"
+
+[l2]
+mac_table_max_entries = 4096
+mac_aging_sec = 300
+arp_table_max_entries = 1024
+arp_timeout_sec = 1200
+bridge_domains = [
+  { name = "bd-lan", members = ["lan0"] },
+  { name = "bd-wan", members = ["wan0"] }
+]
+
+[routing]
+ipv4_static_routes = [
+  { prefix = "0.0.0.0/0", next_hop = "10.0.0.100", out_if = "wan0", metric = 10 }
+]
+
+[nat]
+enabled = true
+mode = "napt44"
+external_if = "wan0"
+hairpin = true
+session_table_max_entries = 65536
+tcp_established_timeout_sec = 7440
+tcp_transitory_timeout_sec = 120
+udp_timeout_sec = 60
+icmp_timeout_sec = 30
+port_forwards = []
+
+[firewall]
+enabled = true
+default_input = "drop"
+default_forward = "drop"
+default_output = "accept"
+allow_established_related = true
+rules = [
+  { name = "allow-lan-to-wan", chain = "forward", action = "accept", proto = "any", src_zone = "lan", dst_zone = "wan", state = ["new", "established", "related"] },
+  { name = "allow-lan-input-icmp", chain = "input", action = "accept", proto = "icmp", src_zone = "lan", dst_zone = "any", state = ["new"] },
+  { name = "block-wan-input", chain = "input", action = "drop", proto = "any", src_zone = "wan", dst_zone = "any", state = ["new"] }
+]
