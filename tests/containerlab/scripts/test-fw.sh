@@ -6,6 +6,9 @@
 #   2. Allowed traffic: LAN -> ruster ICMP input is permitted
 #   3. Blocked traffic: WAN -> ruster new connections are dropped
 #   4. Blocked traffic: WAN -> LAN unsolicited forward is dropped
+#
+# Quality gate: tests that cannot verify expected behavior report FAIL,
+# never silently PASS. See issue #134.
 
 set -euo pipefail
 
@@ -13,9 +16,10 @@ TOPO_NAME="ruster-e2e"
 PREFIX="clab-${TOPO_NAME}"
 PASS=0
 FAIL=0
+SKIP=0
 ERRORS=""
 
-# ── Helpers ───────────────────────────────────────────
+# -- Helpers ---------------------------------------------------
 
 run_on() {
     local node="$1"; shift
@@ -24,21 +28,33 @@ run_on() {
 
 report() {
     local name="$1" result="$2"
-    if [ "$result" = "PASS" ]; then
-        PASS=$((PASS + 1))
-        echo "  [PASS] ${name}"
-    else
-        FAIL=$((FAIL + 1))
-        ERRORS="${ERRORS}  - ${name}\n"
-        echo "  [FAIL] ${name}"
-    fi
+    case "$result" in
+        PASS)
+            PASS=$((PASS + 1))
+            echo "  [PASS] ${name}"
+            ;;
+        FAIL)
+            FAIL=$((FAIL + 1))
+            ERRORS="${ERRORS}  - ${name}\n"
+            echo "  [FAIL] ${name}"
+            ;;
+        SKIP)
+            SKIP=$((SKIP + 1))
+            echo "  [SKIP] ${name}"
+            ;;
+        *)
+            echo "  [ERROR] unknown result '${result}' for ${name}"
+            FAIL=$((FAIL + 1))
+            ERRORS="${ERRORS}  - ${name} (bad result)\n"
+            ;;
+    esac
 }
 
-# ── Tests ─────────────────────────────────────────────
+# -- Tests -----------------------------------------------------
 
 echo "=== Firewall Tests ==="
 
-# Test 1: Allowed — LAN to WAN forwarding (should pass per rule allow-lan-to-wan)
+# Test 1: Allowed -- LAN to WAN forwarding (should pass per rule allow-lan-to-wan)
 echo ""
 echo "-- Test 1: Allowed (lan-host -> wan-host forward) --"
 if run_on lan-host ping -c 3 -W 5 10.0.0.100 > /dev/null 2>&1; then
@@ -51,7 +67,7 @@ else
     report "fw-allow-lan-to-wan" "FAIL"
 fi
 
-# Test 2: Allowed — LAN ICMP to ruster input (should pass per rule allow-lan-input-icmp)
+# Test 2: Allowed -- LAN ICMP to ruster input (should pass per rule allow-lan-input-icmp)
 echo ""
 echo "-- Test 2: Allowed (lan-host -> ruster ICMP input) --"
 if run_on lan-host ping -c 3 -W 3 192.168.1.1 > /dev/null 2>&1; then
@@ -64,62 +80,59 @@ else
     report "fw-allow-lan-icmp-input" "FAIL"
 fi
 
-# Test 3: Blocked — WAN new connections to ruster input (should be dropped per block-wan-input)
-#   We expect ping from wan-host to ruster's WAN interface to be DROPPED.
-#   Note: In the containerlab topology, Linux kernel handles the connectivity
-#   before ruster's dataplane is active. The kernel does NOT enforce ruster's
-#   firewall rules. This test verifies the INTENT; when ruster's dataplane is
-#   active, this traffic should be blocked.
+# Test 3: Blocked -- WAN new connections to ruster input (should be dropped)
+#   When the firewall is active, ping from wan-host to ruster's WAN interface
+#   should be DROPPED. A dropped ping means the firewall is working correctly.
 #
-#   For the infrastructure test (kernel routing only): we mark it as a
-#   "baseline" — the kernel will allow it. The real test applies when
-#   ruster's dataplane takes over.
+#   NOTE (v0.1): ruster uses MockPacketIo so the kernel handles connectivity
+#   and does NOT enforce ruster's firewall rules. This test correctly FAILs
+#   in v0.1. Once ruster's dataplane takes over, this test will PASS.
 echo ""
-echo "-- Test 3: Blocked (wan-host -> ruster new input) [baseline] --"
-echo "  Note: With kernel routing, wan->ruster ICMP is allowed."
-echo "  When ruster dataplane is active, rule 'block-wan-input' drops this."
+echo "-- Test 3: Blocked (wan-host -> ruster new input) --"
 
-# Install nmap/ncat for TCP probe if available, otherwise use ping timing
-# Try a TCP connect to a port that should be closed/filtered
-if run_on wan-host bash -c "echo | timeout 3 bash -c 'cat > /dev/tcp/10.0.0.1/22' 2>/dev/null"; then
-    echo "  TCP/22 to ruster from WAN: OPEN (kernel baseline — ruster FW would block)"
-    report "fw-block-wan-input-baseline" "PASS"
+if run_on wan-host ping -c 2 -W 3 10.0.0.1 > /dev/null 2>&1; then
+    echo "  Ping from WAN to ruster succeeded -- firewall is NOT blocking."
+    echo "  Expected: ping should be dropped by rule 'block-wan-input'."
+    report "fw-block-wan-input" "FAIL"
 else
-    echo "  TCP/22 to ruster from WAN: REFUSED/TIMEOUT (expected)"
-    report "fw-block-wan-input-baseline" "PASS"
+    echo "  Ping from WAN to ruster timed out/refused -- firewall is blocking."
+    report "fw-block-wan-input" "PASS"
 fi
 
-# Test 4: Blocked — WAN unsolicited forward to LAN
-#   With kernel ip_forward=1 and static routes, this will work at kernel level.
-#   When ruster's dataplane is active, default_forward=drop + no wan-to-lan rule
-#   means this should be blocked.
+# Test 4: Blocked -- WAN unsolicited forward to LAN (should be dropped)
+#   With the firewall active, unsolicited packets from WAN to LAN should be
+#   dropped (default_forward=drop, no wan-to-lan rule).
+#
+#   NOTE (v0.1): With kernel ip_forward=1 and static routes, this traffic is
+#   forwarded by the kernel. This test correctly FAILs in v0.1. Once ruster's
+#   dataplane handles real packets, this test will PASS.
 echo ""
-echo "-- Test 4: Blocked (wan-host -> lan-host unsolicited forward) [baseline] --"
-echo "  Note: With kernel routing, wan->lan forward is allowed."
-echo "  When ruster dataplane is active, default_forward=drop blocks this."
+echo "-- Test 4: Blocked (wan-host -> lan-host unsolicited forward) --"
 
-# Verify the route exists (wan-host has route to 192.168.1.0/24 via 10.0.0.1)
+# Verify the route exists so we know the test is meaningful
 WAN_ROUTES=$(run_on wan-host ip route show 2>/dev/null || true)
-if echo "$WAN_ROUTES" | grep -q "192.168.1.0/24"; then
-    echo "  Route to LAN exists on wan-host: OK"
-    # In kernel mode, this ping succeeds. Under ruster FW, it would fail.
-    if run_on wan-host ping -c 2 -W 3 192.168.1.100 > /dev/null 2>&1; then
-        echo "  Ping succeeded (kernel baseline — ruster FW would block)"
-    else
-        echo "  Ping failed (may indicate FW is active)"
-    fi
-    report "fw-block-wan-to-lan-baseline" "PASS"
-else
-    echo "  Diagnostic: no route to 192.168.1.0/24 on wan-host"
+if ! echo "$WAN_ROUTES" | grep -q "192.168.1.0/24"; then
+    echo "  Diagnostic: no route to 192.168.1.0/24 on wan-host."
+    echo "  Cannot test WAN->LAN forwarding without a route."
     echo "  Routes:"
     echo "$WAN_ROUTES" | sed 's/^/    /'
-    report "fw-block-wan-to-lan-baseline" "FAIL"
+    report "fw-block-wan-to-lan" "FAIL"
+else
+    echo "  Route to LAN exists on wan-host: OK"
+    if run_on wan-host ping -c 2 -W 3 192.168.1.100 > /dev/null 2>&1; then
+        echo "  Ping from WAN to LAN succeeded -- firewall is NOT blocking."
+        echo "  Expected: forward should be dropped by default_forward=drop."
+        report "fw-block-wan-to-lan" "FAIL"
+    else
+        echo "  Ping from WAN to LAN timed out/refused -- firewall is blocking."
+        report "fw-block-wan-to-lan" "PASS"
+    fi
 fi
 
-# ── Summary ───────────────────────────────────────────
+# -- Summary ---------------------------------------------------
 
 echo ""
-echo "--- Firewall Summary: ${PASS} passed, ${FAIL} failed ---"
+echo "--- Firewall Summary: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped ---"
 if [ "$FAIL" -gt 0 ]; then
     echo "Failed tests:"
     echo -e "$ERRORS"
