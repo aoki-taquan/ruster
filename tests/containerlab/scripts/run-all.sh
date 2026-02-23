@@ -36,6 +36,22 @@ run_suite() {
 echo "Waiting for topology to settle (5s)..."
 sleep 5
 
+# ── Pre-flight: verify ruster is running ─────────────
+
+echo ""
+echo "================================================================"
+echo "  Pre-flight: checking ruster process"
+echo "================================================================"
+echo ""
+
+if ! bash "${SCRIPT_DIR}/check-ruster.sh"; then
+    echo ""
+    echo "FATAL: ruster process is not running. Cannot proceed with E2E tests."
+    echo "       Tests would pass using kernel routing alone, masking real failures."
+    echo "       See diagnostic output above for details."
+    exit 1
+fi
+
 # ── Run all suites ────────────────────────────────────
 
 run_suite "L2 (ARP / MAC Learning)"   "test-l2.sh"

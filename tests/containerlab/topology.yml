@@ -26,6 +26,10 @@ topology:
         - ip addr add 192.168.1.1/24 dev eth1
         - ip addr add 10.0.0.1/24 dev eth2
         - sysctl -w net.ipv4.ip_forward=1
+        # Start ruster process in background.
+        # v0.1 uses MockPacketIo so kernel forwarding remains enabled;
+        # the E2E gate is ruster process liveness, not dataplane bypass.
+        - bash -c "nohup /usr/local/bin/ruster --config /etc/ruster/router.toml > /var/log/ruster.log 2>&1 &"
 
     lan-host:
       kind: linux

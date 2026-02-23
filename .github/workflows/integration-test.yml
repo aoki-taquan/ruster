@@ -31,6 +31,9 @@ jobs:
       - name: Deploy containerlab topology
         run: sudo containerlab deploy --topo tests/containerlab/topology.yml
 
+      - name: Verify ruster is running
+        run: bash tests/containerlab/scripts/check-ruster.sh
+
       - name: Run E2E tests
         run: bash tests/containerlab/scripts/run-all.sh
 
@@ -58,6 +61,13 @@ jobs:
           echo "=== Host interfaces ==="
           ip link show > "${LOG_DIR}/host-interfaces.txt" 2>&1 || true
           ip link show
+
+          echo "=== ruster process & log ==="
+          echo "--- ruster process status ---"
+          docker exec clab-ruster-e2e-ruster pgrep -a ruster > "${LOG_DIR}/ruster-pgrep.txt" 2>&1 || echo "ruster not running" | tee "${LOG_DIR}/ruster-pgrep.txt"
+          echo "--- ruster application log ---"
+          docker exec clab-ruster-e2e-ruster cat /var/log/ruster.log > "${LOG_DIR}/ruster-app.log" 2>&1 || echo "No ruster log found" | tee "${LOG_DIR}/ruster-app.log"
+          docker exec clab-ruster-e2e-ruster cat /var/log/ruster.log 2>&1 || true
 
           echo "=== Node network state ==="
           for node in ruster lan-host wan-host; do
