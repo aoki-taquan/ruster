@@ -7,6 +7,10 @@ pub mod nat;
 pub mod packet;
 pub mod routing;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use ruster_config::model::RouterConfig;
 
 /// Initialization error for the dataplane.
@@ -65,6 +69,25 @@ impl Dataplane {
             conntrack,
         })
     }
+
+    /// Run the dataplane event loop until the shutdown flag is set.
+    ///
+    /// In v0.1 there is no real packet I/O (DPDK backend is mocked), so the
+    /// loop simply polls the `shutdown` flag at a fixed interval. When actual
+    /// DPDK integration is added, this loop will drive the poll-mode driver.
+    ///
+    /// Returns `Ok(())` on clean shutdown.
+    pub fn run(&self, shutdown: Arc<AtomicBool>) -> Result<(), DataplaneError> {
+        const POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+        while !shutdown.load(Ordering::Relaxed) {
+            // v0.1: no real packet I/O — sleep until shutdown signal.
+            // Future: call DPDK rx_burst / tx_burst here.
+            std::thread::sleep(POLL_INTERVAL);
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -101,5 +124,46 @@ mod tests {
         let config = load_example();
         let result: Result<Dataplane, DataplaneError> = Dataplane::init(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn dataplane_run_returns_on_shutdown() {
+        let config = load_example();
+        let dp = Dataplane::init(&config).expect("init should succeed");
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_trigger = Arc::clone(&shutdown);
+
+        // Signal shutdown after a short delay from another thread.
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            shutdown_trigger.store(true, Ordering::Relaxed);
+        });
+
+        // run() should block until the shutdown flag is set, then return Ok.
+        let result = dp.run(shutdown);
+        assert!(result.is_ok(), "run should return Ok on clean shutdown");
+
+        handle.join().expect("trigger thread should join cleanly");
+    }
+
+    #[test]
+    fn dataplane_run_returns_immediately_if_already_shutdown() {
+        let config = load_example();
+        let dp = Dataplane::init(&config).expect("init should succeed");
+
+        // Pre-set the shutdown flag before calling run.
+        let shutdown = Arc::new(AtomicBool::new(true));
+
+        let start = std::time::Instant::now();
+        let result = dp.run(shutdown);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok(), "run should return Ok");
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "run should return immediately when shutdown is pre-set, took {:?}",
+            elapsed
+        );
     }
 }
