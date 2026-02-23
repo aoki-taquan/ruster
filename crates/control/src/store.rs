@@ -1,3 +1,32 @@
+//! Configuration store implementing the **validate -> plan -> apply** pipeline.
+//!
+//! # The `validate -> plan -> apply` Contract
+//!
+//! Every configuration change flows through a strict three-phase pipeline.
+//! Each phase is a gate: if it fails, no state is mutated and the error is
+//! returned to the caller.
+//!
+//! 1. **`validate(candidate)`** -- Runs the full semantic validation suite from
+//!    [`ruster_config::validate::validate`] against the candidate configuration.
+//!    This includes checks for duplicate interface names/port-IDs, bridge-domain
+//!    member existence, static-route `out_if` references, NAT/firewall
+//!    cross-constraints, and more.  The store state is never modified by this
+//!    method.
+//!
+//! 2. **`plan(candidate)`** -- Calls `validate` first, then diffs the candidate
+//!    against the current running config to produce a [`PlanResult`] with the
+//!    list of changes.  If there is no running config yet the entire candidate
+//!    is reported as an addition.  The store state is not modified.
+//!
+//! 3. **`apply(candidate)`** -- Calls `plan` (which internally calls `validate`),
+//!    and only if both succeed does it promote the candidate to the new running
+//!    config.  The change remains "pending" (uncommitted) until [`ConfigStore::commit`]
+//!    is called.
+//!
+//! Because `plan` gates on `validate`, and `apply` gates on `plan`, **any
+//! semantic error detected by the config crate will prevent a state change
+//! at every level of the pipeline**.
+
 use ruster_config::RouterConfig;
 
 use crate::diff;
@@ -26,7 +55,24 @@ impl std::fmt::Display for PlanResult {
 
 /// Holds running / candidate configuration state.
 ///
-/// Workflow: `validate` → `plan` → `apply` → (optional) `commit`.
+/// # Workflow
+///
+/// ```text
+/// validate(candidate)
+///     |
+///     v
+/// plan(candidate)     -- calls validate, then diffs
+///     |
+///     v
+/// apply(candidate)    -- calls plan, then updates running
+///     |
+///     v
+/// commit()            -- snapshots running as committed
+/// ```
+///
+/// If any earlier phase fails, later phases are never reached and the store
+/// state remains unchanged.  See the [module-level documentation](self) for
+/// the full contract description.
 #[derive(Debug)]
 pub struct ConfigStore {
     /// The currently active configuration (after `apply`).
@@ -71,16 +117,32 @@ impl ConfigStore {
         }
     }
 
-    /// Validate a candidate configuration (parse + semantic checks).
+    /// Validate a candidate configuration using the full `ruster-config` validation suite.
     ///
-    /// This does NOT modify store state.
+    /// This delegates to [`ruster_config::validate::validate`] so that the same semantic
+    /// checks applied at config-load time (duplicate interface names, bridge-domain member
+    /// existence, NAT/firewall cross-references, etc.) are also enforced on every runtime
+    /// config change through the `validate -> plan -> apply` pipeline.
+    ///
+    /// This does **not** modify store state; it is purely a read-only check.
     pub fn validate(&self, candidate: &RouterConfig) -> Result<(), ControlError> {
+        // Empty hostname is caught by the config-crate validation as well,
+        // but we keep the explicit check for a clearer error message.
         if candidate.meta.hostname.trim().is_empty() {
             return Err(ControlError::Validation(
                 "meta.hostname must not be empty".to_string(),
             ));
         }
-        // Config-crate level validation is assumed to have passed at load time.
+
+        // Full semantic validation via ruster-config.
+        ruster_config::validate::validate(candidate).map_err(|errors| {
+            let msgs: Vec<String> = errors
+                .iter()
+                .map(|e| format!("{}: {}", e.field, e.reason))
+                .collect();
+            ControlError::Validation(msgs.join("; "))
+        })?;
+
         Ok(())
     }
 
