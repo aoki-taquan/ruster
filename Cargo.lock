@@ -89,6 +89,7 @@ name = "ruster-dataplane"
 version = "0.1.0"
 dependencies = [
  "ruster-config",
+ "ruster-observe",
  "thiserror",
 ]
 
