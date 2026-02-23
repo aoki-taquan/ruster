@@ -6,4 +6,5 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+ruster-config = { path = "../config" }
 thiserror.workspace = true
