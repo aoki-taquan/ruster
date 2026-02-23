@@ -11,14 +11,46 @@
 //! [`PipelineResult`] indicating whether the packet should be forwarded,
 //! dropped, or was consumed internally.
 
+use std::collections::HashMap;
+
+use crate::conntrack::ConntrackEngine;
 use crate::firewall::{FirewallEngine, FwChain, FwContext, FwVerdict};
 use crate::io::RawPacket;
 use crate::packet;
 use crate::routing::{L3Decision, L3DropReason, L3Engine};
 
-use ruster_config::model::FirewallZone;
+use ruster_config::model::{FirewallZone, InterfaceConfig, InterfaceZone};
 
-use crate::conntrack::ConntrackEngine;
+// ── Zone resolver ─────────────────────────────────────────────────
+
+/// Maps interface names to their firewall zones.
+#[derive(Debug, Clone)]
+pub struct ZoneResolver {
+    zones: HashMap<String, FirewallZone>,
+}
+
+impl ZoneResolver {
+    /// Build a zone resolver from interface configuration.
+    pub fn from_config(interfaces: &[InterfaceConfig]) -> Self {
+        let zones = interfaces
+            .iter()
+            .map(|iface| {
+                let zone = match iface.zone {
+                    InterfaceZone::Lan => FirewallZone::Lan,
+                    InterfaceZone::Wan => FirewallZone::Wan,
+                };
+                (iface.name.clone(), zone)
+            })
+            .collect();
+        Self { zones }
+    }
+
+    /// Resolve the firewall zone for a given interface name.
+    /// Returns `FirewallZone::Lan` as default if the interface is not found.
+    pub fn resolve(&self, iface: &str) -> FirewallZone {
+        self.zones.get(iface).copied().unwrap_or(FirewallZone::Lan)
+    }
+}
 
 // ── Pipeline result types ───────────────────────────────────────────
 
@@ -76,6 +108,7 @@ pub fn process_packet(
     l3: &L3Engine,
     firewall: &FirewallEngine,
     conntrack: &ConntrackEngine,
+    zone_resolver: &ZoneResolver,
 ) -> PipelineResult {
     // Step 1: Parse raw bytes.
     let meta = match packet::parse_packet(&raw_pkt.data, &raw_pkt.ingress_iface) {
@@ -97,18 +130,10 @@ pub fn process_packet(
             new_ttl: _,
         } => {
             // Step 3: Firewall check on the forward chain.
-            // RFC-DEVIATION:
-            // reason: v0.1 uses placeholder zones (Lan/Lan) for simplicity
-            // impact: zone-based firewall filtering is not fully functional
-            // issue: #125
-            // plan: v0.2 will resolve zones from interface config
-            let fw_ctx = FwContext::from_packet(
-                &meta,
-                FwChain::Forward,
-                FirewallZone::Lan,
-                FirewallZone::Lan,
-                conntrack,
-            );
+            let src_zone = zone_resolver.resolve(&raw_pkt.ingress_iface);
+            let dst_zone = zone_resolver.resolve(&out_ifname);
+            let fw_ctx =
+                FwContext::from_packet(&meta, FwChain::Forward, src_zone, dst_zone, conntrack);
             let verdict = firewall.evaluate(&fw_ctx);
 
             match verdict {
@@ -232,6 +257,10 @@ mod tests {
         })
     }
 
+    fn make_zone_resolver() -> ZoneResolver {
+        ZoneResolver::from_config(&make_interfaces())
+    }
+
     /// Compute IPv4 header checksum and write it into the header.
     fn set_ipv4_checksum(hdr: &mut [u8]) {
         hdr[10] = 0x00;
@@ -313,7 +342,8 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct);
+        let zr = make_zone_resolver();
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Forward { egress_iface } => {
                 assert_eq!(egress_iface, "wan0");
@@ -334,7 +364,8 @@ mod tests {
             data: vec![0x00; 5],
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct);
+        let zr = make_zone_resolver();
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason } => {
                 assert_eq!(reason, DropReason::ParseError);
@@ -371,7 +402,8 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct);
+        let zr = make_zone_resolver();
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason } => {
                 assert_eq!(reason, DropReason::L3NoRoute);
@@ -399,7 +431,8 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct);
+        let zr = make_zone_resolver();
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -427,7 +460,8 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct);
+        let zr = make_zone_resolver();
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
         assert!(matches!(result, PipelineResult::Consumed));
     }
 
@@ -450,7 +484,8 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct);
+        let zr = make_zone_resolver();
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -487,7 +522,8 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct);
+        let zr = make_zone_resolver();
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason } => {
                 assert_eq!(reason, DropReason::L3NotIpv4);
@@ -503,6 +539,7 @@ mod tests {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let zr = make_zone_resolver();
 
         let mut parse_errors = 0u64;
         let mut ttl_drops = 0u64;
@@ -513,7 +550,7 @@ mod tests {
             ingress_iface: "eth0".to_string(),
             data: vec![0x00; 5],
         };
-        match process_packet(&short_pkt, &l3, &fw, &ct) {
+        match process_packet(&short_pkt, &l3, &fw, &ct, &zr) {
             PipelineResult::Drop {
                 reason: DropReason::ParseError,
             } => parse_errors += 1,
@@ -526,7 +563,7 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: ttl_data,
         };
-        match process_packet(&ttl_pkt, &l3, &fw, &ct) {
+        match process_packet(&ttl_pkt, &l3, &fw, &ct, &zr) {
             PipelineResult::Drop {
                 reason: DropReason::L3TtlExpired,
             } => ttl_drops += 1,
@@ -539,7 +576,7 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: fwd_data,
         };
-        match process_packet(&fwd_pkt, &l3, &fw, &ct) {
+        match process_packet(&fwd_pkt, &l3, &fw, &ct, &zr) {
             PipelineResult::Forward { .. } => forwards += 1,
             _ => {}
         }
@@ -547,5 +584,126 @@ mod tests {
         assert_eq!(parse_errors, 1);
         assert_eq!(ttl_drops, 1);
         assert_eq!(forwards, 1);
+    }
+
+    // ── Zone resolution tests ───────────────────────────────────────
+
+    #[test]
+    fn forward_resolves_ingress_zone() {
+        // Verify that the ingress interface zone is correctly resolved.
+        // A packet entering from "lan0" (Lan zone) going to "wan0" (Wan zone)
+        // should have src_zone=Lan. With a firewall that allows Lan->Wan,
+        // the packet should be forwarded.
+        use ruster_config::model::{Chain, ConnState, FirewallRule, RuleAction, RuleProto};
+
+        let l3 = make_l3_engine();
+        let ct = make_conntrack();
+        let zr = make_zone_resolver();
+
+        // Firewall: only allow Lan->Wan forward, drop everything else.
+        let fw = FirewallEngine::from_config(&FirewallConfig {
+            enabled: true,
+            default_input: DefaultPolicy::Drop,
+            default_forward: DefaultPolicy::Drop,
+            default_output: DefaultPolicy::Drop,
+            allow_established_related: false,
+            rules: vec![FirewallRule {
+                name: "allow-lan-to-wan".to_string(),
+                chain: Chain::Forward,
+                action: RuleAction::Accept,
+                proto: RuleProto::Any,
+                src_zone: FirewallZone::Lan,
+                dst_zone: FirewallZone::Wan,
+                state: vec![ConnState::New],
+            }],
+        });
+
+        // Packet from lan0 (Lan) to 8.8.8.8 routed via wan0 (Wan).
+        let data = make_ipv4_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            [192, 168, 1, 100],
+            [8, 8, 8, 8],
+            64,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        match result {
+            PipelineResult::Forward { egress_iface } => {
+                assert_eq!(egress_iface, "wan0");
+            }
+            other => panic!(
+                "expected Forward (Lan->Wan should be accepted), got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn forward_resolves_egress_zone() {
+        // Verify that the egress interface zone is correctly resolved.
+        // A packet entering from "wan0" (Wan zone) going to a LAN address
+        // routed via "lan0" (Lan zone) should have src_zone=Wan, dst_zone=Lan.
+        // With a firewall that only allows Lan->Wan, this should be dropped.
+        use ruster_config::model::{Chain, ConnState, FirewallRule, RuleAction, RuleProto};
+
+        let l3 = make_l3_engine();
+        let ct = make_conntrack();
+        let zr = make_zone_resolver();
+
+        // Firewall: only allow Lan->Wan forward, drop everything else.
+        let fw = FirewallEngine::from_config(&FirewallConfig {
+            enabled: true,
+            default_input: DefaultPolicy::Drop,
+            default_forward: DefaultPolicy::Drop,
+            default_output: DefaultPolicy::Drop,
+            allow_established_related: false,
+            rules: vec![FirewallRule {
+                name: "allow-lan-to-wan".to_string(),
+                chain: Chain::Forward,
+                action: RuleAction::Accept,
+                proto: RuleProto::Any,
+                src_zone: FirewallZone::Lan,
+                dst_zone: FirewallZone::Wan,
+                state: vec![ConnState::New],
+            }],
+        });
+
+        // Packet from wan0 (Wan) to 192.168.1.100 routed via lan0 (Lan).
+        // src_zone=Wan, dst_zone=Lan -> no matching rule -> drop.
+        let data = make_ipv4_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
+            [8, 8, 8, 8],
+            [192, 168, 1, 100],
+            64,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "wan0".to_string(),
+            data,
+        };
+
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        match result {
+            PipelineResult::Drop { reason } => {
+                assert_eq!(reason, DropReason::FirewallDrop);
+            }
+            other => panic!(
+                "expected Drop(FirewallDrop) for Wan->Lan with no matching rule, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn unknown_interface_defaults_to_lan() {
+        // Verify that an unknown interface name defaults to FirewallZone::Lan.
+        let zr = make_zone_resolver();
+        assert_eq!(zr.resolve("unknown_iface"), FirewallZone::Lan);
+        assert_eq!(zr.resolve(""), FirewallZone::Lan);
     }
 }
