@@ -2,6 +2,7 @@
 .PHONY: worktree-start worktree-clean worktree-list
 .PHONY: team-start team-stop
 .PHONY: clab-deploy clab-test clab-destroy clab-e2e
+.PHONY: soak-test soak-test-short
 
 # ── Build ──────────────────────────────────────────────
 
@@ -92,3 +93,11 @@ clab-destroy:
 	cd tests/containerlab && sudo containerlab destroy --topo topology.yml
 
 clab-e2e: clab-test clab-destroy
+
+# ── Soak Tests ────────────────────────────────────────
+
+soak-test:
+	cd tests/soak && bash soak-test.sh
+
+soak-test-short:
+	cd tests/soak && SOAK_DURATION_MIN=5 bash soak-test.sh
