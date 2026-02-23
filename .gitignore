@@ -19,3 +19,4 @@
 .claude/plugins/
 .claude/projects/
 .claude/stats-cache.json
+tests/soak/results/
