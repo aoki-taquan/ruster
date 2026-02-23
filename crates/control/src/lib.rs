@@ -1,3 +1,13 @@
+//! `ruster-control` -- validate, plan, and apply configuration changes.
+//!
+//! This crate provides the [`ConfigStore`] type that implements the
+//! **validate -> plan -> apply** pipeline for the ruster software router.
+//! All configuration mutations are gated by the full semantic validation
+//! from [`ruster_config::validate`], ensuring that runtime config changes
+//! are held to the same standard as initial config loading.
+//!
+//! See [`store`] module documentation for the detailed contract.
+
 pub mod diff;
 pub mod error;
 pub mod store;
@@ -206,5 +216,179 @@ mod tests {
         let cfg = load_example();
         let store = ConfigStore::with_running(cfg);
         assert!(!store.has_pending_changes());
+    }
+
+    // ── validate rejects non-hostname invalid configs ──
+
+    #[test]
+    fn validate_rejects_duplicate_interface_names() {
+        let mut cfg = load_example();
+        // Set lan1's name to "lan0" (duplicate of the second interface).
+        cfg.interfaces[2].name = "lan0".to_string();
+        let err = validate(&cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate"), "expected 'duplicate' in: {msg}");
+        assert!(
+            msg.contains("interfaces.name"),
+            "expected 'interfaces.name' in: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_port_ids() {
+        let mut cfg = load_example();
+        // Set lan1's port_id to 1 (duplicate of lan0).
+        cfg.interfaces[2].port_id = 1;
+        let err = validate(&cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("port_id"), "expected 'port_id' in: {msg}");
+        assert!(msg.contains("duplicate"), "expected 'duplicate' in: {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_bridge_domain_unknown_member() {
+        let mut cfg = load_example();
+        cfg.l2.bridge_domains[1].members = vec!["lan0".to_string(), "nonexistent".to_string()];
+        let err = validate(&cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nonexistent"),
+            "expected 'nonexistent' in: {msg}"
+        );
+        assert!(
+            msg.contains("bridge_domains"),
+            "expected 'bridge_domains' in: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_static_route_unknown_out_if() {
+        let mut cfg = load_example();
+        cfg.routing.ipv4_static_routes[0].out_if = "noexist".to_string();
+        let err = validate(&cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("noexist"), "expected 'noexist' in: {msg}");
+        assert!(
+            msg.contains("static_routes"),
+            "expected 'static_routes' in: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nat_external_if_not_wan() {
+        let mut cfg = load_example();
+        cfg.nat.external_if = "lan0".to_string();
+        let err = validate(&cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nat.external_if"),
+            "expected 'nat.external_if' in: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_nat_enabled_without_firewall() {
+        let mut cfg = load_example();
+        cfg.nat.enabled = true;
+        cfg.firewall.enabled = false;
+        let err = validate(&cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("nat.enabled"),
+            "expected 'nat.enabled' in: {msg}"
+        );
+        assert!(msg.contains("firewall"), "expected 'firewall' in: {msg}");
+    }
+
+    #[test]
+    fn validate_rejects_firewall_rule_empty_state() {
+        let mut cfg = load_example();
+        cfg.firewall.rules[0].state = vec![];
+        let err = validate(&cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("state"), "expected 'state' in: {msg}");
+        assert!(msg.contains("empty"), "expected 'empty' in: {msg}");
+    }
+
+    // ── plan/apply reject non-hostname invalid configs ──
+
+    #[test]
+    fn plan_rejects_duplicate_interface_names() {
+        let valid = load_example();
+        let mut invalid = valid.clone();
+        invalid.interfaces[2].name = "lan0".to_string();
+        let err = plan(Some(&valid), &invalid).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate"), "expected 'duplicate' in: {msg}");
+    }
+
+    #[test]
+    fn apply_rejects_duplicate_interface_names() {
+        let valid = load_example();
+        let mut invalid = valid.clone();
+        invalid.interfaces[2].name = "lan0".to_string();
+        let err = apply(Some(&valid), invalid).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate"), "expected 'duplicate' in: {msg}");
+    }
+
+    #[test]
+    fn apply_rejects_bridge_domain_unknown_member() {
+        let valid = load_example();
+        let mut invalid = valid.clone();
+        invalid.l2.bridge_domains[1].members = vec!["lan0".to_string(), "ghost".to_string()];
+        let err = apply(Some(&valid), invalid).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ghost"), "expected 'ghost' in: {msg}");
+    }
+
+    // ── state unchanged on validation failure ──
+
+    #[test]
+    fn store_apply_validation_failure_preserves_state() {
+        let valid = load_example();
+        let mut store = ConfigStore::with_running(valid.clone());
+        store.commit().unwrap();
+
+        // Build an invalid candidate: duplicate interface names.
+        let mut invalid = valid.clone();
+        invalid.interfaces[2].name = "lan0".to_string();
+
+        // apply() must fail.
+        let err = store.apply(invalid);
+        assert!(err.is_err(), "apply should have failed");
+
+        // Running config must be unchanged.
+        assert_eq!(
+            store.running().unwrap().interfaces[2].name,
+            "lan1",
+            "running config should be unchanged after failed apply"
+        );
+
+        // No pending changes should exist.
+        assert!(
+            !store.has_pending_changes(),
+            "no pending changes after failed apply"
+        );
+    }
+
+    #[test]
+    fn store_plan_validation_failure_preserves_state() {
+        let valid = load_example();
+        let store = ConfigStore::with_running(valid.clone());
+
+        // Invalid: NAT external_if points to a lan interface.
+        let mut invalid = valid.clone();
+        invalid.nat.external_if = "lan0".to_string();
+
+        let err = store.plan(&invalid);
+        assert!(err.is_err(), "plan should have failed");
+
+        // Running config unchanged.
+        assert_eq!(
+            store.running().unwrap().nat.external_if,
+            "wan0",
+            "running config should be unchanged after failed plan"
+        );
     }
 }
