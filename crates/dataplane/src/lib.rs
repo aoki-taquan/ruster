@@ -2,6 +2,7 @@ pub mod arp;
 pub mod dpdk;
 pub mod l2;
 pub mod packet;
+pub mod routing;
 
 #[derive(Debug, Default)]
 pub struct Dataplane;
