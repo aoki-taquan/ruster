@@ -2,9 +2,11 @@ pub mod arp;
 pub mod conntrack;
 pub mod dpdk;
 pub mod firewall;
+pub mod io;
 pub mod l2;
 pub mod nat;
 pub mod packet;
+pub mod pipeline;
 pub mod routing;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,18 +74,34 @@ impl Dataplane {
 
     /// Run the dataplane event loop until the shutdown flag is set.
     ///
-    /// In v0.1 there is no real packet I/O (DPDK backend is mocked), so the
-    /// loop simply polls the `shutdown` flag at a fixed interval. When actual
-    /// DPDK integration is added, this loop will drive the poll-mode driver.
+    /// Receives packets via [`io::PacketIo::rx`], processes them through
+    /// the pipeline (parse -> L3 route -> firewall), and transmits
+    /// forwarded packets via [`io::PacketIo::tx`].
+    ///
+    /// If the RX queue is empty the loop sleeps briefly to avoid busy-spinning.
     ///
     /// Returns `Ok(())` on clean shutdown.
-    pub fn run(&self, shutdown: Arc<AtomicBool>) -> Result<(), DataplaneError> {
-        const POLL_INTERVAL: Duration = Duration::from_millis(100);
-
+    pub fn run(
+        &self,
+        shutdown: Arc<AtomicBool>,
+        io: Box<dyn io::PacketIo>,
+    ) -> Result<(), DataplaneError> {
         while !shutdown.load(Ordering::Relaxed) {
-            // v0.1: no real packet I/O — sleep until shutdown signal.
-            // Future: call DPDK rx_burst / tx_burst here.
-            std::thread::sleep(POLL_INTERVAL);
+            let batch = io.rx();
+            if batch.is_empty() {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            for raw_pkt in &batch {
+                let result =
+                    pipeline::process_packet(raw_pkt, &self.l3, &self.firewall, &self.conntrack);
+                match result {
+                    pipeline::PipelineResult::Forward { egress_iface } => {
+                        let _ = io.tx(&egress_iface, raw_pkt);
+                    }
+                    pipeline::PipelineResult::Drop { .. } | pipeline::PipelineResult::Consumed => {}
+                }
+            }
         }
 
         Ok(())
@@ -141,7 +159,8 @@ mod tests {
         });
 
         // run() should block until the shutdown flag is set, then return Ok.
-        let result = dp.run(shutdown);
+        let mock_io = io::MockPacketIo::new();
+        let result = dp.run(shutdown, Box::new(mock_io));
         assert!(result.is_ok(), "run should return Ok on clean shutdown");
 
         handle.join().expect("trigger thread should join cleanly");
@@ -156,7 +175,8 @@ mod tests {
         let shutdown = Arc::new(AtomicBool::new(true));
 
         let start = std::time::Instant::now();
-        let result = dp.run(shutdown);
+        let mock_io = io::MockPacketIo::new();
+        let result = dp.run(shutdown, Box::new(mock_io));
         let elapsed = start.elapsed();
 
         assert!(result.is_ok(), "run should return Ok");

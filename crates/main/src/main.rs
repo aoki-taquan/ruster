@@ -105,8 +105,10 @@ fn main() {
 
     println!("\nruster: running (press Ctrl+C to stop)");
 
-    // Enter the dataplane run loop (blocks until shutdown)
-    if let Err(e) = dataplane.run(shutdown) {
+    // Enter the dataplane run loop (blocks until shutdown).
+    // v0.1: no real NIC I/O — use a mock backend that produces no packets.
+    let mock_io = ruster_dataplane::io::MockPacketIo::new();
+    if let Err(e) = dataplane.run(shutdown, Box::new(mock_io)) {
         eprintln!("Error: dataplane run failed: {}", e);
         process::exit(1);
     }

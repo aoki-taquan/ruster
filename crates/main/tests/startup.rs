@@ -155,7 +155,8 @@ fn dataplane_run_exits_on_shutdown_signal() {
         shutdown_trigger.store(true, Ordering::Relaxed);
     });
 
-    let result = dp.run(shutdown);
+    let mock_io = ruster_dataplane::io::MockPacketIo::new();
+    let result = dp.run(shutdown, Box::new(mock_io));
     assert!(result.is_ok(), "run should return Ok on clean shutdown");
 
     handle.join().expect("trigger thread should join cleanly");
@@ -175,7 +176,8 @@ fn dataplane_run_immediate_shutdown() {
     let shutdown = Arc::new(AtomicBool::new(true));
 
     let start = std::time::Instant::now();
-    let result = dp.run(shutdown);
+    let mock_io = ruster_dataplane::io::MockPacketIo::new();
+    let result = dp.run(shutdown, Box::new(mock_io));
     let elapsed = start.elapsed();
 
     assert!(result.is_ok(), "run should return Ok");
@@ -218,7 +220,8 @@ fn full_startup_run_shutdown_pipeline() {
         shutdown_trigger.store(true, Ordering::Relaxed);
     });
 
-    let result = dp.run(shutdown);
+    let mock_io = ruster_dataplane::io::MockPacketIo::new();
+    let result = dp.run(shutdown, Box::new(mock_io));
     assert!(result.is_ok(), "full pipeline run should succeed");
 
     handle.join().expect("trigger thread should join");
