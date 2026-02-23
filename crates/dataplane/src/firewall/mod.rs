@@ -107,7 +107,7 @@ impl FwContext {
 
 /// The stateful firewall engine.
 ///
-/// Holds the firewall configuration and provides the [`evaluate`] method
+/// Holds the firewall configuration and provides the [`FirewallEngine::evaluate`] method
 /// for per-packet verdict computation.
 pub struct FirewallEngine {
     enabled: bool,
