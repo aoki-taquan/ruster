@@ -157,4 +157,101 @@ mod tests {
         assert!(msg.contains("state"), "error should mention field: {msg}");
         assert!(msg.contains("empty"), "error should mention reason: {msg}");
     }
+
+    // ── IP/CIDR validation tests ─────────────────────────────────────
+
+    #[test]
+    fn reject_invalid_route_prefix_not_cidr() {
+        let toml = make_valid_toml().replace(r#"prefix = "0.0.0.0/0""#, r#"prefix = "not-a-cidr""#);
+        let err = load_from_str(&toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ipv4_static_routes"),
+            "error should mention field: {msg}"
+        );
+        assert!(
+            msg.contains("invalid CIDR prefix"),
+            "error should mention reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_route_prefix_len_too_large() {
+        let toml =
+            make_valid_toml().replace(r#"prefix = "0.0.0.0/0""#, r#"prefix = "192.168.1.0/33""#);
+        let err = load_from_str(&toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ipv4_static_routes"),
+            "error should mention field: {msg}"
+        );
+        assert!(
+            msg.contains("invalid CIDR prefix"),
+            "error should mention reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_route_next_hop() {
+        let toml =
+            make_valid_toml().replace(r#"next_hop = "203.0.113.1""#, r#"next_hop = "not-an-ip""#);
+        let err = load_from_str(&toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("next_hop"),
+            "error should mention field: {msg}"
+        );
+        assert!(
+            msg.contains("invalid IPv4 address"),
+            "error should mention reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_interface_ipv4_addr_no_prefix() {
+        // ipv4_addrs without CIDR prefix notation should be rejected
+        let toml = make_valid_toml().replace(
+            r#"ipv4_addrs = ["203.0.113.2/24"]"#,
+            r#"ipv4_addrs = ["192.168.1.1"]"#,
+        );
+        let err = load_from_str(&toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ipv4_addrs"),
+            "error should mention field: {msg}"
+        );
+        assert!(
+            msg.contains("invalid CIDR"),
+            "error should mention reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_invalid_interface_ipv4_addr_bad_ip() {
+        let toml = make_valid_toml().replace(
+            r#"ipv4_addrs = ["203.0.113.2/24"]"#,
+            r#"ipv4_addrs = ["bad-addr/24"]"#,
+        );
+        let err = load_from_str(&toml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ipv4_addrs"),
+            "error should mention field: {msg}"
+        );
+        assert!(
+            msg.contains("invalid CIDR"),
+            "error should mention reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn accept_valid_ip_and_cidr_values() {
+        // The example toml has valid IPs and CIDRs, so it should pass
+        let result = load_from_str(&make_valid_toml());
+        assert!(
+            result.is_ok(),
+            "valid config should pass: {:?}",
+            result.err()
+        );
+    }
 }

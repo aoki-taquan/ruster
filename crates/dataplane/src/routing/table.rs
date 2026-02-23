@@ -42,6 +42,10 @@ impl RouteTable {
     /// Parses each static route's prefix string (e.g. "192.168.1.0/24")
     /// and next-hop address, then sorts entries for LPM lookup.
     pub fn from_config(routing_config: &RoutingConfig) -> Self {
+        // NOTE: Config validation (ruster-config validate) ensures all prefix
+        // and next_hop strings are well-formed before they reach here.
+        // filter_map is retained as a defence-in-depth measure; any parse
+        // failure at this stage indicates a logic bug.
         let mut entries: Vec<RouteEntry> = routing_config
             .ipv4_static_routes
             .iter()
