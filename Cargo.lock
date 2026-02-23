@@ -58,11 +58,9 @@ dependencies = [
 name = "ruster"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "ruster-config",
  "ruster-control",
  "ruster-dataplane",
- "ruster-observe",
 ]
 
 [[package]]
