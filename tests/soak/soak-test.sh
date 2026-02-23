@@ -51,6 +51,7 @@ REPORT_FILE="${SOAK_OUTPUT_DIR}/report.md"
 # PID tracking
 RUSTER_PID=""
 TRAFFIC_PID=""
+RUSTER_DIED=""
 
 # ── Logging ─────────────────────────────────────────────
 log() {
@@ -168,8 +169,6 @@ start_ruster() {
     local ruster_log="${SOAK_OUTPUT_DIR}/ruster.log"
 
     # Start ruster with the test config
-    # Note: v0.1 ruster may exit quickly if DPDK is not available,
-    # which is expected for standalone mode. We handle this gracefully.
     "$RUSTER_BIN" --config "$RUSTER_CONFIG" > "$ruster_log" 2>&1 &
     RUSTER_PID=$!
 
@@ -178,24 +177,15 @@ start_ruster() {
     # Give it a moment to initialize
     sleep 2
 
-    # Check if process is still running
+    # Check if process is still running — fail fast if it exited
     if ! kill -0 "$RUSTER_PID" 2>/dev/null; then
-        log "WARNING: Ruster process exited during startup"
-        log "This is expected in standalone mode without DPDK"
-        log "Ruster log:"
-        tail -20 "$ruster_log" 2>/dev/null || true
-
-        # In standalone mode, fall back to a sleep process as a surrogate
-        # to test the monitoring infrastructure itself
-        if [ "$SOAK_MODE" = "standalone" ]; then
-            log "Falling back to surrogate process for infrastructure testing"
-            sleep "$SOAK_DURATION_SEC" &
-            RUSTER_PID=$!
-            log "Surrogate process started (PID: $RUSTER_PID)"
-        else
-            log_error "Ruster failed to start in containerlab mode"
-            exit 1
-        fi
+        log_error "Ruster process exited during startup"
+        log_error "Ruster log (last 30 lines):"
+        tail -30 "$ruster_log" 2>/dev/null | while IFS= read -r line; do
+            log_error "  $line"
+        done
+        log_error "Soak test requires a running ruster process"
+        exit 1
     fi
 }
 
@@ -247,9 +237,13 @@ run_health_checks() {
 
         # Check if process died unexpectedly
         if ! kill -0 "$RUSTER_PID" 2>/dev/null; then
-            log "WARNING: Process died at ${elapsed}s (check #${check_count})"
+            log_error "Ruster process died at ${elapsed}s (check #${check_count})"
+            log_error "This is a stability failure — ruster must survive the full soak duration"
             # Record the death in metrics
             bash "$SCRIPT_DIR/check-health.sh" "$RUSTER_PID" "$METRICS_FILE" > /dev/null 2>&1
+            # Set flag to indicate early termination
+            RUSTER_DIED=true
+            break
         fi
 
         # Progress logging (every 5 minutes or at the end of each check)
@@ -341,8 +335,14 @@ main() {
     fi
     TRAFFIC_PID=""
 
-    # Generate report and check thresholds
+    # If ruster died during the soak, force FAIL
     local result=0
+    if [ "$RUSTER_DIED" = "true" ]; then
+        log_error "Ruster process did not survive the full soak duration — forcing FAIL"
+        result=1
+    fi
+
+    # Generate report and check thresholds
     if ! generate_report; then
         result=1
     fi
