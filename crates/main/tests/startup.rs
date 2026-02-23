@@ -133,3 +133,93 @@ fn full_startup_pipeline_succeeds() {
     assert!(dp.nat.is_enabled());
     assert_eq!(dp.conntrack.session_count(), 0);
 }
+
+// ── Run loop tests ──────────────────────────────────────────────────
+
+#[test]
+fn dataplane_run_exits_on_shutdown_signal() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let config =
+        ruster_config::load_from_str(&example_toml_str()).expect("example config should be valid");
+    let dp = ruster_dataplane::Dataplane::init(&config).expect("dataplane init should succeed");
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_trigger = Arc::clone(&shutdown);
+
+    // Signal shutdown after a short delay.
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        shutdown_trigger.store(true, Ordering::Relaxed);
+    });
+
+    let result = dp.run(shutdown);
+    assert!(result.is_ok(), "run should return Ok on clean shutdown");
+
+    handle.join().expect("trigger thread should join cleanly");
+}
+
+#[test]
+fn dataplane_run_immediate_shutdown() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let config =
+        ruster_config::load_from_str(&example_toml_str()).expect("example config should be valid");
+    let dp = ruster_dataplane::Dataplane::init(&config).expect("dataplane init should succeed");
+
+    // Pre-set shutdown before calling run.
+    let shutdown = Arc::new(AtomicBool::new(true));
+
+    let start = std::time::Instant::now();
+    let result = dp.run(shutdown);
+    let elapsed = start.elapsed();
+
+    assert!(result.is_ok(), "run should return Ok");
+    assert!(
+        elapsed < Duration::from_millis(50),
+        "run should return immediately when shutdown is pre-set, took {:?}",
+        elapsed
+    );
+}
+
+#[test]
+fn full_startup_run_shutdown_pipeline() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    // Full E2E: config load -> control -> dataplane init -> run -> shutdown
+    let config_path = example_config_path();
+    let config = ruster_config::load_from_file(config_path.to_str().unwrap())
+        .expect("config load should succeed");
+
+    ruster_control::validate(&config).expect("validation should succeed");
+
+    let mut store = ruster_control::ConfigStore::new();
+    store.apply(config.clone()).expect("apply should succeed");
+    store.commit().expect("commit should succeed");
+
+    let dp = ruster_dataplane::Dataplane::init(&config).expect("dataplane init should succeed");
+
+    // Verify engines.
+    assert!(dp.nat.is_enabled());
+    assert_eq!(dp.conntrack.session_count(), 0);
+
+    // Run and shutdown.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_trigger = Arc::clone(&shutdown);
+
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        shutdown_trigger.store(true, Ordering::Relaxed);
+    });
+
+    let result = dp.run(shutdown);
+    assert!(result.is_ok(), "full pipeline run should succeed");
+
+    handle.join().expect("trigger thread should join");
+}
