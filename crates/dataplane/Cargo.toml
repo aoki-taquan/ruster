@@ -8,3 +8,6 @@ publish.workspace = true
 [dependencies]
 ruster-config = { path = "../config" }
 thiserror.workspace = true
+
+[dev-dependencies]
+ruster-observe = { path = "../observe" }
