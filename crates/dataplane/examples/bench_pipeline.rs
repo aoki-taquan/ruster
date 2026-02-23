@@ -297,7 +297,7 @@ fn bench_l2_fdb_hit() -> BenchResult {
 fn bench_l3_lpm_lookup() -> BenchResult {
     let routing_config = make_routing_config();
     let interfaces = make_interfaces();
-    let engine = L3Engine::from_config(&routing_config, &interfaces);
+    let engine = L3Engine::from_config(&routing_config, &interfaces).unwrap();
 
     // Packet destined to an external IP -> LPM hit on default route.
     let meta = make_ipv4_tcp_meta("lan0", [192, 168, 1, 100], [8, 8, 8, 8], 49152, 80);
@@ -541,7 +541,7 @@ fn bench_arp_cache_hit() -> BenchResult {
 fn bench_full_pipeline() -> BenchResult {
     // Set up all engines.
     let interfaces = make_interfaces();
-    let l3_engine = L3Engine::from_config(&make_routing_config(), &interfaces);
+    let l3_engine = L3Engine::from_config(&make_routing_config(), &interfaces).unwrap();
     let fw_engine = FirewallEngine::from_config(&make_fw_config());
     let nat_config = make_nat_config();
     let mut nat_engine = NatEngine::from_config(&nat_config, &interfaces);
@@ -802,7 +802,7 @@ fn verify_correctness() {
 
     // L3 LPM
     let interfaces = make_interfaces();
-    let l3_engine = L3Engine::from_config(&make_routing_config(), &interfaces);
+    let l3_engine = L3Engine::from_config(&make_routing_config(), &interfaces).unwrap();
     let meta = make_ipv4_tcp_meta("lan0", [192, 168, 1, 100], [8, 8, 8, 8], 49152, 80);
     let decision = l3_engine.process(&meta);
     assert!(

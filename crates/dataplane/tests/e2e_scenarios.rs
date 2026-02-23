@@ -343,7 +343,7 @@ fn e2e_l2_bridge_flood_then_unicast() {
 #[test]
 fn e2e_l3_static_routing_lan_to_wan() {
     let (_, routing_config, _, _, interfaces) = make_home_router_config();
-    let l3 = L3Engine::from_config(&routing_config, &interfaces);
+    let l3 = L3Engine::from_config(&routing_config, &interfaces).unwrap();
 
     // LAN host 192.168.1.100 sends to 8.8.8.8
     let meta = PacketMeta {
@@ -373,7 +373,7 @@ fn e2e_l3_static_routing_lan_to_wan() {
 #[test]
 fn e2e_l3_ttl_expired_vs_local_delivery() {
     let (_, routing_config, _, _, interfaces) = make_home_router_config();
-    let l3 = L3Engine::from_config(&routing_config, &interfaces);
+    let l3 = L3Engine::from_config(&routing_config, &interfaces).unwrap();
 
     // ── Case A: TTL=1 destined for external IP → Drop(TtlExpired) ────
     let meta_ttl1 = PacketMeta {
@@ -713,7 +713,7 @@ fn e2e_firewall_established_return_traffic() {
 fn e2e_full_pipeline_outbound_and_reply() {
     let (_, routing_config, nat_config, fw_config, interfaces) = make_home_router_config();
 
-    let l3 = L3Engine::from_config(&routing_config, &interfaces);
+    let l3 = L3Engine::from_config(&routing_config, &interfaces).unwrap();
     let mut nat = NatEngine::from_config(&nat_config, &interfaces);
     let fw = FirewallEngine::from_config(&fw_config);
     let mut conntrack = make_conntrack_from_nat(&nat_config);
@@ -849,7 +849,7 @@ fn e2e_full_pipeline_outbound_and_reply() {
 fn e2e_observer_counter_tracking() {
     let (_, routing_config, nat_config, _, interfaces) = make_home_router_config();
 
-    let l3 = L3Engine::from_config(&routing_config, &interfaces);
+    let l3 = L3Engine::from_config(&routing_config, &interfaces).unwrap();
 
     // Use a restrictive firewall config that only allows LAN->WAN
     // (no WAN->LAN rule), so our uninvited WAN packet will be dropped.

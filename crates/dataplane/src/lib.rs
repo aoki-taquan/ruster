@@ -15,6 +15,10 @@ pub enum DataplaneError {
     /// DPDK subsystem initialization failed.
     #[error("DPDK init: {0}")]
     Dpdk(#[from] dpdk::error::DpdkError),
+
+    /// L3 routing engine configuration failed (invalid routes or local IPs).
+    #[error("L3 routing config: {0}")]
+    Routing(#[from] routing::L3ConfigError),
 }
 
 /// The dataplane runtime holding initialized engines.
@@ -47,7 +51,7 @@ impl Dataplane {
     pub fn init(config: &RouterConfig) -> Result<Self, DataplaneError> {
         let l2 = l2::L2Engine::from_config(&config.l2);
         let arp = arp::ArpEngine::from_config(&config.l2, &config.interfaces);
-        let l3 = routing::L3Engine::from_config(&config.routing, &config.interfaces);
+        let l3 = routing::L3Engine::from_config(&config.routing, &config.interfaces)?;
         let nat = nat::NatEngine::from_config(&config.nat, &config.interfaces);
         let firewall = firewall::FirewallEngine::from_config(&config.firewall);
         let conntrack = conntrack::ConntrackEngine::from_nat_config(&config.nat);

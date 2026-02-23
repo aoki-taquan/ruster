@@ -7,6 +7,13 @@
 //! 4. Perform longest-prefix-match route lookup.
 //! 5. Return a forwarding decision with the decremented TTL.
 //!
+//! # Validated-input contract
+//!
+//! [`L3Engine::from_config`] assumes its inputs have been validated by the
+//! config layer.  It returns a [`Result`] so that any parse failures
+//! (indicating a bug or unvalidated usage) surface immediately rather than
+//! being silently dropped.
+//!
 //! RFC-REF: RFC 791 Section 3.2
 //! "The internet module determines the destination address [...] and makes
 //! a routing decision to forward the datagram to the next gateway or
@@ -15,10 +22,52 @@
 pub mod table;
 
 use std::collections::HashSet;
+use std::fmt;
 
 use crate::packet::{L3Info, PacketMeta};
 use ruster_config::model::{InterfaceConfig, RoutingConfig};
-use table::RouteTable;
+use table::{RouteError, RouteTable};
+
+/// Error returned when [`L3Engine::from_config`] encounters invalid
+/// configuration entries (route table entries or local IP address strings).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum L3ConfigError {
+    /// One or more static route entries could not be parsed.
+    InvalidRoutes(Vec<RouteError>),
+    /// One or more interface IPv4 address strings could not be parsed.
+    ///
+    /// Each element is `(interface_name, raw_addr_string)`.
+    InvalidLocalAddrs(Vec<(String, String)>),
+}
+
+impl fmt::Display for L3ConfigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRoutes(errs) => {
+                write!(f, "invalid route entries: ")?;
+                for (i, e) in errs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, "; ")?;
+                    }
+                    write!(f, "{e}")?;
+                }
+                Ok(())
+            }
+            Self::InvalidLocalAddrs(addrs) => {
+                write!(f, "invalid local addresses: ")?;
+                for (i, (iface, addr)) in addrs.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, "; ")?;
+                    }
+                    write!(f, "{iface}: \"{addr}\"")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::error::Error for L3ConfigError {}
 
 /// Reason an L3 packet was dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,27 +128,50 @@ impl L3Engine {
     ///
     /// Loads the static route table from `routing_config` and collects
     /// all IPv4 addresses from `interfaces` for local delivery checks.
-    pub fn from_config(routing_config: &RoutingConfig, interfaces: &[InterfaceConfig]) -> Self {
-        let route_table = RouteTable::from_config(routing_config);
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`L3ConfigError`] if any route entry or local IP
+    /// address string cannot be parsed.  Route errors are reported via
+    /// [`L3ConfigError::InvalidRoutes`]; local address errors via
+    /// [`L3ConfigError::InvalidLocalAddrs`].
+    ///
+    /// # Validated-input contract
+    ///
+    /// Callers that run config validation via `ruster-config` before
+    /// reaching this point can expect `from_config` to always succeed.
+    pub fn from_config(
+        routing_config: &RoutingConfig,
+        interfaces: &[InterfaceConfig],
+    ) -> Result<Self, L3ConfigError> {
+        let route_table =
+            RouteTable::from_config(routing_config).map_err(L3ConfigError::InvalidRoutes)?;
 
-        // NOTE: Config validation (ruster-config validate) ensures all
-        // ipv4_addrs entries are well-formed CIDR strings before they reach
-        // here. filter_map is retained as a defence-in-depth measure; any
-        // parse failure at this stage indicates a logic bug.
-        let local_ips: HashSet<[u8; 4]> = interfaces
-            .iter()
-            .flat_map(|iface| {
-                iface
-                    .ipv4_addrs
-                    .iter()
-                    .filter_map(|addr_str| parse_ipv4_addr(addr_str))
-            })
-            .collect();
+        // Collect local IPs, tracking any parse failures.
+        let mut local_ips: HashSet<[u8; 4]> = HashSet::new();
+        let mut addr_errors: Vec<(String, String)> = Vec::new();
 
-        Self {
+        for iface in interfaces {
+            for addr_str in &iface.ipv4_addrs {
+                match parse_ipv4_addr(addr_str) {
+                    Some(ip) => {
+                        local_ips.insert(ip);
+                    }
+                    None => {
+                        addr_errors.push((iface.name.clone(), addr_str.clone()));
+                    }
+                }
+            }
+        }
+
+        if !addr_errors.is_empty() {
+            return Err(L3ConfigError::InvalidLocalAddrs(addr_errors));
+        }
+
+        Ok(Self {
             route_table,
             local_ips,
-        }
+        })
     }
 
     /// Make a forwarding decision for the given packet.
@@ -236,7 +308,7 @@ mod tests {
     }
 
     fn make_engine() -> L3Engine {
-        L3Engine::from_config(&make_routing_config(), &make_interfaces())
+        L3Engine::from_config(&make_routing_config(), &make_interfaces()).unwrap()
     }
 
     fn make_ipv4_meta(
@@ -412,7 +484,7 @@ mod tests {
                 metric: 10,
             }],
         };
-        let engine = L3Engine::from_config(&config, &make_interfaces());
+        let engine = L3Engine::from_config(&config, &make_interfaces()).unwrap();
 
         // Packet to 8.8.8.8 has no matching route.
         let meta = make_ipv4_meta("lan0", [192, 168, 1, 100], [8, 8, 8, 8], 64);
