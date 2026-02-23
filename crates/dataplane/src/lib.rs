@@ -1,4 +1,5 @@
 pub mod arp;
+pub mod conntrack;
 pub mod dpdk;
 pub mod l2;
 pub mod packet;
