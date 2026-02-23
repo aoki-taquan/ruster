@@ -3,6 +3,7 @@
 .PHONY: team-start team-stop
 .PHONY: clab-deploy clab-test clab-destroy clab-e2e
 .PHONY: soak-test soak-test-short
+.PHONY: rfc-check rfc-registry
 
 # ── Build ──────────────────────────────────────────────
 
@@ -101,3 +102,11 @@ soak-test:
 
 soak-test-short:
 	cd tests/soak && SOAK_DURATION_MIN=5 bash soak-test.sh
+
+# ── RFC Deviation ────────────────────────────────────────
+
+rfc-check:
+	bash scripts/rfc-deviation-lint.sh
+
+rfc-registry:
+	bash scripts/rfc-deviation-lint.sh --registry
