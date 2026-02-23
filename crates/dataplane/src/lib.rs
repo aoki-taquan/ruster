@@ -47,6 +47,8 @@ pub struct Dataplane {
     pub firewall: firewall::FirewallEngine,
     /// Connection tracking engine (session table).
     pub conntrack: conntrack::ConntrackEngine,
+    /// Zone resolver: maps interface names to firewall zones.
+    pub zone_resolver: pipeline::ZoneResolver,
     /// Counter for TX errors encountered in the run loop.
     tx_errors: AtomicU64,
 }
@@ -63,6 +65,7 @@ impl Dataplane {
         let nat = nat::NatEngine::from_config(&config.nat, &config.interfaces);
         let firewall = firewall::FirewallEngine::from_config(&config.firewall);
         let conntrack = conntrack::ConntrackEngine::from_nat_config(&config.nat);
+        let zone_resolver = pipeline::ZoneResolver::from_config(&config.interfaces);
 
         Ok(Self {
             l2,
@@ -71,6 +74,7 @@ impl Dataplane {
             nat,
             firewall,
             conntrack,
+            zone_resolver,
             tx_errors: AtomicU64::new(0),
         })
     }
@@ -96,8 +100,13 @@ impl Dataplane {
                 continue;
             }
             for raw_pkt in &batch {
-                let result =
-                    pipeline::process_packet(raw_pkt, &self.l3, &self.firewall, &self.conntrack);
+                let result = pipeline::process_packet(
+                    raw_pkt,
+                    &self.l3,
+                    &self.firewall,
+                    &self.conntrack,
+                    &self.zone_resolver,
+                );
                 match result {
                     pipeline::PipelineResult::Forward { egress_iface } => {
                         if let Err(e) = io.tx(&egress_iface, raw_pkt) {
