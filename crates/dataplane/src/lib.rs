@@ -9,7 +9,7 @@ pub mod packet;
 pub mod pipeline;
 pub mod routing;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,6 +47,8 @@ pub struct Dataplane {
     pub firewall: firewall::FirewallEngine,
     /// Connection tracking engine (session table).
     pub conntrack: conntrack::ConntrackEngine,
+    /// Counter for TX errors encountered in the run loop.
+    tx_errors: AtomicU64,
 }
 
 impl Dataplane {
@@ -69,6 +71,7 @@ impl Dataplane {
             nat,
             firewall,
             conntrack,
+            tx_errors: AtomicU64::new(0),
         })
     }
 
@@ -97,7 +100,10 @@ impl Dataplane {
                     pipeline::process_packet(raw_pkt, &self.l3, &self.firewall, &self.conntrack);
                 match result {
                     pipeline::PipelineResult::Forward { egress_iface } => {
-                        let _ = io.tx(&egress_iface, raw_pkt);
+                        if let Err(e) = io.tx(&egress_iface, raw_pkt) {
+                            self.tx_errors.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("TX error on {}: {}", egress_iface, e);
+                        }
                     }
                     pipeline::PipelineResult::Drop { .. } | pipeline::PipelineResult::Consumed => {}
                 }
@@ -105,6 +111,11 @@ impl Dataplane {
         }
 
         Ok(())
+    }
+
+    /// Return the total number of TX errors observed by the run loop.
+    pub fn tx_error_count(&self) -> u64 {
+        self.tx_errors.load(Ordering::Relaxed)
     }
 }
 
@@ -184,6 +195,118 @@ mod tests {
             elapsed < Duration::from_millis(50),
             "run should return immediately when shutdown is pre-set, took {:?}",
             elapsed
+        );
+    }
+
+    #[test]
+    fn dataplane_tx_error_count_starts_at_zero() {
+        let config = load_example();
+        let dp = Dataplane::init(&config).expect("init should succeed");
+        assert_eq!(dp.tx_error_count(), 0, "tx_error_count should start at 0");
+    }
+
+    /// Load the example config with the firewall and NAT disabled so
+    /// that packets are forwarded (reach TX) in the run loop.
+    fn load_example_fw_disabled() -> RouterConfig {
+        let toml = example_toml()
+            .replace(
+                "\n[firewall]\nenabled = true\n",
+                "\n[firewall]\nenabled = false\n",
+            )
+            .replace("\n[nat]\nenabled = true\n", "\n[nat]\nenabled = false\n");
+        ruster_config::load_from_str(&toml).expect("valid config with fw disabled")
+    }
+
+    /// Build a minimal valid Ethernet+IPv4+UDP packet that the pipeline
+    /// will route via the default route (wan0) in the example config.
+    fn make_forwardable_packet() -> io::RawPacket {
+        let mut pkt = Vec::new();
+        // Ethernet header (14 bytes)
+        let dst_mac = [0x02, 0x00, 0x00, 0x00, 0x10, 0x01]; // wan0 mac
+        let src_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        pkt.extend_from_slice(&dst_mac);
+        pkt.extend_from_slice(&src_mac);
+        pkt.extend_from_slice(&[0x08, 0x00]); // EtherType: IPv4
+
+        // IPv4 header (20 bytes)
+        let ipv4_start = pkt.len();
+        pkt.push(0x45); // version=4, IHL=5
+        pkt.push(0x00); // DSCP/ECN
+        let total_len: u16 = 20 + 8; // IP header + 8 bytes UDP
+        pkt.extend_from_slice(&total_len.to_be_bytes());
+        pkt.extend_from_slice(&[0x00, 0x00]); // identification
+        pkt.extend_from_slice(&[0x00, 0x00]); // flags/fragment
+        pkt.push(64); // TTL
+        pkt.push(17); // protocol: UDP
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+        pkt.extend_from_slice(&[192, 168, 10, 100]); // src IP (LAN)
+        pkt.extend_from_slice(&[8, 8, 8, 8]); // dst IP (internet)
+
+        // Compute IPv4 checksum.
+        {
+            let hdr = &mut pkt[ipv4_start..ipv4_start + 20];
+            hdr[10] = 0x00;
+            hdr[11] = 0x00;
+            let mut sum: u32 = 0;
+            for i in (0..hdr.len()).step_by(2) {
+                let word = u16::from_be_bytes([hdr[i], hdr[i + 1]]);
+                sum += word as u32;
+            }
+            while (sum >> 16) != 0 {
+                sum = (sum & 0xFFFF) + (sum >> 16);
+            }
+            let cksum = !(sum as u16);
+            hdr[10] = (cksum >> 8) as u8;
+            hdr[11] = (cksum & 0xFF) as u8;
+        }
+
+        // Minimal UDP header (8 bytes).
+        pkt.extend_from_slice(&[0x00, 0x50]); // src port: 80
+        pkt.extend_from_slice(&[0x00, 0x51]); // dst port: 81
+        pkt.extend_from_slice(&[0x00, 0x08]); // length: 8
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum: 0
+
+        io::RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data: pkt,
+        }
+    }
+
+    #[test]
+    fn dataplane_run_counts_tx_errors() {
+        let config = load_example_fw_disabled();
+        let dp = Dataplane::init(&config).expect("init should succeed");
+
+        let mock_io = io::MockPacketIo::new();
+
+        // Inject two forwardable packets.
+        mock_io.inject(make_forwardable_packet());
+        mock_io.inject(make_forwardable_packet());
+
+        // Enable TX failure mode so all tx() calls fail.
+        mock_io.set_tx_fail_mode(true);
+
+        // Pre-set shutdown; the loop will process the queued packets
+        // then exit on the next iteration when rx() returns empty.
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_trigger = Arc::clone(&shutdown);
+
+        // Signal shutdown after a short delay to allow processing.
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            shutdown_trigger.store(true, Ordering::Relaxed);
+        });
+
+        let result = dp.run(shutdown, Box::new(mock_io));
+        assert!(result.is_ok(), "run should return Ok on clean shutdown");
+
+        handle.join().expect("trigger thread should join cleanly");
+
+        // Both forwarded packets should have caused TX errors.
+        assert_eq!(
+            dp.tx_error_count(),
+            2,
+            "tx_error_count should reflect 2 TX failures"
         );
     }
 }

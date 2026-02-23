@@ -78,6 +78,8 @@ pub struct MockPacketIo {
     rx_queue: Arc<Mutex<VecDeque<RawPacket>>>,
     /// Capture of all transmitted packets.
     tx_capture: Arc<Mutex<Vec<(String, RawPacket)>>>,
+    /// When true, `tx()` returns `Err(IoError::TxFailed(...))`.
+    tx_fail_mode: Arc<Mutex<bool>>,
 }
 
 impl MockPacketIo {
@@ -86,7 +88,15 @@ impl MockPacketIo {
         Self {
             rx_queue: Arc::new(Mutex::new(VecDeque::new())),
             tx_capture: Arc::new(Mutex::new(Vec::new())),
+            tx_fail_mode: Arc::new(Mutex::new(false)),
         }
+    }
+
+    /// Enable or disable TX failure mode.
+    ///
+    /// When enabled, all `tx()` calls return `Err(IoError::TxFailed(...))`.
+    pub fn set_tx_fail_mode(&self, fail: bool) {
+        *self.tx_fail_mode.lock().unwrap() = fail;
     }
 
     /// Enqueue a packet for the next `rx()` call.
@@ -118,6 +128,9 @@ impl PacketIo for MockPacketIo {
     }
 
     fn tx(&self, iface: &str, packet: &RawPacket) -> Result<(), IoError> {
+        if *self.tx_fail_mode.lock().unwrap() {
+            return Err(IoError::TxFailed("mock tx failure".to_string()));
+        }
         self.tx_capture
             .lock()
             .unwrap()
@@ -191,5 +204,30 @@ mod tests {
         let io = MockPacketIo::default();
         assert!(io.rx().is_empty());
         assert_eq!(io.tx_count(), 0);
+    }
+
+    #[test]
+    fn mock_io_tx_fail_mode() {
+        let io = MockPacketIo::new();
+        let pkt = RawPacket {
+            ingress_iface: "eth0".to_string(),
+            data: vec![0x01, 0x02],
+        };
+
+        // Default: tx succeeds.
+        assert!(io.tx("wan0", &pkt).is_ok());
+        assert_eq!(io.tx_count(), 1);
+
+        // Enable fail mode: tx returns error.
+        io.set_tx_fail_mode(true);
+        let err = io.tx("wan0", &pkt).unwrap_err();
+        assert_eq!(err, IoError::TxFailed("mock tx failure".to_string()));
+        // Tx count unchanged (packet not captured on failure).
+        assert_eq!(io.tx_count(), 1);
+
+        // Disable fail mode: tx succeeds again.
+        io.set_tx_fail_mode(false);
+        assert!(io.tx("wan0", &pkt).is_ok());
+        assert_eq!(io.tx_count(), 2);
     }
 }
