@@ -109,6 +109,7 @@ impl FwContext {
 ///
 /// Holds the firewall configuration and provides the [`FirewallEngine::evaluate`] method
 /// for per-packet verdict computation.
+#[derive(Debug)]
 pub struct FirewallEngine {
     enabled: bool,
     default_input: DefaultPolicy,
