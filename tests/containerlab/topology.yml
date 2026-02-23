@@ -1,0 +1,46 @@
+# ruster E2E test topology — containerlab (Linux kind)
+#
+# 3-node topology:
+#   lan-host  <--eth1-- ruster --eth2-->  wan-host
+#
+# Prerequisites:
+#   - Linux host with Docker
+#   - containerlab installed (https://containerlab.dev)
+#   - ruster binary built: cargo build --release
+#
+# Usage:
+#   sudo containerlab deploy --topo topology.yml
+#   sudo containerlab destroy --topo topology.yml
+
+name: ruster-e2e
+
+topology:
+  nodes:
+    ruster:
+      kind: linux
+      image: debian:bookworm-slim
+      binds:
+        - ../../target/release/ruster:/usr/local/bin/ruster:ro
+        - ./configs/ruster.toml:/etc/ruster/router.toml:ro
+      exec:
+        - ip addr add 192.168.1.1/24 dev eth1
+        - ip addr add 10.0.0.1/24 dev eth2
+        - sysctl -w net.ipv4.ip_forward=1
+
+    lan-host:
+      kind: linux
+      image: debian:bookworm-slim
+      exec:
+        - ip addr add 192.168.1.100/24 dev eth1
+        - ip route add default via 192.168.1.1
+
+    wan-host:
+      kind: linux
+      image: debian:bookworm-slim
+      exec:
+        - ip addr add 10.0.0.100/24 dev eth1
+        - ip route add 192.168.1.0/24 via 10.0.0.1
+
+  links:
+    - endpoints: ["ruster:eth1", "lan-host:eth1"]
+    - endpoints: ["ruster:eth2", "wan-host:eth1"]
