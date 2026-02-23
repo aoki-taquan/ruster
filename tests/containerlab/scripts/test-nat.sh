@@ -5,6 +5,9 @@
 #   1. LAN-host can reach WAN-host (basic NAT traversal)
 #   2. Source IP is translated (wan-host sees ruster's WAN IP, not lan-host's IP)
 #   3. Conntrack state exists on ruster after NAT session
+#
+# Quality gate: tests that cannot verify expected behavior report FAIL,
+# never silently PASS. See issue #134.
 
 set -euo pipefail
 
@@ -12,9 +15,10 @@ TOPO_NAME="ruster-e2e"
 PREFIX="clab-${TOPO_NAME}"
 PASS=0
 FAIL=0
+SKIP=0
 ERRORS=""
 
-# ── Helpers ───────────────────────────────────────────
+# -- Helpers ---------------------------------------------------
 
 run_on() {
     local node="$1"; shift
@@ -23,21 +27,33 @@ run_on() {
 
 report() {
     local name="$1" result="$2"
-    if [ "$result" = "PASS" ]; then
-        PASS=$((PASS + 1))
-        echo "  [PASS] ${name}"
-    else
-        FAIL=$((FAIL + 1))
-        ERRORS="${ERRORS}  - ${name}\n"
-        echo "  [FAIL] ${name}"
-    fi
+    case "$result" in
+        PASS)
+            PASS=$((PASS + 1))
+            echo "  [PASS] ${name}"
+            ;;
+        FAIL)
+            FAIL=$((FAIL + 1))
+            ERRORS="${ERRORS}  - ${name}\n"
+            echo "  [FAIL] ${name}"
+            ;;
+        SKIP)
+            SKIP=$((SKIP + 1))
+            echo "  [SKIP] ${name}"
+            ;;
+        *)
+            echo "  [ERROR] unknown result '${result}' for ${name}"
+            FAIL=$((FAIL + 1))
+            ERRORS="${ERRORS}  - ${name} (bad result)\n"
+            ;;
+    esac
 }
 
-# ── Tests ─────────────────────────────────────────────
+# -- Tests -----------------------------------------------------
 
 echo "=== NAT Tests ==="
 
-# Test 1: Basic NAT traversal — lan-host pings wan-host
+# Test 1: Basic NAT traversal -- lan-host pings wan-host
 echo ""
 echo "-- Test 1: NAT traversal (lan-host -> wan-host via NAT) --"
 if run_on lan-host ping -c 3 -W 5 10.0.0.100 > /dev/null 2>&1; then
@@ -52,17 +68,28 @@ else
     report "nat-traversal-ping" "FAIL"
 fi
 
-# Test 2: Source NAT verification — wan-host should see ruster's WAN IP
+# Test 2: Source NAT verification -- wan-host should see ruster's WAN IP
 #   We start a tcpdump on wan-host, send ICMP from lan-host, then check
-#   that the source IP seen by wan-host is ruster's WAN address (10.0.0.1)
+#   that the source IP seen by wan-host is ruster's WAN address (10.0.0.1).
+#
+#   NOTE (v0.1): ruster uses MockPacketIo so actual SNAT is not performed
+#   at the kernel level. The kernel handles forwarding and the source IP
+#   will remain 192.168.1.100. This test correctly FAILs in v0.1 to signal
+#   that SNAT is not yet wired into the data path. Once the real dataplane
+#   is active, this test will PASS.
 echo ""
 echo "-- Test 2: Source NAT verification (wan-host sees 10.0.0.1) --"
-# Ensure tcpdump is available on wan-host
+
+# tcpdump is a mandatory prerequisite
 if ! run_on wan-host which tcpdump > /dev/null 2>&1; then
+    echo "  Installing tcpdump on wan-host..."
     run_on wan-host bash -c "apt-get update -qq && apt-get install -y -qq tcpdump" > /dev/null 2>&1 || true
 fi
 
-if run_on wan-host which tcpdump > /dev/null 2>&1; then
+if ! run_on wan-host which tcpdump > /dev/null 2>&1; then
+    echo "  ERROR: tcpdump required for SNAT verification but not available on wan-host"
+    report "snat-verification" "FAIL"
+else
     # Start tcpdump in background on wan-host, capture ICMP on eth1
     run_on wan-host bash -c "tcpdump -i eth1 -c 5 -n icmp -w /tmp/nat-capture.pcap &" 2>/dev/null || true
     sleep 1
@@ -79,32 +106,19 @@ if run_on wan-host which tcpdump > /dev/null 2>&1; then
     if echo "$CAPTURE" | grep -q "10.0.0.1"; then
         report "snat-verification" "PASS"
     else
-        # If NAT is not set up via iptables (ruster handles it in userspace),
-        # the source may still be 192.168.1.100 at the kernel level.
-        # In that case, connectivity itself is the NAT proof.
-        echo "  Note: source IP translation not observed at kernel level."
-        echo "  This may be expected if ruster performs NAT in userspace/DPDK."
-        echo "  Marking as PASS if basic connectivity succeeded."
-        if run_on lan-host ping -c 1 -W 3 10.0.0.100 > /dev/null 2>&1; then
-            report "snat-verification" "PASS"
-        else
-            report "snat-verification" "FAIL"
-        fi
+        echo "  Source IP 10.0.0.1 not observed in captured packets."
+        echo "  SNAT is not active in the data path."
+        report "snat-verification" "FAIL"
     fi
 
     # Cleanup
     run_on wan-host rm -f /tmp/nat-capture.pcap 2>/dev/null || true
-else
-    echo "  Skipping: tcpdump not available on wan-host"
-    echo "  Falling back to connectivity check"
-    if run_on lan-host ping -c 1 -W 3 10.0.0.100 > /dev/null 2>&1; then
-        report "snat-verification" "PASS"
-    else
-        report "snat-verification" "FAIL"
-    fi
 fi
 
 # Test 3: Conntrack state on ruster
+#   After NAT traversal, there should be conntrack entries tracking the
+#   translated session. If neither the conntrack tool nor /proc/net/nf_conntrack
+#   is available, the test FAILs — the infrastructure must provide observability.
 echo ""
 echo "-- Test 3: Conntrack state on ruster --"
 # Generate traffic first
@@ -119,9 +133,9 @@ if run_on ruster which conntrack > /dev/null 2>&1; then
     if echo "$CONNTRACK" | grep -q "10.0.0.100"; then
         report "conntrack-state" "PASS"
     else
-        echo "  Note: No conntrack entries found for 10.0.0.100"
-        echo "  This may be expected if ruster manages sessions internally."
-        report "conntrack-state" "PASS"
+        echo "  No conntrack entries found for 10.0.0.100."
+        echo "  NAT session tracking is not active."
+        report "conntrack-state" "FAIL"
     fi
 elif run_on ruster cat /proc/net/nf_conntrack > /dev/null 2>&1; then
     NF_CONNTRACK=$(run_on ruster cat /proc/net/nf_conntrack 2>/dev/null || true)
@@ -130,20 +144,20 @@ elif run_on ruster cat /proc/net/nf_conntrack > /dev/null 2>&1; then
     if echo "$NF_CONNTRACK" | grep -q "10.0.0.100"; then
         report "conntrack-state" "PASS"
     else
-        echo "  Note: No nf_conntrack entries for 10.0.0.100"
-        echo "  Ruster may manage NAT sessions internally."
-        report "conntrack-state" "PASS"
+        echo "  No nf_conntrack entries found for 10.0.0.100."
+        echo "  NAT session tracking is not active."
+        report "conntrack-state" "FAIL"
     fi
 else
-    echo "  Note: conntrack tool and /proc/net/nf_conntrack not available"
-    echo "  Ruster manages NAT sessions in its own dataplane."
-    report "conntrack-state" "PASS"
+    echo "  ERROR: Neither conntrack tool nor /proc/net/nf_conntrack available."
+    echo "  Install conntrack-tools to enable NAT session observability."
+    report "conntrack-state" "FAIL"
 fi
 
-# ── Summary ───────────────────────────────────────────
+# -- Summary ---------------------------------------------------
 
 echo ""
-echo "--- NAT Summary: ${PASS} passed, ${FAIL} failed ---"
+echo "--- NAT Summary: ${PASS} passed, ${FAIL} failed, ${SKIP} skipped ---"
 if [ "$FAIL" -gt 0 ]; then
     echo "Failed tests:"
     echo -e "$ERRORS"
