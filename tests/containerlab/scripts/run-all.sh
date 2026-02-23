@@ -1,8 +1,18 @@
 #!/bin/bash
-# run-all.sh — Execute all containerlab E2E test scenarios
+# run-all.sh — Execute containerlab E2E test scenarios
 #
 # Runs each test script and collects results into a summary.
 # Exits with non-zero if any test scenario failed.
+#
+# Environment variables:
+#   E2E_SUITES  — Comma-separated list of suites to run.
+#                 Available: l2, l3, nat, fw
+#                 Default: all suites (l2,l3,nat,fw)
+#
+# Examples:
+#   bash run-all.sh                       # Run all suites
+#   E2E_SUITES=l2,l3 bash run-all.sh      # v0.1 gate (L2 + L3 only)
+#   E2E_SUITES=nat,fw bash run-all.sh     # NAT/FW strict tests only
 
 set -uo pipefail
 
@@ -11,7 +21,13 @@ TOTAL_PASS=0
 TOTAL_FAIL=0
 RESULTS=""
 
+E2E_SUITES="${E2E_SUITES:-l2,l3,nat,fw}"
+
 # ── Helpers ───────────────────────────────────────────
+
+suite_enabled() {
+    echo ",$E2E_SUITES," | grep -q ",$1,"
+}
 
 run_suite() {
     local name="$1"
@@ -52,12 +68,15 @@ if ! bash "${SCRIPT_DIR}/check-ruster.sh"; then
     exit 1
 fi
 
-# ── Run all suites ────────────────────────────────────
+echo ""
+echo "Suites to run: ${E2E_SUITES}"
 
-run_suite "L2 (ARP / MAC Learning)"   "test-l2.sh"
-run_suite "L3 (Routing)"              "test-l3.sh"
-run_suite "NAT (NAPT44)"              "test-nat.sh"
-run_suite "Firewall"                  "test-fw.sh"
+# ── Run selected suites ──────────────────────────────
+
+suite_enabled "l2"  && run_suite "L2 (ARP / MAC Learning)"   "test-l2.sh"
+suite_enabled "l3"  && run_suite "L3 (Routing)"              "test-l3.sh"
+suite_enabled "nat" && run_suite "NAT (NAPT44)"              "test-nat.sh"
+suite_enabled "fw"  && run_suite "Firewall"                  "test-fw.sh"
 
 # ── Summary ───────────────────────────────────────────
 

@@ -11,8 +11,11 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ── v0.1 gate: ruster liveness + L2/L3 connectivity ─────────
+  # This job validates what v0.1 (MockPacketIo) can actually verify:
+  # process startup, L2 ARP/MAC, L3 routing via kernel.
   containerlab-e2e:
-    name: Containerlab E2E
+    name: Containerlab E2E (v0.1 gate)
     runs-on: [self-hosted, linux, kvm]
     timeout-minutes: 30
 
@@ -34,8 +37,8 @@ jobs:
       - name: Verify ruster is running
         run: bash tests/containerlab/scripts/check-ruster.sh
 
-      - name: Run E2E tests
-        run: bash tests/containerlab/scripts/run-all.sh
+      - name: Run E2E tests (L2 + L3)
+        run: E2E_SUITES=l2,l3 bash tests/containerlab/scripts/run-all.sh
 
       - name: Collect logs on failure
         if: failure()
@@ -85,6 +88,63 @@ jobs:
         with:
           name: e2e-logs
           path: /tmp/ruster-e2e-logs/
+          retention-days: 7
+
+      - name: Destroy topology
+        if: always()
+        run: sudo containerlab destroy --topo tests/containerlab/topology.yml --cleanup
+
+  # ── NAT/FW strict: real dataplane required ───────────────────
+  # These tests require ruster's dataplane to handle real packets.
+  # In v0.1 (MockPacketIo), these are expected to FAIL.
+  # This job is non-blocking (continue-on-error) so it does not
+  # break CI, but still runs to track readiness for v0.2+.
+  containerlab-e2e-strict:
+    name: Containerlab E2E (NAT/FW strict — expected-fail in v0.1)
+    runs-on: [self-hosted, linux, kvm]
+    timeout-minutes: 30
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Deploy containerlab topology
+        run: sudo containerlab deploy --topo tests/containerlab/topology.yml
+
+      - name: Verify ruster is running
+        run: bash tests/containerlab/scripts/check-ruster.sh
+
+      - name: Run E2E tests (NAT + FW strict)
+        run: E2E_SUITES=nat,fw bash tests/containerlab/scripts/run-all.sh
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          LOG_DIR=/tmp/ruster-e2e-strict-logs
+          mkdir -p "$LOG_DIR"
+
+          for node in ruster lan-host wan-host; do
+            docker logs clab-ruster-e2e-${node} > "${LOG_DIR}/${node}.log" 2>&1 || true
+          done
+
+          docker exec clab-ruster-e2e-ruster cat /var/log/ruster.log > "${LOG_DIR}/ruster-app.log" 2>&1 || true
+          docker ps -a > "${LOG_DIR}/docker-ps.txt" 2>&1 || true
+
+      - name: Upload logs artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-strict-logs
+          path: /tmp/ruster-e2e-strict-logs/
           retention-days: 7
 
       - name: Destroy topology
