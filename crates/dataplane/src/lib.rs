@@ -52,6 +52,8 @@ pub struct Dataplane {
     pub zone_resolver: pipeline::ZoneResolver,
     /// Counter for TX errors encountered in the run loop.
     tx_errors: AtomicU64,
+    /// Observability hub: per-interface and per-stage counters.
+    pub observer: Arc<ruster_observe::Observer>,
 }
 
 impl Dataplane {
@@ -68,6 +70,9 @@ impl Dataplane {
         let conntrack = conntrack::ConntrackEngine::from_nat_config(&config.nat);
         let zone_resolver = pipeline::ZoneResolver::from_config(&config.interfaces);
 
+        let iface_names: Vec<String> = config.interfaces.iter().map(|i| i.name.clone()).collect();
+        let observer = Arc::new(ruster_observe::Observer::new(&iface_names));
+
         Ok(Self {
             l2,
             arp,
@@ -77,6 +82,7 @@ impl Dataplane {
             conntrack,
             zone_resolver,
             tx_errors: AtomicU64::new(0),
+            observer,
         })
     }
 
@@ -94,6 +100,8 @@ impl Dataplane {
         shutdown: Arc<AtomicBool>,
         io: Box<dyn io::PacketIo>,
     ) -> Result<(), DataplaneError> {
+        let mut last_stats = std::time::Instant::now();
+
         while !shutdown.load(Ordering::Relaxed) {
             let batch = io.rx();
             if batch.is_empty() {
@@ -101,6 +109,10 @@ impl Dataplane {
                 continue;
             }
             for raw_pkt in &batch {
+                // Count RX on ingress interface.
+                self.observer
+                    .inc_rx(&raw_pkt.ingress_iface, raw_pkt.data.len() as u64);
+
                 let result = pipeline::process_packet(
                     raw_pkt,
                     &self.l3,
@@ -110,15 +122,25 @@ impl Dataplane {
                 );
                 match result {
                     pipeline::PipelineResult::Forward { egress_iface } => {
-                        if let Err(e) = io.tx(&egress_iface, raw_pkt) {
-                            self.tx_errors.fetch_add(1, Ordering::Relaxed);
-                            eprintln!("TX error on {}: {}", egress_iface, e);
+                        self.observer.inc_forwarded();
+                        match io.tx(&egress_iface, raw_pkt) {
+                            Ok(()) => {
+                                self.observer
+                                    .inc_tx(&egress_iface, raw_pkt.data.len() as u64);
+                            }
+                            Err(e) => {
+                                self.tx_errors.fetch_add(1, Ordering::Relaxed);
+                                self.observer.inc_tx_drop(&egress_iface);
+                                eprintln!("TX error on {}: {}", egress_iface, e);
+                            }
                         }
                     }
                     pipeline::PipelineResult::Drop {
+                        reason,
                         icmp_reply: Some(reply),
-                        ..
                     } => {
+                        let obs_reason = map_pipeline_drop_to_observe(reason);
+                        self.observer.inc_drop_reason(obs_reason);
                         let icmp_pkt = io::RawPacket {
                             ingress_iface: reply.egress_iface.clone(),
                             data: reply.data,
@@ -128,8 +150,21 @@ impl Dataplane {
                             eprintln!("TX error for ICMP reply on {}: {}", reply.egress_iface, e);
                         }
                     }
-                    pipeline::PipelineResult::Drop { .. } | pipeline::PipelineResult::Consumed => {}
+                    pipeline::PipelineResult::Drop { reason, .. } => {
+                        let obs_reason = map_pipeline_drop_to_observe(reason);
+                        self.observer.inc_drop_reason(obs_reason);
+                    }
+                    pipeline::PipelineResult::Consumed => {
+                        self.observer.inc_local_delivery();
+                    }
                 }
+            }
+
+            // Periodic stats output every 10 seconds.
+            if last_stats.elapsed() >= Duration::from_secs(10) {
+                let snap = self.observer.snapshot();
+                eprintln!("{}", snap);
+                last_stats = std::time::Instant::now();
             }
         }
 
@@ -139,6 +174,19 @@ impl Dataplane {
     /// Return the total number of TX errors observed by the run loop.
     pub fn tx_error_count(&self) -> u64 {
         self.tx_errors.load(Ordering::Relaxed)
+    }
+}
+
+/// Map a pipeline [`pipeline::DropReason`] to an observe [`ruster_observe::DropReason`].
+fn map_pipeline_drop_to_observe(reason: pipeline::DropReason) -> ruster_observe::DropReason {
+    match reason {
+        pipeline::DropReason::ParseError => ruster_observe::DropReason::ParseError,
+        pipeline::DropReason::L2Drop => ruster_observe::DropReason::L2NoBridgeDomain,
+        pipeline::DropReason::L3NoRoute => ruster_observe::DropReason::L3NoRoute,
+        pipeline::DropReason::L3TtlExpired => ruster_observe::DropReason::L3TtlExpired,
+        pipeline::DropReason::L3NotIpv4 => ruster_observe::DropReason::L3NotIpv4,
+        pipeline::DropReason::FirewallDrop => ruster_observe::DropReason::FirewallDrop,
+        pipeline::DropReason::NatDrop => ruster_observe::DropReason::NatTableFull,
     }
 }
 
@@ -331,5 +379,322 @@ mod tests {
             2,
             "tx_error_count should reflect 2 TX failures"
         );
+    }
+
+    // ── Observer wiring tests ──────────────────────────────────────────
+
+    #[test]
+    fn observer_created_with_config_interfaces() {
+        let config = load_example();
+        let dp = Dataplane::init(&config).expect("init should succeed");
+
+        // The example config has 3 interfaces: wan0, lan0, lan1.
+        assert_eq!(dp.observer.interfaces.len(), 3);
+        assert!(dp.observer.interfaces.contains_key("wan0"));
+        assert!(dp.observer.interfaces.contains_key("lan0"));
+        assert!(dp.observer.interfaces.contains_key("lan1"));
+    }
+
+    #[test]
+    fn observer_rx_counter_increments_on_packet_process() {
+        let config = load_example_fw_disabled();
+        let dp = Dataplane::init(&config).expect("init should succeed");
+
+        let mock_io = io::MockPacketIo::new();
+        let pkt = make_forwardable_packet();
+        let pkt_len = pkt.data.len() as u64;
+        mock_io.inject(pkt);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_trigger = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            shutdown_trigger.store(true, Ordering::Relaxed);
+        });
+
+        dp.run(shutdown, Box::new(mock_io)).expect("run ok");
+        handle.join().unwrap();
+
+        let snap = dp.observer.snapshot();
+        // The packet enters on lan0.
+        let lan0 = snap.interfaces.iter().find(|i| i.name == "lan0").unwrap();
+        assert_eq!(lan0.rx_packets, 1, "RX packet count on lan0");
+        assert_eq!(lan0.rx_bytes, pkt_len, "RX byte count on lan0");
+    }
+
+    #[test]
+    fn observer_tx_counter_increments_on_successful_forward() {
+        let config = load_example_fw_disabled();
+        let dp = Dataplane::init(&config).expect("init should succeed");
+
+        let mock_io = io::MockPacketIo::new();
+        let pkt = make_forwardable_packet();
+        let pkt_len = pkt.data.len() as u64;
+        mock_io.inject(pkt);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_trigger = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            shutdown_trigger.store(true, Ordering::Relaxed);
+        });
+
+        dp.run(shutdown, Box::new(mock_io)).expect("run ok");
+        handle.join().unwrap();
+
+        let snap = dp.observer.snapshot();
+        // The packet is forwarded to wan0 (default route).
+        let wan0 = snap.interfaces.iter().find(|i| i.name == "wan0").unwrap();
+        assert_eq!(wan0.tx_packets, 1, "TX packet count on wan0");
+        assert_eq!(wan0.tx_bytes, pkt_len, "TX byte count on wan0");
+        assert_eq!(snap.forwarded, 1, "forwarded count");
+    }
+
+    #[test]
+    fn observer_tx_drop_counter_increments_on_tx_failure() {
+        let config = load_example_fw_disabled();
+        let dp = Dataplane::init(&config).expect("init should succeed");
+
+        let mock_io = io::MockPacketIo::new();
+        mock_io.inject(make_forwardable_packet());
+        mock_io.inject(make_forwardable_packet());
+        mock_io.set_tx_fail_mode(true);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_trigger = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            shutdown_trigger.store(true, Ordering::Relaxed);
+        });
+
+        dp.run(shutdown, Box::new(mock_io)).expect("run ok");
+        handle.join().unwrap();
+
+        let snap = dp.observer.snapshot();
+        // TX fails -> tx_drops on wan0 should be 2.
+        let wan0 = snap.interfaces.iter().find(|i| i.name == "wan0").unwrap();
+        assert_eq!(wan0.tx_drops, 2, "TX drop count on wan0");
+        assert_eq!(wan0.tx_packets, 0, "TX packets should be 0 when all fail");
+        // Forwarded count still increments (decision was made to forward).
+        assert_eq!(snap.forwarded, 2, "forwarded count still 2");
+    }
+
+    #[test]
+    fn observer_drop_reason_parse_error() {
+        let config = load_example_fw_disabled();
+        let dp = Dataplane::init(&config).expect("init should succeed");
+
+        let mock_io = io::MockPacketIo::new();
+        // Inject a too-short packet that will fail parsing.
+        mock_io.inject(io::RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data: vec![0x00; 5],
+        });
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_trigger = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            shutdown_trigger.store(true, Ordering::Relaxed);
+        });
+
+        dp.run(shutdown, Box::new(mock_io)).expect("run ok");
+        handle.join().unwrap();
+
+        let snap = dp.observer.snapshot();
+        assert_eq!(snap.drops.parse_error, 1, "parse error drop count");
+        // RX counter should still be incremented (we received the packet).
+        let lan0 = snap.interfaces.iter().find(|i| i.name == "lan0").unwrap();
+        assert_eq!(lan0.rx_packets, 1, "RX counted even for parse errors");
+    }
+
+    #[test]
+    fn observer_drop_reason_ttl_expired() {
+        let config = load_example_fw_disabled();
+        let dp = Dataplane::init(&config).expect("init should succeed");
+
+        let mock_io = io::MockPacketIo::new();
+        // Build a packet with TTL=1 to trigger TTL expiration.
+        let mut pkt = make_forwardable_packet();
+        // TTL is at IPv4 header offset 8, which starts at Ethernet header (14) + 8.
+        pkt.data[14 + 8] = 1; // Set TTL to 1
+                              // Recompute IPv4 checksum.
+        {
+            let hdr = &mut pkt.data[14..34];
+            hdr[10] = 0x00;
+            hdr[11] = 0x00;
+            let mut sum: u32 = 0;
+            for i in (0..hdr.len()).step_by(2) {
+                let word = u16::from_be_bytes([hdr[i], hdr[i + 1]]);
+                sum += word as u32;
+            }
+            while (sum >> 16) != 0 {
+                sum = (sum & 0xFFFF) + (sum >> 16);
+            }
+            let cksum = !(sum as u16);
+            hdr[10] = (cksum >> 8) as u8;
+            hdr[11] = (cksum & 0xFF) as u8;
+        }
+        mock_io.inject(pkt);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_trigger = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            shutdown_trigger.store(true, Ordering::Relaxed);
+        });
+
+        dp.run(shutdown, Box::new(mock_io)).expect("run ok");
+        handle.join().unwrap();
+
+        let snap = dp.observer.snapshot();
+        assert_eq!(snap.drops.l3_ttl_expired, 1, "TTL expired drop count");
+    }
+
+    #[test]
+    fn observer_drop_reason_no_route() {
+        // Build a config with no default route so packets to external IPs get dropped.
+        let toml = example_toml()
+            .replace(
+                "\n[firewall]\nenabled = true\n",
+                "\n[firewall]\nenabled = false\n",
+            )
+            .replace("\n[nat]\nenabled = true\n", "\n[nat]\nenabled = false\n")
+            .replace(
+                "ipv4_static_routes = [\n  { prefix = \"0.0.0.0/0\"",
+                "ipv4_static_routes = [\n  { prefix = \"10.99.99.0/24\"",
+            );
+        let config = ruster_config::load_from_str(&toml).expect("valid config");
+        let dp = Dataplane::init(&config).expect("init should succeed");
+
+        let mock_io = io::MockPacketIo::new();
+        // The packet destination 8.8.8.8 has no route (no default route).
+        mock_io.inject(make_forwardable_packet());
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_trigger = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            shutdown_trigger.store(true, Ordering::Relaxed);
+        });
+
+        dp.run(shutdown, Box::new(mock_io)).expect("run ok");
+        handle.join().unwrap();
+
+        let snap = dp.observer.snapshot();
+        assert_eq!(snap.drops.l3_no_route, 1, "no route drop count");
+    }
+
+    #[test]
+    fn observer_local_delivery_increments_on_consumed() {
+        let config = load_example_fw_disabled();
+        let dp = Dataplane::init(&config).expect("init should succeed");
+
+        let mock_io = io::MockPacketIo::new();
+        // Build a packet destined to the router's own WAN IP (203.0.113.2).
+        let mut pkt = make_forwardable_packet();
+        // Overwrite destination IP (bytes 30..34) to the router's WAN IP.
+        pkt.data[30] = 203;
+        pkt.data[31] = 0;
+        pkt.data[32] = 113;
+        pkt.data[33] = 2;
+        // Recompute IPv4 checksum.
+        {
+            let hdr = &mut pkt.data[14..34];
+            hdr[10] = 0x00;
+            hdr[11] = 0x00;
+            let mut sum: u32 = 0;
+            for i in (0..hdr.len()).step_by(2) {
+                let word = u16::from_be_bytes([hdr[i], hdr[i + 1]]);
+                sum += word as u32;
+            }
+            while (sum >> 16) != 0 {
+                sum = (sum & 0xFFFF) + (sum >> 16);
+            }
+            let cksum = !(sum as u16);
+            hdr[10] = (cksum >> 8) as u8;
+            hdr[11] = (cksum & 0xFF) as u8;
+        }
+        mock_io.inject(pkt);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_trigger = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            shutdown_trigger.store(true, Ordering::Relaxed);
+        });
+
+        dp.run(shutdown, Box::new(mock_io)).expect("run ok");
+        handle.join().unwrap();
+
+        let snap = dp.observer.snapshot();
+        assert_eq!(snap.local_delivery, 1, "local delivery count");
+    }
+
+    #[test]
+    fn observer_snapshot_after_mixed_traffic() {
+        let config = load_example_fw_disabled();
+        let dp = Dataplane::init(&config).expect("init should succeed");
+
+        let mock_io = io::MockPacketIo::new();
+
+        // 1. Forwardable packet.
+        mock_io.inject(make_forwardable_packet());
+
+        // 2. Parse error packet.
+        mock_io.inject(io::RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data: vec![0x00; 5],
+        });
+
+        // 3. Another forwardable packet.
+        mock_io.inject(make_forwardable_packet());
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_trigger = Arc::clone(&shutdown);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            shutdown_trigger.store(true, Ordering::Relaxed);
+        });
+
+        dp.run(shutdown, Box::new(mock_io)).expect("run ok");
+        handle.join().unwrap();
+
+        let snap = dp.observer.snapshot();
+
+        // 3 packets received on lan0.
+        let lan0 = snap.interfaces.iter().find(|i| i.name == "lan0").unwrap();
+        assert_eq!(lan0.rx_packets, 3, "all 3 packets counted on RX");
+
+        // 2 forwarded, 1 parse error.
+        assert_eq!(snap.forwarded, 2, "2 packets forwarded");
+        assert_eq!(snap.drops.parse_error, 1, "1 parse error");
+
+        // 2 TX on wan0.
+        let wan0 = snap.interfaces.iter().find(|i| i.name == "wan0").unwrap();
+        assert_eq!(wan0.tx_packets, 2, "2 packets transmitted on wan0");
+    }
+
+    #[test]
+    fn map_pipeline_drop_to_observe_covers_all_variants() {
+        use pipeline::DropReason as PD;
+        use ruster_observe::DropReason as OD;
+
+        assert_eq!(map_pipeline_drop_to_observe(PD::ParseError), OD::ParseError);
+        assert_eq!(
+            map_pipeline_drop_to_observe(PD::L2Drop),
+            OD::L2NoBridgeDomain
+        );
+        assert_eq!(map_pipeline_drop_to_observe(PD::L3NoRoute), OD::L3NoRoute);
+        assert_eq!(
+            map_pipeline_drop_to_observe(PD::L3TtlExpired),
+            OD::L3TtlExpired
+        );
+        assert_eq!(map_pipeline_drop_to_observe(PD::L3NotIpv4), OD::L3NotIpv4);
+        assert_eq!(
+            map_pipeline_drop_to_observe(PD::FirewallDrop),
+            OD::FirewallDrop
+        );
+        assert_eq!(map_pipeline_drop_to_observe(PD::NatDrop), OD::NatTableFull);
     }
 }
