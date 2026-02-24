@@ -18,6 +18,7 @@
 #   SOAK_OUTPUT_DIR      — Output directory for reports (default: auto-generated)
 #   RUSTER_BIN           — Path to ruster binary (default: auto-detected from cargo)
 #   RUSTER_CONFIG        — Path to router.toml config (default: tests/containerlab/configs/ruster.toml)
+#   CLAB_TOPO_NAME       — Containerlab topology name (default: ruster-e2e)
 #
 # Usage:
 #   bash soak-test.sh                              # 30-min standalone
@@ -34,6 +35,8 @@ SOAK_DURATION_MIN="${SOAK_DURATION_MIN:-30}"
 SOAK_DURATION_SEC=$((SOAK_DURATION_MIN * 60))
 SOAK_MODE="${SOAK_MODE:-standalone}"
 SOAK_CHECK_INTERVAL="${SOAK_CHECK_INTERVAL:-60}"
+CLAB_TOPO_NAME="${CLAB_TOPO_NAME:-ruster-e2e}"
+export CLAB_TOPO_NAME
 
 # Output directory
 if [ -z "${SOAK_OUTPUT_DIR:-}" ]; then
@@ -89,9 +92,8 @@ cleanup() {
 
     # Destroy containerlab topology if in containerlab mode
     if [ "$SOAK_MODE" = "containerlab" ]; then
-        log "Destroying containerlab topology..."
-        cd "$PROJECT_ROOT/tests/containerlab" && \
-            sudo containerlab destroy --topo topology.yml 2>/dev/null || true
+        log "Destroying containerlab topology (name: ${CLAB_TOPO_NAME})..."
+        sudo containerlab destroy --name "$CLAB_TOPO_NAME" --cleanup 2>/dev/null || true
     fi
 
     log "Cleanup complete (exit code: $exit_code)"
@@ -207,10 +209,10 @@ deploy_containerlab() {
         return
     fi
 
-    log "Deploying containerlab topology..."
+    log "Deploying containerlab topology (name: ${CLAB_TOPO_NAME})..."
 
     cd "$PROJECT_ROOT/tests/containerlab"
-    if ! sudo containerlab deploy --topo topology.yml; then
+    if ! sudo containerlab deploy --topo topology.yml --name "$CLAB_TOPO_NAME"; then
         log_error "Failed to deploy containerlab topology"
         exit 1
     fi

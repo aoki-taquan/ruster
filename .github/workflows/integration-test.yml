@@ -18,6 +18,8 @@ jobs:
     name: Containerlab E2E (v0.1 gate)
     runs-on: [self-hosted, linux, kvm]
     timeout-minutes: 30
+    env:
+      CLAB_TOPO_NAME: ruster-e2e-${{ github.run_id }}
 
     steps:
       - uses: actions/checkout@v4
@@ -32,7 +34,7 @@ jobs:
         run: cargo build --release
 
       - name: Deploy containerlab topology
-        run: sudo containerlab deploy --topo tests/containerlab/topology.yml
+        run: sudo containerlab deploy --topo tests/containerlab/topology.yml --name "$CLAB_TOPO_NAME"
 
       - name: Verify ruster is running
         run: bash tests/containerlab/scripts/check-ruster.sh
@@ -43,19 +45,19 @@ jobs:
       - name: Collect logs on failure
         if: failure()
         run: |
-          LOG_DIR=/tmp/ruster-e2e-logs
+          LOG_DIR="/tmp/${CLAB_TOPO_NAME}-logs"
           mkdir -p "$LOG_DIR"
 
           echo "=== Container logs ==="
           for node in ruster lan-host wan-host; do
-            echo "--- clab-ruster-e2e-${node} ---"
-            docker logs clab-ruster-e2e-${node} > "${LOG_DIR}/${node}.log" 2>&1 || true
-            docker logs clab-ruster-e2e-${node} 2>&1 || true
+            echo "--- clab-${CLAB_TOPO_NAME}-${node} ---"
+            docker logs "clab-${CLAB_TOPO_NAME}-${node}" > "${LOG_DIR}/${node}.log" 2>&1 || true
+            docker logs "clab-${CLAB_TOPO_NAME}-${node}" 2>&1 || true
           done
 
           echo "=== Topology inspect ==="
-          sudo containerlab inspect --topo tests/containerlab/topology.yml > "${LOG_DIR}/topology-inspect.txt" 2>&1 || true
-          sudo containerlab inspect --topo tests/containerlab/topology.yml || true
+          sudo containerlab inspect --name "$CLAB_TOPO_NAME" > "${LOG_DIR}/topology-inspect.txt" 2>&1 || true
+          sudo containerlab inspect --name "$CLAB_TOPO_NAME" || true
 
           echo "=== Docker ps ==="
           docker ps -a > "${LOG_DIR}/docker-ps.txt" 2>&1 || true
@@ -67,32 +69,32 @@ jobs:
 
           echo "=== ruster process & log ==="
           echo "--- ruster process status ---"
-          docker exec clab-ruster-e2e-ruster pgrep -a ruster > "${LOG_DIR}/ruster-pgrep.txt" 2>&1 || echo "ruster not running" | tee "${LOG_DIR}/ruster-pgrep.txt"
+          docker exec "clab-${CLAB_TOPO_NAME}-ruster" pgrep -a ruster > "${LOG_DIR}/ruster-pgrep.txt" 2>&1 || echo "ruster not running" | tee "${LOG_DIR}/ruster-pgrep.txt"
           echo "--- ruster application log ---"
-          docker exec clab-ruster-e2e-ruster cat /var/log/ruster.log > "${LOG_DIR}/ruster-app.log" 2>&1 || echo "No ruster log found" | tee "${LOG_DIR}/ruster-app.log"
-          docker exec clab-ruster-e2e-ruster cat /var/log/ruster.log 2>&1 || true
+          docker exec "clab-${CLAB_TOPO_NAME}-ruster" cat /var/log/ruster.log > "${LOG_DIR}/ruster-app.log" 2>&1 || echo "No ruster log found" | tee "${LOG_DIR}/ruster-app.log"
+          docker exec "clab-${CLAB_TOPO_NAME}-ruster" cat /var/log/ruster.log 2>&1 || true
 
           echo "=== Node network state ==="
           for node in ruster lan-host wan-host; do
             echo "--- ${node} interfaces ---"
-            docker exec clab-ruster-e2e-${node} ip addr show >> "${LOG_DIR}/${node}-debug.log" 2>&1 || true
+            docker exec "clab-${CLAB_TOPO_NAME}-${node}" ip addr show >> "${LOG_DIR}/${node}-debug.log" 2>&1 || true
             echo "--- ${node} routes ---"
-            docker exec clab-ruster-e2e-${node} ip route show >> "${LOG_DIR}/${node}-debug.log" 2>&1 || true
+            docker exec "clab-${CLAB_TOPO_NAME}-${node}" ip route show >> "${LOG_DIR}/${node}-debug.log" 2>&1 || true
             echo "--- ${node} arp ---"
-            docker exec clab-ruster-e2e-${node} ip neigh show >> "${LOG_DIR}/${node}-debug.log" 2>&1 || true
+            docker exec "clab-${CLAB_TOPO_NAME}-${node}" ip neigh show >> "${LOG_DIR}/${node}-debug.log" 2>&1 || true
           done
 
       - name: Upload logs artifact
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-logs
-          path: /tmp/ruster-e2e-logs/
+          name: e2e-logs-${{ github.run_id }}
+          path: /tmp/${{ env.CLAB_TOPO_NAME }}-logs/
           retention-days: 7
 
       - name: Destroy topology
         if: always()
-        run: sudo containerlab destroy --topo tests/containerlab/topology.yml --cleanup
+        run: sudo containerlab destroy --name "$CLAB_TOPO_NAME" --cleanup
 
   # ── NAT/FW strict: real dataplane required ───────────────────
   # These tests require ruster's dataplane to handle real packets.
@@ -104,6 +106,8 @@ jobs:
     runs-on: [self-hosted, linux, kvm]
     timeout-minutes: 30
     continue-on-error: true
+    env:
+      CLAB_TOPO_NAME: ruster-e2e-strict-${{ github.run_id }}
 
     steps:
       - uses: actions/checkout@v4
@@ -118,7 +122,7 @@ jobs:
         run: cargo build --release
 
       - name: Deploy containerlab topology
-        run: sudo containerlab deploy --topo tests/containerlab/topology.yml
+        run: sudo containerlab deploy --topo tests/containerlab/topology.yml --name "$CLAB_TOPO_NAME"
 
       - name: Verify ruster is running
         run: bash tests/containerlab/scripts/check-ruster.sh
@@ -129,24 +133,24 @@ jobs:
       - name: Collect logs on failure
         if: failure()
         run: |
-          LOG_DIR=/tmp/ruster-e2e-strict-logs
+          LOG_DIR="/tmp/${CLAB_TOPO_NAME}-logs"
           mkdir -p "$LOG_DIR"
 
           for node in ruster lan-host wan-host; do
-            docker logs clab-ruster-e2e-${node} > "${LOG_DIR}/${node}.log" 2>&1 || true
+            docker logs "clab-${CLAB_TOPO_NAME}-${node}" > "${LOG_DIR}/${node}.log" 2>&1 || true
           done
 
-          docker exec clab-ruster-e2e-ruster cat /var/log/ruster.log > "${LOG_DIR}/ruster-app.log" 2>&1 || true
+          docker exec "clab-${CLAB_TOPO_NAME}-ruster" cat /var/log/ruster.log > "${LOG_DIR}/ruster-app.log" 2>&1 || true
           docker ps -a > "${LOG_DIR}/docker-ps.txt" 2>&1 || true
 
       - name: Upload logs artifact
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-strict-logs
-          path: /tmp/ruster-e2e-strict-logs/
+          name: e2e-strict-logs-${{ github.run_id }}
+          path: /tmp/${{ env.CLAB_TOPO_NAME }}-logs/
           retention-days: 7
 
       - name: Destroy topology
         if: always()
-        run: sudo containerlab destroy --topo tests/containerlab/topology.yml --cleanup
+        run: sudo containerlab destroy --name "$CLAB_TOPO_NAME" --cleanup

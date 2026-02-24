@@ -17,7 +17,7 @@
 
 set -uo pipefail
 
-TOPO_NAME="ruster-e2e"
+TOPO_NAME="${CLAB_TOPO_NAME:-ruster-e2e}"
 CONTAINER="clab-${TOPO_NAME}-ruster"
 MAX_RETRIES="${CHECK_RUSTER_RETRIES:-10}"
 RETRY_INTERVAL="${CHECK_RUSTER_INTERVAL:-2}"
