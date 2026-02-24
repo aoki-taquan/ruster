@@ -13,8 +13,9 @@
 #   containerlab  — Real traffic via containerlab nodes
 #
 # Environment variables (containerlab mode):
-#   CLAB_LAN_HOST   — Container name for lan-host (default: clab-ruster-e2e-lan-host)
-#   CLAB_WAN_HOST   — Container name for wan-host (default: clab-ruster-e2e-wan-host)
+#   CLAB_TOPO_NAME  — Containerlab topology name (default: ruster-e2e)
+#   CLAB_LAN_HOST   — Container name for lan-host (default: clab-${CLAB_TOPO_NAME}-lan-host)
+#   CLAB_WAN_HOST   — Container name for wan-host (default: clab-${CLAB_TOPO_NAME}-wan-host)
 #   TRAFFIC_STREAMS — Number of parallel ping streams (default: 4)
 
 set -uo pipefail
@@ -22,8 +23,9 @@ set -uo pipefail
 MODE="${1:-standalone}"
 DURATION_SEC="${2:-1800}"
 
-CLAB_LAN_HOST="${CLAB_LAN_HOST:-clab-ruster-e2e-lan-host}"
-CLAB_WAN_HOST="${CLAB_WAN_HOST:-clab-ruster-e2e-wan-host}"
+CLAB_TOPO_NAME="${CLAB_TOPO_NAME:-ruster-e2e}"
+CLAB_LAN_HOST="${CLAB_LAN_HOST:-clab-${CLAB_TOPO_NAME}-lan-host}"
+CLAB_WAN_HOST="${CLAB_WAN_HOST:-clab-${CLAB_TOPO_NAME}-wan-host}"
 TRAFFIC_STREAMS="${TRAFFIC_STREAMS:-4}"
 
 log() {

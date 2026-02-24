@@ -5,9 +5,11 @@
 # Exits with non-zero if any test scenario failed.
 #
 # Environment variables:
-#   E2E_SUITES  — Comma-separated list of suites to run.
-#                 Available: l2, l3, nat, fw
-#                 Default: all suites (l2,l3,nat,fw)
+#   E2E_SUITES      — Comma-separated list of suites to run.
+#                     Available: l2, l3, nat, fw
+#                     Default: all suites (l2,l3,nat,fw)
+#   CLAB_TOPO_NAME  — Containerlab topology name override.
+#                     Default: ruster-e2e (from topology.yml)
 #
 # Examples:
 #   bash run-all.sh                       # Run all suites

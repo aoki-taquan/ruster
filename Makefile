@@ -83,15 +83,20 @@ team-stop:
 	fi
 
 # ── Containerlab E2E ──────────────────────────────────
+# Use CLAB_TOPO_NAME to override the topology name (default: ruster-e2e).
+# Example: make clab-deploy CLAB_TOPO_NAME=ruster-e2e-dev
+
+CLAB_TOPO_NAME ?= ruster-e2e
+export CLAB_TOPO_NAME
 
 clab-deploy:
-	cd tests/containerlab && sudo containerlab deploy --topo topology.yml
+	cd tests/containerlab && sudo containerlab deploy --topo topology.yml --name $(CLAB_TOPO_NAME)
 
 clab-test: clab-deploy
 	cd tests/containerlab && bash scripts/run-all.sh
 
 clab-destroy:
-	cd tests/containerlab && sudo containerlab destroy --topo topology.yml
+	cd tests/containerlab && sudo containerlab destroy --name $(CLAB_TOPO_NAME) --cleanup
 
 clab-e2e: clab-test clab-destroy
 

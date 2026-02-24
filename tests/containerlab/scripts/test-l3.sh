@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-TOPO_NAME="ruster-e2e"
+TOPO_NAME="${CLAB_TOPO_NAME:-ruster-e2e}"
 PREFIX="clab-${TOPO_NAME}"
 PASS=0
 FAIL=0
