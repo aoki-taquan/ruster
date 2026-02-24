@@ -1,6 +1,8 @@
 name: RFC Deviation Check
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
 
@@ -10,5 +12,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Check RFC-DEVIATION comments
-        run: bash scripts/check-rfc-deviation.sh
+
+      - name: Lint RFC-DEVIATION comments
+        run: bash scripts/rfc-deviation-lint.sh
+
+      - name: Verify deviation registry is up to date
+        run: |
+          bash scripts/rfc-deviation-lint.sh --registry
+          # Ignore comment lines (timestamps) when comparing
+          diff <(grep -v '^# Generated:' docs/rfc-deviations.tsv) \
+               <(git show HEAD:docs/rfc-deviations.tsv | grep -v '^# Generated:') \
+            && echo "OK: Registry is up to date." \
+            || { echo "ERROR: docs/rfc-deviations.tsv is out of date."; \
+                 echo "Run 'make rfc-registry' and commit the updated file."; \
+                 git diff docs/rfc-deviations.tsv; exit 1; }
