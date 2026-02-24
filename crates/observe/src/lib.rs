@@ -115,6 +115,8 @@ pub enum DropReason {
     FirewallDrop,
     /// ARP: next-hop MAC address could not be resolved.
     ArpUnresolved,
+    /// Packet could not be parsed.
+    ParseError,
 }
 
 impl fmt::Display for DropReason {
@@ -127,6 +129,7 @@ impl fmt::Display for DropReason {
             DropReason::NatTableFull => write!(f, "NAT/table-full"),
             DropReason::FirewallDrop => write!(f, "FW/drop"),
             DropReason::ArpUnresolved => write!(f, "ARP/unresolved"),
+            DropReason::ParseError => write!(f, "parse-error"),
         }
     }
 }
@@ -175,6 +178,8 @@ pub struct DropCounters {
     pub fw_drop: AtomicU64,
     /// ARP: next-hop address could not be resolved.
     pub arp_unresolved: AtomicU64,
+    /// Packet could not be parsed.
+    pub parse_error: AtomicU64,
 }
 
 // ── Observer ──────────────────────────────────────────────────────────
@@ -275,6 +280,7 @@ impl Observer {
             DropReason::NatTableFull => &self.drops.nat_table_full,
             DropReason::FirewallDrop => &self.drops.fw_drop,
             DropReason::ArpUnresolved => &self.drops.arp_unresolved,
+            DropReason::ParseError => &self.drops.parse_error,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -311,6 +317,7 @@ impl Observer {
                 nat_table_full: self.drops.nat_table_full.load(Ordering::Relaxed),
                 fw_drop: self.drops.fw_drop.load(Ordering::Relaxed),
                 arp_unresolved: self.drops.arp_unresolved.load(Ordering::Relaxed),
+                parse_error: self.drops.parse_error.load(Ordering::Relaxed),
             },
             forwarded: self.forwarded.load(Ordering::Relaxed),
             local_delivery: self.local_delivery.load(Ordering::Relaxed),
@@ -372,6 +379,8 @@ pub struct DropSnapshot {
     pub fw_drop: u64,
     /// ARP: unresolved.
     pub arp_unresolved: u64,
+    /// Parse error.
+    pub parse_error: u64,
 }
 
 impl fmt::Display for ObserverSnapshot {
@@ -409,7 +418,8 @@ impl fmt::Display for ObserverSnapshot {
         writeln!(f, "  L3/not-ipv4: {}", self.drops.l3_not_ipv4)?;
         writeln!(f, "  NAT/table-full: {}", self.drops.nat_table_full)?;
         writeln!(f, "  FW/drop: {}", self.drops.fw_drop)?;
-        write!(f, "  ARP/unresolved: {}", self.drops.arp_unresolved)?;
+        writeln!(f, "  ARP/unresolved: {}", self.drops.arp_unresolved)?;
+        write!(f, "  parse-error: {}", self.drops.parse_error)?;
         Ok(())
     }
 }
@@ -651,6 +661,7 @@ mod tests {
         obs.inc_drop_reason(DropReason::NatTableFull);
         obs.inc_drop_reason(DropReason::FirewallDrop);
         obs.inc_drop_reason(DropReason::ArpUnresolved);
+        obs.inc_drop_reason(DropReason::ParseError);
 
         assert_eq!(obs.drops.l2_no_bridge_domain.load(Ordering::Relaxed), 1);
         assert_eq!(obs.drops.l3_no_route.load(Ordering::Relaxed), 1);
@@ -659,6 +670,7 @@ mod tests {
         assert_eq!(obs.drops.nat_table_full.load(Ordering::Relaxed), 1);
         assert_eq!(obs.drops.fw_drop.load(Ordering::Relaxed), 1);
         assert_eq!(obs.drops.arp_unresolved.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.drops.parse_error.load(Ordering::Relaxed), 1);
     }
 
     // ── snapshot ──────────────────────────────────────────────────────
@@ -765,6 +777,7 @@ mod tests {
         assert_eq!(dc.nat_table_full.load(Ordering::Relaxed), 0);
         assert_eq!(dc.fw_drop.load(Ordering::Relaxed), 0);
         assert_eq!(dc.arp_unresolved.load(Ordering::Relaxed), 0);
+        assert_eq!(dc.parse_error.load(Ordering::Relaxed), 0);
     }
 
     // ── Multiple increments accumulate ────────────────────────────────
@@ -810,6 +823,7 @@ mod tests {
         assert_eq!(format!("{}", DropReason::NatTableFull), "NAT/table-full");
         assert_eq!(format!("{}", DropReason::FirewallDrop), "FW/drop");
         assert_eq!(format!("{}", DropReason::ArpUnresolved), "ARP/unresolved");
+        assert_eq!(format!("{}", DropReason::ParseError), "parse-error");
     }
 
     // ── TableStats / TableReport Display ──────────────────────────────
@@ -893,6 +907,7 @@ mod tests {
         assert_eq!(snap.drops.nat_table_full, 0);
         assert_eq!(snap.drops.fw_drop, 0);
         assert_eq!(snap.drops.arp_unresolved, 0);
+        assert_eq!(snap.drops.parse_error, 0);
         assert_eq!(snap.interfaces.len(), 1);
         assert_eq!(snap.interfaces[0].rx_packets, 0);
         assert_eq!(snap.interfaces[0].tx_packets, 0);
