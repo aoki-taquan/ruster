@@ -249,6 +249,16 @@ impl L3Engine {
     pub fn router_ip_for_iface(&self, ifname: &str) -> Option<[u8; 4]> {
         self.iface_ips.get(ifname).copied()
     }
+
+    /// Check whether the given IPv4 address is one of the router's
+    /// local (interface) addresses.
+    ///
+    /// Used by the L2 pipeline to decide whether a packet in a bridge
+    /// domain should be handed off to L3 processing (local delivery)
+    /// rather than being L2-forwarded/flooded.
+    pub fn is_local_ip(&self, ip: &[u8; 4]) -> bool {
+        self.local_ips.contains(ip)
+    }
 }
 
 /// Parse an IPv4 address string, stripping an optional CIDR prefix length.

@@ -62,6 +62,16 @@ impl L2Engine {
         L2Decision::Drop
     }
 
+    /// Check whether the given interface belongs to any bridge domain.
+    ///
+    /// Used by the pipeline to decide whether to invoke L2 processing
+    /// before L3 routing.
+    pub fn is_bridged(&self, ifname: &str) -> bool {
+        self.domains
+            .iter()
+            .any(|d| d.members.contains(&ifname.to_string()))
+    }
+
     /// Run aging on all bridge domains' FDBs.
     ///
     /// Returns the total number of entries removed across all domains.
