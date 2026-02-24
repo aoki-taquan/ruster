@@ -11,7 +11,7 @@ pub mod pipeline;
 pub mod routing;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ruster_config::model::RouterConfig;
@@ -37,7 +37,10 @@ pub enum DataplaneError {
 #[derive(Debug)]
 pub struct Dataplane {
     /// L2 bridging engine (MAC learning, FDB, bridge domains).
-    pub l2: l2::L2Engine,
+    ///
+    /// Wrapped in a `Mutex` because [`l2::L2Engine::process`] requires
+    /// `&mut self` (for MAC learning), while the run loop takes `&self`.
+    pub l2: Mutex<l2::L2Engine>,
     /// ARP resolution engine (per-interface ARP caches).
     pub arp: arp::ArpEngine,
     /// L3 IPv4 forwarding engine (static routing, LPM).
@@ -74,7 +77,7 @@ impl Dataplane {
         let observer = Arc::new(ruster_observe::Observer::new(&iface_names));
 
         Ok(Self {
-            l2,
+            l2: Mutex::new(l2),
             arp,
             l3,
             nat,
@@ -113,13 +116,17 @@ impl Dataplane {
                 self.observer
                     .inc_rx(&raw_pkt.ingress_iface, raw_pkt.data.len() as u64);
 
-                let result = pipeline::process_packet(
-                    raw_pkt,
-                    &self.l3,
-                    &self.firewall,
-                    &self.conntrack,
-                    &self.zone_resolver,
-                );
+                let result = {
+                    let mut l2_guard = self.l2.lock().unwrap();
+                    pipeline::process_packet(
+                        raw_pkt,
+                        &mut l2_guard,
+                        &self.l3,
+                        &self.firewall,
+                        &self.conntrack,
+                        &self.zone_resolver,
+                    )
+                };
                 match result {
                     pipeline::PipelineResult::Forward { egress_iface } => {
                         self.observer.inc_forwarded();
@@ -132,6 +139,21 @@ impl Dataplane {
                                 self.tx_errors.fetch_add(1, Ordering::Relaxed);
                                 self.observer.inc_tx_drop(&egress_iface);
                                 eprintln!("TX error on {}: {}", egress_iface, e);
+                            }
+                        }
+                    }
+                    pipeline::PipelineResult::Flood { egress_ifaces } => {
+                        self.observer.inc_forwarded();
+                        for iface in &egress_ifaces {
+                            match io.tx(iface, raw_pkt) {
+                                Ok(()) => {
+                                    self.observer.inc_tx(iface, raw_pkt.data.len() as u64);
+                                }
+                                Err(e) => {
+                                    self.tx_errors.fetch_add(1, Ordering::Relaxed);
+                                    self.observer.inc_tx_drop(iface);
+                                    eprintln!("TX error on {}: {}", iface, e);
+                                }
                             }
                         }
                     }
@@ -276,16 +298,23 @@ mod tests {
         assert_eq!(dp.tx_error_count(), 0, "tx_error_count should start at 0");
     }
 
-    /// Load the example config with the firewall and NAT disabled so
-    /// that packets are forwarded (reach TX) in the run loop.
+    /// Load the example config with the firewall, NAT disabled and
+    /// bridge domains emptied so that packets go straight to L3
+    /// (reach TX) in the run loop.
     fn load_example_fw_disabled() -> RouterConfig {
-        let toml = example_toml()
-            .replace(
-                "\n[firewall]\nenabled = true\n",
-                "\n[firewall]\nenabled = false\n",
-            )
-            .replace("\n[nat]\nenabled = true\n", "\n[nat]\nenabled = false\n");
-        ruster_config::load_from_str(&toml).expect("valid config with fw disabled")
+        let mut config = {
+            let toml = example_toml()
+                .replace(
+                    "\n[firewall]\nenabled = true\n",
+                    "\n[firewall]\nenabled = false\n",
+                )
+                .replace("\n[nat]\nenabled = true\n", "\n[nat]\nenabled = false\n");
+            ruster_config::load_from_str(&toml).expect("valid config with fw disabled")
+        };
+        // Clear bridge domains so L2 processing is skipped and
+        // packets go directly to L3 routing.
+        config.l2.bridge_domains.clear();
+        config
     }
 
     /// Build a minimal valid Ethernet+IPv4+UDP packet that the pipeline
@@ -564,7 +593,8 @@ mod tests {
                 "ipv4_static_routes = [\n  { prefix = \"0.0.0.0/0\"",
                 "ipv4_static_routes = [\n  { prefix = \"10.99.99.0/24\"",
             );
-        let config = ruster_config::load_from_str(&toml).expect("valid config");
+        let mut config = ruster_config::load_from_str(&toml).expect("valid config");
+        config.l2.bridge_domains.clear();
         let dp = Dataplane::init(&config).expect("init should succeed");
 
         let mock_io = io::MockPacketIo::new();

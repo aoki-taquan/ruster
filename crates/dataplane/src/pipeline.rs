@@ -17,7 +17,10 @@ use crate::conntrack::ConntrackEngine;
 use crate::firewall::{FirewallEngine, FwChain, FwContext, FwVerdict};
 use crate::icmp::{self, IcmpReply};
 use crate::io::RawPacket;
+use crate::l2::bridge::L2Decision;
+use crate::l2::L2Engine;
 use crate::packet;
+use crate::packet::L3Info;
 use crate::routing::{L3Decision, L3DropReason, L3Engine};
 
 use ruster_config::model::{FirewallZone, InterfaceConfig, InterfaceZone};
@@ -63,6 +66,12 @@ pub enum PipelineResult {
         /// Name of the egress interface.
         egress_iface: String,
     },
+    /// Packet should be flooded to all listed interfaces (L2 unknown
+    /// unicast or broadcast within a bridge domain).
+    Flood {
+        /// Names of the egress interfaces (excludes the ingress port).
+        egress_ifaces: Vec<String>,
+    },
     /// Packet was dropped.
     Drop {
         /// Why the packet was dropped.
@@ -99,17 +108,27 @@ pub enum DropReason {
 
 /// Process a single raw packet through the forwarding pipeline.
 ///
-/// The simplified v0.1 flow is:
+/// The v0.1 flow is:
 /// 1. Parse the raw bytes into a [`PacketMeta`](packet::PacketMeta).
 /// 2. If parsing fails, return `Drop(ParseError)`.
-/// 3. Check L3 routing via [`L3Engine::process`].
-/// 4. Based on the L3 decision:
-///    - `Forward { .. }` -> check firewall -> return `Forward` or `Drop(FirewallDrop)`.
+/// 3. **L2 check**: if the ingress interface belongs to a bridge domain:
+///    a. Learn source MAC (FDB update).
+///    b. If the destination IP is one of the router's local IPs,
+///    fall through to L3 processing.
+///    c. Otherwise, make an L2 forwarding decision:
+///    Known unicast -> `Forward` to the learned port.
+///    Unknown unicast / broadcast -> `Flood` to all bridge domain
+///    ports except ingress.
+///    Same-port drop -> `Drop(L2Drop)`.
+/// 4. If the interface is **not** in a bridge domain, proceed to L3.
+/// 5. Check L3 routing via [`L3Engine::process`].
+/// 6. Based on the L3 decision:
+///    - `Forward { .. }` -> check firewall -> `Forward` or `Drop(FirewallDrop)`.
 ///    - `LocalDelivery` -> `Consumed`.
 ///    - `Drop(reason)` -> `Drop` with a mapped reason.
-/// 5. If the firewall blocks the packet, return `Drop(FirewallDrop)`.
 pub fn process_packet(
     raw_pkt: &RawPacket,
+    l2: &mut L2Engine,
     l3: &L3Engine,
     firewall: &FirewallEngine,
     conntrack: &ConntrackEngine,
@@ -126,7 +145,37 @@ pub fn process_packet(
         }
     };
 
-    // Step 2: L3 routing decision.
+    // Step 2: L2 bridge domain processing.
+    if l2.is_bridged(&meta.in_ifname) {
+        let l2_decision = l2.process(&meta);
+
+        // Check whether the packet is destined for one of the router's
+        // own IP addresses. If so, skip L2 forwarding and fall through
+        // to L3 processing (the MAC was already learned in `l2.process`).
+        let is_local = match &meta.l3 {
+            Some(L3Info::Ipv4(ipv4)) => l3.is_local_ip(&ipv4.dst_addr),
+            _ => false,
+        };
+
+        if !is_local {
+            // Pure L2 forwarding — do not enter L3.
+            return match l2_decision {
+                L2Decision::Unicast { out_ifname } => PipelineResult::Forward {
+                    egress_iface: out_ifname,
+                },
+                L2Decision::Flood { out_ifnames } => PipelineResult::Flood {
+                    egress_ifaces: out_ifnames,
+                },
+                L2Decision::Drop => PipelineResult::Drop {
+                    reason: DropReason::L2Drop,
+                    icmp_reply: None,
+                },
+            };
+        }
+        // else: packet is for our local IP -> fall through to L3.
+    }
+
+    // Step 3: L3 routing decision.
     let l3_decision = l3.process(&meta);
 
     match l3_decision {
@@ -135,7 +184,7 @@ pub fn process_packet(
             next_hop: _,
             new_ttl: _,
         } => {
-            // Step 3: Firewall check on the forward chain.
+            // Step 4: Firewall check on the forward chain.
             let src_zone = zone_resolver.resolve(&raw_pkt.ingress_iface);
             let dst_zone = zone_resolver.resolve(&out_ifname);
             let fw_ctx =
@@ -205,12 +254,26 @@ mod tests {
     use super::*;
     use crate::conntrack::{ConntrackConfig, ConntrackEngine};
     use crate::io::RawPacket;
+    use crate::l2::L2Engine;
     use ruster_config::model::{
-        DefaultPolicy, FirewallConfig, InterfaceConfig, InterfaceRole, InterfaceZone,
-        RoutingConfig, StaticRoute,
+        BridgeDomain, DefaultPolicy, FirewallConfig, InterfaceConfig, InterfaceRole, InterfaceZone,
+        L2Config, RoutingConfig, StaticRoute,
     };
 
     // ── Test helpers ────────────────────────────────────────────────
+
+    /// Create an L2 engine with **no** bridge domains, so all interfaces
+    /// skip L2 processing and go directly to L3.  This preserves the
+    /// behaviour of every pre-existing pipeline test.
+    fn make_l2_engine_empty() -> L2Engine {
+        L2Engine::from_config(&L2Config {
+            mac_table_max_entries: 1024,
+            mac_aging_sec: 300,
+            arp_table_max_entries: 256,
+            arp_timeout_sec: 120,
+            bridge_domains: vec![],
+        })
+    }
 
     fn make_routing_config() -> RoutingConfig {
         RoutingConfig {
@@ -380,7 +443,8 @@ mod tests {
         };
 
         let zr = make_zone_resolver();
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Forward { egress_iface } => {
                 assert_eq!(egress_iface, "wan0");
@@ -402,7 +466,8 @@ mod tests {
         };
 
         let zr = make_zone_resolver();
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::ParseError);
@@ -440,7 +505,8 @@ mod tests {
         };
 
         let zr = make_zone_resolver();
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3NoRoute);
@@ -469,7 +535,8 @@ mod tests {
         };
 
         let zr = make_zone_resolver();
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -498,7 +565,8 @@ mod tests {
         };
 
         let zr = make_zone_resolver();
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         assert!(matches!(result, PipelineResult::Consumed));
     }
 
@@ -522,7 +590,8 @@ mod tests {
         };
 
         let zr = make_zone_resolver();
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -560,7 +629,8 @@ mod tests {
         };
 
         let zr = make_zone_resolver();
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3NotIpv4);
@@ -577,6 +647,7 @@ mod tests {
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
         let zr = make_zone_resolver();
+        let mut l2 = make_l2_engine_empty();
 
         let mut parse_errors = 0u64;
         let mut ttl_drops = 0u64;
@@ -587,7 +658,7 @@ mod tests {
             ingress_iface: "eth0".to_string(),
             data: vec![0x00; 5],
         };
-        match process_packet(&short_pkt, &l3, &fw, &ct, &zr) {
+        match process_packet(&short_pkt, &mut l2, &l3, &fw, &ct, &zr) {
             PipelineResult::Drop {
                 reason: DropReason::ParseError,
                 ..
@@ -601,7 +672,7 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: ttl_data,
         };
-        match process_packet(&ttl_pkt, &l3, &fw, &ct, &zr) {
+        match process_packet(&ttl_pkt, &mut l2, &l3, &fw, &ct, &zr) {
             PipelineResult::Drop {
                 reason: DropReason::L3TtlExpired,
                 ..
@@ -615,7 +686,7 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: fwd_data,
         };
-        match process_packet(&fwd_pkt, &l3, &fw, &ct, &zr) {
+        match process_packet(&fwd_pkt, &mut l2, &l3, &fw, &ct, &zr) {
             PipelineResult::Forward { .. } => forwards += 1,
             _ => {}
         }
@@ -670,7 +741,8 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Forward { egress_iface } => {
                 assert_eq!(egress_iface, "wan0");
@@ -726,7 +798,8 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -768,7 +841,8 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -817,7 +891,8 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3NoRoute);
@@ -874,7 +949,8 @@ mod tests {
             data: pkt,
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -899,7 +975,8 @@ mod tests {
             data: vec![0x00; 5],
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::ParseError);
@@ -928,7 +1005,8 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -965,7 +1043,8 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        let mut l2 = make_l2_engine_empty();
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3NotIpv4);
@@ -973,5 +1052,297 @@ mod tests {
             }
             other => panic!("expected Drop, got {:?}", other),
         }
+    }
+
+    // ── L2 pipeline integration tests ──────────────────────────────
+
+    /// Helper: build an L2 engine with a bridge domain containing
+    /// eth0, eth1, eth2.
+    fn make_l2_engine_bridged() -> L2Engine {
+        L2Engine::from_config(&L2Config {
+            mac_table_max_entries: 1024,
+            mac_aging_sec: 300,
+            arp_table_max_entries: 256,
+            arp_timeout_sec: 120,
+            bridge_domains: vec![BridgeDomain {
+                name: "br0".to_string(),
+                members: vec!["eth0".to_string(), "eth1".to_string(), "eth2".to_string()],
+            }],
+        })
+    }
+
+    /// Helper: build an L3 engine that knows about eth0/eth1/eth2
+    /// so that local IP checks work in the L2 pipeline tests.
+    fn make_l3_engine_with_bridge_ifaces() -> L3Engine {
+        let routing = RoutingConfig {
+            ipv4_static_routes: vec![StaticRoute {
+                prefix: "0.0.0.0/0".to_string(),
+                next_hop: "10.0.0.1".to_string(),
+                out_if: "wan0".to_string(),
+                metric: 100,
+            }],
+        };
+        let ifaces = vec![
+            InterfaceConfig {
+                name: "eth0".to_string(),
+                port_id: 0,
+                role: InterfaceRole::Lan,
+                admin_up: true,
+                mtu: 1500,
+                mac: "02:00:00:00:00:01".to_string(),
+                ipv4_addrs: vec!["192.168.1.1/24".to_string()],
+                zone: InterfaceZone::Lan,
+                l2_domain: "br0".to_string(),
+            },
+            InterfaceConfig {
+                name: "eth1".to_string(),
+                port_id: 1,
+                role: InterfaceRole::Lan,
+                admin_up: true,
+                mtu: 1500,
+                mac: "02:00:00:00:00:02".to_string(),
+                ipv4_addrs: vec![],
+                zone: InterfaceZone::Lan,
+                l2_domain: "br0".to_string(),
+            },
+            InterfaceConfig {
+                name: "eth2".to_string(),
+                port_id: 2,
+                role: InterfaceRole::Lan,
+                admin_up: true,
+                mtu: 1500,
+                mac: "02:00:00:00:00:03".to_string(),
+                ipv4_addrs: vec![],
+                zone: InterfaceZone::Lan,
+                l2_domain: "br0".to_string(),
+            },
+            InterfaceConfig {
+                name: "wan0".to_string(),
+                port_id: 3,
+                role: InterfaceRole::Wan,
+                admin_up: true,
+                mtu: 1500,
+                mac: "02:00:00:00:10:01".to_string(),
+                ipv4_addrs: vec!["10.0.0.2/24".to_string()],
+                zone: InterfaceZone::Wan,
+                l2_domain: "bd-wan".to_string(),
+            },
+        ];
+        L3Engine::from_config(&routing, &ifaces).unwrap()
+    }
+
+    const MAC_HOST_A: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x01];
+    const MAC_HOST_B: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0x02];
+    const MAC_BROADCAST: [u8; 6] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+
+    /// Build a raw Ethernet + IPv4 + UDP packet with specified MACs and IPs.
+    fn make_l2_raw_packet(
+        ingress_iface: &str,
+        src_mac: [u8; 6],
+        dst_mac: [u8; 6],
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+    ) -> RawPacket {
+        RawPacket {
+            ingress_iface: ingress_iface.to_string(),
+            data: make_ipv4_packet(src_mac, dst_mac, src_ip, dst_ip, 64),
+        }
+    }
+
+    #[test]
+    fn l2_forward_known_unicast() {
+        // Pre-learn MAC_HOST_B on eth1, then send a packet from eth0
+        // to MAC_HOST_B -> should L2 forward to eth1.
+        let mut l2 = make_l2_engine_bridged();
+        let l3 = make_l3_engine_with_bridge_ifaces();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let zr = ZoneResolver::from_config(&[]);
+
+        // Step 1: Learn MAC_HOST_B on eth1.
+        let learn_pkt = make_l2_raw_packet(
+            "eth1",
+            MAC_HOST_B,
+            MAC_HOST_A,
+            [192, 168, 1, 50],
+            [192, 168, 1, 60],
+        );
+        let _ = process_packet(&learn_pkt, &mut l2, &l3, &fw, &ct, &zr);
+
+        // Step 2: Send from MAC_HOST_A on eth0 to MAC_HOST_B -> unicast to eth1.
+        let pkt = make_l2_raw_packet(
+            "eth0",
+            MAC_HOST_A,
+            MAC_HOST_B,
+            [192, 168, 1, 60],
+            [192, 168, 1, 50],
+        );
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+
+        match result {
+            PipelineResult::Forward { egress_iface } => {
+                assert_eq!(egress_iface, "eth1");
+            }
+            other => panic!("expected Forward to eth1, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn l2_flood_unknown_mac() {
+        // Send to an unknown MAC on eth0 -> should flood to eth1, eth2.
+        let mut l2 = make_l2_engine_bridged();
+        let l3 = make_l3_engine_with_bridge_ifaces();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let zr = ZoneResolver::from_config(&[]);
+
+        let pkt = make_l2_raw_packet(
+            "eth0",
+            MAC_HOST_A,
+            MAC_HOST_B,
+            [192, 168, 1, 60],
+            [192, 168, 1, 50],
+        );
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+
+        match result {
+            PipelineResult::Flood { egress_ifaces } => {
+                assert!(
+                    !egress_ifaces.contains(&"eth0".to_string()),
+                    "must not include ingress"
+                );
+                assert!(egress_ifaces.contains(&"eth1".to_string()));
+                assert!(egress_ifaces.contains(&"eth2".to_string()));
+                assert_eq!(egress_ifaces.len(), 2);
+            }
+            other => panic!("expected Flood, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn l2_broadcast_floods() {
+        // Broadcast MAC should always flood.
+        let mut l2 = make_l2_engine_bridged();
+        let l3 = make_l3_engine_with_bridge_ifaces();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let zr = ZoneResolver::from_config(&[]);
+
+        let pkt = make_l2_raw_packet(
+            "eth0",
+            MAC_HOST_A,
+            MAC_BROADCAST,
+            [192, 168, 1, 60],
+            [192, 168, 1, 255],
+        );
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+
+        match result {
+            PipelineResult::Flood { egress_ifaces } => {
+                assert!(
+                    !egress_ifaces.contains(&"eth0".to_string()),
+                    "must not include ingress"
+                );
+                assert!(egress_ifaces.contains(&"eth1".to_string()));
+                assert!(egress_ifaces.contains(&"eth2".to_string()));
+                assert_eq!(egress_ifaces.len(), 2);
+            }
+            other => panic!("expected Flood for broadcast, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn l2_learning_source_mac() {
+        // After processing a packet from eth0 with MAC_HOST_A,
+        // MAC_HOST_A should be learned on eth0. A subsequent packet
+        // to MAC_HOST_A from eth1 should unicast to eth0.
+        let mut l2 = make_l2_engine_bridged();
+        let l3 = make_l3_engine_with_bridge_ifaces();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let zr = ZoneResolver::from_config(&[]);
+
+        // Step 1: MAC_HOST_A arrives on eth0 (triggers learning).
+        let learn_pkt = make_l2_raw_packet(
+            "eth0",
+            MAC_HOST_A,
+            MAC_HOST_B,
+            [192, 168, 1, 60],
+            [192, 168, 1, 50],
+        );
+        let _ = process_packet(&learn_pkt, &mut l2, &l3, &fw, &ct, &zr);
+
+        // Step 2: Send to MAC_HOST_A from eth1 -> should unicast to eth0.
+        let pkt = make_l2_raw_packet(
+            "eth1",
+            MAC_HOST_B,
+            MAC_HOST_A,
+            [192, 168, 1, 50],
+            [192, 168, 1, 60],
+        );
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+
+        match result {
+            PipelineResult::Forward { egress_iface } => {
+                assert_eq!(egress_iface, "eth0");
+            }
+            other => panic!("expected Forward to eth0, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn l2_plus_l3_local_ip_goes_to_l3() {
+        // A packet in a bridge domain but destined for the router's
+        // own IP (192.168.1.1) should bypass L2 forwarding and be
+        // handed to L3 (resulting in Consumed / LocalDelivery).
+        let mut l2 = make_l2_engine_bridged();
+        let l3 = make_l3_engine_with_bridge_ifaces();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let zr = ZoneResolver::from_config(&[]);
+
+        let pkt = make_l2_raw_packet(
+            "eth0",
+            MAC_HOST_A,
+            MAC_HOST_B,
+            [192, 168, 1, 60],
+            [192, 168, 1, 1],
+        );
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+
+        // The packet's dst IP (192.168.1.1) is a local IP on eth0,
+        // so L3 should handle it as LocalDelivery -> Consumed.
+        assert!(
+            matches!(result, PipelineResult::Consumed),
+            "expected Consumed for local IP, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn l2_not_in_bridge_domain_goes_to_l3() {
+        // An interface NOT in any bridge domain should skip L2 and
+        // go directly to L3 routing.
+        let mut l2 = make_l2_engine_bridged(); // br0: eth0, eth1, eth2
+        let l3 = make_l3_engine_with_bridge_ifaces();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let zr = ZoneResolver::from_config(&[]);
+
+        // wan0 is NOT in br0, so it skips L2 entirely.
+        let pkt = make_l2_raw_packet(
+            "wan0",
+            [0xAA; 6],
+            [0xBB; 6],
+            [10, 0, 0, 5],
+            [192, 168, 1, 1], // local IP -> Consumed
+        );
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+
+        assert!(
+            matches!(result, PipelineResult::Consumed),
+            "expected Consumed (L3 local delivery), got {:?}",
+            result
+        );
     }
 }
