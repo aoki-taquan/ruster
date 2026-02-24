@@ -19,9 +19,10 @@ jobs:
       - name: Verify deviation registry is up to date
         run: |
           bash scripts/rfc-deviation-lint.sh --registry
-          if ! git diff --quiet docs/rfc-deviations.tsv 2>/dev/null; then
-            echo "ERROR: docs/rfc-deviations.tsv is out of date."
-            echo "Run 'make rfc-registry' and commit the updated file."
-            git diff docs/rfc-deviations.tsv
-            exit 1
-          fi
+          # Ignore comment lines (timestamps) when comparing
+          diff <(grep -v '^# Generated:' docs/rfc-deviations.tsv) \
+               <(git show HEAD:docs/rfc-deviations.tsv | grep -v '^# Generated:') \
+            && echo "OK: Registry is up to date." \
+            || { echo "ERROR: docs/rfc-deviations.tsv is out of date."; \
+                 echo "Run 'make rfc-registry' and commit the updated file."; \
+                 git diff docs/rfc-deviations.tsv; exit 1; }
