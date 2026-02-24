@@ -1,0 +1,75 @@
+# E2E Strict — Informational CI for NAT/FW validation
+#
+# Runs NAT and firewall E2E tests against the containerlab topology.
+# These tests require a real dataplane (not MockPacketIo), so they are
+# EXPECTED TO FAIL in v0.1. This workflow is non-blocking and exists
+# to track readiness for v0.2+.
+#
+# See docs/ci-gates.md for gate definitions and promotion process.
+
+name: E2E Strict (NAT/FW — informational)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  containerlab-e2e-strict:
+    name: E2E Strict (NAT + FW — expected-fail in v0.1)
+    runs-on: [self-hosted, linux, kvm]
+    timeout-minutes: 30
+    continue-on-error: true
+    env:
+      CLAB_TOPO_NAME: ruster-e2e-strict-${{ github.run_id }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Deploy containerlab topology
+        run: sudo containerlab deploy --topo tests/containerlab/topology.yml --name "$CLAB_TOPO_NAME"
+
+      - name: Verify ruster is running
+        run: bash tests/containerlab/scripts/check-ruster.sh
+
+      - name: Run E2E tests (NAT + FW strict)
+        run: E2E_SUITES=nat,fw bash tests/containerlab/scripts/run-all.sh
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          LOG_DIR="/tmp/${CLAB_TOPO_NAME}-logs"
+          mkdir -p "$LOG_DIR"
+
+          for node in ruster lan-host wan-host; do
+            docker logs "clab-${CLAB_TOPO_NAME}-${node}" > "${LOG_DIR}/${node}.log" 2>&1 || true
+          done
+
+          docker exec "clab-${CLAB_TOPO_NAME}-ruster" cat /var/log/ruster.log > "${LOG_DIR}/ruster-app.log" 2>&1 || true
+          docker ps -a > "${LOG_DIR}/docker-ps.txt" 2>&1 || true
+
+      - name: Upload logs artifact
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-strict-logs-${{ github.run_id }}
+          path: /tmp/${{ env.CLAB_TOPO_NAME }}-logs/
+          retention-days: 7
+
+      - name: Destroy topology
+        if: always()
+        run: sudo containerlab destroy --name "$CLAB_TOPO_NAME" --cleanup
