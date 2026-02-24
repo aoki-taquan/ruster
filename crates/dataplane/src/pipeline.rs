@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use crate::conntrack::ConntrackEngine;
 use crate::firewall::{FirewallEngine, FwChain, FwContext, FwVerdict};
+use crate::icmp::{self, IcmpReply};
 use crate::io::RawPacket;
 use crate::packet;
 use crate::routing::{L3Decision, L3DropReason, L3Engine};
@@ -66,6 +67,10 @@ pub enum PipelineResult {
     Drop {
         /// Why the packet was dropped.
         reason: DropReason,
+        /// Optional ICMP error reply to send back to the original sender.
+        /// Present for TTL expired and no-route drops (when the original
+        /// packet is not itself ICMP).
+        icmp_reply: Option<IcmpReply>,
     },
     /// Packet was consumed (e.g., ARP reply generated internally).
     Consumed,
@@ -116,6 +121,7 @@ pub fn process_packet(
         Err(_) => {
             return PipelineResult::Drop {
                 reason: DropReason::ParseError,
+                icmp_reply: None,
             }
         }
     };
@@ -142,13 +148,44 @@ pub fn process_packet(
                 },
                 FwVerdict::Drop | FwVerdict::DropRule { .. } => PipelineResult::Drop {
                     reason: DropReason::FirewallDrop,
+                    icmp_reply: None,
                 },
             }
         }
         L3Decision::LocalDelivery => PipelineResult::Consumed,
-        L3Decision::Drop { reason } => PipelineResult::Drop {
-            reason: map_l3_drop_reason(reason),
-        },
+        L3Decision::Drop { reason } => {
+            let drop_reason = map_l3_drop_reason(reason);
+            let icmp_reply = match drop_reason {
+                DropReason::L3TtlExpired => {
+                    let router_ip = l3.router_ip_for_iface(&raw_pkt.ingress_iface);
+                    router_ip.and_then(|ip| {
+                        icmp::generate_icmp_error(
+                            &raw_pkt.data,
+                            icmp::IcmpError::TtlExceeded,
+                            ip,
+                            &raw_pkt.ingress_iface,
+                        )
+                    })
+                }
+                DropReason::L3NoRoute => {
+                    let router_ip = l3.router_ip_for_iface(&raw_pkt.ingress_iface);
+                    router_ip.and_then(|ip| {
+                        icmp::generate_icmp_error(
+                            &raw_pkt.data,
+                            icmp::IcmpError::NetUnreachable,
+                            ip,
+                            &raw_pkt.ingress_iface,
+                        )
+                    })
+                }
+                // No ICMP for non-IPv4 drops or other reasons.
+                _ => None,
+            };
+            PipelineResult::Drop {
+                reason: drop_reason,
+                icmp_reply,
+            }
+        }
     }
 }
 
@@ -367,7 +404,7 @@ mod tests {
         let zr = make_zone_resolver();
         let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
         match result {
-            PipelineResult::Drop { reason } => {
+            PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::ParseError);
             }
             other => panic!("expected Drop(ParseError), got {:?}", other),
@@ -405,7 +442,7 @@ mod tests {
         let zr = make_zone_resolver();
         let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
         match result {
-            PipelineResult::Drop { reason } => {
+            PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3NoRoute);
             }
             other => panic!("expected Drop(L3NoRoute), got {:?}", other),
@@ -434,7 +471,7 @@ mod tests {
         let zr = make_zone_resolver();
         let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
         match result {
-            PipelineResult::Drop { reason } => {
+            PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
             }
             other => panic!("expected Drop(L3TtlExpired), got {:?}", other),
@@ -487,7 +524,7 @@ mod tests {
         let zr = make_zone_resolver();
         let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
         match result {
-            PipelineResult::Drop { reason } => {
+            PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
             }
             other => panic!("expected Drop(FirewallDrop), got {:?}", other),
@@ -525,7 +562,7 @@ mod tests {
         let zr = make_zone_resolver();
         let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
         match result {
-            PipelineResult::Drop { reason } => {
+            PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3NotIpv4);
             }
             other => panic!("expected Drop(L3NotIpv4), got {:?}", other),
@@ -553,6 +590,7 @@ mod tests {
         match process_packet(&short_pkt, &l3, &fw, &ct, &zr) {
             PipelineResult::Drop {
                 reason: DropReason::ParseError,
+                ..
             } => parse_errors += 1,
             _ => {}
         }
@@ -566,6 +604,7 @@ mod tests {
         match process_packet(&ttl_pkt, &l3, &fw, &ct, &zr) {
             PipelineResult::Drop {
                 reason: DropReason::L3TtlExpired,
+                ..
             } => ttl_drops += 1,
             _ => {}
         }
@@ -689,7 +728,7 @@ mod tests {
 
         let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
         match result {
-            PipelineResult::Drop { reason } => {
+            PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
             }
             other => panic!(
@@ -705,5 +744,234 @@ mod tests {
         let zr = make_zone_resolver();
         assert_eq!(zr.resolve("unknown_iface"), FirewallZone::Lan);
         assert_eq!(zr.resolve(""), FirewallZone::Lan);
+    }
+
+    // ── ICMP error generation tests ─────────────────────────────────
+
+    #[test]
+    fn ttl_expired_generates_icmp_reply() {
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let zr = make_zone_resolver();
+
+        // TTL = 1 -> L3 drops with TtlExpired -> should generate ICMP.
+        let data = make_ipv4_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            [192, 168, 1, 100],
+            [8, 8, 8, 8],
+            1,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        match result {
+            PipelineResult::Drop { reason, icmp_reply } => {
+                assert_eq!(reason, DropReason::L3TtlExpired);
+                let reply = icmp_reply.expect("should generate ICMP reply for TTL expired");
+                assert_eq!(reply.egress_iface, "lan0");
+
+                // Check ICMP type/code: Time Exceeded (11, 0).
+                let icmp_start = 14 + 20; // Ethernet + IPv4
+                assert_eq!(reply.data[icmp_start], 11);
+                assert_eq!(reply.data[icmp_start + 1], 0);
+
+                // Check that the router IP is the lan0 IP (192.168.1.1).
+                let src_ip = &reply.data[14 + 12..14 + 16];
+                assert_eq!(src_ip, &[192, 168, 1, 1]);
+            }
+            other => panic!("expected Drop with ICMP reply, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn no_route_generates_icmp_reply() {
+        // L3 engine with only a /24 route (no default route).
+        let routing = RoutingConfig {
+            ipv4_static_routes: vec![StaticRoute {
+                prefix: "192.168.1.0/24".to_string(),
+                next_hop: "0.0.0.0".to_string(),
+                out_if: "lan0".to_string(),
+                metric: 10,
+            }],
+        };
+        let l3 = L3Engine::from_config(&routing, &make_interfaces()).unwrap();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let zr = make_zone_resolver();
+
+        // Destination 8.8.8.8 has no matching route.
+        let data = make_ipv4_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            [192, 168, 1, 100],
+            [8, 8, 8, 8],
+            64,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        match result {
+            PipelineResult::Drop { reason, icmp_reply } => {
+                assert_eq!(reason, DropReason::L3NoRoute);
+                let reply = icmp_reply.expect("should generate ICMP reply for no route");
+                assert_eq!(reply.egress_iface, "lan0");
+
+                // Check ICMP type/code: Destination Unreachable / Net Unreachable (3, 0).
+                let icmp_start = 14 + 20;
+                assert_eq!(reply.data[icmp_start], 3);
+                assert_eq!(reply.data[icmp_start + 1], 0);
+            }
+            other => panic!("expected Drop with ICMP reply, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn no_icmp_for_icmp_packets() {
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let zr = make_zone_resolver();
+
+        // Build an ICMP packet (protocol=1) with TTL=1.
+        let mut pkt = Vec::new();
+        // Ethernet header
+        pkt.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // dst
+        pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]); // src
+        pkt.extend_from_slice(&[0x08, 0x00]); // EtherType IPv4
+
+        // IPv4 header
+        let ipv4_start = pkt.len();
+        pkt.push(0x45); // version=4, IHL=5
+        pkt.push(0x00);
+        let total_len: u16 = 20 + 8; // IP header + 8 bytes ICMP
+        pkt.extend_from_slice(&total_len.to_be_bytes());
+        pkt.extend_from_slice(&[0x00, 0x00]); // identification
+        pkt.extend_from_slice(&[0x00, 0x00]); // flags/fragment
+        pkt.push(1); // TTL = 1
+        pkt.push(1); // protocol = ICMP
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+        pkt.extend_from_slice(&[192, 168, 1, 100]); // src
+        pkt.extend_from_slice(&[8, 8, 8, 8]); // dst
+
+        set_ipv4_checksum(&mut pkt[ipv4_start..ipv4_start + 20]);
+
+        // ICMP Echo Request (8 bytes)
+        pkt.push(8); // type: Echo Request
+        pkt.push(0); // code: 0
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum
+        pkt.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]); // ID + seq
+
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data: pkt,
+        };
+
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        match result {
+            PipelineResult::Drop { reason, icmp_reply } => {
+                assert_eq!(reason, DropReason::L3TtlExpired);
+                assert!(
+                    icmp_reply.is_none(),
+                    "should NOT generate ICMP for ICMP packets (loop prevention)"
+                );
+            }
+            other => panic!("expected Drop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_error_no_icmp() {
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let zr = make_zone_resolver();
+
+        let raw_pkt = RawPacket {
+            ingress_iface: "eth0".to_string(),
+            data: vec![0x00; 5],
+        };
+
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        match result {
+            PipelineResult::Drop { reason, icmp_reply } => {
+                assert_eq!(reason, DropReason::ParseError);
+                assert!(icmp_reply.is_none(), "no ICMP for parse errors");
+            }
+            other => panic!("expected Drop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn firewall_drop_no_icmp() {
+        let l3 = make_l3_engine();
+        let fw = make_fw_drop_all();
+        let ct = make_conntrack();
+        let zr = make_zone_resolver();
+
+        let data = make_ipv4_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            [192, 168, 1, 100],
+            [8, 8, 8, 8],
+            64,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        match result {
+            PipelineResult::Drop { reason, icmp_reply } => {
+                assert_eq!(reason, DropReason::FirewallDrop);
+                assert!(icmp_reply.is_none(), "no ICMP for firewall drops");
+            }
+            other => panic!("expected Drop, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn not_ipv4_no_icmp() {
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let zr = make_zone_resolver();
+
+        // ARP packet.
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        data.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        data.extend_from_slice(&[0x08, 0x06]); // ARP
+        data.extend_from_slice(&[0x00, 0x01]);
+        data.extend_from_slice(&[0x08, 0x00]);
+        data.push(0x06);
+        data.push(0x04);
+        data.extend_from_slice(&[0x00, 0x01]);
+        data.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        data.extend_from_slice(&[192, 168, 1, 1]);
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        data.extend_from_slice(&[192, 168, 1, 2]);
+
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        let result = process_packet(&raw_pkt, &l3, &fw, &ct, &zr);
+        match result {
+            PipelineResult::Drop { reason, icmp_reply } => {
+                assert_eq!(reason, DropReason::L3NotIpv4);
+                assert!(icmp_reply.is_none(), "no ICMP for non-IPv4");
+            }
+            other => panic!("expected Drop, got {:?}", other),
+        }
     }
 }
