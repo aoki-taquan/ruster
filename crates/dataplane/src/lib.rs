@@ -2,6 +2,7 @@ pub mod arp;
 pub mod conntrack;
 pub mod dpdk;
 pub mod firewall;
+pub mod icmp;
 pub mod io;
 pub mod l2;
 pub mod nat;
@@ -112,6 +113,19 @@ impl Dataplane {
                         if let Err(e) = io.tx(&egress_iface, raw_pkt) {
                             self.tx_errors.fetch_add(1, Ordering::Relaxed);
                             eprintln!("TX error on {}: {}", egress_iface, e);
+                        }
+                    }
+                    pipeline::PipelineResult::Drop {
+                        icmp_reply: Some(reply),
+                        ..
+                    } => {
+                        let icmp_pkt = io::RawPacket {
+                            ingress_iface: reply.egress_iface.clone(),
+                            data: reply.data,
+                        };
+                        if let Err(e) = io.tx(&reply.egress_iface, &icmp_pkt) {
+                            self.tx_errors.fetch_add(1, Ordering::Relaxed);
+                            eprintln!("TX error for ICMP reply on {}: {}", reply.egress_iface, e);
                         }
                     }
                     pipeline::PipelineResult::Drop { .. } | pipeline::PipelineResult::Consumed => {}
