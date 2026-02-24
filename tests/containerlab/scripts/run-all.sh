@@ -19,15 +19,53 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TOTAL_PASS=0
 TOTAL_FAIL=0
+TOTAL_SKIP=0
 RESULTS=""
 
 E2E_SUITES="${E2E_SUITES:-l2,l3,nat,fw}"
+
+# ── Known suites ──────────────────────────────────────
+KNOWN_SUITES=("l2" "l3" "nat" "fw")
 
 # ── Helpers ───────────────────────────────────────────
 
 suite_enabled() {
     echo ",$E2E_SUITES," | grep -q ",$1,"
 }
+
+# ── Validate E2E_SUITES ──────────────────────────────
+# Check that at least one known suite is requested.
+# This prevents typos like E2E_SUITES=l2,l33 from silently
+# running 0 suites and exiting 0.
+VALID_COUNT=0
+INVALID_NAMES=()
+IFS=',' read -ra REQUESTED_SUITES <<< "$E2E_SUITES"
+for s in "${REQUESTED_SUITES[@]}"; do
+    is_known=false
+    for k in "${KNOWN_SUITES[@]}"; do
+        if [ "$s" = "$k" ]; then
+            is_known=true
+            VALID_COUNT=$((VALID_COUNT + 1))
+            break
+        fi
+    done
+    if [ "$is_known" = false ] && [ -n "$s" ]; then
+        INVALID_NAMES+=("$s")
+    fi
+done
+
+if [ "${#INVALID_NAMES[@]}" -gt 0 ]; then
+    echo "WARNING: Unknown suite(s) in E2E_SUITES: ${INVALID_NAMES[*]}"
+    echo "         Known suites: ${KNOWN_SUITES[*]}"
+fi
+
+if [ "$VALID_COUNT" -eq 0 ]; then
+    echo ""
+    echo "ERROR: E2E_SUITES='${E2E_SUITES}' contains no valid suite names."
+    echo "       Known suites: ${KNOWN_SUITES[*]}"
+    echo "       At least one valid suite must be specified."
+    exit 1
+fi
 
 run_suite() {
     local name="$1"
@@ -80,7 +118,8 @@ suite_enabled "fw"  && run_suite "Firewall"                  "test-fw.sh"
 
 # ── Summary ───────────────────────────────────────────
 
-TOTAL=$((TOTAL_PASS + TOTAL_FAIL))
+TOTAL_RAN=$((TOTAL_PASS + TOTAL_FAIL))
+TOTAL_SKIP=$((VALID_COUNT - TOTAL_RAN))
 
 echo ""
 echo "================================================================"
@@ -88,10 +127,15 @@ echo "  E2E Test Summary"
 echo "================================================================"
 echo ""
 echo -e "$RESULTS"
-echo "Total: ${TOTAL} suites, ${TOTAL_PASS} passed, ${TOTAL_FAIL} failed"
+echo "Suites: ${TOTAL_RAN} ran (${TOTAL_PASS} passed, ${TOTAL_FAIL} failed), ${TOTAL_SKIP} skipped"
 echo ""
 
-if [ "$TOTAL_FAIL" -gt 0 ]; then
+if [ "$TOTAL_RAN" -eq 0 ]; then
+    echo "ERROR: No test suites were executed. This should not happen"
+    echo "       after validation. Check suite scripts exist."
+    echo "RESULT: FAIL"
+    exit 1
+elif [ "$TOTAL_FAIL" -gt 0 ]; then
     echo "RESULT: FAIL"
     exit 1
 else
