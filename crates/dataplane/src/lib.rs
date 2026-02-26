@@ -306,8 +306,19 @@ impl Dataplane {
                                         }
                                         continue;
                                     }
-                                    _ => {
-                                        // ARP unresolved (Drop or other) -> drop packet
+                                    arp::ArpAction::Drop => {
+                                        self.observer.inc_drop_reason(
+                                            ruster_observe::DropReason::ArpUnresolved,
+                                        );
+                                        continue;
+                                    }
+                                    arp::ArpAction::Reply { .. }
+                                    | arp::ArpAction::Update => {
+                                        // Unexpected from resolve(); log and drop.
+                                        eprintln!(
+                                            "unexpected ArpAction from resolve() for {}",
+                                            egress_iface
+                                        );
                                         self.observer.inc_drop_reason(
                                             ruster_observe::DropReason::ArpUnresolved,
                                         );
@@ -349,26 +360,6 @@ impl Dataplane {
                                     self.observer.inc_tx_drop(iface);
                                     eprintln!("TX error on {}: {}", iface, e);
                                 }
-                            }
-                        }
-                    }
-                    pipeline::PipelineResult::ArpPending {
-                        egress_iface,
-                        next_hop_ip,
-                        new_ttl,
-                        data,
-                    } => {
-                        // Enqueue the packet in the ARP hold queue.
-                        let enqueue_result = {
-                            let mut hq_guard = self.hold_queue.lock().unwrap();
-                            hq_guard.enqueue(next_hop_ip, egress_iface.clone(), data, Some(new_ttl))
-                        };
-                        match enqueue_result {
-                            arp::hold_queue::EnqueueResult::Enqueued => {
-                                self.observer.inc_arp_hold_enqueued();
-                            }
-                            _ => {
-                                self.observer.inc_arp_hold_tail_dropped();
                             }
                         }
                     }
@@ -421,70 +412,68 @@ impl Dataplane {
         };
 
         for (target_ip, egress_iface) in pending_ips {
-            let arp_result = {
-                let mut arp_guard = self.arp.lock().unwrap();
-                arp_guard.resolve(target_ip, &egress_iface)
+            // Use lookup_resolved (read-only) instead of resolve() to avoid
+            // the side effect of re-marking the entry as Pending.
+            let resolved_mac = {
+                let arp_guard = self.arp.lock().unwrap();
+                arp_guard.lookup_resolved(&target_ip, &egress_iface)
             };
 
-            match arp_result {
-                arp::ArpAction::Forward { resolved_mac } => {
-                    // ARP resolved! Flush all held packets.
-                    let held_packets = {
-                        let mut hq_guard = self.hold_queue.lock().unwrap();
-                        hq_guard.flush(&target_ip)
-                    };
-                    let flushed_count = held_packets.len() as u64;
+            if let Some(mac) = resolved_mac {
+                // ARP resolved! Flush all held packets.
+                let held_packets = {
+                    let mut hq_guard = self.hold_queue.lock().unwrap();
+                    hq_guard.flush(&target_ip)
+                };
+                let flushed_count = held_packets.len() as u64;
 
-                    for mut held in held_packets {
-                        rewrite::rewrite_dst_mac(&mut held.data, &resolved_mac);
-                        if let Some(ttl) = held.new_ttl {
-                            rewrite::rewrite_ipv4_ttl(&mut held.data, ttl);
-                        }
-                        let tx_pkt = io::RawPacket {
-                            ingress_iface: held.egress_iface.clone(),
-                            data: held.data,
-                        };
-                        match io.tx(&held.egress_iface, &tx_pkt) {
-                            Ok(()) => {
-                                self.observer
-                                    .inc_tx(&held.egress_iface, tx_pkt.data.len() as u64);
-                            }
-                            Err(e) => {
-                                self.tx_errors.fetch_add(1, Ordering::Relaxed);
-                                self.observer.inc_tx_drop(&held.egress_iface);
-                                eprintln!(
-                                    "TX error on {} (hold queue flush): {}",
-                                    held.egress_iface, e
-                                );
-                            }
-                        }
+                for mut held in held_packets {
+                    rewrite::rewrite_dst_mac(&mut held.data, &mac);
+                    if let Some(ttl) = held.new_ttl {
+                        rewrite::rewrite_ipv4_ttl(&mut held.data, ttl);
                     }
-
-                    if flushed_count > 0 {
-                        self.observer.inc_arp_hold_flushed(flushed_count);
+                    let tx_pkt = io::RawPacket {
+                        ingress_iface: held.egress_iface.clone(),
+                        data: held.data,
+                    };
+                    match io.tx(&held.egress_iface, &tx_pkt) {
+                        Ok(()) => {
+                            self.observer
+                                .inc_tx(&held.egress_iface, tx_pkt.data.len() as u64);
+                        }
+                        Err(e) => {
+                            self.tx_errors.fetch_add(1, Ordering::Relaxed);
+                            self.observer.inc_tx_drop(&held.egress_iface);
+                            eprintln!(
+                                "TX error on {} (hold queue flush): {}",
+                                held.egress_iface, e
+                            );
+                        }
                     }
                 }
-                arp::ArpAction::SendRequest {
-                    out_ifname,
-                    target_ip: tip,
-                    sender_ip,
-                    sender_mac,
-                } => {
-                    // Still unresolved; re-send ARP request (rate-limited).
-                    let should_send = {
-                        let mut arp_guard = self.arp.lock().unwrap();
-                        arp_guard.should_send_request(tip)
-                    };
-                    if should_send {
-                        let arp_pkt = arp::build_arp_request(sender_mac, sender_ip, tip);
+
+                if flushed_count > 0 {
+                    self.observer.inc_arp_hold_flushed(flushed_count);
+                }
+            } else {
+                // Still unresolved; re-send ARP request (rate-limited).
+                let (should_send, if_info) = {
+                    let mut arp_guard = self.arp.lock().unwrap();
+                    let should = arp_guard.should_send_request(target_ip);
+                    let info = arp_guard.interface_info_for_request(&egress_iface);
+                    (should, info)
+                };
+                if should_send {
+                    if let Some((sender_mac, sender_ip)) = if_info {
+                        let arp_pkt =
+                            arp::build_arp_request(sender_mac, sender_ip, target_ip);
                         let arp_raw = io::RawPacket {
-                            ingress_iface: out_ifname.clone(),
+                            ingress_iface: egress_iface.clone(),
                             data: arp_pkt,
                         };
-                        let _ = io.tx(&out_ifname, &arp_raw);
+                        let _ = io.tx(&egress_iface, &arp_raw);
                     }
                 }
-                _ => {}
             }
         }
     }

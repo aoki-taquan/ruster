@@ -320,6 +320,22 @@ impl ArpEngine {
             .sum()
     }
 
+    /// Read-only lookup: check whether an IP has been resolved (Reachable)
+    /// in the ARP cache for the given interface, without marking it Pending.
+    ///
+    /// Returns `Some(mac)` if a Reachable entry exists, `None` otherwise.
+    /// This is used by the hold-queue retry path so that checking the cache
+    /// does not have the side effect of re-marking the entry as Pending.
+    pub fn lookup_resolved(&self, ip: &[u8; 4], ifname: &str) -> Option<[u8; 6]> {
+        let cache = self.caches.get(ifname)?;
+        let entry = cache.lookup(ip)?;
+        if entry.state == ArpEntryState::Reachable {
+            Some(entry.mac)
+        } else {
+            None
+        }
+    }
+
     /// Check whether we should rate-limit an ARP request for the given IP.
     ///
     /// Returns `true` if enough time has passed since the last request
@@ -333,7 +349,21 @@ impl ArpEngine {
             }
         }
         self.last_request_time.insert(target_ip, now);
+
+        // Opportunistic cleanup: remove stale entries older than 60 seconds
+        // to prevent unbounded growth of the rate-limiting map.
+        self.cleanup_request_times(60);
+
         true
+    }
+
+    /// Remove entries from `last_request_time` that are older than
+    /// `timeout_sec` seconds. This bounds memory usage for the rate-
+    /// limiting map when many distinct IPs are resolved over time.
+    fn cleanup_request_times(&mut self, timeout_sec: u64) {
+        let now = Instant::now();
+        self.last_request_time
+            .retain(|_ip, ts| now.duration_since(*ts).as_secs() < timeout_sec);
     }
 
     /// Get the interface information needed to build an ARP request for

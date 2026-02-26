@@ -85,19 +85,6 @@ pub enum PipelineResult {
         /// packet is not itself ICMP).
         icmp_reply: Option<IcmpReply>,
     },
-    /// Packet needs ARP resolution before it can be forwarded.
-    /// The dataplane run loop should enqueue it in the ARP hold queue.
-    ArpPending {
-        /// Name of the egress interface.
-        egress_iface: String,
-        /// Next-hop IPv4 address that needs to be resolved.
-        next_hop_ip: [u8; 4],
-        /// New TTL after L3 decrement.
-        new_ttl: u8,
-        /// The partially-rewritten packet data (src MAC rewritten, dst MAC
-        /// still needs the resolved ARP entry).
-        data: Vec<u8>,
-    },
     /// Packet was consumed (e.g., ARP reply generated internally).
     Consumed,
 }
