@@ -32,6 +32,7 @@ use ruster_config::RouterConfig;
 use crate::diff;
 use crate::diff::ConfigChange;
 use crate::error::ControlError;
+use crate::transaction::{self, ConfigDiff, ConfigTransaction, TransactionState};
 
 /// Result of a `plan` operation.
 #[derive(Debug)]
@@ -79,6 +80,8 @@ pub struct ConfigStore {
     running: Option<RouterConfig>,
     /// The last committed (saved) configuration.
     committed: Option<RouterConfig>,
+    /// Snapshot of the previous running config, used for rollback.
+    rollback_snapshot: Option<RouterConfig>,
 }
 
 impl ConfigStore {
@@ -87,6 +90,7 @@ impl ConfigStore {
         Self {
             running: None,
             committed: None,
+            rollback_snapshot: None,
         }
     }
 
@@ -95,6 +99,7 @@ impl ConfigStore {
         Self {
             running: Some(config.clone()),
             committed: Some(config),
+            rollback_snapshot: None,
         }
     }
 
@@ -197,6 +202,131 @@ impl ConfigStore {
                 Ok(())
             }
             None => Err(ControlError::NothingToCommit),
+        }
+    }
+
+    // ── Transaction-based apply ──────────────────────────────────────
+
+    /// Begin a new configuration transaction.
+    ///
+    /// Creates a [`ConfigTransaction`] that captures the current running config
+    /// as a rollback snapshot. If there is no running config, a
+    /// [`ControlError::NothingToCommit`] error is returned (there must be a
+    /// baseline config to roll back to).
+    pub fn begin_transaction(&self) -> Result<ConfigTransaction, ControlError> {
+        match &self.running {
+            Some(running) => Ok(ConfigTransaction::new(running.clone())),
+            None => Err(ControlError::NothingToCommit),
+        }
+    }
+
+    /// Prepare a transaction: validate the candidate config and compute a diff.
+    ///
+    /// The transaction transitions from `Preparing` to `Validated` on success.
+    /// If validation fails, the transaction remains in `Preparing` and the
+    /// error is returned.
+    pub fn prepare(
+        &self,
+        txn: &mut ConfigTransaction,
+        new_config: RouterConfig,
+    ) -> Result<ConfigDiff, ControlError> {
+        if txn.is_consumed() {
+            return Err(ControlError::TransactionAlreadyConsumed);
+        }
+
+        // Validate the candidate through the full validation pipeline.
+        self.validate(&new_config)?;
+
+        // Compute the high-level diff.
+        let diff = transaction::compute_diff(txn.rollback_snapshot(), &new_config);
+
+        // Store the candidate and advance the state.
+        txn.set_candidate(new_config);
+        txn.mark_validated();
+
+        Ok(diff)
+    }
+
+    /// Commit a transaction: atomically apply the candidate as the new running config.
+    ///
+    /// The transaction must be in the `Validated` state. On success, the running
+    /// config is updated and the previous running config is stored as the
+    /// rollback snapshot.
+    pub fn commit_transaction(&mut self, txn: ConfigTransaction) -> Result<(), ControlError> {
+        if txn.is_consumed() {
+            return Err(ControlError::TransactionAlreadyConsumed);
+        }
+        if txn.state() != TransactionState::Validated {
+            return Err(ControlError::TransactionNotValidated);
+        }
+
+        // Save the rollback snapshot before replacing running.
+        self.rollback_snapshot = self.running.clone();
+
+        // Extract the candidate and set as new running.
+        let candidate = txn
+            .take_candidate()
+            .expect("Validated transaction must have a candidate");
+        self.running = Some(candidate);
+
+        Ok(())
+    }
+
+    /// Abort a transaction: discard the candidate without applying any changes.
+    ///
+    /// The running config is left completely unchanged.
+    pub fn abort(&self, mut txn: ConfigTransaction) -> Result<(), ControlError> {
+        if txn.is_consumed() {
+            return Err(ControlError::TransactionAlreadyConsumed);
+        }
+        txn.mark_aborted();
+        Ok(())
+    }
+
+    /// Rollback the running config to the previous snapshot.
+    ///
+    /// This reverts the running config to the state it was in before the last
+    /// `commit_transaction`. Returns an error if there is no rollback snapshot.
+    pub fn rollback(&mut self) -> Result<(), ControlError> {
+        match self.rollback_snapshot.take() {
+            Some(snapshot) => {
+                self.running = Some(snapshot);
+                Ok(())
+            }
+            None => Err(ControlError::NothingToRollback),
+        }
+    }
+
+    /// Dry-run: validate and compute a diff without modifying any state.
+    ///
+    /// This is a convenience method that validates the candidate and returns a
+    /// [`ConfigDiff`] showing what *would* change, without creating a transaction
+    /// or modifying the store.
+    pub fn dry_run(&self, new_config: &RouterConfig) -> Result<ConfigDiff, ControlError> {
+        self.validate(new_config)?;
+
+        match &self.running {
+            Some(running) => Ok(transaction::compute_diff(running, new_config)),
+            None => {
+                // No running config -- everything in the candidate is "new".
+                // Report all interfaces and routes as added.
+                Ok(ConfigDiff {
+                    added_routes: new_config
+                        .routing
+                        .ipv4_static_routes
+                        .iter()
+                        .map(|r| r.prefix.clone())
+                        .collect(),
+                    removed_routes: vec![],
+                    changed_interfaces: new_config
+                        .interfaces
+                        .iter()
+                        .map(|i| i.name.clone())
+                        .collect(),
+                    nat_changed: true,
+                    firewall_changed: true,
+                })
+            }
         }
     }
 }
