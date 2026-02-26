@@ -108,11 +108,14 @@ impl HoldQueue {
 
         let now = Instant::now();
 
-        let queue = self.queues.entry(next_hop_ip).or_insert_with(|| PerIpQueue {
-            packets: VecDeque::new(),
-            egress_iface: egress_iface.clone(),
-            first_enqueued: now,
-        });
+        let queue = self
+            .queues
+            .entry(next_hop_ip)
+            .or_insert_with(|| PerIpQueue {
+                packets: VecDeque::new(),
+                egress_iface: egress_iface.clone(),
+                first_enqueued: now,
+            });
 
         // Check per-IP limit.
         if queue.packets.len() >= self.per_ip_limit {

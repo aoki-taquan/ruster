@@ -272,8 +272,7 @@ impl Dataplane {
                                     } => {
                                         // Enqueue the packet in the ARP hold queue.
                                         let enqueue_result = {
-                                            let mut hq_guard =
-                                                self.hold_queue.lock().unwrap();
+                                            let mut hq_guard = self.hold_queue.lock().unwrap();
                                             hq_guard.enqueue(
                                                 arp_target,
                                                 egress_iface.clone(),
@@ -292,17 +291,13 @@ impl Dataplane {
 
                                         // Send ARP request (rate-limited).
                                         let should_send = {
-                                            let mut arp_guard =
-                                                self.arp.lock().unwrap();
+                                            let mut arp_guard = self.arp.lock().unwrap();
                                             arp_guard.should_send_request(target_ip)
                                         };
                                         if should_send {
-                                            let arp_pkt =
-                                                arp::build_arp_request(
-                                                    sender_mac,
-                                                    sender_ip,
-                                                    target_ip,
-                                                );
+                                            let arp_pkt = arp::build_arp_request(
+                                                sender_mac, sender_ip, target_ip,
+                                            );
                                             let arp_raw = io::RawPacket {
                                                 ingress_iface: out_ifname.clone(),
                                                 data: arp_pkt,
@@ -313,10 +308,9 @@ impl Dataplane {
                                     }
                                     _ => {
                                         // ARP unresolved (Drop or other) -> drop packet
-                                        self.observer
-                                            .inc_drop_reason(
-                                                ruster_observe::DropReason::ArpUnresolved,
-                                            );
+                                        self.observer.inc_drop_reason(
+                                            ruster_observe::DropReason::ArpUnresolved,
+                                        );
                                         continue;
                                     }
                                 }
@@ -367,12 +361,7 @@ impl Dataplane {
                         // Enqueue the packet in the ARP hold queue.
                         let enqueue_result = {
                             let mut hq_guard = self.hold_queue.lock().unwrap();
-                            hq_guard.enqueue(
-                                next_hop_ip,
-                                egress_iface.clone(),
-                                data,
-                                Some(new_ttl),
-                            )
+                            hq_guard.enqueue(next_hop_ip, egress_iface.clone(), data, Some(new_ttl))
                         };
                         match enqueue_result {
                             arp::hold_queue::EnqueueResult::Enqueued => {
@@ -457,10 +446,8 @@ impl Dataplane {
                         };
                         match io.tx(&held.egress_iface, &tx_pkt) {
                             Ok(()) => {
-                                self.observer.inc_tx(
-                                    &held.egress_iface,
-                                    tx_pkt.data.len() as u64,
-                                );
+                                self.observer
+                                    .inc_tx(&held.egress_iface, tx_pkt.data.len() as u64);
                             }
                             Err(e) => {
                                 self.tx_errors.fetch_add(1, Ordering::Relaxed);
@@ -489,8 +476,7 @@ impl Dataplane {
                         arp_guard.should_send_request(tip)
                     };
                     if should_send {
-                        let arp_pkt =
-                            arp::build_arp_request(sender_mac, sender_ip, tip);
+                        let arp_pkt = arp::build_arp_request(sender_mac, sender_ip, tip);
                         let arp_raw = io::RawPacket {
                             ingress_iface: out_ifname.clone(),
                             data: arp_pkt,

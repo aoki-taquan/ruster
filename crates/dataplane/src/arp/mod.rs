@@ -440,11 +440,7 @@ fn parse_mac(mac_str: &str) -> [u8; 6] {
 /// Returns a complete Ethernet frame (14 bytes Ethernet header + 28 bytes
 /// ARP payload = 42 bytes minimum, padded to 60 bytes for Ethernet minimum
 /// frame size).
-pub fn build_arp_request(
-    sender_mac: [u8; 6],
-    sender_ip: [u8; 4],
-    target_ip: [u8; 4],
-) -> Vec<u8> {
+pub fn build_arp_request(sender_mac: [u8; 6], sender_ip: [u8; 4], target_ip: [u8; 4]) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(60);
 
     // Ethernet header (14 bytes)
