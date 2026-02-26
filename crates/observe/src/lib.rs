@@ -117,6 +117,8 @@ pub enum DropReason {
     ArpUnresolved,
     /// Packet could not be parsed.
     ParseError,
+    /// Conntrack: session table is full.
+    ConntrackTableFull,
 }
 
 impl fmt::Display for DropReason {
@@ -130,6 +132,7 @@ impl fmt::Display for DropReason {
             DropReason::FirewallDrop => write!(f, "FW/drop"),
             DropReason::ArpUnresolved => write!(f, "ARP/unresolved"),
             DropReason::ParseError => write!(f, "parse-error"),
+            DropReason::ConntrackTableFull => write!(f, "conntrack/table-full"),
         }
     }
 }
@@ -180,6 +183,8 @@ pub struct DropCounters {
     pub arp_unresolved: AtomicU64,
     /// Packet could not be parsed.
     pub parse_error: AtomicU64,
+    /// Conntrack: session table is full.
+    pub conntrack_table_full: AtomicU64,
 }
 
 // ── ARP hold queue counters ────────────────────────────────────────────
@@ -370,6 +375,7 @@ impl Observer {
             DropReason::FirewallDrop => &self.drops.fw_drop,
             DropReason::ArpUnresolved => &self.drops.arp_unresolved,
             DropReason::ParseError => &self.drops.parse_error,
+            DropReason::ConntrackTableFull => &self.drops.conntrack_table_full,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -407,6 +413,7 @@ impl Observer {
                 fw_drop: self.drops.fw_drop.load(Ordering::Relaxed),
                 arp_unresolved: self.drops.arp_unresolved.load(Ordering::Relaxed),
                 parse_error: self.drops.parse_error.load(Ordering::Relaxed),
+                conntrack_table_full: self.drops.conntrack_table_full.load(Ordering::Relaxed),
             },
             conntrack: ConntrackSnapshot {
                 conntrack_new: self.conntrack.conntrack_new.load(Ordering::Relaxed),
@@ -512,6 +519,8 @@ pub struct DropSnapshot {
     pub arp_unresolved: u64,
     /// Parse error.
     pub parse_error: u64,
+    /// Conntrack: table full.
+    pub conntrack_table_full: u64,
 }
 
 impl fmt::Display for ObserverSnapshot {
@@ -551,6 +560,11 @@ impl fmt::Display for ObserverSnapshot {
         writeln!(f, "  FW/drop: {}", self.drops.fw_drop)?;
         writeln!(f, "  ARP/unresolved: {}", self.drops.arp_unresolved)?;
         writeln!(f, "  parse-error: {}", self.drops.parse_error)?;
+        writeln!(
+            f,
+            "  conntrack/table-full: {}",
+            self.drops.conntrack_table_full
+        )?;
         writeln!(f)?;
         writeln!(f, "--- ARP Hold Queue ---")?;
         writeln!(f, "  enqueued: {}", self.arp_hold_queue.enqueued)?;
@@ -805,6 +819,7 @@ mod tests {
         obs.inc_drop_reason(DropReason::FirewallDrop);
         obs.inc_drop_reason(DropReason::ArpUnresolved);
         obs.inc_drop_reason(DropReason::ParseError);
+        obs.inc_drop_reason(DropReason::ConntrackTableFull);
 
         assert_eq!(obs.drops.l2_no_bridge_domain.load(Ordering::Relaxed), 1);
         assert_eq!(obs.drops.l3_no_route.load(Ordering::Relaxed), 1);
@@ -814,6 +829,7 @@ mod tests {
         assert_eq!(obs.drops.fw_drop.load(Ordering::Relaxed), 1);
         assert_eq!(obs.drops.arp_unresolved.load(Ordering::Relaxed), 1);
         assert_eq!(obs.drops.parse_error.load(Ordering::Relaxed), 1);
+        assert_eq!(obs.drops.conntrack_table_full.load(Ordering::Relaxed), 1);
     }
 
     // ── snapshot ──────────────────────────────────────────────────────
@@ -921,6 +937,7 @@ mod tests {
         assert_eq!(dc.fw_drop.load(Ordering::Relaxed), 0);
         assert_eq!(dc.arp_unresolved.load(Ordering::Relaxed), 0);
         assert_eq!(dc.parse_error.load(Ordering::Relaxed), 0);
+        assert_eq!(dc.conntrack_table_full.load(Ordering::Relaxed), 0);
     }
 
     // ── Multiple increments accumulate ────────────────────────────────
@@ -967,6 +984,10 @@ mod tests {
         assert_eq!(format!("{}", DropReason::FirewallDrop), "FW/drop");
         assert_eq!(format!("{}", DropReason::ArpUnresolved), "ARP/unresolved");
         assert_eq!(format!("{}", DropReason::ParseError), "parse-error");
+        assert_eq!(
+            format!("{}", DropReason::ConntrackTableFull),
+            "conntrack/table-full"
+        );
     }
 
     // ── TableStats / TableReport Display ──────────────────────────────
@@ -1051,6 +1072,7 @@ mod tests {
         assert_eq!(snap.drops.fw_drop, 0);
         assert_eq!(snap.drops.arp_unresolved, 0);
         assert_eq!(snap.drops.parse_error, 0);
+        assert_eq!(snap.drops.conntrack_table_full, 0);
         assert_eq!(snap.interfaces.len(), 1);
         assert_eq!(snap.interfaces[0].rx_packets, 0);
         assert_eq!(snap.interfaces[0].tx_packets, 0);

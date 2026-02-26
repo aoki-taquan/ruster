@@ -107,6 +107,8 @@ pub enum DropReason {
     FirewallDrop,
     /// NAT engine dropped the packet.
     NatDrop,
+    /// Conntrack session table is full.
+    ConntrackTableFull,
 }
 
 // ── Pipeline function ───────────────────────────────────────────────
@@ -220,7 +222,7 @@ pub fn process_packet(
     // If the session table is full, drop the packet immediately.
     if ct_result == ConntrackResult::TableFull {
         return PipelineResult::Drop {
-            reason: DropReason::NatDrop,
+            reason: DropReason::ConntrackTableFull,
             icmp_reply: None,
         };
     }
@@ -1796,11 +1798,11 @@ mod tests {
             matches!(
                 result2,
                 PipelineResult::Drop {
-                    reason: DropReason::NatDrop,
+                    reason: DropReason::ConntrackTableFull,
                     ..
                 }
             ),
-            "expected Drop(NatDrop) when table is full, got {:?}",
+            "expected Drop(ConntrackTableFull) when table is full, got {:?}",
             result2
         );
     }

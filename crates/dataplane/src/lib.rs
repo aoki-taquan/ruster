@@ -218,6 +218,13 @@ impl Dataplane {
                 self.observer
                     .inc_rx(&raw_pkt.ingress_iface, raw_pkt.data.len() as u64);
 
+                // TODO(#149): Per-packet conntrack counters (inc_conntrack_new,
+                // inc_conntrack_established) are not wired yet because
+                // ConntrackResult is internal to process_packet. To wire
+                // them, propagate ConntrackResult out of PipelineResult or
+                // pass an observer reference into the pipeline. For now,
+                // only conntrack_table_full (via DropReason) and
+                // conntrack_expired (via GC) are tracked.
                 let result = {
                     let mut l2_guard = self.l2.lock().unwrap();
                     let mut ct_guard = self.conntrack.lock().unwrap();
@@ -386,6 +393,9 @@ impl Dataplane {
                     } => {
                         let obs_reason = map_pipeline_drop_to_observe(reason);
                         self.observer.inc_drop_reason(obs_reason);
+                        if reason == pipeline::DropReason::ConntrackTableFull {
+                            self.observer.inc_conntrack_table_full();
+                        }
                         let icmp_pkt = io::RawPacket {
                             ingress_iface: reply.egress_iface.clone(),
                             data: reply.data,
@@ -398,6 +408,10 @@ impl Dataplane {
                     pipeline::PipelineResult::Drop { reason, .. } => {
                         let obs_reason = map_pipeline_drop_to_observe(reason);
                         self.observer.inc_drop_reason(obs_reason);
+                        // Wire conntrack table-full counter.
+                        if reason == pipeline::DropReason::ConntrackTableFull {
+                            self.observer.inc_conntrack_table_full();
+                        }
                     }
                     pipeline::PipelineResult::Consumed => {
                         self.observer.inc_local_delivery();
@@ -530,6 +544,7 @@ fn map_pipeline_drop_to_observe(reason: pipeline::DropReason) -> ruster_observe:
         pipeline::DropReason::L3NotIpv4 => ruster_observe::DropReason::L3NotIpv4,
         pipeline::DropReason::FirewallDrop => ruster_observe::DropReason::FirewallDrop,
         pipeline::DropReason::NatDrop => ruster_observe::DropReason::NatTableFull,
+        pipeline::DropReason::ConntrackTableFull => ruster_observe::DropReason::ConntrackTableFull,
     }
 }
 
@@ -1062,5 +1077,9 @@ mod tests {
             OD::FirewallDrop
         );
         assert_eq!(map_pipeline_drop_to_observe(PD::NatDrop), OD::NatTableFull);
+        assert_eq!(
+            map_pipeline_drop_to_observe(PD::ConntrackTableFull),
+            OD::ConntrackTableFull
+        );
     }
 }
