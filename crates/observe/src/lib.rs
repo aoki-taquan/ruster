@@ -202,6 +202,21 @@ pub struct ArpHoldQueueCounters {
 
 // ── Observer ──────────────────────────────────────────────────────────
 
+/// Conntrack-specific counters.
+///
+/// Tracks session lifecycle events for the connection tracking engine.
+#[derive(Debug, Default)]
+pub struct ConntrackCounters {
+    /// Sessions created (new flow detected).
+    pub conntrack_new: AtomicU64,
+    /// Sessions transitioned to established state.
+    pub conntrack_established: AtomicU64,
+    /// Sessions removed by garbage collection (timeout).
+    pub conntrack_expired: AtomicU64,
+    /// Session creation failures due to table full.
+    pub conntrack_table_full: AtomicU64,
+}
+
 /// The main observability hub.
 ///
 /// Aggregates per-interface counters, global drop reason counters, and
@@ -213,6 +228,8 @@ pub struct Observer {
     pub interfaces: HashMap<String, InterfaceCounters>,
     /// Global drop reason counters.
     pub drops: DropCounters,
+    /// Conntrack lifecycle counters.
+    pub conntrack: ConntrackCounters,
     /// Total packets forwarded (L3 forward decision completed).
     pub forwarded: AtomicU64,
     /// Total packets delivered locally (destination is one of our IPs).
@@ -235,6 +252,7 @@ impl Observer {
         Self {
             interfaces,
             drops: DropCounters::default(),
+            conntrack: ConntrackCounters::default(),
             forwarded: AtomicU64::new(0),
             local_delivery: AtomicU64::new(0),
             arp_hold_queue: ArpHoldQueueCounters::default(),
@@ -313,6 +331,32 @@ impl Observer {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment the conntrack new session counter.
+    pub fn inc_conntrack_new(&self) {
+        self.conntrack.conntrack_new.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the conntrack established session counter.
+    pub fn inc_conntrack_established(&self) {
+        self.conntrack
+            .conntrack_established
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the conntrack expired session counter by the given amount.
+    pub fn add_conntrack_expired(&self, count: u64) {
+        self.conntrack
+            .conntrack_expired
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Increment the conntrack table full counter.
+    pub fn inc_conntrack_table_full(&self) {
+        self.conntrack
+            .conntrack_table_full
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Increment the appropriate drop reason counter for the given reason.
     ///
     /// Dispatches to the correct field in [`DropCounters`].
@@ -364,6 +408,18 @@ impl Observer {
                 arp_unresolved: self.drops.arp_unresolved.load(Ordering::Relaxed),
                 parse_error: self.drops.parse_error.load(Ordering::Relaxed),
             },
+            conntrack: ConntrackSnapshot {
+                conntrack_new: self.conntrack.conntrack_new.load(Ordering::Relaxed),
+                conntrack_established: self
+                    .conntrack
+                    .conntrack_established
+                    .load(Ordering::Relaxed),
+                conntrack_expired: self.conntrack.conntrack_expired.load(Ordering::Relaxed),
+                conntrack_table_full: self
+                    .conntrack
+                    .conntrack_table_full
+                    .load(Ordering::Relaxed),
+            },
             forwarded: self.forwarded.load(Ordering::Relaxed),
             local_delivery: self.local_delivery.load(Ordering::Relaxed),
             arp_hold_queue: ArpHoldQueueSnapshot {
@@ -378,6 +434,19 @@ impl Observer {
 
 // ── Snapshot types (non-atomic, for display) ──────────────────────────
 
+/// Conntrack counter snapshot.
+#[derive(Debug, Clone)]
+pub struct ConntrackSnapshot {
+    /// New sessions created.
+    pub conntrack_new: u64,
+    /// Sessions transitioned to established.
+    pub conntrack_established: u64,
+    /// Sessions expired by GC.
+    pub conntrack_expired: u64,
+    /// Session creation failures (table full).
+    pub conntrack_table_full: u64,
+}
+
 /// Immutable snapshot of all observer counters.
 ///
 /// Produced by [`Observer::snapshot`]. Implements [`fmt::Display`] for
@@ -388,6 +457,8 @@ pub struct ObserverSnapshot {
     pub interfaces: Vec<InterfaceSnapshot>,
     /// Drop reason counter snapshot.
     pub drops: DropSnapshot,
+    /// Conntrack counter snapshot.
+    pub conntrack: ConntrackSnapshot,
     /// Total forwarded packets.
     pub forwarded: u64,
     /// Total locally delivered packets.
@@ -491,7 +562,13 @@ impl fmt::Display for ObserverSnapshot {
         writeln!(f, "  enqueued: {}", self.arp_hold_queue.enqueued)?;
         writeln!(f, "  flushed: {}", self.arp_hold_queue.flushed)?;
         writeln!(f, "  gc-dropped: {}", self.arp_hold_queue.gc_dropped)?;
-        write!(f, "  tail-dropped: {}", self.arp_hold_queue.tail_dropped)?;
+        writeln!(f, "  tail-dropped: {}", self.arp_hold_queue.tail_dropped)?;
+        writeln!(f)?;
+        writeln!(f, "--- Conntrack ---")?;
+        writeln!(f, "  new: {}", self.conntrack.conntrack_new)?;
+        writeln!(f, "  established: {}", self.conntrack.conntrack_established)?;
+        writeln!(f, "  expired: {}", self.conntrack.conntrack_expired)?;
+        write!(f, "  table-full: {}", self.conntrack.conntrack_table_full)?;
         Ok(())
     }
 }
@@ -987,6 +1064,10 @@ mod tests {
         assert_eq!(snap.arp_hold_queue.flushed, 0);
         assert_eq!(snap.arp_hold_queue.gc_dropped, 0);
         assert_eq!(snap.arp_hold_queue.tail_dropped, 0);
+        assert_eq!(snap.conntrack.conntrack_new, 0);
+        assert_eq!(snap.conntrack.conntrack_established, 0);
+        assert_eq!(snap.conntrack.conntrack_expired, 0);
+        assert_eq!(snap.conntrack.conntrack_table_full, 0);
     }
 
     // ── ARP hold queue counter tests ─────────────────────────────────
@@ -1023,5 +1104,23 @@ mod tests {
         assert!(output.contains("flushed: 1"));
         assert!(output.contains("gc-dropped: 0"));
         assert!(output.contains("tail-dropped: 0"));
+    }
+
+    #[test]
+    fn observer_snapshot_display_contains_conntrack() {
+        let obs = Observer::new(&[]);
+        obs.inc_conntrack_new();
+        obs.inc_conntrack_established();
+        obs.add_conntrack_expired(10);
+        obs.inc_conntrack_table_full();
+
+        let snap = obs.snapshot();
+        let output = format!("{snap}");
+
+        assert!(output.contains("--- Conntrack ---"));
+        assert!(output.contains("new: 1"));
+        assert!(output.contains("established: 1"));
+        assert!(output.contains("expired: 10"));
+        assert!(output.contains("table-full: 1"));
     }
 }

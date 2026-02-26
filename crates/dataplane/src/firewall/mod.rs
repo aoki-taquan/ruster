@@ -62,17 +62,21 @@ impl FwContext {
     /// Build a firewall context from a parsed packet, chain, interface zones,
     /// and the conntrack engine.
     ///
-    /// - `meta`: parsed packet metadata
-    /// - `chain`: which firewall chain to evaluate
-    /// - `in_zone`: zone of the ingress interface
-    /// - `out_zone`: zone of the egress interface
-    /// - `conntrack`: the conntrack engine for session lookup
+    /// The `is_new_session` flag indicates whether the conntrack pipeline
+    /// stage just created a new session for this packet (true) or the
+    /// packet matched an existing session (false). Untracked packets
+    /// (non-IPv4, no L4) should pass `true`.
+    ///
+    /// This flag is necessary because the pipeline creates conntrack
+    /// sessions *before* the firewall evaluation. Without it, a
+    /// just-created session would appear "established" to the firewall.
     pub fn from_packet(
         meta: &PacketMeta,
         chain: FwChain,
         in_zone: FirewallZone,
         out_zone: FirewallZone,
         conntrack: &ConntrackEngine,
+        is_new_session: bool,
     ) -> Self {
         // Extract L4 protocol.
         let proto = match &meta.l4 {
@@ -83,13 +87,30 @@ impl FwContext {
         };
 
         // Determine connection state from conntrack.
-        let (is_established, is_new) = match SessionKey::from_packet(meta) {
-            Some(key) => {
-                let has_session = conntrack.lookup(&key).is_some();
-                (has_session, !has_session)
+        //
+        // If the pipeline tells us this is a new session, the packet is
+        // "new" for firewall purposes. Otherwise (existing or untracked
+        // that matched reverse), it is "established".
+        let (is_established, is_new) = if is_new_session {
+            (false, true)
+        } else {
+            // Packet matched an existing session (forward or reverse).
+            // Verify via conntrack lookup.
+            match SessionKey::from_packet(meta) {
+                Some(key) => {
+                    let reverse_key = key.reverse();
+                    let has_forward = conntrack.lookup(&key).is_some();
+                    let has_reverse = conntrack.lookup(&reverse_key).is_some();
+                    if has_forward || has_reverse {
+                        (true, false)
+                    } else {
+                        // Should not happen if pipeline is correct, but
+                        // treat as new as a safe fallback.
+                        (false, true)
+                    }
+                }
+                None => (false, true),
             }
-            // Non-trackable packets (no IPv4 or no L4) are treated as new.
-            None => (false, true),
         };
 
         Self {
@@ -1126,6 +1147,7 @@ mod tests {
             FirewallZone::Lan,
             FirewallZone::Wan,
             &conntrack,
+            true, // new session
         );
 
         assert_eq!(ctx.chain, FwChain::Forward);
@@ -1147,6 +1169,7 @@ mod tests {
             FirewallZone::Wan,
             FirewallZone::Any,
             &conntrack,
+            true, // new session
         );
 
         assert_eq!(ctx.proto, FwProto::Udp);
@@ -1165,6 +1188,7 @@ mod tests {
             FirewallZone::Lan,
             FirewallZone::Any,
             &conntrack,
+            true, // new session
         );
 
         assert_eq!(ctx.proto, FwProto::Icmp);
@@ -1182,6 +1206,7 @@ mod tests {
             FirewallZone::Wan,
             FirewallZone::Any,
             &conntrack,
+            true, // untracked -> new
         );
 
         assert_eq!(ctx.proto, FwProto::Other);
@@ -1215,6 +1240,7 @@ mod tests {
             FirewallZone::Lan,
             FirewallZone::Wan,
             &conntrack,
+            false, // existing session
         );
 
         assert!(ctx.is_established);

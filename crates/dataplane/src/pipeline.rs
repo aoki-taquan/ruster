@@ -13,14 +13,15 @@
 
 use std::collections::HashMap;
 
-use crate::conntrack::ConntrackEngine;
+use crate::conntrack::session::{SessionKey, SessionState, TcpState};
+use crate::conntrack::{ConntrackEngine, ConntrackError};
 use crate::firewall::{FirewallEngine, FwChain, FwContext, FwVerdict};
 use crate::icmp::{self, IcmpReply};
 use crate::io::RawPacket;
 use crate::l2::bridge::L2Decision;
 use crate::l2::L2Engine;
 use crate::packet;
-use crate::packet::L3Info;
+use crate::packet::{L3Info, L4Info};
 use crate::routing::{L3Decision, L3DropReason, L3Engine};
 
 use ruster_config::model::{FirewallZone, InterfaceConfig, InterfaceZone};
@@ -110,23 +111,43 @@ pub enum DropReason {
 
 // ── Pipeline function ───────────────────────────────────────────────
 
+/// Result of a conntrack lookup/create attempt for the pipeline.
+///
+/// Used internally by [`process_packet`] to communicate conntrack
+/// state to downstream stages (firewall, NAT).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConntrackResult {
+    /// Existing session matched (forward or reverse direction).
+    Existing,
+    /// New session was created.
+    Created,
+    /// Session table is full; the packet should be dropped.
+    TableFull,
+    /// Packet is not trackable (non-IPv4 or no L4 header).
+    Untracked,
+}
+
 /// Process a single raw packet through the forwarding pipeline.
 ///
-/// The v0.1 flow is:
+/// The processing flow is:
 /// 1. Parse the raw bytes into a [`PacketMeta`](packet::PacketMeta).
 /// 2. If parsing fails, return `Drop(ParseError)`.
 /// 3. **L2 check**: if the ingress interface belongs to a bridge domain:
 ///    a. Learn source MAC (FDB update).
 ///    b. If the destination IP is one of the router's local IPs,
-///    fall through to L3 processing.
+///       fall through to L3 processing.
 ///    c. Otherwise, make an L2 forwarding decision:
-///    Known unicast -> `Forward` to the learned port.
-///    Unknown unicast / broadcast -> `Flood` to all bridge domain
-///    ports except ingress.
-///    Same-port drop -> `Drop(L2Drop)`.
+///       Known unicast -> `Forward` to the learned port.
+///       Unknown unicast / broadcast -> `Flood` to all bridge domain
+///       ports except ingress.
+///       Same-port drop -> `Drop(L2Drop)`.
 /// 4. If the interface is **not** in a bridge domain, proceed to L3.
-/// 5. Check L3 routing via [`L3Engine::process`].
-/// 6. Based on the L3 decision:
+/// 5. **Conntrack lookup/create**: for every trackable packet, look up
+///    both forward and reverse session keys. Create a new session for
+///    new flows; update TCP state and refresh timestamps for existing
+///    sessions.
+/// 6. Check L3 routing via [`L3Engine::process`].
+/// 7. Based on the L3 decision:
 ///    - `Forward { .. }` -> check firewall -> `Forward` or `Drop(FirewallDrop)`.
 ///    - `LocalDelivery` -> `Consumed`.
 ///    - `Drop(reason)` -> `Drop` with a mapped reason.
@@ -135,7 +156,7 @@ pub fn process_packet(
     l2: &mut L2Engine,
     l3: &L3Engine,
     firewall: &FirewallEngine,
-    conntrack: &ConntrackEngine,
+    conntrack: &mut ConntrackEngine,
     zone_resolver: &ZoneResolver,
     iface_macs: &std::collections::HashMap<String, [u8; 6]>,
 ) -> PipelineResult {
@@ -188,7 +209,23 @@ pub fn process_packet(
         // else: packet is for our local IP -> fall through to L3.
     }
 
-    // Step 3: L3 routing decision.
+    // Step 3: Conntrack lookup/create.
+    //
+    // For every trackable packet (IPv4 with TCP/UDP/ICMP L4 header),
+    // perform a session lookup. If a forward or reverse session exists,
+    // update its state and refresh the timestamp. Otherwise, create a
+    // new session for the flow.
+    let ct_result = conntrack_process(&meta, conntrack);
+
+    // If the session table is full, drop the packet immediately.
+    if ct_result == ConntrackResult::TableFull {
+        return PipelineResult::Drop {
+            reason: DropReason::NatDrop,
+            icmp_reply: None,
+        };
+    }
+
+    // Step 4: L3 routing decision.
     let l3_decision = l3.process(&meta);
 
     match l3_decision {
@@ -197,11 +234,21 @@ pub fn process_packet(
             next_hop,
             new_ttl,
         } => {
-            // Step 4: Firewall check on the forward chain.
+            // Step 5: Firewall check on the forward chain.
             let src_zone = zone_resolver.resolve(&raw_pkt.ingress_iface);
             let dst_zone = zone_resolver.resolve(&out_ifname);
-            let fw_ctx =
-                FwContext::from_packet(&meta, FwChain::Forward, src_zone, dst_zone, conntrack);
+            let is_new_session = matches!(
+                ct_result,
+                ConntrackResult::Created | ConntrackResult::Untracked
+            );
+            let fw_ctx = FwContext::from_packet(
+                &meta,
+                FwChain::Forward,
+                src_zone,
+                dst_zone,
+                conntrack,
+                is_new_session,
+            );
             let verdict = firewall.evaluate(&fw_ctx);
 
             match verdict {
@@ -250,6 +297,66 @@ pub fn process_packet(
                 icmp_reply,
             }
         }
+    }
+}
+
+/// Perform conntrack lookup/create/update for a single packet.
+///
+/// This is called on every packet entering the L3 processing path.
+/// The logic:
+/// 1. Extract a session key from the packet. If the packet is not
+///    trackable (non-IPv4, no L4 header), return `Untracked`.
+/// 2. Look up the forward key. If found, update TCP state and touch.
+/// 3. Look up the reverse key. If found, update TCP state and touch.
+/// 4. If neither direction is found, create a new session with the
+///    appropriate initial state.
+/// 5. If the table is full, return `TableFull`.
+fn conntrack_process(
+    meta: &packet::PacketMeta,
+    conntrack: &mut ConntrackEngine,
+) -> ConntrackResult {
+    let forward_key = match SessionKey::from_packet(meta) {
+        Some(k) => k,
+        None => return ConntrackResult::Untracked,
+    };
+
+    let reverse_key = forward_key.reverse();
+
+    // Check forward direction.
+    if conntrack.lookup(&forward_key).is_some() {
+        // Update TCP state machine if applicable.
+        if let Some(L4Info::Tcp(tcp)) = &meta.l4 {
+            conntrack.update_tcp_state(&forward_key, tcp.flags);
+        }
+        conntrack.touch(&forward_key);
+        return ConntrackResult::Existing;
+    }
+
+    // Check reverse direction (return traffic).
+    if conntrack.lookup(&reverse_key).is_some() {
+        // Update TCP state machine on the original session.
+        if let Some(L4Info::Tcp(tcp)) = &meta.l4 {
+            conntrack.update_tcp_state(&reverse_key, tcp.flags);
+        }
+        conntrack.touch(&reverse_key);
+        return ConntrackResult::Existing;
+    }
+
+    // New flow: create a session.
+    let state = initial_session_state(meta);
+    match conntrack.create_session(forward_key, state) {
+        Ok(_) => ConntrackResult::Created,
+        Err(ConntrackError::TableFull) => ConntrackResult::TableFull,
+    }
+}
+
+/// Determine the initial session state from packet metadata.
+fn initial_session_state(meta: &packet::PacketMeta) -> SessionState {
+    match &meta.l4 {
+        Some(L4Info::Tcp(_)) => SessionState::Tcp(TcpState::SynSent),
+        Some(L4Info::Udp(_)) => SessionState::Udp,
+        Some(L4Info::Icmp(_)) => SessionState::Icmp,
+        None => SessionState::Udp, // fallback, should not happen for tracked packets
     }
 }
 
@@ -446,7 +553,7 @@ mod tests {
     fn forward_routed_packet() {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
 
         // Packet from LAN to internet (8.8.8.8) -> default route via wan0.
         let data = make_ipv4_packet(
@@ -464,7 +571,7 @@ mod tests {
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         match result {
             PipelineResult::Forward { egress_iface, .. } => {
                 assert_eq!(egress_iface, "wan0");
@@ -477,7 +584,7 @@ mod tests {
     fn drop_parse_error_too_short() {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
 
         // Packet too short to parse (< 14 bytes).
         let raw_pkt = RawPacket {
@@ -488,7 +595,7 @@ mod tests {
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::ParseError);
@@ -510,7 +617,7 @@ mod tests {
         };
         let l3 = L3Engine::from_config(&routing, &make_interfaces()).unwrap();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
 
         // Destination 8.8.8.8 has no matching route.
         let data = make_ipv4_packet(
@@ -528,7 +635,7 @@ mod tests {
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3NoRoute);
@@ -541,7 +648,7 @@ mod tests {
     fn drop_ttl_expired() {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
 
         // TTL = 1 -> after decrement would be 0, so L3 engine drops.
         let data = make_ipv4_packet(
@@ -559,7 +666,7 @@ mod tests {
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -572,7 +679,7 @@ mod tests {
     fn consumed_local_delivery() {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
 
         // Destination is our local IP (10.0.0.2) -> LocalDelivery -> Consumed.
         let data = make_ipv4_packet(
@@ -590,7 +697,7 @@ mod tests {
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         assert!(matches!(result, PipelineResult::Consumed));
     }
 
@@ -598,7 +705,7 @@ mod tests {
     fn drop_firewall_blocks() {
         let l3 = make_l3_engine();
         let fw = make_fw_drop_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
 
         // Packet should be routed, but firewall drops everything.
         let data = make_ipv4_packet(
@@ -616,7 +723,7 @@ mod tests {
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -629,7 +736,7 @@ mod tests {
     fn drop_not_ipv4() {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
 
         // ARP packet -> L3 engine returns Drop(NotIpv4).
         let mut data = Vec::new();
@@ -656,7 +763,7 @@ mod tests {
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3NotIpv4);
@@ -671,7 +778,7 @@ mod tests {
         // accumulate per-reason drop counters.
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
@@ -685,7 +792,7 @@ mod tests {
             ingress_iface: "eth0".to_string(),
             data: vec![0x00; 5],
         };
-        match process_packet(&short_pkt, &mut l2, &l3, &fw, &ct, &zr, &im) {
+        match process_packet(&short_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im) {
             PipelineResult::Drop {
                 reason: DropReason::ParseError,
                 ..
@@ -699,7 +806,7 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: ttl_data,
         };
-        match process_packet(&ttl_pkt, &mut l2, &l3, &fw, &ct, &zr, &im) {
+        match process_packet(&ttl_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im) {
             PipelineResult::Drop {
                 reason: DropReason::L3TtlExpired,
                 ..
@@ -713,7 +820,7 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: fwd_data,
         };
-        match process_packet(&fwd_pkt, &mut l2, &l3, &fw, &ct, &zr, &im) {
+        match process_packet(&fwd_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im) {
             PipelineResult::Forward { .. } => forwards += 1,
             _ => {}
         }
@@ -734,7 +841,7 @@ mod tests {
         use ruster_config::model::{Chain, ConnState, FirewallRule, RuleAction, RuleProto};
 
         let l3 = make_l3_engine();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
 
@@ -770,7 +877,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         match result {
             PipelineResult::Forward { egress_iface, .. } => {
                 assert_eq!(egress_iface, "wan0");
@@ -791,7 +898,7 @@ mod tests {
         use ruster_config::model::{Chain, ConnState, FirewallRule, RuleAction, RuleProto};
 
         let l3 = make_l3_engine();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
 
@@ -828,7 +935,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -854,7 +961,7 @@ mod tests {
     fn ttl_expired_generates_icmp_reply() {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
 
@@ -872,7 +979,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -905,7 +1012,7 @@ mod tests {
         };
         let l3 = L3Engine::from_config(&routing, &make_interfaces()).unwrap();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
 
@@ -923,7 +1030,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3NoRoute);
@@ -943,7 +1050,7 @@ mod tests {
     fn no_icmp_for_icmp_packets() {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
 
@@ -982,7 +1089,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -999,7 +1106,7 @@ mod tests {
     fn parse_error_no_icmp() {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
 
@@ -1009,7 +1116,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::ParseError);
@@ -1023,7 +1130,7 @@ mod tests {
     fn firewall_drop_no_icmp() {
         let l3 = make_l3_engine();
         let fw = make_fw_drop_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
 
@@ -1040,7 +1147,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -1054,7 +1161,7 @@ mod tests {
     fn not_ipv4_no_icmp() {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
 
@@ -1079,7 +1186,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3NotIpv4);
@@ -1197,7 +1304,7 @@ mod tests {
         let mut l2 = make_l2_engine_bridged();
         let l3 = make_l3_engine_with_bridge_ifaces();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = ZoneResolver::from_config(&[]);
         let im = std::collections::HashMap::new();
 
@@ -1209,7 +1316,7 @@ mod tests {
             [192, 168, 1, 50],
             [192, 168, 1, 60],
         );
-        let _ = process_packet(&learn_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let _ = process_packet(&learn_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
 
         // Step 2: Send from MAC_HOST_A on eth0 to MAC_HOST_B -> unicast to eth1.
         let pkt = make_l2_raw_packet(
@@ -1219,7 +1326,7 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 50],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
 
         match result {
             PipelineResult::Forward { egress_iface, .. } => {
@@ -1235,7 +1342,7 @@ mod tests {
         let mut l2 = make_l2_engine_bridged();
         let l3 = make_l3_engine_with_bridge_ifaces();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = ZoneResolver::from_config(&[]);
         let im = std::collections::HashMap::new();
 
@@ -1246,7 +1353,7 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 50],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
 
         match result {
             PipelineResult::Flood { egress_ifaces } => {
@@ -1268,7 +1375,7 @@ mod tests {
         let mut l2 = make_l2_engine_bridged();
         let l3 = make_l3_engine_with_bridge_ifaces();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = ZoneResolver::from_config(&[]);
         let im = std::collections::HashMap::new();
 
@@ -1279,7 +1386,7 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 255],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
 
         match result {
             PipelineResult::Flood { egress_ifaces } => {
@@ -1303,7 +1410,7 @@ mod tests {
         let mut l2 = make_l2_engine_bridged();
         let l3 = make_l3_engine_with_bridge_ifaces();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = ZoneResolver::from_config(&[]);
         let im = std::collections::HashMap::new();
 
@@ -1315,7 +1422,7 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 50],
         );
-        let _ = process_packet(&learn_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let _ = process_packet(&learn_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
 
         // Step 2: Send to MAC_HOST_A from eth1 -> should unicast to eth0.
         let pkt = make_l2_raw_packet(
@@ -1325,7 +1432,7 @@ mod tests {
             [192, 168, 1, 50],
             [192, 168, 1, 60],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
 
         match result {
             PipelineResult::Forward { egress_iface, .. } => {
@@ -1343,7 +1450,7 @@ mod tests {
         let mut l2 = make_l2_engine_bridged();
         let l3 = make_l3_engine_with_bridge_ifaces();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = ZoneResolver::from_config(&[]);
         let im = std::collections::HashMap::new();
 
@@ -1354,7 +1461,7 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 1],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
 
         // The packet's dst IP (192.168.1.1) is a local IP on eth0,
         // so L3 should handle it as LocalDelivery -> Consumed.
@@ -1372,7 +1479,7 @@ mod tests {
         let mut l2 = make_l2_engine_bridged(); // br0: eth0, eth1, eth2
         let l3 = make_l3_engine_with_bridge_ifaces();
         let fw = make_fw_accept_all();
-        let ct = make_conntrack();
+        let mut ct = make_conntrack();
         let zr = ZoneResolver::from_config(&[]);
         let im = std::collections::HashMap::new();
 
@@ -1384,12 +1491,418 @@ mod tests {
             [10, 0, 0, 5],
             [192, 168, 1, 1], // local IP -> Consumed
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
 
         assert!(
             matches!(result, PipelineResult::Consumed),
             "expected Consumed (L3 local delivery), got {:?}",
             result
         );
+    }
+
+    // ── Conntrack integration tests ─────────────────────────────────
+
+    /// Build a valid Ethernet + IPv4 + TCP packet with specified flags.
+    fn make_tcp_packet(
+        src_mac: [u8; 6],
+        dst_mac: [u8; 6],
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        tcp_flags: u8,
+        ttl: u8,
+    ) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        // Ethernet header (14 bytes)
+        pkt.extend_from_slice(&dst_mac);
+        pkt.extend_from_slice(&src_mac);
+        pkt.extend_from_slice(&[0x08, 0x00]); // EtherType IPv4
+
+        // IPv4 header (20 bytes)
+        let ipv4_start = pkt.len();
+        pkt.push(0x45); // version=4, IHL=5
+        pkt.push(0x00); // DSCP/ECN
+        let total_len: u16 = 20 + 20; // IP header + TCP header
+        pkt.extend_from_slice(&total_len.to_be_bytes());
+        pkt.extend_from_slice(&[0x00, 0x00]); // identification
+        pkt.extend_from_slice(&[0x00, 0x00]); // flags/fragment
+        pkt.push(ttl);
+        pkt.push(6); // protocol: TCP
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+        pkt.extend_from_slice(&src_ip);
+        pkt.extend_from_slice(&dst_ip);
+
+        // Compute IPv4 checksum.
+        set_ipv4_checksum(&mut pkt[ipv4_start..ipv4_start + 20]);
+
+        // TCP header (20 bytes minimum)
+        pkt.extend_from_slice(&src_port.to_be_bytes());
+        pkt.extend_from_slice(&dst_port.to_be_bytes());
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // seq
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // ack
+        pkt.push(0x50); // data offset = 5 (20 bytes), reserved bits
+        pkt.push(tcp_flags);
+        pkt.extend_from_slice(&[0xFF, 0xFF]); // window
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum
+        pkt.extend_from_slice(&[0x00, 0x00]); // urgent pointer
+        pkt
+    }
+
+    #[test]
+    fn conntrack_creates_session_for_new_flow() {
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let mut ct = make_conntrack();
+        let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+
+        assert_eq!(ct.session_count(), 0);
+
+        // Send a UDP packet from LAN to WAN.
+        let data = make_ipv4_packet(
+            [0xAA; 6],
+            [0xBB; 6],
+            [192, 168, 1, 100],
+            [8, 8, 8, 8],
+            64,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
+        assert!(matches!(result, PipelineResult::Forward { .. }));
+
+        // A conntrack session should have been created.
+        assert_eq!(ct.session_count(), 1);
+    }
+
+    #[test]
+    fn conntrack_reuses_session_for_same_flow() {
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let mut ct = make_conntrack();
+        let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+
+        let data = make_ipv4_packet(
+            [0xAA; 6],
+            [0xBB; 6],
+            [192, 168, 1, 100],
+            [8, 8, 8, 8],
+            64,
+        );
+
+        // Send the same packet twice.
+        let pkt1 = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data: data.clone(),
+        };
+        let _ = process_packet(&pkt1, &mut l2, &l3, &fw, &mut ct, &zr, &im);
+        assert_eq!(ct.session_count(), 1);
+
+        let pkt2 = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+        let _ = process_packet(&pkt2, &mut l2, &l3, &fw, &mut ct, &zr, &im);
+        // Should still be 1 session (reused).
+        assert_eq!(ct.session_count(), 1);
+    }
+
+    #[test]
+    fn conntrack_matches_reverse_direction() {
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let mut ct = make_conntrack();
+        let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+
+        // SYN: LAN 192.168.1.100:49152 -> WAN 8.8.8.8:80
+        let syn_data = make_tcp_packet(
+            [0xAA; 6],
+            [0xBB; 6],
+            [192, 168, 1, 100],
+            [8, 8, 8, 8],
+            49152,
+            80,
+            0x02, // SYN
+            64,
+        );
+        let syn_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data: syn_data,
+        };
+        let _ = process_packet(&syn_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
+        assert_eq!(ct.session_count(), 1);
+
+        // SYN-ACK: WAN 8.8.8.8:80 -> LAN 192.168.1.100:49152
+        // This is the reverse direction.
+        let synack_data = make_tcp_packet(
+            [0xBB; 6],
+            [0xAA; 6],
+            [8, 8, 8, 8],
+            [192, 168, 1, 100],
+            80,
+            49152,
+            0x12, // SYN+ACK
+            64,
+        );
+        let synack_pkt = RawPacket {
+            ingress_iface: "wan0".to_string(),
+            data: synack_data,
+        };
+        let _ = process_packet(&synack_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
+
+        // Should still be 1 session (reverse matched the existing one).
+        assert_eq!(ct.session_count(), 1);
+    }
+
+    #[test]
+    fn conntrack_tcp_lifecycle_syn_established_fin() {
+        use crate::conntrack::session::{SessionKey, SessionProto, SessionState, TcpState};
+
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let mut ct = make_conntrack();
+        let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+
+        let src_ip = [192, 168, 1, 100];
+        let dst_ip = [8, 8, 8, 8];
+        let src_port = 49152u16;
+        let dst_port = 80u16;
+
+        // Step 1: SYN
+        let syn = make_tcp_packet([0xAA; 6], [0xBB; 6], src_ip, dst_ip, src_port, dst_port, 0x02, 64);
+        let _ = process_packet(
+            &RawPacket { ingress_iface: "lan0".to_string(), data: syn },
+            &mut l2, &l3, &fw, &mut ct, &zr, &im,
+        );
+
+        let key = SessionKey {
+            src_ip,
+            dst_ip,
+            proto: SessionProto::Tcp { src_port, dst_port },
+        };
+        let session = ct.lookup(&key).expect("session should exist after SYN");
+        assert_eq!(session.state, SessionState::Tcp(TcpState::SynSent));
+
+        // Step 2: SYN-ACK (reverse direction triggers ACK flag -> Established)
+        let synack = make_tcp_packet([0xBB; 6], [0xAA; 6], dst_ip, src_ip, dst_port, src_port, 0x12, 64);
+        let _ = process_packet(
+            &RawPacket { ingress_iface: "wan0".to_string(), data: synack },
+            &mut l2, &l3, &fw, &mut ct, &zr, &im,
+        );
+
+        let session = ct.lookup(&key).expect("session should still exist after SYN-ACK");
+        assert_eq!(session.state, SessionState::Tcp(TcpState::Established));
+
+        // Step 3: FIN (forward direction)
+        let fin = make_tcp_packet([0xAA; 6], [0xBB; 6], src_ip, dst_ip, src_port, dst_port, 0x01, 64);
+        let _ = process_packet(
+            &RawPacket { ingress_iface: "lan0".to_string(), data: fin },
+            &mut l2, &l3, &fw, &mut ct, &zr, &im,
+        );
+
+        let session = ct.lookup(&key).expect("session should still exist after FIN");
+        assert_eq!(session.state, SessionState::Tcp(TcpState::FinWait));
+
+        // Step 4: FIN (reverse direction) -> Closed
+        let fin_rev = make_tcp_packet([0xBB; 6], [0xAA; 6], dst_ip, src_ip, dst_port, src_port, 0x01, 64);
+        let _ = process_packet(
+            &RawPacket { ingress_iface: "wan0".to_string(), data: fin_rev },
+            &mut l2, &l3, &fw, &mut ct, &zr, &im,
+        );
+
+        let session = ct.lookup(&key).expect("session should still exist after both FINs");
+        assert_eq!(session.state, SessionState::Tcp(TcpState::Closed));
+    }
+
+    #[test]
+    fn conntrack_table_full_drops_packet() {
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        // Create a conntrack with max 1 session.
+        let mut ct = ConntrackEngine::new(ConntrackConfig {
+            max_sessions: 1,
+            tcp_established_timeout_sec: 7200,
+            tcp_transitory_timeout_sec: 120,
+            udp_timeout_sec: 300,
+            icmp_timeout_sec: 30,
+        });
+        let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+
+        // First packet fills the table.
+        let data1 = make_ipv4_packet(
+            [0xAA; 6], [0xBB; 6],
+            [192, 168, 1, 100], [8, 8, 8, 8], 64,
+        );
+        let pkt1 = RawPacket { ingress_iface: "lan0".to_string(), data: data1 };
+        let result1 = process_packet(&pkt1, &mut l2, &l3, &fw, &mut ct, &zr, &im);
+        assert!(matches!(result1, PipelineResult::Forward { .. }));
+        assert_eq!(ct.session_count(), 1);
+
+        // Second packet from a different flow should be dropped (table full).
+        let data2 = make_ipv4_packet(
+            [0xAA; 6], [0xBB; 6],
+            [192, 168, 1, 101], [8, 8, 8, 8], 64,
+        );
+        let pkt2 = RawPacket { ingress_iface: "lan0".to_string(), data: data2 };
+        let result2 = process_packet(&pkt2, &mut l2, &l3, &fw, &mut ct, &zr, &im);
+        assert!(
+            matches!(result2, PipelineResult::Drop { reason: DropReason::NatDrop, .. }),
+            "expected Drop(NatDrop) when table is full, got {:?}",
+            result2
+        );
+    }
+
+    #[test]
+    fn conntrack_gc_removes_expired_sessions() {
+        use std::thread;
+        use std::time::Duration;
+
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        // Conntrack with 0-second UDP timeout so sessions expire immediately.
+        let mut ct = ConntrackEngine::new(ConntrackConfig {
+            max_sessions: 1000,
+            tcp_established_timeout_sec: 3600,
+            tcp_transitory_timeout_sec: 120,
+            udp_timeout_sec: 0,
+            icmp_timeout_sec: 30,
+        });
+        let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+
+        // Create a UDP session.
+        let data = make_ipv4_packet(
+            [0xAA; 6], [0xBB; 6],
+            [192, 168, 1, 100], [8, 8, 8, 8], 64,
+        );
+        let pkt = RawPacket { ingress_iface: "lan0".to_string(), data };
+        let _ = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
+        assert_eq!(ct.session_count(), 1);
+
+        // Wait for session to expire.
+        thread::sleep(Duration::from_millis(10));
+
+        // Run GC.
+        let expired = ct.gc();
+        assert_eq!(expired, 1);
+        assert_eq!(ct.session_count(), 0);
+    }
+
+    #[test]
+    fn conntrack_fw_allow_established_integration() {
+        // Integration test: firewall with allow_established_related and
+        // default_forward=drop. A new outbound flow creates a conntrack
+        // session, then the reverse (return) traffic should be accepted
+        // because the session exists.
+        use ruster_config::model::{Chain, ConnState, FirewallRule, RuleAction, RuleProto};
+
+        let l3 = make_l3_engine();
+        let mut ct = make_conntrack();
+        let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+
+        // FW: allow LAN->WAN new, allow established/related, default forward=drop.
+        let fw = FirewallEngine::from_config(&FirewallConfig {
+            enabled: true,
+            default_input: DefaultPolicy::Drop,
+            default_forward: DefaultPolicy::Drop,
+            default_output: DefaultPolicy::Accept,
+            allow_established_related: true,
+            rules: vec![FirewallRule {
+                name: "allow-lan-to-wan".to_string(),
+                chain: Chain::Forward,
+                action: RuleAction::Accept,
+                proto: RuleProto::Any,
+                src_zone: FirewallZone::Lan,
+                dst_zone: FirewallZone::Wan,
+                state: vec![ConnState::New],
+            }],
+        });
+
+        // Step 1: Outbound SYN from LAN -> WAN (should be accepted by rule).
+        let syn = make_tcp_packet(
+            [0xAA; 6], [0xBB; 6],
+            [192, 168, 1, 100], [8, 8, 8, 8],
+            49152, 80, 0x02, 64,
+        );
+        let result1 = process_packet(
+            &RawPacket { ingress_iface: "lan0".to_string(), data: syn },
+            &mut l2, &l3, &fw, &mut ct, &zr, &im,
+        );
+        assert!(
+            matches!(result1, PipelineResult::Forward { .. }),
+            "outbound SYN should be forwarded, got {:?}",
+            result1
+        );
+        assert_eq!(ct.session_count(), 1, "session should be created");
+
+        // Step 2: Return SYN-ACK from WAN -> LAN (reverse direction).
+        // Without conntrack, this would be dropped by default_forward=drop
+        // because there's no rule for WAN->LAN new traffic.
+        // With conntrack, the reverse key matches the existing session,
+        // so FwContext::from_packet sees is_established=true ->
+        // allow_established_related accepts it.
+        let synack = make_tcp_packet(
+            [0xBB; 6], [0xAA; 6],
+            [8, 8, 8, 8], [192, 168, 1, 100],
+            80, 49152, 0x12, 64,
+        );
+        let result2 = process_packet(
+            &RawPacket { ingress_iface: "wan0".to_string(), data: synack },
+            &mut l2, &l3, &fw, &mut ct, &zr, &im,
+        );
+        assert!(
+            matches!(result2, PipelineResult::Forward { .. }),
+            "return SYN-ACK should be forwarded (established), got {:?}",
+            result2
+        );
+    }
+
+    #[test]
+    fn conntrack_untracked_arp_does_not_create_session() {
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let mut ct = make_conntrack();
+        let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+
+        // ARP packet -> not trackable -> no session created.
+        let mut data = Vec::new();
+        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        data.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        data.extend_from_slice(&[0x08, 0x06]); // ARP
+        data.extend_from_slice(&[0x00, 0x01]);
+        data.extend_from_slice(&[0x08, 0x00]);
+        data.push(0x06);
+        data.push(0x04);
+        data.extend_from_slice(&[0x00, 0x01]);
+        data.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        data.extend_from_slice(&[192, 168, 1, 1]);
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        data.extend_from_slice(&[192, 168, 1, 2]);
+
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        let _ = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
+        assert_eq!(ct.session_count(), 0, "ARP should not create a conntrack session");
     }
 }

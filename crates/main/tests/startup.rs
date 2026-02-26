@@ -95,7 +95,7 @@ fn dataplane_init_creates_all_engines() {
 
     // Conntrack should start with zero sessions.
     assert_eq!(
-        dp.conntrack.session_count(),
+        dp.conntrack.lock().unwrap().session_count(),
         0,
         "conntrack should start empty"
     );
@@ -131,7 +131,7 @@ fn full_startup_pipeline_succeeds() {
 
     // Verify the dataplane is properly initialized.
     assert!(dp.nat.is_enabled());
-    assert_eq!(dp.conntrack.session_count(), 0);
+    assert_eq!(dp.conntrack.lock().unwrap().session_count(), 0);
 }
 
 // ── Run loop tests ──────────────────────────────────────────────────
@@ -209,7 +209,7 @@ fn full_startup_run_shutdown_pipeline() {
 
     // Verify engines.
     assert!(dp.nat.is_enabled());
-    assert_eq!(dp.conntrack.session_count(), 0);
+    assert_eq!(dp.conntrack.lock().unwrap().session_count(), 0);
 
     // Run and shutdown.
     let shutdown = Arc::new(AtomicBool::new(false));

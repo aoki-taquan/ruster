@@ -54,6 +54,29 @@ pub struct SessionKey {
 }
 
 impl SessionKey {
+    /// Build the reverse (reply-direction) key for this session key.
+    ///
+    /// Swaps source and destination IP addresses and ports, so that
+    /// return traffic for an existing session can be matched.
+    pub fn reverse(&self) -> Self {
+        let proto = match self.proto {
+            SessionProto::Tcp { src_port, dst_port } => SessionProto::Tcp {
+                src_port: dst_port,
+                dst_port: src_port,
+            },
+            SessionProto::Udp { src_port, dst_port } => SessionProto::Udp {
+                src_port: dst_port,
+                dst_port: src_port,
+            },
+            SessionProto::Icmp { id } => SessionProto::Icmp { id },
+        };
+        Self {
+            src_ip: self.dst_ip,
+            dst_ip: self.src_ip,
+            proto,
+        }
+    }
+
     /// Extract a 5-tuple session key from parsed packet metadata.
     ///
     /// Returns `None` if the packet is not IPv4 or lacks a recognized
@@ -330,5 +353,80 @@ mod tests {
         };
 
         assert!(SessionKey::from_packet(&meta).is_none());
+    }
+
+    // ── SessionKey::reverse tests ──────────────────────────────────
+
+    #[test]
+    fn reverse_tcp_key_swaps_ips_and_ports() {
+        let key = SessionKey {
+            src_ip: [192, 168, 1, 100],
+            dst_ip: [10, 0, 0, 1],
+            proto: SessionProto::Tcp {
+                src_port: 49152,
+                dst_port: 80,
+            },
+        };
+        let rev = key.reverse();
+
+        assert_eq!(rev.src_ip, [10, 0, 0, 1]);
+        assert_eq!(rev.dst_ip, [192, 168, 1, 100]);
+        assert_eq!(
+            rev.proto,
+            SessionProto::Tcp {
+                src_port: 80,
+                dst_port: 49152
+            }
+        );
+    }
+
+    #[test]
+    fn reverse_udp_key_swaps_ips_and_ports() {
+        let key = SessionKey {
+            src_ip: [10, 0, 0, 5],
+            dst_ip: [10, 0, 0, 1],
+            proto: SessionProto::Udp {
+                src_port: 12345,
+                dst_port: 53,
+            },
+        };
+        let rev = key.reverse();
+
+        assert_eq!(rev.src_ip, [10, 0, 0, 1]);
+        assert_eq!(rev.dst_ip, [10, 0, 0, 5]);
+        assert_eq!(
+            rev.proto,
+            SessionProto::Udp {
+                src_port: 53,
+                dst_port: 12345
+            }
+        );
+    }
+
+    #[test]
+    fn reverse_icmp_key_swaps_ips_keeps_id() {
+        let key = SessionKey {
+            src_ip: [192, 168, 1, 1],
+            dst_ip: [192, 168, 1, 2],
+            proto: SessionProto::Icmp { id: 0x1234 },
+        };
+        let rev = key.reverse();
+
+        assert_eq!(rev.src_ip, [192, 168, 1, 2]);
+        assert_eq!(rev.dst_ip, [192, 168, 1, 1]);
+        assert_eq!(rev.proto, SessionProto::Icmp { id: 0x1234 });
+    }
+
+    #[test]
+    fn reverse_of_reverse_is_identity() {
+        let key = SessionKey {
+            src_ip: [192, 168, 1, 100],
+            dst_ip: [10, 0, 0, 1],
+            proto: SessionProto::Tcp {
+                src_port: 49152,
+                dst_port: 80,
+            },
+        };
+        assert_eq!(key.reverse().reverse(), key);
     }
 }

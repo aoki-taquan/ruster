@@ -584,6 +584,7 @@ fn e2e_firewall_allow_lan_to_wan() {
         FirewallZone::Lan,
         FirewallZone::Wan,
         &conntrack,
+        true, // new session
     );
     let verdict = fw.evaluate(&ctx);
     assert!(
@@ -645,6 +646,7 @@ fn e2e_firewall_deny_wan_to_lan_uninvited() {
         FirewallZone::Wan,
         FirewallZone::Lan,
         &conntrack,
+        true, // new session (uninvited WAN traffic)
     );
     let verdict = fw.evaluate(&ctx);
     assert_eq!(
@@ -701,6 +703,7 @@ fn e2e_firewall_established_return_traffic() {
         FirewallZone::Wan,
         FirewallZone::Lan,
         &conntrack,
+        false, // existing session (established return traffic)
     );
     let verdict = fw.evaluate(&ctx);
     assert_eq!(
@@ -758,6 +761,7 @@ fn e2e_full_pipeline_outbound_and_reply() {
         FirewallZone::Lan,
         FirewallZone::Wan,
         &conntrack,
+        true, // new session (outbound LAN -> WAN)
     );
     let fw_verdict = fw.evaluate(&fw_ctx);
     assert!(
@@ -817,6 +821,7 @@ fn e2e_full_pipeline_outbound_and_reply() {
         FirewallZone::Wan,
         FirewallZone::Lan,
         &conntrack,
+        false, // existing session (established return traffic)
     );
     let reply_fw_verdict = fw.evaluate(&reply_fw_ctx);
     assert_eq!(
@@ -956,6 +961,7 @@ fn e2e_observer_counter_tracking() {
         FirewallZone::Wan,
         FirewallZone::Lan,
         &conntrack,
+        true, // new session (uninvited WAN traffic)
     );
     let fw_verdict = fw.evaluate(&fw_ctx);
     if matches!(fw_verdict, FwVerdict::Drop | FwVerdict::DropRule { .. }) {
