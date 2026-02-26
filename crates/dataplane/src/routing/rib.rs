@@ -66,11 +66,11 @@ impl Rib {
     /// their routes without leaving stale entries.
     pub fn insert(&mut self, entry: RibEntry) {
         // Remove any existing entry from the same source for the same prefix.
+        // Dedup key: (prefix, prefix_len, source) — matches `remove()`.
         self.entries.retain(|e| {
             !(e.prefix == entry.prefix
                 && e.prefix_len == entry.prefix_len
-                && e.source == entry.source
-                && e.out_ifname == entry.out_ifname)
+                && e.source == entry.source)
         });
         self.entries.push(entry);
     }
@@ -314,14 +314,25 @@ mod tests {
     #[test]
     fn best_routes_metric_breaks_tie_within_same_ad() {
         let mut rib = Rib::new();
-        // Two static routes for the same prefix with different metrics
-        // (different out_ifname so both are kept).
+        // Two routes from *different* sources but with the same admin
+        // distance for the same prefix.  The one with the lower metric
+        // should win in best-path selection.
         let mut entry1 = static_entry([10, 0, 0, 0], 8, 200);
+        // Override admin_distance to match OSPF's so that metric is
+        // the only differentiator.
+        entry1.admin_distance = 110;
+        entry1.source = ProtocolSource::Ospf;
         entry1.out_ifname = "wan1".to_string();
-        let entry2 = static_entry([10, 0, 0, 0], 8, 100);
+
+        let mut entry2 = static_entry([10, 0, 0, 0], 8, 100);
+        entry2.admin_distance = 110;
+        entry2.source = ProtocolSource::Bgp;
 
         rib.insert(entry1);
         rib.insert(entry2);
+
+        // Both kept because different sources (Ospf vs Bgp).
+        assert_eq!(rib.len(), 2);
 
         let best = rib.best_routes();
         assert_eq!(best.len(), 1);

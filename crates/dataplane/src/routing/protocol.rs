@@ -87,6 +87,9 @@ impl std::fmt::Display for ProtocolSource {
 ///     fn routes(&self) -> Vec<RibEntry> { /* query OSPF LSDB */ }
 /// }
 /// ```
+// TODO: RoutingProtocol trait is scaffolding for future OSPF/BGP protocol
+// adapters.  Remove the allow(dead_code) once dynamic routing is wired in.
+#[allow(dead_code)]
 pub trait RoutingProtocol {
     /// Human-readable protocol name (e.g. "ospf", "bgp").
     fn name(&self) -> &str;
@@ -111,6 +114,9 @@ pub trait RoutingProtocol {
 /// This wraps a set of pre-built [`RibEntry`] values (from config) so
 /// that static routes participate in the same RIB insertion path as
 /// dynamic protocols.
+// TODO: StaticRouteAdapter is scaffolding for future protocol-adapter
+// integration.  Remove the allow(dead_code) once it is wired in.
+#[allow(dead_code)]
 pub struct StaticRouteAdapter {
     entries: Vec<RibEntry>,
 }

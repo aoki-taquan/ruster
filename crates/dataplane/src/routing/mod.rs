@@ -173,44 +173,13 @@ impl L3Engine {
         routing_config: &RoutingConfig,
         interfaces: &[InterfaceConfig],
     ) -> Result<Self, L3ConfigError> {
-        // Parse and validate static routes.
+        // Parse and validate static routes via the shared helper.
+        let rib_entries =
+            parse_static_routes(routing_config).map_err(L3ConfigError::InvalidRoutes)?;
+
         let mut rib = Rib::new();
-        let mut errors: Vec<RouteError> = Vec::new();
-
-        for (index, sr) in routing_config.ipv4_static_routes.iter().enumerate() {
-            let prefix_result = table::parse_prefix(&sr.prefix);
-            let next_hop_result = parse_ipv4_addr(&sr.next_hop);
-
-            if prefix_result.is_none() {
-                errors.push(RouteError {
-                    index,
-                    kind: table::RouteErrorKind::InvalidPrefix,
-                    raw_value: sr.prefix.clone(),
-                });
-            }
-            if next_hop_result.is_none() {
-                errors.push(RouteError {
-                    index,
-                    kind: table::RouteErrorKind::InvalidNextHop,
-                    raw_value: sr.next_hop.clone(),
-                });
-            }
-
-            if let (Some((prefix, prefix_len)), Some(next_hop)) = (prefix_result, next_hop_result) {
-                rib.insert(RibEntry {
-                    prefix,
-                    prefix_len,
-                    next_hop,
-                    out_ifname: sr.out_if.clone(),
-                    metric: sr.metric,
-                    source: ProtocolSource::Static,
-                    admin_distance: ProtocolSource::Static.default_admin_distance(),
-                });
-            }
-        }
-
-        if !errors.is_empty() {
-            return Err(L3ConfigError::InvalidRoutes(errors));
+        for entry in rib_entries {
+            rib.insert(entry);
         }
 
         // Collect local IPs, tracking any parse failures.
@@ -363,6 +332,57 @@ impl L3Engine {
     /// rather than being L2-forwarded/flooded.
     pub fn is_local_ip(&self, ip: &[u8; 4]) -> bool {
         self.local_ips.contains(ip)
+    }
+}
+
+/// Parse static routes from a [`RoutingConfig`] into [`RibEntry`] values.
+///
+/// This is the shared helper used by both [`L3Engine::from_config`] and
+/// (potentially) [`table::RouteTable::from_config`] so that route-parsing
+/// logic is not duplicated.
+///
+/// Returns `Ok(entries)` on success, or `Err(errors)` listing every
+/// invalid entry found.
+fn parse_static_routes(config: &RoutingConfig) -> Result<Vec<RibEntry>, Vec<RouteError>> {
+    let mut entries = Vec::with_capacity(config.ipv4_static_routes.len());
+    let mut errors: Vec<RouteError> = Vec::new();
+
+    for (index, sr) in config.ipv4_static_routes.iter().enumerate() {
+        let prefix_result = table::parse_prefix(&sr.prefix);
+        let next_hop_result = parse_ipv4_addr(&sr.next_hop);
+
+        if prefix_result.is_none() {
+            errors.push(RouteError {
+                index,
+                kind: table::RouteErrorKind::InvalidPrefix,
+                raw_value: sr.prefix.clone(),
+            });
+        }
+        if next_hop_result.is_none() {
+            errors.push(RouteError {
+                index,
+                kind: table::RouteErrorKind::InvalidNextHop,
+                raw_value: sr.next_hop.clone(),
+            });
+        }
+
+        if let (Some((prefix, prefix_len)), Some(next_hop)) = (prefix_result, next_hop_result) {
+            entries.push(RibEntry {
+                prefix,
+                prefix_len,
+                next_hop,
+                out_ifname: sr.out_if.clone(),
+                metric: sr.metric,
+                source: ProtocolSource::Static,
+                admin_distance: ProtocolSource::Static.default_admin_distance(),
+            });
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(entries)
+    } else {
+        Err(errors)
     }
 }
 
