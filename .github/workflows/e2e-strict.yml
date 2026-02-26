@@ -1,13 +1,16 @@
-# E2E Strict — Informational CI for NAT/FW validation
+# E2E Strict — Informational CI for dataplane-only forwarding validation
 #
-# Runs NAT and firewall E2E tests against the containerlab topology.
-# These tests require a real dataplane (not MockPacketIo), so they are
-# EXPECTED TO FAIL in v0.1. This workflow is non-blocking and exists
-# to track readiness for v0.2+.
+# Deploys a strict containerlab topology where kernel ip_forward=0 on all
+# nodes. Traffic can ONLY pass through the ruster dataplane. The test
+# validates:
+#   Phase 1: Without ruster → ping fails (no kernel bypass)
+#   Phase 2: With ruster    → ping succeeds (dataplane forwarding)
+#   Phase 3: Without ruster → ping fails again (confirms ruster was forwarding)
 #
-# See docs/ci-gates.md for gate definitions and promotion process.
+# This workflow is non-blocking (continue-on-error: true) and exists to
+# track dataplane readiness. See docs/ci-gates.md for gate definitions.
 
-name: E2E Strict (NAT/FW — informational)
+name: E2E Strict (dataplane-only — informational)
 
 on:
   push:
@@ -21,7 +24,7 @@ env:
 
 jobs:
   containerlab-e2e-strict:
-    name: E2E Strict (NAT + FW — expected-fail in v0.1)
+    name: E2E Strict (dataplane-only forwarding)
     runs-on: [self-hosted, linux, kvm]
     timeout-minutes: 30
     continue-on-error: true
@@ -40,29 +43,25 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      - name: Deploy containerlab topology
-        run: containerlab deploy --topo tests/containerlab/topology.yml --name "$CLAB_TOPO_NAME"
+      - name: Deploy strict containerlab topology
+        run: containerlab deploy --topo tests/containerlab/configs/strict.clab.yml --name "$CLAB_TOPO_NAME"
 
-      - name: Verify ruster is running
-        run: bash tests/containerlab/scripts/check-ruster.sh
+      - name: Wait for topology to settle
+        run: sleep 10
 
-      - name: Run E2E tests (NAT + FW strict)
-        run: E2E_SUITES=nat,fw bash tests/containerlab/scripts/run-all.sh
+      - name: Run strict setup (harden topology)
+        run: bash tests/containerlab/scripts/strict-setup.sh
 
-      - name: Collect logs on failure
+      - name: Run strict E2E tests (3-phase)
+        run: bash tests/containerlab/scripts/strict-test.sh
+
+      - name: Collect diagnostics on failure
         if: failure()
         run: |
-          LOG_DIR="/tmp/${CLAB_TOPO_NAME}-logs"
-          mkdir -p "$LOG_DIR"
+          export STRICT_LOG_DIR="/tmp/${CLAB_TOPO_NAME}-logs"
+          bash tests/containerlab/scripts/strict-diagnose.sh || true
 
-          for node in ruster lan-host wan-host; do
-            docker logs "clab-${CLAB_TOPO_NAME}-${node}" > "${LOG_DIR}/${node}.log" 2>&1 || true
-          done
-
-          docker exec "clab-${CLAB_TOPO_NAME}-ruster" cat /var/log/ruster.log > "${LOG_DIR}/ruster-app.log" 2>&1 || true
-          docker ps -a > "${LOG_DIR}/docker-ps.txt" 2>&1 || true
-
-      - name: Upload logs artifact
+      - name: Upload diagnostic logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
