@@ -21,9 +21,11 @@ full_pipeline_pps = 400_000
 packet_parse_pps = 2_000_000
 
 [thresholds]
-# Fail if measured performance drops more than this percentage
-# below the recorded baseline (previous run stored in criterion data).
-regression_threshold_pct = 20
+# Regression detection relies on criterion's built-in statistical
+# comparison (the "regressed" keyword in output). We do not implement
+# a custom percentage-based threshold because criterion already accounts
+# for measurement noise via confidence intervals. The bench-report.sh
+# script checks for criterion's "regressed" keyword in CI mode.
 
 [profiles]
 # Standard packet sizes for benchmarking (bytes).

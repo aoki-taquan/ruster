@@ -45,7 +45,6 @@ FW_TARGET=$(parse_toml_value "$TARGETS_FILE" "firewall_pps")
 CT_TARGET=$(parse_toml_value "$TARGETS_FILE" "conntrack_lookup_pps")
 PIPELINE_TARGET=$(parse_toml_value "$TARGETS_FILE" "full_pipeline_pps")
 PARSE_TARGET=$(parse_toml_value "$TARGETS_FILE" "packet_parse_pps")
-REGRESSION_PCT=$(parse_toml_value "$TARGETS_FILE" "regression_threshold_pct")
 
 echo "=== ruster Benchmark Report ==="
 echo "Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -58,7 +57,7 @@ echo "  Firewall:        ${FW_TARGET} pps"
 echo "  Conntrack:       ${CT_TARGET} pps"
 echo "  Full pipeline:   ${PIPELINE_TARGET} pps"
 echo "  Packet parse:    ${PARSE_TARGET} pps"
-echo "  Regression:      ${REGRESSION_PCT}%"
+echo "  Regression:      criterion built-in statistical comparison"
 echo ""
 
 # ── Run benchmarks ───────────────────────────────────────────────────
@@ -134,7 +133,13 @@ check_target() {
     pps=$(ns_to_pps "$ns")
     local status="PASS"
 
-    if [ "$pps" -lt "$target" ] 2>/dev/null; then
+    if ! [[ "$pps" =~ ^[0-9]+$ ]]; then
+        echo "  ERROR $name: non-numeric pps value '$pps'"
+        FAIL=1
+        return
+    fi
+
+    if [[ "$pps" =~ ^[0-9]+$ ]] && [ "$pps" -lt "$target" ]; then
         status="FAIL"
         FAIL=1
     fi
@@ -154,6 +159,11 @@ check_target "Packet parse"  "packet_parse/tcp_ipv4/1500" "$PARSE_TARGET"
 echo ""
 
 # ── Check for regressions ────────────────────────────────────────────
+#
+# Regression detection uses criterion's built-in statistical comparison
+# rather than a custom percentage threshold. Criterion uses confidence
+# intervals to determine whether a benchmark has regressed, which is more
+# robust against measurement noise than a fixed percentage cutoff.
 
 echo "--- Regression Check ---"
 echo ""
