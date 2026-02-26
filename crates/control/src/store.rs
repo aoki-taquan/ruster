@@ -353,10 +353,7 @@ impl ConfigStore {
         };
 
         // Transition to Prepared state.
-        self.transaction
-            .as_mut()
-            .expect("transaction exists")
-            .state = TransactionState::Prepared;
+        self.transaction.as_mut().expect("transaction exists").state = TransactionState::Prepared;
 
         Ok(plan)
     }
@@ -370,7 +367,10 @@ impl ConfigStore {
     /// - [`ControlError::NoTransaction`] if no transaction is active.
     /// - [`ControlError::InvalidTransactionState`] if not in `Prepared` state.
     pub fn commit_transaction(&mut self) -> Result<(), ControlError> {
-        let txn = self.transaction.as_ref().ok_or(ControlError::NoTransaction)?;
+        let txn = self
+            .transaction
+            .as_ref()
+            .ok_or(ControlError::NoTransaction)?;
 
         if txn.state != TransactionState::Prepared {
             return Err(ControlError::InvalidTransactionState {
@@ -394,10 +394,7 @@ impl ConfigStore {
     ///
     /// - [`ControlError::NoTransaction`] if no transaction is active.
     pub fn abort_transaction(&mut self) -> Result<(), ControlError> {
-        let txn = self
-            .transaction
-            .take()
-            .ok_or(ControlError::NoTransaction)?;
+        let txn = self.transaction.take().ok_or(ControlError::NoTransaction)?;
 
         // Restore the snapshot.
         self.running = txn.snapshot;

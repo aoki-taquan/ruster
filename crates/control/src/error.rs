@@ -22,8 +22,5 @@ pub enum ControlError {
     NoTransaction,
 
     #[error("invalid transaction state: expected {expected}, got {actual}")]
-    InvalidTransactionState {
-        expected: String,
-        actual: String,
-    },
+    InvalidTransactionState { expected: String, actual: String },
 }

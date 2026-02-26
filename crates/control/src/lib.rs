@@ -415,10 +415,7 @@ mod tests {
         // Begin transaction.
         store.begin_transaction().unwrap();
         assert!(store.has_active_transaction());
-        assert_eq!(
-            store.transaction_state(),
-            Some(TransactionState::Pending)
-        );
+        assert_eq!(store.transaction_state(), Some(TransactionState::Pending));
 
         // Apply a change within the transaction.
         let mut cfg2 = cfg.clone();
@@ -429,10 +426,7 @@ mod tests {
         // Prepare.
         let plan = store.prepare_transaction().unwrap();
         assert!(plan.has_changes);
-        assert_eq!(
-            store.transaction_state(),
-            Some(TransactionState::Prepared)
-        );
+        assert_eq!(store.transaction_state(), Some(TransactionState::Prepared));
 
         // Commit transaction.
         store.commit_transaction().unwrap();
@@ -481,18 +475,12 @@ mod tests {
 
         // Prepare succeeds.
         store.prepare_transaction().unwrap();
-        assert_eq!(
-            store.transaction_state(),
-            Some(TransactionState::Prepared)
-        );
+        assert_eq!(store.transaction_state(), Some(TransactionState::Prepared));
 
         // Abort after prepare should still revert.
         store.abort_transaction().unwrap();
         assert!(!store.has_active_transaction());
-        assert_eq!(
-            store.running().unwrap().meta.hostname,
-            "ruster-lab",
-        );
+        assert_eq!(store.running().unwrap().meta.hostname, "ruster-lab",);
     }
 
     // ── Rollback (outside transaction) ──
@@ -704,10 +692,7 @@ mod tests {
 
         // Transaction should still be active.
         assert!(store.has_active_transaction());
-        assert_eq!(
-            store.transaction_state(),
-            Some(TransactionState::Pending)
-        );
+        assert_eq!(store.transaction_state(), Some(TransactionState::Pending));
 
         // Abort should still work.
         store.abort_transaction().unwrap();
