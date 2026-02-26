@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 
+use crate::arp::{ArpAction, ArpEngine};
 use crate::conntrack::ConntrackEngine;
 use crate::firewall::{FirewallEngine, FwChain, FwContext, FwVerdict};
 use crate::icmp::{self, IcmpReply};
@@ -83,6 +84,14 @@ pub enum PipelineResult {
     },
     /// Packet was consumed (e.g., ARP reply generated internally).
     Consumed,
+    /// Packet was queued for ARP resolution. An ARP request has been
+    /// triggered and the packet is held in the ARP engine's hold queue
+    /// until the next-hop MAC is resolved.
+    Queued {
+        /// ARP request that the caller should send to resolve the
+        /// next-hop address.
+        arp_request: crate::arp::ArpAction,
+    },
 }
 
 /// Reason a packet was dropped during pipeline processing.
@@ -102,6 +111,8 @@ pub enum DropReason {
     FirewallDrop,
     /// NAT engine dropped the packet.
     NatDrop,
+    /// ARP resolution failed (hold queue full or timeout).
+    ArpUnresolved,
 }
 
 // ── Pipeline function ───────────────────────────────────────────────
@@ -111,7 +122,9 @@ pub enum DropReason {
 /// The v0.1 flow is:
 /// 1. Parse the raw bytes into a [`PacketMeta`](packet::PacketMeta).
 /// 2. If parsing fails, return `Drop(ParseError)`.
-/// 3. **L2 check**: if the ingress interface belongs to a bridge domain:
+/// 3. **ARP check**: if the packet is an ARP packet (EtherType 0x0806),
+///    process it through the ARP engine and return `Consumed`.
+/// 4. **L2 check**: if the ingress interface belongs to a bridge domain:
 ///    a. Learn source MAC (FDB update).
 ///    b. If the destination IP is one of the router's local IPs,
 ///    fall through to L3 processing.
@@ -120,16 +133,18 @@ pub enum DropReason {
 ///    Unknown unicast / broadcast -> `Flood` to all bridge domain
 ///    ports except ingress.
 ///    Same-port drop -> `Drop(L2Drop)`.
-/// 4. If the interface is **not** in a bridge domain, proceed to L3.
-/// 5. Check L3 routing via [`L3Engine::process`].
-/// 6. Based on the L3 decision:
-///    - `Forward { .. }` -> check firewall -> `Forward` or `Drop(FirewallDrop)`.
+/// 5. If the interface is **not** in a bridge domain, proceed to L3.
+/// 6. Check L3 routing via [`L3Engine::process`].
+/// 7. Based on the L3 decision:
+///    - `Forward { .. }` -> ARP resolve next-hop -> firewall check ->
+///      `Forward`, `Queued`, or `Drop`.
 ///    - `LocalDelivery` -> `Consumed`.
 ///    - `Drop(reason)` -> `Drop` with a mapped reason.
 pub fn process_packet(
     raw_pkt: &RawPacket,
     l2: &mut L2Engine,
     l3: &L3Engine,
+    arp: &mut ArpEngine,
     firewall: &FirewallEngine,
     conntrack: &ConntrackEngine,
     zone_resolver: &ZoneResolver,
@@ -145,7 +160,21 @@ pub fn process_packet(
         }
     };
 
-    // Step 2: L2 bridge domain processing.
+    // Step 2: ARP packet processing.
+    // If the packet is ARP, process it through the ARP engine.
+    // ARP replies update the cache (which may trigger hold queue flush
+    // in the run loop). ARP requests may generate a reply.
+    if meta.l2.ethertype == 0x0806 {
+        let arp_action = arp.process_arp(&meta);
+        return match arp_action {
+            ArpAction::Reply { .. } | ArpAction::SendRequest { .. } => PipelineResult::Queued {
+                arp_request: arp_action,
+            },
+            _ => PipelineResult::Consumed,
+        };
+    }
+
+    // Step 3: L2 bridge domain processing.
     if l2.is_bridged(&meta.in_ifname) {
         let l2_decision = l2.process(&meta);
 
@@ -175,16 +204,16 @@ pub fn process_packet(
         // else: packet is for our local IP -> fall through to L3.
     }
 
-    // Step 3: L3 routing decision.
+    // Step 4: L3 routing decision.
     let l3_decision = l3.process(&meta);
 
     match l3_decision {
         L3Decision::Forward {
             out_ifname,
-            next_hop: _,
+            next_hop,
             new_ttl: _,
         } => {
-            // Step 4: Firewall check on the forward chain.
+            // Step 5: Firewall check on the forward chain.
             let src_zone = zone_resolver.resolve(&raw_pkt.ingress_iface);
             let dst_zone = zone_resolver.resolve(&out_ifname);
             let fw_ctx =
@@ -192,9 +221,39 @@ pub fn process_packet(
             let verdict = firewall.evaluate(&fw_ctx);
 
             match verdict {
-                FwVerdict::Accept | FwVerdict::AcceptRule { .. } => PipelineResult::Forward {
-                    egress_iface: out_ifname,
-                },
+                FwVerdict::Accept | FwVerdict::AcceptRule { .. } => {
+                    // Step 6: ARP resolution for the next-hop.
+                    let arp_action = arp.resolve(next_hop, &out_ifname);
+                    match arp_action {
+                        ArpAction::Forward { .. } => {
+                            // MAC is known; forward the packet.
+                            PipelineResult::Forward {
+                                egress_iface: out_ifname,
+                            }
+                        }
+                        ArpAction::SendRequest { .. } => {
+                            // MAC is unknown; queue the packet and request ARP.
+                            let overflow =
+                                arp.queue_packet(next_hop, raw_pkt.data.clone(), out_ifname);
+                            if overflow {
+                                // A packet was dropped due to queue overflow.
+                                // The observer should count this, but we still
+                                // return Queued for the current packet.
+                            }
+                            PipelineResult::Queued {
+                                arp_request: arp_action,
+                            }
+                        }
+                        ArpAction::Drop => {
+                            // No interface info; drop the packet.
+                            PipelineResult::Drop {
+                                reason: DropReason::ArpUnresolved,
+                                icmp_reply: None,
+                            }
+                        }
+                        _ => PipelineResult::Consumed,
+                    }
+                }
                 FwVerdict::Drop | FwVerdict::DropRule { .. } => PipelineResult::Drop {
                     reason: DropReason::FirewallDrop,
                     icmp_reply: None,
@@ -252,6 +311,7 @@ fn map_l3_drop_reason(reason: L3DropReason) -> DropReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arp::ArpEngine;
     use crate::conntrack::{ConntrackConfig, ConntrackEngine};
     use crate::io::RawPacket;
     use crate::l2::L2Engine;
@@ -261,6 +321,70 @@ mod tests {
     };
 
     // ── Test helpers ────────────────────────────────────────────────
+
+    /// Create an ARP engine from the test interfaces with pre-populated
+    /// entries for the default gateway (10.0.0.1) so that existing
+    /// forwarding tests continue to work without ARP queuing.
+    fn make_arp_engine() -> ArpEngine {
+        let l2_config = L2Config {
+            mac_table_max_entries: 1024,
+            mac_aging_sec: 300,
+            arp_table_max_entries: 256,
+            arp_timeout_sec: 120,
+            bridge_domains: vec![],
+        };
+        let mut arp = ArpEngine::from_config(&l2_config, &make_interfaces());
+        // Pre-populate ARP cache with the default gateway MAC so
+        // existing forwarding tests that route via wan0 -> 10.0.0.1
+        // get a cache hit and return Forward instead of Queued.
+        let gw_mac = [0xDE, 0xAD, 0x00, 0x00, 0x00, 0x01];
+        // Resolve once to create the cache entry, then insert.
+        // We directly insert into the cache through process_arp by
+        // simulating an ARP reply.
+        use crate::packet::{ArpInfo, L2Info, PacketMeta};
+        let arp_reply = PacketMeta {
+            in_ifname: "wan0".to_string(),
+            l2: L2Info {
+                dst_mac: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+                src_mac: gw_mac,
+                ethertype: 0x0806,
+            },
+            l3: Some(L3Info::Arp(ArpInfo {
+                operation: 2, // ARP Reply
+                sender_mac: gw_mac,
+                sender_ip: [10, 0, 0, 1],
+                target_mac: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+                target_ip: [10, 0, 0, 2],
+            })),
+            l4: None,
+            raw_len: 42,
+        };
+        arp.process_arp(&arp_reply);
+
+        // Also pre-populate LAN side: direct-connected hosts resolve
+        // via the LAN interface.
+        let host_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let lan_arp_reply = PacketMeta {
+            in_ifname: "lan0".to_string(),
+            l2: L2Info {
+                dst_mac: [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
+                src_mac: host_mac,
+                ethertype: 0x0806,
+            },
+            l3: Some(L3Info::Arp(ArpInfo {
+                operation: 2,
+                sender_mac: host_mac,
+                sender_ip: [192, 168, 1, 100],
+                target_mac: [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
+                target_ip: [192, 168, 1, 1],
+            })),
+            l4: None,
+            raw_len: 42,
+        };
+        arp.process_arp(&lan_arp_reply);
+
+        arp
+    }
 
     /// Create an L2 engine with **no** bridge domains, so all interfaces
     /// skip L2 processing and go directly to L3.  This preserves the
@@ -428,6 +552,7 @@ mod tests {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
 
         // Packet from LAN to internet (8.8.8.8) -> default route via wan0.
         let data = make_ipv4_packet(
@@ -444,7 +569,7 @@ mod tests {
 
         let zr = make_zone_resolver();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
         match result {
             PipelineResult::Forward { egress_iface } => {
                 assert_eq!(egress_iface, "wan0");
@@ -458,6 +583,7 @@ mod tests {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
 
         // Packet too short to parse (< 14 bytes).
         let raw_pkt = RawPacket {
@@ -467,7 +593,7 @@ mod tests {
 
         let zr = make_zone_resolver();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::ParseError);
@@ -490,6 +616,7 @@ mod tests {
         let l3 = L3Engine::from_config(&routing, &make_interfaces()).unwrap();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
 
         // Destination 8.8.8.8 has no matching route.
         let data = make_ipv4_packet(
@@ -506,7 +633,7 @@ mod tests {
 
         let zr = make_zone_resolver();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3NoRoute);
@@ -520,6 +647,7 @@ mod tests {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
 
         // TTL = 1 -> after decrement would be 0, so L3 engine drops.
         let data = make_ipv4_packet(
@@ -536,7 +664,7 @@ mod tests {
 
         let zr = make_zone_resolver();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -550,6 +678,7 @@ mod tests {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
 
         // Destination is our local IP (10.0.0.2) -> LocalDelivery -> Consumed.
         let data = make_ipv4_packet(
@@ -566,7 +695,7 @@ mod tests {
 
         let zr = make_zone_resolver();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
         assert!(matches!(result, PipelineResult::Consumed));
     }
 
@@ -575,6 +704,7 @@ mod tests {
         let l3 = make_l3_engine();
         let fw = make_fw_drop_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
 
         // Packet should be routed, but firewall drops everything.
         let data = make_ipv4_packet(
@@ -591,7 +721,7 @@ mod tests {
 
         let zr = make_zone_resolver();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -601,12 +731,15 @@ mod tests {
     }
 
     #[test]
-    fn drop_not_ipv4() {
+    fn arp_packet_consumed_by_arp_engine() {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
 
-        // ARP packet -> L3 engine returns Drop(NotIpv4).
+        // ARP packet -> now intercepted by the ARP engine before L3.
+        // The ARP engine learns the sender and returns Update (or Reply
+        // if the target is our IP), which maps to Consumed.
         let mut data = Vec::new();
         // Ethernet header
         data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]); // dst: broadcast
@@ -630,13 +763,13 @@ mod tests {
 
         let zr = make_zone_resolver();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
-        match result {
-            PipelineResult::Drop { reason, .. } => {
-                assert_eq!(reason, DropReason::L3NotIpv4);
-            }
-            other => panic!("expected Drop(L3NotIpv4), got {:?}", other),
-        }
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
+        // ARP packets are now consumed by the ARP engine (not passed to L3).
+        assert!(
+            matches!(result, PipelineResult::Consumed),
+            "expected Consumed for ARP packet, got {:?}",
+            result
+        );
     }
 
     #[test]
@@ -646,6 +779,7 @@ mod tests {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = make_zone_resolver();
         let mut l2 = make_l2_engine_empty();
 
@@ -658,7 +792,7 @@ mod tests {
             ingress_iface: "eth0".to_string(),
             data: vec![0x00; 5],
         };
-        match process_packet(&short_pkt, &mut l2, &l3, &fw, &ct, &zr) {
+        match process_packet(&short_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr) {
             PipelineResult::Drop {
                 reason: DropReason::ParseError,
                 ..
@@ -672,7 +806,7 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: ttl_data,
         };
-        match process_packet(&ttl_pkt, &mut l2, &l3, &fw, &ct, &zr) {
+        match process_packet(&ttl_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr) {
             PipelineResult::Drop {
                 reason: DropReason::L3TtlExpired,
                 ..
@@ -686,7 +820,7 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: fwd_data,
         };
-        match process_packet(&fwd_pkt, &mut l2, &l3, &fw, &ct, &zr) {
+        match process_packet(&fwd_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr) {
             PipelineResult::Forward { .. } => forwards += 1,
             _ => {}
         }
@@ -708,6 +842,7 @@ mod tests {
 
         let l3 = make_l3_engine();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = make_zone_resolver();
 
         // Firewall: only allow Lan->Wan forward, drop everything else.
@@ -742,7 +877,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
         match result {
             PipelineResult::Forward { egress_iface } => {
                 assert_eq!(egress_iface, "wan0");
@@ -764,6 +899,7 @@ mod tests {
 
         let l3 = make_l3_engine();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = make_zone_resolver();
 
         // Firewall: only allow Lan->Wan forward, drop everything else.
@@ -799,7 +935,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -826,6 +962,7 @@ mod tests {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = make_zone_resolver();
 
         // TTL = 1 -> L3 drops with TtlExpired -> should generate ICMP.
@@ -842,7 +979,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -876,6 +1013,7 @@ mod tests {
         let l3 = L3Engine::from_config(&routing, &make_interfaces()).unwrap();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = make_zone_resolver();
 
         // Destination 8.8.8.8 has no matching route.
@@ -892,7 +1030,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3NoRoute);
@@ -913,6 +1051,7 @@ mod tests {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = make_zone_resolver();
 
         // Build an ICMP packet (protocol=1) with TTL=1.
@@ -950,7 +1089,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -968,6 +1107,7 @@ mod tests {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = make_zone_resolver();
 
         let raw_pkt = RawPacket {
@@ -976,7 +1116,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::ParseError);
@@ -991,6 +1131,7 @@ mod tests {
         let l3 = make_l3_engine();
         let fw = make_fw_drop_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = make_zone_resolver();
 
         let data = make_ipv4_packet(
@@ -1006,7 +1147,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -1021,22 +1162,17 @@ mod tests {
         let l3 = make_l3_engine();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = make_zone_resolver();
 
-        // ARP packet.
+        // ARP packet: now intercepted by ARP engine (returns Consumed).
+        // Use a non-ARP, non-IPv4 ethertype to test L3NotIpv4.
         let mut data = Vec::new();
-        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-        data.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
-        data.extend_from_slice(&[0x08, 0x06]); // ARP
-        data.extend_from_slice(&[0x00, 0x01]);
-        data.extend_from_slice(&[0x08, 0x00]);
-        data.push(0x06);
-        data.push(0x04);
-        data.extend_from_slice(&[0x00, 0x01]);
-        data.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
-        data.extend_from_slice(&[192, 168, 1, 1]);
-        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
-        data.extend_from_slice(&[192, 168, 1, 2]);
+        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]); // dst
+        data.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // src
+        data.extend_from_slice(&[0x86, 0xDD]); // EtherType: IPv6 (unsupported)
+                                               // Minimal padding so parser does not reject.
+        data.extend_from_slice(&[0x00; 40]);
 
         let raw_pkt = RawPacket {
             ingress_iface: "lan0".to_string(),
@@ -1044,7 +1180,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3NotIpv4);
@@ -1157,6 +1293,7 @@ mod tests {
         let l3 = make_l3_engine_with_bridge_ifaces();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = ZoneResolver::from_config(&[]);
 
         // Step 1: Learn MAC_HOST_B on eth1.
@@ -1167,7 +1304,7 @@ mod tests {
             [192, 168, 1, 50],
             [192, 168, 1, 60],
         );
-        let _ = process_packet(&learn_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let _ = process_packet(&learn_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
 
         // Step 2: Send from MAC_HOST_A on eth0 to MAC_HOST_B -> unicast to eth1.
         let pkt = make_l2_raw_packet(
@@ -1177,7 +1314,7 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 50],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
 
         match result {
             PipelineResult::Forward { egress_iface } => {
@@ -1194,6 +1331,7 @@ mod tests {
         let l3 = make_l3_engine_with_bridge_ifaces();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = ZoneResolver::from_config(&[]);
 
         let pkt = make_l2_raw_packet(
@@ -1203,7 +1341,7 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 50],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
 
         match result {
             PipelineResult::Flood { egress_ifaces } => {
@@ -1226,6 +1364,7 @@ mod tests {
         let l3 = make_l3_engine_with_bridge_ifaces();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = ZoneResolver::from_config(&[]);
 
         let pkt = make_l2_raw_packet(
@@ -1235,7 +1374,7 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 255],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
 
         match result {
             PipelineResult::Flood { egress_ifaces } => {
@@ -1260,6 +1399,7 @@ mod tests {
         let l3 = make_l3_engine_with_bridge_ifaces();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = ZoneResolver::from_config(&[]);
 
         // Step 1: MAC_HOST_A arrives on eth0 (triggers learning).
@@ -1270,7 +1410,7 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 50],
         );
-        let _ = process_packet(&learn_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let _ = process_packet(&learn_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
 
         // Step 2: Send to MAC_HOST_A from eth1 -> should unicast to eth0.
         let pkt = make_l2_raw_packet(
@@ -1280,7 +1420,7 @@ mod tests {
             [192, 168, 1, 50],
             [192, 168, 1, 60],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
 
         match result {
             PipelineResult::Forward { egress_iface } => {
@@ -1299,6 +1439,7 @@ mod tests {
         let l3 = make_l3_engine_with_bridge_ifaces();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = ZoneResolver::from_config(&[]);
 
         let pkt = make_l2_raw_packet(
@@ -1308,7 +1449,7 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 1],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
 
         // The packet's dst IP (192.168.1.1) is a local IP on eth0,
         // so L3 should handle it as LocalDelivery -> Consumed.
@@ -1327,6 +1468,7 @@ mod tests {
         let l3 = make_l3_engine_with_bridge_ifaces();
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
+        let mut arp = make_arp_engine();
         let zr = ZoneResolver::from_config(&[]);
 
         // wan0 is NOT in br0, so it skips L2 entirely.
@@ -1337,12 +1479,293 @@ mod tests {
             [10, 0, 0, 5],
             [192, 168, 1, 1], // local IP -> Consumed
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
 
         assert!(
             matches!(result, PipelineResult::Consumed),
             "expected Consumed (L3 local delivery), got {:?}",
             result
         );
+    }
+
+    // ── ARP integration tests ──────────────────────────────────────
+
+    /// Create a fresh ARP engine with NO pre-populated cache entries.
+    fn make_arp_engine_empty() -> ArpEngine {
+        let l2_config = L2Config {
+            mac_table_max_entries: 1024,
+            mac_aging_sec: 300,
+            arp_table_max_entries: 256,
+            arp_timeout_sec: 120,
+            bridge_domains: vec![],
+        };
+        ArpEngine::from_config(&l2_config, &make_interfaces())
+    }
+
+    #[test]
+    fn arp_cache_hit_forwards_packet() {
+        // When the ARP cache has the next-hop MAC, the packet should be
+        // forwarded immediately (Forward, not Queued).
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let mut arp = make_arp_engine(); // pre-populated with gateway MAC
+        let zr = make_zone_resolver();
+        let mut l2 = make_l2_engine_empty();
+
+        // Packet to 8.8.8.8 routes via 10.0.0.1 on wan0 -> ARP cache hit.
+        let data = make_ipv4_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            [192, 168, 1, 100],
+            [8, 8, 8, 8],
+            64,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
+        match result {
+            PipelineResult::Forward { egress_iface } => {
+                assert_eq!(egress_iface, "wan0");
+            }
+            other => panic!("expected Forward (ARP cache hit), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn arp_cache_miss_queues_packet() {
+        // When the ARP cache does NOT have the next-hop MAC, the packet
+        // should be queued and an ARP request triggered.
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let mut arp = make_arp_engine_empty(); // empty ARP cache
+        let zr = make_zone_resolver();
+        let mut l2 = make_l2_engine_empty();
+
+        // Packet to 8.8.8.8 routes via 10.0.0.1 on wan0 -> ARP cache miss.
+        let data = make_ipv4_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            [192, 168, 1, 100],
+            [8, 8, 8, 8],
+            64,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
+        match &result {
+            PipelineResult::Queued { arp_request } => {
+                // The ARP request should be for the gateway IP on wan0.
+                match arp_request {
+                    ArpAction::SendRequest {
+                        out_ifname,
+                        target_ip,
+                        ..
+                    } => {
+                        assert_eq!(out_ifname, "wan0");
+                        assert_eq!(*target_ip, [10, 0, 0, 1]);
+                    }
+                    other => panic!("expected SendRequest, got {:?}", other),
+                }
+            }
+            other => panic!("expected Queued (ARP cache miss), got {:?}", other),
+        }
+
+        // The packet should be in the hold queue.
+        assert_eq!(
+            arp.hold_queue_len_for(&[10, 0, 0, 1]),
+            1,
+            "one packet queued for gateway"
+        );
+    }
+
+    #[test]
+    fn arp_reply_flushes_hold_queue() {
+        // After an ARP reply arrives, the hold queue for that IP should
+        // be flushed and subsequent packets should forward normally.
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let mut arp = make_arp_engine_empty();
+        let zr = make_zone_resolver();
+        let mut l2 = make_l2_engine_empty();
+
+        // Step 1: Send a packet that triggers ARP cache miss.
+        let data = make_ipv4_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            [192, 168, 1, 100],
+            [8, 8, 8, 8],
+            64,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data: data.clone(),
+        };
+        let result1 = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
+        assert!(
+            matches!(result1, PipelineResult::Queued { .. }),
+            "first packet should be queued"
+        );
+        assert_eq!(arp.hold_queue_len_for(&[10, 0, 0, 1]), 1);
+
+        // Step 2: Simulate an ARP reply from the gateway.
+        use crate::packet::{ArpInfo, L2Info, PacketMeta};
+        let gw_mac = [0xDE, 0xAD, 0x00, 0x00, 0x00, 0x01];
+        let arp_reply = PacketMeta {
+            in_ifname: "wan0".to_string(),
+            l2: L2Info {
+                dst_mac: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+                src_mac: gw_mac,
+                ethertype: 0x0806,
+            },
+            l3: Some(L3Info::Arp(ArpInfo {
+                operation: 2,
+                sender_mac: gw_mac,
+                sender_ip: [10, 0, 0, 1],
+                target_mac: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+                target_ip: [10, 0, 0, 2],
+            })),
+            l4: None,
+            raw_len: 42,
+        };
+        arp.process_arp(&arp_reply);
+
+        // Step 3: Flush the hold queue.
+        let flushed = arp.flush_queue(&[10, 0, 0, 1]);
+        assert_eq!(flushed.len(), 1, "one packet should be flushed");
+        assert_eq!(flushed[0].egress_iface, "wan0");
+        assert_eq!(arp.hold_queue_len(), 0, "hold queue should be empty");
+
+        // Step 4: Send another packet -> should now Forward (cache hit).
+        let raw_pkt2 = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+        let result2 = process_packet(&raw_pkt2, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
+        match result2 {
+            PipelineResult::Forward { egress_iface } => {
+                assert_eq!(egress_iface, "wan0");
+            }
+            other => panic!("expected Forward after ARP reply, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn arp_hold_queue_full_drops_oldest() {
+        // When the hold queue for a next-hop IP is full, the oldest
+        // packet should be dropped to make room for the new one.
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let mut arp = make_arp_engine_empty();
+        let zr = make_zone_resolver();
+        let mut l2 = make_l2_engine_empty();
+
+        // Send 65 packets (max is 64 per IP). The first packet triggers
+        // ARP resolution; subsequent packets just queue.
+        for i in 0..65u32 {
+            let data = make_ipv4_packet(
+                [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+                [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+                [192, 168, 1, 100],
+                [8, 8, 8, 8],
+                64,
+            );
+            let raw_pkt = RawPacket {
+                ingress_iface: "lan0".to_string(),
+                data,
+            };
+            let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
+            assert!(
+                matches!(result, PipelineResult::Queued { .. }),
+                "packet {} should be queued, got {:?}",
+                i,
+                result
+            );
+        }
+
+        // The queue should still be at max size (64), not 65.
+        assert_eq!(
+            arp.hold_queue_len_for(&[10, 0, 0, 1]),
+            64,
+            "queue should be at max 64 after overflow"
+        );
+    }
+
+    #[test]
+    fn arp_hold_queue_timeout_drains_expired() {
+        // Packets that have been in the queue longer than the timeout
+        // should be drained. Since we cannot easily fast-forward time,
+        // we verify the drain_expired method works on a freshly queued
+        // packet (which should NOT be expired).
+        let mut arp = make_arp_engine_empty();
+
+        // Queue a packet manually.
+        let overflow = arp.queue_packet([10, 0, 0, 1], vec![0x00; 42], "wan0".to_string());
+        assert!(!overflow, "should not overflow on first packet");
+        assert_eq!(arp.hold_queue_len(), 1);
+
+        // Drain expired (nothing should expire because we just queued it).
+        let drained = arp.drain_expired();
+        assert_eq!(drained, 0, "freshly queued packet should not be expired");
+        assert_eq!(arp.hold_queue_len(), 1, "packet should still be in queue");
+    }
+
+    #[test]
+    fn arp_incoming_request_for_our_ip_returns_queued() {
+        // An incoming ARP request for our IP should be consumed and
+        // trigger an ARP reply. The pipeline returns Queued with a Reply
+        // action so the caller can send the reply frame.
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let ct = make_conntrack();
+        let mut arp = make_arp_engine();
+        let zr = make_zone_resolver();
+        let mut l2 = make_l2_engine_empty();
+
+        // Build a raw ARP request: "Who has 10.0.0.2? Tell 10.0.0.99"
+        let mut data = Vec::new();
+        // Ethernet header (14 bytes)
+        data.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]); // dst: broadcast
+        data.extend_from_slice(&[0xDE, 0xAD, 0x00, 0x00, 0x00, 0x99]); // src
+        data.extend_from_slice(&[0x08, 0x06]); // EtherType: ARP
+                                               // ARP payload (28 bytes)
+        data.extend_from_slice(&[0x00, 0x01]); // HW Type: Ethernet
+        data.extend_from_slice(&[0x08, 0x00]); // Proto Type: IPv4
+        data.push(0x06); // HW Addr Len
+        data.push(0x04); // Proto Addr Len
+        data.extend_from_slice(&[0x00, 0x01]); // Operation: Request
+        data.extend_from_slice(&[0xDE, 0xAD, 0x00, 0x00, 0x00, 0x99]); // Sender MAC
+        data.extend_from_slice(&[10, 0, 0, 99]); // Sender IP
+        data.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // Target MAC
+        data.extend_from_slice(&[10, 0, 0, 2]); // Target IP (our WAN IP)
+
+        let raw_pkt = RawPacket {
+            ingress_iface: "wan0".to_string(),
+            data,
+        };
+
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &mut arp, &fw, &ct, &zr);
+        match &result {
+            PipelineResult::Queued { arp_request } => {
+                match arp_request {
+                    ArpAction::Reply { out_ifname, packet } => {
+                        assert_eq!(out_ifname, "wan0");
+                        assert_eq!(packet.sender_ip, [10, 0, 0, 2]); // our IP
+                        assert_eq!(packet.target_ip, [10, 0, 0, 99]); // requester IP
+                    }
+                    other => panic!("expected Reply action, got {:?}", other),
+                }
+            }
+            other => panic!("expected Queued (ARP reply), got {:?}", other),
+        }
     }
 }

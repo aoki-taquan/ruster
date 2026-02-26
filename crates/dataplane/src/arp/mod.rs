@@ -4,13 +4,18 @@
 //! caches and handles incoming ARP packets (requests and replies) as well
 //! as next-hop resolution for L3 forwarding.
 //!
+//! The engine includes a packet hold queue: when the next-hop MAC is not
+//! yet resolved, packets are queued until an ARP reply arrives (or the
+//! queue times out / overflows).
+//!
 //! RFC-REF: RFC 826
 //! An Ethernet Address Resolution Protocol — converts protocol addresses
 //! (IPv4) to hardware addresses (Ethernet MAC) within a broadcast domain.
 
 pub mod cache;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 use crate::packet::{ArpInfo, L3Info, PacketMeta};
 use cache::{ArpCache, ArpEntryState};
@@ -22,6 +27,27 @@ use ruster_config::model::{InterfaceConfig, L2Config};
 /// "ar$op — 1 for request, 2 for reply"
 const ARP_OP_REQUEST: u16 = 1;
 const ARP_OP_REPLY: u16 = 2;
+
+/// Maximum number of packets held per next-hop IP while waiting for ARP
+/// resolution. When the queue for a given next-hop exceeds this limit,
+/// the oldest packet is dropped.
+const HOLD_QUEUE_MAX_PER_IP: usize = 64;
+
+/// Timeout in seconds for packets in the hold queue. Packets that have
+/// been queued longer than this are dropped with `ArpUnresolved`.
+const HOLD_QUEUE_TIMEOUT_SECS: u64 = 5;
+
+/// A packet held in the ARP hold queue while waiting for next-hop
+/// resolution.
+#[derive(Debug, Clone)]
+pub struct HeldPacket {
+    /// Raw packet data (Ethernet frame).
+    pub data: Vec<u8>,
+    /// Egress interface name (where the packet should be forwarded).
+    pub egress_iface: String,
+    /// Timestamp when the packet was enqueued.
+    pub enqueued_at: Instant,
+}
 
 /// Information needed to construct an ARP reply packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +107,8 @@ struct InterfaceInfo {
 ///
 /// Manages per-interface ARP caches and interface identity information.
 /// Processes incoming ARP packets and resolves next-hop addresses for
-/// L3 forwarding.
+/// L3 forwarding. Includes a per-next-hop packet hold queue for packets
+/// awaiting ARP resolution.
 #[derive(Debug)]
 pub struct ArpEngine {
     /// Per-interface ARP caches (interface name -> cache).
@@ -92,6 +119,10 @@ pub struct ArpEngine {
     timeout_sec: u64,
     /// Maximum ARP table entries per interface (from configuration).
     max_entries: usize,
+    /// Per-next-hop-IP packet hold queue. Packets waiting for ARP
+    /// resolution are held here until a reply arrives or the timeout
+    /// expires.
+    hold_queue: HashMap<[u8; 4], VecDeque<HeldPacket>>,
 }
 
 impl ArpEngine {
@@ -124,6 +155,7 @@ impl ArpEngine {
             interfaces: if_map,
             timeout_sec,
             max_entries,
+            hold_queue: HashMap::new(),
         }
     }
 
@@ -225,6 +257,79 @@ impl ArpEngine {
             .values_mut()
             .map(|cache| cache.age(timeout))
             .sum()
+    }
+
+    // ── Hold queue methods ────────────────────────────────────────────
+
+    /// Enqueue a packet in the hold queue for a given next-hop IP.
+    ///
+    /// If the queue for this IP exceeds [`HOLD_QUEUE_MAX_PER_IP`], the
+    /// oldest packet is dropped. Returns `true` if a packet was dropped
+    /// due to overflow.
+    pub fn queue_packet(
+        &mut self,
+        next_hop_ip: [u8; 4],
+        data: Vec<u8>,
+        egress_iface: String,
+    ) -> bool {
+        let queue = self.hold_queue.entry(next_hop_ip).or_default();
+
+        let overflow = queue.len() >= HOLD_QUEUE_MAX_PER_IP;
+        if overflow {
+            queue.pop_front(); // Drop oldest packet.
+        }
+
+        queue.push_back(HeldPacket {
+            data,
+            egress_iface,
+            enqueued_at: Instant::now(),
+        });
+
+        overflow
+    }
+
+    /// Flush the hold queue for a resolved next-hop IP.
+    ///
+    /// Returns all held packets for that IP, removing them from the queue.
+    /// Returns an empty `Vec` if there are no packets queued for that IP.
+    pub fn flush_queue(&mut self, next_hop_ip: &[u8; 4]) -> Vec<HeldPacket> {
+        self.hold_queue
+            .remove(next_hop_ip)
+            .map(|q| q.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Drain expired packets from all hold queues.
+    ///
+    /// Packets that have been queued longer than [`HOLD_QUEUE_TIMEOUT_SECS`]
+    /// are removed. Returns the total number of packets dropped.
+    pub fn drain_expired(&mut self) -> usize {
+        let now = Instant::now();
+        let timeout = std::time::Duration::from_secs(HOLD_QUEUE_TIMEOUT_SECS);
+        let mut total_dropped = 0;
+
+        self.hold_queue.retain(|_ip, queue| {
+            let before = queue.len();
+            queue.retain(|pkt| now.duration_since(pkt.enqueued_at) < timeout);
+            total_dropped += before - queue.len();
+            !queue.is_empty()
+        });
+
+        total_dropped
+    }
+
+    /// Return the number of packets currently held across all next-hop
+    /// queues.
+    pub fn hold_queue_len(&self) -> usize {
+        self.hold_queue.values().map(|q| q.len()).sum()
+    }
+
+    /// Return the number of packets held for a specific next-hop IP.
+    pub fn hold_queue_len_for(&self, next_hop_ip: &[u8; 4]) -> usize {
+        self.hold_queue
+            .get(next_hop_ip)
+            .map(|q| q.len())
+            .unwrap_or(0)
     }
 
     // ── Private helpers ────────────────────────────────────────────────

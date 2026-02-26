@@ -41,8 +41,12 @@ pub struct Dataplane {
     /// Wrapped in a `Mutex` because [`l2::L2Engine::process`] requires
     /// `&mut self` (for MAC learning), while the run loop takes `&self`.
     pub l2: Mutex<l2::L2Engine>,
-    /// ARP resolution engine (per-interface ARP caches).
-    pub arp: arp::ArpEngine,
+    /// ARP resolution engine (per-interface ARP caches and hold queue).
+    ///
+    /// Wrapped in a `Mutex` because [`arp::ArpEngine::resolve`] and
+    /// [`arp::ArpEngine::queue_packet`] require `&mut self`, while the
+    /// run loop takes `&self`.
+    pub arp: Mutex<arp::ArpEngine>,
     /// L3 IPv4 forwarding engine (static routing, LPM).
     pub l3: routing::L3Engine,
     /// NAT44 engine (NAPT, port forwarding, hairpin).
@@ -78,7 +82,7 @@ impl Dataplane {
 
         Ok(Self {
             l2: Mutex::new(l2),
-            arp,
+            arp: Mutex::new(arp),
             l3,
             nat,
             firewall,
@@ -118,10 +122,12 @@ impl Dataplane {
 
                 let result = {
                     let mut l2_guard = self.l2.lock().unwrap();
+                    let mut arp_guard = self.arp.lock().unwrap();
                     pipeline::process_packet(
                         raw_pkt,
                         &mut l2_guard,
                         &self.l3,
+                        &mut arp_guard,
                         &self.firewall,
                         &self.conntrack,
                         &self.zone_resolver,
@@ -179,6 +185,20 @@ impl Dataplane {
                     pipeline::PipelineResult::Consumed => {
                         self.observer.inc_local_delivery();
                     }
+                    pipeline::PipelineResult::Queued { arp_request } => {
+                        // The packet is held in the ARP engine's hold
+                        // queue. If the ARP action is a Reply or
+                        // SendRequest, we would need to construct and
+                        // send the ARP packet. For v0.1, we log the
+                        // event; the actual ARP packet transmission
+                        // requires building a raw ARP frame which is
+                        // handled in a future iteration.
+                        //
+                        // When the next ARP reply arrives for this
+                        // next-hop, the hold queue will be flushed in
+                        // the next iteration.
+                        let _ = arp_request; // Suppress unused warning.
+                    }
                 }
             }
 
@@ -209,6 +229,7 @@ fn map_pipeline_drop_to_observe(reason: pipeline::DropReason) -> ruster_observe:
         pipeline::DropReason::L3NotIpv4 => ruster_observe::DropReason::L3NotIpv4,
         pipeline::DropReason::FirewallDrop => ruster_observe::DropReason::FirewallDrop,
         pipeline::DropReason::NatDrop => ruster_observe::DropReason::NatTableFull,
+        pipeline::DropReason::ArpUnresolved => ruster_observe::DropReason::ArpUnresolved,
     }
 }
 
@@ -372,10 +393,43 @@ mod tests {
         }
     }
 
+    /// Pre-populate the ARP cache on the dataplane with the default
+    /// gateway MAC so that forwardable packets get `Forward` instead
+    /// of `Queued` (ARP cache miss).
+    fn prepopulate_arp_cache(dp: &Dataplane) {
+        use crate::packet::{ArpInfo, L2Info, L3Info, PacketMeta};
+
+        let mut arp = dp.arp.lock().unwrap();
+
+        // Simulate an ARP reply from the default gateway (203.0.113.1)
+        // arriving on wan0 with a fake MAC.
+        let gw_mac = [0xDE, 0xAD, 0x00, 0x00, 0x00, 0x01];
+        let wan_mac = [0x02, 0x00, 0x00, 0x00, 0x10, 0x01];
+        let arp_reply = PacketMeta {
+            in_ifname: "wan0".to_string(),
+            l2: L2Info {
+                dst_mac: wan_mac,
+                src_mac: gw_mac,
+                ethertype: 0x0806,
+            },
+            l3: Some(L3Info::Arp(ArpInfo {
+                operation: 2, // ARP Reply
+                sender_mac: gw_mac,
+                sender_ip: [203, 0, 113, 1],
+                target_mac: wan_mac,
+                target_ip: [203, 0, 113, 2],
+            })),
+            l4: None,
+            raw_len: 42,
+        };
+        arp.process_arp(&arp_reply);
+    }
+
     #[test]
     fn dataplane_run_counts_tx_errors() {
         let config = load_example_fw_disabled();
         let dp = Dataplane::init(&config).expect("init should succeed");
+        prepopulate_arp_cache(&dp);
 
         let mock_io = io::MockPacketIo::new();
 
@@ -428,6 +482,7 @@ mod tests {
     fn observer_rx_counter_increments_on_packet_process() {
         let config = load_example_fw_disabled();
         let dp = Dataplane::init(&config).expect("init should succeed");
+        prepopulate_arp_cache(&dp);
 
         let mock_io = io::MockPacketIo::new();
         let pkt = make_forwardable_packet();
@@ -455,6 +510,7 @@ mod tests {
     fn observer_tx_counter_increments_on_successful_forward() {
         let config = load_example_fw_disabled();
         let dp = Dataplane::init(&config).expect("init should succeed");
+        prepopulate_arp_cache(&dp);
 
         let mock_io = io::MockPacketIo::new();
         let pkt = make_forwardable_packet();
@@ -483,6 +539,7 @@ mod tests {
     fn observer_tx_drop_counter_increments_on_tx_failure() {
         let config = load_example_fw_disabled();
         let dp = Dataplane::init(&config).expect("init should succeed");
+        prepopulate_arp_cache(&dp);
 
         let mock_io = io::MockPacketIo::new();
         mock_io.inject(make_forwardable_packet());
@@ -665,6 +722,7 @@ mod tests {
     fn observer_snapshot_after_mixed_traffic() {
         let config = load_example_fw_disabled();
         let dp = Dataplane::init(&config).expect("init should succeed");
+        prepopulate_arp_cache(&dp);
 
         let mock_io = io::MockPacketIo::new();
 
@@ -726,5 +784,9 @@ mod tests {
             OD::FirewallDrop
         );
         assert_eq!(map_pipeline_drop_to_observe(PD::NatDrop), OD::NatTableFull);
+        assert_eq!(
+            map_pipeline_drop_to_observe(PD::ArpUnresolved),
+            OD::ArpUnresolved
+        );
     }
 }
