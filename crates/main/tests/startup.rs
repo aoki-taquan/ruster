@@ -86,11 +86,11 @@ fn dataplane_init_creates_all_engines() {
     // The example config has NAT enabled.
     assert!(dp.nat.is_enabled(), "NAT should be enabled per config");
 
-    // L3 engine should have the static routes loaded.
+    // L3 engine should have the static routes loaded into the FIB.
     assert_eq!(
-        dp.l3.route_table().len(),
+        dp.l3.fib().len(),
         config.routing.ipv4_static_routes.len(),
-        "route table should have all static routes"
+        "FIB should have all static routes"
     );
 
     // Conntrack should start with zero sessions.
