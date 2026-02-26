@@ -20,8 +20,10 @@ use crate::icmp::{self, IcmpReply};
 use crate::io::RawPacket;
 use crate::l2::bridge::L2Decision;
 use crate::l2::L2Engine;
+use crate::nd::NdEngine;
 use crate::packet;
 use crate::packet::{L3Info, L4Info};
+use crate::routing::ipv6_table::Ipv6RouteTable;
 use crate::routing::{L3Decision, L3DropReason, L3Engine};
 
 use ruster_config::model::{FirewallZone, InterfaceConfig, InterfaceZone};
@@ -71,6 +73,19 @@ pub enum PipelineResult {
         /// Next-hop IPv4 address (Some for L3 forwarded packets, None for L2-only).
         next_hop: Option<[u8; 4]>,
     },
+    /// Packet should be forwarded out the given interface (IPv6 path).
+    ///
+    /// RFC-REF: RFC 8200 Section 3
+    /// IPv6 forwarding uses a 128-bit next-hop address and hop-limit
+    /// decrement (no header checksum to update).
+    ForwardV6 {
+        /// Name of the egress interface.
+        egress_iface: String,
+        /// New Hop Limit after decrement.
+        new_hop_limit: u8,
+        /// Next-hop IPv6 address.
+        next_hop_v6: [u8; 16],
+    },
     /// Packet should be flooded to all listed interfaces (L2 unknown
     /// unicast or broadcast within a bridge domain).
     Flood {
@@ -103,6 +118,8 @@ pub enum DropReason {
     L3TtlExpired,
     /// L3 engine received a non-IPv4 packet.
     L3NotIpv4,
+    /// IPv6 Hop Limit expired.
+    L3HopLimitExpired,
     /// Firewall dropped the packet.
     FirewallDrop,
     /// NAT engine dropped the packet.
@@ -148,7 +165,8 @@ pub enum ConntrackResult {
 ///    both forward and reverse session keys. Create a new session for
 ///    new flows; update TCP state and refresh timestamps for existing
 ///    sessions.
-/// 6. Check L3 routing via [`L3Engine::process`].
+/// 6. Check L3 routing via [`L3Engine::process`] (IPv4) or the IPv6
+///    forwarding path (ND check -> route lookup -> forward).
 /// 7. Based on the L3 decision:
 ///    - `Forward { .. }` -> check firewall -> `Forward` or `Drop(FirewallDrop)`.
 ///    - `LocalDelivery` -> `Consumed`.
@@ -161,6 +179,40 @@ pub fn process_packet(
     conntrack: &mut ConntrackEngine,
     zone_resolver: &ZoneResolver,
     iface_macs: &std::collections::HashMap<String, [u8; 6]>,
+) -> PipelineResult {
+    process_packet_v6(
+        raw_pkt,
+        l2,
+        l3,
+        firewall,
+        conntrack,
+        zone_resolver,
+        iface_macs,
+        None,
+        None,
+    )
+}
+
+/// Process a single raw packet with optional IPv6 engine support.
+///
+/// When `nd` and `ipv6_routes` are `Some`, IPv6 packets are forwarded
+/// through the ND resolution + LPM route lookup path. When they are
+/// `None`, IPv6 packets fall through to the IPv4 L3 engine which will
+/// return `Drop(NotIpv4)`.
+///
+/// RFC-REF: RFC 8200 Section 3
+/// IPv6 forwarding is based on the 128-bit destination address;
+/// Hop Limit is decremented and the packet is forwarded or dropped.
+pub fn process_packet_v6(
+    raw_pkt: &RawPacket,
+    l2: &mut L2Engine,
+    l3: &L3Engine,
+    firewall: &FirewallEngine,
+    conntrack: &mut ConntrackEngine,
+    zone_resolver: &ZoneResolver,
+    iface_macs: &std::collections::HashMap<String, [u8; 6]>,
+    nd: Option<&mut NdEngine>,
+    ipv6_routes: Option<&Ipv6RouteTable>,
 ) -> PipelineResult {
     // Step 1: Parse raw bytes.
     let meta = match packet::parse_packet(&raw_pkt.data, &raw_pkt.ingress_iface) {
@@ -184,6 +236,10 @@ pub fn process_packet(
         //   (transit routing — the host is using us as the default gateway).
         let is_local_ip = match &meta.l3 {
             Some(L3Info::Ipv4(ipv4)) => l3.is_local_ip(&ipv4.dst_addr),
+            Some(L3Info::Ipv6(ipv6)) => nd
+                .as_ref()
+                .map(|engine| engine.is_local_ipv6(&ipv6.dst_addr))
+                .unwrap_or(false),
             _ => false,
         };
         let is_router_mac = iface_macs
@@ -211,6 +267,28 @@ pub fn process_packet(
         // else: packet is for our local IP -> fall through to L3.
     }
 
+    // ── IPv6 path ──────────────────────────────────────────────────────
+    //
+    // RFC-REF: RFC 8200 Section 3
+    // If the packet is IPv6 and we have IPv6 engines, process it through
+    // the IPv6-specific forwarding path: ND check -> route lookup.
+    if let Some(L3Info::Ipv6(ref ipv6)) = meta.l3 {
+        if let (Some(nd_engine), Some(route_table)) = (nd, ipv6_routes) {
+            return process_ipv6_packet(
+                raw_pkt,
+                &meta,
+                ipv6,
+                nd_engine,
+                route_table,
+                firewall,
+                conntrack,
+                zone_resolver,
+            );
+        }
+        // No IPv6 engines -> fall through to IPv4 L3 which will return NotIpv4.
+    }
+
+    // ── IPv4 path ──────────────────────────────────────────────────────
     // Step 3: Conntrack lookup/create.
     //
     // For every trackable packet (IPv4 with TCP/UDP/ICMP L4 header),
@@ -362,6 +440,89 @@ fn initial_session_state(meta: &packet::PacketMeta) -> SessionState {
     }
 }
 
+/// Process an IPv6 packet through ND and route lookup.
+///
+/// RFC-REF: RFC 8200 Section 3
+/// 1. Check if this is an ND message (NS/NA) and process via NdEngine.
+/// 2. Check if the destination is one of our local IPv6 addresses.
+/// 3. Check Hop Limit (must be > 1 to forward).
+/// 4. Perform LPM route lookup in the IPv6 route table.
+/// 5. Return ForwardV6 or Drop.
+fn process_ipv6_packet(
+    raw_pkt: &RawPacket,
+    meta: &packet::PacketMeta,
+    ipv6: &packet::Ipv6Info,
+    nd_engine: &mut NdEngine,
+    route_table: &Ipv6RouteTable,
+    firewall: &FirewallEngine,
+    conntrack: &ConntrackEngine,
+    zone_resolver: &ZoneResolver,
+) -> PipelineResult {
+    // Step 1: Check if this is an ND message.
+    if let Some(packet::L4Info::Icmpv6(ref icmpv6)) = meta.l4 {
+        if icmpv6.nd.is_some() {
+            // Process ND and consume the packet.
+            let _nd_action = nd_engine.process_nd(meta);
+            // ND packets are consumed (replies are generated separately).
+            return PipelineResult::Consumed;
+        }
+    }
+
+    // Step 2: Check for local delivery.
+    if nd_engine.is_local_ipv6(&ipv6.dst_addr) {
+        return PipelineResult::Consumed;
+    }
+
+    // Step 3: Check Hop Limit.
+    // RFC-REF: RFC 8200 Section 3
+    // "If [...] the Hop Limit is less than or equal to 1 [...] discard
+    // the packet and originate an ICMPv6 Time Exceeded message."
+    if ipv6.hop_limit <= 1 {
+        return PipelineResult::Drop {
+            reason: DropReason::L3HopLimitExpired,
+            // RFC-DEVIATION:
+            // reason: ICMPv6 Time Exceeded not yet implemented
+            // impact: senders will not be notified of hop limit expiry via ICMPv6
+            // issue: #159
+            // plan: v0.2 で ICMPv6 error generation を実装
+            icmp_reply: None,
+        };
+    }
+
+    // Step 4: Route lookup.
+    let route = match route_table.lookup(&ipv6.dst_addr) {
+        Some(entry) => entry,
+        None => {
+            return PipelineResult::Drop {
+                reason: DropReason::L3NoRoute,
+                icmp_reply: None,
+            }
+        }
+    };
+
+    let out_ifname = route.out_ifname.clone();
+    let next_hop_v6 = route.next_hop;
+    let new_hop_limit = ipv6.hop_limit - 1;
+
+    // Step 5: Firewall check.
+    let src_zone = zone_resolver.resolve(&raw_pkt.ingress_iface);
+    let dst_zone = zone_resolver.resolve(&out_ifname);
+    let fw_ctx = FwContext::from_packet(meta, FwChain::Forward, src_zone, dst_zone, conntrack);
+    let verdict = firewall.evaluate(&fw_ctx);
+
+    match verdict {
+        FwVerdict::Accept | FwVerdict::AcceptRule { .. } => PipelineResult::ForwardV6 {
+            egress_iface: out_ifname,
+            new_hop_limit,
+            next_hop_v6,
+        },
+        FwVerdict::Drop | FwVerdict::DropRule { .. } => PipelineResult::Drop {
+            reason: DropReason::FirewallDrop,
+            icmp_reply: None,
+        },
+    }
+}
+
 /// Map an L3 drop reason to a pipeline drop reason.
 fn map_l3_drop_reason(reason: L3DropReason) -> DropReason {
     match reason {
@@ -417,6 +578,7 @@ mod tests {
                     metric: 10,
                 },
             ],
+            ipv6_static_routes: vec![],
         }
     }
 
@@ -430,6 +592,7 @@ mod tests {
                 mtu: 1500,
                 mac: "00:11:22:33:44:55".to_string(),
                 ipv4_addrs: vec!["10.0.0.2/24".to_string()],
+                ipv6_addrs: vec![],
                 zone: InterfaceZone::Wan,
                 l2_domain: "br0".to_string(),
                 linux_if: None,
@@ -442,6 +605,7 @@ mod tests {
                 mtu: 1500,
                 mac: "00:AA:BB:CC:DD:EE".to_string(),
                 ipv4_addrs: vec!["192.168.1.1/24".to_string()],
+                ipv6_addrs: vec![],
                 zone: InterfaceZone::Lan,
                 l2_domain: "br0".to_string(),
                 linux_if: None,
@@ -616,6 +780,7 @@ mod tests {
                 out_if: "lan0".to_string(),
                 metric: 10,
             }],
+            ipv6_static_routes: vec![],
         };
         let l3 = L3Engine::from_config(&routing, &make_interfaces()).unwrap();
         let fw = make_fw_accept_all();
@@ -1011,6 +1176,7 @@ mod tests {
                 out_if: "lan0".to_string(),
                 metric: 10,
             }],
+            ipv6_static_routes: vec![],
         };
         let l3 = L3Engine::from_config(&routing, &make_interfaces()).unwrap();
         let fw = make_fw_accept_all();
@@ -1227,6 +1393,7 @@ mod tests {
                 out_if: "wan0".to_string(),
                 metric: 100,
             }],
+            ipv6_static_routes: vec![],
         };
         let ifaces = vec![
             InterfaceConfig {
@@ -1237,6 +1404,7 @@ mod tests {
                 mtu: 1500,
                 mac: "02:00:00:00:00:01".to_string(),
                 ipv4_addrs: vec!["192.168.1.1/24".to_string()],
+                ipv6_addrs: vec![],
                 zone: InterfaceZone::Lan,
                 l2_domain: "br0".to_string(),
                 linux_if: None,
@@ -1249,6 +1417,7 @@ mod tests {
                 mtu: 1500,
                 mac: "02:00:00:00:00:02".to_string(),
                 ipv4_addrs: vec![],
+                ipv6_addrs: vec![],
                 zone: InterfaceZone::Lan,
                 l2_domain: "br0".to_string(),
                 linux_if: None,
@@ -1261,6 +1430,7 @@ mod tests {
                 mtu: 1500,
                 mac: "02:00:00:00:00:03".to_string(),
                 ipv4_addrs: vec![],
+                ipv6_addrs: vec![],
                 zone: InterfaceZone::Lan,
                 l2_domain: "br0".to_string(),
                 linux_if: None,
@@ -1273,6 +1443,7 @@ mod tests {
                 mtu: 1500,
                 mac: "02:00:00:00:10:01".to_string(),
                 ipv4_addrs: vec!["10.0.0.2/24".to_string()],
+                ipv6_addrs: vec![],
                 zone: InterfaceZone::Wan,
                 l2_domain: "bd-wan".to_string(),
                 linux_if: None,
@@ -1976,5 +2147,440 @@ mod tests {
             0,
             "ARP should not create a conntrack session"
         );
+    }
+
+    // ── IPv6 pipeline tests ──────────────────────────────────────────
+
+    use crate::nd::NdEngine;
+    use crate::routing::ipv6_table::Ipv6RouteTable;
+    use ruster_config::model::Ipv6StaticRoute;
+
+    fn make_ipv6_interfaces() -> Vec<InterfaceConfig> {
+        vec![
+            InterfaceConfig {
+                name: "wan0".to_string(),
+                port_id: 0,
+                role: InterfaceRole::Wan,
+                admin_up: true,
+                mtu: 1500,
+                mac: "00:11:22:33:44:55".to_string(),
+                ipv4_addrs: vec!["10.0.0.2/24".to_string()],
+                ipv6_addrs: vec!["2001:db8::2/64".to_string()],
+                zone: InterfaceZone::Wan,
+                l2_domain: "br0".to_string(),
+                linux_if: None,
+            },
+            InterfaceConfig {
+                name: "lan0".to_string(),
+                port_id: 1,
+                role: InterfaceRole::Lan,
+                admin_up: true,
+                mtu: 1500,
+                mac: "00:AA:BB:CC:DD:EE".to_string(),
+                ipv4_addrs: vec!["192.168.1.1/24".to_string()],
+                ipv6_addrs: vec!["2001:db8:1::1/64".to_string()],
+                zone: InterfaceZone::Lan,
+                l2_domain: "br0".to_string(),
+                linux_if: None,
+            },
+        ]
+    }
+
+    fn make_ipv6_routing_config() -> RoutingConfig {
+        RoutingConfig {
+            ipv4_static_routes: vec![StaticRoute {
+                prefix: "0.0.0.0/0".to_string(),
+                next_hop: "10.0.0.1".to_string(),
+                out_if: "wan0".to_string(),
+                metric: 100,
+            }],
+            ipv6_static_routes: vec![
+                Ipv6StaticRoute {
+                    prefix: "::/0".to_string(),
+                    next_hop: "2001:db8::1".to_string(),
+                    out_if: "wan0".to_string(),
+                    metric: 100,
+                },
+                Ipv6StaticRoute {
+                    prefix: "2001:db8:1::/48".to_string(),
+                    next_hop: "::".to_string(),
+                    out_if: "lan0".to_string(),
+                    metric: 10,
+                },
+            ],
+        }
+    }
+
+    fn make_nd_engine() -> NdEngine {
+        let l2_config = L2Config {
+            mac_table_max_entries: 1024,
+            mac_aging_sec: 300,
+            arp_table_max_entries: 256,
+            arp_timeout_sec: 120,
+            arp_hold_queue_per_ip: 3,
+            arp_hold_queue_max: 1024,
+            bridge_domains: vec![],
+        };
+        NdEngine::from_config(&l2_config, &make_ipv6_interfaces())
+    }
+
+    fn make_ipv6_route_table() -> Ipv6RouteTable {
+        Ipv6RouteTable::from_config(&make_ipv6_routing_config()).unwrap()
+    }
+
+    /// Build a valid Ethernet + IPv6 + UDP packet.
+    fn make_ipv6_packet(
+        src_mac: [u8; 6],
+        dst_mac: [u8; 6],
+        src_ipv6: [u8; 16],
+        dst_ipv6: [u8; 16],
+        hop_limit: u8,
+    ) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        // Ethernet header (14 bytes)
+        pkt.extend_from_slice(&dst_mac);
+        pkt.extend_from_slice(&src_mac);
+        pkt.extend_from_slice(&[0x86, 0xDD]); // EtherType IPv6
+
+        // IPv6 header (40 bytes)
+        // Version=6, TC=0, FL=0
+        pkt.push(0x60);
+        pkt.push(0x00);
+        pkt.push(0x00);
+        pkt.push(0x00);
+        // Payload Length = 8 (UDP header only)
+        pkt.extend_from_slice(&8u16.to_be_bytes());
+        // Next Header: UDP (17)
+        pkt.push(17);
+        // Hop Limit
+        pkt.push(hop_limit);
+        // Source Address
+        pkt.extend_from_slice(&src_ipv6);
+        // Destination Address
+        pkt.extend_from_slice(&dst_ipv6);
+
+        // Minimal UDP header (8 bytes)
+        pkt.extend_from_slice(&[0x00, 0x50]); // src port: 80
+        pkt.extend_from_slice(&[0x00, 0x51]); // dst port: 81
+        pkt.extend_from_slice(&[0x00, 0x08]); // length: 8
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum: 0
+        pkt
+    }
+
+    #[test]
+    fn ipv6_forward_via_default_route() {
+        let l3 = L3Engine::from_config(
+            &make_ipv6_routing_config(),
+            &make_ipv6_interfaces(),
+        )
+        .unwrap();
+        let fw = make_fw_accept_all();
+        let mut ct = make_conntrack();
+        let zr = ZoneResolver::from_config(&make_ipv6_interfaces());
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+        let mut nd = make_nd_engine();
+        let ipv6_routes = make_ipv6_route_table();
+
+        // 2001:db8:2::100 should match the default route -> wan0
+        let src = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64];
+        let dst = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let data = make_ipv6_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
+            src,
+            dst,
+            64,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        let result = process_packet_v6(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &zr,
+            &im,
+            Some(&mut nd),
+            Some(&ipv6_routes),
+        );
+        match result {
+            PipelineResult::ForwardV6 {
+                egress_iface,
+                new_hop_limit,
+                ..
+            } => {
+                assert_eq!(egress_iface, "wan0");
+                assert_eq!(new_hop_limit, 63);
+            }
+            other => panic!("expected ForwardV6, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ipv6_local_delivery() {
+        let l3 = L3Engine::from_config(
+            &make_ipv6_routing_config(),
+            &make_ipv6_interfaces(),
+        )
+        .unwrap();
+        let fw = make_fw_accept_all();
+        let mut ct = make_conntrack();
+        let zr = ZoneResolver::from_config(&make_ipv6_interfaces());
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+        let mut nd = make_nd_engine();
+        let ipv6_routes = make_ipv6_route_table();
+
+        // Destination is our local IPv6 (2001:db8:1::1 on lan0).
+        let src = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64];
+        let dst = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let data = make_ipv6_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
+            src,
+            dst,
+            64,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        let result = process_packet_v6(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &zr,
+            &im,
+            Some(&mut nd),
+            Some(&ipv6_routes),
+        );
+        assert!(
+            matches!(result, PipelineResult::Consumed),
+            "expected Consumed for local IPv6, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn ipv6_hop_limit_expired() {
+        let l3 = L3Engine::from_config(
+            &make_ipv6_routing_config(),
+            &make_ipv6_interfaces(),
+        )
+        .unwrap();
+        let fw = make_fw_accept_all();
+        let mut ct = make_conntrack();
+        let zr = ZoneResolver::from_config(&make_ipv6_interfaces());
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+        let mut nd = make_nd_engine();
+        let ipv6_routes = make_ipv6_route_table();
+
+        let src = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64];
+        let dst = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        // Hop limit = 1 -> should be dropped.
+        let data = make_ipv6_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
+            src,
+            dst,
+            1,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        let result = process_packet_v6(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &zr,
+            &im,
+            Some(&mut nd),
+            Some(&ipv6_routes),
+        );
+        match result {
+            PipelineResult::Drop { reason, .. } => {
+                assert_eq!(reason, DropReason::L3HopLimitExpired);
+            }
+            other => panic!("expected Drop(L3HopLimitExpired), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ipv6_no_route() {
+        let l3 = L3Engine::from_config(
+            &make_ipv6_routing_config(),
+            &make_ipv6_interfaces(),
+        )
+        .unwrap();
+        let fw = make_fw_accept_all();
+        let mut ct = make_conntrack();
+        let zr = ZoneResolver::from_config(&make_ipv6_interfaces());
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+        let mut nd = make_nd_engine();
+        // Route table with NO default route -- only a specific /48.
+        let routing_no_default = RoutingConfig {
+            ipv4_static_routes: vec![],
+            ipv6_static_routes: vec![Ipv6StaticRoute {
+                prefix: "2001:db8:1::/48".to_string(),
+                next_hop: "::".to_string(),
+                out_if: "lan0".to_string(),
+                metric: 10,
+            }],
+        };
+        let ipv6_routes = Ipv6RouteTable::from_config(&routing_no_default).unwrap();
+
+        // Destination 2001:db8:2::1 has no matching route.
+        let src = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64];
+        let dst = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let data = make_ipv6_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
+            src,
+            dst,
+            64,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        let result = process_packet_v6(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &zr,
+            &im,
+            Some(&mut nd),
+            Some(&ipv6_routes),
+        );
+        match result {
+            PipelineResult::Drop { reason, .. } => {
+                assert_eq!(reason, DropReason::L3NoRoute);
+            }
+            other => panic!("expected Drop(L3NoRoute), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ipv6_nd_consumed() {
+        let l3 = L3Engine::from_config(
+            &make_ipv6_routing_config(),
+            &make_ipv6_interfaces(),
+        )
+        .unwrap();
+        let fw = make_fw_accept_all();
+        let mut ct = make_conntrack();
+        let zr = ZoneResolver::from_config(&make_ipv6_interfaces());
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+        let mut nd = make_nd_engine();
+        let ipv6_routes = make_ipv6_route_table();
+
+        // Build a Neighbor Solicitation packet.
+        let mut pkt = Vec::new();
+        // Ethernet header (14 bytes)
+        pkt.extend_from_slice(&[0x33, 0x33, 0x00, 0x00, 0x00, 0x01]); // dst: solicited-node multicast
+        pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]); // src
+        pkt.extend_from_slice(&[0x86, 0xDD]); // EtherType: IPv6
+
+        // IPv6 header (40 bytes)
+        pkt.push(0x60); // Version=6
+        pkt.push(0x00);
+        pkt.push(0x00);
+        pkt.push(0x00);
+        // Payload Length = 24 (NS without options)
+        pkt.extend_from_slice(&24u16.to_be_bytes());
+        // Next Header: ICMPv6 (58)
+        pkt.push(58);
+        // Hop Limit: 255
+        pkt.push(255);
+        // Source: 2001:db8:1::64
+        let src_ip = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64];
+        pkt.extend_from_slice(&src_ip);
+        // Destination: ff02::1:ff00:1 (solicited-node multicast)
+        let dst_ip = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, 0, 0, 0x01];
+        pkt.extend_from_slice(&dst_ip);
+
+        // ICMPv6 NS (24 bytes)
+        pkt.push(135); // Type: NS
+        pkt.push(0);   // Code: 0
+        pkt.extend_from_slice(&[0x00, 0x00]); // Checksum (simplified)
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Reserved
+        // Target: 2001:db8:1::1 (our address)
+        let target = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        pkt.extend_from_slice(&target);
+
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data: pkt,
+        };
+
+        let result = process_packet_v6(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &zr,
+            &im,
+            Some(&mut nd),
+            Some(&ipv6_routes),
+        );
+        assert!(
+            matches!(result, PipelineResult::Consumed),
+            "expected Consumed for ND packet, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn ipv6_without_engines_falls_through_to_not_ipv4() {
+        // When IPv6 engines are None, IPv6 packets are handled by
+        // the IPv4 L3 engine which returns Drop(NotIpv4).
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let mut ct = make_conntrack();
+        let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+
+        let src = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let dst = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02];
+        let data = make_ipv6_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
+            src,
+            dst,
+            64,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        // Call with no IPv6 engines.
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
+        match result {
+            PipelineResult::Drop { reason, .. } => {
+                assert_eq!(reason, DropReason::L3NotIpv4);
+            }
+            other => panic!("expected Drop(L3NotIpv4), got {:?}", other),
+        }
     }
 }

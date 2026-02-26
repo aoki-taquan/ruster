@@ -9,7 +9,9 @@
 pub mod arp;
 pub mod ethernet;
 pub mod icmp;
+pub mod icmpv6;
 pub mod ipv4;
+pub mod ipv6;
 pub mod tcp;
 pub mod udp;
 
@@ -18,11 +20,15 @@ use std::fmt;
 // ── EtherType constants ────────────────────────────────────────────
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;
+const ETHERTYPE_IPV6: u16 = 0x86DD;
 
 // ── IPv4 protocol constants ────────────────────────────────────────
 const IP_PROTO_ICMP: u8 = 1;
 const IP_PROTO_TCP: u8 = 6;
 const IP_PROTO_UDP: u8 = 17;
+
+// ── IPv6 next-header constants ─────────────────────────────────────
+const IP_PROTO_ICMPV6: u8 = 58;
 
 // ── Core types ─────────────────────────────────────────────────────
 
@@ -57,6 +63,7 @@ pub struct L2Info {
 #[derive(Debug, Clone, PartialEq)]
 pub enum L3Info {
     Ipv4(Ipv4Info),
+    Ipv6(Ipv6Info),
     Arp(ArpInfo),
 }
 
@@ -79,6 +86,24 @@ pub struct Ipv4Info {
     pub payload_offset: usize,
 }
 
+/// Parsed IPv6 header fields.
+///
+/// RFC-REF: RFC 8200 Section 3
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ipv6Info {
+    pub src_addr: [u8; 16],
+    pub dst_addr: [u8; 16],
+    pub hop_limit: u8,
+    /// Next Header field (identifies the type of the next header).
+    pub next_header: u8,
+    /// Payload length (does NOT include the 40-byte fixed header).
+    pub payload_length: u16,
+    pub traffic_class: u8,
+    pub flow_label: u32,
+    /// Byte offset from the start of the raw packet to the IPv6 payload.
+    pub payload_offset: usize,
+}
+
 /// Parsed ARP message fields.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ArpInfo {
@@ -96,6 +121,7 @@ pub enum L4Info {
     Tcp(TcpInfo),
     Udp(UdpInfo),
     Icmp(IcmpInfo),
+    Icmpv6(Icmpv6Info),
 }
 
 /// Parsed TCP header fields.
@@ -134,6 +160,39 @@ pub struct IcmpInfo {
     pub rest_of_header: [u8; 4],
 }
 
+/// Parsed ICMPv6 message fields.
+///
+/// RFC-REF: RFC 4443 Section 2.1
+#[derive(Debug, Clone, PartialEq)]
+pub struct Icmpv6Info {
+    pub icmpv6_type: u8,
+    pub icmpv6_code: u8,
+    pub checksum: u16,
+    /// Optional Neighbor Discovery information, if this is an ND message.
+    pub nd: Option<NdInfo>,
+}
+
+/// Neighbor Discovery information parsed from ICMPv6.
+///
+/// RFC-REF: RFC 4861 Section 4.3, 4.4
+#[derive(Debug, Clone, PartialEq)]
+pub enum NdInfo {
+    /// Neighbor Solicitation (type 135): "who has this IPv6 address?"
+    NeighborSolicitation {
+        /// The target IPv6 address being queried.
+        target_addr: [u8; 16],
+        /// Source link-layer address option (if present).
+        source_mac: Option<[u8; 6]>,
+    },
+    /// Neighbor Advertisement (type 136): "I have this IPv6 address."
+    NeighborAdvertisement {
+        /// The target IPv6 address being advertised.
+        target_addr: [u8; 16],
+        /// Target link-layer address option (if present).
+        target_mac: Option<[u8; 6]>,
+    },
+}
+
 // ── DropReason ─────────────────────────────────────────────────────
 
 /// Reason a packet was dropped during parsing.
@@ -145,6 +204,8 @@ pub enum DropReason {
     InvalidEthertype,
     /// IPv4 header is malformed (bad version, IHL, or total length).
     InvalidIpv4Header,
+    /// IPv6 header is malformed (bad version).
+    InvalidIpv6Header,
     /// IPv4 header checksum verification failed.
     Ipv4ChecksumError,
     /// IPv4 TTL has reached zero.
@@ -167,6 +228,7 @@ impl fmt::Display for DropReason {
             DropReason::TooShort => write!(f, "packet too short"),
             DropReason::InvalidEthertype => write!(f, "invalid EtherType"),
             DropReason::InvalidIpv4Header => write!(f, "invalid IPv4 header"),
+            DropReason::InvalidIpv6Header => write!(f, "invalid IPv6 header"),
             DropReason::Ipv4ChecksumError => write!(f, "IPv4 checksum error"),
             DropReason::Ipv4TtlExpired => write!(f, "IPv4 TTL expired"),
             DropReason::TruncatedL3 => write!(f, "truncated L3 payload"),
@@ -222,6 +284,27 @@ pub fn parse_packet(data: &[u8], in_ifname: &str) -> Result<PacketMeta, DropReas
             };
 
             (Some(L3Info::Ipv4(ipv4_info)), l4)
+        }
+        ETHERTYPE_IPV6 => {
+            let ipv6_info = ipv6::parse_ipv6(eth_payload, eth_payload_offset)?;
+
+            // ── L4 dispatch (IPv6) ─────────────────────────────────
+            let l4_offset = ipv6_info.payload_offset;
+            let l4_data = if l4_offset < data.len() {
+                &data[l4_offset..]
+            } else {
+                &[]
+            };
+            let l4 = match ipv6_info.next_header {
+                IP_PROTO_TCP => Some(L4Info::Tcp(tcp::parse_tcp(l4_data)?)),
+                IP_PROTO_UDP => Some(L4Info::Udp(udp::parse_udp(l4_data)?)),
+                IP_PROTO_ICMPV6 => {
+                    Some(L4Info::Icmpv6(icmpv6::parse_icmpv6(l4_data)?))
+                }
+                _ => None,
+            };
+
+            (Some(L3Info::Ipv6(ipv6_info)), l4)
         }
         // Unknown EtherType: do not drop, let downstream decide.
         _ => (None, None),
@@ -593,5 +676,147 @@ mod tests {
         let meta = parse_packet(&pkt, "eth0").unwrap();
         assert!(meta.l3.is_some());
         assert!(meta.l4.is_none()); // Unknown protocol -> L4 = None
+    }
+
+    // ── IPv6 integration tests ──────────────────────────────────────
+
+    /// Build a minimal Ethernet + IPv6 + UDP packet.
+    fn make_ipv6_udp_packet() -> Vec<u8> {
+        let mut pkt = Vec::new();
+        // Ethernet header (14 bytes)
+        pkt.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // dst
+        pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]); // src
+        pkt.extend_from_slice(&[0x86, 0xDD]); // EtherType: IPv6
+
+        // IPv6 header (40 bytes)
+        pkt.push(0x60); // Version=6, TC=0
+        pkt.push(0x00);
+        pkt.push(0x00);
+        pkt.push(0x00);
+        // Payload Length = 8 (UDP header)
+        pkt.extend_from_slice(&8u16.to_be_bytes());
+        pkt.push(17); // Next Header: UDP
+        pkt.push(64); // Hop Limit
+        // Source: 2001:db8::1
+        pkt.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
+        // Destination: 2001:db8::2
+        pkt.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]);
+
+        // UDP header (8 bytes)
+        pkt.extend_from_slice(&[0x00, 0x50]); // src port: 80
+        pkt.extend_from_slice(&[0x00, 0x51]); // dst port: 81
+        pkt.extend_from_slice(&[0x00, 0x08]); // length: 8
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum: 0
+        pkt
+    }
+
+    #[test]
+    fn ipv6_udp_full_parse() {
+        let pkt = make_ipv6_udp_packet();
+        let meta = parse_packet(&pkt, "eth0").unwrap();
+
+        // L2
+        assert_eq!(meta.l2.ethertype, 0x86DD);
+        assert_eq!(
+            meta.l2.src_mac,
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]
+        );
+
+        // L3: IPv6
+        match &meta.l3 {
+            Some(L3Info::Ipv6(ipv6)) => {
+                assert_eq!(
+                    ipv6.src_addr,
+                    [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]
+                );
+                assert_eq!(
+                    ipv6.dst_addr,
+                    [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]
+                );
+                assert_eq!(ipv6.hop_limit, 64);
+                assert_eq!(ipv6.next_header, 17); // UDP
+                assert_eq!(ipv6.payload_length, 8);
+                assert_eq!(ipv6.payload_offset, 54); // 14 + 40
+            }
+            other => panic!("expected Ipv6, got {:?}", other),
+        }
+
+        // L4: UDP
+        match &meta.l4 {
+            Some(L4Info::Udp(udp)) => {
+                assert_eq!(udp.src_port, 80);
+                assert_eq!(udp.dst_port, 81);
+            }
+            other => panic!("expected Udp, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ipv6_icmpv6_ns_full_parse() {
+        let mut pkt = Vec::new();
+        // Ethernet header
+        pkt.extend_from_slice(&[0x33, 0x33, 0x00, 0x00, 0x00, 0x01]); // dst
+        pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]); // src
+        pkt.extend_from_slice(&[0x86, 0xDD]); // EtherType: IPv6
+
+        // IPv6 header
+        pkt.push(0x60);
+        pkt.push(0x00);
+        pkt.push(0x00);
+        pkt.push(0x00);
+        // Payload Length = 24 (NS without options)
+        pkt.extend_from_slice(&24u16.to_be_bytes());
+        pkt.push(58); // Next Header: ICMPv6
+        pkt.push(255);
+        // Source: 2001:db8::100
+        pkt.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00]);
+        // Destination: ff02::1:ff00:1
+        pkt.extend_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, 0, 0, 0x01]);
+
+        // ICMPv6 NS (24 bytes)
+        pkt.push(135); // Type: NS
+        pkt.push(0);   // Code
+        pkt.extend_from_slice(&[0x00, 0x00]); // Checksum
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Reserved
+        // Target: 2001:db8::1
+        pkt.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
+
+        let meta = parse_packet(&pkt, "lan0").unwrap();
+
+        // L3: IPv6
+        assert!(matches!(&meta.l3, Some(L3Info::Ipv6(_))));
+
+        // L4: ICMPv6 with ND info
+        match &meta.l4 {
+            Some(L4Info::Icmpv6(icmpv6)) => {
+                assert_eq!(icmpv6.icmpv6_type, 135);
+                match &icmpv6.nd {
+                    Some(NdInfo::NeighborSolicitation {
+                        target_addr,
+                        source_mac,
+                    }) => {
+                        assert_eq!(
+                            target_addr,
+                            &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]
+                        );
+                        assert_eq!(*source_mac, None);
+                    }
+                    other => panic!("expected NeighborSolicitation, got {:?}", other),
+                }
+            }
+            other => panic!("expected Icmpv6, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ipv6_too_short() {
+        let mut pkt = Vec::new();
+        pkt.extend_from_slice(&[0x00; 6]); // dst
+        pkt.extend_from_slice(&[0x00; 6]); // src
+        pkt.extend_from_slice(&[0x86, 0xDD]); // IPv6
+        // Only 30 bytes of IPv6 header (need 40)
+        pkt.extend_from_slice(&[0x60; 30]);
+
+        assert_eq!(parse_packet(&pkt, "eth0"), Err(DropReason::TruncatedL3));
     }
 }

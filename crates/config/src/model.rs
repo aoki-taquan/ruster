@@ -105,6 +105,8 @@ pub struct InterfaceConfig {
     pub mtu: u16,
     pub mac: String,
     pub ipv4_addrs: Vec<String>,
+    #[serde(default)]
+    pub ipv6_addrs: Vec<String>,
     pub zone: InterfaceZone,
     pub l2_domain: String,
     #[serde(default)]
@@ -155,8 +157,19 @@ pub struct StaticRoute {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Ipv6StaticRoute {
+    pub prefix: String,
+    pub next_hop: String,
+    pub out_if: String,
+    pub metric: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
     pub ipv4_static_routes: Vec<StaticRoute>,
+    #[serde(default)]
+    pub ipv6_static_routes: Vec<Ipv6StaticRoute>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

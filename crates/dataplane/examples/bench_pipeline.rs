@@ -69,6 +69,7 @@ fn make_interfaces() -> Vec<InterfaceConfig> {
             mtu: 1500,
             mac: "00:11:22:33:44:55".to_string(),
             ipv4_addrs: vec!["10.0.0.2/24".to_string()],
+            ipv6_addrs: vec![],
             zone: InterfaceZone::Wan,
             l2_domain: "br0".to_string(),
             linux_if: None,
@@ -81,6 +82,7 @@ fn make_interfaces() -> Vec<InterfaceConfig> {
             mtu: 1500,
             mac: "00:AA:BB:CC:DD:EE".to_string(),
             ipv4_addrs: vec!["192.168.1.1/24".to_string()],
+            ipv6_addrs: vec![],
             zone: InterfaceZone::Lan,
             l2_domain: "br0".to_string(),
             linux_if: None,
@@ -93,6 +95,7 @@ fn make_interfaces() -> Vec<InterfaceConfig> {
             mtu: 1500,
             mac: "00:AA:BB:CC:DD:FF".to_string(),
             ipv4_addrs: vec!["192.168.2.1/24".to_string()],
+            ipv6_addrs: vec![],
             zone: InterfaceZone::Lan,
             l2_domain: "br0".to_string(),
             linux_if: None,
@@ -137,6 +140,7 @@ fn make_routing_config() -> RoutingConfig {
                 metric: 10,
             },
         ],
+        ipv6_static_routes: vec![],
     }
 }
 
