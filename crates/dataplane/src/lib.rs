@@ -68,6 +68,12 @@ pub struct Dataplane {
     tx_errors: AtomicU64,
     /// Observability hub: per-interface and per-stage counters.
     pub observer: Arc<ruster_observe::Observer>,
+    /// ARP hold queue: buffers packets waiting for next-hop MAC resolution.
+    ///
+    /// Wrapped in a `Mutex` because enqueue/flush/gc all require `&mut self`.
+    pub hold_queue: Mutex<arp::hold_queue::HoldQueue>,
+    /// ARP hold queue GC timeout in seconds (same as ARP timeout).
+    hold_queue_timeout_sec: u64,
 }
 
 impl Dataplane {
@@ -115,6 +121,12 @@ impl Dataplane {
         let iface_names: Vec<String> = config.interfaces.iter().map(|i| i.name.clone()).collect();
         let observer = Arc::new(ruster_observe::Observer::new(&iface_names));
 
+        let hold_queue = arp::hold_queue::HoldQueue::new(
+            config.l2.arp_hold_queue_per_ip as usize,
+            config.l2.arp_hold_queue_max as usize,
+        );
+        let hold_queue_timeout_sec = u64::from(config.l2.arp_timeout_sec);
+
         Ok(Self {
             l2: Mutex::new(l2),
             arp: Mutex::new(arp),
@@ -127,6 +139,8 @@ impl Dataplane {
             linux_to_logical,
             tx_errors: AtomicU64::new(0),
             observer,
+            hold_queue: Mutex::new(hold_queue),
+            hold_queue_timeout_sec,
         })
     }
 
@@ -146,6 +160,8 @@ impl Dataplane {
     ) -> Result<(), DataplaneError> {
         let mut last_stats = std::time::Instant::now();
         let mut last_arp_refresh = std::time::Instant::now();
+        let mut last_hold_queue_gc = std::time::Instant::now();
+        let mut last_arp_retry = std::time::Instant::now();
 
         while !shutdown.load(Ordering::Relaxed) {
             // Periodically refresh ARP cache from the kernel neighbor table.
@@ -155,6 +171,26 @@ impl Dataplane {
                 drop(arp_guard);
                 last_arp_refresh = std::time::Instant::now();
             }
+
+            // Periodically GC the ARP hold queue (remove timed-out entries).
+            if last_hold_queue_gc.elapsed() >= Duration::from_secs(1) {
+                let gc_dropped = {
+                    let mut hq_guard = self.hold_queue.lock().unwrap();
+                    hq_guard.gc(self.hold_queue_timeout_sec)
+                };
+                if gc_dropped > 0 {
+                    self.observer.inc_arp_hold_gc_dropped(gc_dropped as u64);
+                }
+                last_hold_queue_gc = std::time::Instant::now();
+            }
+
+            // Periodically re-send ARP requests for pending hold queue entries
+            // and try to flush any that have been resolved since the last check.
+            if last_arp_retry.elapsed() >= Duration::from_secs(1) {
+                self.retry_pending_arp(&*io);
+                last_arp_retry = std::time::Instant::now();
+            }
+
             let batch = io.rx();
             if batch.is_empty() {
                 std::thread::sleep(Duration::from_millis(1));
@@ -228,10 +264,59 @@ impl Dataplane {
                                     arp::ArpAction::Forward { resolved_mac } => {
                                         rewrite::rewrite_dst_mac(&mut data, &resolved_mac);
                                     }
+                                    arp::ArpAction::SendRequest {
+                                        out_ifname,
+                                        target_ip,
+                                        sender_ip,
+                                        sender_mac,
+                                    } => {
+                                        // Enqueue the packet in the ARP hold queue.
+                                        let enqueue_result = {
+                                            let mut hq_guard =
+                                                self.hold_queue.lock().unwrap();
+                                            hq_guard.enqueue(
+                                                arp_target,
+                                                egress_iface.clone(),
+                                                data,
+                                                new_ttl,
+                                            )
+                                        };
+                                        match enqueue_result {
+                                            arp::hold_queue::EnqueueResult::Enqueued => {
+                                                self.observer.inc_arp_hold_enqueued();
+                                            }
+                                            _ => {
+                                                self.observer.inc_arp_hold_tail_dropped();
+                                            }
+                                        }
+
+                                        // Send ARP request (rate-limited).
+                                        let should_send = {
+                                            let mut arp_guard =
+                                                self.arp.lock().unwrap();
+                                            arp_guard.should_send_request(target_ip)
+                                        };
+                                        if should_send {
+                                            let arp_pkt =
+                                                arp::build_arp_request(
+                                                    sender_mac,
+                                                    sender_ip,
+                                                    target_ip,
+                                                );
+                                            let arp_raw = io::RawPacket {
+                                                ingress_iface: out_ifname.clone(),
+                                                data: arp_pkt,
+                                            };
+                                            let _ = io.tx(&out_ifname, &arp_raw);
+                                        }
+                                        continue;
+                                    }
                                     _ => {
-                                        // ARP unresolved -> drop
+                                        // ARP unresolved (Drop or other) -> drop packet
                                         self.observer
-                                            .inc_drop_reason(ruster_observe::DropReason::L3NoRoute);
+                                            .inc_drop_reason(
+                                                ruster_observe::DropReason::ArpUnresolved,
+                                            );
                                         continue;
                                     }
                                 }
@@ -273,6 +358,31 @@ impl Dataplane {
                             }
                         }
                     }
+                    pipeline::PipelineResult::ArpPending {
+                        egress_iface,
+                        next_hop_ip,
+                        new_ttl,
+                        data,
+                    } => {
+                        // Enqueue the packet in the ARP hold queue.
+                        let enqueue_result = {
+                            let mut hq_guard = self.hold_queue.lock().unwrap();
+                            hq_guard.enqueue(
+                                next_hop_ip,
+                                egress_iface.clone(),
+                                data,
+                                Some(new_ttl),
+                            )
+                        };
+                        match enqueue_result {
+                            arp::hold_queue::EnqueueResult::Enqueued => {
+                                self.observer.inc_arp_hold_enqueued();
+                            }
+                            _ => {
+                                self.observer.inc_arp_hold_tail_dropped();
+                            }
+                        }
+                    }
                     pipeline::PipelineResult::Drop {
                         reason,
                         icmp_reply: Some(reply),
@@ -307,6 +417,90 @@ impl Dataplane {
         }
 
         Ok(())
+    }
+
+    /// Retry pending ARP resolutions and flush any that have been resolved.
+    ///
+    /// Called periodically from the run loop. For each pending IP in the
+    /// hold queue, checks the ARP cache; if resolved, flushes the held
+    /// packets and transmits them. If still unresolved, re-sends the ARP
+    /// request (subject to rate limiting).
+    fn retry_pending_arp(&self, io: &dyn io::PacketIo) {
+        let pending_ips = {
+            let hq_guard = self.hold_queue.lock().unwrap();
+            hq_guard.pending_ips()
+        };
+
+        for (target_ip, egress_iface) in pending_ips {
+            let arp_result = {
+                let mut arp_guard = self.arp.lock().unwrap();
+                arp_guard.resolve(target_ip, &egress_iface)
+            };
+
+            match arp_result {
+                arp::ArpAction::Forward { resolved_mac } => {
+                    // ARP resolved! Flush all held packets.
+                    let held_packets = {
+                        let mut hq_guard = self.hold_queue.lock().unwrap();
+                        hq_guard.flush(&target_ip)
+                    };
+                    let flushed_count = held_packets.len() as u64;
+
+                    for mut held in held_packets {
+                        rewrite::rewrite_dst_mac(&mut held.data, &resolved_mac);
+                        if let Some(ttl) = held.new_ttl {
+                            rewrite::rewrite_ipv4_ttl(&mut held.data, ttl);
+                        }
+                        let tx_pkt = io::RawPacket {
+                            ingress_iface: held.egress_iface.clone(),
+                            data: held.data,
+                        };
+                        match io.tx(&held.egress_iface, &tx_pkt) {
+                            Ok(()) => {
+                                self.observer.inc_tx(
+                                    &held.egress_iface,
+                                    tx_pkt.data.len() as u64,
+                                );
+                            }
+                            Err(e) => {
+                                self.tx_errors.fetch_add(1, Ordering::Relaxed);
+                                self.observer.inc_tx_drop(&held.egress_iface);
+                                eprintln!(
+                                    "TX error on {} (hold queue flush): {}",
+                                    held.egress_iface, e
+                                );
+                            }
+                        }
+                    }
+
+                    if flushed_count > 0 {
+                        self.observer.inc_arp_hold_flushed(flushed_count);
+                    }
+                }
+                arp::ArpAction::SendRequest {
+                    out_ifname,
+                    target_ip: tip,
+                    sender_ip,
+                    sender_mac,
+                } => {
+                    // Still unresolved; re-send ARP request (rate-limited).
+                    let should_send = {
+                        let mut arp_guard = self.arp.lock().unwrap();
+                        arp_guard.should_send_request(tip)
+                    };
+                    if should_send {
+                        let arp_pkt =
+                            arp::build_arp_request(sender_mac, sender_ip, tip);
+                        let arp_raw = io::RawPacket {
+                            ingress_iface: out_ifname.clone(),
+                            data: arp_pkt,
+                        };
+                        let _ = io.tx(&out_ifname, &arp_raw);
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Return the total number of TX errors observed by the run loop.

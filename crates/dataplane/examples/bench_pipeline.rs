@@ -106,6 +106,8 @@ fn make_l2_config() -> L2Config {
         mac_aging_sec: 300,
         arp_table_max_entries: 1024,
         arp_timeout_sec: 120,
+        arp_hold_queue_per_ip: 3,
+        arp_hold_queue_max: 1024,
         bridge_domains: vec![BridgeDomain {
             name: "br0".to_string(),
             members: vec!["wan0".to_string(), "lan0".to_string(), "lan1".to_string()],
