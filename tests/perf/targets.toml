@@ -1,0 +1,32 @@
+# Performance targets for ruster benchmark infrastructure.
+#
+# 10G line rate reference (theoretical maximum):
+#   64-byte packets:  ~14.88 Mpps
+#   512-byte packets: ~2.35 Mpps
+#   1500-byte packets: ~0.81 Mpps
+#
+# Initial software targets represent achievable single-core
+# throughput for the v0.1 software dataplane (no DPDK fast path).
+# These are regression-detection baselines, not line-rate goals.
+
+[targets]
+# Packets per second (pps) targets per core, 1500-byte packets.
+# These represent the minimum acceptable performance for each stage.
+l2_bridge_pps = 1_000_000
+l3_forward_pps = 800_000
+l3_nat_pps = 500_000
+firewall_pps = 1_000_000
+conntrack_lookup_pps = 1_000_000
+full_pipeline_pps = 400_000
+packet_parse_pps = 2_000_000
+
+[thresholds]
+# Fail if measured performance drops more than this percentage
+# below the recorded baseline (previous run stored in criterion data).
+regression_threshold_pct = 20
+
+[profiles]
+# Standard packet sizes for benchmarking (bytes).
+small = 64
+medium = 512
+large = 1500

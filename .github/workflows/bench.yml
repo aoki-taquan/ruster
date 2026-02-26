@@ -1,0 +1,79 @@
+name: Benchmark
+
+on:
+  # Manual trigger for on-demand benchmarking.
+  workflow_dispatch:
+  # Weekly schedule for tracking long-term performance trends.
+  schedule:
+    - cron: "0 4 * * 1" # Every Monday at 04:00 UTC
+  # Optional PR trigger (commented out to avoid slowing PR CI).
+  # Uncomment to run benchmarks on every PR:
+  # pull_request:
+  #   branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+  # Needed for PR comments (if PR trigger is enabled).
+  pull-requests: write
+
+jobs:
+  benchmark:
+    name: Criterion Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Cache criterion baseline data across runs.
+          cache-directories: target/criterion
+
+      - name: Run benchmarks
+        run: cargo bench -p ruster-dataplane 2>&1 | tee bench-output.txt
+
+      - name: Upload criterion report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: criterion-report
+          path: target/criterion/
+          retention-days: 30
+
+      - name: Upload benchmark output
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-output
+          path: bench-output.txt
+          retention-days: 30
+
+      - name: Check for regressions
+        run: |
+          REGRESSIONS=$(grep -ci "regressed" bench-output.txt || true)
+          if [ "$REGRESSIONS" -gt 0 ]; then
+            echo "::warning::$REGRESSIONS benchmark(s) show regression"
+            echo "## Benchmark Regressions Detected" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            grep -i "regressed" bench-output.txt >> "$GITHUB_STEP_SUMMARY" || true
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No regressions detected."
+            echo "## Benchmarks: No Regressions" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Generate summary
+        if: always()
+        run: |
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Benchmark Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          # Extract the timing summary lines from criterion output.
+          grep -E "time:.*\[" bench-output.txt >> "$GITHUB_STEP_SUMMARY" || echo "(no timing data)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
