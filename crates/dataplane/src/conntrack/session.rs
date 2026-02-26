@@ -99,6 +99,12 @@ impl SessionKey {
                 dst_port: udp.dst_port,
             },
             L4Info::Icmp(icmp) => SessionProto::Icmp { id: icmp_id(icmp) },
+            // RFC-DEVIATION:
+            // reason: ICMPv6 conntrack not yet implemented for home-lab v0.1
+            // impact: ICMPv6 flows will not be tracked by conntrack
+            // issue: #159
+            // plan: implement ICMPv6 session tracking in v0.2
+            L4Info::Icmpv6(_) => return None,
         };
 
         Some(Self {

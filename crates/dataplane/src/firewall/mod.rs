@@ -83,6 +83,7 @@ impl FwContext {
             Some(L4Info::Tcp(_)) => FwProto::Tcp,
             Some(L4Info::Udp(_)) => FwProto::Udp,
             Some(L4Info::Icmp(_)) => FwProto::Icmp,
+            Some(L4Info::Icmpv6(_)) => FwProto::Other,
             None => FwProto::Other,
         };
 

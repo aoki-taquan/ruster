@@ -514,6 +514,31 @@ impl Dataplane {
                     pipeline::PipelineResult::Consumed => {
                         self.observer.inc_local_delivery();
                     }
+                    pipeline::PipelineResult::NdReply {
+                        egress_iface,
+                        reply_info,
+                    } => {
+                        self.observer.inc_local_delivery();
+                        let na_data = nd::build_na_packet(&reply_info);
+                        let na_pkt = io::RawPacket {
+                            ingress_iface: egress_iface.clone(),
+                            data: na_data,
+                        };
+                        match io.tx(&egress_iface, &na_pkt) {
+                            Ok(()) => {
+                                self.observer
+                                    .inc_tx(&egress_iface, na_pkt.data.len() as u64);
+                            }
+                            Err(e) => {
+                                self.tx_errors.fetch_add(1, Ordering::Relaxed);
+                                self.observer.inc_tx_drop(&egress_iface);
+                                eprintln!(
+                                    "TX error for ND reply on {}: {}",
+                                    egress_iface, e
+                                );
+                            }
+                        }
+                    }
                 }
             }
 

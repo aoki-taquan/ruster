@@ -298,9 +298,7 @@ pub fn parse_packet(data: &[u8], in_ifname: &str) -> Result<PacketMeta, DropReas
             let l4 = match ipv6_info.next_header {
                 IP_PROTO_TCP => Some(L4Info::Tcp(tcp::parse_tcp(l4_data)?)),
                 IP_PROTO_UDP => Some(L4Info::Udp(udp::parse_udp(l4_data)?)),
-                IP_PROTO_ICMPV6 => {
-                    Some(L4Info::Icmpv6(icmpv6::parse_icmpv6(l4_data)?))
-                }
+                IP_PROTO_ICMPV6 => Some(L4Info::Icmpv6(icmpv6::parse_icmpv6(l4_data)?)),
                 _ => None,
             };
 
@@ -697,10 +695,14 @@ mod tests {
         pkt.extend_from_slice(&8u16.to_be_bytes());
         pkt.push(17); // Next Header: UDP
         pkt.push(64); // Hop Limit
-        // Source: 2001:db8::1
-        pkt.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
+                      // Source: 2001:db8::1
+        pkt.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ]);
         // Destination: 2001:db8::2
-        pkt.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]);
+        pkt.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+        ]);
 
         // UDP header (8 bytes)
         pkt.extend_from_slice(&[0x00, 0x50]); // src port: 80
@@ -717,10 +719,7 @@ mod tests {
 
         // L2
         assert_eq!(meta.l2.ethertype, 0x86DD);
-        assert_eq!(
-            meta.l2.src_mac,
-            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]
-        );
+        assert_eq!(meta.l2.src_mac, [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]);
 
         // L3: IPv6
         match &meta.l3 {
@@ -769,17 +768,23 @@ mod tests {
         pkt.push(58); // Next Header: ICMPv6
         pkt.push(255);
         // Source: 2001:db8::100
-        pkt.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00]);
+        pkt.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x00,
+        ]);
         // Destination: ff02::1:ff00:1
-        pkt.extend_from_slice(&[0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, 0, 0, 0x01]);
+        pkt.extend_from_slice(&[
+            0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, 0, 0, 0x01,
+        ]);
 
         // ICMPv6 NS (24 bytes)
         pkt.push(135); // Type: NS
-        pkt.push(0);   // Code
+        pkt.push(0); // Code
         pkt.extend_from_slice(&[0x00, 0x00]); // Checksum
         pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Reserved
-        // Target: 2001:db8::1
-        pkt.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
+                                                          // Target: 2001:db8::1
+        pkt.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ]);
 
         let meta = parse_packet(&pkt, "lan0").unwrap();
 
@@ -814,7 +819,7 @@ mod tests {
         pkt.extend_from_slice(&[0x00; 6]); // dst
         pkt.extend_from_slice(&[0x00; 6]); // src
         pkt.extend_from_slice(&[0x86, 0xDD]); // IPv6
-        // Only 30 bytes of IPv6 header (need 40)
+                                              // Only 30 bytes of IPv6 header (need 40)
         pkt.extend_from_slice(&[0x60; 30]);
 
         assert_eq!(parse_packet(&pkt, "eth0"), Err(DropReason::TruncatedL3));

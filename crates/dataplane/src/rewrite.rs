@@ -227,9 +227,13 @@ mod tests {
         pkt.push(17); // Next Header: UDP
         pkt.push(hop_limit);
         // src IPv6: 2001:db8::1
-        pkt.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01]);
+        pkt.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ]);
         // dst IPv6: 2001:db8::2
-        pkt.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02]);
+        pkt.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+        ]);
 
         // Minimal UDP header (8 bytes)
         pkt.extend_from_slice(&[0x00, 0x50]); // src port

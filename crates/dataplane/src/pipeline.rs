@@ -20,7 +20,7 @@ use crate::icmp::{self, IcmpReply};
 use crate::io::RawPacket;
 use crate::l2::bridge::L2Decision;
 use crate::l2::L2Engine;
-use crate::nd::NdEngine;
+use crate::nd::{NdAction, NdEngine};
 use crate::packet;
 use crate::packet::{L3Info, L4Info};
 use crate::routing::ipv6_table::Ipv6RouteTable;
@@ -103,6 +103,16 @@ pub enum PipelineResult {
     },
     /// Packet was consumed (e.g., ARP reply generated internally).
     Consumed,
+    /// An ND Neighbor Advertisement reply should be sent.
+    ///
+    /// The run loop is responsible for constructing the NA packet from
+    /// the reply info and transmitting it on the specified interface.
+    NdReply {
+        /// Interface to send the reply on.
+        egress_iface: String,
+        /// NA reply fields needed to build the response packet.
+        reply_info: crate::nd::NaReplyInfo,
+    },
 }
 
 /// Reason a packet was dropped during pipeline processing.
@@ -461,10 +471,18 @@ fn process_ipv6_packet(
     // Step 1: Check if this is an ND message.
     if let Some(packet::L4Info::Icmpv6(ref icmpv6)) = meta.l4 {
         if icmpv6.nd.is_some() {
-            // Process ND and consume the packet.
-            let _nd_action = nd_engine.process_nd(meta);
-            // ND packets are consumed (replies are generated separately).
-            return PipelineResult::Consumed;
+            let nd_action = nd_engine.process_nd(meta);
+            return match nd_action {
+                NdAction::Reply {
+                    out_ifname,
+                    packet,
+                } => PipelineResult::NdReply {
+                    egress_iface: out_ifname,
+                    reply_info: packet,
+                },
+                // NA updates, drops, or other ND actions are consumed.
+                _ => PipelineResult::Consumed,
+            };
         }
     }
 
@@ -2269,11 +2287,8 @@ mod tests {
 
     #[test]
     fn ipv6_forward_via_default_route() {
-        let l3 = L3Engine::from_config(
-            &make_ipv6_routing_config(),
-            &make_ipv6_interfaces(),
-        )
-        .unwrap();
+        let l3 =
+            L3Engine::from_config(&make_ipv6_routing_config(), &make_ipv6_interfaces()).unwrap();
         let fw = make_fw_accept_all();
         let mut ct = make_conntrack();
         let zr = ZoneResolver::from_config(&make_ipv6_interfaces());
@@ -2283,8 +2298,12 @@ mod tests {
         let ipv6_routes = make_ipv6_route_table();
 
         // 2001:db8:2::100 should match the default route -> wan0
-        let src = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64];
-        let dst = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let src = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64,
+        ];
+        let dst = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
         let data = make_ipv6_packet(
             [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
             [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
@@ -2323,11 +2342,8 @@ mod tests {
 
     #[test]
     fn ipv6_local_delivery() {
-        let l3 = L3Engine::from_config(
-            &make_ipv6_routing_config(),
-            &make_ipv6_interfaces(),
-        )
-        .unwrap();
+        let l3 =
+            L3Engine::from_config(&make_ipv6_routing_config(), &make_ipv6_interfaces()).unwrap();
         let fw = make_fw_accept_all();
         let mut ct = make_conntrack();
         let zr = ZoneResolver::from_config(&make_ipv6_interfaces());
@@ -2337,8 +2353,12 @@ mod tests {
         let ipv6_routes = make_ipv6_route_table();
 
         // Destination is our local IPv6 (2001:db8:1::1 on lan0).
-        let src = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64];
-        let dst = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let src = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64,
+        ];
+        let dst = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
         let data = make_ipv6_packet(
             [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
             [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
@@ -2371,11 +2391,8 @@ mod tests {
 
     #[test]
     fn ipv6_hop_limit_expired() {
-        let l3 = L3Engine::from_config(
-            &make_ipv6_routing_config(),
-            &make_ipv6_interfaces(),
-        )
-        .unwrap();
+        let l3 =
+            L3Engine::from_config(&make_ipv6_routing_config(), &make_ipv6_interfaces()).unwrap();
         let fw = make_fw_accept_all();
         let mut ct = make_conntrack();
         let zr = ZoneResolver::from_config(&make_ipv6_interfaces());
@@ -2384,8 +2401,12 @@ mod tests {
         let mut nd = make_nd_engine();
         let ipv6_routes = make_ipv6_route_table();
 
-        let src = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64];
-        let dst = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let src = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64,
+        ];
+        let dst = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
         // Hop limit = 1 -> should be dropped.
         let data = make_ipv6_packet(
             [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
@@ -2420,11 +2441,8 @@ mod tests {
 
     #[test]
     fn ipv6_no_route() {
-        let l3 = L3Engine::from_config(
-            &make_ipv6_routing_config(),
-            &make_ipv6_interfaces(),
-        )
-        .unwrap();
+        let l3 =
+            L3Engine::from_config(&make_ipv6_routing_config(), &make_ipv6_interfaces()).unwrap();
         let fw = make_fw_accept_all();
         let mut ct = make_conntrack();
         let zr = ZoneResolver::from_config(&make_ipv6_interfaces());
@@ -2444,8 +2462,12 @@ mod tests {
         let ipv6_routes = Ipv6RouteTable::from_config(&routing_no_default).unwrap();
 
         // Destination 2001:db8:2::1 has no matching route.
-        let src = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64];
-        let dst = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let src = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64,
+        ];
+        let dst = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
         let data = make_ipv6_packet(
             [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
             [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
@@ -2479,11 +2501,8 @@ mod tests {
 
     #[test]
     fn ipv6_nd_consumed() {
-        let l3 = L3Engine::from_config(
-            &make_ipv6_routing_config(),
-            &make_ipv6_interfaces(),
-        )
-        .unwrap();
+        let l3 =
+            L3Engine::from_config(&make_ipv6_routing_config(), &make_ipv6_interfaces()).unwrap();
         let fw = make_fw_accept_all();
         let mut ct = make_conntrack();
         let zr = ZoneResolver::from_config(&make_ipv6_interfaces());
@@ -2511,19 +2530,25 @@ mod tests {
         // Hop Limit: 255
         pkt.push(255);
         // Source: 2001:db8:1::64
-        let src_ip = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64];
+        let src_ip = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64,
+        ];
         pkt.extend_from_slice(&src_ip);
         // Destination: ff02::1:ff00:1 (solicited-node multicast)
-        let dst_ip = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, 0, 0, 0x01];
+        let dst_ip = [
+            0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0xff, 0, 0, 0x01,
+        ];
         pkt.extend_from_slice(&dst_ip);
 
         // ICMPv6 NS (24 bytes)
         pkt.push(135); // Type: NS
-        pkt.push(0);   // Code: 0
+        pkt.push(0); // Code: 0
         pkt.extend_from_slice(&[0x00, 0x00]); // Checksum (simplified)
         pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // Reserved
-        // Target: 2001:db8:1::1 (our address)
-        let target = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+                                                          // Target: 2001:db8:1::1 (our address)
+        let target = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
         pkt.extend_from_slice(&target);
 
         let raw_pkt = RawPacket {
@@ -2543,8 +2568,11 @@ mod tests {
             Some(&ipv6_routes),
         );
         assert!(
-            matches!(result, PipelineResult::Consumed),
-            "expected Consumed for ND packet, got {:?}",
+            matches!(
+                result,
+                PipelineResult::NdReply { .. } | PipelineResult::Consumed
+            ),
+            "expected NdReply or Consumed for ND packet, got {:?}",
             result
         );
     }
@@ -2560,8 +2588,12 @@ mod tests {
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
 
-        let src = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
-        let dst = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02];
+        let src = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
+        let dst = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+        ];
         let data = make_ipv6_packet(
             [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
             [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],

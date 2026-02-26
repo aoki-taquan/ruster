@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::packet::{Icmpv6Info, Ipv6Info, L3Info, L4Info, NdInfo, PacketMeta};
+use crate::packet::{Ipv6Info, L3Info, L4Info, NdInfo, PacketMeta};
 use ruster_config::model::{InterfaceConfig, L2Config};
 
 /// Action the caller should take after ND processing.
@@ -238,7 +238,7 @@ impl NdEngine {
             NdInfo::NeighborSolicitation {
                 target_addr,
                 source_mac,
-            } => self.handle_ns(in_ifname, ipv6_info, target_addr, source_mac),
+            } => self.handle_ns(in_ifname, ipv6_info, target_addr, source_mac, meta.l2.src_mac),
             NdInfo::NeighborAdvertisement {
                 target_addr,
                 target_mac,
@@ -317,6 +317,7 @@ impl NdEngine {
         ipv6_info: &Ipv6Info,
         target_addr: &[u8; 16],
         source_mac: &Option<[u8; 6]>,
+        l2_src_mac: [u8; 6],
     ) -> NdAction {
         let cache = self.caches.get_mut(in_ifname).unwrap();
 
@@ -340,9 +341,9 @@ impl NdEngine {
                     sender_mac: our_mac,
                     sender_ipv6: *target_addr,
                     target_ipv6: *target_addr,
-                    requester_mac: source_mac.unwrap_or(ipv6_info.src_addr[..6]
-                        .try_into()
-                        .unwrap_or([0; 6])),
+                    // Use the ND option source MAC if available, otherwise
+                    // fall back to the Ethernet source MAC from L2 header.
+                    requester_mac: source_mac.unwrap_or(l2_src_mac),
                     requester_ipv6: ipv6_info.src_addr,
                 },
             }
@@ -366,6 +367,99 @@ impl NdEngine {
     }
 }
 
+// ── NA packet construction ───────────────────────────────────────────────
+
+/// Build a complete Ethernet + IPv6 + ICMPv6 Neighbor Advertisement packet.
+///
+/// RFC-REF: RFC 4861 Section 4.4
+/// The NA includes the Solicited (S) and Override (O) flags set, the
+/// target address, and a Target Link-Layer Address option.
+pub fn build_na_packet(reply: &NaReplyInfo) -> Vec<u8> {
+    // Ethernet header (14 bytes)
+    let mut pkt = Vec::with_capacity(86);
+    pkt.extend_from_slice(&reply.requester_mac); // dst MAC
+    pkt.extend_from_slice(&reply.sender_mac); // src MAC
+    pkt.extend_from_slice(&[0x86, 0xDD]); // EtherType: IPv6
+
+    // IPv6 header (40 bytes)
+    // Version (4) + Traffic Class (8) + Flow Label (20)
+    pkt.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+    // Payload Length: ICMPv6 header (4) + flags/reserved (4) + target (16) + option (8) = 32
+    let payload_len: u16 = 32;
+    pkt.extend_from_slice(&payload_len.to_be_bytes());
+    pkt.push(58); // Next Header: ICMPv6
+    pkt.push(255); // Hop Limit
+    pkt.extend_from_slice(&reply.sender_ipv6); // Source IPv6
+    pkt.extend_from_slice(&reply.requester_ipv6); // Destination IPv6
+
+    // ICMPv6 Neighbor Advertisement (type 136, code 0)
+    let icmpv6_start = pkt.len();
+    pkt.push(136); // Type: Neighbor Advertisement
+    pkt.push(0); // Code
+    pkt.extend_from_slice(&[0x00, 0x00]); // Checksum placeholder
+    // Flags: R=0, S=1 (solicited), O=1 (override) = 0x60
+    pkt.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+    pkt.extend_from_slice(&reply.target_ipv6); // Target Address
+
+    // Target Link-Layer Address option (type=2, length=1 = 8 bytes)
+    pkt.push(2); // Option type: Target Link-Layer Address
+    pkt.push(1); // Option length: 1 (in units of 8 bytes)
+    pkt.extend_from_slice(&reply.sender_mac);
+
+    // Compute ICMPv6 checksum (RFC 4443 Section 2.3).
+    // The checksum covers the IPv6 pseudo-header + ICMPv6 message.
+    let icmpv6_data = &pkt[icmpv6_start..];
+    let checksum = compute_icmpv6_checksum(
+        &reply.sender_ipv6,
+        &reply.requester_ipv6,
+        icmpv6_data,
+    );
+    pkt[icmpv6_start + 2] = (checksum >> 8) as u8;
+    pkt[icmpv6_start + 3] = (checksum & 0xFF) as u8;
+
+    pkt
+}
+
+/// Compute the ICMPv6 checksum per RFC 4443 Section 2.3.
+///
+/// The checksum covers a pseudo-header (src IPv6, dst IPv6, upper-layer
+/// packet length, next header = 58) plus the ICMPv6 message body.
+fn compute_icmpv6_checksum(src_ipv6: &[u8; 16], dst_ipv6: &[u8; 16], icmpv6_data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+
+    // Pseudo-header: source address (16 bytes)
+    for i in (0..16).step_by(2) {
+        sum += u16::from_be_bytes([src_ipv6[i], src_ipv6[i + 1]]) as u32;
+    }
+    // Pseudo-header: destination address (16 bytes)
+    for i in (0..16).step_by(2) {
+        sum += u16::from_be_bytes([dst_ipv6[i], dst_ipv6[i + 1]]) as u32;
+    }
+    // Pseudo-header: upper-layer packet length (4 bytes)
+    let length = icmpv6_data.len() as u32;
+    sum += (length >> 16) as u32;
+    sum += (length & 0xFFFF) as u32;
+    // Pseudo-header: next header = 58 (ICMPv6)
+    sum += 58u32;
+
+    // ICMPv6 message body
+    let mut i = 0;
+    while i + 1 < icmpv6_data.len() {
+        sum += u16::from_be_bytes([icmpv6_data[i], icmpv6_data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < icmpv6_data.len() {
+        sum += (icmpv6_data[i] as u32) << 8;
+    }
+
+    // Fold 32-bit sum to 16 bits
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    !(sum as u16)
+}
+
 // ── Utility functions ──────────────────────────────────────────────────
 
 /// Parse a MAC address string (e.g. "00:11:22:33:44:55") into a 6-byte array.
@@ -384,74 +478,19 @@ fn parse_mac(mac_str: &str) -> [u8; 6] {
 /// Parse an IPv6 address string, stripping an optional prefix length.
 ///
 /// Accepts "2001:db8::1" or "2001:db8::1/64".
-/// This is a simplified parser for common IPv6 notation.
+/// Delegates to `std::net::Ipv6Addr` for full RFC 5952 compliance.
 pub fn parse_ipv6_addr(addr_str: &str) -> Option<[u8; 16]> {
     let ip_part = addr_str.split('/').next()?;
-
-    // Split on "::" to handle zero-compressed notation.
-    let parts: Vec<&str> = ip_part.split("::").collect();
-    if parts.len() > 2 {
-        return None; // Multiple "::" not allowed
-    }
-
-    let mut result = [0u8; 16];
-
-    if parts.len() == 1 {
-        // No "::", must have exactly 8 groups
-        let groups: Vec<&str> = parts[0].split(':').collect();
-        if groups.len() != 8 {
-            return None;
-        }
-        for (i, group) in groups.iter().enumerate() {
-            let val = u16::from_str_radix(group, 16).ok()?;
-            result[i * 2] = (val >> 8) as u8;
-            result[i * 2 + 1] = (val & 0xFF) as u8;
-        }
-    } else {
-        // Has "::" -- expand zeros in the middle
-        let left_groups: Vec<&str> = if parts[0].is_empty() {
-            vec![]
-        } else {
-            parts[0].split(':').collect()
-        };
-        let right_groups: Vec<&str> = if parts[1].is_empty() {
-            vec![]
-        } else {
-            parts[1].split(':').collect()
-        };
-
-        let total_groups = left_groups.len() + right_groups.len();
-        if total_groups > 8 {
-            return None;
-        }
-        let zero_groups = 8 - total_groups;
-
-        // Fill left groups
-        for (i, group) in left_groups.iter().enumerate() {
-            let val = u16::from_str_radix(group, 16).ok()?;
-            result[i * 2] = (val >> 8) as u8;
-            result[i * 2 + 1] = (val & 0xFF) as u8;
-        }
-
-        // Zero groups are already zero in the array
-
-        // Fill right groups
-        let right_start = left_groups.len() + zero_groups;
-        for (i, group) in right_groups.iter().enumerate() {
-            let val = u16::from_str_radix(group, 16).ok()?;
-            let idx = (right_start + i) * 2;
-            result[idx] = (val >> 8) as u8;
-            result[idx + 1] = (val & 0xFF) as u8;
-        }
-    }
-
-    Some(result)
+    ip_part
+        .parse::<std::net::Ipv6Addr>()
+        .ok()
+        .map(|a| a.octets())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::packet::{L2Info, L4Info, PacketMeta};
+    use crate::packet::{Icmpv6Info, L2Info, L4Info, PacketMeta};
     use ruster_config::model::{
         BridgeDomain, InterfaceConfig, InterfaceRole, InterfaceZone, L2Config,
     };
@@ -748,7 +787,10 @@ mod tests {
     fn cache_pending_resolved() {
         let mut cache = NdCache::new(100);
         cache.mark_pending(OUR_IPV6);
-        assert_eq!(cache.lookup(&OUR_IPV6).unwrap().state, NdEntryState::Pending);
+        assert_eq!(
+            cache.lookup(&OUR_IPV6).unwrap().state,
+            NdEntryState::Pending
+        );
         cache.insert(OUR_IPV6, OUR_MAC);
         assert_eq!(
             cache.lookup(&OUR_IPV6).unwrap().state,

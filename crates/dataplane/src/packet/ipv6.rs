@@ -52,8 +52,7 @@ pub fn parse_ipv6(data: &[u8], eth_header_len: usize) -> Result<Ipv6Info, DropRe
 
     // RFC-REF: RFC 8200 Section 3
     // Flow Label (20 bits): bits 12-31 of the first 4 bytes
-    let flow_label =
-        ((data[1] as u32 & 0x0F) << 16) | ((data[2] as u32) << 8) | (data[3] as u32);
+    let flow_label = ((data[1] as u32 & 0x0F) << 16) | ((data[2] as u32) << 8) | (data[3] as u32);
 
     // RFC-REF: RFC 8200 Section 3
     // Payload Length (2 bytes, offset 4): length of the payload after the

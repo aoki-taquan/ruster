@@ -234,14 +234,18 @@ mod tests {
 
     #[test]
     fn matches_slash_64() {
-        let ip = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let ip = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
         let prefix = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
         assert!(matches_ipv6_prefix(&ip, &prefix, 64));
     }
 
     #[test]
     fn no_match_slash_64() {
-        let ip = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let ip = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
         let prefix = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
         assert!(!matches_ipv6_prefix(&ip, &prefix, 64));
     }
@@ -257,8 +261,12 @@ mod tests {
     #[test]
     fn matches_slash_48() {
         // /48 = first 6 bytes must match
-        let ip = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-        let prefix = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let ip = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ];
+        let prefix = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
         assert!(matches_ipv6_prefix(&ip, &prefix, 48));
     }
 
@@ -301,7 +309,9 @@ mod tests {
     fn lookup_specific_route() {
         let table = Ipv6RouteTable::from_config(&make_routing_config()).unwrap();
         // 2001:db8:1::100 should match the /48 route.
-        let dst = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64];
+        let dst = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x64,
+        ];
         let entry = table.lookup(&dst).unwrap();
         assert_eq!(entry.prefix_len, 48);
         assert_eq!(entry.out_ifname, "lan0");
@@ -311,7 +321,9 @@ mod tests {
     fn lookup_default_route() {
         let table = Ipv6RouteTable::from_config(&make_routing_config()).unwrap();
         // 2001:db8:2::1 should fall through to the default route.
-        let dst = [0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01];
+        let dst = [
+            0x20, 0x01, 0x0d, 0xb8, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ];
         let entry = table.lookup(&dst).unwrap();
         assert_eq!(entry.prefix_len, 0);
         assert_eq!(entry.out_ifname, "wan0");

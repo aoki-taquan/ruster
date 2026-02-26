@@ -204,10 +204,10 @@ mod tests {
         pkt.push(ICMPV6_NEIGHBOR_ADVERTISEMENT); // Type
         pkt.push(0x00); // Code
         pkt.extend_from_slice(&[0x00, 0x00]); // Checksum
-        // Flags: R=0, S=1, O=1 + Reserved
+                                              // Flags: R=0, S=1, O=1 + Reserved
         pkt.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
         pkt.extend_from_slice(&target); // Target Address
-        // Target Link-Layer Address option: type=2, length=1 (8 bytes)
+                                        // Target Link-Layer Address option: type=2, length=1 (8 bytes)
         pkt.push(ND_OPT_TARGET_LINK_LAYER);
         pkt.push(1);
         pkt.extend_from_slice(&mac);
