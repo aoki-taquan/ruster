@@ -6,9 +6,6 @@ pub enum ControlError {
     #[error("nothing to commit: no running configuration")]
     NothingToCommit,
 
-    #[error("transaction conflict: another transaction is already in progress")]
-    TransactionConflict,
-
     #[error("no committed configuration: commit a running config first")]
     NoCommittedConfig,
 

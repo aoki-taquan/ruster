@@ -102,7 +102,7 @@ impl std::fmt::Display for TransactionState {
 #[derive(Debug)]
 pub struct Transaction {
     /// State machine: Pending -> Prepared -> (committed or aborted).
-    pub state: TransactionState,
+    state: TransactionState,
     /// Snapshot of running config taken when the transaction began.
     snapshot: Option<RouterConfig>,
 }
