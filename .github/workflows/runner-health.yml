@@ -77,13 +77,13 @@ jobs:
           sed -i 's/^          //' "$TOPO_FILE"
 
           echo "=== Deploy smoke topology ==="
-          sudo containerlab deploy --topo "$TOPO_FILE"
+          containerlab deploy --topo "$TOPO_FILE"
 
           echo "=== Verify container running ==="
           docker ps --filter name=clab-health-check
 
           echo "=== Destroy smoke topology ==="
-          sudo containerlab destroy --topo "$TOPO_FILE" --cleanup
+          containerlab destroy --topo "$TOPO_FILE" --cleanup
 
           rm -f "$TOPO_FILE"
           echo "Smoke test passed."

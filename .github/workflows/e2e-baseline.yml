@@ -38,7 +38,7 @@ jobs:
         run: cargo build --release
 
       - name: Deploy containerlab topology
-        run: sudo containerlab deploy --topo tests/containerlab/topology.yml --name "$CLAB_TOPO_NAME"
+        run: containerlab deploy --topo tests/containerlab/topology.yml --name "$CLAB_TOPO_NAME"
 
       - name: Verify ruster is running
         run: bash tests/containerlab/scripts/check-ruster.sh
@@ -60,8 +60,8 @@ jobs:
           done
 
           echo "=== Topology inspect ==="
-          sudo containerlab inspect --name "$CLAB_TOPO_NAME" > "${LOG_DIR}/topology-inspect.txt" 2>&1 || true
-          sudo containerlab inspect --name "$CLAB_TOPO_NAME" || true
+          containerlab inspect --name "$CLAB_TOPO_NAME" > "${LOG_DIR}/topology-inspect.txt" 2>&1 || true
+          containerlab inspect --name "$CLAB_TOPO_NAME" || true
 
           echo "=== Docker ps ==="
           docker ps -a > "${LOG_DIR}/docker-ps.txt" 2>&1 || true
@@ -98,4 +98,4 @@ jobs:
 
       - name: Destroy topology
         if: always()
-        run: sudo containerlab destroy --name "$CLAB_TOPO_NAME" --cleanup
+        run: containerlab destroy --name "$CLAB_TOPO_NAME" --cleanup
