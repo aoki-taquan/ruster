@@ -9,11 +9,11 @@
 #   0 — ruster is running and healthy
 #   1 — ruster is NOT running or failed to start
 #
-# Note (v0.1): ruster uses MockPacketIo and does not perform real NIC I/O.
-# Kernel IP forwarding handles actual packet forwarding in the E2E topology.
-# This check gates on ruster *process liveness* to ensure the binary is
-# functional and doesn't crash on startup. Future versions with real
-# dataplane I/O will additionally verify that forwarding goes through ruster.
+# ruster uses AF_PACKET raw sockets for real packet I/O.
+# Kernel IP forwarding is disabled (ip_forward=0) so that ruster
+# performs all packet forwarding. This check gates on:
+#   1. ruster process liveness
+#   2. kernel ip_forward=0 (ensures tests are valid)
 
 set -uo pipefail
 
@@ -89,9 +89,17 @@ for attempt in $(seq 1 "${MAX_RETRIES}"); do
             info "WARNING: /var/log/ruster.log not found yet (process may still be starting)"
         fi
 
+        # Verify kernel forwarding is disabled (ruster handles forwarding).
+        KERNEL_FWD=$(docker exec "${CONTAINER}" cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "unknown")
+        if [ "${KERNEL_FWD}" = "0" ]; then
+            info "Kernel ip_forward=0 (ruster handles forwarding)"
+        else
+            error "kernel ip_forward=${KERNEL_FWD} — expected 0; E2E tests may be invalid"
+            exit 1
+        fi
+
         echo ""
-        info "PASSED: ruster is running in ${CONTAINER}"
-        info "NOTE (v0.1): Kernel forwarding is active. ruster process liveness is the E2E gate."
+        info "PASSED: ruster is running in ${CONTAINER} with kernel forwarding disabled"
         exit 0
     fi
 

@@ -8,7 +8,11 @@ pub mod l2;
 pub mod nat;
 pub mod packet;
 pub mod pipeline;
+pub mod rewrite;
 pub mod routing;
+
+#[cfg(target_os = "linux")]
+pub mod afpacket;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,7 +46,10 @@ pub struct Dataplane {
     /// `&mut self` (for MAC learning), while the run loop takes `&self`.
     pub l2: Mutex<l2::L2Engine>,
     /// ARP resolution engine (per-interface ARP caches).
-    pub arp: arp::ArpEngine,
+    ///
+    /// Wrapped in a `Mutex` because [`arp::ArpEngine::resolve`] requires
+    /// `&mut self`, while the run loop takes `&self`.
+    pub arp: Mutex<arp::ArpEngine>,
     /// L3 IPv4 forwarding engine (static routing, LPM).
     pub l3: routing::L3Engine,
     /// NAT44 engine (NAPT, port forwarding, hairpin).
@@ -53,6 +60,10 @@ pub struct Dataplane {
     pub conntrack: conntrack::ConntrackEngine,
     /// Zone resolver: maps interface names to firewall zones.
     pub zone_resolver: pipeline::ZoneResolver,
+    /// Per-interface MAC addresses for src MAC rewriting on egress.
+    iface_macs: std::collections::HashMap<String, [u8; 6]>,
+    /// Linux device name -> logical interface name mapping (for ARP refresh).
+    linux_to_logical: std::collections::HashMap<String, String>,
     /// Counter for TX errors encountered in the run loop.
     tx_errors: AtomicU64,
     /// Observability hub: per-interface and per-stage counters.
@@ -66,24 +77,54 @@ impl Dataplane {
     /// In v0.1 the DPDK backend is mocked, so no real NIC init happens.
     pub fn init(config: &RouterConfig) -> Result<Self, DataplaneError> {
         let l2 = l2::L2Engine::from_config(&config.l2);
-        let arp = arp::ArpEngine::from_config(&config.l2, &config.interfaces);
+        let mut arp = arp::ArpEngine::from_config(&config.l2, &config.interfaces);
         let l3 = routing::L3Engine::from_config(&config.routing, &config.interfaces)?;
         let nat = nat::NatEngine::from_config(&config.nat, &config.interfaces);
         let firewall = firewall::FirewallEngine::from_config(&config.firewall);
         let conntrack = conntrack::ConntrackEngine::from_nat_config(&config.nat);
         let zone_resolver = pipeline::ZoneResolver::from_config(&config.interfaces);
 
+        let iface_macs: std::collections::HashMap<String, [u8; 6]> = config
+            .interfaces
+            .iter()
+            .map(|iface| {
+                let mac = parse_mac_str(&iface.mac);
+                (iface.name.clone(), mac)
+            })
+            .collect();
+
+        // Build linux device -> logical name mapping for ARP cache pre-loading.
+        let linux_to_logical: std::collections::HashMap<String, String> = config
+            .interfaces
+            .iter()
+            .filter_map(|iface| {
+                iface
+                    .linux_if
+                    .as_ref()
+                    .map(|linux_name| (linux_name.clone(), iface.name.clone()))
+            })
+            .collect();
+
+        // Pre-populate ARP caches from the kernel's neighbor table so that
+        // directly connected hosts can be forwarded to immediately.
+        let arp_loaded = arp.load_kernel_arp(&linux_to_logical);
+        if arp_loaded > 0 {
+            println!("  ARP: loaded {} entries from kernel", arp_loaded);
+        }
+
         let iface_names: Vec<String> = config.interfaces.iter().map(|i| i.name.clone()).collect();
         let observer = Arc::new(ruster_observe::Observer::new(&iface_names));
 
         Ok(Self {
             l2: Mutex::new(l2),
-            arp,
+            arp: Mutex::new(arp),
             l3,
             nat,
             firewall,
             conntrack,
             zone_resolver,
+            iface_macs,
+            linux_to_logical,
             tx_errors: AtomicU64::new(0),
             observer,
         })
@@ -104,8 +145,16 @@ impl Dataplane {
         io: Box<dyn io::PacketIo>,
     ) -> Result<(), DataplaneError> {
         let mut last_stats = std::time::Instant::now();
+        let mut last_arp_refresh = std::time::Instant::now();
 
         while !shutdown.load(Ordering::Relaxed) {
+            // Periodically refresh ARP cache from the kernel neighbor table.
+            if last_arp_refresh.elapsed() >= Duration::from_secs(5) {
+                let mut arp_guard = self.arp.lock().unwrap();
+                arp_guard.load_kernel_arp(&self.linux_to_logical);
+                drop(arp_guard);
+                last_arp_refresh = std::time::Instant::now();
+            }
             let batch = io.rx();
             if batch.is_empty() {
                 std::thread::sleep(Duration::from_millis(1));
@@ -125,12 +174,79 @@ impl Dataplane {
                         &self.firewall,
                         &self.conntrack,
                         &self.zone_resolver,
+                        &self.iface_macs,
                     )
                 };
                 match result {
-                    pipeline::PipelineResult::Forward { egress_iface } => {
+                    pipeline::PipelineResult::Forward {
+                        egress_iface,
+                        new_ttl,
+                        next_hop,
+                    } => {
                         self.observer.inc_forwarded();
-                        match io.tx(&egress_iface, raw_pkt) {
+
+                        // Apply packet rewrites for L3 forwarding.
+                        let tx_data;
+                        let tx_pkt = if new_ttl.is_some() || next_hop.is_some() {
+                            let mut data = raw_pkt.data.clone();
+
+                            // 1. TTL + checksum
+                            if let Some(ttl) = new_ttl {
+                                rewrite::rewrite_ipv4_ttl(&mut data, ttl);
+                            }
+
+                            // 2. src MAC -> egress IF's MAC
+                            if let Some(mac) = self.iface_macs.get(&egress_iface) {
+                                rewrite::rewrite_src_mac(&mut data, mac);
+                            }
+
+                            // 3. dst MAC -> ARP resolve
+                            if let Some(nh) = next_hop {
+                                // Determine the IP to ARP-resolve:
+                                // - If next_hop != 0.0.0.0: resolve the next-hop gateway
+                                // - If next_hop == 0.0.0.0: directly connected, resolve
+                                //   the packet's destination IP
+                                let arp_target = if nh != [0, 0, 0, 0] {
+                                    nh
+                                } else {
+                                    // Extract dst IP from the IPv4 header (offset 30..34
+                                    // in an Ethernet+IPv4 frame: 14 eth + 16 dst offset)
+                                    if data.len() >= 34 {
+                                        [data[30], data[31], data[32], data[33]]
+                                    } else {
+                                        // Malformed, cannot extract dst IP
+                                        self.observer
+                                            .inc_drop_reason(ruster_observe::DropReason::L3NoRoute);
+                                        continue;
+                                    }
+                                };
+                                let arp_result = {
+                                    let mut arp_guard = self.arp.lock().unwrap();
+                                    arp_guard.resolve(arp_target, &egress_iface)
+                                };
+                                match arp_result {
+                                    arp::ArpAction::Forward { resolved_mac } => {
+                                        rewrite::rewrite_dst_mac(&mut data, &resolved_mac);
+                                    }
+                                    _ => {
+                                        // ARP unresolved -> drop
+                                        self.observer
+                                            .inc_drop_reason(ruster_observe::DropReason::L3NoRoute);
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            tx_data = io::RawPacket {
+                                ingress_iface: raw_pkt.ingress_iface.clone(),
+                                data,
+                            };
+                            &tx_data
+                        } else {
+                            raw_pkt
+                        };
+
+                        match io.tx(&egress_iface, tx_pkt) {
                             Ok(()) => {
                                 self.observer
                                     .inc_tx(&egress_iface, raw_pkt.data.len() as u64);
@@ -197,6 +313,21 @@ impl Dataplane {
     pub fn tx_error_count(&self) -> u64 {
         self.tx_errors.load(Ordering::Relaxed)
     }
+}
+
+/// Parse a MAC address string (e.g. "00:11:22:33:44:55") into a 6-byte array.
+///
+/// Returns `[0; 6]` if the string cannot be parsed.
+fn parse_mac_str(mac_str: &str) -> [u8; 6] {
+    let parts: Vec<&str> = mac_str.split(':').collect();
+    if parts.len() != 6 {
+        return [0; 6];
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16).unwrap_or(0);
+    }
+    mac
 }
 
 /// Map a pipeline [`pipeline::DropReason`] to an observe [`ruster_observe::DropReason`].
@@ -317,6 +448,17 @@ mod tests {
         config
     }
 
+    /// Pre-populate the ARP cache so that the default route's next hop
+    /// (203.0.113.1 via wan0) can be resolved. Without this, L3 forwarding
+    /// would drop packets waiting for ARP resolution.
+    fn prepopulate_arp(dp: &Dataplane) {
+        let mut arp_guard = dp.arp.lock().unwrap();
+        // Default route next_hop in example config: 203.0.113.1
+        let next_hop = [203, 0, 113, 1];
+        let fake_gw_mac = [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        arp_guard.insert("wan0", next_hop, fake_gw_mac);
+    }
+
     /// Build a minimal valid Ethernet+IPv4+UDP packet that the pipeline
     /// will route via the default route (wan0) in the example config.
     fn make_forwardable_packet() -> io::RawPacket {
@@ -376,6 +518,7 @@ mod tests {
     fn dataplane_run_counts_tx_errors() {
         let config = load_example_fw_disabled();
         let dp = Dataplane::init(&config).expect("init should succeed");
+        prepopulate_arp(&dp);
 
         let mock_io = io::MockPacketIo::new();
 
@@ -455,6 +598,7 @@ mod tests {
     fn observer_tx_counter_increments_on_successful_forward() {
         let config = load_example_fw_disabled();
         let dp = Dataplane::init(&config).expect("init should succeed");
+        prepopulate_arp(&dp);
 
         let mock_io = io::MockPacketIo::new();
         let pkt = make_forwardable_packet();
@@ -483,6 +627,7 @@ mod tests {
     fn observer_tx_drop_counter_increments_on_tx_failure() {
         let config = load_example_fw_disabled();
         let dp = Dataplane::init(&config).expect("init should succeed");
+        prepopulate_arp(&dp);
 
         let mock_io = io::MockPacketIo::new();
         mock_io.inject(make_forwardable_packet());
@@ -665,6 +810,7 @@ mod tests {
     fn observer_snapshot_after_mixed_traffic() {
         let config = load_example_fw_disabled();
         let dp = Dataplane::init(&config).expect("init should succeed");
+        prepopulate_arp(&dp);
 
         let mock_io = io::MockPacketIo::new();
 

@@ -107,6 +107,8 @@ pub struct InterfaceConfig {
     pub ipv4_addrs: Vec<String>,
     pub zone: InterfaceZone,
     pub l2_domain: String,
+    #[serde(default)]
+    pub linux_if: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

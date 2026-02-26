@@ -80,6 +80,7 @@ fn make_home_router_config() -> (
             ipv4_addrs: vec!["10.0.0.2/24".to_string()],
             zone: InterfaceZone::Wan,
             l2_domain: "".to_string(),
+            linux_if: None,
         },
         InterfaceConfig {
             name: "eth1".to_string(),
@@ -91,6 +92,7 @@ fn make_home_router_config() -> (
             ipv4_addrs: vec!["192.168.1.1/24".to_string()],
             zone: InterfaceZone::Lan,
             l2_domain: "br0".to_string(),
+            linux_if: None,
         },
         InterfaceConfig {
             name: "eth2".to_string(),
@@ -102,6 +104,7 @@ fn make_home_router_config() -> (
             ipv4_addrs: vec![],
             zone: InterfaceZone::Lan,
             l2_domain: "br0".to_string(),
+            linux_if: None,
         },
     ];
 
