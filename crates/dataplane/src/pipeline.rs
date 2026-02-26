@@ -1561,13 +1561,7 @@ mod tests {
         assert_eq!(ct.session_count(), 0);
 
         // Send a UDP packet from LAN to WAN.
-        let data = make_ipv4_packet(
-            [0xAA; 6],
-            [0xBB; 6],
-            [192, 168, 1, 100],
-            [8, 8, 8, 8],
-            64,
-        );
+        let data = make_ipv4_packet([0xAA; 6], [0xBB; 6], [192, 168, 1, 100], [8, 8, 8, 8], 64);
         let raw_pkt = RawPacket {
             ingress_iface: "lan0".to_string(),
             data,
@@ -1589,13 +1583,7 @@ mod tests {
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
 
-        let data = make_ipv4_packet(
-            [0xAA; 6],
-            [0xBB; 6],
-            [192, 168, 1, 100],
-            [8, 8, 8, 8],
-            64,
-        );
+        let data = make_ipv4_packet([0xAA; 6], [0xBB; 6], [192, 168, 1, 100], [8, 8, 8, 8], 64);
 
         // Send the same packet twice.
         let pkt1 = RawPacket {
@@ -1680,10 +1668,20 @@ mod tests {
         let dst_port = 80u16;
 
         // Step 1: SYN
-        let syn = make_tcp_packet([0xAA; 6], [0xBB; 6], src_ip, dst_ip, src_port, dst_port, 0x02, 64);
+        let syn = make_tcp_packet(
+            [0xAA; 6], [0xBB; 6], src_ip, dst_ip, src_port, dst_port, 0x02, 64,
+        );
         let _ = process_packet(
-            &RawPacket { ingress_iface: "lan0".to_string(), data: syn },
-            &mut l2, &l3, &fw, &mut ct, &zr, &im,
+            &RawPacket {
+                ingress_iface: "lan0".to_string(),
+                data: syn,
+            },
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &zr,
+            &im,
         );
 
         let key = SessionKey {
@@ -1695,33 +1693,69 @@ mod tests {
         assert_eq!(session.state, SessionState::Tcp(TcpState::SynSent));
 
         // Step 2: SYN-ACK (reverse direction triggers ACK flag -> Established)
-        let synack = make_tcp_packet([0xBB; 6], [0xAA; 6], dst_ip, src_ip, dst_port, src_port, 0x12, 64);
+        let synack = make_tcp_packet(
+            [0xBB; 6], [0xAA; 6], dst_ip, src_ip, dst_port, src_port, 0x12, 64,
+        );
         let _ = process_packet(
-            &RawPacket { ingress_iface: "wan0".to_string(), data: synack },
-            &mut l2, &l3, &fw, &mut ct, &zr, &im,
+            &RawPacket {
+                ingress_iface: "wan0".to_string(),
+                data: synack,
+            },
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &zr,
+            &im,
         );
 
-        let session = ct.lookup(&key).expect("session should still exist after SYN-ACK");
+        let session = ct
+            .lookup(&key)
+            .expect("session should still exist after SYN-ACK");
         assert_eq!(session.state, SessionState::Tcp(TcpState::Established));
 
         // Step 3: FIN (forward direction)
-        let fin = make_tcp_packet([0xAA; 6], [0xBB; 6], src_ip, dst_ip, src_port, dst_port, 0x01, 64);
+        let fin = make_tcp_packet(
+            [0xAA; 6], [0xBB; 6], src_ip, dst_ip, src_port, dst_port, 0x01, 64,
+        );
         let _ = process_packet(
-            &RawPacket { ingress_iface: "lan0".to_string(), data: fin },
-            &mut l2, &l3, &fw, &mut ct, &zr, &im,
+            &RawPacket {
+                ingress_iface: "lan0".to_string(),
+                data: fin,
+            },
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &zr,
+            &im,
         );
 
-        let session = ct.lookup(&key).expect("session should still exist after FIN");
+        let session = ct
+            .lookup(&key)
+            .expect("session should still exist after FIN");
         assert_eq!(session.state, SessionState::Tcp(TcpState::FinWait));
 
         // Step 4: FIN (reverse direction) -> Closed
-        let fin_rev = make_tcp_packet([0xBB; 6], [0xAA; 6], dst_ip, src_ip, dst_port, src_port, 0x01, 64);
+        let fin_rev = make_tcp_packet(
+            [0xBB; 6], [0xAA; 6], dst_ip, src_ip, dst_port, src_port, 0x01, 64,
+        );
         let _ = process_packet(
-            &RawPacket { ingress_iface: "wan0".to_string(), data: fin_rev },
-            &mut l2, &l3, &fw, &mut ct, &zr, &im,
+            &RawPacket {
+                ingress_iface: "wan0".to_string(),
+                data: fin_rev,
+            },
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &zr,
+            &im,
         );
 
-        let session = ct.lookup(&key).expect("session should still exist after both FINs");
+        let session = ct
+            .lookup(&key)
+            .expect("session should still exist after both FINs");
         assert_eq!(session.state, SessionState::Tcp(TcpState::Closed));
     }
 
@@ -1742,24 +1776,30 @@ mod tests {
         let mut l2 = make_l2_engine_empty();
 
         // First packet fills the table.
-        let data1 = make_ipv4_packet(
-            [0xAA; 6], [0xBB; 6],
-            [192, 168, 1, 100], [8, 8, 8, 8], 64,
-        );
-        let pkt1 = RawPacket { ingress_iface: "lan0".to_string(), data: data1 };
+        let data1 = make_ipv4_packet([0xAA; 6], [0xBB; 6], [192, 168, 1, 100], [8, 8, 8, 8], 64);
+        let pkt1 = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data: data1,
+        };
         let result1 = process_packet(&pkt1, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         assert!(matches!(result1, PipelineResult::Forward { .. }));
         assert_eq!(ct.session_count(), 1);
 
         // Second packet from a different flow should be dropped (table full).
-        let data2 = make_ipv4_packet(
-            [0xAA; 6], [0xBB; 6],
-            [192, 168, 1, 101], [8, 8, 8, 8], 64,
-        );
-        let pkt2 = RawPacket { ingress_iface: "lan0".to_string(), data: data2 };
+        let data2 = make_ipv4_packet([0xAA; 6], [0xBB; 6], [192, 168, 1, 101], [8, 8, 8, 8], 64);
+        let pkt2 = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data: data2,
+        };
         let result2 = process_packet(&pkt2, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         assert!(
-            matches!(result2, PipelineResult::Drop { reason: DropReason::NatDrop, .. }),
+            matches!(
+                result2,
+                PipelineResult::Drop {
+                    reason: DropReason::NatDrop,
+                    ..
+                }
+            ),
             "expected Drop(NatDrop) when table is full, got {:?}",
             result2
         );
@@ -1785,11 +1825,11 @@ mod tests {
         let mut l2 = make_l2_engine_empty();
 
         // Create a UDP session.
-        let data = make_ipv4_packet(
-            [0xAA; 6], [0xBB; 6],
-            [192, 168, 1, 100], [8, 8, 8, 8], 64,
-        );
-        let pkt = RawPacket { ingress_iface: "lan0".to_string(), data };
+        let data = make_ipv4_packet([0xAA; 6], [0xBB; 6], [192, 168, 1, 100], [8, 8, 8, 8], 64);
+        let pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
         let _ = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
         assert_eq!(ct.session_count(), 1);
 
@@ -1836,13 +1876,26 @@ mod tests {
 
         // Step 1: Outbound SYN from LAN -> WAN (should be accepted by rule).
         let syn = make_tcp_packet(
-            [0xAA; 6], [0xBB; 6],
-            [192, 168, 1, 100], [8, 8, 8, 8],
-            49152, 80, 0x02, 64,
+            [0xAA; 6],
+            [0xBB; 6],
+            [192, 168, 1, 100],
+            [8, 8, 8, 8],
+            49152,
+            80,
+            0x02,
+            64,
         );
         let result1 = process_packet(
-            &RawPacket { ingress_iface: "lan0".to_string(), data: syn },
-            &mut l2, &l3, &fw, &mut ct, &zr, &im,
+            &RawPacket {
+                ingress_iface: "lan0".to_string(),
+                data: syn,
+            },
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &zr,
+            &im,
         );
         assert!(
             matches!(result1, PipelineResult::Forward { .. }),
@@ -1858,13 +1911,26 @@ mod tests {
         // so FwContext::from_packet sees is_established=true ->
         // allow_established_related accepts it.
         let synack = make_tcp_packet(
-            [0xBB; 6], [0xAA; 6],
-            [8, 8, 8, 8], [192, 168, 1, 100],
-            80, 49152, 0x12, 64,
+            [0xBB; 6],
+            [0xAA; 6],
+            [8, 8, 8, 8],
+            [192, 168, 1, 100],
+            80,
+            49152,
+            0x12,
+            64,
         );
         let result2 = process_packet(
-            &RawPacket { ingress_iface: "wan0".to_string(), data: synack },
-            &mut l2, &l3, &fw, &mut ct, &zr, &im,
+            &RawPacket {
+                ingress_iface: "wan0".to_string(),
+                data: synack,
+            },
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &zr,
+            &im,
         );
         assert!(
             matches!(result2, PipelineResult::Forward { .. }),
@@ -1903,6 +1969,10 @@ mod tests {
         };
 
         let _ = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &zr, &im);
-        assert_eq!(ct.session_count(), 0, "ARP should not create a conntrack session");
+        assert_eq!(
+            ct.session_count(),
+            0,
+            "ARP should not create a conntrack session"
+        );
     }
 }

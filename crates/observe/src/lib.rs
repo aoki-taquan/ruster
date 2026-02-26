@@ -410,15 +410,9 @@ impl Observer {
             },
             conntrack: ConntrackSnapshot {
                 conntrack_new: self.conntrack.conntrack_new.load(Ordering::Relaxed),
-                conntrack_established: self
-                    .conntrack
-                    .conntrack_established
-                    .load(Ordering::Relaxed),
+                conntrack_established: self.conntrack.conntrack_established.load(Ordering::Relaxed),
                 conntrack_expired: self.conntrack.conntrack_expired.load(Ordering::Relaxed),
-                conntrack_table_full: self
-                    .conntrack
-                    .conntrack_table_full
-                    .load(Ordering::Relaxed),
+                conntrack_table_full: self.conntrack.conntrack_table_full.load(Ordering::Relaxed),
             },
             forwarded: self.forwarded.load(Ordering::Relaxed),
             local_delivery: self.local_delivery.load(Ordering::Relaxed),
