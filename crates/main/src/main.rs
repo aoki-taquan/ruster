@@ -105,10 +105,37 @@ fn main() {
 
     println!("\nruster: running (press Ctrl+C to stop)");
 
-    // Enter the dataplane run loop (blocks until shutdown).
-    // v0.1: no real NIC I/O — use a mock backend that produces no packets.
-    let mock_io = ruster_dataplane::io::MockPacketIo::new();
-    if let Err(e) = dataplane.run(shutdown, Box::new(mock_io)) {
+    // Select I/O backend based on config.
+    let io: Box<dyn ruster_dataplane::io::PacketIo> = match config.dataplane.backend.as_str() {
+        #[cfg(target_os = "linux")]
+        "afpacket" => {
+            let iface_map: Vec<(String, String)> = config
+                .interfaces
+                .iter()
+                .filter(|i| i.admin_up)
+                .map(|i| {
+                    let linux_name = i.linux_if.clone().unwrap_or_else(|| i.name.clone());
+                    (i.name.clone(), linux_name)
+                })
+                .collect();
+            match ruster_dataplane::afpacket::AfPacketIo::new(&iface_map) {
+                Ok(io) => {
+                    println!("  Backend: AF_PACKET ({} interfaces)", iface_map.len());
+                    Box::new(io)
+                }
+                Err(e) => {
+                    eprintln!("Error: AF_PACKET init failed: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        _ => {
+            println!("  Backend: mock (no real I/O)");
+            Box::new(ruster_dataplane::io::MockPacketIo::new())
+        }
+    };
+
+    if let Err(e) = dataplane.run(shutdown, io) {
         eprintln!("Error: dataplane run failed: {}", e);
         process::exit(1);
     }

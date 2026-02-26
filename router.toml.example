@@ -19,6 +19,7 @@ mac = "02:00:00:00:10:01"
 ipv4_addrs = ["203.0.113.2/24"]
 zone = "wan"
 l2_domain = "bd-wan"
+# linux_if = "eth1"  # optional: map to Linux device name (for afpacket backend)
 
 [[interfaces]]
 name = "lan0"
@@ -30,6 +31,7 @@ mac = "02:00:00:00:20:01"
 ipv4_addrs = ["192.168.10.1/24"]
 zone = "lan"
 l2_domain = "bd-lan"
+# linux_if = "eth2"
 
 [[interfaces]]
 name = "lan1"

@@ -65,6 +65,10 @@ pub enum PipelineResult {
     Forward {
         /// Name of the egress interface.
         egress_iface: String,
+        /// New TTL after L3 decrement (Some for L3 forwarded packets, None for L2-only).
+        new_ttl: Option<u8>,
+        /// Next-hop IPv4 address (Some for L3 forwarded packets, None for L2-only).
+        next_hop: Option<[u8; 4]>,
     },
     /// Packet should be flooded to all listed interfaces (L2 unknown
     /// unicast or broadcast within a bridge domain).
@@ -133,6 +137,7 @@ pub fn process_packet(
     firewall: &FirewallEngine,
     conntrack: &ConntrackEngine,
     zone_resolver: &ZoneResolver,
+    iface_macs: &std::collections::HashMap<String, [u8; 6]>,
 ) -> PipelineResult {
     // Step 1: Parse raw bytes.
     let meta = match packet::parse_packet(&raw_pkt.data, &raw_pkt.ingress_iface) {
@@ -149,19 +154,27 @@ pub fn process_packet(
     if l2.is_bridged(&meta.in_ifname) {
         let l2_decision = l2.process(&meta);
 
-        // Check whether the packet is destined for one of the router's
-        // own IP addresses. If so, skip L2 forwarding and fall through
-        // to L3 processing (the MAC was already learned in `l2.process`).
-        let is_local = match &meta.l3 {
+        // Check whether the packet should be punted to L3 processing.
+        // This happens when either:
+        // - The destination IP is one of the router's own IPs (local delivery), OR
+        // - The destination MAC matches the router's MAC on the ingress interface
+        //   (transit routing — the host is using us as the default gateway).
+        let is_local_ip = match &meta.l3 {
             Some(L3Info::Ipv4(ipv4)) => l3.is_local_ip(&ipv4.dst_addr),
             _ => false,
         };
+        let is_router_mac = iface_macs
+            .get(&meta.in_ifname)
+            .is_some_and(|our_mac| meta.l2.dst_mac == *our_mac);
+        let is_local = is_local_ip || is_router_mac;
 
         if !is_local {
             // Pure L2 forwarding — do not enter L3.
             return match l2_decision {
                 L2Decision::Unicast { out_ifname } => PipelineResult::Forward {
                     egress_iface: out_ifname,
+                    new_ttl: None,
+                    next_hop: None,
                 },
                 L2Decision::Flood { out_ifnames } => PipelineResult::Flood {
                     egress_ifaces: out_ifnames,
@@ -181,8 +194,8 @@ pub fn process_packet(
     match l3_decision {
         L3Decision::Forward {
             out_ifname,
-            next_hop: _,
-            new_ttl: _,
+            next_hop,
+            new_ttl,
         } => {
             // Step 4: Firewall check on the forward chain.
             let src_zone = zone_resolver.resolve(&raw_pkt.ingress_iface);
@@ -194,6 +207,8 @@ pub fn process_packet(
             match verdict {
                 FwVerdict::Accept | FwVerdict::AcceptRule { .. } => PipelineResult::Forward {
                     egress_iface: out_ifname,
+                    new_ttl: Some(new_ttl),
+                    next_hop: Some(next_hop),
                 },
                 FwVerdict::Drop | FwVerdict::DropRule { .. } => PipelineResult::Drop {
                     reason: DropReason::FirewallDrop,
@@ -306,6 +321,7 @@ mod tests {
                 ipv4_addrs: vec!["10.0.0.2/24".to_string()],
                 zone: InterfaceZone::Wan,
                 l2_domain: "br0".to_string(),
+                linux_if: None,
             },
             InterfaceConfig {
                 name: "lan0".to_string(),
@@ -317,6 +333,7 @@ mod tests {
                 ipv4_addrs: vec!["192.168.1.1/24".to_string()],
                 zone: InterfaceZone::Lan,
                 l2_domain: "br0".to_string(),
+                linux_if: None,
             },
         ]
     }
@@ -443,10 +460,11 @@ mod tests {
         };
 
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         match result {
-            PipelineResult::Forward { egress_iface } => {
+            PipelineResult::Forward { egress_iface, .. } => {
                 assert_eq!(egress_iface, "wan0");
             }
             other => panic!("expected Forward, got {:?}", other),
@@ -466,8 +484,9 @@ mod tests {
         };
 
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::ParseError);
@@ -505,8 +524,9 @@ mod tests {
         };
 
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3NoRoute);
@@ -535,8 +555,9 @@ mod tests {
         };
 
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -565,8 +586,9 @@ mod tests {
         };
 
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         assert!(matches!(result, PipelineResult::Consumed));
     }
 
@@ -590,8 +612,9 @@ mod tests {
         };
 
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -629,8 +652,9 @@ mod tests {
         };
 
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3NotIpv4);
@@ -647,6 +671,7 @@ mod tests {
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
 
         let mut parse_errors = 0u64;
@@ -658,7 +683,7 @@ mod tests {
             ingress_iface: "eth0".to_string(),
             data: vec![0x00; 5],
         };
-        match process_packet(&short_pkt, &mut l2, &l3, &fw, &ct, &zr) {
+        match process_packet(&short_pkt, &mut l2, &l3, &fw, &ct, &zr, &im) {
             PipelineResult::Drop {
                 reason: DropReason::ParseError,
                 ..
@@ -672,7 +697,7 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: ttl_data,
         };
-        match process_packet(&ttl_pkt, &mut l2, &l3, &fw, &ct, &zr) {
+        match process_packet(&ttl_pkt, &mut l2, &l3, &fw, &ct, &zr, &im) {
             PipelineResult::Drop {
                 reason: DropReason::L3TtlExpired,
                 ..
@@ -686,7 +711,7 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: fwd_data,
         };
-        match process_packet(&fwd_pkt, &mut l2, &l3, &fw, &ct, &zr) {
+        match process_packet(&fwd_pkt, &mut l2, &l3, &fw, &ct, &zr, &im) {
             PipelineResult::Forward { .. } => forwards += 1,
             _ => {}
         }
@@ -709,6 +734,7 @@ mod tests {
         let l3 = make_l3_engine();
         let ct = make_conntrack();
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
 
         // Firewall: only allow Lan->Wan forward, drop everything else.
         let fw = FirewallEngine::from_config(&FirewallConfig {
@@ -742,9 +768,9 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         match result {
-            PipelineResult::Forward { egress_iface } => {
+            PipelineResult::Forward { egress_iface, .. } => {
                 assert_eq!(egress_iface, "wan0");
             }
             other => panic!(
@@ -765,6 +791,7 @@ mod tests {
         let l3 = make_l3_engine();
         let ct = make_conntrack();
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
 
         // Firewall: only allow Lan->Wan forward, drop everything else.
         let fw = FirewallEngine::from_config(&FirewallConfig {
@@ -799,7 +826,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -827,6 +854,7 @@ mod tests {
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
 
         // TTL = 1 -> L3 drops with TtlExpired -> should generate ICMP.
         let data = make_ipv4_packet(
@@ -842,7 +870,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -877,6 +905,7 @@ mod tests {
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
 
         // Destination 8.8.8.8 has no matching route.
         let data = make_ipv4_packet(
@@ -892,7 +921,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3NoRoute);
@@ -914,6 +943,7 @@ mod tests {
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
 
         // Build an ICMP packet (protocol=1) with TTL=1.
         let mut pkt = Vec::new();
@@ -950,7 +980,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -969,6 +999,7 @@ mod tests {
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
 
         let raw_pkt = RawPacket {
             ingress_iface: "eth0".to_string(),
@@ -976,7 +1007,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::ParseError);
@@ -992,6 +1023,7 @@ mod tests {
         let fw = make_fw_drop_all();
         let ct = make_conntrack();
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
 
         let data = make_ipv4_packet(
             [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
@@ -1006,7 +1038,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -1022,6 +1054,7 @@ mod tests {
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
         let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
 
         // ARP packet.
         let mut data = Vec::new();
@@ -1044,7 +1077,7 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3NotIpv4);
@@ -1093,6 +1126,7 @@ mod tests {
                 ipv4_addrs: vec!["192.168.1.1/24".to_string()],
                 zone: InterfaceZone::Lan,
                 l2_domain: "br0".to_string(),
+                linux_if: None,
             },
             InterfaceConfig {
                 name: "eth1".to_string(),
@@ -1104,6 +1138,7 @@ mod tests {
                 ipv4_addrs: vec![],
                 zone: InterfaceZone::Lan,
                 l2_domain: "br0".to_string(),
+                linux_if: None,
             },
             InterfaceConfig {
                 name: "eth2".to_string(),
@@ -1115,6 +1150,7 @@ mod tests {
                 ipv4_addrs: vec![],
                 zone: InterfaceZone::Lan,
                 l2_domain: "br0".to_string(),
+                linux_if: None,
             },
             InterfaceConfig {
                 name: "wan0".to_string(),
@@ -1126,6 +1162,7 @@ mod tests {
                 ipv4_addrs: vec!["10.0.0.2/24".to_string()],
                 zone: InterfaceZone::Wan,
                 l2_domain: "bd-wan".to_string(),
+                linux_if: None,
             },
         ];
         L3Engine::from_config(&routing, &ifaces).unwrap()
@@ -1158,6 +1195,7 @@ mod tests {
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
         let zr = ZoneResolver::from_config(&[]);
+        let im = std::collections::HashMap::new();
 
         // Step 1: Learn MAC_HOST_B on eth1.
         let learn_pkt = make_l2_raw_packet(
@@ -1167,7 +1205,7 @@ mod tests {
             [192, 168, 1, 50],
             [192, 168, 1, 60],
         );
-        let _ = process_packet(&learn_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let _ = process_packet(&learn_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
 
         // Step 2: Send from MAC_HOST_A on eth0 to MAC_HOST_B -> unicast to eth1.
         let pkt = make_l2_raw_packet(
@@ -1177,10 +1215,10 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 50],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
 
         match result {
-            PipelineResult::Forward { egress_iface } => {
+            PipelineResult::Forward { egress_iface, .. } => {
                 assert_eq!(egress_iface, "eth1");
             }
             other => panic!("expected Forward to eth1, got {:?}", other),
@@ -1195,6 +1233,7 @@ mod tests {
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
         let zr = ZoneResolver::from_config(&[]);
+        let im = std::collections::HashMap::new();
 
         let pkt = make_l2_raw_packet(
             "eth0",
@@ -1203,7 +1242,7 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 50],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
 
         match result {
             PipelineResult::Flood { egress_ifaces } => {
@@ -1227,6 +1266,7 @@ mod tests {
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
         let zr = ZoneResolver::from_config(&[]);
+        let im = std::collections::HashMap::new();
 
         let pkt = make_l2_raw_packet(
             "eth0",
@@ -1235,7 +1275,7 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 255],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
 
         match result {
             PipelineResult::Flood { egress_ifaces } => {
@@ -1261,6 +1301,7 @@ mod tests {
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
         let zr = ZoneResolver::from_config(&[]);
+        let im = std::collections::HashMap::new();
 
         // Step 1: MAC_HOST_A arrives on eth0 (triggers learning).
         let learn_pkt = make_l2_raw_packet(
@@ -1270,7 +1311,7 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 50],
         );
-        let _ = process_packet(&learn_pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let _ = process_packet(&learn_pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
 
         // Step 2: Send to MAC_HOST_A from eth1 -> should unicast to eth0.
         let pkt = make_l2_raw_packet(
@@ -1280,10 +1321,10 @@ mod tests {
             [192, 168, 1, 50],
             [192, 168, 1, 60],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
 
         match result {
-            PipelineResult::Forward { egress_iface } => {
+            PipelineResult::Forward { egress_iface, .. } => {
                 assert_eq!(egress_iface, "eth0");
             }
             other => panic!("expected Forward to eth0, got {:?}", other),
@@ -1300,6 +1341,7 @@ mod tests {
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
         let zr = ZoneResolver::from_config(&[]);
+        let im = std::collections::HashMap::new();
 
         let pkt = make_l2_raw_packet(
             "eth0",
@@ -1308,7 +1350,7 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 1],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
 
         // The packet's dst IP (192.168.1.1) is a local IP on eth0,
         // so L3 should handle it as LocalDelivery -> Consumed.
@@ -1328,6 +1370,7 @@ mod tests {
         let fw = make_fw_accept_all();
         let ct = make_conntrack();
         let zr = ZoneResolver::from_config(&[]);
+        let im = std::collections::HashMap::new();
 
         // wan0 is NOT in br0, so it skips L2 entirely.
         let pkt = make_l2_raw_packet(
@@ -1337,7 +1380,7 @@ mod tests {
             [10, 0, 0, 5],
             [192, 168, 1, 1], // local IP -> Consumed
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr);
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &ct, &zr, &im);
 
         assert!(
             matches!(result, PipelineResult::Consumed),

@@ -216,6 +216,90 @@ impl ArpEngine {
         }
     }
 
+    /// Pre-populate ARP caches from the kernel's neighbor table (`/proc/net/arp`).
+    ///
+    /// `linux_to_logical` maps Linux device names (e.g. "eth1") to logical
+    /// interface names (e.g. "lan0") used as cache keys. This is used at
+    /// startup so that ruster can immediately forward packets to directly
+    /// connected hosts without waiting for ARP resolution.
+    ///
+    /// Returns the number of entries loaded.
+    #[cfg(target_os = "linux")]
+    pub fn load_kernel_arp(
+        &mut self,
+        linux_to_logical: &std::collections::HashMap<String, String>,
+    ) -> usize {
+        let content = match std::fs::read_to_string("/proc/net/arp") {
+            Ok(c) => c,
+            Err(_) => return 0,
+        };
+        let mut loaded = 0;
+        // /proc/net/arp format:
+        // IP address       HW type     Flags       HW address            Mask     Device
+        // 192.168.1.100    0x1         0x2         aa:bb:cc:dd:ee:ff     *        eth1
+        for line in content.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 6 {
+                continue;
+            }
+            let ip_str = fields[0];
+            let flags = fields[2];
+            let mac_str = fields[3];
+            let device = fields[5];
+
+            // Skip incomplete entries (flags 0x0 means incomplete).
+            if flags == "0x0" {
+                continue;
+            }
+
+            let ip = match parse_ipv4_addr(ip_str) {
+                Some(ip) => ip,
+                None => continue,
+            };
+            let mac = parse_mac(mac_str);
+            if mac == [0; 6] {
+                continue;
+            }
+
+            // Map Linux device name to logical interface name.
+            let logical_name = linux_to_logical
+                .get(device)
+                .map(|s| s.as_str())
+                .unwrap_or(device);
+
+            if let Some(cache) = self.caches.get_mut(logical_name) {
+                cache.insert(ip, mac);
+                loaded += 1;
+            }
+        }
+        loaded
+    }
+
+    /// Pre-populate ARP caches from the kernel's neighbor table.
+    ///
+    /// On non-Linux platforms this is a no-op.
+    #[cfg(not(target_os = "linux"))]
+    pub fn load_kernel_arp(
+        &mut self,
+        _linux_to_logical: &std::collections::HashMap<String, String>,
+    ) -> usize {
+        0
+    }
+
+    /// Insert an ARP entry directly into the cache for a given interface.
+    ///
+    /// This is used for pre-populating the ARP cache (e.g. from the kernel
+    /// neighbor table at startup, or in tests). Returns `true` if the
+    /// interface was found and the entry was inserted.
+    pub fn insert(&mut self, ifname: &str, ip: [u8; 4], mac: [u8; 6]) -> bool {
+        if let Some(cache) = self.caches.get_mut(ifname) {
+            cache.insert(ip, mac);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Run aging on all per-interface ARP caches.
     ///
     /// Returns the total number of entries removed across all interfaces.
@@ -375,6 +459,7 @@ mod tests {
             ipv4_addrs: vec!["192.168.1.1/24".to_string()],
             zone: InterfaceZone::Lan,
             l2_domain: "br0".to_string(),
+            linux_if: None,
         }]
     }
 

@@ -10,7 +10,7 @@ schema = "ruster/v0.1"
 hostname = "ruster-e2e"
 
 [dataplane]
-backend = "dpdk"
+backend = "afpacket"
 lcore_list = "0-1"
 memory_mb = 512
 rx_queue_size = 256
@@ -26,6 +26,7 @@ mac = "02:00:00:00:01:01"
 ipv4_addrs = ["192.168.1.1/24"]
 zone = "lan"
 l2_domain = "bd-lan"
+linux_if = "eth1"
 
 [[interfaces]]
 name = "wan0"
@@ -37,6 +38,7 @@ mac = "02:00:00:00:02:01"
 ipv4_addrs = ["10.0.0.1/24"]
 zone = "wan"
 l2_domain = "bd-wan"
+linux_if = "eth2"
 
 [l2]
 mac_table_max_entries = 4096
@@ -50,6 +52,10 @@ bridge_domains = [
 
 [routing]
 ipv4_static_routes = [
+  # Directly connected subnets (L3Engine does not auto-generate these)
+  { prefix = "192.168.1.0/24", next_hop = "0.0.0.0", out_if = "lan0", metric = 1 },
+  { prefix = "10.0.0.0/24", next_hop = "0.0.0.0", out_if = "wan0", metric = 1 },
+  # Default route for internet-bound traffic
   { prefix = "0.0.0.0/0", next_hop = "10.0.0.100", out_if = "wan0", metric = 10 }
 ]
 
@@ -73,6 +79,7 @@ default_output = "accept"
 allow_established_related = true
 rules = [
   { name = "allow-lan-to-wan", chain = "forward", action = "accept", proto = "any", src_zone = "lan", dst_zone = "wan", state = ["new", "established", "related"] },
+  { name = "allow-wan-to-lan", chain = "forward", action = "accept", proto = "any", src_zone = "wan", dst_zone = "lan", state = ["new", "established", "related"] },
   { name = "allow-lan-input-icmp", chain = "input", action = "accept", proto = "icmp", src_zone = "lan", dst_zone = "any", state = ["new"] },
   { name = "block-wan-input", chain = "input", action = "drop", proto = "any", src_zone = "wan", dst_zone = "any", state = ["new"] }
 ]
