@@ -176,7 +176,12 @@ fn make_conntrack_config() -> ConntrackConfig {
 
 // ── Packet builders ──────────────────────────────────────────────────
 
-fn make_l2_meta(in_ifname: &str, src_mac: [u8; 6], dst_mac: [u8; 6], pkt_size: usize) -> PacketMeta {
+fn make_l2_meta(
+    in_ifname: &str,
+    src_mac: [u8; 6],
+    dst_mac: [u8; 6],
+    pkt_size: usize,
+) -> PacketMeta {
     PacketMeta {
         in_ifname: in_ifname.to_string(),
         l2: L2Info {
@@ -304,13 +309,9 @@ fn bench_packet_parse(c: &mut Criterion) {
     for &pkt_size in &[SMALL_PKT, MEDIUM_PKT, LARGE_PKT] {
         let raw = build_raw_tcp_packet(pkt_size);
         group.throughput(Throughput::Elements(1));
-        group.bench_with_input(
-            BenchmarkId::new("tcp_ipv4", pkt_size),
-            &raw,
-            |b, raw| {
-                b.iter(|| ruster_dataplane::packet::parse_packet(black_box(raw), "lan0"));
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("tcp_ipv4", pkt_size), &raw, |b, raw| {
+            b.iter(|| ruster_dataplane::packet::parse_packet(black_box(raw), "lan0"));
+        });
     }
 
     group.finish();
@@ -360,7 +361,14 @@ fn bench_l3_forward(c: &mut Criterion) {
     let engine = L3Engine::from_config(&make_routing_config(), &interfaces).unwrap();
 
     // Default route hit (LAN -> WAN)
-    let meta = make_ipv4_tcp_meta("lan0", [192, 168, 1, 100], [8, 8, 8, 8], 49152, 80, LARGE_PKT);
+    let meta = make_ipv4_tcp_meta(
+        "lan0",
+        [192, 168, 1, 100],
+        [8, 8, 8, 8],
+        49152,
+        80,
+        LARGE_PKT,
+    );
     group.bench_function("default_route", |b| {
         b.iter(|| engine.process(black_box(&meta)));
     });
@@ -427,8 +435,14 @@ fn bench_nat(c: &mut Criterion) {
     {
         let mut nat_engine = NatEngine::from_config(&nat_config, &interfaces);
         let mut conntrack = ConntrackEngine::new(make_conntrack_config());
-        let meta =
-            make_ipv4_tcp_meta("lan0", [192, 168, 1, 100], [8, 8, 8, 8], 49152, 80, LARGE_PKT);
+        let meta = make_ipv4_tcp_meta(
+            "lan0",
+            [192, 168, 1, 100],
+            [8, 8, 8, 8],
+            49152,
+            80,
+            LARGE_PKT,
+        );
         nat_engine.process_outbound(&meta, &mut conntrack);
 
         group.bench_function("outbound_existing", |b| {
@@ -511,7 +525,14 @@ fn bench_full_pipeline(c: &mut Criterion) {
     let mut nat_engine = NatEngine::from_config(&nat_config, &interfaces);
     let mut conntrack = ConntrackEngine::new(make_conntrack_config());
 
-    let meta = make_ipv4_tcp_meta("lan0", [192, 168, 1, 100], [8, 8, 8, 8], 49152, 80, LARGE_PKT);
+    let meta = make_ipv4_tcp_meta(
+        "lan0",
+        [192, 168, 1, 100],
+        [8, 8, 8, 8],
+        49152,
+        80,
+        LARGE_PKT,
+    );
     nat_engine.process_outbound(&meta, &mut conntrack);
 
     group.bench_function("l3_fw_nat", |b| {
