@@ -2,6 +2,7 @@
 .PHONY: worktree-start worktree-clean worktree-list
 .PHONY: team-start team-stop
 .PHONY: clab-deploy clab-test clab-destroy clab-e2e
+.PHONY: clab-strict-deploy clab-strict-test clab-strict-destroy clab-strict-e2e
 .PHONY: soak-test soak-test-short
 .PHONY: rfc-check rfc-registry
 
@@ -99,6 +100,27 @@ clab-destroy:
 	cd tests/containerlab && sudo containerlab destroy --name $(CLAB_TOPO_NAME) --cleanup
 
 clab-e2e: clab-test clab-destroy
+
+# ── Containerlab E2E Strict ──────────────────────────
+# Strict topology: kernel ip_forward=0 on all nodes.
+# Traffic only passes through the ruster dataplane.
+# Use CLAB_STRICT_NAME to override topology name.
+
+CLAB_STRICT_NAME ?= ruster-e2e-strict
+export CLAB_STRICT_NAME
+
+clab-strict-deploy:
+	cd tests/containerlab && sudo containerlab deploy --topo configs/strict.clab.yml --name $(CLAB_STRICT_NAME)
+	sleep 10
+	cd tests/containerlab && CLAB_TOPO_NAME=$(CLAB_STRICT_NAME) bash scripts/strict-setup.sh
+
+clab-strict-test: clab-strict-deploy
+	cd tests/containerlab && CLAB_TOPO_NAME=$(CLAB_STRICT_NAME) bash scripts/strict-test.sh
+
+clab-strict-destroy:
+	cd tests/containerlab && sudo containerlab destroy --name $(CLAB_STRICT_NAME) --cleanup
+
+clab-strict-e2e: clab-strict-test clab-strict-destroy
 
 # ── Soak Tests ────────────────────────────────────────
 
