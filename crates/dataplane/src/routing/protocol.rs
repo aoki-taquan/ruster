@@ -147,9 +147,18 @@ mod tests {
     #[test]
     fn admin_distance_ordering() {
         // Connected < Static < BGP < OSPF.
-        assert!(ProtocolSource::Connected.default_admin_distance() < ProtocolSource::Static.default_admin_distance());
-        assert!(ProtocolSource::Static.default_admin_distance() < ProtocolSource::Bgp.default_admin_distance());
-        assert!(ProtocolSource::Bgp.default_admin_distance() < ProtocolSource::Ospf.default_admin_distance());
+        assert!(
+            ProtocolSource::Connected.default_admin_distance()
+                < ProtocolSource::Static.default_admin_distance()
+        );
+        assert!(
+            ProtocolSource::Static.default_admin_distance()
+                < ProtocolSource::Bgp.default_admin_distance()
+        );
+        assert!(
+            ProtocolSource::Bgp.default_admin_distance()
+                < ProtocolSource::Ospf.default_admin_distance()
+        );
     }
 
     #[test]

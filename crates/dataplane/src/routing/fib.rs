@@ -152,11 +152,21 @@ mod tests {
         let mut rib = Rib::new();
         // Static default route.
         rib.insert(make_rib_entry(
-            [0, 0, 0, 0], 0, [10, 0, 0, 1], "wan0", 100, ProtocolSource::Static,
+            [0, 0, 0, 0],
+            0,
+            [10, 0, 0, 1],
+            "wan0",
+            100,
+            ProtocolSource::Static,
         ));
         // Static LAN route.
         rib.insert(make_rib_entry(
-            [192, 168, 1, 0], 24, [0, 0, 0, 0], "lan0", 10, ProtocolSource::Static,
+            [192, 168, 1, 0],
+            24,
+            [0, 0, 0, 0],
+            "lan0",
+            10,
+            ProtocolSource::Static,
         ));
 
         let fib = Fib::from_rib(&rib);
@@ -167,13 +177,28 @@ mod tests {
     fn fib_lpm_lookup_longest_match() {
         let mut rib = Rib::new();
         rib.insert(make_rib_entry(
-            [0, 0, 0, 0], 0, [10, 0, 0, 1], "wan0", 100, ProtocolSource::Static,
+            [0, 0, 0, 0],
+            0,
+            [10, 0, 0, 1],
+            "wan0",
+            100,
+            ProtocolSource::Static,
         ));
         rib.insert(make_rib_entry(
-            [192, 168, 1, 0], 24, [0, 0, 0, 0], "lan0", 10, ProtocolSource::Static,
+            [192, 168, 1, 0],
+            24,
+            [0, 0, 0, 0],
+            "lan0",
+            10,
+            ProtocolSource::Static,
         ));
         rib.insert(make_rib_entry(
-            [192, 168, 1, 128], 25, [192, 168, 1, 254], "lan0", 10, ProtocolSource::Static,
+            [192, 168, 1, 128],
+            25,
+            [192, 168, 1, 254],
+            "lan0",
+            10,
+            ProtocolSource::Static,
         ));
 
         let fib = Fib::from_rib(&rib);
@@ -206,7 +231,12 @@ mod tests {
     fn fib_lookup_no_match_no_default() {
         let mut rib = Rib::new();
         rib.insert(make_rib_entry(
-            [192, 168, 1, 0], 24, [0, 0, 0, 0], "lan0", 10, ProtocolSource::Static,
+            [192, 168, 1, 0],
+            24,
+            [0, 0, 0, 0],
+            "lan0",
+            10,
+            ProtocolSource::Static,
         ));
         let fib = Fib::from_rib(&rib);
         assert!(fib.lookup(&[10, 0, 0, 1]).is_none());
@@ -217,11 +247,21 @@ mod tests {
         let mut rib = Rib::new();
         // OSPF route with lower metric but higher AD.
         rib.insert(make_rib_entry(
-            [10, 0, 0, 0], 8, [10, 0, 0, 2], "wan0", 10, ProtocolSource::Ospf,
+            [10, 0, 0, 0],
+            8,
+            [10, 0, 0, 2],
+            "wan0",
+            10,
+            ProtocolSource::Ospf,
         ));
         // Static route with higher metric but lower AD.
         rib.insert(make_rib_entry(
-            [10, 0, 0, 0], 8, [10, 0, 0, 1], "wan0", 100, ProtocolSource::Static,
+            [10, 0, 0, 0],
+            8,
+            [10, 0, 0, 1],
+            "wan0",
+            100,
+            ProtocolSource::Static,
         ));
 
         let fib = Fib::from_rib(&rib);
@@ -236,10 +276,20 @@ mod tests {
     fn fib_from_entries_convenience() {
         let entries = vec![
             make_rib_entry(
-                [0, 0, 0, 0], 0, [10, 0, 0, 1], "wan0", 100, ProtocolSource::Static,
+                [0, 0, 0, 0],
+            0,
+            [10, 0, 0, 1],
+            "wan0",
+            100,
+            ProtocolSource::Static,
             ),
             make_rib_entry(
-                [192, 168, 1, 0], 24, [0, 0, 0, 0], "lan0", 10, ProtocolSource::Static,
+                [192, 168, 1, 0],
+            24,
+            [0, 0, 0, 0],
+            "lan0",
+            10,
+            ProtocolSource::Static,
             ),
         ];
         let fib = Fib::from_entries(entries);
@@ -253,7 +303,12 @@ mod tests {
     fn fib_rebuild_after_rib_insert() {
         let mut rib = Rib::new();
         rib.insert(make_rib_entry(
-            [0, 0, 0, 0], 0, [10, 0, 0, 1], "wan0", 100, ProtocolSource::Static,
+            [0, 0, 0, 0],
+            0,
+            [10, 0, 0, 1],
+            "wan0",
+            100,
+            ProtocolSource::Static,
         ));
 
         let fib1 = Fib::from_rib(&rib);
@@ -261,7 +316,12 @@ mod tests {
 
         // Add a more specific route.
         rib.insert(make_rib_entry(
-            [192, 168, 1, 0], 24, [0, 0, 0, 0], "lan0", 10, ProtocolSource::Static,
+            [192, 168, 1, 0],
+            24,
+            [0, 0, 0, 0],
+            "lan0",
+            10,
+            ProtocolSource::Static,
         ));
 
         let fib2 = Fib::from_rib(&rib);
@@ -272,10 +332,20 @@ mod tests {
     fn fib_rebuild_after_rib_remove() {
         let mut rib = Rib::new();
         rib.insert(make_rib_entry(
-            [0, 0, 0, 0], 0, [10, 0, 0, 1], "wan0", 100, ProtocolSource::Static,
+            [0, 0, 0, 0],
+            0,
+            [10, 0, 0, 1],
+            "wan0",
+            100,
+            ProtocolSource::Static,
         ));
         rib.insert(make_rib_entry(
-            [192, 168, 1, 0], 24, [0, 0, 0, 0], "lan0", 10, ProtocolSource::Static,
+            [192, 168, 1, 0],
+            24,
+            [0, 0, 0, 0],
+            "lan0",
+            10,
+            ProtocolSource::Static,
         ));
 
         let fib1 = Fib::from_rib(&rib);

@@ -196,8 +196,7 @@ impl L3Engine {
                 });
             }
 
-            if let (Some((prefix, prefix_len)), Some(next_hop)) = (prefix_result, next_hop_result)
-            {
+            if let (Some((prefix, prefix_len)), Some(next_hop)) = (prefix_result, next_hop_result) {
                 rib.insert(RibEntry {
                     prefix,
                     prefix_len,
@@ -331,7 +330,7 @@ impl L3Engine {
 
     /// Rebuild the FIB from the current RIB state.
     ///
-    /// Called automatically after RIB mutations via [`update_rib`].
+    /// Called automatically after RIB mutations via [`Self::update_rib`].
     /// Can also be called directly if the RIB was mutated through
     /// direct access.
     pub fn rebuild_fib(&mut self) {

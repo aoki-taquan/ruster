@@ -80,9 +80,8 @@ impl Rib {
     /// Returns the number of entries removed.
     pub fn remove(&mut self, prefix: &[u8; 4], prefix_len: u8, source: ProtocolSource) -> usize {
         let before = self.entries.len();
-        self.entries.retain(|e| {
-            !(e.prefix == *prefix && e.prefix_len == prefix_len && e.source == source)
-        });
+        self.entries
+            .retain(|e| !(e.prefix == *prefix && e.prefix_len == prefix_len && e.source == source));
         before - self.entries.len()
     }
 
