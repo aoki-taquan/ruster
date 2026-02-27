@@ -1,5 +1,8 @@
 # RFC-DEVIATION Registry
-# Generated: 2026-02-24T01:14:20Z
-# Total deviations: 0
+# Generated: 2026-02-27T06:00:22Z
+# Total deviations: 3
 #
 file	line	reason	impact	issue	plan
+./crates/dataplane/src/conntrack/session.rs	102	ICMPv6 conntrack not yet implemented for home-lab v0.1	ICMPv6 flows will not be tracked by conntrack	#159	implement ICMPv6 session tracking in v0.2
+./crates/dataplane/src/nat/mod.rs	460	ICMPv6 NAT not implemented for home-lab v0.1	ICMPv6 return traffic will not be reverse-translated	#159	implement ICMPv6 NAT support in v0.2
+./crates/dataplane/src/pipeline.rs	502	ICMPv6 Time Exceeded not yet implemented	senders will not be notified of hop limit expiry via ICMPv6	#159	v0.2 で ICMPv6 error generation を実装
