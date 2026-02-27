@@ -1,4 +1,5 @@
 .PHONY: build test clippy fmt fmt-check check doc ci clean
+.PHONY: bench bench-report
 .PHONY: worktree-start worktree-clean worktree-list
 .PHONY: team-start team-stop
 .PHONY: clab-deploy clab-test clab-destroy clab-e2e
@@ -34,6 +35,14 @@ ci: check fmt-check clippy test doc
 
 clean:
 	cargo clean
+
+# ── Benchmarks ────────────────────────────────────────
+
+bench:
+	cargo bench -p ruster-dataplane
+
+bench-report:
+	bash scripts/bench-report.sh
 
 # ── Worktree ───────────────────────────────────────────
 
