@@ -137,7 +137,7 @@ pub enum ConntrackResult {
 /// 3. **L2 check**: if the ingress interface belongs to a bridge domain:
 ///    a. Learn source MAC (FDB update).
 ///    b. If the destination IP is one of the router's local IPs,
-///       fall through to L3 processing.
+///   fall through to L3 processing.
 ///    c. Otherwise, make an L2 forwarding decision:
 ///    Known unicast -> `Forward` to the learned port.
 ///    Unknown unicast / broadcast -> `Flood` to all bridge domain
