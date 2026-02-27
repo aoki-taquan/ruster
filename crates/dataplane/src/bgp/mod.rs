@@ -136,15 +136,19 @@ impl BgpEngine {
     /// "After a TCP connection is established, the first message sent by
     /// each side is an OPEN message."
     pub fn build_open(&self) -> OpenMessage {
+        // RFC-DEVIATION:
+        // reason: 4-byte ASN capability not yet advertised in OPEN
+        // impact: peers with 4-byte ASNs will see AS_TRANS (23456) in OPEN
+        // issue: #158
+        // plan: implement 4-byte AS capability (RFC 6793) in v0.2
         OpenMessage {
             version: BGP_VERSION,
-            my_as: self.config.local_as as u16,
-            hold_time: self
-                .config
-                .peers
-                .first()
-                .map(|p| p.hold_time)
-                .unwrap_or(90),
+            my_as: if self.config.local_as > 65535 {
+                23456
+            } else {
+                self.config.local_as as u16
+            },
+            hold_time: self.config.peers.first().map(|p| p.hold_time).unwrap_or(90),
             bgp_id: self.config.router_id,
             capabilities: vec![],
         }
@@ -153,9 +157,18 @@ impl BgpEngine {
     /// Build an OPEN message for a specific peer.
     pub fn build_open_for_peer(&self, peer_addr: &[u8; 4]) -> Option<OpenMessage> {
         let peer = self.peers.get(peer_addr)?;
+        // RFC-DEVIATION:
+        // reason: 4-byte ASN capability not yet advertised in OPEN
+        // impact: peers with 4-byte ASNs will see AS_TRANS (23456) in OPEN
+        // issue: #158
+        // plan: implement 4-byte AS capability (RFC 6793) in v0.2
         Some(OpenMessage {
             version: BGP_VERSION,
-            my_as: self.config.local_as as u16,
+            my_as: if self.config.local_as > 65535 {
+                23456
+            } else {
+                self.config.local_as as u16
+            },
             hold_time: peer.config.hold_time,
             bgp_id: self.config.router_id,
             capabilities: vec![],
@@ -207,11 +220,7 @@ impl BgpEngine {
     /// "An UPDATE message is used to advertise feasible routes that
     /// share a common set of path attributes to a peer, or to withdraw
     /// multiple unfeasible routes from service."
-    pub fn process_update(
-        &mut self,
-        peer_addr: &[u8; 4],
-        update: &UpdateMessage,
-    ) -> Vec<RibEntry> {
+    pub fn process_update(&mut self, peer_addr: &[u8; 4], update: &UpdateMessage) -> Vec<RibEntry> {
         let peer_router_id = self
             .peers
             .get(peer_addr)
@@ -357,11 +366,7 @@ impl BgpEngine {
     }
 
     /// Drive a peer's FSM with an event and return the actions.
-    pub fn process_fsm_event(
-        &mut self,
-        peer_addr: &[u8; 4],
-        event: FsmEvent,
-    ) -> Vec<FsmAction> {
+    pub fn process_fsm_event(&mut self, peer_addr: &[u8; 4], event: FsmEvent) -> Vec<FsmAction> {
         if let Some(peer) = self.peers.get_mut(peer_addr) {
             peer.fsm.process_event(event)
         } else {
@@ -503,11 +508,7 @@ mod tests {
     #[test]
     fn process_update_installs_routes() {
         let mut engine = make_engine();
-        let update = make_update(
-            vec![([192, 168, 1, 0], 24)],
-            vec![65002],
-            [10, 0, 0, 2],
-        );
+        let update = make_update(vec![([192, 168, 1, 0], 24)], vec![65002], [10, 0, 0, 2]);
 
         let rib_entries = engine.process_update(&[10, 0, 0, 2], &update);
         assert_eq!(rib_entries.len(), 1);
@@ -536,11 +537,7 @@ mod tests {
         let mut engine = make_engine();
 
         // First, advertise a route.
-        let update = make_update(
-            vec![([192, 168, 1, 0], 24)],
-            vec![65002],
-            [10, 0, 0, 2],
-        );
+        let update = make_update(vec![([192, 168, 1, 0], 24)], vec![65002], [10, 0, 0, 2]);
         engine.process_update(&[10, 0, 0, 2], &update);
 
         // Now withdraw it.
@@ -575,11 +572,7 @@ mod tests {
         let mut engine = make_engine();
 
         // Advertise routes.
-        let update = make_update(
-            vec![([192, 168, 1, 0], 24)],
-            vec![65002],
-            [10, 0, 0, 2],
-        );
+        let update = make_update(vec![([192, 168, 1, 0], 24)], vec![65002], [10, 0, 0, 2]);
         engine.process_update(&[10, 0, 0, 2], &update);
         assert_eq!(engine.rib_entries().len(), 1);
 
@@ -593,7 +586,11 @@ mod tests {
         let mut engine = make_engine();
         engine.on_session_established(&[10, 0, 0, 2]);
         assert_eq!(
-            engine.peer(&[10, 0, 0, 2]).unwrap().stats.established_transitions,
+            engine
+                .peer(&[10, 0, 0, 2])
+                .unwrap()
+                .stats
+                .established_transitions,
             1
         );
     }
@@ -656,11 +653,7 @@ mod tests {
         engine.process_update(&[10, 0, 0, 2], &update1);
 
         // Peer 2 advertises same prefix with AS_PATH length 1 (shorter = better).
-        let update2 = make_update(
-            vec![([192, 168, 1, 0], 24)],
-            vec![65003],
-            [10, 0, 0, 3],
-        );
+        let update2 = make_update(vec![([192, 168, 1, 0], 24)], vec![65003], [10, 0, 0, 3]);
         let rib_entries = engine.process_update(&[10, 0, 0, 3], &update2);
 
         // Should select peer 2's route (shorter AS_PATH).

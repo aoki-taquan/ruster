@@ -235,7 +235,7 @@ impl BgpMessage {
         }
 
         let length = u16::from_be_bytes([buf[16], buf[17]]) as usize;
-        if length < BGP_MIN_MSG_LEN || length > BGP_MAX_MSG_LEN {
+        if !(BGP_MIN_MSG_LEN..=BGP_MAX_MSG_LEN).contains(&length) {
             return Err(ParseError::InvalidLength(length as u16));
         }
         if buf.len() < length {
@@ -472,15 +472,13 @@ fn parse_nlri(data: &[u8]) -> Result<Vec<([u8; 4], u8)>, ParseError> {
             )));
         }
 
-        let prefix_bytes = ((prefix_len + 7) / 8) as usize;
+        let prefix_bytes = prefix_len.div_ceil(8) as usize;
         if pos + prefix_bytes > data.len() {
             return Err(ParseError::MalformedUpdate("NLRI prefix truncated".into()));
         }
 
         let mut prefix = [0u8; 4];
-        for i in 0..prefix_bytes {
-            prefix[i] = data[pos + i];
-        }
+        prefix[..prefix_bytes].copy_from_slice(&data[pos..pos + prefix_bytes]);
         pos += prefix_bytes;
 
         routes.push((prefix, prefix_len));
@@ -494,7 +492,7 @@ fn serialize_nlri(routes: &[([u8; 4], u8)]) -> Vec<u8> {
     let mut buf = Vec::new();
     for &(prefix, prefix_len) in routes {
         buf.push(prefix_len);
-        let prefix_bytes = ((prefix_len + 7) / 8) as usize;
+        let prefix_bytes = prefix_len.div_ceil(8) as usize;
         buf.extend_from_slice(&prefix[..prefix_bytes]);
     }
     buf
@@ -665,18 +663,18 @@ fn parse_as_path(data: &[u8]) -> Result<AsPath, ParseError> {
 
 /// Serialize path attributes to bytes.
 fn serialize_path_attributes(attrs: &PathAttributes) -> Vec<u8> {
-    let mut buf = Vec::new();
-
     // ORIGIN: well-known mandatory, transitive.
     // Flags: 0x40 (transitive).
-    buf.push(ATTR_FLAG_TRANSITIVE);
-    buf.push(ATTR_ORIGIN);
-    buf.push(1); // length
-    buf.push(match attrs.origin {
-        Origin::Igp => 0,
-        Origin::Egp => 1,
-        Origin::Incomplete => 2,
-    });
+    let mut buf = vec![
+        ATTR_FLAG_TRANSITIVE,
+        ATTR_ORIGIN,
+        1, // length
+        match attrs.origin {
+            Origin::Igp => 0,
+            Origin::Egp => 1,
+            Origin::Incomplete => 2,
+        },
+    ];
 
     // AS_PATH: well-known mandatory, transitive.
     let as_path_data = serialize_as_path(&attrs.as_path);
@@ -722,7 +720,13 @@ fn serialize_as_path(as_path: &AsPath) -> Vec<u8> {
         buf.push(asns.len() as u8);
         for &asn in asns {
             // Serialize as 2-byte ASN on the wire.
-            buf.extend_from_slice(&(asn as u16).to_be_bytes());
+            // RFC-DEVIATION:
+            // reason: 4-byte ASN capability not yet advertised in OPEN
+            // impact: 4-byte ASNs are clamped to AS_TRANS (23456) on the wire
+            // issue: #158
+            // plan: implement 4-byte AS capability (RFC 6793) in v0.2
+            let wire_asn = if asn > 65535 { 23456u16 } else { asn as u16 };
+            buf.extend_from_slice(&wire_asn.to_be_bytes());
         }
     }
     buf

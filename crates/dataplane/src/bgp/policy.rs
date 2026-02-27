@@ -85,15 +85,11 @@ impl PrefixList {
     }
 
     /// Check if a prefix matches a prefix-list entry.
-    fn matches_entry(
-        &self,
-        entry: &PrefixListEntry,
-        prefix: &[u8; 4],
-        prefix_len: u8,
-    ) -> bool {
+    fn matches_entry(&self, entry: &PrefixListEntry, prefix: &[u8; 4], prefix_len: u8) -> bool {
         if entry.exact {
             // Exact match: both prefix and prefix_len must match.
-            prefix_len == entry.prefix_len && prefix_matches(prefix, &entry.prefix, entry.prefix_len)
+            prefix_len == entry.prefix_len
+                && prefix_matches(prefix, &entry.prefix, entry.prefix_len)
         } else {
             // The route prefix must be at least as specific as the entry
             // and must match the entry's prefix bits.
@@ -148,9 +144,7 @@ impl ImportPolicy {
     pub fn apply<'a>(&self, entries: &'a [AdjRibInEntry]) -> Vec<&'a AdjRibInEntry> {
         entries
             .iter()
-            .filter(|e| {
-                self.prefix_list.evaluate(&e.prefix, e.prefix_len) == PolicyAction::Permit
-            })
+            .filter(|e| self.prefix_list.evaluate(&e.prefix, e.prefix_len) == PolicyAction::Permit)
             .collect()
     }
 }
@@ -208,20 +202,14 @@ mod tests {
     #[test]
     fn permit_all_allows_everything() {
         let pl = PrefixList::permit_all();
-        assert_eq!(
-            pl.evaluate(&[192, 168, 1, 0], 24),
-            PolicyAction::Permit
-        );
+        assert_eq!(pl.evaluate(&[192, 168, 1, 0], 24), PolicyAction::Permit);
         assert_eq!(pl.evaluate(&[0, 0, 0, 0], 0), PolicyAction::Permit);
     }
 
     #[test]
     fn deny_all_blocks_everything() {
         let pl = PrefixList::deny_all();
-        assert_eq!(
-            pl.evaluate(&[192, 168, 1, 0], 24),
-            PolicyAction::Deny
-        );
+        assert_eq!(pl.evaluate(&[192, 168, 1, 0], 24), PolicyAction::Deny);
     }
 
     #[test]
@@ -239,10 +227,7 @@ mod tests {
         // More specific: not matched (exact=true), default permit.
         assert_eq!(pl.evaluate(&[10, 0, 0, 0], 16), PolicyAction::Permit);
         // Different prefix: not matched, default permit.
-        assert_eq!(
-            pl.evaluate(&[192, 168, 1, 0], 24),
-            PolicyAction::Permit
-        );
+        assert_eq!(pl.evaluate(&[192, 168, 1, 0], 24), PolicyAction::Permit);
     }
 
     #[test]
@@ -256,15 +241,9 @@ mod tests {
         });
 
         // Matches: 192.168.1.0/24 is within 192.168.0.0/16.
-        assert_eq!(
-            pl.evaluate(&[192, 168, 1, 0], 24),
-            PolicyAction::Permit
-        );
+        assert_eq!(pl.evaluate(&[192, 168, 1, 0], 24), PolicyAction::Permit);
         // Matches: exact match also works.
-        assert_eq!(
-            pl.evaluate(&[192, 168, 0, 0], 16),
-            PolicyAction::Permit
-        );
+        assert_eq!(pl.evaluate(&[192, 168, 0, 0], 16), PolicyAction::Permit);
         // Does not match: different prefix.
         assert_eq!(pl.evaluate(&[10, 0, 0, 0], 8), PolicyAction::Deny);
         // Less specific: /8 is not within /16.

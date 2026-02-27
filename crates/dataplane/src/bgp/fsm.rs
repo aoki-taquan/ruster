@@ -28,9 +28,7 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use super::packet::{
-    NotificationMessage, OpenMessage, ERR_CEASE, ERR_FSM, ERR_HOLD_TIMER_EXPIRED,
-};
+use super::packet::{NotificationMessage, OpenMessage, ERR_CEASE, ERR_FSM, ERR_HOLD_TIMER_EXPIRED};
 
 /// BGP FSM states.
 ///
@@ -262,7 +260,8 @@ impl BgpFsm {
                 // RFC-REF: RFC 4271 Section 4.2
                 // "If the negotiated hold time value is zero, then the Hold
                 // Time timer and KeepaliveTimer are not started."
-                self.negotiated_hold_time = std::cmp::min(self.configured_hold_time, open.hold_time);
+                self.negotiated_hold_time =
+                    std::cmp::min(self.configured_hold_time, open.hold_time);
                 self.peer_open = Some(open);
 
                 self.transition(BgpState::OpenConfirm);
@@ -271,8 +270,7 @@ impl BgpFsm {
 
                 if self.negotiated_hold_time > 0 {
                     let hold_dur = Duration::from_secs(self.negotiated_hold_time as u64);
-                    let keepalive_dur =
-                        Duration::from_secs(self.negotiated_hold_time as u64 / 3);
+                    let keepalive_dur = Duration::from_secs(self.negotiated_hold_time as u64 / 3);
                     actions.push(FsmAction::StartHoldTimer(hold_dur));
                     actions.push(FsmAction::StartKeepaliveTimer(keepalive_dur));
                 }
@@ -633,9 +631,7 @@ mod tests {
         assert!(actions
             .iter()
             .any(|a| matches!(a, FsmAction::SendNotification(_))));
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FsmAction::SessionDown)));
+        assert!(actions.iter().any(|a| matches!(a, FsmAction::SessionDown)));
     }
 
     #[test]
@@ -670,9 +666,7 @@ mod tests {
         };
         let actions = fsm.process_event(FsmEvent::BgpNotificationReceived(notif));
         assert_eq!(fsm.state(), BgpState::Idle);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FsmAction::SessionDown)));
+        assert!(actions.iter().any(|a| matches!(a, FsmAction::SessionDown)));
     }
 
     #[test]
@@ -790,9 +784,7 @@ mod tests {
 
         let actions = fsm.process_event(FsmEvent::TcpConnectionFails);
         assert_eq!(fsm.state(), BgpState::Idle);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, FsmAction::SessionDown)));
+        assert!(actions.iter().any(|a| matches!(a, FsmAction::SessionDown)));
     }
 
     // ── Peer OPEN stored ─────────────────────────────────────────────

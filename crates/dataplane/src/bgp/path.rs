@@ -20,20 +20,15 @@ use std::fmt;
 ///
 /// RFC-REF: RFC 4271 Section 5.1.1
 /// "ORIGIN is a well-known mandatory attribute."
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub enum Origin {
     /// Network Layer Reachability Information is interior to the AS.
+    #[default]
     Igp,
     /// NLRI was learned via EGP.
     Egp,
     /// NLRI was learned by some other means.
     Incomplete,
-}
-
-impl Default for Origin {
-    fn default() -> Self {
-        Self::Igp
-    }
 }
 
 impl fmt::Display for Origin {
