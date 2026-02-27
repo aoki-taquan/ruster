@@ -303,7 +303,10 @@ fn neighbor_dead_expiration() {
 
     // Wait beyond dead_interval (40s): last hello at t=101, dead at t=141+.
     let changed = engine.tick(200);
-    assert!(changed, "tick should report route change after neighbor death");
+    assert!(
+        changed,
+        "tick should report route change after neighbor death"
+    );
 
     // Neighbor should be removed.
     assert!(

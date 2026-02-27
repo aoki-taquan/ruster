@@ -54,11 +54,7 @@ fn make_two_peer_config() -> BgpEngineConfig {
     }
 }
 
-fn make_update(
-    nlri: Vec<([u8; 4], u8)>,
-    as_path: Vec<u32>,
-    next_hop: [u8; 4],
-) -> UpdateMessage {
+fn make_update(nlri: Vec<([u8; 4], u8)>, as_path: Vec<u32>, next_hop: [u8; 4]) -> UpdateMessage {
     UpdateMessage {
         withdrawn_routes: vec![],
         path_attributes: PathAttributes {
@@ -89,9 +85,7 @@ fn establish_session(engine: &mut BgpEngine, peer_addr: &[u8; 4], peer_as: u16) 
     // ManualStart: Idle → Connect
     let actions = engine.process_fsm_event(peer_addr, FsmEvent::ManualStart);
     assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, FsmAction::TcpConnect)),
+        actions.iter().any(|a| matches!(a, FsmAction::TcpConnect)),
         "ManualStart should produce TcpConnect action"
     );
     assert_eq!(engine.peer(peer_addr).unwrap().state(), BgpState::Connect);
@@ -102,10 +96,7 @@ fn establish_session(engine: &mut BgpEngine, peer_addr: &[u8; 4], peer_as: u16) 
         actions.iter().any(|a| matches!(a, FsmAction::SendOpen)),
         "TcpConnectionConfirmed should produce SendOpen action"
     );
-    assert_eq!(
-        engine.peer(peer_addr).unwrap().state(),
-        BgpState::OpenSent
-    );
+    assert_eq!(engine.peer(peer_addr).unwrap().state(), BgpState::OpenSent);
 
     // BgpOpenReceived: OpenSent → OpenConfirm
     let peer_open = make_peer_open(peer_as, *peer_addr);
@@ -156,10 +147,7 @@ fn full_session_lifecycle() {
 
     assert_eq!(engine.established_count(), 1);
     assert!(engine.peer(&peer).unwrap().is_established());
-    assert_eq!(
-        engine.peer(&peer).unwrap().stats.established_transitions,
-        1
-    );
+    assert_eq!(engine.peer(&peer).unwrap().stats.established_transitions, 1);
 }
 
 /// UPDATE message processing installs routes with correct attributes.
@@ -213,11 +201,7 @@ fn best_path_shorter_as_path() {
     engine.process_update(&peer1, &update1);
 
     // Peer 2: AS_PATH = [65003] (length 1 — shorter, should win).
-    let update2 = make_update(
-        vec![([192, 168, 1, 0], 24)],
-        vec![65003],
-        [10, 0, 0, 3],
-    );
+    let update2 = make_update(vec![([192, 168, 1, 0], 24)], vec![65003], [10, 0, 0, 3]);
     let rib_entries = engine.process_update(&peer2, &update2);
 
     assert_eq!(rib_entries.len(), 1);
