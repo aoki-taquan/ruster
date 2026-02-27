@@ -182,6 +182,24 @@ pub struct DropCounters {
     pub parse_error: AtomicU64,
 }
 
+// ── ARP hold queue counters ────────────────────────────────────────────
+
+/// Counters for the ARP hold queue (packets waiting for ARP resolution).
+///
+/// Tracks enqueue, flush (successful resolution), timeout/GC drops,
+/// and tail-drops due to queue limits.
+#[derive(Debug, Default)]
+pub struct ArpHoldQueueCounters {
+    /// Total packets enqueued into the ARP hold queue.
+    pub enqueued: AtomicU64,
+    /// Total packets flushed (forwarded) after ARP resolution.
+    pub flushed: AtomicU64,
+    /// Total packets dropped by the hold queue GC (timeout / stale).
+    pub gc_dropped: AtomicU64,
+    /// Total packets tail-dropped because per-IP or global limit was reached.
+    pub tail_dropped: AtomicU64,
+}
+
 // ── Observer ──────────────────────────────────────────────────────────
 
 /// The main observability hub.
@@ -199,6 +217,8 @@ pub struct Observer {
     pub forwarded: AtomicU64,
     /// Total packets delivered locally (destination is one of our IPs).
     pub local_delivery: AtomicU64,
+    /// ARP hold queue counters.
+    pub arp_hold_queue: ArpHoldQueueCounters,
 }
 
 impl Observer {
@@ -217,6 +237,7 @@ impl Observer {
             drops: DropCounters::default(),
             forwarded: AtomicU64::new(0),
             local_delivery: AtomicU64::new(0),
+            arp_hold_queue: ArpHoldQueueCounters::default(),
         }
     }
 
@@ -266,6 +287,30 @@ impl Observer {
     /// Increment the local delivery counter.
     pub fn inc_local_delivery(&self) {
         self.local_delivery.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the ARP hold queue enqueued counter.
+    pub fn inc_arp_hold_enqueued(&self) {
+        self.arp_hold_queue.enqueued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the ARP hold queue flushed counter by `n`.
+    pub fn inc_arp_hold_flushed(&self, n: u64) {
+        self.arp_hold_queue.flushed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Increment the ARP hold queue GC-dropped counter by `n`.
+    pub fn inc_arp_hold_gc_dropped(&self, n: u64) {
+        self.arp_hold_queue
+            .gc_dropped
+            .fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Increment the ARP hold queue tail-dropped counter.
+    pub fn inc_arp_hold_tail_dropped(&self) {
+        self.arp_hold_queue
+            .tail_dropped
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Increment the appropriate drop reason counter for the given reason.
@@ -321,6 +366,12 @@ impl Observer {
             },
             forwarded: self.forwarded.load(Ordering::Relaxed),
             local_delivery: self.local_delivery.load(Ordering::Relaxed),
+            arp_hold_queue: ArpHoldQueueSnapshot {
+                enqueued: self.arp_hold_queue.enqueued.load(Ordering::Relaxed),
+                flushed: self.arp_hold_queue.flushed.load(Ordering::Relaxed),
+                gc_dropped: self.arp_hold_queue.gc_dropped.load(Ordering::Relaxed),
+                tail_dropped: self.arp_hold_queue.tail_dropped.load(Ordering::Relaxed),
+            },
         }
     }
 }
@@ -341,6 +392,21 @@ pub struct ObserverSnapshot {
     pub forwarded: u64,
     /// Total locally delivered packets.
     pub local_delivery: u64,
+    /// ARP hold queue counter snapshot.
+    pub arp_hold_queue: ArpHoldQueueSnapshot,
+}
+
+/// ARP hold queue counter snapshot.
+#[derive(Debug, Clone)]
+pub struct ArpHoldQueueSnapshot {
+    /// Total packets enqueued.
+    pub enqueued: u64,
+    /// Total packets flushed (forwarded after ARP resolution).
+    pub flushed: u64,
+    /// Total packets GC-dropped (timeout/stale).
+    pub gc_dropped: u64,
+    /// Total packets tail-dropped (queue limit reached).
+    pub tail_dropped: u64,
 }
 
 /// Per-interface counter snapshot.
@@ -419,7 +485,13 @@ impl fmt::Display for ObserverSnapshot {
         writeln!(f, "  NAT/table-full: {}", self.drops.nat_table_full)?;
         writeln!(f, "  FW/drop: {}", self.drops.fw_drop)?;
         writeln!(f, "  ARP/unresolved: {}", self.drops.arp_unresolved)?;
-        write!(f, "  parse-error: {}", self.drops.parse_error)?;
+        writeln!(f, "  parse-error: {}", self.drops.parse_error)?;
+        writeln!(f)?;
+        writeln!(f, "--- ARP Hold Queue ---")?;
+        writeln!(f, "  enqueued: {}", self.arp_hold_queue.enqueued)?;
+        writeln!(f, "  flushed: {}", self.arp_hold_queue.flushed)?;
+        writeln!(f, "  gc-dropped: {}", self.arp_hold_queue.gc_dropped)?;
+        write!(f, "  tail-dropped: {}", self.arp_hold_queue.tail_dropped)?;
         Ok(())
     }
 }
@@ -911,5 +983,45 @@ mod tests {
         assert_eq!(snap.interfaces.len(), 1);
         assert_eq!(snap.interfaces[0].rx_packets, 0);
         assert_eq!(snap.interfaces[0].tx_packets, 0);
+        assert_eq!(snap.arp_hold_queue.enqueued, 0);
+        assert_eq!(snap.arp_hold_queue.flushed, 0);
+        assert_eq!(snap.arp_hold_queue.gc_dropped, 0);
+        assert_eq!(snap.arp_hold_queue.tail_dropped, 0);
+    }
+
+    // ── ARP hold queue counter tests ─────────────────────────────────
+
+    #[test]
+    fn observer_arp_hold_queue_counters() {
+        let obs = Observer::new(&[]);
+
+        obs.inc_arp_hold_enqueued();
+        obs.inc_arp_hold_enqueued();
+        obs.inc_arp_hold_enqueued();
+        obs.inc_arp_hold_flushed(2);
+        obs.inc_arp_hold_gc_dropped(1);
+        obs.inc_arp_hold_tail_dropped();
+
+        let snap = obs.snapshot();
+        assert_eq!(snap.arp_hold_queue.enqueued, 3);
+        assert_eq!(snap.arp_hold_queue.flushed, 2);
+        assert_eq!(snap.arp_hold_queue.gc_dropped, 1);
+        assert_eq!(snap.arp_hold_queue.tail_dropped, 1);
+    }
+
+    #[test]
+    fn observer_snapshot_display_contains_arp_hold_queue() {
+        let obs = Observer::new(&["eth0".to_string()]);
+        obs.inc_arp_hold_enqueued();
+        obs.inc_arp_hold_flushed(1);
+
+        let snap = obs.snapshot();
+        let output = format!("{snap}");
+
+        assert!(output.contains("--- ARP Hold Queue ---"));
+        assert!(output.contains("enqueued: 1"));
+        assert!(output.contains("flushed: 1"));
+        assert!(output.contains("gc-dropped: 0"));
+        assert!(output.contains("tail-dropped: 0"));
     }
 }

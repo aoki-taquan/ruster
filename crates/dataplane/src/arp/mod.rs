@@ -9,8 +9,10 @@
 //! (IPv4) to hardware addresses (Ethernet MAC) within a broadcast domain.
 
 pub mod cache;
+pub mod hold_queue;
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::packet::{ArpInfo, L3Info, PacketMeta};
 use cache::{ArpCache, ArpEntryState};
@@ -92,6 +94,11 @@ pub struct ArpEngine {
     timeout_sec: u64,
     /// Maximum ARP table entries per interface (from configuration).
     max_entries: usize,
+    /// Rate-limiting: last time an ARP request was sent for each IP.
+    /// Used to avoid flooding the network with requests.
+    last_request_time: HashMap<[u8; 4], Instant>,
+    /// Minimum interval between ARP requests for the same IP (1 second).
+    request_interval_sec: u64,
 }
 
 impl ArpEngine {
@@ -124,6 +131,8 @@ impl ArpEngine {
             interfaces: if_map,
             timeout_sec,
             max_entries,
+            last_request_time: HashMap::new(),
+            request_interval_sec: 1,
         }
     }
 
@@ -311,6 +320,63 @@ impl ArpEngine {
             .sum()
     }
 
+    /// Read-only lookup: check whether an IP has been resolved (Reachable)
+    /// in the ARP cache for the given interface, without marking it Pending.
+    ///
+    /// Returns `Some(mac)` if a Reachable entry exists, `None` otherwise.
+    /// This is used by the hold-queue retry path so that checking the cache
+    /// does not have the side effect of re-marking the entry as Pending.
+    pub fn lookup_resolved(&self, ip: &[u8; 4], ifname: &str) -> Option<[u8; 6]> {
+        let cache = self.caches.get(ifname)?;
+        let entry = cache.lookup(ip)?;
+        if entry.state == ArpEntryState::Reachable {
+            Some(entry.mac)
+        } else {
+            None
+        }
+    }
+
+    /// Check whether we should rate-limit an ARP request for the given IP.
+    ///
+    /// Returns `true` if enough time has passed since the last request
+    /// (or if no request was sent yet), and updates the timestamp.
+    /// Returns `false` if the request should be suppressed.
+    pub fn should_send_request(&mut self, target_ip: [u8; 4]) -> bool {
+        let now = Instant::now();
+        if let Some(last) = self.last_request_time.get(&target_ip) {
+            if now.duration_since(*last).as_secs() < self.request_interval_sec {
+                return false;
+            }
+        }
+        self.last_request_time.insert(target_ip, now);
+
+        // Opportunistic cleanup: remove stale entries older than 60 seconds
+        // to prevent unbounded growth of the rate-limiting map.
+        self.cleanup_request_times(60);
+
+        true
+    }
+
+    /// Remove entries from `last_request_time` that are older than
+    /// `timeout_sec` seconds. This bounds memory usage for the rate-
+    /// limiting map when many distinct IPs are resolved over time.
+    fn cleanup_request_times(&mut self, timeout_sec: u64) {
+        let now = Instant::now();
+        self.last_request_time
+            .retain(|_ip, ts| now.duration_since(*ts).as_secs() < timeout_sec);
+    }
+
+    /// Get the interface information needed to build an ARP request for
+    /// a given egress interface.
+    ///
+    /// Returns `(sender_mac, sender_ip)` or `None` if the interface is
+    /// unknown or has no IPv4 address.
+    pub fn interface_info_for_request(&self, out_ifname: &str) -> Option<([u8; 6], [u8; 4])> {
+        let info = self.interfaces.get(out_ifname)?;
+        let sender_ip = *info.ipv4_addrs.first()?;
+        Some((info.mac, sender_ip))
+    }
+
     // ── Private helpers ────────────────────────────────────────────────
 
     /// Handle an ARP request.
@@ -395,6 +461,42 @@ fn parse_mac(mac_str: &str) -> [u8; 6] {
     mac
 }
 
+/// Build a raw Ethernet+ARP request packet.
+///
+/// RFC-REF: RFC 826
+/// The ARP request is broadcast on the local Ethernet to discover the
+/// hardware address corresponding to `target_ip`.
+///
+/// Returns a complete Ethernet frame (14 bytes Ethernet header + 28 bytes
+/// ARP payload = 42 bytes minimum, padded to 60 bytes for Ethernet minimum
+/// frame size).
+pub fn build_arp_request(sender_mac: [u8; 6], sender_ip: [u8; 4], target_ip: [u8; 4]) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(60);
+
+    // Ethernet header (14 bytes)
+    pkt.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]); // dst: broadcast
+    pkt.extend_from_slice(&sender_mac); // src
+    pkt.extend_from_slice(&[0x08, 0x06]); // EtherType: ARP
+
+    // ARP payload (28 bytes)
+    pkt.extend_from_slice(&[0x00, 0x01]); // hardware type: Ethernet
+    pkt.extend_from_slice(&[0x08, 0x00]); // protocol type: IPv4
+    pkt.push(6); // hardware address length
+    pkt.push(4); // protocol address length
+    pkt.extend_from_slice(&[0x00, 0x01]); // operation: request
+    pkt.extend_from_slice(&sender_mac); // sender hardware address
+    pkt.extend_from_slice(&sender_ip); // sender protocol address
+    pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // target hardware address (unknown)
+    pkt.extend_from_slice(&target_ip); // target protocol address
+
+    // Pad to minimum Ethernet frame size (60 bytes, excluding FCS).
+    while pkt.len() < 60 {
+        pkt.push(0x00);
+    }
+
+    pkt
+}
+
 /// Parse an IPv4 address string, stripping an optional CIDR prefix length.
 ///
 /// Accepts "192.168.1.1" or "192.168.1.1/24". Returns `None` if the
@@ -441,6 +543,8 @@ mod tests {
             mac_aging_sec: 300,
             arp_table_max_entries: 256,
             arp_timeout_sec: 120,
+            arp_hold_queue_per_ip: 3,
+            arp_hold_queue_max: 1024,
             bridge_domains: vec![BridgeDomain {
                 name: "br0".to_string(),
                 members: vec!["eth0".to_string()],
@@ -718,6 +822,8 @@ mod tests {
             mac_aging_sec: 300,
             arp_table_max_entries: 256,
             arp_timeout_sec: 0, // Age everything immediately.
+            arp_hold_queue_per_ip: 3,
+            arp_hold_queue_max: 1024,
             bridge_domains: vec![BridgeDomain {
                 name: "br0".to_string(),
                 members: vec!["eth0".to_string()],
@@ -781,5 +887,82 @@ mod tests {
         assert_eq!(parse_ipv4_addr("192.168.1.1/24"), Some([192, 168, 1, 1]));
         assert_eq!(parse_ipv4_addr("10.0.0.1/8"), Some([10, 0, 0, 1]));
         assert_eq!(parse_ipv4_addr("invalid"), None);
+    }
+
+    // ── build_arp_request tests ──────────────────────────────────────
+
+    #[test]
+    fn build_arp_request_packet_structure() {
+        let sender_mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+        let sender_ip = [192, 168, 1, 1];
+        let target_ip = [192, 168, 1, 100];
+
+        let pkt = build_arp_request(sender_mac, sender_ip, target_ip);
+
+        // Minimum Ethernet frame size (60 bytes).
+        assert_eq!(pkt.len(), 60);
+
+        // Ethernet header: broadcast destination.
+        assert_eq!(&pkt[0..6], &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        // Ethernet header: sender MAC.
+        assert_eq!(&pkt[6..12], &sender_mac);
+        // EtherType: ARP (0x0806).
+        assert_eq!(&pkt[12..14], &[0x08, 0x06]);
+
+        // ARP header.
+        assert_eq!(&pkt[14..16], &[0x00, 0x01]); // hardware type: Ethernet
+        assert_eq!(&pkt[16..18], &[0x08, 0x00]); // protocol type: IPv4
+        assert_eq!(pkt[18], 6); // hardware addr len
+        assert_eq!(pkt[19], 4); // protocol addr len
+        assert_eq!(&pkt[20..22], &[0x00, 0x01]); // operation: request
+
+        // Sender hardware address.
+        assert_eq!(&pkt[22..28], &sender_mac);
+        // Sender protocol address.
+        assert_eq!(&pkt[28..32], &sender_ip);
+        // Target hardware address (unknown).
+        assert_eq!(&pkt[32..38], &[0x00; 6]);
+        // Target protocol address.
+        assert_eq!(&pkt[38..42], &target_ip);
+    }
+
+    // ── should_send_request / interface_info_for_request tests ────────
+
+    #[test]
+    fn should_send_request_first_call_returns_true() {
+        let mut engine = make_engine();
+        assert!(engine.should_send_request(PEER_IP));
+    }
+
+    #[test]
+    fn should_send_request_rate_limits() {
+        let mut engine = make_engine();
+        // First call should succeed.
+        assert!(engine.should_send_request(PEER_IP));
+        // Immediate second call should be rate-limited (interval=1s).
+        assert!(!engine.should_send_request(PEER_IP));
+    }
+
+    #[test]
+    fn should_send_request_different_ips_independent() {
+        let mut engine = make_engine();
+        assert!(engine.should_send_request(PEER_IP));
+        assert!(engine.should_send_request(UNKNOWN_IP));
+    }
+
+    #[test]
+    fn interface_info_for_request_known_interface() {
+        let engine = make_engine();
+        let (mac, ip) = engine
+            .interface_info_for_request("eth0")
+            .expect("eth0 should be known");
+        assert_eq!(mac, OUR_MAC);
+        assert_eq!(ip, OUR_IP);
+    }
+
+    #[test]
+    fn interface_info_for_request_unknown_interface() {
+        let engine = make_engine();
+        assert!(engine.interface_info_for_request("unknown_if").is_none());
     }
 }

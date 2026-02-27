@@ -125,7 +125,23 @@ pub struct L2Config {
     pub mac_aging_sec: u32,
     pub arp_table_max_entries: u32,
     pub arp_timeout_sec: u32,
+    /// Maximum number of packets held per unresolved next-hop IP in the
+    /// ARP hold queue.  Packets beyond this limit are tail-dropped.
+    #[serde(default = "default_arp_hold_queue_per_ip")]
+    pub arp_hold_queue_per_ip: u32,
+    /// Global maximum number of packets across all unresolved next-hops
+    /// in the ARP hold queue.  Packets beyond this limit are tail-dropped.
+    #[serde(default = "default_arp_hold_queue_max")]
+    pub arp_hold_queue_max: u32,
     pub bridge_domains: Vec<BridgeDomain>,
+}
+
+fn default_arp_hold_queue_per_ip() -> u32 {
+    3
+}
+
+fn default_arp_hold_queue_max() -> u32 {
+    1024
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
