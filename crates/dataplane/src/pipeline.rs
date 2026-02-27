@@ -601,6 +601,7 @@ mod tests {
                 },
             ],
             ipv6_static_routes: vec![],
+            ospf: None,
         }
     }
 
@@ -803,6 +804,7 @@ mod tests {
                 metric: 10,
             }],
             ipv6_static_routes: vec![],
+            ospf: None,
         };
         let l3 = L3Engine::from_config(&routing, &make_interfaces()).unwrap();
         let fw = make_fw_accept_all();
@@ -1199,6 +1201,7 @@ mod tests {
                 metric: 10,
             }],
             ipv6_static_routes: vec![],
+            ospf: None,
         };
         let l3 = L3Engine::from_config(&routing, &make_interfaces()).unwrap();
         let fw = make_fw_accept_all();
@@ -1416,6 +1419,7 @@ mod tests {
                 metric: 100,
             }],
             ipv6_static_routes: vec![],
+            ospf: None,
         };
         let ifaces = vec![
             InterfaceConfig {
@@ -2230,6 +2234,7 @@ mod tests {
                     metric: 10,
                 },
             ],
+            ospf: None,
         }
     }
 
@@ -2462,6 +2467,7 @@ mod tests {
                 out_if: "lan0".to_string(),
                 metric: 10,
             }],
+            ospf: None,
         };
         let ipv6_routes = Ipv6RouteTable::from_config(&routing_no_default).unwrap();
 

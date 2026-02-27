@@ -110,6 +110,8 @@ fn make_routing_config() -> RoutingConfig {
                 metric: 10,
             },
         ],
+        ipv6_static_routes: vec![],
+        ospf: None,
     }
 }
 

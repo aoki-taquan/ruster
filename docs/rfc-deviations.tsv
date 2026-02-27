@@ -1,8 +1,15 @@
 # RFC-DEVIATION Registry
-# Generated: 2026-02-27T06:00:22Z
-# Total deviations: 3
+# Generated: 2026-02-27T06:40:53Z
+# Total deviations: 10
 #
 file	line	reason	impact	issue	plan
 ./crates/dataplane/src/conntrack/session.rs	102	ICMPv6 conntrack not yet implemented for home-lab v0.1	ICMPv6 flows will not be tracked by conntrack	#159	implement ICMPv6 session tracking in v0.2
 ./crates/dataplane/src/nat/mod.rs	460	ICMPv6 NAT not implemented for home-lab v0.1	ICMPv6 return traffic will not be reverse-translated	#159	implement ICMPv6 NAT support in v0.2
+./crates/dataplane/src/ospf/config.rs	27	Only backbone area (0.0.0.0) is supported in v0.2.	Multi-area OSPF topologies will not work.	#157	Add multi-area support in a future version.
+./crates/dataplane/src/ospf/interface.rs	22	We only implement Down, Waiting, PointToPoint, and	Broadcast network DR election does not work.	#157	Add DR election in a future version.
+./crates/dataplane/src/ospf/interface.rs	35	We skip DR election and treat all interfaces as	Broadcast networks will not have DR/BDR.	#157	Add DR election in a future version.
+./crates/dataplane/src/ospf/mod.rs	27	This is a minimal implementation focused on correctness of the core state machine and SPF algorithm	DR/BDR election, multi-area, authentication, options negotiation, LSA retransmission, virtual links, NSSA/stub areas not implemented	#157	Incrementally add features in future issues
+./crates/dataplane/src/ospf/neighbor.rs	176	We always form adjacency (no DR election).	On broadcast networks with many routers, all	#157	Implement DR election in a future version.
+./crates/dataplane/src/ospf/packet.rs	745	Authentication is not implemented; we zero the auth field	Interop with routers requiring MD5/simple auth will fail.	#157	Add authentication support in a future version.
+./crates/dataplane/src/ospf/spf.rs	83	Network-LSAs and transit network SPF are simplified.	Transit networks with DR will not be optimally routed.	#157	Add full Network-LSA SPF processing in a future version.
 ./crates/dataplane/src/pipeline.rs	502	ICMPv6 Time Exceeded not yet implemented	senders will not be notified of hop limit expiry via ICMPv6	#159	v0.2 で ICMPv6 error generation を実装

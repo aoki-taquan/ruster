@@ -170,6 +170,53 @@ pub struct RoutingConfig {
     pub ipv4_static_routes: Vec<StaticRoute>,
     #[serde(default)]
     pub ipv6_static_routes: Vec<Ipv6StaticRoute>,
+    /// OSPFv2 configuration (optional).
+    #[serde(default)]
+    pub ospf: Option<OspfRoutingConfig>,
+}
+
+/// OSPFv2 routing configuration.
+///
+/// ```toml
+/// [routing.ospf]
+/// router_id = "10.0.0.1"
+/// [[routing.ospf.areas]]
+/// id = "0.0.0.0"
+/// interfaces = ["eth0"]
+/// hello_interval = 10
+/// dead_interval = 40
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OspfRoutingConfig {
+    /// Router ID in dotted-decimal form.
+    pub router_id: String,
+    /// OSPF area configurations.
+    pub areas: Vec<OspfAreaConfig>,
+}
+
+/// OSPF area configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OspfAreaConfig {
+    /// Area ID in dotted-decimal form (e.g. "0.0.0.0" for backbone).
+    pub id: String,
+    /// Interface names participating in this area.
+    pub interfaces: Vec<String>,
+    /// Hello interval in seconds (default: 10).
+    #[serde(default = "default_hello_interval")]
+    pub hello_interval: u16,
+    /// Router dead interval in seconds (default: 40).
+    #[serde(default = "default_dead_interval")]
+    pub dead_interval: u16,
+}
+
+fn default_hello_interval() -> u16 {
+    10
+}
+
+fn default_dead_interval() -> u16 {
+    40
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

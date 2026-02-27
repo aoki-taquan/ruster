@@ -334,6 +334,7 @@ mod tests {
                 },
             ],
             ipv6_static_routes: vec![],
+            ospf: None,
         }
     }
 
@@ -370,6 +371,7 @@ mod tests {
                 },
             ],
             ipv6_static_routes: vec![],
+            ospf: None,
         };
         let err = RouteTable::from_config(&config).unwrap_err();
         assert_eq!(err.len(), 1);
@@ -396,6 +398,7 @@ mod tests {
                 },
             ],
             ipv6_static_routes: vec![],
+            ospf: None,
         };
         let err = RouteTable::from_config(&config).unwrap_err();
         // Entry 0: invalid prefix AND invalid next_hop (2 errors).
@@ -458,6 +461,7 @@ mod tests {
                 metric: 10,
             }],
             ipv6_static_routes: vec![],
+            ospf: None,
         };
         let table = RouteTable::from_config(&config).unwrap();
 
@@ -485,6 +489,7 @@ mod tests {
                 },
             ],
             ipv6_static_routes: vec![],
+            ospf: None,
         };
         let table = RouteTable::from_config(&config).unwrap();
         let result = table.lookup(&[10, 1, 2, 3]).unwrap();
