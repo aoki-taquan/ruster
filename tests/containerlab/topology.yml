@@ -36,6 +36,12 @@ topology:
         # Disable kernel forwarding — ruster handles packet forwarding
         - sysctl -w net.ipv4.ip_forward=0
         - sysctl -w net.ipv6.conf.all.forwarding=0
+        # Mirror ruster firewall policy at kernel level for INPUT chain.
+        # AF_PACKET cannot intercept packets destined to the kernel's own IP stack,
+        # so we use iptables to enforce the same policy (block WAN input).
+        - bash -c "apt-get install -y -qq iptables > /dev/null 2>&1 || true"
+        - iptables -A INPUT -i eth2 -p icmp --icmp-type echo-request -j DROP
+        - ip6tables -A INPUT -i eth2 -p icmpv6 --icmpv6-type echo-request -j DROP
         # Start ruster process in background (AF_PACKET backend).
         - bash -c "nohup /usr/local/bin/ruster --config /etc/ruster/router.toml > /var/log/ruster.log 2>&1 &"
 

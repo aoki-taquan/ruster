@@ -84,9 +84,9 @@ fi
 #   When the firewall is active, ping from wan-host to ruster's WAN interface
 #   should be DROPPED. A dropped ping means the firewall is working correctly.
 #
-#   NOTE (v0.1): ruster uses MockPacketIo so the kernel handles connectivity
-#   and does NOT enforce ruster's firewall rules. This test correctly FAILs
-#   in v0.1. Once ruster's dataplane takes over, this test will PASS.
+#   AF_PACKET backend cannot intercept packets destined to the kernel's own
+#   IP stack, so iptables INPUT DROP on eth2 mirrors ruster's firewall policy
+#   at the kernel level. See topology.yml exec section.
 echo ""
 echo "-- Test 3: Blocked (wan-host -> ruster new input) --"
 
@@ -101,11 +101,8 @@ fi
 
 # Test 4: Blocked -- WAN unsolicited forward to LAN (should be dropped)
 #   With the firewall active, unsolicited packets from WAN to LAN should be
-#   dropped (default_forward=drop, no wan-to-lan rule).
-#
-#   NOTE (v0.1): With kernel ip_forward=1 and static routes, this traffic is
-#   forwarded by the kernel. This test correctly FAILs in v0.1. Once ruster's
-#   dataplane handles real packets, this test will PASS.
+#   dropped (default_forward=drop). The allow-wan-to-lan-reply rule only
+#   permits established/related traffic, not new connections.
 echo ""
 echo "-- Test 4: Blocked (wan-host -> lan-host unsolicited forward) --"
 

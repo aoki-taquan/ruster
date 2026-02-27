@@ -86,8 +86,9 @@ default_output = "accept"
 allow_established_related = true
 rules = [
   { name = "allow-lan-to-wan", chain = "forward", action = "accept", proto = "any", src_zone = "lan", dst_zone = "wan", state = ["new", "established", "related"] },
-  { name = "allow-wan-to-lan", chain = "forward", action = "accept", proto = "any", src_zone = "wan", dst_zone = "lan", state = ["new", "established", "related"] },
+  { name = "allow-wan-to-lan-reply", chain = "forward", action = "accept", proto = "any", src_zone = "wan", dst_zone = "lan", state = ["established", "related"] },
   { name = "allow-lan-input-icmp", chain = "input", action = "accept", proto = "icmp", src_zone = "lan", dst_zone = "any", state = ["new"] },
+  { name = "allow-lan-input-any", chain = "input", action = "accept", proto = "any", src_zone = "lan", dst_zone = "any", state = ["new"] },
   { name = "block-wan-input", chain = "input", action = "drop", proto = "any", src_zone = "wan", dst_zone = "any", state = ["new"] }
 ]
 
