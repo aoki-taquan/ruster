@@ -267,6 +267,50 @@ pub struct FirewallConfig {
     pub rules: Vec<FirewallRule>,
 }
 
+/// SRv6 local SID configuration entry.
+///
+/// RFC-REF: RFC 8986 Section 4
+/// Defines a local SID and its associated action.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Srv6LocalSid {
+    /// SID address (e.g., "fd00:1::"), optionally with prefix (e.g., "fd00::/32").
+    pub sid: String,
+    /// Action name: "end", "end_dt4", "end_dt6", "un".
+    pub action: String,
+    /// Optional VRF table name for decap actions.
+    #[serde(default)]
+    pub table: Option<String>,
+}
+
+/// SRv6 configuration section.
+///
+/// RFC-REF: RFC 8986 (SRv6 Network Programming)
+/// RFC-REF: RFC 8754 (IPv6 Segment Routing Header)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Srv6Config {
+    /// Locator block prefix (e.g., "fd00::").
+    pub locator_block: String,
+    /// Block prefix length in bits (default: 32).
+    #[serde(default = "default_srv6_block_len")]
+    pub block_len: u8,
+    /// uSID length in bits (default: 16).
+    #[serde(default = "default_srv6_usid_len")]
+    pub usid_len: u8,
+    /// Local SID entries.
+    #[serde(default)]
+    pub local_sids: Vec<Srv6LocalSid>,
+}
+
+fn default_srv6_block_len() -> u8 {
+    32
+}
+
+fn default_srv6_usid_len() -> u8 {
+    16
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouterConfig {
@@ -277,4 +321,7 @@ pub struct RouterConfig {
     pub routing: RoutingConfig,
     pub nat: NatConfig,
     pub firewall: FirewallConfig,
+    /// SRv6 configuration (optional).
+    #[serde(default)]
+    pub srv6: Option<Srv6Config>,
 }

@@ -25,6 +25,7 @@ use crate::packet;
 use crate::packet::{L3Info, L4Info};
 use crate::routing::ipv6_table::Ipv6RouteTable;
 use crate::routing::{L3Decision, L3DropReason, L3Engine};
+use crate::srv6::{Srv6Decision, Srv6Engine};
 
 use ruster_config::model::{FirewallZone, InterfaceConfig, InterfaceZone};
 
@@ -85,6 +86,9 @@ pub enum PipelineResult {
         new_hop_limit: u8,
         /// Next-hop IPv6 address.
         next_hop_v6: [u8; 16],
+        /// If SRv6 processing updated the DA, the new destination address
+        /// to write into the packet's IPv6 header (bytes 24..40).
+        srv6_new_da: Option<[u8; 16]>,
     },
     /// Packet should be flooded to all listed interfaces (L2 unknown
     /// unicast or broadcast within a bridge domain).
@@ -116,7 +120,7 @@ pub enum PipelineResult {
 }
 
 /// Reason a packet was dropped during pipeline processing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DropReason {
     /// The raw bytes could not be parsed into a valid packet.
     ParseError,
@@ -136,6 +140,8 @@ pub enum DropReason {
     NatDrop,
     /// Conntrack session table is full.
     ConntrackTableFull,
+    /// SRv6 processing dropped the packet.
+    Srv6Drop(crate::srv6::Srv6DropReason),
 }
 
 // ── Pipeline function ───────────────────────────────────────────────
@@ -200,6 +206,7 @@ pub fn process_packet(
         iface_macs,
         None,
         None,
+        None,
     )
 }
 
@@ -209,6 +216,9 @@ pub fn process_packet(
 /// through the ND resolution + LPM route lookup path. When they are
 /// `None`, IPv6 packets fall through to the IPv4 L3 engine which will
 /// return `Drop(NotIpv4)`.
+///
+/// When `srv6` is `Some`, IPv6 packets with DA matching a local SID
+/// are processed through the SRv6 engine before normal IPv6 forwarding.
 ///
 /// RFC-REF: RFC 8200 Section 3
 /// IPv6 forwarding is based on the 128-bit destination address;
@@ -224,6 +234,7 @@ pub fn process_packet_v6(
     iface_macs: &std::collections::HashMap<String, [u8; 6]>,
     nd: Option<&mut NdEngine>,
     ipv6_routes: Option<&Ipv6RouteTable>,
+    srv6: Option<&Srv6Engine>,
 ) -> PipelineResult {
     // Step 1: Parse raw bytes.
     let meta = match packet::parse_packet(&raw_pkt.data, &raw_pkt.ingress_iface) {
@@ -294,6 +305,7 @@ pub fn process_packet_v6(
                 firewall,
                 conntrack,
                 zone_resolver,
+                srv6,
             );
         }
         // No IPv6 engines -> fall through to IPv4 L3 which will return NotIpv4.
@@ -453,14 +465,18 @@ fn initial_session_state(meta: &packet::PacketMeta) -> SessionState {
     }
 }
 
-/// Process an IPv6 packet through ND and route lookup.
+/// Process an IPv6 packet through SRv6, ND, and route lookup.
 ///
 /// RFC-REF: RFC 8200 Section 3
+/// RFC-REF: RFC 8986 Section 4 (SRv6 SID processing)
+///
+/// Processing order:
 /// 1. Check if this is an ND message (NS/NA) and process via NdEngine.
 /// 2. Check if the destination is one of our local IPv6 addresses.
-/// 3. Check Hop Limit (must be > 1 to forward).
-/// 4. Perform LPM route lookup in the IPv6 route table.
-/// 5. Return ForwardV6 or Drop.
+/// 3. If SRv6 is enabled: check DA against Local SID table.
+/// 4. Check Hop Limit (must be > 1 to forward).
+/// 5. Perform LPM route lookup in the IPv6 route table.
+/// 6. Return ForwardV6 or Drop.
 #[allow(clippy::too_many_arguments)]
 fn process_ipv6_packet(
     raw_pkt: &RawPacket,
@@ -471,6 +487,7 @@ fn process_ipv6_packet(
     firewall: &FirewallEngine,
     conntrack: &ConntrackEngine,
     zone_resolver: &ZoneResolver,
+    srv6: Option<&Srv6Engine>,
 ) -> PipelineResult {
     // Step 1: Check if this is an ND message.
     if let Some(packet::L4Info::Icmpv6(ref icmpv6)) = meta.l4 {
@@ -492,7 +509,108 @@ fn process_ipv6_packet(
         return PipelineResult::Consumed;
     }
 
-    // Step 3: Check Hop Limit.
+    // Step 3: SRv6 processing.
+    //
+    // RFC-REF: RFC 8986 Section 4
+    // If the destination matches a local SID, execute the bound action.
+    // SRv6 processing happens before normal IPv6 forwarding so that
+    // SRv6 endpoints can modify the DA or decapsulate before routing.
+    if let Some(srv6_engine) = srv6 {
+        if srv6_engine.is_enabled() {
+            let payload = if ipv6.payload_offset <= raw_pkt.data.len() {
+                &raw_pkt.data[ipv6.payload_offset..]
+            } else {
+                &[]
+            };
+
+            let decision =
+                srv6_engine.process(&ipv6.dst_addr, ipv6.next_header, payload, ipv6.hop_limit);
+
+            match decision {
+                Srv6Decision::Forward {
+                    new_da,
+                    srh_modified,
+                } => {
+                    // RFC-DEVIATION:
+                    // reason: SRH Segments Left field is not rewritten in packet bytes in v0.1
+                    // impact: Downstream SRv6 nodes see stale SL; multi-hop SRv6 may malfunction
+                    // issue: #160
+                    // plan: v0.2 で SRH in-place rewrite (SL decrement) を実装
+                    let _ = srh_modified;
+
+                    // The SRv6 engine updated the DA. Route the packet
+                    // using the new DA via normal IPv6 forwarding.
+                    // The new_da will be written into the IPv6 header by the caller.
+                    // Hop limit check and route lookup use the new DA.
+                    if ipv6.hop_limit <= 1 {
+                        return PipelineResult::Drop {
+                            reason: DropReason::L3HopLimitExpired,
+                            icmp_reply: None,
+                        };
+                    }
+                    let route = match route_table.lookup(&new_da) {
+                        Some(entry) => entry,
+                        None => {
+                            return PipelineResult::Drop {
+                                reason: DropReason::L3NoRoute,
+                                icmp_reply: None,
+                            }
+                        }
+                    };
+                    let out_ifname = route.out_ifname.clone();
+                    let next_hop_v6 = route.next_hop;
+                    let new_hop_limit = ipv6.hop_limit - 1;
+
+                    // Firewall check.
+                    let src_zone = zone_resolver.resolve(&raw_pkt.ingress_iface);
+                    let dst_zone = zone_resolver.resolve(&out_ifname);
+                    let fw_ctx = FwContext::from_packet(
+                        meta,
+                        FwChain::Forward,
+                        src_zone,
+                        dst_zone,
+                        conntrack,
+                        true,
+                    );
+                    let verdict = firewall.evaluate(&fw_ctx);
+
+                    return match verdict {
+                        FwVerdict::Accept | FwVerdict::AcceptRule { .. } => {
+                            PipelineResult::ForwardV6 {
+                                egress_iface: out_ifname,
+                                new_hop_limit,
+                                next_hop_v6,
+                                srv6_new_da: Some(new_da),
+                            }
+                        }
+                        FwVerdict::Drop | FwVerdict::DropRule { .. } => PipelineResult::Drop {
+                            reason: DropReason::FirewallDrop,
+                            icmp_reply: None,
+                        },
+                    };
+                }
+                Srv6Decision::DecapIpv4 { table: _ } | Srv6Decision::DecapIpv6 { table: _ } => {
+                    // RFC-DEVIATION:
+                    // reason: Full decap path requires inner-packet extraction and re-injection
+                    // impact: End.DT4/DT6 packets are consumed but inner packet is not forwarded
+                    // issue: #160
+                    // plan: v0.2 で inner packet re-injection を実装
+                    return PipelineResult::Consumed;
+                }
+                Srv6Decision::Drop { reason } => {
+                    return PipelineResult::Drop {
+                        reason: DropReason::Srv6Drop(reason),
+                        icmp_reply: None,
+                    };
+                }
+                Srv6Decision::NotSrv6 => {
+                    // Not an SRv6 packet; continue with normal IPv6 forwarding.
+                }
+            }
+        }
+    }
+
+    // Step 4: Check Hop Limit.
     // RFC-REF: RFC 8200 Section 3
     // "If [...] the Hop Limit is less than or equal to 1 [...] discard
     // the packet and originate an ICMPv6 Time Exceeded message."
@@ -508,7 +626,7 @@ fn process_ipv6_packet(
         };
     }
 
-    // Step 4: Route lookup.
+    // Step 5: Route lookup.
     let route = match route_table.lookup(&ipv6.dst_addr) {
         Some(entry) => entry,
         None => {
@@ -523,7 +641,7 @@ fn process_ipv6_packet(
     let next_hop_v6 = route.next_hop;
     let new_hop_limit = ipv6.hop_limit - 1;
 
-    // Step 5: Firewall check.
+    // Step 6: Firewall check.
     let src_zone = zone_resolver.resolve(&raw_pkt.ingress_iface);
     let dst_zone = zone_resolver.resolve(&out_ifname);
     // IPv6 conntrack is not yet implemented — all IPv6 packets are
@@ -537,6 +655,7 @@ fn process_ipv6_packet(
             egress_iface: out_ifname,
             new_hop_limit,
             next_hop_v6,
+            srv6_new_da: None,
         },
         FwVerdict::Drop | FwVerdict::DropRule { .. } => PipelineResult::Drop {
             reason: DropReason::FirewallDrop,
@@ -2335,6 +2454,7 @@ mod tests {
             &im,
             Some(&mut nd),
             Some(&ipv6_routes),
+            None,
         );
         match result {
             PipelineResult::ForwardV6 {
@@ -2390,6 +2510,7 @@ mod tests {
             &im,
             Some(&mut nd),
             Some(&ipv6_routes),
+            None,
         );
         assert!(
             matches!(result, PipelineResult::Consumed),
@@ -2439,6 +2560,7 @@ mod tests {
             &im,
             Some(&mut nd),
             Some(&ipv6_routes),
+            None,
         );
         match result {
             PipelineResult::Drop { reason, .. } => {
@@ -2500,6 +2622,7 @@ mod tests {
             &im,
             Some(&mut nd),
             Some(&ipv6_routes),
+            None,
         );
         match result {
             PipelineResult::Drop { reason, .. } => {
@@ -2576,6 +2699,7 @@ mod tests {
             &im,
             Some(&mut nd),
             Some(&ipv6_routes),
+            None,
         );
         assert!(
             matches!(
