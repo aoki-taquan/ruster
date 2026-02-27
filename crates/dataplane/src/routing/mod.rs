@@ -1,11 +1,22 @@
-//! IPv4 static routing and L3 forwarding engine.
+//! IPv4 routing and L3 forwarding engine with RIB/FIB separation.
 //!
 //! This module implements the L3 forwarding decision pipeline:
 //! 1. Extract IPv4 info from the packet (or drop non-IPv4).
 //! 2. Check if the destination is one of our local IPs (local delivery).
 //! 3. Verify TTL is sufficient for forwarding.
-//! 4. Perform longest-prefix-match route lookup.
+//! 4. Perform longest-prefix-match route lookup via the FIB.
 //! 5. Return a forwarding decision with the decremented TTL.
+//!
+//! # Architecture: RIB / FIB separation
+//!
+//! The **RIB** (Routing Information Base) stores all routes from every
+//! protocol source (static, connected, OSPF, BGP).  The **FIB**
+//! (Forwarding Information Base) is derived from the RIB via best-path
+//! selection and is optimized for LPM lookups in the forwarding path.
+//!
+//! New routing protocols can be added by implementing the
+//! [`protocol::RoutingProtocol`] trait and injecting routes into the RIB
+//! via [`L3Engine::update_rib`].
 //!
 //! # Validated-input contract
 //!
@@ -19,6 +30,9 @@
 //! a routing decision to forward the datagram to the next gateway or
 //! directly to the destination host."
 
+pub mod fib;
+pub mod protocol;
+pub mod rib;
 pub mod table;
 
 use std::collections::{HashMap, HashSet};
@@ -26,7 +40,11 @@ use std::fmt;
 
 use crate::packet::{L3Info, PacketMeta};
 use ruster_config::model::{InterfaceConfig, RoutingConfig};
-use table::{RouteError, RouteTable};
+use table::RouteError;
+
+use fib::Fib;
+use protocol::ProtocolSource;
+use rib::{Rib, RibEntry};
 
 /// Error returned when [`L3Engine::from_config`] encounters invalid
 /// configuration entries (route table entries or local IP address strings).
@@ -112,12 +130,19 @@ pub enum L3Decision {
 
 /// The L3 forwarding engine.
 ///
-/// Combines a static route table with local IP knowledge to make
-/// per-packet forwarding decisions.
+/// Combines a RIB (all routes from all sources), a FIB (best-path
+/// forwarding table), and local IP knowledge to make per-packet
+/// forwarding decisions.
+///
+/// The RIB holds routes from static config, connected interfaces, and
+/// (in future) dynamic protocols.  The FIB is derived from the RIB
+/// and used for fast LPM lookups in the forwarding path.
 #[derive(Debug)]
 pub struct L3Engine {
-    /// The static route table (sorted for LPM).
-    route_table: RouteTable,
+    /// The Routing Information Base — all routes from all sources.
+    rib: Rib,
+    /// The Forwarding Information Base — best-path, LPM-optimized.
+    fib: Fib,
     /// Set of IPv4 addresses assigned to our interfaces. Packets
     /// destined to any of these are handed to local delivery.
     local_ips: HashSet<[u8; 4]>,
@@ -129,8 +154,9 @@ pub struct L3Engine {
 impl L3Engine {
     /// Build an L3 engine from configuration.
     ///
-    /// Loads the static route table from `routing_config` and collects
-    /// all IPv4 addresses from `interfaces` for local delivery checks.
+    /// Parses static routes from `routing_config` into the RIB, then
+    /// derives the FIB.  Collects all IPv4 addresses from `interfaces`
+    /// for local delivery checks.
     ///
     /// # Errors
     ///
@@ -147,8 +173,14 @@ impl L3Engine {
         routing_config: &RoutingConfig,
         interfaces: &[InterfaceConfig],
     ) -> Result<Self, L3ConfigError> {
-        let route_table =
-            RouteTable::from_config(routing_config).map_err(L3ConfigError::InvalidRoutes)?;
+        // Parse and validate static routes via the shared helper.
+        let rib_entries =
+            parse_static_routes(routing_config).map_err(L3ConfigError::InvalidRoutes)?;
+
+        let mut rib = Rib::new();
+        for entry in rib_entries {
+            rib.insert(entry);
+        }
 
         // Collect local IPs, tracking any parse failures.
         let mut local_ips: HashSet<[u8; 4]> = HashSet::new();
@@ -176,8 +208,12 @@ impl L3Engine {
             return Err(L3ConfigError::InvalidLocalAddrs(addr_errors));
         }
 
+        // Build the FIB from the RIB.
+        let fib = Fib::from_rib(&rib);
+
         Ok(Self {
-            route_table,
+            rib,
+            fib,
             local_ips,
             iface_ips,
         })
@@ -189,7 +225,7 @@ impl L3Engine {
     /// 1. Extract IPv4 info; drop if not IPv4.
     /// 2. Check for local delivery (destination is one of our IPs).
     /// 3. Check TTL; drop if expired (TTL <= 1).
-    /// 4. Perform LPM route lookup; drop if no route.
+    /// 4. Perform LPM route lookup via the FIB; drop if no route.
     /// 5. Return `Forward` with the decremented TTL.
     pub fn process(&self, meta: &PacketMeta) -> L3Decision {
         // Step 1: Extract IPv4 info.
@@ -219,8 +255,8 @@ impl L3Engine {
             };
         }
 
-        // Step 4: Route lookup (LPM).
-        let route = match self.route_table.lookup(&ipv4.dst_addr) {
+        // Step 4: Route lookup (LPM) via the FIB.
+        let fib_entry = match self.fib.lookup(&ipv4.dst_addr) {
             Some(entry) => entry,
             None => {
                 return L3Decision::Drop {
@@ -231,15 +267,53 @@ impl L3Engine {
 
         // Step 5: Forward with decremented TTL.
         L3Decision::Forward {
-            out_ifname: route.out_ifname.clone(),
-            next_hop: route.next_hop,
+            out_ifname: fib_entry.out_ifname.clone(),
+            next_hop: fib_entry.next_hop,
             new_ttl: ipv4.ttl - 1,
         }
     }
 
-    /// Returns a reference to the route table.
-    pub fn route_table(&self) -> &RouteTable {
-        &self.route_table
+    /// Update the RIB with routes from a protocol source and rebuild
+    /// the FIB.
+    ///
+    /// This first removes all existing routes from the given `source`,
+    /// then inserts the new `entries`.  Finally, the FIB is rebuilt
+    /// from the updated RIB.
+    ///
+    /// # Usage
+    ///
+    /// ```ignore
+    /// // Future OSPF adapter pushes new routes:
+    /// engine.update_rib(ospf_routes, ProtocolSource::Ospf);
+    /// ```
+    pub fn update_rib(&mut self, entries: Vec<RibEntry>, source: ProtocolSource) {
+        // Remove old routes from this source.
+        self.rib.remove_by_source(source);
+        // Insert new routes.
+        for entry in entries {
+            self.rib.insert(entry);
+        }
+        // Rebuild the FIB.
+        self.rebuild_fib();
+    }
+
+    /// Rebuild the FIB from the current RIB state.
+    ///
+    /// Called automatically after RIB mutations via [`Self::update_rib`].
+    /// Can also be called directly if the RIB was mutated through
+    /// direct access.
+    pub fn rebuild_fib(&mut self) {
+        self.fib = Fib::from_rib(&self.rib);
+    }
+
+    /// Returns a reference to the RIB.
+    pub fn rib(&self) -> &Rib {
+        &self.rib
+    }
+
+    /// Returns a reference to the FIB.
+    pub fn fib(&self) -> &Fib {
+        &self.fib
     }
 
     /// Return the router's IPv4 address for the given interface.
@@ -258,6 +332,57 @@ impl L3Engine {
     /// rather than being L2-forwarded/flooded.
     pub fn is_local_ip(&self, ip: &[u8; 4]) -> bool {
         self.local_ips.contains(ip)
+    }
+}
+
+/// Parse static routes from a [`RoutingConfig`] into [`RibEntry`] values.
+///
+/// This is the shared helper used by both [`L3Engine::from_config`] and
+/// (potentially) [`table::RouteTable::from_config`] so that route-parsing
+/// logic is not duplicated.
+///
+/// Returns `Ok(entries)` on success, or `Err(errors)` listing every
+/// invalid entry found.
+fn parse_static_routes(config: &RoutingConfig) -> Result<Vec<RibEntry>, Vec<RouteError>> {
+    let mut entries = Vec::with_capacity(config.ipv4_static_routes.len());
+    let mut errors: Vec<RouteError> = Vec::new();
+
+    for (index, sr) in config.ipv4_static_routes.iter().enumerate() {
+        let prefix_result = table::parse_prefix(&sr.prefix);
+        let next_hop_result = parse_ipv4_addr(&sr.next_hop);
+
+        if prefix_result.is_none() {
+            errors.push(RouteError {
+                index,
+                kind: table::RouteErrorKind::InvalidPrefix,
+                raw_value: sr.prefix.clone(),
+            });
+        }
+        if next_hop_result.is_none() {
+            errors.push(RouteError {
+                index,
+                kind: table::RouteErrorKind::InvalidNextHop,
+                raw_value: sr.next_hop.clone(),
+            });
+        }
+
+        if let (Some((prefix, prefix_len)), Some(next_hop)) = (prefix_result, next_hop_result) {
+            entries.push(RibEntry {
+                prefix,
+                prefix_len,
+                next_hop,
+                out_ifname: sr.out_if.clone(),
+                metric: sr.metric,
+                source: ProtocolSource::Static,
+                admin_distance: ProtocolSource::Static.default_admin_distance(),
+            });
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(entries)
+    } else {
+        Err(errors)
     }
 }
 
@@ -396,9 +521,17 @@ mod tests {
     }
 
     #[test]
-    fn engine_from_config_loads_routes() {
+    fn engine_from_config_loads_routes_into_rib() {
         let engine = make_engine();
-        assert_eq!(engine.route_table.len(), 2);
+        assert_eq!(engine.rib.len(), 2);
+        assert_eq!(engine.fib.len(), 2);
+    }
+
+    #[test]
+    fn engine_rib_contains_static_routes() {
+        let engine = make_engine();
+        let static_routes = engine.rib.routes_by_source(ProtocolSource::Static);
+        assert_eq!(static_routes.len(), 2);
     }
 
     // ── Forwarding tests ──────────────────────────────────────────────
@@ -602,5 +735,230 @@ mod tests {
     fn router_ip_for_unknown_iface() {
         let engine = make_engine();
         assert_eq!(engine.router_ip_for_iface("unknown"), None);
+    }
+
+    // ── RIB/FIB integration tests ────────────────────────────────────
+
+    #[test]
+    fn update_rib_adds_dynamic_routes() {
+        let mut engine = make_engine();
+
+        // Initially: 2 static routes.
+        assert_eq!(engine.rib.len(), 2);
+
+        // Inject OSPF routes.
+        let ospf_routes = vec![RibEntry {
+            prefix: [172, 16, 0, 0],
+            prefix_len: 12,
+            next_hop: [10, 0, 0, 3],
+            out_ifname: "wan0".to_string(),
+            metric: 50,
+            source: ProtocolSource::Ospf,
+            admin_distance: ProtocolSource::Ospf.default_admin_distance(),
+        }];
+        engine.update_rib(ospf_routes, ProtocolSource::Ospf);
+
+        assert_eq!(engine.rib.len(), 3);
+        assert_eq!(engine.fib.len(), 3);
+
+        // New route should be in the FIB.
+        let result = engine.fib.lookup(&[172, 16, 1, 1]);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().next_hop, [10, 0, 0, 3]);
+    }
+
+    #[test]
+    fn update_rib_replaces_source_routes() {
+        let mut engine = make_engine();
+
+        // Add OSPF route.
+        engine.update_rib(
+            vec![RibEntry {
+                prefix: [172, 16, 0, 0],
+                prefix_len: 12,
+                next_hop: [10, 0, 0, 3],
+                out_ifname: "wan0".to_string(),
+                metric: 50,
+                source: ProtocolSource::Ospf,
+                admin_distance: ProtocolSource::Ospf.default_admin_distance(),
+            }],
+            ProtocolSource::Ospf,
+        );
+        assert_eq!(engine.rib.len(), 3);
+
+        // Replace OSPF routes with a different set.
+        engine.update_rib(
+            vec![RibEntry {
+                prefix: [10, 10, 0, 0],
+                prefix_len: 16,
+                next_hop: [10, 0, 0, 4],
+                out_ifname: "wan0".to_string(),
+                metric: 30,
+                source: ProtocolSource::Ospf,
+                admin_distance: ProtocolSource::Ospf.default_admin_distance(),
+            }],
+            ProtocolSource::Ospf,
+        );
+
+        // Old OSPF route should be gone, new one present.
+        assert_eq!(engine.rib.len(), 3);
+        assert!(engine.fib.lookup(&[172, 16, 1, 1]).is_some()); // falls through to default
+        let result = engine.fib.lookup(&[10, 10, 1, 1]);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().next_hop, [10, 0, 0, 4]);
+    }
+
+    #[test]
+    fn admin_distance_selects_best_in_fib() {
+        let mut engine = make_engine();
+
+        // Add an OSPF default route with lower metric but higher AD.
+        engine.update_rib(
+            vec![RibEntry {
+                prefix: [0, 0, 0, 0],
+                prefix_len: 0,
+                next_hop: [10, 0, 0, 99],
+                out_ifname: "wan0".to_string(),
+                metric: 1, // much lower metric
+                source: ProtocolSource::Ospf,
+                admin_distance: ProtocolSource::Ospf.default_admin_distance(), // AD=110
+            }],
+            ProtocolSource::Ospf,
+        );
+
+        // Static default route (AD=1) should still win over OSPF (AD=110).
+        let meta = make_ipv4_meta("lan0", [192, 168, 1, 100], [8, 8, 8, 8], 64);
+        let decision = engine.process(&meta);
+        assert_eq!(
+            decision,
+            L3Decision::Forward {
+                out_ifname: "wan0".to_string(),
+                next_hop: [10, 0, 0, 1], // static next_hop, not OSPF's
+                new_ttl: 63,
+            }
+        );
+    }
+
+    #[test]
+    fn static_and_dynamic_coexist_in_rib() {
+        let mut engine = make_engine();
+
+        // Add routes from multiple dynamic sources.
+        engine.update_rib(
+            vec![RibEntry {
+                prefix: [172, 16, 0, 0],
+                prefix_len: 12,
+                next_hop: [10, 0, 0, 3],
+                out_ifname: "wan0".to_string(),
+                metric: 50,
+                source: ProtocolSource::Ospf,
+                admin_distance: ProtocolSource::Ospf.default_admin_distance(),
+            }],
+            ProtocolSource::Ospf,
+        );
+        engine.update_rib(
+            vec![RibEntry {
+                prefix: [172, 20, 0, 0],
+                prefix_len: 14,
+                next_hop: [10, 0, 0, 5],
+                out_ifname: "wan0".to_string(),
+                metric: 100,
+                source: ProtocolSource::Bgp,
+                admin_distance: ProtocolSource::Bgp.default_admin_distance(),
+            }],
+            ProtocolSource::Bgp,
+        );
+
+        // RIB has: 2 static + 1 OSPF + 1 BGP = 4
+        assert_eq!(engine.rib.len(), 4);
+
+        // All protocols' routes are reachable through FIB.
+        assert_eq!(engine.fib.len(), 4);
+
+        let static_routes = engine.rib.routes_by_source(ProtocolSource::Static);
+        assert_eq!(static_routes.len(), 2);
+
+        let ospf_routes = engine.rib.routes_by_source(ProtocolSource::Ospf);
+        assert_eq!(ospf_routes.len(), 1);
+
+        let bgp_routes = engine.rib.routes_by_source(ProtocolSource::Bgp);
+        assert_eq!(bgp_routes.len(), 1);
+    }
+
+    #[test]
+    fn fib_rebuild_removes_withdrawn_routes() {
+        let mut engine = make_engine();
+
+        // Add OSPF route.
+        engine.update_rib(
+            vec![RibEntry {
+                prefix: [172, 16, 0, 0],
+                prefix_len: 12,
+                next_hop: [10, 0, 0, 3],
+                out_ifname: "wan0".to_string(),
+                metric: 50,
+                source: ProtocolSource::Ospf,
+                admin_distance: ProtocolSource::Ospf.default_admin_distance(),
+            }],
+            ProtocolSource::Ospf,
+        );
+        assert_eq!(engine.fib.len(), 3);
+
+        // OSPF withdraws all routes (empty update).
+        engine.update_rib(vec![], ProtocolSource::Ospf);
+        assert_eq!(engine.fib.len(), 2); // only static routes remain
+    }
+
+    // ── Error handling (backward compatibility) ──────────────────────
+
+    #[test]
+    fn from_config_rejects_invalid_routes() {
+        let config = RoutingConfig {
+            ipv4_static_routes: vec![StaticRoute {
+                prefix: "invalid/24".to_string(),
+                next_hop: "10.0.0.1".to_string(),
+                out_if: "wan0".to_string(),
+                metric: 100,
+            }],
+        };
+        let result = L3Engine::from_config(&config, &make_interfaces());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            L3ConfigError::InvalidRoutes(errs) => {
+                assert_eq!(errs.len(), 1);
+                assert_eq!(errs[0].kind, table::RouteErrorKind::InvalidPrefix);
+            }
+            other => panic!("expected InvalidRoutes, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn from_config_collects_all_errors() {
+        let config = RoutingConfig {
+            ipv4_static_routes: vec![
+                StaticRoute {
+                    prefix: "bad/99".to_string(),
+                    next_hop: "also_bad".to_string(),
+                    out_if: "wan0".to_string(),
+                    metric: 100,
+                },
+                StaticRoute {
+                    prefix: "10.0.0.0/8".to_string(),
+                    next_hop: "not_an_ip".to_string(),
+                    out_if: "wan0".to_string(),
+                    metric: 50,
+                },
+            ],
+        };
+        let result = L3Engine::from_config(&config, &make_interfaces());
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            L3ConfigError::InvalidRoutes(errs) => {
+                // Entry 0: invalid prefix AND invalid next_hop (2 errors).
+                // Entry 1: valid prefix, invalid next_hop (1 error).
+                assert_eq!(errs.len(), 3);
+            }
+            other => panic!("expected InvalidRoutes, got {:?}", other),
+        }
     }
 }
