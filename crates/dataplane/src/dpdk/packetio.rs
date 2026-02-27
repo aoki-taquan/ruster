@@ -85,8 +85,12 @@ impl DpdkPacketIo {
     #[cfg(feature = "dpdk")]
     pub fn new(
         context: DpdkContext,
-        port_configs: &[PortConfig],
+        _port_configs: &[PortConfig],
     ) -> Result<Self, DpdkError> {
+        // NOTE: port_configs is currently unused because the port map is built
+        // from context.ports (which are already filtered by init_dpdk).
+        // When real DPDK is integrated, port_configs may be used for additional
+        // per-port configuration (e.g., MTU, RSS settings).
         let mut port_map = HashMap::new();
         let mut rx_ifaces = Vec::new();
 
