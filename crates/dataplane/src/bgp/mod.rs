@@ -15,11 +15,11 @@
 //!
 //! # Limitations (v0.2)
 //!
-//! RFC-DEVIATION:
-//! reason: minimal eBGP-only implementation for home-lab use
-//! impact: no iBGP, no route refresh, no graceful restart, no MP-BGP
-//! issue: #158
-//! plan: incrementally add iBGP and MP-BGP in v0.3+
+// RFC-DEVIATION:
+// reason: minimal eBGP-only implementation for home-lab use
+// impact: no iBGP, no route refresh, no graceful restart, no MP-BGP
+// issue: #158
+// plan: incrementally add iBGP and MP-BGP in v0.3+
 
 pub mod config;
 pub mod fsm;

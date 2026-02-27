@@ -19,11 +19,11 @@
 //! This is a minimal eBGP implementation. The Active state is merged
 //! with Connect (we always actively connect, never passively listen).
 //!
-//! RFC-DEVIATION:
-//! reason: minimal implementation omits Active state and passive listen
-//! impact: cannot accept incoming BGP connections from peers
-//! issue: #158
-//! plan: add passive listen and Active state in v0.3
+// RFC-DEVIATION:
+// reason: minimal implementation omits Active state and passive listen
+// impact: cannot accept incoming BGP connections from peers
+// issue: #158
+// plan: add passive listen and Active state in v0.3
 
 use std::fmt;
 use std::time::{Duration, Instant};

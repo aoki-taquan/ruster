@@ -4,11 +4,11 @@
 //! Routes matching a deny entry are filtered out; routes matching a
 //! permit entry (or with no matching entry) are allowed.
 //!
-//! RFC-DEVIATION:
-//! reason: minimal policy engine — only prefix-list filtering supported
-//! impact: cannot implement route-maps, community-based policy, etc.
-//! issue: #158
-//! plan: add route-map support in v0.3
+// RFC-DEVIATION:
+// reason: minimal policy engine with only prefix-list filtering supported
+// impact: cannot implement route-maps, community-based policy, etc.
+// issue: #158
+// plan: add route-map support in v0.3
 
 use super::rib_in::AdjRibInEntry;
 
