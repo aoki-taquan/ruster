@@ -277,19 +277,19 @@ mod tests {
         let entries = vec![
             make_rib_entry(
                 [0, 0, 0, 0],
-            0,
-            [10, 0, 0, 1],
-            "wan0",
-            100,
-            ProtocolSource::Static,
+                0,
+                [10, 0, 0, 1],
+                "wan0",
+                100,
+                ProtocolSource::Static,
             ),
             make_rib_entry(
                 [192, 168, 1, 0],
-            24,
-            [0, 0, 0, 0],
-            "lan0",
-            10,
-            ProtocolSource::Static,
+                24,
+                [0, 0, 0, 0],
+                "lan0",
+                10,
+                ProtocolSource::Static,
             ),
         ];
         let fib = Fib::from_entries(entries);
