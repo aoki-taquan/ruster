@@ -452,10 +452,11 @@ fn e2e_nat_outbound_snat() {
         }
         other => panic!("expected Snat, got {:?}", other),
     };
+    // Forward session + reverse session for return traffic lookup.
     assert_eq!(
         conntrack.session_count(),
-        1,
-        "one session after first packet"
+        2,
+        "forward + reverse session after first packet"
     );
 
     // ── Second packet: same flow → reuse same SNAT translation ───────
@@ -466,8 +467,8 @@ fn e2e_nat_outbound_snat() {
     );
     assert_eq!(
         conntrack.session_count(),
-        1,
-        "still one session after second packet"
+        2,
+        "still two sessions after second packet"
     );
 
     // ── Third packet: different LAN host → different allocated port ──
@@ -491,10 +492,11 @@ fn e2e_nat_outbound_snat() {
         allocated_port_1, allocated_port_3,
         "different hosts should get different ports"
     );
+    // 2 forward + 2 reverse sessions.
     assert_eq!(
         conntrack.session_count(),
-        2,
-        "two sessions for two different flows"
+        4,
+        "four sessions for two different flows (forward + reverse each)"
     );
 }
 
@@ -793,20 +795,8 @@ fn e2e_full_pipeline_outbound_and_reply() {
     // Part B: Inbound reply (8.8.8.8:80 → WAN_IP:allocated_port)
     // ══════════════════════════════════════════════════════════════════
 
-    // For the return path to work, we need a reverse session in conntrack.
-    // In a real router, this would be created when the outbound packet is
-    // actually sent. For this test, we manually create it.
-    let reverse_key = SessionKey {
-        src_ip: EXTERNAL_IP,
-        dst_ip: WAN_IP,
-        proto: SessionProto::Tcp {
-            src_port: 80,
-            dst_port: allocated_port,
-        },
-    };
-    conntrack
-        .create_session(reverse_key, SessionState::Tcp(TcpState::Established))
-        .unwrap();
+    // process_outbound now automatically creates the reverse session in
+    // conntrack, so return traffic can be matched by process_inbound.
 
     let reply_pkt = make_tcp_meta(
         "eth0",

@@ -146,6 +146,11 @@ impl NatEngine {
     /// the same translation. Otherwise, allocates a new ephemeral port
     /// and creates a session.
     ///
+    /// When a new SNAT session is created, a **reverse session** is also
+    /// stored so that return traffic (WAN -> router external IP) can be
+    /// matched in [`process_inbound`] and reverse-translated back to the
+    /// original LAN host.
+    ///
     /// RFC-REF: RFC 3022 Section 2.2
     /// "The router uses a single registered address for the global side,
     /// and uses the transport identifier [...] to act as the demux key."
@@ -194,6 +199,32 @@ impl NatEngine {
                         direction: NatDirection::Outbound,
                     });
                 }
+
+                // Create a reverse session so that return traffic can be
+                // matched by process_inbound's build_reverse_key lookup.
+                //
+                // Reverse key: remote server → our external IP, with the
+                // remote server's port as src and our allocated port as dst.
+                // The NAT info on this reverse session stores the original
+                // LAN host address for reverse translation.
+                if let Some(rev_key) = self.build_snat_reverse_key(meta, allocated_port) {
+                    let rev_state = session_state_from_meta(meta);
+                    if conntrack.create_session(rev_key, rev_state).is_ok() {
+                        if let Some(rev_session) = conntrack.lookup_mut(&rev_key) {
+                            let original_src_port = match &key.proto {
+                                SessionProto::Tcp { src_port, .. } => *src_port,
+                                SessionProto::Udp { src_port, .. } => *src_port,
+                                SessionProto::Icmp { id } => *id,
+                            };
+                            rev_session.nat_info = Some(NatTranslation {
+                                translated_src_ip: key.src_ip,
+                                translated_src_port: original_src_port,
+                                direction: NatDirection::Outbound,
+                            });
+                        }
+                    }
+                }
+
                 NatAction::Snat {
                     new_src_ip: self.external_ip,
                     new_src_port: allocated_port,
@@ -272,26 +303,26 @@ impl NatEngine {
         }
 
         // Check for return traffic from an existing outbound NAT session.
-        // For return traffic, the "source" in the original outbound session
-        // was the LAN host. The return packet has:
-        //   dst_ip = external_ip, dst_port = allocated_port
-        // We need to find the original session and reverse the translation.
+        //
+        // When process_outbound creates an SNAT session, it also creates a
+        // reverse session keyed by (remote_ip → external_ip) with the
+        // allocated port. The NAT info on that reverse session stores the
+        // original LAN host address for reverse translation.
         let reverse_key = self.build_reverse_key(ipv4.src_addr, dst_port, l4);
         if let Some(reverse_key) = reverse_key {
             if let Some(session) = conntrack.lookup(&reverse_key) {
                 if let Some(nat_info) = &session.nat_info {
                     if nat_info.direction == NatDirection::Outbound {
                         // Reverse translate: dst -> original LAN host.
-                        let original_src_ip = session.key.src_ip;
-                        let original_src_port = match &session.key.proto {
-                            SessionProto::Tcp { src_port, .. } => *src_port,
-                            SessionProto::Udp { src_port, .. } => *src_port,
-                            SessionProto::Icmp { id } => *id,
-                        };
+                        // The reverse session's nat_info stores the original
+                        // LAN host IP and port that the return traffic should
+                        // be forwarded to.
+                        let original_ip = nat_info.translated_src_ip;
+                        let original_port = nat_info.translated_src_port;
                         conntrack.touch(&reverse_key);
                         return NatAction::Dnat {
-                            new_dst_ip: original_src_ip,
-                            new_dst_port: original_src_port,
+                            new_dst_ip: original_ip,
+                            new_dst_port: original_port,
                         };
                     }
                 }
@@ -412,38 +443,21 @@ impl NatEngine {
 
     /// Build a reverse session key for return traffic lookup.
     ///
-    /// For return traffic arriving at the external IP, we need to find the
-    /// original outbound session. The original session key was:
-    ///   (lan_src_ip, remote_dst_ip, proto{lan_src_port, remote_dst_port})
+    /// For return traffic arriving at the external IP, we construct a
+    /// session key that matches the reverse session stored by
+    /// [`process_outbound`]. The return packet has:
+    ///   src_ip = remote server, dst_ip = external_ip
     ///
-    /// The return packet has:
-    ///   src_ip = remote server, dst_ip = external_ip, dst_port = allocated_port
+    /// The reverse session was stored with key:
+    ///   (remote_ip → external_ip, proto with remote_port/allocated_port)
     ///
-    /// We search for a session where:
-    ///   dst_ip = return_src_ip (remote server)
-    ///   translated_src_port = return_dst_port (allocated port)
-    ///
-    /// Since we don't have a reverse index, we construct a plausible key
-    /// by scanning the conntrack table via the allocated port. For simplicity
-    /// in v0.1, we construct the reverse key directly from the return packet.
+    /// So we construct: (return_src_ip → external_ip, return_packet_proto).
     fn build_reverse_key(
         &self,
         return_src_ip: [u8; 4],
-        return_dst_port: u16,
+        _return_dst_port: u16,
         l4: &L4Info,
     ) -> Option<SessionKey> {
-        // The return packet's source is the original destination.
-        // The return packet's dst port is the allocated port we assigned.
-        // We need to find the original session. Since we store sessions
-        // keyed by the original LAN->WAN tuple, we cannot directly construct
-        // the key. Instead, we rely on the conntrack engine to store a
-        // reverse mapping. For v0.1, we use a scan approach.
-        //
-        // However, to avoid O(n) scan, we'll store sessions keyed both ways.
-        // For now in v0.1, the caller can use this method to build a key
-        // for sessions where we know the external IP is the destination.
-        //
-        // The reverse key: src=return_src_ip, dst=external_ip, with swapped ports.
         let proto = match l4 {
             L4Info::Tcp(tcp) => SessionProto::Tcp {
                 src_port: tcp.src_port,
@@ -465,18 +479,47 @@ impl NatEngine {
             L4Info::Icmpv6(_) => return None,
         };
 
-        // This won't directly match the original outbound key, so we
-        // need to search conntrack for a session whose NAT translation
-        // matches. Return None here and handle in process_inbound via
-        // a direct scan approach.
-        let _ = return_src_ip;
-        let _ = return_dst_port;
-
-        // Actually, let's create the inbound packet's own key and check
-        // if it was stored as a reverse session. This is the key for
-        // the return packet itself.
         Some(SessionKey {
             src_ip: return_src_ip,
+            dst_ip: self.external_ip,
+            proto,
+        })
+    }
+
+    /// Build the reverse session key for an outbound SNAT session.
+    ///
+    /// Given the original (pre-NAT) outbound packet and the allocated
+    /// external port, construct the key that return traffic will match:
+    ///   src_ip = original dst (remote server)
+    ///   dst_ip = external_ip (our WAN address)
+    ///   proto: src_port = remote server's port, dst_port = allocated_port
+    ///
+    /// For ICMP, only the identifier is used (no port translation).
+    fn build_snat_reverse_key(&self, meta: &PacketMeta, allocated_port: u16) -> Option<SessionKey> {
+        let ipv4 = match &meta.l3 {
+            Some(L3Info::Ipv4(info)) => info,
+            _ => return None,
+        };
+        let l4 = meta.l4.as_ref()?;
+
+        let proto = match l4 {
+            L4Info::Tcp(tcp) => SessionProto::Tcp {
+                src_port: tcp.dst_port,
+                dst_port: allocated_port,
+            },
+            L4Info::Udp(udp) => SessionProto::Udp {
+                src_port: udp.dst_port,
+                dst_port: allocated_port,
+            },
+            L4Info::Icmp(icmp) => {
+                let id = u16::from_be_bytes([icmp.rest_of_header[0], icmp.rest_of_header[1]]);
+                SessionProto::Icmp { id }
+            }
+            L4Info::Icmpv6(_) => return None,
+        };
+
+        Some(SessionKey {
+            src_ip: ipv4.dst_addr,
             dst_ip: self.external_ip,
             proto,
         })
@@ -752,7 +795,8 @@ mod tests {
                 new_src_port: PORT_ALLOC_START,
             }
         );
-        assert_eq!(conntrack.session_count(), 1);
+        // Forward session + reverse session for return traffic lookup.
+        assert_eq!(conntrack.session_count(), 2);
     }
 
     #[test]
@@ -762,15 +806,15 @@ mod tests {
 
         let meta = make_tcp_meta("lan0", [192, 168, 1, 100], [8, 8, 8, 8], 49152, 80);
 
-        // First packet creates session.
+        // First packet creates forward + reverse sessions.
         let action1 = engine.process_outbound(&meta, &mut conntrack);
         assert!(matches!(action1, NatAction::Snat { .. }));
 
         // Second packet from the same flow reuses.
         let action2 = engine.process_outbound(&meta, &mut conntrack);
         assert_eq!(action1, action2);
-        // Only 1 session was created.
-        assert_eq!(conntrack.session_count(), 1);
+        // Forward + reverse sessions (no additional sessions created).
+        assert_eq!(conntrack.session_count(), 2);
     }
 
     #[test]
@@ -797,7 +841,8 @@ mod tests {
             }
             _ => panic!("expected Snat actions"),
         }
-        assert_eq!(conntrack.session_count(), 2);
+        // 2 forward + 2 reverse sessions.
+        assert_eq!(conntrack.session_count(), 4);
     }
 
     #[test]
@@ -831,7 +876,8 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(conntrack.session_count(), 1);
+        // Forward + reverse sessions.
+        assert_eq!(conntrack.session_count(), 2);
     }
 
     #[test]
@@ -849,7 +895,8 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(conntrack.session_count(), 1);
+        // Forward + reverse sessions.
+        assert_eq!(conntrack.session_count(), 2);
     }
 
     // ── Inbound port forward tests ───────────────────────────────────
@@ -909,6 +956,8 @@ mod tests {
         let mut conntrack = make_conntrack();
 
         // Step 1: LAN host makes outbound connection.
+        // process_outbound creates both a forward session and a reverse
+        // session for return traffic lookup.
         let outbound_meta = make_tcp_meta("lan0", [192, 168, 1, 100], [8, 8, 8, 8], 49152, 80);
         let outbound_action = engine.process_outbound(&outbound_meta, &mut conntrack);
         let allocated_port = match outbound_action {
@@ -916,40 +965,21 @@ mod tests {
             _ => panic!("expected Snat"),
         };
 
-        // Step 2: Return traffic from the remote server.
-        // The remote server sees our external_ip:allocated_port as the source,
-        // so it sends back to that address.
-        // We also need to store the reverse session for lookup.
-        // Create a reverse session key manually for the return path.
-        let reverse_key = SessionKey {
-            src_ip: [8, 8, 8, 8],
-            dst_ip: [10, 0, 0, 2],
-            proto: SessionProto::Tcp {
-                src_port: 80,
-                dst_port: allocated_port,
-            },
-        };
-        conntrack
-            .create_session(reverse_key, SessionState::Tcp(TcpState::Established))
-            .unwrap();
-        if let Some(session) = conntrack.lookup_mut(&reverse_key) {
-            session.nat_info = Some(NatTranslation {
-                translated_src_ip: [10, 0, 0, 2],
-                translated_src_port: allocated_port,
-                direction: NatDirection::Outbound,
-            });
-        }
+        // Verify both forward and reverse sessions were created.
+        assert_eq!(conntrack.session_count(), 2);
 
+        // Step 2: Return traffic from the remote server.
+        // The remote server sends back to our external_ip:allocated_port.
         let return_meta = make_tcp_meta("wan0", [8, 8, 8, 8], [10, 0, 0, 2], 80, allocated_port);
 
         let action = engine.process_inbound(&return_meta, &mut conntrack);
-        // The reverse lookup finds the session with Outbound direction,
-        // and returns Dnat to the original LAN host.
+        // The reverse session lookup finds the NAT info with the original
+        // LAN host address, producing a DNAT back to the original source.
         assert_eq!(
             action,
             NatAction::Dnat {
-                new_dst_ip: [8, 8, 8, 8],
-                new_dst_port: 80,
+                new_dst_ip: [192, 168, 1, 100],
+                new_dst_port: 49152,
             }
         );
     }
