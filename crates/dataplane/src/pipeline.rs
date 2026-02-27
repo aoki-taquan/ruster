@@ -131,7 +131,7 @@ pub enum PipelineResult {
 /// When the pipeline decides a packet needs NAT, it returns a
 /// `NatResult` alongside the forwarding decision. The run loop is
 /// responsible for applying the actual byte-level rewrite using
-/// [`rewrite::rewrite_snat`] or [`rewrite::rewrite_dnat`].
+/// `rewrite::rewrite_snat` or `rewrite::rewrite_dnat`.
 ///
 /// RFC-REF: RFC 3022 Section 4.2
 /// "DNAT in PRE_ROUTING, SNAT in POST_ROUTING."
