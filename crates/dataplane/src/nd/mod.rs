@@ -238,7 +238,13 @@ impl NdEngine {
             NdInfo::NeighborSolicitation {
                 target_addr,
                 source_mac,
-            } => self.handle_ns(in_ifname, ipv6_info, target_addr, source_mac, meta.l2.src_mac),
+            } => self.handle_ns(
+                in_ifname,
+                ipv6_info,
+                target_addr,
+                source_mac,
+                meta.l2.src_mac,
+            ),
             NdInfo::NeighborAdvertisement {
                 target_addr,
                 target_mac,
@@ -397,7 +403,7 @@ pub fn build_na_packet(reply: &NaReplyInfo) -> Vec<u8> {
     pkt.push(136); // Type: Neighbor Advertisement
     pkt.push(0); // Code
     pkt.extend_from_slice(&[0x00, 0x00]); // Checksum placeholder
-    // Flags: R=0, S=1 (solicited), O=1 (override) = 0x60
+                                          // Flags: R=0, S=1 (solicited), O=1 (override) = 0x60
     pkt.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
     pkt.extend_from_slice(&reply.target_ipv6); // Target Address
 
@@ -409,11 +415,7 @@ pub fn build_na_packet(reply: &NaReplyInfo) -> Vec<u8> {
     // Compute ICMPv6 checksum (RFC 4443 Section 2.3).
     // The checksum covers the IPv6 pseudo-header + ICMPv6 message.
     let icmpv6_data = &pkt[icmpv6_start..];
-    let checksum = compute_icmpv6_checksum(
-        &reply.sender_ipv6,
-        &reply.requester_ipv6,
-        icmpv6_data,
-    );
+    let checksum = compute_icmpv6_checksum(&reply.sender_ipv6, &reply.requester_ipv6, icmpv6_data);
     pkt[icmpv6_start + 2] = (checksum >> 8) as u8;
     pkt[icmpv6_start + 3] = (checksum & 0xFF) as u8;
 
@@ -437,8 +439,8 @@ fn compute_icmpv6_checksum(src_ipv6: &[u8; 16], dst_ipv6: &[u8; 16], icmpv6_data
     }
     // Pseudo-header: upper-layer packet length (4 bytes)
     let length = icmpv6_data.len() as u32;
-    sum += (length >> 16) as u32;
-    sum += (length & 0xFFFF) as u32;
+    sum += length >> 16;
+    sum += length & 0xFFFF;
     // Pseudo-header: next header = 58 (ICMPv6)
     sum += 58u32;
 

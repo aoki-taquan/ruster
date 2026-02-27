@@ -532,10 +532,7 @@ impl Dataplane {
                             Err(e) => {
                                 self.tx_errors.fetch_add(1, Ordering::Relaxed);
                                 self.observer.inc_tx_drop(&egress_iface);
-                                eprintln!(
-                                    "TX error for ND reply on {}: {}",
-                                    egress_iface, e
-                                );
+                                eprintln!("TX error for ND reply on {}: {}", egress_iface, e);
                             }
                         }
                     }

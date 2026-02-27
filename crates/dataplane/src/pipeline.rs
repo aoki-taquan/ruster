@@ -213,6 +213,7 @@ pub fn process_packet(
 /// RFC-REF: RFC 8200 Section 3
 /// IPv6 forwarding is based on the 128-bit destination address;
 /// Hop Limit is decremented and the packet is forwarded or dropped.
+#[allow(clippy::too_many_arguments)]
 pub fn process_packet_v6(
     raw_pkt: &RawPacket,
     l2: &mut L2Engine,
@@ -458,6 +459,7 @@ fn initial_session_state(meta: &packet::PacketMeta) -> SessionState {
 /// 3. Check Hop Limit (must be > 1 to forward).
 /// 4. Perform LPM route lookup in the IPv6 route table.
 /// 5. Return ForwardV6 or Drop.
+#[allow(clippy::too_many_arguments)]
 fn process_ipv6_packet(
     raw_pkt: &RawPacket,
     meta: &packet::PacketMeta,
@@ -473,10 +475,7 @@ fn process_ipv6_packet(
         if icmpv6.nd.is_some() {
             let nd_action = nd_engine.process_nd(meta);
             return match nd_action {
-                NdAction::Reply {
-                    out_ifname,
-                    packet,
-                } => PipelineResult::NdReply {
+                NdAction::Reply { out_ifname, packet } => PipelineResult::NdReply {
                     egress_iface: out_ifname,
                     reply_info: packet,
                 },

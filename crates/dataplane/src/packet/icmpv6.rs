@@ -72,6 +72,7 @@ pub fn parse_icmpv6(data: &[u8]) -> Result<Icmpv6Info, DropReason> {
 /// Parse Neighbor Solicitation (type 135).
 ///
 /// RFC-REF: RFC 4861 Section 4.3
+/// ```text
 ///  0                   1                   2                   3
 ///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -89,6 +90,7 @@ pub fn parse_icmpv6(data: &[u8]) -> Result<Icmpv6Info, DropReason> {
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// |   Options ...
 /// +-+-+-+-+-+-+-+-+-+-+-+-
+/// ```
 fn parse_neighbor_solicitation(data: &[u8]) -> Result<Option<NdInfo>, DropReason> {
     if data.len() < NS_MIN_LEN {
         return Err(DropReason::TruncatedL4);
@@ -110,6 +112,7 @@ fn parse_neighbor_solicitation(data: &[u8]) -> Result<Option<NdInfo>, DropReason
 /// Parse Neighbor Advertisement (type 136).
 ///
 /// RFC-REF: RFC 4861 Section 4.4
+/// ```text
 ///  0                   1                   2                   3
 ///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -127,6 +130,7 @@ fn parse_neighbor_solicitation(data: &[u8]) -> Result<Option<NdInfo>, DropReason
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// |   Options ...
 /// +-+-+-+-+-+-+-+-+-+-+-+-
+/// ```
 fn parse_neighbor_advertisement(data: &[u8]) -> Result<Option<NdInfo>, DropReason> {
     if data.len() < NA_MIN_LEN {
         return Err(DropReason::TruncatedL4);

@@ -505,7 +505,7 @@ fn session_state_from_meta(meta: &PacketMeta) -> SessionState {
         Some(L4Info::Udp(_)) => SessionState::Udp,
         Some(L4Info::Icmp(_)) => SessionState::Icmp,
         Some(L4Info::Icmpv6(_)) => SessionState::Udp, // ICMPv6 not yet tracked
-        None => SessionState::Udp, // fallback, should not happen
+        None => SessionState::Udp,                    // fallback, should not happen
     }
 }
 
