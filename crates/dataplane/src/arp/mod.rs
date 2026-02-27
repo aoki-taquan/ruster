@@ -561,6 +561,7 @@ mod tests {
             mtu: 1500,
             mac: "00:11:22:33:44:55".to_string(),
             ipv4_addrs: vec!["192.168.1.1/24".to_string()],
+            ipv6_addrs: vec![],
             zone: InterfaceZone::Lan,
             l2_domain: "br0".to_string(),
             linux_if: None,

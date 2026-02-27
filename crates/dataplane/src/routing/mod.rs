@@ -31,6 +31,7 @@
 //! directly to the destination host."
 
 pub mod fib;
+pub mod ipv6_table;
 pub mod protocol;
 pub mod rib;
 pub mod table;
@@ -429,6 +430,7 @@ mod tests {
                     metric: 10,
                 },
             ],
+            ipv6_static_routes: vec![],
         }
     }
 
@@ -442,6 +444,7 @@ mod tests {
                 mtu: 1500,
                 mac: "00:11:22:33:44:55".to_string(),
                 ipv4_addrs: vec!["10.0.0.2/24".to_string()],
+                ipv6_addrs: vec![],
                 zone: InterfaceZone::Wan,
                 l2_domain: "br0".to_string(),
                 linux_if: None,
@@ -454,6 +457,7 @@ mod tests {
                 mtu: 1500,
                 mac: "00:AA:BB:CC:DD:EE".to_string(),
                 ipv4_addrs: vec!["192.168.1.1/24".to_string()],
+                ipv6_addrs: vec![],
                 zone: InterfaceZone::Lan,
                 l2_domain: "br0".to_string(),
                 linux_if: None,
@@ -645,6 +649,7 @@ mod tests {
                 out_if: "lan0".to_string(),
                 metric: 10,
             }],
+            ipv6_static_routes: vec![],
         };
         let engine = L3Engine::from_config(&config, &make_interfaces()).unwrap();
 
@@ -920,6 +925,7 @@ mod tests {
                 out_if: "wan0".to_string(),
                 metric: 100,
             }],
+            ipv6_static_routes: vec![],
         };
         let result = L3Engine::from_config(&config, &make_interfaces());
         assert!(result.is_err());
@@ -949,6 +955,7 @@ mod tests {
                     metric: 50,
                 },
             ],
+            ipv6_static_routes: vec![],
         };
         let result = L3Engine::from_config(&config, &make_interfaces());
         assert!(result.is_err());

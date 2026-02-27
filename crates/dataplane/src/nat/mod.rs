@@ -231,7 +231,7 @@ impl NatEngine {
         let (dst_port, pf_proto) = match l4 {
             L4Info::Tcp(tcp) => (tcp.dst_port, Some(PortForwardProto::Tcp)),
             L4Info::Udp(udp) => (udp.dst_port, Some(PortForwardProto::Udp)),
-            L4Info::Icmp(_) => (0, None),
+            L4Info::Icmp(_) | L4Info::Icmpv6(_) => (0, None),
         };
 
         // Check static port forward rules.
@@ -342,7 +342,7 @@ impl NatEngine {
         let (dst_port, pf_proto) = match l4 {
             L4Info::Tcp(tcp) => (tcp.dst_port, Some(PortForwardProto::Tcp)),
             L4Info::Udp(udp) => (udp.dst_port, Some(PortForwardProto::Udp)),
-            L4Info::Icmp(_) => (0, None),
+            L4Info::Icmp(_) | L4Info::Icmpv6(_) => (0, None),
         };
 
         // Check if there's a matching port forward rule.
@@ -457,6 +457,12 @@ impl NatEngine {
                 let id = u16::from_be_bytes([icmp.rest_of_header[0], icmp.rest_of_header[1]]);
                 SessionProto::Icmp { id }
             }
+            // RFC-DEVIATION:
+            // reason: ICMPv6 NAT not implemented for home-lab v0.1
+            // impact: ICMPv6 return traffic will not be reverse-translated
+            // issue: #159
+            // plan: implement ICMPv6 NAT support in v0.2
+            L4Info::Icmpv6(_) => return None,
         };
 
         // This won't directly match the original outbound key, so we
@@ -498,7 +504,8 @@ fn session_state_from_meta(meta: &PacketMeta) -> SessionState {
         Some(L4Info::Tcp(_)) => SessionState::Tcp(TcpState::SynSent),
         Some(L4Info::Udp(_)) => SessionState::Udp,
         Some(L4Info::Icmp(_)) => SessionState::Icmp,
-        None => SessionState::Udp, // fallback, should not happen
+        Some(L4Info::Icmpv6(_)) => SessionState::Udp, // ICMPv6 not yet tracked
+        None => SessionState::Udp,                    // fallback, should not happen
     }
 }
 
@@ -572,6 +579,7 @@ mod tests {
                 mtu: 1500,
                 mac: "00:11:22:33:44:55".to_string(),
                 ipv4_addrs: vec!["10.0.0.2/24".to_string()],
+                ipv6_addrs: vec![],
                 zone: InterfaceZone::Wan,
                 l2_domain: "br0".to_string(),
                 linux_if: None,
@@ -584,6 +592,7 @@ mod tests {
                 mtu: 1500,
                 mac: "00:AA:BB:CC:DD:EE".to_string(),
                 ipv4_addrs: vec!["192.168.1.1/24".to_string()],
+                ipv6_addrs: vec![],
                 zone: InterfaceZone::Lan,
                 l2_domain: "br0".to_string(),
                 linux_if: None,

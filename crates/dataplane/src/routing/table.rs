@@ -333,6 +333,7 @@ mod tests {
                     metric: 10,
                 },
             ],
+            ipv6_static_routes: vec![],
         }
     }
 
@@ -368,6 +369,7 @@ mod tests {
                     metric: 100,
                 },
             ],
+            ipv6_static_routes: vec![],
         };
         let err = RouteTable::from_config(&config).unwrap_err();
         assert_eq!(err.len(), 1);
@@ -393,6 +395,7 @@ mod tests {
                     metric: 50,
                 },
             ],
+            ipv6_static_routes: vec![],
         };
         let err = RouteTable::from_config(&config).unwrap_err();
         // Entry 0: invalid prefix AND invalid next_hop (2 errors).
@@ -454,6 +457,7 @@ mod tests {
                 out_if: "lan0".to_string(),
                 metric: 10,
             }],
+            ipv6_static_routes: vec![],
         };
         let table = RouteTable::from_config(&config).unwrap();
 
@@ -480,6 +484,7 @@ mod tests {
                     metric: 100,
                 },
             ],
+            ipv6_static_routes: vec![],
         };
         let table = RouteTable::from_config(&config).unwrap();
         let result = table.lookup(&[10, 1, 2, 3]).unwrap();

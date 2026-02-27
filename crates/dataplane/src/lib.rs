@@ -6,6 +6,7 @@ pub mod icmp;
 pub mod io;
 pub mod l2;
 pub mod nat;
+pub mod nd;
 pub mod packet;
 pub mod pipeline;
 pub mod rewrite;
@@ -30,6 +31,10 @@ pub enum DataplaneError {
     /// L3 routing engine configuration failed (invalid routes or local IPs).
     #[error("L3 routing config: {0}")]
     Routing(#[from] routing::L3ConfigError),
+
+    /// IPv6 route table configuration failed.
+    #[error("IPv6 routing config: {0}")]
+    Ipv6Routing(String),
 }
 
 /// The dataplane runtime holding initialized engines.
@@ -52,6 +57,13 @@ pub struct Dataplane {
     pub arp: Mutex<arp::ArpEngine>,
     /// L3 IPv4 forwarding engine (static routing, LPM).
     pub l3: routing::L3Engine,
+    /// Neighbor Discovery engine for IPv6 address resolution.
+    ///
+    /// Wrapped in a `Mutex` because [`nd::NdEngine::resolve`] and
+    /// [`nd::NdEngine::process_nd`] require `&mut self`.
+    pub nd: Mutex<nd::NdEngine>,
+    /// IPv6 static route table with LPM lookup.
+    pub ipv6_routes: routing::ipv6_table::Ipv6RouteTable,
     /// NAT44 engine (NAPT, port forwarding, hairpin).
     pub nat: nat::NatEngine,
     /// Stateful firewall engine.
@@ -88,6 +100,16 @@ impl Dataplane {
         let l2 = l2::L2Engine::from_config(&config.l2);
         let mut arp = arp::ArpEngine::from_config(&config.l2, &config.interfaces);
         let l3 = routing::L3Engine::from_config(&config.routing, &config.interfaces)?;
+        let nd = nd::NdEngine::from_config(&config.l2, &config.interfaces);
+        let ipv6_routes = routing::ipv6_table::Ipv6RouteTable::from_config(&config.routing)
+            .map_err(|errs| {
+                DataplaneError::Ipv6Routing(
+                    errs.iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                )
+            })?;
         let nat = nat::NatEngine::from_config(&config.nat, &config.interfaces);
         let firewall = firewall::FirewallEngine::from_config(&config.firewall);
         let conntrack = conntrack::ConntrackEngine::from_nat_config(&config.nat);
@@ -134,6 +156,8 @@ impl Dataplane {
             l2: Mutex::new(l2),
             arp: Mutex::new(arp),
             l3,
+            nd: Mutex::new(nd),
+            ipv6_routes,
             nat,
             firewall,
             conntrack: Mutex::new(conntrack),
@@ -228,7 +252,8 @@ impl Dataplane {
                 let result = {
                     let mut l2_guard = self.l2.lock().unwrap();
                     let mut ct_guard = self.conntrack.lock().unwrap();
-                    pipeline::process_packet(
+                    let mut nd_guard = self.nd.lock().unwrap();
+                    pipeline::process_packet_v6(
                         raw_pkt,
                         &mut l2_guard,
                         &self.l3,
@@ -236,6 +261,8 @@ impl Dataplane {
                         &mut ct_guard,
                         &self.zone_resolver,
                         &self.iface_macs,
+                        Some(&mut nd_guard),
+                        Some(&self.ipv6_routes),
                     )
                 };
                 match result {
@@ -372,6 +399,77 @@ impl Dataplane {
                             }
                         }
                     }
+                    pipeline::PipelineResult::ForwardV6 {
+                        egress_iface,
+                        new_hop_limit,
+                        next_hop_v6,
+                    } => {
+                        self.observer.inc_forwarded();
+
+                        let mut data = raw_pkt.data.clone();
+
+                        // 1. Hop Limit (no checksum update needed for IPv6).
+                        rewrite::rewrite_ipv6_hop_limit(&mut data, new_hop_limit);
+
+                        // 2. src MAC -> egress IF's MAC.
+                        if let Some(mac) = self.iface_macs.get(&egress_iface) {
+                            rewrite::rewrite_src_mac(&mut data, mac);
+                        }
+
+                        // 3. dst MAC -> ND resolve.
+                        // Determine the IPv6 address to resolve:
+                        // - If next_hop != :: : resolve the next-hop gateway
+                        // - If next_hop == :: : directly connected, resolve
+                        //   the packet's destination IPv6
+                        let nd_target = if next_hop_v6 != [0u8; 16] {
+                            next_hop_v6
+                        } else {
+                            // Extract dst IPv6 from the IPv6 header (offset 14+24..14+40
+                            // in an Ethernet+IPv6 frame)
+                            if data.len() >= 54 {
+                                let mut dst = [0u8; 16];
+                                dst.copy_from_slice(&data[38..54]);
+                                dst
+                            } else {
+                                self.observer
+                                    .inc_drop_reason(ruster_observe::DropReason::L3NoRoute);
+                                continue;
+                            }
+                        };
+
+                        let nd_result = {
+                            let mut nd_guard = self.nd.lock().unwrap();
+                            nd_guard.resolve(nd_target, &egress_iface)
+                        };
+                        match nd_result {
+                            nd::NdAction::Forward { resolved_mac } => {
+                                rewrite::rewrite_dst_mac(&mut data, &resolved_mac);
+                            }
+                            _ => {
+                                // ND unresolved -> drop
+                                self.observer
+                                    .inc_drop_reason(ruster_observe::DropReason::L3NoRoute);
+                                continue;
+                            }
+                        }
+
+                        let tx_data = io::RawPacket {
+                            ingress_iface: raw_pkt.ingress_iface.clone(),
+                            data,
+                        };
+
+                        match io.tx(&egress_iface, &tx_data) {
+                            Ok(()) => {
+                                self.observer
+                                    .inc_tx(&egress_iface, raw_pkt.data.len() as u64);
+                            }
+                            Err(e) => {
+                                self.tx_errors.fetch_add(1, Ordering::Relaxed);
+                                self.observer.inc_tx_drop(&egress_iface);
+                                eprintln!("TX error on {}: {}", egress_iface, e);
+                            }
+                        }
+                    }
                     pipeline::PipelineResult::Flood { egress_ifaces } => {
                         self.observer.inc_forwarded();
                         for iface in &egress_ifaces {
@@ -415,6 +513,28 @@ impl Dataplane {
                     }
                     pipeline::PipelineResult::Consumed => {
                         self.observer.inc_local_delivery();
+                    }
+                    pipeline::PipelineResult::NdReply {
+                        egress_iface,
+                        reply_info,
+                    } => {
+                        self.observer.inc_local_delivery();
+                        let na_data = nd::build_na_packet(&reply_info);
+                        let na_pkt = io::RawPacket {
+                            ingress_iface: egress_iface.clone(),
+                            data: na_data,
+                        };
+                        match io.tx(&egress_iface, &na_pkt) {
+                            Ok(()) => {
+                                self.observer
+                                    .inc_tx(&egress_iface, na_pkt.data.len() as u64);
+                            }
+                            Err(e) => {
+                                self.tx_errors.fetch_add(1, Ordering::Relaxed);
+                                self.observer.inc_tx_drop(&egress_iface);
+                                eprintln!("TX error for ND reply on {}: {}", egress_iface, e);
+                            }
+                        }
                     }
                 }
             }
@@ -542,6 +662,7 @@ fn map_pipeline_drop_to_observe(reason: pipeline::DropReason) -> ruster_observe:
         pipeline::DropReason::L3NoRoute => ruster_observe::DropReason::L3NoRoute,
         pipeline::DropReason::L3TtlExpired => ruster_observe::DropReason::L3TtlExpired,
         pipeline::DropReason::L3NotIpv4 => ruster_observe::DropReason::L3NotIpv4,
+        pipeline::DropReason::L3HopLimitExpired => ruster_observe::DropReason::L3TtlExpired,
         pipeline::DropReason::FirewallDrop => ruster_observe::DropReason::FirewallDrop,
         pipeline::DropReason::NatDrop => ruster_observe::DropReason::NatTableFull,
         pipeline::DropReason::ConntrackTableFull => ruster_observe::DropReason::ConntrackTableFull,
@@ -1072,6 +1193,10 @@ mod tests {
             OD::L3TtlExpired
         );
         assert_eq!(map_pipeline_drop_to_observe(PD::L3NotIpv4), OD::L3NotIpv4);
+        assert_eq!(
+            map_pipeline_drop_to_observe(PD::L3HopLimitExpired),
+            OD::L3TtlExpired
+        );
         assert_eq!(
             map_pipeline_drop_to_observe(PD::FirewallDrop),
             OD::FirewallDrop

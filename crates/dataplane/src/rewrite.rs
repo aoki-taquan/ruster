@@ -47,6 +47,27 @@ pub fn rewrite_ipv4_ttl(data: &mut [u8], new_ttl: u8) -> bool {
     true
 }
 
+/// Rewrite the IPv6 Hop Limit field in-place.
+///
+/// Expects a full Ethernet frame (14-byte header + IPv6 payload).
+/// The Hop Limit is at offset 7 within the IPv6 header (no checksum
+/// to update -- IPv6 has no header checksum).
+///
+/// RFC-REF: RFC 8200 Section 3
+/// "Hop Limit: Decremented by 1 by each node that forwards the
+/// packet."
+pub fn rewrite_ipv6_hop_limit(data: &mut [u8], new_hop_limit: u8) -> bool {
+    const ETH_HLEN: usize = 14;
+    const IPV6_HOP_LIMIT_OFFSET: usize = ETH_HLEN + 7;
+
+    if data.len() < ETH_HLEN + 40 {
+        return false;
+    }
+
+    data[IPV6_HOP_LIMIT_OFFSET] = new_hop_limit;
+    true
+}
+
 /// Rewrite the Ethernet source MAC address (bytes 6..12).
 pub fn rewrite_src_mac(data: &mut [u8], mac: &[u8; 6]) {
     if data.len() >= 14 {
@@ -185,5 +206,61 @@ mod tests {
                                      // Should not panic.
         rewrite_src_mac(&mut pkt, &[0xFF; 6]);
         rewrite_dst_mac(&mut pkt, &[0xFF; 6]);
+    }
+
+    // ── IPv6 Hop Limit rewrite tests ────────────────────────────────
+
+    /// Build a minimal Ethernet + IPv6 + UDP packet.
+    fn make_ipv6_test_packet(hop_limit: u8) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        // Ethernet header (14 bytes)
+        pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]); // dst MAC
+        pkt.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // src MAC
+        pkt.extend_from_slice(&[0x86, 0xDD]); // EtherType: IPv6
+
+        // IPv6 header (40 bytes)
+        pkt.push(0x60); // Version=6, TC=0
+        pkt.push(0x00);
+        pkt.push(0x00);
+        pkt.push(0x00);
+        pkt.extend_from_slice(&8u16.to_be_bytes()); // Payload Length: 8 (UDP)
+        pkt.push(17); // Next Header: UDP
+        pkt.push(hop_limit);
+        // src IPv6: 2001:db8::1
+        pkt.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
+        ]);
+        // dst IPv6: 2001:db8::2
+        pkt.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+        ]);
+
+        // Minimal UDP header (8 bytes)
+        pkt.extend_from_slice(&[0x00, 0x50]); // src port
+        pkt.extend_from_slice(&[0x00, 0x51]); // dst port
+        pkt.extend_from_slice(&[0x00, 0x08]); // length
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum
+        pkt
+    }
+
+    #[test]
+    fn rewrite_ipv6_hop_limit_decrements() {
+        let mut pkt = make_ipv6_test_packet(64);
+        assert!(rewrite_ipv6_hop_limit(&mut pkt, 63));
+        assert_eq!(pkt[14 + 7], 63, "Hop Limit should be 63");
+    }
+
+    #[test]
+    fn rewrite_ipv6_hop_limit_to_one() {
+        let mut pkt = make_ipv6_test_packet(2);
+        assert!(rewrite_ipv6_hop_limit(&mut pkt, 1));
+        assert_eq!(pkt[14 + 7], 1);
+    }
+
+    #[test]
+    fn rewrite_ipv6_hop_limit_too_short() {
+        // Packet too short for Ethernet + IPv6 header
+        let mut pkt = vec![0u8; 40];
+        assert!(!rewrite_ipv6_hop_limit(&mut pkt, 63));
     }
 }
