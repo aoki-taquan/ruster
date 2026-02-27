@@ -57,7 +57,10 @@ pub struct Dataplane {
     /// Stateful firewall engine.
     pub firewall: firewall::FirewallEngine,
     /// Connection tracking engine (session table).
-    pub conntrack: conntrack::ConntrackEngine,
+    ///
+    /// Wrapped in a `Mutex` because [`pipeline::process_packet`] requires
+    /// `&mut self` for session create/update, while the run loop takes `&self`.
+    pub conntrack: Mutex<conntrack::ConntrackEngine>,
     /// Zone resolver: maps interface names to firewall zones.
     pub zone_resolver: pipeline::ZoneResolver,
     /// Per-interface MAC addresses for src MAC rewriting on egress.
@@ -133,7 +136,7 @@ impl Dataplane {
             l3,
             nat,
             firewall,
-            conntrack,
+            conntrack: Mutex::new(conntrack),
             zone_resolver,
             iface_macs,
             linux_to_logical,
@@ -162,6 +165,7 @@ impl Dataplane {
         let mut last_arp_refresh = std::time::Instant::now();
         let mut last_hold_queue_gc = std::time::Instant::now();
         let mut last_arp_retry = std::time::Instant::now();
+        let mut last_conntrack_gc = std::time::Instant::now();
 
         while !shutdown.load(Ordering::Relaxed) {
             // Periodically refresh ARP cache from the kernel neighbor table.
@@ -191,6 +195,19 @@ impl Dataplane {
                 last_arp_retry = std::time::Instant::now();
             }
 
+            // Periodically garbage-collect expired conntrack sessions (every 10s).
+            if last_conntrack_gc.elapsed() >= Duration::from_secs(10) {
+                let mut ct_guard = self.conntrack.lock().unwrap();
+                let expired = ct_guard.gc();
+                let session_count = ct_guard.session_count();
+                drop(ct_guard);
+                if expired > 0 {
+                    self.observer.add_conntrack_expired(expired as u64);
+                    eprintln!("conntrack GC: expired {expired} sessions, {session_count} active");
+                }
+                last_conntrack_gc = std::time::Instant::now();
+            }
+
             let batch = io.rx();
             if batch.is_empty() {
                 std::thread::sleep(Duration::from_millis(1));
@@ -201,14 +218,22 @@ impl Dataplane {
                 self.observer
                     .inc_rx(&raw_pkt.ingress_iface, raw_pkt.data.len() as u64);
 
+                // TODO(#149): Per-packet conntrack counters (inc_conntrack_new,
+                // inc_conntrack_established) are not wired yet because
+                // ConntrackResult is internal to process_packet. To wire
+                // them, propagate ConntrackResult out of PipelineResult or
+                // pass an observer reference into the pipeline. For now,
+                // only conntrack_table_full (via DropReason) and
+                // conntrack_expired (via GC) are tracked.
                 let result = {
                     let mut l2_guard = self.l2.lock().unwrap();
+                    let mut ct_guard = self.conntrack.lock().unwrap();
                     pipeline::process_packet(
                         raw_pkt,
                         &mut l2_guard,
                         &self.l3,
                         &self.firewall,
-                        &self.conntrack,
+                        &mut ct_guard,
                         &self.zone_resolver,
                         &self.iface_macs,
                     )
@@ -368,6 +393,9 @@ impl Dataplane {
                     } => {
                         let obs_reason = map_pipeline_drop_to_observe(reason);
                         self.observer.inc_drop_reason(obs_reason);
+                        if reason == pipeline::DropReason::ConntrackTableFull {
+                            self.observer.inc_conntrack_table_full();
+                        }
                         let icmp_pkt = io::RawPacket {
                             ingress_iface: reply.egress_iface.clone(),
                             data: reply.data,
@@ -380,6 +408,10 @@ impl Dataplane {
                     pipeline::PipelineResult::Drop { reason, .. } => {
                         let obs_reason = map_pipeline_drop_to_observe(reason);
                         self.observer.inc_drop_reason(obs_reason);
+                        // Wire conntrack table-full counter.
+                        if reason == pipeline::DropReason::ConntrackTableFull {
+                            self.observer.inc_conntrack_table_full();
+                        }
                     }
                     pipeline::PipelineResult::Consumed => {
                         self.observer.inc_local_delivery();
@@ -391,6 +423,11 @@ impl Dataplane {
             if last_stats.elapsed() >= Duration::from_secs(10) {
                 let snap = self.observer.snapshot();
                 eprintln!("{}", snap);
+                // Log conntrack table occupancy.
+                let ct_guard = self.conntrack.lock().unwrap();
+                let ct_sessions = ct_guard.session_count();
+                drop(ct_guard);
+                eprintln!("conntrack sessions: {ct_sessions}");
                 last_stats = std::time::Instant::now();
             }
         }
@@ -507,6 +544,7 @@ fn map_pipeline_drop_to_observe(reason: pipeline::DropReason) -> ruster_observe:
         pipeline::DropReason::L3NotIpv4 => ruster_observe::DropReason::L3NotIpv4,
         pipeline::DropReason::FirewallDrop => ruster_observe::DropReason::FirewallDrop,
         pipeline::DropReason::NatDrop => ruster_observe::DropReason::NatTableFull,
+        pipeline::DropReason::ConntrackTableFull => ruster_observe::DropReason::ConntrackTableFull,
     }
 }
 
@@ -1039,5 +1077,9 @@ mod tests {
             OD::FirewallDrop
         );
         assert_eq!(map_pipeline_drop_to_observe(PD::NatDrop), OD::NatTableFull);
+        assert_eq!(
+            map_pipeline_drop_to_observe(PD::ConntrackTableFull),
+            OD::ConntrackTableFull
+        );
     }
 }
