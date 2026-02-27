@@ -290,6 +290,7 @@ mod tests {
                 },
             ],
             ospf: None,
+            bgp: None,
         }
     }
 

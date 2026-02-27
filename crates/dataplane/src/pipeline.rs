@@ -721,6 +721,7 @@ mod tests {
             ],
             ipv6_static_routes: vec![],
             ospf: None,
+            bgp: None,
         }
     }
 
@@ -924,6 +925,7 @@ mod tests {
             }],
             ipv6_static_routes: vec![],
             ospf: None,
+            bgp: None,
         };
         let l3 = L3Engine::from_config(&routing, &make_interfaces()).unwrap();
         let fw = make_fw_accept_all();
@@ -1321,6 +1323,7 @@ mod tests {
             }],
             ipv6_static_routes: vec![],
             ospf: None,
+            bgp: None,
         };
         let l3 = L3Engine::from_config(&routing, &make_interfaces()).unwrap();
         let fw = make_fw_accept_all();
@@ -1539,6 +1542,7 @@ mod tests {
             }],
             ipv6_static_routes: vec![],
             ospf: None,
+            bgp: None,
         };
         let ifaces = vec![
             InterfaceConfig {
@@ -2354,6 +2358,7 @@ mod tests {
                 },
             ],
             ospf: None,
+            bgp: None,
         }
     }
 
@@ -2590,6 +2595,7 @@ mod tests {
                 metric: 10,
             }],
             ospf: None,
+            bgp: None,
         };
         let ipv6_routes = Ipv6RouteTable::from_config(&routing_no_default).unwrap();
 

@@ -164,6 +164,40 @@ pub struct Ipv6StaticRoute {
     pub metric: u32,
 }
 
+/// BGP peer configuration for a single eBGP neighbor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BgpPeerConfig {
+    /// Peer IPv4 address.
+    pub address: String,
+    /// Remote autonomous system number.
+    pub remote_as: u32,
+    /// Hold time in seconds (default: 90).
+    #[serde(default = "default_bgp_hold_time")]
+    pub hold_time: u16,
+}
+
+fn default_bgp_hold_time() -> u16 {
+    90
+}
+
+/// BGP configuration section.
+///
+/// RFC-REF: RFC 4271 Section 3
+/// "A BGP speaker may be configured with a set of policies [...] and a
+/// set of networks that it can reach directly."
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BgpConfig {
+    /// Local autonomous system number.
+    pub local_as: u32,
+    /// BGP router ID in dotted-decimal notation (e.g. "10.0.0.1").
+    pub router_id: String,
+    /// List of eBGP peers.
+    #[serde(default)]
+    pub peers: Vec<BgpPeerConfig>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RoutingConfig {
@@ -173,6 +207,9 @@ pub struct RoutingConfig {
     /// OSPFv2 configuration (optional).
     #[serde(default)]
     pub ospf: Option<OspfRoutingConfig>,
+    /// Optional BGP configuration.
+    #[serde(default)]
+    pub bgp: Option<BgpConfig>,
 }
 
 /// OSPFv2 routing configuration.
