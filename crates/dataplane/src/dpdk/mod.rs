@@ -3,6 +3,7 @@ pub mod config;
 pub mod context;
 pub mod error;
 pub mod mock;
+pub mod packetio;
 
 use self::backend::DpdkBackend;
 use self::config::DpdkConfig;

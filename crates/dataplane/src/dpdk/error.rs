@@ -23,4 +23,10 @@ pub enum DpdkError {
 
     #[error("configuration error: {0}")]
     Config(String),
+
+    /// DPDK packet I/O is not available because the `dpdk` feature was not
+    /// enabled at compile time. Rebuild with `--features dpdk` to use the
+    /// DPDK backend.
+    #[error("DPDK backend not available: {0}")]
+    NotAvailable(String),
 }

@@ -129,9 +129,67 @@ fn main() {
                 }
             }
         }
-        _ => {
+        "dpdk" => {
+            use ruster_dataplane::dpdk;
+
+            // Build DpdkConfig from router.toml settings.
+            let dpdk_config = dpdk::config::DpdkConfig {
+                lcore_list: config.dataplane.lcore_list.clone(),
+                memory_mb: config.dataplane.memory_mb,
+                rx_queue_size: config.dataplane.rx_queue_size as u16,
+                tx_queue_size: config.dataplane.tx_queue_size as u16,
+                ports: config
+                    .interfaces
+                    .iter()
+                    .map(|iface| {
+                        let mac = ruster_dataplane::parse_mac_str(&iface.mac);
+                        dpdk::config::PortConfig {
+                            name: iface.name.clone(),
+                            port_id: iface.port_id,
+                            mtu: iface.mtu,
+                            mac,
+                            admin_up: iface.admin_up,
+                            rx_queues: 1,
+                            tx_queues: 1,
+                        }
+                    })
+                    .collect(),
+            };
+
+            // Initialise DPDK subsystem (EAL, mempool, ports).
+            let backend = dpdk::mock::MockDpdkBackend::new();
+            let context = match dpdk::init_dpdk(&backend, &dpdk_config) {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    eprintln!("Error: DPDK init failed: {}", e);
+                    process::exit(1);
+                }
+            };
+
+            let active_ports = context.ports.len();
+
+            // Wrap the context in a DpdkPacketIo implementing PacketIo.
+            match dpdk::packetio::DpdkPacketIo::new(context, &dpdk_config.ports) {
+                Ok(io) => {
+                    println!("  Backend: DPDK ({} ports)", active_ports);
+                    Box::new(io)
+                }
+                Err(e) => {
+                    eprintln!("Error: DPDK PacketIo init failed: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        "mock" => {
             println!("  Backend: mock (no real I/O)");
             Box::new(ruster_dataplane::io::MockPacketIo::new())
+        }
+        unknown => {
+            eprintln!(
+                "Error: unknown dataplane backend '{}' (expected 'afpacket', 'dpdk', or 'mock')",
+                unknown
+            );
+            process::exit(1);
         }
     };
 

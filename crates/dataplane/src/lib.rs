@@ -642,7 +642,7 @@ impl Dataplane {
 /// Parse a MAC address string (e.g. "00:11:22:33:44:55") into a 6-byte array.
 ///
 /// Returns `[0; 6]` if the string cannot be parsed.
-fn parse_mac_str(mac_str: &str) -> [u8; 6] {
+pub fn parse_mac_str(mac_str: &str) -> [u8; 6] {
     let parts: Vec<&str> = mac_str.split(':').collect();
     if parts.len() != 6 {
         return [0; 6];
