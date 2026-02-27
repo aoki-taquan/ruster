@@ -84,7 +84,10 @@ fn dataplane_init_creates_all_engines() {
 
     // Verify engines are created from config values.
     // The example config has NAT enabled.
-    assert!(dp.nat.is_enabled(), "NAT should be enabled per config");
+    assert!(
+        dp.nat.lock().unwrap().is_enabled(),
+        "NAT should be enabled per config"
+    );
 
     // L3 engine should have the static routes loaded into the FIB.
     assert_eq!(
@@ -130,7 +133,7 @@ fn full_startup_pipeline_succeeds() {
     let dp = ruster_dataplane::Dataplane::init(&config).expect("dataplane init should succeed");
 
     // Verify the dataplane is properly initialized.
-    assert!(dp.nat.is_enabled());
+    assert!(dp.nat.lock().unwrap().is_enabled());
     assert_eq!(dp.conntrack.lock().unwrap().session_count(), 0);
 }
 
@@ -208,7 +211,7 @@ fn full_startup_run_shutdown_pipeline() {
     let dp = ruster_dataplane::Dataplane::init(&config).expect("dataplane init should succeed");
 
     // Verify engines.
-    assert!(dp.nat.is_enabled());
+    assert!(dp.nat.lock().unwrap().is_enabled());
     assert_eq!(dp.conntrack.lock().unwrap().session_count(), 0);
 
     // Run and shutdown.

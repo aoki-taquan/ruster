@@ -1,5 +1,5 @@
 # RFC-DEVIATION Registry
-# Generated: 2026-02-27T06:47:50Z
+# Generated: 2026-02-27T06:58:32Z
 # Total deviations: 27
 #
 file	line	reason	impact	issue	plan
@@ -23,9 +23,9 @@ file	line	reason	impact	issue	plan
 ./crates/dataplane/src/ospf/neighbor.rs	176	We always form adjacency (no DR election).	On broadcast networks with many routers, all	#157	Implement DR election in a future version.
 ./crates/dataplane/src/ospf/packet.rs	745	Authentication is not implemented; we zero the auth field	Interop with routers requiring MD5/simple auth will fail.	#157	Add authentication support in a future version.
 ./crates/dataplane/src/ospf/spf.rs	83	Network-LSAs and transit network SPF are simplified.	Transit networks with DR will not be optimally routed.	#157	Add full Network-LSA SPF processing in a future version.
-./crates/dataplane/src/pipeline.rs	534	SRH Segments Left field is not rewritten in packet bytes in v0.1	Downstream SRv6 nodes see stale SL; multi-hop SRv6 may malfunction	#160	v0.2 で SRH in-place rewrite (SL decrement) を実装
-./crates/dataplane/src/pipeline.rs	593	Full decap path requires inner-packet extraction and re-injection	End.DT4/DT6 packets are consumed but inner packet is not forwarded	#160	v0.2 で inner packet re-injection を実装
-./crates/dataplane/src/pipeline.rs	620	ICMPv6 Time Exceeded not yet implemented	senders will not be notified of hop limit expiry via ICMPv6	#159	v0.2 で ICMPv6 error generation を実装
+./crates/dataplane/src/pipeline.rs	675	SRH Segments Left field is not rewritten in packet bytes in v0.1	Downstream SRv6 nodes see stale SL; multi-hop SRv6 may malfunction	#160	v0.2 で SRH in-place rewrite (SL decrement) を実装
+./crates/dataplane/src/pipeline.rs	734	Full decap path requires inner-packet extraction and re-injection	End.DT4/DT6 packets are consumed but inner packet is not forwarded	#160	v0.2 で inner packet re-injection を実装
+./crates/dataplane/src/pipeline.rs	761	ICMPv6 Time Exceeded not yet implemented	senders will not be notified of hop limit expiry via ICMPv6	#159	v0.2 で ICMPv6 error generation を実装
 ./crates/dataplane/src/srv6/actions.rs	69	Unknown actions default to End for forward-compat	Unsupported actions will behave as basic endpoint	#160	v0.2 で全 RFC 8986 actions をサポート
 ./crates/dataplane/src/srv6/mod.rs	231	When SL==0, RFC says process upper-layer header; we drop for simplicity	Packets reaching final SID with SL==0 at an End node are dropped	#160	v0.2 で upper-layer processing を実装
 ./crates/dataplane/src/srv6/srh.rs	131	We reject SRH with TLVs for simplicity in v0.1	Packets with SRH TLVs will be dropped	#160	v0.2 で SRH TLV parsing を実装

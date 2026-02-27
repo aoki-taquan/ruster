@@ -72,7 +72,10 @@ pub struct Dataplane {
     /// RFC-REF: RFC 8986 (SRv6 Network Programming)
     pub srv6: Option<srv6::Srv6Engine>,
     /// NAT44 engine (NAPT, port forwarding, hairpin).
-    pub nat: nat::NatEngine,
+    ///
+    /// Wrapped in a `Mutex` because [`nat::NatEngine::process_outbound`] and
+    /// other NAT methods require `&mut self`, while the run loop takes `&self`.
+    pub nat: Mutex<nat::NatEngine>,
     /// Stateful firewall engine.
     pub firewall: firewall::FirewallEngine,
     /// Connection tracking engine (session table).
@@ -193,7 +196,7 @@ impl Dataplane {
             nd: Mutex::new(nd),
             ipv6_routes,
             srv6,
-            nat,
+            nat: Mutex::new(nat),
             firewall,
             conntrack: Mutex::new(conntrack),
             zone_resolver,
@@ -287,6 +290,7 @@ impl Dataplane {
                 let result = {
                     let mut l2_guard = self.l2.lock().unwrap();
                     let mut ct_guard = self.conntrack.lock().unwrap();
+                    let mut nat_guard = self.nat.lock().unwrap();
                     let mut nd_guard = self.nd.lock().unwrap();
                     pipeline::process_packet_v6(
                         raw_pkt,
@@ -294,6 +298,7 @@ impl Dataplane {
                         &self.l3,
                         &self.firewall,
                         &mut ct_guard,
+                        &mut nat_guard,
                         &self.zone_resolver,
                         &self.iface_macs,
                         Some(&mut nd_guard),
@@ -306,20 +311,56 @@ impl Dataplane {
                         egress_iface,
                         new_ttl,
                         next_hop,
+                        nat: nat_result,
                     } => {
                         self.observer.inc_forwarded();
 
                         // Apply packet rewrites for L3 forwarding.
                         let tx_data;
-                        let tx_pkt = if new_ttl.is_some() || next_hop.is_some() {
+                        let needs_rewrite = new_ttl.is_some()
+                            || next_hop.is_some()
+                            || nat_result != pipeline::NatResult::None;
+                        let tx_pkt = if needs_rewrite {
                             let mut data = raw_pkt.data.clone();
 
-                            // 1. TTL + checksum
+                            // 1. NAT rewrite (SNAT/DNAT) — must be before TTL
+                            //    so that checksum updates are layered correctly.
+                            //
+                            // RFC-REF: RFC 3022 Section 4.3
+                            // "The checksum adjustment must be performed any time
+                            // the IP header or the TCP/UDP header is modified."
+                            match &nat_result {
+                                pipeline::NatResult::Snat {
+                                    new_src_ip,
+                                    new_src_port,
+                                } => {
+                                    if !rewrite::rewrite_snat(&mut data, *new_src_ip, *new_src_port)
+                                    {
+                                        self.observer.inc_nat_drop();
+                                        continue;
+                                    }
+                                    self.observer.inc_nat_snat();
+                                }
+                                pipeline::NatResult::Dnat {
+                                    new_dst_ip,
+                                    new_dst_port,
+                                } => {
+                                    if !rewrite::rewrite_dnat(&mut data, *new_dst_ip, *new_dst_port)
+                                    {
+                                        self.observer.inc_nat_drop();
+                                        continue;
+                                    }
+                                    self.observer.inc_nat_dnat();
+                                }
+                                pipeline::NatResult::None => {}
+                            }
+
+                            // 2. TTL + checksum
                             if let Some(ttl) = new_ttl {
                                 rewrite::rewrite_ipv4_ttl(&mut data, ttl);
                             }
 
-                            // 2. src MAC -> egress IF's MAC
+                            // 3. src MAC -> egress IF's MAC
                             if let Some(mac) = self.iface_macs.get(&egress_iface) {
                                 rewrite::rewrite_src_mac(&mut data, mac);
                             }
@@ -537,6 +578,9 @@ impl Dataplane {
                         if reason == pipeline::DropReason::ConntrackTableFull {
                             self.observer.inc_conntrack_table_full();
                         }
+                        if reason == pipeline::DropReason::NatDrop {
+                            self.observer.inc_nat_drop();
+                        }
                         let icmp_pkt = io::RawPacket {
                             ingress_iface: reply.egress_iface.clone(),
                             data: reply.data,
@@ -552,6 +596,10 @@ impl Dataplane {
                         // Wire conntrack table-full counter.
                         if reason == pipeline::DropReason::ConntrackTableFull {
                             self.observer.inc_conntrack_table_full();
+                        }
+                        // Wire NAT drop counter.
+                        if reason == pipeline::DropReason::NatDrop {
+                            self.observer.inc_nat_drop();
                         }
                     }
                     pipeline::PipelineResult::Consumed => {
@@ -738,7 +786,7 @@ mod tests {
 
         // Verify all engines were created from the example config.
         // The example has 2 bridge domains, 1 static route, NAT enabled.
-        assert!(dp.nat.is_enabled());
+        assert!(dp.nat.lock().unwrap().is_enabled());
     }
 
     #[test]
