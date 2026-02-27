@@ -334,14 +334,22 @@ impl Dataplane {
                                     new_src_ip,
                                     new_src_port,
                                 } => {
-                                    rewrite::rewrite_snat(&mut data, *new_src_ip, *new_src_port);
+                                    if !rewrite::rewrite_snat(&mut data, *new_src_ip, *new_src_port)
+                                    {
+                                        self.observer.inc_nat_drop();
+                                        continue;
+                                    }
                                     self.observer.inc_nat_snat();
                                 }
                                 pipeline::NatResult::Dnat {
                                     new_dst_ip,
                                     new_dst_port,
                                 } => {
-                                    rewrite::rewrite_dnat(&mut data, *new_dst_ip, *new_dst_port);
+                                    if !rewrite::rewrite_dnat(&mut data, *new_dst_ip, *new_dst_port)
+                                    {
+                                        self.observer.inc_nat_drop();
+                                        continue;
+                                    }
                                     self.observer.inc_nat_dnat();
                                 }
                                 pipeline::NatResult::None => {}

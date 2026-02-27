@@ -273,7 +273,7 @@ pub fn process_packet_v6(
     srv6: Option<&Srv6Engine>,
 ) -> PipelineResult {
     // Step 1: Parse raw bytes.
-    let meta = match packet::parse_packet(&raw_pkt.data, &raw_pkt.ingress_iface) {
+    let mut meta = match packet::parse_packet(&raw_pkt.data, &raw_pkt.ingress_iface) {
         Ok(m) => m,
         Err(_) => {
             return PipelineResult::Drop {
@@ -392,6 +392,33 @@ pub fn process_packet_v6(
         },
         _ => NatResult::None,
     };
+
+    // After DNAT is determined, update the packet metadata so that the
+    // L3 routing decision uses the translated destination IP/port.
+    // Without this, port forwarding is broken: the original dst_ip is
+    // the router's WAN IP, so routing would return LocalDelivery instead
+    // of Forward to the internal server.
+    //
+    // RFC-REF: RFC 3022 Section 4.2
+    // "Destination NAT is performed before the routing decision."
+    if let NatResult::Dnat {
+        new_dst_ip,
+        new_dst_port,
+    } = &dnat_result
+    {
+        if let Some(L3Info::Ipv4(ref mut ipv4)) = meta.l3 {
+            ipv4.dst_addr = *new_dst_ip;
+        }
+        match &mut meta.l4 {
+            Some(L4Info::Tcp(ref mut tcp)) => {
+                tcp.dst_port = *new_dst_port;
+            }
+            Some(L4Info::Udp(ref mut udp)) => {
+                udp.dst_port = *new_dst_port;
+            }
+            _ => {}
+        }
+    }
 
     // Step 4: Conntrack lookup/create.
     //
@@ -2933,6 +2960,205 @@ mod tests {
                 assert_eq!(reason, DropReason::L3NotIpv4);
             }
             other => panic!("expected Drop(L3NotIpv4), got {:?}", other),
+        }
+    }
+
+    // ── NAT pipeline integration tests ───────────────────────────────
+
+    /// Build a NAT engine with NAPT enabled and a UDP port-forward rule:
+    /// external port 8080 -> 192.168.1.50:80.
+    fn make_nat_with_port_forward() -> NatEngine {
+        use ruster_config::model::PortForward;
+        NatEngine::from_config(
+            &NatConfig {
+                enabled: true,
+                mode: NatMode::Napt44,
+                external_if: "wan0".to_string(),
+                hairpin: false,
+                session_table_max_entries: 1000,
+                tcp_established_timeout_sec: 7200,
+                tcp_transitory_timeout_sec: 120,
+                udp_timeout_sec: 300,
+                icmp_timeout_sec: 30,
+                port_forwards: vec![PortForward {
+                    name: "web-server".to_string(),
+                    proto: ruster_config::model::PortForwardProto::Udp,
+                    external_port: 8080,
+                    internal_addr: "192.168.1.50".to_string(),
+                    internal_port: 80,
+                }],
+            },
+            &make_interfaces(),
+        )
+    }
+
+    /// Build a NAT engine with NAPT enabled (outbound SNAT) but no port forwards.
+    fn make_nat_enabled() -> NatEngine {
+        NatEngine::from_config(
+            &NatConfig {
+                enabled: true,
+                mode: NatMode::Napt44,
+                external_if: "wan0".to_string(),
+                hairpin: false,
+                session_table_max_entries: 1000,
+                tcp_established_timeout_sec: 7200,
+                tcp_transitory_timeout_sec: 120,
+                udp_timeout_sec: 300,
+                icmp_timeout_sec: 30,
+                port_forwards: vec![],
+            },
+            &make_interfaces(),
+        )
+    }
+
+    /// Build a valid Ethernet + IPv4 + UDP packet with configurable ports.
+    fn make_ipv4_udp_packet(
+        src_mac: [u8; 6],
+        dst_mac: [u8; 6],
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        ttl: u8,
+    ) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        // Ethernet header (14 bytes)
+        pkt.extend_from_slice(&dst_mac);
+        pkt.extend_from_slice(&src_mac);
+        pkt.extend_from_slice(&[0x08, 0x00]); // EtherType IPv4
+
+        // IPv4 header (20 bytes minimum)
+        let ipv4_start = pkt.len();
+        pkt.push(0x45); // version=4, IHL=5
+        pkt.push(0x00); // DSCP/ECN
+        let total_len: u16 = 20 + 8; // IP header + 8 bytes UDP
+        pkt.extend_from_slice(&total_len.to_be_bytes());
+        pkt.extend_from_slice(&[0x00, 0x00]); // identification
+        pkt.extend_from_slice(&[0x00, 0x00]); // flags/fragment
+        pkt.push(ttl);
+        pkt.push(17); // protocol: UDP
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+        pkt.extend_from_slice(&src_ip);
+        pkt.extend_from_slice(&dst_ip);
+
+        // Compute IPv4 checksum
+        set_ipv4_checksum(&mut pkt[ipv4_start..ipv4_start + 20]);
+
+        // UDP header (8 bytes)
+        pkt.extend_from_slice(&src_port.to_be_bytes());
+        pkt.extend_from_slice(&dst_port.to_be_bytes());
+        pkt.extend_from_slice(&[0x00, 0x08]); // length: 8
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum: 0
+        pkt
+    }
+
+    #[test]
+    fn dnat_port_forward_routes_to_internal_server() {
+        // DNAT port forward: WAN packet with dst=router WAN IP (10.0.0.2)
+        // and dst_port=8080 should be DNAT'd to 192.168.1.50:80, then
+        // routed to lan0 (192.168.1.0/24) instead of returning LocalDelivery.
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let mut ct = make_conntrack();
+        let mut nat = make_nat_with_port_forward();
+        let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+
+        // Packet from external host 203.0.113.10:54321 ->
+        // router's WAN IP 10.0.0.2:8080, entering via wan0.
+        let data = make_ipv4_udp_packet(
+            [0xCC, 0xDD, 0xEE, 0xFF, 0x00, 0x01], // external host MAC
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55], // router WAN MAC
+            [203, 0, 113, 10],                    // external src IP
+            [10, 0, 0, 2],                        // router WAN IP (dst)
+            54321,                                // src port
+            8080,                                 // dst port (matches port forward)
+            64,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "wan0".to_string(),
+            data,
+        };
+
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        match result {
+            PipelineResult::Forward {
+                egress_iface, nat, ..
+            } => {
+                // DNAT should route the packet to the LAN (192.168.1.50 is on
+                // the 192.168.1.0/24 subnet -> out via lan0).
+                assert_eq!(egress_iface, "lan0");
+                // The NAT result should carry the DNAT translation.
+                assert_eq!(
+                    nat,
+                    NatResult::Dnat {
+                        new_dst_ip: [192, 168, 1, 50],
+                        new_dst_port: 80,
+                    }
+                );
+            }
+            other => panic!(
+                "expected Forward with DNAT to lan0, got {:?}. \
+                 Without the DNAT fix, this would be Consumed (LocalDelivery) \
+                 because the original dst_ip is the router's own WAN IP.",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn snat_outbound_through_pipeline() {
+        // SNAT outbound: LAN packet from 192.168.1.100 -> 8.8.8.8 should be
+        // forwarded via wan0 with SNAT to the router's WAN IP (10.0.0.2).
+        let l3 = make_l3_engine();
+        let fw = make_fw_accept_all();
+        let mut ct = make_conntrack();
+        let mut nat = make_nat_enabled();
+        let zr = make_zone_resolver();
+        let im = std::collections::HashMap::new();
+        let mut l2 = make_l2_engine_empty();
+
+        // Packet from LAN host 192.168.1.100:49152 -> 8.8.8.8:53, entering
+        // via lan0.
+        let data = make_ipv4_udp_packet(
+            [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF], // LAN host MAC
+            [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE], // router LAN MAC
+            [192, 168, 1, 100],                   // LAN host IP
+            [8, 8, 8, 8],                         // external dst IP
+            49152,                                // src port
+            53,                                   // dst port (DNS)
+            64,
+        );
+        let raw_pkt = RawPacket {
+            ingress_iface: "lan0".to_string(),
+            data,
+        };
+
+        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        match result {
+            PipelineResult::Forward {
+                egress_iface, nat, ..
+            } => {
+                assert_eq!(egress_iface, "wan0");
+                // SNAT should translate src to the router's WAN IP.
+                match nat {
+                    NatResult::Snat {
+                        new_src_ip,
+                        new_src_port,
+                    } => {
+                        assert_eq!(new_src_ip, [10, 0, 0, 2]);
+                        // Port should be in the ephemeral range (>= 10000).
+                        assert!(
+                            new_src_port >= 10000,
+                            "SNAT port should be ephemeral, got {}",
+                            new_src_port
+                        );
+                    }
+                    other => panic!("expected Snat, got {:?}", other),
+                }
+            }
+            other => panic!("expected Forward with SNAT to wan0, got {:?}", other),
         }
     }
 }
