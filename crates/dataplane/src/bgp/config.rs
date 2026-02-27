@@ -68,7 +68,7 @@ impl fmt::Display for BgpConfigError {
 impl std::error::Error for BgpConfigError {}
 
 impl BgpEngineConfig {
-    /// Parse a [`BgpEngineConfig`] from the config model's [`BgpConfig`].
+    /// Parse a [`BgpEngineConfig`] from the config model's `BgpConfig`.
     ///
     /// # Errors
     ///
