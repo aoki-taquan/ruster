@@ -141,6 +141,7 @@ fn make_home_router_config() -> (
         ],
         ipv6_static_routes: vec![],
         ospf: None,
+        bgp: None,
     };
 
     let nat_config = NatConfig {

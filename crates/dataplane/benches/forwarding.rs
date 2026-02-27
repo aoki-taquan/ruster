@@ -112,6 +112,7 @@ fn make_routing_config() -> RoutingConfig {
         ],
         ipv6_static_routes: vec![],
         ospf: None,
+        bgp: None,
     }
 }
 

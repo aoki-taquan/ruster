@@ -1,4 +1,5 @@
 pub mod arp;
+pub mod bgp;
 pub mod conntrack;
 pub mod dpdk;
 pub mod firewall;
