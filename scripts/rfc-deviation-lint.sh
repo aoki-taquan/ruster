@@ -147,7 +147,6 @@ if [ "$MODE" = "lint" ]; then
         echo ""
         echo "--- Deviation List ---"
         printf '%-50s %-6s %-8s\n' "FILE" "LINE" "ISSUE"
-        local i
         for i in $(seq 1 "$DEVIATION_COUNT"); do
             dev_file="$TMPDIR_WORK/dev${i}"
             [ -f "$dev_file" ] || continue
