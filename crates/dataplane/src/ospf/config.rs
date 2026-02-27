@@ -31,7 +31,7 @@ pub struct OspfConfig {
 /// plan: Add multi-area support in a future version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AreaConfig {
-    /// Area ID as a 4-byte value (e.g. [0,0,0,0] for backbone).
+    /// Area ID as a 4-byte value (e.g. `[0,0,0,0]` for backbone).
     ///
     /// RFC-REF: RFC 2328 Section 4.2
     /// "Each OSPF area is identified by a 32-bit Area ID."

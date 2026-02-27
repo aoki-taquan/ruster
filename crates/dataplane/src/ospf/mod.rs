@@ -24,19 +24,11 @@
 //!
 //! # Limitations (v0.2)
 //!
-//! RFC-DEVIATION:
-//! reason: This is a minimal implementation focused on correctness
-//!         of the core state machine and SPF algorithm.
-//! impact: The following features are not implemented:
-//!         - DR/BDR election (all links treated as point-to-point)
-//!         - Multi-area OSPF (backbone only)
-//!         - Authentication (null auth only)
-//!         - OSPF options negotiation
-//!         - LSA retransmission / reliable flooding
-//!         - Virtual links
-//!         - NSSA / stub areas
-//! issue: #157
-//! plan: Incrementally add features in future issues.
+// RFC-DEVIATION:
+// reason: This is a minimal implementation focused on correctness of the core state machine and SPF algorithm
+// impact: DR/BDR election, multi-area, authentication, options negotiation, LSA retransmission, virtual links, NSSA/stub areas not implemented
+// issue: #157
+// plan: Incrementally add features in future issues
 //!
 //! RFC-REF: RFC 2328
 //! "OSPF Version 2" — the primary reference for this implementation.
