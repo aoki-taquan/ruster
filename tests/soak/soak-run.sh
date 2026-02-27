@@ -37,7 +37,6 @@ SOAK_DURATION_SEC=$((SOAK_DURATION_MIN * 60))
 SOAK_CHECK_INTERVAL="${SOAK_CHECK_INTERVAL:-30}"
 
 CONFIG_FILE="${SCRIPT_DIR}/soak-config.toml"
-THRESHOLDS_FILE="${SCRIPT_DIR}/thresholds.toml"
 
 # Output directory
 TIMESTAMP="$(date '+%Y%m%d-%H%M%S')"
@@ -48,7 +47,6 @@ METRICS_FILE="${SOAK_OUTPUT_DIR}/metrics.tsv"
 TRAFFIC_LOG="${SOAK_OUTPUT_DIR}/traffic.log"
 RUSTER_LOG="${SOAK_OUTPUT_DIR}/ruster.log"
 PACKET_STATS_FILE="${SOAK_OUTPUT_DIR}/packet-stats.tsv"
-PING_LOG="${SOAK_OUTPUT_DIR}/ping-results.log"
 
 # Parse traffic settings from config
 TRAFFIC_STREAMS=4
@@ -218,7 +216,7 @@ start_traffic() {
     for i in $(seq 1 "$TRAFFIC_STREAMS"); do
         docker exec "$PREFIX-lan-host" \
             ping -q -i "$PING_INTERVAL" -w "$SOAK_DURATION_SEC" 10.0.0.100 \
-            >> "$PING_LOG" 2>&1 &
+            >> "${SOAK_OUTPUT_DIR}/ping-stream${i}.log" 2>&1 &
         TRAFFIC_PIDS+=($!)
         log "  Stream ${i} started (PID: ${TRAFFIC_PIDS[-1]})"
     done
@@ -472,7 +470,7 @@ main() {
     echo "  Ended:     $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
     echo "  Metrics:   $METRICS_FILE"
     echo "  Packets:   $PACKET_STATS_FILE"
-    echo "  Ping log:  $PING_LOG"
+    echo "  Ping logs: ${SOAK_OUTPUT_DIR}/ping-stream*.log"
     echo "  Ruster log: $RUSTER_LOG"
     echo ""
 

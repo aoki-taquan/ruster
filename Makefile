@@ -150,11 +150,13 @@ soak-strict:
 	@echo "=== Deploying strict topology for soak test ==="
 	containerlab deploy --topo tests/containerlab/configs/strict.clab.yml --name $(CLAB_SOAK_NAME)
 	sleep 10
-	CLAB_TOPO_NAME=$(CLAB_SOAK_NAME) bash tests/containerlab/scripts/strict-setup.sh
+	CLAB_TOPO_NAME=$(CLAB_SOAK_NAME) bash tests/containerlab/scripts/strict-setup.sh || \
+		(containerlab destroy --name $(CLAB_SOAK_NAME) --cleanup; exit 1)
 	@echo "=== Running soak test on strict dataplane ==="
-	CLAB_TOPO_NAME=$(CLAB_SOAK_NAME) bash tests/soak/soak-run.sh || (containerlab destroy --name $(CLAB_SOAK_NAME) --cleanup; exit 1)
+	CLAB_TOPO_NAME=$(CLAB_SOAK_NAME) bash tests/soak/soak-run.sh || \
+		(containerlab destroy --name $(CLAB_SOAK_NAME) --cleanup; exit 1)
 	@echo "=== Generating soak report ==="
-	CLAB_TOPO_NAME=$(CLAB_SOAK_NAME) bash tests/soak/soak-report.sh || true
+	bash tests/soak/soak-report.sh tests/soak/results/latest || true
 	@echo "=== Destroying topology ==="
 	containerlab destroy --name $(CLAB_SOAK_NAME) --cleanup
 

@@ -22,11 +22,10 @@ set -uo pipefail
 
 # ── Configuration ─────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-RESULTS_DIR="${SCRIPT_DIR}/results/latest"
+RESULTS_DIR="${1:-${SCRIPT_DIR}/results/latest}"
 
 METRICS_FILE="${RESULTS_DIR}/metrics.tsv"
 PACKET_STATS_FILE="${RESULTS_DIR}/packet-stats.tsv"
-PING_LOG="${RESULTS_DIR}/ping-results.log"
 REPORT_FILE="${RESULTS_DIR}/report.md"
 
 THRESHOLDS_FILE="${SCRIPT_DIR}/thresholds.toml"
@@ -235,19 +234,21 @@ PING_LOSS_PCT="0"
 PING_AVG_RTT="0"
 PING_MAX_RTT="0"
 
-if [ -f "$PING_LOG" ] && [ -s "$PING_LOG" ]; then
-    # Parse aggregate ping stats from all streams
+# Aggregate ping stats across all per-stream log files
+PING_STREAM_FILES=("${RESULTS_DIR}"/ping-stream*.log)
+if [ -e "${PING_STREAM_FILES[0]}" ]; then
+    # Parse aggregate ping stats from all stream files
     # Format: X packets transmitted, Y received, Z% packet loss, time NNNms
-    PING_TX=$(awk '/packets transmitted/ { sum += $1 } END { print sum+0 }' "$PING_LOG")
-    PING_RX=$(awk '/packets transmitted/ { gsub(/,/, "", $4); sum += $4 } END { print sum+0 }' "$PING_LOG")
+    PING_TX=$(awk '/packets transmitted/ { sum += $1 } END { print sum+0 }' "${PING_STREAM_FILES[@]}")
+    PING_RX=$(awk '/packets transmitted/ { gsub(/,/, "", $4); sum += $4 } END { print sum+0 }' "${PING_STREAM_FILES[@]}")
 
     if [ "$PING_TX" -gt 0 ]; then
         PING_LOSS_PCT=$(awk "BEGIN { printf \"%.2f\", (1.0 - ${PING_RX} / ${PING_TX}) * 100.0 }")
     fi
 
     # RTT stats: rtt min/avg/max/mdev = A/B/C/D ms
-    PING_AVG_RTT=$(awk -F'/' '/rtt min\/avg\/max/ { sum += $5; count++ } END { if (count>0) printf "%.2f", sum/count; else print "0" }' "$PING_LOG")
-    PING_MAX_RTT=$(awk -F'/' '/rtt min\/avg\/max/ { if ($6+0 > max) max = $6+0 } END { printf "%.2f", max+0 }' "$PING_LOG")
+    PING_AVG_RTT=$(awk -F'/' '/rtt min\/avg\/max/ { sum += $5; count++ } END { if (count>0) printf "%.2f", sum/count; else print "0" }' "${PING_STREAM_FILES[@]}")
+    PING_MAX_RTT=$(awk -F'/' '/rtt min\/avg\/max/ { if ($6+0 > max) max = $6+0 } END { printf "%.2f", max+0 }' "${PING_STREAM_FILES[@]}")
 fi
 
 PING_LOSS_RATE="0"
