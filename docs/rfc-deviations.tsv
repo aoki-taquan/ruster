@@ -1,5 +1,5 @@
 # RFC-DEVIATION Registry
-# Generated: 2026-02-27T06:58:32Z
+# Generated: 2026-02-27T11:07:34Z
 # Total deviations: 27
 #
 file	line	reason	impact	issue	plan
@@ -15,7 +15,7 @@ file	line	reason	impact	issue	plan
 ./crates/dataplane/src/bgp/path.rs	239	comparing MED across different neighbor ASNs for simplicity	may prefer suboptimal routes in multi-AS topologies	#158	implement same-neighbor-AS MED comparison in v0.3
 ./crates/dataplane/src/bgp/policy.rs	7	minimal policy engine with only prefix-list filtering supported	cannot implement route-maps, community-based policy, etc.	#158	add route-map support in v0.3
 ./crates/dataplane/src/conntrack/session.rs	102	ICMPv6 conntrack not yet implemented for home-lab v0.1	ICMPv6 flows will not be tracked by conntrack	#159	implement ICMPv6 session tracking in v0.2
-./crates/dataplane/src/nat/mod.rs	460	ICMPv6 NAT not implemented for home-lab v0.1	ICMPv6 return traffic will not be reverse-translated	#159	implement ICMPv6 NAT support in v0.2
+./crates/dataplane/src/nat/mod.rs	474	ICMPv6 NAT not implemented for home-lab v0.1	ICMPv6 return traffic will not be reverse-translated	#159	implement ICMPv6 NAT support in v0.2
 ./crates/dataplane/src/ospf/config.rs	27	Only backbone area (0.0.0.0) is supported in v0.2.	Multi-area OSPF topologies will not work.	#157	Add multi-area support in a future version.
 ./crates/dataplane/src/ospf/interface.rs	22	We only implement Down, Waiting, PointToPoint, and	Broadcast network DR election does not work.	#157	Add DR election in a future version.
 ./crates/dataplane/src/ospf/interface.rs	35	We skip DR election and treat all interfaces as	Broadcast networks will not have DR/BDR.	#157	Add DR election in a future version.

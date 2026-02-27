@@ -148,7 +148,7 @@ impl NatEngine {
     ///
     /// When a new SNAT session is created, a **reverse session** is also
     /// stored so that return traffic (WAN -> router external IP) can be
-    /// matched in [`process_inbound`] and reverse-translated back to the
+    /// matched in `process_inbound` and reverse-translated back to the
     /// original LAN host.
     ///
     /// RFC-REF: RFC 3022 Section 2.2
