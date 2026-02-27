@@ -925,6 +925,7 @@ mod tests {
                 out_if: "wan0".to_string(),
                 metric: 100,
             }],
+            ipv6_static_routes: vec![],
         };
         let result = L3Engine::from_config(&config, &make_interfaces());
         assert!(result.is_err());
@@ -954,6 +955,7 @@ mod tests {
                     metric: 50,
                 },
             ],
+            ipv6_static_routes: vec![],
         };
         let result = L3Engine::from_config(&config, &make_interfaces());
         assert!(result.is_err());

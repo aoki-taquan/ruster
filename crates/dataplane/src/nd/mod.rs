@@ -512,6 +512,8 @@ mod tests {
             mac_aging_sec: 300,
             arp_table_max_entries: 256,
             arp_timeout_sec: 120,
+            arp_hold_queue_max: None,
+            arp_hold_queue_per_ip: None,
             bridge_domains: vec![BridgeDomain {
                 name: "br0".to_string(),
                 members: vec!["eth0".to_string()],
