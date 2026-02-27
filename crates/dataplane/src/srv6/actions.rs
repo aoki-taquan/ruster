@@ -21,7 +21,7 @@ pub enum Srv6Action {
     ///
     /// RFC-REF: RFC 8986 Section 4.1
     /// "When a node N receives a packet whose DA is S and S is a
-    /// local SID, N does: Decrement SL, update DA with SID[SL],
+    /// local SID, N does: Decrement SL, update DA with SID\[SL\],
     /// submit to IPv6 module for forwarding."
     End,
 

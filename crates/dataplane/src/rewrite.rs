@@ -76,7 +76,7 @@ pub fn rewrite_ipv6_hop_limit(data: &mut [u8], new_hop_limit: u8) -> bool {
 /// Returns `false` if the packet is too short.
 ///
 /// RFC-REF: RFC 8986 Section 4.1
-/// "Update the DA with SID[SL]" -- this is the rewrite step that
+/// "Update the DA with SID\[SL\]" -- this is the rewrite step that
 /// makes the SRv6 forwarding decision effective in the wire packet.
 pub fn rewrite_ipv6_da(data: &mut [u8], new_da: &[u8; 16]) -> bool {
     const ETH_HLEN: usize = 14;

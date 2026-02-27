@@ -12,7 +12,7 @@
 //! |  Last Entry   |     Flags     |              Tag              |
 //! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //! |                                                               |
-//! |            Segment List[0] (128-bit IPv6 address)             |
+//! |            Segment List\[0\] (128-bit IPv6 address)           |
 //! |                                                               |
 //! |                                                               |
 //! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -21,7 +21,7 @@
 //! |                                                               |
 //! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 //! |                                                               |
-//! |            Segment List[n] (128-bit IPv6 address)             |
+//! |            Segment List\[n\] (128-bit IPv6 address)           |
 //! |                                                               |
 //! |                                                               |
 //! +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -77,8 +77,8 @@ pub struct Srh {
     pub tag: u16,
 
     /// Segment List: ordered list of 128-bit SIDs.
-    /// Segment List[0] contains the last segment in the path (the final
-    /// destination). Segment List[Last Entry] contains the first segment.
+    /// Segment List\[0\] contains the last segment in the path (the final
+    /// destination). Segment List\[Last Entry\] contains the first segment.
     ///
     /// RFC-REF: RFC 8754 Section 2
     /// "The Segment List is encoded starting from the last segment of the
