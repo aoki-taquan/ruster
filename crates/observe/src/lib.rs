@@ -227,6 +227,34 @@ pub struct ConntrackCounters {
     pub conntrack_table_full: AtomicU64,
 }
 
+// ── NAT counters ────────────────────────────────────────────────────────
+
+/// NAT-specific counters.
+///
+/// Tracks NAT translation events, failures, and port allocation
+/// exhaustion for the NAT44 engine.
+///
+/// RFC-REF: RFC 4787 Section 11
+/// "It is RECOMMENDED that a NAT generate logs or accounting records
+/// for NAT bindings and sessions."
+#[derive(Debug, Default)]
+pub struct NatCounters {
+    /// Total SNAT (masquerade) translations applied.
+    pub snat_translations: AtomicU64,
+    /// Total DNAT (port forward / reverse) translations applied.
+    pub dnat_translations: AtomicU64,
+    /// Total hairpin NAT translations applied.
+    pub hairpin_translations: AtomicU64,
+    /// Total packets dropped by the NAT engine (any reason).
+    pub nat_drops: AtomicU64,
+    /// Port allocation pool exhaustion events (wrap-around detected).
+    ///
+    /// RFC-REF: RFC 4787 Section 4.1
+    /// "When all ports are in use, subsequent attempts to create
+    /// bindings will fail."
+    pub port_exhaustion: AtomicU64,
+}
+
 /// The main observability hub.
 ///
 /// Aggregates per-interface counters, global drop reason counters, and
@@ -240,6 +268,8 @@ pub struct Observer {
     pub drops: DropCounters,
     /// Conntrack lifecycle counters.
     pub conntrack: ConntrackCounters,
+    /// NAT translation counters.
+    pub nat: NatCounters,
     /// Total packets forwarded (L3 forward decision completed).
     pub forwarded: AtomicU64,
     /// Total packets delivered locally (destination is one of our IPs).
@@ -263,6 +293,7 @@ impl Observer {
             interfaces,
             drops: DropCounters::default(),
             conntrack: ConntrackCounters::default(),
+            nat: NatCounters::default(),
             forwarded: AtomicU64::new(0),
             local_delivery: AtomicU64::new(0),
             arp_hold_queue: ArpHoldQueueCounters::default(),
@@ -367,6 +398,33 @@ impl Observer {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment the SNAT translation counter.
+    pub fn inc_nat_snat(&self) {
+        self.nat.snat_translations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the DNAT translation counter.
+    pub fn inc_nat_dnat(&self) {
+        self.nat.dnat_translations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the hairpin NAT translation counter.
+    pub fn inc_nat_hairpin(&self) {
+        self.nat
+            .hairpin_translations
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the NAT drop counter.
+    pub fn inc_nat_drop(&self) {
+        self.nat.nat_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the NAT port exhaustion counter.
+    pub fn inc_nat_port_exhaustion(&self) {
+        self.nat.port_exhaustion.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Increment the appropriate drop reason counter for the given reason.
     ///
     /// Dispatches to the correct field in [`DropCounters`].
@@ -428,6 +486,13 @@ impl Observer {
                 conntrack_expired: self.conntrack.conntrack_expired.load(Ordering::Relaxed),
                 conntrack_table_full: self.conntrack.conntrack_table_full.load(Ordering::Relaxed),
             },
+            nat: NatSnapshot {
+                snat_translations: self.nat.snat_translations.load(Ordering::Relaxed),
+                dnat_translations: self.nat.dnat_translations.load(Ordering::Relaxed),
+                hairpin_translations: self.nat.hairpin_translations.load(Ordering::Relaxed),
+                nat_drops: self.nat.nat_drops.load(Ordering::Relaxed),
+                port_exhaustion: self.nat.port_exhaustion.load(Ordering::Relaxed),
+            },
             forwarded: self.forwarded.load(Ordering::Relaxed),
             local_delivery: self.local_delivery.load(Ordering::Relaxed),
             arp_hold_queue: ArpHoldQueueSnapshot {
@@ -455,6 +520,21 @@ pub struct ConntrackSnapshot {
     pub conntrack_table_full: u64,
 }
 
+/// NAT counter snapshot.
+#[derive(Debug, Clone)]
+pub struct NatSnapshot {
+    /// Total SNAT translations applied.
+    pub snat_translations: u64,
+    /// Total DNAT translations applied.
+    pub dnat_translations: u64,
+    /// Total hairpin NAT translations applied.
+    pub hairpin_translations: u64,
+    /// Total NAT drops.
+    pub nat_drops: u64,
+    /// Port exhaustion events.
+    pub port_exhaustion: u64,
+}
+
 /// Immutable snapshot of all observer counters.
 ///
 /// Produced by [`Observer::snapshot`]. Implements [`fmt::Display`] for
@@ -467,6 +547,8 @@ pub struct ObserverSnapshot {
     pub drops: DropSnapshot,
     /// Conntrack counter snapshot.
     pub conntrack: ConntrackSnapshot,
+    /// NAT counter snapshot.
+    pub nat: NatSnapshot,
     /// Total forwarded packets.
     pub forwarded: u64,
     /// Total locally delivered packets.
@@ -585,7 +667,14 @@ impl fmt::Display for ObserverSnapshot {
         writeln!(f, "  new: {}", self.conntrack.conntrack_new)?;
         writeln!(f, "  established: {}", self.conntrack.conntrack_established)?;
         writeln!(f, "  expired: {}", self.conntrack.conntrack_expired)?;
-        write!(f, "  table-full: {}", self.conntrack.conntrack_table_full)?;
+        writeln!(f, "  table-full: {}", self.conntrack.conntrack_table_full)?;
+        writeln!(f)?;
+        writeln!(f, "--- NAT ---")?;
+        writeln!(f, "  snat: {}", self.nat.snat_translations)?;
+        writeln!(f, "  dnat: {}", self.nat.dnat_translations)?;
+        writeln!(f, "  hairpin: {}", self.nat.hairpin_translations)?;
+        writeln!(f, "  drops: {}", self.nat.nat_drops)?;
+        write!(f, "  port-exhaustion: {}", self.nat.port_exhaustion)?;
         Ok(())
     }
 }

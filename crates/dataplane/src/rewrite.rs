@@ -105,6 +105,227 @@ pub fn rewrite_dst_mac(data: &mut [u8], mac: &[u8; 6]) {
     }
 }
 
+// ── NAT packet rewrite ─────────────────────────────────────────────
+
+/// Byte offsets within an Ethernet + IPv4 frame.
+const ETH_HLEN: usize = 14;
+const IPV4_SRC_OFFSET: usize = ETH_HLEN + 12;
+const IPV4_DST_OFFSET: usize = ETH_HLEN + 16;
+const IPV4_CHECKSUM_OFFSET: usize = ETH_HLEN + 10;
+const IPV4_PROTOCOL_OFFSET: usize = ETH_HLEN + 9;
+const IPV4_IHL_OFFSET: usize = ETH_HLEN;
+
+/// Rewrite source IP and source port for SNAT, updating IP + L4 checksums.
+///
+/// Modifies the packet in place. Returns `true` on success.
+///
+/// RFC-REF: RFC 3022 Section 4.3
+/// "The checksum adjustment must be performed any time the IP header
+/// or the TCP/UDP header is modified by the NAT."
+pub fn rewrite_snat(data: &mut [u8], new_src_ip: [u8; 4], new_src_port: u16) -> bool {
+    if data.len() < ETH_HLEN + 20 {
+        return false;
+    }
+
+    let old_src_ip = [
+        data[IPV4_SRC_OFFSET],
+        data[IPV4_SRC_OFFSET + 1],
+        data[IPV4_SRC_OFFSET + 2],
+        data[IPV4_SRC_OFFSET + 3],
+    ];
+
+    // 1. Update IP header checksum for source IP change.
+    let old_ip_cksum =
+        u16::from_be_bytes([data[IPV4_CHECKSUM_OFFSET], data[IPV4_CHECKSUM_OFFSET + 1]]);
+    let new_ip_cksum =
+        crate::nat::checksum::nat_ip_checksum_update(old_ip_cksum, old_src_ip, new_src_ip);
+    let ck = new_ip_cksum.to_be_bytes();
+    data[IPV4_CHECKSUM_OFFSET] = ck[0];
+    data[IPV4_CHECKSUM_OFFSET + 1] = ck[1];
+
+    // 2. Write the new source IP.
+    data[IPV4_SRC_OFFSET..IPV4_SRC_OFFSET + 4].copy_from_slice(&new_src_ip);
+
+    // 3. Update L4 header (source port + checksum).
+    let ihl = ((data[IPV4_IHL_OFFSET] & 0x0F) as usize) * 4;
+    let l4_offset = ETH_HLEN + ihl;
+    let protocol = data[IPV4_PROTOCOL_OFFSET];
+
+    rewrite_l4_src_port(
+        data,
+        l4_offset,
+        protocol,
+        old_src_ip,
+        new_src_ip,
+        new_src_port,
+    )
+}
+
+/// Rewrite destination IP and destination port for DNAT, updating IP + L4 checksums.
+///
+/// Modifies the packet in place. Returns `true` on success.
+///
+/// RFC-REF: RFC 3022 Section 4.3
+pub fn rewrite_dnat(data: &mut [u8], new_dst_ip: [u8; 4], new_dst_port: u16) -> bool {
+    if data.len() < ETH_HLEN + 20 {
+        return false;
+    }
+
+    let old_dst_ip = [
+        data[IPV4_DST_OFFSET],
+        data[IPV4_DST_OFFSET + 1],
+        data[IPV4_DST_OFFSET + 2],
+        data[IPV4_DST_OFFSET + 3],
+    ];
+
+    // 1. Update IP header checksum for destination IP change.
+    let old_ip_cksum =
+        u16::from_be_bytes([data[IPV4_CHECKSUM_OFFSET], data[IPV4_CHECKSUM_OFFSET + 1]]);
+    let new_ip_cksum =
+        crate::nat::checksum::nat_ip_checksum_update(old_ip_cksum, old_dst_ip, new_dst_ip);
+    let ck = new_ip_cksum.to_be_bytes();
+    data[IPV4_CHECKSUM_OFFSET] = ck[0];
+    data[IPV4_CHECKSUM_OFFSET + 1] = ck[1];
+
+    // 2. Write the new destination IP.
+    data[IPV4_DST_OFFSET..IPV4_DST_OFFSET + 4].copy_from_slice(&new_dst_ip);
+
+    // 3. Update L4 header (destination port + checksum).
+    let ihl = ((data[IPV4_IHL_OFFSET] & 0x0F) as usize) * 4;
+    let l4_offset = ETH_HLEN + ihl;
+    let protocol = data[IPV4_PROTOCOL_OFFSET];
+
+    rewrite_l4_dst_port(
+        data,
+        l4_offset,
+        protocol,
+        old_dst_ip,
+        new_dst_ip,
+        new_dst_port,
+    )
+}
+
+/// Rewrite L4 source port and update L4 checksum (TCP or UDP).
+///
+/// ICMP has no port; we skip port rewrite for ICMP but still update
+/// the IP header (already done by the caller).
+fn rewrite_l4_src_port(
+    data: &mut [u8],
+    l4_offset: usize,
+    protocol: u8,
+    old_ip: [u8; 4],
+    new_ip: [u8; 4],
+    new_port: u16,
+) -> bool {
+    match protocol {
+        6 => {
+            // TCP: src port at offset 0, checksum at offset 16.
+            if data.len() < l4_offset + 18 {
+                return false;
+            }
+            let old_port = u16::from_be_bytes([data[l4_offset], data[l4_offset + 1]]);
+            let old_cksum = u16::from_be_bytes([data[l4_offset + 16], data[l4_offset + 17]]);
+            let new_cksum = crate::nat::checksum::nat_l4_checksum_update(
+                old_cksum, old_ip, new_ip, old_port, new_port,
+            );
+            let port_bytes = new_port.to_be_bytes();
+            data[l4_offset] = port_bytes[0];
+            data[l4_offset + 1] = port_bytes[1];
+            let ck = new_cksum.to_be_bytes();
+            data[l4_offset + 16] = ck[0];
+            data[l4_offset + 17] = ck[1];
+            true
+        }
+        17 => {
+            // UDP: src port at offset 0, checksum at offset 6.
+            if data.len() < l4_offset + 8 {
+                return false;
+            }
+            let old_port = u16::from_be_bytes([data[l4_offset], data[l4_offset + 1]]);
+            let old_cksum = u16::from_be_bytes([data[l4_offset + 6], data[l4_offset + 7]]);
+            // RFC-REF: RFC 768
+            // "If the computed checksum is zero, it is transmitted as all ones."
+            // A UDP checksum of 0 means "not computed". We only update if non-zero.
+            if old_cksum != 0 {
+                let new_cksum = crate::nat::checksum::nat_l4_checksum_update(
+                    old_cksum, old_ip, new_ip, old_port, new_port,
+                );
+                // A computed result of 0 must be sent as 0xFFFF (RFC 768).
+                let final_cksum = if new_cksum == 0 { 0xFFFF } else { new_cksum };
+                let ck = final_cksum.to_be_bytes();
+                data[l4_offset + 6] = ck[0];
+                data[l4_offset + 7] = ck[1];
+            }
+            let port_bytes = new_port.to_be_bytes();
+            data[l4_offset] = port_bytes[0];
+            data[l4_offset + 1] = port_bytes[1];
+            true
+        }
+        1 => {
+            // ICMP: no port rewrite needed. IP checksum already updated.
+            true
+        }
+        _ => true,
+    }
+}
+
+/// Rewrite L4 destination port and update L4 checksum (TCP or UDP).
+fn rewrite_l4_dst_port(
+    data: &mut [u8],
+    l4_offset: usize,
+    protocol: u8,
+    old_ip: [u8; 4],
+    new_ip: [u8; 4],
+    new_port: u16,
+) -> bool {
+    match protocol {
+        6 => {
+            // TCP: dst port at offset 2, checksum at offset 16.
+            if data.len() < l4_offset + 18 {
+                return false;
+            }
+            let old_port = u16::from_be_bytes([data[l4_offset + 2], data[l4_offset + 3]]);
+            let old_cksum = u16::from_be_bytes([data[l4_offset + 16], data[l4_offset + 17]]);
+            let new_cksum = crate::nat::checksum::nat_l4_checksum_update(
+                old_cksum, old_ip, new_ip, old_port, new_port,
+            );
+            let port_bytes = new_port.to_be_bytes();
+            data[l4_offset + 2] = port_bytes[0];
+            data[l4_offset + 3] = port_bytes[1];
+            let ck = new_cksum.to_be_bytes();
+            data[l4_offset + 16] = ck[0];
+            data[l4_offset + 17] = ck[1];
+            true
+        }
+        17 => {
+            // UDP: dst port at offset 2, checksum at offset 6.
+            if data.len() < l4_offset + 8 {
+                return false;
+            }
+            let old_port = u16::from_be_bytes([data[l4_offset + 2], data[l4_offset + 3]]);
+            let old_cksum = u16::from_be_bytes([data[l4_offset + 6], data[l4_offset + 7]]);
+            if old_cksum != 0 {
+                let new_cksum = crate::nat::checksum::nat_l4_checksum_update(
+                    old_cksum, old_ip, new_ip, old_port, new_port,
+                );
+                let final_cksum = if new_cksum == 0 { 0xFFFF } else { new_cksum };
+                let ck = final_cksum.to_be_bytes();
+                data[l4_offset + 6] = ck[0];
+                data[l4_offset + 7] = ck[1];
+            }
+            let port_bytes = new_port.to_be_bytes();
+            data[l4_offset + 2] = port_bytes[0];
+            data[l4_offset + 3] = port_bytes[1];
+            true
+        }
+        1 => {
+            // ICMP: no port rewrite needed.
+            true
+        }
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +533,131 @@ mod tests {
     fn rewrite_ipv6_da_too_short() {
         let mut pkt = vec![0u8; 50]; // Too short (need 54 bytes)
         assert!(!rewrite_ipv6_da(&mut pkt, &[0u8; 16]));
+    }
+
+    // ── NAT rewrite tests ────────────────────────────────────────────
+
+    /// Build a minimal Ethernet + IPv4 + TCP packet for NAT rewrite tests.
+    fn make_tcp_packet(
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        ttl: u8,
+    ) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        // Ethernet header (14 bytes)
+        pkt.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]); // dst MAC
+        pkt.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // src MAC
+        pkt.extend_from_slice(&[0x08, 0x00]); // EtherType: IPv4
+
+        // IPv4 header (20 bytes)
+        let ipv4_start = pkt.len();
+        pkt.push(0x45); // version=4, IHL=5
+        pkt.push(0x00); // DSCP/ECN
+        let total_len: u16 = 20 + 20; // IP header + TCP header
+        pkt.extend_from_slice(&total_len.to_be_bytes());
+        pkt.extend_from_slice(&[0x00, 0x01]); // identification
+        pkt.extend_from_slice(&[0x40, 0x00]); // flags: DF
+        pkt.push(ttl);
+        pkt.push(6); // protocol: TCP
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+        pkt.extend_from_slice(&src_ip);
+        pkt.extend_from_slice(&dst_ip);
+
+        // Compute IPv4 checksum
+        let cksum = compute_ipv4_checksum(&pkt[ipv4_start..ipv4_start + 20]);
+        pkt[ipv4_start + 10] = (cksum >> 8) as u8;
+        pkt[ipv4_start + 11] = (cksum & 0xFF) as u8;
+
+        // TCP header (20 bytes minimum)
+        pkt.extend_from_slice(&src_port.to_be_bytes()); // src port
+        pkt.extend_from_slice(&dst_port.to_be_bytes()); // dst port
+        pkt.extend_from_slice(&[0x00, 0x00, 0x03, 0xE8]); // seq: 1000
+        pkt.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // ack: 0
+        pkt.push(0x50); // data offset: 5 (20 bytes)
+        pkt.push(0x02); // flags: SYN
+        pkt.extend_from_slice(&[0xFF, 0xFF]); // window
+        pkt.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+        pkt.extend_from_slice(&[0x00, 0x00]); // urgent pointer
+
+        pkt
+    }
+
+    #[test]
+    fn rewrite_snat_updates_src_ip_and_port() {
+        let mut pkt = make_tcp_packet([192, 168, 1, 100], [8, 8, 8, 8], 49152, 80, 64);
+
+        // Verify original IP checksum is valid.
+        assert_eq!(compute_ipv4_checksum(&pkt[14..34]), 0);
+
+        assert!(rewrite_snat(&mut pkt, [10, 0, 0, 2], 10000));
+
+        // Verify new source IP.
+        assert_eq!(&pkt[26..30], &[10, 0, 0, 2]);
+        // Verify new source port (TCP offset 34).
+        assert_eq!(u16::from_be_bytes([pkt[34], pkt[35]]), 10000);
+        // Verify IP checksum is still valid.
+        assert_eq!(
+            compute_ipv4_checksum(&pkt[14..34]),
+            0,
+            "IP checksum must be valid after SNAT"
+        );
+        // Destination IP should be unchanged.
+        assert_eq!(&pkt[30..34], &[8, 8, 8, 8]);
+        // Destination port should be unchanged.
+        assert_eq!(u16::from_be_bytes([pkt[36], pkt[37]]), 80);
+    }
+
+    #[test]
+    fn rewrite_dnat_updates_dst_ip_and_port() {
+        let mut pkt = make_tcp_packet([8, 8, 8, 8], [10, 0, 0, 2], 54321, 8080, 64);
+
+        assert_eq!(compute_ipv4_checksum(&pkt[14..34]), 0);
+
+        assert!(rewrite_dnat(&mut pkt, [192, 168, 1, 50], 80));
+
+        // Verify new destination IP.
+        assert_eq!(&pkt[30..34], &[192, 168, 1, 50]);
+        // Verify new destination port.
+        assert_eq!(u16::from_be_bytes([pkt[36], pkt[37]]), 80);
+        // Verify IP checksum is still valid.
+        assert_eq!(
+            compute_ipv4_checksum(&pkt[14..34]),
+            0,
+            "IP checksum must be valid after DNAT"
+        );
+        // Source IP should be unchanged.
+        assert_eq!(&pkt[26..30], &[8, 8, 8, 8]);
+        // Source port should be unchanged.
+        assert_eq!(u16::from_be_bytes([pkt[34], pkt[35]]), 54321);
+    }
+
+    #[test]
+    fn rewrite_snat_udp_packet() {
+        let mut pkt = make_test_packet(64);
+        // Verify original is valid.
+        assert_eq!(compute_ipv4_checksum(&pkt[14..34]), 0);
+
+        assert!(rewrite_snat(&mut pkt, [10, 0, 0, 2], 10000));
+
+        // Verify new source IP.
+        assert_eq!(&pkt[26..30], &[10, 0, 0, 2]);
+        // Verify new source port (UDP at offset 34).
+        assert_eq!(u16::from_be_bytes([pkt[34], pkt[35]]), 10000);
+        // Verify IP checksum is still valid.
+        assert_eq!(compute_ipv4_checksum(&pkt[14..34]), 0);
+    }
+
+    #[test]
+    fn rewrite_snat_too_short_packet_fails() {
+        let mut pkt = vec![0u8; 20];
+        assert!(!rewrite_snat(&mut pkt, [10, 0, 0, 2], 10000));
+    }
+
+    #[test]
+    fn rewrite_dnat_too_short_packet_fails() {
+        let mut pkt = vec![0u8; 20];
+        assert!(!rewrite_dnat(&mut pkt, [192, 168, 1, 50], 80));
     }
 }
