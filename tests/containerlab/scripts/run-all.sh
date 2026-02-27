@@ -6,8 +6,8 @@
 #
 # Environment variables:
 #   E2E_SUITES      — Comma-separated list of suites to run.
-#                     Available: l2, l3, nat, fw
-#                     Default: all suites (l2,l3,nat,fw)
+#                     Available: l2, l3, nat, fw, srv6
+#                     Default: all suites (l2,l3,nat,fw,srv6)
 #   CLAB_TOPO_NAME  — Containerlab topology name override.
 #                     Default: ruster-e2e (from topology.yml)
 #
@@ -24,10 +24,10 @@ TOTAL_FAIL=0
 TOTAL_SKIP=0
 RESULTS=""
 
-E2E_SUITES="${E2E_SUITES:-l2,l3,nat,fw}"
+E2E_SUITES="${E2E_SUITES:-l2,l3,nat,fw,srv6}"
 
 # ── Known suites ──────────────────────────────────────
-KNOWN_SUITES=("l2" "l3" "nat" "fw")
+KNOWN_SUITES=("l2" "l3" "nat" "fw" "srv6")
 
 # ── Helpers ───────────────────────────────────────────
 
@@ -117,6 +117,7 @@ suite_enabled "l2"  && run_suite "L2 (ARP / MAC Learning)"   "test-l2.sh"
 suite_enabled "l3"  && run_suite "L3 (Routing)"              "test-l3.sh"
 suite_enabled "nat" && run_suite "NAT (NAPT44)"              "test-nat.sh"
 suite_enabled "fw"  && run_suite "Firewall"                  "test-fw.sh"
+suite_enabled "srv6" && run_suite "SRv6 (Segment Routing)" "test-srv6.sh"
 
 # ── Summary ───────────────────────────────────────────
 

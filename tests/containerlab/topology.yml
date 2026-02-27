@@ -30,8 +30,12 @@ topology:
         - ip link set eth2 address 02:00:00:00:02:01
         - ip addr add 192.168.1.1/24 dev eth1
         - ip addr add 10.0.0.1/24 dev eth2
+        # IPv6 ULA addresses for SRv6 E2E testing
+        - ip -6 addr add fd00:1::1/64 dev eth1
+        - ip -6 addr add fd00:2::1/64 dev eth2
         # Disable kernel forwarding — ruster handles packet forwarding
         - sysctl -w net.ipv4.ip_forward=0
+        - sysctl -w net.ipv6.conf.all.forwarding=0
         # Start ruster process in background (AF_PACKET backend).
         - bash -c "nohup /usr/local/bin/ruster --config /etc/ruster/router.toml > /var/log/ruster.log 2>&1 &"
 
@@ -39,11 +43,15 @@ topology:
       kind: linux
       image: debian:bookworm-slim
       exec:
-        - bash -c "apt-get update -qq && apt-get install -y -qq iproute2 iputils-ping > /dev/null 2>&1"
+        - bash -c "apt-get update -qq && apt-get install -y -qq iproute2 iputils-ping python3-scapy > /dev/null 2>&1"
         - ip addr add 192.168.1.100/24 dev eth1
+        # IPv6 ULA address for SRv6 E2E testing
+        - ip -6 addr add fd00:1::100/64 dev eth1
         # Replace Docker's default route with one through ruster
         - bash -c "ip route del default 2>/dev/null || true"
         - ip route add default via 192.168.1.1
+        - bash -c "ip -6 route del default 2>/dev/null || true"
+        - ip -6 route add default via fd00:1::1
         # ARP warmup: let kernel resolve ruster's MAC before tests run
         - bash -c "sleep 3 && ping -c 1 -W 2 192.168.1.1 || true"
 
@@ -51,11 +59,15 @@ topology:
       kind: linux
       image: debian:bookworm-slim
       exec:
-        - bash -c "apt-get update -qq && apt-get install -y -qq iproute2 iputils-ping > /dev/null 2>&1"
+        - bash -c "apt-get update -qq && apt-get install -y -qq iproute2 iputils-ping tcpdump > /dev/null 2>&1"
         - ip addr add 10.0.0.100/24 dev eth1
+        # IPv6 ULA address for SRv6 E2E testing
+        - ip -6 addr add fd00:2::100/64 dev eth1
         # Replace Docker's default route with one through ruster (for return traffic)
         - bash -c "ip route del default 2>/dev/null || true"
         - ip route add default via 10.0.0.1
+        - bash -c "ip -6 route del default 2>/dev/null || true"
+        - ip -6 route add default via fd00:2::1
         # ARP warmup: let kernel resolve ruster's MAC before tests run
         - bash -c "sleep 3 && ping -c 1 -W 2 10.0.0.1 || true"
 
