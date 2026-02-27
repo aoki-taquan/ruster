@@ -528,7 +528,8 @@ fn process_ipv6_packet(
     let dst_zone = zone_resolver.resolve(&out_ifname);
     // IPv6 conntrack is not yet implemented — all IPv6 packets are
     // treated as new / untracked sessions for firewall purposes.
-    let fw_ctx = FwContext::from_packet(meta, FwChain::Forward, src_zone, dst_zone, conntrack, true);
+    let fw_ctx =
+        FwContext::from_packet(meta, FwChain::Forward, src_zone, dst_zone, conntrack, true);
     let verdict = firewall.evaluate(&fw_ctx);
 
     match verdict {
