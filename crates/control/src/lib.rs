@@ -14,7 +14,7 @@ pub mod store;
 
 pub use diff::{ChangeKind, ConfigChange};
 pub use error::ControlError;
-pub use store::{ConfigStore, PlanResult};
+pub use store::{ConfigStore, PlanResult, TransactionState};
 
 use ruster_config::RouterConfig;
 
@@ -53,6 +53,18 @@ pub fn apply(
     let plan = store.apply(candidate)?;
     let new_running = store.running().expect("apply succeeded").clone();
     Ok((new_running, plan))
+}
+
+/// Dry-run: validate and plan without applying any changes.
+///
+/// Returns the plan result showing what *would* change if `apply()` were
+/// called.  The store state is never modified.  This is useful for showing
+/// a preview of changes to the operator before committing.
+pub fn dry_run(
+    running: Option<&RouterConfig>,
+    candidate: &RouterConfig,
+) -> Result<PlanResult, ControlError> {
+    plan(running, candidate)
 }
 
 #[cfg(test)]
@@ -389,6 +401,363 @@ mod tests {
             store.running().unwrap().nat.external_if,
             "wan0",
             "running config should be unchanged after failed plan"
+        );
+    }
+
+    // ── Transaction: begin → prepare → commit ──
+
+    #[test]
+    fn transaction_begin_prepare_commit() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg.clone());
+        assert!(!store.has_active_transaction());
+
+        // Begin transaction.
+        store.begin_transaction().unwrap();
+        assert!(store.has_active_transaction());
+        assert_eq!(store.transaction_state(), Some(TransactionState::Pending));
+
+        // Apply a change within the transaction.
+        let mut cfg2 = cfg.clone();
+        cfg2.meta.hostname = "txn-host".to_string();
+        store.apply(cfg2).unwrap();
+        assert_eq!(store.running().unwrap().meta.hostname, "txn-host");
+
+        // Prepare.
+        let plan = store.prepare_transaction().unwrap();
+        assert!(plan.has_changes);
+        assert_eq!(store.transaction_state(), Some(TransactionState::Prepared));
+
+        // Commit transaction.
+        store.commit_transaction().unwrap();
+        assert!(!store.has_active_transaction());
+        assert_eq!(store.committed().unwrap().meta.hostname, "txn-host");
+        assert!(!store.has_pending_changes());
+    }
+
+    // ── Transaction: begin → abort ──
+
+    #[test]
+    fn transaction_begin_abort_restores_running() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg.clone());
+
+        store.begin_transaction().unwrap();
+
+        // Apply a change.
+        let mut cfg2 = cfg.clone();
+        cfg2.meta.hostname = "will-be-reverted".to_string();
+        store.apply(cfg2).unwrap();
+        assert_eq!(store.running().unwrap().meta.hostname, "will-be-reverted");
+
+        // Abort -- should restore the original running config.
+        store.abort_transaction().unwrap();
+        assert!(!store.has_active_transaction());
+        assert_eq!(
+            store.running().unwrap().meta.hostname,
+            "ruster-lab",
+            "running should revert to pre-transaction snapshot"
+        );
+    }
+
+    // ── Transaction: prepare then abort ──
+
+    #[test]
+    fn transaction_prepare_then_abort() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg.clone());
+
+        store.begin_transaction().unwrap();
+
+        let mut cfg2 = cfg.clone();
+        cfg2.meta.hostname = "prepared-then-aborted".to_string();
+        store.apply(cfg2).unwrap();
+
+        // Prepare succeeds.
+        store.prepare_transaction().unwrap();
+        assert_eq!(store.transaction_state(), Some(TransactionState::Prepared));
+
+        // Abort after prepare should still revert.
+        store.abort_transaction().unwrap();
+        assert!(!store.has_active_transaction());
+        assert_eq!(store.running().unwrap().meta.hostname, "ruster-lab",);
+    }
+
+    // ── Rollback (outside transaction) ──
+
+    #[test]
+    fn rollback_restores_committed() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg.clone());
+
+        // Apply a change without committing.
+        let mut cfg2 = cfg.clone();
+        cfg2.meta.hostname = "uncommitted".to_string();
+        store.apply(cfg2).unwrap();
+        assert!(store.has_pending_changes());
+
+        // Rollback.
+        store.rollback().unwrap();
+        assert!(!store.has_pending_changes());
+        assert_eq!(
+            store.running().unwrap().meta.hostname,
+            "ruster-lab",
+            "running should revert to committed"
+        );
+    }
+
+    // ── Concurrent transaction detection ──
+
+    #[test]
+    fn concurrent_transaction_rejected() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg);
+
+        store.begin_transaction().unwrap();
+        let err = store.begin_transaction().unwrap_err();
+        assert!(
+            matches!(err, ControlError::TransactionInProgress),
+            "expected TransactionInProgress, got: {err}"
+        );
+    }
+
+    // ── Transaction requires running config ──
+
+    #[test]
+    fn begin_transaction_without_running_fails() {
+        let mut store = ConfigStore::new();
+        let err = store.begin_transaction().unwrap_err();
+        assert!(
+            matches!(err, ControlError::NoRunningConfig),
+            "expected NoRunningConfig, got: {err}"
+        );
+    }
+
+    // ── Commit transaction without prepare ──
+
+    #[test]
+    fn commit_transaction_without_prepare_fails() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg);
+
+        store.begin_transaction().unwrap();
+        let err = store.commit_transaction().unwrap_err();
+        assert!(
+            matches!(err, ControlError::InvalidTransactionState { .. }),
+            "expected InvalidTransactionState, got: {err}"
+        );
+    }
+
+    // ── Prepare without transaction ──
+
+    #[test]
+    fn prepare_without_transaction_fails() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg);
+
+        let err = store.prepare_transaction().unwrap_err();
+        assert!(
+            matches!(err, ControlError::NoTransaction),
+            "expected NoTransaction, got: {err}"
+        );
+    }
+
+    // ── Abort without transaction ──
+
+    #[test]
+    fn abort_without_transaction_fails() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg);
+
+        let err = store.abort_transaction().unwrap_err();
+        assert!(
+            matches!(err, ControlError::NoTransaction),
+            "expected NoTransaction, got: {err}"
+        );
+    }
+
+    // ── Commit transaction without transaction ──
+
+    #[test]
+    fn commit_transaction_without_transaction_fails() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg);
+
+        let err = store.commit_transaction().unwrap_err();
+        assert!(
+            matches!(err, ControlError::NoTransaction),
+            "expected NoTransaction, got: {err}"
+        );
+    }
+
+    // ── Apply rejected after prepare ──
+
+    #[test]
+    fn apply_rejected_after_prepare() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg.clone());
+
+        store.begin_transaction().unwrap();
+        store.prepare_transaction().unwrap();
+
+        let mut cfg2 = cfg.clone();
+        cfg2.meta.hostname = "should-fail".to_string();
+        let err = store.apply(cfg2).unwrap_err();
+        assert!(
+            matches!(err, ControlError::InvalidTransactionState { .. }),
+            "expected InvalidTransactionState, got: {err}"
+        );
+    }
+
+    // ── Rollback during transaction rejected ──
+
+    #[test]
+    fn rollback_during_transaction_rejected() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg);
+
+        store.begin_transaction().unwrap();
+        let err = store.rollback().unwrap_err();
+        assert!(
+            matches!(err, ControlError::TransactionInProgress),
+            "expected TransactionInProgress, got: {err}"
+        );
+    }
+
+    // ── Rollback without committed config ──
+
+    #[test]
+    fn rollback_without_committed_fails() {
+        let cfg = load_example();
+        let mut store = ConfigStore::new();
+        store.apply(cfg).unwrap();
+
+        let err = store.rollback().unwrap_err();
+        assert!(
+            matches!(err, ControlError::NoCommittedConfig),
+            "expected NoCommittedConfig, got: {err}"
+        );
+    }
+
+    // ── dry_run does not modify state ──
+
+    #[test]
+    fn dry_run_shows_changes_without_applying() {
+        let cfg1 = load_example();
+        let mut cfg2 = cfg1.clone();
+        cfg2.meta.hostname = "dry-run-host".to_string();
+
+        let result = dry_run(Some(&cfg1), &cfg2).unwrap();
+        assert!(result.has_changes);
+        assert!(result.changes.iter().any(|c| c.path == "meta.hostname"));
+
+        // Verify the original config is not mutated (dry_run is stateless).
+        assert_eq!(cfg1.meta.hostname, "ruster-lab");
+    }
+
+    #[test]
+    fn dry_run_rejects_invalid_config() {
+        let cfg1 = load_example();
+        let mut invalid = cfg1.clone();
+        invalid.meta.hostname = "".to_string();
+
+        let err = dry_run(Some(&cfg1), &invalid).unwrap_err();
+        assert!(err.to_string().contains("hostname"));
+    }
+
+    #[test]
+    fn dry_run_initial_load() {
+        let cfg = load_example();
+        let result = dry_run(None, &cfg).unwrap();
+        assert!(result.has_changes);
+    }
+
+    // ── Transaction: validation failure safety ──
+
+    #[test]
+    fn transaction_validation_failure_preserves_snapshot() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg.clone());
+
+        store.begin_transaction().unwrap();
+
+        // Try to apply an invalid config -- should fail.
+        let mut invalid = cfg.clone();
+        invalid.meta.hostname = "".to_string();
+        let err = store.apply(invalid);
+        assert!(err.is_err());
+
+        // Running config should be unchanged.
+        assert_eq!(store.running().unwrap().meta.hostname, "ruster-lab");
+
+        // Transaction should still be active.
+        assert!(store.has_active_transaction());
+        assert_eq!(store.transaction_state(), Some(TransactionState::Pending));
+
+        // Abort should still work.
+        store.abort_transaction().unwrap();
+        assert_eq!(store.running().unwrap().meta.hostname, "ruster-lab");
+    }
+
+    // ── Transaction: multiple applies before prepare ──
+
+    #[test]
+    fn transaction_multiple_applies() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg.clone());
+
+        store.begin_transaction().unwrap();
+
+        // First apply.
+        let mut cfg2 = cfg.clone();
+        cfg2.meta.hostname = "step1".to_string();
+        store.apply(cfg2).unwrap();
+
+        // Second apply.
+        let mut cfg3 = cfg.clone();
+        cfg3.meta.hostname = "step2".to_string();
+        store.apply(cfg3).unwrap();
+        assert_eq!(store.running().unwrap().meta.hostname, "step2");
+
+        // Prepare should show diff from original to step2.
+        let plan = store.prepare_transaction().unwrap();
+        assert!(plan.has_changes);
+        assert!(plan.changes.iter().any(|c| c.path == "meta.hostname"));
+
+        store.commit_transaction().unwrap();
+        assert_eq!(store.committed().unwrap().meta.hostname, "step2");
+    }
+
+    // ── Prepare with no-op transaction ──
+
+    #[test]
+    fn transaction_prepare_no_op() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg);
+
+        store.begin_transaction().unwrap();
+        // No applies -- prepare should report no changes.
+        let plan = store.prepare_transaction().unwrap();
+        assert!(!plan.has_changes);
+        assert!(plan.changes.is_empty());
+
+        store.commit_transaction().unwrap();
+    }
+
+    // ── Double prepare rejected ──
+
+    #[test]
+    fn transaction_double_prepare_rejected() {
+        let cfg = load_example();
+        let mut store = ConfigStore::with_running(cfg);
+
+        store.begin_transaction().unwrap();
+        store.prepare_transaction().unwrap();
+
+        let err = store.prepare_transaction().unwrap_err();
+        assert!(
+            matches!(err, ControlError::InvalidTransactionState { .. }),
+            "expected InvalidTransactionState, got: {err}"
         );
     }
 }
