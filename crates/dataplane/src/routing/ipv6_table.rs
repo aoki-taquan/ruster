@@ -289,6 +289,7 @@ mod tests {
                     metric: 10,
                 },
             ],
+            ospf: None,
         }
     }
 

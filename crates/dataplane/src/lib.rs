@@ -7,6 +7,7 @@ pub mod io;
 pub mod l2;
 pub mod nat;
 pub mod nd;
+pub mod ospf;
 pub mod packet;
 pub mod pipeline;
 pub mod rewrite;

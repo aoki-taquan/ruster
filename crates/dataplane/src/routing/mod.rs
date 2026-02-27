@@ -431,6 +431,7 @@ mod tests {
                 },
             ],
             ipv6_static_routes: vec![],
+            ospf: None,
         }
     }
 
@@ -650,6 +651,7 @@ mod tests {
                 metric: 10,
             }],
             ipv6_static_routes: vec![],
+            ospf: None,
         };
         let engine = L3Engine::from_config(&config, &make_interfaces()).unwrap();
 
@@ -926,6 +928,7 @@ mod tests {
                 metric: 100,
             }],
             ipv6_static_routes: vec![],
+            ospf: None,
         };
         let result = L3Engine::from_config(&config, &make_interfaces());
         assert!(result.is_err());
@@ -956,6 +959,7 @@ mod tests {
                 },
             ],
             ipv6_static_routes: vec![],
+            ospf: None,
         };
         let result = L3Engine::from_config(&config, &make_interfaces());
         assert!(result.is_err());
