@@ -6,6 +6,10 @@ on:
     - cron: "0 9 * * 1"
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   health-check:
     name: Self-hosted Runner Health
