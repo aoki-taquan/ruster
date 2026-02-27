@@ -139,10 +139,10 @@ pub enum ConntrackResult {
 ///    b. If the destination IP is one of the router's local IPs,
 ///       fall through to L3 processing.
 ///    c. Otherwise, make an L2 forwarding decision:
-///       Known unicast -> `Forward` to the learned port.
-///       Unknown unicast / broadcast -> `Flood` to all bridge domain
-///       ports except ingress.
-///       Same-port drop -> `Drop(L2Drop)`.
+///    Known unicast -> `Forward` to the learned port.
+///    Unknown unicast / broadcast -> `Flood` to all bridge domain
+///    ports except ingress.
+///    Same-port drop -> `Drop(L2Drop)`.
 /// 4. If the interface is **not** in a bridge domain, proceed to L3.
 /// 5. **Conntrack lookup/create**: for every trackable packet, look up
 ///    both forward and reverse session keys. Create a new session for
