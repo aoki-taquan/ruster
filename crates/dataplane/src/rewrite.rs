@@ -68,6 +68,29 @@ pub fn rewrite_ipv6_hop_limit(data: &mut [u8], new_hop_limit: u8) -> bool {
     true
 }
 
+/// Rewrite the IPv6 Destination Address field in-place.
+///
+/// Expects a full Ethernet frame (14-byte header + IPv6 payload).
+/// The Destination Address occupies bytes 24..40 of the IPv6 header
+/// (offsets 38..54 from the start of the Ethernet frame).
+/// Returns `false` if the packet is too short.
+///
+/// RFC-REF: RFC 8986 Section 4.1
+/// "Update the DA with SID[SL]" -- this is the rewrite step that
+/// makes the SRv6 forwarding decision effective in the wire packet.
+pub fn rewrite_ipv6_da(data: &mut [u8], new_da: &[u8; 16]) -> bool {
+    const ETH_HLEN: usize = 14;
+    // IPv6 DA starts at offset 24 within the IPv6 header.
+    const IPV6_DA_OFFSET: usize = ETH_HLEN + 24;
+
+    if data.len() < IPV6_DA_OFFSET + 16 {
+        return false;
+    }
+
+    data[IPV6_DA_OFFSET..IPV6_DA_OFFSET + 16].copy_from_slice(new_da);
+    true
+}
+
 /// Rewrite the Ethernet source MAC address (bytes 6..12).
 pub fn rewrite_src_mac(data: &mut [u8], mac: &[u8; 6]) {
     if data.len() >= 14 {
@@ -262,5 +285,32 @@ mod tests {
         // Packet too short for Ethernet + IPv6 header
         let mut pkt = vec![0u8; 40];
         assert!(!rewrite_ipv6_hop_limit(&mut pkt, 63));
+    }
+
+    // ── IPv6 DA rewrite tests ──────────────────────────────────────
+
+    #[test]
+    fn rewrite_ipv6_da_updates_destination() {
+        let mut pkt = make_ipv6_test_packet(64);
+        // Original DA is at bytes 38..54 (ETH 14 + IPv6 DA offset 24)
+        let original_da: [u8; 16] = [
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02,
+        ];
+        assert_eq!(&pkt[38..54], &original_da);
+
+        let new_da: [u8; 16] = [
+            0xfd, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x02, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert!(rewrite_ipv6_da(&mut pkt, &new_da));
+        assert_eq!(&pkt[38..54], &new_da);
+
+        // Verify other header fields are untouched.
+        assert_eq!(pkt[14 + 7], 64, "Hop Limit should be unchanged");
+    }
+
+    #[test]
+    fn rewrite_ipv6_da_too_short() {
+        let mut pkt = vec![0u8; 50]; // Too short (need 54 bytes)
+        assert!(!rewrite_ipv6_da(&mut pkt, &[0u8; 16]));
     }
 }

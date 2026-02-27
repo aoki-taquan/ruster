@@ -86,6 +86,9 @@ pub enum PipelineResult {
         new_hop_limit: u8,
         /// Next-hop IPv6 address.
         next_hop_v6: [u8; 16],
+        /// If SRv6 processing updated the DA, the new destination address
+        /// to write into the packet's IPv6 header (bytes 24..40).
+        srv6_new_da: Option<[u8; 16]>,
     },
     /// Packet should be flooded to all listed interfaces (L2 unknown
     /// unicast or broadcast within a bridge domain).
@@ -526,10 +529,18 @@ fn process_ipv6_packet(
             match decision {
                 Srv6Decision::Forward {
                     new_da,
-                    srh_modified: _,
+                    srh_modified,
                 } => {
+                    // RFC-DEVIATION:
+                    // reason: SRH Segments Left field is not rewritten in packet bytes in v0.1
+                    // impact: Downstream SRv6 nodes see stale SL; multi-hop SRv6 may malfunction
+                    // issue: #160
+                    // plan: v0.2 で SRH in-place rewrite (SL decrement) を実装
+                    let _ = srh_modified;
+
                     // The SRv6 engine updated the DA. Route the packet
                     // using the new DA via normal IPv6 forwarding.
+                    // The new_da will be written into the IPv6 header by the caller.
                     // Hop limit check and route lookup use the new DA.
                     if ipv6.hop_limit <= 1 {
                         return PipelineResult::Drop {
@@ -569,6 +580,7 @@ fn process_ipv6_packet(
                                 egress_iface: out_ifname,
                                 new_hop_limit,
                                 next_hop_v6,
+                                srv6_new_da: Some(new_da),
                             }
                         }
                         FwVerdict::Drop | FwVerdict::DropRule { .. } => PipelineResult::Drop {
@@ -643,6 +655,7 @@ fn process_ipv6_packet(
             egress_iface: out_ifname,
             new_hop_limit,
             next_hop_v6,
+            srv6_new_da: None,
         },
         FwVerdict::Drop | FwVerdict::DropRule { .. } => PipelineResult::Drop {
             reason: DropReason::FirewallDrop,

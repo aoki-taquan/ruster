@@ -438,10 +438,17 @@ impl Dataplane {
                         egress_iface,
                         new_hop_limit,
                         next_hop_v6,
+                        srv6_new_da,
                     } => {
                         self.observer.inc_forwarded();
 
                         let mut data = raw_pkt.data.clone();
+
+                        // 0. SRv6 DA rewrite (must happen before ND resolution
+                        //    since ND may use the DA from the packet).
+                        if let Some(ref new_da) = srv6_new_da {
+                            rewrite::rewrite_ipv6_da(&mut data, new_da);
+                        }
 
                         // 1. Hop Limit (no checksum update needed for IPv6).
                         rewrite::rewrite_ipv6_hop_limit(&mut data, new_hop_limit);

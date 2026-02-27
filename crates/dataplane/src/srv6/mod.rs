@@ -132,7 +132,16 @@ pub struct Srv6Engine {
 
 impl Srv6Engine {
     /// Create a new SRv6 engine from configuration.
+    ///
+    /// Validates the configuration before building the SID table.
+    /// Returns an error if validation fails or the SID table cannot be built.
     pub fn from_config(config: Srv6Config) -> Result<Self, SidTableError> {
+        let validation_errors = config.validate();
+        if !validation_errors.is_empty() {
+            return Err(SidTableError {
+                messages: validation_errors,
+            });
+        }
         let sid_table = SidTable::from_config(&config.local_sids)?;
         Ok(Self { config, sid_table })
     }
@@ -391,6 +400,35 @@ mod tests {
     fn engine_disabled() {
         let engine = Srv6Engine::disabled();
         assert!(!engine.is_enabled());
+    }
+
+    #[test]
+    fn engine_from_config_rejects_invalid_block_len() {
+        let config = Srv6Config {
+            block_len: 0,
+            ..Srv6Config::default()
+        };
+        let err = Srv6Engine::from_config(config).unwrap_err();
+        assert!(
+            err.messages.iter().any(|m| m.contains("block_len")),
+            "expected validation error about block_len, got: {:?}",
+            err.messages
+        );
+    }
+
+    #[test]
+    fn engine_from_config_rejects_oversized_block_plus_usid() {
+        let config = Srv6Config {
+            block_len: 120,
+            usid_len: 16,
+            ..Srv6Config::default()
+        };
+        let err = Srv6Engine::from_config(config).unwrap_err();
+        assert!(
+            err.messages.iter().any(|m| m.contains("exceeds 128 bits")),
+            "expected validation error about exceeding 128 bits, got: {:?}",
+            err.messages
+        );
     }
 
     // ── End action tests ─────────────────────────────────────────────
