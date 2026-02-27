@@ -4,7 +4,7 @@
 .PHONY: team-start team-stop
 .PHONY: clab-deploy clab-test clab-destroy clab-e2e
 .PHONY: clab-strict-deploy clab-strict-test clab-strict-destroy clab-strict-e2e
-.PHONY: soak-test soak-test-short
+.PHONY: soak-test soak-test-short soak-strict soak-strict-short
 .PHONY: rfc-check rfc-registry
 
 # ── Build ──────────────────────────────────────────────
@@ -138,6 +138,30 @@ soak-test:
 
 soak-test-short:
 	cd tests/soak && SOAK_DURATION_MIN=5 bash soak-test.sh
+
+# Soak test on strict dataplane (requires containerlab).
+# Deploys strict topology, runs extended soak, generates report.
+# Usage: make soak-strict
+#        make soak-strict SOAK_DURATION_MIN=120
+CLAB_SOAK_NAME ?= ruster-soak-strict
+export CLAB_SOAK_NAME
+
+soak-strict:
+	@echo "=== Deploying strict topology for soak test ==="
+	containerlab deploy --topo tests/containerlab/configs/strict.clab.yml --name $(CLAB_SOAK_NAME)
+	sleep 10
+	CLAB_TOPO_NAME=$(CLAB_SOAK_NAME) bash tests/containerlab/scripts/strict-setup.sh || \
+		(containerlab destroy --name $(CLAB_SOAK_NAME) --cleanup; exit 1)
+	@echo "=== Running soak test on strict dataplane ==="
+	CLAB_TOPO_NAME=$(CLAB_SOAK_NAME) bash tests/soak/soak-run.sh || \
+		(containerlab destroy --name $(CLAB_SOAK_NAME) --cleanup; exit 1)
+	@echo "=== Generating soak report ==="
+	CLAB_TOPO_NAME=$(CLAB_SOAK_NAME) bash tests/soak/soak-report.sh tests/soak/results/latest || true
+	@echo "=== Destroying topology ==="
+	containerlab destroy --name $(CLAB_SOAK_NAME) --cleanup
+
+soak-strict-short:
+	SOAK_DURATION_MIN=5 $(MAKE) soak-strict
 
 # ── RFC Deviation ────────────────────────────────────────
 
