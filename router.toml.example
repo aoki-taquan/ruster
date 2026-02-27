@@ -87,3 +87,16 @@ rules = [
   { name = "allow-lan-to-wan", chain = "forward", action = "accept", proto = "any", src_zone = "lan", dst_zone = "wan", state = ["new", "established", "related"] },
   { name = "allow-lan-input-icmp", chain = "input", action = "accept", proto = "icmp", src_zone = "lan", dst_zone = "any", state = ["new"] }
 ]
+
+# ── SRv6 (Segment Routing over IPv6) ──────────────────────────────
+# Optional: enable SRv6 uSID processing.
+# RFC 8986 (SRv6 Network Programming), RFC 8754 (IPv6 SRH)
+# [srv6]
+# locator_block = "fd00::"
+# block_len = 32
+# usid_len = 16
+# local_sids = [
+#   { sid = "fd00::1", action = "end" },
+#   { sid = "fd00::2", action = "end_dt4", table = "default" },
+#   { sid = "fd00::/32", action = "un" },
+# ]

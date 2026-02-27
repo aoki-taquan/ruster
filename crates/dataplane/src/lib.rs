@@ -12,6 +12,7 @@ pub mod packet;
 pub mod pipeline;
 pub mod rewrite;
 pub mod routing;
+pub mod srv6;
 
 #[cfg(target_os = "linux")]
 pub mod afpacket;
@@ -65,6 +66,10 @@ pub struct Dataplane {
     pub nd: Mutex<nd::NdEngine>,
     /// IPv6 static route table with LPM lookup.
     pub ipv6_routes: routing::ipv6_table::Ipv6RouteTable,
+    /// SRv6 processing engine (optional, enabled when [srv6] config is present).
+    ///
+    /// RFC-REF: RFC 8986 (SRv6 Network Programming)
+    pub srv6: Option<srv6::Srv6Engine>,
     /// NAT44 engine (NAPT, port forwarding, hairpin).
     pub nat: nat::NatEngine,
     /// Stateful firewall engine.
@@ -111,6 +116,33 @@ impl Dataplane {
                         .join("; "),
                 )
             })?;
+        // Build SRv6 engine if configured.
+        let srv6 = if let Some(ref srv6_cfg) = config.srv6 {
+            let internal_cfg = srv6::config::Srv6Config {
+                locator_block: srv6_cfg.locator_block.clone(),
+                block_len: srv6_cfg.block_len,
+                usid_len: srv6_cfg.usid_len,
+                local_sids: srv6_cfg
+                    .local_sids
+                    .iter()
+                    .map(|s| srv6::config::LocalSidConfig {
+                        sid: s.sid.clone(),
+                        action: s.action.clone(),
+                        table: s.table.clone(),
+                    })
+                    .collect(),
+            };
+            match srv6::Srv6Engine::from_config(internal_cfg) {
+                Ok(engine) => Some(engine),
+                Err(e) => {
+                    eprintln!("SRv6: failed to initialize: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let nat = nat::NatEngine::from_config(&config.nat, &config.interfaces);
         let firewall = firewall::FirewallEngine::from_config(&config.firewall);
         let conntrack = conntrack::ConntrackEngine::from_nat_config(&config.nat);
@@ -159,6 +191,7 @@ impl Dataplane {
             l3,
             nd: Mutex::new(nd),
             ipv6_routes,
+            srv6,
             nat,
             firewall,
             conntrack: Mutex::new(conntrack),
@@ -264,6 +297,7 @@ impl Dataplane {
                         &self.iface_macs,
                         Some(&mut nd_guard),
                         Some(&self.ipv6_routes),
+                        self.srv6.as_ref(),
                     )
                 };
                 match result {
@@ -490,7 +524,7 @@ impl Dataplane {
                         reason,
                         icmp_reply: Some(reply),
                     } => {
-                        let obs_reason = map_pipeline_drop_to_observe(reason);
+                        let obs_reason = map_pipeline_drop_to_observe(&reason);
                         self.observer.inc_drop_reason(obs_reason);
                         if reason == pipeline::DropReason::ConntrackTableFull {
                             self.observer.inc_conntrack_table_full();
@@ -505,7 +539,7 @@ impl Dataplane {
                         }
                     }
                     pipeline::PipelineResult::Drop { reason, .. } => {
-                        let obs_reason = map_pipeline_drop_to_observe(reason);
+                        let obs_reason = map_pipeline_drop_to_observe(&reason);
                         self.observer.inc_drop_reason(obs_reason);
                         // Wire conntrack table-full counter.
                         if reason == pipeline::DropReason::ConntrackTableFull {
@@ -656,7 +690,7 @@ pub fn parse_mac_str(mac_str: &str) -> [u8; 6] {
 }
 
 /// Map a pipeline [`pipeline::DropReason`] to an observe [`ruster_observe::DropReason`].
-fn map_pipeline_drop_to_observe(reason: pipeline::DropReason) -> ruster_observe::DropReason {
+fn map_pipeline_drop_to_observe(reason: &pipeline::DropReason) -> ruster_observe::DropReason {
     match reason {
         pipeline::DropReason::ParseError => ruster_observe::DropReason::ParseError,
         pipeline::DropReason::L2Drop => ruster_observe::DropReason::L2NoBridgeDomain,
@@ -667,6 +701,7 @@ fn map_pipeline_drop_to_observe(reason: pipeline::DropReason) -> ruster_observe:
         pipeline::DropReason::FirewallDrop => ruster_observe::DropReason::FirewallDrop,
         pipeline::DropReason::NatDrop => ruster_observe::DropReason::NatTableFull,
         pipeline::DropReason::ConntrackTableFull => ruster_observe::DropReason::ConntrackTableFull,
+        pipeline::DropReason::Srv6Drop(_) => ruster_observe::DropReason::Srv6Drop,
     }
 }
 
@@ -1183,29 +1218,36 @@ mod tests {
         use pipeline::DropReason as PD;
         use ruster_observe::DropReason as OD;
 
-        assert_eq!(map_pipeline_drop_to_observe(PD::ParseError), OD::ParseError);
         assert_eq!(
-            map_pipeline_drop_to_observe(PD::L2Drop),
+            map_pipeline_drop_to_observe(&PD::ParseError),
+            OD::ParseError
+        );
+        assert_eq!(
+            map_pipeline_drop_to_observe(&PD::L2Drop),
             OD::L2NoBridgeDomain
         );
-        assert_eq!(map_pipeline_drop_to_observe(PD::L3NoRoute), OD::L3NoRoute);
+        assert_eq!(map_pipeline_drop_to_observe(&PD::L3NoRoute), OD::L3NoRoute);
         assert_eq!(
-            map_pipeline_drop_to_observe(PD::L3TtlExpired),
+            map_pipeline_drop_to_observe(&PD::L3TtlExpired),
             OD::L3TtlExpired
         );
-        assert_eq!(map_pipeline_drop_to_observe(PD::L3NotIpv4), OD::L3NotIpv4);
+        assert_eq!(map_pipeline_drop_to_observe(&PD::L3NotIpv4), OD::L3NotIpv4);
         assert_eq!(
-            map_pipeline_drop_to_observe(PD::L3HopLimitExpired),
+            map_pipeline_drop_to_observe(&PD::L3HopLimitExpired),
             OD::L3TtlExpired
         );
         assert_eq!(
-            map_pipeline_drop_to_observe(PD::FirewallDrop),
+            map_pipeline_drop_to_observe(&PD::FirewallDrop),
             OD::FirewallDrop
         );
-        assert_eq!(map_pipeline_drop_to_observe(PD::NatDrop), OD::NatTableFull);
+        assert_eq!(map_pipeline_drop_to_observe(&PD::NatDrop), OD::NatTableFull);
         assert_eq!(
-            map_pipeline_drop_to_observe(PD::ConntrackTableFull),
+            map_pipeline_drop_to_observe(&PD::ConntrackTableFull),
             OD::ConntrackTableFull
+        );
+        assert_eq!(
+            map_pipeline_drop_to_observe(&PD::Srv6Drop(crate::srv6::Srv6DropReason::SrhTooShort)),
+            OD::Srv6Drop
         );
     }
 }

@@ -119,6 +119,8 @@ pub enum DropReason {
     ParseError,
     /// Conntrack: session table is full.
     ConntrackTableFull,
+    /// SRv6: packet dropped during SRv6 processing.
+    Srv6Drop,
 }
 
 impl fmt::Display for DropReason {
@@ -133,6 +135,7 @@ impl fmt::Display for DropReason {
             DropReason::ArpUnresolved => write!(f, "ARP/unresolved"),
             DropReason::ParseError => write!(f, "parse-error"),
             DropReason::ConntrackTableFull => write!(f, "conntrack/table-full"),
+            DropReason::Srv6Drop => write!(f, "SRv6/drop"),
         }
     }
 }
@@ -185,6 +188,8 @@ pub struct DropCounters {
     pub parse_error: AtomicU64,
     /// Conntrack: session table is full.
     pub conntrack_table_full: AtomicU64,
+    /// SRv6: packet dropped during SRv6 processing.
+    pub srv6_drop: AtomicU64,
 }
 
 // ── ARP hold queue counters ────────────────────────────────────────────
@@ -376,6 +381,7 @@ impl Observer {
             DropReason::ArpUnresolved => &self.drops.arp_unresolved,
             DropReason::ParseError => &self.drops.parse_error,
             DropReason::ConntrackTableFull => &self.drops.conntrack_table_full,
+            DropReason::Srv6Drop => &self.drops.srv6_drop,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -414,6 +420,7 @@ impl Observer {
                 arp_unresolved: self.drops.arp_unresolved.load(Ordering::Relaxed),
                 parse_error: self.drops.parse_error.load(Ordering::Relaxed),
                 conntrack_table_full: self.drops.conntrack_table_full.load(Ordering::Relaxed),
+                srv6_drop: self.drops.srv6_drop.load(Ordering::Relaxed),
             },
             conntrack: ConntrackSnapshot {
                 conntrack_new: self.conntrack.conntrack_new.load(Ordering::Relaxed),
@@ -521,6 +528,8 @@ pub struct DropSnapshot {
     pub parse_error: u64,
     /// Conntrack: table full.
     pub conntrack_table_full: u64,
+    /// SRv6: drop.
+    pub srv6_drop: u64,
 }
 
 impl fmt::Display for ObserverSnapshot {
