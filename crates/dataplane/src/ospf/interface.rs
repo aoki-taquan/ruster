@@ -136,7 +136,8 @@ impl OspfInterface {
 
     /// Check if it is time to send a Hello.
     pub fn should_send_hello(&self, now_secs: u64) -> bool {
-        self.is_up() && (now_secs - self.last_hello_sent >= self.hello_interval as u64)
+        self.is_up()
+            && (now_secs.saturating_sub(self.last_hello_sent) >= self.hello_interval as u64)
     }
 
     /// Process a received Hello packet.

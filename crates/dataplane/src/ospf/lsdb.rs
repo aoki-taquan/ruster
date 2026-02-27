@@ -153,7 +153,11 @@ impl Lsdb {
 
         self.entries.retain(|key, entry| {
             let elapsed = now_secs.saturating_sub(entry.installed_at);
-            let current_age = entry.lsa.header.ls_age.saturating_add(elapsed as u16);
+            let current_age = if elapsed >= MAX_AGE as u64 {
+                MAX_AGE
+            } else {
+                entry.lsa.header.ls_age.saturating_add(elapsed as u16)
+            };
 
             if current_age >= MAX_AGE {
                 flushed.push(key.clone());
@@ -197,7 +201,8 @@ fn is_newer(new_header: &LsaHeader, existing_header: &LsaHeader) -> bool {
     if new_header.ls_sequence_number != existing_header.ls_sequence_number {
         // Sequence numbers are signed 32-bit integers with initial
         // value 0x80000001.  Higher unsigned value means newer.
-        return new_header.ls_sequence_number > existing_header.ls_sequence_number;
+        return (new_header.ls_sequence_number as i32)
+            > (existing_header.ls_sequence_number as i32);
     }
 
     // 2. If only one has MaxAge, that one is newer (for flushing).
