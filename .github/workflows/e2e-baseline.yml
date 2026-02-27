@@ -1,11 +1,12 @@
 # E2E Baseline — Required CI gate for v0.1
 #
-# Validates L2 (ARP, MAC forwarding) and L3 (IP routing) connectivity
-# using containerlab topology. This job MUST pass for PRs to merge.
+# Validates L2 (ARP, MAC forwarding), L3 (IP routing), NAT, Firewall,
+# and SRv6 connectivity using containerlab topology.
+# This job MUST pass for PRs to merge.
 #
 # See docs/ci-gates.md for gate definitions and promotion process.
 
-name: E2E Baseline (L2/L3 — required)
+name: E2E Baseline (L2/L3/NAT/FW/SRv6 — required)
 
 on:
   push:
@@ -19,7 +20,7 @@ env:
 
 jobs:
   containerlab-e2e-baseline:
-    name: E2E Baseline (L2 + L3)
+    name: E2E Baseline (L2/L3/NAT/FW/SRv6)
     runs-on: [self-hosted, linux, kvm]
     timeout-minutes: 30
     env:
@@ -43,8 +44,8 @@ jobs:
       - name: Verify ruster is running
         run: bash tests/containerlab/scripts/check-ruster.sh
 
-      - name: Run E2E tests (L2 + L3)
-        run: E2E_SUITES=l2,l3 bash tests/containerlab/scripts/run-all.sh
+      - name: Run E2E tests (L2/L3/NAT/FW/SRv6)
+        run: E2E_SUITES=l2,l3,nat,fw,srv6 bash tests/containerlab/scripts/run-all.sh
 
       - name: Collect logs on failure
         if: failure()
