@@ -36,10 +36,13 @@ const MAX_BURST_SIZE: usize = 32;
 ///
 /// When compiled **with** the `dpdk` feature, the struct wraps an
 /// initialised [`DpdkContext`] and performs real poll-mode I/O.
+#[derive(Debug)]
 pub struct DpdkPacketIo {
     /// Mapping from logical interface name to DPDK port ID.
+    #[allow(dead_code)]
     port_map: HashMap<String, u16>,
     /// Ordered list of interface names for round-robin RX polling.
+    #[allow(dead_code)]
     rx_ifaces: Vec<String>,
     /// Retained DPDK context (mempool + port handles).
     #[allow(dead_code)]
@@ -66,10 +69,7 @@ impl DpdkPacketIo {
     /// * `port_configs` - The port configurations used to build the
     ///   logical-name-to-port-id mapping.
     #[cfg(not(feature = "dpdk"))]
-    pub fn new(
-        _context: DpdkContext,
-        _port_configs: &[PortConfig],
-    ) -> Result<Self, DpdkError> {
+    pub fn new(_context: DpdkContext, _port_configs: &[PortConfig]) -> Result<Self, DpdkError> {
         Err(DpdkError::NotAvailable(
             "ruster was compiled without the 'dpdk' feature; \
              rebuild with `cargo build --features dpdk` to enable \
@@ -83,10 +83,7 @@ impl DpdkPacketIo {
     /// Maps each port handle in the context to its logical interface name
     /// for use in [`PacketIo::rx`] and [`PacketIo::tx`].
     #[cfg(feature = "dpdk")]
-    pub fn new(
-        context: DpdkContext,
-        _port_configs: &[PortConfig],
-    ) -> Result<Self, DpdkError> {
+    pub fn new(context: DpdkContext, _port_configs: &[PortConfig]) -> Result<Self, DpdkError> {
         // NOTE: port_configs is currently unused because the port map is built
         // from context.ports (which are already filtered by init_dpdk).
         // When real DPDK is integrated, port_configs may be used for additional

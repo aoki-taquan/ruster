@@ -135,7 +135,9 @@ fn main() {
             // TODO(#142): Replace MockDpdkBackend with real DPDK EAL initialization
             // when dpdk-sys bindings are available.
             eprintln!("  WARNING: DPDK backend selected but real DPDK is not yet integrated.");
-            eprintln!("           Using mock DPDK backend. Packets will NOT be processed via DPDK.");
+            eprintln!(
+                "           Using mock DPDK backend. Packets will NOT be processed via DPDK."
+            );
 
             // Build DpdkConfig from router.toml settings.
             let dpdk_config = dpdk::config::DpdkConfig {
