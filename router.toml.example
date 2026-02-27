@@ -3,6 +3,10 @@ schema = "ruster/v0.1"
 hostname = "ruster-lab"
 
 [dataplane]
+# Backend selection: "dpdk", "afpacket", or "mock".
+#   dpdk     — DPDK poll-mode driver (requires --features dpdk at build time)
+#   afpacket — Linux AF_PACKET raw sockets (Linux only, requires CAP_NET_RAW)
+#   mock     — No real I/O (for testing / development)
 backend = "dpdk"
 lcore_list = "0-3"
 memory_mb = 2048
