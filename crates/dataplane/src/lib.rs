@@ -312,8 +312,7 @@ impl Dataplane {
                                         );
                                         continue;
                                     }
-                                    arp::ArpAction::Reply { .. }
-                                    | arp::ArpAction::Update => {
+                                    arp::ArpAction::Reply { .. } | arp::ArpAction::Update => {
                                         // Unexpected from resolve(); log and drop.
                                         eprintln!(
                                             "unexpected ArpAction from resolve() for {}",
@@ -465,8 +464,7 @@ impl Dataplane {
                 };
                 if should_send {
                     if let Some((sender_mac, sender_ip)) = if_info {
-                        let arp_pkt =
-                            arp::build_arp_request(sender_mac, sender_ip, target_ip);
+                        let arp_pkt = arp::build_arp_request(sender_mac, sender_ip, target_ip);
                         let arp_raw = io::RawPacket {
                             ingress_iface: egress_iface.clone(),
                             data: arp_pkt,
