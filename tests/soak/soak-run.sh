@@ -44,7 +44,6 @@ SOAK_OUTPUT_DIR="${SOAK_OUTPUT_DIR:-${SCRIPT_DIR}/results/${TIMESTAMP}}"
 LATEST_LINK="${SCRIPT_DIR}/results/latest"
 
 METRICS_FILE="${SOAK_OUTPUT_DIR}/metrics.tsv"
-TRAFFIC_LOG="${SOAK_OUTPUT_DIR}/traffic.log"
 RUSTER_LOG="${SOAK_OUTPUT_DIR}/ruster.log"
 PACKET_STATS_FILE="${SOAK_OUTPUT_DIR}/packet-stats.tsv"
 

@@ -156,7 +156,7 @@ soak-strict:
 	CLAB_TOPO_NAME=$(CLAB_SOAK_NAME) bash tests/soak/soak-run.sh || \
 		(containerlab destroy --name $(CLAB_SOAK_NAME) --cleanup; exit 1)
 	@echo "=== Generating soak report ==="
-	bash tests/soak/soak-report.sh tests/soak/results/latest || true
+	CLAB_TOPO_NAME=$(CLAB_SOAK_NAME) bash tests/soak/soak-report.sh tests/soak/results/latest || true
 	@echo "=== Destroying topology ==="
 	containerlab destroy --name $(CLAB_SOAK_NAME) --cleanup
 
