@@ -447,6 +447,8 @@ fn initial_session_state(meta: &packet::PacketMeta) -> SessionState {
         Some(L4Info::Tcp(_)) => SessionState::Tcp(TcpState::SynSent),
         Some(L4Info::Udp(_)) => SessionState::Udp,
         Some(L4Info::Icmp(_)) => SessionState::Icmp,
+        // ICMPv6 conntrack uses the same Icmp state (not yet fully tracked).
+        Some(L4Info::Icmpv6(_)) => SessionState::Icmp,
         None => SessionState::Udp, // fallback, should not happen for tracked packets
     }
 }
@@ -524,7 +526,9 @@ fn process_ipv6_packet(
     // Step 5: Firewall check.
     let src_zone = zone_resolver.resolve(&raw_pkt.ingress_iface);
     let dst_zone = zone_resolver.resolve(&out_ifname);
-    let fw_ctx = FwContext::from_packet(meta, FwChain::Forward, src_zone, dst_zone, conntrack);
+    // IPv6 conntrack is not yet implemented — all IPv6 packets are
+    // treated as new / untracked sessions for firewall purposes.
+    let fw_ctx = FwContext::from_packet(meta, FwChain::Forward, src_zone, dst_zone, conntrack, true);
     let verdict = firewall.evaluate(&fw_ctx);
 
     match verdict {
