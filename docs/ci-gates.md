@@ -15,7 +15,7 @@ development). Both run on every push to `main` and on pull requests targeting
 | Workflow file | Name | Status | Suites |
 |---------------|------|--------|--------|
 | `e2e-baseline.yml` | E2E Baseline (L2/L3 -- required) | **Required** | `l2`, `l3` |
-| `e2e-strict.yml` | E2E Strict (NAT/FW -- informational) | Informational | `nat`, `fw` |
+| `e2e-strict.yml` | E2E Strict (dataplane-only -- required) | **Required** | `dataplane` |
 
 In addition to E2E, the following workflows also run:
 
@@ -49,58 +49,42 @@ router behavior.
 **Environment variable:** `CLAB_TOPO_NAME=ruster-e2e-baseline-${{ github.run_id }}`
 ensures unique topology names for concurrent runs.
 
-### E2E Strict (`e2e-strict.yml`) -- INFORMATIONAL
+### E2E Strict (`e2e-strict.yml`) -- REQUIRED
 
 **What it checks:**
 
-- NAT: Source NAT (SNAT/masquerade) for LAN-to-WAN traffic, correct
-  translation and de-translation of addresses/ports.
-- FW: Stateful firewall rules, connection tracking, default-deny policies.
+- Dataplane-only forwarding: Deploys a strict containerlab topology where
+  kernel `ip_forward=0` on all nodes. Traffic can ONLY pass through the
+  ruster dataplane.
+- Three-phase validation:
+  1. Without ruster: ping fails (no kernel bypass)
+  2. With ruster: ping succeeds (dataplane forwarding works)
+  3. Without ruster: ping fails again (confirms ruster was forwarding)
 
-**Why it is informational (expected-fail in v0.1):**
+**Why it is required:**
 
-v0.1 uses `MockPacketIo` for the dataplane, which does not perform real
-packet manipulation. NAT and firewall require a real dataplane to rewrite
-headers and track connections. These tests are expected to fail until the
-dataplane is implemented with real packet I/O (targeted for v0.2+).
-
-The workflow uses `continue-on-error: true` at the job level so failures
-do not block PR merges or mark the overall CI status as failed.
+The strict test validates that ruster's dataplane can independently forward
+packets without relying on kernel forwarding. This was promoted from
+informational to required after demonstrating 4+ consecutive passing runs
+on `main`.
 
 **Environment variable:** `CLAB_TOPO_NAME=ruster-e2e-strict-${{ github.run_id }}`
 ensures unique topology names for concurrent runs.
 
-**Current expected-fail status:**
-
-- `nat` suite: Expected to fail (MockPacketIo cannot rewrite packet headers)
-- `fw` suite: Expected to fail (MockPacketIo cannot enforce firewall rules)
-
 ---
 
-## Promoting Strict Tests to Required
+## Promotion History
 
-When the real dataplane is implemented and NAT/FW tests pass reliably, follow
-these steps to promote the strict gate to required:
+### E2E Strict: Informational → Required (2026-03-01)
 
-1. **Verify stability.** Confirm that `e2e-strict.yml` passes consistently
-   on `main` for at least 5 consecutive runs.
+The E2E Strict gate was promoted from informational to required after
+verifying 4+ consecutive passing runs on `main`. Changes made:
 
-2. **Remove `continue-on-error`.** In `e2e-strict.yml`, delete the
-   `continue-on-error: true` line from the job definition.
-
-3. **Add to branch protection.** In the GitHub repository settings under
-   *Branches > Branch protection rules > main*, add the strict job name
-   (`E2E Strict (NAT + FW -- expected-fail in v0.1)`) to the list of
-   required status checks.
-
-4. **Update this document.** Change the strict gate status from
-   "Informational" to "Required" in the table above and remove the
-   expected-fail notes.
-
-5. **Rename the workflow.** Update the `name` fields to remove
-   "expected-fail" and "informational" labels. Suggested:
-   - Workflow name: `E2E Strict (NAT/FW -- required)`
-   - Job name: `E2E Strict (NAT + FW)`
+1. Removed `continue-on-error: true` from the job definition.
+2. Renamed workflow from "informational" to "required".
+3. Updated this document to reflect the new status.
+4. **Remaining:** Add the strict job name to branch protection rules in
+   GitHub repository settings.
 
 ---
 
