@@ -1,6 +1,6 @@
 # RFC-DEVIATION Registry
-# Generated: 2026-03-01T15:45:04Z
-# Total deviations: 25
+# Generated: 2026-03-01T15:46:03Z
+# Total deviations: 24
 #
 file	line	reason	impact	issue	plan
 ./crates/dataplane/src/bgp/fsm.rs	22	minimal implementation omits Active state and passive listen	cannot accept incoming BGP connections from peers	#158	add passive listen and Active state in v0.3
@@ -23,7 +23,6 @@ file	line	reason	impact	issue	plan
 ./crates/dataplane/src/ospf/neighbor.rs	176	We always form adjacency (no DR election).	On broadcast networks with many routers, all	#157	Implement DR election in a future version.
 ./crates/dataplane/src/ospf/packet.rs	745	Authentication is not implemented; we zero the auth field	Interop with routers requiring MD5/simple auth will fail.	#157	Add authentication support in a future version.
 ./crates/dataplane/src/ospf/spf.rs	83	Network-LSAs and transit network SPF are simplified.	Transit networks with DR will not be optimally routed.	#157	Add full Network-LSA SPF processing in a future version.
-./crates/dataplane/src/pipeline.rs	796	ICMPv6 Time Exceeded not yet implemented	senders will not be notified of hop limit expiry via ICMPv6	#159	v0.2 で ICMPv6 error generation を実装
 ./crates/dataplane/src/srv6/actions.rs	69	Unknown actions default to End for forward-compat	Unsupported actions will behave as basic endpoint	#160	v0.2 で全 RFC 8986 actions をサポート
 ./crates/dataplane/src/srv6/mod.rs	255	When SL==0, RFC says process upper-layer header; we drop for simplicity	Packets reaching final SID with SL==0 at an End node are dropped	#160	v0.2 で upper-layer processing を実装
 ./crates/dataplane/src/srv6/srh.rs	131	We reject SRH with TLVs for simplicity in v0.1	Packets with SRH TLVs will be dropped	#160	v0.2 で SRH TLV parsing を実装

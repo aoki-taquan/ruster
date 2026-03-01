@@ -314,6 +314,16 @@ impl NdEngine {
             .any(|info| info.ipv6_addrs.contains(ipv6))
     }
 
+    /// Return the router's first IPv6 address for the given interface.
+    ///
+    /// Used as the source IPv6 address for ICMPv6 error messages generated
+    /// by the router in response to packets received on this interface.
+    pub fn local_ipv6_for_iface(&self, ifname: &str) -> Option<[u8; 16]> {
+        self.interfaces
+            .get(ifname)
+            .and_then(|info| info.ipv6_addrs.first().copied())
+    }
+
     // ── Private helpers ────────────────────────────────────────────────
 
     /// Handle Neighbor Solicitation.
