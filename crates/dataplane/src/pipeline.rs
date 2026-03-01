@@ -35,6 +35,76 @@ use crate::srv6::{Srv6Decision, Srv6Engine};
 
 use ruster_config::model::{FirewallZone, InterfaceConfig, InterfaceZone};
 
+// ── Interface index ─────────────────────────────────────────────────
+
+/// Numeric interface index used in [`PipelineResult`] to avoid
+/// per-packet `String` allocations on the hot path.
+///
+/// The index is assigned at dataplane init time and is stable for the
+/// lifetime of the process.
+pub type IfIndex = u16;
+
+/// Sentinel value returned when a name cannot be mapped.
+pub const IF_INDEX_UNKNOWN: IfIndex = IfIndex::MAX;
+
+/// Bidirectional mapping between interface names and numeric indices.
+///
+/// Built once during dataplane init and shared (read-only) by all
+/// workers.  The pipeline converts engine-returned `String` names to
+/// `IfIndex` values; the worker run loop converts them back when needed
+/// for I/O and observability calls.
+#[derive(Debug, Clone)]
+pub struct IfIndexMap {
+    name_to_idx: HashMap<String, IfIndex>,
+    idx_to_name: Vec<String>,
+}
+
+impl IfIndexMap {
+    /// Build the map from a list of interface names.
+    ///
+    /// Indices are assigned in the order of the input slice, starting at 0.
+    pub fn from_names(names: &[String]) -> Self {
+        let name_to_idx: HashMap<String, IfIndex> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.clone(), i as IfIndex))
+            .collect();
+        let idx_to_name: Vec<String> = names.to_vec();
+        Self {
+            name_to_idx,
+            idx_to_name,
+        }
+    }
+
+    /// Look up the index for an interface name.
+    ///
+    /// Returns [`IF_INDEX_UNKNOWN`] if the name is not in the map.
+    #[inline]
+    pub fn get_index(&self, name: &str) -> IfIndex {
+        self.name_to_idx
+            .get(name)
+            .copied()
+            .unwrap_or(IF_INDEX_UNKNOWN)
+    }
+
+    /// Look up the name for an interface index.
+    ///
+    /// Returns `"?"` if the index is out of range.
+    #[inline]
+    pub fn get_name(&self, idx: IfIndex) -> &str {
+        self.idx_to_name
+            .get(idx as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("?")
+    }
+
+    /// Resolve multiple names to indices.
+    #[inline]
+    pub fn get_indices(&self, names: &[String]) -> Vec<IfIndex> {
+        names.iter().map(|n| self.get_index(n)).collect()
+    }
+}
+
 // ── Zone resolver ─────────────────────────────────────────────────
 
 /// Maps interface names to their firewall zones.
@@ -69,12 +139,16 @@ impl ZoneResolver {
 // ── Pipeline result types ───────────────────────────────────────────
 
 /// Result of processing a single packet through the pipeline.
+///
+/// Interface references use [`IfIndex`] (a `u16`) rather than `String`
+/// to avoid per-packet heap allocations on the hot path.  Use
+/// [`IfIndexMap::get_name`] to resolve an index back to a name.
 #[derive(Debug)]
 pub enum PipelineResult {
     /// Packet should be forwarded out the given interface.
     Forward {
-        /// Name of the egress interface.
-        egress_iface: String,
+        /// Numeric index of the egress interface.
+        egress_ifindex: IfIndex,
         /// New TTL after L3 decrement (Some for L3 forwarded packets, None for L2-only).
         new_ttl: Option<u8>,
         /// Next-hop IPv4 address (Some for L3 forwarded packets, None for L2-only).
@@ -88,8 +162,8 @@ pub enum PipelineResult {
     /// IPv6 forwarding uses a 128-bit next-hop address and hop-limit
     /// decrement (no header checksum to update).
     ForwardV6 {
-        /// Name of the egress interface.
-        egress_iface: String,
+        /// Numeric index of the egress interface.
+        egress_ifindex: IfIndex,
         /// New Hop Limit after decrement.
         new_hop_limit: u8,
         /// Next-hop IPv6 address.
@@ -125,8 +199,8 @@ pub enum PipelineResult {
     /// Packet should be flooded to all listed interfaces (L2 unknown
     /// unicast or broadcast within a bridge domain).
     Flood {
-        /// Names of the egress interfaces (excludes the ingress port).
-        egress_ifaces: Vec<String>,
+        /// Numeric indices of the egress interfaces (excludes the ingress port).
+        egress_ifindices: Vec<IfIndex>,
     },
     /// Packet was dropped.
     Drop {
@@ -144,8 +218,8 @@ pub enum PipelineResult {
     /// The run loop is responsible for constructing the NA packet from
     /// the reply info and transmitting it on the specified interface.
     NdReply {
-        /// Interface to send the reply on.
-        egress_iface: String,
+        /// Numeric index of the interface to send the reply on.
+        egress_ifindex: IfIndex,
         /// NA reply fields needed to build the response packet.
         reply_info: crate::nd::NaReplyInfo,
     },
@@ -254,6 +328,7 @@ pub fn process_packet(
     nat: &mut NatEngine,
     zone_resolver: &ZoneResolver,
     iface_macs: &std::collections::HashMap<String, [u8; 6]>,
+    ifindex_map: &IfIndexMap,
 ) -> PipelineResult {
     process_packet_v6(
         raw_pkt,
@@ -267,6 +342,7 @@ pub fn process_packet(
         None,
         None,
         None,
+        ifindex_map,
     )
 }
 
@@ -296,6 +372,7 @@ pub fn process_packet_v6(
     nd: Option<&mut NdEngine>,
     ipv6_routes: Option<&Ipv6RouteTable>,
     srv6: Option<&Srv6Engine>,
+    ifindex_map: &IfIndexMap,
 ) -> PipelineResult {
     // Step 1: Parse raw bytes.
     let mut meta = match packet::parse_packet(&raw_pkt.data, &raw_pkt.ingress_iface) {
@@ -326,7 +403,7 @@ pub fn process_packet_v6(
             _ => false,
         };
         let is_router_mac = iface_macs
-            .get(&meta.in_ifname)
+            .get(&raw_pkt.ingress_iface)
             .is_some_and(|our_mac| meta.l2.dst_mac == *our_mac);
         let is_local = is_local_ip || is_router_mac;
 
@@ -334,13 +411,13 @@ pub fn process_packet_v6(
             // Pure L2 forwarding — do not enter L3.
             return match l2_decision {
                 L2Decision::Unicast { out_ifname } => PipelineResult::Forward {
-                    egress_iface: out_ifname,
+                    egress_ifindex: ifindex_map.get_index(&out_ifname),
                     new_ttl: None,
                     next_hop: None,
                     nat: NatResult::None,
                 },
                 L2Decision::Flood { out_ifnames } => PipelineResult::Flood {
-                    egress_ifaces: out_ifnames,
+                    egress_ifindices: ifindex_map.get_indices(&out_ifnames),
                 },
                 L2Decision::Drop => PipelineResult::Drop {
                     reason: DropReason::L2Drop,
@@ -368,6 +445,7 @@ pub fn process_packet_v6(
                 conntrack,
                 zone_resolver,
                 srv6,
+                ifindex_map,
             );
         }
         // No IPv6 engines -> fall through to IPv4 L3 which will return NotIpv4.
@@ -520,7 +598,7 @@ pub fn process_packet_v6(
                     };
 
                     PipelineResult::Forward {
-                        egress_iface: out_ifname,
+                        egress_ifindex: ifindex_map.get_index(&out_ifname),
                         new_ttl: Some(new_ttl),
                         next_hop: Some(next_hop),
                         nat: nat_result,
@@ -654,6 +732,7 @@ fn process_ipv6_packet(
     conntrack: &ConntrackEngine,
     zone_resolver: &ZoneResolver,
     srv6: Option<&Srv6Engine>,
+    ifindex_map: &IfIndexMap,
 ) -> PipelineResult {
     // Step 1: Check if this is an ND message.
     if let Some(packet::L4Info::Icmpv6(ref icmpv6)) = meta.l4 {
@@ -661,7 +740,7 @@ fn process_ipv6_packet(
             let nd_action = nd_engine.process_nd(meta);
             return match nd_action {
                 NdAction::Reply { out_ifname, packet } => PipelineResult::NdReply {
-                    egress_iface: out_ifname,
+                    egress_ifindex: ifindex_map.get_index(&out_ifname),
                     reply_info: packet,
                 },
                 // NA updates, drops, or other ND actions are consumed.
@@ -769,7 +848,7 @@ fn process_ipv6_packet(
                     return match verdict {
                         FwVerdict::Accept | FwVerdict::AcceptRule { .. } => {
                             PipelineResult::ForwardV6 {
-                                egress_iface: out_ifname,
+                                egress_ifindex: ifindex_map.get_index(&out_ifname),
                                 new_hop_limit,
                                 next_hop_v6,
                                 srv6_new_da: Some(new_da),
@@ -872,7 +951,7 @@ fn process_ipv6_packet(
 
     match verdict {
         FwVerdict::Accept | FwVerdict::AcceptRule { .. } => PipelineResult::ForwardV6 {
-            egress_iface: out_ifname,
+            egress_ifindex: ifindex_map.get_index(&out_ifname),
             new_hop_limit,
             next_hop_v6,
             srv6_new_da: None,
@@ -1018,6 +1097,16 @@ mod tests {
         ZoneResolver::from_config(&make_interfaces())
     }
 
+    fn make_ifindex_map() -> IfIndexMap {
+        IfIndexMap::from_names(&[
+            "wan0".to_string(),
+            "lan0".to_string(),
+            "eth0".to_string(),
+            "eth1".to_string(),
+            "eth2".to_string(),
+        ])
+    }
+
     fn make_nat_disabled() -> NatEngine {
         NatEngine::from_config(
             &NatConfig {
@@ -1121,10 +1210,13 @@ mod tests {
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let ifm = make_ifindex_map();
+        let result = process_packet(
+            &raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im, &ifm,
+        );
         match result {
-            PipelineResult::Forward { egress_iface, .. } => {
-                assert_eq!(egress_iface, "wan0");
+            PipelineResult::Forward { egress_ifindex, .. } => {
+                assert_eq!(ifm.get_name(egress_ifindex), "wan0");
             }
             other => panic!("expected Forward, got {:?}", other),
         }
@@ -1146,7 +1238,17 @@ mod tests {
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::ParseError);
@@ -1190,7 +1292,17 @@ mod tests {
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3NoRoute);
@@ -1222,7 +1334,17 @@ mod tests {
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -1254,7 +1376,17 @@ mod tests {
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         assert!(matches!(result, PipelineResult::Consumed));
     }
 
@@ -1281,7 +1413,17 @@ mod tests {
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -1322,7 +1464,17 @@ mod tests {
         let zr = make_zone_resolver();
         let im = std::collections::HashMap::new();
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3NotIpv4);
@@ -1352,7 +1504,17 @@ mod tests {
             ingress_iface: "eth0".to_string(),
             data: vec![0x00; 5],
         };
-        match process_packet(&short_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im) {
+        match process_packet(
+            &short_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        ) {
             PipelineResult::Drop {
                 reason: DropReason::ParseError,
                 ..
@@ -1366,7 +1528,17 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: ttl_data,
         };
-        match process_packet(&ttl_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im) {
+        match process_packet(
+            &ttl_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        ) {
             PipelineResult::Drop {
                 reason: DropReason::L3TtlExpired,
                 ..
@@ -1380,7 +1552,17 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: fwd_data,
         };
-        match process_packet(&fwd_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im) {
+        match process_packet(
+            &fwd_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        ) {
             PipelineResult::Forward { .. } => forwards += 1,
             _ => {}
         }
@@ -1438,10 +1620,13 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let ifm = make_ifindex_map();
+        let result = process_packet(
+            &raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im, &ifm,
+        );
         match result {
-            PipelineResult::Forward { egress_iface, .. } => {
-                assert_eq!(egress_iface, "wan0");
+            PipelineResult::Forward { egress_ifindex, .. } => {
+                assert_eq!(ifm.get_name(egress_ifindex), "wan0");
             }
             other => panic!(
                 "expected Forward (Lan->Wan should be accepted), got {:?}",
@@ -1497,7 +1682,17 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -1542,7 +1737,17 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -1597,7 +1802,17 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3NoRoute);
@@ -1657,7 +1872,17 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3TtlExpired);
@@ -1685,7 +1910,17 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::ParseError);
@@ -1717,7 +1952,17 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::FirewallDrop);
@@ -1757,7 +2002,17 @@ mod tests {
         };
 
         let mut l2 = make_l2_engine_empty();
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         match result {
             PipelineResult::Drop { reason, icmp_reply } => {
                 assert_eq!(reason, DropReason::L3NotIpv4);
@@ -1895,7 +2150,17 @@ mod tests {
             [192, 168, 1, 50],
             [192, 168, 1, 60],
         );
-        let _ = process_packet(&learn_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let _ = process_packet(
+            &learn_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
 
         // Step 2: Send from MAC_HOST_A on eth0 to MAC_HOST_B -> unicast to eth1.
         let pkt = make_l2_raw_packet(
@@ -1905,11 +2170,12 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 50],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let ifm = make_ifindex_map();
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im, &ifm);
 
         match result {
-            PipelineResult::Forward { egress_iface, .. } => {
-                assert_eq!(egress_iface, "eth1");
+            PipelineResult::Forward { egress_ifindex, .. } => {
+                assert_eq!(ifm.get_name(egress_ifindex), "eth1");
             }
             other => panic!("expected Forward to eth1, got {:?}", other),
         }
@@ -1933,17 +2199,16 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 50],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let ifm = make_ifindex_map();
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im, &ifm);
 
         match result {
-            PipelineResult::Flood { egress_ifaces } => {
-                assert!(
-                    !egress_ifaces.contains(&"eth0".to_string()),
-                    "must not include ingress"
-                );
-                assert!(egress_ifaces.contains(&"eth1".to_string()));
-                assert!(egress_ifaces.contains(&"eth2".to_string()));
-                assert_eq!(egress_ifaces.len(), 2);
+            PipelineResult::Flood { egress_ifindices } => {
+                let names: Vec<&str> = egress_ifindices.iter().map(|i| ifm.get_name(*i)).collect();
+                assert!(!names.contains(&"eth0"), "must not include ingress");
+                assert!(names.contains(&"eth1"));
+                assert!(names.contains(&"eth2"));
+                assert_eq!(names.len(), 2);
             }
             other => panic!("expected Flood, got {:?}", other),
         }
@@ -1967,17 +2232,16 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 255],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let ifm = make_ifindex_map();
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im, &ifm);
 
         match result {
-            PipelineResult::Flood { egress_ifaces } => {
-                assert!(
-                    !egress_ifaces.contains(&"eth0".to_string()),
-                    "must not include ingress"
-                );
-                assert!(egress_ifaces.contains(&"eth1".to_string()));
-                assert!(egress_ifaces.contains(&"eth2".to_string()));
-                assert_eq!(egress_ifaces.len(), 2);
+            PipelineResult::Flood { egress_ifindices } => {
+                let names: Vec<&str> = egress_ifindices.iter().map(|i| ifm.get_name(*i)).collect();
+                assert!(!names.contains(&"eth0"), "must not include ingress");
+                assert!(names.contains(&"eth1"));
+                assert!(names.contains(&"eth2"));
+                assert_eq!(names.len(), 2);
             }
             other => panic!("expected Flood for broadcast, got {:?}", other),
         }
@@ -2004,7 +2268,17 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 50],
         );
-        let _ = process_packet(&learn_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let _ = process_packet(
+            &learn_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
 
         // Step 2: Send to MAC_HOST_A from eth1 -> should unicast to eth0.
         let pkt = make_l2_raw_packet(
@@ -2014,11 +2288,12 @@ mod tests {
             [192, 168, 1, 50],
             [192, 168, 1, 60],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let ifm = make_ifindex_map();
+        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im, &ifm);
 
         match result {
-            PipelineResult::Forward { egress_iface, .. } => {
-                assert_eq!(egress_iface, "eth0");
+            PipelineResult::Forward { egress_ifindex, .. } => {
+                assert_eq!(ifm.get_name(egress_ifindex), "eth0");
             }
             other => panic!("expected Forward to eth0, got {:?}", other),
         }
@@ -2044,7 +2319,17 @@ mod tests {
             [192, 168, 1, 60],
             [192, 168, 1, 1],
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
 
         // The packet's dst IP (192.168.1.1) is a local IP on eth0,
         // so L3 should handle it as LocalDelivery -> Consumed.
@@ -2075,7 +2360,17 @@ mod tests {
             [10, 0, 0, 5],
             [192, 168, 1, 1], // local IP -> Consumed
         );
-        let result = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
 
         assert!(
             matches!(result, PipelineResult::Consumed),
@@ -2152,7 +2447,17 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         assert!(matches!(result, PipelineResult::Forward { .. }));
 
         // A conntrack session should have been created.
@@ -2176,14 +2481,34 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: data.clone(),
         };
-        let _ = process_packet(&pkt1, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let _ = process_packet(
+            &pkt1,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         assert_eq!(ct.session_count(), 1);
 
         let pkt2 = RawPacket {
             ingress_iface: "lan0".to_string(),
             data,
         };
-        let _ = process_packet(&pkt2, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let _ = process_packet(
+            &pkt2,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         // Should still be 1 session (reused).
         assert_eq!(ct.session_count(), 1);
     }
@@ -2213,7 +2538,17 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: syn_data,
         };
-        let _ = process_packet(&syn_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let _ = process_packet(
+            &syn_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         assert_eq!(ct.session_count(), 1);
 
         // SYN-ACK: WAN 8.8.8.8:80 -> LAN 192.168.1.100:49152
@@ -2232,7 +2567,17 @@ mod tests {
             ingress_iface: "wan0".to_string(),
             data: synack_data,
         };
-        let _ = process_packet(&synack_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let _ = process_packet(
+            &synack_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
 
         // Should still be 1 session (reverse matched the existing one).
         assert_eq!(ct.session_count(), 1);
@@ -2271,6 +2616,7 @@ mod tests {
             &mut nat,
             &zr,
             &im,
+            &make_ifindex_map(),
         );
 
         let key = SessionKey {
@@ -2297,6 +2643,7 @@ mod tests {
             &mut nat,
             &zr,
             &im,
+            &make_ifindex_map(),
         );
 
         let session = ct
@@ -2320,6 +2667,7 @@ mod tests {
             &mut nat,
             &zr,
             &im,
+            &make_ifindex_map(),
         );
 
         let session = ct
@@ -2343,6 +2691,7 @@ mod tests {
             &mut nat,
             &zr,
             &im,
+            &make_ifindex_map(),
         );
 
         let session = ct
@@ -2374,7 +2723,17 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: data1,
         };
-        let result1 = process_packet(&pkt1, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result1 = process_packet(
+            &pkt1,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         assert!(matches!(result1, PipelineResult::Forward { .. }));
         assert_eq!(ct.session_count(), 1);
 
@@ -2384,7 +2743,17 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data: data2,
         };
-        let result2 = process_packet(&pkt2, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result2 = process_packet(
+            &pkt2,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         assert!(
             matches!(
                 result2,
@@ -2424,7 +2793,17 @@ mod tests {
             ingress_iface: "lan0".to_string(),
             data,
         };
-        let _ = process_packet(&pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let _ = process_packet(
+            &pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         assert_eq!(ct.session_count(), 1);
 
         // Wait for session to expire.
@@ -2492,6 +2871,7 @@ mod tests {
             &mut nat,
             &zr,
             &im,
+            &make_ifindex_map(),
         );
         assert!(
             matches!(result1, PipelineResult::Forward { .. }),
@@ -2528,6 +2908,7 @@ mod tests {
             &mut nat,
             &zr,
             &im,
+            &make_ifindex_map(),
         );
         assert!(
             matches!(result2, PipelineResult::Forward { .. }),
@@ -2566,7 +2947,17 @@ mod tests {
             data,
         };
 
-        let _ = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let _ = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         assert_eq!(
             ct.session_count(),
             0,
@@ -2726,6 +3117,7 @@ mod tests {
             data,
         };
 
+        let ifm = make_ifindex_map();
         let result = process_packet_v6(
             &raw_pkt,
             &mut l2,
@@ -2738,14 +3130,15 @@ mod tests {
             Some(&mut nd),
             Some(&ipv6_routes),
             None,
+            &ifm,
         );
         match result {
             PipelineResult::ForwardV6 {
-                egress_iface,
+                egress_ifindex,
                 new_hop_limit,
                 ..
             } => {
-                assert_eq!(egress_iface, "wan0");
+                assert_eq!(ifm.get_name(egress_ifindex), "wan0");
                 assert_eq!(new_hop_limit, 63);
             }
             other => panic!("expected ForwardV6, got {:?}", other),
@@ -2796,6 +3189,7 @@ mod tests {
             Some(&mut nd),
             Some(&ipv6_routes),
             None,
+            &make_ifindex_map(),
         );
         assert!(
             matches!(result, PipelineResult::Consumed),
@@ -2848,6 +3242,7 @@ mod tests {
             Some(&mut nd),
             Some(&ipv6_routes),
             None,
+            &make_ifindex_map(),
         );
         match result {
             PipelineResult::Drop { reason, .. } => {
@@ -2913,6 +3308,7 @@ mod tests {
             Some(&mut nd),
             Some(&ipv6_routes),
             None,
+            &make_ifindex_map(),
         );
         match result {
             PipelineResult::Drop { reason, .. } => {
@@ -2992,6 +3388,7 @@ mod tests {
             Some(&mut nd),
             Some(&ipv6_routes),
             None,
+            &make_ifindex_map(),
         );
         assert!(
             matches!(
@@ -3034,7 +3431,17 @@ mod tests {
         };
 
         // Call with no IPv6 engines.
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let result = process_packet(
+            &raw_pkt,
+            &mut l2,
+            &l3,
+            &fw,
+            &mut ct,
+            &mut nat,
+            &zr,
+            &im,
+            &make_ifindex_map(),
+        );
         match result {
             PipelineResult::Drop { reason, .. } => {
                 assert_eq!(reason, DropReason::L3NotIpv4);
@@ -3161,14 +3568,19 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let ifm = make_ifindex_map();
+        let result = process_packet(
+            &raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im, &ifm,
+        );
         match result {
             PipelineResult::Forward {
-                egress_iface, nat, ..
+                egress_ifindex,
+                nat,
+                ..
             } => {
                 // DNAT should route the packet to the LAN (192.168.1.50 is on
                 // the 192.168.1.0/24 subnet -> out via lan0).
-                assert_eq!(egress_iface, "lan0");
+                assert_eq!(ifm.get_name(egress_ifindex), "lan0");
                 // The NAT result should carry the DNAT translation.
                 assert_eq!(
                     nat,
@@ -3215,12 +3627,17 @@ mod tests {
             data,
         };
 
-        let result = process_packet(&raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im);
+        let ifm = make_ifindex_map();
+        let result = process_packet(
+            &raw_pkt, &mut l2, &l3, &fw, &mut ct, &mut nat, &zr, &im, &ifm,
+        );
         match result {
             PipelineResult::Forward {
-                egress_iface, nat, ..
+                egress_ifindex,
+                nat,
+                ..
             } => {
-                assert_eq!(egress_iface, "wan0");
+                assert_eq!(ifm.get_name(egress_ifindex), "wan0");
                 // SNAT should translate src to the router's WAN IP.
                 match nat {
                     NatResult::Snat {
