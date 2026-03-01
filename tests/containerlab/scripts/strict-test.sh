@@ -21,6 +21,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/e2e-helpers.sh"
+
 TOPO_NAME="${CLAB_TOPO_NAME:-ruster-e2e-strict}"
 PREFIX="clab-${TOPO_NAME}"
 PING_COUNT="${STRICT_PING_COUNT:-3}"
@@ -75,15 +77,11 @@ info "  Topology: ${TOPO_NAME}"
 info "================================================================"
 info ""
 
-# Verify containers are running
-for node in ruster lan-host wan-host; do
-    STATE=$(docker inspect --format '{{.State.Status}}' "${PREFIX}-${node}" 2>/dev/null || echo "not_found")
-    if [ "$STATE" != "running" ]; then
-        error "Container ${PREFIX}-${node} is not running (state: ${STATE})"
-        exit 1
-    fi
-done
-info "All containers are running."
+# Wait for all containers to be ready (accept exec commands)
+if ! wait_all_containers_ready "$PREFIX" ruster lan-host wan-host; then
+    error "Containers failed readiness check. Cannot proceed."
+    exit 1
+fi
 
 # Run strict setup to harden the topology
 info "Running strict setup..."
@@ -103,15 +101,27 @@ info ""
 
 # Ensure ruster is NOT running
 run_on ruster bash -c "pkill -x ruster 2>/dev/null || true"
-sleep 2
 
-# Verify ruster is not running
-if run_on ruster pgrep -x ruster > /dev/null 2>&1; then
-    error "ruster is still running after pkill — cannot validate strict mode"
+# Wait for ruster to stop with retry loop
+RUSTER_STOPPED=false
+for i in $(seq 1 10); do
+    if ! run_on ruster pgrep -x ruster > /dev/null 2>&1; then
+        RUSTER_STOPPED=true
+        break
+    fi
+    if [ "$i" -eq 8 ]; then
+        info "SIGTERM not effective, sending SIGKILL..."
+        run_on ruster bash -c "pkill -9 -x ruster 2>/dev/null || true"
+    fi
+    sleep 0.5
+done
+
+if [ "$RUSTER_STOPPED" = true ]; then
+    report "phase1-ruster-stopped" "PASS"
+else
+    error "ruster is still running after pkill + SIGKILL — cannot validate strict mode"
     report "phase1-ruster-stopped" "FAIL"
     collect_diagnostics
-else
-    report "phase1-ruster-stopped" "PASS"
 fi
 
 # Verify kernel forwarding is disabled
@@ -146,17 +156,25 @@ info ""
 info "Starting ruster..."
 run_on ruster bash -c "nohup /usr/local/bin/ruster --config /etc/ruster/router.toml > /var/log/ruster.log 2>&1 &"
 
-# Wait for ruster to initialize
-info "Waiting ${SETTLE_TIME}s for ruster to initialize..."
-sleep "$SETTLE_TIME"
+# Wait for ruster to initialize — check process + run-loop log
+RUSTER_STARTED=false
+for i in $(seq 1 20); do
+    if run_on ruster pgrep -x ruster > /dev/null 2>&1; then
+        LOG=$(run_on ruster cat /var/log/ruster.log 2>/dev/null || echo "")
+        if echo "$LOG" | grep -q "running"; then
+            RUSTER_PID=$(run_on ruster pgrep -x ruster 2>/dev/null)
+            info "ruster is running (PID: ${RUSTER_PID}), run-loop confirmed"
+            RUSTER_STARTED=true
+            break
+        fi
+    fi
+    sleep 1
+done
 
-# Verify ruster started
-if run_on ruster pgrep -x ruster > /dev/null 2>&1; then
-    RUSTER_PID=$(run_on ruster pgrep -x ruster 2>/dev/null)
-    info "ruster is running (PID: ${RUSTER_PID})"
+if [ "$RUSTER_STARTED" = true ]; then
     report "phase2-ruster-started" "PASS"
 else
-    error "ruster failed to start"
+    error "ruster failed to start or run-loop not confirmed after 20s"
     info "ruster log:"
     run_on ruster cat /var/log/ruster.log 2>/dev/null | sed 's/^/    /' || true
     report "phase2-ruster-started" "FAIL"
@@ -164,10 +182,7 @@ else
 fi
 
 # ARP warmup: resolve ruster's MAC on client/server
-info "ARP warmup (resolving ruster's MAC addresses)..."
-run_on lan-host ping -c 1 -W 2 192.168.1.1 > /dev/null 2>&1 || true
-run_on wan-host ping -c 1 -W 2 10.0.0.1 > /dev/null 2>&1 || true
-sleep 2
+arp_warmup "$PREFIX"
 
 # Ping MUST succeed (ruster is forwarding)
 info "Testing cross-subnet ping (should SUCCEED)..."
@@ -202,23 +217,27 @@ info ""
 # Stop ruster
 info "Stopping ruster..."
 run_on ruster bash -c "pkill -x ruster 2>/dev/null || true"
-sleep "$SETTLE_TIME"
 
-# Verify ruster stopped
-if run_on ruster pgrep -x ruster > /dev/null 2>&1; then
-    error "ruster is still running after pkill"
-    # Force kill
-    run_on ruster bash -c "pkill -9 -x ruster 2>/dev/null || true"
-    sleep 2
-    if run_on ruster pgrep -x ruster > /dev/null 2>&1; then
-        report "phase3-ruster-stopped" "FAIL"
-    else
-        info "ruster killed with SIGKILL"
-        report "phase3-ruster-stopped" "PASS"
+# Wait for ruster to stop with retry loop
+PHASE3_STOPPED=false
+for i in $(seq 1 10); do
+    if ! run_on ruster pgrep -x ruster > /dev/null 2>&1; then
+        PHASE3_STOPPED=true
+        break
     fi
-else
+    if [ "$i" -eq 8 ]; then
+        info "SIGTERM not effective, sending SIGKILL..."
+        run_on ruster bash -c "pkill -9 -x ruster 2>/dev/null || true"
+    fi
+    sleep 0.5
+done
+
+if [ "$PHASE3_STOPPED" = true ]; then
     info "ruster stopped successfully."
     report "phase3-ruster-stopped" "PASS"
+else
+    error "ruster is still running after pkill + SIGKILL"
+    report "phase3-ruster-stopped" "FAIL"
 fi
 
 # Ping MUST fail again (no forwarding path exists)
