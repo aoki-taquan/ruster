@@ -114,7 +114,7 @@ pub fn rewrite_dst_mac(data: &mut [u8], mac: &[u8; 6]) {
 /// The Segments Left field is at byte 3 within the SRH.
 ///
 /// RFC-REF: RFC 8986 Section 4.1
-/// "Decrement SL. Update the IPv6 DA with SID[SL]."
+/// "Decrement SL. Update the IPv6 DA with SID\[SL\]."
 pub fn rewrite_srh_segments_left(data: &mut [u8], srh_offset: usize, new_sl: u8) -> bool {
     const SL_OFFSET_IN_SRH: usize = 3;
     let sl_offset = srh_offset + SL_OFFSET_IN_SRH;

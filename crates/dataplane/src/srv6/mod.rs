@@ -93,7 +93,7 @@ pub enum Srv6Decision {
         /// New Segments Left value to write into the SRH, if SRH was modified.
         ///
         /// RFC-REF: RFC 8986 Section 4.1
-        /// "Decrement SL. Update the IPv6 DA with SID[SL]."
+        /// "Decrement SL. Update the IPv6 DA with SID\[SL\]."
         new_sl: Option<u8>,
     },
 
