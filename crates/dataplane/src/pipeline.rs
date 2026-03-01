@@ -375,8 +375,7 @@ pub fn process_packet_v6(
     ifindex_map: &IfIndexMap,
 ) -> PipelineResult {
     // Step 1: Parse raw bytes.
-    let in_ifindex = ifindex_map.get_index(&raw_pkt.ingress_iface);
-    let mut meta = match packet::parse_packet(&raw_pkt.data, in_ifindex) {
+    let mut meta = match packet::parse_packet(&raw_pkt.data, &raw_pkt.ingress_iface) {
         Ok(m) => m,
         Err(_) => {
             return PipelineResult::Drop {
@@ -387,7 +386,7 @@ pub fn process_packet_v6(
     };
 
     // Step 2: L2 bridge domain processing.
-    if l2.is_bridged(meta.in_ifindex) {
+    if l2.is_bridged(&meta.in_ifname) {
         let l2_decision = l2.process(&meta);
 
         // Check whether the packet should be punted to L3 processing.
@@ -411,14 +410,14 @@ pub fn process_packet_v6(
         if !is_local {
             // Pure L2 forwarding — do not enter L3.
             return match l2_decision {
-                L2Decision::Unicast { out_ifindex } => PipelineResult::Forward {
-                    egress_ifindex: out_ifindex,
+                L2Decision::Unicast { out_ifname } => PipelineResult::Forward {
+                    egress_ifindex: ifindex_map.get_index(&out_ifname),
                     new_ttl: None,
                     next_hop: None,
                     nat: NatResult::None,
                 },
-                L2Decision::Flood { out_ifindexes } => PipelineResult::Flood {
-                    egress_ifindices: out_ifindexes,
+                L2Decision::Flood { out_ifnames } => PipelineResult::Flood {
+                    egress_ifindices: ifindex_map.get_indices(&out_ifnames),
                 },
                 L2Decision::Drop => PipelineResult::Drop {
                     reason: DropReason::L2Drop,
@@ -738,7 +737,7 @@ fn process_ipv6_packet(
     // Step 1: Check if this is an ND message.
     if let Some(packet::L4Info::Icmpv6(ref icmpv6)) = meta.l4 {
         if icmpv6.nd.is_some() {
-            let nd_action = nd_engine.process_nd(meta, &raw_pkt.ingress_iface);
+            let nd_action = nd_engine.process_nd(meta);
             return match nd_action {
                 NdAction::Reply { out_ifname, packet } => PipelineResult::NdReply {
                     egress_ifindex: ifindex_map.get_index(&out_ifname),
@@ -994,9 +993,7 @@ mod tests {
     /// skip L2 processing and go directly to L3.  This preserves the
     /// behaviour of every pre-existing pipeline test.
     fn make_l2_engine_empty() -> L2Engine {
-        let ifm = make_ifindex_map();
-        L2Engine::from_config(
-            &L2Config {
+        L2Engine::from_config(&L2Config {
             mac_table_max_entries: 1024,
             mac_aging_sec: 300,
             arp_table_max_entries: 256,
@@ -1004,9 +1001,7 @@ mod tests {
             arp_hold_queue_per_ip: 3,
             arp_hold_queue_max: 1024,
             bridge_domains: vec![],
-            },
-            &ifm,
-        )
+        })
     }
 
     fn make_routing_config() -> RoutingConfig {
@@ -2032,9 +2027,7 @@ mod tests {
     /// Helper: build an L2 engine with a bridge domain containing
     /// eth0, eth1, eth2.
     fn make_l2_engine_bridged() -> L2Engine {
-        let ifm = make_ifindex_map_bridged();
-        L2Engine::from_config(
-            &L2Config {
+        L2Engine::from_config(&L2Config {
             mac_table_max_entries: 1024,
             mac_aging_sec: 300,
             arp_table_max_entries: 256,
@@ -2045,19 +2038,7 @@ mod tests {
                 name: "br0".to_string(),
                 members: vec!["eth0".to_string(), "eth1".to_string(), "eth2".to_string()],
             }],
-            },
-            &ifm,
-        )
-    }
-
-    fn make_ifindex_map_bridged() -> IfIndexMap {
-        IfIndexMap::from_names(&[
-            "eth0".to_string(),
-            "eth1".to_string(),
-            "eth2".to_string(),
-            "wan0".to_string(),
-            "lan0".to_string(),
-        ])
+        })
     }
 
     /// Helper: build an L3 engine that knows about eth0/eth1/eth2

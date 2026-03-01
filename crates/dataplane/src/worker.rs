@@ -467,6 +467,7 @@ pub fn handle_pipeline_result(
                     Some(&mut nd_guard),
                     Some(&dp.ipv6_routes),
                     dp.srv6.as_ref(),
+                    &dp.ifindex_map,
                 )
             };
             handle_pipeline_result(dp, io, &synth_pkt, inner_result);
@@ -511,6 +512,7 @@ pub fn handle_pipeline_result(
                     Some(&mut nd_guard),
                     Some(&dp.ipv6_routes),
                     dp.srv6.as_ref(),
+                    &dp.ifindex_map,
                 )
             };
             handle_pipeline_result(dp, io, &synth_pkt, inner_result);
