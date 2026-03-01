@@ -42,8 +42,14 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
-      - name: Clean up stale topology
-        run: containerlab destroy --name "$CLAB_TOPO_NAME" --cleanup 2>/dev/null || true
+      - name: Clean up stale topologies
+        run: |
+          # Clean up our specific topology name (in case of re-runs)
+          containerlab destroy --name "$CLAB_TOPO_NAME" --cleanup 2>/dev/null || true
+          # Clean up any leftover ruster-e2e containers from previous runs
+          docker ps -a --filter "name=clab-ruster-e2e" --format '{{.ID}}' | xargs -r docker rm -f 2>/dev/null || true
+          # Clean up leftover Docker networks from containerlab
+          docker network ls --filter "name=clab-ruster-e2e" --format '{{.ID}}' | xargs -r docker network rm 2>/dev/null || true
 
       - name: Deploy containerlab topology
         run: containerlab deploy --topo tests/containerlab/topology.yml --name "$CLAB_TOPO_NAME"
