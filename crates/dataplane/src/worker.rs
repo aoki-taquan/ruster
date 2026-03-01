@@ -153,6 +153,7 @@ fn worker_loop(
                     Some(&mut nd_guard),
                     Some(&dp.ipv6_routes),
                     dp.srv6.as_ref(),
+                    &dp.ifindex_map,
                 )
             };
 
@@ -173,13 +174,16 @@ pub fn handle_pipeline_result(
     raw_pkt: &RawPacket,
     result: pipeline::PipelineResult,
 ) {
+    let ifm = &dp.ifindex_map;
+
     match result {
         pipeline::PipelineResult::Forward {
-            egress_iface,
+            egress_ifindex,
             new_ttl,
             next_hop,
             nat: nat_result,
         } => {
+            let egress_iface = ifm.get_name(egress_ifindex);
             dp.observer.inc_forwarded();
 
             let tx_data;
@@ -219,7 +223,7 @@ pub fn handle_pipeline_result(
                 }
 
                 // 3. src MAC -> egress IF's MAC
-                if let Some(mac) = dp.iface_macs.get(&egress_iface) {
+                if let Some(mac) = dp.iface_macs.get(egress_iface) {
                     rewrite::rewrite_src_mac(&mut data, mac);
                 }
 
@@ -236,7 +240,7 @@ pub fn handle_pipeline_result(
                     };
                     let arp_result = {
                         let mut arp_guard = dp.arp.lock().unwrap();
-                        arp_guard.resolve(arp_target, &egress_iface)
+                        arp_guard.resolve(arp_target, egress_iface)
                     };
                     match arp_result {
                         arp::ArpAction::Forward { resolved_mac } => {
@@ -250,7 +254,7 @@ pub fn handle_pipeline_result(
                         } => {
                             let enqueue_result = {
                                 let mut hq_guard = dp.hold_queue.lock().unwrap();
-                                hq_guard.enqueue(arp_target, egress_iface.clone(), data, new_ttl)
+                                hq_guard.enqueue(arp_target, egress_iface.to_owned(), data, new_ttl)
                             };
                             match enqueue_result {
                                 arp::hold_queue::EnqueueResult::Enqueued => {
@@ -298,23 +302,24 @@ pub fn handle_pipeline_result(
                 raw_pkt
             };
 
-            match io.tx(&egress_iface, tx_pkt) {
+            match io.tx(egress_iface, tx_pkt) {
                 Ok(()) => {
-                    dp.observer.inc_tx(&egress_iface, raw_pkt.data.len() as u64);
+                    dp.observer.inc_tx(egress_iface, raw_pkt.data.len() as u64);
                 }
                 Err(e) => {
                     dp.tx_errors.fetch_add(1, Ordering::Relaxed);
-                    dp.observer.inc_tx_drop(&egress_iface);
+                    dp.observer.inc_tx_drop(egress_iface);
                     eprintln!("TX error on {}: {}", egress_iface, e);
                 }
             }
         }
         pipeline::PipelineResult::ForwardV6 {
-            egress_iface,
+            egress_ifindex,
             new_hop_limit,
             next_hop_v6,
             srv6_new_da,
         } => {
+            let egress_iface = ifm.get_name(egress_ifindex);
             dp.observer.inc_forwarded();
 
             let mut data = raw_pkt.data.clone();
@@ -324,7 +329,7 @@ pub fn handle_pipeline_result(
             }
             rewrite::rewrite_ipv6_hop_limit(&mut data, new_hop_limit);
 
-            if let Some(mac) = dp.iface_macs.get(&egress_iface) {
+            if let Some(mac) = dp.iface_macs.get(egress_iface) {
                 rewrite::rewrite_src_mac(&mut data, mac);
             }
 
@@ -342,7 +347,7 @@ pub fn handle_pipeline_result(
 
             let nd_result = {
                 let mut nd_guard = dp.nd.lock().unwrap();
-                nd_guard.resolve(nd_target, &egress_iface)
+                nd_guard.resolve(nd_target, egress_iface)
             };
             match nd_result {
                 nd::NdAction::Forward { resolved_mac } => {
@@ -360,20 +365,21 @@ pub fn handle_pipeline_result(
                 data,
             };
 
-            match io.tx(&egress_iface, &tx_data) {
+            match io.tx(egress_iface, &tx_data) {
                 Ok(()) => {
-                    dp.observer.inc_tx(&egress_iface, raw_pkt.data.len() as u64);
+                    dp.observer.inc_tx(egress_iface, raw_pkt.data.len() as u64);
                 }
                 Err(e) => {
                     dp.tx_errors.fetch_add(1, Ordering::Relaxed);
-                    dp.observer.inc_tx_drop(&egress_iface);
+                    dp.observer.inc_tx_drop(egress_iface);
                     eprintln!("TX error on {}: {}", egress_iface, e);
                 }
             }
         }
-        pipeline::PipelineResult::Flood { egress_ifaces } => {
+        pipeline::PipelineResult::Flood { egress_ifindices } => {
             dp.observer.inc_forwarded();
-            for iface in &egress_ifaces {
+            for idx in &egress_ifindices {
+                let iface = ifm.get_name(*idx);
                 match io.tx(iface, raw_pkt) {
                     Ok(()) => {
                         dp.observer.inc_tx(iface, raw_pkt.data.len() as u64);
@@ -421,22 +427,23 @@ pub fn handle_pipeline_result(
             dp.observer.inc_local_delivery();
         }
         pipeline::PipelineResult::NdReply {
-            egress_iface,
+            egress_ifindex,
             reply_info,
         } => {
+            let egress_iface = ifm.get_name(egress_ifindex);
             dp.observer.inc_local_delivery();
             let na_data = nd::build_na_packet(&reply_info);
             let na_pkt = io::RawPacket {
-                ingress_iface: egress_iface.clone(),
+                ingress_iface: egress_iface.to_owned(),
                 data: na_data,
             };
-            match io.tx(&egress_iface, &na_pkt) {
+            match io.tx(egress_iface, &na_pkt) {
                 Ok(()) => {
-                    dp.observer.inc_tx(&egress_iface, na_pkt.data.len() as u64);
+                    dp.observer.inc_tx(egress_iface, na_pkt.data.len() as u64);
                 }
                 Err(e) => {
                     dp.tx_errors.fetch_add(1, Ordering::Relaxed);
-                    dp.observer.inc_tx_drop(&egress_iface);
+                    dp.observer.inc_tx_drop(egress_iface);
                     eprintln!("TX error for ND reply on {}: {}", egress_iface, e);
                 }
             }

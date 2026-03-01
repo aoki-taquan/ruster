@@ -100,6 +100,9 @@ pub struct Dataplane {
     pub hold_queue: Mutex<arp::hold_queue::HoldQueue>,
     /// ARP hold queue GC timeout in seconds (same as ARP timeout).
     hold_queue_timeout_sec: u64,
+    /// Bidirectional interface name ↔ index map, used by the pipeline to
+    /// avoid per-packet `String` allocations.
+    pub ifindex_map: pipeline::IfIndexMap,
 }
 
 impl Dataplane {
@@ -182,6 +185,7 @@ impl Dataplane {
         }
 
         let iface_names: Vec<String> = config.interfaces.iter().map(|i| i.name.clone()).collect();
+        let ifindex_map = pipeline::IfIndexMap::from_names(&iface_names);
         let observer = Arc::new(ruster_observe::Observer::new(&iface_names));
 
         let hold_queue = arp::hold_queue::HoldQueue::new(
@@ -207,6 +211,7 @@ impl Dataplane {
             observer,
             hold_queue: Mutex::new(hold_queue),
             hold_queue_timeout_sec,
+            ifindex_map,
         })
     }
 
@@ -315,6 +320,7 @@ impl Dataplane {
                         Some(&mut nd_guard),
                         Some(&self.ipv6_routes),
                         self.srv6.as_ref(),
+                        &self.ifindex_map,
                     )
                 };
                 worker::handle_pipeline_result(self, io, raw_pkt, result);
