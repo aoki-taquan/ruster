@@ -19,6 +19,8 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/e2e-helpers.sh"
+
 TOTAL_PASS=0
 TOTAL_FAIL=0
 TOTAL_SKIP=0
@@ -87,11 +89,6 @@ run_suite() {
     fi
 }
 
-# ── Wait for topology to settle ──────────────────────
-
-echo "Waiting for topology to settle (5s)..."
-sleep 5
-
 # ── Pre-flight: verify ruster is running ─────────────
 
 echo ""
@@ -107,6 +104,11 @@ if ! bash "${SCRIPT_DIR}/check-ruster.sh"; then
     echo "       See diagnostic output above for details."
     exit 1
 fi
+
+# ── ARP warmup ──────────────────────────────────────
+
+TOPO_NAME="${CLAB_TOPO_NAME:-ruster-e2e}"
+arp_warmup "clab-${TOPO_NAME}"
 
 echo ""
 echo "Suites to run: ${E2E_SUITES}"

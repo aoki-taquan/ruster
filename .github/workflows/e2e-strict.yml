@@ -47,11 +47,14 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Clean up stale topology
+        run: containerlab destroy --name "$CLAB_TOPO_NAME" --cleanup 2>/dev/null || true
+
       - name: Deploy strict containerlab topology
         run: containerlab deploy --topo tests/containerlab/configs/strict.clab.yml --name "$CLAB_TOPO_NAME"
 
       - name: Wait for topology to settle
-        run: sleep 10
+        run: sleep 15
 
       - name: Run strict setup (harden topology)
         run: bash tests/containerlab/scripts/strict-setup.sh

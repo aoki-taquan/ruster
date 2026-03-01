@@ -13,6 +13,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/e2e-helpers.sh"
+
 TOPO_NAME="${CLAB_TOPO_NAME:-ruster-e2e-strict}"
 PREFIX="clab-${TOPO_NAME}"
 
@@ -26,16 +29,26 @@ run_on() {
     docker exec "${PREFIX}-${node}" "$@"
 }
 
+# ── Step 0: Wait for all containers to be ready ──────
+
+if ! wait_all_containers_ready "$PREFIX" ruster lan-host wan-host; then
+    error "Containers failed readiness check. Cannot proceed."
+    exit 1
+fi
+
 # ── Step 1: Disable kernel forwarding on all nodes ───
 
 info "Disabling kernel ip_forward on all nodes..."
 
 for node in ruster lan-host wan-host; do
-    current=$(run_on "$node" cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "unknown")
+    current=$(run_on "$node" cat /proc/sys/net/ipv4/ip_forward || echo "unknown")
     if [ "$current" = "0" ]; then
         info "  ${node}: ip_forward already 0"
     else
-        run_on "$node" sysctl -w net.ipv4.ip_forward=0 > /dev/null 2>&1
+        if ! run_on "$node" sysctl -w net.ipv4.ip_forward=0 > /dev/null; then
+            error "Failed to set ip_forward=0 on ${node}"
+            exit 1
+        fi
         info "  ${node}: ip_forward set to 0 (was ${current})"
     fi
 done
@@ -51,14 +64,14 @@ run_on ruster bash -c "ip route flush proto boot 2>/dev/null || true"
 run_on ruster bash -c "ip route flush proto static 2>/dev/null || true"
 
 info "  ruster routes after flush:"
-run_on ruster ip route show 2>/dev/null | sed 's/^/    /'
+run_on ruster ip route show | sed 's/^/    /'
 
 # ── Step 3: Verify client/server routing ─────────────
 
 info "Verifying client/server routes point to ruster as gateway..."
 
 # lan-host should only have: 192.168.1.0/24 dev eth1 + default via 192.168.1.1
-LAN_DEFAULT=$(run_on lan-host ip route show default 2>/dev/null || echo "")
+LAN_DEFAULT=$(run_on lan-host ip route show default || echo "")
 if echo "$LAN_DEFAULT" | grep -q "192.168.1.1"; then
     info "  lan-host: default via 192.168.1.1 (OK)"
 else
@@ -68,7 +81,7 @@ else
 fi
 
 # wan-host should only have: 10.0.0.0/24 dev eth1 + default via 10.0.0.1
-WAN_DEFAULT=$(run_on wan-host ip route show default 2>/dev/null || echo "")
+WAN_DEFAULT=$(run_on wan-host ip route show default || echo "")
 if echo "$WAN_DEFAULT" | grep -q "10.0.0.1"; then
     info "  wan-host: default via 10.0.0.1 (OK)"
 else
@@ -84,15 +97,15 @@ info "Verifying no bypass paths exist..."
 BYPASS_FOUND=false
 
 # Check that ruster has no default route (it should only forward via dataplane)
-if run_on ruster ip route show default 2>/dev/null | grep -q "default"; then
+if run_on ruster ip route show default | grep -q "default"; then
     error "ruster has a kernel default route — this is a bypass path!"
-    run_on ruster ip route show default 2>/dev/null | sed 's/^/    /'
+    run_on ruster ip route show default | sed 's/^/    /'
     BYPASS_FOUND=true
 fi
 
 # Check kernel forwarding is truly disabled
 for node in ruster lan-host wan-host; do
-    fwd=$(run_on "$node" cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo "unknown")
+    fwd=$(run_on "$node" cat /proc/sys/net/ipv4/ip_forward || echo "unknown")
     if [ "$fwd" != "0" ]; then
         error "${node}: ip_forward=${fwd} (expected 0) — bypass risk!"
         BYPASS_FOUND=true
