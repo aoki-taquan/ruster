@@ -93,6 +93,12 @@ pub struct DataplaneConfig {
     pub memory_mb: u32,
     pub rx_queue_size: u32,
     pub tx_queue_size: u32,
+    #[serde(default = "default_worker_count")]
+    pub worker_count: u32,
+}
+
+fn default_worker_count() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

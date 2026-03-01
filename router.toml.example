@@ -12,6 +12,8 @@ lcore_list = "0-3"
 memory_mb = 2048
 rx_queue_size = 1024
 tx_queue_size = 1024
+# Number of worker threads for packet processing (minimum: 1)
+worker_count = 1
 
 [[interfaces]]
 name = "wan0"
