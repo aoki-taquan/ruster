@@ -30,7 +30,7 @@ topology:
       kind: linux
       image: debian:bookworm-slim
       binds:
-        - ../../target/release/ruster:/usr/local/bin/ruster:ro
+        - ../../../target/release/ruster:/usr/local/bin/ruster:ro
         - ./ruster.toml:/etc/ruster/router.toml:ro
       exec:
         # Install networking tools (bookworm-slim lacks iproute2/procps)
