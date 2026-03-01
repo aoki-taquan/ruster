@@ -105,6 +105,26 @@ pub fn rewrite_dst_mac(data: &mut [u8], mac: &[u8; 6]) {
     }
 }
 
+// ── SRv6 SRH rewrite ──────────────────────────────────────────────
+
+/// Rewrite the SRH Segments Left field in-place.
+///
+/// `srh_offset` is the absolute byte offset of the SRH within the
+/// Ethernet frame (e.g. 54 for ETH + IPv6 fixed header).
+/// The Segments Left field is at byte 3 within the SRH.
+///
+/// RFC-REF: RFC 8986 Section 4.1
+/// "Decrement SL. Update the IPv6 DA with SID[SL]."
+pub fn rewrite_srh_segments_left(data: &mut [u8], srh_offset: usize, new_sl: u8) -> bool {
+    const SL_OFFSET_IN_SRH: usize = 3;
+    let sl_offset = srh_offset + SL_OFFSET_IN_SRH;
+    if data.len() <= sl_offset {
+        return false;
+    }
+    data[sl_offset] = new_sl;
+    true
+}
+
 // ── NAT packet rewrite ─────────────────────────────────────────────
 
 /// Byte offsets within an Ethernet + IPv4 frame.

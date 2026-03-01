@@ -90,6 +90,11 @@ pub enum Srv6Decision {
         new_da: [u8; 16],
         /// Whether the SRH Segments Left was modified.
         srh_modified: bool,
+        /// New Segments Left value to write into the SRH, if SRH was modified.
+        ///
+        /// RFC-REF: RFC 8986 Section 4.1
+        /// "Decrement SL. Update the IPv6 DA with SID[SL]."
+        new_sl: Option<u8>,
     },
 
     /// Decapsulate the packet and process the inner IPv4 packet.
@@ -99,6 +104,8 @@ pub enum Srv6Decision {
     DecapIpv4 {
         /// VRF table for the IPv4 lookup.
         table: String,
+        /// Byte offset within the Ethernet frame where the inner packet starts.
+        inner_offset: usize,
     },
 
     /// Decapsulate the packet and process the inner IPv6 packet.
@@ -108,6 +115,8 @@ pub enum Srv6Decision {
     DecapIpv6 {
         /// VRF table for the IPv6 lookup.
         table: String,
+        /// Byte offset within the Ethernet frame where the inner packet starts.
+        inner_offset: usize,
     },
 
     /// Packet was dropped during SRv6 processing.
@@ -164,6 +173,9 @@ impl Srv6Engine {
     /// * `next_header` - The Next Header field of the IPv6 header.
     /// * `payload` - The payload starting after the IPv6 fixed header.
     /// * `hop_limit` - Current Hop Limit.
+    /// * `payload_offset` - Byte offset of the IPv6 payload within the
+    ///   Ethernet frame. Used to compute absolute offsets for in-place
+    ///   SRH rewrite and inner-packet extraction.
     ///
     /// # Returns
     ///
@@ -178,6 +190,7 @@ impl Srv6Engine {
         next_header: u8,
         payload: &[u8],
         hop_limit: u8,
+        payload_offset: usize,
     ) -> Srv6Decision {
         // Step 1: Check if the DA matches a local SID.
         let sid_entry = match self.sid_table.lookup(dst_addr) {
@@ -195,12 +208,23 @@ impl Srv6Engine {
             None
         };
 
+        // Compute the inner-packet offset: right after the SRH (if present),
+        // or right after the IPv6 fixed header (if no SRH).
+        let inner_offset = match &srh {
+            Some(s) => payload_offset + s.total_len,
+            None => payload_offset,
+        };
+
         // Step 3: Execute the action bound to the SID.
         match &sid_entry.action {
             Srv6Action::End => self.process_end(srh.as_ref(), hop_limit),
             Srv6Action::UN => self.process_un(dst_addr, srh.as_ref(), hop_limit),
-            Srv6Action::EndDT4 { table } => self.process_end_dt4(srh.as_ref(), table),
-            Srv6Action::EndDT6 { table } => self.process_end_dt6(srh.as_ref(), table),
+            Srv6Action::EndDT4 { table } => {
+                self.process_end_dt4(srh.as_ref(), table, inner_offset)
+            }
+            Srv6Action::EndDT6 { table } => {
+                self.process_end_dt6(srh.as_ref(), table, inner_offset)
+            }
         }
     }
 
@@ -245,6 +269,7 @@ impl Srv6Engine {
         Srv6Decision::Forward {
             new_da: next_sid,
             srh_modified: true,
+            new_sl: Some(new_sl),
         }
     }
 
@@ -277,6 +302,7 @@ impl Srv6Engine {
                     Srv6Decision::Forward {
                         new_da: next_sid,
                         srh_modified: true,
+                        new_sl: Some(new_sl),
                     }
                 }
                 _ => {
@@ -288,9 +314,11 @@ impl Srv6Engine {
             }
         } else {
             // Continue with the shifted DA (next uSID becomes active).
+            // SRH is not modified — only the DA changes.
             Srv6Decision::Forward {
                 new_da: shifted,
                 srh_modified: false,
+                new_sl: None,
             }
         }
     }
@@ -300,7 +328,12 @@ impl Srv6Engine {
     /// RFC-REF: RFC 8986 Section 4.1.4
     /// "If SL != 0: drop. Otherwise, pop outer IPv6 + SRH and submit
     /// inner IPv4 to the specified FIB."
-    fn process_end_dt4(&self, srh: Option<&Srh>, table: &str) -> Srv6Decision {
+    fn process_end_dt4(
+        &self,
+        srh: Option<&Srh>,
+        table: &str,
+        inner_offset: usize,
+    ) -> Srv6Decision {
         // RFC-REF: RFC 8986 Section 4.1.4
         // "If Segments Left is not zero, drop."
         if let Some(s) = srh {
@@ -313,6 +346,7 @@ impl Srv6Engine {
 
         Srv6Decision::DecapIpv4 {
             table: table.to_string(),
+            inner_offset,
         }
     }
 
@@ -321,7 +355,12 @@ impl Srv6Engine {
     /// RFC-REF: RFC 8986 Section 4.1.5
     /// "If SL != 0: drop. Otherwise, pop outer IPv6 + SRH and submit
     /// inner IPv6 to the specified FIB."
-    fn process_end_dt6(&self, srh: Option<&Srh>, table: &str) -> Srv6Decision {
+    fn process_end_dt6(
+        &self,
+        srh: Option<&Srh>,
+        table: &str,
+        inner_offset: usize,
+    ) -> Srv6Decision {
         if let Some(s) = srh {
             if s.segments_left != 0 {
                 return Srv6Decision::Drop {
@@ -332,6 +371,7 @@ impl Srv6Engine {
 
         Srv6Decision::DecapIpv6 {
             table: table.to_string(),
+            inner_offset,
         }
     }
 
@@ -357,6 +397,9 @@ impl Srv6Engine {
 mod tests {
     use super::*;
     use config::LocalSidConfig;
+
+    /// Standard payload offset for Ethernet (14) + IPv6 (40) = 54.
+    const TEST_PAYLOAD_OFFSET: usize = 54;
 
     fn make_test_config() -> Srv6Config {
         Srv6Config {
@@ -447,7 +490,8 @@ mod tests {
         let srh = Srh::new(6, vec![sid0, sid1]);
         let payload = srh.serialize();
 
-        let decision = engine.process(&da, IPV6_NH_ROUTING, &payload, 64);
+        let decision =
+            engine.process(&da, IPV6_NH_ROUTING, &payload, 64, TEST_PAYLOAD_OFFSET);
 
         // SL was 1, should decrement to 0, new DA = SID[0] = sid0
         assert_eq!(
@@ -455,6 +499,7 @@ mod tests {
             Srv6Decision::Forward {
                 new_da: sid0,
                 srh_modified: true,
+                new_sl: Some(0),
             }
         );
     }
@@ -477,7 +522,8 @@ mod tests {
                                              // 1 segment
         srh_data.extend_from_slice(&da);
 
-        let decision = engine.process(&da, IPV6_NH_ROUTING, &srh_data, 64);
+        let decision =
+            engine.process(&da, IPV6_NH_ROUTING, &srh_data, 64, TEST_PAYLOAD_OFFSET);
         assert_eq!(
             decision,
             Srv6Decision::Drop {
@@ -492,7 +538,7 @@ mod tests {
         let da: [u8; 16] = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
         // NH=TCP (not routing header), no SRH
-        let decision = engine.process(&da, 6, &[], 64);
+        let decision = engine.process(&da, 6, &[], 64, TEST_PAYLOAD_OFFSET);
         assert_eq!(
             decision,
             Srv6Decision::Drop {
@@ -510,7 +556,8 @@ mod tests {
         let srh = Srh::new(6, vec![sid, da]);
         let payload = srh.serialize();
 
-        let decision = engine.process(&da, IPV6_NH_ROUTING, &payload, 1);
+        let decision =
+            engine.process(&da, IPV6_NH_ROUTING, &payload, 1, TEST_PAYLOAD_OFFSET);
         assert_eq!(
             decision,
             Srv6Decision::Drop {
@@ -529,7 +576,7 @@ mod tests {
         let da: [u8; 16] = [0xfd, 0, 0, 0, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0];
 
         // No SRH needed for uN shift within container
-        let decision = engine.process(&da, 6, &[], 64);
+        let decision = engine.process(&da, 6, &[], 64, TEST_PAYLOAD_OFFSET);
 
         // After shift: fd00:0002:0000:: (active_usid = 0x0002)
         let expected_da: [u8; 16] = [0xfd, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -538,6 +585,7 @@ mod tests {
             Srv6Decision::Forward {
                 new_da: expected_da,
                 srh_modified: false,
+                new_sl: None,
             }
         );
     }
@@ -554,7 +602,8 @@ mod tests {
         let srh = Srh::new(6, vec![next_sid, da]);
         let payload = srh.serialize();
 
-        let decision = engine.process(&da, IPV6_NH_ROUTING, &payload, 64);
+        let decision =
+            engine.process(&da, IPV6_NH_ROUTING, &payload, 64, TEST_PAYLOAD_OFFSET);
 
         // After shift, active uSID is zero -> fall to SRH
         assert_eq!(
@@ -562,6 +611,7 @@ mod tests {
             Srv6Decision::Forward {
                 new_da: next_sid,
                 srh_modified: true,
+                new_sl: Some(0),
             }
         );
     }
@@ -574,7 +624,7 @@ mod tests {
         let da: [u8; 16] = [0xfd, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
         // No SRH
-        let decision = engine.process(&da, 6, &[], 64);
+        let decision = engine.process(&da, 6, &[], 64, TEST_PAYLOAD_OFFSET);
 
         assert_eq!(
             decision,
@@ -589,7 +639,7 @@ mod tests {
         let engine = make_engine();
         let da: [u8; 16] = [0xfd, 0, 0, 0, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0];
 
-        let decision = engine.process(&da, 6, &[], 1);
+        let decision = engine.process(&da, 6, &[], 1, TEST_PAYLOAD_OFFSET);
         assert_eq!(
             decision,
             Srv6Decision::Drop {
@@ -618,11 +668,16 @@ mod tests {
         srh_data.extend_from_slice(&[0, 0]); // Tag
         srh_data.extend_from_slice(&da); // 1 segment
 
-        let decision = engine.process(&da, IPV6_NH_ROUTING, &srh_data, 64);
+        // SRH total_len = (hdr_ext_len + 1) * 8 = (2+1)*8 = 24
+        let expected_inner_offset = TEST_PAYLOAD_OFFSET + 24;
+
+        let decision =
+            engine.process(&da, IPV6_NH_ROUTING, &srh_data, 64, TEST_PAYLOAD_OFFSET);
         assert_eq!(
             decision,
             Srv6Decision::DecapIpv4 {
                 table: "default".to_string(),
+                inner_offset: expected_inner_offset,
             }
         );
     }
@@ -638,7 +693,8 @@ mod tests {
         let srh = Srh::new(4, vec![sid0, da]);
         let payload = srh.serialize();
 
-        let decision = engine.process(&da, IPV6_NH_ROUTING, &payload, 64);
+        let decision =
+            engine.process(&da, IPV6_NH_ROUTING, &payload, 64, TEST_PAYLOAD_OFFSET);
         assert_eq!(
             decision,
             Srv6Decision::Drop {
@@ -655,7 +711,7 @@ mod tests {
 
         // DA that doesn't match any SID
         let da: [u8; 16] = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-        let decision = engine.process(&da, 6, &[], 64);
+        let decision = engine.process(&da, 6, &[], 64, TEST_PAYLOAD_OFFSET);
         assert_eq!(decision, Srv6Decision::NotSrv6);
     }
 
@@ -663,7 +719,7 @@ mod tests {
     fn disabled_engine_returns_not_srv6() {
         let engine = Srv6Engine::disabled();
         let da: [u8; 16] = [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-        let decision = engine.process(&da, IPV6_NH_ROUTING, &[], 64);
+        let decision = engine.process(&da, IPV6_NH_ROUTING, &[], 64, TEST_PAYLOAD_OFFSET);
         assert_eq!(decision, Srv6Decision::NotSrv6);
     }
 
@@ -676,7 +732,8 @@ mod tests {
 
         // Truncated SRH (only 4 bytes)
         let bad_srh = [43, 0, 4, 0];
-        let decision = engine.process(&da, IPV6_NH_ROUTING, &bad_srh, 64);
+        let decision =
+            engine.process(&da, IPV6_NH_ROUTING, &bad_srh, 64, TEST_PAYLOAD_OFFSET);
         assert!(matches!(
             decision,
             Srv6Decision::Drop {
@@ -716,7 +773,8 @@ mod tests {
         };
         let payload = srh.serialize();
 
-        let decision = engine.process(&sid1, IPV6_NH_ROUTING, &payload, 64);
+        let decision =
+            engine.process(&sid1, IPV6_NH_ROUTING, &payload, 64, TEST_PAYLOAD_OFFSET);
 
         // End action: SL 1->0, new DA = SID[0] = 2001:db8::99
         assert_eq!(
@@ -724,6 +782,7 @@ mod tests {
             Srv6Decision::Forward {
                 new_da: sid0,
                 srh_modified: true,
+                new_sl: Some(0),
             }
         );
     }
