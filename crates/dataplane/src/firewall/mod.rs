@@ -389,7 +389,7 @@ mod tests {
 
     fn make_tcp_meta(src: [u8; 4], dst: [u8; 4], src_port: u16, dst_port: u16) -> PacketMeta {
         PacketMeta {
-            in_ifname: "eth0".to_string(),
+            in_ifindex: 0, // eth0
             l2: make_l2(),
             l3: Some(L3Info::Ipv4(make_ipv4(src, dst, 6))),
             l4: Some(L4Info::Tcp(TcpInfo {
@@ -408,7 +408,7 @@ mod tests {
 
     fn make_udp_meta(src: [u8; 4], dst: [u8; 4], src_port: u16, dst_port: u16) -> PacketMeta {
         PacketMeta {
-            in_ifname: "eth0".to_string(),
+            in_ifindex: 0, // eth0
             l2: make_l2(),
             l3: Some(L3Info::Ipv4(make_ipv4(src, dst, 17))),
             l4: Some(L4Info::Udp(UdpInfo {
@@ -423,7 +423,7 @@ mod tests {
 
     fn make_icmp_meta(src: [u8; 4], dst: [u8; 4]) -> PacketMeta {
         PacketMeta {
-            in_ifname: "eth0".to_string(),
+            in_ifindex: 0, // eth0
             l2: make_l2(),
             l3: Some(L3Info::Ipv4(make_ipv4(src, dst, 1))),
             l4: Some(L4Info::Icmp(IcmpInfo {
@@ -438,7 +438,7 @@ mod tests {
 
     fn make_non_ipv4_meta() -> PacketMeta {
         PacketMeta {
-            in_ifname: "eth0".to_string(),
+            in_ifindex: 0, // eth0
             l2: L2Info {
                 dst_mac: [0xFF; 6],
                 src_mac: [0xAA; 6],

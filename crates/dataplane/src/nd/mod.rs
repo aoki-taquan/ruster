@@ -209,7 +209,7 @@ impl NdEngine {
     /// Process an incoming ND packet (Neighbor Solicitation or Advertisement).
     ///
     /// RFC-REF: RFC 4861 Section 7.1, 7.2
-    pub fn process_nd(&mut self, meta: &PacketMeta) -> NdAction {
+    pub fn process_nd(&mut self, meta: &PacketMeta, in_ifname: &str) -> NdAction {
         // Extract IPv6 + ICMPv6 + ND info from the packet.
         let ipv6_info = match &meta.l3 {
             Some(L3Info::Ipv6(info)) => info,
@@ -225,8 +225,6 @@ impl NdEngine {
             Some(nd) => nd,
             None => return NdAction::Drop,
         };
-
-        let in_ifname = &meta.in_ifname;
 
         // Ensure we have a cache for this interface.
         if !self.caches.contains_key(in_ifname) {
@@ -552,13 +550,13 @@ mod tests {
     }
 
     fn make_ns_meta(
-        in_ifname: &str,
+        _in_ifname: &str,
         src_ipv6: [u8; 16],
         target_ipv6: [u8; 16],
         source_mac: Option<[u8; 6]>,
     ) -> PacketMeta {
         PacketMeta {
-            in_ifname: in_ifname.to_string(),
+            in_ifindex: 0, // test index
             l2: L2Info {
                 dst_mac: [0x33, 0x33, 0xFF, 0x00, 0x00, 0x01], // solicited-node multicast
                 src_mac: PEER_MAC,
@@ -588,12 +586,12 @@ mod tests {
     }
 
     fn make_na_meta(
-        in_ifname: &str,
+        _in_ifname: &str,
         target_ipv6: [u8; 16],
         target_mac: Option<[u8; 6]>,
     ) -> PacketMeta {
         PacketMeta {
-            in_ifname: in_ifname.to_string(),
+            in_ifindex: 0, // test index
             l2: L2Info {
                 dst_mac: OUR_MAC,
                 src_mac: PEER_MAC,
@@ -639,7 +637,7 @@ mod tests {
     fn process_ns_for_our_ip() {
         let mut engine = make_engine();
         let meta = make_ns_meta("eth0", PEER_IPV6, OUR_IPV6, Some(PEER_MAC));
-        let action = engine.process_nd(&meta);
+        let action = engine.process_nd(&meta, "eth0");
 
         match action {
             NdAction::Reply { out_ifname, packet } => {
@@ -665,7 +663,7 @@ mod tests {
             0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF,
         ];
         let meta = make_ns_meta("eth0", PEER_IPV6, other_ipv6, Some(PEER_MAC));
-        let action = engine.process_nd(&meta);
+        let action = engine.process_nd(&meta, "eth0");
         assert_eq!(action, NdAction::Update);
     }
 
@@ -675,7 +673,7 @@ mod tests {
     fn process_na_updates_cache() {
         let mut engine = make_engine();
         let meta = make_na_meta("eth0", PEER_IPV6, Some(PEER_MAC));
-        let action = engine.process_nd(&meta);
+        let action = engine.process_nd(&meta, "eth0");
         assert_eq!(action, NdAction::Update);
 
         let cache = engine.caches.get("eth0").unwrap();

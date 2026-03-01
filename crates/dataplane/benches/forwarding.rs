@@ -180,13 +180,13 @@ fn make_conntrack_config() -> ConntrackConfig {
 // ── Packet builders ──────────────────────────────────────────────────
 
 fn make_l2_meta(
-    in_ifname: &str,
+    _in_ifname: &str,
     src_mac: [u8; 6],
     dst_mac: [u8; 6],
     pkt_size: usize,
 ) -> PacketMeta {
     PacketMeta {
-        in_ifname: in_ifname.to_string(),
+        in_ifindex: 0, // test index
         l2: L2Info {
             dst_mac,
             src_mac,
@@ -199,7 +199,7 @@ fn make_l2_meta(
 }
 
 fn make_ipv4_tcp_meta(
-    in_ifname: &str,
+    _in_ifname: &str,
     src_addr: [u8; 4],
     dst_addr: [u8; 4],
     src_port: u16,
@@ -207,7 +207,7 @@ fn make_ipv4_tcp_meta(
     pkt_size: usize,
 ) -> PacketMeta {
     PacketMeta {
-        in_ifname: in_ifname.to_string(),
+        in_ifindex: 0, // test index
         l2: L2Info {
             dst_mac: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
             src_mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
@@ -313,7 +313,7 @@ fn bench_packet_parse(c: &mut Criterion) {
         let raw = build_raw_tcp_packet(pkt_size);
         group.throughput(Throughput::Elements(1));
         group.bench_with_input(BenchmarkId::new("tcp_ipv4", pkt_size), &raw, |b, raw| {
-            b.iter(|| ruster_dataplane::packet::parse_packet(black_box(raw), "lan0"));
+            b.iter(|| ruster_dataplane::packet::parse_packet(black_box(raw), 0));
         });
     }
 
@@ -328,7 +328,12 @@ fn bench_l2_bridge(c: &mut Criterion) {
 
     // FDB hit benchmark
     {
-        let mut engine = L2Engine::from_config(&l2_config);
+        let ifm = ruster_dataplane::pipeline::IfIndexMap::from_names(&[
+            "eth0".to_string(),
+            "eth1".to_string(),
+            "eth2".to_string(),
+        ]);
+        let mut engine = L2Engine::from_config(&l2_config, &ifm);
         let dst_mac: [u8; 6] = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
         let learn_meta = make_l2_meta("lan1", dst_mac, [0x00; 6], LARGE_PKT);
         engine.process(&learn_meta);
@@ -343,7 +348,12 @@ fn bench_l2_bridge(c: &mut Criterion) {
 
     // FDB miss (flood) benchmark
     {
-        let mut engine = L2Engine::from_config(&l2_config);
+        let ifm = ruster_dataplane::pipeline::IfIndexMap::from_names(&[
+            "eth0".to_string(),
+            "eth1".to_string(),
+            "eth2".to_string(),
+        ]);
+        let mut engine = L2Engine::from_config(&l2_config, &ifm);
         let src_mac: [u8; 6] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
         let unknown_mac: [u8; 6] = [0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA];
         let meta = make_l2_meta("lan0", src_mac, unknown_mac, LARGE_PKT);
@@ -490,7 +500,7 @@ fn bench_arp_cache(c: &mut Criterion) {
 
     // Pre-populate ARP cache via a reply.
     let reply_meta = PacketMeta {
-        in_ifname: "lan0".to_string(),
+        in_ifindex: 0, // lan0
         l2: L2Info {
             dst_mac: [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
             src_mac: [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
@@ -506,7 +516,7 @@ fn bench_arp_cache(c: &mut Criterion) {
         l4: None,
         raw_len: 42,
     };
-    engine.process_arp(&reply_meta);
+    engine.process_arp(&reply_meta, "eth0");
 
     let target_ip: [u8; 4] = [192, 168, 1, 100];
 

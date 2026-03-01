@@ -688,14 +688,14 @@ mod tests {
     }
 
     fn make_tcp_meta(
-        in_ifname: &str,
+        _in_ifname: &str,
         src: [u8; 4],
         dst: [u8; 4],
         src_port: u16,
         dst_port: u16,
     ) -> PacketMeta {
         PacketMeta {
-            in_ifname: in_ifname.to_string(),
+            in_ifindex: 0, // test index
             l2: make_l2(),
             l3: Some(L3Info::Ipv4(make_ipv4(src, dst, 6))),
             l4: Some(L4Info::Tcp(TcpInfo {
@@ -713,14 +713,14 @@ mod tests {
     }
 
     fn make_udp_meta(
-        in_ifname: &str,
+        _in_ifname: &str,
         src: [u8; 4],
         dst: [u8; 4],
         src_port: u16,
         dst_port: u16,
     ) -> PacketMeta {
         PacketMeta {
-            in_ifname: in_ifname.to_string(),
+            in_ifindex: 0, // test index
             l2: make_l2(),
             l3: Some(L3Info::Ipv4(make_ipv4(src, dst, 17))),
             l4: Some(L4Info::Udp(UdpInfo {
@@ -733,9 +733,9 @@ mod tests {
         }
     }
 
-    fn make_icmp_meta(in_ifname: &str, src: [u8; 4], dst: [u8; 4], id: u16) -> PacketMeta {
+    fn make_icmp_meta(_in_ifname: &str, src: [u8; 4], dst: [u8; 4], id: u16) -> PacketMeta {
         PacketMeta {
-            in_ifname: in_ifname.to_string(),
+            in_ifindex: 0, // test index
             l2: make_l2(),
             l3: Some(L3Info::Ipv4(make_ipv4(src, dst, 1))),
             l4: Some(L4Info::Icmp(IcmpInfo {

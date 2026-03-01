@@ -6,6 +6,7 @@
 
 use super::fdb::Fdb;
 use crate::packet::PacketMeta;
+use crate::pipeline::IfIndex;
 
 /// The broadcast MAC address (FF:FF:FF:FF:FF:FF).
 const BROADCAST_MAC: [u8; 6] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
@@ -15,8 +16,8 @@ const BROADCAST_MAC: [u8; 6] = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
 pub struct BridgeDomainState {
     /// Name of the bridge domain (from configuration).
     pub name: String,
-    /// Member interface names that belong to this domain.
-    pub members: Vec<String>,
+    /// Member interface indices that belong to this domain.
+    pub members: Vec<IfIndex>,
     /// Forwarding database for this bridge domain.
     pub fdb: Fdb,
 }
@@ -26,14 +27,14 @@ pub struct BridgeDomainState {
 pub enum L2Decision {
     /// The destination MAC is known in the FDB; send to a single interface.
     Unicast {
-        /// The output interface name.
-        out_ifname: String,
+        /// The output interface index.
+        out_ifindex: IfIndex,
     },
     /// The destination MAC is unknown or is broadcast; flood to all member
     /// interfaces except the one the packet arrived on.
     Flood {
-        /// The output interface names (excludes the ingress interface).
-        out_ifnames: Vec<String>,
+        /// The output interface indices (excludes the ingress interface).
+        out_ifindexes: Vec<IfIndex>,
     },
     /// The ingress interface does not belong to any bridge domain.
     Drop,
@@ -42,7 +43,7 @@ pub enum L2Decision {
 impl BridgeDomainState {
     /// Create a new bridge domain state with the given name, members, and FDB
     /// capacity.
-    pub fn new(name: String, members: Vec<String>, max_entries: usize) -> Self {
+    pub fn new(name: String, members: Vec<IfIndex>, max_entries: usize) -> Self {
         Self {
             name,
             members,
@@ -58,11 +59,11 @@ impl BridgeDomainState {
     /// 4. If known -> unicast (but not back to ingress).
     pub fn process(&mut self, meta: &PacketMeta) -> L2Decision {
         // Step 1: Learn source MAC.
-        self.fdb.learn(meta.l2.src_mac, &meta.in_ifname);
+        self.fdb.learn(meta.l2.src_mac, meta.in_ifindex);
 
         // Step 2: Broadcast MAC always floods.
         if meta.l2.dst_mac == BROADCAST_MAC {
-            return self.flood_decision(&meta.in_ifname);
+            return self.flood_decision(meta.in_ifindex);
         }
 
         // Step 3: Look up destination MAC.
@@ -76,33 +77,33 @@ impl BridgeDomainState {
                 // Drop). Per the spec: "do not flood" in this case.
                 // The spec says "unicast output IF == input IF -> do not flood".
                 // We interpret this as: suppress the forwarding entirely.
-                if entry.out_ifname == meta.in_ifname {
+                if entry.out_ifindex == meta.in_ifindex {
                     // Source and destination are on the same port.
                     // No need to forward — the frame was already received
                     // on the correct segment.
                     L2Decision::Drop
                 } else {
                     L2Decision::Unicast {
-                        out_ifname: entry.out_ifname.clone(),
+                        out_ifindex: entry.out_ifindex,
                     }
                 }
             }
             None => {
                 // Unknown unicast: flood to all members except ingress.
-                self.flood_decision(&meta.in_ifname)
+                self.flood_decision(meta.in_ifindex)
             }
         }
     }
 
     /// Build a Flood decision for all members except the ingress interface.
-    fn flood_decision(&self, in_ifname: &str) -> L2Decision {
-        let out_ifnames: Vec<String> = self
+    fn flood_decision(&self, in_ifindex: IfIndex) -> L2Decision {
+        let out_ifindexes: Vec<IfIndex> = self
             .members
             .iter()
-            .filter(|m| m.as_str() != in_ifname)
-            .cloned()
+            .filter(|&&m| m != in_ifindex)
+            .copied()
             .collect();
-        L2Decision::Flood { out_ifnames }
+        L2Decision::Flood { out_ifindexes }
     }
 }
 
@@ -112,9 +113,9 @@ mod tests {
     use crate::packet::{L2Info, PacketMeta};
 
     /// Helper to build a minimal PacketMeta for bridge testing.
-    fn make_meta(in_ifname: &str, src_mac: [u8; 6], dst_mac: [u8; 6]) -> PacketMeta {
+    fn make_meta(in_ifindex: IfIndex, src_mac: [u8; 6], dst_mac: [u8; 6]) -> PacketMeta {
         PacketMeta {
-            in_ifname: in_ifname.to_string(),
+            in_ifindex,
             l2: L2Info {
                 dst_mac,
                 src_mac,
@@ -132,7 +133,7 @@ mod tests {
     fn make_bridge() -> BridgeDomainState {
         BridgeDomainState::new(
             "br0".to_string(),
-            vec!["eth0".to_string(), "eth1".to_string(), "eth2".to_string()],
+            vec![0, 1, 2], // eth0=0, eth1=1, eth2=2
             1024,
         )
     }
@@ -142,17 +143,17 @@ mod tests {
         let mut bd = make_bridge();
 
         // First, learn MAC_B on eth1 by sending a packet from MAC_B on eth1.
-        let learn_pkt = make_meta("eth1", MAC_B, MAC_A);
+        let learn_pkt = make_meta(1, MAC_B, MAC_A);
         let _ = bd.process(&learn_pkt);
 
         // Now send from MAC_A on eth0 to MAC_B -> should unicast to eth1.
-        let pkt = make_meta("eth0", MAC_A, MAC_B);
+        let pkt = make_meta(0, MAC_A, MAC_B);
         let decision = bd.process(&pkt);
 
         assert_eq!(
             decision,
             L2Decision::Unicast {
-                out_ifname: "eth1".to_string()
+                out_ifindex: 1 // eth1
             }
         );
     }
@@ -162,15 +163,15 @@ mod tests {
         let mut bd = make_bridge();
 
         // Send to an unknown MAC -> should flood to all except ingress.
-        let pkt = make_meta("eth0", MAC_A, MAC_B);
+        let pkt = make_meta(0, MAC_A, MAC_B);
         let decision = bd.process(&pkt);
 
         match decision {
-            L2Decision::Flood { ref out_ifnames } => {
-                assert!(!out_ifnames.contains(&"eth0".to_string()));
-                assert!(out_ifnames.contains(&"eth1".to_string()));
-                assert!(out_ifnames.contains(&"eth2".to_string()));
-                assert_eq!(out_ifnames.len(), 2);
+            L2Decision::Flood { ref out_ifindexes } => {
+                assert!(!out_ifindexes.contains(&0)); // eth0
+                assert!(out_ifindexes.contains(&1)); // eth1
+                assert!(out_ifindexes.contains(&2)); // eth2
+                assert_eq!(out_ifindexes.len(), 2);
             }
             _ => panic!("expected Flood, got {:?}", decision),
         }
@@ -181,12 +182,12 @@ mod tests {
         let mut bd = make_bridge();
 
         // Flood should never include the ingress interface.
-        let pkt = make_meta("eth1", MAC_A, MAC_B);
+        let pkt = make_meta(1, MAC_A, MAC_B);
         let decision = bd.process(&pkt);
 
         match decision {
-            L2Decision::Flood { ref out_ifnames } => {
-                assert!(!out_ifnames.contains(&"eth1".to_string()));
+            L2Decision::Flood { ref out_ifindexes } => {
+                assert!(!out_ifindexes.contains(&1)); // eth1
             }
             _ => panic!("expected Flood, got {:?}", decision),
         }
@@ -198,13 +199,13 @@ mod tests {
 
         // Even if we've learned the broadcast MAC (which shouldn't happen
         // in practice), broadcast always floods.
-        let pkt = make_meta("eth0", MAC_A, BROADCAST_MAC);
+        let pkt = make_meta(0, MAC_A, BROADCAST_MAC);
         let decision = bd.process(&pkt);
 
         match decision {
-            L2Decision::Flood { ref out_ifnames } => {
-                assert!(!out_ifnames.contains(&"eth0".to_string()));
-                assert_eq!(out_ifnames.len(), 2);
+            L2Decision::Flood { ref out_ifindexes } => {
+                assert!(!out_ifindexes.contains(&0)); // eth0
+                assert_eq!(out_ifindexes.len(), 2);
             }
             _ => panic!("expected Flood for broadcast, got {:?}", decision),
         }

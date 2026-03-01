@@ -472,13 +472,13 @@ mod tests {
     }
 
     fn make_ipv4_meta(
-        in_ifname: &str,
+        _in_ifname: &str,
         src_addr: [u8; 4],
         dst_addr: [u8; 4],
         ttl: u8,
     ) -> PacketMeta {
         PacketMeta {
-            in_ifname: in_ifname.to_string(),
+            in_ifindex: 0, // test index
             l2: L2Info {
                 dst_mac: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
                 src_mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
@@ -504,7 +504,7 @@ mod tests {
 
     fn make_non_ipv4_meta() -> PacketMeta {
         PacketMeta {
-            in_ifname: "lan0".to_string(),
+            in_ifindex: 0, // lan0
             l2: L2Info {
                 dst_mac: [0xFF; 6],
                 src_mac: [0xAA; 6],
@@ -691,7 +691,7 @@ mod tests {
 
         // ARP packet (has L3Info::Arp, not Ipv4).
         let meta = PacketMeta {
-            in_ifname: "lan0".to_string(),
+            in_ifindex: 0, // lan0
             l2: L2Info {
                 dst_mac: [0xFF; 6],
                 src_mac: [0xAA; 6],

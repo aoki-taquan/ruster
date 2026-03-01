@@ -112,7 +112,10 @@ impl Dataplane {
     /// Creates all sub-engines (L2, ARP, L3, NAT, FW, conntrack) from config.
     /// In v0.1 the DPDK backend is mocked, so no real NIC init happens.
     pub fn init(config: &RouterConfig) -> Result<Self, DataplaneError> {
-        let l2 = l2::L2Engine::from_config(&config.l2);
+        let iface_names_for_map: Vec<String> =
+            config.interfaces.iter().map(|i| i.name.clone()).collect();
+        let ifindex_map = pipeline::IfIndexMap::from_names(&iface_names_for_map);
+        let l2 = l2::L2Engine::from_config(&config.l2, &ifindex_map);
         let mut arp = arp::ArpEngine::from_config(&config.l2, &config.interfaces);
         let l3 = routing::L3Engine::from_config(&config.routing, &config.interfaces)?;
         let nd = nd::NdEngine::from_config(&config.l2, &config.interfaces);
@@ -185,9 +188,7 @@ impl Dataplane {
             println!("  ARP: loaded {} entries from kernel", arp_loaded);
         }
 
-        let iface_names: Vec<String> = config.interfaces.iter().map(|i| i.name.clone()).collect();
-        let ifindex_map = pipeline::IfIndexMap::from_names(&iface_names);
-        let observer = Arc::new(ruster_observe::Observer::new(&iface_names));
+        let observer = Arc::new(ruster_observe::Observer::new(&iface_names_for_map));
 
         let hold_queue = arp::hold_queue::HoldQueue::new(
             config.l2.arp_hold_queue_per_ip as usize,

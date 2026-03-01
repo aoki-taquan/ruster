@@ -9,6 +9,7 @@ pub mod bridge;
 pub mod fdb;
 
 use crate::packet::PacketMeta;
+use crate::pipeline::{IfIndex, IfIndexMap};
 use bridge::{BridgeDomainState, L2Decision};
 use ruster_config::model::L2Config;
 
@@ -29,12 +30,15 @@ impl L2Engine {
     ///
     /// Each configured bridge domain is initialised with its member list
     /// and an FDB whose capacity comes from `l2_config.mac_table_max_entries`.
-    pub fn from_config(l2_config: &L2Config) -> Self {
+    pub fn from_config(l2_config: &L2Config, ifindex_map: &IfIndexMap) -> Self {
         let max_entries = l2_config.mac_table_max_entries as usize;
         let domains = l2_config
             .bridge_domains
             .iter()
-            .map(|bd| BridgeDomainState::new(bd.name.clone(), bd.members.clone(), max_entries))
+            .map(|bd| {
+                let member_indices = ifindex_map.get_indices(&bd.members);
+                BridgeDomainState::new(bd.name.clone(), member_indices, max_entries)
+            })
             .collect();
 
         Self {
@@ -46,14 +50,14 @@ impl L2Engine {
     /// Process a packet through the L2 engine.
     ///
     /// The flow is:
-    /// 1. Find the bridge domain that contains `meta.in_ifname`.
+    /// 1. Find the bridge domain that contains `meta.in_ifindex`.
     /// 2. If no bridge domain matches, return [`L2Decision::Drop`].
     /// 3. Delegate to the bridge domain's `process()` method which handles
     ///    MAC learning and forwarding lookup.
     pub fn process(&mut self, meta: &PacketMeta) -> L2Decision {
         // Find the bridge domain whose members include the ingress interface.
         for domain in &mut self.domains {
-            if domain.members.contains(&meta.in_ifname) {
+            if domain.members.contains(&meta.in_ifindex) {
                 return domain.process(meta);
             }
         }
@@ -66,10 +70,8 @@ impl L2Engine {
     ///
     /// Used by the pipeline to decide whether to invoke L2 processing
     /// before L3 routing.
-    pub fn is_bridged(&self, ifname: &str) -> bool {
-        self.domains
-            .iter()
-            .any(|d| d.members.contains(&ifname.to_string()))
+    pub fn is_bridged(&self, ifindex: IfIndex) -> bool {
+        self.domains.iter().any(|d| d.members.contains(&ifindex))
     }
 
     /// Run aging on all bridge domains' FDBs.
@@ -85,6 +87,7 @@ impl L2Engine {
 mod tests {
     use super::*;
     use crate::packet::{L2Info, PacketMeta};
+    use crate::pipeline::IfIndexMap;
     use ruster_config::model::{BridgeDomain, L2Config};
 
     const MAC_A: [u8; 6] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
@@ -105,9 +108,18 @@ mod tests {
         }
     }
 
-    fn make_meta(in_ifname: &str, src_mac: [u8; 6], dst_mac: [u8; 6]) -> PacketMeta {
+    fn make_ifindex_map() -> IfIndexMap {
+        IfIndexMap::from_names(&[
+            "eth0".to_string(),
+            "eth1".to_string(),
+            "eth2".to_string(),
+            "wan0".to_string(),
+        ])
+    }
+
+    fn make_meta(in_ifindex: IfIndex, src_mac: [u8; 6], dst_mac: [u8; 6]) -> PacketMeta {
         PacketMeta {
-            in_ifname: in_ifname.to_string(),
+            in_ifindex,
             l2: L2Info {
                 dst_mac,
                 src_mac,
@@ -122,7 +134,7 @@ mod tests {
     #[test]
     fn l2engine_from_config() {
         let cfg = make_l2_config();
-        let engine = L2Engine::from_config(&cfg);
+        let engine = L2Engine::from_config(&cfg, &make_ifindex_map());
 
         assert_eq!(engine.domains.len(), 1);
         assert_eq!(engine.domains[0].name, "br0");
@@ -133,20 +145,20 @@ mod tests {
     #[test]
     fn l2engine_process_full_flow() {
         let cfg = make_l2_config();
-        let mut engine = L2Engine::from_config(&cfg);
+        let mut engine = L2Engine::from_config(&cfg, &make_ifindex_map());
 
         // Step 1: MAC_B arrives on eth1 (destination doesn't matter here).
-        let learn_pkt = make_meta("eth1", MAC_B, MAC_A);
+        let learn_pkt = make_meta(1, MAC_B, MAC_A);
         let _ = engine.process(&learn_pkt);
 
         // Step 2: MAC_A sends to MAC_B on eth0 -> should unicast to eth1.
-        let pkt = make_meta("eth0", MAC_A, MAC_B);
+        let pkt = make_meta(0, MAC_A, MAC_B);
         let decision = engine.process(&pkt);
 
         assert_eq!(
             decision,
             L2Decision::Unicast {
-                out_ifname: "eth1".to_string()
+                out_ifindex: 1 // eth1
             }
         );
     }
@@ -155,10 +167,10 @@ mod tests {
     fn l2engine_age_all() {
         let mut cfg = make_l2_config();
         cfg.mac_aging_sec = 0; // Age out everything immediately.
-        let mut engine = L2Engine::from_config(&cfg);
+        let mut engine = L2Engine::from_config(&cfg, &make_ifindex_map());
 
         // Learn a MAC.
-        let pkt = make_meta("eth0", MAC_A, MAC_B);
+        let pkt = make_meta(0, MAC_A, MAC_B);
         let _ = engine.process(&pkt);
 
         // Age should remove the learned entry.
@@ -169,10 +181,10 @@ mod tests {
     #[test]
     fn bridge_drop_unknown_domain() {
         let cfg = make_l2_config();
-        let mut engine = L2Engine::from_config(&cfg);
+        let mut engine = L2Engine::from_config(&cfg, &make_ifindex_map());
 
         // "wan0" is not a member of any bridge domain.
-        let pkt = make_meta("wan0", MAC_A, MAC_B);
+        let pkt = make_meta(3, MAC_A, MAC_B);
         let decision = engine.process(&pkt);
 
         assert_eq!(decision, L2Decision::Drop);

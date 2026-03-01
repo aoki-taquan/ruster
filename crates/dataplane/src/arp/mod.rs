@@ -148,13 +148,11 @@ impl ArpEngine {
     /// my translation table, update the sender hardware address field [...]
     /// If I am the target protocol address, [set Merge_flag] and add the
     /// triplet to the table."
-    pub fn process_arp(&mut self, meta: &PacketMeta) -> ArpAction {
+    pub fn process_arp(&mut self, meta: &PacketMeta, in_ifname: &str) -> ArpAction {
         let arp_info = match &meta.l3 {
             Some(L3Info::Arp(info)) => info,
             _ => return ArpAction::Drop,
         };
-
-        let in_ifname = &meta.in_ifname;
 
         // Ensure we have an ARP cache for this interface. If not, create one
         // (defensive; normally from_config already created it).
@@ -569,7 +567,7 @@ mod tests {
     }
 
     fn make_arp_meta(
-        in_ifname: &str,
+        _in_ifname: &str,
         src_mac: [u8; 6],
         dst_mac: [u8; 6],
         operation: u16,
@@ -579,7 +577,7 @@ mod tests {
         target_ip: [u8; 4],
     ) -> PacketMeta {
         PacketMeta {
-            in_ifname: in_ifname.to_string(),
+            in_ifindex: 0, // test index
             l2: L2Info {
                 dst_mac,
                 src_mac,
@@ -633,7 +631,7 @@ mod tests {
             OUR_IP,
         );
 
-        let action = engine.process_arp(&meta);
+        let action = engine.process_arp(&meta, "eth0");
 
         // We should reply with our MAC.
         assert_eq!(
@@ -672,7 +670,7 @@ mod tests {
             UNKNOWN_IP,
         );
 
-        let action = engine.process_arp(&meta);
+        let action = engine.process_arp(&meta, "eth0");
 
         // We should not reply, but still learn the sender.
         assert_eq!(action, ArpAction::Update);
@@ -699,7 +697,7 @@ mod tests {
             OUR_IP,
         );
 
-        let action = engine.process_arp(&meta);
+        let action = engine.process_arp(&meta, "eth0");
         assert_eq!(action, ArpAction::Update);
 
         // Cache should now contain the peer's binding.
@@ -735,7 +733,7 @@ mod tests {
             PEER_IP, // gratuitous: target == sender
         );
 
-        let action = engine.process_arp(&meta);
+        let action = engine.process_arp(&meta, "eth0");
         assert_eq!(action, ArpAction::Update);
 
         // Cache should be updated with the new MAC.
@@ -759,7 +757,7 @@ mod tests {
             PEER_IP,
         );
 
-        let action = engine.process_arp(&meta);
+        let action = engine.process_arp(&meta, "eth0");
         assert_eq!(action, ArpAction::Drop);
     }
 
@@ -851,7 +849,7 @@ mod tests {
         let mut engine = make_engine();
 
         let meta = PacketMeta {
-            in_ifname: "eth0".to_string(),
+            in_ifindex: 0, // eth0
             l2: L2Info {
                 dst_mac: OUR_MAC,
                 src_mac: PEER_MAC,
@@ -862,7 +860,7 @@ mod tests {
             raw_len: 64,
         };
 
-        let action = engine.process_arp(&meta);
+        let action = engine.process_arp(&meta, "eth0");
         assert_eq!(action, ArpAction::Drop);
     }
 

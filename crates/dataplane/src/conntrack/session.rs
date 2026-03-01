@@ -239,7 +239,7 @@ mod tests {
     #[test]
     fn session_key_from_tcp_packet() {
         let meta = PacketMeta {
-            in_ifname: "eth0".to_string(),
+            in_ifindex: 0, // eth0
             l2: make_ipv4_l2(),
             l3: Some(L3Info::Ipv4(make_ipv4_info(
                 [192, 168, 1, 100],
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn session_key_from_udp_packet() {
         let meta = PacketMeta {
-            in_ifname: "eth0".to_string(),
+            in_ifindex: 0, // eth0
             l2: make_ipv4_l2(),
             l3: Some(L3Info::Ipv4(make_ipv4_info(
                 [10, 0, 0, 5],
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn session_key_from_icmp_packet() {
         let meta = PacketMeta {
-            in_ifname: "eth0".to_string(),
+            in_ifindex: 0, // eth0
             l2: make_ipv4_l2(),
             l3: Some(L3Info::Ipv4(make_ipv4_info(
                 [192, 168, 1, 1],
@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn session_key_from_non_ipv4_returns_none() {
         let meta = PacketMeta {
-            in_ifname: "eth0".to_string(),
+            in_ifindex: 0, // eth0
             l2: L2Info {
                 dst_mac: [0xFF; 6],
                 src_mac: [0xAA; 6],
@@ -347,7 +347,7 @@ mod tests {
     #[test]
     fn session_key_from_ipv4_no_l4_returns_none() {
         let meta = PacketMeta {
-            in_ifname: "eth0".to_string(),
+            in_ifindex: 0, // eth0
             l2: make_ipv4_l2(),
             l3: Some(L3Info::Ipv4(make_ipv4_info(
                 [10, 0, 0, 1],

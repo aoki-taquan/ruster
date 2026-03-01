@@ -209,9 +209,9 @@ fn make_conntrack_config() -> ConntrackConfig {
 
 // ── Packet builders ──────────────────────────────────────────────────
 
-fn make_l2_meta(in_ifname: &str, src_mac: [u8; 6], dst_mac: [u8; 6]) -> PacketMeta {
+fn make_l2_meta(_in_ifname: &str, src_mac: [u8; 6], dst_mac: [u8; 6]) -> PacketMeta {
     PacketMeta {
-        in_ifname: in_ifname.to_string(),
+        in_ifindex: 0, // test index
         l2: L2Info {
             dst_mac,
             src_mac,
@@ -224,14 +224,14 @@ fn make_l2_meta(in_ifname: &str, src_mac: [u8; 6], dst_mac: [u8; 6]) -> PacketMe
 }
 
 fn make_ipv4_tcp_meta(
-    in_ifname: &str,
+    _in_ifname: &str,
     src_addr: [u8; 4],
     dst_addr: [u8; 4],
     src_port: u16,
     dst_port: u16,
 ) -> PacketMeta {
     PacketMeta {
-        in_ifname: in_ifname.to_string(),
+        in_ifindex: 0, // test index
         l2: L2Info {
             dst_mac: [0x00, 0x11, 0x22, 0x33, 0x44, 0x55],
             src_mac: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF],
@@ -277,7 +277,12 @@ fn warmup<F: FnMut()>(mut f: F) {
 
 fn bench_l2_fdb_hit() -> BenchResult {
     let l2_config = make_l2_config();
-    let mut engine = L2Engine::from_config(&l2_config);
+    let ifm = ruster_dataplane::pipeline::IfIndexMap::from_names(&[
+        "eth0".to_string(),
+        "eth1".to_string(),
+        "eth2".to_string(),
+    ]);
+    let mut engine = L2Engine::from_config(&l2_config, &ifm);
 
     // Learn a MAC so subsequent lookups are cache hits.
     let dst_mac: [u8; 6] = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
@@ -511,7 +516,7 @@ fn bench_arp_cache_hit() -> BenchResult {
     use ruster_dataplane::packet::ArpInfo;
 
     let reply_meta = PacketMeta {
-        in_ifname: "lan0".to_string(),
+        in_ifindex: 0, // lan0
         l2: L2Info {
             dst_mac: [0x00, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE],
             src_mac: [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01],
@@ -527,7 +532,7 @@ fn bench_arp_cache_hit() -> BenchResult {
         l4: None,
         raw_len: 42,
     };
-    engine.process_arp(&reply_meta);
+    engine.process_arp(&reply_meta, "eth0");
 
     // Now resolve should hit the cache.
     let target_ip: [u8; 4] = [192, 168, 1, 100];
@@ -615,12 +620,12 @@ fn bench_packet_parse() -> BenchResult {
     let raw_packet = build_raw_tcp_packet();
 
     warmup(|| {
-        let _ = ruster_dataplane::packet::parse_packet(&raw_packet, "lan0");
+        let _ = ruster_dataplane::packet::parse_packet(&raw_packet, 0);
     });
 
     let start = Instant::now();
     for _ in 0..ITERATIONS {
-        let _ = ruster_dataplane::packet::parse_packet(&raw_packet, "lan0");
+        let _ = ruster_dataplane::packet::parse_packet(&raw_packet, 0);
     }
     let elapsed = start.elapsed();
 
@@ -795,7 +800,12 @@ fn verify_correctness() {
 
     // L2 FDB
     let l2_config = make_l2_config();
-    let mut l2_engine = L2Engine::from_config(&l2_config);
+    let ifm2 = ruster_dataplane::pipeline::IfIndexMap::from_names(&[
+        "eth0".to_string(),
+        "eth1".to_string(),
+        "eth2".to_string(),
+    ]);
+    let mut l2_engine = L2Engine::from_config(&l2_config, &ifm2);
     let dst_mac: [u8; 6] = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
     let learn_meta = make_l2_meta("lan1", dst_mac, [0x00; 6]);
     l2_engine.process(&learn_meta);
@@ -872,7 +882,7 @@ fn verify_correctness() {
 
     // Packet parse
     let raw = build_raw_tcp_packet();
-    let result = ruster_dataplane::packet::parse_packet(&raw, "lan0");
+    let result = ruster_dataplane::packet::parse_packet(&raw, 0);
     assert!(result.is_ok(), "Parse: expected Ok");
     println!("  Packet parse        : OK");
 

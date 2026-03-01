@@ -21,6 +21,7 @@ use ruster_dataplane::l2::bridge::L2Decision;
 use ruster_dataplane::l2::L2Engine;
 use ruster_dataplane::nat::{NatAction, NatEngine};
 use ruster_dataplane::packet::{Ipv4Info, L2Info, L3Info, L4Info, PacketMeta, TcpInfo};
+use ruster_dataplane::pipeline::IfIndexMap;
 use ruster_dataplane::routing::{L3Decision, L3DropReason, L3Engine};
 use ruster_observe::{DropReason, Observer};
 
@@ -243,7 +244,7 @@ fn make_tcp_l4(src_port: u16, dst_port: u16, flags: u8) -> L4Info {
 
 /// Build a TCP packet meta for LAN -> WAN traffic.
 fn make_tcp_meta(
-    in_ifname: &str,
+    _in_ifname: &str,
     src_mac: [u8; 6],
     dst_mac: [u8; 6],
     src_ip: [u8; 4],
@@ -254,7 +255,7 @@ fn make_tcp_meta(
     flags: u8,
 ) -> PacketMeta {
     PacketMeta {
-        in_ifname: in_ifname.to_string(),
+        in_ifindex: 0, // test index
         l2: make_l2(src_mac, dst_mac),
         l3: Some(L3Info::Ipv4(make_ipv4(src_ip, dst_ip, ttl, 6))),
         l4: Some(make_tcp_l4(src_port, dst_port, flags)),
@@ -285,11 +286,12 @@ const TCP_SYN_ACK: u8 = TCP_SYN | TCP_ACK;
 #[test]
 fn e2e_l2_bridge_flood_then_unicast() {
     let (l2_config, _, _, _, _) = make_home_router_config();
-    let mut l2 = L2Engine::from_config(&l2_config);
+    let ifm = IfIndexMap::from_names(&["eth0".to_string(), "eth1".to_string(), "eth2".to_string()]);
+    let mut l2 = L2Engine::from_config(&l2_config, &ifm);
 
     // ── Step 1: Host A sends to Host B (unknown MAC) on eth1 → flood ─
     let pkt1 = PacketMeta {
-        in_ifname: "eth1".to_string(),
+        in_ifindex: 1, // eth1
         l2: make_l2(HOST_A_MAC, HOST_B_MAC),
         l3: None,
         l4: None,
@@ -297,14 +299,14 @@ fn e2e_l2_bridge_flood_then_unicast() {
     };
     let decision1 = l2.process(&pkt1);
     match &decision1 {
-        L2Decision::Flood { out_ifnames } => {
+        L2Decision::Flood { out_ifindexes } => {
             // Should flood to eth2 (the other bridge member), not eth1.
             assert!(
-                out_ifnames.contains(&"eth2".to_string()),
+                out_ifindexes.contains(&2), // eth2
                 "flood should include eth2"
             );
             assert!(
-                !out_ifnames.contains(&"eth1".to_string()),
+                !out_ifindexes.contains(&1), // eth1
                 "flood should exclude ingress eth1"
             );
         }
@@ -313,7 +315,7 @@ fn e2e_l2_bridge_flood_then_unicast() {
 
     // ── Step 2: Host B replies from eth2 (learns Host B MAC on eth2) ─
     let pkt2 = PacketMeta {
-        in_ifname: "eth2".to_string(),
+        in_ifindex: 2, // eth2
         l2: make_l2(HOST_B_MAC, HOST_A_MAC),
         l3: None,
         l4: None,
@@ -324,14 +326,14 @@ fn e2e_l2_bridge_flood_then_unicast() {
     assert_eq!(
         decision2,
         L2Decision::Unicast {
-            out_ifname: "eth1".to_string()
+            out_ifindex: 1 // eth1
         },
         "after learning, Host A should be unicast to eth1"
     );
 
     // ── Step 3: Host A sends again to Host B → unicast to eth2 ───────
     let pkt3 = PacketMeta {
-        in_ifname: "eth1".to_string(),
+        in_ifindex: 1, // eth1
         l2: make_l2(HOST_A_MAC, HOST_B_MAC),
         l3: None,
         l4: None,
@@ -341,7 +343,7 @@ fn e2e_l2_bridge_flood_then_unicast() {
     assert_eq!(
         decision3,
         L2Decision::Unicast {
-            out_ifname: "eth2".to_string()
+            out_ifindex: 2 // eth2
         },
         "after learning, Host B should be unicast to eth2"
     );
@@ -358,7 +360,7 @@ fn e2e_l3_static_routing_lan_to_wan() {
 
     // LAN host 192.168.1.100 sends to 8.8.8.8
     let meta = PacketMeta {
-        in_ifname: "eth1".to_string(),
+        in_ifindex: 1, // eth1
         l2: make_l2(HOST_A_MAC, LAN_MAC),
         l3: Some(L3Info::Ipv4(make_ipv4(HOST_A_IP, EXTERNAL_IP, 64, 6))),
         l4: Some(make_tcp_l4(49152, 80, TCP_SYN)),
@@ -388,7 +390,7 @@ fn e2e_l3_ttl_expired_vs_local_delivery() {
 
     // ── Case A: TTL=1 destined for external IP → Drop(TtlExpired) ────
     let meta_ttl1 = PacketMeta {
-        in_ifname: "eth1".to_string(),
+        in_ifindex: 1, // eth1
         l2: make_l2(HOST_A_MAC, LAN_MAC),
         l3: Some(L3Info::Ipv4(make_ipv4(HOST_A_IP, EXTERNAL_IP, 1, 6))),
         l4: Some(make_tcp_l4(49152, 80, TCP_SYN)),
@@ -405,7 +407,7 @@ fn e2e_l3_ttl_expired_vs_local_delivery() {
 
     // ── Case B: TTL=1 to our own IP → LocalDelivery (TTL not checked) ─
     let meta_local = PacketMeta {
-        in_ifname: "eth1".to_string(),
+        in_ifindex: 1, // eth1
         l2: make_l2(HOST_A_MAC, LAN_MAC),
         l3: Some(L3Info::Ipv4(make_ipv4(HOST_A_IP, LAN_IP, 1, 6))),
         l4: Some(make_tcp_l4(49152, 22, TCP_SYN)),
@@ -829,7 +831,7 @@ fn e2e_full_pipeline_outbound_and_reply() {
     // Step 5: L3 routing for reply (to LAN subnet)
     // Simulate the NAT-rewritten packet destined to LAN host
     let reply_after_nat = PacketMeta {
-        in_ifname: "eth0".to_string(),
+        in_ifindex: 0, // eth0
         l2: make_l2([0xEE; 6], WAN_MAC),
         l3: Some(L3Info::Ipv4(make_ipv4(EXTERNAL_IP, HOST_A_IP, 63, 6))),
         l4: Some(make_tcp_l4(80, 49152, TCP_SYN_ACK)),
@@ -913,7 +915,7 @@ fn e2e_observer_counter_tracking() {
 
     // ── Packet 2: TTL expired → drop ────────────────────────────────
     let pkt2 = PacketMeta {
-        in_ifname: "eth1".to_string(),
+        in_ifindex: 1, // eth1
         l2: make_l2(HOST_A_MAC, LAN_MAC),
         l3: Some(L3Info::Ipv4(make_ipv4(HOST_A_IP, EXTERNAL_IP, 1, 6))),
         l4: Some(make_tcp_l4(49153, 80, TCP_SYN)),

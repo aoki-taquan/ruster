@@ -6,11 +6,13 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use crate::pipeline::IfIndex;
+
 /// A single FDB entry recording which interface a MAC address was learned on.
 #[derive(Debug, Clone)]
 pub struct FdbEntry {
-    /// The interface name where this MAC address was last observed.
-    pub out_ifname: String,
+    /// The interface index where this MAC address was last observed.
+    pub out_ifindex: IfIndex,
     /// The time at which this entry was learned (or last refreshed).
     pub learned_at: Instant,
 }
@@ -36,23 +38,23 @@ impl Fdb {
         }
     }
 
-    /// Learn a MAC address: record that `mac` was seen on `in_ifname`.
+    /// Learn a MAC address: record that `mac` was seen on `in_ifindex`.
     ///
     /// If the MAC is already present, the entry is updated with the new
     /// interface and a refreshed timestamp. If the table is full and the
     /// MAC is not already present, the learning is silently ignored.
-    pub fn learn(&mut self, mac: [u8; 6], in_ifname: &str) {
+    pub fn learn(&mut self, mac: [u8; 6], in_ifindex: IfIndex) {
         if self.entries.contains_key(&mac) {
             // Update existing entry (port migration or timestamp refresh).
             let entry = self.entries.get_mut(&mac).unwrap();
-            entry.out_ifname = in_ifname.to_string();
+            entry.out_ifindex = in_ifindex;
             entry.learned_at = Instant::now();
         } else if self.entries.len() < self.max_entries {
             // Insert new entry only if there is room.
             self.entries.insert(
                 mac,
                 FdbEntry {
-                    out_ifname: in_ifname.to_string(),
+                    out_ifindex: in_ifindex,
                     learned_at: Instant::now(),
                 },
             );
@@ -102,10 +104,10 @@ mod tests {
     #[test]
     fn fdb_learn_and_lookup() {
         let mut fdb = Fdb::new(100);
-        fdb.learn(MAC_A, "eth0");
+        fdb.learn(MAC_A, 0);
 
         let entry = fdb.lookup(&MAC_A).expect("MAC_A should be in FDB");
-        assert_eq!(entry.out_ifname, "eth0");
+        assert_eq!(entry.out_ifindex, 0);
     }
 
     #[test]
@@ -117,7 +119,7 @@ mod tests {
     #[test]
     fn fdb_age_removes_old() {
         let mut fdb = Fdb::new(100);
-        fdb.learn(MAC_A, "eth0");
+        fdb.learn(MAC_A, 0);
 
         // Sleep briefly so the entry ages past 0 seconds.
         thread::sleep(Duration::from_millis(50));
@@ -137,12 +139,12 @@ mod tests {
     #[test]
     fn fdb_max_entries() {
         let mut fdb = Fdb::new(2);
-        fdb.learn(MAC_A, "eth0");
-        fdb.learn(MAC_B, "eth1");
+        fdb.learn(MAC_A, 0);
+        fdb.learn(MAC_B, 1);
         assert_eq!(fdb.len(), 2);
 
         // Table is full; new MAC should be ignored.
-        fdb.learn(MAC_C, "eth2");
+        fdb.learn(MAC_C, 2);
         assert_eq!(fdb.len(), 2);
         assert!(fdb.lookup(&MAC_C).is_none());
     }
@@ -150,13 +152,13 @@ mod tests {
     #[test]
     fn fdb_learn_updates_existing() {
         let mut fdb = Fdb::new(100);
-        fdb.learn(MAC_A, "eth0");
+        fdb.learn(MAC_A, 0);
 
         // Same MAC learned on a different interface (port migration).
-        fdb.learn(MAC_A, "eth1");
+        fdb.learn(MAC_A, 1);
         assert_eq!(fdb.len(), 1);
 
         let entry = fdb.lookup(&MAC_A).unwrap();
-        assert_eq!(entry.out_ifname, "eth1");
+        assert_eq!(entry.out_ifindex, 1);
     }
 }

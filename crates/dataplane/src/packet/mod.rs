@@ -17,6 +17,8 @@ pub mod udp;
 
 use std::fmt;
 
+use crate::pipeline::IfIndex;
+
 // ── EtherType constants ────────────────────────────────────────────
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;
@@ -39,8 +41,8 @@ const IP_PROTO_ICMPV6: u8 = 58;
 /// re-parsing the raw packet bytes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PacketMeta {
-    /// Receive interface name (set by the caller, not the parser).
-    pub in_ifname: String,
+    /// Receive interface index (set by the caller, not the parser).
+    pub in_ifindex: IfIndex,
     /// L2 (Ethernet) information.
     pub l2: L2Info,
     /// L3 information (parsed from the Ethernet payload), if applicable.
@@ -259,7 +261,7 @@ impl fmt::Display for DropReason {
 /// # Errors
 ///
 /// Returns [`DropReason`] if the packet is malformed at any layer.
-pub fn parse_packet(data: &[u8], in_ifname: &str) -> Result<PacketMeta, DropReason> {
+pub fn parse_packet(data: &[u8], in_ifindex: IfIndex) -> Result<PacketMeta, DropReason> {
     // ── L2: Ethernet ───────────────────────────────────────────────
     let (l2, eth_payload_offset) = ethernet::parse_ethernet(data)?;
     let eth_payload = &data[eth_payload_offset..];
@@ -309,7 +311,7 @@ pub fn parse_packet(data: &[u8], in_ifname: &str) -> Result<PacketMeta, DropReas
     };
 
     Ok(PacketMeta {
-        in_ifname: in_ifname.to_string(),
+        in_ifindex,
         l2,
         l3,
         l4,
@@ -478,9 +480,9 @@ mod tests {
     #[test]
     fn full_tcp_packet() {
         let pkt = make_full_tcp_packet();
-        let meta = parse_packet(&pkt, "eth0").unwrap();
+        let meta = parse_packet(&pkt, 0).unwrap();
 
-        assert_eq!(meta.in_ifname, "eth0");
+        assert_eq!(meta.in_ifindex, 0);
         assert_eq!(meta.raw_len, pkt.len());
 
         // L2
@@ -518,9 +520,9 @@ mod tests {
     #[test]
     fn full_udp_packet() {
         let pkt = make_full_udp_packet();
-        let meta = parse_packet(&pkt, "wan0").unwrap();
+        let meta = parse_packet(&pkt, 1).unwrap();
 
-        assert_eq!(meta.in_ifname, "wan0");
+        assert_eq!(meta.in_ifindex, 1);
         assert_eq!(meta.raw_len, pkt.len());
 
         // L2
@@ -552,9 +554,9 @@ mod tests {
     #[test]
     fn full_arp_packet() {
         let pkt = make_full_arp_packet();
-        let meta = parse_packet(&pkt, "lan0").unwrap();
+        let meta = parse_packet(&pkt, 2).unwrap();
 
-        assert_eq!(meta.in_ifname, "lan0");
+        assert_eq!(meta.in_ifindex, 2);
         assert_eq!(meta.raw_len, pkt.len());
 
         // L2
@@ -579,7 +581,7 @@ mod tests {
     #[test]
     fn parse_packet_too_short() {
         let data = [0u8; 10];
-        assert_eq!(parse_packet(&data, "eth0"), Err(DropReason::TooShort));
+        assert_eq!(parse_packet(&data, 0), Err(DropReason::TooShort));
     }
 
     #[test]
@@ -590,7 +592,7 @@ mod tests {
             0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, // src
             0x99, 0x99, // EtherType: unknown
         ];
-        let meta = parse_packet(&frame, "eth0").unwrap();
+        let meta = parse_packet(&frame, 0).unwrap();
         assert!(meta.l3.is_none());
         assert!(meta.l4.is_none());
         assert_eq!(meta.l2.ethertype, 0x9999);
@@ -628,7 +630,7 @@ mod tests {
         pkt.extend_from_slice(&[0x00, 0x01]); // Identifier
         pkt.extend_from_slice(&[0x00, 0x01]); // Sequence
 
-        let meta = parse_packet(&pkt, "eth0").unwrap();
+        let meta = parse_packet(&pkt, 0).unwrap();
 
         match meta.l3.as_ref().unwrap() {
             L3Info::Ipv4(ipv4) => {
@@ -671,7 +673,7 @@ mod tests {
 
         set_ipv4_checksum(&mut pkt[ipv4_start..ipv4_start + 20]);
 
-        let meta = parse_packet(&pkt, "eth0").unwrap();
+        let meta = parse_packet(&pkt, 0).unwrap();
         assert!(meta.l3.is_some());
         assert!(meta.l4.is_none()); // Unknown protocol -> L4 = None
     }
@@ -715,7 +717,7 @@ mod tests {
     #[test]
     fn ipv6_udp_full_parse() {
         let pkt = make_ipv6_udp_packet();
-        let meta = parse_packet(&pkt, "eth0").unwrap();
+        let meta = parse_packet(&pkt, 0).unwrap();
 
         // L2
         assert_eq!(meta.l2.ethertype, 0x86DD);
@@ -786,7 +788,7 @@ mod tests {
             0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
         ]);
 
-        let meta = parse_packet(&pkt, "lan0").unwrap();
+        let meta = parse_packet(&pkt, 2).unwrap();
 
         // L3: IPv6
         assert!(matches!(&meta.l3, Some(L3Info::Ipv6(_))));
@@ -822,6 +824,6 @@ mod tests {
                                               // Only 30 bytes of IPv6 header (need 40)
         pkt.extend_from_slice(&[0x60; 30]);
 
-        assert_eq!(parse_packet(&pkt, "eth0"), Err(DropReason::TruncatedL3));
+        assert_eq!(parse_packet(&pkt, 0), Err(DropReason::TruncatedL3));
     }
 }
