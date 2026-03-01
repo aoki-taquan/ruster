@@ -217,7 +217,7 @@ impl Dataplane {
     /// forwarded packets via [`io::PacketIo::tx`].
     ///
     /// This is the single-threaded (worker_count=1) path. For multi-worker
-    /// mode, use [`run_with_workers`].
+    /// mode, use [`Dataplane::run_with_workers`].
     ///
     /// Returns `Ok(())` on clean shutdown.
     pub fn run(
@@ -326,7 +326,7 @@ impl Dataplane {
 
     /// Run the maintenance-only loop (no packet processing).
     ///
-    /// Used by [`run_with_workers`] where workers handle packet I/O.
+    /// Used by [`Dataplane::run_with_workers`] where workers handle packet I/O.
     fn run_maintenance_loop(&self, shutdown: &AtomicBool, io: &dyn io::PacketIo) {
         let mut last_stats = std::time::Instant::now();
         let mut last_arp_refresh = std::time::Instant::now();
