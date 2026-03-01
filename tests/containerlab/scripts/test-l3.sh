@@ -112,8 +112,8 @@ if run_on lan-host which traceroute > /dev/null 2>&1 || \
         report "traceroute-hop" "FAIL"
     fi
 else
-    echo "  Skipping: traceroute not available and could not install"
-    report "traceroute-hop" "FAIL"
+    echo "  Skipped: traceroute not available and could not install"
+    report "traceroute-hop" "SKIP"
 fi
 
 # Test 6: TTL decrement — verify ruster (not kernel) is forwarding

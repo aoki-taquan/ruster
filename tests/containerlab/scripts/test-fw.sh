@@ -106,9 +106,10 @@ fi
 echo ""
 echo "-- Test 4: Blocked (wan-host -> lan-host unsolicited forward) --"
 
-# Verify the route exists so we know the test is meaningful
+# Verify the route exists so we know the test is meaningful.
+# Accept either an explicit route to 192.168.1.0/24 or a default route via ruster.
 WAN_ROUTES=$(run_on wan-host ip route show 2>/dev/null || true)
-if ! echo "$WAN_ROUTES" | grep -q "192.168.1.0/24"; then
+if ! echo "$WAN_ROUTES" | grep -qE "192.168.1.0/24|default via 10.0.0.1"; then
     echo "  Diagnostic: no route to 192.168.1.0/24 on wan-host."
     echo "  Cannot test WAN->LAN forwarding without a route."
     echo "  Routes:"
