@@ -318,6 +318,7 @@ pub fn handle_pipeline_result(
             new_hop_limit,
             next_hop_v6,
             srv6_new_da,
+            srv6_srh_rewrite,
         } => {
             let egress_iface = ifm.get_name(egress_ifindex);
             dp.observer.inc_forwarded();
@@ -326,6 +327,9 @@ pub fn handle_pipeline_result(
 
             if let Some(ref new_da) = srv6_new_da {
                 rewrite::rewrite_ipv6_da(&mut data, new_da);
+            }
+            if let Some((srh_offset, new_sl)) = srv6_srh_rewrite {
+                rewrite::rewrite_srh_segments_left(&mut data, srh_offset, new_sl);
             }
             rewrite::rewrite_ipv6_hop_limit(&mut data, new_hop_limit);
 
@@ -422,6 +426,94 @@ pub fn handle_pipeline_result(
             if reason == pipeline::DropReason::NatDrop {
                 dp.observer.inc_nat_drop();
             }
+        }
+        pipeline::PipelineResult::DecapToIpv4 { inner_offset } => {
+            // SRv6 End.DT4: extract inner IPv4 packet and re-inject.
+            //
+            // RFC-REF: RFC 8986 Section 4.1.4
+            // "Pop the outer IPv6 header with all its extension headers and
+            // submit the inner IPv4 packet to the IPv4 FIB."
+            if inner_offset >= raw_pkt.data.len() {
+                dp.observer
+                    .inc_drop_reason(ruster_observe::DropReason::ParseError);
+                return;
+            }
+            let inner = &raw_pkt.data[inner_offset..];
+            // Build a synthetic Ethernet frame: reuse original MACs + IPv4 EtherType.
+            let mut synth = Vec::with_capacity(14 + inner.len());
+            synth.extend_from_slice(&raw_pkt.data[0..12]); // dst + src MAC
+            synth.extend_from_slice(&[0x08, 0x00]); // EtherType: IPv4
+            synth.extend_from_slice(inner);
+
+            let synth_pkt = io::RawPacket {
+                ingress_iface: raw_pkt.ingress_iface.clone(),
+                data: synth,
+            };
+
+            let inner_result = {
+                let mut l2_guard = dp.l2.lock().unwrap();
+                let mut ct_guard = dp.conntrack.lock().unwrap();
+                let mut nat_guard = dp.nat.lock().unwrap();
+                let mut nd_guard = dp.nd.lock().unwrap();
+                pipeline::process_packet_v6(
+                    &synth_pkt,
+                    &mut l2_guard,
+                    &dp.l3,
+                    &dp.firewall,
+                    &mut ct_guard,
+                    &mut nat_guard,
+                    &dp.zone_resolver,
+                    &dp.iface_macs,
+                    Some(&mut nd_guard),
+                    Some(&dp.ipv6_routes),
+                    dp.srv6.as_ref(),
+                )
+            };
+            handle_pipeline_result(dp, io, &synth_pkt, inner_result);
+        }
+        pipeline::PipelineResult::DecapToIpv6 { inner_offset } => {
+            // SRv6 End.DT6: extract inner IPv6 packet and re-inject.
+            //
+            // RFC-REF: RFC 8986 Section 4.1.5
+            // "Pop the outer IPv6 header with all its extension headers and
+            // submit the inner IPv6 packet to the IPv6 FIB."
+            if inner_offset >= raw_pkt.data.len() {
+                dp.observer
+                    .inc_drop_reason(ruster_observe::DropReason::ParseError);
+                return;
+            }
+            let inner = &raw_pkt.data[inner_offset..];
+            // Build a synthetic Ethernet frame: reuse original MACs + IPv6 EtherType.
+            let mut synth = Vec::with_capacity(14 + inner.len());
+            synth.extend_from_slice(&raw_pkt.data[0..12]); // dst + src MAC
+            synth.extend_from_slice(&[0x86, 0xDD]); // EtherType: IPv6
+            synth.extend_from_slice(inner);
+
+            let synth_pkt = io::RawPacket {
+                ingress_iface: raw_pkt.ingress_iface.clone(),
+                data: synth,
+            };
+
+            let inner_result = {
+                let mut l2_guard = dp.l2.lock().unwrap();
+                let mut ct_guard = dp.conntrack.lock().unwrap();
+                let mut nat_guard = dp.nat.lock().unwrap();
+                let mut nd_guard = dp.nd.lock().unwrap();
+                pipeline::process_packet_v6(
+                    &synth_pkt,
+                    &mut l2_guard,
+                    &dp.l3,
+                    &dp.firewall,
+                    &mut ct_guard,
+                    &mut nat_guard,
+                    &dp.zone_resolver,
+                    &dp.iface_macs,
+                    Some(&mut nd_guard),
+                    Some(&dp.ipv6_routes),
+                    dp.srv6.as_ref(),
+                )
+            };
+            handle_pipeline_result(dp, io, &synth_pkt, inner_result);
         }
         pipeline::PipelineResult::Consumed => {
             dp.observer.inc_local_delivery();

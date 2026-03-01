@@ -21,6 +21,7 @@ use crate::conntrack::session::{SessionKey, SessionState, TcpState};
 use crate::conntrack::{ConntrackEngine, ConntrackError};
 use crate::firewall::{FirewallEngine, FwChain, FwContext, FwVerdict};
 use crate::icmp::{self, IcmpReply};
+use crate::icmpv6;
 use crate::io::RawPacket;
 use crate::l2::bridge::L2Decision;
 use crate::l2::L2Engine;
@@ -170,6 +171,30 @@ pub enum PipelineResult {
         /// If SRv6 processing updated the DA, the new destination address
         /// to write into the packet's IPv6 header (bytes 24..40).
         srv6_new_da: Option<[u8; 16]>,
+        /// If SRv6 processing modified the SRH, `(srh_offset, new_sl)` for rewriting.
+        ///
+        /// RFC-REF: RFC 8986 Section 4.1
+        /// "Decrement SL" — the SRH Segments Left field must be
+        /// rewritten in the wire packet for downstream SRv6 nodes.
+        srv6_srh_rewrite: Option<(usize, u8)>,
+    },
+    /// SRv6 decapsulated inner IPv4 packet to re-inject into the pipeline.
+    ///
+    /// RFC-REF: RFC 8986 Section 4.1.4
+    /// "Pop the outer IPv6 header with all its extension headers and
+    /// submit the inner IPv4 packet to the IPv4 FIB."
+    DecapToIpv4 {
+        /// Byte offset of the inner IPv4 packet within the Ethernet frame.
+        inner_offset: usize,
+    },
+    /// SRv6 decapsulated inner IPv6 packet to re-inject into the pipeline.
+    ///
+    /// RFC-REF: RFC 8986 Section 4.1.5
+    /// "Pop the outer IPv6 header with all its extension headers and
+    /// submit the inner IPv6 packet to the IPv6 FIB."
+    DecapToIpv6 {
+        /// Byte offset of the inner IPv6 packet within the Ethernet frame.
+        inner_offset: usize,
     },
     /// Packet should be flooded to all listed interfaces (L2 unknown
     /// unicast or broadcast within a bridge domain).
@@ -744,38 +769,64 @@ fn process_ipv6_packet(
                 &[]
             };
 
-            let decision =
-                srv6_engine.process(&ipv6.dst_addr, ipv6.next_header, payload, ipv6.hop_limit);
+            let decision = srv6_engine.process(
+                &ipv6.dst_addr,
+                ipv6.next_header,
+                payload,
+                ipv6.hop_limit,
+                ipv6.payload_offset,
+            );
 
             match decision {
                 Srv6Decision::Forward {
                     new_da,
                     srh_modified,
+                    new_sl,
                 } => {
-                    // RFC-DEVIATION:
-                    // reason: SRH Segments Left field is not rewritten in packet bytes in v0.1
-                    // impact: Downstream SRv6 nodes see stale SL; multi-hop SRv6 may malfunction
-                    // issue: #160
-                    // plan: v0.2 で SRH in-place rewrite (SL decrement) を実装
-                    let _ = srh_modified;
+                    // Build SRH rewrite info for the worker to apply.
+                    let srh_rewrite = if srh_modified {
+                        new_sl.map(|sl| (ipv6.payload_offset, sl))
+                    } else {
+                        None
+                    };
 
                     // The SRv6 engine updated the DA. Route the packet
                     // using the new DA via normal IPv6 forwarding.
                     // The new_da will be written into the IPv6 header by the caller.
                     // Hop limit check and route lookup use the new DA.
                     if ipv6.hop_limit <= 1 {
+                        let icmp_reply = nd_engine
+                            .local_ipv6_for_iface(&raw_pkt.ingress_iface)
+                            .and_then(|router_ip| {
+                                icmpv6::generate_icmpv6_error(
+                                    &raw_pkt.data,
+                                    icmpv6::Icmpv6Error::HopLimitExceeded,
+                                    router_ip,
+                                    &raw_pkt.ingress_iface,
+                                )
+                            });
                         return PipelineResult::Drop {
                             reason: DropReason::L3HopLimitExpired,
-                            icmp_reply: None,
+                            icmp_reply,
                         };
                     }
                     let route = match route_table.lookup(&new_da) {
                         Some(entry) => entry,
                         None => {
+                            let icmp_reply = nd_engine
+                                .local_ipv6_for_iface(&raw_pkt.ingress_iface)
+                                .and_then(|router_ip| {
+                                    icmpv6::generate_icmpv6_error(
+                                        &raw_pkt.data,
+                                        icmpv6::Icmpv6Error::NoRoute,
+                                        router_ip,
+                                        &raw_pkt.ingress_iface,
+                                    )
+                                });
                             return PipelineResult::Drop {
                                 reason: DropReason::L3NoRoute,
-                                icmp_reply: None,
-                            }
+                                icmp_reply,
+                            };
                         }
                     };
                     let out_ifname = route.out_ifname.clone();
@@ -802,6 +853,7 @@ fn process_ipv6_packet(
                                 new_hop_limit,
                                 next_hop_v6,
                                 srv6_new_da: Some(new_da),
+                                srv6_srh_rewrite: srh_rewrite,
                             }
                         }
                         FwVerdict::Drop | FwVerdict::DropRule { .. } => PipelineResult::Drop {
@@ -810,13 +862,17 @@ fn process_ipv6_packet(
                         },
                     };
                 }
-                Srv6Decision::DecapIpv4 { table: _ } | Srv6Decision::DecapIpv6 { table: _ } => {
-                    // RFC-DEVIATION:
-                    // reason: Full decap path requires inner-packet extraction and re-injection
-                    // impact: End.DT4/DT6 packets are consumed but inner packet is not forwarded
-                    // issue: #160
-                    // plan: v0.2 で inner packet re-injection を実装
-                    return PipelineResult::Consumed;
+                Srv6Decision::DecapIpv4 {
+                    table: _,
+                    inner_offset,
+                } => {
+                    return PipelineResult::DecapToIpv4 { inner_offset };
+                }
+                Srv6Decision::DecapIpv6 {
+                    table: _,
+                    inner_offset,
+                } => {
+                    return PipelineResult::DecapToIpv6 { inner_offset };
                 }
                 Srv6Decision::Drop { reason } => {
                     return PipelineResult::Drop {
@@ -835,26 +891,49 @@ fn process_ipv6_packet(
     // RFC-REF: RFC 8200 Section 3
     // "If [...] the Hop Limit is less than or equal to 1 [...] discard
     // the packet and originate an ICMPv6 Time Exceeded message."
+    //
+    // RFC-REF: RFC 4443 Section 3.3
+    // Generate ICMPv6 Time Exceeded (Type 3, Code 0) when hop limit
+    // reaches zero during forwarding.
     if ipv6.hop_limit <= 1 {
+        let icmp_reply = nd_engine
+            .local_ipv6_for_iface(&raw_pkt.ingress_iface)
+            .and_then(|router_ip| {
+                icmpv6::generate_icmpv6_error(
+                    &raw_pkt.data,
+                    icmpv6::Icmpv6Error::HopLimitExceeded,
+                    router_ip,
+                    &raw_pkt.ingress_iface,
+                )
+            });
         return PipelineResult::Drop {
             reason: DropReason::L3HopLimitExpired,
-            // RFC-DEVIATION:
-            // reason: ICMPv6 Time Exceeded not yet implemented
-            // impact: senders will not be notified of hop limit expiry via ICMPv6
-            // issue: #159
-            // plan: v0.2 で ICMPv6 error generation を実装
-            icmp_reply: None,
+            icmp_reply,
         };
     }
 
     // Step 5: Route lookup.
+    //
+    // RFC-REF: RFC 4443 Section 3.1
+    // Generate ICMPv6 Destination Unreachable (Type 1, Code 0) when
+    // no route matches the destination address.
     let route = match route_table.lookup(&ipv6.dst_addr) {
         Some(entry) => entry,
         None => {
+            let icmp_reply = nd_engine
+                .local_ipv6_for_iface(&raw_pkt.ingress_iface)
+                .and_then(|router_ip| {
+                    icmpv6::generate_icmpv6_error(
+                        &raw_pkt.data,
+                        icmpv6::Icmpv6Error::NoRoute,
+                        router_ip,
+                        &raw_pkt.ingress_iface,
+                    )
+                });
             return PipelineResult::Drop {
                 reason: DropReason::L3NoRoute,
-                icmp_reply: None,
-            }
+                icmp_reply,
+            };
         }
     };
 
@@ -877,6 +956,7 @@ fn process_ipv6_packet(
             new_hop_limit,
             next_hop_v6,
             srv6_new_da: None,
+            srv6_srh_rewrite: None,
         },
         FwVerdict::Drop | FwVerdict::DropRule { .. } => PipelineResult::Drop {
             reason: DropReason::FirewallDrop,
