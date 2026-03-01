@@ -247,6 +247,41 @@ impl PacketIo for AfPacketIo {
         batch
     }
 
+    /// Optimized per-interface RX for the AF_PACKET backend.
+    ///
+    /// Only calls `recv()` on the sockets for the specified interfaces,
+    /// avoiding syscalls on interfaces not in the filter list.
+    fn rx_on_ifaces(&self, ifaces: &[String]) -> Vec<RawPacket> {
+        let mut batch = Vec::new();
+        let mut buf = [0u8; MAX_FRAME_SIZE];
+
+        for iface_name in ifaces {
+            let if_sock = match self.sockets.get(iface_name) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            let n = unsafe {
+                recv(
+                    if_sock.fd.as_raw_fd(),
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                    MSG_DONTWAIT,
+                )
+            };
+
+            if n > 0 {
+                batch.push(RawPacket {
+                    ingress_iface: iface_name.clone(),
+                    data: buf[..n as usize].to_vec(),
+                });
+            }
+            // n <= 0: EAGAIN/EWOULDBLOCK or error, skip silently.
+        }
+
+        batch
+    }
+
     fn tx(&self, iface: &str, packet: &RawPacket) -> Result<(), IoError> {
         let if_sock = self
             .sockets

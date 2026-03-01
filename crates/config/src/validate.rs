@@ -16,6 +16,7 @@ impl std::fmt::Display for ValidationError {
 pub fn validate(config: &RouterConfig) -> Result<(), Vec<ValidationError>> {
     let mut errors = Vec::new();
 
+    check_worker_count(config, &mut errors);
     check_unique_interface_names(config, &mut errors);
     check_unique_port_ids(config, &mut errors);
     check_bridge_domain_members(config, &mut errors);
@@ -35,6 +36,15 @@ pub fn validate(config: &RouterConfig) -> Result<(), Vec<ValidationError>> {
 
 fn interface_names(config: &RouterConfig) -> HashSet<&str> {
     config.interfaces.iter().map(|i| i.name.as_str()).collect()
+}
+
+fn check_worker_count(config: &RouterConfig, errors: &mut Vec<ValidationError>) {
+    if config.dataplane.worker_count < 1 {
+        errors.push(ValidationError {
+            field: "dataplane.worker_count".to_string(),
+            reason: "worker_count must be >= 1".to_string(),
+        });
+    }
 }
 
 fn check_unique_interface_names(config: &RouterConfig, errors: &mut Vec<ValidationError>) {

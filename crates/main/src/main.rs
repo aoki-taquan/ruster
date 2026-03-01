@@ -200,9 +200,32 @@ fn main() {
         }
     };
 
-    if let Err(e) = dataplane.run(shutdown, io) {
-        eprintln!("Error: dataplane run failed: {}", e);
-        process::exit(1);
+    let worker_count = config.dataplane.worker_count as usize;
+
+    if worker_count > 1 {
+        // Multi-worker mode: wrap in Arc for shared ownership.
+        let dataplane = Arc::new(dataplane);
+        let io: Arc<dyn ruster_dataplane::io::PacketIo> = Arc::from(io);
+        let all_ifaces: Vec<String> = config
+            .interfaces
+            .iter()
+            .filter(|i| i.admin_up)
+            .map(|i| i.name.clone())
+            .collect();
+
+        println!("  Workers: {} (multi-worker mode)", worker_count);
+
+        if let Err(e) = dataplane.run_with_workers(shutdown, io, worker_count, &all_ifaces) {
+            eprintln!("Error: dataplane run failed: {}", e);
+            process::exit(1);
+        }
+    } else {
+        println!("  Workers: 1 (single-thread mode)");
+
+        if let Err(e) = dataplane.run(shutdown, io) {
+            eprintln!("Error: dataplane run failed: {}", e);
+            process::exit(1);
+        }
     }
 
     // Wait for the monitor thread to finish

@@ -56,6 +56,18 @@ pub trait PacketIo: Send + Sync {
     /// The implementation should not block.
     fn rx(&self) -> Vec<RawPacket>;
 
+    /// Receive packets only from the specified interfaces.
+    ///
+    /// Returns an empty `Vec` if no packets are currently available.
+    /// The implementation should not block.
+    fn rx_on_ifaces(&self, ifaces: &[String]) -> Vec<RawPacket> {
+        // Default: call rx() and filter
+        self.rx()
+            .into_iter()
+            .filter(|p| ifaces.contains(&p.ingress_iface))
+            .collect()
+    }
+
     /// Transmit a packet on the specified egress interface.
     ///
     /// # Errors
@@ -125,6 +137,27 @@ impl PacketIo for MockPacketIo {
     fn rx(&self) -> Vec<RawPacket> {
         let mut queue = self.rx_queue.lock().unwrap();
         queue.drain(..).collect()
+    }
+
+    /// Optimized per-interface RX for the mock backend.
+    ///
+    /// Only drains packets whose `ingress_iface` is in `ifaces`, leaving
+    /// non-matching packets in the queue for later retrieval.
+    fn rx_on_ifaces(&self, ifaces: &[String]) -> Vec<RawPacket> {
+        let mut queue = self.rx_queue.lock().unwrap();
+        let mut matched = Vec::new();
+        let mut remaining = VecDeque::new();
+
+        for pkt in queue.drain(..) {
+            if ifaces.contains(&pkt.ingress_iface) {
+                matched.push(pkt);
+            } else {
+                remaining.push_back(pkt);
+            }
+        }
+
+        *queue = remaining;
+        matched
     }
 
     fn tx(&self, iface: &str, packet: &RawPacket) -> Result<(), IoError> {
@@ -229,5 +262,99 @@ mod tests {
         io.set_tx_fail_mode(false);
         assert!(io.tx("wan0", &pkt).is_ok());
         assert_eq!(io.tx_count(), 2);
+    }
+
+    // ── rx_on_ifaces tests ──────────────────────────────────────────
+
+    #[test]
+    fn mock_io_rx_on_ifaces_empty_queue() {
+        let io = MockPacketIo::new();
+        let result = io.rx_on_ifaces(&["eth0".to_string()]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn mock_io_rx_on_ifaces_filters_correctly() {
+        let io = MockPacketIo::new();
+        io.inject(RawPacket {
+            ingress_iface: "eth0".to_string(),
+            data: vec![0x01],
+        });
+        io.inject(RawPacket {
+            ingress_iface: "eth1".to_string(),
+            data: vec![0x02],
+        });
+        io.inject(RawPacket {
+            ingress_iface: "eth2".to_string(),
+            data: vec![0x03],
+        });
+
+        let result = io.rx_on_ifaces(&["eth0".to_string(), "eth2".to_string()]);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].ingress_iface, "eth0");
+        assert_eq!(result[0].data, vec![0x01]);
+        assert_eq!(result[1].ingress_iface, "eth2");
+        assert_eq!(result[1].data, vec![0x03]);
+    }
+
+    #[test]
+    fn mock_io_rx_on_ifaces_leaves_non_matching_in_queue() {
+        let io = MockPacketIo::new();
+        io.inject(RawPacket {
+            ingress_iface: "eth0".to_string(),
+            data: vec![0x01],
+        });
+        io.inject(RawPacket {
+            ingress_iface: "eth1".to_string(),
+            data: vec![0x02],
+        });
+        io.inject(RawPacket {
+            ingress_iface: "eth2".to_string(),
+            data: vec![0x03],
+        });
+
+        // Only drain eth0 packets.
+        let result = io.rx_on_ifaces(&["eth0".to_string()]);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].ingress_iface, "eth0");
+
+        // eth1 and eth2 should still be in the queue.
+        let remaining = io.rx();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].ingress_iface, "eth1");
+        assert_eq!(remaining[1].ingress_iface, "eth2");
+    }
+
+    #[test]
+    fn mock_io_rx_on_ifaces_no_matching_ifaces() {
+        let io = MockPacketIo::new();
+        io.inject(RawPacket {
+            ingress_iface: "eth0".to_string(),
+            data: vec![0x01],
+        });
+
+        let result = io.rx_on_ifaces(&["wan0".to_string()]);
+        assert!(result.is_empty());
+
+        // eth0 packet should remain in the queue.
+        let remaining = io.rx();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].ingress_iface, "eth0");
+    }
+
+    #[test]
+    fn mock_io_rx_on_ifaces_empty_filter_list() {
+        let io = MockPacketIo::new();
+        io.inject(RawPacket {
+            ingress_iface: "eth0".to_string(),
+            data: vec![0x01],
+        });
+
+        let result = io.rx_on_ifaces(&[]);
+        assert!(result.is_empty());
+
+        // All packets should remain in the queue.
+        let remaining = io.rx();
+        assert_eq!(remaining.len(), 1);
     }
 }

@@ -14,6 +14,7 @@ pub mod pipeline;
 pub mod rewrite;
 pub mod routing;
 pub mod srv6;
+pub mod worker;
 
 #[cfg(target_os = "linux")]
 pub mod afpacket;
@@ -86,11 +87,11 @@ pub struct Dataplane {
     /// Zone resolver: maps interface names to firewall zones.
     pub zone_resolver: pipeline::ZoneResolver,
     /// Per-interface MAC addresses for src MAC rewriting on egress.
-    iface_macs: std::collections::HashMap<String, [u8; 6]>,
+    pub iface_macs: std::collections::HashMap<String, [u8; 6]>,
     /// Linux device name -> logical interface name mapping (for ARP refresh).
     linux_to_logical: std::collections::HashMap<String, String>,
     /// Counter for TX errors encountered in the run loop.
-    tx_errors: AtomicU64,
+    pub tx_errors: AtomicU64,
     /// Observability hub: per-interface and per-stage counters.
     pub observer: Arc<ruster_observe::Observer>,
     /// ARP hold queue: buffers packets waiting for next-hop MAC resolution.
@@ -215,13 +216,62 @@ impl Dataplane {
     /// the pipeline (parse -> L3 route -> firewall), and transmits
     /// forwarded packets via [`io::PacketIo::tx`].
     ///
-    /// If the RX queue is empty the loop sleeps briefly to avoid busy-spinning.
+    /// This is the single-threaded (worker_count=1) path. For multi-worker
+    /// mode, use [`run_with_workers`].
     ///
     /// Returns `Ok(())` on clean shutdown.
     pub fn run(
         &self,
         shutdown: Arc<AtomicBool>,
         io: Box<dyn io::PacketIo>,
+    ) -> Result<(), DataplaneError> {
+        self.run_maintenance_and_rx_loop(shutdown, &*io)
+    }
+
+    /// Run the dataplane with multiple worker threads.
+    ///
+    /// Spawns `worker_count` threads, each handling a subset of interfaces.
+    /// The calling thread runs maintenance tasks (ARP refresh, conntrack GC,
+    /// stats output) until the shutdown flag is set.
+    ///
+    /// Returns `Ok(())` on clean shutdown after all workers have exited.
+    pub fn run_with_workers(
+        self: &Arc<Self>,
+        shutdown: Arc<AtomicBool>,
+        io: Arc<dyn io::PacketIo>,
+        worker_count: usize,
+        all_ifaces: &[String],
+    ) -> Result<(), DataplaneError> {
+        let mut pool = worker::WorkerPool::spawn(
+            Arc::clone(self),
+            Arc::clone(&io),
+            Arc::clone(&shutdown),
+            worker_count,
+            all_ifaces,
+        );
+
+        eprintln!(
+            "dataplane: running with {} workers (main thread handles maintenance)",
+            pool.worker_count()
+        );
+
+        // Main thread: maintenance loop only (no packet processing).
+        self.run_maintenance_loop(&shutdown, &*io);
+
+        // Workers will see the shutdown flag and exit their loops.
+        pool.join_all();
+        eprintln!("dataplane: all {} workers joined", pool.worker_count());
+
+        Ok(())
+    }
+
+    /// Run the combined maintenance + single-thread RX/TX loop.
+    ///
+    /// Used by [`run`] for the single-worker path.
+    fn run_maintenance_and_rx_loop(
+        &self,
+        shutdown: Arc<AtomicBool>,
+        io: &dyn io::PacketIo,
     ) -> Result<(), DataplaneError> {
         let mut last_stats = std::time::Instant::now();
         let mut last_arp_refresh = std::time::Instant::now();
@@ -230,45 +280,14 @@ impl Dataplane {
         let mut last_conntrack_gc = std::time::Instant::now();
 
         while !shutdown.load(Ordering::Relaxed) {
-            // Periodically refresh ARP cache from the kernel neighbor table.
-            if last_arp_refresh.elapsed() >= Duration::from_secs(5) {
-                let mut arp_guard = self.arp.lock().unwrap();
-                arp_guard.load_kernel_arp(&self.linux_to_logical);
-                drop(arp_guard);
-                last_arp_refresh = std::time::Instant::now();
-            }
-
-            // Periodically GC the ARP hold queue (remove timed-out entries).
-            if last_hold_queue_gc.elapsed() >= Duration::from_secs(1) {
-                let gc_dropped = {
-                    let mut hq_guard = self.hold_queue.lock().unwrap();
-                    hq_guard.gc(self.hold_queue_timeout_sec)
-                };
-                if gc_dropped > 0 {
-                    self.observer.inc_arp_hold_gc_dropped(gc_dropped as u64);
-                }
-                last_hold_queue_gc = std::time::Instant::now();
-            }
-
-            // Periodically re-send ARP requests for pending hold queue entries
-            // and try to flush any that have been resolved since the last check.
-            if last_arp_retry.elapsed() >= Duration::from_secs(1) {
-                self.retry_pending_arp(&*io);
-                last_arp_retry = std::time::Instant::now();
-            }
-
-            // Periodically garbage-collect expired conntrack sessions (every 10s).
-            if last_conntrack_gc.elapsed() >= Duration::from_secs(10) {
-                let mut ct_guard = self.conntrack.lock().unwrap();
-                let expired = ct_guard.gc();
-                let session_count = ct_guard.session_count();
-                drop(ct_guard);
-                if expired > 0 {
-                    self.observer.add_conntrack_expired(expired as u64);
-                    eprintln!("conntrack GC: expired {expired} sessions, {session_count} active");
-                }
-                last_conntrack_gc = std::time::Instant::now();
-            }
+            self.run_maintenance_tick(
+                io,
+                &mut last_arp_refresh,
+                &mut last_hold_queue_gc,
+                &mut last_arp_retry,
+                &mut last_conntrack_gc,
+                &mut last_stats,
+            );
 
             let batch = io.rx();
             if batch.is_empty() {
@@ -276,17 +295,9 @@ impl Dataplane {
                 continue;
             }
             for raw_pkt in &batch {
-                // Count RX on ingress interface.
                 self.observer
                     .inc_rx(&raw_pkt.ingress_iface, raw_pkt.data.len() as u64);
 
-                // TODO(#149): Per-packet conntrack counters (inc_conntrack_new,
-                // inc_conntrack_established) are not wired yet because
-                // ConntrackResult is internal to process_packet. To wire
-                // them, propagate ConntrackResult out of PipelineResult or
-                // pass an observer reference into the pipeline. For now,
-                // only conntrack_table_full (via DropReason) and
-                // conntrack_expired (via GC) are tracked.
                 let result = {
                     let mut l2_guard = self.l2.lock().unwrap();
                     let mut ct_guard = self.conntrack.lock().unwrap();
@@ -306,344 +317,95 @@ impl Dataplane {
                         self.srv6.as_ref(),
                     )
                 };
-                match result {
-                    pipeline::PipelineResult::Forward {
-                        egress_iface,
-                        new_ttl,
-                        next_hop,
-                        nat: nat_result,
-                    } => {
-                        self.observer.inc_forwarded();
-
-                        // Apply packet rewrites for L3 forwarding.
-                        let tx_data;
-                        let needs_rewrite = new_ttl.is_some()
-                            || next_hop.is_some()
-                            || nat_result != pipeline::NatResult::None;
-                        let tx_pkt = if needs_rewrite {
-                            let mut data = raw_pkt.data.clone();
-
-                            // 1. NAT rewrite (SNAT/DNAT) — must be before TTL
-                            //    so that checksum updates are layered correctly.
-                            //
-                            // RFC-REF: RFC 3022 Section 4.3
-                            // "The checksum adjustment must be performed any time
-                            // the IP header or the TCP/UDP header is modified."
-                            match &nat_result {
-                                pipeline::NatResult::Snat {
-                                    new_src_ip,
-                                    new_src_port,
-                                } => {
-                                    if !rewrite::rewrite_snat(&mut data, *new_src_ip, *new_src_port)
-                                    {
-                                        self.observer.inc_nat_drop();
-                                        continue;
-                                    }
-                                    self.observer.inc_nat_snat();
-                                }
-                                pipeline::NatResult::Dnat {
-                                    new_dst_ip,
-                                    new_dst_port,
-                                } => {
-                                    if !rewrite::rewrite_dnat(&mut data, *new_dst_ip, *new_dst_port)
-                                    {
-                                        self.observer.inc_nat_drop();
-                                        continue;
-                                    }
-                                    self.observer.inc_nat_dnat();
-                                }
-                                pipeline::NatResult::None => {}
-                            }
-
-                            // 2. TTL + checksum
-                            if let Some(ttl) = new_ttl {
-                                rewrite::rewrite_ipv4_ttl(&mut data, ttl);
-                            }
-
-                            // 3. src MAC -> egress IF's MAC
-                            if let Some(mac) = self.iface_macs.get(&egress_iface) {
-                                rewrite::rewrite_src_mac(&mut data, mac);
-                            }
-
-                            // 3. dst MAC -> ARP resolve
-                            if let Some(nh) = next_hop {
-                                // Determine the IP to ARP-resolve:
-                                // - If next_hop != 0.0.0.0: resolve the next-hop gateway
-                                // - If next_hop == 0.0.0.0: directly connected, resolve
-                                //   the packet's destination IP
-                                let arp_target = if nh != [0, 0, 0, 0] {
-                                    nh
-                                } else {
-                                    // Extract dst IP from the IPv4 header (offset 30..34
-                                    // in an Ethernet+IPv4 frame: 14 eth + 16 dst offset)
-                                    if data.len() >= 34 {
-                                        [data[30], data[31], data[32], data[33]]
-                                    } else {
-                                        // Malformed, cannot extract dst IP
-                                        self.observer
-                                            .inc_drop_reason(ruster_observe::DropReason::L3NoRoute);
-                                        continue;
-                                    }
-                                };
-                                let arp_result = {
-                                    let mut arp_guard = self.arp.lock().unwrap();
-                                    arp_guard.resolve(arp_target, &egress_iface)
-                                };
-                                match arp_result {
-                                    arp::ArpAction::Forward { resolved_mac } => {
-                                        rewrite::rewrite_dst_mac(&mut data, &resolved_mac);
-                                    }
-                                    arp::ArpAction::SendRequest {
-                                        out_ifname,
-                                        target_ip,
-                                        sender_ip,
-                                        sender_mac,
-                                    } => {
-                                        // Enqueue the packet in the ARP hold queue.
-                                        let enqueue_result = {
-                                            let mut hq_guard = self.hold_queue.lock().unwrap();
-                                            hq_guard.enqueue(
-                                                arp_target,
-                                                egress_iface.clone(),
-                                                data,
-                                                new_ttl,
-                                            )
-                                        };
-                                        match enqueue_result {
-                                            arp::hold_queue::EnqueueResult::Enqueued => {
-                                                self.observer.inc_arp_hold_enqueued();
-                                            }
-                                            _ => {
-                                                self.observer.inc_arp_hold_tail_dropped();
-                                            }
-                                        }
-
-                                        // Send ARP request (rate-limited).
-                                        let should_send = {
-                                            let mut arp_guard = self.arp.lock().unwrap();
-                                            arp_guard.should_send_request(target_ip)
-                                        };
-                                        if should_send {
-                                            let arp_pkt = arp::build_arp_request(
-                                                sender_mac, sender_ip, target_ip,
-                                            );
-                                            let arp_raw = io::RawPacket {
-                                                ingress_iface: out_ifname.clone(),
-                                                data: arp_pkt,
-                                            };
-                                            let _ = io.tx(&out_ifname, &arp_raw);
-                                        }
-                                        continue;
-                                    }
-                                    arp::ArpAction::Drop => {
-                                        self.observer.inc_drop_reason(
-                                            ruster_observe::DropReason::ArpUnresolved,
-                                        );
-                                        continue;
-                                    }
-                                    arp::ArpAction::Reply { .. } | arp::ArpAction::Update => {
-                                        // Unexpected from resolve(); log and drop.
-                                        eprintln!(
-                                            "unexpected ArpAction from resolve() for {}",
-                                            egress_iface
-                                        );
-                                        self.observer.inc_drop_reason(
-                                            ruster_observe::DropReason::ArpUnresolved,
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            tx_data = io::RawPacket {
-                                ingress_iface: raw_pkt.ingress_iface.clone(),
-                                data,
-                            };
-                            &tx_data
-                        } else {
-                            raw_pkt
-                        };
-
-                        match io.tx(&egress_iface, tx_pkt) {
-                            Ok(()) => {
-                                self.observer
-                                    .inc_tx(&egress_iface, raw_pkt.data.len() as u64);
-                            }
-                            Err(e) => {
-                                self.tx_errors.fetch_add(1, Ordering::Relaxed);
-                                self.observer.inc_tx_drop(&egress_iface);
-                                eprintln!("TX error on {}: {}", egress_iface, e);
-                            }
-                        }
-                    }
-                    pipeline::PipelineResult::ForwardV6 {
-                        egress_iface,
-                        new_hop_limit,
-                        next_hop_v6,
-                        srv6_new_da,
-                    } => {
-                        self.observer.inc_forwarded();
-
-                        let mut data = raw_pkt.data.clone();
-
-                        // 0. SRv6 DA rewrite (must happen before ND resolution
-                        //    since ND may use the DA from the packet).
-                        if let Some(ref new_da) = srv6_new_da {
-                            rewrite::rewrite_ipv6_da(&mut data, new_da);
-                        }
-
-                        // 1. Hop Limit (no checksum update needed for IPv6).
-                        rewrite::rewrite_ipv6_hop_limit(&mut data, new_hop_limit);
-
-                        // 2. src MAC -> egress IF's MAC.
-                        if let Some(mac) = self.iface_macs.get(&egress_iface) {
-                            rewrite::rewrite_src_mac(&mut data, mac);
-                        }
-
-                        // 3. dst MAC -> ND resolve.
-                        // Determine the IPv6 address to resolve:
-                        // - If next_hop != :: : resolve the next-hop gateway
-                        // - If next_hop == :: : directly connected, resolve
-                        //   the packet's destination IPv6
-                        let nd_target = if next_hop_v6 != [0u8; 16] {
-                            next_hop_v6
-                        } else {
-                            // Extract dst IPv6 from the IPv6 header (offset 14+24..14+40
-                            // in an Ethernet+IPv6 frame)
-                            if data.len() >= 54 {
-                                let mut dst = [0u8; 16];
-                                dst.copy_from_slice(&data[38..54]);
-                                dst
-                            } else {
-                                self.observer
-                                    .inc_drop_reason(ruster_observe::DropReason::L3NoRoute);
-                                continue;
-                            }
-                        };
-
-                        let nd_result = {
-                            let mut nd_guard = self.nd.lock().unwrap();
-                            nd_guard.resolve(nd_target, &egress_iface)
-                        };
-                        match nd_result {
-                            nd::NdAction::Forward { resolved_mac } => {
-                                rewrite::rewrite_dst_mac(&mut data, &resolved_mac);
-                            }
-                            _ => {
-                                // ND unresolved -> drop
-                                self.observer
-                                    .inc_drop_reason(ruster_observe::DropReason::L3NoRoute);
-                                continue;
-                            }
-                        }
-
-                        let tx_data = io::RawPacket {
-                            ingress_iface: raw_pkt.ingress_iface.clone(),
-                            data,
-                        };
-
-                        match io.tx(&egress_iface, &tx_data) {
-                            Ok(()) => {
-                                self.observer
-                                    .inc_tx(&egress_iface, raw_pkt.data.len() as u64);
-                            }
-                            Err(e) => {
-                                self.tx_errors.fetch_add(1, Ordering::Relaxed);
-                                self.observer.inc_tx_drop(&egress_iface);
-                                eprintln!("TX error on {}: {}", egress_iface, e);
-                            }
-                        }
-                    }
-                    pipeline::PipelineResult::Flood { egress_ifaces } => {
-                        self.observer.inc_forwarded();
-                        for iface in &egress_ifaces {
-                            match io.tx(iface, raw_pkt) {
-                                Ok(()) => {
-                                    self.observer.inc_tx(iface, raw_pkt.data.len() as u64);
-                                }
-                                Err(e) => {
-                                    self.tx_errors.fetch_add(1, Ordering::Relaxed);
-                                    self.observer.inc_tx_drop(iface);
-                                    eprintln!("TX error on {}: {}", iface, e);
-                                }
-                            }
-                        }
-                    }
-                    pipeline::PipelineResult::Drop {
-                        reason,
-                        icmp_reply: Some(reply),
-                    } => {
-                        let obs_reason = map_pipeline_drop_to_observe(&reason);
-                        self.observer.inc_drop_reason(obs_reason);
-                        if reason == pipeline::DropReason::ConntrackTableFull {
-                            self.observer.inc_conntrack_table_full();
-                        }
-                        if reason == pipeline::DropReason::NatDrop {
-                            self.observer.inc_nat_drop();
-                        }
-                        let icmp_pkt = io::RawPacket {
-                            ingress_iface: reply.egress_iface.clone(),
-                            data: reply.data,
-                        };
-                        if let Err(e) = io.tx(&reply.egress_iface, &icmp_pkt) {
-                            self.tx_errors.fetch_add(1, Ordering::Relaxed);
-                            eprintln!("TX error for ICMP reply on {}: {}", reply.egress_iface, e);
-                        }
-                    }
-                    pipeline::PipelineResult::Drop { reason, .. } => {
-                        let obs_reason = map_pipeline_drop_to_observe(&reason);
-                        self.observer.inc_drop_reason(obs_reason);
-                        // Wire conntrack table-full counter.
-                        if reason == pipeline::DropReason::ConntrackTableFull {
-                            self.observer.inc_conntrack_table_full();
-                        }
-                        // Wire NAT drop counter.
-                        if reason == pipeline::DropReason::NatDrop {
-                            self.observer.inc_nat_drop();
-                        }
-                    }
-                    pipeline::PipelineResult::Consumed => {
-                        self.observer.inc_local_delivery();
-                    }
-                    pipeline::PipelineResult::NdReply {
-                        egress_iface,
-                        reply_info,
-                    } => {
-                        self.observer.inc_local_delivery();
-                        let na_data = nd::build_na_packet(&reply_info);
-                        let na_pkt = io::RawPacket {
-                            ingress_iface: egress_iface.clone(),
-                            data: na_data,
-                        };
-                        match io.tx(&egress_iface, &na_pkt) {
-                            Ok(()) => {
-                                self.observer
-                                    .inc_tx(&egress_iface, na_pkt.data.len() as u64);
-                            }
-                            Err(e) => {
-                                self.tx_errors.fetch_add(1, Ordering::Relaxed);
-                                self.observer.inc_tx_drop(&egress_iface);
-                                eprintln!("TX error for ND reply on {}: {}", egress_iface, e);
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Periodic stats output every 10 seconds.
-            if last_stats.elapsed() >= Duration::from_secs(10) {
-                let snap = self.observer.snapshot();
-                eprintln!("{}", snap);
-                // Log conntrack table occupancy.
-                let ct_guard = self.conntrack.lock().unwrap();
-                let ct_sessions = ct_guard.session_count();
-                drop(ct_guard);
-                eprintln!("conntrack sessions: {ct_sessions}");
-                last_stats = std::time::Instant::now();
+                worker::handle_pipeline_result(self, io, raw_pkt, result);
             }
         }
 
         Ok(())
+    }
+
+    /// Run the maintenance-only loop (no packet processing).
+    ///
+    /// Used by [`run_with_workers`] where workers handle packet I/O.
+    fn run_maintenance_loop(&self, shutdown: &AtomicBool, io: &dyn io::PacketIo) {
+        let mut last_stats = std::time::Instant::now();
+        let mut last_arp_refresh = std::time::Instant::now();
+        let mut last_hold_queue_gc = std::time::Instant::now();
+        let mut last_arp_retry = std::time::Instant::now();
+        let mut last_conntrack_gc = std::time::Instant::now();
+
+        while !shutdown.load(Ordering::Relaxed) {
+            self.run_maintenance_tick(
+                io,
+                &mut last_arp_refresh,
+                &mut last_hold_queue_gc,
+                &mut last_arp_retry,
+                &mut last_conntrack_gc,
+                &mut last_stats,
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Execute one tick of maintenance tasks (ARP, hold queue, conntrack, stats).
+    fn run_maintenance_tick(
+        &self,
+        io: &dyn io::PacketIo,
+        last_arp_refresh: &mut std::time::Instant,
+        last_hold_queue_gc: &mut std::time::Instant,
+        last_arp_retry: &mut std::time::Instant,
+        last_conntrack_gc: &mut std::time::Instant,
+        last_stats: &mut std::time::Instant,
+    ) {
+        // Periodically refresh ARP cache from the kernel neighbor table.
+        if last_arp_refresh.elapsed() >= Duration::from_secs(5) {
+            let mut arp_guard = self.arp.lock().unwrap();
+            arp_guard.load_kernel_arp(&self.linux_to_logical);
+            drop(arp_guard);
+            *last_arp_refresh = std::time::Instant::now();
+        }
+
+        // Periodically GC the ARP hold queue (remove timed-out entries).
+        if last_hold_queue_gc.elapsed() >= Duration::from_secs(1) {
+            let gc_dropped = {
+                let mut hq_guard = self.hold_queue.lock().unwrap();
+                hq_guard.gc(self.hold_queue_timeout_sec)
+            };
+            if gc_dropped > 0 {
+                self.observer.inc_arp_hold_gc_dropped(gc_dropped as u64);
+            }
+            *last_hold_queue_gc = std::time::Instant::now();
+        }
+
+        // Periodically re-send ARP requests for pending hold queue entries.
+        if last_arp_retry.elapsed() >= Duration::from_secs(1) {
+            self.retry_pending_arp(io);
+            *last_arp_retry = std::time::Instant::now();
+        }
+
+        // Periodically garbage-collect expired conntrack sessions (every 10s).
+        if last_conntrack_gc.elapsed() >= Duration::from_secs(10) {
+            let mut ct_guard = self.conntrack.lock().unwrap();
+            let expired = ct_guard.gc();
+            let session_count = ct_guard.session_count();
+            drop(ct_guard);
+            if expired > 0 {
+                self.observer.add_conntrack_expired(expired as u64);
+                eprintln!("conntrack GC: expired {expired} sessions, {session_count} active");
+            }
+            *last_conntrack_gc = std::time::Instant::now();
+        }
+
+        // Periodic stats output every 10 seconds.
+        if last_stats.elapsed() >= Duration::from_secs(10) {
+            let snap = self.observer.snapshot();
+            eprintln!("{}", snap);
+            let ct_guard = self.conntrack.lock().unwrap();
+            let ct_sessions = ct_guard.session_count();
+            drop(ct_guard);
+            eprintln!("conntrack sessions: {ct_sessions}");
+            *last_stats = std::time::Instant::now();
+        }
     }
 
     /// Retry pending ARP resolutions and flush any that have been resolved.
