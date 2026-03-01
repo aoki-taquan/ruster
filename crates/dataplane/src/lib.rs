@@ -4,6 +4,7 @@ pub mod conntrack;
 pub mod dpdk;
 pub mod firewall;
 pub mod icmp;
+pub mod icmpv6;
 pub mod io;
 pub mod l2;
 pub mod nat;

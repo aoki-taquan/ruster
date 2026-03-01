@@ -21,6 +21,7 @@ use crate::conntrack::session::{SessionKey, SessionState, TcpState};
 use crate::conntrack::{ConntrackEngine, ConntrackError};
 use crate::firewall::{FirewallEngine, FwChain, FwContext, FwVerdict};
 use crate::icmp::{self, IcmpReply};
+use crate::icmpv6;
 use crate::io::RawPacket;
 use crate::l2::bridge::L2Decision;
 use crate::l2::L2Engine;
@@ -684,18 +685,38 @@ fn process_ipv6_packet(
                     // The new_da will be written into the IPv6 header by the caller.
                     // Hop limit check and route lookup use the new DA.
                     if ipv6.hop_limit <= 1 {
+                        let icmp_reply = nd_engine
+                            .local_ipv6_for_iface(&raw_pkt.ingress_iface)
+                            .and_then(|router_ip| {
+                                icmpv6::generate_icmpv6_error(
+                                    &raw_pkt.data,
+                                    icmpv6::Icmpv6Error::HopLimitExceeded,
+                                    router_ip,
+                                    &raw_pkt.ingress_iface,
+                                )
+                            });
                         return PipelineResult::Drop {
                             reason: DropReason::L3HopLimitExpired,
-                            icmp_reply: None,
+                            icmp_reply,
                         };
                     }
                     let route = match route_table.lookup(&new_da) {
                         Some(entry) => entry,
                         None => {
+                            let icmp_reply = nd_engine
+                                .local_ipv6_for_iface(&raw_pkt.ingress_iface)
+                                .and_then(|router_ip| {
+                                    icmpv6::generate_icmpv6_error(
+                                        &raw_pkt.data,
+                                        icmpv6::Icmpv6Error::NoRoute,
+                                        router_ip,
+                                        &raw_pkt.ingress_iface,
+                                    )
+                                });
                             return PipelineResult::Drop {
                                 reason: DropReason::L3NoRoute,
-                                icmp_reply: None,
-                            }
+                                icmp_reply,
+                            };
                         }
                     };
                     let out_ifname = route.out_ifname.clone();
@@ -755,26 +776,49 @@ fn process_ipv6_packet(
     // RFC-REF: RFC 8200 Section 3
     // "If [...] the Hop Limit is less than or equal to 1 [...] discard
     // the packet and originate an ICMPv6 Time Exceeded message."
+    //
+    // RFC-REF: RFC 4443 Section 3.3
+    // Generate ICMPv6 Time Exceeded (Type 3, Code 0) when hop limit
+    // reaches zero during forwarding.
     if ipv6.hop_limit <= 1 {
+        let icmp_reply = nd_engine
+            .local_ipv6_for_iface(&raw_pkt.ingress_iface)
+            .and_then(|router_ip| {
+                icmpv6::generate_icmpv6_error(
+                    &raw_pkt.data,
+                    icmpv6::Icmpv6Error::HopLimitExceeded,
+                    router_ip,
+                    &raw_pkt.ingress_iface,
+                )
+            });
         return PipelineResult::Drop {
             reason: DropReason::L3HopLimitExpired,
-            // RFC-DEVIATION:
-            // reason: ICMPv6 Time Exceeded not yet implemented
-            // impact: senders will not be notified of hop limit expiry via ICMPv6
-            // issue: #159
-            // plan: v0.2 で ICMPv6 error generation を実装
-            icmp_reply: None,
+            icmp_reply,
         };
     }
 
     // Step 5: Route lookup.
+    //
+    // RFC-REF: RFC 4443 Section 3.1
+    // Generate ICMPv6 Destination Unreachable (Type 1, Code 0) when
+    // no route matches the destination address.
     let route = match route_table.lookup(&ipv6.dst_addr) {
         Some(entry) => entry,
         None => {
+            let icmp_reply = nd_engine
+                .local_ipv6_for_iface(&raw_pkt.ingress_iface)
+                .and_then(|router_ip| {
+                    icmpv6::generate_icmpv6_error(
+                        &raw_pkt.data,
+                        icmpv6::Icmpv6Error::NoRoute,
+                        router_ip,
+                        &raw_pkt.ingress_iface,
+                    )
+                });
             return PipelineResult::Drop {
                 reason: DropReason::L3NoRoute,
-                icmp_reply: None,
-            }
+                icmp_reply,
+            };
         }
     };
 
