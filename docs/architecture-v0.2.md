@@ -87,7 +87,9 @@ action/stateを変更しません。live entryはevictせず、TTL後だけreuse
 同じkeyのactionは一つだけqueueできます。抑制deadlineはenqueue時でなく、generated
 leaseをcommitしてTX requestedになった注入時刻から開始します。allocation/build失敗時は
 actionを保持しdeadlineを開始しません。backendのpartial rejectでもcommit済みなので
-抑制を開始します。retryは新しいtraffic missでだけ起きます。target `0.0.0.0`、IPv4
+抑制を開始します。commit済みARP Requestの次回生成は、deadline後に新しいtraffic missが
+来た場合だけです。allocation/build失敗で未commitの保持actionはexecutorを再実行できます。
+target `0.0.0.0`、IPv4
 multicast、limited broadcast、およびcanonical connected routeから確定できるdirected
 broadcastにはARP Requestを生成しません。directed broadcast判定はpacketを選択したroute
 だけでなく、snapshot内の同一egressにある全connected routeを確認します。source local
