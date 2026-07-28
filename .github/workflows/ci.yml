@@ -39,6 +39,7 @@ jobs:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
       - run: cargo test --workspace --all-targets
+      - run: cargo test --doc --workspace
 
   clippy:
     name: Clippy

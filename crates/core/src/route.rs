@@ -106,8 +106,8 @@ impl Route {
         address.0 & mask == self.prefix.0
     }
 
-    pub(crate) fn is_directed_broadcast(self, address: Ipv4Address) -> bool {
-        if self.next_hop.is_some() || self.prefix_len >= 31 || !self.matches(address) {
+    pub(crate) fn is_connected_directed_broadcast(self, address: Ipv4Address) -> bool {
+        if self.next_hop.is_some() || self.prefix_len > 30 || !self.matches(address) {
             return false;
         }
         let mask = prefix_mask(self.prefix_len).expect("Route::new validates prefix length");

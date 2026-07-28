@@ -80,16 +80,21 @@ resolution runtimeも`!Send + !Sync`で、caller提供のlinear fixed tableとac
 借用します。keyは`(IfId,target IPv4)`です。intervalは1000ms以上、state TTLはinterval
 以上とし、batch単位で注入された`MonotonicMillis`だけを使います。加算deadlineを作らず
 順序確認後の差分で判定するため`u64` overflowはありません。逆行はtyped resultとして
-action/stateを変更しません。live entryはevictせず、TTL後だけreuseします。
+action/stateを変更しません。live entryはevictせず、TTL後だけreuseします。runtimeの
+生成時はcaller storageをすべてemptyへ初期化します。processをまたぐstate永続化/resumeは
+未実装です。
 
 同じkeyのactionは一つだけqueueできます。抑制deadlineはenqueue時でなく、generated
 leaseをcommitしてTX requestedになった注入時刻から開始します。allocation/build失敗時は
 actionを保持しdeadlineを開始しません。backendのpartial rejectでもcommit済みなので
 抑制を開始します。retryは新しいtraffic missでだけ起きます。target `0.0.0.0`、IPv4
 multicast、limited broadcast、およびcanonical connected routeから確定できるdirected
-broadcastにはARP Requestを生成しません。
+broadcastにはARP Requestを生成しません。directed broadcast判定はpacketを選択したroute
+だけでなく、snapshot内の同一egressにある全connected routeを確認します。source local
+IPv4自身がtargetになる場合も生成しません。
 
-生成する通常RequestはFCSを含まない60 bytesです。先頭42 bytesをRFC 826の
+生成する通常RequestはRFC 894のEthernet minimum framingに合わせた、FCSを含まない
+60 bytesです。先頭42 bytesをRFC 826の
 Ethernet/IPv4 ARP（Ethernet destination broadcast、SHA/source MACはlocal、SPAはnonzero
 local IPv4、THA zero、TPA target）として書き、残り18 bytesを必ずzero paddingします。
 THA zeroは決定的なlocal profile choiceであり、RFCのMUSTとは主張しません。

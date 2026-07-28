@@ -70,6 +70,43 @@ fn resolution_policy_rejects_short_interval_and_state_ttl() {
     );
 }
 
+#[test]
+fn recreating_runtime_clears_caller_state_and_queued_actions() {
+    let routes = [gateway_route()];
+    let interfaces = [interface()];
+    let bindings = [binding()];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut io = SimIo::new();
+    let destination = Ipv4Address::from_octets([198, 51, 100, 20]);
+    {
+        let mut runtime = ResolutionRuntime::new(policy(), &mut states, &mut actions);
+        run_miss(
+            &mut io,
+            &snapshot,
+            &mut runtime,
+            0,
+            destination,
+            &mut VecTrace::default(),
+        );
+        assert_eq!(runtime.pending_actions(), 1);
+    }
+    let mut recreated = ResolutionRuntime::new(policy(), &mut states, &mut actions);
+    assert_eq!(recreated.pending_actions(), 0);
+    run_miss(
+        &mut io,
+        &snapshot,
+        &mut recreated,
+        0,
+        destination,
+        &mut VecTrace::default(),
+    );
+    assert_eq!(recreated.pending_actions(), 1);
+    assert_eq!(recreated.counters().queued, 1);
+    assert_eq!(recreated.counters().suppressed, 0);
+}
+
 fn run_miss(
     io: &mut SimIo,
     snapshot: &ForwardingSnapshot<'_>,
@@ -242,6 +279,48 @@ fn same_target_is_rate_limited_to_one_request_per_second_at_exact_deadline() {
     run_miss(&mut io, &snapshot, &mut runtime, 1_000, dst, &mut trace);
     assert_eq!(runtime.pending_actions(), 1);
     assert_eq!(runtime.counters().queued, 2);
+    assert_eq!(runtime.counters().suppressed, 1);
+}
+
+#[test]
+fn suppression_deadline_starts_at_generated_commit_time() {
+    let routes = [gateway_route()];
+    let interfaces = [interface()];
+    let bindings = [binding()];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut runtime = ResolutionRuntime::new(policy(), &mut states, &mut actions);
+    let mut io = SimIo::new();
+    let mut trace = VecTrace::default();
+    let destination = Ipv4Address::from_octets([198, 51, 100, 20]);
+    run_miss(&mut io, &snapshot, &mut runtime, 0, destination, &mut trace);
+    execute_one_arp_request(
+        &mut io,
+        &mut runtime,
+        MonotonicMillis(700),
+        &mut VecGeneratedTrace::default(),
+    )
+    .unwrap()
+    .unwrap();
+    run_miss(
+        &mut io,
+        &snapshot,
+        &mut runtime,
+        1_699,
+        destination,
+        &mut trace,
+    );
+    assert_eq!(runtime.pending_actions(), 0);
+    run_miss(
+        &mut io,
+        &snapshot,
+        &mut runtime,
+        1_700,
+        destination,
+        &mut trace,
+    );
+    assert_eq!(runtime.pending_actions(), 1);
     assert_eq!(runtime.counters().suppressed, 1);
 }
 
@@ -483,6 +562,75 @@ fn local_binding_missing_and_forbidden_targets_generate_nothing() {
             .count(),
         4
     );
+}
+
+#[test]
+fn local_source_ip_is_forbidden_as_connected_or_gateway_target() {
+    let interfaces = [interface()];
+    let bindings = [binding()];
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut runtime = ResolutionRuntime::new(policy(), &mut states, &mut actions);
+    let mut io = SimIo::new();
+    let mut trace = VecTrace::default();
+
+    let connected = Route::new(Ipv4Address::from_octets([203, 0, 113, 0]), 24, WAN, None).unwrap();
+    let routes = [connected];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+    run_miss(&mut io, &snapshot, &mut runtime, 0, LOCAL_IP, &mut trace);
+
+    let gateway = Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, Some(LOCAL_IP)).unwrap();
+    let routes = [gateway];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+    run_miss(
+        &mut io,
+        &snapshot,
+        &mut runtime,
+        0,
+        Ipv4Address::from_octets([198, 51, 100, 20]),
+        &mut trace,
+    );
+    assert_eq!(runtime.pending_actions(), 0);
+    assert_eq!(runtime.counters().forbidden_target, 2);
+}
+
+#[test]
+fn gateway_target_matching_same_egress_connected_broadcast_is_forbidden() {
+    let connected = Route::new(Ipv4Address::from_octets([203, 0, 113, 0]), 24, WAN, None).unwrap();
+    let default = Route::new(
+        Ipv4Address::from_octets([0; 4]),
+        0,
+        WAN,
+        Some(Ipv4Address::from_octets([203, 0, 113, 255])),
+    )
+    .unwrap();
+    let routes = [connected, default];
+    let interfaces = [interface()];
+    let bindings = [binding()];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut runtime = ResolutionRuntime::new(policy(), &mut states, &mut actions);
+    let mut io = SimIo::new();
+    let mut trace = VecTrace::default();
+    run_miss(
+        &mut io,
+        &snapshot,
+        &mut runtime,
+        0,
+        Ipv4Address::from_octets([198, 51, 100, 20]),
+        &mut trace,
+    );
+    assert_eq!(runtime.pending_actions(), 0);
+    assert_eq!(runtime.counters().forbidden_target, 1);
+    assert!(trace.events().iter().any(|event| matches!(
+        event,
+        TraceEvent::NeighborResolution {
+            target,
+            result: ResolutionResult::ForbiddenTarget,
+            ..
+        } if *target == Ipv4Address::from_octets([203, 0, 113, 255])
+    )));
 }
 
 #[test]

@@ -138,6 +138,7 @@ impl<'a> ResolutionRuntime<'a> {
         states: &'a mut [ResolutionStateSlot],
         action_storage: &'a mut [ResolutionActionSlot],
     ) -> Self {
+        states.fill(ResolutionStateSlot::EMPTY);
         action_storage.fill(ResolutionActionSlot::EMPTY);
         Self {
             policy,
@@ -172,7 +173,10 @@ impl<'a> ResolutionRuntime<'a> {
             return ResolutionResult::ClockRegression;
         }
         self.last_now = Some(now);
-        if directed_broadcast || forbidden_target(action.target_ip) {
+        if directed_broadcast
+            || action.target_ip == action.source_ip
+            || forbidden_target(action.target_ip)
+        {
             self.counters.forbidden_target += 1;
             return ResolutionResult::ForbiddenTarget;
         }

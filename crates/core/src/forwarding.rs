@@ -392,7 +392,10 @@ fn decide_ipv4<T: TraceSink>(
                     target_ip: target,
                 },
                 *now,
-                route.is_directed_broadcast(target),
+                snapshot.routes.iter().any(|candidate| {
+                    candidate.egress() == route.egress()
+                        && candidate.is_connected_directed_broadcast(target)
+                }),
             );
             trace.record(TraceEvent::NeighborResolution {
                 egress: route.egress(),

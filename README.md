@@ -42,6 +42,7 @@ stable Rustだけで検証できます。
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets
+cargo test --doc --workspace
 RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps
 cargo check --workspace
 ```
