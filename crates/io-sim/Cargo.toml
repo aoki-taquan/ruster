@@ -1,0 +1,9 @@
+[package]
+name = "ruster-io-sim"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ruster-core = { path = "../core" }

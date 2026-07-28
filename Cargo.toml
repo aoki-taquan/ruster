@@ -1,21 +1,9 @@
 [workspace]
-members = [
-  "crates/config",
-  "crates/control",
-  "crates/dataplane",
-  "crates/observe",
-  "crates/main",
-]
+members = ["crates/core", "crates/io-sim"]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.1.0"
+version = "0.2.0"
 license = "MIT OR Apache-2.0"
 publish = false
-
-[workspace.dependencies]
-anyhow = "1.0"
-serde = { version = "1.0", features = ["derive"] }
-thiserror = "2.0"
-toml = "0.8"
