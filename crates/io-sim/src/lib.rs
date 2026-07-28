@@ -4,8 +4,11 @@
 use std::{collections::VecDeque, convert::Infallible};
 
 use ruster_core::{
-    forward_batch, BatchCompletion, BatchReport, DropReason, ForwardingSnapshot, IfId, PacketBatch,
-    PacketIo, PacketLease, PacketSlot, SlotCompletion, TraceEvent, TraceSink,
+    forward_batch, BatchCompletion, BatchReport, DropReason, ForwardingSnapshot,
+    GeneratedAllocationError, GeneratedArpTrace, GeneratedBatchCompletion, GeneratedPacketBatch,
+    GeneratedPacketIo, GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion,
+    GeneratedTraceSink, IfId, PacketBatch, PacketIo, PacketLease, PacketSlot, SlotCompletion,
+    TraceEvent, TraceSink,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -20,7 +23,14 @@ pub struct TxFrame {
     pub sequence: u64,
     pub ingress: IfId,
     pub egress: IfId,
+    pub origin: FrameOrigin,
     pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameOrigin {
+    Received { ingress: IfId },
+    Generated,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,12 +47,53 @@ pub struct RecycledFrame {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratedRecycleCause {
+    Cancelled,
+    Abandoned,
+    TxRejected,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct GeneratedRecycledFrame {
+    pub sequence: u64,
+    pub egress: IfId,
+    pub cause: GeneratedRecycleCause,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SimGeneratedError {
+    Injected,
+}
+
+#[derive(Debug)]
 pub struct SimIo {
     next_sequence: u64,
     rx: VecDeque<Slot>,
     tx: VecDeque<TxFrame>,
     recycled: VecDeque<RecycledFrame>,
+    generated_recycled: VecDeque<GeneratedRecycledFrame>,
+    generated_budget: usize,
+    generated_max_frame: usize,
+    generated_accept_budget: usize,
+    fail_generated_finish: bool,
+}
+
+impl Default for SimIo {
+    fn default() -> Self {
+        Self {
+            next_sequence: 0,
+            rx: VecDeque::new(),
+            tx: VecDeque::new(),
+            recycled: VecDeque::new(),
+            generated_recycled: VecDeque::new(),
+            generated_budget: usize::MAX,
+            generated_max_frame: 1_514,
+            generated_accept_budget: usize::MAX,
+            fail_generated_finish: false,
+        }
+    }
 }
 
 impl SimIo {
@@ -83,6 +134,26 @@ impl SimIo {
 
     pub fn pop_recycled(&mut self) -> Option<RecycledFrame> {
         self.recycled.pop_front()
+    }
+
+    pub fn pop_generated_recycled(&mut self) -> Option<GeneratedRecycledFrame> {
+        self.generated_recycled.pop_front()
+    }
+
+    pub fn set_generated_budget(&mut self, budget: usize) {
+        self.generated_budget = budget;
+    }
+
+    pub fn set_generated_max_frame(&mut self, max_frame: usize) {
+        self.generated_max_frame = max_frame;
+    }
+
+    pub fn set_generated_accept_budget(&mut self, budget: usize) {
+        self.generated_accept_budget = budget;
+    }
+
+    pub fn fail_next_generated_finish(&mut self) {
+        self.fail_generated_finish = true;
     }
 
     pub fn run_once<T: TraceSink>(
@@ -184,6 +255,9 @@ impl PacketSlot for SimSlot<'_> {
                     sequence: slot.sequence,
                     ingress: slot.ingress,
                     egress,
+                    origin: FrameOrigin::Received {
+                        ingress: slot.ingress,
+                    },
                     bytes: slot.bytes,
                 });
                 self.counters.tx_accepted += 1;
@@ -195,6 +269,179 @@ impl PacketSlot for SimSlot<'_> {
                 self.recycle(slot, RecycleCause::LeaseAbandoned);
             }
         }
+    }
+}
+
+impl GeneratedPacketIo for SimIo {
+    type Error = SimGeneratedError;
+    type Batch<'a> = SimGeneratedBatch<'a>;
+
+    fn begin_generated(&mut self, egress: IfId) -> Self::Batch<'_> {
+        let fail_finish = self.fail_generated_finish;
+        self.fail_generated_finish = false;
+        SimGeneratedBatch {
+            next_sequence: &mut self.next_sequence,
+            tx: &mut self.tx,
+            recycled: &mut self.generated_recycled,
+            egress,
+            remaining_allocations: self.generated_budget,
+            max_frame: self.generated_max_frame,
+            accept_budget: self.generated_accept_budget,
+            fail_finish,
+            pending: VecDeque::new(),
+            counters: GeneratedCounters::default(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GeneratedSlot {
+    sequence: u64,
+    bytes: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct GeneratedCounters {
+    attempts: usize,
+    allocated: usize,
+    failed: usize,
+    requested: usize,
+    cancelled: usize,
+    abandoned: usize,
+}
+
+pub struct SimGeneratedBatch<'a> {
+    next_sequence: &'a mut u64,
+    tx: &'a mut VecDeque<TxFrame>,
+    recycled: &'a mut VecDeque<GeneratedRecycledFrame>,
+    egress: IfId,
+    remaining_allocations: usize,
+    max_frame: usize,
+    accept_budget: usize,
+    fail_finish: bool,
+    pending: VecDeque<GeneratedSlot>,
+    counters: GeneratedCounters,
+}
+
+impl GeneratedPacketBatch for SimGeneratedBatch<'_> {
+    type Error = SimGeneratedError;
+    type Slot<'a>
+        = SimGeneratedSlot<'a>
+    where
+        Self: 'a;
+
+    fn allocate(
+        &mut self,
+        frame_len: usize,
+    ) -> Result<GeneratedPacketLease<Self::Slot<'_>>, GeneratedAllocationError> {
+        self.counters.attempts += 1;
+        let error = if frame_len == 0 {
+            Some(GeneratedAllocationError::ZeroLength)
+        } else if frame_len > self.max_frame {
+            Some(GeneratedAllocationError::FrameTooLarge)
+        } else if self.remaining_allocations == 0 {
+            Some(GeneratedAllocationError::Unavailable)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            self.counters.failed += 1;
+            return Err(error);
+        }
+        self.remaining_allocations -= 1;
+        self.counters.allocated += 1;
+        let sequence = *self.next_sequence;
+        *self.next_sequence = self.next_sequence.wrapping_add(1);
+        Ok(GeneratedPacketLease::new(SimGeneratedSlot {
+            slot: Some(GeneratedSlot {
+                sequence,
+                bytes: vec![0xa5; frame_len],
+            }),
+            pending: &mut self.pending,
+            recycled: self.recycled,
+            counters: &mut self.counters,
+            egress: self.egress,
+        }))
+    }
+
+    fn finish(mut self) -> GeneratedBatchCompletion<Self::Error> {
+        let accepted = self.accept_budget.min(self.pending.len());
+        for _ in 0..accepted {
+            let slot = self.pending.pop_front().expect("accepted generated slot");
+            self.tx.push_back(TxFrame {
+                sequence: slot.sequence,
+                ingress: self.egress,
+                egress: self.egress,
+                origin: FrameOrigin::Generated,
+                bytes: slot.bytes,
+            });
+        }
+        let rejected = self.pending.len();
+        while let Some(slot) = self.pending.pop_front() {
+            self.recycled.push_back(GeneratedRecycledFrame {
+                sequence: slot.sequence,
+                egress: self.egress,
+                cause: GeneratedRecycleCause::TxRejected,
+                bytes: slot.bytes,
+            });
+        }
+        GeneratedBatchCompletion {
+            attempts: self.counters.attempts,
+            allocated: self.counters.allocated,
+            failed: self.counters.failed,
+            requested: self.counters.requested,
+            cancelled: self.counters.cancelled,
+            abandoned: self.counters.abandoned,
+            accepted,
+            rejected,
+            error: self.fail_finish.then_some(SimGeneratedError::Injected),
+        }
+    }
+}
+
+pub struct SimGeneratedSlot<'a> {
+    slot: Option<GeneratedSlot>,
+    pending: &'a mut VecDeque<GeneratedSlot>,
+    recycled: &'a mut VecDeque<GeneratedRecycledFrame>,
+    counters: &'a mut GeneratedCounters,
+    egress: IfId,
+}
+
+impl GeneratedPacketSlot for SimGeneratedSlot<'_> {
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.slot.as_mut().expect("live generated sim slot").bytes
+    }
+
+    fn complete(mut self, completion: GeneratedSlotCompletion) {
+        let slot = self
+            .slot
+            .take()
+            .expect("generated sim slot completed exactly once");
+        match completion {
+            GeneratedSlotCompletion::Transmit => {
+                self.counters.requested += 1;
+                self.pending.push_back(slot);
+            }
+            GeneratedSlotCompletion::Cancelled => {
+                self.counters.cancelled += 1;
+                self.recycle(slot, GeneratedRecycleCause::Cancelled);
+            }
+            GeneratedSlotCompletion::Abandoned => {
+                self.counters.abandoned += 1;
+                self.recycle(slot, GeneratedRecycleCause::Abandoned);
+            }
+        }
+    }
+}
+
+impl SimGeneratedSlot<'_> {
+    fn recycle(&mut self, slot: GeneratedSlot, cause: GeneratedRecycleCause) {
+        self.recycled.push_back(GeneratedRecycledFrame {
+            sequence: slot.sequence,
+            egress: self.egress,
+            cause,
+            bytes: slot.bytes,
+        });
     }
 }
 
@@ -228,6 +475,24 @@ impl VecTrace {
 
 impl TraceSink for VecTrace {
     fn record(&mut self, event: TraceEvent) {
+        self.events.push(event);
+    }
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct VecGeneratedTrace {
+    events: Vec<GeneratedArpTrace>,
+}
+
+impl VecGeneratedTrace {
+    #[must_use]
+    pub fn events(&self) -> &[GeneratedArpTrace] {
+        &self.events
+    }
+}
+
+impl GeneratedTraceSink for VecGeneratedTrace {
+    fn record_generated(&mut self, event: GeneratedArpTrace) {
         self.events.push(event);
     }
 }

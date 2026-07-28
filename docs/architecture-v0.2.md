@@ -62,12 +62,42 @@ local bindingはMACを持ちません。ARP replyのlocal MACは対応する`Int
 routeに対応するneighborがまだ無いこと自体はvalidです。ARP解決前の通常状態として
 forwarding時に`NeighborUnresolved`でbytes不変recycleします。
 
-このsliceはstatic neighborとARP responderを接続しません。neighbor miss時もARP request
-を生成せず、packetをholdせずに従来どおり`NeighborUnresolved`でrecycleします。
-generated packet用allocator/lifetime contractがまだ無いため、場当たり的にsimの
-`Vec`をcoreへ導入しません。RFC 1122 §2.3.2.1/§2.3.2.2とRFC 1812 §3.3.2が述べる
-ARP cache/address resolutionとpacket queue/hold（少なくとも一つを保持するSHOULDを
-含む）は未達で、最初のpacketは解決後に自動再送されません。
+static neighbor missでは、routeが選んだ`(egress, next-hopまたはdestination)`と、
+egress interfaceのMAC/local IPv4からtyped `ArpRequestAction`を作れます。RX処理中は
+caller提供の固定ringへactionを積むだけで、RX batchの`finish`後に独立したgenerated
+sessionを開始します。元packetは常にbyte不変`NeighborUnresolved`でrecycleし、hold
+しません。
+
+generated sessionはbegin時にegressを固定し、最終Ethernet frame長ちょうどの
+backend-owned bufferをGAT/RAII leaseで借用します。coreにはheadroom、capacity全体、
+UMEM、mbufを公開しません。leaseは`!Send + !Sync`で、`commit`、`cancel`、未完了Dropの
+いずれかをexactly onceでbackendへ返します。allocationのzero length、max frame超過、
+buffer unavailableを区別し、失敗時はownershipを移しません。finishはerror時も
+`attempts=allocated+failed`、`allocated=requested+cancelled+abandoned`、
+`accepted+rejected=requested`のaccountingを返し、rejectをreturn前にrecycleします。
+
+resolution runtimeも`!Send + !Sync`で、caller提供のlinear fixed tableとaction ringだけを
+借用します。keyは`(IfId,target IPv4)`です。intervalは1000ms以上、state TTLはinterval
+以上とし、batch単位で注入された`MonotonicMillis`だけを使います。加算deadlineを作らず
+順序確認後の差分で判定するため`u64` overflowはありません。逆行はtyped resultとして
+action/stateを変更しません。live entryはevictせず、TTL後だけreuseします。
+
+同じkeyのactionは一つだけqueueできます。抑制deadlineはenqueue時でなく、generated
+leaseをcommitしてTX requestedになった注入時刻から開始します。allocation/build失敗時は
+actionを保持しdeadlineを開始しません。backendのpartial rejectでもcommit済みなので
+抑制を開始します。retryは新しいtraffic missでだけ起きます。target `0.0.0.0`、IPv4
+multicast、limited broadcast、およびcanonical connected routeから確定できるdirected
+broadcastにはARP Requestを生成しません。
+
+生成する通常RequestはFCSを含まない60 bytesです。先頭42 bytesをRFC 826の
+Ethernet/IPv4 ARP（Ethernet destination broadcast、SHA/source MACはlocal、SPAはnonzero
+local IPv4、THA zero、TPA target）として書き、残り18 bytesを必ずzero paddingします。
+THA zeroは決定的なlocal profile choiceであり、RFCのMUSTとは主張しません。
+
+これはRFC 826の通常ARP Request生成とRFC 1122 §2.3.2.1のflood preventionまでです。
+reply learning/cache/aging/flush、timer-only retry/max attempts/Failed、unresolved packet
+hold/replay（RFC 1122 §2.3.2.2、RFC 1812 §3.3.2）、multi-worker resolution ownership/
+SPSCは未実装です。最初のpacketは解決後に自動再送されません。
 
 ## IPv4 scope
 
@@ -98,13 +128,15 @@ RFC 5227 §2.4のaddress conflict detection/defenseは未実装です。foreign 
 conflict状態やdefensive announcementを生成しません。正常なlocal target requestを
 追加policyでdropしないことを優先した明示deviationです。
 
-ARP learning/cache、ARP request生成、retry、unresolved packet hold queue、gratuitous
-ARP、proxy ARP、VLAN、generated-packet allocator、Address Conflict Detection、ICMP生成、
+ARP learning/cache/aging/flush、timer retry、unresolved packet hold queue、gratuitous
+ARP、ARP Probe/Announcement生成、proxy ARP、VLAN、Address Conflict Detection、ICMP生成、
 NAT、firewall、config parser、pcap、AF_XDP、DPDK、binary、thread、benchmarkはこの
 sliceのscope外です。
 
 ## backend progression
 
-`ruster-io-sim`はFIFOとbudgetを決定的に実装します。RXの`Vec<u8>`そのものをTX/dropへ
-moveし、packet bytesをcloneしません。次の実I/O backendも同じlease contractを実装し、
+`ruster-io-sim`はRXとgenerated TXのFIFO、budget、max frame、allocation exhaustion、
+cancel/abandon、partial TX/reject、finish errorを決定的に実装します。captureは
+`FrameOrigin`でRXとgeneratedを区別します。RX/生成の`Vec<u8>`そのものをTX/dropへmoveし、
+packet bytesをcloneしません。次の実I/O backendも同じlease contractを実装し、
 backend固有pointerをcoreへ漏らしません。
