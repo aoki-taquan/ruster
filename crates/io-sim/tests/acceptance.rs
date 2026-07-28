@@ -874,6 +874,78 @@ fn mixed_ipv4_and_arp_batch_is_fifo_budgeted_and_deterministic() {
 }
 
 #[test]
+fn arp_reply_does_not_learn_or_generate_for_unresolved_neighbor() {
+    let routes = [route(REQUESTER_IPV4, 32, LAN, None)];
+    let interfaces = [local_interface()];
+    let bindings = [local_binding()];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+    let request = arp_frame(
+        1,
+        REQUESTER_IPV4,
+        LOCAL_IPV4,
+        REQUESTER_MAC,
+        REQUESTER_MAC,
+        [0; 6],
+        &[],
+    );
+    let mut toward_sender = frame(8, &[]);
+    toward_sender[30..34].copy_from_slice(&REQUESTER_IPV4);
+    toward_sender[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&toward_sender[14..34]);
+    toward_sender[24..26].copy_from_slice(&checksum.to_be_bytes());
+    let original_ipv4 = toward_sender.clone();
+
+    let mut io = SimIo::new();
+    let mut trace = VecTrace::default();
+    io.inject(LAN, request);
+    io.inject(LAN, toward_sender);
+    let report = io.run_once(2, &snapshot, &mut trace).unwrap();
+
+    assert_eq!(report.received, 2);
+    assert_eq!(report.tx_requested, 1, "no generated ARP request");
+    assert_eq!(report.dropped, 1);
+    assert_eq!(
+        report.completion,
+        BatchCompletion {
+            tx_requested: 1,
+            tx_accepted: 1,
+            tx_rejected: 0,
+            recycled: 1,
+            error: None,
+        }
+    );
+    assert_eq!(io.pending_tx(), 1, "only the in-place ARP reply exists");
+    let reply = io.pop_tx().unwrap();
+    assert_eq!(reply.sequence, 0);
+    assert_eq!(&reply.bytes[20..22], &2_u16.to_be_bytes());
+    let recycled = io.pop_recycled().unwrap();
+    assert_eq!(recycled.sequence, 1);
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Forwarding(DropReason::NeighborUnresolved)
+    );
+    assert_eq!(recycled.bytes, original_ipv4, "unresolved drop is atomic");
+    assert_eq!(io.pending_rx(), 0, "the unresolved packet is not held");
+    assert!(matches!(
+        trace.events(),
+        [
+            TraceEvent::ArpRequestValidated { .. },
+            TraceEvent::ArpReplyRequested { egress: LAN, .. },
+            TraceEvent::TxRequested { egress: LAN },
+            TraceEvent::Ipv4Validated { ingress: LAN, .. },
+            TraceEvent::Dropped {
+                ingress: LAN,
+                reason: DropReason::NeighborUnresolved
+            },
+            TraceEvent::BatchCompleted {
+                tx_accepted: 1,
+                tx_rejected: 0
+            }
+        ]
+    ));
+}
+
+#[test]
 fn arp_partial_backend_rejection_preserves_error_report_and_trace() {
     let interfaces = [local_interface()];
     let bindings = [local_binding()];

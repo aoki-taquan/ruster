@@ -65,9 +65,9 @@ forwarding時に`NeighborUnresolved`でbytes不変recycleします。
 このsliceはstatic neighborとARP responderを接続しません。neighbor miss時もARP request
 を生成せず、packetをholdせずに従来どおり`NeighborUnresolved`でrecycleします。
 generated packet用allocator/lifetime contractがまだ無いため、場当たり的にsimの
-`Vec`をcoreへ導入しません。RFC 1122 §2.3.2.2とRFC 1812 §3.3.2が述べるaddress
-resolution中のpacket queue/hold（少なくとも一つを保持するSHOULDを含む）は未達で、
-最初のpacketは解決後に自動再送されません。
+`Vec`をcoreへ導入しません。RFC 1122 §2.3.2.1/§2.3.2.2とRFC 1812 §3.3.2が述べる
+ARP cache/address resolutionとpacket queue/hold（少なくとも一つを保持するSHOULDを
+含む）は未達で、最初のpacketは解決後に自動再送されません。
 
 ## IPv4 scope
 
@@ -82,8 +82,9 @@ v0.2 bootstrapはEthernet II上のIPv4 datagramを転送します。
 ## ARP responder scope
 
 Ethernet II / IPv4 profile（HTYPE 1、PTYPE 0x0800、HLEN 6、PLEN 4）のARP Requestだけを
-扱います。TPAがingress interfaceのlocal IPv4と一致するとき、同じRX bufferを次の
-replyへ書き換えてingressへcommitします。
+扱います。opcode profileはRFC 826に加えてRFC 5494/IANA ARP Parameters registryに
+基づき、Replyと未対応opcodeを別reasonにします。TPAがingress interfaceのlocal IPv4と
+一致するとき、同じRX bufferを次のreplyへ書き換えてingressへcommitします。
 
 - Ethernet destinationとTHAはrequest SHA、Ethernet sourceとSHAはlocal interface MAC。
 - SPAはrequest TPA、TPAはrequest SPA。ARP ProbeのSPA `0.0.0.0`にもTPA zeroでreplyする。

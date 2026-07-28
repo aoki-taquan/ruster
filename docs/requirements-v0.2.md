@@ -23,16 +23,16 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | FWD-004 incremental checksum update | RFC 1624 §4 | `rfc_1624_negative_zero_boundary_is_positive_zero` | implemented | `0xdd2f,0x5555→0x3285 = 0x0000` |
 | FWD-005 drop atomicity | architecture contract | `all_validation_and_decision_drops_are_granular_and_atomic` | implemented | なし |
 | FWD-006 snapshot integrity | architecture contract | `snapshot_constructor_rejects_all_broken_references_and_duplicates` | implemented | 公開前にvalidation |
-| FWD-007 unresolved packet hold/ARP request generation | RFC 1122 §2.3.2.2, RFC 1812 §3.3.2 | `all_validation_and_decision_drops_are_granular_and_atomic` | deferred | static neighbor missはbyte不変NeighborUnresolved。allocator/request/retry/hold queueが無く、最初のpacketは自動再送されない |
-| ARP-001 Ethernet/IPv4 request profile validation | RFC 826 | `arp_profile_validation_drops_are_granular_and_atomic` | implemented | HTYPE=1/PTYPE=0x0800/HLEN=6/PLEN=4/opcode=1 |
+| FWD-007 unresolved packet hold/ARP request generation | RFC 1122 §2.3.2.1/§2.3.2.2, RFC 1812 §3.3.2 | `arp_reply_does_not_learn_or_generate_for_unresolved_neighbor` | deferred | static neighbor missはbyte不変NeighborUnresolved。allocator/request/retry/hold queueが無く、最初のpacketは自動再送されない |
+| ARP-001 Ethernet/IPv4 request profile validation | RFC 826, RFC 5494/IANA ARP Parameters | `arp_profile_validation_drops_are_granular_and_atomic` | implemented | HTYPE=1/PTYPE=0x0800/HLEN=6/PLEN=4/opcode=1。replyとunknown opcodeを区別 |
 | ARP-002 local target in-place reply on ingress | RFC 826 | `arp_request_for_local_ipv4_replies_in_place_on_ingress` | implemented | 同じRX allocation、egress=ingress、wire fieldsを検証 |
-| ARP-003 probe reply with zero target protocol | RFC 5227 §2.1 | `arp_probe_for_local_ipv4_replies_with_zero_target_protocol` | implemented | SPA=0 requestにも通常reply |
+| ARP-003 probe reply with zero target protocol | RFC 5227 §2.5（Probe形式は§1.1/§2.1.1） | `arp_probe_for_local_ipv4_replies_with_zero_target_protocol` | implemented | SPA=0 requestにも通常reply |
 | ARP-004 request THA ignored/source identities not coupled | RFC 826 | `arp_request_target_hardware_is_ignored` | implemented | Ethernet source≠ARP SHAも受理 |
 | ARP-005 tail/padding preservation | RFC 826 wire profile | `arp_padding_is_ignored_and_preserved_on_reply` | implemented | 42 byte以後を変更しない |
 | ARP-006 nonlocal/reply/unknown opcode stable recycle | explainability requirement | `arp_nonlocal_and_reply_are_recycled_without_mutation` | implemented | replyとunknown opcodeは別stable reason |
 | ARP-007 local binding snapshot integrity | architecture contract | `arp_snapshot_rejects_duplicate_or_unknown_local_addresses` | implemented | 現profileはinterfaceごとにlocal IPv4一つ、address重複も拒否。MACはInterfaceのみ |
 | ARP-008 address conflict detection/defense | RFC 5227 §2.4 | `arp_foreign_sender_claiming_local_address_gets_normal_reply` | deviation | foreign SHAがlocal SPAを名乗ってもconflict state/defensive announcementなし。local targetへの通常replyのみ |
-| ARP-009 learning/cache/request/retry/hold/proxy/gratuitous/ACD | RFC 826, RFC 5227 | `arp_nonlocal_and_reply_are_recycled_without_mutation` | deferred | immutable responder sliceのみ。neighbor学習・VLAN・generated allocatorも非対象 |
+| ARP-009 learning/cache/request/retry/hold/proxy/gratuitous/ACD | RFC 826, RFC 1122 §2.3.2.1/§2.3.2.2, RFC 1812 §3.3.2, RFC 5227 | `arp_reply_does_not_learn_or_generate_for_unresolved_neighbor` | deferred | reply直後もsenderを学習せず、static missはARP生成/holdなし。neighbor学習・VLAN・generated allocatorも非対象 |
 | OBS-001 stable reason code | explainability requirement | `drop_reason_discriminants_and_codes_are_stable_and_unique` | implemented | repr(u16) |
 | OBS-002 requestedとaggregate TX outcome trace | explainability requirement | `partial_backend_completion_preserves_report_and_aggregate_trace` | implemented | packet単位accepted traceはdeferred |
 | OBS-003 protocol-aware ARP trace ordering | explainability requirement | `arp_trace_is_deterministic_and_tx_follows_commit` | implemented | validated/reply requested/TX requested/completionを順序検証 |
