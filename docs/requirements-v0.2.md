@@ -29,10 +29,10 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | ARP-003 probe reply with zero target protocol | RFC 5227 §2.5（Probe形式は§1.1/§2.1.1） | `arp_probe_for_local_ipv4_replies_with_zero_target_protocol` | implemented | SPA=0 requestにも通常reply |
 | ARP-004 request THA ignored/source identities not coupled | RFC 826 | `arp_request_target_hardware_is_ignored` | implemented | Ethernet source≠ARP SHAも受理 |
 | ARP-005 tail/padding preservation | RFC 826 wire profile | `arp_padding_is_ignored_and_preserved_on_reply` | implemented | 42 byte以後を変更しない |
-| ARP-006 nonlocal/reply/unknown opcode stable recycle | explainability requirement | `arp_nonlocal_and_reply_are_recycled_without_mutation` | implemented | replyとunknown opcodeは別stable reason |
+| ARP-006 nonlocal/proxy-disabled/reply/unknown opcode stable recycle | RFC 826, RFC 1027, RFC 5494/IANA ARP Parameters | `arp_nonlocal_and_reply_are_recycled_without_mutation` | implemented | nonlocal targetへ応答せずproxy ARPは無効。replyとunknown opcodeは別stable reason |
 | ARP-007 local binding snapshot integrity | architecture contract | `arp_snapshot_rejects_duplicate_or_unknown_local_addresses` | implemented | 現profileはinterfaceごとにlocal IPv4一つ、address重複も拒否。MACはInterfaceのみ |
 | ARP-008 address conflict detection/defense | RFC 5227 §2.4 | `arp_foreign_sender_claiming_local_address_gets_normal_reply` | deviation | foreign SHAがlocal SPAを名乗ってもconflict state/defensive announcementなし。local targetへの通常replyのみ |
-| ARP-009 learning/cache/request/retry/hold/proxy/gratuitous/ACD | RFC 826, RFC 1122 §2.3.2.1/§2.3.2.2, RFC 1812 §3.3.2, RFC 5227 | `arp_reply_does_not_learn_or_generate_for_unresolved_neighbor` | deferred | reply直後もsenderを学習せず、static missはARP生成/holdなし。neighbor学習・VLAN・generated allocatorも非対象 |
+| ARP-009 learning/cache/request/retry/hold | RFC 826, RFC 1122 §2.3.2.1/§2.3.2.2, RFC 1812 §3.3.2 | `arp_reply_does_not_learn_or_generate_for_unresolved_neighbor` | deferred | reply直後もsenderを学習せず、static missはARP生成・retry・holdなし |
 | OBS-001 stable reason code | explainability requirement | `drop_reason_discriminants_and_codes_are_stable_and_unique` | implemented | repr(u16) |
 | OBS-002 requestedとaggregate TX outcome trace | explainability requirement | `partial_backend_completion_preserves_report_and_aggregate_trace` | implemented | packet単位accepted traceはdeferred |
 | OBS-003 protocol-aware ARP trace ordering | explainability requirement | `arp_trace_is_deterministic_and_tx_follows_commit` | implemented | validated/reply requested/TX requested/completionを順序検証 |
