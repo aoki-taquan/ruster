@@ -1,8 +1,11 @@
 use crate::DropReason;
 
 pub const ETHERNET_HEADER_LEN: usize = 14;
+pub const ARP_PACKET_LEN: usize = 28;
+pub const ARP_FRAME_LEN: usize = ETHERNET_HEADER_LEN + ARP_PACKET_LEN;
 const IPV4_MIN_HEADER_LEN: usize = 20;
-const IPV4_ETHERTYPE: u16 = 0x0800;
+pub const IPV4_ETHERTYPE: u16 = 0x0800;
+pub const ARP_ETHERTYPE: u16 = 0x0806;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MacAddress(pub [u8; 6]);
@@ -17,6 +20,13 @@ pub struct ValidatedIpv4 {
     pub source: crate::Ipv4Address,
     pub destination: crate::Ipv4Address,
     pub checksum: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedArpRequest {
+    pub sender_hardware: MacAddress,
+    pub sender_protocol: crate::Ipv4Address,
+    pub target_protocol: crate::Ipv4Address,
 }
 
 /// Validates Ethernet II and the entire IPv4 header without mutating the frame.
@@ -99,7 +109,55 @@ pub fn validate_ipv4_frame(frame: &[u8]) -> Result<ValidatedIpv4, DropReason> {
     })
 }
 
-fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+/// Validates the Ethernet/IPv4 ARP profile and returns a request view.
+///
+/// The target hardware address is intentionally ignored as required by
+/// RFC 826 request processing. Ethernet source and ARP sender hardware are
+/// also not required to match. No bytes are mutated by this function.
+pub fn validate_arp_request(frame: &[u8]) -> Result<ValidatedArpRequest, DropReason> {
+    if frame.len() < ETHERNET_HEADER_LEN {
+        return Err(DropReason::EthernetHeaderTruncated);
+    }
+    if read_u16(frame, 12) != Some(ARP_ETHERTYPE) {
+        return Err(DropReason::UnsupportedEtherType);
+    }
+    if frame.len() < ARP_FRAME_LEN {
+        return Err(DropReason::ArpPacketTruncated);
+    }
+
+    if read_u16(frame, 14) != Some(1) {
+        return Err(DropReason::ArpHardwareTypeUnsupported);
+    }
+    if read_u16(frame, 16) != Some(IPV4_ETHERTYPE) {
+        return Err(DropReason::ArpProtocolTypeUnsupported);
+    }
+    if frame[18] != 6 {
+        return Err(DropReason::ArpHardwareLengthUnsupported);
+    }
+    if frame[19] != 4 {
+        return Err(DropReason::ArpProtocolLengthUnsupported);
+    }
+    match read_u16(frame, 20) {
+        Some(1) => {}
+        Some(2) => return Err(DropReason::ArpReplyUnsupported),
+        Some(_) => return Err(DropReason::ArpOpcodeUnsupported),
+        None => return Err(DropReason::ArpPacketTruncated),
+    }
+
+    Ok(ValidatedArpRequest {
+        sender_hardware: MacAddress([
+            frame[22], frame[23], frame[24], frame[25], frame[26], frame[27],
+        ]),
+        sender_protocol: crate::Ipv4Address::from_octets([
+            frame[28], frame[29], frame[30], frame[31],
+        ]),
+        target_protocol: crate::Ipv4Address::from_octets([
+            frame[38], frame[39], frame[40], frame[41],
+        ]),
+    })
+}
+
+pub(crate) fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     let end = offset.checked_add(2)?;
     let word = bytes.get(offset..end)?;
     Some(u16::from_be_bytes([word[0], word[1]]))

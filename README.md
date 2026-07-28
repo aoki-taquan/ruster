@@ -10,7 +10,7 @@ active treeは、そのコードを継承しないv0.2のゼロベース実装�
 この最初の縦切りは、外部依存を持たない二つのlibrary crateだけで構成します。
 
 - `ruster-core`: backend所有packetを借用し、Ethernet II / IPv4検証、LPM、
-  TTL/checksum/MAC rewriteを行う。
+  TTL/checksum/MAC rewriteとlocal IPv4向けARP replyを行う。
 - `ruster-io-sim`: rootやNICなしでFIFO、budget、TX/drop、traceを決定的に検証する。
 
 ```text
@@ -24,6 +24,8 @@ sim RX slot ──borrow──► ruster-core ──commit──► sim TX slot
 
 fast pathはpacket batchをworkerが専有します。共有`Mutex`、packet単位の`String`、
 packet clone、`dyn PacketIo`を導入しません。simの`Vec`はcold I/O境界に閉じています。
+ARP replyも同じRX bufferをin-placeで書き換え、受信interfaceへcommitします。現在の
+ARP profileはinterfaceごとにlocal IPv4を一つだけ持つ静的snapshotです。
 
 ## 開発
 

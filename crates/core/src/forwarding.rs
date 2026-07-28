@@ -1,6 +1,6 @@
 use crate::{
-    rfc1624_update, route, validate_ipv4_frame, BatchCompletion, IfId, Interface, Neighbor,
-    PacketBatch, Route,
+    packet, rfc1624_update, route, validate_arp_request, validate_ipv4_frame, BatchCompletion,
+    IfId, Interface, LocalIpv4Binding, Neighbor, PacketBatch, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,6 +21,14 @@ pub enum DropReason {
     RouteMiss = 12,
     NeighborUnresolved = 13,
     InterfaceMiss = 14,
+    ArpPacketTruncated = 15,
+    ArpHardwareTypeUnsupported = 16,
+    ArpProtocolTypeUnsupported = 17,
+    ArpHardwareLengthUnsupported = 18,
+    ArpProtocolLengthUnsupported = 19,
+    ArpReplyUnsupported = 20,
+    ArpOpcodeUnsupported = 21,
+    ArpTargetNotLocal = 22,
 }
 
 use DropReason::*;
@@ -43,6 +51,14 @@ impl DropReason {
             RouteMiss => "ROUTE_MISS",
             NeighborUnresolved => "NEIGHBOR_UNRESOLVED",
             InterfaceMiss => "INTERFACE_MISS",
+            ArpPacketTruncated => "ARP_PACKET_TRUNCATED",
+            ArpHardwareTypeUnsupported => "ARP_HARDWARE_TYPE_UNSUPPORTED",
+            ArpProtocolTypeUnsupported => "ARP_PROTOCOL_TYPE_UNSUPPORTED",
+            ArpHardwareLengthUnsupported => "ARP_HARDWARE_LENGTH_UNSUPPORTED",
+            ArpProtocolLengthUnsupported => "ARP_PROTOCOL_LENGTH_UNSUPPORTED",
+            ArpReplyUnsupported => "ARP_REPLY_UNSUPPORTED",
+            ArpOpcodeUnsupported => "ARP_OPCODE_UNSUPPORTED",
+            ArpTargetNotLocal => "ARP_TARGET_NOT_LOCAL",
         }
     }
 }
@@ -54,6 +70,8 @@ pub enum SnapshotError {
     DuplicateNeighbor,
     RouteUnknownInterface,
     NeighborUnknownInterface,
+    DuplicateLocalIpv4Binding,
+    LocalIpv4BindingUnknownInterface,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -61,6 +79,7 @@ pub struct ForwardingSnapshot<'a> {
     routes: &'a [Route],
     interfaces: &'a [Interface],
     neighbors: &'a [Neighbor],
+    local_ipv4: &'a [LocalIpv4Binding],
 }
 
 impl<'a> ForwardingSnapshot<'a> {
@@ -68,6 +87,7 @@ impl<'a> ForwardingSnapshot<'a> {
         routes: &'a [Route],
         interfaces: &'a [Interface],
         neighbors: &'a [Neighbor],
+        local_ipv4: &'a [LocalIpv4Binding],
     ) -> Result<Self, SnapshotError> {
         for (index, route) in routes.iter().enumerate() {
             if routes[..index].iter().any(|candidate| {
@@ -103,19 +123,38 @@ impl<'a> ForwardingSnapshot<'a> {
                 return Err(SnapshotError::NeighborUnknownInterface);
             }
         }
+        for (index, binding) in local_ipv4.iter().enumerate() {
+            if local_ipv4[..index].iter().any(|candidate| {
+                candidate.interface == binding.interface || candidate.address == binding.address
+            }) {
+                return Err(SnapshotError::DuplicateLocalIpv4Binding);
+            }
+            if !interfaces
+                .iter()
+                .any(|interface| interface.id == binding.interface)
+            {
+                return Err(SnapshotError::LocalIpv4BindingUnknownInterface);
+            }
+        }
         Ok(Self {
             routes,
             interfaces,
             neighbors,
+            local_ipv4,
         })
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TraceEvent {
-    Validated {
+    Ipv4Validated {
         ingress: IfId,
         destination: crate::Ipv4Address,
+    },
+    ArpRequestValidated {
+        ingress: IfId,
+        sender_protocol: crate::Ipv4Address,
+        target_protocol: crate::Ipv4Address,
     },
     Routed {
         egress: IfId,
@@ -124,6 +163,10 @@ pub enum TraceEvent {
     /// The packet was handed to the backend, not necessarily accepted by TX.
     TxRequested {
         egress: IfId,
+    },
+    ArpReplyRequested {
+        egress: IfId,
+        target_protocol: crate::Ipv4Address,
     },
     Dropped {
         ingress: IfId,
@@ -159,7 +202,7 @@ pub struct BatchReport<E> {
 }
 
 #[derive(Clone, Copy)]
-struct RewriteDecision {
+struct Ipv4RewriteDecision {
     egress: IfId,
     source_mac: [u8; 6],
     destination_mac: [u8; 6],
@@ -169,6 +212,30 @@ struct RewriteDecision {
     old_ttl_protocol: u16,
     new_ttl_protocol: u16,
     old_checksum: u16,
+}
+
+#[derive(Clone, Copy)]
+struct ArpReplyDecision {
+    egress: IfId,
+    local_mac: [u8; 6],
+    requester_mac: [u8; 6],
+    requester_protocol: [u8; 4],
+    local_protocol: [u8; 4],
+}
+
+#[derive(Clone, Copy)]
+enum PacketDecision {
+    Ipv4(Ipv4RewriteDecision),
+    ArpReply(ArpReplyDecision),
+}
+
+impl PacketDecision {
+    const fn egress(self) -> IfId {
+        match self {
+            Self::Ipv4(decision) => decision.egress,
+            Self::ArpReply(decision) => decision.egress,
+        }
+    }
 }
 
 pub fn forward_batch<B, T>(
@@ -189,15 +256,20 @@ where
         let result = {
             let frame = packet.bytes_mut();
             decide(&*frame, snapshot, ingress, trace)
-                .and_then(|decision| apply_rewrite(frame, decision).map(|()| decision))
+                .and_then(|decision| apply_decision(frame, decision).map(|()| decision))
         };
         match result {
             Ok(decision) => {
-                packet.commit(decision.egress);
+                let egress = decision.egress();
+                packet.commit(egress);
                 tx_requested += 1;
-                trace.record(TraceEvent::TxRequested {
-                    egress: decision.egress,
-                });
+                if let PacketDecision::ArpReply(arp) = decision {
+                    trace.record(TraceEvent::ArpReplyRequested {
+                        egress,
+                        target_protocol: crate::Ipv4Address::from_octets(arp.requester_protocol),
+                    });
+                }
+                trace.record(TraceEvent::TxRequested { egress });
             }
             Err(reason) => {
                 packet.recycle(reason);
@@ -224,9 +296,23 @@ fn decide<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     trace: &mut T,
-) -> Result<RewriteDecision, DropReason> {
+) -> Result<PacketDecision, DropReason> {
+    let ether_type = packet::read_u16(frame, 12).ok_or(EthernetHeaderTruncated)?;
+    match ether_type {
+        IPV4_ETHERTYPE => decide_ipv4(frame, snapshot, ingress, trace).map(PacketDecision::Ipv4),
+        ARP_ETHERTYPE => decide_arp(frame, snapshot, ingress, trace).map(PacketDecision::ArpReply),
+        _ => Err(UnsupportedEtherType),
+    }
+}
+
+fn decide_ipv4<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    trace: &mut T,
+) -> Result<Ipv4RewriteDecision, DropReason> {
     let ipv4 = validate_ipv4_frame(frame)?;
-    trace.record(TraceEvent::Validated {
+    trace.record(TraceEvent::Ipv4Validated {
         ingress,
         destination: ipv4.destination,
     });
@@ -263,7 +349,7 @@ fn decide<T: TraceSink>(
         egress: route.egress(),
         neighbor_target: target,
     });
-    Ok(RewriteDecision {
+    Ok(Ipv4RewriteDecision {
         egress: route.egress(),
         source_mac: interface.mac.0,
         destination_mac: neighbor.mac.0,
@@ -276,7 +362,50 @@ fn decide<T: TraceSink>(
     })
 }
 
-fn apply_rewrite(frame: &mut [u8], decision: RewriteDecision) -> Result<(), DropReason> {
+fn decide_arp<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    trace: &mut T,
+) -> Result<ArpReplyDecision, DropReason> {
+    let arp = validate_arp_request(frame)?;
+    trace.record(TraceEvent::ArpRequestValidated {
+        ingress,
+        sender_protocol: arp.sender_protocol,
+        target_protocol: arp.target_protocol,
+    });
+    if !snapshot
+        .local_ipv4
+        .iter()
+        .any(|binding| binding.interface == ingress && binding.address == arp.target_protocol)
+    {
+        return Err(ArpTargetNotLocal);
+    }
+    let interface = snapshot
+        .interfaces
+        .iter()
+        .find(|item| item.id == ingress)
+        .ok_or(InterfaceMiss)?;
+    if frame.get(0..packet::ARP_FRAME_LEN).is_none() {
+        return Err(ArpPacketTruncated);
+    }
+    Ok(ArpReplyDecision {
+        egress: ingress,
+        local_mac: interface.mac.0,
+        requester_mac: arp.sender_hardware.0,
+        requester_protocol: arp.sender_protocol.octets(),
+        local_protocol: arp.target_protocol.octets(),
+    })
+}
+
+fn apply_decision(frame: &mut [u8], decision: PacketDecision) -> Result<(), DropReason> {
+    match decision {
+        PacketDecision::Ipv4(ipv4) => apply_ipv4_rewrite(frame, ipv4),
+        PacketDecision::ArpReply(arp) => apply_arp_reply(frame, arp),
+    }
+}
+
+fn apply_ipv4_rewrite(frame: &mut [u8], decision: Ipv4RewriteDecision) -> Result<(), DropReason> {
     if frame.get(0..6).is_none()
         || frame.get(6..12).is_none()
         || frame.get(decision.ttl_offset).is_none()
@@ -295,6 +424,20 @@ fn apply_rewrite(frame: &mut [u8], decision: RewriteDecision) -> Result<(), Drop
         decision.new_ttl_protocol,
     );
     frame[decision.checksum_offset..decision.checksum_end].copy_from_slice(&checksum.to_be_bytes());
+    Ok(())
+}
+
+fn apply_arp_reply(frame: &mut [u8], decision: ArpReplyDecision) -> Result<(), DropReason> {
+    if frame.get(0..packet::ARP_FRAME_LEN).is_none() {
+        return Err(ArpPacketTruncated);
+    }
+    frame[0..6].copy_from_slice(&decision.requester_mac);
+    frame[6..12].copy_from_slice(&decision.local_mac);
+    frame[20..22].copy_from_slice(&2_u16.to_be_bytes());
+    frame[22..28].copy_from_slice(&decision.local_mac);
+    frame[28..32].copy_from_slice(&decision.local_protocol);
+    frame[32..38].copy_from_slice(&decision.requester_mac);
+    frame[38..42].copy_from_slice(&decision.requester_protocol);
     Ok(())
 }
 
@@ -319,6 +462,14 @@ mod tests {
             (12, "ROUTE_MISS"),
             (13, "NEIGHBOR_UNRESOLVED"),
             (14, "INTERFACE_MISS"),
+            (15, "ARP_PACKET_TRUNCATED"),
+            (16, "ARP_HARDWARE_TYPE_UNSUPPORTED"),
+            (17, "ARP_PROTOCOL_TYPE_UNSUPPORTED"),
+            (18, "ARP_HARDWARE_LENGTH_UNSUPPORTED"),
+            (19, "ARP_PROTOCOL_LENGTH_UNSUPPORTED"),
+            (20, "ARP_REPLY_UNSUPPORTED"),
+            (21, "ARP_OPCODE_UNSUPPORTED"),
+            (22, "ARP_TARGET_NOT_LOCAL"),
         ];
         let actual = [
             DropReason::EthernetHeaderTruncated,
@@ -335,6 +486,14 @@ mod tests {
             DropReason::RouteMiss,
             DropReason::NeighborUnresolved,
             DropReason::InterfaceMiss,
+            DropReason::ArpPacketTruncated,
+            DropReason::ArpHardwareTypeUnsupported,
+            DropReason::ArpProtocolTypeUnsupported,
+            DropReason::ArpHardwareLengthUnsupported,
+            DropReason::ArpProtocolLengthUnsupported,
+            DropReason::ArpReplyUnsupported,
+            DropReason::ArpOpcodeUnsupported,
+            DropReason::ArpTargetNotLocal,
         ];
         for (reason, &(discriminant, code)) in actual.iter().zip(&expected) {
             assert_eq!(*reason as u16, discriminant);
