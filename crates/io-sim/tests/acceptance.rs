@@ -304,6 +304,14 @@ fn arp_snapshot_rejects_duplicate_or_unknown_local_addresses() {
         ForwardingSnapshot::new(&[], &interfaces, &[], &unknown),
         Err(SnapshotError::LocalIpv4BindingUnknownInterface)
     ));
+    let unspecified = [LocalIpv4Binding {
+        interface: LAN,
+        address: ip([0; 4]),
+    }];
+    assert!(matches!(
+        ForwardingSnapshot::new(&[], &interfaces, &[], &unspecified),
+        Err(SnapshotError::LocalIpv4BindingUnspecified)
+    ));
 }
 
 #[test]

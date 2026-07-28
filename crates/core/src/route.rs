@@ -16,6 +16,11 @@ impl Ipv4Address {
     pub const fn octets(self) -> [u8; 4] {
         self.0.to_be_bytes()
     }
+
+    #[must_use]
+    pub const fn is_unspecified(self) -> bool {
+        self.0 == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,6 +104,14 @@ impl Route {
     pub(crate) fn matches(self, address: Ipv4Address) -> bool {
         let mask = prefix_mask(self.prefix_len).expect("Route::new validates prefix length");
         address.0 & mask == self.prefix.0
+    }
+
+    pub(crate) fn is_connected_directed_broadcast(self, address: Ipv4Address) -> bool {
+        if self.next_hop.is_some() || self.prefix_len > 30 || !self.matches(address) {
+            return false;
+        }
+        let mask = prefix_mask(self.prefix_len).expect("Route::new validates prefix length");
+        address.0 == self.prefix.0 | !mask
     }
 }
 

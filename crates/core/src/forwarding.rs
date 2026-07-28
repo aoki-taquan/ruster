@@ -1,6 +1,7 @@
 use crate::{
-    packet, rfc1624_update, route, validate_arp_request, validate_ipv4_frame, BatchCompletion,
-    IfId, Interface, LocalIpv4Binding, Neighbor, PacketBatch, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
+    packet, rfc1624_update, route, validate_arp_request, validate_ipv4_frame, ArpRequestAction,
+    BatchCompletion, IfId, Interface, LocalIpv4Binding, MonotonicMillis, Neighbor, PacketBatch,
+    ResolutionResult, ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -72,6 +73,7 @@ pub enum SnapshotError {
     NeighborUnknownInterface,
     DuplicateLocalIpv4Binding,
     LocalIpv4BindingUnknownInterface,
+    LocalIpv4BindingUnspecified,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -124,6 +126,9 @@ impl<'a> ForwardingSnapshot<'a> {
             }
         }
         for (index, binding) in local_ipv4.iter().enumerate() {
+            if binding.address.is_unspecified() {
+                return Err(SnapshotError::LocalIpv4BindingUnspecified);
+            }
             if local_ipv4[..index].iter().any(|candidate| {
                 candidate.interface == binding.interface || candidate.address == binding.address
             }) {
@@ -159,6 +164,11 @@ pub enum TraceEvent {
     Routed {
         egress: IfId,
         neighbor_target: crate::Ipv4Address,
+    },
+    NeighborResolution {
+        egress: IfId,
+        target: crate::Ipv4Address,
+        result: ResolutionResult,
     },
     /// The packet was handed to the backend, not necessarily accepted by TX.
     TxRequested {
@@ -239,8 +249,37 @@ impl PacketDecision {
 }
 
 pub fn forward_batch<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(batch, snapshot, None, trace)
+}
+
+/// Forwards RX packets and queues resolution actions without allocating TX
+/// frames. Generated execution must start only after this function returns.
+pub fn forward_batch_with_resolution<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    runtime: &mut ResolutionRuntime<'_>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(batch, snapshot, Some((runtime, now)), trace)
+}
+
+fn forward_batch_inner<B, T>(
     mut batch: B,
     snapshot: &ForwardingSnapshot<'_>,
+    mut resolution: Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
 where
@@ -255,7 +294,7 @@ where
         let ingress = packet.ingress();
         let result = {
             let frame = packet.bytes_mut();
-            decide(&*frame, snapshot, ingress, trace)
+            decide(&*frame, snapshot, ingress, &mut resolution, trace)
                 .and_then(|decision| apply_decision(frame, decision).map(|()| decision))
         };
         match result {
@@ -295,11 +334,14 @@ fn decide<T: TraceSink>(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
+    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     let ether_type = packet::read_u16(frame, 12).ok_or(EthernetHeaderTruncated)?;
     match ether_type {
-        IPV4_ETHERTYPE => decide_ipv4(frame, snapshot, ingress, trace).map(PacketDecision::Ipv4),
+        IPV4_ETHERTYPE => {
+            decide_ipv4(frame, snapshot, ingress, resolution, trace).map(PacketDecision::Ipv4)
+        }
         ARP_ETHERTYPE => decide_arp(frame, snapshot, ingress, trace).map(PacketDecision::ArpReply),
         _ => Err(UnsupportedEtherType),
     }
@@ -309,6 +351,7 @@ fn decide_ipv4<T: TraceSink>(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
+    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) -> Result<Ipv4RewriteDecision, DropReason> {
     let ipv4 = validate_ipv4_frame(frame)?;
@@ -324,16 +367,44 @@ fn decide_ipv4<T: TraceSink>(
     }
     let route = route::lookup(snapshot.routes, ipv4.destination).ok_or(RouteMiss)?;
     let target = route.next_hop().unwrap_or(ipv4.destination);
-    let neighbor = snapshot
-        .neighbors
-        .iter()
-        .find(|item| item.interface == route.egress() && item.target == target)
-        .ok_or(NeighborUnresolved)?;
     let interface = snapshot
         .interfaces
         .iter()
         .find(|item| item.id == route.egress())
         .ok_or(InterfaceMiss)?;
+    let neighbor = snapshot
+        .neighbors
+        .iter()
+        .find(|item| item.interface == route.egress() && item.target == target);
+    let Some(neighbor) = neighbor else {
+        if let (Some(binding), Some((runtime, now))) = (
+            snapshot
+                .local_ipv4
+                .iter()
+                .find(|binding| binding.interface == route.egress()),
+            resolution.as_mut(),
+        ) {
+            let result = runtime.schedule(
+                ArpRequestAction {
+                    egress: route.egress(),
+                    source_mac: interface.mac,
+                    source_ip: binding.address,
+                    target_ip: target,
+                },
+                *now,
+                snapshot.routes.iter().any(|candidate| {
+                    candidate.egress() == route.egress()
+                        && candidate.is_connected_directed_broadcast(target)
+                }),
+            );
+            trace.record(TraceEvent::NeighborResolution {
+                egress: route.egress(),
+                target,
+                result,
+            });
+        }
+        return Err(NeighborUnresolved);
+    };
     let ttl_offset = ipv4
         .header_offset
         .checked_add(8)

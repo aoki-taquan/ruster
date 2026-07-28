@@ -42,16 +42,27 @@ table && /^\|/ {
         printf "%s:%d: deviation %s requires a note\n", FILENAME, NR, id > "/dev/stderr"
         failed = 1
     }
-    if (test !~ /^`[a-zA-Z0-9_]+`$/) {
-        printf "%s:%d: Test ID must be one backticked Rust test name\n", FILENAME, NR > "/dev/stderr"
-        failed = 1
-        next
-    }
-    gsub(/`/, "", test)
     if (seen[requirement_id]++) {
         printf "%s:%d: duplicate requirement ID %s\n", FILENAME, NR, requirement_id > "/dev/stderr"
         failed = 1
     }
+    if (test == "—") {
+        if (status != "deferred") {
+            printf "%s:%d: only deferred requirements may use — for Test ID\n", FILENAME, NR > "/dev/stderr"
+            failed = 1
+        }
+        if (note == "" || note == "なし") {
+            printf "%s:%d: deferred requirement %s with — requires a note\n", FILENAME, NR, id > "/dev/stderr"
+            failed = 1
+        }
+        next
+    }
+    if (test !~ /^`[a-zA-Z0-9_]+`$/) {
+        printf "%s:%d: Test ID must be one backticked Rust test name or deferred —\n", FILENAME, NR > "/dev/stderr"
+        failed = 1
+        next
+    }
+    gsub(/`/, "", test)
     print requirement_id "\t" test
     next
 }
