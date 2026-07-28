@@ -1,19 +1,25 @@
 ## Summary
 
+## Scope
 
-## Related Issue
-Closes #
+- Requirement IDs:
+- Explicitly deferred:
 
-## RFC Reference
-<!-- この変更が依拠する RFC 節を記載（該当なしなら「N/A」） -->
+## RFC evidence
 
-## RFC Deviations
-<!-- 非準拠がある場合はコード内 RFC-DEVIATION コメントの概要。なければ「なし」 -->
+- RFC and section:
+- Deviation ledger update (or `none`):
 
-## Changes
+## Ownership / hot-path review
 
+- [ ] Backend buffers remain borrowed and are commit/recycled exactly once
+- [ ] No shared Mutex, packet clone, per-packet String, or dyn PacketIo was added
+- [ ] Every drop path before mutation preserves packet bytes
 
-## Testing
-- [ ] cargo test --workspace
-- [ ] cargo clippy --workspace -- -D warnings
-- [ ] cargo fmt --all -- --check
+## Validation
+
+- [ ] `cargo fmt --all -- --check`
+- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- [ ] `cargo test --workspace --all-targets`
+- [ ] `RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps`
+- [ ] `cargo check --workspace`
