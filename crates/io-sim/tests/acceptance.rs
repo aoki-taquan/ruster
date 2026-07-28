@@ -1,17 +1,22 @@
 use ruster_core::{
     forward_batch, ipv4_header_checksum, validate_ipv4_frame, BatchCompletion, DropReason,
-    ForwardingSnapshot, IfId, Interface, Ipv4Address, MacAddress, Neighbor, NoTrace, PacketBatch,
-    PacketIo, PacketLease, PacketSlot, Route, SlotCompletion, SnapshotError, TraceEvent,
-    ETHERNET_HEADER_LEN,
+    ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress, Neighbor,
+    NoTrace, PacketBatch, PacketIo, PacketLease, PacketSlot, Route, SlotCompletion, SnapshotError,
+    TraceEvent, ETHERNET_HEADER_LEN,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 
 const LAN: IfId = IfId(1);
 const WAN: IfId = IfId(2);
+const LAN_MAC: MacAddress = MacAddress([0x02, 0, 0, 0, 0, 0x10]);
 const ROUTER_MAC: MacAddress = MacAddress([0x02, 0, 0, 0, 0, 2]);
 const NEXT_HOP_MAC: MacAddress = MacAddress([0x02, 0, 0, 0, 0, 3]);
 const ORIGINAL_DST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 9];
 const ORIGINAL_SRC_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+const REQUESTER_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x20];
+const FOREIGN_ETHERNET_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x21];
+const LOCAL_IPV4: [u8; 4] = [192, 0, 2, 1];
+const REQUESTER_IPV4: [u8; 4] = [192, 0, 2, 20];
 const DESTINATION: [u8; 4] = [198, 51, 100, 20];
 const GATEWAY: [u8; 4] = [203, 0, 113, 1];
 
@@ -40,6 +45,53 @@ fn gateway_neighbor() -> Neighbor {
         target: ip(GATEWAY),
         mac: NEXT_HOP_MAC,
     }
+}
+
+fn local_interface() -> Interface {
+    Interface {
+        id: LAN,
+        mac: LAN_MAC,
+    }
+}
+
+fn local_binding() -> LocalIpv4Binding {
+    LocalIpv4Binding {
+        interface: LAN,
+        address: ip(LOCAL_IPV4),
+    }
+}
+
+fn arp_frame(
+    opcode: u16,
+    sender_protocol: [u8; 4],
+    target_protocol: [u8; 4],
+    ethernet_source: [u8; 6],
+    sender_hardware: [u8; 6],
+    target_hardware: [u8; 6],
+    tail: &[u8],
+) -> Vec<u8> {
+    let mut bytes = vec![0_u8; 42 + tail.len()];
+    bytes[0..6].copy_from_slice(&[0xff; 6]);
+    bytes[6..12].copy_from_slice(&ethernet_source);
+    bytes[12..14].copy_from_slice(&0x0806_u16.to_be_bytes());
+    bytes[14..16].copy_from_slice(&1_u16.to_be_bytes());
+    bytes[16..18].copy_from_slice(&0x0800_u16.to_be_bytes());
+    bytes[18] = 6;
+    bytes[19] = 4;
+    bytes[20..22].copy_from_slice(&opcode.to_be_bytes());
+    bytes[22..28].copy_from_slice(&sender_hardware);
+    bytes[28..32].copy_from_slice(&sender_protocol);
+    bytes[32..38].copy_from_slice(&target_hardware);
+    bytes[38..42].copy_from_slice(&target_protocol);
+    bytes[42..].copy_from_slice(tail);
+    bytes
+}
+
+fn arp_snapshot<'a>(
+    interfaces: &'a [Interface],
+    bindings: &'a [LocalIpv4Binding],
+) -> ForwardingSnapshot<'a> {
+    ForwardingSnapshot::new(&[], interfaces, &[], bindings).unwrap()
 }
 
 fn frame(ttl: u8, payload: &[u8]) -> Vec<u8> {
@@ -100,7 +152,7 @@ fn gateway_route_rewrites_and_reports_backend_acceptance() {
     let routes = [gateway_route()];
     let interfaces = [interface()];
     let neighbors = [gateway_neighbor()];
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors).unwrap();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
     let packet = frame(64, &[1, 2, 3, 4]);
     let allocation = packet.as_ptr();
     let mut io = SimIo::new();
@@ -136,7 +188,7 @@ fn connected_route_uses_packet_destination_as_neighbor_target() {
         target: ip(DESTINATION),
         mac: NEXT_HOP_MAC,
     }];
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors).unwrap();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
     let mut io = SimIo::new();
     io.inject(LAN, frame(10, &[]));
     let report = io.run_once(1, &snapshot, &mut NoTrace).unwrap();
@@ -162,7 +214,7 @@ fn lpm_supports_default_and_host_routes() {
             mac: MacAddress([4; 6]),
         },
     ];
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors).unwrap();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
     let mut io = SimIo::new();
     io.inject(LAN, frame(9, &[]));
     io.run_once(1, &snapshot, &mut NoTrace).unwrap();
@@ -174,22 +226,27 @@ fn snapshot_constructor_rejects_all_broken_references_and_duplicates() {
     let known_interfaces = [interface()];
     let duplicate_routes = [gateway_route(), gateway_route()];
     assert!(matches!(
-        ForwardingSnapshot::new(&duplicate_routes, &known_interfaces, &[gateway_neighbor()]),
+        ForwardingSnapshot::new(
+            &duplicate_routes,
+            &known_interfaces,
+            &[gateway_neighbor()],
+            &[]
+        ),
         Err(SnapshotError::DuplicateRoute)
     ));
     let duplicate_interfaces = [interface(), interface()];
     assert!(matches!(
-        ForwardingSnapshot::new(&[], &duplicate_interfaces, &[]),
+        ForwardingSnapshot::new(&[], &duplicate_interfaces, &[], &[]),
         Err(SnapshotError::DuplicateInterface)
     ));
     let duplicate_neighbors = [gateway_neighbor(), gateway_neighbor()];
     assert!(matches!(
-        ForwardingSnapshot::new(&[], &known_interfaces, &duplicate_neighbors),
+        ForwardingSnapshot::new(&[], &known_interfaces, &duplicate_neighbors, &[]),
         Err(SnapshotError::DuplicateNeighbor)
     ));
     let unknown_route = [route([0, 0, 0, 0], 0, IfId(99), None)];
     assert!(matches!(
-        ForwardingSnapshot::new(&unknown_route, &known_interfaces, &[]),
+        ForwardingSnapshot::new(&unknown_route, &known_interfaces, &[], &[]),
         Err(SnapshotError::RouteUnknownInterface)
     ));
     let unknown_neighbor = [Neighbor {
@@ -198,8 +255,54 @@ fn snapshot_constructor_rejects_all_broken_references_and_duplicates() {
         mac: NEXT_HOP_MAC,
     }];
     assert!(matches!(
-        ForwardingSnapshot::new(&[], &known_interfaces, &unknown_neighbor),
+        ForwardingSnapshot::new(&[], &known_interfaces, &unknown_neighbor, &[]),
         Err(SnapshotError::NeighborUnknownInterface)
+    ));
+}
+
+#[test]
+fn arp_snapshot_rejects_duplicate_or_unknown_local_addresses() {
+    let interfaces = [
+        local_interface(),
+        Interface {
+            id: WAN,
+            mac: ROUTER_MAC,
+        },
+    ];
+    let duplicate = [local_binding(), local_binding()];
+    assert!(matches!(
+        ForwardingSnapshot::new(&[], &interfaces, &[], &duplicate),
+        Err(SnapshotError::DuplicateLocalIpv4Binding)
+    ));
+    let second_on_interface = [
+        local_binding(),
+        LocalIpv4Binding {
+            interface: LAN,
+            address: ip([192, 0, 2, 2]),
+        },
+    ];
+    assert!(matches!(
+        ForwardingSnapshot::new(&[], &interfaces, &[], &second_on_interface),
+        Err(SnapshotError::DuplicateLocalIpv4Binding)
+    ));
+    let duplicate_across_interfaces = [
+        local_binding(),
+        LocalIpv4Binding {
+            interface: WAN,
+            address: ip(LOCAL_IPV4),
+        },
+    ];
+    assert!(matches!(
+        ForwardingSnapshot::new(&[], &interfaces, &[], &duplicate_across_interfaces),
+        Err(SnapshotError::DuplicateLocalIpv4Binding)
+    ));
+    let unknown = [LocalIpv4Binding {
+        interface: IfId(99),
+        address: ip(LOCAL_IPV4),
+    }];
+    assert!(matches!(
+        ForwardingSnapshot::new(&[], &interfaces, &[], &unknown),
+        Err(SnapshotError::LocalIpv4BindingUnknownInterface)
     ));
 }
 
@@ -208,7 +311,7 @@ fn all_validation_and_decision_drops_are_granular_and_atomic() {
     let routes = [gateway_route()];
     let interfaces = [interface()];
     let neighbors = [gateway_neighbor()];
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors).unwrap();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
 
     let mut ethernet_type = frame(8, &[]);
     ethernet_type[12..14].copy_from_slice(&0x86dd_u16.to_be_bytes());
@@ -245,9 +348,9 @@ fn all_validation_and_decision_drops_are_granular_and_atomic() {
         assert_forwarding_drop(packet, &snapshot, reason);
     }
 
-    let no_routes = ForwardingSnapshot::new(&[], &interfaces, &neighbors).unwrap();
+    let no_routes = ForwardingSnapshot::new(&[], &interfaces, &neighbors, &[]).unwrap();
     assert_forwarding_drop(frame(8, &[]), &no_routes, DropReason::RouteMiss);
-    let unresolved = ForwardingSnapshot::new(&routes, &interfaces, &[]).unwrap();
+    let unresolved = ForwardingSnapshot::new(&routes, &interfaces, &[], &[]).unwrap();
     assert_forwarding_drop(frame(8, &[]), &unresolved, DropReason::NeighborUnresolved);
 }
 
@@ -262,7 +365,7 @@ fn padding_is_ignored_but_preserved() {
     let routes = [gateway_route()];
     let interfaces = [interface()];
     let neighbors = [gateway_neighbor()];
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors).unwrap();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
     let mut padded = frame(10, &[7, 8]);
     let datagram_end = padded.len();
     padded.extend_from_slice(&[0xff; 48]);
@@ -281,7 +384,7 @@ fn fragment_flags_offset_payload_and_checksum_are_preserved_or_updated_correctly
     let routes = [gateway_route()];
     let interfaces = [interface()];
     let neighbors = [gateway_neighbor()];
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors).unwrap();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
     let mut fragment = frame(5, &[0xaa; 8]);
     fragment[20..22].copy_from_slice(&0x2001_u16.to_be_bytes());
     fragment[24..26].fill(0);
@@ -303,7 +406,7 @@ fn mixed_batch_is_fifo_budgeted_and_reports_requested_accepted_recycled() {
     let routes = [gateway_route()];
     let interfaces = [interface()];
     let neighbors = [gateway_neighbor()];
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors).unwrap();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
     let mut io = SimIo::new();
     for ttl in [7, 1, 6] {
         io.inject(LAN, frame(ttl, &[]));
@@ -348,7 +451,7 @@ fn trace_is_deterministic_and_terminal_event_follows_completion() {
         let routes = [gateway_route()];
         let interfaces = [interface()];
         let neighbors = [gateway_neighbor()];
-        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors).unwrap();
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
         let mut io = SimIo::new();
         let mut trace = VecTrace::default();
         io.inject(LAN, frame(32, &[1, 2, 3]));
@@ -359,7 +462,7 @@ fn trace_is_deterministic_and_terminal_event_follows_completion() {
     assert!(matches!(
         first.1.as_slice(),
         [
-            TraceEvent::Validated { .. },
+            TraceEvent::Ipv4Validated { .. },
             TraceEvent::Routed { egress: WAN, .. },
             TraceEvent::TxRequested { egress: WAN },
             TraceEvent::BatchCompleted {
@@ -424,7 +527,7 @@ fn partial_backend_completion_preserves_report_and_aggregate_trace() {
     let routes = [gateway_route()];
     let interfaces = [interface()];
     let neighbors = [gateway_neighbor()];
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors).unwrap();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
     let batch = PartialBatch {
         packet: Some(frame(8, &[])),
     };
@@ -439,7 +542,7 @@ fn partial_backend_completion_preserves_report_and_aggregate_trace() {
     assert!(matches!(
         trace.events(),
         [
-            TraceEvent::Validated { .. },
+            TraceEvent::Ipv4Validated { .. },
             TraceEvent::Routed { .. },
             TraceEvent::TxRequested { egress: WAN },
             TraceEvent::BatchCompleted {
@@ -448,4 +551,404 @@ fn partial_backend_completion_preserves_report_and_aggregate_trace() {
             }
         ]
     ));
+}
+
+#[test]
+fn arp_request_for_local_ipv4_replies_in_place_on_ingress() {
+    let interfaces = [local_interface()];
+    let bindings = [local_binding()];
+    let snapshot = arp_snapshot(&interfaces, &bindings);
+    let packet = arp_frame(
+        1,
+        REQUESTER_IPV4,
+        LOCAL_IPV4,
+        REQUESTER_MAC,
+        REQUESTER_MAC,
+        [0; 6],
+        &[],
+    );
+    let allocation = packet.as_ptr();
+    let mut io = SimIo::new();
+    io.inject(LAN, packet);
+
+    let report = io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    assert_eq!(report.received, 1);
+    assert_eq!(report.tx_requested, 1);
+    assert_eq!(report.dropped, 0);
+    assert_eq!(
+        report.completion,
+        BatchCompletion {
+            tx_requested: 1,
+            tx_accepted: 1,
+            tx_rejected: 0,
+            recycled: 0,
+            error: None,
+        }
+    );
+    let tx = io.pop_tx().unwrap();
+    assert_eq!(tx.egress, LAN);
+    assert_eq!(tx.bytes.as_ptr(), allocation, "RX Vec must move, not clone");
+    assert_eq!(&tx.bytes[0..6], &REQUESTER_MAC);
+    assert_eq!(&tx.bytes[6..12], &LAN_MAC.0);
+    assert_eq!(&tx.bytes[12..14], &0x0806_u16.to_be_bytes());
+    assert_eq!(&tx.bytes[20..22], &2_u16.to_be_bytes());
+    assert_eq!(&tx.bytes[22..28], &LAN_MAC.0);
+    assert_eq!(&tx.bytes[28..32], &LOCAL_IPV4);
+    assert_eq!(&tx.bytes[32..38], &REQUESTER_MAC);
+    assert_eq!(&tx.bytes[38..42], &REQUESTER_IPV4);
+}
+
+#[test]
+fn arp_probe_for_local_ipv4_replies_with_zero_target_protocol() {
+    let interfaces = [local_interface()];
+    let bindings = [local_binding()];
+    let snapshot = arp_snapshot(&interfaces, &bindings);
+    let mut io = SimIo::new();
+    io.inject(
+        LAN,
+        arp_frame(
+            1,
+            [0; 4],
+            LOCAL_IPV4,
+            REQUESTER_MAC,
+            REQUESTER_MAC,
+            [0; 6],
+            &[],
+        ),
+    );
+    io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    let reply = io.pop_tx().unwrap();
+    assert_eq!(&reply.bytes[28..32], &LOCAL_IPV4);
+    assert_eq!(&reply.bytes[38..42], &[0; 4]);
+}
+
+#[test]
+fn arp_request_target_hardware_is_ignored() {
+    let interfaces = [local_interface()];
+    let bindings = [local_binding()];
+    let snapshot = arp_snapshot(&interfaces, &bindings);
+    let mut io = SimIo::new();
+    io.inject(
+        LAN,
+        arp_frame(
+            1,
+            REQUESTER_IPV4,
+            LOCAL_IPV4,
+            FOREIGN_ETHERNET_MAC,
+            REQUESTER_MAC,
+            [0xa5; 6],
+            &[],
+        ),
+    );
+    io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    let reply = io.pop_tx().unwrap();
+    assert_eq!(&reply.bytes[0..6], &REQUESTER_MAC);
+    assert_eq!(&reply.bytes[32..38], &REQUESTER_MAC);
+}
+
+#[test]
+fn arp_foreign_sender_claiming_local_address_gets_normal_reply() {
+    let interfaces = [local_interface()];
+    let bindings = [local_binding()];
+    let snapshot = arp_snapshot(&interfaces, &bindings);
+    let mut io = SimIo::new();
+    io.inject(
+        LAN,
+        arp_frame(
+            1,
+            LOCAL_IPV4,
+            LOCAL_IPV4,
+            FOREIGN_ETHERNET_MAC,
+            REQUESTER_MAC,
+            [0; 6],
+            &[],
+        ),
+    );
+    let report = io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    assert_eq!(report.tx_requested, 1);
+    assert_eq!(report.dropped, 0);
+    let reply = io.pop_tx().unwrap();
+    assert_eq!(&reply.bytes[0..6], &REQUESTER_MAC);
+    assert_eq!(&reply.bytes[38..42], &LOCAL_IPV4);
+}
+
+#[test]
+fn arp_profile_validation_drops_are_granular_and_atomic() {
+    let interfaces = [local_interface()];
+    let bindings = [local_binding()];
+    let snapshot = arp_snapshot(&interfaces, &bindings);
+    let request = || {
+        arp_frame(
+            1,
+            REQUESTER_IPV4,
+            LOCAL_IPV4,
+            REQUESTER_MAC,
+            REQUESTER_MAC,
+            [0; 6],
+            &[],
+        )
+    };
+    let mut truncated = request();
+    truncated.truncate(41);
+    let mut hardware_type = request();
+    hardware_type[14..16].copy_from_slice(&2_u16.to_be_bytes());
+    let mut protocol_type = request();
+    protocol_type[16..18].copy_from_slice(&0x86dd_u16.to_be_bytes());
+    let mut hardware_length = request();
+    hardware_length[18] = 8;
+    let mut protocol_length = request();
+    protocol_length[19] = 16;
+    let mut reply = request();
+    reply[20..22].copy_from_slice(&2_u16.to_be_bytes());
+    let mut unknown_opcode = request();
+    unknown_opcode[20..22].copy_from_slice(&99_u16.to_be_bytes());
+
+    let cases = [
+        (truncated, DropReason::ArpPacketTruncated),
+        (hardware_type, DropReason::ArpHardwareTypeUnsupported),
+        (protocol_type, DropReason::ArpProtocolTypeUnsupported),
+        (hardware_length, DropReason::ArpHardwareLengthUnsupported),
+        (protocol_length, DropReason::ArpProtocolLengthUnsupported),
+        (reply, DropReason::ArpReplyUnsupported),
+        (unknown_opcode, DropReason::ArpOpcodeUnsupported),
+    ];
+    for (packet, reason) in cases {
+        assert_forwarding_drop(packet, &snapshot, reason);
+    }
+}
+
+#[test]
+fn arp_padding_is_ignored_and_preserved_on_reply() {
+    let interfaces = [local_interface()];
+    let bindings = [local_binding()];
+    let snapshot = arp_snapshot(&interfaces, &bindings);
+    let padding = [0xde, 0xad, 0xbe, 0xef, 0xa5, 0x5a];
+    let mut io = SimIo::new();
+    io.inject(
+        LAN,
+        arp_frame(
+            1,
+            REQUESTER_IPV4,
+            LOCAL_IPV4,
+            REQUESTER_MAC,
+            REQUESTER_MAC,
+            [0; 6],
+            &padding,
+        ),
+    );
+    io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    let reply = io.pop_tx().unwrap();
+    assert_eq!(reply.bytes.len(), 42 + padding.len());
+    assert_eq!(&reply.bytes[42..], &padding);
+}
+
+#[test]
+fn arp_nonlocal_and_reply_are_recycled_without_mutation() {
+    let interfaces = [local_interface()];
+    let bindings = [local_binding()];
+    let snapshot = arp_snapshot(&interfaces, &bindings);
+    let nonlocal = arp_frame(
+        1,
+        REQUESTER_IPV4,
+        [192, 0, 2, 99],
+        REQUESTER_MAC,
+        REQUESTER_MAC,
+        [0; 6],
+        &[],
+    );
+    assert_forwarding_drop(nonlocal, &snapshot, DropReason::ArpTargetNotLocal);
+    let reply = arp_frame(
+        2,
+        REQUESTER_IPV4,
+        LOCAL_IPV4,
+        REQUESTER_MAC,
+        REQUESTER_MAC,
+        LAN_MAC.0,
+        &[],
+    );
+    assert_forwarding_drop(reply, &snapshot, DropReason::ArpReplyUnsupported);
+    let unknown_opcode = arp_frame(
+        77,
+        REQUESTER_IPV4,
+        LOCAL_IPV4,
+        REQUESTER_MAC,
+        REQUESTER_MAC,
+        [0; 6],
+        &[],
+    );
+    assert_forwarding_drop(unknown_opcode, &snapshot, DropReason::ArpOpcodeUnsupported);
+
+    let interfaces = [local_interface(), interface()];
+    let wan_binding = [LocalIpv4Binding {
+        interface: WAN,
+        address: ip(LOCAL_IPV4),
+    }];
+    let wrong_ingress_snapshot = arp_snapshot(&interfaces, &wan_binding);
+    let wrong_ingress = arp_frame(
+        1,
+        REQUESTER_IPV4,
+        LOCAL_IPV4,
+        REQUESTER_MAC,
+        REQUESTER_MAC,
+        [0; 6],
+        &[],
+    );
+    assert_forwarding_drop(
+        wrong_ingress,
+        &wrong_ingress_snapshot,
+        DropReason::ArpTargetNotLocal,
+    );
+}
+
+#[test]
+fn arp_trace_is_deterministic_and_tx_follows_commit() {
+    fn run() -> (Vec<u8>, Vec<TraceEvent>) {
+        let interfaces = [local_interface()];
+        let bindings = [local_binding()];
+        let snapshot = arp_snapshot(&interfaces, &bindings);
+        let mut io = SimIo::new();
+        let mut trace = VecTrace::default();
+        io.inject(
+            LAN,
+            arp_frame(
+                1,
+                REQUESTER_IPV4,
+                LOCAL_IPV4,
+                REQUESTER_MAC,
+                REQUESTER_MAC,
+                [0; 6],
+                &[],
+            ),
+        );
+        io.run_once(1, &snapshot, &mut trace).unwrap();
+        (io.pop_tx().unwrap().bytes, trace.events().to_vec())
+    }
+    let first = run();
+    assert!(matches!(
+        first.1.as_slice(),
+        [
+            TraceEvent::ArpRequestValidated { ingress: LAN, .. },
+            TraceEvent::ArpReplyRequested { egress: LAN, .. },
+            TraceEvent::TxRequested { egress: LAN },
+            TraceEvent::BatchCompleted {
+                tx_accepted: 1,
+                tx_rejected: 0
+            }
+        ]
+    ));
+    assert_eq!(first, run());
+}
+
+#[test]
+fn mixed_ipv4_and_arp_batch_is_fifo_budgeted_and_deterministic() {
+    let routes = [gateway_route()];
+    let interfaces = [local_interface(), interface()];
+    let neighbors = [gateway_neighbor()];
+    let bindings = [local_binding()];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let mut io = SimIo::new();
+    io.inject(LAN, frame(8, &[]));
+    io.inject(
+        LAN,
+        arp_frame(
+            1,
+            REQUESTER_IPV4,
+            LOCAL_IPV4,
+            REQUESTER_MAC,
+            REQUESTER_MAC,
+            [0; 6],
+            &[],
+        ),
+    );
+    io.inject(LAN, frame(7, &[]));
+
+    let first = io.run_once(2, &snapshot, &mut NoTrace).unwrap();
+    assert_eq!(first.received, 2);
+    assert_eq!(first.tx_requested, 2);
+    assert_eq!(io.pending_rx(), 1);
+    assert_eq!(io.pop_tx().unwrap().sequence, 0);
+    assert_eq!(io.pop_tx().unwrap().sequence, 1);
+    let second = io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    assert_eq!(second.tx_requested, 1);
+    assert_eq!(io.pop_tx().unwrap().sequence, 2);
+}
+
+#[test]
+fn arp_partial_backend_rejection_preserves_error_report_and_trace() {
+    let interfaces = [local_interface()];
+    let bindings = [local_binding()];
+    let snapshot = arp_snapshot(&interfaces, &bindings);
+    let batch = ArpPartialBatch {
+        packet: Some(arp_frame(
+            1,
+            REQUESTER_IPV4,
+            LOCAL_IPV4,
+            REQUESTER_MAC,
+            REQUESTER_MAC,
+            [0; 6],
+            &[],
+        )),
+    };
+    let mut trace = VecTrace::default();
+    let report = forward_batch(batch, &snapshot, &mut trace);
+    assert_eq!(report.tx_requested, 1);
+    assert_eq!(report.completion.tx_requested, 1);
+    assert_eq!(report.completion.tx_accepted, 0);
+    assert_eq!(report.completion.tx_rejected, 1);
+    assert_eq!(report.completion.error, Some(TestBackendError::RingFull));
+    assert!(matches!(
+        trace.events(),
+        [
+            TraceEvent::ArpRequestValidated { .. },
+            TraceEvent::ArpReplyRequested { egress: LAN, .. },
+            TraceEvent::TxRequested { egress: LAN },
+            TraceEvent::BatchCompleted {
+                tx_accepted: 0,
+                tx_rejected: 1
+            }
+        ]
+    ));
+}
+
+struct ArpPartialBatch {
+    packet: Option<Vec<u8>>,
+}
+
+struct ArpPartialSlot {
+    bytes: Vec<u8>,
+}
+
+impl PacketSlot for ArpPartialSlot {
+    fn ingress(&self) -> IfId {
+        LAN
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
+    fn complete(self, completion: SlotCompletion) {
+        assert!(matches!(completion, SlotCompletion::Transmit(LAN)));
+    }
+}
+
+impl PacketBatch for ArpPartialBatch {
+    type Error = TestBackendError;
+    type Slot<'a> = ArpPartialSlot;
+
+    fn next_packet(&mut self) -> Option<PacketLease<Self::Slot<'_>>> {
+        self.packet
+            .take()
+            .map(|bytes| PacketLease::new(ArpPartialSlot { bytes }))
+    }
+
+    fn finish(self) -> BatchCompletion<Self::Error> {
+        BatchCompletion {
+            tx_requested: 1,
+            tx_accepted: 0,
+            tx_rejected: 1,
+            recycled: 0,
+            error: Some(TestBackendError::RingFull),
+        }
+    }
 }

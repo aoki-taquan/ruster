@@ -31,6 +31,18 @@ pub struct Neighbor {
     pub mac: MacAddress,
 }
 
+/// The single IPv4 address owned by one interface in the current profile.
+///
+/// The binding deliberately has no MAC address. [`Interface`] remains the
+/// single source of truth for the link-layer identity used by ARP replies.
+/// [`crate::ForwardingSnapshot::new`] rejects a second address on an interface
+/// and the same address on another interface.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalIpv4Binding {
+    pub interface: IfId,
+    pub address: Ipv4Address,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Route {
     prefix: Ipv4Address,

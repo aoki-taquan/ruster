@@ -9,6 +9,7 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | IO-002 RX bufferをcloneせずTXへmove | architecture contract | `gateway_route_rewrites_and_reports_backend_acceptance` | implemented | allocation addressも検証 |
 | IO-003 requested/accepted/recycled accounting | architecture contract | `mixed_batch_is_fifo_budgeted_and_reports_requested_accepted_recycled` | implemented | backend finishで確定 |
 | IO-004 partial/error completion preserves report | architecture contract | `partial_backend_completion_preserves_report_and_aggregate_trace` | implemented | rejected slotはbackend所有で解放 |
+| IO-005 ARP partial/error completion preserves report | architecture contract | `arp_partial_backend_rejection_preserves_error_report_and_trace` | implemented | requested=1/accepted=0/rejected=1とerrorを保持 |
 | ETH-001 Ethernet II framing | RFC 894 | `all_validation_and_decision_drops_are_granular_and_atomic` | implemented | 802.3 LLC/VLANはdeferred |
 | IP4-001 Version/IHL/Total Length validation | RFC 791 §3.1 | `all_validation_and_decision_drops_are_granular_and_atomic` | implemented | なし |
 | IP4-002 Total Length後のpadding無視 | RFC 791 §3.1 | `padding_is_ignored_but_preserved` | implemented | なし |
@@ -22,9 +23,21 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | FWD-004 incremental checksum update | RFC 1624 §4 | `rfc_1624_negative_zero_boundary_is_positive_zero` | implemented | `0xdd2f,0x5555→0x3285 = 0x0000` |
 | FWD-005 drop atomicity | architecture contract | `all_validation_and_decision_drops_are_granular_and_atomic` | implemented | なし |
 | FWD-006 snapshot integrity | architecture contract | `snapshot_constructor_rejects_all_broken_references_and_duplicates` | implemented | 公開前にvalidation |
+| FWD-007 unresolved packet hold/ARP request generation | RFC 1122 §2.3.2.2, RFC 1812 §3.3.2 | `all_validation_and_decision_drops_are_granular_and_atomic` | deferred | static neighbor missはbyte不変NeighborUnresolved。allocator/request/retry/hold queueが無く、最初のpacketは自動再送されない |
+| ARP-001 Ethernet/IPv4 request profile validation | RFC 826 | `arp_profile_validation_drops_are_granular_and_atomic` | implemented | HTYPE=1/PTYPE=0x0800/HLEN=6/PLEN=4/opcode=1 |
+| ARP-002 local target in-place reply on ingress | RFC 826 | `arp_request_for_local_ipv4_replies_in_place_on_ingress` | implemented | 同じRX allocation、egress=ingress、wire fieldsを検証 |
+| ARP-003 probe reply with zero target protocol | RFC 5227 §2.1 | `arp_probe_for_local_ipv4_replies_with_zero_target_protocol` | implemented | SPA=0 requestにも通常reply |
+| ARP-004 request THA ignored/source identities not coupled | RFC 826 | `arp_request_target_hardware_is_ignored` | implemented | Ethernet source≠ARP SHAも受理 |
+| ARP-005 tail/padding preservation | RFC 826 wire profile | `arp_padding_is_ignored_and_preserved_on_reply` | implemented | 42 byte以後を変更しない |
+| ARP-006 nonlocal/reply/unknown opcode stable recycle | explainability requirement | `arp_nonlocal_and_reply_are_recycled_without_mutation` | implemented | replyとunknown opcodeは別stable reason |
+| ARP-007 local binding snapshot integrity | architecture contract | `arp_snapshot_rejects_duplicate_or_unknown_local_addresses` | implemented | 現profileはinterfaceごとにlocal IPv4一つ、address重複も拒否。MACはInterfaceのみ |
+| ARP-008 address conflict detection/defense | RFC 5227 §2.4 | `arp_foreign_sender_claiming_local_address_gets_normal_reply` | deviation | foreign SHAがlocal SPAを名乗ってもconflict state/defensive announcementなし。local targetへの通常replyのみ |
+| ARP-009 learning/cache/request/retry/hold/proxy/gratuitous/ACD | RFC 826, RFC 5227 | `arp_nonlocal_and_reply_are_recycled_without_mutation` | deferred | immutable responder sliceのみ。neighbor学習・VLAN・generated allocatorも非対象 |
 | OBS-001 stable reason code | explainability requirement | `drop_reason_discriminants_and_codes_are_stable_and_unique` | implemented | repr(u16) |
 | OBS-002 requestedとaggregate TX outcome trace | explainability requirement | `partial_backend_completion_preserves_report_and_aggregate_trace` | implemented | packet単位accepted traceはdeferred |
+| OBS-003 protocol-aware ARP trace ordering | explainability requirement | `arp_trace_is_deterministic_and_tx_follows_commit` | implemented | validated/reply requested/TX requested/completionを順序検証 |
 | SIM-001 FIFO/budget/mixed batch | deterministic test requirement | `mixed_batch_is_fifo_budgeted_and_reports_requested_accepted_recycled` | implemented | なし |
+| SIM-002 mixed IPv4/ARP FIFO and budget | deterministic test requirement | `mixed_ipv4_and_arp_batch_is_fifo_budgeted_and_deterministic` | implemented | protocol混在でもsequenceとbudgetを保持 |
 
 ## RFC deviation rule
 
