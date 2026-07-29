@@ -4,11 +4,12 @@
 use std::{collections::VecDeque, convert::Infallible};
 
 use ruster_core::{
-    forward_batch, BatchCompletion, BatchReport, ConsumeReason, DropReason, ForwardingSnapshot,
-    GeneratedAllocationError, GeneratedArpTrace, GeneratedBatchCompletion, GeneratedIcmpv4Trace,
-    GeneratedIcmpv4TraceSink, GeneratedPacketBatch, GeneratedPacketIo, GeneratedPacketLease,
-    GeneratedPacketSlot, GeneratedSlotCompletion, GeneratedTraceSink, IfId, PacketBatch, PacketIo,
-    PacketLease, PacketSlot, SlotCompletion, TraceEvent, TraceSink,
+    forward_batch, forward_batch_with_nat44_udp, BatchCompletion, BatchReport, ConsumeReason,
+    DropReason, ForwardingSnapshot, GeneratedAllocationError, GeneratedArpTrace,
+    GeneratedBatchCompletion, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedPacketBatch,
+    GeneratedPacketIo, GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion,
+    GeneratedTraceSink, IfId, MonotonicMillis, Nat44UdpConfig, Nat44UdpRuntime, PacketBatch,
+    PacketIo, PacketLease, PacketSlot, ResolutionRuntime, SlotCompletion, TraceEvent, TraceSink,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -37,6 +38,7 @@ pub enum FrameOrigin {
 pub enum RecycleCause {
     Forwarding(DropReason),
     Consumed(ConsumeReason),
+    TxRejected,
     LeaseAbandoned,
 }
 
@@ -79,6 +81,7 @@ pub struct SimIo {
     generated_max_frame: usize,
     generated_accept_budget: usize,
     fail_generated_finish: bool,
+    received_accept_budget: usize,
 }
 
 impl Default for SimIo {
@@ -93,6 +96,7 @@ impl Default for SimIo {
             generated_max_frame: 1_514,
             generated_accept_budget: usize::MAX,
             fail_generated_finish: false,
+            received_accept_budget: usize::MAX,
         }
     }
 }
@@ -157,6 +161,10 @@ impl SimIo {
         self.fail_generated_finish = true;
     }
 
+    pub fn set_received_accept_budget(&mut self, budget: usize) {
+        self.received_accept_budget = budget;
+    }
+
     pub fn run_once<T: TraceSink>(
         &mut self,
         budget: usize,
@@ -165,6 +173,23 @@ impl SimIo {
     ) -> Result<BatchReport<Infallible>, Infallible> {
         let batch = self.receive(budget)?;
         Ok(forward_batch(batch, snapshot, trace))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_nat44_udp_once<T: TraceSink>(
+        &mut self,
+        budget: usize,
+        snapshot: &ForwardingSnapshot<'_>,
+        resolution: &mut ResolutionRuntime<'_>,
+        config: &Nat44UdpConfig,
+        nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+        now: MonotonicMillis,
+        trace: &mut T,
+    ) -> Result<BatchReport<Infallible>, Infallible> {
+        let batch = self.receive(budget)?;
+        Ok(forward_batch_with_nat44_udp(
+            batch, snapshot, resolution, config, nat44_udp, now, trace,
+        ))
     }
 }
 
@@ -178,6 +203,7 @@ impl PacketIo for SimIo {
             rx: &mut self.rx,
             tx: &mut self.tx,
             recycled: &mut self.recycled,
+            accept_budget: &mut self.received_accept_budget,
             remaining,
             counters: BatchCounters::default(),
         })
@@ -188,6 +214,7 @@ pub struct SimBatch<'a> {
     rx: &'a mut VecDeque<Slot>,
     tx: &'a mut VecDeque<TxFrame>,
     recycled: &'a mut VecDeque<RecycledFrame>,
+    accept_budget: &'a mut usize,
     remaining: usize,
     counters: BatchCounters,
 }
@@ -196,6 +223,7 @@ pub struct SimBatch<'a> {
 struct BatchCounters {
     tx_requested: usize,
     tx_accepted: usize,
+    tx_rejected: usize,
     recycled: usize,
 }
 
@@ -216,6 +244,7 @@ impl PacketBatch for SimBatch<'_> {
             slot: Some(slot),
             tx: self.tx,
             recycled: self.recycled,
+            accept_budget: self.accept_budget,
             counters: &mut self.counters,
         }))
     }
@@ -224,7 +253,7 @@ impl PacketBatch for SimBatch<'_> {
         BatchCompletion {
             tx_requested: self.counters.tx_requested,
             tx_accepted: self.counters.tx_accepted,
-            tx_rejected: 0,
+            tx_rejected: self.counters.tx_rejected,
             recycled: self.counters.recycled,
             error: None,
         }
@@ -235,6 +264,7 @@ pub struct SimSlot<'a> {
     slot: Option<Slot>,
     tx: &'a mut VecDeque<TxFrame>,
     recycled: &'a mut VecDeque<RecycledFrame>,
+    accept_budget: &'a mut usize,
     counters: &'a mut BatchCounters,
 }
 
@@ -252,16 +282,27 @@ impl PacketSlot for SimSlot<'_> {
         match completion {
             SlotCompletion::Transmit(egress) => {
                 self.counters.tx_requested += 1;
-                self.tx.push_back(TxFrame {
-                    sequence: slot.sequence,
-                    ingress: slot.ingress,
-                    egress,
-                    origin: FrameOrigin::Received {
+                if *self.accept_budget == 0 {
+                    self.counters.tx_rejected += 1;
+                    self.recycled.push_back(RecycledFrame {
+                        sequence: slot.sequence,
                         ingress: slot.ingress,
-                    },
-                    bytes: slot.bytes,
-                });
-                self.counters.tx_accepted += 1;
+                        cause: RecycleCause::TxRejected,
+                        bytes: slot.bytes,
+                    });
+                } else {
+                    *self.accept_budget -= 1;
+                    self.tx.push_back(TxFrame {
+                        sequence: slot.sequence,
+                        ingress: slot.ingress,
+                        egress,
+                        origin: FrameOrigin::Received {
+                            ingress: slot.ingress,
+                        },
+                        bytes: slot.bytes,
+                    });
+                    self.counters.tx_accepted += 1;
+                }
             }
             SlotCompletion::Recycle(reason) => {
                 self.recycle(slot, RecycleCause::Forwarding(reason));

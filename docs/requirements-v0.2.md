@@ -131,6 +131,27 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | SIM-001 FIFO/budget/mixed batch | deterministic test requirement | `mixed_batch_is_fifo_budgeted_and_reports_requested_accepted_recycled` | implemented | なし |
 | SIM-002 mixed IPv4/ARP FIFO and budget | deterministic test requirement | `mixed_ipv4_and_arp_batch_is_fifo_budgeted_and_deterministic` | implemented | protocol混在でもsequenceとbudgetを保持 |
 | SIM-003 mixed RX/generated FIFO and typed origin | deterministic test requirement | `mixed_rx_and_generated_tx_are_fifo_budgeted_and_origin_typed` | implemented | RX batch finish後に生成しoriginを型で区別 |
+| NAT44-001 opt-in single-domain UDP NAPT | RFC 3022 §§2–4, architecture contract | `exact_bidirectional_wire_and_same_batch_visibility` | implemented | one inside/outside/public IPv4。既存forwarding wrapperはNATなしの挙動を維持 |
+| NAT44-002 Endpoint-Independent Mapping | RFC 4787 REQ-1 | `eim_reuses_public_tuple_and_adf_keys_only_remote_address` | implemented | keyはinside/internal IPv4/internal UDP port。remote endpointを含めない |
+| NAT44-003 Address-Dependent Filtering | RFC 4787 filtering taxonomy, local profile | `eim_reuses_public_tuple_and_adf_keys_only_remote_address` | implemented | contacted remote IPv4だけ許可しremote portは任意。unknown IPはbyte不変drop |
+| NAT44-004 unique deterministic public port | RFC 4787 REQ-3, local bounded allocator | `allocator_preserves_then_falls_back_without_overload_and_exhausts` | implemented | internal portを可能なら保存し、seeded startからpoolを一周。overload/live evictionなし |
+| NAT44-005 fixed caller-backed state/generation | architecture contract | `full_tables_do_not_evict_or_refresh_live_state_and_zero_capacity_is_safe` | implemented | mapping/peer zero/full safe、generationでstale peerを無効化、`!Send + !Sync` |
+| NAT44-006 idle timer and refresh direction | RFC 4787 REQ-5/REQ-6, RFC 7857 §§7–7.1 | `exact_idle_expiry_outbound_refresh_and_inbound_no_refresh` | implemented | default 300s/minimum 120s、exact expiry。outbound TX requestだけrefreshし、inboundはrefreshしない |
+| NAT44-007 monotonic clock atomicity | architecture contract | `failed_lookup_and_capacity_operations_advance_the_watermark` | implemented | non-regressed operationはdropでもwatermarkを進める。regressionはcounter/trace以外を変更せずequal timeで回復 |
+| NAT44-008 atomic IPv4-only profile | RFC 6864 §§4.1–4.2 | `structural_and_policy_failures_are_byte_and_state_atomic` | deviation | DF=1/MF=0/offset=0だけ変換。DF=0を含むfragment-capable datagramはtyped drop |
+| NAT44-009 UDP length and padding | RFC 768 | `checksum_zero_invalid_nonzero_and_odd_or_padded_udp_are_algebraic` | implemented | UDP length 8..=IPv4 payload。UDP後のIP/link paddingを保存 |
+| NAT44-010 incremental address/port checksum | RFC 1624 §4, RFC 768 | `checksum_zero_invalid_nonzero_and_odd_or_padded_udp_are_algebraic` | implemented | UDP zeroを保存。nonzeroはaddress/port更新、negative zeroを`0xffff` encode |
+| NAT44-011 original route/neighbor before state | RFC 1812 §§5.2.4–5.2.7, architecture contract | `route_ttl_neighbor_and_reverse_authority_fail_before_nat_state` | implemented | route/TTL/egress/static-or-dynamic neighbor失敗でmapping/peerなし |
+| NAT44-012 internal source authority | RFC 1812 §5.3.7, local anti-spoof policy | `route_ttl_neighbor_and_reverse_authority_fail_before_nat_state` | implemented | non-host/local/public sourceを拒否しsource reverse-LPMはinside必須 |
+| NAT44-013 inbound intercept before local | RFC 3022 translation direction | `exact_bidirectional_wire_and_same_batch_visibility` | implemented | outside/public UDPをordinary local consumeより先にmapping/ADFへ渡す |
+| NAT44-014 transactional rewrite/state/TX request | architecture contract | `backend_reject_keeps_tx_request_mapping_and_filter_state` | implemented | full plan後bytes→state→lease commit。backend rejectでもTX-request stateを保持 |
+| NAT44-015 publication mismatch and flush | control-plane publication contract | `absent_runtime_and_stale_snapshot_authority_fail_closed` | implemented | runtime absent/mismatchはfail closed。`reconcile`は全mapping/peerをflush |
+| NAT44-016 malformed/unsupported fail closed | RFC 768, local security boundary | `malformed_udp_options_and_unsupported_transport_never_create_state` | implemented | truncated/invalid length/options/TCP crossingでprivate sourceを漏らさずstateなし |
+| NAT44-017 hairpinning | RFC 4787 REQ-9 | `structural_and_policy_failures_are_byte_and_state_atomic` | deferred | inside→own publicはWANへ漏らさずtyped drop。hairpin translation未実装 |
+| NAT44-018 fragment translation | RFC 3022 §6.3, RFC 4787 REQ-14 | `structural_and_policy_failures_are_byte_and_state_atomic` | deferred | fragment association/reassembly未実装。atomic DF=1だけの初期profile |
+| NAT44-019 ICMP error translation and PMTU | RFC 3022 §§4.3, 6.3 | `wrong_ingress_unrelated_traffic_and_icmp_are_explicitly_non_nat` | deferred | incoming ICMPはmappingをrefresh/deleteせず従来local path。embedded tuple/PMTU translationなし |
+| NAT44-020 other transports/features | RFC 3022, RFC 4787, RFC 7857 | — | deferred | TCP/ICMP query NAT、static forwards、multi-public、port randomization/parity、full packet filter/firewall |
+| NAT44-021 external-to-internal bypass prevention | RFC 3022 traditional NAT domain boundary, local security policy | `outside_to_inside_lpm_bypass_is_always_fail_closed_before_neighbor_work` | implemented | authorized public UDP DNAT以外のoutside→inside LPMをprotocol/runtime/state非依存でneighbor処理前にdrop |
 
 ## RFC deviation rule
 

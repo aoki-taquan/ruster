@@ -12,7 +12,8 @@ active treeは、そのコードを継承しないv0.2のゼロベース実装�
 - `ruster-core`: backend所有packetを借用し、Ethernet II / IPv4検証、LPM、
   TTL/checksum/MAC rewrite、local IPv4向けARP reply、static neighbor miss時の
   ARP Request生成action、fixed-capacity dynamic ARP cache、local ICMPv4 Echo
-  responder、ICMPv4 Time Exceeded / Destination Unreachable生成を扱う。
+  responder、ICMPv4 Time Exceeded / Destination Unreachable生成、opt-inの
+  single-domain UDP NAT44/NAPTを扱う。
 - `ruster-io-sim`: rootやNICなしでRX/generated TXのFIFO、budget、TX/drop、
   traceを決定的に検証する。
 
@@ -53,6 +54,24 @@ fixed-capacity worker-local FIFOとper-egress default 100ms timer limiterを共�
 staticまたはfresh dynamic neighborが無い場合はARPだけを開始し、今回のICMP actionは保持
 しません。generated outer IPv4は576 bytes以下、quoteは受信時IPv4 bytesを最大548 bytes
 所有し、link paddingを含みません。
+
+UDP NAT44は`forward_batch_with_nat44_udp`、またはgenerated ICMP errorも含む
+`forward_batch_with_nat44_udp_and_icmpv4_errors`を選んだworkerだけで有効です。一つの
+inside/outside/public IPv4とnonzero port poolを設定し、mappingとremote-address filter
+peerをcaller-backed固定配列で所有します。outboundはEndpoint-Independent Mapping、
+inboundは過去に送信したremote IPv4だけを許すAddress-Dependent Filteringです。
+IPv4 optionsなし、DF=1/MF=0/offset=0のatomic UDPだけを変換し、UDP checksum zeroを保存、
+nonzero checksumとIPv4 checksumをRFC 1624でincremental更新します。
+
+idle TTLはdefault 300秒、minimum 120秒で、outbound TX requestだけがrefreshします。
+live stateをcapacity pressureでevictせず、snapshot/config mismatchはfail closedです。
+NAT runtimeへ到達した非退行時刻はdrop結果でもwatermarkへ反映し、expired/miss後の古い
+時刻によるmapping復活を許しません。outsideからinsideへのpublic DNATを通らない直通LPMも
+neighbor解決前にfail closedです。
+publication変更はvalidated configと`Nat44UdpRuntime::reconcile`による明示的な全state flushを
+要求します。fragment、hairpin、ICMP error translation/PMTU、TCP/ICMP query NAT、static
+forward、multi-public、port randomization/parity、full firewallはdeferredで、RFC 4787/
+7857全体への準拠は主張しません。
 
 ## 開発
 
