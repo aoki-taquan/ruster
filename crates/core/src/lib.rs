@@ -2,6 +2,7 @@
 #![doc = "A small, allocation-free IPv4 and ARP packet-processing core."]
 
 mod checksum;
+mod firewall;
 mod forwarding;
 mod generated;
 mod icmpv4_error;
@@ -12,13 +13,29 @@ mod resolution;
 mod route;
 
 pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
+pub use firewall::{
+    FirewallAction, FirewallAuditBuffer, FirewallAuditRecord, FirewallCommitError, FirewallConfig,
+    FirewallConfigError, FirewallConnectionClass, FirewallCounters, FirewallDisposition,
+    FirewallFailure, FirewallHashKey, FirewallHashKeyError, FirewallInterface, FirewallIpv4Prefix,
+    FirewallIpv4PrefixError, FirewallPlanError, FirewallPolicy, FirewallPolicyError,
+    FirewallPolicySource, FirewallPortRange, FirewallPortRangeError, FirewallProtocol,
+    FirewallReconcileError, FirewallReconcileReport, FirewallRule, FirewallRuleId, FirewallRuntime,
+    FirewallStateSlot, FirewallTcpPhase, FirewallVerdict, FIREWALL_MAX_IDLE_TTL_MS,
+    FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS, FIREWALL_TCP_ACTIVE_MIN_IDLE_TTL_MS,
+    FIREWALL_TCP_OPENING_DEFAULT_IDLE_TTL_MS, FIREWALL_TCP_OPENING_MIN_IDLE_TTL_MS,
+    FIREWALL_UDP_DEFAULT_IDLE_TTL_MS, FIREWALL_UDP_MIN_IDLE_TTL_MS,
+};
 pub use forwarding::{
-    forward_batch, forward_batch_with_nat44_tcp, forward_batch_with_nat44_tcp_and_icmpv4_errors,
+    forward_batch, forward_batch_with_firewall, forward_batch_with_firewall_and_icmpv4_errors,
+    forward_batch_with_firewall_and_icmpv4_errors_audited, forward_batch_with_firewall_audited,
+    forward_batch_with_nat44_tcp, forward_batch_with_nat44_tcp_and_icmpv4_errors,
     forward_batch_with_nat44_udp, forward_batch_with_nat44_udp_and_icmpv4_errors,
-    forward_batch_with_nat44_udp_and_tcp, forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors,
-    forward_batch_with_resolution, forward_batch_with_resolution_and_icmpv4_errors, BatchReport,
-    DropReason, ForwardingSnapshot, Ipv4OriginPolicy, Ipv4OriginPolicyError,
-    Nat44Icmpv4Disposition, NoTrace, SnapshotError, TraceEvent, TraceSink,
+    forward_batch_with_nat44_udp_and_tcp, forward_batch_with_nat44_udp_and_tcp_and_firewall,
+    forward_batch_with_nat44_udp_and_tcp_and_firewall_audited,
+    forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors, forward_batch_with_resolution,
+    forward_batch_with_resolution_and_icmpv4_errors, BatchReport, DropReason, ForwardingSnapshot,
+    Ipv4OriginPolicy, Ipv4OriginPolicyError, Nat44Icmpv4Disposition, NoTrace, SnapshotError,
+    TraceEvent, TraceSink,
 };
 pub use generated::{
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,

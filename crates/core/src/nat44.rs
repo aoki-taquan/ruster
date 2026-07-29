@@ -375,6 +375,7 @@ pub struct Nat44UdpConfig {
     last_port: u16,
     policy: Nat44UdpPolicy,
     authority: u64,
+    snapshot_identity: [usize; 8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -444,6 +445,7 @@ impl Nat44UdpConfig {
             last_port,
             policy,
             authority: snapshot_authority(snapshot),
+            snapshot_identity: snapshot.identity(),
         })
     }
 
@@ -479,9 +481,7 @@ impl Nat44UdpConfig {
 
     pub(crate) fn authority_matches(self, snapshot: &ForwardingSnapshot<'_>) -> bool {
         self.authority == snapshot_authority(snapshot)
-            && snapshot.local_ipv4.iter().any(|binding| {
-                binding.interface == self.outside && binding.address == self.public_address
-            })
+            && self.snapshot_identity == snapshot.identity()
     }
 }
 
@@ -801,6 +801,27 @@ impl<'a> Nat44UdpRuntime<'a> {
         now_ms: u64,
     ) -> Result<Nat44UdpOutboundPlan, Nat44UdpPlanError> {
         self.observe_now(now_ms)?;
+        self.plan_outbound_after_clock(internal_address, internal_port, remote_address, now_ms)
+    }
+
+    pub(crate) fn plan_outbound_read_only(
+        &self,
+        internal_address: Ipv4Address,
+        internal_port: u16,
+        remote_address: Ipv4Address,
+        now_ms: u64,
+    ) -> Result<Nat44UdpOutboundPlan, Nat44UdpPlanError> {
+        self.check_now_read_only(now_ms)?;
+        self.plan_outbound_after_clock(internal_address, internal_port, remote_address, now_ms)
+    }
+
+    fn plan_outbound_after_clock(
+        &self,
+        internal_address: Ipv4Address,
+        internal_port: u16,
+        remote_address: Ipv4Address,
+        now_ms: u64,
+    ) -> Result<Nat44UdpOutboundPlan, Nat44UdpPlanError> {
         if let Some((mapping_index, mapping)) =
             self.find_mapping(internal_address, internal_port, now_ms)
         {
@@ -910,6 +931,25 @@ impl<'a> Nat44UdpRuntime<'a> {
         now_ms: u64,
     ) -> Result<Nat44UdpInboundPlan, Nat44UdpPlanError> {
         self.observe_now(now_ms)?;
+        self.plan_inbound_after_clock(public_port, remote_address, now_ms)
+    }
+
+    pub(crate) fn plan_inbound_read_only(
+        &self,
+        public_port: u16,
+        remote_address: Ipv4Address,
+        now_ms: u64,
+    ) -> Result<Nat44UdpInboundPlan, Nat44UdpPlanError> {
+        self.check_now_read_only(now_ms)?;
+        self.plan_inbound_after_clock(public_port, remote_address, now_ms)
+    }
+
+    fn plan_inbound_after_clock(
+        &self,
+        public_port: u16,
+        remote_address: Ipv4Address,
+        now_ms: u64,
+    ) -> Result<Nat44UdpInboundPlan, Nat44UdpPlanError> {
         let Some((mapping_index, mapping)) =
             self.mappings
                 .iter()
@@ -964,6 +1004,13 @@ impl<'a> Nat44UdpRuntime<'a> {
                 // `observe_now` owns this counter so a forwarding caller can
                 // record the typed plan error without double-counting it.
             }
+        }
+    }
+
+    pub(crate) fn record_read_only_plan_error(&mut self, error: Nat44UdpPlanError) {
+        self.record_plan_error(error);
+        if error == Nat44UdpPlanError::ClockRegression {
+            self.counters.clock_regressions = self.counters.clock_regressions.saturating_add(1);
         }
     }
 
@@ -1092,6 +1139,17 @@ impl<'a> Nat44UdpRuntime<'a> {
     fn next_nonzero_generation(&self) -> u64 {
         self.next_generation.max(1)
     }
+
+    fn check_now_read_only(&self, now_ms: u64) -> Result<(), Nat44UdpPlanError> {
+        if self
+            .watermark_ms
+            .is_some_and(|watermark| now_ms < watermark)
+        {
+            Err(Nat44UdpPlanError::ClockRegression)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn address_is_host_unicast(snapshot: &ForwardingSnapshot<'_>, address: Ipv4Address) -> bool {
@@ -1105,50 +1163,8 @@ fn address_is_host_unicast(snapshot: &ForwardingSnapshot<'_>, address: Ipv4Addre
     })
 }
 
-fn snapshot_authority(snapshot: &ForwardingSnapshot<'_>) -> u64 {
-    fn mix(hash: u64, value: u64) -> u64 {
-        (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
-    }
-
-    let mut hash = 0xcbf2_9ce4_8422_2325;
-    for interface in snapshot.interfaces {
-        hash = mix(hash, u64::from(interface.id.0));
-        for octet in interface.mac.0 {
-            hash = mix(hash, u64::from(octet));
-        }
-    }
-    hash = mix(hash, 0xff);
-    for binding in snapshot.local_ipv4 {
-        hash = mix(hash, u64::from(binding.interface.0));
-        hash = mix(
-            hash,
-            u64::from(u32::from_be_bytes(binding.address.octets())),
-        );
-    }
-    hash = mix(hash, 0xfe);
-    for route in snapshot.routes {
-        hash = mix(hash, u64::from(u32::from_be_bytes(route.prefix().octets())));
-        hash = mix(hash, u64::from(route.prefix_len()));
-        hash = mix(hash, u64::from(route.egress().0));
-        hash = mix(
-            hash,
-            route.next_hop().map_or(u64::MAX, |next| {
-                u64::from(u32::from_be_bytes(next.octets()))
-            }),
-        );
-    }
-    hash = mix(hash, 0xfd);
-    for neighbor in snapshot.neighbors {
-        hash = mix(hash, u64::from(neighbor.interface.0));
-        hash = mix(
-            hash,
-            u64::from(u32::from_be_bytes(neighbor.target.octets())),
-        );
-        for octet in neighbor.mac.0 {
-            hash = mix(hash, u64::from(octet));
-        }
-    }
-    hash
+pub(crate) fn snapshot_authority(snapshot: &ForwardingSnapshot<'_>) -> u64 {
+    snapshot.authority()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1221,6 +1237,7 @@ pub struct Nat44TcpConfig {
     last_port: u16,
     policy: Nat44TcpPolicy,
     authority: u64,
+    snapshot_identity: [usize; 8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1290,6 +1307,7 @@ impl Nat44TcpConfig {
             last_port,
             policy,
             authority: snapshot_authority(snapshot),
+            snapshot_identity: snapshot.identity(),
         })
     }
 
@@ -1325,9 +1343,7 @@ impl Nat44TcpConfig {
 
     pub(crate) fn authority_matches(self, snapshot: &ForwardingSnapshot<'_>) -> bool {
         self.authority == snapshot_authority(snapshot)
-            && snapshot.local_ipv4.iter().any(|binding| {
-                binding.interface == self.outside && binding.address == self.public_address
-            })
+            && self.snapshot_identity == snapshot.identity()
     }
 
     pub(crate) fn realm_matches_udp(self, udp: Nat44UdpConfig) -> bool {
@@ -1664,6 +1680,47 @@ impl<'a> Nat44TcpRuntime<'a> {
         now_ms: u64,
     ) -> Result<Nat44TcpOutboundPlan, Nat44TcpPlanError> {
         self.observe_now(now_ms)?;
+        self.plan_outbound_after_clock(
+            internal_address,
+            internal_port,
+            remote_address,
+            remote_port,
+            initial_syn,
+            now_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_outbound_read_only(
+        &self,
+        internal_address: Ipv4Address,
+        internal_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        initial_syn: bool,
+        now_ms: u64,
+    ) -> Result<Nat44TcpOutboundPlan, Nat44TcpPlanError> {
+        self.check_now_read_only(now_ms)?;
+        self.plan_outbound_after_clock(
+            internal_address,
+            internal_port,
+            remote_address,
+            remote_port,
+            initial_syn,
+            now_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_outbound_after_clock(
+        &self,
+        internal_address: Ipv4Address,
+        internal_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        initial_syn: bool,
+        now_ms: u64,
+    ) -> Result<Nat44TcpOutboundPlan, Nat44TcpPlanError> {
         if let Some((mapping_index, mapping)) =
             self.find_mapping(internal_address, internal_port, now_ms)
         {
@@ -1760,6 +1817,27 @@ impl<'a> Nat44TcpRuntime<'a> {
         now_ms: u64,
     ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
         self.observe_now(now_ms)?;
+        self.plan_inbound_after_clock(public_port, remote_address, remote_port, now_ms)
+    }
+
+    pub(crate) fn plan_inbound_read_only(
+        &self,
+        public_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        now_ms: u64,
+    ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
+        self.check_now_read_only(now_ms)?;
+        self.plan_inbound_after_clock(public_port, remote_address, remote_port, now_ms)
+    }
+
+    fn plan_inbound_after_clock(
+        &self,
+        public_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        now_ms: u64,
+    ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
         let Some((mapping_index, mapping)) =
             self.mappings
                 .iter()
@@ -1855,6 +1933,13 @@ impl<'a> Nat44TcpRuntime<'a> {
         }
     }
 
+    pub(crate) fn record_read_only_plan_error(&mut self, error: Nat44TcpPlanError) {
+        self.record_plan_error(error);
+        if error == Nat44TcpPlanError::ClockRegression {
+            self.counters.clock_regressions = self.counters.clock_regressions.saturating_add(1);
+        }
+    }
+
     pub(crate) fn inspect_icmpv4(
         &self,
         public_port: u16,
@@ -1902,6 +1987,17 @@ impl<'a> Nat44TcpRuntime<'a> {
         session.occupied
             && now_ms >= session.last_activity_ms
             && now_ms - session.last_activity_ms < self.config.policy.idle_ttl_ms
+    }
+
+    fn check_now_read_only(&self, now_ms: u64) -> Result<(), Nat44TcpPlanError> {
+        if self
+            .watermark_ms
+            .is_some_and(|watermark| now_ms < watermark)
+        {
+            Err(Nat44TcpPlanError::ClockRegression)
+        } else {
+            Ok(())
+        }
     }
 
     fn mapping_is_live(&self, index: usize, mapping: Nat44TcpMappingSlot, now_ms: u64) -> bool {
