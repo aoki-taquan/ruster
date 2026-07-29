@@ -602,10 +602,24 @@ heap、`String`、trait objectを導入しません。
 
 NAT inbound mapping/sessionがあってもexact reverse FW stateが無ければinside neighborより前に
 denyします。NAT/FWどちらかのcapacity plan failureでも他方をcommitしません。NAT44 ICMPv4
-Type 3/Code 4のquoted canonical tupleをread-only RELATED lookupする機能はdeferredです。
-firewallとopt-in NAT ICMP translationを同時に選んだcandidateは、追跡済みであっても現在は
-`FirewallRelatedIcmpv4Unsupported`で明示的にfail closedし、NAT/FW state、phase、watermarkを
-refresh/deleteしません。
+Type 3/Code 4は、NAT read-only inspectionが復元したpre-SNAT internal address/portと引用内の
+remote address/portから、origin ingress=inside、egress=outsideのcanonical forward tupleを
+構成します。UDPもremote portまでexactにfirewall照合し、TCPはNAT sessionとfirewall stateの
+両方でendpoint exactを要求します。firewall lookupはkeyed tableを最大capacity回probeし、
+live/config generation/interface/tupleのdirect origin一致だけをRELATEDとして許可します。
+reverse match、rule scan、expiry cleanup、delete/move、activity/phase/counter/watermark更新は
+行いません。退行時刻は状態不変のtyped clock regression、state missは
+`FirewallRelatedIcmpv4StateMiss`でinside route/neighbor/rewriteより前にsilent dropします。
+audit到達時だけhitを`Allow/Related/Rule(origin)/AllowStateful`、missを
+`Drop/Related/Default`かつ`matched_action=None`、`failure=None`として記録します。terminalな
+miss理由はaudit failure enumを拡張せず`FirewallRelatedIcmpv4StateMiss`で表現します。
+parser、NAT authority/lookup、clock errorはRELATED auditを残しません。tracked hit後の
+neighbor missだけがARPをscheduleでき、fresh retryで再照合します。backend rejectを含め
+NAT/FW stateはread-onlyです。
+
+NATを伴わないplain forwarded ICMPv4 RELATEDは、引用tupleからorigin interface authorityを
+安全に一意化する契約が未確定のためdeferredです。既存の
+`FirewallRelatedIcmpv4Unsupported = 114`は互換性のため予約し、renumberしません。
 
 eager dynamic-cache scan/flush、unresolved packet hold queue、gratuitous ARP生成、
 ARP Probe/Announcement生成、proxy ARP、VLAN、Address Conflict Detection、実装済み
