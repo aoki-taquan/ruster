@@ -16,18 +16,22 @@ const ETHERNET_MIN_FRAME_LEN: usize = 60;
 pub enum Icmpv4ErrorKind {
     TimeExceededTtl,
     DestinationUnreachableNetwork,
+    DestinationUnreachableHost,
 }
 
 impl Icmpv4ErrorKind {
     const fn icmp_type(self) -> u8 {
         match self {
             Self::TimeExceededTtl => 11,
-            Self::DestinationUnreachableNetwork => 3,
+            Self::DestinationUnreachableNetwork | Self::DestinationUnreachableHost => 3,
         }
     }
 
     const fn icmp_code(self) -> u8 {
-        0
+        match self {
+            Self::DestinationUnreachableHost => 1,
+            Self::TimeExceededTtl | Self::DestinationUnreachableNetwork => 0,
+        }
     }
 }
 
@@ -213,6 +217,10 @@ pub enum Icmpv4ErrorDisposition {
         egress: IfId,
         quote_len: usize,
     },
+    HostUnreachableQueued {
+        egress: IfId,
+        quote_len: usize,
+    },
     Pending {
         egress: IfId,
     },
@@ -257,6 +265,7 @@ pub struct Icmpv4ErrorCounters {
     pub queued: usize,
     pub queued_time_exceeded: usize,
     pub queued_destination_unreachable: usize,
+    pub queued_host_unreachable: usize,
     pub pending: usize,
     pub rate_limited: usize,
     pub state_full: usize,
@@ -280,6 +289,7 @@ pub struct Icmpv4ErrorCounters {
     pub dequeued: usize,
     pub dequeued_time_exceeded: usize,
     pub dequeued_destination_unreachable: usize,
+    pub dequeued_host_unreachable: usize,
 }
 
 /// Caller-backed, worker-local ICMP error queue and per-egress limiter.
@@ -350,6 +360,10 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             Icmpv4ErrorDisposition::DestinationUnreachableQueued { .. } => {
                 self.counters.queued += 1;
                 self.counters.queued_destination_unreachable += 1;
+            }
+            Icmpv4ErrorDisposition::HostUnreachableQueued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_host_unreachable += 1;
             }
             Icmpv4ErrorDisposition::Pending { .. } => self.counters.pending += 1,
             Icmpv4ErrorDisposition::RateLimited { .. } => {
@@ -479,6 +493,12 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                     quote_len: action.quote_len(),
                 }
             }
+            Icmpv4ErrorKind::DestinationUnreachableHost => {
+                Icmpv4ErrorDisposition::HostUnreachableQueued {
+                    egress: action.egress,
+                    quote_len: action.quote_len(),
+                }
+            }
         };
         self.record_suppression(disposition)
     }
@@ -522,6 +542,9 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             Icmpv4ErrorKind::DestinationUnreachableNetwork => {
                 self.counters.dequeued_destination_unreachable += 1;
             }
+            Icmpv4ErrorKind::DestinationUnreachableHost => {
+                self.counters.dequeued_host_unreachable += 1;
+            }
         }
         if let Some(state) = self.states.iter_mut().find(|state| {
             state.occupied
@@ -555,8 +578,11 @@ pub enum GeneratedIcmpv4Trace {
     BuildFailed(Icmpv4ErrorBuildError),
     DestinationUnreachableAllocationFailed(GeneratedAllocationError),
     DestinationUnreachableBuildFailed(Icmpv4ErrorBuildError),
+    HostUnreachableAllocationFailed(GeneratedAllocationError),
+    HostUnreachableBuildFailed(Icmpv4ErrorBuildError),
     ClockRegression,
     DestinationUnreachableClockRegression,
+    HostUnreachableClockRegression,
     TxRequested {
         egress: IfId,
         destination: Ipv4Address,
@@ -565,11 +591,19 @@ pub enum GeneratedIcmpv4Trace {
         egress: IfId,
         destination: Ipv4Address,
     },
+    HostUnreachableTxRequested {
+        egress: IfId,
+        destination: Ipv4Address,
+    },
     BatchCompleted {
         accepted: usize,
         rejected: usize,
     },
     DestinationUnreachableBatchCompleted {
+        accepted: usize,
+        rejected: usize,
+    },
+    HostUnreachableBatchCompleted {
         accepted: usize,
         rejected: usize,
     },
@@ -626,6 +660,9 @@ where
             Icmpv4ErrorKind::DestinationUnreachableNetwork => {
                 GeneratedIcmpv4Trace::DestinationUnreachableClockRegression
             }
+            Icmpv4ErrorKind::DestinationUnreachableHost => {
+                GeneratedIcmpv4Trace::HostUnreachableClockRegression
+            }
         };
         trace.record_generated_icmpv4(event);
         return Err(ExecuteIcmpv4TimeExceededError::ClockRegression);
@@ -645,6 +682,12 @@ where
                         destination: queued.action.destination_ip,
                     }
                 }
+                Icmpv4ErrorKind::DestinationUnreachableHost => {
+                    GeneratedIcmpv4Trace::HostUnreachableTxRequested {
+                        egress: queued.action.egress,
+                        destination: queued.action.destination_ip,
+                    }
+                }
             };
             trace.record_generated_icmpv4(event);
             (None, None)
@@ -655,6 +698,9 @@ where
                 Icmpv4ErrorKind::DestinationUnreachableNetwork => {
                     GeneratedIcmpv4Trace::DestinationUnreachableAllocationFailed(error)
                 }
+                Icmpv4ErrorKind::DestinationUnreachableHost => {
+                    GeneratedIcmpv4Trace::HostUnreachableAllocationFailed(error)
+                }
             };
             trace.record_generated_icmpv4(event);
             (Some(error), None)
@@ -664,6 +710,9 @@ where
                 Icmpv4ErrorKind::TimeExceededTtl => GeneratedIcmpv4Trace::BuildFailed(error),
                 Icmpv4ErrorKind::DestinationUnreachableNetwork => {
                     GeneratedIcmpv4Trace::DestinationUnreachableBuildFailed(error)
+                }
+                Icmpv4ErrorKind::DestinationUnreachableHost => {
+                    GeneratedIcmpv4Trace::HostUnreachableBuildFailed(error)
                 }
             };
             trace.record_generated_icmpv4(event);
@@ -678,6 +727,12 @@ where
         },
         Icmpv4ErrorKind::DestinationUnreachableNetwork => {
             GeneratedIcmpv4Trace::DestinationUnreachableBatchCompleted {
+                accepted: completion.accepted,
+                rejected: completion.rejected,
+            }
+        }
+        Icmpv4ErrorKind::DestinationUnreachableHost => {
+            GeneratedIcmpv4Trace::HostUnreachableBatchCompleted {
                 accepted: completion.accepted,
                 rejected: completion.rejected,
             }
@@ -797,6 +852,31 @@ mod tests {
         let long = action(1, 548);
         assert_eq!(long.frame_len(), ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN);
         assert_eq!(long.outer_tos, 0xce, "RFC 1812 reserved TOS bit is cleared");
+    }
+
+    #[test]
+    fn host_unreachable_code_and_maximum_odd_quote_wire_are_exact() {
+        let action = action_kind(
+            Icmpv4ErrorKind::DestinationUnreachableHost,
+            1,
+            ICMPV4_ERROR_MAX_QUOTE_LEN,
+        );
+        let mut frame = [0xa5; ICMPV4_ERROR_MAX_FRAME_LEN];
+        build_icmpv4_error(&mut frame, &action);
+        assert_eq!(&frame[34..36], &[3, 1]);
+        assert_eq!(&frame[38..42], &[0; 4]);
+        assert_eq!(
+            u16::from_be_bytes([frame[16], frame[17]]),
+            576,
+            "outer IPv4 remains within the RFC 1812 quote ceiling"
+        );
+        assert_eq!(ipv4_header_checksum(&frame[14..34]), 0);
+        assert_eq!(internet_checksum(&frame[34..]), 0);
+
+        let odd = action_kind(Icmpv4ErrorKind::DestinationUnreachableHost, 1, 21);
+        let mut odd_frame = [0; 63];
+        build_icmpv4_error(&mut odd_frame, &odd);
+        assert_eq!(internet_checksum(&odd_frame[34..63]), 0);
     }
 
     #[test]

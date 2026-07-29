@@ -138,7 +138,7 @@ pub struct ForwardingSnapshot<'a> {
     pub(crate) interfaces: &'a [Interface],
     pub(crate) neighbors: &'a [Neighbor],
     pub(crate) local_ipv4: &'a [LocalIpv4Binding],
-    ipv4_origin: Ipv4OriginPolicy,
+    pub(crate) ipv4_origin: Ipv4OriginPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -722,6 +722,24 @@ fn decide_ipv4<T: TraceSink>(
                         target,
                         result,
                     });
+                    if route.next_hop().is_none()
+                        && target == ipv4.destination
+                        && icmp_error_candidate_eligible(frame, snapshot, ipv4, Some(route))
+                    {
+                        let quote_end = ipv4.header_offset + ipv4.total_len;
+                        let _ = runtime.capture_failure_candidate(
+                            route.egress(),
+                            target,
+                            ipv4.source,
+                            ipv4.destination,
+                            interface.mac,
+                            binding.address,
+                            route.prefix(),
+                            route.prefix_len(),
+                            frame[ipv4.header_offset + 1],
+                            &frame[ipv4.header_offset..quote_end],
+                        );
+                    }
                 }
                 return Err(NeighborUnresolved);
             }
@@ -950,6 +968,48 @@ fn icmp_error_source_is_host(
             selected.is_prefix_network_address(source)
                 || selected.is_prefix_directed_broadcast(source)
         })
+}
+
+fn icmp_error_candidate_eligible(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ipv4: packet::ValidatedIpv4,
+    selected_destination_route: Option<Route>,
+) -> bool {
+    if !icmp_error_source_is_host(snapshot, ipv4.source)
+        || snapshot
+            .local_ipv4
+            .iter()
+            .any(|binding| binding.address == ipv4.source)
+    {
+        return false;
+    }
+    let destination = ipv4.destination.octets();
+    if (destination[0] & 0xf0) == 0xe0 || destination == [255; 4] {
+        return false;
+    }
+    if selected_destination_route.is_some_and(|route| {
+        route.is_prefix_network_address(ipv4.destination)
+            || route.is_prefix_directed_broadcast(ipv4.destination)
+    }) || frame.first().is_some_and(|first| first & 1 != 0)
+    {
+        return false;
+    }
+    let Some(flags_fragment) = packet::read_u16(frame, ipv4.header_offset + 6) else {
+        return false;
+    };
+    if flags_fragment & 0x1fff != 0 {
+        return false;
+    }
+    if ipv4.protocol == 1 {
+        let Some(icmp_type) = frame.get(ipv4.header_offset + ipv4.header_len).copied() else {
+            return false;
+        };
+        if matches!(icmp_type, 3 | 4 | 5 | 11 | 12) {
+            return false;
+        }
+    }
+    true
 }
 
 fn reverse_target_forbidden(

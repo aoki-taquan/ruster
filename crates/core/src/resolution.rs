@@ -2,7 +2,8 @@ use std::{marker::PhantomData, rc::Rc};
 
 use crate::{
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,
-    IfId, Ipv4Address, MacAddress, ARP_ETHERTYPE, IPV4_ETHERTYPE,
+    Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorRuntime, IfId,
+    Ipv4Address, MacAddress, ARP_ETHERTYPE, ICMPV4_ERROR_MAX_QUOTE_LEN, IPV4_ETHERTYPE,
 };
 
 pub const ARP_REQUEST_FRAME_LEN: usize = 60;
@@ -145,6 +146,7 @@ pub struct ResolutionStateSlot {
     action: ArpRequestAction,
     generation: u64,
     attempts: u16,
+    accepted_attempts: u16,
     requested_at: MonotonicMillis,
     failed_at: MonotonicMillis,
     occupied: bool,
@@ -166,6 +168,7 @@ impl ResolutionStateSlot {
         },
         generation: 0,
         attempts: 0,
+        accepted_attempts: 0,
         requested_at: MonotonicMillis(0),
         failed_at: MonotonicMillis(0),
         occupied: false,
@@ -240,6 +243,7 @@ pub enum ResolutionResult {
 pub struct ResolutionStatus {
     pub phase: ResolutionPhase,
     pub attempts: u16,
+    pub accepted_attempts: u16,
     pub generation: u64,
     pub requested_at: Option<MonotonicMillis>,
     pub failed_at: Option<MonotonicMillis>,
@@ -257,9 +261,166 @@ pub struct ResolutionCounters {
     pub dequeued: usize,
     pub retry_queued: usize,
     pub attempts_committed: usize,
+    pub attempts_accepted: usize,
     pub timed_out: usize,
     pub failed_hits: usize,
     pub failures_expired: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolutionGenerationToken {
+    pub egress: IfId,
+    pub target: Ipv4Address,
+    pub generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolutionFailureHoldPhase {
+    Empty,
+    WaitingForward,
+    TerminalReady,
+    WaitingReverse,
+}
+
+/// A bounded quote-only candidate for a future ICMPv4 Host Unreachable.
+///
+/// This is deliberately separate from [`ResolutionStateSlot`]. It never owns
+/// an RX/TX lease and is not a packet queue: only validated metadata and at
+/// most 548 original IPv4 bytes are copied before the original RX is recycled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolutionFailureHoldSlot {
+    phase: ResolutionFailureHoldPhase,
+    forward: ResolutionGenerationToken,
+    reverse: ResolutionGenerationToken,
+    original_source: Ipv4Address,
+    original_destination: Ipv4Address,
+    forward_source_mac: MacAddress,
+    forward_source_ip: Ipv4Address,
+    forward_prefix: Ipv4Address,
+    forward_prefix_len: u8,
+    original_tos: u8,
+    quote_len: u16,
+    quote: [u8; ICMPV4_ERROR_MAX_QUOTE_LEN],
+}
+
+impl ResolutionFailureHoldSlot {
+    pub const EMPTY: Self = Self {
+        phase: ResolutionFailureHoldPhase::Empty,
+        forward: ResolutionGenerationToken {
+            egress: IfId(0),
+            target: Ipv4Address::from_octets([0; 4]),
+            generation: 0,
+        },
+        reverse: ResolutionGenerationToken {
+            egress: IfId(0),
+            target: Ipv4Address::from_octets([0; 4]),
+            generation: 0,
+        },
+        original_source: Ipv4Address::from_octets([0; 4]),
+        original_destination: Ipv4Address::from_octets([0; 4]),
+        forward_source_mac: MacAddress([0; 6]),
+        forward_source_ip: Ipv4Address::from_octets([0; 4]),
+        forward_prefix: Ipv4Address::from_octets([0; 4]),
+        forward_prefix_len: 0,
+        original_tos: 0,
+        quote_len: 0,
+        quote: [0; ICMPV4_ERROR_MAX_QUOTE_LEN],
+    };
+
+    #[must_use]
+    pub const fn phase(&self) -> ResolutionFailureHoldPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub const fn forward_token(&self) -> Option<ResolutionGenerationToken> {
+        if matches!(self.phase, ResolutionFailureHoldPhase::Empty) {
+            None
+        } else {
+            Some(self.forward)
+        }
+    }
+
+    #[must_use]
+    pub const fn quote_len(&self) -> usize {
+        self.quote_len as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResolutionFailureCounters {
+    pub captured: usize,
+    pub capture_full: usize,
+    pub promoted: usize,
+    pub no_accepted_arp_request: usize,
+    pub cancelled: usize,
+    pub reverse_arp_scheduled: usize,
+    pub reverse_resolution_failed: usize,
+    pub same_failed_key: usize,
+    pub queued: usize,
+    pub retained_transient: usize,
+    pub retired_permanent: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResolutionFailureDispatchReport {
+    pub scanned: usize,
+    pub queued: usize,
+    pub retained: usize,
+    pub retired: usize,
+    pub reverse_arp_scheduled: usize,
+    pub pending: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolutionFailureDispatchError {
+    ClockRegression,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolutionFailureCapture {
+    Captured(ResolutionGenerationToken),
+    Existing(ResolutionGenerationToken),
+    Inactive,
+    CapacityFull,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolutionFailureTrace {
+    Queued {
+        forward: ResolutionGenerationToken,
+        reverse_egress: IfId,
+    },
+    ReverseArpScheduled {
+        forward: ResolutionGenerationToken,
+        reverse: ResolutionGenerationToken,
+    },
+    Retained {
+        forward: ResolutionGenerationToken,
+        disposition: Icmpv4ErrorDisposition,
+    },
+    ReverseResolutionFailed {
+        forward: ResolutionGenerationToken,
+        reverse: ResolutionGenerationToken,
+    },
+    SameFailedKey {
+        forward: ResolutionGenerationToken,
+    },
+    ForwardAuthorityLost {
+        forward: ResolutionGenerationToken,
+    },
+    ClockRegression,
+}
+
+pub trait ResolutionFailureTraceSink {
+    fn record_resolution_failure(&mut self, event: ResolutionFailureTrace);
+}
+
+#[derive(Default)]
+pub struct NoResolutionFailureTrace;
+
+impl ResolutionFailureTraceSink for NoResolutionFailureTrace {
+    fn record_resolution_failure(&mut self, _event: ResolutionFailureTrace) {}
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -267,6 +428,7 @@ pub struct ResolutionTimerReport {
     pub scanned: usize,
     pub retries_queued: usize,
     pub timed_out: usize,
+    pub no_accepted_arp_request: usize,
     pub failures_expired: usize,
     pub action_full: usize,
     pub deferred_due: usize,
@@ -290,6 +452,11 @@ pub enum ResolutionTimerTrace {
         egress: IfId,
         target: Ipv4Address,
         attempts: u16,
+        generation: u64,
+    },
+    NoAcceptedArpRequest {
+        egress: IfId,
+        target: Ipv4Address,
         generation: u64,
     },
     FailureExpired {
@@ -334,11 +501,14 @@ pub struct ResolutionRuntime<'a> {
     states: &'a mut [ResolutionStateSlot],
     actions: &'a mut [ResolutionActionSlot],
     dynamic_neighbors: &'a mut [DynamicNeighborSlot],
+    failure_holds: &'a mut [ResolutionFailureHoldSlot],
     head: usize,
     len: usize,
     poll_cursor: usize,
+    failure_cursor: usize,
     last_now: Option<MonotonicMillis>,
     counters: ResolutionCounters,
+    failure_counters: ResolutionFailureCounters,
     _worker_local: PhantomData<Rc<()>>,
 }
 
@@ -359,19 +529,40 @@ impl<'a> ResolutionRuntime<'a> {
         action_storage: &'a mut [ResolutionActionSlot],
         dynamic_neighbors: &'a mut [DynamicNeighborSlot],
     ) -> Self {
+        Self::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            states,
+            action_storage,
+            dynamic_neighbors,
+            &mut [],
+        )
+    }
+
+    #[must_use]
+    pub fn with_dynamic_neighbors_and_failure_holds(
+        policy: ResolutionPolicy,
+        states: &'a mut [ResolutionStateSlot],
+        action_storage: &'a mut [ResolutionActionSlot],
+        dynamic_neighbors: &'a mut [DynamicNeighborSlot],
+        failure_holds: &'a mut [ResolutionFailureHoldSlot],
+    ) -> Self {
         states.fill(ResolutionStateSlot::EMPTY);
         action_storage.fill(ResolutionActionSlot::EMPTY);
         dynamic_neighbors.fill(DynamicNeighborSlot::EMPTY);
+        failure_holds.fill(ResolutionFailureHoldSlot::EMPTY);
         Self {
             policy,
             states,
             actions: action_storage,
             dynamic_neighbors,
+            failure_holds,
             head: 0,
             len: 0,
             poll_cursor: 0,
+            failure_cursor: 0,
             last_now: None,
             counters: ResolutionCounters::default(),
+            failure_counters: ResolutionFailureCounters::default(),
             _worker_local: PhantomData,
         }
     }
@@ -420,6 +611,17 @@ impl<'a> ResolutionRuntime<'a> {
                 neighbor.interface == action.egress && neighbor.target == action.target_ip
             })
         });
+        for hold in &mut *self.failure_holds {
+            if hold.phase != ResolutionFailureHoldPhase::Empty
+                && neighbors.iter().any(|neighbor| {
+                    neighbor.interface == hold.forward.egress
+                        && neighbor.target == hold.forward.target
+                })
+            {
+                *hold = ResolutionFailureHoldSlot::EMPTY;
+                self.failure_counters.cancelled += 1;
+            }
+        }
         report
     }
 
@@ -483,12 +685,57 @@ impl<'a> ResolutionRuntime<'a> {
         });
         report.actions_removed = static_removed;
         report.invalid_actions_removed = invalid_removed;
+        for hold in &mut *self.failure_holds {
+            if hold.phase == ResolutionFailureHoldPhase::Empty {
+                continue;
+            }
+            let forward_valid =
+                crate::route::lookup(snapshot.routes, hold.original_destination).is_some_and(
+                    |route| {
+                        route.egress() == hold.forward.egress
+                            && route.next_hop().is_none()
+                            && hold.forward.target == hold.original_destination
+                            && route.prefix() == hold.forward_prefix
+                            && route.prefix_len() == hold.forward_prefix_len
+                    },
+                ) && snapshot.interfaces.iter().any(|interface| {
+                    interface.id == hold.forward.egress && interface.mac == hold.forward_source_mac
+                }) && snapshot.local_ipv4.iter().any(|binding| {
+                    binding.interface == hold.forward.egress
+                        && binding.address == hold.forward_source_ip
+                }) && !snapshot.neighbors.iter().any(|neighbor| {
+                    neighbor.interface == hold.forward.egress
+                        && neighbor.target == hold.forward.target
+                }) && !host_failure_target_forbidden(
+                    snapshot,
+                    hold.forward.egress,
+                    hold.forward.target,
+                    hold.forward_source_ip,
+                );
+            if !forward_valid {
+                *hold = ResolutionFailureHoldSlot::EMPTY;
+                self.failure_counters.cancelled += 1;
+            }
+        }
         report
     }
 
     #[must_use]
     pub const fn counters(&self) -> ResolutionCounters {
         self.counters
+    }
+
+    #[must_use]
+    pub const fn failure_counters(&self) -> ResolutionFailureCounters {
+        self.failure_counters
+    }
+
+    #[must_use]
+    pub fn pending_failure_holds(&self) -> usize {
+        self.failure_holds
+            .iter()
+            .filter(|hold| hold.phase != ResolutionFailureHoldPhase::Empty)
+            .count()
     }
 
     #[must_use]
@@ -522,11 +769,76 @@ impl<'a> ResolutionRuntime<'a> {
             .map(|state| ResolutionStatus {
                 phase: state.phase,
                 attempts: state.attempts,
+                accepted_attempts: state.accepted_attempts,
                 generation: state.generation,
                 requested_at: (state.attempts != 0).then_some(state.requested_at),
                 failed_at: (state.phase == ResolutionPhase::Failed).then_some(state.failed_at),
                 terminal_notified: state.failure_notified,
             })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_failure_candidate(
+        &mut self,
+        egress: IfId,
+        target: Ipv4Address,
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        forward_source_mac: MacAddress,
+        forward_source_ip: Ipv4Address,
+        forward_prefix: Ipv4Address,
+        forward_prefix_len: u8,
+        original_tos: u8,
+        original_ipv4: &[u8],
+    ) -> ResolutionFailureCapture {
+        let Some(state) = self.states.iter().find(|state| {
+            state.occupied
+                && state.key.egress == egress
+                && state.key.target == target
+                && matches!(
+                    state.phase,
+                    ResolutionPhase::InitialQueued
+                        | ResolutionPhase::Waiting
+                        | ResolutionPhase::RetryQueued
+                )
+        }) else {
+            return ResolutionFailureCapture::Inactive;
+        };
+        let token = ResolutionGenerationToken {
+            egress,
+            target,
+            generation: state.generation,
+        };
+        if self
+            .failure_holds
+            .iter()
+            .any(|hold| hold.phase != ResolutionFailureHoldPhase::Empty && hold.forward == token)
+        {
+            return ResolutionFailureCapture::Existing(token);
+        }
+        let Some(slot) = self
+            .failure_holds
+            .iter_mut()
+            .find(|hold| hold.phase == ResolutionFailureHoldPhase::Empty)
+        else {
+            self.failure_counters.capture_full += 1;
+            return ResolutionFailureCapture::CapacityFull;
+        };
+        let quote_len = original_ipv4.len().min(ICMPV4_ERROR_MAX_QUOTE_LEN);
+        *slot = ResolutionFailureHoldSlot::EMPTY;
+        slot.phase = ResolutionFailureHoldPhase::WaitingForward;
+        slot.forward = token;
+        slot.original_source = source;
+        slot.original_destination = destination;
+        slot.forward_source_mac = forward_source_mac;
+        slot.forward_source_ip = forward_source_ip;
+        slot.forward_prefix = forward_prefix;
+        slot.forward_prefix_len = forward_prefix_len;
+        slot.original_tos = original_tos;
+        slot.quote_len = quote_len as u16;
+        slot.quote[..quote_len].copy_from_slice(&original_ipv4[..quote_len]);
+        self.failure_counters.captured += 1;
+        ResolutionFailureCapture::Captured(token)
     }
 
     pub(crate) fn schedule(
@@ -584,6 +896,21 @@ impl<'a> ResolutionRuntime<'a> {
                         return ResolutionResult::ActionFull;
                     }
                     self.counters.failures_expired += 1;
+                    let expired = ResolutionGenerationToken {
+                        egress: self.states[index].key.egress,
+                        target: self.states[index].key.target,
+                        generation: self.states[index].generation,
+                    };
+                    for hold in &mut *self.failure_holds {
+                        if hold.phase != ResolutionFailureHoldPhase::Empty
+                            && (hold.forward == expired
+                                || (hold.phase == ResolutionFailureHoldPhase::WaitingReverse
+                                    && hold.reverse == expired))
+                        {
+                            *hold = ResolutionFailureHoldSlot::EMPTY;
+                            self.failure_counters.cancelled += 1;
+                        }
+                    }
                     self.start_cycle(index, action);
                     return self.enqueue_initial(index);
                 }
@@ -714,6 +1041,7 @@ impl<'a> ResolutionRuntime<'a> {
             }
         }
         self.compact_actions(|action| action.egress == interface && action.target_ip == target);
+        self.cancel_forward_holds(interface, target);
     }
 
     fn reconcile_static_key(&mut self, interface: IfId, target: Ipv4Address) {
@@ -750,7 +1078,11 @@ impl<'a> ResolutionRuntime<'a> {
     }
 
     fn start_cycle(&mut self, index: usize, action: ArpRequestAction) {
-        let generation = self.states[index].generation.wrapping_add(1);
+        let generation = self.next_generation(
+            action.egress,
+            action.target_ip,
+            self.states[index].generation,
+        );
         self.states[index] = ResolutionStateSlot {
             key: ResolutionKey {
                 egress: action.egress,
@@ -759,6 +1091,7 @@ impl<'a> ResolutionRuntime<'a> {
             action,
             generation,
             attempts: 0,
+            accepted_attempts: 0,
             requested_at: MonotonicMillis(0),
             failed_at: MonotonicMillis(0),
             occupied: true,
@@ -803,6 +1136,28 @@ impl<'a> ResolutionRuntime<'a> {
         self.states[index].failed_at = now;
         self.states[index].failure_notified = true;
         self.counters.timed_out += 1;
+        let token = ResolutionGenerationToken {
+            egress: self.states[index].key.egress,
+            target: self.states[index].key.target,
+            generation: self.states[index].generation,
+        };
+        if self.states[index].accepted_attempts == 0 {
+            for hold in &mut *self.failure_holds {
+                if hold.phase == ResolutionFailureHoldPhase::WaitingForward && hold.forward == token
+                {
+                    *hold = ResolutionFailureHoldSlot::EMPTY;
+                    self.failure_counters.no_accepted_arp_request += 1;
+                }
+            }
+        } else {
+            for hold in &mut *self.failure_holds {
+                if hold.phase == ResolutionFailureHoldPhase::WaitingForward && hold.forward == token
+                {
+                    hold.phase = ResolutionFailureHoldPhase::TerminalReady;
+                    self.failure_counters.promoted += 1;
+                }
+            }
+        }
         ResolutionResult::TimedOut
     }
 
@@ -841,6 +1196,54 @@ impl<'a> ResolutionRuntime<'a> {
         }
     }
 
+    fn accepted(&mut self, queued: QueuedAction, accepted: usize) {
+        if accepted == 0 {
+            return;
+        }
+        if let Some(state) = self.states.iter_mut().find(|state| {
+            state.occupied
+                && state.key.egress == queued.action.egress
+                && state.key.target == queued.action.target_ip
+                && state.generation == queued.generation
+        }) {
+            state.accepted_attempts = state.accepted_attempts.saturating_add(accepted as u16);
+            self.counters.attempts_accepted += accepted;
+        }
+    }
+
+    fn next_generation(&self, egress: IfId, target: Ipv4Address, previous: u64) -> u64 {
+        let mut candidate = previous.wrapping_add(1);
+        for _ in 0..=self.failure_holds.len() {
+            let aliases = self.failure_holds.iter().any(|hold| {
+                hold.phase != ResolutionFailureHoldPhase::Empty
+                    && ((hold.forward.egress == egress
+                        && hold.forward.target == target
+                        && hold.forward.generation == candidate)
+                        || (hold.phase == ResolutionFailureHoldPhase::WaitingReverse
+                            && hold.reverse.egress == egress
+                            && hold.reverse.target == target
+                            && hold.reverse.generation == candidate))
+            });
+            if !aliases {
+                return candidate;
+            }
+            candidate = candidate.wrapping_add(1);
+        }
+        unreachable!("more live tokens than caller-backed hold slots")
+    }
+
+    fn cancel_forward_holds(&mut self, egress: IfId, target: Ipv4Address) {
+        for hold in &mut *self.failure_holds {
+            if hold.phase != ResolutionFailureHoldPhase::Empty
+                && hold.forward.egress == egress
+                && hold.forward.target == target
+            {
+                *hold = ResolutionFailureHoldSlot::EMPTY;
+                self.failure_counters.cancelled += 1;
+            }
+        }
+    }
+
     fn poll_timers<T: ResolutionTimerTraceSink>(
         &mut self,
         now: MonotonicMillis,
@@ -872,6 +1275,16 @@ impl<'a> ResolutionRuntime<'a> {
                     }
                     if self.states[index].attempts >= self.policy.max_attempts {
                         let state = self.states[index];
+                        let token = ResolutionGenerationToken {
+                            egress: state.key.egress,
+                            target: state.key.target,
+                            generation: state.generation,
+                        };
+                        let no_accepted_candidate = state.accepted_attempts == 0
+                            && self.failure_holds.iter().any(|hold| {
+                                hold.phase == ResolutionFailureHoldPhase::WaitingForward
+                                    && hold.forward == token
+                            });
                         self.mark_failed(index, now);
                         report.timed_out += 1;
                         trace.record_resolution_timer(ResolutionTimerTrace::TimedOut {
@@ -880,6 +1293,16 @@ impl<'a> ResolutionRuntime<'a> {
                             attempts: state.attempts,
                             generation: state.generation,
                         });
+                        if no_accepted_candidate {
+                            report.no_accepted_arp_request += 1;
+                            trace.record_resolution_timer(
+                                ResolutionTimerTrace::NoAcceptedArpRequest {
+                                    egress: state.key.egress,
+                                    target: state.key.target,
+                                    generation: state.generation,
+                                },
+                            );
+                        }
                     } else if self.len == self.actions.len() {
                         let state = self.states[index];
                         self.counters.action_full += 1;
@@ -907,6 +1330,21 @@ impl<'a> ResolutionRuntime<'a> {
                 ResolutionPhase::Failed => {
                     if now.0 - self.states[index].failed_at.0 >= self.policy.state_ttl_ms {
                         let state = self.states[index];
+                        let token = ResolutionGenerationToken {
+                            egress: state.key.egress,
+                            target: state.key.target,
+                            generation: state.generation,
+                        };
+                        for hold in &mut *self.failure_holds {
+                            if hold.phase != ResolutionFailureHoldPhase::Empty
+                                && (hold.forward == token
+                                    || (hold.phase == ResolutionFailureHoldPhase::WaitingReverse
+                                        && hold.reverse == token))
+                            {
+                                *hold = ResolutionFailureHoldSlot::EMPTY;
+                                self.failure_counters.cancelled += 1;
+                            }
+                        }
                         vacate_state(&mut self.states[index]);
                         self.counters.failures_expired += 1;
                         report.failures_expired += 1;
@@ -957,6 +1395,331 @@ pub fn poll_resolution_timers<T: ResolutionTimerTraceSink>(
     trace: &mut T,
 ) -> Result<ResolutionTimerReport, ResolutionTimerError> {
     runtime.poll_timers(now, scan_budget, trace)
+}
+
+/// Boundedly promotes fruitless directly-connected ARP generations into
+/// ICMPv4 Destination Unreachable, Host Unreachable actions.
+///
+/// Call after publication reconciliation, RX processing, and resolution timer
+/// polling, but before generated ARP and ICMP execution.
+pub fn dispatch_host_unreachable_failures<T: ResolutionFailureTraceSink>(
+    resolution: &mut ResolutionRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    snapshot: &crate::ForwardingSnapshot<'_>,
+    now: MonotonicMillis,
+    scan_budget: usize,
+    trace: &mut T,
+) -> Result<ResolutionFailureDispatchReport, ResolutionFailureDispatchError> {
+    if !resolution.observe_now(now) {
+        trace.record_resolution_failure(ResolutionFailureTrace::ClockRegression);
+        return Err(ResolutionFailureDispatchError::ClockRegression);
+    }
+    let mut report = ResolutionFailureDispatchReport::default();
+    if resolution.failure_holds.is_empty() || scan_budget == 0 {
+        report.pending = resolution.pending_failure_holds();
+        return Ok(report);
+    }
+    let scans = scan_budget.min(resolution.failure_holds.len());
+    for _ in 0..scans {
+        let index = resolution.failure_cursor;
+        resolution.failure_cursor =
+            (resolution.failure_cursor + 1) % resolution.failure_holds.len();
+        report.scanned += 1;
+        let hold = resolution.failure_holds[index];
+        if !matches!(
+            hold.phase,
+            ResolutionFailureHoldPhase::TerminalReady | ResolutionFailureHoldPhase::WaitingReverse
+        ) {
+            continue;
+        }
+        match dispatch_one_failure(resolution, icmpv4_errors, snapshot, now, hold) {
+            FailureDispatch::Queued(reverse_egress) => {
+                resolution.failure_holds[index] = ResolutionFailureHoldSlot::EMPTY;
+                resolution.failure_counters.queued += 1;
+                report.queued += 1;
+                trace.record_resolution_failure(ResolutionFailureTrace::Queued {
+                    forward: hold.forward,
+                    reverse_egress,
+                });
+            }
+            FailureDispatch::WaitReverse(reverse) => {
+                resolution.failure_holds[index].phase = ResolutionFailureHoldPhase::WaitingReverse;
+                resolution.failure_holds[index].reverse = reverse;
+                resolution.failure_counters.reverse_arp_scheduled += 1;
+                report.reverse_arp_scheduled += 1;
+                report.retained += 1;
+                trace.record_resolution_failure(ResolutionFailureTrace::ReverseArpScheduled {
+                    forward: hold.forward,
+                    reverse,
+                });
+            }
+            FailureDispatch::Retain(disposition) => {
+                resolution.failure_counters.retained_transient += 1;
+                report.retained += 1;
+                trace.record_resolution_failure(ResolutionFailureTrace::Retained {
+                    forward: hold.forward,
+                    disposition,
+                });
+            }
+            FailureDispatch::ReverseFailed(reverse) => {
+                resolution.failure_holds[index] = ResolutionFailureHoldSlot::EMPTY;
+                resolution.failure_counters.reverse_resolution_failed += 1;
+                report.retired += 1;
+                trace.record_resolution_failure(ResolutionFailureTrace::ReverseResolutionFailed {
+                    forward: hold.forward,
+                    reverse,
+                });
+            }
+            FailureDispatch::SameFailedKey => {
+                resolution.failure_holds[index] = ResolutionFailureHoldSlot::EMPTY;
+                resolution.failure_counters.same_failed_key += 1;
+                report.retired += 1;
+                trace.record_resolution_failure(ResolutionFailureTrace::SameFailedKey {
+                    forward: hold.forward,
+                });
+            }
+            FailureDispatch::AuthorityLost => {
+                resolution.failure_holds[index] = ResolutionFailureHoldSlot::EMPTY;
+                resolution.failure_counters.retired_permanent += 1;
+                report.retired += 1;
+                trace.record_resolution_failure(ResolutionFailureTrace::ForwardAuthorityLost {
+                    forward: hold.forward,
+                });
+            }
+        }
+    }
+    report.pending = resolution.pending_failure_holds();
+    Ok(report)
+}
+
+enum FailureDispatch {
+    Queued(IfId),
+    WaitReverse(ResolutionGenerationToken),
+    Retain(Icmpv4ErrorDisposition),
+    ReverseFailed(ResolutionGenerationToken),
+    SameFailedKey,
+    AuthorityLost,
+}
+
+fn dispatch_one_failure(
+    resolution: &mut ResolutionRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    snapshot: &crate::ForwardingSnapshot<'_>,
+    now: MonotonicMillis,
+    hold: ResolutionFailureHoldSlot,
+) -> FailureDispatch {
+    let forward_status = resolution.status(hold.forward.egress, hold.forward.target);
+    if !forward_status.is_some_and(|status| {
+        status.generation == hold.forward.generation
+            && status.phase == ResolutionPhase::Failed
+            && status.accepted_attempts != 0
+    }) {
+        return FailureDispatch::AuthorityLost;
+    }
+    let forward_route = crate::route::lookup(snapshot.routes, hold.original_destination);
+    if !forward_route.is_some_and(|route| {
+        route.egress() == hold.forward.egress
+            && route.next_hop().is_none()
+            && hold.forward.target == hold.original_destination
+            && route.prefix() == hold.forward_prefix
+            && route.prefix_len() == hold.forward_prefix_len
+    }) || !snapshot.interfaces.iter().any(|interface| {
+        interface.id == hold.forward.egress && interface.mac == hold.forward_source_mac
+    }) || !snapshot.local_ipv4.iter().any(|binding| {
+        binding.interface == hold.forward.egress && binding.address == hold.forward_source_ip
+    }) || snapshot.neighbors.iter().any(|neighbor| {
+        neighbor.interface == hold.forward.egress && neighbor.target == hold.forward.target
+    }) || host_failure_target_forbidden(
+        snapshot,
+        hold.forward.egress,
+        hold.forward.target,
+        hold.forward_source_ip,
+    ) {
+        return FailureDispatch::AuthorityLost;
+    }
+    match resolution.lookup_dynamic(hold.forward.egress, hold.forward.target, now) {
+        DynamicLookup::Hit(_) | DynamicLookup::ClockRegression => {
+            return FailureDispatch::AuthorityLost;
+        }
+        DynamicLookup::Miss => {}
+    }
+    if !current_icmp_error_eligible(snapshot, hold) {
+        return FailureDispatch::AuthorityLost;
+    }
+
+    let Some(reverse_route) = crate::route::lookup(snapshot.routes, hold.original_source) else {
+        return FailureDispatch::AuthorityLost;
+    };
+    let reverse_egress = reverse_route.egress();
+    let Some(interface) = snapshot
+        .interfaces
+        .iter()
+        .find(|interface| interface.id == reverse_egress)
+    else {
+        return FailureDispatch::AuthorityLost;
+    };
+    let Some(binding) = snapshot
+        .local_ipv4
+        .iter()
+        .find(|binding| binding.interface == reverse_egress)
+    else {
+        return FailureDispatch::AuthorityLost;
+    };
+    let target = reverse_route.next_hop().unwrap_or(hold.original_source);
+    if host_failure_target_forbidden(snapshot, reverse_egress, target, binding.address) {
+        return FailureDispatch::AuthorityLost;
+    }
+    let reverse_key = ResolutionKey {
+        egress: reverse_egress,
+        target,
+    };
+    if reverse_key
+        == (ResolutionKey {
+            egress: hold.forward.egress,
+            target: hold.forward.target,
+        })
+    {
+        return FailureDispatch::SameFailedKey;
+    }
+
+    let destination_mac = if let Some(neighbor) = snapshot
+        .neighbors
+        .iter()
+        .find(|neighbor| neighbor.interface == reverse_egress && neighbor.target == target)
+    {
+        neighbor.mac
+    } else {
+        match resolution.lookup_dynamic(reverse_egress, target, now) {
+            DynamicLookup::Hit(mac) => mac,
+            DynamicLookup::ClockRegression => {
+                return FailureDispatch::Retain(Icmpv4ErrorDisposition::ClockRegression);
+            }
+            DynamicLookup::Miss => {
+                if hold.phase == ResolutionFailureHoldPhase::WaitingReverse
+                    && hold.reverse.egress == reverse_egress
+                    && hold.reverse.target == target
+                    && resolution
+                        .status(hold.reverse.egress, hold.reverse.target)
+                        .is_some_and(|status| {
+                            status.generation == hold.reverse.generation
+                                && status.phase == ResolutionPhase::Failed
+                        })
+                {
+                    return FailureDispatch::ReverseFailed(hold.reverse);
+                }
+                let result = resolution.schedule(
+                    ArpRequestAction {
+                        egress: reverse_egress,
+                        source_mac: interface.mac,
+                        source_ip: binding.address,
+                        target_ip: target,
+                    },
+                    now,
+                    false,
+                );
+                if result == ResolutionResult::Failed {
+                    if let Some(status) = resolution.status(reverse_egress, target) {
+                        return FailureDispatch::ReverseFailed(ResolutionGenerationToken {
+                            egress: reverse_egress,
+                            target,
+                            generation: status.generation,
+                        });
+                    }
+                }
+                if resolution
+                    .status(reverse_egress, target)
+                    .is_some_and(|status| {
+                        matches!(
+                            status.phase,
+                            ResolutionPhase::InitialQueued
+                                | ResolutionPhase::RetryQueued
+                                | ResolutionPhase::Waiting
+                        )
+                    })
+                {
+                    let status = resolution
+                        .status(reverse_egress, target)
+                        .expect("active status was just observed");
+                    return FailureDispatch::WaitReverse(ResolutionGenerationToken {
+                        egress: reverse_egress,
+                        target,
+                        generation: status.generation,
+                    });
+                }
+                return FailureDispatch::Retain(
+                    Icmpv4ErrorDisposition::ReverseNeighborUnresolved {
+                        egress: reverse_egress,
+                        target,
+                        resolution: result,
+                    },
+                );
+            }
+        }
+    };
+
+    let disposition = icmpv4_errors.schedule(
+        Icmpv4ErrorAction::new_with_kind(
+            Icmpv4ErrorKind::DestinationUnreachableHost,
+            reverse_egress,
+            interface.mac,
+            destination_mac,
+            binding.address,
+            hold.original_source,
+            hold.original_tos,
+            snapshot.ipv4_origin.default_ttl(),
+            &hold.quote[..usize::from(hold.quote_len)],
+        ),
+        now,
+    );
+    if matches!(
+        disposition,
+        Icmpv4ErrorDisposition::HostUnreachableQueued { .. }
+    ) {
+        FailureDispatch::Queued(reverse_egress)
+    } else {
+        FailureDispatch::Retain(disposition)
+    }
+}
+
+fn current_icmp_error_eligible(
+    snapshot: &crate::ForwardingSnapshot<'_>,
+    hold: ResolutionFailureHoldSlot,
+) -> bool {
+    let source = hold.original_source.octets();
+    source[0] != 0
+        && source[0] != 127
+        && source[0] < 224
+        && !snapshot
+            .local_ipv4
+            .iter()
+            .any(|binding| binding.address == hold.original_source)
+        && !crate::route::lookup(snapshot.routes, hold.original_source).is_some_and(|route| {
+            route.is_prefix_network_address(hold.original_source)
+                || route.is_prefix_directed_broadcast(hold.original_source)
+        })
+}
+
+fn host_failure_target_forbidden(
+    snapshot: &crate::ForwardingSnapshot<'_>,
+    egress: IfId,
+    target: Ipv4Address,
+    local: Ipv4Address,
+) -> bool {
+    let octets = target.octets();
+    octets[0] == 0
+        || octets[0] == 127
+        || octets[0] >= 224
+        || octets == [255; 4]
+        || target == local
+        || snapshot
+            .local_ipv4
+            .iter()
+            .any(|binding| binding.address == target)
+        || snapshot.routes.iter().any(|route| {
+            route.egress() == egress
+                && (route.is_connected_directed_broadcast(target)
+                    || route.is_connected_network_address(target))
+        })
 }
 
 fn forbidden_target(target: Ipv4Address) -> bool {
@@ -1022,25 +1785,29 @@ where
         return Err(ExecuteArpRequestError::ClockRegression);
     }
     let mut batch = io.begin_generated(queued.action.egress);
-    let (allocation_error, build_error) = match allocate_arp_request(&mut batch, queued.action) {
-        Ok(()) => {
-            runtime.committed(queued, now);
-            trace.record_generated(GeneratedArpTrace::TxRequested {
-                egress: queued.action.egress,
-                target: queued.action.target_ip,
-            });
-            (None, None)
-        }
-        Err(ArpRequestGenerationError::Allocation(error)) => {
-            trace.record_generated(GeneratedArpTrace::AllocationFailed(error));
-            (Some(error), None)
-        }
-        Err(ArpRequestGenerationError::Build(error)) => {
-            trace.record_generated(GeneratedArpTrace::BuildFailed(error));
-            (None, Some(error))
-        }
-    };
+    let (allocation_error, build_error, committed) =
+        match allocate_arp_request(&mut batch, queued.action) {
+            Ok(()) => {
+                runtime.committed(queued, now);
+                trace.record_generated(GeneratedArpTrace::TxRequested {
+                    egress: queued.action.egress,
+                    target: queued.action.target_ip,
+                });
+                (None, None, true)
+            }
+            Err(ArpRequestGenerationError::Allocation(error)) => {
+                trace.record_generated(GeneratedArpTrace::AllocationFailed(error));
+                (Some(error), None, false)
+            }
+            Err(ArpRequestGenerationError::Build(error)) => {
+                trace.record_generated(GeneratedArpTrace::BuildFailed(error));
+                (None, Some(error), false)
+            }
+        };
     let completion = batch.finish();
+    if committed {
+        runtime.accepted(queued, completion.accepted);
+    }
     trace.record_generated(GeneratedArpTrace::BatchCompleted {
         accepted: completion.accepted,
         rejected: completion.rejected,
@@ -1802,5 +2569,48 @@ mod tests {
             ResolutionResult::Queued
         );
         assert_eq!(runtime.front().unwrap().action.source_mac, new_mac);
+    }
+
+    #[test]
+    fn generation_wrap_skips_live_failure_token_and_recreation_zeroes_quote() {
+        let policy = ResolutionPolicy::new(1_000, 2_000).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        {
+            let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+                policy,
+                &mut states,
+                &mut actions,
+                &mut [],
+                &mut holds,
+            );
+            runtime.states[0].generation = u64::MAX;
+            runtime.failure_holds[0].phase = ResolutionFailureHoldPhase::TerminalReady;
+            runtime.failure_holds[0].forward = ResolutionGenerationToken {
+                egress: WAN,
+                target: target(2),
+                generation: 0,
+            };
+            runtime.failure_holds[0].quote_len = 1;
+            runtime.failure_holds[0].quote[0] = 0xa5;
+            assert_eq!(
+                runtime.schedule(action(2), MonotonicMillis(0), false),
+                ResolutionResult::Queued
+            );
+            assert_eq!(runtime.status(WAN, target(2)).unwrap().generation, 1);
+        }
+        {
+            let runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+                policy,
+                &mut states,
+                &mut actions,
+                &mut [],
+                &mut holds,
+            );
+            assert_eq!(runtime.pending_failure_holds(), 0);
+        }
+        assert_eq!(holds[0].quote_len, 0);
+        assert!(holds[0].quote.iter().all(|byte| *byte == 0));
     }
 }

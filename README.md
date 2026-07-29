@@ -39,7 +39,11 @@ traffic-independentなbounded timer pollがretryとterminal `Failed` hold-down�
 これらのretry回数・schedule・Failed/hold-downはRFC固定値ではなくlocal policyです。
 RX batchとgenerated TX sessionは二相に分離し、生成frameもbackend所有bufferを借用します。
 ARP Reply/RequestはRFC 826 mergeでworker-local cacheへ学習し、matching retry/Failed stateを
-cancelします。元IPv4 packetのhold/replayとICMPv4 Type 3/Code 1生成はまだ行いません。
+cancelします。packet bufferのhold/replayは行いません。directly-connected targetの最初の
+eligible missだけは別caller-backed slotへ最大548-byte IPv4 quoteをcopyし、少なくとも一つ
+accepted ARP Requestを含むgenerationがfruitlessに終わった場合、bounded dispatchから
+ICMPv4 Destination Unreachable Type 3/Code 1を生成できます。元RXは直ちにrecycleされ、
+ARP成功時にも自動replayしません。gateway failureはCode 1対象外です。
 
 nonlocal IPv4はoptions/local判定後にまずLPMします。routeが無ければ元packetをbyte不変の
 `RouteMiss`でdropし、eligibleならICMPv4 Destination Unreachable Type 3/Code 0をqueueします。

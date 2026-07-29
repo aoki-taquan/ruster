@@ -87,15 +87,16 @@ buffer unavailableを区別し、失敗時はownershipを移しません。finis
 `accepted+rejected=requested`のaccountingを返し、rejectをreturn前にrecycleします。
 
 resolution runtimeも`!Send + !Sync`で、caller提供のlinear fixed resolution table、
-action ring、dynamic neighbor tableを借用します。すべてのkeyは`(IfId,target IPv4)`です。
-stateはauthoritativeなRequest action、generation、committed total attempts、request/failure
-時刻を保持し、`InitialQueued → Waiting → RetryQueued → Waiting → Failed`を明示します。
+action ring、dynamic neighbor table、任意のfailure hold tableを借用します。すべてのkeyは
+`(IfId,target IPv4)`です。stateはauthoritativeなRequest action、generation、committed
+total attempts、backend accepted attempts、request/failure時刻を保持し、
+`InitialQueued → Waiting → RetryQueued → Waiting → Failed`を明示します。
 intervalは1000ms以上、Failed hold-down TTLはinterval以上、max attemptsはnonzeroとし、
 local defaultはtotal 3 attemptsです。この回数とhold-downはRFCの固定値ではありません。
 batch/timer単位で注入された`MonotonicMillis`だけを使い、加算deadlineや
 `attempts * interval`を作らず、順序確認後の差分で判定するため`u64` overflowはありません。
 逆行はcounter/trace以外のaction/state/poll cursorを変更しません。active/Failed entryは
-evictせず、Failed TTL exact boundary後だけreuseします。runtime生成時は三storageをすべて
+evictせず、Failed TTL exact boundary後だけreuseします。runtime生成時は全storageを
 emptyへ初期化します。processをまたぐstate永続化/resumeは未実装です。
 
 dynamic neighbor TTLはzeroを拒否するconfigurable policyです。static neighborを最初に
@@ -120,7 +121,8 @@ actionのcancelはtombstoneを残しません。expired tombstoneだけstate pre
 同じkeyのactionは一つだけqueueできます。抑制deadlineはenqueue時でなく、generated
 leaseをcommitしてTX requestedになった注入時刻から開始します。allocation/build失敗時は
 actionを保持しattempt/deadlineを消費しません。backend reject/finish errorでもcommit済み
-total attemptとして数えます。最後のRequest commit直後にはFailedにせず、完全なinterval後の
+total attemptとして数えますが、accepted attemptはcompletionの`accepted`だけを
+generation-safeに数えます。最後のRequest commit直後にはFailedにせず、完全なinterval後の
 schedule/timer pollが一世代一度だけ`TimedOut`へ遷移させ、その後はhold-down中`Failed`を
 返します。
 
@@ -146,10 +148,15 @@ RFC 1122 §2.3.2.1から採用する境界はARP cache invalidation adviceとReq
 preventionです。retry scheduling、max attempts、`Failed`、hold-downとそのdefault値は
 すべてlocal policyであり、RFC要件とは主張しません。RFC 1812 §3.3.2はfruitless
 resolutionを永遠に続けずdatagramを捨てる、より広いrouter behaviorの境界として扱います。
-unresolved packet hold/replay（RFC 1122 §2.3.2.2、RFC 1812 §3.3.2）、ARP失敗に対する
-ICMP Destination Unreachable Type 3/Code 1、multi-worker resolution ownership/SPSCは
-未実装です。最初のpacketは解決後に自動再送されず、失敗時も元datagramへ応答できないことを
-明示的なdeviationとして残します。
+packet bufferのhold/replayは実装しません。代わりにdirectly-connected destinationの最初の
+eligible missだけ、別caller-backed slotへvalidated metadataと元IPv4を最大548 bytes copy
+します。元RX leaseは直ちに`NeighborUnresolved`でrecycleされ、ARP成功後もreplayしません。
+generationの最後のcommitted attemptからfull interval経過し、同generationで少なくとも一つ
+ARP Requestがbackend acceptedだった場合だけType 3/Code 1候補へpromotionします。全Request
+reject、gateway next-hop failure、hold capacity不足では生成しません。RFC 1122 §2.3.2.2の
+「最新datagramを保存してresolution成功時に送る」SHOULDとは異なる、DoS耐性を優先した
+quote-only/first-eligible-wins deviationです。multi-worker resolution ownership/SPSCは
+未実装です。
 
 ## IPv4 scope
 
@@ -221,8 +228,8 @@ deferredです。
 
 ## ICMPv4 generated error scope
 
-RFC 792のType 11/Code 0とType 3/Code 0、RFC 1812 §§4.3.2, 4.3.3, 5.2.7.1,
-5.2.7.3, 5.3.1を対象にします。valid IHL=5のnonlocal IPv4はlocal/options判定後にLPMし、
+RFC 792のType 11/Code 0とType 3/Code 0/Code 1、RFC 1812 §§3.3.2, 4.3.2, 4.3.3,
+5.2.7.1, 5.2.7.3, 5.3.1を対象にします。valid IHL=5のnonlocal IPv4はlocal/options判定後にLPMし、
 route missならTTL値にかかわらず元RX leaseを一切変更せず`RouteMiss`でrecycleして
 eligibleなDestination Unreachable Network actionをqueueします。route hitかつTTL 0/1は
 従来どおり`Ipv4TtlExpired`とTime Exceeded TTL actionです。一つのpacketから両方を生成
@@ -230,6 +237,27 @@ eligibleなDestination Unreachable Network actionをqueueします。route hit�
 queueし、RX batch終了後のgenerated sessionで送信します。kindはFIFO/retry/builder/report/
 traceまでtypedに保持し、action FIFOとper-egress rate stateは両kindで共有します。
 worker-localであり、共有lock、packet clone、backend buffer pointerを持ちません。
+
+Code 1はconnected routeのdirect targetだけが対象です。failure holdはresolution state/action
+とは別のfixed sliceで、`{egress,target,generation}` token、元source/destination/TOS、
+forward authority、最大548-byte quoteだけを持ちます。packet lease、Ethernet header、
+padding、buffer pointerは保持しません。各generationの最初のeligible packetが勝ち、後続packet
+はquoteを置換しません。最初がRFC error suppression対象なら後続eligible packetで空slotを
+埋められますが、すでにFailedのgenerationへretroactive captureはしません。generation wrapは
+live forward/reverse tokenをbounded scanでskipします。
+
+terminal候補のdispatchも明示scan budgetとpersistent round-robin cursorを使います。current
+snapshotでforward direct authorityと未解決状態を再確認し、元sourceへのreverse LPMを行います。
+reverse static/fresh dynamic hitなら共有`Icmpv4ErrorRuntime`へCode 1をqueueします。reverse miss
+では通常ARPをholdなしでscheduleし、候補だけを保持します。学習後の後続dispatchでfresh RXなしに
+queueでき、reverse generationがFailedならrecursive ICMPを作らずretireします。同じfailed
+forward keyをreverse resolutionとして再開しません。ICMP FIFOのPending/rate/state/action
+pressureは候補を保持し、publication、forward learning/static、authority変更は未queue候補を
+cancelします。queue済みICMP actionはhistorical eventとしてcancelしません。
+
+worker tick順は `publication/reconcile → RX → resolution timer poll → failure dispatch →
+generated ARP → generated ICMP` です。exact timeoutでのARP学習は、ICMP actionがqueueされる前
+なら `poll → learn → dispatch` と `learn → poll` の両方で勝ちます。
 
 逆経路は元IPv4 sourceへの通常LPMです。gateway routeではnext-hop、connected routeでは
 元sourceをneighbor targetにし、reverse egressのInterface MAC/local IPv4 bindingを使います。
@@ -249,7 +277,8 @@ Ethernet headerとTotal Length後のpaddingは引用しません。生成wire pr
   `(original_tos & 0x1e) | 0xc0`。reserved bit 0をclearし、source/destinationはreverse
   binding/original source。
 - ICMPはTime ExceededならType 11/Code 0、Destination Unreachable NetworkならType 3/
-  Code 0で、どちらもunused=0。odd lengthを含むheader+quote全体をchecksumする。
+  Code 0、fruitless direct ARPならType 3/Code 1で、いずれもunused=0。odd lengthを含む
+  header+quote全体をchecksumする。
 - outer IPv4 Total Lengthは最大576、Ethernet frameは最大590 bytes。
 
 RFC 1812のerror suppressionとして、invalid/non-host/router-local source、IP
@@ -271,8 +300,8 @@ state TTLはinterval以上を要求します。egressごとにqueue中actionは�
 deadlineを開始しexact boundaryを許可します。allocation/build失敗はactionを保持してdeadlineを
 開始せず、backend reject/finish errorもTX requested済みなのでdeadlineを開始します。
 state/action fullとclock regressionはphantom state/action/deadlineを作りません。expired idle
-stateだけ再利用します。multi-worker共通limit、unresolved neighborを跨ぐICMP hold/replay、
-RFC 4884 extension、MTU別quote縮小/generated fragmentation、interface別disableはdeferredです。
+stateだけ再利用します。multi-worker共通limit、packet hold/replay、RFC 4884 extension、
+MTU別quote縮小/generated fragmentation、interface別disableはdeferredです。
 
 ## ARP control scope
 
