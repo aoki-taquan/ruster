@@ -143,6 +143,13 @@ pub enum ControlDisposition {
     ClockRegression,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StaticReconcileReport {
+    pub dynamic_removed: usize,
+    pub states_removed: usize,
+    pub actions_removed: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolutionResult {
     Queued,
@@ -226,6 +233,41 @@ impl<'a> ResolutionRuntime<'a> {
             .iter()
             .filter(|slot| slot.occupied)
             .count()
+    }
+
+    /// Removes worker-local state shadowed by a newly published static set.
+    ///
+    /// The owner must call this on the same worker tick that publishes the
+    /// corresponding immutable forwarding snapshot, before processing another
+    /// packet with that snapshot.
+    pub fn reconcile_static(&mut self, neighbors: &[crate::Neighbor]) -> StaticReconcileReport {
+        let mut report = StaticReconcileReport::default();
+        for slot in &mut *self.dynamic_neighbors {
+            if slot.occupied
+                && neighbors.iter().any(|neighbor| {
+                    neighbor.interface == slot.interface && neighbor.target == slot.target
+                })
+            {
+                *slot = DynamicNeighborSlot::EMPTY;
+                report.dynamic_removed += 1;
+            }
+        }
+        for state in &mut *self.states {
+            if state.occupied
+                && neighbors.iter().any(|neighbor| {
+                    neighbor.interface == state.key.egress && neighbor.target == state.key.target
+                })
+            {
+                *state = ResolutionStateSlot::EMPTY;
+                report.states_removed += 1;
+            }
+        }
+        report.actions_removed = self.compact_actions(|action| {
+            neighbors.iter().any(|neighbor| {
+                neighbor.interface == action.egress && neighbor.target == action.target_ip
+            })
+        });
+        report
     }
 
     #[must_use]
@@ -335,6 +377,7 @@ impl<'a> ResolutionRuntime<'a> {
             return ControlDisposition::ClockRegression;
         }
         if static_key {
+            self.reconcile_static_key(interface, sender);
             return ControlDisposition::StaticPreserved;
         }
         if let Some(index) = self
@@ -391,15 +434,28 @@ impl<'a> ResolutionRuntime<'a> {
                 *state = ResolutionStateSlot::EMPTY;
             }
         }
+        self.compact_actions(|action| action.egress == interface && action.target_ip == target);
+    }
+
+    fn reconcile_static_key(&mut self, interface: IfId, target: Ipv4Address) {
+        for slot in &mut *self.dynamic_neighbors {
+            if slot.occupied && slot.interface == interface && slot.target == target {
+                *slot = DynamicNeighborSlot::EMPTY;
+            }
+        }
+        self.clear_resolution(interface, target);
+    }
+
+    fn compact_actions(&mut self, remove: impl Fn(ArpRequestAction) -> bool) -> usize {
         if self.actions.is_empty() {
-            return;
+            return 0;
         }
         let old_len = self.len;
         let mut retained = 0;
         for read in 0..old_len {
             let read_index = (self.head + read) % self.actions.len();
             let queued = self.actions[read_index].0.take().expect("queued action");
-            if queued.action.egress == interface && queued.action.target_ip == target {
+            if remove(queued.action) {
                 continue;
             }
             let write_index = (self.head + retained) % self.actions.len();
@@ -407,6 +463,7 @@ impl<'a> ResolutionRuntime<'a> {
             retained += 1;
         }
         self.len = retained;
+        old_len - retained
     }
 
     fn enqueue_at(&mut self, index: usize, action: ArpRequestAction) -> ResolutionResult {

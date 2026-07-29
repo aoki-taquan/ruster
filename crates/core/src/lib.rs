@@ -30,6 +30,6 @@ pub use resolution::{
     DynamicNeighborSlot, ExecuteArpRequestError, GeneratedArpReport, GeneratedArpTrace,
     GeneratedTraceSink, MonotonicMillis, NoGeneratedTrace, ResolutionActionSlot,
     ResolutionCounters, ResolutionPolicy, ResolutionPolicyError, ResolutionResult,
-    ResolutionRuntime, ResolutionStateSlot, ARP_REQUEST_FRAME_LEN,
+    ResolutionRuntime, ResolutionStateSlot, StaticReconcileReport, ARP_REQUEST_FRAME_LEN,
 };
 pub use route::{IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route, RouteError};

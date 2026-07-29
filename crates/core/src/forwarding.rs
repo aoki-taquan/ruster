@@ -527,7 +527,7 @@ fn decide_arp<T: TraceSink>(
     let sender_local = snapshot
         .local_ipv4
         .iter()
-        .any(|binding| binding.address == arp.sender_protocol);
+        .any(|binding| binding.interface == ingress && binding.address == arp.sender_protocol);
     let sender_host = sender_is_host(snapshot, ingress, arp.sender_protocol);
     let static_key = snapshot
         .neighbors
@@ -535,7 +535,16 @@ fn decide_arp<T: TraceSink>(
         .any(|neighbor| neighbor.interface == ingress && neighbor.target == arp.sender_protocol);
     let has_runtime = resolution.is_some();
     let disposition = if let Some((runtime, now)) = resolution.as_mut() {
-        if arp.sender_protocol.is_unspecified() {
+        if static_key {
+            runtime.merge_dynamic(
+                ingress,
+                arp.sender_protocol,
+                arp.sender_hardware,
+                target_local,
+                true,
+                *now,
+            )
+        } else if arp.sender_protocol.is_unspecified() {
             if runtime.observe_control(*now) {
                 ControlDisposition::Probe
             } else {
@@ -559,7 +568,7 @@ fn decide_arp<T: TraceSink>(
                 arp.sender_protocol,
                 arp.sender_hardware,
                 target_local,
-                static_key,
+                false,
                 *now,
             )
         }
@@ -600,12 +609,14 @@ fn sender_is_host(
     sender: crate::Ipv4Address,
 ) -> bool {
     let octets = sender.octets();
-    octets != [255; 4]
-        && (octets[0] & 0xf0) != 0xe0
-        && !snapshot
-            .routes
-            .iter()
-            .any(|route| route.egress() == ingress && route.is_connected_directed_broadcast(sender))
+    octets[0] != 0
+        && octets[0] != 127
+        && octets[0] < 224
+        && !snapshot.routes.iter().any(|route| {
+            route.egress() == ingress
+                && (route.is_connected_directed_broadcast(sender)
+                    || route.is_connected_network_address(sender))
+        })
 }
 
 fn apply_decision(frame: &mut [u8], decision: PacketDecision) -> Result<(), DropReason> {

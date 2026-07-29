@@ -15,7 +15,7 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | IO-007 generated partial/error completion | architecture contract | `generated_partial_tx_error_preserves_invariants_and_recycles_rejects` | implemented | 三つのaccounting不変条件を保持しrejectをreturn前にrecycle |
 | IO-008 generated builder failure isolation | defensive backend boundary | `builder_failure_cancels_lease_and_retains_action` | implemented | exact-length契約違反bufferをcancelしactionを保持 |
 | IO-009 real generated backend | backend roadmap | — | deferred | AF_XDP/DPDK generated allocator/TXは未実装 |
-| IO-010 ARP control consume lifecycle/accounting | architecture contract | `mixed_reply_then_ipv4_uses_dynamic_mapping_in_same_batch` | implemented | logical consumedとphysical recycleを区別し、received=TX+drop+consume |
+| IO-010 ARP control consume lifecycle/accounting | architecture contract | `mixed_reply_then_ipv4_uses_dynamic_mapping_in_same_batch` | implemented | `BatchReport`/`RecycleCause`でlogical consumeを区別。physical recycle countはdrop+consumeを含み、received=TX+drop+consume |
 | ETH-001 Ethernet II framing | RFC 894 | `all_validation_and_decision_drops_are_granular_and_atomic` | implemented | 802.3 LLC/VLANはdeferred |
 | IP4-001 Version/IHL/Total Length validation | RFC 791 §3.1 | `all_validation_and_decision_drops_are_granular_and_atomic` | implemented | なし |
 | IP4-002 Total Length後のpadding無視 | RFC 791 §3.1 | `padding_is_ignored_but_preserved` | implemented | なし |
@@ -62,10 +62,14 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | ARP-016 Probe/Announcement/GARP/ACD generation | RFC 5227 | — | deferred | generated pathは通常ARP Requestだけ。Probe/Announcement/GARP/ACDは未実装 |
 | ARP-017 target-local unsolicited admission/nonlocal ignore | RFC 826 | `unsolicited_local_reply_learns_while_nonlocal_absent_is_ignored` | implemented | solicited-only制限なし。target-local Replyはinsert、nonlocal absentはconsume-ignore |
 | ARP-018 merge precedes opcode/target and GARP refresh | RFC 826 | `existing_mapping_merge_precedes_target_and_opcode_and_garp_refreshes` | implemented | existing keyはReply/Request/Announcement、local/nonlocal TPAに依らずSHAへmerge |
+| ARP-018A unknown opcode atomic hardening drop | RFC 826 merge orderからのhardening deviation | `unknown_opcode_drops_before_merge_without_mutating_cache_or_pending` | deviation | unsupported opcodeはprofile validationで先にdropし、MAC/TTL/pending/bytesを変更しない |
 | ARP-019 local Request/Probe/SHA authority | RFC 826, RFC 5227 | `local_request_learns_sha_even_when_ethernet_source_differs_and_probe_does_not` | implemented | Requestはlearn後reply、Probeはno-learn、Ethernet source≠SHAでもSHAを採用 |
 | ARP-020 invalid sender hardware security drop | RFC 1812 §3.3.2, local zero policy | `invalid_sender_hardware_drops_atomically_without_cache_or_action_mutation` | implemented | zero/broadcast/multicast SHAはbyte/cache/action atomic drop |
-| ARP-021 non-host sender protocol no-learn | RFC 1812 §3.3.2, local policy | `non_host_sender_protocol_addresses_are_consumed_without_learning` | implemented | multicast/limited/directed broadcast SPAはconsumeするが学習しない |
-| ARP-022 static authority over dynamic | local authority policy | `foreign_local_spa_cannot_poison_and_static_mapping_has_priority` | deviation | staticはARPで上書き/slot消費せず常にforward優先 |
+| ARP-021 non-host sender protocol no-learn | RFC 1122 §3.2.1.3, local safety policy | `non_host_sender_protocol_addresses_are_consumed_without_learning` | implemented | nonzero `0/8`、`127/8`、multicast、`240/4`、limited broadcast、connected network/directed broadcast SPAはconsume/no-learn、cache/action不変 |
+| ARP-021A point-to-point endpoint learning | RFC 3021, host-route semantics | `point_to_point_prefix_endpoints_are_learnable` | implemented | `/31`と`/32`はnetwork/broadcast addressとして除外しない |
+| ARP-021B local SPA claim is ingress scoped | RFC 5227 link scope | `local_address_value_on_another_interface_is_learnable_on_ingress` | implemented | 別IfIdのlocal IPv4値と同じSPAはingress上のpeerとして学習可能 |
+| ARP-022 static authority over dynamic | local authority policy | `foreign_local_spa_cannot_poison_and_static_mapping_has_priority` | deviation | staticはARPで上書き/slot消費せず常にforward優先し、同keyのstale dynamic/pendingを削除 |
+| ARP-022A static snapshot reconciliation | control-plane publication contract | `reconcile_static_clears_stale_cache_and_wrapped_middle_action_fifo` | implemented | snapshot公開と同worker tickでdynamic/state/actionを削除し、wrapped ringのFIFO/容量/IfId独立性を保持 |
 | ARP-023 cache-full disposition/pending preservation | architecture contract | `ttl_boundary_refresh_expired_reuse_and_cache_full_are_exact` | implemented | live entry非evict、Reply consume、matching pending actionをclearしない |
 | ARP-024 unified monotonic watermark | architecture contract | `clock_regression_does_not_mutate_cache_and_later_equal_time_recovers` | implemented | regressionはcache/action不変、後続normal nowで回復 |
 | ARP-025 learned mapping cancels matching resolution | architecture contract | `reply_before_generated_execution_cancels_only_matching_fifo_action` | implemented | matching action/stateだけcancel、unrelated key/IfId FIFOとcapacityを維持 |

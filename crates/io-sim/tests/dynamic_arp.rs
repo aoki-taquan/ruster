@@ -12,6 +12,9 @@ const LOCAL: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 1]);
 const PEER: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 20]);
 const OTHER: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 21]);
 const THIRD: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 22]);
+const FOURTH: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 23]);
+const FIFTH: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 24]);
+const SIXTH: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 25]);
 const LOCAL_MAC: MacAddress = MacAddress([2, 0, 0, 0, 0, 1]);
 const PEER_MAC: MacAddress = MacAddress([2, 0, 0, 0, 0, 20]);
 const NEW_MAC: MacAddress = MacAddress([2, 0, 0, 0, 0, 30]);
@@ -195,6 +198,46 @@ fn existing_mapping_merge_precedes_target_and_opcode_and_garp_refreshes() {
 }
 
 #[test]
+fn unknown_opcode_drops_before_merge_without_mutating_cache_or_pending() {
+    let (routes, interfaces, bindings) = base();
+    let s = snapshot(&routes, &interfaces, &[], &bindings);
+    let policy = ResolutionPolicy::with_dynamic_neighbor_ttl(1_000, 2_000, 100).unwrap();
+    let mut states = [ResolutionStateSlot::EMPTY; 2];
+    let mut actions = [ResolutionActionSlot::EMPTY; 2];
+    let mut cache = [DynamicNeighborSlot::EMPTY; 1];
+    let mut rt = runtime!(policy, states, actions, cache);
+    let mut io = SimIo::new();
+
+    io.inject(IFACE, arp(2, PEER, LOCAL, PEER_MAC, PEER_MAC));
+    run(&mut io, &mut rt, &s, 100, 1, &mut VecTrace::default());
+    io.pop_recycled();
+    io.inject(IFACE, ipv4(OTHER));
+    run(&mut io, &mut rt, &s, 100, 1, &mut VecTrace::default());
+    io.pop_recycled();
+
+    let packet = arp(77, PEER, LOCAL, NEW_MAC, NEW_MAC);
+    io.inject(IFACE, packet.clone());
+    let report = run(&mut io, &mut rt, &s, 150, 1, &mut VecTrace::default());
+    assert_eq!((report.dropped, report.consumed), (1, 0));
+    let recycled = io.pop_recycled().unwrap();
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Forwarding(DropReason::ArpOpcodeUnsupported)
+    );
+    assert_eq!(recycled.bytes, packet);
+    assert_eq!((rt.dynamic_neighbor_count(), rt.pending_actions()), (1, 1));
+
+    io.inject(IFACE, ipv4(PEER));
+    run(&mut io, &mut rt, &s, 199, 1, &mut VecTrace::default());
+    assert_eq!(&io.pop_tx().unwrap().bytes[0..6], &PEER_MAC.0);
+    io.inject(IFACE, ipv4(PEER));
+    assert_eq!(
+        run(&mut io, &mut rt, &s, 200, 1, &mut VecTrace::default()).dropped,
+        1
+    );
+}
+
+#[test]
 fn local_request_learns_sha_even_when_ethernet_source_differs_and_probe_does_not() {
     let (routes, interfaces, bindings) = base();
     let s = snapshot(&routes, &interfaces, &[], &bindings);
@@ -283,17 +326,26 @@ fn non_host_sender_protocol_addresses_are_consumed_without_learning() {
         cache
     );
     let mut io = SimIo::new();
-    for sender in [
+    io.inject(IFACE, ipv4(OTHER));
+    run(&mut io, &mut rt, &s, 0, 1, &mut VecTrace::default());
+    io.pop_recycled();
+    let senders = [
+        Ipv4Address::from_octets([0, 0, 0, 1]),
+        Ipv4Address::from_octets([127, 0, 0, 1]),
         Ipv4Address::from_octets([224, 0, 0, 1]),
+        Ipv4Address::from_octets([240, 0, 0, 1]),
         Ipv4Address::from_octets([255; 4]),
+        Ipv4Address::from_octets([192, 0, 2, 0]),
         Ipv4Address::from_octets([192, 0, 2, 255]),
-    ] {
+    ];
+    for sender in senders {
         io.inject(IFACE, arp(2, sender, LOCAL, PEER_MAC, PEER_MAC));
     }
     let mut trace = VecTrace::default();
-    let report = run(&mut io, &mut rt, &s, 0, 3, &mut trace);
-    assert_eq!((report.consumed, report.dropped), (3, 0));
+    let report = run(&mut io, &mut rt, &s, 0, senders.len(), &mut trace);
+    assert_eq!((report.consumed, report.dropped), (senders.len(), 0));
     assert_eq!(rt.dynamic_neighbor_count(), 0);
+    assert_eq!(rt.pending_actions(), 1);
     assert_eq!(
         trace
             .events()
@@ -306,13 +358,92 @@ fn non_host_sender_protocol_addresses_are_consumed_without_learning() {
                 }
             ))
             .count(),
-        3
+        senders.len()
     );
+}
+
+#[test]
+fn point_to_point_prefix_endpoints_are_learnable() {
+    let routes = [
+        Route::new(Ipv4Address::from_octets([198, 51, 100, 0]), 31, IFACE, None).unwrap(),
+        Route::new(Ipv4Address::from_octets([203, 0, 113, 9]), 32, IFACE, None).unwrap(),
+    ];
+    let interfaces = [Interface {
+        id: IFACE,
+        mac: LOCAL_MAC,
+    }];
+    let bindings = [LocalIpv4Binding {
+        interface: IFACE,
+        address: LOCAL,
+    }];
+    let s = snapshot(&routes, &interfaces, &[], &bindings);
+    let mut states = [ResolutionStateSlot::EMPTY; 2];
+    let mut actions = [ResolutionActionSlot::EMPTY; 2];
+    let mut cache = [DynamicNeighborSlot::EMPTY; 2];
+    let mut rt = runtime!(
+        ResolutionPolicy::new(1_000, 2_000).unwrap(),
+        states,
+        actions,
+        cache
+    );
+    let mut io = SimIo::new();
+    for sender in [
+        Ipv4Address::from_octets([198, 51, 100, 0]),
+        Ipv4Address::from_octets([203, 0, 113, 9]),
+    ] {
+        io.inject(IFACE, arp(2, sender, LOCAL, PEER_MAC, PEER_MAC));
+    }
+    let report = run(&mut io, &mut rt, &s, 0, 2, &mut VecTrace::default());
+    assert_eq!((report.consumed, report.dropped), (2, 0));
+    assert_eq!(rt.dynamic_neighbor_count(), 2);
+}
+
+#[test]
+fn local_address_value_on_another_interface_is_learnable_on_ingress() {
+    let (routes, _, _) = base();
+    let interfaces = [
+        Interface {
+            id: IFACE,
+            mac: LOCAL_MAC,
+        },
+        Interface {
+            id: IfId(2),
+            mac: NEW_MAC,
+        },
+    ];
+    let bindings = [
+        LocalIpv4Binding {
+            interface: IFACE,
+            address: LOCAL,
+        },
+        LocalIpv4Binding {
+            interface: IfId(2),
+            address: PEER,
+        },
+    ];
+    let s = snapshot(&routes, &interfaces, &[], &bindings);
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut cache = [DynamicNeighborSlot::EMPTY; 1];
+    let mut rt = runtime!(
+        ResolutionPolicy::new(1_000, 2_000).unwrap(),
+        states,
+        actions,
+        cache
+    );
+    let mut io = SimIo::new();
+    io.inject(IFACE, arp(2, PEER, LOCAL, PEER_MAC, PEER_MAC));
+    run(&mut io, &mut rt, &s, 0, 1, &mut VecTrace::default());
+    assert_eq!(rt.dynamic_neighbor_count(), 1);
+    io.inject(IFACE, ipv4(PEER));
+    run(&mut io, &mut rt, &s, 0, 1, &mut VecTrace::default());
+    assert_eq!(&io.pop_tx().unwrap().bytes[0..6], &PEER_MAC.0);
 }
 
 #[test]
 fn foreign_local_spa_cannot_poison_and_static_mapping_has_priority() {
     let (routes, interfaces, bindings) = base();
+    let dynamic = snapshot(&routes, &interfaces, &[], &bindings);
     let static_mac = MacAddress([2, 7, 7, 7, 7, 7]);
     let neighbor = Neighbor {
         interface: IFACE,
@@ -320,7 +451,7 @@ fn foreign_local_spa_cannot_poison_and_static_mapping_has_priority() {
         mac: static_mac,
     };
     let neighbors = [neighbor];
-    let s = snapshot(&routes, &interfaces, &neighbors, &bindings);
+    let with_static = snapshot(&routes, &interfaces, &neighbors, &bindings);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut cache = [DynamicNeighborSlot::EMPTY; 1];
@@ -333,13 +464,16 @@ fn foreign_local_spa_cannot_poison_and_static_mapping_has_priority() {
     let mut io = SimIo::new();
     io.inject(IFACE, arp(1, LOCAL, LOCAL, NEW_MAC, NEW_MAC));
     assert_eq!(
-        run(&mut io, &mut rt, &s, 0, 1, &mut VecTrace::default()).tx_requested,
+        run(&mut io, &mut rt, &dynamic, 0, 1, &mut VecTrace::default()).tx_requested,
         1
     );
     io.pop_tx();
+    io.inject(IFACE, arp(2, PEER, LOCAL, PEER_MAC, PEER_MAC));
+    run(&mut io, &mut rt, &dynamic, 0, 1, &mut VecTrace::default());
+    assert_eq!(rt.dynamic_neighbor_count(), 1);
     io.inject(IFACE, arp(2, PEER, LOCAL, NEW_MAC, NEW_MAC));
     let mut trace = VecTrace::default();
-    let static_reply = run(&mut io, &mut rt, &s, 0, 1, &mut trace);
+    let static_reply = run(&mut io, &mut rt, &with_static, 0, 1, &mut trace);
     assert_eq!((static_reply.consumed, static_reply.dropped), (1, 0));
     assert!(trace.events().iter().any(|event| matches!(
         event,
@@ -350,7 +484,29 @@ fn foreign_local_spa_cannot_poison_and_static_mapping_has_priority() {
     )));
     assert_eq!(rt.dynamic_neighbor_count(), 0);
     io.inject(IFACE, ipv4(PEER));
-    run(&mut io, &mut rt, &s, 0, 1, &mut VecTrace::default());
+    run(&mut io, &mut rt, &dynamic, 0, 1, &mut VecTrace::default());
+    io.pop_recycled();
+    assert_eq!(rt.pending_actions(), 1);
+    io.inject(IFACE, arp(2, PEER, LOCAL, NEW_MAC, NEW_MAC));
+    run(
+        &mut io,
+        &mut rt,
+        &with_static,
+        0,
+        1,
+        &mut VecTrace::default(),
+    );
+    io.pop_recycled();
+    assert_eq!(rt.pending_actions(), 0);
+    io.inject(IFACE, ipv4(PEER));
+    run(
+        &mut io,
+        &mut rt,
+        &with_static,
+        0,
+        1,
+        &mut VecTrace::default(),
+    );
     assert_eq!(&io.pop_tx().unwrap().bytes[0..6], &static_mac.0);
 }
 
@@ -490,6 +646,121 @@ fn reply_before_generated_execution_cancels_only_matching_fifo_action() {
         .unwrap()
         .unwrap();
     assert_eq!(io.pop_tx().unwrap().egress, second_if);
+}
+
+#[test]
+fn reconcile_static_clears_stale_cache_and_wrapped_middle_action_fifo() {
+    let (routes, interfaces, bindings) = base();
+    let dynamic = snapshot(&routes, &interfaces, &[], &bindings);
+    let second_if = IfId(2);
+    let second_routes =
+        [Route::new(PEER, 32, second_if, None).expect("canonical host route is valid")];
+    let second_interfaces = [Interface {
+        id: second_if,
+        mac: NEW_MAC,
+    }];
+    let second_bindings = [LocalIpv4Binding {
+        interface: second_if,
+        address: Ipv4Address::from_octets([198, 51, 100, 2]),
+    }];
+    let second = snapshot(&second_routes, &second_interfaces, &[], &second_bindings);
+    let static_mac = MacAddress([2, 7, 7, 7, 7, 7]);
+    let neighbors = [
+        Neighbor {
+            interface: IFACE,
+            target: PEER,
+            mac: static_mac,
+        },
+        Neighbor {
+            interface: IFACE,
+            target: THIRD,
+            mac: MacAddress([2, 7, 7, 7, 7, 8]),
+        },
+    ];
+    let with_static = snapshot(&routes, &interfaces, &neighbors, &bindings);
+    let mut states = [ResolutionStateSlot::EMPTY; 4];
+    let mut actions = [ResolutionActionSlot::EMPTY; 3];
+    let mut cache = [DynamicNeighborSlot::EMPTY; 1];
+    let mut rt = runtime!(
+        ResolutionPolicy::new(1_000, 2_000).unwrap(),
+        states,
+        actions,
+        cache
+    );
+    let mut io = SimIo::new();
+
+    io.inject(IFACE, arp(2, PEER, LOCAL, PEER_MAC, PEER_MAC));
+    run(&mut io, &mut rt, &dynamic, 0, 1, &mut VecTrace::default());
+    io.pop_recycled();
+    for target in [OTHER, THIRD, FOURTH] {
+        io.inject(IFACE, ipv4(target));
+    }
+    run(&mut io, &mut rt, &dynamic, 0, 3, &mut VecTrace::default());
+    assert_eq!(rt.pending_actions(), 3);
+    for _ in 0..3 {
+        io.pop_recycled();
+    }
+    execute_one_arp_request(&mut io, &mut rt, MonotonicMillis(0), &mut NoGeneratedTrace)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        &io.pop_tx().unwrap().bytes[38..42],
+        &OTHER.octets(),
+        "advance the ring head before wrapping the tail"
+    );
+    io.inject(second_if, ipv4(PEER));
+    run(&mut io, &mut rt, &second, 0, 1, &mut VecTrace::default());
+    io.pop_recycled();
+    assert_eq!(rt.pending_actions(), 3);
+
+    let report = rt.reconcile_static(&neighbors);
+    assert_eq!(
+        (
+            report.dynamic_removed,
+            report.states_removed,
+            report.actions_removed
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(rt.pending_actions(), 2);
+    io.inject(IFACE, ipv4(FIFTH));
+    run(&mut io, &mut rt, &dynamic, 0, 1, &mut VecTrace::default());
+    io.pop_recycled();
+    assert_eq!(rt.pending_actions(), 3, "removed capacity is reusable");
+
+    for (expected_egress, expected_target) in [(IFACE, FOURTH), (second_if, PEER), (IFACE, FIFTH)] {
+        execute_one_arp_request(&mut io, &mut rt, MonotonicMillis(0), &mut NoGeneratedTrace)
+            .unwrap()
+            .unwrap();
+        let request = io.pop_tx().unwrap();
+        assert_eq!(request.egress, expected_egress);
+        assert_eq!(&request.bytes[38..42], &expected_target.octets());
+    }
+
+    io.inject(IFACE, ipv4(PEER));
+    run(
+        &mut io,
+        &mut rt,
+        &with_static,
+        1,
+        1,
+        &mut VecTrace::default(),
+    );
+    assert_eq!(&io.pop_tx().unwrap().bytes[0..6], &static_mac.0);
+    io.inject(IFACE, arp(2, SIXTH, LOCAL, NEW_MAC, NEW_MAC));
+    run(
+        &mut io,
+        &mut rt,
+        &with_static,
+        1,
+        1,
+        &mut VecTrace::default(),
+    );
+    assert_eq!(
+        rt.dynamic_neighbor_count(),
+        1,
+        "reconcile freed the sole dynamic slot"
+    );
 }
 
 #[test]

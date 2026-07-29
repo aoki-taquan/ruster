@@ -18,6 +18,10 @@ leaseを未完了のままdropした場合、coreのRAII実装が`LeaseAbandoned
 leaseしていないslotはRX backendの所有下に残ります。coreからUMEM、mbuf、simの`Vec`
 は見えません。
 
+`consume`はforwarding上の論理終端です。backendはそのRX bufferを物理的にはrecycleし、
+simの`BatchCompletion.recycled`にはdropとconsumeの両方を数えます。両者の区別は
+`BatchReport.consumed`、typed `RecycleCause`、terminal traceで保持します。
+
 `receive`はbackend固有errorを返せます。`finish`はerror時にも失われないcompletionを
 必ず返し、TX requested/accepted/rejectedを分けます。常に
 `accepted + rejected == requested`で、reject slotはbackendがreturn前にrecycle/free
@@ -92,6 +96,12 @@ exact boundaryではlazy expiryして転送に使いません。insert時もempt
 reuseし、liveな別keyをevictしません。既存keyのMAC/refresh時刻更新は追加capacity不要です。
 periodic scanはなく、lookup/insert時のbounded linear lazy maintenanceです。
 
+control planeがstatic neighbor snapshotを公開する同じworker tickでは、次のpacketを処理
+する前に、そのsnapshotのneighbor sliceを`ResolutionRuntime::reconcile_static`へ渡します。
+これによりstatic keyと一致するdynamic slot、resolution state、queued actionを削除し、
+wrapped action ringのunrelated FIFOを維持します。static公開後に同keyのARPを受けた場合も
+merge pathが同じcleanupを行います。
+
 同じkeyのactionは一つだけqueueできます。抑制deadlineはenqueue時でなく、generated
 leaseをcommitしてTX requestedになった注入時刻から開始します。allocation/build失敗時は
 actionを保持しdeadlineを開始しません。backendのpartial rejectでもcommit済みなので
@@ -127,10 +137,12 @@ v0.2 bootstrapはEthernet II上のIPv4 datagramを転送します。
 ## ARP control scope
 
 Ethernet II / IPv4 profile（HTYPE 1、PTYPE 0x0800、HLEN 6、PLEN 4）のRequest/Replyを
-扱います。RFC 826の順序どおり、valid senderの既存dynamic entryはTPA/opcode非依存で
-mergeし、entryが無い場合はTPAがingress localのときだけinsertします。その後local
+扱います。RFC 826の順序どおり、supported opcodeかつvalid senderの既存dynamic entryは
+TPA非依存でmergeし、entryが無い場合はTPAがingress localのときだけinsertします。その後local
 Requestは同じRX bufferをReplyへ書き換えてingressへcommitし、Replyとnonlocal Requestは
 byte不変でlocal consumeします。`received == tx_requested + dropped + consumed`です。
+unknown opcodeはhardening deviationとしてprofile validationでdropし、既存entryの
+MAC/refresh時刻やpending resolutionを変更しません。
 
 - Ethernet destinationとTHAはrequest SHA、Ethernet sourceとSHAはlocal interface MAC。
 - SPAはrequest TPA、TPAはrequest SPA。ARP ProbeのSPA `0.0.0.0`にもTPA zeroでreplyする。
@@ -140,16 +152,21 @@ byte不変でlocal consumeします。`received == tx_requested + dropped + cons
 - 42 byte以後はpadding/tailとして長さと内容を保存する。
 - static mappingはdynamicより常に優先し、ARPで上書きもdynamic slot消費もしないlocal policy。
 - zero/broadcast/multicast SHAはRFC 1812 group-address prohibitionとlocal zero policyにより
-  stable security reasonでdropする。SPA multicast/limited/directed broadcastはconsumeするが
-  学習しない。
+  stable security reasonでdropする。RFC 1122 §3.2.1.3とlocal safety policyにより、SPAの
+  `0/8`（exact zeroはProbe）、`127/8`、multicast、`240/4`、limited broadcast、connected
+  `/0`から`/30`のnetwork/directed broadcast addressはconsumeするが学習しない。`/31`と
+  `/32`にはnetwork/broadcast endpoint除外を適用しない。
+- local SPA claimの保護はlink scopedで、`(ingress IfId, SPA)`がlocal bindingと一致する場合
+  だけ学習しない。同じIPv4値が別interfaceのlocal bindingでも、ingress上では通常peerとして
+  学習できる。
 - 学習成功時だけmatching resolution state/actionをcancelし、unrelated FIFOを維持する。
 
 Reply admissionへsolicited-only制約は追加しません。`ArpReplyUnsupported`と
 `ArpTargetNotLocal`のstable reason番号は互換性のためretired/reservedとして維持します。
 
-RFC 5227 §2.4のaddress conflict detection/defenseは未実装です。foreign SHAがlocal SPAを
-名乗り、同じlocal addressをTPAにしたrequestも通常requestとしてdirected replyするだけで、
-conflict状態やdefensive announcementを生成しません。正常なlocal target requestを
+RFC 5227 §2.4のaddress conflict detection/defenseは未実装です。foreign SHAが同じingressの
+local SPAを名乗り、そのlocal addressをTPAにしたrequestも通常requestとしてdirected reply
+するだけで、conflict状態やdefensive announcementを生成しません。正常なlocal target requestを
 追加policyでdropしないことを優先した明示deviationです。
 
 eager cache scan/flush、timer retry、unresolved packet hold queue、gratuitous ARP生成、
