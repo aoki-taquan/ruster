@@ -15,6 +15,7 @@ pub enum ResolutionPolicyError {
     IntervalTooShort,
     StateTtlTooShort,
     DynamicNeighborTtlZero,
+    MaxAttemptsZero,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +23,7 @@ pub struct ResolutionPolicy {
     interval_ms: u64,
     state_ttl_ms: u64,
     dynamic_neighbor_ttl_ms: u64,
+    max_attempts: u16,
 }
 
 impl ResolutionPolicy {
@@ -36,7 +38,21 @@ impl ResolutionPolicy {
             interval_ms,
             state_ttl_ms,
             dynamic_neighbor_ttl_ms: 60_000,
+            max_attempts: 3,
         })
+    }
+
+    pub fn with_retry(
+        interval_ms: u64,
+        state_ttl_ms: u64,
+        max_attempts: u16,
+    ) -> Result<Self, ResolutionPolicyError> {
+        if max_attempts == 0 {
+            return Err(ResolutionPolicyError::MaxAttemptsZero);
+        }
+        let mut policy = Self::new(interval_ms, state_ttl_ms)?;
+        policy.max_attempts = max_attempts;
+        Ok(policy)
     }
 
     pub fn with_dynamic_neighbor_ttl(
@@ -50,6 +66,40 @@ impl ResolutionPolicy {
         }
         policy.dynamic_neighbor_ttl_ms = dynamic_neighbor_ttl_ms;
         Ok(policy)
+    }
+
+    pub fn with_retry_and_dynamic_neighbor_ttl(
+        interval_ms: u64,
+        state_ttl_ms: u64,
+        max_attempts: u16,
+        dynamic_neighbor_ttl_ms: u64,
+    ) -> Result<Self, ResolutionPolicyError> {
+        let mut policy = Self::with_retry(interval_ms, state_ttl_ms, max_attempts)?;
+        if dynamic_neighbor_ttl_ms == 0 {
+            return Err(ResolutionPolicyError::DynamicNeighborTtlZero);
+        }
+        policy.dynamic_neighbor_ttl_ms = dynamic_neighbor_ttl_ms;
+        Ok(policy)
+    }
+
+    #[must_use]
+    pub const fn interval_ms(self) -> u64 {
+        self.interval_ms
+    }
+
+    #[must_use]
+    pub const fn failed_hold_ms(self) -> u64 {
+        self.state_ttl_ms
+    }
+
+    #[must_use]
+    pub const fn max_attempts(self) -> u16 {
+        self.max_attempts
+    }
+
+    #[must_use]
+    pub const fn dynamic_neighbor_ttl_ms(self) -> u64 {
+        self.dynamic_neighbor_ttl_ms
     }
 }
 
@@ -74,6 +124,14 @@ struct QueuedAction {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolutionPhase {
+    InitialQueued,
+    Waiting,
+    RetryQueued,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolutionActionSlot(Option<QueuedAction>);
 
 impl ResolutionActionSlot {
@@ -83,11 +141,14 @@ impl ResolutionActionSlot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolutionStateSlot {
     key: ResolutionKey,
+    action: ArpRequestAction,
     generation: u64,
+    attempts: u16,
     requested_at: MonotonicMillis,
+    failed_at: MonotonicMillis,
     occupied: bool,
-    action_queued: bool,
-    has_requested: bool,
+    phase: ResolutionPhase,
+    failure_notified: bool,
 }
 
 impl ResolutionStateSlot {
@@ -96,11 +157,19 @@ impl ResolutionStateSlot {
             egress: IfId(0),
             target: Ipv4Address::from_octets([0; 4]),
         },
+        action: ArpRequestAction {
+            egress: IfId(0),
+            source_mac: MacAddress([0; 6]),
+            source_ip: Ipv4Address::from_octets([0; 4]),
+            target_ip: Ipv4Address::from_octets([0; 4]),
+        },
         generation: 0,
+        attempts: 0,
         requested_at: MonotonicMillis(0),
+        failed_at: MonotonicMillis(0),
         occupied: false,
-        action_queued: false,
-        has_requested: false,
+        phase: ResolutionPhase::InitialQueued,
+        failure_notified: false,
     };
 }
 
@@ -148,16 +217,31 @@ pub struct StaticReconcileReport {
     pub dynamic_removed: usize,
     pub states_removed: usize,
     pub actions_removed: usize,
+    pub invalid_states_removed: usize,
+    pub invalid_actions_removed: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolutionResult {
     Queued,
+    RetryQueued,
     Suppressed,
+    TimedOut,
+    Failed,
     StateFull,
     ActionFull,
     ClockRegression,
     ForbiddenTarget,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolutionStatus {
+    pub phase: ResolutionPhase,
+    pub attempts: u16,
+    pub generation: u64,
+    pub requested_at: Option<MonotonicMillis>,
+    pub failed_at: Option<MonotonicMillis>,
+    pub terminal_notified: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -169,6 +253,67 @@ pub struct ResolutionCounters {
     pub clock_regressions: usize,
     pub forbidden_target: usize,
     pub dequeued: usize,
+    pub retry_queued: usize,
+    pub attempts_committed: usize,
+    pub timed_out: usize,
+    pub failed_hits: usize,
+    pub failures_expired: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResolutionTimerReport {
+    pub scanned: usize,
+    pub retries_queued: usize,
+    pub timed_out: usize,
+    pub failures_expired: usize,
+    pub action_full: usize,
+    pub deferred_due: usize,
+    pub pending: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolutionTimerError {
+    ClockRegression,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolutionTimerTrace {
+    RetryQueued {
+        egress: IfId,
+        target: Ipv4Address,
+        attempts: u16,
+        generation: u64,
+    },
+    TimedOut {
+        egress: IfId,
+        target: Ipv4Address,
+        attempts: u16,
+        generation: u64,
+    },
+    FailureExpired {
+        egress: IfId,
+        target: Ipv4Address,
+        generation: u64,
+    },
+    ActionFull {
+        egress: IfId,
+        target: Ipv4Address,
+        attempts: u16,
+        generation: u64,
+    },
+    ClockRegression,
+}
+
+pub trait ResolutionTimerTraceSink {
+    fn record_resolution_timer(&mut self, event: ResolutionTimerTrace);
+}
+
+#[derive(Default)]
+pub struct NoResolutionTimerTrace;
+
+impl ResolutionTimerTraceSink for NoResolutionTimerTrace {
+    #[inline]
+    fn record_resolution_timer(&mut self, _event: ResolutionTimerTrace) {}
 }
 
 /// Caller-backed worker-local resolution state.
@@ -189,6 +334,7 @@ pub struct ResolutionRuntime<'a> {
     dynamic_neighbors: &'a mut [DynamicNeighborSlot],
     head: usize,
     len: usize,
+    poll_cursor: usize,
     last_now: Option<MonotonicMillis>,
     counters: ResolutionCounters,
     _worker_local: PhantomData<Rc<()>>,
@@ -221,6 +367,7 @@ impl<'a> ResolutionRuntime<'a> {
             dynamic_neighbors,
             head: 0,
             len: 0,
+            poll_cursor: 0,
             last_now: None,
             counters: ResolutionCounters::default(),
             _worker_local: PhantomData,
@@ -258,7 +405,7 @@ impl<'a> ResolutionRuntime<'a> {
                     neighbor.interface == state.key.egress && neighbor.target == state.key.target
                 })
             {
-                *state = ResolutionStateSlot::EMPTY;
+                vacate_state(state);
                 report.states_removed += 1;
             }
         }
@@ -267,6 +414,63 @@ impl<'a> ResolutionRuntime<'a> {
                 neighbor.interface == action.egress && neighbor.target == action.target_ip
             })
         });
+        report
+    }
+
+    /// Reconciles resolution authority with a newly published snapshot.
+    ///
+    /// The owner must publish the snapshot and call this method on the same
+    /// worker tick, before timer polling or packet processing. Static
+    /// resolution and changed/removed interface, binding, route, or target
+    /// authority cancel matching states and actions atomically.
+    pub fn reconcile_publication(
+        &mut self,
+        snapshot: &crate::ForwardingSnapshot<'_>,
+    ) -> StaticReconcileReport {
+        let mut report = StaticReconcileReport::default();
+        for slot in &mut *self.dynamic_neighbors {
+            if slot.occupied
+                && snapshot.neighbors.iter().any(|neighbor| {
+                    neighbor.interface == slot.interface && neighbor.target == slot.target
+                })
+            {
+                *slot = DynamicNeighborSlot::EMPTY;
+                report.dynamic_removed += 1;
+            }
+        }
+        for state in &mut *self.states {
+            if !state.occupied {
+                continue;
+            }
+            match snapshot.resolution_action_authority(state.action) {
+                crate::forwarding::ResolutionActionAuthority::Valid => {}
+                crate::forwarding::ResolutionActionAuthority::StaticResolved => {
+                    vacate_state(state);
+                    report.states_removed += 1;
+                }
+                crate::forwarding::ResolutionActionAuthority::Invalid => {
+                    vacate_state(state);
+                    report.invalid_states_removed += 1;
+                }
+            }
+        }
+        let mut static_removed = 0;
+        let mut invalid_removed = 0;
+        self.compact_queued_actions(|queued| {
+            match snapshot.resolution_action_authority(queued.action) {
+                crate::forwarding::ResolutionActionAuthority::Valid => false,
+                crate::forwarding::ResolutionActionAuthority::StaticResolved => {
+                    static_removed += 1;
+                    true
+                }
+                crate::forwarding::ResolutionActionAuthority::Invalid => {
+                    invalid_removed += 1;
+                    true
+                }
+            }
+        });
+        report.actions_removed = static_removed;
+        report.invalid_actions_removed = invalid_removed;
         report
     }
 
@@ -280,16 +484,38 @@ impl<'a> ResolutionRuntime<'a> {
         self.len
     }
 
+    #[must_use]
+    pub fn pending_states(&self) -> usize {
+        self.states.iter().filter(|state| state.occupied).count()
+    }
+
+    #[must_use]
+    pub fn status(&self, egress: IfId, target: Ipv4Address) -> Option<ResolutionStatus> {
+        self.states
+            .iter()
+            .find(|state| {
+                state.occupied && state.key.egress == egress && state.key.target == target
+            })
+            .map(|state| ResolutionStatus {
+                phase: state.phase,
+                attempts: state.attempts,
+                generation: state.generation,
+                requested_at: (state.attempts != 0).then_some(state.requested_at),
+                failed_at: (state.phase == ResolutionPhase::Failed).then_some(state.failed_at),
+                terminal_notified: state.failure_notified,
+            })
+    }
+
     pub(crate) fn schedule(
         &mut self,
         action: ArpRequestAction,
         now: MonotonicMillis,
-        directed_broadcast: bool,
+        forbidden_by_snapshot: bool,
     ) -> ResolutionResult {
         if !self.observe_now(now) {
             return ResolutionResult::ClockRegression;
         }
-        if directed_broadcast
+        if forbidden_by_snapshot
             || action.target_ip == action.source_ip
             || forbidden_target(action.target_ip)
         {
@@ -305,22 +531,42 @@ impl<'a> ResolutionRuntime<'a> {
             .iter()
             .position(|slot| slot.occupied && slot.key == key);
         if let Some(index) = existing {
-            let state = &self.states[index];
-            if state.action_queued
-                || (state.has_requested
-                    && now.0.saturating_sub(state.requested_at.0) < self.policy.interval_ms)
-            {
-                self.counters.suppressed += 1;
-                return ResolutionResult::Suppressed;
+            match self.states[index].phase {
+                ResolutionPhase::InitialQueued | ResolutionPhase::RetryQueued => {
+                    self.counters.suppressed += 1;
+                    return ResolutionResult::Suppressed;
+                }
+                ResolutionPhase::Waiting => {
+                    if now.0 - self.states[index].requested_at.0 < self.policy.interval_ms {
+                        self.counters.suppressed += 1;
+                        return ResolutionResult::Suppressed;
+                    }
+                    if self.states[index].attempts >= self.policy.max_attempts {
+                        return self.mark_failed(index, now);
+                    }
+                    if self.len == self.actions.len() {
+                        self.counters.action_full += 1;
+                        return ResolutionResult::ActionFull;
+                    }
+                    self.states[index].action = action;
+                    return self.enqueue_retry(index);
+                }
+                ResolutionPhase::Failed => {
+                    if now.0 - self.states[index].failed_at.0 < self.policy.state_ttl_ms {
+                        self.counters.failed_hits += 1;
+                        return ResolutionResult::Failed;
+                    }
+                    if self.len == self.actions.len() {
+                        self.counters.action_full += 1;
+                        return ResolutionResult::ActionFull;
+                    }
+                    self.counters.failures_expired += 1;
+                    self.start_cycle(index, action);
+                    return self.enqueue_initial(index);
+                }
             }
-            return self.enqueue_at(index, action);
         }
-        let reusable = self.states.iter().position(|slot| {
-            !slot.occupied
-                || (!slot.action_queued
-                    && slot.has_requested
-                    && now.0.saturating_sub(slot.requested_at.0) >= self.policy.state_ttl_ms)
-        });
+        let reusable = self.states.iter().position(|slot| !slot.occupied);
         let Some(index) = reusable else {
             self.counters.state_full += 1;
             return ResolutionResult::StateFull;
@@ -329,15 +575,9 @@ impl<'a> ResolutionRuntime<'a> {
             self.counters.action_full += 1;
             return ResolutionResult::ActionFull;
         }
-        self.states[index] = ResolutionStateSlot {
-            key,
-            generation: self.states[index].generation.wrapping_add(1),
-            requested_at: MonotonicMillis(0),
-            occupied: true,
-            action_queued: false,
-            has_requested: false,
-        };
-        self.enqueue_at(index, action)
+        self.start_cycle(index, action);
+        debug_assert_eq!(self.states[index].key, key);
+        self.enqueue_initial(index)
     }
 
     pub(crate) fn lookup_dynamic(
@@ -431,7 +671,7 @@ impl<'a> ResolutionRuntime<'a> {
     fn clear_resolution(&mut self, interface: IfId, target: Ipv4Address) {
         for state in &mut *self.states {
             if state.occupied && state.key.egress == interface && state.key.target == target {
-                *state = ResolutionStateSlot::EMPTY;
+                vacate_state(state);
             }
         }
         self.compact_actions(|action| action.egress == interface && action.target_ip == target);
@@ -447,6 +687,10 @@ impl<'a> ResolutionRuntime<'a> {
     }
 
     fn compact_actions(&mut self, remove: impl Fn(ArpRequestAction) -> bool) -> usize {
+        self.compact_queued_actions(|queued| remove(queued.action))
+    }
+
+    fn compact_queued_actions(&mut self, mut remove: impl FnMut(QueuedAction) -> bool) -> usize {
         if self.actions.is_empty() {
             return 0;
         }
@@ -455,7 +699,7 @@ impl<'a> ResolutionRuntime<'a> {
         for read in 0..old_len {
             let read_index = (self.head + read) % self.actions.len();
             let queued = self.actions[read_index].0.take().expect("queued action");
-            if remove(queued.action) {
+            if remove(queued) {
                 continue;
             }
             let write_index = (self.head + retained) % self.actions.len();
@@ -466,19 +710,61 @@ impl<'a> ResolutionRuntime<'a> {
         old_len - retained
     }
 
-    fn enqueue_at(&mut self, index: usize, action: ArpRequestAction) -> ResolutionResult {
+    fn start_cycle(&mut self, index: usize, action: ArpRequestAction) {
+        let generation = self.states[index].generation.wrapping_add(1);
+        self.states[index] = ResolutionStateSlot {
+            key: ResolutionKey {
+                egress: action.egress,
+                target: action.target_ip,
+            },
+            action,
+            generation,
+            attempts: 0,
+            requested_at: MonotonicMillis(0),
+            failed_at: MonotonicMillis(0),
+            occupied: true,
+            phase: ResolutionPhase::InitialQueued,
+            failure_notified: false,
+        };
+    }
+
+    fn enqueue_initial(&mut self, index: usize) -> ResolutionResult {
+        debug_assert_eq!(self.states[index].attempts, 0);
+        debug_assert_eq!(self.states[index].phase, ResolutionPhase::InitialQueued);
+        self.enqueue_state_action(index);
+        self.counters.queued += 1;
+        ResolutionResult::Queued
+    }
+
+    fn enqueue_retry(&mut self, index: usize) -> ResolutionResult {
         if self.len == self.actions.len() {
             self.counters.action_full += 1;
             return ResolutionResult::ActionFull;
         }
-        let generation = self.states[index].generation.wrapping_add(1);
+        self.states[index].phase = ResolutionPhase::RetryQueued;
+        self.enqueue_state_action(index);
+        self.counters.queued += 1;
+        self.counters.retry_queued += 1;
+        ResolutionResult::RetryQueued
+    }
+
+    fn enqueue_state_action(&mut self, index: usize) {
+        debug_assert!(self.len < self.actions.len());
+        let action = self.states[index].action;
+        let generation = self.states[index].generation;
         let tail = (self.head + self.len) % self.actions.len();
         self.actions[tail].0 = Some(QueuedAction { action, generation });
-        self.states[index].generation = generation;
-        self.states[index].action_queued = true;
         self.len += 1;
-        self.counters.queued += 1;
-        ResolutionResult::Queued
+    }
+
+    fn mark_failed(&mut self, index: usize, now: MonotonicMillis) -> ResolutionResult {
+        debug_assert_eq!(self.states[index].phase, ResolutionPhase::Waiting);
+        debug_assert!(self.states[index].attempts >= self.policy.max_attempts);
+        self.states[index].phase = ResolutionPhase::Failed;
+        self.states[index].failed_at = now;
+        self.states[index].failure_notified = true;
+        self.counters.timed_out += 1;
+        ResolutionResult::TimedOut
     }
 
     fn front(&self) -> Option<QueuedAction> {
@@ -504,16 +790,120 @@ impl<'a> ResolutionRuntime<'a> {
                 && state.key.target == queued.action.target_ip
                 && state.generation == queued.generation
         }) {
-            state.action_queued = false;
-            state.has_requested = true;
+            debug_assert!(matches!(
+                state.phase,
+                ResolutionPhase::InitialQueued | ResolutionPhase::RetryQueued
+            ));
+            debug_assert!(state.attempts < self.policy.max_attempts);
+            state.attempts += 1;
+            state.phase = ResolutionPhase::Waiting;
             state.requested_at = now;
+            self.counters.attempts_committed += 1;
         }
     }
+
+    fn poll_timers<T: ResolutionTimerTraceSink>(
+        &mut self,
+        now: MonotonicMillis,
+        scan_budget: usize,
+        trace: &mut T,
+    ) -> Result<ResolutionTimerReport, ResolutionTimerError> {
+        if !self.observe_now(now) {
+            trace.record_resolution_timer(ResolutionTimerTrace::ClockRegression);
+            return Err(ResolutionTimerError::ClockRegression);
+        }
+        let mut report = ResolutionTimerReport::default();
+        if self.states.is_empty() || scan_budget == 0 {
+            report.pending = self.pending_states();
+            return Ok(report);
+        }
+        let scans = scan_budget.min(self.states.len());
+        for _ in 0..scans {
+            let index = self.poll_cursor;
+            self.poll_cursor = (self.poll_cursor + 1) % self.states.len();
+            report.scanned += 1;
+            if !self.states[index].occupied {
+                continue;
+            }
+            match self.states[index].phase {
+                ResolutionPhase::InitialQueued | ResolutionPhase::RetryQueued => {}
+                ResolutionPhase::Waiting => {
+                    if now.0 - self.states[index].requested_at.0 < self.policy.interval_ms {
+                        continue;
+                    }
+                    if self.states[index].attempts >= self.policy.max_attempts {
+                        let state = self.states[index];
+                        self.mark_failed(index, now);
+                        report.timed_out += 1;
+                        trace.record_resolution_timer(ResolutionTimerTrace::TimedOut {
+                            egress: state.key.egress,
+                            target: state.key.target,
+                            attempts: state.attempts,
+                            generation: state.generation,
+                        });
+                    } else if self.len == self.actions.len() {
+                        let state = self.states[index];
+                        self.counters.action_full += 1;
+                        report.action_full += 1;
+                        report.deferred_due += 1;
+                        trace.record_resolution_timer(ResolutionTimerTrace::ActionFull {
+                            egress: state.key.egress,
+                            target: state.key.target,
+                            attempts: state.attempts,
+                            generation: state.generation,
+                        });
+                    } else {
+                        let state = self.states[index];
+                        let result = self.enqueue_retry(index);
+                        debug_assert_eq!(result, ResolutionResult::RetryQueued);
+                        report.retries_queued += 1;
+                        trace.record_resolution_timer(ResolutionTimerTrace::RetryQueued {
+                            egress: state.key.egress,
+                            target: state.key.target,
+                            attempts: state.attempts,
+                            generation: state.generation,
+                        });
+                    }
+                }
+                ResolutionPhase::Failed => {
+                    if now.0 - self.states[index].failed_at.0 >= self.policy.state_ttl_ms {
+                        let state = self.states[index];
+                        vacate_state(&mut self.states[index]);
+                        self.counters.failures_expired += 1;
+                        report.failures_expired += 1;
+                        trace.record_resolution_timer(ResolutionTimerTrace::FailureExpired {
+                            egress: state.key.egress,
+                            target: state.key.target,
+                            generation: state.generation,
+                        });
+                    }
+                }
+            }
+        }
+        report.pending = self.pending_states();
+        Ok(report)
+    }
+}
+
+fn vacate_state(state: &mut ResolutionStateSlot) {
+    let generation = state.generation;
+    *state = ResolutionStateSlot::EMPTY;
+    state.generation = generation;
+}
+
+/// Advances bounded ARP retry/timeout state without performing packet I/O.
+pub fn poll_resolution_timers<T: ResolutionTimerTraceSink>(
+    runtime: &mut ResolutionRuntime<'_>,
+    now: MonotonicMillis,
+    scan_budget: usize,
+    trace: &mut T,
+) -> Result<ResolutionTimerReport, ResolutionTimerError> {
+    runtime.poll_timers(now, scan_budget, trace)
 }
 
 fn forbidden_target(target: Ipv4Address) -> bool {
     let octets = target.octets();
-    octets == [0, 0, 0, 0] || octets == [255; 4] || (octets[0] & 0xf0) == 0xe0
+    octets[0] == 0 || octets[0] == 127 || octets[0] >= 224 || octets == [255; 4]
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -642,4 +1032,501 @@ fn build_arp_request(frame: &mut [u8], action: ArpRequestAction) {
     frame[22..28].copy_from_slice(&action.source_mac.0);
     frame[28..32].copy_from_slice(&action.source_ip.octets());
     frame[38..42].copy_from_slice(&action.target_ip.octets());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ForwardingSnapshot, Interface, LocalIpv4Binding, Neighbor, Route};
+
+    const WAN: IfId = IfId(2);
+    const SOURCE_IP: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 1]);
+    const SOURCE_MAC: MacAddress = MacAddress([2, 0, 0, 0, 0, 1]);
+
+    fn target(last: u8) -> Ipv4Address {
+        Ipv4Address::from_octets([192, 0, 2, last])
+    }
+
+    fn action(last: u8) -> ArpRequestAction {
+        ArpRequestAction {
+            egress: WAN,
+            source_mac: SOURCE_MAC,
+            source_ip: SOURCE_IP,
+            target_ip: target(last),
+        }
+    }
+
+    fn commit_front(runtime: &mut ResolutionRuntime<'_>, now: u64) {
+        let queued = runtime.front().expect("queued action");
+        runtime.committed(queued, MonotonicMillis(now));
+    }
+
+    #[derive(Default)]
+    struct TimerTrace {
+        events: [Option<ResolutionTimerTrace>; 16],
+        len: usize,
+    }
+
+    impl ResolutionTimerTraceSink for TimerTrace {
+        fn record_resolution_timer(&mut self, event: ResolutionTimerTrace) {
+            self.events[self.len] = Some(event);
+            self.len += 1;
+        }
+    }
+
+    #[test]
+    fn exact_three_attempt_timeline_and_max_one_wait_full_interval() {
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        assert_eq!(policy.interval_ms(), 1_000);
+        assert_eq!(policy.failed_hold_ms(), 1_000);
+        assert_eq!(policy.max_attempts(), 3);
+        assert_eq!(policy.dynamic_neighbor_ttl_ms(), 60_000);
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        assert_eq!(
+            runtime.schedule(action(2), MonotonicMillis(0), false),
+            ResolutionResult::Queued
+        );
+        commit_front(&mut runtime, 0);
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(999),
+                1,
+                &mut NoResolutionTimerTrace
+            )
+            .unwrap()
+            .retries_queued,
+            0
+        );
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(1_000),
+                1,
+                &mut NoResolutionTimerTrace
+            )
+            .unwrap()
+            .retries_queued,
+            1
+        );
+        commit_front(&mut runtime, 1_000);
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(2_000),
+                1,
+                &mut NoResolutionTimerTrace
+            )
+            .unwrap()
+            .retries_queued,
+            1
+        );
+        commit_front(&mut runtime, 2_000);
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(2_999),
+                1,
+                &mut NoResolutionTimerTrace
+            )
+            .unwrap()
+            .timed_out,
+            0
+        );
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(3_000),
+                1,
+                &mut NoResolutionTimerTrace
+            )
+            .unwrap()
+            .timed_out,
+            1
+        );
+        assert_eq!(
+            runtime.status(WAN, target(2)).unwrap().phase,
+            ResolutionPhase::Failed
+        );
+        assert_eq!(runtime.counters().attempts_committed, 3);
+
+        let policy = ResolutionPolicy::with_retry(1_000, 1_000, 1).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        assert_eq!(
+            runtime.schedule(action(3), MonotonicMillis(0), false),
+            ResolutionResult::Queued
+        );
+        commit_front(&mut runtime, 0);
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(999),
+                1,
+                &mut NoResolutionTimerTrace
+            )
+            .unwrap()
+            .timed_out,
+            0
+        );
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(1_000),
+                1,
+                &mut NoResolutionTimerTrace
+            )
+            .unwrap()
+            .timed_out,
+            1
+        );
+    }
+
+    #[test]
+    fn late_poll_queues_only_one_retry_and_rx_timer_order_is_idempotent() {
+        for rx_first in [false, true] {
+            let policy = ResolutionPolicy::new(1_000, 2_000).unwrap();
+            let mut states = [ResolutionStateSlot::EMPTY; 1];
+            let mut actions = [ResolutionActionSlot::EMPTY; 1];
+            let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+            assert_eq!(
+                runtime.schedule(action(2), MonotonicMillis(0), false),
+                ResolutionResult::Queued
+            );
+            commit_front(&mut runtime, 0);
+            if rx_first {
+                assert_eq!(
+                    runtime.schedule(action(2), MonotonicMillis(5_000), false),
+                    ResolutionResult::RetryQueued
+                );
+                assert_eq!(
+                    poll_resolution_timers(
+                        &mut runtime,
+                        MonotonicMillis(5_000),
+                        1,
+                        &mut NoResolutionTimerTrace
+                    )
+                    .unwrap()
+                    .retries_queued,
+                    0
+                );
+            } else {
+                assert_eq!(
+                    poll_resolution_timers(
+                        &mut runtime,
+                        MonotonicMillis(5_000),
+                        1,
+                        &mut NoResolutionTimerTrace
+                    )
+                    .unwrap()
+                    .retries_queued,
+                    1
+                );
+                assert_eq!(
+                    runtime.schedule(action(2), MonotonicMillis(5_000), false),
+                    ResolutionResult::Suppressed
+                );
+            }
+            assert_eq!(runtime.pending_actions(), 1);
+            assert_eq!(runtime.status(WAN, target(2)).unwrap().attempts, 1);
+        }
+    }
+
+    #[test]
+    fn failed_hold_has_one_terminal_transition_and_exact_expiry_new_generation() {
+        let policy = ResolutionPolicy::with_retry(1_000, 2_000, 1).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.schedule(action(2), MonotonicMillis(0), false);
+        let first_generation = runtime.status(WAN, target(2)).unwrap().generation;
+        commit_front(&mut runtime, 0);
+        assert_eq!(
+            runtime.schedule(action(2), MonotonicMillis(1_000), false),
+            ResolutionResult::TimedOut
+        );
+        assert_eq!(
+            runtime.schedule(action(2), MonotonicMillis(2_999), false),
+            ResolutionResult::Failed
+        );
+        assert_eq!(runtime.counters().timed_out, 1);
+        assert_eq!(runtime.counters().failed_hits, 1);
+        assert_eq!(
+            runtime.schedule(action(2), MonotonicMillis(3_000), false),
+            ResolutionResult::Queued
+        );
+        let status = runtime.status(WAN, target(2)).unwrap();
+        assert_eq!(status.phase, ResolutionPhase::InitialQueued);
+        assert_eq!(status.attempts, 0);
+        assert_eq!(status.generation, first_generation.wrapping_add(1));
+        assert_eq!(runtime.counters().failures_expired, 1);
+    }
+
+    #[test]
+    fn bounded_round_robin_makes_progress_under_action_pressure() {
+        let policy = ResolutionPolicy::new(1_000, 2_000).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 2];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.schedule(action(2), MonotonicMillis(0), false);
+        commit_front(&mut runtime, 0);
+        runtime.schedule(action(3), MonotonicMillis(0), false);
+        commit_front(&mut runtime, 0);
+
+        let first = poll_resolution_timers(
+            &mut runtime,
+            MonotonicMillis(1_000),
+            1,
+            &mut NoResolutionTimerTrace,
+        )
+        .unwrap();
+        assert_eq!((first.scanned, first.retries_queued), (1, 1));
+        let mut trace = TimerTrace::default();
+        let second =
+            poll_resolution_timers(&mut runtime, MonotonicMillis(1_000), 1, &mut trace).unwrap();
+        assert_eq!(
+            (
+                second.scanned,
+                second.retries_queued,
+                second.action_full,
+                second.deferred_due
+            ),
+            (1, 0, 1, 1)
+        );
+        assert!(matches!(
+            trace.events[0],
+            Some(ResolutionTimerTrace::ActionFull { target: value, .. }) if value == target(3)
+        ));
+        commit_front(&mut runtime, 1_000);
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(1_000),
+                1,
+                &mut NoResolutionTimerTrace
+            )
+            .unwrap()
+            .retries_queued,
+            0,
+            "persistent cursor first scans the other state"
+        );
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(1_000),
+                1,
+                &mut NoResolutionTimerTrace
+            )
+            .unwrap()
+            .retries_queued,
+            1
+        );
+        assert_eq!(runtime.front().unwrap().action.target_ip, target(3));
+    }
+
+    #[test]
+    fn clock_regression_is_atomic_for_poll_and_equal_time_recovers() {
+        let policy = ResolutionPolicy::new(1_000, 2_000).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.schedule(action(2), MonotonicMillis(u64::MAX - 2_000), false);
+        commit_front(&mut runtime, u64::MAX - 2_000);
+        let before = runtime.status(WAN, target(2));
+        let mut trace = TimerTrace::default();
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(u64::MAX - 2_001),
+                1,
+                &mut trace
+            ),
+            Err(ResolutionTimerError::ClockRegression)
+        );
+        assert_eq!(runtime.status(WAN, target(2)), before);
+        assert_eq!(runtime.pending_actions(), 0);
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(u64::MAX - 1_000),
+                1,
+                &mut trace
+            )
+            .unwrap()
+            .retries_queued,
+            1
+        );
+        assert!(matches!(
+            trace.events[0],
+            Some(ResolutionTimerTrace::ClockRegression)
+        ));
+    }
+
+    #[test]
+    fn successful_merge_cancels_queued_waiting_and_failed_cycles() {
+        for cancellation_point in 0..4 {
+            let policy = ResolutionPolicy::with_retry(1_000, 2_000, 1).unwrap();
+            let mut states = [ResolutionStateSlot::EMPTY; 1];
+            let mut actions = [ResolutionActionSlot::EMPTY; 1];
+            let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
+            let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+                policy,
+                &mut states,
+                &mut actions,
+                &mut dynamic,
+            );
+            runtime.schedule(action(2), MonotonicMillis(0), false);
+            if cancellation_point >= 1 {
+                commit_front(&mut runtime, 0);
+            }
+            if cancellation_point == 2 {
+                runtime.policy.max_attempts = 2;
+                poll_resolution_timers(
+                    &mut runtime,
+                    MonotonicMillis(1_000),
+                    1,
+                    &mut NoResolutionTimerTrace,
+                )
+                .unwrap();
+            }
+            if cancellation_point == 3 {
+                poll_resolution_timers(
+                    &mut runtime,
+                    MonotonicMillis(1_000),
+                    1,
+                    &mut NoResolutionTimerTrace,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                runtime.merge_dynamic(
+                    WAN,
+                    target(2),
+                    MacAddress([3; 6]),
+                    true,
+                    false,
+                    MonotonicMillis(1_000),
+                ),
+                ControlDisposition::Inserted
+            );
+            assert_eq!(runtime.status(WAN, target(2)), None);
+            assert_eq!(runtime.pending_actions(), 0);
+        }
+    }
+
+    #[test]
+    fn publication_reconciliation_removes_static_and_invalid_authority_only() {
+        let policy = ResolutionPolicy::new(1_000, 2_000).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 3];
+        let mut actions = [ResolutionActionSlot::EMPTY; 3];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        for last in [2, 3, 4] {
+            runtime.schedule(action(last), MonotonicMillis(0), false);
+        }
+        let routes = [Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, WAN, None).unwrap()];
+        let interfaces = [Interface {
+            id: WAN,
+            mac: SOURCE_MAC,
+        }];
+        let bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: SOURCE_IP,
+        }];
+        let neighbors = [Neighbor {
+            interface: WAN,
+            target: target(3),
+            mac: MacAddress([9; 6]),
+        }];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let report = runtime.reconcile_publication(&snapshot);
+        assert_eq!(report.states_removed, 1);
+        assert_eq!(report.actions_removed, 1);
+        assert_eq!(runtime.pending_actions(), 2);
+        assert_eq!(runtime.front().unwrap().action.target_ip, target(2));
+        commit_front(&mut runtime, 0);
+        assert_eq!(runtime.front().unwrap().action.target_ip, target(4));
+
+        let changed_interfaces = [Interface {
+            id: WAN,
+            mac: MacAddress([7; 6]),
+        }];
+        let changed =
+            ForwardingSnapshot::new(&routes, &changed_interfaces, &[], &bindings).unwrap();
+        let report = runtime.reconcile_publication(&changed);
+        assert_eq!(report.invalid_states_removed, 2);
+        assert_eq!(report.invalid_actions_removed, 1);
+        assert_eq!(runtime.pending_actions(), 0);
+    }
+
+    #[test]
+    fn zero_storage_and_policy_validation_are_safe() {
+        assert_eq!(
+            ResolutionPolicy::with_retry(1_000, 1_000, 0),
+            Err(ResolutionPolicyError::MaxAttemptsZero)
+        );
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let mut states = [];
+        let mut actions = [];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        assert_eq!(
+            runtime.schedule(action(2), MonotonicMillis(0), false),
+            ResolutionResult::StateFull
+        );
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(0),
+                usize::MAX,
+                &mut NoResolutionTimerTrace
+            )
+            .unwrap(),
+            ResolutionTimerReport::default()
+        );
+    }
+
+    #[test]
+    fn generation_wrap_and_due_action_full_are_lifecycle_safe_and_atomic() {
+        let policy = ResolutionPolicy::with_retry(1_000, 1_000, 2).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 2];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.states[0].generation = u64::MAX;
+        assert_eq!(
+            runtime.schedule(action(2), MonotonicMillis(0), false),
+            ResolutionResult::Queued
+        );
+        assert_eq!(runtime.status(WAN, target(2)).unwrap().generation, 0);
+        commit_front(&mut runtime, 0);
+
+        assert_eq!(
+            runtime.schedule(action(3), MonotonicMillis(1_000), false),
+            ResolutionResult::Queued
+        );
+        let authoritative = runtime
+            .states
+            .iter()
+            .find(|state| state.occupied && state.key.target == target(2))
+            .unwrap()
+            .action;
+        let mut changed = action(2);
+        changed.source_mac = MacAddress([9; 6]);
+        assert_eq!(
+            runtime.schedule(changed, MonotonicMillis(1_000), false),
+            ResolutionResult::ActionFull
+        );
+        assert_eq!(
+            runtime
+                .states
+                .iter()
+                .find(|state| state.occupied && state.key.target == target(2))
+                .unwrap()
+                .action,
+            authoritative
+        );
+        assert_eq!(runtime.status(WAN, target(2)).unwrap().attempts, 1);
+    }
 }

@@ -2,12 +2,13 @@ use std::convert::Infallible;
 
 use ruster_core::{
     execute_one_arp_request, forward_batch_with_resolution, ipv4_header_checksum,
-    ArpRequestBuildError, BatchCompletion, DropReason, ExecuteArpRequestError, ForwardingSnapshot,
-    GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,
-    GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion, IfId, Interface,
-    Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoTrace, PacketIo,
-    ResolutionActionSlot, ResolutionPolicy, ResolutionPolicyError, ResolutionResult,
-    ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent, ETHERNET_HEADER_LEN,
+    poll_resolution_timers, ArpRequestBuildError, BatchCompletion, DropReason,
+    ExecuteArpRequestError, ForwardingSnapshot, GeneratedAllocationError, GeneratedBatchCompletion,
+    GeneratedPacketBatch, GeneratedPacketIo, GeneratedPacketLease, GeneratedPacketSlot,
+    GeneratedSlotCompletion, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    MonotonicMillis, Neighbor, NoResolutionTimerTrace, NoTrace, PacketIo, ResolutionActionSlot,
+    ResolutionPolicy, ResolutionPolicyError, ResolutionResult, ResolutionRuntime,
+    ResolutionStateSlot, Route, TraceEvent, ETHERNET_HEADER_LEN,
 };
 use ruster_io_sim::{
     FrameOrigin, GeneratedRecycleCause, RecycleCause, SimGeneratedError, SimIo, VecGeneratedTrace,
@@ -274,10 +275,12 @@ fn same_target_is_rate_limited_to_one_request_per_second_at_exact_deadline() {
     .unwrap()
     .unwrap();
     assert_eq!(first_request.completion.rejected, 1);
+    assert_eq!(runtime.counters().attempts_committed, 1);
     run_miss(&mut io, &snapshot, &mut runtime, 999, dst, &mut trace);
     assert_eq!(runtime.pending_actions(), 0);
     run_miss(&mut io, &snapshot, &mut runtime, 1_000, dst, &mut trace);
     assert_eq!(runtime.pending_actions(), 1);
+    assert_eq!(runtime.counters().attempts_committed, 1);
     assert_eq!(runtime.counters().queued, 2);
     assert_eq!(runtime.counters().suppressed, 1);
 }
@@ -441,7 +444,7 @@ fn generated_commit_clock_regression_retains_action() {
 }
 
 #[test]
-fn state_full_never_evicts_live_entry_and_ttl_allows_reuse() {
+fn state_full_never_evicts_active_or_failed_entry_and_hold_expiry_allows_reuse() {
     let direct = Route::new(Ipv4Address::from_octets([198, 51, 100, 0]), 24, WAN, None).unwrap();
     let routes = [direct];
     let interfaces = [interface()];
@@ -449,7 +452,8 @@ fn state_full_never_evicts_live_entry_and_ttl_allows_reuse() {
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let mut runtime = ResolutionRuntime::new(policy(), &mut states, &mut actions);
+    let policy = ResolutionPolicy::with_retry(1_000, 2_000, 1).unwrap();
+    let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
     let mut io = SimIo::new();
     let mut trace = VecTrace::default();
     let first = Ipv4Address::from_octets([198, 51, 100, 10]);
@@ -463,10 +467,25 @@ fn state_full_never_evicts_live_entry_and_ttl_allows_reuse() {
     )
     .unwrap()
     .unwrap();
-    run_miss(&mut io, &snapshot, &mut runtime, 1_999, second, &mut trace);
+    poll_resolution_timers(
+        &mut runtime,
+        MonotonicMillis(1_000),
+        1,
+        &mut NoResolutionTimerTrace,
+    )
+    .unwrap();
+    run_miss(&mut io, &snapshot, &mut runtime, 2_999, second, &mut trace);
     assert_eq!(runtime.counters().state_full, 1);
-    run_miss(&mut io, &snapshot, &mut runtime, 2_000, second, &mut trace);
+    poll_resolution_timers(
+        &mut runtime,
+        MonotonicMillis(3_000),
+        1,
+        &mut NoResolutionTimerTrace,
+    )
+    .unwrap();
+    run_miss(&mut io, &snapshot, &mut runtime, 3_000, second, &mut trace);
     assert_eq!(runtime.pending_actions(), 1);
+    assert_eq!(runtime.counters().attempts_committed, 1);
 }
 
 #[test]
@@ -519,7 +538,13 @@ fn local_binding_missing_and_forbidden_targets_generate_nothing() {
     );
     assert_eq!(runtime.pending_actions(), 0);
 
-    for target in [[0, 0, 0, 0], [224, 0, 0, 1], [255, 255, 255, 255]] {
+    for target in [
+        [0, 0, 0, 0],
+        [127, 0, 0, 1],
+        [224, 0, 0, 1],
+        [240, 0, 0, 1],
+        [255, 255, 255, 255],
+    ] {
         let target = Ipv4Address::from_octets(target);
         let route = Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, Some(target)).unwrap();
         let routes = [route];
@@ -547,7 +572,7 @@ fn local_binding_missing_and_forbidden_targets_generate_nothing() {
         &mut trace,
     );
     assert_eq!(runtime.pending_actions(), 0);
-    assert_eq!(runtime.counters().forbidden_target, 4);
+    assert_eq!(runtime.counters().forbidden_target, 6);
     assert_eq!(
         trace
             .events()
@@ -560,7 +585,7 @@ fn local_binding_missing_and_forbidden_targets_generate_nothing() {
                 }
             ))
             .count(),
-        4
+        6
     );
 }
 
@@ -776,6 +801,7 @@ fn allocation_failure_retains_action_and_does_not_start_deadline() {
         ]
     ));
     assert_eq!(runtime.pending_actions(), 1);
+    assert_eq!(runtime.counters().attempts_committed, 0);
     io.set_generated_budget(1);
     execute_one_arp_request(
         &mut io,
@@ -824,6 +850,103 @@ fn builder_failure_cancels_lease_and_retains_action() {
     assert!(report.completion.invariants_hold());
     assert_eq!(report.completion.cancelled, 1);
     assert_eq!(runtime.pending_actions(), 1);
+    assert_eq!(runtime.counters().attempts_committed, 0);
+}
+
+#[test]
+fn terminal_resolution_is_typed_in_forwarding_trace_but_drop_stays_unresolved() {
+    let routes = [gateway_route()];
+    let interfaces = [interface()];
+    let bindings = [binding()];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let policy = ResolutionPolicy::with_retry(1_000, 2_000, 1).unwrap();
+    let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+    let mut io = SimIo::new();
+    let destination = Ipv4Address::from_octets([198, 51, 100, 20]);
+    run_miss(
+        &mut io,
+        &snapshot,
+        &mut runtime,
+        0,
+        destination,
+        &mut VecTrace::default(),
+    );
+    execute_one_arp_request(
+        &mut io,
+        &mut runtime,
+        MonotonicMillis(0),
+        &mut VecGeneratedTrace::default(),
+    )
+    .unwrap()
+    .unwrap();
+
+    let mut timed_out = VecTrace::default();
+    run_miss(
+        &mut io,
+        &snapshot,
+        &mut runtime,
+        1_000,
+        destination,
+        &mut timed_out,
+    );
+    assert!(timed_out.events().iter().any(|event| matches!(
+        event,
+        TraceEvent::NeighborResolution {
+            result: ResolutionResult::TimedOut,
+            ..
+        }
+    )));
+
+    let mut failed = VecTrace::default();
+    run_miss(
+        &mut io,
+        &snapshot,
+        &mut runtime,
+        1_000,
+        destination,
+        &mut failed,
+    );
+    assert!(failed.events().iter().any(|event| matches!(
+        event,
+        TraceEvent::NeighborResolution {
+            result: ResolutionResult::Failed,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn generated_finish_error_still_commits_one_resolution_attempt() {
+    let routes = [gateway_route()];
+    let interfaces = [interface()];
+    let bindings = [binding()];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut runtime = ResolutionRuntime::new(policy(), &mut states, &mut actions);
+    let mut io = SimIo::new();
+    run_miss(
+        &mut io,
+        &snapshot,
+        &mut runtime,
+        0,
+        Ipv4Address::from_octets([198, 51, 100, 20]),
+        &mut VecTrace::default(),
+    );
+    io.fail_next_generated_finish();
+    let report = execute_one_arp_request(
+        &mut io,
+        &mut runtime,
+        MonotonicMillis(0),
+        &mut VecGeneratedTrace::default(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.completion.error, Some(SimGeneratedError::Injected));
+    assert_eq!(runtime.counters().attempts_committed, 1);
+    assert_eq!(runtime.pending_actions(), 0);
 }
 
 struct ShortBufferIo;

@@ -60,7 +60,7 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | ICMP4-012G2 Destination Unreachable reverse authority | RFC 1812 §4.3.2.4, §§5.2.4.1–5.2.4.3 | `reverse_connected_static_and_gateway_dynamic_neighbors_are_authoritative` | implemented | original sourceへのconnected/gateway LPM、static→fresh dynamic。unresolved時はARPだけでfresh packetが必要 |
 | ICMP4-012G3 Destination Unreachable suppression/options | RFC 1812 §§4.3.2.6–4.3.2.8 | `route_miss_suppression_matrix_and_options_are_atomic` | deviation | RFC error suppressionを共有。source-route/options未実装のためLPM前にbyte不変drop |
 | ICMP4-012G4 Destination Unreachable bounded wire | RFC 792, RFC 1812 §§4.3.2.3, 4.3.2.5 | `destination_unreachable_quote_bounds_exclude_padding_and_checksum_odd_lengths` | implemented | Type 3/Code 0/unused zero、quote最大548、outer最大576、odd checksum、padding zero |
-| ICMP4-012H other ICMP errors and queries | RFC 792, RFC 1122 §3.2.2 | — | deferred | Destination UnreachableのCode 0以外、Parameter Problem、Redirect、Timestamp等は未実装 |
+| ICMP4-012H other ICMP errors and queries | RFC 792, RFC 1122 §3.2.2 | — | deferred | Destination UnreachableのCode 0以外（ARP failure Code 1を含む）、Parameter Problem、Redirect、Timestamp等は未実装 |
 | ICMP4-013 resolution isolation | architecture contract | `local_echo_and_consume_leave_resolution_runtime_untouched` | implemented | Echo/consumeはdynamic cache、pending state/action、FIFO/capacity、monotonic watermarkを変更しない |
 | ARP-001 Ethernet/IPv4 Request/Reply profile validation | RFC 826, RFC 5494/IANA ARP Parameters | `arp_profile_validation_drops_are_granular_and_atomic` | implemented | HTYPE=1/PTYPE=0x0800/HLEN=6/PLEN=4、unknown opcodeはdrop |
 | ARP-002 local target in-place reply on ingress | RFC 826 | `arp_request_for_local_ipv4_replies_in_place_on_ingress` | implemented | 同じRX allocation、egress=ingress、wire fieldsを検証 |
@@ -79,16 +79,23 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | ARP-011B exact interval and rejected request suppression | RFC 1122 §2.3.2.1 | `same_target_is_rate_limited_to_one_request_per_second_at_exact_deadline` | implemented | partial rejectもTX requestedなので0msから999ms suppress、1000ms queue |
 | ARP-011A suppression policy validation | RFC 1122 §2.3.2.1, local policy | `resolution_policy_rejects_short_interval_and_state_ttl` | implemented | interval>=1000ms、state TTL>=interval |
 | ARP-012 action ring full semantics | architecture contract | `action_full_does_not_create_phantom_suppression` | implemented | action fullはphantom deadlineなし |
-| ARP-012A state table full semantics | architecture contract | `state_full_never_evicts_live_entry_and_ttl_allows_reuse` | implemented | live非evict、TTL到達でreuse |
+| ARP-012A state table full semantics | architecture contract | `state_full_never_evicts_active_or_failed_entry_and_hold_expiry_allows_reuse` | implemented | active/Failed非evict、Failed hold exact expiry後だけreuse |
 | ARP-012B monotonic clock regression | architecture contract | `clock_regression_is_typed_and_does_not_mutate_queue` | implemented | typed result/counter/trace、queue非変更 |
 | ARP-012C resolution key independence | architecture contract | `resolution_keys_are_independent_by_interface_and_target` | implemented | target違いとIfId違いを独立queue |
 | ARP-012D runtime storage initialization | architecture contract | `recreating_runtime_clears_caller_state_and_queued_actions` | implemented | constructorはstate/action storageをemptyへ初期化 |
 | ARP-012E runtime state persistence/resume | architecture contract | — | deferred | process/runtime再生成をまたぐresolution state永続化は未実装 |
-| ARP-013 forbidden request targets | local safety policy | `local_binding_missing_and_forbidden_targets_generate_nothing` | implemented | unspecified/multicast/limited broadcast/確定可能なdirected broadcastとbindingなしは生成しない |
+| ARP-013 forbidden request targets | local safety policy | `local_binding_missing_and_forbidden_targets_generate_nothing` | implemented | unspecified/multicast/limited broadcast/確定可能なnetwork・directed broadcastとbindingなしは生成しない |
 | ARP-013A local source address target prohibition | local safety policy | `local_source_ip_is_forbidden_as_connected_or_gateway_target` | implemented | connected destinationとgateway next-hopの両方でsource local IPを拒否 |
 | ARP-013B all-connected-route directed broadcast check | local safety policy | `gateway_target_matching_same_egress_connected_broadcast_is_forbidden` | implemented | packet選択default route以外の同一egress connected /24も確認 |
-| ARP-014 allocation failure action retention | architecture contract | `allocation_failure_retains_action_and_does_not_start_deadline` | implemented | unavailable時はaction保持、deadline非開始、後続executorでretry可能 |
-| ARP-014A timer-only retry/max attempts/Failed | RFC 1122 §2.3.2.1 | — | deferred | retryはtraffic-drivenまたは保持actionのexecutor再実行のみ |
+| ARP-014 allocation failure action retention | architecture contract | `allocation_failure_retains_action_and_does_not_start_deadline` | implemented | action保持、attempt/deadline非開始、後続executorでretry可能 |
+| ARP-014E build failure action retention | architecture contract | `builder_failure_cancels_lease_and_retains_action` | implemented | short allocationをcancelしaction保持、attempt/deadline非開始 |
+| ARP-014A timer retry/max attempts/Failed | RFC 1122 §2.3.2.1、回数/holdはlocal policy | `exact_three_attempt_timeline_and_max_one_wait_full_interval` | implemented | default total 3、max=1もfinal commitからfull interval後に一度だけTimedOut |
+| ARP-014B traffic-independent bounded timer progress | architecture contract | `late_poll_queues_only_one_retry_and_rx_timer_order_is_idempotent` | implemented | explicit scan budget、late poll一attempt、RX/timer順序によらずone queued |
+| ARP-014F timer action pressure fairness | architecture contract | `bounded_round_robin_makes_progress_under_action_pressure` | implemented | persistent RR、action-full deferred report/trace、次keyも飢餓しない |
+| ARP-014C terminal hold lifecycle | architecture contract | `failed_hold_has_one_terminal_transition_and_exact_expiry_new_generation` | implemented | TTL-1 Failed、exact fresh generation、世代ごとにterminal通知一度 |
+| ARP-014G terminal forwarding visibility | architecture contract | `terminal_resolution_is_typed_in_forwarding_trace_but_drop_stays_unresolved` | implemented | dropはNeighborUnresolvedのままresolution resultはTimedOut/Failed |
+| ARP-014D committed attempt lifecycle | architecture contract | `same_target_is_rate_limited_to_one_request_per_second_at_exact_deadline` | implemented | lease commitだけattempt増加。backend rejectもcommitted attempt |
+| ARP-014H generated finish error attempt lifecycle | architecture contract | `generated_finish_error_still_commits_one_resolution_attempt` | implemented | finish errorでもTX requested済みの一attemptとして数える |
 | ARP-015 multi-worker resolution ownership/sharding | concurrency design | — | deferred | 現sliceはsingle worker ownerのみ。shard/SPSC handoff未実装 |
 | ARP-016 Probe/Announcement/GARP/ACD generation | RFC 5227 | — | deferred | generated pathは通常ARP Requestだけ。Probe/Announcement/GARP/ACDは未実装 |
 | ARP-017 target-local unsolicited admission/nonlocal ignore | RFC 826 | `unsolicited_local_reply_learns_while_nonlocal_absent_is_ignored` | implemented | solicited-only制限なし。target-local Replyはinsert、nonlocal absentはconsume-ignore |
@@ -101,11 +108,13 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | ARP-021B local SPA claim is ingress scoped | RFC 5227 link scope | `local_address_value_on_another_interface_is_learnable_on_ingress` | implemented | 別IfIdのlocal IPv4値と同じSPAはingress上のpeerとして学習可能 |
 | ARP-022 static authority over dynamic | local authority policy | `foreign_local_spa_cannot_poison_and_static_mapping_has_priority` | deviation | staticはARPで上書き/slot消費せず常にforward優先し、同keyのstale dynamic/pendingを削除 |
 | ARP-022A static snapshot reconciliation | control-plane publication contract | `reconcile_static_clears_stale_cache_and_wrapped_middle_action_fifo` | implemented | snapshot公開と同worker tickでdynamic/state/actionを削除し、wrapped ringのFIFO/容量/IfId独立性を保持 |
+| ARP-022B full publication retry authority | control-plane publication contract | `publication_reconciliation_removes_static_and_invalid_authority_only` | implemented | timer/packet前にsnapshotをreconcileし、static解決またはMAC/binding/route/target authorityがstaleなstate/actionだけを削除 |
 | ARP-023 cache-full disposition/pending preservation | architecture contract | `ttl_boundary_refresh_expired_reuse_and_cache_full_are_exact` | implemented | live entry非evict、Reply consume、matching pending actionをclearしない |
 | ARP-024 unified monotonic watermark | architecture contract | `clock_regression_does_not_mutate_cache_and_later_equal_time_recovers` | implemented | regressionはcache/action不変、後続normal nowで回復 |
 | ARP-025 learned mapping cancels matching resolution | architecture contract | `reply_before_generated_execution_cancels_only_matching_fifo_action` | implemented | matching action/stateだけcancel、unrelated key/IfId FIFOとcapacityを維持 |
 | ARP-026 same-batch sequential visibility | architecture contract | `mixed_reply_then_ipv4_uses_dynamic_mapping_in_same_batch` | implemented | `[Reply, IPv4]`の2packet目が直前のdynamic mergeを利用 |
 | ARP-027 zero capacity/recreate safety | architecture contract | `zero_capacity_and_runtime_recreation_are_safe` | implemented | zero容量panicなし、constructorでcacheをemptyへ初期化 |
+| ARP-028 unresolved datagram hold and failure response | RFC 1122 §2.3.2.2, RFC 1812 §3.3.2 | `terminal_resolution_is_typed_in_forwarding_trace_but_drop_stays_unresolved` | deviation | packet bufferを保持/replayしないため、terminal ARP failureで元datagramへのICMP Type 3/Code 1を生成しない |
 | OBS-001 stable reason code | explainability requirement | `drop_reason_discriminants_and_codes_are_stable_and_unique` | implemented | repr(u16) |
 | OBS-002 requestedとaggregate TX outcome trace | explainability requirement | `partial_backend_completion_preserves_report_and_aggregate_trace` | implemented | packet単位accepted traceはdeferred |
 | OBS-003 protocol-aware ARP trace ordering | explainability requirement | `arp_trace_is_deterministic_and_tx_follows_commit` | implemented | validated/reply requested/TX requested/completionを順序検証 |

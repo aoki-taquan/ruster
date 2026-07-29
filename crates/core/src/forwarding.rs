@@ -134,11 +134,18 @@ impl Default for Ipv4OriginPolicy {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ForwardingSnapshot<'a> {
-    routes: &'a [Route],
-    interfaces: &'a [Interface],
-    neighbors: &'a [Neighbor],
-    local_ipv4: &'a [LocalIpv4Binding],
+    pub(crate) routes: &'a [Route],
+    pub(crate) interfaces: &'a [Interface],
+    pub(crate) neighbors: &'a [Neighbor],
+    pub(crate) local_ipv4: &'a [LocalIpv4Binding],
     ipv4_origin: Ipv4OriginPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResolutionActionAuthority {
+    Valid,
+    StaticResolved,
+    Invalid,
 }
 
 impl<'a> ForwardingSnapshot<'a> {
@@ -221,6 +228,57 @@ impl<'a> ForwardingSnapshot<'a> {
             local_ipv4,
             ipv4_origin,
         })
+    }
+
+    pub(crate) fn resolution_action_authority(
+        &self,
+        action: ArpRequestAction,
+    ) -> ResolutionActionAuthority {
+        if self.neighbors.iter().any(|neighbor| {
+            neighbor.interface == action.egress && neighbor.target == action.target_ip
+        }) {
+            return ResolutionActionAuthority::StaticResolved;
+        }
+        if !self
+            .interfaces
+            .iter()
+            .any(|interface| interface.id == action.egress && interface.mac == action.source_mac)
+            || !self.local_ipv4.iter().any(|binding| {
+                binding.interface == action.egress && binding.address == action.source_ip
+            })
+        {
+            return ResolutionActionAuthority::Invalid;
+        }
+        let target = action.target_ip;
+        let octets = target.octets();
+        if target == action.source_ip
+            || octets[0] == 0
+            || octets[0] == 127
+            || octets[0] >= 224
+            || octets == [255; 4]
+            || self
+                .local_ipv4
+                .iter()
+                .any(|binding| binding.address == target)
+            || self.routes.iter().any(|route| {
+                route.egress() == action.egress
+                    && (route.is_connected_network_address(target)
+                        || route.is_connected_directed_broadcast(target))
+            })
+        {
+            return ResolutionActionAuthority::Invalid;
+        }
+        let route_still_authorizes = self
+            .routes
+            .iter()
+            .any(|route| route.egress() == action.egress && route.next_hop() == Some(target))
+            || route::lookup(self.routes, target)
+                .is_some_and(|route| route.egress() == action.egress && route.next_hop().is_none());
+        if route_still_authorizes {
+            ResolutionActionAuthority::Valid
+        } else {
+            ResolutionActionAuthority::Invalid
+        }
     }
 }
 
@@ -649,10 +707,15 @@ fn decide_ipv4<T: TraceSink>(
                             target_ip: target,
                         },
                         *now,
-                        snapshot.routes.iter().any(|candidate| {
-                            candidate.egress() == route.egress()
-                                && candidate.is_connected_directed_broadcast(target)
-                        }),
+                        snapshot
+                            .local_ipv4
+                            .iter()
+                            .any(|binding| binding.address == target)
+                            || snapshot.routes.iter().any(|candidate| {
+                                candidate.egress() == route.egress()
+                                    && (candidate.is_connected_directed_broadcast(target)
+                                        || candidate.is_connected_network_address(target))
+                            }),
                     );
                     trace.record(TraceEvent::NeighborResolution {
                         egress: route.egress(),
@@ -823,10 +886,15 @@ fn decide_icmpv4_error<T: TraceSink>(
                         target_ip: target,
                     },
                     *resolution_now,
-                    snapshot.routes.iter().any(|candidate| {
-                        candidate.egress() == reverse_egress
-                            && candidate.is_connected_directed_broadcast(target)
-                    }),
+                    snapshot
+                        .local_ipv4
+                        .iter()
+                        .any(|binding| binding.address == target)
+                        || snapshot.routes.iter().any(|candidate| {
+                            candidate.egress() == reverse_egress
+                                && (candidate.is_connected_directed_broadcast(target)
+                                    || candidate.is_connected_network_address(target))
+                        }),
                 );
                 trace.record(TraceEvent::NeighborResolution {
                     egress: reverse_egress,
@@ -896,6 +964,10 @@ fn reverse_target_forbidden(
         || octets[0] >= 224
         || octets == [255; 4]
         || target == local
+        || snapshot
+            .local_ipv4
+            .iter()
+            .any(|binding| binding.address == target)
         || snapshot.routes.iter().any(|route| {
             route.egress() == egress
                 && (route.is_connected_directed_broadcast(target)
