@@ -654,7 +654,6 @@ pub enum FirewallPolicySource {
 pub enum FirewallFailure {
     InvalidInitialTcp,
     StateTableFull,
-    RelatedStateMiss,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1814,6 +1813,88 @@ mod tests {
                 runtime.inspect_related_icmpv4(flow, 10),
                 Err(FirewallRelatedIcmpv4Error::StateMiss)
             );
+        });
+    }
+
+    #[test]
+    fn related_icmpv4_probe_crosses_expired_same_home_wrap_without_mutation() {
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                9,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut candidates = [packet(FirewallProtocol::Udp, 0); 4];
+            let mut first_port = 1_u16;
+            for candidate in &mut candidates {
+                let mut trial = *candidate;
+                let port = (first_port..=u16::MAX)
+                    .find(|port| {
+                        trial.source_port = *port;
+                        flow_hash(trial, 1, hash_key()) as usize % 3 == 2
+                    })
+                    .expect("four UDP tuples hash to the wrapped home");
+                candidate.source_port = port;
+                first_port = port.saturating_add(1);
+            }
+
+            let mut slots = [FirewallStateSlot::default(); 3];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let first = runtime.plan_packet(candidates[0], 0).unwrap();
+            runtime.commit(first).unwrap();
+            for candidate in &candidates[1..3] {
+                let plan = runtime
+                    .plan_packet(*candidate, FIREWALL_UDP_DEFAULT_IDLE_TTL_MS - 1)
+                    .unwrap();
+                runtime.commit(plan).unwrap();
+            }
+            assert_eq!(
+                [
+                    runtime.states()[2].initiator_port(),
+                    runtime.states()[0].initiator_port(),
+                    runtime.states()[1].initiator_port(),
+                ],
+                [
+                    candidates[0].source_port,
+                    candidates[1].source_port,
+                    candidates[2].source_port,
+                ]
+            );
+
+            let related = |candidate: FirewallPacket| {
+                FirewallRelatedIcmpv4Flow::new(
+                    candidate.ingress,
+                    candidate.egress,
+                    candidate.source,
+                    candidate.destination,
+                    candidate.protocol,
+                    candidate.source_port,
+                    candidate.destination_port,
+                )
+            };
+            let before_states = runtime.states().to_vec();
+            let before_counters = runtime.counters();
+            assert_eq!(
+                runtime.inspect_related_icmpv4(
+                    related(candidates[1]),
+                    FIREWALL_UDP_DEFAULT_IDLE_TTL_MS,
+                ),
+                Ok(FirewallRuleId(9)),
+                "the displaced direct hit remains reachable past an expired wrapped blocker"
+            );
+            assert_eq!(
+                runtime.inspect_related_icmpv4(
+                    related(candidates[3]),
+                    FIREWALL_UDP_DEFAULT_IDLE_TTL_MS,
+                ),
+                Err(FirewallRelatedIcmpv4Error::StateMiss),
+                "a full same-home table terminates after one capacity-bounded probe"
+            );
+            assert_eq!(runtime.states(), before_states);
+            assert_eq!(runtime.counters(), before_counters);
         });
     }
 

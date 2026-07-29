@@ -2198,7 +2198,7 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
                             class: FirewallConnectionClass::Related,
                             source: FirewallPolicySource::Default,
                             matched_action: None,
-                            failure: Some(FirewallFailure::RelatedStateMiss),
+                            failure: None,
                         },
                     );
                 }

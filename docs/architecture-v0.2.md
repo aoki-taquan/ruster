@@ -611,9 +611,11 @@ reverse match、rule scan、expiry cleanup、delete/move、activity/phase/counte
 行いません。退行時刻は状態不変のtyped clock regression、state missは
 `FirewallRelatedIcmpv4StateMiss`でinside route/neighbor/rewriteより前にsilent dropします。
 audit到達時だけhitを`Allow/Related/Rule(origin)/AllowStateful`、missを
-`Drop/Related/Default/RelatedStateMiss`として記録します。parser、NAT authority/lookup、
-clock errorはRELATED auditを残しません。tracked hit後のneighbor missだけがARPをscheduleでき、
-fresh retryで再照合します。backend rejectを含めNAT/FW stateはread-onlyです。
+`Drop/Related/Default`かつ`matched_action=None`、`failure=None`として記録します。terminalな
+miss理由はaudit failure enumを拡張せず`FirewallRelatedIcmpv4StateMiss`で表現します。
+parser、NAT authority/lookup、clock errorはRELATED auditを残しません。tracked hit後の
+neighbor missだけがARPをscheduleでき、fresh retryで再照合します。backend rejectを含め
+NAT/FW stateはread-onlyです。
 
 NATを伴わないplain forwarded ICMPv4 RELATEDは、引用tupleからorigin interface authorityを
 安全に一意化する契約が未確定のためdeferredです。既存の

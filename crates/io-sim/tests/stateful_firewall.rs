@@ -929,6 +929,108 @@ fn legacy_forwarding_is_unchanged_when_firewall_api_is_not_selected() {
 }
 
 #[test]
+fn plain_natless_code4_preserves_legacy_and_firewall_deferred_behavior() {
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let quoted = udp_frame(WAN_LOCAL, REMOTE, 40_000, 53, 0x4000, false);
+    let local = frag_needed(&quoted[14..42]);
+
+    let mut legacy = SimIo::new();
+    legacy.inject(WAN, local.clone());
+    let legacy_local = legacy.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    assert_eq!(
+        (
+            legacy_local.tx_requested,
+            legacy_local.dropped,
+            legacy_local.consumed
+        ),
+        (0, 0, 1)
+    );
+    let recycled = legacy.pop_recycled().unwrap();
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Consumed(ruster_core::ConsumeReason::Ipv4LocalUnsupported)
+    );
+    assert_eq!(recycled.bytes, local);
+
+    let rules = [allow(FirewallProtocol::Udp)];
+    let config = firewall_config(&snapshot, &rules, 1);
+    let mut firewall_slots = [FirewallStateSlot::default(); 1];
+    let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut protected = SimIo::new();
+    protected.inject(WAN, local.clone());
+    let protected_local = protected
+        .run_firewall_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(&mut firewall),
+            MonotonicMillis(0),
+            &mut NoTrace,
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            protected_local.tx_requested,
+            protected_local.dropped,
+            protected_local.consumed
+        ),
+        (0, 0, 1)
+    );
+    let recycled = protected.pop_recycled().unwrap();
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Consumed(ruster_core::ConsumeReason::Ipv4LocalUnsupported)
+    );
+    assert_eq!(recycled.bytes, local);
+    assert_eq!(firewall.counters(), Default::default());
+
+    let mut forwarded = local;
+    forwarded[30..34].copy_from_slice(&HOST.octets());
+    rewrite_ipv4_header(&mut forwarded);
+    legacy.inject(WAN, forwarded.clone());
+    let legacy_forwarded = legacy.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    assert_eq!(
+        (
+            legacy_forwarded.tx_requested,
+            legacy_forwarded.dropped,
+            legacy_forwarded.consumed
+        ),
+        (1, 0, 0)
+    );
+    assert_eq!(legacy.pop_tx().unwrap().egress, LAN);
+
+    protected.inject(WAN, forwarded.clone());
+    protected
+        .run_firewall_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(&mut firewall),
+            MonotonicMillis(0),
+            &mut NoTrace,
+        )
+        .unwrap();
+    assert_drop(
+        &mut protected,
+        DropReason::FirewallUnsupportedProtocol,
+        &forwarded,
+    );
+    assert_ne!(
+        DropReason::FirewallUnsupportedProtocol,
+        DropReason::FirewallRelatedIcmpv4Unsupported
+    );
+    assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
+    assert_eq!(firewall.counters().invalid_packets, 1);
+    assert_eq!(resolution.pending_actions(), 0);
+}
+
+#[test]
 fn nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically() {
     let (routes, interfaces, neighbors, bindings) = topology();
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
@@ -1159,7 +1261,7 @@ fn nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically() {
                 class: FirewallConnectionClass::Related,
                 source: FirewallPolicySource::Default,
                 matched_action: None,
-                failure: Some(FirewallFailure::RelatedStateMiss),
+                failure: None,
             }
     }));
     assert_eq!(audit.dropped_records(), 1);
@@ -1334,7 +1436,7 @@ fn related_icmpv4_requires_both_nat_mapping_and_firewall_origin_state() {
             class: FirewallConnectionClass::Related,
             source: FirewallPolicySource::Default,
             matched_action: None,
-            failure: Some(FirewallFailure::RelatedStateMiss),
+            failure: None,
         }
     );
     assert_eq!(udp.mappings(), before_udp);
@@ -1872,6 +1974,19 @@ fn typed_audit_preserves_first_match_rule_default_and_established_identity() {
     assert!(firewall.states()[0].is_occupied());
     assert_eq!(firewall.states()[0].origin_rule_id(), FirewallRuleId(2));
     assert_eq!(firewall.counters().rule_evaluations, 5);
+}
+
+#[test]
+fn public_firewall_failure_remains_exhaustive_for_existing_callers() {
+    fn stable_code(failure: FirewallFailure) -> u8 {
+        match failure {
+            FirewallFailure::InvalidInitialTcp => 1,
+            FirewallFailure::StateTableFull => 2,
+        }
+    }
+
+    assert_eq!(stable_code(FirewallFailure::InvalidInitialTcp), 1);
+    assert_eq!(stable_code(FirewallFailure::StateTableFull), 2);
 }
 
 #[test]
