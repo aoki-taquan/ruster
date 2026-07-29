@@ -35,6 +35,14 @@ pub enum DropReason {
     ArpSenderHardwareZero = 23,
     ArpSenderHardwareBroadcast = 24,
     ArpSenderHardwareMulticast = 25,
+    Icmpv4HeaderTruncated = 26,
+    Icmpv4EchoHeaderTruncated = 27,
+    Icmpv4ChecksumInvalid = 28,
+    Icmpv4EchoCodeInvalid = 29,
+    Icmpv4FragmentUnsupported = 30,
+    Icmpv4SourceNotUnicast = 31,
+    Icmpv4EthernetSourceInvalid = 32,
+    Icmpv4EthernetDestinationNotLocal = 33,
 }
 
 use DropReason::*;
@@ -68,6 +76,14 @@ impl DropReason {
             ArpSenderHardwareZero => "ARP_SENDER_HARDWARE_ZERO",
             ArpSenderHardwareBroadcast => "ARP_SENDER_HARDWARE_BROADCAST",
             ArpSenderHardwareMulticast => "ARP_SENDER_HARDWARE_MULTICAST",
+            Icmpv4HeaderTruncated => "ICMPV4_HEADER_TRUNCATED",
+            Icmpv4EchoHeaderTruncated => "ICMPV4_ECHO_HEADER_TRUNCATED",
+            Icmpv4ChecksumInvalid => "ICMPV4_CHECKSUM_INVALID",
+            Icmpv4EchoCodeInvalid => "ICMPV4_ECHO_CODE_INVALID",
+            Icmpv4FragmentUnsupported => "ICMPV4_FRAGMENT_UNSUPPORTED",
+            Icmpv4SourceNotUnicast => "ICMPV4_SOURCE_NOT_UNICAST",
+            Icmpv4EthernetSourceInvalid => "ICMPV4_ETHERNET_SOURCE_INVALID",
+            Icmpv4EthernetDestinationNotLocal => "ICMPV4_ETHERNET_DESTINATION_NOT_LOCAL",
         }
     }
 }
@@ -84,12 +100,44 @@ pub enum SnapshotError {
     LocalIpv4BindingUnspecified,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ipv4OriginPolicy {
+    default_ttl: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Ipv4OriginPolicyError {
+    DefaultTtlZero,
+}
+
+impl Ipv4OriginPolicy {
+    pub const fn new(default_ttl: u8) -> Result<Self, Ipv4OriginPolicyError> {
+        if default_ttl == 0 {
+            return Err(Ipv4OriginPolicyError::DefaultTtlZero);
+        }
+        Ok(Self { default_ttl })
+    }
+
+    #[must_use]
+    pub const fn default_ttl(self) -> u8 {
+        self.default_ttl
+    }
+}
+
+impl Default for Ipv4OriginPolicy {
+    fn default() -> Self {
+        Self { default_ttl: 64 }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ForwardingSnapshot<'a> {
     routes: &'a [Route],
     interfaces: &'a [Interface],
     neighbors: &'a [Neighbor],
     local_ipv4: &'a [LocalIpv4Binding],
+    ipv4_origin: Ipv4OriginPolicy,
 }
 
 impl<'a> ForwardingSnapshot<'a> {
@@ -98,6 +146,22 @@ impl<'a> ForwardingSnapshot<'a> {
         interfaces: &'a [Interface],
         neighbors: &'a [Neighbor],
         local_ipv4: &'a [LocalIpv4Binding],
+    ) -> Result<Self, SnapshotError> {
+        Self::with_ipv4_origin_policy(
+            routes,
+            interfaces,
+            neighbors,
+            local_ipv4,
+            Ipv4OriginPolicy::default(),
+        )
+    }
+
+    pub fn with_ipv4_origin_policy(
+        routes: &'a [Route],
+        interfaces: &'a [Interface],
+        neighbors: &'a [Neighbor],
+        local_ipv4: &'a [LocalIpv4Binding],
+        ipv4_origin: Ipv4OriginPolicy,
     ) -> Result<Self, SnapshotError> {
         for (index, route) in routes.iter().enumerate() {
             if routes[..index].iter().any(|candidate| {
@@ -154,14 +218,21 @@ impl<'a> ForwardingSnapshot<'a> {
             interfaces,
             neighbors,
             local_ipv4,
+            ipv4_origin,
         })
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum TraceEvent {
     Ipv4Validated {
         ingress: IfId,
+        destination: crate::Ipv4Address,
+    },
+    Icmpv4EchoRequestValidated {
+        ingress: IfId,
+        source: crate::Ipv4Address,
         destination: crate::Ipv4Address,
     },
     ArpRequestValidated {
@@ -195,6 +266,11 @@ pub enum TraceEvent {
         egress: IfId,
         target_protocol: crate::Ipv4Address,
     },
+    Icmpv4EchoReplyRequested {
+        egress: IfId,
+        source: crate::Ipv4Address,
+        destination: crate::Ipv4Address,
+    },
     Dropped {
         ingress: IfId,
         reason: DropReason,
@@ -203,6 +279,10 @@ pub enum TraceEvent {
         ingress: IfId,
         reason: ConsumeReason,
         disposition: ControlDisposition,
+    },
+    Ipv4LocalConsumed {
+        ingress: IfId,
+        reason: ConsumeReason,
     },
     BatchCompleted {
         tx_accepted: usize,
@@ -257,10 +337,26 @@ struct ArpReplyDecision {
 }
 
 #[derive(Clone, Copy)]
+struct Icmpv4EchoReplyDecision {
+    egress: IfId,
+    local_mac: [u8; 6],
+    requester_mac: [u8; 6],
+    local_ip: [u8; 4],
+    requester_ip: [u8; 4],
+    ipv4_checksum: u16,
+    icmp_checksum: u16,
+    reply_ttl: u8,
+    icmp_offset: usize,
+    icmp_end: usize,
+}
+
+#[derive(Clone, Copy)]
 enum PacketDecision {
     Ipv4(Ipv4RewriteDecision),
     ArpReply(ArpReplyDecision),
-    Consume(ControlDisposition),
+    Icmpv4EchoReply(Icmpv4EchoReplyDecision),
+    ConsumeArp(ControlDisposition),
+    ConsumeIpv4Local,
 }
 
 impl PacketDecision {
@@ -268,7 +364,10 @@ impl PacketDecision {
         match self {
             Self::Ipv4(decision) => decision.egress,
             Self::ArpReply(decision) => decision.egress,
-            Self::Consume(_) => unreachable!("consumed controls have no egress"),
+            Self::Icmpv4EchoReply(decision) => decision.egress,
+            Self::ConsumeArp(_) | Self::ConsumeIpv4Local => {
+                unreachable!("consumed controls have no egress")
+            }
         }
     }
 }
@@ -321,7 +420,10 @@ where
         let result = {
             let frame = packet.bytes_mut();
             decide(&*frame, snapshot, ingress, &mut resolution, trace).and_then(|decision| {
-                if matches!(decision, PacketDecision::Consume(_)) {
+                if matches!(
+                    decision,
+                    PacketDecision::ConsumeArp(_) | PacketDecision::ConsumeIpv4Local
+                ) {
                     Ok(decision)
                 } else {
                     apply_decision(frame, decision).map(|()| decision)
@@ -329,13 +431,21 @@ where
             })
         };
         match result {
-            Ok(PacketDecision::Consume(disposition)) => {
+            Ok(PacketDecision::ConsumeArp(disposition)) => {
                 packet.consume(ConsumeReason::ArpControl);
                 consumed += 1;
                 trace.record(TraceEvent::Consumed {
                     ingress,
                     reason: ConsumeReason::ArpControl,
                     disposition,
+                });
+            }
+            Ok(PacketDecision::ConsumeIpv4Local) => {
+                packet.consume(ConsumeReason::Ipv4LocalUnsupported);
+                consumed += 1;
+                trace.record(TraceEvent::Ipv4LocalConsumed {
+                    ingress,
+                    reason: ConsumeReason::Ipv4LocalUnsupported,
                 });
             }
             Ok(decision) => {
@@ -346,6 +456,13 @@ where
                     trace.record(TraceEvent::ArpReplyRequested {
                         egress,
                         target_protocol: crate::Ipv4Address::from_octets(arp.requester_protocol),
+                    });
+                }
+                if let PacketDecision::Icmpv4EchoReply(icmp) = decision {
+                    trace.record(TraceEvent::Icmpv4EchoReplyRequested {
+                        egress,
+                        source: crate::Ipv4Address::from_octets(icmp.local_ip),
+                        destination: crate::Ipv4Address::from_octets(icmp.requester_ip),
                     });
                 }
                 trace.record(TraceEvent::TxRequested { egress });
@@ -381,9 +498,7 @@ fn decide<T: TraceSink>(
 ) -> Result<PacketDecision, DropReason> {
     let ether_type = packet::read_u16(frame, 12).ok_or(EthernetHeaderTruncated)?;
     match ether_type {
-        IPV4_ETHERTYPE => {
-            decide_ipv4(frame, snapshot, ingress, resolution, trace).map(PacketDecision::Ipv4)
-        }
+        IPV4_ETHERTYPE => decide_ipv4(frame, snapshot, ingress, resolution, trace),
         ARP_ETHERTYPE => decide_arp(frame, snapshot, ingress, resolution, trace),
         _ => Err(UnsupportedEtherType),
     }
@@ -395,12 +510,19 @@ fn decide_ipv4<T: TraceSink>(
     ingress: IfId,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
-) -> Result<Ipv4RewriteDecision, DropReason> {
+) -> Result<PacketDecision, DropReason> {
     let ipv4 = validate_ipv4_frame(frame)?;
     trace.record(TraceEvent::Ipv4Validated {
         ingress,
         destination: ipv4.destination,
     });
+    let local = snapshot
+        .local_ipv4
+        .iter()
+        .any(|binding| binding.interface == ingress && binding.address == ipv4.destination);
+    if local {
+        return decide_local_ipv4(frame, snapshot, ingress, ipv4, trace);
+    }
     if ipv4.header_len > 20 {
         return Err(Ipv4OptionsUnsupported);
     }
@@ -477,7 +599,7 @@ fn decide_ipv4<T: TraceSink>(
         egress: route.egress(),
         neighbor_target: target,
     });
-    Ok(Ipv4RewriteDecision {
+    Ok(PacketDecision::Ipv4(Ipv4RewriteDecision {
         egress: route.egress(),
         source_mac: interface.mac.0,
         destination_mac: destination_mac.0,
@@ -487,7 +609,112 @@ fn decide_ipv4<T: TraceSink>(
         old_ttl_protocol: u16::from_be_bytes([ipv4.ttl, ipv4.protocol]),
         new_ttl_protocol: u16::from_be_bytes([ipv4.ttl - 1, ipv4.protocol]),
         old_checksum: ipv4.checksum,
-    })
+    }))
+}
+
+fn decide_local_ipv4<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    ipv4: packet::ValidatedIpv4,
+    trace: &mut T,
+) -> Result<PacketDecision, DropReason> {
+    if ipv4.header_len > 20 {
+        return Err(Ipv4OptionsUnsupported);
+    }
+    if ipv4.protocol != 1 {
+        return Ok(PacketDecision::ConsumeIpv4Local);
+    }
+
+    let flags_fragment =
+        packet::read_u16(frame, ipv4.header_offset + 6).ok_or(Ipv4HeaderLengthExceedsPacket)?;
+    if flags_fragment & 0x3fff != 0 {
+        return Err(Icmpv4FragmentUnsupported);
+    }
+
+    let icmp_offset = ipv4
+        .header_offset
+        .checked_add(ipv4.header_len)
+        .ok_or(Ipv4TotalLengthExceedsPacket)?;
+    let icmp_end = ipv4
+        .header_offset
+        .checked_add(ipv4.total_len)
+        .ok_or(Ipv4TotalLengthExceedsPacket)?;
+    let icmp = frame
+        .get(icmp_offset..icmp_end)
+        .ok_or(Ipv4TotalLengthExceedsPacket)?;
+    if icmp.len() < 4 {
+        return Err(Icmpv4HeaderTruncated);
+    }
+    if icmp[0] != 8 {
+        if crate::internet_checksum(icmp) != 0 {
+            return Err(Icmpv4ChecksumInvalid);
+        }
+        return Ok(PacketDecision::ConsumeIpv4Local);
+    }
+    if icmp[1] != 0 {
+        return Err(Icmpv4EchoCodeInvalid);
+    }
+    if icmp.len() < 8 {
+        return Err(Icmpv4EchoHeaderTruncated);
+    }
+    if crate::internet_checksum(icmp) != 0 {
+        return Err(Icmpv4ChecksumInvalid);
+    }
+
+    let interface = snapshot
+        .interfaces
+        .iter()
+        .find(|item| item.id == ingress)
+        .ok_or(InterfaceMiss)?;
+    if !sender_is_host(snapshot, ingress, ipv4.source)
+        || snapshot
+            .local_ipv4
+            .iter()
+            .any(|binding| binding.interface == ingress && binding.address == ipv4.source)
+    {
+        return Err(Icmpv4SourceNotUnicast);
+    }
+    let requester_mac: [u8; 6] = frame
+        .get(6..12)
+        .ok_or(EthernetHeaderTruncated)?
+        .try_into()
+        .map_err(|_| EthernetHeaderTruncated)?;
+    if requester_mac == [0; 6] || requester_mac[0] & 1 != 0 {
+        return Err(Icmpv4EthernetSourceInvalid);
+    }
+    if frame.get(0..6) != Some(interface.mac.0.as_slice()) {
+        return Err(Icmpv4EthernetDestinationNotLocal);
+    }
+    let old_icmp_checksum =
+        packet::read_u16(frame, icmp_offset + 2).ok_or(Icmpv4HeaderTruncated)?;
+    let ipv4_id =
+        packet::read_u16(frame, ipv4.header_offset + 4).ok_or(Ipv4HeaderLengthExceedsPacket)?;
+    let ipv4_checksum = rfc1624_update(
+        ipv4.checksum,
+        u16::from_be_bytes([ipv4.ttl, ipv4.protocol]),
+        u16::from_be_bytes([snapshot.ipv4_origin.default_ttl(), ipv4.protocol]),
+    );
+    let ipv4_checksum = rfc1624_update(ipv4_checksum, ipv4_id, 0);
+    let ipv4_checksum = rfc1624_update(ipv4_checksum, flags_fragment, 0x4000);
+    let icmp_checksum = rfc1624_update(old_icmp_checksum, 0x0800, 0x0000);
+    trace.record(TraceEvent::Icmpv4EchoRequestValidated {
+        ingress,
+        source: ipv4.source,
+        destination: ipv4.destination,
+    });
+    Ok(PacketDecision::Icmpv4EchoReply(Icmpv4EchoReplyDecision {
+        egress: ingress,
+        local_mac: interface.mac.0,
+        requester_mac,
+        local_ip: ipv4.destination.octets(),
+        requester_ip: ipv4.source.octets(),
+        ipv4_checksum,
+        icmp_checksum,
+        reply_ttl: snapshot.ipv4_origin.default_ttl(),
+        icmp_offset,
+        icmp_end,
+    }))
 }
 
 fn decide_arp<T: TraceSink>(
@@ -584,7 +811,7 @@ fn decide_arp<T: TraceSink>(
         });
     }
     if arp.opcode == ArpOpcode::Reply || !target_local {
-        return Ok(PacketDecision::Consume(disposition));
+        return Ok(PacketDecision::ConsumeArp(disposition));
     }
     let interface = snapshot
         .interfaces
@@ -623,7 +850,10 @@ fn apply_decision(frame: &mut [u8], decision: PacketDecision) -> Result<(), Drop
     match decision {
         PacketDecision::Ipv4(ipv4) => apply_ipv4_rewrite(frame, ipv4),
         PacketDecision::ArpReply(arp) => apply_arp_reply(frame, arp),
-        PacketDecision::Consume(_) => unreachable!("consume decisions are never rewritten"),
+        PacketDecision::Icmpv4EchoReply(icmp) => apply_icmpv4_echo_reply(frame, icmp),
+        PacketDecision::ConsumeArp(_) | PacketDecision::ConsumeIpv4Local => {
+            unreachable!("consume decisions are never rewritten")
+        }
     }
 }
 
@@ -663,6 +893,34 @@ fn apply_arp_reply(frame: &mut [u8], decision: ArpReplyDecision) -> Result<(), D
     Ok(())
 }
 
+fn apply_icmpv4_echo_reply(
+    frame: &mut [u8],
+    decision: Icmpv4EchoReplyDecision,
+) -> Result<(), DropReason> {
+    if frame.get(0..12).is_none()
+        || frame.get(14..34).is_none()
+        || frame.get(decision.icmp_offset..decision.icmp_end).is_none()
+        || frame
+            .get(decision.icmp_offset..decision.icmp_offset + 4)
+            .is_none()
+    {
+        return Err(Ipv4TotalLengthExceedsPacket);
+    }
+
+    frame[0..6].copy_from_slice(&decision.requester_mac);
+    frame[6..12].copy_from_slice(&decision.local_mac);
+    frame[18..20].copy_from_slice(&0_u16.to_be_bytes());
+    frame[20..22].copy_from_slice(&0x4000_u16.to_be_bytes());
+    frame[22] = decision.reply_ttl;
+    frame[24..26].copy_from_slice(&decision.ipv4_checksum.to_be_bytes());
+    frame[26..30].copy_from_slice(&decision.local_ip);
+    frame[30..34].copy_from_slice(&decision.requester_ip);
+    frame[decision.icmp_offset] = 0;
+    frame[decision.icmp_offset + 2..decision.icmp_offset + 4]
+        .copy_from_slice(&decision.icmp_checksum.to_be_bytes());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::DropReason;
@@ -695,6 +953,14 @@ mod tests {
             (23, "ARP_SENDER_HARDWARE_ZERO"),
             (24, "ARP_SENDER_HARDWARE_BROADCAST"),
             (25, "ARP_SENDER_HARDWARE_MULTICAST"),
+            (26, "ICMPV4_HEADER_TRUNCATED"),
+            (27, "ICMPV4_ECHO_HEADER_TRUNCATED"),
+            (28, "ICMPV4_CHECKSUM_INVALID"),
+            (29, "ICMPV4_ECHO_CODE_INVALID"),
+            (30, "ICMPV4_FRAGMENT_UNSUPPORTED"),
+            (31, "ICMPV4_SOURCE_NOT_UNICAST"),
+            (32, "ICMPV4_ETHERNET_SOURCE_INVALID"),
+            (33, "ICMPV4_ETHERNET_DESTINATION_NOT_LOCAL"),
         ];
         let actual = [
             DropReason::EthernetHeaderTruncated,
@@ -722,6 +988,14 @@ mod tests {
             DropReason::ArpSenderHardwareZero,
             DropReason::ArpSenderHardwareBroadcast,
             DropReason::ArpSenderHardwareMulticast,
+            DropReason::Icmpv4HeaderTruncated,
+            DropReason::Icmpv4EchoHeaderTruncated,
+            DropReason::Icmpv4ChecksumInvalid,
+            DropReason::Icmpv4EchoCodeInvalid,
+            DropReason::Icmpv4FragmentUnsupported,
+            DropReason::Icmpv4SourceNotUnicast,
+            DropReason::Icmpv4EthernetSourceInvalid,
+            DropReason::Icmpv4EthernetDestinationNotLocal,
         ];
         for (reason, &(discriminant, code)) in actual.iter().zip(&expected) {
             assert_eq!(*reason as u16, discriminant);

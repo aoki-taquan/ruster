@@ -9,10 +9,10 @@ mod packet;
 mod resolution;
 mod route;
 
-pub use checksum::{ipv4_header_checksum, rfc1624_update};
+pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
 pub use forwarding::{
     forward_batch, forward_batch_with_resolution, BatchReport, DropReason, ForwardingSnapshot,
-    NoTrace, SnapshotError, TraceEvent, TraceSink,
+    Ipv4OriginPolicy, Ipv4OriginPolicyError, NoTrace, SnapshotError, TraceEvent, TraceSink,
 };
 pub use generated::{
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,

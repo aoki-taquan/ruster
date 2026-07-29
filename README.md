@@ -11,7 +11,8 @@ active treeは、そのコードを継承しないv0.2のゼロベース実装�
 
 - `ruster-core`: backend所有packetを借用し、Ethernet II / IPv4検証、LPM、
   TTL/checksum/MAC rewrite、local IPv4向けARP reply、static neighbor miss時の
-  ARP Request生成action、fixed-capacity dynamic ARP cacheを扱う。
+  ARP Request生成action、fixed-capacity dynamic ARP cache、local ICMPv4 Echo
+  responderを扱う。
 - `ruster-io-sim`: rootやNICなしでRX/generated TXのFIFO、budget、TX/drop、
   traceを決定的に検証する。
 
@@ -28,6 +29,9 @@ fast pathはpacket batchをworkerが専有します。共有`Mutex`、packet単�
 packet clone、`dyn PacketIo`を導入しません。simの`Vec`はcold I/O境界に閉じています。
 ARP replyも同じRX bufferをin-placeで書き換え、受信interfaceへcommitします。現在の
 ARP profileはinterfaceごとにlocal IPv4を一つだけ持つ静的snapshotです。
+同じbinding宛てのICMPv4 Echo Requestも、checksumとsource admissionを完了してから同じ
+RX bufferをEcho Replyへ書き換えます。local宛ての未実装protocol/controlはroutingへ
+fall throughせず、typed consumeで終端します。
 
 static neighbor missでは元IPv4 packetをbyte不変でrecycleした後、worker-localな固定
 storageで1秒に一度までARP Requestを生成できます。RX batchとgenerated TX sessionは

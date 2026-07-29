@@ -44,8 +44,12 @@ pub enum SlotCompletion {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ConsumeReason {
     ArpControl,
+    /// Valid local IPv4 traffic that this deliberately small control plane
+    /// does not implement. It must not fall through to router forwarding.
+    Ipv4LocalUnsupported,
 }
 
 /// A core-owned, worker-local RAII lease.
