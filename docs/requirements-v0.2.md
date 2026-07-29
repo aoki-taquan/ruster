@@ -39,7 +39,7 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | ICMP4-004 malformed Echo atomic drop | RFC 792, architecture contract | `invalid_ipv4_or_icmp_checksum_and_nonzero_echo_code_are_atomic` | implemented | invalid IPv4/ICMP checksumとnonzero codeはstable reasonでbyte不変drop |
 | ICMP4-005 exact ICMP/Echo minimum lengths | RFC 792 | `exact_icmp_truncation_boundaries_have_stable_atomic_reasons` | implemented | common header 4 bytes、Echo header 8 bytesの直前/境界を検証 |
 | ICMP4-006 local fragment reassembly | RFC 1122 §3.2.1.4 | `local_echo_fragments_are_typed_atomic_drops` | deviation | reassembly未実装のためMF/offset付きlocal ICMPをbyte不変dropし応答しない |
-| ICMP4-006A reserved IPv4 flag rejection | RFC 791 §3.1 | `local_echo_reserved_flag_is_typed_atomic_drop` | implemented | reserved flagをfragment reasonと区別してbyte不変drop |
+| ICMP4-006A reserved IPv4 flag handling | RFC 1812 §4.2.2.3 | `local_echo_reserved_flag_is_accepted_and_cleared_in_reply` | implemented | reserved bitだけでは受信dropせず、originated atomic ReplyではclearしてDFだけを設定 |
 | ICMP4-007 invalid IPv4 source reply suppression | RFC 1812 §§4.2.2.11, 5.3.7 | `invalid_echo_ipv4_sources_cannot_trigger_replies` | implemented | non-host、connected network/broadcast、ingress-local sourceへ応答しない |
 | ICMP4-008 exact L2 reply admission | RFC 1812 §5.3.4, local anti-amplification policy | `echo_requires_unicast_source_mac_and_exact_local_destination_mac` | implemented | link broadcast/multicastを抑止し、local policyでnonzero unicast sourceとexact local destination MACを要求 |
 | ICMP4-009 atomic reply IPv4 profile | RFC 6864, local deterministic policy | `local_echo_reply_is_in_place_exact_and_traced` | implemented | default TTL=64、ID=0、DF=1、MF/offset=0。DSCP/ECNとTotal Lengthは保存 |

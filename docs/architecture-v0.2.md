@@ -186,8 +186,9 @@ behaviorであり、RFC準拠のupper-layer deliveryを主張しません。RFC 
 deliveryはdeferredです。
 
 IPv4 reassemblyはRFC 1122 §3.2.1.4に対する現時点の明示deviationです。local ICMP fragmentは
-reassemblyや応答を行わず`Icmpv4FragmentUnsupported`でdropします。IPv4 reserved flagはRFC 791
-のzero requirementに従い、fragmentとは区別した`Icmpv4ReservedFlagSet`でbyte不変dropします。
+reassemblyや応答を行わず`Icmpv4FragmentUnsupported`でdropします。RFC 1812 §4.2.2.3に従い、
+reserved IPv4 flagがnonzeroであることだけを理由に受信packetをdropしません。valid local Echo
+として処理し、originated atomic Replyではreserved bitをclearしてDFだけを設定します。
 IPv4 options付きlocal Echoもbyte不変dropします。RFC 1122 §3.2.2.6とRFC 1812 §4.3.3.6が
 source-route reversalをMUST、Record Route/Timestamp更新をSHOULDとしているため、これは
 明示deviationです。Timestamp等の他ICMP query、options処理、ICMP error生成（TTL

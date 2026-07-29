@@ -364,15 +364,26 @@ fn local_echo_fragments_are_typed_atomic_drops() {
 }
 
 #[test]
-fn local_echo_reserved_flag_is_typed_atomic_drop() {
+fn local_echo_reserved_flag_is_accepted_and_cleared_in_reply() {
     let interfaces = interfaces();
     let bindings = [local_binding(LAN)];
     let snapshot = local_snapshot(&interfaces, &bindings);
-    assert_drop_atomic(
+    let mut io = SimIo::new();
+    io.inject(
+        LAN,
         ipv4_frame(LOCAL_IP, 1, 64, 0x8000, &icmp_message(8, 0, &[]), &[]),
-        &snapshot,
-        DropReason::Icmpv4ReservedFlagSet,
     );
+
+    let report = io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+
+    assert_eq!(report.tx_requested, 1);
+    assert_eq!(report.dropped, 0);
+    let reply = io.pop_tx().unwrap();
+    assert_eq!(&reply.bytes[18..20], &[0, 0]);
+    assert_eq!(&reply.bytes[20..22], &0x4000_u16.to_be_bytes());
+    assert_eq!(ipv4_header_checksum(&reply.bytes[14..34]), 0);
+    assert_eq!(reply.bytes[34], 0);
+    assert_eq!(internet_checksum(&reply.bytes[34..42]), 0);
 }
 
 #[test]

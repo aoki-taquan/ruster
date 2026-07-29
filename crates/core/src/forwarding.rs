@@ -43,7 +43,6 @@ pub enum DropReason {
     Icmpv4SourceNotUnicast = 31,
     Icmpv4EthernetSourceInvalid = 32,
     Icmpv4EthernetDestinationNotLocal = 33,
-    Icmpv4ReservedFlagSet = 34,
 }
 
 use DropReason::*;
@@ -85,7 +84,6 @@ impl DropReason {
             Icmpv4SourceNotUnicast => "ICMPV4_SOURCE_NOT_UNICAST",
             Icmpv4EthernetSourceInvalid => "ICMPV4_ETHERNET_SOURCE_INVALID",
             Icmpv4EthernetDestinationNotLocal => "ICMPV4_ETHERNET_DESTINATION_NOT_LOCAL",
-            Icmpv4ReservedFlagSet => "ICMPV4_RESERVED_FLAG_SET",
         }
     }
 }
@@ -630,9 +628,6 @@ fn decide_local_ipv4<T: TraceSink>(
 
     let flags_fragment =
         packet::read_u16(frame, ipv4.header_offset + 6).ok_or(Ipv4HeaderLengthExceedsPacket)?;
-    if flags_fragment & 0x8000 != 0 {
-        return Err(Icmpv4ReservedFlagSet);
-    }
     if flags_fragment & 0x3fff != 0 {
         return Err(Icmpv4FragmentUnsupported);
     }
@@ -966,7 +961,6 @@ mod tests {
             (31, "ICMPV4_SOURCE_NOT_UNICAST"),
             (32, "ICMPV4_ETHERNET_SOURCE_INVALID"),
             (33, "ICMPV4_ETHERNET_DESTINATION_NOT_LOCAL"),
-            (34, "ICMPV4_RESERVED_FLAG_SET"),
         ];
         let actual = [
             DropReason::EthernetHeaderTruncated,
@@ -1002,7 +996,6 @@ mod tests {
             DropReason::Icmpv4SourceNotUnicast,
             DropReason::Icmpv4EthernetSourceInvalid,
             DropReason::Icmpv4EthernetDestinationNotLocal,
-            DropReason::Icmpv4ReservedFlagSet,
         ];
         for (reason, &(discriminant, code)) in actual.iter().zip(&expected) {
             assert_eq!(*reason as u16, discriminant);
