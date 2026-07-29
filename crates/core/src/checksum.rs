@@ -1,10 +1,10 @@
-/// Computes the Internet checksum over an IPv4 header.
+/// Computes the Internet checksum over an arbitrary byte slice.
 ///
-/// The checksum field must be zero when creating a header. A complete valid
-/// header, including its checksum, produces zero.
+/// This is the checksum algorithm shared by IPv4 and ICMP. An odd final byte
+/// is treated as the high byte of a zero-padded 16-bit word.
 #[must_use]
-pub fn ipv4_header_checksum(header: &[u8]) -> u16 {
-    let mut chunks = header.chunks_exact(2);
+pub fn internet_checksum(bytes: &[u8]) -> u16 {
+    let mut chunks = bytes.chunks_exact(2);
     let mut sum = chunks.by_ref().fold(0_u32, |sum, word| {
         sum + u32::from(u16::from_be_bytes([word[0], word[1]]))
     });
@@ -12,6 +12,15 @@ pub fn ipv4_header_checksum(header: &[u8]) -> u16 {
         sum += u32::from(last) << 8;
     }
     fold(sum)
+}
+
+/// Computes the Internet checksum over an IPv4 header.
+///
+/// The checksum field must be zero when creating a header. A complete valid
+/// header, including its checksum, produces zero.
+#[must_use]
+pub fn ipv4_header_checksum(header: &[u8]) -> u16 {
+    internet_checksum(header)
 }
 
 /// Updates an Internet checksum after replacing one 16-bit word (RFC 1624 §4).
