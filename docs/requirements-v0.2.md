@@ -149,7 +149,21 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | NAT44-016 malformed/unsupported fail closed | RFC 768, local security boundary | `malformed_udp_options_and_unsupported_transport_never_create_state` | implemented | truncated/invalid length/options/unsupported protocol crossingでprivate sourceを漏らさずstateなし。非TCP/UDPはNAT state/trace/watermark不変 |
 | NAT44-017 hairpinning | RFC 4787 REQ-9 | `structural_and_policy_failures_are_byte_and_state_atomic` | deferred | inside→own publicはWANへ漏らさずtyped drop。hairpin translation未実装 |
 | NAT44-018 fragment translation | RFC 3022 §6.3, RFC 4787 REQ-14 | `structural_and_policy_failures_are_byte_and_state_atomic` | deferred | fragment association/reassembly未実装。atomic DF=1だけの初期profile |
-| NAT44-019 ICMP error translation and PMTU | RFC 3022 §§4.3, 6.3 | `wrong_ingress_unrelated_traffic_and_icmp_are_explicitly_non_nat` | deferred | incoming ICMPはmappingをrefresh/deleteせず従来local path。embedded tuple/PMTU translationなし |
+| NAT44-019 external Fragmentation Needed tuple translation | RFC 5508 REQ-4, RFC 1191, RFC 3022 §4.3 | `udp_frag_needed_translates_cascade_and_keeps_nat_state_read_only` | implemented | policy opt-inのoutside/public Type 3/Code 4だけouter destinationと引用UDP/TCP source tupleをinsideへ戻しtype/codeを保存 |
+| NAT44-019A ICMP error payload validation | RFC 5508 REQ-3(a-c) | `malformed_candidate_matrix_has_stable_atomic_reasons` | implemented | outer ICMPと引用IPv4 checksumを検証しoptions IHLを使用。embedded transport checksumは検証しない |
+| NAT44-019B read-only ICMP NAT session | RFC 5508 REQ-6 safety objective generalized by local policy, architecture contract | `backend_reject_and_clock_regression_leave_icmp_lookup_state_unchanged` | implemented | REQ-6が直接対象にするICMP Query/responseに加え、UDP/TCP引用でもlookup成功/drop/backend reject時にmapping/peer/session/last time/counter/watermarkを変更しないlocal generalization |
+| NAT44-019C bounded quoted transport checksum rewrite | RFC 1624 §4, local bounded profile | `tcp_quote_boundaries_and_exact_session_authority_are_enforced` | implemented | UDP zero/negative-zero、TCP 8..16/17/18境界を区別し引用Total Length内だけを更新 |
+| NAT44-019D opaque trailing bytes boundary | local safe boundary; RFC 5508 REQ-3(d)/RFC 4884 full parsing tracked by NAT44-019N | `tcp_total_length_prevents_opaque_trailing_bytes_from_becoming_a_checksum` | implemented | local safe boundaryのみ実装。引用Total Length外をtransport checksumと誤認しないだけで、REQ-3(d)のRFC 4884 object検出・解析を直接実装したものではない |
+| NAT44-019E external source admission and preservation | RFC 5508 REQ-4, RFC 1812 §5.3.8, local strict-uRPF policy | `outer_source_admission_rejects_non_hosts_local_and_inside_routes_atomically` | implemented | host-unicastかつreverse outsideだけ許可するためasymmetric external pathを意図的に拒否し、中継sourceは引用remoteと不一致でもouter sourceを保存 |
+| NAT44-019F protocol-side opt-in and padding bound | architecture compatibility contract | `mixed_protocol_policies_and_padding_peek_preserve_legacy_local_handling` | implemented | 引用protocol側policyだけがinterceptしType/Code peekをouter Total Length内に限定 |
+| NAT44-019G Next-Hop MTU pass-through | RFC 1191 §§3–4, RFC 5508 §7.1.2 | `same_batch_combined_dispatches_same_public_port_and_preserves_all_mtu_values` | implemented | unused+MTU 32 bitsを解釈せず保存しMTU 0/68/1500/65535を同等に扱う |
+| NAT44-019H private-to-external ICMP error translation | RFC 5508 REQ-5 | — | deferred | ExternalOnly profileの逆方向は未実装 |
+| NAT44-019I hairpin ICMP error traversal | RFC 5508 REQ-7 | — | deferred | hairpin NAT自体とouter/引用の二重変換を未実装 |
+| NAT44-019J other ICMP error type/code translation | RFC 5508 REQ-3/4 | — | deferred | Type 3/Code 4以外はlegacy local control path |
+| NAT44-019K local Packet Too Big generation | RFC 1191 §4, RFC 5508 §7.1.1 | — | deferred | local egress MTU判定とType 3/Code 4生成を未実装 |
+| NAT44-019L DF-zero fragmentation | RFC 5508 §7.1.1, RFC 1812 §5.2.7 | — | deferred | forwarding MTU超過時のIPv4 fragmentation未実装 |
+| NAT44-019M PMTU cache and plateau fallback | RFC 1191 §§5–7 | — | deferred | received MTUによるcache更新、timer、MTU 0推定を未実装 |
+| NAT44-019N RFC 4884 extension parsing | RFC 5508 REQ-3(d), RFC 4884 | — | deferred | optional paddingとextension objectを識別・変換するfull support未実装 |
 | NAT44-020 other transports/features | RFC 3022, RFC 4787, RFC 7857 | — | deferred | ICMP query NAT、static forwards、multi-public、port randomization/parity、full packet filter/firewall |
 | NAT44-021 external-to-internal bypass prevention | RFC 3022 traditional NAT domain boundary, local security policy | `outside_to_inside_lpm_bypass_is_always_fail_closed_before_neighbor_work` | implemented | authorized public UDP/TCP DNAT以外のoutside→inside LPMをprotocol/runtime/state非依存でneighbor処理前にgeneric drop |
 | NAT44-022 outbound-initiated TCP EIM | RFC 3022 §§2–4, RFC 5382 §§4–5 | `syn_synack_and_data_translate_bidirectionally_in_one_batch` | implemented | internal TCP tuple mapping。新規sessionはoutbound initial SYNだけ。RFC 5382全体準拠は非主張 |
@@ -160,7 +174,7 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | NAT44-027 TCP incremental checksum zero semantics | RFC 1624 §4, RFC 9293 §3.1 | `incremental_tcp_checksum_keeps_mathematical_zero_on_wire` | implemented | address/portをincremental更新。UDP式zero preservation/`0xffff` normalizationなし |
 | NAT44-028 TCP flag admission without phase claims | RFC 9293 §§3.1, 3.10.7 | `only_initial_syn_creates_and_fin_rst_only_refresh_idle_lifetime` | deviation | initial SYNだけstate作成。既存exact sessionの全valid flagsを変換するがsequence/window/ACK validationなし |
 | NAT44-029 protocol-separated combined service | RFC 3022 traditional NAPT, architecture contract | `combined_udp_tcp_realms_keep_protocol_state_and_ports_independent` | implemented | UDP/TCPは同一数値public port可。single-protocol crossingとcombined realm mismatchはfail closed |
-| NAT44-030 TCP fragment/hairpin/ICMP PMTU | RFC 3022 §§4.3, 6.3, RFC 5382 §§6–9, RFC 6864 §§4.1–4.2 | `malformed_checksum_fragment_source_zero_and_options_are_atomic` | deferred | atomic DF=1のみ。hairpin、fragment association、embedded ICMP/PMTU、full RFC 5382 sequence lifecycleは未実装 |
+| NAT44-030 TCP fragment/hairpin/other ICMP | RFC 3022 §§4.3, 6.3, RFC 5382 §§6–9, RFC 6864 §§4.1–4.2 | `malformed_checksum_fragment_source_zero_and_options_are_atomic` | deferred | atomic DF=1のみ。hairpin、fragment association、Type 3/Code 4以外のembedded ICMP、full RFC 5382 sequence lifecycleは未実装 |
 
 ## RFC deviation rule
 
