@@ -508,11 +508,12 @@ RFC 4884 full supportもdeferredです。
 
 firewallはopt-inの追加serviceであり、既存`forward_batch*` APIとdefault forwardingを変更
 しません。`forward_batch_with_firewall`はplain forwarding、combined APIはUDP/TCP NAT44と
-同じworker-local RX transactionで合成します。対象はrouterを通過するatomic IPv4 UDP/TCP
-だけです。ARP、ingress-scoped router-local IPv4、RX phase後に実行するrouter-originated
+同じworker-local RX transactionで合成します。対象はrouterを通過するunfragmented IPv4
+UDP/TCPだけです。ARP、ingress-scoped router-local IPv4、RX phase後に実行するrouter-originated
 generated packetはfirewall domain外です。options、reserved flag、MF、nonzero fragment
 offset、TCP/UDP以外のforward protocolはsilent typed dropで、ICMP/RSTを生成しません。
-DF=0とDF=1はどちらもnonfragment datagramとして許可します。
+RFC 791のfragment fieldsでMF=0/offset=0なら、DF=0とDF=1のどちらもunfragmented datagram
+として許可します。ここでRFC 6864のatomic datagramという用語は使いません。
 
 ruleはstable `FirewallRuleId`を持つimmutable sliceで、ingress/egress `IfId|Any`、
 canonical source/destination prefix、TCP/UDP、inclusive source/destination port range、
@@ -521,7 +522,9 @@ canonical source/destination prefix、TCP/UDP、inclusive source/destination por
 noncanonical prefix、reversed range、invalid timeout、zero config generationはpublication
 前に拒否します。同一generationと同一rules/snapshot identityのreconcileはno-op、
 同一generationの別identityとgeneration regressionは拒否し、forward generationは全stateを
-flushします。
+flushします。snapshotのcontent fingerprintとslice identity、rule fingerprintはpublication
+時に一度だけ計算してconfig/runtimeへbindし、packet pathのauthority確認はpointer/length/
+fingerprintのO(1)比較です。packetごとのsnapshot再hashやrules slice equalityは行いません。
 
 flow keyはprotocol、origin ingress/egress、initiator/responder IPv4 address+port、
 config generationです。ordinary forwardingはwire view、NAT outboundはpre-SNAT
@@ -545,13 +548,31 @@ default/minimum 240秒、Activeはdefault/minimum 2時間4分、最大7日です
 `ESTABLISHED`はlocal exact state hitだけで、conntrack helper、TCP reassembly、RFC 5382/
 RFC 7857 full complianceの主張ではありません。
 
-stateはcaller-backed fixed sliceをworkerが専有し、runtimeは`!Send + !Sync`です。lookup/
-expired-slot probeはcapacityでbounded、live evictionなし、zero/full capacityはtyped drop、
-slot generationはnonzeroでstale plan commitを防ぎます。planはstateを変更せず、full
-validation、NAT authority、LPM、FW rule/state、TTL/neighbor、rewrite preflightがすべて成功
-してbytesを更新した後にNAT/FWをinfallible commitし、TX requestします。同batchの次packetは
-直前commitを参照できます。backend rejectでもTX-request stateは保持します。deny、route/
-neighbor/NAT/rewrite failureではFW flowを作りません。
+stateはcaller-backed fixed sliceをworkerが専有し、runtimeは`!Send + !Sync`です。
+forward/reverseで同じcanonical hashを使うlinear open addressingで、established lookupは
+cluster終端のempty slotまたはcapacityまでのbounded probeです。new flowだけordered ruleを
+scanし、first expired tombstoneをreuseします。live evictionはなく、zero/full capacityはtyped
+dropです。probe数とrule evaluation数はcounterで観測できます。
+
+runtime/config/snapshot authorityとIPv4/transport structural/checksum validationはLPMより前に
+行います。valid attemptはstate/NAT lookupより前にworker-local security watermarkを単調更新し、
+rule/default deny、state full、route/neighbor/NAT missでも戻しません。そのためfuture時刻のdeny
+やmiss後に古い時刻でflowが復活することはなく、古いpacketはbyte/state/activity不変の
+`FirewallClockRegression`またはNAT clock regressionになります。FW opt-in時のLPM missは
+egress不明のためrule評価せず`FirewallRouteUnavailable`でsilent dropし、Type 3/Code 0やARPを
+queueしません。NAT inboundもFW state/rule判定をTTL判定より先に行います。
+
+planはflow stateを変更せず、runtime epoch、config generation、slot generationを保持します。
+commitはrelease buildでも三者を検証するtyped `Result`で、reconcileはepochを進めるため、
+reconcile後またはslot reuse後のstale planをcommitできません。直列packet pathではvalidation、
+NAT authority、LPM、FW rule/state、TTL/neighbor、rewrite preflightが成功してbytesを更新した
+後にchecked NAT/FW commitを行い、TX requestします。同batchの次packetは直前commitを参照でき、
+backend rejectでもTX-request stateを保持します。deny、route/neighbor/NAT/rewrite failureでは
+FW flowを作りません。
+
+audited APIはcaller-backed fixed `FirewallAuditBuffer`へ、policy evaluationへ到達した各packetの
+`Allow|Drop`、`New|Established`、`Rule(FirewallRuleId)|Default`を順番に記録します。buffer不足は
+typed overflow countになり、hot pathにheap、`String`、trait objectを導入しません。
 
 NAT inbound mapping/sessionがあってもexact reverse FW stateが無ければinside neighborより前に
 denyします。NAT/FWどちらかのcapacity plan failureでも他方をcommitしません。NAT44 ICMPv4

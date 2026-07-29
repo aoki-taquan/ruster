@@ -1,13 +1,14 @@
 use ruster_core::{
-    internet_checksum, ipv4_header_checksum, DropReason, FirewallAction, FirewallConfig,
-    FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange, FirewallProtocol,
-    FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot, FirewallTcpPhase,
-    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
-    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
-    MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy,
-    Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
-    Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace, ResolutionActionSlot, ResolutionPolicy,
-    ResolutionRuntime, ResolutionStateSlot, Route,
+    internet_checksum, ipv4_header_checksum, DropReason, FirewallAction, FirewallAuditBuffer,
+    FirewallAuditRecord, FirewallConfig, FirewallConnectionClass, FirewallDisposition,
+    FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPolicySource, FirewallPortRange,
+    FirewallProtocol, FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot,
+    FirewallTcpPhase, FirewallVerdict, ForwardingSnapshot, Icmpv4ErrorActionSlot,
+    Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
+    LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
+    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig,
+    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace,
+    ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
 };
 use ruster_io_sim::{RecycleCause, SimIo};
 
@@ -229,6 +230,23 @@ fn assert_drop(io: &mut SimIo, reason: DropReason, original: &[u8]) {
     assert_eq!(dropped.bytes, original);
 }
 
+fn rewrite_ipv4_header(frame: &mut [u8]) {
+    let header_len = usize::from(frame[14] & 0x0f) * 4;
+    frame[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&frame[14..14 + header_len]);
+    frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+}
+
+fn set_ttl(frame: &mut [u8], ttl: u8) {
+    frame[22] = ttl;
+    rewrite_ipv4_header(frame);
+}
+
+fn set_protocol(frame: &mut [u8], protocol: u8) {
+    frame[23] = protocol;
+    rewrite_ipv4_header(frame);
+}
+
 fn frag_needed(quote: &[u8]) -> Vec<u8> {
     let total_len = 20 + 8 + quote.len();
     let mut frame = vec![0_u8; 14 + total_len];
@@ -416,6 +434,20 @@ fn udp_pseudo_session_exact_reverse_checksum_df_and_padding_are_enforced() {
     )
     .unwrap();
     assert_drop(&mut io, DropReason::FirewallDefaultDenied, &wrong);
+
+    let wrong_interface = udp_frame(REMOTE, HOST, 53, 12_345, 0, false);
+    io.inject(LAN, wrong_interface.clone());
+    io.run_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut firewall),
+        MonotonicMillis(11),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallDefaultDenied, &wrong_interface);
 
     let mut bad_checksum = reverse;
     bad_checksum[42] ^= 1;
@@ -761,7 +793,8 @@ fn nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically() {
     let mut resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
 
-    io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false));
+    let outbound_udp = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
+    io.inject(LAN, outbound_udp);
     io.inject(LAN, tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0x4000));
     io.run_nat44_udp_and_tcp_with_firewall_once(
         2,
@@ -810,6 +843,12 @@ fn nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically() {
     assert_eq!(&tcp_in.bytes[30..34], &HOST.octets());
 
     let before_firewall = firewall.states().to_vec();
+    let before_udp_counters = udp.counters();
+    let before_udp_mappings = udp.mappings().to_vec();
+    let before_udp_peers = udp.peers().to_vec();
+    let before_tcp_counters = tcp.counters();
+    let before_tcp_mappings = tcp.mappings().to_vec();
+    let before_tcp_sessions = tcp.sessions().to_vec();
     let related = frag_needed(&udp_out.bytes[14..42]);
     io.inject(WAN, related.clone());
     io.run_nat44_udp_and_tcp_with_firewall_once(
@@ -832,6 +871,12 @@ fn nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically() {
         &related,
     );
     assert_eq!(firewall.states(), before_firewall);
+    assert_eq!(udp.counters(), before_udp_counters);
+    assert_eq!(udp.mappings(), before_udp_mappings);
+    assert_eq!(udp.peers(), before_udp_peers);
+    assert_eq!(tcp.counters(), before_tcp_counters);
+    assert_eq!(tcp.mappings(), before_tcp_mappings);
+    assert_eq!(tcp.sessions(), before_tcp_sessions);
 
     io.set_received_accept_budget(0);
     let existing = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
@@ -972,7 +1017,23 @@ fn nat_inbound_mapping_without_exact_firewall_reverse_state_is_denied() {
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
-    io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false));
+    let outbound = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
+    io.inject(LAN, outbound);
+    io.run_nat44_udp_and_tcp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        MonotonicMillis(0),
+        &mut NoTrace,
+    )
+    .unwrap();
+    io.pop_tx().unwrap();
+    let outbound_tcp = tcp_frame(HOST, REMOTE, 12_346, 443, 0x02, 0x4000);
+    io.inject(LAN, outbound_tcp);
     io.run_nat44_udp_and_tcp_once(
         1,
         &snapshot,
@@ -993,7 +1054,8 @@ fn nat_inbound_mapping_without_exact_firewall_reverse_state_is_denied() {
         FirewallConfig::new(&snapshot, &rules, FirewallPolicy::default(), 1).unwrap();
     let mut firewall_slots = [FirewallStateSlot::default(); 1];
     let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_slots);
-    let inbound = udp_frame(REMOTE, WAN_LOCAL, 53, 40_000, 0x4000, false);
+    let mut inbound = udp_frame(REMOTE, WAN_LOCAL, 53, 40_000, 0x4000, false);
+    set_ttl(&mut inbound, 1);
     io.inject(WAN, inbound.clone());
     io.run_nat44_udp_and_tcp_with_firewall_once(
         1,
@@ -1014,7 +1076,28 @@ fn nat_inbound_mapping_without_exact_firewall_reverse_state_is_denied() {
     assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
     assert_eq!(resolution.pending_actions(), 0);
 
-    io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false));
+    let mut inbound_tcp = tcp_frame(REMOTE, WAN_LOCAL, 443, 40_000, 0x12, 0x4000);
+    set_ttl(&mut inbound_tcp, 1);
+    io.inject(WAN, inbound_tcp.clone());
+    io.run_nat44_udp_and_tcp_with_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        &firewall_config,
+        Some(&mut firewall),
+        MonotonicMillis(100),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallDefaultDenied, &inbound_tcp);
+    assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
+
+    let old_time = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
+    io.inject(LAN, old_time.clone());
     io.run_nat44_udp_and_tcp_once(
         1,
         &snapshot,
@@ -1027,5 +1110,595 @@ fn nat_inbound_mapping_without_exact_firewall_reverse_state_is_denied() {
         &mut NoTrace,
     )
     .unwrap();
+    assert_drop(&mut io, DropReason::Nat44UdpClockRegression, &old_time);
+}
+
+#[test]
+fn typed_audit_preserves_first_match_rule_default_and_established_identity() {
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let rules = [
+        rule(
+            1,
+            FirewallInterface::Interface(LAN),
+            FirewallInterface::Interface(WAN),
+            prefix(HOST, 32),
+            any_prefix(),
+            FirewallProtocol::Udp,
+            ports(12_345, 12_345),
+            ports(53, 53),
+            FirewallAction::Deny,
+        ),
+        rule(
+            2,
+            FirewallInterface::Interface(LAN),
+            FirewallInterface::Interface(WAN),
+            prefix(HOST, 32),
+            any_prefix(),
+            FirewallProtocol::Udp,
+            ports(12_346, 12_346),
+            ports(53, 53),
+            FirewallAction::AllowStateful,
+        ),
+    ];
+    let config = FirewallConfig::new(&snapshot, &rules, FirewallPolicy::default(), 1).unwrap();
+    let mut firewall_slots = [FirewallStateSlot::default(); 1];
+    let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut audit_storage = [FirewallAuditRecord::default(); 4];
+    let mut audit = FirewallAuditBuffer::new(&mut audit_storage);
+    let mut io = SimIo::new();
+    io.set_received_accept_budget(0);
+    io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53, 0, false));
+    io.inject(LAN, udp_frame(HOST, REMOTE, 12_346, 53, 0, false));
+    io.inject(WAN, udp_frame(REMOTE, HOST, 53, 12_346, 0, false));
+    io.inject(LAN, udp_frame(HOST, REMOTE, 12_347, 53, 0, false));
+    let report = io
+        .run_firewall_audited_once(
+            4,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(&mut firewall),
+            &mut audit,
+            MonotonicMillis(10),
+            &mut NoTrace,
+        )
+        .unwrap();
+    assert_eq!(report.dropped, 2);
+    assert_eq!(report.completion.tx_rejected, 2);
+    assert_eq!(audit.dropped_records(), 0);
+    assert_eq!(
+        audit
+            .records()
+            .iter()
+            .map(|record| record.disposition)
+            .collect::<Vec<_>>(),
+        vec![
+            FirewallDisposition {
+                verdict: FirewallVerdict::Drop,
+                class: FirewallConnectionClass::New,
+                source: FirewallPolicySource::Rule(FirewallRuleId(1)),
+            },
+            FirewallDisposition {
+                verdict: FirewallVerdict::Allow,
+                class: FirewallConnectionClass::New,
+                source: FirewallPolicySource::Rule(FirewallRuleId(2)),
+            },
+            FirewallDisposition {
+                verdict: FirewallVerdict::Allow,
+                class: FirewallConnectionClass::Established,
+                source: FirewallPolicySource::Rule(FirewallRuleId(2)),
+            },
+            FirewallDisposition {
+                verdict: FirewallVerdict::Drop,
+                class: FirewallConnectionClass::New,
+                source: FirewallPolicySource::Default,
+            },
+        ]
+    );
+    assert!(firewall.states()[0].is_occupied());
+    assert_eq!(firewall.states()[0].origin_rule_id(), FirewallRuleId(2));
+    assert_eq!(firewall.counters().rule_evaluations, 5);
+}
+
+#[test]
+fn future_denies_make_plain_udp_and_tcp_old_time_fail_closed_without_state_changes() {
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let rules = [
+        rule(
+            1,
+            FirewallInterface::Any,
+            FirewallInterface::Any,
+            any_prefix(),
+            any_prefix(),
+            FirewallProtocol::Udp,
+            ports(0, u16::MAX),
+            ports(0, u16::MAX),
+            FirewallAction::Deny,
+        ),
+        rule(
+            2,
+            FirewallInterface::Any,
+            FirewallInterface::Any,
+            any_prefix(),
+            any_prefix(),
+            FirewallProtocol::Tcp,
+            ports(0, u16::MAX),
+            ports(0, u16::MAX),
+            FirewallAction::Deny,
+        ),
+    ];
+    let config = FirewallConfig::new(&snapshot, &rules, FirewallPolicy::default(), 1).unwrap();
+    let mut firewall_slots = [FirewallStateSlot::default(); 2];
+    let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut io = SimIo::new();
+
+    for (frame, now, reason) in [
+        (
+            udp_frame(HOST, REMOTE, 12_345, 53, 0, false),
+            100,
+            DropReason::FirewallRuleDenied,
+        ),
+        (
+            udp_frame(HOST, REMOTE, 12_345, 53, 0, false),
+            99,
+            DropReason::FirewallClockRegression,
+        ),
+        (
+            tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0),
+            200,
+            DropReason::FirewallRuleDenied,
+        ),
+        (
+            tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0),
+            199,
+            DropReason::FirewallClockRegression,
+        ),
+    ] {
+        io.inject(LAN, frame.clone());
+        io.run_firewall_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(&mut firewall),
+            MonotonicMillis(now),
+            &mut NoTrace,
+        )
+        .unwrap();
+        assert_drop(&mut io, reason, &frame);
+        assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
+    }
+    assert_eq!(firewall.counters().clock_regressions, 2);
+}
+
+#[test]
+fn future_combined_denies_advance_udp_and_tcp_nat_security_watermarks_only() {
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let udp_config = Nat44UdpConfig::new(
+        &snapshot,
+        LAN,
+        WAN,
+        WAN_LOCAL,
+        40_000,
+        40_000,
+        Nat44UdpPolicy::default(),
+    )
+    .unwrap();
+    let tcp_config = Nat44TcpConfig::new(
+        &snapshot,
+        LAN,
+        WAN,
+        WAN_LOCAL,
+        40_000,
+        40_000,
+        Nat44TcpPolicy::default(),
+    )
+    .unwrap();
+    let rules = [
+        rule(
+            1,
+            FirewallInterface::Any,
+            FirewallInterface::Any,
+            any_prefix(),
+            any_prefix(),
+            FirewallProtocol::Udp,
+            ports(0, u16::MAX),
+            ports(0, u16::MAX),
+            FirewallAction::Deny,
+        ),
+        rule(
+            2,
+            FirewallInterface::Any,
+            FirewallInterface::Any,
+            any_prefix(),
+            any_prefix(),
+            FirewallProtocol::Tcp,
+            ports(0, u16::MAX),
+            ports(0, u16::MAX),
+            FirewallAction::Deny,
+        ),
+    ];
+    let firewall_config =
+        FirewallConfig::new(&snapshot, &rules, FirewallPolicy::default(), 1).unwrap();
+    let mut firewall_slots = [];
+    let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_slots);
+    let mut udp_mappings = [Nat44UdpMappingSlot::default(); 1];
+    let mut udp_peers = [Nat44UdpPeerSlot::default(); 1];
+    let mut udp = Nat44UdpRuntime::new(udp_config, &mut udp_mappings, &mut udp_peers);
+    let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
+    let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
+    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut io = SimIo::new();
+
+    let future_udp = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
+    io.inject(LAN, future_udp.clone());
+    io.run_nat44_udp_and_tcp_with_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        &firewall_config,
+        Some(&mut firewall),
+        MonotonicMillis(100),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallRuleDenied, &future_udp);
+    let old_udp = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
+    io.inject(LAN, old_udp.clone());
+    io.run_nat44_udp_and_tcp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        MonotonicMillis(99),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::Nat44UdpClockRegression, &old_udp);
+
+    let future_tcp = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0x4000);
+    io.inject(LAN, future_tcp.clone());
+    io.run_nat44_udp_and_tcp_with_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        &firewall_config,
+        Some(&mut firewall),
+        MonotonicMillis(200),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallRuleDenied, &future_tcp);
+    let old_tcp = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0x4000);
+    io.inject(LAN, old_tcp.clone());
+    io.run_nat44_udp_and_tcp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        MonotonicMillis(199),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::Nat44TcpClockRegression, &old_tcp);
+    assert!(udp.mappings().iter().all(|slot| !slot.is_occupied()));
+    assert!(tcp.mappings().iter().all(|slot| !slot.is_occupied()));
+    assert!(tcp.sessions().iter().all(|slot| !slot.is_occupied()));
+}
+
+#[test]
+fn firewall_preflight_hides_route_oracles_and_never_queues_icmp_or_arp_on_failures() {
+    let (all_routes, interfaces, neighbors, bindings) = topology();
+    let no_remote_routes = [all_routes[0]];
+    let snapshot =
+        ForwardingSnapshot::new(&no_remote_routes, &interfaces, &neighbors, &bindings).unwrap();
+    let rules = [allow(FirewallProtocol::Udp)];
+    let config = FirewallConfig::new(&snapshot, &rules, FirewallPolicy::default(), 1).unwrap();
+    let config2 = FirewallConfig::new(&snapshot, &rules, FirewallPolicy::default(), 2).unwrap();
+    let mut firewall_slots = [FirewallStateSlot::default(); 1];
+    let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 2];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 2];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 2];
+    let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 2];
+    let mut errors = Icmpv4ErrorRuntime::new(
+        Icmpv4ErrorPolicy::default(),
+        &mut error_states,
+        &mut error_actions,
+    );
+    let mut io = SimIo::new();
+
+    let valid_no_route = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
+    io.inject(LAN, valid_no_route.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        &config,
+        Some(&mut firewall),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(
+        &mut io,
+        DropReason::FirewallRouteUnavailable,
+        &valid_no_route,
+    );
+
+    let absent = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
+    io.inject(LAN, absent.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        &config,
+        None,
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallRuntimeUnavailable, &absent);
+
+    let mismatch = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
+    io.inject(LAN, mismatch.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        &config2,
+        Some(&mut firewall),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallConfigMismatch, &mismatch);
+
+    let mut unsupported = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
+    set_protocol(&mut unsupported, 99);
+    io.inject(LAN, unsupported.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        &config,
+        Some(&mut firewall),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(
+        &mut io,
+        DropReason::FirewallUnsupportedProtocol,
+        &unsupported,
+    );
+
+    let mut malformed = udp_frame(HOST, REMOTE, 12_345, 53, 0, true);
+    malformed[42] ^= 1;
+    io.inject(LAN, malformed.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        &config,
+        Some(&mut firewall),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallUdpChecksumInvalid, &malformed);
+
+    let fragment = udp_frame(HOST, REMOTE, 12_345, 53, 0x2000, false);
+    io.inject(LAN, fragment.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        &config,
+        Some(&mut firewall),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallFragmentUnsupported, &fragment);
+    assert_eq!(errors.pending_actions(), 0);
+    assert_eq!(resolution.pending_actions(), 0);
+    assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
+
+    let snapshot =
+        ForwardingSnapshot::new(&all_routes, &interfaces, &neighbors, &bindings).unwrap();
+    let deny_rules = [rule(
+        7,
+        FirewallInterface::Any,
+        FirewallInterface::Any,
+        any_prefix(),
+        any_prefix(),
+        FirewallProtocol::Udp,
+        ports(12_345, 12_345),
+        ports(53, 53),
+        FirewallAction::Deny,
+    )];
+    let deny_config =
+        FirewallConfig::new(&snapshot, &deny_rules, FirewallPolicy::default(), 1).unwrap();
+    let mut deny_slots = [FirewallStateSlot::default(); 1];
+    let mut deny_runtime = FirewallRuntime::new(deny_config, &mut deny_slots);
+    let explicit = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
+    let default = udp_frame(HOST, REMOTE, 12_346, 53, 0, false);
+    io.inject(LAN, explicit.clone());
+    io.inject(LAN, default.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        2,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        &deny_config,
+        Some(&mut deny_runtime),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallRuleDenied, &explicit);
+    assert_drop(&mut io, DropReason::FirewallDefaultDenied, &default);
+    assert_eq!(errors.pending_actions(), 0);
+    assert_eq!(resolution.pending_actions(), 0);
+}
+
+#[test]
+fn unfragmented_transport_boundary_matrix_is_typed_and_byte_atomic() {
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let rules = [allow(FirewallProtocol::Udp), allow(FirewallProtocol::Tcp)];
+    let config = FirewallConfig::new(&snapshot, &rules, FirewallPolicy::default(), 1).unwrap();
+    let mut firewall_slots = [FirewallStateSlot::default(); 1];
+    let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut io = SimIo::new();
+
+    let mut udp_len_seven = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
+    udp_len_seven[38..40].copy_from_slice(&7_u16.to_be_bytes());
+    let mut udp_len_exceeds = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
+    udp_len_exceeds[38..40].copy_from_slice(&12_u16.to_be_bytes());
+    let mut udp_truncated = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
+    udp_truncated[16..18].copy_from_slice(&27_u16.to_be_bytes());
+    rewrite_ipv4_header(&mut udp_truncated);
+    let reserved = udp_frame(HOST, REMOTE, 12_345, 53, 0x8000, false);
+    let more_fragments = udp_frame(HOST, REMOTE, 12_345, 53, 0x2000, false);
+    let fragment_offset = udp_frame(HOST, REMOTE, 12_345, 53, 1, false);
+    let mut tcp_offset_small = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0);
+    tcp_offset_small[46] = 4 << 4;
+    let mut tcp_offset_exceeds = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0);
+    tcp_offset_exceeds[46] = 6 << 4;
+    let mut tcp_truncated = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0);
+    tcp_truncated[16..18].copy_from_slice(&39_u16.to_be_bytes());
+    rewrite_ipv4_header(&mut tcp_truncated);
+
+    for (frame, reason) in [
+        (udp_len_seven, DropReason::FirewallUdpLengthTooSmall),
+        (
+            udp_len_exceeds,
+            DropReason::FirewallUdpLengthExceedsIpv4Payload,
+        ),
+        (udp_truncated, DropReason::FirewallUdpHeaderTruncated),
+        (reserved, DropReason::FirewallFragmentUnsupported),
+        (more_fragments, DropReason::FirewallFragmentUnsupported),
+        (fragment_offset, DropReason::FirewallFragmentUnsupported),
+        (tcp_offset_small, DropReason::FirewallTcpDataOffsetTooSmall),
+        (
+            tcp_offset_exceeds,
+            DropReason::FirewallTcpDataOffsetExceedsIpv4Payload,
+        ),
+        (tcp_truncated, DropReason::FirewallTcpHeaderTruncated),
+    ] {
+        io.inject(LAN, frame.clone());
+        io.run_firewall_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(&mut firewall),
+            MonotonicMillis(1),
+            &mut NoTrace,
+        )
+        .unwrap();
+        assert_drop(&mut io, reason, &frame);
+        assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
+    }
+}
+
+#[test]
+fn nat_outbound_and_exact_reverse_are_visible_in_the_same_batch() {
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let udp_config = Nat44UdpConfig::new(
+        &snapshot,
+        LAN,
+        WAN,
+        WAN_LOCAL,
+        40_000,
+        40_000,
+        Nat44UdpPolicy::default(),
+    )
+    .unwrap();
+    let tcp_config = Nat44TcpConfig::new(
+        &snapshot,
+        LAN,
+        WAN,
+        WAN_LOCAL,
+        41_000,
+        41_000,
+        Nat44TcpPolicy::default(),
+    )
+    .unwrap();
+    let rules = [allow(FirewallProtocol::Udp)];
+    let firewall_config =
+        FirewallConfig::new(&snapshot, &rules, FirewallPolicy::default(), 1).unwrap();
+    let mut firewall_slots = [FirewallStateSlot::default(); 1];
+    let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_slots);
+    let mut udp_mappings = [Nat44UdpMappingSlot::default(); 1];
+    let mut udp_peers = [Nat44UdpPeerSlot::default(); 1];
+    let mut udp = Nat44UdpRuntime::new(udp_config, &mut udp_mappings, &mut udp_peers);
+    let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
+    let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
+    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut io = SimIo::new();
+    io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false));
+    io.inject(WAN, udp_frame(REMOTE, WAN_LOCAL, 53, 40_000, 0x4000, false));
+    io.run_nat44_udp_and_tcp_with_firewall_once(
+        2,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        &firewall_config,
+        Some(&mut firewall),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
     assert_eq!(io.pop_tx().unwrap().egress, WAN);
+    assert_eq!(io.pop_tx().unwrap().egress, LAN);
+    assert_eq!(udp.counters().outbound_translated, 1);
+    assert_eq!(udp.counters().inbound_translated, 1);
+    assert_eq!(firewall.counters().allowed_new, 1);
+    assert_eq!(firewall.counters().allowed_established, 1);
 }

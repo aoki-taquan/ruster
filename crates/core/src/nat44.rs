@@ -375,6 +375,7 @@ pub struct Nat44UdpConfig {
     last_port: u16,
     policy: Nat44UdpPolicy,
     authority: u64,
+    snapshot_identity: [usize; 8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -444,6 +445,7 @@ impl Nat44UdpConfig {
             last_port,
             policy,
             authority: snapshot_authority(snapshot),
+            snapshot_identity: snapshot.identity(),
         })
     }
 
@@ -479,9 +481,7 @@ impl Nat44UdpConfig {
 
     pub(crate) fn authority_matches(self, snapshot: &ForwardingSnapshot<'_>) -> bool {
         self.authority == snapshot_authority(snapshot)
-            && snapshot.local_ipv4.iter().any(|binding| {
-                binding.interface == self.outside && binding.address == self.public_address
-            })
+            && self.snapshot_identity == snapshot.identity()
     }
 }
 
@@ -1164,49 +1164,7 @@ fn address_is_host_unicast(snapshot: &ForwardingSnapshot<'_>, address: Ipv4Addre
 }
 
 pub(crate) fn snapshot_authority(snapshot: &ForwardingSnapshot<'_>) -> u64 {
-    fn mix(hash: u64, value: u64) -> u64 {
-        (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
-    }
-
-    let mut hash = 0xcbf2_9ce4_8422_2325;
-    for interface in snapshot.interfaces {
-        hash = mix(hash, u64::from(interface.id.0));
-        for octet in interface.mac.0 {
-            hash = mix(hash, u64::from(octet));
-        }
-    }
-    hash = mix(hash, 0xff);
-    for binding in snapshot.local_ipv4 {
-        hash = mix(hash, u64::from(binding.interface.0));
-        hash = mix(
-            hash,
-            u64::from(u32::from_be_bytes(binding.address.octets())),
-        );
-    }
-    hash = mix(hash, 0xfe);
-    for route in snapshot.routes {
-        hash = mix(hash, u64::from(u32::from_be_bytes(route.prefix().octets())));
-        hash = mix(hash, u64::from(route.prefix_len()));
-        hash = mix(hash, u64::from(route.egress().0));
-        hash = mix(
-            hash,
-            route.next_hop().map_or(u64::MAX, |next| {
-                u64::from(u32::from_be_bytes(next.octets()))
-            }),
-        );
-    }
-    hash = mix(hash, 0xfd);
-    for neighbor in snapshot.neighbors {
-        hash = mix(hash, u64::from(neighbor.interface.0));
-        hash = mix(
-            hash,
-            u64::from(u32::from_be_bytes(neighbor.target.octets())),
-        );
-        for octet in neighbor.mac.0 {
-            hash = mix(hash, u64::from(octet));
-        }
-    }
-    hash
+    snapshot.authority()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1279,6 +1237,7 @@ pub struct Nat44TcpConfig {
     last_port: u16,
     policy: Nat44TcpPolicy,
     authority: u64,
+    snapshot_identity: [usize; 8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1348,6 +1307,7 @@ impl Nat44TcpConfig {
             last_port,
             policy,
             authority: snapshot_authority(snapshot),
+            snapshot_identity: snapshot.identity(),
         })
     }
 
@@ -1383,9 +1343,7 @@ impl Nat44TcpConfig {
 
     pub(crate) fn authority_matches(self, snapshot: &ForwardingSnapshot<'_>) -> bool {
         self.authority == snapshot_authority(snapshot)
-            && snapshot.local_ipv4.iter().any(|binding| {
-                binding.interface == self.outside && binding.address == self.public_address
-            })
+            && self.snapshot_identity == snapshot.identity()
     }
 
     pub(crate) fn realm_matches_udp(self, udp: Nat44UdpConfig) -> bool {

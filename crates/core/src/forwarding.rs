@@ -6,8 +6,9 @@ use crate::nat44::{
 use crate::resolution::DynamicLookup;
 use crate::{
     packet, rfc1624_update, route, validate_arp, validate_ipv4_frame, ArpOpcode, ArpRequestAction,
-    BatchCompletion, ConsumeReason, ControlDisposition, FirewallConfig, FirewallProtocol,
-    FirewallRuntime, Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind,
+    BatchCompletion, ConsumeReason, ControlDisposition, FirewallAuditBuffer, FirewallConfig,
+    FirewallConnectionClass, FirewallDisposition, FirewallPolicySource, FirewallProtocol,
+    FirewallRuntime, FirewallVerdict, Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind,
     Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface, LocalIpv4Binding,
     MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition, Nat44TcpRuntime,
     Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, ResolutionResult,
@@ -132,6 +133,7 @@ pub enum DropReason {
     FirewallStateTableFull = 112,
     FirewallClockRegression = 113,
     FirewallRelatedIcmpv4Unsupported = 114,
+    FirewallRouteUnavailable = 115,
 }
 
 use DropReason::*;
@@ -256,6 +258,7 @@ impl DropReason {
             FirewallStateTableFull => "FIREWALL_STATE_TABLE_FULL",
             FirewallClockRegression => "FIREWALL_CLOCK_REGRESSION",
             FirewallRelatedIcmpv4Unsupported => "FIREWALL_RELATED_ICMPV4_UNSUPPORTED",
+            FirewallRouteUnavailable => "FIREWALL_ROUTE_UNAVAILABLE",
         }
     }
 }
@@ -310,6 +313,8 @@ pub struct ForwardingSnapshot<'a> {
     pub(crate) neighbors: &'a [Neighbor],
     pub(crate) local_ipv4: &'a [LocalIpv4Binding],
     pub(crate) ipv4_origin: Ipv4OriginPolicy,
+    authority: u64,
+    identity: [usize; 8],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -398,7 +403,32 @@ impl<'a> ForwardingSnapshot<'a> {
             neighbors,
             local_ipv4,
             ipv4_origin,
+            authority: calculate_snapshot_authority(
+                routes,
+                interfaces,
+                neighbors,
+                local_ipv4,
+                ipv4_origin,
+            ),
+            identity: [
+                routes.as_ptr() as usize,
+                routes.len(),
+                interfaces.as_ptr() as usize,
+                interfaces.len(),
+                neighbors.as_ptr() as usize,
+                neighbors.len(),
+                local_ipv4.as_ptr() as usize,
+                local_ipv4.len(),
+            ],
         })
+    }
+
+    pub(crate) const fn authority(&self) -> u64 {
+        self.authority
+    }
+
+    pub(crate) const fn identity(&self) -> [usize; 8] {
+        self.identity
     }
 
     pub(crate) fn resolution_action_authority(
@@ -451,6 +481,58 @@ impl<'a> ForwardingSnapshot<'a> {
             ResolutionActionAuthority::Invalid
         }
     }
+}
+
+fn calculate_snapshot_authority(
+    routes: &[Route],
+    interfaces: &[Interface],
+    neighbors: &[Neighbor],
+    local_ipv4: &[LocalIpv4Binding],
+    ipv4_origin: Ipv4OriginPolicy,
+) -> u64 {
+    fn mix(hash: u64, value: u64) -> u64 {
+        (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
+    }
+
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    for interface in interfaces {
+        hash = mix(hash, u64::from(interface.id.0));
+        for octet in interface.mac.0 {
+            hash = mix(hash, u64::from(octet));
+        }
+    }
+    hash = mix(hash, 0xff);
+    for binding in local_ipv4 {
+        hash = mix(hash, u64::from(binding.interface.0));
+        hash = mix(
+            hash,
+            u64::from(u32::from_be_bytes(binding.address.octets())),
+        );
+    }
+    hash = mix(hash, 0xfe);
+    for route in routes {
+        hash = mix(hash, u64::from(u32::from_be_bytes(route.prefix().octets())));
+        hash = mix(hash, u64::from(route.prefix_len()));
+        hash = mix(hash, u64::from(route.egress().0));
+        hash = mix(
+            hash,
+            route.next_hop().map_or(u64::MAX, |next| {
+                u64::from(u32::from_be_bytes(next.octets()))
+            }),
+        );
+    }
+    hash = mix(hash, 0xfd);
+    for neighbor in neighbors {
+        hash = mix(hash, u64::from(neighbor.interface.0));
+        hash = mix(
+            hash,
+            u64::from(u32::from_be_bytes(neighbor.target.octets())),
+        );
+        for octet in neighbor.mac.0 {
+            hash = mix(hash, u64::from(octet));
+        }
+    }
+    mix(hash, u64::from(ipv4_origin.default_ttl()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -725,7 +807,7 @@ where
     T: TraceSink,
 {
     forward_batch_inner(
-        batch, snapshot, None, None, None, None, None, None, None, None, trace,
+        batch, snapshot, None, None, None, None, None, None, None, None, None, trace,
     )
 }
 
@@ -746,6 +828,7 @@ where
         batch,
         snapshot,
         Some((runtime, now)),
+        None,
         None,
         None,
         None,
@@ -778,6 +861,7 @@ where
         snapshot,
         Some((resolution, now)),
         Some((icmpv4_errors, now)),
+        None,
         None,
         None,
         None,
@@ -819,6 +903,7 @@ where
         None,
         None,
         None,
+        None,
         trace,
     )
 }
@@ -855,6 +940,7 @@ where
         None,
         None,
         None,
+        None,
         trace,
     )
 }
@@ -882,6 +968,7 @@ where
         None,
         Some(config),
         nat44_tcp,
+        None,
         None,
         None,
         trace,
@@ -915,6 +1002,7 @@ where
         nat44_tcp,
         None,
         None,
+        None,
         trace,
     )
 }
@@ -945,6 +1033,7 @@ where
         nat44_udp,
         Some(tcp_config),
         nat44_tcp,
+        None,
         None,
         None,
         trace,
@@ -980,11 +1069,12 @@ where
         nat44_tcp,
         None,
         None,
+        None,
         trace,
     )
 }
 
-/// Runs an opt-in stateful firewall for forwarded atomic IPv4 UDP/TCP.
+/// Runs an opt-in stateful firewall for forwarded unfragmented IPv4 UDP/TCP.
 ///
 /// ARP, router-local traffic, and router-originated generated packets remain
 /// outside this service. A missing or mismatched runtime fails closed.
@@ -1013,6 +1103,40 @@ where
         None,
         Some(config),
         firewall,
+        None,
+        trace,
+    )
+}
+
+/// Runs the opt-in stateful firewall and appends one typed policy record for
+/// every packet that reaches rule or established-flow evaluation.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_with_firewall_audited<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    config: &FirewallConfig<'_>,
+    firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    audit: &mut FirewallAuditBuffer<'_>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(config),
+        firewall,
+        Some(audit),
         trace,
     )
 }
@@ -1045,6 +1169,40 @@ where
         None,
         Some(config),
         firewall,
+        None,
+        trace,
+    )
+}
+
+/// Audited variant of [`forward_batch_with_firewall_and_icmpv4_errors`].
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_with_firewall_and_icmpv4_errors_audited<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    config: &FirewallConfig<'_>,
+    firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    audit: &mut FirewallAuditBuffer<'_>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        Some((icmpv4_errors, now)),
+        None,
+        None,
+        None,
+        None,
+        Some(config),
+        firewall,
+        Some(audit),
         trace,
     )
 }
@@ -1079,6 +1237,44 @@ where
         nat44_tcp,
         Some(firewall_config),
         firewall,
+        None,
+        trace,
+    )
+}
+
+/// Audited variant of
+/// [`forward_batch_with_nat44_udp_and_tcp_and_firewall`].
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_with_nat44_udp_and_tcp_and_firewall_audited<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    udp_config: &Nat44UdpConfig,
+    nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+    tcp_config: &Nat44TcpConfig,
+    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    firewall_config: &FirewallConfig<'_>,
+    firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    audit: &mut FirewallAuditBuffer<'_>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        None,
+        Some(udp_config),
+        nat44_udp,
+        Some(tcp_config),
+        nat44_tcp,
+        Some(firewall_config),
+        firewall,
+        Some(audit),
         trace,
     )
 }
@@ -1095,6 +1291,7 @@ fn forward_batch_inner<B, T>(
     mut nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
     mut firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    mut firewall_audit: Option<&mut FirewallAuditBuffer<'_>>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
 where
@@ -1124,6 +1321,7 @@ where
                 &mut nat44_tcp,
                 firewall_config,
                 &mut firewall,
+                &mut firewall_audit,
                 &mut firewall_plan,
                 trace,
             )
@@ -1213,7 +1411,8 @@ where
                     firewall
                         .as_deref_mut()
                         .expect("firewall plan requires a bound runtime")
-                        .commit(plan, nat_now_ms);
+                        .commit(plan)
+                        .expect("sequential packet path keeps firewall plan authority stable");
                 }
                 packet.commit(egress);
                 tx_requested += 1;
@@ -1267,6 +1466,7 @@ fn decide<T: TraceSink>(
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
     firewall: &mut Option<&mut FirewallRuntime<'_, '_>>,
+    firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
@@ -1284,6 +1484,7 @@ fn decide<T: TraceSink>(
             nat44_tcp,
             firewall_config,
             firewall,
+            firewall_audit,
             firewall_plan,
             trace,
         ),
@@ -1305,6 +1506,7 @@ fn decide_ipv4<T: TraceSink>(
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
     firewall: &mut Option<&mut FirewallRuntime<'_, '_>>,
+    firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
@@ -1337,6 +1539,52 @@ fn decide_ipv4<T: TraceSink>(
             combined_realm_mismatch,
             trace,
         );
+    }
+    let local = snapshot
+        .local_ipv4
+        .iter()
+        .any(|binding| binding.interface == ingress && binding.address == ipv4.destination);
+    let nat_inbound_candidate = nat44_udp_config
+        .is_some_and(|config| ipv4.destination == config.public_address() && ipv4.protocol == 17)
+        || nat44_tcp_config.is_some_and(|config| {
+            ipv4.destination == config.public_address() && ipv4.protocol == 6
+        });
+    let mut firewall_validated = None;
+    if let Some(config) = firewall_config {
+        if !local || nat_inbound_candidate {
+            let runtime = require_firewall_runtime(snapshot, config, firewall)?;
+            let validated = match validate_firewall_transport(frame, ipv4) {
+                Ok(validated) => validated,
+                Err(reason) => {
+                    runtime.record_invalid_packet();
+                    return Err(reason);
+                }
+            };
+            if let Err(error) = runtime.observe_attempt(nat_now.0) {
+                return Err(match error {
+                    FirewallPlanError::ClockRegression => FirewallClockRegression,
+                    FirewallPlanError::RuleDenied(_)
+                    | FirewallPlanError::DefaultDenied
+                    | FirewallPlanError::InvalidInitialTcp(_)
+                    | FirewallPlanError::StateFull(_) => {
+                        unreachable!("clock observation only reports regression")
+                    }
+                });
+            }
+            observe_combined_nat_security_time(
+                snapshot,
+                ingress,
+                ipv4,
+                validated,
+                nat44_udp_config,
+                nat44_udp,
+                nat44_tcp_config,
+                nat44_tcp,
+                nat_now,
+                trace,
+            )?;
+            firewall_validated = Some(validated);
+        }
     }
     if combined_realm_mismatch
         && matches!(ipv4.protocol, 6 | 17)
@@ -1381,6 +1629,8 @@ fn decide_ipv4<T: TraceSink>(
                 nat44_udp,
                 firewall_config,
                 firewall,
+                firewall_audit,
+                firewall_validated,
                 firewall_plan,
                 trace,
             );
@@ -1413,27 +1663,24 @@ fn decide_ipv4<T: TraceSink>(
                 nat44_tcp,
                 firewall_config,
                 firewall,
+                firewall_audit,
+                firewall_validated,
                 firewall_plan,
                 trace,
             );
         }
     }
-    let local = snapshot
-        .local_ipv4
-        .iter()
-        .any(|binding| binding.interface == ingress && binding.address == ipv4.destination);
     if local {
         return decide_local_ipv4(frame, snapshot, ingress, ipv4, trace);
     }
     if ipv4.header_len > 20 {
-        if let Some(config) = firewall_config {
-            require_firewall_runtime(snapshot, config, firewall)?.record_invalid_packet();
-            return Err(FirewallIpv4OptionsUnsupported);
-        }
         return Err(Ipv4OptionsUnsupported);
     }
     let route = route::lookup(snapshot.routes, ipv4.destination);
     let Some(route) = route else {
+        if firewall_config.is_some() {
+            return Err(FirewallRouteUnavailable);
+        }
         if let Some((runtime, now)) = icmpv4_errors.as_mut() {
             let disposition = decide_icmpv4_error(
                 frame,
@@ -1500,16 +1747,16 @@ fn decide_ipv4<T: TraceSink>(
                 let _ = require_nat44_tcp_runtime(snapshot, tcp_config, nat44_tcp, ingress, trace)?;
             }
         }
+        let runtime = require_firewall_runtime(snapshot, config, firewall)?;
         *firewall_plan = Some(plan_firewall(
-            frame,
-            snapshot,
             ingress,
             route.egress(),
             ipv4,
+            firewall_validated.expect("forward firewall packet was preflight validated"),
             None,
-            config,
-            firewall,
-            nat_now,
+            runtime,
+            firewall_audit,
+            nat_now.0,
         )?);
     }
     if ipv4.ttl <= 1 {
@@ -2196,34 +2443,115 @@ fn trace_nat44_icmpv4_drop<T: TraceSink>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn plan_firewall(
-    frame: &[u8],
+fn observe_combined_nat_security_time<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    ipv4: packet::ValidatedIpv4,
+    validated: ValidatedFirewallTransport,
+    nat44_udp_config: Option<&Nat44UdpConfig>,
+    nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
+    nat44_tcp_config: Option<&Nat44TcpConfig>,
+    nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> Result<(), DropReason> {
+    match validated.protocol {
+        FirewallProtocol::Udp => {
+            let Some(config) = nat44_udp_config else {
+                return Ok(());
+            };
+            if ingress != config.inside() && ipv4.destination != config.public_address() {
+                return Ok(());
+            }
+            let runtime = require_nat44_udp_runtime(snapshot, config, nat44_udp, ingress, trace)?;
+            if let Err(error) = runtime.observe_now(now.0) {
+                let (reason, disposition) = nat44_udp_plan_error(error);
+                trace.record(TraceEvent::Nat44Udp {
+                    ingress,
+                    disposition,
+                });
+                return Err(reason);
+            }
+        }
+        FirewallProtocol::Tcp => {
+            let Some(config) = nat44_tcp_config else {
+                return Ok(());
+            };
+            if ingress != config.inside() && ipv4.destination != config.public_address() {
+                return Ok(());
+            }
+            let runtime = require_nat44_tcp_runtime(snapshot, config, nat44_tcp, ingress, trace)?;
+            if let Err(error) = runtime.observe_now(now.0) {
+                let (reason, disposition) = nat44_tcp_plan_error(error);
+                trace.record(TraceEvent::Nat44Tcp {
+                    ingress,
+                    disposition,
+                });
+                return Err(reason);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_firewall(
     ingress: IfId,
     egress: IfId,
     ipv4: packet::ValidatedIpv4,
+    validated: ValidatedFirewallTransport,
     canonical: Option<FirewallPacket>,
-    config: &FirewallConfig<'_>,
-    firewall: &mut Option<&mut FirewallRuntime<'_, '_>>,
-    now: MonotonicMillis,
+    runtime: &mut FirewallRuntime<'_, '_>,
+    audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
+    now_ms: u64,
 ) -> Result<FirewallPlan, DropReason> {
-    let runtime = require_firewall_runtime(snapshot, config, firewall)?;
-    let packet = match validate_firewall_packet(frame, ingress, egress, ipv4, canonical) {
-        Ok(packet) => packet,
-        Err(reason) => {
-            runtime.record_invalid_packet();
-            return Err(reason);
+    let packet = firewall_packet(ingress, egress, ipv4, validated, canonical);
+    match runtime.plan_packet(packet, now_ms) {
+        Ok(plan) => {
+            if let Some(audit) = audit.as_deref_mut() {
+                audit.record(packet, plan.disposition());
+            }
+            Ok(plan)
         }
-    };
-    match runtime.plan_packet(packet, now.0) {
-        Ok(plan) => Ok(plan),
         Err(error) => {
             runtime.record_plan_error(error);
+            let disposition = match error {
+                FirewallPlanError::RuleDenied(rule_id) => FirewallDisposition {
+                    verdict: FirewallVerdict::Drop,
+                    class: FirewallConnectionClass::New,
+                    source: FirewallPolicySource::Rule(rule_id),
+                },
+                FirewallPlanError::DefaultDenied => FirewallDisposition {
+                    verdict: FirewallVerdict::Drop,
+                    class: FirewallConnectionClass::New,
+                    source: FirewallPolicySource::Default,
+                },
+                FirewallPlanError::InvalidInitialTcp(rule_id)
+                | FirewallPlanError::StateFull(rule_id) => FirewallDisposition {
+                    verdict: FirewallVerdict::Allow,
+                    class: FirewallConnectionClass::New,
+                    source: FirewallPolicySource::Rule(rule_id),
+                },
+                FirewallPlanError::ClockRegression => {
+                    return Err(match error {
+                        FirewallPlanError::ClockRegression => FirewallClockRegression,
+                        FirewallPlanError::RuleDenied(_)
+                        | FirewallPlanError::DefaultDenied
+                        | FirewallPlanError::InvalidInitialTcp(_)
+                        | FirewallPlanError::StateFull(_) => {
+                            unreachable!("policy errors were handled above")
+                        }
+                    });
+                }
+            };
+            if let Some(audit) = audit.as_deref_mut() {
+                audit.record(packet, disposition);
+            }
             Err(match error {
                 FirewallPlanError::RuleDenied(_) => FirewallRuleDenied,
                 FirewallPlanError::DefaultDenied => FirewallDefaultDenied,
-                FirewallPlanError::InvalidInitialTcp => FirewallTcpInvalidInitialFlags,
-                FirewallPlanError::StateFull => FirewallStateTableFull,
+                FirewallPlanError::InvalidInitialTcp(_) => FirewallTcpInvalidInitialFlags,
+                FirewallPlanError::StateFull(_) => FirewallStateTableFull,
                 FirewallPlanError::ClockRegression => FirewallClockRegression,
             })
         }
@@ -2251,13 +2579,18 @@ fn require_firewall_runtime<'runtime, 'rules, 'state>(
     Ok(runtime)
 }
 
-fn validate_firewall_packet(
+#[derive(Clone, Copy)]
+struct ValidatedFirewallTransport {
+    protocol: FirewallProtocol,
+    source_port: u16,
+    destination_port: u16,
+    tcp_flags: u8,
+}
+
+fn validate_firewall_transport(
     frame: &[u8],
-    ingress: IfId,
-    egress: IfId,
     ipv4: packet::ValidatedIpv4,
-    canonical: Option<FirewallPacket>,
-) -> Result<FirewallPacket, DropReason> {
+) -> Result<ValidatedFirewallTransport, DropReason> {
     if ipv4.header_len != 20 {
         return Err(FirewallIpv4OptionsUnsupported);
     }
@@ -2267,7 +2600,7 @@ fn validate_firewall_packet(
         return Err(FirewallFragmentUnsupported);
     }
     let protocol = FirewallProtocol::from_ipv4(ipv4.protocol).ok_or(FirewallUnsupportedProtocol)?;
-    let mut packet = match protocol {
+    let packet = match protocol {
         FirewallProtocol::Tcp => {
             let tcp = validate_nat44_tcp(frame, ipv4).map_err(|reason| match reason {
                 Nat44TcpHeaderTruncated => FirewallTcpHeaderTruncated,
@@ -2279,11 +2612,7 @@ fn validate_firewall_packet(
             if tcp.source_port == 0 || tcp.destination_port == 0 {
                 return Err(FirewallTcpPortZero);
             }
-            FirewallPacket {
-                ingress,
-                egress,
-                source: ipv4.source,
-                destination: ipv4.destination,
+            ValidatedFirewallTransport {
                 protocol,
                 source_port: tcp.source_port,
                 destination_port: tcp.destination_port,
@@ -2303,11 +2632,7 @@ fn validate_firewall_packet(
             if udp.checksum != 0 && !udp_checksum_valid(frame, ipv4, udp.offset) {
                 return Err(FirewallUdpChecksumInvalid);
             }
-            FirewallPacket {
-                ingress,
-                egress,
-                source: ipv4.source,
-                destination: ipv4.destination,
+            ValidatedFirewallTransport {
                 protocol,
                 source_port: udp.source_port,
                 destination_port: udp.destination_port,
@@ -2315,13 +2640,26 @@ fn validate_firewall_packet(
             }
         }
     };
-    if let Some(canonical) = canonical {
-        debug_assert_eq!(canonical.ingress, ingress);
-        debug_assert_eq!(canonical.egress, egress);
-        debug_assert_eq!(canonical.protocol, protocol);
-        packet = canonical;
-    }
     Ok(packet)
+}
+
+fn firewall_packet(
+    ingress: IfId,
+    egress: IfId,
+    ipv4: packet::ValidatedIpv4,
+    validated: ValidatedFirewallTransport,
+    canonical: Option<FirewallPacket>,
+) -> FirewallPacket {
+    canonical.unwrap_or(FirewallPacket {
+        ingress,
+        egress,
+        source: ipv4.source,
+        destination: ipv4.destination,
+        protocol: validated.protocol,
+        source_port: validated.source_port,
+        destination_port: validated.destination_port,
+        tcp_flags: validated.tcp_flags,
+    })
 }
 
 fn udp_checksum_valid(frame: &[u8], ipv4: packet::ValidatedIpv4, udp_offset: usize) -> bool {
@@ -2474,6 +2812,8 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
     firewall: &mut Option<&mut FirewallRuntime<'_, '_>>,
+    firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
+    firewall_validated: Option<ValidatedFirewallTransport>,
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
@@ -2501,9 +2841,6 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
         Ok(udp) => udp,
         Err(reason) => return nat44_udp_drop(ingress, reason, trace),
     };
-    if ipv4.ttl <= 1 {
-        return nat44_udp_drop(ingress, Ipv4TtlExpired, trace);
-    }
     if !icmp_error_source_is_host(snapshot, ipv4.source)
         || snapshot
             .local_ipv4
@@ -2551,17 +2888,20 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
             destination_port: plan.internal_port(),
             tcp_flags: 0,
         };
+        let firewall_runtime = require_firewall_runtime(snapshot, firewall_config, firewall)?;
         *firewall_plan = Some(plan_firewall(
-            frame,
-            snapshot,
             ingress,
             reverse_route.egress(),
             ipv4,
+            firewall_validated.expect("inbound firewall packet was preflight validated"),
             Some(firewall_packet),
-            firewall_config,
-            firewall,
-            now,
+            firewall_runtime,
+            firewall_audit,
+            now.0,
         )?);
+    }
+    if ipv4.ttl <= 1 {
+        return nat44_udp_drop(ingress, Ipv4TtlExpired, trace);
     }
     let target = reverse_route.next_hop().unwrap_or(internal_address);
     let interface = snapshot
@@ -2753,6 +3093,8 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
     firewall: &mut Option<&mut FirewallRuntime<'_, '_>>,
+    firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
+    firewall_validated: Option<ValidatedFirewallTransport>,
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
@@ -2780,9 +3122,6 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
         Ok(tcp) => tcp,
         Err(reason) => return nat44_tcp_drop(ingress, reason, trace),
     };
-    if ipv4.ttl <= 1 {
-        return nat44_tcp_drop(ingress, Ipv4TtlExpired, trace);
-    }
     if tcp.source_port == 0 {
         return nat44_tcp_drop(ingress, Nat44TcpSourcePortZero, trace);
     }
@@ -2833,17 +3172,20 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
             destination_port: plan.internal_port(),
             tcp_flags: tcp.flags,
         };
+        let firewall_runtime = require_firewall_runtime(snapshot, firewall_config, firewall)?;
         *firewall_plan = Some(plan_firewall(
-            frame,
-            snapshot,
             ingress,
             reverse_route.egress(),
             ipv4,
+            firewall_validated.expect("inbound firewall packet was preflight validated"),
             Some(firewall_packet),
-            firewall_config,
-            firewall,
-            now,
+            firewall_runtime,
+            firewall_audit,
+            now.0,
         )?);
+    }
+    if ipv4.ttl <= 1 {
+        return nat44_tcp_drop(ingress, Ipv4TtlExpired, trace);
     }
     let target = reverse_route.next_hop().unwrap_or(internal_address);
     let interface = snapshot
@@ -4209,6 +4551,7 @@ mod tests {
         let mut udp = Some(&mut nat);
         let mut tcp = None;
         let mut firewall = None;
+        let mut firewall_audit = None;
         let mut firewall_plan = None;
         let result = decide_ipv4(
             &frag_needed_frame(),
@@ -4222,6 +4565,7 @@ mod tests {
             &mut tcp,
             None,
             &mut firewall,
+            &mut firewall_audit,
             &mut firewall_plan,
             &mut NoTrace,
         );
@@ -4356,6 +4700,7 @@ mod tests {
             (112, "FIREWALL_STATE_TABLE_FULL"),
             (113, "FIREWALL_CLOCK_REGRESSION"),
             (114, "FIREWALL_RELATED_ICMPV4_UNSUPPORTED"),
+            (115, "FIREWALL_ROUTE_UNAVAILABLE"),
         ];
         let actual = [
             DropReason::EthernetHeaderTruncated,
@@ -4472,6 +4817,7 @@ mod tests {
             DropReason::FirewallStateTableFull,
             DropReason::FirewallClockRegression,
             DropReason::FirewallRelatedIcmpv4Unsupported,
+            DropReason::FirewallRouteUnavailable,
         ];
         assert_eq!(actual.len(), expected.len());
         for (reason, &(discriminant, code)) in actual.iter().zip(&expected) {
