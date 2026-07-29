@@ -1135,19 +1135,23 @@ fn decide_ipv4<T: TraceSink>(
             return reject_combined_realm_mismatch(ingress, nat44_udp, nat44_tcp, trace);
         }
     }
-    if nat44_udp_config.is_some_and(|config| {
-        ingress == config.outside()
-            && route.egress() == config.inside()
-            && (ipv4.protocol == 17 || nat44_tcp_config.is_none())
-    }) {
-        return nat44_udp_drop(ingress, Nat44ExternalToInternalBypass, trace);
+    let crosses_external_to_internal = nat44_udp_config
+        .is_some_and(|config| ingress == config.outside() && route.egress() == config.inside())
+        || nat44_tcp_config
+            .is_some_and(|config| ingress == config.outside() && route.egress() == config.inside());
+    if crosses_external_to_internal {
+        return Err(Nat44ExternalToInternalBypass);
     }
-    if nat44_tcp_config.is_some_and(|config| {
-        ingress == config.outside()
-            && route.egress() == config.inside()
-            && (ipv4.protocol == 6 || nat44_udp_config.is_none())
-    }) {
-        return nat44_tcp_drop(ingress, Nat44ExternalToInternalBypass, trace);
+    let crosses_internal_to_external = nat44_udp_config
+        .is_some_and(|config| ingress == config.inside() && route.egress() == config.outside())
+        || nat44_tcp_config
+            .is_some_and(|config| ingress == config.inside() && route.egress() == config.outside());
+    if crosses_internal_to_external && !matches!(ipv4.protocol, 6 | 17) {
+        return Err(if nat44_udp_config.is_some() {
+            Nat44UdpUnsupportedTransport
+        } else {
+            Nat44TcpUnsupportedTransport
+        });
     }
     if ipv4.ttl <= 1 {
         if let Some((runtime, now)) = icmpv4_errors.as_mut() {

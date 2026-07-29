@@ -445,9 +445,11 @@ overloadは行いません。
 UDP-only serviceはTCP domain crossingを、TCP-only serviceはUDP domain crossingをfail
 closedにします。combined serviceはinside/outside/public IPv4 realmが完全一致しなければ
 TCP/UDPのpublic宛てまたはdomain crossingをfail closedにし、各runtime stateは独立して
-dispatchします。ICMPとその他のprotocolはrealm mismatch判定の対象外で通常forwarding/local
-処理を維持し、どちらのruntime、watermark、counter、NAT traceも変更しません。
-outside→inside direct LPM bypass、runtime/config/snapshot mismatch、
+dispatchします。ICMPとその他のprotocolはrealm mismatch判定の対象外で、どちらのruntime、
+watermark、counter、NAT traceも変更しません。ただしtraditional NAT domain境界はprotocol
+非依存です。設定済みoutside→inside direct LPMと、変換不能なinside→outside protocolは
+neighbor lookup/ARP scheduleより前にgeneric fail-closeし、private sourceや外部から内部への
+bypassを許可しません。runtime/config/snapshot mismatch、
 hairpinはneighbor処理やstate変更より前にtyped dropします。
 
 TCP fragment association/reassembly、hairpin translation、embedded ICMP error/PMTU translation、
