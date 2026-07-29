@@ -627,6 +627,7 @@ pub struct FirewallCounters {
     pub reconciliations: u64,
     pub states_expired: u64,
     pub state_probes: u64,
+    pub maintenance_steps: u64,
     pub rule_evaluations: u64,
 }
 
@@ -777,6 +778,7 @@ pub(crate) struct FirewallPlan {
     expected_config_generation: u64,
     replacement: FirewallStateSlot,
     created: bool,
+    replaced_expired: bool,
     disposition: FirewallDisposition,
 }
 
@@ -792,6 +794,7 @@ pub enum FirewallCommitError {
     ConfigGenerationChanged,
     SlotOutOfBounds,
     SlotGenerationChanged,
+    UsableCapacityExceeded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -802,6 +805,10 @@ struct FirewallProbe {
 }
 
 fn flow_hash(packet: FirewallPacket, config_generation: u64, hash_key: FirewallHashKey) -> u64 {
+    siphash24(hash_key, canonical_flow_words(packet, config_generation))
+}
+
+fn canonical_flow_words(packet: FirewallPacket, config_generation: u64) -> [u64; 8] {
     let mut first = (
         packet.ingress.0,
         u32::from_be_bytes(packet.source.octets()),
@@ -815,22 +822,19 @@ fn flow_hash(packet: FirewallPacket, config_generation: u64, hash_key: FirewallH
     if second < first {
         std::mem::swap(&mut first, &mut second);
     }
-    siphash24(
-        hash_key,
-        [
-            config_generation,
-            match packet.protocol {
-                FirewallProtocol::Tcp => 6,
-                FirewallProtocol::Udp => 17,
-            },
-            u64::from(first.0),
-            u64::from(first.1),
-            u64::from(first.2),
-            u64::from(second.0),
-            u64::from(second.1),
-            u64::from(second.2),
-        ],
-    )
+    [
+        config_generation,
+        match packet.protocol {
+            FirewallProtocol::Tcp => 6,
+            FirewallProtocol::Udp => 17,
+        },
+        u64::from(first.0),
+        u64::from(first.1),
+        u64::from(first.2),
+        u64::from(second.0),
+        u64::from(second.1),
+        u64::from(second.2),
+    ]
 }
 
 fn siphash24<const WORDS: usize>(key: FirewallHashKey, words: [u64; WORDS]) -> u64 {
@@ -873,6 +877,52 @@ fn siphash24<const WORDS: usize>(key: FirewallHashKey, words: [u64; WORDS]) -> u
     v0 ^ v1 ^ v2 ^ v3
 }
 
+#[cfg(test)]
+fn siphash24_bytes(key: FirewallHashKey, input: &[u8]) -> u64 {
+    fn round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
+        *v0 = v0.wrapping_add(*v1);
+        *v1 = v1.rotate_left(13);
+        *v1 ^= *v0;
+        *v0 = v0.rotate_left(32);
+        *v2 = v2.wrapping_add(*v3);
+        *v3 = v3.rotate_left(16);
+        *v3 ^= *v2;
+        *v0 = v0.wrapping_add(*v3);
+        *v3 = v3.rotate_left(21);
+        *v3 ^= *v0;
+        *v2 = v2.wrapping_add(*v1);
+        *v1 = v1.rotate_left(17);
+        *v1 ^= *v2;
+        *v2 = v2.rotate_left(32);
+    }
+
+    let mut v0 = key.first ^ 0x736f_6d65_7073_6575;
+    let mut v1 = key.second ^ 0x646f_7261_6e64_6f6d;
+    let mut v2 = key.first ^ 0x6c79_6765_6e65_7261;
+    let mut v3 = key.second ^ 0x7465_6462_7974_6573;
+    let mut chunks = input.chunks_exact(8);
+    for chunk in &mut chunks {
+        let word = u64::from_le_bytes(chunk.try_into().expect("chunk size is exact"));
+        v3 ^= word;
+        round(&mut v0, &mut v1, &mut v2, &mut v3);
+        round(&mut v0, &mut v1, &mut v2, &mut v3);
+        v0 ^= word;
+    }
+    let mut final_block = (input.len() as u64) << 56;
+    for (offset, byte) in chunks.remainder().iter().copied().enumerate() {
+        final_block |= u64::from(byte) << (offset * 8);
+    }
+    v3 ^= final_block;
+    round(&mut v0, &mut v1, &mut v2, &mut v3);
+    round(&mut v0, &mut v1, &mut v2, &mut v3);
+    v0 ^= final_block;
+    v2 ^= 0xff;
+    for _ in 0..4 {
+        round(&mut v0, &mut v1, &mut v2, &mut v3);
+    }
+    v0 ^ v1 ^ v2 ^ v3
+}
+
 fn slot_packet(slot: FirewallStateSlot) -> FirewallPacket {
     FirewallPacket {
         ingress: slot.origin_ingress,
@@ -894,6 +944,14 @@ fn probe_distance(home: usize, position: usize, capacity: usize) -> usize {
     }
 }
 
+const fn usable_state_capacity(capacity: usize) -> usize {
+    match capacity {
+        0 => 0,
+        1..=3 => capacity,
+        _ => capacity - ((capacity - 1) / 4 + 1),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FirewallReconcileReport {
     pub states_flushed: usize,
@@ -904,6 +962,7 @@ pub struct FirewallReconcileReport {
 pub enum FirewallReconcileError {
     GenerationRegression,
     IdentityCollision,
+    HashKeyNotRotated,
 }
 
 /// Fixed-capacity, worker-local IPv4 flow state.
@@ -928,6 +987,7 @@ pub struct FirewallRuntime<'rules, 'state> {
     watermark_ms: Option<u64>,
     runtime_epoch: u64,
     next_slot_generation: u64,
+    occupied_count: usize,
     counters: FirewallCounters,
     _worker_local: PhantomData<Rc<()>>,
 }
@@ -941,6 +1001,7 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
             watermark_ms: None,
             runtime_epoch: 1,
             next_slot_generation: 1,
+            occupied_count: 0,
             counters: FirewallCounters::default(),
             _worker_local: PhantomData,
         }
@@ -961,6 +1022,11 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
         self.states
     }
 
+    #[must_use]
+    pub const fn usable_capacity(&self) -> usize {
+        usable_state_capacity(self.states.len())
+    }
+
     pub fn reconcile(
         &mut self,
         config: FirewallConfig<'rules>,
@@ -974,8 +1040,12 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
             }
             return Err(FirewallReconcileError::IdentityCollision);
         }
+        if config.hash_key == self.config.hash_key {
+            return Err(FirewallReconcileError::HashKeyNotRotated);
+        }
         let states_flushed = self.states.iter().filter(|slot| slot.occupied).count();
         self.states.fill(FirewallStateSlot::default());
+        self.occupied_count = 0;
         self.config = config;
         self.runtime_epoch = self.runtime_epoch.wrapping_add(1).max(1);
         self.counters.reconciliations = self.counters.reconciliations.saturating_add(1);
@@ -1057,6 +1127,7 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
                 expected_config_generation: self.config.generation,
                 replacement,
                 created: false,
+                replaced_expired: false,
                 disposition: FirewallDisposition {
                     verdict: FirewallVerdict::Allow,
                     class: FirewallConnectionClass::Established,
@@ -1090,6 +1161,9 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
             .reusable
             .ok_or(FirewallPlanError::StateFull(rule_id))?;
         let current = self.states[index];
+        if !current.occupied && self.occupied_count >= self.usable_capacity() {
+            return Err(FirewallPlanError::StateFull(rule_id));
+        }
         let slot_generation = self.next_slot_generation.max(1);
         Ok(FirewallPlan {
             index,
@@ -1114,6 +1188,7 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
                 origin_rule_id: rule_id,
             },
             created: true,
+            replaced_expired: current.occupied,
             disposition: FirewallDisposition {
                 verdict: FirewallVerdict::Allow,
                 class: FirewallConnectionClass::New,
@@ -1131,16 +1206,25 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
         if self.config.generation != plan.expected_config_generation {
             return Err(FirewallCommitError::ConfigGenerationChanged);
         }
-        let Some(current) = self.states.get(plan.index) else {
+        let Some(&current) = self.states.get(plan.index) else {
             return Err(FirewallCommitError::SlotOutOfBounds);
         };
         if current.slot_generation != plan.expected_generation {
             return Err(FirewallCommitError::SlotGenerationChanged);
         }
+        if plan.created && !current.occupied && self.occupied_count >= self.usable_capacity() {
+            return Err(FirewallCommitError::UsableCapacityExceeded);
+        }
         self.states[plan.index] = plan.replacement;
         if plan.created {
+            if !current.occupied {
+                self.occupied_count += 1;
+            }
             self.next_slot_generation = plan.replacement.slot_generation.wrapping_add(1).max(1);
             self.counters.allowed_new = self.counters.allowed_new.saturating_add(1);
+            if plan.replaced_expired {
+                self.counters.states_expired = self.counters.states_expired.saturating_add(1);
+            }
         } else {
             self.counters.allowed_established = self.counters.allowed_established.saturating_add(1);
         }
@@ -1159,7 +1243,10 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
         let start =
             flow_hash(packet, self.config.generation, self.config.hash_key) as usize % capacity;
         let mut probes = 0;
-        'restart: loop {
+        let mut cleanup_allowed = true;
+        for _pass in 0..2 {
+            let mut first_expired = None;
+            let mut restart = false;
             for distance in 0..capacity {
                 let index = (start + distance) % capacity;
                 let slot = self.states[index];
@@ -1167,13 +1254,19 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
                 if !slot.occupied {
                     return FirewallProbe {
                         live: None,
-                        reusable: Some(index),
+                        reusable: Some(first_expired.unwrap_or(index)),
                         probes,
                     };
                 }
                 if !self.slot_live(slot, now_ms) {
-                    self.delete_expired_and_shift(index);
-                    continue 'restart;
+                    if cleanup_allowed {
+                        self.delete_expired_and_shift(index);
+                        cleanup_allowed = false;
+                        restart = true;
+                        break;
+                    }
+                    first_expired.get_or_insert(index);
+                    continue;
                 }
                 if slot.protocol != packet.protocol {
                     continue;
@@ -1198,26 +1291,34 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
                     };
                 }
             }
+            if restart {
+                continue;
+            }
             return FirewallProbe {
                 live: None,
-                reusable: None,
+                reusable: first_expired,
                 probes,
             };
         }
+        unreachable!("one cleanup permits at most one bounded restart")
     }
 
     fn delete_expired_and_shift(&mut self, index: usize) {
         let capacity = self.states.len();
         self.states[index] = FirewallStateSlot::default();
+        self.occupied_count -= 1;
         self.runtime_epoch = self.runtime_epoch.wrapping_add(1).max(1);
         self.counters.states_expired = self.counters.states_expired.saturating_add(1);
+        self.counters.maintenance_steps = self.counters.maintenance_steps.saturating_add(1);
         let mut hole = index;
         let mut scan = (index + 1) % capacity;
         for _ in 0..capacity {
+            self.counters.maintenance_steps = self.counters.maintenance_steps.saturating_add(1);
             let slot = self.states[scan];
             if !slot.occupied {
                 break;
             }
+            self.counters.maintenance_steps = self.counters.maintenance_steps.saturating_add(1);
             let home = flow_hash(
                 slot_packet(slot),
                 self.config.generation,
@@ -1228,6 +1329,7 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
                 self.states[hole] = slot;
                 self.states[scan] = FirewallStateSlot::default();
                 hole = scan;
+                self.counters.maintenance_steps = self.counters.maintenance_steps.saturating_add(1);
             }
             scan = (scan + 1) % capacity;
         }
@@ -1306,6 +1408,10 @@ mod tests {
         FirewallHashKey::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210).unwrap()
     }
 
+    fn rotated_hash_key() -> FirewallHashKey {
+        FirewallHashKey::new(0xa5a5_5a5a_0123_4567, 0x1357_9bdf_2468_ace0).unwrap()
+    }
+
     fn rule(id: u32, action: FirewallAction, protocol: FirewallProtocol) -> FirewallRule {
         FirewallRule::new(
             FirewallRuleId(id),
@@ -1340,9 +1446,6 @@ mod tests {
             Err(FirewallHashKeyError::AllZero)
         );
         assert_eq!(format!("{:?}", hash_key()), "FirewallHashKey([REDACTED])");
-        let reference_key =
-            FirewallHashKey::new(0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908).unwrap();
-        assert_eq!(siphash24(reference_key, []), 0x726f_db47_dd0e_0e31);
         assert!(any().matches(Ipv4Address::from_octets([255; 4])));
         let host = FirewallIpv4Prefix::new(INTERNAL, 32).unwrap();
         assert!(host.matches(INTERNAL));
@@ -1417,6 +1520,51 @@ mod tests {
                 Err(FirewallPlanError::RuleDenied(FirewallRuleId(1)))
             );
         });
+    }
+
+    #[test]
+    fn siphash_vectors_and_canonical_flow_layout_match_independent_references() {
+        let reference_key =
+            FirewallHashKey::new(0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908).unwrap();
+        let mut message = [0_u8; 63];
+        for (index, byte) in message.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        for (length, expected) in [
+            (0, 0x726f_db47_dd0e_0e31),
+            (1, 0x74f8_39c5_93dc_67fd),
+            (7, 0xab02_00f5_8b01_d137),
+            (8, 0x93f5_f579_9a93_2462),
+            (15, 0xa129_ca61_49be_45e5),
+            (16, 0x3f2a_cc7f_57c2_9bdb),
+            (63, 0x958a_324c_eb06_4572),
+        ] {
+            assert_eq!(siphash24_bytes(reference_key, &message[..length]), expected);
+        }
+        assert_eq!(
+            siphash24(reference_key, [0x0706_0504_0302_0100]),
+            0x93f5_f579_9a93_2462
+        );
+        assert_eq!(
+            siphash24(
+                reference_key,
+                [0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908]
+            ),
+            0x3f2a_cc7f_57c2_9bdb
+        );
+
+        let candidate = packet(FirewallProtocol::Udp, 0);
+        let words = canonical_flow_words(candidate, 1);
+        let mut layout = [0_u8; 64];
+        for (word, chunk) in words.iter().zip(layout.chunks_exact_mut(8)) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        const EXPECTED_CANONICAL_HASH: u64 = 0x6040_22bd_edf7_0c4d;
+        assert_eq!(
+            siphash24_bytes(hash_key(), &layout),
+            EXPECTED_CANONICAL_HASH
+        );
+        assert_eq!(flow_hash(candidate, 1, hash_key()), EXPECTED_CANONICAL_HASH);
     }
 
     #[test]
@@ -1519,9 +1667,21 @@ mod tests {
                 runtime.reconcile(collision),
                 Err(FirewallReconcileError::IdentityCollision)
             );
-            let config2 =
+            let unrotated =
                 FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 2, hash_key())
                     .unwrap();
+            assert_eq!(
+                runtime.reconcile(unrotated),
+                Err(FirewallReconcileError::HashKeyNotRotated)
+            );
+            let config2 = FirewallConfig::new(
+                snapshot,
+                &rules,
+                FirewallPolicy::default(),
+                2,
+                rotated_hash_key(),
+            )
+            .unwrap();
             assert_eq!(runtime.reconcile(config2).unwrap().states_flushed, 0);
             assert!(runtime.states().iter().all(|slot| !slot.is_occupied()));
             assert_eq!(
@@ -1608,7 +1768,7 @@ mod tests {
     }
 
     #[test]
-    fn full_expired_collision_cluster_is_vacated_and_returns_to_short_probes() {
+    fn cleanup_budget_is_linear_for_n_and_two_n_capacity() {
         with_snapshot(|snapshot| {
             let rules = [rule(
                 1,
@@ -1618,57 +1778,107 @@ mod tests {
             let config =
                 FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
                     .unwrap();
-            let mut candidates = [packet(FirewallProtocol::Udp, 0); 5];
-            let mut found = 0;
-            for port in 1..=u16::MAX {
-                let mut candidate = packet(FirewallProtocol::Udp, 0);
-                candidate.source_port = port;
-                if flow_hash(candidate, 1, hash_key()) % 4 == 3 {
-                    candidates[found] = candidate;
-                    found += 1;
-                    if found == candidates.len() {
-                        break;
+
+            let mut small_slots = [FirewallStateSlot::default(); 4];
+            let mut small = FirewallRuntime::new(config, &mut small_slots);
+            assert_eq!(small.usable_capacity(), 3);
+            let mut distinct_homes = [packet(FirewallProtocol::Udp, 0); 4];
+            for (home, candidate) in distinct_homes.iter_mut().enumerate() {
+                let mut trial = *candidate;
+                candidate.source_port = (1..=u16::MAX)
+                    .find(|port| {
+                        trial.source_port = *port;
+                        flow_hash(trial, 1, hash_key()) as usize % 4 == home
+                    })
+                    .unwrap();
+            }
+            let plans = distinct_homes.map(|candidate| small.plan_packet(candidate, 0).unwrap());
+            for plan in &plans[..3] {
+                small.commit(*plan).unwrap();
+            }
+            assert_eq!(
+                small.commit(plans[3]),
+                Err(FirewallCommitError::UsableCapacityExceeded)
+            );
+            assert_eq!(
+                small
+                    .states()
+                    .iter()
+                    .filter(|slot| slot.is_occupied())
+                    .count(),
+                small.usable_capacity()
+            );
+
+            for capacity in [32, 64] {
+                let mut slots = vec![FirewallStateSlot::default(); capacity];
+                let mut runtime = FirewallRuntime::new(config, &mut slots);
+                let usable = runtime.usable_capacity();
+                assert_eq!(usable, capacity * 3 / 4);
+                let mut candidates = Vec::with_capacity(usable + 1);
+                for port in 1..=u16::MAX {
+                    let mut candidate = packet(FirewallProtocol::Udp, 0);
+                    candidate.source_port = port;
+                    if flow_hash(candidate, 1, hash_key()) as usize % capacity == capacity - 1 {
+                        candidates.push(candidate);
+                        if candidates.len() == usable + 1 {
+                            break;
+                        }
                     }
                 }
-            }
-            assert_eq!(found, candidates.len());
+                assert_eq!(candidates.len(), usable + 1);
+                for candidate in &candidates[..usable] {
+                    let plan = runtime.plan_packet(*candidate, 0).unwrap();
+                    runtime.commit(plan).unwrap();
+                }
+                assert_eq!(
+                    runtime
+                        .states()
+                        .iter()
+                        .filter(|slot| slot.is_occupied())
+                        .count(),
+                    usable
+                );
+                assert_eq!(
+                    runtime.plan_packet(candidates[usable], 0),
+                    Err(FirewallPlanError::StateFull(FirewallRuleId(1)))
+                );
+                assert!(runtime
+                    .states()
+                    .iter()
+                    .filter(|slot| slot.is_occupied())
+                    .all(|slot| candidates[..usable]
+                        .iter()
+                        .any(|candidate| candidate.source_port == slot.initiator_port())));
 
-            let mut slots = [FirewallStateSlot::default(); 4];
-            let mut runtime = FirewallRuntime::new(config, &mut slots);
-            for candidate in &candidates[..4] {
-                let plan = runtime.plan_packet(*candidate, 0).unwrap();
-                runtime.commit(plan).unwrap();
-            }
-            assert!(runtime.states().iter().all(|slot| slot.is_occupied()));
-            assert_eq!(
-                runtime.plan_packet(candidates[4], 0),
-                Err(FirewallPlanError::StateFull(FirewallRuleId(1)))
-            );
+                let stale = runtime
+                    .plan_packet(candidates[0], FIREWALL_UDP_DEFAULT_IDLE_TTL_MS - 1)
+                    .unwrap();
+                for _ in 0..usable {
+                    let before = runtime.counters();
+                    let _uncommitted = runtime
+                        .plan_packet(candidates[usable], FIREWALL_UDP_DEFAULT_IDLE_TTL_MS)
+                        .unwrap();
+                    let after = runtime.counters();
+                    let operations = (after.state_probes - before.state_probes)
+                        + (after.maintenance_steps - before.maintenance_steps);
+                    assert!(operations <= (capacity as u64) * 6 + 2);
+                    assert!(after.maintenance_steps > before.maintenance_steps);
+                }
+                assert!(runtime.states().iter().all(|slot| !slot.is_occupied()));
+                assert_eq!(runtime.counters().states_expired, usable as u64);
+                assert_eq!(
+                    runtime.commit(stale),
+                    Err(FirewallCommitError::RuntimeEpochChanged)
+                );
 
-            let stale = runtime
-                .plan_packet(candidates[0], FIREWALL_UDP_DEFAULT_IDLE_TTL_MS - 1)
-                .unwrap();
-            let replacement = runtime
-                .plan_packet(candidates[4], FIREWALL_UDP_DEFAULT_IDLE_TTL_MS)
-                .unwrap();
-            assert!(runtime.states().iter().all(|slot| !slot.is_occupied()));
-            assert_eq!(runtime.counters().states_expired, 4);
-            assert_eq!(
-                runtime.commit(stale),
-                Err(FirewallCommitError::RuntimeEpochChanged)
-            );
-            runtime.commit(replacement).unwrap();
-            let before_hit = runtime.counters().state_probes;
-            let established = runtime
-                .plan_packet(candidates[4], FIREWALL_UDP_DEFAULT_IDLE_TTL_MS)
-                .unwrap();
-            assert_eq!(runtime.counters().state_probes - before_hit, 1);
-            runtime.commit(established).unwrap();
-            let before_miss = runtime.counters().state_probes;
-            assert!(runtime
-                .plan_packet(candidates[0], FIREWALL_UDP_DEFAULT_IDLE_TTL_MS)
-                .is_ok());
-            assert!(runtime.counters().state_probes - before_miss <= 2);
+                let before = runtime.counters();
+                assert!(runtime
+                    .plan_packet(candidates[usable], FIREWALL_UDP_DEFAULT_IDLE_TTL_MS,)
+                    .is_ok());
+                let after = runtime.counters();
+                assert_eq!(after.state_probes - before.state_probes, 1);
+                assert_eq!(after.maintenance_steps - before.maintenance_steps, 0);
+            }
         });
     }
 
@@ -1676,8 +1886,7 @@ mod tests {
     fn secret_changes_hash_and_rotation_flushes_state() {
         with_snapshot(|snapshot| {
             let first_key = hash_key();
-            let second_key =
-                FirewallHashKey::new(0xa5a5_5a5a_0123_4567, 0x1357_9bdf_2468_ace0).unwrap();
+            let second_key = rotated_hash_key();
             let candidate = packet(FirewallProtocol::Udp, 0);
             assert_ne!(
                 flow_hash(candidate, 1, first_key),
@@ -1703,6 +1912,9 @@ mod tests {
             let config =
                 FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, first_key)
                     .unwrap();
+            let unrotated =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 2, first_key)
+                    .unwrap();
             let rotated =
                 FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 2, second_key)
                     .unwrap();
@@ -1710,7 +1922,18 @@ mod tests {
             let mut runtime = FirewallRuntime::new(config, &mut slots);
             let plan = runtime.plan_packet(candidate, 0).unwrap();
             runtime.commit(plan).unwrap();
+            let survives_rejection = runtime.plan_packet(candidate, 1).unwrap();
+            assert_eq!(
+                runtime.reconcile(unrotated),
+                Err(FirewallReconcileError::HashKeyNotRotated)
+            );
+            runtime.commit(survives_rejection).unwrap();
+            let stale_after_rotation = runtime.plan_packet(candidate, 2).unwrap();
             assert_eq!(runtime.reconcile(rotated).unwrap().states_flushed, 1);
+            assert_eq!(
+                runtime.commit(stale_after_rotation),
+                Err(FirewallCommitError::RuntimeEpochChanged)
+            );
             assert!(!runtime.states()[0].is_occupied());
         });
     }
@@ -1726,9 +1949,14 @@ mod tests {
             let config =
                 FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
                     .unwrap();
-            let config2 =
-                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 2, hash_key())
-                    .unwrap();
+            let config2 = FirewallConfig::new(
+                snapshot,
+                &rules,
+                FirewallPolicy::default(),
+                2,
+                rotated_hash_key(),
+            )
+            .unwrap();
             let mut slots = [FirewallStateSlot::default(); 1];
             let mut runtime = FirewallRuntime::new(config, &mut slots);
             let stale_epoch = runtime

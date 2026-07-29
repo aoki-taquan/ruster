@@ -524,8 +524,9 @@ noncanonical prefix、reversed range、invalid timeout、zero config generation�
 `FirewallHashKey`を生成してconfigへ渡します。all-zero keyはtyped constructorで拒否し、
 randomnessやsyscallをpacket pathへ持ち込みません。同一generationと同一rules/snapshot
 identity/hash keyのreconcileはno-op、
-同一generationの別identityとgeneration regressionは拒否し、forward generationは全stateを
-flushします。hash key rotationも新generationのpublicationとして全stateをflushします。
+同一generationの別identityとgeneration regressionは拒否します。generation前進時に同じ
+hash keyを再利用したpublicationも`HashKeyNotRotated`で拒否し、fresh keyを伴うforward
+generationだけが全stateをflushします。
 snapshotのcontent fingerprintとslice identity、rule fingerprintはpublication
 時に一度だけ計算してconfig/runtimeへbindし、packet pathのauthority確認はpointer/length/
 fingerprintのO(1)比較です。packetごとのsnapshot再hashやrules slice equalityは行いません。
@@ -554,14 +555,22 @@ RFC 7857 full complianceの主張ではありません。
 
 stateはcaller-backed fixed sliceをworkerが専有し、runtimeは`!Send + !Sync`です。
 forward/reverseで同じhomeになるSipHash-2-4相当のkeyed canonical hashを使うlinear open
-addressingで、established lookupはcluster終端のempty slotまたはcapacityまでのbounded probe
-です。new flowだけordered ruleをscanします。exact expiryをprobe中に発見するとslotを
-`occupied=false`へ戻し、backward-shift deletionで後続live entryのprobe chainを修復してから
-lookupをrestartします。これにより一度fullになったtableもexpiry後はempty terminationを回復し、
-期限切れslotをtombstoneとして永久scanしません。通常live hitはexpected O(1)、cleanupはcluster長に比例し
-expiryへamortizeされます。cleanupによるslot移動はruntime epochを進め、移動前planをrelease
-buildでもstaleとして拒否します。live evictionはなく、zero/full capacityはtyped dropです。
-probe数とrule evaluation数はcounterで観測できます。
+addressingです。capacity 4以上の`usable_capacity`は`N-ceil(N/4)`、つまり最大75% occupiedとし、
+少なくとも25%のempty headroomを維持します。0はusable 0、caller-backedの小容量test/profileを
+壊さないため1..=3だけは全slot usableという明示的例外です。commitも上限を再検証するため、
+複数のoutstanding planからlive loadを超過できません。通常live hitはsecret hashとheadroomの下で
+expected O(1)、established lookupはemptyまたはcapacityまでのbounded probeで、new flowだけ
+ordered ruleをscanします。
+
+exact expiryをprobe中に発見したattemptは最大1 slotだけ`occupied=false`へ戻し、最大capacity回の
+backward-shift deletionで後続live entryのprobe chainを修復し、最大1回だけ先頭から再scanします。
+再scanで見つけた別のexpired slotは追加deleteせずfirst reuse候補として扱います。このため単一
+packetはprobe最大2N、maintenanceも定数倍Nでstrict O(N)であり、expired数を掛けたO(N²)には
+なりません。full相当のusable loadが全expiryしても、繰返しattemptが1 slotずつamortized cleanup
+し、最終的にempty terminationを回復します。新規flowはcleanupが追いつかない間fail closedで
+構いません。cleanupによるdelete/moveはruntime epochを進め、移動前planをrelease buildでも
+staleとして拒否します。live evictionはありません。probe、maintenance shift/hash/scan、
+rule evaluation数はcounterで観測できます。
 
 runtime/config/snapshot authorityとIPv4/transport structural/checksum validationはLPMより前に
 行います。valid attemptはstate/NAT lookupより前にworker-local security watermarkを単調更新し、
@@ -571,8 +580,12 @@ rule/default deny、state full、route/neighbor/NAT missでも戻しません。
 egress不明のためrule評価せず`FirewallRouteUnavailable`でsilent dropし、Type 3/Code 0やARPを
 queueしません。NAT inboundもFW state/rule判定をTTL判定より先に行います。
 
-planはflow stateを変更せず、runtime epoch、config generation、slot generationを保持します。
-commitはrelease buildでも三者を検証するtyped `Result`で、reconcileはepochを進めるため、
+planが返すcreate/refresh replacementと論理的にliveなflowのactivity/phaseはcommitまで反映
+しません。一方、security watermarkと同様にlazy expiry housekeepingはprobe中に実行でき、
+expired slotのdelete、backward-shift move、expired counter、maintenance counter、runtime
+epochを更新します。planはそのhousekeeping後のruntime epoch、config generation、slot
+generationを保持します。commitはrelease buildでもこれらとusable capacityを検証するtyped
+`Result`で、reconcile/cleanupはepochを進めるため、
 reconcile後またはslot reuse後のstale planをcommitできません。直列packet pathではvalidation、
 NAT authority、LPM、FW rule/state、TTL/neighbor、rewrite preflightが成功してbytesを更新した
 後にchecked NAT/FW commitを行い、TX requestします。同batchの次packetは直前commitを参照でき、

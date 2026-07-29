@@ -107,7 +107,9 @@ zeroは許可し、nonzeroはfull検証します。UDPはexact reverse pseudo-se
 snapshot/rule fingerprintは設定publication時に固定します。control planeがpublicationごとに
 生成する非ゼロ128-bit `FirewallHashKey`を必須とし、established lookupはforward/reverse共通の
 keyed canonical hashとopen addressingで行います。秘密鍵生成のrandom/syscallはfast path外です。
-期限切れslotはbackward-shift cleanupで実際にvacateしてclusterを修復し、新規flowだけordered
+generation更新時のkey再利用は拒否します。capacity 4以上は最大75%のusable loadに制限し、
+packetごとの期限切れmaintenanceは最大1回のbackward-shiftと1回の再scanだけです。したがって
+worst caseはtable容量に線形で、繰返しattemptにより漸進回収します。新規flowだけordered
 ruleをscanします。
 non-regressiveなvalid attemptはdeny/missでもsecurity watermarkを進め、古い時刻でのstate
 復活をfail closedにします。`*_audited` APIはcaller-backed固定bufferへRuleId/default、
