@@ -38,12 +38,16 @@ pub use packet::{
     ValidatedArpRequest, ValidatedIpv4, ARP_ETHERTYPE, ETHERNET_HEADER_LEN, IPV4_ETHERTYPE,
 };
 pub use resolution::{
-    execute_one_arp_request, poll_resolution_timers, ArpRequestAction, ArpRequestBuildError,
-    ControlDisposition, DynamicNeighborSlot, ExecuteArpRequestError, GeneratedArpReport,
-    GeneratedArpTrace, GeneratedTraceSink, MonotonicMillis, NoGeneratedTrace,
-    NoResolutionTimerTrace, ResolutionActionSlot, ResolutionCounters, ResolutionPhase,
-    ResolutionPolicy, ResolutionPolicyError, ResolutionResult, ResolutionRuntime,
-    ResolutionStateSlot, ResolutionStatus, ResolutionTimerError, ResolutionTimerReport,
-    ResolutionTimerTrace, ResolutionTimerTraceSink, StaticReconcileReport, ARP_REQUEST_FRAME_LEN,
+    dispatch_host_unreachable_failures, execute_one_arp_request, poll_resolution_timers,
+    ArpRequestAction, ArpRequestBuildError, ControlDisposition, DynamicNeighborSlot,
+    ExecuteArpRequestError, GeneratedArpReport, GeneratedArpTrace, GeneratedTraceSink,
+    MonotonicMillis, NoGeneratedTrace, NoResolutionFailureTrace, NoResolutionTimerTrace,
+    ResolutionActionSlot, ResolutionCounters, ResolutionFailureCapture, ResolutionFailureCounters,
+    ResolutionFailureDispatchError, ResolutionFailureDispatchReport, ResolutionFailureHoldPhase,
+    ResolutionFailureHoldSlot, ResolutionFailureTrace, ResolutionFailureTraceSink,
+    ResolutionGenerationToken, ResolutionPhase, ResolutionPolicy, ResolutionPolicyError,
+    ResolutionResult, ResolutionRuntime, ResolutionStateSlot, ResolutionStatus,
+    ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTrace, ResolutionTimerTraceSink,
+    StaticReconcileReport, ARP_REQUEST_FRAME_LEN,
 };
 pub use route::{IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route, RouteError};
