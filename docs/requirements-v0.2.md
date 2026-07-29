@@ -26,7 +26,7 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | IP4-005 header checksum validation | RFC 1071 | `all_validation_and_decision_drops_are_granular_and_atomic` | implemented | なし |
 | FWD-001 `/0`と`/32`を含むLPM | forwarding requirement | `lpm_supports_default_and_host_routes` | implemented | ECMPなし |
 | FWD-002 connected/gateway neighbor selection | forwarding requirement | `connected_route_uses_packet_destination_as_neighbor_target` | implemented | static lookupを優先しdynamicへfallback |
-| FWD-003 TTL decrement | RFC 791 §3.1 | `gateway_route_rewrites_and_reports_backend_acceptance` | implemented | TTL expiry ICMP生成はdeferred |
+| FWD-003 TTL decrement | RFC 791 §3.1 | `gateway_route_rewrites_and_reports_backend_acceptance` | implemented | TTL 2以上を転送時に1減算 |
 | FWD-004 incremental checksum update | RFC 1624 §4 | `rfc_1624_negative_zero_boundary_is_positive_zero` | implemented | `0xdd2f,0x5555→0x3285 = 0x0000` |
 | FWD-005 drop atomicity | architecture contract | `all_validation_and_decision_drops_are_granular_and_atomic` | implemented | なし |
 | FWD-006 snapshot integrity | architecture contract | `snapshot_constructor_rejects_all_broken_references_and_duplicates` | implemented | 公開前にvalidation |
@@ -47,7 +47,14 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | ICMP4-010 unsupported local consume lifecycle | architecture contract | `valid_unsupported_local_traffic_is_consumed_without_routing` | implemented | local non-ICMPとchecksum-valid non-Echo ICMPをbyte不変consumeしownershipを終端 |
 | ICMP4-010A ICMP user interface delivery | RFC 1122 §3.2.2, RFC 1812 §4.3.3 | — | deferred | Echo ReplyとICMP error/controlを渡すupper-layer interfaceは未実装 |
 | ICMP4-011 partial TX completion | architecture contract | `echo_partial_backend_rejection_preserves_lifecycle_and_trace` | implemented | requested/accepted/rejected/errorとterminal traceを保持 |
-| ICMP4-012 ICMP error generation and other queries | RFC 792, RFC 1122 §3.2.2 | — | deferred | TTL Exceeded、Destination Unreachable、Timestamp等は未実装 |
+| ICMP4-012 Time Exceeded Code 0 generation | RFC 792, RFC 1812 §§4.3.2, 5.2.7.3 | `ttl_expiry_is_atomic_and_generates_exact_asymmetric_static_reply` | implemented | nonlocal TTL 0/1をbyte不変drop後、別generated sessionでType 11/Code 0 |
+| ICMP4-012A RFC error suppression | RFC 1812 §§4.3.2.7, 4.3.2.8, 5.3.1 | `rfc1812_suppression_matrix_is_typed_and_byte_atomic` | implemented | invalid source/destination、L2 group、noninitial fragment、ICMP error recursionをtyped suppression |
+| ICMP4-012B reverse route and neighbor authority | RFC 1812 §§4.3.2.4, 4.3.2.5 | `unresolved_reverse_neighbor_queues_only_arp_and_same_batch_learning_is_ordered` | implemented | sourceへの通常LPM。ingress Ethernet sourceを信用せず、static→fresh dynamic。missはARPだけでICMP holdなし |
+| ICMP4-012C bounded quote and generated wire | RFC 792, RFC 1812 §§4.3.2.3, 4.3.2.5 | `quote_boundaries_exclude_padding_and_zero_generated_padding` | implemented | received IPv4を最大548 bytes引用、outer IP最大576/frame最大590、odd checksum、padding zero |
+| ICMP4-012D per-egress timer limiter | RFC 1812 §4.3.2.8 | `allocation_build_and_backend_reject_lifecycles_are_exact` | implemented | default 100ms、commit起点、exact boundary、rejectもdeadline開始、allocation/build失敗はaction保持 |
+| ICMP4-012E fixed caller-backed error runtime | architecture contract | `wrapped_fifo_reuses_only_expired_idle_state` | implemented | ARPと別FIFO/state、one queued per egress、expired idleだけreuse、zero capacity/clock regression safe |
+| ICMP4-012F options Time Exceeded | RFC 1812 §§4.3.2.4, 4.3.3.6 | `ethernet_group_destination_and_options_suppress_without_mutation` | deviation | source-route reversal/option処理未実装のためTTL判定前にbyte不変drop |
+| ICMP4-012G other ICMP errors and queries | RFC 792, RFC 1122 §3.2.2 | — | deferred | Destination Unreachable、Parameter Problem、Redirect、Timestamp等は未実装 |
 | ICMP4-013 resolution isolation | architecture contract | `local_echo_and_consume_leave_resolution_runtime_untouched` | implemented | Echo/consumeはdynamic cache、pending state/action、FIFO/capacity、monotonic watermarkを変更しない |
 | ARP-001 Ethernet/IPv4 Request/Reply profile validation | RFC 826, RFC 5494/IANA ARP Parameters | `arp_profile_validation_drops_are_granular_and_atomic` | implemented | HTYPE=1/PTYPE=0x0800/HLEN=6/PLEN=4、unknown opcodeはdrop |
 | ARP-002 local target in-place reply on ingress | RFC 826 | `arp_request_for_local_ipv4_replies_in_place_on_ingress` | implemented | 同じRX allocation、egress=ingress、wire fieldsを検証 |

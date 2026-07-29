@@ -191,8 +191,51 @@ reserved IPv4 flagがnonzeroであることだけを理由に受信packetをdrop
 として処理し、originated atomic Replyではreserved bitをclearしてDFだけを設定します。
 IPv4 options付きlocal Echoもbyte不変dropします。RFC 1122 §3.2.2.6とRFC 1812 §4.3.3.6が
 source-route reversalをMUST、Record Route/Timestamp更新をSHOULDとしているため、これは
-明示deviationです。Timestamp等の他ICMP query、options処理、ICMP error生成（TTL
-Exceeded/Destination Unreachableを含む）、rate limit、PMTU処理はdeferredです。
+明示deviationです。Timestamp等の他ICMP query、options処理、Destination Unreachable、
+Parameter Problem、Redirect、PMTU処理はdeferredです。
+
+## ICMPv4 Time Exceeded scope
+
+RFC 792のType 11/Code 0とRFC 1812 §§4.3.2, 4.3.3, 5.2.7.3, 5.3.1を対象にします。
+valid IHL=5のnonlocal IPv4でTTLが0または1なら、元RX leaseは一切変更せず
+`Ipv4TtlExpired`でrecycleします。eligibleなpacketだけ、ARPとは別のcaller-backed
+`Icmpv4ErrorRuntime`へactionをqueueし、RX batch終了後のgenerated sessionで送信します。
+action FIFOとper-egress rate stateはworker-localであり、共有lock、packet clone、backend
+buffer pointerを持ちません。
+
+逆経路は元IPv4 sourceへの通常LPMです。gateway routeではnext-hop、connected routeでは
+元sourceをneighbor targetにし、reverse egressのInterface MAC/local IPv4 bindingを使います。
+static neighborを優先し、次にfresh dynamic ARP entryを使います。未解決時は既存ARP actionを
+scheduleしますがICMP actionは保存しません。受信Ethernet sourceはprevious hopにすぎないため
+neighborとして信用しません。このため最初のtraceroute probeがARP warm-upだけで終わることが
+あり、学習後のfresh probeが必要です。同じbatchでは先行ARP学習だけが後続TTL packetから見え、
+後続ARPは先行TTL packetにretroactiveな生成を行いません。
+
+actionは受信時のIPv4 datagram bytesを`min(Total Length, 548)`だけ固定配列へcopyします。
+Ethernet headerとTotal Length後のpaddingは引用しません。生成wire profileは次です。
+
+- Ethernet II frame lengthは`max(60, 14 + 28 + quote_len)`、FCSなし。padding/tailをzero-fill。
+- outer IPv4はIHL=5、Total Length=`28 + quote_len`、ID=0、DF=1、MF/offset=0、
+  protocol=1。TTLはvalidated `Ipv4OriginPolicy`。
+- outer TOSはRFC 1812 legacy profileのprecedence 6として
+  `(original_tos & 0x1f) | 0xc0`。source/destinationはreverse binding/original source。
+- ICMPはType 11、Code 0、unused=0。odd lengthを含むheader+quote全体をchecksumする。
+- outer IPv4 Total Lengthは最大576、Ethernet frameは最大590 bytes。
+
+RFC 1812のerror suppressionとして、invalid/non-host/router-local source、IP
+multicast/limited/directed-broadcast destination、Ethernet group destination、
+noninitial fragment、ICMP error Types 3/4/5/11/12、protocol 1でtype byteが無いpacket、
+reverse route/interface/binding/neighbor不在では生成しません。first fragment
+offset=0/MF=1とICMP queryは生成可能です。IPv4 optionsはsource-route reversal等を実装して
+いないため、従来どおりTTL判定前に`Ipv4OptionsUnsupported`でatomic dropするdeviationです。
+
+rate limiterはreverse egress単位のtimer方式でdefault 100msです。intervalはnonzero、
+state TTLはinterval以上を要求します。egressごとにqueue中actionは一つ、lease commitから
+deadlineを開始しexact boundaryを許可します。allocation/build失敗はactionを保持してdeadlineを
+開始せず、backend reject/finish errorもTX requested済みなのでdeadlineを開始します。
+state/action fullとclock regressionはphantom state/action/deadlineを作りません。expired idle
+stateだけ再利用します。multi-worker共通limit、unresolved neighborを跨ぐICMP hold/replay、
+RFC 4884 extension、MTU別quote縮小/generated fragmentation、interface別disableはdeferredです。
 
 ## ARP control scope
 
