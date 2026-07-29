@@ -307,11 +307,43 @@ impl Default for FirewallPolicy {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct FirewallHashKey {
+    first: u64,
+    second: u64,
+}
+
+impl std::fmt::Debug for FirewallHashKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FirewallHashKey([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FirewallHashKeyError {
+    AllZero,
+}
+
+impl FirewallHashKey {
+    /// Constructs a control-plane supplied 128-bit flow-table hash key.
+    ///
+    /// The control plane must generate a fresh, unpredictable key for every
+    /// configuration publication. The packet path never generates randomness.
+    pub const fn new(first: u64, second: u64) -> Result<Self, FirewallHashKeyError> {
+        if first == 0 && second == 0 {
+            return Err(FirewallHashKeyError::AllZero);
+        }
+        Ok(Self { first, second })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FirewallConfig<'a> {
     rules: &'a [FirewallRule],
     policy: FirewallPolicy,
     generation: u64,
+    hash_key: FirewallHashKey,
     snapshot_authority: u64,
     snapshot_identity: [usize; 8],
     rules_identity: usize,
@@ -335,6 +367,7 @@ impl<'a> FirewallConfig<'a> {
         rules: &'a [FirewallRule],
         policy: FirewallPolicy,
         generation: u64,
+        hash_key: FirewallHashKey,
     ) -> Result<Self, FirewallConfigError> {
         if generation == 0 {
             return Err(FirewallConfigError::GenerationZero);
@@ -372,6 +405,7 @@ impl<'a> FirewallConfig<'a> {
             rules,
             policy,
             generation,
+            hash_key,
             snapshot_authority: snapshot.authority(),
             snapshot_identity: snapshot.identity(),
             rules_identity: rules.as_ptr() as usize,
@@ -395,6 +429,11 @@ impl<'a> FirewallConfig<'a> {
         self.generation
     }
 
+    #[must_use]
+    pub const fn hash_key(self) -> FirewallHashKey {
+        self.hash_key
+    }
+
     pub(crate) fn authority_matches(self, snapshot: &ForwardingSnapshot<'_>) -> bool {
         self.snapshot_authority == snapshot.authority()
             && self.snapshot_identity == snapshot.identity()
@@ -403,6 +442,7 @@ impl<'a> FirewallConfig<'a> {
     pub(crate) fn identity_matches(self, other: FirewallConfig<'_>) -> bool {
         self.policy == other.policy
             && self.generation == other.generation
+            && self.hash_key == other.hash_key
             && self.snapshot_authority == other.snapshot_authority
             && self.snapshot_identity == other.snapshot_identity
             && self.rules_identity == other.rules_identity
@@ -610,10 +650,18 @@ pub enum FirewallPolicySource {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirewallFailure {
+    InvalidInitialTcp,
+    StateTableFull,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FirewallDisposition {
     pub verdict: FirewallVerdict,
     pub class: FirewallConnectionClass,
     pub source: FirewallPolicySource,
+    pub matched_action: Option<FirewallAction>,
+    pub failure: Option<FirewallFailure>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -642,6 +690,8 @@ impl Default for FirewallAuditRecord {
                 verdict: FirewallVerdict::Drop,
                 class: FirewallConnectionClass::New,
                 source: FirewallPolicySource::Default,
+                matched_action: None,
+                failure: None,
             },
         }
     }
@@ -727,7 +777,6 @@ pub(crate) struct FirewallPlan {
     expected_config_generation: u64,
     replacement: FirewallStateSlot,
     created: bool,
-    expired: bool,
     disposition: FirewallDisposition,
 }
 
@@ -748,15 +797,11 @@ pub enum FirewallCommitError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FirewallProbe {
     live: Option<(usize, bool)>,
-    reusable: Option<(usize, bool)>,
+    reusable: Option<usize>,
     probes: usize,
 }
 
-fn flow_hash(packet: FirewallPacket, config_generation: u64) -> u64 {
-    fn mix(hash: u64, value: u64) -> u64 {
-        (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
-    }
-
+fn flow_hash(packet: FirewallPacket, config_generation: u64, hash_key: FirewallHashKey) -> u64 {
     let mut first = (
         packet.ingress.0,
         u32::from_be_bytes(packet.source.octets()),
@@ -770,20 +815,83 @@ fn flow_hash(packet: FirewallPacket, config_generation: u64) -> u64 {
     if second < first {
         std::mem::swap(&mut first, &mut second);
     }
-    let mut hash = mix(0xcbf2_9ce4_8422_2325, config_generation);
-    hash = mix(
-        hash,
-        match packet.protocol {
-            FirewallProtocol::Tcp => 6,
-            FirewallProtocol::Udp => 17,
-        },
-    );
-    for (interface, address, port) in [first, second] {
-        hash = mix(hash, u64::from(interface));
-        hash = mix(hash, u64::from(address));
-        hash = mix(hash, u64::from(port));
+    siphash24(
+        hash_key,
+        [
+            config_generation,
+            match packet.protocol {
+                FirewallProtocol::Tcp => 6,
+                FirewallProtocol::Udp => 17,
+            },
+            u64::from(first.0),
+            u64::from(first.1),
+            u64::from(first.2),
+            u64::from(second.0),
+            u64::from(second.1),
+            u64::from(second.2),
+        ],
+    )
+}
+
+fn siphash24<const WORDS: usize>(key: FirewallHashKey, words: [u64; WORDS]) -> u64 {
+    fn round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
+        *v0 = v0.wrapping_add(*v1);
+        *v1 = v1.rotate_left(13);
+        *v1 ^= *v0;
+        *v0 = v0.rotate_left(32);
+        *v2 = v2.wrapping_add(*v3);
+        *v3 = v3.rotate_left(16);
+        *v3 ^= *v2;
+        *v0 = v0.wrapping_add(*v3);
+        *v3 = v3.rotate_left(21);
+        *v3 ^= *v0;
+        *v2 = v2.wrapping_add(*v1);
+        *v1 = v1.rotate_left(17);
+        *v1 ^= *v2;
+        *v2 = v2.rotate_left(32);
     }
-    hash
+
+    let mut v0 = key.first ^ 0x736f_6d65_7073_6575;
+    let mut v1 = key.second ^ 0x646f_7261_6e64_6f6d;
+    let mut v2 = key.first ^ 0x6c79_6765_6e65_7261;
+    let mut v3 = key.second ^ 0x7465_6462_7974_6573;
+    for word in words {
+        v3 ^= word;
+        round(&mut v0, &mut v1, &mut v2, &mut v3);
+        round(&mut v0, &mut v1, &mut v2, &mut v3);
+        v0 ^= word;
+    }
+    let final_block = ((WORDS * 8) as u64) << 56;
+    v3 ^= final_block;
+    round(&mut v0, &mut v1, &mut v2, &mut v3);
+    round(&mut v0, &mut v1, &mut v2, &mut v3);
+    v0 ^= final_block;
+    v2 ^= 0xff;
+    for _ in 0..4 {
+        round(&mut v0, &mut v1, &mut v2, &mut v3);
+    }
+    v0 ^ v1 ^ v2 ^ v3
+}
+
+fn slot_packet(slot: FirewallStateSlot) -> FirewallPacket {
+    FirewallPacket {
+        ingress: slot.origin_ingress,
+        egress: slot.origin_egress,
+        source: slot.initiator_address,
+        destination: slot.responder_address,
+        protocol: slot.protocol,
+        source_port: slot.initiator_port,
+        destination_port: slot.responder_port,
+        tcp_flags: 0,
+    }
+}
+
+fn probe_distance(home: usize, position: usize, capacity: usize) -> usize {
+    if position >= home {
+        position - home
+    } else {
+        capacity - home + position
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -949,11 +1057,12 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
                 expected_config_generation: self.config.generation,
                 replacement,
                 created: false,
-                expired: false,
                 disposition: FirewallDisposition {
                     verdict: FirewallVerdict::Allow,
                     class: FirewallConnectionClass::Established,
                     source: FirewallPolicySource::Rule(current.origin_rule_id),
+                    matched_action: Some(FirewallAction::AllowStateful),
+                    failure: None,
                 },
             });
         }
@@ -977,7 +1086,7 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
         if packet.protocol == FirewallProtocol::Tcp && packet.tcp_flags & 0x17 != 0x02 {
             return Err(FirewallPlanError::InvalidInitialTcp(rule_id));
         }
-        let (index, expired) = probe
+        let index = probe
             .reusable
             .ok_or(FirewallPlanError::StateFull(rule_id))?;
         let current = self.states[index];
@@ -1005,11 +1114,12 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
                 origin_rule_id: rule_id,
             },
             created: true,
-            expired,
             disposition: FirewallDisposition {
                 verdict: FirewallVerdict::Allow,
                 class: FirewallConnectionClass::New,
                 source: FirewallPolicySource::Rule(rule_id),
+                matched_action: Some(FirewallAction::AllowStateful),
+                failure: None,
             },
         })
     }
@@ -1031,16 +1141,13 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
         if plan.created {
             self.next_slot_generation = plan.replacement.slot_generation.wrapping_add(1).max(1);
             self.counters.allowed_new = self.counters.allowed_new.saturating_add(1);
-            if plan.expired {
-                self.counters.states_expired = self.counters.states_expired.saturating_add(1);
-            }
         } else {
             self.counters.allowed_established = self.counters.allowed_established.saturating_add(1);
         }
         Ok(())
     }
 
-    fn probe(&self, packet: FirewallPacket, now_ms: u64) -> FirewallProbe {
+    fn probe(&mut self, packet: FirewallPacket, now_ms: u64) -> FirewallProbe {
         if self.states.is_empty() {
             return FirewallProbe {
                 live: None,
@@ -1049,52 +1156,80 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
             };
         }
         let capacity = self.states.len();
-        let start = flow_hash(packet, self.config.generation) as usize % capacity;
-        let mut first_reusable = None;
+        let start =
+            flow_hash(packet, self.config.generation, self.config.hash_key) as usize % capacity;
         let mut probes = 0;
-        for distance in 0..capacity {
-            let index = (start + distance) % capacity;
-            let slot = self.states[index];
-            probes += 1;
-            if !slot.occupied {
-                let expired = first_reusable.is_some();
-                return FirewallProbe {
-                    live: None,
-                    reusable: Some((first_reusable.unwrap_or(index), expired)),
-                    probes,
-                };
+        'restart: loop {
+            for distance in 0..capacity {
+                let index = (start + distance) % capacity;
+                let slot = self.states[index];
+                probes += 1;
+                if !slot.occupied {
+                    return FirewallProbe {
+                        live: None,
+                        reusable: Some(index),
+                        probes,
+                    };
+                }
+                if !self.slot_live(slot, now_ms) {
+                    self.delete_expired_and_shift(index);
+                    continue 'restart;
+                }
+                if slot.protocol != packet.protocol {
+                    continue;
+                }
+                let direct = slot.origin_ingress == packet.ingress
+                    && slot.origin_egress == packet.egress
+                    && slot.initiator_address == packet.source
+                    && slot.responder_address == packet.destination
+                    && slot.initiator_port == packet.source_port
+                    && slot.responder_port == packet.destination_port;
+                let reverse = slot.origin_ingress == packet.egress
+                    && slot.origin_egress == packet.ingress
+                    && slot.initiator_address == packet.destination
+                    && slot.responder_address == packet.source
+                    && slot.initiator_port == packet.destination_port
+                    && slot.responder_port == packet.source_port;
+                if direct || reverse {
+                    return FirewallProbe {
+                        live: Some((index, reverse)),
+                        reusable: None,
+                        probes,
+                    };
+                }
             }
-            if !self.slot_live(slot, now_ms) {
-                first_reusable.get_or_insert(index);
-                continue;
-            }
-            if slot.protocol != packet.protocol {
-                continue;
-            }
-            let direct = slot.origin_ingress == packet.ingress
-                && slot.origin_egress == packet.egress
-                && slot.initiator_address == packet.source
-                && slot.responder_address == packet.destination
-                && slot.initiator_port == packet.source_port
-                && slot.responder_port == packet.destination_port;
-            let reverse = slot.origin_ingress == packet.egress
-                && slot.origin_egress == packet.ingress
-                && slot.initiator_address == packet.destination
-                && slot.responder_address == packet.source
-                && slot.initiator_port == packet.destination_port
-                && slot.responder_port == packet.source_port;
-            if direct || reverse {
-                return FirewallProbe {
-                    live: Some((index, reverse)),
-                    reusable: first_reusable.map(|candidate| (candidate, true)),
-                    probes,
-                };
-            }
+            return FirewallProbe {
+                live: None,
+                reusable: None,
+                probes,
+            };
         }
-        FirewallProbe {
-            live: None,
-            reusable: first_reusable.map(|index| (index, true)),
-            probes,
+    }
+
+    fn delete_expired_and_shift(&mut self, index: usize) {
+        let capacity = self.states.len();
+        self.states[index] = FirewallStateSlot::default();
+        self.runtime_epoch = self.runtime_epoch.wrapping_add(1).max(1);
+        self.counters.states_expired = self.counters.states_expired.saturating_add(1);
+        let mut hole = index;
+        let mut scan = (index + 1) % capacity;
+        for _ in 0..capacity {
+            let slot = self.states[scan];
+            if !slot.occupied {
+                break;
+            }
+            let home = flow_hash(
+                slot_packet(slot),
+                self.config.generation,
+                self.config.hash_key,
+            ) as usize
+                % capacity;
+            if probe_distance(home, hole, capacity) < probe_distance(home, scan, capacity) {
+                self.states[hole] = slot;
+                self.states[scan] = FirewallStateSlot::default();
+                hole = scan;
+            }
+            scan = (scan + 1) % capacity;
         }
     }
 
@@ -1167,6 +1302,10 @@ mod tests {
         FirewallIpv4Prefix::new(Ipv4Address::from_octets([0; 4]), 0).unwrap()
     }
 
+    fn hash_key() -> FirewallHashKey {
+        FirewallHashKey::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210).unwrap()
+    }
+
     fn rule(id: u32, action: FirewallAction, protocol: FirewallProtocol) -> FirewallRule {
         FirewallRule::new(
             FirewallRuleId(id),
@@ -1196,6 +1335,14 @@ mod tests {
 
     #[test]
     fn config_validates_prefix_range_ids_interfaces_generation_and_first_match() {
+        assert_eq!(
+            FirewallHashKey::new(0, 0),
+            Err(FirewallHashKeyError::AllZero)
+        );
+        assert_eq!(format!("{:?}", hash_key()), "FirewallHashKey([REDACTED])");
+        let reference_key =
+            FirewallHashKey::new(0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908).unwrap();
+        assert_eq!(siphash24(reference_key, []), 0x726f_db47_dd0e_0e31);
         assert!(any().matches(Ipv4Address::from_octets([255; 4])));
         let host = FirewallIpv4Prefix::new(INTERNAL, 32).unwrap();
         assert!(host.matches(INTERNAL));
@@ -1222,11 +1369,23 @@ mod tests {
                 rule(1, FirewallAction::AllowStateful, FirewallProtocol::Udp),
             ];
             assert_eq!(
-                FirewallConfig::new(snapshot, &duplicate, FirewallPolicy::default(), 1),
+                FirewallConfig::new(
+                    snapshot,
+                    &duplicate,
+                    FirewallPolicy::default(),
+                    1,
+                    hash_key()
+                ),
                 Err(FirewallConfigError::DuplicateRuleId)
             );
             assert_eq!(
-                FirewallConfig::new(snapshot, &duplicate[..1], FirewallPolicy::default(), 0),
+                FirewallConfig::new(
+                    snapshot,
+                    &duplicate[..1],
+                    FirewallPolicy::default(),
+                    0,
+                    hash_key(),
+                ),
                 Err(FirewallConfigError::GenerationZero)
             );
             let unknown = [FirewallRule::new(
@@ -1241,7 +1400,7 @@ mod tests {
                 FirewallAction::AllowStateful,
             )];
             assert_eq!(
-                FirewallConfig::new(snapshot, &unknown, FirewallPolicy::default(), 1),
+                FirewallConfig::new(snapshot, &unknown, FirewallPolicy::default(), 1, hash_key()),
                 Err(FirewallConfigError::IngressInterfaceMissing)
             );
             let rules = [
@@ -1249,7 +1408,8 @@ mod tests {
                 rule(2, FirewallAction::AllowStateful, FirewallProtocol::Udp),
             ];
             let config =
-                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1).unwrap();
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
             let mut slots = [FirewallStateSlot::default(); 1];
             let mut runtime = FirewallRuntime::new(config, &mut slots);
             assert_eq!(
@@ -1268,7 +1428,8 @@ mod tests {
                 FirewallProtocol::Tcp,
             )];
             let config =
-                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1).unwrap();
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
             let mut slots = [FirewallStateSlot::default(); 1];
             let mut runtime = FirewallRuntime::new(config, &mut slots);
             let initial = runtime
@@ -1315,7 +1476,8 @@ mod tests {
                 FirewallProtocol::Udp,
             )];
             let config =
-                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1).unwrap();
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
             let mut no_slots = [];
             let mut runtime = FirewallRuntime::new(config, &mut no_slots);
             assert_eq!(
@@ -1345,15 +1507,22 @@ mod tests {
             let same = runtime.reconcile(config).unwrap();
             assert_eq!(same.states_flushed, 0);
             let copied_rules = rules;
-            let collision =
-                FirewallConfig::new(snapshot, &copied_rules, FirewallPolicy::default(), 1).unwrap();
+            let collision = FirewallConfig::new(
+                snapshot,
+                &copied_rules,
+                FirewallPolicy::default(),
+                1,
+                hash_key(),
+            )
+            .unwrap();
             assert_eq!(
                 runtime.reconcile(collision),
                 Err(FirewallReconcileError::IdentityCollision)
             );
             let config2 =
-                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 2).unwrap();
-            assert_eq!(runtime.reconcile(config2).unwrap().states_flushed, 1);
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 2, hash_key())
+                    .unwrap();
+            assert_eq!(runtime.reconcile(config2).unwrap().states_flushed, 0);
             assert!(runtime.states().iter().all(|slot| !slot.is_occupied()));
             assert_eq!(
                 runtime.reconcile(config),
@@ -1363,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn symmetric_open_addressing_wraps_reuses_tombstones_and_skips_rules_on_hits() {
+    fn keyed_symmetric_hash_reclaims_mixed_wrapped_clusters_without_live_eviction() {
         with_snapshot(|snapshot| {
             let rules = [rule(
                 1,
@@ -1371,26 +1540,27 @@ mod tests {
                 FirewallProtocol::Udp,
             )];
             let config =
-                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1).unwrap();
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
             let mut first = packet(FirewallProtocol::Udp, 0);
             first.source_port = (1..=u16::MAX)
                 .find(|port| {
                     first.source_port = *port;
-                    flow_hash(first, 1) % 3 == 2
+                    flow_hash(first, 1, hash_key()) % 3 == 2
                 })
                 .unwrap();
             let mut second = first;
             second.source_port = (first.source_port + 1..=u16::MAX)
                 .find(|port| {
                     second.source_port = *port;
-                    flow_hash(second, 1) % 3 == 2
+                    flow_hash(second, 1, hash_key()) % 3 == 2
                 })
                 .unwrap();
             let mut third = second;
             third.source_port = (second.source_port + 1..=u16::MAX)
                 .find(|port| {
                     third.source_port = *port;
-                    flow_hash(third, 1) % 3 == 2
+                    flow_hash(third, 1, hash_key()) % 3 == 2
                 })
                 .unwrap();
 
@@ -1416,16 +1586,132 @@ mod tests {
                 .unwrap();
             runtime.commit(refresh).unwrap();
             assert_eq!(runtime.counters().rule_evaluations, rule_evaluations);
+            let stale_before_movement = runtime
+                .plan_packet(reverse_second, FIREWALL_UDP_DEFAULT_IDLE_TTL_MS - 1)
+                .unwrap();
 
             let replacement = runtime
                 .plan_packet(third, FIREWALL_UDP_DEFAULT_IDLE_TTL_MS)
                 .unwrap();
+            assert_eq!(
+                runtime.commit(stale_before_movement),
+                Err(FirewallCommitError::RuntimeEpochChanged)
+            );
             runtime.commit(replacement).unwrap();
-            assert_eq!(runtime.states()[2].initiator_port(), third.source_port);
+            assert_eq!(runtime.states()[2].initiator_port(), second.source_port);
+            assert_eq!(runtime.states()[0].initiator_port(), third.source_port);
             assert!(runtime
                 .plan_packet(reverse_second, FIREWALL_UDP_DEFAULT_IDLE_TTL_MS)
                 .is_ok());
             assert!(runtime.counters().state_probes >= 8);
+        });
+    }
+
+    #[test]
+    fn full_expired_collision_cluster_is_vacated_and_returns_to_short_probes() {
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut candidates = [packet(FirewallProtocol::Udp, 0); 5];
+            let mut found = 0;
+            for port in 1..=u16::MAX {
+                let mut candidate = packet(FirewallProtocol::Udp, 0);
+                candidate.source_port = port;
+                if flow_hash(candidate, 1, hash_key()) % 4 == 3 {
+                    candidates[found] = candidate;
+                    found += 1;
+                    if found == candidates.len() {
+                        break;
+                    }
+                }
+            }
+            assert_eq!(found, candidates.len());
+
+            let mut slots = [FirewallStateSlot::default(); 4];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            for candidate in &candidates[..4] {
+                let plan = runtime.plan_packet(*candidate, 0).unwrap();
+                runtime.commit(plan).unwrap();
+            }
+            assert!(runtime.states().iter().all(|slot| slot.is_occupied()));
+            assert_eq!(
+                runtime.plan_packet(candidates[4], 0),
+                Err(FirewallPlanError::StateFull(FirewallRuleId(1)))
+            );
+
+            let stale = runtime
+                .plan_packet(candidates[0], FIREWALL_UDP_DEFAULT_IDLE_TTL_MS - 1)
+                .unwrap();
+            let replacement = runtime
+                .plan_packet(candidates[4], FIREWALL_UDP_DEFAULT_IDLE_TTL_MS)
+                .unwrap();
+            assert!(runtime.states().iter().all(|slot| !slot.is_occupied()));
+            assert_eq!(runtime.counters().states_expired, 4);
+            assert_eq!(
+                runtime.commit(stale),
+                Err(FirewallCommitError::RuntimeEpochChanged)
+            );
+            runtime.commit(replacement).unwrap();
+            let before_hit = runtime.counters().state_probes;
+            let established = runtime
+                .plan_packet(candidates[4], FIREWALL_UDP_DEFAULT_IDLE_TTL_MS)
+                .unwrap();
+            assert_eq!(runtime.counters().state_probes - before_hit, 1);
+            runtime.commit(established).unwrap();
+            let before_miss = runtime.counters().state_probes;
+            assert!(runtime
+                .plan_packet(candidates[0], FIREWALL_UDP_DEFAULT_IDLE_TTL_MS)
+                .is_ok());
+            assert!(runtime.counters().state_probes - before_miss <= 2);
+        });
+    }
+
+    #[test]
+    fn secret_changes_hash_and_rotation_flushes_state() {
+        with_snapshot(|snapshot| {
+            let first_key = hash_key();
+            let second_key =
+                FirewallHashKey::new(0xa5a5_5a5a_0123_4567, 0x1357_9bdf_2468_ace0).unwrap();
+            let candidate = packet(FirewallProtocol::Udp, 0);
+            assert_ne!(
+                flow_hash(candidate, 1, first_key),
+                flow_hash(candidate, 1, second_key)
+            );
+            let mut reverse = candidate;
+            reverse.ingress = candidate.egress;
+            reverse.egress = candidate.ingress;
+            reverse.source = candidate.destination;
+            reverse.destination = candidate.source;
+            reverse.source_port = candidate.destination_port;
+            reverse.destination_port = candidate.source_port;
+            assert_eq!(
+                flow_hash(candidate, 1, first_key),
+                flow_hash(reverse, 1, first_key)
+            );
+
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, first_key)
+                    .unwrap();
+            let rotated =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 2, second_key)
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 1];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let plan = runtime.plan_packet(candidate, 0).unwrap();
+            runtime.commit(plan).unwrap();
+            assert_eq!(runtime.reconcile(rotated).unwrap().states_flushed, 1);
+            assert!(!runtime.states()[0].is_occupied());
         });
     }
 
@@ -1438,9 +1724,11 @@ mod tests {
                 FirewallProtocol::Udp,
             )];
             let config =
-                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1).unwrap();
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
             let config2 =
-                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 2).unwrap();
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 2, hash_key())
+                    .unwrap();
             let mut slots = [FirewallStateSlot::default(); 1];
             let mut runtime = FirewallRuntime::new(config, &mut slots);
             let stale_epoch = runtime

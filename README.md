@@ -104,11 +104,15 @@ DF=1のnonfragment UDP/TCPです。ARP、router-local、router-originated genera
 zeroは許可し、nonzeroはfull検証します。UDPはexact reverse pseudo-session、TCPはinitial SYN
 だけが新規stateを作り、tupleとorigin ingress/egressの完全一致だけをlocal `ESTABLISHED`として
 扱います。これはTCP sequence/window stateやRFC 5382/7857全体への準拠を意味しません。
-snapshot/rule fingerprintは設定publication時に固定し、established lookupはforward/reverse
-共通hashのbounded open addressingで行います。新規flowだけordered ruleをscanします。
+snapshot/rule fingerprintは設定publication時に固定します。control planeがpublicationごとに
+生成する非ゼロ128-bit `FirewallHashKey`を必須とし、established lookupはforward/reverse共通の
+keyed canonical hashとopen addressingで行います。秘密鍵生成のrandom/syscallはfast path外です。
+期限切れslotはbackward-shift cleanupで実際にvacateしてclusterを修復し、新規flowだけordered
+ruleをscanします。
 non-regressiveなvalid attemptはdeny/missでもsecurity watermarkを進め、古い時刻でのstate
-復活をfail closedにします。`*_audited` APIはcaller-backed固定bufferへRuleId/defaultと
-New/Establishedを含むtyped verdictをpacket順に保存します。
+復活をfail closedにします。`*_audited` APIはcaller-backed固定bufferへRuleId/default、
+matched action、New/Established、terminal failureとeffective `Allow|Drop` verdictをpacket順に
+保存します。
 
 NATとのcombined APIではoutboundをpre-SNAT internal→remote、inboundをpost-DNAT
 remote→internalのcanonical tupleで照合します。NAT mappingだけではinboundを許可せず、exact

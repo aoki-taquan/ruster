@@ -6,13 +6,14 @@ use crate::nat44::{
 use crate::resolution::DynamicLookup;
 use crate::{
     packet, rfc1624_update, route, validate_arp, validate_ipv4_frame, ArpOpcode, ArpRequestAction,
-    BatchCompletion, ConsumeReason, ControlDisposition, FirewallAuditBuffer, FirewallConfig,
-    FirewallConnectionClass, FirewallDisposition, FirewallPolicySource, FirewallProtocol,
-    FirewallRuntime, FirewallVerdict, Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind,
-    Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface, LocalIpv4Binding,
-    MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition, Nat44TcpRuntime,
-    Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, ResolutionResult,
-    ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
+    BatchCompletion, ConsumeReason, ControlDisposition, FirewallAction, FirewallAuditBuffer,
+    FirewallConfig, FirewallConnectionClass, FirewallDisposition, FirewallFailure,
+    FirewallPolicySource, FirewallProtocol, FirewallRuntime, FirewallVerdict, Icmpv4ErrorAction,
+    Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition,
+    IfId, Interface, LocalIpv4Binding, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
+    Nat44TcpDisposition, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime,
+    Neighbor, PacketBatch, ResolutionResult, ResolutionRuntime, Route, ARP_ETHERTYPE,
+    IPV4_ETHERTYPE,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2520,17 +2521,29 @@ fn plan_firewall(
                     verdict: FirewallVerdict::Drop,
                     class: FirewallConnectionClass::New,
                     source: FirewallPolicySource::Rule(rule_id),
+                    matched_action: Some(FirewallAction::Deny),
+                    failure: None,
                 },
                 FirewallPlanError::DefaultDenied => FirewallDisposition {
                     verdict: FirewallVerdict::Drop,
                     class: FirewallConnectionClass::New,
                     source: FirewallPolicySource::Default,
+                    matched_action: None,
+                    failure: None,
                 },
-                FirewallPlanError::InvalidInitialTcp(rule_id)
-                | FirewallPlanError::StateFull(rule_id) => FirewallDisposition {
-                    verdict: FirewallVerdict::Allow,
+                FirewallPlanError::InvalidInitialTcp(rule_id) => FirewallDisposition {
+                    verdict: FirewallVerdict::Drop,
                     class: FirewallConnectionClass::New,
                     source: FirewallPolicySource::Rule(rule_id),
+                    matched_action: Some(FirewallAction::AllowStateful),
+                    failure: Some(FirewallFailure::InvalidInitialTcp),
+                },
+                FirewallPlanError::StateFull(rule_id) => FirewallDisposition {
+                    verdict: FirewallVerdict::Drop,
+                    class: FirewallConnectionClass::New,
+                    source: FirewallPolicySource::Rule(rule_id),
+                    matched_action: Some(FirewallAction::AllowStateful),
+                    failure: Some(FirewallFailure::StateTableFull),
                 },
                 FirewallPlanError::ClockRegression => {
                     return Err(match error {

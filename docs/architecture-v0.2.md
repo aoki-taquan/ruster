@@ -520,9 +520,13 @@ canonical source/destination prefix、TCP/UDP、inclusive source/destination por
 `AllowStateful|Deny`を持ちます。順序どおりfirst-matchし、matchなしはimplicit default deny
 です。overlapは順序の意味を持つため許可し、duplicate ID、unknown interface、
 noncanonical prefix、reversed range、invalid timeout、zero config generationはpublication
-前に拒否します。同一generationと同一rules/snapshot identityのreconcileはno-op、
+前に拒否します。さらにcontrol planeはCSPRNGからpublicationごとにfreshな非ゼロ128-bit
+`FirewallHashKey`を生成してconfigへ渡します。all-zero keyはtyped constructorで拒否し、
+randomnessやsyscallをpacket pathへ持ち込みません。同一generationと同一rules/snapshot
+identity/hash keyのreconcileはno-op、
 同一generationの別identityとgeneration regressionは拒否し、forward generationは全stateを
-flushします。snapshotのcontent fingerprintとslice identity、rule fingerprintはpublication
+flushします。hash key rotationも新generationのpublicationとして全stateをflushします。
+snapshotのcontent fingerprintとslice identity、rule fingerprintはpublication
 時に一度だけ計算してconfig/runtimeへbindし、packet pathのauthority確認はpointer/length/
 fingerprintのO(1)比較です。packetごとのsnapshot再hashやrules slice equalityは行いません。
 
@@ -549,10 +553,15 @@ default/minimum 240秒、Activeはdefault/minimum 2時間4分、最大7日です
 RFC 7857 full complianceの主張ではありません。
 
 stateはcaller-backed fixed sliceをworkerが専有し、runtimeは`!Send + !Sync`です。
-forward/reverseで同じcanonical hashを使うlinear open addressingで、established lookupは
-cluster終端のempty slotまたはcapacityまでのbounded probeです。new flowだけordered ruleを
-scanし、first expired tombstoneをreuseします。live evictionはなく、zero/full capacityはtyped
-dropです。probe数とrule evaluation数はcounterで観測できます。
+forward/reverseで同じhomeになるSipHash-2-4相当のkeyed canonical hashを使うlinear open
+addressingで、established lookupはcluster終端のempty slotまたはcapacityまでのbounded probe
+です。new flowだけordered ruleをscanします。exact expiryをprobe中に発見するとslotを
+`occupied=false`へ戻し、backward-shift deletionで後続live entryのprobe chainを修復してから
+lookupをrestartします。これにより一度fullになったtableもexpiry後はempty terminationを回復し、
+期限切れslotをtombstoneとして永久scanしません。通常live hitはexpected O(1)、cleanupはcluster長に比例し
+expiryへamortizeされます。cleanupによるslot移動はruntime epochを進め、移動前planをrelease
+buildでもstaleとして拒否します。live evictionはなく、zero/full capacityはtyped dropです。
+probe数とrule evaluation数はcounterで観測できます。
 
 runtime/config/snapshot authorityとIPv4/transport structural/checksum validationはLPMより前に
 行います。valid attemptはstate/NAT lookupより前にworker-local security watermarkを単調更新し、
@@ -571,8 +580,12 @@ backend rejectでもTX-request stateを保持します。deny、route/neighbor/N
 FW flowを作りません。
 
 audited APIはcaller-backed fixed `FirewallAuditBuffer`へ、policy evaluationへ到達した各packetの
-`Allow|Drop`、`New|Established`、`Rule(FirewallRuleId)|Default`を順番に記録します。buffer不足は
-typed overflow countになり、hot pathにheap、`String`、trait objectを導入しません。
+effective `Allow|Drop`、`New|Established`、`Rule(FirewallRuleId)|Default`、matched action、
+typed terminal failureを順番に記録します。allow ruleへmatchしてもinvalid initial TCPやstate
+fullで最終的に転送しないpacketは、matched actionを`AllowStateful`のまま保持しつつeffective
+verdictを`Drop`、failureをそれぞれ`InvalidInitialTcp|StateTableFull`として記録します。
+buffer不足はtyped overflow countになり、`clear`はrecord/overflow viewをresetします。hot pathに
+heap、`String`、trait objectを導入しません。
 
 NAT inbound mapping/sessionがあってもexact reverse FW stateが無ければinside neighborより前に
 denyします。NAT/FWどちらかのcapacity plan failureでも他方をcommitしません。NAT44 ICMPv4
