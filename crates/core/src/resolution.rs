@@ -129,6 +129,7 @@ pub enum ResolutionPhase {
     Waiting,
     RetryQueued,
     Failed,
+    Cooldown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -219,6 +220,7 @@ pub struct StaticReconcileReport {
     pub actions_removed: usize,
     pub invalid_states_removed: usize,
     pub invalid_actions_removed: usize,
+    pub cooldowns_retained: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -401,11 +403,15 @@ impl<'a> ResolutionRuntime<'a> {
         }
         for state in &mut *self.states {
             if state.occupied
+                && state.phase != ResolutionPhase::Cooldown
                 && neighbors.iter().any(|neighbor| {
                     neighbor.interface == state.key.egress && neighbor.target == state.key.target
                 })
             {
-                vacate_state(state);
+                if state.attempts != 0 {
+                    report.cooldowns_retained += 1;
+                }
+                cancel_state(state);
                 report.states_removed += 1;
             }
         }
@@ -439,17 +445,23 @@ impl<'a> ResolutionRuntime<'a> {
             }
         }
         for state in &mut *self.states {
-            if !state.occupied {
+            if !state.occupied || state.phase == ResolutionPhase::Cooldown {
                 continue;
             }
             match snapshot.resolution_action_authority(state.action) {
                 crate::forwarding::ResolutionActionAuthority::Valid => {}
                 crate::forwarding::ResolutionActionAuthority::StaticResolved => {
-                    vacate_state(state);
+                    if state.attempts != 0 {
+                        report.cooldowns_retained += 1;
+                    }
+                    cancel_state(state);
                     report.states_removed += 1;
                 }
                 crate::forwarding::ResolutionActionAuthority::Invalid => {
-                    vacate_state(state);
+                    if state.attempts != 0 {
+                        report.cooldowns_retained += 1;
+                    }
+                    cancel_state(state);
                     report.invalid_states_removed += 1;
                 }
             }
@@ -486,7 +498,18 @@ impl<'a> ResolutionRuntime<'a> {
 
     #[must_use]
     pub fn pending_states(&self) -> usize {
-        self.states.iter().filter(|state| state.occupied).count()
+        self.states
+            .iter()
+            .filter(|state| state.occupied && state.phase != ResolutionPhase::Cooldown)
+            .count()
+    }
+
+    #[must_use]
+    pub fn cooldown_count(&self) -> usize {
+        self.states
+            .iter()
+            .filter(|state| state.occupied && state.phase == ResolutionPhase::Cooldown)
+            .count()
     }
 
     #[must_use]
@@ -564,9 +587,25 @@ impl<'a> ResolutionRuntime<'a> {
                     self.start_cycle(index, action);
                     return self.enqueue_initial(index);
                 }
+                ResolutionPhase::Cooldown => {
+                    if now.0 - self.states[index].requested_at.0 < self.policy.interval_ms {
+                        self.counters.suppressed += 1;
+                        return ResolutionResult::Suppressed;
+                    }
+                    if self.len == self.actions.len() {
+                        self.counters.action_full += 1;
+                        return ResolutionResult::ActionFull;
+                    }
+                    self.start_cycle(index, action);
+                    return self.enqueue_initial(index);
+                }
             }
         }
-        let reusable = self.states.iter().position(|slot| !slot.occupied);
+        let reusable = self.states.iter().position(|slot| {
+            !slot.occupied
+                || (slot.phase == ResolutionPhase::Cooldown
+                    && now.0 - slot.requested_at.0 >= self.policy.interval_ms)
+        });
         let Some(index) = reusable else {
             self.counters.state_full += 1;
             return ResolutionResult::StateFull;
@@ -671,7 +710,7 @@ impl<'a> ResolutionRuntime<'a> {
     fn clear_resolution(&mut self, interface: IfId, target: Ipv4Address) {
         for state in &mut *self.states {
             if state.occupied && state.key.egress == interface && state.key.target == target {
-                vacate_state(state);
+                cancel_state(state);
             }
         }
         self.compact_actions(|action| action.egress == interface && action.target_ip == target);
@@ -878,6 +917,7 @@ impl<'a> ResolutionRuntime<'a> {
                         });
                     }
                 }
+                ResolutionPhase::Cooldown => {}
             }
         }
         report.pending = self.pending_states();
@@ -889,6 +929,24 @@ fn vacate_state(state: &mut ResolutionStateSlot) {
     let generation = state.generation;
     *state = ResolutionStateSlot::EMPTY;
     state.generation = generation;
+}
+
+fn cancel_state(state: &mut ResolutionStateSlot) {
+    if state.attempts == 0 {
+        vacate_state(state);
+        return;
+    }
+    let key = state.key;
+    let generation = state.generation;
+    let attempts = state.attempts;
+    let requested_at = state.requested_at;
+    *state = ResolutionStateSlot::EMPTY;
+    state.key = key;
+    state.generation = generation;
+    state.attempts = attempts;
+    state.requested_at = requested_at;
+    state.occupied = true;
+    state.phase = ResolutionPhase::Cooldown;
 }
 
 /// Advances bounded ARP retry/timeout state without performing packet I/O.
@@ -1412,7 +1470,14 @@ mod tests {
                 ),
                 ControlDisposition::Inserted
             );
-            assert_eq!(runtime.status(WAN, target(2)), None);
+            if cancellation_point == 0 {
+                assert_eq!(runtime.status(WAN, target(2)), None);
+            } else {
+                assert_eq!(
+                    runtime.status(WAN, target(2)).unwrap().phase,
+                    ResolutionPhase::Cooldown
+                );
+            }
             assert_eq!(runtime.pending_actions(), 0);
         }
     }
@@ -1528,5 +1593,214 @@ mod tests {
             authoritative
         );
         assert_eq!(runtime.status(WAN, target(2)).unwrap().attempts, 1);
+    }
+
+    #[test]
+    fn learned_mapping_with_short_ttl_cannot_reset_committed_cooldown() {
+        let policy =
+            ResolutionPolicy::with_retry_and_dynamic_neighbor_ttl(1_000, 2_000, 3, 1).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut dynamic,
+        );
+        runtime.schedule(action(2), MonotonicMillis(0), false);
+        commit_front(&mut runtime, 0);
+        assert_eq!(
+            runtime.merge_dynamic(
+                WAN,
+                target(2),
+                MacAddress([3; 6]),
+                true,
+                false,
+                MonotonicMillis(1),
+            ),
+            ControlDisposition::Inserted
+        );
+        assert_eq!(
+            runtime.status(WAN, target(2)).unwrap().phase,
+            ResolutionPhase::Cooldown
+        );
+        assert_eq!(
+            runtime.lookup_dynamic(WAN, target(2), MonotonicMillis(2)),
+            DynamicLookup::Miss
+        );
+        assert_eq!(
+            runtime.schedule(action(2), MonotonicMillis(2), false),
+            ResolutionResult::Suppressed
+        );
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(999),
+                1,
+                &mut NoResolutionTimerTrace
+            )
+            .unwrap()
+            .retries_queued,
+            0
+        );
+        assert_eq!(runtime.pending_actions(), 0);
+        assert_eq!(
+            runtime.schedule(action(2), MonotonicMillis(1_000), false),
+            ResolutionResult::Queued
+        );
+    }
+
+    #[test]
+    fn static_publication_removal_cannot_reset_committed_cooldown() {
+        let policy = ResolutionPolicy::new(1_000, 2_000).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.schedule(action(2), MonotonicMillis(0), false);
+        commit_front(&mut runtime, 0);
+
+        let routes = [Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, WAN, None).unwrap()];
+        let interfaces = [Interface {
+            id: WAN,
+            mac: SOURCE_MAC,
+        }];
+        let bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: SOURCE_IP,
+        }];
+        let neighbors = [Neighbor {
+            interface: WAN,
+            target: target(2),
+            mac: MacAddress([4; 6]),
+        }];
+        let with_static =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let report = runtime.reconcile_publication(&with_static);
+        assert_eq!(report.cooldowns_retained, 1);
+        assert_eq!(
+            runtime.status(WAN, target(2)).unwrap().phase,
+            ResolutionPhase::Cooldown
+        );
+
+        let without_static = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+        assert_eq!(
+            runtime.reconcile_publication(&without_static),
+            StaticReconcileReport::default()
+        );
+        assert_eq!(
+            runtime.schedule(action(2), MonotonicMillis(999), false),
+            ResolutionResult::Suppressed
+        );
+        assert_eq!(
+            runtime.schedule(action(2), MonotonicMillis(1_000), false),
+            ResolutionResult::Queued
+        );
+    }
+
+    #[test]
+    fn uncommitted_cancel_has_no_cooldown_and_expired_tombstone_is_reusable() {
+        let policy =
+            ResolutionPolicy::with_retry_and_dynamic_neighbor_ttl(1_000, 2_000, 3, 1).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut dynamic,
+        );
+        runtime.schedule(action(2), MonotonicMillis(0), false);
+        runtime.merge_dynamic(
+            WAN,
+            target(2),
+            MacAddress([3; 6]),
+            true,
+            false,
+            MonotonicMillis(1),
+        );
+        assert_eq!(runtime.status(WAN, target(2)), None);
+        assert_eq!(
+            runtime.lookup_dynamic(WAN, target(2), MonotonicMillis(2)),
+            DynamicLookup::Miss
+        );
+        assert_eq!(
+            runtime.schedule(action(2), MonotonicMillis(2), false),
+            ResolutionResult::Queued
+        );
+        commit_front(&mut runtime, 2);
+        runtime.clear_resolution(WAN, target(2));
+        assert_eq!(
+            runtime.schedule(action(3), MonotonicMillis(1_001), false),
+            ResolutionResult::StateFull
+        );
+        assert_eq!(
+            runtime.schedule(action(3), MonotonicMillis(1_002), false),
+            ResolutionResult::Queued,
+            "expired cooldown slot is reusable by a different key"
+        );
+    }
+
+    #[test]
+    fn authority_change_scrubs_retry_but_preserves_cooldown_and_clock_atomicity() {
+        let policy = ResolutionPolicy::new(1_000, 2_000).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.schedule(action(2), MonotonicMillis(0), false);
+        commit_front(&mut runtime, 0);
+
+        let routes = [Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, WAN, None).unwrap()];
+        let new_mac = MacAddress([8; 6]);
+        let interfaces = [Interface {
+            id: WAN,
+            mac: new_mac,
+        }];
+        let bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: SOURCE_IP,
+        }];
+        let changed = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+        let report = runtime.reconcile_publication(&changed);
+        assert_eq!(
+            (report.invalid_states_removed, report.cooldowns_retained),
+            (1, 1)
+        );
+        assert_eq!(runtime.pending_actions(), 0);
+        let mut fresh = action(2);
+        fresh.source_mac = new_mac;
+        assert_eq!(
+            runtime.schedule(fresh, MonotonicMillis(500), false),
+            ResolutionResult::Suppressed
+        );
+        let before = runtime.status(WAN, target(2));
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(499),
+                1,
+                &mut NoResolutionTimerTrace
+            ),
+            Err(ResolutionTimerError::ClockRegression)
+        );
+        assert_eq!(runtime.status(WAN, target(2)), before);
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(500),
+                1,
+                &mut NoResolutionTimerTrace
+            )
+            .unwrap()
+            .retries_queued,
+            0
+        );
+        assert_eq!(runtime.status(WAN, target(2)), before);
+        assert_eq!(
+            runtime.schedule(fresh, MonotonicMillis(1_000), false),
+            ResolutionResult::Queued
+        );
+        assert_eq!(runtime.front().unwrap().action.source_mac, new_mac);
     }
 }

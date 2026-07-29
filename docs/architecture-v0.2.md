@@ -106,10 +106,16 @@ periodic scanはなく、lookup/insert時のbounded linear lazy maintenanceで�
 
 control planeがforwarding snapshotを公開する同じworker tickでは、timer pollや次のpacket
 より前に、そのsnapshotを`ResolutionRuntime::reconcile_publication`へ渡します。これにより
-static keyと一致するdynamic/state/actionに加え、interface MAC、local binding、route authority、
-target safetyが新snapshotと一致しないstale retryを削除し、wrapped action ringのunrelated
+static keyと一致するdynamic/active state/actionに加え、interface MAC、local binding、
+route authority、target safetyが新snapshotと一致しないstale retryを削除し、wrapped action ringのunrelated
 FIFOを維持します。旧static-only caller向け`reconcile_static`は互換APIとして残します。
 static公開後に同keyのARPを受けた場合もmerge pathが同じkey cleanupを行います。
+一度でもRequestをcommitしたkeyを学習/static/authority変更でcancelする場合、retry actionと
+stale source authorityは削除しますが、`(IfId,target,requested_at)`だけのnon-retrying
+`Cooldown` tombstoneを残します。dynamic TTL expiryやstatic publish/remove churnはこの
+commit起点intervalを短縮できません。timer pollはtombstoneからretryを生成せず、exact
+interval後だけfresh packetが新しいsnapshot authorityで新世代を開始できます。未commit
+actionのcancelはtombstoneを残しません。expired tombstoneだけstate pressure時にreuseします。
 
 同じkeyのactionは一つだけqueueできます。抑制deadlineはenqueue時でなく、generated
 leaseをcommitしてTX requestedになった注入時刻から開始します。allocation/build失敗時は
@@ -136,11 +142,14 @@ Ethernet/IPv4 ARP（Ethernet destination broadcast、SHA/source MACはlocal、SP
 local IPv4、THA zero、TPA target）として書き、残り18 bytesを必ずzero paddingします。
 THA zeroは決定的なlocal profile choiceであり、RFCのMUSTとは主張しません。
 
-これはRFC 826の通常ARP Request生成/mergeとRFC 1122 §2.3.2.1のflood prevention、
-timer retry/terminal failureまでです。unresolved packet hold/replay（RFC 1122
-§2.3.2.2、RFC 1812 §3.3.2）、ARP失敗に対するICMP Destination Unreachable Type 3/Code 1、
-multi-worker resolution ownership/SPSCは未実装です。最初のpacketは解決後に自動再送
-されず、失敗時も元datagramへ応答できないことを明示的なdeviationとして残します。
+RFC 1122 §2.3.2.1から採用する境界はARP cache invalidation adviceとRequest flood
+preventionです。retry scheduling、max attempts、`Failed`、hold-downとそのdefault値は
+すべてlocal policyであり、RFC要件とは主張しません。RFC 1812 §3.3.2はfruitless
+resolutionを永遠に続けずdatagramを捨てる、より広いrouter behaviorの境界として扱います。
+unresolved packet hold/replay（RFC 1122 §2.3.2.2、RFC 1812 §3.3.2）、ARP失敗に対する
+ICMP Destination Unreachable Type 3/Code 1、multi-worker resolution ownership/SPSCは
+未実装です。最初のpacketは解決後に自動再送されず、失敗時も元datagramへ応答できないことを
+明示的なdeviationとして残します。
 
 ## IPv4 scope
 
@@ -290,7 +299,8 @@ MAC/refresh時刻やpending resolutionを変更しません。
 - local SPA claimの保護はlink scopedで、`(ingress IfId, SPA)`がlocal bindingと一致する場合
   だけ学習しない。同じIPv4値が別interfaceのlocal bindingでも、ingress上では通常peerとして
   学習できる。
-- 学習成功時だけmatching resolution state/actionをcancelし、unrelated FIFOを維持する。
+- 学習成功時だけmatching active resolution/actionをcancelし、unrelated FIFOを維持する。
+  commit済みRequestのflood cooldown tombstoneは残す。
 
 Reply admissionへsolicited-only制約は追加しません。`ArpReplyUnsupported`と
 `ArpTargetNotLocal`のstable reason番号は互換性のためretired/reservedとして維持します。
