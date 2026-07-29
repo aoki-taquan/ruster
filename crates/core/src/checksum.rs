@@ -6,10 +6,10 @@
 pub fn internet_checksum(bytes: &[u8]) -> u16 {
     let mut chunks = bytes.chunks_exact(2);
     let mut sum = chunks.by_ref().fold(0_u32, |sum, word| {
-        sum + u32::from(u16::from_be_bytes([word[0], word[1]]))
+        add_folded(sum, u16::from_be_bytes([word[0], word[1]]))
     });
     if let Some(&last) = chunks.remainder().first() {
-        sum += u32::from(last) << 8;
+        sum = add_folded(sum, u16::from(last) << 8);
     }
     fold(sum)
 }
@@ -34,6 +34,11 @@ fn fold(sum: u32) -> u16 {
     !fold_sum(sum)
 }
 
+fn add_folded(sum: u32, word: u16) -> u32 {
+    let sum = sum + u32::from(word);
+    (sum & 0xffff) + (sum >> 16)
+}
+
 fn fold_sum(mut sum: u32) -> u16 {
     while sum > 0xffff {
         sum = (sum & 0xffff) + (sum >> 16);
@@ -53,5 +58,11 @@ mod tests {
     #[test]
     fn checksum_accepts_an_odd_slice_without_panicking() {
         assert_eq!(ipv4_header_checksum(&[0x01, 0x02, 0x03]), 0xfbfd);
+    }
+
+    #[test]
+    fn internet_checksum_folds_carry_for_large_odd_messages() {
+        let bytes = vec![0xff; 200_001];
+        assert_eq!(internet_checksum(&bytes), 0x00ff);
     }
 }

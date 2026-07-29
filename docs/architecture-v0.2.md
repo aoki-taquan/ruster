@@ -48,6 +48,9 @@ packet terminal traceの`TxRequested`はcommit後に記録しますが、wire送
 ordered outcome/tokenを導入するまではpacket単位accepted traceを主張しません。
 `TraceSink`はpanic禁止の契約で、productionの`NoTrace`はallocationしません。
 `VecTrace`はsim crateだけに存在します。
+`DropReason`は既存の`repr(u16)` discriminantを変更せず末尾へ追加します。
+`TraceEvent`と`ConsumeReason`は今後のprotocol追加をsource-compatibleにするため
+`#[non_exhaustive]`です。downstreamはwildcard armを持つ必要があります。
 
 route、interface、neighbor、local IPv4 bindingはvalidated immutable snapshotのborrowed
 sliceです。routeはcanonical prefixだけを受け付け、lookupは`/0`と`/32`を含む
@@ -137,11 +140,18 @@ v0.2 bootstrapはEthernet II上のIPv4 datagramを転送します。
 
 ## ICMPv4 local control scope
 
-RFC 792とRFC 1122 §3.2.2.6に従い、ingress `IfId`にbindingされたdestinationだけを
-router自身へのlocal deliveryとして扱います。同じaddressが別interfaceにbindingされて
-いてもlocal扱いせず、通常のL3 forwardingへ進めます。local判定はIPv4
+RFC 792とRFC 1122 §3.2.2.6のEcho responder要件を実装します。ただしlocal deliveryは
+RFC 1122 §3.3.4.2のStrong ES modelと同様に、ingress `IfId`にbindingされたdestinationだけを
+router自身宛てとして扱います。同じaddressが別interfaceにbindingされていてもlocal扱いせず、
+通常のL3 forwardingへ進めます。これはrouterのいずれかのinterface address宛てをlocal
+deliveryとするRFC 1812 §5.2.3からのbootstrap deviationです。local判定はIPv4
 version/IHL/Total Length/header checksum検証後、forwardingのTTL expiry/LPM/ARPより前です。
-したがってTTL 0/1のlocal Echo Requestにも応答し、reply TTLは受信値から独立した64です。
+したがってTTL 0/1のlocal Echo Requestにも応答します。
+
+originated IPv4のTTLはRFC 1122 §3.2.1.7とRFC 1812 §4.2.2.9に従うvalidated
+`Ipv4OriginPolicy`から取得します。`ForwardingSnapshot::new`はdefault 64を使い、
+`with_ipv4_origin_policy`で1..=255を選べます。zeroはsnapshotへ到達する前にrejectします。
+Echo Reply TTLは受信値から独立したこのpolicy値です。
 
 実装profileはIHL=5、protocol=1、unfragmented、Echo Request Type 8/Code 0です。ICMP message
 範囲はIPv4 Total Lengthで閉じ、Internet checksumはodd lengthを含む全messageで検証します。
@@ -149,7 +159,7 @@ version/IHL/Total Length/header checksum検証後、forwardingのTTL expiry/LPM/
 commitし、次だけを書き換えます。
 
 - Ethernet destinationをrequest source、sourceをingress Interface MACにする。
-- IPv4 source/destinationを交換し、TTLを64にする。
+- IPv4 source/destinationを交換し、TTLをvalidated origin policy値にする。
 - RFC 6864のatomic datagram profileとしてID=0、DF=1、MF=0、fragment offset=0にする。
 - ICMP Typeを0へ変え、IPv4/ICMP checksumをRFC 1624で正しく更新する。
 
@@ -157,24 +167,31 @@ DSCP/ECN、Total Length、protocol、ICMP identifier/sequence/data、IPv4 Total 
 link paddingは保存します。IPv4 address pairの交換はone's-complement sumを変えないため、
 IPv4 checksum更新対象はTTL/protocol word、ID、flags/offsetです。
 
-RFC 1812 §§4.2.2.11, 4.2.3.1, 5.3.7に基づくnarrow anti-amplification profileとして、
-replyを生成する前に次を要求します。
+RFC 1812 §§4.2.2.11, 5.3.4, 5.3.7とlocal anti-amplification policyに基づくnarrow
+admission profileとして、replyを生成する前に次を要求します。
 
 - IPv4 sourceがingress上のunicast hostである。`0/8`、`127/8`、multicast、`240/4`、
   limited/directed broadcast、connected network address、ingress-local claimはdropする。
-- Ethernet sourceがnonzero unicastである。
-- Ethernet destinationがingress Interface MACと完全一致する。broadcast、multicast、
-  foreign unicast宛てのIP-local frameには応答しない。
+- RFC 1812 §5.3.4のlink broadcast/multicast抑止に加え、local policyとしてEthernet
+  sourceがnonzero unicastである。
+- local policyとしてEthernet destinationがingress Interface MACと完全一致する。
+  broadcast、multicast、foreign unicast宛てのIP-local frameには応答しない。
 
 validなlocal non-ICMPと、checksum-validなunfragmented non-Echo ICMPは
 `Ipv4LocalUnsupported`でbyte不変consumeし、routing/ARPへ流しません。malformed/truncated
 Echo、invalid checksum、nonzero Echo code、source/L2 admission failureはstable
-`DropReason`でbyte不変dropします。
+`DropReason`でbyte不変dropします。このconsumeはpacket ownershipを確実に終端するarchitecture
+behaviorであり、RFC準拠のupper-layer deliveryを主張しません。RFC 1122 §3.2.2とRFC 1812
+§4.3.3が想定するEcho ReplyおよびICMP error/controlのICMP user interfaceはまだ存在せず、
+deliveryはdeferredです。
 
 IPv4 reassemblyはRFC 1122 §3.2.1.4に対する現時点の明示deviationです。local ICMP fragmentは
-reassemblyや応答を行わず`Icmpv4FragmentUnsupported`でdropします。Timestamp等の他ICMP query、
-IPv4 options、ICMP error生成（TTL Exceeded/Destination Unreachableを含む）、rate limit、
-PMTU処理はdeferredです。
+reassemblyや応答を行わず`Icmpv4FragmentUnsupported`でdropします。IPv4 reserved flagはRFC 791
+のzero requirementに従い、fragmentとは区別した`Icmpv4ReservedFlagSet`でbyte不変dropします。
+IPv4 options付きlocal Echoもbyte不変dropします。RFC 1122 §3.2.2.6とRFC 1812 §4.3.3.6が
+source-route reversalをMUST、Record Route/Timestamp更新をSHOULDとしているため、これは
+明示deviationです。Timestamp等の他ICMP query、options処理、ICMP error生成（TTL
+Exceeded/Destination Unreachableを含む）、rate limit、PMTU処理はdeferredです。
 
 ## ARP control scope
 

@@ -1,7 +1,10 @@
 use ruster_core::{
-    forward_batch, internet_checksum, ipv4_header_checksum, BatchCompletion, ConsumeReason,
-    DropReason, ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
-    Neighbor, NoTrace, PacketBatch, PacketLease, PacketSlot, Route, SlotCompletion, TraceEvent,
+    execute_one_arp_request, forward_batch, forward_batch_with_resolution, internet_checksum,
+    ipv4_header_checksum, BatchCompletion, ConsumeReason, DropReason, DynamicNeighborSlot,
+    ForwardingSnapshot, IfId, Interface, Ipv4Address, Ipv4OriginPolicy, Ipv4OriginPolicyError,
+    LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoGeneratedTrace, NoTrace,
+    PacketBatch, PacketIo, PacketLease, PacketSlot, ResolutionActionSlot, ResolutionPolicy,
+    ResolutionRuntime, ResolutionStateSlot, Route, SlotCompletion, TraceEvent,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 
@@ -93,6 +96,33 @@ fn ipv4_frame(
 
 fn echo_request(payload: &[u8], padding: &[u8]) -> Vec<u8> {
     ipv4_frame(LOCAL_IP, 1, 1, 0, &icmp_message(8, 0, payload), padding)
+}
+
+fn echo_request_with_options() -> Vec<u8> {
+    let mut frame = echo_request(&[1, 2], &[]);
+    frame.splice(34..34, [1, 1, 0, 0]);
+    frame[14] = 0x46;
+    let total_len = u16::from_be_bytes([frame[16], frame[17]]) + 4;
+    frame[16..18].copy_from_slice(&total_len.to_be_bytes());
+    frame[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&frame[14..38]);
+    frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+    frame
+}
+
+fn arp_reply(sender: Ipv4Address, sender_mac: MacAddress) -> Vec<u8> {
+    let mut frame = vec![0_u8; 60];
+    frame[0..6].copy_from_slice(&LOCAL_MAC.0);
+    frame[6..12].copy_from_slice(&sender_mac.0);
+    frame[12..14].copy_from_slice(&0x0806_u16.to_be_bytes());
+    frame[14..16].copy_from_slice(&1_u16.to_be_bytes());
+    frame[16..18].copy_from_slice(&0x0800_u16.to_be_bytes());
+    frame[18..22].copy_from_slice(&[6, 4, 0, 2]);
+    frame[22..28].copy_from_slice(&sender_mac.0);
+    frame[28..32].copy_from_slice(&sender.octets());
+    frame[32..38].copy_from_slice(&LOCAL_MAC.0);
+    frame[38..42].copy_from_slice(&LOCAL_IP.octets());
+    frame
 }
 
 fn with_ipv4_source(mut frame: Vec<u8>, source: Ipv4Address) -> Vec<u8> {
@@ -220,6 +250,49 @@ fn odd_length_echo_payload_checksum_and_ttl_zero_are_supported() {
 }
 
 #[test]
+fn configured_origin_ttl_is_validated_and_used_for_echo_reply() {
+    assert_eq!(
+        Ipv4OriginPolicy::new(0),
+        Err(Ipv4OriginPolicyError::DefaultTtlZero)
+    );
+    assert_eq!(Ipv4OriginPolicy::default().default_ttl(), 64);
+    let interfaces = interfaces();
+    let bindings = [local_binding(LAN)];
+    let snapshot = ForwardingSnapshot::with_ipv4_origin_policy(
+        &[],
+        &interfaces,
+        &[],
+        &bindings,
+        Ipv4OriginPolicy::new(37).unwrap(),
+    )
+    .unwrap();
+    let mut io = SimIo::new();
+    io.inject(LAN, echo_request(&[], &[]));
+
+    assert_eq!(
+        io.run_once(1, &snapshot, &mut NoTrace)
+            .unwrap()
+            .tx_requested,
+        1
+    );
+    let reply = io.pop_tx().unwrap();
+    assert_eq!(reply.bytes[22], 37);
+    assert_eq!(ipv4_header_checksum(&reply.bytes[14..34]), 0);
+}
+
+#[test]
+fn local_echo_with_ipv4_options_is_an_atomic_documented_deviation() {
+    let interfaces = interfaces();
+    let bindings = [local_binding(LAN)];
+    let snapshot = local_snapshot(&interfaces, &bindings);
+    assert_drop_atomic(
+        echo_request_with_options(),
+        &snapshot,
+        DropReason::Ipv4OptionsUnsupported,
+    );
+}
+
+#[test]
 fn exact_icmp_truncation_boundaries_have_stable_atomic_reasons() {
     let interfaces = interfaces();
     let bindings = [local_binding(LAN)];
@@ -288,6 +361,18 @@ fn local_echo_fragments_are_typed_atomic_drops() {
             DropReason::Icmpv4FragmentUnsupported,
         );
     }
+}
+
+#[test]
+fn local_echo_reserved_flag_is_typed_atomic_drop() {
+    let interfaces = interfaces();
+    let bindings = [local_binding(LAN)];
+    let snapshot = local_snapshot(&interfaces, &bindings);
+    assert_drop_atomic(
+        ipv4_frame(LOCAL_IP, 1, 64, 0x8000, &icmp_message(8, 0, &[]), &[]),
+        &snapshot,
+        DropReason::Icmpv4ReservedFlagSet,
+    );
 }
 
 #[test]
@@ -429,6 +514,122 @@ fn valid_unsupported_local_traffic_is_consumed_without_routing() {
             }
         ]
     ));
+}
+
+#[test]
+fn local_echo_and_consume_leave_resolution_runtime_untouched() {
+    let interfaces = interfaces();
+    let routes = [Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, LAN, None).unwrap()];
+    let bindings = [local_binding(LAN)];
+    let snapshot = routed_snapshot(&routes, &interfaces, &[], &bindings);
+    let first = Ipv4Address::from_octets([192, 0, 2, 21]);
+    let second = Ipv4Address::from_octets([192, 0, 2, 22]);
+    let third = Ipv4Address::from_octets([192, 0, 2, 23]);
+    let learned = Ipv4Address::from_octets([192, 0, 2, 24]);
+    let mut states = [ResolutionStateSlot::EMPTY; 3];
+    let mut actions = [ResolutionActionSlot::EMPTY; 3];
+    let mut cache = [DynamicNeighborSlot::EMPTY; 1];
+    let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+        ResolutionPolicy::new(1_000, 2_000).unwrap(),
+        &mut states,
+        &mut actions,
+        &mut cache,
+    );
+    let mut io = SimIo::new();
+
+    io.inject(LAN, arp_reply(learned, NEXT_HOP_MAC));
+    let batch = io.receive(1).unwrap();
+    forward_batch_with_resolution(
+        batch,
+        &snapshot,
+        &mut runtime,
+        MonotonicMillis(100),
+        &mut NoTrace,
+    );
+    io.pop_recycled();
+    for target in [first, second] {
+        io.inject(LAN, ipv4_frame(target, 17, 64, 0, &[0; 8], &[]));
+    }
+    let batch = io.receive(2).unwrap();
+    forward_batch_with_resolution(
+        batch,
+        &snapshot,
+        &mut runtime,
+        MonotonicMillis(100),
+        &mut NoTrace,
+    );
+    io.pop_recycled();
+    io.pop_recycled();
+    let counters_before = runtime.counters();
+    assert_eq!(runtime.dynamic_neighbor_count(), 1);
+    assert_eq!(runtime.pending_actions(), 2);
+
+    io.inject(LAN, echo_request(&[], &[]));
+    io.inject(LAN, ipv4_frame(LOCAL_IP, 17, 64, 0, &[0; 8], &[]));
+    let batch = io.receive(2).unwrap();
+    let local = forward_batch_with_resolution(
+        batch,
+        &snapshot,
+        &mut runtime,
+        MonotonicMillis(200),
+        &mut NoTrace,
+    );
+
+    assert_eq!(
+        (
+            local.tx_requested,
+            local.consumed,
+            local.dropped,
+            runtime.dynamic_neighbor_count(),
+            runtime.pending_actions(),
+            runtime.counters()
+        ),
+        (1, 1, 0, 1, 2, counters_before)
+    );
+    io.pop_tx();
+    io.pop_recycled();
+
+    io.inject(LAN, ipv4_frame(learned, 17, 64, 0, &[0; 8], &[]));
+    let batch = io.receive(1).unwrap();
+    let learned_forward = forward_batch_with_resolution(
+        batch,
+        &snapshot,
+        &mut runtime,
+        MonotonicMillis(150),
+        &mut NoTrace,
+    );
+    assert_eq!(learned_forward.tx_requested, 1);
+    assert_eq!(&io.pop_tx().unwrap().bytes[0..6], &NEXT_HOP_MAC.0);
+    assert_eq!(runtime.dynamic_neighbor_count(), 1);
+    assert_eq!(runtime.pending_actions(), 2);
+    assert_eq!(runtime.counters(), counters_before);
+
+    io.inject(LAN, ipv4_frame(third, 17, 64, 0, &[0; 8], &[]));
+    let batch = io.receive(1).unwrap();
+    let after = forward_batch_with_resolution(
+        batch,
+        &snapshot,
+        &mut runtime,
+        MonotonicMillis(150),
+        &mut NoTrace,
+    );
+    assert_eq!(after.dropped, 1);
+    assert_eq!(runtime.pending_actions(), 3);
+    assert_eq!(runtime.counters().clock_regressions, 0);
+
+    for expected in [first, second, third] {
+        let generated = execute_one_arp_request(
+            &mut io,
+            &mut runtime,
+            MonotonicMillis(150),
+            &mut NoGeneratedTrace,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(generated.action.target_ip, expected);
+    }
+    assert_eq!(runtime.pending_actions(), 0);
+    assert_eq!(runtime.dynamic_neighbor_count(), 1);
 }
 
 #[test]

@@ -43,6 +43,7 @@ pub enum DropReason {
     Icmpv4SourceNotUnicast = 31,
     Icmpv4EthernetSourceInvalid = 32,
     Icmpv4EthernetDestinationNotLocal = 33,
+    Icmpv4ReservedFlagSet = 34,
 }
 
 use DropReason::*;
@@ -84,6 +85,7 @@ impl DropReason {
             Icmpv4SourceNotUnicast => "ICMPV4_SOURCE_NOT_UNICAST",
             Icmpv4EthernetSourceInvalid => "ICMPV4_ETHERNET_SOURCE_INVALID",
             Icmpv4EthernetDestinationNotLocal => "ICMPV4_ETHERNET_DESTINATION_NOT_LOCAL",
+            Icmpv4ReservedFlagSet => "ICMPV4_RESERVED_FLAG_SET",
         }
     }
 }
@@ -100,12 +102,44 @@ pub enum SnapshotError {
     LocalIpv4BindingUnspecified,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ipv4OriginPolicy {
+    default_ttl: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Ipv4OriginPolicyError {
+    DefaultTtlZero,
+}
+
+impl Ipv4OriginPolicy {
+    pub const fn new(default_ttl: u8) -> Result<Self, Ipv4OriginPolicyError> {
+        if default_ttl == 0 {
+            return Err(Ipv4OriginPolicyError::DefaultTtlZero);
+        }
+        Ok(Self { default_ttl })
+    }
+
+    #[must_use]
+    pub const fn default_ttl(self) -> u8 {
+        self.default_ttl
+    }
+}
+
+impl Default for Ipv4OriginPolicy {
+    fn default() -> Self {
+        Self { default_ttl: 64 }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ForwardingSnapshot<'a> {
     routes: &'a [Route],
     interfaces: &'a [Interface],
     neighbors: &'a [Neighbor],
     local_ipv4: &'a [LocalIpv4Binding],
+    ipv4_origin: Ipv4OriginPolicy,
 }
 
 impl<'a> ForwardingSnapshot<'a> {
@@ -114,6 +148,22 @@ impl<'a> ForwardingSnapshot<'a> {
         interfaces: &'a [Interface],
         neighbors: &'a [Neighbor],
         local_ipv4: &'a [LocalIpv4Binding],
+    ) -> Result<Self, SnapshotError> {
+        Self::with_ipv4_origin_policy(
+            routes,
+            interfaces,
+            neighbors,
+            local_ipv4,
+            Ipv4OriginPolicy::default(),
+        )
+    }
+
+    pub fn with_ipv4_origin_policy(
+        routes: &'a [Route],
+        interfaces: &'a [Interface],
+        neighbors: &'a [Neighbor],
+        local_ipv4: &'a [LocalIpv4Binding],
+        ipv4_origin: Ipv4OriginPolicy,
     ) -> Result<Self, SnapshotError> {
         for (index, route) in routes.iter().enumerate() {
             if routes[..index].iter().any(|candidate| {
@@ -170,11 +220,13 @@ impl<'a> ForwardingSnapshot<'a> {
             interfaces,
             neighbors,
             local_ipv4,
+            ipv4_origin,
         })
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum TraceEvent {
     Ipv4Validated {
         ingress: IfId,
@@ -295,6 +347,7 @@ struct Icmpv4EchoReplyDecision {
     requester_ip: [u8; 4],
     ipv4_checksum: u16,
     icmp_checksum: u16,
+    reply_ttl: u8,
     icmp_offset: usize,
     icmp_end: usize,
 }
@@ -577,6 +630,9 @@ fn decide_local_ipv4<T: TraceSink>(
 
     let flags_fragment =
         packet::read_u16(frame, ipv4.header_offset + 6).ok_or(Ipv4HeaderLengthExceedsPacket)?;
+    if flags_fragment & 0x8000 != 0 {
+        return Err(Icmpv4ReservedFlagSet);
+    }
     if flags_fragment & 0x3fff != 0 {
         return Err(Icmpv4FragmentUnsupported);
     }
@@ -642,7 +698,7 @@ fn decide_local_ipv4<T: TraceSink>(
     let ipv4_checksum = rfc1624_update(
         ipv4.checksum,
         u16::from_be_bytes([ipv4.ttl, ipv4.protocol]),
-        u16::from_be_bytes([64, ipv4.protocol]),
+        u16::from_be_bytes([snapshot.ipv4_origin.default_ttl(), ipv4.protocol]),
     );
     let ipv4_checksum = rfc1624_update(ipv4_checksum, ipv4_id, 0);
     let ipv4_checksum = rfc1624_update(ipv4_checksum, flags_fragment, 0x4000);
@@ -660,6 +716,7 @@ fn decide_local_ipv4<T: TraceSink>(
         requester_ip: ipv4.source.octets(),
         ipv4_checksum,
         icmp_checksum,
+        reply_ttl: snapshot.ipv4_origin.default_ttl(),
         icmp_offset,
         icmp_end,
     }))
@@ -859,7 +916,7 @@ fn apply_icmpv4_echo_reply(
     frame[6..12].copy_from_slice(&decision.local_mac);
     frame[18..20].copy_from_slice(&0_u16.to_be_bytes());
     frame[20..22].copy_from_slice(&0x4000_u16.to_be_bytes());
-    frame[22] = 64;
+    frame[22] = decision.reply_ttl;
     frame[24..26].copy_from_slice(&decision.ipv4_checksum.to_be_bytes());
     frame[26..30].copy_from_slice(&decision.local_ip);
     frame[30..34].copy_from_slice(&decision.requester_ip);
@@ -909,6 +966,7 @@ mod tests {
             (31, "ICMPV4_SOURCE_NOT_UNICAST"),
             (32, "ICMPV4_ETHERNET_SOURCE_INVALID"),
             (33, "ICMPV4_ETHERNET_DESTINATION_NOT_LOCAL"),
+            (34, "ICMPV4_RESERVED_FLAG_SET"),
         ];
         let actual = [
             DropReason::EthernetHeaderTruncated,
@@ -944,6 +1002,7 @@ mod tests {
             DropReason::Icmpv4SourceNotUnicast,
             DropReason::Icmpv4EthernetSourceInvalid,
             DropReason::Icmpv4EthernetDestinationNotLocal,
+            DropReason::Icmpv4ReservedFlagSet,
         ];
         for (reason, &(discriminant, code)) in actual.iter().zip(&expected) {
             assert_eq!(*reason as u16, discriminant);
