@@ -12,7 +12,7 @@ active treeは、そのコードを継承しないv0.2のゼロベース実装�
 - `ruster-core`: backend所有packetを借用し、Ethernet II / IPv4検証、LPM、
   TTL/checksum/MAC rewrite、local IPv4向けARP reply、static neighbor miss時の
   ARP Request生成action、fixed-capacity dynamic ARP cache、local ICMPv4 Echo
-  responder、ICMPv4 Time Exceeded生成を扱う。
+  responder、ICMPv4 Time Exceeded / Destination Unreachable生成を扱う。
 - `ruster-io-sim`: rootやNICなしでRX/generated TXのFIFO、budget、TX/drop、
   traceを決定的に検証する。
 
@@ -38,13 +38,14 @@ storageで1秒に一度までARP Requestを生成できます。RX batchとgener
 二相に分離し、生成frameもbackend所有bufferを借用します。ARP Reply/RequestはRFC 826
 mergeでworker-local cacheへ学習しますが、元IPv4 packetのhold/replayは行いません。
 
-nonlocal IPv4のTTL 0/1は元packetをbyte不変でdropし、RFC 792 / RFC 1812に従って
-eligibleなICMPv4 Time Exceeded Code 0 actionを別のfixed-capacity worker-local FIFOへ
-queueします。逆経路は元sourceへの通常LPMで選び、受信Ethernet sourceをnext-hopとして
-信用しません。staticまたはfresh dynamic neighborが無い場合はARPだけを開始し、今回の
-ICMP actionは保持しません。generated outer IPv4は576 bytes以下、quoteは受信時IPv4 bytesを
-最大548 bytes所有し、link paddingを含みません。per-egress default 100ms timer limiterも
-worker-localです。
+nonlocal IPv4はoptions/local判定後にまずLPMします。routeが無ければ元packetをbyte不変の
+`RouteMiss`でdropし、eligibleならICMPv4 Destination Unreachable Type 3/Code 0をqueueします。
+routeがありTTL 0/1なら`Ipv4TtlExpired`とTime Exceeded Type 11/Code 0です。両kindは同じ
+fixed-capacity worker-local FIFOとper-egress default 100ms timer limiterを共有します。
+逆経路は元sourceへの通常LPMで選び、受信Ethernet sourceをnext-hopとして信用しません。
+staticまたはfresh dynamic neighborが無い場合はARPだけを開始し、今回のICMP actionは保持
+しません。generated outer IPv4は576 bytes以下、quoteは受信時IPv4 bytesを最大548 bytes
+所有し、link paddingを含みません。
 
 ## 開発
 

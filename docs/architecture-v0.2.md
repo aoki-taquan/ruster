@@ -35,7 +35,8 @@ simの`BatchCompletion.recycled`にはdropとconsumeの両方を数えます。�
 Ethernet validate
   ├─ IPv4 version/IHL/Total Length/header checksum validate
   │    ├─ ingress local binding → ICMPv4 validate/admission → Echo Reply or local consume
-  │    └─ options policy → TTL check → LPM → typed neighbor/interface lookup
+  │    └─ options policy → LPM（missならICMP Type 3/Code 0）→ TTL check
+  │         （expiredならICMP Type 11/Code 0）→ typed neighbor/interface lookup
   │         → TTL/checksum/MAC rewrite → commit
   └─ Ethernet/IPv4 ARP profile validate → ingress local target lookup
        → RFC 826 merge → Request localならin-place Reply、それ以外はlocal consume
@@ -192,17 +193,21 @@ reserved IPv4 flagがnonzeroであることだけを理由に受信packetをdrop
 IPv4 options付きlocal Echoもbyte不変dropします。RFC 1122 §3.2.2.6、RFC 1812
 §4.3.3.6および§§5.3.13.4–5.3.13.6がsource-route reversalとSource Route/Record
 Route/Timestamp処理を要求しているため、これは明示deviationです。Timestamp等の他ICMP
-query、options処理、Destination Unreachable、Parameter Problem、Redirect、PMTU処理は
+query、options処理、Destination UnreachableのCode 0以外、Parameter Problem、Redirect、
+PMTU処理は
 deferredです。
 
-## ICMPv4 Time Exceeded scope
+## ICMPv4 generated error scope
 
-RFC 792のType 11/Code 0とRFC 1812 §§4.3.2, 4.3.3, 5.2.7.3, 5.3.1を対象にします。
-valid IHL=5のnonlocal IPv4でTTLが0または1なら、元RX leaseは一切変更せず
-`Ipv4TtlExpired`でrecycleします。eligibleなpacketだけ、ARPとは別のcaller-backed
-`Icmpv4ErrorRuntime`へactionをqueueし、RX batch終了後のgenerated sessionで送信します。
-action FIFOとper-egress rate stateはworker-localであり、共有lock、packet clone、backend
-buffer pointerを持ちません。
+RFC 792のType 11/Code 0とType 3/Code 0、RFC 1812 §§4.3.2, 4.3.3, 5.2.7.1,
+5.2.7.3, 5.3.1を対象にします。valid IHL=5のnonlocal IPv4はlocal/options判定後にLPMし、
+route missならTTL値にかかわらず元RX leaseを一切変更せず`RouteMiss`でrecycleして
+eligibleなDestination Unreachable Network actionをqueueします。route hitかつTTL 0/1は
+従来どおり`Ipv4TtlExpired`とTime Exceeded TTL actionです。一つのpacketから両方を生成
+しません。eligibleなpacketだけARPとは別のcaller-backed `Icmpv4ErrorRuntime`へactionを
+queueし、RX batch終了後のgenerated sessionで送信します。kindはFIFO/retry/builder/report/
+traceまでtypedに保持し、action FIFOとper-egress rate stateは両kindで共有します。
+worker-localであり、共有lock、packet clone、backend buffer pointerを持ちません。
 
 逆経路は元IPv4 sourceへの通常LPMです。gateway routeではnext-hop、connected routeでは
 元sourceをneighbor targetにし、reverse egressのInterface MAC/local IPv4 bindingを使います。
@@ -221,7 +226,8 @@ Ethernet headerとTotal Length後のpaddingは引用しません。生成wire pr
 - outer TOSはRFC 1812 legacy profileのprecedence 6として
   `(original_tos & 0x1e) | 0xc0`。reserved bit 0をclearし、source/destinationはreverse
   binding/original source。
-- ICMPはType 11、Code 0、unused=0。odd lengthを含むheader+quote全体をchecksumする。
+- ICMPはTime ExceededならType 11/Code 0、Destination Unreachable NetworkならType 3/
+  Code 0で、どちらもunused=0。odd lengthを含むheader+quote全体をchecksumする。
 - outer IPv4 Total Lengthは最大576、Ethernet frameは最大590 bytes。
 
 RFC 1812のerror suppressionとして、invalid/non-host/router-local source、IP
@@ -232,7 +238,11 @@ offset=0/MF=1とICMP queryは生成可能です。source/destinationのprefix ne
 判定はgateway routeを含むLPM-selected prefixに対して行い、more-specific `/32`を優先し、
 `/31`と`/32` endpointをnetwork/broadcast扱いしません。RFC 1812 §4.3.2.6と
 §§5.3.13.4–5.3.13.6のsource-route reversalおよびoptions処理を実装していないため、
-IPv4 optionsは従来どおりTTL判定前に`Ipv4OptionsUnsupported`でatomic dropするdeviationです。
+IPv4 optionsは従来どおりLPM/TTL判定前に`Ipv4OptionsUnsupported`でatomic dropする
+deviationです。route missにはselected destination prefixが無いためprefix network/
+directed-broadcast判定はできませんが、multicast/limited broadcast/L2 groupは抑止します。
+`InterfaceMiss`、`NeighborUnresolved`、options/source route等をType 3/Code 0へ変換せず、
+このCodeはLPMが完全にmissした場合だけに限定します。
 
 rate limiterはreverse egress単位のtimer方式でdefault 100msです。intervalはnonzero、
 state TTLはinterval以上を要求します。egressごとにqueue中actionは一つ、lease commitから
@@ -278,8 +288,9 @@ local SPAを名乗り、そのlocal addressをTPAにしたrequestも通常reques
 追加policyでdropしないことを優先した明示deviationです。
 
 eager cache scan/flush、timer retry、unresolved packet hold queue、gratuitous ARP生成、
-ARP Probe/Announcement生成、proxy ARP、VLAN、Address Conflict Detection、Echo Reply以外の
-ICMP生成、NAT、firewall、config parser、pcap、AF_XDP、DPDK、binary、thread、
+ARP Probe/Announcement生成、proxy ARP、VLAN、Address Conflict Detection、実装済み
+Echo Reply/Time Exceeded/Destination Unreachable Network以外のICMP生成、NAT、firewall、
+config parser、pcap、AF_XDP、DPDK、binary、thread、
 benchmarkはこの
 sliceのscope外です。
 

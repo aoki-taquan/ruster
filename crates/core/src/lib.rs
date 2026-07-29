@@ -21,11 +21,14 @@ pub use generated::{
     GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion,
 };
 pub use icmpv4_error::{
-    execute_one_icmpv4_time_exceeded, ExecuteIcmpv4TimeExceededError, GeneratedIcmpv4Report,
-    GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, Icmpv4ErrorActionSlot, Icmpv4ErrorCounters,
-    Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot,
-    Icmpv4TimeExceededAction, Icmpv4TimeExceededBuildError, Icmpv4TimeExceededDisposition,
-    NoGeneratedIcmpv4Trace, ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN, ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN,
+    execute_one_icmpv4_error, execute_one_icmpv4_time_exceeded, ExecuteIcmpv4Error,
+    ExecuteIcmpv4TimeExceededError, GeneratedIcmpv4Report, GeneratedIcmpv4Trace,
+    GeneratedIcmpv4TraceSink, Icmpv4ErrorAction, Icmpv4ErrorActionSlot, Icmpv4ErrorBuildError,
+    Icmpv4ErrorCounters, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorPolicy,
+    Icmpv4ErrorPolicyError, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Icmpv4TimeExceededAction,
+    Icmpv4TimeExceededBuildError, Icmpv4TimeExceededDisposition, NoGeneratedIcmpv4Trace,
+    ICMPV4_ERROR_MAX_FRAME_LEN, ICMPV4_ERROR_MAX_QUOTE_LEN, ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN,
+    ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN,
 };
 pub use io::{
     BatchCompletion, ConsumeReason, PacketBatch, PacketIo, PacketLease, PacketSlot, SlotCompletion,
