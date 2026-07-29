@@ -806,6 +806,7 @@ fn rfc1812_suppression_matrix_is_typed_and_byte_atomic() {
             matches!(
                 event,
                 TraceEvent::Icmpv4TimeExceededDisposition { disposition, .. }
+                    | TraceEvent::Icmpv4DestinationUnreachableDisposition { disposition, .. }
                     if *disposition == expected
             )
         }));

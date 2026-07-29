@@ -6,9 +6,30 @@ use crate::{
     IPV4_ETHERTYPE,
 };
 
-pub const ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN: usize = 548;
-pub const ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN: usize = 590;
+pub const ICMPV4_ERROR_MAX_QUOTE_LEN: usize = 548;
+pub const ICMPV4_ERROR_MAX_FRAME_LEN: usize = 590;
+pub const ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN: usize = ICMPV4_ERROR_MAX_QUOTE_LEN;
+pub const ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN: usize = ICMPV4_ERROR_MAX_FRAME_LEN;
 const ETHERNET_MIN_FRAME_LEN: usize = 60;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Icmpv4ErrorKind {
+    TimeExceededTtl,
+    DestinationUnreachableNetwork,
+}
+
+impl Icmpv4ErrorKind {
+    const fn icmp_type(self) -> u8 {
+        match self {
+            Self::TimeExceededTtl => 11,
+            Self::DestinationUnreachableNetwork => 3,
+        }
+    }
+
+    const fn icmp_code(self) -> u8 {
+        0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Icmpv4ErrorPolicyError {
@@ -57,7 +78,8 @@ impl Default for Icmpv4ErrorPolicy {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Icmpv4TimeExceededAction {
+pub struct Icmpv4ErrorAction {
+    pub kind: Icmpv4ErrorKind,
     pub egress: IfId,
     pub source_mac: MacAddress,
     pub destination_mac: MacAddress,
@@ -66,12 +88,12 @@ pub struct Icmpv4TimeExceededAction {
     pub outer_tos: u8,
     pub outer_ttl: u8,
     quote_len: u16,
-    quote: [u8; ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN],
+    quote: [u8; ICMPV4_ERROR_MAX_QUOTE_LEN],
 }
 
-impl Icmpv4TimeExceededAction {
+impl Icmpv4ErrorAction {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub fn new(
         egress: IfId,
         source_mac: MacAddress,
         destination_mac: MacAddress,
@@ -81,10 +103,36 @@ impl Icmpv4TimeExceededAction {
         outer_ttl: u8,
         original_ipv4: &[u8],
     ) -> Self {
-        let quote_len = original_ipv4.len().min(ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN);
-        let mut quote = [0; ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN];
+        Self::new_with_kind(
+            Icmpv4ErrorKind::TimeExceededTtl,
+            egress,
+            source_mac,
+            destination_mac,
+            source_ip,
+            destination_ip,
+            original_tos,
+            outer_ttl,
+            original_ipv4,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_kind(
+        kind: Icmpv4ErrorKind,
+        egress: IfId,
+        source_mac: MacAddress,
+        destination_mac: MacAddress,
+        source_ip: Ipv4Address,
+        destination_ip: Ipv4Address,
+        original_tos: u8,
+        outer_ttl: u8,
+        original_ipv4: &[u8],
+    ) -> Self {
+        let quote_len = original_ipv4.len().min(ICMPV4_ERROR_MAX_QUOTE_LEN);
+        let mut quote = [0; ICMPV4_ERROR_MAX_QUOTE_LEN];
         quote[..quote_len].copy_from_slice(&original_ipv4[..quote_len]);
         Self {
+            kind,
             egress,
             source_mac,
             destination_mac,
@@ -118,6 +166,8 @@ impl Icmpv4TimeExceededAction {
     }
 }
 
+pub type Icmpv4TimeExceededAction = Icmpv4ErrorAction;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Icmpv4ErrorActionSlot(Option<QueuedAction>);
 
@@ -148,14 +198,18 @@ impl Icmpv4ErrorStateSlot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct QueuedAction {
-    action: Icmpv4TimeExceededAction,
+    action: Icmpv4ErrorAction,
     generation: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
-pub enum Icmpv4TimeExceededDisposition {
+pub enum Icmpv4ErrorDisposition {
     Queued {
+        egress: IfId,
+        quote_len: usize,
+    },
+    DestinationUnreachableQueued {
         egress: IfId,
         quote_len: usize,
     },
@@ -196,9 +250,13 @@ pub enum Icmpv4TimeExceededDisposition {
     },
 }
 
+pub type Icmpv4TimeExceededDisposition = Icmpv4ErrorDisposition;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Icmpv4ErrorCounters {
     pub queued: usize,
+    pub queued_time_exceeded: usize,
+    pub queued_destination_unreachable: usize,
     pub pending: usize,
     pub rate_limited: usize,
     pub state_full: usize,
@@ -220,6 +278,8 @@ pub struct Icmpv4ErrorCounters {
     pub reverse_target_forbidden: usize,
     pub reverse_neighbor_unresolved: usize,
     pub dequeued: usize,
+    pub dequeued_time_exceeded: usize,
+    pub dequeued_destination_unreachable: usize,
 }
 
 /// Caller-backed, worker-local ICMP error queue and per-egress limiter.
@@ -280,60 +340,67 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
 
     pub(crate) fn record_suppression(
         &mut self,
-        disposition: Icmpv4TimeExceededDisposition,
-    ) -> Icmpv4TimeExceededDisposition {
+        disposition: Icmpv4ErrorDisposition,
+    ) -> Icmpv4ErrorDisposition {
         match disposition {
-            Icmpv4TimeExceededDisposition::Queued { .. } => self.counters.queued += 1,
-            Icmpv4TimeExceededDisposition::Pending { .. } => self.counters.pending += 1,
-            Icmpv4TimeExceededDisposition::RateLimited { .. } => {
+            Icmpv4ErrorDisposition::Queued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_time_exceeded += 1;
+            }
+            Icmpv4ErrorDisposition::DestinationUnreachableQueued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_destination_unreachable += 1;
+            }
+            Icmpv4ErrorDisposition::Pending { .. } => self.counters.pending += 1,
+            Icmpv4ErrorDisposition::RateLimited { .. } => {
                 self.counters.rate_limited += 1;
             }
-            Icmpv4TimeExceededDisposition::StateFull => self.counters.state_full += 1,
-            Icmpv4TimeExceededDisposition::ActionFull => self.counters.action_full += 1,
-            Icmpv4TimeExceededDisposition::ClockRegression => {
+            Icmpv4ErrorDisposition::StateFull => self.counters.state_full += 1,
+            Icmpv4ErrorDisposition::ActionFull => self.counters.action_full += 1,
+            Icmpv4ErrorDisposition::ClockRegression => {
                 self.counters.clock_regressions += 1;
             }
-            Icmpv4TimeExceededDisposition::SourceNotUnicast => {
+            Icmpv4ErrorDisposition::SourceNotUnicast => {
                 self.counters.source_not_unicast += 1;
             }
-            Icmpv4TimeExceededDisposition::SourceIsLocal => self.counters.source_is_local += 1,
-            Icmpv4TimeExceededDisposition::DestinationMulticast => {
+            Icmpv4ErrorDisposition::SourceIsLocal => self.counters.source_is_local += 1,
+            Icmpv4ErrorDisposition::DestinationMulticast => {
                 self.counters.destination_multicast += 1;
             }
-            Icmpv4TimeExceededDisposition::DestinationLimitedBroadcast => {
+            Icmpv4ErrorDisposition::DestinationLimitedBroadcast => {
                 self.counters.destination_limited_broadcast += 1;
             }
-            Icmpv4TimeExceededDisposition::DestinationNetworkAddress => {
+            Icmpv4ErrorDisposition::DestinationNetworkAddress => {
                 self.counters.destination_network_address += 1;
             }
-            Icmpv4TimeExceededDisposition::DestinationDirectedBroadcast => {
+            Icmpv4ErrorDisposition::DestinationDirectedBroadcast => {
                 self.counters.destination_directed_broadcast += 1;
             }
-            Icmpv4TimeExceededDisposition::EthernetDestinationGroup => {
+            Icmpv4ErrorDisposition::EthernetDestinationGroup => {
                 self.counters.ethernet_destination_group += 1;
             }
-            Icmpv4TimeExceededDisposition::NonInitialFragment => {
+            Icmpv4ErrorDisposition::NonInitialFragment => {
                 self.counters.noninitial_fragment += 1;
             }
-            Icmpv4TimeExceededDisposition::IcmpErrorMessage => {
+            Icmpv4ErrorDisposition::IcmpErrorMessage => {
                 self.counters.icmp_error_message += 1;
             }
-            Icmpv4TimeExceededDisposition::IcmpTypeMissing => {
+            Icmpv4ErrorDisposition::IcmpTypeMissing => {
                 self.counters.icmp_type_missing += 1;
             }
-            Icmpv4TimeExceededDisposition::ReverseRouteMiss => {
+            Icmpv4ErrorDisposition::ReverseRouteMiss => {
                 self.counters.reverse_route_miss += 1;
             }
-            Icmpv4TimeExceededDisposition::ReverseInterfaceMiss { .. } => {
+            Icmpv4ErrorDisposition::ReverseInterfaceMiss { .. } => {
                 self.counters.reverse_interface_miss += 1;
             }
-            Icmpv4TimeExceededDisposition::ReverseBindingMiss { .. } => {
+            Icmpv4ErrorDisposition::ReverseBindingMiss { .. } => {
                 self.counters.reverse_binding_miss += 1;
             }
-            Icmpv4TimeExceededDisposition::ReverseTargetForbidden { .. } => {
+            Icmpv4ErrorDisposition::ReverseTargetForbidden { .. } => {
                 self.counters.reverse_target_forbidden += 1;
             }
-            Icmpv4TimeExceededDisposition::ReverseNeighborUnresolved { .. } => {
+            Icmpv4ErrorDisposition::ReverseNeighborUnresolved { .. } => {
                 self.counters.reverse_neighbor_unresolved += 1;
             }
         }
@@ -342,9 +409,9 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
 
     pub(crate) fn schedule(
         &mut self,
-        action: Icmpv4TimeExceededAction,
+        action: Icmpv4ErrorAction,
         now: MonotonicMillis,
-    ) -> Icmpv4TimeExceededDisposition {
+    ) -> Icmpv4ErrorDisposition {
         if !self.observe_now(now) {
             return self.record_suppression(Icmpv4TimeExceededDisposition::ClockRegression);
         }
@@ -391,11 +458,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         self.enqueue(index, action)
     }
 
-    fn enqueue(
-        &mut self,
-        state_index: usize,
-        action: Icmpv4TimeExceededAction,
-    ) -> Icmpv4TimeExceededDisposition {
+    fn enqueue(&mut self, state_index: usize, action: Icmpv4ErrorAction) -> Icmpv4ErrorDisposition {
         if self.len == self.actions.len() {
             return self.record_suppression(Icmpv4TimeExceededDisposition::ActionFull);
         }
@@ -405,10 +468,19 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         self.states[state_index].generation = generation;
         self.states[state_index].action_queued = true;
         self.len += 1;
-        self.record_suppression(Icmpv4TimeExceededDisposition::Queued {
-            egress: action.egress,
-            quote_len: action.quote_len(),
-        })
+        let disposition = match action.kind {
+            Icmpv4ErrorKind::TimeExceededTtl => Icmpv4ErrorDisposition::Queued {
+                egress: action.egress,
+                quote_len: action.quote_len(),
+            },
+            Icmpv4ErrorKind::DestinationUnreachableNetwork => {
+                Icmpv4ErrorDisposition::DestinationUnreachableQueued {
+                    egress: action.egress,
+                    quote_len: action.quote_len(),
+                }
+            }
+        };
+        self.record_suppression(disposition)
     }
 
     pub(crate) fn observe_decision(&mut self, now: MonotonicMillis) -> bool {
@@ -445,6 +517,12 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         self.head = (self.head + 1) % self.actions.len();
         self.len -= 1;
         self.counters.dequeued += 1;
+        match queued.action.kind {
+            Icmpv4ErrorKind::TimeExceededTtl => self.counters.dequeued_time_exceeded += 1,
+            Icmpv4ErrorKind::DestinationUnreachableNetwork => {
+                self.counters.dequeued_destination_unreachable += 1;
+            }
+        }
         if let Some(state) = self.states.iter_mut().find(|state| {
             state.occupied
                 && state.egress == queued.action.egress
@@ -458,25 +536,40 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Icmpv4TimeExceededBuildError {
+pub enum Icmpv4ErrorBuildError {
     ExactLengthRequired,
 }
 
+pub type Icmpv4TimeExceededBuildError = Icmpv4ErrorBuildError;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ExecuteIcmpv4TimeExceededError {
+pub enum ExecuteIcmpv4Error {
     ClockRegression,
 }
+
+pub type ExecuteIcmpv4TimeExceededError = ExecuteIcmpv4Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GeneratedIcmpv4Trace {
     AllocationFailed(GeneratedAllocationError),
-    BuildFailed(Icmpv4TimeExceededBuildError),
+    BuildFailed(Icmpv4ErrorBuildError),
+    DestinationUnreachableAllocationFailed(GeneratedAllocationError),
+    DestinationUnreachableBuildFailed(Icmpv4ErrorBuildError),
     ClockRegression,
+    DestinationUnreachableClockRegression,
     TxRequested {
         egress: IfId,
         destination: Ipv4Address,
     },
+    DestinationUnreachableTxRequested {
+        egress: IfId,
+        destination: Ipv4Address,
+    },
     BatchCompleted {
+        accepted: usize,
+        rejected: usize,
+    },
+    DestinationUnreachableBatchCompleted {
         accepted: usize,
         rejected: usize,
     },
@@ -495,9 +588,9 @@ impl GeneratedIcmpv4TraceSink for NoGeneratedIcmpv4Trace {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct GeneratedIcmpv4Report<E> {
-    pub action: Icmpv4TimeExceededAction,
+    pub action: Icmpv4ErrorAction,
     pub allocation_error: Option<GeneratedAllocationError>,
-    pub build_error: Option<Icmpv4TimeExceededBuildError>,
+    pub build_error: Option<Icmpv4ErrorBuildError>,
     pub completion: GeneratedBatchCompletion<E>,
 }
 
@@ -511,37 +604,86 @@ where
     I: GeneratedPacketIo,
     T: GeneratedIcmpv4TraceSink,
 {
+    execute_one_icmpv4_error(io, runtime, now, trace)
+}
+
+pub fn execute_one_icmpv4_error<I, T>(
+    io: &mut I,
+    runtime: &mut Icmpv4ErrorRuntime<'_>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> Result<Option<GeneratedIcmpv4Report<I::Error>>, ExecuteIcmpv4Error>
+where
+    I: GeneratedPacketIo,
+    T: GeneratedIcmpv4TraceSink,
+{
     let Some(queued) = runtime.front() else {
         return Ok(None);
     };
     if !runtime.execution_time_valid(now) {
-        trace.record_generated_icmpv4(GeneratedIcmpv4Trace::ClockRegression);
+        let event = match queued.action.kind {
+            Icmpv4ErrorKind::TimeExceededTtl => GeneratedIcmpv4Trace::ClockRegression,
+            Icmpv4ErrorKind::DestinationUnreachableNetwork => {
+                GeneratedIcmpv4Trace::DestinationUnreachableClockRegression
+            }
+        };
+        trace.record_generated_icmpv4(event);
         return Err(ExecuteIcmpv4TimeExceededError::ClockRegression);
     }
     let mut batch = io.begin_generated(queued.action.egress);
-    let (allocation_error, build_error) = match allocate_time_exceeded(&mut batch, &queued.action) {
+    let (allocation_error, build_error) = match allocate_icmpv4_error(&mut batch, &queued.action) {
         Ok(()) => {
             runtime.committed(queued, now);
-            trace.record_generated_icmpv4(GeneratedIcmpv4Trace::TxRequested {
-                egress: queued.action.egress,
-                destination: queued.action.destination_ip,
-            });
+            let event = match queued.action.kind {
+                Icmpv4ErrorKind::TimeExceededTtl => GeneratedIcmpv4Trace::TxRequested {
+                    egress: queued.action.egress,
+                    destination: queued.action.destination_ip,
+                },
+                Icmpv4ErrorKind::DestinationUnreachableNetwork => {
+                    GeneratedIcmpv4Trace::DestinationUnreachableTxRequested {
+                        egress: queued.action.egress,
+                        destination: queued.action.destination_ip,
+                    }
+                }
+            };
+            trace.record_generated_icmpv4(event);
             (None, None)
         }
         Err(GenerationError::Allocation(error)) => {
-            trace.record_generated_icmpv4(GeneratedIcmpv4Trace::AllocationFailed(error));
+            let event = match queued.action.kind {
+                Icmpv4ErrorKind::TimeExceededTtl => GeneratedIcmpv4Trace::AllocationFailed(error),
+                Icmpv4ErrorKind::DestinationUnreachableNetwork => {
+                    GeneratedIcmpv4Trace::DestinationUnreachableAllocationFailed(error)
+                }
+            };
+            trace.record_generated_icmpv4(event);
             (Some(error), None)
         }
         Err(GenerationError::Build(error)) => {
-            trace.record_generated_icmpv4(GeneratedIcmpv4Trace::BuildFailed(error));
+            let event = match queued.action.kind {
+                Icmpv4ErrorKind::TimeExceededTtl => GeneratedIcmpv4Trace::BuildFailed(error),
+                Icmpv4ErrorKind::DestinationUnreachableNetwork => {
+                    GeneratedIcmpv4Trace::DestinationUnreachableBuildFailed(error)
+                }
+            };
+            trace.record_generated_icmpv4(event);
             (None, Some(error))
         }
     };
     let completion = batch.finish();
-    trace.record_generated_icmpv4(GeneratedIcmpv4Trace::BatchCompleted {
-        accepted: completion.accepted,
-        rejected: completion.rejected,
-    });
+    let event = match queued.action.kind {
+        Icmpv4ErrorKind::TimeExceededTtl => GeneratedIcmpv4Trace::BatchCompleted {
+            accepted: completion.accepted,
+            rejected: completion.rejected,
+        },
+        Icmpv4ErrorKind::DestinationUnreachableNetwork => {
+            GeneratedIcmpv4Trace::DestinationUnreachableBatchCompleted {
+                accepted: completion.accepted,
+                rejected: completion.rejected,
+            }
+        }
+    };
+    trace.record_generated_icmpv4(event);
     Ok(Some(GeneratedIcmpv4Report {
         action: queued.action,
         allocation_error,
@@ -552,12 +694,12 @@ where
 
 enum GenerationError {
     Allocation(GeneratedAllocationError),
-    Build(Icmpv4TimeExceededBuildError),
+    Build(Icmpv4ErrorBuildError),
 }
 
-fn allocate_time_exceeded<B: GeneratedPacketBatch>(
+fn allocate_icmpv4_error<B: GeneratedPacketBatch>(
     batch: &mut B,
-    action: &Icmpv4TimeExceededAction,
+    action: &Icmpv4ErrorAction,
 ) -> Result<(), GenerationError> {
     let frame_len = action.frame_len();
     let mut lease = batch
@@ -569,12 +711,12 @@ fn allocate_time_exceeded<B: GeneratedPacketBatch>(
             Icmpv4TimeExceededBuildError::ExactLengthRequired,
         ));
     }
-    build_time_exceeded(lease.bytes_mut(), action);
+    build_icmpv4_error(lease.bytes_mut(), action);
     lease.commit();
     Ok(())
 }
 
-fn build_time_exceeded(frame: &mut [u8], action: &Icmpv4TimeExceededAction) {
+fn build_icmpv4_error(frame: &mut [u8], action: &Icmpv4ErrorAction) {
     debug_assert_eq!(frame.len(), action.frame_len());
     let quote_len = action.quote_len();
     let ipv4_total_len = 28 + quote_len;
@@ -593,8 +735,8 @@ fn build_time_exceeded(frame: &mut [u8], action: &Icmpv4TimeExceededAction) {
     frame[30..34].copy_from_slice(&action.destination_ip.octets());
     let header_checksum = ipv4_header_checksum(&frame[14..34]);
     frame[24..26].copy_from_slice(&header_checksum.to_be_bytes());
-    frame[34] = 11;
-    frame[35] = 0;
+    frame[34] = action.kind.icmp_type();
+    frame[35] = action.kind.icmp_code();
     frame[42..icmp_end].copy_from_slice(action.quote());
     let icmp_checksum = internet_checksum(&frame[34..icmp_end]);
     frame[36..38].copy_from_slice(&icmp_checksum.to_be_bytes());
@@ -613,6 +755,21 @@ mod tests {
             Ipv4Address::from_octets([192, 0, 2, 1]),
             Ipv4Address::from_octets([198, 51, 100, 1]),
             0x2f,
+            64,
+            &original[..quote_len],
+        )
+    }
+
+    fn action_kind(kind: Icmpv4ErrorKind, egress: u16, quote_len: usize) -> Icmpv4ErrorAction {
+        let original = [0x5a; ICMPV4_ERROR_MAX_QUOTE_LEN];
+        Icmpv4ErrorAction::new_with_kind(
+            kind,
+            IfId(egress),
+            MacAddress([2, 0, 0, 0, 0, 1]),
+            MacAddress([2, 0, 0, 0, 0, 2]),
+            Ipv4Address::from_octets([192, 0, 2, 1]),
+            Ipv4Address::from_octets([198, 51, 100, 1]),
+            0,
             64,
             &original[..quote_len],
         )
@@ -673,6 +830,85 @@ mod tests {
             runtime.schedule(action(1, 20), MonotonicMillis(100)),
             Icmpv4TimeExceededDisposition::Queued { .. }
         ));
+    }
+
+    #[test]
+    fn mixed_kinds_share_fifo_pending_and_exact_rate_boundary() {
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; 2];
+        let mut slots = [Icmpv4ErrorActionSlot::EMPTY; 2];
+        let mut runtime = Icmpv4ErrorRuntime::new(
+            Icmpv4ErrorPolicy::new(100, 1_000).unwrap(),
+            &mut states,
+            &mut slots,
+        );
+        let time = action_kind(Icmpv4ErrorKind::TimeExceededTtl, 1, 20);
+        let unreachable = action_kind(Icmpv4ErrorKind::DestinationUnreachableNetwork, 1, 21);
+        assert!(matches!(
+            runtime.schedule(time, MonotonicMillis(0)),
+            Icmpv4ErrorDisposition::Queued { .. }
+        ));
+        assert_eq!(
+            runtime.schedule(unreachable, MonotonicMillis(0)),
+            Icmpv4ErrorDisposition::Pending { egress: IfId(1) }
+        );
+        let queued = runtime.front().unwrap();
+        assert_eq!(queued.action.kind, Icmpv4ErrorKind::TimeExceededTtl);
+        runtime.committed(queued, MonotonicMillis(0));
+        assert_eq!(
+            runtime.schedule(unreachable, MonotonicMillis(99)),
+            Icmpv4ErrorDisposition::RateLimited { egress: IfId(1) }
+        );
+        assert!(matches!(
+            runtime.schedule(unreachable, MonotonicMillis(100)),
+            Icmpv4ErrorDisposition::DestinationUnreachableQueued { .. }
+        ));
+        let queued = runtime.front().unwrap();
+        assert_eq!(
+            queued.action.kind,
+            Icmpv4ErrorKind::DestinationUnreachableNetwork
+        );
+        runtime.committed(queued, MonotonicMillis(100));
+        assert_eq!(
+            runtime.counters(),
+            Icmpv4ErrorCounters {
+                queued: 2,
+                queued_time_exceeded: 1,
+                queued_destination_unreachable: 1,
+                pending: 1,
+                rate_limited: 1,
+                dequeued: 2,
+                dequeued_time_exceeded: 1,
+                dequeued_destination_unreachable: 1,
+                ..Icmpv4ErrorCounters::default()
+            }
+        );
+    }
+
+    #[test]
+    fn mixed_kind_fifo_is_ordered_across_egresses_and_clock_failure_is_atomic() {
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; 2];
+        let mut slots = [Icmpv4ErrorActionSlot::EMPTY; 2];
+        let mut runtime =
+            Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut states, &mut slots);
+        let time = action_kind(Icmpv4ErrorKind::TimeExceededTtl, 1, 20);
+        let unreachable = action_kind(Icmpv4ErrorKind::DestinationUnreachableNetwork, 2, 20);
+        runtime.schedule(time, MonotonicMillis(10));
+        runtime.schedule(unreachable, MonotonicMillis(10));
+        assert_eq!(runtime.pending_actions(), 2);
+        let first = runtime.front().unwrap();
+        assert_eq!(first.action.kind, Icmpv4ErrorKind::TimeExceededTtl);
+        runtime.committed(first, MonotonicMillis(10));
+        let second = runtime.front().unwrap();
+        assert_eq!(
+            second.action.kind,
+            Icmpv4ErrorKind::DestinationUnreachableNetwork
+        );
+        assert_eq!(
+            runtime.schedule(time, MonotonicMillis(9)),
+            Icmpv4ErrorDisposition::ClockRegression
+        );
+        assert_eq!(runtime.front(), Some(second));
+        assert_eq!(runtime.pending_actions(), 1);
     }
 
     #[test]

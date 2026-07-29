@@ -1,10 +1,10 @@
 use crate::resolution::DynamicLookup;
 use crate::{
     packet, rfc1624_update, route, validate_arp, validate_ipv4_frame, ArpOpcode, ArpRequestAction,
-    BatchCompletion, ConsumeReason, ControlDisposition, Icmpv4ErrorRuntime,
-    Icmpv4TimeExceededAction, Icmpv4TimeExceededDisposition, IfId, Interface, LocalIpv4Binding,
-    MonotonicMillis, Neighbor, PacketBatch, ResolutionResult, ResolutionRuntime, Route,
-    ARP_ETHERTYPE, IPV4_ETHERTYPE,
+    BatchCompletion, ConsumeReason, ControlDisposition, Icmpv4ErrorAction, Icmpv4ErrorDisposition,
+    Icmpv4ErrorKind, Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface,
+    LocalIpv4Binding, MonotonicMillis, Neighbor, PacketBatch, ResolutionResult, ResolutionRuntime,
+    Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -238,7 +238,11 @@ pub enum TraceEvent {
     },
     Icmpv4TimeExceededDisposition {
         ingress: IfId,
-        disposition: Icmpv4TimeExceededDisposition,
+        disposition: Icmpv4ErrorDisposition,
+    },
+    Icmpv4DestinationUnreachableDisposition {
+        ingress: IfId,
+        disposition: Icmpv4ErrorDisposition,
     },
     ArpRequestValidated {
         ingress: IfId,
@@ -405,8 +409,8 @@ where
     forward_batch_inner(batch, snapshot, Some((runtime, now)), None, trace)
 }
 
-/// Forwards RX packets while queueing ARP resolution and eligible ICMPv4 Time
-/// Exceeded actions into separate caller-backed worker-local runtimes.
+/// Forwards RX packets while queueing ARP resolution and eligible ICMPv4 error
+/// actions into separate caller-backed worker-local runtimes.
 ///
 /// Generated packet execution must happen after this function returns.
 pub fn forward_batch_with_resolution_and_icmpv4_errors<B, T>(
@@ -567,10 +571,39 @@ fn decide_ipv4<T: TraceSink>(
     if ipv4.header_len > 20 {
         return Err(Ipv4OptionsUnsupported);
     }
+    let route = route::lookup(snapshot.routes, ipv4.destination);
+    let Some(route) = route else {
+        if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+            let disposition = decide_icmpv4_error(
+                frame,
+                snapshot,
+                ipv4,
+                None,
+                Icmpv4ErrorKind::DestinationUnreachableNetwork,
+                resolution,
+                runtime,
+                *now,
+                trace,
+            );
+            trace.record(TraceEvent::Icmpv4DestinationUnreachableDisposition {
+                ingress,
+                disposition,
+            });
+        }
+        return Err(RouteMiss);
+    };
     if ipv4.ttl <= 1 {
         if let Some((runtime, now)) = icmpv4_errors.as_mut() {
-            let disposition = decide_icmpv4_time_exceeded(
-                frame, snapshot, ipv4, resolution, runtime, *now, trace,
+            let disposition = decide_icmpv4_error(
+                frame,
+                snapshot,
+                ipv4,
+                Some(route),
+                Icmpv4ErrorKind::TimeExceededTtl,
+                resolution,
+                runtime,
+                *now,
+                trace,
             );
             trace.record(TraceEvent::Icmpv4TimeExceededDisposition {
                 ingress,
@@ -579,7 +612,6 @@ fn decide_ipv4<T: TraceSink>(
         }
         return Err(Ipv4TtlExpired);
     }
-    let route = route::lookup(snapshot.routes, ipv4.destination).ok_or(RouteMiss)?;
     let target = route.next_hop().unwrap_or(ipv4.destination);
     let interface = snapshot
         .interfaces
@@ -662,15 +694,18 @@ fn decide_ipv4<T: TraceSink>(
     }))
 }
 
-fn decide_icmpv4_time_exceeded<T: TraceSink>(
+#[allow(clippy::too_many_arguments)]
+fn decide_icmpv4_error<T: TraceSink>(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
     ipv4: packet::ValidatedIpv4,
+    selected_destination_route: Option<Route>,
+    kind: Icmpv4ErrorKind,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     runtime: &mut Icmpv4ErrorRuntime<'_>,
     now: MonotonicMillis,
     trace: &mut T,
-) -> Icmpv4TimeExceededDisposition {
+) -> Icmpv4ErrorDisposition {
     if !runtime.observe_decision(now) {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::ClockRegression);
     }
@@ -693,7 +728,7 @@ fn decide_icmpv4_time_exceeded<T: TraceSink>(
         return runtime
             .record_suppression(Icmpv4TimeExceededDisposition::DestinationLimitedBroadcast);
     }
-    if let Some(selected) = route::lookup(snapshot.routes, ipv4.destination) {
+    if let Some(selected) = selected_destination_route {
         if selected.is_prefix_network_address(ipv4.destination) {
             return runtime
                 .record_suppression(Icmpv4TimeExceededDisposition::DestinationNetworkAddress);
@@ -820,7 +855,8 @@ fn decide_icmpv4_time_exceeded<T: TraceSink>(
     let quote_end = ipv4.header_offset + ipv4.total_len;
     let original_ipv4 = &frame[ipv4.header_offset..quote_end];
     runtime.schedule(
-        Icmpv4TimeExceededAction::new(
+        Icmpv4ErrorAction::new_with_kind(
+            kind,
             reverse_egress,
             interface.mac,
             destination_mac,
