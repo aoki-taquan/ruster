@@ -9,10 +9,19 @@ pub const NAT44_TCP_MIN_IDLE_TTL_MS: u64 = 7_440_000;
 pub const NAT44_TCP_DEFAULT_IDLE_TTL_MS: u64 = 7_440_000;
 pub const NAT44_TCP_MAX_IDLE_TTL_MS: u64 = 604_800_000;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Nat44Icmpv4ErrorPolicy {
+    #[default]
+    Disabled,
+    ExternalOnly,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Nat44UdpPolicy {
     idle_ttl_ms: u64,
     allocator_seed: u64,
+    icmpv4_errors: Nat44Icmpv4ErrorPolicy,
 }
 
 #[cfg(test)]
@@ -244,6 +253,7 @@ impl Nat44UdpPolicy {
         Ok(Self {
             idle_ttl_ms,
             allocator_seed,
+            icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
         })
     }
 
@@ -256,6 +266,17 @@ impl Nat44UdpPolicy {
     pub const fn allocator_seed(self) -> u64 {
         self.allocator_seed
     }
+
+    #[must_use]
+    pub const fn with_icmpv4_errors(mut self, policy: Nat44Icmpv4ErrorPolicy) -> Self {
+        self.icmpv4_errors = policy;
+        self
+    }
+
+    #[must_use]
+    pub const fn icmpv4_errors(self) -> Nat44Icmpv4ErrorPolicy {
+        self.icmpv4_errors
+    }
 }
 
 impl Default for Nat44UdpPolicy {
@@ -263,6 +284,7 @@ impl Default for Nat44UdpPolicy {
         Self {
             idle_ttl_ms: NAT44_UDP_DEFAULT_IDLE_TTL_MS,
             allocator_seed: 0,
+            icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
         }
     }
 }
@@ -577,6 +599,22 @@ pub(crate) enum Nat44UdpPlanError {
     ClockRegression,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct Nat44UdpIcmpv4Lookup {
+    internal_address: Ipv4Address,
+    internal_port: u16,
+}
+
+impl Nat44UdpIcmpv4Lookup {
+    pub(crate) const fn internal_address(self) -> Ipv4Address {
+        self.internal_address
+    }
+
+    pub(crate) const fn internal_port(self) -> u16 {
+        self.internal_port
+    }
+}
+
 /// Fixed-capacity, worker-local UDP NAPT state.
 ///
 /// The caller owns both storage arrays. Recreating the runtime deliberately
@@ -852,6 +890,38 @@ impl<'a> Nat44UdpRuntime<'a> {
         }
     }
 
+    pub(crate) fn inspect_icmpv4(
+        &self,
+        public_port: u16,
+        remote_address: Ipv4Address,
+        now_ms: u64,
+    ) -> Result<Nat44UdpIcmpv4Lookup, Nat44UdpPlanError> {
+        if self
+            .watermark_ms
+            .is_some_and(|watermark| now_ms < watermark)
+        {
+            return Err(Nat44UdpPlanError::ClockRegression);
+        }
+        let Some((mapping_index, mapping)) =
+            self.mappings
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(_, mapping)| {
+                    self.mapping_is_live(*mapping, now_ms) && mapping.public_port == public_port
+                })
+        else {
+            return Err(Nat44UdpPlanError::MappingMiss);
+        };
+        if !self.peer_exists(mapping_index, mapping.generation, remote_address) {
+            return Err(Nat44UdpPlanError::FilterDenied);
+        }
+        Ok(Nat44UdpIcmpv4Lookup {
+            internal_address: mapping.internal_address,
+            internal_port: mapping.internal_port,
+        })
+    }
+
     fn mapping_is_live(&self, mapping: Nat44UdpMappingSlot, now_ms: u64) -> bool {
         mapping.occupied
             && now_ms >= mapping.last_outbound_ms
@@ -1008,6 +1078,7 @@ fn snapshot_authority(snapshot: &ForwardingSnapshot<'_>) -> u64 {
 pub struct Nat44TcpPolicy {
     idle_ttl_ms: u64,
     allocator_seed: u64,
+    icmpv4_errors: Nat44Icmpv4ErrorPolicy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1028,6 +1099,7 @@ impl Nat44TcpPolicy {
         Ok(Self {
             idle_ttl_ms,
             allocator_seed,
+            icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
         })
     }
 
@@ -1040,6 +1112,17 @@ impl Nat44TcpPolicy {
     pub const fn allocator_seed(self) -> u64 {
         self.allocator_seed
     }
+
+    #[must_use]
+    pub const fn with_icmpv4_errors(mut self, policy: Nat44Icmpv4ErrorPolicy) -> Self {
+        self.icmpv4_errors = policy;
+        self
+    }
+
+    #[must_use]
+    pub const fn icmpv4_errors(self) -> Nat44Icmpv4ErrorPolicy {
+        self.icmpv4_errors
+    }
 }
 
 impl Default for Nat44TcpPolicy {
@@ -1047,6 +1130,7 @@ impl Default for Nat44TcpPolicy {
         Self {
             idle_ttl_ms: NAT44_TCP_DEFAULT_IDLE_TTL_MS,
             allocator_seed: 0,
+            icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
         }
     }
 }
@@ -1380,6 +1464,22 @@ pub(crate) enum Nat44TcpPlanError {
     ClockRegression,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct Nat44TcpIcmpv4Lookup {
+    internal_address: Ipv4Address,
+    internal_port: u16,
+}
+
+impl Nat44TcpIcmpv4Lookup {
+    pub(crate) const fn internal_address(self) -> Ipv4Address {
+        self.internal_address
+    }
+
+    pub(crate) const fn internal_port(self) -> u16 {
+        self.internal_port
+    }
+}
+
 /// Fixed-capacity, worker-local outbound-initiated TCP NAPT state.
 ///
 /// This intentionally models exact remote endpoint sessions, not TCP sequence
@@ -1676,6 +1776,49 @@ impl<'a> Nat44TcpRuntime<'a> {
             }
             Nat44TcpPlanError::ClockRegression => {}
         }
+    }
+
+    pub(crate) fn inspect_icmpv4(
+        &self,
+        public_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        now_ms: u64,
+    ) -> Result<Nat44TcpIcmpv4Lookup, Nat44TcpPlanError> {
+        if self
+            .watermark_ms
+            .is_some_and(|watermark| now_ms < watermark)
+        {
+            return Err(Nat44TcpPlanError::ClockRegression);
+        }
+        let Some((mapping_index, mapping)) =
+            self.mappings
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|(index, mapping)| {
+                    self.mapping_is_live(*index, *mapping, now_ms)
+                        && mapping.public_port == public_port
+                })
+        else {
+            return Err(Nat44TcpPlanError::MappingMiss);
+        };
+        if self
+            .find_session(
+                mapping_index,
+                mapping.generation,
+                remote_address,
+                remote_port,
+                now_ms,
+            )
+            .is_none()
+        {
+            return Err(Nat44TcpPlanError::SessionMiss);
+        }
+        Ok(Nat44TcpIcmpv4Lookup {
+            internal_address: mapping.internal_address,
+            internal_port: mapping.internal_port,
+        })
     }
 
     fn session_is_live(&self, session: Nat44TcpSessionSlot, now_ms: u64) -> bool {

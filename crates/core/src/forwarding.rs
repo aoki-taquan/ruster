@@ -7,9 +7,9 @@ use crate::{
     packet, rfc1624_update, route, validate_arp, validate_ipv4_frame, ArpOpcode, ArpRequestAction,
     BatchCompletion, ConsumeReason, ControlDisposition, Icmpv4ErrorAction, Icmpv4ErrorDisposition,
     Icmpv4ErrorKind, Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface,
-    LocalIpv4Binding, MonotonicMillis, Nat44TcpConfig, Nat44TcpDisposition, Nat44TcpRuntime,
-    Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, ResolutionResult,
-    ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
+    LocalIpv4Binding, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition,
+    Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch,
+    ResolutionResult, ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,6 +91,23 @@ pub enum DropReason {
     Nat44TcpWrongIngress = 73,
     Nat44TcpWrongEgress = 74,
     Nat44CombinedRealmMismatch = 75,
+    Nat44Icmpv4WrongIngress = 76,
+    Nat44Icmpv4OuterOptionsUnsupported = 77,
+    Nat44Icmpv4OuterFragmentUnsupported = 78,
+    Nat44Icmpv4OuterTtlExpired = 79,
+    Nat44Icmpv4HeaderTruncated = 80,
+    Nat44Icmpv4ChecksumInvalid = 81,
+    Nat44Icmpv4QuoteTruncated = 82,
+    Nat44Icmpv4QuotedVersionUnsupported = 83,
+    Nat44Icmpv4QuotedIhlTooSmall = 84,
+    Nat44Icmpv4QuotedHeaderTruncated = 85,
+    Nat44Icmpv4QuotedTotalLengthTooSmall = 86,
+    Nat44Icmpv4QuotedChecksumInvalid = 87,
+    Nat44Icmpv4QuotedFragmentUnsupported = 88,
+    Nat44Icmpv4QuotedProtocolUnsupported = 89,
+    Nat44Icmpv4QuotedPublicSourceMismatch = 90,
+    Nat44Icmpv4TcpChecksumPartial = 91,
+    Nat44Icmpv4WrongEgress = 92,
 }
 
 use DropReason::*;
@@ -174,6 +191,23 @@ impl DropReason {
             Nat44TcpWrongIngress => "NAT44_TCP_WRONG_INGRESS",
             Nat44TcpWrongEgress => "NAT44_TCP_WRONG_EGRESS",
             Nat44CombinedRealmMismatch => "NAT44_COMBINED_REALM_MISMATCH",
+            Nat44Icmpv4WrongIngress => "NAT44_ICMPV4_WRONG_INGRESS",
+            Nat44Icmpv4OuterOptionsUnsupported => "NAT44_ICMPV4_OUTER_OPTIONS_UNSUPPORTED",
+            Nat44Icmpv4OuterFragmentUnsupported => "NAT44_ICMPV4_OUTER_FRAGMENT_UNSUPPORTED",
+            Nat44Icmpv4OuterTtlExpired => "NAT44_ICMPV4_OUTER_TTL_EXPIRED",
+            Nat44Icmpv4HeaderTruncated => "NAT44_ICMPV4_HEADER_TRUNCATED",
+            Nat44Icmpv4ChecksumInvalid => "NAT44_ICMPV4_CHECKSUM_INVALID",
+            Nat44Icmpv4QuoteTruncated => "NAT44_ICMPV4_QUOTE_TRUNCATED",
+            Nat44Icmpv4QuotedVersionUnsupported => "NAT44_ICMPV4_QUOTED_VERSION_UNSUPPORTED",
+            Nat44Icmpv4QuotedIhlTooSmall => "NAT44_ICMPV4_QUOTED_IHL_TOO_SMALL",
+            Nat44Icmpv4QuotedHeaderTruncated => "NAT44_ICMPV4_QUOTED_HEADER_TRUNCATED",
+            Nat44Icmpv4QuotedTotalLengthTooSmall => "NAT44_ICMPV4_QUOTED_TOTAL_LENGTH_TOO_SMALL",
+            Nat44Icmpv4QuotedChecksumInvalid => "NAT44_ICMPV4_QUOTED_CHECKSUM_INVALID",
+            Nat44Icmpv4QuotedFragmentUnsupported => "NAT44_ICMPV4_QUOTED_FRAGMENT_UNSUPPORTED",
+            Nat44Icmpv4QuotedProtocolUnsupported => "NAT44_ICMPV4_QUOTED_PROTOCOL_UNSUPPORTED",
+            Nat44Icmpv4QuotedPublicSourceMismatch => "NAT44_ICMPV4_QUOTED_PUBLIC_SOURCE_MISMATCH",
+            Nat44Icmpv4TcpChecksumPartial => "NAT44_ICMPV4_TCP_CHECKSUM_PARTIAL",
+            Nat44Icmpv4WrongEgress => "NAT44_ICMPV4_WRONG_EGRESS",
         }
     }
 }
@@ -373,6 +407,19 @@ impl<'a> ForwardingSnapshot<'a> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
+pub enum Nat44Icmpv4Disposition {
+    Translated {
+        quoted_protocol: u8,
+        internal_address: crate::Ipv4Address,
+        internal_port: u16,
+    },
+    Rejected {
+        reason: DropReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum TraceEvent {
     Ipv4Validated {
         ingress: IfId,
@@ -434,6 +481,10 @@ pub enum TraceEvent {
     Nat44Tcp {
         ingress: IfId,
         disposition: Nat44TcpDisposition,
+    },
+    Nat44Icmpv4 {
+        ingress: IfId,
+        disposition: Nat44Icmpv4Disposition,
     },
     Dropped {
         ingress: IfId,
@@ -561,10 +612,33 @@ struct Nat44TcpRewriteDecision {
 }
 
 #[derive(Clone, Copy)]
+struct Nat44Icmpv4RewriteDecision {
+    egress: IfId,
+    source_mac: [u8; 6],
+    destination_mac: [u8; 6],
+    outer_ttl_offset: usize,
+    outer_checksum_offset: usize,
+    outer_destination_offset: usize,
+    inner_checksum_offset: usize,
+    inner_source_offset: usize,
+    inner_port_offset: usize,
+    transport_checksum_offset: Option<usize>,
+    icmp_checksum_offset: usize,
+    internal_address: [u8; 4],
+    internal_port: u16,
+    outer_checksum: u16,
+    inner_checksum: u16,
+    transport_checksum: Option<u16>,
+    icmp_checksum: u16,
+    disposition: Nat44Icmpv4Disposition,
+}
+
+#[derive(Clone, Copy)]
 enum PacketDecision {
     Ipv4(Ipv4RewriteDecision),
     Nat44Udp(Nat44UdpRewriteDecision),
     Nat44Tcp(Nat44TcpRewriteDecision),
+    Nat44Icmpv4(Nat44Icmpv4RewriteDecision),
     ArpReply(ArpReplyDecision),
     Icmpv4EchoReply(Icmpv4EchoReplyDecision),
     ConsumeArp(ControlDisposition),
@@ -577,6 +651,7 @@ impl PacketDecision {
             Self::Ipv4(decision) => decision.egress,
             Self::Nat44Udp(decision) => decision.forwarding.egress,
             Self::Nat44Tcp(decision) => decision.forwarding.egress,
+            Self::Nat44Icmpv4(decision) => decision.egress,
             Self::ArpReply(decision) => decision.egress,
             Self::Icmpv4EchoReply(decision) => decision.egress,
             Self::ConsumeArp(_) | Self::ConsumeIpv4Local => {
@@ -940,6 +1015,12 @@ where
                         disposition: nat.disposition,
                     });
                 }
+                if let PacketDecision::Nat44Icmpv4(nat) = decision {
+                    trace.record(TraceEvent::Nat44Icmpv4 {
+                        ingress,
+                        disposition: nat.disposition,
+                    });
+                }
                 packet.commit(egress);
                 tx_requested += 1;
                 if let PacketDecision::ArpReply(arp) = decision {
@@ -1033,6 +1114,33 @@ fn decide_ipv4<T: TraceSink>(
         .as_ref()
         .map_or(MonotonicMillis(0), |(_, now)| *now);
     let combined_realm_mismatch = matches!((nat44_udp_config, nat44_tcp_config), (Some(udp), Some(tcp)) if !tcp.realm_matches_udp(*udp));
+    let nat44_icmpv4_candidate = ipv4.protocol == 1
+        && (nat44_udp_config.is_some_and(|config| {
+            config.policy().icmpv4_errors() == Nat44Icmpv4ErrorPolicy::ExternalOnly
+                && ipv4.destination == config.public_address()
+        }) || nat44_tcp_config.is_some_and(|config| {
+            config.policy().icmpv4_errors() == Nat44Icmpv4ErrorPolicy::ExternalOnly
+                && ipv4.destination == config.public_address()
+        }))
+        && frame
+            .get(ipv4.header_offset + ipv4.header_len..ipv4.header_offset + ipv4.header_len + 2)
+            .is_some_and(|type_and_code| type_and_code == [3, 4]);
+    if nat44_icmpv4_candidate {
+        return decide_nat44_icmpv4_frag_needed(
+            frame,
+            snapshot,
+            ingress,
+            ipv4,
+            resolution,
+            nat44_udp_config,
+            nat44_udp,
+            nat44_tcp_config,
+            nat44_tcp,
+            nat_now,
+            combined_realm_mismatch,
+            trace,
+        );
+    }
     if combined_realm_mismatch
         && matches!(ipv4.protocol, 6 | 17)
         && (nat44_udp_config.is_some_and(|config| ipv4.destination == config.public_address())
@@ -1321,6 +1429,456 @@ fn decide_ipv4<T: TraceSink>(
         return nat44_udp_drop(ingress, Nat44UdpUnsupportedTransport, trace);
     }
     Ok(PacketDecision::Ipv4(forwarding))
+}
+
+#[derive(Clone, Copy)]
+struct ParsedNat44Icmpv4Quote {
+    protocol: u8,
+    public_address: crate::Ipv4Address,
+    public_port: u16,
+    remote_address: crate::Ipv4Address,
+    remote_port: u16,
+    inner_checksum_offset: usize,
+    inner_checksum: u16,
+    inner_source_offset: usize,
+    inner_port_offset: usize,
+    transport_checksum_offset: Option<usize>,
+    transport_checksum: Option<u16>,
+    icmp_checksum_offset: usize,
+    icmp_checksum: u16,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    outer: packet::ValidatedIpv4,
+    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    nat44_udp_config: Option<&Nat44UdpConfig>,
+    nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
+    nat44_tcp_config: Option<&Nat44TcpConfig>,
+    nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
+    now: MonotonicMillis,
+    combined_realm_mismatch: bool,
+    trace: &mut T,
+) -> Result<PacketDecision, DropReason> {
+    let quote = parse_nat44_icmpv4_frag_needed(frame, outer)
+        .map_err(|reason| trace_nat44_icmpv4_drop(ingress, reason, trace))?;
+
+    let (inside, internal_address, internal_port) = match quote.protocol {
+        17 => {
+            let Some(config) = nat44_udp_config else {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedProtocolUnsupported, trace);
+            };
+            if config.policy().icmpv4_errors() != Nat44Icmpv4ErrorPolicy::ExternalOnly
+                || outer.destination != config.public_address()
+                || quote.public_address != config.public_address()
+            {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedPublicSourceMismatch, trace);
+            }
+            if combined_realm_mismatch {
+                return nat44_icmpv4_drop(ingress, Nat44CombinedRealmMismatch, trace);
+            }
+            if ingress != config.outside() {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongIngress, trace);
+            }
+            if !config.authority_matches(snapshot) {
+                return nat44_icmpv4_drop(ingress, Nat44UdpConfigMismatch, trace);
+            }
+            let Some(runtime) = nat44_udp.as_deref() else {
+                return nat44_icmpv4_drop(ingress, Nat44UdpRuntimeUnavailable, trace);
+            };
+            if runtime.config() != *config {
+                return nat44_icmpv4_drop(ingress, Nat44UdpConfigMismatch, trace);
+            }
+            let lookup = runtime
+                .inspect_icmpv4(quote.public_port, quote.remote_address, now.0)
+                .map_err(|error| {
+                    let reason = match error {
+                        Nat44UdpPlanError::MappingMiss => Nat44UdpMappingMiss,
+                        Nat44UdpPlanError::FilterDenied => Nat44UdpFilterDenied,
+                        Nat44UdpPlanError::ClockRegression => Nat44UdpClockRegression,
+                        Nat44UdpPlanError::MappingFull
+                        | Nat44UdpPlanError::PeerFull
+                        | Nat44UdpPlanError::PortExhausted => {
+                            unreachable!("read-only ICMP lookup cannot exhaust state")
+                        }
+                    };
+                    trace_nat44_icmpv4_drop(ingress, reason, trace)
+                })?;
+            (
+                config.inside(),
+                lookup.internal_address(),
+                lookup.internal_port(),
+            )
+        }
+        6 => {
+            let Some(config) = nat44_tcp_config else {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedProtocolUnsupported, trace);
+            };
+            if config.policy().icmpv4_errors() != Nat44Icmpv4ErrorPolicy::ExternalOnly
+                || outer.destination != config.public_address()
+                || quote.public_address != config.public_address()
+            {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedPublicSourceMismatch, trace);
+            }
+            if combined_realm_mismatch {
+                return nat44_icmpv4_drop(ingress, Nat44CombinedRealmMismatch, trace);
+            }
+            if ingress != config.outside() {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongIngress, trace);
+            }
+            if !config.authority_matches(snapshot) {
+                return nat44_icmpv4_drop(ingress, Nat44TcpConfigMismatch, trace);
+            }
+            let Some(runtime) = nat44_tcp.as_deref() else {
+                return nat44_icmpv4_drop(ingress, Nat44TcpRuntimeUnavailable, trace);
+            };
+            if runtime.config() != *config {
+                return nat44_icmpv4_drop(ingress, Nat44TcpConfigMismatch, trace);
+            }
+            let lookup = runtime
+                .inspect_icmpv4(
+                    quote.public_port,
+                    quote.remote_address,
+                    quote.remote_port,
+                    now.0,
+                )
+                .map_err(|error| {
+                    let reason = match error {
+                        Nat44TcpPlanError::MappingMiss => Nat44TcpMappingMiss,
+                        Nat44TcpPlanError::SessionMiss => Nat44TcpSessionMiss,
+                        Nat44TcpPlanError::ClockRegression => Nat44TcpClockRegression,
+                        Nat44TcpPlanError::InvalidInitialFlags
+                        | Nat44TcpPlanError::MappingFull
+                        | Nat44TcpPlanError::SessionFull
+                        | Nat44TcpPlanError::PortExhausted => {
+                            unreachable!("read-only ICMP lookup cannot create state")
+                        }
+                    };
+                    trace_nat44_icmpv4_drop(ingress, reason, trace)
+                })?;
+            (
+                config.inside(),
+                lookup.internal_address(),
+                lookup.internal_port(),
+            )
+        }
+        _ => {
+            return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedProtocolUnsupported, trace);
+        }
+    };
+
+    let route = route::lookup(snapshot.routes, internal_address).ok_or(RouteMiss)?;
+    if route.egress() != inside {
+        return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongEgress, trace);
+    }
+    let interface = snapshot
+        .interfaces
+        .iter()
+        .find(|interface| interface.id == inside)
+        .ok_or(InterfaceMiss)?;
+    let target = route.next_hop().unwrap_or(internal_address);
+    let destination_mac = if let Some(neighbor) = snapshot
+        .neighbors
+        .iter()
+        .find(|neighbor| neighbor.interface == inside && neighbor.target == target)
+    {
+        neighbor.mac
+    } else if let Some((runtime, resolution_now)) = resolution.as_mut() {
+        match runtime.lookup_dynamic(inside, target, *resolution_now) {
+            DynamicLookup::Hit(mac) => mac,
+            DynamicLookup::ClockRegression => {
+                trace.record(TraceEvent::NeighborResolution {
+                    egress: inside,
+                    target,
+                    result: ResolutionResult::ClockRegression,
+                });
+                return Err(NeighborUnresolved);
+            }
+            DynamicLookup::Miss => {
+                if let Some(binding) = snapshot
+                    .local_ipv4
+                    .iter()
+                    .find(|binding| binding.interface == inside)
+                {
+                    let result = runtime.schedule(
+                        ArpRequestAction {
+                            egress: inside,
+                            source_mac: interface.mac,
+                            source_ip: binding.address,
+                            target_ip: target,
+                        },
+                        *resolution_now,
+                        snapshot
+                            .local_ipv4
+                            .iter()
+                            .any(|binding| binding.address == target)
+                            || snapshot.routes.iter().any(|candidate| {
+                                candidate.egress() == inside
+                                    && (candidate.is_connected_directed_broadcast(target)
+                                        || candidate.is_connected_network_address(target))
+                            }),
+                    );
+                    trace.record(TraceEvent::NeighborResolution {
+                        egress: inside,
+                        target,
+                        result,
+                    });
+                }
+                return Err(NeighborUnresolved);
+            }
+        }
+    } else {
+        return Err(NeighborUnresolved);
+    };
+
+    trace.record(TraceEvent::Routed {
+        egress: inside,
+        neighbor_target: target,
+    });
+    build_nat44_icmpv4_rewrite(
+        outer,
+        quote,
+        inside,
+        interface.mac.0,
+        destination_mac.0,
+        internal_address,
+        internal_port,
+    )
+}
+
+fn parse_nat44_icmpv4_frag_needed(
+    frame: &[u8],
+    outer: packet::ValidatedIpv4,
+) -> Result<ParsedNat44Icmpv4Quote, DropReason> {
+    if outer.header_len != 20 {
+        return Err(Nat44Icmpv4OuterOptionsUnsupported);
+    }
+    let outer_flags =
+        packet::read_u16(frame, outer.header_offset + 6).ok_or(Nat44Icmpv4HeaderTruncated)?;
+    if outer_flags & 0x3fff != 0 {
+        return Err(Nat44Icmpv4OuterFragmentUnsupported);
+    }
+    if outer.ttl <= 1 {
+        return Err(Nat44Icmpv4OuterTtlExpired);
+    }
+    let icmp_offset = outer.header_offset + outer.header_len;
+    let icmp_end = outer.header_offset + outer.total_len;
+    let icmp = frame
+        .get(icmp_offset..icmp_end)
+        .ok_or(Nat44Icmpv4HeaderTruncated)?;
+    if icmp.len() < 8 {
+        return Err(Nat44Icmpv4HeaderTruncated);
+    }
+    if crate::internet_checksum(icmp) != 0 {
+        return Err(Nat44Icmpv4ChecksumInvalid);
+    }
+    let quote_offset = icmp_offset + 8;
+    let quote = frame
+        .get(quote_offset..icmp_end)
+        .ok_or(Nat44Icmpv4QuoteTruncated)?;
+    let Some(&version_ihl) = quote.first() else {
+        return Err(Nat44Icmpv4QuoteTruncated);
+    };
+    if version_ihl >> 4 != 4 {
+        return Err(Nat44Icmpv4QuotedVersionUnsupported);
+    }
+    let ihl_words = version_ihl & 0x0f;
+    if ihl_words < 5 {
+        return Err(Nat44Icmpv4QuotedIhlTooSmall);
+    }
+    let inner_header_len = usize::from(ihl_words) * 4;
+    let inner_header = quote
+        .get(..inner_header_len)
+        .ok_or(Nat44Icmpv4QuotedHeaderTruncated)?;
+    let inner_total_len =
+        usize::from(packet::read_u16(inner_header, 2).ok_or(Nat44Icmpv4QuotedHeaderTruncated)?);
+    if inner_total_len < inner_header_len + 8 {
+        return Err(Nat44Icmpv4QuotedTotalLengthTooSmall);
+    }
+    if crate::internet_checksum(inner_header) != 0 {
+        return Err(Nat44Icmpv4QuotedChecksumInvalid);
+    }
+    let inner_flags = packet::read_u16(inner_header, 6).ok_or(Nat44Icmpv4QuotedHeaderTruncated)?;
+    if inner_flags != 0x4000 {
+        return Err(Nat44Icmpv4QuotedFragmentUnsupported);
+    }
+    let protocol = *inner_header
+        .get(9)
+        .ok_or(Nat44Icmpv4QuotedHeaderTruncated)?;
+    if !matches!(protocol, 6 | 17) {
+        return Err(Nat44Icmpv4QuotedProtocolUnsupported);
+    }
+    let public_address = crate::Ipv4Address::from_octets(
+        inner_header[12..16]
+            .try_into()
+            .expect("validated IPv4 header contains the source address"),
+    );
+    let remote_address = crate::Ipv4Address::from_octets(
+        inner_header[16..20]
+            .try_into()
+            .expect("validated IPv4 header contains the destination address"),
+    );
+    let transport_offset = quote_offset + inner_header_len;
+    let quoted_datagram_end = quote_offset + inner_total_len.min(quote.len());
+    let transport_available = quoted_datagram_end - transport_offset;
+    if transport_available < 8 {
+        return Err(Nat44Icmpv4QuoteTruncated);
+    }
+    let public_port = packet::read_u16(frame, transport_offset).ok_or(Nat44Icmpv4QuoteTruncated)?;
+    let remote_port =
+        packet::read_u16(frame, transport_offset + 2).ok_or(Nat44Icmpv4QuoteTruncated)?;
+    let (transport_checksum_offset, transport_checksum) = if protocol == 17 {
+        (
+            Some(transport_offset + 6),
+            Some(packet::read_u16(frame, transport_offset + 6).ok_or(Nat44Icmpv4QuoteTruncated)?),
+        )
+    } else if transport_available == 17 {
+        return Err(Nat44Icmpv4TcpChecksumPartial);
+    } else if transport_available >= 18 {
+        (
+            Some(transport_offset + 16),
+            Some(
+                packet::read_u16(frame, transport_offset + 16)
+                    .ok_or(Nat44Icmpv4TcpChecksumPartial)?,
+            ),
+        )
+    } else {
+        (None, None)
+    };
+    Ok(ParsedNat44Icmpv4Quote {
+        protocol,
+        public_address,
+        public_port,
+        remote_address,
+        remote_port,
+        inner_checksum_offset: quote_offset + 10,
+        inner_checksum: packet::read_u16(frame, quote_offset + 10)
+            .ok_or(Nat44Icmpv4QuotedHeaderTruncated)?,
+        inner_source_offset: quote_offset + 12,
+        inner_port_offset: transport_offset,
+        transport_checksum_offset,
+        transport_checksum,
+        icmp_checksum_offset: icmp_offset + 2,
+        icmp_checksum: packet::read_u16(frame, icmp_offset + 2)
+            .ok_or(Nat44Icmpv4HeaderTruncated)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_nat44_icmpv4_rewrite(
+    outer: packet::ValidatedIpv4,
+    quote: ParsedNat44Icmpv4Quote,
+    egress: IfId,
+    source_mac: [u8; 6],
+    destination_mac: [u8; 6],
+    internal_address: crate::Ipv4Address,
+    internal_port: u16,
+) -> Result<PacketDecision, DropReason> {
+    let old_octets = quote.public_address.octets();
+    let new_octets = internal_address.octets();
+    let old_high = u16::from_be_bytes([old_octets[0], old_octets[1]]);
+    let old_low = u16::from_be_bytes([old_octets[2], old_octets[3]]);
+    let new_high = u16::from_be_bytes([new_octets[0], new_octets[1]]);
+    let new_low = u16::from_be_bytes([new_octets[2], new_octets[3]]);
+
+    let inner_checksum = rfc1624_update(
+        rfc1624_update(quote.inner_checksum, old_high, new_high),
+        old_low,
+        new_low,
+    );
+    let transport_checksum = quote.transport_checksum.map(|checksum| {
+        if quote.protocol == 17 && checksum == 0 {
+            return 0;
+        }
+        let updated = rfc1624_update(
+            rfc1624_update(
+                rfc1624_update(checksum, old_high, new_high),
+                old_low,
+                new_low,
+            ),
+            quote.public_port,
+            internal_port,
+        );
+        if quote.protocol == 17 && updated == 0 {
+            0xffff
+        } else {
+            updated
+        }
+    });
+    let mut icmp_checksum =
+        rfc1624_update(quote.icmp_checksum, quote.inner_checksum, inner_checksum);
+    icmp_checksum = rfc1624_update(icmp_checksum, old_high, new_high);
+    icmp_checksum = rfc1624_update(icmp_checksum, old_low, new_low);
+    icmp_checksum = rfc1624_update(icmp_checksum, quote.public_port, internal_port);
+    if let (Some(old), Some(new)) = (quote.transport_checksum, transport_checksum) {
+        icmp_checksum = rfc1624_update(icmp_checksum, old, new);
+    }
+
+    let outer_destination_offset = outer.header_offset + 16;
+    let outer_destination = outer.destination.octets();
+    let outer_old_high = u16::from_be_bytes([outer_destination[0], outer_destination[1]]);
+    let outer_old_low = u16::from_be_bytes([outer_destination[2], outer_destination[3]]);
+    let outer_checksum = rfc1624_update(
+        rfc1624_update(
+            rfc1624_update(
+                outer.checksum,
+                u16::from_be_bytes([outer.ttl, outer.protocol]),
+                u16::from_be_bytes([outer.ttl - 1, outer.protocol]),
+            ),
+            outer_old_high,
+            new_high,
+        ),
+        outer_old_low,
+        new_low,
+    );
+    let disposition = Nat44Icmpv4Disposition::Translated {
+        quoted_protocol: quote.protocol,
+        internal_address,
+        internal_port,
+    };
+    Ok(PacketDecision::Nat44Icmpv4(Nat44Icmpv4RewriteDecision {
+        egress,
+        source_mac,
+        destination_mac,
+        outer_ttl_offset: outer.header_offset + 8,
+        outer_checksum_offset: outer.header_offset + 10,
+        outer_destination_offset,
+        inner_checksum_offset: quote.inner_checksum_offset,
+        inner_source_offset: quote.inner_source_offset,
+        inner_port_offset: quote.inner_port_offset,
+        transport_checksum_offset: quote.transport_checksum_offset,
+        icmp_checksum_offset: quote.icmp_checksum_offset,
+        internal_address: new_octets,
+        internal_port,
+        outer_checksum,
+        inner_checksum,
+        transport_checksum,
+        icmp_checksum,
+        disposition,
+    }))
+}
+
+fn trace_nat44_icmpv4_drop<T: TraceSink>(
+    ingress: IfId,
+    reason: DropReason,
+    trace: &mut T,
+) -> DropReason {
+    trace.record(TraceEvent::Nat44Icmpv4 {
+        ingress,
+        disposition: Nat44Icmpv4Disposition::Rejected { reason },
+    });
+    reason
+}
+
+fn nat44_icmpv4_drop<T: TraceSink>(
+    ingress: IfId,
+    reason: DropReason,
+    trace: &mut T,
+) -> Result<PacketDecision, DropReason> {
+    Err(trace_nat44_icmpv4_drop(ingress, reason, trace))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2769,12 +3327,60 @@ fn apply_decision(frame: &mut [u8], decision: PacketDecision) -> Result<(), Drop
         PacketDecision::Ipv4(ipv4) => apply_ipv4_rewrite(frame, ipv4),
         PacketDecision::Nat44Udp(nat) => apply_nat44_udp_rewrite(frame, nat),
         PacketDecision::Nat44Tcp(nat) => apply_nat44_tcp_rewrite(frame, nat),
+        PacketDecision::Nat44Icmpv4(nat) => apply_nat44_icmpv4_rewrite(frame, nat),
         PacketDecision::ArpReply(arp) => apply_arp_reply(frame, arp),
         PacketDecision::Icmpv4EchoReply(icmp) => apply_icmpv4_echo_reply(frame, icmp),
         PacketDecision::ConsumeArp(_) | PacketDecision::ConsumeIpv4Local => {
             unreachable!("consume decisions are never rewritten")
         }
     }
+}
+
+fn apply_nat44_icmpv4_rewrite(
+    frame: &mut [u8],
+    decision: Nat44Icmpv4RewriteDecision,
+) -> Result<(), DropReason> {
+    let required = [
+        (decision.outer_checksum_offset, 2),
+        (decision.outer_destination_offset, 4),
+        (decision.inner_checksum_offset, 2),
+        (decision.inner_source_offset, 4),
+        (decision.inner_port_offset, 2),
+        (decision.icmp_checksum_offset, 2),
+    ];
+    if frame.get(0..12).is_none()
+        || frame.get(decision.outer_ttl_offset).is_none()
+        || required
+            .iter()
+            .any(|(offset, len)| frame.get(*offset..*offset + *len).is_none())
+        || decision
+            .transport_checksum_offset
+            .is_some_and(|offset| frame.get(offset..offset + 2).is_none())
+    {
+        return Err(Nat44Icmpv4QuoteTruncated);
+    }
+    frame[0..6].copy_from_slice(&decision.destination_mac);
+    frame[6..12].copy_from_slice(&decision.source_mac);
+    frame[decision.outer_ttl_offset] -= 1;
+    frame[decision.outer_checksum_offset..decision.outer_checksum_offset + 2]
+        .copy_from_slice(&decision.outer_checksum.to_be_bytes());
+    frame[decision.outer_destination_offset..decision.outer_destination_offset + 4]
+        .copy_from_slice(&decision.internal_address);
+    frame[decision.inner_checksum_offset..decision.inner_checksum_offset + 2]
+        .copy_from_slice(&decision.inner_checksum.to_be_bytes());
+    frame[decision.inner_source_offset..decision.inner_source_offset + 4]
+        .copy_from_slice(&decision.internal_address);
+    frame[decision.inner_port_offset..decision.inner_port_offset + 2]
+        .copy_from_slice(&decision.internal_port.to_be_bytes());
+    if let (Some(offset), Some(checksum)) = (
+        decision.transport_checksum_offset,
+        decision.transport_checksum,
+    ) {
+        frame[offset..offset + 2].copy_from_slice(&checksum.to_be_bytes());
+    }
+    frame[decision.icmp_checksum_offset..decision.icmp_checksum_offset + 2]
+        .copy_from_slice(&decision.icmp_checksum.to_be_bytes());
+    Ok(())
 }
 
 fn apply_nat44_tcp_rewrite(
@@ -2987,6 +3593,23 @@ mod tests {
             (73, "NAT44_TCP_WRONG_INGRESS"),
             (74, "NAT44_TCP_WRONG_EGRESS"),
             (75, "NAT44_COMBINED_REALM_MISMATCH"),
+            (76, "NAT44_ICMPV4_WRONG_INGRESS"),
+            (77, "NAT44_ICMPV4_OUTER_OPTIONS_UNSUPPORTED"),
+            (78, "NAT44_ICMPV4_OUTER_FRAGMENT_UNSUPPORTED"),
+            (79, "NAT44_ICMPV4_OUTER_TTL_EXPIRED"),
+            (80, "NAT44_ICMPV4_HEADER_TRUNCATED"),
+            (81, "NAT44_ICMPV4_CHECKSUM_INVALID"),
+            (82, "NAT44_ICMPV4_QUOTE_TRUNCATED"),
+            (83, "NAT44_ICMPV4_QUOTED_VERSION_UNSUPPORTED"),
+            (84, "NAT44_ICMPV4_QUOTED_IHL_TOO_SMALL"),
+            (85, "NAT44_ICMPV4_QUOTED_HEADER_TRUNCATED"),
+            (86, "NAT44_ICMPV4_QUOTED_TOTAL_LENGTH_TOO_SMALL"),
+            (87, "NAT44_ICMPV4_QUOTED_CHECKSUM_INVALID"),
+            (88, "NAT44_ICMPV4_QUOTED_FRAGMENT_UNSUPPORTED"),
+            (89, "NAT44_ICMPV4_QUOTED_PROTOCOL_UNSUPPORTED"),
+            (90, "NAT44_ICMPV4_QUOTED_PUBLIC_SOURCE_MISMATCH"),
+            (91, "NAT44_ICMPV4_TCP_CHECKSUM_PARTIAL"),
+            (92, "NAT44_ICMPV4_WRONG_EGRESS"),
         ];
         let actual = [
             DropReason::EthernetHeaderTruncated,
@@ -3064,6 +3687,23 @@ mod tests {
             DropReason::Nat44TcpWrongIngress,
             DropReason::Nat44TcpWrongEgress,
             DropReason::Nat44CombinedRealmMismatch,
+            DropReason::Nat44Icmpv4WrongIngress,
+            DropReason::Nat44Icmpv4OuterOptionsUnsupported,
+            DropReason::Nat44Icmpv4OuterFragmentUnsupported,
+            DropReason::Nat44Icmpv4OuterTtlExpired,
+            DropReason::Nat44Icmpv4HeaderTruncated,
+            DropReason::Nat44Icmpv4ChecksumInvalid,
+            DropReason::Nat44Icmpv4QuoteTruncated,
+            DropReason::Nat44Icmpv4QuotedVersionUnsupported,
+            DropReason::Nat44Icmpv4QuotedIhlTooSmall,
+            DropReason::Nat44Icmpv4QuotedHeaderTruncated,
+            DropReason::Nat44Icmpv4QuotedTotalLengthTooSmall,
+            DropReason::Nat44Icmpv4QuotedChecksumInvalid,
+            DropReason::Nat44Icmpv4QuotedFragmentUnsupported,
+            DropReason::Nat44Icmpv4QuotedProtocolUnsupported,
+            DropReason::Nat44Icmpv4QuotedPublicSourceMismatch,
+            DropReason::Nat44Icmpv4TcpChecksumPartial,
+            DropReason::Nat44Icmpv4WrongEgress,
         ];
         assert_eq!(actual.len(), expected.len());
         for (reason, &(discriminant, code)) in actual.iter().zip(&expected) {

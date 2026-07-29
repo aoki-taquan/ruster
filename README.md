@@ -69,9 +69,11 @@ NAT runtimeへ到達した非退行時刻はdrop結果でもwatermarkへ反映�
 時刻によるmapping復活を許しません。outsideからinsideへのpublic DNATを通らない直通LPMも
 neighbor解決前にfail closedです。
 publication変更はvalidated configと`Nat44UdpRuntime::reconcile`による明示的な全state flushを
-要求します。fragment、hairpin、ICMP error translation/PMTU、ICMP query NAT、static
-forward、multi-public、port randomization/parity、full firewallはdeferredで、RFC 4787/
-7857全体への準拠は主張しません。
+要求します。policyで明示的にopt-inした場合だけ、outside/public宛てICMPv4 Type 3/Code 4が
+引用するlive UDP mapping/ADF peerをread-only参照し、outer destinationと引用source tupleを
+insideへ戻します。fragment、hairpin、他のICMP error/query NAT、static forward、
+multi-public、port randomization/parity、full firewallはdeferredで、RFC 4787/7857全体への
+準拠は主張しません。
 
 TCP NAT44は別のcaller-backed mapping/session storageを持ち、UDPと同じ数値public portを
 独立して使用できます。mappingはinternal TCP tupleのEndpoint-Independent Mapping、filterは
@@ -84,9 +86,10 @@ ACK/RST/FIN=0だけが作成し、既存sessionではSYN-ACK、data、FIN、RST�
 TCP session idle TTLはdefault/minimumともに2時間4分です。sequence/window/ACK妥当性は追跡
 せず、FIN/RSTもsessionを削除・短縮せず通常のsuccessful TX requestとしてTTLだけをrefresh
 します。この保守的な単一timer profile、recommended EIF/ADFより厳しいconnection-dependent
-filter、fragment/hairpin/embedded ICMP/PMTU未実装を明示し、RFC 5382全体への準拠は主張
-しません。UDP-only/TCP-only wrapperは他方のprotocolがdomainをcrossするとfail closedにし、
-combined wrapperはinside/outside/public realm一致を要求します。
+filter、fragment/hairpin未実装を明示し、RFC 5382全体への準拠は主張しません。TCPもpolicyで
+opt-inしたType 3/Code 4だけ、引用public source portとexact live remote address/port sessionを
+read-only参照してinsideへ変換します。UDP-only/TCP-only wrapperは他方のprotocolがdomainを
+crossするとfail closedにし、combined wrapperはinside/outside/public realm一致を要求します。
 
 ## 開発
 
