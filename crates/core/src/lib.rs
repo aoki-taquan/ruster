@@ -18,15 +18,18 @@ pub use generated::{
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,
     GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion,
 };
-pub use io::{BatchCompletion, PacketBatch, PacketIo, PacketLease, PacketSlot, SlotCompletion};
+pub use io::{
+    BatchCompletion, ConsumeReason, PacketBatch, PacketIo, PacketLease, PacketSlot, SlotCompletion,
+};
 pub use packet::{
-    validate_arp_request, validate_ipv4_frame, MacAddress, ValidatedArpRequest, ValidatedIpv4,
-    ARP_ETHERTYPE, ETHERNET_HEADER_LEN, IPV4_ETHERTYPE,
+    validate_arp, validate_arp_request, validate_ipv4_frame, ArpOpcode, MacAddress, ValidatedArp,
+    ValidatedArpRequest, ValidatedIpv4, ARP_ETHERTYPE, ETHERNET_HEADER_LEN, IPV4_ETHERTYPE,
 };
 pub use resolution::{
-    execute_one_arp_request, ArpRequestAction, ArpRequestBuildError, ExecuteArpRequestError,
-    GeneratedArpReport, GeneratedArpTrace, GeneratedTraceSink, MonotonicMillis, NoGeneratedTrace,
-    ResolutionActionSlot, ResolutionCounters, ResolutionPolicy, ResolutionPolicyError,
-    ResolutionResult, ResolutionRuntime, ResolutionStateSlot, ARP_REQUEST_FRAME_LEN,
+    execute_one_arp_request, ArpRequestAction, ArpRequestBuildError, ControlDisposition,
+    DynamicNeighborSlot, ExecuteArpRequestError, GeneratedArpReport, GeneratedArpTrace,
+    GeneratedTraceSink, MonotonicMillis, NoGeneratedTrace, ResolutionActionSlot,
+    ResolutionCounters, ResolutionPolicy, ResolutionPolicyError, ResolutionResult,
+    ResolutionRuntime, ResolutionStateSlot, StaticReconcileReport, ARP_REQUEST_FRAME_LEN,
 };
 pub use route::{IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route, RouteError};

@@ -113,6 +113,13 @@ impl Route {
         let mask = prefix_mask(self.prefix_len).expect("Route::new validates prefix length");
         address.0 == self.prefix.0 | !mask
     }
+
+    pub(crate) fn is_connected_network_address(self, address: Ipv4Address) -> bool {
+        self.next_hop.is_none()
+            && self.prefix_len <= 30
+            && self.matches(address)
+            && address == self.prefix
+    }
 }
 
 pub(crate) fn lookup(routes: &[Route], destination: Ipv4Address) -> Option<Route> {

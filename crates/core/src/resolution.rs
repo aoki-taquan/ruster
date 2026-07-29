@@ -14,12 +14,14 @@ pub struct MonotonicMillis(pub u64);
 pub enum ResolutionPolicyError {
     IntervalTooShort,
     StateTtlTooShort,
+    DynamicNeighborTtlZero,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolutionPolicy {
     interval_ms: u64,
     state_ttl_ms: u64,
+    dynamic_neighbor_ttl_ms: u64,
 }
 
 impl ResolutionPolicy {
@@ -33,7 +35,21 @@ impl ResolutionPolicy {
         Ok(Self {
             interval_ms,
             state_ttl_ms,
+            dynamic_neighbor_ttl_ms: 60_000,
         })
+    }
+
+    pub fn with_dynamic_neighbor_ttl(
+        interval_ms: u64,
+        state_ttl_ms: u64,
+        dynamic_neighbor_ttl_ms: u64,
+    ) -> Result<Self, ResolutionPolicyError> {
+        let mut policy = Self::new(interval_ms, state_ttl_ms)?;
+        if dynamic_neighbor_ttl_ms == 0 {
+            return Err(ResolutionPolicyError::DynamicNeighborTtlZero);
+        }
+        policy.dynamic_neighbor_ttl_ms = dynamic_neighbor_ttl_ms;
+        Ok(policy)
     }
 }
 
@@ -89,6 +105,52 @@ impl ResolutionStateSlot {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DynamicNeighborSlot {
+    interface: IfId,
+    target: Ipv4Address,
+    mac: MacAddress,
+    refreshed_at: MonotonicMillis,
+    occupied: bool,
+}
+
+impl DynamicNeighborSlot {
+    pub const EMPTY: Self = Self {
+        interface: IfId(0),
+        target: Ipv4Address::from_octets([0; 4]),
+        mac: MacAddress([0; 6]),
+        refreshed_at: MonotonicMillis(0),
+        occupied: false,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DynamicLookup {
+    Hit(MacAddress),
+    Miss,
+    ClockRegression,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlDisposition {
+    Inserted,
+    Updated,
+    Ignored,
+    StaticPreserved,
+    CacheFull,
+    Probe,
+    SenderNotHost,
+    LocalAddressPreserved,
+    ClockRegression,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct StaticReconcileReport {
+    pub dynamic_removed: usize,
+    pub states_removed: usize,
+    pub actions_removed: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolutionResult {
     Queued,
     Suppressed,
@@ -124,6 +186,7 @@ pub struct ResolutionRuntime<'a> {
     policy: ResolutionPolicy,
     states: &'a mut [ResolutionStateSlot],
     actions: &'a mut [ResolutionActionSlot],
+    dynamic_neighbors: &'a mut [DynamicNeighborSlot],
     head: usize,
     len: usize,
     last_now: Option<MonotonicMillis>,
@@ -138,18 +201,73 @@ impl<'a> ResolutionRuntime<'a> {
         states: &'a mut [ResolutionStateSlot],
         action_storage: &'a mut [ResolutionActionSlot],
     ) -> Self {
+        Self::with_dynamic_neighbors(policy, states, action_storage, &mut [])
+    }
+
+    #[must_use]
+    pub fn with_dynamic_neighbors(
+        policy: ResolutionPolicy,
+        states: &'a mut [ResolutionStateSlot],
+        action_storage: &'a mut [ResolutionActionSlot],
+        dynamic_neighbors: &'a mut [DynamicNeighborSlot],
+    ) -> Self {
         states.fill(ResolutionStateSlot::EMPTY);
         action_storage.fill(ResolutionActionSlot::EMPTY);
+        dynamic_neighbors.fill(DynamicNeighborSlot::EMPTY);
         Self {
             policy,
             states,
             actions: action_storage,
+            dynamic_neighbors,
             head: 0,
             len: 0,
             last_now: None,
             counters: ResolutionCounters::default(),
             _worker_local: PhantomData,
         }
+    }
+
+    #[must_use]
+    pub fn dynamic_neighbor_count(&self) -> usize {
+        self.dynamic_neighbors
+            .iter()
+            .filter(|slot| slot.occupied)
+            .count()
+    }
+
+    /// Removes worker-local state shadowed by a newly published static set.
+    ///
+    /// The owner must call this on the same worker tick that publishes the
+    /// corresponding immutable forwarding snapshot, before processing another
+    /// packet with that snapshot.
+    pub fn reconcile_static(&mut self, neighbors: &[crate::Neighbor]) -> StaticReconcileReport {
+        let mut report = StaticReconcileReport::default();
+        for slot in &mut *self.dynamic_neighbors {
+            if slot.occupied
+                && neighbors.iter().any(|neighbor| {
+                    neighbor.interface == slot.interface && neighbor.target == slot.target
+                })
+            {
+                *slot = DynamicNeighborSlot::EMPTY;
+                report.dynamic_removed += 1;
+            }
+        }
+        for state in &mut *self.states {
+            if state.occupied
+                && neighbors.iter().any(|neighbor| {
+                    neighbor.interface == state.key.egress && neighbor.target == state.key.target
+                })
+            {
+                *state = ResolutionStateSlot::EMPTY;
+                report.states_removed += 1;
+            }
+        }
+        report.actions_removed = self.compact_actions(|action| {
+            neighbors.iter().any(|neighbor| {
+                neighbor.interface == action.egress && neighbor.target == action.target_ip
+            })
+        });
+        report
     }
 
     #[must_use]
@@ -168,11 +286,9 @@ impl<'a> ResolutionRuntime<'a> {
         now: MonotonicMillis,
         directed_broadcast: bool,
     ) -> ResolutionResult {
-        if self.last_now.is_some_and(|last| now < last) {
-            self.counters.clock_regressions += 1;
+        if !self.observe_now(now) {
             return ResolutionResult::ClockRegression;
         }
-        self.last_now = Some(now);
         if directed_broadcast
             || action.target_ip == action.source_ip
             || forbidden_target(action.target_ip)
@@ -224,6 +340,132 @@ impl<'a> ResolutionRuntime<'a> {
         self.enqueue_at(index, action)
     }
 
+    pub(crate) fn lookup_dynamic(
+        &mut self,
+        interface: IfId,
+        target: Ipv4Address,
+        now: MonotonicMillis,
+    ) -> DynamicLookup {
+        if !self.observe_now(now) {
+            return DynamicLookup::ClockRegression;
+        }
+        let Some(slot) = self
+            .dynamic_neighbors
+            .iter_mut()
+            .find(|slot| slot.occupied && slot.interface == interface && slot.target == target)
+        else {
+            return DynamicLookup::Miss;
+        };
+        if now.0 - slot.refreshed_at.0 >= self.policy.dynamic_neighbor_ttl_ms {
+            *slot = DynamicNeighborSlot::EMPTY;
+            DynamicLookup::Miss
+        } else {
+            DynamicLookup::Hit(slot.mac)
+        }
+    }
+
+    pub(crate) fn merge_dynamic(
+        &mut self,
+        interface: IfId,
+        sender: Ipv4Address,
+        mac: MacAddress,
+        allow_insert: bool,
+        static_key: bool,
+        now: MonotonicMillis,
+    ) -> ControlDisposition {
+        if !self.observe_now(now) {
+            return ControlDisposition::ClockRegression;
+        }
+        if static_key {
+            self.reconcile_static_key(interface, sender);
+            return ControlDisposition::StaticPreserved;
+        }
+        if let Some(index) = self
+            .dynamic_neighbors
+            .iter()
+            .position(|slot| slot.occupied && slot.interface == interface && slot.target == sender)
+        {
+            if now.0 - self.dynamic_neighbors[index].refreshed_at.0
+                < self.policy.dynamic_neighbor_ttl_ms
+            {
+                self.dynamic_neighbors[index].mac = mac;
+                self.dynamic_neighbors[index].refreshed_at = now;
+                self.clear_resolution(interface, sender);
+                return ControlDisposition::Updated;
+            }
+            self.dynamic_neighbors[index] = DynamicNeighborSlot::EMPTY;
+        }
+        if !allow_insert {
+            return ControlDisposition::Ignored;
+        }
+        let reusable = self.dynamic_neighbors.iter().position(|slot| {
+            !slot.occupied || now.0 - slot.refreshed_at.0 >= self.policy.dynamic_neighbor_ttl_ms
+        });
+        let Some(index) = reusable else {
+            return ControlDisposition::CacheFull;
+        };
+        self.dynamic_neighbors[index] = DynamicNeighborSlot {
+            interface,
+            target: sender,
+            mac,
+            refreshed_at: now,
+            occupied: true,
+        };
+        self.clear_resolution(interface, sender);
+        ControlDisposition::Inserted
+    }
+
+    fn observe_now(&mut self, now: MonotonicMillis) -> bool {
+        if self.last_now.is_some_and(|last| now < last) {
+            self.counters.clock_regressions += 1;
+            return false;
+        }
+        self.last_now = Some(now);
+        true
+    }
+
+    pub(crate) fn observe_control(&mut self, now: MonotonicMillis) -> bool {
+        self.observe_now(now)
+    }
+
+    fn clear_resolution(&mut self, interface: IfId, target: Ipv4Address) {
+        for state in &mut *self.states {
+            if state.occupied && state.key.egress == interface && state.key.target == target {
+                *state = ResolutionStateSlot::EMPTY;
+            }
+        }
+        self.compact_actions(|action| action.egress == interface && action.target_ip == target);
+    }
+
+    fn reconcile_static_key(&mut self, interface: IfId, target: Ipv4Address) {
+        for slot in &mut *self.dynamic_neighbors {
+            if slot.occupied && slot.interface == interface && slot.target == target {
+                *slot = DynamicNeighborSlot::EMPTY;
+            }
+        }
+        self.clear_resolution(interface, target);
+    }
+
+    fn compact_actions(&mut self, remove: impl Fn(ArpRequestAction) -> bool) -> usize {
+        if self.actions.is_empty() {
+            return 0;
+        }
+        let old_len = self.len;
+        let mut retained = 0;
+        for read in 0..old_len {
+            let read_index = (self.head + read) % self.actions.len();
+            let queued = self.actions[read_index].0.take().expect("queued action");
+            if remove(queued.action) {
+                continue;
+            }
+            let write_index = (self.head + retained) % self.actions.len();
+            self.actions[write_index].0 = Some(queued);
+            retained += 1;
+        }
+        self.len = retained;
+        old_len - retained
+    }
+
     fn enqueue_at(&mut self, index: usize, action: ArpRequestAction) -> ResolutionResult {
         if self.len == self.actions.len() {
             self.counters.action_full += 1;
@@ -244,12 +486,7 @@ impl<'a> ResolutionRuntime<'a> {
     }
 
     fn execution_time_valid(&mut self, now: MonotonicMillis) -> bool {
-        if self.last_now.is_some_and(|last| now < last) {
-            self.counters.clock_regressions += 1;
-            return false;
-        }
-        self.last_now = Some(now);
-        true
+        self.observe_now(now)
     }
 
     fn committed(&mut self, queued: QueuedAction, now: MonotonicMillis) {
