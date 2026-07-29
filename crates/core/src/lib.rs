@@ -13,7 +13,9 @@ mod route;
 
 pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
 pub use forwarding::{
-    forward_batch, forward_batch_with_nat44_udp, forward_batch_with_nat44_udp_and_icmpv4_errors,
+    forward_batch, forward_batch_with_nat44_tcp, forward_batch_with_nat44_tcp_and_icmpv4_errors,
+    forward_batch_with_nat44_udp, forward_batch_with_nat44_udp_and_icmpv4_errors,
+    forward_batch_with_nat44_udp_and_tcp, forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors,
     forward_batch_with_resolution, forward_batch_with_resolution_and_icmpv4_errors, BatchReport,
     DropReason, ForwardingSnapshot, Ipv4OriginPolicy, Ipv4OriginPolicyError, NoTrace,
     SnapshotError, TraceEvent, TraceSink,
@@ -36,9 +38,12 @@ pub use io::{
     BatchCompletion, ConsumeReason, PacketBatch, PacketIo, PacketLease, PacketSlot, SlotCompletion,
 };
 pub use nat44::{
-    Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpCounters, Nat44UdpDisposition,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError,
-    Nat44UdpReconcileReport, Nat44UdpRuntime, NAT44_UDP_DEFAULT_IDLE_TTL_MS,
+    Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpCounters, Nat44TcpDisposition,
+    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpReconcileReport,
+    Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpCounters,
+    Nat44UdpDisposition, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
+    Nat44UdpPolicyError, Nat44UdpReconcileReport, Nat44UdpRuntime, NAT44_TCP_DEFAULT_IDLE_TTL_MS,
+    NAT44_TCP_MAX_IDLE_TTL_MS, NAT44_TCP_MIN_IDLE_TTL_MS, NAT44_UDP_DEFAULT_IDLE_TTL_MS,
     NAT44_UDP_MAX_IDLE_TTL_MS, NAT44_UDP_MIN_IDLE_TTL_MS,
 };
 pub use packet::{

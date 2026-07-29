@@ -392,9 +392,65 @@ translated IPv4 address wordsとportを更新し、算術結果zeroをUDP wire�
 します。入力nonzero checksumを新規にfull validationしないrouter profileです。IPv4 IDは
 RFC 6864 atomic datagramとして保存します。
 
-fragment handling/reassembly、hairpinning、ICMP error translationとPMTU、TCP/ICMP query
+fragment handling/reassembly、hairpinning、ICMP error translationとPMTU、ICMP query
 NAT、static port forward、複数public address、port randomization/parity、full packet
 filter/firewallはdeferredです。RFC 3022/4787/7857の全機能準拠は主張しません。
+
+## Outbound-initiated TCP NAT44/NAPT vertical slice
+
+TCP serviceはRFC 3022のtraditional NAPT tuple rewrite、RFC 5382/7857のtimerとmapping/filter
+用語、RFC 9293のTCP header、RFC 1624のincremental checksum、RFC 6864のatomic datagram
+profileを参照する限定実装です。RFC 5382全体への準拠は主張しません。
+
+`Nat44TcpRuntime`はUDP runtimeとstorage、generation、watermark、allocatorを共有しない
+`!Send + !Sync` worker-local ownerです。mapping keyは
+`(inside IfId, internal IPv4, internal TCP port)`、session keyは
+`(mapping slot, mapping generation, remote IPv4, remote TCP port)`です。複数remote sessionは
+同じpublic tupleを再利用しますが、inbound filterはremote address/portのexact matchであり、
+RFC 5382が推奨するEndpoint-Independent FilteringやAddress-Dependent Filteringより厳しい
+connection-dependent local policyです。protocol-dependent tableなのでUDPとTCPは同じ数値
+public portを同時に所有できます。
+
+新mapping/sessionを作れるpacketはinsideからoutsideへ向かうSYN=1、ACK=0、RST=0、FIN=0
+だけです。ECE/CWR、TCP options、SYN dataは許可します。既存exact sessionではflagによる
+phase遷移を行わず、SYN retransmit、inbound exact SYN（basic simultaneous open）、
+SYN-ACK、ACK/data、FIN、RSTを同じ規則で変換します。sequence number、receive window、
+ACK妥当性を追跡しないため、flagだけを信頼したFIN/RST cleanupは安全ではありません。
+このため全sessionはdefault/minimum 7,440,000ms（2時間4分）、設定上限7日間の単一idle
+timerを使い、FIN/RSTも削除・短縮せずsuccessful TX request時にexact sessionをrefresh
+するだけです。unmatched inboundはrefreshしません。exact boundaryでsessionがexpireし、
+最後のlive linked sessionが無くなったmapping/public portだけが再利用可能です。
+
+admissionとtransaction順はUDP profileに合わせ、次を追加します。
+
+1. IHL=5、DF=1/MF=0/offset=0、protocol=6、IPv4 payload 20 bytes以上を要求する。
+2. TCP Data Offsetは5以上かつheader endがIPv4 Total Length内であることを要求する。
+3. pseudo-headerとIPv4 TCP payload全体（odd final byteはlogical zero pad）を含むincoming
+   TCP checksumをfull validationする。TCP checksum field zeroも無効化表現ではなく、
+   full checksumがvalidな場合だけ受理する。
+4. outboundはoriginal LPM/TTL/outside neighborとsource reverse authority、inboundは
+   public mapping/exact session後のinside route/neighborをstate commit前に確定する。
+5. L2、TTL、IPv4 address、TCP port、IPv4/TCP checksumをplanしてin-place applyし、
+   mapping/sessionをinfallible commitしてからTX requestする。backend rejectでも
+   TX-request済みstateは残す。
+
+TCP checksumはRFC 1624でpseudo-header address wordsとportを更新します。UDPと異なり
+checksum zero保存や算術zeroの`0xffff` normalizationは行わず、数学的結果zeroはwire zeroの
+ままです。options/data、IPv4 Total Length内のTCP payload、Total Length後のlink paddingを
+保存します。capacity/port exhaustion、malformed/checksum/source/authority/route/TTL/neighbor
+failureはpacket bytesとmapping/sessionを変更せず、非退行clock watermarkだけを観測します。
+generationは再利用mappingからstale sessionを切り離します。live state evictionとport
+overloadは行いません。
+
+UDP-only serviceはTCP domain crossingを、TCP-only serviceはUDP domain crossingをfail
+closedにします。combined serviceはinside/outside/public IPv4 realmが完全一致しなければ
+両protocolをfail closedにし、各runtime stateは独立してdispatchします。ICMPはどちらの
+runtimeも変更しません。outside→inside direct LPM bypass、runtime/config/snapshot mismatch、
+hairpinはneighbor処理やstate変更より前にtyped dropします。
+
+TCP fragment association/reassembly、hairpin translation、embedded ICMP error/PMTU translation、
+static forwards、sequence/window validation、full RFC 5382 lifecycle、safe FIN/RST cleanupは
+deferredです。
 
 eager dynamic-cache scan/flush、unresolved packet hold queue、gratuitous ARP生成、
 ARP Probe/Announcement生成、proxy ARP、VLAN、Address Conflict Detection、実装済み

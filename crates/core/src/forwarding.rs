@@ -1,12 +1,15 @@
-use crate::nat44::{Nat44UdpInboundPlan, Nat44UdpOutboundPlan, Nat44UdpPlanError};
+use crate::nat44::{
+    Nat44TcpInboundPlan, Nat44TcpOutboundPlan, Nat44TcpPlanError, Nat44UdpInboundPlan,
+    Nat44UdpOutboundPlan, Nat44UdpPlanError,
+};
 use crate::resolution::DynamicLookup;
 use crate::{
     packet, rfc1624_update, route, validate_arp, validate_ipv4_frame, ArpOpcode, ArpRequestAction,
     BatchCompletion, ConsumeReason, ControlDisposition, Icmpv4ErrorAction, Icmpv4ErrorDisposition,
     Icmpv4ErrorKind, Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface,
-    LocalIpv4Binding, MonotonicMillis, Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime,
-    Neighbor, PacketBatch, ResolutionResult, ResolutionRuntime, Route, ARP_ETHERTYPE,
-    IPV4_ETHERTYPE,
+    LocalIpv4Binding, MonotonicMillis, Nat44TcpConfig, Nat44TcpDisposition, Nat44TcpRuntime,
+    Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, ResolutionResult,
+    ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,6 +69,28 @@ pub enum DropReason {
     Nat44UdpWrongIngress = 51,
     Nat44UdpWrongEgress = 52,
     Nat44ExternalToInternalBypass = 53,
+    Nat44TcpRuntimeUnavailable = 54,
+    Nat44TcpConfigMismatch = 55,
+    Nat44TcpUnsupportedTransport = 56,
+    Nat44TcpHairpinUnsupported = 57,
+    Nat44TcpNonAtomicIpv4Unsupported = 58,
+    Nat44TcpHeaderTruncated = 59,
+    Nat44TcpDataOffsetTooSmall = 60,
+    Nat44TcpDataOffsetExceedsIpv4Payload = 61,
+    Nat44TcpChecksumInvalid = 62,
+    Nat44TcpSourcePortZero = 63,
+    Nat44TcpSourceForbidden = 64,
+    Nat44TcpReverseAuthorityMismatch = 65,
+    Nat44TcpMappingMiss = 66,
+    Nat44TcpSessionMiss = 67,
+    Nat44TcpInvalidInitialFlags = 68,
+    Nat44TcpMappingTableFull = 69,
+    Nat44TcpSessionTableFull = 70,
+    Nat44TcpPortExhausted = 71,
+    Nat44TcpClockRegression = 72,
+    Nat44TcpWrongIngress = 73,
+    Nat44TcpWrongEgress = 74,
+    Nat44CombinedRealmMismatch = 75,
 }
 
 use DropReason::*;
@@ -127,6 +152,28 @@ impl DropReason {
             Nat44UdpWrongIngress => "NAT44_UDP_WRONG_INGRESS",
             Nat44UdpWrongEgress => "NAT44_UDP_WRONG_EGRESS",
             Nat44ExternalToInternalBypass => "NAT44_EXTERNAL_TO_INTERNAL_BYPASS",
+            Nat44TcpRuntimeUnavailable => "NAT44_TCP_RUNTIME_UNAVAILABLE",
+            Nat44TcpConfigMismatch => "NAT44_TCP_CONFIG_MISMATCH",
+            Nat44TcpUnsupportedTransport => "NAT44_TCP_UNSUPPORTED_TRANSPORT",
+            Nat44TcpHairpinUnsupported => "NAT44_TCP_HAIRPIN_UNSUPPORTED",
+            Nat44TcpNonAtomicIpv4Unsupported => "NAT44_TCP_NON_ATOMIC_IPV4_UNSUPPORTED",
+            Nat44TcpHeaderTruncated => "NAT44_TCP_HEADER_TRUNCATED",
+            Nat44TcpDataOffsetTooSmall => "NAT44_TCP_DATA_OFFSET_TOO_SMALL",
+            Nat44TcpDataOffsetExceedsIpv4Payload => "NAT44_TCP_DATA_OFFSET_EXCEEDS_IPV4_PAYLOAD",
+            Nat44TcpChecksumInvalid => "NAT44_TCP_CHECKSUM_INVALID",
+            Nat44TcpSourcePortZero => "NAT44_TCP_SOURCE_PORT_ZERO",
+            Nat44TcpSourceForbidden => "NAT44_TCP_SOURCE_FORBIDDEN",
+            Nat44TcpReverseAuthorityMismatch => "NAT44_TCP_REVERSE_AUTHORITY_MISMATCH",
+            Nat44TcpMappingMiss => "NAT44_TCP_MAPPING_MISS",
+            Nat44TcpSessionMiss => "NAT44_TCP_SESSION_MISS",
+            Nat44TcpInvalidInitialFlags => "NAT44_TCP_INVALID_INITIAL_FLAGS",
+            Nat44TcpMappingTableFull => "NAT44_TCP_MAPPING_TABLE_FULL",
+            Nat44TcpSessionTableFull => "NAT44_TCP_SESSION_TABLE_FULL",
+            Nat44TcpPortExhausted => "NAT44_TCP_PORT_EXHAUSTED",
+            Nat44TcpClockRegression => "NAT44_TCP_CLOCK_REGRESSION",
+            Nat44TcpWrongIngress => "NAT44_TCP_WRONG_INGRESS",
+            Nat44TcpWrongEgress => "NAT44_TCP_WRONG_EGRESS",
+            Nat44CombinedRealmMismatch => "NAT44_COMBINED_REALM_MISMATCH",
         }
     }
 }
@@ -384,6 +431,10 @@ pub enum TraceEvent {
         ingress: IfId,
         disposition: Nat44UdpDisposition,
     },
+    Nat44Tcp {
+        ingress: IfId,
+        disposition: Nat44TcpDisposition,
+    },
     Dropped {
         ingress: IfId,
         reason: DropReason,
@@ -470,6 +521,12 @@ enum Nat44UdpTransition {
 }
 
 #[derive(Clone, Copy)]
+enum Nat44TcpTransition {
+    Outbound(Nat44TcpOutboundPlan),
+    Inbound(Nat44TcpInboundPlan),
+}
+
+#[derive(Clone, Copy)]
 struct Nat44UdpRewriteDecision {
     forwarding: Ipv4RewriteDecision,
     address_offset: usize,
@@ -487,9 +544,27 @@ struct Nat44UdpRewriteDecision {
 }
 
 #[derive(Clone, Copy)]
+struct Nat44TcpRewriteDecision {
+    forwarding: Ipv4RewriteDecision,
+    address_offset: usize,
+    address_end: usize,
+    new_address: [u8; 4],
+    port_offset: usize,
+    port_end: usize,
+    new_port: u16,
+    tcp_checksum_offset: usize,
+    tcp_checksum_end: usize,
+    ipv4_checksum: u16,
+    tcp_checksum: u16,
+    transition: Nat44TcpTransition,
+    disposition: Nat44TcpDisposition,
+}
+
+#[derive(Clone, Copy)]
 enum PacketDecision {
     Ipv4(Ipv4RewriteDecision),
     Nat44Udp(Nat44UdpRewriteDecision),
+    Nat44Tcp(Nat44TcpRewriteDecision),
     ArpReply(ArpReplyDecision),
     Icmpv4EchoReply(Icmpv4EchoReplyDecision),
     ConsumeArp(ControlDisposition),
@@ -501,6 +576,7 @@ impl PacketDecision {
         match self {
             Self::Ipv4(decision) => decision.egress,
             Self::Nat44Udp(decision) => decision.forwarding.egress,
+            Self::Nat44Tcp(decision) => decision.forwarding.egress,
             Self::ArpReply(decision) => decision.egress,
             Self::Icmpv4EchoReply(decision) => decision.egress,
             Self::ConsumeArp(_) | Self::ConsumeIpv4Local => {
@@ -519,7 +595,7 @@ where
     B: PacketBatch,
     T: TraceSink,
 {
-    forward_batch_inner(batch, snapshot, None, None, None, None, trace)
+    forward_batch_inner(batch, snapshot, None, None, None, None, None, None, trace)
 }
 
 /// Forwards RX packets and queues resolution actions without allocating TX
@@ -539,6 +615,8 @@ where
         batch,
         snapshot,
         Some((runtime, now)),
+        None,
+        None,
         None,
         None,
         None,
@@ -567,6 +645,8 @@ where
         snapshot,
         Some((resolution, now)),
         Some((icmpv4_errors, now)),
+        None,
+        None,
         None,
         None,
         trace,
@@ -600,6 +680,8 @@ where
         None,
         Some(config),
         nat44_udp,
+        None,
+        None,
         trace,
     )
 }
@@ -632,10 +714,130 @@ where
         Some((icmpv4_errors, now)),
         Some(config),
         nat44_udp,
+        None,
+        None,
         trace,
     )
 }
 
+/// Runs one outbound-initiated TCP NAPT domain with ARP resolution.
+pub fn forward_batch_with_nat44_tcp<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    config: &Nat44TcpConfig,
+    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        None,
+        None,
+        None,
+        Some(config),
+        nat44_tcp,
+        trace,
+    )
+}
+
+/// Composes TCP NAPT with generated ICMPv4 errors in one RX phase.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_with_nat44_tcp_and_icmpv4_errors<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    config: &Nat44TcpConfig,
+    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        Some((icmpv4_errors, now)),
+        None,
+        None,
+        Some(config),
+        nat44_tcp,
+        trace,
+    )
+}
+
+/// Runs independent UDP and TCP NAPT state for one matching address realm.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_with_nat44_udp_and_tcp<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    udp_config: &Nat44UdpConfig,
+    nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+    tcp_config: &Nat44TcpConfig,
+    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        None,
+        Some(udp_config),
+        nat44_udp,
+        Some(tcp_config),
+        nat44_tcp,
+        trace,
+    )
+}
+
+/// Full UDP/TCP NAPT and generated ICMPv4-error composition.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    udp_config: &Nat44UdpConfig,
+    nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+    tcp_config: &Nat44TcpConfig,
+    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        Some((icmpv4_errors, now)),
+        Some(udp_config),
+        nat44_udp,
+        Some(tcp_config),
+        nat44_tcp,
+        trace,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn forward_batch_inner<B, T>(
     mut batch: B,
     snapshot: &ForwardingSnapshot<'_>,
@@ -643,6 +845,8 @@ fn forward_batch_inner<B, T>(
     mut icmpv4_errors: Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     nat44_udp_config: Option<&Nat44UdpConfig>,
     mut nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+    nat44_tcp_config: Option<&Nat44TcpConfig>,
+    mut nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
 where
@@ -667,6 +871,8 @@ where
                 &mut icmpv4_errors,
                 nat44_udp_config,
                 &mut nat44_udp,
+                nat44_tcp_config,
+                &mut nat44_tcp,
                 trace,
             )
             .and_then(|decision| {
@@ -713,6 +919,23 @@ where
                         }
                     }
                     trace.record(TraceEvent::Nat44Udp {
+                        ingress,
+                        disposition: nat.disposition,
+                    });
+                }
+                if let PacketDecision::Nat44Tcp(nat) = decision {
+                    let runtime = nat44_tcp
+                        .as_deref_mut()
+                        .expect("TCP NAT decision requires a bound runtime");
+                    match nat.transition {
+                        Nat44TcpTransition::Outbound(plan) => {
+                            runtime.commit_outbound(plan, nat_now_ms);
+                        }
+                        Nat44TcpTransition::Inbound(plan) => {
+                            runtime.commit_inbound(plan, nat_now_ms);
+                        }
+                    }
+                    trace.record(TraceEvent::Nat44Tcp {
                         ingress,
                         disposition: nat.disposition,
                     });
@@ -765,6 +988,8 @@ fn decide<T: TraceSink>(
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     nat44_udp_config: Option<&Nat44UdpConfig>,
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
+    nat44_tcp_config: Option<&Nat44TcpConfig>,
+    nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     let ether_type = packet::read_u16(frame, 12).ok_or(EthernetHeaderTruncated)?;
@@ -777,6 +1002,8 @@ fn decide<T: TraceSink>(
             icmpv4_errors,
             nat44_udp_config,
             nat44_udp,
+            nat44_tcp_config,
+            nat44_tcp,
             trace,
         ),
         ARP_ETHERTYPE => decide_arp(frame, snapshot, ingress, resolution, trace),
@@ -793,6 +1020,8 @@ fn decide_ipv4<T: TraceSink>(
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     nat44_udp_config: Option<&Nat44UdpConfig>,
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
+    nat44_tcp_config: Option<&Nat44TcpConfig>,
+    nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     let ipv4 = validate_ipv4_frame(frame)?;
@@ -800,36 +1029,72 @@ fn decide_ipv4<T: TraceSink>(
         ingress,
         destination: ipv4.destination,
     });
-    if let Some(config) = nat44_udp_config {
-        if ingress == config.inside() && ipv4.destination == config.public_address() {
-            observe_nat_candidate_if_present(
-                snapshot,
-                config,
-                nat44_udp,
-                resolution
-                    .as_ref()
-                    .map_or(MonotonicMillis(0), |(_, now)| *now),
+    let nat_now = resolution
+        .as_ref()
+        .map_or(MonotonicMillis(0), |(_, now)| *now);
+    if let (Some(udp), Some(tcp)) = (nat44_udp_config, nat44_tcp_config) {
+        if !tcp.realm_matches_udp(*udp) {
+            if let Some(runtime) = nat44_udp.as_deref_mut() {
+                runtime.record_config_mismatch();
+            }
+            if let Some(runtime) = nat44_tcp.as_deref_mut() {
+                runtime.record_config_mismatch();
+            }
+            trace.record(TraceEvent::Nat44Tcp {
                 ingress,
-                trace,
+                disposition: Nat44TcpDisposition::ConfigMismatch,
+            });
+            return Err(Nat44CombinedRealmMismatch);
+        }
+    }
+    if let Some(config) = nat44_tcp_config {
+        if ipv4.protocol == 6
+            && (ingress == config.inside() || ipv4.destination == config.public_address())
+        {
+            observe_nat44_tcp_candidate_if_present(
+                snapshot, config, nat44_tcp, nat_now, ingress, trace,
             )?;
+        }
+    }
+    if let Some(config) = nat44_udp_config {
+        if ingress == config.inside()
+            && ipv4.destination == config.public_address()
+            && (ipv4.protocol == 17 || (ipv4.protocol == 6 && nat44_tcp_config.is_none()))
+        {
+            observe_nat_candidate_if_present(snapshot, config, nat44_udp, nat_now, ingress, trace)?;
             return nat44_udp_drop(ingress, Nat44UdpHairpinUnsupported, trace);
         }
         if ipv4.destination == config.public_address() && ipv4.protocol == 17 {
             if ingress != config.outside() {
                 observe_nat_candidate_if_present(
-                    snapshot,
-                    config,
-                    nat44_udp,
-                    resolution
-                        .as_ref()
-                        .map_or(MonotonicMillis(0), |(_, now)| *now),
-                    ingress,
-                    trace,
+                    snapshot, config, nat44_udp, nat_now, ingress, trace,
                 )?;
                 return nat44_udp_drop(ingress, Nat44UdpWrongIngress, trace);
             }
             return decide_nat44_udp_inbound(
                 frame, snapshot, ingress, ipv4, resolution, config, nat44_udp, trace,
+            );
+        }
+    }
+    if let Some(config) = nat44_tcp_config {
+        if ingress == config.inside()
+            && ipv4.destination == config.public_address()
+            && (ipv4.protocol == 6 || (ipv4.protocol == 17 && nat44_udp_config.is_none()))
+        {
+            observe_nat44_tcp_candidate_if_present(
+                snapshot, config, nat44_tcp, nat_now, ingress, trace,
+            )?;
+            return nat44_tcp_drop(ingress, Nat44TcpHairpinUnsupported, trace);
+        }
+        if ipv4.destination == config.public_address() && ipv4.protocol == 6 {
+            if ingress != config.outside() {
+                observe_nat44_tcp_candidate_if_present(
+                    snapshot, config, nat44_tcp, nat_now, ingress, trace,
+                )?;
+                return nat44_tcp_drop(ingress, Nat44TcpWrongIngress, trace);
+            }
+            return decide_nat44_tcp_inbound(
+                frame, snapshot, ingress, ipv4, resolution, config, nat44_tcp, trace,
             );
         }
     }
@@ -864,10 +1129,17 @@ fn decide_ipv4<T: TraceSink>(
         }
         return Err(RouteMiss);
     };
-    if nat44_udp_config
+    if nat44_udp_config.is_some_and(|config| {
+        ingress == config.outside()
+            && route.egress() == config.inside()
+            && (ipv4.protocol == 17 || nat44_tcp_config.is_none())
+    }) {
+        return nat44_udp_drop(ingress, Nat44ExternalToInternalBypass, trace);
+    }
+    if nat44_tcp_config
         .is_some_and(|config| ingress == config.outside() && route.egress() == config.inside())
     {
-        return nat44_udp_drop(ingress, Nat44ExternalToInternalBypass, trace);
+        return nat44_tcp_drop(ingress, Nat44ExternalToInternalBypass, trace);
     }
     if ipv4.ttl <= 1 {
         if let Some((runtime, now)) = icmpv4_errors.as_mut() {
@@ -993,7 +1265,10 @@ fn decide_ipv4<T: TraceSink>(
         old_checksum: ipv4.checksum,
     };
     if let Some(config) = nat44_udp_config {
-        if ingress == config.inside() && route.egress() == config.outside() {
+        if ingress == config.inside()
+            && route.egress() == config.outside()
+            && (ipv4.protocol == 17 || (ipv4.protocol == 6 && nat44_tcp_config.is_none()))
+        {
             return decide_nat44_udp_outbound(
                 frame,
                 snapshot,
@@ -1008,6 +1283,26 @@ fn decide_ipv4<T: TraceSink>(
                 trace,
             );
         }
+    }
+    if let Some(config) = nat44_tcp_config {
+        if ingress == config.inside()
+            && route.egress() == config.outside()
+            && (ipv4.protocol == 6 || (ipv4.protocol == 17 && nat44_udp_config.is_none()))
+        {
+            return decide_nat44_tcp_outbound(
+                frame, snapshot, ingress, ipv4, forwarding, config, nat44_tcp, nat_now, trace,
+            );
+        }
+    }
+    let crosses_udp = nat44_udp_config
+        .is_some_and(|config| ingress == config.inside() && route.egress() == config.outside());
+    let crosses_tcp = nat44_tcp_config
+        .is_some_and(|config| ingress == config.inside() && route.egress() == config.outside());
+    if crosses_tcp {
+        return nat44_tcp_drop(ingress, Nat44TcpUnsupportedTransport, trace);
+    }
+    if crosses_udp {
+        return nat44_udp_drop(ingress, Nat44UdpUnsupportedTransport, trace);
     }
     Ok(PacketDecision::Ipv4(forwarding))
 }
@@ -1227,6 +1522,395 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn decide_nat44_tcp_outbound<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    ipv4: packet::ValidatedIpv4,
+    forwarding: Ipv4RewriteDecision,
+    config: &Nat44TcpConfig,
+    nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> Result<PacketDecision, DropReason> {
+    let runtime = require_nat44_tcp_runtime(snapshot, config, nat44_tcp, ingress, trace)?;
+    if let Err(error) = runtime.observe_now(now.0) {
+        let (reason, disposition) = nat44_tcp_plan_error(error);
+        trace.record(TraceEvent::Nat44Tcp {
+            ingress,
+            disposition,
+        });
+        return Err(reason);
+    }
+    if ipv4.header_len > 20 {
+        return nat44_tcp_drop(ingress, Ipv4OptionsUnsupported, trace);
+    }
+    if ipv4.protocol != 6 {
+        return nat44_tcp_drop(ingress, Nat44TcpUnsupportedTransport, trace);
+    }
+    if let Err(reason) = validate_nat44_tcp_atomic(frame, ipv4) {
+        return nat44_tcp_drop(ingress, reason, trace);
+    }
+    let tcp = match validate_nat44_tcp(frame, ipv4) {
+        Ok(tcp) => tcp,
+        Err(reason) => return nat44_tcp_drop(ingress, reason, trace),
+    };
+    if tcp.source_port == 0 {
+        return nat44_tcp_drop(ingress, Nat44TcpSourcePortZero, trace);
+    }
+    if !icmp_error_source_is_host(snapshot, ipv4.source)
+        || snapshot
+            .local_ipv4
+            .iter()
+            .any(|binding| binding.address == ipv4.source)
+        || ipv4.source == config.public_address()
+    {
+        return nat44_tcp_drop(ingress, Nat44TcpSourceForbidden, trace);
+    }
+    if route::lookup(snapshot.routes, ipv4.source)
+        .is_none_or(|reverse| reverse.egress() != config.inside())
+    {
+        return nat44_tcp_drop(ingress, Nat44TcpReverseAuthorityMismatch, trace);
+    }
+    let initial_syn = tcp.flags & 0x17 == 0x02;
+    let plan = match runtime.plan_outbound(
+        ipv4.source,
+        tcp.source_port,
+        ipv4.destination,
+        tcp.destination_port,
+        initial_syn,
+        now.0,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            runtime.record_plan_error(error);
+            let (reason, disposition) = nat44_tcp_plan_error(error);
+            trace.record(TraceEvent::Nat44Tcp {
+                ingress,
+                disposition,
+            });
+            return Err(reason);
+        }
+    };
+    build_nat44_tcp_rewrite(
+        ipv4,
+        tcp,
+        forwarding,
+        ipv4.source,
+        config.public_address(),
+        tcp.source_port,
+        plan.public_port(),
+        Nat44TcpTransition::Outbound(plan),
+        plan.disposition(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decide_nat44_tcp_inbound<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    ipv4: packet::ValidatedIpv4,
+    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    config: &Nat44TcpConfig,
+    nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
+    trace: &mut T,
+) -> Result<PacketDecision, DropReason> {
+    let now = resolution
+        .as_ref()
+        .map_or(MonotonicMillis(0), |(_, now)| *now);
+    let runtime = require_nat44_tcp_runtime(snapshot, config, nat44_tcp, ingress, trace)?;
+    if let Err(error) = runtime.observe_now(now.0) {
+        let (reason, disposition) = nat44_tcp_plan_error(error);
+        trace.record(TraceEvent::Nat44Tcp {
+            ingress,
+            disposition,
+        });
+        return Err(reason);
+    }
+    if ipv4.header_len > 20 {
+        return nat44_tcp_drop(ingress, Ipv4OptionsUnsupported, trace);
+    }
+    if let Err(reason) = validate_nat44_tcp_atomic(frame, ipv4) {
+        return nat44_tcp_drop(ingress, reason, trace);
+    }
+    let tcp = match validate_nat44_tcp(frame, ipv4) {
+        Ok(tcp) => tcp,
+        Err(reason) => return nat44_tcp_drop(ingress, reason, trace),
+    };
+    if ipv4.ttl <= 1 {
+        return nat44_tcp_drop(ingress, Ipv4TtlExpired, trace);
+    }
+    if tcp.source_port == 0 {
+        return nat44_tcp_drop(ingress, Nat44TcpSourcePortZero, trace);
+    }
+    if !icmp_error_source_is_host(snapshot, ipv4.source)
+        || snapshot
+            .local_ipv4
+            .iter()
+            .any(|binding| binding.address == ipv4.source)
+    {
+        return nat44_tcp_drop(ingress, Nat44TcpSourceForbidden, trace);
+    }
+    let plan = match runtime.plan_inbound(tcp.destination_port, ipv4.source, tcp.source_port, now.0)
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            runtime.record_plan_error(error);
+            let (reason, disposition) = nat44_tcp_plan_error(error);
+            trace.record(TraceEvent::Nat44Tcp {
+                ingress,
+                disposition,
+            });
+            return Err(reason);
+        }
+    };
+    let internal_address = plan.internal_address();
+    let Some(reverse_route) = route::lookup(snapshot.routes, internal_address) else {
+        return nat44_tcp_drop(ingress, Nat44TcpReverseAuthorityMismatch, trace);
+    };
+    if reverse_route.egress() != config.inside() {
+        return nat44_tcp_drop(ingress, Nat44TcpWrongEgress, trace);
+    }
+    let target = reverse_route.next_hop().unwrap_or(internal_address);
+    let interface = snapshot
+        .interfaces
+        .iter()
+        .find(|interface| interface.id == reverse_route.egress())
+        .ok_or(InterfaceMiss)?;
+    let destination_mac = if let Some(neighbor) = snapshot
+        .neighbors
+        .iter()
+        .find(|neighbor| neighbor.interface == reverse_route.egress() && neighbor.target == target)
+    {
+        neighbor.mac
+    } else if let Some((resolution_runtime, resolution_now)) = resolution.as_mut() {
+        match resolution_runtime.lookup_dynamic(reverse_route.egress(), target, *resolution_now) {
+            DynamicLookup::Hit(mac) => mac,
+            DynamicLookup::ClockRegression => {
+                return nat44_tcp_drop(ingress, NeighborUnresolved, trace);
+            }
+            DynamicLookup::Miss => {
+                if let Some(binding) = snapshot
+                    .local_ipv4
+                    .iter()
+                    .find(|binding| binding.interface == reverse_route.egress())
+                {
+                    let result = resolution_runtime.schedule(
+                        ArpRequestAction {
+                            egress: reverse_route.egress(),
+                            source_mac: interface.mac,
+                            source_ip: binding.address,
+                            target_ip: target,
+                        },
+                        *resolution_now,
+                        false,
+                    );
+                    trace.record(TraceEvent::NeighborResolution {
+                        egress: reverse_route.egress(),
+                        target,
+                        result,
+                    });
+                }
+                return nat44_tcp_drop(ingress, NeighborUnresolved, trace);
+            }
+        }
+    } else {
+        return nat44_tcp_drop(ingress, NeighborUnresolved, trace);
+    };
+    let ttl_offset = ipv4.header_offset + 8;
+    let checksum_offset = ipv4.header_offset + 10;
+    let forwarding = Ipv4RewriteDecision {
+        egress: reverse_route.egress(),
+        source_mac: interface.mac.0,
+        destination_mac: destination_mac.0,
+        ttl_offset,
+        checksum_offset,
+        checksum_end: checksum_offset + 2,
+        old_ttl_protocol: u16::from_be_bytes([ipv4.ttl, ipv4.protocol]),
+        new_ttl_protocol: u16::from_be_bytes([ipv4.ttl - 1, ipv4.protocol]),
+        old_checksum: ipv4.checksum,
+    };
+    trace.record(TraceEvent::Routed {
+        egress: reverse_route.egress(),
+        neighbor_target: target,
+    });
+    build_nat44_tcp_rewrite(
+        ipv4,
+        tcp,
+        forwarding,
+        ipv4.destination,
+        internal_address,
+        tcp.destination_port,
+        plan.internal_port(),
+        Nat44TcpTransition::Inbound(plan),
+        plan.disposition(),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct ValidatedNat44Tcp {
+    offset: usize,
+    source_port: u16,
+    destination_port: u16,
+    checksum: u16,
+    flags: u8,
+}
+
+fn validate_nat44_tcp_atomic(frame: &[u8], ipv4: packet::ValidatedIpv4) -> Result<(), DropReason> {
+    let flags_fragment =
+        packet::read_u16(frame, ipv4.header_offset + 6).ok_or(Ipv4HeaderLengthExceedsPacket)?;
+    if flags_fragment != 0x4000 {
+        return Err(Nat44TcpNonAtomicIpv4Unsupported);
+    }
+    Ok(())
+}
+
+fn validate_nat44_tcp(
+    frame: &[u8],
+    ipv4: packet::ValidatedIpv4,
+) -> Result<ValidatedNat44Tcp, DropReason> {
+    let offset = ipv4
+        .header_offset
+        .checked_add(ipv4.header_len)
+        .ok_or(Nat44TcpHeaderTruncated)?;
+    let ipv4_end = ipv4
+        .header_offset
+        .checked_add(ipv4.total_len)
+        .ok_or(Nat44TcpHeaderTruncated)?;
+    let minimum_end = offset.checked_add(20).ok_or(Nat44TcpHeaderTruncated)?;
+    if minimum_end > ipv4_end || frame.get(offset..minimum_end).is_none() {
+        return Err(Nat44TcpHeaderTruncated);
+    }
+    let data_offset_words = frame[offset + 12] >> 4;
+    if data_offset_words < 5 {
+        return Err(Nat44TcpDataOffsetTooSmall);
+    }
+    let header_len = usize::from(data_offset_words) * 4;
+    if offset
+        .checked_add(header_len)
+        .is_none_or(|header_end| header_end > ipv4_end)
+    {
+        return Err(Nat44TcpDataOffsetExceedsIpv4Payload);
+    }
+    let segment = frame.get(offset..ipv4_end).ok_or(Nat44TcpHeaderTruncated)?;
+    if !tcp_checksum_valid(ipv4.source, ipv4.destination, segment) {
+        return Err(Nat44TcpChecksumInvalid);
+    }
+    Ok(ValidatedNat44Tcp {
+        offset,
+        source_port: packet::read_u16(frame, offset).ok_or(Nat44TcpHeaderTruncated)?,
+        destination_port: packet::read_u16(frame, offset + 2).ok_or(Nat44TcpHeaderTruncated)?,
+        checksum: packet::read_u16(frame, offset + 16).ok_or(Nat44TcpHeaderTruncated)?,
+        flags: frame[offset + 13],
+    })
+}
+
+fn tcp_checksum_valid(
+    source: crate::Ipv4Address,
+    destination: crate::Ipv4Address,
+    segment: &[u8],
+) -> bool {
+    let source = source.octets();
+    let destination = destination.octets();
+    let Ok(length) = u16::try_from(segment.len()) else {
+        return false;
+    };
+    let mut sum = u32::from(u16::from_be_bytes([source[0], source[1]]))
+        + u32::from(u16::from_be_bytes([source[2], source[3]]))
+        + u32::from(u16::from_be_bytes([destination[0], destination[1]]))
+        + u32::from(u16::from_be_bytes([destination[2], destination[3]]))
+        + 6
+        + u32::from(length);
+    let mut chunks = segment.chunks_exact(2);
+    for word in chunks.by_ref() {
+        sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    if let Some(last) = chunks.remainder().first() {
+        sum += u32::from(*last) << 8;
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum == 0xffff
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_nat44_tcp_rewrite(
+    ipv4: packet::ValidatedIpv4,
+    tcp: ValidatedNat44Tcp,
+    forwarding: Ipv4RewriteDecision,
+    old_address: crate::Ipv4Address,
+    new_address: crate::Ipv4Address,
+    old_port: u16,
+    new_port: u16,
+    transition: Nat44TcpTransition,
+    disposition: Nat44TcpDisposition,
+) -> Result<PacketDecision, DropReason> {
+    let outbound = matches!(transition, Nat44TcpTransition::Outbound(_));
+    let address_offset = ipv4
+        .header_offset
+        .checked_add(if outbound { 12 } else { 16 })
+        .ok_or(Ipv4HeaderLengthExceedsPacket)?;
+    let address_end = address_offset
+        .checked_add(4)
+        .ok_or(Ipv4HeaderLengthExceedsPacket)?;
+    let port_offset = tcp
+        .offset
+        .checked_add(if outbound { 0 } else { 2 })
+        .ok_or(Nat44TcpHeaderTruncated)?;
+    let port_end = port_offset.checked_add(2).ok_or(Nat44TcpHeaderTruncated)?;
+    let tcp_checksum_offset = tcp.offset.checked_add(16).ok_or(Nat44TcpHeaderTruncated)?;
+    let tcp_checksum_end = tcp_checksum_offset
+        .checked_add(2)
+        .ok_or(Nat44TcpHeaderTruncated)?;
+    let old_octets = old_address.octets();
+    let new_octets = new_address.octets();
+    let old_high = u16::from_be_bytes([old_octets[0], old_octets[1]]);
+    let old_low = u16::from_be_bytes([old_octets[2], old_octets[3]]);
+    let new_high = u16::from_be_bytes([new_octets[0], new_octets[1]]);
+    let new_low = u16::from_be_bytes([new_octets[2], new_octets[3]]);
+    let ipv4_checksum = rfc1624_update(
+        rfc1624_update(
+            rfc1624_update(
+                forwarding.old_checksum,
+                forwarding.old_ttl_protocol,
+                forwarding.new_ttl_protocol,
+            ),
+            old_high,
+            new_high,
+        ),
+        old_low,
+        new_low,
+    );
+    let tcp_checksum = rfc1624_update(
+        rfc1624_update(
+            rfc1624_update(tcp.checksum, old_high, new_high),
+            old_low,
+            new_low,
+        ),
+        old_port,
+        new_port,
+    );
+    Ok(PacketDecision::Nat44Tcp(Nat44TcpRewriteDecision {
+        forwarding,
+        address_offset,
+        address_end,
+        new_address: new_octets,
+        port_offset,
+        port_end,
+        new_port,
+        tcp_checksum_offset,
+        tcp_checksum_end,
+        ipv4_checksum,
+        tcp_checksum,
+        transition,
+        disposition,
+    }))
+}
+
 #[derive(Clone, Copy)]
 struct ValidatedNat44Udp {
     offset: usize,
@@ -1443,6 +2127,102 @@ fn observe_nat_candidate_if_present<T: TraceSink>(
     if let Err(error) = runtime.observe_now(now.0) {
         let (reason, disposition) = nat44_udp_plan_error(error);
         trace.record(TraceEvent::Nat44Udp {
+            ingress,
+            disposition,
+        });
+        return Err(reason);
+    }
+    Ok(())
+}
+
+fn nat44_tcp_plan_error(error: Nat44TcpPlanError) -> (DropReason, Nat44TcpDisposition) {
+    match error {
+        Nat44TcpPlanError::MappingMiss => (Nat44TcpMappingMiss, Nat44TcpDisposition::MappingMiss),
+        Nat44TcpPlanError::SessionMiss => (Nat44TcpSessionMiss, Nat44TcpDisposition::SessionMiss),
+        Nat44TcpPlanError::InvalidInitialFlags => (
+            Nat44TcpInvalidInitialFlags,
+            Nat44TcpDisposition::InvalidInitialFlags,
+        ),
+        Nat44TcpPlanError::MappingFull => {
+            (Nat44TcpMappingTableFull, Nat44TcpDisposition::MappingFull)
+        }
+        Nat44TcpPlanError::SessionFull => {
+            (Nat44TcpSessionTableFull, Nat44TcpDisposition::SessionFull)
+        }
+        Nat44TcpPlanError::PortExhausted => {
+            (Nat44TcpPortExhausted, Nat44TcpDisposition::PortExhausted)
+        }
+        Nat44TcpPlanError::ClockRegression => (
+            Nat44TcpClockRegression,
+            Nat44TcpDisposition::ClockRegression,
+        ),
+    }
+}
+
+fn nat44_tcp_drop<T: TraceSink>(
+    ingress: IfId,
+    reason: DropReason,
+    trace: &mut T,
+) -> Result<PacketDecision, DropReason> {
+    trace.record(TraceEvent::Nat44Tcp {
+        ingress,
+        disposition: Nat44TcpDisposition::Rejected { reason },
+    });
+    Err(reason)
+}
+
+fn require_nat44_tcp_runtime<'runtime, 'storage, T: TraceSink>(
+    snapshot: &ForwardingSnapshot<'_>,
+    config: &Nat44TcpConfig,
+    runtime: &'runtime mut Option<&mut Nat44TcpRuntime<'storage>>,
+    ingress: IfId,
+    trace: &mut T,
+) -> Result<&'runtime mut Nat44TcpRuntime<'storage>, DropReason> {
+    if !config.authority_matches(snapshot) {
+        if let Some(runtime) = runtime.as_deref_mut() {
+            runtime.record_config_mismatch();
+        }
+        trace.record(TraceEvent::Nat44Tcp {
+            ingress,
+            disposition: Nat44TcpDisposition::ConfigMismatch,
+        });
+        return Err(Nat44TcpConfigMismatch);
+    }
+    let Some(runtime) = runtime.as_deref_mut() else {
+        trace.record(TraceEvent::Nat44Tcp {
+            ingress,
+            disposition: Nat44TcpDisposition::Rejected {
+                reason: Nat44TcpRuntimeUnavailable,
+            },
+        });
+        return Err(Nat44TcpRuntimeUnavailable);
+    };
+    if runtime.config() != *config {
+        runtime.record_config_mismatch();
+        trace.record(TraceEvent::Nat44Tcp {
+            ingress,
+            disposition: Nat44TcpDisposition::ConfigMismatch,
+        });
+        return Err(Nat44TcpConfigMismatch);
+    }
+    Ok(runtime)
+}
+
+fn observe_nat44_tcp_candidate_if_present<T: TraceSink>(
+    snapshot: &ForwardingSnapshot<'_>,
+    config: &Nat44TcpConfig,
+    runtime: &mut Option<&mut Nat44TcpRuntime<'_>>,
+    now: MonotonicMillis,
+    ingress: IfId,
+    trace: &mut T,
+) -> Result<(), DropReason> {
+    if runtime.is_none() {
+        return Ok(());
+    }
+    let runtime = require_nat44_tcp_runtime(snapshot, config, runtime, ingress, trace)?;
+    if let Err(error) = runtime.observe_now(now.0) {
+        let (reason, disposition) = nat44_tcp_plan_error(error);
+        trace.record(TraceEvent::Nat44Tcp {
             ingress,
             disposition,
         });
@@ -1949,12 +2729,45 @@ fn apply_decision(frame: &mut [u8], decision: PacketDecision) -> Result<(), Drop
     match decision {
         PacketDecision::Ipv4(ipv4) => apply_ipv4_rewrite(frame, ipv4),
         PacketDecision::Nat44Udp(nat) => apply_nat44_udp_rewrite(frame, nat),
+        PacketDecision::Nat44Tcp(nat) => apply_nat44_tcp_rewrite(frame, nat),
         PacketDecision::ArpReply(arp) => apply_arp_reply(frame, arp),
         PacketDecision::Icmpv4EchoReply(icmp) => apply_icmpv4_echo_reply(frame, icmp),
         PacketDecision::ConsumeArp(_) | PacketDecision::ConsumeIpv4Local => {
             unreachable!("consume decisions are never rewritten")
         }
     }
+}
+
+fn apply_nat44_tcp_rewrite(
+    frame: &mut [u8],
+    decision: Nat44TcpRewriteDecision,
+) -> Result<(), DropReason> {
+    if frame.get(0..12).is_none()
+        || frame.get(decision.forwarding.ttl_offset).is_none()
+        || frame
+            .get(decision.forwarding.checksum_offset..decision.forwarding.checksum_end)
+            .is_none()
+        || frame
+            .get(decision.address_offset..decision.address_end)
+            .is_none()
+        || frame.get(decision.port_offset..decision.port_end).is_none()
+        || frame
+            .get(decision.tcp_checksum_offset..decision.tcp_checksum_end)
+            .is_none()
+    {
+        return Err(Nat44TcpHeaderTruncated);
+    }
+    frame[0..6].copy_from_slice(&decision.forwarding.destination_mac);
+    frame[6..12].copy_from_slice(&decision.forwarding.source_mac);
+    frame[decision.forwarding.ttl_offset] -= 1;
+    frame[decision.forwarding.checksum_offset..decision.forwarding.checksum_end]
+        .copy_from_slice(&decision.ipv4_checksum.to_be_bytes());
+    frame[decision.address_offset..decision.address_end].copy_from_slice(&decision.new_address);
+    frame[decision.port_offset..decision.port_end]
+        .copy_from_slice(&decision.new_port.to_be_bytes());
+    frame[decision.tcp_checksum_offset..decision.tcp_checksum_end]
+        .copy_from_slice(&decision.tcp_checksum.to_be_bytes());
+    Ok(())
 }
 
 fn apply_nat44_udp_rewrite(
@@ -2113,6 +2926,28 @@ mod tests {
             (51, "NAT44_UDP_WRONG_INGRESS"),
             (52, "NAT44_UDP_WRONG_EGRESS"),
             (53, "NAT44_EXTERNAL_TO_INTERNAL_BYPASS"),
+            (54, "NAT44_TCP_RUNTIME_UNAVAILABLE"),
+            (55, "NAT44_TCP_CONFIG_MISMATCH"),
+            (56, "NAT44_TCP_UNSUPPORTED_TRANSPORT"),
+            (57, "NAT44_TCP_HAIRPIN_UNSUPPORTED"),
+            (58, "NAT44_TCP_NON_ATOMIC_IPV4_UNSUPPORTED"),
+            (59, "NAT44_TCP_HEADER_TRUNCATED"),
+            (60, "NAT44_TCP_DATA_OFFSET_TOO_SMALL"),
+            (61, "NAT44_TCP_DATA_OFFSET_EXCEEDS_IPV4_PAYLOAD"),
+            (62, "NAT44_TCP_CHECKSUM_INVALID"),
+            (63, "NAT44_TCP_SOURCE_PORT_ZERO"),
+            (64, "NAT44_TCP_SOURCE_FORBIDDEN"),
+            (65, "NAT44_TCP_REVERSE_AUTHORITY_MISMATCH"),
+            (66, "NAT44_TCP_MAPPING_MISS"),
+            (67, "NAT44_TCP_SESSION_MISS"),
+            (68, "NAT44_TCP_INVALID_INITIAL_FLAGS"),
+            (69, "NAT44_TCP_MAPPING_TABLE_FULL"),
+            (70, "NAT44_TCP_SESSION_TABLE_FULL"),
+            (71, "NAT44_TCP_PORT_EXHAUSTED"),
+            (72, "NAT44_TCP_CLOCK_REGRESSION"),
+            (73, "NAT44_TCP_WRONG_INGRESS"),
+            (74, "NAT44_TCP_WRONG_EGRESS"),
+            (75, "NAT44_COMBINED_REALM_MISMATCH"),
         ];
         let actual = [
             DropReason::EthernetHeaderTruncated,
@@ -2168,6 +3003,28 @@ mod tests {
             DropReason::Nat44UdpWrongIngress,
             DropReason::Nat44UdpWrongEgress,
             DropReason::Nat44ExternalToInternalBypass,
+            DropReason::Nat44TcpRuntimeUnavailable,
+            DropReason::Nat44TcpConfigMismatch,
+            DropReason::Nat44TcpUnsupportedTransport,
+            DropReason::Nat44TcpHairpinUnsupported,
+            DropReason::Nat44TcpNonAtomicIpv4Unsupported,
+            DropReason::Nat44TcpHeaderTruncated,
+            DropReason::Nat44TcpDataOffsetTooSmall,
+            DropReason::Nat44TcpDataOffsetExceedsIpv4Payload,
+            DropReason::Nat44TcpChecksumInvalid,
+            DropReason::Nat44TcpSourcePortZero,
+            DropReason::Nat44TcpSourceForbidden,
+            DropReason::Nat44TcpReverseAuthorityMismatch,
+            DropReason::Nat44TcpMappingMiss,
+            DropReason::Nat44TcpSessionMiss,
+            DropReason::Nat44TcpInvalidInitialFlags,
+            DropReason::Nat44TcpMappingTableFull,
+            DropReason::Nat44TcpSessionTableFull,
+            DropReason::Nat44TcpPortExhausted,
+            DropReason::Nat44TcpClockRegression,
+            DropReason::Nat44TcpWrongIngress,
+            DropReason::Nat44TcpWrongEgress,
+            DropReason::Nat44CombinedRealmMismatch,
         ];
         assert_eq!(actual.len(), expected.len());
         for (reason, &(discriminant, code)) in actual.iter().zip(&expected) {

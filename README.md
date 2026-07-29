@@ -13,7 +13,7 @@ active treeは、そのコードを継承しないv0.2のゼロベース実装�
   TTL/checksum/MAC rewrite、local IPv4向けARP reply、static neighbor miss時の
   ARP Request生成action、fixed-capacity dynamic ARP cache、local ICMPv4 Echo
   responder、ICMPv4 Time Exceeded / Destination Unreachable生成、opt-inの
-  single-domain UDP NAT44/NAPTを扱う。
+  single-domain UDP NAT44/NAPTとoutbound-initiated TCP NAT44/NAPTを扱う。
 - `ruster-io-sim`: rootやNICなしでRX/generated TXのFIFO、budget、TX/drop、
   traceを決定的に検証する。
 
@@ -69,9 +69,24 @@ NAT runtimeへ到達した非退行時刻はdrop結果でもwatermarkへ反映�
 時刻によるmapping復活を許しません。outsideからinsideへのpublic DNATを通らない直通LPMも
 neighbor解決前にfail closedです。
 publication変更はvalidated configと`Nat44UdpRuntime::reconcile`による明示的な全state flushを
-要求します。fragment、hairpin、ICMP error translation/PMTU、TCP/ICMP query NAT、static
+要求します。fragment、hairpin、ICMP error translation/PMTU、ICMP query NAT、static
 forward、multi-public、port randomization/parity、full firewallはdeferredで、RFC 4787/
 7857全体への準拠は主張しません。
+
+TCP NAT44は別のcaller-backed mapping/session storageを持ち、UDPと同じ数値public portを
+独立して使用できます。mappingはinternal TCP tupleのEndpoint-Independent Mapping、filterは
+remote IPv4とremote TCP portのexact matchです。新規sessionはoutbound SYN=1かつ
+ACK/RST/FIN=0だけが作成し、既存sessionではSYN-ACK、data、FIN、RSTを含むvalid packetを
+双方向に変換します。TCP header/options/dataを含むIPv4 payload全体のchecksumをstate更新前に
+検証し、address/port rewrite後もRFC 1624で更新します。TCPでは算術結果zeroもwire zeroの
+ままです。
+
+TCP session idle TTLはdefault/minimumともに2時間4分です。sequence/window/ACK妥当性は追跡
+せず、FIN/RSTもsessionを削除・短縮せず通常のsuccessful TX requestとしてTTLだけをrefresh
+します。この保守的な単一timer profile、recommended EIF/ADFより厳しいconnection-dependent
+filter、fragment/hairpin/embedded ICMP/PMTU未実装を明示し、RFC 5382全体への準拠は主張
+しません。UDP-only/TCP-only wrapperは他方のprotocolがdomainをcrossするとfail closedにし、
+combined wrapperはinside/outside/public realm一致を要求します。
 
 ## 開発
 
