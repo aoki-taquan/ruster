@@ -1,7 +1,8 @@
 use crate::resolution::DynamicLookup;
 use crate::{
     packet, rfc1624_update, route, validate_arp, validate_ipv4_frame, ArpOpcode, ArpRequestAction,
-    BatchCompletion, ConsumeReason, ControlDisposition, IfId, Interface, LocalIpv4Binding,
+    BatchCompletion, ConsumeReason, ControlDisposition, Icmpv4ErrorRuntime,
+    Icmpv4TimeExceededAction, Icmpv4TimeExceededDisposition, IfId, Interface, LocalIpv4Binding,
     MonotonicMillis, Neighbor, PacketBatch, ResolutionResult, ResolutionRuntime, Route,
     ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
@@ -235,6 +236,10 @@ pub enum TraceEvent {
         source: crate::Ipv4Address,
         destination: crate::Ipv4Address,
     },
+    Icmpv4TimeExceededDisposition {
+        ingress: IfId,
+        disposition: Icmpv4TimeExceededDisposition,
+    },
     ArpRequestValidated {
         ingress: IfId,
         sender_protocol: crate::Ipv4Address,
@@ -381,7 +386,7 @@ where
     B: PacketBatch,
     T: TraceSink,
 {
-    forward_batch_inner(batch, snapshot, None, trace)
+    forward_batch_inner(batch, snapshot, None, None, trace)
 }
 
 /// Forwards RX packets and queues resolution actions without allocating TX
@@ -397,13 +402,39 @@ where
     B: PacketBatch,
     T: TraceSink,
 {
-    forward_batch_inner(batch, snapshot, Some((runtime, now)), trace)
+    forward_batch_inner(batch, snapshot, Some((runtime, now)), None, trace)
+}
+
+/// Forwards RX packets while queueing ARP resolution and eligible ICMPv4 Time
+/// Exceeded actions into separate caller-backed worker-local runtimes.
+///
+/// Generated packet execution must happen after this function returns.
+pub fn forward_batch_with_resolution_and_icmpv4_errors<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        Some((icmpv4_errors, now)),
+        trace,
+    )
 }
 
 fn forward_batch_inner<B, T>(
     mut batch: B,
     snapshot: &ForwardingSnapshot<'_>,
     mut resolution: Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    mut icmpv4_errors: Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
 where
@@ -419,7 +450,15 @@ where
         let ingress = packet.ingress();
         let result = {
             let frame = packet.bytes_mut();
-            decide(&*frame, snapshot, ingress, &mut resolution, trace).and_then(|decision| {
+            decide(
+                &*frame,
+                snapshot,
+                ingress,
+                &mut resolution,
+                &mut icmpv4_errors,
+                trace,
+            )
+            .and_then(|decision| {
                 if matches!(
                     decision,
                     PacketDecision::ConsumeArp(_) | PacketDecision::ConsumeIpv4Local
@@ -494,11 +533,12 @@ fn decide<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     let ether_type = packet::read_u16(frame, 12).ok_or(EthernetHeaderTruncated)?;
     match ether_type {
-        IPV4_ETHERTYPE => decide_ipv4(frame, snapshot, ingress, resolution, trace),
+        IPV4_ETHERTYPE => decide_ipv4(frame, snapshot, ingress, resolution, icmpv4_errors, trace),
         ARP_ETHERTYPE => decide_arp(frame, snapshot, ingress, resolution, trace),
         _ => Err(UnsupportedEtherType),
     }
@@ -509,6 +549,7 @@ fn decide_ipv4<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     let ipv4 = validate_ipv4_frame(frame)?;
@@ -527,6 +568,15 @@ fn decide_ipv4<T: TraceSink>(
         return Err(Ipv4OptionsUnsupported);
     }
     if ipv4.ttl <= 1 {
+        if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+            let disposition = decide_icmpv4_time_exceeded(
+                frame, snapshot, ipv4, resolution, runtime, *now, trace,
+            );
+            trace.record(TraceEvent::Icmpv4TimeExceededDisposition {
+                ingress,
+                disposition,
+            });
+        }
         return Err(Ipv4TtlExpired);
     }
     let route = route::lookup(snapshot.routes, ipv4.destination).ok_or(RouteMiss)?;
@@ -610,6 +660,211 @@ fn decide_ipv4<T: TraceSink>(
         new_ttl_protocol: u16::from_be_bytes([ipv4.ttl - 1, ipv4.protocol]),
         old_checksum: ipv4.checksum,
     }))
+}
+
+fn decide_icmpv4_time_exceeded<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ipv4: packet::ValidatedIpv4,
+    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    runtime: &mut Icmpv4ErrorRuntime<'_>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> Icmpv4TimeExceededDisposition {
+    if !runtime.observe_decision(now) {
+        return runtime.record_suppression(Icmpv4TimeExceededDisposition::ClockRegression);
+    }
+    if !icmp_error_source_is_host(snapshot, ipv4.source) {
+        return runtime.record_suppression(Icmpv4TimeExceededDisposition::SourceNotUnicast);
+    }
+    if snapshot
+        .local_ipv4
+        .iter()
+        .any(|binding| binding.address == ipv4.source)
+    {
+        return runtime.record_suppression(Icmpv4TimeExceededDisposition::SourceIsLocal);
+    }
+
+    let destination_octets = ipv4.destination.octets();
+    if (destination_octets[0] & 0xf0) == 0xe0 {
+        return runtime.record_suppression(Icmpv4TimeExceededDisposition::DestinationMulticast);
+    }
+    if destination_octets == [255; 4] {
+        return runtime
+            .record_suppression(Icmpv4TimeExceededDisposition::DestinationLimitedBroadcast);
+    }
+    if let Some(selected) = route::lookup(snapshot.routes, ipv4.destination) {
+        if selected.is_prefix_network_address(ipv4.destination) {
+            return runtime
+                .record_suppression(Icmpv4TimeExceededDisposition::DestinationNetworkAddress);
+        }
+        if selected.is_prefix_directed_broadcast(ipv4.destination) {
+            return runtime
+                .record_suppression(Icmpv4TimeExceededDisposition::DestinationDirectedBroadcast);
+        }
+    }
+    if frame.first().is_some_and(|first| first & 1 != 0) {
+        return runtime.record_suppression(Icmpv4TimeExceededDisposition::EthernetDestinationGroup);
+    }
+
+    let flags_fragment = match packet::read_u16(frame, ipv4.header_offset + 6) {
+        Some(value) => value,
+        None => {
+            return runtime.record_suppression(Icmpv4TimeExceededDisposition::NonInitialFragment);
+        }
+    };
+    if flags_fragment & 0x1fff != 0 {
+        return runtime.record_suppression(Icmpv4TimeExceededDisposition::NonInitialFragment);
+    }
+    if ipv4.protocol == 1 {
+        let type_offset = ipv4.header_offset + ipv4.header_len;
+        let Some(icmp_type) = frame.get(type_offset).copied() else {
+            return runtime.record_suppression(Icmpv4TimeExceededDisposition::IcmpTypeMissing);
+        };
+        if matches!(icmp_type, 3 | 4 | 5 | 11 | 12) {
+            return runtime.record_suppression(Icmpv4TimeExceededDisposition::IcmpErrorMessage);
+        }
+    }
+
+    let Some(reverse_route) = route::lookup(snapshot.routes, ipv4.source) else {
+        return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseRouteMiss);
+    };
+    let reverse_egress = reverse_route.egress();
+    let Some(interface) = snapshot
+        .interfaces
+        .iter()
+        .find(|interface| interface.id == reverse_egress)
+    else {
+        return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseInterfaceMiss {
+            egress: reverse_egress,
+        });
+    };
+    let Some(binding) = snapshot
+        .local_ipv4
+        .iter()
+        .find(|binding| binding.interface == reverse_egress)
+    else {
+        return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseBindingMiss {
+            egress: reverse_egress,
+        });
+    };
+    let target = reverse_route.next_hop().unwrap_or(ipv4.source);
+    if reverse_target_forbidden(snapshot, reverse_egress, target, binding.address) {
+        return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseTargetForbidden {
+            egress: reverse_egress,
+            target,
+        });
+    }
+
+    let static_neighbor = snapshot
+        .neighbors
+        .iter()
+        .find(|neighbor| neighbor.interface == reverse_egress && neighbor.target == target);
+    let destination_mac = if let Some(neighbor) = static_neighbor {
+        neighbor.mac
+    } else if let Some((resolution_runtime, resolution_now)) = resolution.as_mut() {
+        match resolution_runtime.lookup_dynamic(reverse_egress, target, *resolution_now) {
+            DynamicLookup::Hit(mac) => mac,
+            DynamicLookup::ClockRegression => {
+                trace.record(TraceEvent::NeighborResolution {
+                    egress: reverse_egress,
+                    target,
+                    result: ResolutionResult::ClockRegression,
+                });
+                return runtime.record_suppression(
+                    Icmpv4TimeExceededDisposition::ReverseNeighborUnresolved {
+                        egress: reverse_egress,
+                        target,
+                        resolution: ResolutionResult::ClockRegression,
+                    },
+                );
+            }
+            DynamicLookup::Miss => {
+                let result = resolution_runtime.schedule(
+                    ArpRequestAction {
+                        egress: reverse_egress,
+                        source_mac: interface.mac,
+                        source_ip: binding.address,
+                        target_ip: target,
+                    },
+                    *resolution_now,
+                    snapshot.routes.iter().any(|candidate| {
+                        candidate.egress() == reverse_egress
+                            && candidate.is_connected_directed_broadcast(target)
+                    }),
+                );
+                trace.record(TraceEvent::NeighborResolution {
+                    egress: reverse_egress,
+                    target,
+                    result,
+                });
+                return runtime.record_suppression(
+                    Icmpv4TimeExceededDisposition::ReverseNeighborUnresolved {
+                        egress: reverse_egress,
+                        target,
+                        resolution: result,
+                    },
+                );
+            }
+        }
+    } else {
+        return runtime.record_suppression(
+            Icmpv4TimeExceededDisposition::ReverseNeighborUnresolved {
+                egress: reverse_egress,
+                target,
+                resolution: ResolutionResult::StateFull,
+            },
+        );
+    };
+
+    let quote_end = ipv4.header_offset + ipv4.total_len;
+    let original_ipv4 = &frame[ipv4.header_offset..quote_end];
+    runtime.schedule(
+        Icmpv4TimeExceededAction::new(
+            reverse_egress,
+            interface.mac,
+            destination_mac,
+            binding.address,
+            ipv4.source,
+            frame[ipv4.header_offset + 1],
+            snapshot.ipv4_origin.default_ttl(),
+            original_ipv4,
+        ),
+        now,
+    )
+}
+
+fn icmp_error_source_is_host(
+    snapshot: &ForwardingSnapshot<'_>,
+    source: crate::Ipv4Address,
+) -> bool {
+    let octets = source.octets();
+    octets[0] != 0
+        && octets[0] != 127
+        && octets[0] < 224
+        && !route::lookup(snapshot.routes, source).is_some_and(|selected| {
+            selected.is_prefix_network_address(source)
+                || selected.is_prefix_directed_broadcast(source)
+        })
+}
+
+fn reverse_target_forbidden(
+    snapshot: &ForwardingSnapshot<'_>,
+    egress: IfId,
+    target: crate::Ipv4Address,
+    local: crate::Ipv4Address,
+) -> bool {
+    let octets = target.octets();
+    octets[0] == 0
+        || octets[0] == 127
+        || octets[0] >= 224
+        || octets == [255; 4]
+        || target == local
+        || snapshot.routes.iter().any(|route| {
+            route.egress() == egress
+                && (route.is_connected_directed_broadcast(target)
+                    || route.is_connected_network_address(target))
+        })
 }
 
 fn decide_local_ipv4<T: TraceSink>(

@@ -5,10 +5,10 @@ use std::{collections::VecDeque, convert::Infallible};
 
 use ruster_core::{
     forward_batch, BatchCompletion, BatchReport, ConsumeReason, DropReason, ForwardingSnapshot,
-    GeneratedAllocationError, GeneratedArpTrace, GeneratedBatchCompletion, GeneratedPacketBatch,
-    GeneratedPacketIo, GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion,
-    GeneratedTraceSink, IfId, PacketBatch, PacketIo, PacketLease, PacketSlot, SlotCompletion,
-    TraceEvent, TraceSink,
+    GeneratedAllocationError, GeneratedArpTrace, GeneratedBatchCompletion, GeneratedIcmpv4Trace,
+    GeneratedIcmpv4TraceSink, GeneratedPacketBatch, GeneratedPacketIo, GeneratedPacketLease,
+    GeneratedPacketSlot, GeneratedSlotCompletion, GeneratedTraceSink, IfId, PacketBatch, PacketIo,
+    PacketLease, PacketSlot, SlotCompletion, TraceEvent, TraceSink,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -497,6 +497,24 @@ impl VecGeneratedTrace {
 
 impl GeneratedTraceSink for VecGeneratedTrace {
     fn record_generated(&mut self, event: GeneratedArpTrace) {
+        self.events.push(event);
+    }
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct VecGeneratedIcmpv4Trace {
+    events: Vec<GeneratedIcmpv4Trace>,
+}
+
+impl VecGeneratedIcmpv4Trace {
+    #[must_use]
+    pub fn events(&self) -> &[GeneratedIcmpv4Trace] {
+        &self.events
+    }
+}
+
+impl GeneratedIcmpv4TraceSink for VecGeneratedIcmpv4Trace {
+    fn record_generated_icmpv4(&mut self, event: GeneratedIcmpv4Trace) {
         self.events.push(event);
     }
 }
