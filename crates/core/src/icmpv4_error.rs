@@ -90,7 +90,7 @@ impl Icmpv4TimeExceededAction {
             destination_mac,
             source_ip,
             destination_ip,
-            outer_tos: (original_tos & 0x1f) | 0xc0,
+            outer_tos: (original_tos & 0x1e) | 0xc0,
             outer_ttl,
             quote_len: quote_len as u16,
             quote,
@@ -607,7 +607,7 @@ mod tests {
             MacAddress([2, 0, 0, 0, 0, 2]),
             Ipv4Address::from_octets([192, 0, 2, 1]),
             Ipv4Address::from_octets([198, 51, 100, 1]),
-            0x2e,
+            0x2f,
             64,
             &original[..quote_len],
         )
@@ -634,7 +634,7 @@ mod tests {
         assert!(short.quote[20..].iter().all(|byte| *byte == 0));
         let long = action(1, 548);
         assert_eq!(long.frame_len(), ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN);
-        assert_eq!(long.outer_tos, 0xce);
+        assert_eq!(long.outer_tos, 0xce, "RFC 1812 reserved TOS bit is cleared");
     }
 
     #[test]

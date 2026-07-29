@@ -189,10 +189,11 @@ IPv4 reassemblyはRFC 1122 §3.2.1.4に対する現時点の明示deviationで�
 reassemblyや応答を行わず`Icmpv4FragmentUnsupported`でdropします。RFC 1812 §4.2.2.3に従い、
 reserved IPv4 flagがnonzeroであることだけを理由に受信packetをdropしません。valid local Echo
 として処理し、originated atomic Replyではreserved bitをclearしてDFだけを設定します。
-IPv4 options付きlocal Echoもbyte不変dropします。RFC 1122 §3.2.2.6とRFC 1812 §4.3.3.6が
-source-route reversalをMUST、Record Route/Timestamp更新をSHOULDとしているため、これは
-明示deviationです。Timestamp等の他ICMP query、options処理、Destination Unreachable、
-Parameter Problem、Redirect、PMTU処理はdeferredです。
+IPv4 options付きlocal Echoもbyte不変dropします。RFC 1122 §3.2.2.6、RFC 1812
+§4.3.3.6および§§5.3.13.4–5.3.13.6がsource-route reversalとSource Route/Record
+Route/Timestamp処理を要求しているため、これは明示deviationです。Timestamp等の他ICMP
+query、options処理、Destination Unreachable、Parameter Problem、Redirect、PMTU処理は
+deferredです。
 
 ## ICMPv4 Time Exceeded scope
 
@@ -218,7 +219,8 @@ Ethernet headerとTotal Length後のpaddingは引用しません。生成wire pr
 - outer IPv4はIHL=5、Total Length=`28 + quote_len`、ID=0、DF=1、MF/offset=0、
   protocol=1。TTLはvalidated `Ipv4OriginPolicy`。
 - outer TOSはRFC 1812 legacy profileのprecedence 6として
-  `(original_tos & 0x1f) | 0xc0`。source/destinationはreverse binding/original source。
+  `(original_tos & 0x1e) | 0xc0`。reserved bit 0をclearし、source/destinationはreverse
+  binding/original source。
 - ICMPはType 11、Code 0、unused=0。odd lengthを含むheader+quote全体をchecksumする。
 - outer IPv4 Total Lengthは最大576、Ethernet frameは最大590 bytes。
 
@@ -226,8 +228,11 @@ RFC 1812のerror suppressionとして、invalid/non-host/router-local source、I
 multicast/limited/directed-broadcast destination、Ethernet group destination、
 noninitial fragment、ICMP error Types 3/4/5/11/12、protocol 1でtype byteが無いpacket、
 reverse route/interface/binding/neighbor不在では生成しません。first fragment
-offset=0/MF=1とICMP queryは生成可能です。IPv4 optionsはsource-route reversal等を実装して
-いないため、従来どおりTTL判定前に`Ipv4OptionsUnsupported`でatomic dropするdeviationです。
+offset=0/MF=1とICMP queryは生成可能です。source/destinationのprefix network/broadcast
+判定はgateway routeを含むLPM-selected prefixに対して行い、more-specific `/32`を優先し、
+`/31`と`/32` endpointをnetwork/broadcast扱いしません。RFC 1812 §4.3.2.6と
+§§5.3.13.4–5.3.13.6のsource-route reversalおよびoptions処理を実装していないため、
+IPv4 optionsは従来どおりTTL判定前に`Ipv4OptionsUnsupported`でatomic dropするdeviationです。
 
 rate limiterはreverse egress単位のtimer方式でdefault 100msです。intervalはnonzero、
 state TTLはinterval以上を要求します。egressごとにqueue中actionは一つ、lease commitから

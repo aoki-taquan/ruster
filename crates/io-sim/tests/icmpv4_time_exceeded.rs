@@ -128,6 +128,38 @@ fn resolution_policy() -> ResolutionPolicy {
     ResolutionPolicy::new(1_000, 60_000).unwrap()
 }
 
+fn error_disposition(
+    snapshot: &ForwardingSnapshot<'_>,
+    packet: Vec<u8>,
+) -> Icmpv4TimeExceededDisposition {
+    let mut rs = [ResolutionStateSlot::EMPTY; 1];
+    let mut ra = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = ResolutionRuntime::new(resolution_policy(), &mut rs, &mut ra);
+    let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut es, &mut ea);
+    let mut io = SimIo::new();
+    io.inject(LAN, packet);
+    let mut trace = VecTrace::default();
+    let batch = io.receive(1).unwrap();
+    forward_batch_with_resolution_and_icmpv4_errors(
+        batch,
+        snapshot,
+        &mut resolution,
+        &mut errors,
+        MonotonicMillis(0),
+        &mut trace,
+    );
+    trace
+        .events()
+        .iter()
+        .find_map(|event| match event {
+            TraceEvent::Icmpv4TimeExceededDisposition { disposition, .. } => Some(*disposition),
+            _ => None,
+        })
+        .expect("TTL-expired packet has a typed ICMP disposition")
+}
+
 #[test]
 fn ttl_expiry_is_atomic_and_generates_exact_asymmetric_static_reply() {
     let interfaces = interfaces();
@@ -148,7 +180,7 @@ fn ttl_expiry_is_atomic_and_generates_exact_asymmetric_static_reply() {
         1,
         17,
         0,
-        0x2e,
+        0x2f,
         &[1, 2, 3, 4, 5, 6, 7, 8, 9],
         &[0xde, 0xad],
     );
@@ -268,6 +300,186 @@ fn ttl_expiry_is_atomic_and_generates_exact_asymmetric_static_reply() {
     );
     assert_eq!(internet_checksum(&tx.bytes[34..]), 0);
     assert_eq!(&tx.bytes[42..], &original[14..43]);
+}
+
+#[test]
+fn selected_gateway_prefix_suppresses_remote_boundaries_but_lpm_host_routes_win() {
+    let interfaces = interfaces();
+    let bindings = bindings();
+    let neighbors = neighbors();
+    let gateway_destination = Route::new(
+        Ipv4Address::from_octets([172, 16, 1, 0]),
+        24,
+        WAN,
+        Some(REVERSE_GATEWAY),
+    )
+    .unwrap();
+    let base_routes = [gateway_destination, routes()[1], routes()[2]];
+    let base = ForwardingSnapshot::new(&base_routes, &interfaces, &neighbors, &bindings).unwrap();
+    assert_eq!(
+        error_disposition(
+            &base,
+            frame(
+                SOURCE,
+                Ipv4Address::from_octets([172, 16, 1, 255]),
+                1,
+                17,
+                0,
+                0,
+                &[],
+                &[],
+            ),
+        ),
+        Icmpv4TimeExceededDisposition::DestinationDirectedBroadcast
+    );
+    for source in [
+        Ipv4Address::from_octets([203, 0, 113, 0]),
+        Ipv4Address::from_octets([203, 0, 113, 255]),
+    ] {
+        assert_eq!(
+            error_disposition(
+                &base,
+                frame(
+                    source,
+                    Ipv4Address::from_octets([172, 16, 1, 1]),
+                    1,
+                    17,
+                    0,
+                    0,
+                    &[],
+                    &[],
+                ),
+            ),
+            Icmpv4TimeExceededDisposition::SourceNotUnicast
+        );
+    }
+
+    let host_destination_routes = [
+        gateway_destination,
+        Route::new(
+            Ipv4Address::from_octets([172, 16, 1, 255]),
+            32,
+            WAN,
+            Some(REVERSE_GATEWAY),
+        )
+        .unwrap(),
+        routes()[1],
+        routes()[2],
+    ];
+    let host_destination =
+        ForwardingSnapshot::new(&host_destination_routes, &interfaces, &neighbors, &bindings)
+            .unwrap();
+    assert!(matches!(
+        error_disposition(
+            &host_destination,
+            frame(
+                SOURCE,
+                Ipv4Address::from_octets([172, 16, 1, 255]),
+                1,
+                17,
+                0,
+                0,
+                &[],
+                &[],
+            ),
+        ),
+        Icmpv4TimeExceededDisposition::Queued { .. }
+    ));
+
+    let point_to_point_destination_routes = [
+        gateway_destination,
+        Route::new(
+            Ipv4Address::from_octets([172, 16, 1, 254]),
+            31,
+            WAN,
+            Some(REVERSE_GATEWAY),
+        )
+        .unwrap(),
+        routes()[1],
+        routes()[2],
+    ];
+    let point_to_point_destination = ForwardingSnapshot::new(
+        &point_to_point_destination_routes,
+        &interfaces,
+        &neighbors,
+        &bindings,
+    )
+    .unwrap();
+    for destination in [
+        Ipv4Address::from_octets([172, 16, 1, 254]),
+        Ipv4Address::from_octets([172, 16, 1, 255]),
+    ] {
+        assert!(matches!(
+            error_disposition(
+                &point_to_point_destination,
+                frame(SOURCE, destination, 1, 17, 0, 0, &[], &[]),
+            ),
+            Icmpv4TimeExceededDisposition::Queued { .. }
+        ));
+    }
+
+    let host_source = Ipv4Address::from_octets([203, 0, 113, 0]);
+    let host_source_routes = [
+        gateway_destination,
+        routes()[1],
+        Route::new(host_source, 32, WAN, Some(REVERSE_GATEWAY)).unwrap(),
+        routes()[2],
+    ];
+    let host_source_snapshot =
+        ForwardingSnapshot::new(&host_source_routes, &interfaces, &neighbors, &bindings).unwrap();
+    assert!(matches!(
+        error_disposition(
+            &host_source_snapshot,
+            frame(
+                host_source,
+                Ipv4Address::from_octets([172, 16, 1, 1]),
+                1,
+                17,
+                0,
+                0,
+                &[],
+                &[],
+            ),
+        ),
+        Icmpv4TimeExceededDisposition::Queued { .. }
+    ));
+
+    let point_to_point_source = Ipv4Address::from_octets([203, 0, 113, 0]);
+    let point_to_point_routes = [
+        gateway_destination,
+        Route::new(
+            Ipv4Address::from_octets([203, 0, 113, 0]),
+            31,
+            WAN,
+            Some(REVERSE_GATEWAY),
+        )
+        .unwrap(),
+        routes()[2],
+    ];
+    let point_to_point =
+        ForwardingSnapshot::new(&point_to_point_routes, &interfaces, &neighbors, &bindings)
+            .unwrap();
+    for source in [
+        point_to_point_source,
+        Ipv4Address::from_octets([203, 0, 113, 1]),
+    ] {
+        assert!(matches!(
+            error_disposition(
+                &point_to_point,
+                frame(
+                    source,
+                    Ipv4Address::from_octets([172, 16, 1, 1]),
+                    1,
+                    17,
+                    0,
+                    0,
+                    &[],
+                    &[],
+                ),
+            ),
+            Icmpv4TimeExceededDisposition::Queued { .. }
+        ));
+    }
 }
 
 #[test]

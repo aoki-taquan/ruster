@@ -570,7 +570,7 @@ fn decide_ipv4<T: TraceSink>(
     if ipv4.ttl <= 1 {
         if let Some((runtime, now)) = icmpv4_errors.as_mut() {
             let disposition = decide_icmpv4_time_exceeded(
-                frame, snapshot, ingress, ipv4, resolution, runtime, *now, trace,
+                frame, snapshot, ipv4, resolution, runtime, *now, trace,
             );
             trace.record(TraceEvent::Icmpv4TimeExceededDisposition {
                 ingress,
@@ -662,11 +662,9 @@ fn decide_ipv4<T: TraceSink>(
     }))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn decide_icmpv4_time_exceeded<T: TraceSink>(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
-    ingress: IfId,
     ipv4: packet::ValidatedIpv4,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     runtime: &mut Icmpv4ErrorRuntime<'_>,
@@ -676,7 +674,7 @@ fn decide_icmpv4_time_exceeded<T: TraceSink>(
     if !runtime.observe_decision(now) {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::ClockRegression);
     }
-    if !sender_is_host(snapshot, ingress, ipv4.source) {
+    if !icmp_error_source_is_host(snapshot, ipv4.source) {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::SourceNotUnicast);
     }
     if snapshot
@@ -695,10 +693,8 @@ fn decide_icmpv4_time_exceeded<T: TraceSink>(
         return runtime
             .record_suppression(Icmpv4TimeExceededDisposition::DestinationLimitedBroadcast);
     }
-    if snapshot
-        .routes
-        .iter()
-        .any(|route| route.is_connected_directed_broadcast(ipv4.destination))
+    if route::lookup(snapshot.routes, ipv4.destination)
+        .is_some_and(|selected| selected.is_prefix_directed_broadcast(ipv4.destination))
     {
         return runtime
             .record_suppression(Icmpv4TimeExceededDisposition::DestinationDirectedBroadcast);
@@ -832,6 +828,20 @@ fn decide_icmpv4_time_exceeded<T: TraceSink>(
         ),
         now,
     )
+}
+
+fn icmp_error_source_is_host(
+    snapshot: &ForwardingSnapshot<'_>,
+    source: crate::Ipv4Address,
+) -> bool {
+    let octets = source.octets();
+    octets[0] != 0
+        && octets[0] != 127
+        && octets[0] < 224
+        && !route::lookup(snapshot.routes, source).is_some_and(|selected| {
+            selected.is_prefix_network_address(source)
+                || selected.is_prefix_directed_broadcast(source)
+        })
 }
 
 fn reverse_target_forbidden(

@@ -107,18 +107,23 @@ impl Route {
     }
 
     pub(crate) fn is_connected_directed_broadcast(self, address: Ipv4Address) -> bool {
-        if self.next_hop.is_some() || self.prefix_len > 30 || !self.matches(address) {
+        self.next_hop.is_none() && self.is_prefix_directed_broadcast(address)
+    }
+
+    pub(crate) fn is_connected_network_address(self, address: Ipv4Address) -> bool {
+        self.next_hop.is_none() && self.is_prefix_network_address(address)
+    }
+
+    pub(crate) fn is_prefix_directed_broadcast(self, address: Ipv4Address) -> bool {
+        if self.prefix_len > 30 || !self.matches(address) {
             return false;
         }
         let mask = prefix_mask(self.prefix_len).expect("Route::new validates prefix length");
         address.0 == self.prefix.0 | !mask
     }
 
-    pub(crate) fn is_connected_network_address(self, address: Ipv4Address) -> bool {
-        self.next_hop.is_none()
-            && self.prefix_len <= 30
-            && self.matches(address)
-            && address == self.prefix
+    pub(crate) fn is_prefix_network_address(self, address: Ipv4Address) -> bool {
+        self.prefix_len <= 30 && self.matches(address) && address == self.prefix
     }
 }
 
@@ -172,5 +177,21 @@ mod tests {
             Route::new(ip([0, 0, 0, 0]), 33, IfId(1), None),
             Err(RouteError::InvalidPrefixLength)
         );
+    }
+
+    #[test]
+    fn prefix_boundaries_are_independent_of_gateway_and_exclude_point_to_point() {
+        let gateway =
+            Route::new(ip([198, 51, 100, 0]), 24, IfId(1), Some(ip([192, 0, 2, 1]))).unwrap();
+        assert!(gateway.is_prefix_network_address(ip([198, 51, 100, 0])));
+        assert!(gateway.is_prefix_directed_broadcast(ip([198, 51, 100, 255])));
+        assert!(!gateway.is_connected_network_address(ip([198, 51, 100, 0])));
+        assert!(!gateway.is_connected_directed_broadcast(ip([198, 51, 100, 255])));
+
+        for prefix_len in [31, 32] {
+            let route = Route::new(ip([198, 51, 100, 0]), prefix_len, IfId(1), None).unwrap();
+            assert!(!route.is_prefix_network_address(ip([198, 51, 100, 0])));
+            assert!(!route.is_prefix_directed_broadcast(ip([198, 51, 100, 0])));
+        }
     }
 }
