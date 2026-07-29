@@ -13,7 +13,8 @@ active treeは、そのコードを継承しないv0.2のゼロベース実装�
   TTL/checksum/MAC rewrite、local IPv4向けARP reply、static neighbor miss時の
   ARP Request生成action、fixed-capacity dynamic ARP cache、local ICMPv4 Echo
   responder、ICMPv4 Time Exceeded / Destination Unreachable生成、opt-inの
-  single-domain UDP NAT44/NAPTとoutbound-initiated TCP NAT44/NAPTを扱う。
+  single-domain UDP NAT44/NAPT、outbound-initiated TCP NAT44/NAPT、最小IPv4
+  stateful forward firewallを扱う。
 - `ruster-io-sim`: rootやNICなしでRX/generated TXのFIFO、budget、TX/drop、
   traceを決定的に検証する。
 
@@ -76,7 +77,7 @@ local strict-uRPF policyで、asymmetric external pathを意図的に拒否し�
 addressは引用remoteと異なっていても保存します。fragment、hairpin、private発の
 ICMP error、他のtype/codeとquery NAT、local MTU起因のType 3/Code 4生成、PMTU cache、
 static forward、
-multi-public、port randomization/parity、full firewallはdeferredで、RFC 4787/7857全体への
+multi-public、port randomization/parity、full packet filterはdeferredで、RFC 4787/7857全体への
 準拠は主張しません。
 
 TCP NAT44は別のcaller-backed mapping/session storageを持ち、UDPと同じ数値public portを
@@ -94,6 +95,22 @@ filter、fragment/hairpin未実装を明示し、RFC 5382全体への準拠は�
 opt-inしたType 3/Code 4だけ、引用public source portとexact live remote address/port sessionを
 read-only参照してinsideへ変換します。UDP-only/TCP-only wrapperは他方のprotocolがdomainを
 crossするとfail closedにし、combined wrapperはinside/outside/public realm一致を要求します。
+
+IPv4 forward firewallは`forward_batch_with_firewall`を選んだworkerだけで有効です。immutableな
+ordered rule sliceとmutableなfixed-capacity state sliceをcallerが所有し、first-matchの
+`AllowStateful`/`Deny`とimplicit default denyを適用します。対象はoptionsなし、DF=0または
+DF=1のnonfragment UDP/TCPです。ARP、router-local、router-originated generated packetは対象外で、
+その他のforward protocol、options、reserved/MF/fragment offsetはfail closedです。UDP checksum
+zeroは許可し、nonzeroはfull検証します。UDPはexact reverse pseudo-session、TCPはinitial SYN
+だけが新規stateを作り、tupleとorigin ingress/egressの完全一致だけをlocal `ESTABLISHED`として
+扱います。これはTCP sequence/window stateやRFC 5382/7857全体への準拠を意味しません。
+
+NATとのcombined APIではoutboundをpre-SNAT internal→remote、inboundをpost-DNAT
+remote→internalのcanonical tupleで照合します。NAT mappingだけではinboundを許可せず、exact
+reverse firewall stateが無ければinside neighbor処理前にdenyします。packet rewrite成功後、
+NAT/FW stateをTX request前にcommitするためbackend rejectでも両stateを保持します。ICMPv4
+Type 3/Code 4のRELATED判定は未実装で、firewall serviceとNAT ICMP translationを組み合わせた
+場合は`FIREWALL_RELATED_ICMPV4_UNSUPPORTED`で明示的にfail closedします。
 
 ## 開発
 

@@ -801,6 +801,27 @@ impl<'a> Nat44UdpRuntime<'a> {
         now_ms: u64,
     ) -> Result<Nat44UdpOutboundPlan, Nat44UdpPlanError> {
         self.observe_now(now_ms)?;
+        self.plan_outbound_after_clock(internal_address, internal_port, remote_address, now_ms)
+    }
+
+    pub(crate) fn plan_outbound_read_only(
+        &self,
+        internal_address: Ipv4Address,
+        internal_port: u16,
+        remote_address: Ipv4Address,
+        now_ms: u64,
+    ) -> Result<Nat44UdpOutboundPlan, Nat44UdpPlanError> {
+        self.check_now_read_only(now_ms)?;
+        self.plan_outbound_after_clock(internal_address, internal_port, remote_address, now_ms)
+    }
+
+    fn plan_outbound_after_clock(
+        &self,
+        internal_address: Ipv4Address,
+        internal_port: u16,
+        remote_address: Ipv4Address,
+        now_ms: u64,
+    ) -> Result<Nat44UdpOutboundPlan, Nat44UdpPlanError> {
         if let Some((mapping_index, mapping)) =
             self.find_mapping(internal_address, internal_port, now_ms)
         {
@@ -910,6 +931,25 @@ impl<'a> Nat44UdpRuntime<'a> {
         now_ms: u64,
     ) -> Result<Nat44UdpInboundPlan, Nat44UdpPlanError> {
         self.observe_now(now_ms)?;
+        self.plan_inbound_after_clock(public_port, remote_address, now_ms)
+    }
+
+    pub(crate) fn plan_inbound_read_only(
+        &self,
+        public_port: u16,
+        remote_address: Ipv4Address,
+        now_ms: u64,
+    ) -> Result<Nat44UdpInboundPlan, Nat44UdpPlanError> {
+        self.check_now_read_only(now_ms)?;
+        self.plan_inbound_after_clock(public_port, remote_address, now_ms)
+    }
+
+    fn plan_inbound_after_clock(
+        &self,
+        public_port: u16,
+        remote_address: Ipv4Address,
+        now_ms: u64,
+    ) -> Result<Nat44UdpInboundPlan, Nat44UdpPlanError> {
         let Some((mapping_index, mapping)) =
             self.mappings
                 .iter()
@@ -964,6 +1004,13 @@ impl<'a> Nat44UdpRuntime<'a> {
                 // `observe_now` owns this counter so a forwarding caller can
                 // record the typed plan error without double-counting it.
             }
+        }
+    }
+
+    pub(crate) fn record_read_only_plan_error(&mut self, error: Nat44UdpPlanError) {
+        self.record_plan_error(error);
+        if error == Nat44UdpPlanError::ClockRegression {
+            self.counters.clock_regressions = self.counters.clock_regressions.saturating_add(1);
         }
     }
 
@@ -1092,6 +1139,17 @@ impl<'a> Nat44UdpRuntime<'a> {
     fn next_nonzero_generation(&self) -> u64 {
         self.next_generation.max(1)
     }
+
+    fn check_now_read_only(&self, now_ms: u64) -> Result<(), Nat44UdpPlanError> {
+        if self
+            .watermark_ms
+            .is_some_and(|watermark| now_ms < watermark)
+        {
+            Err(Nat44UdpPlanError::ClockRegression)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn address_is_host_unicast(snapshot: &ForwardingSnapshot<'_>, address: Ipv4Address) -> bool {
@@ -1105,7 +1163,7 @@ fn address_is_host_unicast(snapshot: &ForwardingSnapshot<'_>, address: Ipv4Addre
     })
 }
 
-fn snapshot_authority(snapshot: &ForwardingSnapshot<'_>) -> u64 {
+pub(crate) fn snapshot_authority(snapshot: &ForwardingSnapshot<'_>) -> u64 {
     fn mix(hash: u64, value: u64) -> u64 {
         (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
     }
@@ -1664,6 +1722,47 @@ impl<'a> Nat44TcpRuntime<'a> {
         now_ms: u64,
     ) -> Result<Nat44TcpOutboundPlan, Nat44TcpPlanError> {
         self.observe_now(now_ms)?;
+        self.plan_outbound_after_clock(
+            internal_address,
+            internal_port,
+            remote_address,
+            remote_port,
+            initial_syn,
+            now_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plan_outbound_read_only(
+        &self,
+        internal_address: Ipv4Address,
+        internal_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        initial_syn: bool,
+        now_ms: u64,
+    ) -> Result<Nat44TcpOutboundPlan, Nat44TcpPlanError> {
+        self.check_now_read_only(now_ms)?;
+        self.plan_outbound_after_clock(
+            internal_address,
+            internal_port,
+            remote_address,
+            remote_port,
+            initial_syn,
+            now_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn plan_outbound_after_clock(
+        &self,
+        internal_address: Ipv4Address,
+        internal_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        initial_syn: bool,
+        now_ms: u64,
+    ) -> Result<Nat44TcpOutboundPlan, Nat44TcpPlanError> {
         if let Some((mapping_index, mapping)) =
             self.find_mapping(internal_address, internal_port, now_ms)
         {
@@ -1760,6 +1859,27 @@ impl<'a> Nat44TcpRuntime<'a> {
         now_ms: u64,
     ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
         self.observe_now(now_ms)?;
+        self.plan_inbound_after_clock(public_port, remote_address, remote_port, now_ms)
+    }
+
+    pub(crate) fn plan_inbound_read_only(
+        &self,
+        public_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        now_ms: u64,
+    ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
+        self.check_now_read_only(now_ms)?;
+        self.plan_inbound_after_clock(public_port, remote_address, remote_port, now_ms)
+    }
+
+    fn plan_inbound_after_clock(
+        &self,
+        public_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        now_ms: u64,
+    ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
         let Some((mapping_index, mapping)) =
             self.mappings
                 .iter()
@@ -1855,6 +1975,13 @@ impl<'a> Nat44TcpRuntime<'a> {
         }
     }
 
+    pub(crate) fn record_read_only_plan_error(&mut self, error: Nat44TcpPlanError) {
+        self.record_plan_error(error);
+        if error == Nat44TcpPlanError::ClockRegression {
+            self.counters.clock_regressions = self.counters.clock_regressions.saturating_add(1);
+        }
+    }
+
     pub(crate) fn inspect_icmpv4(
         &self,
         public_port: u16,
@@ -1902,6 +2029,17 @@ impl<'a> Nat44TcpRuntime<'a> {
         session.occupied
             && now_ms >= session.last_activity_ms
             && now_ms - session.last_activity_ms < self.config.policy.idle_ttl_ms
+    }
+
+    fn check_now_read_only(&self, now_ms: u64) -> Result<(), Nat44TcpPlanError> {
+        if self
+            .watermark_ms
+            .is_some_and(|watermark| now_ms < watermark)
+        {
+            Err(Nat44TcpPlanError::ClockRegression)
+        } else {
+            Ok(())
+        }
     }
 
     fn mapping_is_live(&self, index: usize, mapping: Nat44TcpMappingSlot, now_ms: u64) -> bool {

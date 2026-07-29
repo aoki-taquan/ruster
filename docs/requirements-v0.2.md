@@ -164,7 +164,7 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | NAT44-019L DF-zero fragmentation | RFC 5508 §7.1.1, RFC 1812 §5.2.7 | — | deferred | forwarding MTU超過時のIPv4 fragmentation未実装 |
 | NAT44-019M PMTU cache and plateau fallback | RFC 1191 §§5–7 | — | deferred | received MTUによるcache更新、timer、MTU 0推定を未実装 |
 | NAT44-019N RFC 4884 extension parsing | RFC 5508 REQ-3(d), RFC 4884 | — | deferred | optional paddingとextension objectを識別・変換するfull support未実装 |
-| NAT44-020 other transports/features | RFC 3022, RFC 4787, RFC 7857 | — | deferred | ICMP query NAT、static forwards、multi-public、port randomization/parity、full packet filter/firewall |
+| NAT44-020 other transports/features | RFC 3022, RFC 4787, RFC 7857 | — | deferred | ICMP query NAT、static forwards、multi-public、port randomization/parity、minimal stateful sliceを越えるfull packet filter |
 | NAT44-021 external-to-internal bypass prevention | RFC 3022 traditional NAT domain boundary, local security policy | `outside_to_inside_lpm_bypass_is_always_fail_closed_before_neighbor_work` | implemented | authorized public UDP/TCP DNAT以外のoutside→inside LPMをprotocol/runtime/state非依存でneighbor処理前にgeneric drop |
 | NAT44-022 outbound-initiated TCP EIM | RFC 3022 §§2–4, RFC 5382 §§4–5 | `syn_synack_and_data_translate_bidirectionally_in_one_batch` | implemented | internal TCP tuple mapping。新規sessionはoutbound initial SYNだけ。RFC 5382全体準拠は非主張 |
 | NAT44-023 exact TCP endpoint filtering | RFC 5382 §5, RFC 7857 §4 | `eim_reuses_mapping_but_filter_is_exact_remote_endpoint` | deviation | remote IPv4+port完全一致のconnection-dependent filter。推奨EIF/ADFより厳しい |
@@ -175,6 +175,20 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | NAT44-028 TCP flag admission without phase claims | RFC 9293 §§3.1, 3.10.7 | `only_initial_syn_creates_and_fin_rst_only_refresh_idle_lifetime` | deviation | initial SYNだけstate作成。既存exact sessionの全valid flagsを変換するがsequence/window/ACK validationなし |
 | NAT44-029 protocol-separated combined service | RFC 3022 traditional NAPT, architecture contract | `combined_udp_tcp_realms_keep_protocol_state_and_ports_independent` | implemented | UDP/TCPは同一数値public port可。single-protocol crossingとcombined realm mismatchはfail closed |
 | NAT44-030 TCP fragment/hairpin/other ICMP | RFC 3022 §§4.3, 6.3, RFC 5382 §§6–9, RFC 6864 §§4.1–4.2 | `malformed_checksum_fragment_source_zero_and_options_are_atomic` | deferred | atomic DF=1のみ。hairpin、fragment association、Type 3/Code 4以外のembedded ICMP、full RFC 5382 sequence lifecycleは未実装 |
+| FW-001 opt-in legacy compatibility | architecture contract | `legacy_forwarding_is_unchanged_when_firewall_api_is_not_selected` | implemented | 既存forward API/default behaviorを変更せず追加APIだけで有効化 |
+| FW-002 ordered canonical rule policy | local policy | `ordered_rules_cidr_ports_default_deny_and_runtime_authority_are_exact` | implemented | first-match、overlap許可、implicit default deny、CIDR/interface/inclusive port match |
+| FW-003 rule/config publication validation | control-plane publication contract | `config_validates_prefix_range_ids_interfaces_generation_and_first_match` | implemented | duplicate/zero RuleId、unknown IfId、noncanonical prefix、reversed range、zero generationを拒否 |
+| FW-004 protocol/phase timeout bounds | local conservative policy | `policy_bounds_are_protocol_and_phase_specific` | implemented | UDP 300s/min120s、TCP Opening 240s、Active 2h4m、最大7日 |
+| FW-005 fixed worker-local state lifecycle | architecture contract | `zero_full_regression_and_reconcile_do_not_evict_live_state` | implemented | caller-backed、zero/full safe、live evictionなし、exact expiry、generation reconcile/collision/regression |
+| FW-006 UDP exact reverse pseudo-session | RFC 768, local state policy | `udp_pseudo_session_exact_reverse_checksum_df_and_padding_are_enforced` | implemented | checksum zero/nonzero、padding、DF0/DF1、protocol/interface/tuple exact reverse |
+| FW-007 conservative TCP flow admission | RFC 9293 §3.1, local state policy | `tcp_initial_syn_same_batch_reverse_phase_fin_and_rst_refresh_are_exact` | deviation | initial SYNのみ新規。simultaneous-open可、両方向ACKでcoarse Active、sequence/window非検証、FIN非短縮、RST no-refresh |
+| FW-008 transport and IPv4 fail-close validation | RFC 768, RFC 9293 §3.1, RFC 6864 | `firewall_transport_options_ports_checksums_and_ttl_fail_closed_before_state` | implemented | full checksum/header/port、options/reserved/MF/offset、allow後TTLをstate未commitで検証 |
+| FW-009 silent transactional deny | architecture contract | `deny_is_silent_and_precedes_ttl_neighbor_and_resolution_mutation` | implemented | bytes/NAT/resolution/action不変、ARP/ICMP/RST生成なし |
+| FW-010 runtime/config/snapshot authority | control-plane publication contract | `firewall_runtime_config_and_snapshot_mismatches_fail_closed` | implemented | runtime absent/mismatchとstale snapshotをstate作成前にfail closed |
+| FW-011 NAT canonical tuple composition | architecture contract | `nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically` | implemented | outbound pre-SNAT、inbound post-DNAT、TCP/UDP分離、backend rejectでもTX-request NAT/FW state保持 |
+| FW-012 NAT/FW capacity transaction | architecture contract | `nat_and_firewall_capacity_failures_leave_the_other_state_uncommitted` | implemented | どちらかのfull/plan failureでも他方をcommitしない |
+| FW-013 unsolicited NAT inbound firewall gate | local security boundary | `nat_inbound_mapping_without_exact_firewall_reverse_state_is_denied` | implemented | NAT mappingがあってもexact reverse FW stateなしはinside neighbor前deny |
+| FW-014 NAT ICMPv4 RELATED lookup | RFC 5508, local state policy | `nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically` | deferred | quoted canonical tupleのread-only lookup未実装。combined serviceではtyped fail-closeしstate/phase/watermarkを変更しない |
 
 ## RFC deviation rule
 

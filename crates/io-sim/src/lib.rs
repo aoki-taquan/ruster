@@ -4,8 +4,10 @@
 use std::{collections::VecDeque, convert::Infallible};
 
 use ruster_core::{
-    forward_batch, forward_batch_with_nat44_tcp, forward_batch_with_nat44_udp,
-    forward_batch_with_nat44_udp_and_tcp, BatchCompletion, BatchReport, ConsumeReason, DropReason,
+    forward_batch, forward_batch_with_firewall, forward_batch_with_firewall_and_icmpv4_errors,
+    forward_batch_with_nat44_tcp, forward_batch_with_nat44_udp,
+    forward_batch_with_nat44_udp_and_tcp, forward_batch_with_nat44_udp_and_tcp_and_firewall,
+    BatchCompletion, BatchReport, ConsumeReason, DropReason, FirewallConfig, FirewallRuntime,
     ForwardingSnapshot, GeneratedAllocationError, GeneratedArpTrace, GeneratedBatchCompletion,
     GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedPacketBatch, GeneratedPacketIo,
     GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion, GeneratedTraceSink, IfId,
@@ -226,6 +228,79 @@ impl SimIo {
         let batch = self.receive(budget)?;
         Ok(forward_batch_with_nat44_udp_and_tcp(
             batch, snapshot, resolution, udp_config, nat44_udp, tcp_config, nat44_tcp, now, trace,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_firewall_once<T: TraceSink>(
+        &mut self,
+        budget: usize,
+        snapshot: &ForwardingSnapshot<'_>,
+        resolution: &mut ResolutionRuntime<'_>,
+        config: &FirewallConfig<'_>,
+        firewall: Option<&mut FirewallRuntime<'_, '_>>,
+        now: MonotonicMillis,
+        trace: &mut T,
+    ) -> Result<BatchReport<Infallible>, Infallible> {
+        let batch = self.receive(budget)?;
+        Ok(forward_batch_with_firewall(
+            batch, snapshot, resolution, config, firewall, now, trace,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_firewall_with_icmpv4_errors_once<T: TraceSink>(
+        &mut self,
+        budget: usize,
+        snapshot: &ForwardingSnapshot<'_>,
+        resolution: &mut ResolutionRuntime<'_>,
+        icmpv4_errors: &mut ruster_core::Icmpv4ErrorRuntime<'_>,
+        config: &FirewallConfig<'_>,
+        firewall: Option<&mut FirewallRuntime<'_, '_>>,
+        now: MonotonicMillis,
+        trace: &mut T,
+    ) -> Result<BatchReport<Infallible>, Infallible> {
+        let batch = self.receive(budget)?;
+        Ok(forward_batch_with_firewall_and_icmpv4_errors(
+            batch,
+            snapshot,
+            resolution,
+            icmpv4_errors,
+            config,
+            firewall,
+            now,
+            trace,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_nat44_udp_and_tcp_with_firewall_once<T: TraceSink>(
+        &mut self,
+        budget: usize,
+        snapshot: &ForwardingSnapshot<'_>,
+        resolution: &mut ResolutionRuntime<'_>,
+        udp_config: &Nat44UdpConfig,
+        nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+        tcp_config: &Nat44TcpConfig,
+        nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+        firewall_config: &FirewallConfig<'_>,
+        firewall: Option<&mut FirewallRuntime<'_, '_>>,
+        now: MonotonicMillis,
+        trace: &mut T,
+    ) -> Result<BatchReport<Infallible>, Infallible> {
+        let batch = self.receive(budget)?;
+        Ok(forward_batch_with_nat44_udp_and_tcp_and_firewall(
+            batch,
+            snapshot,
+            resolution,
+            udp_config,
+            nat44_udp,
+            tcp_config,
+            nat44_tcp,
+            firewall_config,
+            firewall,
+            now,
+            trace,
         ))
     }
 }
