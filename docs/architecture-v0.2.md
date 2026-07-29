@@ -88,12 +88,15 @@ buffer unavailableを区別し、失敗時はownershipを移しません。finis
 
 resolution runtimeも`!Send + !Sync`で、caller提供のlinear fixed resolution table、
 action ring、dynamic neighbor tableを借用します。すべてのkeyは`(IfId,target IPv4)`です。
-intervalは1000ms以上、state TTLはinterval
-以上とし、batch単位で注入された`MonotonicMillis`だけを使います。加算deadlineを作らず
-順序確認後の差分で判定するため`u64` overflowはありません。逆行はtyped resultとして
-action/stateを変更しません。live entryはevictせず、TTL後だけreuseします。runtimeの
-生成時は三storageをすべてemptyへ初期化します。processをまたぐstate永続化/resumeは
-未実装です。
+stateはauthoritativeなRequest action、generation、committed total attempts、request/failure
+時刻を保持し、`InitialQueued → Waiting → RetryQueued → Waiting → Failed`を明示します。
+intervalは1000ms以上、Failed hold-down TTLはinterval以上、max attemptsはnonzeroとし、
+local defaultはtotal 3 attemptsです。この回数とhold-downはRFCの固定値ではありません。
+batch/timer単位で注入された`MonotonicMillis`だけを使い、加算deadlineや
+`attempts * interval`を作らず、順序確認後の差分で判定するため`u64` overflowはありません。
+逆行はcounter/trace以外のaction/state/poll cursorを変更しません。active/Failed entryは
+evictせず、Failed TTL exact boundary後だけreuseします。runtime生成時は三storageをすべて
+emptyへ初期化します。processをまたぐstate永続化/resumeは未実装です。
 
 dynamic neighbor TTLはzeroを拒否するconfigurable policyです。static neighborを最初に
 lookupし、static missだけdynamicを参照します。dynamic slotは`elapsed < TTL`だけliveで、
@@ -101,22 +104,37 @@ exact boundaryではlazy expiryして転送に使いません。insert時もempt
 reuseし、liveな別keyをevictしません。既存keyのMAC/refresh時刻更新は追加capacity不要です。
 periodic scanはなく、lookup/insert時のbounded linear lazy maintenanceです。
 
-control planeがstatic neighbor snapshotを公開する同じworker tickでは、次のpacketを処理
-する前に、そのsnapshotのneighbor sliceを`ResolutionRuntime::reconcile_static`へ渡します。
-これによりstatic keyと一致するdynamic slot、resolution state、queued actionを削除し、
-wrapped action ringのunrelated FIFOを維持します。static公開後に同keyのARPを受けた場合も
-merge pathが同じcleanupを行います。
+control planeがforwarding snapshotを公開する同じworker tickでは、timer pollや次のpacket
+より前に、そのsnapshotを`ResolutionRuntime::reconcile_publication`へ渡します。これにより
+static keyと一致するdynamic/active state/actionに加え、interface MAC、local binding、
+route authority、target safetyが新snapshotと一致しないstale retryを削除し、wrapped action ringのunrelated
+FIFOを維持します。旧static-only caller向け`reconcile_static`は互換APIとして残します。
+static公開後に同keyのARPを受けた場合もmerge pathが同じkey cleanupを行います。
+一度でもRequestをcommitしたkeyを学習/static/authority変更でcancelする場合、retry actionと
+stale source authorityは削除しますが、`(IfId,target,requested_at)`だけのnon-retrying
+`Cooldown` tombstoneを残します。dynamic TTL expiryやstatic publish/remove churnはこの
+commit起点intervalを短縮できません。timer pollはtombstoneからretryを生成せず、exact
+interval後だけfresh packetが新しいsnapshot authorityで新世代を開始できます。未commit
+actionのcancelはtombstoneを残しません。expired tombstoneだけstate pressure時にreuseします。
 
 同じkeyのactionは一つだけqueueできます。抑制deadlineはenqueue時でなく、generated
 leaseをcommitしてTX requestedになった注入時刻から開始します。allocation/build失敗時は
-actionを保持しdeadlineを開始しません。backendのpartial rejectでもcommit済みなので
-抑制を開始します。commit済みARP Requestの次回生成は、deadline後に新しいtraffic missが
-来た場合だけです。allocation/build失敗で未commitの保持actionはexecutorを再実行できます。
-target `0.0.0.0`、IPv4
-multicast、limited broadcast、およびcanonical connected routeから確定できるdirected
-broadcastにはARP Requestを生成しません。directed broadcast判定はpacketを選択したroute
-だけでなく、snapshot内の同一egressにある全connected routeを確認します。source local
-IPv4自身がtargetになる場合も生成しません。
+actionを保持しattempt/deadlineを消費しません。backend reject/finish errorでもcommit済み
+total attemptとして数えます。最後のRequest commit直後にはFailedにせず、完全なinterval後の
+schedule/timer pollが一世代一度だけ`TimedOut`へ遷移させ、その後はhold-down中`Failed`を
+返します。
+
+`poll_resolution_timers`はI/Oを行わず、明示scan budgetまでpersistent round-robin cursorで
+走査します。late pollも一つの次attemptしかqueueせずcatch-up burstを作りません。action
+capacity不足はtyped deferred report/traceとなり、cursorを進めて他keyを飢餓させません。
+traffic missもdue retry/timeout/Failed expiryを進めるため、timer頻度だけに正しさを依存
+しません。normal forwardingとreverse ICMP neighbor missは同じruntimeを使い、terminalでも
+受信packetのdrop reasonは`NeighborUnresolved`のままですがresolution resultで区別できます。
+
+target `0.0.0.0`、IPv4 multicast、limited broadcast、local address、およびcanonical
+connected routeから確定できるnetwork/directed-broadcastにはARP Requestを生成しません。
+判定はpacketを選択したrouteだけでなく、snapshot内の同一egressにある全connected routeを
+確認します。
 
 生成する通常RequestはRFC 894のEthernet minimum framingに合わせた、FCSを含まない
 60 bytesです。先頭42 bytesをRFC 826の
@@ -124,10 +142,14 @@ Ethernet/IPv4 ARP（Ethernet destination broadcast、SHA/source MACはlocal、SP
 local IPv4、THA zero、TPA target）として書き、残り18 bytesを必ずzero paddingします。
 THA zeroは決定的なlocal profile choiceであり、RFCのMUSTとは主張しません。
 
-これはRFC 826の通常ARP Request生成/mergeとRFC 1122 §2.3.2.1のflood prevention/stale
-entry TTLまでです。timer-only retry/max attempts/Failed、unresolved packet
-hold/replay（RFC 1122 §2.3.2.2、RFC 1812 §3.3.2）、multi-worker resolution ownership/
-SPSCは未実装です。最初のpacketは解決後に自動再送されません。
+RFC 1122 §2.3.2.1から採用する境界はARP cache invalidation adviceとRequest flood
+preventionです。retry scheduling、max attempts、`Failed`、hold-downとそのdefault値は
+すべてlocal policyであり、RFC要件とは主張しません。RFC 1812 §3.3.2はfruitless
+resolutionを永遠に続けずdatagramを捨てる、より広いrouter behaviorの境界として扱います。
+unresolved packet hold/replay（RFC 1122 §2.3.2.2、RFC 1812 §3.3.2）、ARP失敗に対する
+ICMP Destination Unreachable Type 3/Code 1、multi-worker resolution ownership/SPSCは
+未実装です。最初のpacketは解決後に自動再送されず、失敗時も元datagramへ応答できないことを
+明示的なdeviationとして残します。
 
 ## IPv4 scope
 
@@ -277,7 +299,8 @@ MAC/refresh時刻やpending resolutionを変更しません。
 - local SPA claimの保護はlink scopedで、`(ingress IfId, SPA)`がlocal bindingと一致する場合
   だけ学習しない。同じIPv4値が別interfaceのlocal bindingでも、ingress上では通常peerとして
   学習できる。
-- 学習成功時だけmatching resolution state/actionをcancelし、unrelated FIFOを維持する。
+- 学習成功時だけmatching active resolution/actionをcancelし、unrelated FIFOを維持する。
+  commit済みRequestのflood cooldown tombstoneは残す。
 
 Reply admissionへsolicited-only制約は追加しません。`ArpReplyUnsupported`と
 `ArpTargetNotLocal`のstable reason番号は互換性のためretired/reservedとして維持します。
@@ -287,7 +310,7 @@ local SPAを名乗り、そのlocal addressをTPAにしたrequestも通常reques
 するだけで、conflict状態やdefensive announcementを生成しません。正常なlocal target requestを
 追加policyでdropしないことを優先した明示deviationです。
 
-eager cache scan/flush、timer retry、unresolved packet hold queue、gratuitous ARP生成、
+eager dynamic-cache scan/flush、unresolved packet hold queue、gratuitous ARP生成、
 ARP Probe/Announcement生成、proxy ARP、VLAN、Address Conflict Detection、実装済み
 Echo Reply/Time Exceeded/Destination Unreachable Network以外のICMP生成、NAT、firewall、
 config parser、pcap、AF_XDP、DPDK、binary、thread、

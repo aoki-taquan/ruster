@@ -34,9 +34,12 @@ RX bufferをEcho Replyへ書き換えます。local宛ての未実装protocol/co
 fall throughせず、typed consumeで終端します。
 
 static neighbor missでは元IPv4 packetをbyte不変でrecycleした後、worker-localな固定
-storageで1秒に一度までARP Requestを生成できます。RX batchとgenerated TX sessionは
-二相に分離し、生成frameもbackend所有bufferを借用します。ARP Reply/RequestはRFC 826
-mergeでworker-local cacheへ学習しますが、元IPv4 packetのhold/replayは行いません。
+storageでARP Requestを生成します。defaultは1秒間隔、total 3 attemptsで、
+traffic-independentなbounded timer pollがretryとterminal `Failed` hold-downを進めます。
+これらのretry回数・schedule・Failed/hold-downはRFC固定値ではなくlocal policyです。
+RX batchとgenerated TX sessionは二相に分離し、生成frameもbackend所有bufferを借用します。
+ARP Reply/RequestはRFC 826 mergeでworker-local cacheへ学習し、matching retry/Failed stateを
+cancelします。元IPv4 packetのhold/replayとICMPv4 Type 3/Code 1生成はまだ行いません。
 
 nonlocal IPv4はoptions/local判定後にまずLPMします。routeが無ければ元packetをbyte不変の
 `RouteMiss`でdropし、eligibleならICMPv4 Destination Unreachable Type 3/Code 0をqueueします。
