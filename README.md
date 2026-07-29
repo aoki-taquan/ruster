@@ -71,8 +71,9 @@ neighbor解決前にfail closedです。
 publication変更はvalidated configと`Nat44UdpRuntime::reconcile`による明示的な全state flushを
 要求します。policyで明示的にopt-inした場合だけ、outside/public宛てICMPv4 Type 3/Code 4が
 引用するlive UDP mapping/ADF peerをread-only参照し、outer destinationと引用source tupleを
-insideへ戻します。outer sourceはexternal host-unicastかつoutsideへのreverse LPMを要求し、
-中継routerのaddressは引用remoteと異なっていても保存します。fragment、hairpin、private発の
+insideへ戻します。outer sourceはexternal host-unicastかつoutsideへのreverse LPMを要求する
+local strict-uRPF policyで、asymmetric external pathを意図的に拒否します。中継routerの
+addressは引用remoteと異なっていても保存します。fragment、hairpin、private発の
 ICMP error、他のtype/codeとquery NAT、local MTU起因のType 3/Code 4生成、PMTU cache、
 static forward、
 multi-public、port randomization/parity、full firewallはdeferredで、RFC 4787/7857全体への

@@ -177,6 +177,15 @@ fn refresh_icmp_and_outer_checksums(frame: &mut [u8]) {
     frame[24..26].copy_from_slice(&outer_checksum.to_be_bytes());
 }
 
+fn assert_outer_icmp_checksum_valid(frame: &[u8]) {
+    let outer_ihl = usize::from(frame[14] & 0x0f) * 4;
+    let outer_total = usize::from(u16::from_be_bytes(frame[16..18].try_into().unwrap()));
+    assert_eq!(
+        internet_checksum(&frame[14 + outer_ihl..14 + outer_total]),
+        0
+    );
+}
+
 fn set_outer_source(frame: &mut [u8], source: Ipv4Address) {
     frame[26..30].copy_from_slice(&source.octets());
     let outer_ihl = usize::from(frame[14] & 0x0f) * 4;
@@ -450,7 +459,9 @@ fn udp_zero_checksum_and_remote_port_are_not_authority() {
         &mut NoTrace,
     )
     .unwrap();
-    assert_eq!(&io.pop_tx().unwrap().bytes[68..70], &[0xff, 0xff]);
+    let translated_negative_zero = io.pop_tx().unwrap();
+    assert_eq!(&translated_negative_zero.bytes[68..70], &[0xff, 0xff]);
+    assert_outer_icmp_checksum_valid(&translated_negative_zero.bytes);
 
     quote[16..20].copy_from_slice(&OTHER_REMOTE.octets());
     refresh_inner_checksum(&mut quote);
@@ -569,6 +580,7 @@ fn tcp_quote_boundaries_and_exact_session_authority_are_enforced() {
     .unwrap();
     let translated_zero = io.pop_tx().unwrap();
     assert_eq!(&translated_zero.bytes[78..80], &[0, 0]);
+    assert_outer_icmp_checksum_valid(&translated_zero.bytes);
 
     let mut wrong_port = complete_quote[..28].to_vec();
     wrong_port[22..24].copy_from_slice(&444_u16.to_be_bytes());
@@ -1406,6 +1418,7 @@ fn same_batch_combined_dispatches_same_public_port_and_preserves_all_mtu_values(
             u16::from_be_bytes(translated.bytes[40..42].try_into().unwrap()),
             mtu
         );
+        assert_outer_icmp_checksum_valid(&translated.bytes);
     }
 }
 

@@ -471,23 +471,28 @@ transport先頭8 bytesが実際に存在することを要求します。
 RFC 5508 REQ-3に従いouter ICMP checksumと引用IPv4 checksumを検証し、引用IPv4 optionsを
 IHLで越えてtransportを探し、embedded transport checksumそのものは検証しません。outer
 sourceはhost-unicast、router-localでないこと、outsideへreverse LPMされることを要求します。
-0/8、127/8、multicast、240/4、limited/selected-prefix network/broadcast、inside/local source
-はstateやresolutionを変更せずdropします。RFC 5508 REQ-4のexternal-realm profileとして、
-validな中継router sourceは引用remote addressと一致する必要がなく、translation後も不変です。
+これはRFC 1812 §5.3.8を根拠にしたlocal strict-uRPF anti-spoof policyであり、asymmetricな
+external pathを意図的に拒否するtradeoffがあります。0/8、127/8、multicast、240/4、
+limited/selected-prefix network/broadcast、inside/local sourceはstateやresolutionを変更せず
+dropします。RFC 5508 REQ-4のexternal-realm profileとして、validな中継router sourceは
+引用remote addressと一致する必要がなく、translation後も不変です。
 
 UDPはpublic source portのlive mappingと同generationのremote destination IPv4 ADF peerを
 authorityとし、引用remote portはfilter keyにしません。TCPはpublic source portのlive mapping
 と引用remote destination IPv4/portに完全一致するlive sessionを要求します。lookupは
 mapping/session/peer、last activity、counter、monotonic watermarkを変更しません。退行時刻は
-typed drop、同時刻以上はread-onlyです。
+typed drop、同時刻以上はread-onlyです。RFC 5508 REQ-6が直接扱うのはICMP Queryまたは
+そのresponseに関係するICMP Errorです。このUDP/TCP引用でもstateを変更しない挙動は、
+REQ-6の安全目的を一般化したlocal policyであり、REQ-6の直接実装という主張ではありません。
 
 変換はouter Ethernet、outer destination/TTL/IPv4 checksum、引用source IPv4/source port/
 IPv4 checksum、ICMP checksumを一つのpreflight後にin-place更新します。引用UDP checksum
 zeroは保存し、nonzeroはRFC 1624更新後のzeroを`0xffff`へencodeします。TCP引用がtransport
 8..16 bytesならchecksum fieldを更新せず、17 bytesだけならpartial fieldとしてdropし、
 18 bytes以上なら更新します。引用IPv4 Total Lengthを境界にするため、その外側のopaque
-trailing bytesをTCP checksum fieldと誤認しません。RFC 4884 extension objectの検出・解析を
-実装したという主張ではありません。
+trailing bytesをTCP checksum fieldと誤認しません。これはlocal safe boundaryだけであり、
+RFC 5508 REQ-3(d)を完全に実装したという主張ではありません。RFC 4884 extension objectの
+検出・解析を含むfull supportはNAT44-019Nとしてdeferredです。
 translated internal addressを通常LPMし、inside egressと通常neighbor authorityを要求します。
 NAT state commitは無く、backend TX rejectでもstateは不変です。
 
