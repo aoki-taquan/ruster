@@ -355,6 +355,7 @@ pub struct ResolutionFailureCounters {
     pub no_accepted_arp_request: usize,
     pub cancelled: usize,
     pub reverse_arp_scheduled: usize,
+    pub reverse_arp_pending: usize,
     pub reverse_resolution_failed: usize,
     pub same_failed_key: usize,
     pub queued: usize,
@@ -369,6 +370,7 @@ pub struct ResolutionFailureDispatchReport {
     pub retained: usize,
     pub retired: usize,
     pub reverse_arp_scheduled: usize,
+    pub reverse_arp_pending: usize,
     pub pending: usize,
 }
 
@@ -392,6 +394,10 @@ pub enum ResolutionFailureTrace {
         reverse_egress: IfId,
     },
     ReverseArpScheduled {
+        forward: ResolutionGenerationToken,
+        reverse: ResolutionGenerationToken,
+    },
+    ReverseArpPending {
         forward: ResolutionGenerationToken,
         reverse: ResolutionGenerationToken,
     },
@@ -1442,16 +1448,28 @@ pub fn dispatch_host_unreachable_failures<T: ResolutionFailureTraceSink>(
                     reverse_egress,
                 });
             }
-            FailureDispatch::WaitReverse(reverse) => {
+            FailureDispatch::WaitReverse {
+                reverse,
+                newly_scheduled,
+            } => {
                 resolution.failure_holds[index].phase = ResolutionFailureHoldPhase::WaitingReverse;
                 resolution.failure_holds[index].reverse = reverse;
-                resolution.failure_counters.reverse_arp_scheduled += 1;
-                report.reverse_arp_scheduled += 1;
                 report.retained += 1;
-                trace.record_resolution_failure(ResolutionFailureTrace::ReverseArpScheduled {
-                    forward: hold.forward,
-                    reverse,
-                });
+                if newly_scheduled {
+                    resolution.failure_counters.reverse_arp_scheduled += 1;
+                    report.reverse_arp_scheduled += 1;
+                    trace.record_resolution_failure(ResolutionFailureTrace::ReverseArpScheduled {
+                        forward: hold.forward,
+                        reverse,
+                    });
+                } else {
+                    resolution.failure_counters.reverse_arp_pending += 1;
+                    report.reverse_arp_pending += 1;
+                    trace.record_resolution_failure(ResolutionFailureTrace::ReverseArpPending {
+                        forward: hold.forward,
+                        reverse,
+                    });
+                }
             }
             FailureDispatch::Retain(disposition) => {
                 resolution.failure_counters.retained_transient += 1;
@@ -1494,7 +1512,10 @@ pub fn dispatch_host_unreachable_failures<T: ResolutionFailureTraceSink>(
 
 enum FailureDispatch {
     Queued(IfId),
-    WaitReverse(ResolutionGenerationToken),
+    WaitReverse {
+        reverse: ResolutionGenerationToken,
+        newly_scheduled: bool,
+    },
     Retain(Icmpv4ErrorDisposition),
     ReverseFailed(ResolutionGenerationToken),
     SameFailedKey,
@@ -1617,7 +1638,10 @@ fn dispatch_one_failure(
                     now,
                     false,
                 );
-                if result == ResolutionResult::Failed {
+                if matches!(
+                    result,
+                    ResolutionResult::Failed | ResolutionResult::TimedOut
+                ) {
                     if let Some(status) = resolution.status(reverse_egress, target) {
                         return FailureDispatch::ReverseFailed(ResolutionGenerationToken {
                             egress: reverse_egress,
@@ -1640,11 +1664,17 @@ fn dispatch_one_failure(
                     let status = resolution
                         .status(reverse_egress, target)
                         .expect("active status was just observed");
-                    return FailureDispatch::WaitReverse(ResolutionGenerationToken {
-                        egress: reverse_egress,
-                        target,
-                        generation: status.generation,
-                    });
+                    return FailureDispatch::WaitReverse {
+                        reverse: ResolutionGenerationToken {
+                            egress: reverse_egress,
+                            target,
+                            generation: status.generation,
+                        },
+                        newly_scheduled: matches!(
+                            result,
+                            ResolutionResult::Queued | ResolutionResult::RetryQueued
+                        ),
+                    };
                 }
                 return FailureDispatch::Retain(
                     Icmpv4ErrorDisposition::ReverseNeighborUnresolved {

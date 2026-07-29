@@ -7,8 +7,8 @@ use ruster_core::{
     LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoGeneratedIcmpv4Trace,
     NoGeneratedTrace, NoResolutionFailureTrace, NoResolutionTimerTrace, NoTrace, PacketIo,
     ResolutionActionSlot, ResolutionFailureDispatchError, ResolutionFailureHoldPhase,
-    ResolutionFailureHoldSlot, ResolutionPhase, ResolutionPolicy, ResolutionRuntime,
-    ResolutionStateSlot, Route,
+    ResolutionFailureHoldSlot, ResolutionFailureTrace, ResolutionFailureTraceSink, ResolutionPhase,
+    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
 };
 use ruster_io_sim::{FrameOrigin, RecycleCause, SimIo};
 
@@ -111,6 +111,17 @@ fn forward_arp_reply() -> Vec<u8> {
 
 fn retry_policy() -> ResolutionPolicy {
     ResolutionPolicy::with_retry(1_000, 60_000, 1).unwrap()
+}
+
+#[derive(Default)]
+struct FailureTrace {
+    events: Vec<ResolutionFailureTrace>,
+}
+
+impl ResolutionFailureTraceSink for FailureTrace {
+    fn record_resolution_failure(&mut self, event: ResolutionFailureTrace) {
+        self.events.push(event);
+    }
 }
 
 #[test]
@@ -628,13 +639,14 @@ fn reverse_miss_survives_arp_then_learning_queues_once() {
         &mut NoResolutionTimerTrace,
     )
     .unwrap();
+    let mut failure_trace = FailureTrace::default();
     let first = dispatch_host_unreachable_failures(
         &mut resolution,
         &mut errors,
         &snapshot,
         MonotonicMillis(1_000),
         1,
-        &mut NoResolutionFailureTrace,
+        &mut failure_trace,
     )
     .unwrap();
     assert_eq!(
@@ -645,6 +657,32 @@ fn reverse_miss_survives_arp_then_learning_queues_once() {
         resolution.status(LAN, SOURCE).unwrap().phase,
         ResolutionPhase::InitialQueued
     );
+    assert!(matches!(
+        failure_trace.events.as_slice(),
+        [ResolutionFailureTrace::ReverseArpScheduled { .. }]
+    ));
+    let queued_wait = dispatch_host_unreachable_failures(
+        &mut resolution,
+        &mut errors,
+        &snapshot,
+        MonotonicMillis(1_000),
+        1,
+        &mut failure_trace,
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            queued_wait.reverse_arp_scheduled,
+            queued_wait.reverse_arp_pending,
+            resolution.pending_actions(),
+            resolution.failure_counters().reverse_arp_scheduled
+        ),
+        (0, 1, 1, 1)
+    );
+    assert!(matches!(
+        failure_trace.events.last(),
+        Some(ResolutionFailureTrace::ReverseArpPending { .. })
+    ));
     execute_one_arp_request(
         &mut io,
         &mut resolution,
@@ -652,6 +690,28 @@ fn reverse_miss_survives_arp_then_learning_queues_once() {
         &mut NoGeneratedTrace,
     )
     .unwrap();
+    let committed_wait = dispatch_host_unreachable_failures(
+        &mut resolution,
+        &mut errors,
+        &snapshot,
+        MonotonicMillis(1_000),
+        1,
+        &mut failure_trace,
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            committed_wait.reverse_arp_scheduled,
+            committed_wait.reverse_arp_pending,
+            resolution.pending_actions(),
+            resolution.failure_counters().reverse_arp_scheduled
+        ),
+        (0, 1, 0, 1)
+    );
+    assert!(matches!(
+        failure_trace.events.last(),
+        Some(ResolutionFailureTrace::ReverseArpPending { .. })
+    ));
     io.inject(LAN, arp_reply(SOURCE, REVERSE_MAC, LAN_IP));
     forward_batch_with_resolution(
         io.receive(1).unwrap(),

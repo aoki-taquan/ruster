@@ -253,7 +253,10 @@ reverse static/fresh dynamic hitなら共有`Icmpv4ErrorRuntime`へCode 1をqueu
 queueでき、reverse generationがFailedならrecursive ICMPを作らずretireします。同じfailed
 forward keyをreverse resolutionとして再開しません。ICMP FIFOのPending/rate/state/action
 pressureは候補を保持し、publication、forward learning/static、authority変更は未queue候補を
-cancelします。queue済みICMP actionはhistorical eventとしてcancelしません。
+cancelします。`reverse_arp_scheduled`はfailure dispatch自身が`Queued`/`RetryQueued`を作った
+場合だけ増やします。同じactive tokenの`InitialQueued`/`Waiting`/`RetryQueued`を反復scanした
+場合は`ReverseArpPending`であり、既存actionやtimer-generated retryを新規scheduleとして
+二重計上しません。queue済みICMP actionはhistorical eventとしてcancelしません。
 
 worker tick順は `publication/reconcile → RX → resolution timer poll → failure dispatch →
 generated ARP → generated ICMP` です。exact timeoutでのARP学習は、ICMP actionがqueueされる前
