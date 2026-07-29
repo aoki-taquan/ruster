@@ -4,9 +4,9 @@ use ruster_core::{
     Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig,
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace,
     ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
-    NAT44_TCP_DEFAULT_IDLE_TTL_MS,
+    TraceEvent, NAT44_TCP_DEFAULT_IDLE_TTL_MS,
 };
-use ruster_io_sim::{RecycleCause, SimIo};
+use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 
 const LAN: IfId = IfId(1);
 const WAN: IfId = IfId(2);
@@ -464,6 +464,46 @@ fn combined_realm_mismatch_fails_closed_without_cross_state() {
     let packet = udp_frame(HOST, REMOTE1, 40_000, 53);
     let mut io = SimIo::new();
     io.inject(LAN, packet.clone());
+    let mut trace = VecTrace::default();
+    io.run_nat44_udp_and_tcp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        MonotonicMillis(0),
+        &mut trace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::Nat44CombinedRealmMismatch, &packet);
+    assert!(udp.mappings().iter().all(|slot| !slot.is_occupied()));
+    assert!(tcp.mappings().iter().all(|slot| !slot.is_occupied()));
+    assert_eq!(udp.counters().config_mismatches, 1);
+    assert_eq!(tcp.counters().config_mismatches, 1);
+    assert!(matches!(
+        trace.events(),
+        [
+            TraceEvent::Ipv4Validated { ingress: LAN, .. },
+            TraceEvent::Nat44Udp {
+                ingress: LAN,
+                disposition: ruster_core::Nat44UdpDisposition::ConfigMismatch
+            },
+            TraceEvent::Nat44Tcp {
+                ingress: LAN,
+                disposition: ruster_core::Nat44TcpDisposition::ConfigMismatch
+            },
+            TraceEvent::Dropped {
+                ingress: LAN,
+                reason: DropReason::Nat44CombinedRealmMismatch
+            },
+            TraceEvent::BatchCompleted { .. }
+        ]
+    ));
+
+    let tcp_packet = tcp_frame(HOST, REMOTE1, 40_000, 443, 64, 0x4000, 0x02, &[], &[], &[]);
+    io.inject(LAN, tcp_packet.clone());
     io.run_nat44_udp_and_tcp_once(
         1,
         &snapshot,
@@ -476,11 +516,120 @@ fn combined_realm_mismatch_fails_closed_without_cross_state() {
         &mut NoTrace,
     )
     .unwrap();
-    assert_drop(&mut io, DropReason::Nat44CombinedRealmMismatch, &packet);
-    assert!(udp.mappings().iter().all(|slot| !slot.is_occupied()));
-    assert!(tcp.mappings().iter().all(|slot| !slot.is_occupied()));
-    assert_eq!(udp.counters().config_mismatches, 1);
-    assert_eq!(tcp.counters().config_mismatches, 1);
+    assert_drop(&mut io, DropReason::Nat44CombinedRealmMismatch, &tcp_packet);
+    assert_eq!(udp.counters().config_mismatches, 2);
+    assert_eq!(tcp.counters().config_mismatches, 2);
+}
+
+#[test]
+fn combined_realm_mismatch_ignores_icmp_and_unrelated_protocols() {
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let udp_config = Nat44UdpConfig::new(
+        &snapshot,
+        LAN,
+        WAN,
+        PUBLIC,
+        40_000,
+        40_000,
+        Nat44UdpPolicy::default(),
+    )
+    .unwrap();
+    let tcp_config = Nat44TcpConfig::new(
+        &snapshot,
+        WAN,
+        LAN,
+        Ipv4Address::from_octets([10, 0, 0, 1]),
+        40_000,
+        40_000,
+        Nat44TcpPolicy::default(),
+    )
+    .unwrap();
+    let mut udp_mappings = [Nat44UdpMappingSlot::default(); 1];
+    let mut udp_peers = [Nat44UdpPeerSlot::default(); 1];
+    let mut udp = Nat44UdpRuntime::new(udp_config, &mut udp_mappings, &mut udp_peers);
+    let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
+    let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
+    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut states, &mut actions);
+    let mut packets = Vec::new();
+    for protocol in [1, 99] {
+        let mut packet = tcp_frame(HOST, REMOTE1, 40_000, 443, 64, 0x4000, 0x02, &[], &[], &[]);
+        packet[23] = protocol;
+        refresh_ipv4_checksum(&mut packet);
+        packets.push(packet);
+    }
+
+    let mut expected_io = SimIo::new();
+    for packet in &packets {
+        expected_io.inject(LAN, packet.clone());
+    }
+    expected_io.run_once(2, &snapshot, &mut NoTrace).unwrap();
+    let expected = [expected_io.pop_tx().unwrap(), expected_io.pop_tx().unwrap()];
+
+    let mut io = SimIo::new();
+    for packet in packets {
+        io.inject(LAN, packet);
+    }
+    let mut trace = VecTrace::default();
+    let report = io
+        .run_nat44_udp_and_tcp_once(
+            2,
+            &snapshot,
+            &mut resolution,
+            &udp_config,
+            Some(&mut udp),
+            &tcp_config,
+            Some(&mut tcp),
+            MonotonicMillis(100),
+            &mut trace,
+        )
+        .unwrap();
+    assert_eq!((report.tx_requested, report.dropped), (2, 0));
+    for expected in expected {
+        let actual = io.pop_tx().unwrap();
+        assert_eq!(actual.egress, expected.egress);
+        assert_eq!(actual.bytes, expected.bytes);
+    }
+    assert!(!trace.events().iter().any(|event| {
+        matches!(
+            event,
+            TraceEvent::Nat44Udp { .. } | TraceEvent::Nat44Tcp { .. }
+        )
+    }));
+    assert_eq!(udp.counters(), Default::default());
+    assert_eq!(tcp.counters(), Default::default());
+
+    io.inject(LAN, udp_frame(HOST, REMOTE1, 40_000, 53));
+    io.run_nat44_udp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        MonotonicMillis(99),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_eq!(io.pop_tx().unwrap().egress, WAN);
+
+    io.inject(
+        WAN,
+        tcp_frame(REMOTE1, HOST, 40_000, 443, 64, 0x4000, 0x02, &[], &[], &[]),
+    );
+    io.run_nat44_tcp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &tcp_config,
+        Some(&mut tcp),
+        MonotonicMillis(99),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_eq!(io.pop_tx().unwrap().egress, LAN);
 }
 
 #[test]
@@ -690,7 +839,7 @@ fn malformed_checksum_fragment_source_zero_and_options_are_atomic() {
 }
 
 #[test]
-fn icmp_crossing_is_fail_closed_without_touching_tcp_clock_or_state() {
+fn icmp_crossing_uses_normal_forwarding_without_touching_tcp_clock_or_state() {
     let (routes, interfaces, neighbors, bindings) = topology();
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
     let config = config(&snapshot, 40_000, 40_000);
@@ -715,7 +864,9 @@ fn icmp_crossing_is_fail_closed_without_touching_tcp_clock_or_state() {
         &mut NoTrace,
     )
     .unwrap();
-    assert_drop(&mut io, DropReason::Nat44TcpUnsupportedTransport, &icmp);
+    let forwarded = io.pop_tx().unwrap();
+    assert_eq!(forwarded.egress, WAN);
+    assert_eq!(&forwarded.bytes[26..30], &HOST.octets());
     assert_eq!(nat.counters(), Default::default());
 
     io.inject(

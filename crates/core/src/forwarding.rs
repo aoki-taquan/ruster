@@ -1032,24 +1032,18 @@ fn decide_ipv4<T: TraceSink>(
     let nat_now = resolution
         .as_ref()
         .map_or(MonotonicMillis(0), |(_, now)| *now);
-    if let (Some(udp), Some(tcp)) = (nat44_udp_config, nat44_tcp_config) {
-        if !tcp.realm_matches_udp(*udp) {
-            if let Some(runtime) = nat44_udp.as_deref_mut() {
-                runtime.record_config_mismatch();
-            }
-            if let Some(runtime) = nat44_tcp.as_deref_mut() {
-                runtime.record_config_mismatch();
-            }
-            trace.record(TraceEvent::Nat44Tcp {
-                ingress,
-                disposition: Nat44TcpDisposition::ConfigMismatch,
-            });
-            return Err(Nat44CombinedRealmMismatch);
-        }
+    let combined_realm_mismatch = matches!((nat44_udp_config, nat44_tcp_config), (Some(udp), Some(tcp)) if !tcp.realm_matches_udp(*udp));
+    if combined_realm_mismatch
+        && matches!(ipv4.protocol, 6 | 17)
+        && (nat44_udp_config.is_some_and(|config| ipv4.destination == config.public_address())
+            || nat44_tcp_config.is_some_and(|config| ipv4.destination == config.public_address()))
+    {
+        return reject_combined_realm_mismatch(ingress, nat44_udp, nat44_tcp, trace);
     }
     if let Some(config) = nat44_tcp_config {
         if ipv4.protocol == 6
             && (ingress == config.inside() || ipv4.destination == config.public_address())
+            && !combined_realm_mismatch
         {
             observe_nat44_tcp_candidate_if_present(
                 snapshot, config, nat44_tcp, nat_now, ingress, trace,
@@ -1129,6 +1123,18 @@ fn decide_ipv4<T: TraceSink>(
         }
         return Err(RouteMiss);
     };
+    if combined_realm_mismatch && matches!(ipv4.protocol, 6 | 17) {
+        let crosses_mismatched_realm = nat44_udp_config.is_some_and(|config| {
+            (ingress == config.inside() && route.egress() == config.outside())
+                || (ingress == config.outside() && route.egress() == config.inside())
+        }) || nat44_tcp_config.is_some_and(|config| {
+            (ingress == config.inside() && route.egress() == config.outside())
+                || (ingress == config.outside() && route.egress() == config.inside())
+        });
+        if crosses_mismatched_realm {
+            return reject_combined_realm_mismatch(ingress, nat44_udp, nat44_tcp, trace);
+        }
+    }
     if nat44_udp_config.is_some_and(|config| {
         ingress == config.outside()
             && route.egress() == config.inside()
@@ -1136,9 +1142,11 @@ fn decide_ipv4<T: TraceSink>(
     }) {
         return nat44_udp_drop(ingress, Nat44ExternalToInternalBypass, trace);
     }
-    if nat44_tcp_config
-        .is_some_and(|config| ingress == config.outside() && route.egress() == config.inside())
-    {
+    if nat44_tcp_config.is_some_and(|config| {
+        ingress == config.outside()
+            && route.egress() == config.inside()
+            && (ipv4.protocol == 6 || nat44_udp_config.is_none())
+    }) {
         return nat44_tcp_drop(ingress, Nat44ExternalToInternalBypass, trace);
     }
     if ipv4.ttl <= 1 {
@@ -1294,14 +1302,18 @@ fn decide_ipv4<T: TraceSink>(
             );
         }
     }
-    let crosses_udp = nat44_udp_config
-        .is_some_and(|config| ingress == config.inside() && route.egress() == config.outside());
-    let crosses_tcp = nat44_tcp_config
-        .is_some_and(|config| ingress == config.inside() && route.egress() == config.outside());
-    if crosses_tcp {
+    let crosses_udp_only = nat44_tcp_config.is_none()
+        && ipv4.protocol == 6
+        && nat44_udp_config
+            .is_some_and(|config| ingress == config.inside() && route.egress() == config.outside());
+    let crosses_tcp_only = nat44_udp_config.is_none()
+        && ipv4.protocol == 17
+        && nat44_tcp_config
+            .is_some_and(|config| ingress == config.inside() && route.egress() == config.outside());
+    if crosses_tcp_only {
         return nat44_tcp_drop(ingress, Nat44TcpUnsupportedTransport, trace);
     }
-    if crosses_udp {
+    if crosses_udp_only {
         return nat44_udp_drop(ingress, Nat44UdpUnsupportedTransport, trace);
     }
     Ok(PacketDecision::Ipv4(forwarding))
@@ -2133,6 +2145,29 @@ fn observe_nat_candidate_if_present<T: TraceSink>(
         return Err(reason);
     }
     Ok(())
+}
+
+fn reject_combined_realm_mismatch<T: TraceSink>(
+    ingress: IfId,
+    nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
+    nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
+    trace: &mut T,
+) -> Result<PacketDecision, DropReason> {
+    if let Some(runtime) = nat44_udp.as_deref_mut() {
+        runtime.record_config_mismatch();
+    }
+    if let Some(runtime) = nat44_tcp.as_deref_mut() {
+        runtime.record_config_mismatch();
+    }
+    trace.record(TraceEvent::Nat44Udp {
+        ingress,
+        disposition: Nat44UdpDisposition::ConfigMismatch,
+    });
+    trace.record(TraceEvent::Nat44Tcp {
+        ingress,
+        disposition: Nat44TcpDisposition::ConfigMismatch,
+    });
+    Err(Nat44CombinedRealmMismatch)
 }
 
 fn nat44_tcp_plan_error(error: Nat44TcpPlanError) -> (DropReason, Nat44TcpDisposition) {
