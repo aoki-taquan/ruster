@@ -673,7 +673,7 @@ fn reconcile_static_clears_stale_cache_and_wrapped_middle_action_fifo() {
         },
         Neighbor {
             interface: IFACE,
-            target: THIRD,
+            target: FOURTH,
             mac: MacAddress([2, 7, 7, 7, 7, 8]),
         },
     ];
@@ -728,7 +728,7 @@ fn reconcile_static_clears_stale_cache_and_wrapped_middle_action_fifo() {
     io.pop_recycled();
     assert_eq!(rt.pending_actions(), 3, "removed capacity is reusable");
 
-    for (expected_egress, expected_target) in [(IFACE, FOURTH), (second_if, PEER), (IFACE, FIFTH)] {
+    for (expected_egress, expected_target) in [(IFACE, THIRD), (second_if, PEER), (IFACE, FIFTH)] {
         execute_one_arp_request(&mut io, &mut rt, MonotonicMillis(0), &mut NoGeneratedTrace)
             .unwrap()
             .unwrap();
