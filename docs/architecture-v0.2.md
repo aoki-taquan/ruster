@@ -225,7 +225,7 @@ Ethernet headerとTotal Length後のpaddingは引用しません。生成wire pr
 - outer IPv4 Total Lengthは最大576、Ethernet frameは最大590 bytes。
 
 RFC 1812のerror suppressionとして、invalid/non-host/router-local source、IP
-multicast/limited/directed-broadcast destination、Ethernet group destination、
+multicast/limited/prefix-network/directed-broadcast destination、Ethernet group destination、
 noninitial fragment、ICMP error Types 3/4/5/11/12、protocol 1でtype byteが無いpacket、
 reverse route/interface/binding/neighbor不在では生成しません。first fragment
 offset=0/MF=1とICMP queryは生成可能です。source/destinationのprefix network/broadcast

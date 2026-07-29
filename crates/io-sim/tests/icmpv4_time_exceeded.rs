@@ -332,6 +332,22 @@ fn selected_gateway_prefix_suppresses_remote_boundaries_but_lpm_host_routes_win(
         ),
         Icmpv4TimeExceededDisposition::DestinationDirectedBroadcast
     );
+    assert_eq!(
+        error_disposition(
+            &base,
+            frame(
+                SOURCE,
+                Ipv4Address::from_octets([172, 16, 1, 0]),
+                1,
+                17,
+                0,
+                0,
+                &[],
+                &[],
+            ),
+        ),
+        Icmpv4TimeExceededDisposition::DestinationNetworkAddress
+    );
     for source in [
         Ipv4Address::from_octets([203, 0, 113, 0]),
         Ipv4Address::from_octets([203, 0, 113, 255]),
@@ -357,6 +373,13 @@ fn selected_gateway_prefix_suppresses_remote_boundaries_but_lpm_host_routes_win(
     let host_destination_routes = [
         gateway_destination,
         Route::new(
+            Ipv4Address::from_octets([172, 16, 1, 0]),
+            32,
+            WAN,
+            Some(REVERSE_GATEWAY),
+        )
+        .unwrap(),
+        Route::new(
             Ipv4Address::from_octets([172, 16, 1, 255]),
             32,
             WAN,
@@ -369,22 +392,18 @@ fn selected_gateway_prefix_suppresses_remote_boundaries_but_lpm_host_routes_win(
     let host_destination =
         ForwardingSnapshot::new(&host_destination_routes, &interfaces, &neighbors, &bindings)
             .unwrap();
-    assert!(matches!(
-        error_disposition(
-            &host_destination,
-            frame(
-                SOURCE,
-                Ipv4Address::from_octets([172, 16, 1, 255]),
-                1,
-                17,
-                0,
-                0,
-                &[],
-                &[],
+    for destination in [
+        Ipv4Address::from_octets([172, 16, 1, 0]),
+        Ipv4Address::from_octets([172, 16, 1, 255]),
+    ] {
+        assert!(matches!(
+            error_disposition(
+                &host_destination,
+                frame(SOURCE, destination, 1, 17, 0, 0, &[], &[]),
             ),
-        ),
-        Icmpv4TimeExceededDisposition::Queued { .. }
-    ));
+            Icmpv4TimeExceededDisposition::Queued { .. }
+        ));
+    }
 
     let point_to_point_destination_routes = [
         gateway_destination,
@@ -693,6 +712,19 @@ fn rfc1812_suppression_matrix_is_typed_and_byte_atomic() {
                 &[],
             ),
             Icmpv4TimeExceededDisposition::DestinationLimitedBroadcast,
+        ),
+        (
+            frame(
+                SOURCE,
+                Ipv4Address::from_octets([10, 0, 0, 0]),
+                1,
+                17,
+                0,
+                0,
+                &[],
+                &[],
+            ),
+            Icmpv4TimeExceededDisposition::DestinationNetworkAddress,
         ),
         (
             frame(

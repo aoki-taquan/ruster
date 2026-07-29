@@ -172,6 +172,7 @@ pub enum Icmpv4TimeExceededDisposition {
     SourceIsLocal,
     DestinationMulticast,
     DestinationLimitedBroadcast,
+    DestinationNetworkAddress,
     DestinationDirectedBroadcast,
     EthernetDestinationGroup,
     NonInitialFragment,
@@ -207,6 +208,7 @@ pub struct Icmpv4ErrorCounters {
     pub source_is_local: usize,
     pub destination_multicast: usize,
     pub destination_limited_broadcast: usize,
+    pub destination_network_address: usize,
     pub destination_directed_broadcast: usize,
     pub ethernet_destination_group: usize,
     pub noninitial_fragment: usize,
@@ -300,6 +302,9 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             }
             Icmpv4TimeExceededDisposition::DestinationLimitedBroadcast => {
                 self.counters.destination_limited_broadcast += 1;
+            }
+            Icmpv4TimeExceededDisposition::DestinationNetworkAddress => {
+                self.counters.destination_network_address += 1;
             }
             Icmpv4TimeExceededDisposition::DestinationDirectedBroadcast => {
                 self.counters.destination_directed_broadcast += 1;

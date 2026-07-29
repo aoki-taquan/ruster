@@ -693,11 +693,15 @@ fn decide_icmpv4_time_exceeded<T: TraceSink>(
         return runtime
             .record_suppression(Icmpv4TimeExceededDisposition::DestinationLimitedBroadcast);
     }
-    if route::lookup(snapshot.routes, ipv4.destination)
-        .is_some_and(|selected| selected.is_prefix_directed_broadcast(ipv4.destination))
-    {
-        return runtime
-            .record_suppression(Icmpv4TimeExceededDisposition::DestinationDirectedBroadcast);
+    if let Some(selected) = route::lookup(snapshot.routes, ipv4.destination) {
+        if selected.is_prefix_network_address(ipv4.destination) {
+            return runtime
+                .record_suppression(Icmpv4TimeExceededDisposition::DestinationNetworkAddress);
+        }
+        if selected.is_prefix_directed_broadcast(ipv4.destination) {
+            return runtime
+                .record_suppression(Icmpv4TimeExceededDisposition::DestinationDirectedBroadcast);
+        }
     }
     if frame.first().is_some_and(|first| first & 1 != 0) {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::EthernetDestinationGroup);
