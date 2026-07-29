@@ -200,6 +200,83 @@ mod tcp_tests {
     }
 
     #[test]
+    fn tcp_icmp_lookup_is_read_only_across_time_generation_and_zero_capacity() {
+        with_config(
+            Nat44TcpPolicy::new(NAT44_TCP_MIN_IDLE_TTL_MS, 0)
+                .unwrap()
+                .with_icmpv4_errors(Nat44Icmpv4ErrorPolicy::ExternalOnly),
+            40_000,
+            40_000,
+            |config| {
+                let mut no_mappings = [];
+                let mut no_sessions = [];
+                let empty = Nat44TcpRuntime::new(config, &mut no_mappings, &mut no_sessions);
+                assert!(matches!(
+                    empty.inspect_icmpv4(40_000, REMOTE1, 443, 0),
+                    Err(Nat44TcpPlanError::MappingMiss)
+                ));
+
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+                let mut runtime = Nat44TcpRuntime::new(config, &mut mappings, &mut sessions);
+                let first = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 100)
+                    .unwrap();
+                runtime.commit_outbound(first, 100);
+                let before_mapping = runtime.mappings()[0];
+                let before_session = runtime.sessions()[0];
+                let before_counters = runtime.counters();
+                assert!(matches!(
+                    runtime.inspect_icmpv4(40_000, REMOTE1, 443, 99),
+                    Err(Nat44TcpPlanError::ClockRegression)
+                ));
+                for now in [100, 100 + NAT44_TCP_MIN_IDLE_TTL_MS - 1] {
+                    let lookup = runtime.inspect_icmpv4(40_000, REMOTE1, 443, now).unwrap();
+                    assert_eq!(lookup.internal_address(), INTERNAL);
+                    assert_eq!(lookup.internal_port(), 40_000);
+                }
+                assert!(matches!(
+                    runtime.inspect_icmpv4(40_000, REMOTE1, 443, 100 + NAT44_TCP_MIN_IDLE_TTL_MS),
+                    Err(Nat44TcpPlanError::MappingMiss)
+                ));
+                assert!(runtime.inspect_icmpv4(40_000, REMOTE1, 443, 100).is_ok());
+                assert_eq!(runtime.mappings()[0], before_mapping);
+                assert_eq!(runtime.sessions()[0], before_session);
+                assert_eq!(runtime.counters(), before_counters);
+
+                let reused = runtime
+                    .plan_outbound(
+                        INTERNAL2,
+                        40_000,
+                        REMOTE2,
+                        8443,
+                        true,
+                        100 + NAT44_TCP_MIN_IDLE_TTL_MS,
+                    )
+                    .unwrap();
+                runtime.commit_outbound(reused, 100 + NAT44_TCP_MIN_IDLE_TTL_MS);
+                assert!(matches!(
+                    runtime.inspect_icmpv4(
+                        reused.public_port(),
+                        REMOTE1,
+                        443,
+                        100 + NAT44_TCP_MIN_IDLE_TTL_MS
+                    ),
+                    Err(Nat44TcpPlanError::SessionMiss)
+                ));
+                assert!(runtime
+                    .inspect_icmpv4(
+                        reused.public_port(),
+                        REMOTE2,
+                        8443,
+                        100 + NAT44_TCP_MIN_IDLE_TTL_MS
+                    )
+                    .is_ok());
+            },
+        );
+    }
+
+    #[test]
     fn tcp_allocator_preserves_scans_once_and_never_overloads() {
         with_config(
             Nat44TcpPolicy::new(NAT44_TCP_MIN_IDLE_TTL_MS, u64::MAX).unwrap(),
@@ -2021,6 +2098,70 @@ mod tests {
             ));
             assert!(runtime
                 .plan_inbound(reused.public_port(), REMOTE2, NAT44_UDP_MIN_IDLE_TTL_MS + 1)
+                .is_ok());
+        });
+    }
+
+    #[test]
+    fn udp_icmp_lookup_is_read_only_across_time_generation_and_zero_capacity() {
+        let policy = Nat44UdpPolicy::new(NAT44_UDP_MIN_IDLE_TTL_MS, 0)
+            .unwrap()
+            .with_icmpv4_errors(Nat44Icmpv4ErrorPolicy::ExternalOnly);
+        with_config(policy, |config| {
+            let mut no_mappings = [];
+            let mut no_peers = [];
+            let empty = Nat44UdpRuntime::new(config, &mut no_mappings, &mut no_peers);
+            assert!(matches!(
+                empty.inspect_icmpv4(40_000, REMOTE1, 0),
+                Err(Nat44UdpPlanError::MappingMiss)
+            ));
+
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut runtime = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+            let first = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, 100)
+                .unwrap();
+            runtime.commit_outbound(first, 100);
+            let before_mapping = runtime.mappings()[0];
+            let before_peer = runtime.peers()[0];
+            let before_counters = runtime.counters();
+            assert!(matches!(
+                runtime.inspect_icmpv4(40_000, REMOTE1, 99),
+                Err(Nat44UdpPlanError::ClockRegression)
+            ));
+            for now in [100, 100 + NAT44_UDP_MIN_IDLE_TTL_MS - 1] {
+                let lookup = runtime.inspect_icmpv4(40_000, REMOTE1, now).unwrap();
+                assert_eq!(lookup.internal_address(), INTERNAL);
+                assert_eq!(lookup.internal_port(), 40_000);
+            }
+            assert!(matches!(
+                runtime.inspect_icmpv4(40_000, REMOTE1, 100 + NAT44_UDP_MIN_IDLE_TTL_MS),
+                Err(Nat44UdpPlanError::MappingMiss)
+            ));
+            assert!(runtime.inspect_icmpv4(40_000, REMOTE1, 100).is_ok());
+            assert_eq!(runtime.mappings()[0], before_mapping);
+            assert_eq!(runtime.peers()[0], before_peer);
+            assert_eq!(runtime.counters(), before_counters);
+
+            let reused = runtime
+                .plan_outbound(INTERNAL2, 40_000, REMOTE2, 100 + NAT44_UDP_MIN_IDLE_TTL_MS)
+                .unwrap();
+            runtime.commit_outbound(reused, 100 + NAT44_UDP_MIN_IDLE_TTL_MS);
+            assert!(matches!(
+                runtime.inspect_icmpv4(
+                    reused.public_port(),
+                    REMOTE1,
+                    100 + NAT44_UDP_MIN_IDLE_TTL_MS
+                ),
+                Err(Nat44UdpPlanError::FilterDenied)
+            ));
+            assert!(runtime
+                .inspect_icmpv4(
+                    reused.public_port(),
+                    REMOTE2,
+                    100 + NAT44_UDP_MIN_IDLE_TTL_MS
+                )
                 .is_ok());
         });
     }

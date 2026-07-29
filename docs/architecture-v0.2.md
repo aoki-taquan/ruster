@@ -461,9 +461,19 @@ safe FIN/RST cleanupはdeferredです。
 `Nat44UdpPolicy`または`Nat44TcpPolicy`の`icmpv4_errors`を`ExternalOnly`へ明示設定した
 serviceだけが、outside ingress/public IPv4宛てICMPv4 Type 3/Code 4をlocal consumeより前に
 interceptします。default `Disabled`は従来どおりunsupported local controlとしてconsume
-します。対象はouter IHL=5、nonfragment、TTL>1、valid ICMP checksumと、validなIPv4 headerを
-含む引用です。引用datagramはDF=1/MF=0/offset=0、UDPまたはTCP、public sourceで、IPv4 header
-とtransport先頭8 bytesが実際に存在することを要求します。
+します。combined serviceでは引用protocolに対応するpolicyだけがopt-in判定を所有するため、
+UDPだけを有効にしてもTCP引用をinterceptせず、その逆も同じです。Type/Codeと引用protocolの
+peekはouter IPv4 Total Length内だけで行い、link paddingをcandidate bytesとして扱いません。
+対象はouter IHL=5、nonfragment、TTL>1、valid ICMP checksumと、validなIPv4 headerを含む
+引用です。引用datagramはDF=1/MF=0/offset=0、UDPまたはTCP、public sourceで、IPv4 headerと
+transport先頭8 bytesが実際に存在することを要求します。
+
+RFC 5508 REQ-3に従いouter ICMP checksumと引用IPv4 checksumを検証し、引用IPv4 optionsを
+IHLで越えてtransportを探し、embedded transport checksumそのものは検証しません。outer
+sourceはhost-unicast、router-localでないこと、outsideへreverse LPMされることを要求します。
+0/8、127/8、multicast、240/4、limited/selected-prefix network/broadcast、inside/local source
+はstateやresolutionを変更せずdropします。RFC 5508 REQ-4のexternal-realm profileとして、
+validな中継router sourceは引用remote addressと一致する必要がなく、translation後も不変です。
 
 UDPはpublic source portのlive mappingと同generationのremote destination IPv4 ADF peerを
 authorityとし、引用remote portはfilter keyにしません。TCPはpublic source portのlive mapping
@@ -475,10 +485,18 @@ typed drop、同時刻以上はread-onlyです。
 IPv4 checksum、ICMP checksumを一つのpreflight後にin-place更新します。引用UDP checksum
 zeroは保存し、nonzeroはRFC 1624更新後のzeroを`0xffff`へencodeします。TCP引用がtransport
 8..16 bytesならchecksum fieldを更新せず、17 bytesだけならpartial fieldとしてdropし、
-18 bytes以上なら更新します。引用IPv4 Total Lengthを境界にするため、後続ICMP extensionを
-TCP checksum fieldと誤認しません。embedded transport checksum自体のvalidityは検証しません。
+18 bytes以上なら更新します。引用IPv4 Total Lengthを境界にするため、その外側のopaque
+trailing bytesをTCP checksum fieldと誤認しません。RFC 4884 extension objectの検出・解析を
+実装したという主張ではありません。
 translated internal addressを通常LPMし、inside egressと通常neighbor authorityを要求します。
 NAT state commitは無く、backend TX rejectでもstateは不変です。
+
+RFC 1191およびRFC 5508 §7.1.2に関係する受信Type 3/Code 4として、unused 16 bitsとNext-Hop
+MTU 16 bitsは解釈・clampせず32 bitsすべてを保存します。MTU 0、68、1500、65535も同じです。
+local forwarding MTUとの比較、PMTU cache更新、MTU 0のplateau推定、local MTU超過時の
+Type 3/Code 4生成はまだありません。DF=0 packetの必要なfragmentation、private→externalの
+RFC 5508 REQ-5、hairpin ICMP errorのREQ-7、他のICMP error type/code、ICMP query NAT、
+RFC 4884 full supportもdeferredです。
 
 eager dynamic-cache scan/flush、unresolved packet hold queue、gratuitous ARP生成、
 ARP Probe/Announcement生成、proxy ARP、VLAN、Address Conflict Detection、実装済み

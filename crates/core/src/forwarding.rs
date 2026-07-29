@@ -108,6 +108,7 @@ pub enum DropReason {
     Nat44Icmpv4QuotedPublicSourceMismatch = 90,
     Nat44Icmpv4TcpChecksumPartial = 91,
     Nat44Icmpv4WrongEgress = 92,
+    Nat44Icmpv4SourceForbidden = 93,
 }
 
 use DropReason::*;
@@ -208,6 +209,7 @@ impl DropReason {
             Nat44Icmpv4QuotedPublicSourceMismatch => "NAT44_ICMPV4_QUOTED_PUBLIC_SOURCE_MISMATCH",
             Nat44Icmpv4TcpChecksumPartial => "NAT44_ICMPV4_TCP_CHECKSUM_PARTIAL",
             Nat44Icmpv4WrongEgress => "NAT44_ICMPV4_WRONG_EGRESS",
+            Nat44Icmpv4SourceForbidden => "NAT44_ICMPV4_SOURCE_FORBIDDEN",
         }
     }
 }
@@ -1114,18 +1116,7 @@ fn decide_ipv4<T: TraceSink>(
         .as_ref()
         .map_or(MonotonicMillis(0), |(_, now)| *now);
     let combined_realm_mismatch = matches!((nat44_udp_config, nat44_tcp_config), (Some(udp), Some(tcp)) if !tcp.realm_matches_udp(*udp));
-    let nat44_icmpv4_candidate = ipv4.protocol == 1
-        && (nat44_udp_config.is_some_and(|config| {
-            config.policy().icmpv4_errors() == Nat44Icmpv4ErrorPolicy::ExternalOnly
-                && ipv4.destination == config.public_address()
-        }) || nat44_tcp_config.is_some_and(|config| {
-            config.policy().icmpv4_errors() == Nat44Icmpv4ErrorPolicy::ExternalOnly
-                && ipv4.destination == config.public_address()
-        }))
-        && frame
-            .get(ipv4.header_offset + ipv4.header_len..ipv4.header_offset + ipv4.header_len + 2)
-            .is_some_and(|type_and_code| type_and_code == [3, 4]);
-    if nat44_icmpv4_candidate {
+    if is_nat44_icmpv4_candidate(frame, ipv4, nat44_udp_config, nat44_tcp_config) {
         return decide_nat44_icmpv4_frag_needed(
             frame,
             snapshot,
@@ -1431,6 +1422,49 @@ fn decide_ipv4<T: TraceSink>(
     Ok(PacketDecision::Ipv4(forwarding))
 }
 
+fn is_nat44_icmpv4_candidate(
+    frame: &[u8],
+    ipv4: packet::ValidatedIpv4,
+    nat44_udp_config: Option<&Nat44UdpConfig>,
+    nat44_tcp_config: Option<&Nat44TcpConfig>,
+) -> bool {
+    if ipv4.protocol != 1 {
+        return false;
+    }
+    let Some(ipv4_end) = ipv4.header_offset.checked_add(ipv4.total_len) else {
+        return false;
+    };
+    let Some(icmp_offset) = ipv4.header_offset.checked_add(ipv4.header_len) else {
+        return false;
+    };
+    let Some(type_code_end) = icmp_offset.checked_add(2) else {
+        return false;
+    };
+    if type_code_end > ipv4_end || frame.get(icmp_offset..type_code_end) != Some([3, 4].as_slice())
+    {
+        return false;
+    }
+
+    let udp_enabled = nat44_udp_config.is_some_and(|config| {
+        config.policy().icmpv4_errors() == Nat44Icmpv4ErrorPolicy::ExternalOnly
+            && ipv4.destination == config.public_address()
+    });
+    let tcp_enabled = nat44_tcp_config.is_some_and(|config| {
+        config.policy().icmpv4_errors() == Nat44Icmpv4ErrorPolicy::ExternalOnly
+            && ipv4.destination == config.public_address()
+    });
+    let quoted_protocol = icmp_offset
+        .checked_add(8 + 9)
+        .filter(|offset| *offset < ipv4_end)
+        .and_then(|offset| frame.get(offset))
+        .copied();
+    match quoted_protocol {
+        Some(17) => udp_enabled,
+        Some(6) => tcp_enabled,
+        Some(_) | None => udp_enabled || tcp_enabled,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ParsedNat44Icmpv4Quote {
     protocol: u8,
@@ -1465,6 +1499,14 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
 ) -> Result<PacketDecision, DropReason> {
     let quote = parse_nat44_icmpv4_frag_needed(frame, outer)
         .map_err(|reason| trace_nat44_icmpv4_drop(ingress, reason, trace))?;
+    if !icmp_error_source_is_host(snapshot, outer.source)
+        || snapshot
+            .local_ipv4
+            .iter()
+            .any(|binding| binding.address == outer.source)
+    {
+        return nat44_icmpv4_drop(ingress, Nat44Icmpv4SourceForbidden, trace);
+    }
 
     let (inside, internal_address, internal_port) = match quote.protocol {
         17 => {
@@ -1482,6 +1524,11 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
             }
             if ingress != config.outside() {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongIngress, trace);
+            }
+            if route::lookup(snapshot.routes, outer.source)
+                .is_none_or(|reverse| reverse.egress() != config.outside())
+            {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4SourceForbidden, trace);
             }
             if !config.authority_matches(snapshot) {
                 return nat44_icmpv4_drop(ingress, Nat44UdpConfigMismatch, trace);
@@ -1528,6 +1575,11 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
             }
             if ingress != config.outside() {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongIngress, trace);
+            }
+            if route::lookup(snapshot.routes, outer.source)
+                .is_none_or(|reverse| reverse.egress() != config.outside())
+            {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4SourceForbidden, trace);
             }
             if !config.authority_matches(snapshot) {
                 return nat44_icmpv4_drop(ingress, Nat44TcpConfigMismatch, trace);
@@ -3513,7 +3565,128 @@ fn apply_icmpv4_echo_reply(
 
 #[cfg(test)]
 mod tests {
-    use super::DropReason;
+    use super::{decide_ipv4, DropReason};
+    use crate::{
+        ipv4_header_checksum, ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
+        MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44UdpConfig, Nat44UdpMappingSlot,
+        Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, NoTrace, ResolutionActionSlot,
+        ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
+    };
+
+    const LAN: IfId = IfId(1);
+    const WAN: IfId = IfId(2);
+    const PUBLIC: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 10]);
+    const INTERNAL: Ipv4Address = Ipv4Address::from_octets([10, 0, 0, 10]);
+    const REMOTE: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 20]);
+    const ROUTER: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 1]);
+
+    fn frag_needed_frame() -> Vec<u8> {
+        let mut frame = vec![0_u8; 14 + 20 + 8 + 20 + 8];
+        frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+        frame[14] = 0x45;
+        frame[16..18].copy_from_slice(&56_u16.to_be_bytes());
+        frame[20..22].copy_from_slice(&0x4000_u16.to_be_bytes());
+        frame[22] = 64;
+        frame[23] = 1;
+        frame[26..30].copy_from_slice(&ROUTER.octets());
+        frame[30..34].copy_from_slice(&PUBLIC.octets());
+        frame[34..36].copy_from_slice(&[3, 4]);
+        frame[40..42].copy_from_slice(&1500_u16.to_be_bytes());
+        frame[42] = 0x45;
+        frame[44..46].copy_from_slice(&28_u16.to_be_bytes());
+        frame[48..50].copy_from_slice(&0x4000_u16.to_be_bytes());
+        frame[50] = 64;
+        frame[51] = 17;
+        frame[54..58].copy_from_slice(&PUBLIC.octets());
+        frame[58..62].copy_from_slice(&REMOTE.octets());
+        frame[62..64].copy_from_slice(&40_000_u16.to_be_bytes());
+        frame[64..66].copy_from_slice(&53_u16.to_be_bytes());
+        frame[66..68].copy_from_slice(&8_u16.to_be_bytes());
+        let inner_checksum = ipv4_header_checksum(&frame[42..62]);
+        frame[52..54].copy_from_slice(&inner_checksum.to_be_bytes());
+        let icmp_checksum = crate::internet_checksum(&frame[34..70]);
+        frame[36..38].copy_from_slice(&icmp_checksum.to_be_bytes());
+        let outer_checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&outer_checksum.to_be_bytes());
+        frame
+    }
+
+    fn assert_icmp_routing_defense(routes: &[Route], expected: DropReason) {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: Ipv4Address::from_octets([10, 0, 0, 1]),
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+        ];
+        let snapshot = ForwardingSnapshot::new(routes, &interfaces, &[], &bindings).unwrap();
+        let config = Nat44UdpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44UdpPolicy::default().with_icmpv4_errors(Nat44Icmpv4ErrorPolicy::ExternalOnly),
+        )
+        .unwrap();
+        let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+        let mut peers = [Nat44UdpPeerSlot::default(); 1];
+        let mut nat = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+        let plan = nat.plan_outbound(INTERNAL, 12_345, REMOTE, 0).unwrap();
+        nat.commit_outbound(plan, 0);
+        let before_mapping = nat.mappings()[0];
+        let before_peer = nat.peers()[0];
+        let before_counters = nat.counters();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut resolution = ResolutionRuntime::new(
+            ResolutionPolicy::new(1_000, 2_000).unwrap(),
+            &mut states,
+            &mut actions,
+        );
+        let mut resolution = Some((&mut resolution, MonotonicMillis(0)));
+        let mut generated_errors = None;
+        let mut udp = Some(&mut nat);
+        let mut tcp = None;
+        let result = decide_ipv4(
+            &frag_needed_frame(),
+            &snapshot,
+            WAN,
+            &mut resolution,
+            &mut generated_errors,
+            Some(&config),
+            &mut udp,
+            None,
+            &mut tcp,
+            &mut NoTrace,
+        );
+        assert!(matches!(result, Err(reason) if reason == expected));
+        assert_eq!(nat.mappings()[0], before_mapping);
+        assert_eq!(nat.peers()[0], before_peer);
+        assert_eq!(nat.counters(), before_counters);
+    }
+
+    #[test]
+    fn icmp_translation_route_miss_and_wrong_egress_are_defensive_and_read_only() {
+        let route_to_router = Route::new(ROUTER, 32, WAN, None).expect("host route is canonical");
+        assert_icmp_routing_defense(&[route_to_router], DropReason::RouteMiss);
+        let default = Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, None).unwrap();
+        assert_icmp_routing_defense(&[default], DropReason::Nat44Icmpv4WrongEgress);
+    }
 
     #[test]
     fn drop_reason_discriminants_and_codes_are_stable_and_unique() {
@@ -3610,6 +3783,7 @@ mod tests {
             (90, "NAT44_ICMPV4_QUOTED_PUBLIC_SOURCE_MISMATCH"),
             (91, "NAT44_ICMPV4_TCP_CHECKSUM_PARTIAL"),
             (92, "NAT44_ICMPV4_WRONG_EGRESS"),
+            (93, "NAT44_ICMPV4_SOURCE_FORBIDDEN"),
         ];
         let actual = [
             DropReason::EthernetHeaderTruncated,
@@ -3704,6 +3878,7 @@ mod tests {
             DropReason::Nat44Icmpv4QuotedPublicSourceMismatch,
             DropReason::Nat44Icmpv4TcpChecksumPartial,
             DropReason::Nat44Icmpv4WrongEgress,
+            DropReason::Nat44Icmpv4SourceForbidden,
         ];
         assert_eq!(actual.len(), expected.len());
         for (reason, &(discriminant, code)) in actual.iter().zip(&expected) {
