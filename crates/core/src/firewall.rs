@@ -654,6 +654,7 @@ pub enum FirewallPolicySource {
 pub enum FirewallFailure {
     InvalidInitialTcp,
     StateTableFull,
+    RelatedStateMiss,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -755,6 +756,64 @@ pub enum FirewallPlanError {
     DefaultDenied,
     InvalidInitialTcp(FirewallRuleId),
     StateFull(FirewallRuleId),
+    ClockRegression,
+}
+
+/// Canonical forward/origin tuple quoted by an ICMPv4 error.
+///
+/// The interfaces and endpoints must describe the original packet before NAT
+/// translation. RELATED inspection deliberately never reverses this tuple.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirewallRelatedIcmpv4Flow {
+    ingress: IfId,
+    egress: IfId,
+    source: Ipv4Address,
+    destination: Ipv4Address,
+    protocol: FirewallProtocol,
+    source_port: u16,
+    destination_port: u16,
+}
+
+impl FirewallRelatedIcmpv4Flow {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        ingress: IfId,
+        egress: IfId,
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        protocol: FirewallProtocol,
+        source_port: u16,
+        destination_port: u16,
+    ) -> Self {
+        Self {
+            ingress,
+            egress,
+            source,
+            destination,
+            protocol,
+            source_port,
+            destination_port,
+        }
+    }
+
+    const fn packet(self) -> FirewallPacket {
+        FirewallPacket {
+            ingress: self.ingress,
+            egress: self.egress,
+            source: self.source,
+            destination: self.destination,
+            protocol: self.protocol,
+            source_port: self.source_port,
+            destination_port: self.destination_port,
+            tcp_flags: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum FirewallRelatedIcmpv4Error {
+    StateMiss,
     ClockRegression,
 }
 
@@ -1199,6 +1258,51 @@ impl<'rules, 'state> FirewallRuntime<'rules, 'state> {
         })
     }
 
+    /// Looks up a live originating flow without changing any runtime state.
+    ///
+    /// This bounded probe accepts only the exact forward/origin tuple. It does
+    /// not scan rules, accept reverse tuples, refresh activity, advance the
+    /// clock watermark, clean expired slots, or update counters.
+    pub fn inspect_related_icmpv4(
+        &self,
+        flow: FirewallRelatedIcmpv4Flow,
+        now_ms: u64,
+    ) -> Result<FirewallRuleId, FirewallRelatedIcmpv4Error> {
+        if self
+            .watermark_ms
+            .is_some_and(|watermark| now_ms < watermark)
+        {
+            return Err(FirewallRelatedIcmpv4Error::ClockRegression);
+        }
+        if self.states.is_empty() {
+            return Err(FirewallRelatedIcmpv4Error::StateMiss);
+        }
+
+        let packet = flow.packet();
+        let capacity = self.states.len();
+        let start =
+            flow_hash(packet, self.config.generation, self.config.hash_key) as usize % capacity;
+        for distance in 0..capacity {
+            let slot = self.states[(start + distance) % capacity];
+            if !slot.occupied {
+                break;
+            }
+            if !self.slot_live(slot, now_ms) || slot.protocol != packet.protocol {
+                continue;
+            }
+            let direct = slot.origin_ingress == packet.ingress
+                && slot.origin_egress == packet.egress
+                && slot.initiator_address == packet.source
+                && slot.responder_address == packet.destination
+                && slot.initiator_port == packet.source_port
+                && slot.responder_port == packet.destination_port;
+            if direct {
+                return Ok(slot.origin_rule_id);
+            }
+        }
+        Err(FirewallRelatedIcmpv4Error::StateMiss)
+    }
+
     pub(crate) fn commit(&mut self, plan: FirewallPlan) -> Result<(), FirewallCommitError> {
         if self.runtime_epoch != plan.expected_runtime_epoch {
             return Err(FirewallCommitError::RuntimeEpochChanged);
@@ -1611,6 +1715,104 @@ mod tests {
             assert_eq!(
                 runtime.plan_packet(reverse, 2 + FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS),
                 Err(FirewallPlanError::DefaultDenied)
+            );
+        });
+    }
+
+    #[test]
+    fn related_icmpv4_inspection_is_direct_exact_bounded_and_read_only() {
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                7,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 4];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let origin = packet(FirewallProtocol::Udp, 0);
+            let plan = runtime.plan_packet(origin, 10).unwrap();
+            runtime.commit(plan).unwrap();
+            let flow = FirewallRelatedIcmpv4Flow::new(
+                origin.ingress,
+                origin.egress,
+                origin.source,
+                origin.destination,
+                origin.protocol,
+                origin.source_port,
+                origin.destination_port,
+            );
+            let before_states = runtime.states().to_vec();
+            let before_counters = runtime.counters();
+
+            assert_eq!(
+                runtime.inspect_related_icmpv4(flow, 10),
+                Ok(FirewallRuleId(7))
+            );
+            let wrong_remote_port = FirewallRelatedIcmpv4Flow::new(
+                origin.ingress,
+                origin.egress,
+                origin.source,
+                origin.destination,
+                origin.protocol,
+                origin.source_port,
+                origin.destination_port + 1,
+            );
+            assert_eq!(
+                runtime.inspect_related_icmpv4(wrong_remote_port, 10),
+                Err(FirewallRelatedIcmpv4Error::StateMiss)
+            );
+            let reverse = FirewallRelatedIcmpv4Flow::new(
+                origin.egress,
+                origin.ingress,
+                origin.destination,
+                origin.source,
+                origin.protocol,
+                origin.destination_port,
+                origin.source_port,
+            );
+            assert_eq!(
+                runtime.inspect_related_icmpv4(reverse, 10),
+                Err(FirewallRelatedIcmpv4Error::StateMiss)
+            );
+            let wrong_egress = FirewallRelatedIcmpv4Flow::new(
+                origin.ingress,
+                IfId(99),
+                origin.source,
+                origin.destination,
+                origin.protocol,
+                origin.source_port,
+                origin.destination_port,
+            );
+            assert_eq!(
+                runtime.inspect_related_icmpv4(wrong_egress, 10),
+                Err(FirewallRelatedIcmpv4Error::StateMiss)
+            );
+            assert_eq!(
+                runtime.inspect_related_icmpv4(flow, 9),
+                Err(FirewallRelatedIcmpv4Error::ClockRegression)
+            );
+            assert_eq!(
+                runtime.inspect_related_icmpv4(flow, 10 + FIREWALL_UDP_DEFAULT_IDLE_TTL_MS),
+                Err(FirewallRelatedIcmpv4Error::StateMiss)
+            );
+            assert_eq!(runtime.states(), before_states);
+            assert_eq!(runtime.counters(), before_counters);
+
+            let config2 = FirewallConfig::new(
+                snapshot,
+                &rules,
+                FirewallPolicy::default(),
+                2,
+                rotated_hash_key(),
+            )
+            .unwrap();
+            assert_eq!(runtime.reconcile(config2).unwrap().states_flushed, 1);
+            assert_eq!(
+                runtime.inspect_related_icmpv4(flow, 10),
+                Err(FirewallRelatedIcmpv4Error::StateMiss)
             );
         });
     }

@@ -1,15 +1,15 @@
 use ruster_core::{
-    internet_checksum, ipv4_header_checksum, DropReason, FirewallAction, FirewallAuditBuffer,
-    FirewallAuditRecord, FirewallConfig, FirewallConnectionClass, FirewallDisposition,
-    FirewallFailure, FirewallHashKey, FirewallInterface, FirewallIpv4Prefix, FirewallPolicy,
-    FirewallPolicySource, FirewallPortRange, FirewallProtocol, FirewallRule, FirewallRuleId,
-    FirewallRuntime, FirewallStateSlot, FirewallTcpPhase, FirewallVerdict, ForwardingSnapshot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId,
-    Interface, Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy,
-    Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot,
-    Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime,
-    Neighbor, NoTrace, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime,
-    ResolutionStateSlot, Route,
+    internet_checksum, ipv4_header_checksum, DropReason, DynamicNeighborSlot, FirewallAction,
+    FirewallAuditBuffer, FirewallAuditRecord, FirewallConfig, FirewallConnectionClass,
+    FirewallDisposition, FirewallFailure, FirewallHashKey, FirewallInterface, FirewallIpv4Prefix,
+    FirewallPolicy, FirewallPolicySource, FirewallPortRange, FirewallProtocol, FirewallRule,
+    FirewallRuleId, FirewallRuntime, FirewallStateSlot, FirewallTcpPhase, FirewallVerdict,
+    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
+    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy,
+    Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
+    Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace, ResolutionActionSlot, ResolutionPolicy,
+    ResolutionRuntime, ResolutionStateSlot, Route,
 };
 use ruster_io_sim::{RecycleCause, SimIo};
 
@@ -288,6 +288,21 @@ fn frag_needed(quote: &[u8]) -> Vec<u8> {
     frame[36..38].copy_from_slice(&icmp_checksum.to_be_bytes());
     let ipv4_checksum = ipv4_header_checksum(&frame[14..34]);
     frame[24..26].copy_from_slice(&ipv4_checksum.to_be_bytes());
+    frame
+}
+
+fn arp_reply(sender: Ipv4Address, sender_mac: MacAddress) -> Vec<u8> {
+    let mut frame = vec![0_u8; 60];
+    frame[0..6].copy_from_slice(&LAN_MAC.0);
+    frame[6..12].copy_from_slice(&sender_mac.0);
+    frame[12..14].copy_from_slice(&0x0806_u16.to_be_bytes());
+    frame[14..16].copy_from_slice(&1_u16.to_be_bytes());
+    frame[16..18].copy_from_slice(&0x0800_u16.to_be_bytes());
+    frame[18..22].copy_from_slice(&[6, 4, 0, 2]);
+    frame[22..28].copy_from_slice(&sender_mac.0);
+    frame[28..32].copy_from_slice(&sender.octets());
+    frame[32..38].copy_from_slice(&LAN_MAC.0);
+    frame[38..42].copy_from_slice(&LAN_LOCAL.octets());
     frame
 }
 
@@ -941,10 +956,13 @@ fn nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically() {
     let mut io = SimIo::new();
 
     let outbound_udp = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
+    let quoted_public_udp = udp_frame(WAN_LOCAL, REMOTE, 40_000, 53, 0x4000, false);
+    let same_batch_related = frag_needed(&quoted_public_udp[14..42]);
     io.inject(LAN, outbound_udp);
     io.inject(LAN, tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0x4000));
+    io.inject(WAN, same_batch_related);
     io.run_nat44_udp_and_tcp_with_firewall_once(
-        2,
+        3,
         &snapshot,
         &mut resolution,
         &udp_config,
@@ -959,8 +977,12 @@ fn nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically() {
     .unwrap();
     let udp_out = io.pop_tx().unwrap();
     let tcp_out = io.pop_tx().unwrap();
+    let related_out = io.pop_tx().unwrap();
     assert_eq!(&udp_out.bytes[26..30], &WAN_LOCAL.octets());
     assert_eq!(&tcp_out.bytes[26..30], &WAN_LOCAL.octets());
+    assert_eq!(related_out.egress, LAN);
+    assert_eq!(&related_out.bytes[30..34], &HOST.octets());
+    assert_eq!(&related_out.bytes[54..58], &HOST.octets());
     let udp_state = firewall
         .states()
         .iter()
@@ -1005,9 +1027,155 @@ fn nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically() {
     let before_tcp_counters = tcp.counters();
     let before_tcp_mappings = tcp.mappings().to_vec();
     let before_tcp_sessions = tcp.sessions().to_vec();
-    let related = frag_needed(&udp_out.bytes[14..42]);
-    io.inject(WAN, related.clone());
-    io.run_nat44_udp_and_tcp_with_firewall_once(
+    let udp_related = frag_needed(&udp_out.bytes[14..42]);
+    let tcp_related = frag_needed(&tcp_out.bytes[14..42]);
+    let mut audit_storage = [FirewallAuditRecord::default(); 2];
+    let mut audit = FirewallAuditBuffer::new(&mut audit_storage);
+    io.inject(WAN, udp_related.clone());
+    io.inject(WAN, tcp_related);
+    io.run_nat44_udp_and_tcp_with_firewall_audited_once(
+        2,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        &firewall_config,
+        Some(&mut firewall),
+        &mut audit,
+        MonotonicMillis(100),
+        &mut NoTrace,
+    )
+    .unwrap();
+    let translated_udp_related = io.pop_tx().unwrap();
+    let translated_tcp_related = io.pop_tx().unwrap();
+    assert_eq!(translated_udp_related.egress, LAN);
+    assert_eq!(&translated_udp_related.bytes[30..34], &HOST.octets());
+    assert_eq!(
+        &translated_udp_related.bytes[38..42],
+        &1500_u32.to_be_bytes()
+    );
+    assert_eq!(&translated_udp_related.bytes[54..58], &HOST.octets());
+    assert_eq!(
+        &translated_udp_related.bytes[62..64],
+        &12_345_u16.to_be_bytes()
+    );
+    assert_eq!(internet_checksum(&translated_udp_related.bytes[14..34]), 0);
+    assert_eq!(internet_checksum(&translated_udp_related.bytes[34..]), 0);
+    assert_eq!(internet_checksum(&translated_udp_related.bytes[42..62]), 0);
+    assert_eq!(translated_tcp_related.egress, LAN);
+    assert_eq!(&translated_tcp_related.bytes[30..34], &HOST.octets());
+    assert_eq!(&translated_tcp_related.bytes[54..58], &HOST.octets());
+    assert_eq!(
+        &translated_tcp_related.bytes[62..64],
+        &12_345_u16.to_be_bytes()
+    );
+    assert_eq!(
+        audit
+            .records()
+            .iter()
+            .map(|record| record.disposition)
+            .collect::<Vec<_>>(),
+        vec![
+            FirewallDisposition {
+                verdict: FirewallVerdict::Allow,
+                class: FirewallConnectionClass::Related,
+                source: FirewallPolicySource::Rule(FirewallRuleId(10)),
+                matched_action: Some(FirewallAction::AllowStateful),
+                failure: None,
+            },
+            FirewallDisposition {
+                verdict: FirewallVerdict::Allow,
+                class: FirewallConnectionClass::Related,
+                source: FirewallPolicySource::Rule(FirewallRuleId(20)),
+                matched_action: Some(FirewallAction::AllowStateful),
+                failure: None,
+            },
+        ]
+    );
+    assert_eq!(audit.dropped_records(), 0);
+    assert_eq!(firewall.states(), before_firewall);
+    assert_eq!(firewall.counters(), before_firewall_counters);
+    assert_eq!(udp.counters(), before_udp_counters);
+    assert_eq!(udp.mappings(), before_udp_mappings);
+    assert_eq!(udp.peers(), before_udp_peers);
+    assert_eq!(tcp.counters(), before_tcp_counters);
+    assert_eq!(tcp.mappings(), before_tcp_mappings);
+    assert_eq!(tcp.sessions(), before_tcp_sessions);
+
+    audit.clear();
+    let mut wrong_udp_quote = udp_out.bytes[14..42].to_vec();
+    wrong_udp_quote[22..24].copy_from_slice(&54_u16.to_be_bytes());
+    let wrong_udp = frag_needed(&wrong_udp_quote);
+    let mut other_wrong_udp_quote = wrong_udp_quote;
+    other_wrong_udp_quote[22..24].copy_from_slice(&55_u16.to_be_bytes());
+    let other_wrong_udp = frag_needed(&other_wrong_udp_quote);
+    let mut overflow_udp_quote = other_wrong_udp_quote;
+    overflow_udp_quote[22..24].copy_from_slice(&56_u16.to_be_bytes());
+    let overflow_udp = frag_needed(&overflow_udp_quote);
+    let mut wrong_tcp_quote = tcp_out.bytes[14..42].to_vec();
+    wrong_tcp_quote[22..24].copy_from_slice(&444_u16.to_be_bytes());
+    let wrong_tcp = frag_needed(&wrong_tcp_quote);
+    io.inject(WAN, wrong_udp.clone());
+    io.inject(WAN, wrong_tcp.clone());
+    io.inject(WAN, other_wrong_udp.clone());
+    io.inject(WAN, overflow_udp.clone());
+    io.run_nat44_udp_and_tcp_with_firewall_audited_once(
+        4,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        &firewall_config,
+        Some(&mut firewall),
+        &mut audit,
+        MonotonicMillis(101),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(
+        &mut io,
+        DropReason::FirewallRelatedIcmpv4StateMiss,
+        &wrong_udp,
+    );
+    assert_drop(&mut io, DropReason::Nat44TcpSessionMiss, &wrong_tcp);
+    assert_drop(
+        &mut io,
+        DropReason::FirewallRelatedIcmpv4StateMiss,
+        &other_wrong_udp,
+    );
+    assert_drop(
+        &mut io,
+        DropReason::FirewallRelatedIcmpv4StateMiss,
+        &overflow_udp,
+    );
+    assert!(audit.records().iter().all(|record| {
+        record.disposition
+            == FirewallDisposition {
+                verdict: FirewallVerdict::Drop,
+                class: FirewallConnectionClass::Related,
+                source: FirewallPolicySource::Default,
+                matched_action: None,
+                failure: Some(FirewallFailure::RelatedStateMiss),
+            }
+    }));
+    assert_eq!(audit.dropped_records(), 1);
+    assert_eq!(firewall.states(), before_firewall);
+    assert_eq!(firewall.counters(), before_firewall_counters);
+    assert_eq!(udp.counters(), before_udp_counters);
+    assert_eq!(udp.mappings(), before_udp_mappings);
+    assert_eq!(udp.peers(), before_udp_peers);
+    assert_eq!(tcp.counters(), before_tcp_counters);
+    assert_eq!(tcp.mappings(), before_tcp_mappings);
+    assert_eq!(tcp.sessions(), before_tcp_sessions);
+
+    audit.clear();
+    io.set_received_accept_budget(0);
+    io.inject(WAN, udp_related.clone());
+    io.run_nat44_udp_and_tcp_with_firewall_audited_once(
         1,
         &snapshot,
         &mut resolution,
@@ -1017,25 +1185,30 @@ fn nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically() {
         Some(&mut tcp),
         &firewall_config,
         Some(&mut firewall),
-        MonotonicMillis(100),
+        &mut audit,
+        MonotonicMillis(102),
         &mut NoTrace,
     )
     .unwrap();
-    assert_drop(
-        &mut io,
-        DropReason::FirewallRelatedIcmpv4Unsupported,
-        &related,
+    let rejected_related = io.pop_recycled().unwrap();
+    assert_eq!(rejected_related.cause, RecycleCause::TxRejected);
+    assert_ne!(rejected_related.bytes, udp_related);
+    assert_eq!(&rejected_related.bytes[30..34], &HOST.octets());
+    assert_eq!(
+        audit.records()[0].disposition,
+        FirewallDisposition {
+            verdict: FirewallVerdict::Allow,
+            class: FirewallConnectionClass::Related,
+            source: FirewallPolicySource::Rule(FirewallRuleId(10)),
+            matched_action: Some(FirewallAction::AllowStateful),
+            failure: None,
+        }
     );
     assert_eq!(firewall.states(), before_firewall);
-    let mut expected_firewall_counters = before_firewall_counters;
-    expected_firewall_counters.invalid_packets += 1;
-    assert_eq!(firewall.counters(), expected_firewall_counters);
+    assert_eq!(firewall.counters(), before_firewall_counters);
     assert_eq!(udp.counters(), before_udp_counters);
     assert_eq!(udp.mappings(), before_udp_mappings);
     assert_eq!(udp.peers(), before_udp_peers);
-    assert_eq!(tcp.counters(), before_tcp_counters);
-    assert_eq!(tcp.mappings(), before_tcp_mappings);
-    assert_eq!(tcp.sessions(), before_tcp_sessions);
 
     io.set_received_accept_budget(0);
     let existing = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
@@ -1073,6 +1246,322 @@ fn nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically() {
         before_udp_counters.outbound_translated + 1
     );
     assert_eq!(io.pop_recycled().unwrap().cause, RecycleCause::TxRejected);
+}
+
+#[test]
+fn related_icmpv4_requires_both_nat_mapping_and_firewall_origin_state() {
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let udp_config = Nat44UdpConfig::new(
+        &snapshot,
+        LAN,
+        WAN,
+        WAN_LOCAL,
+        40_000,
+        40_000,
+        Nat44UdpPolicy::default().with_icmpv4_errors(Nat44Icmpv4ErrorPolicy::ExternalOnly),
+    )
+    .unwrap();
+    let tcp_config = Nat44TcpConfig::new(
+        &snapshot,
+        LAN,
+        WAN,
+        WAN_LOCAL,
+        40_000,
+        40_000,
+        Nat44TcpPolicy::default().with_icmpv4_errors(Nat44Icmpv4ErrorPolicy::ExternalOnly),
+    )
+    .unwrap();
+    let rules = [allow(FirewallProtocol::Udp), allow(FirewallProtocol::Tcp)];
+    let firewall_config = firewall_config(&snapshot, &rules, 1);
+    let mut firewall_slots = [FirewallStateSlot::default(); 2];
+    let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_slots);
+    let mut udp_mappings = [Nat44UdpMappingSlot::default(); 1];
+    let mut udp_peers = [Nat44UdpPeerSlot::default(); 1];
+    let mut udp = Nat44UdpRuntime::new(udp_config, &mut udp_mappings, &mut udp_peers);
+    let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
+    let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
+    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut audit_storage = [FirewallAuditRecord::default(); 1];
+    let mut audit = FirewallAuditBuffer::new(&mut audit_storage);
+    let mut io = SimIo::new();
+
+    io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false));
+    io.run_nat44_udp_and_tcp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        MonotonicMillis(0),
+        &mut NoTrace,
+    )
+    .unwrap();
+    let translated_udp = io.pop_tx().unwrap();
+    let mapping_only = frag_needed(&translated_udp.bytes[14..42]);
+    let before_udp = udp.mappings().to_vec();
+    let before_udp_counters = udp.counters();
+    io.inject(WAN, mapping_only.clone());
+    io.run_nat44_udp_and_tcp_with_firewall_audited_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        &firewall_config,
+        Some(&mut firewall),
+        &mut audit,
+        MonotonicMillis(10),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(
+        &mut io,
+        DropReason::FirewallRelatedIcmpv4StateMiss,
+        &mapping_only,
+    );
+    assert_eq!(
+        audit.records()[0].disposition,
+        FirewallDisposition {
+            verdict: FirewallVerdict::Drop,
+            class: FirewallConnectionClass::Related,
+            source: FirewallPolicySource::Default,
+            matched_action: None,
+            failure: Some(FirewallFailure::RelatedStateMiss),
+        }
+    );
+    assert_eq!(udp.mappings(), before_udp);
+    assert_eq!(udp.counters(), before_udp_counters);
+    assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
+    assert_eq!(firewall.counters(), Default::default());
+
+    audit.clear();
+    io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false));
+    io.run_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &firewall_config,
+        Some(&mut firewall),
+        MonotonicMillis(10),
+        &mut NoTrace,
+    )
+    .unwrap();
+    io.pop_tx().unwrap();
+    let before_clock_states = firewall.states().to_vec();
+    let before_clock_counters = firewall.counters();
+    io.inject(WAN, mapping_only.clone());
+    io.run_nat44_udp_and_tcp_with_firewall_audited_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        &firewall_config,
+        Some(&mut firewall),
+        &mut audit,
+        MonotonicMillis(5),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallClockRegression, &mapping_only);
+    assert!(audit.records().is_empty());
+    assert_eq!(firewall.states(), before_clock_states);
+    assert_eq!(firewall.counters(), before_clock_counters);
+    assert_eq!(udp.mappings(), before_udp);
+    assert_eq!(udp.counters(), before_udp_counters);
+
+    io.inject(LAN, tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0x4000));
+    io.run_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &firewall_config,
+        Some(&mut firewall),
+        MonotonicMillis(10),
+        &mut NoTrace,
+    )
+    .unwrap();
+    io.pop_tx().unwrap();
+    let firewall_only_quote = udp_frame(WAN_LOCAL, REMOTE, 40_000, 443, 0x4000, false);
+    let mut tcp_quote = firewall_only_quote[14..42].to_vec();
+    tcp_quote[9] = 6;
+    tcp_quote[10..12].fill(0);
+    let checksum = ipv4_header_checksum(&tcp_quote[..20]);
+    tcp_quote[10..12].copy_from_slice(&checksum.to_be_bytes());
+    let firewall_only = frag_needed(&tcp_quote);
+    let before_firewall = firewall.states().to_vec();
+    let before_firewall_counters = firewall.counters();
+    io.inject(WAN, firewall_only.clone());
+    io.run_nat44_udp_and_tcp_with_firewall_audited_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        &firewall_config,
+        Some(&mut firewall),
+        &mut audit,
+        MonotonicMillis(11),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::Nat44TcpMappingMiss, &firewall_only);
+    assert!(audit.records().is_empty());
+    assert_eq!(firewall.states(), before_firewall);
+    assert_eq!(firewall.counters(), before_firewall_counters);
+}
+
+#[test]
+fn tracked_related_neighbor_miss_schedules_arp_and_fresh_retry_translates() {
+    let (routes, interfaces, _, bindings) = topology();
+    let neighbors = [Neighbor {
+        interface: WAN,
+        target: GW,
+        mac: GW_MAC,
+    }];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let udp_config = Nat44UdpConfig::new(
+        &snapshot,
+        LAN,
+        WAN,
+        WAN_LOCAL,
+        40_000,
+        40_000,
+        Nat44UdpPolicy::default().with_icmpv4_errors(Nat44Icmpv4ErrorPolicy::ExternalOnly),
+    )
+    .unwrap();
+    let tcp_config = Nat44TcpConfig::new(
+        &snapshot,
+        LAN,
+        WAN,
+        WAN_LOCAL,
+        40_000,
+        40_000,
+        Nat44TcpPolicy::default().with_icmpv4_errors(Nat44Icmpv4ErrorPolicy::ExternalOnly),
+    )
+    .unwrap();
+    let rules = [allow(FirewallProtocol::Udp)];
+    let firewall_config = firewall_config(&snapshot, &rules, 1);
+    let mut firewall_slots = [FirewallStateSlot::default(); 1];
+    let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_slots);
+    let mut udp_mappings = [Nat44UdpMappingSlot::default(); 1];
+    let mut udp_peers = [Nat44UdpPeerSlot::default(); 1];
+    let mut udp = Nat44UdpRuntime::new(udp_config, &mut udp_mappings, &mut udp_peers);
+    let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
+    let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
+    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
+    let mut resolution = ResolutionRuntime::with_dynamic_neighbors(
+        ResolutionPolicy::new(1_000, 2_000).unwrap(),
+        &mut resolution_states,
+        &mut resolution_actions,
+        &mut dynamic,
+    );
+    let mut io = SimIo::new();
+
+    io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false));
+    io.run_nat44_udp_and_tcp_with_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        &firewall_config,
+        Some(&mut firewall),
+        MonotonicMillis(0),
+        &mut NoTrace,
+    )
+    .unwrap();
+    let outbound = io.pop_tx().unwrap();
+    let related = frag_needed(&outbound.bytes[14..42]);
+    let before_firewall = firewall.states().to_vec();
+    let before_firewall_counters = firewall.counters();
+    let before_udp = udp.mappings().to_vec();
+    let before_udp_peers = udp.peers().to_vec();
+    let before_udp_counters = udp.counters();
+
+    io.inject(WAN, related.clone());
+    io.run_nat44_udp_and_tcp_with_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        &firewall_config,
+        Some(&mut firewall),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::NeighborUnresolved, &related);
+    assert_eq!(resolution.pending_actions(), 1);
+    assert_eq!(firewall.states(), before_firewall);
+    assert_eq!(firewall.counters(), before_firewall_counters);
+    assert_eq!(udp.mappings(), before_udp);
+    assert_eq!(udp.peers(), before_udp_peers);
+    assert_eq!(udp.counters(), before_udp_counters);
+
+    io.inject(LAN, arp_reply(HOST, HOST_MAC));
+    let learned = io
+        .run_nat44_udp_and_tcp_with_firewall_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &udp_config,
+            Some(&mut udp),
+            &tcp_config,
+            Some(&mut tcp),
+            &firewall_config,
+            Some(&mut firewall),
+            MonotonicMillis(2),
+            &mut NoTrace,
+        )
+        .unwrap();
+    assert_eq!(learned.consumed, 1);
+    assert_eq!(resolution.dynamic_neighbor_count(), 1);
+    io.pop_recycled();
+
+    io.inject(WAN, related);
+    io.run_nat44_udp_and_tcp_with_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        &firewall_config,
+        Some(&mut firewall),
+        MonotonicMillis(2),
+        &mut NoTrace,
+    )
+    .unwrap();
+    let translated = io.pop_tx().unwrap();
+    assert_eq!(translated.egress, LAN);
+    assert_eq!(&translated.bytes[0..6], &HOST_MAC.0);
+    assert_eq!(firewall.states(), before_firewall);
+    assert_eq!(firewall.counters(), before_firewall_counters);
+    assert_eq!(udp.mappings(), before_udp);
+    assert_eq!(udp.peers(), before_udp_peers);
+    assert_eq!(udp.counters(), before_udp_counters);
 }
 
 #[test]

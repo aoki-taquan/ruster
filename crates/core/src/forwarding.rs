@@ -8,12 +8,12 @@ use crate::{
     packet, rfc1624_update, route, validate_arp, validate_ipv4_frame, ArpOpcode, ArpRequestAction,
     BatchCompletion, ConsumeReason, ControlDisposition, FirewallAction, FirewallAuditBuffer,
     FirewallConfig, FirewallConnectionClass, FirewallDisposition, FirewallFailure,
-    FirewallPolicySource, FirewallProtocol, FirewallRuntime, FirewallVerdict, Icmpv4ErrorAction,
-    Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition,
-    IfId, Interface, LocalIpv4Binding, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
-    Nat44TcpDisposition, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime,
-    Neighbor, PacketBatch, ResolutionResult, ResolutionRuntime, Route, ARP_ETHERTYPE,
-    IPV4_ETHERTYPE,
+    FirewallPolicySource, FirewallProtocol, FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow,
+    FirewallRuntime, FirewallVerdict, Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind,
+    Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface, LocalIpv4Binding,
+    MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition, Nat44TcpRuntime,
+    Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, ResolutionResult,
+    ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -135,6 +135,7 @@ pub enum DropReason {
     FirewallClockRegression = 113,
     FirewallRelatedIcmpv4Unsupported = 114,
     FirewallRouteUnavailable = 115,
+    FirewallRelatedIcmpv4StateMiss = 116,
 }
 
 use DropReason::*;
@@ -260,6 +261,7 @@ impl DropReason {
             FirewallClockRegression => "FIREWALL_CLOCK_REGRESSION",
             FirewallRelatedIcmpv4Unsupported => "FIREWALL_RELATED_ICMPV4_UNSUPPORTED",
             FirewallRouteUnavailable => "FIREWALL_ROUTE_UNAVAILABLE",
+            FirewallRelatedIcmpv4StateMiss => "FIREWALL_RELATED_ICMPV4_STATE_MISS",
         }
     }
 }
@@ -1521,11 +1523,9 @@ fn decide_ipv4<T: TraceSink>(
         .map_or(MonotonicMillis(0), |(_, now)| *now);
     let combined_realm_mismatch = matches!((nat44_udp_config, nat44_tcp_config), (Some(udp), Some(tcp)) if !tcp.realm_matches_udp(*udp));
     if is_nat44_icmpv4_candidate(frame, ipv4, nat44_udp_config, nat44_tcp_config) {
-        if let Some(config) = firewall_config {
-            let runtime = require_firewall_runtime(snapshot, config, firewall)?;
-            runtime.record_invalid_packet();
-            return Err(FirewallRelatedIcmpv4Unsupported);
-        }
+        let related_firewall = firewall_config
+            .map(|config| require_firewall_runtime(snapshot, config, firewall))
+            .transpose()?;
         return decide_nat44_icmpv4_frag_needed(
             frame,
             snapshot,
@@ -1538,6 +1538,8 @@ fn decide_ipv4<T: TraceSink>(
             nat44_tcp,
             nat_now,
             combined_realm_mismatch,
+            related_firewall,
+            firewall_audit,
             trace,
         );
     }
@@ -2013,6 +2015,8 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
     now: MonotonicMillis,
     combined_realm_mismatch: bool,
+    related_firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     let quote = parse_nat44_icmpv4_frag_needed(frame, outer)
@@ -2139,6 +2143,72 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
             return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedProtocolUnsupported, trace);
         }
     };
+
+    if let Some(runtime) = related_firewall.as_deref() {
+        let protocol = FirewallProtocol::from_ipv4(quote.protocol)
+            .expect("the NAT ICMPv4 parser accepts only UDP and TCP quotes");
+        let packet = FirewallPacket {
+            ingress: inside,
+            egress: match quote.protocol {
+                17 => nat44_udp_config
+                    .expect("UDP quote was accepted only with UDP configuration")
+                    .outside(),
+                6 => nat44_tcp_config
+                    .expect("TCP quote was accepted only with TCP configuration")
+                    .outside(),
+                _ => unreachable!("the NAT ICMPv4 parser accepts only UDP and TCP quotes"),
+            },
+            source: internal_address,
+            destination: quote.remote_address,
+            protocol,
+            source_port: internal_port,
+            destination_port: quote.remote_port,
+            tcp_flags: 0,
+        };
+        let flow = FirewallRelatedIcmpv4Flow::new(
+            packet.ingress,
+            packet.egress,
+            packet.source,
+            packet.destination,
+            packet.protocol,
+            packet.source_port,
+            packet.destination_port,
+        );
+        match runtime.inspect_related_icmpv4(flow, now.0) {
+            Ok(rule_id) => {
+                if let Some(audit) = firewall_audit.as_deref_mut() {
+                    audit.record(
+                        packet,
+                        FirewallDisposition {
+                            verdict: FirewallVerdict::Allow,
+                            class: FirewallConnectionClass::Related,
+                            source: FirewallPolicySource::Rule(rule_id),
+                            matched_action: Some(FirewallAction::AllowStateful),
+                            failure: None,
+                        },
+                    );
+                }
+            }
+            Err(FirewallRelatedIcmpv4Error::StateMiss) => {
+                if let Some(audit) = firewall_audit.as_deref_mut() {
+                    audit.record(
+                        packet,
+                        FirewallDisposition {
+                            verdict: FirewallVerdict::Drop,
+                            class: FirewallConnectionClass::Related,
+                            source: FirewallPolicySource::Default,
+                            matched_action: None,
+                            failure: Some(FirewallFailure::RelatedStateMiss),
+                        },
+                    );
+                }
+                return nat44_icmpv4_drop(ingress, FirewallRelatedIcmpv4StateMiss, trace);
+            }
+            Err(FirewallRelatedIcmpv4Error::ClockRegression) => {
+                return nat44_icmpv4_drop(ingress, FirewallClockRegression, trace);
+            }
+        }
+    }
 
     let route = route::lookup(snapshot.routes, internal_address).ok_or(RouteMiss)?;
     if route.egress() != inside {
@@ -4714,6 +4784,7 @@ mod tests {
             (113, "FIREWALL_CLOCK_REGRESSION"),
             (114, "FIREWALL_RELATED_ICMPV4_UNSUPPORTED"),
             (115, "FIREWALL_ROUTE_UNAVAILABLE"),
+            (116, "FIREWALL_RELATED_ICMPV4_STATE_MISS"),
         ];
         let actual = [
             DropReason::EthernetHeaderTruncated,
@@ -4831,6 +4902,7 @@ mod tests {
             DropReason::FirewallClockRegression,
             DropReason::FirewallRelatedIcmpv4Unsupported,
             DropReason::FirewallRouteUnavailable,
+            DropReason::FirewallRelatedIcmpv4StateMiss,
         ];
         assert_eq!(actual.len(), expected.len());
         for (reason, &(discriminant, code)) in actual.iter().zip(&expected) {

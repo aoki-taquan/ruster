@@ -120,8 +120,12 @@ NATとのcombined APIではoutboundをpre-SNAT internal→remote、inboundをpos
 remote→internalのcanonical tupleで照合します。NAT mappingだけではinboundを許可せず、exact
 reverse firewall stateが無ければinside neighbor処理前にdenyします。packet rewrite成功後、
 NAT/FW stateをTX request前にcommitするためbackend rejectでも両stateを保持します。ICMPv4
-Type 3/Code 4のRELATED判定は未実装で、firewall serviceとNAT ICMP translationを組み合わせた
-場合は`FIREWALL_RELATED_ICMPV4_UNSUPPORTED`で明示的にfail closedします。
+Type 3/Code 4はopt-in NAT translationがmapping/sessionから復元したpre-SNAT
+internal→remote tupleを、firewall origin stateへdirect exactかつread-onlyで照合します。
+hitだけを`RELATED`として許可し、missは`FIREWALL_RELATED_ICMPV4_STATE_MISS`でneighbor処理前に
+silent dropします。lookupはrule scan、reverse match、activity/phase/counter/watermark更新を
+行いません。NATを伴わないplain forwarded RELATEDはdeferredで、既存の
+`FIREWALL_RELATED_ICMPV4_UNSUPPORTED` discriminantは予約したままです。
 
 ## 開発
 
