@@ -65,6 +65,9 @@ nonzero checksumとIPv4 checksumをRFC 1624でincremental更新します。
 
 idle TTLはdefault 300秒、minimum 120秒で、outbound TX requestだけがrefreshします。
 live stateをcapacity pressureでevictせず、snapshot/config mismatchはfail closedです。
+NAT runtimeへ到達した非退行時刻はdrop結果でもwatermarkへ反映し、expired/miss後の古い
+時刻によるmapping復活を許しません。outsideからinsideへのpublic DNATを通らない直通LPMも
+neighbor解決前にfail closedです。
 publication変更はvalidated configと`Nat44UdpRuntime::reconcile`による明示的な全state flushを
 要求します。fragment、hairpin、ICMP error translation/PMTU、TCP/ICMP query NAT、static
 forward、multi-public、port randomization/parity、full firewallはdeferredで、RFC 4787/

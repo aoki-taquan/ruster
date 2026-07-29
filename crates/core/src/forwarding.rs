@@ -65,6 +65,7 @@ pub enum DropReason {
     Nat44UdpClockRegression = 50,
     Nat44UdpWrongIngress = 51,
     Nat44UdpWrongEgress = 52,
+    Nat44ExternalToInternalBypass = 53,
 }
 
 use DropReason::*;
@@ -125,6 +126,7 @@ impl DropReason {
             Nat44UdpClockRegression => "NAT44_UDP_CLOCK_REGRESSION",
             Nat44UdpWrongIngress => "NAT44_UDP_WRONG_INGRESS",
             Nat44UdpWrongEgress => "NAT44_UDP_WRONG_EGRESS",
+            Nat44ExternalToInternalBypass => "NAT44_EXTERNAL_TO_INTERNAL_BYPASS",
         }
     }
 }
@@ -800,14 +802,31 @@ fn decide_ipv4<T: TraceSink>(
     });
     if let Some(config) = nat44_udp_config {
         if ingress == config.inside() && ipv4.destination == config.public_address() {
-            return nat44_udp_drop(nat44_udp, ingress, Nat44UdpHairpinUnsupported, trace);
+            observe_nat_candidate_if_present(
+                snapshot,
+                config,
+                nat44_udp,
+                resolution
+                    .as_ref()
+                    .map_or(MonotonicMillis(0), |(_, now)| *now),
+                ingress,
+                trace,
+            )?;
+            return nat44_udp_drop(ingress, Nat44UdpHairpinUnsupported, trace);
         }
         if ipv4.destination == config.public_address() && ipv4.protocol == 17 {
-            if ipv4.header_len > 20 {
-                return nat44_udp_drop(nat44_udp, ingress, Ipv4OptionsUnsupported, trace);
-            }
             if ingress != config.outside() {
-                return nat44_udp_drop(nat44_udp, ingress, Nat44UdpWrongIngress, trace);
+                observe_nat_candidate_if_present(
+                    snapshot,
+                    config,
+                    nat44_udp,
+                    resolution
+                        .as_ref()
+                        .map_or(MonotonicMillis(0), |(_, now)| *now),
+                    ingress,
+                    trace,
+                )?;
+                return nat44_udp_drop(ingress, Nat44UdpWrongIngress, trace);
             }
             return decide_nat44_udp_inbound(
                 frame, snapshot, ingress, ipv4, resolution, config, nat44_udp, trace,
@@ -845,6 +864,11 @@ fn decide_ipv4<T: TraceSink>(
         }
         return Err(RouteMiss);
     };
+    if nat44_udp_config
+        .is_some_and(|config| ingress == config.outside() && route.egress() == config.inside())
+    {
+        return nat44_udp_drop(ingress, Nat44ExternalToInternalBypass, trace);
+    }
     if ipv4.ttl <= 1 {
         if let Some((runtime, now)) = icmpv4_errors.as_mut() {
             let disposition = decide_icmpv4_error(
@@ -1000,18 +1024,30 @@ fn decide_nat44_udp_outbound<T: TraceSink>(
     now: MonotonicMillis,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
+    let runtime = require_nat44_udp_runtime(snapshot, config, nat44_udp, ingress, trace)?;
+    if let Err(error) = runtime.observe_now(now.0) {
+        let (reason, disposition) = nat44_udp_plan_error(error);
+        trace.record(TraceEvent::Nat44Udp {
+            ingress,
+            disposition,
+        });
+        return Err(reason);
+    }
+    if ipv4.header_len > 20 {
+        return nat44_udp_drop(ingress, Ipv4OptionsUnsupported, trace);
+    }
     if ipv4.protocol != 17 {
-        return nat44_udp_drop(nat44_udp, ingress, Nat44UdpUnsupportedTransport, trace);
+        return nat44_udp_drop(ingress, Nat44UdpUnsupportedTransport, trace);
     }
     if let Err(reason) = validate_nat44_atomic(frame, ipv4) {
-        return nat44_udp_drop(nat44_udp, ingress, reason, trace);
+        return nat44_udp_drop(ingress, reason, trace);
     }
     let udp = match validate_nat44_udp(frame, ipv4) {
         Ok(udp) => udp,
-        Err(reason) => return nat44_udp_drop(nat44_udp, ingress, reason, trace),
+        Err(reason) => return nat44_udp_drop(ingress, reason, trace),
     };
     if udp.source_port == 0 {
-        return nat44_udp_drop(nat44_udp, ingress, Nat44UdpSourcePortZero, trace);
+        return nat44_udp_drop(ingress, Nat44UdpSourcePortZero, trace);
     }
     if !icmp_error_source_is_host(snapshot, ipv4.source)
         || snapshot
@@ -1020,14 +1056,13 @@ fn decide_nat44_udp_outbound<T: TraceSink>(
             .any(|binding| binding.address == ipv4.source)
         || ipv4.source == config.public_address()
     {
-        return nat44_udp_drop(nat44_udp, ingress, Nat44UdpSourceForbidden, trace);
+        return nat44_udp_drop(ingress, Nat44UdpSourceForbidden, trace);
     }
     if route::lookup(snapshot.routes, ipv4.source)
         .is_none_or(|reverse| reverse.egress() != config.inside())
     {
-        return nat44_udp_drop(nat44_udp, ingress, Nat44UdpReverseAuthorityMismatch, trace);
+        return nat44_udp_drop(ingress, Nat44UdpReverseAuthorityMismatch, trace);
     }
-    let runtime = require_nat44_udp_runtime(snapshot, config, nat44_udp, ingress, trace)?;
     let plan = match runtime.plan_outbound(ipv4.source, udp.source_port, ipv4.destination, now.0) {
         Ok(plan) => plan,
         Err(error) => {
@@ -1064,15 +1099,30 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
+    let now = resolution
+        .as_ref()
+        .map_or(MonotonicMillis(0), |(_, now)| *now);
+    let runtime = require_nat44_udp_runtime(snapshot, config, nat44_udp, ingress, trace)?;
+    if let Err(error) = runtime.observe_now(now.0) {
+        let (reason, disposition) = nat44_udp_plan_error(error);
+        trace.record(TraceEvent::Nat44Udp {
+            ingress,
+            disposition,
+        });
+        return Err(reason);
+    }
+    if ipv4.header_len > 20 {
+        return nat44_udp_drop(ingress, Ipv4OptionsUnsupported, trace);
+    }
     if let Err(reason) = validate_nat44_atomic(frame, ipv4) {
-        return nat44_udp_drop(nat44_udp, ingress, reason, trace);
+        return nat44_udp_drop(ingress, reason, trace);
     }
     let udp = match validate_nat44_udp(frame, ipv4) {
         Ok(udp) => udp,
-        Err(reason) => return nat44_udp_drop(nat44_udp, ingress, reason, trace),
+        Err(reason) => return nat44_udp_drop(ingress, reason, trace),
     };
     if ipv4.ttl <= 1 {
-        return nat44_udp_drop(nat44_udp, ingress, Ipv4TtlExpired, trace);
+        return nat44_udp_drop(ingress, Ipv4TtlExpired, trace);
     }
     if !icmp_error_source_is_host(snapshot, ipv4.source)
         || snapshot
@@ -1080,12 +1130,8 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
             .iter()
             .any(|binding| binding.address == ipv4.source)
     {
-        return nat44_udp_drop(nat44_udp, ingress, Nat44UdpSourceForbidden, trace);
+        return nat44_udp_drop(ingress, Nat44UdpSourceForbidden, trace);
     }
-    let now = resolution
-        .as_ref()
-        .map_or(MonotonicMillis(0), |(_, now)| *now);
-    let runtime = require_nat44_udp_runtime(snapshot, config, nat44_udp, ingress, trace)?;
     let plan = match runtime.plan_inbound(udp.destination_port, ipv4.source, now.0) {
         Ok(plan) => plan,
         Err(error) => {
@@ -1100,10 +1146,10 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
     };
     let internal_address = plan.internal_address();
     let Some(reverse_route) = route::lookup(snapshot.routes, internal_address) else {
-        return nat44_udp_drop(nat44_udp, ingress, Nat44UdpReverseAuthorityMismatch, trace);
+        return nat44_udp_drop(ingress, Nat44UdpReverseAuthorityMismatch, trace);
     };
     if reverse_route.egress() != config.inside() {
-        return nat44_udp_drop(nat44_udp, ingress, Nat44UdpWrongEgress, trace);
+        return nat44_udp_drop(ingress, Nat44UdpWrongEgress, trace);
     }
     let target = reverse_route.next_hop().unwrap_or(internal_address);
     let interface = snapshot
@@ -1121,7 +1167,7 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
         match resolution_runtime.lookup_dynamic(reverse_route.egress(), target, *resolution_now) {
             DynamicLookup::Hit(mac) => mac,
             DynamicLookup::ClockRegression => {
-                return nat44_udp_drop(nat44_udp, ingress, NeighborUnresolved, trace);
+                return nat44_udp_drop(ingress, NeighborUnresolved, trace);
             }
             DynamicLookup::Miss => {
                 if let Some(binding) = snapshot
@@ -1145,11 +1191,11 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
                         result,
                     });
                 }
-                return nat44_udp_drop(nat44_udp, ingress, NeighborUnresolved, trace);
+                return nat44_udp_drop(ingress, NeighborUnresolved, trace);
             }
         }
     } else {
-        return nat44_udp_drop(nat44_udp, ingress, NeighborUnresolved, trace);
+        return nat44_udp_drop(ingress, NeighborUnresolved, trace);
     };
     let ttl_offset = ipv4.header_offset + 8;
     let checksum_offset = ipv4.header_offset + 10;
@@ -1334,7 +1380,6 @@ fn nat44_udp_plan_error(error: Nat44UdpPlanError) -> (DropReason, Nat44UdpDispos
 }
 
 fn nat44_udp_drop<T: TraceSink>(
-    _runtime: &mut Option<&mut Nat44UdpRuntime<'_>>,
     ingress: IfId,
     reason: DropReason,
     trace: &mut T,
@@ -1381,6 +1426,29 @@ fn require_nat44_udp_runtime<'runtime, 'storage, T: TraceSink>(
         return Err(Nat44UdpConfigMismatch);
     }
     Ok(runtime)
+}
+
+fn observe_nat_candidate_if_present<T: TraceSink>(
+    snapshot: &ForwardingSnapshot<'_>,
+    config: &Nat44UdpConfig,
+    runtime: &mut Option<&mut Nat44UdpRuntime<'_>>,
+    now: MonotonicMillis,
+    ingress: IfId,
+    trace: &mut T,
+) -> Result<(), DropReason> {
+    if runtime.is_none() {
+        return Ok(());
+    }
+    let runtime = require_nat44_udp_runtime(snapshot, config, runtime, ingress, trace)?;
+    if let Err(error) = runtime.observe_now(now.0) {
+        let (reason, disposition) = nat44_udp_plan_error(error);
+        trace.record(TraceEvent::Nat44Udp {
+            ingress,
+            disposition,
+        });
+        return Err(reason);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2044,6 +2112,7 @@ mod tests {
             (50, "NAT44_UDP_CLOCK_REGRESSION"),
             (51, "NAT44_UDP_WRONG_INGRESS"),
             (52, "NAT44_UDP_WRONG_EGRESS"),
+            (53, "NAT44_EXTERNAL_TO_INTERNAL_BYPASS"),
         ];
         let actual = [
             DropReason::EthernetHeaderTruncated,
@@ -2098,6 +2167,7 @@ mod tests {
             DropReason::Nat44UdpClockRegression,
             DropReason::Nat44UdpWrongIngress,
             DropReason::Nat44UdpWrongEgress,
+            DropReason::Nat44ExternalToInternalBypass,
         ];
         assert_eq!(actual.len(), expected.len());
         for (reason, &(discriminant, code)) in actual.iter().zip(&expected) {

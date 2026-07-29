@@ -1162,6 +1162,169 @@ fn wrong_ingress_unrelated_traffic_and_icmp_are_explicitly_non_nat() {
 }
 
 #[test]
+fn outside_to_inside_lpm_bypass_is_always_fail_closed_before_neighbor_work() {
+    let (routes, interfaces, neighbors, bindings) = base();
+    let snapshot =
+        ForwardingSnapshot::new(&routes, &interfaces, &neighbors[2..], &bindings).unwrap();
+    let config = config(&snapshot, 40_000, 40_000);
+    let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+    let mut peers = [Nat44UdpPeerSlot::default(); 1];
+    let mut nat = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+    let mut rs = [ResolutionStateSlot::EMPTY; 2];
+    let mut ra = [ResolutionActionSlot::EMPTY; 2];
+    let mut resolution = resolution(&mut rs, &mut ra);
+    let mut io = SimIo::new();
+
+    let empty_runtime = udp_frame(
+        REMOTE1,
+        HOST,
+        53,
+        40_000,
+        64,
+        0x4000,
+        &[],
+        &[],
+        UdpChecksum::Zero,
+    );
+    io.inject(WAN, empty_runtime.clone());
+    io.run_nat44_udp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut nat),
+        MonotonicMillis(0),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(
+        &mut io,
+        DropReason::Nat44ExternalToInternalBypass,
+        &empty_runtime,
+    );
+    assert!(nat.mappings().iter().all(|mapping| !mapping.is_occupied()));
+    assert!(nat.peers().iter().all(|peer| !peer.is_occupied()));
+    assert_eq!(nat.counters(), Default::default());
+    assert_eq!(resolution.counters().queued, 0);
+
+    io.inject(
+        LAN,
+        udp_frame(
+            HOST,
+            REMOTE1,
+            40_000,
+            53,
+            64,
+            0x4000,
+            &[],
+            &[],
+            UdpChecksum::Zero,
+        ),
+    );
+    io.run_nat44_udp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut nat),
+        MonotonicMillis(0),
+        &mut NoTrace,
+    )
+    .unwrap();
+    io.pop_tx();
+    let mapping_before = nat.mappings()[0];
+    let peer_before = nat.peers()[0];
+    let counters_before = nat.counters();
+    let resolution_before = resolution.counters();
+
+    let mut tcp = udp_frame(
+        REMOTE1,
+        HOST,
+        53,
+        40_000,
+        64,
+        0x4000,
+        &[],
+        &[],
+        UdpChecksum::Zero,
+    );
+    tcp[23] = 6;
+    refresh_ipv4_checksum(&mut tcp);
+    let cases = [
+        udp_frame(
+            REMOTE1,
+            HOST,
+            53,
+            40_000,
+            64,
+            0x4000,
+            &[],
+            &[],
+            UdpChecksum::Zero,
+        ),
+        udp_frame(
+            REMOTE2,
+            HOST,
+            53,
+            40_000,
+            64,
+            0x4000,
+            &[],
+            &[],
+            UdpChecksum::Zero,
+        ),
+        tcp,
+    ];
+    for packet in cases {
+        io.inject(WAN, packet.clone());
+        io.run_nat44_udp_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(&mut nat),
+            MonotonicMillis(100),
+            &mut NoTrace,
+        )
+        .unwrap();
+        assert_drop(&mut io, DropReason::Nat44ExternalToInternalBypass, &packet);
+        assert_eq!(nat.mappings()[0], mapping_before);
+        assert_eq!(nat.peers()[0], peer_before);
+        assert_eq!(nat.counters(), counters_before);
+        assert_eq!(resolution.counters(), resolution_before);
+    }
+
+    let absent_runtime = udp_frame(
+        REMOTE1,
+        HOST,
+        53,
+        40_000,
+        64,
+        0x4000,
+        &[],
+        &[],
+        UdpChecksum::Zero,
+    );
+    io.inject(WAN, absent_runtime.clone());
+    io.run_nat44_udp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        None,
+        MonotonicMillis(100),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(
+        &mut io,
+        DropReason::Nat44ExternalToInternalBypass,
+        &absent_runtime,
+    );
+    assert_eq!(resolution.counters(), resolution_before);
+}
+
+#[test]
 fn route_ttl_neighbor_and_reverse_authority_fail_before_nat_state() {
     let (routes, interfaces, neighbors, bindings) = base();
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
@@ -1302,4 +1465,160 @@ fn route_ttl_neighbor_and_reverse_authority_fail_before_nat_state() {
     .unwrap();
     assert_eq!(io.pop_tx().unwrap().egress, WAN);
     assert_eq!(unresolved_nat.counters().mappings_created, 1);
+}
+
+#[test]
+fn later_forwarding_and_structural_failures_still_advance_nat_time() {
+    let (routes, interfaces, neighbors, bindings) = base();
+    let snapshot =
+        ForwardingSnapshot::new(&routes, &interfaces, &neighbors[2..], &bindings).unwrap();
+    let config = config(&snapshot, 40_000, 40_000);
+    let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+    let mut peers = [Nat44UdpPeerSlot::default(); 1];
+    let mut nat = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+    let mut rs = [ResolutionStateSlot::EMPTY; 2];
+    let mut ra = [ResolutionActionSlot::EMPTY; 2];
+    let mut resolution = resolution(&mut rs, &mut ra);
+    let mut io = SimIo::new();
+    let outbound = || {
+        udp_frame(
+            HOST,
+            REMOTE1,
+            40_000,
+            53,
+            64,
+            0x4000,
+            &[],
+            &[],
+            UdpChecksum::Zero,
+        )
+    };
+    let inbound = || {
+        udp_frame(
+            REMOTE1,
+            PUBLIC,
+            53,
+            40_000,
+            64,
+            0x4000,
+            &[],
+            &[],
+            UdpChecksum::Zero,
+        )
+    };
+
+    io.inject(LAN, outbound());
+    io.run_nat44_udp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut nat),
+        MonotonicMillis(0),
+        &mut NoTrace,
+    )
+    .unwrap();
+    io.pop_tx();
+
+    let neighbor_failure = inbound();
+    io.inject(WAN, neighbor_failure.clone());
+    io.run_nat44_udp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut nat),
+        MonotonicMillis(100),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::NeighborUnresolved, &neighbor_failure);
+    assert_eq!(nat.mappings()[0].last_outbound_ms(), 0);
+    assert_eq!(nat.counters().inbound_translated, 0);
+    let resolution_after_failure = resolution.counters();
+
+    let older = inbound();
+    io.inject(WAN, older.clone());
+    io.run_nat44_udp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut nat),
+        MonotonicMillis(99),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::Nat44UdpClockRegression, &older);
+    assert_eq!(resolution.counters(), resolution_after_failure);
+
+    let equal = inbound();
+    io.inject(WAN, equal.clone());
+    io.run_nat44_udp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut nat),
+        MonotonicMillis(100),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::NeighborUnresolved, &equal);
+
+    let malformed = udp_frame(
+        HOST,
+        REMOTE1,
+        40_000,
+        53,
+        64,
+        0,
+        &[],
+        &[],
+        UdpChecksum::Zero,
+    );
+    io.inject(LAN, malformed.clone());
+    io.run_nat44_udp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut nat),
+        MonotonicMillis(200),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(
+        &mut io,
+        DropReason::Nat44UdpNonAtomicIpv4Unsupported,
+        &malformed,
+    );
+
+    let older = outbound();
+    io.inject(LAN, older.clone());
+    io.run_nat44_udp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut nat),
+        MonotonicMillis(199),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::Nat44UdpClockRegression, &older);
+
+    io.inject(LAN, outbound());
+    io.run_nat44_udp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut nat),
+        MonotonicMillis(200),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_eq!(io.pop_tx().unwrap().egress, WAN);
+    assert_eq!(nat.mappings()[0].last_outbound_ms(), 200);
 }

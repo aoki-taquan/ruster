@@ -452,14 +452,26 @@ impl<'a> Nat44UdpRuntime<'a> {
         self.counters.config_mismatches = self.counters.config_mismatches.saturating_add(1);
     }
 
+    pub(crate) fn observe_now(&mut self, now_ms: u64) -> Result<(), Nat44UdpPlanError> {
+        if self
+            .watermark_ms
+            .is_some_and(|watermark| now_ms < watermark)
+        {
+            self.counters.clock_regressions = self.counters.clock_regressions.saturating_add(1);
+            return Err(Nat44UdpPlanError::ClockRegression);
+        }
+        self.watermark_ms = Some(now_ms);
+        Ok(())
+    }
+
     pub(crate) fn plan_outbound(
-        &self,
+        &mut self,
         internal_address: Ipv4Address,
         internal_port: u16,
         remote_address: Ipv4Address,
         now_ms: u64,
     ) -> Result<Nat44UdpOutboundPlan, Nat44UdpPlanError> {
-        self.check_clock(now_ms)?;
+        self.observe_now(now_ms)?;
         if let Some((mapping_index, mapping)) =
             self.find_mapping(internal_address, internal_port, now_ms)
         {
@@ -563,12 +575,12 @@ impl<'a> Nat44UdpRuntime<'a> {
     }
 
     pub(crate) fn plan_inbound(
-        &self,
+        &mut self,
         public_port: u16,
         remote_address: Ipv4Address,
         now_ms: u64,
     ) -> Result<Nat44UdpInboundPlan, Nat44UdpPlanError> {
-        self.check_clock(now_ms)?;
+        self.observe_now(now_ms)?;
         let Some((mapping_index, mapping)) =
             self.mappings
                 .iter()
@@ -620,19 +632,9 @@ impl<'a> Nat44UdpRuntime<'a> {
                 self.counters.port_exhausted = self.counters.port_exhausted.saturating_add(1);
             }
             Nat44UdpPlanError::ClockRegression => {
-                self.counters.clock_regressions = self.counters.clock_regressions.saturating_add(1);
+                // `observe_now` owns this counter so a forwarding caller can
+                // record the typed plan error without double-counting it.
             }
-        }
-    }
-
-    fn check_clock(&self, now_ms: u64) -> Result<(), Nat44UdpPlanError> {
-        if self
-            .watermark_ms
-            .is_some_and(|watermark| now_ms < watermark)
-        {
-            Err(Nat44UdpPlanError::ClockRegression)
-        } else {
-            Ok(())
         }
     }
 
@@ -902,14 +904,14 @@ mod tests {
 
             let mut no_mappings = [];
             let mut one_peer = [Nat44UdpPeerSlot::default(); 1];
-            let empty = Nat44UdpRuntime::new(config, &mut no_mappings, &mut one_peer);
+            let mut empty = Nat44UdpRuntime::new(config, &mut no_mappings, &mut one_peer);
             assert!(matches!(
                 empty.plan_outbound(INTERNAL, 40_000, REMOTE1, 0),
                 Err(Nat44UdpPlanError::MappingFull)
             ));
             let mut one_mapping = [Nat44UdpMappingSlot::default(); 1];
             let mut no_peers = [];
-            let empty = Nat44UdpRuntime::new(config, &mut one_mapping, &mut no_peers);
+            let mut empty = Nat44UdpRuntime::new(config, &mut one_mapping, &mut no_peers);
             assert!(matches!(
                 empty.plan_outbound(INTERNAL, 40_000, REMOTE1, 0),
                 Err(Nat44UdpPlanError::PeerFull)
@@ -957,11 +959,74 @@ mod tests {
                 Err(Nat44UdpPlanError::ClockRegression)
             ));
             assert_eq!(runtime.mappings()[0], before);
+            assert_eq!(runtime.counters().clock_regressions, 1);
             let equal = runtime
                 .plan_outbound(INTERNAL, 40_000, REMOTE1, 100)
                 .unwrap();
             runtime.commit_outbound(equal, 100);
             assert_eq!(runtime.mappings()[0].last_outbound_ms(), 100);
+        });
+    }
+
+    #[test]
+    fn failed_lookup_and_capacity_operations_advance_the_watermark() {
+        let policy = Nat44UdpPolicy::new(NAT44_UDP_MIN_IDLE_TTL_MS, 0).unwrap();
+        with_config(policy, |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut runtime = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(first, 0);
+            assert!(matches!(
+                runtime.plan_inbound(40_000, REMOTE1, NAT44_UDP_MIN_IDLE_TTL_MS),
+                Err(Nat44UdpPlanError::MappingMiss)
+            ));
+            assert!(matches!(
+                runtime.plan_inbound(40_000, REMOTE1, NAT44_UDP_MIN_IDLE_TTL_MS - 1),
+                Err(Nat44UdpPlanError::ClockRegression)
+            ));
+            assert!(matches!(
+                runtime.plan_inbound(40_000, REMOTE1, NAT44_UDP_MIN_IDLE_TTL_MS),
+                Err(Nat44UdpPlanError::MappingMiss)
+            ));
+        });
+
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut runtime = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(first, 0);
+            assert!(matches!(
+                runtime.plan_inbound(40_000, REMOTE2, 100),
+                Err(Nat44UdpPlanError::FilterDenied)
+            ));
+            assert!(matches!(
+                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 99),
+                Err(Nat44UdpPlanError::ClockRegression)
+            ));
+            assert!(runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, 100)
+                .is_ok());
+        });
+
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 2];
+            let mut runtime = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(first, 0);
+            assert!(matches!(
+                runtime.plan_outbound(INTERNAL2, 40_001, REMOTE1, 200),
+                Err(Nat44UdpPlanError::MappingFull)
+            ));
+            assert!(matches!(
+                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 199),
+                Err(Nat44UdpPlanError::ClockRegression)
+            ));
+            assert!(runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, 200)
+                .is_ok());
         });
     }
 

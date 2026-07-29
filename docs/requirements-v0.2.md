@@ -136,8 +136,8 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | NAT44-003 Address-Dependent Filtering | RFC 4787 filtering taxonomy, local profile | `eim_reuses_public_tuple_and_adf_keys_only_remote_address` | implemented | contacted remote IPv4だけ許可しremote portは任意。unknown IPはbyte不変drop |
 | NAT44-004 unique deterministic public port | RFC 4787 REQ-3, local bounded allocator | `allocator_preserves_then_falls_back_without_overload_and_exhausts` | implemented | internal portを可能なら保存し、seeded startからpoolを一周。overload/live evictionなし |
 | NAT44-005 fixed caller-backed state/generation | architecture contract | `full_tables_do_not_evict_or_refresh_live_state_and_zero_capacity_is_safe` | implemented | mapping/peer zero/full safe、generationでstale peerを無効化、`!Send + !Sync` |
-| NAT44-006 idle timer and refresh direction | RFC 4787 REQ-5, RFC 7857 timer updates | `exact_idle_expiry_outbound_refresh_and_inbound_no_refresh` | implemented | default 300s/minimum 120s、exact expiry。outbound TX requestだけrefresh |
-| NAT44-007 monotonic clock atomicity | architecture contract | `clock_regression_is_atomic_and_equal_time_recovers` | implemented | regressionはcounter/trace以外を変更せずequal timeで回復 |
+| NAT44-006 idle timer and refresh direction | RFC 4787 REQ-5/REQ-6, RFC 7857 §§7–7.1 | `exact_idle_expiry_outbound_refresh_and_inbound_no_refresh` | implemented | default 300s/minimum 120s、exact expiry。outbound TX requestだけrefreshし、inboundはrefreshしない |
+| NAT44-007 monotonic clock atomicity | architecture contract | `failed_lookup_and_capacity_operations_advance_the_watermark` | implemented | non-regressed operationはdropでもwatermarkを進める。regressionはcounter/trace以外を変更せずequal timeで回復 |
 | NAT44-008 atomic IPv4-only profile | RFC 6864 §§4.1–4.2 | `structural_and_policy_failures_are_byte_and_state_atomic` | deviation | DF=1/MF=0/offset=0だけ変換。DF=0を含むfragment-capable datagramはtyped drop |
 | NAT44-009 UDP length and padding | RFC 768 | `checksum_zero_invalid_nonzero_and_odd_or_padded_udp_are_algebraic` | implemented | UDP length 8..=IPv4 payload。UDP後のIP/link paddingを保存 |
 | NAT44-010 incremental address/port checksum | RFC 1624 §4, RFC 768 | `checksum_zero_invalid_nonzero_and_odd_or_padded_udp_are_algebraic` | implemented | UDP zeroを保存。nonzeroはaddress/port更新、negative zeroを`0xffff` encode |
@@ -151,6 +151,7 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | NAT44-018 fragment translation | RFC 3022 §6.3, RFC 4787 REQ-14 | `structural_and_policy_failures_are_byte_and_state_atomic` | deferred | fragment association/reassembly未実装。atomic DF=1だけの初期profile |
 | NAT44-019 ICMP error translation and PMTU | RFC 3022 §§4.3, 6.3 | `wrong_ingress_unrelated_traffic_and_icmp_are_explicitly_non_nat` | deferred | incoming ICMPはmappingをrefresh/deleteせず従来local path。embedded tuple/PMTU translationなし |
 | NAT44-020 other transports/features | RFC 3022, RFC 4787, RFC 7857 | — | deferred | TCP/ICMP query NAT、static forwards、multi-public、port randomization/parity、full packet filter/firewall |
+| NAT44-021 external-to-internal bypass prevention | RFC 3022 traditional NAT domain boundary, local security policy | `outside_to_inside_lpm_bypass_is_always_fail_closed_before_neighbor_work` | implemented | authorized public UDP DNAT以外のoutside→inside LPMをprotocol/runtime/state非依存でneighbor処理前にdrop |
 
 ## RFC deviation rule
 

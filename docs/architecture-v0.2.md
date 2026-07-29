@@ -375,8 +375,16 @@ refreshせずdropし、filterを緩めません。live mappingをevictせず、p
 core dropはpacket bytesとmapping/peer stateを変更しません。outbound TX requestでmapping
 idle timeとADF peerをcommitするため、backend aggregate rejectでもrollbackしません。
 same batchの後続inboundは直前outboundのstateを見ます。inboundはmapping idle timeをrefresh
-しません。clock regressionはcounter/trace以外を変更せず、直前watermarkと等しい時刻で回復
-します。default idle TTLは300秒、minimum 120秒、exact boundaryでexpiredです。
+しません。NAT runtimeへ到達した非退行operationは、mapping/filter miss、capacity/port
+exhaustion、後続route/neighbor failure、structural/policy dropでもoperation開始時にwatermarkを
+進めます。これによりexact expiryを観測した後の古い時刻でmapping/ADFが復活しません。
+clock regressionはcounter/trace以外を変更せずfail closedにし、直前watermarkと等しい時刻で
+回復します。default idle TTLは300秒、minimum 120秒、exact boundaryでexpiredです。
+
+outside ingressから通常LPMがinside egressを選んだpacketは、宛先public UDPのauthorized
+DNAT pathを先に完了した場合を除き、protocol/runtime/mappingの有無にかかわらず
+`Nat44ExternalToInternalBypass`でdropします。この境界はneighbor lookup/ARP scheduleより前で、
+single-domain traditional NATを迂回する外部から内部への直接転送を許可しません。
 
 RFC 768のUDP lengthは8以上かつIPv4 payload以下を要求し、短いUDP lengthの後ろにあるIP
 paddingは保存します。checksum zeroはzeroのままです。nonzero checksumはRFC 1624で
