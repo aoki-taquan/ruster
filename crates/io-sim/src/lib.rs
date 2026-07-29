@@ -4,11 +4,12 @@
 use std::{collections::VecDeque, convert::Infallible};
 
 use ruster_core::{
-    forward_batch, forward_batch_with_nat44_udp, BatchCompletion, BatchReport, ConsumeReason,
-    DropReason, ForwardingSnapshot, GeneratedAllocationError, GeneratedArpTrace,
-    GeneratedBatchCompletion, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedPacketBatch,
-    GeneratedPacketIo, GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion,
-    GeneratedTraceSink, IfId, MonotonicMillis, Nat44UdpConfig, Nat44UdpRuntime, PacketBatch,
+    forward_batch, forward_batch_with_nat44_tcp, forward_batch_with_nat44_udp,
+    forward_batch_with_nat44_udp_and_tcp, BatchCompletion, BatchReport, ConsumeReason, DropReason,
+    ForwardingSnapshot, GeneratedAllocationError, GeneratedArpTrace, GeneratedBatchCompletion,
+    GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedPacketBatch, GeneratedPacketIo,
+    GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion, GeneratedTraceSink, IfId,
+    MonotonicMillis, Nat44TcpConfig, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpRuntime, PacketBatch,
     PacketIo, PacketLease, PacketSlot, ResolutionRuntime, SlotCompletion, TraceEvent, TraceSink,
 };
 
@@ -189,6 +190,42 @@ impl SimIo {
         let batch = self.receive(budget)?;
         Ok(forward_batch_with_nat44_udp(
             batch, snapshot, resolution, config, nat44_udp, now, trace,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_nat44_tcp_once<T: TraceSink>(
+        &mut self,
+        budget: usize,
+        snapshot: &ForwardingSnapshot<'_>,
+        resolution: &mut ResolutionRuntime<'_>,
+        config: &Nat44TcpConfig,
+        nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+        now: MonotonicMillis,
+        trace: &mut T,
+    ) -> Result<BatchReport<Infallible>, Infallible> {
+        let batch = self.receive(budget)?;
+        Ok(forward_batch_with_nat44_tcp(
+            batch, snapshot, resolution, config, nat44_tcp, now, trace,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_nat44_udp_and_tcp_once<T: TraceSink>(
+        &mut self,
+        budget: usize,
+        snapshot: &ForwardingSnapshot<'_>,
+        resolution: &mut ResolutionRuntime<'_>,
+        udp_config: &Nat44UdpConfig,
+        nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+        tcp_config: &Nat44TcpConfig,
+        nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+        now: MonotonicMillis,
+        trace: &mut T,
+    ) -> Result<BatchReport<Infallible>, Infallible> {
+        let batch = self.receive(budget)?;
+        Ok(forward_batch_with_nat44_udp_and_tcp(
+            batch, snapshot, resolution, udp_config, nat44_udp, tcp_config, nat44_tcp, now, trace,
         ))
     }
 }
