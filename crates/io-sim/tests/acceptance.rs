@@ -1,8 +1,8 @@
 use ruster_core::{
-    forward_batch, ipv4_header_checksum, validate_ipv4_frame, BatchCompletion, DropReason,
-    ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress, Neighbor,
-    NoTrace, PacketBatch, PacketIo, PacketLease, PacketSlot, Route, SlotCompletion, SnapshotError,
-    TraceEvent, ETHERNET_HEADER_LEN,
+    forward_batch, ipv4_header_checksum, validate_ipv4_frame, BatchCompletion, ConsumeReason,
+    DropReason, ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    Neighbor, NoTrace, PacketBatch, PacketIo, PacketLease, PacketSlot, Route, SlotCompletion,
+    SnapshotError, TraceEvent, ETHERNET_HEADER_LEN,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 
@@ -145,6 +145,21 @@ fn assert_forwarding_drop(
     let recycled = io.pop_recycled().unwrap();
     assert_eq!(recycled.cause, RecycleCause::Forwarding(expected));
     assert_eq!(recycled.bytes, original, "drop must not mutate bytes");
+}
+
+fn assert_arp_control_consumed(packet: Vec<u8>, snapshot: &ForwardingSnapshot<'_>) {
+    let original = packet.clone();
+    let mut io = SimIo::new();
+    io.inject(LAN, packet);
+    let report = io.run_once(1, snapshot, &mut NoTrace).unwrap();
+    assert_eq!(report.dropped, 0);
+    assert_eq!(report.consumed, 1);
+    let recycled = io.pop_recycled().unwrap();
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Consumed(ConsumeReason::ArpControl)
+    );
+    assert_eq!(recycled.bytes, original);
 }
 
 #[test]
@@ -706,8 +721,6 @@ fn arp_profile_validation_drops_are_granular_and_atomic() {
     hardware_length[18] = 8;
     let mut protocol_length = request();
     protocol_length[19] = 16;
-    let mut reply = request();
-    reply[20..22].copy_from_slice(&2_u16.to_be_bytes());
     let mut unknown_opcode = request();
     unknown_opcode[20..22].copy_from_slice(&99_u16.to_be_bytes());
 
@@ -717,7 +730,6 @@ fn arp_profile_validation_drops_are_granular_and_atomic() {
         (protocol_type, DropReason::ArpProtocolTypeUnsupported),
         (hardware_length, DropReason::ArpHardwareLengthUnsupported),
         (protocol_length, DropReason::ArpProtocolLengthUnsupported),
-        (reply, DropReason::ArpReplyUnsupported),
         (unknown_opcode, DropReason::ArpOpcodeUnsupported),
     ];
     for (packet, reason) in cases {
@@ -764,7 +776,7 @@ fn arp_nonlocal_and_reply_are_recycled_without_mutation() {
         [0; 6],
         &[],
     );
-    assert_forwarding_drop(nonlocal, &snapshot, DropReason::ArpTargetNotLocal);
+    assert_arp_control_consumed(nonlocal, &snapshot);
     let reply = arp_frame(
         2,
         REQUESTER_IPV4,
@@ -774,7 +786,7 @@ fn arp_nonlocal_and_reply_are_recycled_without_mutation() {
         LAN_MAC.0,
         &[],
     );
-    assert_forwarding_drop(reply, &snapshot, DropReason::ArpReplyUnsupported);
+    assert_arp_control_consumed(reply, &snapshot);
     let unknown_opcode = arp_frame(
         77,
         REQUESTER_IPV4,
@@ -801,11 +813,7 @@ fn arp_nonlocal_and_reply_are_recycled_without_mutation() {
         [0; 6],
         &[],
     );
-    assert_forwarding_drop(
-        wrong_ingress,
-        &wrong_ingress_snapshot,
-        DropReason::ArpTargetNotLocal,
-    );
+    assert_arp_control_consumed(wrong_ingress, &wrong_ingress_snapshot);
 }
 
 #[test]

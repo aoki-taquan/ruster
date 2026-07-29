@@ -39,7 +39,13 @@ pub trait PacketSlot {
 pub enum SlotCompletion {
     Transmit(IfId),
     Recycle(DropReason),
+    Consume(ConsumeReason),
     LeaseAbandoned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsumeReason {
+    ArpControl,
 }
 
 /// A core-owned, worker-local RAII lease.
@@ -75,6 +81,10 @@ impl<S: PacketSlot> PacketLease<S> {
 
     pub fn recycle(mut self, reason: DropReason) {
         self.complete(SlotCompletion::Recycle(reason));
+    }
+
+    pub fn consume(mut self, reason: ConsumeReason) {
+        self.complete(SlotCompletion::Consume(reason));
     }
 
     fn complete(&mut self, completion: SlotCompletion) {

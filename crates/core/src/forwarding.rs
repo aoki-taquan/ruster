@@ -1,7 +1,9 @@
+use crate::resolution::DynamicLookup;
 use crate::{
-    packet, rfc1624_update, route, validate_arp_request, validate_ipv4_frame, ArpRequestAction,
-    BatchCompletion, IfId, Interface, LocalIpv4Binding, MonotonicMillis, Neighbor, PacketBatch,
-    ResolutionResult, ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
+    packet, rfc1624_update, route, validate_arp, validate_ipv4_frame, ArpOpcode, ArpRequestAction,
+    BatchCompletion, ConsumeReason, ControlDisposition, IfId, Interface, LocalIpv4Binding,
+    MonotonicMillis, Neighbor, PacketBatch, ResolutionResult, ResolutionRuntime, Route,
+    ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +32,9 @@ pub enum DropReason {
     ArpReplyUnsupported = 20,
     ArpOpcodeUnsupported = 21,
     ArpTargetNotLocal = 22,
+    ArpSenderHardwareZero = 23,
+    ArpSenderHardwareBroadcast = 24,
+    ArpSenderHardwareMulticast = 25,
 }
 
 use DropReason::*;
@@ -60,6 +65,9 @@ impl DropReason {
             ArpReplyUnsupported => "ARP_REPLY_UNSUPPORTED",
             ArpOpcodeUnsupported => "ARP_OPCODE_UNSUPPORTED",
             ArpTargetNotLocal => "ARP_TARGET_NOT_LOCAL",
+            ArpSenderHardwareZero => "ARP_SENDER_HARDWARE_ZERO",
+            ArpSenderHardwareBroadcast => "ARP_SENDER_HARDWARE_BROADCAST",
+            ArpSenderHardwareMulticast => "ARP_SENDER_HARDWARE_MULTICAST",
         }
     }
 }
@@ -161,6 +169,15 @@ pub enum TraceEvent {
         sender_protocol: crate::Ipv4Address,
         target_protocol: crate::Ipv4Address,
     },
+    ArpReplyValidated {
+        ingress: IfId,
+        sender_protocol: crate::Ipv4Address,
+        target_protocol: crate::Ipv4Address,
+    },
+    ArpControl {
+        ingress: IfId,
+        disposition: ControlDisposition,
+    },
     Routed {
         egress: IfId,
         neighbor_target: crate::Ipv4Address,
@@ -181,6 +198,11 @@ pub enum TraceEvent {
     Dropped {
         ingress: IfId,
         reason: DropReason,
+    },
+    Consumed {
+        ingress: IfId,
+        reason: ConsumeReason,
+        disposition: ControlDisposition,
     },
     BatchCompleted {
         tx_accepted: usize,
@@ -208,6 +230,7 @@ pub struct BatchReport<E> {
     /// Packets requested for TX; this does not mean backend or wire acceptance.
     pub tx_requested: usize,
     pub dropped: usize,
+    pub consumed: usize,
     pub completion: BatchCompletion<E>,
 }
 
@@ -237,13 +260,15 @@ struct ArpReplyDecision {
 enum PacketDecision {
     Ipv4(Ipv4RewriteDecision),
     ArpReply(ArpReplyDecision),
+    Consume(ControlDisposition),
 }
 
 impl PacketDecision {
-    const fn egress(self) -> IfId {
+    fn egress(self) -> IfId {
         match self {
             Self::Ipv4(decision) => decision.egress,
             Self::ArpReply(decision) => decision.egress,
+            Self::Consume(_) => unreachable!("consumed controls have no egress"),
         }
     }
 }
@@ -289,15 +314,30 @@ where
     let mut received = 0;
     let mut tx_requested = 0;
     let mut dropped = 0;
+    let mut consumed = 0;
     while let Some(mut packet) = batch.next_packet() {
         received += 1;
         let ingress = packet.ingress();
         let result = {
             let frame = packet.bytes_mut();
-            decide(&*frame, snapshot, ingress, &mut resolution, trace)
-                .and_then(|decision| apply_decision(frame, decision).map(|()| decision))
+            decide(&*frame, snapshot, ingress, &mut resolution, trace).and_then(|decision| {
+                if matches!(decision, PacketDecision::Consume(_)) {
+                    Ok(decision)
+                } else {
+                    apply_decision(frame, decision).map(|()| decision)
+                }
+            })
         };
         match result {
+            Ok(PacketDecision::Consume(disposition)) => {
+                packet.consume(ConsumeReason::ArpControl);
+                consumed += 1;
+                trace.record(TraceEvent::Consumed {
+                    ingress,
+                    reason: ConsumeReason::ArpControl,
+                    disposition,
+                });
+            }
             Ok(decision) => {
                 let egress = decision.egress();
                 packet.commit(egress);
@@ -318,6 +358,7 @@ where
         }
     }
     let completion = batch.finish();
+    debug_assert_eq!(received, tx_requested + dropped + consumed);
     trace.record(TraceEvent::BatchCompleted {
         tx_accepted: completion.tx_accepted,
         tx_rejected: completion.tx_rejected,
@@ -326,6 +367,7 @@ where
         received,
         tx_requested,
         dropped,
+        consumed,
         completion,
     }
 }
@@ -342,7 +384,7 @@ fn decide<T: TraceSink>(
         IPV4_ETHERTYPE => {
             decide_ipv4(frame, snapshot, ingress, resolution, trace).map(PacketDecision::Ipv4)
         }
-        ARP_ETHERTYPE => decide_arp(frame, snapshot, ingress, trace).map(PacketDecision::ArpReply),
+        ARP_ETHERTYPE => decide_arp(frame, snapshot, ingress, resolution, trace),
         _ => Err(UnsupportedEtherType),
     }
 }
@@ -372,37 +414,52 @@ fn decide_ipv4<T: TraceSink>(
         .iter()
         .find(|item| item.id == route.egress())
         .ok_or(InterfaceMiss)?;
-    let neighbor = snapshot
+    let static_neighbor = snapshot
         .neighbors
         .iter()
         .find(|item| item.interface == route.egress() && item.target == target);
-    let Some(neighbor) = neighbor else {
-        if let (Some(binding), Some((runtime, now))) = (
-            snapshot
-                .local_ipv4
-                .iter()
-                .find(|binding| binding.interface == route.egress()),
-            resolution.as_mut(),
-        ) {
-            let result = runtime.schedule(
-                ArpRequestAction {
+    let destination_mac = if let Some(neighbor) = static_neighbor {
+        neighbor.mac
+    } else if let Some((runtime, now)) = resolution.as_mut() {
+        match runtime.lookup_dynamic(route.egress(), target, *now) {
+            DynamicLookup::Hit(mac) => mac,
+            DynamicLookup::ClockRegression => {
+                trace.record(TraceEvent::NeighborResolution {
                     egress: route.egress(),
-                    source_mac: interface.mac,
-                    source_ip: binding.address,
-                    target_ip: target,
-                },
-                *now,
-                snapshot.routes.iter().any(|candidate| {
-                    candidate.egress() == route.egress()
-                        && candidate.is_connected_directed_broadcast(target)
-                }),
-            );
-            trace.record(TraceEvent::NeighborResolution {
-                egress: route.egress(),
-                target,
-                result,
-            });
+                    target,
+                    result: ResolutionResult::ClockRegression,
+                });
+                return Err(NeighborUnresolved);
+            }
+            DynamicLookup::Miss => {
+                if let Some(binding) = snapshot
+                    .local_ipv4
+                    .iter()
+                    .find(|binding| binding.interface == route.egress())
+                {
+                    let result = runtime.schedule(
+                        ArpRequestAction {
+                            egress: route.egress(),
+                            source_mac: interface.mac,
+                            source_ip: binding.address,
+                            target_ip: target,
+                        },
+                        *now,
+                        snapshot.routes.iter().any(|candidate| {
+                            candidate.egress() == route.egress()
+                                && candidate.is_connected_directed_broadcast(target)
+                        }),
+                    );
+                    trace.record(TraceEvent::NeighborResolution {
+                        egress: route.egress(),
+                        target,
+                        result,
+                    });
+                }
+                return Err(NeighborUnresolved);
+            }
         }
+    } else {
         return Err(NeighborUnresolved);
     };
     let ttl_offset = ipv4
@@ -423,7 +480,7 @@ fn decide_ipv4<T: TraceSink>(
     Ok(Ipv4RewriteDecision {
         egress: route.egress(),
         source_mac: interface.mac.0,
-        destination_mac: neighbor.mac.0,
+        destination_mac: destination_mac.0,
         ttl_offset,
         checksum_offset,
         checksum_end,
@@ -437,20 +494,88 @@ fn decide_arp<T: TraceSink>(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
+    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
-) -> Result<ArpReplyDecision, DropReason> {
-    let arp = validate_arp_request(frame)?;
-    trace.record(TraceEvent::ArpRequestValidated {
-        ingress,
-        sender_protocol: arp.sender_protocol,
-        target_protocol: arp.target_protocol,
-    });
-    if !snapshot
+) -> Result<PacketDecision, DropReason> {
+    let arp = validate_arp(frame)?;
+    match arp.opcode {
+        ArpOpcode::Request => trace.record(TraceEvent::ArpRequestValidated {
+            ingress,
+            sender_protocol: arp.sender_protocol,
+            target_protocol: arp.target_protocol,
+        }),
+        ArpOpcode::Reply => trace.record(TraceEvent::ArpReplyValidated {
+            ingress,
+            sender_protocol: arp.sender_protocol,
+            target_protocol: arp.target_protocol,
+        }),
+    }
+    let sha = arp.sender_hardware.0;
+    if sha == [0; 6] {
+        return Err(ArpSenderHardwareZero);
+    }
+    if sha == [0xff; 6] {
+        return Err(ArpSenderHardwareBroadcast);
+    }
+    if sha[0] & 1 != 0 {
+        return Err(ArpSenderHardwareMulticast);
+    }
+    let target_local = snapshot
         .local_ipv4
         .iter()
-        .any(|binding| binding.interface == ingress && binding.address == arp.target_protocol)
-    {
-        return Err(ArpTargetNotLocal);
+        .any(|binding| binding.interface == ingress && binding.address == arp.target_protocol);
+    let sender_local = snapshot
+        .local_ipv4
+        .iter()
+        .any(|binding| binding.address == arp.sender_protocol);
+    let sender_host = sender_is_host(snapshot, ingress, arp.sender_protocol);
+    let static_key = snapshot
+        .neighbors
+        .iter()
+        .any(|neighbor| neighbor.interface == ingress && neighbor.target == arp.sender_protocol);
+    let has_runtime = resolution.is_some();
+    let disposition = if let Some((runtime, now)) = resolution.as_mut() {
+        if arp.sender_protocol.is_unspecified() {
+            if runtime.observe_control(*now) {
+                ControlDisposition::Probe
+            } else {
+                ControlDisposition::ClockRegression
+            }
+        } else if sender_local {
+            if runtime.observe_control(*now) {
+                ControlDisposition::LocalAddressPreserved
+            } else {
+                ControlDisposition::ClockRegression
+            }
+        } else if !sender_host {
+            if runtime.observe_control(*now) {
+                ControlDisposition::SenderNotHost
+            } else {
+                ControlDisposition::ClockRegression
+            }
+        } else {
+            runtime.merge_dynamic(
+                ingress,
+                arp.sender_protocol,
+                arp.sender_hardware,
+                target_local,
+                static_key,
+                *now,
+            )
+        }
+    } else if static_key {
+        ControlDisposition::StaticPreserved
+    } else {
+        ControlDisposition::Ignored
+    };
+    if has_runtime {
+        trace.record(TraceEvent::ArpControl {
+            ingress,
+            disposition,
+        });
+    }
+    if arp.opcode == ArpOpcode::Reply || !target_local {
+        return Ok(PacketDecision::Consume(disposition));
     }
     let interface = snapshot
         .interfaces
@@ -460,19 +585,34 @@ fn decide_arp<T: TraceSink>(
     if frame.get(0..packet::ARP_FRAME_LEN).is_none() {
         return Err(ArpPacketTruncated);
     }
-    Ok(ArpReplyDecision {
+    Ok(PacketDecision::ArpReply(ArpReplyDecision {
         egress: ingress,
         local_mac: interface.mac.0,
         requester_mac: arp.sender_hardware.0,
         requester_protocol: arp.sender_protocol.octets(),
         local_protocol: arp.target_protocol.octets(),
-    })
+    }))
+}
+
+fn sender_is_host(
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    sender: crate::Ipv4Address,
+) -> bool {
+    let octets = sender.octets();
+    octets != [255; 4]
+        && (octets[0] & 0xf0) != 0xe0
+        && !snapshot
+            .routes
+            .iter()
+            .any(|route| route.egress() == ingress && route.is_connected_directed_broadcast(sender))
 }
 
 fn apply_decision(frame: &mut [u8], decision: PacketDecision) -> Result<(), DropReason> {
     match decision {
         PacketDecision::Ipv4(ipv4) => apply_ipv4_rewrite(frame, ipv4),
         PacketDecision::ArpReply(arp) => apply_arp_reply(frame, arp),
+        PacketDecision::Consume(_) => unreachable!("consume decisions are never rewritten"),
     }
 }
 
@@ -541,6 +681,9 @@ mod tests {
             (20, "ARP_REPLY_UNSUPPORTED"),
             (21, "ARP_OPCODE_UNSUPPORTED"),
             (22, "ARP_TARGET_NOT_LOCAL"),
+            (23, "ARP_SENDER_HARDWARE_ZERO"),
+            (24, "ARP_SENDER_HARDWARE_BROADCAST"),
+            (25, "ARP_SENDER_HARDWARE_MULTICAST"),
         ];
         let actual = [
             DropReason::EthernetHeaderTruncated,
@@ -565,6 +708,9 @@ mod tests {
             DropReason::ArpReplyUnsupported,
             DropReason::ArpOpcodeUnsupported,
             DropReason::ArpTargetNotLocal,
+            DropReason::ArpSenderHardwareZero,
+            DropReason::ArpSenderHardwareBroadcast,
+            DropReason::ArpSenderHardwareMulticast,
         ];
         for (reason, &(discriminant, code)) in actual.iter().zip(&expected) {
             assert_eq!(*reason as u16, discriminant);

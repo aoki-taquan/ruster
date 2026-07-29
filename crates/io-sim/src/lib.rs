@@ -4,7 +4,7 @@
 use std::{collections::VecDeque, convert::Infallible};
 
 use ruster_core::{
-    forward_batch, BatchCompletion, BatchReport, DropReason, ForwardingSnapshot,
+    forward_batch, BatchCompletion, BatchReport, ConsumeReason, DropReason, ForwardingSnapshot,
     GeneratedAllocationError, GeneratedArpTrace, GeneratedBatchCompletion, GeneratedPacketBatch,
     GeneratedPacketIo, GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion,
     GeneratedTraceSink, IfId, PacketBatch, PacketIo, PacketLease, PacketSlot, SlotCompletion,
@@ -36,6 +36,7 @@ pub enum FrameOrigin {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecycleCause {
     Forwarding(DropReason),
+    Consumed(ConsumeReason),
     LeaseAbandoned,
 }
 
@@ -264,6 +265,9 @@ impl PacketSlot for SimSlot<'_> {
             }
             SlotCompletion::Recycle(reason) => {
                 self.recycle(slot, RecycleCause::Forwarding(reason));
+            }
+            SlotCompletion::Consume(reason) => {
+                self.recycle(slot, RecycleCause::Consumed(reason));
             }
             SlotCompletion::LeaseAbandoned => {
                 self.recycle(slot, RecycleCause::LeaseAbandoned);

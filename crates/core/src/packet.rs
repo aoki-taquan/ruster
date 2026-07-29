@@ -23,7 +23,14 @@ pub struct ValidatedIpv4 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ValidatedArpRequest {
+pub enum ArpOpcode {
+    Request,
+    Reply,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedArp {
+    pub opcode: ArpOpcode,
     pub sender_hardware: MacAddress,
     pub sender_protocol: crate::Ipv4Address,
     pub target_protocol: crate::Ipv4Address,
@@ -109,12 +116,12 @@ pub fn validate_ipv4_frame(frame: &[u8]) -> Result<ValidatedIpv4, DropReason> {
     })
 }
 
-/// Validates the Ethernet/IPv4 ARP profile and returns a request view.
+/// Validates the common Ethernet/IPv4 ARP Request/Reply profile.
 ///
 /// The target hardware address is intentionally ignored as required by
 /// RFC 826 request processing. Ethernet source and ARP sender hardware are
 /// also not required to match. No bytes are mutated by this function.
-pub fn validate_arp_request(frame: &[u8]) -> Result<ValidatedArpRequest, DropReason> {
+pub fn validate_arp(frame: &[u8]) -> Result<ValidatedArp, DropReason> {
     if frame.len() < ETHERNET_HEADER_LEN {
         return Err(DropReason::EthernetHeaderTruncated);
     }
@@ -137,14 +144,15 @@ pub fn validate_arp_request(frame: &[u8]) -> Result<ValidatedArpRequest, DropRea
     if frame[19] != 4 {
         return Err(DropReason::ArpProtocolLengthUnsupported);
     }
-    match read_u16(frame, 20) {
-        Some(1) => {}
-        Some(2) => return Err(DropReason::ArpReplyUnsupported),
+    let opcode = match read_u16(frame, 20) {
+        Some(1) => ArpOpcode::Request,
+        Some(2) => ArpOpcode::Reply,
         Some(_) => return Err(DropReason::ArpOpcodeUnsupported),
         None => return Err(DropReason::ArpPacketTruncated),
-    }
+    };
 
-    Ok(ValidatedArpRequest {
+    Ok(ValidatedArp {
+        opcode,
         sender_hardware: MacAddress([
             frame[22], frame[23], frame[24], frame[25], frame[26], frame[27],
         ]),
@@ -156,6 +164,17 @@ pub fn validate_arp_request(frame: &[u8]) -> Result<ValidatedArpRequest, DropRea
         ]),
     })
 }
+
+/// Compatibility validator for callers that require a Request.
+pub fn validate_arp_request(frame: &[u8]) -> Result<ValidatedArp, DropReason> {
+    let arp = validate_arp(frame)?;
+    if arp.opcode == ArpOpcode::Reply {
+        return Err(DropReason::ArpReplyUnsupported);
+    }
+    Ok(arp)
+}
+
+pub type ValidatedArpRequest = ValidatedArp;
 
 pub(crate) fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     let end = offset.checked_add(2)?;
