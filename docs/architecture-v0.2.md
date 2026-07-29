@@ -342,9 +342,55 @@ local SPAを名乗り、そのlocal addressをTPAにしたrequestも通常reques
 するだけで、conflict状態やdefensive announcementを生成しません。正常なlocal target requestを
 追加policyでdropしないことを優先した明示deviationです。
 
+## UDP NAT44/NAPT vertical slice
+
+NATは既存wrapperへ暗黙に入れず、`forward_batch_with_nat44_udp`、またはgenerated ICMP
+errorも含む`forward_batch_with_nat44_udp_and_icmpv4_errors`という合成service APIで
+ARP resolutionと同じworker tickへ明示的にbindします。config公開済みでruntime storageが
+無い場合、またはruntime/config/snapshot authority fingerprintが不一致ならdomain crossingを
+fail closedにします。新snapshot公開時はそのsnapshotでconfigをvalidateし、
+`Nat44UdpRuntime::reconcile`でmapping/peerを全flushします。旧generationのpeerが新mappingを
+許可することはありません。
+
+mapping keyは`(inside IfId, internal IPv4, internal UDP port)`でremote endpointを含めない
+Endpoint-Independent Mappingです。別のremoteへ送っても同じpublic tupleを使います。
+filter peerは`(mapping slot, mapping generation, remote IPv4)`で、既知IPの任意remote UDP
+portを許し、未接触IPをbyte不変dropします。outboundでpeer slotを確保できなければmappingを
+refreshせずdropし、filterを緩めません。live mappingをevictせず、port overloadもしません。
+内部portがpool内かつfreeなら保存し、それ以外はcaller seedを混ぜたstartからinclusive poolを
+一周だけscanします。randomness、parity、low-class preservationは保証しません。
+
+対象packetの順序は次です。
+
+1. common Ethernet/IPv4 validationとoptions rejection。
+2. outboundはoriginal destinationのLPM、TTL、selected outside egress、static/fresh dynamic
+   neighborを先に確定。source reverse-LPMがinsideであることを確認。
+3. inbound public UDPはlocal deliveryより先にinterceptし、mapping/ADF lookup後、
+   translated internal destinationを通常LPMしinside neighborを確定。
+4. DF=1/MF=0/offset=0、UDP header/length、全offset、mapping/peer/port transactionを
+   mutationなしでplan。
+5. L2、TTL、IPv4 address、UDP port、IPv4/UDP checksumの完全なrewrite planを適用。
+6. mapping/peer/refreshをinfallible commitし、最後にRX leaseをTX requestへcommit。
+
+core dropはpacket bytesとmapping/peer stateを変更しません。outbound TX requestでmapping
+idle timeとADF peerをcommitするため、backend aggregate rejectでもrollbackしません。
+same batchの後続inboundは直前outboundのstateを見ます。inboundはmapping idle timeをrefresh
+しません。clock regressionはcounter/trace以外を変更せず、直前watermarkと等しい時刻で回復
+します。default idle TTLは300秒、minimum 120秒、exact boundaryでexpiredです。
+
+RFC 768のUDP lengthは8以上かつIPv4 payload以下を要求し、短いUDP lengthの後ろにあるIP
+paddingは保存します。checksum zeroはzeroのままです。nonzero checksumはRFC 1624で
+translated IPv4 address wordsとportを更新し、算術結果zeroをUDP wireの`0xffff`へencode
+します。入力nonzero checksumを新規にfull validationしないrouter profileです。IPv4 IDは
+RFC 6864 atomic datagramとして保存します。
+
+fragment handling/reassembly、hairpinning、ICMP error translationとPMTU、TCP/ICMP query
+NAT、static port forward、複数public address、port randomization/parity、full packet
+filter/firewallはdeferredです。RFC 3022/4787/7857の全機能準拠は主張しません。
+
 eager dynamic-cache scan/flush、unresolved packet hold queue、gratuitous ARP生成、
 ARP Probe/Announcement生成、proxy ARP、VLAN、Address Conflict Detection、実装済み
-Echo Reply/Time Exceeded/Destination Unreachable Network以外のICMP生成、NAT、firewall、
+Echo Reply/Time Exceeded/Destination Unreachable Network以外のICMP生成、firewall、
 config parser、pcap、AF_XDP、DPDK、binary、thread、
 benchmarkはこの
 sliceのscope外です。
