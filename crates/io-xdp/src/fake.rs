@@ -1,10 +1,14 @@
 use crate::{
-    DescriptorError, EndpointHandle, EndpointLocation, FakeEndpointId, FrameToken,
-    ProducerReservation, RawDescriptor, RingError, RingKind, SpscRing, UmemLayout,
+    DescriptorError, EndpointHandle, EndpointLocation, FakeEndpointId, FrameLedger, FrameStateKind,
+    FrameToken, LedgerError, RawDescriptor, RingError, RingKind, SpscRing, UmemLayout,
     ValidatedDescriptor,
 };
 
-/// Shadow descriptor used by the finite fake rings.
+/// Shadow descriptor observed on one of the finite fake rings.
+///
+/// Descriptor constructors are intentionally private to this crate. Callers
+/// publish Fill and TX work through the typed fake APIs instead of injecting a
+/// raw [`FrameToken`] into a ring.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RingDescriptor {
     token: FrameToken,
@@ -12,18 +16,14 @@ pub struct RingDescriptor {
 }
 
 impl RingDescriptor {
-    /// Creates an address-only fill or completion descriptor.
-    #[must_use]
-    pub const fn frame(token: FrameToken) -> Self {
+    const fn frame(token: FrameToken) -> Self {
         Self {
             token,
             packet: None,
         }
     }
 
-    /// Creates an RX or TX packet descriptor.
-    #[must_use]
-    pub const fn packet(token: FrameToken, descriptor: ValidatedDescriptor) -> Self {
+    const fn packet(token: FrameToken, descriptor: ValidatedDescriptor) -> Self {
         Self {
             token,
             packet: Some(descriptor),
@@ -43,47 +43,259 @@ impl RingDescriptor {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FakeFrameState {
-    Idle,
-    FillOwned(FrameToken),
-    RxPublished(FrameToken),
-    AppOwned(FrameToken),
-    TxOwned(FrameToken),
-    CompletionPublished(FrameToken),
-    Retired(FrameToken),
+/// Ledger-authorized frame reserved only for Fill publication.
+///
+/// This capability is move-only, has no public constructor, and cannot be used
+/// with the TX publication API.
+pub struct FillReservation<'fake, const RING_SIZE: usize, const FRAME_COUNT: usize> {
+    fake: &'fake mut FakeKernel<RING_SIZE, FRAME_COUNT>,
+    token: FrameToken,
+    resolved: bool,
+}
+
+impl<const RING_SIZE: usize, const FRAME_COUNT: usize> FillReservation<'_, RING_SIZE, FRAME_COUNT> {
+    /// Returns the exact ownership generation represented by this reservation.
+    #[must_use]
+    pub const fn token(&self) -> FrameToken {
+        self.token
+    }
+
+    /// Publishes this exact reservation to the Fill ring.
+    pub fn publish(mut self) -> Result<(), FakeFault> {
+        self.fake.publish_fill_token(self.token)?;
+        self.resolved = true;
+        Ok(())
+    }
+
+    /// Explicitly cancels the reservation and frees the frame.
+    pub fn release_cancel(mut self) {
+        self.fake
+            .ledger
+            .cancel_fill(self.token)
+            .expect("reservation owns the exact FillReserved state");
+        self.resolved = true;
+    }
+}
+
+impl<const RING_SIZE: usize, const FRAME_COUNT: usize> Drop
+    for FillReservation<'_, RING_SIZE, FRAME_COUNT>
+{
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.fake
+                .ledger
+                .cancel_fill(self.token)
+                .expect("unresolved reservation owns the exact FillReserved state");
+        }
+    }
+}
+
+/// Ledger-authorized frame reserved only for TX publication.
+///
+/// This capability is move-only, has no public constructor, and cannot be used
+/// with the Fill publication API.
+pub struct TxReservation<'fake, const RING_SIZE: usize, const FRAME_COUNT: usize> {
+    fake: &'fake mut FakeKernel<RING_SIZE, FRAME_COUNT>,
+    token: FrameToken,
+    resolved: bool,
+}
+
+impl<const RING_SIZE: usize, const FRAME_COUNT: usize> TxReservation<'_, RING_SIZE, FRAME_COUNT> {
+    /// Returns the exact ownership generation represented by this reservation.
+    #[must_use]
+    pub const fn token(&self) -> FrameToken {
+        self.token
+    }
+
+    /// Publishes this exact reservation and descriptor to the TX ring.
+    pub fn publish(mut self, packet: ValidatedDescriptor) -> Result<(), FakeFault> {
+        self.fake.publish_tx_token(self.token, packet)?;
+        self.resolved = true;
+        Ok(())
+    }
+
+    /// Explicitly cancels the reservation back to pending TX.
+    pub fn release_cancel(mut self) {
+        self.fake
+            .ledger
+            .cancel_tx_reservation(self.token)
+            .expect("reservation owns the exact TxReserved state");
+        self.resolved = true;
+    }
+}
+
+impl<const RING_SIZE: usize, const FRAME_COUNT: usize> Drop
+    for TxReservation<'_, RING_SIZE, FRAME_COUNT>
+{
+    fn drop(&mut self) {
+        if !self.resolved {
+            self.fake
+                .ledger
+                .cancel_tx_reservation(self.token)
+                .expect("unresolved reservation owns the exact TxReserved state");
+        }
+    }
+}
+
+/// Proof that the fake kernel consumed one published Fill entry.
+pub struct ConsumedFill<'fake, const RING_SIZE: usize> {
+    acquisition: Option<crate::ConsumerAcquisition<'fake, RingDescriptor, RING_SIZE>>,
+    ledger: &'fake mut FrameLedger,
+    rx: &'fake mut SpscRing<RingDescriptor, RING_SIZE>,
+    endpoint: &'fake crate::endpoint::PhysicalEndpoint,
+    descriptor: RingDescriptor,
+}
+
+impl<const RING_SIZE: usize> ConsumedFill<'_, RING_SIZE> {
+    /// Returns the exact consumed ownership generation.
+    #[must_use]
+    pub const fn token(&self) -> FrameToken {
+        self.descriptor.token
+    }
+
+    /// Publishes RX for this consumed Fill entry.
+    ///
+    /// If validation or RX capacity rejects the operation, Drop cancels the
+    /// in-place acquisition so the same head remains next.
+    pub fn produce_rx(mut self, raw: RawDescriptor) -> Result<ValidatedDescriptor, FakeFault> {
+        let token = self.descriptor.token;
+        self.ledger
+            .verify_state(token, FrameStateKind::FillOwnedByKernel)
+            .map_err(FakeFault::Ledger)?;
+        let descriptor = self
+            .ledger
+            .layout()
+            .validate_descriptor(raw)
+            .map_err(FakeFault::Descriptor)?;
+        if descriptor.frame() != token.frame() {
+            return Err(FakeFault::Ledger(LedgerError::DescriptorFrameAlias {
+                token_frame: token.frame(),
+                descriptor_frame: descriptor.frame(),
+            }));
+        }
+        let observation = self.endpoint.handle().observe(RingKind::Rx);
+        let mut output = self.rx.reserve(1).map_err(FakeFault::Ring)?;
+        output
+            .write(
+                0,
+                observation.bind(RingDescriptor::packet(token, descriptor)),
+            )
+            .map_err(FakeFault::Ring)?;
+        self.ledger
+            .receive(token, descriptor)
+            .expect("Fill ownership and descriptor were prevalidated");
+        self.acquisition
+            .take()
+            .expect("live consumed Fill acquisition")
+            .release_consume()
+            .expect("the acquired input slot was already peeked");
+        output
+            .release_submit()
+            .expect("the exact one-slot output reservation was written");
+        Ok(descriptor)
+    }
+}
+
+impl<const RING_SIZE: usize> Drop for ConsumedFill<'_, RING_SIZE> {
+    fn drop(&mut self) {
+        // The still-present acquisition field drops after this method and
+        // cancels in place. A successful resolution takes it first.
+    }
+}
+
+/// Proof that the fake kernel consumed one published TX entry.
+pub struct ConsumedTx<'fake, const RING_SIZE: usize> {
+    acquisition: Option<crate::ConsumerAcquisition<'fake, RingDescriptor, RING_SIZE>>,
+    ledger: &'fake mut FrameLedger,
+    completion: &'fake mut SpscRing<RingDescriptor, RING_SIZE>,
+    endpoint: &'fake crate::endpoint::PhysicalEndpoint,
+    descriptor: RingDescriptor,
+}
+
+impl<const RING_SIZE: usize> ConsumedTx<'_, RING_SIZE> {
+    /// Returns the exact consumed ownership generation.
+    #[must_use]
+    pub const fn token(&self) -> FrameToken {
+        self.descriptor.token
+    }
+
+    /// Publishes completion for this consumed TX entry.
+    pub fn produce_completion(mut self) -> Result<(), FakeFault> {
+        let token = self.descriptor.token;
+        self.ledger
+            .verify_state(token, FrameStateKind::TxOwnedByKernel)
+            .map_err(FakeFault::Ledger)?;
+        let observation = self.endpoint.handle().observe(RingKind::Completion);
+        let mut output = self.completion.reserve(1).map_err(FakeFault::Ring)?;
+        output
+            .write(0, observation.bind(RingDescriptor::frame(token)))
+            .map_err(FakeFault::Ring)?;
+        self.ledger
+            .complete_tx(token)
+            .expect("TX ownership was prevalidated under the same mutable borrow");
+        self.acquisition
+            .take()
+            .expect("live consumed TX acquisition")
+            .release_consume()
+            .expect("the acquired input slot was already peeked");
+        output
+            .release_submit()
+            .expect("the exact one-slot output reservation was written");
+        Ok(())
+    }
+}
+
+impl<const RING_SIZE: usize> Drop for ConsumedTx<'_, RING_SIZE> {
+    fn drop(&mut self) {
+        // The still-present acquisition field drops after this method and
+        // cancels in place. A successful resolution takes it first.
+    }
 }
 
 /// Finite deterministic producer/consumer for all four AF_XDP rings.
 ///
-/// It owns only fixed arrays and pure ring state. It does not implement a
-/// packet-I/O engine, socket, FFI, or native XDP lifecycle.
+/// One authoritative [`FrameLedger`] is consumed at construction. Ring
+/// publication and consumption never accept caller-built descriptors, and each
+/// ownership transition is coupled to the matching ledger transition. Ring
+/// storage is fixed; the ledger performs its one allocation only during cold
+/// construction.
 #[derive(Debug)]
 pub struct FakeKernel<const RING_SIZE: usize, const FRAME_COUNT: usize> {
     endpoint: crate::endpoint::PhysicalEndpoint,
+    ledger: FrameLedger,
     fill: SpscRing<RingDescriptor, RING_SIZE>,
     rx: SpscRing<RingDescriptor, RING_SIZE>,
     tx: SpscRing<RingDescriptor, RING_SIZE>,
     completion: SpscRing<RingDescriptor, RING_SIZE>,
-    frames: [FakeFrameState; FRAME_COUNT],
 }
 
 impl<const RING_SIZE: usize, const FRAME_COUNT: usize> FakeKernel<RING_SIZE, FRAME_COUNT> {
-    /// Creates four rings attached to one finite fake physical endpoint.
-    pub fn new(identity: FakeEndpointId, location: EndpointLocation) -> Result<Self, RingError> {
+    /// Creates four rings bound to the consumed ledger's single UMEM domain.
+    pub fn new(
+        identity: FakeEndpointId,
+        location: EndpointLocation,
+        ledger: FrameLedger,
+    ) -> Result<Self, FakeFault> {
+        if ledger.frame_count() != FRAME_COUNT {
+            return Err(FakeFault::FrameCountMismatch {
+                expected: FRAME_COUNT,
+                actual: ledger.frame_count(),
+            });
+        }
         let endpoint = crate::endpoint::PhysicalEndpoint::new(identity, location);
         let handle = endpoint.handle();
-        let fill = SpscRing::new(handle.observe(RingKind::Fill))?;
-        let rx = SpscRing::new(handle.observe(RingKind::Rx))?;
-        let tx = SpscRing::new(handle.observe(RingKind::Tx))?;
-        let completion = SpscRing::new(handle.observe(RingKind::Completion))?;
+        let fill = SpscRing::new(handle.observe(RingKind::Fill)).map_err(FakeFault::Ring)?;
+        let rx = SpscRing::new(handle.observe(RingKind::Rx)).map_err(FakeFault::Ring)?;
+        let tx = SpscRing::new(handle.observe(RingKind::Tx)).map_err(FakeFault::Ring)?;
+        let completion =
+            SpscRing::new(handle.observe(RingKind::Completion)).map_err(FakeFault::Ring)?;
         Ok(Self {
             endpoint,
+            ledger,
             fill,
             rx,
             tx,
             completion,
-            frames: [FakeFrameState::Idle; FRAME_COUNT],
         })
     }
 
@@ -93,31 +305,154 @@ impl<const RING_SIZE: usize, const FRAME_COUNT: usize> FakeKernel<RING_SIZE, FRA
         self.endpoint.handle()
     }
 
-    /// Reserves application-producer fill slots.
-    pub fn reserve_fill(
-        &mut self,
-        len: usize,
-    ) -> Result<ProducerReservation<'_, RingDescriptor, RING_SIZE>, RingError> {
-        self.fill.reserve(len)
+    /// Returns the authoritative ownership ledger.
+    #[must_use]
+    pub const fn ledger(&self) -> &FrameLedger {
+        &self.ledger
     }
 
-    /// Reserves application-producer TX slots.
+    /// Returns the immutable UMEM layout bound to every fake ring.
+    #[must_use]
+    pub const fn layout(&self) -> &UmemLayout {
+        self.ledger.layout()
+    }
+
+    /// Returns the number of published entries in one fake ring.
+    pub fn ring_occupied(&self, kind: RingKind) -> Result<usize, RingError> {
+        match kind {
+            RingKind::Fill => self.fill.occupied(),
+            RingKind::Rx => self.rx.occupied(),
+            RingKind::Tx => self.tx.occupied(),
+            RingKind::Completion => self.completion.occupied(),
+        }
+    }
+
+    /// Reserves one free frame in the ledger for Fill publication.
+    pub fn reserve_fill(
+        &mut self,
+        frame_index: u32,
+    ) -> Result<FillReservation<'_, RING_SIZE, FRAME_COUNT>, FakeFault> {
+        let token = self
+            .ledger
+            .reserve_fill(frame_index)
+            .map_err(FakeFault::Ledger)?;
+        Ok(FillReservation {
+            fake: self,
+            token,
+            resolved: false,
+        })
+    }
+
+    /// Validates a token as an existing Fill reservation without mutation.
+    ///
+    /// This is useful at a control-plane handoff boundary. Generated leases,
+    /// TX reservations, stale generations, and foreign domains are rejected
+    /// before any ring cursor or ledger state changes.
+    pub fn authorize_fill(
+        &mut self,
+        token: FrameToken,
+    ) -> Result<FillReservation<'_, RING_SIZE, FRAME_COUNT>, FakeFault> {
+        self.ledger
+            .verify_state(token, FrameStateKind::FillReserved)
+            .map_err(FakeFault::Ledger)?;
+        Ok(FillReservation {
+            fake: self,
+            token,
+            resolved: false,
+        })
+    }
+
+    fn publish_fill_token(&mut self, token: FrameToken) -> Result<(), FakeFault> {
+        self.ledger
+            .verify_state(token, FrameStateKind::FillReserved)
+            .map_err(FakeFault::Ledger)?;
+        let observation = self.endpoint.handle().observe(RingKind::Fill);
+        let mut ring = self.fill.reserve(1).map_err(FakeFault::Ring)?;
+        ring.write(0, observation.bind(RingDescriptor::frame(token)))
+            .map_err(FakeFault::Ring)?;
+        self.ledger
+            .publish_fill(token)
+            .expect("Fill state was prevalidated under the same mutable borrow");
+        ring.release_submit()
+            .expect("the exact one-slot reservation was written");
+        Ok(())
+    }
+
+    /// Starts a generated-packet processing lease.
+    pub fn lease_generated(&mut self, frame_index: u32) -> Result<FrameToken, FakeFault> {
+        self.ledger
+            .lease_generated(frame_index)
+            .map_err(FakeFault::Ledger)
+    }
+
+    /// Stages a received or generated processing lease for TX.
+    pub fn stage_tx(&mut self, token: FrameToken) -> Result<(), FakeFault> {
+        self.ledger.stage_tx(token).map_err(FakeFault::Ledger)
+    }
+
+    /// Recycles a processing lease that will not be transmitted.
+    pub fn recycle_lease(&mut self, token: FrameToken) -> Result<(), FakeFault> {
+        self.ledger.recycle_lease(token).map_err(FakeFault::Ledger)
+    }
+
+    /// Cancels pending TX back to its processing lease.
+    pub fn cancel_pending_tx(&mut self, token: FrameToken) -> Result<(), FakeFault> {
+        self.ledger
+            .cancel_pending_tx(token)
+            .map_err(FakeFault::Ledger)
+    }
+
+    /// Reserves a staged token only for TX ring publication.
     pub fn reserve_tx(
         &mut self,
-        len: usize,
-    ) -> Result<ProducerReservation<'_, RingDescriptor, RING_SIZE>, RingError> {
-        self.tx.reserve(len)
+        token: FrameToken,
+    ) -> Result<TxReservation<'_, RING_SIZE, FRAME_COUNT>, FakeFault> {
+        self.ledger.reserve_tx(token).map_err(FakeFault::Ledger)?;
+        Ok(TxReservation {
+            fake: self,
+            token,
+            resolved: false,
+        })
+    }
+
+    fn publish_tx_token(
+        &mut self,
+        token: FrameToken,
+        packet: ValidatedDescriptor,
+    ) -> Result<(), FakeFault> {
+        self.ledger
+            .verify_state(token, FrameStateKind::TxReserved)
+            .map_err(FakeFault::Ledger)?;
+        if !packet.belongs_to(self.ledger.layout().domain()) {
+            return Err(FakeFault::Ledger(LedgerError::ForeignDescriptorDomain));
+        }
+        if packet.frame() != token.frame() {
+            return Err(FakeFault::Ledger(LedgerError::DescriptorFrameAlias {
+                token_frame: token.frame(),
+                descriptor_frame: packet.frame(),
+            }));
+        }
+        let observation = self.endpoint.handle().observe(RingKind::Tx);
+        let mut ring = self.tx.reserve(1).map_err(FakeFault::Ring)?;
+        ring.write(0, observation.bind(RingDescriptor::packet(token, packet)))
+            .map_err(FakeFault::Ring)?;
+        self.ledger
+            .publish_tx(token)
+            .expect("TX state was prevalidated under the same mutable borrow");
+        ring.release_submit()
+            .expect("the exact one-slot reservation was written");
+        Ok(())
     }
 
     /// Acquires application-consumer RX slots.
     pub fn acquire_rx(
         &mut self,
         len: usize,
-    ) -> Result<FakeConsumerAcquisition<'_, RING_SIZE, FRAME_COUNT>, RingError> {
-        let acquisition = self.rx.acquire(len)?;
+    ) -> Result<FakeConsumerAcquisition<'_, RING_SIZE>, FakeFault> {
+        let acquisition = self.rx.acquire(len).map_err(FakeFault::Ring)?;
         Ok(FakeConsumerAcquisition {
             acquisition,
-            frames: &mut self.frames,
+            ledger: &mut self.ledger,
             kind: RingKind::Rx,
         })
     }
@@ -126,17 +461,17 @@ impl<const RING_SIZE: usize, const FRAME_COUNT: usize> FakeKernel<RING_SIZE, FRA
     pub fn acquire_completion(
         &mut self,
         len: usize,
-    ) -> Result<FakeConsumerAcquisition<'_, RING_SIZE, FRAME_COUNT>, RingError> {
-        let acquisition = self.completion.acquire(len)?;
+    ) -> Result<FakeConsumerAcquisition<'_, RING_SIZE>, FakeFault> {
+        let acquisition = self.completion.acquire(len).map_err(FakeFault::Ring)?;
         Ok(FakeConsumerAcquisition {
             acquisition,
-            frames: &mut self.frames,
+            ledger: &mut self.ledger,
             kind: RingKind::Completion,
         })
     }
 
-    /// Consumes one application-submitted fill descriptor.
-    pub fn kernel_consume_fill(&mut self) -> Result<FrameToken, FakeFault> {
+    /// Consumes one application-published Fill descriptor.
+    pub fn kernel_consume_fill(&mut self) -> Result<ConsumedFill<'_, RING_SIZE>, FakeFault> {
         let acquisition = self.fill.acquire(1).map_err(FakeFault::Ring)?;
         let descriptor = acquisition.peek(0).map_err(FakeFault::Ring)?;
         if descriptor.packet.is_some() {
@@ -144,139 +479,72 @@ impl<const RING_SIZE: usize, const FRAME_COUNT: usize> FakeKernel<RING_SIZE, FRA
                 ring: RingKind::Fill,
             });
         }
-        let index = frame_index::<FRAME_COUNT>(descriptor.token)?;
-        match self.frames[index] {
-            FakeFrameState::Idle => {}
-            FakeFrameState::Retired(previous) if previous != descriptor.token => {}
-            state if state.token() == Some(descriptor.token) => {
-                return Err(FakeFault::DuplicateToken);
-            }
-            _ => return Err(FakeFault::WrongOrder),
-        }
-        acquisition.release_consume().map_err(FakeFault::Ring)?;
-        self.frames[index] = FakeFrameState::FillOwned(descriptor.token);
-        Ok(descriptor.token)
+        self.ledger
+            .verify_state(descriptor.token, FrameStateKind::FillOwnedByKernel)
+            .map_err(FakeFault::Ledger)?;
+        Ok(ConsumedFill {
+            acquisition: Some(acquisition),
+            ledger: &mut self.ledger,
+            rx: &mut self.rx,
+            endpoint: &self.endpoint,
+            descriptor,
+        })
     }
 
-    /// Produces one kernel RX descriptor after consuming its fill token.
-    pub fn kernel_produce_rx(
-        &mut self,
-        token: FrameToken,
-        raw: RawDescriptor,
-        layout: &UmemLayout,
-    ) -> Result<ValidatedDescriptor, FakeFault> {
-        let index = frame_index::<FRAME_COUNT>(token)?;
-        if self.frames[index] != FakeFrameState::FillOwned(token) {
-            return Err(FakeFault::WrongOrder);
-        }
-        if !token.belongs_to(layout.domain()) {
-            return Err(FakeFault::ForeignDomain);
-        }
-        let descriptor = layout
-            .validate_descriptor(raw)
-            .map_err(FakeFault::Descriptor)?;
-        if descriptor.frame() != token.frame() {
-            return Err(FakeFault::DescriptorFrameAlias);
-        }
-        let observation = self.endpoint.handle().observe(RingKind::Rx);
-        let mut reservation = self.rx.reserve(1).map_err(FakeFault::Ring)?;
-        reservation
-            .write(
-                0,
-                observation.bind(RingDescriptor::packet(token, descriptor)),
-            )
-            .map_err(FakeFault::Ring)?;
-        reservation.release_submit().map_err(FakeFault::Ring)?;
-        self.frames[index] = FakeFrameState::RxPublished(token);
-        Ok(descriptor)
-    }
-
-    /// Consumes one application-submitted TX packet descriptor.
-    pub fn kernel_consume_tx(&mut self, layout: &UmemLayout) -> Result<RingDescriptor, FakeFault> {
+    /// Consumes one application-published TX descriptor.
+    pub fn kernel_consume_tx(&mut self) -> Result<ConsumedTx<'_, RING_SIZE>, FakeFault> {
         let acquisition = self.tx.acquire(1).map_err(FakeFault::Ring)?;
         let descriptor = acquisition.peek(0).map_err(FakeFault::Ring)?;
         let Some(packet) = descriptor.packet else {
             return Err(FakeFault::WrongDescriptorShape { ring: RingKind::Tx });
         };
-        if !descriptor.token.belongs_to(layout.domain()) || !packet.belongs_to(layout.domain()) {
-            return Err(FakeFault::ForeignDomain);
+        self.ledger
+            .verify_state(descriptor.token, FrameStateKind::TxOwnedByKernel)
+            .map_err(FakeFault::Ledger)?;
+        if !packet.belongs_to(self.ledger.layout().domain()) {
+            return Err(FakeFault::Ledger(LedgerError::ForeignDescriptorDomain));
         }
         if packet.frame() != descriptor.token.frame() {
-            return Err(FakeFault::DescriptorFrameAlias);
+            return Err(FakeFault::Ledger(LedgerError::DescriptorFrameAlias {
+                token_frame: descriptor.token.frame(),
+                descriptor_frame: packet.frame(),
+            }));
         }
-        let index = frame_index::<FRAME_COUNT>(descriptor.token)?;
-        match self.frames[index] {
-            FakeFrameState::Idle => {}
-            FakeFrameState::AppOwned(owned) if owned == descriptor.token => {}
-            FakeFrameState::Retired(previous) if previous != descriptor.token => {}
-            state if state.token() == Some(descriptor.token) => {
-                return Err(FakeFault::DuplicateToken);
-            }
-            _ => return Err(FakeFault::WrongOrder),
-        }
-        acquisition.release_consume().map_err(FakeFault::Ring)?;
-        self.frames[index] = FakeFrameState::TxOwned(descriptor.token);
-        Ok(descriptor)
-    }
-
-    /// Produces one completion after the exact TX token was consumed.
-    pub fn kernel_produce_completion(&mut self, token: FrameToken) -> Result<(), FakeFault> {
-        let index = frame_index::<FRAME_COUNT>(token)?;
-        if self.frames[index] != FakeFrameState::TxOwned(token) {
-            return Err(FakeFault::WrongOrder);
-        }
-        let observation = self.endpoint.handle().observe(RingKind::Completion);
-        let mut reservation = self.completion.reserve(1).map_err(FakeFault::Ring)?;
-        reservation
-            .write(0, observation.bind(RingDescriptor::frame(token)))
-            .map_err(FakeFault::Ring)?;
-        reservation.release_submit().map_err(FakeFault::Ring)?;
-        self.frames[index] = FakeFrameState::CompletionPublished(token);
-        Ok(())
+        Ok(ConsumedTx {
+            acquisition: Some(acquisition),
+            ledger: &mut self.ledger,
+            completion: &mut self.completion,
+            endpoint: &self.endpoint,
+            descriptor,
+        })
     }
 }
 
-impl FakeFrameState {
-    const fn token(self) -> Option<FrameToken> {
-        match self {
-            Self::Idle => None,
-            Self::FillOwned(token)
-            | Self::RxPublished(token)
-            | Self::AppOwned(token)
-            | Self::TxOwned(token)
-            | Self::CompletionPublished(token)
-            | Self::Retired(token) => Some(token),
-        }
-    }
-}
-
-/// Application-side RX or completion acquisition tied to fake ownership state.
-pub struct FakeConsumerAcquisition<'fake, const RING_SIZE: usize, const FRAME_COUNT: usize> {
+/// Application-side RX or completion acquisition tied to the authoritative
+/// ledger.
+pub struct FakeConsumerAcquisition<'fake, const RING_SIZE: usize> {
     acquisition: crate::ConsumerAcquisition<'fake, RingDescriptor, RING_SIZE>,
-    frames: &'fake mut [FakeFrameState; FRAME_COUNT],
+    ledger: &'fake mut FrameLedger,
     kind: RingKind,
 }
 
-impl<const RING_SIZE: usize, const FRAME_COUNT: usize>
-    FakeConsumerAcquisition<'_, RING_SIZE, FRAME_COUNT>
-{
-    /// Peeks without changing ring cursors or fake ownership.
+impl<const RING_SIZE: usize> FakeConsumerAcquisition<'_, RING_SIZE> {
+    /// Peeks without changing ring cursors or ledger ownership.
     pub fn peek(&self, offset: usize) -> Result<RingDescriptor, RingError> {
         self.acquisition.peek(offset)
     }
 
-    /// Consumes the complete range and advances each exact token state.
+    /// Consumes the complete range and advances every authoritative state.
     pub fn release_consume(self) -> Result<(), FakeFault> {
         let mut updates = [None; RING_SIZE];
-        for (offset, update) in updates.iter_mut().enumerate().take(self.acquisition.len()) {
+        for offset in 0..self.acquisition.len() {
             let descriptor = self.acquisition.peek(offset).map_err(FakeFault::Ring)?;
-            let index = frame_index::<FRAME_COUNT>(descriptor.token)?;
             let expected = match self.kind {
                 RingKind::Rx => {
                     if descriptor.packet.is_none() {
                         return Err(FakeFault::WrongDescriptorShape { ring: RingKind::Rx });
                     }
-                    FakeFrameState::RxPublished(descriptor.token)
+                    FrameStateKind::RxAvailable
                 }
                 RingKind::Completion => {
                     if descriptor.packet.is_some() {
@@ -284,63 +552,72 @@ impl<const RING_SIZE: usize, const FRAME_COUNT: usize>
                             ring: RingKind::Completion,
                         });
                     }
-                    FakeFrameState::CompletionPublished(descriptor.token)
+                    FrameStateKind::CompletionAvailable
                 }
                 RingKind::Fill | RingKind::Tx => return Err(FakeFault::WrongOrder),
             };
-            if self.frames[index] != expected {
-                return Err(FakeFault::WrongOrder);
+            self.ledger
+                .verify_state(descriptor.token, expected)
+                .map_err(FakeFault::Ledger)?;
+            if updates[..offset]
+                .iter()
+                .flatten()
+                .any(|token| *token == descriptor.token)
+            {
+                return Err(FakeFault::DuplicateToken);
             }
-            *update = Some((index, descriptor.token));
+            updates[offset] = Some(descriptor.token);
         }
         self.acquisition
             .release_consume()
             .map_err(FakeFault::Ring)?;
-        for update in updates.into_iter().flatten() {
-            let (index, token) = update;
-            self.frames[index] = match self.kind {
-                RingKind::Rx => FakeFrameState::AppOwned(token),
-                RingKind::Completion => FakeFrameState::Retired(token),
+        for token in updates.into_iter().flatten() {
+            match self.kind {
+                RingKind::Rx => {
+                    self.ledger
+                        .lease_rx(token)
+                        .expect("RX state was batch-prevalidated");
+                }
+                RingKind::Completion => {
+                    self.ledger
+                        .recycle_completion(token)
+                        .expect("completion state was batch-prevalidated");
+                }
                 RingKind::Fill | RingKind::Tx => unreachable!("constructor limits fake consumer"),
-            };
+            }
         }
         Ok(())
     }
 
-    /// Cancels without changing ring cursors or fake ownership.
+    /// Cancels without changing ring cursors or ledger ownership.
     pub fn release_cancel(self) {
         self.acquisition.release_cancel();
     }
 }
 
-fn frame_index<const FRAME_COUNT: usize>(token: FrameToken) -> Result<usize, FakeFault> {
-    let index = usize::try_from(token.frame().index()).map_err(|_| FakeFault::FrameOutsideFake)?;
-    if index >= FRAME_COUNT {
-        return Err(FakeFault::FrameOutsideFake);
-    }
-    Ok(index)
-}
-
-/// Finite fake fault detected without mutating ring or ownership state.
+/// Finite fake fault detected without partially mutating ring and ledger state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FakeFault {
     /// Ring construction or operation failed.
     Ring(RingError),
+    /// Authoritative ownership transition failed.
+    Ledger(LedgerError),
     /// Packet descriptor geometry is invalid.
     Descriptor(DescriptorError),
-    /// Token frame index exceeds the fake tracking array.
-    FrameOutsideFake,
+    /// Const fake capacity did not match the consumed ledger.
+    FrameCountMismatch {
+        /// Compile-time capacity expected by the fake.
+        expected: usize,
+        /// Frames tracked by the supplied ledger.
+        actual: usize,
+    },
     /// The descriptor shape is not valid for this ring.
     WrongDescriptorShape {
         /// Ring whose descriptor was rejected.
         ring: RingKind,
     },
-    /// The token is already owned by a kernel-side operation.
+    /// One ownership generation appeared more than once in a consumer batch.
     DuplicateToken,
-    /// A dependent kernel operation was attempted before its predecessor.
+    /// A dependent operation was attempted through the wrong ring direction.
     WrongOrder,
-    /// Token or descriptor belongs to another UMEM domain.
-    ForeignDomain,
-    /// Packet descriptor canonicalized to a different frame.
-    DescriptorFrameAlias,
 }

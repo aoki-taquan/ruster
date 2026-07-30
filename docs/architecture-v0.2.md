@@ -821,10 +821,30 @@ consumer cursorを進めます。Dropとexplicit cancelはslot/cursor不変で�
 descriptor write → Release producer、Acquire producer → descriptor read、
 read完了 → Release consumer、Acquire consumer → slot reuseです。
 
-`FakeKernel<RING_SIZE, FRAME_COUNT>`は四ringとframe単位のfixed state arrayをinline所有します。
-Fill consume → RX publish → application RX consume → optional TX consume → Completion publish
-→ application completion consumeを追跡し、RX consume後は`AppOwned`、completion consume後は
-`Retired`を残します。wrong descriptor shape、zero/invalid packet length、別UMEM domain、
-frame alias、同generation duplicate、前段未完了のorder違反はringとfake stateを変更せず
-typed faultになります。fakeはengine、`PacketIo` adapter、socket、FFI、XDP attach、
-wakeup/pollを実装せず、token/domain constructorもX00A ledger/control-plane境界から移しません。
+`FakeKernel<RING_SIZE, FRAME_COUNT>`は四ringと単一のauthoritative `FrameLedger`を所有します。
+constructorはledgerをconsumeし、そのUMEM domainとexact frame countへfake全体をbindします。
+callerはraw `FrameToken`/`RingDescriptor`をFill/TX ringへ投入できません。Fillは
+`FillReservation`、TXは`TxReservation`というledger stateから発行した用途別・move-only・
+public constructorなしのcapabilityだけをpublishできます。kernel側の次段もring consumeから
+得た`ConsumedFill`/`ConsumedTx`だけを受け取ります。四capabilityはfakeを排他的にborrowする
+guardです。未解決のFill/TX reservationをDropするとそれぞれFree/PendingTxへrollbackし、
+consumed Fill/TX guardは元ringのconsumer acquisitionを次段完了まで保持します。Dropは
+consumer cursor不変のin-place cancelとなり、descriptorをtailへ再送しません。従って
+`[A, B]`のAをDropしても次のacquireはAで、FIFOとexactly-once publicationを同時に保ちます。
+panic/early return後も同じkernel ownershipを再取得できます。RX/CQ acquisitionのDropも
+同じcursor/state不変のcancelです。
+
+各操作はdescriptor/ring capacityを先に検証してunpublished slotへwriteし、ledger transition
+成功後にcursorをpublishします。consumer側はrange全体のledger stateと重複を検証し、ring
+consume後に同じrangeのledger transitionを完了します。従ってgenerated leaseのFill利用、
+FillReserved tokenのTX利用、別domain capability、同generation二重publish、invalid descriptorは
+ring cursorとledger partitionを両方不変に保ち、正しいownerがretryできます。Fill publication
+→ kernel Fill consume → RX publication → application lease → TX stage/reserve/publication
+→ kernel TX consume → Completion publication → recycleの全段でledger countersとdeep auditが
+frame partition conservationを検証します。fakeのhot operationは四ringのinline storageと
+構築時だけallocateするledgerを使い、operation単位のallocationはありません。
+非TX leaseは明示recycleでき、PendingTxはleaseへrollback後にrecycleできます。lifecycle testの
+終端は四ringすべてempty、全frame Free、deep audit成功を要求します。
+
+fakeはengine、`PacketIo` adapter、socket、FFI、XDP attach、wakeup/pollを実装せず、
+token/domain constructorもX00A ledger/control-plane境界から移しません。

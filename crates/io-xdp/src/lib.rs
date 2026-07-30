@@ -19,7 +19,10 @@ pub use domain::UmemDomainId;
 pub use endpoint::{
     EndpointHandle, EndpointLocation, FakeEndpointId, ObservedSubmission, RingKind, RingObservation,
 };
-pub use fake::{FakeConsumerAcquisition, FakeFault, FakeKernel, RingDescriptor};
+pub use fake::{
+    ConsumedFill, ConsumedTx, FakeConsumerAcquisition, FakeFault, FakeKernel, FillReservation,
+    RingDescriptor, TxReservation,
+};
 pub use layout::{LayoutError, UmemLayout};
 pub use ledger::{
     AuditError, FrameLedger, FrameStateKind, FrameStateView, LeaseKind, LedgerError, StateCounts,

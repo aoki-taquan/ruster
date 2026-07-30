@@ -545,6 +545,14 @@ impl FrameLedger {
         Ok(index)
     }
 
+    pub(crate) fn verify_state(
+        &self,
+        token: FrameToken,
+        expected: FrameStateKind,
+    ) -> Result<(), LedgerError> {
+        self.verify(token, expected).map(|_| ())
+    }
+
     fn tx_lease_kind(
         &self,
         token: FrameToken,
