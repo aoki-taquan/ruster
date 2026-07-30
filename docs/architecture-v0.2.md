@@ -1014,3 +1014,27 @@ descriptorとproducer cursorは既にpublish済みであり、rollbackを意味�
 callerはpublication前の古いneed-wakeup観測をkick判断に利用しません。socket fd、ring/UMEMの
 OS mmap、UMEM registration、bind、poll/sendto kick、libxdp attach、core `PacketIo` adapterは
 後続sliceです。
+
+C2A sliceは後続resource setupだけが使うprivateなLinux syscall/RAII seamを追加します。
+Linux v6.8 profileの`socket`、`setsockopt`、`getsockopt`、`mmap`、`munmap`、`bind`、
+`poll`、`sendto`、`close`をdependencyなしのprivate FFIへ閉じ、sealed genericでstatic
+dispatchします。production実装とNIC不要のfinite fakeは同じ境界を使いますが、このsliceに
+public resource constructorはなく、packet fast pathへtrait objectやsyscall dispatchを追加
+しません。socket作成要求は`SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK`で固定します。
+
+socket optionとsocket addressの動的byte lengthはnonzeroかつLinux `socklen_t`へ表現可能、
+ring mmap offsetは64-bit `off_t`へ表現可能であることをFFI前に検証します。kernelが返した
+getsockopt lengthがcaller bufferを超えればtyped rejectします。mmap失敗はexact
+`MAP_FAILED`だけであり、address zeroを失敗と取り違えません。fd、mapping address、packet
+dataはerrorまたはresourceのDebugへ出しません。
+
+fdとmappingは取得成功後だけRAII ownerへ入り、明示cleanupとDropはresourceをcall前にinactive
+化するため、close/munmapがerrorでもretryせず高々一回です。これはclose後に同じ数値へ再利用
+されたfdを誤ってcloseすることも防ぎます。finite fakeは各syscallのexact transcript、
+argument validation前後、partial failure、reverse cleanup、cleanup failureをroot/NICなしで
+検証します。
+
+C2AはUMEM allocation/registration、Fill/Completion/RX/TX ring configuration、
+`XDP_MMAP_OFFSETS` query、ring mappingの組立、`sockaddr_xdp` bind transaction、negotiated
+mode、wakeup policy、live session、XDP program/XSKMAP、libxdp、core `PacketIo`を実装済みとは
+主張しません。これらのresource lifetimeとpacket ownershipは後続sliceで別途検証します。

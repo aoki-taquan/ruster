@@ -1,8 +1,9 @@
 #![deny(unsafe_code)]
 #![doc = "Checked Linux UAPI facts and borrowed native AF_XDP ring views."]
 #![doc = ""]
-#![doc = "This crate does not open sockets, create mappings, register UMEM, implement packet I/O,"]
-#![doc = "or link libxdp. Callers retain ownership of every borrowed mapping."]
+#![doc = "A private, dependency-free Linux syscall/RAII seam exists for later resource setup, but"]
+#![doc = "no public API opens sockets or mappings. UMEM registration, ring configuration, bind"]
+#![doc = "transactions, packet I/O, and libxdp integration remain unimplemented."]
 
 mod config;
 mod error;
@@ -16,6 +17,9 @@ mod native_unsafe {
     pub(super) mod mmap;
     #[path = "ring_mem.rs"]
     pub(super) mod ring_mem;
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[path = "syscall.rs"]
+    pub(super) mod syscall;
 }
 
 pub use config::{
