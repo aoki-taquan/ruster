@@ -524,6 +524,12 @@ offset、TCP/UDP以外のforward protocolはsilent typed dropで、ICMP/RSTを�
 RFC 791のfragment fieldsでMF=0/offset=0なら、DF=0とDF=1のどちらもunfragmented datagram
 として許可します。ここでRFC 6864のatomic datagramという用語は使いません。
 
+UDP/TCP NAT44、firewall、router-originated ICMPv4 error captureを全て有効にするworkerは
+`forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors`または監査付きvariantを
+選び、caller-backed `Icmpv4ErrorRuntime`を必須でbindします。既存のruntimeを取らない
+combined APIは非生成のままです。公開APIへfeature選択用のoptional runtimeを追加せず、
+capabilityはentry pointで明示します。
+
 ruleはstable `FirewallRuleId`を持つimmutable sliceで、ingress/egress `IfId|Any`、
 canonical source/destination prefix、TCP/UDP、inclusive source/destination port range、
 `AllowStateful|Deny`を持ちます。順序どおりfirst-matchし、matchなしはimplicit default deny
@@ -588,6 +594,15 @@ rule/default deny、state full、route/neighbor/NAT missでも戻しません。
 `FirewallClockRegression`またはNAT clock regressionになります。FW opt-in時のLPM missは
 egress不明のためrule評価せず`FirewallRouteUnavailable`でsilent dropし、Type 3/Code 0やARPを
 queueしません。NAT inboundもFW state/rule判定をTTL判定より先に行います。
+
+full compositionでもfirewall authorizationはTTL判定とgenerated error captureより先です。
+rule/default deny、runtime/config/snapshot authority failure、LPM missはICMP/ARPをqueueしない
+silent dropを維持します。認可済みpacketのTTL 0/1は既存のerror suppressionとreverse
+authorityを通過した場合にactionをqueueし、quoteはNAT rewrite前の受信IPv4 datagramです。
+TTL failureではNAT mapping/sessionとfirewall flowをcommitしません。captureはRX phaseだけで、
+generated実行をforwarding wrapper内へ融合しません。worker tick順は引き続き
+`publication/reconcile → RX → resolution timer poll → failure dispatch → generated ARP →
+generated ICMP`で、生成packetはfirewall domain外です。
 
 planが返すcreate/refresh replacementと論理的にliveなflowのactivity/phaseはcommitまで反映
 しません。一方、security watermarkと同様にlazy expiry housekeepingはprobe中に実行でき、

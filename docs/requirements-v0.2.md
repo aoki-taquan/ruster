@@ -202,6 +202,7 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | FW-020 keyed flow hashing | local hash-flood resistance contract | `secret_changes_hash_and_rotation_flushes_state` | implemented | caller-supplied fresh nonzero 128-bit secret、forward/reverse同home、generation前進のsame-key publishをtyped拒否、fresh rotationはstate flush、fast path random/syscallなし |
 | FW-021 expiry cluster repair | architecture complexity contract | `cleanup_budget_is_linear_for_n_and_two_n_capacity` | implemented | capacity 4以上は最大75% usable。attemptごとにdelete/shift/restart各最大1回、probe+maintenanceは定数倍N、繰返しでempty terminationを回復、live evictionなし |
 | FW-022 SipHash conformance and flow layout | SipHash-2-4 reference vectors, local canonical-key contract | `siphash_vectors_and_canonical_flow_layout_match_independent_references` | implemented | official length 0/1/7/8/15/16/63 vectorsと固定64-byte canonical flow layoutの独立hard-coded reference値を検証 |
+| FW-023 explicit full-service generated ICMPv4 composition | RFC 1812 §4.3.2, architecture composition contract | `full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_errors` | implemented | UDP/TCP NAT44+FWの明示error APIで認可後TTL errorをpre-NAT quoteでqueue。deny/authority/route失敗はsilent、RX後のgenerated phaseでdispatch |
 
 ## RFC deviation rule
 
