@@ -1,0 +1,196 @@
+name: Security Smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Full matrix or one exact target
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - parser
+          - checksum
+          - admission
+          - resolution
+      seed:
+        description: Exact-mode unsigned decimal or 0x-prefixed u64 seed
+        required: true
+        default: "0x6a09e667f3bcc909"
+        type: string
+      case_start:
+        description: Exact-mode first case index
+        required: true
+        default: "0"
+        type: string
+      cases:
+        description: Exact-mode case count
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTER_R16A_ARTIFACT_DIR: /tmp/ruster-r16a-artifacts
+
+jobs:
+  r16a-bounded:
+    name: R16A Bounded
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+
+      - name: Run full fixed matrix
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' }}
+        run: >-
+          timeout --signal=TERM --kill-after=30s 8m
+          cargo test --locked -p ruster-io-sim
+          --test security_property_smoke r16a_bounded_smoke --
+          --ignored --exact --nocapture --test-threads=1
+
+      - name: Run exact seed range
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.target != 'all' }}
+        env:
+          RUSTER_R16A_TARGET: ${{ inputs.target }}
+          RUSTER_R16A_SEED: ${{ inputs.seed }}
+          RUSTER_R16A_CASE_START: ${{ inputs.case_start }}
+          RUSTER_R16A_CASES: ${{ inputs.cases }}
+        run: >-
+          timeout --signal=TERM --kill-after=30s 8m
+          cargo test --locked -p ruster-io-sim
+          --test security_property_smoke r16a_bounded_smoke --
+          --ignored --exact --nocapture --test-threads=1
+
+      - name: Validate bounded failure artifacts
+        id: validate_artifacts
+        if: >-
+          ${{
+            failure() &&
+            (
+              github.event_name != 'pull_request' ||
+              github.event.pull_request.head.repo.full_name == github.repository
+            )
+          }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="${RUSTER_R16A_ARTIFACT_DIR}"
+          if [[ ! -e "${artifact_dir}" && ! -L "${artifact_dir}" ]]; then
+            exit 0
+          fi
+          if [[ ! -d "${artifact_dir}" || -L "${artifact_dir}" ]]; then
+            echo "artifact path is not a real directory" >&2
+            exit 1
+          fi
+          if [[ "$(stat -c '%a' -- "${artifact_dir}")" != "700" ]]; then
+            echo "artifact directory mode is not 0700" >&2
+            exit 1
+          fi
+          if [[ "$(stat -c '%u' -- "${artifact_dir}")" != "$(id -u)" ]]; then
+            echo "artifact directory owner does not match the runner" >&2
+            exit 1
+          fi
+
+          entries_manifest="$(mktemp "${RUNNER_TEMP}/r16a-artifact-entries.XXXXXX")"
+          find "${artifact_dir}" -mindepth 1 -maxdepth 1 -print0 > "${entries_manifest}"
+          mapfile -d '' entries < "${entries_manifest}"
+          rm -f -- "${entries_manifest}"
+          if (( ${#entries[@]} == 0 )); then
+            exit 0
+          fi
+          if (( ${#entries[@]} != 2 )); then
+            echo "failure artifact directory must contain exactly two entries" >&2
+            exit 1
+          fi
+
+          case_files=()
+          jsonl_files=()
+          for path in "${entries[@]}"; do
+            if [[ ! -f "${path}" || -L "${path}" ]]; then
+              echo "failure artifact entry is not a regular non-symlink file" >&2
+              exit 1
+            fi
+            if [[ "$(stat -c '%a' -- "${path}")" != "600" ]]; then
+              echo "failure artifact file mode is not 0600" >&2
+              exit 1
+            fi
+            if [[ "$(stat -c '%u' -- "${path}")" != "$(id -u)" ]]; then
+              echo "failure artifact file owner does not match the runner" >&2
+              exit 1
+            fi
+            name="${path##*/}"
+            case "${name}" in
+              *.case) case_files+=("${path}") ;;
+              *.jsonl) jsonl_files+=("${path}") ;;
+              *)
+                echo "failure artifact has an unsupported filename" >&2
+                exit 1
+                ;;
+            esac
+          done
+          if (( ${#case_files[@]} != 1 || ${#jsonl_files[@]} != 1 )); then
+            echo "failure artifact must contain one .case and one .jsonl" >&2
+            exit 1
+          fi
+
+          case_path="${case_files[0]}"
+          jsonl_path="${jsonl_files[0]}"
+          case_name="${case_path##*/}"
+          if [[ ! "${case_name}" =~ ^r16a-(parser|checksum|admission|resolution)-[0-9a-f]{16}-[0-9a-f]{16}(-([1-9]|1[0-5]))?\.case$ ]]; then
+            echo "failure artifact case filename is not canonical" >&2
+            exit 1
+          fi
+          if [[ "${case_path%.case}" != "${jsonl_path%.jsonl}" ]]; then
+            echo "failure artifact stems do not match" >&2
+            exit 1
+          fi
+
+          case_size="$(stat -c '%s' -- "${case_path}")"
+          jsonl_size="$(stat -c '%s' -- "${jsonl_path}")"
+          if (( case_size < 72 || case_size > 131072 )); then
+            echo "failure .case size is outside the v1 envelope bound" >&2
+            exit 1
+          fi
+          if (( jsonl_size < 1 || jsonl_size > 65536 )); then
+            echo "failure .jsonl size is outside the metadata bound" >&2
+            exit 1
+          fi
+
+          {
+            echo "case_path=${case_path}"
+            echo "jsonl_path=${jsonl_path}"
+            echo "upload=true"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Upload bounded failure artifacts
+        if: ${{ failure() && steps.validate_artifacts.outputs.upload == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: r16a-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.validate_artifacts.outputs.case_path }}
+            ${{ steps.validate_artifacts.outputs.jsonl_path }}
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false
