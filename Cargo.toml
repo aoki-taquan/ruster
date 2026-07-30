@@ -2,6 +2,7 @@
 members = [
     "crates/bench",
     "crates/config",
+    "crates/control",
     "crates/core",
     "crates/io-afpacket",
     "crates/io-conformance",

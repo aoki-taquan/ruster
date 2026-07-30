@@ -321,6 +321,24 @@ worker tick順は `publication/reconcile → RX → resolution timer poll → fa
 generated ARP → generated ICMP` です。exact timeoutでのARP学習は、ICMP actionがqueueされる前
 なら `poll → learn → dispatch` と `learn → poll` の両方で勝ちます。
 
+`ruster-control`のstatic-only owned publication境界は、nonzero generation、固定runtime
+storage shape、owned forwarding table、必須UDP/TCP NAT44 input、owned firewall rulesを
+`PublicationPlan`へ集約します。`ValidatedCandidate`構築はfull-service presenceと全NAT
+directory/node/port-owner shapeを先に検査し、`ValidatedForwardingOwner`を作ってからその
+snapshotへUDP/TCP configと`ValidatedFirewallOwner`をbindします。dependent configとfirewall
+ownerをforwarding ownerより先にdropするfield順で保持しますが、self-reference、leak、unsafe
+pointerは使いません。`authority()`はcandidate lifetimeに制約されたsnapshot/config viewを
+allocation、再validation、再hashなしのO(1)で返します。generation前進、UDP/TCP/firewall key
+rotation、固定shape/policyはstatic successor checkだけを提供し、ownerのinstallやruntime変更は
+行いません。
+
+この段階では`ActivePublication`、`FullServiceView`構築、既存runtimeのadopt、apply、
+rollback、backend quiescence APIを一切公開しません。Resolution/ICMP runtimeには旧snapshotの
+egress/MAC/IP authorityを持つqueueがあり、shape/policy一致だけで新candidateへ接続するとstale
+出力を許すためです。live activationは、全5 runtimeのR06G permitとbackend quiescenceを同じ
+exclusive transactionに保持する後続workerだけが行います。`ruster-control`はR06O時点では
+`ruster-core`だけに依存し、runtime依存の追加もそのworker PRまで延期します。
+
 `ruster-runtime`の`FullServicePublication`は、具体的なowned publicationやparserを持たず、
 candidateのall-or-nothing適用とactive full-service viewの借用だけを抽象化します。
 candidate rejectは旧active viewを失効させず、そのtickのdata phaseを旧generationで継続します。

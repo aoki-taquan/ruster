@@ -65,18 +65,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "ruster-core"
-version = "0.2.0"
-
-[[package]]
-name = "ruster-io-conformance"
+name = "ruster-control"
 version = "0.2.0"
 dependencies = [
  "ruster-core",
 ]
 
 [[package]]
+name = "ruster-core"
+version = "0.2.0"
+
+[[package]]
 name = "ruster-io-afpacket"
+version = "0.2.0"
+dependencies = [
+ "ruster-core",
+]
+
+[[package]]
+name = "ruster-io-conformance"
 version = "0.2.0"
 dependencies = [
  "ruster-core",
