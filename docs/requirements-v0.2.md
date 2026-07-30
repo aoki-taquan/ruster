@@ -241,6 +241,7 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | R16A-003 fixed past-regression corpus | black-box regression contract | `r16a_past_regression_corpus_is_exact` | implemented | current-mainの固定input/expected 9件だけを保持し、prototype実装は再利用しない |
 | R16A-004 exact bounded failure replay | security test infrastructure contract | `r16a_failure_artifact_is_binary_jsonl_and_exactly_replayable` | implemented | private 0700の明示absolute directoryへ0600/create-newでbounded `.case`と1行JSONLを生成し、同一binary envelopeのexact replay commandを記録 |
 | R16A-005 explicit bounded smoke command | security test infrastructure contract | `r16a_bounded_smoke` | implemented | `fuzz-smoke.yml`がPR/mainで固定4 seed/target別budgetを実行し、manual dispatchは最大65536件の完全指定rangeを許可。branch protection/rulesetのrequired status設定済みとは主張しない |
+| CONFIG-001 bounded versioned exact syntax | declarative control-plane security contract | `versioned_config_parser_is_exact_bounded_and_redacted` | implemented | 1 MiB inputと全V1 listをbounded化。schema-version predispatch、nested unknown/duplicate/future runtime fieldをtyped rejectし、diagnosticとDTOのDebugからsource value/allocator seedをredact。semantic validation/normalize/plan/applyは対象外 |
 
 ### R16A dependency-free seed runner
 

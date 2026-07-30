@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/bench",
+    "crates/config",
     "crates/core",
     "crates/io-conformance",
     "crates/io-sim",
