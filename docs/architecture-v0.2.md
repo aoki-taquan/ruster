@@ -22,10 +22,19 @@ leaseしていないslotはRX backendの所有下に残ります。coreからUME
 simの`BatchCompletion.recycled`にはdropとconsumeの両方を数えます。両者の区別は
 `BatchReport.consumed`、typed `RecycleCause`、terminal traceで保持します。
 
+`forward_batch*`へ渡すbatchは`PacketIo::receive`が返したfreshなbatchに限ります。
+事前に`next_packet`を呼んだり、leaseを完了したりしてはならず、batch lifecycle counterは
+zeroから始まります。`BatchCompletion`はforwarding関数の差分ではなくbatch生成からの
+全期間を集計するため、partial/pre-accounted batchはservice APIの対象外です。
+
 `receive`はbackend固有errorを返せます。`finish`はerror時にも失われないcompletionを
 必ず返し、TX requested/accepted/rejectedを分けます。常に
 `accepted + rejected == requested`で、reject slotはbackendがreturn前にrecycle/free
-します。これによりAF_XDP ring fullやDPDK partial TXでもrequestを成功と誤認しません。
+します。AF_XDPのacceptedは`finish`のreturn前にTX producerへdescriptorをpublishしたことを
+意味し、wire送信やcompletion queue到着を意味しません。publish後のwakeup errorでもその
+descriptorはaccepted/in-flightのままです。rejectedはpublishされずreturn前にreclaimされます。
+publish済みframeはcompletionまでbackend所有で、`recycled`には数えません。これにより
+AF_XDP ring fullやDPDK partial TXでもrequestを成功と誤認しません。
 
 ## forwarding transaction
 

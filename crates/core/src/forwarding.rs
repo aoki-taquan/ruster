@@ -835,6 +835,15 @@ impl PacketDecision {
     }
 }
 
+/// Forwards every packet offered by one fresh backend batch.
+///
+/// # Fresh-batch precondition
+///
+/// `batch` must be passed directly from [`crate::PacketIo::receive`]:
+/// [`PacketBatch::next_packet`] must not have been called and no lifecycle
+/// completion or accounting may predate this invocation. [`BatchCompletion`]
+/// reports whole-batch totals, so these forwarding APIs deliberately do not
+/// accept partially processed or pre-accounted batches.
 pub fn forward_batch<B, T>(
     batch: B,
     snapshot: &ForwardingSnapshot<'_>,
@@ -851,6 +860,8 @@ where
 
 /// Forwards RX packets and queues resolution actions without allocating TX
 /// frames. Generated execution must start only after this function returns.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
 pub fn forward_batch_with_resolution<B, T>(
     batch: B,
     snapshot: &ForwardingSnapshot<'_>,
@@ -882,6 +893,8 @@ where
 /// actions into separate caller-backed worker-local runtimes.
 ///
 /// Generated packet execution must happen after this function returns.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
 pub fn forward_batch_with_resolution_and_icmpv4_errors<B, T>(
     batch: B,
     snapshot: &ForwardingSnapshot<'_>,
@@ -917,6 +930,8 @@ where
 /// cross the configured inside/outside boundary. This lets a control plane
 /// publish configuration before runtime storage without leaking private
 /// addresses. Generated ARP execution remains a separate post-RX phase.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
 pub fn forward_batch_with_nat44_udp<B, T>(
     batch: B,
     snapshot: &ForwardingSnapshot<'_>,
@@ -952,6 +967,8 @@ where
 /// TTL expiry, route miss, and direct ARP failure capture happen before NAT
 /// mutation and therefore quote the original datagram. Generated packet
 /// execution still starts only after this RX function returns.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_with_nat44_udp_and_icmpv4_errors<B, T>(
     batch: B,
@@ -984,6 +1001,8 @@ where
 }
 
 /// Runs one outbound-initiated TCP NAPT domain with ARP resolution.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
 pub fn forward_batch_with_nat44_tcp<B, T>(
     batch: B,
     snapshot: &ForwardingSnapshot<'_>,
@@ -1014,6 +1033,8 @@ where
 }
 
 /// Composes TCP NAPT with generated ICMPv4 errors in one RX phase.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_with_nat44_tcp_and_icmpv4_errors<B, T>(
     batch: B,
@@ -1046,6 +1067,8 @@ where
 }
 
 /// Runs independent UDP and TCP NAPT state for one matching address realm.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_with_nat44_udp_and_tcp<B, T>(
     batch: B,
@@ -1079,6 +1102,8 @@ where
 }
 
 /// Full UDP/TCP NAPT and generated ICMPv4-error composition.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors<B, T>(
     batch: B,
@@ -1116,6 +1141,8 @@ where
 ///
 /// ARP, router-local traffic, and router-originated generated packets remain
 /// outside this service. A missing or mismatched runtime fails closed.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_with_firewall<B, T>(
     batch: B,
@@ -1148,6 +1175,8 @@ where
 
 /// Runs the opt-in stateful firewall and appends one typed policy record for
 /// every packet that reaches rule or established-flow evaluation.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_with_firewall_audited<B, T>(
     batch: B,
@@ -1181,6 +1210,8 @@ where
 
 /// Composes the stateful firewall with the existing generated ICMPv4 error
 /// capture path. Firewall authorization precedes TTL error capture.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_with_firewall_and_icmpv4_errors<B, T>(
     batch: B,
@@ -1213,6 +1244,8 @@ where
 }
 
 /// Audited variant of [`forward_batch_with_firewall_and_icmpv4_errors`].
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_with_firewall_and_icmpv4_errors_audited<B, T>(
     batch: B,
@@ -1246,6 +1279,8 @@ where
 }
 
 /// Composes independent UDP/TCP NAPT with one canonical-tuple firewall.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_with_nat44_udp_and_tcp_and_firewall<B, T>(
     batch: B,
@@ -1282,6 +1317,8 @@ where
 
 /// Audited variant of
 /// [`forward_batch_with_nat44_udp_and_tcp_and_firewall`].
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_batch_with_nat44_udp_and_tcp_and_firewall_audited<B, T>(
     batch: B,
@@ -1477,10 +1514,6 @@ where
         }
     }
     let completion = batch.finish();
-    trace.record(TraceEvent::BatchCompleted {
-        tx_accepted: completion.tx_accepted,
-        tx_rejected: completion.tx_rejected,
-    });
     let report = BatchReport {
         received,
         tx_requested,
@@ -1488,7 +1521,17 @@ where
         consumed,
         completion,
     };
-    debug_assert!(report.invariants_hold());
+    let invariants_hold = report.invariants_hold();
+    debug_assert!(
+        invariants_hold,
+        "backend batch accounting violates the forwarding contract"
+    );
+    if invariants_hold {
+        trace.record(TraceEvent::BatchCompleted {
+            tx_accepted: report.completion.tx_accepted,
+            tx_rejected: report.completion.tx_rejected,
+        });
+    }
     report
 }
 
@@ -4572,13 +4615,15 @@ fn apply_icmpv4_echo_reply(
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_ipv4, BatchReport, DropReason};
+    use super::{decide_ipv4, forward_batch, BatchReport, DropReason};
     use crate::{
         ipv4_header_checksum, BatchCompletion, ForwardingSnapshot, IfId, Interface, Ipv4Address,
         LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44UdpConfig,
         Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, NoTrace,
-        ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
+        PacketBatch, PacketLease, PacketSlot, ResolutionActionSlot, ResolutionPolicy,
+        ResolutionRuntime, ResolutionStateSlot, Route, SlotCompletion, TraceEvent, TraceSink,
     };
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     const LAN: IfId = IfId(1);
     const WAN: IfId = IfId(2);
@@ -4624,6 +4669,92 @@ mod tests {
             (usize::MAX, usize::MAX, 0, 1),
         )
         .invariants_hold());
+    }
+
+    struct NeverLeasedSlot;
+
+    impl PacketSlot for NeverLeasedSlot {
+        fn ingress(&self) -> IfId {
+            unreachable!("accounting-only batch never leases a slot")
+        }
+
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            unreachable!("accounting-only batch never leases a slot")
+        }
+
+        fn complete(self, _completion: SlotCompletion) {
+            unreachable!("accounting-only batch never leases a slot")
+        }
+    }
+
+    struct AccountingOnlyBatch {
+        completion: BatchCompletion<()>,
+    }
+
+    impl PacketBatch for AccountingOnlyBatch {
+        type Error = ();
+        type Slot<'a> = NeverLeasedSlot;
+
+        fn next_packet(&mut self) -> Option<PacketLease<Self::Slot<'_>>> {
+            None
+        }
+
+        fn finish(self) -> BatchCompletion<Self::Error> {
+            self.completion
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingTrace {
+        events: Vec<TraceEvent>,
+    }
+
+    impl TraceSink for RecordingTrace {
+        fn record(&mut self, event: TraceEvent) {
+            self.events.push(event);
+        }
+    }
+
+    fn assert_invalid_batch_has_no_terminal_trace(completion: BatchCompletion<()>) {
+        let snapshot = ForwardingSnapshot::new(&[], &[], &[], &[]).unwrap();
+        let mut trace = RecordingTrace::default();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            forward_batch(AccountingOnlyBatch { completion }, &snapshot, &mut trace)
+        }));
+        if cfg!(debug_assertions) {
+            assert!(result.is_err(), "debug builds reject invalid accounting");
+        } else {
+            assert!(result.is_ok(), "release builds return the invalid report");
+        }
+        assert!(
+            !trace
+                .events
+                .iter()
+                .any(|event| matches!(event, TraceEvent::BatchCompleted { .. })),
+            "invalid accounting must not publish a terminal batch trace"
+        );
+    }
+
+    #[test]
+    fn preaccounted_batch_violates_fresh_batch_precondition_before_terminal_trace() {
+        assert_invalid_batch_has_no_terminal_trace(BatchCompletion {
+            tx_requested: 1,
+            tx_accepted: 1,
+            tx_rejected: 0,
+            recycled: 0,
+            error: None,
+        });
+    }
+
+    #[test]
+    fn malformed_backend_completion_is_rejected_before_terminal_trace() {
+        assert_invalid_batch_has_no_terminal_trace(BatchCompletion {
+            tx_requested: 0,
+            tx_accepted: 1,
+            tx_rejected: 0,
+            recycled: 0,
+            error: Some(()),
+        });
     }
 
     fn frag_needed_frame() -> Vec<u8> {

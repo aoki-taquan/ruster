@@ -20,13 +20,23 @@ pub trait PacketBatch {
     /// Returns a core-owned lease, never a backend's raw slot.
     fn next_packet(&mut self) -> Option<PacketLease<Self::Slot<'_>>>;
 
-    /// Flushes requested transmissions and always returns their accounting.
+    /// Flushes requested transmissions and returns accounting for the entire
+    /// batch lifetime, starting when the backend created the batch.
     ///
     /// [`BatchCompletion::invariants_hold`] must return `true`, including when
     /// `error` is present. The backend must recycle or free every rejected
     /// slot before returning. Rejected TX slots are accounted in
     /// [`BatchCompletion::tx_rejected`], not
     /// [`BatchCompletion::recycled`].
+    ///
+    /// For an AF_XDP backend, `tx_accepted` means that a descriptor was
+    /// published to the TX producer before this method returned. It does not
+    /// mean that the frame reached the wire or appeared on the completion
+    /// queue. An error from a wakeup after publication leaves that descriptor
+    /// accepted and in flight. `tx_rejected` means the descriptor was not
+    /// published and its frame was reclaimed before return. Published frames
+    /// remain backend-owned until completion and are not counted as
+    /// `recycled`.
     fn finish(self) -> BatchCompletion<Self::Error>;
 }
 
@@ -136,6 +146,9 @@ pub struct BatchCompletion<E> {
     /// Slots completed with [`SlotCompletion::Transmit`].
     pub tx_requested: usize,
     /// Requested TX slots accepted by the backend.
+    ///
+    /// For AF_XDP this is the number of descriptors published to the TX
+    /// producer, not wire delivery or completion-queue ownership return.
     pub tx_accepted: usize,
     /// Requested TX slots rejected and reclaimed by the backend.
     pub tx_rejected: usize,
@@ -143,7 +156,8 @@ pub struct BatchCompletion<E> {
     /// [`SlotCompletion::Consume`], or [`SlotCompletion::LeaseAbandoned`].
     ///
     /// This excludes rejected TX slots and slots that were never leased from
-    /// the batch.
+    /// the batch. For AF_XDP it also excludes published TX frames waiting for
+    /// completion; those remain backend-owned.
     pub recycled: usize,
     /// A backend error that occurred while preserving all accounting above.
     pub error: Option<E>,
