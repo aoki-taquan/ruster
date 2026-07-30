@@ -510,6 +510,8 @@ pub struct ResolutionRuntime<'a> {
     failure_holds: &'a mut [ResolutionFailureHoldSlot],
     head: usize,
     len: usize,
+    pending_state_count: usize,
+    pending_failure_hold_count: usize,
     poll_cursor: usize,
     failure_cursor: usize,
     last_now: Option<MonotonicMillis>,
@@ -564,6 +566,8 @@ impl<'a> ResolutionRuntime<'a> {
             failure_holds,
             head: 0,
             len: 0,
+            pending_state_count: 0,
+            pending_failure_hold_count: 0,
             poll_cursor: 0,
             failure_cursor: 0,
             last_now: None,
@@ -598,17 +602,18 @@ impl<'a> ResolutionRuntime<'a> {
                 report.dynamic_removed += 1;
             }
         }
-        for state in &mut *self.states {
-            if state.occupied
-                && state.phase != ResolutionPhase::Cooldown
+        for index in 0..self.states.len() {
+            if self.states[index].occupied
+                && self.states[index].phase != ResolutionPhase::Cooldown
                 && neighbors.iter().any(|neighbor| {
-                    neighbor.interface == state.key.egress && neighbor.target == state.key.target
+                    neighbor.interface == self.states[index].key.egress
+                        && neighbor.target == self.states[index].key.target
                 })
             {
-                if state.attempts != 0 {
+                if self.states[index].attempts != 0 {
                     report.cooldowns_retained += 1;
                 }
-                cancel_state(state);
+                self.cancel_state_at(index);
                 report.states_removed += 1;
             }
         }
@@ -617,14 +622,14 @@ impl<'a> ResolutionRuntime<'a> {
                 neighbor.interface == action.egress && neighbor.target == action.target_ip
             })
         });
-        for hold in &mut *self.failure_holds {
-            if hold.phase != ResolutionFailureHoldPhase::Empty
+        for index in 0..self.failure_holds.len() {
+            if self.failure_holds[index].phase != ResolutionFailureHoldPhase::Empty
                 && neighbors.iter().any(|neighbor| {
-                    neighbor.interface == hold.forward.egress
-                        && neighbor.target == hold.forward.target
+                    neighbor.interface == self.failure_holds[index].forward.egress
+                        && neighbor.target == self.failure_holds[index].forward.target
                 })
             {
-                *hold = ResolutionFailureHoldSlot::EMPTY;
+                self.clear_failure_hold(index);
                 self.failure_counters.cancelled += 1;
             }
         }
@@ -652,24 +657,25 @@ impl<'a> ResolutionRuntime<'a> {
                 report.dynamic_removed += 1;
             }
         }
-        for state in &mut *self.states {
-            if !state.occupied || state.phase == ResolutionPhase::Cooldown {
+        for index in 0..self.states.len() {
+            if !self.states[index].occupied || self.states[index].phase == ResolutionPhase::Cooldown
+            {
                 continue;
             }
-            match snapshot.resolution_action_authority(state.action) {
+            match snapshot.resolution_action_authority(self.states[index].action) {
                 crate::forwarding::ResolutionActionAuthority::Valid => {}
                 crate::forwarding::ResolutionActionAuthority::StaticResolved => {
-                    if state.attempts != 0 {
+                    if self.states[index].attempts != 0 {
                         report.cooldowns_retained += 1;
                     }
-                    cancel_state(state);
+                    self.cancel_state_at(index);
                     report.states_removed += 1;
                 }
                 crate::forwarding::ResolutionActionAuthority::Invalid => {
-                    if state.attempts != 0 {
+                    if self.states[index].attempts != 0 {
                         report.cooldowns_retained += 1;
                     }
-                    cancel_state(state);
+                    self.cancel_state_at(index);
                     report.invalid_states_removed += 1;
                 }
             }
@@ -691,7 +697,8 @@ impl<'a> ResolutionRuntime<'a> {
         });
         report.actions_removed = static_removed;
         report.invalid_actions_removed = invalid_removed;
-        for hold in &mut *self.failure_holds {
+        for index in 0..self.failure_holds.len() {
+            let hold = self.failure_holds[index];
             if hold.phase == ResolutionFailureHoldPhase::Empty {
                 continue;
             }
@@ -719,7 +726,7 @@ impl<'a> ResolutionRuntime<'a> {
                     hold.forward_source_ip,
                 );
             if !forward_valid {
-                *hold = ResolutionFailureHoldSlot::EMPTY;
+                self.clear_failure_hold(index);
                 self.failure_counters.cancelled += 1;
             }
         }
@@ -737,11 +744,8 @@ impl<'a> ResolutionRuntime<'a> {
     }
 
     #[must_use]
-    pub fn pending_failure_holds(&self) -> usize {
-        self.failure_holds
-            .iter()
-            .filter(|hold| hold.phase != ResolutionFailureHoldPhase::Empty)
-            .count()
+    pub const fn pending_failure_holds(&self) -> usize {
+        self.pending_failure_hold_count
     }
 
     #[must_use]
@@ -750,11 +754,8 @@ impl<'a> ResolutionRuntime<'a> {
     }
 
     #[must_use]
-    pub fn pending_states(&self) -> usize {
-        self.states
-            .iter()
-            .filter(|state| state.occupied && state.phase != ResolutionPhase::Cooldown)
-            .count()
+    pub const fn pending_states(&self) -> usize {
+        self.pending_state_count
     }
 
     #[must_use]
@@ -822,15 +823,16 @@ impl<'a> ResolutionRuntime<'a> {
         {
             return ResolutionFailureCapture::Existing(token);
         }
-        let Some(slot) = self
+        let Some(index) = self
             .failure_holds
-            .iter_mut()
-            .find(|hold| hold.phase == ResolutionFailureHoldPhase::Empty)
+            .iter()
+            .position(|hold| hold.phase == ResolutionFailureHoldPhase::Empty)
         else {
             self.failure_counters.capture_full += 1;
             return ResolutionFailureCapture::CapacityFull;
         };
         let quote_len = original_ipv4.len().min(ICMPV4_ERROR_MAX_QUOTE_LEN);
+        let slot = &mut self.failure_holds[index];
         *slot = ResolutionFailureHoldSlot::EMPTY;
         slot.phase = ResolutionFailureHoldPhase::WaitingForward;
         slot.forward = token;
@@ -843,6 +845,8 @@ impl<'a> ResolutionRuntime<'a> {
         slot.original_tos = original_tos;
         slot.quote_len = quote_len as u16;
         slot.quote[..quote_len].copy_from_slice(&original_ipv4[..quote_len]);
+        debug_assert!(self.pending_failure_hold_count < self.failure_holds.len());
+        self.pending_failure_hold_count += 1;
         self.failure_counters.captured += 1;
         ResolutionFailureCapture::Captured(token)
     }
@@ -907,13 +911,14 @@ impl<'a> ResolutionRuntime<'a> {
                         target: self.states[index].key.target,
                         generation: self.states[index].generation,
                     };
-                    for hold in &mut *self.failure_holds {
+                    for hold_index in 0..self.failure_holds.len() {
+                        let hold = self.failure_holds[hold_index];
                         if hold.phase != ResolutionFailureHoldPhase::Empty
                             && (hold.forward == expired
                                 || (hold.phase == ResolutionFailureHoldPhase::WaitingReverse
                                     && hold.reverse == expired))
                         {
-                            *hold = ResolutionFailureHoldSlot::EMPTY;
+                            self.clear_failure_hold(hold_index);
                             self.failure_counters.cancelled += 1;
                         }
                     }
@@ -1041,9 +1046,10 @@ impl<'a> ResolutionRuntime<'a> {
     }
 
     fn clear_resolution(&mut self, interface: IfId, target: Ipv4Address) {
-        for state in &mut *self.states {
+        for index in 0..self.states.len() {
+            let state = self.states[index];
             if state.occupied && state.key.egress == interface && state.key.target == target {
-                cancel_state(state);
+                self.cancel_state_at(index);
             }
         }
         self.compact_actions(|action| action.egress == interface && action.target_ip == target);
@@ -1083,7 +1089,34 @@ impl<'a> ResolutionRuntime<'a> {
         old_len - retained
     }
 
+    fn cancel_state_at(&mut self, index: usize) {
+        if cancel_state(&mut self.states[index]) {
+            debug_assert!(self.pending_state_count != 0);
+            self.pending_state_count -= 1;
+        }
+    }
+
+    fn vacate_state_at(&mut self, index: usize) {
+        let was_pending = state_is_pending(self.states[index]);
+        vacate_state(&mut self.states[index]);
+        if was_pending {
+            debug_assert!(self.pending_state_count != 0);
+            self.pending_state_count -= 1;
+        }
+    }
+
+    fn clear_failure_hold(&mut self, index: usize) {
+        debug_assert!(
+            self.failure_holds[index].phase != ResolutionFailureHoldPhase::Empty,
+            "only a live failure hold can be cleared"
+        );
+        self.failure_holds[index] = ResolutionFailureHoldSlot::EMPTY;
+        debug_assert!(self.pending_failure_hold_count != 0);
+        self.pending_failure_hold_count -= 1;
+    }
+
     fn start_cycle(&mut self, index: usize, action: ArpRequestAction) {
+        let was_pending = state_is_pending(self.states[index]);
         let generation = self.next_generation(
             action.egress,
             action.target_ip,
@@ -1104,6 +1137,10 @@ impl<'a> ResolutionRuntime<'a> {
             phase: ResolutionPhase::InitialQueued,
             failure_notified: false,
         };
+        if !was_pending {
+            debug_assert!(self.pending_state_count < self.states.len());
+            self.pending_state_count += 1;
+        }
     }
 
     fn enqueue_initial(&mut self, index: usize) -> ResolutionResult {
@@ -1148,10 +1185,11 @@ impl<'a> ResolutionRuntime<'a> {
             generation: self.states[index].generation,
         };
         if self.states[index].accepted_attempts == 0 {
-            for hold in &mut *self.failure_holds {
+            for hold_index in 0..self.failure_holds.len() {
+                let hold = self.failure_holds[hold_index];
                 if hold.phase == ResolutionFailureHoldPhase::WaitingForward && hold.forward == token
                 {
-                    *hold = ResolutionFailureHoldSlot::EMPTY;
+                    self.clear_failure_hold(hold_index);
                     self.failure_counters.no_accepted_arp_request += 1;
                 }
             }
@@ -1239,12 +1277,13 @@ impl<'a> ResolutionRuntime<'a> {
     }
 
     fn cancel_forward_holds(&mut self, egress: IfId, target: Ipv4Address) {
-        for hold in &mut *self.failure_holds {
+        for index in 0..self.failure_holds.len() {
+            let hold = self.failure_holds[index];
             if hold.phase != ResolutionFailureHoldPhase::Empty
                 && hold.forward.egress == egress
                 && hold.forward.target == target
             {
-                *hold = ResolutionFailureHoldSlot::EMPTY;
+                self.clear_failure_hold(index);
                 self.failure_counters.cancelled += 1;
             }
         }
@@ -1341,17 +1380,18 @@ impl<'a> ResolutionRuntime<'a> {
                             target: state.key.target,
                             generation: state.generation,
                         };
-                        for hold in &mut *self.failure_holds {
+                        for hold_index in 0..self.failure_holds.len() {
+                            let hold = self.failure_holds[hold_index];
                             if hold.phase != ResolutionFailureHoldPhase::Empty
                                 && (hold.forward == token
                                     || (hold.phase == ResolutionFailureHoldPhase::WaitingReverse
                                         && hold.reverse == token))
                             {
-                                *hold = ResolutionFailureHoldSlot::EMPTY;
+                                self.clear_failure_hold(hold_index);
                                 self.failure_counters.cancelled += 1;
                             }
                         }
-                        vacate_state(&mut self.states[index]);
+                        self.vacate_state_at(index);
                         self.counters.failures_expired += 1;
                         report.failures_expired += 1;
                         trace.record_resolution_timer(ResolutionTimerTrace::FailureExpired {
@@ -1369,16 +1409,21 @@ impl<'a> ResolutionRuntime<'a> {
     }
 }
 
+const fn state_is_pending(state: ResolutionStateSlot) -> bool {
+    state.occupied && !matches!(state.phase, ResolutionPhase::Cooldown)
+}
+
 fn vacate_state(state: &mut ResolutionStateSlot) {
     let generation = state.generation;
     *state = ResolutionStateSlot::EMPTY;
     state.generation = generation;
 }
 
-fn cancel_state(state: &mut ResolutionStateSlot) {
+fn cancel_state(state: &mut ResolutionStateSlot) -> bool {
+    let was_pending = state_is_pending(*state);
     if state.attempts == 0 {
         vacate_state(state);
-        return;
+        return was_pending;
     }
     let key = state.key;
     let generation = state.generation;
@@ -1391,6 +1436,7 @@ fn cancel_state(state: &mut ResolutionStateSlot) {
     state.requested_at = requested_at;
     state.occupied = true;
     state.phase = ResolutionPhase::Cooldown;
+    was_pending
 }
 
 /// Advances bounded ARP retry/timeout state without performing packet I/O.
@@ -1440,7 +1486,7 @@ pub fn dispatch_host_unreachable_failures<T: ResolutionFailureTraceSink>(
         }
         match dispatch_one_failure(resolution, icmpv4_errors, snapshot, now, hold) {
             FailureDispatch::Queued(reverse_egress) => {
-                resolution.failure_holds[index] = ResolutionFailureHoldSlot::EMPTY;
+                resolution.clear_failure_hold(index);
                 resolution.failure_counters.queued += 1;
                 report.queued += 1;
                 trace.record_resolution_failure(ResolutionFailureTrace::Queued {
@@ -1480,7 +1526,7 @@ pub fn dispatch_host_unreachable_failures<T: ResolutionFailureTraceSink>(
                 });
             }
             FailureDispatch::ReverseFailed(reverse) => {
-                resolution.failure_holds[index] = ResolutionFailureHoldSlot::EMPTY;
+                resolution.clear_failure_hold(index);
                 resolution.failure_counters.reverse_resolution_failed += 1;
                 report.retired += 1;
                 trace.record_resolution_failure(ResolutionFailureTrace::ReverseResolutionFailed {
@@ -1489,7 +1535,7 @@ pub fn dispatch_host_unreachable_failures<T: ResolutionFailureTraceSink>(
                 });
             }
             FailureDispatch::SameFailedKey => {
-                resolution.failure_holds[index] = ResolutionFailureHoldSlot::EMPTY;
+                resolution.clear_failure_hold(index);
                 resolution.failure_counters.same_failed_key += 1;
                 report.retired += 1;
                 trace.record_resolution_failure(ResolutionFailureTrace::SameFailedKey {
@@ -1497,7 +1543,7 @@ pub fn dispatch_host_unreachable_failures<T: ResolutionFailureTraceSink>(
                 });
             }
             FailureDispatch::AuthorityLost => {
-                resolution.failure_holds[index] = ResolutionFailureHoldSlot::EMPTY;
+                resolution.clear_failure_hold(index);
                 resolution.failure_counters.retired_permanent += 1;
                 report.retired += 1;
                 trace.record_resolution_failure(ResolutionFailureTrace::ForwardAuthorityLost {
@@ -1914,6 +1960,32 @@ mod tests {
     fn commit_front(runtime: &mut ResolutionRuntime<'_>, now: u64) {
         let queued = runtime.front().expect("queued action");
         runtime.committed(queued, MonotonicMillis(now));
+    }
+
+    fn commit_front_accepted(runtime: &mut ResolutionRuntime<'_>, now: u64) {
+        let queued = runtime.front().expect("queued action");
+        runtime.committed(queued, MonotonicMillis(now));
+        runtime.accepted(queued, 1);
+    }
+
+    fn assert_pending_accounting(runtime: &ResolutionRuntime<'_>) {
+        assert_eq!(
+            runtime.pending_states(),
+            runtime
+                .states
+                .iter()
+                .copied()
+                .filter(|state| state_is_pending(*state))
+                .count()
+        );
+        assert_eq!(
+            runtime.pending_failure_holds(),
+            runtime
+                .failure_holds
+                .iter()
+                .filter(|hold| hold.phase != ResolutionFailureHoldPhase::Empty)
+                .count()
+        );
     }
 
     #[derive(Default)]
@@ -2599,6 +2671,209 @@ mod tests {
             ResolutionResult::Queued
         );
         assert_eq!(runtime.front().unwrap().action.source_mac, new_mac);
+    }
+
+    #[test]
+    fn pending_state_accounting_survives_rollback_reconcile_regression_and_cursor_wrap() {
+        let policy = ResolutionPolicy::new(1_000, 2_000).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 4];
+        let mut actions = [ResolutionActionSlot::EMPTY; 3];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        for last in [2, 3, 4] {
+            assert_eq!(
+                runtime.schedule(action(last), MonotonicMillis(100), false),
+                ResolutionResult::Queued
+            );
+        }
+        assert_pending_accounting(&runtime);
+        assert_eq!(runtime.pending_states(), 3);
+
+        assert_eq!(
+            runtime.schedule(action(5), MonotonicMillis(100), false),
+            ResolutionResult::ActionFull
+        );
+        assert_pending_accounting(&runtime);
+        assert_eq!(runtime.pending_states(), 3);
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(99),
+                usize::MAX,
+                &mut NoResolutionTimerTrace
+            ),
+            Err(ResolutionTimerError::ClockRegression)
+        );
+        assert_pending_accounting(&runtime);
+        let zero_budget = poll_resolution_timers(
+            &mut runtime,
+            MonotonicMillis(100),
+            0,
+            &mut NoResolutionTimerTrace,
+        )
+        .unwrap();
+        assert_eq!((zero_budget.scanned, zero_budget.pending), (0, 3));
+
+        commit_front(&mut runtime, 100);
+        let routes = [Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, WAN, None).unwrap()];
+        let interfaces = [Interface {
+            id: WAN,
+            mac: SOURCE_MAC,
+        }];
+        let bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: SOURCE_IP,
+        }];
+        let neighbors = [
+            Neighbor {
+                interface: WAN,
+                target: target(2),
+                mac: MacAddress([8; 6]),
+            },
+            Neighbor {
+                interface: WAN,
+                target: target(3),
+                mac: MacAddress([9; 6]),
+            },
+        ];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let reconciled = runtime.reconcile_publication(&snapshot);
+        assert_eq!(
+            (
+                reconciled.states_removed,
+                reconciled.cooldowns_retained,
+                reconciled.actions_removed
+            ),
+            (2, 1, 1)
+        );
+        assert_pending_accounting(&runtime);
+        assert_eq!(runtime.pending_states(), 1);
+
+        for _ in 0..=runtime.states.len() {
+            let report = poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(100),
+                1,
+                &mut NoResolutionTimerTrace,
+            )
+            .unwrap();
+            assert_eq!((report.scanned, report.pending), (1, 1));
+            assert_pending_accounting(&runtime);
+        }
+    }
+
+    #[test]
+    fn pending_failure_accounting_survives_capacity_regression_dispatch_wrap_and_expiry() {
+        let policy = ResolutionPolicy::with_retry(1_000, 1_000, 1).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 3];
+        let mut actions = [ResolutionActionSlot::EMPTY; 3];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 2];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        for last in [2, 3, 4] {
+            assert_eq!(
+                runtime.schedule(action(last), MonotonicMillis(0), false),
+                ResolutionResult::Queued
+            );
+            commit_front_accepted(&mut runtime, 0);
+            let capture = runtime.capture_failure_candidate(
+                WAN,
+                target(last),
+                target(100 + last),
+                target(last),
+                SOURCE_MAC,
+                SOURCE_IP,
+                Ipv4Address::from_octets([192, 0, 2, 0]),
+                24,
+                0,
+                &[0x45; 28],
+            );
+            if last == 4 {
+                assert_eq!(capture, ResolutionFailureCapture::CapacityFull);
+            } else {
+                assert!(matches!(capture, ResolutionFailureCapture::Captured(_)));
+            }
+            assert_pending_accounting(&runtime);
+        }
+        assert_eq!(
+            (runtime.pending_states(), runtime.pending_failure_holds()),
+            (3, 2)
+        );
+
+        let timed_out = poll_resolution_timers(
+            &mut runtime,
+            MonotonicMillis(1_000),
+            usize::MAX,
+            &mut NoResolutionTimerTrace,
+        )
+        .unwrap();
+        assert_eq!((timed_out.timed_out, timed_out.pending), (3, 3));
+        assert_pending_accounting(&runtime);
+        assert_eq!(runtime.pending_failure_holds(), 2);
+
+        let snapshot = ForwardingSnapshot::new(&[], &[], &[], &[]).unwrap();
+        let mut icmp_states = [crate::Icmpv4ErrorStateSlot::EMPTY; 1];
+        let mut icmp_actions = [crate::Icmpv4ErrorActionSlot::EMPTY; 1];
+        let mut icmpv4_errors = Icmpv4ErrorRuntime::new(
+            crate::Icmpv4ErrorPolicy::default(),
+            &mut icmp_states,
+            &mut icmp_actions,
+        );
+        assert_eq!(
+            dispatch_host_unreachable_failures(
+                &mut runtime,
+                &mut icmpv4_errors,
+                &snapshot,
+                MonotonicMillis(999),
+                usize::MAX,
+                &mut NoResolutionFailureTrace
+            ),
+            Err(ResolutionFailureDispatchError::ClockRegression)
+        );
+        assert_pending_accounting(&runtime);
+
+        for expected_pending in [1, 0] {
+            let report = dispatch_host_unreachable_failures(
+                &mut runtime,
+                &mut icmpv4_errors,
+                &snapshot,
+                MonotonicMillis(1_000),
+                1,
+                &mut NoResolutionFailureTrace,
+            )
+            .unwrap();
+            assert_eq!(
+                (report.scanned, report.retired, report.pending),
+                (1, 1, expected_pending)
+            );
+            assert_pending_accounting(&runtime);
+        }
+        let wrapped = dispatch_host_unreachable_failures(
+            &mut runtime,
+            &mut icmpv4_errors,
+            &snapshot,
+            MonotonicMillis(1_000),
+            1,
+            &mut NoResolutionFailureTrace,
+        )
+        .unwrap();
+        assert_eq!((wrapped.scanned, wrapped.pending), (1, 0));
+        assert_pending_accounting(&runtime);
+
+        let expired = poll_resolution_timers(
+            &mut runtime,
+            MonotonicMillis(2_000),
+            usize::MAX,
+            &mut NoResolutionTimerTrace,
+        )
+        .unwrap();
+        assert_eq!((expired.failures_expired, expired.pending), (3, 0));
+        assert_pending_accounting(&runtime);
     }
 
     #[test]
