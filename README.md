@@ -19,8 +19,9 @@ benchmark harness、I/O conformance、AF_XDP ownership modelで構成します�
 - `ruster-io-sim`: rootやNICなしでRX/generated TXのFIFO、budget、TX/drop、
   traceを決定的に検証する。
 - `ruster-io-xdp`: AF_XDP native接続より前に固定するpure-Rust ownership model。
-  UMEM layout、descriptor境界、nonzero generation token、frame state ledgerだけを持ち、
-  socket、ring、FFI、core `PacketIo`接続はまだ持たない。
+  UMEM layout、descriptor境界、nonzero generation token、frame state ledger、
+  fixed-storage ring/fake kernelを持つ。socket、native ring、FFI、core `PacketIo`接続は
+  まだ持たない。
 - `ruster-runtime`: genericなpublication seamから一つのactive generationを借用し、
   `RX → resolution timer → failure dispatch → generated ARP → generated ICMPv4`を
   明示budget付きのsingle-worker tickとして実行する。

@@ -752,9 +752,9 @@ packet bytesをcloneしません。次の実I/O backendも同じlease contract�
 backend固有pointerをcoreへ漏らしません。
 
 `ruster-io-xdp`の最初のsliceは、native AF_XDP backendではなく、全targetでcompileできる
-pure-Rust ownership modelです。socket、ring、libxdp FFI、XDP program、core `PacketIo`
-adapterを持たず、`unsafe`をcrate全体で禁止します。従ってIO-009のreal generated backendは
-deferredのままです。
+pure-Rust ownership/ring modelです。socket、native ring、libxdp FFI、XDP program、core
+`PacketIo` adapterを持たず、`unsafe`をcrate全体で禁止します。従ってIO-009のreal generated
+backendはdeferredのままです。
 
 UMEMは固定長frameの集合として表現し、descriptor addressはUMEM相対値です。
 `FrameId`はaddressをframe sizeで正規化したindexだけをcanonical identityとし、packet data
@@ -793,3 +793,38 @@ canonicalizeされたdescriptorもentryとcounterを変更せずtyped errorで�
 ledgerはUMEMの全frame partitionを一workerが所有するため`!Send + !Sync`です。このpure modelは
 live byte sliceをまだ貸し出しませんが、将来のring/native engineも同じworker localityを維持
 するか、別設計の明示的ownership handoffを追加しなければなりません。
+
+### pure-Rust AF_XDP ring/fake model
+
+physical endpoint observationはadapterがinterface/queue/ring kindを自己申告して作る値では
+ありません。finite fakeが所有する`PhysicalEndpoint`のborrowed `EndpointHandle`だけが
+`RingObservation`を作れ、public constructorはありません。observationはendpoint identity、
+visibleなinterface index/queue、Fill/RX/TX/Completion kindをbindします。別endpointまたは
+別ring observationでsealされたsubmissionは、slot/cursor不変の`WrongRing`です。fake endpoint
+identityはcold pathのnonzero unique inputをconsumeし、Debugではredactします。native endpoint
+handleの作成は後続sliceです。
+
+`SpscRing<T, N>`はinline `[Option<ObservedSubmission<T>>; N]`だけを所有し、`N`はnonzero
+power-of-twoかつ`u32` representableでなければなりません。producer/consumer cursorは
+wrapping `u32`、occupancyは`producer.wrapping_sub(consumer) <= N`です。logical cursorから
+physical slotへの変換は`cursor & (N - 1)`で、wrap前後もFIFOを維持します。hot reserve、
+write、submit、acquire、peek、consume、cancelはheap allocation、shared lock、packet clone、
+packet単位Stringを使いません。
+
+producerはexact lengthをreserveし、各offsetを一度だけwriteした後でrange全体を
+`release_submit`します。writeはcursorをpublishせず、wrong ring、duplicate offset、
+range外offset、incomplete submitをtyped errorにします。unreleased reservationのDropと
+explicit cancelは書いたunpublished slotをすべてclearし、producer cursorを変えません。
+consumerはpublished rangeをacquireしてpeekし、`release_consume`で全slotを検証・clearしてから
+consumer cursorを進めます。Dropとexplicit cancelはslot/cursor不変です。Rust modelは
+`&mut` exclusionで逐次実行するためatomicをまだ持ちませんが、native mappingの順序契約は
+descriptor write → Release producer、Acquire producer → descriptor read、
+read完了 → Release consumer、Acquire consumer → slot reuseです。
+
+`FakeKernel<RING_SIZE, FRAME_COUNT>`は四ringとframe単位のfixed state arrayをinline所有します。
+Fill consume → RX publish → application RX consume → optional TX consume → Completion publish
+→ application completion consumeを追跡し、RX consume後は`AppOwned`、completion consume後は
+`Retired`を残します。wrong descriptor shape、zero/invalid packet length、別UMEM domain、
+frame alias、同generation duplicate、前段未完了のorder違反はringとfake stateを変更せず
+typed faultになります。fakeはengine、`PacketIo` adapter、socket、FFI、XDP attach、
+wakeup/pollを実装せず、token/domain constructorもX00A ledger/control-plane境界から移しません。
