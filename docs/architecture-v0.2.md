@@ -759,9 +759,9 @@ packet bytesをcloneしません。次の実I/O backendも同じlease contract�
 backend固有pointerをcoreへ漏らしません。
 
 `ruster-io-xdp`の最初のsliceは、native AF_XDP backendではなく、全targetでcompileできる
-pure-Rust ownership modelです。socket、ring、libxdp FFI、XDP program、core `PacketIo`
-adapterを持たず、`unsafe`をcrate全体で禁止します。従ってIO-009のreal generated backendは
-deferredのままです。
+pure-Rust ownership/ring modelです。socket、native ring、libxdp FFI、XDP program、core
+`PacketIo` adapterを持たず、`unsafe`をcrate全体で禁止します。従ってIO-009のreal generated
+backendはdeferredのままです。
 
 UMEMは固定長frameの集合として表現し、descriptor addressはUMEM相対値です。
 `FrameId`はaddressをframe sizeで正規化したindexだけをcanonical identityとし、packet data
@@ -800,3 +800,58 @@ canonicalizeされたdescriptorもentryとcounterを変更せずtyped errorで�
 ledgerはUMEMの全frame partitionを一workerが所有するため`!Send + !Sync`です。このpure modelは
 live byte sliceをまだ貸し出しませんが、将来のring/native engineも同じworker localityを維持
 するか、別設計の明示的ownership handoffを追加しなければなりません。
+
+### pure-Rust AF_XDP ring/fake model
+
+physical endpoint observationはadapterがinterface/queue/ring kindを自己申告して作る値では
+ありません。finite fakeが所有する`PhysicalEndpoint`のborrowed `EndpointHandle`だけが
+`RingObservation`を作れ、public constructorはありません。observationはendpoint identity、
+visibleなinterface index/queue、Fill/RX/TX/Completion kindをbindします。別endpointまたは
+別ring observationでsealされたsubmissionは、slot/cursor不変の`WrongRing`です。fake endpoint
+identityはcold pathのnonzero unique inputをconsumeし、Debugではredactします。native endpoint
+handleの作成は後続sliceです。
+
+`SpscRing<T, N>`はinline `[Option<ObservedSubmission<T>>; N]`だけを所有し、`N`はnonzero
+power-of-twoかつ`u32` representableでなければなりません。producer/consumer cursorは
+wrapping `u32`、occupancyは`producer.wrapping_sub(consumer) <= N`です。logical cursorから
+physical slotへの変換は`cursor & (N - 1)`で、wrap前後もFIFOを維持します。hot reserve、
+write、submit、acquire、peek、consume、cancelはheap allocation、shared lock、packet clone、
+packet単位Stringを使いません。
+
+producerはexact lengthをreserveし、各offsetを一度だけwriteした後でrange全体を
+`release_submit`します。writeはcursorをpublishせず、wrong ring、duplicate offset、
+range外offset、incomplete submitをtyped errorにします。unreleased reservationのDropと
+explicit cancelは書いたunpublished slotをすべてclearし、producer cursorを変えません。
+consumerはpublished rangeをacquireしてpeekし、`release_consume`で全slotを検証・clearしてから
+consumer cursorを進めます。Dropとexplicit cancelはslot/cursor不変です。Rust modelは
+`&mut` exclusionで逐次実行するためatomicをまだ持ちませんが、native mappingの順序契約は
+descriptor write → Release producer、Acquire producer → descriptor read、
+read完了 → Release consumer、Acquire consumer → slot reuseです。
+
+`FakeKernel<RING_SIZE, FRAME_COUNT>`は四ringと単一のauthoritative `FrameLedger`を所有します。
+constructorはledgerをconsumeし、そのUMEM domainとexact frame countへfake全体をbindします。
+callerはraw `FrameToken`/`RingDescriptor`をFill/TX ringへ投入できません。Fillは
+`FillReservation`、TXは`TxReservation`というledger stateから発行した用途別・move-only・
+public constructorなしのcapabilityだけをpublishできます。kernel側の次段もring consumeから
+得た`ConsumedFill`/`ConsumedTx`だけを受け取ります。四capabilityはfakeを排他的にborrowする
+guardです。未解決のFill/TX reservationをDropするとそれぞれFree/PendingTxへrollbackし、
+consumed Fill/TX guardは元ringのconsumer acquisitionを次段完了まで保持します。Dropは
+consumer cursor不変のin-place cancelとなり、descriptorをtailへ再送しません。従って
+`[A, B]`のAをDropしても次のacquireはAで、FIFOとexactly-once publicationを同時に保ちます。
+panic/early return後も同じkernel ownershipを再取得できます。RX/CQ acquisitionのDropも
+同じcursor/state不変のcancelです。
+
+各操作はdescriptor/ring capacityを先に検証してunpublished slotへwriteし、ledger transition
+成功後にcursorをpublishします。consumer側はrange全体のledger stateと重複を検証し、ring
+consume後に同じrangeのledger transitionを完了します。従ってgenerated leaseのFill利用、
+FillReserved tokenのTX利用、別domain capability、同generation二重publish、invalid descriptorは
+ring cursorとledger partitionを両方不変に保ち、正しいownerがretryできます。Fill publication
+→ kernel Fill consume → RX publication → application lease → TX stage/reserve/publication
+→ kernel TX consume → Completion publication → recycleの全段でledger countersとdeep auditが
+frame partition conservationを検証します。fakeのhot operationは四ringのinline storageと
+構築時だけallocateするledgerを使い、operation単位のallocationはありません。
+非TX leaseは明示recycleでき、PendingTxはleaseへrollback後にrecycleできます。lifecycle testの
+終端は四ringすべてempty、全frame Free、deep audit成功を要求します。
+
+fakeはengine、`PacketIo` adapter、socket、FFI、XDP attach、wakeup/pollを実装せず、
+token/domain constructorもX00A ledger/control-plane境界から移しません。
