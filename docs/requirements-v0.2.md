@@ -239,7 +239,7 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | R16A-002 deterministic parser/checksum/admission/resolution properties | security test infrastructure contract | `r16a_short_seed_matrix_is_deterministic` | implemented | dependency-free SplitMix64-v1、固定seed/budgetでproduction public APIをblack-box検証。parser/checksum oracleとadmission/resolution accounting modelはtest側で独立 |
 | R16A-003 fixed past-regression corpus | black-box regression contract | `r16a_past_regression_corpus_is_exact` | implemented | current-mainの固定input/expected 9件だけを保持し、prototype実装は再利用しない |
 | R16A-004 exact bounded failure replay | security test infrastructure contract | `r16a_failure_artifact_is_binary_jsonl_and_exactly_replayable` | implemented | private 0700の明示absolute directoryへ0600/create-newでbounded `.case`と1行JSONLを生成し、同一binary envelopeのexact replay commandを記録 |
-| R16A-005 explicit bounded smoke command | security test infrastructure contract | `r16a_bounded_smoke` | implemented | 手動または将来の専用jobから明示実行できるignored test。固定4 seed/target別case budget、または最大65536件の完全指定range/単一replay fileだけを許可。本PRはworkflowを追加せずrequired CI化を主張しない |
+| R16A-005 explicit bounded smoke command | security test infrastructure contract | `r16a_bounded_smoke` | implemented | `fuzz-smoke.yml`がPR/mainで固定4 seed/target別budgetを実行し、manual dispatchは最大65536件の完全指定rangeを許可。branch protection/rulesetのrequired status設定済みとは主張しない |
 
 ### R16A dependency-free seed runner
 
