@@ -1,12 +1,15 @@
-//! Versioned declarative configuration data transfer objects and exact parser.
+//! Versioned declarative configuration parsing and cold semantic validation.
 //!
-//! This crate deliberately stops at syntax. Semantic validation, normalization,
-//! publication generations, secret generation, planning, and apply belong to
-//! later control-plane stages.
+//! Parsing preserves the exact V1 source schema. Semantic validation resolves
+//! names, canonicalizes order-independent tables, synthesizes connected routes,
+//! and owns canonical core tables without minting a publication identity.
+//! Publication generations, fresh hash-key generation, planning, and apply
+//! belong to later control-plane stages.
 
 mod diagnostic;
 mod model;
 mod parse;
+mod validate;
 
 pub use diagnostic::{Diagnostic, DiagnosticCode, PathSegment, SourcePath};
 pub use model::{
@@ -19,4 +22,11 @@ pub use model::{
 pub use parse::{
     parse, MAX_ADDRESSES, MAX_CONFIG_BYTES, MAX_FIREWALL_RULES, MAX_INTERFACES, MAX_NEIGHBORS,
     MAX_ROUTES, SCHEMA_VERSION_V1,
+};
+pub use validate::{
+    validate, Icmpv4ErrorStorageShapeV1, InterfaceBindingV1, Nat44TcpStorageShapeV1,
+    Nat44UdpStorageShapeV1, ResolutionStorageShapeV1, RuntimeStorageShapeV1, TickBudgetsV1,
+    ValidatedConfig, ValidatedConfigV1, ValidatedFirewallV1, ValidatedIcmpv4ErrorV1,
+    ValidatedNat44TcpV1, ValidatedNat44UdpV1, ValidatedNat44V1, ValidatedResolutionV1,
+    ValidationCode, ValidationError, ValidationLimits,
 };

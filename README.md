@@ -15,7 +15,9 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
 - `ruster-config`: 最大1 MiBのUTF-8 TOMLをschema versionでpredispatchし、V1の
   interface/address/route/neighbor/NAT44/firewall/capacity/tick budget DTOへexact decode
   する。unknown/duplicate field、runtime生成値、過大listをvalue-freeなtyped diagnosticで
-  fail-closeする。semantic validation、normalize、plan/applyはまだ持たない。
+  fail-closeする。cold semantic validationはcanonicalなowned core値、connected route、
+  cross-reference/on-link検証、policy/NAT/firewall検証、全runtime storage shapeを作る。
+  publication identity、fresh secret、plan/applyはまだ持たない。
 - `ruster-core`: backend所有packetを借用し、Ethernet II / IPv4検証、LPM、
   TTL/checksum/MAC rewrite、local IPv4向けARP reply、static neighbor miss時の
   ARP Request生成action、fixed-capacity dynamic ARP cache、local ICMPv4 Echo
