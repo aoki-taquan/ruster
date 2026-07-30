@@ -421,7 +421,7 @@ fn invalid_echo_ipv4_sources_cannot_trigger_replies() {
             Ipv4Address::from_octets([192, 0, 2, 255]),
             DropReason::Ipv4SourceDirectedBroadcast,
         ),
-        (LOCAL_IP, DropReason::Icmpv4SourceNotUnicast),
+        (LOCAL_IP, DropReason::Ipv4SourceLocalAddress),
     ];
 
     for (source, reason) in invalid_sources {
@@ -460,7 +460,7 @@ fn echo_requires_unicast_source_mac_and_exact_local_destination_mac() {
         ),
         (
             [0x02, 0, 0, 0, 0, 9],
-            DropReason::Icmpv4EthernetDestinationNotLocal,
+            DropReason::EthernetDestinationNotLocal,
         ),
     ] {
         let mut frame = echo_request(&[], &[]);

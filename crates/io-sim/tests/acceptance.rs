@@ -103,7 +103,7 @@ fn frame_with_options(ttl: u8, payload: &[u8], options: &[u8]) -> Vec<u8> {
     let header_len = 20 + options.len();
     let total_len = header_len + payload.len();
     let mut bytes = vec![0_u8; ETHERNET_HEADER_LEN + total_len];
-    bytes[0..6].copy_from_slice(&ORIGINAL_DST_MAC);
+    bytes[0..6].copy_from_slice(&LAN_MAC.0);
     bytes[6..12].copy_from_slice(&ORIGINAL_SRC_MAC);
     bytes[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
     let ip = ETHERNET_HEADER_LEN;
@@ -180,7 +180,8 @@ fn ipv4_ingress_admission_matrix_is_typed_and_atomic() {
     ];
     let interfaces = [local_interface(), interface()];
     let neighbors = [gateway_neighbor()];
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
+    let bindings = [local_binding()];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
     let base = frame(64, &[]);
 
     let mut cases = Vec::new();
@@ -203,6 +204,7 @@ fn ipv4_ingress_admission_matrix_is_typed_and_atomic() {
             [0x01, 0, 0, 0, 0, 1],
             DropReason::Ipv4EthernetDestinationMulticast,
         ),
+        (ORIGINAL_DST_MAC, DropReason::EthernetDestinationNotLocal),
     ] {
         let mut packet = base.clone();
         packet[0..6].copy_from_slice(&destination);
@@ -214,6 +216,7 @@ fn ipv4_ingress_admission_matrix_is_typed_and_atomic() {
         ([224, 0, 0, 1], DropReason::Ipv4SourceMulticast),
         ([240, 0, 0, 1], DropReason::Ipv4SourceClassE),
         ([255; 4], DropReason::Ipv4SourceLimitedBroadcast),
+        (LOCAL_IPV4, DropReason::Ipv4SourceLocalAddress),
         ([192, 0, 2, 0], DropReason::Ipv4SourceNetworkAddress),
         ([192, 0, 2, 255], DropReason::Ipv4SourceDirectedBroadcast),
     ] {
@@ -252,6 +255,80 @@ fn ipv4_ingress_admission_matrix_is_typed_and_atomic() {
     assert_eq!(
         recycled.cause,
         RecycleCause::Forwarding(DropReason::Ipv4IngressInterfaceUnknown)
+    );
+    assert_eq!(recycled.bytes, original);
+}
+
+#[test]
+fn ethernet_ingress_exact_mac_and_arp_broadcast_exception_are_atomic() {
+    let interfaces = [local_interface(), interface()];
+    let bindings = [local_binding()];
+    let snapshot = arp_snapshot(&interfaces, &bindings);
+    let request = arp_frame(
+        1,
+        REQUESTER_IPV4,
+        LOCAL_IPV4,
+        REQUESTER_MAC,
+        REQUESTER_MAC,
+        [0; 6],
+        &[],
+    );
+
+    let mut wrong_unicast = request.clone();
+    wrong_unicast[0..6].copy_from_slice(&ROUTER_MAC.0);
+    assert_forwarding_drop(
+        wrong_unicast,
+        &snapshot,
+        DropReason::EthernetDestinationNotLocal,
+    );
+
+    for (source, reason) in [
+        ([0; 6], DropReason::ArpEthernetSourceZero),
+        ([0xff; 6], DropReason::ArpEthernetSourceBroadcast),
+        (
+            [0x01, 0, 0, 0, 0, 1],
+            DropReason::ArpEthernetSourceMulticast,
+        ),
+    ] {
+        let mut packet = request.clone();
+        packet[6..12].copy_from_slice(&source);
+        assert_forwarding_drop(packet, &snapshot, reason);
+    }
+    for (destination, reason) in [
+        ([0; 6], DropReason::ArpEthernetDestinationZero),
+        (
+            [0x01, 0, 0, 0, 0, 1],
+            DropReason::ArpEthernetDestinationMulticast,
+        ),
+    ] {
+        let mut packet = request.clone();
+        packet[0..6].copy_from_slice(&destination);
+        assert_forwarding_drop(packet, &snapshot, reason);
+    }
+
+    let mut io = SimIo::new();
+    io.inject(LAN, request);
+    let report = io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    assert_eq!((report.tx_requested, report.dropped), (1, 0));
+    assert_eq!(&io.pop_tx().unwrap().bytes[6..12], &LAN_MAC.0);
+
+    let unknown = arp_frame(
+        1,
+        REQUESTER_IPV4,
+        LOCAL_IPV4,
+        REQUESTER_MAC,
+        REQUESTER_MAC,
+        [0; 6],
+        &[],
+    );
+    let original = unknown.clone();
+    io.inject(IfId(99), unknown);
+    let report = io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    assert_eq!((report.tx_requested, report.dropped), (0, 1));
+    let recycled = io.pop_recycled().unwrap();
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Forwarding(DropReason::ArpIngressInterfaceUnknown)
     );
     assert_eq!(recycled.bytes, original);
 }
@@ -473,7 +550,13 @@ fn all_validation_and_decision_drops_are_granular_and_atomic() {
 
     let mut ethernet_type = frame(8, &[]);
     ethernet_type[12..14].copy_from_slice(&0x86dd_u16.to_be_bytes());
+    let mut vlan = frame(8, &[]);
+    vlan[12..14].copy_from_slice(&0x8100_u16.to_be_bytes());
+    let mut qinq = frame(8, &[]);
+    qinq[12..14].copy_from_slice(&0x88a8_u16.to_be_bytes());
     let mut ipv4_truncated = vec![0; ETHERNET_HEADER_LEN + 19];
+    ipv4_truncated[0..6].copy_from_slice(&LAN_MAC.0);
+    ipv4_truncated[6..12].copy_from_slice(&ORIGINAL_SRC_MAC);
     ipv4_truncated[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
     let mut version = frame(8, &[]);
     version[14] = 0x65;
@@ -492,6 +575,8 @@ fn all_validation_and_decision_drops_are_granular_and_atomic() {
     let cases = [
         (vec![0; 13], DropReason::EthernetHeaderTruncated),
         (ethernet_type, DropReason::UnsupportedEtherType),
+        (vlan, DropReason::UnsupportedEtherType),
+        (qinq, DropReason::UnsupportedEtherType),
         (ipv4_truncated, DropReason::Ipv4HeaderTruncated),
         (version, DropReason::Ipv4VersionUnsupported),
         (ihl, DropReason::Ipv4IhlTooSmall),

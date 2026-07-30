@@ -814,6 +814,9 @@ fn rfc1812_suppression_matrix_is_typed_and_byte_atomic() {
                     }
                 }
             }
+            Icmpv4TimeExceededDisposition::SourceIsLocal => {
+                Some(DropReason::Ipv4SourceLocalAddress)
+            }
             Icmpv4TimeExceededDisposition::DestinationMulticast => {
                 Some(DropReason::Ipv4DestinationMulticast)
             }

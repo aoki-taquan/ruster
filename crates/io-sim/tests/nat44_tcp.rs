@@ -123,7 +123,8 @@ fn tcp_frame(
     let tcp_len = 20 + options.len() + data.len();
     let total_len = 20 + tcp_len + ip_padding.len();
     let mut frame = vec![0_u8; 14 + total_len + 3];
-    frame[0..6].copy_from_slice(&LAN_MAC.0);
+    let ingress_mac = if source == HOST { LAN_MAC } else { WAN_MAC };
+    frame[0..6].copy_from_slice(&ingress_mac.0);
     frame[6..12].copy_from_slice(&HOST_MAC.0);
     frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
     frame[14] = 0x45;
@@ -171,7 +172,8 @@ fn udp_frame(
     destination_port: u16,
 ) -> Vec<u8> {
     let mut frame = vec![0_u8; 14 + 28];
-    frame[0..6].copy_from_slice(&LAN_MAC.0);
+    let ingress_mac = if source == HOST { LAN_MAC } else { WAN_MAC };
+    frame[0..6].copy_from_slice(&ingress_mac.0);
     frame[6..12].copy_from_slice(&HOST_MAC.0);
     frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
     frame[14] = 0x45;

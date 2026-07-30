@@ -23,7 +23,7 @@ const TARGET: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 1]);
 
 fn frame(destination: Ipv4Address) -> Vec<u8> {
     let mut bytes = vec![0_u8; ETHERNET_HEADER_LEN + 20];
-    bytes[0..6].copy_from_slice(&[0x02, 0, 0, 0, 0, 9]);
+    bytes[0..6].copy_from_slice(&[0x02, 0, 0, 0, 0, 1]);
     bytes[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 1]);
     bytes[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
     bytes[14] = 0x45;

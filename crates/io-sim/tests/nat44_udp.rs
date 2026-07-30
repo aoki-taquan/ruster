@@ -131,7 +131,12 @@ fn udp_frame(
     let udp_len = 8 + payload.len();
     let total_len = 20 + udp_len + ip_padding.len();
     let mut frame = vec![0_u8; 14 + total_len + 3];
-    frame[0..6].copy_from_slice(&LAN_MAC.0);
+    let ingress_mac = if source.octets()[0] == 10 {
+        LAN_MAC
+    } else {
+        WAN_MAC
+    };
+    frame[0..6].copy_from_slice(&ingress_mac.0);
     frame[6..12].copy_from_slice(&HOST_MAC.0);
     frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
     frame[14] = 0x45;
@@ -1085,7 +1090,7 @@ fn wrong_ingress_unrelated_traffic_and_icmp_are_explicitly_non_nat() {
     let mut ra = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut rs, &mut ra);
     let mut io = SimIo::new();
-    let wrong = udp_frame(
+    let mut wrong = udp_frame(
         REMOTE1,
         PUBLIC,
         53,
@@ -1096,6 +1101,7 @@ fn wrong_ingress_unrelated_traffic_and_icmp_are_explicitly_non_nat() {
         &[],
         UdpChecksum::Zero,
     );
+    wrong[0..6].copy_from_slice(&DMZ_MAC.0);
     io.inject(DMZ, wrong.clone());
     io.run_nat44_udp_once(
         1,
@@ -1354,7 +1360,7 @@ fn route_ttl_neighbor_and_reverse_authority_fail_before_nat_state() {
         &[],
         UdpChecksum::Zero,
     );
-    let spoof = udp_frame(
+    let mut spoof = udp_frame(
         REMOTE2,
         REMOTE1,
         40_000,
@@ -1365,6 +1371,7 @@ fn route_ttl_neighbor_and_reverse_authority_fail_before_nat_state() {
         &[],
         UdpChecksum::Zero,
     );
+    spoof[0..6].copy_from_slice(&LAN_MAC.0);
     let mut io = SimIo::new();
     for (packet, reason) in [
         (ttl, DropReason::Ipv4TtlExpired),

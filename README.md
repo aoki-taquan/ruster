@@ -56,15 +56,24 @@ staticまたはfresh dynamic neighborが無い場合はARPだけを開始し、�
 しません。generated outer IPv4は576 bytes以下、quoteは受信時IPv4 bytesを最大548 bytes
 所有し、link paddingを含みません。
 
-IPv4の構造とheader checksumを検証した直後、snapshotに存在しないingress、zero/group
-Ethernet source/destination、`0/8`、`127/8`、multicast、`240/4`のIPv4 source/destination、
-limited broadcastをstableなtyped reasonでbyte不変dropします。forward対象ではsourceと
-destinationのLPM-selected prefixに対するnetwork/directed-broadcastも拒否します。
+EtherTypeを読んだ直後、IPv4/ARPはsnapshot上の正確なingress interfaceを解決し、
+Ethernet sourceのzero/broadcast/multicastをstableなtyped reasonでbyte不変dropします。
+IPv4 destinationはそのingress interface MACとの完全一致を要求し、ARP destinationだけは
+完全一致またはexact broadcastを許可します。別interfaceのrouter MACを含むforeign unicast、
+ARP destinationのzero/multicastもprotocol parser、時刻・state・action mutationより前に
+拒否します。Ethernet sourceとARP SHAの一致は要求せず、individual unicast sourceは許可します。
+VLAN/QinQ (`0x8100`/`0x88a8`) はinner frameを解析せず`UnsupportedEtherType`です。
+
+IPv4の構造とheader checksumを検証した後、`0/8`、`127/8`、multicast、`240/4`の
+source/destination、limited broadcast、routerのいずれかのlocal IPv4を名乗るsourceを
+stableなtyped reasonでbyte不変dropします。forward対象ではsourceとdestinationの
+LPM-selected prefixに対するnetwork/directed-broadcastも拒否します。
 more-specific host routeを優先し、RFC 3021の`/31`とhost routeの`/32` endpointは許可します。
 このcommon admissionはNAT/FWの時刻・state・audit、resolution、ICMP error actionより前です。
-任意のunicast Ethernet destinationはforwardingでは許可し、router-local ICMPだけは後段で
-ingress interface MACとの完全一致を追加要求します。limited broadcastを転送しないRFC 1812
-§5.3.5.1の境界は実装済みですが、同節のlocal receptionはupper-layer delivery/BOOTP relayが
+同一interfaceへrouteされるpacketもこの正確なingress MAC admissionを通れば従来どおり
+forwardできます。generated ARP/ICMPはRX admissionを通らず、egress interfaceから正しい
+Ethernet sourceを組み立てます。limited broadcastを転送しないRFC 1812 §5.3.5.1の境界は
+実装済みですが、同節のlocal receptionはupper-layer delivery/BOOTP relayが
 未実装のためdropする明示deviationです。
 
 UDP NAT44は`forward_batch_with_nat44_udp`、またはgenerated ICMP errorも含む

@@ -169,7 +169,12 @@ fn udp_frame(
     let payload = [1_u8, 2, 3];
     let udp_len = 8 + payload.len();
     let mut frame = vec![0_u8; 14 + 20 + udp_len + 3];
-    frame[0..6].copy_from_slice(&WAN_MAC.0);
+    let ingress_mac = if source.octets()[0] == 10 {
+        LAN_MAC
+    } else {
+        WAN_MAC
+    };
+    frame[0..6].copy_from_slice(&ingress_mac.0);
     frame[6..12].copy_from_slice(&HOST_MAC.0);
     frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
     frame[14] = 0x45;
@@ -201,7 +206,12 @@ fn tcp_frame(
     flags_fragment: u16,
 ) -> Vec<u8> {
     let mut frame = vec![0_u8; 14 + 40 + 3];
-    frame[0..6].copy_from_slice(&WAN_MAC.0);
+    let ingress_mac = if source.octets()[0] == 10 {
+        LAN_MAC
+    } else {
+        WAN_MAC
+    };
+    frame[0..6].copy_from_slice(&ingress_mac.0);
     frame[6..12].copy_from_slice(&HOST_MAC.0);
     frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
     frame[14] = 0x45;
@@ -673,7 +683,8 @@ fn udp_pseudo_session_exact_reverse_checksum_df_and_padding_are_enforced() {
     .unwrap();
     assert_drop(&mut io, DropReason::FirewallDefaultDenied, &wrong);
 
-    let wrong_interface = udp_frame(REMOTE, HOST, 53, 12_345, 0, false);
+    let mut wrong_interface = udp_frame(REMOTE, HOST, 53, 12_345, 0, false);
+    wrong_interface[0..6].copy_from_slice(&LAN_MAC.0);
     io.inject(LAN, wrong_interface.clone());
     io.run_firewall_once(
         1,
@@ -3335,7 +3346,7 @@ fn ipv4_ingress_admission_precedes_nat_firewall_time_state_audit_and_actions() {
         let before_nat_counters = nat.counters();
         let before_resolution_counters = resolution.counters();
         let mut rejected = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
-        rejected[0] = 0x01;
+        rejected[0..6].copy_from_slice(&[0x02, 9, 9, 9, 9, 9]);
         let mut io = SimIo::new();
         io.inject(LAN, rejected.clone());
         io.run_nat44_udp_once(
@@ -3348,11 +3359,7 @@ fn ipv4_ingress_admission_precedes_nat_firewall_time_state_audit_and_actions() {
             &mut NoTrace,
         )
         .unwrap();
-        assert_drop(
-            &mut io,
-            DropReason::Ipv4EthernetDestinationMulticast,
-            &rejected,
-        );
+        assert_drop(&mut io, DropReason::EthernetDestinationNotLocal, &rejected);
         assert_eq!(nat.counters(), before_nat_counters);
         assert!(nat.mappings().iter().all(|slot| !slot.is_occupied()));
         assert!(nat.peers().iter().all(|slot| !slot.is_occupied()));
@@ -3450,9 +3457,9 @@ fn ipv4_ingress_admission_precedes_nat_firewall_time_state_audit_and_actions() {
         let before_resolution_counters = resolution.counters();
 
         let mut rejected_udp = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
-        rejected_udp[0..6].fill(0xff);
+        rejected_udp[0..6].copy_from_slice(&[0x02, 8, 8, 8, 8, 8]);
         let mut rejected_tcp = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0x4000);
-        rejected_tcp[30..34].copy_from_slice(&[240, 0, 0, 1]);
+        rejected_tcp[26..30].copy_from_slice(&LAN_LOCAL.octets());
         rewrite_ipv4_header(&mut rejected_tcp);
         let mut io = SimIo::new();
         io.inject(LAN, rejected_udp.clone());
@@ -3474,10 +3481,10 @@ fn ipv4_ingress_admission_precedes_nat_firewall_time_state_audit_and_actions() {
         .unwrap();
         assert_drop(
             &mut io,
-            DropReason::Ipv4EthernetDestinationBroadcast,
+            DropReason::EthernetDestinationNotLocal,
             &rejected_udp,
         );
-        assert_drop(&mut io, DropReason::Ipv4DestinationClassE, &rejected_tcp);
+        assert_drop(&mut io, DropReason::Ipv4SourceLocalAddress, &rejected_tcp);
         assert_eq!(udp.counters(), before_udp_counters);
         assert_eq!(tcp.counters(), before_tcp_counters);
         assert_eq!(firewall.counters(), before_firewall_counters);

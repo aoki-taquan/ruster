@@ -177,18 +177,23 @@ v0.2 bootstrapはEthernet II上のIPv4 datagramを転送します。
 - fragment offsetやMFに関係なく、このsliceはL4を参照しないためdatagramとして転送する。
 - TTLは1減算し、header checksumはRFC 1624のincremental updateで更新する。
 
-構造とIPv4 header checksumの検証後、NAT/FWのruntime/config参照、monotonic watermark、
-state、audit、resolution、ICMP error action、packet rewriteより前にcommon ingress admissionを
-行います。順序とstable reasonは次のとおりです。
+EtherTypeを読んだ直後、IPv4/ARPのprotocol parserより前にcommon Ethernet ingress admissionを
+行います。その後のIPv4構造/header checksum検証とIP admissionを含め、NAT/FWの
+runtime/config参照、monotonic watermark、state、audit、resolution、ICMP error action、
+packet rewriteより前に完了します。順序とstable reasonは次のとおりです。
 
 1. ingress `IfId`がsnapshotのinterfaceに存在すること。
-2. Ethernet source、destinationの順にzero、exact broadcast、multicast/groupを拒否すること。
-   forwardingのdestinationは任意のnonzero unicastを許可し、local ICMPだけ後段でingress MACとの
-   exact matchを追加要求する。
-3. IPv4 sourceは`0/8`、`127/8`、`224/4` multicast、`240/4` Class Eを拒否すること。
-4. IPv4 destinationはlimited broadcastを最優先で分類し、`0/8`、`127/8`、multicast、
+2. Ethernet sourceのzero、exact broadcast、multicast/groupを拒否すること。任意の
+   individual unicast sourceは許可し、sourceがrouter MACと同じ値であることだけでは拒否しない。
+3. IPv4 destinationはexact ingress interface MACだけを許可する。ARP destinationはexact
+   ingress interface MACまたはexact broadcastだけを許可し、zero、その他のgroup、
+   別interfaceのrouter MACを含むforeign unicastを拒否する。ARPではEthernet sourceとSHAの
+   一致を要求しない。
+4. IPv4 sourceはrouterのいずれかのlocal IPv4 address、`0/8`、`127/8`、`224/4` multicast、
+   `240/4` Class Eを拒否すること。
+5. IPv4 destinationはlimited broadcastを最優先で分類し、`0/8`、`127/8`、multicast、
    その他の`240/4`を拒否すること。
-5. read-only LPMで選んだsource prefixのnetwork/directed-broadcastを拒否する。nonlocal
+6. read-only LPMで選んだsource prefixのnetwork/directed-broadcastを拒否する。nonlocal
    destinationも同様に選択prefix境界を拒否し、そのRouteを後続処理で再利用する。
 
 RFC 1812 §§4.2.2.11, 5.3.4, 5.3.5, 5.3.7に基づくmartian/group境界です。BOOTP relayや
@@ -200,6 +205,10 @@ IPv4 local deliveryとBOOTP relayが無いためcommon admissionでdropしてお
 LPMはmore-specific routeを優先するため明示`/32` host routeが広いprefixの境界を上書きします。
 RFC 3021の`/31`と`/32`はnetwork/directed-broadcast分類から除外します。local destinationは
 forward destination境界判定を受けずStrong ES local処理へ進みますが、source admissionは共通です。
+同一interfaceをegressに選ぶrouteもexact ingress MACを満たせば通常どおりforwardします。
+generated ARP/ICMP frameはRX ingress admissionを通らず、生成時にegress interfaceのMACを
+使用します。VLAN/QinQ (`0x8100`/`0x88a8`) はinner EtherTypeを解析せず
+`UnsupportedEtherType`でbyte不変dropします。
 reserved IPv4 flagだけを理由にdropしない既存契約は維持します。
 
 ## ICMPv4 local control scope
@@ -351,6 +360,8 @@ byte不変でlocal consumeします。`received == tx_requested + dropped + cons
 unknown opcodeはhardening deviationとしてprofile validationでdropし、既存entryの
 MAC/refresh時刻やpending resolutionを変更しません。
 
+- RX Ethernet sourceはindividual unicast、destinationはingress interface MACまたはexact
+  broadcastを要求し、ARP parser/cache mergeより前にbyte不変dropする。
 - Ethernet destinationとTHAはrequest SHA、Ethernet sourceとSHAはlocal interface MAC。
 - SPAはrequest TPA、TPAはrequest SPA。ARP ProbeのSPA `0.0.0.0`にもTPA zeroでreplyする。
 - Probeは学習しない。GARP/Announcementは既存entryだけ更新し、absent keyをinsertしない。
@@ -634,7 +645,8 @@ packetはprobe最大2N、maintenanceも定数倍Nでstrict O(N)であり、expir
 staleとして拒否します。live evictionはありません。probe、maintenance shift/hash/scan、
 rule evaluation数はcounterで観測できます。
 
-common ingress admissionだけは、structural/header-checksum検証後にsourceとnonlocal destinationの
+common Ethernet ingress admissionはprotocol parserより前にexact ingress MACを検証します。
+続くIPv4 structural/header-checksum検証後のIP admissionだけは、sourceとnonlocal destinationの
 selected-prefix境界を分類するread-only LPMを行います。このlookupはbytes、watermark、state、
 audit、resolution、generated actionを変更せず、rejectionはICMP/ARPを一切生成しないsilent drop
 なのでwire-visibleなroute oracleを作りません。local `DropReason`だけが境界を区別します。
