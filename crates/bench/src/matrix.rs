@@ -138,14 +138,14 @@ impl Case {
     }
 
     const fn checksum_passes(self) -> u8 {
-        if !self.transport.checksum_enabled() {
-            0
-        } else {
-            match self.profile {
-                Profile::Plain => 0,
-                Profile::Nat | Profile::Firewall => 1,
-                Profile::Combined => 2,
-            }
+        match (self.profile, self.transport) {
+            (_, Transport::UdpZero)
+            | (Profile::Plain, Transport::UdpChecksum | Transport::Tcp)
+            | (Profile::Nat, Transport::UdpChecksum) => 0,
+            (Profile::Nat, Transport::Tcp)
+            | (Profile::Firewall, Transport::UdpChecksum | Transport::Tcp)
+            | (Profile::Combined, Transport::UdpChecksum) => 1,
+            (Profile::Combined, Transport::Tcp) => 2,
         }
     }
 }
@@ -1257,6 +1257,39 @@ mod tests {
                     };
                     assert!(result.is_ok(), "{}: {result:?}", case.label());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn checksum_pass_metadata_matches_full_transport_scans() {
+        let expectations = [
+            (Profile::Plain, Transport::UdpZero, 0),
+            (Profile::Plain, Transport::UdpChecksum, 0),
+            (Profile::Plain, Transport::Tcp, 0),
+            (Profile::Nat, Transport::UdpZero, 0),
+            (Profile::Nat, Transport::UdpChecksum, 0),
+            (Profile::Nat, Transport::Tcp, 1),
+            (Profile::Firewall, Transport::UdpZero, 0),
+            (Profile::Firewall, Transport::UdpChecksum, 1),
+            (Profile::Firewall, Transport::Tcp, 1),
+            (Profile::Combined, Transport::UdpZero, 0),
+            (Profile::Combined, Transport::UdpChecksum, 1),
+            (Profile::Combined, Transport::Tcp, 2),
+        ];
+        for (profile, transport, expected) in expectations {
+            for direction in Direction::ALL {
+                let case = Case {
+                    profile,
+                    transport,
+                    direction,
+                };
+                assert_eq!(
+                    case.checksum_passes(),
+                    expected,
+                    "{} metadata",
+                    case.label()
+                );
             }
         }
     }

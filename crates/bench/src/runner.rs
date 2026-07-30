@@ -88,10 +88,10 @@ impl fmt::Display for RunError {
                 write!(formatter, "{case} allocated {count} times in timed regions")
             }
             Self::UnexpectedBatchReport => {
-                formatter.write_str("plain forwarding returned an unexpected batch report")
+                formatter.write_str("benchmark forwarding returned an unexpected batch report")
             }
             Self::ForwardingOracle => {
-                formatter.write_str("plain forwarding output failed its untimed oracle")
+                formatter.write_str("benchmark forwarding output failed its untimed oracle")
             }
             Self::InvalidStatistics => formatter.write_str("sample statistics were invalid"),
         }
@@ -518,6 +518,18 @@ mod tests {
                 setup: Duration::from_nanos(8),
                 measured: Duration::from_nanos(3),
             })
+        );
+    }
+
+    #[test]
+    fn forwarding_errors_describe_all_benchmark_profiles() {
+        assert_eq!(
+            RunError::UnexpectedBatchReport.to_string(),
+            "benchmark forwarding returned an unexpected batch report"
+        );
+        assert_eq!(
+            RunError::ForwardingOracle.to_string(),
+            "benchmark forwarding output failed its untimed oracle"
         );
     }
 }
