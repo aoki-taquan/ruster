@@ -9,6 +9,23 @@
 
 use ruster_core::{ConsumeReason, DropReason, GeneratedPacketIo, IfId, PacketIo};
 
+/// Known ingress/egress used by reusable conformance cases.
+pub const CONFORMANCE_LAN: IfId = IfId(11);
+/// Second known ingress/egress used by reusable conformance cases.
+pub const CONFORMANCE_WAN: IfId = IfId(22);
+/// Interface deliberately absent from the backend's publication map.
+pub const CONFORMANCE_UNKNOWN: IfId = IfId(99);
+/// Required publication ring for [`CONFORMANCE_LAN`].
+pub const CONFORMANCE_LAN_ENDPOINT: TxEndpoint = TxEndpoint {
+    interface: CONFORMANCE_LAN,
+    queue: 3,
+};
+/// Required publication ring for [`CONFORMANCE_WAN`].
+pub const CONFORMANCE_WAN_ENDPOINT: TxEndpoint = TxEndpoint {
+    interface: CONFORMANCE_WAN,
+    queue: 7,
+};
+
 /// Backend frame identity plus an ownership-cycle generation.
 ///
 /// `frame_id` identifies physical storage, such as an AF_XDP UMEM frame.
@@ -47,7 +64,8 @@ pub struct TxEndpoint {
 
 /// Independent observer used while the I/O object is mutably borrowed.
 ///
-/// `bind` is called exactly when ownership of a generated allocation begins.
+/// `bind` is called exactly when ownership of an injected RX frame or a
+/// generated allocation begins.
 /// `observe` must return that existing binding and must never invent a new
 /// token for a terminal event.
 pub trait LeaseObserver {
@@ -133,9 +151,12 @@ pub trait RxHarness: Sized {
     fn inject_rx(&mut self, ingress: IfId, bytes: Vec<u8>) -> LiveFrame;
     fn set_rx_accept_budget(&mut self, budget: usize);
     fn pending_rx(&self) -> usize;
-    fn endpoint(&self, egress: IfId) -> Option<TxEndpoint>;
+    /// Drains observations from actual publication and reclamation rings.
+    ///
     /// Rejected/reclaimed events are already reusable; submitted events remain
-    /// in flight until a completion capability advances them.
+    /// in flight until a completion capability advances them. The endpoint of
+    /// a submitted event must identify the ring that received the descriptor,
+    /// not a value inferred from the requested egress afterward.
     fn drain_rx_events(&mut self) -> Vec<RxEvent>;
 }
 
@@ -148,7 +169,7 @@ pub trait RxFinishErrorHarness: RxHarness {
 }
 
 pub trait RxCompletionHarness: RxHarness {
-    /// Advances backend-observed completions for previously submitted tokens.
+    /// Advances CQ-observed completions for previously submitted tokens.
     fn complete_rx_submissions(&mut self) -> Vec<TxCompletion>;
 }
 
@@ -159,9 +180,16 @@ pub trait RxFinitePoolHarness: RxHarness {
     fn free_rx_frames(&self) -> usize;
 }
 
-pub trait RxUnknownEgressHarness: RxHarness {
-    /// Returns an interface that has no backend TX endpoint or ring.
-    fn unknown_rx_egress(&self) -> IfId;
+pub trait RxUnknownEgressHarness: RxHarness {}
+
+pub trait RxCqPoolHarness: RxCompletionHarness + RxFinitePoolHarness {
+    /// Reserves the named physical frame from the real free pool for RX.
+    fn inject_rx_from_free_frame(
+        &mut self,
+        frame_id: u64,
+        ingress: IfId,
+        bytes: Vec<u8>,
+    ) -> LiveFrame;
 }
 
 pub trait GeneratedHarness: Sized {
@@ -173,9 +201,12 @@ pub trait GeneratedHarness: Sized {
     fn set_generated_allocation_budget(&mut self, budget: usize);
     fn set_generated_max_frame(&mut self, max_frame: usize);
     fn set_generated_accept_budget(&mut self, budget: usize);
-    fn endpoint(&self, egress: IfId) -> Option<TxEndpoint>;
+    /// Drains observations from actual publication and reclamation rings.
+    ///
     /// Rejected/reclaimed events are already reusable; submitted events remain
-    /// in flight until a completion capability advances them.
+    /// in flight until a completion capability advances them. The endpoint of
+    /// a submitted event must identify the ring that received the descriptor,
+    /// not a value inferred from the requested egress afterward.
     fn drain_generated_events(&mut self) -> Vec<GeneratedEvent>;
 }
 
@@ -184,7 +215,7 @@ pub trait GeneratedFinishErrorHarness: GeneratedHarness {
 }
 
 pub trait GeneratedCompletionHarness: GeneratedHarness {
-    /// Advances backend-observed completions for previously submitted tokens.
+    /// Advances CQ-observed completions for previously submitted tokens.
     fn complete_generated_submissions(&mut self) -> Vec<TxCompletion>;
 }
 
@@ -194,9 +225,11 @@ pub trait GeneratedFinitePoolHarness: GeneratedHarness {
     fn free_generated_frames(&self) -> usize;
 }
 
-pub trait GeneratedUnknownEgressHarness: GeneratedHarness {
-    /// Returns an interface that has no backend TX endpoint or ring.
-    fn unknown_generated_egress(&self) -> IfId;
+pub trait GeneratedUnknownEgressHarness: GeneratedHarness {}
+
+pub trait GeneratedCqPoolHarness: GeneratedCompletionHarness + GeneratedFinitePoolHarness {
+    /// Makes the next allocation select the named physical free frame.
+    fn prefer_generated_frame(&mut self, frame_id: u64);
 }
 
 pub mod rx {
@@ -205,18 +238,21 @@ pub mod rx {
     use ruster_core::{ConsumeReason, DropReason, IfId, PacketBatch, PacketIo};
 
     use super::{
-        BufferToken, LeaseObserver, LiveFrame, RxCompletionHarness, RxEvent, RxEventKind,
-        RxFinishErrorHarness, RxFinitePoolHarness, RxHarness, RxReceiveErrorHarness, RxReclaim,
-        RxUnknownEgressHarness, TxEndpoint,
+        BufferToken, LeaseObserver, LiveFrame, RxCompletionHarness, RxCqPoolHarness, RxEvent,
+        RxEventKind, RxFinishErrorHarness, RxFinitePoolHarness, RxHarness, RxReceiveErrorHarness,
+        RxReclaim, RxUnknownEgressHarness, TxEndpoint, CONFORMANCE_LAN, CONFORMANCE_LAN_ENDPOINT,
+        CONFORMANCE_UNKNOWN, CONFORMANCE_WAN, CONFORMANCE_WAN_ENDPOINT,
     };
 
-    const LAN: IfId = IfId(11);
-    const WAN: IfId = IfId(22);
+    const LAN: IfId = CONFORMANCE_LAN;
+    const WAN: IfId = CONFORMANCE_WAN;
 
-    fn expected_endpoint<H: RxHarness>(harness: &H, egress: IfId) -> TxEndpoint {
-        harness
-            .endpoint(egress)
-            .expect("known conformance endpoint")
+    fn expected_endpoint(egress: IfId) -> TxEndpoint {
+        match egress {
+            LAN => CONFORMANCE_LAN_ENDPOINT,
+            WAN => CONFORMANCE_WAN_ENDPOINT,
+            _ => panic!("unknown conformance endpoint"),
+        }
     }
 
     fn assert_distinct_live(frames: &[LiveFrame]) {
@@ -325,7 +361,7 @@ pub mod rx {
 
     pub fn commit_is_submitted_in_place_with_exact_descriptor<H: RxHarness>() {
         let mut harness = H::new();
-        let endpoint = expected_endpoint(&harness, WAN);
+        let endpoint = expected_endpoint(WAN);
         let injected = harness.inject_rx(LAN, vec![0x10, 0x20, 0x30]);
         let completion = {
             let (io, observer) = harness.io_and_observer();
@@ -405,7 +441,7 @@ pub mod rx {
     pub fn partial_reject_reclaims_exact_tokens<H: RxHarness>() {
         let mut harness = H::new();
         harness.set_rx_accept_budget(1);
-        let endpoint = expected_endpoint(&harness, WAN);
+        let endpoint = expected_endpoint(WAN);
         let injected = [
             harness.inject_rx(LAN, vec![1, 0x41]),
             harness.inject_rx(LAN, vec![2, 0x42]),
@@ -518,7 +554,7 @@ pub mod rx {
 
     pub fn completion_advances_the_exact_submitted_token<H: RxCompletionHarness>() {
         let mut harness = H::new();
-        let endpoint = expected_endpoint(&harness, WAN);
+        let endpoint = expected_endpoint(WAN);
         let injected = harness.inject_rx(LAN, vec![0x71, 0x72]);
         {
             let (io, observer) = harness.io_and_observer();
@@ -547,11 +583,22 @@ pub mod rx {
         let mut harness = H::new();
         harness.set_rx_accept_budget(0);
         let baseline = harness.free_rx_frames();
+        let mut last_generation = BTreeMap::<u64, u64>::new();
         for cycle in 0_u8..4 {
             let injected = [
                 harness.inject_rx(LAN, vec![cycle, 1]),
                 harness.inject_rx(LAN, vec![cycle, 2]),
             ];
+            for frame in injected {
+                if let Some(previous) =
+                    last_generation.insert(frame.token.frame_id, frame.token.generation)
+                {
+                    assert!(
+                        frame.token.generation > previous,
+                        "reused RX frame did not advance ownership generation"
+                    );
+                }
+            }
             assert_eq!(harness.free_rx_frames() + injected.len(), baseline);
             {
                 let (io, observer) = harness.io_and_observer();
@@ -577,8 +624,7 @@ pub mod rx {
 
     pub fn unknown_egress_is_rejected_without_submission<H: RxUnknownEgressHarness>() {
         let mut harness = H::new();
-        let unknown = harness.unknown_rx_egress();
-        assert!(harness.endpoint(unknown).is_none());
+        let unknown = CONFORMANCE_UNKNOWN;
         let injected = harness.inject_rx(LAN, vec![0x81]);
         let completion = {
             let (io, observer) = harness.io_and_observer();
@@ -602,6 +648,78 @@ pub mod rx {
             }
         );
     }
+
+    pub fn cq_return_releases_same_rx_frame_with_new_generation<H: RxCqPoolHarness>() {
+        let mut harness = H::new();
+        harness.set_rx_accept_budget(1);
+        let baseline = harness.free_rx_frames();
+        assert!(baseline >= 1);
+        let first = harness.inject_rx(LAN, vec![0x91, 0x92]);
+        assert_eq!(harness.free_rx_frames() + 1, baseline);
+        {
+            let (io, observer) = harness.io_and_observer();
+            let mut batch = match io.receive(1) {
+                Ok(batch) => batch,
+                Err(_) => panic!("RX receive failed"),
+            };
+            let mut packet = batch.next_packet().expect("RX lease");
+            assert_eq!(observer.observe(packet.bytes_mut()), first);
+            packet.commit(WAN);
+            assert_eq!(batch.finish().tx_accepted, 1);
+        }
+        let events = harness.drain_rx_events();
+        assert_event_bindings(&[first], &events);
+        assert_eq!(
+            events[0].kind,
+            RxEventKind::TxSubmitted {
+                endpoint: expected_endpoint(WAN),
+                descriptor_len: first.requested_len,
+            }
+        );
+        assert_eq!(
+            harness.free_rx_frames() + 1,
+            baseline,
+            "submitted RX frame returned before CQ observation"
+        );
+        assert_eq!(
+            harness.complete_rx_submissions(),
+            [super::TxCompletion {
+                frame: first,
+                endpoint: expected_endpoint(WAN),
+            }]
+        );
+        assert_eq!(
+            harness.free_rx_frames(),
+            baseline,
+            "CQ-observed RX frame was not returned to the free pool"
+        );
+
+        let second = harness.inject_rx_from_free_frame(first.token.frame_id, LAN, vec![0x93, 0x94]);
+        assert_eq!(second.token.frame_id, first.token.frame_id);
+        assert!(
+            second.token.generation > first.token.generation,
+            "CQ-returned RX frame reused a stale generation"
+        );
+        assert_eq!(harness.free_rx_frames() + 1, baseline);
+        {
+            let (io, observer) = harness.io_and_observer();
+            let mut batch = match io.receive(1) {
+                Ok(batch) => batch,
+                Err(_) => panic!("RX receive failed"),
+            };
+            let mut packet = batch.next_packet().expect("re-leased RX frame");
+            assert_eq!(observer.observe(packet.bytes_mut()), second);
+            packet.recycle(DropReason::RouteMiss);
+            assert_eq!(batch.finish().recycled, 1);
+        }
+        assert_eq!(harness.free_rx_frames(), baseline);
+        let events = harness.drain_rx_events();
+        assert_event_bindings(&[second], &events);
+        assert_eq!(
+            events[0].kind,
+            RxEventKind::Reclaimed(RxReclaim::Recycled(DropReason::RouteMiss))
+        );
+    }
 }
 
 pub mod generated {
@@ -610,18 +728,22 @@ pub mod generated {
     use ruster_core::{GeneratedAllocationError, GeneratedPacketBatch, GeneratedPacketIo, IfId};
 
     use super::{
-        BufferToken, GeneratedCompletionHarness, GeneratedEvent, GeneratedEventKind,
-        GeneratedFinishErrorHarness, GeneratedFinitePoolHarness, GeneratedHarness,
-        GeneratedReclaim, GeneratedUnknownEgressHarness, LeaseObserver, LiveFrame, TxEndpoint,
+        BufferToken, GeneratedCompletionHarness, GeneratedCqPoolHarness, GeneratedEvent,
+        GeneratedEventKind, GeneratedFinishErrorHarness, GeneratedFinitePoolHarness,
+        GeneratedHarness, GeneratedReclaim, GeneratedUnknownEgressHarness, LeaseObserver,
+        LiveFrame, TxEndpoint, CONFORMANCE_LAN, CONFORMANCE_LAN_ENDPOINT, CONFORMANCE_UNKNOWN,
+        CONFORMANCE_WAN, CONFORMANCE_WAN_ENDPOINT,
     };
 
-    const LAN: IfId = IfId(11);
-    const WAN: IfId = IfId(22);
+    const LAN: IfId = CONFORMANCE_LAN;
+    const WAN: IfId = CONFORMANCE_WAN;
 
-    fn expected_endpoint<H: GeneratedHarness>(harness: &H, egress: IfId) -> TxEndpoint {
-        harness
-            .endpoint(egress)
-            .expect("known conformance endpoint")
+    fn expected_endpoint(egress: IfId) -> TxEndpoint {
+        match egress {
+            LAN => CONFORMANCE_LAN_ENDPOINT,
+            WAN => CONFORMANCE_WAN_ENDPOINT,
+            _ => panic!("unknown conformance endpoint"),
+        }
     }
 
     fn assert_distinct_live(frames: &[LiveFrame]) {
@@ -741,7 +863,7 @@ pub mod generated {
         let mut harness = H::new();
         harness.set_generated_max_frame(64);
         harness.set_generated_allocation_budget(3);
-        let endpoint = expected_endpoint(&harness, WAN);
+        let endpoint = expected_endpoint(WAN);
         let mut live = Vec::new();
         let completion = {
             let (io, observer) = harness.io_and_observer();
@@ -806,7 +928,7 @@ pub mod generated {
         let mut harness = H::new();
         harness.set_generated_allocation_budget(3);
         harness.set_generated_accept_budget(1);
-        let endpoint = expected_endpoint(&harness, WAN);
+        let endpoint = expected_endpoint(WAN);
         let mut live = Vec::new();
         let completion = {
             let (io, observer) = harness.io_and_observer();
@@ -855,8 +977,8 @@ pub mod generated {
         let mut harness = H::new();
         harness.set_generated_allocation_budget(1);
         let expected = [
-            (LAN, expected_endpoint(&harness, LAN), 1_u8),
-            (WAN, expected_endpoint(&harness, WAN), 2_u8),
+            (LAN, expected_endpoint(LAN), 1_u8),
+            (WAN, expected_endpoint(WAN), 2_u8),
         ];
         let mut live = Vec::new();
         for (egress, _, marker) in expected {
@@ -916,7 +1038,7 @@ pub mod generated {
     pub fn completion_advances_the_exact_submitted_token<H: GeneratedCompletionHarness>() {
         let mut harness = H::new();
         harness.set_generated_allocation_budget(1);
-        let endpoint = expected_endpoint(&harness, WAN);
+        let endpoint = expected_endpoint(WAN);
         let frame = {
             let (io, observer) = harness.io_and_observer();
             let mut batch = io.begin_generated(WAN);
@@ -980,8 +1102,7 @@ pub mod generated {
     pub fn unknown_egress_is_rejected_without_submission<H: GeneratedUnknownEgressHarness>() {
         let mut harness = H::new();
         harness.set_generated_allocation_budget(1);
-        let unknown = harness.unknown_generated_egress();
-        assert!(harness.endpoint(unknown).is_none());
+        let unknown = CONFORMANCE_UNKNOWN;
         let frame = {
             let (io, observer) = harness.io_and_observer();
             let mut batch = io.begin_generated(unknown);
@@ -1003,4 +1124,78 @@ pub mod generated {
             }
         );
     }
+
+    pub fn cq_return_releases_same_generated_frame_with_new_generation<
+        H: GeneratedCqPoolHarness,
+    >() {
+        let mut harness = H::new();
+        harness.set_generated_allocation_budget(1);
+        harness.set_generated_accept_budget(1);
+        let baseline = harness.free_generated_frames();
+        assert!(baseline >= 1);
+        let first = {
+            let (io, observer) = harness.io_and_observer();
+            let mut batch = io.begin_generated(WAN);
+            let mut packet = batch.allocate(60).expect("generated allocation");
+            packet.bytes_mut().fill(0xb1);
+            let frame = observer.bind(packet.bytes_mut(), 60);
+            packet.commit();
+            assert_eq!(batch.finish().accepted, 1);
+            frame
+        };
+        let events = harness.drain_generated_events();
+        assert_event_bindings(&[first], &events);
+        assert_eq!(
+            events[0].kind,
+            GeneratedEventKind::TxSubmitted {
+                endpoint: expected_endpoint(WAN),
+                descriptor_len: first.requested_len,
+            }
+        );
+        assert_eq!(
+            harness.free_generated_frames() + 1,
+            baseline,
+            "submitted generated frame returned before CQ observation"
+        );
+        assert_eq!(
+            harness.complete_generated_submissions(),
+            [super::TxCompletion {
+                frame: first,
+                endpoint: expected_endpoint(WAN),
+            }]
+        );
+        assert_eq!(
+            harness.free_generated_frames(),
+            baseline,
+            "CQ-observed generated frame was not returned to the free pool"
+        );
+
+        harness.prefer_generated_frame(first.token.frame_id);
+        harness.set_generated_allocation_budget(1);
+        let second = {
+            let (io, observer) = harness.io_and_observer();
+            let mut batch = io.begin_generated(WAN);
+            let mut packet = batch.allocate(60).expect("re-leased generated frame");
+            packet.bytes_mut().fill(0xb2);
+            let frame = observer.bind(packet.bytes_mut(), 60);
+            packet.cancel();
+            assert_eq!(batch.finish().cancelled, 1);
+            frame
+        };
+        assert_eq!(second.token.frame_id, first.token.frame_id);
+        assert!(
+            second.token.generation > first.token.generation,
+            "CQ-returned generated frame reused a stale generation"
+        );
+        assert_eq!(harness.free_generated_frames(), baseline);
+        let events = harness.drain_generated_events();
+        assert_event_bindings(&[second], &events);
+        assert_eq!(
+            events[0].kind,
+            GeneratedEventKind::Reclaimed(GeneratedReclaim::Cancelled)
+        );
+    }
 }
+
+#[cfg(test)]
+mod finite_fake_tests;

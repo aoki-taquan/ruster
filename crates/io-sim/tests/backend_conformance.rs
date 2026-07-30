@@ -4,6 +4,7 @@ use ruster_io_conformance::{
     generated, rx, BufferToken, GeneratedCompletionHarness, GeneratedEvent, GeneratedEventKind,
     GeneratedFinishErrorHarness, GeneratedHarness, GeneratedReclaim, LeaseObserver, LiveFrame,
     RxCompletionHarness, RxEvent, RxEventKind, RxHarness, RxReclaim, TxCompletion, TxEndpoint,
+    CONFORMANCE_LAN, CONFORMANCE_LAN_ENDPOINT, CONFORMANCE_WAN, CONFORMANCE_WAN_ENDPOINT,
 };
 use ruster_io_sim::{FrameOrigin, GeneratedRecycleCause, RecycleCause, SimIo};
 
@@ -64,10 +65,14 @@ struct SimHarness {
 }
 
 impl SimHarness {
-    fn endpoint(egress: ruster_core::IfId) -> TxEndpoint {
-        TxEndpoint {
-            interface: egress,
-            queue: 0,
+    fn publication_endpoint(egress: ruster_core::IfId) -> TxEndpoint {
+        match egress {
+            CONFORMANCE_LAN => CONFORMANCE_LAN_ENDPOINT,
+            CONFORMANCE_WAN => CONFORMANCE_WAN_ENDPOINT,
+            _ => TxEndpoint {
+                interface: egress,
+                queue: u32::MAX,
+            },
         }
     }
 }
@@ -104,16 +109,12 @@ impl RxHarness for SimHarness {
         self.io.pending_rx()
     }
 
-    fn endpoint(&self, egress: ruster_core::IfId) -> Option<TxEndpoint> {
-        Some(Self::endpoint(egress))
-    }
-
     fn drain_rx_events(&mut self) -> Vec<RxEvent> {
         let mut events = Vec::new();
         while let Some(frame) = self.io.pop_tx() {
             assert!(matches!(frame.origin, FrameOrigin::Received { .. }));
             let identity = self.observer.observe(&frame.bytes);
-            let endpoint = Self::endpoint(frame.egress);
+            let endpoint = Self::publication_endpoint(frame.egress);
             self.rx_completions.push(TxCompletion {
                 frame: identity,
                 endpoint,
@@ -144,7 +145,7 @@ impl RxHarness for SimHarness {
                     let attempted_egress = capture.rejected_egress.expect("sim rejected TX egress");
                     RxEventKind::TxRejected {
                         attempted_egress,
-                        endpoint: Some(Self::endpoint(attempted_egress)),
+                        endpoint: Some(Self::publication_endpoint(attempted_egress)),
                     }
                 }
                 RecycleCause::LeaseAbandoned => {
@@ -164,6 +165,8 @@ impl RxHarness for SimHarness {
 }
 
 impl RxCompletionHarness for SimHarness {
+    // Sim has no hardware CQ. This capability models the same logical
+    // completion boundary while keeping submission and completion distinct.
     fn complete_rx_submissions(&mut self) -> Vec<TxCompletion> {
         let completions = std::mem::take(&mut self.rx_completions);
         for completion in &completions {
@@ -197,16 +200,12 @@ impl GeneratedHarness for SimHarness {
         self.io.set_generated_accept_budget(budget);
     }
 
-    fn endpoint(&self, egress: ruster_core::IfId) -> Option<TxEndpoint> {
-        Some(Self::endpoint(egress))
-    }
-
     fn drain_generated_events(&mut self) -> Vec<GeneratedEvent> {
         let mut events = Vec::new();
         while let Some(frame) = self.io.pop_tx() {
             assert_eq!(frame.origin, FrameOrigin::Generated);
             let identity = self.observer.observe(&frame.bytes);
-            let endpoint = Self::endpoint(frame.egress);
+            let endpoint = Self::publication_endpoint(frame.egress);
             self.generated_completions.push(TxCompletion {
                 frame: identity,
                 endpoint,
@@ -232,7 +231,7 @@ impl GeneratedHarness for SimHarness {
                 }
                 GeneratedRecycleCause::TxRejected => GeneratedEventKind::TxRejected {
                     attempted_egress: frame.egress,
-                    endpoint: Some(Self::endpoint(frame.egress)),
+                    endpoint: Some(Self::publication_endpoint(frame.egress)),
                 },
             };
             events.push(GeneratedEvent {
@@ -253,6 +252,8 @@ impl GeneratedFinishErrorHarness for SimHarness {
 }
 
 impl GeneratedCompletionHarness for SimHarness {
+    // Sim has no hardware CQ. This capability models the same logical
+    // completion boundary while keeping submission and completion distinct.
     fn complete_generated_submissions(&mut self) -> Vec<TxCompletion> {
         let completions = std::mem::take(&mut self.generated_completions);
         for completion in &completions {
