@@ -15,6 +15,19 @@ pub trait PublicationQuiescenceWitness: quiescence_guard_sealed::Sealed {
     type Backend;
 }
 
+/// Whether packet I/O may continue after a publication-quiescence failure.
+///
+/// Backends must select `ContinueOldIo` only when the failure prevents an
+/// authority change but cannot conflict with another operation using the
+/// current publication. Unknown failures are conservatively treated as
+/// [`Self::SkipIo`] by [`PublicationQuiescence`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PublicationQuiescenceDisposition {
+    ContinueOldIo,
+    SkipIo,
+    Stop,
+}
+
 /// Exclusive, worker-local proof that one exact backend is quiescent.
 ///
 /// The guard deliberately exposes no backend operations. Holding it only
@@ -91,6 +104,10 @@ impl<Backend> PublicationQuiescenceWitness for PublicationQuiescenceGuard<'_, Ba
 /// that exact backend exclusively. Implementing this trait does not by itself
 /// claim an AF_XDP completion-queue drain; each backend must define and prove
 /// its own authoritative completion boundary.
+/// [`Self::quiescence_error_disposition`] separately determines whether the
+/// old publication can safely perform another local operation. The default
+/// skips packet I/O, so adding a new error cannot accidentally become
+/// re-entrant.
 ///
 /// A scalar cannot be substituted for the exact borrow:
 ///
@@ -133,6 +150,14 @@ pub trait PublicationQuiescence: Sized {
         Self: 'backend;
 
     fn try_publication_quiescence(&mut self) -> Result<Self::Guard<'_>, Self::Error>;
+
+    /// Classifies whether the current publication may continue packet I/O.
+    ///
+    /// The default is fail-closed for backends whose error taxonomy has not
+    /// proved that an error is compatible with another local operation.
+    fn quiescence_error_disposition(_error: &Self::Error) -> PublicationQuiescenceDisposition {
+        PublicationQuiescenceDisposition::SkipIo
+    }
 }
 
 pub trait PacketIo {
@@ -313,7 +338,29 @@ impl<E> BatchCompletion<E> {
 
 #[cfg(test)]
 mod tests {
-    use super::BatchCompletion;
+    use super::{
+        BatchCompletion, PublicationQuiescence, PublicationQuiescenceDisposition,
+        PublicationQuiescenceGuard,
+    };
+
+    struct UnclassifiedBackend;
+
+    impl PublicationQuiescence for UnclassifiedBackend {
+        type Error = ();
+        type Guard<'backend> = PublicationQuiescenceGuard<'backend, Self>;
+
+        fn try_publication_quiescence(&mut self) -> Result<Self::Guard<'_>, Self::Error> {
+            Err(())
+        }
+    }
+
+    #[test]
+    fn unclassified_quiescence_error_skips_io_by_default() {
+        assert_eq!(
+            UnclassifiedBackend::quiescence_error_disposition(&()),
+            PublicationQuiescenceDisposition::SkipIo
+        );
+    }
 
     #[test]
     fn batch_completion_invariant_is_exact_even_with_error() {

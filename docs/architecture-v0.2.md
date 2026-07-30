@@ -331,7 +331,10 @@ accepted TX completion待ちをboundedな所有状態から検査し、成功時
 推測してclearせず、terminal commit/recycle/consume/cancel/abandonだけがlease countを減らします。
 runtimeはopaqueな`I::Guard<'_>`をcandidateと一緒にpublicationへmoveし、publication callが戻って
 guardがdropされた後にだけactive viewとpacket I/Oへ進みます。quiescence failureはcandidateを
-publicationへ渡さないtyped `Deferred`であり、旧active generationのtickは継続します。
+publicationへ渡さないtyped `Deferred`です。backendはerrorごとに`ContinueOldIo`、`SkipIo`、
+`Stop`を返し、未知errorのdefaultは`SkipIo`です。Simのaccepted TX completion待ちだけは旧active
+generationでI/Oを継続し、unfinished batchまたはterminal未完了leaseは旧activeを保持したまま
+RX、resolution timer、failure dispatch、generated ARP/ICMPの全data phaseをskipします。
 candidateなしのsteady tickはquiescence checkを行いません。Simのaccepted TX output queueを明示
 completionする有限modelは、forgotten batch/leaseをsticky busyにする保守的実装であり、AF_XDP
 CQ drainやnative backend quiescenceを実装済みとは主張しません。
