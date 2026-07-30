@@ -1,7 +1,50 @@
 use ruster_core::{
-    DirectoryBucket, DirectoryNode, Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpIndexStorage,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpRuntime, PortOwnerSlot,
+    DirectoryBucket, DirectoryNode, Nat44TcpConfig, Nat44TcpHashKey, Nat44TcpIndexStorage,
+    Nat44TcpMappingSlot, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpHashKey,
+    Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpRuntime, PortOwnerSlot,
 };
+
+#[allow(dead_code)]
+pub fn tcp_runtime<'a>(
+    config: Nat44TcpConfig,
+    mappings: &'a mut [Nat44TcpMappingSlot],
+    sessions: &'a mut [Nat44TcpSessionSlot],
+) -> Nat44TcpRuntime<'a> {
+    let mapping_bucket_count = if mappings.is_empty() {
+        0
+    } else {
+        mappings.len().next_power_of_two()
+    };
+    let session_bucket_count = if sessions.is_empty() {
+        0
+    } else {
+        sessions.len().next_power_of_two()
+    };
+    let mapping_buckets =
+        Box::leak(vec![DirectoryBucket::default(); mapping_bucket_count].into_boxed_slice());
+    let mapping_nodes =
+        Box::leak(vec![DirectoryNode::default(); mappings.len()].into_boxed_slice());
+    let session_buckets =
+        Box::leak(vec![DirectoryBucket::default(); session_bucket_count].into_boxed_slice());
+    let session_nodes =
+        Box::leak(vec![DirectoryNode::default(); sessions.len()].into_boxed_slice());
+    let port_count = usize::from(config.last_port() - config.first_port()) + 1;
+    let port_owners = Box::leak(vec![PortOwnerSlot::default(); port_count].into_boxed_slice());
+    Nat44TcpRuntime::new(
+        config,
+        mappings,
+        sessions,
+        Nat44TcpIndexStorage::new(
+            mapping_buckets,
+            mapping_nodes,
+            session_buckets,
+            session_nodes,
+            port_owners,
+        ),
+        Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0).unwrap(),
+    )
+    .unwrap()
+}
 
 pub struct UdpTestIndexes {
     mapping_buckets: Vec<DirectoryBucket>,

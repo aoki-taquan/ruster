@@ -3,10 +3,9 @@ mod support;
 use ruster_core::{
     internet_checksum, ipv4_header_checksum, rfc1624_update, DropReason, ForwardingSnapshot, IfId,
     Interface, Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44TcpConfig,
-    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Neighbor, NoTrace, ResolutionActionSlot,
-    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent,
-    NAT44_TCP_DEFAULT_IDLE_TTL_MS,
+    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot,
+    Nat44UdpPeerSlot, Nat44UdpPolicy, Neighbor, NoTrace, ResolutionActionSlot, ResolutionPolicy,
+    ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent, NAT44_TCP_DEFAULT_IDLE_TTL_MS,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 use support::UdpTestIndexes;
@@ -235,7 +234,7 @@ fn assert_external_non_transport_boundary_isolated(
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 2];
     let mut actions = [ResolutionActionSlot::EMPTY; 2];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -337,7 +336,7 @@ fn syn_synack_and_data_translate_bidirectionally_in_one_batch() {
     let config = config(&snapshot, 40_000, 40_010);
     let mut mappings = [Nat44TcpMappingSlot::default(); 2];
     let mut sessions = [Nat44TcpSessionSlot::default(); 4];
-    let mut nat = Nat44TcpRuntime::new(config, &mut mappings, &mut sessions);
+    let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -449,7 +448,7 @@ fn eim_reuses_mapping_but_filter_is_exact_remote_endpoint() {
     let config = config(&snapshot, 40_000, 40_000);
     let mut mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut sessions = [Nat44TcpSessionSlot::default(); 2];
-    let mut nat = Nat44TcpRuntime::new(config, &mut mappings, &mut sessions);
+    let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -518,7 +517,7 @@ fn combined_udp_tcp_realms_keep_protocol_state_and_ports_independent() {
     .unwrap();
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut udp_mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut udp_peers = [Nat44UdpPeerSlot::default(); 1];
     let mut udp_indexes = UdpTestIndexes::new(udp_config, udp_mappings.len(), udp_peers.len());
@@ -590,7 +589,7 @@ fn combined_realm_mismatch_fails_closed_without_cross_state() {
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -715,7 +714,7 @@ fn combined_realm_mismatch_non_tcp_udp_outbound_is_isolated_and_fail_closed() {
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -813,7 +812,7 @@ fn matching_combined_non_tcp_udp_outbound_fails_before_neighbor_without_nat_stat
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 2];
     let mut actions = [ResolutionActionSlot::EMPTY; 2];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -896,7 +895,7 @@ fn only_initial_syn_creates_and_fin_rst_only_refresh_idle_lifetime() {
     let config = config(&snapshot, 40_000, 40_000);
     let mut mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut nat = Nat44TcpRuntime::new(config, &mut mappings, &mut sessions);
+    let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -981,7 +980,7 @@ fn exact_idle_boundary_bidirectional_refresh_and_unmatched_no_refresh() {
     assert_eq!(config.policy().idle_ttl_ms(), NAT44_TCP_DEFAULT_IDLE_TTL_MS);
     let mut mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut nat = Nat44TcpRuntime::new(config, &mut mappings, &mut sessions);
+    let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -1058,7 +1057,7 @@ fn malformed_checksum_fragment_source_zero_and_options_are_atomic() {
     let config = config(&snapshot, 40_000, 40_000);
     let mut mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut nat = Nat44TcpRuntime::new(config, &mut mappings, &mut sessions);
+    let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -1110,7 +1109,7 @@ fn icmp_crossing_fails_closed_without_touching_tcp_clock_or_state() {
     let config = config(&snapshot, 40_000, 40_000);
     let mut mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut nat = Nat44TcpRuntime::new(config, &mut mappings, &mut sessions);
+    let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -1156,7 +1155,7 @@ fn backend_reject_retains_tx_requested_mapping_and_session() {
     let config = config(&snapshot, 40_000, 40_000);
     let mut mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut nat = Nat44TcpRuntime::new(config, &mut mappings, &mut sessions);
+    let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -1296,7 +1295,7 @@ fn incremental_tcp_checksum_keeps_mathematical_zero_on_wire() {
     let config = config(&snapshot, 40_001, 40_001);
     let mut mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut nat = Nat44TcpRuntime::new(config, &mut mappings, &mut sessions);
+    let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -1355,7 +1354,7 @@ fn a_deliberately_valid_zero_tcp_checksum_field_is_accepted() {
     let config = config(&snapshot, 40_000, 40_000);
     let mut mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut nat = Nat44TcpRuntime::new(config, &mut mappings, &mut sessions);
+    let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);

@@ -122,14 +122,20 @@ multi-public、port randomization/parity、full packet filterはdeferredで、RF
 引用UDP/TCP IPv4 headerもreserved flagをfragment判定から除外し、reserved以外は
 DF=1/MF=0/offset=0を要求します。引用reserved flagはtuple rewrite後も保存します。
 
-TCP NAT44は別のcaller-backed mapping/session storageを持ち、UDPと同じ数値public portを
-独立して使用できます。mappingはinternal TCP tupleのEndpoint-Independent Mapping、filterは
+TCP NAT44は別のcaller-backed mapping/session storage、両keyed directory、direct
+public-port ownerを持ち、UDPと同じ数値public portを独立して使用できます。freshなTCP専用
+redacted keyとgeneration+lifecycle epochでstale authorityを遮断します。mappingはinternal
+TCP tupleのEndpoint-Independent Mapping、filterは
 remote IPv4とremote TCP portのexact matchです。新規sessionはoutbound SYN=1かつ
 ACK/RST/FIN=0だけが作成し、既存sessionではSYN-ACK、data、FIN、RSTを含むvalid packetを
 双方向に変換します。TCP header/options/dataを含むIPv4 payload全体のchecksumをstate更新前に
 検証し、address/port rewrite後もRFC 1624で更新します。TCPでは算術結果zeroもwire zeroの
 ままです。TCPもreserved flagをfragment判定から除外してwireへ保存し、reserved以外は
 DF=1/MF=0/offset=0を要求します。
+
+outbound lookupはmapping/session/port pool capacityをそれぞれ最大1回だけ調べる
+additive `O(M+S+P)`、inboundとquoted ICMPはdirect owner後にexact sessionだけを調べます。
+mapping再生成時は旧sessionを全走査せずgeneration+epochでlazyに無効化します。
 
 TCP session idle TTLはdefault/minimumともに2時間4分です。sequence/window/ACK妥当性は追跡
 せず、FIN/RSTもsessionを削除・短縮せず通常のsuccessful TX requestとしてTTLだけをrefresh
