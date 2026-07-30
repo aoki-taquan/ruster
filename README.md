@@ -24,6 +24,9 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
   stateful forward firewallを扱う。
 - `ruster-io-sim`: rootやNICなしでRX/generated TXのFIFO、budget、TX/drop、
   traceを決定的に検証する。
+- `ruster-io-afpacket`: Linux AF_PACKET/TPACKET_V3 backendのchecked configuration、
+  fixed IfId mapping、ring ownership/UAPI scaffold。現時点ではPacketIo RX/TXを未接続。
+  copy/zero-copy modeや実NIC throughputを主張する段階ではない。
 - `ruster-io-xdp`: AF_XDP native接続より前に固定するpure-Rust ownership model。
   UMEM layout、descriptor境界、nonzero generation token、frame state ledger、
   fixed-storage ring、authoritative ledgerと結合したfinite fake kernelを持つ。socket、
