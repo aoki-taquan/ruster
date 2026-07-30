@@ -116,6 +116,94 @@ impl fmt::Display for AbiLayoutError {
 
 impl Error for AbiLayoutError {}
 
+/// Failure while binding a checked ring layout to caller-owned mapped bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RingMapError {
+    /// The kernel-reported layout was invalid.
+    Layout(AbiLayoutError),
+    /// The borrowed mapping does not cover every checked field.
+    MappingTooShort {
+        /// Minimum byte length computed from the checked layout.
+        required: usize,
+        /// Actual borrowed byte length.
+        actual: usize,
+    },
+    /// A field address is misaligned even though its relative offset is aligned.
+    MisalignedFieldAddress {
+        /// Misaligned field.
+        field: RingField,
+        /// Required alignment.
+        alignment: usize,
+    },
+    /// Adding a checked field offset to the mapping base address overflowed.
+    FieldAddressOverflow {
+        /// Field whose process address overflowed.
+        field: RingField,
+    },
+}
+
+impl From<AbiLayoutError> for RingMapError {
+    fn from(value: AbiLayoutError) -> Self {
+        Self::Layout(value)
+    }
+}
+
+impl fmt::Display for RingMapError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for RingMapError {}
+
+/// Native SPSC ring operation failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeRingError {
+    /// A reservation or acquisition must contain at least one entry.
+    ZeroLength,
+    /// The requested range exceeds the configured ring capacity.
+    LengthExceedsCapacity,
+    /// The producer has insufficient free entries.
+    RingFull,
+    /// The consumer has insufficient published entries.
+    RingEmpty,
+    /// Published cursor distance exceeds the configured capacity.
+    CorruptCursor {
+        /// Producer cursor observed from shared memory.
+        producer: u32,
+        /// Consumer cursor observed from shared memory.
+        consumer: u32,
+        /// Checked ring capacity.
+        capacity: u32,
+    },
+    /// The reservation was submitted before every descriptor was written.
+    IncompleteReservation {
+        /// Reserved entry count.
+        reserved: u32,
+        /// Entries written before submission.
+        written: u32,
+    },
+    /// The acquisition was consumed before every descriptor was read.
+    IncompleteAcquisition {
+        /// Acquired entry count.
+        acquired: u32,
+        /// Entries read before consumption.
+        read: u32,
+    },
+    /// The caller attempted to write or read beyond its fixed range.
+    RangeExhausted,
+    /// The kernel exposed ring flag bits outside the reviewed v6.8 profile.
+    UnsupportedRingFlags(u32),
+}
+
+impl fmt::Display for NativeRingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for NativeRingError {}
+
 /// Native platform support failure detected before any syscall.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlatformError {

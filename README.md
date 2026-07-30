@@ -37,8 +37,11 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
   native ring、FFI、core `PacketIo`接続はまだ持たない。
 - `ruster-io-xdp-native`: Linux v6.8 AF_XDP UAPIのC layout、raw flag profile、
   2048/4096-byte aligned UMEMと固定256-byte kernel headroomを含むring geometry、
-  kernel報告mmap offsetをcold pathで検証するnative scaffold。socket、mmap、ring access、
-  libxdp link、core `PacketIo`接続はまだ持たず、crate全体で`unsafe`をdenyする。
+  kernel報告mmap offsetをcold pathで検証するnative scaffold。caller-owned mappingを
+  排他的にborrowするFill/TX producerとRX/Completion consumerは、wrapping cursor、
+  Acquire/Release publication、need-wakeup flagをallocationなしで扱う。socket、OS mmap作成、
+  UMEM登録、libxdp link、core `PacketIo`接続はまだ持たず、pointer accessはprivateな
+  `native_unsafe` moduleだけに閉じる。
 - `ruster-runtime`: genericなpublication seamから一つのactive generationを借用し、
   `RX → resolution timer → failure dispatch → generated ARP → generated ICMPv4`を
   明示budget付きのsingle-worker tickとして実行する。
