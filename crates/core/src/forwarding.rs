@@ -1191,7 +1191,7 @@ pub fn forward_batch_with_firewall<B, T>(
     snapshot: &ForwardingSnapshot<'_>,
     resolution: &mut ResolutionRuntime<'_>,
     config: &FirewallConfig<'_>,
-    firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
     now: MonotonicMillis,
     trace: &mut T,
 ) -> BatchReport<B::Error>
@@ -1225,7 +1225,7 @@ pub fn forward_batch_with_firewall_audited<B, T>(
     snapshot: &ForwardingSnapshot<'_>,
     resolution: &mut ResolutionRuntime<'_>,
     config: &FirewallConfig<'_>,
-    firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
     audit: &mut FirewallAuditBuffer<'_>,
     now: MonotonicMillis,
     trace: &mut T,
@@ -1261,7 +1261,7 @@ pub fn forward_batch_with_firewall_and_icmpv4_errors<B, T>(
     resolution: &mut ResolutionRuntime<'_>,
     icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
     config: &FirewallConfig<'_>,
-    firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
     now: MonotonicMillis,
     trace: &mut T,
 ) -> BatchReport<B::Error>
@@ -1295,7 +1295,7 @@ pub fn forward_batch_with_firewall_and_icmpv4_errors_audited<B, T>(
     resolution: &mut ResolutionRuntime<'_>,
     icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
     config: &FirewallConfig<'_>,
-    firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
     audit: &mut FirewallAuditBuffer<'_>,
     now: MonotonicMillis,
     trace: &mut T,
@@ -1333,7 +1333,7 @@ pub fn forward_batch_with_nat44_udp_and_tcp_and_firewall<B, T>(
     tcp_config: &Nat44TcpConfig,
     nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: &FirewallConfig<'_>,
-    firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
     now: MonotonicMillis,
     trace: &mut T,
 ) -> BatchReport<B::Error>
@@ -1371,7 +1371,7 @@ pub fn forward_batch_with_nat44_udp_and_tcp_and_firewall_audited<B, T>(
     tcp_config: &Nat44TcpConfig,
     nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: &FirewallConfig<'_>,
-    firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
     audit: &mut FirewallAuditBuffer<'_>,
     now: MonotonicMillis,
     trace: &mut T,
@@ -1412,7 +1412,7 @@ pub fn forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors<B, T>
     tcp_config: &Nat44TcpConfig,
     nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: &FirewallConfig<'_>,
-    firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
     now: MonotonicMillis,
     trace: &mut T,
 ) -> BatchReport<B::Error>
@@ -1449,7 +1449,7 @@ pub fn forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_audit
     tcp_config: &Nat44TcpConfig,
     nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: &FirewallConfig<'_>,
-    firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
     audit: &mut FirewallAuditBuffer<'_>,
     now: MonotonicMillis,
     trace: &mut T,
@@ -1485,7 +1485,7 @@ fn forward_batch_inner<B, T>(
     nat44_tcp_config: Option<&Nat44TcpConfig>,
     mut nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
-    mut firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    mut firewall: Option<&mut FirewallRuntime<'_>>,
     mut firewall_audit: Option<&mut FirewallAuditBuffer<'_>>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
@@ -1671,7 +1671,7 @@ fn decide<T: TraceSink>(
     nat44_tcp_config: Option<&Nat44TcpConfig>,
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
-    firewall: &mut Option<&mut FirewallRuntime<'_, '_>>,
+    firewall: &mut Option<&mut FirewallRuntime<'_>>,
     firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
@@ -1794,7 +1794,7 @@ fn decide_ipv4<T: TraceSink>(
     nat44_tcp_config: Option<&Nat44TcpConfig>,
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
-    firewall: &mut Option<&mut FirewallRuntime<'_, '_>>,
+    firewall: &mut Option<&mut FirewallRuntime<'_>>,
     firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
@@ -2051,6 +2051,7 @@ fn decide_ipv4<T: TraceSink>(
             ipv4,
             firewall_validated.expect("forward firewall packet was preflight validated"),
             None,
+            config,
             runtime,
             firewall_audit,
             nat_now.0,
@@ -2309,7 +2310,7 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
     now: MonotonicMillis,
     combined_realm_mismatch: bool,
-    related_firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    related_firewall: Option<&mut FirewallRuntime<'_>>,
     firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
@@ -2866,12 +2867,13 @@ fn plan_firewall(
     ipv4: packet::ValidatedIpv4,
     validated: ValidatedFirewallTransport,
     canonical: Option<FirewallPacket>,
-    runtime: &mut FirewallRuntime<'_, '_>,
+    config: &FirewallConfig<'_>,
+    runtime: &mut FirewallRuntime<'_>,
     audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
     now_ms: u64,
 ) -> Result<FirewallPlan, DropReason> {
     let packet = firewall_packet(ingress, egress, ipv4, validated, canonical);
-    match runtime.plan_packet(packet, now_ms) {
+    match runtime.plan_packet(config, packet, now_ms) {
         Ok(plan) => {
             if let Some(audit) = audit.as_deref_mut() {
                 audit.record(packet, plan.disposition());
@@ -2935,11 +2937,11 @@ fn plan_firewall(
     }
 }
 
-fn require_firewall_runtime<'runtime, 'rules, 'state>(
+fn require_firewall_runtime<'runtime, 'state>(
     snapshot: &ForwardingSnapshot<'_>,
     config: &FirewallConfig<'_>,
-    runtime: &'runtime mut Option<&mut FirewallRuntime<'rules, 'state>>,
-) -> Result<&'runtime mut FirewallRuntime<'rules, 'state>, DropReason> {
+    runtime: &'runtime mut Option<&mut FirewallRuntime<'state>>,
+) -> Result<&'runtime mut FirewallRuntime<'state>, DropReason> {
     if !config.authority_matches(snapshot) {
         if let Some(runtime) = runtime.as_deref_mut() {
             runtime.record_config_mismatch();
@@ -2949,7 +2951,7 @@ fn require_firewall_runtime<'runtime, 'rules, 'state>(
     let Some(runtime) = runtime.as_deref_mut() else {
         return Err(FirewallRuntimeUnavailable);
     };
-    if !runtime.config().identity_matches(*config) {
+    if !runtime.config_matches(config) {
         runtime.record_config_mismatch();
         return Err(FirewallConfigMismatch);
     }
@@ -3188,7 +3190,7 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
     config: &Nat44UdpConfig,
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
-    firewall: &mut Option<&mut FirewallRuntime<'_, '_>>,
+    firewall: &mut Option<&mut FirewallRuntime<'_>>,
     firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
     firewall_validated: Option<ValidatedFirewallTransport>,
     firewall_plan: &mut Option<FirewallPlan>,
@@ -3272,6 +3274,7 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
             ipv4,
             firewall_validated.expect("inbound firewall packet was preflight validated"),
             Some(firewall_packet),
+            firewall_config,
             firewall_runtime,
             firewall_audit,
             now.0,
@@ -3469,7 +3472,7 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
     config: &Nat44TcpConfig,
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
-    firewall: &mut Option<&mut FirewallRuntime<'_, '_>>,
+    firewall: &mut Option<&mut FirewallRuntime<'_>>,
     firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
     firewall_validated: Option<ValidatedFirewallTransport>,
     firewall_plan: &mut Option<FirewallPlan>,
@@ -3556,6 +3559,7 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
             ipv4,
             firewall_validated.expect("inbound firewall packet was preflight validated"),
             Some(firewall_packet),
+            firewall_config,
             firewall_runtime,
             firewall_audit,
             now.0,
