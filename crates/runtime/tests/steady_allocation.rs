@@ -3,6 +3,9 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+#[cfg(target_pointer_width = "64")]
+use std::mem::size_of;
+
 use ruster_core::{
     FirewallConfig, FirewallHashKey, FirewallPolicy, FirewallRuntime, ForwardingSnapshot,
     GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedTraceSink, Icmpv4ErrorActionSlot,
@@ -52,6 +55,11 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 struct Publication<'view, 'storage> {
+    active_calls: usize,
+    semantic_validation_calls: usize,
+    fingerprint_calls: usize,
+    hash_calls: usize,
+    slice_scan_calls: usize,
     snapshot: &'view ForwardingSnapshot<'storage>,
     resolution: &'view mut ResolutionRuntime<'storage>,
     icmpv4_errors: &'view mut Icmpv4ErrorRuntime<'storage>,
@@ -65,12 +73,17 @@ impl<'view, 'storage> FullServicePublication<'storage> for Publication<'view, 's
     type Reject = ();
 
     fn publish_candidate(&mut self, _candidate: Self::Candidate) -> Result<(), Self::Reject> {
+        self.semantic_validation_calls += 1;
+        self.fingerprint_calls += 1;
+        self.hash_calls += 1;
+        self.slice_scan_calls += 1;
         Ok(())
     }
 
     fn active(&mut self) -> Option<FullServiceView<'_, 'storage>> {
+        self.active_calls += 1;
         Some(FullServiceView {
-            snapshot: self.snapshot,
+            snapshot: *self.snapshot,
             resolution: self.resolution,
             icmpv4_errors: self.icmpv4_errors,
             udp_config: self.udp_config,
@@ -110,7 +123,7 @@ impl GeneratedIcmpv4TraceSink for NoTrace {
 }
 
 #[test]
-fn active_zero_budget_steady_tick_allocates_nothing() {
+fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
     const LAN: IfId = IfId(1);
     const WAN: IfId = IfId(2);
     const PUBLIC: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 10]);
@@ -191,6 +204,11 @@ fn active_zero_budget_steady_tick_allocates_nothing() {
         &mut icmp_actions,
     );
     let mut publication = Publication {
+        active_calls: 0,
+        semantic_validation_calls: 0,
+        fingerprint_calls: 0,
+        hash_calls: 0,
+        slice_scan_calls: 0,
         snapshot: &snapshot,
         resolution: &mut resolution,
         icmpv4_errors: &mut icmpv4_errors,
@@ -201,17 +219,33 @@ fn active_zero_budget_steady_tick_allocates_nothing() {
     let mut io = SimIo::new();
     let mut trace = NoTrace;
 
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert_eq!(size_of::<ForwardingSnapshot<'static>>(), 144);
+        assert_eq!(size_of::<FirewallConfig<'static>>(), 160);
+        assert_eq!(size_of::<Nat44UdpConfig>(), 112);
+        assert_eq!(size_of::<Nat44TcpConfig>(), 112);
+        assert!(size_of::<FullServiceView<'static, 'static>>() <= 576);
+    }
+
     let before = ALLOCATIONS.load(Ordering::Relaxed);
-    let report = run_tick(
-        &mut publication,
-        None,
-        &mut io,
-        MonotonicMillis(0),
-        TickBudgets::default(),
-        &mut trace,
-    );
+    for tick in 0..1_024 {
+        let report = run_tick(
+            &mut publication,
+            None,
+            &mut io,
+            MonotonicMillis(tick),
+            TickBudgets::default(),
+            &mut trace,
+        );
+        assert!(report.active);
+    }
     let after = ALLOCATIONS.load(Ordering::Relaxed);
 
-    assert!(report.active);
+    assert_eq!(publication.active_calls, 1_024);
+    assert_eq!(publication.semantic_validation_calls, 0);
+    assert_eq!(publication.fingerprint_calls, 0);
+    assert_eq!(publication.hash_calls, 0);
+    assert_eq!(publication.slice_scan_calls, 0);
     assert_eq!(after - before, 0);
 }

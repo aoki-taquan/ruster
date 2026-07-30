@@ -313,9 +313,16 @@ active viewがなければRXを開始せず、残りの全phaseを`NoActivePubli
 resolution、generated ICMP captureのfull composition wrapperだけを使用します。
 `active`はO(1)のsteady-tick borrowであり、semantic validation、fingerprint/hash計算、slice scan、
 allocationを繰り返しません。これらはcandidate構築・publicationのcold pathで完了します。
-validated NAT/firewall config identityは`Copy`値としてviewへ渡し、publication adapterに
-一時config値への参照を返させません。snapshotとmutable runtime storageだけがview lifetimeで
-borrowされます。
+validated snapshotとNAT/firewall config identityは`Copy`値としてviewへ渡し、publication
+adapterに一時値への参照を返させません。snapshot内sliceとfirewall rulesのborrowはactive
+adapter borrowと同じview lifetimeへ短縮し、mutable runtime storageもそのtick-local viewだけが
+exclusiveにreborrowします。`FullServiceView`自身は`Copy`/`Clone`にせず、viewをtick外へescape
+させません。このsnapshot by-value化はpre-1.0 APIの意図したsource breakであり、旧
+`snapshot: &ForwardingSnapshot` struct literalを使うdownstream adapterは値copyへ更新します。
+64-bit buildではsnapshot 144 bytes、Firewall config 160 bytes、UDP/TCP NAT configは各112
+bytesで、full view全体を576 bytes以下に保ちます。1024 tickの回帰fixtureは各tickの`active`
+呼出しがexactly once、heap allocationとvalidation/fingerprint/hash/slice scan再実行がzeroで
+あることを固定します。
 
 `TickBudgets`はRX packet数、resolution timer scan、failure dispatch scan、generated ARP action、
 generated ICMPv4 actionを独立に制限します。RX batchはlexical scopeでwrapperへmoveし、

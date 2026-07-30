@@ -15,15 +15,59 @@ use ruster_core::{
 
 /// All immutable authority and mutable worker-local state required by the
 /// full UDP/TCP NAT44, firewall, resolution, and generated ICMP composition.
+///
+/// The immutable snapshot and validated configs are copied into each
+/// tick-local view. Their borrowed slices are shortened to `'view`, so neither
+/// immutable authority nor mutable runtime state can escape the borrow of the
+/// publication adapter. `FullServiceView` deliberately remains move-only:
+///
+/// ```compile_fail
+/// use ruster_runtime::FullServiceView;
+///
+/// fn move_twice(view: FullServiceView<'_, '_>) {
+///     let first = view;
+///     let second = view;
+///     drop((first, second));
+/// }
+/// ```
+///
+/// It is not clonable either:
+///
+/// ```compile_fail
+/// use ruster_runtime::FullServiceView;
+///
+/// fn clone_view(view: FullServiceView<'_, '_>) {
+///     let _copy = view.clone();
+/// }
+/// ```
+///
+/// An active view also cannot be widened beyond the adapter borrow:
+///
+/// ```compile_fail
+/// use ruster_runtime::{FullServicePublication, FullServiceView};
+///
+/// fn escape<'storage, P>(
+///     publication: &mut P,
+/// ) -> FullServiceView<'static, 'storage>
+/// where
+///     P: FullServicePublication<'storage>,
+/// {
+///     publication.active().expect("active publication")
+/// }
+/// ```
+///
+/// This by-value layout is a pre-1.0 source break from the earlier
+/// `&ForwardingSnapshot` field. Downstream adapters construct the view with a
+/// copied `ForwardingSnapshot` and may need to update struct literals.
 pub struct FullServiceView<'view, 'storage> {
-    pub snapshot: &'view ForwardingSnapshot<'storage>,
+    pub snapshot: ForwardingSnapshot<'view>,
     pub resolution: &'view mut ResolutionRuntime<'storage>,
     pub icmpv4_errors: &'view mut Icmpv4ErrorRuntime<'storage>,
     pub udp_config: Nat44UdpConfig,
     pub nat44_udp: Option<&'view mut Nat44UdpRuntime<'storage>>,
     pub tcp_config: Nat44TcpConfig,
     pub nat44_tcp: Option<&'view mut Nat44TcpRuntime<'storage>>,
-    pub firewall_config: FirewallConfig<'storage>,
+    pub firewall_config: FirewallConfig<'view>,
     pub firewall: Option<&'view mut FirewallRuntime<'storage>>,
 }
 
@@ -37,8 +81,8 @@ pub struct FullServiceView<'view, 'storage> {
 /// `active` is a steady-tick O(1) borrow: it must not repeat semantic
 /// validation, fingerprinting, hashing, slice scans, or allocation. Those
 /// cold-path operations belong to candidate construction/publication.
-/// Validated NAT and firewall configs are copied into the view by value so an
-/// adapter never has to return references to temporary config values.
+/// The validated snapshot and NAT/firewall configs are copied into the view by
+/// value so an adapter never has to return references to temporary values.
 pub trait FullServicePublication<'storage> {
     type Candidate;
     type Reject;
@@ -574,7 +618,7 @@ where
         Ok(batch) => {
             let report = forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors(
                 batch,
-                snapshot,
+                &snapshot,
                 resolution,
                 icmpv4_errors,
                 &udp_config,
@@ -632,7 +676,7 @@ where
         let report = match dispatch_host_unreachable_failures(
             resolution,
             icmpv4_errors,
-            snapshot,
+            &snapshot,
             now,
             budgets.failure_dispatch_scans,
             trace,
@@ -746,7 +790,7 @@ mod tests {
         fn active(&mut self) -> Option<FullServiceView<'_, 'storage>> {
             self.active_calls += 1;
             self.enabled.then_some(FullServiceView {
-                snapshot: self.snapshot,
+                snapshot: *self.snapshot,
                 resolution: self.resolution,
                 icmpv4_errors: self.icmpv4_errors,
                 udp_config: self.udp_config,
