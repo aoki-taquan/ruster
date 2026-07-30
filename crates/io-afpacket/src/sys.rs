@@ -9,8 +9,9 @@ use std::{
 use crate::{
     boundary::{ColdRingMetadata, CombinedRingExtents},
     BlockDescriptor, Errno, MappingAccessError, OwnershipError, PacketDescriptor, PlatformError,
-    RingKind, RingLayout, RxBlockModel, RxOwnership, SyscallStage, UapiLayout, ValidatedPort,
-    TPACKET_ALIGNMENT,
+    PortTable, RingKind, RingLayout, RxBlockModel, RxOwnership, SyscallStage, TxOwnership,
+    UapiLayout, ValidatedConfig, ValidatedPort, TPACKET_ALIGNMENT, TPACKET_V3_TX_DATA_OFFSET,
+    TP_STATUS_AVAILABLE, TP_STATUS_SENDING, TP_STATUS_SEND_REQUEST, TP_STATUS_WRONG_FORMAT,
 };
 
 const AF_PACKET: c_int = 17;
@@ -25,6 +26,7 @@ const ETH_P_ALL: u16 = 0x0003;
 const PROT_READ: c_int = 1;
 const PROT_WRITE: c_int = 2;
 const MAP_SHARED: c_int = 1;
+const MSG_DONTWAIT: c_int = 0x40;
 
 const _: [(); 0] = [(); crate::TP_STATUS_KERNEL as usize];
 const _: [(); 1] = [(); crate::TP_STATUS_USER as usize];
@@ -202,6 +204,8 @@ pub(crate) trait PacketOps: Clone {
 
     fn map(&mut self, fd: RawFd, len: usize) -> Result<NonNull<u8>, PlatformError>;
 
+    fn kick(&mut self, fd: RawFd) -> Result<(), PlatformError>;
+
     fn unmap(&mut self, base: NonNull<u8>, len: usize);
 
     fn close(&mut self, fd: RawFd);
@@ -292,6 +296,17 @@ impl PacketOps for LinuxOps {
         Ok(base)
     }
 
+    fn kick(&mut self, fd: RawFd) -> Result<(), PlatformError> {
+        // SAFETY: a zero-length send does not dereference the null payload.
+        // MSG_DONTWAIT makes this a bounded notification attempt.
+        let result = unsafe { send(fd, std::ptr::null(), 0, MSG_DONTWAIT) };
+        if result < 0 {
+            Err(last_error(SyscallStage::Kick))
+        } else {
+            Ok(())
+        }
+    }
+
     fn unmap(&mut self, base: NonNull<u8>, len: usize) {
         // SAFETY: the mapping owner calls this once with the exact live range.
         let _ = unsafe { munmap(base.as_ptr().cast(), len) };
@@ -366,6 +381,476 @@ impl<O: PacketOps> PacketRingResources<O> {
     ) -> Result<UserRxBlock<'_, O>, MappingAccessError> {
         self.mapping.acquire_user_block(self.rx, block_index)
     }
+
+    fn tx_frame_count(&self) -> usize {
+        self.metadata.tx_frames().len()
+    }
+
+    fn load_tx_status(&self, frame_index: usize) -> Result<u32, MappingAccessError> {
+        let status_offset = self.tx_frame_status_offset(frame_index)?;
+        self.mapping.load_status_acquire(status_offset)
+    }
+
+    fn publish_tx_frame(
+        &mut self,
+        frame_index: usize,
+        payload: &[u8],
+        generation: u64,
+    ) -> Result<(), MappingAccessError> {
+        let frame_offset = self.tx_frame_offset(frame_index)?;
+        let header_address = self.mapping.ring_address(
+            self.extents,
+            RingKind::Tx,
+            frame_offset,
+            size_of::<Tpacket3Hdr>(),
+            align_of::<Tpacket3Hdr>(),
+        )?;
+        let data_offset = frame_offset
+            .checked_add(TPACKET_V3_TX_DATA_OFFSET)
+            .ok_or(MappingAccessError::ArithmeticOverflow)?;
+        let data_address =
+            self.mapping
+                .ring_address(self.extents, RingKind::Tx, data_offset, payload.len(), 1)?;
+        let length =
+            u32::try_from(payload.len()).map_err(|_| MappingAccessError::ArithmeticOverflow)?;
+        let frame = &mut self.metadata.tx_frames_mut()[frame_index];
+        frame
+            .ownership
+            .prepare()
+            .map_err(MappingAccessError::Ownership)?;
+        frame.generation = generation;
+        let header = Tpacket3Hdr {
+            tp_next_offset: 0,
+            tp_sec: 0,
+            tp_nsec: 0,
+            tp_snaplen: length,
+            tp_len: length,
+            tp_status: TP_STATUS_AVAILABLE,
+            tp_mac: 0,
+            tp_net: 0,
+            hv1: TpacketHdrVariant1 {
+                tp_rxhash: 0,
+                tp_vlan_tci: 0,
+                tp_vlan_tpid: 0,
+                tp_padding: 0,
+            },
+            tp_padding: [0; 8],
+        };
+        // SAFETY: ring_address proved the complete aligned header is within
+        // the TX extent, and AVAILABLE ownership excludes kernel access.
+        unsafe { std::ptr::write(header_address.cast::<Tpacket3Hdr>(), header) };
+        // SAFETY: ring_address proved the exact payload range is within this
+        // distinct backend-owned TX frame. This is the accepted path's single
+        // packet-byte copy.
+        unsafe { std::slice::from_raw_parts_mut(data_address, payload.len()) }
+            .copy_from_slice(payload);
+        frame
+            .ownership
+            .publish()
+            .map_err(MappingAccessError::Ownership)?;
+        self.mapping.store_status_release(
+            frame_offset + offset_of!(Tpacket3Hdr, tp_status) + self.extents.tx().start(),
+            TP_STATUS_SEND_REQUEST,
+        )
+    }
+
+    fn tx_metadata(&self, frame_index: usize) -> &crate::boundary::TxFrameMetadata {
+        &self.metadata.tx_frames()[frame_index]
+    }
+
+    fn tx_metadata_mut(&mut self, frame_index: usize) -> &mut crate::boundary::TxFrameMetadata {
+        &mut self.metadata.tx_frames_mut()[frame_index]
+    }
+
+    fn recycle_wrong_format(&mut self, frame_index: usize) -> Result<(), MappingAccessError> {
+        let status_offset = self.tx_frame_status_offset(frame_index)?;
+        self.mapping
+            .store_status_release(status_offset, TP_STATUS_AVAILABLE)
+    }
+
+    fn kick_tx(&mut self) -> Result<(), PlatformError> {
+        self.socket.ops.kick(self.socket.fd)
+    }
+
+    fn tx_frame_offset(&self, frame_index: usize) -> Result<usize, MappingAccessError> {
+        if frame_index >= self.tx_frame_count() {
+            return Err(MappingAccessError::RingOffsetOutOfBounds {
+                kind: RingKind::Tx,
+                offset: frame_index,
+                length: 1,
+            });
+        }
+        frame_index
+            .checked_mul(self.metadata_tx_frame_size())
+            .ok_or(MappingAccessError::ArithmeticOverflow)
+    }
+
+    fn tx_frame_status_offset(&self, frame_index: usize) -> Result<usize, MappingAccessError> {
+        let frame_offset = self.tx_frame_offset(frame_index)?;
+        let relative = frame_offset
+            .checked_add(offset_of!(Tpacket3Hdr, tp_status))
+            .ok_or(MappingAccessError::ArithmeticOverflow)?;
+        let absolute = self
+            .extents
+            .tx()
+            .start()
+            .checked_add(relative)
+            .ok_or(MappingAccessError::ArithmeticOverflow)?;
+        self.mapping
+            .checked_address(absolute, size_of::<u32>(), align_of::<u32>())?;
+        Ok(absolute)
+    }
+
+    fn metadata_tx_frame_size(&self) -> usize {
+        self.extents.tx().len() / self.tx_frame_count()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TxSubmission {
+    pub(crate) frame_index: usize,
+    pub(crate) generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TxSubmitError {
+    UnknownInterface,
+    Oversize { length: usize, maximum: usize },
+    Unavailable { status: u32 },
+    InvalidStatus { status: u32 },
+    GenerationExhausted { frame_index: usize },
+    Mapping(MappingAccessError),
+    Ownership(OwnershipError),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TxCompletionReport {
+    pub(crate) inspected: usize,
+    pub(crate) reclaimed: usize,
+    pub(crate) wrong_format: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TxCompletionError {
+    UnknownInterface,
+    InvalidStatus {
+        status: u32,
+    },
+    UnexpectedOwnership {
+        frame_index: usize,
+        ownership: TxOwnership,
+    },
+    Mapping(MappingAccessError),
+    Ownership(OwnershipError),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TxBatchReport {
+    pub(crate) accepted: usize,
+    pub(crate) kick_attempted: usize,
+    pub(crate) kick_failed: usize,
+    pub(crate) first_kick_error: Option<PlatformError>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct TxPortState {
+    producer_head: usize,
+    completion_head: usize,
+    in_flight: usize,
+}
+
+#[allow(dead_code)]
+pub(crate) struct TxEngine<O: PacketOps = LinuxOps> {
+    table: PortTable,
+    max_frame_len: usize,
+    ports: Box<[PacketRingResources<O>]>,
+    states: Box<[TxPortState]>,
+    touched_epoch: Box<[u64]>,
+    touched_ports: Box<[usize]>,
+    epoch: u64,
+}
+
+#[allow(dead_code)]
+impl TxEngine<LinuxOps> {
+    pub(crate) fn open(config: ValidatedConfig) -> Result<Self, PlatformError> {
+        Self::open_with_ops(config, LinuxOps)
+    }
+}
+
+#[allow(dead_code)]
+impl<O: PacketOps> TxEngine<O> {
+    fn open_with_ops(config: ValidatedConfig, ops: O) -> Result<Self, PlatformError> {
+        let (validated_ports, table, max_frame_len) = config.into_parts();
+        let entries = validated_ports.len();
+        let mut ports = Vec::new();
+        ports
+            .try_reserve_exact(entries)
+            .map_err(|_| PlatformError::MetadataAllocationFailed {
+                kind: RingKind::Tx,
+                entries,
+            })?;
+        for port in validated_ports.iter().copied() {
+            ports.push(PacketRingResources::open_with_ops(port, ops.clone())?);
+        }
+        Ok(Self {
+            table,
+            max_frame_len,
+            ports: ports.into_boxed_slice(),
+            states: fixed_tx_storage(entries, TxPortState::default())?,
+            touched_epoch: fixed_tx_storage(entries, 0_u64)?,
+            touched_ports: fixed_tx_storage(entries, usize::MAX)?,
+            epoch: 0,
+        })
+    }
+
+    pub(crate) fn begin_batch(&mut self) -> TxBatch<'_, O> {
+        self.epoch = match self.epoch.checked_add(1) {
+            Some(epoch) => epoch,
+            None => {
+                self.touched_epoch.fill(0);
+                1
+            }
+        };
+        let epoch = self.epoch;
+        TxBatch {
+            engine: self,
+            epoch,
+            touched_len: 0,
+            accepted: 0,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn scan_completions(
+        &mut self,
+        interface: ruster_core::IfId,
+        budget: usize,
+    ) -> Result<TxCompletionReport, TxCompletionError> {
+        let port_index = self
+            .table
+            .lookup(interface)
+            .ok_or(TxCompletionError::UnknownInterface)?
+            .get();
+        let mut report = TxCompletionReport::default();
+        while report.inspected < budget && self.states[port_index].in_flight != 0 {
+            let frame_index = self.states[port_index].completion_head;
+            let status = self.ports[port_index]
+                .load_tx_status(frame_index)
+                .map_err(TxCompletionError::Mapping)?;
+            report.inspected += 1;
+            let ownership = self.ports[port_index]
+                .tx_metadata(frame_index)
+                .ownership
+                .owner();
+            match status {
+                TP_STATUS_SEND_REQUEST => {
+                    if ownership != TxOwnership::SendRequest {
+                        return Err(TxCompletionError::UnexpectedOwnership {
+                            frame_index,
+                            ownership,
+                        });
+                    }
+                    break;
+                }
+                TP_STATUS_SENDING => {
+                    if ownership == TxOwnership::SendRequest {
+                        self.ports[port_index]
+                            .tx_metadata_mut(frame_index)
+                            .ownership
+                            .kernel_accept()
+                            .map_err(TxCompletionError::Ownership)?;
+                    } else if ownership != TxOwnership::Sending {
+                        return Err(TxCompletionError::UnexpectedOwnership {
+                            frame_index,
+                            ownership,
+                        });
+                    }
+                    break;
+                }
+                TP_STATUS_AVAILABLE => {
+                    let metadata = self.ports[port_index].tx_metadata_mut(frame_index);
+                    if ownership == TxOwnership::SendRequest {
+                        metadata
+                            .ownership
+                            .reclaim_unconsumed()
+                            .map_err(TxCompletionError::Ownership)?;
+                    } else if ownership == TxOwnership::Sending {
+                        metadata
+                            .ownership
+                            .kernel_complete()
+                            .map_err(TxCompletionError::Ownership)?;
+                    } else {
+                        return Err(TxCompletionError::UnexpectedOwnership {
+                            frame_index,
+                            ownership,
+                        });
+                    }
+                    report.reclaimed += 1;
+                    self.advance_completion(port_index);
+                }
+                TP_STATUS_WRONG_FORMAT => {
+                    if ownership != TxOwnership::SendRequest {
+                        return Err(TxCompletionError::UnexpectedOwnership {
+                            frame_index,
+                            ownership,
+                        });
+                    }
+                    {
+                        let metadata = self.ports[port_index].tx_metadata_mut(frame_index);
+                        metadata
+                            .ownership
+                            .kernel_reject_format()
+                            .map_err(TxCompletionError::Ownership)?;
+                        metadata
+                            .ownership
+                            .recycle_wrong_format()
+                            .map_err(TxCompletionError::Ownership)?;
+                    }
+                    self.ports[port_index]
+                        .recycle_wrong_format(frame_index)
+                        .map_err(TxCompletionError::Mapping)?;
+                    report.reclaimed += 1;
+                    report.wrong_format += 1;
+                    self.advance_completion(port_index);
+                }
+                _ => return Err(TxCompletionError::InvalidStatus { status }),
+            }
+        }
+        Ok(report)
+    }
+
+    fn advance_completion(&mut self, port_index: usize) {
+        let frame_count = self.ports[port_index].tx_frame_count();
+        let state = &mut self.states[port_index];
+        state.completion_head = (state.completion_head + 1) % frame_count;
+        state.in_flight -= 1;
+    }
+
+    fn submit(
+        &mut self,
+        interface: ruster_core::IfId,
+        payload: &[u8],
+    ) -> Result<(usize, TxSubmission), TxSubmitError> {
+        let port_index = self
+            .table
+            .lookup(interface)
+            .ok_or(TxSubmitError::UnknownInterface)?
+            .get();
+        if payload.len() > self.max_frame_len {
+            return Err(TxSubmitError::Oversize {
+                length: payload.len(),
+                maximum: self.max_frame_len,
+            });
+        }
+        let frame_index = self.states[port_index].producer_head;
+        let status = self.ports[port_index]
+            .load_tx_status(frame_index)
+            .map_err(TxSubmitError::Mapping)?;
+        match status {
+            TP_STATUS_AVAILABLE => {}
+            TP_STATUS_SEND_REQUEST | TP_STATUS_SENDING | TP_STATUS_WRONG_FORMAT => {
+                return Err(TxSubmitError::Unavailable { status });
+            }
+            _ => return Err(TxSubmitError::InvalidStatus { status }),
+        }
+        let metadata = self.ports[port_index].tx_metadata(frame_index);
+        if metadata.ownership.owner() != TxOwnership::Available {
+            return Err(TxSubmitError::Unavailable { status });
+        }
+        let generation = metadata
+            .generation
+            .checked_add(1)
+            .ok_or(TxSubmitError::GenerationExhausted { frame_index })?;
+        self.ports[port_index]
+            .publish_tx_frame(frame_index, payload, generation)
+            .map_err(|error| match error {
+                MappingAccessError::Ownership(source) => TxSubmitError::Ownership(source),
+                source => TxSubmitError::Mapping(source),
+            })?;
+        let state = &mut self.states[port_index];
+        state.producer_head = (state.producer_head + 1) % self.ports[port_index].tx_frame_count();
+        state.in_flight += 1;
+        Ok((
+            port_index,
+            TxSubmission {
+                frame_index,
+                generation,
+            },
+        ))
+    }
+
+    fn kick_touched(&mut self, touched_len: usize, accepted: usize) -> TxBatchReport {
+        let mut report = TxBatchReport {
+            accepted,
+            ..TxBatchReport::default()
+        };
+        for scratch_index in 0..touched_len {
+            let port_index = self.touched_ports[scratch_index];
+            report.kick_attempted += 1;
+            if let Err(error) = self.ports[port_index].kick_tx() {
+                report.kick_failed += 1;
+                if report.first_kick_error.is_none() {
+                    report.first_kick_error = Some(error);
+                }
+            }
+            self.touched_ports[scratch_index] = usize::MAX;
+        }
+        report
+    }
+}
+
+#[must_use]
+pub(crate) struct TxBatch<'a, O: PacketOps = LinuxOps> {
+    engine: &'a mut TxEngine<O>,
+    epoch: u64,
+    touched_len: usize,
+    accepted: usize,
+    finished: bool,
+}
+
+#[allow(dead_code)]
+impl<O: PacketOps> TxBatch<'_, O> {
+    pub(crate) fn submit(
+        &mut self,
+        interface: ruster_core::IfId,
+        payload: &[u8],
+    ) -> Result<TxSubmission, TxSubmitError> {
+        let (port_index, submission) = self.engine.submit(interface, payload)?;
+        if self.engine.touched_epoch[port_index] != self.epoch {
+            self.engine.touched_epoch[port_index] = self.epoch;
+            self.engine.touched_ports[self.touched_len] = port_index;
+            self.touched_len += 1;
+        }
+        self.accepted += 1;
+        Ok(submission)
+    }
+
+    pub(crate) fn finish(mut self) -> TxBatchReport {
+        let report = self.engine.kick_touched(self.touched_len, self.accepted);
+        self.finished = true;
+        report
+    }
+}
+
+impl<O: PacketOps> Drop for TxBatch<'_, O> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.engine.kick_touched(self.touched_len, self.accepted);
+            self.finished = true;
+        }
+    }
+}
+
+fn fixed_tx_storage<T: Copy>(entries: usize, value: T) -> Result<Box<[T]>, PlatformError> {
+    let mut storage = Vec::new();
+    storage
+        .try_reserve_exact(entries)
+        .map_err(|_| PlatformError::MetadataAllocationFailed {
+            kind: RingKind::Tx,
+            entries,
+        })?;
+    storage.resize(entries, value);
+    Ok(storage.into_boxed_slice())
 }
 
 struct PacketSocket<O: PacketOps> {
@@ -782,6 +1267,7 @@ unsafe extern "C" {
         offset: i64,
     ) -> *mut c_void;
     fn munmap(address: *mut c_void, length: usize) -> c_int;
+    fn send(socket: c_int, buffer: *const c_void, length: usize, flags: c_int) -> isize;
     fn close(fd: c_int) -> c_int;
 }
 
@@ -798,13 +1284,15 @@ mod tests {
     };
 
     use super::{
-        LinuxOps, MmapRegion, PacketOps, PacketRingResources, SockaddrLl, AF_PACKET, ETH_P_ALL,
+        LinuxOps, MmapRegion, PacketOps, PacketRingResources, SockaddrLl, TxCompletionError,
+        TxCompletionReport, TxEngine, TxSubmitError, AF_PACKET, ETH_P_ALL,
     };
     use crate::{
         boundary::{ColdRingMetadata, CombinedRingExtents},
         Errno, GeometryError, MappingAccessError, PlatformError, PortConfig, RingGeometry,
-        RingKind, RxOwnership, SyscallStage, ValidatedConfig, TPACKET_ALIGNMENT, TP_STATUS_KERNEL,
-        TP_STATUS_USER,
+        RingKind, RxOwnership, SyscallStage, ValidatedConfig, TPACKET_ALIGNMENT,
+        TP_STATUS_AVAILABLE, TP_STATUS_KERNEL, TP_STATUS_SENDING, TP_STATUS_SEND_REQUEST,
+        TP_STATUS_USER, TP_STATUS_WRONG_FORMAT,
     };
 
     struct CountingAllocator;
@@ -869,6 +1357,7 @@ mod tests {
         Set(SyscallStage),
         Map(usize),
         Bind,
+        Kick,
         Unmap(usize),
         Close,
     }
@@ -877,6 +1366,8 @@ mod tests {
         fail: Option<SyscallStage>,
         calls: Vec<ScriptedCall>,
         mapping: Box<AlignedCombinedRing>,
+        second_mapping: Box<AlignedCombinedRing>,
+        map_count: usize,
     }
 
     #[derive(Clone)]
@@ -888,6 +1379,8 @@ mod tests {
                 fail,
                 calls: Vec::new(),
                 mapping: Box::new(AlignedCombinedRing([0; 8_193])),
+                second_mapping: Box::new(AlignedCombinedRing([0; 8_193])),
+                map_count: 0,
             })))
         }
 
@@ -935,7 +1428,20 @@ mod tests {
             self.fail_if_requested(SyscallStage::Mmap)?;
             let mut state = self.0.borrow_mut();
             assert!(len <= state.mapping.0.len());
-            Ok(NonNull::new(state.mapping.0.as_mut_ptr()).expect("scripted mapping"))
+            let map_count = state.map_count;
+            state.map_count += 1;
+            let base = if map_count == 0 {
+                state.mapping.0.as_mut_ptr()
+            } else {
+                assert_eq!(map_count, 1, "test supports two mapped ports");
+                state.second_mapping.0.as_mut_ptr()
+            };
+            Ok(NonNull::new(base).expect("scripted mapping"))
+        }
+
+        fn kick(&mut self, _fd: RawFd) -> Result<(), PlatformError> {
+            self.0.borrow_mut().calls.push(ScriptedCall::Kick);
+            self.fail_if_requested(SyscallStage::Kick)
         }
 
         fn unmap(&mut self, _base: NonNull<u8>, len: usize) {
@@ -970,6 +1476,10 @@ mod tests {
     }
 
     fn validated_port() -> crate::ValidatedPort {
+        validated_config(&[IfId(7)]).ports()[0]
+    }
+
+    fn validated_config(interfaces: &[IfId]) -> ValidatedConfig {
         let rx = RingGeometry {
             block_size: 4_096,
             block_count: 1,
@@ -988,18 +1498,17 @@ mod tests {
             private_size: 0,
             feature_flags: 0,
         };
-        let config = ValidatedConfig::new(
-            &[PortConfig {
-                interface: IfId(7),
-                if_index: 9,
+        let ports = interfaces
+            .iter()
+            .enumerate()
+            .map(|(index, interface)| PortConfig {
+                interface: *interface,
+                if_index: u32::try_from(index + 9).expect("small test ifindex"),
                 rx,
                 tx,
-            }],
-            4_096,
-            1_514,
-        )
-        .expect("combined port");
-        config.ports()[0]
+            })
+            .collect::<Vec<_>>();
+        ValidatedConfig::new(&ports, 4_096, 1_514).expect("combined ports")
     }
 
     fn one_packet_ring(next_offset: u32) -> AlignedRing {
@@ -1276,5 +1785,396 @@ mod tests {
         assert_eq!(after, before);
         assert_eq!(metadata.rx_packets().as_ptr(), rx_address);
         assert_eq!(metadata.tx_frames().as_ptr(), tx_address);
+    }
+
+    fn set_engine_tx_status<O: PacketOps>(
+        engine: &mut TxEngine<O>,
+        port_index: usize,
+        frame_index: usize,
+        status: u32,
+    ) {
+        let offset = engine.ports[port_index]
+            .tx_frame_status_offset(frame_index)
+            .expect("TX status offset");
+        engine.ports[port_index]
+            .mapping
+            .store_status_release(offset, status)
+            .expect("test status publication");
+    }
+
+    fn engine_tx_u32<O: PacketOps>(
+        engine: &TxEngine<O>,
+        port_index: usize,
+        frame_index: usize,
+        field_offset: usize,
+    ) -> u32 {
+        let relative = engine.ports[port_index]
+            .tx_frame_offset(frame_index)
+            .expect("TX frame offset")
+            + field_offset;
+        let absolute = engine.ports[port_index].extents.tx().start() + relative;
+        engine.ports[port_index]
+            .mapping
+            .read_u32_volatile(absolute)
+            .expect("TX field")
+    }
+
+    fn engine_tx_payload<O: PacketOps>(
+        engine: &TxEngine<O>,
+        port_index: usize,
+        frame_index: usize,
+        length: usize,
+    ) -> &[u8] {
+        let frame_offset = engine.ports[port_index]
+            .tx_frame_offset(frame_index)
+            .expect("TX frame offset");
+        let address = engine.ports[port_index]
+            .mapping
+            .ring_address(
+                engine.ports[port_index].extents,
+                RingKind::Tx,
+                frame_offset + crate::TPACKET_V3_TX_DATA_OFFSET,
+                length,
+                1,
+            )
+            .expect("TX payload");
+        // SAFETY: ring_address proved this immutable test observation is
+        // wholly inside the mapped TX frame, and no mutation overlaps it.
+        unsafe { std::slice::from_raw_parts(address, length) }
+    }
+
+    #[test]
+    fn tx_status_validation_precedes_reserve_and_rejected_packets_copy_nothing() {
+        let ops = ScriptedOps::new(None);
+        let mut engine =
+            TxEngine::open_with_ops(validated_config(&[IfId(7)]), ops.clone()).expect("TX engine");
+        let payload = [0xa5; 64];
+
+        {
+            let mut batch = engine.begin_batch();
+            assert_eq!(
+                batch.submit(IfId(8), &payload),
+                Err(TxSubmitError::UnknownInterface)
+            );
+            assert_eq!(
+                batch.submit(IfId(7), &[0x5a; 1_515]),
+                Err(TxSubmitError::Oversize {
+                    length: 1_515,
+                    maximum: 1_514
+                })
+            );
+        }
+        assert_eq!(
+            ops.calls()
+                .iter()
+                .filter(|call| **call == ScriptedCall::Kick)
+                .count(),
+            0
+        );
+        assert_eq!(
+            engine.ports[0].tx_metadata(0).ownership.owner(),
+            crate::TxOwnership::Available
+        );
+        assert_eq!(engine.ports[0].tx_metadata(0).generation, 0);
+        assert!(engine_tx_payload(&engine, 0, 0, payload.len())
+            .iter()
+            .all(|byte| *byte == 0));
+
+        set_engine_tx_status(&mut engine, 0, 0, TP_STATUS_SEND_REQUEST);
+        {
+            let mut batch = engine.begin_batch();
+            assert_eq!(
+                batch.submit(IfId(7), &payload),
+                Err(TxSubmitError::Unavailable {
+                    status: TP_STATUS_SEND_REQUEST
+                })
+            );
+        }
+        set_engine_tx_status(&mut engine, 0, 0, 0x80);
+        {
+            let mut batch = engine.begin_batch();
+            assert_eq!(
+                batch.submit(IfId(7), &payload),
+                Err(TxSubmitError::InvalidStatus { status: 0x80 })
+            );
+        }
+        assert_eq!(
+            engine.ports[0].tx_metadata(0).ownership.owner(),
+            crate::TxOwnership::Available
+        );
+        assert_eq!(engine.ports[0].tx_metadata(0).generation, 0);
+        assert!(engine_tx_payload(&engine, 0, 0, payload.len())
+            .iter()
+            .all(|byte| *byte == 0));
+
+        set_engine_tx_status(&mut engine, 0, 0, TP_STATUS_AVAILABLE);
+        engine.ports[0].tx_metadata_mut(0).generation = u64::MAX;
+        {
+            let mut batch = engine.begin_batch();
+            assert_eq!(
+                batch.submit(IfId(7), &payload),
+                Err(TxSubmitError::GenerationExhausted { frame_index: 0 })
+            );
+        }
+        assert!(engine_tx_payload(&engine, 0, 0, payload.len())
+            .iter()
+            .all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn accepted_tx_writes_exact_v3_header_payload_and_release_status() {
+        let ops = ScriptedOps::new(None);
+        let mut engine =
+            TxEngine::open_with_ops(validated_config(&[IfId(7)]), ops.clone()).expect("TX engine");
+        let payload = [0x33; 60];
+        let mut batch = engine.begin_batch();
+        let submission = batch.submit(IfId(7), &payload).expect("accepted");
+        assert_eq!(
+            submission,
+            super::TxSubmission {
+                frame_index: 0,
+                generation: 1
+            }
+        );
+        let report = batch.finish();
+        assert_eq!(
+            report,
+            super::TxBatchReport {
+                accepted: 1,
+                kick_attempted: 1,
+                kick_failed: 0,
+                first_kick_error: None
+            }
+        );
+        assert_eq!(engine_tx_u32(&engine, 0, 0, 0), 0);
+        assert_eq!(engine_tx_u32(&engine, 0, 0, 12), 60);
+        assert_eq!(engine_tx_u32(&engine, 0, 0, 16), 60);
+        assert_eq!(engine_tx_u32(&engine, 0, 0, 20), TP_STATUS_SEND_REQUEST);
+        assert_eq!(engine_tx_payload(&engine, 0, 0, payload.len()), payload);
+        assert_eq!(engine.states[0].in_flight, 1);
+        assert_eq!(
+            ops.calls()
+                .iter()
+                .filter(|call| **call == ScriptedCall::Kick)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn completion_scan_is_budgeted_fifo_and_handles_all_kernel_transitions_once() {
+        let ops = ScriptedOps::new(None);
+        let mut engine =
+            TxEngine::open_with_ops(validated_config(&[IfId(7)]), ops).expect("TX engine");
+        let mut batch = engine.begin_batch();
+        let first = batch.submit(IfId(7), &[0x11; 64]).expect("first");
+        let second = batch.submit(IfId(7), &[0x22; 64]).expect("second");
+        let _ = batch.finish();
+
+        set_engine_tx_status(&mut engine, 0, second.frame_index, TP_STATUS_AVAILABLE);
+        assert_eq!(
+            engine
+                .scan_completions(IfId(7), 2)
+                .expect("blocked FIFO head"),
+            TxCompletionReport {
+                inspected: 1,
+                reclaimed: 0,
+                wrong_format: 0
+            }
+        );
+        assert_eq!(engine.states[0].in_flight, 2);
+
+        set_engine_tx_status(&mut engine, 0, first.frame_index, TP_STATUS_SENDING);
+        assert_eq!(
+            engine.scan_completions(IfId(7), 2).expect("kernel sending"),
+            TxCompletionReport {
+                inspected: 1,
+                reclaimed: 0,
+                wrong_format: 0
+            }
+        );
+        assert_eq!(
+            engine.ports[0]
+                .tx_metadata(first.frame_index)
+                .ownership
+                .owner(),
+            crate::TxOwnership::Sending
+        );
+
+        set_engine_tx_status(&mut engine, 0, first.frame_index, TP_STATUS_AVAILABLE);
+        assert_eq!(
+            engine.scan_completions(IfId(7), 1).expect("one completion"),
+            TxCompletionReport {
+                inspected: 1,
+                reclaimed: 1,
+                wrong_format: 0
+            }
+        );
+        assert_eq!(engine.states[0].in_flight, 1);
+        assert_eq!(
+            engine
+                .scan_completions(IfId(7), 1)
+                .expect("unobserved direct completion"),
+            TxCompletionReport {
+                inspected: 1,
+                reclaimed: 1,
+                wrong_format: 0
+            }
+        );
+        assert_eq!(engine.states[0].in_flight, 0);
+
+        let mut batch = engine.begin_batch();
+        let reused = batch.submit(IfId(7), &[0x44; 64]).expect("reused");
+        assert_eq!(reused.frame_index, first.frame_index);
+        assert_eq!(reused.generation, first.generation + 1);
+        let _ = batch.finish();
+        set_engine_tx_status(&mut engine, 0, reused.frame_index, TP_STATUS_WRONG_FORMAT);
+        assert_eq!(
+            engine
+                .scan_completions(IfId(7), 8)
+                .expect("wrong format recycle"),
+            TxCompletionReport {
+                inspected: 1,
+                reclaimed: 1,
+                wrong_format: 1
+            }
+        );
+        assert_eq!(
+            engine_tx_u32(&engine, 0, reused.frame_index, 20),
+            TP_STATUS_AVAILABLE
+        );
+        assert_eq!(
+            engine
+                .scan_completions(IfId(7), 8)
+                .expect("no double recycle"),
+            TxCompletionReport::default()
+        );
+        assert_eq!(
+            engine.scan_completions(IfId(99), 1),
+            Err(TxCompletionError::UnknownInterface)
+        );
+    }
+
+    #[test]
+    fn fixed_touched_ports_kick_each_endpoint_once_and_drop_never_retries() {
+        let ops = ScriptedOps::new(None);
+        let mut engine =
+            TxEngine::open_with_ops(validated_config(&[IfId(7), IfId(8)]), ops.clone())
+                .expect("two-port TX engine");
+        let mut batch = engine.begin_batch();
+        let _ = batch.submit(IfId(7), &[0x11; 64]).expect("port 7 first");
+        let _ = batch.submit(IfId(7), &[0x22; 64]).expect("port 7 second");
+        let _ = batch.submit(IfId(8), &[0x33; 64]).expect("port 8");
+        drop(batch);
+        assert_eq!(
+            ops.calls()
+                .iter()
+                .filter(|call| **call == ScriptedCall::Kick)
+                .count(),
+            2
+        );
+
+        let failing = ScriptedOps::new(Some(SyscallStage::Kick));
+        let mut engine = TxEngine::open_with_ops(validated_config(&[IfId(9)]), failing.clone())
+            .expect("failing-kick engine");
+        let mut batch = engine.begin_batch();
+        let submission = batch.submit(IfId(9), &[0x55; 64]).expect("published");
+        let report = batch.finish();
+        assert_eq!(report.accepted, 1);
+        assert_eq!(report.kick_attempted, 1);
+        assert_eq!(report.kick_failed, 1);
+        assert!(matches!(
+            report.first_kick_error,
+            Some(PlatformError::Syscall {
+                stage: SyscallStage::Kick,
+                errno: _
+            })
+        ));
+        assert_eq!(engine.states[0].in_flight, 1);
+        assert_eq!(
+            engine.ports[0]
+                .tx_metadata(submission.frame_index)
+                .ownership
+                .owner(),
+            crate::TxOwnership::SendRequest
+        );
+        assert_eq!(
+            failing
+                .calls()
+                .iter()
+                .filter(|call| **call == ScriptedCall::Kick)
+                .count(),
+            1
+        );
+    }
+
+    #[derive(Clone)]
+    struct QuietOps {
+        base: NonNull<u8>,
+        kicks: Rc<Cell<usize>>,
+    }
+
+    impl PacketOps for QuietOps {
+        fn open_socket(&mut self) -> Result<RawFd, PlatformError> {
+            Ok(73)
+        }
+
+        fn set_socket_option<T>(
+            &mut self,
+            _fd: RawFd,
+            _option: c_int,
+            _value: &T,
+            _stage: SyscallStage,
+        ) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn bind(&mut self, _fd: RawFd, _address: &SockaddrLl) -> Result<(), PlatformError> {
+            Ok(())
+        }
+
+        fn map(&mut self, _fd: RawFd, _len: usize) -> Result<NonNull<u8>, PlatformError> {
+            Ok(self.base)
+        }
+
+        fn kick(&mut self, _fd: RawFd) -> Result<(), PlatformError> {
+            self.kicks.set(self.kicks.get() + 1);
+            Ok(())
+        }
+
+        fn unmap(&mut self, _base: NonNull<u8>, _len: usize) {}
+
+        fn close(&mut self, _fd: RawFd) {}
+    }
+
+    #[test]
+    fn tx_submit_completion_reuse_has_zero_steady_allocations() {
+        let mut backing = AlignedCombinedRing([0; 8_193]);
+        let kicks = Rc::new(Cell::new(0));
+        let ops = QuietOps {
+            base: NonNull::new(backing.0.as_mut_ptr()).expect("quiet backing"),
+            kicks: Rc::clone(&kicks),
+        };
+        let mut engine =
+            TxEngine::open_with_ops(validated_config(&[IfId(7)]), ops).expect("quiet TX engine");
+        let payload = [0x77; 64];
+        let before = allocation_count();
+        let mut generation = 0_u64;
+        for _ in 0..10_000 {
+            let mut batch = engine.begin_batch();
+            let submission = batch.submit(IfId(7), &payload).expect("steady submit");
+            generation ^= submission.generation;
+            let report = batch.finish();
+            assert_eq!(report.accepted, 1);
+            set_engine_tx_status(&mut engine, 0, submission.frame_index, TP_STATUS_AVAILABLE);
+            let completion = engine
+                .scan_completions(IfId(7), 1)
+                .expect("steady completion");
+            assert_eq!(completion.reclaimed, 1);
+        }
+        std::hint::black_box(generation);
+        let after = allocation_count();
+        assert_eq!(after, before);
+        assert_eq!(kicks.get(), 10_000);
     }
 }

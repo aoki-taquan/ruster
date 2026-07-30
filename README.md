@@ -29,13 +29,15 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
 - `ruster-io-afpacket`: Linux AF_PACKET/TPACKET_V3 backendのchecked configuration、
   fixed IfId mapping、ring ownership/UAPI scaffold。combined mmapのRX/TX extentを
   overlap/gap/overflow/実address alignmentまで検証し、後続state machine用metadataを
-  resource取得前のcold pathで固定長preallocateする。現時点ではPacketIo RX/TXを未接続。
+  resource取得前のcold pathで固定長preallocateする。内部TX engineはfixed frameへexact
+  one-copyでpublishし、FIFO completionとendpoint単位のnonblocking kickをboundedに処理する。
+  現時点ではPacketIoとRX pathを未接続。
   64-bit Linux、SOCK_RAW Ethernet II、PACKET_RESERVEなしのstrict profileで、TX
   requestのretire timeout/private/feature fieldsはzeroに限定する。RX private areaは
   kernel同様に8-byte alignした`BLK_PLUS_PRIV`を使い、宣言した最大Ethernet frameを
   block内で切り詰めず保持できるgeometryだけを許す。Linux syscallとtest scriptは
-  privateなstatic dispatch seamを共有するが、copy/zero-copy mode、live RX/TX、
-  wakeup、cleanup/stats、実NIC throughputを主張する段階ではない。
+  privateなstatic dispatch seamを共有するが、public live adapter、copy/zero-copy mode、
+  RX、poll、cleanup/stats、実NIC throughputを主張する段階ではない。
 - `ruster-io-xdp`: AF_XDP native接続より前に固定するpure-Rust ownership model。
   UMEM layout、descriptor境界、nonzero generation token、frame state ledger、
   fixed-storage ring、authoritative ledgerと結合したfinite fake kernelを持つ。socket、

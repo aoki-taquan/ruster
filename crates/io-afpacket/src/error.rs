@@ -28,6 +28,7 @@ pub enum SyscallStage {
     SetTxRing,
     Bind,
     Mmap,
+    Kick,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

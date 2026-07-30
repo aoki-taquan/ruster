@@ -854,10 +854,24 @@ validated portごとに、一つのRX blockが取り得る最大packet metadata�
 socket取得前にfallibleなcold pathで固定長確保します。確保後の反復accessはallocationせず、
 storage addressも変わりません。
 
-このsliceはpersistent RX validation cursor、`PacketIo` lease、RXからdistinct TX frameへのcopy、
-TX descriptor publication/completion、`send(MSG_DONTWAIT)` wakeup、poll、live stats/cleanupを
-実装しません。従ってIO-012のproduction conformance、実packet送受信、throughputは引き続き
-deferredです。
+AP1-TXのprivate engineはfixed `IfId` tableからportをO(1)選択し、各portのproducer headだけを
+確認します。TX statusをAcquireで読む前にframeをreserveせず、unknown interface、宣言最大長超過、
+AVAILABLE以外、未知status、generation枯渇はpayloadをcopyせず拒否します。受理時だけdistinctな
+backend-owned TX mmap frameへ一度`copy_from_slice`し、`tp_next_offset=0`、
+`tp_snaplen=tp_len=payload length`のV3 headerを構築してSEND_REQUESTをRelease publishします。
+固定metadataのownershipとchecked generationはframe再利用cycleを区別します。
+
+completionは固定budget内でFIFO headだけを走査し、SEND_REQUESTまたはSENDINGを見た時点で後続を
+skipせず停止します。AVAILABLEはSENDINGを観測しなかった直接遷移も含め一度だけreclaimし、
+WRONG_FORMATは一度だけAVAILABLEへrecycleします。batchは固定長epoch/scratchでpublish済みportを
+deduplicateし、明示finishとDropのどちらも各endpointへ
+`send(fd, NULL, 0, MSG_DONTWAIT)`を最大一回だけ試し、失敗をretryしません。kick失敗はすでに
+publishしたsubmissionをrejectへ巻き戻さずin-flightに残します。hot submit/completion/reuseは
+heap allocationしません。
+
+このsliceはpersistent RX validation cursor、`PacketIo` lease、RXからTXへのadapter接続、poll、
+live stats/cleanupを実装しません。従ってIO-012のproduction conformance、実packet送受信、
+throughputは引き続きdeferredです。
 
 `ruster-io-xdp`の最初のsliceは、native AF_XDP backendではなく、全targetでcompileできる
 pure-Rust ownership/ring modelです。socket、native ring、libxdp FFI、XDP program、core

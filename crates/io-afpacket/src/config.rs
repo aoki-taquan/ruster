@@ -369,6 +369,7 @@ impl ValidatedPort {
 pub struct ValidatedConfig {
     ports: Box<[ValidatedPort]>,
     table: PortTable,
+    max_frame_len: usize,
 }
 
 impl ValidatedConfig {
@@ -442,6 +443,7 @@ impl ValidatedConfig {
         Ok(Self {
             ports: validated.into_boxed_slice(),
             table,
+            max_frame_len,
         })
     }
 
@@ -460,6 +462,15 @@ impl ValidatedConfig {
     #[must_use]
     pub const fn table(&self) -> &PortTable {
         &self.table
+    }
+
+    #[must_use]
+    pub const fn max_frame_len(&self) -> usize {
+        self.max_frame_len
+    }
+
+    pub(crate) fn into_parts(self) -> (Box<[ValidatedPort]>, PortTable, usize) {
+        (self.ports, self.table, self.max_frame_len)
     }
 }
 

@@ -3,8 +3,10 @@
 //!
 //! This crate currently provides checked configuration, fixed interface
 //! lookup, ring geometry, descriptor bounds, ownership state, and the Linux
-//! syscall/mmap boundary needed by the future AF_PACKET backend. It does not
-//! yet implement [`ruster_core::PacketIo`] or perform RX/TX.
+//! syscall/mmap boundary needed by the future AF_PACKET backend. Its private
+//! AP1 TX engine publishes fixed frames, scans FIFO completions, and batches
+//! nonblocking endpoint kicks. It does not yet implement
+//! [`ruster_core::PacketIo`] or expose a live adapter.
 //!
 //! The safe model is available on every target. Raw Linux UAPI access is
 //! confined to `sys`; [`AfPacketPlatform::ensure_supported`] returns
@@ -23,8 +25,9 @@
 //! offset. The socket is opened with protocol zero and becomes active only when
 //! its validated `sockaddr_ll` is bound. Backend counters are fixed accumulators
 //! only. AP1-0 additionally fixes disjoint RX/TX extents within the combined
-//! mapping and cold-preallocates fixed metadata for later state machines. It
-//! still provides no live I/O, `PacketIo`, wakeup, or cleanup telemetry.
+//! mapping and cold-preallocates fixed metadata. AP1-TX uses that storage for
+//! an internal producer/completion/kick engine without exposing `PacketIo`,
+//! an RX path, poll integration, or cleanup telemetry.
 
 #[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
 compile_error!("ruster-io-afpacket currently supports only 64-bit Linux targets");
