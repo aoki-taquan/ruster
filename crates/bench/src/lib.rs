@@ -5,6 +5,7 @@ mod backend;
 mod fixture;
 mod hardware_artifact;
 mod hardware_plan;
+mod hardware_protocol;
 mod matrix;
 mod output;
 mod runner;
@@ -25,6 +26,19 @@ pub use hardware_plan::{
     HardwarePlanError, ImixWireModel, PlannedHardwareCase, HARDWARE_CONTROL_CASE_COUNT,
     HARDWARE_PLAN_VERSION, HARDWARE_PRIMARY_CASE_COUNT, HARDWARE_TOTAL_CASE_COUNT,
     RUSTER_IMIX_V1_CYCLE,
+};
+pub use hardware_protocol::{
+    validate_complete_measurement, validate_lifecycle_sequence, BoundHardwareMeasurement,
+    CompletenessMetadata, DirectionPacketCounters, GeneratorProfile, GitCommitId,
+    HardwareMeasurementProtocol, LatencyMode, LatencyProfile, LifecycleSequenceValidator,
+    MeasurementLifecycleCode, MeasurementLifecycleEvent, MeasurementProfileId,
+    MeasurementProtocolError, MeasurementRunOutcome, MeasurementTiming, RawRepeatCounters,
+    Sha256Digest, VerifiedMeasurementInterval, VerifiedRepeat, VerifiedSummary,
+    HARDWARE_MEASUREMENT_PROTOCOL_VERSION, HARDWARE_PLAN_FINGERPRINT_V1,
+    MAX_HARDWARE_CASE_TIMEOUT_MS, MAX_HARDWARE_DRAIN_TIMEOUT_MS, MAX_HARDWARE_DURATION_SECONDS,
+    MAX_HARDWARE_REPEAT_COUNT, MAX_HARDWARE_RUN_TIMEOUT_MS, MAX_HARDWARE_WARMUP_SECONDS,
+    MAX_LATENCY_SAMPLE_EVERY_PACKETS, MAX_MEASUREMENT_ARTIFACT_HASHES,
+    MAX_MEASUREMENT_ARTIFACT_PATH_BYTES,
 };
 pub use output::{OutputFormat, ResultRow};
 pub use runner::{run, RunConfig, RunError, Suite};
