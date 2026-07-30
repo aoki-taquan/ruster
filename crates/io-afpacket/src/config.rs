@@ -3,6 +3,7 @@ use ruster_core::IfId;
 use crate::{ConfigError, GeometryError};
 
 pub const TPACKET_ALIGNMENT: usize = 16;
+pub const TPACKET_V3_ALIGNMENT: usize = 8;
 pub const TPACKET_V3_VERSION: u32 = 2;
 pub const TPACKET_V3_HEADER_LEN: usize = 48;
 pub const TPACKET_BLOCK_HEADER_LEN: usize = 48;
@@ -40,7 +41,33 @@ impl RingGeometry {
         page_size: usize,
         max_frame_len: usize,
     ) -> Result<RingLayout, GeometryError> {
-        self.validate_common(page_size, max_frame_len, TPACKET_V3_ETHERNET_MAC_OFFSET)
+        let layout =
+            self.validate_common(page_size, max_frame_len, TPACKET_V3_ETHERNET_MAC_OFFSET)?;
+        let kernel_minimum = layout
+            .block_plus_private
+            .checked_add(TPACKET_V3_HDRLEN)
+            .ok_or(GeometryError::ArithmeticOverflow)?;
+        if kernel_minimum > layout.block_size {
+            return Err(GeometryError::RxBlockBelowKernelMinimum {
+                block_plus_private: layout.block_plus_private,
+                header_len: TPACKET_V3_HDRLEN,
+                block_size: self.block_size,
+            });
+        }
+        let strict_minimum = layout
+            .block_plus_private
+            .checked_add(TPACKET_V3_ETHERNET_MAC_OFFSET)
+            .and_then(|minimum| minimum.checked_add(max_frame_len))
+            .ok_or(GeometryError::ArithmeticOverflow)?;
+        if strict_minimum > layout.block_size {
+            return Err(GeometryError::RxBlockWouldTruncateMaxFrame {
+                block_plus_private: layout.block_plus_private,
+                mac_offset: TPACKET_V3_ETHERNET_MAC_OFFSET,
+                max_frame_len,
+                block_size: self.block_size,
+            });
+        }
+        Ok(layout)
     }
 
     pub fn validate_tx(
@@ -144,21 +171,17 @@ impl RingGeometry {
                 expected: expected_frames,
             });
         }
-        if usize::try_from(self.private_size).map_err(|_| GeometryError::ArithmeticOverflow)?
-            % TPACKET_ALIGNMENT
-            != 0
-        {
-            return Err(GeometryError::PrivateAreaNotAligned {
-                private_size: self.private_size,
-            });
-        }
-        let private_end = TPACKET_BLOCK_HEADER_LEN
-            .checked_add(
-                usize::try_from(self.private_size)
-                    .map_err(|_| GeometryError::ArithmeticOverflow)?,
-            )
+        let block_header_len = align_up(TPACKET_BLOCK_HEADER_LEN, TPACKET_V3_ALIGNMENT)
             .ok_or(GeometryError::ArithmeticOverflow)?;
-        if private_end > block_size {
+        let private_len = align_up(
+            usize::try_from(self.private_size).map_err(|_| GeometryError::ArithmeticOverflow)?,
+            TPACKET_V3_ALIGNMENT,
+        )
+        .ok_or(GeometryError::ArithmeticOverflow)?;
+        let block_plus_private = block_header_len
+            .checked_add(private_len)
+            .ok_or(GeometryError::ArithmeticOverflow)?;
+        if block_plus_private > block_size {
             return Err(GeometryError::PrivateAreaTooLarge {
                 private_size: self.private_size,
                 block_size: self.block_size,
@@ -185,6 +208,7 @@ impl RingGeometry {
             frame_size,
             frames_per_block,
             map_len,
+            block_plus_private,
         })
     }
 }
@@ -197,6 +221,7 @@ pub struct RingLayout {
     frame_size: usize,
     frames_per_block: usize,
     map_len: usize,
+    block_plus_private: usize,
 }
 
 impl RingLayout {
@@ -228,6 +253,11 @@ impl RingLayout {
     #[must_use]
     pub const fn map_len(self) -> usize {
         self.map_len
+    }
+
+    #[must_use]
+    pub const fn block_plus_private(self) -> usize {
+        self.block_plus_private
     }
 
     pub fn block_range(self, block_index: usize) -> Result<std::ops::Range<usize>, GeometryError> {

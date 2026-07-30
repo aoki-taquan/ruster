@@ -48,6 +48,7 @@ fn af_packet_v3_ring_model_validates_geometry_and_ownership() {
     assert!(config.port(IfId(8)).is_none());
     let first = config.ports()[0];
     assert_eq!(first.rx().map_len(), 8_192);
+    assert_eq!(first.rx().block_plus_private(), 64);
     assert_eq!(first.tx_map_offset(), 8_192);
     assert_eq!(first.combined_map_len(), 16_384);
     assert_eq!(first.rx().block_range(1), Ok(4_096..8_192));
@@ -160,6 +161,27 @@ fn geometry_descriptor_and_status_fail_closed_on_checked_boundaries() {
         invalid.validate_rx(4_096, 1_514),
         Err(GeometryError::UnknownFeatureFlags { feature_flags: 2 })
     );
+    invalid = geometry();
+    invalid.private_size = 4_048;
+    assert_eq!(
+        invalid.validate_rx(4_096, 1_514),
+        Err(GeometryError::RxBlockBelowKernelMinimum {
+            block_plus_private: 4_096,
+            header_len: 68,
+            block_size: 4_096,
+        })
+    );
+    invalid = geometry();
+    invalid.private_size = 2_496;
+    assert_eq!(
+        invalid.validate_rx(4_096, 1_514),
+        Err(GeometryError::RxBlockWouldTruncateMaxFrame {
+            block_plus_private: 2_544,
+            mac_offset: 82,
+            max_frame_len: 1_514,
+            block_size: 4_096,
+        })
+    );
     let layout = geometry().validate_rx(4_096, 1_514).expect("layout");
     assert_eq!(
         BlockDescriptor {
@@ -183,6 +205,46 @@ fn geometry_descriptor_and_status_fail_closed_on_checked_boundaries() {
         .validate(layout),
         Err(GeometryError::PrivateOffsetInvalid { offset: 64 })
     );
+    assert_eq!(
+        BlockDescriptor {
+            version: 2,
+            offset_to_private: 48,
+            block_len: 4_096,
+            packet_count: 1,
+            first_packet_offset: 80,
+        }
+        .validate(layout),
+        Err(GeometryError::FirstPacketOffsetMismatch {
+            configured: 80,
+            expected: 64,
+        })
+    );
+    let mut eight_aligned_private = geometry();
+    eight_aligned_private.private_size = 17;
+    let eight_aligned_layout = eight_aligned_private
+        .validate_rx(4_096, 1_514)
+        .expect("private size is rounded up to eight bytes");
+    assert_eq!(eight_aligned_layout.block_plus_private(), 72);
+    BlockDescriptor {
+        version: 2,
+        offset_to_private: 48,
+        block_len: 4_096,
+        packet_count: 1,
+        first_packet_offset: 72,
+    }
+    .validate(eight_aligned_layout)
+    .expect("kernel first-packet offset may be eight-byte aligned");
+    PacketDescriptor {
+        packet_offset: 72,
+        next_offset: 0,
+        mac_offset: 82,
+        net_offset: 96,
+        snap_len: 60,
+        wire_len: 60,
+        is_last: true,
+    }
+    .validate(4_096)
+    .expect("V3 packet descriptors use the kernel's eight-byte alignment");
     assert_eq!(
         geometry()
             .validate_rx(4_096, 1_514)

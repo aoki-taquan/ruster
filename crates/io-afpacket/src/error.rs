@@ -92,11 +92,19 @@ pub enum GeometryError {
         configured: u32,
         expected: usize,
     },
-    PrivateAreaNotAligned {
-        private_size: u32,
-    },
     PrivateAreaTooLarge {
         private_size: u32,
+        block_size: u32,
+    },
+    RxBlockBelowKernelMinimum {
+        block_plus_private: usize,
+        header_len: usize,
+        block_size: u32,
+    },
+    RxBlockWouldTruncateMaxFrame {
+        block_plus_private: usize,
+        mac_offset: usize,
+        max_frame_len: usize,
         block_size: u32,
     },
     UnknownFeatureFlags {
@@ -142,6 +150,10 @@ pub enum GeometryError {
     },
     FirstPacketOffsetInvalid {
         offset: usize,
+    },
+    FirstPacketOffsetMismatch {
+        configured: usize,
+        expected: usize,
     },
     PacketOffsetNotAligned {
         offset: usize,

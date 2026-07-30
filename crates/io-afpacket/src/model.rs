@@ -1,8 +1,8 @@
 use std::ops::Range;
 
 use crate::{
-    error::TxOperation, GeometryError, OwnershipError, RingLayout, TPACKET_ALIGNMENT,
-    TPACKET_BLOCK_HEADER_LEN, TPACKET_V3_ETHERNET_MAC_OFFSET, TPACKET_V3_ETHERNET_NETWORK_OFFSET,
+    error::TxOperation, GeometryError, OwnershipError, RingLayout, TPACKET_BLOCK_HEADER_LEN,
+    TPACKET_V3_ALIGNMENT, TPACKET_V3_ETHERNET_MAC_OFFSET, TPACKET_V3_ETHERNET_NETWORK_OFFSET,
     TPACKET_V3_HDRLEN, TPACKET_V3_HEADER_LEN, TPACKET_V3_VERSION,
 };
 
@@ -42,18 +42,11 @@ impl BlockDescriptor {
                 offset: self.first_packet_offset,
             });
         }
-        let first_packet_minimum = self
-            .offset_to_private
-            .checked_add(
-                usize::try_from(layout.geometry().private_size)
-                    .map_err(|_| GeometryError::ArithmeticOverflow)?,
-            )
-            .ok_or(GeometryError::ArithmeticOverflow)?;
-        if self.first_packet_offset < first_packet_minimum
-            || !self.first_packet_offset.is_multiple_of(TPACKET_ALIGNMENT)
-        {
-            return Err(GeometryError::FirstPacketOffsetInvalid {
-                offset: self.first_packet_offset,
+        let expected = layout.block_plus_private();
+        if self.first_packet_offset != expected {
+            return Err(GeometryError::FirstPacketOffsetMismatch {
+                configured: self.first_packet_offset,
+                expected,
             });
         }
         let first_header_end = self
@@ -92,7 +85,7 @@ pub struct PacketDescriptor {
 
 impl PacketDescriptor {
     pub fn validate(self, block_len: usize) -> Result<ValidatedPacket, GeometryError> {
-        if !self.packet_offset.is_multiple_of(TPACKET_ALIGNMENT) {
+        if !self.packet_offset.is_multiple_of(TPACKET_V3_ALIGNMENT) {
             return Err(GeometryError::PacketOffsetNotAligned {
                 offset: self.packet_offset,
             });
@@ -158,7 +151,7 @@ impl PacketDescriptor {
                     offset: self.next_offset,
                 });
             }
-            if !self.next_offset.is_multiple_of(TPACKET_ALIGNMENT) {
+            if !self.next_offset.is_multiple_of(TPACKET_V3_ALIGNMENT) {
                 return Err(GeometryError::NextPacketOffsetNotAligned {
                     offset: self.next_offset,
                 });
