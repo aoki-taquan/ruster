@@ -1,5 +1,5 @@
 [package]
-name = "ruster-io-sim"
+name = "ruster-io-conformance"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -7,6 +7,3 @@ publish.workspace = true
 
 [dependencies]
 ruster-core = { path = "../core" }
-
-[dev-dependencies]
-ruster-io-conformance = { path = "../io-conformance" }
