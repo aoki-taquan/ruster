@@ -305,6 +305,33 @@ worker tick順は `publication/reconcile → RX → resolution timer poll → fa
 generated ARP → generated ICMP` です。exact timeoutでのARP学習は、ICMP actionがqueueされる前
 なら `poll → learn → dispatch` と `learn → poll` の両方で勝ちます。
 
+`ruster-runtime`の`FullServicePublication`は、具体的なowned publicationやparserを持たず、
+candidateのall-or-nothing適用とactive full-service viewの借用だけを抽象化します。
+candidate rejectは旧active viewを失効させず、そのtickのdata phaseを旧generationで継続します。
+active viewがなければRXを開始せず、残りの全phaseを`NoActivePublication`としてtyped skipします。
+一度借用したactive viewはtick終了まで同一generationであり、RXにはUDP/TCP NAT44、firewall、
+resolution、generated ICMP captureのfull composition wrapperだけを使用します。
+`active`はO(1)のsteady-tick borrowであり、semantic validation、fingerprint/hash計算、slice scan、
+allocationを繰り返しません。これらはcandidate構築・publicationのcold pathで完了します。
+validated NAT/firewall config identityは`Copy`値としてviewへ渡し、publication adapterに
+一時config値への参照を返させません。snapshotとmutable runtime storageだけがview lifetimeで
+borrowされます。
+
+`TickBudgets`はRX packet数、resolution timer scan、failure dispatch scan、generated ARP action、
+generated ICMPv4 actionを独立に制限します。RX batchはlexical scopeでwrapperへmoveし、
+`finish`後にだけgenerated I/Oを再borrowします。generated allocation/build/finish errorは同じ
+tickで同じpending actionを再試行せず、そのphaseを一回で停止します。accounting invariant違反は
+backend contract failureとして以後のgenerated phaseを停止します。固定サイズreportとphase
+sentinel traceは、RX errorとgenerated error、clock regression、zero/exact budgetを区別します。
+RX receive/finish error後もtimerとfailure dispatchは進めますが、同tickのgenerated I/Oは
+開始しません。timer clock regressionはfailure dispatchを含む全後続phaseをskipし、failure
+dispatchまたはgenerated ARPのclock regressionも全後続generated phaseをskipします。generated
+ARPの`Unavailable` allocationだけは独立したICMP generated sessionの試行を許し、build/finish
+errorは許しません。accounting違反reportはbackendが返した生counterを保持し、runtime側で
+帳尻を推測・修復しません。
+TX accepted/submittedはdescriptor publicationであってwire deliveryやcompletion queue返却では
+ありません。runtime packet pathはheap allocationと共有同期を行いません。
+
 逆経路は元IPv4 sourceへの通常LPMです。gateway routeではnext-hop、connected routeでは
 元sourceをneighbor targetにし、reverse egressのInterface MAC/local IPv4 bindingを使います。
 static neighborを優先し、次にfresh dynamic ARP entryを使います。未解決時は既存ARP actionを

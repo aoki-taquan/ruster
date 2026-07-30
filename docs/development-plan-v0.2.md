@@ -60,10 +60,8 @@ worker-localであり、live capacity pressureで別flowをevictしない。こ�
   UDP/TCP NAT+FW+generated ICMPを同時に選ぶfull composition wrapperがない。
   private `forward_batch_inner`は全serviceを同時に受け取れるため、内部能力ではなくpublic
   compositionの欠落である。
-- architectureが要求する
-  `publication/reconcile → RX → resolution timer → failure dispatch → generated ARP
-  → generated ICMP`
-  を一つのbounded tickとして実行するpublic runtimeがない。sim helperはRX phaseまでである。
+- architecture順のbounded single-worker tickとgeneric publication seamは`ruster-runtime`に
+  ある。具体的なowned publication、設定parser、daemon、thread/signal lifecycleは後続taskである。
 - `ForwardingSnapshot`とNAT/FW configはborrowed sliceのpointer identityへbindされる。
   owned configをmove/reallocateした後のsnapshot、runtimeより短命なrule slice、partial reloadは
   fail closedまたはdangling設計を招く。Rustのborrowでmemory safetyは守れても、daemonの

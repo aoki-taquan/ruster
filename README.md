@@ -7,7 +7,8 @@ active treeは、そのコードを継承しないv0.2のゼロベース実装�
 
 ## v0.2 bootstrap
 
-この最初の縦切りは、外部依存を持たないlibrary crateで構成します。
+active treeは、外部依存を持たないpacket core、bounded worker runtime、sim I/O、
+benchmark harness、I/O conformance、AF_XDP ownership modelで構成します。
 
 - `ruster-core`: backend所有packetを借用し、Ethernet II / IPv4検証、LPM、
   TTL/checksum/MAC rewrite、local IPv4向けARP reply、static neighbor miss時の
@@ -20,6 +21,9 @@ active treeは、そのコードを継承しないv0.2のゼロベース実装�
 - `ruster-io-xdp`: AF_XDP native接続より前に固定するpure-Rust ownership model。
   UMEM layout、descriptor境界、nonzero generation token、frame state ledgerだけを持ち、
   socket、ring、FFI、core `PacketIo`接続はまだ持たない。
+- `ruster-runtime`: genericなpublication seamから一つのactive generationを借用し、
+  `RX → resolution timer → failure dispatch → generated ARP → generated ICMPv4`を
+  明示budget付きのsingle-worker tickとして実行する。
 
 ```text
 inject Vec<u8>
@@ -161,6 +165,13 @@ UDP/TCP NAT44、firewall、router-originated ICMPv4 errorを同じworkerへbind�
 silentのままで、認可後のeligible TTL expiryはSNAT前の受信IPv4をquoteしてactionをqueueします。
 RX batchとgenerated TXは融合せず、既定のworker tick順どおりRX完了後に生成します。生成packet
 そのものはfirewallの対象外です。既存のICMP runtimeを取らないcombined APIは変更しません。
+`ruster-runtime`はcandidate publicationをtick先頭でatomicに試し、reject時は旧active
+publicationで継続します。active publicationがなければbackendへ触れず全data phaseをtyped
+skipします。RX batchはfull composition wrapperへmoveされ、そのborrowが終了した後だけ
+generated sessionを開始します。各phase reportは固定サイズで、RX errorとgenerated error、
+clock regression、budget exhaustion、allocation/build/finish/accounting failureを区別します。
+backendのTX acceptedはdescriptor publicationであり、wire送信やcompletion queue返却を
+意味しません。
 
 ## 開発
 
