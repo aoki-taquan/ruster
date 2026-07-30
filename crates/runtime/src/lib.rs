@@ -19,11 +19,11 @@ pub struct FullServiceView<'view, 'storage> {
     pub snapshot: &'view ForwardingSnapshot<'storage>,
     pub resolution: &'view mut ResolutionRuntime<'storage>,
     pub icmpv4_errors: &'view mut Icmpv4ErrorRuntime<'storage>,
-    pub udp_config: &'view Nat44UdpConfig,
+    pub udp_config: Nat44UdpConfig,
     pub nat44_udp: Option<&'view mut Nat44UdpRuntime<'storage>>,
-    pub tcp_config: &'view Nat44TcpConfig,
+    pub tcp_config: Nat44TcpConfig,
     pub nat44_tcp: Option<&'view mut Nat44TcpRuntime<'storage>>,
-    pub firewall_config: &'view FirewallConfig<'storage>,
+    pub firewall_config: FirewallConfig<'storage>,
     pub firewall: Option<&'view mut FirewallRuntime<'storage>>,
 }
 
@@ -37,6 +37,8 @@ pub struct FullServiceView<'view, 'storage> {
 /// `active` is a steady-tick O(1) borrow: it must not repeat semantic
 /// validation, fingerprinting, hashing, slice scans, or allocation. Those
 /// cold-path operations belong to candidate construction/publication.
+/// Validated NAT and firewall configs are copied into the view by value so an
+/// adapter never has to return references to temporary config values.
 pub trait FullServicePublication<'storage> {
     type Candidate;
     type Reject;
@@ -575,11 +577,11 @@ where
                 snapshot,
                 resolution,
                 icmpv4_errors,
-                udp_config,
+                &udp_config,
                 nat44_udp,
-                tcp_config,
+                &tcp_config,
                 nat44_tcp,
-                firewall_config,
+                &firewall_config,
                 firewall,
                 now,
                 trace,
@@ -747,11 +749,11 @@ mod tests {
                 snapshot: self.snapshot,
                 resolution: self.resolution,
                 icmpv4_errors: self.icmpv4_errors,
-                udp_config: &self.udp_config,
+                udp_config: self.udp_config,
                 nat44_udp: None,
-                tcp_config: &self.tcp_config,
+                tcp_config: self.tcp_config,
                 nat44_tcp: None,
-                firewall_config: &self.firewall_config,
+                firewall_config: self.firewall_config,
                 firewall: None,
             })
         }
@@ -1316,6 +1318,19 @@ mod tests {
             assert!(report.active);
             assert_eq!(publication.active_calls, 1);
             assert_eq!(publication.steady_validation_scans, 0);
+        });
+    }
+
+    #[test]
+    fn active_view_adapter_copies_config_values_without_temporary_references() {
+        with_fixture(|publication, _io, _trace| {
+            let udp = publication.udp_config;
+            let tcp = publication.tcp_config;
+            let firewall = publication.firewall_config;
+            let view = publication.active().expect("active view");
+            assert_eq!(view.udp_config, udp);
+            assert_eq!(view.tcp_config, tcp);
+            assert_eq!(view.firewall_config, firewall);
         });
     }
 

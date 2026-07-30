@@ -73,11 +73,11 @@ impl<'view, 'storage> FullServicePublication<'storage> for Publication<'view, 's
             snapshot: self.snapshot,
             resolution: self.resolution,
             icmpv4_errors: self.icmpv4_errors,
-            udp_config: &self.udp_config,
+            udp_config: self.udp_config,
             nat44_udp: None::<&mut Nat44UdpRuntime<'_>>,
-            tcp_config: &self.tcp_config,
+            tcp_config: self.tcp_config,
             nat44_tcp: None::<&mut Nat44TcpRuntime<'_>>,
-            firewall_config: &self.firewall_config,
+            firewall_config: self.firewall_config,
             firewall: None::<&mut FirewallRuntime<'_>>,
         })
     }

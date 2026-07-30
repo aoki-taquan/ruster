@@ -313,6 +313,9 @@ active viewがなければRXを開始せず、残りの全phaseを`NoActivePubli
 resolution、generated ICMP captureのfull composition wrapperだけを使用します。
 `active`はO(1)のsteady-tick borrowであり、semantic validation、fingerprint/hash計算、slice scan、
 allocationを繰り返しません。これらはcandidate構築・publicationのcold pathで完了します。
+validated NAT/firewall config identityは`Copy`値としてviewへ渡し、publication adapterに
+一時config値への参照を返させません。snapshotとmutable runtime storageだけがview lifetimeで
+borrowされます。
 
 `TickBudgets`はRX packet数、resolution timer scan、failure dispatch scan、generated ARP action、
 generated ICMPv4 actionを独立に制限します。RX batchはlexical scopeでwrapperへmoveし、
