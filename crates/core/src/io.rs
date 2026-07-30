@@ -104,10 +104,17 @@ impl<Backend> PublicationQuiescenceWitness for PublicationQuiescenceGuard<'_, Ba
 /// that exact backend exclusively. Implementing this trait does not by itself
 /// claim an AF_XDP completion-queue drain; each backend must define and prove
 /// its own authoritative completion boundary.
-/// [`Self::quiescence_error_disposition`] separately determines whether the
-/// old publication can safely perform another local operation. The default
-/// skips packet I/O, so adding a new error cannot accidentally become
-/// re-entrant.
+/// [`Self::quiescence_error_disposition`] classifies one failed publication
+/// attempt. [`Self::current_io_disposition`] is the steady, backend-owned
+/// re-entry seam: runtimes call it on candidate-free ticks instead of
+/// requesting another guard. It must keep returning [`PublicationQuiescenceDisposition::SkipIo`]
+/// until an explicit backend recovery has made packet I/O re-entrant.
+/// [`PublicationQuiescenceDisposition::Stop`] is terminal for that backend
+/// value and must never transition back to another disposition.
+///
+/// Both checks must inspect only bounded backend-owned state. The error
+/// classifier defaults to `SkipIo`, so adding a new error cannot accidentally
+/// make the tick containing that error re-entrant.
 ///
 /// A scalar cannot be substituted for the exact borrow:
 ///
@@ -150,6 +157,15 @@ pub trait PublicationQuiescence: Sized {
         Self: 'backend;
 
     fn try_publication_quiescence(&mut self) -> Result<Self::Guard<'_>, Self::Error>;
+
+    /// Reports whether the backend can safely enter packet I/O now.
+    ///
+    /// This bounded, read-only check is distinct from acquiring a publication
+    /// guard. It is required so a candidate-free tick cannot re-enter a
+    /// backend after an earlier `SkipIo` or `Stop` result. `SkipIo` may recover
+    /// only after the backend has explicitly reclaimed all conflicting local
+    /// ownership. `Stop` is terminal for the lifetime of this backend value.
+    fn current_io_disposition(&self) -> PublicationQuiescenceDisposition;
 
     /// Classifies whether the current publication may continue packet I/O.
     ///
@@ -351,6 +367,10 @@ mod tests {
 
         fn try_publication_quiescence(&mut self) -> Result<Self::Guard<'_>, Self::Error> {
             Err(())
+        }
+
+        fn current_io_disposition(&self) -> PublicationQuiescenceDisposition {
+            PublicationQuiescenceDisposition::SkipIo
         }
     }
 

@@ -536,6 +536,17 @@ impl PublicationQuiescence for SimIo {
         Ok(PublicationQuiescenceGuard::new(self))
     }
 
+    fn current_io_disposition(&self) -> PublicationQuiescenceDisposition {
+        if self.batch_state != SimBatchState::Idle
+            || self.rx_leases_live != 0
+            || self.generated_leases_live != 0
+        {
+            PublicationQuiescenceDisposition::SkipIo
+        } else {
+            PublicationQuiescenceDisposition::ContinueOldIo
+        }
+    }
+
     fn quiescence_error_disposition(error: &Self::Error) -> PublicationQuiescenceDisposition {
         match error {
             SimPublicationQuiescenceError::TxCompletionPending => {
