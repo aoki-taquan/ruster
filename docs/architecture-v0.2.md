@@ -460,7 +460,11 @@ timerを使い、FIN/RSTも削除・短縮せずsuccessful TX request時にexact
 non-regressing clockの下ではこの値がlinked sessionの最大activityと一致するため、
 mappingのlive判定はsession storageを走査せずO(1)です。refresh planはmapping/sessionの
 両方のcopyを更新し、後続処理が成功したcommitでだけ同時に公開するため、破棄されたplanは
-mapping lifetimeを延長しません。
+mapping lifetimeを延長しません。要約はcaller-backed mapping slotごとに`u64` 1個
+（logical 8 bytes、Rust layoutのpaddingを除く）を追加し、session capacityには比例しません。
+planはruntime epoch、計画時watermark、対象mapping/sessionのbefore valueへbindします。
+release buildのcommitも全authorityが一致しないstale planをtyped errorとして拒否するため、
+reconcileがgenerationをresetしたABAやslot再利用後に旧tupleを復活させません。
 
 admissionとtransaction順はUDP profileに合わせ、次を追加します。
 

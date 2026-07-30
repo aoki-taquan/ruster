@@ -129,7 +129,7 @@ mod tcp_tests {
             let first = runtime
                 .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
                 .unwrap();
-            runtime.commit_outbound(first, 0);
+            runtime.commit_outbound(first, 0).unwrap();
             assert!(matches!(
                 runtime.plan_outbound(INTERNAL, 40_000, REMOTE2, 443, true, 1),
                 Err(Nat44TcpPlanError::SessionFull)
@@ -151,7 +151,9 @@ mod tcp_tests {
                     NAT44_TCP_DEFAULT_IDLE_TTL_MS,
                 )
                 .unwrap();
-            runtime.commit_outbound(replacement, NAT44_TCP_DEFAULT_IDLE_TTL_MS);
+            runtime
+                .commit_outbound(replacement, NAT44_TCP_DEFAULT_IDLE_TTL_MS)
+                .unwrap();
             assert_eq!(runtime.mappings()[0].internal_address(), INTERNAL2);
             assert_eq!(runtime.counters().mappings_expired, 1);
         });
@@ -170,7 +172,7 @@ mod tcp_tests {
                 let first = runtime
                     .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
                     .unwrap();
-                runtime.commit_outbound(first, 0);
+                runtime.commit_outbound(first, 0).unwrap();
                 assert!(runtime
                     .plan_inbound(40_000, REMOTE1, 443, NAT44_TCP_MIN_IDLE_TTL_MS - 1)
                     .is_ok());
@@ -199,7 +201,9 @@ mod tcp_tests {
                         NAT44_TCP_MIN_IDLE_TTL_MS,
                     )
                     .unwrap();
-                runtime.commit_outbound(recreated, NAT44_TCP_MIN_IDLE_TTL_MS);
+                runtime
+                    .commit_outbound(recreated, NAT44_TCP_MIN_IDLE_TTL_MS)
+                    .unwrap();
                 assert_eq!(runtime.counters().mappings_expired, 1);
                 assert_eq!(runtime.counters().sessions_expired, 1);
                 let report = runtime.reconcile(config);
@@ -235,13 +239,13 @@ mod tcp_tests {
                 let first = runtime
                     .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
                     .unwrap();
-                runtime.commit_outbound(first, 0);
+                runtime.commit_outbound(first, 0).unwrap();
                 let generation = runtime.mappings()[0].generation;
 
                 let second = runtime
                     .plan_outbound(INTERNAL, 40_000, REMOTE2, 8443, true, ttl - 1)
                     .unwrap();
-                runtime.commit_outbound(second, ttl - 1);
+                runtime.commit_outbound(second, ttl - 1).unwrap();
                 assert_eq!(runtime.mappings()[0].last_activity_ms, ttl - 1);
 
                 assert!(matches!(
@@ -251,7 +255,7 @@ mod tcp_tests {
                 let third = runtime
                     .plan_outbound(INTERNAL, 40_000, REMOTE1, 9443, true, ttl)
                     .unwrap();
-                runtime.commit_outbound(third, ttl);
+                runtime.commit_outbound(third, ttl).unwrap();
 
                 assert_eq!(runtime.mappings()[0].generation, generation);
                 assert_eq!(runtime.mappings()[0].last_activity_ms, ttl);
@@ -291,7 +295,7 @@ mod tcp_tests {
                 let first = runtime
                     .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 100)
                     .unwrap();
-                runtime.commit_outbound(first, 100);
+                runtime.commit_outbound(first, 100).unwrap();
 
                 let before_mapping = runtime.mappings()[0];
                 let before_session = runtime.sessions()[0];
@@ -318,6 +322,134 @@ mod tcp_tests {
     }
 
     #[test]
+    fn stale_outbound_plan_after_reconcile_is_rejected_atomically() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_000, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let mut runtime = Nat44TcpRuntime::new(config, &mut mappings, &mut sessions);
+            let first = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                .unwrap();
+            runtime.commit_outbound(first, 0).unwrap();
+            let stale = runtime
+                .plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 443, false, 1)
+                .unwrap();
+
+            runtime.reconcile(config);
+            let before_mapping = runtime.mappings()[0];
+            let before_session = runtime.sessions()[0];
+            let before_watermark = runtime.watermark_ms;
+            let before_epoch = runtime.runtime_epoch;
+            let before_generation = runtime.next_generation;
+            let before_counters = runtime.counters();
+            assert_eq!(
+                runtime.commit_outbound(stale, 1),
+                Err(Nat44TcpCommitError::StalePlan)
+            );
+            assert_eq!(runtime.mappings()[0], before_mapping);
+            assert_eq!(runtime.sessions()[0], before_session);
+            assert_eq!(runtime.watermark_ms, before_watermark);
+            assert_eq!(runtime.runtime_epoch, before_epoch);
+            assert_eq!(runtime.next_generation, before_generation);
+            assert_eq!(runtime.counters(), before_counters);
+        });
+    }
+
+    #[test]
+    fn stale_inbound_plan_cannot_aba_after_same_generation_recreation() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_000, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let mut runtime = Nat44TcpRuntime::new(config, &mut mappings, &mut sessions);
+            let first = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                .unwrap();
+            runtime.commit_outbound(first, 0).unwrap();
+            let stale = runtime
+                .plan_inbound_read_only(40_000, REMOTE1, 443, 0)
+                .unwrap();
+            let stale_mapping = runtime.mappings()[0];
+            let stale_session = runtime.sessions()[0];
+
+            runtime.reconcile(config);
+            let recreated = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                .unwrap();
+            runtime.commit_outbound(recreated, 0).unwrap();
+            assert_eq!(runtime.mappings()[0], stale_mapping);
+            assert_eq!(runtime.sessions()[0], stale_session);
+
+            let before_mapping = runtime.mappings()[0];
+            let before_session = runtime.sessions()[0];
+            let before_watermark = runtime.watermark_ms;
+            let before_epoch = runtime.runtime_epoch;
+            let before_counters = runtime.counters();
+            assert_eq!(
+                runtime.commit_inbound(stale, 0),
+                Err(Nat44TcpCommitError::StalePlan)
+            );
+            assert_eq!(runtime.mappings()[0], before_mapping);
+            assert_eq!(runtime.sessions()[0], before_session);
+            assert_eq!(runtime.watermark_ms, before_watermark);
+            assert_eq!(runtime.runtime_epoch, before_epoch);
+            assert_eq!(runtime.counters(), before_counters);
+        });
+    }
+
+    #[test]
+    fn stale_bidirectional_plans_cannot_overwrite_reused_mapping_slot() {
+        let ttl = NAT44_TCP_MIN_IDLE_TTL_MS;
+        with_config(
+            Nat44TcpPolicy::new(ttl, 0).unwrap(),
+            40_000,
+            40_000,
+            |config| {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+                let mut runtime = Nat44TcpRuntime::new(config, &mut mappings, &mut sessions);
+                let first = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                    .unwrap();
+                runtime.commit_outbound(first, 0).unwrap();
+                let stale_outbound = runtime
+                    .plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 443, false, 0)
+                    .unwrap();
+                let stale_inbound = runtime
+                    .plan_inbound_read_only(40_000, REMOTE1, 443, 0)
+                    .unwrap();
+
+                let replacement = runtime
+                    .plan_outbound(INTERNAL2, 40_000, REMOTE2, 8443, true, ttl)
+                    .unwrap();
+                runtime.commit_outbound(replacement, ttl).unwrap();
+                let before_mapping = runtime.mappings()[0];
+                let before_session = runtime.sessions()[0];
+                let before_watermark = runtime.watermark_ms;
+                let before_epoch = runtime.runtime_epoch;
+                let before_generation = runtime.next_generation;
+                let before_counters = runtime.counters();
+
+                assert_eq!(
+                    runtime.commit_outbound(stale_outbound, 0),
+                    Err(Nat44TcpCommitError::StalePlan)
+                );
+                assert_eq!(
+                    runtime.commit_inbound(stale_inbound, 0),
+                    Err(Nat44TcpCommitError::StalePlan)
+                );
+                assert_eq!(runtime.mappings()[0], before_mapping);
+                assert_eq!(runtime.sessions()[0], before_session);
+                assert_eq!(runtime.mappings()[0].internal_address, INTERNAL2);
+                assert_eq!(runtime.sessions()[0].remote_address, REMOTE2);
+                assert_eq!(runtime.watermark_ms, before_watermark);
+                assert_eq!(runtime.runtime_epoch, before_epoch);
+                assert_eq!(runtime.next_generation, before_generation);
+                assert_eq!(runtime.counters(), before_counters);
+            },
+        );
+    }
+
+    #[test]
     fn tcp_mapping_liveness_never_inspects_session_storage() {
         with_config(Nat44TcpPolicy::default(), 40_000, 40_002, |config| {
             let internal3 = Ipv4Address::from_octets([10, 0, 0, 12]);
@@ -328,7 +460,7 @@ mod tcp_tests {
                 let plan = runtime
                     .plan_outbound(internal, port, REMOTE1, 443, true, 0)
                     .unwrap();
-                runtime.commit_outbound(plan, 0);
+                runtime.commit_outbound(plan, 0).unwrap();
             }
 
             runtime.reset_liveness_checks();
@@ -364,7 +496,7 @@ mod tcp_tests {
                 let first = runtime
                     .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 100)
                     .unwrap();
-                runtime.commit_outbound(first, 100);
+                runtime.commit_outbound(first, 100).unwrap();
                 let before_mapping = runtime.mappings()[0];
                 let before_session = runtime.sessions()[0];
                 let before_counters = runtime.counters();
@@ -396,7 +528,9 @@ mod tcp_tests {
                         100 + NAT44_TCP_MIN_IDLE_TTL_MS,
                     )
                     .unwrap();
-                runtime.commit_outbound(reused, 100 + NAT44_TCP_MIN_IDLE_TTL_MS);
+                runtime
+                    .commit_outbound(reused, 100 + NAT44_TCP_MIN_IDLE_TTL_MS)
+                    .unwrap();
                 assert!(matches!(
                     runtime.inspect_icmpv4(
                         reused.public_port(),
@@ -432,12 +566,12 @@ mod tcp_tests {
                     .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
                     .unwrap();
                 assert_eq!(first.public_port(), 40_000);
-                runtime.commit_outbound(first, 0);
+                runtime.commit_outbound(first, 0).unwrap();
                 let second = runtime
                     .plan_outbound(INTERNAL2, 40_000, REMOTE1, 443, true, 0)
                     .unwrap();
                 assert_eq!(second.public_port(), 40_001);
-                runtime.commit_outbound(second, 0);
+                runtime.commit_outbound(second, 0).unwrap();
                 assert!(matches!(
                     runtime.plan_outbound(
                         Ipv4Address::from_octets([10, 0, 0, 12]),
@@ -1641,6 +1775,7 @@ pub struct Nat44TcpReconcileReport {
 
 #[derive(Clone, Copy)]
 pub(crate) struct Nat44TcpOutboundPlan {
+    authority: Nat44TcpPlanAuthority,
     mapping_index: usize,
     mapping: Nat44TcpMappingSlot,
     session_index: usize,
@@ -1667,10 +1802,25 @@ impl Nat44TcpOutboundPlan {
 
 #[derive(Clone, Copy)]
 pub(crate) struct Nat44TcpInboundPlan {
+    authority: Nat44TcpPlanAuthority,
     mapping_index: usize,
     mapping: Nat44TcpMappingSlot,
     session_index: usize,
     session: Nat44TcpSessionSlot,
+}
+
+#[derive(Clone, Copy)]
+struct Nat44TcpPlanAuthority {
+    runtime_epoch: u128,
+    watermark_ms: Option<u64>,
+    planned_now_ms: u64,
+    mapping_before: Nat44TcpMappingSlot,
+    session_before: Nat44TcpSessionSlot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Nat44TcpCommitError {
+    StalePlan,
 }
 
 impl Nat44TcpInboundPlan {
@@ -1739,6 +1889,7 @@ pub struct Nat44TcpRuntime<'a> {
     mappings: &'a mut [Nat44TcpMappingSlot],
     sessions: &'a mut [Nat44TcpSessionSlot],
     watermark_ms: Option<u64>,
+    runtime_epoch: u128,
     next_generation: u64,
     counters: Nat44TcpCounters,
     #[cfg(test)]
@@ -1761,6 +1912,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             mappings,
             sessions,
             watermark_ms: None,
+            runtime_epoch: 1,
             next_generation: 1,
             counters: Nat44TcpCounters::default(),
             #[cfg(test)]
@@ -1798,6 +1950,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         self.sessions.fill(Nat44TcpSessionSlot::default());
         self.config = config;
         self.watermark_ms = None;
+        self.runtime_epoch = self.runtime_epoch.wrapping_add(1);
         self.next_generation = 1;
         self.counters.reconciliations = self.counters.reconciliations.saturating_add(1);
         Nat44TcpReconcileReport {
@@ -1876,6 +2029,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         if let Some((mapping_index, mut mapping)) =
             self.find_mapping(internal_address, internal_port, now_ms)
         {
+            let mapping_before = mapping;
             if let Some((session_index, mut session)) = self.find_session(
                 mapping_index,
                 mapping.generation,
@@ -1883,9 +2037,11 @@ impl<'a> Nat44TcpRuntime<'a> {
                 remote_port,
                 now_ms,
             ) {
+                let session_before = session;
                 mapping.last_activity_ms = now_ms;
                 session.last_activity_ms = now_ms;
                 return Ok(Nat44TcpOutboundPlan {
+                    authority: self.plan_authority(now_ms, mapping_before, session_before),
                     mapping_index,
                     mapping,
                     session_index,
@@ -1902,9 +2058,11 @@ impl<'a> Nat44TcpRuntime<'a> {
             let Some(session_index) = self.find_reusable_session(now_ms) else {
                 return Err(Nat44TcpPlanError::SessionFull);
             };
-            let session_expired = self.sessions[session_index].occupied;
+            let session_before = self.sessions[session_index];
+            let session_expired = session_before.occupied;
             mapping.last_activity_ms = now_ms;
             return Ok(Nat44TcpOutboundPlan {
+                authority: self.plan_authority(now_ms, mapping_before, session_before),
                 mapping_index,
                 mapping,
                 session_index,
@@ -1935,9 +2093,12 @@ impl<'a> Nat44TcpRuntime<'a> {
             return Err(Nat44TcpPlanError::PortExhausted);
         };
         let generation = self.next_generation.max(1);
-        let mapping_expired = self.mappings[mapping_index].occupied;
-        let session_expired = self.sessions[session_index].occupied;
+        let mapping_before = self.mappings[mapping_index];
+        let session_before = self.sessions[session_index];
+        let mapping_expired = mapping_before.occupied;
+        let session_expired = session_before.occupied;
         Ok(Nat44TcpOutboundPlan {
+            authority: self.plan_authority(now_ms, mapping_before, session_before),
             mapping_index,
             mapping: Nat44TcpMappingSlot {
                 occupied: true,
@@ -2004,6 +2165,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         else {
             return Err(Nat44TcpPlanError::MappingMiss);
         };
+        let mapping_before = mapping;
         let Some((session_index, mut session)) = self.find_session(
             mapping_index,
             mapping.generation,
@@ -2013,9 +2175,11 @@ impl<'a> Nat44TcpRuntime<'a> {
         ) else {
             return Err(Nat44TcpPlanError::SessionMiss);
         };
+        let session_before = session;
         mapping.last_activity_ms = now_ms;
         session.last_activity_ms = now_ms;
         Ok(Nat44TcpInboundPlan {
+            authority: self.plan_authority(now_ms, mapping_before, session_before),
             mapping_index,
             mapping,
             session_index,
@@ -2023,7 +2187,17 @@ impl<'a> Nat44TcpRuntime<'a> {
         })
     }
 
-    pub(crate) fn commit_outbound(&mut self, plan: Nat44TcpOutboundPlan, now_ms: u64) {
+    pub(crate) fn commit_outbound(
+        &mut self,
+        plan: Nat44TcpOutboundPlan,
+        now_ms: u64,
+    ) -> Result<(), Nat44TcpCommitError> {
+        self.validate_commit_authority(
+            plan.authority,
+            plan.mapping_index,
+            plan.session_index,
+            now_ms,
+        )?;
         if plan.mapping_created {
             for session in self
                 .sessions
@@ -2054,20 +2228,61 @@ impl<'a> Nat44TcpRuntime<'a> {
             self.counters.sessions_reused = self.counters.sessions_reused.saturating_add(1);
         }
         self.counters.outbound_translated = self.counters.outbound_translated.saturating_add(1);
+        self.runtime_epoch = self.runtime_epoch.wrapping_add(1);
+        Ok(())
     }
 
-    pub(crate) fn commit_inbound(&mut self, plan: Nat44TcpInboundPlan, now_ms: u64) {
-        debug_assert!(self
-            .mappings
-            .get(plan.mapping_index)
-            .is_some_and(|mapping| {
-                mapping.occupied && mapping.generation == plan.mapping.generation
-            }));
+    pub(crate) fn commit_inbound(
+        &mut self,
+        plan: Nat44TcpInboundPlan,
+        now_ms: u64,
+    ) -> Result<(), Nat44TcpCommitError> {
+        self.validate_commit_authority(
+            plan.authority,
+            plan.mapping_index,
+            plan.session_index,
+            now_ms,
+        )?;
         self.mappings[plan.mapping_index] = plan.mapping;
         self.sessions[plan.session_index] = plan.session;
         self.watermark_ms = Some(now_ms);
         self.counters.sessions_reused = self.counters.sessions_reused.saturating_add(1);
         self.counters.inbound_translated = self.counters.inbound_translated.saturating_add(1);
+        self.runtime_epoch = self.runtime_epoch.wrapping_add(1);
+        Ok(())
+    }
+
+    fn plan_authority(
+        &self,
+        planned_now_ms: u64,
+        mapping_before: Nat44TcpMappingSlot,
+        session_before: Nat44TcpSessionSlot,
+    ) -> Nat44TcpPlanAuthority {
+        Nat44TcpPlanAuthority {
+            runtime_epoch: self.runtime_epoch,
+            watermark_ms: self.watermark_ms,
+            planned_now_ms,
+            mapping_before,
+            session_before,
+        }
+    }
+
+    fn validate_commit_authority(
+        &self,
+        authority: Nat44TcpPlanAuthority,
+        mapping_index: usize,
+        session_index: usize,
+        now_ms: u64,
+    ) -> Result<(), Nat44TcpCommitError> {
+        if authority.runtime_epoch != self.runtime_epoch
+            || authority.watermark_ms != self.watermark_ms
+            || authority.planned_now_ms != now_ms
+            || self.mappings.get(mapping_index) != Some(&authority.mapping_before)
+            || self.sessions.get(session_index) != Some(&authority.session_before)
+        {
+            return Err(Nat44TcpCommitError::StalePlan);
+        }
+        Ok(())
     }
 
     pub(crate) fn record_plan_error(&mut self, error: Nat44TcpPlanError) {

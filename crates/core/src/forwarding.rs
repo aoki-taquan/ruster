@@ -1585,10 +1585,14 @@ where
                         .expect("TCP NAT decision requires a bound runtime");
                     match nat.transition {
                         Nat44TcpTransition::Outbound(plan) => {
-                            runtime.commit_outbound(plan, nat_now_ms);
+                            runtime
+                                .commit_outbound(plan, nat_now_ms)
+                                .expect("sequential packet path keeps TCP NAT plan current");
                         }
                         Nat44TcpTransition::Inbound(plan) => {
-                            runtime.commit_inbound(plan, nat_now_ms);
+                            runtime
+                                .commit_inbound(plan, nat_now_ms)
+                                .expect("sequential packet path keeps TCP NAT plan current");
                         }
                     }
                     trace.record(TraceEvent::Nat44Tcp {
