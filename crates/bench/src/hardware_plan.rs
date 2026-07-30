@@ -84,9 +84,21 @@ pub enum FrameWireModel {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A reduced packet-rate fraction whose denominator is always nonzero.
+///
+/// The invariant is enforced at the public API boundary:
+///
+/// ```compile_fail
+/// use ruster_bench::ExactPacketRate;
+///
+/// let _invalid = ExactPacketRate {
+///     numerator: 1,
+///     denominator: 0,
+/// };
+/// ```
 pub struct ExactPacketRate {
-    pub numerator: u128,
-    pub denominator: u128,
+    numerator: u128,
+    denominator: u128,
 }
 
 impl ExactPacketRate {
@@ -99,6 +111,16 @@ impl ExactPacketRate {
     }
 
     #[must_use]
+    pub const fn numerator(self) -> u128 {
+        self.numerator
+    }
+
+    #[must_use]
+    pub const fn denominator(self) -> u128 {
+        self.denominator
+    }
+
+    #[must_use]
     pub const fn floor_pps(self) -> u128 {
         self.numerator / self.denominator
     }
@@ -106,6 +128,10 @@ impl ExactPacketRate {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HardwarePlanError {
+    UnsupportedVersion {
+        expected: u32,
+        actual: u32,
+    },
     ZeroBitRate,
     ArithmeticOverflow,
     InvalidCase {
@@ -143,6 +169,12 @@ pub enum HardwarePlanError {
 impl fmt::Display for HardwarePlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::UnsupportedVersion { expected, actual } => {
+                write!(
+                    formatter,
+                    "unsupported hardware plan version: expected {expected}, got {actual}"
+                )
+            }
             Self::ZeroBitRate => formatter.write_str("line bit rate must be nonzero"),
             Self::ArithmeticOverflow => formatter.write_str("hardware plan arithmetic overflow"),
             Self::InvalidCase { case_id, reason } => {
@@ -254,14 +286,21 @@ pub fn line_rate_packet_rate(
 
 pub fn hardware_plan_v1() -> Result<HardwarePlan, HardwarePlanError> {
     let plan = HardwarePlan {
-        version: HARDWARE_PLAN_VERSION,
+        version: 1,
         cases: build_hardware_plan_v1(),
     };
-    validate_hardware_plan_v1(&plan.cases)?;
+    validate_hardware_plan_v1(&plan)?;
     Ok(plan)
 }
 
-pub fn validate_hardware_plan_v1(cases: &[PlannedHardwareCase]) -> Result<(), HardwarePlanError> {
+pub fn validate_hardware_plan_v1(plan: &HardwarePlan) -> Result<(), HardwarePlanError> {
+    if plan.version != 1 {
+        return Err(HardwarePlanError::UnsupportedVersion {
+            expected: 1,
+            actual: plan.version,
+        });
+    }
+    let cases = &plan.cases;
     for planned in cases {
         planned
             .case
@@ -622,6 +661,16 @@ mod tests {
         );
 
         let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in first.version.to_be_bytes().into_iter().chain(*b"\n") {
+            fingerprint ^= u64::from(byte);
+            fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        for frame in RUSTER_IMIX_V1_CYCLE {
+            for byte in frame.label().bytes().chain(*b"\n") {
+                fingerprint ^= u64::from(byte);
+                fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
         for planned in &first.cases {
             for byte in planned
                 .ordinal
@@ -636,44 +685,54 @@ mod tests {
                 fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
             }
         }
-        assert_eq!(fingerprint, 0xf203_5b2f_c3d2_2d89);
+        assert_eq!(fingerprint, 0xf68c_80b7_2065_c023);
     }
 
     #[test]
-    fn hardware_plan_rejects_duplicate_missing_unexpected_order_and_metadata_drift() {
+    fn hardware_plan_rejects_version_duplicate_missing_unexpected_order_and_metadata_drift() {
         let plan = hardware_plan_v1().unwrap();
 
-        let mut duplicate = plan.cases.clone();
-        duplicate[1] = duplicate[0].clone();
+        let mut wrong_version = plan.clone();
+        wrong_version.version = 2;
+        assert_eq!(
+            validate_hardware_plan_v1(&wrong_version),
+            Err(HardwarePlanError::UnsupportedVersion {
+                expected: 1,
+                actual: 2,
+            })
+        );
+
+        let mut duplicate = plan.clone();
+        duplicate.cases[1] = duplicate.cases[0].clone();
         assert!(matches!(
             validate_hardware_plan_v1(&duplicate),
             Err(HardwarePlanError::DuplicateCase(_))
         ));
 
-        let mut missing = plan.cases.clone();
-        let missing_id = missing.remove(17).case_id;
+        let mut missing = plan.clone();
+        let missing_id = missing.cases.remove(17).case_id;
         assert_eq!(
             validate_hardware_plan_v1(&missing),
             Err(HardwarePlanError::MissingCase(missing_id))
         );
 
-        let mut unexpected = plan.cases.clone();
-        unexpected[0].case.flow_count = 9_999;
-        unexpected[0].case_id = unexpected[0].case.canonical_id();
+        let mut unexpected = plan.clone();
+        unexpected.cases[0].case.flow_count = 9_999;
+        unexpected.cases[0].case_id = unexpected.cases[0].case.canonical_id();
         assert!(matches!(
             validate_hardware_plan_v1(&unexpected),
             Err(HardwarePlanError::UnexpectedCase(_))
         ));
 
-        let mut reordered = plan.cases.clone();
-        reordered.swap(0, 1);
+        let mut reordered = plan.clone();
+        reordered.cases.swap(0, 1);
         assert!(matches!(
             validate_hardware_plan_v1(&reordered),
             Err(HardwarePlanError::OrdinalMismatch { .. })
         ));
 
-        let mut seed_drift = plan.cases.clone();
-        seed_drift[3].seed += 1;
+        let mut seed_drift = plan;
+        seed_drift.cases[3].seed += 1;
         assert!(matches!(
             validate_hardware_plan_v1(&seed_drift),
             Err(HardwarePlanError::SeedMismatch { ordinal: 3, .. })
@@ -743,25 +802,21 @@ mod tests {
             })
         );
         assert_eq!(
-            RUSTER_IMIX_V1_CYCLE
-                .iter()
-                .filter(|frame| **frame == HardwareFrame::Eth64)
-                .count(),
-            7
-        );
-        assert_eq!(
-            RUSTER_IMIX_V1_CYCLE
-                .iter()
-                .filter(|frame| **frame == HardwareFrame::Eth512)
-                .count(),
-            4
-        );
-        assert_eq!(
-            RUSTER_IMIX_V1_CYCLE
-                .iter()
-                .filter(|frame| **frame == HardwareFrame::Ipv4Mtu1500)
-                .count(),
-            1
+            RUSTER_IMIX_V1_CYCLE,
+            [
+                HardwareFrame::Eth64,
+                HardwareFrame::Eth64,
+                HardwareFrame::Eth64,
+                HardwareFrame::Eth64,
+                HardwareFrame::Eth64,
+                HardwareFrame::Eth64,
+                HardwareFrame::Eth64,
+                HardwareFrame::Eth512,
+                HardwareFrame::Eth512,
+                HardwareFrame::Eth512,
+                HardwareFrame::Eth512,
+                HardwareFrame::Ipv4Mtu1500,
+            ]
         );
 
         for (frame, numerator, denominator, floor) in [
@@ -772,8 +827,9 @@ mod tests {
             (HardwareFrame::RusterImixV1, 2_500_000_000, 709, 3_526_093),
         ] {
             let rate = line_rate_packet_rate(frame, 10_000_000_000).unwrap();
-            assert_eq!(rate.numerator, numerator);
-            assert_eq!(rate.denominator, denominator);
+            assert_eq!(rate.numerator(), numerator);
+            assert_eq!(rate.denominator(), denominator);
+            assert_ne!(rate.denominator(), 0);
             assert_eq!(rate.floor_pps(), floor);
         }
         assert_eq!(

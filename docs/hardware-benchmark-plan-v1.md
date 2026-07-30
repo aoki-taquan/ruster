@@ -17,9 +17,10 @@ traffic generator、AF_XDP、PVE、hardware runner、threshold、baseline、pass
 
 各slice内では文書に記載した配列順で、frame、direction、service、transportの順に
 nested enumerationします。plannerはcanonical IDの重複、期待集合からのmissing/
-unexpected case、order、ordinal、seed、class driftを拒否します。
-unit testは全237件のordinal、seed、class、case IDを含む非暗号学的regression fingerprint
-`f2035b2fc3d22d89`も固定し、中間caseの意図しない変更を検出します。このfingerprintは
+unexpected case、order、ordinal、seed、class driftに加え、literal plan version `1`
+以外を拒否します。unit testはliteral version、ordered 12-packet IMIX cycle、全237件の
+ordinal、seed、class、case IDを含む非暗号学的regression fingerprint
+`f68c80b72065c023`も固定し、中間caseの意図しない変更を検出します。このfingerprintは
 artifactの真正性や署名を表しません。
 
 ## Primary cases
