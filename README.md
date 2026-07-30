@@ -143,4 +143,5 @@ scripts/test-check-requirements.sh
 ```
 
 設計契約と非対象は[architecture v0.2](docs/architecture-v0.2.md)、要件とRFC根拠は
-[requirements](docs/requirements-v0.2.md)を参照してください。
+[requirements](docs/requirements-v0.2.md)、production backendから自宅ラボ運用までの
+優先順位とmilestoneは[development plan](docs/development-plan-v0.2.md)を参照してください。
