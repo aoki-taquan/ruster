@@ -346,12 +346,12 @@ pub struct FirewallConfig<'a> {
     hash_key: FirewallHashKey,
     snapshot_authority: u64,
     snapshot_identity: [usize; 8],
-    snapshot_publication_nonce: u64,
-    firewall_publication_nonce: u64,
     rules_identity: usize,
     rules_len: usize,
     rules_fingerprint: u64,
 }
+
+const VALIDATED_FIREWALL_OWNER_AUTHORITY_BIT: u64 = 1 << 63;
 
 impl std::fmt::Debug for FirewallConfig<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -486,11 +486,9 @@ impl<'a> FirewallConfig<'a> {
             hash_key,
             snapshot_authority: snapshot.authority(),
             snapshot_identity: snapshot.identity(),
-            snapshot_publication_nonce: snapshot.publication_nonce(),
-            firewall_publication_nonce: 0,
             rules_identity: rules.as_ptr() as usize,
             rules_len: rules.len(),
-            rules_fingerprint: rules_fingerprint(rules),
+            rules_fingerprint: rules_fingerprint(rules) & !VALIDATED_FIREWALL_OWNER_AUTHORITY_BIT,
         })
     }
 
@@ -515,9 +513,12 @@ impl<'a> FirewallConfig<'a> {
     }
 
     pub(crate) fn authority_matches(self, snapshot: &ForwardingSnapshot<'_>) -> bool {
-        self.snapshot_authority == snapshot.authority()
-            && self.snapshot_identity == snapshot.identity()
-            && self.snapshot_publication_nonce == snapshot.publication_nonce()
+        let authority = if self.rules_fingerprint & VALIDATED_FIREWALL_OWNER_AUTHORITY_BIT == 0 {
+            snapshot.authority()
+        } else {
+            snapshot.publication_nonce()
+        };
+        self.snapshot_authority == authority && self.snapshot_identity == snapshot.identity()
     }
 
     const fn binding(self) -> FirewallConfigBinding {
@@ -527,8 +528,6 @@ impl<'a> FirewallConfig<'a> {
             hash_key: self.hash_key,
             snapshot_authority: self.snapshot_authority,
             snapshot_identity: self.snapshot_identity,
-            snapshot_publication_nonce: self.snapshot_publication_nonce,
-            firewall_publication_nonce: self.firewall_publication_nonce,
             rules_identity: self.rules_identity,
             rules_len: self.rules_len,
             rules_fingerprint: self.rules_fingerprint,
@@ -549,7 +548,8 @@ impl ValidatedFirewallOwner {
         }
         let mut binding =
             FirewallConfig::new(snapshot, &rules, policy, generation, hash_key)?.binding();
-        binding.firewall_publication_nonce = next_firewall_publication_nonce()
+        binding.snapshot_authority = snapshot.publication_nonce();
+        binding.rules_fingerprint = next_firewall_publication_nonce()
             .ok_or(FirewallConfigError::PublicationNonceExhausted)?;
         Ok(Self { rules, binding })
     }
@@ -565,8 +565,6 @@ impl ValidatedFirewallOwner {
             hash_key: binding.hash_key,
             snapshot_authority: binding.snapshot_authority,
             snapshot_identity: binding.snapshot_identity,
-            snapshot_publication_nonce: binding.snapshot_publication_nonce,
-            firewall_publication_nonce: binding.firewall_publication_nonce,
             rules_identity: self.rules.as_ptr() as usize,
             rules_len: self.rules.len(),
             rules_fingerprint: binding.rules_fingerprint,
@@ -584,24 +582,46 @@ impl ValidatedFirewallOwner {
 /// The rules pointer is compared as an opaque identity only and is never
 /// dereferenced. Rule evaluation always borrows the current
 /// [`FirewallConfig`] supplied by the caller.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct FirewallConfigBinding {
     policy: FirewallPolicy,
     generation: u64,
     hash_key: FirewallHashKey,
     snapshot_authority: u64,
     snapshot_identity: [usize; 8],
-    snapshot_publication_nonce: u64,
-    firewall_publication_nonce: u64,
     rules_identity: usize,
     rules_len: usize,
     rules_fingerprint: u64,
 }
 
+impl FirewallConfigBinding {
+    #[cfg(test)]
+    const fn publication_nonce(self) -> u64 {
+        if self.rules_fingerprint & VALIDATED_FIREWALL_OWNER_AUTHORITY_BIT == 0 {
+            0
+        } else {
+            self.rules_fingerprint
+        }
+    }
+}
+
+impl std::fmt::Debug for FirewallConfigBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FirewallConfigBinding")
+            .field("policy", &self.policy)
+            .field("generation", &self.generation)
+            .field("hash_key", &self.hash_key)
+            .field("rules_len", &self.rules_len)
+            .finish_non_exhaustive()
+    }
+}
+
 fn next_firewall_publication_nonce() -> Option<u64> {
     use std::sync::atomic::AtomicU64;
 
-    static NEXT_FIREWALL_PUBLICATION_NONCE: AtomicU64 = AtomicU64::new(1);
+    static NEXT_FIREWALL_PUBLICATION_NONCE: AtomicU64 =
+        AtomicU64::new(VALIDATED_FIREWALL_OWNER_AUTHORITY_BIT | 1);
     next_firewall_publication_nonce_from(&NEXT_FIREWALL_PUBLICATION_NONCE)
 }
 
@@ -1939,6 +1959,22 @@ mod tests {
              tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000 }, generation: 1, \
              hash_key: FirewallHashKey([REDACTED]), rules_len: 1, .. }"
         );
+        assert_eq!(
+            format!("{:?}", first.binding()),
+            "FirewallConfigBinding { policy: FirewallPolicy { udp_idle_ttl_ms: 300000, \
+             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000 }, generation: 1, \
+             hash_key: FirewallHashKey([REDACTED]), rules_len: 1, .. }"
+        );
+        let baseline = first.binding();
+        let mut sensitive = baseline;
+        sensitive.snapshot_authority = u64::MAX;
+        sensitive.snapshot_identity = [usize::MAX; 8];
+        sensitive.rules_identity = usize::MAX;
+        sensitive.rules_fingerprint = u64::MAX;
+        assert_eq!(format!("{baseline:?}"), format!("{sensitive:?}"));
+        assert_eq!(format!("{baseline:#?}"), format!("{sensitive:#?}"));
+        assert!(!format!("{sensitive:?}").contains(&u64::MAX.to_string()));
+        assert!(!format!("{sensitive:#?}").contains(&u64::MAX.to_string()));
     }
 
     #[test]
@@ -1965,13 +2001,14 @@ mod tests {
         .unwrap();
         let first_config = first.config();
         let identity = first_config.rules_identity;
-        let nonce = first_config.firewall_publication_nonce;
+        let nonce = first_config.binding().publication_nonce();
         assert_eq!(identity, second.config().rules_identity);
         assert_ne!(first_config.binding(), second.config().binding());
+        assert_ne!(nonce & VALIDATED_FIREWALL_OWNER_AUTHORITY_BIT, 0);
 
         let moved = first;
         assert_eq!(moved.config().rules_identity, identity);
-        assert_eq!(moved.config().firewall_publication_nonce, nonce);
+        assert_eq!(moved.config().binding().publication_nonce(), nonce);
 
         let counter = AtomicU64::new(u64::MAX - 1);
         assert_eq!(
