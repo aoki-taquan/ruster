@@ -1,0 +1,12 @@
+[package]
+name = "ruster-control"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+validation-test-hooks = ["ruster-core/validation-test-hooks"]
+
+[dependencies]
+ruster-core = { path = "../core" }
