@@ -1,9 +1,21 @@
-use std::{marker::PhantomData, rc::Rc};
+use std::{
+    marker::PhantomData,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 #[cfg(test)]
 use std::cell::Cell;
 
-use crate::{route, ForwardingSnapshot, IfId, Ipv4Address};
+use crate::{
+    fixed_directory::{
+        DirectoryHashDomain, DirectoryHashKey, DirectorySemanticError, FixedDirectory,
+        PortOwnerError, PortOwnerExpectation, PortOwnerSemanticError, PortOwnerTable,
+        PortOwnerToken, PreparedDirectoryLink, PreparedDirectoryRelink,
+        PreparedPortOwnerMoveTopology,
+    },
+    route, DirectoryBucket, DirectoryNode, ForwardingSnapshot, IfId, Ipv4Address, PortOwnerSlot,
+};
 
 pub const NAT44_UDP_MIN_IDLE_TTL_MS: u64 = 120_000;
 pub const NAT44_UDP_DEFAULT_IDLE_TTL_MS: u64 = 300_000;
@@ -11,6 +23,30 @@ pub const NAT44_UDP_MAX_IDLE_TTL_MS: u64 = 86_400_000;
 pub const NAT44_TCP_MIN_IDLE_TTL_MS: u64 = 7_440_000;
 pub const NAT44_TCP_DEFAULT_IDLE_TTL_MS: u64 = 7_440_000;
 pub const NAT44_TCP_MAX_IDLE_TTL_MS: u64 = 604_800_000;
+const UDP_INDEX_NONE: u32 = u32::MAX;
+static NEXT_UDP_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_udp_runtime_identity() -> Result<u64, Nat44UdpRuntimeConfigError> {
+    allocate_udp_runtime_identity_from(&NEXT_UDP_RUNTIME_IDENTITY)
+}
+
+fn allocate_udp_runtime_identity_from(
+    identities: &AtomicU64,
+) -> Result<u64, Nat44UdpRuntimeConfigError> {
+    identities
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+            identity.checked_add(1)
+        })
+        .map_err(|_| Nat44UdpRuntimeConfigError::RuntimeIdentityExhausted)
+}
+
+fn encode_udp_index(index: usize) -> u32 {
+    u32::try_from(index).expect("validated UDP NAT capacity fits u32")
+}
+
+fn encode_optional_udp_index(index: Option<usize>) -> u32 {
+    index.map_or(UDP_INDEX_NONE, encode_udp_index)
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
@@ -642,6 +678,34 @@ impl Default for Nat44UdpPolicy {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct Nat44UdpHashKey(DirectoryHashKey);
+
+impl std::fmt::Debug for Nat44UdpHashKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Nat44UdpHashKey([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Nat44UdpHashKeyError {
+    AllZero,
+}
+
+impl Nat44UdpHashKey {
+    /// Constructs a control-plane supplied UDP NAT index key.
+    ///
+    /// The control plane must generate a fresh unpredictable key for every
+    /// runtime construction and successful publication.
+    pub const fn new(first: u64, second: u64) -> Result<Self, Nat44UdpHashKeyError> {
+        match DirectoryHashKey::new(first, second) {
+            Ok(key) => Ok(Self(key)),
+            Err(_) => Err(Nat44UdpHashKeyError::AllZero),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Nat44UdpConfig {
     inside: IfId,
@@ -765,6 +829,8 @@ impl Nat44UdpConfig {
 pub struct Nat44UdpMappingSlot {
     occupied: bool,
     generation: u64,
+    lifecycle_epoch: u128,
+    port_owned: bool,
     inside: IfId,
     internal_address: Ipv4Address,
     internal_port: u16,
@@ -777,6 +843,8 @@ impl Default for Nat44UdpMappingSlot {
         Self {
             occupied: false,
             generation: 0,
+            lifecycle_epoch: 0,
+            port_owned: false,
             inside: IfId(0),
             internal_address: Ipv4Address::from_octets([0; 4]),
             internal_port: 0,
@@ -818,6 +886,7 @@ pub struct Nat44UdpPeerSlot {
     occupied: bool,
     mapping_index: usize,
     mapping_generation: u64,
+    mapping_lifecycle_epoch: u128,
     remote_address: Ipv4Address,
 }
 
@@ -827,6 +896,7 @@ impl Default for Nat44UdpPeerSlot {
             occupied: false,
             mapping_index: 0,
             mapping_generation: 0,
+            mapping_lifecycle_epoch: 0,
             remote_address: Ipv4Address::from_octets([0; 4]),
         }
     }
@@ -894,16 +964,34 @@ pub struct Nat44UdpReconcileReport {
 
 #[derive(Clone, Copy)]
 pub(crate) struct Nat44UdpOutboundPlan {
-    mapping_index: usize,
+    mapping_index: u32,
     mapping: Nat44UdpMappingSlot,
-    peer_index: Option<usize>,
+    peer_index: u32,
     peer: Option<Nat44UdpPeerSlot>,
     mapping_created: bool,
     mapping_expired: bool,
     peer_created: bool,
+    expected_runtime_epoch: u128,
+    expected_revision: u128,
+    planned_now_ms: u64,
+    displaced_port_mapping_index: u32,
+    prepared: PreparedNat44UdpOutboundCommit,
 }
 
 impl Nat44UdpOutboundPlan {
+    const fn mapping_index(self) -> usize {
+        self.mapping_index as usize
+    }
+
+    fn peer_index(self) -> Option<usize> {
+        (self.peer_index != UDP_INDEX_NONE).then_some(self.peer_index as usize)
+    }
+
+    fn displaced_port_mapping_index(self) -> Option<usize> {
+        (self.displaced_port_mapping_index != UDP_INDEX_NONE)
+            .then_some(self.displaced_port_mapping_index as usize)
+    }
+
     pub(crate) const fn public_port(self) -> u16 {
         self.mapping.public_port
     }
@@ -923,6 +1011,9 @@ pub(crate) struct Nat44UdpInboundPlan {
     mapping_generation: u64,
     internal_address: Ipv4Address,
     internal_port: u16,
+    expected_runtime_epoch: u128,
+    expected_revision: u128,
+    planned_now_ms: u64,
 }
 
 impl Nat44UdpInboundPlan {
@@ -950,6 +1041,56 @@ pub(crate) enum Nat44UdpPlanError {
     PeerFull,
     PortExhausted,
     ClockRegression,
+    IndexCorrupt,
+    GenerationExhausted,
+    StateRevisionExhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Nat44UdpCommitError {
+    RuntimeEpochChanged,
+    StateRevisionChanged,
+    CommitTimeChanged,
+    MappingSlotChanged,
+    IndexCorrupt,
+    StateRevisionExhausted,
+}
+
+#[derive(Clone, Copy)]
+struct Nat44UdpPortSelection {
+    port: u16,
+    expected_owner: Option<PortOwnerToken>,
+    displaced_mapping_index: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+enum PreparedUdpDirectoryMutation {
+    Link(PreparedDirectoryLink),
+    Relink(PreparedDirectoryRelink),
+}
+
+#[derive(Clone, Copy)]
+struct PreparedNat44UdpOutboundCommit {
+    mapping: Option<PreparedUdpDirectoryMutation>,
+    peer: Option<PreparedUdpDirectoryMutation>,
+    owner: Option<PreparedPortOwnerMoveTopology>,
+}
+
+impl PreparedNat44UdpOutboundCommit {
+    const EMPTY: Self = Self {
+        mapping: None,
+        peer: None,
+        owner: None,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Nat44UdpIndexInvariantError {
+    Mapping(DirectorySemanticError),
+    Peer(DirectorySemanticError),
+    Port(PortOwnerSemanticError),
+    DuplicateMappingKey,
+    DuplicatePeerKey,
 }
 
 #[derive(Clone, Copy)]
@@ -968,11 +1109,288 @@ impl Nat44UdpIcmpv4Lookup {
     }
 }
 
+/// Caller-owned storage for the three UDP NAT hot-path indexes.
+pub struct Nat44UdpIndexStorage<'a> {
+    mapping_buckets: &'a mut [DirectoryBucket],
+    mapping_nodes: &'a mut [DirectoryNode],
+    peer_buckets: &'a mut [DirectoryBucket],
+    peer_nodes: &'a mut [DirectoryNode],
+    port_owners: &'a mut [PortOwnerSlot],
+}
+
+impl<'a> Nat44UdpIndexStorage<'a> {
+    pub fn new(
+        mapping_buckets: &'a mut [DirectoryBucket],
+        mapping_nodes: &'a mut [DirectoryNode],
+        peer_buckets: &'a mut [DirectoryBucket],
+        peer_nodes: &'a mut [DirectoryNode],
+        port_owners: &'a mut [PortOwnerSlot],
+    ) -> Self {
+        Self {
+            mapping_buckets,
+            mapping_nodes,
+            peer_buckets,
+            peer_nodes,
+            port_owners,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct TestNat44UdpIndexes {
+    mapping_buckets: Vec<DirectoryBucket>,
+    mapping_nodes: Vec<DirectoryNode>,
+    peer_buckets: Vec<DirectoryBucket>,
+    peer_nodes: Vec<DirectoryNode>,
+    port_owners: Vec<PortOwnerSlot>,
+}
+
+#[cfg(test)]
+fn test_udp_hash_key() -> Nat44UdpHashKey {
+    Nat44UdpHashKey::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210).unwrap()
+}
+
+#[cfg(test)]
+impl TestNat44UdpIndexes {
+    pub(crate) fn new(
+        config: Nat44UdpConfig,
+        mapping_capacity: usize,
+        peer_capacity: usize,
+    ) -> Self {
+        let mapping_bucket_count = if mapping_capacity == 0 {
+            0
+        } else {
+            mapping_capacity.next_power_of_two()
+        };
+        let peer_bucket_count = if peer_capacity == 0 {
+            0
+        } else {
+            peer_capacity.next_power_of_two()
+        };
+        let port_count = usize::from(config.last_port - config.first_port) + 1;
+        Self {
+            mapping_buckets: vec![DirectoryBucket::default(); mapping_bucket_count],
+            mapping_nodes: vec![DirectoryNode::default(); mapping_capacity],
+            peer_buckets: vec![DirectoryBucket::default(); peer_bucket_count],
+            peer_nodes: vec![DirectoryNode::default(); peer_capacity],
+            port_owners: vec![PortOwnerSlot::default(); port_count],
+        }
+    }
+
+    pub(crate) fn runtime<'a>(
+        &'a mut self,
+        config: Nat44UdpConfig,
+        mappings: &'a mut [Nat44UdpMappingSlot],
+        peers: &'a mut [Nat44UdpPeerSlot],
+    ) -> Nat44UdpRuntime<'a> {
+        let indexes = Nat44UdpIndexStorage::new(
+            &mut self.mapping_buckets,
+            &mut self.mapping_nodes,
+            &mut self.peer_buckets,
+            &mut self.peer_nodes,
+            &mut self.port_owners,
+        );
+        Nat44UdpRuntime::new(config, mappings, peers, indexes, test_udp_hash_key()).unwrap()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Nat44UdpRuntimeConfigError {
+    MappingNodeCountMismatch,
+    PeerNodeCountMismatch,
+    MappingDirectoryInvalid,
+    PeerDirectoryInvalid,
+    PortOwnerTableInvalid,
+    RuntimeIdentityExhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Nat44UdpReconcileError {
+    HashKeyNotRotated,
+    PortOwnerTableInvalid,
+    RuntimeEpochExhausted,
+}
+
+/// Validated caller-owned capacity of a UDP NAT runtime and all of its indexes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Nat44UdpStorageShape {
+    mapping_slots: u32,
+    peer_slots: u32,
+    mapping_buckets: u32,
+    mapping_nodes: u32,
+    peer_buckets: u32,
+    peer_nodes: u32,
+    port_owner_slots: u32,
+}
+
+impl Nat44UdpStorageShape {
+    #[must_use]
+    pub const fn mapping_slots(self) -> u32 {
+        self.mapping_slots
+    }
+
+    #[must_use]
+    pub const fn peer_slots(self) -> u32 {
+        self.peer_slots
+    }
+
+    #[must_use]
+    pub const fn mapping_buckets(self) -> u32 {
+        self.mapping_buckets
+    }
+
+    #[must_use]
+    pub const fn mapping_nodes(self) -> u32 {
+        self.mapping_nodes
+    }
+
+    #[must_use]
+    pub const fn peer_buckets(self) -> u32 {
+        self.peer_buckets
+    }
+
+    #[must_use]
+    pub const fn peer_nodes(self) -> u32 {
+        self.peer_nodes
+    }
+
+    #[must_use]
+    pub const fn port_owner_slots(self) -> u32 {
+        self.port_owner_slots
+    }
+}
+
+/// Lifetime-bound proof that a UDP NAT reconcile can commit without failure.
+///
+/// The permit exclusively borrows the exact runtime that produced it. It is
+/// intentionally opaque, non-cloneable, non-copyable, and non-debuggable.
+/// Dropping it releases the borrow without changing the runtime.
+///
+/// ```compile_fail
+/// use ruster_core::Nat44UdpReconcilePermit;
+/// fn assert_clone<T: Clone>() {}
+/// assert_clone::<Nat44UdpReconcilePermit<'static, 'static>>();
+/// ```
+///
+/// ```compile_fail
+/// use ruster_core::Nat44UdpReconcilePermit;
+/// fn assert_copy<T: Copy>() {}
+/// assert_copy::<Nat44UdpReconcilePermit<'static, 'static>>();
+/// ```
+///
+/// ```compile_fail
+/// use ruster_core::Nat44UdpReconcilePermit;
+/// fn assert_debug<T: std::fmt::Debug>() {}
+/// assert_debug::<Nat44UdpReconcilePermit<'static, 'static>>();
+/// ```
+///
+/// ```compile_fail
+/// use ruster_core::{
+///     Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpReconcileError, Nat44UdpRuntime,
+/// };
+///
+/// fn runtime_stays_exclusively_borrowed<'storage>(
+///     runtime: &mut Nat44UdpRuntime<'storage>,
+///     config: Nat44UdpConfig,
+///     key: Nat44UdpHashKey,
+/// ) -> Result<(), Nat44UdpReconcileError> {
+///     let permit = runtime.preflight_reconcile(config, key)?;
+///     let _ = runtime.config();
+///     permit.commit();
+///     Ok(())
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ruster_core::{
+///     Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpReconcileError, Nat44UdpRuntime,
+/// };
+///
+/// fn permit_cannot_be_applied_to_another_runtime<'storage>(
+///     first: &mut Nat44UdpRuntime<'storage>,
+///     second: &mut Nat44UdpRuntime<'storage>,
+///     config: Nat44UdpConfig,
+///     key: Nat44UdpHashKey,
+/// ) -> Result<(), Nat44UdpReconcileError> {
+///     let permit = first.preflight_reconcile(config, key)?;
+///     second.commit_reconcile(permit);
+///     Ok(())
+/// }
+/// ```
+#[must_use = "dropping a UDP NAT reconcile permit leaves the runtime unchanged"]
+pub struct Nat44UdpReconcilePermit<'runtime, 'storage> {
+    runtime: &'runtime mut Nat44UdpRuntime<'storage>,
+    config: Nat44UdpConfig,
+    hash_key: Nat44UdpHashKey,
+    next_runtime_epoch: u128,
+}
+
+impl Nat44UdpReconcilePermit<'_, '_> {
+    /// Consumes this one-shot permit and applies its prevalidated reconcile.
+    pub fn commit(self) -> Nat44UdpReconcileReport {
+        self.runtime.commit_prevalidated_reconcile(
+            self.config,
+            self.hash_key,
+            self.next_runtime_epoch,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Nat44UdpBackingIdentity {
+    address: usize,
+    length: usize,
+}
+
+impl Nat44UdpBackingIdentity {
+    fn of<T>(storage: &[T]) -> Self {
+        Self {
+            address: storage.as_ptr() as usize,
+            length: storage.len(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Nat44UdpReconcileBinding {
+    runtime_identity: u64,
+    mappings: Nat44UdpBackingIdentity,
+    peers: Nat44UdpBackingIdentity,
+    mapping_buckets: Nat44UdpBackingIdentity,
+    mapping_nodes: Nat44UdpBackingIdentity,
+    peer_buckets: Nat44UdpBackingIdentity,
+    peer_nodes: Nat44UdpBackingIdentity,
+    port_owners: Nat44UdpBackingIdentity,
+}
+
+impl Nat44UdpReconcileBinding {
+    fn new(
+        runtime_identity: u64,
+        mappings: &[Nat44UdpMappingSlot],
+        peers: &[Nat44UdpPeerSlot],
+        indexes: &Nat44UdpIndexStorage<'_>,
+    ) -> Self {
+        Self {
+            runtime_identity,
+            mappings: Nat44UdpBackingIdentity::of(mappings),
+            peers: Nat44UdpBackingIdentity::of(peers),
+            mapping_buckets: Nat44UdpBackingIdentity::of(indexes.mapping_buckets),
+            mapping_nodes: Nat44UdpBackingIdentity::of(indexes.mapping_nodes),
+            peer_buckets: Nat44UdpBackingIdentity::of(indexes.peer_buckets),
+            peer_nodes: Nat44UdpBackingIdentity::of(indexes.peer_nodes),
+            port_owners: Nat44UdpBackingIdentity::of(indexes.port_owners),
+        }
+    }
+}
+
 /// Fixed-capacity, worker-local UDP NAPT state.
 ///
-/// The caller owns both storage arrays. Recreating the runtime deliberately
-/// clears them. The `Rc` marker makes the runtime `!Send + !Sync`, so a mapping
-/// shard cannot accidentally migrate between packet workers.
+/// The caller owns the mapping, peer, directory, and port-owner storage.
+/// Recreating the runtime deliberately clears it. The `Rc` marker makes the
+/// runtime `!Send + !Sync`, so a mapping shard cannot accidentally migrate
+/// between packet workers.
 ///
 /// ```compile_fail
 /// use ruster_core::Nat44UdpRuntime;
@@ -989,9 +1407,23 @@ pub struct Nat44UdpRuntime<'a> {
     config: Nat44UdpConfig,
     mappings: &'a mut [Nat44UdpMappingSlot],
     peers: &'a mut [Nat44UdpPeerSlot],
+    mapping_directory: FixedDirectory<'a>,
+    peer_directory: FixedDirectory<'a>,
+    port_owners: PortOwnerTable<'a>,
+    hash_key: Nat44UdpHashKey,
     watermark_ms: Option<u64>,
     next_generation: u64,
+    runtime_epoch: u128,
+    state_revision: u128,
+    #[allow(dead_code)] // Retained as defense-in-depth for the publication owner.
+    reconcile_binding: Nat44UdpReconcileBinding,
     counters: Nat44UdpCounters,
+    #[cfg(test)]
+    mapping_lookup_probes: Cell<usize>,
+    #[cfg(test)]
+    peer_lookup_probes: Cell<usize>,
+    #[cfg(test)]
+    port_owner_probes: Cell<usize>,
     _worker_local: PhantomData<Rc<()>>,
 }
 
@@ -1000,23 +1432,81 @@ impl<'a> Nat44UdpRuntime<'a> {
         config: Nat44UdpConfig,
         mappings: &'a mut [Nat44UdpMappingSlot],
         peers: &'a mut [Nat44UdpPeerSlot],
-    ) -> Self {
+        indexes: Nat44UdpIndexStorage<'a>,
+        hash_key: Nat44UdpHashKey,
+    ) -> Result<Self, Nat44UdpRuntimeConfigError> {
+        if indexes.mapping_nodes.len() != mappings.len() {
+            return Err(Nat44UdpRuntimeConfigError::MappingNodeCountMismatch);
+        }
+        if indexes.peer_nodes.len() != peers.len() {
+            return Err(Nat44UdpRuntimeConfigError::PeerNodeCountMismatch);
+        }
+        FixedDirectory::validate_config(indexes.mapping_buckets.len(), indexes.mapping_nodes.len())
+            .map_err(|_| Nat44UdpRuntimeConfigError::MappingDirectoryInvalid)?;
+        FixedDirectory::validate_config(indexes.peer_buckets.len(), indexes.peer_nodes.len())
+            .map_err(|_| Nat44UdpRuntimeConfigError::PeerDirectoryInvalid)?;
+        PortOwnerTable::validate_config(
+            indexes.port_owners.len(),
+            config.first_port,
+            config.last_port,
+            mappings.len(),
+        )
+        .map_err(|_| Nat44UdpRuntimeConfigError::PortOwnerTableInvalid)?;
+        let runtime_identity = allocate_udp_runtime_identity()?;
+        let reconcile_binding =
+            Nat44UdpReconcileBinding::new(runtime_identity, mappings, peers, &indexes);
+        let mapping_directory =
+            FixedDirectory::new(indexes.mapping_buckets, indexes.mapping_nodes, hash_key.0)
+                .expect("mapping directory dimensions were preflighted");
+        let peer_directory =
+            FixedDirectory::new(indexes.peer_buckets, indexes.peer_nodes, hash_key.0)
+                .expect("peer directory dimensions were preflighted");
+        let port_owners = PortOwnerTable::new(
+            indexes.port_owners,
+            config.first_port,
+            config.last_port,
+            mappings.len(),
+        )
+        .expect("port owner dimensions were preflighted");
         mappings.fill(Nat44UdpMappingSlot::default());
         peers.fill(Nat44UdpPeerSlot::default());
-        Self {
+        Ok(Self {
             config,
             mappings,
             peers,
+            mapping_directory,
+            peer_directory,
+            port_owners,
+            hash_key,
             watermark_ms: None,
             next_generation: 1,
+            runtime_epoch: 1,
+            state_revision: 0,
+            reconcile_binding,
             counters: Nat44UdpCounters::default(),
+            #[cfg(test)]
+            mapping_lookup_probes: Cell::new(0),
+            #[cfg(test)]
+            peer_lookup_probes: Cell::new(0),
+            #[cfg(test)]
+            port_owner_probes: Cell::new(0),
             _worker_local: PhantomData,
-        }
+        })
     }
 
     #[must_use]
     pub const fn config(&self) -> Nat44UdpConfig {
         self.config
+    }
+
+    /// Checks the exact control-plane binding without exposing the hash key.
+    #[must_use]
+    pub fn publication_binding_matches(
+        &self,
+        config: Nat44UdpConfig,
+        hash_key: Nat44UdpHashKey,
+    ) -> bool {
+        self.config == config && self.hash_key == hash_key
     }
 
     #[must_use]
@@ -1034,7 +1524,86 @@ impl<'a> Nat44UdpRuntime<'a> {
         self.peers
     }
 
-    pub fn reconcile(&mut self, config: Nat44UdpConfig) -> Nat44UdpReconcileReport {
+    #[must_use]
+    pub fn storage_shape(&self) -> Nat44UdpStorageShape {
+        Nat44UdpStorageShape {
+            mapping_slots: u32::try_from(self.mappings.len())
+                .expect("validated mapping capacity fits u32"),
+            peer_slots: u32::try_from(self.peers.len()).expect("validated peer capacity fits u32"),
+            mapping_buckets: u32::try_from(self.mapping_directory.bucket_count())
+                .expect("validated mapping bucket count fits u32"),
+            mapping_nodes: u32::try_from(self.mapping_directory.node_capacity())
+                .expect("validated mapping node count fits u32"),
+            peer_buckets: u32::try_from(self.peer_directory.bucket_count())
+                .expect("validated peer bucket count fits u32"),
+            peer_nodes: u32::try_from(self.peer_directory.node_capacity())
+                .expect("validated peer node count fits u32"),
+            port_owner_slots: u32::try_from(self.port_owners.slot_count())
+                .expect("validated port-owner count fits u32"),
+        }
+    }
+
+    #[cfg(test)]
+    fn reset_index_probe_counts(&self) {
+        self.mapping_lookup_probes.set(0);
+        self.peer_lookup_probes.set(0);
+        self.port_owner_probes.set(0);
+    }
+
+    #[cfg(test)]
+    fn index_probe_counts(&self) -> (usize, usize, usize) {
+        (
+            self.mapping_lookup_probes.get(),
+            self.peer_lookup_probes.get(),
+            self.port_owner_probes.get(),
+        )
+    }
+
+    pub fn reconcile(
+        &mut self,
+        config: Nat44UdpConfig,
+        hash_key: Nat44UdpHashKey,
+    ) -> Result<Nat44UdpReconcileReport, Nat44UdpReconcileError> {
+        self.preflight_reconcile(config, hash_key)
+            .map(Nat44UdpReconcilePermit::commit)
+    }
+
+    pub fn preflight_reconcile<'runtime>(
+        &'runtime mut self,
+        config: Nat44UdpConfig,
+        hash_key: Nat44UdpHashKey,
+    ) -> Result<Nat44UdpReconcilePermit<'runtime, 'a>, Nat44UdpReconcileError> {
+        if hash_key == self.hash_key {
+            return Err(Nat44UdpReconcileError::HashKeyNotRotated);
+        }
+        let next_runtime_epoch = self
+            .runtime_epoch
+            .checked_add(1)
+            .ok_or(Nat44UdpReconcileError::RuntimeEpochExhausted)?;
+        if PortOwnerTable::validate_config(
+            self.port_owners.slot_count(),
+            config.first_port,
+            config.last_port,
+            self.mappings.len(),
+        )
+        .is_err()
+        {
+            return Err(Nat44UdpReconcileError::PortOwnerTableInvalid);
+        }
+        Ok(Nat44UdpReconcilePermit {
+            runtime: self,
+            config,
+            hash_key,
+            next_runtime_epoch,
+        })
+    }
+
+    fn commit_prevalidated_reconcile(
+        &mut self,
+        config: Nat44UdpConfig,
+        hash_key: Nat44UdpHashKey,
+        next_runtime_epoch: u128,
+    ) -> Nat44UdpReconcileReport {
         let mappings_flushed = self
             .mappings
             .iter()
@@ -1043,14 +1612,29 @@ impl<'a> Nat44UdpRuntime<'a> {
         let peers_flushed = self.peers.iter().filter(|peer| peer.occupied).count();
         self.mappings.fill(Nat44UdpMappingSlot::default());
         self.peers.fill(Nat44UdpPeerSlot::default());
+        self.mapping_directory.clear_with_key(hash_key.0);
+        self.peer_directory.clear_with_key(hash_key.0);
+        self.port_owners.reconfigure_prevalidated_and_clear(
+            config.first_port,
+            config.last_port,
+            self.mappings.len(),
+        );
         self.config = config;
+        self.hash_key = hash_key;
         self.watermark_ms = None;
         self.next_generation = 1;
+        self.runtime_epoch = next_runtime_epoch;
+        self.state_revision = 0;
         self.counters.reconciliations = self.counters.reconciliations.saturating_add(1);
         Nat44UdpReconcileReport {
             mappings_flushed,
             peers_flushed,
         }
+    }
+
+    #[allow(dead_code)] // Test/future publication-owner identity; not a permit authority.
+    fn reconcile_binding(&self) -> Nat44UdpReconcileBinding {
+        self.reconcile_binding
     }
 
     pub(crate) fn record_config_mismatch(&mut self) {
@@ -1065,7 +1649,13 @@ impl<'a> Nat44UdpRuntime<'a> {
             self.counters.clock_regressions = self.counters.clock_regressions.saturating_add(1);
             return Err(Nat44UdpPlanError::ClockRegression);
         }
-        self.watermark_ms = Some(now_ms);
+        if self.watermark_ms != Some(now_ms) {
+            self.state_revision = self
+                .state_revision
+                .checked_add(1)
+                .ok_or(Nat44UdpPlanError::StateRevisionExhausted)?;
+            self.watermark_ms = Some(now_ms);
+        }
         Ok(())
     }
 
@@ -1098,99 +1688,163 @@ impl<'a> Nat44UdpRuntime<'a> {
         remote_address: Ipv4Address,
         now_ms: u64,
     ) -> Result<Nat44UdpOutboundPlan, Nat44UdpPlanError> {
+        if self.state_revision == u128::MAX {
+            return Err(Nat44UdpPlanError::StateRevisionExhausted);
+        }
+        let exact_mapping = self.find_mapping(internal_address, internal_port)?;
         if let Some((mapping_index, mapping)) =
-            self.find_mapping(internal_address, internal_port, now_ms)
+            exact_mapping.filter(|(_, mapping)| self.mapping_is_live(*mapping, now_ms))
         {
-            if self.peer_exists(mapping_index, mapping.generation, remote_address) {
+            if self.peer_exists(mapping_index, mapping.generation, remote_address)? {
                 let mut refreshed = mapping;
                 refreshed.last_outbound_ms = now_ms;
-                return Ok(Nat44UdpOutboundPlan {
-                    mapping_index,
-                    mapping: refreshed,
-                    peer_index: None,
-                    peer: None,
-                    mapping_created: false,
-                    mapping_expired: false,
-                    peer_created: false,
-                });
+                return self.prepare_outbound_plan(
+                    Nat44UdpOutboundPlan {
+                        mapping_index: encode_udp_index(mapping_index),
+                        mapping: refreshed,
+                        peer_index: UDP_INDEX_NONE,
+                        peer: None,
+                        mapping_created: false,
+                        mapping_expired: false,
+                        peer_created: false,
+                        expected_runtime_epoch: self.runtime_epoch,
+                        expected_revision: self.state_revision,
+                        planned_now_ms: now_ms,
+                        displaced_port_mapping_index: UDP_INDEX_NONE,
+                        prepared: PreparedNat44UdpOutboundCommit::EMPTY,
+                    },
+                    None,
+                );
             }
             let Some(peer_index) = self.find_reusable_peer(now_ms) else {
                 return Err(Nat44UdpPlanError::PeerFull);
             };
             let mut refreshed = mapping;
             refreshed.last_outbound_ms = now_ms;
-            return Ok(Nat44UdpOutboundPlan {
-                mapping_index,
-                mapping: refreshed,
-                peer_index: Some(peer_index),
-                peer: Some(Nat44UdpPeerSlot {
-                    occupied: true,
-                    mapping_index,
-                    mapping_generation: mapping.generation,
-                    remote_address,
-                }),
-                mapping_created: false,
-                mapping_expired: false,
-                peer_created: true,
-            });
+            return self.prepare_outbound_plan(
+                Nat44UdpOutboundPlan {
+                    mapping_index: encode_udp_index(mapping_index),
+                    mapping: refreshed,
+                    peer_index: encode_udp_index(peer_index),
+                    peer: Some(Nat44UdpPeerSlot {
+                        occupied: true,
+                        mapping_index,
+                        mapping_generation: mapping.generation,
+                        mapping_lifecycle_epoch: mapping.lifecycle_epoch,
+                        remote_address,
+                    }),
+                    mapping_created: false,
+                    mapping_expired: false,
+                    peer_created: true,
+                    expected_runtime_epoch: self.runtime_epoch,
+                    expected_revision: self.state_revision,
+                    planned_now_ms: now_ms,
+                    displaced_port_mapping_index: UDP_INDEX_NONE,
+                    prepared: PreparedNat44UdpOutboundCommit::EMPTY,
+                },
+                None,
+            );
         }
 
-        let Some(mapping_index) = self.find_reusable_mapping(now_ms) else {
+        let mapping_index = if let Some((mapping_index, _)) = exact_mapping {
+            mapping_index
+        } else if let Some(mapping_index) = self.find_reusable_mapping(now_ms) {
+            mapping_index
+        } else {
             return Err(Nat44UdpPlanError::MappingFull);
         };
         let Some(peer_index) = self.find_reusable_peer(now_ms) else {
             return Err(Nat44UdpPlanError::PeerFull);
         };
-        let Some(public_port) = self.allocate_port(internal_address, internal_port, now_ms) else {
+        let Some(port) = self.allocate_port(internal_address, internal_port, now_ms)? else {
             return Err(Nat44UdpPlanError::PortExhausted);
         };
-        let generation = self.next_nonzero_generation();
+        let generation = self.next_nonzero_generation()?;
         let mapping_expired = self.mappings[mapping_index].occupied;
-        Ok(Nat44UdpOutboundPlan {
-            mapping_index,
-            mapping: Nat44UdpMappingSlot {
-                occupied: true,
-                generation,
-                inside: self.config.inside,
-                internal_address,
-                internal_port,
-                public_port,
-                last_outbound_ms: now_ms,
+        self.prepare_outbound_plan(
+            Nat44UdpOutboundPlan {
+                mapping_index: encode_udp_index(mapping_index),
+                mapping: Nat44UdpMappingSlot {
+                    occupied: true,
+                    generation,
+                    lifecycle_epoch: self.runtime_epoch,
+                    port_owned: true,
+                    inside: self.config.inside,
+                    internal_address,
+                    internal_port,
+                    public_port: port.port,
+                    last_outbound_ms: now_ms,
+                },
+                peer_index: encode_udp_index(peer_index),
+                peer: Some(Nat44UdpPeerSlot {
+                    occupied: true,
+                    mapping_index,
+                    mapping_generation: generation,
+                    mapping_lifecycle_epoch: self.runtime_epoch,
+                    remote_address,
+                }),
+                mapping_created: true,
+                mapping_expired,
+                peer_created: true,
+                expected_runtime_epoch: self.runtime_epoch,
+                expected_revision: self.state_revision,
+                planned_now_ms: now_ms,
+                displaced_port_mapping_index: encode_optional_udp_index(
+                    port.displaced_mapping_index,
+                ),
+                prepared: PreparedNat44UdpOutboundCommit::EMPTY,
             },
-            peer_index: Some(peer_index),
-            peer: Some(Nat44UdpPeerSlot {
-                occupied: true,
-                mapping_index,
-                mapping_generation: generation,
-                remote_address,
-            }),
-            mapping_created: true,
-            mapping_expired,
-            peer_created: true,
-        })
+            port.expected_owner,
+        )
     }
 
-    pub(crate) fn commit_outbound(&mut self, plan: Nat44UdpOutboundPlan, now_ms: u64) {
-        if plan.mapping_created {
-            for peer in self
-                .peers
-                .iter_mut()
-                .filter(|peer| peer.occupied && peer.mapping_index == plan.mapping_index)
-            {
-                *peer = Nat44UdpPeerSlot::default();
-            }
+    pub(crate) fn commit_outbound(
+        &mut self,
+        plan: Nat44UdpOutboundPlan,
+        now_ms: u64,
+    ) -> Result<(), Nat44UdpCommitError> {
+        self.revalidate_outbound_commit(plan, now_ms)?;
+        let prepared = plan.prepared;
+        if let Some(mutation) = prepared.mapping {
+            self.apply_mapping_directory_mutation(mutation);
         }
-        self.mappings[plan.mapping_index] = plan.mapping;
-        if let (Some(index), Some(peer)) = (plan.peer_index, plan.peer) {
+        if let Some(mutation) = prepared.peer {
+            self.apply_peer_directory_mutation(mutation);
+        }
+        if let Some(owner) = prepared.owner {
+            let replacement = PortOwnerToken::from_prevalidated_index(
+                plan.mapping_index,
+                plan.mapping.generation,
+                plan.mapping.lifecycle_epoch,
+            );
+            self.port_owners
+                .apply_prepared_move_topology(owner, replacement);
+        }
+        if let Some(index) = plan
+            .displaced_port_mapping_index()
+            .filter(|index| *index != plan.mapping_index())
+        {
+            self.mappings[index].port_owned = false;
+        }
+        self.mappings[plan.mapping_index()] = plan.mapping;
+        if let (Some(index), Some(peer)) = (plan.peer_index(), plan.peer) {
             self.peers[index] = peer;
         }
         self.watermark_ms = Some(now_ms);
+        self.state_revision = self
+            .state_revision
+            .checked_add(1)
+            .expect("preflight rejected state revision exhaustion");
         if plan.mapping_created {
             self.counters.mappings_created = self.counters.mappings_created.saturating_add(1);
             if plan.mapping_expired {
                 self.counters.mappings_expired = self.counters.mappings_expired.saturating_add(1);
             }
-            self.next_generation = plan.mapping.generation.wrapping_add(1).max(1);
+            self.next_generation = plan
+                .mapping
+                .generation
+                .checked_add(1)
+                .expect("preflight rejected mapping generation exhaustion");
         } else {
             self.counters.mappings_reused = self.counters.mappings_reused.saturating_add(1);
         }
@@ -1198,6 +1852,8 @@ impl<'a> Nat44UdpRuntime<'a> {
             self.counters.peers_created = self.counters.peers_created.saturating_add(1);
         }
         self.counters.outbound_translated = self.counters.outbound_translated.saturating_add(1);
+        debug_assert!(self.validate_indexes().is_ok());
+        Ok(())
     }
 
     pub(crate) fn plan_inbound(
@@ -1226,18 +1882,14 @@ impl<'a> Nat44UdpRuntime<'a> {
         remote_address: Ipv4Address,
         now_ms: u64,
     ) -> Result<Nat44UdpInboundPlan, Nat44UdpPlanError> {
-        let Some((mapping_index, mapping)) =
-            self.mappings
-                .iter()
-                .copied()
-                .enumerate()
-                .find(|(_, mapping)| {
-                    self.mapping_is_live(*mapping, now_ms) && mapping.public_port == public_port
-                })
+        if self.state_revision == u128::MAX {
+            return Err(Nat44UdpPlanError::StateRevisionExhausted);
+        }
+        let Some((mapping_index, mapping)) = self.mapping_for_public_port(public_port, now_ms)?
         else {
             return Err(Nat44UdpPlanError::MappingMiss);
         };
-        if !self.peer_exists(mapping_index, mapping.generation, remote_address) {
+        if !self.peer_exists(mapping_index, mapping.generation, remote_address)? {
             return Err(Nat44UdpPlanError::FilterDenied);
         }
         Ok(Nat44UdpInboundPlan {
@@ -1245,18 +1897,44 @@ impl<'a> Nat44UdpRuntime<'a> {
             mapping_generation: mapping.generation,
             internal_address: mapping.internal_address,
             internal_port: mapping.internal_port,
+            expected_runtime_epoch: self.runtime_epoch,
+            expected_revision: self.state_revision,
+            planned_now_ms: now_ms,
         })
     }
 
-    pub(crate) fn commit_inbound(&mut self, plan: Nat44UdpInboundPlan, now_ms: u64) {
-        debug_assert!(self
+    pub(crate) fn commit_inbound(
+        &mut self,
+        plan: Nat44UdpInboundPlan,
+        now_ms: u64,
+    ) -> Result<(), Nat44UdpCommitError> {
+        if plan.expected_runtime_epoch != self.runtime_epoch {
+            return Err(Nat44UdpCommitError::RuntimeEpochChanged);
+        }
+        if plan.expected_revision != self.state_revision {
+            return Err(Nat44UdpCommitError::StateRevisionChanged);
+        }
+        if plan.planned_now_ms != now_ms {
+            return Err(Nat44UdpCommitError::CommitTimeChanged);
+        }
+        if !self
             .mappings
             .get(plan.mapping_index)
             .is_some_and(|mapping| {
                 mapping.occupied && mapping.generation == plan.mapping_generation
-            }));
+            })
+        {
+            return Err(Nat44UdpCommitError::MappingSlotChanged);
+        }
+        let next_revision = self
+            .state_revision
+            .checked_add(1)
+            .ok_or(Nat44UdpCommitError::StateRevisionExhausted)?;
         self.watermark_ms = Some(now_ms);
+        self.state_revision = next_revision;
         self.counters.inbound_translated = self.counters.inbound_translated.saturating_add(1);
+        debug_assert!(self.validate_indexes().is_ok());
+        Ok(())
     }
 
     pub(crate) fn record_plan_error(&mut self, error: Nat44UdpPlanError) {
@@ -1280,6 +1958,11 @@ impl<'a> Nat44UdpRuntime<'a> {
                 // `observe_now` owns this counter so a forwarding caller can
                 // record the typed plan error without double-counting it.
             }
+            Nat44UdpPlanError::IndexCorrupt
+            | Nat44UdpPlanError::GenerationExhausted
+            | Nat44UdpPlanError::StateRevisionExhausted => {
+                self.counters.config_mismatches = self.counters.config_mismatches.saturating_add(1);
+            }
         }
     }
 
@@ -1302,24 +1985,366 @@ impl<'a> Nat44UdpRuntime<'a> {
         {
             return Err(Nat44UdpPlanError::ClockRegression);
         }
-        let Some((mapping_index, mapping)) =
-            self.mappings
-                .iter()
-                .copied()
-                .enumerate()
-                .find(|(_, mapping)| {
-                    self.mapping_is_live(*mapping, now_ms) && mapping.public_port == public_port
-                })
+        let Some((mapping_index, mapping)) = self.mapping_for_public_port(public_port, now_ms)?
         else {
             return Err(Nat44UdpPlanError::MappingMiss);
         };
-        if !self.peer_exists(mapping_index, mapping.generation, remote_address) {
+        if !self.peer_exists(mapping_index, mapping.generation, remote_address)? {
             return Err(Nat44UdpPlanError::FilterDenied);
         }
         Ok(Nat44UdpIcmpv4Lookup {
             internal_address: mapping.internal_address,
             internal_port: mapping.internal_port,
         })
+    }
+
+    fn prepare_outbound_plan(
+        &self,
+        mut plan: Nat44UdpOutboundPlan,
+        expected_port_owner: Option<PortOwnerToken>,
+    ) -> Result<Nat44UdpOutboundPlan, Nat44UdpPlanError> {
+        plan.prepared = self
+            .prepare_outbound_index_mutations(plan, expected_port_owner, plan.planned_now_ms)
+            .map_err(|_| Nat44UdpPlanError::IndexCorrupt)?;
+        Ok(plan)
+    }
+
+    fn prepare_outbound_index_mutations(
+        &self,
+        plan: Nat44UdpOutboundPlan,
+        expected_port_owner: Option<PortOwnerToken>,
+        now_ms: u64,
+    ) -> Result<PreparedNat44UdpOutboundCommit, Nat44UdpCommitError> {
+        if plan.expected_runtime_epoch != self.runtime_epoch {
+            return Err(Nat44UdpCommitError::RuntimeEpochChanged);
+        }
+        if plan.expected_revision != self.state_revision {
+            return Err(Nat44UdpCommitError::StateRevisionChanged);
+        }
+        if plan.planned_now_ms != now_ms {
+            return Err(Nat44UdpCommitError::CommitTimeChanged);
+        }
+        if self.state_revision == u128::MAX {
+            return Err(Nat44UdpCommitError::StateRevisionExhausted);
+        }
+        if let Some(index) = plan.displaced_port_mapping_index() {
+            let displaced = self
+                .mappings
+                .get(index)
+                .copied()
+                .ok_or(Nat44UdpCommitError::MappingSlotChanged)?;
+            if !displaced.occupied
+                || !displaced.port_owned
+                || self.mapping_is_live(displaced, now_ms)
+            {
+                return Err(Nat44UdpCommitError::MappingSlotChanged);
+            }
+        }
+
+        let mapping = if plan.mapping_created {
+            let mapping_index = plan.mapping_index();
+            let expected_mapping = self.mappings[mapping_index];
+            let words = Self::mapping_words(plan.mapping);
+            Some(if expected_mapping.occupied {
+                PreparedUdpDirectoryMutation::Relink(
+                    self.mapping_directory
+                        .prepare_relink(mapping_index, DirectoryHashDomain::UdpMapping, &words)
+                        .map_err(|_| Nat44UdpCommitError::IndexCorrupt)?,
+                )
+            } else {
+                PreparedUdpDirectoryMutation::Link(
+                    self.mapping_directory
+                        .prepare_link(mapping_index, DirectoryHashDomain::UdpMapping, &words)
+                        .map_err(|_| Nat44UdpCommitError::IndexCorrupt)?,
+                )
+            })
+        } else {
+            None
+        };
+
+        let peer = if let (Some(index), Some(peer)) = (plan.peer_index(), plan.peer) {
+            let expected_peer = self.peers[index];
+            let words = Self::peer_words(peer);
+            Some(if expected_peer.occupied {
+                PreparedUdpDirectoryMutation::Relink(
+                    self.peer_directory
+                        .prepare_relink(index, DirectoryHashDomain::UdpPeer, &words)
+                        .map_err(|_| Nat44UdpCommitError::IndexCorrupt)?,
+                )
+            } else {
+                PreparedUdpDirectoryMutation::Link(
+                    self.peer_directory
+                        .prepare_link(index, DirectoryHashDomain::UdpPeer, &words)
+                        .map_err(|_| Nat44UdpCommitError::IndexCorrupt)?,
+                )
+            })
+        } else {
+            None
+        };
+
+        let owner = if plan.mapping_created {
+            let mapping_index = plan.mapping_index();
+            let expected_mapping = self.mappings[mapping_index];
+            let old_owner = if expected_mapping.occupied && expected_mapping.port_owned {
+                Some((
+                    expected_mapping.public_port,
+                    self.mapping_owner_token(mapping_index, expected_mapping)
+                        .map_err(|_| Nat44UdpCommitError::IndexCorrupt)?,
+                ))
+            } else {
+                None
+            };
+            let replacement = self
+                .mapping_owner_token(mapping_index, plan.mapping)
+                .map_err(|_| Nat44UdpCommitError::IndexCorrupt)?;
+            Some(
+                self.port_owners
+                    .prepare_move(
+                        old_owner,
+                        plan.mapping.public_port,
+                        expected_port_owner,
+                        replacement,
+                    )
+                    .map_err(|_| Nat44UdpCommitError::IndexCorrupt)?
+                    .topology(),
+            )
+        } else {
+            None
+        };
+
+        if !mapping.is_none_or(|mutation| self.mapping_mutation_matches(mutation))
+            || !peer.is_none_or(|mutation| self.peer_mutation_matches(mutation))
+        {
+            return Err(Nat44UdpCommitError::IndexCorrupt);
+        }
+        Ok(PreparedNat44UdpOutboundCommit {
+            mapping,
+            peer,
+            owner,
+        })
+    }
+
+    fn revalidate_outbound_commit(
+        &self,
+        plan: Nat44UdpOutboundPlan,
+        now_ms: u64,
+    ) -> Result<(), Nat44UdpCommitError> {
+        if plan.expected_runtime_epoch != self.runtime_epoch {
+            return Err(Nat44UdpCommitError::RuntimeEpochChanged);
+        }
+        if plan.expected_revision != self.state_revision {
+            return Err(Nat44UdpCommitError::StateRevisionChanged);
+        }
+        if plan.planned_now_ms != now_ms {
+            return Err(Nat44UdpCommitError::CommitTimeChanged);
+        }
+        if self.state_revision == u128::MAX {
+            return Err(Nat44UdpCommitError::StateRevisionExhausted);
+        }
+        if !plan
+            .prepared
+            .mapping
+            .is_none_or(|mutation| self.mapping_mutation_matches(mutation))
+            || !plan
+                .prepared
+                .peer
+                .is_none_or(|mutation| self.peer_mutation_matches(mutation))
+        {
+            return Err(Nat44UdpCommitError::IndexCorrupt);
+        }
+        Ok(())
+    }
+
+    fn mapping_mutation_matches(&self, mutation: PreparedUdpDirectoryMutation) -> bool {
+        match mutation {
+            PreparedUdpDirectoryMutation::Link(prepared) => {
+                self.mapping_directory.prepared_link_matches(prepared)
+            }
+            PreparedUdpDirectoryMutation::Relink(prepared) => {
+                self.mapping_directory.prepared_relink_matches(prepared)
+            }
+        }
+    }
+
+    fn peer_mutation_matches(&self, mutation: PreparedUdpDirectoryMutation) -> bool {
+        match mutation {
+            PreparedUdpDirectoryMutation::Link(prepared) => {
+                self.peer_directory.prepared_link_matches(prepared)
+            }
+            PreparedUdpDirectoryMutation::Relink(prepared) => {
+                self.peer_directory.prepared_relink_matches(prepared)
+            }
+        }
+    }
+
+    fn apply_mapping_directory_mutation(&mut self, mutation: PreparedUdpDirectoryMutation) {
+        match mutation {
+            PreparedUdpDirectoryMutation::Link(prepared) => {
+                self.mapping_directory.apply_prepared_link(prepared);
+            }
+            PreparedUdpDirectoryMutation::Relink(prepared) => {
+                self.mapping_directory.apply_prepared_relink(prepared);
+            }
+        }
+    }
+
+    fn apply_peer_directory_mutation(&mut self, mutation: PreparedUdpDirectoryMutation) {
+        match mutation {
+            PreparedUdpDirectoryMutation::Link(prepared) => {
+                self.peer_directory.apply_prepared_link(prepared);
+            }
+            PreparedUdpDirectoryMutation::Relink(prepared) => {
+                self.peer_directory.apply_prepared_relink(prepared);
+            }
+        }
+    }
+
+    fn mapping_for_public_port(
+        &self,
+        public_port: u16,
+        now_ms: u64,
+    ) -> Result<Option<(usize, Nat44UdpMappingSlot)>, Nat44UdpPlanError> {
+        let owner = match self.port_owners.owner(public_port) {
+            Ok(owner) => owner,
+            Err(PortOwnerError::PortOutOfRange) => return Ok(None),
+            Err(_) => return Err(Nat44UdpPlanError::IndexCorrupt),
+        };
+        let Some(owner) = owner else {
+            return Ok(None);
+        };
+        if owner.runtime_epoch() != self.runtime_epoch {
+            return Err(Nat44UdpPlanError::IndexCorrupt);
+        }
+        let mapping = self
+            .mappings
+            .get(owner.state_index())
+            .copied()
+            .ok_or(Nat44UdpPlanError::IndexCorrupt)?;
+        if !mapping.occupied
+            || !mapping.port_owned
+            || mapping.generation != owner.state_generation()
+            || mapping.lifecycle_epoch != owner.runtime_epoch()
+            || mapping.public_port != public_port
+        {
+            return Err(Nat44UdpPlanError::IndexCorrupt);
+        }
+        if !self.mapping_is_live(mapping, now_ms) {
+            return Ok(None);
+        }
+        Ok(Some((owner.state_index(), mapping)))
+    }
+
+    fn mapping_owner_token(
+        &self,
+        mapping_index: usize,
+        mapping: Nat44UdpMappingSlot,
+    ) -> Result<PortOwnerToken, PortOwnerError> {
+        PortOwnerToken::new(mapping_index, mapping.generation, mapping.lifecycle_epoch)
+    }
+
+    const fn mapping_lookup_words(
+        inside: IfId,
+        internal_address: Ipv4Address,
+        internal_port: u16,
+    ) -> [u64; 3] {
+        [
+            inside.0 as u64,
+            u32::from_be_bytes(internal_address.octets()) as u64,
+            internal_port as u64,
+        ]
+    }
+
+    const fn mapping_words(mapping: Nat44UdpMappingSlot) -> [u64; 3] {
+        Self::mapping_lookup_words(
+            mapping.inside,
+            mapping.internal_address,
+            mapping.internal_port,
+        )
+    }
+
+    const fn peer_lookup_words(
+        mapping_index: usize,
+        mapping_generation: u64,
+        lifecycle_epoch: u128,
+        remote_address: Ipv4Address,
+    ) -> [u64; 5] {
+        [
+            mapping_index as u64,
+            mapping_generation,
+            (lifecycle_epoch >> 64) as u64,
+            lifecycle_epoch as u64,
+            u32::from_be_bytes(remote_address.octets()) as u64,
+        ]
+    }
+
+    const fn peer_words(peer: Nat44UdpPeerSlot) -> [u64; 5] {
+        Self::peer_lookup_words(
+            peer.mapping_index,
+            peer.mapping_generation,
+            peer.mapping_lifecycle_epoch,
+            peer.remote_address,
+        )
+    }
+
+    fn validate_indexes(&self) -> Result<(), Nat44UdpIndexInvariantError> {
+        let hash_key = self.hash_key.0;
+        self.mapping_directory
+            .validate_semantics(|index| {
+                let mapping = self.mappings[index];
+                mapping.occupied.then(|| {
+                    hash_key.hash_words(
+                        DirectoryHashDomain::UdpMapping,
+                        &Self::mapping_words(mapping),
+                    )
+                })
+            })
+            .map_err(Nat44UdpIndexInvariantError::Mapping)?;
+        self.peer_directory
+            .validate_semantics(|index| {
+                let peer = self.peers[index];
+                peer.occupied.then(|| {
+                    hash_key.hash_words(DirectoryHashDomain::UdpPeer, &Self::peer_words(peer))
+                })
+            })
+            .map_err(Nat44UdpIndexInvariantError::Peer)?;
+        self.port_owners
+            .validate_semantics(|index| {
+                let mapping = self.mappings[index];
+                (mapping.occupied && mapping.port_owned).then_some(PortOwnerExpectation {
+                    port: mapping.public_port,
+                    state_generation: mapping.generation,
+                    runtime_epoch: mapping.lifecycle_epoch,
+                })
+            })
+            .map_err(Nat44UdpIndexInvariantError::Port)?;
+        for (index, mapping) in self.mappings.iter().copied().enumerate() {
+            if !mapping.occupied {
+                continue;
+            }
+            if self.mappings[..index].iter().copied().any(|other| {
+                other.occupied
+                    && other.inside == mapping.inside
+                    && other.internal_address == mapping.internal_address
+                    && other.internal_port == mapping.internal_port
+            }) {
+                return Err(Nat44UdpIndexInvariantError::DuplicateMappingKey);
+            }
+        }
+        for (index, peer) in self.peers.iter().copied().enumerate() {
+            if !peer.occupied {
+                continue;
+            }
+            if self.peers[..index].iter().copied().any(|other| {
+                other.occupied
+                    && other.mapping_index == peer.mapping_index
+                    && other.mapping_generation == peer.mapping_generation
+                    && other.mapping_lifecycle_epoch == peer.mapping_lifecycle_epoch
+                    && other.remote_address == peer.remote_address
+            }) {
+                return Err(Nat44UdpIndexInvariantError::DuplicatePeerKey);
+            }
+        }
+        Ok(())
     }
 
     fn mapping_is_live(&self, mapping: Nat44UdpMappingSlot, now_ms: u64) -> bool {
@@ -1332,18 +2357,25 @@ impl<'a> Nat44UdpRuntime<'a> {
         &self,
         internal_address: Ipv4Address,
         internal_port: u16,
-        now_ms: u64,
-    ) -> Option<(usize, Nat44UdpMappingSlot)> {
-        self.mappings
-            .iter()
-            .copied()
-            .enumerate()
-            .find(|(_, mapping)| {
-                self.mapping_is_live(*mapping, now_ms)
+    ) -> Result<Option<(usize, Nat44UdpMappingSlot)>, Nat44UdpPlanError> {
+        let words = Self::mapping_lookup_words(self.config.inside, internal_address, internal_port);
+        let probe = self
+            .mapping_directory
+            .lookup(DirectoryHashDomain::UdpMapping, &words, |index| {
+                let mapping = self.mappings[index];
+                mapping.occupied
                     && mapping.inside == self.config.inside
                     && mapping.internal_address == internal_address
                     && mapping.internal_port == internal_port
             })
+            .map_err(|_| Nat44UdpPlanError::IndexCorrupt)?;
+        #[cfg(test)]
+        self.mapping_lookup_probes.set(
+            self.mapping_lookup_probes
+                .get()
+                .saturating_add(probe.probes),
+        );
+        Ok(probe.state_index.map(|index| (index, self.mappings[index])))
     }
 
     fn find_reusable_mapping(&self, now_ms: u64) -> Option<usize> {
@@ -1357,13 +2389,36 @@ impl<'a> Nat44UdpRuntime<'a> {
         mapping_index: usize,
         mapping_generation: u64,
         remote_address: Ipv4Address,
-    ) -> bool {
-        self.peers.iter().any(|peer| {
-            peer.occupied
-                && peer.mapping_index == mapping_index
-                && peer.mapping_generation == mapping_generation
-                && peer.remote_address == remote_address
-        })
+    ) -> Result<bool, Nat44UdpPlanError> {
+        let mapping = self
+            .mappings
+            .get(mapping_index)
+            .copied()
+            .ok_or(Nat44UdpPlanError::IndexCorrupt)?;
+        if !mapping.occupied || mapping.generation != mapping_generation {
+            return Err(Nat44UdpPlanError::IndexCorrupt);
+        }
+        let words = Self::peer_lookup_words(
+            mapping_index,
+            mapping_generation,
+            mapping.lifecycle_epoch,
+            remote_address,
+        );
+        let probe = self
+            .peer_directory
+            .lookup(DirectoryHashDomain::UdpPeer, &words, |index| {
+                let peer = self.peers[index];
+                peer.occupied
+                    && peer.mapping_index == mapping_index
+                    && peer.mapping_generation == mapping_generation
+                    && peer.mapping_lifecycle_epoch == mapping.lifecycle_epoch
+                    && peer.remote_address == remote_address
+            })
+            .map_err(|_| Nat44UdpPlanError::IndexCorrupt)?;
+        #[cfg(test)]
+        self.peer_lookup_probes
+            .set(self.peer_lookup_probes.get().saturating_add(probe.probes));
+        Ok(probe.state_index.is_some())
     }
 
     fn find_reusable_peer(&self, now_ms: u64) -> Option<usize> {
@@ -1374,15 +2429,54 @@ impl<'a> Nat44UdpRuntime<'a> {
             self.mappings.get(peer.mapping_index).is_none_or(|mapping| {
                 !self.mapping_is_live(*mapping, now_ms)
                     || mapping.generation != peer.mapping_generation
+                    || mapping.lifecycle_epoch != peer.mapping_lifecycle_epoch
             })
         })
     }
 
-    fn port_is_free(&self, port: u16, now_ms: u64) -> bool {
-        !self
+    fn select_port(
+        &self,
+        port: u16,
+        now_ms: u64,
+    ) -> Result<Option<Nat44UdpPortSelection>, Nat44UdpPlanError> {
+        #[cfg(test)]
+        self.port_owner_probes
+            .set(self.port_owner_probes.get().saturating_add(1));
+        let owner = self
+            .port_owners
+            .owner(port)
+            .map_err(|_| Nat44UdpPlanError::IndexCorrupt)?;
+        let Some(owner) = owner else {
+            return Ok(Some(Nat44UdpPortSelection {
+                port,
+                expected_owner: None,
+                displaced_mapping_index: None,
+            }));
+        };
+        if owner.runtime_epoch() != self.runtime_epoch {
+            return Err(Nat44UdpPlanError::IndexCorrupt);
+        }
+        let mapping = self
             .mappings
-            .iter()
-            .any(|mapping| self.mapping_is_live(*mapping, now_ms) && mapping.public_port == port)
+            .get(owner.state_index())
+            .copied()
+            .ok_or(Nat44UdpPlanError::IndexCorrupt)?;
+        if !mapping.occupied
+            || !mapping.port_owned
+            || mapping.generation != owner.state_generation()
+            || mapping.lifecycle_epoch != owner.runtime_epoch()
+            || mapping.public_port != port
+        {
+            return Err(Nat44UdpPlanError::IndexCorrupt);
+        }
+        if self.mapping_is_live(mapping, now_ms) {
+            return Ok(None);
+        }
+        Ok(Some(Nat44UdpPortSelection {
+            port,
+            expected_owner: Some(owner),
+            displaced_mapping_index: Some(owner.state_index()),
+        }))
     }
 
     fn allocate_port(
@@ -1390,30 +2484,38 @@ impl<'a> Nat44UdpRuntime<'a> {
         internal_address: Ipv4Address,
         internal_port: u16,
         now_ms: u64,
-    ) -> Option<u16> {
-        if (self.config.first_port..=self.config.last_port).contains(&internal_port)
-            && self.port_is_free(internal_port, now_ms)
-        {
-            return Some(internal_port);
+    ) -> Result<Option<Nat44UdpPortSelection>, Nat44UdpPlanError> {
+        if (self.config.first_port..=self.config.last_port).contains(&internal_port) {
+            if let Some(selection) = self.select_port(internal_port, now_ms)? {
+                return Ok(Some(selection));
+            }
         }
         let pool_size = u32::from(self.config.last_port) - u32::from(self.config.first_port) + 1;
         let address = u32::from_be_bytes(internal_address.octets());
         let mixed = self.config.policy.allocator_seed
             ^ u64::from(address)
             ^ u64::from(internal_port).rotate_left(17);
-        let start = u32::try_from(mixed % u64::from(pool_size)).ok()?;
+        let start = u32::try_from(mixed % u64::from(pool_size))
+            .map_err(|_| Nat44UdpPlanError::IndexCorrupt)?;
         for step in 0..pool_size {
             let offset = (start + step) % pool_size;
-            let candidate = u16::try_from(u32::from(self.config.first_port) + offset).ok()?;
-            if self.port_is_free(candidate, now_ms) {
-                return Some(candidate);
+            let candidate = u16::try_from(u32::from(self.config.first_port) + offset)
+                .map_err(|_| Nat44UdpPlanError::IndexCorrupt)?;
+            if candidate == internal_port {
+                continue;
+            }
+            if let Some(selection) = self.select_port(candidate, now_ms)? {
+                return Ok(Some(selection));
             }
         }
-        None
+        Ok(None)
     }
 
-    fn next_nonzero_generation(&self) -> u64 {
-        self.next_generation.max(1)
+    fn next_nonzero_generation(&self) -> Result<u64, Nat44UdpPlanError> {
+        if self.next_generation == 0 || self.next_generation == u64::MAX {
+            return Err(Nat44UdpPlanError::GenerationExhausted);
+        }
+        Ok(self.next_generation)
     }
 
     fn check_now_read_only(&self, now_ms: u64) -> Result<(), Nat44UdpPlanError> {
@@ -2509,7 +3611,20 @@ mod tests {
     const REMOTE1: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 1]);
     const REMOTE2: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 2]);
 
+    fn rotated_udp_hash_key() -> Nat44UdpHashKey {
+        Nat44UdpHashKey::new(0xa5a5_5a5a_0123_4567, 0x1357_9bdf_2468_ace0).unwrap()
+    }
+
     fn with_config<R>(policy: Nat44UdpPolicy, run: impl FnOnce(Nat44UdpConfig) -> R) -> R {
+        with_port_config(policy, 40_000, 40_001, run)
+    }
+
+    fn with_port_config<R>(
+        policy: Nat44UdpPolicy,
+        first_port: u16,
+        last_port: u16,
+        run: impl FnOnce(Nat44UdpConfig) -> R,
+    ) -> R {
         let routes = [
             Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, INSIDE, None).unwrap(),
             Route::new(
@@ -2547,9 +3662,10 @@ mod tests {
         ];
         let snapshot =
             ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
-        let config =
-            Nat44UdpConfig::new(&snapshot, INSIDE, OUTSIDE, PUBLIC, 40_000, 40_001, policy)
-                .unwrap();
+        let config = Nat44UdpConfig::new(
+            &snapshot, INSIDE, OUTSIDE, PUBLIC, first_port, last_port, policy,
+        )
+        .unwrap();
         run(config)
     }
 
@@ -2559,13 +3675,16 @@ mod tests {
         with_config(policy, |config| {
             let mut mappings = [Nat44UdpMappingSlot::default(); 1];
             let mut peers = [Nat44UdpPeerSlot::default(); 2];
-            let mut runtime = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+            let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
+            assert!(runtime.publication_binding_matches(config, test_udp_hash_key()));
+            assert!(!runtime.publication_binding_matches(config, rotated_udp_hash_key()));
             let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
             assert_eq!(first.public_port(), 40_000);
-            runtime.commit_outbound(first, 0);
+            runtime.commit_outbound(first, 0).unwrap();
             let second = runtime.plan_outbound(INTERNAL, 40_000, REMOTE2, 1).unwrap();
             assert_eq!(second.public_port(), 40_000);
-            runtime.commit_outbound(second, 1);
+            runtime.commit_outbound(second, 1).unwrap();
             assert!(runtime.plan_inbound(40_000, REMOTE1, 2).is_ok());
             assert!(runtime.plan_inbound(40_000, REMOTE2, 2).is_ok());
 
@@ -2576,7 +3695,9 @@ mod tests {
             let reused = runtime
                 .plan_outbound(INTERNAL2, 40_000, REMOTE2, NAT44_UDP_MIN_IDLE_TTL_MS + 1)
                 .unwrap();
-            runtime.commit_outbound(reused, NAT44_UDP_MIN_IDLE_TTL_MS + 1);
+            runtime
+                .commit_outbound(reused, NAT44_UDP_MIN_IDLE_TTL_MS + 1)
+                .unwrap();
             assert!(matches!(
                 runtime.plan_inbound(reused.public_port(), REMOTE1, NAT44_UDP_MIN_IDLE_TTL_MS + 1),
                 Err(Nat44UdpPlanError::FilterDenied)
@@ -2595,7 +3716,9 @@ mod tests {
         with_config(policy, |config| {
             let mut no_mappings = [];
             let mut no_peers = [];
-            let empty = Nat44UdpRuntime::new(config, &mut no_mappings, &mut no_peers);
+            let mut empty_indexes =
+                TestNat44UdpIndexes::new(config, no_mappings.len(), no_peers.len());
+            let empty = empty_indexes.runtime(config, &mut no_mappings, &mut no_peers);
             assert!(matches!(
                 empty.inspect_icmpv4(40_000, REMOTE1, 0),
                 Err(Nat44UdpPlanError::MappingMiss)
@@ -2603,11 +3726,12 @@ mod tests {
 
             let mut mappings = [Nat44UdpMappingSlot::default(); 1];
             let mut peers = [Nat44UdpPeerSlot::default(); 1];
-            let mut runtime = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+            let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
             let first = runtime
                 .plan_outbound(INTERNAL, 40_000, REMOTE1, 100)
                 .unwrap();
-            runtime.commit_outbound(first, 100);
+            runtime.commit_outbound(first, 100).unwrap();
             let before_mapping = runtime.mappings()[0];
             let before_peer = runtime.peers()[0];
             let before_counters = runtime.counters();
@@ -2632,7 +3756,9 @@ mod tests {
             let reused = runtime
                 .plan_outbound(INTERNAL2, 40_000, REMOTE2, 100 + NAT44_UDP_MIN_IDLE_TTL_MS)
                 .unwrap();
-            runtime.commit_outbound(reused, 100 + NAT44_UDP_MIN_IDLE_TTL_MS);
+            runtime
+                .commit_outbound(reused, 100 + NAT44_UDP_MIN_IDLE_TTL_MS)
+                .unwrap();
             assert!(matches!(
                 runtime.inspect_icmpv4(
                     reused.public_port(),
@@ -2656,11 +3782,12 @@ mod tests {
         with_config(Nat44UdpPolicy::default(), |config| {
             let mut mappings = [Nat44UdpMappingSlot::default(); 1];
             let mut peers = [Nat44UdpPeerSlot::default(); 1];
-            let mut runtime = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+            let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
             let first = runtime
                 .plan_outbound(INTERNAL, 40_000, REMOTE1, 10)
                 .unwrap();
-            runtime.commit_outbound(first, 10);
+            runtime.commit_outbound(first, 10).unwrap();
             assert!(matches!(
                 runtime.plan_outbound(INTERNAL, 40_000, REMOTE2, 20),
                 Err(Nat44UdpPlanError::PeerFull)
@@ -2674,14 +3801,18 @@ mod tests {
 
             let mut no_mappings = [];
             let mut one_peer = [Nat44UdpPeerSlot::default(); 1];
-            let mut empty = Nat44UdpRuntime::new(config, &mut no_mappings, &mut one_peer);
+            let mut empty_indexes =
+                TestNat44UdpIndexes::new(config, no_mappings.len(), one_peer.len());
+            let mut empty = empty_indexes.runtime(config, &mut no_mappings, &mut one_peer);
             assert!(matches!(
                 empty.plan_outbound(INTERNAL, 40_000, REMOTE1, 0),
                 Err(Nat44UdpPlanError::MappingFull)
             ));
             let mut one_mapping = [Nat44UdpMappingSlot::default(); 1];
             let mut no_peers = [];
-            let mut empty = Nat44UdpRuntime::new(config, &mut one_mapping, &mut no_peers);
+            let mut empty_indexes =
+                TestNat44UdpIndexes::new(config, one_mapping.len(), no_peers.len());
+            let mut empty = empty_indexes.runtime(config, &mut one_mapping, &mut no_peers);
             assert!(matches!(
                 empty.plan_outbound(INTERNAL, 40_000, REMOTE1, 0),
                 Err(Nat44UdpPlanError::PeerFull)
@@ -2694,10 +3825,11 @@ mod tests {
         with_config(Nat44UdpPolicy::default(), |config| {
             let mut mappings = [Nat44UdpMappingSlot::default(); 2];
             let mut peers = [Nat44UdpPeerSlot::default(); 2];
-            let mut runtime = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+            let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
             let last = runtime.plan_outbound(INTERNAL, 40_001, REMOTE1, 0).unwrap();
             assert_eq!(last.public_port(), 40_001);
-            runtime.commit_outbound(last, 0);
+            runtime.commit_outbound(last, 0).unwrap();
 
             // For INTERNAL2/50000 and seed zero the deterministic start is
             // offset one. It collides with 40001, wraps, and selects 40000.
@@ -2705,7 +3837,7 @@ mod tests {
                 .plan_outbound(INTERNAL2, 50_000, REMOTE1, 0)
                 .unwrap();
             assert_eq!(wrapped.public_port(), 40_000);
-            runtime.commit_outbound(wrapped, 0);
+            runtime.commit_outbound(wrapped, 0).unwrap();
             assert_ne!(
                 runtime.mappings()[0].public_port(),
                 runtime.mappings()[1].public_port()
@@ -2718,11 +3850,12 @@ mod tests {
         with_config(Nat44UdpPolicy::default(), |config| {
             let mut mappings = [Nat44UdpMappingSlot::default(); 1];
             let mut peers = [Nat44UdpPeerSlot::default(); 1];
-            let mut runtime = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+            let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
             let first = runtime
                 .plan_outbound(INTERNAL, 40_000, REMOTE1, 100)
                 .unwrap();
-            runtime.commit_outbound(first, 100);
+            runtime.commit_outbound(first, 100).unwrap();
             let before = runtime.mappings()[0];
             assert!(matches!(
                 runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 99),
@@ -2733,7 +3866,7 @@ mod tests {
             let equal = runtime
                 .plan_outbound(INTERNAL, 40_000, REMOTE1, 100)
                 .unwrap();
-            runtime.commit_outbound(equal, 100);
+            runtime.commit_outbound(equal, 100).unwrap();
             assert_eq!(runtime.mappings()[0].last_outbound_ms(), 100);
         });
     }
@@ -2744,9 +3877,10 @@ mod tests {
         with_config(policy, |config| {
             let mut mappings = [Nat44UdpMappingSlot::default(); 1];
             let mut peers = [Nat44UdpPeerSlot::default(); 1];
-            let mut runtime = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+            let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
             let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
-            runtime.commit_outbound(first, 0);
+            runtime.commit_outbound(first, 0).unwrap();
             assert!(matches!(
                 runtime.plan_inbound(40_000, REMOTE1, NAT44_UDP_MIN_IDLE_TTL_MS),
                 Err(Nat44UdpPlanError::MappingMiss)
@@ -2764,9 +3898,10 @@ mod tests {
         with_config(Nat44UdpPolicy::default(), |config| {
             let mut mappings = [Nat44UdpMappingSlot::default(); 1];
             let mut peers = [Nat44UdpPeerSlot::default(); 1];
-            let mut runtime = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+            let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
             let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
-            runtime.commit_outbound(first, 0);
+            runtime.commit_outbound(first, 0).unwrap();
             assert!(matches!(
                 runtime.plan_inbound(40_000, REMOTE2, 100),
                 Err(Nat44UdpPlanError::FilterDenied)
@@ -2783,9 +3918,10 @@ mod tests {
         with_config(Nat44UdpPolicy::default(), |config| {
             let mut mappings = [Nat44UdpMappingSlot::default(); 1];
             let mut peers = [Nat44UdpPeerSlot::default(); 2];
-            let mut runtime = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+            let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
             let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
-            runtime.commit_outbound(first, 0);
+            runtime.commit_outbound(first, 0).unwrap();
             assert!(matches!(
                 runtime.plan_outbound(INTERNAL2, 40_001, REMOTE1, 200),
                 Err(Nat44UdpPlanError::MappingFull)
@@ -2805,10 +3941,16 @@ mod tests {
         with_config(Nat44UdpPolicy::default(), |config| {
             let mut mappings = [Nat44UdpMappingSlot::default(); 1];
             let mut peers = [Nat44UdpPeerSlot::default(); 1];
-            let mut runtime = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+            let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
             let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
-            runtime.commit_outbound(first, 0);
-            let report = runtime.reconcile(config);
+            runtime.commit_outbound(first, 0).unwrap();
+            let stale = runtime.plan_inbound_read_only(40_000, REMOTE1, 0).unwrap();
+            let before_counters = runtime.counters();
+            let permit = runtime
+                .preflight_reconcile(config, rotated_udp_hash_key())
+                .unwrap();
+            let report = permit.commit();
             assert_eq!(
                 report,
                 Nat44UdpReconcileReport {
@@ -2822,7 +3964,591 @@ mod tests {
                 runtime.plan_inbound(40_000, REMOTE1, 0),
                 Err(Nat44UdpPlanError::MappingMiss)
             ));
+            let recreated = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(recreated, 0).unwrap();
+            let before_mapping = runtime.mappings()[0];
+            let before_peer = runtime.peers()[0];
+            assert_eq!(
+                runtime.commit_inbound(stale, 0),
+                Err(Nat44UdpCommitError::RuntimeEpochChanged)
+            );
+            assert_eq!(runtime.mappings(), &[before_mapping]);
+            assert_eq!(runtime.peers(), &[before_peer]);
+            assert_eq!(
+                before_counters.reconciliations.saturating_add(1),
+                runtime.counters().reconciliations
+            );
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+            assert!(runtime.publication_binding_matches(config, rotated_udp_hash_key()));
+            assert!(!runtime.publication_binding_matches(config, test_udp_hash_key()));
+            assert!(matches!(
+                runtime.preflight_reconcile(config, rotated_udp_hash_key()),
+                Err(Nat44UdpReconcileError::HashKeyNotRotated)
+            ));
         });
+    }
+
+    #[test]
+    fn runtime_identity_distinguishes_equal_shaped_alternate_backings() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut first_mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut first_peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut first_indexes =
+                TestNat44UdpIndexes::new(config, first_mappings.len(), first_peers.len());
+            let first_binding = {
+                let first_runtime =
+                    first_indexes.runtime(config, &mut first_mappings, &mut first_peers);
+                first_runtime.reconcile_binding()
+            };
+
+            let mut second_mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut second_peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut second_indexes =
+                TestNat44UdpIndexes::new(config, second_mappings.len(), second_peers.len());
+            let second_runtime =
+                second_indexes.runtime(config, &mut second_mappings, &mut second_peers);
+            let second_binding = second_runtime.reconcile_binding();
+            assert_ne!(
+                first_binding.runtime_identity,
+                second_binding.runtime_identity
+            );
+            assert_ne!(first_binding.mappings, second_binding.mappings);
+            assert_ne!(first_binding.peers, second_binding.peers);
+            assert_ne!(
+                first_binding.mapping_buckets,
+                second_binding.mapping_buckets
+            );
+            assert_ne!(first_binding.mapping_nodes, second_binding.mapping_nodes);
+            assert_ne!(first_binding.peer_buckets, second_binding.peer_buckets);
+            assert_ne!(first_binding.peer_nodes, second_binding.peer_nodes);
+            assert_ne!(first_binding.port_owners, second_binding.port_owners);
+        });
+    }
+
+    #[test]
+    fn dropped_and_rejected_reconcile_permits_are_byte_invariant() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let plan = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(plan, 0).unwrap();
+
+            let before_mappings = runtime.mappings().to_vec();
+            let before_peers = runtime.peers().to_vec();
+            let before_config = runtime.config;
+            let before_hash_key = runtime.hash_key;
+            let before_watermark = runtime.watermark_ms;
+            let before_generation = runtime.next_generation;
+            let before_epoch = runtime.runtime_epoch;
+            let before_revision = runtime.state_revision;
+            let before_binding = runtime.reconcile_binding;
+            let before_counters = runtime.counters();
+            let before_mapping_directory = runtime.mapping_directory.backing_snapshot();
+            let before_peer_directory = runtime.peer_directory.backing_snapshot();
+            let before_port_owners = runtime.port_owners.backing_snapshot();
+
+            drop(
+                runtime
+                    .preflight_reconcile(config, rotated_udp_hash_key())
+                    .unwrap(),
+            );
+            assert!(matches!(
+                runtime.preflight_reconcile(config, test_udp_hash_key()),
+                Err(Nat44UdpReconcileError::HashKeyNotRotated)
+            ));
+            with_port_config(
+                Nat44UdpPolicy::default(),
+                40_000,
+                40_002,
+                |oversized_config| {
+                    assert!(matches!(
+                        runtime.preflight_reconcile(oversized_config, rotated_udp_hash_key()),
+                        Err(Nat44UdpReconcileError::PortOwnerTableInvalid)
+                    ));
+                },
+            );
+
+            assert_eq!(runtime.mappings(), before_mappings);
+            assert_eq!(runtime.peers(), before_peers);
+            assert_eq!(runtime.config, before_config);
+            assert_eq!(runtime.hash_key, before_hash_key);
+            assert_eq!(runtime.watermark_ms, before_watermark);
+            assert_eq!(runtime.next_generation, before_generation);
+            assert_eq!(runtime.runtime_epoch, before_epoch);
+            assert_eq!(runtime.state_revision, before_revision);
+            assert!(runtime.reconcile_binding == before_binding);
+            assert_eq!(runtime.counters(), before_counters);
+            assert_eq!(
+                runtime.mapping_directory.backing_snapshot(),
+                before_mapping_directory
+            );
+            assert_eq!(
+                runtime.peer_directory.backing_snapshot(),
+                before_peer_directory
+            );
+            assert_eq!(runtime.port_owners.backing_snapshot(), before_port_owners);
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+    }
+
+    #[test]
+    fn runtime_identity_allocator_never_wraps_or_recovers_after_exhaustion() {
+        let identities = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            allocate_udp_runtime_identity_from(&identities),
+            Ok(u64::MAX - 1)
+        );
+        assert_eq!(identities.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(
+            allocate_udp_runtime_identity_from(&identities),
+            Err(Nat44UdpRuntimeConfigError::RuntimeIdentityExhausted)
+        );
+        assert_eq!(
+            allocate_udp_runtime_identity_from(&identities),
+            Err(Nat44UdpRuntimeConfigError::RuntimeIdentityExhausted)
+        );
+        assert_eq!(identities.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn zero_capacity_same_backing_uses_a_fresh_runtime_identity() {
+        with_port_config(Nat44UdpPolicy::default(), 40_000, 40_000, |config| {
+            let mut mappings = [];
+            let mut peers = [];
+            let mut indexes = TestNat44UdpIndexes::new(config, 0, 0);
+            let first_binding = {
+                let first_runtime = indexes.runtime(config, &mut mappings, &mut peers);
+                first_runtime.reconcile_binding()
+            };
+
+            let mut replacement = indexes.runtime(config, &mut mappings, &mut peers);
+            let replacement_binding = replacement.reconcile_binding();
+            assert_ne!(
+                first_binding.runtime_identity,
+                replacement_binding.runtime_identity
+            );
+            assert_eq!(first_binding.mappings, replacement_binding.mappings);
+            assert_eq!(first_binding.peers, replacement_binding.peers);
+            assert_eq!(
+                first_binding.mapping_buckets,
+                replacement_binding.mapping_buckets
+            );
+            assert_eq!(
+                first_binding.mapping_nodes,
+                replacement_binding.mapping_nodes
+            );
+            assert_eq!(first_binding.peer_buckets, replacement_binding.peer_buckets);
+            assert_eq!(first_binding.peer_nodes, replacement_binding.peer_nodes);
+            assert_eq!(first_binding.port_owners, replacement_binding.port_owners);
+            assert_eq!(
+                replacement
+                    .preflight_reconcile(config, rotated_udp_hash_key())
+                    .unwrap()
+                    .commit(),
+                Nat44UdpReconcileReport {
+                    mappings_flushed: 0,
+                    peers_flushed: 0,
+                }
+            );
+            assert!(replacement.publication_binding_matches(config, rotated_udp_hash_key()));
+            assert_eq!(replacement.validate_indexes(), Ok(()));
+        });
+    }
+
+    #[test]
+    fn storage_shape_reports_every_validated_backing_array() {
+        with_port_config(Nat44UdpPolicy::default(), 40_000, 40_004, |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 3];
+            let mut peers = [Nat44UdpPeerSlot::default(); 5];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let shape = runtime.storage_shape();
+            assert_eq!(shape.mapping_slots(), 3);
+            assert_eq!(shape.peer_slots(), 5);
+            assert_eq!(shape.mapping_buckets(), 4);
+            assert_eq!(shape.mapping_nodes(), 3);
+            assert_eq!(shape.peer_buckets(), 8);
+            assert_eq!(shape.peer_nodes(), 5);
+            assert_eq!(shape.port_owner_slots(), 5);
+            assert!(format!("{shape:?}").contains("port_owner_slots: 5"));
+        });
+    }
+
+    #[test]
+    fn udp_hash_key_and_canonical_index_words_are_exact() {
+        let first = Nat44UdpHashKey::new(0x0011_2233_4455_6677, 0x8899_aabb_ccdd_eeff).unwrap();
+        let second = Nat44UdpHashKey::new(0xfedc_ba98_7654_3210, 0x0123_4567_89ab_cdef).unwrap();
+        assert_eq!(
+            Nat44UdpHashKey::new(0, 0),
+            Err(Nat44UdpHashKeyError::AllZero)
+        );
+        assert_eq!(format!("{first:?}"), "Nat44UdpHashKey([REDACTED])");
+        assert_eq!(format!("{first:#?}"), "Nat44UdpHashKey([REDACTED])");
+        assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        assert_eq!(
+            Nat44UdpRuntime::mapping_lookup_words(INSIDE, INTERNAL, 40_000),
+            [1, 0x0a00_000a, 40_000]
+        );
+        assert_eq!(
+            Nat44UdpRuntime::peer_lookup_words(
+                7,
+                11,
+                0x0011_2233_4455_6677_8899_aabb_ccdd_eeff,
+                REMOTE1,
+            ),
+            [
+                7,
+                11,
+                0x0011_2233_4455_6677,
+                0x8899_aabb_ccdd_eeff,
+                0xc633_6401,
+            ]
+        );
+    }
+
+    #[test]
+    fn invalid_index_storage_and_reconcile_fail_without_partial_mutation() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let occupied_mapping = Nat44UdpMappingSlot {
+                occupied: true,
+                generation: 9,
+                lifecycle_epoch: 7,
+                port_owned: true,
+                inside: INSIDE,
+                internal_address: INTERNAL,
+                internal_port: 40_000,
+                public_port: 40_000,
+                last_outbound_ms: 3,
+            };
+            let occupied_peer = Nat44UdpPeerSlot {
+                occupied: true,
+                mapping_index: 0,
+                mapping_generation: 9,
+                mapping_lifecycle_epoch: 7,
+                remote_address: REMOTE1,
+            };
+            let mut mappings = [occupied_mapping];
+            let mut peers = [occupied_peer];
+            let mut mapping_buckets = [DirectoryBucket::default(); 1];
+            let mut no_mapping_nodes = [];
+            let mut peer_buckets = [DirectoryBucket::default(); 1];
+            let mut peer_nodes = [DirectoryNode::default(); 1];
+            let mut owners = [PortOwnerSlot::default(); 2];
+            let before_mapping_buckets = mapping_buckets;
+            let before_peer_buckets = peer_buckets;
+            let before_peer_nodes = peer_nodes;
+            let before_owners = owners;
+            let storage = Nat44UdpIndexStorage::new(
+                &mut mapping_buckets,
+                &mut no_mapping_nodes,
+                &mut peer_buckets,
+                &mut peer_nodes,
+                &mut owners,
+            );
+            assert!(matches!(
+                Nat44UdpRuntime::new(
+                    config,
+                    &mut mappings,
+                    &mut peers,
+                    storage,
+                    test_udp_hash_key(),
+                ),
+                Err(Nat44UdpRuntimeConfigError::MappingNodeCountMismatch)
+            ));
+            assert_eq!(mappings, [occupied_mapping]);
+            assert_eq!(peers, [occupied_peer]);
+            assert_eq!(mapping_buckets, before_mapping_buckets);
+            assert_eq!(peer_buckets, before_peer_buckets);
+            assert_eq!(peer_nodes, before_peer_nodes);
+            assert_eq!(owners, before_owners);
+
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let plan = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(plan, 0).unwrap();
+            let before_mapping = runtime.mappings()[0];
+            let before_peer = runtime.peers()[0];
+            let before_counters = runtime.counters();
+            assert_eq!(
+                runtime.reconcile(config, test_udp_hash_key()),
+                Err(Nat44UdpReconcileError::HashKeyNotRotated)
+            );
+            assert_eq!(runtime.mappings(), &[before_mapping]);
+            assert_eq!(runtime.peers(), &[before_peer]);
+            assert_eq!(runtime.counters(), before_counters);
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+
+            runtime.runtime_epoch = u128::MAX;
+            let before_config = runtime.config;
+            let before_hash_key = runtime.hash_key;
+            let before_watermark = runtime.watermark_ms;
+            let before_generation = runtime.next_generation;
+            let before_revision = runtime.state_revision;
+            let before_binding = runtime.reconcile_binding;
+            let before_counters = runtime.counters();
+            let before_mapping_directory = runtime.mapping_directory.backing_snapshot();
+            let before_peer_directory = runtime.peer_directory.backing_snapshot();
+            let before_port_owners = runtime.port_owners.backing_snapshot();
+            assert_eq!(
+                runtime.reconcile(config, rotated_udp_hash_key()),
+                Err(Nat44UdpReconcileError::RuntimeEpochExhausted)
+            );
+            assert_eq!(runtime.mappings(), &[before_mapping]);
+            assert_eq!(runtime.peers(), &[before_peer]);
+            assert_eq!(runtime.config, before_config);
+            assert_eq!(runtime.hash_key, before_hash_key);
+            assert_eq!(runtime.watermark_ms, before_watermark);
+            assert_eq!(runtime.next_generation, before_generation);
+            assert_eq!(runtime.runtime_epoch, u128::MAX);
+            assert_eq!(runtime.state_revision, before_revision);
+            assert!(runtime.reconcile_binding == before_binding);
+            assert_eq!(runtime.counters(), before_counters);
+            assert_eq!(
+                runtime.mapping_directory.backing_snapshot(),
+                before_mapping_directory
+            );
+            assert_eq!(
+                runtime.peer_directory.backing_snapshot(),
+                before_peer_directory
+            );
+            assert_eq!(runtime.port_owners.backing_snapshot(), before_port_owners);
+        });
+    }
+
+    #[test]
+    fn composite_stale_plans_and_nonwrapping_authority_are_atomic() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 2];
+            let mut peers = [Nat44UdpPeerSlot::default(); 2];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let stale = runtime
+                .plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 0)
+                .unwrap();
+            let current = runtime
+                .plan_outbound_read_only(INTERNAL2, 40_001, REMOTE2, 0)
+                .unwrap();
+            runtime.commit_outbound(current, 0).unwrap();
+            let before_mappings = [runtime.mappings()[0], runtime.mappings()[1]];
+            let before_peers = [runtime.peers()[0], runtime.peers()[1]];
+            let before_counters = runtime.counters();
+            assert_eq!(
+                runtime.commit_outbound(stale, 0),
+                Err(Nat44UdpCommitError::StateRevisionChanged)
+            );
+            assert_eq!(runtime.mappings(), &before_mappings);
+            assert_eq!(runtime.peers(), &before_peers);
+            assert_eq!(runtime.counters(), before_counters);
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+
+            runtime.next_generation = u64::MAX;
+            let before_mappings = [runtime.mappings()[0], runtime.mappings()[1]];
+            assert!(matches!(
+                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 1),
+                Err(Nat44UdpPlanError::GenerationExhausted)
+            ));
+            assert_eq!(runtime.mappings(), &before_mappings);
+
+            runtime.next_generation = 2;
+            runtime.state_revision = u128::MAX;
+            assert!(matches!(
+                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 1),
+                Err(Nat44UdpPlanError::StateRevisionExhausted)
+            ));
+            assert_eq!(runtime.mappings(), &before_mappings);
+        });
+    }
+
+    #[test]
+    fn expired_owner_displacement_preserves_eim_uniqueness_and_conservation() {
+        let policy = Nat44UdpPolicy::new(NAT44_UDP_MIN_IDLE_TTL_MS, 0).unwrap();
+        with_config(policy, |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 2];
+            let mut peers = [Nat44UdpPeerSlot::default(); 3];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(first, 0).unwrap();
+            let second = runtime
+                .plan_outbound(INTERNAL2, 40_001, REMOTE1, 0)
+                .unwrap();
+            runtime.commit_outbound(second, 0).unwrap();
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+
+            let replacement = runtime
+                .plan_outbound(
+                    Ipv4Address::from_octets([10, 0, 0, 12]),
+                    40_001,
+                    REMOTE2,
+                    NAT44_UDP_MIN_IDLE_TTL_MS,
+                )
+                .unwrap();
+            assert_eq!(replacement.mapping_index, 0);
+            assert_eq!(replacement.displaced_port_mapping_index(), Some(1));
+            runtime
+                .commit_outbound(replacement, NAT44_UDP_MIN_IDLE_TTL_MS)
+                .unwrap();
+            assert!(!runtime.mappings()[1].port_owned);
+            assert_eq!(
+                runtime
+                    .mappings()
+                    .iter()
+                    .filter(|mapping| mapping.occupied && mapping.port_owned)
+                    .map(|mapping| mapping.public_port)
+                    .collect::<Vec<_>>(),
+                vec![40_001]
+            );
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+
+            let eim = runtime
+                .plan_outbound(
+                    Ipv4Address::from_octets([10, 0, 0, 12]),
+                    40_001,
+                    REMOTE1,
+                    NAT44_UDP_MIN_IDLE_TTL_MS,
+                )
+                .unwrap();
+            assert_eq!(eim.public_port(), 40_001);
+            runtime
+                .commit_outbound(eim, NAT44_UDP_MIN_IDLE_TTL_MS)
+                .unwrap();
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+    }
+
+    #[test]
+    fn expired_exact_mapping_is_recreated_in_place_without_duplicate_key() {
+        let policy = Nat44UdpPolicy::new(NAT44_UDP_MIN_IDLE_TTL_MS, 0).unwrap();
+        with_config(policy, |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 2];
+            let mut peers = [Nat44UdpPeerSlot::default(); 2];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(first, 0).unwrap();
+            let exact = runtime
+                .plan_outbound(INTERNAL2, 40_001, REMOTE1, 0)
+                .unwrap();
+            assert_eq!(exact.mapping_index, 1);
+            runtime.commit_outbound(exact, 0).unwrap();
+
+            let recreated = runtime
+                .plan_outbound(INTERNAL2, 40_001, REMOTE2, NAT44_UDP_MIN_IDLE_TTL_MS)
+                .unwrap();
+            assert_eq!(recreated.mapping_index, 1);
+            runtime
+                .commit_outbound(recreated, NAT44_UDP_MIN_IDLE_TTL_MS)
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .mappings()
+                    .iter()
+                    .filter(|mapping| {
+                        mapping.occupied
+                            && mapping.inside == INSIDE
+                            && mapping.internal_address == INTERNAL2
+                            && mapping.internal_port == 40_001
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+    }
+
+    #[test]
+    fn collision_probes_are_capacity_bounded_and_port_search_is_linear_in_pool_only() {
+        with_port_config(Nat44UdpPolicy::default(), 40_000, 40_003, |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 5];
+            let mut peers = [Nat44UdpPeerSlot::default(); 5];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let target_bucket = runtime
+                .mapping_directory
+                .bucket_for_words(
+                    DirectoryHashDomain::UdpMapping,
+                    &Nat44UdpRuntime::mapping_lookup_words(INSIDE, INTERNAL, 10_000),
+                )
+                .unwrap();
+            let colliding_ports = (10_000..u16::MAX)
+                .filter(|port| {
+                    runtime.mapping_directory.bucket_for_words(
+                        DirectoryHashDomain::UdpMapping,
+                        &Nat44UdpRuntime::mapping_lookup_words(INSIDE, INTERNAL, *port),
+                    ) == Some(target_bucket)
+                })
+                .take(4)
+                .collect::<Vec<_>>();
+            assert_eq!(colliding_ports.len(), 4);
+            for (offset, port) in colliding_ports.iter().copied().enumerate() {
+                let remote = Ipv4Address::from_octets([198, 51, 100, offset as u8 + 1]);
+                let plan = runtime.plan_outbound(INTERNAL, port, remote, 0).unwrap();
+                runtime.commit_outbound(plan, 0).unwrap();
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+            }
+            runtime.reset_index_probe_counts();
+            assert!(runtime
+                .find_mapping(INTERNAL, colliding_ports[0])
+                .unwrap()
+                .is_some());
+            let (mapping_probes, _, _) = runtime.index_probe_counts();
+            assert_eq!(mapping_probes, 4);
+            assert!(mapping_probes <= runtime.mappings.len());
+
+            runtime.reset_index_probe_counts();
+            assert!(matches!(
+                runtime
+                    .plan_outbound(Ipv4Address::from_octets([10, 0, 0, 99]), 40_000, REMOTE1, 0,),
+                Err(Nat44UdpPlanError::PortExhausted)
+            ));
+            let (_, _, owner_probes) = runtime.index_probe_counts();
+            assert_eq!(owner_probes, 4);
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+
+        with_port_config(Nat44UdpPolicy::default(), 40_000, 40_000, |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 4];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let target_bucket = runtime
+                .peer_directory
+                .bucket_for_words(
+                    DirectoryHashDomain::UdpPeer,
+                    &Nat44UdpRuntime::peer_lookup_words(0, 1, 1, REMOTE1),
+                )
+                .unwrap();
+            let colliding_remotes = (1..=254)
+                .map(|last| Ipv4Address::from_octets([198, 51, 100, last]))
+                .filter(|remote| {
+                    runtime.peer_directory.bucket_for_words(
+                        DirectoryHashDomain::UdpPeer,
+                        &Nat44UdpRuntime::peer_lookup_words(0, 1, 1, *remote),
+                    ) == Some(target_bucket)
+                })
+                .take(4)
+                .collect::<Vec<_>>();
+            assert_eq!(colliding_remotes.len(), 4);
+            for remote in colliding_remotes.iter().copied() {
+                let plan = runtime.plan_outbound(INTERNAL, 40_000, remote, 0).unwrap();
+                runtime.commit_outbound(plan, 0).unwrap();
+            }
+            runtime.reset_index_probe_counts();
+            assert!(runtime.peer_exists(0, 1, colliding_remotes[0]).unwrap());
+            let (_, peer_probes, _) = runtime.index_probe_counts();
+            assert_eq!(peer_probes, 4);
+            assert!(peer_probes <= runtime.peers.len());
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+    }
+
+    #[test]
+    fn prepared_outbound_plan_stays_within_four_cache_lines() {
+        assert!(std::mem::size_of::<Nat44UdpOutboundPlan>() <= 256);
     }
 
     #[test]

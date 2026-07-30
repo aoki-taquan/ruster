@@ -429,16 +429,25 @@ errorも含む`forward_batch_with_nat44_udp_and_icmpv4_errors`という合成ser
 ARP resolutionと同じworker tickへ明示的にbindします。config公開済みでruntime storageが
 無い場合、またはruntime/config/snapshot authority fingerprintが不一致ならdomain crossingを
 fail closedにします。新snapshot公開時はそのsnapshotでconfigをvalidateし、
-`Nat44UdpRuntime::reconcile`でmapping/peerを全flushします。旧generationのpeerが新mappingを
-許可することはありません。
+freshなUDP専用hash keyを伴う`preflight_reconcile`でexact runtimeを排他的に借用する
+one-shot permitを作り、publication owner交換後はinfallibleな`permit.commit()`で
+mapping/peer/indexを全flushします。permitは別runtimeへ移せず、drop時は何も変更しません。
+互換`reconcile`はこの二段階処理のwrapperです。dimension/key/config validationはclearより先に
+完了し、失敗時は旧publicationを保持します。commit経路に再validation、`Result`、panicは
+ありません。`storage_shape`はmapping/peer slot、両directory
+のbucket/node、port-owner slotの全capacityをopaque valueで比較可能にします。旧generation
+または旧runtime lifecycle epochのpeer/port ownerが新mappingを許可することはありません。
 
 mapping keyは`(inside IfId, internal IPv4, internal UDP port)`でremote endpointを含めない
 Endpoint-Independent Mappingです。別のremoteへ送っても同じpublic tupleを使います。
-filter peerは`(mapping slot, mapping generation, remote IPv4)`で、既知IPの任意remote UDP
+filter peerのcanonical index wordsは
+`(mapping slot, mapping generation, lifecycle epoch high, lifecycle epoch low, remote IPv4)`
+で、mappingは`(inside IfId, internal IPv4, internal UDP port)`です。既知IPの任意remote UDP
 portを許し、未接触IPをbyte不変dropします。outboundでpeer slotを確保できなければmappingを
 refreshせずdropし、filterを緩めません。live mappingをevictせず、port overloadもしません。
 内部portがpool内かつfreeなら保存し、それ以外はcaller seedを混ぜたstartからinclusive poolを
-一周だけscanします。randomness、parity、low-class preservationは保証しません。
+一周だけscanします。各candidateはdirect owner tableを一回参照し、mapping tableを再scan
+しません。randomness、parity、low-class preservationは保証しません。
 
 対象packetの順序は次です。
 

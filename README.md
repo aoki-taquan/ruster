@@ -87,7 +87,10 @@ Ethernet sourceを組み立てます。limited broadcastを転送しないRFC 18
 UDP NAT44は`forward_batch_with_nat44_udp`、またはgenerated ICMP errorも含む
 `forward_batch_with_nat44_udp_and_icmpv4_errors`を選んだworkerだけで有効です。一つの
 inside/outside/public IPv4とnonzero port poolを設定し、mappingとremote-address filter
-peerをcaller-backed固定配列で所有します。outboundはEndpoint-Independent Mapping、
+peerに加えてmapping/peer directoryとpublic-port ownerをcaller-backed固定配列で所有します。
+control planeはruntime生成とreconcileごとにfreshな`Nat44UdpHashKey`を供給します。
+mapping/peer/public-port lookupは固定capacityでbounded、port allocationはpoolを最大一周し、
+候補ごとのmapping全走査は行いません。outboundはEndpoint-Independent Mapping、
 inboundは過去に送信したremote IPv4だけを許すAddress-Dependent Filteringです。
 IPv4 optionsなし、DF=1/MF=0/offset=0のatomic UDPだけを変換します。受信reserved flagは
 fragment判定から除外し、NAT rewrite後もwire上に保存します。UDP checksum zeroを保存、
@@ -98,8 +101,10 @@ live stateをcapacity pressureでevictせず、snapshot/config mismatchはfail c
 NAT runtimeへ到達した非退行時刻はdrop結果でもwatermarkへ反映し、expired/miss後の古い
 時刻によるmapping復活を許しません。outsideからinsideへのpublic DNATを通らない直通LPMも
 neighbor解決前にfail closedです。
-publication変更はvalidated configと`Nat44UdpRuntime::reconcile`による明示的な全state flushを
-要求します。policyで明示的にopt-inした場合だけ、outside/public宛てICMPv4 Type 3/Code 4が
+publication変更はvalidated config、fresh hash key、reconcile permitの事前検証後に行う
+明示的な全state/index flushを要求します。`storage_shape`はmapping/peerと全index backing
+arrayのcapacityを一つのopaque valueとして返します。policyで明示的にopt-inした場合だけ、
+outside/public宛てICMPv4 Type 3/Code 4が
 引用するlive UDP mapping/ADF peerをread-only参照し、outer destinationと引用source tupleを
 insideへ戻します。outer sourceはexternal host-unicastかつoutsideへのreverse LPMを要求する
 local strict-uRPF policyで、asymmetric external pathを意図的に拒否します。中継routerの

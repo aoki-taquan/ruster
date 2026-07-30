@@ -1,13 +1,15 @@
+mod support;
+
 use ruster_core::{
     internet_checksum, ipv4_header_checksum, rfc1624_update, ConsumeReason, DropReason,
     DynamicNeighborSlot, ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
     MacAddress, MonotonicMillis, Nat44Icmpv4Disposition, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
     Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace,
-    ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
-    TraceEvent,
+    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Neighbor, NoTrace, ResolutionActionSlot,
+    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
+use support::UdpTestIndexes;
 
 const LAN: IfId = IfId(1);
 const WAN: IfId = IfId(2);
@@ -279,7 +281,8 @@ fn udp_frag_needed_translates_cascade_and_keeps_nat_state_read_only() {
     let config = udp_config(&snapshot, true);
     let mut mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
-    let mut nat = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+    let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
+    let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -412,7 +415,8 @@ fn udp_zero_checksum_and_remote_port_are_not_authority() {
     let config = udp_config(&snapshot, true);
     let mut mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
-    let mut nat = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+    let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
+    let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -739,7 +743,8 @@ fn disabled_policy_preserves_local_consume_and_candidate_drops_are_atomic() {
     );
     let mut mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
-    let mut nat = Nat44UdpRuntime::new(enabled, &mut mappings, &mut peers);
+    let mut nat_indexes = UdpTestIndexes::new(enabled, mappings.len(), peers.len());
+    let mut nat = nat_indexes.runtime(enabled, &mut mappings, &mut peers);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -760,8 +765,10 @@ fn disabled_policy_preserves_local_consume_and_candidate_drops_are_atomic() {
 
     let mut disabled_mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut disabled_peers = [Nat44UdpPeerSlot::default(); 1];
+    let mut disabled_nat_indexes =
+        UdpTestIndexes::new(disabled, disabled_mappings.len(), disabled_peers.len());
     let mut disabled_nat =
-        Nat44UdpRuntime::new(disabled, &mut disabled_mappings, &mut disabled_peers);
+        disabled_nat_indexes.runtime(disabled, &mut disabled_mappings, &mut disabled_peers);
     io.inject(WAN, valid.clone());
     let report = io
         .run_nat44_udp_once(
@@ -829,7 +836,8 @@ fn backend_reject_and_clock_regression_leave_icmp_lookup_state_unchanged() {
     let config = udp_config(&snapshot, true);
     let mut mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
-    let mut nat = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+    let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
+    let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -908,7 +916,8 @@ fn malformed_candidate_matrix_has_stable_atomic_reasons() {
     let config = udp_config(&snapshot, true);
     let mut mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
-    let mut nat = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+    let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
+    let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -1030,8 +1039,10 @@ fn malformed_candidate_matrix_has_stable_atomic_reasons() {
     let no_mapping_config = udp_config(&snapshot, true);
     let mut empty_mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut empty_peers = [Nat44UdpPeerSlot::default(); 1];
+    let mut empty_nat_indexes =
+        UdpTestIndexes::new(no_mapping_config, empty_mappings.len(), empty_peers.len());
     let mut empty_nat =
-        Nat44UdpRuntime::new(no_mapping_config, &mut empty_mappings, &mut empty_peers);
+        empty_nat_indexes.runtime(no_mapping_config, &mut empty_mappings, &mut empty_peers);
     io.inject(WAN, valid.clone());
     io.run_nat44_udp_once(
         1,
@@ -1119,7 +1130,8 @@ fn combined_realm_mismatch_is_candidate_only_and_precedes_lookup_without_counter
     .unwrap();
     let mut udp_mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut udp_peers = [Nat44UdpPeerSlot::default(); 1];
-    let mut udp = Nat44UdpRuntime::new(udp_config, &mut udp_mappings, &mut udp_peers);
+    let mut udp_indexes = UdpTestIndexes::new(udp_config, udp_mappings.len(), udp_peers.len());
+    let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
     let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
@@ -1218,7 +1230,8 @@ fn outer_source_admission_rejects_non_hosts_local_and_inside_routes_atomically()
     let config = udp_config(&snapshot, true);
     let mut mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
-    let mut nat = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+    let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
+    let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -1347,7 +1360,8 @@ fn mixed_protocol_policies_and_padding_peek_preserve_legacy_local_handling() {
         let tcp_config = tcp_config(&snapshot, tcp_enabled);
         let mut udp_mappings = [Nat44UdpMappingSlot::default(); 1];
         let mut udp_peers = [Nat44UdpPeerSlot::default(); 1];
-        let mut udp = Nat44UdpRuntime::new(udp_config, &mut udp_mappings, &mut udp_peers);
+        let mut udp_indexes = UdpTestIndexes::new(udp_config, udp_mappings.len(), udp_peers.len());
+        let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
         let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
         let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
         let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
@@ -1395,7 +1409,8 @@ fn mixed_protocol_policies_and_padding_peek_preserve_legacy_local_handling() {
     let config = udp_config(&snapshot, true);
     let mut mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
-    let mut nat = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+    let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
+    let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -1428,7 +1443,8 @@ fn same_batch_combined_dispatches_same_public_port_and_preserves_all_mtu_values(
     let tcp_config = tcp_config(&snapshot, true);
     let mut udp_mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut udp_peers = [Nat44UdpPeerSlot::default(); 1];
-    let mut udp = Nat44UdpRuntime::new(udp_config, &mut udp_mappings, &mut udp_peers);
+    let mut udp_indexes = UdpTestIndexes::new(udp_config, udp_mappings.len(), udp_peers.len());
+    let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
     let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
@@ -1533,7 +1549,8 @@ fn udp_tcp_runtime_config_and_snapshot_mismatches_fail_before_read_only_lookup()
     .unwrap();
     let mut udp_mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut udp_peers = [Nat44UdpPeerSlot::default(); 1];
-    let mut udp = Nat44UdpRuntime::new(alternate_udp, &mut udp_mappings, &mut udp_peers);
+    let mut udp_indexes = UdpTestIndexes::new(alternate_udp, udp_mappings.len(), udp_peers.len());
+    let mut udp = udp_indexes.runtime(alternate_udp, &mut udp_mappings, &mut udp_peers);
     let udp_counters = udp.counters();
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
@@ -1595,7 +1612,12 @@ fn udp_tcp_runtime_config_and_snapshot_mismatches_fail_before_read_only_lookup()
         ForwardingSnapshot::new(&routes, &interfaces, &changed_neighbors, &bindings).unwrap();
     let mut matching_udp_mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut matching_udp_peers = [Nat44UdpPeerSlot::default(); 1];
-    let mut matching_udp = Nat44UdpRuntime::new(
+    let mut matching_udp_indexes = UdpTestIndexes::new(
+        udp_config,
+        matching_udp_mappings.len(),
+        matching_udp_peers.len(),
+    );
+    let mut matching_udp = matching_udp_indexes.runtime(
         udp_config,
         &mut matching_udp_mappings,
         &mut matching_udp_peers,
@@ -1659,7 +1681,8 @@ fn unresolved_inside_neighbor_schedules_arp_then_dynamic_learning_allows_transla
     let config = udp_config(&snapshot, true);
     let mut mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
-    let mut nat = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+    let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
+    let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];

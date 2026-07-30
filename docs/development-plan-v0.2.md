@@ -53,9 +53,9 @@ worker-localであり、live capacity pressureで別flowをevictしない。こ�
 
 - forwarded IPv4に対する統一されたingress L2 admissionとmartian source/destination policyが
   ない。local ICMP、ARP、NATには個別防御があるが、plain forwardingを含む入口全体の境界ではない。
-- NAT tableはfixed-capacityだがindexed lookupではない。TCPのport allocationは候補port数
-  `P`ごとにmapping `M`を走査し、mappingのlive判定がsession `S`を走査するため、最悪
-  `O(P*M*S)`となる。UDPも最悪`O(P*M)`である。
+- UDP NATはcaller-backed mapping/peer directoryとdirect public-port ownerへ移行済みで、
+  lookupはcapacity-bounded、allocatorは候補port数`P`だけをscanする。TCPは候補portごとの
+  mapping scanが残るため後続R04でindex化する。
 - NAT+generated ICMP、FW+generated ICMP、NAT+FWのpublic wrapperはあるが、
   UDP/TCP NAT+FW+generated ICMPを同時に選ぶfull composition wrapperがない。
   private `forward_batch_inner`は全serviceを同時に受け取れるため、内部能力ではなくpublic
