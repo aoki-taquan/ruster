@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "ruster-bench"
+version = "0.2.0"
+dependencies = [
+ "ruster-core",
+]
+
+[[package]]
 name = "ruster-core"
 version = "0.2.0"
 
