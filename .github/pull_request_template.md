@@ -19,7 +19,10 @@
 ## Validation
 
 - [ ] `cargo fmt --all -- --check`
-- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- [ ] `cargo test --workspace --all-targets`
-- [ ] `RUSTDOCFLAGS=-Dwarnings cargo doc --workspace --no-deps`
-- [ ] `cargo check --workspace`
+- [ ] `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+- [ ] `cargo test --workspace --all-targets --all-features --locked`
+- [ ] `cargo test --doc --workspace --all-features --locked`
+- [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`
+- [ ] `cargo check --workspace --all-targets --all-features --locked`
+- [ ] `scripts/check-requirements.sh`
+- [ ] `scripts/test-check-requirements.sh`

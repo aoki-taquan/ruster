@@ -78,7 +78,7 @@ test -s "$rows" || {
     exit 1
 }
 
-cargo test --workspace --all-targets -- --list > "$tests"
+cargo test --workspace --all-targets --all-features --locked -- --list > "$tests"
 while IFS="$(printf '\t')" read -r id test_id; do
     if ! grep -Eq "(^|::)${test_id}: test$" "$tests"; then
         echo "$ledger: $id references missing test $test_id" >&2
