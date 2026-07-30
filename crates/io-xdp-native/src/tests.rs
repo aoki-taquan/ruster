@@ -13,6 +13,7 @@ use crate::{
     },
     ensure_supported, validate_descriptor_options, AbiLayoutError, BindMode, ConfigError,
     RingConfig, RingEntries, RingField, RingName, UmemConfig, ValidatedBindFlags,
+    MIN_VISIBLE_FRAME_CAPACITY, SUPPORTED_ALIGNED_CHUNK_SIZES, XDP_PACKET_HEADROOM,
 };
 
 #[test]
@@ -173,26 +174,32 @@ fn native_config_rejects_invalid_geometry_and_flags() {
             umem.frame_count(),
             umem.frame_size(),
             umem.headroom(),
+            umem.visible_capacity(),
             umem.rx_frames(),
             umem.generated_frames(),
             umem.byte_len(),
         ),
-        (4_096, 2_048, 256, 3_584, 512, 8_388_608)
+        (4_096, 2_048, 256, 1_536, 3_584, 512, 8_388_608)
     );
     assert_eq!(
         UmemConfig::new(0, 2_048, 256, 1, 1, 0),
         Err(ConfigError::ZeroFrameCount)
     );
     assert_eq!(
+        UmemConfig::new(2, 1, 0, 1, 1, 0),
+        Err(ConfigError::InvalidFrameSize(1))
+    );
+    assert_eq!(
+        UmemConfig::new(2, 1_024, 0, 1, 1, 0),
+        Err(ConfigError::InvalidFrameSize(1_024))
+    );
+    assert_eq!(
         UmemConfig::new(2, 1_500, 0, 1, 1, 0),
         Err(ConfigError::InvalidFrameSize(1_500))
     );
     assert_eq!(
-        UmemConfig::new(2, 2_048, 2_048, 1, 1, 0),
-        Err(ConfigError::HeadroomConsumesFrame {
-            headroom: 2_048,
-            frame_size: 2_048,
-        })
+        UmemConfig::new(2, 8_192, 0, 1, 1, 0),
+        Err(ConfigError::InvalidFrameSize(8_192))
     );
     assert_eq!(
         UmemConfig::new(2, 2_048, 0, 1, 1, 1),
@@ -254,6 +261,50 @@ fn native_config_rejects_invalid_geometry_and_flags() {
     assert_eq!(
         validate_descriptor_options(XDP_TX_METADATA),
         Err(ConfigError::UnsupportedDescriptorOptions(XDP_TX_METADATA))
+    );
+}
+
+#[test]
+fn native_umem_capacity_accounts_fixed_kernel_headroom() {
+    assert_eq!(XDP_PACKET_HEADROOM, 256);
+    assert_eq!(MIN_VISIBLE_FRAME_CAPACITY, 1);
+    assert_eq!(SUPPORTED_ALIGNED_CHUNK_SIZES, [2_048, 4_096]);
+
+    let smallest_2k =
+        UmemConfig::new(2, 2_048, 1_791, 1, 1, 0).expect("one visible byte in 2K chunk");
+    assert_eq!(smallest_2k.visible_capacity(), 1);
+    assert_eq!(
+        UmemConfig::new(2, 2_048, 1_792, 1, 1, 0),
+        Err(ConfigError::InsufficientVisibleCapacity {
+            headroom: 1_792,
+            frame_size: 2_048,
+            kernel_headroom: 256,
+            minimum_visible: 1,
+        })
+    );
+
+    let smallest_4k =
+        UmemConfig::new(2, 4_096, 3_839, 1, 1, 0).expect("one visible byte in 4K chunk");
+    assert_eq!(smallest_4k.visible_capacity(), 1);
+    assert_eq!(
+        UmemConfig::new(2, 4_096, 3_840, 1, 1, 0),
+        Err(ConfigError::InsufficientVisibleCapacity {
+            headroom: 3_840,
+            frame_size: 4_096,
+            kernel_headroom: 256,
+            minimum_visible: 1,
+        })
+    );
+
+    assert_eq!(
+        UmemConfig::new(2, 2_048, u32::MAX, 1, 1, 0),
+        Err(ConfigError::HeadroomCapacityOverflow { headroom: u32::MAX })
+    );
+    assert_eq!(
+        UmemConfig::new(2, 2_048, u32::MAX - 256, 1, 1, 0),
+        Err(ConfigError::HeadroomCapacityOverflow {
+            headroom: u32::MAX - 256,
+        })
     );
 }
 

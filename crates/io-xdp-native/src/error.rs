@@ -20,14 +20,23 @@ pub enum RingField {
 pub enum ConfigError {
     /// At least one UMEM frame is required.
     ZeroFrameCount,
-    /// Aligned chunks require a nonzero power-of-two size.
+    /// The initial aligned profile supports only 2,048 or 4,096-byte chunks.
     InvalidFrameSize(u32),
-    /// Headroom must leave at least one visible byte.
-    HeadroomConsumesFrame {
+    /// Adding fixed kernel headroom and minimum visible capacity overflowed.
+    HeadroomCapacityOverflow {
         /// Requested headroom.
+        headroom: u32,
+    },
+    /// Combined configured and fixed headroom left no minimum visible area.
+    InsufficientVisibleCapacity {
+        /// Requested additional UMEM headroom.
         headroom: u32,
         /// Configured frame size.
         frame_size: u32,
+        /// Fixed kernel RX headroom.
+        kernel_headroom: u32,
+        /// Minimum required packet capacity.
+        minimum_visible: u32,
     },
     /// The initial profile does not accept these UMEM flags.
     UnsupportedUmemFlags(u32),

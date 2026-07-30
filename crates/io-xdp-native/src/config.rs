@@ -3,6 +3,13 @@ use crate::{
     ConfigError,
 };
 
+/// Fixed RX headroom required by Linux v6.8 `include/uapi/linux/bpf.h`.
+pub const XDP_PACKET_HEADROOM: u32 = 256;
+/// Smallest packet byte capacity accepted by the initial profile.
+pub const MIN_VISIBLE_FRAME_CAPACITY: u32 = 1;
+/// Aligned chunk sizes reviewed for the initial profile.
+pub const SUPPORTED_ALIGNED_CHUNK_SIZES: [u32; 2] = [2_048, 4_096];
+
 /// AF_XDP bind-mode policy encoded in checked socket flags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BindMode {
@@ -157,6 +164,7 @@ pub struct UmemConfig {
     frame_count: u32,
     frame_size: u32,
     headroom: u32,
+    visible_capacity: u32,
     rx_frames: u32,
     generated_frames: u32,
     byte_len: u64,
@@ -165,9 +173,12 @@ pub struct UmemConfig {
 impl UmemConfig {
     /// Validates fixed-frame geometry and the RX/generated frame partition.
     ///
-    /// The first native profile accepts no UMEM flags: unaligned chunks,
-    /// software TX checksum, and TX metadata remain deferred. Both pools must
-    /// be nonempty and must partition the complete UMEM exactly.
+    /// The first native profile accepts only 2,048-byte and 4,096-byte aligned
+    /// chunks and no UMEM flags: unaligned chunks, software TX checksum, and TX
+    /// metadata remain deferred. User headroom plus the kernel's fixed
+    /// [`XDP_PACKET_HEADROOM`] must leave at least
+    /// [`MIN_VISIBLE_FRAME_CAPACITY`]. Both pools must be nonempty and must
+    /// partition the complete UMEM exactly.
     pub fn new(
         frame_count: u32,
         frame_size: u32,
@@ -179,15 +190,22 @@ impl UmemConfig {
         if frame_count == 0 {
             return Err(ConfigError::ZeroFrameCount);
         }
-        if frame_size == 0 || !frame_size.is_power_of_two() {
+        if !SUPPORTED_ALIGNED_CHUNK_SIZES.contains(&frame_size) {
             return Err(ConfigError::InvalidFrameSize(frame_size));
         }
-        if headroom >= frame_size {
-            return Err(ConfigError::HeadroomConsumesFrame {
+        let required = headroom
+            .checked_add(XDP_PACKET_HEADROOM)
+            .and_then(|value| value.checked_add(MIN_VISIBLE_FRAME_CAPACITY))
+            .ok_or(ConfigError::HeadroomCapacityOverflow { headroom })?;
+        if required > frame_size {
+            return Err(ConfigError::InsufficientVisibleCapacity {
                 headroom,
                 frame_size,
+                kernel_headroom: XDP_PACKET_HEADROOM,
+                minimum_visible: MIN_VISIBLE_FRAME_CAPACITY,
             });
         }
+        let visible_capacity = frame_size - headroom - XDP_PACKET_HEADROOM;
         if raw_flags != 0 {
             return Err(ConfigError::UnsupportedUmemFlags(raw_flags));
         }
@@ -213,6 +231,7 @@ impl UmemConfig {
             frame_count,
             frame_size,
             headroom,
+            visible_capacity,
             rx_frames,
             generated_frames,
             byte_len,
@@ -231,10 +250,16 @@ impl UmemConfig {
         self.frame_size
     }
 
-    /// Returns the per-frame kernel headroom.
+    /// Returns the configured UMEM headroom in addition to kernel headroom.
     #[must_use]
     pub const fn headroom(self) -> u32 {
         self.headroom
+    }
+
+    /// Returns packet bytes left after configured and fixed kernel headroom.
+    #[must_use]
+    pub const fn visible_capacity(self) -> u32 {
+        self.visible_capacity
     }
 
     /// Returns the frames reserved for RX/FILL lifecycle.

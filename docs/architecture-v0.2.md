@@ -882,10 +882,14 @@ field offsetとsocket option/mmap offset定数をdependencyなしの`repr(C)`型
 
 initial profileのbind flagは`XDP_USE_NEED_WAKEUP`を必須とし、automatic、copy required、
 zero-copy requiredを区別します。`XDP_SHARED_UMEM`は許可しますが、copyとzero-copyの同時指定、
-scatter/gather、unknown bitをresource取得前にtyped rejectします。UMEMはaligned chunk、
-metadataなし、software checksum指定なしに限定し、frame count/size/headroom、RX/generated
-frame partitionを検証します。四ring capacityはnonzero power-of-twoです。RX/TX descriptorは
-single-bufferのoptions zeroだけを許可します。
+scatter/gather、unknown bitをresource取得前にtyped rejectします。UMEMはunaligned flagなしの
+exact 2048-byteまたは4096-byte chunkだけに限定します。他のpower-of-two sizeも、page sizeと
+platform条件を別途検証する後続sliceまではrejectします。Linux v6.8
+`include/uapi/linux/bpf.h`の`XDP_PACKET_HEADROOM=256`をuser-configured UMEM headroomへ
+checked加算し、少なくとも1-byteのvisible packet capacityが残らなければtyped rejectします。
+metadataなし、software checksum指定なし、RX/generated frame exact partitionを要求します。
+四ring capacityはnonzero power-of-twoです。RX/TX descriptorはsingle-bufferのoptions zeroだけを
+許可します。
 
 kernelが将来`XDP_MMAP_OFFSETS`で返す各ring offsetは、producer、consumer、flags、
 descriptor領域のalignment、checked extent、process `usize`変換、相互非overlapを検証してから
