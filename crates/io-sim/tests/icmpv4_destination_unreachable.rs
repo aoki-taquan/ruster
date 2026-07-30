@@ -569,6 +569,21 @@ fn route_miss_suppression_matrix_and_options_are_atomic() {
     cases.push((group, Icmpv4ErrorDisposition::EthernetDestinationGroup));
 
     for (original, expected) in cases {
+        let admission_reason = match expected {
+            Icmpv4ErrorDisposition::SourceNotUnicast => {
+                Some(DropReason::Ipv4SourceUnspecifiedNetwork)
+            }
+            Icmpv4ErrorDisposition::DestinationMulticast => {
+                Some(DropReason::Ipv4DestinationMulticast)
+            }
+            Icmpv4ErrorDisposition::DestinationLimitedBroadcast => {
+                Some(DropReason::Ipv4DestinationLimitedBroadcast)
+            }
+            Icmpv4ErrorDisposition::EthernetDestinationGroup => {
+                Some(DropReason::Ipv4EthernetDestinationMulticast)
+            }
+            _ => None,
+        };
         let mut rs = [ResolutionStateSlot::EMPTY; 1];
         let mut ra = [ResolutionActionSlot::EMPTY; 1];
         let mut resolution = ResolutionRuntime::new(resolution_policy(), &mut rs, &mut ra);
@@ -587,7 +602,16 @@ fn route_miss_suppression_matrix_and_options_are_atomic() {
             &mut trace,
         );
         assert_eq!(errors.pending_actions(), 0, "{expected:?}");
-        assert_eq!(io.pop_recycled().unwrap().bytes, original);
+        let recycled = io.pop_recycled().unwrap();
+        assert_eq!(recycled.bytes, original);
+        if let Some(reason) = admission_reason {
+            assert_eq!(recycled.cause, RecycleCause::Forwarding(reason));
+            assert!(!trace.events().iter().any(|event| matches!(
+                event,
+                TraceEvent::Icmpv4DestinationUnreachableDisposition { .. }
+            )));
+            continue;
+        }
         assert!(trace.events().iter().any(|event| matches!(
             event,
             TraceEvent::Icmpv4DestinationUnreachableDisposition { disposition, .. }

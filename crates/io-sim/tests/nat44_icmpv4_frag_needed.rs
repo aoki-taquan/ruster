@@ -1183,18 +1183,39 @@ fn outer_source_admission_rejects_non_hosts_local_and_inside_routes_atomically()
     let before_resolution_counters = resolution.counters();
 
     let invalid_sources = [
-        Ipv4Address::from_octets([0, 1, 2, 3]),
-        Ipv4Address::from_octets([127, 0, 0, 1]),
-        Ipv4Address::from_octets([224, 0, 0, 1]),
-        Ipv4Address::from_octets([240, 0, 0, 1]),
-        Ipv4Address::from_octets([255; 4]),
-        Ipv4Address::from_octets([192, 0, 2, 0]),
-        Ipv4Address::from_octets([192, 0, 2, 255]),
-        PUBLIC,
-        LAN_LOCAL,
-        HOST,
+        (
+            Ipv4Address::from_octets([0, 1, 2, 3]),
+            DropReason::Ipv4SourceUnspecifiedNetwork,
+        ),
+        (
+            Ipv4Address::from_octets([127, 0, 0, 1]),
+            DropReason::Ipv4SourceLoopback,
+        ),
+        (
+            Ipv4Address::from_octets([224, 0, 0, 1]),
+            DropReason::Ipv4SourceMulticast,
+        ),
+        (
+            Ipv4Address::from_octets([240, 0, 0, 1]),
+            DropReason::Ipv4SourceClassE,
+        ),
+        (
+            Ipv4Address::from_octets([255; 4]),
+            DropReason::Ipv4SourceLimitedBroadcast,
+        ),
+        (
+            Ipv4Address::from_octets([192, 0, 2, 0]),
+            DropReason::Ipv4SourceNetworkAddress,
+        ),
+        (
+            Ipv4Address::from_octets([192, 0, 2, 255]),
+            DropReason::Ipv4SourceDirectedBroadcast,
+        ),
+        (PUBLIC, DropReason::Nat44Icmpv4SourceForbidden),
+        (LAN_LOCAL, DropReason::Nat44Icmpv4SourceForbidden),
+        (HOST, DropReason::Nat44Icmpv4SourceForbidden),
     ];
-    for source in invalid_sources {
+    for (source, reason) in invalid_sources {
         let mut packet = valid.clone();
         set_outer_source(&mut packet, source);
         io.inject(WAN, packet.clone());
@@ -1208,7 +1229,7 @@ fn outer_source_admission_rejects_non_hosts_local_and_inside_routes_atomically()
             &mut NoTrace,
         )
         .unwrap();
-        assert_drop(&mut io, DropReason::Nat44Icmpv4SourceForbidden, &packet);
+        assert_drop(&mut io, reason, &packet);
         assert_eq!(nat.mappings()[0], before_mapping);
         assert_eq!(nat.peers()[0], before_peer);
         assert_eq!(nat.counters(), before_nat_counters);

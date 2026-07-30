@@ -177,6 +177,27 @@ v0.2 bootstrapはEthernet II上のIPv4 datagramを転送します。
 - fragment offsetやMFに関係なく、このsliceはL4を参照しないためdatagramとして転送する。
 - TTLは1減算し、header checksumはRFC 1624のincremental updateで更新する。
 
+構造とIPv4 header checksumの検証後、NAT/FWのruntime/config参照、monotonic watermark、
+state、audit、resolution、ICMP error action、packet rewriteより前にcommon ingress admissionを
+行います。順序とstable reasonは次のとおりです。
+
+1. ingress `IfId`がsnapshotのinterfaceに存在すること。
+2. Ethernet source、destinationの順にzero、exact broadcast、multicast/groupを拒否すること。
+   forwardingのdestinationは任意のnonzero unicastを許可し、local ICMPだけ後段でingress MACとの
+   exact matchを追加要求する。
+3. IPv4 sourceは`0/8`、`127/8`、`224/4` multicast、`240/4` Class Eを拒否すること。
+4. IPv4 destinationはlimited broadcastを最優先で分類し、`0/8`、`127/8`、multicast、
+   その他の`240/4`を拒否すること。
+5. read-only LPMで選んだsource prefixのnetwork/directed-broadcastを拒否する。nonlocal
+   destinationも同様に選択prefix境界を拒否し、そのRouteを後続処理で再利用する。
+
+RFC 1812 §§4.2.2.11, 5.3.4, 5.3.5, 5.3.7に基づくmartian/group境界です。BOOTP relayや
+IPv4 multicast forwardingのhandlerは存在しないため例外を設けずfail closedにします。
+LPMはmore-specific routeを優先するため明示`/32` host routeが広いprefixの境界を上書きします。
+RFC 3021の`/31`と`/32`はnetwork/directed-broadcast分類から除外します。local destinationは
+forward destination境界判定を受けずStrong ES local処理へ進みますが、source admissionは共通です。
+reserved IPv4 flagだけを理由にdropしない既存契約は維持します。
+
 ## ICMPv4 local control scope
 
 RFC 792とRFC 1122 §3.2.2.6のEcho responder要件を実装します。ただしlocal deliveryは
@@ -293,10 +314,11 @@ Ethernet headerとTotal Length後のpaddingは引用しません。生成wire pr
   header+quote全体をchecksumする。
 - outer IPv4 Total Lengthは最大576、Ethernet frameは最大590 bytes。
 
-RFC 1812のerror suppressionとして、invalid/non-host/router-local source、IP
-multicast/limited/prefix-network/directed-broadcast destination、Ethernet group destination、
-noninitial fragment、ICMP error Types 3/4/5/11/12、protocol 1でtype byteが無いpacket、
-reverse route/interface/binding/neighbor不在では生成しません。first fragment
+RFC 1812のerror suppressionとして、router-local source、noninitial fragment、ICMP error
+Types 3/4/5/11/12、protocol 1でtype byteが無いpacket、
+reverse route/interface/binding/neighbor不在では生成しません。invalid/non-host source、
+IP multicast/limited/prefix-network/directed-broadcast destination、Ethernet group destinationは
+common ingress admissionがerror runtimeより先にbyte不変dropします。first fragment
 offset=0/MF=1とICMP queryは生成可能です。source/destinationのprefix network/broadcast
 判定はgateway routeを含むLPM-selected prefixに対して行い、more-specific `/32`を優先し、
 `/31`と`/32` endpointをnetwork/broadcast扱いしません。RFC 1812 §4.3.2.6と

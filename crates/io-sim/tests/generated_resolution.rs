@@ -23,8 +23,8 @@ const TARGET: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 1]);
 
 fn frame(destination: Ipv4Address) -> Vec<u8> {
     let mut bytes = vec![0_u8; ETHERNET_HEADER_LEN + 20];
-    bytes[0..6].copy_from_slice(&[9; 6]);
-    bytes[6..12].copy_from_slice(&[1; 6]);
+    bytes[0..6].copy_from_slice(&[0x02, 0, 0, 0, 0, 9]);
+    bytes[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 1]);
     bytes[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
     bytes[14] = 0x45;
     bytes[16..18].copy_from_slice(&20_u16.to_be_bytes());
@@ -42,6 +42,16 @@ fn interface() -> Interface {
         id: WAN,
         mac: ROUTER_MAC,
     }
+}
+
+fn interfaces() -> [Interface; 2] {
+    [
+        Interface {
+            id: LAN,
+            mac: MacAddress([0x02, 0, 0, 0, 0, 1]),
+        },
+        interface(),
+    ]
 }
 
 fn binding() -> LocalIpv4Binding {
@@ -74,7 +84,7 @@ fn resolution_policy_rejects_short_interval_and_state_ttl() {
 #[test]
 fn recreating_runtime_clears_caller_state_and_queued_actions() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 1];
@@ -143,7 +153,7 @@ fn run_miss(
 #[test]
 fn unresolved_neighbor_generates_broadcast_arp_request_and_recycles_trigger_atomically() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 2];
@@ -218,7 +228,7 @@ fn unresolved_neighbor_generates_broadcast_arp_request_and_recycles_trigger_atom
 #[test]
 fn ordinary_resolution_request_is_not_probe_or_announcement() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 1];
@@ -254,7 +264,7 @@ fn ordinary_resolution_request_is_not_probe_or_announcement() {
 #[test]
 fn same_target_is_rate_limited_to_one_request_per_second_at_exact_deadline() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 1];
@@ -288,7 +298,7 @@ fn same_target_is_rate_limited_to_one_request_per_second_at_exact_deadline() {
 #[test]
 fn suppression_deadline_starts_at_generated_commit_time() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 1];
@@ -331,7 +341,7 @@ fn suppression_deadline_starts_at_generated_commit_time() {
 fn resolution_keys_are_independent_by_interface_and_target() {
     let direct = Route::new(Ipv4Address::from_octets([198, 51, 100, 0]), 24, WAN, None).unwrap();
     let routes = [direct];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 3];
@@ -373,7 +383,13 @@ fn resolution_keys_are_independent_by_interface_and_target() {
         address: Ipv4Address::from_octets([198, 18, 0, 1]),
     };
     let routes = [other_route];
-    let interfaces = [other_interface];
+    let interfaces = [
+        Interface {
+            id: LAN,
+            mac: MacAddress([0x02, 0, 0, 0, 0, 1]),
+        },
+        other_interface,
+    ];
     let bindings = [other_binding];
     let other = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     run_miss(
@@ -390,7 +406,7 @@ fn resolution_keys_are_independent_by_interface_and_target() {
 #[test]
 fn clock_regression_is_typed_and_does_not_mutate_queue() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 2];
@@ -415,7 +431,7 @@ fn clock_regression_is_typed_and_does_not_mutate_queue() {
 #[test]
 fn generated_commit_clock_regression_retains_action() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 1];
@@ -447,7 +463,7 @@ fn generated_commit_clock_regression_retains_action() {
 fn state_full_never_evicts_active_or_failed_entry_and_hold_expiry_allows_reuse() {
     let direct = Route::new(Ipv4Address::from_octets([198, 51, 100, 0]), 24, WAN, None).unwrap();
     let routes = [direct];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 1];
@@ -492,7 +508,7 @@ fn state_full_never_evicts_active_or_failed_entry_and_hold_expiry_allows_reuse()
 fn action_full_does_not_create_phantom_suppression() {
     let direct = Route::new(Ipv4Address::from_octets([198, 51, 100, 0]), 24, WAN, None).unwrap();
     let routes = [direct];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 2];
@@ -521,7 +537,7 @@ fn action_full_does_not_create_phantom_suppression() {
 #[test]
 fn local_binding_missing_and_forbidden_targets_generate_nothing() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let no_binding = ForwardingSnapshot::new(&routes, &interfaces, &[], &[]).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 4];
     let mut actions = [ResolutionActionSlot::EMPTY; 4];
@@ -563,16 +579,25 @@ fn local_binding_missing_and_forbidden_targets_generate_nothing() {
     let routes = [direct];
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
-    run_miss(
-        &mut io,
+    let original = frame(Ipv4Address::from_octets([198, 51, 100, 255]));
+    io.inject(LAN, original.clone());
+    let batch = io.receive(1).unwrap();
+    let report = forward_batch_with_resolution(
+        batch,
         &snapshot,
         &mut runtime,
-        0,
-        Ipv4Address::from_octets([198, 51, 100, 255]),
+        MonotonicMillis(0),
         &mut trace,
     );
+    assert_eq!(report.dropped, 1);
+    let recycled = io.pop_recycled().unwrap();
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Forwarding(DropReason::Ipv4DestinationDirectedBroadcast)
+    );
+    assert_eq!(recycled.bytes, original);
     assert_eq!(runtime.pending_actions(), 0);
-    assert_eq!(runtime.counters().forbidden_target, 6);
+    assert_eq!(runtime.counters().forbidden_target, 5);
     assert_eq!(
         trace
             .events()
@@ -585,13 +610,13 @@ fn local_binding_missing_and_forbidden_targets_generate_nothing() {
                 }
             ))
             .count(),
-        6
+        5
     );
 }
 
 #[test]
 fn local_source_ip_is_forbidden_as_connected_or_gateway_target() {
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
@@ -630,7 +655,7 @@ fn gateway_target_matching_same_egress_connected_broadcast_is_forbidden() {
     )
     .unwrap();
     let routes = [connected, default];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 1];
@@ -661,7 +686,7 @@ fn gateway_target_matching_same_egress_connected_broadcast_is_forbidden() {
 #[test]
 fn static_neighbor_hit_leaves_resolution_runtime_untouched() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let neighbors = [Neighbor {
         interface: WAN,
@@ -766,7 +791,7 @@ fn generated_partial_tx_error_preserves_invariants_and_recycles_rejects() {
 #[test]
 fn allocation_failure_retains_action_and_does_not_start_deadline() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 1];
@@ -820,7 +845,7 @@ fn allocation_failure_retains_action_and_does_not_start_deadline() {
 #[test]
 fn builder_failure_cancels_lease_and_retains_action() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 1];
@@ -856,7 +881,7 @@ fn builder_failure_cancels_lease_and_retains_action() {
 #[test]
 fn terminal_resolution_is_typed_in_forwarding_trace_but_drop_stays_unresolved() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 1];
@@ -920,7 +945,7 @@ fn terminal_resolution_is_typed_in_forwarding_trace_but_drop_stays_unresolved() 
 #[test]
 fn generated_finish_error_still_commits_one_resolution_attempt() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 1];
@@ -1027,7 +1052,7 @@ impl GeneratedPacketSlot for ShortBufferSlot<'_> {
 #[test]
 fn mixed_rx_and_generated_tx_are_fifo_budgeted_and_origin_typed() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = interfaces();
     let bindings = [binding()];
     let neighbors = [Neighbor {
         interface: WAN,

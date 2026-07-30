@@ -136,6 +136,27 @@ pub enum DropReason {
     FirewallRelatedIcmpv4Unsupported = 114,
     FirewallRouteUnavailable = 115,
     FirewallRelatedIcmpv4StateMiss = 116,
+    Ipv4IngressInterfaceUnknown = 117,
+    Ipv4EthernetSourceZero = 118,
+    Ipv4EthernetSourceBroadcast = 119,
+    Ipv4EthernetSourceMulticast = 120,
+    Ipv4EthernetDestinationZero = 121,
+    Ipv4EthernetDestinationBroadcast = 122,
+    Ipv4EthernetDestinationMulticast = 123,
+    Ipv4SourceUnspecifiedNetwork = 124,
+    Ipv4SourceLoopback = 125,
+    Ipv4SourceMulticast = 126,
+    Ipv4SourceLimitedBroadcast = 127,
+    Ipv4SourceClassE = 128,
+    Ipv4SourceNetworkAddress = 129,
+    Ipv4SourceDirectedBroadcast = 130,
+    Ipv4DestinationUnspecifiedNetwork = 131,
+    Ipv4DestinationLoopback = 132,
+    Ipv4DestinationMulticast = 133,
+    Ipv4DestinationLimitedBroadcast = 134,
+    Ipv4DestinationClassE = 135,
+    Ipv4DestinationNetworkAddress = 136,
+    Ipv4DestinationDirectedBroadcast = 137,
 }
 
 use DropReason::*;
@@ -262,6 +283,27 @@ impl DropReason {
             FirewallRelatedIcmpv4Unsupported => "FIREWALL_RELATED_ICMPV4_UNSUPPORTED",
             FirewallRouteUnavailable => "FIREWALL_ROUTE_UNAVAILABLE",
             FirewallRelatedIcmpv4StateMiss => "FIREWALL_RELATED_ICMPV4_STATE_MISS",
+            Ipv4IngressInterfaceUnknown => "IPV4_INGRESS_INTERFACE_UNKNOWN",
+            Ipv4EthernetSourceZero => "IPV4_ETHERNET_SOURCE_ZERO",
+            Ipv4EthernetSourceBroadcast => "IPV4_ETHERNET_SOURCE_BROADCAST",
+            Ipv4EthernetSourceMulticast => "IPV4_ETHERNET_SOURCE_MULTICAST",
+            Ipv4EthernetDestinationZero => "IPV4_ETHERNET_DESTINATION_ZERO",
+            Ipv4EthernetDestinationBroadcast => "IPV4_ETHERNET_DESTINATION_BROADCAST",
+            Ipv4EthernetDestinationMulticast => "IPV4_ETHERNET_DESTINATION_MULTICAST",
+            Ipv4SourceUnspecifiedNetwork => "IPV4_SOURCE_UNSPECIFIED_NETWORK",
+            Ipv4SourceLoopback => "IPV4_SOURCE_LOOPBACK",
+            Ipv4SourceMulticast => "IPV4_SOURCE_MULTICAST",
+            Ipv4SourceLimitedBroadcast => "IPV4_SOURCE_LIMITED_BROADCAST",
+            Ipv4SourceClassE => "IPV4_SOURCE_CLASS_E",
+            Ipv4SourceNetworkAddress => "IPV4_SOURCE_NETWORK_ADDRESS",
+            Ipv4SourceDirectedBroadcast => "IPV4_SOURCE_DIRECTED_BROADCAST",
+            Ipv4DestinationUnspecifiedNetwork => "IPV4_DESTINATION_UNSPECIFIED_NETWORK",
+            Ipv4DestinationLoopback => "IPV4_DESTINATION_LOOPBACK",
+            Ipv4DestinationMulticast => "IPV4_DESTINATION_MULTICAST",
+            Ipv4DestinationLimitedBroadcast => "IPV4_DESTINATION_LIMITED_BROADCAST",
+            Ipv4DestinationClassE => "IPV4_DESTINATION_CLASS_E",
+            Ipv4DestinationNetworkAddress => "IPV4_DESTINATION_NETWORK_ADDRESS",
+            Ipv4DestinationDirectedBroadcast => "IPV4_DESTINATION_DIRECTED_BROADCAST",
         }
     }
 }
@@ -1653,6 +1695,89 @@ fn decide<T: TraceSink>(
     }
 }
 
+fn validate_ipv4_ingress(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    ipv4: packet::ValidatedIpv4,
+) -> Result<(), DropReason> {
+    if !snapshot
+        .interfaces
+        .iter()
+        .any(|interface| interface.id == ingress)
+    {
+        return Err(Ipv4IngressInterfaceUnknown);
+    }
+
+    let destination_mac = &frame[0..6];
+    let source_mac = &frame[6..12];
+    if source_mac == [0; 6] {
+        return Err(Ipv4EthernetSourceZero);
+    }
+    if source_mac == [0xff; 6] {
+        return Err(Ipv4EthernetSourceBroadcast);
+    }
+    if source_mac[0] & 1 != 0 {
+        return Err(Ipv4EthernetSourceMulticast);
+    }
+    if destination_mac == [0; 6] {
+        return Err(Ipv4EthernetDestinationZero);
+    }
+    if destination_mac == [0xff; 6] {
+        return Err(Ipv4EthernetDestinationBroadcast);
+    }
+    if destination_mac[0] & 1 != 0 {
+        return Err(Ipv4EthernetDestinationMulticast);
+    }
+
+    let source = ipv4.source.octets();
+    if source == [255; 4] {
+        return Err(Ipv4SourceLimitedBroadcast);
+    }
+    match source[0] {
+        0 => return Err(Ipv4SourceUnspecifiedNetwork),
+        127 => return Err(Ipv4SourceLoopback),
+        224..=239 => return Err(Ipv4SourceMulticast),
+        240..=255 => return Err(Ipv4SourceClassE),
+        _ => {}
+    }
+    if let Some(selected) = route::lookup(snapshot.routes, ipv4.source) {
+        if selected.is_prefix_network_address(ipv4.source) {
+            return Err(Ipv4SourceNetworkAddress);
+        }
+        if selected.is_prefix_directed_broadcast(ipv4.source) {
+            return Err(Ipv4SourceDirectedBroadcast);
+        }
+    }
+
+    let destination = ipv4.destination.octets();
+    if destination == [255; 4] {
+        return Err(Ipv4DestinationLimitedBroadcast);
+    }
+    match destination[0] {
+        0 => Err(Ipv4DestinationUnspecifiedNetwork),
+        127 => Err(Ipv4DestinationLoopback),
+        224..=239 => Err(Ipv4DestinationMulticast),
+        240..=255 => Err(Ipv4DestinationClassE),
+        _ => Ok(()),
+    }
+}
+
+fn validate_ipv4_forward_destination(
+    ipv4: packet::ValidatedIpv4,
+    selected_route: Option<Route>,
+) -> Result<(), DropReason> {
+    if let Some(selected) = selected_route {
+        if selected.is_prefix_network_address(ipv4.destination) {
+            return Err(Ipv4DestinationNetworkAddress);
+        }
+        if selected.is_prefix_directed_broadcast(ipv4.destination) {
+            return Err(Ipv4DestinationDirectedBroadcast);
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decide_ipv4<T: TraceSink>(
     frame: &[u8],
@@ -1675,6 +1800,19 @@ fn decide_ipv4<T: TraceSink>(
         ingress,
         destination: ipv4.destination,
     });
+    validate_ipv4_ingress(frame, snapshot, ingress, ipv4)?;
+    let local = snapshot
+        .local_ipv4
+        .iter()
+        .any(|binding| binding.interface == ingress && binding.address == ipv4.destination);
+    let selected_route = if local {
+        None
+    } else {
+        route::lookup(snapshot.routes, ipv4.destination)
+    };
+    if !local {
+        validate_ipv4_forward_destination(ipv4, selected_route)?;
+    }
     let nat_now = resolution
         .as_ref()
         .map_or(MonotonicMillis(0), |(_, now)| *now);
@@ -1700,10 +1838,6 @@ fn decide_ipv4<T: TraceSink>(
             trace,
         );
     }
-    let local = snapshot
-        .local_ipv4
-        .iter()
-        .any(|binding| binding.interface == ingress && binding.address == ipv4.destination);
     let nat_inbound_candidate = nat44_udp_config
         .is_some_and(|config| ipv4.destination == config.public_address() && ipv4.protocol == 17)
         || nat44_tcp_config.is_some_and(|config| {
@@ -1836,8 +1970,7 @@ fn decide_ipv4<T: TraceSink>(
     if ipv4.header_len > 20 {
         return Err(Ipv4OptionsUnsupported);
     }
-    let route = route::lookup(snapshot.routes, ipv4.destination);
-    let Some(route) = route else {
+    let Some(route) = selected_route else {
         if firewall_config.is_some() {
             return Err(FirewallRouteUnavailable);
         }
@@ -4837,6 +4970,8 @@ mod tests {
 
     fn frag_needed_frame() -> Vec<u8> {
         let mut frame = vec![0_u8; 14 + 20 + 8 + 20 + 8];
+        frame[0..6].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
+        frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 3]);
         frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
         frame[14] = 0x45;
         frame[16..18].copy_from_slice(&56_u16.to_be_bytes());
@@ -5069,6 +5204,27 @@ mod tests {
             (114, "FIREWALL_RELATED_ICMPV4_UNSUPPORTED"),
             (115, "FIREWALL_ROUTE_UNAVAILABLE"),
             (116, "FIREWALL_RELATED_ICMPV4_STATE_MISS"),
+            (117, "IPV4_INGRESS_INTERFACE_UNKNOWN"),
+            (118, "IPV4_ETHERNET_SOURCE_ZERO"),
+            (119, "IPV4_ETHERNET_SOURCE_BROADCAST"),
+            (120, "IPV4_ETHERNET_SOURCE_MULTICAST"),
+            (121, "IPV4_ETHERNET_DESTINATION_ZERO"),
+            (122, "IPV4_ETHERNET_DESTINATION_BROADCAST"),
+            (123, "IPV4_ETHERNET_DESTINATION_MULTICAST"),
+            (124, "IPV4_SOURCE_UNSPECIFIED_NETWORK"),
+            (125, "IPV4_SOURCE_LOOPBACK"),
+            (126, "IPV4_SOURCE_MULTICAST"),
+            (127, "IPV4_SOURCE_LIMITED_BROADCAST"),
+            (128, "IPV4_SOURCE_CLASS_E"),
+            (129, "IPV4_SOURCE_NETWORK_ADDRESS"),
+            (130, "IPV4_SOURCE_DIRECTED_BROADCAST"),
+            (131, "IPV4_DESTINATION_UNSPECIFIED_NETWORK"),
+            (132, "IPV4_DESTINATION_LOOPBACK"),
+            (133, "IPV4_DESTINATION_MULTICAST"),
+            (134, "IPV4_DESTINATION_LIMITED_BROADCAST"),
+            (135, "IPV4_DESTINATION_CLASS_E"),
+            (136, "IPV4_DESTINATION_NETWORK_ADDRESS"),
+            (137, "IPV4_DESTINATION_DIRECTED_BROADCAST"),
         ];
         let actual = [
             DropReason::EthernetHeaderTruncated,
@@ -5187,6 +5343,27 @@ mod tests {
             DropReason::FirewallRelatedIcmpv4Unsupported,
             DropReason::FirewallRouteUnavailable,
             DropReason::FirewallRelatedIcmpv4StateMiss,
+            DropReason::Ipv4IngressInterfaceUnknown,
+            DropReason::Ipv4EthernetSourceZero,
+            DropReason::Ipv4EthernetSourceBroadcast,
+            DropReason::Ipv4EthernetSourceMulticast,
+            DropReason::Ipv4EthernetDestinationZero,
+            DropReason::Ipv4EthernetDestinationBroadcast,
+            DropReason::Ipv4EthernetDestinationMulticast,
+            DropReason::Ipv4SourceUnspecifiedNetwork,
+            DropReason::Ipv4SourceLoopback,
+            DropReason::Ipv4SourceMulticast,
+            DropReason::Ipv4SourceLimitedBroadcast,
+            DropReason::Ipv4SourceClassE,
+            DropReason::Ipv4SourceNetworkAddress,
+            DropReason::Ipv4SourceDirectedBroadcast,
+            DropReason::Ipv4DestinationUnspecifiedNetwork,
+            DropReason::Ipv4DestinationLoopback,
+            DropReason::Ipv4DestinationMulticast,
+            DropReason::Ipv4DestinationLimitedBroadcast,
+            DropReason::Ipv4DestinationClassE,
+            DropReason::Ipv4DestinationNetworkAddress,
+            DropReason::Ipv4DestinationDirectedBroadcast,
         ];
         assert_eq!(actual.len(), expected.len());
         for (reason, &(discriminant, code)) in actual.iter().zip(&expected) {

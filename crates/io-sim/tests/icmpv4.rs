@@ -393,21 +393,42 @@ fn invalid_echo_ipv4_sources_cannot_trigger_replies() {
     let bindings = [local_binding(LAN)];
     let snapshot = routed_snapshot(&routes, &interfaces, &[], &bindings);
     let invalid_sources = [
-        Ipv4Address::from_octets([0, 0, 0, 1]),
-        Ipv4Address::from_octets([127, 0, 0, 1]),
-        Ipv4Address::from_octets([224, 0, 0, 1]),
-        Ipv4Address::from_octets([240, 0, 0, 1]),
-        Ipv4Address::from_octets([255, 255, 255, 255]),
-        Ipv4Address::from_octets([192, 0, 2, 0]),
-        Ipv4Address::from_octets([192, 0, 2, 255]),
-        LOCAL_IP,
+        (
+            Ipv4Address::from_octets([0, 0, 0, 1]),
+            DropReason::Ipv4SourceUnspecifiedNetwork,
+        ),
+        (
+            Ipv4Address::from_octets([127, 0, 0, 1]),
+            DropReason::Ipv4SourceLoopback,
+        ),
+        (
+            Ipv4Address::from_octets([224, 0, 0, 1]),
+            DropReason::Ipv4SourceMulticast,
+        ),
+        (
+            Ipv4Address::from_octets([240, 0, 0, 1]),
+            DropReason::Ipv4SourceClassE,
+        ),
+        (
+            Ipv4Address::from_octets([255, 255, 255, 255]),
+            DropReason::Ipv4SourceLimitedBroadcast,
+        ),
+        (
+            Ipv4Address::from_octets([192, 0, 2, 0]),
+            DropReason::Ipv4SourceNetworkAddress,
+        ),
+        (
+            Ipv4Address::from_octets([192, 0, 2, 255]),
+            DropReason::Ipv4SourceDirectedBroadcast,
+        ),
+        (LOCAL_IP, DropReason::Icmpv4SourceNotUnicast),
     ];
 
-    for source in invalid_sources {
+    for (source, reason) in invalid_sources {
         assert_drop_atomic(
             with_ipv4_source(echo_request(&[], &[]), source),
             &snapshot,
-            DropReason::Icmpv4SourceNotUnicast,
+            reason,
         );
     }
 }
@@ -418,20 +439,33 @@ fn echo_requires_unicast_source_mac_and_exact_local_destination_mac() {
     let bindings = [local_binding(LAN)];
     let snapshot = local_snapshot(&interfaces, &bindings);
 
-    for source in [[0; 6], [0xff; 6], [0x01, 0, 0, 0, 0, 1]] {
+    for (source, reason) in [
+        ([0; 6], DropReason::Ipv4EthernetSourceZero),
+        ([0xff; 6], DropReason::Ipv4EthernetSourceBroadcast),
+        (
+            [0x01, 0, 0, 0, 0, 1],
+            DropReason::Ipv4EthernetSourceMulticast,
+        ),
+    ] {
         let mut frame = echo_request(&[], &[]);
         frame[6..12].copy_from_slice(&source);
-        assert_drop_atomic(frame, &snapshot, DropReason::Icmpv4EthernetSourceInvalid);
+        assert_drop_atomic(frame, &snapshot, reason);
     }
 
-    for destination in [[0xff; 6], [0x01, 0, 0, 0, 0, 1], [0x02, 0, 0, 0, 0, 9]] {
+    for (destination, reason) in [
+        ([0xff; 6], DropReason::Ipv4EthernetDestinationBroadcast),
+        (
+            [0x01, 0, 0, 0, 0, 1],
+            DropReason::Ipv4EthernetDestinationMulticast,
+        ),
+        (
+            [0x02, 0, 0, 0, 0, 9],
+            DropReason::Icmpv4EthernetDestinationNotLocal,
+        ),
+    ] {
         let mut frame = echo_request(&[], &[]);
         frame[0..6].copy_from_slice(&destination);
-        assert_drop_atomic(
-            frame,
-            &snapshot,
-            DropReason::Icmpv4EthernetDestinationNotLocal,
-        );
+        assert_drop_atomic(frame, &snapshot, reason);
     }
 }
 
