@@ -58,7 +58,9 @@ pub use icmpv4_error::{
     ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN,
 };
 pub use io::{
-    BatchCompletion, ConsumeReason, PacketBatch, PacketIo, PacketLease, PacketSlot, SlotCompletion,
+    BatchCompletion, ConsumeReason, PacketBatch, PacketIo, PacketLease, PacketSlot,
+    PublicationQuiescence, PublicationQuiescenceGuard, PublicationQuiescenceWitness,
+    SlotCompletion,
 };
 pub use nat44::{
     Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpCounters,

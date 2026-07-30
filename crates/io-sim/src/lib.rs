@@ -16,7 +16,8 @@ use ruster_core::{
     GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedPacketBatch, GeneratedPacketIo,
     GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion, GeneratedTraceSink, IfId,
     MonotonicMillis, Nat44TcpConfig, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpRuntime, PacketBatch,
-    PacketIo, PacketLease, PacketSlot, ResolutionRuntime, SlotCompletion, TraceEvent, TraceSink,
+    PacketIo, PacketLease, PacketSlot, PublicationQuiescence, PublicationQuiescenceGuard,
+    ResolutionRuntime, SlotCompletion, TraceEvent, TraceSink,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -84,6 +85,59 @@ pub enum SimGeneratedError {
     Injected,
 }
 
+/// Exact bounded reason why the simulated backend cannot publish new
+/// authority yet.
+///
+/// The priority is deterministic: unfinished RX batch, unfinished generated
+/// batch, then accepted TX awaiting explicit completion.
+/// `SimIo`'s finite output queue is a conservative simulation boundary, not
+/// evidence that a native AF_XDP completion queue has drained.
+///
+/// A successful guard keeps the exact backend exclusively borrowed:
+///
+/// ```compile_fail
+/// use ruster_core::{PacketIo, PublicationQuiescence};
+/// use ruster_io_sim::SimIo;
+///
+/// fn overlap_receive(io: &mut SimIo) {
+///     let Ok(guard) = io.try_publication_quiescence() else {
+///         return;
+///     };
+///     let batch = io.receive(1);
+///     drop((guard, batch));
+/// }
+/// ```
+///
+/// The guard is move-only:
+///
+/// ```compile_fail
+/// use ruster_core::PublicationQuiescence;
+/// use ruster_io_sim::SimIo;
+///
+/// fn reuse_guard(io: &mut SimIo) {
+///     let Ok(guard) = io.try_publication_quiescence() else {
+///         return;
+///     };
+///     let first = guard;
+///     let second = guard;
+///     drop((first, second));
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SimPublicationQuiescenceError {
+    RxBatchNotFinished,
+    GeneratedBatchNotFinished,
+    TxCompletionPending,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SimBatchState {
+    #[default]
+    Idle,
+    Rx,
+    Generated,
+}
+
 #[derive(Debug)]
 pub struct SimIo {
     next_sequence: u64,
@@ -96,6 +150,7 @@ pub struct SimIo {
     generated_accept_budget: usize,
     fail_generated_finish: bool,
     received_accept_budget: usize,
+    batch_state: SimBatchState,
 }
 
 impl Default for SimIo {
@@ -111,6 +166,7 @@ impl Default for SimIo {
             generated_accept_budget: usize::MAX,
             fail_generated_finish: false,
             received_accept_budget: usize::MAX,
+            batch_state: SimBatchState::Idle,
         }
     }
 }
@@ -147,6 +203,10 @@ impl SimIo {
         self.recycled.len()
     }
 
+    /// Completes and returns the oldest backend-accepted TX frame.
+    ///
+    /// Until every accepted frame is completed through this method, the
+    /// simulated backend conservatively refuses publication quiescence.
     pub fn pop_tx(&mut self) -> Option<TxFrame> {
         self.tx.pop_front()
     }
@@ -443,17 +503,45 @@ impl SimIo {
     }
 }
 
+impl PublicationQuiescence for SimIo {
+    type Error = SimPublicationQuiescenceError;
+    type Guard<'backend> = PublicationQuiescenceGuard<'backend, Self>;
+
+    fn try_publication_quiescence(&mut self) -> Result<Self::Guard<'_>, Self::Error> {
+        match self.batch_state {
+            SimBatchState::Rx => {
+                return Err(SimPublicationQuiescenceError::RxBatchNotFinished);
+            }
+            SimBatchState::Generated => {
+                return Err(SimPublicationQuiescenceError::GeneratedBatchNotFinished);
+            }
+            SimBatchState::Idle => {}
+        }
+        if !self.tx.is_empty() {
+            return Err(SimPublicationQuiescenceError::TxCompletionPending);
+        }
+        Ok(PublicationQuiescenceGuard::new(self))
+    }
+}
+
 impl PacketIo for SimIo {
     type Error = Infallible;
     type Batch<'a> = SimBatch<'a>;
 
     fn receive(&mut self, budget: usize) -> Result<Self::Batch<'_>, Self::Error> {
+        assert_eq!(
+            self.batch_state,
+            SimBatchState::Idle,
+            "simulated packet batches cannot overlap"
+        );
+        self.batch_state = SimBatchState::Rx;
         let remaining = budget.min(self.rx.len());
         Ok(SimBatch {
             rx: &mut self.rx,
             tx: &mut self.tx,
             recycled: &mut self.recycled,
             accept_budget: &mut self.received_accept_budget,
+            state: &mut self.batch_state,
             remaining,
             counters: BatchCounters::default(),
         })
@@ -465,6 +553,7 @@ pub struct SimBatch<'a> {
     tx: &'a mut VecDeque<TxFrame>,
     recycled: &'a mut VecDeque<RecycledFrameCapture>,
     accept_budget: &'a mut usize,
+    state: &'a mut SimBatchState,
     remaining: usize,
     counters: BatchCounters,
 }
@@ -500,6 +589,7 @@ impl PacketBatch for SimBatch<'_> {
     }
 
     fn finish(self) -> BatchCompletion<Self::Error> {
+        *self.state = SimBatchState::Idle;
         BatchCompletion {
             tx_requested: self.counters.tx_requested,
             tx_accepted: self.counters.tx_accepted,
@@ -507,6 +597,12 @@ impl PacketBatch for SimBatch<'_> {
             recycled: self.counters.recycled,
             error: None,
         }
+    }
+}
+
+impl Drop for SimBatch<'_> {
+    fn drop(&mut self) {
+        *self.state = SimBatchState::Idle;
     }
 }
 
@@ -575,6 +671,12 @@ impl GeneratedPacketIo for SimIo {
     type Batch<'a> = SimGeneratedBatch<'a>;
 
     fn begin_generated(&mut self, egress: IfId) -> Self::Batch<'_> {
+        assert_eq!(
+            self.batch_state,
+            SimBatchState::Idle,
+            "simulated packet batches cannot overlap"
+        );
+        self.batch_state = SimBatchState::Generated;
         let fail_finish = self.fail_generated_finish;
         self.fail_generated_finish = false;
         SimGeneratedBatch {
@@ -588,6 +690,7 @@ impl GeneratedPacketIo for SimIo {
             fail_finish,
             pending: VecDeque::new(),
             counters: GeneratedCounters::default(),
+            state: &mut self.batch_state,
         }
     }
 }
@@ -619,6 +722,7 @@ pub struct SimGeneratedBatch<'a> {
     fail_finish: bool,
     pending: VecDeque<GeneratedSlot>,
     counters: GeneratedCounters,
+    state: &'a mut SimBatchState,
 }
 
 impl GeneratedPacketBatch for SimGeneratedBatch<'_> {
@@ -683,6 +787,7 @@ impl GeneratedPacketBatch for SimGeneratedBatch<'_> {
                 bytes: slot.bytes,
             });
         }
+        *self.state = SimBatchState::Idle;
         GeneratedBatchCompletion {
             attempts: self.counters.attempts,
             allocated: self.counters.allocated,
@@ -694,6 +799,12 @@ impl GeneratedPacketBatch for SimGeneratedBatch<'_> {
             rejected,
             error: self.fail_finish.then_some(SimGeneratedError::Injected),
         }
+    }
+}
+
+impl Drop for SimGeneratedBatch<'_> {
+    fn drop(&mut self) {
+        *self.state = SimBatchState::Idle;
     }
 }
 
