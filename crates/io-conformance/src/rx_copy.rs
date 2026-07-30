@@ -1020,6 +1020,77 @@ pub fn validation_budgets_and_fault_advance_are_bounded<H: RxCopyAdversarialHarn
     );
 }
 
+/// A locally invalid packet is terminal exactly once at every boundary
+/// position. Its hole is skipped by the persistent lease cursor without
+/// rescanning descriptors or delaying the physical block return.
+pub fn safe_packet_fault_positions_are_terminal_exactly_once<H: RxCopyAdversarialHarness>() {
+    for (packet_count, fault_index) in [(3, 0), (3, 2), (1, 0)] {
+        let mut harness = H::new();
+        harness.set_copy_operation_budgets(CopyOperationBudgets {
+            rx_block_status_reads: 1,
+            rx_descriptor_visits: packet_count,
+            ..CopyOperationBudgets::default()
+        });
+        let payloads = (0..packet_count)
+            .map(|index| vec![u8::try_from(index + 1).expect("small fixture")])
+            .collect();
+        let injected = harness.inject_rx_block_with_fault(
+            CONFORMANCE_LAN,
+            payloads,
+            fault_index,
+            CopyRxDescriptorFault::SafePacket,
+        );
+        {
+            let (io, _) = harness.io_and_observer();
+            let mut batch = io
+                .receive(packet_count)
+                .unwrap_or_else(|_| panic!("RX receive failed"));
+            while let Some(packet) = batch.next_packet() {
+                packet.recycle(DropReason::RouteMiss);
+            }
+            assert_eq!(batch.finish().recycled, packet_count - 1);
+        }
+        assert_eq!(harness.pending_copy_rx_packets(), 0);
+        assert_eq!(
+            harness.copy_rx_scan_observation(injected.block),
+            CopyRxScanObservation {
+                block_status_reads: 1,
+                block_acquisitions: 1,
+                descriptor_validations: packet_count,
+            }
+        );
+        assert_eq!(
+            harness.drain_copy_rx_faults(),
+            [CopyRxFaultEvent {
+                block: injected.block,
+                packet_index: fault_index,
+                fault: CopyRxDescriptorFault::SafePacket,
+            }]
+        );
+        let source_events = harness.drain_copy_source_events();
+        assert_source_bindings(&injected.packets, &source_events);
+        for (index, source) in injected.packets.iter().enumerate() {
+            let event = source_events
+                .iter()
+                .find(|event| event.source == *source)
+                .expect("source terminal");
+            let expected = if index == fault_index {
+                CopySourceDisposition::RxInvalid(CopyRxDescriptorFault::SafePacket)
+            } else {
+                CopySourceDisposition::Reclaimed(RxReclaim::Recycled(DropReason::RouteMiss))
+            };
+            assert_eq!(event.disposition, expected);
+        }
+        assert_eq!(
+            harness.drain_copy_rx_block_returns(),
+            [CopyRxBlockReturn {
+                block: injected.block,
+                packet_count,
+            }]
+        );
+    }
+}
+
 /// TX status-read exhaustion rejects without copying; accepted bytes have one
 /// and only one copy invocation.
 pub fn submit_status_budget_precedes_copy<H: RxCopyHarness>() {
@@ -1138,10 +1209,29 @@ pub fn completion_capable_batch_drop_is_exact<H: RxCopyCompletionHarness>() {
         drop(batch);
     }
     assert_eq!(harness.pending_copy_rx_packets(), 2);
+    assert!(
+        harness.drain_copy_rx_block_returns().is_empty(),
+        "source block returned before its unleased siblings became terminal"
+    );
     let events = harness.drain_copy_source_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].source, injected.packets[0]);
+    assert_eq!(events[0].ingress, CONFORMANCE_LAN);
     let CopySourceDisposition::TxAccepted { tx, endpoint } = events[0].disposition else {
         panic!("dropped batch lost accepted TX");
     };
+    let tx_events = harness.drain_copy_tx_events();
+    assert_eq!(
+        tx_events,
+        [CopyTxEvent {
+            source: injected.packets[0],
+            tx,
+            endpoint,
+            descriptor_len: 1,
+            disposition: CopyTxDisposition::Submitted,
+            copied_bytes: 1,
+        }]
+    );
     assert_eq!(harness.free_copy_tx_frames() + 1, baseline);
     assert_eq!(
         harness.drain_copy_tx_kicks(),

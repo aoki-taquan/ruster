@@ -285,6 +285,9 @@ impl CopyState {
             .find(|block| block.token == packet.live.token.block)
             .expect("source block remains until every packet is terminal");
         block.terminals += 1;
+        while block.cursor < block.packets.len() && block.packets[block.cursor].is_none() {
+            block.cursor += 1;
+        }
         if block.terminals == block.packets.len() {
             assert_eq!(
                 block.cursor,
@@ -923,6 +926,11 @@ fn copy_acceptance_12_tx_pool_exhaustion() {
 #[test]
 fn copy_acceptance_13_validation_budgets_and_faults() {
     rx_copy::validation_budgets_and_fault_advance_are_bounded::<CopyFakeHarness>();
+}
+
+#[test]
+fn copy_acceptance_20_safe_fault_terminal_positions() {
+    rx_copy::safe_packet_fault_positions_are_terminal_exactly_once::<CopyFakeHarness>();
 }
 
 #[test]
