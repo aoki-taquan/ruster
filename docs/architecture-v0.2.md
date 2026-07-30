@@ -512,8 +512,11 @@ interceptします。default `Disabled`は従来どおりunsupported local contr
 UDPだけを有効にしてもTCP引用をinterceptせず、その逆も同じです。Type/Codeと引用protocolの
 peekはouter IPv4 Total Length内だけで行い、link paddingをcandidate bytesとして扱いません。
 対象はouter IHL=5、nonfragment、TTL>1、valid ICMP checksumと、validなIPv4 headerを含む
-引用です。引用datagramはDF=1/MF=0/offset=0、UDPまたはTCP、public sourceで、IPv4 headerと
-transport先頭8 bytesが実際に存在することを要求します。
+引用です。引用datagramはreserved flagをfragment判定からmaskした上で
+DF=1/MF=0/offset=0、UDPまたはTCP、public sourceで、IPv4 headerとtransport先頭8 bytesが
+実際に存在することを要求します。RFC 1812 §4.2.2.3に従いreserved flagだけではdropせず、
+引用tuple/checksum rewrite後もflags/fragment wordへ保存します。reserved併存MF/offsetは
+MF/offsetを理由にtyped dropします。
 
 RFC 5508 REQ-3に従いouter ICMP checksumと引用IPv4 checksumを検証し、引用IPv4 optionsを
 IHLで越えてtransportを探し、embedded transport checksumそのものは検証しません。outer

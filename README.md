@@ -91,6 +91,8 @@ ICMP error、他のtype/codeとquery NAT、local MTU起因のType 3/Code 4生成
 static forward、
 multi-public、port randomization/parity、full packet filterはdeferredで、RFC 4787/7857全体への
 準拠は主張しません。
+引用UDP/TCP IPv4 headerもreserved flagをfragment判定から除外し、reserved以外は
+DF=1/MF=0/offset=0を要求します。引用reserved flagはtuple rewrite後も保存します。
 
 TCP NAT44は別のcaller-backed mapping/session storageを持ち、UDPと同じ数値public portを
 独立して使用できます。mappingはinternal TCP tupleのEndpoint-Independent Mapping、filterは

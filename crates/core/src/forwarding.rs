@@ -2637,7 +2637,7 @@ fn parse_nat44_icmpv4_frag_needed(
         return Err(Nat44Icmpv4QuotedChecksumInvalid);
     }
     let inner_flags = packet::read_u16(inner_header, 6).ok_or(Nat44Icmpv4QuotedHeaderTruncated)?;
-    if inner_flags != 0x4000 {
+    if inner_flags & 0x7fff != 0x4000 {
         return Err(Nat44Icmpv4QuotedFragmentUnsupported);
     }
     let protocol = *inner_header

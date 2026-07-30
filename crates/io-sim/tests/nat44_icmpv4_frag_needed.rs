@@ -296,9 +296,11 @@ fn udp_frag_needed_translates_cascade_and_keeps_nat_state_read_only() {
     )
     .unwrap();
     let outbound = io.pop_tx().unwrap();
-    let quote = &outbound.bytes[14..42];
+    let mut quote = outbound.bytes[14..42].to_vec();
+    quote[6..8].copy_from_slice(&0xc000_u16.to_be_bytes());
+    refresh_inner_checksum(&mut quote);
     let original_transport_checksum = u16::from_be_bytes(quote[26..28].try_into().unwrap());
-    let error = frag_needed(quote, 55, 0x4000, &[]);
+    let error = frag_needed(&quote, 55, 0x4000, &[]);
     let original = error.clone();
     let before_mapping = nat.mappings()[0];
     let before_peer = nat.peers()[0];
@@ -324,6 +326,7 @@ fn udp_frag_needed_translates_cascade_and_keeps_nat_state_read_only() {
     assert_eq!(translated.bytes[22], 54);
     assert_eq!(&translated.bytes[30..34], &HOST.octets());
     assert_eq!(&translated.bytes[54..58], &HOST.octets());
+    assert_eq!(&translated.bytes[48..50], &0xc000_u16.to_be_bytes());
     assert_eq!(
         u16::from_be_bytes(translated.bytes[62..64].try_into().unwrap()),
         12_345
@@ -360,6 +363,31 @@ fn udp_frag_needed_translates_cascade_and_keeps_nat_state_read_only() {
             internal_port: 12_345,
         },
     }));
+    for flags_fragment in [0xe000_u16, 0xc001] {
+        let mut fragmented_quote = quote.clone();
+        fragmented_quote[6..8].copy_from_slice(&flags_fragment.to_be_bytes());
+        refresh_inner_checksum(&mut fragmented_quote);
+        let fragmented = frag_needed(&fragmented_quote, 64, 0, &[]);
+        io.inject(WAN, fragmented.clone());
+        io.run_nat44_udp_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(&mut nat),
+            MonotonicMillis(200),
+            &mut NoTrace,
+        )
+        .unwrap();
+        assert_drop(
+            &mut io,
+            DropReason::Nat44Icmpv4QuotedFragmentUnsupported,
+            &fragmented,
+        );
+        assert_eq!(nat.mappings()[0], before_mapping);
+        assert_eq!(nat.peers()[0], before_peer);
+        assert_eq!(nat.counters(), before_counters);
+    }
 
     let later = udp_frame(REMOTE, 53, 0);
     io.inject(LAN, later);
@@ -504,7 +532,9 @@ fn tcp_quote_boundaries_and_exact_session_authority_are_enforced() {
     )
     .unwrap();
     let outbound = io.pop_tx().unwrap();
-    let complete_quote = outbound.bytes[14..54].to_vec();
+    let mut complete_quote = outbound.bytes[14..54].to_vec();
+    complete_quote[6..8].copy_from_slice(&0xc000_u16.to_be_bytes());
+    refresh_inner_checksum(&mut complete_quote);
     let before_mapping = nat.mappings()[0];
     let before_session = nat.sessions()[0];
     let before_counters = nat.counters();
@@ -523,6 +553,7 @@ fn tcp_quote_boundaries_and_exact_session_authority_are_enforced() {
     .unwrap();
     let translated_short = io.pop_tx().unwrap();
     assert_eq!(&translated_short.bytes[54..58], &HOST.octets());
+    assert_eq!(&translated_short.bytes[48..50], &0xc000_u16.to_be_bytes());
     assert_eq!(
         u16::from_be_bytes(translated_short.bytes[62..64].try_into().unwrap()),
         12_345
@@ -601,6 +632,32 @@ fn tcp_quote_boundaries_and_exact_session_authority_are_enforced() {
     assert_eq!(nat.mappings()[0], before_mapping);
     assert_eq!(nat.sessions()[0], before_session);
     assert_eq!(nat.counters(), before_counters);
+
+    for flags_fragment in [0xe000_u16, 0xc001] {
+        let mut fragmented_quote = complete_quote[..28].to_vec();
+        fragmented_quote[6..8].copy_from_slice(&flags_fragment.to_be_bytes());
+        refresh_inner_checksum(&mut fragmented_quote);
+        let fragmented = frag_needed(&fragmented_quote, 64, 0, &[]);
+        io.inject(WAN, fragmented.clone());
+        io.run_nat44_tcp_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(&mut nat),
+            MonotonicMillis(203),
+            &mut NoTrace,
+        )
+        .unwrap();
+        assert_drop(
+            &mut io,
+            DropReason::Nat44Icmpv4QuotedFragmentUnsupported,
+            &fragmented,
+        );
+        assert_eq!(nat.mappings()[0], before_mapping);
+        assert_eq!(nat.sessions()[0], before_session);
+        assert_eq!(nat.counters(), before_counters);
+    }
 
     io.set_received_accept_budget(0);
     io.inject(WAN, frag_needed(&complete_quote[..28], 64, 0, &[]));
