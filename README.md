@@ -210,9 +210,14 @@ generated ICMP runtimeは直接borrowのままです。現行core full wrapper�
 candidateがあるtickだけ、backendはboundedな所有状態からpublication quiescenceを検証し、
 exact `&mut backend`を保持するsealed GAT guardをpublicationへ渡します。unfinished RX/generated
 batch、terminal action未完了のleased slot、またはcompletion待ちTXがあればcandidateを
-publicationへ渡さずtyped `Deferred`とし、guardをdropした後に旧active generationでtickを
-継続します。Sim backendの出力queue完了は保守的なmodelであり、AF_XDP CQ drainを実装・証明
-したものではありません。
+publicationへ渡さず、backendのtyped dispositionを伴う`Deferred`とします。Simではaccepted TX
+completion待ちだけが旧activeでI/Oを継続でき、unfinished batchまたはterminal未完了leaseは
+旧activeを保持したままRX、timer、failure、generatedの全data phaseをskipします。backendは
+candidateなしのtickにもboundedなread-only current-I/O dispositionを返し、明示的なownership
+回収まで`SkipIo`を維持し、`Stop`はbackend valueの寿命中terminalです。このためstickyな
+forgotten batch/leaseを次tickで再進入しません。未知errorは保守的にI/Oをskipし、candidateなしの
+steady tickはquiescence guard checkを行いません。Sim backendの出力queue完了は保守的なmodelで
+あり、AF_XDP CQ drainを実装・証明したものではありません。
 
 ## 開発
 

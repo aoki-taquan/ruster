@@ -331,10 +331,15 @@ accepted TX completion待ちをboundedな所有状態から検査し、成功時
 推測してclearせず、terminal commit/recycle/consume/cancel/abandonだけがlease countを減らします。
 runtimeはopaqueな`I::Guard<'_>`をcandidateと一緒にpublicationへmoveし、publication callが戻って
 guardがdropされた後にだけactive viewとpacket I/Oへ進みます。quiescence failureはcandidateを
-publicationへ渡さないtyped `Deferred`であり、旧active generationのtickは継続します。
-candidateなしのsteady tickはquiescence checkを行いません。Simのaccepted TX output queueを明示
-completionする有限modelは、forgotten batch/leaseをsticky busyにする保守的実装であり、AF_XDP
-CQ drainやnative backend quiescenceを実装済みとは主張しません。
+publicationへ渡さないtyped `Deferred`です。backendはerrorごとに`ContinueOldIo`、`SkipIo`、
+`Stop`を返し、未知errorのdefaultは`SkipIo`です。Simのaccepted TX completion待ちだけは旧active
+generationでI/Oを継続し、unfinished batchまたはterminal未完了leaseは旧activeを保持したまま
+RX、resolution timer、failure dispatch、generated ARP/ICMPの全data phaseをskipします。
+candidateなしのtickはguardを取得せず、backendのboundedなread-only current-I/O dispositionを
+確認します。`SkipIo`はbackendがconflicting ownershipを明示回収するまで継続し、`Stop`はその
+backend valueの寿命中terminalです。したがってforgotten batch/leaseのsticky busyは次tickにも
+全data phaseを抑止します。Simのaccepted TX output queueを明示completionする有限modelは、
+AF_XDP CQ drainやnative backend quiescenceを実装済みとは主張しません。
 active viewがなければRXを開始せず、残りの全phaseを`NoActivePublication`としてtyped skipします。
 一度借用したactive viewはtick終了まで同一generationであり、RXにはUDP/TCP NAT44、firewall、
 resolution、generated ICMP captureのfull composition wrapperだけを使用します。

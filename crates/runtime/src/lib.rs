@@ -8,9 +8,9 @@ use ruster_core::{
     FirewallRuntime, ForwardingSnapshot, GeneratedAllocationError, GeneratedIcmpv4TraceSink,
     GeneratedPacketIo, GeneratedTraceSink, Icmpv4ErrorBuildError, Icmpv4ErrorRuntime,
     MonotonicMillis, Nat44TcpConfig, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpRuntime, PacketIo,
-    PublicationQuiescence, ResolutionFailureDispatchError, ResolutionFailureDispatchReport,
-    ResolutionFailureTraceSink, ResolutionRuntime, ResolutionTimerError, ResolutionTimerReport,
-    ResolutionTimerTraceSink, TraceSink,
+    PublicationQuiescence, PublicationQuiescenceDisposition, ResolutionFailureDispatchError,
+    ResolutionFailureDispatchReport, ResolutionFailureTraceSink, ResolutionRuntime,
+    ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTraceSink, TraceSink,
 };
 use std::num::NonZeroU64;
 
@@ -160,10 +160,12 @@ pub struct FullServiceView<'view, 'storage> {
 /// `publish_candidate` receives a move-only guard for the exact packet backend
 /// and must either install the entire candidate or leave the previous active
 /// publication unchanged. The guard cannot coexist with packet I/O and is
-/// dropped when the publication call returns. A deferred or rejected
-/// candidate does not stop the tick: `active` is subsequently called so the
-/// old publication can continue serving traffic. The active view returned for
-/// a tick must remain one coherent generation until the view is dropped.
+/// dropped when the publication call returns. A rejected candidate continues
+/// with the old publication. A deferred candidate continues only when the
+/// backend classifies its exact error as `ContinueOldIo`; `SkipIo` and `Stop`
+/// retain the old active publication but suppress data phases. The active view
+/// returned for a tick must remain one coherent generation until the view is
+/// dropped.
 /// `active` is a steady-tick O(1) borrow: it must not repeat semantic
 /// validation, fingerprinting, hashing, slice scans, or allocation. Those
 /// cold-path operations belong to candidate construction/publication.
@@ -230,6 +232,8 @@ pub enum TickPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TickPhaseSkip {
     NoActivePublication,
+    BackendIoNotReentrant,
+    BackendStopped,
     BackendIoFailure,
     BackendContractViolation,
     ClockRegression,
@@ -265,7 +269,10 @@ pub enum PublicationOutcome<E, Q> {
     Applied,
     /// The backend refused quiescence. The candidate was not passed to the
     /// publication adapter and was dropped unchanged.
-    Deferred(Q),
+    Deferred {
+        error: Q,
+        disposition: PublicationQuiescenceDisposition,
+    },
     Rejected(E),
 }
 
@@ -641,12 +648,13 @@ fn skip_phase<T: TickPhaseTraceSink>(trace: &mut T, phase: TickPhase, reason: Ti
 
 /// Runs one bounded, single-worker service tick.
 ///
-/// A candidate first requires a backend-authoritative quiescence guard. The
-/// guard is moved into the publication call and released before `active` or
-/// any packet I/O is attempted. A quiescence failure is reported as
-/// [`PublicationOutcome::Deferred`], after which the old active publication
-/// continues through the normal data phases. A tick without a candidate does
-/// not request a guard.
+/// A candidate first requires backend-authoritative quiescence. Its successful
+/// guard is released before `active` or packet I/O. A failure is classified by
+/// the backend: `ContinueOldIo` may run the old publication, while `SkipIo`
+/// and `Stop` suppress every data phase. Unknown backend failures default to
+/// `SkipIo`. On candidate-free ticks the runtime reads the backend's bounded
+/// current-I/O disposition, so a sticky `SkipIo` or terminal `Stop` cannot be
+/// bypassed. This steady check does not request a quiescence guard.
 ///
 /// The phase order is publication, RX, resolution timers, failure dispatch,
 /// generated ARP, and generated ICMPv4. The RX batch is moved into the full
@@ -702,13 +710,18 @@ where
 {
     trace.record_tick_phase(TickPhaseTrace::TickStarted);
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::Publication));
+    let mut io_disposition = candidate.is_none().then(|| io.current_io_disposition());
     let publication_report = match candidate {
         Some(candidate) => match io.try_publication_quiescence() {
             Ok(quiescence) => match publication.publish_candidate(candidate, quiescence) {
                 Ok(()) => PublicationOutcome::Applied,
                 Err(error) => PublicationOutcome::Rejected(error),
             },
-            Err(error) => PublicationOutcome::Deferred(error),
+            Err(error) => {
+                let disposition = I::quiescence_error_disposition(&error);
+                io_disposition = Some(disposition);
+                PublicationOutcome::Deferred { error, disposition }
+            }
         },
         None => PublicationOutcome::Unchanged,
     };
@@ -735,6 +748,37 @@ where
             generated_icmpv4: PhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
         };
     };
+
+    if matches!(
+        io_disposition,
+        Some(PublicationQuiescenceDisposition::SkipIo | PublicationQuiescenceDisposition::Stop)
+    ) {
+        let reason = if io_disposition == Some(PublicationQuiescenceDisposition::Stop) {
+            TickPhaseSkip::BackendStopped
+        } else {
+            TickPhaseSkip::BackendIoNotReentrant
+        };
+        for phase in [
+            TickPhase::Rx,
+            TickPhase::ResolutionTimers,
+            TickPhase::FailureDispatch,
+            TickPhase::GeneratedArp,
+            TickPhase::GeneratedIcmpv4,
+        ] {
+            skip_phase(trace, phase, reason);
+        }
+        trace.record_tick_phase(TickPhaseTrace::TickFinished);
+        return TickReport {
+            publication: publication_report,
+            active: true,
+            rx: RxPhaseReport::Skipped(reason),
+            resolution_timers: PhaseReport::Skipped(reason),
+            failure_dispatch: PhaseReport::Skipped(reason),
+            generated_arp: PhaseReport::Skipped(reason),
+            generated_icmpv4: PhaseReport::Skipped(reason),
+        };
+    }
+
     let FullServiceView {
         generation: _generation,
         snapshot,
@@ -782,6 +826,7 @@ where
         }
         Err(error) => RxPhaseReport::ReceiveFailed(error),
     };
+    trace.record_tick_phase(TickPhaseTrace::PhaseFinished(TickPhase::Rx));
     let mut generated_skip = match &rx {
         RxPhaseReport::AccountingInvariantViolation(_) => {
             Some(TickPhaseSkip::BackendContractViolation)
@@ -792,7 +837,6 @@ where
         }
         RxPhaseReport::Skipped(_) | RxPhaseReport::Completed(_) => None,
     };
-    trace.record_tick_phase(TickPhaseTrace::PhaseFinished(TickPhase::Rx));
 
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::ResolutionTimers));
     let resolution_timers =
@@ -887,7 +931,10 @@ mod tests {
         ResolutionFailureTrace, ResolutionPolicy, ResolutionStateSlot, ResolutionTimerTrace, Route,
         SlotCompletion, TraceEvent,
     };
-    use ruster_io_sim::{FrameOrigin, SimIo};
+    use ruster_io_sim::{
+        FrameOrigin, SimBatch, SimGeneratedBatch, SimGeneratedError, SimIo,
+        SimPublicationQuiescenceError,
+    };
 
     const LAN: IfId = IfId(1);
     const WAN: IfId = IfId(2);
@@ -1168,6 +1215,7 @@ mod tests {
         rx_mode: RxMode,
         generated_mode: GeneratedMode,
         batch_state: TestBatchState,
+        quiescence_override: Option<TestPublicationQuiescenceError>,
         pending_tx: usize,
         generated_leases_live: usize,
         quiescence_calls: usize,
@@ -1182,6 +1230,7 @@ mod tests {
                 rx_mode: RxMode::Empty,
                 generated_mode: GeneratedMode::Exact,
                 batch_state: TestBatchState::Idle,
+                quiescence_override: None,
                 pending_tx: 0,
                 generated_leases_live: 0,
                 quiescence_calls: 0,
@@ -1198,6 +1247,8 @@ mod tests {
         GeneratedBatchNotFinished,
         GeneratedLeaseNotCompleted,
         TxCompletionPending,
+        OwnershipFault,
+        Closing,
     }
 
     impl PublicationQuiescence for TestIo {
@@ -1206,6 +1257,9 @@ mod tests {
 
         fn try_publication_quiescence(&mut self) -> Result<Self::Guard<'_>, Self::Error> {
             self.quiescence_calls += 1;
+            if let Some(error) = self.quiescence_override {
+                return Err(error);
+            }
             match self.batch_state {
                 TestBatchState::Rx => {
                     return Err(TestPublicationQuiescenceError::RxBatchNotFinished);
@@ -1223,11 +1277,104 @@ mod tests {
             }
             Ok(PublicationQuiescenceGuard::new(self))
         }
+
+        fn current_io_disposition(&self) -> PublicationQuiescenceDisposition {
+            match self.quiescence_override {
+                Some(
+                    TestPublicationQuiescenceError::OwnershipFault
+                    | TestPublicationQuiescenceError::Closing,
+                ) => PublicationQuiescenceDisposition::Stop,
+                Some(
+                    TestPublicationQuiescenceError::RxBatchNotFinished
+                    | TestPublicationQuiescenceError::GeneratedBatchNotFinished
+                    | TestPublicationQuiescenceError::GeneratedLeaseNotCompleted,
+                ) => PublicationQuiescenceDisposition::SkipIo,
+                Some(TestPublicationQuiescenceError::TxCompletionPending) | None => {
+                    if self.batch_state != TestBatchState::Idle || self.generated_leases_live != 0 {
+                        PublicationQuiescenceDisposition::SkipIo
+                    } else {
+                        PublicationQuiescenceDisposition::ContinueOldIo
+                    }
+                }
+            }
+        }
+
+        fn quiescence_error_disposition(error: &Self::Error) -> PublicationQuiescenceDisposition {
+            match error {
+                TestPublicationQuiescenceError::TxCompletionPending => {
+                    PublicationQuiescenceDisposition::ContinueOldIo
+                }
+                TestPublicationQuiescenceError::RxBatchNotFinished
+                | TestPublicationQuiescenceError::GeneratedBatchNotFinished
+                | TestPublicationQuiescenceError::GeneratedLeaseNotCompleted => {
+                    PublicationQuiescenceDisposition::SkipIo
+                }
+                TestPublicationQuiescenceError::OwnershipFault
+                | TestPublicationQuiescenceError::Closing => PublicationQuiescenceDisposition::Stop,
+            }
+        }
     }
 
     impl TestIo {
         fn complete_pending_tx(&mut self) {
             self.pending_tx = 0;
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingSimIo {
+        inner: SimIo,
+        receive_calls: usize,
+        generated_calls: usize,
+    }
+
+    impl CountingSimIo {
+        fn reset_calls(&mut self) {
+            self.receive_calls = 0;
+            self.generated_calls = 0;
+        }
+    }
+
+    impl PublicationQuiescence for CountingSimIo {
+        type Error = SimPublicationQuiescenceError;
+        type Guard<'backend> = PublicationQuiescenceGuard<'backend, Self>;
+
+        fn try_publication_quiescence(&mut self) -> Result<Self::Guard<'_>, Self::Error> {
+            match self.inner.try_publication_quiescence() {
+                Ok(inner_guard) => {
+                    drop(inner_guard);
+                    Ok(PublicationQuiescenceGuard::new(self))
+                }
+                Err(error) => Err(error),
+            }
+        }
+
+        fn current_io_disposition(&self) -> PublicationQuiescenceDisposition {
+            self.inner.current_io_disposition()
+        }
+
+        fn quiescence_error_disposition(error: &Self::Error) -> PublicationQuiescenceDisposition {
+            SimIo::quiescence_error_disposition(error)
+        }
+    }
+
+    impl PacketIo for CountingSimIo {
+        type Error = core::convert::Infallible;
+        type Batch<'a> = SimBatch<'a>;
+
+        fn receive(&mut self, budget: usize) -> Result<Self::Batch<'_>, Self::Error> {
+            self.receive_calls += 1;
+            self.inner.receive(budget)
+        }
+    }
+
+    impl GeneratedPacketIo for CountingSimIo {
+        type Error = SimGeneratedError;
+        type Batch<'a> = SimGeneratedBatch<'a>;
+
+        fn begin_generated(&mut self, egress: IfId) -> Self::Batch<'_> {
+            self.generated_calls += 1;
+            self.inner.begin_generated(egress)
         }
     }
 
@@ -1659,7 +1806,10 @@ mod tests {
             );
             assert_eq!(
                 report.publication,
-                PublicationOutcome::Deferred(TestPublicationQuiescenceError::TxCompletionPending)
+                PublicationOutcome::Deferred {
+                    error: TestPublicationQuiescenceError::TxCompletionPending,
+                    disposition: PublicationQuiescenceDisposition::ContinueOldIo,
+                }
             );
             assert_eq!(publication.applied, 0);
             assert_eq!(publication.active_calls, 1);
@@ -1683,6 +1833,276 @@ mod tests {
             assert_eq!(io.quiescence_calls, 2);
             assert_eq!(io.receive_calls, 2);
         });
+    }
+
+    #[test]
+    fn candidate_with_forgotten_sim_batch_or_lease_skips_every_data_phase() {
+        with_fixture(|publication, _unused_io, trace| {
+            macro_rules! assert_skipped {
+                ($io:ident, $error:expr) => {{
+                    $io.reset_calls();
+                    *trace = TestTrace::default();
+                    let report = run_tick(
+                        publication,
+                        Some(Candidate::Apply),
+                        &mut $io,
+                        MonotonicMillis(0),
+                        TickBudgets {
+                            rx: usize::MAX,
+                            resolution_timer_scans: usize::MAX,
+                            failure_dispatch_scans: usize::MAX,
+                            generated_arp: usize::MAX,
+                            generated_icmpv4: usize::MAX,
+                        },
+                        trace,
+                    );
+                    assert_eq!(
+                        report.publication,
+                        PublicationOutcome::Deferred {
+                            error: $error,
+                            disposition: PublicationQuiescenceDisposition::SkipIo,
+                        }
+                    );
+                    assert!(report.active);
+                    assert_eq!(
+                        report.rx,
+                        RxPhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+                    );
+                    assert!(matches!(
+                        report.resolution_timers,
+                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+                    ));
+                    assert!(matches!(
+                        report.failure_dispatch,
+                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+                    ));
+                    assert!(matches!(
+                        report.generated_arp,
+                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+                    ));
+                    assert!(matches!(
+                        report.generated_icmpv4,
+                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+                    ));
+                    assert_eq!(trace.phase_len, 9);
+                    assert_eq!(($io.receive_calls, $io.generated_calls), (0, 0));
+
+                    *trace = TestTrace::default();
+                    let report = run_tick(
+                        publication,
+                        None,
+                        &mut $io,
+                        MonotonicMillis(1),
+                        TickBudgets {
+                            rx: usize::MAX,
+                            resolution_timer_scans: usize::MAX,
+                            failure_dispatch_scans: usize::MAX,
+                            generated_arp: usize::MAX,
+                            generated_icmpv4: usize::MAX,
+                        },
+                        trace,
+                    );
+                    assert_eq!(report.publication, PublicationOutcome::Unchanged);
+                    assert!(report.active);
+                    assert_eq!(
+                        report.rx,
+                        RxPhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+                    );
+                    assert!(matches!(
+                        report.resolution_timers,
+                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+                    ));
+                    assert!(matches!(
+                        report.failure_dispatch,
+                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+                    ));
+                    assert!(matches!(
+                        report.generated_arp,
+                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+                    ));
+                    assert!(matches!(
+                        report.generated_icmpv4,
+                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+                    ));
+                    assert_eq!(trace.phase_len, 9);
+                    assert_eq!(($io.receive_calls, $io.generated_calls), (0, 0));
+                }};
+            }
+
+            let mut forgotten_rx_batch = CountingSimIo::default();
+            let batch = forgotten_rx_batch.receive(0).unwrap();
+            core::mem::forget(batch);
+            assert_skipped!(
+                forgotten_rx_batch,
+                SimPublicationQuiescenceError::RxBatchNotFinished
+            );
+
+            let mut forgotten_generated_batch = CountingSimIo::default();
+            let batch = forgotten_generated_batch.begin_generated(WAN);
+            core::mem::forget(batch);
+            assert_skipped!(
+                forgotten_generated_batch,
+                SimPublicationQuiescenceError::GeneratedBatchNotFinished
+            );
+
+            let mut forgotten_rx_lease = CountingSimIo::default();
+            forgotten_rx_lease.inner.inject(LAN, vec![0; 64]);
+            let mut batch = forgotten_rx_lease.receive(1).unwrap();
+            let lease = batch.next_packet().expect("one injected frame");
+            core::mem::forget(lease);
+            assert!(batch.finish().invariants_hold());
+            assert_skipped!(
+                forgotten_rx_lease,
+                SimPublicationQuiescenceError::RxLeaseNotCompleted
+            );
+
+            let mut forgotten_generated_lease = CountingSimIo::default();
+            let mut batch = forgotten_generated_lease.begin_generated(WAN);
+            let lease = batch.allocate(64).expect("one generated frame");
+            core::mem::forget(lease);
+            assert!(!batch.finish().invariants_hold());
+            assert_skipped!(
+                forgotten_generated_lease,
+                SimPublicationQuiescenceError::GeneratedLeaseNotCompleted
+            );
+
+            assert_eq!(publication.applied, 0);
+            assert_eq!(publication.active_calls, 8);
+        });
+    }
+
+    #[test]
+    fn sim_pending_tx_defers_candidate_but_continues_old_io() {
+        with_fixture(|publication, _unused_io, trace| {
+            let mut io = SimIo::new();
+            let mut generated = io.begin_generated(WAN);
+            generated.allocate(64).expect("generated frame").commit();
+            assert_eq!(generated.finish().accepted, 1);
+
+            let report = run_tick(
+                publication,
+                Some(Candidate::Apply),
+                &mut io,
+                MonotonicMillis(0),
+                TickBudgets::default(),
+                trace,
+            );
+            assert_eq!(
+                report.publication,
+                PublicationOutcome::Deferred {
+                    error: SimPublicationQuiescenceError::TxCompletionPending,
+                    disposition: PublicationQuiescenceDisposition::ContinueOldIo,
+                }
+            );
+            assert_eq!(publication.applied, 0);
+            assert!(matches!(
+                report.rx,
+                RxPhaseReport::Completed(BatchReport { received: 0, .. })
+            ));
+            assert!(matches!(
+                report.resolution_timers,
+                PhaseReport::Completed(_)
+            ));
+            assert!(matches!(report.failure_dispatch, PhaseReport::Completed(_)));
+            assert!(matches!(report.generated_arp, PhaseReport::Completed(_)));
+            assert!(matches!(report.generated_icmpv4, PhaseReport::Completed(_)));
+            assert_eq!(io.pending_tx(), 1);
+        });
+    }
+
+    #[test]
+    fn ownership_fault_or_closing_stops_every_data_phase() {
+        for error in [
+            TestPublicationQuiescenceError::OwnershipFault,
+            TestPublicationQuiescenceError::Closing,
+        ] {
+            with_fixture(|publication, io, trace| {
+                io.quiescence_override = Some(error);
+                let report = run_tick(
+                    publication,
+                    Some(Candidate::Apply),
+                    io,
+                    MonotonicMillis(0),
+                    TickBudgets {
+                        rx: usize::MAX,
+                        resolution_timer_scans: usize::MAX,
+                        failure_dispatch_scans: usize::MAX,
+                        generated_arp: usize::MAX,
+                        generated_icmpv4: usize::MAX,
+                    },
+                    trace,
+                );
+                assert_eq!(
+                    report.publication,
+                    PublicationOutcome::Deferred {
+                        error,
+                        disposition: PublicationQuiescenceDisposition::Stop,
+                    }
+                );
+                assert_eq!(publication.applied, 0);
+                assert_eq!((io.receive_calls, io.generated_calls), (0, 0));
+                assert_eq!(
+                    report.rx,
+                    RxPhaseReport::Skipped(TickPhaseSkip::BackendStopped)
+                );
+                assert!(matches!(
+                    report.resolution_timers,
+                    PhaseReport::Skipped(TickPhaseSkip::BackendStopped)
+                ));
+                assert!(matches!(
+                    report.failure_dispatch,
+                    PhaseReport::Skipped(TickPhaseSkip::BackendStopped)
+                ));
+                assert!(matches!(
+                    report.generated_arp,
+                    PhaseReport::Skipped(TickPhaseSkip::BackendStopped)
+                ));
+                assert!(matches!(
+                    report.generated_icmpv4,
+                    PhaseReport::Skipped(TickPhaseSkip::BackendStopped)
+                ));
+
+                *trace = TestTrace::default();
+                let report = run_tick(
+                    publication,
+                    None,
+                    io,
+                    MonotonicMillis(1),
+                    TickBudgets {
+                        rx: usize::MAX,
+                        resolution_timer_scans: usize::MAX,
+                        failure_dispatch_scans: usize::MAX,
+                        generated_arp: usize::MAX,
+                        generated_icmpv4: usize::MAX,
+                    },
+                    trace,
+                );
+                assert_eq!(report.publication, PublicationOutcome::Unchanged);
+                assert_eq!(publication.active_calls, 2);
+                assert_eq!(io.quiescence_calls, 1);
+                assert_eq!((io.receive_calls, io.generated_calls), (0, 0));
+                assert_eq!(
+                    report.rx,
+                    RxPhaseReport::Skipped(TickPhaseSkip::BackendStopped)
+                );
+                assert!(matches!(
+                    report.resolution_timers,
+                    PhaseReport::Skipped(TickPhaseSkip::BackendStopped)
+                ));
+                assert!(matches!(
+                    report.failure_dispatch,
+                    PhaseReport::Skipped(TickPhaseSkip::BackendStopped)
+                ));
+                assert!(matches!(
+                    report.generated_arp,
+                    PhaseReport::Skipped(TickPhaseSkip::BackendStopped)
+                ));
+                assert!(matches!(
+                    report.generated_icmpv4,
+                    PhaseReport::Skipped(TickPhaseSkip::BackendStopped)
+                ));
+            });
+        }
     }
 
     #[test]

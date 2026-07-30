@@ -66,8 +66,8 @@ pub use icmpv4_error::{
 };
 pub use io::{
     BatchCompletion, ConsumeReason, PacketBatch, PacketIo, PacketLease, PacketSlot,
-    PublicationQuiescence, PublicationQuiescenceGuard, PublicationQuiescenceWitness,
-    SlotCompletion,
+    PublicationQuiescence, PublicationQuiescenceDisposition, PublicationQuiescenceGuard,
+    PublicationQuiescenceWitness, SlotCompletion,
 };
 pub use nat44::{
     Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpCounters,

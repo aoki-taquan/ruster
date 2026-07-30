@@ -16,8 +16,8 @@ use ruster_core::{
     GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedPacketBatch, GeneratedPacketIo,
     GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion, GeneratedTraceSink, IfId,
     MonotonicMillis, Nat44TcpConfig, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpRuntime, PacketBatch,
-    PacketIo, PacketLease, PacketSlot, PublicationQuiescence, PublicationQuiescenceGuard,
-    ResolutionRuntime, SlotCompletion, TraceEvent, TraceSink,
+    PacketIo, PacketLease, PacketSlot, PublicationQuiescence, PublicationQuiescenceDisposition,
+    PublicationQuiescenceGuard, ResolutionRuntime, SlotCompletion, TraceEvent, TraceSink,
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -534,6 +534,31 @@ impl PublicationQuiescence for SimIo {
             return Err(SimPublicationQuiescenceError::TxCompletionPending);
         }
         Ok(PublicationQuiescenceGuard::new(self))
+    }
+
+    fn current_io_disposition(&self) -> PublicationQuiescenceDisposition {
+        if self.batch_state != SimBatchState::Idle
+            || self.rx_leases_live != 0
+            || self.generated_leases_live != 0
+        {
+            PublicationQuiescenceDisposition::SkipIo
+        } else {
+            PublicationQuiescenceDisposition::ContinueOldIo
+        }
+    }
+
+    fn quiescence_error_disposition(error: &Self::Error) -> PublicationQuiescenceDisposition {
+        match error {
+            SimPublicationQuiescenceError::TxCompletionPending => {
+                PublicationQuiescenceDisposition::ContinueOldIo
+            }
+            SimPublicationQuiescenceError::RxBatchNotFinished
+            | SimPublicationQuiescenceError::GeneratedBatchNotFinished
+            | SimPublicationQuiescenceError::RxLeaseNotCompleted
+            | SimPublicationQuiescenceError::GeneratedLeaseNotCompleted => {
+                PublicationQuiescenceDisposition::SkipIo
+            }
+        }
     }
 }
 
