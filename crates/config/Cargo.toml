@@ -1,0 +1,11 @@
+[package]
+name = "ruster-config"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+serde_path_to_error = "0.1.20"
+toml = { version = "1.1.4", default-features = false, features = ["parse", "serde", "std"] }

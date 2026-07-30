@@ -265,6 +265,8 @@ JSONL内のcommand、または
 `RUSTER_R16A_REPLAY=/tmp/ruster-r16a-artifacts/<case>.case`を同じignored test commandへ
 付けると、そのbinary envelopeだけを再生します。replayとseed/range指定は併用できません。
 
+| CONFIG-001 bounded versioned exact syntax | declarative control-plane security contract | `versioned_config_parser_is_exact_bounded_and_redacted` | implemented | 1 MiB inputと全V1 listをbounded化。schema-version predispatch、nested unknown/duplicate/future runtime fieldをtyped rejectし、diagnosticとDTOのDebugからsource value/allocator seedをredact。semantic validation/normalize/plan/applyは対象外 |
+
 ## RFC deviation rule
 
 RFC準拠の挙動を意図的に変える変更は、この表に`deviation`としてRFC section、理由、

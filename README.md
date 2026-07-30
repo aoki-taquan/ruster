@@ -9,7 +9,13 @@ active treeは、そのコードを継承しないv0.2のゼロベース実装�
 
 active treeは、外部依存を持たないpacket core、bounded worker runtime、sim I/O、
 benchmark harness、I/O conformance、AF_XDP ownership modelで構成します。
+data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control-planeの
+`ruster-config`だけは、保守されているSerde/TOML parserを最小featureで利用します。
 
+- `ruster-config`: 最大1 MiBのUTF-8 TOMLをschema versionでpredispatchし、V1の
+  interface/address/route/neighbor/NAT44/firewall/capacity/tick budget DTOへexact decode
+  する。unknown/duplicate field、runtime生成値、過大listをvalue-freeなtyped diagnosticで
+  fail-closeする。semantic validation、normalize、plan/applyはまだ持たない。
 - `ruster-core`: backend所有packetを借用し、Ethernet II / IPv4検証、LPM、
   TTL/checksum/MAC rewrite、local IPv4向けARP reply、static neighbor miss時の
   ARP Request生成action、fixed-capacity dynamic ARP cache、local ICMPv4 Echo
