@@ -3,6 +3,9 @@
 
 mod checksum;
 mod firewall;
+// The N2 primitive intentionally lands before its NAT runtime integration.
+#[allow(dead_code)]
+mod fixed_directory;
 mod forwarding;
 mod generated;
 mod icmpv4_error;
