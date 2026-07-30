@@ -174,6 +174,16 @@ scripts/check-requirements.sh
 scripts/test-check-requirements.sh
 ```
 
+CIの`Musl` jobは、固定したRust 1.97.1へtargetを追加して次のcheckも実行します。
+
+```bash
+rustup target add --toolchain 1.97.1 x86_64-unknown-linux-musl
+cargo +1.97.1 check --workspace --all-targets --all-features --locked --target x86_64-unknown-linux-musl
+```
+
+これはmusl targetでworkspace全体が型検査を通ることだけを確認するcompile-only portability
+checkです。musl向けartifactのlink、test実行、実NICでのruntime compatibilityは保証しません。
+
 設計契約と非対象は[architecture v0.2](docs/architecture-v0.2.md)、要件とRFC根拠は
 [requirements](docs/requirements-v0.2.md)、production backendから自宅ラボ運用までの
 優先順位とmilestoneは[development plan](docs/development-plan-v0.2.md)を参照してください。
