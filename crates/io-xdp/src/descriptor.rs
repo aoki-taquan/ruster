@@ -1,4 +1,4 @@
-use crate::FrameId;
+use crate::{domain::DomainIdentity, FrameId};
 
 /// Untrusted descriptor fields read from, or intended for, an AF_XDP ring.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12,8 +12,12 @@ pub struct RawDescriptor {
 }
 
 /// Descriptor fields after validation against one [`crate::UmemLayout`].
+///
+/// The value is `Copy`, but its hidden domain binding remains unchanged.
+/// Copying it cannot make it valid for another UMEM or ledger.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ValidatedDescriptor {
+    domain: DomainIdentity,
     frame: FrameId,
     frame_base: u64,
     data_offset: u32,
@@ -21,8 +25,15 @@ pub struct ValidatedDescriptor {
 }
 
 impl ValidatedDescriptor {
-    pub(crate) const fn new(frame: FrameId, frame_base: u64, data_offset: u32, len: u32) -> Self {
+    pub(crate) const fn new(
+        domain: DomainIdentity,
+        frame: FrameId,
+        frame_base: u64,
+        data_offset: u32,
+        len: u32,
+    ) -> Self {
         Self {
+            domain,
             frame,
             frame_base,
             data_offset,
@@ -58,6 +69,10 @@ impl ValidatedDescriptor {
     #[must_use]
     pub const fn is_empty(self) -> bool {
         self.len == 0
+    }
+
+    pub(crate) fn belongs_to(self, domain: DomainIdentity) -> bool {
+        self.domain == domain
     }
 }
 

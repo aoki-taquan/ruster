@@ -736,11 +736,25 @@ frame size、frameより小さいheadroomをpublication前に検証します。d
 single-buffer profileに限定し、nonzero visible length、UMEM範囲、headroom、同一frame内の
 `addr + len`をchecked arithmeticで検証してからledgerへ渡します。
 
-各frameはledgerだけが発行できる`(FrameId, NonZeroU64 generation)` tokenで一ownership cycleを
-識別します。generationはchecked incrementだけで進め、`u64::MAX`の次へwrapせず、そのframeを
+control planeはUMEM ownership lifetimeごとにnonzero 128-bit unique inputをcold pathで生成し、
+move-onlyな`UmemDomainId`としてlayoutへ渡します。この値はpointer、公開counter、ZST identity
+から導出せず、Debugでもredactします。同じ値を別のlive ledger、process restart後、UMEM
+recreate後に再利用してはなりません。layoutはledgerへconsumeされ、domainをin-place
+reconcileするAPIは持ちません。UMEMまたはledgerを作り直す場合は必ず新domainで全frameを
+Free/generation zeroから作り、旧token/descriptorをforeign domainとして拒否します。
+
+各frameはledgerだけが発行できる
+`(hidden UMEM domain, FrameId, NonZeroU64 generation)` tokenで一ownership cycleを識別します。
+validated descriptorも同じhidden domainを保持します。token/descriptorはring state間で
+allocationなしに渡すため`Copy`ですが、copyから新しいownershipやdomain identityは生まれません。
+最初の有効なstate transition後、同じtokenの別copyはexact state checkで拒否されます。別ledgerの
+同じFrameId/generation tokenと、別layoutで検証した同じFrameId descriptorは、entry/counterを
+変更する前にtyped foreign-domain errorとなります。
+
+generationはchecked incrementだけで進め、`u64::MAX`の次へwrapせず、そのframeを
 `Quarantined`へ移して永久に通常reuseから外します。ledgerはFree、fill予約/kernel所有、
 RX available、core lease、pending/reserved/kernel TX、completion available、quarantineの
 exact partitionを持ちます。通常遷移はframe indexによるO(1) lookupと二つのstate counter更新
-だけです。全entry、token identity、generation、counterを再計算する`deep_audit`は明示的な
-cold pathです。stale token、wrong-state token、tokenと異なるframeへcanonicalizeされた
-descriptorは、entryとcounterを変更せずtyped errorで拒否します。
+だけです。全entry、domain、token identity、generation、descriptor、counterを再計算する
+`deep_audit`は明示的なcold pathです。stale token、wrong-state token、tokenと異なるframeへ
+canonicalizeされたdescriptorもentryとcounterを変更せずtyped errorで拒否します。

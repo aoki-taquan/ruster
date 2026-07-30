@@ -6,11 +6,13 @@
 #![doc = "are connected."]
 
 mod descriptor;
+mod domain;
 mod layout;
 mod ledger;
 mod token;
 
 pub use descriptor::{DescriptorError, RawDescriptor, ValidatedDescriptor};
+pub use domain::UmemDomainId;
 pub use layout::{LayoutError, UmemLayout};
 pub use ledger::{
     AuditError, FrameLedger, FrameStateKind, FrameStateView, LeaseKind, LedgerError, StateCounts,

@@ -1,13 +1,20 @@
 use std::num::NonZeroU64;
 
-use crate::{FrameId, FrameToken, OwnershipGeneration, ValidatedDescriptor};
+use crate::{
+    domain::DomainIdentity, FrameId, FrameToken, OwnershipGeneration, UmemLayout,
+    ValidatedDescriptor,
+};
 
 #[derive(Debug)]
-pub(crate) struct TokenAuthority(());
+pub(crate) struct TokenAuthority(DomainIdentity);
 
 impl TokenAuthority {
-    const fn new() -> Self {
-        Self(())
+    const fn new(domain: DomainIdentity) -> Self {
+        Self(domain)
+    }
+
+    pub(crate) const fn domain(&self) -> DomainIdentity {
+        self.0
     }
 }
 
@@ -190,17 +197,20 @@ impl FrameStateView {
 /// is the explicit cold path that scans the complete ledger.
 #[derive(Debug)]
 pub struct FrameLedger {
+    layout: UmemLayout,
     entries: Box<[FrameEntry]>,
     counts: StateCounts,
     authority: TokenAuthority,
 }
 
 impl FrameLedger {
-    /// Creates a ledger with every frame in [`FrameStateKind::Free`].
-    pub fn new(frame_count: u32) -> Result<Self, LedgerError> {
-        if frame_count == 0 {
-            return Err(LedgerError::ZeroFrameCount);
-        }
+    /// Consumes a uniquely identified layout and creates every frame as free.
+    ///
+    /// Recreating a ledger or UMEM requires a newly generated
+    /// [`crate::UmemDomainId`]; an old domain must not be reconciled into a new
+    /// ledger.
+    pub fn new(layout: UmemLayout) -> Result<Self, LedgerError> {
+        let frame_count = layout.frame_count();
         let count = usize::try_from(frame_count).map_err(|_| LedgerError::FrameCountUnsupported)?;
         let entries = vec![
             FrameEntry {
@@ -211,11 +221,19 @@ impl FrameLedger {
         ]
         .into_boxed_slice();
 
+        let domain = layout.domain();
         Ok(Self {
+            layout,
             entries,
             counts: StateCounts::new(count),
-            authority: TokenAuthority::new(),
+            authority: TokenAuthority::new(domain),
         })
+    }
+
+    /// Returns the immutable layout bound to this ledger.
+    #[must_use]
+    pub const fn layout(&self) -> &UmemLayout {
+        &self.layout
     }
 
     /// Returns the number of tracked frames.
@@ -260,6 +278,9 @@ impl FrameLedger {
         descriptor: ValidatedDescriptor,
     ) -> Result<(), LedgerError> {
         self.verify(token, FrameStateKind::FillOwnedByKernel)?;
+        if !descriptor.belongs_to(self.layout.domain()) {
+            return Err(LedgerError::ForeignDescriptorDomain);
+        }
         if descriptor.frame() != token.frame() {
             return Err(LedgerError::DescriptorFrameAlias {
                 token_frame: token.frame(),
@@ -377,6 +398,13 @@ impl FrameLedger {
         for (index, entry) in self.entries.iter().enumerate() {
             observed[entry.state.kind().index()] += 1;
             if let Some(token) = entry.state.token() {
+                if !token.belongs_to(self.layout.domain()) {
+                    return Err(AuditError::TokenDomain {
+                        frame: FrameId::from_index(
+                            u32::try_from(index).expect("entry index originated from u32"),
+                        ),
+                    });
+                }
                 let token_index =
                     usize::try_from(token.frame().index()).map_err(|_| AuditError::TokenFrame {
                         entry: index,
@@ -394,6 +422,19 @@ impl FrameLedger {
                         entry_generation: entry.generation,
                         token_generation: token.generation(),
                     });
+                }
+                if let FrameState::RxAvailable { descriptor, .. } = entry.state {
+                    if !descriptor.belongs_to(self.layout.domain()) {
+                        return Err(AuditError::DescriptorDomain {
+                            frame: token.frame(),
+                        });
+                    }
+                    if descriptor.frame() != token.frame() {
+                        return Err(AuditError::DescriptorFrame {
+                            token_frame: token.frame(),
+                            descriptor_frame: descriptor.frame(),
+                        });
+                    }
                 }
             } else if entry.generation != 0 && entry.state.kind() != FrameStateKind::Free {
                 return Err(AuditError::MissingToken {
@@ -478,6 +519,9 @@ impl FrameLedger {
     }
 
     fn verify(&self, token: FrameToken, expected: FrameStateKind) -> Result<usize, LedgerError> {
+        if !token.belongs_to(self.authority.domain()) {
+            return Err(LedgerError::ForeignTokenDomain);
+        }
         let index = self.index(token.frame().index())?;
         let entry = self.entries[index];
         if entry.generation != token.generation().get() {
@@ -535,8 +579,6 @@ impl FrameLedger {
 /// Rejected ledger operation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LedgerError {
-    /// At least one frame is required.
-    ZeroFrameCount,
     /// The requested frame count cannot be indexed on this target.
     FrameCountUnsupported,
     /// The requested index does not name a ledger entry.
@@ -569,11 +611,20 @@ pub enum LedgerError {
         /// Frame resolved from descriptor geometry.
         descriptor_frame: FrameId,
     },
+    /// The token was issued by another ledger/UMEM ownership domain.
+    ForeignTokenDomain,
+    /// The descriptor was validated for another UMEM ownership domain.
+    ForeignDescriptorDomain,
 }
 
 /// Cold-audit invariant failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AuditError {
+    /// A stored token belongs to another ledger/UMEM ownership domain.
+    TokenDomain {
+        /// Entry whose token has the wrong domain.
+        frame: FrameId,
+    },
     /// A stored token identifies a different entry.
     TokenFrame {
         /// Entry position being audited.
@@ -589,6 +640,18 @@ pub enum AuditError {
         entry_generation: u64,
         /// Epoch stored by the token.
         token_generation: OwnershipGeneration,
+    },
+    /// A stored RX descriptor belongs to another UMEM ownership domain.
+    DescriptorDomain {
+        /// Entry whose descriptor has the wrong domain.
+        frame: FrameId,
+    },
+    /// A stored RX descriptor resolves to another frame.
+    DescriptorFrame {
+        /// Frame authorized by the token.
+        token_frame: FrameId,
+        /// Frame resolved by the descriptor.
+        descriptor_frame: FrameId,
     },
     /// A non-free ownership state did not carry its token.
     MissingToken {

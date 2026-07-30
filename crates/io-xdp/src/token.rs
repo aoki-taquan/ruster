@@ -1,6 +1,6 @@
 use std::num::NonZeroU64;
 
-use crate::ledger::TokenAuthority;
+use crate::{domain::DomainIdentity, ledger::TokenAuthority};
 
 /// Canonical identity of one fixed-size frame in a UMEM region.
 ///
@@ -40,9 +40,13 @@ impl OwnershipGeneration {
 /// Capability identifying one particular ownership cycle of a frame.
 ///
 /// There is intentionally no public constructor. Only a ledger holding its
-/// private issuance authority can create a token.
+/// private issuance authority can create a token. Tokens are `Copy` so they can
+/// cross ring-model state boundaries without allocation; copying one does not
+/// duplicate ownership. After the first valid transition, another copy is
+/// rejected by the exact state/generation check.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FrameToken {
+    domain: DomainIdentity,
     frame: FrameId,
     generation: OwnershipGeneration,
 }
@@ -51,9 +55,13 @@ impl FrameToken {
     pub(crate) const fn from_ledger(
         frame: FrameId,
         generation: OwnershipGeneration,
-        _authority: &TokenAuthority,
+        authority: &TokenAuthority,
     ) -> Self {
-        Self { frame, generation }
+        Self {
+            domain: authority.domain(),
+            frame,
+            generation,
+        }
     }
 
     /// Returns the canonical UMEM frame identity.
@@ -66,5 +74,9 @@ impl FrameToken {
     #[must_use]
     pub const fn generation(self) -> OwnershipGeneration {
         self.generation
+    }
+
+    pub(crate) fn belongs_to(self, domain: DomainIdentity) -> bool {
+        self.domain == domain
     }
 }
