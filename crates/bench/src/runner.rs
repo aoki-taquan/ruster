@@ -16,6 +16,7 @@ const LAN: IfId = IfId(1);
 const WAN: IfId = IfId(2);
 const WAN_MAC: MacAddress = MacAddress([0x02, 0, 0, 0, 0, 2]);
 const GATEWAY_MAC: MacAddress = MacAddress([0x02, 0, 0, 0, 0, 3]);
+const MIN_AGGREGATE_REPETITIONS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Suite {
@@ -65,6 +66,7 @@ pub enum RunError {
     ZeroSampleTime,
     ZeroBatch,
     RepetitionOverflow,
+    SetupControlExceededMeasured { setup: Duration, measured: Duration },
     TimedAllocations { case: &'static str, count: u64 },
     UnexpectedBatchReport,
     ForwardingOracle,
@@ -78,6 +80,10 @@ impl fmt::Display for RunError {
             Self::ZeroSampleTime => formatter.write_str("sample time must be nonzero"),
             Self::ZeroBatch => formatter.write_str("batch sizes must be nonzero"),
             Self::RepetitionOverflow => formatter.write_str("adaptive repetition count overflowed"),
+            Self::SetupControlExceededMeasured { setup, measured } => write!(
+                formatter,
+                "setup control ({setup:?}) exceeded measured interval ({measured:?})"
+            ),
             Self::TimedAllocations { case, count } => {
                 write!(formatter, "{case} allocated {count} times in timed regions")
             }
@@ -223,9 +229,24 @@ fn warm_plain(
 ) -> Result<(), RunError> {
     let started = Instant::now();
     while started.elapsed() < warmup_time {
-        let measurement = measure_plain(backend, template, snapshot, batch_size, 1)?;
-        ensure_no_allocations("plain-ipv4", measurement.allocations)?;
-        black_box(measurement);
+        match measure_plain(
+            backend,
+            template,
+            snapshot,
+            batch_size,
+            MIN_AGGREGATE_REPETITIONS,
+        ) {
+            Ok(measurement) => {
+                ensure_no_allocations("plain-ipv4", measurement.allocations)?;
+                black_box(measurement);
+            }
+            Err(RunError::SetupControlExceededMeasured { .. }) => {
+                // A discarded warmup probe can be shorter than scheduler and
+                // cache noise. Formal samples still propagate this typed
+                // error rather than substituting zero.
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }
@@ -237,9 +258,19 @@ fn calibrate_plain(
     batch_size: usize,
     target: Duration,
 ) -> Result<usize, RunError> {
-    let mut repetitions = 1_usize;
+    let mut repetitions = MIN_AGGREGATE_REPETITIONS;
     loop {
-        let measurement = measure_plain(backend, template, snapshot, batch_size, repetitions)?;
+        let measurement = match measure_plain(backend, template, snapshot, batch_size, repetitions)
+        {
+            Ok(measurement) => measurement,
+            Err(RunError::SetupControlExceededMeasured { .. }) => {
+                repetitions = repetitions
+                    .checked_mul(2)
+                    .ok_or(RunError::RepetitionOverflow)?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         ensure_no_allocations("plain-ipv4", measurement.allocations)?;
         if measurement.elapsed >= target {
             return Ok(repetitions);
@@ -290,10 +321,16 @@ fn measure_plain(
         return Err(RunError::UnexpectedBatchReport);
     }
     Ok(Measurement {
-        elapsed: measured_elapsed.saturating_sub(setup_elapsed),
+        elapsed: subtract_setup_control(setup_elapsed, measured_elapsed)?,
         allocations,
         digest: u16::try_from(report.tx_requested).unwrap_or(u16::MAX),
     })
+}
+
+fn subtract_setup_control(setup: Duration, measured: Duration) -> Result<Duration, RunError> {
+    measured
+        .checked_sub(setup)
+        .ok_or(RunError::SetupControlExceededMeasured { setup, measured })
 }
 
 fn verify_forwarded(
@@ -432,7 +469,7 @@ mod tests {
     fn one_plain_iteration_passes_the_untimed_wire_oracle() {
         let mut config = RunConfig::smoke();
         config.samples = 1;
-        config.sample_time = Duration::from_nanos(1);
+        config.sample_time = Duration::from_micros(100);
         config.warmup_time = Duration::ZERO;
         config.batches = vec![1];
         let rows = run(&config).unwrap();
@@ -453,5 +490,20 @@ mod tests {
         assert_eq!(once.digest, 0x220d);
         assert_eq!(twice.digest, once.digest);
         assert_eq!(internet_checksum(&bytes), 0x220d);
+    }
+
+    #[test]
+    fn setup_control_subtraction_never_silently_saturates() {
+        assert_eq!(
+            subtract_setup_control(Duration::from_nanos(3), Duration::from_nanos(8)),
+            Ok(Duration::from_nanos(5))
+        );
+        assert_eq!(
+            subtract_setup_control(Duration::from_nanos(8), Duration::from_nanos(3)),
+            Err(RunError::SetupControlExceededMeasured {
+                setup: Duration::from_nanos(8),
+                measured: Duration::from_nanos(3),
+            })
+        );
     }
 }

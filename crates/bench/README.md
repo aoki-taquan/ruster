@@ -25,6 +25,8 @@ threadのallocationを一つでも検出したrunは失敗します。
 plain forwardingは同じ反復数の`reset + receive` intervalを別に一度測り、全反復を一つの
 intervalで測った値から差し引きます。packetごとのclock読取りを入れず、batchごとの
 `forward_batch`/finish境界を維持します。
+短いcalibration probeでcontrolがmeasured intervalを上回った場合は反復数を増やします。
+正式sampleで同じ状態になった場合はzeroへ丸めず、両Durationを持つtyped errorで失敗します。
 各packet bufferは測定直前のresetでCPU cacheへ触れるため、これはcoreのhot-cache
 microbenchmarkであり、NIC/backend DMAやcold-cache throughputの主張ではありません。
 
