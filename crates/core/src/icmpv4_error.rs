@@ -292,6 +292,40 @@ pub struct Icmpv4ErrorCounters {
     pub dequeued_host_unreachable: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Icmpv4ErrorPublicationReport {
+    pub states_flushed: usize,
+    pub actions_flushed: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Icmpv4ErrorPublicationError {
+    ActionQueueCapacity,
+    ActionQueueHead,
+    ActionQueueWindow,
+    QueuedStateMismatch,
+    RuntimeEpochExhausted,
+}
+
+/// Exclusive proof that old generated-ICMP authority can be flushed totally.
+///
+/// ```compile_fail
+/// use ruster_core::Icmpv4ErrorRuntime;
+///
+/// fn reborrow<'storage>(runtime: &mut Icmpv4ErrorRuntime<'storage>) {
+///     let permit = runtime.preflight_publication().unwrap();
+///     let _ = runtime.pending_actions();
+///     permit.commit();
+/// }
+/// ```
+#[must_use]
+pub struct Icmpv4ErrorPublicationPermit<'runtime, 'storage> {
+    runtime: &'runtime mut Icmpv4ErrorRuntime<'storage>,
+    next_runtime_epoch: u128,
+    report: Icmpv4ErrorPublicationReport,
+}
+
 /// Caller-backed, worker-local ICMP error queue and per-egress limiter.
 ///
 /// The runtime deliberately has no shared state and cannot cross worker
@@ -313,6 +347,7 @@ pub struct Icmpv4ErrorRuntime<'a> {
     head: usize,
     len: usize,
     last_now: Option<MonotonicMillis>,
+    runtime_epoch: u128,
     counters: Icmpv4ErrorCounters,
     _worker_local: PhantomData<Rc<()>>,
 }
@@ -333,6 +368,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             head: 0,
             len: 0,
             last_now: None,
+            runtime_epoch: 1,
             counters: Icmpv4ErrorCounters::default(),
             _worker_local: PhantomData,
         }
@@ -346,6 +382,115 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
     #[must_use]
     pub const fn counters(&self) -> Icmpv4ErrorCounters {
         self.counters
+    }
+
+    #[must_use]
+    pub const fn policy(&self) -> Icmpv4ErrorPolicy {
+        self.policy
+    }
+
+    #[must_use]
+    pub const fn state_capacity(&self) -> usize {
+        self.states.len()
+    }
+
+    #[must_use]
+    pub const fn action_capacity(&self) -> usize {
+        self.actions.len()
+    }
+
+    /// Returns whether this runtime is still in its exact constructor state.
+    #[must_use]
+    pub fn is_pristine(&self) -> bool {
+        self.states
+            .iter()
+            .all(|slot| *slot == Icmpv4ErrorStateSlot::EMPTY)
+            && self
+                .actions
+                .iter()
+                .all(|slot| *slot == Icmpv4ErrorActionSlot::EMPTY)
+            && self.head == 0
+            && self.len == 0
+            && self.last_now.is_none()
+            && self.runtime_epoch == 1
+            && self.counters == Icmpv4ErrorCounters::default()
+    }
+
+    /// Validates the generated-action queue without changing runtime state.
+    ///
+    /// Successful commit clears all limiter and action state because queued
+    /// actions contain publication-specific egress, MAC, and IPv4 authority.
+    /// Cumulative operational counters are deliberately preserved.
+    pub fn preflight_publication<'runtime>(
+        &'runtime mut self,
+    ) -> Result<Icmpv4ErrorPublicationPermit<'runtime, 'a>, Icmpv4ErrorPublicationError> {
+        if self.len > self.actions.len() {
+            return Err(Icmpv4ErrorPublicationError::ActionQueueCapacity);
+        }
+        if self.actions.is_empty() {
+            if self.head != 0 || self.len != 0 {
+                return Err(Icmpv4ErrorPublicationError::ActionQueueHead);
+            }
+        } else if self.head >= self.actions.len() {
+            return Err(Icmpv4ErrorPublicationError::ActionQueueHead);
+        }
+        for index in 0..self.actions.len() {
+            let distance = (index + self.actions.len() - self.head) % self.actions.len();
+            if self.actions[index].0.is_some() != (distance < self.len) {
+                return Err(Icmpv4ErrorPublicationError::ActionQueueWindow);
+            }
+        }
+        if self
+            .states
+            .iter()
+            .any(|state| state.action_queued && !state.occupied)
+        {
+            return Err(Icmpv4ErrorPublicationError::QueuedStateMismatch);
+        }
+        let queued_states = self
+            .states
+            .iter()
+            .filter(|state| state.occupied && state.action_queued)
+            .count();
+        if queued_states != self.len {
+            return Err(Icmpv4ErrorPublicationError::QueuedStateMismatch);
+        }
+        for offset in 0..self.len {
+            let index = (self.head + offset) % self.actions.len();
+            let Some(queued) = self.actions[index].0 else {
+                return Err(Icmpv4ErrorPublicationError::ActionQueueWindow);
+            };
+            if (0..offset).any(|previous_offset| {
+                let previous_index = (self.head + previous_offset) % self.actions.len();
+                self.actions[previous_index].0.is_some_and(|previous| {
+                    previous.action.egress == queued.action.egress
+                        && previous.generation == queued.generation
+                })
+            }) {
+                return Err(Icmpv4ErrorPublicationError::QueuedStateMismatch);
+            }
+            if !self.states.iter().any(|state| {
+                state.occupied
+                    && state.action_queued
+                    && state.egress == queued.action.egress
+                    && state.generation == queued.generation
+            }) {
+                return Err(Icmpv4ErrorPublicationError::QueuedStateMismatch);
+            }
+        }
+        let next_runtime_epoch = self
+            .runtime_epoch
+            .checked_add(1)
+            .ok_or(Icmpv4ErrorPublicationError::RuntimeEpochExhausted)?;
+        let report = Icmpv4ErrorPublicationReport {
+            states_flushed: self.states.iter().filter(|state| state.occupied).count(),
+            actions_flushed: self.len,
+        };
+        Ok(Icmpv4ErrorPublicationPermit {
+            runtime: self,
+            next_runtime_epoch,
+            report,
+        })
     }
 
     pub(crate) fn record_suppression(
@@ -555,6 +700,19 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             state.has_requested = true;
             state.requested_at = now;
         }
+    }
+}
+
+impl Icmpv4ErrorPublicationPermit<'_, '_> {
+    /// Flushes old publication authority without failure.
+    pub fn commit(self) -> Icmpv4ErrorPublicationReport {
+        self.runtime.states.fill(Icmpv4ErrorStateSlot::EMPTY);
+        self.runtime.actions.fill(Icmpv4ErrorActionSlot::EMPTY);
+        self.runtime.head = 0;
+        self.runtime.len = 0;
+        self.runtime.last_now = None;
+        self.runtime.runtime_epoch = self.next_runtime_epoch;
+        self.report
     }
 }
 
@@ -801,6 +959,40 @@ fn build_icmpv4_error(frame: &mut [u8], action: &Icmpv4ErrorAction) {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct RuntimeImage {
+        policy: Icmpv4ErrorPolicy,
+        states: Vec<Icmpv4ErrorStateSlot>,
+        actions: Vec<Icmpv4ErrorActionSlot>,
+        head: usize,
+        len: usize,
+        last_now: Option<MonotonicMillis>,
+        runtime_epoch: u128,
+        counters: Icmpv4ErrorCounters,
+    }
+
+    fn runtime_image(runtime: &Icmpv4ErrorRuntime<'_>) -> RuntimeImage {
+        RuntimeImage {
+            policy: runtime.policy,
+            states: runtime.states.to_vec(),
+            actions: runtime.actions.to_vec(),
+            head: runtime.head,
+            len: runtime.len,
+            last_now: runtime.last_now,
+            runtime_epoch: runtime.runtime_epoch,
+            counters: runtime.counters,
+        }
+    }
+
+    fn assert_publication_error_is_atomic(
+        runtime: &mut Icmpv4ErrorRuntime<'_>,
+        expected: Icmpv4ErrorPublicationError,
+    ) {
+        let before = runtime_image(runtime);
+        assert_eq!(runtime.preflight_publication().err(), Some(expected));
+        assert_eq!(runtime_image(runtime), before);
+    }
+
     fn action(egress: u16, quote_len: usize) -> Icmpv4TimeExceededAction {
         let original = [0xa5; ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN];
         Icmpv4TimeExceededAction::new(
@@ -841,6 +1033,156 @@ mod tests {
             Err(Icmpv4ErrorPolicyError::StateTtlTooShort)
         );
         assert_eq!(Icmpv4ErrorPolicy::default().interval_ms(), 100);
+    }
+
+    #[test]
+    fn publication_preflight_errors_leave_runtime_exactly_unchanged() {
+        let mut states = [];
+        let mut actions = [];
+        let mut runtime =
+            Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut states, &mut actions);
+        runtime.len = 1;
+        assert_publication_error_is_atomic(
+            &mut runtime,
+            Icmpv4ErrorPublicationError::ActionQueueCapacity,
+        );
+
+        let mut states = [];
+        let mut actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+        let mut runtime =
+            Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut states, &mut actions);
+        runtime.head = 1;
+        assert_publication_error_is_atomic(
+            &mut runtime,
+            Icmpv4ErrorPublicationError::ActionQueueHead,
+        );
+
+        let mut states = [];
+        let mut actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+        let mut runtime =
+            Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut states, &mut actions);
+        runtime.len = 1;
+        assert_publication_error_is_atomic(
+            &mut runtime,
+            Icmpv4ErrorPublicationError::ActionQueueWindow,
+        );
+
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+        let mut actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+        let mut runtime =
+            Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut states, &mut actions);
+        assert!(matches!(
+            runtime.schedule(action(1, 20), MonotonicMillis(0)),
+            Icmpv4ErrorDisposition::Queued { .. }
+        ));
+        runtime.states[0].action_queued = false;
+        assert_publication_error_is_atomic(
+            &mut runtime,
+            Icmpv4ErrorPublicationError::QueuedStateMismatch,
+        );
+
+        let mut states = [];
+        let mut actions = [];
+        let mut runtime =
+            Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut states, &mut actions);
+        runtime.runtime_epoch = u128::MAX;
+        assert_publication_error_is_atomic(
+            &mut runtime,
+            Icmpv4ErrorPublicationError::RuntimeEpochExhausted,
+        );
+    }
+
+    #[test]
+    fn publication_preflight_rejects_duplicate_action_authority() {
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; 2];
+        let mut actions = [Icmpv4ErrorActionSlot::EMPTY; 2];
+        let mut runtime =
+            Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut states, &mut actions);
+        assert!(matches!(
+            runtime.schedule(action(1, 20), MonotonicMillis(0)),
+            Icmpv4ErrorDisposition::Queued { .. }
+        ));
+        assert!(matches!(
+            runtime.schedule(action(2, 20), MonotonicMillis(0)),
+            Icmpv4ErrorDisposition::Queued { .. }
+        ));
+        runtime.actions[1] = runtime.actions[0];
+        assert_publication_error_is_atomic(
+            &mut runtime,
+            Icmpv4ErrorPublicationError::QueuedStateMismatch,
+        );
+    }
+
+    #[test]
+    fn publication_permit_drop_and_commit_cover_wrapped_fifo_and_counter_policy() {
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; 2];
+        let mut actions = [Icmpv4ErrorActionSlot::EMPTY; 2];
+        let mut runtime = Icmpv4ErrorRuntime::new(
+            Icmpv4ErrorPolicy::new(1, 2).unwrap(),
+            &mut states,
+            &mut actions,
+        );
+        runtime.schedule(action(1, 20), MonotonicMillis(0));
+        runtime.schedule(action(2, 20), MonotonicMillis(0));
+        let first = runtime.front().unwrap();
+        runtime.committed(first, MonotonicMillis(0));
+        runtime.schedule(action(1, 20), MonotonicMillis(1));
+        runtime.counters.queued = usize::MAX;
+
+        let before = runtime_image(&runtime);
+        let permit = runtime.preflight_publication().unwrap();
+        assert_eq!(
+            permit.report,
+            Icmpv4ErrorPublicationReport {
+                states_flushed: 2,
+                actions_flushed: 2,
+            }
+        );
+        drop(permit);
+        assert_eq!(runtime_image(&runtime), before);
+
+        let counters = runtime.counters;
+        let report = runtime.preflight_publication().unwrap().commit();
+        assert_eq!(
+            report,
+            Icmpv4ErrorPublicationReport {
+                states_flushed: 2,
+                actions_flushed: 2,
+            }
+        );
+        assert!(runtime
+            .states
+            .iter()
+            .all(|slot| *slot == Icmpv4ErrorStateSlot::EMPTY));
+        assert!(runtime
+            .actions
+            .iter()
+            .all(|slot| *slot == Icmpv4ErrorActionSlot::EMPTY));
+        assert_eq!((runtime.head, runtime.len), (0, 0));
+        assert_eq!(runtime.last_now, None);
+        assert_eq!(runtime.runtime_epoch, 2);
+        assert_eq!(runtime.counters, counters);
+    }
+
+    #[test]
+    fn publication_zero_capacity_is_total_and_pristine_is_exact() {
+        let mut states = [];
+        let mut actions = [];
+        let mut runtime =
+            Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut states, &mut actions);
+        assert!(runtime.is_pristine());
+        assert_eq!(
+            runtime.preflight_publication().unwrap().commit(),
+            Icmpv4ErrorPublicationReport::default()
+        );
+        assert!(!runtime.is_pristine());
+
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+        let mut actions = [];
+        let runtime =
+            Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut states, &mut actions);
+        runtime.states[0].egress = IfId(9);
+        assert!(!runtime.is_pristine());
     }
 
     #[test]

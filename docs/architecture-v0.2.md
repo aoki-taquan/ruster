@@ -120,6 +120,18 @@ static keyと一致するdynamic/active state/actionに加え、interface MAC、
 route authority、target safetyが新snapshotと一致しないstale retryを削除し、wrapped action ringのunrelated
 FIFOを維持します。旧static-only caller向け`reconcile_static`は互換APIとして残します。
 static公開後に同keyのARPを受けた場合もmerge pathが同じkey cleanupを行います。
+
+新しいpublication pathでは`ValidatedForwardingOwner`がcallerから受け取ったboxed tableを
+一度だけ検証・hashし、以後の`ForwardingSnapshot` viewをallocation/再scanなしのO(1) borrowで
+返します。ownerごとのnonzero nonceはchecked incrementだけで発行し、枯渇時はwrapせず
+publicationを拒否します。pointer/contentが同じでもnonceが異なるため、allocator reuseを
+publication identityとして受理しません。公開前の`ResolutionRuntime::preflight_publication`
+はaction ring windowとpending countをread-onlyで検証し、exact runtimeのexclusive borrowを
+permitへ保持します。permitのDropは全field不変、`commit`は失敗分岐やpanic/overflowなしに
+state/action/dynamic neighbor/failure holdを全flushしてcursor/countをzeroへ戻します。
+累積運用counterとmonotonic watermarkは履歴として保持します。これは旧snapshot由来の
+ARP request、learned MAC、Host Unreachable候補を新publicationへ持ち越さない保守的境界です。
+`reconcile_publication`は既存caller向けの選択的互換APIとして残します。
 一度でもRequestをcommitしたkeyを学習/static/authority変更でcancelする場合、retry actionと
 stale source authorityは削除しますが、`(IfId,target,requested_at)`だけのnon-retrying
 `Cooldown` tombstoneを残します。dynamic TTL expiryやstatic publish/remove churnはこの
@@ -295,11 +307,15 @@ reverse static/fresh dynamic hitなら共有`Icmpv4ErrorRuntime`へCode 1をqueu
 では通常ARPをholdなしでscheduleし、候補だけを保持します。学習後の後続dispatchでfresh RXなしに
 queueでき、reverse generationがFailedならrecursive ICMPを作らずretireします。同じfailed
 forward keyをreverse resolutionとして再開しません。ICMP FIFOのPending/rate/state/action
-pressureは候補を保持し、publication、forward learning/static、authority変更は未queue候補を
+pressureは候補を保持し、forward learning/static、authority変更は未queue候補を
 cancelします。`reverse_arp_scheduled`はfailure dispatch自身が`Queued`/`RetryQueued`を作った
 場合だけ増やします。同じactive tokenの`InitialQueued`/`Waiting`/`RetryQueued`を反復scanした
 場合は`ReverseArpPending`であり、既存actionやtimer-generated retryを新規scheduleとして
-二重計上しません。queue済みICMP actionはhistorical eventとしてcancelしません。
+二重計上しません。通常処理中にqueue済みICMP actionはhistorical eventとしてcancelしません。
+ただしpublication境界ではegress/MAC/IP authorityが旧snapshotへbindされているため、
+`Icmpv4ErrorRuntime::preflight_publication`がring/stateの全単射とcapacity/head/windowを
+read-onlyで検証し、exclusive permitのtotal commitでqueue、limiter、head/len、watermarkを
+全flushします。累積counterは保持し、permit Dropと全preflight errorはruntime不変です。
 
 worker tick順は `publication/reconcile → RX → resolution timer poll → failure dispatch →
 generated ARP → generated ICMP` です。exact timeoutでのARP学習は、ICMP actionがqueueされる前
@@ -657,14 +673,22 @@ identity/hash keyのreconcileはno-op、
 同一generationの別identityとgeneration regressionは拒否します。generation前進時に同じ
 hash keyを再利用したpublicationも`HashKeyNotRotated`で拒否し、fresh keyを伴うforward
 generationだけが全stateをflushします。
-snapshotのcontent fingerprintとslice identity、rule fingerprintはpublication
-時に一度だけ計算してconfig/runtimeへbindし、packet pathのauthority確認はpointer/length/
-fingerprintのO(1)比較です。packetごとのsnapshot再hashやrules slice equalityは行いません。
-runtimeがpublicationを跨いで保持するのは、このpointer値をdereferenceしないowned binding
-metadataだけです。rules sliceは各forward batchのcurrent `FirewallConfig`からrule scan中だけ
-borrowします。generation前進とfresh hash keyを検証した`reconcile`後は、旧rules allocationを
-dropでき、新allocationのrulesだけを次batchへ渡せます。これによりruntimeとimmutable
-publication ownerのself-referenceを作らず、fast pathのrule scanはborrow-onlyのままです。
+新しいpublication pathでは`ValidatedFirewallOwner`が
+`ValidatedForwardingOwner`のnonzero nonceへbindしたboxed rulesを一度だけ検証・fingerprint化
+します。owner固有のnonzero firewall publication nonceもchecked incrementだけで発行し、
+枯渇時はwrapせず拒否します。`config()`はowner lifetime内のO(1) borrowで、pointer/contentが
+再利用されてもnonceが異なるため同一identityにはなりません。互換用`FirewallConfig::new`は
+firewall nonce zeroのlegacy identityを作れます。`ValidatedFirewallOwner::new`はnonzero
+forwarding nonceを持つsnapshotだけを受理し、nonzero firewall nonceを生成します。
+packetごとのsnapshot再hashやrules slice equalityは行いません。
+runtimeがpublicationを跨いで保持するのはpointerをdereferenceしないowned binding metadata
+だけで、rules sliceはcurrent `FirewallConfig`からrule scan中だけborrowします。
+`preflight_reconcile`はgeneration regression、same-generation collision、hash-key reuse、
+runtime epoch exhaustionをmutation前に検証し、exact runtime borrowをpermitへ保持します。
+permit Dropとerrorは全field不変です。fresh generationのtotal commitは全flow stateをflushし、
+binding/epochを更新し、counterだけをsaturating加算します。旧rules allocationはその後drop
+でき、新allocationだけを次batchへ渡せるためself-referenceを作らず、fast pathのrule scanは
+borrow-onlyのままです。
 
 flow keyはprotocol、origin ingress/egress、initiator/responder IPv4 address+port、
 config generationです。ordinary forwardingはwire view、NAT outboundはpre-SNAT
