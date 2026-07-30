@@ -251,6 +251,28 @@ fn assert_drop(io: &mut SimIo, reason: DropReason, original: &[u8]) {
     assert_eq!(dropped.bytes, original);
 }
 
+type CombinedStateSnapshot = (
+    Vec<Nat44UdpMappingSlot>,
+    Vec<Nat44UdpPeerSlot>,
+    Vec<Nat44TcpMappingSlot>,
+    Vec<Nat44TcpSessionSlot>,
+    Vec<FirewallStateSlot>,
+);
+
+fn combined_state_snapshot(
+    udp: &Nat44UdpRuntime<'_>,
+    tcp: &Nat44TcpRuntime<'_>,
+    firewall: &FirewallRuntime<'_, '_>,
+) -> CombinedStateSnapshot {
+    (
+        udp.mappings().to_vec(),
+        udp.peers().to_vec(),
+        tcp.mappings().to_vec(),
+        tcp.sessions().to_vec(),
+        firewall.states().to_vec(),
+    )
+}
+
 fn rewrite_ipv4_header(frame: &mut [u8]) {
     let header_len = usize::from(frame[14] & 0x0f) * 4;
     frame[24..26].fill(0);
@@ -965,6 +987,63 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
     );
     assert_eq!(errors.pending_actions(), 0);
 
+    let mut authorized_audit_storage = [FirewallAuditRecord::default(); 1];
+    let mut authorized_audit = FirewallAuditBuffer::new(&mut authorized_audit_storage);
+    let mut audited_ttl = udp_frame(HOST, REMOTE, 12_349, 53, 0x4000, false);
+    set_ttl(&mut audited_ttl, 1);
+    let audited_ipv4_total_len =
+        usize::from(u16::from_be_bytes([audited_ttl[16], audited_ttl[17]]));
+    let audited_quote = audited_ttl[14..14 + audited_ipv4_total_len].to_vec();
+    let audited_state_before = combined_state_snapshot(&udp, &tcp, &firewall);
+    io.inject(LAN, audited_ttl.clone());
+    io.run_nat44_udp_and_tcp_with_firewall_and_icmpv4_errors_audited_once(
+        1,
+        &snapshot,
+        &mut resolution_runtime,
+        &mut errors,
+        &udp_config,
+        Some(&mut udp),
+        &tcp_config,
+        Some(&mut tcp),
+        &allow_config,
+        Some(&mut firewall),
+        &mut authorized_audit,
+        MonotonicMillis(101),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::Ipv4TtlExpired, &audited_ttl);
+    assert_eq!(errors.pending_actions(), 1);
+    assert_eq!(resolution_runtime.pending_actions(), 0);
+    assert_eq!(resolution_runtime.pending_states(), 0);
+    assert_eq!(
+        combined_state_snapshot(&udp, &tcp, &firewall),
+        audited_state_before
+    );
+    assert_eq!(authorized_audit.records().len(), 1);
+    assert_eq!(
+        authorized_audit.records()[0].disposition.verdict,
+        FirewallVerdict::Allow
+    );
+
+    let audited_generated = execute_one_icmpv4_error(
+        &mut io,
+        &mut errors,
+        MonotonicMillis(101),
+        &mut NoGeneratedIcmpv4Trace,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(audited_generated.action.quote_len(), audited_quote.len());
+    let audited_generated_frame = io.pop_tx().unwrap();
+    assert_eq!(audited_generated_frame.origin, FrameOrigin::Generated);
+    assert_eq!(&audited_generated_frame.bytes[34..36], &[11, 0]);
+    assert_eq!(
+        &audited_generated_frame.bytes[42..42 + audited_quote.len()],
+        audited_quote.as_slice()
+    );
+    assert_eq!(errors.pending_actions(), 0);
+
     let deny_rules = [rule(
         30,
         FirewallInterface::Interface(LAN),
@@ -983,6 +1062,7 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
     let mut audit = FirewallAuditBuffer::new(&mut audit_storage);
     let mut denied = udp_frame(HOST, REMOTE, 12_346, 53, 0x4000, false);
     set_ttl(&mut denied, 1);
+    let denied_state_before = combined_state_snapshot(&udp, &tcp, &deny_firewall);
     io.inject(LAN, denied.clone());
     io.run_nat44_udp_and_tcp_with_firewall_and_icmpv4_errors_audited_once(
         1,
@@ -996,13 +1076,18 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
         &deny_config,
         Some(&mut deny_firewall),
         &mut audit,
-        MonotonicMillis(2),
+        MonotonicMillis(102),
         &mut NoTrace,
     )
     .unwrap();
     assert_drop(&mut io, DropReason::FirewallRuleDenied, &denied);
     assert_eq!(errors.pending_actions(), 0);
     assert_eq!(resolution_runtime.pending_actions(), 0);
+    assert_eq!(resolution_runtime.pending_states(), 0);
+    assert_eq!(
+        combined_state_snapshot(&udp, &tcp, &deny_firewall),
+        denied_state_before
+    );
     assert_eq!(audit.records().len(), 1);
     assert_eq!(
         audit.records()[0].disposition.verdict,
@@ -1012,6 +1097,7 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
     let mismatched_firewall_config = firewall_config(&snapshot, &rules, 2);
     let mut authority = udp_frame(HOST, REMOTE, 12_347, 53, 0x4000, false);
     set_ttl(&mut authority, 1);
+    let authority_state_before = combined_state_snapshot(&udp, &tcp, &firewall);
     io.inject(LAN, authority.clone());
     io.run_nat44_udp_and_tcp_with_firewall_and_icmpv4_errors_once(
         1,
@@ -1024,13 +1110,18 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
         Some(&mut tcp),
         &mismatched_firewall_config,
         Some(&mut firewall),
-        MonotonicMillis(3),
+        MonotonicMillis(103),
         &mut NoTrace,
     )
     .unwrap();
     assert_drop(&mut io, DropReason::FirewallConfigMismatch, &authority);
     assert_eq!(errors.pending_actions(), 0);
     assert_eq!(resolution_runtime.pending_actions(), 0);
+    assert_eq!(resolution_runtime.pending_states(), 0);
+    assert_eq!(
+        combined_state_snapshot(&udp, &tcp, &firewall),
+        authority_state_before
+    );
 
     let no_remote_routes = [routes[0]];
     let route_snapshot =
@@ -1079,6 +1170,7 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
         resolution(&mut route_resolution_states, &mut route_resolution_actions);
     let mut no_route = udp_frame(HOST, REMOTE, 12_348, 53, 0x4000, false);
     set_ttl(&mut no_route, 1);
+    let route_state_before = combined_state_snapshot(&route_udp, &route_tcp, &route_firewall);
     io.inject(LAN, no_route.clone());
     io.run_nat44_udp_and_tcp_with_firewall_and_icmpv4_errors_once(
         1,
@@ -1091,13 +1183,18 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
         Some(&mut route_tcp),
         &route_firewall_config,
         Some(&mut route_firewall),
-        MonotonicMillis(4),
+        MonotonicMillis(104),
         &mut NoTrace,
     )
     .unwrap();
     assert_drop(&mut io, DropReason::FirewallRouteUnavailable, &no_route);
     assert_eq!(errors.pending_actions(), 0);
     assert_eq!(route_resolution.pending_actions(), 0);
+    assert_eq!(route_resolution.pending_states(), 0);
+    assert_eq!(
+        combined_state_snapshot(&route_udp, &route_tcp, &route_firewall),
+        route_state_before
+    );
 }
 
 #[test]
