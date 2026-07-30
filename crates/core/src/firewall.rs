@@ -338,7 +338,7 @@ impl FirewallHashKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct FirewallConfig<'a> {
     rules: &'a [FirewallRule],
     policy: FirewallPolicy,
@@ -351,6 +351,62 @@ pub struct FirewallConfig<'a> {
     rules_fingerprint: u64,
 }
 
+const VALIDATED_FIREWALL_OWNER_AUTHORITY_BIT: u64 = 1 << 63;
+
+impl std::fmt::Debug for FirewallConfig<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FirewallConfig")
+            .field("policy", &self.policy)
+            .field("generation", &self.generation)
+            .field("hash_key", &self.hash_key)
+            .field("rules_len", &self.rules_len)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Immutable validated firewall rules owned by the cold publication path.
+///
+/// Construction consumes caller-allocated rule storage and validates it once.
+/// [`Self::config`] is an infallible O(1) borrow scoped to this owner.
+///
+/// ```compile_fail
+/// use ruster_core::{FirewallConfig, ValidatedFirewallOwner};
+///
+/// fn escape(owner: &ValidatedFirewallOwner) -> FirewallConfig<'static> {
+///     owner.config()
+/// }
+/// ```
+pub struct ValidatedFirewallOwner {
+    rules: Box<[FirewallRule]>,
+    binding: FirewallConfigBinding,
+}
+
+impl std::fmt::Debug for ValidatedFirewallOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ValidatedFirewallOwner")
+            .field("policy", &self.binding.policy)
+            .field("generation", &self.binding.generation)
+            .field("hash_key", &self.binding.hash_key)
+            .field("rules_len", &self.rules.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(test, feature = "validation-test-hooks"))]
+std::thread_local! {
+    static FULL_FIREWALL_VALIDATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Returns and resets the current thread's full firewall validation count.
+#[cfg(feature = "validation-test-hooks")]
+#[doc(hidden)]
+pub fn take_full_firewall_validation_count() -> usize {
+    FULL_FIREWALL_VALIDATIONS.with(|count| count.replace(0))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum FirewallConfigError {
@@ -359,6 +415,8 @@ pub enum FirewallConfigError {
     DuplicateRuleId,
     IngressInterfaceMissing,
     EgressInterfaceMissing,
+    PublicationOwnerRequired,
+    PublicationNonceExhausted,
 }
 
 /// Validates firewall rule identity and interface references without creating
@@ -415,6 +473,8 @@ impl<'a> FirewallConfig<'a> {
         generation: u64,
         hash_key: FirewallHashKey,
     ) -> Result<Self, FirewallConfigError> {
+        #[cfg(any(test, feature = "validation-test-hooks"))]
+        FULL_FIREWALL_VALIDATIONS.with(|count| count.set(count.get().saturating_add(1)));
         if generation == 0 {
             return Err(FirewallConfigError::GenerationZero);
         }
@@ -428,7 +488,7 @@ impl<'a> FirewallConfig<'a> {
             snapshot_identity: snapshot.identity(),
             rules_identity: rules.as_ptr() as usize,
             rules_len: rules.len(),
-            rules_fingerprint: rules_fingerprint(rules),
+            rules_fingerprint: rules_fingerprint(rules) & !VALIDATED_FIREWALL_OWNER_AUTHORITY_BIT,
         })
     }
 
@@ -453,8 +513,12 @@ impl<'a> FirewallConfig<'a> {
     }
 
     pub(crate) fn authority_matches(self, snapshot: &ForwardingSnapshot<'_>) -> bool {
-        self.snapshot_authority == snapshot.authority()
-            && self.snapshot_identity == snapshot.identity()
+        let authority = if self.rules_fingerprint & VALIDATED_FIREWALL_OWNER_AUTHORITY_BIT == 0 {
+            snapshot.authority()
+        } else {
+            snapshot.publication_nonce()
+        };
+        self.snapshot_authority == authority && self.snapshot_identity == snapshot.identity()
     }
 
     const fn binding(self) -> FirewallConfigBinding {
@@ -471,12 +535,54 @@ impl<'a> FirewallConfig<'a> {
     }
 }
 
+impl ValidatedFirewallOwner {
+    pub fn new(
+        snapshot: &ForwardingSnapshot<'_>,
+        rules: Box<[FirewallRule]>,
+        policy: FirewallPolicy,
+        generation: u64,
+        hash_key: FirewallHashKey,
+    ) -> Result<Self, FirewallConfigError> {
+        if snapshot.publication_nonce() == 0 {
+            return Err(FirewallConfigError::PublicationOwnerRequired);
+        }
+        let mut binding =
+            FirewallConfig::new(snapshot, &rules, policy, generation, hash_key)?.binding();
+        binding.snapshot_authority = snapshot.publication_nonce();
+        binding.rules_fingerprint = next_firewall_publication_nonce()
+            .ok_or(FirewallConfigError::PublicationNonceExhausted)?;
+        Ok(Self { rules, binding })
+    }
+
+    /// Borrows the validated configuration without validation or hashing.
+    #[must_use]
+    pub fn config(&self) -> FirewallConfig<'_> {
+        let binding = self.binding;
+        FirewallConfig {
+            rules: &self.rules,
+            policy: binding.policy,
+            generation: binding.generation,
+            hash_key: binding.hash_key,
+            snapshot_authority: binding.snapshot_authority,
+            snapshot_identity: binding.snapshot_identity,
+            rules_identity: self.rules.as_ptr() as usize,
+            rules_len: self.rules.len(),
+            rules_fingerprint: binding.rules_fingerprint,
+        }
+    }
+
+    #[must_use]
+    pub fn rules(&self) -> &[FirewallRule] {
+        &self.rules
+    }
+}
+
 /// Owned publication identity retained by [`FirewallRuntime`].
 ///
 /// The rules pointer is compared as an opaque identity only and is never
 /// dereferenced. Rule evaluation always borrows the current
 /// [`FirewallConfig`] supplied by the caller.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct FirewallConfigBinding {
     policy: FirewallPolicy,
     generation: u64,
@@ -486,6 +592,54 @@ struct FirewallConfigBinding {
     rules_identity: usize,
     rules_len: usize,
     rules_fingerprint: u64,
+}
+
+impl FirewallConfigBinding {
+    #[cfg(test)]
+    const fn publication_nonce(self) -> u64 {
+        if self.rules_fingerprint & VALIDATED_FIREWALL_OWNER_AUTHORITY_BIT == 0 {
+            0
+        } else {
+            self.rules_fingerprint
+        }
+    }
+}
+
+impl std::fmt::Debug for FirewallConfigBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("FirewallConfigBinding")
+            .field("policy", &self.policy)
+            .field("generation", &self.generation)
+            .field("hash_key", &self.hash_key)
+            .field("rules_len", &self.rules_len)
+            .finish_non_exhaustive()
+    }
+}
+
+fn next_firewall_publication_nonce() -> Option<u64> {
+    use std::sync::atomic::AtomicU64;
+
+    static NEXT_FIREWALL_PUBLICATION_NONCE: AtomicU64 =
+        AtomicU64::new(VALIDATED_FIREWALL_OWNER_AUTHORITY_BIT | 1);
+    next_firewall_publication_nonce_from(&NEXT_FIREWALL_PUBLICATION_NONCE)
+}
+
+fn next_firewall_publication_nonce_from(counter: &std::sync::atomic::AtomicU64) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+
+    counter
+        .fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| match current {
+                0 => None,
+                u64::MAX => Some(0),
+                _ => current.checked_add(1),
+            },
+        )
+        .ok()
+        .filter(|nonce| *nonce != 0)
 }
 
 fn rules_fingerprint(rules: &[FirewallRule]) -> u64 {
@@ -1058,6 +1212,33 @@ pub enum FirewallReconcileError {
     GenerationRegression,
     IdentityCollision,
     HashKeyNotRotated,
+    RuntimeEpochExhausted,
+}
+
+/// Exclusive proof that one firewall publication can be committed totally.
+///
+/// The permit owns the exact runtime borrow validated by preflight. It cannot
+/// be applied to another runtime, cloned, or committed twice.
+///
+/// ```compile_fail
+/// use ruster_core::{FirewallConfig, FirewallRuntime};
+///
+/// fn reborrow<'state>(
+///     runtime: &mut FirewallRuntime<'state>,
+///     config: FirewallConfig<'_>,
+/// ) {
+///     let permit = runtime.preflight_reconcile(config).unwrap();
+///     let _ = runtime.counters();
+///     permit.commit();
+/// }
+/// ```
+#[must_use]
+pub struct FirewallReconcilePermit<'runtime, 'state> {
+    runtime: &'runtime mut FirewallRuntime<'state>,
+    next: FirewallConfigBinding,
+    next_runtime_epoch: u64,
+    advance: bool,
+    report: FirewallReconcileReport,
 }
 
 /// Fixed-capacity, worker-local IPv4 flow state.
@@ -1132,6 +1313,60 @@ impl<'state> FirewallRuntime<'state> {
         usable_state_capacity(self.states.len())
     }
 
+    /// Returns whether this runtime is still in its exact constructor state.
+    #[must_use]
+    pub fn is_pristine(&self) -> bool {
+        self.states
+            .iter()
+            .all(|slot| *slot == FirewallStateSlot::default())
+            && self.watermark_ms.is_none()
+            && self.runtime_epoch == 1
+            && self.next_slot_generation == 1
+            && self.occupied_count == 0
+            && self.counters == FirewallCounters::default()
+    }
+
+    /// Validates a publication and exclusively retains this exact runtime.
+    ///
+    /// Dropping the returned permit leaves every runtime byte unchanged.
+    pub fn preflight_reconcile<'runtime>(
+        &'runtime mut self,
+        config: FirewallConfig<'_>,
+    ) -> Result<FirewallReconcilePermit<'runtime, 'state>, FirewallReconcileError> {
+        let next = config.binding();
+        if next.generation < self.binding.generation {
+            return Err(FirewallReconcileError::GenerationRegression);
+        }
+        if next.generation == self.binding.generation {
+            if next != self.binding {
+                return Err(FirewallReconcileError::IdentityCollision);
+            }
+            let next_runtime_epoch = self.runtime_epoch;
+            return Ok(FirewallReconcilePermit {
+                runtime: self,
+                next,
+                next_runtime_epoch,
+                advance: false,
+                report: FirewallReconcileReport { states_flushed: 0 },
+            });
+        }
+        if next.hash_key == self.binding.hash_key {
+            return Err(FirewallReconcileError::HashKeyNotRotated);
+        }
+        let next_runtime_epoch = self
+            .runtime_epoch
+            .checked_add(1)
+            .ok_or(FirewallReconcileError::RuntimeEpochExhausted)?;
+        let states_flushed = self.states.iter().filter(|slot| slot.occupied).count();
+        Ok(FirewallReconcilePermit {
+            runtime: self,
+            next,
+            next_runtime_epoch,
+            advance: true,
+            report: FirewallReconcileReport { states_flushed },
+        })
+    }
+
     /// Binds a validated publication and flushes state on a fresh generation.
     ///
     /// No borrow of `config` or its rules slice is retained after this call.
@@ -1139,26 +1374,8 @@ impl<'state> FirewallRuntime<'state> {
         &mut self,
         config: FirewallConfig<'_>,
     ) -> Result<FirewallReconcileReport, FirewallReconcileError> {
-        let binding = config.binding();
-        if binding.generation < self.binding.generation {
-            return Err(FirewallReconcileError::GenerationRegression);
-        }
-        if binding.generation == self.binding.generation {
-            if binding == self.binding {
-                return Ok(FirewallReconcileReport { states_flushed: 0 });
-            }
-            return Err(FirewallReconcileError::IdentityCollision);
-        }
-        if binding.hash_key == self.binding.hash_key {
-            return Err(FirewallReconcileError::HashKeyNotRotated);
-        }
-        let states_flushed = self.states.iter().filter(|slot| slot.occupied).count();
-        self.states.fill(FirewallStateSlot::default());
-        self.occupied_count = 0;
-        self.binding = binding;
-        self.runtime_epoch = self.runtime_epoch.wrapping_add(1).max(1);
-        self.counters.reconciliations = self.counters.reconciliations.saturating_add(1);
-        Ok(FirewallReconcileReport { states_flushed })
+        self.preflight_reconcile(config)
+            .map(FirewallReconcilePermit::commit)
     }
 
     pub(crate) fn record_config_mismatch(&mut self) {
@@ -1511,10 +1728,28 @@ impl<'state> FirewallRuntime<'state> {
     }
 }
 
+impl FirewallReconcilePermit<'_, '_> {
+    /// Commits the preflighted publication without validation or failure.
+    pub fn commit(self) -> FirewallReconcileReport {
+        if self.advance {
+            self.runtime.states.fill(FirewallStateSlot::default());
+            self.runtime.occupied_count = 0;
+            self.runtime.binding = self.next;
+            self.runtime.runtime_epoch = self.next_runtime_epoch;
+            self.runtime.counters.reconciliations =
+                self.runtime.counters.reconciliations.saturating_add(1);
+        }
+        self.report
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Interface, LocalIpv4Binding, MacAddress, Neighbor, Route};
+    use crate::{
+        Interface, Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, Neighbor, Route,
+        ValidatedForwardingOwner,
+    };
 
     const LAN: IfId = IfId(1);
     const WAN: IfId = IfId(2);
@@ -1556,6 +1791,46 @@ mod tests {
         test(&snapshot)
     }
 
+    fn validated_forwarding_owner() -> ValidatedForwardingOwner {
+        let routes = [
+            Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, LAN, None).unwrap(),
+            Route::new(
+                Ipv4Address::from_octets([0; 4]),
+                0,
+                WAN,
+                Some(Ipv4Address::from_octets([203, 0, 113, 1])),
+            )
+            .unwrap(),
+        ];
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let neighbors = [Neighbor {
+            interface: WAN,
+            target: Ipv4Address::from_octets([203, 0, 113, 1]),
+            mac: MacAddress([2, 0, 0, 0, 0, 3]),
+        }];
+        let bindings = [LocalIpv4Binding {
+            interface: LAN,
+            address: Ipv4Address::from_octets([10, 0, 0, 1]),
+        }];
+        ValidatedForwardingOwner::new(
+            routes.into(),
+            interfaces.into(),
+            neighbors.into(),
+            bindings.into(),
+            Ipv4OriginPolicy::default(),
+        )
+        .unwrap()
+    }
+
     fn any() -> FirewallIpv4Prefix {
         FirewallIpv4Prefix::new(Ipv4Address::from_octets([0; 4]), 0).unwrap()
     }
@@ -1593,6 +1868,248 @@ mod tests {
             destination_port: 443,
             tcp_flags: flags,
         }
+    }
+
+    fn validated_firewall_owner(
+        snapshot: &ForwardingSnapshot<'_>,
+        generation: u64,
+        hash_key: FirewallHashKey,
+    ) -> ValidatedFirewallOwner {
+        ValidatedFirewallOwner::new(
+            snapshot,
+            vec![rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )]
+            .into_boxed_slice(),
+            FirewallPolicy::default(),
+            generation,
+            hash_key,
+        )
+        .unwrap()
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct RuntimeImage {
+        binding: FirewallConfigBinding,
+        states: Vec<FirewallStateSlot>,
+        watermark_ms: Option<u64>,
+        runtime_epoch: u64,
+        next_slot_generation: u64,
+        occupied_count: usize,
+        counters: FirewallCounters,
+    }
+
+    fn runtime_image(runtime: &FirewallRuntime<'_>) -> RuntimeImage {
+        RuntimeImage {
+            binding: runtime.binding,
+            states: runtime.states.to_vec(),
+            watermark_ms: runtime.watermark_ms,
+            runtime_epoch: runtime.runtime_epoch,
+            next_slot_generation: runtime.next_slot_generation,
+            occupied_count: runtime.occupied_count,
+            counters: runtime.counters,
+        }
+    }
+
+    fn assert_reconcile_error_is_atomic(
+        runtime: &mut FirewallRuntime<'_>,
+        config: FirewallConfig<'_>,
+        expected: FirewallReconcileError,
+    ) {
+        let before = runtime_image(runtime);
+        assert_eq!(runtime.preflight_reconcile(config).err(), Some(expected));
+        assert_eq!(runtime_image(runtime), before);
+    }
+
+    #[test]
+    fn validated_firewall_owner_rejects_legacy_snapshot_and_caches_validation() {
+        with_snapshot(|legacy| {
+            assert!(matches!(
+                ValidatedFirewallOwner::new(
+                    legacy,
+                    Vec::new().into_boxed_slice(),
+                    FirewallPolicy::default(),
+                    1,
+                    hash_key(),
+                ),
+                Err(FirewallConfigError::PublicationOwnerRequired)
+            ));
+        });
+
+        FULL_FIREWALL_VALIDATIONS.with(|count| count.set(0));
+        let forwarding = validated_forwarding_owner();
+        let owner = validated_firewall_owner(&forwarding.snapshot(), 1, hash_key());
+        assert_eq!(FULL_FIREWALL_VALIDATIONS.with(std::cell::Cell::get), 1);
+        let first = owner.config();
+        for _ in 0..1_024 {
+            assert_eq!(owner.config().binding(), first.binding());
+        }
+        assert_eq!(FULL_FIREWALL_VALIDATIONS.with(std::cell::Cell::get), 1);
+        assert_eq!(
+            format!("{first:?}"),
+            "FirewallConfig { policy: FirewallPolicy { udp_idle_ttl_ms: 300000, \
+             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000 }, generation: 1, \
+             hash_key: FirewallHashKey([REDACTED]), rules_len: 1, .. }"
+        );
+        assert_eq!(
+            format!("{owner:?}"),
+            "ValidatedFirewallOwner { policy: FirewallPolicy { udp_idle_ttl_ms: 300000, \
+             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000 }, generation: 1, \
+             hash_key: FirewallHashKey([REDACTED]), rules_len: 1, .. }"
+        );
+        assert_eq!(
+            format!("{:?}", first.binding()),
+            "FirewallConfigBinding { policy: FirewallPolicy { udp_idle_ttl_ms: 300000, \
+             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000 }, generation: 1, \
+             hash_key: FirewallHashKey([REDACTED]), rules_len: 1, .. }"
+        );
+        let baseline = first.binding();
+        let mut sensitive = baseline;
+        sensitive.snapshot_authority = u64::MAX;
+        sensitive.snapshot_identity = [usize::MAX; 8];
+        sensitive.rules_identity = usize::MAX;
+        sensitive.rules_fingerprint = u64::MAX;
+        assert_eq!(format!("{baseline:?}"), format!("{sensitive:?}"));
+        assert_eq!(format!("{baseline:#?}"), format!("{sensitive:#?}"));
+        assert!(!format!("{sensitive:?}").contains(&u64::MAX.to_string()));
+        assert!(!format!("{sensitive:#?}").contains(&u64::MAX.to_string()));
+    }
+
+    #[test]
+    fn firewall_publication_nonce_prevents_empty_rule_aba_and_never_wraps() {
+        use std::sync::atomic::AtomicU64;
+
+        let forwarding = validated_forwarding_owner();
+        let snapshot = forwarding.snapshot();
+        let first = ValidatedFirewallOwner::new(
+            &snapshot,
+            Vec::new().into_boxed_slice(),
+            FirewallPolicy::default(),
+            1,
+            hash_key(),
+        )
+        .unwrap();
+        let second = ValidatedFirewallOwner::new(
+            &snapshot,
+            Vec::new().into_boxed_slice(),
+            FirewallPolicy::default(),
+            1,
+            hash_key(),
+        )
+        .unwrap();
+        let first_config = first.config();
+        let identity = first_config.rules_identity;
+        let nonce = first_config.binding().publication_nonce();
+        assert_eq!(identity, second.config().rules_identity);
+        assert_ne!(first_config.binding(), second.config().binding());
+        assert_ne!(nonce & VALIDATED_FIREWALL_OWNER_AUTHORITY_BIT, 0);
+
+        let moved = first;
+        assert_eq!(moved.config().rules_identity, identity);
+        assert_eq!(moved.config().binding().publication_nonce(), nonce);
+
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            next_firewall_publication_nonce_from(&counter),
+            Some(u64::MAX - 1)
+        );
+        assert_eq!(
+            next_firewall_publication_nonce_from(&counter),
+            Some(u64::MAX)
+        );
+        assert_eq!(next_firewall_publication_nonce_from(&counter), None);
+        assert_eq!(next_firewall_publication_nonce_from(&counter), None);
+    }
+
+    #[test]
+    fn firewall_reconcile_preflight_errors_are_atomic() {
+        let forwarding = validated_forwarding_owner();
+        let snapshot = forwarding.snapshot();
+        let current_owner = validated_firewall_owner(&snapshot, 2, hash_key());
+        let regression_owner = validated_firewall_owner(&snapshot, 1, rotated_hash_key());
+        let collision_owner = validated_firewall_owner(&snapshot, 2, hash_key());
+        let unrotated_owner = validated_firewall_owner(&snapshot, 3, hash_key());
+        let rotated_owner = validated_firewall_owner(&snapshot, 3, rotated_hash_key());
+        let mut states = [FirewallStateSlot::default(); 1];
+        let mut runtime = FirewallRuntime::new(current_owner.config(), &mut states);
+
+        assert_reconcile_error_is_atomic(
+            &mut runtime,
+            regression_owner.config(),
+            FirewallReconcileError::GenerationRegression,
+        );
+        assert_reconcile_error_is_atomic(
+            &mut runtime,
+            collision_owner.config(),
+            FirewallReconcileError::IdentityCollision,
+        );
+        assert_reconcile_error_is_atomic(
+            &mut runtime,
+            unrotated_owner.config(),
+            FirewallReconcileError::HashKeyNotRotated,
+        );
+        runtime.runtime_epoch = u64::MAX;
+        assert_reconcile_error_is_atomic(
+            &mut runtime,
+            rotated_owner.config(),
+            FirewallReconcileError::RuntimeEpochExhausted,
+        );
+    }
+
+    #[test]
+    fn firewall_reconcile_permit_is_exact_drop_safe_and_total() {
+        let forwarding = validated_forwarding_owner();
+        let snapshot = forwarding.snapshot();
+        let current_owner = validated_firewall_owner(&snapshot, 1, hash_key());
+        let next_owner = validated_firewall_owner(&snapshot, 2, rotated_hash_key());
+        let current = current_owner.config();
+        let next = next_owner.config();
+        let mut states = [FirewallStateSlot::default(); 2];
+        let mut runtime = FirewallRuntime::new(current, &mut states);
+        runtime.states[0].occupied = true;
+        runtime.occupied_count = 1;
+        runtime.watermark_ms = Some(9);
+        runtime.counters.reconciliations = u64::MAX;
+
+        let before = runtime_image(&runtime);
+        let permit = runtime.preflight_reconcile(next).unwrap();
+        assert_eq!(permit.report, FirewallReconcileReport { states_flushed: 1 });
+        drop(permit);
+        assert_eq!(runtime_image(&runtime), before);
+
+        assert_eq!(
+            runtime.preflight_reconcile(next).unwrap().commit(),
+            FirewallReconcileReport { states_flushed: 1 }
+        );
+        assert!(runtime
+            .states
+            .iter()
+            .all(|slot| *slot == FirewallStateSlot::default()));
+        assert_eq!(runtime.occupied_count, 0);
+        assert_eq!(runtime.runtime_epoch, 2);
+        assert_eq!(runtime.counters.reconciliations, u64::MAX);
+        assert!(runtime.config_matches(&next));
+        assert!(!runtime.config_matches(&current));
+    }
+
+    #[test]
+    fn firewall_same_generation_noop_and_pristine_check_are_exact() {
+        let forwarding = validated_forwarding_owner();
+        let owner = validated_firewall_owner(&forwarding.snapshot(), 1, hash_key());
+        let config = owner.config();
+        let mut states = [FirewallStateSlot::default(); 1];
+        let mut runtime = FirewallRuntime::new(config, &mut states);
+        assert!(runtime.is_pristine());
+        let before = runtime_image(&runtime);
+        assert_eq!(
+            runtime.preflight_reconcile(config).unwrap().commit(),
+            FirewallReconcileReport { states_flushed: 0 }
+        );
+        assert_eq!(runtime_image(&runtime), before);
+        runtime.states[0].slot_generation = 9;
+        assert!(!runtime.is_pristine());
     }
 
     #[test]

@@ -14,21 +14,27 @@ mod resolution;
 mod route;
 
 pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
+#[cfg(feature = "validation-test-hooks")]
+#[doc(hidden)]
+pub use firewall::take_full_firewall_validation_count;
 pub use firewall::{
     validate_firewall_rules, FirewallAction, FirewallAuditBuffer, FirewallAuditRecord,
     FirewallCommitError, FirewallConfig, FirewallConfigError, FirewallConnectionClass,
     FirewallCounters, FirewallDisposition, FirewallFailure, FirewallHashKey, FirewallHashKeyError,
     FirewallInterface, FirewallIpv4Prefix, FirewallIpv4PrefixError, FirewallPlanError,
     FirewallPolicy, FirewallPolicyError, FirewallPolicySource, FirewallPortRange,
-    FirewallPortRangeError, FirewallProtocol, FirewallReconcileError, FirewallReconcileReport,
-    FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow, FirewallRule, FirewallRuleId,
-    FirewallRuntime, FirewallStateSlot, FirewallTcpPhase, FirewallVerdict,
-    FIREWALL_MAX_IDLE_TTL_MS, FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS,
+    FirewallPortRangeError, FirewallProtocol, FirewallReconcileError, FirewallReconcilePermit,
+    FirewallReconcileReport, FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow, FirewallRule,
+    FirewallRuleId, FirewallRuntime, FirewallStateSlot, FirewallTcpPhase, FirewallVerdict,
+    ValidatedFirewallOwner, FIREWALL_MAX_IDLE_TTL_MS, FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS,
     FIREWALL_TCP_ACTIVE_MIN_IDLE_TTL_MS, FIREWALL_TCP_OPENING_DEFAULT_IDLE_TTL_MS,
     FIREWALL_TCP_OPENING_MIN_IDLE_TTL_MS, FIREWALL_UDP_DEFAULT_IDLE_TTL_MS,
     FIREWALL_UDP_MIN_IDLE_TTL_MS,
 };
 pub use fixed_directory::{DirectoryBucket, DirectoryNode, PortOwnerSlot};
+#[cfg(feature = "validation-test-hooks")]
+#[doc(hidden)]
+pub use forwarding::take_full_forwarding_validation_count;
 pub use forwarding::{
     forward_batch, forward_batch_with_firewall, forward_batch_with_firewall_and_icmpv4_errors,
     forward_batch_with_firewall_and_icmpv4_errors_audited, forward_batch_with_firewall_audited,
@@ -41,7 +47,7 @@ pub use forwarding::{
     forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors, forward_batch_with_resolution,
     forward_batch_with_resolution_and_icmpv4_errors, BatchReport, DropReason, ForwardingSnapshot,
     Ipv4OriginPolicy, Ipv4OriginPolicyError, Nat44Icmpv4Disposition, NoTrace, SnapshotError,
-    TraceEvent, TraceSink,
+    TraceEvent, TraceSink, ValidatedForwardingOwner, ValidatedForwardingOwnerError,
 };
 pub use generated::{
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,
@@ -52,10 +58,11 @@ pub use icmpv4_error::{
     ExecuteIcmpv4TimeExceededError, GeneratedIcmpv4Report, GeneratedIcmpv4Trace,
     GeneratedIcmpv4TraceSink, Icmpv4ErrorAction, Icmpv4ErrorActionSlot, Icmpv4ErrorBuildError,
     Icmpv4ErrorCounters, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorPolicy,
-    Icmpv4ErrorPolicyError, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Icmpv4TimeExceededAction,
-    Icmpv4TimeExceededBuildError, Icmpv4TimeExceededDisposition, NoGeneratedIcmpv4Trace,
-    ICMPV4_ERROR_MAX_FRAME_LEN, ICMPV4_ERROR_MAX_QUOTE_LEN, ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN,
-    ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN,
+    Icmpv4ErrorPolicyError, Icmpv4ErrorPublicationError, Icmpv4ErrorPublicationPermit,
+    Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot,
+    Icmpv4TimeExceededAction, Icmpv4TimeExceededBuildError, Icmpv4TimeExceededDisposition,
+    NoGeneratedIcmpv4Trace, ICMPV4_ERROR_MAX_FRAME_LEN, ICMPV4_ERROR_MAX_QUOTE_LEN,
+    ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN, ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN,
 };
 pub use io::{
     BatchCompletion, ConsumeReason, PacketBatch, PacketIo, PacketLease, PacketSlot,
@@ -88,6 +95,7 @@ pub use resolution::{
     ResolutionFailureDispatchError, ResolutionFailureDispatchReport, ResolutionFailureHoldPhase,
     ResolutionFailureHoldSlot, ResolutionFailureTrace, ResolutionFailureTraceSink,
     ResolutionGenerationToken, ResolutionPhase, ResolutionPolicy, ResolutionPolicyError,
+    ResolutionPublicationError, ResolutionPublicationPermit, ResolutionPublicationReport,
     ResolutionResult, ResolutionRuntime, ResolutionStateSlot, ResolutionStatus,
     ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTrace, ResolutionTimerTraceSink,
     StaticReconcileReport, ARP_REQUEST_FRAME_LEN,

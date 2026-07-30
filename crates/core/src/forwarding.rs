@@ -367,7 +367,7 @@ impl Default for Ipv4OriginPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ForwardingSnapshot<'a> {
     pub(crate) routes: &'a [Route],
     pub(crate) interfaces: &'a [Interface],
@@ -376,6 +376,75 @@ pub struct ForwardingSnapshot<'a> {
     pub(crate) ipv4_origin: Ipv4OriginPolicy,
     authority: u64,
     identity: [usize; 8],
+}
+
+const VALIDATED_OWNER_AUTHORITY_BIT: u64 = 1 << 63;
+
+impl std::fmt::Debug for ForwardingSnapshot<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ForwardingSnapshot")
+            .field("routes_len", &self.routes.len())
+            .field("interfaces_len", &self.interfaces.len())
+            .field("neighbors_len", &self.neighbors.len())
+            .field("local_ipv4_len", &self.local_ipv4.len())
+            .field("ipv4_origin", &self.ipv4_origin)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Immutable validated forwarding tables owned by the cold publication path.
+///
+/// Construction consumes caller-allocated boxes and validates them once.
+/// [`Self::snapshot`] is then an infallible O(1) borrow scoped to this owner.
+///
+/// ```compile_fail
+/// use ruster_core::{ForwardingSnapshot, ValidatedForwardingOwner};
+///
+/// fn escape(owner: &ValidatedForwardingOwner) -> ForwardingSnapshot<'static> {
+///     owner.snapshot()
+/// }
+/// ```
+pub struct ValidatedForwardingOwner {
+    routes: Box<[Route]>,
+    interfaces: Box<[Interface]>,
+    neighbors: Box<[Neighbor]>,
+    local_ipv4: Box<[LocalIpv4Binding]>,
+    ipv4_origin: Ipv4OriginPolicy,
+    authority: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ValidatedForwardingOwnerError {
+    Snapshot(SnapshotError),
+    PublicationNonceExhausted,
+}
+
+impl std::fmt::Debug for ValidatedForwardingOwner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ValidatedForwardingOwner")
+            .field("routes_len", &self.routes.len())
+            .field("interfaces_len", &self.interfaces.len())
+            .field("neighbors_len", &self.neighbors.len())
+            .field("local_ipv4_len", &self.local_ipv4.len())
+            .field("ipv4_origin", &self.ipv4_origin)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(test, feature = "validation-test-hooks"))]
+std::thread_local! {
+    static FULL_FORWARDING_VALIDATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Returns and resets the current thread's full forwarding validation count.
+#[cfg(feature = "validation-test-hooks")]
+#[doc(hidden)]
+pub fn take_full_forwarding_validation_count() -> usize {
+    FULL_FORWARDING_VALIDATIONS.with(|count| count.replace(0))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -408,6 +477,8 @@ impl<'a> ForwardingSnapshot<'a> {
         local_ipv4: &'a [LocalIpv4Binding],
         ipv4_origin: Ipv4OriginPolicy,
     ) -> Result<Self, SnapshotError> {
+        #[cfg(any(test, feature = "validation-test-hooks"))]
+        FULL_FORWARDING_VALIDATIONS.with(|count| count.set(count.get().saturating_add(1)));
         for (index, route) in routes.iter().enumerate() {
             if routes[..index].iter().any(|candidate| {
                 candidate.prefix() == route.prefix() && candidate.prefix_len() == route.prefix_len()
@@ -492,6 +563,14 @@ impl<'a> ForwardingSnapshot<'a> {
         self.identity
     }
 
+    pub(crate) const fn publication_nonce(&self) -> u64 {
+        if self.authority & VALIDATED_OWNER_AUTHORITY_BIT == 0 {
+            0
+        } else {
+            self.authority
+        }
+    }
+
     pub(crate) fn resolution_action_authority(
         &self,
         action: ArpRequestAction,
@@ -544,6 +623,104 @@ impl<'a> ForwardingSnapshot<'a> {
     }
 }
 
+impl ValidatedForwardingOwner {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        routes: Box<[Route]>,
+        interfaces: Box<[Interface]>,
+        neighbors: Box<[Neighbor]>,
+        local_ipv4: Box<[LocalIpv4Binding]>,
+        ipv4_origin: Ipv4OriginPolicy,
+    ) -> Result<Self, ValidatedForwardingOwnerError> {
+        ForwardingSnapshot::with_ipv4_origin_policy(
+            &routes,
+            &interfaces,
+            &neighbors,
+            &local_ipv4,
+            ipv4_origin,
+        )
+        .map_err(ValidatedForwardingOwnerError::Snapshot)?;
+        let authority = next_publication_nonce()
+            .ok_or(ValidatedForwardingOwnerError::PublicationNonceExhausted)?;
+        Ok(Self {
+            routes,
+            interfaces,
+            neighbors,
+            local_ipv4,
+            ipv4_origin,
+            authority,
+        })
+    }
+
+    /// Borrows a coherent snapshot without validation, hashing, or allocation.
+    #[must_use]
+    pub fn snapshot(&self) -> ForwardingSnapshot<'_> {
+        let identity = [
+            self.routes.as_ptr() as usize,
+            self.routes.len(),
+            self.interfaces.as_ptr() as usize,
+            self.interfaces.len(),
+            self.neighbors.as_ptr() as usize,
+            self.neighbors.len(),
+            self.local_ipv4.as_ptr() as usize,
+            self.local_ipv4.len(),
+        ];
+        ForwardingSnapshot {
+            routes: &self.routes,
+            interfaces: &self.interfaces,
+            neighbors: &self.neighbors,
+            local_ipv4: &self.local_ipv4,
+            ipv4_origin: self.ipv4_origin,
+            authority: self.authority,
+            identity,
+        }
+    }
+
+    #[must_use]
+    pub fn routes(&self) -> &[Route] {
+        &self.routes
+    }
+
+    #[must_use]
+    pub fn interfaces(&self) -> &[Interface] {
+        &self.interfaces
+    }
+
+    #[must_use]
+    pub fn neighbors(&self) -> &[Neighbor] {
+        &self.neighbors
+    }
+
+    #[must_use]
+    pub fn local_ipv4(&self) -> &[LocalIpv4Binding] {
+        &self.local_ipv4
+    }
+}
+
+fn next_publication_nonce() -> Option<u64> {
+    use std::sync::atomic::AtomicU64;
+
+    static NEXT_PUBLICATION_NONCE: AtomicU64 = AtomicU64::new(VALIDATED_OWNER_AUTHORITY_BIT | 1);
+    next_publication_nonce_from(&NEXT_PUBLICATION_NONCE)
+}
+
+fn next_publication_nonce_from(counter: &std::sync::atomic::AtomicU64) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+
+    counter
+        .fetch_update(
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+            |current| match current {
+                0 => None,
+                u64::MAX => Some(0),
+                _ => current.checked_add(1),
+            },
+        )
+        .ok()
+        .filter(|nonce| *nonce != 0)
+}
+
 fn calculate_snapshot_authority(
     routes: &[Route],
     interfaces: &[Interface],
@@ -593,7 +770,7 @@ fn calculate_snapshot_authority(
             hash = mix(hash, u64::from(octet));
         }
     }
-    mix(hash, u64::from(ipv4_origin.default_ttl()))
+    mix(hash, u64::from(ipv4_origin.default_ttl())) & !VALIDATED_OWNER_AUTHORITY_BIT
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4921,8 +5098,9 @@ fn apply_icmpv4_echo_reply(
 #[cfg(test)]
 mod tests {
     use super::{
-        decide_ipv4, forward_batch, forward_batch_with_nat44_udp_and_tcp_and_firewall, BatchReport,
-        DropReason,
+        decide_ipv4, forward_batch, forward_batch_with_nat44_udp_and_tcp_and_firewall,
+        next_publication_nonce_from, BatchReport, DropReason, Ipv4OriginPolicy,
+        ValidatedForwardingOwner, FULL_FORWARDING_VALIDATIONS, VALIDATED_OWNER_AUTHORITY_BIT,
     };
     use crate::{
         internet_checksum, ipv4_header_checksum, BatchCompletion, DirectoryBucket, DirectoryNode,
@@ -4948,6 +5126,17 @@ mod tests {
     const REMOTE: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 20]);
     const ROUTER: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 1]);
 
+    fn empty_validated_owner() -> ValidatedForwardingOwner {
+        ValidatedForwardingOwner::new(
+            Vec::new().into_boxed_slice(),
+            Vec::new().into_boxed_slice(),
+            Vec::new().into_boxed_slice(),
+            Vec::new().into_boxed_slice(),
+            Ipv4OriginPolicy::default(),
+        )
+        .unwrap()
+    }
+
     fn report(
         core: (usize, usize, usize, usize),
         backend: (usize, usize, usize, usize),
@@ -4967,6 +5156,98 @@ mod tests {
                 error: None,
             },
         }
+    }
+
+    #[test]
+    fn validated_owner_snapshot_is_o1_lifetime_bound_and_move_stable() {
+        FULL_FORWARDING_VALIDATIONS.with(|count| count.set(0));
+        let owner = empty_validated_owner();
+        assert_eq!(FULL_FORWARDING_VALIDATIONS.with(std::cell::Cell::get), 1);
+        let first = owner.snapshot();
+        let identity = first.identity();
+        let publication_nonce = first.publication_nonce();
+        for _ in 0..1_024 {
+            let snapshot = owner.snapshot();
+            assert_eq!(snapshot.identity(), identity);
+            assert_eq!(snapshot.publication_nonce(), publication_nonce);
+        }
+        assert_eq!(FULL_FORWARDING_VALIDATIONS.with(std::cell::Cell::get), 1);
+
+        let moved = owner;
+        let moved_snapshot = moved.snapshot();
+        assert_eq!(moved_snapshot.identity(), identity);
+        assert_eq!(moved_snapshot.publication_nonce(), publication_nonce);
+    }
+
+    #[test]
+    fn validated_owner_nonce_distinguishes_equal_empty_storage_without_identity_leak() {
+        let first = empty_validated_owner();
+        let second = empty_validated_owner();
+        let first_snapshot = first.snapshot();
+        let second_snapshot = second.snapshot();
+        assert!(first_snapshot.routes.as_ptr() == second_snapshot.routes.as_ptr());
+        assert!(first_snapshot.interfaces.as_ptr() == second_snapshot.interfaces.as_ptr());
+        assert!(first_snapshot.neighbors.as_ptr() == second_snapshot.neighbors.as_ptr());
+        assert!(first_snapshot.local_ipv4.as_ptr() == second_snapshot.local_ipv4.as_ptr());
+        assert_eq!(first_snapshot.identity(), second_snapshot.identity());
+        assert_ne!(
+            first_snapshot.publication_nonce(),
+            second_snapshot.publication_nonce()
+        );
+        assert_ne!(
+            first_snapshot.publication_nonce() & VALIDATED_OWNER_AUTHORITY_BIT,
+            0
+        );
+        assert_eq!(
+            format!("{first_snapshot:?}"),
+            "ForwardingSnapshot { routes_len: 0, interfaces_len: 0, neighbors_len: 0, \
+             local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64 }, .. }"
+        );
+        assert_eq!(
+            format!("{first:?}"),
+            "ValidatedForwardingOwner { routes_len: 0, interfaces_len: 0, neighbors_len: 0, \
+             local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64 }, .. }"
+        );
+    }
+
+    #[test]
+    fn publication_nonce_is_monotonic_and_never_wraps() {
+        use std::sync::atomic::AtomicU64;
+
+        let counter = AtomicU64::new(1);
+        assert_eq!(next_publication_nonce_from(&counter), Some(1));
+        assert_eq!(next_publication_nonce_from(&counter), Some(2));
+
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(next_publication_nonce_from(&counter), Some(u64::MAX - 1));
+        assert_eq!(next_publication_nonce_from(&counter), Some(u64::MAX));
+        assert_eq!(next_publication_nonce_from(&counter), None);
+        assert_eq!(next_publication_nonce_from(&counter), None);
+    }
+
+    #[test]
+    fn legacy_snapshot_identity_keeps_all_pointer_and_length_facts() {
+        let interfaces = [Interface {
+            id: LAN,
+            mac: MacAddress([2, 0, 0, 0, 0, 1]),
+        }];
+        let neighbors = [crate::Neighbor {
+            interface: LAN,
+            target: Ipv4Address::from_octets([10, 0, 0, 2]),
+            mac: MacAddress([2, 0, 0, 0, 0, 2]),
+        }];
+        let bindings = [LocalIpv4Binding {
+            interface: LAN,
+            address: Ipv4Address::from_octets([10, 0, 0, 1]),
+        }];
+        let empty =
+            ForwardingSnapshot::new(&[], &interfaces, &neighbors[..0], &bindings[..0]).unwrap();
+        let populated = ForwardingSnapshot::new(&[], &interfaces, &neighbors, &bindings).unwrap();
+        assert!(empty.neighbors.as_ptr() == populated.neighbors.as_ptr());
+        assert!(empty.local_ipv4.as_ptr() == populated.local_ipv4.as_ptr());
+        assert_ne!(empty.identity(), populated.identity());
+        assert_eq!(empty.publication_nonce(), 0);
+        assert_eq!(populated.publication_nonce(), 0);
     }
 
     #[test]

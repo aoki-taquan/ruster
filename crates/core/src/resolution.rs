@@ -227,6 +227,48 @@ pub struct StaticReconcileReport {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ResolutionPublicationError {
+    ActionQueueCapacity,
+    ActionQueueHead,
+    ActionQueueWindow,
+    PendingStateCount,
+    PendingFailureHoldCount,
+    RuntimeEpochExhausted,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResolutionPublicationReport {
+    pub states_flushed: usize,
+    pub actions_flushed: usize,
+    pub dynamic_neighbors_flushed: usize,
+    pub failure_holds_flushed: usize,
+}
+
+/// Exclusive proof that old resolution authority can be flushed totally.
+///
+/// A fresh publication conservatively flushes all learned and queued
+/// resolution authority. The permit therefore retains no target-owner borrow
+/// and cannot become self-referential when that owner moves into its active
+/// slot.
+///
+/// ```compile_fail
+/// use ruster_core::ResolutionRuntime;
+///
+/// fn reborrow<'storage>(runtime: &mut ResolutionRuntime<'storage>) {
+///     let permit = runtime.preflight_publication().unwrap();
+///     let _ = runtime.pending_actions();
+///     permit.commit();
+/// }
+/// ```
+#[must_use]
+pub struct ResolutionPublicationPermit<'runtime, 'storage> {
+    runtime: &'runtime mut ResolutionRuntime<'storage>,
+    next_runtime_epoch: u128,
+    preview: ResolutionPublicationReport,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResolutionResult {
     Queued,
     RetryQueued,
@@ -515,6 +557,7 @@ pub struct ResolutionRuntime<'a> {
     poll_cursor: usize,
     failure_cursor: usize,
     last_now: Option<MonotonicMillis>,
+    publication_epoch: u128,
     counters: ResolutionCounters,
     failure_counters: ResolutionFailureCounters,
     _worker_local: PhantomData<Rc<()>>,
@@ -571,6 +614,7 @@ impl<'a> ResolutionRuntime<'a> {
             poll_cursor: 0,
             failure_cursor: 0,
             last_now: None,
+            publication_epoch: 1,
             counters: ResolutionCounters::default(),
             failure_counters: ResolutionFailureCounters::default(),
             _worker_local: PhantomData,
@@ -583,6 +627,94 @@ impl<'a> ResolutionRuntime<'a> {
             .iter()
             .filter(|slot| slot.occupied)
             .count()
+    }
+
+    #[must_use]
+    pub const fn policy(&self) -> ResolutionPolicy {
+        self.policy
+    }
+
+    #[must_use]
+    pub const fn state_capacity(&self) -> usize {
+        self.states.len()
+    }
+
+    #[must_use]
+    pub const fn action_capacity(&self) -> usize {
+        self.actions.len()
+    }
+
+    #[must_use]
+    pub const fn dynamic_neighbor_capacity(&self) -> usize {
+        self.dynamic_neighbors.len()
+    }
+
+    #[must_use]
+    pub const fn failure_hold_capacity(&self) -> usize {
+        self.failure_holds.len()
+    }
+
+    /// Returns whether this runtime is still in its exact constructor state.
+    #[must_use]
+    pub fn is_pristine(&self) -> bool {
+        self.states
+            .iter()
+            .all(|slot| *slot == ResolutionStateSlot::EMPTY)
+            && self
+                .actions
+                .iter()
+                .all(|slot| *slot == ResolutionActionSlot::EMPTY)
+            && self
+                .dynamic_neighbors
+                .iter()
+                .all(|slot| *slot == DynamicNeighborSlot::EMPTY)
+            && self
+                .failure_holds
+                .iter()
+                .all(|slot| *slot == ResolutionFailureHoldSlot::EMPTY)
+            && self.head == 0
+            && self.len == 0
+            && self.pending_state_count == 0
+            && self.pending_failure_hold_count == 0
+            && self.poll_cursor == 0
+            && self.failure_cursor == 0
+            && self.last_now.is_none()
+            && self.publication_epoch == 1
+            && self.counters == ResolutionCounters::default()
+            && self.failure_counters == ResolutionFailureCounters::default()
+    }
+
+    /// Validates queue/accounting invariants and previews one publication.
+    ///
+    /// Preflight never mutates runtime state. The returned permit retains the
+    /// exact runtime exclusively until it is committed or dropped.
+    pub fn preflight_publication<'runtime>(
+        &'runtime mut self,
+    ) -> Result<ResolutionPublicationPermit<'runtime, 'a>, ResolutionPublicationError> {
+        self.validate_publication_invariants()?;
+        let next_runtime_epoch = self
+            .publication_epoch
+            .checked_add(1)
+            .ok_or(ResolutionPublicationError::RuntimeEpochExhausted)?;
+        let preview = ResolutionPublicationReport {
+            states_flushed: self.states.iter().filter(|state| state.occupied).count(),
+            actions_flushed: self.len,
+            dynamic_neighbors_flushed: self
+                .dynamic_neighbors
+                .iter()
+                .filter(|slot| slot.occupied)
+                .count(),
+            failure_holds_flushed: self
+                .failure_holds
+                .iter()
+                .filter(|hold| hold.phase != ResolutionFailureHoldPhase::Empty)
+                .count(),
+        };
+        Ok(ResolutionPublicationPermit {
+            runtime: self,
+            next_runtime_epoch,
+            preview,
+        })
     }
 
     /// Removes worker-local state shadowed by a newly published static set.
@@ -646,6 +778,49 @@ impl<'a> ResolutionRuntime<'a> {
         &mut self,
         snapshot: &crate::ForwardingSnapshot<'_>,
     ) -> StaticReconcileReport {
+        self.commit_publication(snapshot)
+    }
+
+    fn validate_publication_invariants(&self) -> Result<(), ResolutionPublicationError> {
+        if self.len > self.actions.len() {
+            return Err(ResolutionPublicationError::ActionQueueCapacity);
+        }
+        if self.actions.is_empty() {
+            if self.head != 0 || self.len != 0 {
+                return Err(ResolutionPublicationError::ActionQueueHead);
+            }
+        } else if self.head >= self.actions.len() {
+            return Err(ResolutionPublicationError::ActionQueueHead);
+        }
+        for index in 0..self.actions.len() {
+            let distance = (index + self.actions.len() - self.head) % self.actions.len();
+            if self.actions[index].0.is_some() != (distance < self.len) {
+                return Err(ResolutionPublicationError::ActionQueueWindow);
+            }
+        }
+        let pending_states = self
+            .states
+            .iter()
+            .filter(|state| state_is_pending(**state))
+            .count();
+        if pending_states != self.pending_state_count {
+            return Err(ResolutionPublicationError::PendingStateCount);
+        }
+        let pending_holds = self
+            .failure_holds
+            .iter()
+            .filter(|hold| hold.phase != ResolutionFailureHoldPhase::Empty)
+            .count();
+        if pending_holds != self.pending_failure_hold_count {
+            return Err(ResolutionPublicationError::PendingFailureHoldCount);
+        }
+        Ok(())
+    }
+
+    fn commit_publication(
+        &mut self,
+        snapshot: &crate::ForwardingSnapshot<'_>,
+    ) -> StaticReconcileReport {
         let mut report = StaticReconcileReport::default();
         for slot in &mut *self.dynamic_neighbors {
             if slot.occupied
@@ -654,83 +829,94 @@ impl<'a> ResolutionRuntime<'a> {
                 })
             {
                 *slot = DynamicNeighborSlot::EMPTY;
-                report.dynamic_removed += 1;
+                report.dynamic_removed = report.dynamic_removed.saturating_add(1);
             }
         }
         for index in 0..self.states.len() {
-            if !self.states[index].occupied || self.states[index].phase == ResolutionPhase::Cooldown
-            {
+            let state = self.states[index];
+            if !state_is_pending(state) {
                 continue;
             }
-            match snapshot.resolution_action_authority(self.states[index].action) {
-                crate::forwarding::ResolutionActionAuthority::Valid => {}
+            let authority = snapshot.resolution_action_authority(state.action);
+            if authority == crate::forwarding::ResolutionActionAuthority::Valid {
+                continue;
+            }
+            if state.attempts != 0 {
+                report.cooldowns_retained = report.cooldowns_retained.saturating_add(1);
+            }
+            if cancel_state(&mut self.states[index]) {
+                self.pending_state_count = self.pending_state_count.saturating_sub(1);
+            }
+            match authority {
                 crate::forwarding::ResolutionActionAuthority::StaticResolved => {
-                    if self.states[index].attempts != 0 {
-                        report.cooldowns_retained += 1;
-                    }
-                    self.cancel_state_at(index);
-                    report.states_removed += 1;
+                    report.states_removed = report.states_removed.saturating_add(1);
                 }
                 crate::forwarding::ResolutionActionAuthority::Invalid => {
-                    if self.states[index].attempts != 0 {
-                        report.cooldowns_retained += 1;
-                    }
-                    self.cancel_state_at(index);
-                    report.invalid_states_removed += 1;
+                    report.invalid_states_removed = report.invalid_states_removed.saturating_add(1);
                 }
+                crate::forwarding::ResolutionActionAuthority::Valid => {}
             }
         }
-        let mut static_removed = 0;
-        let mut invalid_removed = 0;
-        self.compact_queued_actions(|queued| {
-            match snapshot.resolution_action_authority(queued.action) {
-                crate::forwarding::ResolutionActionAuthority::Valid => false,
-                crate::forwarding::ResolutionActionAuthority::StaticResolved => {
-                    static_removed += 1;
-                    true
-                }
-                crate::forwarding::ResolutionActionAuthority::Invalid => {
-                    invalid_removed += 1;
-                    true
-                }
-            }
-        });
+        let (static_removed, invalid_removed) = self.compact_publication_actions(snapshot);
         report.actions_removed = static_removed;
         report.invalid_actions_removed = invalid_removed;
         for index in 0..self.failure_holds.len() {
             let hold = self.failure_holds[index];
-            if hold.phase == ResolutionFailureHoldPhase::Empty {
+            if hold.phase == ResolutionFailureHoldPhase::Empty
+                || publication_hold_valid(snapshot, hold)
+            {
                 continue;
             }
-            let forward_valid =
-                crate::route::lookup(snapshot.routes, hold.original_destination).is_some_and(
-                    |route| {
-                        route.egress() == hold.forward.egress
-                            && route.next_hop().is_none()
-                            && hold.forward.target == hold.original_destination
-                            && route.prefix() == hold.forward_prefix
-                            && route.prefix_len() == hold.forward_prefix_len
-                    },
-                ) && snapshot.interfaces.iter().any(|interface| {
-                    interface.id == hold.forward.egress && interface.mac == hold.forward_source_mac
-                }) && snapshot.local_ipv4.iter().any(|binding| {
-                    binding.interface == hold.forward.egress
-                        && binding.address == hold.forward_source_ip
-                }) && !snapshot.neighbors.iter().any(|neighbor| {
-                    neighbor.interface == hold.forward.egress
-                        && neighbor.target == hold.forward.target
-                }) && !host_failure_target_forbidden(
-                    snapshot,
-                    hold.forward.egress,
-                    hold.forward.target,
-                    hold.forward_source_ip,
-                );
-            if !forward_valid {
-                self.clear_failure_hold(index);
-                self.failure_counters.cancelled += 1;
-            }
+            self.failure_holds[index] = ResolutionFailureHoldSlot::EMPTY;
+            self.pending_failure_hold_count = self.pending_failure_hold_count.saturating_sub(1);
+            self.failure_counters.cancelled = self.failure_counters.cancelled.saturating_add(1);
         }
         report
+    }
+
+    fn compact_publication_actions(
+        &mut self,
+        snapshot: &crate::ForwardingSnapshot<'_>,
+    ) -> (usize, usize) {
+        if self.actions.is_empty() {
+            self.head = 0;
+            self.len = 0;
+            return (0, 0);
+        }
+        let capacity = self.actions.len();
+        let head = self.head % capacity;
+        let old_len = self.len.min(capacity);
+        let mut retained = 0usize;
+        let mut static_removed = 0usize;
+        let mut invalid_removed = 0usize;
+        for offset in 0..old_len {
+            let read_index = (head + offset) % capacity;
+            let Some(queued) = self.actions[read_index].0.take() else {
+                continue;
+            };
+            match snapshot.resolution_action_authority(queued.action) {
+                crate::forwarding::ResolutionActionAuthority::Valid => {
+                    let write_index = (head + retained) % capacity;
+                    self.actions[write_index].0 = Some(queued);
+                    retained = retained.saturating_add(1);
+                }
+                crate::forwarding::ResolutionActionAuthority::StaticResolved => {
+                    static_removed = static_removed.saturating_add(1);
+                }
+                crate::forwarding::ResolutionActionAuthority::Invalid => {
+                    invalid_removed = invalid_removed.saturating_add(1);
+                }
+            }
+        }
+        for index in 0..capacity {
+            let distance = (index + capacity - head) % capacity;
+            if distance >= retained {
+                self.actions[index] = ResolutionActionSlot::EMPTY;
+            }
+        }
+        self.head = if retained == 0 { 0 } else { head };
+        self.len = retained;
+        (static_removed, invalid_removed)
     }
 
     #[must_use]
@@ -1077,7 +1263,9 @@ impl<'a> ResolutionRuntime<'a> {
         let mut retained = 0;
         for read in 0..old_len {
             let read_index = (self.head + read) % self.actions.len();
-            let queued = self.actions[read_index].0.take().expect("queued action");
+            let Some(queued) = self.actions[read_index].0.take() else {
+                continue;
+            };
             if remove(queued) {
                 continue;
             }
@@ -1086,7 +1274,7 @@ impl<'a> ResolutionRuntime<'a> {
             retained += 1;
         }
         self.len = retained;
-        old_len - retained
+        old_len.saturating_sub(retained)
     }
 
     fn cancel_state_at(&mut self, index: usize) {
@@ -1407,6 +1595,57 @@ impl<'a> ResolutionRuntime<'a> {
         report.pending = self.pending_states();
         Ok(report)
     }
+}
+
+impl ResolutionPublicationPermit<'_, '_> {
+    #[must_use]
+    pub const fn preview(&self) -> ResolutionPublicationReport {
+        self.preview
+    }
+
+    /// Flushes all old publication authority without failure.
+    pub fn commit(self) -> ResolutionPublicationReport {
+        self.runtime.states.fill(ResolutionStateSlot::EMPTY);
+        self.runtime.actions.fill(ResolutionActionSlot::EMPTY);
+        self.runtime
+            .dynamic_neighbors
+            .fill(DynamicNeighborSlot::EMPTY);
+        self.runtime
+            .failure_holds
+            .fill(ResolutionFailureHoldSlot::EMPTY);
+        self.runtime.head = 0;
+        self.runtime.len = 0;
+        self.runtime.pending_state_count = 0;
+        self.runtime.pending_failure_hold_count = 0;
+        self.runtime.poll_cursor = 0;
+        self.runtime.failure_cursor = 0;
+        self.runtime.publication_epoch = self.next_runtime_epoch;
+        self.preview
+    }
+}
+
+fn publication_hold_valid(
+    snapshot: &crate::ForwardingSnapshot<'_>,
+    hold: ResolutionFailureHoldSlot,
+) -> bool {
+    crate::route::lookup(snapshot.routes, hold.original_destination).is_some_and(|route| {
+        route.egress() == hold.forward.egress
+            && route.next_hop().is_none()
+            && hold.forward.target == hold.original_destination
+            && route.prefix() == hold.forward_prefix
+            && route.prefix_len() == hold.forward_prefix_len
+    }) && snapshot.interfaces.iter().any(|interface| {
+        interface.id == hold.forward.egress && interface.mac == hold.forward_source_mac
+    }) && snapshot.local_ipv4.iter().any(|binding| {
+        binding.interface == hold.forward.egress && binding.address == hold.forward_source_ip
+    }) && !snapshot.neighbors.iter().any(|neighbor| {
+        neighbor.interface == hold.forward.egress && neighbor.target == hold.forward.target
+    }) && !host_failure_target_forbidden(
+        snapshot,
+        hold.forward.egress,
+        hold.forward.target,
+        hold.forward_source_ip,
+    )
 }
 
 const fn state_is_pending(state: ResolutionStateSlot) -> bool {
@@ -1988,10 +2227,256 @@ mod tests {
         );
     }
 
+    #[derive(Debug, Eq, PartialEq)]
+    struct RuntimeImage {
+        policy: ResolutionPolicy,
+        states: Vec<ResolutionStateSlot>,
+        actions: Vec<ResolutionActionSlot>,
+        dynamic_neighbors: Vec<DynamicNeighborSlot>,
+        failure_holds: Vec<ResolutionFailureHoldSlot>,
+        head: usize,
+        len: usize,
+        pending_state_count: usize,
+        pending_failure_hold_count: usize,
+        poll_cursor: usize,
+        failure_cursor: usize,
+        last_now: Option<MonotonicMillis>,
+        publication_epoch: u128,
+        counters: ResolutionCounters,
+        failure_counters: ResolutionFailureCounters,
+    }
+
+    fn runtime_image(runtime: &ResolutionRuntime<'_>) -> RuntimeImage {
+        RuntimeImage {
+            policy: runtime.policy,
+            states: runtime.states.to_vec(),
+            actions: runtime.actions.to_vec(),
+            dynamic_neighbors: runtime.dynamic_neighbors.to_vec(),
+            failure_holds: runtime.failure_holds.to_vec(),
+            head: runtime.head,
+            len: runtime.len,
+            pending_state_count: runtime.pending_state_count,
+            pending_failure_hold_count: runtime.pending_failure_hold_count,
+            poll_cursor: runtime.poll_cursor,
+            failure_cursor: runtime.failure_cursor,
+            last_now: runtime.last_now,
+            publication_epoch: runtime.publication_epoch,
+            counters: runtime.counters,
+            failure_counters: runtime.failure_counters,
+        }
+    }
+
+    fn assert_publication_error_is_atomic(
+        runtime: &mut ResolutionRuntime<'_>,
+        expected: ResolutionPublicationError,
+    ) {
+        let before = runtime_image(runtime);
+        assert_eq!(runtime.preflight_publication().err(), Some(expected));
+        assert_eq!(runtime_image(runtime), before);
+    }
+
     #[derive(Default)]
     struct TimerTrace {
         events: [Option<ResolutionTimerTrace>; 16],
         len: usize,
+    }
+
+    #[test]
+    fn publication_preflight_errors_leave_runtime_exactly_unchanged() {
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let mut states = [];
+        let mut actions = [];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.len = 1;
+        assert_publication_error_is_atomic(
+            &mut runtime,
+            ResolutionPublicationError::ActionQueueCapacity,
+        );
+
+        let mut states = [];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.head = 1;
+        assert_publication_error_is_atomic(
+            &mut runtime,
+            ResolutionPublicationError::ActionQueueHead,
+        );
+
+        let mut states = [];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.len = 1;
+        assert_publication_error_is_atomic(
+            &mut runtime,
+            ResolutionPublicationError::ActionQueueWindow,
+        );
+
+        let mut states = [];
+        let mut actions = [];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.pending_state_count = 1;
+        assert_publication_error_is_atomic(
+            &mut runtime,
+            ResolutionPublicationError::PendingStateCount,
+        );
+
+        let mut states = [];
+        let mut actions = [];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        runtime.pending_failure_hold_count = 1;
+        assert_publication_error_is_atomic(
+            &mut runtime,
+            ResolutionPublicationError::PendingFailureHoldCount,
+        );
+
+        let mut states = [];
+        let mut actions = [];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.publication_epoch = u128::MAX;
+        assert_publication_error_is_atomic(
+            &mut runtime,
+            ResolutionPublicationError::RuntimeEpochExhausted,
+        );
+    }
+
+    #[test]
+    fn publication_permit_drop_and_commit_flush_all_authority_without_overflow() {
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 2];
+        let mut actions = [ResolutionActionSlot::EMPTY; 2];
+        let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut dynamic,
+            &mut holds,
+        );
+        assert_eq!(
+            runtime.schedule(action(2), MonotonicMillis(0), false),
+            ResolutionResult::Queued
+        );
+        assert_eq!(
+            runtime.schedule(action(3), MonotonicMillis(0), false),
+            ResolutionResult::Queued
+        );
+        commit_front(&mut runtime, 0);
+        assert_eq!(
+            poll_resolution_timers(
+                &mut runtime,
+                MonotonicMillis(1_000),
+                usize::MAX,
+                &mut NoResolutionTimerTrace,
+            )
+            .unwrap()
+            .retries_queued,
+            1
+        );
+        assert_eq!(runtime.head, 1);
+        assert_eq!(runtime.len, 2);
+        runtime.dynamic_neighbors[0] = DynamicNeighborSlot {
+            interface: WAN,
+            target: target(9),
+            mac: MacAddress([2, 0, 0, 0, 0, 9]),
+            refreshed_at: MonotonicMillis(1_000),
+            occupied: true,
+        };
+        runtime.failure_holds[0].phase = ResolutionFailureHoldPhase::TerminalReady;
+        runtime.pending_failure_hold_count = 1;
+        runtime.counters.queued = usize::MAX;
+        runtime.failure_counters.cancelled = usize::MAX;
+
+        let before = runtime_image(&runtime);
+        let permit = runtime.preflight_publication().unwrap();
+        assert_eq!(
+            permit.preview(),
+            ResolutionPublicationReport {
+                states_flushed: 2,
+                actions_flushed: 2,
+                dynamic_neighbors_flushed: 1,
+                failure_holds_flushed: 1,
+            }
+        );
+        drop(permit);
+        assert_eq!(runtime_image(&runtime), before);
+
+        let counters = runtime.counters;
+        let failure_counters = runtime.failure_counters;
+        let report = runtime.preflight_publication().unwrap().commit();
+        assert_eq!(
+            report,
+            ResolutionPublicationReport {
+                states_flushed: 2,
+                actions_flushed: 2,
+                dynamic_neighbors_flushed: 1,
+                failure_holds_flushed: 1,
+            }
+        );
+        assert!(runtime
+            .states
+            .iter()
+            .all(|slot| *slot == ResolutionStateSlot::EMPTY));
+        assert!(runtime
+            .actions
+            .iter()
+            .all(|slot| *slot == ResolutionActionSlot::EMPTY));
+        assert!(runtime
+            .dynamic_neighbors
+            .iter()
+            .all(|slot| *slot == DynamicNeighborSlot::EMPTY));
+        assert!(runtime
+            .failure_holds
+            .iter()
+            .all(|slot| *slot == ResolutionFailureHoldSlot::EMPTY));
+        assert_eq!(
+            (
+                runtime.head,
+                runtime.len,
+                runtime.pending_state_count,
+                runtime.pending_failure_hold_count,
+                runtime.poll_cursor,
+                runtime.failure_cursor,
+                runtime.publication_epoch,
+            ),
+            (0, 0, 0, 0, 0, 0, 2)
+        );
+        assert_eq!(runtime.counters, counters);
+        assert_eq!(runtime.failure_counters, failure_counters);
+    }
+
+    #[test]
+    fn publication_zero_capacity_is_total_and_pristine_is_exact() {
+        let mut states = [];
+        let mut actions = [];
+        let mut runtime = ResolutionRuntime::new(
+            ResolutionPolicy::new(1_000, 1_000).unwrap(),
+            &mut states,
+            &mut actions,
+        );
+        assert!(runtime.is_pristine());
+        assert_eq!(
+            runtime.preflight_publication().unwrap().commit(),
+            ResolutionPublicationReport::default()
+        );
+        assert!(!runtime.is_pristine());
+
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [];
+        let runtime = ResolutionRuntime::new(
+            ResolutionPolicy::new(1_000, 1_000).unwrap(),
+            &mut states,
+            &mut actions,
+        );
+        runtime.states[0].generation = 9;
+        assert!(!runtime.is_pristine());
     }
 
     impl ResolutionTimerTraceSink for TimerTrace {
