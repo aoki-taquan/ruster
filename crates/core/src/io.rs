@@ -85,11 +85,12 @@ impl<Backend> PublicationQuiescenceWitness for PublicationQuiescenceGuard<'_, Ba
 /// Backend-authoritative publication quiescence boundary.
 ///
 /// Implementations must inspect only bounded backend-owned state and return a
-/// typed error while an RX/generated batch is unfinished or accepted TX still
-/// embeds authority from the active publication. Success returns core's
-/// sealed guard, which borrows that exact backend exclusively. Implementing
-/// this trait does not by itself claim an AF_XDP completion-queue drain; each
-/// backend must define and prove its own authoritative completion boundary.
+/// typed error while an RX/generated batch is unfinished, a leased slot has
+/// not reached a terminal action, or accepted TX still embeds authority from
+/// the active publication. Success returns core's sealed guard, which borrows
+/// that exact backend exclusively. Implementing this trait does not by itself
+/// claim an AF_XDP completion-queue drain; each backend must define and prove
+/// its own authoritative completion boundary.
 ///
 /// A scalar cannot be substituted for the exact borrow:
 ///

@@ -206,9 +206,10 @@ generated ICMP runtimeは直接borrowのままです。現行core full wrapper�
 ため、service pair全体の不在表現はoptional-config composition seamを追加する後続作業です。
 candidateがあるtickだけ、backendはboundedな所有状態からpublication quiescenceを検証し、
 exact `&mut backend`を保持するsealed GAT guardをpublicationへ渡します。unfinished RX/generated
-batchまたはcompletion待ちTXがあればcandidateをpublicationへ渡さずtyped `Deferred`とし、
-guardをdropした後に旧active generationでtickを継続します。Sim backendの出力queue完了は
-保守的なmodelであり、AF_XDP CQ drainを実装・証明したものではありません。
+batch、terminal action未完了のleased slot、またはcompletion待ちTXがあればcandidateを
+publicationへ渡さずtyped `Deferred`とし、guardをdropした後に旧active generationでtickを
+継続します。Sim backendの出力queue完了は保守的なmodelであり、AF_XDP CQ drainを実装・証明
+したものではありません。
 
 ## 開発
 

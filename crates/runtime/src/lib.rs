@@ -1169,6 +1169,7 @@ mod tests {
         generated_mode: GeneratedMode,
         batch_state: TestBatchState,
         pending_tx: usize,
+        generated_leases_live: usize,
         quiescence_calls: usize,
         receive_calls: usize,
         generated_calls: usize,
@@ -1182,6 +1183,7 @@ mod tests {
                 generated_mode: GeneratedMode::Exact,
                 batch_state: TestBatchState::Idle,
                 pending_tx: 0,
+                generated_leases_live: 0,
                 quiescence_calls: 0,
                 receive_calls: 0,
                 generated_calls: 0,
@@ -1194,6 +1196,7 @@ mod tests {
     enum TestPublicationQuiescenceError {
         RxBatchNotFinished,
         GeneratedBatchNotFinished,
+        GeneratedLeaseNotCompleted,
         TxCompletionPending,
     }
 
@@ -1211,6 +1214,9 @@ mod tests {
                     return Err(TestPublicationQuiescenceError::GeneratedBatchNotFinished);
                 }
                 TestBatchState::Idle => {}
+            }
+            if self.generated_leases_live != 0 {
+                return Err(TestPublicationQuiescenceError::GeneratedLeaseNotCompleted);
             }
             if self.pending_tx != 0 {
                 return Err(TestPublicationQuiescenceError::TxCompletionPending);
@@ -1289,6 +1295,10 @@ mod tests {
                 TestBatchState::Idle,
                 "packet I/O batches cannot overlap"
             );
+            assert_eq!(
+                self.generated_leases_live, 0,
+                "nonterminal generated leases prevent another batch"
+            );
             self.batch_state = TestBatchState::Rx;
             Ok(EmptyRxBatch {
                 state: &mut self.batch_state,
@@ -1300,6 +1310,7 @@ mod tests {
     struct TestGeneratedSlot<'a> {
         bytes: &'a mut [u8],
         completion: &'a mut Option<GeneratedSlotCompletion>,
+        leases_live: &'a mut usize,
     }
 
     impl GeneratedPacketSlot for TestGeneratedSlot<'_> {
@@ -1309,6 +1320,10 @@ mod tests {
 
         fn complete(self, completion: GeneratedSlotCompletion) {
             *self.completion = Some(completion);
+            *self.leases_live = self
+                .leases_live
+                .checked_sub(1)
+                .expect("generated lease completed exactly once");
         }
     }
 
@@ -1317,7 +1332,9 @@ mod tests {
         frame: &'a mut [u8; 590],
         state: &'a mut TestBatchState,
         pending_tx: &'a mut usize,
+        leases_live: &'a mut usize,
         attempted: bool,
+        allocated: bool,
         completion: Option<GeneratedSlotCompletion>,
     }
 
@@ -1337,6 +1354,11 @@ mod tests {
             if self.mode == GeneratedMode::AllocationFailure {
                 return Err(GeneratedAllocationError::Unavailable);
             }
+            *self.leases_live = self
+                .leases_live
+                .checked_add(1)
+                .expect("generated lease count cannot overflow");
+            self.allocated = true;
             let visible_len = if self.mode == GeneratedMode::WrongLength {
                 frame_len - 1
             } else {
@@ -1345,16 +1367,19 @@ mod tests {
             Ok(GeneratedPacketLease::new(TestGeneratedSlot {
                 bytes: &mut self.frame[..visible_len],
                 completion: &mut self.completion,
+                leases_live: self.leases_live,
             }))
         }
 
         fn finish(self) -> GeneratedBatchCompletion<Self::Error> {
-            let (allocated, failed, requested, cancelled, abandoned) = match self.completion {
-                Some(GeneratedSlotCompletion::Transmit) => (1, 0, 1, 0, 0),
-                Some(GeneratedSlotCompletion::Cancelled) => (1, 0, 0, 1, 0),
-                Some(GeneratedSlotCompletion::Abandoned) => (1, 0, 0, 0, 1),
-                None => (0, usize::from(self.attempted), 0, 0, 0),
+            let (requested, cancelled, abandoned) = match self.completion {
+                Some(GeneratedSlotCompletion::Transmit) => (1, 0, 0),
+                Some(GeneratedSlotCompletion::Cancelled) => (0, 1, 0),
+                Some(GeneratedSlotCompletion::Abandoned) => (0, 0, 1),
+                None => (0, 0, 0),
             };
+            let allocated = usize::from(self.allocated);
+            let failed = usize::from(self.attempted && !self.allocated);
             let invalid = self.mode == GeneratedMode::InvalidAccounting;
             let accepted = if invalid { 0 } else { requested };
             *self.state = TestBatchState::Idle;
@@ -1389,6 +1414,10 @@ mod tests {
                 TestBatchState::Idle,
                 "packet I/O batches cannot overlap"
             );
+            assert_eq!(
+                self.generated_leases_live, 0,
+                "nonterminal generated leases prevent another batch"
+            );
             self.batch_state = TestBatchState::Generated;
             self.generated_calls += 1;
             TestGeneratedBatch {
@@ -1396,7 +1425,9 @@ mod tests {
                 frame: &mut self.frame,
                 state: &mut self.batch_state,
                 pending_tx: &mut self.pending_tx,
+                leases_live: &mut self.generated_leases_live,
                 attempted: false,
+                allocated: false,
                 completion: None,
             }
         }
@@ -1595,6 +1626,17 @@ mod tests {
         assert!(matches!(
             generated_io.try_publication_quiescence(),
             Err(TestPublicationQuiescenceError::GeneratedBatchNotFinished)
+        ));
+
+        let mut lease_io = TestIo::default();
+        let mut generated = lease_io.begin_generated(WAN);
+        let lease = generated.allocate(64).expect("generated frame");
+        core::mem::forget(lease);
+        let completion = generated.finish();
+        assert!(!completion.invariants_hold());
+        assert!(matches!(
+            lease_io.try_publication_quiescence(),
+            Err(TestPublicationQuiescenceError::GeneratedLeaseNotCompleted)
         ));
     }
 

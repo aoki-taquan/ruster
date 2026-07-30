@@ -89,7 +89,8 @@ pub enum SimGeneratedError {
 /// authority yet.
 ///
 /// The priority is deterministic: unfinished RX batch, unfinished generated
-/// batch, then accepted TX awaiting explicit completion.
+/// batch, nonterminal RX lease, nonterminal generated lease, then accepted TX
+/// awaiting explicit completion.
 /// `SimIo`'s finite output queue is a conservative simulation boundary, not
 /// evidence that a native AF_XDP completion queue has drained.
 ///
@@ -127,6 +128,8 @@ pub enum SimGeneratedError {
 pub enum SimPublicationQuiescenceError {
     RxBatchNotFinished,
     GeneratedBatchNotFinished,
+    RxLeaseNotCompleted,
+    GeneratedLeaseNotCompleted,
     TxCompletionPending,
 }
 
@@ -151,6 +154,8 @@ pub struct SimIo {
     fail_generated_finish: bool,
     received_accept_budget: usize,
     batch_state: SimBatchState,
+    rx_leases_live: usize,
+    generated_leases_live: usize,
 }
 
 impl Default for SimIo {
@@ -167,6 +172,8 @@ impl Default for SimIo {
             fail_generated_finish: false,
             received_accept_budget: usize::MAX,
             batch_state: SimBatchState::Idle,
+            rx_leases_live: 0,
+            generated_leases_live: 0,
         }
     }
 }
@@ -517,6 +524,12 @@ impl PublicationQuiescence for SimIo {
             }
             SimBatchState::Idle => {}
         }
+        if self.rx_leases_live != 0 {
+            return Err(SimPublicationQuiescenceError::RxLeaseNotCompleted);
+        }
+        if self.generated_leases_live != 0 {
+            return Err(SimPublicationQuiescenceError::GeneratedLeaseNotCompleted);
+        }
         if !self.tx.is_empty() {
             return Err(SimPublicationQuiescenceError::TxCompletionPending);
         }
@@ -534,6 +547,11 @@ impl PacketIo for SimIo {
             SimBatchState::Idle,
             "simulated packet batches cannot overlap"
         );
+        assert_eq!(
+            (self.rx_leases_live, self.generated_leases_live),
+            (0, 0),
+            "nonterminal packet leases prevent another batch"
+        );
         self.batch_state = SimBatchState::Rx;
         let remaining = budget.min(self.rx.len());
         Ok(SimBatch {
@@ -542,6 +560,7 @@ impl PacketIo for SimIo {
             recycled: &mut self.recycled,
             accept_budget: &mut self.received_accept_budget,
             state: &mut self.batch_state,
+            leases_live: &mut self.rx_leases_live,
             remaining,
             counters: BatchCounters::default(),
         })
@@ -554,6 +573,7 @@ pub struct SimBatch<'a> {
     recycled: &'a mut VecDeque<RecycledFrameCapture>,
     accept_budget: &'a mut usize,
     state: &'a mut SimBatchState,
+    leases_live: &'a mut usize,
     remaining: usize,
     counters: BatchCounters,
 }
@@ -579,12 +599,17 @@ impl PacketBatch for SimBatch<'_> {
         }
         let slot = self.rx.pop_front()?;
         self.remaining -= 1;
+        *self.leases_live = self
+            .leases_live
+            .checked_add(1)
+            .expect("simulated RX lease count cannot overflow");
         Some(PacketLease::new(SimSlot {
             slot: Some(slot),
             tx: self.tx,
             recycled: self.recycled,
             accept_budget: self.accept_budget,
             counters: &mut self.counters,
+            leases_live: self.leases_live,
         }))
     }
 
@@ -612,6 +637,7 @@ pub struct SimSlot<'a> {
     recycled: &'a mut VecDeque<RecycledFrameCapture>,
     accept_budget: &'a mut usize,
     counters: &'a mut BatchCounters,
+    leases_live: &'a mut usize,
 }
 
 impl PacketSlot for SimSlot<'_> {
@@ -663,6 +689,10 @@ impl PacketSlot for SimSlot<'_> {
                 self.recycle(slot, RecycleCause::LeaseAbandoned);
             }
         }
+        *self.leases_live = self
+            .leases_live
+            .checked_sub(1)
+            .expect("simulated RX lease completed exactly once");
     }
 }
 
@@ -675,6 +705,11 @@ impl GeneratedPacketIo for SimIo {
             self.batch_state,
             SimBatchState::Idle,
             "simulated packet batches cannot overlap"
+        );
+        assert_eq!(
+            (self.rx_leases_live, self.generated_leases_live),
+            (0, 0),
+            "nonterminal packet leases prevent another batch"
         );
         self.batch_state = SimBatchState::Generated;
         let fail_finish = self.fail_generated_finish;
@@ -691,6 +726,7 @@ impl GeneratedPacketIo for SimIo {
             pending: VecDeque::new(),
             counters: GeneratedCounters::default(),
             state: &mut self.batch_state,
+            leases_live: &mut self.generated_leases_live,
         }
     }
 }
@@ -723,6 +759,7 @@ pub struct SimGeneratedBatch<'a> {
     pending: VecDeque<GeneratedSlot>,
     counters: GeneratedCounters,
     state: &'a mut SimBatchState,
+    leases_live: &'a mut usize,
 }
 
 impl GeneratedPacketBatch for SimGeneratedBatch<'_> {
@@ -752,6 +789,10 @@ impl GeneratedPacketBatch for SimGeneratedBatch<'_> {
         }
         self.remaining_allocations -= 1;
         self.counters.allocated += 1;
+        *self.leases_live = self
+            .leases_live
+            .checked_add(1)
+            .expect("simulated generated lease count cannot overflow");
         let sequence = *self.next_sequence;
         *self.next_sequence = self.next_sequence.wrapping_add(1);
         Ok(GeneratedPacketLease::new(SimGeneratedSlot {
@@ -763,6 +804,7 @@ impl GeneratedPacketBatch for SimGeneratedBatch<'_> {
             recycled: self.recycled,
             counters: &mut self.counters,
             egress: self.egress,
+            leases_live: self.leases_live,
         }))
     }
 
@@ -814,6 +856,7 @@ pub struct SimGeneratedSlot<'a> {
     recycled: &'a mut VecDeque<GeneratedRecycledFrame>,
     counters: &'a mut GeneratedCounters,
     egress: IfId,
+    leases_live: &'a mut usize,
 }
 
 impl GeneratedPacketSlot for SimGeneratedSlot<'_> {
@@ -840,6 +883,10 @@ impl GeneratedPacketSlot for SimGeneratedSlot<'_> {
                 self.recycle(slot, GeneratedRecycleCause::Abandoned);
             }
         }
+        *self.leases_live = self
+            .leases_live
+            .checked_sub(1)
+            .expect("simulated generated lease completed exactly once");
     }
 }
 
