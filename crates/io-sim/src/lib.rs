@@ -57,6 +57,13 @@ pub struct RecycledFrame {
     pub bytes: Vec<u8>,
 }
 
+/// Extended cold-path capture for backend conformance observation.
+#[derive(Debug, Eq, PartialEq)]
+pub struct RecycledFrameCapture {
+    pub frame: RecycledFrame,
+    pub rejected_egress: Option<IfId>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GeneratedRecycleCause {
     Cancelled,
@@ -82,7 +89,7 @@ pub struct SimIo {
     next_sequence: u64,
     rx: VecDeque<Slot>,
     tx: VecDeque<TxFrame>,
-    recycled: VecDeque<RecycledFrame>,
+    recycled: VecDeque<RecycledFrameCapture>,
     generated_recycled: VecDeque<GeneratedRecycledFrame>,
     generated_budget: usize,
     generated_max_frame: usize,
@@ -145,6 +152,10 @@ impl SimIo {
     }
 
     pub fn pop_recycled(&mut self) -> Option<RecycledFrame> {
+        self.recycled.pop_front().map(|capture| capture.frame)
+    }
+
+    pub fn pop_recycled_capture(&mut self) -> Option<RecycledFrameCapture> {
         self.recycled.pop_front()
     }
 
@@ -452,7 +463,7 @@ impl PacketIo for SimIo {
 pub struct SimBatch<'a> {
     rx: &'a mut VecDeque<Slot>,
     tx: &'a mut VecDeque<TxFrame>,
-    recycled: &'a mut VecDeque<RecycledFrame>,
+    recycled: &'a mut VecDeque<RecycledFrameCapture>,
     accept_budget: &'a mut usize,
     remaining: usize,
     counters: BatchCounters,
@@ -502,7 +513,7 @@ impl PacketBatch for SimBatch<'_> {
 pub struct SimSlot<'a> {
     slot: Option<Slot>,
     tx: &'a mut VecDeque<TxFrame>,
-    recycled: &'a mut VecDeque<RecycledFrame>,
+    recycled: &'a mut VecDeque<RecycledFrameCapture>,
     accept_budget: &'a mut usize,
     counters: &'a mut BatchCounters,
 }
@@ -523,11 +534,14 @@ impl PacketSlot for SimSlot<'_> {
                 self.counters.tx_requested += 1;
                 if *self.accept_budget == 0 {
                     self.counters.tx_rejected += 1;
-                    self.recycled.push_back(RecycledFrame {
-                        sequence: slot.sequence,
-                        ingress: slot.ingress,
-                        cause: RecycleCause::TxRejected,
-                        bytes: slot.bytes,
+                    self.recycled.push_back(RecycledFrameCapture {
+                        frame: RecycledFrame {
+                            sequence: slot.sequence,
+                            ingress: slot.ingress,
+                            cause: RecycleCause::TxRejected,
+                            bytes: slot.bytes,
+                        },
+                        rejected_egress: Some(egress),
                     });
                 } else {
                     *self.accept_budget -= 1;
@@ -731,11 +745,14 @@ impl SimGeneratedSlot<'_> {
 
 impl SimSlot<'_> {
     fn recycle(&mut self, slot: Slot, cause: RecycleCause) {
-        self.recycled.push_back(RecycledFrame {
-            sequence: slot.sequence,
-            ingress: slot.ingress,
-            cause,
-            bytes: slot.bytes,
+        self.recycled.push_back(RecycledFrameCapture {
+            frame: RecycledFrame {
+                sequence: slot.sequence,
+                ingress: slot.ingress,
+                cause,
+                bytes: slot.bytes,
+            },
+            rejected_egress: None,
         });
         self.counters.recycled += 1;
     }
