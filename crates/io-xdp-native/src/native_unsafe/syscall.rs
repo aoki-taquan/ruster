@@ -1,5 +1,5 @@
 #![allow(dead_code, unsafe_code)]
-//! Private Linux syscall and RAII foundation for future AF_XDP resource setup.
+//! Private x86_64 Linux syscall and RAII foundation for future AF_XDP resource setup.
 //!
 //! C2A deliberately has no public constructor and performs no UMEM
 //! registration, ring configuration, bind transaction, or packet I/O. The
@@ -10,10 +10,17 @@
 use std::{
     ffi::{c_int, c_short, c_void},
     fmt,
+    mem::size_of,
     os::fd::RawFd,
 };
 
-use crate::abi::AF_XDP;
+use crate::{abi::AF_XDP, ensure_native_syscall_supported, NativeSyscallPlatformError};
+
+/// Pinned source profile for architecture-dependent syscall constants.
+const SYSCALL_ABI_PROFILE: &str =
+    "Linux v6.8 x86_64: include/linux/net.h, include/linux/socket.h, \
+     include/uapi/asm-generic/fcntl.h, include/uapi/linux/mman.h, \
+     include/uapi/asm-generic/mman-common.h";
 
 const SOCK_RAW: c_int = 3;
 const SOCK_NONBLOCK: c_int = 0x800;
@@ -31,6 +38,12 @@ const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
 type SockLen = u32;
 type Offset = i64;
 type PollCount = usize;
+
+const _: [(); 4] = [(); size_of::<c_int>()];
+const _: [(); 4] = [(); size_of::<SockLen>()];
+const _: [(); 8] = [(); size_of::<Offset>()];
+const _: [(); 8] = [(); size_of::<PollCount>()];
+const _: [(); 4] = [(); size_of::<RawFd>()];
 
 /// Largest positive errno encoded by the reviewed Linux syscall ABI.
 const MAX_LINUX_ERRNO: i32 = 4_095;
@@ -106,6 +119,7 @@ pub(super) enum SyscallArgumentError {
 /// Fixed-size error from the private syscall/RAII seam.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ResourceError {
+    Platform(NativeSyscallPlatformError),
     Argument(SyscallArgumentError),
     Syscall(SyscallError),
 }
@@ -364,6 +378,7 @@ pub(super) struct OwnedXdpFd<'syscalls, S: Syscalls> {
 
 impl<'syscalls, S: Syscalls> OwnedXdpFd<'syscalls, S> {
     pub(super) fn open(syscalls: &'syscalls S) -> Result<Self, ResourceError> {
+        ensure_native_syscall_supported().map_err(ResourceError::Platform)?;
         let fd = syscalls
             .socket(AF_XDP, XDP_SOCKET_KIND, 0)
             .map_err(|errno| syscall_error(SyscallStage::OpenSocket, errno))?;
@@ -565,7 +580,7 @@ mod ffi {
         pub(super) revents: c_short,
     }
 
-    // SAFETY: these declarations exactly match the reviewed 64-bit Linux libc
+    // SAFETY: these declarations exactly match the reviewed x86_64 Linux libc
     // ABI. Every pointer extent and ownership precondition is established by
     // the safe wrappers before the corresponding function is called.
     unsafe extern "C" {
@@ -861,6 +876,40 @@ mod tests {
     }
 
     fn assert_static_syscalls<T: Syscalls>() {}
+
+    #[test]
+    fn native_x86_64_syscall_source_and_constants_are_exact() {
+        const {
+            assert!(cfg!(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                target_pointer_width = "64"
+            )));
+        }
+        assert_eq!(
+            SYSCALL_ABI_PROFILE,
+            "Linux v6.8 x86_64: include/linux/net.h, include/linux/socket.h, \
+             include/uapi/asm-generic/fcntl.h, include/uapi/linux/mman.h, \
+             include/uapi/asm-generic/mman-common.h"
+        );
+        assert_eq!(
+            (SOCK_RAW, SOCK_NONBLOCK, SOCK_CLOEXEC, XDP_SOCKET_KIND),
+            (3, 0x800, 0x8_0000, 3 | 0x800 | 0x8_0000)
+        );
+        assert_eq!((PROT_READ, PROT_WRITE), (1, 2));
+        assert_eq!((MAP_SHARED, MAP_PRIVATE, MAP_ANONYMOUS), (1, 2, 0x20));
+        assert_eq!(MSG_DONTWAIT, 0x40);
+        assert_eq!(
+            (
+                size_of::<c_int>(),
+                size_of::<SockLen>(),
+                size_of::<Offset>(),
+                size_of::<PollCount>(),
+                size_of::<RawFd>(),
+            ),
+            (4, 4, 8, 8, 4)
+        );
+    }
 
     #[test]
     fn native_syscall_raii_transcript_is_static_bounded_and_redacted() {

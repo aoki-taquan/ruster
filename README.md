@@ -45,9 +45,11 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
   kernel報告mmap offsetをcold pathで検証するnative scaffold。caller-owned mappingを
   排他的にborrowするFill/TX producerとRX/Completion consumerは、wrapping cursor、
   Acquire/Release publication、need-wakeup flagをallocationなしで扱う。後続resource setup用の
-  private Linux syscall/RAII seamは、CLOEXEC/nonblocking AF_XDP socket、socket option、
+  private x86_64 Linux syscall/RAII seamは、CLOEXEC/nonblocking AF_XDP socket、socket option、
   mmap/munmap、bind、poll、sendto、closeをdependencyなしで包み、fd/addressをDebugから
-  redactしてcleanupを高々一回にする。publicなsocket/mapping constructor、UMEM登録、
+  redactしてcleanupを高々一回にする。他の64-bit Linux architectureはC0/C1のpure ABI/ring
+  validationを狭めず、別のtyped syscall capability checkで拒否する。publicなsocket/mapping
+  constructor、UMEM登録、
   ring設定・bind transaction、live session、libxdp link、core `PacketIo`接続はまだ持たず、
   FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
 - `ruster-runtime`: genericなpublication seamから一つのactive generationを借用し、

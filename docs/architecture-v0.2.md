@@ -982,8 +982,9 @@ metadataなし、software checksum指定なし、RX/generated frame exact partit
 kernelが将来`XDP_MMAP_OFFSETS`で返す各ring offsetは、producer、consumer、flags、
 descriptor領域のalignment、checked extent、process `usize`変換、相互非overlapを検証してから
 minimum mmap byte lengthへ変換します。この計算はmemoryをaccessせず、offset overflowや
-aliasするlayoutをtyped errorにします。native syscall層は64-bit Linuxだけを対象とし、
-non-Linuxと未reviewのpointer widthはresource取得前のtyped unsupportedです。
+aliasするlayoutをtyped errorにします。C0/C1のpure ABI/ring profileは64-bit Linuxを対象とし、
+non-Linuxと未reviewのpointer widthはtyped unsupportedです。architecture依存定数を持つC2A
+syscall seamは、後述する別のnarrower x86_64 boundaryを使います。
 
 C1 sliceはOS mappingを作成せず、caller-owned `&mut [u8]`をmapping lifetime全体で
 排他的にborrowします。C0 layout検証後にactual base addressを加え、minimum extentと
@@ -1015,12 +1016,20 @@ callerはpublication前の古いneed-wakeup観測をkick判断に利用しませ
 OS mmap、UMEM registration、bind、poll/sendto kick、libxdp attach、core `PacketIo` adapterは
 後続sliceです。
 
-C2A sliceは後続resource setupだけが使うprivateなLinux syscall/RAII seamを追加します。
+C2A sliceは後続resource setupだけが使うprivateなx86_64 Linux syscall/RAII seamを追加します。
 Linux v6.8 profileの`socket`、`setsockopt`、`getsockopt`、`mmap`、`munmap`、`bind`、
 `poll`、`sendto`、`close`をdependencyなしのprivate FFIへ閉じ、sealed genericでstatic
 dispatchします。production実装とNIC不要のfinite fakeは同じ境界を使いますが、このsliceに
 public resource constructorはなく、packet fast pathへtrait objectやsyscall dispatchを追加
 しません。socket作成要求は`SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK`で固定します。
+`SOCK_NONBLOCK=0x800`、`SOCK_CLOEXEC=0x80000`、`MAP_ANONYMOUS=0x20`を含む定数と
+`socklen_t`/`off_t`/`nfds_t`幅はLinux v6.8 x86_64 UAPI profileとしてcompile-timeとunit testで
+固定します。これらが異なるmips64/sparc64等へasm-generic値を誤適用しません。
+
+C0/C1のlayout計算とborrowed ringは従来どおり64-bit Linux profileを維持します。一方、
+resource builderが将来公開される場合は別の`ensure_native_syscall_supported`を最初に呼び、
+non-Linux、非64-bit、64-bit Linux上の非x86_64をそれぞれtyped rejectしなければなりません。
+C2Aのfd owner自身もsocket callより前にこのnarrower checkを実行します。
 
 socket optionとsocket addressの動的byte lengthはnonzeroかつLinux `socklen_t`へ表現可能、
 ring mmap offsetは64-bit `off_t`へ表現可能であることをFFI前に検証します。kernelが返した
