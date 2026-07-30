@@ -226,6 +226,35 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | FW-021 expiry cluster repair | architecture complexity contract | `cleanup_budget_is_linear_for_n_and_two_n_capacity` | implemented | capacity 4以上は最大75% usable。attemptごとにdelete/shift/restart各最大1回、probe+maintenanceは定数倍N、繰返しでempty terminationを回復、live evictionなし |
 | FW-022 SipHash conformance and flow layout | SipHash-2-4 reference vectors, local canonical-key contract | `siphash_vectors_and_canonical_flow_layout_match_independent_references` | implemented | official length 0/1/7/8/15/16/63 vectorsと固定64-byte canonical flow layoutの独立hard-coded reference値を検証 |
 | FW-023 explicit full-service generated ICMPv4 composition | RFC 1812 §4.3.2, architecture composition contract | `full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_errors` | implemented | UDP/TCP NAT44+FWの明示error APIで認可後TTL errorをpre-NAT quoteでqueue。deny/authority/route失敗はsilent、RX後のgenerated phaseでdispatch |
+| R16A-001 versioned typed replay envelope | security test infrastructure contract | `r16a_envelope_parser_is_typed_canonical_and_bounded` | implemented | v1 magic/version、target別expected型、reserved/canonical encoding、128KiB envelope、payload、case countを固定上限で検証 |
+| R16A-002 deterministic parser/checksum/admission/resolution properties | security test infrastructure contract | `r16a_short_seed_matrix_is_deterministic` | implemented | dependency-free SplitMix64-v1、固定seed/budgetでproduction public APIをblack-box検証。parser/checksum oracleとadmission/resolution accounting modelはtest側で独立 |
+| R16A-003 fixed past-regression corpus | black-box regression contract | `r16a_past_regression_corpus_is_exact` | implemented | current-mainの固定input/expected 9件だけを保持し、prototype実装は再利用しない |
+| R16A-004 exact bounded failure replay | security test infrastructure contract | `r16a_failure_artifact_is_binary_jsonl_and_exactly_replayable` | implemented | private 0700の明示absolute directoryへ0600/create-newでbounded `.case`と1行JSONLを生成し、同一binary envelopeのexact replay commandを記録 |
+| R16A-005 explicit bounded smoke command | security test infrastructure contract | `r16a_bounded_smoke` | implemented | 手動または将来の専用jobから明示実行できるignored test。固定4 seed/target別case budget、または最大65536件の完全指定range/単一replay fileだけを許可。本PRはworkflowを追加せずrequired CI化を主張しない |
+
+### R16A dependency-free seed runner
+
+通常のworkspace testは、固定seedの短いparser/checksum/admission/resolution matrixと過去の
+black-box regression corpusを実行します。全固定seedとtarget別case budgetを実行する
+unprivileged smokeは次の明示commandです。
+
+```bash
+cargo test --locked -p ruster-io-sim --test security_property_smoke r16a_bounded_smoke -- --ignored --exact --nocapture --test-threads=1
+```
+
+seed failureはtarget、seed、caseを完全指定して1件だけ再現できます。
+
+```bash
+RUSTER_R16A_TARGET=parser RUSTER_R16A_SEED=0x6a09e667f3bcc909 RUSTER_R16A_CASE_START=317 RUSTER_R16A_CASES=1 cargo test --locked -p ruster-io-sim --test security_property_smoke r16a_bounded_smoke -- --ignored --exact --nocapture --test-threads=1
+```
+
+`RUSTER_R16A_ARTIFACT_DIR`には`/tmp/ruster-r16a-artifacts`のような明示absolute pathだけを
+指定できます。leaf directoryは新規0700で作成するか、既存ならexact 0700かつsymlinkを
+経由しない必要があります。failure時は0600のversioned binary `.case`と1行JSONLを
+create-newで保存します。detailは4096 bytes、JSONLは65536 bytesが上限です。
+JSONL内のcommand、または
+`RUSTER_R16A_REPLAY=/tmp/ruster-r16a-artifacts/<case>.case`を同じignored test commandへ
+付けると、そのbinary envelopeだけを再生します。replayとseed/range指定は併用できません。
 
 ## RFC deviation rule
 
