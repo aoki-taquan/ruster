@@ -38,6 +38,7 @@ const GATEWAY: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 1]);
 const HOST_PORT: u16 = 40_000;
 const REMOTE_PORT: u16 = 443;
 const NOW: MonotonicMillis = MonotonicMillis(1_000);
+const MATRIX_CASE_COUNT: usize = 24;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Profile {
@@ -45,6 +46,10 @@ enum Profile {
     Nat,
     Firewall,
     Combined,
+}
+
+impl Profile {
+    const ALL: [Self; 4] = [Self::Plain, Self::Nat, Self::Firewall, Self::Combined];
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +112,36 @@ struct Case {
     direction: Direction,
 }
 
+#[derive(Clone, Copy)]
+enum MeasurementMode {
+    Timed,
+    #[cfg(test)]
+    DeterministicOnePass,
+}
+
+#[derive(Clone, Copy)]
+struct CaseExecution<'a> {
+    config: &'a RunConfig,
+    measurement_mode: MeasurementMode,
+}
+
+impl<'a> CaseExecution<'a> {
+    const fn timed(config: &'a RunConfig) -> Self {
+        Self {
+            config,
+            measurement_mode: MeasurementMode::Timed,
+        }
+    }
+
+    #[cfg(test)]
+    const fn deterministic_one_pass(config: &'a RunConfig) -> Self {
+        Self {
+            config,
+            measurement_mode: MeasurementMode::DeterministicOnePass,
+        }
+    }
+}
+
 impl Case {
     const fn label(self) -> &'static str {
         match (self.profile, self.transport, self.direction) {
@@ -150,43 +185,43 @@ impl Case {
     }
 }
 
+fn matrix_cases() -> impl Iterator<Item = Case> {
+    Transport::ALL.into_iter().flat_map(|transport| {
+        Direction::ALL.into_iter().flat_map(move |direction| {
+            Profile::ALL.into_iter().map(move |profile| Case {
+                profile,
+                transport,
+                direction,
+            })
+        })
+    })
+}
+
 pub(crate) fn run_matrix(
     config: &RunConfig,
     size: FrameSize,
     batch_size: usize,
 ) -> Result<Vec<ResultRow>, RunError> {
-    let mut rows = Vec::with_capacity(24);
-    for transport in Transport::ALL {
-        for direction in Direction::ALL {
-            for profile in [
-                Profile::Plain,
-                Profile::Nat,
-                Profile::Firewall,
-                Profile::Combined,
-            ] {
-                let case = Case {
-                    profile,
-                    transport,
-                    direction,
-                };
-                rows.push(match profile {
-                    Profile::Plain => run_plain_control(config, size, batch_size, case)?,
-                    Profile::Nat => run_nat_case(config, size, batch_size, case)?,
-                    Profile::Firewall => run_firewall_case(config, size, batch_size, case)?,
-                    Profile::Combined => run_combined_case(config, size, batch_size, case)?,
-                });
-            }
-        }
+    let mut rows = Vec::with_capacity(MATRIX_CASE_COUNT);
+    let execution = CaseExecution::timed(config);
+    for case in matrix_cases() {
+        rows.push(match case.profile {
+            Profile::Plain => run_plain_control(execution, size, batch_size, case)?,
+            Profile::Nat => run_nat_case(execution, size, batch_size, case)?,
+            Profile::Firewall => run_firewall_case(execution, size, batch_size, case)?,
+            Profile::Combined => run_combined_case(execution, size, batch_size, case)?,
+        });
     }
     Ok(rows)
 }
 
 fn run_plain_control(
-    config: &RunConfig,
+    execution: CaseExecution<'_>,
     size: FrameSize,
     batch_size: usize,
     case: Case,
 ) -> Result<ResultRow, RunError> {
+    let config = execution.config;
     let (routes, interfaces, neighbors, bindings) = topology();
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings)
         .expect("benchmark snapshot");
@@ -194,8 +229,8 @@ fn run_plain_control(
     let mut backend = BenchBackend::new(batch_size, case.direction.ingress(), &template);
     let row = {
         let mut forward = |batch: BenchBatch<'_>| forward_batch(batch, &snapshot, &mut NoTrace);
-        measure_case(
-            config,
+        execute_case(
+            execution,
             size,
             batch_size,
             case,
@@ -339,11 +374,12 @@ fn firewall_config<'a>(
 }
 
 fn run_nat_case(
-    config: &RunConfig,
+    execution: CaseExecution<'_>,
     size: FrameSize,
     batch_size: usize,
     case: Case,
 ) -> Result<ResultRow, RunError> {
+    let config = execution.config;
     let (routes, interfaces, neighbors, bindings) = topology();
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings)
         .expect("benchmark snapshot");
@@ -386,8 +422,8 @@ fn run_nat_case(
                         &mut NoTrace,
                     )
                 };
-                measure_case(
-                    config,
+                execute_case(
+                    execution,
                     size,
                     batch_size,
                     case,
@@ -447,8 +483,8 @@ fn run_nat_case(
                         &mut NoTrace,
                     )
                 };
-                measure_case(
-                    config,
+                execute_case(
+                    execution,
                     size,
                     batch_size,
                     case,
@@ -481,11 +517,12 @@ fn run_nat_case(
 }
 
 fn run_firewall_case(
-    config: &RunConfig,
+    execution: CaseExecution<'_>,
     size: FrameSize,
     batch_size: usize,
     case: Case,
 ) -> Result<ResultRow, RunError> {
+    let config = execution.config;
     let (routes, interfaces, neighbors, bindings) = topology();
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings)
         .expect("benchmark snapshot");
@@ -544,8 +581,8 @@ fn run_firewall_case(
                 &mut NoTrace,
             )
         };
-        measure_case(
-            config,
+        execute_case(
+            execution,
             size,
             batch_size,
             case,
@@ -575,11 +612,12 @@ fn run_firewall_case(
 }
 
 fn run_combined_case(
-    config: &RunConfig,
+    execution: CaseExecution<'_>,
     size: FrameSize,
     batch_size: usize,
     case: Case,
 ) -> Result<ResultRow, RunError> {
+    let config = execution.config;
     let (routes, interfaces, neighbors, bindings) = topology();
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings)
         .expect("benchmark snapshot");
@@ -657,8 +695,8 @@ fn run_combined_case(
                 &mut NoTrace,
             )
         };
-        measure_case(
-            config,
+        execute_case(
+            execution,
             size,
             batch_size,
             case,
@@ -753,6 +791,80 @@ where
         return Err(RunError::ForwardingOracle);
     }
     Ok(())
+}
+
+fn execute_case<F>(
+    execution: CaseExecution<'_>,
+    size: FrameSize,
+    batch_size: usize,
+    case: Case,
+    template: &[u8],
+    backend: &mut BenchBackend,
+    forward: &mut F,
+) -> Result<ResultRow, RunError>
+where
+    F: for<'a> FnMut(BenchBatch<'a>) -> BatchReport<Infallible>,
+{
+    match execution.measurement_mode {
+        MeasurementMode::Timed => measure_case(
+            execution.config,
+            size,
+            batch_size,
+            case,
+            template,
+            backend,
+            forward,
+        ),
+        #[cfg(test)]
+        MeasurementMode::DeterministicOnePass => deterministic_one_pass(
+            execution.config,
+            size,
+            batch_size,
+            case,
+            template,
+            backend,
+            forward,
+        ),
+    }
+}
+
+#[cfg(test)]
+fn deterministic_one_pass<F>(
+    config: &RunConfig,
+    size: FrameSize,
+    batch_size: usize,
+    case: Case,
+    template: &[u8],
+    backend: &mut BenchBackend,
+    forward: &mut F,
+) -> Result<ResultRow, RunError>
+where
+    F: for<'a> FnMut(BenchBatch<'a>) -> BatchReport<Infallible>,
+{
+    let before_allocations = allocation_count();
+    backend.reset(template);
+    let batch = backend.receive(batch_size).expect("infallible backend");
+    let report = black_box(forward(batch));
+    let allocations = allocation_count() - before_allocations;
+    ensure_no_allocations(case.label(), allocations)?;
+    verify_report(&report, batch_size)?;
+    Ok(ResultRow {
+        case: case.label(),
+        size,
+        batch: batch_size,
+        checksum_passes: case.checksum_passes(),
+        seed: config.seed,
+        repetitions_per_sample: 1,
+        timed_allocations: allocations,
+        stats: SampleStats {
+            samples: 1,
+            min_ns: 1.0,
+            p50_ns: 1.0,
+            p95_ns: 1.0,
+            mad_ns: 0.0,
+        },
+        digest: u16::try_from(report.tx_requested).unwrap_or(u16::MAX),
+    })
 }
 
 fn measure_case<F>(
@@ -1231,34 +1343,50 @@ mod tests {
     }
 
     #[test]
-    fn short_matrix_identifies_every_case() {
-        let mut config = RunConfig::smoke();
-        config.samples = 1;
-        config.sample_time = Duration::from_micros(100);
-        config.warmup_time = Duration::ZERO;
-        for transport in Transport::ALL {
-            for direction in Direction::ALL {
-                for profile in [
-                    Profile::Plain,
-                    Profile::Nat,
-                    Profile::Firewall,
-                    Profile::Combined,
-                ] {
-                    let case = Case {
-                        profile,
-                        transport,
-                        direction,
-                    };
-                    let result = match profile {
-                        Profile::Plain => run_plain_control(&config, FrameSize::Wire64, 1, case),
-                        Profile::Nat => run_nat_case(&config, FrameSize::Wire64, 1, case),
-                        Profile::Firewall => run_firewall_case(&config, FrameSize::Wire64, 1, case),
-                        Profile::Combined => run_combined_case(&config, FrameSize::Wire64, 1, case),
-                    };
-                    assert!(result.is_ok(), "{}: {result:?}", case.label());
-                }
+    fn short_matrix_identifies_every_case_without_wall_clock_measurement() {
+        let config = RunConfig::smoke();
+        let execution = CaseExecution::deterministic_one_pass(&config);
+        let mut labels = Vec::with_capacity(MATRIX_CASE_COUNT);
+        for case in matrix_cases() {
+            let result = match case.profile {
+                Profile::Plain => run_plain_control(execution, FrameSize::Wire64, 1, case),
+                Profile::Nat => run_nat_case(execution, FrameSize::Wire64, 1, case),
+                Profile::Firewall => run_firewall_case(execution, FrameSize::Wire64, 1, case),
+                Profile::Combined => run_combined_case(execution, FrameSize::Wire64, 1, case),
             }
+            .unwrap_or_else(|error| panic!("{}: {error:?}", case.label()));
+            assert_eq!(result.case, case.label());
+            labels.push(result.case);
         }
+        assert_eq!(
+            labels,
+            [
+                "ctl-udp0-out",
+                "nat-udp0-out-est",
+                "fw-udp0-out-est",
+                "both-udp0-out-est",
+                "ctl-udp0-in",
+                "nat-udp0-in-est",
+                "fw-udp0-in-est",
+                "both-udp0-in-est",
+                "ctl-udpc-out",
+                "nat-udpc-out-est",
+                "fw-udpc-out-est",
+                "both-udpc-out-est",
+                "ctl-udpc-in",
+                "nat-udpc-in-est",
+                "fw-udpc-in-est",
+                "both-udpc-in-est",
+                "ctl-tcp-out",
+                "nat-tcp-out-est",
+                "fw-tcp-out-est",
+                "both-tcp-out-est",
+                "ctl-tcp-in",
+                "nat-tcp-in-est",
+                "fw-tcp-in-est",
+                "both-tcp-in-est",
+            ]
+        );
     }
 
     #[test]
