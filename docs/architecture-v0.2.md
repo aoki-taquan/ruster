@@ -815,6 +815,32 @@ cancel/abandon、partial TX/reject、finish errorを決定的に実装します�
 packet bytesをcloneしません。次の実I/O backendも同じlease contractを実装し、
 backend固有pointerをcoreへ漏らしません。
 
+### AF_PACKET checked combined-mapping substrate
+
+`ruster-io-afpacket`のAP0は、64-bit Linuxのstrict TPACKET_V3 profileについて
+socket option、single combined mmap、bind activation、RX block/packet descriptor、
+RX/TX ownership modelを固定します。AP1-0はpacket処理を接続せず、このresource境界を
+後続RX/TX state machineが安全に所有できる形へ限定して拡張します。
+
+combined mappingはRXをoffset zero、TXを`rx.map_len()`直後に置きます。cold validationは
+RX/TX overlap、間隙、`usize`加算overflow、exact combined length、16-byteのTX relative
+alignmentを検証します。mapping取得後はactual base addressを加えたRX/TX先頭alignmentと
+各ring内のrelative access rangeを再検証し、RX accessがTX extentへ、またはその逆へ
+越境するpointerを生成しません。mapping ownerは分割されず一つのresourceに残り、field drop順を
+mapping、socketに固定するため、通常終了とbind失敗のどちらもunmapがcloseより先です。
+
+syscall境界はprivate genericによるstatic dispatchです。productionのzero-sized `LinuxOps`は
+既存FFIを直接呼び、test専用`ScriptedOps`はsetup各段のerrnoとcleanup順をNIC/rootなしで
+注入します。trait object、runtime backend selection、共有lockは追加しません。
+validated portごとに、一つのRX blockが取り得る最大packet metadataとTX全frame metadataを
+socket取得前にfallibleなcold pathで固定長確保します。確保後の反復accessはallocationせず、
+storage addressも変わりません。
+
+このsliceはpersistent RX validation cursor、`PacketIo` lease、RXからdistinct TX frameへのcopy、
+TX descriptor publication/completion、`send(MSG_DONTWAIT)` wakeup、poll、live stats/cleanupを
+実装しません。従ってIO-012のproduction conformance、実packet送受信、throughputは引き続き
+deferredです。
+
 `ruster-io-xdp`の最初のsliceは、native AF_XDP backendではなく、全targetでcompileできる
 pure-Rust ownership/ring modelです。socket、native ring、libxdp FFI、XDP program、core
 `PacketIo` adapterを持たず、`unsafe`をcrate全体で禁止します。従ってIO-009のreal generated

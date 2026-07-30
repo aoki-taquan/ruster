@@ -22,11 +22,14 @@
 //! the kernel's 48-byte minimum data offset rather than the larger RX Ethernet
 //! offset. The socket is opened with protocol zero and becomes active only when
 //! its validated `sockaddr_ll` is bound. Backend counters are fixed accumulators
-//! only; no live I/O or cleanup telemetry is wired in AP0.
+//! only. AP1-0 additionally fixes disjoint RX/TX extents within the combined
+//! mapping and cold-preallocates fixed metadata for later state machines. It
+//! still provides no live I/O, `PacketIo`, wakeup, or cleanup telemetry.
 
 #[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
 compile_error!("ruster-io-afpacket currently supports only 64-bit Linux targets");
 
+mod boundary;
 mod config;
 mod error;
 mod model;

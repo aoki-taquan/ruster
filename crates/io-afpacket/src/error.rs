@@ -35,6 +35,8 @@ pub enum PlatformError {
     UnsupportedPlatform,
     UapiLayoutMismatch,
     InvalidSocketAddress { family: u16, if_index: i32 },
+    InvalidCombinedMapping(MappingAccessError),
+    MetadataAllocationFailed { kind: RingKind, entries: usize },
     Syscall { stage: SyscallStage, errno: Errno },
 }
 
@@ -49,6 +51,15 @@ impl fmt::Display for PlatformError {
                 write!(
                     formatter,
                     "invalid AF_PACKET address family {family}, ifindex {if_index}"
+                )
+            }
+            Self::InvalidCombinedMapping(source) => {
+                write!(formatter, "invalid combined AF_PACKET mapping: {source:?}")
+            }
+            Self::MetadataAllocationFailed { kind, entries } => {
+                write!(
+                    formatter,
+                    "cannot preallocate {entries} {kind:?} metadata entries"
                 )
             }
             Self::Syscall { stage, errno } => {
@@ -233,9 +244,38 @@ pub enum ConfigError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MappingAccessError {
     ArithmeticOverflow,
-    OffsetOutOfBounds { offset: usize, length: usize },
-    StatusNotAligned { offset: usize },
-    BlockNotUser { status: u32 },
+    OffsetOutOfBounds {
+        offset: usize,
+        length: usize,
+    },
+    StatusNotAligned {
+        offset: usize,
+    },
+    RingExtentsOverlap {
+        rx_end: usize,
+        tx_start: usize,
+    },
+    RingExtentGap {
+        rx_end: usize,
+        tx_start: usize,
+    },
+    RingExtentMisaligned {
+        kind: RingKind,
+        offset: usize,
+        alignment: usize,
+    },
+    RingOffsetOutOfBounds {
+        kind: RingKind,
+        offset: usize,
+        length: usize,
+    },
+    CombinedLengthMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    BlockNotUser {
+        status: u32,
+    },
     PacketAlreadyBorrowed,
     PacketNotBorrowed,
     Geometry(GeometryError),
