@@ -41,18 +41,44 @@ use ruster_core::{
 /// }
 /// ```
 ///
-/// An active view also cannot be widened beyond the adapter borrow:
+/// Extracting copied authority does not release the adapter borrow. A
+/// candidate cannot be published while that authority is still live:
 ///
 /// ```compile_fail
 /// use ruster_runtime::{FullServicePublication, FullServiceView};
 ///
-/// fn escape<'storage, P>(
+/// fn publish_while_authority_is_live<'storage, P>(
 ///     publication: &mut P,
-/// ) -> FullServiceView<'static, 'storage>
+///     candidate: P::Candidate,
+/// )
 /// where
 ///     P: FullServicePublication<'storage>,
 /// {
-///     publication.active().expect("active publication")
+///     let view: FullServiceView<'_, 'storage> =
+///         publication.active().expect("active publication");
+///     let snapshot = view.snapshot;
+///     let firewall_config = view.firewall_config;
+///     let _result = publication.publish_candidate(candidate);
+///     drop((snapshot, firewall_config));
+/// }
+/// ```
+///
+/// The complete old view likewise cannot remain live across a publication
+/// attempt:
+///
+/// ```compile_fail
+/// use ruster_runtime::FullServicePublication;
+///
+/// fn publish_while_old_view_is_live<'storage, P>(
+///     publication: &mut P,
+///     candidate: P::Candidate,
+/// )
+/// where
+///     P: FullServicePublication<'storage>,
+/// {
+///     let old_view = publication.active().expect("active publication");
+///     let _result = publication.publish_candidate(candidate);
+///     drop(old_view);
 /// }
 /// ```
 ///
