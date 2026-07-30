@@ -1,0 +1,173 @@
+use std::fmt::Write as _;
+
+use crate::{FrameSize, SampleStats};
+
+pub const SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OutputFormat {
+    Human,
+    JsonLines,
+    Both,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResultRow {
+    pub case: &'static str,
+    pub size: FrameSize,
+    pub batch: usize,
+    pub checksum_passes: u8,
+    pub seed: u64,
+    pub repetitions_per_sample: usize,
+    pub timed_allocations: u64,
+    pub stats: SampleStats,
+    pub digest: u16,
+}
+
+impl ResultRow {
+    #[must_use]
+    pub fn human_header() -> &'static str {
+        "case                 size         batch passes  p50 ns/op  p95 ns/op   Mops/s allocs"
+    }
+
+    #[must_use]
+    pub fn to_human_line(&self) -> String {
+        format!(
+            "{:<20} {:<12} {:>5} {:>6} {:>10.2} {:>10.2} {:>8.3} {:>6}",
+            self.case,
+            self.size.label(),
+            self.batch,
+            self.checksum_passes,
+            self.stats.p50_ns,
+            self.stats.p95_ns,
+            self.stats.million_per_second(),
+            self.timed_allocations,
+        )
+    }
+
+    #[must_use]
+    pub fn to_json_line(&self) -> String {
+        let case = escape_json(self.case);
+        let size = escape_json(self.size.label());
+        format!(
+            concat!(
+                "{{\"schema_version\":{},\"kind\":\"measurement\",",
+                "\"case\":\"{}\",\"size\":\"{}\",",
+                "\"backend_bytes\":{},\"ethernet_bytes_including_fcs\":{},",
+                "\"wire_bytes_with_preamble_ifg\":{},\"ipv4_total_bytes\":{},",
+                "\"batch\":{},\"checksum_passes\":{},\"seed\":{},",
+                "\"samples\":{},\"repetitions_per_sample\":{},",
+                "\"min_ns_per_op\":{:.6},\"p50_ns_per_op\":{:.6},",
+                "\"p95_ns_per_op\":{:.6},\"mad_ns_per_op\":{:.6},",
+                "\"million_ops_per_second\":{:.6},",
+                "\"timed_allocations\":{},\"digest\":{}}}"
+            ),
+            SCHEMA_VERSION,
+            case,
+            size,
+            self.size.backend_bytes(),
+            self.size.ethernet_bytes_including_fcs(),
+            self.size.wire_bytes_with_preamble_ifg(),
+            self.size.ipv4_total_bytes(),
+            self.batch,
+            self.checksum_passes,
+            self.seed,
+            self.stats.samples,
+            self.repetitions_per_sample,
+            self.stats.min_ns,
+            self.stats.p50_ns,
+            self.stats.p95_ns,
+            self.stats.mad_ns,
+            self.stats.million_per_second(),
+            self.timed_allocations,
+            self.digest,
+        )
+    }
+}
+
+fn escape_json(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\u{000c}' => escaped.push_str("\\f"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{0000}'..='\u{001f}' => {
+                write!(escaped, "\\u{:04x}", u32::from(character))
+                    .expect("writing to String cannot fail");
+            }
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_line_has_stable_schema_and_unambiguous_wire_metadata() {
+        let row = ResultRow {
+            case: "plain-ipv4",
+            size: FrameSize::Wire64,
+            batch: 32,
+            checksum_passes: 0,
+            seed: 7,
+            repetitions_per_sample: 10,
+            timed_allocations: 0,
+            stats: SampleStats {
+                samples: 3,
+                min_ns: 1.0,
+                p50_ns: 2.0,
+                p95_ns: 3.0,
+                mad_ns: 1.0,
+            },
+            digest: 42,
+        };
+        assert_eq!(
+            row.to_json_line(),
+            concat!(
+                "{\"schema_version\":1,\"kind\":\"measurement\",",
+                "\"case\":\"plain-ipv4\",\"size\":\"wire64\",",
+                "\"backend_bytes\":60,\"ethernet_bytes_including_fcs\":64,",
+                "\"wire_bytes_with_preamble_ifg\":84,\"ipv4_total_bytes\":46,",
+                "\"batch\":32,\"checksum_passes\":0,\"seed\":7,",
+                "\"samples\":3,\"repetitions_per_sample\":10,",
+                "\"min_ns_per_op\":1.000000,\"p50_ns_per_op\":2.000000,",
+                "\"p95_ns_per_op\":3.000000,\"mad_ns_per_op\":1.000000,",
+                "\"million_ops_per_second\":500.000000,",
+                "\"timed_allocations\":0,\"digest\":42}"
+            )
+        );
+    }
+
+    #[test]
+    fn json_line_escapes_hostile_public_string_values() {
+        let row = ResultRow {
+            case: "quote\" slash\\ controls\n\r\t\u{0008}\u{000c}\u{0001}",
+            size: FrameSize::Wire64,
+            batch: 1,
+            checksum_passes: 0,
+            seed: 1,
+            repetitions_per_sample: 1,
+            timed_allocations: 0,
+            stats: SampleStats {
+                samples: 1,
+                min_ns: 1.0,
+                p50_ns: 1.0,
+                p95_ns: 1.0,
+                mad_ns: 0.0,
+            },
+            digest: 0,
+        };
+        let json = row.to_json_line();
+        assert!(json.contains("\"case\":\"quote\\\" slash\\\\ controls\\n\\r\\t\\b\\f\\u0001\""));
+        assert!(!json.contains('\u{0001}'));
+        assert_eq!(escape_json("雪"), "雪");
+    }
+}
