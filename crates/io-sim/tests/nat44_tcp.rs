@@ -341,7 +341,7 @@ fn syn_synack_and_data_translate_bidirectionally_in_one_batch() {
         40_000,
         443,
         64,
-        0x4000,
+        0xc000,
         0xc2,
         &[2, 4, 5, 0xb4],
         &[1, 2, 3],
@@ -353,7 +353,7 @@ fn syn_synack_and_data_translate_bidirectionally_in_one_batch() {
         443,
         40_000,
         50,
-        0x4000,
+        0xc000,
         0x12,
         &[],
         &[],
@@ -379,6 +379,7 @@ fn syn_synack_and_data_translate_bidirectionally_in_one_batch() {
     assert_eq!(&out.bytes[0..6], &GW_MAC.0);
     assert_eq!(&out.bytes[26..30], &PUBLIC.octets());
     assert_eq!(out.bytes[22], 63);
+    assert_eq!(&out.bytes[20..22], &0xc000_u16.to_be_bytes());
     assert_eq!(ipv4_header_checksum(&out.bytes[14..34]), 0);
     assert!(tcp_checksum_valid(&out.bytes));
     assert_eq!(&out.bytes[54..58], &[2, 4, 5, 0xb4]);
@@ -388,6 +389,7 @@ fn syn_synack_and_data_translate_bidirectionally_in_one_batch() {
     assert_eq!(inbound.egress, LAN);
     assert_eq!(&inbound.bytes[30..34], &HOST.octets());
     assert_eq!(inbound.bytes[22], 49);
+    assert_eq!(&inbound.bytes[20..22], &0xc000_u16.to_be_bytes());
     assert!(tcp_checksum_valid(&inbound.bytes));
 
     io.inject(
@@ -1057,6 +1059,14 @@ fn malformed_checksum_fragment_source_zero_and_options_are_atomic() {
     cases.push((checksum, DropReason::Nat44TcpChecksumInvalid));
     cases.push((
         tcp_frame(HOST, REMOTE1, 40_000, 443, 64, 0, 0x02, &[], &[], &[]),
+        DropReason::Nat44TcpNonAtomicIpv4Unsupported,
+    ));
+    cases.push((
+        tcp_frame(HOST, REMOTE1, 40_000, 443, 64, 0xe000, 0x02, &[], &[], &[]),
+        DropReason::Nat44TcpNonAtomicIpv4Unsupported,
+    ));
+    cases.push((
+        tcp_frame(HOST, REMOTE1, 40_000, 443, 64, 0xc001, 0x02, &[], &[], &[]),
         DropReason::Nat44TcpNonAtomicIpv4Unsupported,
     ));
     cases.push((

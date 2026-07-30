@@ -402,8 +402,8 @@ refreshせずdropし、filterを緩めません。live mappingをevictせず、p
    neighborを先に確定。source reverse-LPMがinsideであることを確認。
 3. inbound public UDPはlocal deliveryより先にinterceptし、mapping/ADF lookup後、
    translated internal destinationを通常LPMしinside neighborを確定。
-4. DF=1/MF=0/offset=0、UDP header/length、全offset、mapping/peer/port transactionを
-   mutationなしでplan。
+4. reserved flagをfragment判定からmaskした上でDF=1/MF=0/offset=0、UDP header/length、
+   全offset、mapping/peer/port transactionをmutationなしでplan。
 5. L2、TTL、IPv4 address、UDP port、IPv4/UDP checksumの完全なrewrite planを適用。
 6. mapping/peer/refreshをinfallible commitし、最後にRX leaseをTX requestへcommit。
 
@@ -425,7 +425,8 @@ RFC 768のUDP lengthは8以上かつIPv4 payload以下を要求し、短いUDP l
 paddingは保存します。checksum zeroはzeroのままです。nonzero checksumはRFC 1624で
 translated IPv4 address wordsとportを更新し、算術結果zeroをUDP wireの`0xffff`へencode
 します。入力nonzero checksumを新規にfull validationしないrouter profileです。IPv4 IDは
-RFC 6864 atomic datagramとして保存します。
+RFC 6864 atomic datagramとして保存します。RFC 1812 §4.2.2.3に従いreserved flagだけでは
+dropせず、IPv4 flags/fragment wordをNAT rewrite後のwireへそのまま保存します。
 
 fragment handling/reassembly、hairpinning、Type 3/Code 4以外のICMP errorとICMP query
 NAT、static port forward、複数public address、port randomization/parity、minimal
@@ -468,7 +469,8 @@ reconcileがgenerationをresetしたABAやslot再利用後に旧tupleを復活�
 
 admissionとtransaction順はUDP profileに合わせ、次を追加します。
 
-1. IHL=5、DF=1/MF=0/offset=0、protocol=6、IPv4 payload 20 bytes以上を要求する。
+1. IHL=5、reserved flagを除いてDF=1/MF=0/offset=0、protocol=6、IPv4 payload 20 bytes以上を
+   要求する。reserved flagは受理してNAT rewrite後も保存する。
 2. TCP Data Offsetは5以上かつheader endがIPv4 Total Length内であることを要求する。
 3. pseudo-headerとIPv4 TCP payload全体（odd final byteはlogical zero pad）を含むincoming
    TCP checksumをfull validationする。TCP checksum field zeroも無効化表現ではなく、
@@ -554,10 +556,12 @@ firewallはopt-inの追加serviceであり、既存`forward_batch*` APIとdefaul
 しません。`forward_batch_with_firewall`はplain forwarding、combined APIはUDP/TCP NAT44と
 同じworker-local RX transactionで合成します。対象はrouterを通過するunfragmented IPv4
 UDP/TCPだけです。ARP、ingress-scoped router-local IPv4、RX phase後に実行するrouter-originated
-generated packetはfirewall domain外です。options、reserved flag、MF、nonzero fragment
-offset、TCP/UDP以外のforward protocolはsilent typed dropで、ICMP/RSTを生成しません。
+generated packetはfirewall domain外です。options、MF、nonzero fragment offset、
+TCP/UDP以外のforward protocolはsilent typed dropで、ICMP/RSTを生成しません。
 RFC 791のfragment fieldsでMF=0/offset=0なら、DF=0とDF=1のどちらもunfragmented datagram
-として許可します。ここでRFC 6864のatomic datagramという用語は使いません。
+として許可します。RFC 1812 §4.2.2.3に従いreserved flagはfragment判定からmaskし、単独では
+dropせずforward wireへ保存します。reserved flagとMF/offsetが同時にある場合は、MF/offsetを
+理由に従来どおりdropします。ここでRFC 6864のatomic datagramという用語は使いません。
 
 UDP/TCP NAT44、firewall、router-originated ICMPv4 error captureを全て有効にするworkerは
 `forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors`または監査付きvariantを
