@@ -14,17 +14,18 @@ mod route;
 
 pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
 pub use firewall::{
-    FirewallAction, FirewallAuditBuffer, FirewallAuditRecord, FirewallCommitError, FirewallConfig,
-    FirewallConfigError, FirewallConnectionClass, FirewallCounters, FirewallDisposition,
-    FirewallFailure, FirewallHashKey, FirewallHashKeyError, FirewallInterface, FirewallIpv4Prefix,
-    FirewallIpv4PrefixError, FirewallPlanError, FirewallPolicy, FirewallPolicyError,
-    FirewallPolicySource, FirewallPortRange, FirewallPortRangeError, FirewallProtocol,
-    FirewallReconcileError, FirewallReconcileReport, FirewallRelatedIcmpv4Error,
-    FirewallRelatedIcmpv4Flow, FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot,
-    FirewallTcpPhase, FirewallVerdict, FIREWALL_MAX_IDLE_TTL_MS,
-    FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS, FIREWALL_TCP_ACTIVE_MIN_IDLE_TTL_MS,
-    FIREWALL_TCP_OPENING_DEFAULT_IDLE_TTL_MS, FIREWALL_TCP_OPENING_MIN_IDLE_TTL_MS,
-    FIREWALL_UDP_DEFAULT_IDLE_TTL_MS, FIREWALL_UDP_MIN_IDLE_TTL_MS,
+    validate_firewall_rules, FirewallAction, FirewallAuditBuffer, FirewallAuditRecord,
+    FirewallCommitError, FirewallConfig, FirewallConfigError, FirewallConnectionClass,
+    FirewallCounters, FirewallDisposition, FirewallFailure, FirewallHashKey, FirewallHashKeyError,
+    FirewallInterface, FirewallIpv4Prefix, FirewallIpv4PrefixError, FirewallPlanError,
+    FirewallPolicy, FirewallPolicyError, FirewallPolicySource, FirewallPortRange,
+    FirewallPortRangeError, FirewallProtocol, FirewallReconcileError, FirewallReconcileReport,
+    FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow, FirewallRule, FirewallRuleId,
+    FirewallRuntime, FirewallStateSlot, FirewallTcpPhase, FirewallVerdict,
+    FIREWALL_MAX_IDLE_TTL_MS, FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS,
+    FIREWALL_TCP_ACTIVE_MIN_IDLE_TTL_MS, FIREWALL_TCP_OPENING_DEFAULT_IDLE_TTL_MS,
+    FIREWALL_TCP_OPENING_MIN_IDLE_TTL_MS, FIREWALL_UDP_DEFAULT_IDLE_TTL_MS,
+    FIREWALL_UDP_MIN_IDLE_TTL_MS,
 };
 pub use forwarding::{
     forward_batch, forward_batch_with_firewall, forward_batch_with_firewall_and_icmpv4_errors,

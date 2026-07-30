@@ -361,6 +361,52 @@ pub enum FirewallConfigError {
     EgressInterfaceMissing,
 }
 
+/// Validates firewall rule identity and interface references without creating
+/// publication state.
+///
+/// This is the control-plane validation seam for an offline configuration.
+/// It does not require a configuration generation or a per-publication
+/// [`FirewallHashKey`]. Policy values are validated independently by
+/// [`FirewallPolicy::new`].
+///
+/// Rules are checked in slice order. Within each rule, the stable error
+/// precedence is zero ID, duplicate ID, missing ingress, then missing egress.
+pub fn validate_firewall_rules(
+    snapshot: &ForwardingSnapshot<'_>,
+    rules: &[FirewallRule],
+) -> Result<(), FirewallConfigError> {
+    for (index, rule) in rules.iter().enumerate() {
+        if rule.id.0 == 0 {
+            return Err(FirewallConfigError::RuleIdZero);
+        }
+        if rules[..index]
+            .iter()
+            .any(|candidate| candidate.id == rule.id)
+        {
+            return Err(FirewallConfigError::DuplicateRuleId);
+        }
+        if let FirewallInterface::Interface(interface) = rule.ingress {
+            if !snapshot
+                .interfaces
+                .iter()
+                .any(|candidate| candidate.id == interface)
+            {
+                return Err(FirewallConfigError::IngressInterfaceMissing);
+            }
+        }
+        if let FirewallInterface::Interface(interface) = rule.egress {
+            if !snapshot
+                .interfaces
+                .iter()
+                .any(|candidate| candidate.id == interface)
+            {
+                return Err(FirewallConfigError::EgressInterfaceMissing);
+            }
+        }
+    }
+    Ok(())
+}
+
 impl<'a> FirewallConfig<'a> {
     pub fn new(
         snapshot: &ForwardingSnapshot<'_>,
@@ -372,35 +418,7 @@ impl<'a> FirewallConfig<'a> {
         if generation == 0 {
             return Err(FirewallConfigError::GenerationZero);
         }
-        for (index, rule) in rules.iter().enumerate() {
-            if rule.id.0 == 0 {
-                return Err(FirewallConfigError::RuleIdZero);
-            }
-            if rules[..index]
-                .iter()
-                .any(|candidate| candidate.id == rule.id)
-            {
-                return Err(FirewallConfigError::DuplicateRuleId);
-            }
-            if let FirewallInterface::Interface(interface) = rule.ingress {
-                if !snapshot
-                    .interfaces
-                    .iter()
-                    .any(|candidate| candidate.id == interface)
-                {
-                    return Err(FirewallConfigError::IngressInterfaceMissing);
-                }
-            }
-            if let FirewallInterface::Interface(interface) = rule.egress {
-                if !snapshot
-                    .interfaces
-                    .iter()
-                    .any(|candidate| candidate.id == interface)
-                {
-                    return Err(FirewallConfigError::EgressInterfaceMissing);
-                }
-            }
-        }
+        validate_firewall_rules(snapshot, rules)?;
         Ok(Self {
             rules,
             policy,
@@ -1621,6 +1639,111 @@ mod tests {
             assert_eq!(
                 runtime.plan_packet(packet(FirewallProtocol::Udp, 0), 0),
                 Err(FirewallPlanError::RuleDenied(FirewallRuleId(1)))
+            );
+        });
+    }
+
+    #[test]
+    fn offline_rule_validation_matches_publication_validation_and_error_order() {
+        with_snapshot(|snapshot| {
+            let valid = [
+                rule(1, FirewallAction::Deny, FirewallProtocol::Udp),
+                rule(2, FirewallAction::AllowStateful, FirewallProtocol::Tcp),
+            ];
+            assert_eq!(validate_firewall_rules(snapshot, &[]), Ok(()));
+            assert_eq!(validate_firewall_rules(snapshot, &valid), Ok(()));
+            assert!(FirewallConfig::new(
+                snapshot,
+                &valid,
+                FirewallPolicy::default(),
+                1,
+                hash_key(),
+            )
+            .is_ok());
+
+            let zero_id_before_missing_interfaces = [FirewallRule::new(
+                FirewallRuleId(0),
+                FirewallInterface::Interface(IfId(98)),
+                FirewallInterface::Interface(IfId(99)),
+                any(),
+                any(),
+                FirewallProtocol::Udp,
+                FirewallPortRange::new(0, u16::MAX).unwrap(),
+                FirewallPortRange::new(0, u16::MAX).unwrap(),
+                FirewallAction::Deny,
+            )];
+            let duplicate_before_missing_interfaces = [
+                rule(7, FirewallAction::Deny, FirewallProtocol::Udp),
+                FirewallRule::new(
+                    FirewallRuleId(7),
+                    FirewallInterface::Interface(IfId(98)),
+                    FirewallInterface::Interface(IfId(99)),
+                    any(),
+                    any(),
+                    FirewallProtocol::Udp,
+                    FirewallPortRange::new(0, u16::MAX).unwrap(),
+                    FirewallPortRange::new(0, u16::MAX).unwrap(),
+                    FirewallAction::Deny,
+                ),
+            ];
+            let ingress_before_egress = [FirewallRule::new(
+                FirewallRuleId(8),
+                FirewallInterface::Interface(IfId(98)),
+                FirewallInterface::Interface(IfId(99)),
+                any(),
+                any(),
+                FirewallProtocol::Udp,
+                FirewallPortRange::new(0, u16::MAX).unwrap(),
+                FirewallPortRange::new(0, u16::MAX).unwrap(),
+                FirewallAction::Deny,
+            )];
+            let missing_egress = [FirewallRule::new(
+                FirewallRuleId(9),
+                FirewallInterface::Any,
+                FirewallInterface::Interface(IfId(99)),
+                any(),
+                any(),
+                FirewallProtocol::Udp,
+                FirewallPortRange::new(0, u16::MAX).unwrap(),
+                FirewallPortRange::new(0, u16::MAX).unwrap(),
+                FirewallAction::Deny,
+            )];
+
+            for (rules, expected) in [
+                (
+                    zero_id_before_missing_interfaces.as_slice(),
+                    FirewallConfigError::RuleIdZero,
+                ),
+                (
+                    duplicate_before_missing_interfaces.as_slice(),
+                    FirewallConfigError::DuplicateRuleId,
+                ),
+                (
+                    ingress_before_egress.as_slice(),
+                    FirewallConfigError::IngressInterfaceMissing,
+                ),
+                (
+                    missing_egress.as_slice(),
+                    FirewallConfigError::EgressInterfaceMissing,
+                ),
+            ] {
+                assert_eq!(validate_firewall_rules(snapshot, rules), Err(expected));
+                assert_eq!(
+                    FirewallConfig::new(snapshot, rules, FirewallPolicy::default(), 1, hash_key(),),
+                    Err(expected)
+                );
+            }
+
+            assert_eq!(
+                FirewallConfig::new(
+                    snapshot,
+                    &zero_id_before_missing_interfaces,
+                    FirewallPolicy::default(),
+                    0,
+                    hash_key(),
+                ),
+                Err(FirewallConfigError::GenerationZero),
+                "publication metadata remains the first FirewallConfig::new check"
             );
         });
     }
