@@ -314,15 +314,19 @@ resolution、generated ICMP captureのfull composition wrapperだけを使用し
 `active`はO(1)のsteady-tick borrowであり、semantic validation、fingerprint/hash計算、slice scan、
 allocationを繰り返しません。これらはcandidate構築・publicationのcold pathで完了します。
 validated snapshotとNAT/firewall config identityは`Copy`値としてviewへ渡し、publication
-adapterに一時値への参照を返させません。snapshot内sliceとfirewall rulesのborrowはactive
-adapter borrowと同じview lifetimeへ短縮し、mutable runtime storageもそのtick-local viewだけが
-exclusiveにreborrowします。`FullServiceView`自身は`Copy`/`Clone`にせず、viewをtick外へescape
-させません。このsnapshot by-value化はpre-1.0 APIの意図したsource breakであり、旧
-`snapshot: &ForwardingSnapshot` struct literalを使うdownstream adapterは値copyへ更新します。
-64-bit buildではsnapshot 144 bytes、Firewall config 160 bytes、UDP/TCP NAT configは各112
-bytesで、full view全体を576 bytes以下に保ちます。1024 tickの回帰fixtureは各tickの`active`
-呼出しがexactly once、heap allocationとvalidation/fingerprint/hash/slice scan再実行がzeroで
-あることを固定します。
+adapterに一時値への参照を返させません。UDP/TCP NAT44とfirewallは各configと対応するoptional
+runtimeをservice-specific nested viewで対にし、resolutionとgenerated ICMP runtimeは直接
+borrowします。view自身の`NonZeroU64` generationがtick内のcoherent publication identityです。
+snapshot内sliceとfirewall rulesのborrowはactive adapter borrowと同じview lifetimeへ短縮し、
+mutable runtime storageもそのtick-local viewだけがexclusiveにreborrowします。
+`FullServiceView`自身は`Copy`/`Clone`にせず、viewをtick外へescapeさせません。このsnapshot
+by-value化、generation追加、flat config/runtime fieldのnested化はpre-1.0 APIの意図したsource
+breakであり、downstream adapterはstruct literalを更新します。現行core full wrapperは3 configを
+必須とするため、service pair全体の不在表現はoptional-config composition seamを追加する後続
+作業です。64-bit buildではsnapshot 144 bytes、Firewall config 160 bytes、UDP/TCP NAT configは
+各112 bytesで、full view全体を576 bytes以下に保ちます。1024 tickの回帰fixtureは各tickの
+`active`呼出しがexactly once、heap allocationとvalidation/fingerprint/hash/slice scan再実行が
+zeroであることを固定します。
 
 `TickBudgets`はRX packet数、resolution timer scan、failure dispatch scan、generated ARP action、
 generated ICMPv4 actionを独立に制限します。RX batchはlexical scopeでwrapperへmoveし、

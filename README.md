@@ -183,7 +183,10 @@ skipします。RX batchはfull composition wrapperへmoveされ、そのborrow�
 generated sessionを開始します。各phase reportは固定サイズで、RX errorとgenerated error、
 clock regression、budget exhaustion、allocation/build/finish/accounting failureを区別します。
 backendのTX acceptedはdescriptor publicationであり、wire送信やcompletion queue返却を
-意味しません。
+意味しません。tick-local `FullServiceView`は非ゼロgenerationを持ち、UDP/TCP NAT44と
+firewallの各configを対応するoptional runtimeとnested viewで対にします。resolutionと
+generated ICMP runtimeは直接borrowのままです。現行core full wrapperは3 configを必須とする
+ため、service pair全体の不在表現はoptional-config composition seamを追加する後続作業です。
 
 ## 開発
 
