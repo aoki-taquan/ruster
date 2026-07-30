@@ -1013,6 +1013,54 @@ mod tcp_tests {
     }
 
     #[test]
+    fn tcp_read_only_outbound_revision_exhaustion_is_byte_atomic() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_000, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            let plan = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                .unwrap();
+            runtime.commit_outbound(plan, 0).unwrap();
+            runtime.state_revision = u128::MAX;
+
+            let before_mappings: [Nat44TcpMappingSlot; 1] = runtime.mappings().try_into().unwrap();
+            let before_sessions: [Nat44TcpSessionSlot; 1] = runtime.sessions().try_into().unwrap();
+            let before_mapping_directory = runtime.mapping_directory.backing_snapshot();
+            let before_session_directory = runtime.session_directory.backing_snapshot();
+            let before_port_owners = runtime.port_owners.backing_snapshot();
+            let before_watermark = runtime.watermark_ms;
+            let before_generation = runtime.next_generation;
+            let before_epoch = runtime.runtime_epoch;
+            let before_binding = runtime.runtime_binding;
+            let before_counters = runtime.counters();
+
+            assert!(matches!(
+                runtime.plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 443, false, 0,),
+                Err(Nat44TcpPlanError::StateRevisionExhausted)
+            ));
+            assert_eq!(runtime.mappings(), &before_mappings);
+            assert_eq!(runtime.sessions(), &before_sessions);
+            assert_eq!(
+                runtime.mapping_directory.backing_snapshot(),
+                before_mapping_directory
+            );
+            assert_eq!(
+                runtime.session_directory.backing_snapshot(),
+                before_session_directory
+            );
+            assert_eq!(runtime.port_owners.backing_snapshot(), before_port_owners);
+            assert_eq!(runtime.watermark_ms, before_watermark);
+            assert_eq!(runtime.next_generation, before_generation);
+            assert_eq!(runtime.runtime_epoch, before_epoch);
+            assert_eq!(runtime.state_revision, u128::MAX);
+            assert!(runtime.runtime_binding == before_binding);
+            assert_eq!(runtime.counters(), before_counters);
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+    }
+
+    #[test]
     fn tcp_mapping_recreation_keeps_stale_sessions_lazy_and_capacity_reusable() {
         with_config(
             Nat44TcpPolicy::new(NAT44_TCP_MIN_IDLE_TTL_MS, 0).unwrap(),
@@ -4279,6 +4327,12 @@ impl<'a> Nat44TcpRuntime<'a> {
         self.counters.config_mismatches = self.counters.config_mismatches.saturating_add(1);
     }
 
+    #[cfg(test)]
+    pub(crate) fn exhaust_state_revision_at_for_test(&mut self, now_ms: u64) {
+        self.state_revision = u128::MAX;
+        self.watermark_ms = Some(now_ms);
+    }
+
     pub(crate) fn observe_now(&mut self, now_ms: u64) -> Result<(), Nat44TcpPlanError> {
         if self
             .watermark_ms
@@ -4351,6 +4405,9 @@ impl<'a> Nat44TcpRuntime<'a> {
         initial_syn: bool,
         now_ms: u64,
     ) -> Result<Nat44TcpOutboundPlan, Nat44TcpPlanError> {
+        if self.state_revision == u128::MAX {
+            return Err(Nat44TcpPlanError::StateRevisionExhausted);
+        }
         let exact_mapping = self.find_mapping(internal_address, internal_port)?;
         if let Some((mapping_index, mut mapping)) =
             exact_mapping.filter(|(_, mapping)| self.mapping_is_live(*mapping, now_ms))
