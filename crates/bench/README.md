@@ -19,8 +19,12 @@ two-pass controlを測定します。NAT/firewall/state pressureは後続slice�
 84 bytesです。`ip-mtu1500`はそれぞれ1514、1518、1538 bytesです。結果のJSONLにも
 全ての値を別fieldで保存します。
 
-fixture生成、buffer reset、batch acquisition、結果検証、formattingはtimed region外です。
-timed region内でcurrent worker threadのallocationを一つでも検出したrunは失敗します。
+fixture生成、結果検証、formattingはtimed region外です。buffer resetとbatch acquisitionの
+costは次のaggregate subtractionで結果から除外します。測定interval内でcurrent worker
+threadのallocationを一つでも検出したrunは失敗します。
+plain forwardingは同じ反復数の`reset + receive` intervalを別に一度測り、全反復を一つの
+intervalで測った値から差し引きます。packetごとのclock読取りを入れず、batchごとの
+`forward_batch`/finish境界を維持します。
 各packet bufferは測定直前のresetでCPU cacheへ触れるため、これはcoreのhot-cache
 microbenchmarkであり、NIC/backend DMAやcold-cache throughputの主張ではありません。
 

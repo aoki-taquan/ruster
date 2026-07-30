@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use crate::{FrameSize, SampleStats};
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -45,6 +47,8 @@ impl ResultRow {
 
     #[must_use]
     pub fn to_json_line(&self) -> String {
+        let case = escape_json(self.case);
+        let size = escape_json(self.size.label());
         format!(
             concat!(
                 "{{\"schema_version\":{},\"kind\":\"measurement\",",
@@ -59,8 +63,8 @@ impl ResultRow {
                 "\"timed_allocations\":{},\"digest\":{}}}"
             ),
             SCHEMA_VERSION,
-            self.case,
-            self.size.label(),
+            case,
+            size,
             self.size.backend_bytes(),
             self.size.ethernet_bytes_including_fcs(),
             self.size.wire_bytes_with_preamble_ifg(),
@@ -79,6 +83,27 @@ impl ResultRow {
             self.digest,
         )
     }
+}
+
+fn escape_json(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '"' => escaped.push_str("\\\""),
+            '\\' => escaped.push_str("\\\\"),
+            '\u{0008}' => escaped.push_str("\\b"),
+            '\u{000c}' => escaped.push_str("\\f"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{0000}'..='\u{001f}' => {
+                write!(escaped, "\\u{:04x}", u32::from(character))
+                    .expect("writing to String cannot fail");
+            }
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -119,5 +144,30 @@ mod tests {
                 "\"timed_allocations\":0,\"digest\":42}"
             )
         );
+    }
+
+    #[test]
+    fn json_line_escapes_hostile_public_string_values() {
+        let row = ResultRow {
+            case: "quote\" slash\\ controls\n\r\t\u{0008}\u{000c}\u{0001}",
+            size: FrameSize::Wire64,
+            batch: 1,
+            checksum_passes: 0,
+            seed: 1,
+            repetitions_per_sample: 1,
+            timed_allocations: 0,
+            stats: SampleStats {
+                samples: 1,
+                min_ns: 1.0,
+                p50_ns: 1.0,
+                p95_ns: 1.0,
+                mad_ns: 0.0,
+            },
+            digest: 0,
+        };
+        let json = row.to_json_line();
+        assert!(json.contains("\"case\":\"quote\\\" slash\\\\ controls\\n\\r\\t\\b\\f\\u0001\""));
+        assert!(!json.contains('\u{0001}'));
+        assert_eq!(escape_json("雪"), "雪");
     }
 }

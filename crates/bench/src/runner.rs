@@ -257,36 +257,42 @@ fn measure_plain(
     batch_size: usize,
     repetitions: usize,
 ) -> Result<Measurement, RunError> {
-    let mut elapsed = Duration::ZERO;
-    let mut allocations = 0_u64;
-    let mut digest = 0_u16;
-    let mut trace = NoTrace;
+    let setup_started = Instant::now();
     for _ in 0..repetitions {
         backend.reset(template);
         let batch = backend.receive(batch_size).expect("infallible backend");
-        let before_allocations = allocation_count();
-        let started = Instant::now();
-        let report = forward_batch(batch, snapshot, &mut trace);
-        elapsed += started.elapsed();
-        allocations += allocation_count() - before_allocations;
-        if report.received != batch_size
-            || report.tx_requested != batch_size
-            || report.dropped != 0
-            || report.consumed != 0
-            || report.completion.tx_requested != batch_size
-            || report.completion.tx_accepted != batch_size
-            || report.completion.tx_rejected != 0
-            || report.completion.recycled != 0
-            || report.completion.error.is_some()
-        {
-            return Err(RunError::UnexpectedBatchReport);
-        }
-        digest = u16::try_from(black_box(report.tx_requested)).unwrap_or(u16::MAX);
+        let _ = black_box(batch);
+    }
+    let setup_elapsed = setup_started.elapsed();
+
+    let mut trace = NoTrace;
+    let before_allocations = allocation_count();
+    let measured_started = Instant::now();
+    let mut last_report = None;
+    for _ in 0..repetitions {
+        backend.reset(template);
+        let batch = backend.receive(batch_size).expect("infallible backend");
+        last_report = Some(black_box(forward_batch(batch, snapshot, &mut trace)));
+    }
+    let measured_elapsed = measured_started.elapsed();
+    let allocations = allocation_count() - before_allocations;
+    let report = black_box(last_report).expect("repetitions are nonzero");
+    if report.received != batch_size
+        || report.tx_requested != batch_size
+        || report.dropped != 0
+        || report.consumed != 0
+        || report.completion.tx_requested != batch_size
+        || report.completion.tx_accepted != batch_size
+        || report.completion.tx_rejected != 0
+        || report.completion.recycled != 0
+        || report.completion.error.is_some()
+    {
+        return Err(RunError::UnexpectedBatchReport);
     }
     Ok(Measurement {
-        elapsed,
+        elapsed: measured_elapsed.saturating_sub(setup_elapsed),
         allocations,
-        digest,
+        digest: u16::try_from(report.tx_requested).unwrap_or(u16::MAX),
     })
 }
 
@@ -435,5 +441,17 @@ mod tests {
         assert!(rows.iter().any(|row| {
             row.case == "plain-ipv4" && row.size == FrameSize::Wire64 && row.stats.samples == 1
         }));
+    }
+
+    #[test]
+    fn checksum_control_matches_an_independent_known_answer() {
+        // RFC 1071-style four-word example:
+        // 0001 + f203 + f4f5 + f6f7 = ddf2 after carry folding.
+        let bytes = [0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7];
+        let once = measure_checksum(&bytes, 1, 3);
+        let twice = measure_checksum(&bytes, 2, 3);
+        assert_eq!(once.digest, 0x220d);
+        assert_eq!(twice.digest, once.digest);
+        assert_eq!(internet_checksum(&bytes), 0x220d);
     }
 }
