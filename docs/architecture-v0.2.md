@@ -311,6 +311,8 @@ candidate rejectは旧active viewを失効させず、そのtickのdata phaseを
 active viewがなければRXを開始せず、残りの全phaseを`NoActivePublication`としてtyped skipします。
 一度借用したactive viewはtick終了まで同一generationであり、RXにはUDP/TCP NAT44、firewall、
 resolution、generated ICMP captureのfull composition wrapperだけを使用します。
+`active`はO(1)のsteady-tick borrowであり、semantic validation、fingerprint/hash計算、slice scan、
+allocationを繰り返しません。これらはcandidate構築・publicationのcold pathで完了します。
 
 `TickBudgets`はRX packet数、resolution timer scan、failure dispatch scan、generated ARP action、
 generated ICMPv4 actionを独立に制限します。RX batchはlexical scopeでwrapperへmoveし、

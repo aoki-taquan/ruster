@@ -34,6 +34,9 @@ pub struct FullServiceView<'view, 'storage> {
 /// but does not stop the tick: `active` is subsequently called so the old
 /// publication can continue serving traffic. The active view returned for a
 /// tick must remain one coherent generation until the view is dropped.
+/// `active` is a steady-tick O(1) borrow: it must not repeat semantic
+/// validation, fingerprinting, hashing, slice scans, or allocation. Those
+/// cold-path operations belong to candidate construction/publication.
 pub trait FullServicePublication<'storage> {
     type Candidate;
     type Reject;
@@ -714,6 +717,8 @@ mod tests {
     struct TestPublication<'view, 'storage> {
         enabled: bool,
         applied: usize,
+        active_calls: usize,
+        steady_validation_scans: usize,
         snapshot: &'view ForwardingSnapshot<'storage>,
         resolution: &'view mut ResolutionRuntime<'storage>,
         icmpv4_errors: &'view mut Icmpv4ErrorRuntime<'storage>,
@@ -737,6 +742,7 @@ mod tests {
         }
 
         fn active(&mut self) -> Option<FullServiceView<'_, 'storage>> {
+            self.active_calls += 1;
             self.enabled.then_some(FullServiceView {
                 snapshot: self.snapshot,
                 resolution: self.resolution,
@@ -831,6 +837,8 @@ mod tests {
         let mut publication = TestPublication {
             enabled: true,
             applied: 0,
+            active_calls: 0,
+            steady_validation_scans: 0,
             snapshot: &snapshot,
             resolution: &mut resolution,
             icmpv4_errors: &mut icmpv4_errors,
@@ -1291,6 +1299,23 @@ mod tests {
                 trace.phases[trace.phase_len - 1],
                 Some(TickPhaseTrace::TickFinished)
             );
+        });
+    }
+
+    #[test]
+    fn active_view_is_one_o1_borrow_without_revalidation_scans() {
+        with_fixture(|publication, io, trace| {
+            let report = run_tick(
+                publication,
+                None,
+                io,
+                MonotonicMillis(0),
+                TickBudgets::default(),
+                trace,
+            );
+            assert!(report.active);
+            assert_eq!(publication.active_calls, 1);
+            assert_eq!(publication.steady_validation_scans, 0);
         });
     }
 
