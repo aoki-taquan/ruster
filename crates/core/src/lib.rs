@@ -3,7 +3,8 @@
 
 mod checksum;
 mod firewall;
-// The N2 primitive intentionally lands before its NAT runtime integration.
+// N2 lands crate-private before N3/N4 NAT runtime integration. The temporary
+// allowance is scoped to that staged rollout and is removed when it is wired.
 #[allow(dead_code)]
 mod fixed_directory;
 mod forwarding;
