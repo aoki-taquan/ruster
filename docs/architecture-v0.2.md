@@ -497,10 +497,13 @@ TCP serviceはRFC 3022のtraditional NAPT tuple rewrite、RFC 5382/7857のtimer�
 用語、RFC 9293のTCP header、RFC 1624のincremental checksum、RFC 6864のatomic datagram
 profileを参照する限定実装です。RFC 5382全体への準拠は主張しません。
 
-`Nat44TcpRuntime`はUDP runtimeとstorage、generation、watermark、allocatorを共有しない
-`!Send + !Sync` worker-local ownerです。mapping keyは
+`Nat44TcpRuntime`はUDP runtimeとstorage、key、generation、watermark、allocatorを共有しない
+`!Send + !Sync` worker-local ownerです。caller-backed mapping/session directoryと
+protocol-local direct public-port ownerを専有し、outbound worst-caseはadditive
+`O(M+S+P)`、inbound/quoted ICMPはownerからexact sessionへ直接到達します。mapping keyは
 `(inside IfId, internal IPv4, internal TCP port)`、session keyは
-`(mapping slot, mapping generation, remote IPv4, remote TCP port)`です。複数remote sessionは
+`(mapping slot, mapping generation, lifecycle epoch, remote IPv4, remote TCP port)`です。
+mapping再生成は旧sessionを全走査せずgeneration+epochでlazyに無効化します。複数remote sessionは
 同じpublic tupleを再利用しますが、inbound filterはremote address/portのexact matchであり、
 RFC 5382が推奨するEndpoint-Independent FilteringやAddress-Dependent Filteringより厳しい
 connection-dependent local policyです。protocol-dependent tableなのでUDPとTCPは同じ数値
@@ -521,7 +524,8 @@ mappingのlive判定はsession storageを走査せずO(1)です。refresh plan�
 両方のcopyを更新し、後続処理が成功したcommitでだけ同時に公開するため、破棄されたplanは
 mapping lifetimeを延長しません。要約はcaller-backed mapping slotごとに`u64` 1個
 （logical 8 bytes、Rust layoutのpaddingを除く）を追加し、session capacityには比例しません。
-planはruntime epoch、計画時watermark、対象mapping/sessionのbefore valueへbindします。
+planはruntime epoch、nonwrapping state revision、計画時watermark、prepared directory/owner
+topologyへbindします。packet rewrite前に全topologyを検証し、rewrite後commitはinfallibleです。
 release buildのcommitも全authorityが一致しないstale planをtyped errorとして拒否するため、
 reconcileがgenerationをresetしたABAやslot再利用後に旧tupleを復活させません。
 

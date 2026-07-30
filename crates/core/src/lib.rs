@@ -62,12 +62,14 @@ pub use io::{
 };
 pub use nat44::{
     Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpCounters,
-    Nat44TcpDisposition, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError,
-    Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig,
-    Nat44UdpConfigError, Nat44UdpCounters, Nat44UdpDisposition, Nat44UdpHashKey,
-    Nat44UdpHashKeyError, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
-    Nat44UdpPolicy, Nat44UdpPolicyError, Nat44UdpReconcileError, Nat44UdpReconcilePermit,
-    Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError, Nat44UdpStorageShape,
+    Nat44TcpDisposition, Nat44TcpHashKey, Nat44TcpHashKeyError, Nat44TcpIndexStorage,
+    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpReconcileError,
+    Nat44TcpReconcilePermit, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError,
+    Nat44TcpSessionSlot, Nat44TcpStorageShape, Nat44UdpConfig, Nat44UdpConfigError,
+    Nat44UdpCounters, Nat44UdpDisposition, Nat44UdpHashKey, Nat44UdpHashKeyError,
+    Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
+    Nat44UdpPolicyError, Nat44UdpReconcileError, Nat44UdpReconcilePermit, Nat44UdpReconcileReport,
+    Nat44UdpRuntime, Nat44UdpRuntimeConfigError, Nat44UdpStorageShape,
     NAT44_TCP_DEFAULT_IDLE_TTL_MS, NAT44_TCP_MAX_IDLE_TTL_MS, NAT44_TCP_MIN_IDLE_TTL_MS,
     NAT44_UDP_DEFAULT_IDLE_TTL_MS, NAT44_UDP_MAX_IDLE_TTL_MS, NAT44_UDP_MIN_IDLE_TTL_MS,
 };

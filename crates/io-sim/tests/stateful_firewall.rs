@@ -1015,7 +1015,7 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 2];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 2];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
     let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution_runtime = resolution(&mut resolution_states, &mut resolution_actions);
@@ -1259,7 +1259,7 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
     );
     let mut route_tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut route_tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut route_tcp = Nat44TcpRuntime::new(
+    let mut route_tcp = support::tcp_runtime(
         route_tcp_config,
         &mut route_tcp_mappings,
         &mut route_tcp_sessions,
@@ -1485,7 +1485,7 @@ fn nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically() {
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 2];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 2];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -1818,7 +1818,7 @@ fn related_icmpv4_requires_both_nat_mapping_and_firewall_origin_state() {
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
     let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
@@ -1999,7 +1999,7 @@ fn tracked_related_neighbor_miss_schedules_arp_and_fresh_retry_translates() {
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
     let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
     let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
@@ -2136,7 +2136,7 @@ fn nat_and_firewall_capacity_failures_leave_the_other_state_uncommitted() {
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -2217,7 +2217,7 @@ fn nat_inbound_mapping_without_exact_firewall_reverse_state_is_denied() {
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut states = [ResolutionStateSlot::EMPTY; 1];
     let mut actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut states, &mut actions);
@@ -2714,7 +2714,7 @@ fn future_combined_denies_advance_udp_and_tcp_nat_security_watermarks_only() {
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
     let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
@@ -2824,7 +2824,7 @@ fn exact_nat_expiry_then_old_time_cannot_resurrect_udp_or_tcp_mappings() {
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
     let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
@@ -3220,7 +3220,7 @@ fn nat_outbound_and_exact_reverse_are_visible_in_the_same_batch() {
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
     let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
@@ -3287,7 +3287,7 @@ fn tcp_nat_and_firewall_state_is_same_batch_visible_despite_backend_rejection() 
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
     let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
@@ -3465,7 +3465,7 @@ fn ipv4_ingress_admission_precedes_nat_firewall_time_state_audit_and_actions() {
         let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
         let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
         let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
-        let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+        let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
         let mut firewall_slots = [FirewallStateSlot::default(); 2];
         let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_slots);
         let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];

@@ -9,11 +9,12 @@ use ruster_core::{
     FirewallAction, FirewallConfig, FirewallHashKey, FirewallInterface, FirewallIpv4Prefix,
     FirewallPolicy, FirewallPortRange, FirewallProtocol, FirewallRule, FirewallRuleId,
     FirewallRuntime, FirewallStateSlot, ForwardingSnapshot, IfId, Interface, Ipv4Address,
-    LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44TcpConfig, Nat44TcpMappingSlot,
-    Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpHashKey,
-    Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime,
-    Neighbor, NoTrace, PacketIo, PortOwnerSlot, ResolutionActionSlot, ResolutionPolicy,
-    ResolutionRuntime, ResolutionStateSlot, Route,
+    LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44TcpConfig, Nat44TcpHashKey,
+    Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime,
+    Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpIndexStorage,
+    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace,
+    PacketIo, PortOwnerSlot, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime,
+    ResolutionStateSlot, Route,
 };
 
 use crate::backend::BenchBatch;
@@ -73,6 +74,41 @@ impl UdpBenchIndexes {
                 .expect("benchmark UDP hash key"),
         )
         .expect("benchmark UDP runtime")
+    }
+}
+
+#[derive(Default)]
+struct TcpBenchIndexes {
+    mapping_buckets: [DirectoryBucket; 4],
+    mapping_nodes: [DirectoryNode; 4],
+    session_buckets: [DirectoryBucket; 4],
+    session_nodes: [DirectoryNode; 4],
+    port_owners: [PortOwnerSlot; 1],
+}
+
+impl TcpBenchIndexes {
+    fn runtime<'a>(
+        &'a mut self,
+        config: Nat44TcpConfig,
+        mappings: &'a mut [Nat44TcpMappingSlot; 4],
+        sessions: &'a mut [Nat44TcpSessionSlot; 4],
+    ) -> Nat44TcpRuntime<'a> {
+        let storage = Nat44TcpIndexStorage::new(
+            &mut self.mapping_buckets,
+            &mut self.mapping_nodes,
+            &mut self.session_buckets,
+            &mut self.session_nodes,
+            &mut self.port_owners,
+        );
+        Nat44TcpRuntime::new(
+            config,
+            mappings,
+            sessions,
+            storage,
+            Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0)
+                .expect("benchmark TCP hash key"),
+        )
+        .expect("benchmark TCP runtime")
     }
 }
 
@@ -492,7 +528,8 @@ fn run_nat_case(
         Transport::Tcp => {
             let mut mappings = [Nat44TcpMappingSlot::default(); 4];
             let mut sessions = [Nat44TcpSessionSlot::default(); 4];
-            let mut runtime = Nat44TcpRuntime::new(tcp_config, &mut mappings, &mut sessions);
+            let mut indexes = TcpBenchIndexes::default();
+            let mut runtime = indexes.runtime(tcp_config, &mut mappings, &mut sessions);
             establish_tcp(
                 case,
                 |batch| {
@@ -666,9 +703,10 @@ fn run_combined_case(
     let mut udp_indexes = UdpBenchIndexes::default();
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 4];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 4];
+    let mut tcp_indexes = TcpBenchIndexes::default();
     let mut firewall_states = [FirewallStateSlot::default(); 4];
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
-    let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut tcp = tcp_indexes.runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_states);
     let mut resolution_states: [ResolutionStateSlot; 0] = [];
     let mut resolution_actions: [ResolutionActionSlot; 0] = [];

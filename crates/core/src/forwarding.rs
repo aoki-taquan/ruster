@@ -1537,6 +1537,19 @@ where
                 trace,
             )
             .and_then(|decision| {
+                if let PacketDecision::Nat44Tcp(nat) = decision {
+                    let runtime = nat44_tcp
+                        .as_deref()
+                        .ok_or(DropReason::Nat44TcpRuntimeUnavailable)?;
+                    match nat.transition {
+                        Nat44TcpTransition::Outbound(plan) => runtime
+                            .prevalidate_outbound_commit(plan, nat_now_ms)
+                            .map_err(|_| DropReason::Nat44TcpConfigMismatch)?,
+                        Nat44TcpTransition::Inbound(plan) => runtime
+                            .prevalidate_inbound_commit(plan, nat_now_ms)
+                            .map_err(|_| DropReason::Nat44TcpConfigMismatch)?,
+                    }
+                }
                 if matches!(
                     decision,
                     PacketDecision::ConsumeArp(_) | PacketDecision::ConsumeIpv4Local
@@ -1600,19 +1613,14 @@ where
                     });
                 }
                 if let PacketDecision::Nat44Tcp(nat) = decision {
-                    let runtime = nat44_tcp
-                        .as_deref_mut()
-                        .expect("TCP NAT decision requires a bound runtime");
-                    match nat.transition {
-                        Nat44TcpTransition::Outbound(plan) => {
-                            runtime
-                                .commit_outbound(plan, nat_now_ms)
-                                .expect("sequential packet path keeps TCP NAT plan current");
-                        }
-                        Nat44TcpTransition::Inbound(plan) => {
-                            runtime
-                                .commit_inbound(plan, nat_now_ms)
-                                .expect("sequential packet path keeps TCP NAT plan current");
+                    if let Some(runtime) = nat44_tcp.as_deref_mut() {
+                        match nat.transition {
+                            Nat44TcpTransition::Outbound(plan) => {
+                                runtime.commit_prevalidated_outbound(plan, nat_now_ms);
+                            }
+                            Nat44TcpTransition::Inbound(plan) => {
+                                runtime.commit_prevalidated_inbound(plan, nat_now_ms);
+                            }
                         }
                     }
                     trace.record(TraceEvent::Nat44Tcp {
@@ -2490,6 +2498,9 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
                         | Nat44TcpPlanError::PortExhausted => {
                             unreachable!("read-only ICMP lookup cannot create state")
                         }
+                        Nat44TcpPlanError::IndexCorrupt
+                        | Nat44TcpPlanError::GenerationExhausted
+                        | Nat44TcpPlanError::StateRevisionExhausted => Nat44TcpConfigMismatch,
                     };
                     trace_nat44_icmpv4_drop(ingress, reason, trace)
                 })?;
@@ -4144,6 +4155,11 @@ fn nat44_tcp_plan_error(error: Nat44TcpPlanError) -> (DropReason, Nat44TcpDispos
             Nat44TcpClockRegression,
             Nat44TcpDisposition::ClockRegression,
         ),
+        Nat44TcpPlanError::IndexCorrupt
+        | Nat44TcpPlanError::GenerationExhausted
+        | Nat44TcpPlanError::StateRevisionExhausted => {
+            (Nat44TcpConfigMismatch, Nat44TcpDisposition::ConfigMismatch)
+        }
     }
 }
 
