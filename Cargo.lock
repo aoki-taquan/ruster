@@ -31,3 +31,11 @@ dependencies = [
 [[package]]
 name = "ruster-io-xdp"
 version = "0.2.0"
+
+[[package]]
+name = "ruster-runtime"
+version = "0.2.0"
+dependencies = [
+ "ruster-core",
+ "ruster-io-sim",
+]

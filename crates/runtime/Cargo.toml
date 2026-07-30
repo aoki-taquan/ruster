@@ -1,0 +1,12 @@
+[package]
+name = "ruster-runtime"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ruster-core = { path = "../core" }
+
+[dev-dependencies]
+ruster-io-sim = { path = "../io-sim" }
