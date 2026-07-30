@@ -278,7 +278,7 @@ fn exact_bidirectional_wire_and_same_batch_visibility() {
         40_000,
         53,
         64,
-        0x4000,
+        0xc000,
         &[1, 2, 3, 4, 5],
         &[0xaa, 0xbb],
         UdpChecksum::Valid,
@@ -289,7 +289,7 @@ fn exact_bidirectional_wire_and_same_batch_visibility() {
         9_999,
         40_000,
         50,
-        0x4000,
+        0xc000,
         &[9, 8, 7],
         &[],
         UdpChecksum::Valid,
@@ -321,6 +321,7 @@ fn exact_bidirectional_wire_and_same_batch_visibility() {
         40_000
     );
     assert_eq!(out.bytes[22], 63);
+    assert_eq!(&out.bytes[20..22], &0xc000_u16.to_be_bytes());
     assert_eq!(ipv4_header_checksum(&out.bytes[14..34]), 0);
     assert!(udp_checksum_valid(&out.bytes));
     assert_eq!(&out.bytes[47..49], &[0xaa, 0xbb]);
@@ -336,6 +337,7 @@ fn exact_bidirectional_wire_and_same_batch_visibility() {
         40_000
     );
     assert_eq!(inbound.bytes[22], 49);
+    assert_eq!(&inbound.bytes[20..22], &0xc000_u16.to_be_bytes());
     assert_eq!(ipv4_header_checksum(&inbound.bytes[14..34]), 0);
     assert!(udp_checksum_valid(&inbound.bytes));
     assert_eq!(nat.counters().outbound_translated, 1);
@@ -696,7 +698,7 @@ fn structural_and_policy_failures_are_byte_and_state_atomic() {
                 40_000,
                 53,
                 64,
-                0x4001,
+                0xc001,
                 &[],
                 &[],
                 UdpChecksum::Zero,
@@ -710,7 +712,7 @@ fn structural_and_policy_failures_are_byte_and_state_atomic() {
                 40_000,
                 53,
                 64,
-                0x2000,
+                0xe000,
                 &[],
                 &[],
                 UdpChecksum::Zero,

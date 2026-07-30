@@ -544,7 +544,7 @@ fn fragment_flags_offset_payload_and_checksum_are_preserved_or_updated_correctly
     let neighbors = [gateway_neighbor()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
     let mut fragment = frame(5, &[0xaa; 8]);
-    fragment[20..22].copy_from_slice(&0x2001_u16.to_be_bytes());
+    fragment[20..22].copy_from_slice(&0xa001_u16.to_be_bytes());
     fragment[24..26].fill(0);
     let checksum = ipv4_header_checksum(&fragment[14..34]);
     fragment[24..26].copy_from_slice(&checksum.to_be_bytes());

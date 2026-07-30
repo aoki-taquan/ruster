@@ -72,7 +72,8 @@ UDP NAT44は`forward_batch_with_nat44_udp`、またはgenerated ICMP errorも含
 inside/outside/public IPv4とnonzero port poolを設定し、mappingとremote-address filter
 peerをcaller-backed固定配列で所有します。outboundはEndpoint-Independent Mapping、
 inboundは過去に送信したremote IPv4だけを許すAddress-Dependent Filteringです。
-IPv4 optionsなし、DF=1/MF=0/offset=0のatomic UDPだけを変換し、UDP checksum zeroを保存、
+IPv4 optionsなし、DF=1/MF=0/offset=0のatomic UDPだけを変換します。受信reserved flagは
+fragment判定から除外し、NAT rewrite後もwire上に保存します。UDP checksum zeroを保存、
 nonzero checksumとIPv4 checksumをRFC 1624でincremental更新します。
 
 idle TTLはdefault 300秒、minimum 120秒で、outbound TX requestだけがrefreshします。
@@ -90,6 +91,8 @@ ICMP error、他のtype/codeとquery NAT、local MTU起因のType 3/Code 4生成
 static forward、
 multi-public、port randomization/parity、full packet filterはdeferredで、RFC 4787/7857全体への
 準拠は主張しません。
+引用UDP/TCP IPv4 headerもreserved flagをfragment判定から除外し、reserved以外は
+DF=1/MF=0/offset=0を要求します。引用reserved flagはtuple rewrite後も保存します。
 
 TCP NAT44は別のcaller-backed mapping/session storageを持ち、UDPと同じ数値public portを
 独立して使用できます。mappingはinternal TCP tupleのEndpoint-Independent Mapping、filterは
@@ -97,7 +100,8 @@ remote IPv4とremote TCP portのexact matchです。新規sessionはoutbound SYN
 ACK/RST/FIN=0だけが作成し、既存sessionではSYN-ACK、data、FIN、RSTを含むvalid packetを
 双方向に変換します。TCP header/options/dataを含むIPv4 payload全体のchecksumをstate更新前に
 検証し、address/port rewrite後もRFC 1624で更新します。TCPでは算術結果zeroもwire zeroの
-ままです。
+ままです。TCPもreserved flagをfragment判定から除外してwireへ保存し、reserved以外は
+DF=1/MF=0/offset=0を要求します。
 
 TCP session idle TTLはdefault/minimumともに2時間4分です。sequence/window/ACK妥当性は追跡
 せず、FIN/RSTもsessionを削除・短縮せず通常のsuccessful TX requestとしてTTLだけをrefresh
@@ -111,8 +115,9 @@ IPv4 forward firewallは`forward_batch_with_firewall`を選んだworkerだけで
 ordered rule sliceとmutableなfixed-capacity state sliceをcallerが所有し、first-matchの
 `AllowStateful`/`Deny`とimplicit default denyを適用します。対象はoptionsなし、DF=0または
 DF=1のnonfragment UDP/TCPです。ARP、router-local、router-originated generated packetは対象外で、
-その他のforward protocol、options、reserved/MF/fragment offsetはfail closedです。UDP checksum
-zeroは許可し、nonzeroはfull検証します。UDPはexact reverse pseudo-session、TCPはinitial SYN
+その他のforward protocol、options、MF/fragment offsetはfail closedです。reserved flagだけでは
+dropせずforward wireに保存します。UDP checksum zeroは許可し、nonzeroはfull検証します。
+UDPはexact reverse pseudo-session、TCPはinitial SYN
 だけが新規stateを作り、tupleとorigin ingress/egressの完全一致だけをlocal `ESTABLISHED`として
 扱います。これはTCP sequence/window stateやRFC 5382/7857全体への準拠を意味しません。
 snapshot/rule fingerprintは設定publication時に固定します。control planeがpublicationごとに

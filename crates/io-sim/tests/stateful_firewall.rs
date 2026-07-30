@@ -633,8 +633,8 @@ fn udp_pseudo_session_exact_reverse_checksum_df_and_padding_are_enforced() {
     let mut resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
 
-    let outbound = udp_frame(HOST, REMOTE, 12_345, 53, 0, true);
-    let reverse = udp_frame(REMOTE, HOST, 53, 12_345, 0x4000, true);
+    let outbound = udp_frame(HOST, REMOTE, 12_345, 53, 0x8000, true);
+    let reverse = udp_frame(REMOTE, HOST, 53, 12_345, 0xc000, true);
     io.inject(LAN, outbound);
     io.inject(WAN, reverse.clone());
     io.run_firewall_once(
@@ -647,9 +647,15 @@ fn udp_pseudo_session_exact_reverse_checksum_df_and_padding_are_enforced() {
         &mut NoTrace,
     )
     .unwrap();
-    assert_eq!(io.pop_tx().unwrap().egress, WAN);
+    let translated_outbound = io.pop_tx().unwrap();
+    assert_eq!(translated_outbound.egress, WAN);
+    assert_eq!(
+        &translated_outbound.bytes[20..22],
+        &0x8000_u16.to_be_bytes()
+    );
     let translated_reverse = io.pop_tx().unwrap();
     assert_eq!(translated_reverse.egress, LAN);
+    assert_eq!(&translated_reverse.bytes[20..22], &0xc000_u16.to_be_bytes());
     assert_eq!(&translated_reverse.bytes[45..], &[0, 0, 0]);
     assert_eq!(firewall.counters().allowed_established, 1);
 
@@ -735,8 +741,8 @@ fn tcp_initial_syn_same_batch_reverse_phase_fin_and_rst_refresh_are_exact() {
     let mut resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
 
-    let syn = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0x4000);
-    let simultaneous = tcp_frame(REMOTE, HOST, 443, 12_345, 0x02, 0);
+    let syn = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0xc000);
+    let simultaneous = tcp_frame(REMOTE, HOST, 443, 12_345, 0x02, 0x8000);
     io.inject(LAN, syn);
     io.inject(WAN, simultaneous);
     io.run_firewall_once(
@@ -749,11 +755,18 @@ fn tcp_initial_syn_same_batch_reverse_phase_fin_and_rst_refresh_are_exact() {
         &mut NoTrace,
     )
     .unwrap();
-    assert_eq!(io.pop_tx().unwrap().egress, WAN);
-    assert_eq!(io.pop_tx().unwrap().egress, LAN);
+    let forwarded_syn = io.pop_tx().unwrap();
+    assert_eq!(forwarded_syn.egress, WAN);
+    assert_eq!(&forwarded_syn.bytes[20..22], &0xc000_u16.to_be_bytes());
+    let forwarded_simultaneous = io.pop_tx().unwrap();
+    assert_eq!(forwarded_simultaneous.egress, LAN);
+    assert_eq!(
+        &forwarded_simultaneous.bytes[20..22],
+        &0x8000_u16.to_be_bytes()
+    );
 
-    let syn_ack = tcp_frame(REMOTE, HOST, 443, 12_345, 0x12, 0x4000);
-    let ack = tcp_frame(HOST, REMOTE, 12_345, 443, 0x10, 0x4000);
+    let syn_ack = tcp_frame(REMOTE, HOST, 443, 12_345, 0x12, 0xc000);
+    let ack = tcp_frame(HOST, REMOTE, 12_345, 443, 0x10, 0xc000);
     io.inject(WAN, syn_ack);
     io.inject(LAN, ack);
     io.run_firewall_once(
@@ -3102,9 +3115,8 @@ fn unfragmented_transport_boundary_matrix_is_typed_and_byte_atomic() {
     let mut udp_truncated = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
     udp_truncated[16..18].copy_from_slice(&27_u16.to_be_bytes());
     rewrite_ipv4_header(&mut udp_truncated);
-    let reserved = udp_frame(HOST, REMOTE, 12_345, 53, 0x8000, false);
-    let more_fragments = udp_frame(HOST, REMOTE, 12_345, 53, 0x2000, false);
-    let fragment_offset = udp_frame(HOST, REMOTE, 12_345, 53, 1, false);
+    let more_fragments = udp_frame(HOST, REMOTE, 12_345, 53, 0xa000, false);
+    let fragment_offset = udp_frame(HOST, REMOTE, 12_345, 53, 0x8001, false);
     let mut tcp_offset_small = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0);
     tcp_offset_small[46] = 4 << 4;
     let mut tcp_offset_exceeds = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0);
@@ -3120,7 +3132,6 @@ fn unfragmented_transport_boundary_matrix_is_typed_and_byte_atomic() {
             DropReason::FirewallUdpLengthExceedsIpv4Payload,
         ),
         (udp_truncated, DropReason::FirewallUdpHeaderTruncated),
-        (reserved, DropReason::FirewallFragmentUnsupported),
         (more_fragments, DropReason::FirewallFragmentUnsupported),
         (fragment_offset, DropReason::FirewallFragmentUnsupported),
         (tcp_offset_small, DropReason::FirewallTcpDataOffsetTooSmall),
@@ -3184,8 +3195,8 @@ fn nat_outbound_and_exact_reverse_are_visible_in_the_same_batch() {
     let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut io = SimIo::new();
-    io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false));
-    io.inject(WAN, udp_frame(REMOTE, WAN_LOCAL, 53, 40_000, 0x4000, false));
+    io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53, 0xc000, false));
+    io.inject(WAN, udp_frame(REMOTE, WAN_LOCAL, 53, 40_000, 0xc000, false));
     io.run_nat44_udp_and_tcp_with_firewall_once(
         2,
         &snapshot,
@@ -3200,8 +3211,12 @@ fn nat_outbound_and_exact_reverse_are_visible_in_the_same_batch() {
         &mut NoTrace,
     )
     .unwrap();
-    assert_eq!(io.pop_tx().unwrap().egress, WAN);
-    assert_eq!(io.pop_tx().unwrap().egress, LAN);
+    let outbound = io.pop_tx().unwrap();
+    assert_eq!(outbound.egress, WAN);
+    assert_eq!(&outbound.bytes[20..22], &0xc000_u16.to_be_bytes());
+    let inbound = io.pop_tx().unwrap();
+    assert_eq!(inbound.egress, LAN);
+    assert_eq!(&inbound.bytes[20..22], &0xc000_u16.to_be_bytes());
     assert_eq!(udp.counters().outbound_translated, 1);
     assert_eq!(udp.counters().inbound_translated, 1);
     assert_eq!(firewall.counters().allowed_new, 1);
@@ -3247,8 +3262,8 @@ fn tcp_nat_and_firewall_state_is_same_batch_visible_despite_backend_rejection() 
     let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut io = SimIo::new();
     io.set_received_accept_budget(0);
-    let outbound = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0x4000);
-    let reverse = tcp_frame(REMOTE, WAN_LOCAL, 443, 41_000, 0x12, 0x4000);
+    let outbound = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0xc000);
+    let reverse = tcp_frame(REMOTE, WAN_LOCAL, 443, 41_000, 0x12, 0xc000);
     io.inject(LAN, outbound);
     io.inject(WAN, reverse);
     let report = io
@@ -3268,8 +3283,12 @@ fn tcp_nat_and_firewall_state_is_same_batch_visible_despite_backend_rejection() 
         .unwrap();
     assert_eq!(report.completion.tx_rejected, 2);
     assert!(io.pop_tx().is_none());
-    assert_eq!(io.pop_recycled().unwrap().cause, RecycleCause::TxRejected);
-    assert_eq!(io.pop_recycled().unwrap().cause, RecycleCause::TxRejected);
+    let rejected_outbound = io.pop_recycled().unwrap();
+    assert_eq!(rejected_outbound.cause, RecycleCause::TxRejected);
+    assert_eq!(&rejected_outbound.bytes[20..22], &0xc000_u16.to_be_bytes());
+    let rejected_inbound = io.pop_recycled().unwrap();
+    assert_eq!(rejected_inbound.cause, RecycleCause::TxRejected);
+    assert_eq!(&rejected_inbound.bytes[20..22], &0xc000_u16.to_be_bytes());
     assert!(tcp.mappings()[0].is_occupied());
     assert!(tcp.sessions()[0].is_occupied());
     assert!(firewall.states()[0].is_occupied());

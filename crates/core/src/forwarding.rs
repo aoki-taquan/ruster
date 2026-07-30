@@ -2637,7 +2637,7 @@ fn parse_nat44_icmpv4_frag_needed(
         return Err(Nat44Icmpv4QuotedChecksumInvalid);
     }
     let inner_flags = packet::read_u16(inner_header, 6).ok_or(Nat44Icmpv4QuotedHeaderTruncated)?;
-    if inner_flags != 0x4000 {
+    if inner_flags & 0x7fff != 0x4000 {
         return Err(Nat44Icmpv4QuotedFragmentUnsupported);
     }
     let protocol = *inner_header
@@ -2975,7 +2975,7 @@ fn validate_firewall_transport(
     }
     let flags_fragment =
         packet::read_u16(frame, ipv4.header_offset + 6).ok_or(FirewallFragmentUnsupported)?;
-    if !matches!(flags_fragment, 0 | 0x4000) {
+    if !matches!(flags_fragment & 0x7fff, 0 | 0x4000) {
         return Err(FirewallFragmentUnsupported);
     }
     let protocol = FirewallProtocol::from_ipv4(ipv4.protocol).ok_or(FirewallUnsupportedProtocol)?;
@@ -3656,7 +3656,7 @@ struct ValidatedNat44Tcp {
 fn validate_nat44_tcp_atomic(frame: &[u8], ipv4: packet::ValidatedIpv4) -> Result<(), DropReason> {
     let flags_fragment =
         packet::read_u16(frame, ipv4.header_offset + 6).ok_or(Ipv4HeaderLengthExceedsPacket)?;
-    if flags_fragment != 0x4000 {
+    if flags_fragment & 0x7fff != 0x4000 {
         return Err(Nat44TcpNonAtomicIpv4Unsupported);
     }
     Ok(())
@@ -3817,7 +3817,7 @@ struct ValidatedNat44Udp {
 fn validate_nat44_atomic(frame: &[u8], ipv4: packet::ValidatedIpv4) -> Result<(), DropReason> {
     let flags_fragment =
         packet::read_u16(frame, ipv4.header_offset + 6).ok_or(Ipv4HeaderLengthExceedsPacket)?;
-    if flags_fragment != 0x4000 {
+    if flags_fragment & 0x7fff != 0x4000 {
         return Err(Nat44UdpNonAtomicIpv4Unsupported);
     }
     Ok(())
