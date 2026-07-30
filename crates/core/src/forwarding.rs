@@ -1354,6 +1354,84 @@ where
     )
 }
 
+/// Composes independent UDP/TCP NAPT, one canonical-tuple firewall, and
+/// generated ICMPv4 error capture in one ordered RX phase.
+///
+/// Firewall authorization precedes TTL error capture. Generated execution
+/// remains a separate post-RX phase.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    udp_config: &Nat44UdpConfig,
+    nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+    tcp_config: &Nat44TcpConfig,
+    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    firewall_config: &FirewallConfig<'_>,
+    firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        Some((icmpv4_errors, now)),
+        Some(udp_config),
+        nat44_udp,
+        Some(tcp_config),
+        nat44_tcp,
+        Some(firewall_config),
+        firewall,
+        None,
+        trace,
+    )
+}
+
+/// Audited variant of
+/// [`forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors`].
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_audited<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    udp_config: &Nat44UdpConfig,
+    nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+    tcp_config: &Nat44TcpConfig,
+    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    firewall_config: &FirewallConfig<'_>,
+    firewall: Option<&mut FirewallRuntime<'_, '_>>,
+    audit: &mut FirewallAuditBuffer<'_>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        Some((icmpv4_errors, now)),
+        Some(udp_config),
+        nat44_udp,
+        Some(tcp_config),
+        nat44_tcp,
+        Some(firewall_config),
+        firewall,
+        Some(audit),
+        trace,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn forward_batch_inner<B, T>(
     mut batch: B,

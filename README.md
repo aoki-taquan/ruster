@@ -127,6 +127,13 @@ silent dropします。lookupはrule scan、reverse match、activity/phase/count
 行いません。NATを伴わないplain forwarded RELATEDはdeferredで、既存の
 `FIREWALL_RELATED_ICMPV4_UNSUPPORTED` discriminantは予約したままです。
 
+UDP/TCP NAT44、firewall、router-originated ICMPv4 errorを同じworkerへbindする場合は、
+`forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors`または監査付きvariantを
+選び、`Icmpv4ErrorRuntime`を必須で渡します。firewall deny、authority failure、route missは
+silentのままで、認可後のeligible TTL expiryはSNAT前の受信IPv4をquoteしてactionをqueueします。
+RX batchとgenerated TXは融合せず、既定のworker tick順どおりRX完了後に生成します。生成packet
+そのものはfirewallの対象外です。既存のICMP runtimeを取らないcombined APIは変更しません。
+
 ## 開発
 
 stable Rustだけで検証できます。
