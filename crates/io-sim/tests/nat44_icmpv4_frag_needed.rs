@@ -1012,7 +1012,9 @@ fn malformed_candidate_matrix_has_stable_atomic_reasons() {
         assert_eq!(nat.counters(), before_counters);
     }
 
-    io.inject(LAN, valid.clone());
+    let mut wrong_ingress = valid.clone();
+    wrong_ingress[0..6].copy_from_slice(&LAN_MAC.0);
+    io.inject(LAN, wrong_ingress.clone());
     io.run_nat44_udp_once(
         1,
         &snapshot,
@@ -1023,7 +1025,7 @@ fn malformed_candidate_matrix_has_stable_atomic_reasons() {
         &mut NoTrace,
     )
     .unwrap();
-    assert_drop(&mut io, DropReason::Nat44Icmpv4WrongIngress, &valid);
+    assert_drop(&mut io, DropReason::Nat44Icmpv4WrongIngress, &wrong_ingress);
 
     let no_mapping_config = udp_config(&snapshot, true);
     let mut empty_mappings = [Nat44UdpMappingSlot::default(); 1];
@@ -1268,8 +1270,8 @@ fn outer_source_admission_rejects_non_hosts_local_and_inside_routes_atomically()
             Ipv4Address::from_octets([192, 0, 2, 255]),
             DropReason::Ipv4SourceDirectedBroadcast,
         ),
-        (PUBLIC, DropReason::Nat44Icmpv4SourceForbidden),
-        (LAN_LOCAL, DropReason::Nat44Icmpv4SourceForbidden),
+        (PUBLIC, DropReason::Ipv4SourceLocalAddress),
+        (LAN_LOCAL, DropReason::Ipv4SourceLocalAddress),
         (HOST, DropReason::Nat44Icmpv4SourceForbidden),
     ];
     for (source, reason) in invalid_sources {

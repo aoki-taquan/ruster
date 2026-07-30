@@ -97,6 +97,47 @@ macro_rules! runtime {
 }
 
 #[test]
+fn ethernet_admission_precedes_arp_state_and_broadcast_request_remains_valid() {
+    let (routes, interfaces, bindings) = base();
+    let s = snapshot(&routes, &interfaces, &[], &bindings);
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut cache = [DynamicNeighborSlot::EMPTY; 1];
+    let mut rt = runtime!(
+        ResolutionPolicy::new(1_000, 2_000).unwrap(),
+        states,
+        actions,
+        cache
+    );
+    let before_counters = rt.counters();
+    let mut io = SimIo::new();
+
+    let mut wrong_unicast = arp(1, PEER, LOCAL, PEER_MAC, PEER_MAC);
+    wrong_unicast[0..6].copy_from_slice(&NEW_MAC.0);
+    let original = wrong_unicast.clone();
+    io.inject(IFACE, wrong_unicast);
+    let report = run(&mut io, &mut rt, &s, 500, 1, &mut VecTrace::default());
+    assert_eq!((report.tx_requested, report.dropped), (0, 1));
+    let recycled = io.pop_recycled().unwrap();
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Forwarding(DropReason::EthernetDestinationNotLocal)
+    );
+    assert_eq!(recycled.bytes, original);
+    assert_eq!(rt.counters(), before_counters);
+    assert_eq!((rt.dynamic_neighbor_count(), rt.pending_actions()), (0, 0));
+
+    let mut broadcast = arp(1, PEER, LOCAL, PEER_MAC, PEER_MAC);
+    broadcast[0..6].fill(0xff);
+    io.inject(IFACE, broadcast);
+    let report = run(&mut io, &mut rt, &s, 0, 1, &mut VecTrace::default());
+    assert_eq!((report.tx_requested, report.dropped), (1, 0));
+    let reply = io.pop_tx().unwrap();
+    assert_eq!(&reply.bytes[0..6], &PEER_MAC.0);
+    assert_eq!(&reply.bytes[6..12], &LOCAL_MAC.0);
+}
+
+#[test]
 fn miss_request_reply_consume_then_reinjected_ipv4_forwards() {
     let (routes, interfaces, bindings) = base();
     let s = snapshot(&routes, &interfaces, &[], &bindings);
@@ -185,7 +226,7 @@ fn existing_mapping_merge_precedes_target_and_opcode_and_garp_refreshes() {
         (80, 1, OTHER, PEER_MAC),
         (120, 1, PEER, NEW_MAC),
     ] {
-        io.inject(IFACE, arp(opcode, PEER, tpa, mac, MacAddress([9; 6])));
+        io.inject(IFACE, arp(opcode, PEER, tpa, mac, MacAddress([8; 6])));
         run(&mut io, &mut rt, &s, now, 1, &mut VecTrace::default());
         io.pop_recycled();
         io.inject(IFACE, ipv4(PEER));
@@ -628,7 +669,9 @@ fn reply_before_generated_execution_cancels_only_matching_fifo_action() {
         io.inject(IFACE, ipv4(target));
     }
     run(&mut io, &mut rt, &s, 0, 2, &mut VecTrace::default());
-    io.inject(second_if, ipv4(PEER));
+    let mut second_packet = ipv4(PEER);
+    second_packet[0..6].copy_from_slice(&NEW_MAC.0);
+    io.inject(second_if, second_packet);
     run(&mut io, &mut rt, &second, 0, 1, &mut VecTrace::default());
     assert_eq!(rt.pending_actions(), 3);
     io.inject(IFACE, arp(2, PEER, LOCAL, PEER_MAC, PEER_MAC));
@@ -708,7 +751,9 @@ fn reconcile_static_clears_stale_cache_and_wrapped_middle_action_fifo() {
         &OTHER.octets(),
         "advance the ring head before wrapping the tail"
     );
-    io.inject(second_if, ipv4(PEER));
+    let mut second_packet = ipv4(PEER);
+    second_packet[0..6].copy_from_slice(&NEW_MAC.0);
+    io.inject(second_if, second_packet);
     run(&mut io, &mut rt, &second, 0, 1, &mut VecTrace::default());
     io.pop_recycled();
     assert_eq!(rt.pending_actions(), 3);

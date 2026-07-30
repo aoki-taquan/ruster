@@ -157,6 +157,14 @@ pub enum DropReason {
     Ipv4DestinationClassE = 135,
     Ipv4DestinationNetworkAddress = 136,
     Ipv4DestinationDirectedBroadcast = 137,
+    EthernetDestinationNotLocal = 138,
+    ArpIngressInterfaceUnknown = 139,
+    ArpEthernetSourceZero = 140,
+    ArpEthernetSourceBroadcast = 141,
+    ArpEthernetSourceMulticast = 142,
+    ArpEthernetDestinationZero = 143,
+    ArpEthernetDestinationMulticast = 144,
+    Ipv4SourceLocalAddress = 145,
 }
 
 use DropReason::*;
@@ -304,6 +312,14 @@ impl DropReason {
             Ipv4DestinationClassE => "IPV4_DESTINATION_CLASS_E",
             Ipv4DestinationNetworkAddress => "IPV4_DESTINATION_NETWORK_ADDRESS",
             Ipv4DestinationDirectedBroadcast => "IPV4_DESTINATION_DIRECTED_BROADCAST",
+            EthernetDestinationNotLocal => "ETHERNET_DESTINATION_NOT_LOCAL",
+            ArpIngressInterfaceUnknown => "ARP_INGRESS_INTERFACE_UNKNOWN",
+            ArpEthernetSourceZero => "ARP_ETHERNET_SOURCE_ZERO",
+            ArpEthernetSourceBroadcast => "ARP_ETHERNET_SOURCE_BROADCAST",
+            ArpEthernetSourceMulticast => "ARP_ETHERNET_SOURCE_MULTICAST",
+            ArpEthernetDestinationZero => "ARP_ETHERNET_DESTINATION_ZERO",
+            ArpEthernetDestinationMulticast => "ARP_ETHERNET_DESTINATION_MULTICAST",
+            Ipv4SourceLocalAddress => "IPV4_SOURCE_LOCAL_ADDRESS",
         }
     }
 }
@@ -1677,6 +1693,7 @@ fn decide<T: TraceSink>(
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     let ether_type = packet::read_u16(frame, 12).ok_or(EthernetHeaderTruncated)?;
+    validate_ethernet_ingress(frame, snapshot, ingress, ether_type)?;
     match ether_type {
         IPV4_ETHERTYPE => decide_ipv4(
             frame,
@@ -1699,41 +1716,75 @@ fn decide<T: TraceSink>(
     }
 }
 
-fn validate_ipv4_ingress(
+fn validate_ethernet_ingress(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
-    ipv4: packet::ValidatedIpv4,
+    ether_type: u16,
 ) -> Result<(), DropReason> {
-    if !snapshot
+    if !matches!(ether_type, IPV4_ETHERTYPE | ARP_ETHERTYPE) {
+        return Ok(());
+    }
+    let interface = snapshot
         .interfaces
         .iter()
-        .any(|interface| interface.id == ingress)
-    {
-        return Err(Ipv4IngressInterfaceUnknown);
+        .find(|interface| interface.id == ingress)
+        .ok_or(if ether_type == IPV4_ETHERTYPE {
+            Ipv4IngressInterfaceUnknown
+        } else {
+            ArpIngressInterfaceUnknown
+        })?;
+    let destination_mac = frame.get(0..6).ok_or(EthernetHeaderTruncated)?;
+    let source_mac = frame.get(6..12).ok_or(EthernetHeaderTruncated)?;
+    if ether_type == IPV4_ETHERTYPE {
+        if source_mac == [0; 6] {
+            return Err(Ipv4EthernetSourceZero);
+        }
+        if source_mac == [0xff; 6] {
+            return Err(Ipv4EthernetSourceBroadcast);
+        }
+        if source_mac[0] & 1 != 0 {
+            return Err(Ipv4EthernetSourceMulticast);
+        }
+        if destination_mac == [0; 6] {
+            return Err(Ipv4EthernetDestinationZero);
+        }
+        if destination_mac == [0xff; 6] {
+            return Err(Ipv4EthernetDestinationBroadcast);
+        }
+        if destination_mac[0] & 1 != 0 {
+            return Err(Ipv4EthernetDestinationMulticast);
+        }
+    } else {
+        if source_mac == [0; 6] {
+            return Err(ArpEthernetSourceZero);
+        }
+        if source_mac == [0xff; 6] {
+            return Err(ArpEthernetSourceBroadcast);
+        }
+        if source_mac[0] & 1 != 0 {
+            return Err(ArpEthernetSourceMulticast);
+        }
+        if destination_mac == [0; 6] {
+            return Err(ArpEthernetDestinationZero);
+        }
+        if destination_mac == [0xff; 6] {
+            return Ok(());
+        }
+        if destination_mac[0] & 1 != 0 {
+            return Err(ArpEthernetDestinationMulticast);
+        }
     }
+    if destination_mac != interface.mac.0 {
+        return Err(EthernetDestinationNotLocal);
+    }
+    Ok(())
+}
 
-    let destination_mac = &frame[0..6];
-    let source_mac = &frame[6..12];
-    if source_mac == [0; 6] {
-        return Err(Ipv4EthernetSourceZero);
-    }
-    if source_mac == [0xff; 6] {
-        return Err(Ipv4EthernetSourceBroadcast);
-    }
-    if source_mac[0] & 1 != 0 {
-        return Err(Ipv4EthernetSourceMulticast);
-    }
-    if destination_mac == [0; 6] {
-        return Err(Ipv4EthernetDestinationZero);
-    }
-    if destination_mac == [0xff; 6] {
-        return Err(Ipv4EthernetDestinationBroadcast);
-    }
-    if destination_mac[0] & 1 != 0 {
-        return Err(Ipv4EthernetDestinationMulticast);
-    }
-
+fn validate_ipv4_ingress(
+    snapshot: &ForwardingSnapshot<'_>,
+    ipv4: packet::ValidatedIpv4,
+) -> Result<(), DropReason> {
     let source = ipv4.source.octets();
     if source == [255; 4] {
         return Err(Ipv4SourceLimitedBroadcast);
@@ -1744,6 +1795,13 @@ fn validate_ipv4_ingress(
         224..=239 => return Err(Ipv4SourceMulticast),
         240..=255 => return Err(Ipv4SourceClassE),
         _ => {}
+    }
+    if snapshot
+        .local_ipv4
+        .iter()
+        .any(|binding| binding.address == ipv4.source)
+    {
+        return Err(Ipv4SourceLocalAddress);
     }
     if let Some(selected) = route::lookup(snapshot.routes, ipv4.source) {
         if selected.is_prefix_network_address(ipv4.source) {
@@ -1804,7 +1862,7 @@ fn decide_ipv4<T: TraceSink>(
         ingress,
         destination: ipv4.destination,
     });
-    validate_ipv4_ingress(frame, snapshot, ingress, ipv4)?;
+    validate_ipv4_ingress(snapshot, ipv4)?;
     let local = snapshot
         .local_ipv4
         .iter()
@@ -5233,6 +5291,14 @@ mod tests {
             (135, "IPV4_DESTINATION_CLASS_E"),
             (136, "IPV4_DESTINATION_NETWORK_ADDRESS"),
             (137, "IPV4_DESTINATION_DIRECTED_BROADCAST"),
+            (138, "ETHERNET_DESTINATION_NOT_LOCAL"),
+            (139, "ARP_INGRESS_INTERFACE_UNKNOWN"),
+            (140, "ARP_ETHERNET_SOURCE_ZERO"),
+            (141, "ARP_ETHERNET_SOURCE_BROADCAST"),
+            (142, "ARP_ETHERNET_SOURCE_MULTICAST"),
+            (143, "ARP_ETHERNET_DESTINATION_ZERO"),
+            (144, "ARP_ETHERNET_DESTINATION_MULTICAST"),
+            (145, "IPV4_SOURCE_LOCAL_ADDRESS"),
         ];
         let actual = [
             DropReason::EthernetHeaderTruncated,
@@ -5372,6 +5438,14 @@ mod tests {
             DropReason::Ipv4DestinationClassE,
             DropReason::Ipv4DestinationNetworkAddress,
             DropReason::Ipv4DestinationDirectedBroadcast,
+            DropReason::EthernetDestinationNotLocal,
+            DropReason::ArpIngressInterfaceUnknown,
+            DropReason::ArpEthernetSourceZero,
+            DropReason::ArpEthernetSourceBroadcast,
+            DropReason::ArpEthernetSourceMulticast,
+            DropReason::ArpEthernetDestinationZero,
+            DropReason::ArpEthernetDestinationMulticast,
+            DropReason::Ipv4SourceLocalAddress,
         ];
         assert_eq!(actual.len(), expected.len());
         for (reason, &(discriminant, code)) in actual.iter().zip(&expected) {

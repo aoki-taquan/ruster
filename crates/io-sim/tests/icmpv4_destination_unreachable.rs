@@ -573,6 +573,7 @@ fn route_miss_suppression_matrix_and_options_are_atomic() {
             Icmpv4ErrorDisposition::SourceNotUnicast => {
                 Some(DropReason::Ipv4SourceUnspecifiedNetwork)
             }
+            Icmpv4ErrorDisposition::SourceIsLocal => Some(DropReason::Ipv4SourceLocalAddress),
             Icmpv4ErrorDisposition::DestinationMulticast => {
                 Some(DropReason::Ipv4DestinationMulticast)
             }
