@@ -16,7 +16,7 @@ const LAN: IfId = IfId(1);
 const WAN: IfId = IfId(2);
 const WAN_MAC: MacAddress = MacAddress([0x02, 0, 0, 0, 0, 2]);
 const GATEWAY_MAC: MacAddress = MacAddress([0x02, 0, 0, 0, 0, 3]);
-const MIN_AGGREGATE_REPETITIONS: usize = 64;
+pub(crate) const MIN_AGGREGATE_REPETITIONS: usize = 64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Suite {
@@ -88,10 +88,10 @@ impl fmt::Display for RunError {
                 write!(formatter, "{case} allocated {count} times in timed regions")
             }
             Self::UnexpectedBatchReport => {
-                formatter.write_str("plain forwarding returned an unexpected batch report")
+                formatter.write_str("benchmark forwarding returned an unexpected batch report")
             }
             Self::ForwardingOracle => {
-                formatter.write_str("plain forwarding output failed its untimed oracle")
+                formatter.write_str("benchmark forwarding output failed its untimed oracle")
             }
             Self::InvalidStatistics => formatter.write_str("sample statistics were invalid"),
         }
@@ -101,10 +101,10 @@ impl fmt::Display for RunError {
 impl std::error::Error for RunError {}
 
 #[derive(Clone, Copy)]
-struct Measurement {
-    elapsed: Duration,
-    allocations: u64,
-    digest: u16,
+pub(crate) struct Measurement {
+    pub(crate) elapsed: Duration,
+    pub(crate) allocations: u64,
+    pub(crate) digest: u16,
 }
 
 /// Executes the selected NIC-free cases and returns structured result rows.
@@ -112,11 +112,22 @@ struct Measurement {
 /// Formatting and artifact I/O are deliberately outside this function.
 pub fn run(config: &RunConfig) -> Result<Vec<ResultRow>, RunError> {
     validate_config(config)?;
-    let mut rows =
-        Vec::with_capacity(FrameSize::ALL.len() * (config.batches.len() + usize::from(2_u8)));
+    let rows_per_size = config
+        .batches
+        .len()
+        .checked_mul(25)
+        .and_then(|count| count.checked_add(2))
+        .ok_or(RunError::RepetitionOverflow)?;
+    let mut rows = Vec::with_capacity(
+        FrameSize::ALL
+            .len()
+            .checked_mul(rows_per_size)
+            .ok_or(RunError::RepetitionOverflow)?,
+    );
     for size in FrameSize::ALL {
         for &batch in &config.batches {
             rows.push(run_plain_case(config, size, batch)?);
+            rows.extend(crate::matrix::run_matrix(config, size, batch)?);
         }
         rows.push(run_checksum_case(config, size, 1)?);
         rows.push(run_checksum_case(config, size, 2)?);
@@ -327,7 +338,10 @@ fn measure_plain(
     })
 }
 
-fn subtract_setup_control(setup: Duration, measured: Duration) -> Result<Duration, RunError> {
+pub(crate) fn subtract_setup_control(
+    setup: Duration,
+    measured: Duration,
+) -> Result<Duration, RunError> {
     measured
         .checked_sub(setup)
         .ok_or(RunError::SetupControlExceededMeasured { setup, measured })
@@ -422,7 +436,7 @@ fn calibrate_checksum(bytes: &[u8], passes: u8, target: Duration) -> Result<usiz
     }
 }
 
-fn ensure_no_allocations(case: &'static str, count: u64) -> Result<(), RunError> {
+pub(crate) fn ensure_no_allocations(case: &'static str, count: u64) -> Result<(), RunError> {
     if count == 0 {
         Ok(())
     } else {
@@ -473,7 +487,7 @@ mod tests {
         config.warmup_time = Duration::ZERO;
         config.batches = vec![1];
         let rows = run(&config).unwrap();
-        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.len(), 54);
         assert!(rows.iter().all(|row| row.timed_allocations == 0));
         assert!(rows.iter().any(|row| {
             row.case == "plain-ipv4" && row.size == FrameSize::Wire64 && row.stats.samples == 1
@@ -504,6 +518,18 @@ mod tests {
                 setup: Duration::from_nanos(8),
                 measured: Duration::from_nanos(3),
             })
+        );
+    }
+
+    #[test]
+    fn forwarding_errors_describe_all_benchmark_profiles() {
+        assert_eq!(
+            RunError::UnexpectedBatchReport.to_string(),
+            "benchmark forwarding returned an unexpected batch report"
+        );
+        assert_eq!(
+            RunError::ForwardingOracle.to_string(),
+            "benchmark forwarding output failed its untimed oracle"
         );
     }
 }

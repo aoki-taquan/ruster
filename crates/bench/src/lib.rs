@@ -3,6 +3,7 @@
 mod allocation;
 mod backend;
 mod fixture;
+mod matrix;
 mod output;
 mod runner;
 mod stats;

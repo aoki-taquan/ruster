@@ -12,8 +12,12 @@ cargo run --release -p ruster-bench -- \
   --suite datapath --format jsonl
 ```
 
-現在のfoundation suiteはplain IPv4 forwardingとInternet checksumのone-pass /
-two-pass controlを測定します。NAT/firewall/state pressureは後続sliceです。
+現在のsuiteはplain IPv4 forwardingとInternet checksumのone-pass / two-pass controlに加え、
+UDP/TCPのoutbound/inbound established flowを、matched plain control、NAT44、
+stateful firewall、NAT44+firewallの4 profileで測定します。UDPはchecksum zero/nonzeroを
+分離し、TCPはfull checksumを持つfixtureを使います。state確立はtimed region外です。
+`checksum_passes`はtransport payload全体を走査するfull checksum検証回数を表し、
+NAT44のRFC 1624 incremental checksum updateは数えません。
 
 `wire64`はbackend buffer 60 bytes、FCS込みEthernet 64 bytes、preamble/SFDとIFG込み
 84 bytesです。`ip-mtu1500`はそれぞれ1514、1518、1538 bytesです。結果のJSONLにも
@@ -22,7 +26,7 @@ two-pass controlを測定します。NAT/firewall/state pressureは後続slice�
 fixture生成、結果検証、formattingはtimed region外です。buffer resetとbatch acquisitionの
 costは次のaggregate subtractionで結果から除外します。測定interval内でcurrent worker
 threadのallocationを一つでも検出したrunは失敗します。
-plain forwardingは同じ反復数の`reset + receive` intervalを別に一度測り、全反復を一つの
+各forwarding caseは同じ反復数の`reset + receive` intervalを別に一度測り、全反復を一つの
 intervalで測った値から差し引きます。packetごとのclock読取りを入れず、batchごとの
 `forward_batch`/finish境界を維持します。
 短いcalibration probeでcontrolがmeasured intervalを上回った場合は反復数を増やします。
