@@ -723,3 +723,24 @@ cancel/abandon、partial TX/reject、finish errorを決定的に実装します�
 `FrameOrigin`でRXとgeneratedを区別します。RX/生成の`Vec<u8>`そのものをTX/dropへmoveし、
 packet bytesをcloneしません。次の実I/O backendも同じlease contractを実装し、
 backend固有pointerをcoreへ漏らしません。
+
+`ruster-io-xdp`の最初のsliceは、native AF_XDP backendではなく、全targetでcompileできる
+pure-Rust ownership modelです。socket、ring、libxdp FFI、XDP program、core `PacketIo`
+adapterを持たず、`unsafe`をcrate全体で禁止します。従ってIO-009のreal generated backendは
+deferredのままです。
+
+UMEMは固定長frameの集合として表現し、descriptor addressはUMEM相対値です。
+`FrameId`はaddressをframe sizeで正規化したindexだけをcanonical identityとし、packet data
+offsetやvirtual addressをidentityに使いません。layoutはnonzero frame count、power-of-two
+frame size、frameより小さいheadroomをpublication前に検証します。descriptorはoptions zeroの
+single-buffer profileに限定し、nonzero visible length、UMEM範囲、headroom、同一frame内の
+`addr + len`をchecked arithmeticで検証してからledgerへ渡します。
+
+各frameはledgerだけが発行できる`(FrameId, NonZeroU64 generation)` tokenで一ownership cycleを
+識別します。generationはchecked incrementだけで進め、`u64::MAX`の次へwrapせず、そのframeを
+`Quarantined`へ移して永久に通常reuseから外します。ledgerはFree、fill予約/kernel所有、
+RX available、core lease、pending/reserved/kernel TX、completion available、quarantineの
+exact partitionを持ちます。通常遷移はframe indexによるO(1) lookupと二つのstate counter更新
+だけです。全entry、token identity、generation、counterを再計算する`deep_audit`は明示的な
+cold pathです。stale token、wrong-state token、tokenと異なるframeへcanonicalizeされた
+descriptorは、entryとcounterを変更せずtyped errorで拒否します。
