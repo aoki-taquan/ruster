@@ -37,3 +37,15 @@ microbenchmarkであり、NIC/backend DMAやcold-cache throughputの主張では
 比較するrunでは同じRust toolchain、target、`RUSTFLAGS`、CPU、governor、pinning、
 suite引数を使用し、実行commandとJSONLを一緒に保存してください。host固有の値を
 異なるmachine間でbaselineとして比較する用途は想定していません。
+
+## Hardware artifact schema
+
+`ruster.hardware-bench/v1`は、将来の専用hardware runnerが出力するmanifest、repeat、
+summary、lifecycle recordの厳格なNIC不要schemaです。このcrateはrecordのparse、
+validation、canonical JSONL化、機密fieldのredactionだけを提供します。hardwareへの
+アクセス、traffic生成、runner制御、合否threshold、性能主張は行いません。既存の
+`ResultRow` JSONL schemaは変更しません。
+
+field、enum、case ID、frame ownership、hash、redactionの契約とgolden fixtureは
+[hardware benchmark artifact v1](../../docs/hardware-benchmark-artifact-v1.md)を
+参照してください。
