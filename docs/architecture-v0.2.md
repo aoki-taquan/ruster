@@ -308,6 +308,15 @@ generated ARP → generated ICMP` です。exact timeoutでのARP学習は、ICM
 `ruster-runtime`の`FullServicePublication`は、具体的なowned publicationやparserを持たず、
 candidateのall-or-nothing適用とactive full-service viewの借用だけを抽象化します。
 candidate rejectは旧active viewを失効させず、そのtickのdata phaseを旧generationで継続します。
+candidateがある場合だけ、runtimeはpacket backendの`PublicationQuiescence`を先に呼びます。
+backendはunfinished RX/generated batchとaccepted TX completion待ちをboundedな所有状態から検査し、
+成功時はexact `&mut backend`を内包するsealed、move-only、`!Send + !Sync`のGAT guardを返します。
+runtimeはopaqueな`I::Guard<'_>`をcandidateと一緒にpublicationへmoveし、publication callが戻って
+guardがdropされた後にだけactive viewとpacket I/Oへ進みます。quiescence failureはcandidateを
+publicationへ渡さないtyped `Deferred`であり、旧active generationのtickは継続します。
+candidateなしのsteady tickはquiescence checkを行いません。Simのaccepted TX output queueを明示
+completionする有限modelはこの境界を検証するための保守的実装であり、AF_XDP CQ drainやnative
+backend quiescenceを実装済みとは主張しません。
 active viewがなければRXを開始せず、残りの全phaseを`NoActivePublication`としてtyped skipします。
 一度借用したactive viewはtick終了まで同一generationであり、RXにはUDP/TCP NAT44、firewall、
 resolution、generated ICMP captureのfull composition wrapperだけを使用します。

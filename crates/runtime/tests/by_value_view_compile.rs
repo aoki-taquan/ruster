@@ -2,16 +2,19 @@ use std::num::NonZeroU64;
 
 use ruster_core::{
     FirewallConfig, FirewallRuntime, ForwardingSnapshot, Icmpv4ErrorRuntime, Nat44TcpConfig,
-    Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpRuntime, ResolutionRuntime,
+    Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpRuntime, PublicationQuiescenceGuard,
+    ResolutionRuntime,
 };
+use ruster_io_sim::SimIo;
 use ruster_runtime::{
     FirewallServiceView, FullServicePublication, FullServiceView, Nat44TcpServiceView,
     Nat44UdpServiceView,
 };
 
 /// A downstream crate's minimal adapter fixture. Keeping this as an
-/// integration test makes the public struct literal and lifetime shortening
-/// compile through the same surface available to external users.
+/// integration test makes the public struct literal, exact backend guard, and
+/// lifetime shortening compile through the same surface available to external
+/// users.
 struct ExternalPublication<'owner, 'storage> {
     generation: NonZeroU64,
     snapshot: &'owner ForwardingSnapshot<'storage>,
@@ -25,11 +28,17 @@ struct ExternalPublication<'owner, 'storage> {
     firewall: Option<&'owner mut FirewallRuntime<'storage>>,
 }
 
-impl<'owner, 'storage> FullServicePublication<'storage> for ExternalPublication<'owner, 'storage> {
+impl<'owner, 'storage> FullServicePublication<'storage, SimIo>
+    for ExternalPublication<'owner, 'storage>
+{
     type Candidate = ();
     type Reject = ();
 
-    fn publish_candidate(&mut self, _candidate: Self::Candidate) -> Result<(), Self::Reject> {
+    fn publish_candidate(
+        &mut self,
+        _candidate: Self::Candidate,
+        _quiescence: PublicationQuiescenceGuard<'_, SimIo>,
+    ) -> Result<(), Self::Reject> {
         Ok(())
     }
 
@@ -55,9 +64,9 @@ impl<'owner, 'storage> FullServicePublication<'storage> for ExternalPublication<
     }
 }
 
-fn require_external_publication<P: FullServicePublication<'static>>() {}
+fn require_external_publication<P: FullServicePublication<'static, SimIo>>() {}
 
 #[test]
-fn external_downstream_adapter_compiles_with_paired_generation_authority() {
+fn external_adapter_compiles_with_paired_generation_and_exact_backend_guard() {
     require_external_publication::<ExternalPublication<'static, 'static>>();
 }

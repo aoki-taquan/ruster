@@ -204,6 +204,11 @@ backendのTX acceptedはdescriptor publicationであり、wire送信やcompletio
 firewallの各configを対応するoptional runtimeとnested viewで対にします。resolutionと
 generated ICMP runtimeは直接borrowのままです。現行core full wrapperは3 configを必須とする
 ため、service pair全体の不在表現はoptional-config composition seamを追加する後続作業です。
+candidateがあるtickだけ、backendはboundedな所有状態からpublication quiescenceを検証し、
+exact `&mut backend`を保持するsealed GAT guardをpublicationへ渡します。unfinished RX/generated
+batchまたはcompletion待ちTXがあればcandidateをpublicationへ渡さずtyped `Deferred`とし、
+guardをdropした後に旧active generationでtickを継続します。Sim backendの出力queue完了は
+保守的なmodelであり、AF_XDP CQ drainを実装・証明したものではありません。
 
 ## 開発
 

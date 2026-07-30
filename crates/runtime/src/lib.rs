@@ -8,9 +8,9 @@ use ruster_core::{
     FirewallRuntime, ForwardingSnapshot, GeneratedAllocationError, GeneratedIcmpv4TraceSink,
     GeneratedPacketIo, GeneratedTraceSink, Icmpv4ErrorBuildError, Icmpv4ErrorRuntime,
     MonotonicMillis, Nat44TcpConfig, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpRuntime, PacketIo,
-    ResolutionFailureDispatchError, ResolutionFailureDispatchReport, ResolutionFailureTraceSink,
-    ResolutionRuntime, ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTraceSink,
-    TraceSink,
+    PublicationQuiescence, ResolutionFailureDispatchError, ResolutionFailureDispatchReport,
+    ResolutionFailureTraceSink, ResolutionRuntime, ResolutionTimerError, ResolutionTimerReport,
+    ResolutionTimerTraceSink, TraceSink,
 };
 use std::num::NonZeroU64;
 
@@ -75,20 +75,26 @@ pub struct FirewallServiceView<'view, 'storage> {
 /// candidate cannot be published while that authority is still live:
 ///
 /// ```compile_fail
+/// use ruster_core::PublicationQuiescence;
 /// use ruster_runtime::{FullServicePublication, FullServiceView};
 ///
-/// fn publish_while_authority_is_live<'storage, P>(
+/// fn publish_while_authority_is_live<'storage, I, P>(
 ///     publication: &mut P,
+///     io: &mut I,
 ///     candidate: P::Candidate,
 /// )
 /// where
-///     P: FullServicePublication<'storage>,
+///     I: PublicationQuiescence,
+///     P: FullServicePublication<'storage, I>,
 /// {
 ///     let view: FullServiceView<'_, 'storage> =
 ///         publication.active().expect("active publication");
 ///     let snapshot = view.snapshot;
 ///     let firewall_config = view.firewall.config;
-///     let _result = publication.publish_candidate(candidate);
+///     let Ok(guard) = io.try_publication_quiescence() else {
+///         return;
+///     };
+///     let _result = publication.publish_candidate(candidate, guard);
 ///     drop((snapshot, firewall_config));
 /// }
 /// ```
@@ -97,17 +103,23 @@ pub struct FirewallServiceView<'view, 'storage> {
 /// attempt:
 ///
 /// ```compile_fail
+/// use ruster_core::PublicationQuiescence;
 /// use ruster_runtime::FullServicePublication;
 ///
-/// fn publish_while_old_view_is_live<'storage, P>(
+/// fn publish_while_old_view_is_live<'storage, I, P>(
 ///     publication: &mut P,
+///     io: &mut I,
 ///     candidate: P::Candidate,
 /// )
 /// where
-///     P: FullServicePublication<'storage>,
+///     I: PublicationQuiescence,
+///     P: FullServicePublication<'storage, I>,
 /// {
 ///     let old_view = publication.active().expect("active publication");
-///     let _result = publication.publish_candidate(candidate);
+///     let Ok(guard) = io.try_publication_quiescence() else {
+///         return;
+///     };
+///     let _result = publication.publish_candidate(candidate, guard);
 ///     drop(old_view);
 /// }
 /// ```
@@ -145,11 +157,13 @@ pub struct FullServiceView<'view, 'storage> {
 
 /// Atomic publication seam used by [`run_tick`].
 ///
-/// `publish_candidate` must either install the entire candidate or leave the
-/// previous active publication unchanged. A rejected candidate is reported,
-/// but does not stop the tick: `active` is subsequently called so the old
-/// publication can continue serving traffic. The active view returned for a
-/// tick must remain one coherent generation until the view is dropped.
+/// `publish_candidate` receives a move-only guard for the exact packet backend
+/// and must either install the entire candidate or leave the previous active
+/// publication unchanged. The guard cannot coexist with packet I/O and is
+/// dropped when the publication call returns. A deferred or rejected
+/// candidate does not stop the tick: `active` is subsequently called so the
+/// old publication can continue serving traffic. The active view returned for
+/// a tick must remain one coherent generation until the view is dropped.
 /// `active` is a steady-tick O(1) borrow: it must not repeat semantic
 /// validation, fingerprinting, hashing, slice scans, or allocation. Those
 /// cold-path operations belong to candidate construction/publication.
@@ -159,11 +173,37 @@ pub struct FullServiceView<'view, 'storage> {
 /// currently contains all three configured service pairs; representing a
 /// service as wholly absent requires a future core composition seam that
 /// accepts optional configs as well as optional runtimes.
-pub trait FullServicePublication<'storage> {
+///
+/// Adding the exact backend type and guard parameter is an intentional
+/// pre-1.0 source break for publication adapters:
+///
+/// ```compile_fail
+/// use ruster_runtime::{FullServicePublication, FullServiceView};
+///
+/// struct OldAdapter;
+///
+/// impl<'storage> FullServicePublication<'storage> for OldAdapter {
+///     type Candidate = ();
+///     type Reject = ();
+///
+///     fn publish_candidate(&mut self, _: ()) -> Result<(), ()> {
+///         Ok(())
+///     }
+///
+///     fn active(&mut self) -> Option<FullServiceView<'_, 'storage>> {
+///         None
+///     }
+/// }
+/// ```
+pub trait FullServicePublication<'storage, I: PublicationQuiescence> {
     type Candidate;
     type Reject;
 
-    fn publish_candidate(&mut self, candidate: Self::Candidate) -> Result<(), Self::Reject>;
+    fn publish_candidate(
+        &mut self,
+        candidate: Self::Candidate,
+        quiescence: I::Guard<'_>,
+    ) -> Result<(), Self::Reject>;
 
     fn active(&mut self) -> Option<FullServiceView<'_, 'storage>>;
 }
@@ -220,9 +260,12 @@ impl TickPhaseTraceSink for NoTickPhaseTrace {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum PublicationOutcome<E> {
+pub enum PublicationOutcome<E, Q> {
     Unchanged,
     Applied,
+    /// The backend refused quiescence. The candidate was not passed to the
+    /// publication adapter and was dropped unchanged.
+    Deferred(Q),
     Rejected(E),
 }
 
@@ -348,8 +391,8 @@ pub struct GeneratedPhaseReport<S> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct TickReport<PublicationError, RxError, GeneratedError> {
-    pub publication: PublicationOutcome<PublicationError>,
+pub struct TickReport<PublicationError, QuiescenceError, RxError, GeneratedError> {
+    pub publication: PublicationOutcome<PublicationError, QuiescenceError>,
     pub active: bool,
     pub rx: RxPhaseReport<RxError>,
     pub resolution_timers: PhaseReport<ResolutionTimerReport, ResolutionTimerError>,
@@ -598,6 +641,13 @@ fn skip_phase<T: TickPhaseTraceSink>(trace: &mut T, phase: TickPhase, reason: Ti
 
 /// Runs one bounded, single-worker service tick.
 ///
+/// A candidate first requires a backend-authoritative quiescence guard. The
+/// guard is moved into the publication call and released before `active` or
+/// any packet I/O is attempted. A quiescence failure is reported as
+/// [`PublicationOutcome::Deferred`], after which the old active publication
+/// continues through the normal data phases. A tick without a candidate does
+/// not request a guard.
+///
 /// The phase order is publication, RX, resolution timers, failure dispatch,
 /// generated ARP, and generated ICMPv4. The RX batch is moved into the full
 /// composition wrapper in a lexical scope and is therefore finished before
@@ -634,10 +684,15 @@ pub fn run_tick<'storage, P, I, T>(
     now: MonotonicMillis,
     budgets: TickBudgets,
     trace: &mut T,
-) -> TickReport<P::Reject, <I as PacketIo>::Error, <I as GeneratedPacketIo>::Error>
+) -> TickReport<
+    P::Reject,
+    <I as PublicationQuiescence>::Error,
+    <I as PacketIo>::Error,
+    <I as GeneratedPacketIo>::Error,
+>
 where
-    P: FullServicePublication<'storage>,
-    I: PacketIo + GeneratedPacketIo,
+    P: FullServicePublication<'storage, I>,
+    I: PacketIo + GeneratedPacketIo + PublicationQuiescence,
     T: TickPhaseTraceSink
         + TraceSink
         + ResolutionTimerTraceSink
@@ -648,9 +703,12 @@ where
     trace.record_tick_phase(TickPhaseTrace::TickStarted);
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::Publication));
     let publication_report = match candidate {
-        Some(candidate) => match publication.publish_candidate(candidate) {
-            Ok(()) => PublicationOutcome::Applied,
-            Err(error) => PublicationOutcome::Rejected(error),
+        Some(candidate) => match io.try_publication_quiescence() {
+            Ok(quiescence) => match publication.publish_candidate(candidate, quiescence) {
+                Ok(()) => PublicationOutcome::Applied,
+                Err(error) => PublicationOutcome::Rejected(error),
+            },
+            Err(error) => PublicationOutcome::Deferred(error),
         },
         None => PublicationOutcome::Unchanged,
     };
@@ -825,8 +883,9 @@ mod tests {
         GeneratedSlotCompletion, GeneratedTraceSink, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy,
         Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
         Nat44TcpPolicy, Nat44UdpPolicy, Neighbor, NoTrace, PacketBatch, PacketLease, PacketSlot,
-        ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionFailureTrace, ResolutionPolicy,
-        ResolutionStateSlot, ResolutionTimerTrace, Route, SlotCompletion, TraceEvent,
+        PublicationQuiescenceGuard, ResolutionActionSlot, ResolutionFailureHoldSlot,
+        ResolutionFailureTrace, ResolutionPolicy, ResolutionStateSlot, ResolutionTimerTrace, Route,
+        SlotCompletion, TraceEvent,
     };
     use ruster_io_sim::{FrameOrigin, SimIo};
 
@@ -859,11 +918,18 @@ mod tests {
         firewall_config: FirewallConfig<'storage>,
     }
 
-    impl<'view, 'storage> FullServicePublication<'storage> for TestPublication<'view, 'storage> {
+    impl<'view, 'storage, I> FullServicePublication<'storage, I> for TestPublication<'view, 'storage>
+    where
+        I: PublicationQuiescence,
+    {
         type Candidate = Candidate;
         type Reject = &'static str;
 
-        fn publish_candidate(&mut self, candidate: Self::Candidate) -> Result<(), Self::Reject> {
+        fn publish_candidate(
+            &mut self,
+            candidate: Self::Candidate,
+            _quiescence: I::Guard<'_>,
+        ) -> Result<(), Self::Reject> {
             match candidate {
                 Candidate::Apply => {
                     self.applied += 1;
@@ -1090,10 +1156,20 @@ mod tests {
         InvalidAccounting,
     }
 
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    enum TestBatchState {
+        #[default]
+        Idle,
+        Rx,
+        Generated,
+    }
+
     struct TestIo {
         rx_mode: RxMode,
         generated_mode: GeneratedMode,
-        rx_live: bool,
+        batch_state: TestBatchState,
+        pending_tx: usize,
+        quiescence_calls: usize,
         receive_calls: usize,
         generated_calls: usize,
         frame: [u8; 590],
@@ -1104,11 +1180,48 @@ mod tests {
             Self {
                 rx_mode: RxMode::Empty,
                 generated_mode: GeneratedMode::Exact,
-                rx_live: false,
+                batch_state: TestBatchState::Idle,
+                pending_tx: 0,
+                quiescence_calls: 0,
                 receive_calls: 0,
                 generated_calls: 0,
                 frame: [0; 590],
             }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum TestPublicationQuiescenceError {
+        RxBatchNotFinished,
+        GeneratedBatchNotFinished,
+        TxCompletionPending,
+    }
+
+    impl PublicationQuiescence for TestIo {
+        type Error = TestPublicationQuiescenceError;
+        type Guard<'backend> = PublicationQuiescenceGuard<'backend, Self>;
+
+        fn try_publication_quiescence(&mut self) -> Result<Self::Guard<'_>, Self::Error> {
+            self.quiescence_calls += 1;
+            match self.batch_state {
+                TestBatchState::Rx => {
+                    return Err(TestPublicationQuiescenceError::RxBatchNotFinished);
+                }
+                TestBatchState::Generated => {
+                    return Err(TestPublicationQuiescenceError::GeneratedBatchNotFinished);
+                }
+                TestBatchState::Idle => {}
+            }
+            if self.pending_tx != 0 {
+                return Err(TestPublicationQuiescenceError::TxCompletionPending);
+            }
+            Ok(PublicationQuiescenceGuard::new(self))
+        }
+    }
+
+    impl TestIo {
+        fn complete_pending_tx(&mut self) {
+            self.pending_tx = 0;
         }
     }
 
@@ -1129,7 +1242,7 @@ mod tests {
     }
 
     struct EmptyRxBatch<'a> {
-        live: &'a mut bool,
+        state: &'a mut TestBatchState,
         finish_error: bool,
     }
 
@@ -1145,7 +1258,7 @@ mod tests {
         }
 
         fn finish(self) -> BatchCompletion<Self::Error> {
-            *self.live = false;
+            *self.state = TestBatchState::Idle;
             BatchCompletion {
                 tx_requested: 0,
                 tx_accepted: 0,
@@ -1153,6 +1266,12 @@ mod tests {
                 recycled: 0,
                 error: self.finish_error.then_some(RxError::Injected),
             }
+        }
+    }
+
+    impl Drop for EmptyRxBatch<'_> {
+        fn drop(&mut self) {
+            *self.state = TestBatchState::Idle;
         }
     }
 
@@ -1165,10 +1284,14 @@ mod tests {
             if self.rx_mode == RxMode::Fail {
                 return Err(RxError::Injected);
             }
-            assert!(!self.rx_live, "RX batches cannot overlap");
-            self.rx_live = true;
+            assert_eq!(
+                self.batch_state,
+                TestBatchState::Idle,
+                "packet I/O batches cannot overlap"
+            );
+            self.batch_state = TestBatchState::Rx;
             Ok(EmptyRxBatch {
-                live: &mut self.rx_live,
+                state: &mut self.batch_state,
                 finish_error: self.rx_mode == RxMode::FinishError,
             })
         }
@@ -1192,6 +1315,8 @@ mod tests {
     struct TestGeneratedBatch<'a> {
         mode: GeneratedMode,
         frame: &'a mut [u8; 590],
+        state: &'a mut TestBatchState,
+        pending_tx: &'a mut usize,
         attempted: bool,
         completion: Option<GeneratedSlotCompletion>,
     }
@@ -1231,6 +1356,9 @@ mod tests {
                 None => (0, usize::from(self.attempted), 0, 0, 0),
             };
             let invalid = self.mode == GeneratedMode::InvalidAccounting;
+            let accepted = if invalid { 0 } else { requested };
+            *self.state = TestBatchState::Idle;
+            *self.pending_tx += accepted;
             GeneratedBatchCompletion {
                 attempts: usize::from(self.attempted),
                 allocated,
@@ -1238,10 +1366,16 @@ mod tests {
                 requested,
                 cancelled,
                 abandoned,
-                accepted: if invalid { 0 } else { requested },
+                accepted,
                 rejected: 0,
                 error: (self.mode == GeneratedMode::FinishError).then_some(GeneratedError::Finish),
             }
+        }
+    }
+
+    impl Drop for TestGeneratedBatch<'_> {
+        fn drop(&mut self) {
+            *self.state = TestBatchState::Idle;
         }
     }
 
@@ -1250,14 +1384,18 @@ mod tests {
         type Batch<'a> = TestGeneratedBatch<'a>;
 
         fn begin_generated(&mut self, _egress: IfId) -> Self::Batch<'_> {
-            assert!(
-                !self.rx_live,
-                "generated I/O began before the RX batch finished"
+            assert_eq!(
+                self.batch_state,
+                TestBatchState::Idle,
+                "packet I/O batches cannot overlap"
             );
+            self.batch_state = TestBatchState::Generated;
             self.generated_calls += 1;
             TestGeneratedBatch {
                 mode: self.generated_mode,
                 frame: &mut self.frame,
+                state: &mut self.batch_state,
+                pending_tx: &mut self.pending_tx,
                 attempted: false,
                 completion: None,
             }
@@ -1319,7 +1457,7 @@ mod tests {
             assert!(report.active);
             assert_eq!(io.receive_calls, 1);
             assert_eq!(io.generated_calls, 1);
-            assert!(!io.rx_live);
+            assert_eq!(io.batch_state, TestBatchState::Idle);
             assert!(matches!(
                 report.resolution_timers,
                 PhaseReport::Completed(ResolutionTimerReport {
@@ -1442,6 +1580,93 @@ mod tests {
     }
 
     #[test]
+    fn fake_quiescence_reports_each_unfinished_batch_state_exactly() {
+        let mut rx_io = TestIo::default();
+        let rx = rx_io.receive(0).expect("empty RX batch");
+        core::mem::forget(rx);
+        assert!(matches!(
+            rx_io.try_publication_quiescence(),
+            Err(TestPublicationQuiescenceError::RxBatchNotFinished)
+        ));
+
+        let mut generated_io = TestIo::default();
+        let generated = generated_io.begin_generated(WAN);
+        core::mem::forget(generated);
+        assert!(matches!(
+            generated_io.try_publication_quiescence(),
+            Err(TestPublicationQuiescenceError::GeneratedBatchNotFinished)
+        ));
+    }
+
+    #[test]
+    fn candidate_quiescence_deferral_preserves_old_active_without_publication() {
+        with_fixture(|publication, io, trace| {
+            let mut generated = io.begin_generated(WAN);
+            generated.allocate(64).expect("generated frame").commit();
+            let completion = generated.finish();
+            assert_eq!(completion.accepted, 1);
+            assert_eq!(io.pending_tx, 1);
+
+            let report = run_tick(
+                publication,
+                Some(Candidate::Apply),
+                io,
+                MonotonicMillis(0),
+                TickBudgets::default(),
+                trace,
+            );
+            assert_eq!(
+                report.publication,
+                PublicationOutcome::Deferred(TestPublicationQuiescenceError::TxCompletionPending)
+            );
+            assert_eq!(publication.applied, 0);
+            assert_eq!(publication.active_calls, 1);
+            assert_eq!(io.quiescence_calls, 1);
+            assert_eq!(io.receive_calls, 1);
+            assert_eq!(io.pending_tx, 1);
+
+            io.complete_pending_tx();
+            *trace = TestTrace::default();
+            let report = run_tick(
+                publication,
+                Some(Candidate::Apply),
+                io,
+                MonotonicMillis(1),
+                TickBudgets::default(),
+                trace,
+            );
+            assert_eq!(report.publication, PublicationOutcome::Applied);
+            assert_eq!(publication.applied, 1);
+            assert_eq!(publication.active_calls, 2);
+            assert_eq!(io.quiescence_calls, 2);
+            assert_eq!(io.receive_calls, 2);
+        });
+    }
+
+    #[test]
+    fn unchanged_tick_never_requests_a_quiescence_guard() {
+        with_fixture(|publication, io, trace| {
+            let mut generated = io.begin_generated(WAN);
+            generated.allocate(64).expect("generated frame").commit();
+            let completion = generated.finish();
+            assert_eq!(completion.accepted, 1);
+
+            let report = run_tick(
+                publication,
+                None,
+                io,
+                MonotonicMillis(0),
+                TickBudgets::default(),
+                trace,
+            );
+            assert_eq!(report.publication, PublicationOutcome::Unchanged);
+            assert_eq!(io.quiescence_calls, 0);
+            assert_eq!(publication.active_calls, 1);
+            assert_eq!(io.receive_calls, 1);
+        });
+    }
+
+    #[test]
     fn active_view_is_one_o1_borrow_without_revalidation_scans() {
         with_fixture(|publication, io, trace| {
             let report = run_tick(
@@ -1464,7 +1689,10 @@ mod tests {
             let udp = publication.udp_config;
             let tcp = publication.tcp_config;
             let firewall = publication.firewall_config;
-            let view = publication.active().expect("active view");
+            let view = <TestPublication<'_, '_> as FullServicePublication<'_, TestIo>>::active(
+                publication,
+            )
+            .expect("active view");
             assert_eq!(view.generation, NonZeroU64::MIN);
             assert_eq!(view.nat44_udp.config, udp);
             assert!(view.nat44_udp.runtime.is_none());
