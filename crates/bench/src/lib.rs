@@ -33,10 +33,12 @@ pub use hardware_protocol::{
     HardwareMeasurementProtocol, LatencyMode, LatencyProfile, LifecycleSequenceValidator,
     MeasurementLifecycleCode, MeasurementLifecycleEvent, MeasurementProfileId,
     MeasurementProtocolError, MeasurementRunOutcome, MeasurementTiming, RawRepeatCounters,
-    Sha256Digest, VerifiedRepeat, VerifiedSummary, HARDWARE_MEASUREMENT_PROTOCOL_VERSION,
-    HARDWARE_PLAN_FINGERPRINT_V1, MAX_HARDWARE_CASE_TIMEOUT_MS, MAX_HARDWARE_DRAIN_TIMEOUT_MS,
-    MAX_HARDWARE_DURATION_SECONDS, MAX_HARDWARE_REPEAT_COUNT, MAX_HARDWARE_RUN_TIMEOUT_MS,
-    MAX_HARDWARE_WARMUP_SECONDS, MAX_LATENCY_SAMPLE_EVERY_PACKETS,
+    Sha256Digest, VerifiedMeasurementInterval, VerifiedRepeat, VerifiedSummary,
+    HARDWARE_MEASUREMENT_PROTOCOL_VERSION, HARDWARE_PLAN_FINGERPRINT_V1,
+    MAX_HARDWARE_CASE_TIMEOUT_MS, MAX_HARDWARE_DRAIN_TIMEOUT_MS, MAX_HARDWARE_DURATION_SECONDS,
+    MAX_HARDWARE_REPEAT_COUNT, MAX_HARDWARE_RUN_TIMEOUT_MS, MAX_HARDWARE_WARMUP_SECONDS,
+    MAX_LATENCY_SAMPLE_EVERY_PACKETS, MAX_MEASUREMENT_ARTIFACT_HASHES,
+    MAX_MEASUREMENT_ARTIFACT_PATH_BYTES,
 };
 pub use output::{OutputFormat, ResultRow};
 pub use runner::{run, RunConfig, RunError, Suite};

@@ -4,7 +4,6 @@
 //! does not execute a driver, access a filesystem, mutate Linux state, evaluate
 //! thresholds, compare baselines, or make performance claims.
 
-use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::{
@@ -23,6 +22,8 @@ pub const MAX_HARDWARE_DRAIN_TIMEOUT_MS: u64 = 600_000;
 pub const MAX_HARDWARE_CASE_TIMEOUT_MS: u64 = 21_600_000;
 pub const MAX_HARDWARE_RUN_TIMEOUT_MS: u64 = 5_184_000_000;
 pub const MAX_LATENCY_SAMPLE_EVERY_PACKETS: u32 = 1_000_000;
+pub const MAX_MEASUREMENT_ARTIFACT_HASHES: usize = 64;
+pub const MAX_MEASUREMENT_ARTIFACT_PATH_BYTES: usize = 256;
 
 const PROFILE_ID_CAPACITY: usize = 64;
 
@@ -58,6 +59,21 @@ pub enum MeasurementProtocolError {
     UnexpectedImixEvidence(DirectionProfile),
     InvalidImixEvidence(DirectionProfile),
     InvalidLatency(&'static str),
+    MeasurementIntervalBindingMismatch,
+    MeasurementIntervalSequenceMismatch,
+    MeasurementIntervalDuration {
+        expected_ms: u64,
+        actual_ms: u64,
+    },
+    ArtifactHashCountOutOfRange {
+        actual: usize,
+        maximum: usize,
+    },
+    ArtifactPathTooLong {
+        actual: usize,
+        maximum: usize,
+    },
+    ArtifactHashOrder,
     InvalidArtifact(SchemaError),
     RepeatSetLength {
         expected: usize,
@@ -80,6 +96,18 @@ pub enum MeasurementProtocolError {
     DuplicateSummary(u16),
     MissingSummary(u16),
     SummaryDerivationMismatch(u16),
+    RepeatOrderMismatch {
+        position: usize,
+        expected_ordinal: u16,
+        expected_repeat_index: u16,
+        actual_ordinal: u16,
+        actual_repeat_index: u16,
+    },
+    SummaryOrderMismatch {
+        position: usize,
+        expected_ordinal: u16,
+        actual_ordinal: u16,
+    },
     LifecycleSequence {
         expected: u64,
         actual: u64,
@@ -184,6 +212,29 @@ impl fmt::Display for MeasurementProtocolError {
             Self::InvalidLatency(reason) => {
                 write!(formatter, "invalid latency counters: {reason}")
             }
+            Self::MeasurementIntervalBindingMismatch => formatter
+                .write_str("measurement interval belongs to another protocol, case, or repeat"),
+            Self::MeasurementIntervalSequenceMismatch => {
+                formatter.write_str("measurement interval lifecycle records are not adjacent")
+            }
+            Self::MeasurementIntervalDuration {
+                expected_ms,
+                actual_ms,
+            } => write!(
+                formatter,
+                "measurement interval duration: expected {expected_ms} ms, got {actual_ms} ms"
+            ),
+            Self::ArtifactHashCountOutOfRange { actual, maximum } => write!(
+                formatter,
+                "measurement artifact hash count {actual} exceeds {maximum}"
+            ),
+            Self::ArtifactPathTooLong { actual, maximum } => write!(
+                formatter,
+                "measurement artifact path length {actual} exceeds {maximum} bytes"
+            ),
+            Self::ArtifactHashOrder => {
+                formatter.write_str("measurement artifact hashes are not in canonical path order")
+            }
             Self::InvalidArtifact(error) => {
                 write!(formatter, "invalid derived hardware artifact: {error}")
             }
@@ -231,6 +282,24 @@ impl fmt::Display for MeasurementProtocolError {
                     "hardware summary at ordinal {ordinal} is not derived from the supplied repeats"
                 )
             }
+            Self::RepeatOrderMismatch {
+                position,
+                expected_ordinal,
+                expected_repeat_index,
+                actual_ordinal,
+                actual_repeat_index,
+            } => write!(
+                formatter,
+                "repeat position {position}: expected ({expected_ordinal}, {expected_repeat_index}), got ({actual_ordinal}, {actual_repeat_index})"
+            ),
+            Self::SummaryOrderMismatch {
+                position,
+                expected_ordinal,
+                actual_ordinal,
+            } => write!(
+                formatter,
+                "summary position {position}: expected ordinal {expected_ordinal}, got {actual_ordinal}"
+            ),
             Self::LifecycleSequence { expected, actual } => write!(
                 formatter,
                 "lifecycle sequence mismatch: expected {expected}, got {actual}"
@@ -763,11 +832,116 @@ impl DirectionPacketCounters {
     }
 }
 
+/// Exact, typed lifecycle interval that authorizes counters for one repeat.
+///
+/// The interval can only be built from an adjacent `started`/`completed`
+/// measurement pair whose observed duration exactly matches the protocol.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedMeasurementInterval {
+    protocol: HardwareMeasurementProtocol,
+    ordinal: u16,
+    repeat_index: u16,
+    started_sequence: u64,
+    completed_sequence: u64,
+    started_monotonic_ms: u64,
+    completed_monotonic_ms: u64,
+}
+
+impl VerifiedMeasurementInterval {
+    pub fn from_lifecycle_pair(
+        binding: BoundHardwareMeasurement<'_>,
+        ordinal: u16,
+        repeat_index: u16,
+        started: &MeasurementLifecycleEvent,
+        completed: &MeasurementLifecycleEvent,
+    ) -> Result<Self, MeasurementProtocolError> {
+        let expected = MeasurementLifecycleCode::case_measurement(binding, ordinal, repeat_index)?;
+        if started.code != expected
+            || completed.code != expected
+            || started.record.outcome != LifecycleOutcome::Started
+            || completed.record.outcome != LifecycleOutcome::Completed
+        {
+            return Err(MeasurementProtocolError::MeasurementIntervalBindingMismatch);
+        }
+        let expected_completed_sequence = started.record.sequence.checked_add(1).ok_or(
+            MeasurementProtocolError::ArithmeticOverflow("measurement interval sequence"),
+        )?;
+        if completed.record.sequence != expected_completed_sequence {
+            return Err(MeasurementProtocolError::MeasurementIntervalSequenceMismatch);
+        }
+        let actual_ms = completed
+            .record
+            .monotonic_ms
+            .checked_sub(started.record.monotonic_ms)
+            .ok_or(MeasurementProtocolError::LifecycleTimeRegression {
+                previous: started.record.monotonic_ms,
+                actual: completed.record.monotonic_ms,
+            })?;
+        let expected_ms = u64::from(binding.protocol.timing.duration_seconds)
+            .checked_mul(1_000)
+            .ok_or(MeasurementProtocolError::ArithmeticOverflow(
+                "measurement interval duration",
+            ))?;
+        if actual_ms != expected_ms {
+            return Err(MeasurementProtocolError::MeasurementIntervalDuration {
+                expected_ms,
+                actual_ms,
+            });
+        }
+        Ok(Self {
+            protocol: binding.protocol,
+            ordinal,
+            repeat_index,
+            started_sequence: started.record.sequence,
+            completed_sequence: completed.record.sequence,
+            started_monotonic_ms: started.record.monotonic_ms,
+            completed_monotonic_ms: completed.record.monotonic_ms,
+        })
+    }
+
+    #[must_use]
+    pub const fn ordinal(self) -> u16 {
+        self.ordinal
+    }
+
+    #[must_use]
+    pub const fn repeat_index(self) -> u16 {
+        self.repeat_index
+    }
+
+    #[must_use]
+    pub const fn started_sequence(self) -> u64 {
+        self.started_sequence
+    }
+
+    #[must_use]
+    pub const fn completed_sequence(self) -> u64 {
+        self.completed_sequence
+    }
+
+    #[must_use]
+    pub const fn started_monotonic_ms(self) -> u64 {
+        self.started_monotonic_ms
+    }
+
+    #[must_use]
+    pub const fn completed_monotonic_ms(self) -> u64 {
+        self.completed_monotonic_ms
+    }
+
+    #[must_use]
+    pub const fn duration_ms(self) -> u64 {
+        self.completed_monotonic_ms
+            .saturating_sub(self.started_monotonic_ms)
+    }
+}
+
 /// Untrusted integer observations from one measurement interval.
 ///
 /// All fields are validated before a [`VerifiedRepeat`] can be produced.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RawRepeatCounters {
+    pub measurement_interval: VerifiedMeasurementInterval,
     pub outbound: DirectionPacketCounters,
     pub inbound: DirectionPacketCounters,
     pub duplicate_packets: u64,
@@ -787,6 +961,7 @@ pub struct RawRepeatCounters {
 pub struct VerifiedRepeat {
     protocol: HardwareMeasurementProtocol,
     ordinal: u16,
+    measurement_interval: VerifiedMeasurementInterval,
     record: HardwareRepeat,
 }
 
@@ -805,6 +980,13 @@ impl VerifiedRepeat {
                 maximum: repeat_count,
             });
         }
+        validate_measurement_interval_binding(
+            binding,
+            ordinal,
+            repeat_index,
+            raw.measurement_interval,
+        )?;
+        validate_bounded_artifact_hashes(&raw.artifact_hashes)?;
         if raw.duplicate_packets != 0 {
             return Err(MeasurementProtocolError::DuplicatePackets(
                 raw.duplicate_packets,
@@ -897,6 +1079,7 @@ impl VerifiedRepeat {
         Ok(Self {
             protocol: binding.protocol,
             ordinal,
+            measurement_interval: raw.measurement_interval,
             record,
         })
     }
@@ -914,6 +1097,11 @@ impl VerifiedRepeat {
     #[must_use]
     pub const fn record(&self) -> &HardwareRepeat {
         &self.record
+    }
+
+    #[must_use]
+    pub const fn measurement_interval(&self) -> VerifiedMeasurementInterval {
+        self.measurement_interval
     }
 
     #[must_use]
@@ -936,6 +1124,7 @@ impl VerifiedSummary {
         repeats: &[VerifiedRepeat],
         artifact_hashes: Vec<ArtifactHash>,
     ) -> Result<Self, MeasurementProtocolError> {
+        validate_bounded_artifact_hashes(&artifact_hashes)?;
         let record = derive_summary_record(binding, ordinal, repeats, artifact_hashes)?;
         Ok(Self {
             protocol: binding.protocol,
@@ -987,52 +1176,52 @@ pub fn validate_complete_measurement(
         });
     }
 
-    let mut repeat_keys = BTreeSet::new();
-    for repeat in repeats {
+    let repeats_per_case = usize::from(metadata.repeats_per_case);
+    for (position, repeat) in repeats.iter().enumerate() {
         validate_repeat_binding(binding, repeat)?;
-        let key = (repeat.ordinal, repeat.record.repeat_index);
-        if !repeat_keys.insert(key) {
-            return Err(MeasurementProtocolError::DuplicateRepeat {
-                ordinal: key.0,
-                repeat_index: key.1,
+        let expected_ordinal = u16::try_from(position / repeats_per_case).map_err(|_| {
+            MeasurementProtocolError::ArithmeticOverflow("canonical repeat ordinal")
+        })?;
+        let expected_repeat_index = u16::try_from(position % repeats_per_case + 1)
+            .map_err(|_| MeasurementProtocolError::ArithmeticOverflow("canonical repeat index"))?;
+        if repeat.ordinal != expected_ordinal || repeat.record.repeat_index != expected_repeat_index
+        {
+            return Err(MeasurementProtocolError::RepeatOrderMismatch {
+                position,
+                expected_ordinal,
+                expected_repeat_index,
+                actual_ordinal: repeat.ordinal,
+                actual_repeat_index: repeat.record.repeat_index,
             });
         }
     }
-    for ordinal in 0..metadata.case_count {
-        for repeat_index in 1..=metadata.repeats_per_case {
-            if !repeat_keys.contains(&(ordinal, repeat_index)) {
-                return Err(MeasurementProtocolError::MissingRepeat {
-                    ordinal,
-                    repeat_index,
-                });
-            }
-        }
-    }
 
-    let mut summary_ordinals = BTreeSet::new();
-    for summary in summaries {
+    for (position, summary) in summaries.iter().enumerate() {
         validate_summary_binding(binding, summary)?;
-        if !summary_ordinals.insert(summary.ordinal) {
-            return Err(MeasurementProtocolError::DuplicateSummary(summary.ordinal));
+        let expected_ordinal = u16::try_from(position).map_err(|_| {
+            MeasurementProtocolError::ArithmeticOverflow("canonical summary ordinal")
+        })?;
+        if summary.ordinal != expected_ordinal {
+            return Err(MeasurementProtocolError::SummaryOrderMismatch {
+                position,
+                expected_ordinal,
+                actual_ordinal: summary.ordinal,
+            });
         }
     }
-    for ordinal in 0..metadata.case_count {
-        if !summary_ordinals.contains(&ordinal) {
-            return Err(MeasurementProtocolError::MissingSummary(ordinal));
-        }
-        let supplied = summaries
-            .iter()
-            .find(|summary| summary.ordinal == ordinal)
-            .ok_or(MeasurementProtocolError::MissingSummary(ordinal))?;
-        let case_repeats = repeats
-            .iter()
-            .filter(|repeat| repeat.ordinal == ordinal)
-            .cloned()
-            .collect::<Vec<_>>();
+    for (ordinal_index, supplied) in summaries.iter().enumerate() {
+        let ordinal = u16::try_from(ordinal_index)
+            .map_err(|_| MeasurementProtocolError::ArithmeticOverflow("summary ordinal"))?;
+        let start = ordinal_index.checked_mul(repeats_per_case).ok_or(
+            MeasurementProtocolError::ArithmeticOverflow("case repeat slice start"),
+        )?;
+        let end = start.checked_add(repeats_per_case).ok_or(
+            MeasurementProtocolError::ArithmeticOverflow("case repeat slice end"),
+        )?;
         let expected = derive_summary_record(
             binding,
             ordinal,
-            &case_repeats,
+            &repeats[start..end],
             supplied.record.artifact_hashes.clone(),
         )?;
         if expected != supplied.record {
@@ -1056,24 +1245,17 @@ fn derive_summary_record(
             actual: repeats.len(),
         });
     }
-    let mut indices = BTreeSet::new();
-    for repeat in repeats {
+    for (position, repeat) in repeats.iter().enumerate() {
         validate_repeat_binding(binding, repeat)?;
-        if repeat.ordinal != ordinal {
-            return Err(MeasurementProtocolError::RepeatBindingMismatch);
-        }
-        if !indices.insert(repeat.record.repeat_index) {
-            return Err(MeasurementProtocolError::DuplicateRepeat {
-                ordinal,
-                repeat_index: repeat.record.repeat_index,
-            });
-        }
-    }
-    for repeat_index in 1..=binding.protocol.timing.repeat_count {
-        if !indices.contains(&repeat_index) {
-            return Err(MeasurementProtocolError::MissingRepeat {
-                ordinal,
-                repeat_index,
+        let expected_repeat_index = u16::try_from(position + 1)
+            .map_err(|_| MeasurementProtocolError::ArithmeticOverflow("summary repeat index"))?;
+        if repeat.ordinal != ordinal || repeat.record.repeat_index != expected_repeat_index {
+            return Err(MeasurementProtocolError::RepeatOrderMismatch {
+                position,
+                expected_ordinal: ordinal,
+                expected_repeat_index,
+                actual_ordinal: repeat.ordinal,
+                actual_repeat_index: repeat.record.repeat_index,
             });
         }
     }
@@ -1115,6 +1297,13 @@ fn validate_repeat_binding(
     {
         return Err(MeasurementProtocolError::RepeatBindingMismatch);
     }
+    validate_measurement_interval_binding(
+        binding,
+        repeat.ordinal,
+        repeat.record.repeat_index,
+        repeat.measurement_interval,
+    )?;
+    validate_bounded_artifact_hashes(&repeat.record.artifact_hashes)?;
     repeat.record.validate()?;
     Ok(())
 }
@@ -1133,7 +1322,60 @@ fn validate_summary_binding(
     {
         return Err(MeasurementProtocolError::SummaryBindingMismatch);
     }
+    validate_bounded_artifact_hashes(&summary.record.artifact_hashes)?;
     summary.record.validate()?;
+    Ok(())
+}
+
+fn validate_measurement_interval_binding(
+    binding: BoundHardwareMeasurement<'_>,
+    ordinal: u16,
+    repeat_index: u16,
+    interval: VerifiedMeasurementInterval,
+) -> Result<(), MeasurementProtocolError> {
+    if interval.protocol != binding.protocol
+        || interval.ordinal != ordinal
+        || interval.repeat_index != repeat_index
+    {
+        return Err(MeasurementProtocolError::MeasurementIntervalBindingMismatch);
+    }
+    let expected_ms = u64::from(binding.protocol.timing.duration_seconds)
+        .checked_mul(1_000)
+        .ok_or(MeasurementProtocolError::ArithmeticOverflow(
+            "measurement interval duration",
+        ))?;
+    if interval.duration_ms() != expected_ms {
+        return Err(MeasurementProtocolError::MeasurementIntervalDuration {
+            expected_ms,
+            actual_ms: interval.duration_ms(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_bounded_artifact_hashes(
+    artifact_hashes: &[ArtifactHash],
+) -> Result<(), MeasurementProtocolError> {
+    if artifact_hashes.len() > MAX_MEASUREMENT_ARTIFACT_HASHES {
+        return Err(MeasurementProtocolError::ArtifactHashCountOutOfRange {
+            actual: artifact_hashes.len(),
+            maximum: MAX_MEASUREMENT_ARTIFACT_HASHES,
+        });
+    }
+    for hash in artifact_hashes {
+        if hash.path.len() > MAX_MEASUREMENT_ARTIFACT_PATH_BYTES {
+            return Err(MeasurementProtocolError::ArtifactPathTooLong {
+                actual: hash.path.len(),
+                maximum: MAX_MEASUREMENT_ARTIFACT_PATH_BYTES,
+            });
+        }
+    }
+    if artifact_hashes
+        .windows(2)
+        .any(|pair| pair[0].path >= pair[1].path)
+    {
+        return Err(MeasurementProtocolError::ArtifactHashOrder);
+    }
     Ok(())
 }
 
@@ -1297,6 +1539,7 @@ impl MeasurementLifecycleEvent {
                 actual: 0,
             });
         }
+        validate_bounded_artifact_hashes(&artifact_hashes)?;
         let record = LifecycleRecord {
             sequence,
             monotonic_ms,
@@ -1409,7 +1652,11 @@ impl<'a> LifecycleSequenceValidator<'a> {
                 if event.record.outcome != LifecycleOutcome::Started {
                     return Err(MeasurementProtocolError::LifecycleUnexpectedOutcome);
                 }
-                self.validate_deadlines(event.record.monotonic_ms, event.code)?;
+                self.validate_deadlines(
+                    event.record.monotonic_ms,
+                    event.code,
+                    event.record.outcome,
+                )?;
                 self.open_code = Some(event.code);
                 self.open_started_ms = Some(event.record.monotonic_ms);
                 if event.code == MeasurementLifecycleCode::preflight() {
@@ -1426,7 +1673,11 @@ impl<'a> LifecycleSequenceValidator<'a> {
                 if event.record.outcome == LifecycleOutcome::Started {
                     return Err(MeasurementProtocolError::LifecycleUnexpectedOutcome);
                 }
-                self.validate_deadlines(event.record.monotonic_ms, event.code)?;
+                self.validate_deadlines(
+                    event.record.monotonic_ms,
+                    event.code,
+                    event.record.outcome,
+                )?;
                 self.open_code = None;
                 self.open_started_ms = None;
                 if event.record.outcome == LifecycleOutcome::Failed {
@@ -1526,6 +1777,7 @@ impl<'a> LifecycleSequenceValidator<'a> {
         self,
         monotonic_ms: u64,
         code: MeasurementLifecycleCode,
+        outcome: LifecycleOutcome,
     ) -> Result<(), MeasurementProtocolError> {
         let timing = self.binding.protocol.timing;
         if let Some(started_ms) = self.run_started_ms {
@@ -1542,6 +1794,27 @@ impl<'a> LifecycleSequenceValidator<'a> {
                     monotonic_ms,
                     timing.drain_timeout_ms,
                 )?;
+            }
+        }
+        if code.phase == LifecyclePhase::Measurement && outcome == LifecycleOutcome::Completed {
+            if let Some(started_ms) = self.open_started_ms {
+                let actual_ms = monotonic_ms.checked_sub(started_ms).ok_or(
+                    MeasurementProtocolError::LifecycleTimeRegression {
+                        previous: started_ms,
+                        actual: monotonic_ms,
+                    },
+                )?;
+                let expected_ms = u64::from(timing.duration_seconds)
+                    .checked_mul(1_000)
+                    .ok_or(MeasurementProtocolError::ArithmeticOverflow(
+                        "measurement interval duration",
+                    ))?;
+                if actual_ms != expected_ms {
+                    return Err(MeasurementProtocolError::MeasurementIntervalDuration {
+                        expected_ms,
+                        actual_ms,
+                    });
+                }
             }
         }
         Ok(())
@@ -1925,7 +2198,44 @@ mod tests {
         }
     }
 
-    fn raw_for_case(case: &HardwareCase, repeat_index: u16) -> RawRepeatCounters {
+    fn measurement_interval(
+        binding: BoundHardwareMeasurement<'_>,
+        ordinal: u16,
+        repeat_index: u16,
+    ) -> VerifiedMeasurementInterval {
+        let stride = u64::from(binding.protocol().timing().repeat_count()) * 2 + 4;
+        let started_sequence = 7 + u64::from(ordinal) * stride + u64::from(repeat_index - 1) * 2;
+        let started_ms = started_sequence * 2_000;
+        let code =
+            MeasurementLifecycleCode::case_measurement(binding, ordinal, repeat_index).unwrap();
+        let started = lifecycle_event_at(
+            started_sequence,
+            started_ms,
+            code,
+            LifecycleOutcome::Started,
+        );
+        let completed = lifecycle_event_at(
+            started_sequence + 1,
+            started_ms + u64::from(binding.protocol().timing().duration_seconds()) * 1_000,
+            code,
+            LifecycleOutcome::Completed,
+        );
+        VerifiedMeasurementInterval::from_lifecycle_pair(
+            binding,
+            ordinal,
+            repeat_index,
+            &started,
+            &completed,
+        )
+        .unwrap()
+    }
+
+    fn raw_for_case(
+        binding: BoundHardwareMeasurement<'_>,
+        ordinal: u16,
+        repeat_index: u16,
+    ) -> RawRepeatCounters {
+        let case = &binding.case(ordinal).unwrap().case;
         let outbound_active = matches!(
             case.direction,
             DirectionProfile::Outbound | DirectionProfile::Bidirectional
@@ -1937,6 +2247,7 @@ mod tests {
         let outbound = direction_counters(outbound_active, repeat_index);
         let inbound = direction_counters(inbound_active, repeat_index);
         RawRepeatCounters {
+            measurement_interval: measurement_interval(binding, ordinal, repeat_index),
             outbound,
             inbound,
             duplicate_packets: 0,
@@ -1959,14 +2270,13 @@ mod tests {
         binding: BoundHardwareMeasurement<'_>,
         ordinal: u16,
     ) -> Vec<VerifiedRepeat> {
-        let case = &binding.case(ordinal).unwrap().case;
         (1..=binding.protocol().timing().repeat_count())
             .map(|repeat_index| {
                 VerifiedRepeat::from_raw(
                     binding,
                     ordinal,
                     repeat_index,
-                    raw_for_case(case, repeat_index),
+                    raw_for_case(binding, ordinal, repeat_index),
                 )
                 .unwrap()
             })
@@ -2004,13 +2314,29 @@ mod tests {
         code: MeasurementLifecycleCode,
         terminal: LifecycleOutcome,
     ) {
-        events.push(lifecycle_event(
+        let started_ms = events
+            .last()
+            .map_or(0, |event| event.record().monotonic_ms + 10);
+        events.push(lifecycle_event_at(
             *next_sequence,
+            started_ms,
             code,
             LifecycleOutcome::Started,
         ));
         *next_sequence += 1;
-        events.push(lifecycle_event(*next_sequence, code, terminal));
+        let interval_ms = if code.phase() == LifecyclePhase::Measurement
+            && terminal == LifecycleOutcome::Completed
+        {
+            1_000
+        } else {
+            10
+        };
+        events.push(lifecycle_event_at(
+            *next_sequence,
+            started_ms + interval_ms,
+            code,
+            terminal,
+        ));
         *next_sequence += 1;
     }
 
@@ -2072,6 +2398,140 @@ mod tests {
     }
 
     #[test]
+    fn measurement_interval_rejects_short_long_gapped_and_detached_counters() {
+        let plan = hardware_plan_v1().unwrap();
+        let binding = protocol(1, no_latency()).bind(&plan).unwrap();
+        let code = MeasurementLifecycleCode::case_measurement(binding, 0, 1).unwrap();
+        let started = lifecycle_event_at(7, 10_000, code, LifecycleOutcome::Started);
+        for (completed_ms, actual_ms) in [(10_999, 999), (11_001, 1_001)] {
+            let completed = lifecycle_event_at(8, completed_ms, code, LifecycleOutcome::Completed);
+            assert!(matches!(
+                VerifiedMeasurementInterval::from_lifecycle_pair(
+                    binding, 0, 1, &started, &completed
+                ),
+                Err(MeasurementProtocolError::MeasurementIntervalDuration {
+                    expected_ms: 1_000,
+                    actual_ms: observed
+                }) if observed == actual_ms
+            ));
+        }
+        let gapped = lifecycle_event_at(9, 11_000, code, LifecycleOutcome::Completed);
+        assert!(matches!(
+            VerifiedMeasurementInterval::from_lifecycle_pair(binding, 0, 1, &started, &gapped),
+            Err(MeasurementProtocolError::MeasurementIntervalSequenceMismatch)
+        ));
+
+        let mut detached = raw_for_case(binding, 1, 1);
+        detached.measurement_interval = measurement_interval(binding, 0, 1);
+        assert!(matches!(
+            VerifiedRepeat::from_raw(binding, 1, 1, detached),
+            Err(MeasurementProtocolError::MeasurementIntervalBindingMismatch)
+        ));
+
+        let mut validator = LifecycleSequenceValidator::new(binding);
+        let setup_codes = [
+            MeasurementLifecycleCode::preflight(),
+            MeasurementLifecycleCode::setup(),
+            MeasurementLifecycleCode::case_warmup(binding, 0).unwrap(),
+        ];
+        let mut sequence = 1;
+        for setup_code in setup_codes {
+            validator
+                .push(&lifecycle_event_at(
+                    sequence,
+                    0,
+                    setup_code,
+                    LifecycleOutcome::Started,
+                ))
+                .unwrap();
+            sequence += 1;
+            validator
+                .push(&lifecycle_event_at(
+                    sequence,
+                    0,
+                    setup_code,
+                    LifecycleOutcome::Completed,
+                ))
+                .unwrap();
+            sequence += 1;
+        }
+        validator
+            .push(&lifecycle_event_at(
+                sequence,
+                0,
+                code,
+                LifecycleOutcome::Started,
+            ))
+            .unwrap();
+        sequence += 1;
+        assert!(matches!(
+            validator.push(&lifecycle_event_at(
+                sequence,
+                10,
+                code,
+                LifecycleOutcome::Completed
+            )),
+            Err(MeasurementProtocolError::MeasurementIntervalDuration {
+                expected_ms: 1_000,
+                actual_ms: 10
+            })
+        ));
+    }
+
+    #[test]
+    fn measurement_artifact_inputs_are_bounded_and_canonical_before_derivation() {
+        let plan = hardware_plan_v1().unwrap();
+        let binding = protocol(1, no_latency()).bind(&plan).unwrap();
+        let hash_a = ArtifactHash::new("a", SHA_A).unwrap();
+        let hash_b = ArtifactHash::new("b", SHA_B).unwrap();
+        let oversized = vec![hash_a.clone(); MAX_MEASUREMENT_ARTIFACT_HASHES + 1];
+
+        let mut raw = raw_for_case(binding, 0, 1);
+        raw.artifact_hashes = oversized.clone();
+        assert!(matches!(
+            VerifiedRepeat::from_raw(binding, 0, 1, raw),
+            Err(MeasurementProtocolError::ArtifactHashCountOutOfRange {
+                actual: 65,
+                maximum: 64
+            })
+        ));
+        let repeats = verified_repeats(binding, 0);
+        assert!(matches!(
+            VerifiedSummary::derive(binding, 0, &repeats, oversized.clone()),
+            Err(MeasurementProtocolError::ArtifactHashCountOutOfRange { .. })
+        ));
+        assert!(matches!(
+            MeasurementLifecycleEvent::new(
+                1,
+                0,
+                MeasurementLifecycleCode::preflight(),
+                LifecycleOutcome::Started,
+                healthy_frames(),
+                oversized,
+            ),
+            Err(MeasurementProtocolError::ArtifactHashCountOutOfRange { .. })
+        ));
+
+        let long_path =
+            ArtifactHash::new("a".repeat(MAX_MEASUREMENT_ARTIFACT_PATH_BYTES + 1), SHA_A).unwrap();
+        let mut long_path_raw = raw_for_case(binding, 0, 1);
+        long_path_raw.artifact_hashes = vec![long_path];
+        assert!(matches!(
+            VerifiedRepeat::from_raw(binding, 0, 1, long_path_raw),
+            Err(MeasurementProtocolError::ArtifactPathTooLong {
+                actual: 257,
+                maximum: 256
+            })
+        ));
+        let mut reordered = raw_for_case(binding, 0, 1);
+        reordered.artifact_hashes = vec![hash_b, hash_a];
+        assert!(matches!(
+            VerifiedRepeat::from_raw(binding, 0, 1, reordered),
+            Err(MeasurementProtocolError::ArtifactHashOrder)
+        ));
+    }
+
+    #[test]
     fn raw_fixed_and_bidirectional_imix_counters_derive_exact_records() {
         let plan = hardware_plan_v1().unwrap();
         let binding = protocol(1, no_latency()).bind(&plan).unwrap();
@@ -2087,7 +2547,7 @@ mod tests {
             binding,
             fixed_ordinal,
             1,
-            raw_for_case(&binding.case(fixed_ordinal).unwrap().case, 1),
+            raw_for_case(binding, fixed_ordinal, 1),
         )
         .unwrap();
         assert_eq!(fixed.record().offered_packets, 120);
@@ -2113,7 +2573,7 @@ mod tests {
             binding,
             imix_ordinal,
             1,
-            raw_for_case(&binding.case(imix_ordinal).unwrap().case, 1),
+            raw_for_case(binding, imix_ordinal, 1),
         )
         .unwrap();
         assert_eq!(imix.record().accepted_packets, 216);
@@ -2139,15 +2599,13 @@ mod tests {
                     && planned.case.direction == DirectionProfile::Outbound
             })
             .unwrap() as u16;
-        let fixed_case = &binding.case(fixed_ordinal).unwrap().case;
-
-        let mut duplicate = raw_for_case(fixed_case, 1);
+        let mut duplicate = raw_for_case(binding, fixed_ordinal, 1);
         duplicate.duplicate_packets = 1;
         assert!(matches!(
             VerifiedRepeat::from_raw(binding, fixed_ordinal, 1, duplicate),
             Err(MeasurementProtocolError::DuplicatePackets(1))
         ));
-        let mut inactive = raw_for_case(fixed_case, 1);
+        let mut inactive = raw_for_case(binding, fixed_ordinal, 1);
         inactive.inbound = DirectionPacketCounters {
             offered_packets: 1,
             received_packets: 1,
@@ -2159,7 +2617,7 @@ mod tests {
                 DirectionProfile::Inbound
             ))
         ));
-        let mut oracle_mismatch = raw_for_case(fixed_case, 1);
+        let mut oracle_mismatch = raw_for_case(binding, fixed_ordinal, 1);
         oracle_mismatch.outbound.accepted_packets -= 1;
         assert!(matches!(
             VerifiedRepeat::from_raw(binding, fixed_ordinal, 1, oracle_mismatch),
@@ -2167,7 +2625,7 @@ mod tests {
                 DirectionProfile::Outbound
             ))
         ));
-        let mut unexpected_imix = raw_for_case(fixed_case, 1);
+        let mut unexpected_imix = raw_for_case(binding, fixed_ordinal, 1);
         unexpected_imix.outbound_imix = Some(imix_evidence(unexpected_imix.outbound));
         assert!(matches!(
             VerifiedRepeat::from_raw(binding, fixed_ordinal, 1, unexpected_imix),
@@ -2182,7 +2640,7 @@ mod tests {
             .position(|planned| planned.case.frame == HardwareFrame::RusterImixV1)
             .unwrap() as u16;
         let imix_case = &binding.case(imix_ordinal).unwrap().case;
-        let mut missing_imix = raw_for_case(imix_case, 1);
+        let mut missing_imix = raw_for_case(binding, imix_ordinal, 1);
         match imix_case.direction {
             DirectionProfile::Outbound | DirectionProfile::Bidirectional => {
                 missing_imix.outbound_imix = None;
@@ -2205,8 +2663,7 @@ mod tests {
             .iter()
             .position(|planned| planned.case.direction != DirectionProfile::Bidirectional)
             .unwrap() as u16;
-        let case = &binding.case(ordinal).unwrap().case;
-        let mut raw = raw_for_case(case, 1);
+        let mut raw = raw_for_case(binding, ordinal, 1);
         raw.latency_samples = 9;
         raw.p50_latency_ns = 100;
         raw.p99_latency_ns = 200;
@@ -2237,6 +2694,15 @@ mod tests {
             first_summary.record().loss_ratio_worst.to_bits(),
             0.1_f64.to_bits()
         );
+        let reordered_case = [
+            first_repeats[2].clone(),
+            first_repeats[0].clone(),
+            first_repeats[1].clone(),
+        ];
+        assert!(matches!(
+            VerifiedSummary::derive(binding, 0, &reordered_case, Vec::new()),
+            Err(MeasurementProtocolError::RepeatOrderMismatch { .. })
+        ));
 
         let mut repeats = Vec::with_capacity(711);
         let mut summaries = Vec::with_capacity(237);
@@ -2250,12 +2716,17 @@ mod tests {
         let metadata = validate_complete_measurement(binding, &repeats, &summaries).unwrap();
         assert_eq!(metadata.expected_repeat_records(), 711);
 
-        let mut duplicated = repeats.clone();
-        duplicated[1] = duplicated[0].clone();
+        let mut reordered = repeats.clone();
+        reordered.swap(0, 1);
         assert!(matches!(
-            validate_complete_measurement(binding, &duplicated, &summaries),
-            Err(MeasurementProtocolError::DuplicateRepeat { .. })
-                | Err(MeasurementProtocolError::MissingRepeat { .. })
+            validate_complete_measurement(binding, &reordered, &summaries),
+            Err(MeasurementProtocolError::RepeatOrderMismatch { position: 0, .. })
+        ));
+        let mut reordered_summaries = summaries.clone();
+        reordered_summaries.swap(0, 1);
+        assert!(matches!(
+            validate_complete_measurement(binding, &repeats, &reordered_summaries),
+            Err(MeasurementProtocolError::SummaryOrderMismatch { position: 0, .. })
         ));
         let mut forged_summaries = summaries.clone();
         forged_summaries[0].record.accepted_pps_median += 1.0;
@@ -2451,21 +2922,23 @@ mod tests {
             MeasurementLifecycleCode::case_drain(binding, 0).unwrap(),
         ];
         let mut timeout_sequence = 1;
+        let mut timeout_ms = 0;
         for code in timeout_codes {
             timeout_validator
                 .push(&lifecycle_event_at(
                     timeout_sequence,
-                    0,
+                    timeout_ms,
                     code,
                     LifecycleOutcome::Started,
                 ))
                 .unwrap();
             timeout_sequence += 1;
-            let terminal_ms = if code.phase() == LifecyclePhase::Drain {
-                1_001
-            } else {
-                0
+            let interval_ms = match code.phase() {
+                LifecyclePhase::Measurement => 1_000,
+                LifecyclePhase::Drain => 1_001,
+                _ => 0,
             };
+            let terminal_ms = timeout_ms + interval_ms;
             let result = timeout_validator.push(&lifecycle_event_at(
                 timeout_sequence,
                 terminal_ms,
@@ -2473,6 +2946,7 @@ mod tests {
                 LifecycleOutcome::Completed,
             ));
             timeout_sequence += 1;
+            timeout_ms = terminal_ms;
             if code.phase() == LifecyclePhase::Drain {
                 assert!(matches!(
                     result,

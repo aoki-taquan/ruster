@@ -67,8 +67,10 @@ plannerはtrafficを実行せず、threshold、baseline、合否、hardware性�
 237-case planへbindし、untrusted integer counterからだけrepeatを導出します。
 duplicate、unexpected、oracle failure、direction mismatch、IMIX evidence driftを
 fail closedで拒否し、exact odd repeat setからsummaryと237-case completenessを
-再検証します。typed lifecycleはcontiguous sequence、monotonic time、case/repeat順序、
-failure時のdrain/cleanupを固定します。
+canonical orderで再検証します。counterはtyped lifecycle measurement pairへbindし、
+observed intervalとdeclared durationのexact一致を要求します。typed lifecycleは
+contiguous sequence、monotonic time、case/repeat順序、failure時のdrain/cleanupを
+固定します。artifact hash inputも件数、path長、path順序を明示的にboundします。
 
 契約と境界は
 [hardware measurement protocol v1](../../docs/hardware-measurement-protocol-v1.md)を

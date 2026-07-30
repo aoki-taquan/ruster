@@ -27,8 +27,11 @@ warmupとdurationは各600秒以下、repeat countは1..=31の奇数です。dra
 
 ## Integer observations
 
-`RawRepeatCounters`はuntrusted inputです。`VerifiedRepeat::from_raw`だけがartifact
-recordを生成します。各active directionはofferedがnonzeroで、
+`RawRepeatCounters`はuntrusted inputです。counterは同じprotocol/case/repeatのtyped
+measurement lifecycle pairへbindします。pairはadjacentな`started`/`completed`で、
+observed intervalがdeclared durationとmillisecond単位でexact一致しなければなりません。
+短い、長い、別case/repeatへdetachedしたintervalはrate導出前に拒否します。
+`VerifiedRepeat::from_raw`だけがartifact recordを生成します。各active directionはofferedがnonzeroで、
 `received <= offered`かつ`accepted == received`でなければなりません。inactive
 directionは全counterがexact zeroです。duplicate、unexpected、packet oracle failureは
 いずれもexact zeroを要求します。direction合計とL1 bit countはchecked integer
@@ -52,8 +55,10 @@ positiveかつ`p99 >= p50`です。one-way profileはclock synchronization evide
 median、lossとlatencyはworst valueをrepeat recordから決定的に導出します。
 
 complete runはexactly 237 case、各case exactly R repeat、exactly 237 summaryです。
-R=3ならrepeat recordは711件です。duplicate、missing、別protocol/caseへのbinding、
-または supplied repeat setから再導出できないsummaryを拒否します。
+R=3ならrepeat recordは711件です。repeatはordinal outer/repeat index inner、
+summaryはordinal順のcanonical orderを要求します。duplicate、missing、reorder、
+別protocol/caseへのbinding、またはsupplied repeat setから再導出できないsummaryを
+拒否します。
 
 ## Lifecycle
 
@@ -73,7 +78,11 @@ run.cleanup
 ordinal 0..236のwarmup、repeat 1..=R、drain、cleanupのexact順序です。
 preflight/setup failureはcleanupへ、warmup/measurement failureは同じcaseのdrainを
 経てcleanupへ遷移します。各eventでrun/case deadlineを、drain pairでdrain timeoutを
-検証します。validator更新はtransactionalで、拒否eventは状態を進めません。
+検証し、completed measurement pairはdeclared durationとのexact一致も要求します。
+validator更新はtransactionalで、拒否eventは状態を進めません。
+
+artifact hash inputは最大64件、各relative pathは最大256 bytesです。path昇順の
+canonical orderを要求し、件数、path長、orderをrecord生成や内部cloneより前に検証します。
 
 ## Test boundary
 
