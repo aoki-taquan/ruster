@@ -3,6 +3,7 @@ members = [
     "crates/bench",
     "crates/config",
     "crates/core",
+    "crates/io-afpacket",
     "crates/io-conformance",
     "crates/io-sim",
     "crates/io-xdp",

@@ -76,6 +76,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruster-io-afpacket"
+version = "0.2.0"
+dependencies = [
+ "ruster-core",
+]
+
+[[package]]
 name = "ruster-io-sim"
 version = "0.2.0"
 dependencies = [
