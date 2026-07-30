@@ -834,8 +834,8 @@ impl DirectionPacketCounters {
 
 /// Exact, typed lifecycle interval that authorizes counters for one repeat.
 ///
-/// The interval can only be built from an adjacent `started`/`completed`
-/// measurement pair whose observed duration exactly matches the protocol.
+/// Only [`LifecycleSequenceValidator::push`] can mint this capability, after
+/// accepting the canonical global lifecycle position and exact duration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VerifiedMeasurementInterval {
     protocol: HardwareMeasurementProtocol,
@@ -848,33 +848,35 @@ pub struct VerifiedMeasurementInterval {
 }
 
 impl VerifiedMeasurementInterval {
-    pub fn from_lifecycle_pair(
+    fn from_validated_completion(
         binding: BoundHardwareMeasurement<'_>,
-        ordinal: u16,
-        repeat_index: u16,
-        started: &MeasurementLifecycleEvent,
+        code: MeasurementLifecycleCode,
+        started_sequence: u64,
+        started_monotonic_ms: u64,
         completed: &MeasurementLifecycleEvent,
     ) -> Result<Self, MeasurementProtocolError> {
-        let expected = MeasurementLifecycleCode::case_measurement(binding, ordinal, repeat_index)?;
-        if started.code != expected
-            || completed.code != expected
-            || started.record.outcome != LifecycleOutcome::Started
-            || completed.record.outcome != LifecycleOutcome::Completed
-        {
+        let LifecycleScope::Repeat {
+            ordinal,
+            repeat_index,
+        } = code.scope
+        else {
             return Err(MeasurementProtocolError::MeasurementIntervalBindingMismatch);
-        }
-        let expected_completed_sequence = started.record.sequence.checked_add(1).ok_or(
-            MeasurementProtocolError::ArithmeticOverflow("measurement interval sequence"),
-        )?;
+        };
+        let expected_completed_sequence =
+            started_sequence
+                .checked_add(1)
+                .ok_or(MeasurementProtocolError::ArithmeticOverflow(
+                    "measurement interval sequence",
+                ))?;
         if completed.record.sequence != expected_completed_sequence {
             return Err(MeasurementProtocolError::MeasurementIntervalSequenceMismatch);
         }
         let actual_ms = completed
             .record
             .monotonic_ms
-            .checked_sub(started.record.monotonic_ms)
+            .checked_sub(started_monotonic_ms)
             .ok_or(MeasurementProtocolError::LifecycleTimeRegression {
-                previous: started.record.monotonic_ms,
+                previous: started_monotonic_ms,
                 actual: completed.record.monotonic_ms,
             })?;
         let expected_ms = u64::from(binding.protocol.timing.duration_seconds)
@@ -892,9 +894,9 @@ impl VerifiedMeasurementInterval {
             protocol: binding.protocol,
             ordinal,
             repeat_index,
-            started_sequence: started.record.sequence,
+            started_sequence,
             completed_sequence: completed.record.sequence,
-            started_monotonic_ms: started.record.monotonic_ms,
+            started_monotonic_ms,
             completed_monotonic_ms: completed.record.monotonic_ms,
         })
     }
@@ -1177,6 +1179,7 @@ pub fn validate_complete_measurement(
     }
 
     let repeats_per_case = usize::from(metadata.repeats_per_case);
+    let mut previous_completed_ms = None;
     for (position, repeat) in repeats.iter().enumerate() {
         validate_repeat_binding(binding, repeat)?;
         let expected_ordinal = u16::try_from(position / repeats_per_case).map_err(|_| {
@@ -1194,6 +1197,11 @@ pub fn validate_complete_measurement(
                 actual_repeat_index: repeat.record.repeat_index,
             });
         }
+        validate_interval_after(
+            previous_completed_ms,
+            repeat.measurement_interval.started_monotonic_ms,
+        )?;
+        previous_completed_ms = Some(repeat.measurement_interval.completed_monotonic_ms);
     }
 
     for (position, summary) in summaries.iter().enumerate() {
@@ -1245,6 +1253,7 @@ fn derive_summary_record(
             actual: repeats.len(),
         });
     }
+    let mut previous_completed_ms = None;
     for (position, repeat) in repeats.iter().enumerate() {
         validate_repeat_binding(binding, repeat)?;
         let expected_repeat_index = u16::try_from(position + 1)
@@ -1258,6 +1267,11 @@ fn derive_summary_record(
                 actual_repeat_index: repeat.record.repeat_index,
             });
         }
+        validate_interval_after(
+            previous_completed_ms,
+            repeat.measurement_interval.started_monotonic_ms,
+        )?;
+        previous_completed_ms = Some(repeat.measurement_interval.completed_monotonic_ms);
     }
 
     let accepted_pps_median = median_metric(repeats, |record| record.accepted_pps)?;
@@ -1339,6 +1353,38 @@ fn validate_measurement_interval_binding(
     {
         return Err(MeasurementProtocolError::MeasurementIntervalBindingMismatch);
     }
+    let repeat_stride = u64::from(binding.protocol.timing.repeat_count)
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(4))
+        .ok_or(MeasurementProtocolError::ArithmeticOverflow(
+            "measurement interval sequence stride",
+        ))?;
+    let repeat_offset =
+        repeat_index
+            .checked_sub(1)
+            .ok_or(MeasurementProtocolError::RepeatIndexOutOfRange {
+                actual: repeat_index,
+                maximum: binding.protocol.timing.repeat_count,
+            })?;
+    let expected_started_sequence = u64::from(ordinal)
+        .checked_mul(repeat_stride)
+        .and_then(|value| {
+            u64::from(repeat_offset)
+                .checked_mul(2)
+                .and_then(|repeat_offset| value.checked_add(repeat_offset))
+        })
+        .and_then(|value| value.checked_add(7))
+        .ok_or(MeasurementProtocolError::ArithmeticOverflow(
+            "measurement interval global sequence",
+        ))?;
+    let expected_completed_sequence = expected_started_sequence.checked_add(1).ok_or(
+        MeasurementProtocolError::ArithmeticOverflow("measurement interval completion sequence"),
+    )?;
+    if interval.started_sequence != expected_started_sequence
+        || interval.completed_sequence != expected_completed_sequence
+    {
+        return Err(MeasurementProtocolError::MeasurementIntervalSequenceMismatch);
+    }
     let expected_ms = u64::from(binding.protocol.timing.duration_seconds)
         .checked_mul(1_000)
         .ok_or(MeasurementProtocolError::ArithmeticOverflow(
@@ -1349,6 +1395,21 @@ fn validate_measurement_interval_binding(
             expected_ms,
             actual_ms: interval.duration_ms(),
         });
+    }
+    Ok(())
+}
+
+fn validate_interval_after(
+    previous_completed_ms: Option<u64>,
+    started_monotonic_ms: u64,
+) -> Result<(), MeasurementProtocolError> {
+    if let Some(previous) = previous_completed_ms {
+        if started_monotonic_ms < previous {
+            return Err(MeasurementProtocolError::LifecycleTimeRegression {
+                previous,
+                actual: started_monotonic_ms,
+            });
+        }
     }
     Ok(())
 }
@@ -1582,6 +1643,7 @@ pub struct LifecycleSequenceValidator<'a> {
     last_monotonic_ms: Option<u64>,
     expected_code: Option<MeasurementLifecycleCode>,
     open_code: Option<MeasurementLifecycleCode>,
+    open_started_sequence: Option<u64>,
     open_started_ms: Option<u64>,
     run_started_ms: Option<u64>,
     case_started_ms: Option<u64>,
@@ -1599,6 +1661,7 @@ impl<'a> LifecycleSequenceValidator<'a> {
             last_monotonic_ms: None,
             expected_code: Some(MeasurementLifecycleCode::preflight()),
             open_code: None,
+            open_started_sequence: None,
             open_started_ms: None,
             run_started_ms: None,
             case_started_ms: None,
@@ -1611,17 +1674,17 @@ impl<'a> LifecycleSequenceValidator<'a> {
     pub fn push(
         &mut self,
         event: &MeasurementLifecycleEvent,
-    ) -> Result<(), MeasurementProtocolError> {
+    ) -> Result<Option<VerifiedMeasurementInterval>, MeasurementProtocolError> {
         let mut candidate = *self;
-        candidate.push_inner(event)?;
+        let interval = candidate.push_inner(event)?;
         *self = candidate;
-        Ok(())
+        Ok(interval)
     }
 
     fn push_inner(
         &mut self,
         event: &MeasurementLifecycleEvent,
-    ) -> Result<(), MeasurementProtocolError> {
+    ) -> Result<Option<VerifiedMeasurementInterval>, MeasurementProtocolError> {
         if self.finished {
             return Err(MeasurementProtocolError::LifecycleFinished);
         }
@@ -1644,7 +1707,7 @@ impl<'a> LifecycleSequenceValidator<'a> {
         )?;
         self.last_monotonic_ms = Some(event.record.monotonic_ms);
 
-        match self.open_code {
+        let interval = match self.open_code {
             None => {
                 if Some(event.code) != self.expected_code {
                     return Err(MeasurementProtocolError::LifecycleUnexpectedCode);
@@ -1658,6 +1721,7 @@ impl<'a> LifecycleSequenceValidator<'a> {
                     event.record.outcome,
                 )?;
                 self.open_code = Some(event.code);
+                self.open_started_sequence = Some(event.record.sequence);
                 self.open_started_ms = Some(event.record.monotonic_ms);
                 if event.code == MeasurementLifecycleCode::preflight() {
                     self.run_started_ms = Some(event.record.monotonic_ms);
@@ -1665,6 +1729,7 @@ impl<'a> LifecycleSequenceValidator<'a> {
                 if event.code.phase == LifecyclePhase::Warmup {
                     self.case_started_ms = Some(event.record.monotonic_ms);
                 }
+                None
             }
             Some(open) => {
                 if event.code != open {
@@ -1678,7 +1743,23 @@ impl<'a> LifecycleSequenceValidator<'a> {
                     event.code,
                     event.record.outcome,
                 )?;
+                let interval = if open.phase == LifecyclePhase::Measurement
+                    && event.record.outcome == LifecycleOutcome::Completed
+                {
+                    Some(VerifiedMeasurementInterval::from_validated_completion(
+                        self.binding,
+                        open,
+                        self.open_started_sequence
+                            .ok_or(MeasurementProtocolError::LifecycleOpenEvent)?,
+                        self.open_started_ms
+                            .ok_or(MeasurementProtocolError::LifecycleOpenEvent)?,
+                        event,
+                    )?)
+                } else {
+                    None
+                };
                 self.open_code = None;
+                self.open_started_sequence = None;
                 self.open_started_ms = None;
                 if event.record.outcome == LifecycleOutcome::Failed {
                     self.failed = true;
@@ -1688,9 +1769,10 @@ impl<'a> LifecycleSequenceValidator<'a> {
                 if open.phase == LifecyclePhase::Drain {
                     self.case_started_ms = None;
                 }
+                interval
             }
-        }
-        Ok(())
+        };
+        Ok(interval)
     }
 
     pub fn finish(self) -> Result<MeasurementRunOutcome, MeasurementProtocolError> {
@@ -1827,7 +1909,7 @@ pub fn validate_lifecycle_sequence(
 ) -> Result<MeasurementRunOutcome, MeasurementProtocolError> {
     let mut validator = LifecycleSequenceValidator::new(binding);
     for event in events {
-        validator.push(event)?;
+        let _ = validator.push(event)?;
     }
     validator.finish()
 }
@@ -2206,28 +2288,16 @@ mod tests {
         let stride = u64::from(binding.protocol().timing().repeat_count()) * 2 + 4;
         let started_sequence = 7 + u64::from(ordinal) * stride + u64::from(repeat_index - 1) * 2;
         let started_ms = started_sequence * 2_000;
-        let code =
-            MeasurementLifecycleCode::case_measurement(binding, ordinal, repeat_index).unwrap();
-        let started = lifecycle_event_at(
-            started_sequence,
-            started_ms,
-            code,
-            LifecycleOutcome::Started,
-        );
-        let completed = lifecycle_event_at(
-            started_sequence + 1,
-            started_ms + u64::from(binding.protocol().timing().duration_seconds()) * 1_000,
-            code,
-            LifecycleOutcome::Completed,
-        );
-        VerifiedMeasurementInterval::from_lifecycle_pair(
-            binding,
+        VerifiedMeasurementInterval {
+            protocol: binding.protocol(),
             ordinal,
             repeat_index,
-            &started,
-            &completed,
-        )
-        .unwrap()
+            started_sequence,
+            completed_sequence: started_sequence + 1,
+            started_monotonic_ms: started_ms,
+            completed_monotonic_ms: started_ms
+                + u64::from(binding.protocol().timing().duration_seconds()) * 1_000,
+        }
     }
 
     fn raw_for_case(
@@ -2340,6 +2410,57 @@ mod tests {
         *next_sequence += 1;
     }
 
+    fn validator_at_first_measurement<'a>(
+        binding: BoundHardwareMeasurement<'a>,
+    ) -> (LifecycleSequenceValidator<'a>, MeasurementLifecycleCode) {
+        let mut validator = LifecycleSequenceValidator::new(binding);
+        let setup_codes = [
+            MeasurementLifecycleCode::preflight(),
+            MeasurementLifecycleCode::setup(),
+            MeasurementLifecycleCode::case_warmup(binding, 0).unwrap(),
+        ];
+        let mut sequence = 1;
+        for code in setup_codes {
+            assert_eq!(
+                validator
+                    .push(&lifecycle_event_at(
+                        sequence,
+                        0,
+                        code,
+                        LifecycleOutcome::Started,
+                    ))
+                    .unwrap(),
+                None
+            );
+            sequence += 1;
+            assert_eq!(
+                validator
+                    .push(&lifecycle_event_at(
+                        sequence,
+                        0,
+                        code,
+                        LifecycleOutcome::Completed,
+                    ))
+                    .unwrap(),
+                None
+            );
+            sequence += 1;
+        }
+        let measurement = MeasurementLifecycleCode::case_measurement(binding, 0, 1).unwrap();
+        assert_eq!(
+            validator
+                .push(&lifecycle_event_at(
+                    sequence,
+                    0,
+                    measurement,
+                    LifecycleOutcome::Started,
+                ))
+                .unwrap(),
+            None
+        );
+        (validator, measurement)
+    }
+
     #[test]
     fn hardware_measurement_protocol_binds_exact_frozen_plan_and_completeness() {
         let plan = hardware_plan_v1().unwrap();
@@ -2401,24 +2522,34 @@ mod tests {
     fn measurement_interval_rejects_short_long_gapped_and_detached_counters() {
         let plan = hardware_plan_v1().unwrap();
         let binding = protocol(1, no_latency()).bind(&plan).unwrap();
-        let code = MeasurementLifecycleCode::case_measurement(binding, 0, 1).unwrap();
-        let started = lifecycle_event_at(7, 10_000, code, LifecycleOutcome::Started);
-        for (completed_ms, actual_ms) in [(10_999, 999), (11_001, 1_001)] {
-            let completed = lifecycle_event_at(8, completed_ms, code, LifecycleOutcome::Completed);
+        for actual_ms in [999, 1_001] {
+            let (mut validator, code) = validator_at_first_measurement(binding);
             assert!(matches!(
-                VerifiedMeasurementInterval::from_lifecycle_pair(
-                    binding, 0, 1, &started, &completed
-                ),
+                validator.push(&lifecycle_event_at(
+                    8,
+                    actual_ms,
+                    code,
+                    LifecycleOutcome::Completed
+                )),
                 Err(MeasurementProtocolError::MeasurementIntervalDuration {
                     expected_ms: 1_000,
                     actual_ms: observed
                 }) if observed == actual_ms
             ));
         }
-        let gapped = lifecycle_event_at(9, 11_000, code, LifecycleOutcome::Completed);
+
+        let (mut gapped_validator, code) = validator_at_first_measurement(binding);
         assert!(matches!(
-            VerifiedMeasurementInterval::from_lifecycle_pair(binding, 0, 1, &started, &gapped),
-            Err(MeasurementProtocolError::MeasurementIntervalSequenceMismatch)
+            gapped_validator.push(&lifecycle_event_at(
+                9,
+                1_000,
+                code,
+                LifecycleOutcome::Completed
+            )),
+            Err(MeasurementProtocolError::LifecycleSequence {
+                expected: 8,
+                actual: 9
+            })
         ));
 
         let mut detached = raw_for_case(binding, 1, 1);
@@ -2428,54 +2559,28 @@ mod tests {
             Err(MeasurementProtocolError::MeasurementIntervalBindingMismatch)
         ));
 
-        let mut validator = LifecycleSequenceValidator::new(binding);
-        let setup_codes = [
-            MeasurementLifecycleCode::preflight(),
-            MeasurementLifecycleCode::setup(),
-            MeasurementLifecycleCode::case_warmup(binding, 0).unwrap(),
-        ];
-        let mut sequence = 1;
-        for setup_code in setup_codes {
-            validator
-                .push(&lifecycle_event_at(
-                    sequence,
-                    0,
-                    setup_code,
-                    LifecycleOutcome::Started,
-                ))
-                .unwrap();
-            sequence += 1;
-            validator
-                .push(&lifecycle_event_at(
-                    sequence,
-                    0,
-                    setup_code,
-                    LifecycleOutcome::Completed,
-                ))
-                .unwrap();
-            sequence += 1;
-        }
-        validator
-            .push(&lifecycle_event_at(
-                sequence,
-                0,
-                code,
-                LifecycleOutcome::Started,
-            ))
-            .unwrap();
-        sequence += 1;
+        let mut wrong_position = raw_for_case(binding, 236, 1);
+        wrong_position.measurement_interval.started_sequence = 1;
+        wrong_position.measurement_interval.completed_sequence = 2;
         assert!(matches!(
-            validator.push(&lifecycle_event_at(
-                sequence,
-                10,
-                code,
-                LifecycleOutcome::Completed
-            )),
-            Err(MeasurementProtocolError::MeasurementIntervalDuration {
-                expected_ms: 1_000,
-                actual_ms: 10
-            })
+            VerifiedRepeat::from_raw(binding, 236, 1, wrong_position),
+            Err(MeasurementProtocolError::MeasurementIntervalSequenceMismatch)
         ));
+
+        let (mut validator, code) = validator_at_first_measurement(binding);
+        let minted = validator
+            .push(&lifecycle_event_at(
+                8,
+                1_000,
+                code,
+                LifecycleOutcome::Completed,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(minted.ordinal(), 0);
+        assert_eq!(minted.repeat_index(), 1);
+        assert_eq!(minted.started_sequence(), 7);
+        assert_eq!(minted.completed_sequence(), 8);
     }
 
     #[test]
@@ -2702,6 +2807,19 @@ mod tests {
         assert!(matches!(
             VerifiedSummary::derive(binding, 0, &reordered_case, Vec::new()),
             Err(MeasurementProtocolError::RepeatOrderMismatch { .. })
+        ));
+        let mut regressed_case = first_repeats.clone();
+        regressed_case[1].measurement_interval.started_monotonic_ms = first_repeats[0]
+            .measurement_interval
+            .started_monotonic_ms
+            .saturating_sub(1);
+        regressed_case[1]
+            .measurement_interval
+            .completed_monotonic_ms =
+            regressed_case[1].measurement_interval.started_monotonic_ms + 1_000;
+        assert!(matches!(
+            VerifiedSummary::derive(binding, 0, &regressed_case, Vec::new()),
+            Err(MeasurementProtocolError::LifecycleTimeRegression { .. })
         ));
 
         let mut repeats = Vec::with_capacity(711);

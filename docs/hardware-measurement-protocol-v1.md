@@ -28,9 +28,12 @@ warmupとdurationは各600秒以下、repeat countは1..=31の奇数です。dra
 ## Integer observations
 
 `RawRepeatCounters`はuntrusted inputです。counterは同じprotocol/case/repeatのtyped
-measurement lifecycle pairへbindします。pairはadjacentな`started`/`completed`で、
+measurement lifecycle intervalへbindします。このcapabilityは
+`LifecycleSequenceValidator`がrun先頭からcanonical global positionまでの全eventを
+成功適用し、measurement `completed`を受理した時だけmintします。pairはadjacentで、
 observed intervalがdeclared durationとmillisecond単位でexact一致しなければなりません。
-短い、長い、別case/repeatへdetachedしたintervalはrate導出前に拒否します。
+短い、長い、wrong global sequence、別case/repeatへdetachedしたintervalはrate導出前に
+拒否します。
 `VerifiedRepeat::from_raw`だけがartifact recordを生成します。各active directionはofferedがnonzeroで、
 `received <= offered`かつ`accepted == received`でなければなりません。inactive
 directionは全counterがexact zeroです。duplicate、unexpected、packet oracle failureは
@@ -58,6 +61,8 @@ complete runはexactly 237 case、各case exactly R repeat、exactly 237 summary
 R=3ならrepeat recordは711件です。repeatはordinal outer/repeat index inner、
 summaryはordinal順のcanonical orderを要求します。duplicate、missing、reorder、
 別protocol/caseへのbinding、またはsupplied repeat setから再導出できないsummaryを
+拒否します。canonical順で隣接するintervalは前のcompleted time以降にstartする必要が
+あり、別validator由来capabilityを組み合わせたcross-repeat/cross-case time regressionも
 拒否します。
 
 ## Lifecycle

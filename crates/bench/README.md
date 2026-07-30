@@ -68,9 +68,11 @@ plannerはtrafficを実行せず、threshold、baseline、合否、hardware性�
 duplicate、unexpected、oracle failure、direction mismatch、IMIX evidence driftを
 fail closedで拒否し、exact odd repeat setからsummaryと237-case completenessを
 canonical orderで再検証します。counterはtyped lifecycle measurement pairへbindし、
-observed intervalとdeclared durationのexact一致を要求します。typed lifecycleは
-contiguous sequence、monotonic time、case/repeat順序、failure時のdrain/cleanupを
-固定します。artifact hash inputも件数、path長、path順序を明示的にboundします。
+canonical validatorだけがinterval capabilityをmintします。observed intervalとdeclared
+duration、global sequence placement、interval間のmonotonic timeを検証します。typed
+lifecycleはcontiguous sequence、monotonic time、case/repeat順序、failure時の
+drain/cleanupを固定します。artifact hash inputも件数、path長、path順序を明示的に
+boundします。
 
 契約と境界は
 [hardware measurement protocol v1](../../docs/hardware-measurement-protocol-v1.md)を
