@@ -27,6 +27,8 @@ const STALE_GENERATION: u8 = 3;
 const WRONG_LENGTH: u8 = 4;
 const WRONG_RING: u8 = 5;
 const TOKEN_INVENTION: u8 = 6;
+const RX_BATCH_DROP_LEAK: u8 = 7;
+const GENERATED_STALE_CARRYOVER: u8 = 8;
 const FRAME_CAPACITY: usize = 128;
 const FRAME_COUNT: usize = 4;
 
@@ -80,7 +82,7 @@ struct State<const FAULT: u8> {
     rx: VecDeque<Frame>,
     rx_events: Vec<RxEvent>,
     generated_events: Vec<GeneratedEvent>,
-    generated_pending: Vec<Frame>,
+    generated_carryover: Vec<Frame>,
     submitted_rx: Vec<Submitted>,
     submitted_generated: Vec<Submitted>,
     physical_by_address: BTreeMap<usize, u64>,
@@ -107,7 +109,7 @@ impl<const FAULT: u8> State<FAULT> {
             rx: VecDeque::new(),
             rx_events: Vec::new(),
             generated_events: Vec::new(),
-            generated_pending: Vec::new(),
+            generated_carryover: Vec::new(),
             submitted_rx: Vec::new(),
             submitted_generated: Vec::new(),
             physical_by_address,
@@ -300,6 +302,19 @@ impl<const FAULT: u8> PacketBatch for FakeRxBatch<FAULT> {
     }
 }
 
+impl<const FAULT: u8> Drop for FakeRxBatch<FAULT> {
+    fn drop(&mut self) {
+        if FAULT == RX_BATCH_DROP_LEAK {
+            self.leased.clear();
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        while let Some(frame) = self.leased.pop_back() {
+            state.rx.push_front(frame);
+        }
+    }
+}
+
 impl<const FAULT: u8> PacketSlot for FakeRxSlot<FAULT> {
     fn ingress(&self) -> IfId {
         self.frame.as_ref().expect("live RX frame").ingress
@@ -403,12 +418,14 @@ struct FakeGeneratedBatch<const FAULT: u8> {
     egress: IfId,
     remaining_allocations: usize,
     max_frame: usize,
+    pending: Rc<RefCell<Vec<Frame>>>,
     counters: Rc<RefCell<GeneratedCounters>>,
 }
 
 struct FakeGeneratedSlot<const FAULT: u8> {
     state: Rc<RefCell<State<FAULT>>>,
     frame: Option<Frame>,
+    pending: Rc<RefCell<Vec<Frame>>>,
     counters: Rc<RefCell<GeneratedCounters>>,
     egress: IfId,
 }
@@ -418,15 +435,21 @@ impl<const FAULT: u8> GeneratedPacketIo for FakeIo<FAULT> {
     type Batch<'a> = FakeGeneratedBatch<FAULT>;
 
     fn begin_generated(&mut self, egress: IfId) -> Self::Batch<'_> {
-        let state = self.0.borrow();
+        let mut state = self.0.borrow_mut();
         let remaining_allocations = state.generated_allocation_budget;
         let max_frame = state.generated_max_frame;
+        let pending = if FAULT == GENERATED_STALE_CARRYOVER {
+            std::mem::take(&mut state.generated_carryover)
+        } else {
+            Vec::new()
+        };
         drop(state);
         FakeGeneratedBatch {
             state: Rc::clone(&self.0),
             egress,
             remaining_allocations,
             max_frame,
+            pending: Rc::new(RefCell::new(pending)),
             counters: Rc::new(RefCell::new(GeneratedCounters::default())),
         }
     }
@@ -470,6 +493,7 @@ impl<const FAULT: u8> GeneratedPacketBatch for FakeGeneratedBatch<FAULT> {
         Ok(GeneratedPacketLease::new(FakeGeneratedSlot {
             state: Rc::clone(&self.state),
             frame: Some(frame),
+            pending: Rc::clone(&self.pending),
             counters: Rc::clone(&self.counters),
             egress: self.egress,
         }))
@@ -478,7 +502,7 @@ impl<const FAULT: u8> GeneratedPacketBatch for FakeGeneratedBatch<FAULT> {
     fn finish(self) -> GeneratedBatchCompletion<Self::Error> {
         let mut state = self.state.borrow_mut();
         let endpoint = State::<FAULT>::publication_endpoint(self.egress);
-        let pending = std::mem::take(&mut state.generated_pending);
+        let pending: Vec<_> = self.pending.borrow_mut().drain(..).collect();
         let mut accepted = 0;
         let mut rejected = 0;
         for frame in pending {
@@ -532,6 +556,35 @@ impl<const FAULT: u8> GeneratedPacketBatch for FakeGeneratedBatch<FAULT> {
     }
 }
 
+impl<const FAULT: u8> Drop for FakeGeneratedBatch<FAULT> {
+    fn drop(&mut self) {
+        let pending: Vec<_> = self.pending.borrow_mut().drain(..).collect();
+        if pending.is_empty() {
+            return;
+        }
+        let mut state = self.state.borrow_mut();
+        if FAULT == GENERATED_STALE_CARRYOVER {
+            state.generated_carryover.extend(pending);
+            return;
+        }
+        let endpoint = State::<FAULT>::publication_endpoint(self.egress);
+        for frame in pending {
+            let binding = state.retire(frame.bytes());
+            let bytes = frame.bytes().to_vec();
+            state.generated_events.push(GeneratedEvent {
+                frame: State::<FAULT>::event_frame(binding),
+                egress: self.egress,
+                bytes,
+                kind: GeneratedEventKind::TxRejected {
+                    attempted_egress: self.egress,
+                    endpoint,
+                },
+            });
+            state.return_to_pool(frame);
+        }
+    }
+}
+
 impl<const FAULT: u8> GeneratedPacketSlot for FakeGeneratedSlot<FAULT> {
     fn bytes_mut(&mut self) -> &mut [u8] {
         self.frame
@@ -545,7 +598,7 @@ impl<const FAULT: u8> GeneratedPacketSlot for FakeGeneratedSlot<FAULT> {
         match completion {
             GeneratedSlotCompletion::Transmit => {
                 self.counters.borrow_mut().requested += 1;
-                self.state.borrow_mut().generated_pending.push(frame);
+                self.pending.borrow_mut().push(frame);
             }
             GeneratedSlotCompletion::Cancelled | GeneratedSlotCompletion::Abandoned => {
                 let mut state = self.state.borrow_mut();
@@ -737,6 +790,7 @@ fn finite_fake_positive_rx_cases_include_unknown_egress_and_cq_reuse() {
     rx::repeated_rejects_restore_physical_pool::<FakeHarness<GOOD>>();
     rx::unknown_egress_is_rejected_without_submission::<FakeHarness<GOOD>>();
     rx::cq_return_releases_same_rx_frame_with_new_generation::<FakeHarness<GOOD>>();
+    rx::dropped_batch_preserves_unleased_rx_and_cq_ownership::<FakeHarness<GOOD>>();
 }
 
 #[test]
@@ -745,6 +799,8 @@ fn finite_fake_positive_generated_cases_include_unknown_egress_and_cq_reuse() {
     generated::repeated_rejects_restore_physical_pool_and_advance_generation::<FakeHarness<GOOD>>();
     generated::unknown_egress_is_rejected_without_submission::<FakeHarness<GOOD>>();
     generated::cq_return_releases_same_generated_frame_with_new_generation::<FakeHarness<GOOD>>();
+    generated::dropped_batch_accounts_generated_and_cannot_carry_to_next_egress::<FakeHarness<GOOD>>(
+    );
 }
 
 fn assert_detected(case: impl FnOnce()) {
@@ -789,5 +845,21 @@ fn conformance_detects_publication_on_the_wrong_ring() {
 fn conformance_detects_terminal_token_invention() {
     assert_detected(
         rx::commit_is_submitted_in_place_with_exact_descriptor::<FakeHarness<TOKEN_INVENTION>>,
+    );
+}
+
+#[test]
+fn conformance_detects_rx_whole_batch_drop_leak() {
+    assert_detected(
+        rx::dropped_batch_preserves_unleased_rx_and_cq_ownership::<FakeHarness<RX_BATCH_DROP_LEAK>>,
+    );
+}
+
+#[test]
+fn conformance_detects_generated_whole_batch_stale_carryover() {
+    assert_detected(
+        generated::dropped_batch_accounts_generated_and_cannot_carry_to_next_egress::<
+            FakeHarness<GENERATED_STALE_CARRYOVER>,
+        >,
     );
 }

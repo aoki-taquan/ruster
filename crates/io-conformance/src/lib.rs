@@ -720,6 +720,113 @@ pub mod rx {
             RxEventKind::Reclaimed(RxReclaim::Recycled(DropReason::RouteMiss))
         );
     }
+
+    pub fn dropped_batch_preserves_unleased_rx_and_cq_ownership<H: RxCqPoolHarness>() {
+        let mut harness = H::new();
+        harness.set_rx_accept_budget(1);
+        let baseline = harness.free_rx_frames();
+        assert!(baseline >= 3);
+        let injected = [
+            harness.inject_rx(LAN, vec![0xc1]),
+            harness.inject_rx(LAN, vec![0xc2]),
+            harness.inject_rx(LAN, vec![0xc3]),
+        ];
+        assert_distinct_live(&injected);
+        assert_eq!(harness.free_rx_frames() + injected.len(), baseline);
+
+        {
+            let (io, observer) = harness.io_and_observer();
+            let mut batch = match io.receive(3) {
+                Ok(batch) => batch,
+                Err(_) => panic!("RX receive failed"),
+            };
+            let mut packet = batch.next_packet().expect("committed RX lease");
+            assert_eq!(observer.observe(packet.bytes_mut()), injected[0]);
+            packet.commit(WAN);
+            drop(batch);
+        }
+
+        let terminal = harness.drain_rx_events();
+        assert_event_bindings(&injected[..1], &terminal);
+        let submitted = match terminal[0].kind {
+            RxEventKind::TxSubmitted {
+                endpoint,
+                descriptor_len,
+            } => {
+                assert_eq!(endpoint, expected_endpoint(WAN));
+                assert_eq!(descriptor_len, injected[0].requested_len);
+                assert_eq!(
+                    harness.free_rx_frames() + injected.len(),
+                    baseline,
+                    "batch drop returned a published RX frame before CQ"
+                );
+                true
+            }
+            RxEventKind::TxRejected {
+                attempted_egress,
+                endpoint,
+            } => {
+                assert_eq!(attempted_egress, WAN);
+                assert_eq!(endpoint, Some(expected_endpoint(WAN)));
+                assert_eq!(harness.free_rx_frames() + 2, baseline);
+                false
+            }
+            RxEventKind::Reclaimed(_) => panic!("committed RX lease lost its TX disposition"),
+        };
+        assert_eq!(
+            harness.pending_rx(),
+            2,
+            "batch drop lost or exposed unleased RX ownership"
+        );
+
+        let mut reobserved = Vec::new();
+        {
+            let (io, observer) = harness.io_and_observer();
+            let mut batch = match io.receive(2) {
+                Ok(batch) => batch,
+                Err(_) => panic!("unleased RX retry failed"),
+            };
+            while let Some(mut packet) = batch.next_packet() {
+                reobserved.push(observer.observe(packet.bytes_mut()));
+                packet.recycle(DropReason::RouteMiss);
+            }
+            assert_eq!(batch.finish().recycled, 2);
+        }
+        assert_eq!(
+            reobserved
+                .iter()
+                .map(|frame| frame.token)
+                .collect::<BTreeSet<_>>(),
+            injected[1..]
+                .iter()
+                .map(|frame| frame.token)
+                .collect::<BTreeSet<_>>(),
+            "batch drop changed unleased RX ownership"
+        );
+        let reclaimed = harness.drain_rx_events();
+        assert_event_bindings(&injected[1..], &reclaimed);
+        assert!(reclaimed.iter().all(|event| {
+            event.kind == RxEventKind::Reclaimed(RxReclaim::Recycled(DropReason::RouteMiss))
+        }));
+
+        let completions = harness.complete_rx_submissions();
+        if submitted {
+            assert_eq!(
+                completions,
+                [super::TxCompletion {
+                    frame: injected[0],
+                    endpoint: expected_endpoint(WAN),
+                }]
+            );
+        } else {
+            assert!(completions.is_empty());
+        }
+        assert_eq!(
+            harness.free_rx_frames(),
+            baseline,
+            "batch-drop lifecycle did not restore the physical RX pool"
+        );
+    }
 }
 
 pub mod generated {
@@ -1193,6 +1300,114 @@ pub mod generated {
         assert_eq!(
             events[0].kind,
             GeneratedEventKind::Reclaimed(GeneratedReclaim::Cancelled)
+        );
+    }
+
+    pub fn dropped_batch_accounts_generated_and_cannot_carry_to_next_egress<
+        H: GeneratedCqPoolHarness,
+    >() {
+        let mut harness = H::new();
+        harness.set_generated_allocation_budget(3);
+        harness.set_generated_accept_budget(1);
+        let baseline = harness.free_generated_frames();
+        assert!(baseline >= 3);
+        let mut live = Vec::new();
+        {
+            let (io, observer) = harness.io_and_observer();
+            let mut batch = io.begin_generated(WAN);
+            for (marker, terminal) in [(0xd1_u8, 0_u8), (0xd2, 1), (0xd3, 2)] {
+                let mut packet = batch.allocate(60).expect("generated allocation");
+                packet.bytes_mut().fill(marker);
+                live.push(observer.bind(packet.bytes_mut(), 60));
+                match terminal {
+                    0 => packet.commit(),
+                    1 => packet.cancel(),
+                    2 => drop(packet),
+                    _ => unreachable!(),
+                }
+            }
+            drop(batch);
+        }
+        assert_distinct_cycles(&live);
+        let events = harness.drain_generated_events();
+        assert_event_bindings(&live, &events);
+        let mut submitted = false;
+        for event in events {
+            let expected = match event.bytes[0] {
+                0xd1 => match event.kind {
+                    GeneratedEventKind::TxSubmitted {
+                        endpoint,
+                        descriptor_len,
+                    } => {
+                        assert_eq!(endpoint, expected_endpoint(WAN));
+                        assert_eq!(descriptor_len, live[0].requested_len);
+                        submitted = true;
+                        continue;
+                    }
+                    GeneratedEventKind::TxRejected {
+                        attempted_egress,
+                        endpoint,
+                    } => {
+                        assert_eq!(attempted_egress, WAN);
+                        assert_eq!(endpoint, Some(expected_endpoint(WAN)));
+                        continue;
+                    }
+                    GeneratedEventKind::Reclaimed(_) => {
+                        panic!("committed generated lease lost its TX disposition")
+                    }
+                },
+                0xd2 => GeneratedEventKind::Reclaimed(GeneratedReclaim::Cancelled),
+                0xd3 => GeneratedEventKind::Reclaimed(GeneratedReclaim::Abandoned),
+                _ => panic!("unexpected generated marker"),
+            };
+            assert_eq!(event.kind, expected);
+        }
+        assert_eq!(
+            harness.free_generated_frames() + usize::from(submitted),
+            baseline,
+            "generated batch drop lost a frame or returned an in-flight frame"
+        );
+
+        harness.set_generated_allocation_budget(0);
+        let next = {
+            let (io, _) = harness.io_and_observer();
+            io.begin_generated(LAN).finish()
+        };
+        assert_eq!(
+            (
+                next.attempts,
+                next.allocated,
+                next.failed,
+                next.requested,
+                next.cancelled,
+                next.abandoned,
+                next.accepted,
+                next.rejected,
+            ),
+            (0, 0, 0, 0, 0, 0, 0, 0),
+            "later egress inherited a dropped generated batch"
+        );
+        assert!(
+            harness.drain_generated_events().is_empty(),
+            "later egress published or reclaimed stale generated ownership"
+        );
+
+        let completions = harness.complete_generated_submissions();
+        if submitted {
+            assert_eq!(
+                completions,
+                [super::TxCompletion {
+                    frame: live[0],
+                    endpoint: expected_endpoint(WAN),
+                }]
+            );
+        } else {
+            assert!(completions.is_empty());
+        }
+        assert_eq!(
+            harness.free_generated_frames(),
+            baseline,
+            "batch-drop lifecycle did not restore the generated physical pool"
         );
     }
 }
