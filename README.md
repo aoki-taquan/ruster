@@ -63,7 +63,9 @@ destinationのLPM-selected prefixに対するnetwork/directed-broadcastも拒否
 more-specific host routeを優先し、RFC 3021の`/31`とhost routeの`/32` endpointは許可します。
 このcommon admissionはNAT/FWの時刻・state・audit、resolution、ICMP error actionより前です。
 任意のunicast Ethernet destinationはforwardingでは許可し、router-local ICMPだけは後段で
-ingress interface MACとの完全一致を追加要求します。
+ingress interface MACとの完全一致を追加要求します。limited broadcastを転送しないRFC 1812
+§5.3.5.1の境界は実装済みですが、同節のlocal receptionはupper-layer delivery/BOOTP relayが
+未実装のためdropする明示deviationです。
 
 UDP NAT44は`forward_batch_with_nat44_udp`、またはgenerated ICMP errorも含む
 `forward_batch_with_nat44_udp_and_icmpv4_errors`を選んだworkerだけで有効です。一つの

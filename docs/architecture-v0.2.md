@@ -193,6 +193,10 @@ state、audit、resolution、ICMP error action、packet rewriteより前にcommo
 
 RFC 1812 §§4.2.2.11, 5.3.4, 5.3.5, 5.3.7に基づくmartian/group境界です。BOOTP relayや
 IPv4 multicast forwardingのhandlerは存在しないため例外を設けずfail closedにします。
+limited broadcastをforwardしないRFC 1812 §5.3.5.1のMUSTは満たします。一方、同節は受信した
+limited broadcastをdiscardせずlocal deliveryすることも要求します。現profileにはgenericな
+IPv4 local deliveryとBOOTP relayが無いためcommon admissionでdropしており、このlocal reception
+要件は明示deviationです。
 LPMはmore-specific routeを優先するため明示`/32` host routeが広いprefixの境界を上書きします。
 RFC 3021の`/31`と`/32`はnetwork/directed-broadcast分類から除外します。local destinationは
 forward destination境界判定を受けずStrong ES local処理へ進みますが、source admissionは共通です。
@@ -609,8 +613,13 @@ packetはprobe最大2N、maintenanceも定数倍Nでstrict O(N)であり、expir
 staleとして拒否します。live evictionはありません。probe、maintenance shift/hash/scan、
 rule evaluation数はcounterで観測できます。
 
-runtime/config/snapshot authorityとIPv4/transport structural/checksum validationはLPMより前に
-行います。valid attemptはstate/NAT lookupより前にworker-local security watermarkを単調更新し、
+common ingress admissionだけは、structural/header-checksum検証後にsourceとnonlocal destinationの
+selected-prefix境界を分類するread-only LPMを行います。このlookupはbytes、watermark、state、
+audit、resolution、generated actionを変更せず、rejectionはICMP/ARPを一切生成しないsilent drop
+なのでwire-visibleなroute oracleを作りません。local `DropReason`だけが境界を区別します。
+このcommon admissionを通過したpacketでは、runtime/config/snapshot authorityとIPv4/transport
+structural/checksum validationを通常forwarding destination LPMより前に行います。valid attemptは
+state/NAT lookupより前にworker-local security watermarkを単調更新し、
 rule/default deny、state full、route/neighbor/NAT missでも戻しません。そのためfuture時刻のdeny
 やmiss後に古い時刻でflowが復活することはなく、古いpacketはbyte/state/activity不変の
 `FirewallClockRegression`またはNAT clock regressionになります。FW opt-in時のLPM missは
