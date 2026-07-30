@@ -262,7 +262,7 @@ type CombinedStateSnapshot = (
 fn combined_state_snapshot(
     udp: &Nat44UdpRuntime<'_>,
     tcp: &Nat44TcpRuntime<'_>,
-    firewall: &FirewallRuntime<'_, '_>,
+    firewall: &FirewallRuntime<'_>,
 ) -> CombinedStateSnapshot {
     (
         udp.mappings().to_vec(),
@@ -544,6 +544,73 @@ fn firewall_runtime_config_and_snapshot_mismatches_fail_closed() {
     assert_drop(&mut io, DropReason::FirewallConfigMismatch, &packet);
     assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
     assert_eq!(firewall.counters().config_mismatches, 2);
+}
+
+#[test]
+fn reconciled_runtime_borrows_only_the_current_rules_and_releases_old_storage() {
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let old_rules = vec![allow(FirewallProtocol::Udp)];
+    let old_config = firewall_config(&snapshot, &old_rules, 1);
+    let mut slots = [FirewallStateSlot::default(); 1];
+    let mut firewall = FirewallRuntime::new(old_config, &mut slots);
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut states, &mut actions);
+    let mut io = SimIo::new();
+    let packet = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
+
+    io.inject(LAN, packet.clone());
+    io.run_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &old_config,
+        Some(&mut firewall),
+        MonotonicMillis(0),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_eq!(io.pop_tx().unwrap().egress, WAN);
+
+    let new_rules = vec![rule(
+        30,
+        FirewallInterface::Interface(LAN),
+        FirewallInterface::Interface(WAN),
+        any_prefix(),
+        any_prefix(),
+        FirewallProtocol::Udp,
+        ports(0, u16::MAX),
+        ports(0, u16::MAX),
+        FirewallAction::Deny,
+    )];
+    let new_config = FirewallConfig::new(
+        &snapshot,
+        &new_rules,
+        FirewallPolicy::default(),
+        2,
+        FirewallHashKey::new(0xa5a5_5a5a_0123_4567, 0x1357_9bdf_2468_ace0).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(firewall.reconcile(new_config).unwrap().states_flushed, 1);
+    drop(old_rules);
+
+    io.inject(LAN, packet.clone());
+    io.run_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &new_config,
+        Some(&mut firewall),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallRuleDenied, &packet);
+    drop(new_rules);
+
+    assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
+    assert_eq!(firewall.counters().reconciliations, 1);
 }
 
 #[test]

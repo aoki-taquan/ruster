@@ -580,6 +580,11 @@ generationだけが全stateをflushします。
 snapshotのcontent fingerprintとslice identity、rule fingerprintはpublication
 時に一度だけ計算してconfig/runtimeへbindし、packet pathのauthority確認はpointer/length/
 fingerprintのO(1)比較です。packetごとのsnapshot再hashやrules slice equalityは行いません。
+runtimeがpublicationを跨いで保持するのは、このpointer値をdereferenceしないowned binding
+metadataだけです。rules sliceは各forward batchのcurrent `FirewallConfig`からrule scan中だけ
+borrowします。generation前進とfresh hash keyを検証した`reconcile`後は、旧rules allocationを
+dropでき、新allocationのrulesだけを次batchへ渡せます。これによりruntimeとimmutable
+publication ownerのself-referenceを作らず、fast pathのrule scanはborrow-onlyのままです。
 
 flow keyはprotocol、origin ingress/egress、initiator/responder IPv4 address+port、
 config generationです。ordinary forwardingはwire view、NAT outboundはpre-SNAT
