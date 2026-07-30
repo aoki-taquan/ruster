@@ -28,14 +28,13 @@ pub enum SyscallStage {
     SetTxRing,
     Bind,
     Mmap,
-    Munmap,
-    Close,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlatformError {
     UnsupportedPlatform,
     UapiLayoutMismatch,
+    InvalidSocketAddress { family: u16, if_index: i32 },
     Syscall { stage: SyscallStage, errno: Errno },
 }
 
@@ -45,6 +44,12 @@ impl fmt::Display for PlatformError {
             Self::UnsupportedPlatform => formatter.write_str("AF_PACKET requires Linux"),
             Self::UapiLayoutMismatch => {
                 formatter.write_str("compiled TPACKET_V3 UAPI layout is incompatible")
+            }
+            Self::InvalidSocketAddress { family, if_index } => {
+                write!(
+                    formatter,
+                    "invalid AF_PACKET address family {family}, ifindex {if_index}"
+                )
             }
             Self::Syscall { stage, errno } => {
                 write!(formatter, "{stage:?} failed with errno {}", errno.get())
@@ -57,37 +62,127 @@ impl std::error::Error for PlatformError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GeometryError {
-    PageSizeNotPowerOfTwo { page_size: usize },
+    PageSizeNotPowerOfTwo {
+        page_size: usize,
+    },
     ZeroMaxFrameLength,
     ZeroBlockSize,
     ZeroBlockCount,
     ZeroFrameSize,
     ZeroFrameCount,
-    BlockSizeNotPageAligned { block_size: u32, page_size: usize },
-    FrameSizeNotAligned { frame_size: u32 },
-    FrameTooSmall { frame_size: u32, minimum: usize },
-    FramesDoNotTileBlock { block_size: u32, frame_size: u32 },
-    FrameCountMismatch { configured: u32, expected: usize },
-    PrivateAreaNotAligned { private_size: u32 },
-    PrivateAreaTooLarge { private_size: u32, block_size: u32 },
-    UnknownFeatureFlags { feature_flags: u32 },
-    FeatureFlagsUnsupportedForTx { feature_flags: u32 },
+    BlockSizeNotPageAligned {
+        block_size: u32,
+        page_size: usize,
+    },
+    BlockSizeExceedsKernelLimit {
+        block_size: u32,
+    },
+    FrameSizeNotAligned {
+        frame_size: u32,
+    },
+    FrameTooSmall {
+        frame_size: u32,
+        minimum: usize,
+    },
+    FramesDoNotTileBlock {
+        block_size: u32,
+        frame_size: u32,
+    },
+    FrameCountMismatch {
+        configured: u32,
+        expected: usize,
+    },
+    PrivateAreaNotAligned {
+        private_size: u32,
+    },
+    PrivateAreaTooLarge {
+        private_size: u32,
+        block_size: u32,
+    },
+    UnknownFeatureFlags {
+        feature_flags: u32,
+    },
+    RetireTimeoutUnsupportedForTx {
+        retire_timeout_ms: u32,
+    },
+    PrivateAreaUnsupportedForTx {
+        private_size: u32,
+    },
+    FeatureFlagsUnsupportedForTx {
+        feature_flags: u32,
+    },
+    MapLengthExceedsAddressSpace {
+        map_len: usize,
+    },
     ArithmeticOverflow,
-    BlockIndexOutOfRange { block_index: usize },
+    BlockIndexOutOfRange {
+        block_index: usize,
+    },
     PacketCountZero,
-    PacketCountExceedsBlock { packet_count: u32, maximum: usize },
-    FirstPacketOffsetInvalid { offset: usize },
-    PacketOffsetNotAligned { offset: usize },
-    PacketHeaderOutOfBounds { offset: usize },
-    MacOffsetBeforeHeader { mac_offset: usize },
-    SnapshotExceedsWireLength { snap_len: usize, wire_len: usize },
-    PacketDataOutOfBounds { offset: usize, length: usize },
+    PacketCountExceedsBlock {
+        packet_count: u32,
+        maximum: usize,
+    },
+    PacketDescriptorCountMismatch {
+        packet_count: u32,
+        descriptors: usize,
+    },
+    PacketChainOffsetMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    PacketTerminalFlagMismatch {
+        index: usize,
+    },
+    UnsupportedBlockVersion {
+        version: u32,
+    },
+    PrivateOffsetInvalid {
+        offset: usize,
+    },
+    FirstPacketOffsetInvalid {
+        offset: usize,
+    },
+    PacketOffsetNotAligned {
+        offset: usize,
+    },
+    PacketHeaderOutOfBounds {
+        offset: usize,
+    },
+    MacOffsetBeforeHeader {
+        mac_offset: usize,
+    },
+    EthernetMacOffsetInvalid {
+        mac_offset: usize,
+    },
+    EthernetNetworkOffsetInvalid {
+        net_offset: usize,
+    },
+    SnapshotExceedsWireLength {
+        snap_len: usize,
+        wire_len: usize,
+    },
+    PacketDataOutOfBounds {
+        offset: usize,
+        length: usize,
+    },
     MissingNextPacketOffset,
-    NextPacketOffsetNotAligned { offset: usize },
-    NextPacketOffsetTooSmall { offset: usize },
+    TerminalPacketHasNextOffset {
+        offset: usize,
+    },
+    NextPacketOffsetNotAligned {
+        offset: usize,
+    },
+    NextPacketOffsetTooSmall {
+        offset: usize,
+    },
     PacketCrossesNextOffset,
-    InvalidRxStatus { status: u32 },
-    InvalidTxStatus { status: u32 },
+    InvalidRxStatus {
+        status: u32,
+    },
+    InvalidTxStatus {
+        status: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,6 +212,22 @@ pub enum ConfigError {
     CombinedMapOverflow {
         interface: IfId,
     },
+    CombinedMapExceedsAddressSpace {
+        interface: IfId,
+        map_len: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MappingAccessError {
+    ArithmeticOverflow,
+    OffsetOutOfBounds { offset: usize, length: usize },
+    StatusNotAligned { offset: usize },
+    BlockNotUser { status: u32 },
+    PacketAlreadyBorrowed,
+    PacketNotBorrowed,
+    Geometry(GeometryError),
+    Ownership(OwnershipError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

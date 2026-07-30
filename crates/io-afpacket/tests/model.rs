@@ -1,8 +1,9 @@
 use ruster_core::IfId;
 use ruster_io_afpacket::{
-    AfPacketPlatform, BackendStat, BackendStats, BlockDescriptor, ConfigError, GeometryError,
-    OwnershipError, PacketDescriptor, PlatformError, PortConfig, RingGeometry, RingKind,
-    RxBlockModel, RxOwnership, SyscallStage, TxFrameModel, TxOwnership, ValidatedConfig,
+    validate_v3_block_chain, AfPacketPlatform, BackendStat, BackendStats, BlockDescriptor,
+    ConfigError, GeometryError, OwnershipError, PacketDescriptor, PlatformError, PortConfig,
+    RingGeometry, RingKind, RxBlockModel, RxOwnership, SyscallStage, TxFrameModel, TxOwnership,
+    ValidatedConfig,
 };
 
 fn geometry() -> RingGeometry {
@@ -19,6 +20,8 @@ fn geometry() -> RingGeometry {
 
 fn port(interface: u16, if_index: u32) -> PortConfig {
     let mut tx = geometry();
+    tx.retire_timeout_ms = 0;
+    tx.private_size = 0;
     tx.feature_flags = 0;
     PortConfig {
         interface: IfId(interface),
@@ -49,27 +52,39 @@ fn af_packet_v3_ring_model_validates_geometry_and_ownership() {
     assert_eq!(first.combined_map_len(), 16_384);
     assert_eq!(first.rx().block_range(1), Ok(4_096..8_192));
 
-    BlockDescriptor {
+    let block = BlockDescriptor {
+        version: 2,
+        offset_to_private: 48,
         block_len: 4_096,
         packet_count: 2,
         first_packet_offset: 64,
-    }
-    .validate(first.rx())
-    .expect("bounded block");
-    let packet = PacketDescriptor {
+    };
+    block.validate(first.rx()).expect("bounded block");
+    let first_descriptor = PacketDescriptor {
         packet_offset: 64,
-        next_offset: 1_552,
-        mac_offset: 80,
+        next_offset: 1_568,
+        mac_offset: 82,
+        net_offset: 96,
         snap_len: 1_472,
         wire_len: 1_500,
         is_last: false,
-    }
-    .validate(4_096)
-    .expect("bounded packet");
+    };
+    let packet = first_descriptor.validate(4_096).expect("bounded packet");
     assert_eq!(packet.header(), 64..112);
-    assert_eq!(packet.data(), 144..1_616);
-    assert_eq!(packet.next_packet_offset(), Some(1_616));
+    assert_eq!(packet.data(), 146..1_618);
+    assert_eq!(packet.next_packet_offset(), Some(1_632));
     assert!(packet.is_truncated());
+    let terminal = PacketDescriptor {
+        packet_offset: 1_632,
+        next_offset: 0,
+        mac_offset: 82,
+        net_offset: 96,
+        snap_len: 60,
+        wire_len: 60,
+        is_last: true,
+    };
+    validate_v3_block_chain(block, &[first_descriptor, terminal], first.rx())
+        .expect("complete terminal chain");
 
     let mut rx = RxBlockModel::new();
     rx.acquire(2).expect("kernel transfers block");
@@ -93,13 +108,30 @@ fn af_packet_v3_ring_model_validates_geometry_and_ownership() {
 #[test]
 fn geometry_descriptor_and_status_fail_closed_on_checked_boundaries() {
     assert_eq!(
-        geometry().validate(4_096, 0),
+        geometry().validate_rx(4_096, 0),
         Err(GeometryError::ZeroMaxFrameLength)
+    );
+    let compact_tx = RingGeometry {
+        block_size: 4_096,
+        block_count: 1,
+        frame_size: 256,
+        frame_count: 16,
+        retire_timeout_ms: 0,
+        private_size: 0,
+        feature_flags: 0,
+    };
+    assert!(compact_tx.validate_tx(4_096, 190).is_ok());
+    assert_eq!(
+        compact_tx.validate_rx(4_096, 190),
+        Err(GeometryError::FrameTooSmall {
+            frame_size: 256,
+            minimum: 272,
+        })
     );
     let mut invalid = geometry();
     invalid.block_size = 4_095;
     assert_eq!(
-        invalid.validate(4_096, 1_514),
+        invalid.validate_rx(4_096, 1_514),
         Err(GeometryError::BlockSizeNotPageAligned {
             block_size: 4_095,
             page_size: 4_096,
@@ -108,32 +140,65 @@ fn geometry_descriptor_and_status_fail_closed_on_checked_boundaries() {
     invalid = geometry();
     invalid.frame_count = 3;
     assert_eq!(
-        invalid.validate(4_096, 1_514),
+        invalid.validate_rx(4_096, 1_514),
         Err(GeometryError::FrameCountMismatch {
             configured: 3,
             expected: 4,
         })
     );
     invalid = geometry();
+    invalid.block_size = i32::MAX as u32 + 1;
+    assert_eq!(
+        invalid.validate_rx(4_096, 1_514),
+        Err(GeometryError::BlockSizeExceedsKernelLimit {
+            block_size: i32::MAX as u32 + 1,
+        })
+    );
+    invalid = geometry();
     invalid.feature_flags = 2;
     assert_eq!(
-        invalid.validate(4_096, 1_514),
+        invalid.validate_rx(4_096, 1_514),
         Err(GeometryError::UnknownFeatureFlags { feature_flags: 2 })
+    );
+    let layout = geometry().validate_rx(4_096, 1_514).expect("layout");
+    assert_eq!(
+        BlockDescriptor {
+            version: 1,
+            offset_to_private: 48,
+            block_len: 4_096,
+            packet_count: 1,
+            first_packet_offset: 64,
+        }
+        .validate(layout),
+        Err(GeometryError::UnsupportedBlockVersion { version: 1 })
+    );
+    assert_eq!(
+        BlockDescriptor {
+            version: 2,
+            offset_to_private: 64,
+            block_len: 4_096,
+            packet_count: 1,
+            first_packet_offset: 80,
+        }
+        .validate(layout),
+        Err(GeometryError::PrivateOffsetInvalid { offset: 64 })
     );
     assert_eq!(
         geometry()
-            .validate(4_096, 1_514)
+            .validate_rx(4_096, 1_514)
             .expect("layout")
             .block_range(2),
         Err(GeometryError::BlockIndexOutOfRange { block_index: 2 })
     );
     assert_eq!(
         BlockDescriptor {
+            version: 2,
+            offset_to_private: 48,
             block_len: 128,
             packet_count: 2,
             first_packet_offset: 64,
         }
-        .validate(geometry().validate(4_096, 1_514).expect("layout")),
+        .validate(geometry().validate_rx(4_096, 1_514).expect("layout")),
         Err(GeometryError::PacketCountExceedsBlock {
             packet_count: 2,
             maximum: 1,
@@ -143,7 +208,8 @@ fn geometry_descriptor_and_status_fail_closed_on_checked_boundaries() {
     let crossing = PacketDescriptor {
         packet_offset: 48,
         next_offset: 64,
-        mac_offset: 48,
+        mac_offset: 82,
+        net_offset: 96,
         snap_len: 60,
         wire_len: 60,
         is_last: false,
@@ -155,7 +221,8 @@ fn geometry_descriptor_and_status_fail_closed_on_checked_boundaries() {
     let overflow = PacketDescriptor {
         packet_offset: usize::MAX - 15,
         next_offset: 0,
-        mac_offset: 48,
+        mac_offset: 82,
+        net_offset: 96,
         snap_len: 60,
         wire_len: 60,
         is_last: true,
@@ -223,6 +290,57 @@ fn config_rejects_ambiguous_interface_mappings() {
             source: GeometryError::FeatureFlagsUnsupportedForTx { feature_flags: 1 },
         })
     );
+    let mut bad_tx = port(1, 3);
+    bad_tx.tx.retire_timeout_ms = 1;
+    assert_eq!(
+        ValidatedConfig::new(&[bad_tx], 4_096, 1_514),
+        Err(ConfigError::Ring {
+            interface: IfId(1),
+            kind: RingKind::Tx,
+            source: GeometryError::RetireTimeoutUnsupportedForTx {
+                retire_timeout_ms: 1,
+            },
+        })
+    );
+    let mut bad_tx = port(1, 3);
+    bad_tx.tx.private_size = 16;
+    assert_eq!(
+        ValidatedConfig::new(&[bad_tx], 4_096, 1_514),
+        Err(ConfigError::Ring {
+            interface: IfId(1),
+            kind: RingKind::Tx,
+            source: GeometryError::PrivateAreaUnsupportedForTx { private_size: 16 },
+        })
+    );
+
+    #[cfg(target_pointer_width = "64")]
+    {
+        let huge = RingGeometry {
+            block_size: 2_147_479_552,
+            block_count: u32::MAX,
+            frame_size: 2_147_479_552,
+            frame_count: u32::MAX,
+            retire_timeout_ms: 0,
+            private_size: 0,
+            feature_flags: 0,
+        };
+        assert_eq!(
+            ValidatedConfig::new(
+                &[PortConfig {
+                    interface: IfId(9),
+                    if_index: 9,
+                    rx: huge,
+                    tx: huge,
+                }],
+                4_096,
+                1_514,
+            ),
+            Err(ConfigError::CombinedMapExceedsAddressSpace {
+                interface: IfId(9),
+                map_len: 18_446_708_885_042_503_680,
+            })
+        );
+    }
 }
 
 #[test]
@@ -291,7 +409,9 @@ fn stats_are_fixed_saturating_counters_and_platform_is_explicit() {
         assert_eq!(layout.tpacket3_header, 48);
         assert_eq!(layout.tpacket3_status_offset, 20);
         assert_eq!(layout.tpacket3_mac_offset, 24);
+        assert_eq!(layout.tpacket_block_alignment, 8);
         assert_eq!(layout.block_status_offset, 8);
+        assert_eq!(layout.block_sequence_offset, 24);
         assert_eq!(layout.tpacket3_hdrlen, 68);
         assert_eq!(layout.ethernet_mac_offset, 82);
     }

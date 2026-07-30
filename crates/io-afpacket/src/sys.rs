@@ -1,11 +1,15 @@
 use std::{
     ffi::{c_int, c_void},
-    mem::{offset_of, size_of},
+    mem::{align_of, offset_of, size_of},
     os::fd::RawFd,
     ptr::NonNull,
+    sync::atomic::{fence, Ordering},
 };
 
-use crate::{Errno, PlatformError, SyscallStage, UapiLayout, ValidatedPort};
+use crate::{
+    BlockDescriptor, Errno, MappingAccessError, OwnershipError, PacketDescriptor, PlatformError,
+    RingLayout, RxBlockModel, RxOwnership, SyscallStage, UapiLayout, ValidatedPort,
+};
 
 const AF_PACKET: c_int = 17;
 const SOCK_RAW: c_int = 3;
@@ -26,6 +30,7 @@ const _: [(); 0] = [(); crate::TP_STATUS_AVAILABLE as usize];
 const _: [(); 1] = [(); crate::TP_STATUS_SEND_REQUEST as usize];
 const _: [(); 2] = [(); crate::TP_STATUS_SENDING as usize];
 const _: [(); 4] = [(); crate::TP_STATUS_WRONG_FORMAT as usize];
+const _: [(); 2] = [(); crate::TPACKET_V3_VERSION as usize];
 
 #[repr(C)]
 struct TpacketHdrVariant1 {
@@ -102,13 +107,47 @@ struct SockaddrLl {
     sll_addr: [u8; 8],
 }
 
+impl SockaddrLl {
+    fn packet_all(if_index: u32) -> Result<Self, PlatformError> {
+        let sll_ifindex =
+            i32::try_from(if_index).map_err(|_| PlatformError::InvalidSocketAddress {
+                family: AF_PACKET as u16,
+                if_index: -1,
+            })?;
+        let address = Self {
+            sll_family: AF_PACKET as u16,
+            sll_protocol: ETH_P_ALL.to_be(),
+            sll_ifindex,
+            sll_hatype: 0,
+            sll_pkttype: 0,
+            sll_halen: 0,
+            sll_addr: [0; 8],
+        };
+        address.validate()?;
+        Ok(address)
+    }
+
+    fn validate(&self) -> Result<(), PlatformError> {
+        if self.sll_family != AF_PACKET as u16 || self.sll_ifindex <= 0 {
+            return Err(PlatformError::InvalidSocketAddress {
+                family: self.sll_family,
+                if_index: self.sll_ifindex,
+            });
+        }
+        Ok(())
+    }
+}
+
 const _: [(); 48] = [(); size_of::<Tpacket3Hdr>()];
 const _: [(); 48] = [(); size_of::<TpacketBlockDesc>()];
+const _: [(); 8] = [(); align_of::<TpacketHdrV1>()];
+const _: [(); 8] = [(); align_of::<TpacketBlockDesc>()];
 const _: [(); 28] = [(); size_of::<TpacketReq3>()];
 const _: [(); 20] = [(); size_of::<SockaddrLl>()];
 const _: [(); 20] = [(); offset_of!(Tpacket3Hdr, tp_status)];
 const _: [(); 24] = [(); offset_of!(Tpacket3Hdr, tp_mac)];
 const _: [(); 8] = [(); offset_of!(TpacketBlockDesc, hdr)];
+const _: [(); 16] = [(); offset_of!(TpacketHdrV1, seq_num)];
 const _: [(); crate::TPACKET_V3_HDRLEN] = [(); size_of::<Tpacket3Hdr>() + size_of::<SockaddrLl>()];
 
 pub(crate) fn validated_uapi_layout() -> Result<UapiLayout, PlatformError> {
@@ -117,7 +156,10 @@ pub(crate) fn validated_uapi_layout() -> Result<UapiLayout, PlatformError> {
         tpacket3_status_offset: offset_of!(Tpacket3Hdr, tp_status),
         tpacket3_mac_offset: offset_of!(Tpacket3Hdr, tp_mac),
         tpacket_block_descriptor: size_of::<TpacketBlockDesc>(),
+        tpacket_block_alignment: align_of::<TpacketBlockDesc>(),
         block_status_offset: offset_of!(TpacketBlockDesc, hdr),
+        block_sequence_offset: offset_of!(TpacketBlockDesc, hdr)
+            + offset_of!(TpacketHdrV1, seq_num),
         tpacket_request3: size_of::<TpacketReq3>(),
         sockaddr_ll: size_of::<SockaddrLl>(),
         tpacket3_hdrlen: crate::TPACKET_V3_HDRLEN,
@@ -129,7 +171,9 @@ pub(crate) fn validated_uapi_layout() -> Result<UapiLayout, PlatformError> {
             tpacket3_status_offset: 20,
             tpacket3_mac_offset: 24,
             tpacket_block_descriptor: 48,
+            tpacket_block_alignment: 8,
             block_status_offset: 8,
+            block_sequence_offset: 24,
             tpacket_request3: 28,
             sockaddr_ll: 20,
             tpacket3_hdrlen: 68,
@@ -147,7 +191,7 @@ pub(crate) fn validated_uapi_layout() -> Result<UapiLayout, PlatformError> {
 pub(crate) struct PacketRingResources {
     mapping: MmapRegion,
     socket: PacketSocket,
-    rx_len: usize,
+    rx: RingLayout,
 }
 
 #[allow(dead_code)]
@@ -166,21 +210,22 @@ impl PacketRingResources {
             port.tx().geometry(),
             SyscallStage::SetTxRing,
         )?;
-        socket.bind(port.if_index())?;
         let mapping = MmapRegion::map(socket.fd, port.combined_map_len())?;
+        // The protocol-zero socket remains inactive through ring creation and
+        // mmap. This validated bind is the single activation point.
+        socket.bind(port.if_index())?;
         Ok(Self {
             mapping,
             socket,
-            rx_len: port.tx_map_offset(),
+            rx: port.rx(),
         })
     }
 
-    pub(crate) fn rx_bytes(&mut self) -> &mut [u8] {
-        &mut self.mapping.bytes_mut()[..self.rx_len]
-    }
-
-    pub(crate) fn tx_bytes(&mut self) -> &mut [u8] {
-        &mut self.mapping.bytes_mut()[self.rx_len..]
+    pub(crate) fn acquire_rx_block(
+        &mut self,
+        block_index: usize,
+    ) -> Result<UserRxBlock<'_>, MappingAccessError> {
+        self.mapping.acquire_user_block(self.rx, block_index)
     }
 }
 
@@ -190,10 +235,10 @@ struct PacketSocket {
 
 impl PacketSocket {
     fn open() -> Result<Self, PlatformError> {
-        let protocol = ETH_P_ALL.to_be();
         // SAFETY: `socket` has no borrowed pointer arguments. The constants
-        // are Linux UAPI values and a nonnegative return is an owned fd.
-        let fd = unsafe { socket(AF_PACKET, SOCK_RAW, c_int::from(protocol)) };
+        // are Linux UAPI values and protocol zero keeps capture inactive until
+        // the checked interface bind. A nonnegative return is an owned fd.
+        let fd = unsafe { socket(AF_PACKET, SOCK_RAW, 0) };
         if fd < 0 {
             return Err(last_error(SyscallStage::Socket));
         }
@@ -237,15 +282,7 @@ impl PacketSocket {
     }
 
     fn bind(&self, if_index: u32) -> Result<(), PlatformError> {
-        let address = SockaddrLl {
-            sll_family: AF_PACKET as u16,
-            sll_protocol: ETH_P_ALL.to_be(),
-            sll_ifindex: i32::try_from(if_index).expect("validated interface index"),
-            sll_hatype: 0,
-            sll_pkttype: 0,
-            sll_halen: 0,
-            sll_addr: [0; 8],
-        };
+        let address = SockaddrLl::packet_all(if_index)?;
         // SAFETY: `address` is a fully initialized C-layout `sockaddr_ll`;
         // its pointer remains valid for the duration of this blocking call.
         let result = unsafe {
@@ -272,10 +309,14 @@ impl Drop for PacketSocket {
 struct MmapRegion {
     base: NonNull<u8>,
     len: usize,
+    unmap_on_drop: bool,
 }
 
 impl MmapRegion {
     fn map(fd: RawFd, len: usize) -> Result<Self, PlatformError> {
+        if len == 0 || len > isize::MAX as usize {
+            return Err(PlatformError::UapiLayoutMismatch);
+        }
         // SAFETY: this requests a shared mapping from an owned packet socket;
         // the returned pointer is checked before it is stored.
         let address = unsafe {
@@ -285,28 +326,266 @@ impl MmapRegion {
                 PROT_READ | PROT_WRITE,
                 MAP_SHARED,
                 fd,
-                0,
+                0_i64,
             )
         };
         if address as isize == -1 {
             return Err(last_error(SyscallStage::Mmap));
         }
-        let base = NonNull::new(address.cast::<u8>()).ok_or(PlatformError::Syscall {
-            stage: SyscallStage::Mmap,
-            errno: Errno::new(14),
-        })?;
-        Ok(Self { base, len })
+        let Some(base) = NonNull::new(address.cast::<u8>()) else {
+            // SAFETY: mmap returned a successful mapping at address zero.
+            // Rust cannot represent it as NonNull, so release that exact
+            // mapping before returning a typed failure.
+            let _ = unsafe { munmap(address, len) };
+            return Err(PlatformError::Syscall {
+                stage: SyscallStage::Mmap,
+                errno: Errno::new(14),
+            });
+        };
+        Ok(Self {
+            base,
+            len,
+            unmap_on_drop: true,
+        })
     }
 
-    fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: `base..base+len` is the live mapping owned by `self`.
-        // Requiring `&mut self` prevents overlapping safe mutable slices.
-        unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr(), self.len) }
+    fn checked_address(
+        &self,
+        offset: usize,
+        length: usize,
+        alignment: usize,
+    ) -> Result<*mut u8, MappingAccessError> {
+        let end = offset
+            .checked_add(length)
+            .ok_or(MappingAccessError::ArithmeticOverflow)?;
+        if end > self.len {
+            return Err(MappingAccessError::OffsetOutOfBounds { offset, length });
+        }
+        let address = self.base.as_ptr().wrapping_add(offset);
+        if !(address as usize).is_multiple_of(alignment) {
+            return Err(MappingAccessError::StatusNotAligned { offset });
+        }
+        Ok(address)
+    }
+
+    fn read_u32_volatile(&self, offset: usize) -> Result<u32, MappingAccessError> {
+        let address = self.checked_address(offset, size_of::<u32>(), align_of::<u32>())?;
+        // SAFETY: checked_address proves a live, aligned 4-byte range. A
+        // volatile read is required because the kernel may update this mmap.
+        Ok(unsafe { std::ptr::read_volatile(address.cast::<u32>()) })
+    }
+
+    fn read_u16_volatile(&self, offset: usize) -> Result<u16, MappingAccessError> {
+        let address = self.checked_address(offset, size_of::<u16>(), align_of::<u16>())?;
+        // SAFETY: checked_address proves a live, aligned 2-byte range. A
+        // volatile read prevents the compiler from caching shared metadata.
+        Ok(unsafe { std::ptr::read_volatile(address.cast::<u16>()) })
+    }
+
+    fn load_status_acquire(&self, offset: usize) -> Result<u32, MappingAccessError> {
+        let status = self.read_u32_volatile(offset)?;
+        fence(Ordering::Acquire);
+        Ok(status)
+    }
+
+    fn store_status_release(
+        &mut self,
+        offset: usize,
+        status: u32,
+    ) -> Result<(), MappingAccessError> {
+        let address = self.checked_address(offset, size_of::<u32>(), align_of::<u32>())?;
+        fence(Ordering::Release);
+        // SAFETY: checked_address proves a live, aligned 4-byte range and
+        // `&mut self` excludes any simultaneous userspace mutable access.
+        unsafe { std::ptr::write_volatile(address.cast::<u32>(), status) };
+        Ok(())
+    }
+
+    fn packet_descriptor(
+        &self,
+        block_start: usize,
+        packet_offset: usize,
+        is_last: bool,
+    ) -> Result<PacketDescriptor, MappingAccessError> {
+        let packet_start = block_start
+            .checked_add(packet_offset)
+            .ok_or(MappingAccessError::ArithmeticOverflow)?;
+        let snap_offset = checked_offset(packet_start, 12)?;
+        let wire_offset = checked_offset(packet_start, 16)?;
+        let mac_offset = checked_offset(packet_start, 24)?;
+        let net_offset = checked_offset(packet_start, 26)?;
+        Ok(PacketDescriptor {
+            packet_offset,
+            next_offset: self.read_u32_volatile(packet_start)? as usize,
+            snap_len: self.read_u32_volatile(snap_offset)? as usize,
+            wire_len: self.read_u32_volatile(wire_offset)? as usize,
+            mac_offset: self.read_u16_volatile(mac_offset)? as usize,
+            net_offset: self.read_u16_volatile(net_offset)? as usize,
+            is_last,
+        })
+    }
+
+    fn acquire_user_block(
+        &mut self,
+        layout: RingLayout,
+        block_index: usize,
+    ) -> Result<UserRxBlock<'_>, MappingAccessError> {
+        let block_range = layout
+            .block_range(block_index)
+            .map_err(MappingAccessError::Geometry)?;
+        let block_start = block_range.start;
+        let status_offset = block_start
+            .checked_add(offset_of!(TpacketBlockDesc, hdr))
+            .ok_or(MappingAccessError::ArithmeticOverflow)?;
+        let status = self.load_status_acquire(status_offset)?;
+        if RxOwnership::from_status(status).map_err(MappingAccessError::Geometry)?
+            != RxOwnership::User
+        {
+            return Err(MappingAccessError::BlockNotUser { status });
+        }
+
+        let block = BlockDescriptor {
+            version: self.read_u32_volatile(block_start)?,
+            offset_to_private: self.read_u32_volatile(checked_offset(block_start, 4)?)? as usize,
+            packet_count: self.read_u32_volatile(checked_offset(block_start, 12)?)?,
+            first_packet_offset: self.read_u32_volatile(checked_offset(block_start, 16)?)? as usize,
+            block_len: self.read_u32_volatile(checked_offset(block_start, 20)?)? as usize,
+        };
+        block
+            .validate(layout)
+            .map_err(MappingAccessError::Geometry)?;
+
+        let mut packet_offset = block.first_packet_offset;
+        for index in 0..block.packet_count {
+            let is_last = index + 1 == block.packet_count;
+            let packet = self.packet_descriptor(block_start, packet_offset, is_last)?;
+            let validated = packet
+                .validate(block.block_len)
+                .map_err(MappingAccessError::Geometry)?;
+            if let Some(next) = validated.next_packet_offset() {
+                packet_offset = next;
+            }
+        }
+
+        let mut ownership = RxBlockModel::new();
+        ownership
+            .acquire(block.packet_count)
+            .map_err(MappingAccessError::Ownership)?;
+        Ok(UserRxBlock {
+            mapping: self,
+            status_offset,
+            block_start,
+            block_len: block.block_len,
+            packet_count: block.packet_count,
+            packet_index: 0,
+            packet_offset: block.first_packet_offset,
+            pending: false,
+            pending_next: None,
+            ownership,
+        })
+    }
+
+    fn exact_packet_address(
+        &self,
+        absolute_offset: usize,
+        length: usize,
+    ) -> Result<*mut u8, MappingAccessError> {
+        self.checked_address(absolute_offset, length, 1)
+    }
+
+    #[cfg(test)]
+    unsafe fn borrowed_for_test(base: NonNull<u8>, len: usize) -> Self {
+        Self {
+            base,
+            len,
+            unmap_on_drop: false,
+        }
+    }
+}
+
+#[must_use]
+#[allow(dead_code)]
+pub(crate) struct UserRxBlock<'a> {
+    mapping: &'a mut MmapRegion,
+    status_offset: usize,
+    block_start: usize,
+    block_len: usize,
+    packet_count: u32,
+    packet_index: u32,
+    packet_offset: usize,
+    pending: bool,
+    pending_next: Option<usize>,
+    ownership: RxBlockModel,
+}
+
+#[allow(dead_code)]
+impl UserRxBlock<'_> {
+    pub(crate) fn packet_data(&mut self) -> Result<&mut [u8], MappingAccessError> {
+        if self.pending {
+            return Err(MappingAccessError::PacketAlreadyBorrowed);
+        }
+        if self.ownership.owner() != RxOwnership::User || self.ownership.remaining() == 0 {
+            return Err(MappingAccessError::Ownership(
+                OwnershipError::RxReleaseWhileKernelOwned,
+            ));
+        }
+        let is_last = self.packet_index + 1 == self.packet_count;
+        let packet =
+            self.mapping
+                .packet_descriptor(self.block_start, self.packet_offset, is_last)?;
+        let validated = packet
+            .validate(self.block_len)
+            .map_err(MappingAccessError::Geometry)?;
+        let data = validated.data();
+        let absolute_offset = self
+            .block_start
+            .checked_add(data.start)
+            .ok_or(MappingAccessError::ArithmeticOverflow)?;
+        let data_len = data.end - data.start;
+        let address = self
+            .mapping
+            .exact_packet_address(absolute_offset, data_len)?;
+        self.pending_next = validated.next_packet_offset();
+        self.pending = true;
+        // SAFETY: exact_packet_address proved this exact range is live.
+        // UserRxBlock uniquely borrows the mapping, holds USER ownership, and
+        // cannot be terminally completed while this returned borrow is live.
+        Ok(unsafe { std::slice::from_raw_parts_mut(address, data_len) })
+    }
+
+    pub(crate) fn complete_packet(&mut self) -> Result<(), MappingAccessError> {
+        if !self.pending {
+            return Err(MappingAccessError::PacketNotBorrowed);
+        }
+        self.ownership
+            .complete_packet()
+            .map_err(MappingAccessError::Ownership)?;
+        self.packet_index += 1;
+        if let Some(next) = self.pending_next {
+            self.packet_offset = next;
+        }
+        self.pending = false;
+        self.pending_next = None;
+        Ok(())
+    }
+
+    pub(crate) fn release(&mut self) -> Result<(), MappingAccessError> {
+        if self.pending {
+            return Err(MappingAccessError::PacketAlreadyBorrowed);
+        }
+        self.ownership
+            .release()
+            .map_err(MappingAccessError::Ownership)?;
+        self.mapping
+            .store_status_release(self.status_offset, crate::TP_STATUS_KERNEL)
     }
 }
 
 impl Drop for MmapRegion {
     fn drop(&mut self) {
+        if !self.unmap_on_drop {
+            return;
+        }
         // SAFETY: this exact nonempty mapping is uniquely owned and unmapped
         // once. `PacketRingResources` declares it before the socket so it is
         // dropped before the fd closes.
@@ -337,6 +616,11 @@ fn set_socket_option<T>(
     Ok(())
 }
 
+fn checked_offset(base: usize, relative: usize) -> Result<usize, MappingAccessError> {
+    base.checked_add(relative)
+        .ok_or(MappingAccessError::ArithmeticOverflow)
+}
+
 fn last_error(stage: SyscallStage) -> PlatformError {
     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(5);
     PlatformError::Syscall {
@@ -361,8 +645,146 @@ unsafe extern "C" {
         protection: c_int,
         flags: c_int,
         fd: c_int,
-        offset: isize,
+        offset: i64,
     ) -> *mut c_void;
     fn munmap(address: *mut c_void, length: usize) -> c_int;
     fn close(fd: c_int) -> c_int;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MmapRegion, SockaddrLl, AF_PACKET, ETH_P_ALL};
+    use crate::{
+        GeometryError, MappingAccessError, RingGeometry, RxOwnership, TP_STATUS_KERNEL,
+        TP_STATUS_USER,
+    };
+
+    #[repr(align(16))]
+    struct AlignedRing([u8; 4_096]);
+
+    fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+        bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+        bytes[offset..offset + 2].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn rx_layout() -> crate::RingLayout {
+        RingGeometry {
+            block_size: 4_096,
+            block_count: 1,
+            frame_size: 2_048,
+            frame_count: 2,
+            retire_timeout_ms: 10,
+            private_size: 16,
+            feature_flags: 1,
+        }
+        .validate_rx(4_096, 1_514)
+        .expect("strict RX layout")
+    }
+
+    fn one_packet_ring(next_offset: u32) -> AlignedRing {
+        let mut ring = AlignedRing([0; 4_096]);
+        let bytes = &mut ring.0;
+        write_u32(bytes, 0, 2);
+        write_u32(bytes, 4, 48);
+        write_u32(bytes, 8, TP_STATUS_USER);
+        write_u32(bytes, 12, 1);
+        write_u32(bytes, 16, 64);
+        write_u32(bytes, 20, 4_096);
+
+        write_u32(bytes, 64, next_offset);
+        write_u32(bytes, 64 + 12, 60);
+        write_u32(bytes, 64 + 16, 60);
+        write_u32(bytes, 64 + 20, TP_STATUS_USER);
+        write_u16(bytes, 64 + 24, 82);
+        write_u16(bytes, 64 + 26, 96);
+        bytes[146..206].fill(0xa5);
+        ring
+    }
+
+    #[test]
+    fn exact_packet_borrow_requires_user_ownership_and_release_is_terminal() {
+        let mut backing = one_packet_ring(0);
+        // SAFETY: backing remains alive and exclusively accessed through the
+        // mapping until mapping is dropped below.
+        let mut mapping = unsafe {
+            MmapRegion::borrowed_for_test(
+                std::ptr::NonNull::new(backing.0.as_mut_ptr()).expect("test backing"),
+                backing.0.len(),
+            )
+        };
+        let mut block = mapping
+            .acquire_user_block(rx_layout(), 0)
+            .expect("validated USER block");
+        assert_eq!(
+            block.release(),
+            Err(MappingAccessError::Ownership(
+                crate::OwnershipError::RxPacketsOutstanding { remaining: 1 }
+            ))
+        );
+        {
+            let packet = block.packet_data().expect("exact packet borrow");
+            assert_eq!(packet.len(), 60);
+            assert!(packet.iter().all(|byte| *byte == 0xa5));
+            packet[0] = 0x5a;
+        }
+        assert_eq!(
+            block.packet_data(),
+            Err(MappingAccessError::PacketAlreadyBorrowed)
+        );
+        block.complete_packet().expect("terminal packet completion");
+        block.release().expect("whole block release");
+        drop(block);
+        assert_eq!(
+            mapping.load_status_acquire(8).expect("status"),
+            TP_STATUS_KERNEL
+        );
+        drop(mapping);
+        assert_eq!(backing.0[146], 0x5a);
+    }
+
+    #[test]
+    fn terminal_chain_and_inactive_socket_address_profile_are_exact() {
+        let mut backing = one_packet_ring(48);
+        // SAFETY: backing outlives the mapping and is not otherwise accessed.
+        let mut mapping = unsafe {
+            MmapRegion::borrowed_for_test(
+                std::ptr::NonNull::new(backing.0.as_mut_ptr()).expect("test backing"),
+                backing.0.len(),
+            )
+        };
+        assert_eq!(
+            mapping.load_status_acquire(1),
+            Err(MappingAccessError::StatusNotAligned { offset: 1 })
+        );
+        let error = mapping
+            .acquire_user_block(rx_layout(), 0)
+            .err()
+            .expect("terminal next offset must fail");
+        assert_eq!(
+            error,
+            MappingAccessError::Geometry(GeometryError::TerminalPacketHasNextOffset { offset: 48 })
+        );
+
+        let address = SockaddrLl::packet_all(7).expect("validated address");
+        assert_eq!(address.sll_family, AF_PACKET as u16);
+        assert_eq!(address.sll_protocol, ETH_P_ALL.to_be());
+        assert_eq!(address.sll_ifindex, 7);
+        assert!(SockaddrLl::packet_all(0).is_err());
+        let mut wrong_family = address;
+        wrong_family.sll_family = 0;
+        assert!(matches!(
+            wrong_family.validate(),
+            Err(crate::PlatformError::InvalidSocketAddress {
+                family: 0,
+                if_index: 7,
+            })
+        ));
+        assert_eq!(
+            RxOwnership::from_status(TP_STATUS_USER),
+            Ok(RxOwnership::User)
+        );
+    }
 }

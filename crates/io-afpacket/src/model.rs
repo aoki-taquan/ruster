@@ -2,7 +2,8 @@ use std::ops::Range;
 
 use crate::{
     error::TxOperation, GeometryError, OwnershipError, RingLayout, TPACKET_ALIGNMENT,
-    TPACKET_BLOCK_HEADER_LEN, TPACKET_V3_HEADER_LEN,
+    TPACKET_BLOCK_HEADER_LEN, TPACKET_V3_ETHERNET_MAC_OFFSET, TPACKET_V3_ETHERNET_NETWORK_OFFSET,
+    TPACKET_V3_HDRLEN, TPACKET_V3_HEADER_LEN, TPACKET_V3_VERSION,
 };
 
 pub const TP_STATUS_KERNEL: u32 = 0;
@@ -14,6 +15,8 @@ pub const TP_STATUS_WRONG_FORMAT: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockDescriptor {
+    pub version: u32,
+    pub offset_to_private: usize,
     pub block_len: usize,
     pub packet_count: u32,
     pub first_packet_offset: usize,
@@ -21,6 +24,16 @@ pub struct BlockDescriptor {
 
 impl BlockDescriptor {
     pub fn validate(self, layout: RingLayout) -> Result<(), GeometryError> {
+        if self.version != TPACKET_V3_VERSION {
+            return Err(GeometryError::UnsupportedBlockVersion {
+                version: self.version,
+            });
+        }
+        if self.offset_to_private != TPACKET_BLOCK_HEADER_LEN {
+            return Err(GeometryError::PrivateOffsetInvalid {
+                offset: self.offset_to_private,
+            });
+        }
         if self.packet_count == 0 {
             return Err(GeometryError::PacketCountZero);
         }
@@ -29,7 +42,8 @@ impl BlockDescriptor {
                 offset: self.first_packet_offset,
             });
         }
-        let first_packet_minimum = TPACKET_BLOCK_HEADER_LEN
+        let first_packet_minimum = self
+            .offset_to_private
             .checked_add(
                 usize::try_from(layout.geometry().private_size)
                     .map_err(|_| GeometryError::ArithmeticOverflow)?,
@@ -70,6 +84,7 @@ pub struct PacketDescriptor {
     pub packet_offset: usize,
     pub next_offset: usize,
     pub mac_offset: usize,
+    pub net_offset: usize,
     pub snap_len: usize,
     pub wire_len: usize,
     pub is_last: bool,
@@ -96,9 +111,19 @@ impl PacketDescriptor {
                 offset: self.packet_offset,
             });
         }
-        if self.mac_offset < TPACKET_V3_HEADER_LEN {
+        if self.mac_offset < TPACKET_V3_HDRLEN {
             return Err(GeometryError::MacOffsetBeforeHeader {
                 mac_offset: self.mac_offset,
+            });
+        }
+        if self.mac_offset != TPACKET_V3_ETHERNET_MAC_OFFSET {
+            return Err(GeometryError::EthernetMacOffsetInvalid {
+                mac_offset: self.mac_offset,
+            });
+        }
+        if self.net_offset != TPACKET_V3_ETHERNET_NETWORK_OFFSET {
+            return Err(GeometryError::EthernetNetworkOffsetInvalid {
+                net_offset: self.net_offset,
             });
         }
         if self.snap_len > self.wire_len {
@@ -128,6 +153,11 @@ impl PacketDescriptor {
                 return Err(GeometryError::MissingNextPacketOffset);
             }
         } else {
+            if self.is_last {
+                return Err(GeometryError::TerminalPacketHasNextOffset {
+                    offset: self.next_offset,
+                });
+            }
             if !self.next_offset.is_multiple_of(TPACKET_ALIGNMENT) {
                 return Err(GeometryError::NextPacketOffsetNotAligned {
                     offset: self.next_offset,
@@ -161,6 +191,37 @@ impl PacketDescriptor {
             truncated: self.snap_len < self.wire_len,
         })
     }
+}
+
+pub fn validate_v3_block_chain(
+    block: BlockDescriptor,
+    packets: &[PacketDescriptor],
+    layout: RingLayout,
+) -> Result<(), GeometryError> {
+    block.validate(layout)?;
+    if usize::try_from(block.packet_count).ok() != Some(packets.len()) {
+        return Err(GeometryError::PacketDescriptorCountMismatch {
+            packet_count: block.packet_count,
+            descriptors: packets.len(),
+        });
+    }
+    let mut expected_offset = block.first_packet_offset;
+    for (index, packet) in packets.iter().enumerate() {
+        if packet.packet_offset != expected_offset {
+            return Err(GeometryError::PacketChainOffsetMismatch {
+                expected: expected_offset,
+                actual: packet.packet_offset,
+            });
+        }
+        if packet.is_last != (index + 1 == packets.len()) {
+            return Err(GeometryError::PacketTerminalFlagMismatch { index });
+        }
+        let validated = packet.validate(block.block_len)?;
+        if let Some(next) = validated.next_packet_offset() {
+            expected_offset = next;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

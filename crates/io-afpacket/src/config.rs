@@ -3,10 +3,13 @@ use ruster_core::IfId;
 use crate::{ConfigError, GeometryError};
 
 pub const TPACKET_ALIGNMENT: usize = 16;
+pub const TPACKET_V3_VERSION: u32 = 2;
 pub const TPACKET_V3_HEADER_LEN: usize = 48;
 pub const TPACKET_BLOCK_HEADER_LEN: usize = 48;
 pub const TPACKET_V3_HDRLEN: usize = 68;
 pub const TPACKET_V3_ETHERNET_MAC_OFFSET: usize = 82;
+pub const TPACKET_V3_ETHERNET_NETWORK_OFFSET: usize = 96;
+pub const TPACKET_V3_TX_DATA_OFFSET: usize = 48;
 pub const DEFAULT_MAX_FRAME_LEN: usize = 1_514;
 
 const PORT_TABLE_LEN: usize = u16::MAX as usize + 1;
@@ -32,10 +35,42 @@ pub struct RingGeometry {
 }
 
 impl RingGeometry {
-    pub fn validate(
+    pub fn validate_rx(
         self,
         page_size: usize,
         max_frame_len: usize,
+    ) -> Result<RingLayout, GeometryError> {
+        self.validate_common(page_size, max_frame_len, TPACKET_V3_ETHERNET_MAC_OFFSET)
+    }
+
+    pub fn validate_tx(
+        self,
+        page_size: usize,
+        max_frame_len: usize,
+    ) -> Result<RingLayout, GeometryError> {
+        if self.retire_timeout_ms != 0 {
+            return Err(GeometryError::RetireTimeoutUnsupportedForTx {
+                retire_timeout_ms: self.retire_timeout_ms,
+            });
+        }
+        if self.private_size != 0 {
+            return Err(GeometryError::PrivateAreaUnsupportedForTx {
+                private_size: self.private_size,
+            });
+        }
+        if self.feature_flags != 0 {
+            return Err(GeometryError::FeatureFlagsUnsupportedForTx {
+                feature_flags: self.feature_flags,
+            });
+        }
+        self.validate_common(page_size, max_frame_len, TPACKET_V3_TX_DATA_OFFSET)
+    }
+
+    fn validate_common(
+        self,
+        page_size: usize,
+        max_frame_len: usize,
+        frame_data_offset: usize,
     ) -> Result<RingLayout, GeometryError> {
         if page_size == 0 || !page_size.is_power_of_two() {
             return Err(GeometryError::PageSizeNotPowerOfTwo { page_size });
@@ -58,6 +93,11 @@ impl RingGeometry {
 
         let block_size =
             usize::try_from(self.block_size).map_err(|_| GeometryError::ArithmeticOverflow)?;
+        if self.block_size > i32::MAX as u32 {
+            return Err(GeometryError::BlockSizeExceedsKernelLimit {
+                block_size: self.block_size,
+            });
+        }
         let frame_size =
             usize::try_from(self.frame_size).map_err(|_| GeometryError::ArithmeticOverflow)?;
         if block_size % page_size != 0 {
@@ -73,7 +113,7 @@ impl RingGeometry {
         }
 
         let minimum = align_up(
-            TPACKET_V3_ETHERNET_MAC_OFFSET
+            frame_data_offset
                 .checked_add(max_frame_len)
                 .ok_or(GeometryError::ArithmeticOverflow)?,
             TPACKET_ALIGNMENT,
@@ -134,6 +174,9 @@ impl RingGeometry {
         let map_len = block_size
             .checked_mul(block_count)
             .ok_or(GeometryError::ArithmeticOverflow)?;
+        if map_len > isize::MAX as usize {
+            return Err(GeometryError::MapLengthExceedsAddressSpace { map_len });
+        }
 
         Ok(RingLayout {
             geometry: self,
@@ -331,24 +374,15 @@ impl ValidatedConfig {
             }
             let rx = port
                 .rx
-                .validate(page_size, max_frame_len)
+                .validate_rx(page_size, max_frame_len)
                 .map_err(|source| ConfigError::Ring {
                     interface: port.interface,
                     kind: RingKind::Rx,
                     source,
                 })?;
-            if port.tx.feature_flags != 0 {
-                return Err(ConfigError::Ring {
-                    interface: port.interface,
-                    kind: RingKind::Tx,
-                    source: GeometryError::FeatureFlagsUnsupportedForTx {
-                        feature_flags: port.tx.feature_flags,
-                    },
-                });
-            }
             let tx = port
                 .tx
-                .validate(page_size, max_frame_len)
+                .validate_tx(page_size, max_frame_len)
                 .map_err(|source| ConfigError::Ring {
                     interface: port.interface,
                     kind: RingKind::Tx,
@@ -360,6 +394,12 @@ impl ValidatedConfig {
                     .ok_or(ConfigError::CombinedMapOverflow {
                         interface: port.interface,
                     })?;
+            if combined_map_len > isize::MAX as usize {
+                return Err(ConfigError::CombinedMapExceedsAddressSpace {
+                    interface: port.interface,
+                    map_len: combined_map_len,
+                });
+            }
             validated.push(ValidatedPort {
                 interface: port.interface,
                 if_index: port.if_index,
