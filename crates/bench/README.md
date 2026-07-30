@@ -60,3 +60,17 @@ frame byte convention、`ruster-imix-v1`の7:4:1 cycle、exact line-rate rationa
 floor packets/s、matrixの全sliceは
 [hardware benchmark plan v1](../../docs/hardware-benchmark-plan-v1.md)を参照してください。
 plannerはtrafficを実行せず、threshold、baseline、合否、hardware性能を主張しません。
+
+## Hardware measurement protocol
+
+`HardwareMeasurementProtocol`はspec/source/generator/latency/timingをfrozen
+237-case planへbindし、untrusted integer counterからだけrepeatを導出します。
+duplicate、unexpected、oracle failure、direction mismatch、IMIX evidence driftを
+fail closedで拒否し、exact odd repeat setからsummaryと237-case completenessを
+再検証します。typed lifecycleはcontiguous sequence、monotonic time、case/repeat順序、
+failure時のdrain/cleanupを固定します。
+
+契約と境界は
+[hardware measurement protocol v1](../../docs/hardware-measurement-protocol-v1.md)を
+参照してください。このcrateはdriver、filesystem/resume、Linux、threshold、
+baseline、pass/fail、性能主張を実装しません。
