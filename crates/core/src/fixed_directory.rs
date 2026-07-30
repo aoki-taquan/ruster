@@ -9,10 +9,16 @@
 
 const NONE: u32 = u32::MAX;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct DirectoryHashKey {
     first: u64,
     second: u64,
+}
+
+impl std::fmt::Debug for DirectoryHashKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DirectoryHashKey([REDACTED])")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -915,6 +921,9 @@ mod tests {
             DirectoryHashKey::new(0, 0),
             Err(DirectoryHashKeyError::AllZero)
         );
+        assert_eq!(format!("{first_key:?}"), "DirectoryHashKey([REDACTED])");
+        assert_eq!(format!("{first_key:#?}"), "DirectoryHashKey([REDACTED])");
+        assert_eq!(format!("{first_key:?}"), format!("{second_key:?}"));
     }
 
     #[test]
