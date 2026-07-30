@@ -147,6 +147,16 @@ fn assert_forwarding_drop(
     assert_eq!(recycled.bytes, original, "drop must not mutate bytes");
 }
 
+fn with_ipv4_addresses(mut packet: Vec<u8>, source: [u8; 4], destination: [u8; 4]) -> Vec<u8> {
+    packet[26..30].copy_from_slice(&source);
+    packet[30..34].copy_from_slice(&destination);
+    packet[24..26].fill(0);
+    let header_len = usize::from(packet[14] & 0x0f) * 4;
+    let checksum = ipv4_header_checksum(&packet[14..14 + header_len]);
+    packet[24..26].copy_from_slice(&checksum.to_be_bytes());
+    packet
+}
+
 fn assert_arp_control_consumed(packet: Vec<u8>, snapshot: &ForwardingSnapshot<'_>) {
     let original = packet.clone();
     let mut io = SimIo::new();
@@ -163,9 +173,133 @@ fn assert_arp_control_consumed(packet: Vec<u8>, snapshot: &ForwardingSnapshot<'_
 }
 
 #[test]
+fn ipv4_ingress_admission_matrix_is_typed_and_atomic() {
+    let routes = [
+        route([192, 0, 2, 0], 24, WAN, Some(GATEWAY)),
+        route([198, 51, 100, 0], 24, WAN, Some(GATEWAY)),
+    ];
+    let interfaces = [local_interface(), interface()];
+    let neighbors = [gateway_neighbor()];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
+    let base = frame(64, &[]);
+
+    let mut cases = Vec::new();
+    for (source, reason) in [
+        ([0; 6], DropReason::Ipv4EthernetSourceZero),
+        ([0xff; 6], DropReason::Ipv4EthernetSourceBroadcast),
+        (
+            [0x01, 0, 0, 0, 0, 1],
+            DropReason::Ipv4EthernetSourceMulticast,
+        ),
+    ] {
+        let mut packet = base.clone();
+        packet[6..12].copy_from_slice(&source);
+        cases.push((packet, reason));
+    }
+    for (destination, reason) in [
+        ([0; 6], DropReason::Ipv4EthernetDestinationZero),
+        ([0xff; 6], DropReason::Ipv4EthernetDestinationBroadcast),
+        (
+            [0x01, 0, 0, 0, 0, 1],
+            DropReason::Ipv4EthernetDestinationMulticast,
+        ),
+    ] {
+        let mut packet = base.clone();
+        packet[0..6].copy_from_slice(&destination);
+        cases.push((packet, reason));
+    }
+    for (source, reason) in [
+        ([0, 1, 2, 3], DropReason::Ipv4SourceUnspecifiedNetwork),
+        ([127, 0, 0, 1], DropReason::Ipv4SourceLoopback),
+        ([224, 0, 0, 1], DropReason::Ipv4SourceMulticast),
+        ([240, 0, 0, 1], DropReason::Ipv4SourceClassE),
+        ([255; 4], DropReason::Ipv4SourceLimitedBroadcast),
+        ([192, 0, 2, 0], DropReason::Ipv4SourceNetworkAddress),
+        ([192, 0, 2, 255], DropReason::Ipv4SourceDirectedBroadcast),
+    ] {
+        cases.push((
+            with_ipv4_addresses(base.clone(), source, DESTINATION),
+            reason,
+        ));
+    }
+    for (destination, reason) in [
+        ([0, 1, 2, 3], DropReason::Ipv4DestinationUnspecifiedNetwork),
+        ([127, 0, 0, 1], DropReason::Ipv4DestinationLoopback),
+        ([224, 0, 0, 1], DropReason::Ipv4DestinationMulticast),
+        ([255; 4], DropReason::Ipv4DestinationLimitedBroadcast),
+        ([240, 0, 0, 1], DropReason::Ipv4DestinationClassE),
+        ([198, 51, 100, 0], DropReason::Ipv4DestinationNetworkAddress),
+        (
+            [198, 51, 100, 255],
+            DropReason::Ipv4DestinationDirectedBroadcast,
+        ),
+    ] {
+        cases.push((
+            with_ipv4_addresses(base.clone(), [192, 0, 2, 10], destination),
+            reason,
+        ));
+    }
+    for (packet, reason) in cases {
+        assert_forwarding_drop(packet, &snapshot, reason);
+    }
+
+    let original = base.clone();
+    let mut io = SimIo::new();
+    io.inject(IfId(99), base);
+    let report = io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    assert_eq!((report.tx_requested, report.dropped), (0, 1));
+    let recycled = io.pop_recycled().unwrap();
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Forwarding(DropReason::Ipv4IngressInterfaceUnknown)
+    );
+    assert_eq!(recycled.bytes, original);
+}
+
+#[test]
+fn point_to_point_and_host_route_endpoints_pass_ipv4_ingress_admission() {
+    let host_destination = [198, 51, 100, 22];
+    let routes = [
+        route([198, 51, 100, 20], 31, WAN, None),
+        route(host_destination, 32, WAN, None),
+    ];
+    let interfaces = [local_interface(), interface()];
+    let neighbors = [
+        Neighbor {
+            interface: WAN,
+            target: ip([198, 51, 100, 20]),
+            mac: NEXT_HOP_MAC,
+        },
+        Neighbor {
+            interface: WAN,
+            target: ip([198, 51, 100, 21]),
+            mac: NEXT_HOP_MAC,
+        },
+        Neighbor {
+            interface: WAN,
+            target: ip(host_destination),
+            mac: NEXT_HOP_MAC,
+        },
+    ];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
+    let mut io = SimIo::new();
+    for destination in [[198, 51, 100, 20], [198, 51, 100, 21], host_destination] {
+        io.inject(
+            LAN,
+            with_ipv4_addresses(frame(64, &[]), [192, 0, 2, 10], destination),
+        );
+    }
+    let report = io.run_once(3, &snapshot, &mut NoTrace).unwrap();
+    assert_eq!((report.tx_requested, report.dropped), (3, 0));
+    for _ in 0..3 {
+        assert_eq!(io.pop_tx().unwrap().egress, WAN);
+    }
+}
+
+#[test]
 fn gateway_route_rewrites_and_reports_backend_acceptance() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = [local_interface(), interface()];
     let neighbors = [gateway_neighbor()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
     let packet = frame(64, &[1, 2, 3, 4]);
@@ -197,7 +331,7 @@ fn gateway_route_rewrites_and_reports_backend_acceptance() {
 #[test]
 fn connected_route_uses_packet_destination_as_neighbor_target() {
     let routes = [route([198, 51, 100, 0], 24, WAN, None)];
-    let interfaces = [interface()];
+    let interfaces = [local_interface(), interface()];
     let neighbors = [Neighbor {
         interface: WAN,
         target: ip(DESTINATION),
@@ -215,6 +349,7 @@ fn connected_route_uses_packet_destination_as_neighbor_target() {
 fn lpm_supports_default_and_host_routes() {
     let routes = [gateway_route(), route(DESTINATION, 32, IfId(3), None)];
     let interfaces = [
+        local_interface(),
         interface(),
         Interface {
             id: IfId(3),
@@ -332,7 +467,7 @@ fn arp_snapshot_rejects_duplicate_or_unknown_local_addresses() {
 #[test]
 fn all_validation_and_decision_drops_are_granular_and_atomic() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = [local_interface(), interface()];
     let neighbors = [gateway_neighbor()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
 
@@ -386,7 +521,7 @@ fn options_header_is_valid_but_forwarding_is_explicitly_unsupported() {
 #[test]
 fn padding_is_ignored_but_preserved() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = [local_interface(), interface()];
     let neighbors = [gateway_neighbor()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
     let mut padded = frame(10, &[7, 8]);
@@ -405,7 +540,7 @@ fn padding_is_ignored_but_preserved() {
 #[test]
 fn fragment_flags_offset_payload_and_checksum_are_preserved_or_updated_correctly() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = [local_interface(), interface()];
     let neighbors = [gateway_neighbor()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
     let mut fragment = frame(5, &[0xaa; 8]);
@@ -427,7 +562,7 @@ fn fragment_flags_offset_payload_and_checksum_are_preserved_or_updated_correctly
 #[test]
 fn mixed_batch_is_fifo_budgeted_and_reports_requested_accepted_recycled() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = [local_interface(), interface()];
     let neighbors = [gateway_neighbor()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
     let mut io = SimIo::new();
@@ -472,7 +607,7 @@ fn unfinished_core_lease_is_backend_lifecycle_recycle() {
 fn trace_is_deterministic_and_terminal_event_follows_completion() {
     fn run() -> (Vec<u8>, Vec<TraceEvent>) {
         let routes = [gateway_route()];
-        let interfaces = [interface()];
+        let interfaces = [local_interface(), interface()];
         let neighbors = [gateway_neighbor()];
         let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
         let mut io = SimIo::new();
@@ -548,7 +683,7 @@ impl PacketBatch for PartialBatch {
 #[test]
 fn partial_backend_completion_preserves_report_and_aggregate_trace() {
     let routes = [gateway_route()];
-    let interfaces = [interface()];
+    let interfaces = [local_interface(), interface()];
     let neighbors = [gateway_neighbor()];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
     let batch = PartialBatch {

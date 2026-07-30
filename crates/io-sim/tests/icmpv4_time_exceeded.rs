@@ -160,6 +160,30 @@ fn error_disposition(
         .expect("TTL-expired packet has a typed ICMP disposition")
 }
 
+fn forwarding_drop_reason(snapshot: &ForwardingSnapshot<'_>, packet: Vec<u8>) -> DropReason {
+    let mut rs = [ResolutionStateSlot::EMPTY; 1];
+    let mut ra = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = ResolutionRuntime::new(resolution_policy(), &mut rs, &mut ra);
+    let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut es, &mut ea);
+    let mut io = SimIo::new();
+    io.inject(LAN, packet);
+    let batch = io.receive(1).unwrap();
+    forward_batch_with_resolution_and_icmpv4_errors(
+        batch,
+        snapshot,
+        &mut resolution,
+        &mut errors,
+        MonotonicMillis(0),
+        &mut NoTrace,
+    );
+    match io.pop_recycled().unwrap().cause {
+        RecycleCause::Forwarding(reason) => reason,
+        cause => panic!("expected forwarding drop, got {cause:?}"),
+    }
+}
+
 #[test]
 fn ttl_expiry_is_atomic_and_generates_exact_asymmetric_static_reply() {
     let interfaces = interfaces();
@@ -317,7 +341,7 @@ fn selected_gateway_prefix_suppresses_remote_boundaries_but_lpm_host_routes_win(
     let base_routes = [gateway_destination, routes()[1], routes()[2]];
     let base = ForwardingSnapshot::new(&base_routes, &interfaces, &neighbors, &bindings).unwrap();
     assert_eq!(
-        error_disposition(
+        forwarding_drop_reason(
             &base,
             frame(
                 SOURCE,
@@ -330,10 +354,10 @@ fn selected_gateway_prefix_suppresses_remote_boundaries_but_lpm_host_routes_win(
                 &[],
             ),
         ),
-        Icmpv4TimeExceededDisposition::DestinationDirectedBroadcast
+        DropReason::Ipv4DestinationDirectedBroadcast
     );
     assert_eq!(
-        error_disposition(
+        forwarding_drop_reason(
             &base,
             frame(
                 SOURCE,
@@ -346,14 +370,14 @@ fn selected_gateway_prefix_suppresses_remote_boundaries_but_lpm_host_routes_win(
                 &[],
             ),
         ),
-        Icmpv4TimeExceededDisposition::DestinationNetworkAddress
+        DropReason::Ipv4DestinationNetworkAddress
     );
     for source in [
         Ipv4Address::from_octets([203, 0, 113, 0]),
         Ipv4Address::from_octets([203, 0, 113, 255]),
     ] {
         assert_eq!(
-            error_disposition(
+            forwarding_drop_reason(
                 &base,
                 frame(
                     source,
@@ -366,7 +390,11 @@ fn selected_gateway_prefix_suppresses_remote_boundaries_but_lpm_host_routes_win(
                     &[],
                 ),
             ),
-            Icmpv4TimeExceededDisposition::SourceNotUnicast
+            if source == Ipv4Address::from_octets([203, 0, 113, 0]) {
+                DropReason::Ipv4SourceNetworkAddress
+            } else {
+                DropReason::Ipv4SourceDirectedBroadcast
+            }
         );
     }
 
@@ -769,6 +797,37 @@ fn rfc1812_suppression_matrix_is_typed_and_byte_atomic() {
         ),
     ];
     for (mut original, expected) in cases {
+        let admission_reason = match expected {
+            Icmpv4TimeExceededDisposition::SourceNotUnicast => {
+                if original[26..30] == [255; 4] {
+                    Some(DropReason::Ipv4SourceLimitedBroadcast)
+                } else {
+                    match original[26] {
+                        0 => Some(DropReason::Ipv4SourceUnspecifiedNetwork),
+                        127 => Some(DropReason::Ipv4SourceLoopback),
+                        224..=239 => Some(DropReason::Ipv4SourceMulticast),
+                        240..=255 => Some(DropReason::Ipv4SourceClassE),
+                        _ if original[26..30] == [192, 0, 2, 0] => {
+                            Some(DropReason::Ipv4SourceNetworkAddress)
+                        }
+                        _ => Some(DropReason::Ipv4SourceDirectedBroadcast),
+                    }
+                }
+            }
+            Icmpv4TimeExceededDisposition::DestinationMulticast => {
+                Some(DropReason::Ipv4DestinationMulticast)
+            }
+            Icmpv4TimeExceededDisposition::DestinationLimitedBroadcast => {
+                Some(DropReason::Ipv4DestinationLimitedBroadcast)
+            }
+            Icmpv4TimeExceededDisposition::DestinationNetworkAddress => {
+                Some(DropReason::Ipv4DestinationNetworkAddress)
+            }
+            Icmpv4TimeExceededDisposition::DestinationDirectedBroadcast => {
+                Some(DropReason::Ipv4DestinationDirectedBroadcast)
+            }
+            _ => None,
+        };
         if matches!(
             expected,
             Icmpv4TimeExceededDisposition::DestinationMulticast
@@ -801,7 +860,17 @@ fn rfc1812_suppression_matrix_is_typed_and_byte_atomic() {
             &mut trace,
         );
         assert_eq!(errors.pending_actions(), 0, "{expected:?}");
-        assert_eq!(io.pop_recycled().unwrap().bytes, original);
+        let recycled = io.pop_recycled().unwrap();
+        assert_eq!(recycled.bytes, original);
+        if let Some(reason) = admission_reason {
+            assert_eq!(recycled.cause, RecycleCause::Forwarding(reason));
+            assert!(!trace.events().iter().any(|event| matches!(
+                event,
+                TraceEvent::Icmpv4TimeExceededDisposition { .. }
+                    | TraceEvent::Icmpv4DestinationUnreachableDisposition { .. }
+            )));
+            continue;
+        }
         assert!(trace.events().iter().any(|event| {
             matches!(
                 event,
@@ -857,7 +926,7 @@ fn ethernet_group_destination_and_options_suppress_without_mutation() {
     options[14] = 0x46;
     replace_ipv4_word(&mut options, 16, 24);
     for (original, reason) in [
-        (group, DropReason::Ipv4TtlExpired),
+        (group, DropReason::Ipv4EthernetDestinationMulticast),
         (options, DropReason::Ipv4OptionsUnsupported),
     ] {
         let mut rs = [ResolutionStateSlot::EMPTY; 1];
