@@ -429,10 +429,12 @@ errorも含む`forward_batch_with_nat44_udp_and_icmpv4_errors`という合成ser
 ARP resolutionと同じworker tickへ明示的にbindします。config公開済みでruntime storageが
 無い場合、またはruntime/config/snapshot authority fingerprintが不一致ならdomain crossingを
 fail closedにします。新snapshot公開時はそのsnapshotでconfigをvalidateし、
-freshなUDP専用hash keyを伴う`preflight_reconcile`でone-shot permitを作り、publication
-owner交換後はinfallibleな`commit_reconcile`でmapping/peer/indexを全flushします。互換
-`reconcile`はこの二段階処理のwrapperです。dimension/key/config validationはclearより先に
-完了し、失敗時は旧publicationを保持します。`storage_shape`はmapping/peer slot、両directory
+freshなUDP専用hash keyを伴う`preflight_reconcile`でexact runtimeを排他的に借用する
+one-shot permitを作り、publication owner交換後はinfallibleな`permit.commit()`で
+mapping/peer/indexを全flushします。permitは別runtimeへ移せず、drop時は何も変更しません。
+互換`reconcile`はこの二段階処理のwrapperです。dimension/key/config validationはclearより先に
+完了し、失敗時は旧publicationを保持します。commit経路に再validation、`Result`、panicは
+ありません。`storage_shape`はmapping/peer slot、両directory
 のbucket/node、port-owner slotの全capacityをopaque valueで比較可能にします。旧generation
 または旧runtime lifecycle epochのpeer/port ownerが新mappingを許可することはありません。
 

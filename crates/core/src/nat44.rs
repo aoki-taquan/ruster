@@ -1,4 +1,8 @@
-use std::{marker::PhantomData, rc::Rc};
+use std::{
+    marker::PhantomData,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -20,6 +24,21 @@ pub const NAT44_TCP_MIN_IDLE_TTL_MS: u64 = 7_440_000;
 pub const NAT44_TCP_DEFAULT_IDLE_TTL_MS: u64 = 7_440_000;
 pub const NAT44_TCP_MAX_IDLE_TTL_MS: u64 = 604_800_000;
 const UDP_INDEX_NONE: u32 = u32::MAX;
+static NEXT_UDP_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_udp_runtime_identity() -> Result<u64, Nat44UdpRuntimeConfigError> {
+    allocate_udp_runtime_identity_from(&NEXT_UDP_RUNTIME_IDENTITY)
+}
+
+fn allocate_udp_runtime_identity_from(
+    identities: &AtomicU64,
+) -> Result<u64, Nat44UdpRuntimeConfigError> {
+    identities
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+            identity.checked_add(1)
+        })
+        .map_err(|_| Nat44UdpRuntimeConfigError::RuntimeIdentityExhausted)
+}
 
 fn encode_udp_index(index: usize) -> u32 {
     u32::try_from(index).expect("validated UDP NAT capacity fits u32")
@@ -1183,6 +1202,7 @@ pub enum Nat44UdpRuntimeConfigError {
     MappingDirectoryInvalid,
     PeerDirectoryInvalid,
     PortOwnerTableInvalid,
+    RuntimeIdentityExhausted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1242,17 +1262,127 @@ impl Nat44UdpStorageShape {
     }
 }
 
-/// One-shot proof that a UDP NAT reconcile can be committed without failure.
+/// Lifetime-bound proof that a UDP NAT reconcile can commit without failure.
 ///
-/// This value is intentionally opaque and non-cloneable. It owns the new
-/// configuration and hash key, so committing it has no caller-owned borrow.
-pub struct Nat44UdpReconcilePermit {
+/// The permit exclusively borrows the exact runtime that produced it. It is
+/// intentionally opaque, non-cloneable, non-copyable, and non-debuggable.
+/// Dropping it releases the borrow without changing the runtime.
+///
+/// ```compile_fail
+/// use ruster_core::Nat44UdpReconcilePermit;
+/// fn assert_clone<T: Clone>() {}
+/// assert_clone::<Nat44UdpReconcilePermit<'static, 'static>>();
+/// ```
+///
+/// ```compile_fail
+/// use ruster_core::Nat44UdpReconcilePermit;
+/// fn assert_copy<T: Copy>() {}
+/// assert_copy::<Nat44UdpReconcilePermit<'static, 'static>>();
+/// ```
+///
+/// ```compile_fail
+/// use ruster_core::Nat44UdpReconcilePermit;
+/// fn assert_debug<T: std::fmt::Debug>() {}
+/// assert_debug::<Nat44UdpReconcilePermit<'static, 'static>>();
+/// ```
+///
+/// ```compile_fail
+/// use ruster_core::{
+///     Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpReconcileError, Nat44UdpRuntime,
+/// };
+///
+/// fn runtime_stays_exclusively_borrowed<'storage>(
+///     runtime: &mut Nat44UdpRuntime<'storage>,
+///     config: Nat44UdpConfig,
+///     key: Nat44UdpHashKey,
+/// ) -> Result<(), Nat44UdpReconcileError> {
+///     let permit = runtime.preflight_reconcile(config, key)?;
+///     let _ = runtime.config();
+///     permit.commit();
+///     Ok(())
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ruster_core::{
+///     Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpReconcileError, Nat44UdpRuntime,
+/// };
+///
+/// fn permit_cannot_be_applied_to_another_runtime<'storage>(
+///     first: &mut Nat44UdpRuntime<'storage>,
+///     second: &mut Nat44UdpRuntime<'storage>,
+///     config: Nat44UdpConfig,
+///     key: Nat44UdpHashKey,
+/// ) -> Result<(), Nat44UdpReconcileError> {
+///     let permit = first.preflight_reconcile(config, key)?;
+///     second.commit_reconcile(permit);
+///     Ok(())
+/// }
+/// ```
+#[must_use = "dropping a UDP NAT reconcile permit leaves the runtime unchanged"]
+pub struct Nat44UdpReconcilePermit<'runtime, 'storage> {
+    runtime: &'runtime mut Nat44UdpRuntime<'storage>,
     config: Nat44UdpConfig,
     hash_key: Nat44UdpHashKey,
-    expected_config: Nat44UdpConfig,
-    expected_hash_key: Nat44UdpHashKey,
     next_runtime_epoch: u128,
-    binding: [usize; 7],
+}
+
+impl Nat44UdpReconcilePermit<'_, '_> {
+    /// Consumes this one-shot permit and applies its prevalidated reconcile.
+    pub fn commit(self) -> Nat44UdpReconcileReport {
+        self.runtime.commit_prevalidated_reconcile(
+            self.config,
+            self.hash_key,
+            self.next_runtime_epoch,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Nat44UdpBackingIdentity {
+    address: usize,
+    length: usize,
+}
+
+impl Nat44UdpBackingIdentity {
+    fn of<T>(storage: &[T]) -> Self {
+        Self {
+            address: storage.as_ptr() as usize,
+            length: storage.len(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Nat44UdpReconcileBinding {
+    runtime_identity: u64,
+    mappings: Nat44UdpBackingIdentity,
+    peers: Nat44UdpBackingIdentity,
+    mapping_buckets: Nat44UdpBackingIdentity,
+    mapping_nodes: Nat44UdpBackingIdentity,
+    peer_buckets: Nat44UdpBackingIdentity,
+    peer_nodes: Nat44UdpBackingIdentity,
+    port_owners: Nat44UdpBackingIdentity,
+}
+
+impl Nat44UdpReconcileBinding {
+    fn new(
+        runtime_identity: u64,
+        mappings: &[Nat44UdpMappingSlot],
+        peers: &[Nat44UdpPeerSlot],
+        indexes: &Nat44UdpIndexStorage<'_>,
+    ) -> Self {
+        Self {
+            runtime_identity,
+            mappings: Nat44UdpBackingIdentity::of(mappings),
+            peers: Nat44UdpBackingIdentity::of(peers),
+            mapping_buckets: Nat44UdpBackingIdentity::of(indexes.mapping_buckets),
+            mapping_nodes: Nat44UdpBackingIdentity::of(indexes.mapping_nodes),
+            peer_buckets: Nat44UdpBackingIdentity::of(indexes.peer_buckets),
+            peer_nodes: Nat44UdpBackingIdentity::of(indexes.peer_nodes),
+            port_owners: Nat44UdpBackingIdentity::of(indexes.port_owners),
+        }
+    }
 }
 
 /// Fixed-capacity, worker-local UDP NAPT state.
@@ -1285,6 +1415,8 @@ pub struct Nat44UdpRuntime<'a> {
     next_generation: u64,
     runtime_epoch: u128,
     state_revision: u128,
+    #[allow(dead_code)] // Retained as defense-in-depth for the publication owner.
+    reconcile_binding: Nat44UdpReconcileBinding,
     counters: Nat44UdpCounters,
     #[cfg(test)]
     mapping_lookup_probes: Cell<usize>,
@@ -1320,6 +1452,9 @@ impl<'a> Nat44UdpRuntime<'a> {
             mappings.len(),
         )
         .map_err(|_| Nat44UdpRuntimeConfigError::PortOwnerTableInvalid)?;
+        let runtime_identity = allocate_udp_runtime_identity()?;
+        let reconcile_binding =
+            Nat44UdpReconcileBinding::new(runtime_identity, mappings, peers, &indexes);
         let mapping_directory =
             FixedDirectory::new(indexes.mapping_buckets, indexes.mapping_nodes, hash_key.0)
                 .expect("mapping directory dimensions were preflighted");
@@ -1347,6 +1482,7 @@ impl<'a> Nat44UdpRuntime<'a> {
             next_generation: 1,
             runtime_epoch: 1,
             state_revision: 0,
+            reconcile_binding,
             counters: Nat44UdpCounters::default(),
             #[cfg(test)]
             mapping_lookup_probes: Cell::new(0),
@@ -1428,15 +1564,15 @@ impl<'a> Nat44UdpRuntime<'a> {
         config: Nat44UdpConfig,
         hash_key: Nat44UdpHashKey,
     ) -> Result<Nat44UdpReconcileReport, Nat44UdpReconcileError> {
-        let permit = self.preflight_reconcile(config, hash_key)?;
-        Ok(self.commit_reconcile(permit))
+        self.preflight_reconcile(config, hash_key)
+            .map(Nat44UdpReconcilePermit::commit)
     }
 
-    pub fn preflight_reconcile(
-        &self,
+    pub fn preflight_reconcile<'runtime>(
+        &'runtime mut self,
         config: Nat44UdpConfig,
         hash_key: Nat44UdpHashKey,
-    ) -> Result<Nat44UdpReconcilePermit, Nat44UdpReconcileError> {
+    ) -> Result<Nat44UdpReconcilePermit<'runtime, 'a>, Nat44UdpReconcileError> {
         if hash_key == self.hash_key {
             return Err(Nat44UdpReconcileError::HashKeyNotRotated);
         }
@@ -1455,36 +1591,19 @@ impl<'a> Nat44UdpRuntime<'a> {
             return Err(Nat44UdpReconcileError::PortOwnerTableInvalid);
         }
         Ok(Nat44UdpReconcilePermit {
+            runtime: self,
             config,
             hash_key,
-            expected_config: self.config,
-            expected_hash_key: self.hash_key,
             next_runtime_epoch,
-            binding: self.reconcile_binding(),
         })
     }
 
-    /// Applies a permit produced by this runtime without a fallible step.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the permit belongs to a different runtime/publication or was
-    /// made stale by an intervening reconcile.
-    pub fn commit_reconcile(&mut self, permit: Nat44UdpReconcilePermit) -> Nat44UdpReconcileReport {
-        assert_eq!(
-            permit.binding,
-            self.reconcile_binding(),
-            "UDP NAT reconcile permit belongs to a different runtime binding"
-        );
-        assert!(
-            self.publication_binding_matches(permit.expected_config, permit.expected_hash_key),
-            "UDP NAT reconcile permit belongs to a different publication binding"
-        );
-        assert_eq!(
-            Some(permit.next_runtime_epoch),
-            self.runtime_epoch.checked_add(1),
-            "UDP NAT reconcile permit is stale"
-        );
+    fn commit_prevalidated_reconcile(
+        &mut self,
+        config: Nat44UdpConfig,
+        hash_key: Nat44UdpHashKey,
+        next_runtime_epoch: u128,
+    ) -> Nat44UdpReconcileReport {
         let mappings_flushed = self
             .mappings
             .iter()
@@ -1493,39 +1612,29 @@ impl<'a> Nat44UdpRuntime<'a> {
         let peers_flushed = self.peers.iter().filter(|peer| peer.occupied).count();
         self.mappings.fill(Nat44UdpMappingSlot::default());
         self.peers.fill(Nat44UdpPeerSlot::default());
-        self.mapping_directory.clear_with_key(permit.hash_key.0);
-        self.peer_directory.clear_with_key(permit.hash_key.0);
-        self.port_owners
-            .reconfigure_and_clear(
-                permit.config.first_port,
-                permit.config.last_port,
-                self.mappings.len(),
-            )
-            .expect("port owner dimensions were preflighted");
-        self.config = permit.config;
-        self.hash_key = permit.hash_key;
+        self.mapping_directory.clear_with_key(hash_key.0);
+        self.peer_directory.clear_with_key(hash_key.0);
+        self.port_owners.reconfigure_prevalidated_and_clear(
+            config.first_port,
+            config.last_port,
+            self.mappings.len(),
+        );
+        self.config = config;
+        self.hash_key = hash_key;
         self.watermark_ms = None;
         self.next_generation = 1;
-        self.runtime_epoch = permit.next_runtime_epoch;
+        self.runtime_epoch = next_runtime_epoch;
         self.state_revision = 0;
         self.counters.reconciliations = self.counters.reconciliations.saturating_add(1);
-        debug_assert!(self.validate_indexes().is_ok());
         Nat44UdpReconcileReport {
             mappings_flushed,
             peers_flushed,
         }
     }
 
-    fn reconcile_binding(&self) -> [usize; 7] {
-        [
-            self.mappings.as_ptr() as usize,
-            self.peers.as_ptr() as usize,
-            self.mappings.len(),
-            self.peers.len(),
-            self.mapping_directory.bucket_count(),
-            self.peer_directory.bucket_count(),
-            self.port_owners.slot_count(),
-        ]
+    #[allow(dead_code)] // Test/future publication-owner identity; not a permit authority.
+    fn reconcile_binding(&self) -> Nat44UdpReconcileBinding {
+        self.reconcile_binding
     }
 
     pub(crate) fn record_config_mismatch(&mut self) {
@@ -3837,19 +3946,11 @@ mod tests {
             let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
             runtime.commit_outbound(first, 0).unwrap();
             let stale = runtime.plan_inbound_read_only(40_000, REMOTE1, 0).unwrap();
-            let before_mapping = runtime.mappings()[0];
-            let before_peer = runtime.peers()[0];
             let before_counters = runtime.counters();
             let permit = runtime
                 .preflight_reconcile(config, rotated_udp_hash_key())
                 .unwrap();
-            let stale_permit = runtime
-                .preflight_reconcile(config, rotated_udp_hash_key())
-                .unwrap();
-            assert_eq!(runtime.mappings(), &[before_mapping]);
-            assert_eq!(runtime.peers(), &[before_peer]);
-            assert_eq!(runtime.counters(), before_counters);
-            let report = runtime.commit_reconcile(permit);
+            let report = permit.commit();
             assert_eq!(
                 report,
                 Nat44UdpReconcileReport {
@@ -3867,16 +3968,16 @@ mod tests {
             runtime.commit_outbound(recreated, 0).unwrap();
             let before_mapping = runtime.mappings()[0];
             let before_peer = runtime.peers()[0];
-            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                runtime.commit_reconcile(stale_permit);
-            }))
-            .is_err());
             assert_eq!(
                 runtime.commit_inbound(stale, 0),
                 Err(Nat44UdpCommitError::RuntimeEpochChanged)
             );
             assert_eq!(runtime.mappings(), &[before_mapping]);
             assert_eq!(runtime.peers(), &[before_peer]);
+            assert_eq!(
+                before_counters.reconciliations.saturating_add(1),
+                runtime.counters().reconciliations
+            );
             assert_eq!(runtime.validate_indexes(), Ok(()));
             assert!(runtime.publication_binding_matches(config, rotated_udp_hash_key()));
             assert!(!runtime.publication_binding_matches(config, test_udp_hash_key()));
@@ -3884,6 +3985,175 @@ mod tests {
                 runtime.preflight_reconcile(config, rotated_udp_hash_key()),
                 Err(Nat44UdpReconcileError::HashKeyNotRotated)
             ));
+        });
+    }
+
+    #[test]
+    fn runtime_identity_distinguishes_equal_shaped_alternate_backings() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut first_mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut first_peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut first_indexes =
+                TestNat44UdpIndexes::new(config, first_mappings.len(), first_peers.len());
+            let first_binding = {
+                let first_runtime =
+                    first_indexes.runtime(config, &mut first_mappings, &mut first_peers);
+                first_runtime.reconcile_binding()
+            };
+
+            let mut second_mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut second_peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut second_indexes =
+                TestNat44UdpIndexes::new(config, second_mappings.len(), second_peers.len());
+            let second_runtime =
+                second_indexes.runtime(config, &mut second_mappings, &mut second_peers);
+            let second_binding = second_runtime.reconcile_binding();
+            assert_ne!(
+                first_binding.runtime_identity,
+                second_binding.runtime_identity
+            );
+            assert_ne!(first_binding.mappings, second_binding.mappings);
+            assert_ne!(first_binding.peers, second_binding.peers);
+            assert_ne!(
+                first_binding.mapping_buckets,
+                second_binding.mapping_buckets
+            );
+            assert_ne!(first_binding.mapping_nodes, second_binding.mapping_nodes);
+            assert_ne!(first_binding.peer_buckets, second_binding.peer_buckets);
+            assert_ne!(first_binding.peer_nodes, second_binding.peer_nodes);
+            assert_ne!(first_binding.port_owners, second_binding.port_owners);
+        });
+    }
+
+    #[test]
+    fn dropped_and_rejected_reconcile_permits_are_byte_invariant() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let plan = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(plan, 0).unwrap();
+
+            let before_mappings = runtime.mappings().to_vec();
+            let before_peers = runtime.peers().to_vec();
+            let before_config = runtime.config;
+            let before_hash_key = runtime.hash_key;
+            let before_watermark = runtime.watermark_ms;
+            let before_generation = runtime.next_generation;
+            let before_epoch = runtime.runtime_epoch;
+            let before_revision = runtime.state_revision;
+            let before_binding = runtime.reconcile_binding;
+            let before_counters = runtime.counters();
+            let before_mapping_directory = runtime.mapping_directory.backing_snapshot();
+            let before_peer_directory = runtime.peer_directory.backing_snapshot();
+            let before_port_owners = runtime.port_owners.backing_snapshot();
+
+            drop(
+                runtime
+                    .preflight_reconcile(config, rotated_udp_hash_key())
+                    .unwrap(),
+            );
+            assert!(matches!(
+                runtime.preflight_reconcile(config, test_udp_hash_key()),
+                Err(Nat44UdpReconcileError::HashKeyNotRotated)
+            ));
+            with_port_config(
+                Nat44UdpPolicy::default(),
+                40_000,
+                40_002,
+                |oversized_config| {
+                    assert!(matches!(
+                        runtime.preflight_reconcile(oversized_config, rotated_udp_hash_key()),
+                        Err(Nat44UdpReconcileError::PortOwnerTableInvalid)
+                    ));
+                },
+            );
+
+            assert_eq!(runtime.mappings(), before_mappings);
+            assert_eq!(runtime.peers(), before_peers);
+            assert_eq!(runtime.config, before_config);
+            assert_eq!(runtime.hash_key, before_hash_key);
+            assert_eq!(runtime.watermark_ms, before_watermark);
+            assert_eq!(runtime.next_generation, before_generation);
+            assert_eq!(runtime.runtime_epoch, before_epoch);
+            assert_eq!(runtime.state_revision, before_revision);
+            assert!(runtime.reconcile_binding == before_binding);
+            assert_eq!(runtime.counters(), before_counters);
+            assert_eq!(
+                runtime.mapping_directory.backing_snapshot(),
+                before_mapping_directory
+            );
+            assert_eq!(
+                runtime.peer_directory.backing_snapshot(),
+                before_peer_directory
+            );
+            assert_eq!(runtime.port_owners.backing_snapshot(), before_port_owners);
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+    }
+
+    #[test]
+    fn runtime_identity_allocator_never_wraps_or_recovers_after_exhaustion() {
+        let identities = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(
+            allocate_udp_runtime_identity_from(&identities),
+            Ok(u64::MAX - 1)
+        );
+        assert_eq!(identities.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(
+            allocate_udp_runtime_identity_from(&identities),
+            Err(Nat44UdpRuntimeConfigError::RuntimeIdentityExhausted)
+        );
+        assert_eq!(
+            allocate_udp_runtime_identity_from(&identities),
+            Err(Nat44UdpRuntimeConfigError::RuntimeIdentityExhausted)
+        );
+        assert_eq!(identities.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn zero_capacity_same_backing_uses_a_fresh_runtime_identity() {
+        with_port_config(Nat44UdpPolicy::default(), 40_000, 40_000, |config| {
+            let mut mappings = [];
+            let mut peers = [];
+            let mut indexes = TestNat44UdpIndexes::new(config, 0, 0);
+            let first_binding = {
+                let first_runtime = indexes.runtime(config, &mut mappings, &mut peers);
+                first_runtime.reconcile_binding()
+            };
+
+            let mut replacement = indexes.runtime(config, &mut mappings, &mut peers);
+            let replacement_binding = replacement.reconcile_binding();
+            assert_ne!(
+                first_binding.runtime_identity,
+                replacement_binding.runtime_identity
+            );
+            assert_eq!(first_binding.mappings, replacement_binding.mappings);
+            assert_eq!(first_binding.peers, replacement_binding.peers);
+            assert_eq!(
+                first_binding.mapping_buckets,
+                replacement_binding.mapping_buckets
+            );
+            assert_eq!(
+                first_binding.mapping_nodes,
+                replacement_binding.mapping_nodes
+            );
+            assert_eq!(first_binding.peer_buckets, replacement_binding.peer_buckets);
+            assert_eq!(first_binding.peer_nodes, replacement_binding.peer_nodes);
+            assert_eq!(first_binding.port_owners, replacement_binding.port_owners);
+            assert_eq!(
+                replacement
+                    .preflight_reconcile(config, rotated_udp_hash_key())
+                    .unwrap()
+                    .commit(),
+                Nat44UdpReconcileReport {
+                    mappings_flushed: 0,
+                    peers_flushed: 0,
+                }
+            );
+            assert!(replacement.publication_binding_matches(config, rotated_udp_hash_key()));
+            assert_eq!(replacement.validate_indexes(), Ok(()));
         });
     }
 
@@ -4013,12 +4283,39 @@ mod tests {
             assert_eq!(runtime.validate_indexes(), Ok(()));
 
             runtime.runtime_epoch = u128::MAX;
+            let before_config = runtime.config;
+            let before_hash_key = runtime.hash_key;
+            let before_watermark = runtime.watermark_ms;
+            let before_generation = runtime.next_generation;
+            let before_revision = runtime.state_revision;
+            let before_binding = runtime.reconcile_binding;
+            let before_counters = runtime.counters();
+            let before_mapping_directory = runtime.mapping_directory.backing_snapshot();
+            let before_peer_directory = runtime.peer_directory.backing_snapshot();
+            let before_port_owners = runtime.port_owners.backing_snapshot();
             assert_eq!(
                 runtime.reconcile(config, rotated_udp_hash_key()),
                 Err(Nat44UdpReconcileError::RuntimeEpochExhausted)
             );
             assert_eq!(runtime.mappings(), &[before_mapping]);
             assert_eq!(runtime.peers(), &[before_peer]);
+            assert_eq!(runtime.config, before_config);
+            assert_eq!(runtime.hash_key, before_hash_key);
+            assert_eq!(runtime.watermark_ms, before_watermark);
+            assert_eq!(runtime.next_generation, before_generation);
+            assert_eq!(runtime.runtime_epoch, u128::MAX);
+            assert_eq!(runtime.state_revision, before_revision);
+            assert!(runtime.reconcile_binding == before_binding);
+            assert_eq!(runtime.counters(), before_counters);
+            assert_eq!(
+                runtime.mapping_directory.backing_snapshot(),
+                before_mapping_directory
+            );
+            assert_eq!(
+                runtime.peer_directory.backing_snapshot(),
+                before_peer_directory
+            );
+            assert_eq!(runtime.port_owners.backing_snapshot(), before_port_owners);
         });
     }
 

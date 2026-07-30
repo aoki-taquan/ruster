@@ -209,6 +209,11 @@ impl<'a> FixedDirectory<'a> {
         self.buckets.len()
     }
 
+    #[cfg(test)]
+    pub(crate) fn backing_snapshot(&self) -> (Vec<DirectoryBucket>, Vec<DirectoryNode>) {
+        (self.buckets.to_vec(), self.nodes.to_vec())
+    }
+
     pub(crate) fn clear(&mut self) {
         self.buckets.fill(DirectoryBucket::default());
         self.nodes.fill(DirectoryNode::default());
@@ -898,27 +903,21 @@ impl<'a> PortOwnerTable<'a> {
         self.slots.len()
     }
 
-    pub(crate) fn reconfigure(
+    #[cfg(test)]
+    pub(crate) fn backing_snapshot(&self) -> Vec<PortOwnerSlot> {
+        self.slots.to_vec()
+    }
+
+    pub(crate) fn reconfigure_prevalidated_and_clear(
         &mut self,
         first_port: u16,
         last_port: u16,
         state_capacity: usize,
-    ) -> Result<(), PortOwnerConfigError> {
-        validate_port_owner_dimensions(self.slots.len(), first_port, last_port, state_capacity)?;
+    ) {
         self.clear();
         self.first_port = first_port;
         self.last_port = last_port;
         self.state_capacity = state_capacity;
-        Ok(())
-    }
-
-    pub(crate) fn reconfigure_and_clear(
-        &mut self,
-        first_port: u16,
-        last_port: u16,
-        state_capacity: usize,
-    ) -> Result<(), PortOwnerConfigError> {
-        self.reconfigure(first_port, last_port, state_capacity)
     }
 
     pub(crate) fn owner(&self, port: u16) -> Result<Option<PortOwnerToken>, PortOwnerError> {
