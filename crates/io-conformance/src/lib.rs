@@ -1412,5 +1412,9 @@ pub mod generated {
     }
 }
 
+pub mod rx_copy;
+
+#[cfg(test)]
+mod copy_fake_tests;
 #[cfg(test)]
 mod finite_fake_tests;
