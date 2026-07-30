@@ -12,9 +12,9 @@ use ruster_core::{
     GeneratedIcmpv4TraceSink, GeneratedTraceSink, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy,
     Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
     MacAddress, MonotonicMillis, Nat44TcpConfig, Nat44TcpPolicy, Nat44UdpConfig, Nat44UdpPolicy,
-    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionFailureTrace,
-    ResolutionFailureTraceSink, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot,
-    ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent, TraceSink,
+    PublicationQuiescenceGuard, ResolutionActionSlot, ResolutionFailureHoldSlot,
+    ResolutionFailureTrace, ResolutionFailureTraceSink, ResolutionPolicy, ResolutionRuntime,
+    ResolutionStateSlot, ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent, TraceSink,
 };
 use ruster_io_sim::SimIo;
 use ruster_runtime::{
@@ -69,11 +69,15 @@ struct Publication<'view, 'storage> {
     firewall_config: FirewallConfig<'storage>,
 }
 
-impl<'view, 'storage> FullServicePublication<'storage> for Publication<'view, 'storage> {
+impl<'view, 'storage> FullServicePublication<'storage, SimIo> for Publication<'view, 'storage> {
     type Candidate = ();
     type Reject = ();
 
-    fn publish_candidate(&mut self, _candidate: Self::Candidate) -> Result<(), Self::Reject> {
+    fn publish_candidate(
+        &mut self,
+        _candidate: Self::Candidate,
+        _quiescence: PublicationQuiescenceGuard<'_, SimIo>,
+    ) -> Result<(), Self::Reject> {
         self.semantic_validation_calls += 1;
         self.fingerprint_calls += 1;
         self.hash_calls += 1;

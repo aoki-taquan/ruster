@@ -2,6 +2,139 @@ use std::{marker::PhantomData, rc::Rc};
 
 use crate::{DropReason, IfId};
 
+mod quiescence_guard_sealed {
+    pub trait Sealed {}
+}
+
+/// Sealed witness implemented only by core's exact backend-borrowing guard.
+///
+/// This bound prevents a [`PublicationQuiescence`] implementation from using
+/// a boolean, counter, or unrelated token as its publication proof.
+#[doc(hidden)]
+pub trait PublicationQuiescenceWitness: quiescence_guard_sealed::Sealed {
+    type Backend;
+}
+
+/// Exclusive, worker-local proof that one exact backend is quiescent.
+///
+/// The guard deliberately exposes no backend operations. Holding it only
+/// preserves the exclusive borrow until a publication attempt returns.
+/// `Rc` in the marker keeps the proof `!Send + !Sync`, and the type is neither
+/// `Copy`, `Clone`, nor `Debug`.
+///
+/// ```compile_fail
+/// use ruster_core::PublicationQuiescenceGuard;
+///
+/// fn require_send<T: Send>() {}
+/// require_send::<PublicationQuiescenceGuard<'static, Backend>>();
+/// # struct Backend;
+/// ```
+///
+/// ```compile_fail
+/// use ruster_core::PublicationQuiescenceGuard;
+///
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<PublicationQuiescenceGuard<'static, Backend>>();
+/// # struct Backend;
+/// ```
+///
+/// ```compile_fail
+/// use ruster_core::PublicationQuiescenceGuard;
+///
+/// fn clone_guard(guard: PublicationQuiescenceGuard<'_, Backend>) {
+///     let _copy = guard.clone();
+/// }
+/// # struct Backend;
+/// ```
+///
+/// ```compile_fail
+/// use std::fmt::Debug;
+/// use ruster_core::PublicationQuiescenceGuard;
+///
+/// fn require_debug<T: Debug>() {}
+/// require_debug::<PublicationQuiescenceGuard<'static, Backend>>();
+/// # struct Backend;
+/// ```
+#[must_use = "dropping the guard releases the backend for packet I/O"]
+pub struct PublicationQuiescenceGuard<'backend, Backend> {
+    _backend: &'backend mut Backend,
+    _worker_local: PhantomData<Rc<()>>,
+}
+
+impl<'backend, Backend> PublicationQuiescenceGuard<'backend, Backend> {
+    /// Constructs a guard after the backend has checked all of its
+    /// authoritative outstanding-ownership state.
+    ///
+    /// This constructor does not perform the check itself. It is intended for
+    /// [`PublicationQuiescence::try_publication_quiescence`]
+    /// implementations after their bounded check succeeds.
+    pub fn new(backend: &'backend mut Backend) -> Self {
+        Self {
+            _backend: backend,
+            _worker_local: PhantomData,
+        }
+    }
+}
+
+impl<Backend> quiescence_guard_sealed::Sealed for PublicationQuiescenceGuard<'_, Backend> {}
+
+impl<Backend> PublicationQuiescenceWitness for PublicationQuiescenceGuard<'_, Backend> {
+    type Backend = Backend;
+}
+
+/// Backend-authoritative publication quiescence boundary.
+///
+/// Implementations must inspect only bounded backend-owned state and return a
+/// typed error while an RX/generated batch is unfinished, a leased slot has
+/// not reached a terminal action, or accepted TX still embeds authority from
+/// the active publication. Success returns core's sealed guard, which borrows
+/// that exact backend exclusively. Implementing this trait does not by itself
+/// claim an AF_XDP completion-queue drain; each backend must define and prove
+/// its own authoritative completion boundary.
+///
+/// A scalar cannot be substituted for the exact borrow:
+///
+/// ```compile_fail
+/// use ruster_core::PublicationQuiescence;
+///
+/// struct Backend;
+///
+/// impl PublicationQuiescence for Backend {
+///     type Error = ();
+///     type Guard<'a> = bool;
+///
+///     fn try_publication_quiescence(&mut self) -> Result<Self::Guard<'_>, ()> {
+///         Ok(true)
+///     }
+/// }
+/// ```
+///
+/// A guard for another backend is rejected too:
+///
+/// ```compile_fail
+/// use ruster_core::{PublicationQuiescence, PublicationQuiescenceGuard};
+///
+/// struct Backend;
+/// struct OtherBackend;
+///
+/// impl PublicationQuiescence for Backend {
+///     type Error = ();
+///     type Guard<'a> = PublicationQuiescenceGuard<'a, OtherBackend>;
+///
+///     fn try_publication_quiescence(&mut self) -> Result<Self::Guard<'_>, ()> {
+///         unreachable!()
+///     }
+/// }
+/// ```
+pub trait PublicationQuiescence: Sized {
+    type Error;
+    type Guard<'backend>: PublicationQuiescenceWitness<Backend = Self>
+    where
+        Self: 'backend;
+
+    fn try_publication_quiescence(&mut self) -> Result<Self::Guard<'_>, Self::Error>;
+}
+
 pub trait PacketIo {
     type Error;
     type Batch<'a>: PacketBatch<Error = Self::Error>
