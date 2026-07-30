@@ -11,10 +11,39 @@ use crate::{
         XDP_UMEM_TX_SW_CSUM, XDP_UMEM_UNALIGNED_CHUNK_FLAG, XDP_USE_NEED_WAKEUP, XDP_USE_SG,
         XDP_ZEROCOPY,
     },
-    ensure_supported, validate_descriptor_options, AbiLayoutError, BindMode, ConfigError,
-    RingConfig, RingEntries, RingField, RingName, UmemConfig, ValidatedBindFlags,
+    ensure_supported, validate_descriptor_options, AbiLayoutError, BindMode, CompletionConsumer,
+    ConfigError, FillProducer, NativeRingError, NeedWakeup, RingConfig, RingEntries, RingField,
+    RingMapError, RingName, RxConsumer, TxProducer, UmemConfig, ValidatedBindFlags,
     MIN_VISIBLE_FRAME_CAPACITY, SUPPORTED_ALIGNED_CHUNK_SIZES, XDP_PACKET_HEADROOM,
 };
+
+const TEST_RING_OFFSETS: XdpRingOffset = XdpRingOffset {
+    producer: 0,
+    consumer: 64,
+    flags: 128,
+    descriptors: 192,
+};
+
+#[repr(align(64))]
+struct AlignedRingMemory([u8; 256]);
+
+impl AlignedRingMemory {
+    const fn zeroed() -> Self {
+        Self([0; 256])
+    }
+}
+
+fn write_u32(memory: &mut [u8], offset: usize, value: u32) {
+    memory[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn read_u32(memory: &[u8], offset: usize) -> u32 {
+    u32::from_ne_bytes(
+        memory[offset..offset + size_of::<u32>()]
+            .try_into()
+            .expect("four bytes"),
+    )
+}
 
 #[test]
 fn native_abi_matches_linux_v6_8_uapi_layout() {
@@ -324,4 +353,242 @@ fn native_platform_support_is_typed() {
         ensure_supported(),
         Err(crate::PlatformError::UnsupportedPointerWidth)
     );
+}
+
+#[test]
+fn native_ring_mapping_rejects_invalid_borrowed_memory() {
+    let entries = RingEntries::new(RingName::Fill, 4).expect("capacity");
+    let mut short = AlignedRingMemory::zeroed();
+    assert!(matches!(
+        FillProducer::new(&mut short.0[..223], TEST_RING_OFFSETS, entries),
+        Err(RingMapError::MappingTooShort {
+            required: 224,
+            actual: 223,
+        })
+    ));
+
+    let mut shifted = AlignedRingMemory::zeroed();
+    assert!(matches!(
+        FillProducer::new(&mut shifted.0[1..], TEST_RING_OFFSETS, entries),
+        Err(RingMapError::MisalignedFieldAddress {
+            field: RingField::Producer,
+            alignment: 4,
+            ..
+        })
+    ));
+
+    let mut corrupt = AlignedRingMemory::zeroed();
+    assert_eq!(
+        FillProducer::new(
+            &mut corrupt.0,
+            XdpRingOffset {
+                consumer: 0,
+                ..TEST_RING_OFFSETS
+            },
+            entries,
+        )
+        .err(),
+        Some(RingMapError::Layout(AbiLayoutError::OverlappingFields {
+            first: RingField::Producer,
+            second: RingField::Consumer,
+        }))
+    );
+    assert_eq!(
+        FillProducer::new(
+            &mut corrupt.0,
+            XdpRingOffset {
+                producer: 2,
+                ..TEST_RING_OFFSETS
+            },
+            entries,
+        )
+        .err(),
+        Some(RingMapError::Layout(AbiLayoutError::MisalignedOffset {
+            field: RingField::Producer,
+            offset: 2,
+            alignment: 4,
+        }))
+    );
+
+    let descriptors_past_mapping = XdpRingOffset {
+        descriptors: 248,
+        ..TEST_RING_OFFSETS
+    };
+    assert_eq!(
+        FillProducer::new(&mut corrupt.0, descriptors_past_mapping, entries).err(),
+        Some(RingMapError::MappingTooShort {
+            required: 280,
+            actual: 256,
+        })
+    );
+}
+
+#[test]
+fn native_u64_roles_wrap_and_enforce_full_empty() {
+    let entries = RingEntries::new(RingName::Fill, 4).expect("capacity");
+    let mut memory = AlignedRingMemory::zeroed();
+    write_u32(&mut memory.0, 0, u32::MAX - 1);
+    write_u32(&mut memory.0, 64, u32::MAX - 1);
+    write_u32(&mut memory.0, 128, XDP_RING_NEED_WAKEUP);
+
+    {
+        let mut fill =
+            FillProducer::new(&mut memory.0, TEST_RING_OFFSETS, entries).expect("Fill view");
+        assert_eq!(fill.capacity(), 4);
+        let mut reservation = fill.reserve(4).expect("whole ring");
+        for address in [10, 11, 12, 13] {
+            reservation.write(address).expect("sequential address");
+        }
+        let publication = reservation.release_submit().expect("complete publish");
+        assert_eq!(publication.need_wakeup(), Ok(NeedWakeup::Required));
+    }
+    assert_eq!(read_u32(&memory.0, 0), 2);
+
+    {
+        let mut fill =
+            FillProducer::new(&mut memory.0, TEST_RING_OFFSETS, entries).expect("Fill view");
+        assert_eq!(fill.reserve(1).err(), Some(NativeRingError::RingFull));
+    }
+    {
+        let mut completion =
+            CompletionConsumer::new(&mut memory.0, TEST_RING_OFFSETS, entries).expect("CQ view");
+        assert_eq!(completion.capacity(), 4);
+        let mut acquisition = completion.acquire(4).expect("wrapped entries");
+        assert_eq!(acquisition.read(), Ok(10));
+        assert_eq!(acquisition.read(), Ok(11));
+        assert_eq!(acquisition.read(), Ok(12));
+        assert_eq!(acquisition.read(), Ok(13));
+        assert_eq!(acquisition.read(), Err(NativeRingError::RangeExhausted));
+        acquisition.release_consume().expect("complete consume");
+    }
+    assert_eq!(read_u32(&memory.0, 64), 2);
+    let mut completion =
+        CompletionConsumer::new(&mut memory.0, TEST_RING_OFFSETS, entries).expect("CQ view");
+    assert_eq!(
+        completion.acquire(1).err(),
+        Some(NativeRingError::RingEmpty)
+    );
+}
+
+#[test]
+fn native_reservation_cancel_and_incomplete_submit_are_invisible() {
+    let entries = RingEntries::new(RingName::Fill, 4).expect("capacity");
+    let mut memory = AlignedRingMemory::zeroed();
+    {
+        let mut fill =
+            FillProducer::new(&mut memory.0, TEST_RING_OFFSETS, entries).expect("Fill view");
+        let mut incomplete = fill.reserve(2).expect("reserve two");
+        incomplete.write(41).expect("first only");
+        assert_eq!(
+            incomplete.release_submit(),
+            Err(NativeRingError::IncompleteReservation {
+                reserved: 2,
+                written: 1,
+            })
+        );
+
+        let mut cancelled = fill.reserve(2).expect("same unpublished range");
+        cancelled.write(42).expect("first");
+        cancelled.write(43).expect("second");
+        cancelled.release_cancel();
+    }
+    assert_eq!(read_u32(&memory.0, 0), 0);
+
+    let mut completion =
+        CompletionConsumer::new(&mut memory.0, TEST_RING_OFFSETS, entries).expect("CQ view");
+    assert_eq!(
+        completion.acquire(1).err(),
+        Some(NativeRingError::RingEmpty)
+    );
+}
+
+#[test]
+fn native_descriptor_memory_order_visibility_is_exact() {
+    let entries = RingEntries::new(RingName::Tx, 4).expect("capacity");
+    let first = XdpDescriptor {
+        address: 2_304,
+        len: 64,
+        options: 0,
+    };
+    let second = XdpDescriptor {
+        address: 4_352,
+        len: 128,
+        options: 0,
+    };
+    let mut memory = AlignedRingMemory::zeroed();
+
+    {
+        let mut tx = TxProducer::new(&mut memory.0, TEST_RING_OFFSETS, entries).expect("TX view");
+        let mut reservation = tx.reserve(2).expect("reserve");
+        reservation.write(first).expect("first");
+        reservation.write(second).expect("second");
+        let publication = reservation.release_submit().expect("Release producer");
+        assert_eq!(publication.need_wakeup(), Ok(NeedWakeup::NotRequired));
+    }
+    assert_eq!(read_u32(&memory.0, 0), 2);
+
+    {
+        let mut rx = RxConsumer::new(&mut memory.0, TEST_RING_OFFSETS, entries).expect("RX view");
+        let mut incomplete = rx.acquire(2).expect("Acquire producer");
+        assert_eq!(incomplete.read(), Ok(first));
+        assert_eq!(
+            incomplete.release_consume(),
+            Err(NativeRingError::IncompleteAcquisition {
+                acquired: 2,
+                read: 1,
+            })
+        );
+    }
+    assert_eq!(read_u32(&memory.0, 64), 0);
+
+    {
+        let mut rx = RxConsumer::new(&mut memory.0, TEST_RING_OFFSETS, entries).expect("RX view");
+        assert_eq!(rx.capacity(), 4);
+        let mut acquisition = rx.acquire(2).expect("reacquire");
+        assert_eq!(acquisition.read(), Ok(first));
+        assert_eq!(acquisition.read(), Ok(second));
+        acquisition.release_consume().expect("Release consumer");
+    }
+    assert_eq!(read_u32(&memory.0, 64), 2);
+}
+
+#[test]
+fn native_need_wakeup_is_checked_after_release_publication() {
+    let entries = RingEntries::new(RingName::Fill, 4).expect("capacity");
+    let mut memory = AlignedRingMemory::zeroed();
+    write_u32(&mut memory.0, 128, XDP_RING_NEED_WAKEUP | 2);
+
+    let observation = {
+        let mut fill =
+            FillProducer::new(&mut memory.0, TEST_RING_OFFSETS, entries).expect("Fill view");
+        let mut reservation = fill.reserve(1).expect("reserve");
+        reservation.write(99).expect("descriptor first");
+        reservation.release_submit().expect("producer publication")
+    };
+    assert_eq!(read_u32(&memory.0, 0), 1);
+    assert_eq!(
+        observation.need_wakeup(),
+        Err(NativeRingError::UnsupportedRingFlags(2))
+    );
+}
+
+#[test]
+fn native_corrupt_cursor_is_typed_and_atomic() {
+    let entries = RingEntries::new(RingName::Fill, 4).expect("capacity");
+    let mut memory = AlignedRingMemory::zeroed();
+    write_u32(&mut memory.0, 0, 5);
+    {
+        let mut fill =
+            FillProducer::new(&mut memory.0, TEST_RING_OFFSETS, entries).expect("Fill view");
+        assert_eq!(
+            fill.reserve(1).err(),
+            Some(NativeRingError::CorruptCursor {
+                producer: 5,
+                consumer: 0,
+                capacity: 4,
+            })
+        );
+    }
+    assert_eq!(read_u32(&memory.0, 0), 5);
+    assert_eq!(read_u32(&memory.0, 64), 0);
 }

@@ -908,14 +908,14 @@ frame partition conservationを検証します。fakeのhot operationは四ring�
 fakeはengine、`PacketIo` adapter、socket、FFI、XDP attach、wakeup/pollを実装せず、
 token/domain constructorもX00A ledger/control-plane境界から移しません。
 
-### native AF_XDP ABI scaffold
+### native AF_XDP ABI and borrowed ring scaffold
 
-`ruster-io-xdp-native`の最初のsliceは、Linux v6.8
+`ruster-io-xdp-native`のC0 sliceは、Linux v6.8
 `include/uapi/linux/if_xdp.h`を明示profileとして、将来のnative resource取得より前に必要な
 C layoutとcold validationだけを固定します。`sockaddr_xdp`、ring offset/mmap offsets、
 UMEM registration、statistics、negotiated options、RX/TX descriptorのsize、alignment、
 field offsetとsocket option/mmap offset定数をdependencyなしの`repr(C)`型として保持します。
-このsliceはFFI call、socket、mmap、pointer access、libxdp linkを一切行わず、crate全体で
+C0のABI/config moduleはFFI call、socket、mmap、pointer access、libxdp linkを行わず、
 `unsafe`をdenyします。従ってnative backend、実kernel互換、packet送受信、zero-copy性能は
 まだ主張しません。
 
@@ -935,3 +935,33 @@ descriptor領域のalignment、checked extent、process `usize`変換、相互�
 minimum mmap byte lengthへ変換します。この計算はmemoryをaccessせず、offset overflowや
 aliasするlayoutをtyped errorにします。native syscall層は64-bit Linuxだけを対象とし、
 non-Linuxと未reviewのpointer widthはresource取得前のtyped unsupportedです。
+
+C1 sliceはOS mappingを作成せず、caller-owned `&mut [u8]`をmapping lifetime全体で
+排他的にborrowします。C0 layout検証後にactual base addressを加え、minimum extentと
+producer/consumer/flags/descriptorの実address alignmentを再検証します。public raw pointer
+constructorはなく、kernel-mutated memoryへのreferenceもAPIから返しません。pointer、
+`AtomicU32`、volatile descriptor accessはprivateな`native_unsafe/mmap.rs`と
+`native_unsafe/ring_mem.rs`だけに閉じ、各unsafe blockはchecked extent、alignment、
+value validity、SPSC ownershipの根拠を記載します。
+
+application-owned roleは`FillProducer<u64>`相当、`TxProducer<XdpDescriptor>`相当、
+`RxConsumer<XdpDescriptor>`相当、`CompletionConsumer<u64>`相当の四つを別のpublic typeで
+表します。実際の型はelement parameterを公開せず、foreign elementのwriteをcompile時に
+拒否します。producer reservationとconsumer acquisitionはring viewを排他的にborrowし、
+heap allocation、shared `Mutex`、packet clone、packet単位`String`、`dyn PacketIo`を
+導入しません。範囲内を順番にwrite/readするためbitmapも不要です。
+
+cursorはpower-of-two capacityとwrapping `u32`差分でexact full/emptyを判定し、差分が
+capacityを超えればcorrupt cursorとしてcursor不変でrejectします。producerはconsumerを
+Acquire loadし、全descriptorをvolatile writeした後だけproducerをRelease storeします。
+Drop、明示cancel、incomplete submitはproducer cursorを変更せず、未publishの古いslot byteは
+kernelから不可視です。consumerはproducerをAcquire loadしてからdescriptorをcopy readし、
+全rangeをreadした後だけconsumerをRelease storeします。Drop、cancel、incomplete consumeは
+consumer cursor不変です。kernel-mutated descriptorへのlong-lived referenceは生成しません。
+
+producer publication直後にflagsをAcquire loadし、Linux v6.8の
+`XDP_RING_NEED_WAKEUP`以外をtyped unsupportedとして返します。flag errorを返す時点でも
+descriptorとproducer cursorは既にpublish済みであり、rollbackを意味しません。この順序により
+callerはpublication前の古いneed-wakeup観測をkick判断に利用しません。socket fd、ring/UMEMの
+OS mmap、UMEM registration、bind、poll/sendto kick、libxdp attach、core `PacketIo` adapterは
+後続sliceです。
