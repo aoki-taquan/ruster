@@ -3,6 +3,10 @@
 
 mod checksum;
 mod firewall;
+// N2 lands crate-private before N3/N4 NAT runtime integration. The temporary
+// allowance is scoped to that staged rollout and is removed when it is wired.
+#[allow(dead_code)]
+mod fixed_directory;
 mod forwarding;
 mod generated;
 mod icmpv4_error;
