@@ -44,7 +44,11 @@ impl OwnershipGeneration {
 /// cross ring-model state boundaries without allocation; copying one does not
 /// duplicate ownership. After the first valid transition, another copy is
 /// rejected by the exact state/generation check.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+///
+/// `FrameToken` intentionally does not implement [`std::hash::Hash`]. Its
+/// equality includes a hidden domain, and exposing that domain to a
+/// caller-controlled hasher would let an untrusted token holder recreate it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameToken {
     domain: DomainIdentity,
     frame: FrameId,

@@ -1,4 +1,4 @@
-use std::num::NonZeroU64;
+use std::{marker::PhantomData, num::NonZeroU64, rc::Rc};
 
 use crate::{
     domain::DomainIdentity, FrameId, FrameToken, OwnershipGeneration, UmemLayout,
@@ -194,13 +194,17 @@ impl FrameStateView {
 /// Fixed-size ownership ledger for one UMEM frame set.
 ///
 /// Hot transitions index one entry and update two counters. [`Self::deep_audit`]
-/// is the explicit cold path that scans the complete ledger.
+/// is the explicit cold path that scans the complete ledger. The ledger is
+/// deliberately `!Send + !Sync`: one worker owns its complete frame partition.
+/// A later native engine must preserve that locality or add an explicit
+/// ownership handoff outside this model.
 #[derive(Debug)]
 pub struct FrameLedger {
     layout: UmemLayout,
     entries: Box<[FrameEntry]>,
     counts: StateCounts,
     authority: TokenAuthority,
+    worker_local: PhantomData<Rc<()>>,
 }
 
 impl FrameLedger {
@@ -227,6 +231,7 @@ impl FrameLedger {
             entries,
             counts: StateCounts::new(count),
             authority: TokenAuthority::new(domain),
+            worker_local: PhantomData,
         })
     }
 

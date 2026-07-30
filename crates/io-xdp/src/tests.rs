@@ -1,4 +1,8 @@
-use std::num::NonZeroU128;
+use std::{
+    hash::{Hash, Hasher},
+    marker::PhantomData,
+    num::NonZeroU128,
+};
 
 use crate::{
     DescriptorError, FrameLedger, FrameStateKind, LayoutError, RawDescriptor, UmemDomainId,
@@ -283,6 +287,9 @@ fn new_domain_prevents_token_aba_across_ledger_recreation() {
     replacement
         .publish_fill(current)
         .expect("new domain token remains valid");
+    replacement
+        .deep_audit()
+        .expect("foreign rejection preserved replacement");
 }
 
 #[test]
@@ -309,6 +316,62 @@ fn domain_identity_is_redacted_from_debug_output() {
     let rendered = format!("{ledger:?}");
     assert!(rendered.contains("<redacted>"));
     assert!(!rendered.contains(&layout_unique.to_string()));
+}
+
+#[test]
+fn frame_token_has_no_hash_domain_extraction_surface() {
+    struct TraitProbe<T: ?Sized>(PhantomData<T>);
+    trait AmbiguousIfHash<Marker> {
+        fn probe() {}
+    }
+    impl<T: ?Sized> AmbiguousIfHash<()> for TraitProbe<T> {}
+    impl<T: ?Sized + Hash> AmbiguousIfHash<u8> for TraitProbe<T> {}
+
+    let _ = <TraitProbe<crate::FrameToken> as AmbiguousIfHash<_>>::probe;
+    let _ = <TraitProbe<crate::domain::DomainIdentity> as AmbiguousIfHash<_>>::probe;
+
+    #[derive(Default)]
+    struct ExtractU128 {
+        extracted: Option<u128>,
+    }
+
+    impl Hasher for ExtractU128 {
+        fn finish(&self) -> u64 {
+            0
+        }
+
+        fn write(&mut self, _bytes: &[u8]) {}
+
+        fn write_u128(&mut self, value: u128) {
+            self.extracted = Some(value);
+        }
+    }
+
+    let mut ledger = ledger(16, 1);
+    let token = ledger.reserve_fill(0).expect("token");
+    let mut extractor = ExtractU128::default();
+    token.frame().hash(&mut extractor);
+    token.generation().hash(&mut extractor);
+    assert_eq!(extractor.extracted, None);
+}
+
+#[test]
+fn frame_ledger_is_not_send_or_sync() {
+    struct TraitProbe<T: ?Sized>(PhantomData<T>);
+    trait AmbiguousIfSend<Marker> {
+        fn probe() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for TraitProbe<T> {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for TraitProbe<T> {}
+
+    trait AmbiguousIfSync<Marker> {
+        fn probe() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSync<()> for TraitProbe<T> {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<u8> for TraitProbe<T> {}
+
+    let _ = <TraitProbe<FrameLedger> as AmbiguousIfSend<_>>::probe;
+    let _ = <TraitProbe<FrameLedger> as AmbiguousIfSync<_>>::probe;
 }
 
 fn assert_state_and_partition(ledger: &FrameLedger, frame: u32, state: FrameStateKind) {

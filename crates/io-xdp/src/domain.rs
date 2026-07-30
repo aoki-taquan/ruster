@@ -8,7 +8,9 @@ use std::{fmt, num::NonZeroU128};
 ///
 /// This type is move-only so one identity cannot accidentally initialize two
 /// layouts. A caller can still repeat the numeric input, so persistence and
-/// uniqueness across restarts remain a control-plane responsibility.
+/// uniqueness across restarts remain a trusted control-plane responsibility.
+/// The identity is not a secret from that constructor caller; the opacity
+/// boundary prevents a downstream token holder from recovering it.
 pub struct UmemDomainId(DomainIdentity);
 
 impl UmemDomainId {
@@ -29,7 +31,9 @@ impl fmt::Debug for UmemDomainId {
     }
 }
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+// Deliberately not Hash: feeding the value to a caller-controlled Hasher would
+// expose the opaque u128 domain through Hasher::write_u128.
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct DomainIdentity(NonZeroU128);
 
 impl fmt::Debug for DomainIdentity {

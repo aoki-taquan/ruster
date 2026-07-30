@@ -742,6 +742,10 @@ move-onlyな`UmemDomainId`としてlayoutへ渡します。この値はpointer�
 recreate後に再利用してはなりません。layoutはledgerへconsumeされ、domainをin-place
 reconcileするAPIは持ちません。UMEMまたはledgerを作り直す場合は必ず新domainで全frameを
 Free/generation zeroから作り、旧token/descriptorをforeign domainとして拒否します。
+unique inputを知るconstructor callerはtrusted control-plane境界で、token consumerには値を
+公開しません。`FrameToken`と内部domain identityは`Hash`を実装しません。domainを
+caller-controlled `Hasher`へ渡さないため、token holderはHash経由で値を回収して
+`UmemDomainId`を再構成できません。
 
 各frameはledgerだけが発行できる
 `(hidden UMEM domain, FrameId, NonZeroU64 generation)` tokenで一ownership cycleを識別します。
@@ -758,3 +762,7 @@ exact partitionを持ちます。通常遷移はframe indexによるO(1) lookup�
 だけです。全entry、domain、token identity、generation、descriptor、counterを再計算する
 `deep_audit`は明示的なcold pathです。stale token、wrong-state token、tokenと異なるframeへ
 canonicalizeされたdescriptorもentryとcounterを変更せずtyped errorで拒否します。
+
+ledgerはUMEMの全frame partitionを一workerが所有するため`!Send + !Sync`です。このpure modelは
+live byte sliceをまだ貸し出しませんが、将来のring/native engineも同じworker localityを維持
+するか、別設計の明示的ownership handoffを追加しなければなりません。
