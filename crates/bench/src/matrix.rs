@@ -5,13 +5,14 @@ use std::time::{Duration, Instant};
 use ruster_core::{
     forward_batch, forward_batch_with_firewall, forward_batch_with_nat44_tcp,
     forward_batch_with_nat44_udp, forward_batch_with_nat44_udp_and_tcp_and_firewall,
-    ipv4_header_checksum, validate_ipv4_frame, BatchReport, FirewallAction, FirewallConfig,
-    FirewallHashKey, FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange,
-    FirewallProtocol, FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot,
-    ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
-    MonotonicMillis, Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime,
-    Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
-    Nat44UdpRuntime, Neighbor, NoTrace, PacketIo, ResolutionActionSlot, ResolutionPolicy,
+    ipv4_header_checksum, validate_ipv4_frame, BatchReport, DirectoryBucket, DirectoryNode,
+    FirewallAction, FirewallConfig, FirewallHashKey, FirewallInterface, FirewallIpv4Prefix,
+    FirewallPolicy, FirewallPortRange, FirewallProtocol, FirewallRule, FirewallRuleId,
+    FirewallRuntime, FirewallStateSlot, ForwardingSnapshot, IfId, Interface, Ipv4Address,
+    LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44TcpConfig, Nat44TcpMappingSlot,
+    Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpHashKey,
+    Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime,
+    Neighbor, NoTrace, PacketIo, PortOwnerSlot, ResolutionActionSlot, ResolutionPolicy,
     ResolutionRuntime, ResolutionStateSlot, Route,
 };
 
@@ -38,6 +39,41 @@ const GATEWAY: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 1]);
 const HOST_PORT: u16 = 40_000;
 const REMOTE_PORT: u16 = 443;
 const NOW: MonotonicMillis = MonotonicMillis(1_000);
+
+#[derive(Default)]
+struct UdpBenchIndexes {
+    mapping_buckets: [DirectoryBucket; 4],
+    mapping_nodes: [DirectoryNode; 4],
+    peer_buckets: [DirectoryBucket; 4],
+    peer_nodes: [DirectoryNode; 4],
+    port_owners: [PortOwnerSlot; 1],
+}
+
+impl UdpBenchIndexes {
+    fn runtime<'a>(
+        &'a mut self,
+        config: Nat44UdpConfig,
+        mappings: &'a mut [Nat44UdpMappingSlot; 4],
+        peers: &'a mut [Nat44UdpPeerSlot; 4],
+    ) -> Nat44UdpRuntime<'a> {
+        let storage = Nat44UdpIndexStorage::new(
+            &mut self.mapping_buckets,
+            &mut self.mapping_nodes,
+            &mut self.peer_buckets,
+            &mut self.peer_nodes,
+            &mut self.port_owners,
+        );
+        Nat44UdpRuntime::new(
+            config,
+            mappings,
+            peers,
+            storage,
+            Nat44UdpHashKey::new(0x1357_9bdf_2468_ace0, 0xfdb9_7531_eca8_6420)
+                .expect("benchmark UDP hash key"),
+        )
+        .expect("benchmark UDP runtime")
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Profile {
@@ -358,7 +394,8 @@ fn run_nat_case(
         Transport::UdpZero | Transport::UdpChecksum => {
             let mut mappings = [Nat44UdpMappingSlot::default(); 4];
             let mut peers = [Nat44UdpPeerSlot::default(); 4];
-            let mut runtime = Nat44UdpRuntime::new(udp_config, &mut mappings, &mut peers);
+            let mut indexes = UdpBenchIndexes::default();
+            let mut runtime = indexes.runtime(udp_config, &mut mappings, &mut peers);
             establish_udp(
                 case,
                 |batch| {
@@ -588,10 +625,11 @@ fn run_combined_case(
     let firewall_config = firewall_config(&snapshot, &rules);
     let mut udp_mappings = [Nat44UdpMappingSlot::default(); 4];
     let mut udp_peers = [Nat44UdpPeerSlot::default(); 4];
+    let mut udp_indexes = UdpBenchIndexes::default();
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 4];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 4];
     let mut firewall_states = [FirewallStateSlot::default(); 4];
-    let mut udp = Nat44UdpRuntime::new(udp_config, &mut udp_mappings, &mut udp_peers);
+    let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp = Nat44TcpRuntime::new(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_states);
     let mut resolution_states: [ResolutionStateSlot; 0] = [];

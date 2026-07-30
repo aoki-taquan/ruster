@@ -1584,10 +1584,14 @@ where
                         .expect("NAT decision requires a bound runtime");
                     match nat.transition {
                         Nat44UdpTransition::Outbound(plan) => {
-                            runtime.commit_outbound(plan, nat_now_ms);
+                            runtime
+                                .commit_outbound(plan, nat_now_ms)
+                                .expect("sequential packet path keeps UDP NAT plan current");
                         }
                         Nat44UdpTransition::Inbound(plan) => {
-                            runtime.commit_inbound(plan, nat_now_ms);
+                            runtime
+                                .commit_inbound(plan, nat_now_ms)
+                                .expect("sequential packet path keeps UDP NAT plan current");
                         }
                     }
                     trace.record(TraceEvent::Nat44Udp {
@@ -2423,9 +2427,12 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
                         Nat44UdpPlanError::ClockRegression => Nat44UdpClockRegression,
                         Nat44UdpPlanError::MappingFull
                         | Nat44UdpPlanError::PeerFull
-                        | Nat44UdpPlanError::PortExhausted => {
+                        | Nat44UdpPlanError::PortExhausted
+                        | Nat44UdpPlanError::GenerationExhausted
+                        | Nat44UdpPlanError::StateRevisionExhausted => {
                             unreachable!("read-only ICMP lookup cannot exhaust state")
                         }
+                        Nat44UdpPlanError::IndexCorrupt => Nat44UdpConfigMismatch,
                     };
                     trace_nat44_icmpv4_drop(ingress, reason, trace)
                 })?;
@@ -4013,6 +4020,11 @@ fn nat44_udp_plan_error(error: Nat44UdpPlanError) -> (DropReason, Nat44UdpDispos
             Nat44UdpClockRegression,
             Nat44UdpDisposition::ClockRegression,
         ),
+        Nat44UdpPlanError::IndexCorrupt
+        | Nat44UdpPlanError::GenerationExhausted
+        | Nat44UdpPlanError::StateRevisionExhausted => {
+            (Nat44UdpConfigMismatch, Nat44UdpDisposition::ConfigMismatch)
+        }
     }
 }
 
@@ -4896,9 +4908,9 @@ mod tests {
     use crate::{
         ipv4_header_checksum, BatchCompletion, ForwardingSnapshot, IfId, Interface, Ipv4Address,
         LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44UdpConfig,
-        Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, NoTrace,
-        PacketBatch, PacketLease, PacketSlot, ResolutionActionSlot, ResolutionPolicy,
-        ResolutionRuntime, ResolutionStateSlot, Route, SlotCompletion, TraceEvent, TraceSink,
+        Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, NoTrace, PacketBatch, PacketLease,
+        PacketSlot, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot,
+        Route, SlotCompletion, TraceEvent, TraceSink,
     };
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
@@ -5101,9 +5113,11 @@ mod tests {
         .unwrap();
         let mut mappings = [Nat44UdpMappingSlot::default(); 1];
         let mut peers = [Nat44UdpPeerSlot::default(); 1];
-        let mut nat = Nat44UdpRuntime::new(config, &mut mappings, &mut peers);
+        let mut nat_indexes =
+            crate::nat44::TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+        let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
         let plan = nat.plan_outbound(INTERNAL, 12_345, REMOTE, 0).unwrap();
-        nat.commit_outbound(plan, 0);
+        nat.commit_outbound(plan, 0).unwrap();
         let before_mapping = nat.mappings()[0];
         let before_peer = nat.peers()[0];
         let before_counters = nat.counters();

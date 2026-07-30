@@ -37,10 +37,15 @@ impl DirectoryHashKey {
         }
         Ok(Self { first, second })
     }
+
+    pub(crate) fn hash_words(self, domain: DirectoryHashDomain, words: &[u64]) -> u64 {
+        keyed_hash_words(self, domain, words)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u64)]
+#[allow(dead_code)] // TCP domains are reserved for the separately reviewed N4 integration.
 pub(crate) enum DirectoryHashDomain {
     UdpMapping = 0x4e41_5434_554d_4150,
     UdpPeer = 0x4e41_5434_5550_4545,
@@ -49,7 +54,7 @@ pub(crate) enum DirectoryHashDomain {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DirectoryBucket {
+pub struct DirectoryBucket {
     head: u32,
 }
 
@@ -60,7 +65,7 @@ impl Default for DirectoryBucket {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DirectoryNode {
+pub struct DirectoryNode {
     hash: u64,
     bucket: u32,
     previous: u32,
@@ -99,6 +104,28 @@ pub(crate) enum DirectoryMutationError {
     AlreadyLinked,
     NotLinked,
     Corrupt,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedDirectoryLink {
+    state: u32,
+    hash: u64,
+    bucket: u32,
+    expected_head: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedDirectoryUnlink {
+    state: u32,
+    node: DirectoryNode,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedDirectoryRelink {
+    state: u32,
+    hash: u64,
+    bucket: u32,
+    expected_head: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,6 +177,13 @@ pub(crate) struct FixedDirectory<'a> {
 }
 
 impl<'a> FixedDirectory<'a> {
+    pub(crate) fn validate_config(
+        bucket_count: usize,
+        node_count: usize,
+    ) -> Result<(), DirectoryConfigError> {
+        validate_dimensions(bucket_count, node_count)
+    }
+
     pub(crate) fn new(
         buckets: &'a mut [DirectoryBucket],
         nodes: &'a mut [DirectoryNode],
@@ -165,10 +199,12 @@ impl<'a> FixedDirectory<'a> {
         })
     }
 
+    #[allow(dead_code)] // Kept for bounded-complexity assertions and the N2 primitive API.
     pub(crate) const fn node_capacity(&self) -> usize {
         self.nodes.len()
     }
 
+    #[allow(dead_code)] // Kept for bounded-complexity assertions and the N2 primitive API.
     pub(crate) const fn bucket_count(&self) -> usize {
         self.buckets.len()
     }
@@ -178,14 +214,21 @@ impl<'a> FixedDirectory<'a> {
         self.nodes.fill(DirectoryNode::default());
     }
 
+    pub(crate) fn clear_with_key(&mut self, hash_key: DirectoryHashKey) {
+        self.clear();
+        self.hash_key = hash_key;
+    }
+
+    #[allow(dead_code)] // Used by fault-model tests and the N2 primitive API.
     pub(crate) fn is_linked(&self, state_index: usize) -> Option<bool> {
         self.nodes.get(state_index).map(|node| node.is_linked())
     }
 
     pub(crate) fn hash_words(&self, domain: DirectoryHashDomain, words: &[u64]) -> u64 {
-        keyed_hash_words(self.hash_key, domain, words)
+        self.hash_key.hash_words(domain, words)
     }
 
+    #[allow(dead_code)] // Used by collision-model tests and the N2 primitive API.
     pub(crate) fn bucket_for_words(
         &self,
         domain: DirectoryHashDomain,
@@ -194,12 +237,31 @@ impl<'a> FixedDirectory<'a> {
         self.bucket_for_hash(self.hash_words(domain, words))
     }
 
+    #[allow(dead_code)] // Compatibility wrapper around prepare/apply.
     pub(crate) fn link(
         &mut self,
         state_index: usize,
         domain: DirectoryHashDomain,
         words: &[u64],
     ) -> Result<(), DirectoryMutationError> {
+        let prepared = self.prepare_link(state_index, domain, words)?;
+        self.apply_prepared_link(prepared);
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Compatibility wrapper around prepare/apply.
+    pub(crate) fn unlink(&mut self, state_index: usize) -> Result<(), DirectoryMutationError> {
+        let prepared = self.prepare_unlink(state_index)?;
+        self.apply_prepared_unlink(prepared);
+        Ok(())
+    }
+
+    pub(crate) fn prepare_link(
+        &self,
+        state_index: usize,
+        domain: DirectoryHashDomain,
+        words: &[u64],
+    ) -> Result<PreparedDirectoryLink, DirectoryMutationError> {
         let state = index_to_link(state_index, self.nodes.len())?;
         if self.nodes[state_index].is_linked() {
             return Err(DirectoryMutationError::AlreadyLinked);
@@ -210,33 +272,49 @@ impl<'a> FixedDirectory<'a> {
             .ok_or(DirectoryMutationError::StateIndexOutOfRange)?;
         let bucket = u32::try_from(bucket_index)
             .map_err(|_| DirectoryMutationError::StateIndexOutOfRange)?;
-        let old_head = self.buckets[bucket_index].head;
-        let old_head_index = if old_head == NONE {
-            None
-        } else {
-            let old_head_index =
-                link_to_index(old_head, self.nodes.len()).ok_or(DirectoryMutationError::Corrupt)?;
-            let old_head_node = self.nodes[old_head_index];
-            if old_head_node.bucket != bucket || old_head_node.previous != NONE {
-                return Err(DirectoryMutationError::Corrupt);
-            }
-            Some(old_head_index)
-        };
-
-        self.nodes[state_index] = DirectoryNode {
+        let expected_head = self.buckets[bucket_index].head;
+        self.validate_head(bucket, expected_head)?;
+        Ok(PreparedDirectoryLink {
+            state,
             hash,
             bucket,
-            previous: NONE,
-            next: old_head,
-        };
-        if let Some(old_head_index) = old_head_index {
-            self.nodes[old_head_index].previous = state;
-        }
-        self.buckets[bucket_index].head = state;
-        Ok(())
+            expected_head,
+        })
     }
 
-    pub(crate) fn unlink(&mut self, state_index: usize) -> Result<(), DirectoryMutationError> {
+    pub(crate) fn prepared_link_matches(&self, prepared: PreparedDirectoryLink) -> bool {
+        let state_index = prepared.state as usize;
+        self.nodes.get(state_index) == Some(&DirectoryNode::default())
+            && self
+                .buckets
+                .get(prepared.bucket as usize)
+                .map(|bucket| bucket.head)
+                == Some(prepared.expected_head)
+            && self
+                .validate_head(prepared.bucket, prepared.expected_head)
+                .is_ok()
+    }
+
+    pub(crate) fn apply_prepared_link(&mut self, prepared: PreparedDirectoryLink) {
+        debug_assert!(self.prepared_link_matches(prepared));
+        let state_index = prepared.state as usize;
+        self.nodes[state_index] = DirectoryNode {
+            hash: prepared.hash,
+            bucket: prepared.bucket,
+            previous: NONE,
+            next: prepared.expected_head,
+        };
+        if prepared.expected_head != NONE {
+            let index = prepared.expected_head as usize;
+            self.nodes[index].previous = prepared.state;
+        }
+        self.buckets[prepared.bucket as usize].head = prepared.state;
+    }
+
+    pub(crate) fn prepare_unlink(
+        &self,
+        state_index: usize,
+    ) -> Result<PreparedDirectoryUnlink, DirectoryMutationError> {
         let state = index_to_link(state_index, self.nodes.len())?;
         let node = self.nodes[state_index];
         if !node.is_linked() {
@@ -250,11 +328,11 @@ impl<'a> FixedDirectory<'a> {
         {
             return Err(DirectoryMutationError::Corrupt);
         }
-        let previous_index = if node.previous == NONE {
-            if self.buckets[bucket_index].head != state {
+        let expected_bucket_head = self.buckets[bucket_index].head;
+        if node.previous == NONE {
+            if expected_bucket_head != state {
                 return Err(DirectoryMutationError::Corrupt);
             }
-            None
         } else {
             let index = link_to_index(node.previous, self.nodes.len())
                 .ok_or(DirectoryMutationError::Corrupt)?;
@@ -268,11 +346,8 @@ impl<'a> FixedDirectory<'a> {
             {
                 return Err(DirectoryMutationError::Corrupt);
             }
-            Some(index)
-        };
-        let next_index = if node.next == NONE {
-            None
-        } else {
+        }
+        if node.next != NONE {
             let index = link_to_index(node.next, self.nodes.len())
                 .ok_or(DirectoryMutationError::Corrupt)?;
             let next = self.nodes[index];
@@ -284,19 +359,119 @@ impl<'a> FixedDirectory<'a> {
             {
                 return Err(DirectoryMutationError::Corrupt);
             }
-            Some(index)
-        };
+        }
+        Ok(PreparedDirectoryUnlink { state, node })
+    }
 
-        if let Some(index) = previous_index {
-            self.nodes[index].next = node.next;
+    pub(crate) fn prepared_unlink_matches(&self, prepared: PreparedDirectoryUnlink) -> bool {
+        let state_index = prepared.state as usize;
+        if self.nodes.get(state_index) != Some(&prepared.node) {
+            return false;
+        }
+        let Some(bucket) = self.buckets.get(prepared.node.bucket as usize) else {
+            return false;
+        };
+        if prepared.node.previous == NONE {
+            if bucket.head != prepared.state {
+                return false;
+            }
         } else {
-            self.buckets[bucket_index].head = node.next;
+            let Some(previous) = self.nodes.get(prepared.node.previous as usize).copied() else {
+                return false;
+            };
+            if previous.bucket != prepared.node.bucket || previous.next != prepared.state {
+                return false;
+            }
         }
-        if let Some(index) = next_index {
-            self.nodes[index].previous = node.previous;
+        if prepared.node.next != NONE {
+            let Some(next) = self.nodes.get(prepared.node.next as usize).copied() else {
+                return false;
+            };
+            if next.bucket != prepared.node.bucket || next.previous != prepared.state {
+                return false;
+            }
         }
-        self.nodes[state_index] = DirectoryNode::default();
-        Ok(())
+        true
+    }
+
+    pub(crate) fn apply_prepared_unlink(&mut self, prepared: PreparedDirectoryUnlink) {
+        debug_assert!(self.prepared_unlink_matches(prepared));
+        if prepared.node.previous != NONE {
+            self.nodes[prepared.node.previous as usize].next = prepared.node.next;
+        } else {
+            self.buckets[prepared.node.bucket as usize].head = prepared.node.next;
+        }
+        if prepared.node.next != NONE {
+            self.nodes[prepared.node.next as usize].previous = prepared.node.previous;
+        }
+        self.nodes[prepared.state as usize] = DirectoryNode::default();
+    }
+
+    pub(crate) fn prepare_relink(
+        &self,
+        state_index: usize,
+        domain: DirectoryHashDomain,
+        words: &[u64],
+    ) -> Result<PreparedDirectoryRelink, DirectoryMutationError> {
+        let unlink = self.prepare_unlink(state_index)?;
+        let hash = self.hash_words(domain, words);
+        let bucket_index = self
+            .bucket_for_hash(hash)
+            .ok_or(DirectoryMutationError::StateIndexOutOfRange)?;
+        let bucket = u32::try_from(bucket_index)
+            .map_err(|_| DirectoryMutationError::StateIndexOutOfRange)?;
+        let expected_head = if bucket == unlink.node.bucket && unlink.node.previous == NONE {
+            unlink.node.next
+        } else {
+            let head = self.buckets[bucket_index].head;
+            self.validate_head(bucket, head)?;
+            head
+        };
+        Ok(PreparedDirectoryRelink {
+            state: unlink.state,
+            hash,
+            bucket,
+            expected_head,
+        })
+    }
+
+    pub(crate) fn prepared_relink_matches(&self, prepared: PreparedDirectoryRelink) -> bool {
+        let Ok(unlink) = self.prepare_unlink(prepared.state as usize) else {
+            return false;
+        };
+        if prepared.bucket == unlink.node.bucket && unlink.node.previous == NONE {
+            prepared.expected_head == unlink.node.next
+        } else {
+            self.buckets
+                .get(prepared.bucket as usize)
+                .is_some_and(|bucket| bucket.head == prepared.expected_head)
+                && self
+                    .validate_head(prepared.bucket, prepared.expected_head)
+                    .is_ok()
+        }
+    }
+
+    pub(crate) fn apply_prepared_relink(&mut self, prepared: PreparedDirectoryRelink) {
+        debug_assert!(self.prepared_relink_matches(prepared));
+        let node = self.nodes[prepared.state as usize];
+        if node.previous != NONE {
+            self.nodes[node.previous as usize].next = node.next;
+        } else {
+            self.buckets[node.bucket as usize].head = node.next;
+        }
+        if node.next != NONE {
+            self.nodes[node.next as usize].previous = node.previous;
+        }
+        self.nodes[prepared.state as usize] = DirectoryNode {
+            hash: prepared.hash,
+            bucket: prepared.bucket,
+            previous: NONE,
+            next: prepared.expected_head,
+        };
+        if prepared.expected_head != NONE {
+            self.nodes[prepared.expected_head as usize].previous = prepared.state;
+        }
+        self.buckets[prepared.bucket as usize].head = prepared.state;
     }
 
     pub(crate) fn lookup(
@@ -431,6 +606,22 @@ impl<'a> FixedDirectory<'a> {
         let mask = self.buckets.len() - 1;
         Some((hash as usize) & mask)
     }
+
+    fn validate_head(
+        &self,
+        bucket: u32,
+        head: u32,
+    ) -> Result<Option<DirectoryNode>, DirectoryMutationError> {
+        if head == NONE {
+            return Ok(None);
+        }
+        let index = link_to_index(head, self.nodes.len()).ok_or(DirectoryMutationError::Corrupt)?;
+        let node = self.nodes[index];
+        if node.bucket != bucket || node.previous != NONE {
+            return Err(DirectoryMutationError::Corrupt);
+        }
+        Ok(Some(node))
+    }
 }
 
 fn validate_dimensions(bucket_count: usize, node_count: usize) -> Result<(), DirectoryConfigError> {
@@ -512,7 +703,7 @@ fn sip_rounds(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64, rounds: us
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct PortOwnerSlot {
+pub struct PortOwnerSlot {
     state_index_plus_one: u32,
     state_generation: u64,
     runtime_epoch: u128,
@@ -538,6 +729,18 @@ impl PortOwnerToken {
             state_generation,
             runtime_epoch,
         })
+    }
+
+    pub(crate) const fn from_prevalidated_index(
+        state_index: u32,
+        state_generation: u64,
+        runtime_epoch: u128,
+    ) -> Self {
+        Self {
+            state_index,
+            state_generation,
+            runtime_epoch,
+        }
     }
 
     pub(crate) const fn state_index(self) -> usize {
@@ -597,6 +800,41 @@ pub(crate) enum PortOwnerError {
     CorruptOwner,
 }
 
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // N3 uses prepare_move; claim remains the single-port primitive.
+pub(crate) struct PreparedPortOwnerClaim {
+    offset: usize,
+    expected: PortOwnerSlot,
+    replacement: PortOwnerSlot,
+}
+
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Exact snapshot form remains covered by primitive tests.
+pub(crate) struct PreparedPortOwnerMove {
+    old_offset: Option<usize>,
+    old_expected: Option<PortOwnerSlot>,
+    new_offset: usize,
+    new_expected: PortOwnerSlot,
+    replacement: PortOwnerSlot,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedPortOwnerMoveTopology {
+    old_offset: u32,
+    new_offset: u32,
+}
+
+impl PreparedPortOwnerMove {
+    pub(crate) fn topology(self) -> PreparedPortOwnerMoveTopology {
+        PreparedPortOwnerMoveTopology {
+            old_offset: self.old_offset.map_or(NONE, |offset| {
+                u32::try_from(offset).expect("validated offset fits u32")
+            }),
+            new_offset: u32::try_from(self.new_offset).expect("validated offset fits u32"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PortOwnerExpectation {
     pub port: u16,
@@ -627,25 +865,22 @@ pub(crate) struct PortOwnerTable<'a> {
 }
 
 impl<'a> PortOwnerTable<'a> {
+    pub(crate) fn validate_config(
+        slot_count: usize,
+        first_port: u16,
+        last_port: u16,
+        state_capacity: usize,
+    ) -> Result<(), PortOwnerConfigError> {
+        validate_port_owner_dimensions(slot_count, first_port, last_port, state_capacity)
+    }
+
     pub(crate) fn new(
         slots: &'a mut [PortOwnerSlot],
         first_port: u16,
         last_port: u16,
         state_capacity: usize,
     ) -> Result<Self, PortOwnerConfigError> {
-        if first_port == 0 {
-            return Err(PortOwnerConfigError::ZeroPort);
-        }
-        if first_port > last_port {
-            return Err(PortOwnerConfigError::InvalidRange);
-        }
-        let required = (u32::from(last_port) - u32::from(first_port) + 1) as usize;
-        if slots.len() != required {
-            return Err(PortOwnerConfigError::SlotCountMismatch);
-        }
-        if state_capacity > u32::MAX as usize {
-            return Err(PortOwnerConfigError::StateCapacityTooLarge);
-        }
+        validate_port_owner_dimensions(slots.len(), first_port, last_port, state_capacity)?;
         slots.fill(PortOwnerSlot::default());
         Ok(Self {
             slots,
@@ -659,6 +894,33 @@ impl<'a> PortOwnerTable<'a> {
         self.slots.fill(PortOwnerSlot::default());
     }
 
+    pub(crate) const fn slot_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub(crate) fn reconfigure(
+        &mut self,
+        first_port: u16,
+        last_port: u16,
+        state_capacity: usize,
+    ) -> Result<(), PortOwnerConfigError> {
+        validate_port_owner_dimensions(self.slots.len(), first_port, last_port, state_capacity)?;
+        self.clear();
+        self.first_port = first_port;
+        self.last_port = last_port;
+        self.state_capacity = state_capacity;
+        Ok(())
+    }
+
+    pub(crate) fn reconfigure_and_clear(
+        &mut self,
+        first_port: u16,
+        last_port: u16,
+        state_capacity: usize,
+    ) -> Result<(), PortOwnerConfigError> {
+        self.reconfigure(first_port, last_port, state_capacity)
+    }
+
     pub(crate) fn owner(&self, port: u16) -> Result<Option<PortOwnerToken>, PortOwnerError> {
         let offset = self.offset(port)?;
         let token = self.slots[offset].token()?;
@@ -668,6 +930,7 @@ impl<'a> PortOwnerTable<'a> {
         Ok(token)
     }
 
+    #[allow(dead_code)] // Compatibility primitive; N3 commits through prepared moves.
     pub(crate) fn assign(
         &mut self,
         port: u16,
@@ -681,6 +944,7 @@ impl<'a> PortOwnerTable<'a> {
         Ok(())
     }
 
+    #[allow(dead_code)] // Compatibility primitive; N3 commits through prepared moves.
     pub(crate) fn claim(
         &mut self,
         port: u16,
@@ -702,6 +966,122 @@ impl<'a> PortOwnerTable<'a> {
         Ok(true)
     }
 
+    #[allow(dead_code)] // Retained for single-port integrations and fault tests.
+    pub(crate) fn prepare_claim(
+        &self,
+        port: u16,
+        expected: Option<PortOwnerToken>,
+        replacement: PortOwnerToken,
+    ) -> Result<PreparedPortOwnerClaim, PortOwnerError> {
+        let offset = self.offset(port)?;
+        if replacement.state_index() >= self.state_capacity {
+            return Err(PortOwnerError::StateIndexOutOfRange);
+        }
+        let current = self.slots[offset].token()?;
+        if current.is_some_and(|owner| owner.state_index() >= self.state_capacity) {
+            return Err(PortOwnerError::CorruptOwner);
+        }
+        if current != expected {
+            return Err(PortOwnerError::CorruptOwner);
+        }
+        Ok(PreparedPortOwnerClaim {
+            offset,
+            expected: self.slots[offset],
+            replacement: PortOwnerSlot::from_token(replacement)?,
+        })
+    }
+
+    #[allow(dead_code)] // Retained for single-port integrations and fault tests.
+    pub(crate) fn prepared_claim_matches(&self, prepared: PreparedPortOwnerClaim) -> bool {
+        self.slots.get(prepared.offset) == Some(&prepared.expected)
+    }
+
+    #[allow(dead_code)] // Retained for single-port integrations and fault tests.
+    pub(crate) fn apply_prepared_claim(&mut self, prepared: PreparedPortOwnerClaim) {
+        debug_assert!(self.prepared_claim_matches(prepared));
+        self.slots[prepared.offset] = prepared.replacement;
+    }
+
+    pub(crate) fn prepare_move(
+        &self,
+        old: Option<(u16, PortOwnerToken)>,
+        new_port: u16,
+        new_expected: Option<PortOwnerToken>,
+        replacement: PortOwnerToken,
+    ) -> Result<PreparedPortOwnerMove, PortOwnerError> {
+        if replacement.state_index() >= self.state_capacity {
+            return Err(PortOwnerError::StateIndexOutOfRange);
+        }
+        let new_offset = self.offset(new_port)?;
+        let new_current = self.slots[new_offset].token()?;
+        if new_current.is_some_and(|owner| owner.state_index() >= self.state_capacity) {
+            return Err(PortOwnerError::CorruptOwner);
+        }
+        if new_current != new_expected {
+            return Err(PortOwnerError::CorruptOwner);
+        }
+        let (old_offset, old_expected) = if let Some((old_port, old_token)) = old {
+            let offset = self.offset(old_port)?;
+            let current = self.slots[offset].token()?;
+            if current.is_some_and(|owner| owner.state_index() >= self.state_capacity) {
+                return Err(PortOwnerError::CorruptOwner);
+            }
+            if current != Some(old_token) {
+                return Err(PortOwnerError::CorruptOwner);
+            }
+            if offset == new_offset {
+                if new_expected != Some(old_token) {
+                    return Err(PortOwnerError::CorruptOwner);
+                }
+                (None, None)
+            } else {
+                (Some(offset), Some(self.slots[offset]))
+            }
+        } else {
+            (None, None)
+        };
+        Ok(PreparedPortOwnerMove {
+            old_offset,
+            old_expected,
+            new_offset,
+            new_expected: self.slots[new_offset],
+            replacement: PortOwnerSlot::from_token(replacement)?,
+        })
+    }
+
+    #[allow(dead_code)] // Exact snapshot form remains covered by primitive tests.
+    pub(crate) fn prepared_move_matches(&self, prepared: PreparedPortOwnerMove) -> bool {
+        self.slots.get(prepared.new_offset) == Some(&prepared.new_expected)
+            && match (prepared.old_offset, prepared.old_expected) {
+                (Some(offset), Some(expected)) => self.slots.get(offset) == Some(&expected),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    #[allow(dead_code)] // Exact snapshot form remains covered by primitive tests.
+    pub(crate) fn apply_prepared_move(&mut self, prepared: PreparedPortOwnerMove) {
+        debug_assert!(self.prepared_move_matches(prepared));
+        if let Some(offset) = prepared.old_offset {
+            self.slots[offset] = PortOwnerSlot::default();
+        }
+        self.slots[prepared.new_offset] = prepared.replacement;
+    }
+
+    pub(crate) fn apply_prepared_move_topology(
+        &mut self,
+        prepared: PreparedPortOwnerMoveTopology,
+        replacement: PortOwnerToken,
+    ) {
+        debug_assert!((prepared.new_offset as usize) < self.slots.len());
+        if prepared.old_offset != NONE {
+            self.slots[prepared.old_offset as usize] = PortOwnerSlot::default();
+        }
+        self.slots[prepared.new_offset as usize] =
+            PortOwnerSlot::from_token(replacement).expect("prepared owner token fits storage");
+    }
+
+    #[allow(dead_code)] // Compatibility primitive; N3 commits through prepared moves.
     pub(crate) fn clear_if(
         &mut self,
         port: u16,
@@ -796,6 +1176,28 @@ impl<'a> PortOwnerTable<'a> {
         }
         Ok(usize::from(port - self.first_port))
     }
+}
+
+fn validate_port_owner_dimensions(
+    slot_count: usize,
+    first_port: u16,
+    last_port: u16,
+    state_capacity: usize,
+) -> Result<(), PortOwnerConfigError> {
+    if first_port == 0 {
+        return Err(PortOwnerConfigError::ZeroPort);
+    }
+    if first_port > last_port {
+        return Err(PortOwnerConfigError::InvalidRange);
+    }
+    let required = (u32::from(last_port) - u32::from(first_port) + 1) as usize;
+    if slot_count != required {
+        return Err(PortOwnerConfigError::SlotCountMismatch);
+    }
+    if state_capacity > u32::MAX as usize {
+        return Err(PortOwnerConfigError::StateCapacityTooLarge);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1187,6 +1589,42 @@ mod tests {
     }
 
     #[test]
+    fn prepared_directory_mutations_recheck_snapshots_and_apply_without_failure() {
+        let mut buckets = [DirectoryBucket::default(); 2];
+        let mut nodes = [DirectoryNode::default(); 2];
+        let mut directory = FixedDirectory::new(&mut buckets, &mut nodes, key(29)).unwrap();
+
+        let link = directory.prepare_link(0, DOMAIN, &[10, 1]).unwrap();
+        assert!(directory.prepared_link_matches(link));
+        directory.apply_prepared_link(link);
+        let stale_link = directory.prepare_link(1, DOMAIN, &[20, 1]).unwrap();
+        let current_link = directory.prepare_link(1, DOMAIN, &[21, 1]).unwrap();
+        directory.apply_prepared_link(current_link);
+        assert!(!directory.prepared_link_matches(stale_link));
+
+        let relink = directory.prepare_relink(0, DOMAIN, &[10, 2]).unwrap();
+        assert!(directory.prepared_relink_matches(relink));
+        directory.apply_prepared_relink(relink);
+        let expected_hash = directory.hash_words(DOMAIN, &[10, 2]);
+        let other_hash = directory.hash_words(DOMAIN, &[21, 1]);
+        assert_eq!(
+            directory.validate_semantics(|index| match index {
+                0 => Some(expected_hash),
+                1 => Some(other_hash),
+                _ => None,
+            }),
+            directory
+                .validate()
+                .map_err(DirectorySemanticError::Structural)
+        );
+
+        let unlink = directory.prepare_unlink(1).unwrap();
+        assert!(directory.prepared_unlink_matches(unlink));
+        directory.apply_prepared_unlink(unlink);
+        assert_eq!(directory.is_linked(1), Some(false));
+    }
+
+    #[test]
     fn port_owner_range_assignment_conditional_clear_and_validation_are_exact() {
         let mut slots = [PortOwnerSlot::default(); 3];
         let mut owners = PortOwnerTable::new(&mut slots, 40_000, 40_002, 2).unwrap();
@@ -1229,6 +1667,35 @@ mod tests {
         assert_eq!(owners.claim(40_000, Some(generation_b), epoch_b), Ok(true));
         assert_eq!(owners.clear_if(40_000, generation_b), Ok(false));
         assert_eq!(owners.owner(40_000), Ok(Some(epoch_b)));
+    }
+
+    #[test]
+    fn prepared_port_claim_and_move_are_exact_and_nofail_after_recheck() {
+        let mut slots = [PortOwnerSlot::default(); 2];
+        let mut owners = PortOwnerTable::new(&mut slots, 40_000, 40_001, 2).unwrap();
+        let first = PortOwnerToken::new(0, 1, 10).unwrap();
+        let second = PortOwnerToken::new(1, 1, 10).unwrap();
+        let replacement = PortOwnerToken::new(0, 2, 10).unwrap();
+
+        let claim = owners.prepare_claim(40_000, None, first).unwrap();
+        assert!(owners.prepared_claim_matches(claim));
+        owners.apply_prepared_claim(claim);
+        owners.assign(40_001, second).unwrap();
+        let movement = owners
+            .prepare_move(Some((40_000, first)), 40_001, Some(second), replacement)
+            .unwrap();
+        assert!(owners.prepared_move_matches(movement));
+        owners.apply_prepared_move(movement);
+        assert_eq!(owners.owner(40_000), Ok(None));
+        assert_eq!(owners.owner(40_001), Ok(Some(replacement)));
+
+        let stale = owners
+            .prepare_move(Some((40_001, replacement)), 40_000, None, first)
+            .unwrap();
+        owners.assign(40_000, second).unwrap();
+        assert!(!owners.prepared_move_matches(stale));
+        assert_eq!(owners.owner(40_000), Ok(Some(second)));
+        assert_eq!(owners.owner(40_001), Ok(Some(replacement)));
     }
 
     #[test]

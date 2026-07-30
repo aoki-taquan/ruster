@@ -3,9 +3,6 @@
 
 mod checksum;
 mod firewall;
-// N2 lands crate-private before N3/N4 NAT runtime integration. The temporary
-// allowance is scoped to that staged rollout and is removed when it is wired.
-#[allow(dead_code)]
 mod fixed_directory;
 mod forwarding;
 mod generated;
@@ -31,6 +28,7 @@ pub use firewall::{
     FIREWALL_TCP_OPENING_MIN_IDLE_TTL_MS, FIREWALL_UDP_DEFAULT_IDLE_TTL_MS,
     FIREWALL_UDP_MIN_IDLE_TTL_MS,
 };
+pub use fixed_directory::{DirectoryBucket, DirectoryNode, PortOwnerSlot};
 pub use forwarding::{
     forward_batch, forward_batch_with_firewall, forward_batch_with_firewall_and_icmpv4_errors,
     forward_batch_with_firewall_and_icmpv4_errors_audited, forward_batch_with_firewall_audited,
@@ -66,11 +64,12 @@ pub use nat44::{
     Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpCounters,
     Nat44TcpDisposition, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError,
     Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig,
-    Nat44UdpConfigError, Nat44UdpCounters, Nat44UdpDisposition, Nat44UdpMappingSlot,
-    Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Nat44UdpReconcileReport,
-    Nat44UdpRuntime, NAT44_TCP_DEFAULT_IDLE_TTL_MS, NAT44_TCP_MAX_IDLE_TTL_MS,
-    NAT44_TCP_MIN_IDLE_TTL_MS, NAT44_UDP_DEFAULT_IDLE_TTL_MS, NAT44_UDP_MAX_IDLE_TTL_MS,
-    NAT44_UDP_MIN_IDLE_TTL_MS,
+    Nat44UdpConfigError, Nat44UdpCounters, Nat44UdpDisposition, Nat44UdpHashKey,
+    Nat44UdpHashKeyError, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
+    Nat44UdpPolicy, Nat44UdpPolicyError, Nat44UdpReconcileError, Nat44UdpReconcilePermit,
+    Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError, Nat44UdpStorageShape,
+    NAT44_TCP_DEFAULT_IDLE_TTL_MS, NAT44_TCP_MAX_IDLE_TTL_MS, NAT44_TCP_MIN_IDLE_TTL_MS,
+    NAT44_UDP_DEFAULT_IDLE_TTL_MS, NAT44_UDP_MAX_IDLE_TTL_MS, NAT44_UDP_MIN_IDLE_TTL_MS,
 };
 pub use packet::{
     validate_arp, validate_arp_request, validate_ipv4_frame, ArpOpcode, MacAddress, ValidatedArp,
