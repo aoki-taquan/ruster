@@ -654,12 +654,47 @@ impl TraceSink for NoTrace {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct BatchReport<E> {
+    /// RX slots leased from the backend and terminally handled by the core.
     pub received: usize,
     /// Packets requested for TX; this does not mean backend or wire acceptance.
     pub tx_requested: usize,
+    /// RX slots completed with a forwarding [`DropReason`].
     pub dropped: usize,
+    /// RX slots completed with a typed [`ConsumeReason`].
     pub consumed: usize,
+    /// Backend completion for the same batch.
     pub completion: BatchCompletion<E>,
+}
+
+impl<E> BatchReport<E> {
+    /// Returns whether core terminal outcomes and backend accounting agree.
+    ///
+    /// A valid report satisfies all of the following:
+    ///
+    /// - every received slot is requested for TX, dropped, or consumed;
+    /// - the core and backend report the same number of TX requests;
+    /// - backend `recycled` is exactly core drops plus consumes; and
+    /// - [`BatchCompletion::invariants_hold`] is true.
+    ///
+    /// A returned report cannot contain an abandoned lease: abandonment is
+    /// the RAII fallback for an interrupted packet path, while normal
+    /// forwarding explicitly drops or consumes every non-TX packet.
+    #[must_use]
+    pub const fn invariants_hold(&self) -> bool {
+        let Some(core_terminal) = self.tx_requested.checked_add(self.dropped) else {
+            return false;
+        };
+        let Some(core_terminal) = core_terminal.checked_add(self.consumed) else {
+            return false;
+        };
+        let Some(core_recycled) = self.dropped.checked_add(self.consumed) else {
+            return false;
+        };
+        core_terminal == self.received
+            && self.tx_requested == self.completion.tx_requested
+            && core_recycled == self.completion.recycled
+            && self.completion.invariants_hold()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1442,18 +1477,19 @@ where
         }
     }
     let completion = batch.finish();
-    debug_assert_eq!(received, tx_requested + dropped + consumed);
     trace.record(TraceEvent::BatchCompleted {
         tx_accepted: completion.tx_accepted,
         tx_rejected: completion.tx_rejected,
     });
-    BatchReport {
+    let report = BatchReport {
         received,
         tx_requested,
         dropped,
         consumed,
         completion,
-    }
+    };
+    debug_assert!(report.invariants_hold());
+    report
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4536,12 +4572,12 @@ fn apply_icmpv4_echo_reply(
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_ipv4, DropReason};
+    use super::{decide_ipv4, BatchReport, DropReason};
     use crate::{
-        ipv4_header_checksum, ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
-        MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44UdpConfig, Nat44UdpMappingSlot,
-        Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, NoTrace, ResolutionActionSlot,
-        ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
+        ipv4_header_checksum, BatchCompletion, ForwardingSnapshot, IfId, Interface, Ipv4Address,
+        LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44UdpConfig,
+        Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, NoTrace,
+        ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
     };
 
     const LAN: IfId = IfId(1);
@@ -4550,6 +4586,45 @@ mod tests {
     const INTERNAL: Ipv4Address = Ipv4Address::from_octets([10, 0, 0, 10]);
     const REMOTE: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 20]);
     const ROUTER: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 1]);
+
+    fn report(
+        core: (usize, usize, usize, usize),
+        backend: (usize, usize, usize, usize),
+    ) -> BatchReport<()> {
+        let (received, tx_requested, dropped, consumed) = core;
+        let (completion_tx_requested, tx_accepted, tx_rejected, recycled) = backend;
+        BatchReport {
+            received,
+            tx_requested,
+            dropped,
+            consumed,
+            completion: BatchCompletion {
+                tx_requested: completion_tx_requested,
+                tx_accepted,
+                tx_rejected,
+                recycled,
+                error: None,
+            },
+        }
+    }
+
+    #[test]
+    fn batch_report_invariants_cover_core_and_backend_accounting() {
+        assert!(report((5, 2, 2, 1), (2, 1, 1, 3)).invariants_hold());
+        assert!(!report((6, 2, 2, 1), (2, 1, 1, 3)).invariants_hold());
+        assert!(!report((5, 2, 2, 1), (1, 1, 0, 3)).invariants_hold());
+        assert!(!report((5, 2, 2, 1), (2, 2, 1, 3)).invariants_hold());
+        assert!(!report((5, 2, 2, 1), (2, 1, 1, 2)).invariants_hold());
+    }
+
+    #[test]
+    fn batch_report_invariants_reject_counter_overflow() {
+        assert!(!report(
+            (usize::MAX, usize::MAX, 1, 0),
+            (usize::MAX, usize::MAX, 0, 1),
+        )
+        .invariants_hold());
+    }
 
     fn frag_needed_frame() -> Vec<u8> {
         let mut frame = vec![0_u8; 14 + 20 + 8 + 20 + 8];

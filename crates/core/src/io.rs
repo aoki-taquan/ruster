@@ -22,9 +22,11 @@ pub trait PacketBatch {
 
     /// Flushes requested transmissions and always returns their accounting.
     ///
-    /// `tx_accepted + tx_rejected == tx_requested` must hold, including when
+    /// [`BatchCompletion::invariants_hold`] must return `true`, including when
     /// `error` is present. The backend must recycle or free every rejected
-    /// slot before returning.
+    /// slot before returning. Rejected TX slots are accounted in
+    /// [`BatchCompletion::tx_rejected`], not
+    /// [`BatchCompletion::recycled`].
     fn finish(self) -> BatchCompletion<Self::Error>;
 }
 
@@ -56,6 +58,28 @@ pub enum ConsumeReason {
 ///
 /// The `Rc` marker makes this type `!Send + !Sync`; moving a live backend slot
 /// across workers is therefore rejected at compile time.
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<ruster_core::PacketLease<MySlot>>();
+/// # struct MySlot;
+/// # impl ruster_core::PacketSlot for MySlot {
+/// #   fn ingress(&self) -> ruster_core::IfId { ruster_core::IfId(1) }
+/// #   fn bytes_mut(&mut self) -> &mut [u8] { &mut [] }
+/// #   fn complete(self, _: ruster_core::SlotCompletion) {}
+/// # }
+/// ```
+///
+/// ```compile_fail
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<ruster_core::PacketLease<MySlot>>();
+/// # struct MySlot;
+/// # impl ruster_core::PacketSlot for MySlot {
+/// #   fn ingress(&self) -> ruster_core::IfId { ruster_core::IfId(1) }
+/// #   fn bytes_mut(&mut self) -> &mut [u8] { &mut [] }
+/// #   fn complete(self, _: ruster_core::SlotCompletion) {}
+/// # }
+/// ```
 pub struct PacketLease<S: PacketSlot> {
     slot: Option<S>,
     _worker_local: PhantomData<Rc<()>>,
@@ -109,9 +133,71 @@ impl<S: PacketSlot> Drop for PacketLease<S> {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct BatchCompletion<E> {
+    /// Slots completed with [`SlotCompletion::Transmit`].
     pub tx_requested: usize,
+    /// Requested TX slots accepted by the backend.
     pub tx_accepted: usize,
+    /// Requested TX slots rejected and reclaimed by the backend.
     pub tx_rejected: usize,
+    /// RX slots completed with [`SlotCompletion::Recycle`],
+    /// [`SlotCompletion::Consume`], or [`SlotCompletion::LeaseAbandoned`].
+    ///
+    /// This excludes rejected TX slots and slots that were never leased from
+    /// the batch.
     pub recycled: usize,
+    /// A backend error that occurred while preserving all accounting above.
     pub error: Option<E>,
+}
+
+impl<E> BatchCompletion<E> {
+    /// Returns whether requested TX slots are partitioned exactly into
+    /// accepted and rejected slots.
+    ///
+    /// The invariant is independent of `error`: backends must preserve it on
+    /// both successful and failed finishes.
+    #[must_use]
+    pub const fn invariants_hold(&self) -> bool {
+        let Some(accounted) = self.tx_accepted.checked_add(self.tx_rejected) else {
+            return false;
+        };
+        accounted == self.tx_requested
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BatchCompletion;
+
+    #[test]
+    fn batch_completion_invariant_is_exact_even_with_error() {
+        let completion = BatchCompletion {
+            tx_requested: 3,
+            tx_accepted: 1,
+            tx_rejected: 2,
+            recycled: 4,
+            error: Some("injected"),
+        };
+        assert!(completion.invariants_hold());
+
+        let invalid = BatchCompletion {
+            tx_requested: 3,
+            tx_accepted: 1,
+            tx_rejected: 1,
+            recycled: 4,
+            error: None::<&str>,
+        };
+        assert!(!invalid.invariants_hold());
+    }
+
+    #[test]
+    fn batch_completion_invariant_rejects_counter_overflow() {
+        let completion = BatchCompletion {
+            tx_requested: 0,
+            tx_accepted: usize::MAX,
+            tx_rejected: 1,
+            recycled: 0,
+            error: None::<()>,
+        };
+        assert!(!completion.invariants_hold());
+    }
 }
