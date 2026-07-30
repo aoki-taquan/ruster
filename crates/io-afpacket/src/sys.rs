@@ -7,8 +7,10 @@ use std::{
 };
 
 use crate::{
+    boundary::{ColdRingMetadata, CombinedRingExtents},
     BlockDescriptor, Errno, MappingAccessError, OwnershipError, PacketDescriptor, PlatformError,
-    RingLayout, RxBlockModel, RxOwnership, SyscallStage, UapiLayout, ValidatedPort,
+    RingKind, RingLayout, RxBlockModel, RxOwnership, SyscallStage, UapiLayout, ValidatedPort,
+    TPACKET_ALIGNMENT,
 };
 
 const AF_PACKET: c_int = 17;
@@ -97,7 +99,7 @@ struct TpacketReq3 {
 }
 
 #[repr(C)]
-struct SockaddrLl {
+pub(crate) struct SockaddrLl {
     sll_family: u16,
     sll_protocol: u16,
     sll_ifindex: i32,
@@ -185,140 +187,86 @@ pub(crate) fn validated_uapi_layout() -> Result<UapiLayout, PlatformError> {
     Ok(layout)
 }
 
-// AP0 establishes and reviews the unsafe lifetime boundary. AP1/AP2 will own
-// construction and consume these resources through their PacketIo state.
-#[allow(dead_code)]
-pub(crate) struct PacketRingResources {
-    mapping: MmapRegion,
-    socket: PacketSocket,
-    rx: RingLayout,
-}
+pub(crate) trait PacketOps: Clone {
+    fn open_socket(&mut self) -> Result<RawFd, PlatformError>;
 
-#[allow(dead_code)]
-impl PacketRingResources {
-    pub(crate) fn open(port: ValidatedPort) -> Result<Self, PlatformError> {
-        let socket = PacketSocket::open()?;
-        socket.set_version()?;
-        socket.ignore_outgoing()?;
-        socket.set_ring(
-            PACKET_RX_RING,
-            port.rx().geometry(),
-            SyscallStage::SetRxRing,
-        )?;
-        socket.set_ring(
-            PACKET_TX_RING,
-            port.tx().geometry(),
-            SyscallStage::SetTxRing,
-        )?;
-        let mapping = MmapRegion::map(socket.fd, port.combined_map_len())?;
-        // The protocol-zero socket remains inactive through ring creation and
-        // mmap. This validated bind is the single activation point.
-        socket.bind(port.if_index())?;
-        Ok(Self {
-            mapping,
-            socket,
-            rx: port.rx(),
-        })
-    }
-
-    pub(crate) fn acquire_rx_block(
+    fn set_socket_option<T>(
         &mut self,
-        block_index: usize,
-    ) -> Result<UserRxBlock<'_>, MappingAccessError> {
-        self.mapping.acquire_user_block(self.rx, block_index)
-    }
+        fd: RawFd,
+        option: c_int,
+        value: &T,
+        stage: SyscallStage,
+    ) -> Result<(), PlatformError>;
+
+    fn bind(&mut self, fd: RawFd, address: &SockaddrLl) -> Result<(), PlatformError>;
+
+    fn map(&mut self, fd: RawFd, len: usize) -> Result<NonNull<u8>, PlatformError>;
+
+    fn unmap(&mut self, base: NonNull<u8>, len: usize);
+
+    fn close(&mut self, fd: RawFd);
 }
 
-struct PacketSocket {
-    fd: RawFd,
-}
+#[derive(Clone, Copy)]
+pub(crate) struct LinuxOps;
 
-impl PacketSocket {
-    fn open() -> Result<Self, PlatformError> {
-        // SAFETY: `socket` has no borrowed pointer arguments. The constants
-        // are Linux UAPI values and protocol zero keeps capture inactive until
-        // the checked interface bind. A nonnegative return is an owned fd.
+impl PacketOps for LinuxOps {
+    fn open_socket(&mut self) -> Result<RawFd, PlatformError> {
+        // SAFETY: `socket` has no borrowed pointer arguments. Protocol zero
+        // keeps capture inactive until the later checked bind.
         let fd = unsafe { socket(AF_PACKET, SOCK_RAW, 0) };
         if fd < 0 {
-            return Err(last_error(SyscallStage::Socket));
+            Err(last_error(SyscallStage::Socket))
+        } else {
+            Ok(fd)
         }
-        Ok(Self { fd })
     }
 
-    fn set_version(&self) -> Result<(), PlatformError> {
-        set_socket_option(
-            self.fd,
-            PACKET_VERSION,
-            &TPACKET_V3,
-            SyscallStage::SetVersion,
-        )
-    }
-
-    fn ignore_outgoing(&self) -> Result<(), PlatformError> {
-        set_socket_option(
-            self.fd,
-            PACKET_IGNORE_OUTGOING,
-            &1_i32,
-            SyscallStage::SetIgnoreOutgoing,
-        )
-    }
-
-    fn set_ring(
-        &self,
+    fn set_socket_option<T>(
+        &mut self,
+        fd: RawFd,
         option: c_int,
-        geometry: crate::RingGeometry,
+        value: &T,
         stage: SyscallStage,
     ) -> Result<(), PlatformError> {
-        let request = TpacketReq3 {
-            tp_block_size: geometry.block_size,
-            tp_block_nr: geometry.block_count,
-            tp_frame_size: geometry.frame_size,
-            tp_frame_nr: geometry.frame_count,
-            tp_retire_blk_tov: geometry.retire_timeout_ms,
-            tp_sizeof_priv: geometry.private_size,
-            tp_feature_req_word: geometry.feature_flags,
+        // SAFETY: `value` is initialized for `size_of::<T>()` bytes and
+        // remains borrowed until Linux copies it during this call.
+        let result = unsafe {
+            setsockopt(
+                fd,
+                SOL_PACKET,
+                option,
+                (value as *const T).cast(),
+                u32::try_from(size_of::<T>()).expect("socket option size fits socklen_t"),
+            )
         };
-        set_socket_option(self.fd, option, &request, stage)
+        if result < 0 {
+            Err(last_error(stage))
+        } else {
+            Ok(())
+        }
     }
 
-    fn bind(&self, if_index: u32) -> Result<(), PlatformError> {
-        let address = SockaddrLl::packet_all(if_index)?;
-        // SAFETY: `address` is a fully initialized C-layout `sockaddr_ll`;
-        // its pointer remains valid for the duration of this blocking call.
+    fn bind(&mut self, fd: RawFd, address: &SockaddrLl) -> Result<(), PlatformError> {
+        // SAFETY: `address` is a fully initialized C-layout `sockaddr_ll` and
+        // remains live until the blocking call returns.
         let result = unsafe {
             bind(
-                self.fd,
-                (&address as *const SockaddrLl).cast(),
+                fd,
+                (address as *const SockaddrLl).cast(),
                 u32::try_from(size_of::<SockaddrLl>()).expect("sockaddr_ll size fits socklen_t"),
             )
         };
         if result < 0 {
-            return Err(last_error(SyscallStage::Bind));
+            Err(last_error(SyscallStage::Bind))
+        } else {
+            Ok(())
         }
-        Ok(())
     }
-}
 
-impl Drop for PacketSocket {
-    fn drop(&mut self) {
-        // SAFETY: `fd` is uniquely owned by this value and Drop runs once.
-        let _ = unsafe { close(self.fd) };
-    }
-}
-
-struct MmapRegion {
-    base: NonNull<u8>,
-    len: usize,
-    unmap_on_drop: bool,
-}
-
-impl MmapRegion {
-    fn map(fd: RawFd, len: usize) -> Result<Self, PlatformError> {
-        if len == 0 || len > isize::MAX as usize {
-            return Err(PlatformError::UapiLayoutMismatch);
-        }
-        // SAFETY: this requests a shared mapping from an owned packet socket;
-        // the returned pointer is checked before it is stored.
+    fn map(&mut self, fd: RawFd, len: usize) -> Result<NonNull<u8>, PlatformError> {
+        // SAFETY: this requests one shared mapping from the uniquely owned
+        // packet socket. The returned sentinel and null address are handled.
         let address = unsafe {
             mmap(
                 std::ptr::null_mut(),
@@ -333,20 +281,231 @@ impl MmapRegion {
             return Err(last_error(SyscallStage::Mmap));
         }
         let Some(base) = NonNull::new(address.cast::<u8>()) else {
-            // SAFETY: mmap returned a successful mapping at address zero.
-            // Rust cannot represent it as NonNull, so release that exact
-            // mapping before returning a typed failure.
+            // SAFETY: mmap succeeded at address zero, which Rust cannot hold
+            // in NonNull. Release that exact mapping before returning.
             let _ = unsafe { munmap(address, len) };
             return Err(PlatformError::Syscall {
                 stage: SyscallStage::Mmap,
                 errno: Errno::new(14),
             });
         };
+        Ok(base)
+    }
+
+    fn unmap(&mut self, base: NonNull<u8>, len: usize) {
+        // SAFETY: the mapping owner calls this once with the exact live range.
+        let _ = unsafe { munmap(base.as_ptr().cast(), len) };
+    }
+
+    fn close(&mut self, fd: RawFd) {
+        // SAFETY: the socket owner calls this once for its unique fd.
+        let _ = unsafe { close(fd) };
+    }
+}
+
+// AP0 establishes and reviews the unsafe lifetime boundary. AP1-0 keeps the
+// combined mapping owner intact while fixing checked disjoint extents and cold
+// metadata. Later slices consume them through their PacketIo state.
+#[allow(dead_code)]
+pub(crate) struct PacketRingResources<O: PacketOps = LinuxOps> {
+    // Field declaration order is the required Drop order: unmap before close.
+    mapping: MmapRegion<O>,
+    socket: PacketSocket<O>,
+    rx: RingLayout,
+    extents: CombinedRingExtents,
+    metadata: ColdRingMetadata,
+}
+
+#[allow(dead_code)]
+impl PacketRingResources<LinuxOps> {
+    pub(crate) fn open(port: ValidatedPort) -> Result<Self, PlatformError> {
+        Self::open_with_ops(port, LinuxOps)
+    }
+}
+
+#[allow(dead_code)]
+impl<O: PacketOps> PacketRingResources<O> {
+    fn open_with_ops(port: ValidatedPort, ops: O) -> Result<Self, PlatformError> {
+        let extents =
+            CombinedRingExtents::for_port(port).map_err(PlatformError::InvalidCombinedMapping)?;
+        // All fallible cold allocation happens before external resources are
+        // acquired, so allocation failure has no fd or mapping to unwind.
+        let metadata = ColdRingMetadata::for_port(port)?;
+        let mut socket = PacketSocket::open(ops.clone())?;
+        socket.set_version()?;
+        socket.ignore_outgoing()?;
+        socket.set_ring(
+            PACKET_RX_RING,
+            port.rx().geometry(),
+            SyscallStage::SetRxRing,
+        )?;
+        socket.set_ring(
+            PACKET_TX_RING,
+            port.tx().geometry(),
+            SyscallStage::SetTxRing,
+        )?;
+        let mapping = MmapRegion::map(ops, socket.fd, port.combined_map_len())?;
+        mapping
+            .validate_extents(extents)
+            .map_err(PlatformError::InvalidCombinedMapping)?;
+        // The protocol-zero socket remains inactive through ring creation and
+        // mmap. This validated bind is the single activation point.
+        socket.bind(port.if_index())?;
+        Ok(Self {
+            mapping,
+            socket,
+            rx: port.rx(),
+            extents,
+            metadata,
+        })
+    }
+
+    pub(crate) fn acquire_rx_block(
+        &mut self,
+        block_index: usize,
+    ) -> Result<UserRxBlock<'_, O>, MappingAccessError> {
+        self.mapping.acquire_user_block(self.rx, block_index)
+    }
+}
+
+struct PacketSocket<O: PacketOps> {
+    fd: RawFd,
+    ops: O,
+}
+
+impl<O: PacketOps> PacketSocket<O> {
+    fn open(mut ops: O) -> Result<Self, PlatformError> {
+        let fd = ops.open_socket()?;
+        Ok(Self { fd, ops })
+    }
+
+    fn set_version(&mut self) -> Result<(), PlatformError> {
+        self.ops.set_socket_option(
+            self.fd,
+            PACKET_VERSION,
+            &TPACKET_V3,
+            SyscallStage::SetVersion,
+        )
+    }
+
+    fn ignore_outgoing(&mut self) -> Result<(), PlatformError> {
+        self.ops.set_socket_option(
+            self.fd,
+            PACKET_IGNORE_OUTGOING,
+            &1_i32,
+            SyscallStage::SetIgnoreOutgoing,
+        )
+    }
+
+    fn set_ring(
+        &mut self,
+        option: c_int,
+        geometry: crate::RingGeometry,
+        stage: SyscallStage,
+    ) -> Result<(), PlatformError> {
+        let request = TpacketReq3 {
+            tp_block_size: geometry.block_size,
+            tp_block_nr: geometry.block_count,
+            tp_frame_size: geometry.frame_size,
+            tp_frame_nr: geometry.frame_count,
+            tp_retire_blk_tov: geometry.retire_timeout_ms,
+            tp_sizeof_priv: geometry.private_size,
+            tp_feature_req_word: geometry.feature_flags,
+        };
+        self.ops.set_socket_option(self.fd, option, &request, stage)
+    }
+
+    fn bind(&mut self, if_index: u32) -> Result<(), PlatformError> {
+        let address = SockaddrLl::packet_all(if_index)?;
+        self.ops.bind(self.fd, &address)
+    }
+}
+
+impl<O: PacketOps> Drop for PacketSocket<O> {
+    fn drop(&mut self) {
+        self.ops.close(self.fd);
+    }
+}
+
+struct MmapRegion<O: PacketOps = LinuxOps> {
+    base: NonNull<u8>,
+    len: usize,
+    unmap_on_drop: bool,
+    ops: O,
+}
+
+impl<O: PacketOps> MmapRegion<O> {
+    fn map(mut ops: O, fd: RawFd, len: usize) -> Result<Self, PlatformError> {
+        if len == 0 || len > isize::MAX as usize {
+            return Err(PlatformError::UapiLayoutMismatch);
+        }
+        let base = ops.map(fd, len)?;
         Ok(Self {
             base,
             len,
             unmap_on_drop: true,
+            ops,
         })
+    }
+
+    fn validate_extents(&self, extents: CombinedRingExtents) -> Result<(), MappingAccessError> {
+        if self.len != extents.combined_len() {
+            return Err(MappingAccessError::CombinedLengthMismatch {
+                expected: extents.combined_len(),
+                actual: self.len,
+            });
+        }
+        for (kind, extent) in [(RingKind::Rx, extents.rx()), (RingKind::Tx, extents.tx())] {
+            let end = extent
+                .start()
+                .checked_add(extent.len())
+                .ok_or(MappingAccessError::ArithmeticOverflow)?;
+            if end > self.len {
+                return Err(MappingAccessError::OffsetOutOfBounds {
+                    offset: extent.start(),
+                    length: extent.len(),
+                });
+            }
+            let address = self.base.as_ptr().wrapping_add(extent.start());
+            if !(address as usize).is_multiple_of(TPACKET_ALIGNMENT) {
+                return Err(MappingAccessError::RingExtentMisaligned {
+                    kind,
+                    offset: extent.start(),
+                    alignment: TPACKET_ALIGNMENT,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    fn ring_address(
+        &self,
+        extents: CombinedRingExtents,
+        kind: RingKind,
+        offset: usize,
+        length: usize,
+        alignment: usize,
+    ) -> Result<*mut u8, MappingAccessError> {
+        let extent = match kind {
+            RingKind::Rx => extents.rx(),
+            RingKind::Tx => extents.tx(),
+        };
+        let relative_end = offset
+            .checked_add(length)
+            .ok_or(MappingAccessError::ArithmeticOverflow)?;
+        if relative_end > extent.len() {
+            return Err(MappingAccessError::RingOffsetOutOfBounds {
+                kind,
+                offset,
+                length,
+            });
+        }
+        let absolute = extent
+            .start()
+            .checked_add(offset)
+            .ok_or(MappingAccessError::ArithmeticOverflow)?;
+        self.checked_address(absolute, length, alignment)
     }
 
     fn checked_address(
@@ -429,7 +588,7 @@ impl MmapRegion {
         &mut self,
         layout: RingLayout,
         block_index: usize,
-    ) -> Result<UserRxBlock<'_>, MappingAccessError> {
+    ) -> Result<UserRxBlock<'_, O>, MappingAccessError> {
         let block_range = layout
             .block_range(block_index)
             .map_err(MappingAccessError::Geometry)?;
@@ -494,19 +653,20 @@ impl MmapRegion {
     }
 
     #[cfg(test)]
-    unsafe fn borrowed_for_test(base: NonNull<u8>, len: usize) -> Self {
+    unsafe fn borrowed_for_test(base: NonNull<u8>, len: usize, ops: O) -> Self {
         Self {
             base,
             len,
             unmap_on_drop: false,
+            ops,
         }
     }
 }
 
 #[must_use]
 #[allow(dead_code)]
-pub(crate) struct UserRxBlock<'a> {
-    mapping: &'a mut MmapRegion,
+pub(crate) struct UserRxBlock<'a, O: PacketOps = LinuxOps> {
+    mapping: &'a mut MmapRegion<O>,
     status_offset: usize,
     block_start: usize,
     block_len: usize,
@@ -519,7 +679,7 @@ pub(crate) struct UserRxBlock<'a> {
 }
 
 #[allow(dead_code)]
-impl UserRxBlock<'_> {
+impl<O: PacketOps> UserRxBlock<'_, O> {
     pub(crate) fn packet_data(&mut self) -> Result<&mut [u8], MappingAccessError> {
         if self.pending {
             return Err(MappingAccessError::PacketAlreadyBorrowed);
@@ -581,39 +741,13 @@ impl UserRxBlock<'_> {
     }
 }
 
-impl Drop for MmapRegion {
+impl<O: PacketOps> Drop for MmapRegion<O> {
     fn drop(&mut self) {
         if !self.unmap_on_drop {
             return;
         }
-        // SAFETY: this exact nonempty mapping is uniquely owned and unmapped
-        // once. `PacketRingResources` declares it before the socket so it is
-        // dropped before the fd closes.
-        let _ = unsafe { munmap(self.base.as_ptr().cast(), self.len) };
+        self.ops.unmap(self.base, self.len);
     }
-}
-
-fn set_socket_option<T>(
-    fd: RawFd,
-    option: c_int,
-    value: &T,
-    stage: SyscallStage,
-) -> Result<(), PlatformError> {
-    // SAFETY: `value` is initialized for `size_of::<T>()` bytes and remains
-    // borrowed until `setsockopt` returns; Linux copies option data in-call.
-    let result = unsafe {
-        setsockopt(
-            fd,
-            SOL_PACKET,
-            option,
-            (value as *const T).cast(),
-            u32::try_from(size_of::<T>()).expect("socket option size fits socklen_t"),
-        )
-    };
-    if result < 0 {
-        return Err(last_error(stage));
-    }
-    Ok(())
 }
 
 fn checked_offset(base: usize, relative: usize) -> Result<usize, MappingAccessError> {
@@ -653,14 +787,165 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
-    use super::{MmapRegion, SockaddrLl, AF_PACKET, ETH_P_ALL};
+    use ruster_core::IfId;
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::{Cell, RefCell},
+        ffi::c_int,
+        os::fd::RawFd,
+        ptr::NonNull,
+        rc::Rc,
+    };
+
+    use super::{
+        LinuxOps, MmapRegion, PacketOps, PacketRingResources, SockaddrLl, AF_PACKET, ETH_P_ALL,
+    };
     use crate::{
-        GeometryError, MappingAccessError, RingGeometry, RxOwnership, TP_STATUS_KERNEL,
+        boundary::{ColdRingMetadata, CombinedRingExtents},
+        Errno, GeometryError, MappingAccessError, PlatformError, PortConfig, RingGeometry,
+        RingKind, RxOwnership, SyscallStage, ValidatedConfig, TPACKET_ALIGNMENT, TP_STATUS_KERNEL,
         TP_STATUS_USER,
     };
 
+    struct CountingAllocator;
+
+    thread_local! {
+        static ALLOCATION_COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    // SAFETY: every allocation operation delegates the unchanged contract to
+    // the system allocator. The const TLS counter does not allocate and keeps
+    // concurrent test threads out of this test's measurement.
+    unsafe impl GlobalAlloc for CountingAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: the caller supplies the GlobalAlloc layout contract.
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                ALLOCATION_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+            }
+            pointer
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: the caller supplies the GlobalAlloc layout contract.
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                ALLOCATION_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            // SAFETY: pointer and layout came from this allocator.
+            unsafe { System.dealloc(pointer, layout) };
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            // SAFETY: the caller supplies the GlobalAlloc reallocation contract.
+            let new_pointer = unsafe { System.realloc(pointer, layout, new_size) };
+            if !new_pointer.is_null() {
+                ALLOCATION_COUNT.with(|count| count.set(count.get().saturating_add(1)));
+            }
+            new_pointer
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
+
+    fn allocation_count() -> u64 {
+        ALLOCATION_COUNT.with(Cell::get)
+    }
+
     #[repr(align(16))]
     struct AlignedRing([u8; 4_096]);
+
+    #[repr(align(4_096))]
+    struct AlignedCombinedRing([u8; 8_193]);
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ScriptedCall {
+        Socket,
+        Set(SyscallStage),
+        Map(usize),
+        Bind,
+        Unmap(usize),
+        Close,
+    }
+
+    struct ScriptedState {
+        fail: Option<SyscallStage>,
+        calls: Vec<ScriptedCall>,
+        mapping: Box<AlignedCombinedRing>,
+    }
+
+    #[derive(Clone)]
+    struct ScriptedOps(Rc<RefCell<ScriptedState>>);
+
+    impl ScriptedOps {
+        fn new(fail: Option<SyscallStage>) -> Self {
+            Self(Rc::new(RefCell::new(ScriptedState {
+                fail,
+                calls: Vec::new(),
+                mapping: Box::new(AlignedCombinedRing([0; 8_193])),
+            })))
+        }
+
+        fn calls(&self) -> Vec<ScriptedCall> {
+            self.0.borrow().calls.clone()
+        }
+
+        fn fail_if_requested(&self, stage: SyscallStage) -> Result<(), PlatformError> {
+            if self.0.borrow().fail == Some(stage) {
+                Err(PlatformError::Syscall {
+                    stage,
+                    errno: Errno::new(5),
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl PacketOps for ScriptedOps {
+        fn open_socket(&mut self) -> Result<RawFd, PlatformError> {
+            self.0.borrow_mut().calls.push(ScriptedCall::Socket);
+            self.fail_if_requested(SyscallStage::Socket)?;
+            Ok(71)
+        }
+
+        fn set_socket_option<T>(
+            &mut self,
+            _fd: RawFd,
+            _option: c_int,
+            _value: &T,
+            stage: SyscallStage,
+        ) -> Result<(), PlatformError> {
+            self.0.borrow_mut().calls.push(ScriptedCall::Set(stage));
+            self.fail_if_requested(stage)
+        }
+
+        fn bind(&mut self, _fd: RawFd, _address: &SockaddrLl) -> Result<(), PlatformError> {
+            self.0.borrow_mut().calls.push(ScriptedCall::Bind);
+            self.fail_if_requested(SyscallStage::Bind)
+        }
+
+        fn map(&mut self, _fd: RawFd, len: usize) -> Result<NonNull<u8>, PlatformError> {
+            self.0.borrow_mut().calls.push(ScriptedCall::Map(len));
+            self.fail_if_requested(SyscallStage::Mmap)?;
+            let mut state = self.0.borrow_mut();
+            assert!(len <= state.mapping.0.len());
+            Ok(NonNull::new(state.mapping.0.as_mut_ptr()).expect("scripted mapping"))
+        }
+
+        fn unmap(&mut self, _base: NonNull<u8>, len: usize) {
+            self.0.borrow_mut().calls.push(ScriptedCall::Unmap(len));
+        }
+
+        fn close(&mut self, _fd: RawFd) {
+            self.0.borrow_mut().calls.push(ScriptedCall::Close);
+        }
+    }
 
     fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
@@ -682,6 +967,39 @@ mod tests {
         }
         .validate_rx(4_096, 1_514)
         .expect("strict RX layout")
+    }
+
+    fn validated_port() -> crate::ValidatedPort {
+        let rx = RingGeometry {
+            block_size: 4_096,
+            block_count: 1,
+            frame_size: 2_048,
+            frame_count: 2,
+            retire_timeout_ms: 10,
+            private_size: 16,
+            feature_flags: 1,
+        };
+        let tx = RingGeometry {
+            block_size: 4_096,
+            block_count: 1,
+            frame_size: 2_048,
+            frame_count: 2,
+            retire_timeout_ms: 0,
+            private_size: 0,
+            feature_flags: 0,
+        };
+        let config = ValidatedConfig::new(
+            &[PortConfig {
+                interface: IfId(7),
+                if_index: 9,
+                rx,
+                tx,
+            }],
+            4_096,
+            1_514,
+        )
+        .expect("combined port");
+        config.ports()[0]
     }
 
     fn one_packet_ring(next_offset: u32) -> AlignedRing {
@@ -713,6 +1031,7 @@ mod tests {
             MmapRegion::borrowed_for_test(
                 std::ptr::NonNull::new(backing.0.as_mut_ptr()).expect("test backing"),
                 backing.0.len(),
+                LinuxOps,
             )
         };
         let mut block = mapping
@@ -753,6 +1072,7 @@ mod tests {
             MmapRegion::borrowed_for_test(
                 std::ptr::NonNull::new(backing.0.as_mut_ptr()).expect("test backing"),
                 backing.0.len(),
+                LinuxOps,
             )
         };
         assert_eq!(
@@ -786,5 +1106,175 @@ mod tests {
             RxOwnership::from_status(TP_STATUS_USER),
             Ok(RxOwnership::User)
         );
+    }
+
+    #[test]
+    fn combined_mapping_access_is_disjoint_exact_and_address_aligned() {
+        let port = validated_port();
+        let extents = CombinedRingExtents::for_port(port).expect("validated extents");
+        let mut backing = AlignedCombinedRing([0; 8_193]);
+        // SAFETY: backing outlives the non-owning mapping and is accessed only
+        // through it until mapping is dropped.
+        let mapping = unsafe {
+            MmapRegion::borrowed_for_test(
+                NonNull::new(backing.0.as_mut_ptr()).expect("combined backing"),
+                port.combined_map_len(),
+                LinuxOps,
+            )
+        };
+        mapping.validate_extents(extents).expect("exact split");
+        let rx = mapping
+            .ring_address(extents, RingKind::Rx, 0, 16, TPACKET_ALIGNMENT)
+            .expect("RX address");
+        let tx = mapping
+            .ring_address(extents, RingKind::Tx, 0, 16, TPACKET_ALIGNMENT)
+            .expect("TX address");
+        assert_eq!(rx, backing.0.as_mut_ptr());
+        assert_eq!(
+            tx,
+            backing.0.as_mut_ptr().wrapping_add(port.tx_map_offset())
+        );
+        assert_eq!(
+            mapping.ring_address(extents, RingKind::Rx, 4_090, 16, 1),
+            Err(MappingAccessError::RingOffsetOutOfBounds {
+                kind: RingKind::Rx,
+                offset: 4_090,
+                length: 16,
+            })
+        );
+        drop(mapping);
+
+        // SAFETY: the shifted range is still within backing and has the exact
+        // combined length; validation must reject its actual misalignment.
+        let shifted = unsafe {
+            MmapRegion::borrowed_for_test(
+                NonNull::new(backing.0.as_mut_ptr().wrapping_add(1)).expect("shifted backing"),
+                port.combined_map_len(),
+                LinuxOps,
+            )
+        };
+        assert_eq!(
+            shifted.validate_extents(extents),
+            Err(MappingAccessError::RingExtentMisaligned {
+                kind: RingKind::Rx,
+                offset: 0,
+                alignment: TPACKET_ALIGNMENT,
+            })
+        );
+        drop(shifted);
+
+        // SAFETY: no access occurs; this deliberately short logical mapping is
+        // rejected before either extent can be used.
+        let short = unsafe {
+            MmapRegion::borrowed_for_test(
+                NonNull::new(backing.0.as_mut_ptr()).expect("short backing"),
+                port.combined_map_len() - 1,
+                LinuxOps,
+            )
+        };
+        assert_eq!(
+            short.validate_extents(extents),
+            Err(MappingAccessError::CombinedLengthMismatch {
+                expected: port.combined_map_len(),
+                actual: port.combined_map_len() - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn scripted_resource_failures_cleanup_mapping_before_socket_exactly_once() {
+        let port = validated_port();
+        for stage in [
+            SyscallStage::Socket,
+            SyscallStage::SetVersion,
+            SyscallStage::SetIgnoreOutgoing,
+            SyscallStage::SetRxRing,
+            SyscallStage::SetTxRing,
+            SyscallStage::Mmap,
+            SyscallStage::Bind,
+        ] {
+            let ops = ScriptedOps::new(Some(stage));
+            assert!(matches!(
+                PacketRingResources::open_with_ops(port, ops.clone()),
+                Err(PlatformError::Syscall {
+                    stage: failed,
+                    errno: _
+                }) if failed == stage
+            ));
+            let calls = ops.calls();
+            let closes = calls
+                .iter()
+                .filter(|call| **call == ScriptedCall::Close)
+                .count();
+            let unmaps = calls
+                .iter()
+                .filter(|call| matches!(call, ScriptedCall::Unmap(_)))
+                .count();
+            assert_eq!(closes, usize::from(stage != SyscallStage::Socket));
+            assert_eq!(unmaps, usize::from(stage == SyscallStage::Bind));
+            if stage == SyscallStage::Bind {
+                assert!(matches!(
+                    calls.as_slice(),
+                    [
+                        ..,
+                        ScriptedCall::Bind,
+                        ScriptedCall::Unmap(8_192),
+                        ScriptedCall::Close
+                    ]
+                ));
+            }
+        }
+
+        let ops = ScriptedOps::new(None);
+        let resources =
+            PacketRingResources::open_with_ops(port, ops.clone()).expect("scripted open");
+        assert!(matches!(
+            ops.calls().as_slice(),
+            [
+                ScriptedCall::Socket,
+                ScriptedCall::Set(SyscallStage::SetVersion),
+                ScriptedCall::Set(SyscallStage::SetIgnoreOutgoing),
+                ScriptedCall::Set(SyscallStage::SetRxRing),
+                ScriptedCall::Set(SyscallStage::SetTxRing),
+                ScriptedCall::Map(8_192),
+                ScriptedCall::Bind,
+            ]
+        ));
+        drop(resources);
+        assert!(matches!(
+            ops.calls().as_slice(),
+            [
+                ..,
+                ScriptedCall::Bind,
+                ScriptedCall::Unmap(8_192),
+                ScriptedCall::Close
+            ]
+        ));
+    }
+
+    #[test]
+    fn cold_ring_metadata_preallocates_fixed_steady_storage() {
+        let mut metadata =
+            ColdRingMetadata::for_port(validated_port()).expect("cold fixed metadata");
+        assert_eq!(metadata.rx_packets().len(), 84);
+        assert_eq!(metadata.tx_frames().len(), 2);
+        let rx_address = metadata.rx_packets().as_ptr();
+        let tx_address = metadata.tx_frames().as_ptr();
+
+        let before = allocation_count();
+        let mut digest = 0_usize;
+        for index in 0..10_000 {
+            let rx_index = index % metadata.rx_packets().len();
+            metadata.rx_packets_mut()[rx_index].data_len = index;
+            digest ^= metadata.rx_packets()[rx_index].data_len;
+            let tx_index = index % metadata.tx_frames().len();
+            digest ^= metadata.tx_frames_mut()[tx_index].generation as usize;
+        }
+        std::hint::black_box(digest);
+        let after = allocation_count();
+
+        assert_eq!(after, before);
+        assert_eq!(metadata.rx_packets().as_ptr(), rx_address);
+        assert_eq!(metadata.tx_frames().as_ptr(), tx_address);
     }
 }
