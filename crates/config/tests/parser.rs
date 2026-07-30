@@ -108,13 +108,11 @@ first = 443
 last = 443
 
 [tick]
-rx-packets = 64
-resolution-timers = 16
-icmpv4-error-timers = 16
-nat44-udp-cleanup = 16
-nat44-tcp-cleanup = 16
-firewall-cleanup = 16
-generated-packets = 16
+rx = 64
+resolution-timer-scans = 16
+failure-dispatch-scans = 16
+generated-arp = 16
+generated-icmpv4 = 16
 "#;
 
 #[test]
@@ -133,7 +131,12 @@ fn v1_exact_dto_decodes_every_roadmap_section() {
     assert_eq!(config.icmpv4_errors.unwrap().capacity.actions, 64);
     assert_eq!(config.nat44.unwrap().realm.inside, "lan");
     assert_eq!(config.firewall.unwrap().rules.len(), 1);
-    assert_eq!(config.tick.unwrap().rx_packets, 64);
+    let tick = config.tick.unwrap();
+    assert_eq!(tick.rx, 64);
+    assert_eq!(tick.resolution_timer_scans, 16);
+    assert_eq!(tick.failure_dispatch_scans, 16);
+    assert_eq!(tick.generated_arp, 16);
+    assert_eq!(tick.generated_icmpv4, 16);
 }
 
 #[test]
@@ -269,6 +272,49 @@ fn input_and_every_v1_list_are_bounded() {
 }
 
 #[test]
+fn exact_input_and_v1_list_limits_are_accepted() {
+    let mut exact_input = b"schema-version=1\n".to_vec();
+    exact_input.resize(MAX_CONFIG_BYTES, b' ');
+    assert_eq!(exact_input.len(), MAX_CONFIG_BYTES);
+    assert!(parse(&exact_input).is_ok());
+
+    assert_list_at_limit(
+        "interfaces",
+        "{ id=1, name=\"x\", device=\"x\", mac=\"x\" }",
+        MAX_INTERFACES,
+        "",
+    );
+    assert_list_at_limit(
+        "addresses",
+        "{ interface=\"x\", ipv4=\"x\" }",
+        MAX_ADDRESSES,
+        "",
+    );
+    assert_list_at_limit("routes", "{ prefix=\"x\", egress=\"x\" }", MAX_ROUTES, "");
+    assert_list_at_limit(
+        "neighbors",
+        "{ interface=\"x\", address=\"x\", mac=\"x\" }",
+        MAX_NEIGHBORS,
+        "",
+    );
+    assert_list_at_limit(
+        "rules",
+        concat!(
+            "{ id=1, source=\"x\", destination=\"x\", protocol=\"tcp\", ",
+            "source-ports={first=0,last=0}, destination-ports={first=0,last=0}, ",
+            "action=\"deny\" }"
+        ),
+        MAX_FIREWALL_RULES,
+        concat!(
+            "[firewall]\n",
+            "policy={udp-idle-ttl-ms=1,tcp-opening-idle-ttl-ms=1,",
+            "tcp-active-idle-ttl-ms=1}\n",
+            "capacity={states=1}\n"
+        ),
+    );
+}
+
+#[test]
 fn future_runtime_fields_are_forbidden_and_secret_values_are_redacted() {
     for field in [
         "config-generation",
@@ -366,4 +412,22 @@ fn assert_list_limit(field: &str, item: &str, limit: usize, prefix: &str) {
     assert_eq!(diagnostic.code(), DiagnosticCode::ListTooLong);
     assert_eq!(diagnostic.limit(), Some(limit));
     assert_eq!(diagnostic.actual(), Some(limit + 1));
+}
+
+fn assert_list_at_limit(field: &str, item: &str, limit: usize, prefix: &str) {
+    let mut input = String::from("schema-version=1\n");
+    input.push_str(prefix);
+    input.push_str(field);
+    input.push_str("=[");
+    for index in 0..limit {
+        if index != 0 {
+            input.push(',');
+        }
+        input.push_str(item);
+    }
+    input.push_str("]\n");
+    assert!(
+        parse(input.as_bytes()).is_ok(),
+        "{field} must accept exactly {limit} entries"
+    );
 }

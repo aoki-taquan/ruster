@@ -253,11 +253,9 @@ pub enum FirewallActionV1 {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct TickBudgetV1 {
-    pub rx_packets: u32,
-    pub resolution_timers: u32,
-    pub icmpv4_error_timers: u32,
-    pub nat44_udp_cleanup: u32,
-    pub nat44_tcp_cleanup: u32,
-    pub firewall_cleanup: u32,
-    pub generated_packets: u32,
+    pub rx: u32,
+    pub resolution_timer_scans: u32,
+    pub failure_dispatch_scans: u32,
+    pub generated_arp: u32,
+    pub generated_icmpv4: u32,
 }
