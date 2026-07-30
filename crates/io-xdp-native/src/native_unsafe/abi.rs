@@ -35,8 +35,6 @@ pub const XDP_SUPPORTED_BIND_FLAGS: u16 =
 pub const XDP_UMEM_UNALIGNED_CHUNK_FLAG: u32 = 1 << 0;
 /// Force software TX checksum in copy mode.
 pub const XDP_UMEM_TX_SW_CSUM: u32 = 1 << 1;
-/// Reserve TX metadata in each UMEM chunk.
-pub const XDP_UMEM_TX_METADATA_LEN: u32 = 1 << 2;
 
 /// Producer needs an explicit wakeup.
 pub const XDP_RING_NEED_WAKEUP: u32 = 1 << 0;

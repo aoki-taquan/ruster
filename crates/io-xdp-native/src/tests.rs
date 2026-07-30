@@ -8,8 +8,8 @@ use crate::{
         XDP_PKT_CONTD, XDP_RING_NEED_WAKEUP, XDP_RX_RING, XDP_SHARED_UMEM, XDP_STATISTICS,
         XDP_TX_METADATA, XDP_TX_RING, XDP_UMEM_COMPLETION_RING, XDP_UMEM_FILL_RING,
         XDP_UMEM_PGOFF_COMPLETION_RING, XDP_UMEM_PGOFF_FILL_RING, XDP_UMEM_REG,
-        XDP_UMEM_TX_METADATA_LEN, XDP_UMEM_TX_SW_CSUM, XDP_UMEM_UNALIGNED_CHUNK_FLAG,
-        XDP_USE_NEED_WAKEUP, XDP_USE_SG, XDP_ZEROCOPY,
+        XDP_UMEM_TX_SW_CSUM, XDP_UMEM_UNALIGNED_CHUNK_FLAG, XDP_USE_NEED_WAKEUP, XDP_USE_SG,
+        XDP_ZEROCOPY,
     },
     ensure_supported, validate_descriptor_options, AbiLayoutError, BindMode, ConfigError,
     RingConfig, RingEntries, RingField, RingName, UmemConfig, ValidatedBindFlags,
@@ -29,14 +29,7 @@ fn native_abi_matches_linux_v6_8_uapi_layout() {
         ),
         (1, 2, 4, 8, 16)
     );
-    assert_eq!(
-        (
-            XDP_UMEM_UNALIGNED_CHUNK_FLAG,
-            XDP_UMEM_TX_SW_CSUM,
-            XDP_UMEM_TX_METADATA_LEN,
-        ),
-        (1, 2, 4)
-    );
+    assert_eq!((XDP_UMEM_UNALIGNED_CHUNK_FLAG, XDP_UMEM_TX_SW_CSUM), (1, 2));
     assert_eq!(XDP_RING_NEED_WAKEUP, 1);
     assert_eq!(
         (
