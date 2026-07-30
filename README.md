@@ -7,7 +7,7 @@ active treeは、そのコードを継承しないv0.2のゼロベース実装�
 
 ## v0.2 bootstrap
 
-この最初の縦切りは、外部依存を持たない二つのlibrary crateだけで構成します。
+この最初の縦切りは、外部依存を持たないlibrary crateで構成します。
 
 - `ruster-core`: backend所有packetを借用し、Ethernet II / IPv4検証、LPM、
   TTL/checksum/MAC rewrite、local IPv4向けARP reply、static neighbor miss時の
@@ -17,6 +17,9 @@ active treeは、そのコードを継承しないv0.2のゼロベース実装�
   stateful forward firewallを扱う。
 - `ruster-io-sim`: rootやNICなしでRX/generated TXのFIFO、budget、TX/drop、
   traceを決定的に検証する。
+- `ruster-io-xdp`: AF_XDP native接続より前に固定するpure-Rust ownership model。
+  UMEM layout、descriptor境界、nonzero generation token、frame state ledgerだけを持ち、
+  socket、ring、FFI、core `PacketIo`接続はまだ持たない。
 
 ```text
 inject Vec<u8>

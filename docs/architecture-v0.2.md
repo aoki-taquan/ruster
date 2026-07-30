@@ -723,3 +723,46 @@ cancel/abandon、partial TX/reject、finish errorを決定的に実装します�
 `FrameOrigin`でRXとgeneratedを区別します。RX/生成の`Vec<u8>`そのものをTX/dropへmoveし、
 packet bytesをcloneしません。次の実I/O backendも同じlease contractを実装し、
 backend固有pointerをcoreへ漏らしません。
+
+`ruster-io-xdp`の最初のsliceは、native AF_XDP backendではなく、全targetでcompileできる
+pure-Rust ownership modelです。socket、ring、libxdp FFI、XDP program、core `PacketIo`
+adapterを持たず、`unsafe`をcrate全体で禁止します。従ってIO-009のreal generated backendは
+deferredのままです。
+
+UMEMは固定長frameの集合として表現し、descriptor addressはUMEM相対値です。
+`FrameId`はaddressをframe sizeで正規化したindexだけをcanonical identityとし、packet data
+offsetやvirtual addressをidentityに使いません。layoutはnonzero frame count、power-of-two
+frame size、frameより小さいheadroomをpublication前に検証します。descriptorはoptions zeroの
+single-buffer profileに限定し、nonzero visible length、UMEM範囲、headroom、同一frame内の
+`addr + len`をchecked arithmeticで検証してからledgerへ渡します。
+
+control planeはUMEM ownership lifetimeごとにnonzero 128-bit unique inputをcold pathで生成し、
+move-onlyな`UmemDomainId`としてlayoutへ渡します。この値はpointer、公開counter、ZST identity
+から導出せず、Debugでもredactします。同じ値を別のlive ledger、process restart後、UMEM
+recreate後に再利用してはなりません。layoutはledgerへconsumeされ、domainをin-place
+reconcileするAPIは持ちません。UMEMまたはledgerを作り直す場合は必ず新domainで全frameを
+Free/generation zeroから作り、旧token/descriptorをforeign domainとして拒否します。
+unique inputを知るconstructor callerはtrusted control-plane境界で、token consumerには値を
+公開しません。`FrameToken`と内部domain identityは`Hash`を実装しません。domainを
+caller-controlled `Hasher`へ渡さないため、token holderはHash経由で値を回収して
+`UmemDomainId`を再構成できません。
+
+各frameはledgerだけが発行できる
+`(hidden UMEM domain, FrameId, NonZeroU64 generation)` tokenで一ownership cycleを識別します。
+validated descriptorも同じhidden domainを保持します。token/descriptorはring state間で
+allocationなしに渡すため`Copy`ですが、copyから新しいownershipやdomain identityは生まれません。
+最初の有効なstate transition後、同じtokenの別copyはexact state checkで拒否されます。別ledgerの
+同じFrameId/generation tokenと、別layoutで検証した同じFrameId descriptorは、entry/counterを
+変更する前にtyped foreign-domain errorとなります。
+
+generationはchecked incrementだけで進め、`u64::MAX`の次へwrapせず、そのframeを
+`Quarantined`へ移して永久に通常reuseから外します。ledgerはFree、fill予約/kernel所有、
+RX available、core lease、pending/reserved/kernel TX、completion available、quarantineの
+exact partitionを持ちます。通常遷移はframe indexによるO(1) lookupと二つのstate counter更新
+だけです。全entry、domain、token identity、generation、descriptor、counterを再計算する
+`deep_audit`は明示的なcold pathです。stale token、wrong-state token、tokenと異なるframeへ
+canonicalizeされたdescriptorもentryとcounterを変更せずtyped errorで拒否します。
+
+ledgerはUMEMの全frame partitionを一workerが所有するため`!Send + !Sync`です。このpure modelは
+live byte sliceをまだ貸し出しませんが、将来のring/native engineも同じworker localityを維持
+するか、別設計の明示的ownership handoffを追加しなければなりません。

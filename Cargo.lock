@@ -27,3 +27,7 @@ dependencies = [
  "ruster-core",
  "ruster-io-conformance",
 ]
+
+[[package]]
+name = "ruster-io-xdp"
+version = "0.2.0"
