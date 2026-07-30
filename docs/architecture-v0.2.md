@@ -868,3 +868,27 @@ frame partition conservationを検証します。fakeのhot operationは四ring�
 
 fakeはengine、`PacketIo` adapter、socket、FFI、XDP attach、wakeup/pollを実装せず、
 token/domain constructorもX00A ledger/control-plane境界から移しません。
+
+### native AF_XDP ABI scaffold
+
+`ruster-io-xdp-native`の最初のsliceは、Linux v6.8
+`include/uapi/linux/if_xdp.h`を明示profileとして、将来のnative resource取得より前に必要な
+C layoutとcold validationだけを固定します。`sockaddr_xdp`、ring offset/mmap offsets、
+UMEM registration、statistics、negotiated options、RX/TX descriptorのsize、alignment、
+field offsetとsocket option/mmap offset定数をdependencyなしの`repr(C)`型として保持します。
+このsliceはFFI call、socket、mmap、pointer access、libxdp linkを一切行わず、crate全体で
+`unsafe`をdenyします。従ってnative backend、実kernel互換、packet送受信、zero-copy性能は
+まだ主張しません。
+
+initial profileのbind flagは`XDP_USE_NEED_WAKEUP`を必須とし、automatic、copy required、
+zero-copy requiredを区別します。`XDP_SHARED_UMEM`は許可しますが、copyとzero-copyの同時指定、
+scatter/gather、unknown bitをresource取得前にtyped rejectします。UMEMはaligned chunk、
+metadataなし、software checksum指定なしに限定し、frame count/size/headroom、RX/generated
+frame partitionを検証します。四ring capacityはnonzero power-of-twoです。RX/TX descriptorは
+single-bufferのoptions zeroだけを許可します。
+
+kernelが将来`XDP_MMAP_OFFSETS`で返す各ring offsetは、producer、consumer、flags、
+descriptor領域のalignment、checked extent、process `usize`変換、相互非overlapを検証してから
+minimum mmap byte lengthへ変換します。この計算はmemoryをaccessせず、offset overflowや
+aliasするlayoutをtyped errorにします。native syscall層は64-bit Linuxだけを対象とし、
+non-Linuxと未reviewのpointer widthはresource取得前のtyped unsupportedです。

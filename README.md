@@ -28,6 +28,10 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
   UMEM layout、descriptor境界、nonzero generation token、frame state ledger、
   fixed-storage ring、authoritative ledgerと結合したfinite fake kernelを持つ。socket、
   native ring、FFI、core `PacketIo`接続はまだ持たない。
+- `ruster-io-xdp-native`: Linux v6.8 AF_XDP UAPIのC layout、raw flag profile、
+  aligned UMEM/ring geometry、kernel報告mmap offsetをcold pathで検証するnative
+  scaffold。socket、mmap、ring access、libxdp link、core `PacketIo`接続はまだ持たず、
+  crate全体で`unsafe`をdenyする。
 - `ruster-runtime`: genericなpublication seamから一つのactive generationを借用し、
   `RX → resolution timer → failure dispatch → generated ARP → generated ICMPv4`を
   明示budget付きのsingle-worker tickとして実行する。
