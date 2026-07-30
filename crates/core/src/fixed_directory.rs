@@ -53,9 +53,15 @@ pub(crate) enum DirectoryHashDomain {
     TcpSession = 0x4e41_5434_5453_4553,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct DirectoryBucket {
     head: u32,
+}
+
+impl std::fmt::Debug for DirectoryBucket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DirectoryBucket([REDACTED])")
+    }
 }
 
 impl Default for DirectoryBucket {
@@ -64,12 +70,18 @@ impl Default for DirectoryBucket {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct DirectoryNode {
     hash: u64,
     bucket: u32,
     previous: u32,
     next: u32,
+}
+
+impl std::fmt::Debug for DirectoryNode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("DirectoryNode([REDACTED])")
+    }
 }
 
 impl Default for DirectoryNode {
@@ -707,18 +719,30 @@ fn sip_rounds(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64, rounds: us
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub struct PortOwnerSlot {
     state_index_plus_one: u32,
     state_generation: u64,
     runtime_epoch: u128,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+impl std::fmt::Debug for PortOwnerSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PortOwnerSlot([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct PortOwnerToken {
     state_index: u32,
     state_generation: u64,
     runtime_epoch: u128,
+}
+
+impl std::fmt::Debug for PortOwnerToken {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PortOwnerToken([REDACTED])")
+    }
 }
 
 impl PortOwnerToken {
@@ -840,11 +864,17 @@ impl PreparedPortOwnerMove {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) struct PortOwnerExpectation {
     pub port: u16,
     pub state_generation: u64,
     pub runtime_epoch: u128,
+}
+
+impl std::fmt::Debug for PortOwnerExpectation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PortOwnerExpectation([REDACTED])")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1325,6 +1355,87 @@ mod tests {
         assert_eq!(format!("{first_key:?}"), "DirectoryHashKey([REDACTED])");
         assert_eq!(format!("{first_key:#?}"), "DirectoryHashKey([REDACTED])");
         assert_eq!(format!("{first_key:?}"), format!("{second_key:?}"));
+    }
+
+    #[test]
+    fn directory_and_port_owner_debug_are_topology_independent() {
+        const POISON_U64: u64 = 18_446_744_073_709_551_613;
+        const POISON_U128: u128 = 0xfedc_ba98_7654_3210_0123_4567_89ab_cdef;
+
+        let buckets_a = [
+            DirectoryBucket::default(),
+            DirectoryBucket { head: u32::MAX - 2 },
+        ];
+        let buckets_b = [DirectoryBucket { head: 7 }, DirectoryBucket::default()];
+        assert_eq!(
+            format!("{buckets_a:?}"),
+            "[DirectoryBucket([REDACTED]), DirectoryBucket([REDACTED])]"
+        );
+        assert_eq!(format!("{buckets_a:#?}"), format!("{buckets_b:#?}"));
+
+        let nodes_a = [
+            DirectoryNode::default(),
+            DirectoryNode {
+                hash: POISON_U64,
+                bucket: u32::MAX - 3,
+                previous: u32::MAX - 4,
+                next: u32::MAX - 5,
+            },
+        ];
+        let nodes_b = [nodes_a[1], nodes_a[0]];
+        assert_eq!(
+            format!("{nodes_a:?}"),
+            "[DirectoryNode([REDACTED]), DirectoryNode([REDACTED])]"
+        );
+        assert_eq!(format!("{nodes_a:#?}"), format!("{nodes_b:#?}"));
+
+        let owner_slots_a = [
+            PortOwnerSlot::default(),
+            PortOwnerSlot {
+                state_index_plus_one: u32::MAX - 6,
+                state_generation: POISON_U64,
+                runtime_epoch: POISON_U128,
+            },
+        ];
+        let owner_slots_b = [owner_slots_a[1], owner_slots_a[0]];
+        assert_eq!(
+            format!("{owner_slots_a:?}"),
+            "[PortOwnerSlot([REDACTED]), PortOwnerSlot([REDACTED])]"
+        );
+        assert_eq!(format!("{owner_slots_a:#?}"), format!("{owner_slots_b:#?}"));
+
+        let token_a = PortOwnerToken::new(0, 1, 2).unwrap();
+        let token_b = PortOwnerToken::new(u32::MAX as usize - 1, POISON_U64, POISON_U128).unwrap();
+        assert_eq!(format!("{token_a:?}"), "PortOwnerToken([REDACTED])");
+        assert_eq!(format!("{token_a:#?}"), "PortOwnerToken([REDACTED])");
+        assert_eq!(format!("{token_a:?}"), format!("{token_b:?}"));
+
+        let expectation_a = PortOwnerExpectation {
+            port: 1,
+            state_generation: 2,
+            runtime_epoch: 3,
+        };
+        let expectation_b = PortOwnerExpectation {
+            port: u16::MAX,
+            state_generation: POISON_U64,
+            runtime_epoch: POISON_U128,
+        };
+        assert_eq!(
+            format!("{expectation_a:?}"),
+            "PortOwnerExpectation([REDACTED])"
+        );
+        assert_eq!(
+            format!("{expectation_a:#?}"),
+            "PortOwnerExpectation([REDACTED])"
+        );
+        assert_eq!(format!("{expectation_a:?}"), format!("{expectation_b:?}"));
+
+        let combined =
+            format!("{buckets_a:?}{nodes_a:?}{owner_slots_a:?}{token_b:?}{expectation_b:?}");
+        assert!(!combined.contains(&POISON_U64.to_string()));
+        assert!(!combined.contains(&format!("{POISON_U64:x}")));
+        assert!(!combined.contains(&POISON_U128.to_string()));
+        assert!(!combined.contains(&format!("{POISON_U128:x}")));
     }
 
     #[test]

@@ -27,6 +27,14 @@ const UDP_INDEX_NONE: u32 = u32::MAX;
 const TCP_INDEX_NONE: u32 = u32::MAX;
 static NEXT_UDP_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
+struct Redacted;
+
+impl std::fmt::Debug for Redacted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
 fn allocate_udp_runtime_identity() -> Result<u64, Nat44UdpRuntimeConfigError> {
     allocate_udp_runtime_identity_from(&NEXT_UDP_RUNTIME_IDENTITY)
 }
@@ -57,11 +65,22 @@ pub enum Nat44Icmpv4ErrorPolicy {
     ExternalOnly,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Nat44UdpPolicy {
     idle_ttl_ms: u64,
     allocator_seed: u64,
     icmpv4_errors: Nat44Icmpv4ErrorPolicy,
+}
+
+impl std::fmt::Debug for Nat44UdpPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Nat44UdpPolicy")
+            .field("idle_ttl_ms", &self.idle_ttl_ms)
+            .field("allocator_seed", &Redacted)
+            .field("icmpv4_errors", &self.icmpv4_errors)
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -1531,7 +1550,7 @@ impl Nat44UdpHashKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Nat44UdpConfig {
     inside: IfId,
     outside: IfId,
@@ -1541,6 +1560,22 @@ pub struct Nat44UdpConfig {
     policy: Nat44UdpPolicy,
     authority: u64,
     snapshot_identity: [usize; 8],
+}
+
+impl std::fmt::Debug for Nat44UdpConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Nat44UdpConfig")
+            .field("inside", &self.inside)
+            .field("outside", &self.outside)
+            .field("public_address", &self.public_address)
+            .field("first_port", &self.first_port)
+            .field("last_port", &self.last_port)
+            .field("policy", &self.policy)
+            .field("authority", &Redacted)
+            .field("snapshot_identity", &Redacted)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1650,7 +1685,7 @@ impl Nat44UdpConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Nat44UdpMappingSlot {
     occupied: bool,
     generation: u64,
@@ -1661,6 +1696,18 @@ pub struct Nat44UdpMappingSlot {
     internal_port: u16,
     public_port: u16,
     last_outbound_ms: u64,
+}
+
+impl std::fmt::Debug for Nat44UdpMappingSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Nat44UdpMappingSlot")
+            .field("occupied", &self.occupied)
+            .field("inside", &self.inside)
+            .field("public_port", &self.public_port)
+            .field("last_outbound_ms", &self.last_outbound_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Nat44UdpMappingSlot {
@@ -1706,13 +1753,22 @@ impl Nat44UdpMappingSlot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Nat44UdpPeerSlot {
     occupied: bool,
     mapping_index: usize,
     mapping_generation: u64,
     mapping_lifecycle_epoch: u128,
     remote_address: Ipv4Address,
+}
+
+impl std::fmt::Debug for Nat44UdpPeerSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Nat44UdpPeerSlot")
+            .field("occupied", &self.occupied)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Nat44UdpPeerSlot {
@@ -2163,10 +2219,16 @@ impl Nat44UdpReconcilePermit<'_, '_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct Nat44UdpBackingIdentity {
     address: usize,
     length: usize,
+}
+
+impl std::fmt::Debug for Nat44UdpBackingIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Nat44UdpBackingIdentity([REDACTED])")
+    }
 }
 
 impl Nat44UdpBackingIdentity {
@@ -3410,11 +3472,22 @@ impl Nat44TcpHashKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Nat44TcpPolicy {
     idle_ttl_ms: u64,
     allocator_seed: u64,
     icmpv4_errors: Nat44Icmpv4ErrorPolicy,
+}
+
+impl std::fmt::Debug for Nat44TcpPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Nat44TcpPolicy")
+            .field("idle_ttl_ms", &self.idle_ttl_ms)
+            .field("allocator_seed", &Redacted)
+            .field("icmpv4_errors", &self.icmpv4_errors)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3471,7 +3544,7 @@ impl Default for Nat44TcpPolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Nat44TcpConfig {
     inside: IfId,
     outside: IfId,
@@ -3481,6 +3554,22 @@ pub struct Nat44TcpConfig {
     policy: Nat44TcpPolicy,
     authority: u64,
     snapshot_identity: [usize; 8],
+}
+
+impl std::fmt::Debug for Nat44TcpConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Nat44TcpConfig")
+            .field("inside", &self.inside)
+            .field("outside", &self.outside)
+            .field("public_address", &self.public_address)
+            .field("first_port", &self.first_port)
+            .field("last_port", &self.last_port)
+            .field("policy", &self.policy)
+            .field("authority", &Redacted)
+            .field("snapshot_identity", &Redacted)
+            .finish()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3596,7 +3685,7 @@ impl Nat44TcpConfig {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Nat44TcpMappingSlot {
     occupied: bool,
     generation: u64,
@@ -3607,6 +3696,18 @@ pub struct Nat44TcpMappingSlot {
     internal_port: u16,
     public_port: u16,
     last_activity_ms: u64,
+}
+
+impl std::fmt::Debug for Nat44TcpMappingSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Nat44TcpMappingSlot")
+            .field("occupied", &self.occupied)
+            .field("inside", &self.inside)
+            .field("public_port", &self.public_port)
+            .field("last_activity_ms", &self.last_activity_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Nat44TcpMappingSlot {
@@ -3647,7 +3748,7 @@ impl Nat44TcpMappingSlot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Nat44TcpSessionSlot {
     occupied: bool,
     mapping_index: usize,
@@ -3656,6 +3757,16 @@ pub struct Nat44TcpSessionSlot {
     remote_address: Ipv4Address,
     remote_port: u16,
     last_activity_ms: u64,
+}
+
+impl std::fmt::Debug for Nat44TcpSessionSlot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Nat44TcpSessionSlot")
+            .field("occupied", &self.occupied)
+            .field("last_activity_ms", &self.last_activity_ms)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Nat44TcpSessionSlot {
@@ -5422,6 +5533,652 @@ mod tests {
         )
         .unwrap();
         run(config)
+    }
+
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        if let Some(message) = payload.downcast_ref::<String>() {
+            return message.clone();
+        }
+        payload
+            .downcast_ref::<&str>()
+            .map_or_else(String::new, |message| (*message).to_owned())
+    }
+
+    #[test]
+    fn nat44_public_debug_redaction_is_exact_and_deterministic() {
+        const POISON_SEED: u64 = 18_446_744_073_709_551_613;
+        const POISON_AUTHORITY: u64 = 18_446_744_073_709_551_611;
+        const POISON_POINTER: usize = usize::MAX - 6;
+
+        let udp_policy = Nat44UdpPolicy::new(NAT44_UDP_MIN_IDLE_TTL_MS, POISON_SEED)
+            .unwrap()
+            .with_icmpv4_errors(Nat44Icmpv4ErrorPolicy::ExternalOnly);
+        let tcp_policy = Nat44TcpPolicy::new(NAT44_TCP_MIN_IDLE_TTL_MS, POISON_SEED)
+            .unwrap()
+            .with_icmpv4_errors(Nat44Icmpv4ErrorPolicy::ExternalOnly);
+
+        assert_eq!(
+            format!("{udp_policy:?}"),
+            "Nat44UdpPolicy { idle_ttl_ms: 120000, allocator_seed: [REDACTED], \
+             icmpv4_errors: ExternalOnly }"
+        );
+        assert_eq!(
+            format!("{udp_policy:#?}"),
+            "Nat44UdpPolicy {\n    idle_ttl_ms: 120000,\n    allocator_seed: [REDACTED],\n    \
+             icmpv4_errors: ExternalOnly,\n}"
+        );
+        assert_eq!(
+            format!("{tcp_policy:?}"),
+            "Nat44TcpPolicy { idle_ttl_ms: 7440000, allocator_seed: [REDACTED], \
+             icmpv4_errors: ExternalOnly }"
+        );
+        assert_eq!(
+            format!("{tcp_policy:#?}"),
+            "Nat44TcpPolicy {\n    idle_ttl_ms: 7440000,\n    allocator_seed: [REDACTED],\n    \
+             icmpv4_errors: ExternalOnly,\n}"
+        );
+
+        with_config(udp_policy, |udp_config| {
+            let tcp_config = Nat44TcpConfig {
+                inside: udp_config.inside,
+                outside: udp_config.outside,
+                public_address: udp_config.public_address,
+                first_port: udp_config.first_port,
+                last_port: udp_config.last_port,
+                policy: tcp_policy,
+                authority: udp_config.authority,
+                snapshot_identity: udp_config.snapshot_identity,
+            };
+            let mut poisoned_udp = udp_config;
+            poisoned_udp.policy.allocator_seed = POISON_SEED - 2;
+            poisoned_udp.authority = POISON_AUTHORITY;
+            poisoned_udp.snapshot_identity = [POISON_POINTER; 8];
+            let mut poisoned_tcp = tcp_config;
+            poisoned_tcp.policy.allocator_seed = POISON_SEED - 4;
+            poisoned_tcp.authority = POISON_AUTHORITY;
+            poisoned_tcp.snapshot_identity = [POISON_POINTER; 8];
+
+            assert_eq!(format!("{udp_config:?}"), format!("{poisoned_udp:?}"));
+            assert_eq!(format!("{udp_config:#?}"), format!("{poisoned_udp:#?}"));
+            assert_eq!(format!("{tcp_config:?}"), format!("{poisoned_tcp:?}"));
+            assert_eq!(format!("{tcp_config:#?}"), format!("{poisoned_tcp:#?}"));
+            assert_eq!(
+                format!("{udp_config:?}"),
+                "Nat44UdpConfig { inside: IfId(1), outside: IfId(2), public_address: \
+                 Ipv4Address(3405803786), first_port: 40000, last_port: 40001, policy: \
+                 Nat44UdpPolicy { idle_ttl_ms: 120000, allocator_seed: [REDACTED], \
+                 icmpv4_errors: ExternalOnly }, authority: [REDACTED], snapshot_identity: \
+                 [REDACTED] }"
+            );
+            assert_eq!(
+                format!("{tcp_config:?}"),
+                "Nat44TcpConfig { inside: IfId(1), outside: IfId(2), public_address: \
+                 Ipv4Address(3405803786), first_port: 40000, last_port: 40001, policy: \
+                 Nat44TcpPolicy { idle_ttl_ms: 7440000, allocator_seed: [REDACTED], \
+                 icmpv4_errors: ExternalOnly }, authority: [REDACTED], snapshot_identity: \
+                 [REDACTED] }"
+            );
+            let udp_pretty = format!("{udp_config:#?}");
+            let tcp_pretty = format!("{tcp_config:#?}");
+            assert_eq!(
+                udp_pretty,
+                "Nat44UdpConfig {\n    inside: IfId(\n        1,\n    ),\n    outside: IfId(\n        \
+                 2,\n    ),\n    public_address: Ipv4Address(\n        3405803786,\n    ),\n    \
+                 first_port: 40000,\n    last_port: 40001,\n    policy: Nat44UdpPolicy {\n        \
+                 idle_ttl_ms: 120000,\n        allocator_seed: [REDACTED],\n        icmpv4_errors: \
+                 ExternalOnly,\n    },\n    authority: [REDACTED],\n    snapshot_identity: \
+                 [REDACTED],\n}"
+            );
+            assert_eq!(
+                tcp_pretty,
+                "Nat44TcpConfig {\n    inside: IfId(\n        1,\n    ),\n    outside: IfId(\n        \
+                 2,\n    ),\n    public_address: Ipv4Address(\n        3405803786,\n    ),\n    \
+                 first_port: 40000,\n    last_port: 40001,\n    policy: Nat44TcpPolicy {\n        \
+                 idle_ttl_ms: 7440000,\n        allocator_seed: [REDACTED],\n        icmpv4_errors: \
+                 ExternalOnly,\n    },\n    authority: [REDACTED],\n    snapshot_identity: \
+                 [REDACTED],\n}"
+            );
+            assert_eq!(udp_pretty.matches("[REDACTED]").count(), 3);
+            assert_eq!(tcp_pretty.matches("[REDACTED]").count(), 3);
+            assert!(udp_pretty.contains("\n    authority: [REDACTED],\n"));
+            assert!(udp_pretty.contains("\n    snapshot_identity: [REDACTED],\n"));
+            assert!(tcp_pretty.contains("\n    authority: [REDACTED],\n"));
+            assert!(tcp_pretty.contains("\n    snapshot_identity: [REDACTED],\n"));
+
+            #[derive(Debug)]
+            #[allow(dead_code)]
+            struct Nested<T> {
+                value: T,
+            }
+            assert_eq!(
+                format!("{:?}", Nested { value: udp_config }),
+                format!(
+                    "{:?}",
+                    Nested {
+                        value: poisoned_udp
+                    }
+                )
+            );
+            assert_eq!(
+                format!("{:#?}", Nested { value: tcp_config }),
+                format!(
+                    "{:#?}",
+                    Nested {
+                        value: poisoned_tcp
+                    }
+                )
+            );
+
+            let mut safe_change = udp_config;
+            safe_change.last_port -= 1;
+            assert_ne!(format!("{udp_config:?}"), format!("{safe_change:?}"));
+
+            let combined =
+                format!("{poisoned_udp:?}{poisoned_udp:#?}{poisoned_tcp:?}{poisoned_tcp:#?}");
+            for poison in [
+                POISON_SEED.to_string(),
+                format!("{POISON_SEED:x}"),
+                POISON_AUTHORITY.to_string(),
+                format!("{POISON_AUTHORITY:x}"),
+                POISON_POINTER.to_string(),
+                format!("{POISON_POINTER:x}"),
+            ] {
+                assert!(!combined.contains(&poison), "leaked poison marker");
+            }
+        });
+
+        let panic = std::panic::catch_unwind(|| {
+            assert_eq!(
+                Nat44UdpPolicy::new(NAT44_UDP_MIN_IDLE_TTL_MS, POISON_SEED).unwrap(),
+                Nat44UdpPolicy::new(NAT44_UDP_MIN_IDLE_TTL_MS, POISON_SEED - 1).unwrap()
+            );
+        })
+        .unwrap_err();
+        let panic = panic_message(panic);
+        assert!(panic.contains("Nat44UdpPolicy"));
+        assert!(panic.contains("[REDACTED]"));
+        assert!(!panic.contains(&POISON_SEED.to_string()));
+        assert!(!panic.contains(&format!("{POISON_SEED:x}")));
+    }
+
+    #[test]
+    fn nat44_state_slot_debug_exposes_only_allowed_telemetry() {
+        const POISON_U64: u64 = 18_446_744_073_709_551_613;
+        const POISON_U128: u128 = 0xfedc_ba98_7654_3210_0123_4567_89ab_cdef;
+        const POISON_INDEX: usize = usize::MAX - 8;
+        const POISON_ADDRESS: Ipv4Address = Ipv4Address::from_octets([253, 252, 251, 250]);
+
+        let udp_mapping = Nat44UdpMappingSlot {
+            occupied: true,
+            generation: POISON_U64,
+            lifecycle_epoch: POISON_U128,
+            port_owned: true,
+            inside: INSIDE,
+            internal_address: POISON_ADDRESS,
+            internal_port: 65_533,
+            public_port: 40_001,
+            last_outbound_ms: 77,
+        };
+        let mut udp_mapping_hidden = udp_mapping;
+        udp_mapping_hidden.generation -= 1;
+        udp_mapping_hidden.lifecycle_epoch -= 1;
+        udp_mapping_hidden.port_owned = false;
+        udp_mapping_hidden.internal_address = INTERNAL2;
+        udp_mapping_hidden.internal_port = 65_531;
+        assert_eq!(
+            format!("{udp_mapping:?}"),
+            "Nat44UdpMappingSlot { occupied: true, inside: IfId(1), public_port: 40001, \
+             last_outbound_ms: 77, .. }"
+        );
+        assert_eq!(
+            format!("{udp_mapping:#?}"),
+            "Nat44UdpMappingSlot {\n    occupied: true,\n    inside: IfId(\n        1,\n    ),\n    \
+             public_port: 40001,\n    last_outbound_ms: 77,\n    ..\n}"
+        );
+        assert_eq!(
+            format!("{udp_mapping:?}"),
+            format!("{udp_mapping_hidden:?}")
+        );
+
+        let udp_peer = Nat44UdpPeerSlot {
+            occupied: true,
+            mapping_index: POISON_INDEX,
+            mapping_generation: POISON_U64,
+            mapping_lifecycle_epoch: POISON_U128,
+            remote_address: POISON_ADDRESS,
+        };
+        let mut udp_peer_hidden = udp_peer;
+        udp_peer_hidden.mapping_index -= 1;
+        udp_peer_hidden.mapping_generation -= 1;
+        udp_peer_hidden.mapping_lifecycle_epoch -= 1;
+        udp_peer_hidden.remote_address = REMOTE2;
+        assert_eq!(
+            format!("{udp_peer:?}"),
+            "Nat44UdpPeerSlot { occupied: true, .. }"
+        );
+        assert_eq!(
+            format!("{udp_peer:#?}"),
+            "Nat44UdpPeerSlot {\n    occupied: true,\n    ..\n}"
+        );
+        assert_eq!(format!("{udp_peer:?}"), format!("{udp_peer_hidden:?}"));
+
+        let tcp_mapping = Nat44TcpMappingSlot {
+            occupied: true,
+            generation: POISON_U64,
+            lifecycle_epoch: POISON_U128,
+            port_owned: true,
+            inside: INSIDE,
+            internal_address: POISON_ADDRESS,
+            internal_port: 65_533,
+            public_port: 40_001,
+            last_activity_ms: 88,
+        };
+        let mut tcp_mapping_hidden = tcp_mapping;
+        tcp_mapping_hidden.generation -= 1;
+        tcp_mapping_hidden.lifecycle_epoch -= 1;
+        tcp_mapping_hidden.port_owned = false;
+        tcp_mapping_hidden.internal_address = INTERNAL2;
+        tcp_mapping_hidden.internal_port = 65_531;
+        assert_eq!(
+            format!("{tcp_mapping:?}"),
+            "Nat44TcpMappingSlot { occupied: true, inside: IfId(1), public_port: 40001, \
+             last_activity_ms: 88, .. }"
+        );
+        assert_eq!(
+            format!("{tcp_mapping:?}"),
+            format!("{tcp_mapping_hidden:?}")
+        );
+        assert_eq!(
+            format!("{tcp_mapping:#?}"),
+            "Nat44TcpMappingSlot {\n    occupied: true,\n    inside: IfId(\n        1,\n    ),\n    \
+             public_port: 40001,\n    last_activity_ms: 88,\n    ..\n}"
+        );
+
+        let tcp_session = Nat44TcpSessionSlot {
+            occupied: true,
+            mapping_index: POISON_INDEX,
+            mapping_generation: POISON_U64,
+            mapping_lifecycle_epoch: POISON_U128,
+            remote_address: POISON_ADDRESS,
+            remote_port: 65_529,
+            last_activity_ms: 99,
+        };
+        let mut tcp_session_hidden = tcp_session;
+        tcp_session_hidden.mapping_index -= 1;
+        tcp_session_hidden.mapping_generation -= 1;
+        tcp_session_hidden.mapping_lifecycle_epoch -= 1;
+        tcp_session_hidden.remote_address = REMOTE2;
+        tcp_session_hidden.remote_port = 65_527;
+        assert_eq!(
+            format!("{tcp_session:?}"),
+            "Nat44TcpSessionSlot { occupied: true, last_activity_ms: 99, .. }"
+        );
+        assert_eq!(
+            format!("{tcp_session:#?}"),
+            "Nat44TcpSessionSlot {\n    occupied: true,\n    last_activity_ms: 99,\n    ..\n}"
+        );
+        assert_eq!(
+            format!("{tcp_session:?}"),
+            format!("{tcp_session_hidden:?}")
+        );
+
+        let backing = Nat44UdpBackingIdentity {
+            address: POISON_INDEX,
+            length: POISON_INDEX - 2,
+        };
+        let other_backing = Nat44UdpBackingIdentity {
+            address: 1,
+            length: 2,
+        };
+        assert_eq!(
+            format!("{backing:?}"),
+            "Nat44UdpBackingIdentity([REDACTED])"
+        );
+        assert_eq!(
+            format!("{backing:#?}"),
+            "Nat44UdpBackingIdentity([REDACTED])"
+        );
+        assert_eq!(format!("{backing:?}"), format!("{other_backing:?}"));
+
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct SlotSet {
+            udp_mapping: Nat44UdpMappingSlot,
+            udp_peer: Nat44UdpPeerSlot,
+            tcp_mapping: Nat44TcpMappingSlot,
+            tcp_session: Nat44TcpSessionSlot,
+            backing: Nat44UdpBackingIdentity,
+        }
+        let nested = format!(
+            "{:#?}",
+            SlotSet {
+                udp_mapping,
+                udp_peer,
+                tcp_mapping,
+                tcp_session,
+                backing,
+            }
+        );
+        for poison in [
+            POISON_U64.to_string(),
+            format!("{POISON_U64:x}"),
+            POISON_U128.to_string(),
+            format!("{POISON_U128:x}"),
+            POISON_INDEX.to_string(),
+            format!("{POISON_INDEX:x}"),
+            "253.252.251.250".to_owned(),
+            "65533".to_owned(),
+            "65529".to_owned(),
+        ] {
+            assert!(!nested.contains(&poison), "leaked poison marker");
+        }
+
+        let mut safe_change = tcp_session;
+        safe_change.last_activity_ms += 1;
+        assert_ne!(format!("{tcp_session:?}"), format!("{safe_change:?}"));
+    }
+
+    #[test]
+    fn nat44_debug_source_boundary_is_explicit_and_panic_payloads_are_static() {
+        fn assert_custom_debug(source: &str, declaration: &str) {
+            let declaration = source
+                .find(declaration)
+                .unwrap_or_else(|| panic!("missing declaration: {declaration}"));
+            let tests = source
+                .rfind("#[cfg(test)]\nmod tests {")
+                .expect("source has final test module");
+            assert!(
+                declaration < tests,
+                "matched test text instead of production"
+            );
+            for line in source[..declaration].lines().rev() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with("///") {
+                    continue;
+                }
+                if line.starts_with("#[") {
+                    assert!(
+                        !(line.starts_with("#[derive(") && line.contains("Debug")),
+                        "{declaration} must not derive Debug"
+                    );
+                    continue;
+                }
+                break;
+            }
+        }
+
+        fn assert_no_debug_surface(source: &str, declaration: &str, type_name: &str) {
+            assert_custom_debug(source, declaration);
+            assert!(
+                !source.contains(&format!("Debug for {type_name}")),
+                "{type_name} must remain non-debuggable"
+            );
+        }
+
+        fn type_block<'a>(source: &'a str, declaration: &str) -> &'a str {
+            let start = source
+                .find(declaration)
+                .unwrap_or_else(|| panic!("missing declaration: {declaration}"));
+            let tests = source
+                .rfind("#[cfg(test)]\nmod tests {")
+                .expect("source has final test module");
+            assert!(start < tests, "matched test text instead of production");
+            let remainder = &source[start..tests];
+            let end = [
+                "\n\n#[derive",
+                "\n\nimpl ",
+                "\n\n#[cfg",
+                "\n\n///",
+                "\n\npub(",
+                "\n\npub ",
+                "\n\nstruct ",
+                "\n\nenum ",
+                "\n\nfn ",
+            ]
+            .into_iter()
+            .filter_map(|boundary| remainder.find(boundary))
+            .min()
+            .unwrap_or(remainder.len());
+            &remainder[..end]
+        }
+
+        fn assert_contains_no_hidden_type(source: &str, declaration: &str) {
+            let block = type_block(source, declaration);
+            for hidden in [
+                "Nat44UdpPolicy",
+                "Nat44TcpPolicy",
+                "Nat44UdpConfig",
+                "Nat44TcpConfig",
+                "Nat44UdpHashKey",
+                "Nat44TcpHashKey",
+                "Nat44UdpMappingSlot",
+                "Nat44UdpPeerSlot",
+                "Nat44TcpMappingSlot",
+                "Nat44TcpSessionSlot",
+                "Nat44UdpBackingIdentity",
+                "DirectoryBucket",
+                "DirectoryNode",
+                "PortOwnerSlot",
+                "PortOwnerToken",
+                "PortOwnerExpectation",
+            ] {
+                assert!(
+                    !block.contains(hidden),
+                    "{declaration} unexpectedly nests hidden {hidden}"
+                );
+            }
+        }
+
+        fn public_field_names<'a>(source: &'a str, declaration: &str) -> Vec<&'a str> {
+            type_block(source, declaration)
+                .lines()
+                .filter_map(|line| {
+                    line.trim()
+                        .strip_prefix("pub ")
+                        .and_then(|field| field.split_once(':'))
+                        .map(|(name, _)| name)
+                })
+                .collect()
+        }
+
+        let nat_source = include_str!("nat44.rs");
+        let directory_source = include_str!("fixed_directory.rs");
+        for declaration in [
+            "pub struct Nat44UdpPolicy",
+            "pub struct Nat44TcpPolicy",
+            "pub struct Nat44UdpConfig",
+            "pub struct Nat44TcpConfig",
+            "pub struct Nat44UdpMappingSlot",
+            "pub struct Nat44UdpPeerSlot",
+            "pub struct Nat44TcpMappingSlot",
+            "pub struct Nat44TcpSessionSlot",
+            "struct Nat44UdpBackingIdentity",
+        ] {
+            assert_custom_debug(nat_source, declaration);
+        }
+        for declaration in [
+            "pub struct DirectoryBucket",
+            "pub struct DirectoryNode",
+            "pub struct PortOwnerSlot",
+            "pub(crate) struct PortOwnerToken",
+            "pub(crate) struct PortOwnerExpectation",
+        ] {
+            assert_custom_debug(directory_source, declaration);
+        }
+        for (declaration, type_name) in [
+            (
+                "struct Nat44UdpReconcileBinding",
+                "Nat44UdpReconcileBinding",
+            ),
+            ("struct Nat44TcpRuntimeBinding", "Nat44TcpRuntimeBinding"),
+            ("pub struct Nat44UdpIndexStorage", "Nat44UdpIndexStorage"),
+            ("pub struct Nat44TcpIndexStorage", "Nat44TcpIndexStorage"),
+            ("pub struct Nat44UdpRuntime", "Nat44UdpRuntime"),
+            ("pub struct Nat44TcpRuntime", "Nat44TcpRuntime"),
+            (
+                "pub struct Nat44UdpReconcilePermit",
+                "Nat44UdpReconcilePermit",
+            ),
+            (
+                "pub struct Nat44TcpReconcilePermit",
+                "Nat44TcpReconcilePermit",
+            ),
+        ] {
+            assert_no_debug_surface(nat_source, declaration, type_name);
+        }
+
+        // These are deliberate caller-selected telemetry, unlike accidental
+        // formatting of long-lived configuration, state, and backing storage.
+        for declaration in [
+            "pub enum Nat44UdpDisposition",
+            "pub enum Nat44TcpDisposition",
+            "pub struct Nat44UdpCounters",
+            "pub struct Nat44TcpCounters",
+            "pub struct Nat44UdpReconcileReport",
+            "pub struct Nat44TcpReconcileReport",
+            "pub struct Nat44UdpStorageShape",
+            "pub struct Nat44TcpStorageShape",
+            "pub(crate) enum Nat44UdpPlanError",
+            "pub(crate) enum Nat44TcpPlanError",
+            "pub(crate) enum Nat44UdpCommitError",
+            "pub(crate) enum Nat44TcpCommitError",
+            "pub enum Nat44UdpRuntimeConfigError",
+            "pub enum Nat44TcpRuntimeConfigError",
+            "pub enum Nat44UdpReconcileError",
+            "pub enum Nat44TcpReconcileError",
+        ] {
+            assert_contains_no_hidden_type(nat_source, declaration);
+        }
+        for declaration in [
+            "pub(crate) enum DirectoryLookupError",
+            "pub(crate) struct DirectoryProbe",
+            "pub(crate) struct DirectoryConservation",
+            "pub(crate) enum DirectorySemanticError",
+            "pub(crate) struct PortOwnerConservation",
+            "pub(crate) enum PortOwnerSemanticError",
+        ] {
+            assert_contains_no_hidden_type(directory_source, declaration);
+        }
+
+        assert_eq!(
+            public_field_names(nat_source, "pub struct Nat44UdpCounters"),
+            [
+                "mappings_created",
+                "mappings_reused",
+                "mappings_expired",
+                "peers_created",
+                "outbound_translated",
+                "inbound_translated",
+                "mapping_misses",
+                "filter_denied",
+                "mapping_full",
+                "peer_full",
+                "port_exhausted",
+                "clock_regressions",
+                "config_mismatches",
+                "reconciliations",
+            ]
+        );
+        assert_eq!(
+            public_field_names(nat_source, "pub struct Nat44TcpCounters"),
+            [
+                "mappings_created",
+                "mappings_reused",
+                "mappings_expired",
+                "sessions_created",
+                "sessions_reused",
+                "sessions_expired",
+                "outbound_translated",
+                "inbound_translated",
+                "mapping_misses",
+                "session_misses",
+                "invalid_initial_flags",
+                "mapping_full",
+                "session_full",
+                "port_exhausted",
+                "clock_regressions",
+                "config_mismatches",
+                "reconciliations",
+            ]
+        );
+        assert_eq!(
+            public_field_names(nat_source, "pub struct Nat44UdpReconcileReport"),
+            ["mappings_flushed", "peers_flushed"]
+        );
+        assert_eq!(
+            public_field_names(nat_source, "pub struct Nat44TcpReconcileReport"),
+            ["mappings_flushed", "sessions_flushed"]
+        );
+        assert_eq!(
+            type_block(nat_source, "pub struct Nat44UdpStorageShape")
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    line.strip_suffix(':')
+                        .or_else(|| line.split_once(':').map(|(name, _)| name))
+                        .filter(|name| !name.starts_with("pub struct"))
+                })
+                .collect::<Vec<_>>(),
+            [
+                "mapping_slots",
+                "peer_slots",
+                "mapping_buckets",
+                "mapping_nodes",
+                "peer_buckets",
+                "peer_nodes",
+                "port_owner_slots",
+            ]
+        );
+        assert_eq!(
+            type_block(nat_source, "pub struct Nat44TcpStorageShape")
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    line.strip_suffix(':')
+                        .or_else(|| line.split_once(':').map(|(name, _)| name))
+                        .filter(|name| !name.starts_with("pub struct"))
+                })
+                .collect::<Vec<_>>(),
+            [
+                "mapping_slots",
+                "session_slots",
+                "mapping_buckets",
+                "mapping_nodes",
+                "session_buckets",
+                "session_nodes",
+                "port_owner_slots",
+            ]
+        );
+
+        let before_tcp_tests = nat_source
+            .split_once("#[cfg(test)]\nmod tcp_tests {")
+            .unwrap()
+            .0;
+        let after_tcp_tests = nat_source
+            .split_once("pub enum Nat44UdpPolicyError")
+            .unwrap()
+            .1
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        let directory_production = directory_source
+            .split_once("#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        for production in [before_tcp_tests, after_tcp_tests, directory_production] {
+            for forbidden in ["panic!(", "assert_eq!(", "assert_ne!("] {
+                assert!(
+                    !production.contains(forbidden),
+                    "production formatting must not use dynamic {forbidden}"
+                );
+            }
+            for line in production.lines().filter(|line| line.contains(".expect(")) {
+                assert!(
+                    line.contains(".expect(\""),
+                    "production expect payload must be a static literal: {line}"
+                );
+            }
+        }
     }
 
     #[test]
