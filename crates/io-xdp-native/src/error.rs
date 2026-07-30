@@ -220,3 +220,22 @@ impl fmt::Display for PlatformError {
 }
 
 impl Error for PlatformError {}
+
+/// Narrow platform failure for the architecture-dependent native syscall seam.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeSyscallPlatformError {
+    /// Native syscalls are available only on Linux.
+    UnsupportedOperatingSystem,
+    /// The reviewed syscall ABI uses 64-bit pointer-sized C types.
+    UnsupportedPointerWidth,
+    /// Numeric syscall flags are audited only for x86_64.
+    UnsupportedArchitecture,
+}
+
+impl fmt::Display for NativeSyscallPlatformError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for NativeSyscallPlatformError {}
