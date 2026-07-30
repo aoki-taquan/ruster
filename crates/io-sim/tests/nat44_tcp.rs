@@ -1163,6 +1163,27 @@ fn backend_reject_retains_tx_requested_mapping_and_session() {
     assert_eq!(nat.counters().mappings_created, 1);
     assert_eq!(nat.counters().sessions_created, 1);
 
+    io.inject(
+        LAN,
+        tcp_frame(HOST, REMOTE1, 40_000, 443, 64, 0x4000, 0x18, &[], &[1], &[]),
+    );
+    let refresh_ms = 10;
+    let report = io
+        .run_nat44_tcp_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(&mut nat),
+            MonotonicMillis(refresh_ms),
+            &mut NoTrace,
+        )
+        .unwrap();
+    assert_eq!(report.completion.tx_rejected, 1);
+    assert_eq!(io.pop_recycled().unwrap().cause, RecycleCause::TxRejected);
+    assert_eq!(nat.counters().mappings_reused, 1);
+    assert_eq!(nat.counters().sessions_reused, 1);
+
     io.set_received_accept_budget(1);
     io.inject(
         WAN,
@@ -1185,7 +1206,7 @@ fn backend_reject_retains_tx_requested_mapping_and_session() {
         &mut resolution,
         &config,
         Some(&mut nat),
-        MonotonicMillis(1),
+        MonotonicMillis(refresh_ms + NAT44_TCP_DEFAULT_IDLE_TTL_MS - 1),
         &mut NoTrace,
     )
     .unwrap();

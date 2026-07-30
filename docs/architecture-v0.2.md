@@ -456,6 +456,11 @@ ACK妥当性を追跡しないため、flagだけを信頼したFIN/RST cleanup�
 timerを使い、FIN/RSTも削除・短縮せずsuccessful TX request時にexact sessionをrefresh
 するだけです。unmatched inboundはrefreshしません。exact boundaryでsessionがexpireし、
 最後のlive linked sessionが無くなったmapping/public portだけが再利用可能です。
+各mappingは同generationで最後にcommitされたsession activityを要約として保持します。
+non-regressing clockの下ではこの値がlinked sessionの最大activityと一致するため、
+mappingのlive判定はsession storageを走査せずO(1)です。refresh planはmapping/sessionの
+両方のcopyを更新し、後続処理が成功したcommitでだけ同時に公開するため、破棄されたplanは
+mapping lifetimeを延長しません。
 
 admissionとtransaction順はUDP profileに合わせ、次を追加します。
 
