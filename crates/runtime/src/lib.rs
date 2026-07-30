@@ -12,14 +12,44 @@ use ruster_core::{
     ResolutionRuntime, ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTraceSink,
     TraceSink,
 };
+use std::num::NonZeroU64;
+
+/// Tick-local UDP NAT44 authority and its optional worker-local runtime.
+///
+/// Keeping these values in one view prevents downstream publication adapters
+/// from accidentally pairing a config with another service's runtime.
+pub struct Nat44UdpServiceView<'view, 'storage> {
+    pub config: Nat44UdpConfig,
+    pub runtime: Option<&'view mut Nat44UdpRuntime<'storage>>,
+}
+
+/// Tick-local TCP NAT44 authority and its optional worker-local runtime.
+///
+/// The optional runtime preserves the existing fail-closed packet semantics
+/// when a configured service cannot supply mutable state for a tick.
+pub struct Nat44TcpServiceView<'view, 'storage> {
+    pub config: Nat44TcpConfig,
+    pub runtime: Option<&'view mut Nat44TcpRuntime<'storage>>,
+}
+
+/// Tick-local firewall authority and its optional worker-local runtime.
+///
+/// The config's borrowed rules and the runtime borrow are both shortened to
+/// the lifetime of the active publication view.
+pub struct FirewallServiceView<'view, 'storage> {
+    pub config: FirewallConfig<'view>,
+    pub runtime: Option<&'view mut FirewallRuntime<'storage>>,
+}
 
 /// All immutable authority and mutable worker-local state required by the
 /// full UDP/TCP NAT44, firewall, resolution, and generated ICMP composition.
 ///
 /// The immutable snapshot and validated configs are copied into each
-/// tick-local view. Their borrowed slices are shortened to `'view`, so neither
-/// immutable authority nor mutable runtime state can escape the borrow of the
-/// publication adapter. `FullServiceView` deliberately remains move-only:
+/// tick-local view. Each NAT/firewall config is paired with its runtime in a
+/// service-specific nested view, and every borrowed slice is shortened to
+/// `'view`, so neither immutable authority nor mutable runtime state can
+/// escape the borrow of the publication adapter. `FullServiceView`
+/// deliberately remains move-only:
 ///
 /// ```compile_fail
 /// use ruster_runtime::FullServiceView;
@@ -57,7 +87,7 @@ use ruster_core::{
 ///     let view: FullServiceView<'_, 'storage> =
 ///         publication.active().expect("active publication");
 ///     let snapshot = view.snapshot;
-///     let firewall_config = view.firewall_config;
+///     let firewall_config = view.firewall.config;
 ///     let _result = publication.publish_candidate(candidate);
 ///     drop((snapshot, firewall_config));
 /// }
@@ -82,19 +112,35 @@ use ruster_core::{
 /// }
 /// ```
 ///
-/// This by-value layout is a pre-1.0 source break from the earlier
+/// This paired, generation-tagged by-value layout is a pre-1.0 source break
+/// from the earlier flat config/runtime fields and the older
 /// `&ForwardingSnapshot` field. Downstream adapters construct the view with a
-/// copied `ForwardingSnapshot` and may need to update struct literals.
+/// copied `ForwardingSnapshot`, a nonzero generation, and the three nested
+/// service views.
+///
+/// Existing code that extracts the removed flat fields no longer compiles:
+///
+/// ```compile_fail
+/// use ruster_runtime::FullServiceView;
+///
+/// fn use_old_flat_fields(view: FullServiceView<'_, '_>) {
+///     let FullServiceView {
+///         udp_config,
+///         tcp_config,
+///         firewall_config,
+///         ..
+///     } = view;
+///     drop((udp_config, tcp_config, firewall_config));
+/// }
+/// ```
 pub struct FullServiceView<'view, 'storage> {
+    pub generation: NonZeroU64,
     pub snapshot: ForwardingSnapshot<'view>,
     pub resolution: &'view mut ResolutionRuntime<'storage>,
     pub icmpv4_errors: &'view mut Icmpv4ErrorRuntime<'storage>,
-    pub udp_config: Nat44UdpConfig,
-    pub nat44_udp: Option<&'view mut Nat44UdpRuntime<'storage>>,
-    pub tcp_config: Nat44TcpConfig,
-    pub nat44_tcp: Option<&'view mut Nat44TcpRuntime<'storage>>,
-    pub firewall_config: FirewallConfig<'view>,
-    pub firewall: Option<&'view mut FirewallRuntime<'storage>>,
+    pub nat44_udp: Nat44UdpServiceView<'view, 'storage>,
+    pub nat44_tcp: Nat44TcpServiceView<'view, 'storage>,
+    pub firewall: FirewallServiceView<'view, 'storage>,
 }
 
 /// Atomic publication seam used by [`run_tick`].
@@ -109,6 +155,10 @@ pub struct FullServiceView<'view, 'storage> {
 /// cold-path operations belong to candidate construction/publication.
 /// The validated snapshot and NAT/firewall configs are copied into the view by
 /// value so an adapter never has to return references to temporary values.
+/// The generation is the identity of that coherent publication. A full view
+/// currently contains all three configured service pairs; representing a
+/// service as wholly absent requires a future core composition seam that
+/// accepts optional configs as well as optional runtimes.
 pub trait FullServicePublication<'storage> {
     type Candidate;
     type Reject;
@@ -628,16 +678,26 @@ where
         };
     };
     let FullServiceView {
+        generation: _generation,
         snapshot,
         resolution,
         icmpv4_errors,
-        udp_config,
         nat44_udp,
-        tcp_config,
         nat44_tcp,
-        firewall_config,
         firewall,
     } = view;
+    let Nat44UdpServiceView {
+        config: udp_config,
+        runtime: nat44_udp,
+    } = nat44_udp;
+    let Nat44TcpServiceView {
+        config: tcp_config,
+        runtime: nat44_tcp,
+    } = nat44_tcp;
+    let FirewallServiceView {
+        config: firewall_config,
+        runtime: firewall,
+    } = firewall;
 
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::Rx));
     let rx = match io.receive(budgets.rx) {
@@ -816,15 +876,22 @@ mod tests {
         fn active(&mut self) -> Option<FullServiceView<'_, 'storage>> {
             self.active_calls += 1;
             self.enabled.then_some(FullServiceView {
+                generation: NonZeroU64::MIN,
                 snapshot: *self.snapshot,
                 resolution: self.resolution,
                 icmpv4_errors: self.icmpv4_errors,
-                udp_config: self.udp_config,
-                nat44_udp: None,
-                tcp_config: self.tcp_config,
-                nat44_tcp: None,
-                firewall_config: self.firewall_config,
-                firewall: None,
+                nat44_udp: Nat44UdpServiceView {
+                    config: self.udp_config,
+                    runtime: None,
+                },
+                nat44_tcp: Nat44TcpServiceView {
+                    config: self.tcp_config,
+                    runtime: None,
+                },
+                firewall: FirewallServiceView {
+                    config: self.firewall_config,
+                    runtime: None,
+                },
             })
         }
     }
@@ -1392,15 +1459,19 @@ mod tests {
     }
 
     #[test]
-    fn active_view_adapter_copies_config_values_without_temporary_references() {
+    fn active_view_pairs_one_generation_with_config_and_runtime_values() {
         with_fixture(|publication, _io, _trace| {
             let udp = publication.udp_config;
             let tcp = publication.tcp_config;
             let firewall = publication.firewall_config;
             let view = publication.active().expect("active view");
-            assert_eq!(view.udp_config, udp);
-            assert_eq!(view.tcp_config, tcp);
-            assert_eq!(view.firewall_config, firewall);
+            assert_eq!(view.generation, NonZeroU64::MIN);
+            assert_eq!(view.nat44_udp.config, udp);
+            assert!(view.nat44_udp.runtime.is_none());
+            assert_eq!(view.nat44_tcp.config, tcp);
+            assert!(view.nat44_tcp.runtime.is_none());
+            assert_eq!(view.firewall.config, firewall);
+            assert!(view.firewall.runtime.is_none());
         });
     }
 

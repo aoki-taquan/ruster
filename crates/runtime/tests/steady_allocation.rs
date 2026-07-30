@@ -1,5 +1,6 @@
 use std::{
     alloc::{GlobalAlloc, Layout, System},
+    num::NonZeroU64,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -7,19 +8,18 @@ use std::{
 use std::mem::size_of;
 
 use ruster_core::{
-    FirewallConfig, FirewallHashKey, FirewallPolicy, FirewallRuntime, ForwardingSnapshot,
-    GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedTraceSink, Icmpv4ErrorActionSlot,
-    Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
-    LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44TcpConfig, Nat44TcpPolicy, Nat44TcpRuntime,
-    Nat44UdpConfig, Nat44UdpPolicy, Nat44UdpRuntime, ResolutionActionSlot,
-    ResolutionFailureHoldSlot, ResolutionFailureTrace, ResolutionFailureTraceSink,
-    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, ResolutionTimerTrace,
-    ResolutionTimerTraceSink, TraceEvent, TraceSink,
+    FirewallConfig, FirewallHashKey, FirewallPolicy, ForwardingSnapshot, GeneratedIcmpv4Trace,
+    GeneratedIcmpv4TraceSink, GeneratedTraceSink, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy,
+    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
+    MacAddress, MonotonicMillis, Nat44TcpConfig, Nat44TcpPolicy, Nat44UdpConfig, Nat44UdpPolicy,
+    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionFailureTrace,
+    ResolutionFailureTraceSink, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot,
+    ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent, TraceSink,
 };
 use ruster_io_sim::SimIo;
 use ruster_runtime::{
-    run_tick, FullServicePublication, FullServiceView, TickBudgets, TickPhaseTrace,
-    TickPhaseTraceSink,
+    run_tick, FirewallServiceView, FullServicePublication, FullServiceView, Nat44TcpServiceView,
+    Nat44UdpServiceView, TickBudgets, TickPhaseTrace, TickPhaseTraceSink,
 };
 
 struct CountingAllocator;
@@ -55,6 +55,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
 static GLOBAL: CountingAllocator = CountingAllocator;
 
 struct Publication<'view, 'storage> {
+    generation: NonZeroU64,
     active_calls: usize,
     semantic_validation_calls: usize,
     fingerprint_calls: usize,
@@ -83,15 +84,22 @@ impl<'view, 'storage> FullServicePublication<'storage> for Publication<'view, 's
     fn active(&mut self) -> Option<FullServiceView<'_, 'storage>> {
         self.active_calls += 1;
         Some(FullServiceView {
+            generation: self.generation,
             snapshot: *self.snapshot,
             resolution: self.resolution,
             icmpv4_errors: self.icmpv4_errors,
-            udp_config: self.udp_config,
-            nat44_udp: None::<&mut Nat44UdpRuntime<'_>>,
-            tcp_config: self.tcp_config,
-            nat44_tcp: None::<&mut Nat44TcpRuntime<'_>>,
-            firewall_config: self.firewall_config,
-            firewall: None::<&mut FirewallRuntime<'_>>,
+            nat44_udp: Nat44UdpServiceView {
+                config: self.udp_config,
+                runtime: None,
+            },
+            nat44_tcp: Nat44TcpServiceView {
+                config: self.tcp_config,
+                runtime: None,
+            },
+            firewall: FirewallServiceView {
+                config: self.firewall_config,
+                runtime: None,
+            },
         })
     }
 }
@@ -204,6 +212,7 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         &mut icmp_actions,
     );
     let mut publication = Publication {
+        generation: NonZeroU64::MIN,
         active_calls: 0,
         semantic_validation_calls: 0,
         fingerprint_calls: 0,
@@ -225,6 +234,9 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         assert_eq!(size_of::<FirewallConfig<'static>>(), 160);
         assert_eq!(size_of::<Nat44UdpConfig>(), 112);
         assert_eq!(size_of::<Nat44TcpConfig>(), 112);
+        assert_eq!(size_of::<Nat44UdpServiceView<'static, 'static>>(), 120);
+        assert_eq!(size_of::<Nat44TcpServiceView<'static, 'static>>(), 120);
+        assert_eq!(size_of::<FirewallServiceView<'static, 'static>>(), 168);
         assert!(size_of::<FullServiceView<'static, 'static>>() <= 576);
     }
 
