@@ -41,6 +41,30 @@ Before starting, validate the configuration without requiring privileges:
 /usr/bin/ruster plan /etc/ruster/config.toml
 ```
 
+## Reload
+
+`systemctl reload ruster` sends `SIGHUP` through the unit's
+`ExecReload=/bin/kill -HUP $MAINPID`. The signal requests a reload; the daemon
+then reads, parses, and validates `/etc/ruster/config.toml` before comparing its
+exact source bytes with the active configuration identity. The identity is not
+a canonicalized semantic value: changing comments, whitespace, or source order
+also counts as a change.
+
+Reload is not a zero-downtime operation. When the validated source bytes differ
+and the successor is applied, ruster advances the generation, rotates the
+UDP/TCP NAT and firewall hash keys, prepares the candidate on the cold path,
+and publishes it in place when the successor is eligible. The publication
+flushes and rebinds runtime state, so established NAT/firewall sessions and NAT
+mappings are lost and traffic is interrupted. Do not assume established
+sessions survive a changed reload.
+
+When the validated source bytes are identical, the result is `Unchanged`: the
+active generation, storage, and established NAT/firewall state and
+session/mapping state remain in use, with no data-plane publication. A parse or
+validation failure, or a rejected, deferred, or `RestartRequired` successor,
+also leaves the old active publication in place; it is not a successful config
+change.
+
 ## Permissions and networking
 
 The service runs with `User=ruster` and `Group=ruster`. Creating the

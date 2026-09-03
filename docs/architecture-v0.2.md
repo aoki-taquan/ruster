@@ -491,6 +491,23 @@ active-failure latchへ記録し、後続tickもfail-closeします。control en
 場合もintegrationはproduction panicにせず、candidateを保持したtyped
 `UnsupportedStaticClassification`へfail-closeします。
 
+daemonのreload boundaryでは、`systemctl reload ruster`がunitの
+`ExecReload=/bin/kill -HUP $MAINPID`を通じて`SIGHUP`を送り、daemonがtick境界で
+設定を再読込します。比較対象はparseとsemantic validationが成功した入力のexact
+source bytesであり、canonicalizedなsemantic valueではありません。そのためコメント、
+空白、source orderだけの変更もchangedとして扱われます。parse/validateに失敗した入力は
+`Unchanged`とは扱わず、旧active publicationを維持します。
+
+validated source bytesがactive identityと一致するreloadは`Unchanged`であり、active
+generation、既存storage、確立済みのNAT/firewall state・session・mappingを維持し、candidate、
+hash key、publicationを生成しません。bytesが異なるreloadを適用すると、callerはhigher
+generationとUDP/TCP NAT・firewallのfresh hash keyでcold candidateを作り、eligibleならin-place
+publicationへ進みます。五つのpermitのcommitはruntime stateをflush/rebindするため、確立済みの
+NAT/firewall sessionとNAT mappingは失われ、通信断が起きます。reloadは無停止ではなく、変更ありの
+適用で確立済みsessionが維持されるとは限りません。successorが`RestartRequired`、rejected、または
+deferredの場合はpublicationせず旧activeを維持するため、変更あり入力の全てが適用成功を意味するわけでは
+ありません。
+
 libraryに旧candidateを復活させるrollback APIはありません。rollbackはcallerが旧config contentを再parse・
 validateし、higher generationとpublication履歴上freshなhash keyで新candidateをre-planして通常のsuccessor
 として適用する操作です。従ってold candidate resurrectionやgeneration rewindは行わず、全履歴のkey freshnessと
