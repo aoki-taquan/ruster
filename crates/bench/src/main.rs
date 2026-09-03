@@ -2,7 +2,8 @@ use std::env;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ruster_bench::{
@@ -50,7 +51,7 @@ fn execute() -> Result<(), String> {
         }
         let bytes = read_bounded_file(Path::new(&path), BENCHMARK_SOURCE_MAX_BYTES)
             .map_err(|error| format_benchmark_source_error(error, "identity source"))?;
-        let (compiled, typed) = parse_identity_source(&bytes)?;
+        let (compiled, typed) = parse_identity_source_file(Path::new(&path), &bytes)?;
         println!("benchmark_compiled_sha256={compiled}");
         println!("benchmark_typed_sha256={typed}");
         return Ok(());
@@ -114,6 +115,7 @@ fn read_bounded_artifact(path: &str) -> Result<String, String> {
 }
 
 const BENCHMARK_SOURCE_MAX_BYTES: usize = 64 * 1024;
+const BENCHMARK_MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BoundedFileError {
@@ -1329,6 +1331,349 @@ fn parse_identity_source(bytes: &[u8]) -> Result<(String, String), String> {
         "identity source must contain one complete typed 32-byte R17 SHA-256 array".to_owned()
     })?;
     Ok((compiled, typed))
+}
+
+fn parse_identity_source_file(
+    path: &Path,
+    source_bytes: &[u8],
+) -> Result<(String, String), String> {
+    let lexical = parse_identity_source(source_bytes)?;
+    let uses_expansion = identity_source_uses_expansion(source_bytes)?;
+    if !uses_expansion {
+        return Ok(lexical);
+    }
+    let compiled = compile_identity_source(path, source_bytes)?;
+    if lexical != compiled
+        || compiled.0 != ruster_bench::R17_BENCHMARK_SPEC_SHA256_HEX
+        || compiled.1 != ruster_bench::R17_BENCHMARK_SPEC_SHA256.to_lower_hex()
+    {
+        return Err(
+            "identity source contains R17 identities that differ after cfg/include expansion or from the compiled benchmark crate"
+                .to_owned(),
+        );
+    }
+    Ok(lexical)
+}
+
+fn identity_source_uses_expansion(source_bytes: &[u8]) -> Result<bool, String> {
+    let source = std::str::from_utf8(source_bytes)
+        .map_err(|_| "identity source is not valid UTF-8".to_owned())?;
+    let tokens = tokenize_rust_source(source)?;
+    let mut brace_depth = 0_usize;
+    let mut parenthesis_depth = 0_usize;
+    let mut bracket_depth = 0_usize;
+    let mut identity_declaration_seen = false;
+    let mut index = 0;
+    while index < tokens.len() {
+        let top_level = brace_depth == 0 && parenthesis_depth == 0 && bracket_depth == 0;
+        if top_level
+            && token_word(&tokens[index], "include")
+            && tokens
+                .get(index + 1)
+                .is_some_and(|token| punctuation(token, '!'))
+        {
+            return Ok(true);
+        }
+        if top_level && !identity_declaration_seen && cfg_attribute_starts_at(&tokens, index) {
+            return Ok(true);
+        }
+        if top_level
+            && token_word(&tokens[index], "pub")
+            && tokens
+                .get(index + 1)
+                .is_some_and(|token| token_word(token, "const"))
+            && tokens.get(index + 2).is_some_and(|token| {
+                token_word(token, "R17_BENCHMARK_SPEC_SHA256_HEX")
+                    || token_word(token, "R17_BENCHMARK_SPEC_SHA256")
+            })
+            && identity_declaration_has_cfg_attribute(&tokens, index)
+        {
+            return Ok(true);
+        }
+        if top_level
+            && token_word(&tokens[index], "pub")
+            && tokens
+                .get(index + 1)
+                .is_some_and(|token| token_word(token, "const"))
+            && tokens.get(index + 2).is_some_and(|token| {
+                token_word(token, "R17_BENCHMARK_SPEC_SHA256_HEX")
+                    || token_word(token, "R17_BENCHMARK_SPEC_SHA256")
+            })
+        {
+            identity_declaration_seen = true;
+        }
+        match tokens[index].kind {
+            RustTokenKind::Punctuation('{') => brace_depth = brace_depth.saturating_add(1),
+            RustTokenKind::Punctuation('}') => {
+                if brace_depth == 0 {
+                    return Err("identity source contains unbalanced delimiters".to_owned());
+                }
+                brace_depth -= 1;
+            }
+            RustTokenKind::Punctuation('(') => parenthesis_depth += 1,
+            RustTokenKind::Punctuation(')') => {
+                if parenthesis_depth == 0 {
+                    return Err("identity source contains unbalanced delimiters".to_owned());
+                }
+                parenthesis_depth -= 1;
+            }
+            RustTokenKind::Punctuation('[') => bracket_depth += 1,
+            RustTokenKind::Punctuation(']') => {
+                if bracket_depth == 0 {
+                    return Err("identity source contains unbalanced delimiters".to_owned());
+                }
+                bracket_depth -= 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    Ok(false)
+}
+
+fn cfg_attribute_starts_at(tokens: &[RustToken], index: usize) -> bool {
+    if !tokens
+        .get(index)
+        .is_some_and(|token| punctuation(token, '#'))
+    {
+        return false;
+    }
+    let mut opening = index + 1;
+    if tokens
+        .get(opening)
+        .is_some_and(|token| punctuation(token, '!'))
+    {
+        opening += 1;
+    }
+    tokens
+        .get(opening)
+        .is_some_and(|token| punctuation(token, '['))
+        && tokens
+            .get(opening + 1)
+            .is_some_and(|token| token_word(token, "cfg") || token_word(token, "cfg_attr"))
+}
+
+fn identity_declaration_has_cfg_attribute(tokens: &[RustToken], declaration_index: usize) -> bool {
+    let mut end = declaration_index;
+    while end > 0 && punctuation(&tokens[end - 1], ']') {
+        let mut cursor = end - 1;
+        let mut square_depth = 1_usize;
+        while cursor > 0 {
+            cursor -= 1;
+            match tokens[cursor].kind {
+                RustTokenKind::Punctuation(']') => square_depth += 1,
+                RustTokenKind::Punctuation('[') => {
+                    square_depth -= 1;
+                    if square_depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if square_depth != 0 {
+            return false;
+        }
+        if (cursor > 0 && punctuation(&tokens[cursor - 1], '#'))
+            || (cursor > 1
+                && punctuation(&tokens[cursor - 1], '!')
+                && punctuation(&tokens[cursor - 2], '#'))
+        {
+            if tokens
+                .get(cursor + 1)
+                .is_some_and(|token| token_word(token, "cfg") || token_word(token, "cfg_attr"))
+            {
+                return true;
+            }
+            end = if punctuation(&tokens[cursor - 1], '#') {
+                cursor - 1
+            } else {
+                cursor - 2
+            };
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+fn compile_identity_source(path: &Path, source_bytes: &[u8]) -> Result<(String, String), String> {
+    let source_path = fs::canonicalize(path).map_err(|_| {
+        "identity source contains an R17 identity that could not be compiled".to_owned()
+    })?;
+    if !matches!(
+        read_bounded_file(&source_path, BENCHMARK_SOURCE_MAX_BYTES),
+        Ok(current) if current.as_slice() == source_bytes
+    ) {
+        return Err("identity source changed during R17 compilation".to_owned());
+    }
+    let source_path = source_path.to_str().ok_or_else(|| {
+        "identity source contains an R17 identity with an unsupported path".to_owned()
+    })?;
+    let source_path = rust_string_literal(source_path);
+    let mut wrapper = String::from(
+        r#"#[derive(Clone, Copy)]
+pub struct Sha256Digest([u8; 32]);
+
+impl Sha256Digest {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+#[path = "#,
+    );
+    wrapper.push_str(&source_path);
+    wrapper.push_str(
+        r#"]
+mod identity;
+
+fn print_hex(bytes: &[u8; 32]) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        print!(
+            "{}{}",
+            char::from(HEX[usize::from(byte >> 4)]),
+            char::from(HEX[usize::from(byte & 0x0f)])
+        );
+    }
+}
+
+fn main() {
+    println!(
+        "benchmark_compiled_sha256={}",
+        identity::R17_BENCHMARK_SPEC_SHA256_HEX
+    );
+    print!("benchmark_typed_sha256=");
+    print_hex(identity::R17_BENCHMARK_SPEC_SHA256.as_bytes());
+    println!();
+}
+"#,
+    );
+
+    let workspace = IdentityCompilationWorkspace::new()?;
+    let wrapper_path = workspace.path.join("identity_wrapper.rs");
+    let executable_path = workspace.path.join(if cfg!(windows) {
+        "identity_wrapper.exe"
+    } else {
+        "identity_wrapper"
+    });
+    fs::write(&wrapper_path, wrapper).map_err(|_| {
+        "identity source contains an R17 identity that could not be compiled".to_owned()
+    })?;
+
+    let compiler = env::var_os("R17_RUSTC")
+        .or_else(|| env::var_os("RUSTC"))
+        .unwrap_or_else(|| "rustc".into());
+    let mut command = Command::new(compiler);
+    command
+        .arg("--edition=2021")
+        .arg("--crate-type=bin")
+        .arg("-o")
+        .arg(&executable_path)
+        .arg(&wrapper_path)
+        .env("CARGO_MANIFEST_DIR", BENCHMARK_MANIFEST_DIR);
+    if cfg!(debug_assertions) {
+        command.arg("-C").arg("debug-assertions=yes");
+    }
+    let compilation = command.output().map_err(|_| {
+        "identity source contains an R17 identity that could not be compiled".to_owned()
+    })?;
+    if !matches!(
+        read_bounded_file(path, BENCHMARK_SOURCE_MAX_BYTES),
+        Ok(current) if current.as_slice() == source_bytes
+    ) {
+        return Err("identity source changed during R17 compilation".to_owned());
+    }
+    if !compilation.status.success() {
+        return Err(
+            "identity source contains an R17 identity that could not be compiled".to_owned(),
+        );
+    }
+
+    let execution = Command::new(&executable_path).output().map_err(|_| {
+        "identity source contains an R17 identity that could not be evaluated".to_owned()
+    })?;
+    if !execution.status.success() {
+        return Err(
+            "identity source contains an R17 identity that could not be evaluated".to_owned(),
+        );
+    }
+    parse_compiled_identity_output(&execution.stdout)
+}
+
+fn parse_compiled_identity_output(output: &[u8]) -> Result<(String, String), String> {
+    let output = std::str::from_utf8(output).map_err(|_| {
+        "identity source contains an R17 identity with invalid compiled output".to_owned()
+    })?;
+    let mut lines = output.lines();
+    let compiled = lines
+        .next()
+        .and_then(|line| line.strip_prefix("benchmark_compiled_sha256="))
+        .filter(|value| is_lower_hex(value, 64))
+        .ok_or_else(|| {
+            "identity source contains an R17 identity with invalid compiled output".to_owned()
+        })?;
+    let typed = lines
+        .next()
+        .and_then(|line| line.strip_prefix("benchmark_typed_sha256="))
+        .filter(|value| is_lower_hex(value, 64))
+        .ok_or_else(|| {
+            "identity source contains an R17 identity with invalid compiled output".to_owned()
+        })?;
+    if lines.next().is_some() {
+        return Err(
+            "identity source contains an R17 identity with invalid compiled output".to_owned(),
+        );
+    }
+    Ok((compiled.to_owned(), typed.to_owned()))
+}
+
+fn rust_string_literal(value: &str) -> String {
+    let mut literal = String::with_capacity(value.len().saturating_add(2));
+    literal.push('"');
+    for character in value.chars() {
+        match character {
+            '\\' => literal.push_str("\\\\"),
+            '"' => literal.push_str("\\\""),
+            _ if character.is_control() => literal.extend(character.escape_default()),
+            _ => literal.push(character),
+        }
+    }
+    literal.push('"');
+    literal
+}
+
+struct IdentityCompilationWorkspace {
+    path: std::path::PathBuf,
+}
+
+impl IdentityCompilationWorkspace {
+    fn new() -> Result<Self, String> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let temporary_root = env::temp_dir();
+        for _ in 0..128 {
+            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path =
+                temporary_root.join(format!("ruster-bench-identity-{}-{id}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(_) => break,
+            }
+        }
+        Err("identity source compiler workspace could not be created".to_owned())
+    }
+}
+
+impl Drop for IdentityCompilationWorkspace {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
 }
 
 fn token_word(token: &RustToken, expected: &str) -> bool {

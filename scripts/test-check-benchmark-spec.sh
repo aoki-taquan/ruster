@@ -52,6 +52,57 @@ assert_rejected() {
     fi
 }
 
+sha256_file() {
+    file=$1
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | awk 'NR == 1 { print $1; exit }'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | awk 'NR == 1 { print $1; exit }'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$file" | awk 'NR == 1 { print $NF; exit }'
+    else
+        echo "sha256sum, shasum -a 256, or openssl dgst -sha256 is required" >&2
+        exit 1
+    fi
+}
+
+# Regression: before the verifier-owned anchor existed, changing the document
+# and changing both parsed identity declarations to its new digest passed.
+tampered_spec="$temporary_dir/tampered-canonical-spec.md"
+tampered_identity="$temporary_dir/tampered-canonical-spec.rs"
+sed '1s/v0.2/v0.2 content-drift/' "$spec" >"$tampered_spec"
+tampered_sha256=$(sha256_file "$tampered_spec")
+if [ "$tampered_sha256" = "$actual" ]; then
+    echo "tampered benchmark specification unexpectedly retained its SHA-256" >&2
+    exit 1
+fi
+if ! printf '%s\n' "$tampered_sha256" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ { valid = 1 } END { exit !valid }'; then
+    echo "tampered benchmark specification did not produce a lowercase 64-hex SHA-256" >&2
+    exit 1
+fi
+awk -v old="$actual" -v replacement="$tampered_sha256" '
+/^pub const R17_BENCHMARK_SPEC_SHA256:.*from_bytes/ { in_array = 1 }
+in_array {
+    rewritten = ""
+    remainder=$0
+    while (match(remainder, /0x[0-9a-f][0-9a-f]/)) {
+        byte = substr(replacement, byte_index * 2 + 1, 2)
+        rewritten = rewritten substr(remainder, 1, RSTART - 1) "0x" byte
+        remainder = substr(remainder, RSTART + RLENGTH)
+        byte_index += 1
+        if (byte_index == 32) {
+            in_array = 0
+            break
+        }
+    }
+    $0 = rewritten remainder
+}
+!in_array && index($0, old) { sub(old, replacement) }
+{ print }
+END { if (byte_index != 32) exit 1 }
+' "$identity" >"$tampered_identity"
+assert_rejected "$tampered_spec" "$tampered_identity" "benchmark specification canonical identity drift"
+
 rustc_bin=${R17_RUSTC:-rustc}
 if ! command -v "$rustc_bin" >/dev/null 2>&1; then
     echo "Rust 1.97.1 compiler is required for the R17 differential" >&2
@@ -541,7 +592,7 @@ assert_rejected "$spec" "$typed_only_identity" "typed and hexadecimal benchmark 
 
 content_drift="$temporary_dir/content-drift.md"
 sed '1s/v0.2/v0.2 content-drift/' "$spec" >"$content_drift"
-assert_rejected "$content_drift" "$identity" "compiled identity drift"
+assert_rejected "$content_drift" "$identity" "benchmark specification canonical identity drift"
 
 missing_identity="$temporary_dir/missing-spec.rs"
 sed '/R17_BENCHMARK_SPEC_SHA256_HEX/d' "$identity" >"$missing_identity"
