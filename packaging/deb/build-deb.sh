@@ -6,12 +6,6 @@ repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
 package_dir=$script_dir
 pkg_work=$repo_root/.pkgwork
 
-# Keep cargo's temporary files, the staging tree, ldd report, and resulting
-# package out of the worktree.  This is intentionally independent of the
-# caller's TMPDIR so a normal invocation cannot scatter build files elsewhere.
-export TMPDIR=$pkg_work
-mkdir -p "$pkg_work"
-
 control=$package_dir/DEBIAN/control
 version=$(awk -F': ' '$1 == "Version" { print $2; exit }' "$control")
 architecture=$(dpkg --print-architecture)
@@ -33,9 +27,15 @@ case "$output" in
     *) output=$repo_root/$output ;;
 esac
 
-# The output is an artifact of this local packaging workflow.  Keeping it in
-# .pkgwork also makes an accidental invocation unable to add a .deb to the
-# source tree.
+if ! pkg_work=$(realpath -m -- "$pkg_work") \
+    || ! output=$(realpath -m -- "$output"); then
+    printf '%s\n' "unable to canonicalize packaging paths" >&2
+    exit 1
+fi
+
+# The output is an artifact of this local packaging workflow.  Canonicalize
+# it before any mkdir, removal, or package-builder invocation so traversal
+# such as .pkgwork/../README.md cannot pass this boundary check.
 case "$output" in
     "$pkg_work"/*) ;;
     *)
@@ -43,6 +43,12 @@ case "$output" in
         exit 2
         ;;
 esac
+
+# Keep cargo's temporary files, the staging tree, ldd report, and resulting
+# package out of the worktree.  This is intentionally independent of the
+# caller's TMPDIR so a normal invocation cannot scatter build files elsewhere.
+export TMPDIR=$pkg_work
+mkdir -p "$pkg_work"
 mkdir -p "$(dirname -- "$output")"
 
 if command -v cargo >/dev/null 2>&1; then
@@ -93,18 +99,68 @@ for library_path in $ldd_paths; do
     owner_package=${owner_record%%:*}
     printf '%s\n' "$owner_package" >>"$detected_depends_file"
 done
-detected_depends=$(sort -u "$detected_depends_file" | paste -sd, -)
-declared_depends=$(awk -F': ' '$1 == "Depends" { print $2; exit }' "$control" \
+detected_elf_depends_file=$pkg_work/detected-elf-depends.txt
+sort -u "$detected_depends_file" >"$detected_elf_depends_file"
+detected_depends=$(paste -sd, - <"$detected_elf_depends_file")
+declared_depends_file=$pkg_work/declared-depends.txt
+awk -F': ' '$1 == "Depends" { print $2; exit }' "$control" \
     | tr ',' '\n' \
     | sed 's/[[:space:]]//g;/^$/d' \
-    | sort -u \
-    | paste -sd, -)
+    | sort -u >"$declared_depends_file"
+
+# ldd can only account for ELF library dependencies.  The maintainer scripts
+# also invoke groupadd and useradd, which Debian ships in passwd.  Keep that
+# non-ELF dependency as an explicit contract: remove only this known package
+# from the ldd comparison, and report any missing or otherwise unexpected
+# dependency instead of silently accepting it.
+maintainer_script_depends_file=$pkg_work/maintainer-script-depends.txt
+maintainer_script_depends=passwd
+printf '%s\n' "$maintainer_script_depends" >"$maintainer_script_depends_file"
+declared_non_elf_depends_file=$pkg_work/declared-non-elf-depends.txt
+comm -12 "$declared_depends_file" "$maintainer_script_depends_file" \
+    >"$declared_non_elf_depends_file"
+missing_non_elf_depends_file=$pkg_work/missing-non-elf-depends.txt
+comm -13 "$declared_depends_file" "$maintainer_script_depends_file" \
+    >"$missing_non_elf_depends_file"
+declared_elf_depends_file=$pkg_work/declared-elf-depends.txt
+comm -23 "$declared_depends_file" "$maintainer_script_depends_file" \
+    >"$declared_elf_depends_file"
+missing_elf_depends_file=$pkg_work/missing-elf-depends.txt
+comm -13 "$declared_elf_depends_file" "$detected_elf_depends_file" \
+    >"$missing_elf_depends_file"
+extra_declared_elf_depends_file=$pkg_work/extra-declared-elf-depends.txt
+comm -23 "$declared_elf_depends_file" "$detected_elf_depends_file" \
+    >"$extra_declared_elf_depends_file"
+
+declared_elf_depends=$(paste -sd, - <"$declared_elf_depends_file")
+declared_non_elf_depends=$(paste -sd, - <"$declared_non_elf_depends_file")
+missing_non_elf_depends=$(paste -sd, - <"$missing_non_elf_depends_file")
+missing_elf_depends=$(paste -sd, - <"$missing_elf_depends_file")
+extra_declared_elf_depends=$(paste -sd, - <"$extra_declared_elf_depends_file")
 
 printf 'Depends selected from ldd: %s\n' "$detected_depends" >&2
-if [ "$detected_depends" != "$declared_depends" ]; then
-    printf '%s\n' "control Depends does not match the ldd-derived packages" >&2
-    printf 'declared: %s\n' "$declared_depends" >&2
-    printf 'detected: %s\n' "$detected_depends" >&2
+printf 'Depends selected for maintainer scripts (non-ELF): %s\n' \
+    "$declared_non_elf_depends" >&2
+dependency_mismatch=0
+if [ -n "$missing_non_elf_depends" ]; then
+    printf '%s\n' \
+        "control Depends is missing an explicit non-ELF maintainer-script dependency" >&2
+    printf 'missing non-ELF: %s\n' "$missing_non_elf_depends" >&2
+    dependency_mismatch=1
+fi
+if [ -n "$missing_elf_depends" ]; then
+    printf '%s\n' "control Depends is missing an ldd-derived ELF package" >&2
+    printf 'missing ELF: %s\n' "$missing_elf_depends" >&2
+    dependency_mismatch=1
+fi
+if [ -n "$extra_declared_elf_depends" ]; then
+    printf '%s\n' "control Depends does not match the ldd-derived ELF packages" >&2
+    printf 'extra declared ELF: %s\n' "$extra_declared_elf_depends" >&2
+    dependency_mismatch=1
+fi
+if [ "$dependency_mismatch" -ne 0 ]; then
+    printf 'declared ELF: %s\n' "$declared_elf_depends" >&2
+    printf 'detected ELF: %s\n' "$detected_depends" >&2
     exit 1
 fi
 

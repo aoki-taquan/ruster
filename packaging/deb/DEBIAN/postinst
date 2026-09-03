@@ -3,6 +3,9 @@ set -e
 
 case "${1:-}" in
     configure|reconfigure)
+        config_dir=/etc/ruster
+        config_file=$config_dir/config.toml
+
         if ! getent group ruster >/dev/null 2>&1; then
             groupadd --system ruster
         fi
@@ -16,10 +19,22 @@ case "${1:-}" in
                 ruster
         fi
 
-        install -d -o root -g ruster -m 0750 /etc/ruster
-        if [ -f /etc/ruster/config.toml ]; then
-            chown root:ruster /etc/ruster/config.toml
-            chmod 0640 /etc/ruster/config.toml
+        # Never follow a user-controlled symlink at the configuration path.
+        # Create a missing directory, but only change an existing directory
+        # after confirming that it is not a symlink.
+        if [ -d "$config_dir" ] && [ ! -L "$config_dir" ]; then
+            chown root:ruster "$config_dir"
+            chmod 0750 "$config_dir"
+        elif [ ! -e "$config_dir" ] && [ ! -L "$config_dir" ]; then
+            install -d -o root -g ruster -m 0750 "$config_dir"
+        fi
+
+        # -f follows symlinks, so check the parent and the final component
+        # independently before changing the conffile's ownership or mode.
+        if [ -d "$config_dir" ] && [ ! -L "$config_dir" ] \
+            && [ -f "$config_file" ] && [ ! -L "$config_file" ]; then
+            chown root:ruster "$config_file"
+            chmod 0640 "$config_file"
         fi
 
         # A package install must also work in a chroot or on a non-systemd
@@ -28,6 +43,14 @@ case "${1:-}" in
         if command -v systemctl >/dev/null 2>&1 \
             && [ -d /run/systemd/system ]; then
             systemctl daemon-reload >/dev/null 2>&1 || :
+            upgrade_marker=/run/ruster-upgrade-needed
+            if [ "${1:-}" = configure ] && [ -n "${2:-}" ] \
+                && [ -f "$upgrade_marker" ] \
+                && [ ! -L "$upgrade_marker" ]; then
+                if systemctl restart ruster.service >/dev/null 2>&1; then
+                    rm -f -- "$upgrade_marker"
+                fi
+            fi
         fi
         ;;
     abort-upgrade|abort-remove|abort-deconfigure)

@@ -13,6 +13,7 @@ Source0:        %{name}-%{version}.tar.gz
 BuildRequires:  cargo
 Requires:       glibc
 Requires:       libgcc
+Requires(pre):  shadow-utils
 BuildArch:      x86_64
 
 %description
@@ -52,17 +53,41 @@ if ! getent passwd ruster >/dev/null 2>&1; then
 fi
 
 %post
-install -d -o root -g ruster -m 0750 %{_sysconfdir}/ruster
-if [ -f %{_sysconfdir}/ruster/config.toml ]; then
-    chown root:ruster %{_sysconfdir}/ruster/config.toml
-    chmod 0640 %{_sysconfdir}/ruster/config.toml
+config_dir=%{_sysconfdir}/ruster
+config_file=$config_dir/config.toml
+upgrade_marker=/run/ruster-upgrade-needed
+
+if [ -d "$config_dir" ] && [ ! -L "$config_dir" ]; then
+    chown root:ruster "$config_dir"
+    chmod 0750 "$config_dir"
+    if [ -f "$config_file" ] && [ ! -L "$config_file" ]; then
+        chown root:ruster "$config_file"
+        chmod 0640 "$config_file"
+    fi
+elif [ ! -e "$config_dir" ] && [ ! -L "$config_dir" ]; then
+    mkdir -m 0750 "$config_dir" 2>/dev/null \
+        && chown root:ruster "$config_dir"
 fi
 if command -v systemctl >/dev/null 2>&1 \
     && [ -d /run/systemd/system ]; then
     systemctl daemon-reload >/dev/null 2>&1 || :
+    if [ "${1:-0}" -gt 1 ] \
+        && [ -f "$upgrade_marker" ] && [ ! -L "$upgrade_marker" ]; then
+        if systemctl restart ruster.service >/dev/null 2>&1; then
+            rm -f -- "$upgrade_marker" || :
+        fi
+    fi
 fi
 
 %preun
+upgrade_marker=/run/ruster-upgrade-needed
+if [ "$1" -eq 1 ] \
+    && command -v systemctl >/dev/null 2>&1 \
+    && [ -d /run/systemd/system ] \
+    && systemctl is-active --quiet ruster.service \
+    && systemctl is-enabled --quiet ruster.service; then
+    (umask 077; set -C; : > "$upgrade_marker") 2>/dev/null || :
+fi
 if [ "$1" -eq 0 ] || [ "$1" -eq 1 ]; then
     if command -v systemctl >/dev/null 2>&1 \
         && [ -d /run/systemd/system ]; then
@@ -83,8 +108,8 @@ fi
 %files
 %{_bindir}/ruster
 %{_unitdir}/ruster.service
-%dir %attr(0750,root,root) %{_sysconfdir}/ruster
-%config(noreplace) %attr(0640,root,root) %{_sysconfdir}/ruster/config.toml
+%dir %attr(0750,root,ruster) %{_sysconfdir}/ruster
+%config(noreplace) %attr(0640,root,ruster) %{_sysconfdir}/ruster/config.toml
 %doc %{_docdir}/ruster/README.md
 %doc %{_docdir}/ruster/systemd.md
 
