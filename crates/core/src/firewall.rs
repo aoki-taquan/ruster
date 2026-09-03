@@ -2608,6 +2608,227 @@ mod tests {
     }
 
     #[test]
+    fn firewall_rule_matches_requires_every_packet_field() {
+        // Contract: a rule matches only when interface, endpoint, protocol, and both ports all match.
+        let source = FirewallIpv4Prefix::new(INTERNAL, 32).unwrap();
+        let destination = FirewallIpv4Prefix::new(REMOTE, 32).unwrap();
+        let source_ports = FirewallPortRange::new(12_345, 12_345).unwrap();
+        let destination_ports = FirewallPortRange::new(443, 443).unwrap();
+        let rule = FirewallRule::new(
+            FirewallRuleId(1),
+            FirewallInterface::Interface(LAN),
+            FirewallInterface::Interface(WAN),
+            source,
+            destination,
+            FirewallProtocol::Udp,
+            source_ports,
+            destination_ports,
+            FirewallAction::AllowStateful,
+        );
+        let matching = packet(FirewallProtocol::Udp, 0);
+        assert!(rule.matches(matching));
+
+        let mut mismatches = [matching; 7];
+        mismatches[0].ingress = WAN;
+        mismatches[1].egress = LAN;
+        mismatches[2].source = Ipv4Address::from_octets([10, 0, 0, 11]);
+        mismatches[3].destination = Ipv4Address::from_octets([198, 51, 100, 21]);
+        mismatches[4].protocol = FirewallProtocol::Tcp;
+        mismatches[5].source_port = 12_346;
+        mismatches[6].destination_port = 444;
+        for (index, candidate) in mismatches.into_iter().enumerate() {
+            assert!(!rule.matches(candidate), "mismatch {index} must not match");
+        }
+    }
+
+    #[test]
+    fn firewall_config_authority_matches_requires_authority_and_identity() {
+        // Contract: a configuration is authorized only for the exact snapshot authority and identity.
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            assert!(config.authority_matches(snapshot));
+
+            let mut wrong_authority = config;
+            wrong_authority.snapshot_authority ^= 1;
+            assert!(!wrong_authority.authority_matches(snapshot));
+
+            let mut wrong_identity = config;
+            wrong_identity.snapshot_identity[0] ^= 1;
+            assert!(!wrong_identity.authority_matches(snapshot));
+        });
+    }
+
+    #[test]
+    fn firewall_state_authority_digest_encodes_protocol_and_tcp_phase() {
+        // Contract: authority digest distinguishes the protocol and TCP phase bits of every slot.
+        let default_state = FirewallStateSlot::default();
+        assert_eq!(
+            firewall_state_authority_digest(&[default_state]),
+            0xf58d_cf69_4a4c_80b9
+        );
+
+        let mut tcp_state = default_state;
+        tcp_state.protocol = FirewallProtocol::Tcp;
+        assert_eq!(
+            firewall_state_authority_digest(&[tcp_state]),
+            0x7de9_6766_a38f_d944
+        );
+
+        let mut active_state = default_state;
+        active_state.tcp_phase = FirewallTcpPhase::Active;
+        assert_eq!(
+            firewall_state_authority_digest(&[active_state]),
+            0x1215_6b01_55a4_4202
+        );
+    }
+
+    #[test]
+    fn firewall_authority_evidence_occupied_count_conservation_is_exact() {
+        // Contract: maintained and recomputed occupancy are conserved iff their counts are equal.
+        let conserved = FirewallAuthorityEvidence::from_expected_contract([0, 0, 1, 1, 3, 3, 0]);
+        assert!(conserved.occupied_count_conserved());
+
+        let not_conserved =
+            FirewallAuthorityEvidence::from_expected_contract([0, 0, 1, 1, 3, 2, 0]);
+        assert!(!not_conserved.occupied_count_conserved());
+    }
+
+    #[test]
+    fn firewall_plan_packet_requires_tcp_protocol_for_rst_and_ack_flags() {
+        // Contract: TCP-only RST/ACK handling must not suppress refreshes or set TCP flags on UDP state.
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 1];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let initial = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Udp, 0), 0)
+                .unwrap();
+            runtime.commit(initial).unwrap();
+
+            let rst_flagged = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Udp, 0x04), 5)
+                .unwrap();
+            runtime.commit(rst_flagged).unwrap();
+            assert_eq!(runtime.states()[0].last_activity_ms(), 5);
+
+            let ack_flagged = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Udp, 0x10), 6)
+                .unwrap();
+            runtime.commit(ack_flagged).unwrap();
+            assert!(!runtime.states()[0].tcp_forward_ack);
+            assert!(!runtime.states()[0].tcp_reverse_ack);
+        });
+    }
+
+    #[test]
+    fn firewall_commit_rejects_each_established_state_regression_condition() {
+        // Contract: an established commit must preserve activity, TCP phase, and both ACK observations.
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Tcp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 1];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+
+            let initial = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Tcp, 0x02), 0)
+                .unwrap();
+            runtime.commit(initial).unwrap();
+            let mut reverse = packet(FirewallProtocol::Tcp, 0x12);
+            reverse.ingress = WAN;
+            reverse.egress = LAN;
+            reverse.source = REMOTE;
+            reverse.destination = INTERNAL;
+            reverse.source_port = 443;
+            reverse.destination_port = 12_345;
+            let reverse_syn_ack = runtime.plan_packet(&config, reverse, 1).unwrap();
+            runtime.commit(reverse_syn_ack).unwrap();
+            assert_eq!(runtime.states()[0].tcp_phase(), FirewallTcpPhase::Opening);
+            let direct_ack = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Tcp, 0x10), 2)
+                .unwrap();
+            runtime.commit(direct_ack).unwrap();
+            assert_eq!(runtime.states()[0].tcp_phase(), FirewallTcpPhase::Active);
+
+            let mut phase_regression = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Tcp, 0x10), 3)
+                .unwrap();
+            phase_regression.replacement.tcp_phase = FirewallTcpPhase::Opening;
+            assert_eq!(
+                runtime.commit(phase_regression),
+                Err(FirewallCommitError::EstablishedStateRegressed)
+            );
+
+            let mut forward_ack_regression = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Tcp, 0x10), 3)
+                .unwrap();
+            forward_ack_regression.replacement.tcp_forward_ack = false;
+            assert_eq!(
+                runtime.commit(forward_ack_regression),
+                Err(FirewallCommitError::EstablishedStateRegressed)
+            );
+
+            let mut reverse_ack_regression = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Tcp, 0x10), 3)
+                .unwrap();
+            reverse_ack_regression.replacement.tcp_reverse_ack = false;
+            assert_eq!(
+                runtime.commit(reverse_ack_regression),
+                Err(FirewallCommitError::EstablishedStateRegressed)
+            );
+        });
+    }
+
+    #[test]
+    fn firewall_slot_live_rejects_unoccupied_and_wrong_generation_slots() {
+        // Contract: only occupied state from this configuration and a non-regressing clock is live.
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 1];
+            let runtime = FirewallRuntime::new(config, &mut slots);
+
+            let unoccupied = FirewallStateSlot {
+                config_generation: runtime.binding.generation,
+                ..FirewallStateSlot::default()
+            };
+            assert!(!runtime.slot_live(unoccupied, 0));
+
+            let wrong_generation = FirewallStateSlot {
+                occupied: true,
+                config_generation: runtime.binding.generation + 1,
+                ..FirewallStateSlot::default()
+            };
+            assert!(!runtime.slot_live(wrong_generation, 0));
+        });
+    }
+
+    #[test]
     fn siphash_vectors_and_canonical_flow_layout_match_independent_references() {
         let reference_key =
             FirewallHashKey::new(0x0706_0504_0302_0100, 0x0f0e_0d0c_0b0a_0908).unwrap();

@@ -2248,4 +2248,332 @@ mod tests {
         assert_eq!(owners.owner(40_000), Err(PortOwnerError::CorruptOwner));
         assert_eq!(owners.slots[0], before);
     }
+
+    fn assert_middle_prepare_unlink_rejects(corrupt: impl FnOnce(&mut FixedDirectory<'_>)) {
+        let mut buckets = [DirectoryBucket::default(); 4];
+        let mut nodes = [DirectoryNode::default(); 3];
+        let mut directory = FixedDirectory::new(&mut buckets, &mut nodes, key(53)).unwrap();
+        for state_index in 0..3 {
+            directory.link(state_index, DOMAIN, &[61]).unwrap();
+        }
+        corrupt(&mut directory);
+        assert!(matches!(
+            directory.prepare_unlink(1),
+            Err(DirectoryMutationError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn prepare_unlink_rejects_previous_bucket_mismatch_with_or_guard() {
+        // Protects the previous-neighbor bucket disjunction from || -> &&.
+        assert_middle_prepare_unlink_rejects(|directory| {
+            let state_bucket = directory.nodes[1].bucket;
+            let previous = directory.nodes[1].previous as usize;
+            directory.nodes[previous].bucket = (state_bucket + 1) % 4;
+        });
+    }
+
+    #[test]
+    fn prepare_unlink_rejects_previous_next_mismatch_with_or_guard() {
+        // Protects the previous-neighbor next-link disjunction from || -> &&.
+        assert_middle_prepare_unlink_rejects(|directory| {
+            let previous = directory.nodes[1].previous as usize;
+            directory.nodes[previous].next = NONE;
+        });
+    }
+
+    #[test]
+    fn prepare_unlink_rejects_previous_self_backlink_with_or_guard() {
+        // Protects the previous-neighbor self-backlink disjunction from || -> &&.
+        assert_middle_prepare_unlink_rejects(|directory| {
+            let previous = directory.nodes[1].previous as usize;
+            directory.nodes[previous].previous = 1;
+        });
+    }
+
+    #[test]
+    fn prepare_unlink_rejects_previous_previous_alias_with_or_guard() {
+        // Protects the previous-neighbor previous-alias disjunction from || -> &&.
+        assert_middle_prepare_unlink_rejects(|directory| {
+            let node = directory.nodes[1];
+            let previous = node.previous as usize;
+            directory.nodes[previous].previous = node.previous;
+        });
+    }
+
+    #[test]
+    fn prepare_unlink_rejects_previous_next_alias_with_or_guard() {
+        // Protects the previous-neighbor next-alias disjunction from || -> &&.
+        assert_middle_prepare_unlink_rejects(|directory| {
+            let node = directory.nodes[1];
+            let previous = node.previous as usize;
+            directory.nodes[previous].previous = node.next;
+        });
+    }
+
+    #[test]
+    fn prepare_unlink_rejects_next_bucket_mismatch_with_or_guard() {
+        // Protects the next-neighbor bucket disjunction from || -> &&.
+        assert_middle_prepare_unlink_rejects(|directory| {
+            let state_bucket = directory.nodes[1].bucket;
+            let next = directory.nodes[1].next as usize;
+            directory.nodes[next].bucket = (state_bucket + 1) % 4;
+        });
+    }
+
+    #[test]
+    fn prepare_unlink_rejects_next_previous_mismatch_with_or_guard() {
+        // Protects the next-neighbor previous-link disjunction from || -> &&.
+        assert_middle_prepare_unlink_rejects(|directory| {
+            let next = directory.nodes[1].next as usize;
+            directory.nodes[next].previous = NONE;
+        });
+    }
+
+    #[test]
+    fn prepare_unlink_rejects_next_self_forward_link_with_or_guard() {
+        // Protects the next-neighbor self-forward-link disjunction from || -> &&.
+        assert_middle_prepare_unlink_rejects(|directory| {
+            let next = directory.nodes[1].next as usize;
+            directory.nodes[next].next = 1;
+        });
+    }
+
+    #[test]
+    fn prepare_unlink_rejects_next_previous_alias_with_or_guard() {
+        // Protects the next-neighbor previous-alias disjunction from || -> &&.
+        assert_middle_prepare_unlink_rejects(|directory| {
+            let node = directory.nodes[1];
+            let next = node.next as usize;
+            directory.nodes[next].next = node.previous;
+        });
+    }
+
+    #[test]
+    fn prepare_unlink_rejects_next_next_alias_with_or_guard() {
+        // Protects the next-neighbor next-alias disjunction from || -> &&.
+        assert_middle_prepare_unlink_rejects(|directory| {
+            let node = directory.nodes[1];
+            let next = node.next as usize;
+            directory.nodes[next].next = node.next;
+        });
+    }
+
+    #[test]
+    fn prepared_unlink_matches_rejects_previous_snapshot_bucket_mismatch() {
+        // Protects the previous snapshot check from || -> &&.
+        let mut buckets = [DirectoryBucket::default(); 4];
+        let mut nodes = [DirectoryNode::default(); 3];
+        let mut directory = FixedDirectory::new(&mut buckets, &mut nodes, key(67)).unwrap();
+        for state_index in 0..3 {
+            directory.link(state_index, DOMAIN, &[71]).unwrap();
+        }
+        let prepared = directory.prepare_unlink(1).unwrap();
+        let previous = directory.nodes[1].previous as usize;
+        directory.nodes[previous].bucket = (directory.nodes[1].bucket + 1) % 4;
+        assert!(!directory.prepared_unlink_matches(prepared));
+    }
+
+    #[test]
+    fn prepared_unlink_matches_rejects_next_snapshot_previous_mismatch() {
+        // Protects the next snapshot check from || -> &&.
+        let mut buckets = [DirectoryBucket::default(); 4];
+        let mut nodes = [DirectoryNode::default(); 3];
+        let mut directory = FixedDirectory::new(&mut buckets, &mut nodes, key(73)).unwrap();
+        for state_index in 0..3 {
+            directory.link(state_index, DOMAIN, &[79]).unwrap();
+        }
+        let prepared = directory.prepare_unlink(1).unwrap();
+        let next = directory.nodes[1].next as usize;
+        directory.nodes[next].previous = NONE;
+        assert!(!directory.prepared_unlink_matches(prepared));
+    }
+
+    #[test]
+    fn prepared_relink_matches_requires_a_valid_destination_head() {
+        // Protects the destination-head && guard from && -> ||.
+        let mut buckets = [DirectoryBucket::default(); 2];
+        let mut nodes = [DirectoryNode::default(); 2];
+        let mut directory = FixedDirectory::new(&mut buckets, &mut nodes, key(83)).unwrap();
+        let old_words = [89];
+        let old_bucket = directory.bucket_for_words(DOMAIN, &old_words).unwrap();
+        let new_word = (90_u64..200)
+            .find(|candidate| directory.bucket_for_words(DOMAIN, &[*candidate]) != Some(old_bucket))
+            .unwrap();
+        directory.link(0, DOMAIN, &old_words).unwrap();
+        directory.link(1, DOMAIN, &[new_word]).unwrap();
+        let prepared = directory.prepare_relink(0, DOMAIN, &[new_word]).unwrap();
+        directory.nodes[1].previous = 0;
+        assert!(!directory.prepared_relink_matches(prepared));
+    }
+
+    #[test]
+    fn validate_head_rejects_a_wrong_bucket_or_previous_link() {
+        // Protects validate_head's independent corruption checks from || -> &&.
+        let mut buckets = [DirectoryBucket::default(); 2];
+        let mut nodes = [DirectoryNode::default(); 1];
+        let directory = FixedDirectory::new(&mut buckets, &mut nodes, key(97)).unwrap();
+        directory.buckets[0].head = 0;
+        directory.nodes[0] = DirectoryNode {
+            bucket: 1,
+            previous: NONE,
+            ..DirectoryNode::default()
+        };
+        assert_eq!(
+            directory.validate_head(0, 0),
+            Err(DirectoryMutationError::Corrupt)
+        );
+    }
+
+    #[test]
+    fn validate_dimensions_rejects_each_dimension_over_u32_without_conjunction() {
+        // Protects the independent bucket/node capacity checks from || -> && and > -> ==.
+        let over_u32 = u32::MAX as usize + 1;
+        assert_eq!(
+            validate_dimensions(over_u32, 1),
+            Err(DirectoryConfigError::CapacityTooLarge)
+        );
+        assert_eq!(
+            validate_dimensions(1, over_u32),
+            Err(DirectoryConfigError::CapacityTooLarge)
+        );
+    }
+
+    #[test]
+    fn validate_dimensions_keeps_u32_max_strictly_within_capacity() {
+        // Protects the strict > boundary from > -> >= and > -> ==.
+        assert_eq!(
+            validate_dimensions(u32::MAX as usize, 1),
+            Err(DirectoryConfigError::BucketCountNotPowerOfTwo)
+        );
+        assert_eq!(
+            validate_dimensions(1, u32::MAX as usize),
+            Err(DirectoryConfigError::BucketCountTooSmall)
+        );
+    }
+
+    #[test]
+    fn link_to_index_rejects_an_index_equal_to_capacity() {
+        // Protects the strict link bound from < -> <=.
+        assert_eq!(link_to_index(0, 0), None);
+        assert_eq!(link_to_index(1, 1), None);
+    }
+
+    #[test]
+    fn port_owner_slot_token_rejects_partially_zeroed_empty_slots() {
+        // Protects the empty-slot integrity conjunction from && -> ||.
+        for slot in [
+            PortOwnerSlot {
+                state_index_plus_one: 0,
+                state_generation: 1,
+                runtime_epoch: 0,
+            },
+            PortOwnerSlot {
+                state_index_plus_one: 0,
+                state_generation: 0,
+                runtime_epoch: 1,
+            },
+        ] {
+            assert_eq!(slot.token(), Err(PortOwnerError::CorruptOwner));
+        }
+    }
+
+    #[test]
+    fn prepare_claim_rejects_a_replacement_at_state_capacity() {
+        // Protects the replacement state upper bound from >= -> <.
+        let mut slots = [PortOwnerSlot::default(); 1];
+        let owners = PortOwnerTable::new(&mut slots, 40_000, 40_000, 1).unwrap();
+        let out_of_range = PortOwnerToken::new(1, 1, 1).unwrap();
+        assert!(matches!(
+            owners.prepare_claim(40_000, None, out_of_range),
+            Err(PortOwnerError::StateIndexOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn prepare_claim_rejects_a_corrupt_current_owner_at_state_capacity() {
+        // Protects the current-owner state bound from >= -> <.
+        let mut slots = [PortOwnerSlot::default(); 1];
+        let owners = PortOwnerTable::new(&mut slots, 40_000, 40_000, 1).unwrap();
+        let corrupt_owner = PortOwnerToken::new(1, 7, 31).unwrap();
+        let replacement = PortOwnerToken::new(0, 8, 31).unwrap();
+        owners.slots[0] = PortOwnerSlot::from_token(corrupt_owner).unwrap();
+        assert!(matches!(
+            owners.prepare_claim(40_000, Some(corrupt_owner), replacement),
+            Err(PortOwnerError::CorruptOwner)
+        ));
+    }
+
+    #[test]
+    fn prepared_claim_matches_rejects_epoch_only_aba() {
+        // Protects the prepared claim epoch guard, including hardcoded true and && -> ||.
+        let mut slots = [PortOwnerSlot::default(); 1];
+        let mut owners = PortOwnerTable::new(&mut slots, 40_000, 40_000, 1).unwrap();
+        let replacement = PortOwnerToken::new(0, 1, 1).unwrap();
+        let prepared = owners.prepare_claim(40_000, None, replacement).unwrap();
+        owners.clear();
+        assert!(!owners.prepared_claim_matches(prepared));
+        owners.apply_prepared_claim(prepared);
+        assert_eq!(owners.owner(40_000), Ok(None));
+    }
+
+    #[test]
+    fn prepared_move_matches_rejects_epoch_only_aba() {
+        // Protects the prepared move epoch guard from && -> ||.
+        let mut slots = [PortOwnerSlot::default(); 1];
+        let mut owners = PortOwnerTable::new(&mut slots, 40_000, 40_000, 1).unwrap();
+        let replacement = PortOwnerToken::new(0, 1, 1).unwrap();
+        let prepared = owners
+            .prepare_move(None, 40_000, None, replacement)
+            .unwrap();
+        owners.clear();
+        assert!(!owners.prepared_move_matches(prepared));
+    }
+
+    #[test]
+    fn prepared_move_matches_rejects_slot_snapshot_mismatch_at_same_epoch() {
+        // Protects every prepared move snapshot conjunction from && -> ||.
+        let mut slots = [PortOwnerSlot::default(); 1];
+        let owners = PortOwnerTable::new(&mut slots, 40_000, 40_000, 1).unwrap();
+        let replacement = PortOwnerToken::new(0, 1, 1).unwrap();
+        let other = PortOwnerToken::new(0, 2, 1).unwrap();
+        let prepared = owners
+            .prepare_move(None, 40_000, None, replacement)
+            .unwrap();
+        owners.slots[0] = PortOwnerSlot::from_token(other).unwrap();
+        assert!(!owners.prepared_move_matches(prepared));
+    }
+
+    #[test]
+    fn prepared_move_topology_matches_rejects_same_old_and_new_offsets() {
+        // Protects the distinct old/new topology guard from != -> ==.
+        let mut slots = [PortOwnerSlot::default(); 1];
+        let owners = PortOwnerTable::new(&mut slots, 40_000, 40_000, 1).unwrap();
+        let topology = PreparedPortOwnerMoveTopology {
+            offsets: 0,
+            expected_epoch: owners.mutation_epoch,
+        };
+        assert!(!owners.prepared_move_topology_matches(topology));
+    }
+
+    #[test]
+    fn port_owner_semantics_reports_port_mismatch_before_reverse_lookup() {
+        // Protects the assigned-port disjunction from || -> &&.
+        let mut slots = [PortOwnerSlot::default(); 2];
+        let mut owners = PortOwnerTable::new(&mut slots, 40_000, 40_001, 1).unwrap();
+        let owner = PortOwnerToken::new(0, 7, 31).unwrap();
+        let wrong_port = PortOwnerExpectation {
+            port: 40_001,
+            state_generation: owner.state_generation(),
+            runtime_epoch: owner.runtime_epoch(),
+        };
+        owners.assign(40_000, owner).unwrap();
+        assert_eq!(
+            owners.validate_semantics(|index| (index == 0).then_some(wrong_port)),
+            Err(PortOwnerSemanticError::OwnerMismatch {
+                port: 40_000,
+                state_index: 0,
+            })
+        );
+    }
 }
