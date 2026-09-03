@@ -563,6 +563,44 @@ impl<'a> ForwardingSnapshot<'a> {
         self.identity
     }
 
+    /// Borrows the route table in the order supplied to the constructor.
+    ///
+    /// [`ForwardingSnapshot::new`] validates but does not sort its input. The
+    /// config-origin path canonicalizes routes before constructing a validated
+    /// publication owner; callers using this general constructor must not infer
+    /// canonical order from this accessor. Publication authority, snapshot
+    /// identity, and allocation addresses are not part of this view.
+    #[must_use]
+    pub const fn routes(&self) -> &'a [Route] {
+        self.routes
+    }
+
+    /// Borrows the static-neighbor table in the order supplied to the constructor.
+    ///
+    /// The general snapshot constructor validates but does not sort this slice.
+    /// Config-origin validated candidates retain their separate canonicalization
+    /// contract.
+    #[must_use]
+    pub const fn neighbors(&self) -> &'a [Neighbor] {
+        self.neighbors
+    }
+
+    /// Borrows the local IPv4 bindings in the order supplied to the constructor.
+    ///
+    /// The general snapshot constructor validates but does not sort this slice.
+    /// Config-origin validated candidates retain their separate canonicalization
+    /// contract.
+    #[must_use]
+    pub const fn local_ipv4(&self) -> &'a [LocalIpv4Binding] {
+        self.local_ipv4
+    }
+
+    /// Returns the IPv4 origin policy without exposing publication identity.
+    #[must_use]
+    pub const fn ipv4_origin_policy(&self) -> Ipv4OriginPolicy {
+        self.ipv4_origin
+    }
+
     pub(crate) const fn publication_nonce(&self) -> u64 {
         if self.authority & VALIDATED_OWNER_AUTHORITY_BIT == 0 {
             0
@@ -2169,7 +2207,9 @@ fn decide_ipv4<T: TraceSink>(
                 snapshot,
                 ingress,
                 ipv4,
+                selected_route,
                 resolution,
+                icmpv4_errors,
                 config,
                 nat44_udp,
                 firewall_config,
@@ -2203,7 +2243,9 @@ fn decide_ipv4<T: TraceSink>(
                 snapshot,
                 ingress,
                 ipv4,
+                selected_route,
                 resolution,
+                icmpv4_errors,
                 config,
                 nat44_tcp,
                 firewall_config,
@@ -3004,6 +3046,13 @@ fn build_nat44_icmpv4_rewrite(
     if let (Some(old), Some(new)) = (quote.transport_checksum, transport_checksum) {
         icmp_checksum = rfc1624_update(icmp_checksum, old, new);
     }
+    let icmp_checksum = if icmp_checksum == 0 {
+        // RFC 1624 returns +0 for this mathematical-zero update. ICMP stores
+        // the equivalent one's-complement -0 as 0xffff on the wire.
+        0xffff
+    } else {
+        icmp_checksum
+    };
 
     let outer_destination_offset = outer.header_offset + 16;
     let outer_destination = outer.destination.octets();
@@ -3439,7 +3488,9 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
+    selected_destination_route: Option<Route>,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     config: &Nat44UdpConfig,
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
@@ -3534,6 +3585,23 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
         )?);
     }
     if ipv4.ttl <= 1 {
+        if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+            let disposition = decide_icmpv4_error(
+                frame,
+                snapshot,
+                ipv4,
+                selected_destination_route,
+                Icmpv4ErrorKind::TimeExceededTtl,
+                resolution,
+                runtime,
+                *now,
+                trace,
+            );
+            trace.record(TraceEvent::Icmpv4TimeExceededDisposition {
+                ingress,
+                disposition,
+            });
+        }
         return nat44_udp_drop(ingress, Ipv4TtlExpired, trace);
     }
     let target = reverse_route.next_hop().unwrap_or(internal_address);
@@ -3721,7 +3789,9 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
+    selected_destination_route: Option<Route>,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     config: &Nat44TcpConfig,
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
@@ -3819,6 +3889,23 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
         )?);
     }
     if ipv4.ttl <= 1 {
+        if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+            let disposition = decide_icmpv4_error(
+                frame,
+                snapshot,
+                ipv4,
+                selected_destination_route,
+                Icmpv4ErrorKind::TimeExceededTtl,
+                resolution,
+                runtime,
+                *now,
+                trace,
+            );
+            trace.record(TraceEvent::Icmpv4TimeExceededDisposition {
+                ingress,
+                disposition,
+            });
+        }
         return nat44_tcp_drop(ingress, Ipv4TtlExpired, trace);
     }
     let target = reverse_route.next_hop().unwrap_or(internal_address);
@@ -4470,8 +4557,7 @@ fn decide_icmpv4_error<T: TraceSink>(
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::NonInitialFragment);
     }
     if ipv4.protocol == 1 {
-        let type_offset = ipv4.header_offset + ipv4.header_len;
-        let Some(icmp_type) = frame.get(type_offset).copied() else {
+        let Some(icmp_type) = icmpv4_type_within_total_length(frame, ipv4) else {
             return runtime.record_suppression(Icmpv4TimeExceededDisposition::IcmpTypeMissing);
         };
         if matches!(icmp_type, 3 | 4 | 5 | 11 | 12) {
@@ -4639,7 +4725,7 @@ fn icmp_error_candidate_eligible(
         return false;
     }
     if ipv4.protocol == 1 {
-        let Some(icmp_type) = frame.get(ipv4.header_offset + ipv4.header_len).copied() else {
+        let Some(icmp_type) = icmpv4_type_within_total_length(frame, ipv4) else {
             return false;
         };
         if matches!(icmp_type, 3 | 4 | 5 | 11 | 12) {
@@ -4647,6 +4733,15 @@ fn icmp_error_candidate_eligible(
         }
     }
     true
+}
+
+fn icmpv4_type_within_total_length(frame: &[u8], ipv4: packet::ValidatedIpv4) -> Option<u8> {
+    let icmp_offset = ipv4.header_offset.checked_add(ipv4.header_len)?;
+    let ipv4_end = ipv4.header_offset.checked_add(ipv4.total_len)?;
+    (icmp_offset < ipv4_end)
+        .then(|| frame.get(icmp_offset))
+        .flatten()
+        .copied()
 }
 
 fn reverse_target_forbidden(
@@ -4758,6 +4853,13 @@ fn decide_local_ipv4<T: TraceSink>(
     let ipv4_checksum = rfc1624_update(ipv4_checksum, ipv4_id, 0);
     let ipv4_checksum = rfc1624_update(ipv4_checksum, flags_fragment, 0x4000);
     let icmp_checksum = rfc1624_update(old_icmp_checksum, 0x0800, 0x0000);
+    let icmp_checksum = if icmp_checksum == 0 {
+        // RFC 1624 returns +0 for this mathematical-zero update. ICMP stores
+        // the equivalent one's-complement -0 as 0xffff on the wire.
+        0xffff
+    } else {
+        icmp_checksum
+    };
     trace.record(TraceEvent::Icmpv4EchoRequestValidated {
         ingress,
         source: ipv4.source,
@@ -5099,20 +5201,23 @@ fn apply_icmpv4_echo_reply(
 mod tests {
     use super::{
         decide_ipv4, forward_batch, forward_batch_with_nat44_udp_and_tcp_and_firewall,
-        next_publication_nonce_from, BatchReport, DropReason, Ipv4OriginPolicy,
+        forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_audited,
+        next_publication_nonce_from, BatchReport, DropReason, FirewallPacket, Ipv4OriginPolicy,
         ValidatedForwardingOwner, FULL_FORWARDING_VALIDATIONS, VALIDATED_OWNER_AUTHORITY_BIT,
     };
     use crate::{
         internet_checksum, ipv4_header_checksum, BatchCompletion, DirectoryBucket, DirectoryNode,
-        FirewallAction, FirewallConfig, FirewallHashKey, FirewallInterface, FirewallIpv4Prefix,
-        FirewallPolicy, FirewallPortRange, FirewallProtocol, FirewallRule, FirewallRuleId,
-        FirewallRuntime, FirewallStateSlot, ForwardingSnapshot, IfId, Interface, Ipv4Address,
-        LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
-        Nat44TcpHashKey, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy,
-        Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot,
-        Nat44UdpPeerSlot, Nat44UdpPolicy, NoTrace, PacketBatch, PacketLease, PacketSlot,
-        PortOwnerSlot, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime,
-        ResolutionStateSlot, Route, SlotCompletion, TraceEvent, TraceSink,
+        FirewallAction, FirewallAuditBuffer, FirewallAuditRecord, FirewallConfig, FirewallHashKey,
+        FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange, FirewallProtocol,
+        FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot, FirewallVerdict,
+        ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorDisposition, Icmpv4ErrorPolicy,
+        Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
+        MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpHashKey,
+        Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime,
+        Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
+        NoTrace, PacketBatch, PacketLease, PacketSlot, PortOwnerSlot, ResolutionActionSlot,
+        ResolutionFailureHoldSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
+        SlotCompletion, TraceEvent, TraceSink,
     };
     use std::{
         cell::Cell,
@@ -5452,6 +5557,545 @@ mod tests {
         let ipv4_checksum = ipv4_header_checksum(&frame[14..34]);
         frame[24..26].copy_from_slice(&ipv4_checksum.to_be_bytes());
         frame
+    }
+
+    fn empty_ipv4_icmp_frame(ttl: u8, destination: Ipv4Address) -> Vec<u8> {
+        let mut frame = vec![0_u8; 60];
+        frame[0..6].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
+        frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 30]);
+        frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+        frame[14] = 0x45;
+        frame[16..18].copy_from_slice(&20_u16.to_be_bytes());
+        frame[20..22].copy_from_slice(&0x4000_u16.to_be_bytes());
+        frame[22] = ttl;
+        frame[23] = 1;
+        frame[26..30].copy_from_slice(&REMOTE.octets());
+        frame[30..34].copy_from_slice(&destination.octets());
+        frame[34] = 0x08;
+        let checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        frame
+    }
+
+    fn zero_identifier_echo_request() -> Vec<u8> {
+        let mut frame = vec![0_u8; 60];
+        frame[0..6].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
+        frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 30]);
+        frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+        frame[14] = 0x45;
+        frame[16..18].copy_from_slice(&28_u16.to_be_bytes());
+        frame[18..20].copy_from_slice(&0x1234_u16.to_be_bytes());
+        frame[20..22].copy_from_slice(&0_u16.to_be_bytes());
+        frame[22] = 64;
+        frame[23] = 1;
+        frame[26..30].copy_from_slice(&REMOTE.octets());
+        frame[30..34].copy_from_slice(&INTERNAL.octets());
+        frame[34..42].copy_from_slice(&[0x08, 0x00, 0xf7, 0xff, 0, 0, 0, 0]);
+        let checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn local_echo_reply_encodes_mathematical_zero_as_icmp_negative_zero() {
+        let interfaces = [Interface {
+            id: LAN,
+            mac: MacAddress([2, 0, 0, 0, 0, 1]),
+        }];
+        let bindings = [LocalIpv4Binding {
+            interface: LAN,
+            address: INTERNAL,
+        }];
+        let snapshot = ForwardingSnapshot::new(&[], &interfaces, &[], &bindings).unwrap();
+        let mut frame = zero_identifier_echo_request();
+        let ipv4 = crate::validate_ipv4_frame(&frame).unwrap();
+        let mut trace = RecordingTrace::default();
+
+        let decision = super::decide_local_ipv4(&frame, &snapshot, LAN, ipv4, &mut trace).unwrap();
+        super::apply_decision(&mut frame, decision).unwrap();
+
+        assert_eq!(
+            u16::from_be_bytes(frame[36..38].try_into().unwrap()),
+            0xffff
+        );
+        assert_eq!(internet_checksum(&frame[34..42]), 0);
+    }
+
+    fn nat_inbound_ttl_frame(protocol: FirewallProtocol) -> Vec<u8> {
+        let (ipv4_total_len, transport_len) = match protocol {
+            FirewallProtocol::Udp => (28_u16, 8_usize),
+            FirewallProtocol::Tcp => (40_u16, 20_usize),
+        };
+        let mut frame = vec![0_u8; 60];
+        frame[0..6].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
+        frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 30]);
+        frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+        frame[14] = 0x45;
+        frame[16..18].copy_from_slice(&ipv4_total_len.to_be_bytes());
+        frame[20..22].copy_from_slice(&0x4000_u16.to_be_bytes());
+        frame[22] = 1;
+        frame[23] = match protocol {
+            FirewallProtocol::Udp => 17,
+            FirewallProtocol::Tcp => 6,
+        };
+        frame[26..30].copy_from_slice(&REMOTE.octets());
+        frame[30..34].copy_from_slice(&PUBLIC.octets());
+        match protocol {
+            FirewallProtocol::Udp => {
+                frame[34..36].copy_from_slice(&53_u16.to_be_bytes());
+                frame[36..38].copy_from_slice(&40_000_u16.to_be_bytes());
+                frame[38..40].copy_from_slice(&8_u16.to_be_bytes());
+                let mut pseudo = Vec::with_capacity(12 + transport_len);
+                pseudo.extend_from_slice(&REMOTE.octets());
+                pseudo.extend_from_slice(&PUBLIC.octets());
+                pseudo.extend_from_slice(&[0, 17]);
+                pseudo.extend_from_slice(&(transport_len as u16).to_be_bytes());
+                pseudo.extend_from_slice(&frame[34..42]);
+                let checksum = internet_checksum(&pseudo);
+                frame[40..42].copy_from_slice(&checksum.to_be_bytes());
+            }
+            FirewallProtocol::Tcp => {
+                frame[34..36].copy_from_slice(&443_u16.to_be_bytes());
+                frame[36..38].copy_from_slice(&40_000_u16.to_be_bytes());
+                frame[38..42].copy_from_slice(&2_u32.to_be_bytes());
+                frame[42..46].copy_from_slice(&1_u32.to_be_bytes());
+                frame[46] = 5 << 4;
+                frame[47] = 0x12;
+                frame[48..50].copy_from_slice(&4096_u16.to_be_bytes());
+                let mut pseudo = Vec::with_capacity(12 + transport_len);
+                pseudo.extend_from_slice(&REMOTE.octets());
+                pseudo.extend_from_slice(&PUBLIC.octets());
+                pseudo.extend_from_slice(&[0, 6]);
+                pseudo.extend_from_slice(&(transport_len as u16).to_be_bytes());
+                pseudo.extend_from_slice(&frame[34..54]);
+                let checksum = internet_checksum(&pseudo);
+                frame[50..52].copy_from_slice(&checksum.to_be_bytes());
+            }
+        }
+        let checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        frame
+    }
+
+    fn assert_nat_inbound_ttl_error_is_captured_after_firewall(protocol: FirewallProtocol) {
+        let routes = [
+            Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, LAN, None).unwrap(),
+            Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, Some(ROUTER)).unwrap(),
+        ];
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let neighbors = [
+            crate::Neighbor {
+                interface: LAN,
+                target: INTERNAL,
+                mac: MacAddress([2, 0, 0, 0, 0, 10]),
+            },
+            crate::Neighbor {
+                interface: WAN,
+                target: ROUTER,
+                mac: MacAddress([2, 0, 0, 0, 0, 20]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: Ipv4Address::from_octets([10, 0, 0, 1]),
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+        ];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let udp_config = Nat44UdpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44UdpPolicy::default(),
+        )
+        .unwrap();
+        let tcp_config = Nat44TcpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+        let inside_prefix =
+            FirewallIpv4Prefix::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24).unwrap();
+        let any_prefix = FirewallIpv4Prefix::new(Ipv4Address::from_octets([0; 4]), 0).unwrap();
+        let any_ports = FirewallPortRange::new(1, u16::MAX).unwrap();
+        let rules = [
+            FirewallRule::new(
+                FirewallRuleId(1),
+                FirewallInterface::Interface(LAN),
+                FirewallInterface::Interface(WAN),
+                inside_prefix,
+                any_prefix,
+                FirewallProtocol::Udp,
+                any_ports,
+                any_ports,
+                FirewallAction::AllowStateful,
+            ),
+            FirewallRule::new(
+                FirewallRuleId(2),
+                FirewallInterface::Interface(WAN),
+                FirewallInterface::Interface(LAN),
+                any_prefix,
+                inside_prefix,
+                FirewallProtocol::Udp,
+                any_ports,
+                any_ports,
+                FirewallAction::AllowStateful,
+            ),
+            FirewallRule::new(
+                FirewallRuleId(3),
+                FirewallInterface::Interface(LAN),
+                FirewallInterface::Interface(WAN),
+                inside_prefix,
+                any_prefix,
+                FirewallProtocol::Tcp,
+                any_ports,
+                any_ports,
+                FirewallAction::AllowStateful,
+            ),
+            FirewallRule::new(
+                FirewallRuleId(4),
+                FirewallInterface::Interface(WAN),
+                FirewallInterface::Interface(LAN),
+                any_prefix,
+                inside_prefix,
+                FirewallProtocol::Tcp,
+                any_ports,
+                any_ports,
+                FirewallAction::AllowStateful,
+            ),
+        ];
+        let firewall_config = FirewallConfig::new(
+            &snapshot,
+            &rules,
+            FirewallPolicy::default(),
+            1,
+            FirewallHashKey::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210).unwrap(),
+        )
+        .unwrap();
+
+        let mut udp_mappings = [Nat44UdpMappingSlot::default(); 1];
+        let mut udp_peers = [Nat44UdpPeerSlot::default(); 1];
+        let mut udp_indexes =
+            crate::nat44::TestNat44UdpIndexes::new(udp_config, udp_mappings.len(), udp_peers.len());
+        let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
+        let udp_seed = udp.plan_outbound(INTERNAL, 12_345, REMOTE, 0).unwrap();
+        assert_eq!(udp_seed.public_port(), 40_000);
+        udp.commit_outbound(udp_seed, 0).unwrap();
+        let before_udp_mappings = udp.mappings().to_vec();
+        let before_udp_peers = udp.peers().to_vec();
+        let before_udp_counters = udp.counters();
+
+        let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
+        let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
+        let mut tcp_mapping_buckets = [DirectoryBucket::default(); 1];
+        let mut tcp_mapping_nodes = [DirectoryNode::default(); 1];
+        let mut tcp_session_buckets = [DirectoryBucket::default(); 1];
+        let mut tcp_session_nodes = [DirectoryNode::default(); 1];
+        let mut tcp_owners = [PortOwnerSlot::default(); 1];
+        let mut tcp = Nat44TcpRuntime::new(
+            tcp_config,
+            &mut tcp_mappings,
+            &mut tcp_sessions,
+            Nat44TcpIndexStorage::new(
+                &mut tcp_mapping_buckets,
+                &mut tcp_mapping_nodes,
+                &mut tcp_session_buckets,
+                &mut tcp_session_nodes,
+                &mut tcp_owners,
+            ),
+            Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0).unwrap(),
+        )
+        .unwrap();
+        let tcp_seed = tcp
+            .plan_outbound(INTERNAL, 12_346, REMOTE, 443, true, 0)
+            .unwrap();
+        assert_eq!(tcp_seed.public_port(), 40_000);
+        tcp.commit_outbound(tcp_seed, 0).unwrap();
+        let before_tcp_mappings = tcp.mappings().to_vec();
+        let before_tcp_sessions = tcp.sessions().to_vec();
+        let before_tcp_counters = tcp.counters();
+
+        let mut firewall_states = [FirewallStateSlot::default(); 2];
+        let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_states);
+        let udp_firewall_seed = FirewallPacket {
+            ingress: LAN,
+            egress: WAN,
+            source: INTERNAL,
+            destination: REMOTE,
+            protocol: FirewallProtocol::Udp,
+            source_port: 12_345,
+            destination_port: 53,
+            tcp_flags: 0,
+        };
+        let udp_firewall_plan = firewall
+            .plan_packet(&firewall_config, udp_firewall_seed, 0)
+            .unwrap();
+        firewall.commit(udp_firewall_plan).unwrap();
+        let tcp_firewall_seed = FirewallPacket {
+            ingress: LAN,
+            egress: WAN,
+            source: INTERNAL,
+            destination: REMOTE,
+            protocol: FirewallProtocol::Tcp,
+            source_port: 12_346,
+            destination_port: 443,
+            tcp_flags: 0x02,
+        };
+        let tcp_firewall_plan = firewall
+            .plan_packet(&firewall_config, tcp_firewall_seed, 0)
+            .unwrap();
+        firewall.commit(tcp_firewall_plan).unwrap();
+        let before_firewall_states = firewall.states().to_vec();
+
+        let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+        let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut resolution = ResolutionRuntime::new(
+            ResolutionPolicy::new(1_000, 2_000).unwrap(),
+            &mut resolution_states,
+            &mut resolution_actions,
+        );
+        let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+        let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+        let mut errors = Icmpv4ErrorRuntime::new(
+            Icmpv4ErrorPolicy::default(),
+            &mut error_states,
+            &mut error_actions,
+        );
+        let mut audit_storage = [FirewallAuditRecord::default(); 1];
+        let mut audit = FirewallAuditBuffer::new(&mut audit_storage);
+        let mut trace = RecordingTrace::default();
+        let mut frame = nat_inbound_ttl_frame(protocol);
+        let original = frame.clone();
+        let completion = Cell::new(None);
+        let report = forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_audited(
+            OnePacketBatch {
+                ingress: WAN,
+                frame: Some(&mut frame),
+                completion: &completion,
+            },
+            &snapshot,
+            &mut resolution,
+            &mut errors,
+            &udp_config,
+            Some(&mut udp),
+            &tcp_config,
+            Some(&mut tcp),
+            &firewall_config,
+            Some(&mut firewall),
+            &mut audit,
+            MonotonicMillis(0),
+            &mut trace,
+        );
+        let disposition = trace.events.iter().find_map(|event| match event {
+            TraceEvent::Icmpv4TimeExceededDisposition { disposition, .. } => Some(*disposition),
+            _ => None,
+        });
+        let has_icmp_trace = disposition.is_some();
+        eprintln!(
+            "defect3 {protocol:?} inbound ttl=1: expected=drop/Ipv4TtlExpired pending=1 \
+             queued_time_exceeded=1 icmp_trace=true actual=completion={:?} pending={} \
+             queued_time_exceeded={} icmp_trace={has_icmp_trace}",
+            completion.get(),
+            errors.pending_actions(),
+            errors.counters().queued_time_exceeded,
+        );
+        assert_eq!(
+            (report.received, report.tx_requested, report.dropped),
+            (1, 0, 1)
+        );
+        assert_eq!(report.completion.recycled, 1);
+        assert_eq!(
+            completion.get(),
+            Some(SlotCompletion::Recycle(DropReason::Ipv4TtlExpired))
+        );
+        assert_eq!(
+            disposition,
+            Some(Icmpv4ErrorDisposition::Queued {
+                egress: WAN,
+                quote_len: match protocol {
+                    FirewallProtocol::Udp => 28,
+                    FirewallProtocol::Tcp => 40,
+                },
+            })
+        );
+        assert_eq!(errors.pending_actions(), 1);
+        assert_eq!(errors.counters().queued_time_exceeded, 1);
+        assert_eq!(errors.counters().queued, 1);
+        assert_eq!(frame, original);
+        assert_eq!(udp.mappings(), before_udp_mappings.as_slice());
+        assert_eq!(udp.peers(), before_udp_peers.as_slice());
+        assert_eq!(udp.counters(), before_udp_counters);
+        assert_eq!(tcp.mappings(), before_tcp_mappings.as_slice());
+        assert_eq!(tcp.sessions(), before_tcp_sessions.as_slice());
+        assert_eq!(tcp.counters(), before_tcp_counters);
+        assert_eq!(firewall.states(), before_firewall_states.as_slice());
+        assert_eq!(audit.records().len(), 1);
+        assert_eq!(audit.records()[0].ingress, WAN);
+        assert_eq!(audit.records()[0].egress, LAN);
+        assert_eq!(
+            audit.records()[0].disposition.verdict,
+            FirewallVerdict::Allow
+        );
+        assert_eq!(
+            audit.records()[0].disposition.matched_action,
+            Some(FirewallAction::AllowStateful)
+        );
+    }
+
+    #[test]
+    fn nat_inbound_udp_ttl_expiry_captures_generic_icmp_after_firewall() {
+        assert_nat_inbound_ttl_error_is_captured_after_firewall(FirewallProtocol::Udp);
+    }
+
+    #[test]
+    fn nat_inbound_tcp_ttl_expiry_captures_generic_icmp_after_firewall() {
+        assert_nat_inbound_ttl_error_is_captured_after_firewall(FirewallProtocol::Tcp);
+    }
+
+    #[test]
+    fn icmp_error_type_read_is_limited_to_ipv4_total_length_for_ttl_expiry() {
+        let routes = [Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, Some(ROUTER)).unwrap()];
+        let interfaces = [Interface {
+            id: WAN,
+            mac: MacAddress([2, 0, 0, 0, 0, 2]),
+        }];
+        let neighbors = [crate::Neighbor {
+            interface: WAN,
+            target: ROUTER,
+            mac: MacAddress([2, 0, 0, 0, 0, 20]),
+        }];
+        let bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: PUBLIC,
+        }];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+        let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+        let mut errors = Icmpv4ErrorRuntime::new(
+            Icmpv4ErrorPolicy::default(),
+            &mut error_states,
+            &mut error_actions,
+        );
+        let mut icmpv4_errors = Some((&mut errors, MonotonicMillis(0)));
+        let mut resolution = None;
+        let mut nat44_udp = None;
+        let mut nat44_tcp = None;
+        let mut firewall = None;
+        let mut firewall_audit = None;
+        let mut firewall_plan = None;
+        let mut trace = RecordingTrace::default();
+        let result = decide_ipv4(
+            &empty_ipv4_icmp_frame(1, Ipv4Address::from_octets([192, 0, 2, 99])),
+            &snapshot,
+            WAN,
+            &mut resolution,
+            &mut icmpv4_errors,
+            None,
+            &mut nat44_udp,
+            None,
+            &mut nat44_tcp,
+            None,
+            &mut firewall,
+            &mut firewall_audit,
+            &mut firewall_plan,
+            &mut trace,
+        );
+        let disposition = trace.events.iter().find_map(|event| match event {
+            TraceEvent::Icmpv4TimeExceededDisposition { disposition, .. } => Some(*disposition),
+            _ => None,
+        });
+        eprintln!(
+            "defect2 ttl=1 missing-payload ICMP type: expected=IcmpTypeMissing/pending=0 \
+             actual={disposition:?}/pending={}",
+            errors.pending_actions()
+        );
+        assert!(matches!(result, Err(DropReason::Ipv4TtlExpired)));
+        assert_eq!(disposition, Some(Icmpv4ErrorDisposition::IcmpTypeMissing));
+        assert_eq!(errors.pending_actions(), 0);
+    }
+
+    #[test]
+    fn icmp_failure_candidate_ignores_ethernet_padding_after_ipv4_total_length() {
+        let direct =
+            Route::new(Ipv4Address::from_octets([198, 51, 100, 0]), 24, WAN, None).unwrap();
+        let default = Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, Some(ROUTER)).unwrap();
+        let routes = [direct, default];
+        let interfaces = [Interface {
+            id: WAN,
+            mac: MacAddress([2, 0, 0, 0, 0, 2]),
+        }];
+        let bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: PUBLIC,
+        }];
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+        let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+        let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut dynamic_neighbors = [crate::DynamicNeighborSlot::EMPTY; 0];
+        let mut failure_holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut resolution = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            ResolutionPolicy::new(1_000, 2_000).unwrap(),
+            &mut resolution_states,
+            &mut resolution_actions,
+            &mut dynamic_neighbors,
+            &mut failure_holds,
+        );
+        let mut no_icmpv4_errors = None;
+        let mut nat44_udp = None;
+        let mut nat44_tcp = None;
+        let mut firewall = None;
+        let mut firewall_audit = None;
+        let mut firewall_plan = None;
+        let mut trace = RecordingTrace::default();
+        let destination = Ipv4Address::from_octets([198, 51, 100, 99]);
+        let result = decide_ipv4(
+            &empty_ipv4_icmp_frame(64, destination),
+            &snapshot,
+            WAN,
+            &mut Some((&mut resolution, MonotonicMillis(0))),
+            &mut no_icmpv4_errors,
+            None,
+            &mut nat44_udp,
+            None,
+            &mut nat44_tcp,
+            None,
+            &mut firewall,
+            &mut firewall_audit,
+            &mut firewall_plan,
+            &mut trace,
+        );
+        eprintln!(
+            "defect2 direct-neighbor-miss missing-payload candidate: \
+             expected=captured=0/pending_hold=0 actual=captured={}/pending_hold={}",
+            resolution.failure_counters().captured,
+            resolution.pending_failure_holds()
+        );
+        assert!(matches!(result, Err(DropReason::NeighborUnresolved)));
+        assert_eq!(resolution.failure_counters().captured, 0);
+        assert_eq!(resolution.pending_failure_holds(), 0);
     }
 
     #[test]

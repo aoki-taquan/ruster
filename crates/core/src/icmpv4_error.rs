@@ -184,6 +184,7 @@ pub struct Icmpv4ErrorStateSlot {
     egress: IfId,
     generation: u64,
     requested_at: MonotonicMillis,
+    action_slot: usize,
     occupied: bool,
     action_queued: bool,
     has_requested: bool,
@@ -194,6 +195,7 @@ impl Icmpv4ErrorStateSlot {
         egress: IfId(0),
         generation: 0,
         requested_at: MonotonicMillis(0),
+        action_slot: 0,
         occupied: false,
         action_queued: false,
         has_requested: false,
@@ -204,6 +206,7 @@ impl Icmpv4ErrorStateSlot {
 struct QueuedAction {
     action: Icmpv4ErrorAction,
     generation: u64,
+    state_index: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -326,6 +329,14 @@ pub struct Icmpv4ErrorPublicationPermit<'runtime, 'storage> {
     report: Icmpv4ErrorPublicationReport,
 }
 
+struct Icmpv4ErrorPublicationValidation {
+    states_flushed: usize,
+    #[cfg(test)]
+    action_slots_visited: usize,
+    #[cfg(test)]
+    states_visited: usize,
+}
+
 /// Caller-backed, worker-local ICMP error queue and per-egress limiter.
 ///
 /// The runtime deliberately has no shared state and cannot cross worker
@@ -424,6 +435,25 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
     pub fn preflight_publication<'runtime>(
         &'runtime mut self,
     ) -> Result<Icmpv4ErrorPublicationPermit<'runtime, 'a>, Icmpv4ErrorPublicationError> {
+        let validation = self.validate_publication()?;
+        let next_runtime_epoch = self
+            .runtime_epoch
+            .checked_add(1)
+            .ok_or(Icmpv4ErrorPublicationError::RuntimeEpochExhausted)?;
+        let report = Icmpv4ErrorPublicationReport {
+            states_flushed: validation.states_flushed,
+            actions_flushed: self.len,
+        };
+        Ok(Icmpv4ErrorPublicationPermit {
+            runtime: self,
+            next_runtime_epoch,
+            report,
+        })
+    }
+
+    fn validate_publication(
+        &self,
+    ) -> Result<Icmpv4ErrorPublicationValidation, Icmpv4ErrorPublicationError> {
         if self.len > self.actions.len() {
             return Err(Icmpv4ErrorPublicationError::ActionQueueCapacity);
         }
@@ -434,62 +464,75 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         } else if self.head >= self.actions.len() {
             return Err(Icmpv4ErrorPublicationError::ActionQueueHead);
         }
-        for index in 0..self.actions.len() {
+
+        #[cfg(test)]
+        let mut action_slots_visited = 0;
+        for (index, slot) in self.actions.iter().enumerate() {
+            #[cfg(test)]
+            {
+                action_slots_visited += 1;
+            }
             let distance = (index + self.actions.len() - self.head) % self.actions.len();
-            if self.actions[index].0.is_some() != (distance < self.len) {
+            if slot.0.is_some() != (distance < self.len) {
                 return Err(Icmpv4ErrorPublicationError::ActionQueueWindow);
             }
         }
-        if self
-            .states
-            .iter()
-            .any(|state| state.action_queued && !state.occupied)
-        {
-            return Err(Icmpv4ErrorPublicationError::QueuedStateMismatch);
-        }
-        let queued_states = self
-            .states
-            .iter()
-            .filter(|state| state.occupied && state.action_queued)
-            .count();
-        if queued_states != self.len {
-            return Err(Icmpv4ErrorPublicationError::QueuedStateMismatch);
-        }
-        for offset in 0..self.len {
-            let index = (self.head + offset) % self.actions.len();
-            let Some(queued) = self.actions[index].0 else {
-                return Err(Icmpv4ErrorPublicationError::ActionQueueWindow);
+
+        let mut states_flushed = 0;
+        #[cfg(test)]
+        let mut states_visited = 0;
+        for (state_index, state) in self.states.iter().enumerate() {
+            #[cfg(test)]
+            {
+                states_visited += 1;
+            }
+            if state.occupied {
+                states_flushed += 1;
+            }
+            if !state.action_queued {
+                continue;
+            }
+            if !state.occupied {
+                return Err(Icmpv4ErrorPublicationError::QueuedStateMismatch);
+            }
+            let Some(queued) = self.actions.get(state.action_slot).and_then(|slot| slot.0) else {
+                return Err(Icmpv4ErrorPublicationError::QueuedStateMismatch);
             };
-            if (0..offset).any(|previous_offset| {
-                let previous_index = (self.head + previous_offset) % self.actions.len();
-                self.actions[previous_index].0.is_some_and(|previous| {
-                    previous.action.egress == queued.action.egress
-                        && previous.generation == queued.generation
-                })
-            }) {
-                return Err(Icmpv4ErrorPublicationError::QueuedStateMismatch);
-            }
-            if !self.states.iter().any(|state| {
-                state.occupied
-                    && state.action_queued
-                    && state.egress == queued.action.egress
-                    && state.generation == queued.generation
-            }) {
+            if queued.state_index != state_index
+                || queued.action.egress != state.egress
+                || queued.generation != state.generation
+            {
                 return Err(Icmpv4ErrorPublicationError::QueuedStateMismatch);
             }
         }
-        let next_runtime_epoch = self
-            .runtime_epoch
-            .checked_add(1)
-            .ok_or(Icmpv4ErrorPublicationError::RuntimeEpochExhausted)?;
-        let report = Icmpv4ErrorPublicationReport {
-            states_flushed: self.states.iter().filter(|state| state.occupied).count(),
-            actions_flushed: self.len,
-        };
-        Ok(Icmpv4ErrorPublicationPermit {
-            runtime: self,
-            next_runtime_epoch,
-            report,
+
+        for (action_slot, slot) in self.actions.iter().enumerate() {
+            #[cfg(test)]
+            {
+                action_slots_visited += 1;
+            }
+            let Some(queued) = slot.0 else {
+                continue;
+            };
+            let Some(state) = self.states.get(queued.state_index) else {
+                return Err(Icmpv4ErrorPublicationError::QueuedStateMismatch);
+            };
+            if !state.occupied
+                || !state.action_queued
+                || state.action_slot != action_slot
+                || state.egress != queued.action.egress
+                || state.generation != queued.generation
+            {
+                return Err(Icmpv4ErrorPublicationError::QueuedStateMismatch);
+            }
+        }
+
+        Ok(Icmpv4ErrorPublicationValidation {
+            states_flushed,
+            #[cfg(test)]
+            action_slots_visited,
+            #[cfg(test)]
+            states_visited,
         })
     }
 
@@ -610,6 +653,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             egress: action.egress,
             generation: self.states[index].generation.wrapping_add(1),
             requested_at: MonotonicMillis(0),
+            action_slot: 0,
             occupied: true,
             action_queued: false,
             has_requested: false,
@@ -623,8 +667,13 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         }
         let generation = self.states[state_index].generation.wrapping_add(1);
         let tail = (self.head + self.len) % self.actions.len();
-        self.actions[tail].0 = Some(QueuedAction { action, generation });
+        self.actions[tail].0 = Some(QueuedAction {
+            action,
+            generation,
+            state_index,
+        });
         self.states[state_index].generation = generation;
+        self.states[state_index].action_slot = tail;
         self.states[state_index].action_queued = true;
         self.len += 1;
         let disposition = match action.kind {
@@ -674,7 +723,8 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
     }
 
     fn committed(&mut self, queued: QueuedAction, now: MonotonicMillis) {
-        let actual = self.actions[self.head]
+        let action_slot = self.head;
+        let actual = self.actions[action_slot]
             .0
             .take()
             .expect("committed ICMP action is queue front");
@@ -691,11 +741,14 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 self.counters.dequeued_host_unreachable += 1;
             }
         }
-        if let Some(state) = self.states.iter_mut().find(|state| {
+        if let Some(state) = self.states.get_mut(queued.state_index).filter(|state| {
             state.occupied
+                && state.action_queued
+                && state.action_slot == action_slot
                 && state.egress == queued.action.egress
                 && state.generation == queued.generation
         }) {
+            state.action_slot = 0;
             state.action_queued = false;
             state.has_requested = true;
             state.requested_at = now;
@@ -952,6 +1005,13 @@ fn build_icmpv4_error(frame: &mut [u8], action: &Icmpv4ErrorAction) {
     frame[35] = action.kind.icmp_code();
     frame[42..icmp_end].copy_from_slice(action.quote());
     let icmp_checksum = internet_checksum(&frame[34..icmp_end]);
+    let icmp_checksum = if icmp_checksum == 0 {
+        // RFC 1071 returns +0 for this mathematical-zero checksum. ICMP
+        // stores the equivalent one's-complement -0 as 0xffff on the wire.
+        0xffff
+    } else {
+        icmp_checksum
+    };
     frame[36..38].copy_from_slice(&icmp_checksum.to_be_bytes());
 }
 
@@ -1093,24 +1153,66 @@ mod tests {
     }
 
     #[test]
-    fn publication_preflight_rejects_duplicate_action_authority() {
-        let mut states = [Icmpv4ErrorStateSlot::EMPTY; 2];
-        let mut actions = [Icmpv4ErrorActionSlot::EMPTY; 2];
+    fn publication_preflight_rejects_tail_backreference_corruption_atomically() {
+        const CAPACITY: usize = 64;
+
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; CAPACITY];
+        let mut actions = [Icmpv4ErrorActionSlot::EMPTY; CAPACITY];
         let mut runtime =
             Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut states, &mut actions);
-        assert!(matches!(
-            runtime.schedule(action(1, 20), MonotonicMillis(0)),
-            Icmpv4ErrorDisposition::Queued { .. }
-        ));
-        assert!(matches!(
-            runtime.schedule(action(2, 20), MonotonicMillis(0)),
-            Icmpv4ErrorDisposition::Queued { .. }
-        ));
-        runtime.actions[1] = runtime.actions[0];
+        for egress in 1..=CAPACITY as u16 {
+            assert!(matches!(
+                runtime.schedule(action(egress, 20), MonotonicMillis(0)),
+                Icmpv4ErrorDisposition::Queued { .. }
+            ));
+        }
+
+        let tail_action = runtime.actions[CAPACITY - 1];
+        runtime.actions[CAPACITY - 1] = runtime.actions[0];
         assert_publication_error_is_atomic(
             &mut runtime,
             Icmpv4ErrorPublicationError::QueuedStateMismatch,
         );
+
+        runtime.actions[CAPACITY - 1] = tail_action;
+        runtime.states[CAPACITY - 1].action_slot = 0;
+        assert_publication_error_is_atomic(
+            &mut runtime,
+            Icmpv4ErrorPublicationError::QueuedStateMismatch,
+        );
+    }
+
+    #[test]
+    fn publication_validation_visits_two_action_passes_and_one_state_pass() {
+        const CAPACITY: usize = 64;
+
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; CAPACITY];
+        let mut actions = [Icmpv4ErrorActionSlot::EMPTY; CAPACITY];
+        let mut runtime =
+            Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut states, &mut actions);
+        for egress in 1..=CAPACITY as u16 {
+            assert!(matches!(
+                runtime.schedule(action(egress, 20), MonotonicMillis(0)),
+                Icmpv4ErrorDisposition::Queued { .. }
+            ));
+        }
+
+        let validation = runtime.validate_publication().unwrap();
+        assert_eq!(validation.action_slots_visited, CAPACITY * 2);
+        assert_eq!(validation.states_visited, CAPACITY);
+        assert_eq!(validation.states_flushed, CAPACITY);
+
+        let before = runtime_image(&runtime);
+        let permit = runtime.preflight_publication().unwrap();
+        assert_eq!(
+            permit.report,
+            Icmpv4ErrorPublicationReport {
+                states_flushed: CAPACITY,
+                actions_flushed: CAPACITY,
+            }
+        );
+        drop(permit);
+        assert_eq!(runtime_image(&runtime), before);
     }
 
     #[test]
@@ -1219,6 +1321,30 @@ mod tests {
         let mut odd_frame = [0; 63];
         build_icmpv4_error(&mut odd_frame, &odd);
         assert_eq!(internet_checksum(&odd_frame[34..63]), 0);
+    }
+
+    #[test]
+    fn host_unreachable_math_zero_checksum_uses_icmp_negative_zero() {
+        let original_ipv4 = [
+            0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, 0x40, 0x01, 0x4e, 0xab, 0xc0, 0x00,
+            0x02, 0x01, 0xc6, 0x33, 0x64, 0x01, 0xfc, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let action = Icmpv4ErrorAction::new_with_kind(
+            Icmpv4ErrorKind::DestinationUnreachableHost,
+            IfId(1),
+            MacAddress([2, 0, 0, 0, 0, 1]),
+            MacAddress([2, 0, 0, 0, 0, 2]),
+            Ipv4Address::from_octets([192, 0, 2, 1]),
+            Ipv4Address::from_octets([198, 51, 100, 1]),
+            0,
+            64,
+            &original_ipv4,
+        );
+        let mut frame = [0_u8; 70];
+        build_icmpv4_error(&mut frame, &action);
+
+        assert_eq!(internet_checksum(&frame[34..]), 0);
+        assert_eq!(u16::from_be_bytes([frame[36], frame[37]]), 0xffff);
     }
 
     #[test]

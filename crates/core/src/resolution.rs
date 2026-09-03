@@ -138,6 +138,18 @@ pub struct ResolutionActionSlot(Option<QueuedAction>);
 
 impl ResolutionActionSlot {
     pub const EMPTY: Self = Self(None);
+
+    /// Returns the queued ARP action and its resolution generation.
+    ///
+    /// The value is a copy of bounded metadata; it does not expose a packet
+    /// lease or any owner capability.
+    #[must_use]
+    pub const fn queued(self) -> Option<(ArpRequestAction, u64)> {
+        match self.0 {
+            Some(queued) => Some((queued.action, queued.generation)),
+            None => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -175,6 +187,61 @@ impl ResolutionStateSlot {
         phase: ResolutionPhase::InitialQueued,
         failure_notified: false,
     };
+
+    #[must_use]
+    pub const fn is_occupied(self) -> bool {
+        self.occupied
+    }
+
+    #[must_use]
+    pub const fn egress(self) -> IfId {
+        self.key.egress
+    }
+
+    #[must_use]
+    pub const fn target(self) -> Ipv4Address {
+        self.key.target
+    }
+
+    #[must_use]
+    pub const fn action(self) -> ArpRequestAction {
+        self.action
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn attempts(self) -> u16 {
+        self.attempts
+    }
+
+    #[must_use]
+    pub const fn accepted_attempts(self) -> u16 {
+        self.accepted_attempts
+    }
+
+    #[must_use]
+    pub const fn requested_at(self) -> MonotonicMillis {
+        self.requested_at
+    }
+
+    #[must_use]
+    pub const fn failed_at(self) -> MonotonicMillis {
+        self.failed_at
+    }
+
+    #[must_use]
+    pub const fn phase(self) -> ResolutionPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub const fn failure_notified(self) -> bool {
+        self.failure_notified
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -194,6 +261,31 @@ impl DynamicNeighborSlot {
         refreshed_at: MonotonicMillis(0),
         occupied: false,
     };
+
+    #[must_use]
+    pub const fn is_occupied(self) -> bool {
+        self.occupied
+    }
+
+    #[must_use]
+    pub const fn interface(self) -> IfId {
+        self.interface
+    }
+
+    #[must_use]
+    pub const fn target(self) -> Ipv4Address {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn mac(self) -> MacAddress {
+        self.mac
+    }
+
+    #[must_use]
+    pub const fn refreshed_at(self) -> MonotonicMillis {
+        self.refreshed_at
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -243,6 +335,12 @@ pub struct ResolutionPublicationReport {
     pub actions_flushed: usize,
     pub dynamic_neighbors_flushed: usize,
     pub failure_holds_flushed: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResolutionPublicationValidation {
+    states_flushed: usize,
+    failure_holds_flushed: usize,
 }
 
 /// Exclusive proof that old resolution authority can be flushed totally.
@@ -557,6 +655,7 @@ pub struct ResolutionRuntime<'a> {
     poll_cursor: usize,
     failure_cursor: usize,
     last_now: Option<MonotonicMillis>,
+    last_interface_identity: Option<u64>,
     publication_epoch: u128,
     counters: ResolutionCounters,
     failure_counters: ResolutionFailureCounters,
@@ -614,6 +713,7 @@ impl<'a> ResolutionRuntime<'a> {
             poll_cursor: 0,
             failure_cursor: 0,
             last_now: None,
+            last_interface_identity: None,
             publication_epoch: 1,
             counters: ResolutionCounters::default(),
             failure_counters: ResolutionFailureCounters::default(),
@@ -627,6 +727,46 @@ impl<'a> ResolutionRuntime<'a> {
             .iter()
             .filter(|slot| slot.occupied)
             .count()
+    }
+
+    /// Returns the caller-owned resolution state slots for cold/test evidence.
+    #[must_use]
+    pub fn state_slots(&self) -> &[ResolutionStateSlot] {
+        self.states
+    }
+
+    /// Returns the caller-owned action slots for cold/test evidence.
+    #[must_use]
+    pub fn action_slots(&self) -> &[ResolutionActionSlot] {
+        self.actions
+    }
+
+    /// Returns the caller-owned dynamic-neighbor slots for cold/test evidence.
+    #[must_use]
+    pub fn dynamic_neighbor_slots(&self) -> &[DynamicNeighborSlot] {
+        self.dynamic_neighbors
+    }
+
+    /// Returns one pending action in FIFO order without changing queue state.
+    #[must_use]
+    pub fn queued_action(&self, position: usize) -> Option<(ArpRequestAction, u64)> {
+        if position >= self.len || self.actions.is_empty() {
+            return None;
+        }
+        let index = (self.head + position) % self.actions.len();
+        self.actions[index].queued()
+    }
+
+    /// Returns the last monotonic timestamp accepted by this runtime.
+    #[must_use]
+    pub const fn last_observed_at(&self) -> Option<MonotonicMillis> {
+        self.last_now
+    }
+
+    /// Returns the current publication epoch of this worker-local runtime.
+    #[must_use]
+    pub const fn publication_epoch(&self) -> u128 {
+        self.publication_epoch
     }
 
     #[must_use]
@@ -679,6 +819,7 @@ impl<'a> ResolutionRuntime<'a> {
             && self.poll_cursor == 0
             && self.failure_cursor == 0
             && self.last_now.is_none()
+            && self.last_interface_identity.is_none()
             && self.publication_epoch == 1
             && self.counters == ResolutionCounters::default()
             && self.failure_counters == ResolutionFailureCounters::default()
@@ -691,24 +832,20 @@ impl<'a> ResolutionRuntime<'a> {
     pub fn preflight_publication<'runtime>(
         &'runtime mut self,
     ) -> Result<ResolutionPublicationPermit<'runtime, 'a>, ResolutionPublicationError> {
-        self.validate_publication_invariants()?;
+        let validation = self.validate_publication_invariants()?;
         let next_runtime_epoch = self
             .publication_epoch
             .checked_add(1)
             .ok_or(ResolutionPublicationError::RuntimeEpochExhausted)?;
         let preview = ResolutionPublicationReport {
-            states_flushed: self.states.iter().filter(|state| state.occupied).count(),
+            states_flushed: validation.states_flushed,
             actions_flushed: self.len,
             dynamic_neighbors_flushed: self
                 .dynamic_neighbors
                 .iter()
                 .filter(|slot| slot.occupied)
                 .count(),
-            failure_holds_flushed: self
-                .failure_holds
-                .iter()
-                .filter(|hold| hold.phase != ResolutionFailureHoldPhase::Empty)
-                .count(),
+            failure_holds_flushed: validation.failure_holds_flushed,
         };
         Ok(ResolutionPublicationPermit {
             runtime: self,
@@ -781,7 +918,9 @@ impl<'a> ResolutionRuntime<'a> {
         self.commit_publication(snapshot)
     }
 
-    fn validate_publication_invariants(&self) -> Result<(), ResolutionPublicationError> {
+    fn validate_publication_invariants(
+        &self,
+    ) -> Result<ResolutionPublicationValidation, ResolutionPublicationError> {
         if self.len > self.actions.len() {
             return Err(ResolutionPublicationError::ActionQueueCapacity);
         }
@@ -798,23 +937,31 @@ impl<'a> ResolutionRuntime<'a> {
                 return Err(ResolutionPublicationError::ActionQueueWindow);
             }
         }
-        let pending_states = self
-            .states
-            .iter()
-            .filter(|state| state_is_pending(**state))
-            .count();
+        let mut states_flushed = 0;
+        let mut pending_states = 0;
+        for state in &*self.states {
+            if state.occupied {
+                states_flushed += 1;
+            }
+            if state_is_pending(*state) {
+                pending_states += 1;
+            }
+        }
         if pending_states != self.pending_state_count {
             return Err(ResolutionPublicationError::PendingStateCount);
         }
-        let pending_holds = self
+        let failure_holds_flushed = self
             .failure_holds
             .iter()
             .filter(|hold| hold.phase != ResolutionFailureHoldPhase::Empty)
             .count();
-        if pending_holds != self.pending_failure_hold_count {
+        if failure_holds_flushed != self.pending_failure_hold_count {
             return Err(ResolutionPublicationError::PendingFailureHoldCount);
         }
-        Ok(())
+        Ok(ResolutionPublicationValidation {
+            states_flushed,
+            failure_holds_flushed,
+        })
     }
 
     fn commit_publication(
@@ -822,6 +969,16 @@ impl<'a> ResolutionRuntime<'a> {
         snapshot: &crate::ForwardingSnapshot<'_>,
     ) -> StaticReconcileReport {
         let mut report = StaticReconcileReport::default();
+        let interface_identity = snapshot_interface_identity(snapshot);
+        if self.last_interface_identity != Some(interface_identity) {
+            for slot in &mut *self.dynamic_neighbors {
+                if slot.occupied {
+                    *slot = DynamicNeighborSlot::EMPTY;
+                    report.dynamic_removed = report.dynamic_removed.saturating_add(1);
+                }
+            }
+            self.last_interface_identity = Some(interface_identity);
+        }
         for slot in &mut *self.dynamic_neighbors {
             if slot.occupied
                 && snapshot.neighbors.iter().any(|neighbor| {
@@ -1620,8 +1777,24 @@ impl ResolutionPublicationPermit<'_, '_> {
         self.runtime.poll_cursor = 0;
         self.runtime.failure_cursor = 0;
         self.runtime.publication_epoch = self.next_runtime_epoch;
+        self.runtime.last_interface_identity = None;
         self.preview
     }
+}
+
+fn snapshot_interface_identity(snapshot: &crate::ForwardingSnapshot<'_>) -> u64 {
+    fn mix(identity: u64, value: u64) -> u64 {
+        (identity ^ value).wrapping_mul(0x0000_0100_0000_01b3)
+    }
+
+    let mut identity = 0xcbf2_9ce4_8422_2325;
+    for interface in snapshot.interfaces {
+        identity = mix(identity, u64::from(interface.id.0));
+        for octet in interface.mac.0 {
+            identity = mix(identity, u64::from(octet));
+        }
+    }
+    mix(identity, 0xff)
 }
 
 fn publication_hold_valid(
@@ -2241,6 +2414,7 @@ mod tests {
         poll_cursor: usize,
         failure_cursor: usize,
         last_now: Option<MonotonicMillis>,
+        last_interface_identity: Option<u64>,
         publication_epoch: u128,
         counters: ResolutionCounters,
         failure_counters: ResolutionFailureCounters,
@@ -2260,6 +2434,7 @@ mod tests {
             poll_cursor: runtime.poll_cursor,
             failure_cursor: runtime.failure_cursor,
             last_now: runtime.last_now,
+            last_interface_identity: runtime.last_interface_identity,
             publication_epoch: runtime.publication_epoch,
             counters: runtime.counters,
             failure_counters: runtime.failure_counters,
@@ -2879,6 +3054,66 @@ mod tests {
         assert_eq!(report.invalid_states_removed, 2);
         assert_eq!(report.invalid_actions_removed, 1);
         assert_eq!(runtime.pending_actions(), 0);
+    }
+
+    #[test]
+    fn publication_reconciliation_invalidates_dynamic_neighbor_on_interface_reuse() {
+        let policy = ResolutionPolicy::with_dynamic_neighbor_ttl(1_000, 2_000, 60_000).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut dynamic,
+        );
+        let old_interface = [Interface {
+            id: WAN,
+            mac: SOURCE_MAC,
+        }];
+        let old_snapshot = ForwardingSnapshot::new(&[], &old_interface, &[], &[]).unwrap();
+        assert_eq!(
+            runtime.reconcile_publication(&old_snapshot),
+            StaticReconcileReport::default()
+        );
+        let old_neighbor_mac = MacAddress([3; 6]);
+        assert_eq!(
+            runtime.merge_dynamic(
+                WAN,
+                target(2),
+                old_neighbor_mac,
+                true,
+                false,
+                MonotonicMillis(1_000),
+            ),
+            ControlDisposition::Inserted
+        );
+        assert_eq!(
+            runtime.lookup_dynamic(WAN, target(2), MonotonicMillis(2_000)),
+            DynamicLookup::Hit(old_neighbor_mac)
+        );
+        assert_eq!(
+            runtime.reconcile_publication(&old_snapshot),
+            StaticReconcileReport::default()
+        );
+        assert_eq!(
+            runtime.lookup_dynamic(WAN, target(2), MonotonicMillis(2_000)),
+            DynamicLookup::Hit(old_neighbor_mac)
+        );
+
+        let reused_interface = [Interface {
+            id: WAN,
+            mac: MacAddress([7; 6]),
+        }];
+        let reused_snapshot = ForwardingSnapshot::new(&[], &reused_interface, &[], &[]).unwrap();
+        let report = runtime.reconcile_publication(&reused_snapshot);
+
+        assert_eq!(report.dynamic_removed, 1);
+        assert_eq!(
+            runtime.lookup_dynamic(WAN, target(2), MonotonicMillis(2_000)),
+            DynamicLookup::Miss
+        );
     }
 
     #[test]

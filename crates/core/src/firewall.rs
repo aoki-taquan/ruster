@@ -1,4 +1,8 @@
-use std::{marker::PhantomData, rc::Rc};
+use std::{
+    marker::PhantomData,
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use crate::{ForwardingSnapshot, IfId, Ipv4Address};
 
@@ -9,6 +13,16 @@ pub const FIREWALL_TCP_OPENING_DEFAULT_IDLE_TTL_MS: u64 = 240_000;
 pub const FIREWALL_TCP_ACTIVE_MIN_IDLE_TTL_MS: u64 = 7_440_000;
 pub const FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS: u64 = 7_440_000;
 pub const FIREWALL_MAX_IDLE_TTL_MS: u64 = 604_800_000;
+
+static NEXT_FIREWALL_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
+
+fn allocate_firewall_runtime_identity() -> u64 {
+    NEXT_FIREWALL_RUNTIME_IDENTITY
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |identity| {
+            identity.checked_add(1)
+        })
+        .expect("firewall runtime identity exhausted")
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FirewallRuleId(pub u32);
@@ -512,6 +526,42 @@ impl<'a> FirewallConfig<'a> {
         self.hash_key
     }
 
+    /// Compares firewall behavior while excluding publication and storage
+    /// identity metadata.
+    ///
+    /// Rule order is intentionally preserved because rules use first-match
+    /// semantics. The exhaustive field inventory makes a future top-level field
+    /// addition require an explicit decision here instead of silently changing
+    /// the meaning of a semantic comparison. Hash key, generation, authority,
+    /// allocation identity, cached length, and fingerprint are not behavior.
+    #[must_use]
+    pub fn semantic_eq<'b>(self, other: FirewallConfig<'b>) -> bool {
+        let FirewallConfig {
+            rules,
+            policy,
+            generation: _,
+            hash_key: _,
+            snapshot_authority: _,
+            snapshot_identity: _,
+            rules_identity: _,
+            rules_len: _,
+            rules_fingerprint: _,
+        } = self;
+        let FirewallConfig {
+            rules: other_rules,
+            policy: other_policy,
+            generation: _,
+            hash_key: _,
+            snapshot_authority: _,
+            snapshot_identity: _,
+            rules_identity: _,
+            rules_len: _,
+            rules_fingerprint: _,
+        } = other;
+
+        policy == other_policy && rules == other_rules
+    }
+
     pub(crate) fn authority_matches(self, snapshot: &ForwardingSnapshot<'_>) -> bool {
         let authority = if self.rules_fingerprint & VALIDATED_FIREWALL_OWNER_AUTHORITY_BIT == 0 {
             snapshot.authority()
@@ -805,6 +855,122 @@ impl FirewallStateSlot {
     }
 }
 
+fn firewall_authority_digest_step(digest: u64, value: u64) -> u64 {
+    digest
+        .wrapping_add(value.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .rotate_left(17)
+        ^ 0xa5a5_5a5a_c3c3_3c3c
+}
+
+fn firewall_state_authority_digest(states: &[FirewallStateSlot]) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    for (index, state) in states.iter().copied().enumerate() {
+        for value in [
+            u64::try_from(index).expect("validated firewall capacity fits u64"),
+            u64::from(state.occupied),
+            state.slot_generation,
+            state.config_generation,
+            u64::from(state.protocol == FirewallProtocol::Tcp),
+            u64::from(state.origin_ingress.0),
+            u64::from(state.origin_egress.0),
+            u64::from(u32::from_be_bytes(state.initiator_address.octets())),
+            u64::from(u32::from_be_bytes(state.responder_address.octets())),
+            u64::from(state.initiator_port),
+            u64::from(state.responder_port),
+            state.last_activity_ms,
+            u64::from(state.tcp_phase == FirewallTcpPhase::Active),
+            u64::from(state.tcp_forward_ack),
+            u64::from(state.tcp_reverse_ack),
+            u64::from(state.origin_rule_id.0),
+        ] {
+            digest = firewall_authority_digest_step(digest, value);
+        }
+    }
+    digest
+}
+
+const FIREWALL_AUTHORITY_COMMITMENT_TAG: u64 = 0x5255_5354_2e46_4952;
+
+/// Commits the firewall constructor hash configuration and every bounded
+/// state node without exposing either the key or the state backing. The keyed
+/// configuration probe makes an alternate key distinguishable even when all
+/// open-addressing start buckets are preserved; the per-state keyed flow hash
+/// binds the node/hash relation as well.
+#[allow(clippy::too_many_arguments)]
+fn firewall_authority_commitment(
+    binding: FirewallConfigBinding,
+    states: &[FirewallStateSlot],
+    watermark_ms: Option<u64>,
+    runtime_epoch: u64,
+    next_slot_generation: u64,
+    occupied_count: usize,
+    recomputed_occupied_count: usize,
+    state_digest: u64,
+) -> u64 {
+    let mut commitment = siphash24(
+        binding.hash_key,
+        [
+            FIREWALL_AUTHORITY_COMMITMENT_TAG,
+            binding.generation,
+            u64::try_from(states.len()).expect("validated firewall capacity fits u64"),
+            u64::from(watermark_ms.is_some()),
+            watermark_ms.unwrap_or_default(),
+            runtime_epoch,
+            next_slot_generation,
+            u64::try_from(occupied_count).expect("validated firewall count fits u64"),
+            u64::try_from(recomputed_occupied_count).expect("validated firewall count fits u64"),
+            state_digest,
+        ],
+    );
+    for (index, state) in states.iter().copied().enumerate() {
+        commitment = firewall_authority_digest_step(
+            commitment,
+            u64::try_from(index).expect("validated firewall index fits u64"),
+        );
+        commitment = firewall_authority_digest_step(commitment, u64::from(state.occupied));
+        let node_hash = state
+            .occupied
+            .then(|| flow_hash(slot_packet(state), binding.generation, binding.hash_key));
+        commitment = firewall_authority_digest_step(commitment, node_hash.unwrap_or_default());
+    }
+    commitment
+}
+
+/// Opaque, fixed-width authority evidence for a firewall runtime.
+///
+/// `Eq` compares the complete private envelope, including lifecycle scalars,
+/// occupied counts, slot generations, and the bounded state digest. `Debug`
+/// intentionally emits only a redacted marker, so a consumer cannot recover
+/// state topology, packet tuples, keys, or generation values from diagnostics.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct FirewallAuthorityEvidence {
+    words: [u64; 7],
+}
+
+impl std::fmt::Debug for FirewallAuthorityEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FirewallAuthorityEvidence([REDACTED])")
+    }
+}
+
+impl FirewallAuthorityEvidence {
+    /// Encodes a bounded, independently calculated expected contract.
+    ///
+    /// This creates an opaque equality value only; it never extracts or
+    /// enumerates runtime state. The fixed envelope is deliberately not
+    /// exposed after construction.
+    pub const fn from_expected_contract(words: [u64; 7]) -> Self {
+        Self { words }
+    }
+
+    /// Returns only the aggregate maintained/recomputed occupancy verdict.
+    /// Full authority checks must compare the opaque value with `Eq`.
+    #[must_use]
+    pub const fn occupied_count_conserved(self) -> bool {
+        self.words[4] == self.words[5]
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FirewallCounters {
     pub allowed_new: u64,
@@ -1022,6 +1188,7 @@ pub(crate) struct FirewallPacket {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FirewallPlan {
     index: usize,
+    expected_runtime_identity: u64,
     expected_generation: u64,
     expected_runtime_epoch: u64,
     expected_config_generation: u64,
@@ -1039,11 +1206,13 @@ impl FirewallPlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FirewallCommitError {
+    RuntimeIdentityChanged,
     RuntimeEpochChanged,
     ConfigGenerationChanged,
     SlotOutOfBounds,
     SlotGenerationChanged,
     UsableCapacityExceeded,
+    EstablishedStateRegressed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1260,6 +1429,7 @@ pub struct FirewallReconcilePermit<'runtime, 'state> {
 pub struct FirewallRuntime<'state> {
     binding: FirewallConfigBinding,
     states: &'state mut [FirewallStateSlot],
+    runtime_identity: u64,
     watermark_ms: Option<u64>,
     runtime_epoch: u64,
     next_slot_generation: u64,
@@ -1275,10 +1445,12 @@ impl<'state> FirewallRuntime<'state> {
     /// the rules slice; callers provide the current [`FirewallConfig`] again
     /// for each rule-evaluating packet plan.
     pub fn new(config: FirewallConfig<'_>, states: &'state mut [FirewallStateSlot]) -> Self {
+        let runtime_identity = allocate_firewall_runtime_identity();
         states.fill(FirewallStateSlot::default());
         Self {
             binding: config.binding(),
             states,
+            runtime_identity,
             watermark_ms: None,
             runtime_epoch: 1,
             next_slot_generation: 1,
@@ -1306,6 +1478,40 @@ impl<'state> FirewallRuntime<'state> {
     #[must_use]
     pub fn states(&self) -> &[FirewallStateSlot] {
         self.states
+    }
+
+    /// Returns fixed, secret-free authority evidence for cold/test consumers.
+    ///
+    /// The words are watermark-present, watermark, runtime epoch, next slot
+    /// generation, maintained occupied count, recomputed occupied count, and
+    /// a private keyed commitment over the constructor hash configuration,
+    /// every bounded state node/hash relation, and the complete state digest.
+    /// No packet, rule source, hash key, or allocation is exposed. This
+    /// deliberately cold validation must stay out of the packet path.
+    #[must_use]
+    pub fn authority_evidence(&self) -> FirewallAuthorityEvidence {
+        let occupied_count = self.states.iter().filter(|slot| slot.occupied).count();
+        let state_digest = firewall_state_authority_digest(self.states);
+        FirewallAuthorityEvidence {
+            words: [
+                u64::from(self.watermark_ms.is_some()),
+                self.watermark_ms.unwrap_or_default(),
+                self.runtime_epoch,
+                self.next_slot_generation,
+                u64::try_from(self.occupied_count).expect("validated firewall count fits u64"),
+                u64::try_from(occupied_count).expect("validated firewall count fits u64"),
+                firewall_authority_commitment(
+                    self.binding,
+                    self.states,
+                    self.watermark_ms,
+                    self.runtime_epoch,
+                    self.next_slot_generation,
+                    self.occupied_count,
+                    occupied_count,
+                    state_digest,
+                ),
+            ],
+        }
     }
 
     #[must_use]
@@ -1357,7 +1563,7 @@ impl<'state> FirewallRuntime<'state> {
             .runtime_epoch
             .checked_add(1)
             .ok_or(FirewallReconcileError::RuntimeEpochExhausted)?;
-        let states_flushed = self.states.iter().filter(|slot| slot.occupied).count();
+        let states_flushed = self.occupied_count;
         Ok(FirewallReconcilePermit {
             runtime: self,
             next,
@@ -1450,6 +1656,7 @@ impl<'state> FirewallRuntime<'state> {
             }
             return Ok(FirewallPlan {
                 index,
+                expected_runtime_identity: self.runtime_identity,
                 expected_generation: current.slot_generation,
                 expected_runtime_epoch: self.runtime_epoch,
                 expected_config_generation: self.binding.generation,
@@ -1495,6 +1702,7 @@ impl<'state> FirewallRuntime<'state> {
         let slot_generation = self.next_slot_generation.max(1);
         Ok(FirewallPlan {
             index,
+            expected_runtime_identity: self.runtime_identity,
             expected_generation: current.slot_generation,
             expected_runtime_epoch: self.runtime_epoch,
             expected_config_generation: self.binding.generation,
@@ -1573,6 +1781,9 @@ impl<'state> FirewallRuntime<'state> {
     }
 
     pub(crate) fn commit(&mut self, plan: FirewallPlan) -> Result<(), FirewallCommitError> {
+        if self.runtime_identity != plan.expected_runtime_identity {
+            return Err(FirewallCommitError::RuntimeIdentityChanged);
+        }
         if self.runtime_epoch != plan.expected_runtime_epoch {
             return Err(FirewallCommitError::RuntimeEpochChanged);
         }
@@ -1587,6 +1798,16 @@ impl<'state> FirewallRuntime<'state> {
         }
         if plan.created && !current.occupied && self.occupied_count >= self.usable_capacity() {
             return Err(FirewallCommitError::UsableCapacityExceeded);
+        }
+        if !plan.created
+            && (plan.replacement.last_activity_ms < current.last_activity_ms
+                || (current.protocol == FirewallProtocol::Tcp
+                    && ((current.tcp_phase == FirewallTcpPhase::Active
+                        && plan.replacement.tcp_phase == FirewallTcpPhase::Opening)
+                        || (current.tcp_forward_ack && !plan.replacement.tcp_forward_ack)
+                        || (current.tcp_reverse_ack && !plan.replacement.tcp_reverse_ack))))
+        {
+            return Err(FirewallCommitError::EstablishedStateRegressed);
         }
         self.states[plan.index] = plan.replacement;
         if plan.created {
@@ -1888,6 +2109,92 @@ mod tests {
             hash_key,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn firewall_config_semantic_eq_tracks_rules_and_policy_only() {
+        let forwarding = validated_forwarding_owner();
+        let snapshot = forwarding.snapshot();
+        {
+            let owner = validated_firewall_owner(&snapshot, 1, hash_key());
+            let base = owner.config();
+
+            let mut identity_only = base;
+            identity_only.generation = u64::MAX;
+            identity_only.hash_key = rotated_hash_key();
+            identity_only.snapshot_authority = u64::MAX;
+            identity_only.snapshot_identity = [usize::MAX; 8];
+            identity_only.rules_identity = usize::MAX;
+            identity_only.rules_len = usize::MAX;
+            identity_only.rules_fingerprint = u64::MAX;
+            assert!(base.semantic_eq(identity_only));
+
+            let changed_policy = FirewallPolicy::new(
+                base.policy().udp_idle_ttl_ms() + 1,
+                base.policy().tcp_opening_idle_ttl_ms(),
+                base.policy().tcp_active_idle_ttl_ms(),
+            )
+            .unwrap();
+            let policy_config = FirewallConfig::new(
+                &snapshot,
+                base.rules(),
+                changed_policy,
+                base.generation(),
+                base.hash_key(),
+            )
+            .unwrap();
+            assert!(!base.semantic_eq(policy_config));
+
+            let changed_rules = [rule(1, FirewallAction::Deny, FirewallProtocol::Udp)];
+            let rules_config = FirewallConfig::new(
+                &snapshot,
+                &changed_rules,
+                base.policy(),
+                base.generation(),
+                base.hash_key(),
+            )
+            .unwrap();
+            assert!(!base.semantic_eq(rules_config));
+        }
+    }
+
+    #[test]
+    fn firewall_authority_evidence_is_full_eq_and_redacted_debug() {
+        fn assert_copy_eq<T: Copy + Eq + PartialEq>() {}
+
+        assert_copy_eq::<FirewallAuthorityEvidence>();
+
+        const POISON: u64 = 0xfedc_ba98_7654_3210;
+        let words = [POISON; 7];
+        let evidence = FirewallAuthorityEvidence::from_expected_contract(words);
+        let mut changed_words = words;
+        changed_words[6] ^= 1;
+        let changed = FirewallAuthorityEvidence::from_expected_contract(changed_words);
+
+        assert_ne!(evidence, changed);
+        for index in 0..7 {
+            let mut changed_words = words;
+            changed_words[index] ^= 1;
+            assert_ne!(
+                evidence,
+                FirewallAuthorityEvidence::from_expected_contract(changed_words),
+                "firewall authority word {index} must participate in Eq"
+            );
+        }
+        assert_eq!(
+            format!("{evidence:?}"),
+            "FirewallAuthorityEvidence([REDACTED])"
+        );
+        assert_eq!(format!("{evidence:#?}"), format!("{evidence:?}"));
+        assert!(!format!("{evidence:?}").contains(&POISON.to_string()));
+        assert!(!format!("{evidence:?}").contains(&format!("{POISON:x}")));
+
+        let mut count_changed = words;
+        count_changed[4] ^= 1;
+        assert_ne!(
+            evidence,
+            FirewallAuthorityEvidence::from_expected_contract(count_changed)
+        );
     }
 
     #[derive(Debug, Eq, PartialEq)]
@@ -3011,6 +3318,121 @@ mod tests {
                 runtime.commit(stale_slot),
                 Err(FirewallCommitError::SlotGenerationChanged)
             );
+        });
+    }
+
+    #[test]
+    fn stale_established_plan_is_rejected_after_same_slot_runtime_recreation() {
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 1];
+            let first_flow = packet(FirewallProtocol::Udp, 0);
+            let stale = {
+                let mut runtime = FirewallRuntime::new(config, &mut slots);
+                let first = runtime.plan_packet(&config, first_flow, 0).unwrap();
+                runtime.commit(first).unwrap();
+                runtime.plan_packet(&config, first_flow, 0).unwrap()
+            };
+
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let mut replacement_flow = first_flow;
+            replacement_flow.source_port += 1;
+            let replacement = runtime.plan_packet(&config, replacement_flow, 0).unwrap();
+            runtime.commit(replacement).unwrap();
+
+            let result = runtime.commit(stale);
+            assert!(
+                result.is_err(),
+                "same-slot runtime recreation accepted stale firewall plan: {result:?}"
+            );
+            assert_eq!(
+                runtime.states()[0].initiator_port(),
+                replacement_flow.source_port
+            );
+        });
+    }
+
+    #[test]
+    fn stale_tcp_established_plan_cannot_roll_back_activity_or_phase() {
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Tcp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 1];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let initial = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Tcp, 0x02), 0)
+                .unwrap();
+            runtime.commit(initial).unwrap();
+
+            let mut reverse = packet(FirewallProtocol::Tcp, 0x12);
+            reverse.ingress = WAN;
+            reverse.egress = LAN;
+            reverse.source = REMOTE;
+            reverse.destination = INTERNAL;
+            reverse.source_port = 443;
+            reverse.destination_port = 12_345;
+            let reverse_syn_ack = runtime.plan_packet(&config, reverse, 1).unwrap();
+            runtime.commit(reverse_syn_ack).unwrap();
+
+            let stale = runtime.plan_packet(&config, reverse, 2).unwrap();
+            let direct_ack = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Tcp, 0x10), 3)
+                .unwrap();
+            runtime.commit(direct_ack).unwrap();
+            assert_eq!(runtime.states()[0].tcp_phase(), FirewallTcpPhase::Active);
+            assert_eq!(runtime.states()[0].last_activity_ms(), 3);
+
+            let result = runtime.commit(stale);
+            assert!(
+                result.is_err(),
+                "stale TCP established plan rolled back active state: {result:?}"
+            );
+            assert_eq!(runtime.states()[0].tcp_phase(), FirewallTcpPhase::Active);
+            assert_eq!(runtime.states()[0].last_activity_ms(), 3);
+        });
+    }
+
+    #[test]
+    fn stale_udp_established_plan_cannot_roll_back_activity() {
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 1];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let flow = packet(FirewallProtocol::Udp, 0);
+            let initial = runtime.plan_packet(&config, flow, 0).unwrap();
+            runtime.commit(initial).unwrap();
+
+            let stale = runtime.plan_packet(&config, flow, 2).unwrap();
+            let fresh = runtime.plan_packet(&config, flow, 3).unwrap();
+            runtime.commit(fresh).unwrap();
+            assert_eq!(runtime.states()[0].last_activity_ms(), 3);
+
+            let result = runtime.commit(stale);
+            assert!(
+                result.is_err(),
+                "stale UDP established plan rolled back activity: {result:?}"
+            );
+            assert_eq!(runtime.states()[0].last_activity_ms(), 3);
         });
     }
 

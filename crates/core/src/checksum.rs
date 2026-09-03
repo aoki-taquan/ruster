@@ -260,8 +260,9 @@ mod tests {
 
     #[test]
     fn transport_profiles_keep_udp_and_tcp_zero_encodings_distinct() {
-        let mathematical_zero = rfc1624_update(0xdd2f, 0x5555, 0x3285);
-        assert_eq!(mathematical_zero, 0);
+        let present_checksum = rfc1624_update(0xdd2f, 0x5555, 0x3285);
+        assert_eq!(present_checksum, 0);
+        let mathematical_zero = present_checksum;
 
         // NAT UDP preserves an absent input checksum as zero, but represents
         // a present checksum whose update is mathematical zero as 0xffff.
@@ -274,9 +275,8 @@ mod tests {
         assert_eq!(udp_absent, 0);
         assert_eq!(udp_present, 0xffff);
 
-        // TCP has no "checksum absent" encoding and keeps mathematical zero
-        // on the wire. The end-to-end production boundaries are exercised by
-        // the NAT UDP/TCP integration tests.
+        // TCP has no "checksum absent" encoding; it keeps the mathematical
+        // zero result from the shared update helper.
         let tcp_present = mathematical_zero;
         assert_eq!(tcp_present, 0);
     }

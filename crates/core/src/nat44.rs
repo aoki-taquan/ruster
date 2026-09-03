@@ -208,6 +208,40 @@ mod tcp_tests {
     }
 
     #[test]
+    fn tcp_config_semantic_eq_tracks_behavior_and_ignores_owner_identity() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |base| {
+            let mut identity_only = base;
+            identity_only.authority = u64::MAX;
+            identity_only.snapshot_identity = [usize::MAX; 8];
+            assert!(base.semantic_eq(identity_only));
+
+            let mut inside_changed = base;
+            inside_changed.inside = IfId(9);
+            assert!(!base.semantic_eq(inside_changed));
+
+            let mut outside_changed = base;
+            outside_changed.outside = IfId(9);
+            assert!(!base.semantic_eq(outside_changed));
+
+            let mut address_changed = base;
+            address_changed.public_address = Ipv4Address::from_octets([203, 0, 113, 11]);
+            assert!(!base.semantic_eq(address_changed));
+
+            let mut first_port_changed = base;
+            first_port_changed.first_port += 1;
+            assert!(!base.semantic_eq(first_port_changed));
+
+            let mut last_port_changed = base;
+            last_port_changed.last_port += 1;
+            assert!(!base.semantic_eq(last_port_changed));
+
+            let mut policy_changed = base;
+            policy_changed.policy.idle_ttl_ms += 1;
+            assert!(!base.semantic_eq(policy_changed));
+        });
+    }
+
+    #[test]
     fn tcp_zero_and_full_capacity_never_evict_live_state() {
         with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
             let mut no_mappings = [];
@@ -327,6 +361,40 @@ mod tcp_tests {
                     .mappings()
                     .iter()
                     .all(|slot| slot.last_activity_ms == 0));
+            },
+        );
+    }
+
+    #[test]
+    fn tcp_reconcile_counts_and_clears_every_dirty_slot() {
+        with_config(
+            Nat44TcpPolicy::new(NAT44_TCP_MIN_IDLE_TTL_MS, 7).unwrap(),
+            40_000,
+            40_001,
+            |config| {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 2];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 2];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                let first = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                    .unwrap();
+                runtime.commit_outbound(first, 0).unwrap();
+                let second = runtime
+                    .plan_outbound(INTERNAL2, 40_001, REMOTE2, 443, true, 0)
+                    .unwrap();
+                runtime.commit_outbound(second, 0).unwrap();
+
+                assert_eq!(
+                    runtime
+                        .reconcile(config, rotated_test_tcp_hash_key())
+                        .unwrap(),
+                    Nat44TcpReconcileReport {
+                        mappings_flushed: 2,
+                        sessions_flushed: 2,
+                    }
+                );
+                assert!(runtime.mappings().iter().all(|slot| !slot.is_occupied()));
+                assert!(runtime.sessions().iter().all(|slot| !slot.is_occupied()));
             },
         );
     }
@@ -904,6 +972,195 @@ mod tcp_tests {
             );
             assert!(replacement.publication_binding_matches(config, rotated_test_tcp_hash_key()));
             assert_eq!(replacement.validate_indexes(), Ok(()));
+        });
+    }
+
+    #[test]
+    fn tcp_stale_plan_is_rejected_after_same_backing_runtime_recreation() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_000, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let mut mapping_buckets = [DirectoryBucket::default(); 1];
+            let mut mapping_nodes = [DirectoryNode::default(); 1];
+            let mut session_buckets = [DirectoryBucket::default(); 1];
+            let mut session_nodes = [DirectoryNode::default(); 1];
+            let mut owners = [PortOwnerSlot::default(); 1];
+
+            let stale = {
+                let mut runtime = Nat44TcpRuntime::new(
+                    config,
+                    &mut mappings,
+                    &mut sessions,
+                    Nat44TcpIndexStorage::new(
+                        &mut mapping_buckets,
+                        &mut mapping_nodes,
+                        &mut session_buckets,
+                        &mut session_nodes,
+                        &mut owners,
+                    ),
+                    test_tcp_hash_key(),
+                )
+                .unwrap();
+                let first = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                    .unwrap();
+                runtime.commit_outbound(first, 0).unwrap();
+                runtime
+                    .plan_inbound_read_only(40_000, REMOTE1, 443, 0)
+                    .unwrap()
+            };
+
+            let mut runtime = Nat44TcpRuntime::new(
+                config,
+                &mut mappings,
+                &mut sessions,
+                Nat44TcpIndexStorage::new(
+                    &mut mapping_buckets,
+                    &mut mapping_nodes,
+                    &mut session_buckets,
+                    &mut session_nodes,
+                    &mut owners,
+                ),
+                test_tcp_hash_key(),
+            )
+            .unwrap();
+            let replacement = runtime
+                .plan_outbound(INTERNAL2, 40_001, REMOTE1, 443, true, 0)
+                .unwrap();
+            runtime.commit_outbound(replacement, 0).unwrap();
+
+            let result = runtime.commit_inbound(stale, 0);
+            assert!(
+                result.is_err(),
+                "same-backing runtime recreation accepted stale TCP plan: {result:?}"
+            );
+            assert_eq!(runtime.mappings()[0].internal_address(), INTERNAL2);
+            assert_eq!(runtime.sessions()[0].remote_address(), REMOTE1);
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+    }
+
+    #[test]
+    fn tcp_stale_prevalidated_outbound_commit_cannot_cross_runtime() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_000, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let mut mapping_buckets = [DirectoryBucket::default(); 1];
+            let mut mapping_nodes = [DirectoryNode::default(); 1];
+            let mut session_buckets = [DirectoryBucket::default(); 1];
+            let mut session_nodes = [DirectoryNode::default(); 1];
+            let mut owners = [PortOwnerSlot::default(); 1];
+
+            let stale = {
+                let mut runtime = Nat44TcpRuntime::new(
+                    config,
+                    &mut mappings,
+                    &mut sessions,
+                    Nat44TcpIndexStorage::new(
+                        &mut mapping_buckets,
+                        &mut mapping_nodes,
+                        &mut session_buckets,
+                        &mut session_nodes,
+                        &mut owners,
+                    ),
+                    test_tcp_hash_key(),
+                )
+                .unwrap();
+                let first = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                    .unwrap();
+                runtime.commit_outbound(first, 0).unwrap();
+                runtime
+                    .plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 443, false, 0)
+                    .unwrap()
+            };
+
+            let mut runtime = Nat44TcpRuntime::new(
+                config,
+                &mut mappings,
+                &mut sessions,
+                Nat44TcpIndexStorage::new(
+                    &mut mapping_buckets,
+                    &mut mapping_nodes,
+                    &mut session_buckets,
+                    &mut session_nodes,
+                    &mut owners,
+                ),
+                test_tcp_hash_key(),
+            )
+            .unwrap();
+            let replacement = runtime
+                .plan_outbound(INTERNAL2, 40_001, REMOTE2, 8443, true, 0)
+                .unwrap();
+            runtime.commit_outbound(replacement, 0).unwrap();
+
+            runtime.commit_prevalidated_outbound(stale, 0);
+            assert_eq!(runtime.mappings()[0].internal_address(), INTERNAL2);
+            assert_eq!(runtime.mappings()[0].internal_port(), 40_001);
+            assert_eq!(runtime.sessions()[0].remote_address(), REMOTE2);
+            assert_eq!(runtime.sessions()[0].remote_port(), 8443);
+        });
+    }
+
+    #[test]
+    fn tcp_stale_prevalidated_inbound_commit_cannot_cross_runtime() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_000, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let mut mapping_buckets = [DirectoryBucket::default(); 1];
+            let mut mapping_nodes = [DirectoryNode::default(); 1];
+            let mut session_buckets = [DirectoryBucket::default(); 1];
+            let mut session_nodes = [DirectoryNode::default(); 1];
+            let mut owners = [PortOwnerSlot::default(); 1];
+
+            let stale = {
+                let mut runtime = Nat44TcpRuntime::new(
+                    config,
+                    &mut mappings,
+                    &mut sessions,
+                    Nat44TcpIndexStorage::new(
+                        &mut mapping_buckets,
+                        &mut mapping_nodes,
+                        &mut session_buckets,
+                        &mut session_nodes,
+                        &mut owners,
+                    ),
+                    test_tcp_hash_key(),
+                )
+                .unwrap();
+                let first = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                    .unwrap();
+                runtime.commit_outbound(first, 0).unwrap();
+                runtime
+                    .plan_inbound_read_only(40_000, REMOTE1, 443, 0)
+                    .unwrap()
+            };
+
+            let mut runtime = Nat44TcpRuntime::new(
+                config,
+                &mut mappings,
+                &mut sessions,
+                Nat44TcpIndexStorage::new(
+                    &mut mapping_buckets,
+                    &mut mapping_nodes,
+                    &mut session_buckets,
+                    &mut session_nodes,
+                    &mut owners,
+                ),
+                test_tcp_hash_key(),
+            )
+            .unwrap();
+            let replacement = runtime
+                .plan_outbound(INTERNAL2, 40_001, REMOTE2, 8443, true, 0)
+                .unwrap();
+            runtime.commit_outbound(replacement, 0).unwrap();
+
+            runtime.commit_prevalidated_inbound(stale, 0);
+            assert_eq!(runtime.mappings()[0].internal_address(), INTERNAL2);
+            assert_eq!(runtime.mappings()[0].internal_port(), 40_001);
+            assert_eq!(runtime.sessions()[0].remote_address(), REMOTE2);
+            assert_eq!(runtime.sessions()[0].remote_port(), 8443);
         });
     }
 
@@ -1679,6 +1936,43 @@ impl Nat44UdpConfig {
         self.policy
     }
 
+    /// Compares the identity-neutral NAT44 UDP configuration semantics.
+    ///
+    /// Publication authority and snapshot identity are deliberately excluded:
+    /// they identify the owner of this configuration, not its packet-processing
+    /// behavior. The field list is exhaustive so adding a top-level config field
+    /// requires this semantic inventory to be revisited at compile time.
+    #[must_use]
+    pub fn semantic_eq(self, other: Self) -> bool {
+        let Self {
+            inside,
+            outside,
+            public_address,
+            first_port,
+            last_port,
+            policy,
+            authority: _,
+            snapshot_identity: _,
+        } = self;
+        let Self {
+            inside: other_inside,
+            outside: other_outside,
+            public_address: other_public_address,
+            first_port: other_first_port,
+            last_port: other_last_port,
+            policy: other_policy,
+            authority: _,
+            snapshot_identity: _,
+        } = other;
+
+        inside == other_inside
+            && outside == other_outside
+            && public_address == other_public_address
+            && first_port == other_first_port
+            && last_port == other_last_port
+            && policy == other_policy
+    }
+
     pub(crate) fn authority_matches(self, snapshot: &ForwardingSnapshot<'_>) -> bool {
         self.authority == snapshot_authority(snapshot)
             && self.snapshot_identity == snapshot.identity()
@@ -1852,6 +2146,7 @@ pub(crate) struct Nat44UdpOutboundPlan {
     mapping_created: bool,
     mapping_expired: bool,
     peer_created: bool,
+    expected_runtime_identity: u64,
     expected_runtime_epoch: u128,
     expected_revision: u128,
     planned_now_ms: u64,
@@ -1892,6 +2187,7 @@ pub(crate) struct Nat44UdpInboundPlan {
     mapping_generation: u64,
     internal_address: Ipv4Address,
     internal_port: u16,
+    expected_runtime_identity: u64,
     expected_runtime_epoch: u128,
     expected_revision: u128,
     planned_now_ms: u64,
@@ -1929,6 +2225,7 @@ pub(crate) enum Nat44UdpPlanError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Nat44UdpCommitError {
+    RuntimeIdentityChanged,
     RuntimeEpochChanged,
     StateRevisionChanged,
     CommitTimeChanged,
@@ -2141,6 +2438,264 @@ impl Nat44UdpStorageShape {
     pub const fn port_owner_slots(self) -> u32 {
         self.port_owner_slots
     }
+}
+
+const NAT44_AUTHORITY_WORDS: usize = 29;
+const NAT44_AUTHORITY_COMMITMENT_TAG: u64 = 0x5255_5354_2e4e_4154;
+
+/// Opaque, fixed-width authority evidence for a UDP NAT runtime.
+///
+/// The evidence is intentionally a named value instead of a public tuple or
+/// array. Its complete value participates in `Eq`, while its backing words and
+/// all directory/owner topology remain private. The only public constructor is
+/// for an independently built expected contract; it never reads a runtime or
+/// exposes actual state.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct Nat44UdpAuthorityEvidence {
+    storage_shape: Nat44UdpStorageShape,
+    words: [u64; NAT44_AUTHORITY_WORDS],
+}
+
+impl std::fmt::Debug for Nat44UdpAuthorityEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Nat44UdpAuthorityEvidence([REDACTED])")
+    }
+}
+
+impl Nat44UdpAuthorityEvidence {
+    /// Encodes a bounded, independently calculated expected contract.
+    ///
+    /// This constructor is a comparison seam for cold property tests. The
+    /// fixed word envelope is opaque after construction: callers can compare
+    /// it with runtime evidence but cannot inspect, enumerate, or format the
+    /// runtime's actual topology through this type.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn from_expected_contract(
+        mapping_slots: u32,
+        peer_slots: u32,
+        mapping_buckets: u32,
+        mapping_nodes: u32,
+        peer_buckets: u32,
+        peer_nodes: u32,
+        port_owner_slots: u32,
+        words: [u64; NAT44_AUTHORITY_WORDS],
+    ) -> Self {
+        Self {
+            storage_shape: Nat44UdpStorageShape {
+                mapping_slots,
+                peer_slots,
+                mapping_buckets,
+                mapping_nodes,
+                peer_buckets,
+                peer_nodes,
+                port_owner_slots,
+            },
+            words,
+        }
+    }
+
+    fn from_runtime(
+        storage_shape: Nat44UdpStorageShape,
+        words: [u64; NAT44_AUTHORITY_WORDS],
+    ) -> Self {
+        Self {
+            storage_shape,
+            words,
+        }
+    }
+
+    /// Returns only the aggregate index-coherence verdict.
+    ///
+    /// This probe is intentionally not a state extractor; full authority
+    /// comparisons should use `Eq` against an expected contract.
+    #[must_use]
+    pub const fn indexes_coherent(self) -> bool {
+        self.words[26] == 1
+    }
+
+    /// Returns only the aggregate directory/owner-coherence verdict.
+    #[must_use]
+    pub const fn directories_coherent(self) -> bool {
+        self.words[9] == 1 && self.words[15] == 1 && self.words[21] == 1
+    }
+}
+
+fn authority_digest_step(digest: u64, value: u64) -> u64 {
+    digest
+        .wrapping_add(value.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+        .rotate_left(17)
+        ^ 0xa5a5_5a5a_c3c3_3c3c
+}
+
+fn udp_mapping_authority_digest(mappings: &[Nat44UdpMappingSlot]) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    for (index, mapping) in mappings.iter().copied().enumerate() {
+        for value in [
+            u64::try_from(index).expect("validated mapping capacity fits u64"),
+            u64::from(mapping.occupied),
+            mapping.generation,
+            mapping.lifecycle_epoch as u64,
+            (mapping.lifecycle_epoch >> 64) as u64,
+            u64::from(mapping.port_owned),
+            u64::from(mapping.inside.0),
+            u64::from(u32::from_be_bytes(mapping.internal_address.octets())),
+            u64::from(mapping.internal_port),
+            u64::from(mapping.public_port),
+            mapping.last_outbound_ms,
+        ] {
+            digest = authority_digest_step(digest, value);
+        }
+    }
+    digest
+}
+
+fn udp_peer_authority_digest(peers: &[Nat44UdpPeerSlot]) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    for (index, peer) in peers.iter().copied().enumerate() {
+        for value in [
+            u64::try_from(index).expect("validated peer capacity fits u64"),
+            u64::from(peer.occupied),
+            u64::try_from(peer.mapping_index).expect("validated mapping index fits u64"),
+            peer.mapping_generation,
+            peer.mapping_lifecycle_epoch as u64,
+            (peer.mapping_lifecycle_epoch >> 64) as u64,
+            u64::from(u32::from_be_bytes(peer.remote_address.octets())),
+        ] {
+            digest = authority_digest_step(digest, value);
+        }
+    }
+    digest
+}
+
+fn directory_authority_words(
+    directory: &FixedDirectory<'_>,
+    expected_hash: impl FnMut(usize) -> Option<u64>,
+) -> [u64; 6] {
+    let mut link_mask = 0_u64;
+    let mut topology_digest = 0xcbf2_9ce4_8422_2325_u64;
+    for index in 0..directory.node_capacity() {
+        let linked = directory.is_linked(index).unwrap_or(false);
+        if linked && index < u64::BITS as usize {
+            link_mask |= 1_u64 << index;
+        }
+        topology_digest = authority_digest_step(
+            topology_digest,
+            u64::try_from(index).expect("validated directory capacity fits u64"),
+        );
+        topology_digest = authority_digest_step(topology_digest, u64::from(linked));
+    }
+    let semantic = directory.validate_semantics(expected_hash);
+    let (linked_nodes, nonempty_buckets, max_chain_len) =
+        semantic.as_ref().map_or((0, 0, 0), |report| {
+            (
+                report.linked_nodes,
+                report.nonempty_buckets,
+                report.max_chain_len,
+            )
+        });
+    [
+        u64::from(semantic.is_ok()),
+        u64::try_from(linked_nodes).expect("validated directory count fits u64"),
+        u64::try_from(nonempty_buckets).expect("validated directory count fits u64"),
+        u64::try_from(max_chain_len).expect("validated directory count fits u64"),
+        link_mask,
+        topology_digest,
+    ]
+}
+
+fn port_owner_authority_words(
+    table: &PortOwnerTable<'_>,
+    first_port: u16,
+    expected_owner: impl FnMut(usize) -> Option<PortOwnerExpectation>,
+) -> [u64; 5] {
+    let mut assigned_mask = 0_u64;
+    let mut owner_digest = 0xcbf2_9ce4_8422_2325_u64;
+    let mut lookup_valid = true;
+    for offset in 0..table.slot_count() {
+        let port = first_port
+            .checked_add(u16::try_from(offset).expect("validated port count fits u16"))
+            .expect("validated port range fits u16");
+        match table.owner(port) {
+            Ok(Some(owner)) => {
+                if offset < u64::BITS as usize {
+                    assigned_mask |= 1_u64 << offset;
+                }
+                owner_digest = authority_digest_step(
+                    owner_digest,
+                    u64::try_from(offset).expect("validated port count fits u64"),
+                );
+                owner_digest = authority_digest_step(
+                    owner_digest,
+                    u64::try_from(owner.state_index()).expect("validated state index fits u64"),
+                );
+                owner_digest = authority_digest_step(owner_digest, owner.state_generation());
+                owner_digest = authority_digest_step(owner_digest, owner.runtime_epoch() as u64);
+                owner_digest =
+                    authority_digest_step(owner_digest, (owner.runtime_epoch() >> 64) as u64);
+            }
+            Ok(None) => {
+                owner_digest = authority_digest_step(
+                    owner_digest,
+                    u64::try_from(offset).expect("validated port count fits u64"),
+                );
+            }
+            Err(_) => lookup_valid = false,
+        }
+    }
+    let semantic = table.validate_semantics(expected_owner);
+    let (assigned_ports, live_states) = semantic
+        .as_ref()
+        .map_or((0, 0), |report| (report.assigned_ports, report.live_states));
+    [
+        u64::from(lookup_valid && semantic.is_ok()),
+        u64::try_from(assigned_ports).expect("validated owner count fits u64"),
+        u64::try_from(live_states).expect("validated owner count fits u64"),
+        assigned_mask,
+        owner_digest,
+    ]
+}
+
+/// Commits the keyed directory configuration and every live node hash without
+/// exposing either the key or the directory backing. The semantic validator
+/// remains the authority for the concrete bucket/link invariants; this second
+/// bounded pass makes the opaque evidence sensitive to a key change even when
+/// the low bucket bits happen to be unchanged.
+fn directory_authority_commitment(
+    directory: &FixedDirectory<'_>,
+    domain: DirectoryHashDomain,
+    mut expected_hash: impl FnMut(usize) -> Option<u64>,
+) -> u64 {
+    let bucket_count = directory.bucket_count();
+    let node_capacity = directory.node_capacity();
+    let mut commitment = directory.hash_words(
+        domain,
+        &[
+            NAT44_AUTHORITY_COMMITMENT_TAG,
+            u64::try_from(bucket_count).expect("validated directory capacity fits u64"),
+            u64::try_from(node_capacity).expect("validated directory capacity fits u64"),
+        ],
+    );
+    for index in 0..node_capacity {
+        let linked = directory.is_linked(index).unwrap_or(false);
+        let expected = expected_hash(index);
+        commitment = authority_digest_step(
+            commitment,
+            u64::try_from(index).expect("validated directory capacity fits u64"),
+        );
+        commitment = authority_digest_step(commitment, u64::from(linked));
+        commitment = authority_digest_step(commitment, u64::from(expected.is_some()));
+        if let Some(hash) = expected {
+            commitment = authority_digest_step(commitment, hash);
+            let bucket = if bucket_count == 0 {
+                u64::MAX
+            } else {
+                hash & u64::try_from(bucket_count - 1)
+                    .expect("validated directory capacity fits u64")
+            };
+            commitment = authority_digest_step(commitment, bucket);
+        }
+    }
+    authority_digest_step(commitment, u64::from(directory.validate().is_ok()))
 }
 
 /// Lifetime-bound proof that a UDP NAT reconcile can commit without failure.
@@ -2430,6 +2985,104 @@ impl<'a> Nat44UdpRuntime<'a> {
         }
     }
 
+    /// Returns bounded, secret-free authority evidence for cold/test consumers.
+    ///
+    /// The private envelope includes the storage shape, watermark, runtime
+    /// epoch, next generation, state revision, occupied mapping/peer counts,
+    /// semantic directory conservation plus link topology, port-owner
+    /// conservation plus assignment topology, and the complete index-
+    /// invariant result. It never contains the keyed hash secret, packet
+    /// bytes, or configuration references, and performs no allocation. Callers
+    /// should keep this out of the packet path because it intentionally
+    /// revalidates cold authority.
+    ///
+    /// Word layout is stable within this evidence contract:
+    /// `0..=8` are runtime scalars, `9..=14` mapping-directory evidence,
+    /// `15..=20` peer-directory evidence, `21..=25` port-owner evidence, and
+    /// `26` is the complete index-invariant result. Word `27` retains the
+    /// mapping-slot digest; word `28` is a private keyed authority commitment
+    /// over both directory configurations, live node hashes, owner evidence,
+    /// and both slot digests.
+    #[must_use]
+    pub fn authority_evidence(&self) -> Nat44UdpAuthorityEvidence {
+        let mapping_commitment = directory_authority_commitment(
+            &self.mapping_directory,
+            DirectoryHashDomain::UdpMapping,
+            |index| {
+                let mapping = self.mappings[index];
+                mapping.occupied.then(|| {
+                    self.hash_key.0.hash_words(
+                        DirectoryHashDomain::UdpMapping,
+                        &Self::mapping_words(mapping),
+                    )
+                })
+            },
+        );
+        let peer_commitment = directory_authority_commitment(
+            &self.peer_directory,
+            DirectoryHashDomain::UdpPeer,
+            |index| {
+                let peer = self.peers[index];
+                peer.occupied.then(|| {
+                    self.hash_key
+                        .0
+                        .hash_words(DirectoryHashDomain::UdpPeer, &Self::peer_words(peer))
+                })
+            },
+        );
+        let mapping_directory = directory_authority_words(&self.mapping_directory, |index| {
+            let mapping = self.mappings[index];
+            mapping.occupied.then(|| {
+                self.hash_key.0.hash_words(
+                    DirectoryHashDomain::UdpMapping,
+                    &Self::mapping_words(mapping),
+                )
+            })
+        });
+        let peer_directory = directory_authority_words(&self.peer_directory, |index| {
+            let peer = self.peers[index];
+            peer.occupied.then(|| {
+                self.hash_key
+                    .0
+                    .hash_words(DirectoryHashDomain::UdpPeer, &Self::peer_words(peer))
+            })
+        });
+        let port_owners =
+            port_owner_authority_words(&self.port_owners, self.config.first_port, |index| {
+                let mapping = self.mappings[index];
+                (mapping.occupied && mapping.port_owned).then_some(PortOwnerExpectation {
+                    port: mapping.public_port,
+                    state_generation: mapping.generation,
+                    runtime_epoch: mapping.lifecycle_epoch,
+                })
+            });
+        let mapping_digest = udp_mapping_authority_digest(self.mappings);
+        let peer_digest = udp_peer_authority_digest(self.peers);
+        let mut authority_commitment = authority_digest_step(mapping_commitment, peer_commitment);
+        for value in port_owners.into_iter().chain([mapping_digest, peer_digest]) {
+            authority_commitment = authority_digest_step(authority_commitment, value);
+        }
+        let mut words = [0_u64; NAT44_AUTHORITY_WORDS];
+        words[0] = u64::from(self.watermark_ms.is_some());
+        words[1] = self.watermark_ms.unwrap_or_default();
+        words[2] = self.runtime_epoch as u64;
+        words[3] = (self.runtime_epoch >> 64) as u64;
+        words[4] = self.next_generation;
+        words[5] = self.state_revision as u64;
+        words[6] = (self.state_revision >> 64) as u64;
+        words[7] = u64::try_from(self.mappings.iter().filter(|slot| slot.occupied).count())
+            .expect("validated mapping count fits u64");
+        words[8] = u64::try_from(self.peers.iter().filter(|slot| slot.occupied).count())
+            .expect("validated peer count fits u64");
+        words[9..15].copy_from_slice(&mapping_directory);
+        words[15..21].copy_from_slice(&peer_directory);
+        words[21..26].copy_from_slice(&port_owners);
+        words[26] = u64::from(self.validate_indexes().is_ok());
+        words[27] = mapping_digest;
+        words[28] = authority_commitment;
+        Nat44UdpAuthorityEvidence::from_runtime(self.storage_shape(), words)
+    }
+
     #[cfg(test)]
     fn reset_index_probe_counts(&self) {
         self.mapping_lookup_probes.set(0);
@@ -2491,14 +3144,20 @@ impl<'a> Nat44UdpRuntime<'a> {
         hash_key: Nat44UdpHashKey,
         next_runtime_epoch: u128,
     ) -> Nat44UdpReconcileReport {
-        let mappings_flushed = self
-            .mappings
-            .iter()
-            .filter(|mapping| mapping.occupied)
-            .count();
-        let peers_flushed = self.peers.iter().filter(|peer| peer.occupied).count();
-        self.mappings.fill(Nat44UdpMappingSlot::default());
-        self.peers.fill(Nat44UdpPeerSlot::default());
+        let mut mappings_flushed = 0;
+        for mapping in self.mappings.iter_mut() {
+            if mapping.occupied {
+                mappings_flushed += 1;
+            }
+            *mapping = Nat44UdpMappingSlot::default();
+        }
+        let mut peers_flushed = 0;
+        for peer in self.peers.iter_mut() {
+            if peer.occupied {
+                peers_flushed += 1;
+            }
+            *peer = Nat44UdpPeerSlot::default();
+        }
         self.mapping_directory.clear_with_key(hash_key.0);
         self.peer_directory.clear_with_key(hash_key.0);
         self.port_owners.reconfigure_prevalidated_and_clear(
@@ -2594,6 +3253,7 @@ impl<'a> Nat44UdpRuntime<'a> {
                         mapping_created: false,
                         mapping_expired: false,
                         peer_created: false,
+                        expected_runtime_identity: self.reconcile_binding.runtime_identity,
                         expected_runtime_epoch: self.runtime_epoch,
                         expected_revision: self.state_revision,
                         planned_now_ms: now_ms,
@@ -2623,6 +3283,7 @@ impl<'a> Nat44UdpRuntime<'a> {
                     mapping_created: false,
                     mapping_expired: false,
                     peer_created: true,
+                    expected_runtime_identity: self.reconcile_binding.runtime_identity,
                     expected_runtime_epoch: self.runtime_epoch,
                     expected_revision: self.state_revision,
                     planned_now_ms: now_ms,
@@ -2673,6 +3334,7 @@ impl<'a> Nat44UdpRuntime<'a> {
                 mapping_created: true,
                 mapping_expired,
                 peer_created: true,
+                expected_runtime_identity: self.reconcile_binding.runtime_identity,
                 expected_runtime_epoch: self.runtime_epoch,
                 expected_revision: self.state_revision,
                 planned_now_ms: now_ms,
@@ -2784,6 +3446,7 @@ impl<'a> Nat44UdpRuntime<'a> {
             mapping_generation: mapping.generation,
             internal_address: mapping.internal_address,
             internal_port: mapping.internal_port,
+            expected_runtime_identity: self.reconcile_binding.runtime_identity,
             expected_runtime_epoch: self.runtime_epoch,
             expected_revision: self.state_revision,
             planned_now_ms: now_ms,
@@ -2795,6 +3458,9 @@ impl<'a> Nat44UdpRuntime<'a> {
         plan: Nat44UdpInboundPlan,
         now_ms: u64,
     ) -> Result<(), Nat44UdpCommitError> {
+        if plan.expected_runtime_identity != self.reconcile_binding.runtime_identity {
+            return Err(Nat44UdpCommitError::RuntimeIdentityChanged);
+        }
         if plan.expected_runtime_epoch != self.runtime_epoch {
             return Err(Nat44UdpCommitError::RuntimeEpochChanged);
         }
@@ -2902,6 +3568,9 @@ impl<'a> Nat44UdpRuntime<'a> {
         expected_port_owner: Option<PortOwnerToken>,
         now_ms: u64,
     ) -> Result<PreparedNat44UdpOutboundCommit, Nat44UdpCommitError> {
+        if plan.expected_runtime_identity != self.reconcile_binding.runtime_identity {
+            return Err(Nat44UdpCommitError::RuntimeIdentityChanged);
+        }
         if plan.expected_runtime_epoch != self.runtime_epoch {
             return Err(Nat44UdpCommitError::RuntimeEpochChanged);
         }
@@ -3016,6 +3685,9 @@ impl<'a> Nat44UdpRuntime<'a> {
         plan: Nat44UdpOutboundPlan,
         now_ms: u64,
     ) -> Result<(), Nat44UdpCommitError> {
+        if plan.expected_runtime_identity != self.reconcile_binding.runtime_identity {
+            return Err(Nat44UdpCommitError::RuntimeIdentityChanged);
+        }
         if plan.expected_runtime_epoch != self.runtime_epoch {
             return Err(Nat44UdpCommitError::RuntimeEpochChanged);
         }
@@ -3673,6 +4345,43 @@ impl Nat44TcpConfig {
         self.policy
     }
 
+    /// Compares the identity-neutral NAT44 TCP configuration semantics.
+    ///
+    /// Publication authority and snapshot identity are deliberately excluded:
+    /// they identify the owner of this configuration, not its packet-processing
+    /// behavior. The field list is exhaustive so adding a top-level config field
+    /// requires this semantic inventory to be revisited at compile time.
+    #[must_use]
+    pub fn semantic_eq(self, other: Self) -> bool {
+        let Self {
+            inside,
+            outside,
+            public_address,
+            first_port,
+            last_port,
+            policy,
+            authority: _,
+            snapshot_identity: _,
+        } = self;
+        let Self {
+            inside: other_inside,
+            outside: other_outside,
+            public_address: other_public_address,
+            first_port: other_first_port,
+            last_port: other_last_port,
+            policy: other_policy,
+            authority: _,
+            snapshot_identity: _,
+        } = other;
+
+        inside == other_inside
+            && outside == other_outside
+            && public_address == other_public_address
+            && first_port == other_first_port
+            && last_port == other_last_port
+            && policy == other_policy
+    }
+
     pub(crate) fn authority_matches(self, snapshot: &ForwardingSnapshot<'_>) -> bool {
         self.authority == snapshot_authority(snapshot)
             && self.snapshot_identity == snapshot.identity()
@@ -3910,6 +4619,7 @@ pub(crate) struct Nat44TcpInboundPlan {
 
 #[derive(Clone, Copy)]
 struct Nat44TcpPlanAuthority {
+    runtime_identity: u64,
     runtime_epoch: u128,
     state_revision: u128,
     watermark_ms: Option<u64>,
@@ -3980,7 +4690,6 @@ struct Nat44TcpPortSelection {
     displaced_mapping_index: Option<usize>,
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Nat44TcpIndexInvariantError {
     Mapping(DirectorySemanticError),
@@ -4087,6 +4796,119 @@ impl Nat44TcpStorageShape {
     pub const fn port_owner_slots(self) -> u32 {
         self.port_owner_slots
     }
+}
+
+/// Opaque, fixed-width authority evidence for a TCP NAT runtime.
+///
+/// The complete private value participates in `Eq`; no mapping, session,
+/// directory, port-owner, key, or lifecycle word can be read or formatted by
+/// a consumer. The expected-contract constructor is bounded and intended for
+/// an independently calculated cold/test oracle.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct Nat44TcpAuthorityEvidence {
+    storage_shape: Nat44TcpStorageShape,
+    words: [u64; NAT44_AUTHORITY_WORDS],
+}
+
+impl std::fmt::Debug for Nat44TcpAuthorityEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Nat44TcpAuthorityEvidence([REDACTED])")
+    }
+}
+
+impl Nat44TcpAuthorityEvidence {
+    /// Encodes a bounded, independently calculated expected contract.
+    ///
+    /// The resulting value is opaque: this API only creates a value for
+    /// equality comparison and does not extract or enumerate runtime state.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn from_expected_contract(
+        mapping_slots: u32,
+        session_slots: u32,
+        mapping_buckets: u32,
+        mapping_nodes: u32,
+        session_buckets: u32,
+        session_nodes: u32,
+        port_owner_slots: u32,
+        words: [u64; NAT44_AUTHORITY_WORDS],
+    ) -> Self {
+        Self {
+            storage_shape: Nat44TcpStorageShape {
+                mapping_slots,
+                session_slots,
+                mapping_buckets,
+                mapping_nodes,
+                session_buckets,
+                session_nodes,
+                port_owner_slots,
+            },
+            words,
+        }
+    }
+
+    fn from_runtime(
+        storage_shape: Nat44TcpStorageShape,
+        words: [u64; NAT44_AUTHORITY_WORDS],
+    ) -> Self {
+        Self {
+            storage_shape,
+            words,
+        }
+    }
+
+    /// Returns only the aggregate index-coherence verdict.
+    #[must_use]
+    pub const fn indexes_coherent(self) -> bool {
+        self.words[26] == 1
+    }
+
+    /// Returns only the aggregate directory/owner-coherence verdict.
+    #[must_use]
+    pub const fn directories_coherent(self) -> bool {
+        self.words[9] == 1 && self.words[15] == 1 && self.words[21] == 1
+    }
+}
+
+fn tcp_mapping_authority_digest(mappings: &[Nat44TcpMappingSlot]) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    for (index, mapping) in mappings.iter().copied().enumerate() {
+        for value in [
+            u64::try_from(index).expect("validated mapping capacity fits u64"),
+            u64::from(mapping.occupied),
+            mapping.generation,
+            mapping.lifecycle_epoch as u64,
+            (mapping.lifecycle_epoch >> 64) as u64,
+            u64::from(mapping.port_owned),
+            u64::from(mapping.inside.0),
+            u64::from(u32::from_be_bytes(mapping.internal_address.octets())),
+            u64::from(mapping.internal_port),
+            u64::from(mapping.public_port),
+            mapping.last_activity_ms,
+        ] {
+            digest = authority_digest_step(digest, value);
+        }
+    }
+    digest
+}
+
+fn tcp_session_authority_digest(sessions: &[Nat44TcpSessionSlot]) -> u64 {
+    let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+    for (index, session) in sessions.iter().copied().enumerate() {
+        for value in [
+            u64::try_from(index).expect("validated session capacity fits u64"),
+            u64::from(session.occupied),
+            u64::try_from(session.mapping_index).expect("validated mapping index fits u64"),
+            session.mapping_generation,
+            session.mapping_lifecycle_epoch as u64,
+            (session.mapping_lifecycle_epoch >> 64) as u64,
+            u64::from(u32::from_be_bytes(session.remote_address.octets())),
+            u64::from(session.remote_port),
+            session.last_activity_ms,
+        ] {
+            digest = authority_digest_step(digest, value);
+        }
+    }
+    digest
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -4357,6 +5179,103 @@ impl<'a> Nat44TcpRuntime<'a> {
         }
     }
 
+    /// Returns bounded, secret-free authority evidence for cold/test consumers.
+    ///
+    /// The fixed word envelope has the same layout as the UDP evidence:
+    /// runtime scalars at `0..=8`, mapping-directory evidence at `9..=14`,
+    /// session-directory evidence at `15..=20`, port-owner evidence at
+    /// `21..=25`, and the complete index-invariant result at `26`. Word `27`
+    /// retains the mapping-slot digest; word `28` is a private keyed authority
+    /// commitment over both directory configurations, live node hashes, owner
+    /// evidence, and both slot digests. Hash keys, packet bytes, and
+    /// configuration references are intentionally absent. This method performs
+    /// cold authority validation and must stay out of the packet path.
+    #[must_use]
+    pub fn authority_evidence(&self) -> Nat44TcpAuthorityEvidence {
+        let mapping_commitment = directory_authority_commitment(
+            &self.mapping_directory,
+            DirectoryHashDomain::TcpMapping,
+            |index| {
+                let mapping = self.mappings[index];
+                mapping.occupied.then(|| {
+                    self.hash_key.0.hash_words(
+                        DirectoryHashDomain::TcpMapping,
+                        &Self::mapping_words(mapping),
+                    )
+                })
+            },
+        );
+        let session_commitment = directory_authority_commitment(
+            &self.session_directory,
+            DirectoryHashDomain::TcpSession,
+            |index| {
+                let session = self.sessions[index];
+                session.occupied.then(|| {
+                    self.hash_key.0.hash_words(
+                        DirectoryHashDomain::TcpSession,
+                        &Self::session_words(session),
+                    )
+                })
+            },
+        );
+        let mapping_directory = directory_authority_words(&self.mapping_directory, |index| {
+            let mapping = self.mappings[index];
+            mapping.occupied.then(|| {
+                self.hash_key.0.hash_words(
+                    DirectoryHashDomain::TcpMapping,
+                    &Self::mapping_words(mapping),
+                )
+            })
+        });
+        let session_directory = directory_authority_words(&self.session_directory, |index| {
+            let session = self.sessions[index];
+            session.occupied.then(|| {
+                self.hash_key.0.hash_words(
+                    DirectoryHashDomain::TcpSession,
+                    &Self::session_words(session),
+                )
+            })
+        });
+        let port_owners =
+            port_owner_authority_words(&self.port_owners, self.config.first_port, |index| {
+                let mapping = self.mappings[index];
+                (mapping.occupied && mapping.port_owned).then_some(PortOwnerExpectation {
+                    port: mapping.public_port,
+                    state_generation: mapping.generation,
+                    runtime_epoch: mapping.lifecycle_epoch,
+                })
+            });
+        let mapping_digest = tcp_mapping_authority_digest(self.mappings);
+        let session_digest = tcp_session_authority_digest(self.sessions);
+        let mut authority_commitment =
+            authority_digest_step(mapping_commitment, session_commitment);
+        for value in port_owners
+            .into_iter()
+            .chain([mapping_digest, session_digest])
+        {
+            authority_commitment = authority_digest_step(authority_commitment, value);
+        }
+        let mut words = [0_u64; NAT44_AUTHORITY_WORDS];
+        words[0] = u64::from(self.watermark_ms.is_some());
+        words[1] = self.watermark_ms.unwrap_or_default();
+        words[2] = self.runtime_epoch as u64;
+        words[3] = (self.runtime_epoch >> 64) as u64;
+        words[4] = self.next_generation;
+        words[5] = self.state_revision as u64;
+        words[6] = (self.state_revision >> 64) as u64;
+        words[7] = u64::try_from(self.mappings.iter().filter(|slot| slot.occupied).count())
+            .expect("validated mapping count fits u64");
+        words[8] = u64::try_from(self.sessions.iter().filter(|slot| slot.occupied).count())
+            .expect("validated session count fits u64");
+        words[9..15].copy_from_slice(&mapping_directory);
+        words[15..21].copy_from_slice(&session_directory);
+        words[21..26].copy_from_slice(&port_owners);
+        words[26] = u64::from(self.validate_indexes().is_ok());
+        words[27] = mapping_digest;
+        words[28] = authority_commitment;
+        Nat44TcpAuthorityEvidence::from_runtime(self.storage_shape(), words)
+    }
+
     pub fn publication_binding_matches(
         &self,
         config: Nat44TcpConfig,
@@ -4410,10 +5329,20 @@ impl<'a> Nat44TcpRuntime<'a> {
         hash_key: Nat44TcpHashKey,
         next_runtime_epoch: u128,
     ) -> Nat44TcpReconcileReport {
-        let mappings_flushed = self.mappings.iter().filter(|slot| slot.occupied).count();
-        let sessions_flushed = self.sessions.iter().filter(|slot| slot.occupied).count();
-        self.mappings.fill(Nat44TcpMappingSlot::default());
-        self.sessions.fill(Nat44TcpSessionSlot::default());
+        let mut mappings_flushed = 0;
+        for mapping in self.mappings.iter_mut() {
+            if mapping.occupied {
+                mappings_flushed += 1;
+            }
+            *mapping = Nat44TcpMappingSlot::default();
+        }
+        let mut sessions_flushed = 0;
+        for session in self.sessions.iter_mut() {
+            if session.occupied {
+                sessions_flushed += 1;
+            }
+            *session = Nat44TcpSessionSlot::default();
+        }
         self.mapping_directory.clear_with_key(hash_key.0);
         self.session_directory.clear_with_key(hash_key.0);
         self.port_owners.reconfigure_prevalidated_and_clear(
@@ -4754,6 +5683,17 @@ impl<'a> Nat44TcpRuntime<'a> {
     }
 
     pub(crate) fn commit_prevalidated_outbound(&mut self, plan: Nat44TcpOutboundPlan, now_ms: u64) {
+        if self
+            .validate_commit_authority(
+                plan.authority,
+                plan.mapping_index(),
+                plan.session_index(),
+                now_ms,
+            )
+            .is_err()
+        {
+            return;
+        }
         if let Some(mutation) = plan.prepared.mapping {
             self.apply_mapping_mutation(mutation);
         }
@@ -4824,6 +5764,17 @@ impl<'a> Nat44TcpRuntime<'a> {
     }
 
     pub(crate) fn commit_prevalidated_inbound(&mut self, plan: Nat44TcpInboundPlan, now_ms: u64) {
+        if self
+            .validate_commit_authority(
+                plan.authority,
+                plan.mapping_index,
+                plan.session_index,
+                now_ms,
+            )
+            .is_err()
+        {
+            return;
+        }
         self.mappings[plan.mapping_index] = plan.mapping;
         self.sessions[plan.session_index] = plan.session;
         self.watermark_ms = Some(now_ms);
@@ -4839,6 +5790,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         _session_before: Nat44TcpSessionSlot,
     ) -> Nat44TcpPlanAuthority {
         Nat44TcpPlanAuthority {
+            runtime_identity: self.runtime_binding.runtime_identity,
             runtime_epoch: self.runtime_epoch,
             state_revision: self.state_revision,
             watermark_ms: self.watermark_ms,
@@ -4853,7 +5805,8 @@ impl<'a> Nat44TcpRuntime<'a> {
         session_index: usize,
         now_ms: u64,
     ) -> Result<(), Nat44TcpCommitError> {
-        if authority.runtime_epoch != self.runtime_epoch
+        if authority.runtime_identity != self.runtime_binding.runtime_identity
+            || authority.runtime_epoch != self.runtime_epoch
             || authority.state_revision != self.state_revision
             || authority.watermark_ms != self.watermark_ms
             || authority.planned_now_ms != now_ms
@@ -5342,7 +6295,6 @@ impl<'a> Nat44TcpRuntime<'a> {
         }
     }
 
-    #[cfg(test)]
     #[allow(dead_code)]
     fn validate_indexes(&self) -> Result<(), Nat44TcpIndexInvariantError> {
         let key = self.hash_key.0;
@@ -5533,6 +6485,129 @@ mod tests {
         )
         .unwrap();
         run(config)
+    }
+
+    #[test]
+    fn udp_config_semantic_eq_tracks_behavior_and_ignores_owner_identity() {
+        with_config(Nat44UdpPolicy::default(), |base| {
+            let mut identity_only = base;
+            identity_only.authority = u64::MAX;
+            identity_only.snapshot_identity = [usize::MAX; 8];
+            assert!(base.semantic_eq(identity_only));
+
+            let mut inside_changed = base;
+            inside_changed.inside = IfId(9);
+            assert!(!base.semantic_eq(inside_changed));
+
+            let mut outside_changed = base;
+            outside_changed.outside = IfId(9);
+            assert!(!base.semantic_eq(outside_changed));
+
+            let mut address_changed = base;
+            address_changed.public_address = Ipv4Address::from_octets([203, 0, 113, 11]);
+            assert!(!base.semantic_eq(address_changed));
+
+            let mut first_port_changed = base;
+            first_port_changed.first_port += 1;
+            assert!(!base.semantic_eq(first_port_changed));
+
+            let mut last_port_changed = base;
+            last_port_changed.last_port += 1;
+            assert!(!base.semantic_eq(last_port_changed));
+
+            let mut policy_changed = base;
+            policy_changed.policy.idle_ttl_ms += 1;
+            assert!(!base.semantic_eq(policy_changed));
+        });
+    }
+
+    #[test]
+    fn nat44_authority_evidence_is_full_eq_and_redacted_debug() {
+        fn assert_copy_eq<T: Copy + Eq + PartialEq>() {}
+
+        assert_copy_eq::<Nat44UdpAuthorityEvidence>();
+        assert_copy_eq::<Nat44TcpAuthorityEvidence>();
+
+        const POISON: u64 = 0xfedc_ba98_7654_3210;
+        let udp_words = [POISON; NAT44_AUTHORITY_WORDS];
+        let udp = Nat44UdpAuthorityEvidence::from_expected_contract(2, 2, 2, 2, 2, 2, 2, udp_words);
+        let mut udp_changed_words = udp_words;
+        udp_changed_words[28] ^= 1;
+        let udp_changed = Nat44UdpAuthorityEvidence::from_expected_contract(
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            udp_changed_words,
+        );
+        assert_ne!(udp, udp_changed);
+        for index in 0..NAT44_AUTHORITY_WORDS {
+            let mut changed_words = udp_words;
+            changed_words[index] ^= 1;
+            assert_ne!(
+                udp,
+                Nat44UdpAuthorityEvidence::from_expected_contract(
+                    2,
+                    2,
+                    2,
+                    2,
+                    2,
+                    2,
+                    2,
+                    changed_words,
+                ),
+                "UDP authority word {index} must participate in Eq"
+            );
+        }
+        assert_eq!(format!("{udp:?}"), "Nat44UdpAuthorityEvidence([REDACTED])");
+        assert_eq!(format!("{udp:#?}"), format!("{udp:?}"));
+        assert!(!format!("{udp:?}").contains(&POISON.to_string()));
+        assert!(!format!("{udp:?}").contains(&format!("{POISON:x}")));
+
+        let tcp_words = [POISON; NAT44_AUTHORITY_WORDS];
+        let tcp = Nat44TcpAuthorityEvidence::from_expected_contract(2, 2, 2, 2, 2, 2, 2, tcp_words);
+        let mut tcp_changed_words = tcp_words;
+        tcp_changed_words[9] ^= 1;
+        let tcp_changed = Nat44TcpAuthorityEvidence::from_expected_contract(
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            tcp_changed_words,
+        );
+        assert_ne!(tcp, tcp_changed);
+        for index in 0..NAT44_AUTHORITY_WORDS {
+            let mut changed_words = tcp_words;
+            changed_words[index] ^= 1;
+            assert_ne!(
+                tcp,
+                Nat44TcpAuthorityEvidence::from_expected_contract(
+                    2,
+                    2,
+                    2,
+                    2,
+                    2,
+                    2,
+                    2,
+                    changed_words,
+                ),
+                "TCP authority word {index} must participate in Eq"
+            );
+        }
+        assert_eq!(format!("{tcp:?}"), "Nat44TcpAuthorityEvidence([REDACTED])");
+        assert_eq!(format!("{tcp:#?}"), format!("{tcp:?}"));
+        assert!(!format!("{tcp:?}").contains(&POISON.to_string()));
+        assert!(!format!("{tcp:?}").contains(&format!("{POISON:x}")));
+
+        let shape_changed =
+            Nat44UdpAuthorityEvidence::from_expected_contract(1, 2, 2, 2, 2, 2, 2, udp_words);
+        assert_ne!(udp, shape_changed);
     }
 
     fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -5992,6 +7067,8 @@ mod tests {
             "pub struct Nat44UdpPeerSlot",
             "pub struct Nat44TcpMappingSlot",
             "pub struct Nat44TcpSessionSlot",
+            "pub struct Nat44UdpAuthorityEvidence",
+            "pub struct Nat44TcpAuthorityEvidence",
             "struct Nat44UdpBackingIdentity",
         ] {
             assert_custom_debug(nat_source, declaration);
@@ -6046,6 +7123,8 @@ mod tests {
             "pub enum Nat44TcpRuntimeConfigError",
             "pub enum Nat44UdpReconcileError",
             "pub enum Nat44TcpReconcileError",
+            "pub struct Nat44UdpAuthorityEvidence",
+            "pub struct Nat44TcpAuthorityEvidence",
         ] {
             assert_contains_no_hidden_type(nat_source, declaration);
         }
@@ -6451,12 +7530,16 @@ mod tests {
     #[test]
     fn reconcile_flushes_every_mapping_and_peer_before_rebinding() {
         with_config(Nat44UdpPolicy::default(), |config| {
-            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
-            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut mappings = [Nat44UdpMappingSlot::default(); 2];
+            let mut peers = [Nat44UdpPeerSlot::default(); 2];
             let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
             let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
             let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
             runtime.commit_outbound(first, 0).unwrap();
+            let second = runtime
+                .plan_outbound(INTERNAL2, 40_001, REMOTE2, 0)
+                .unwrap();
+            runtime.commit_outbound(second, 0).unwrap();
             let stale = runtime.plan_inbound_read_only(40_000, REMOTE1, 0).unwrap();
             let before_counters = runtime.counters();
             let permit = runtime
@@ -6466,8 +7549,8 @@ mod tests {
             assert_eq!(
                 report,
                 Nat44UdpReconcileReport {
-                    mappings_flushed: 1,
-                    peers_flushed: 1,
+                    mappings_flushed: 2,
+                    peers_flushed: 2,
                 }
             );
             assert!(runtime.mappings().iter().all(|slot| !slot.occupied));
@@ -6478,14 +7561,14 @@ mod tests {
             ));
             let recreated = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
             runtime.commit_outbound(recreated, 0).unwrap();
-            let before_mapping = runtime.mappings()[0];
-            let before_peer = runtime.peers()[0];
+            let before_mappings = runtime.mappings().to_vec();
+            let before_peers = runtime.peers().to_vec();
             assert_eq!(
                 runtime.commit_inbound(stale, 0),
                 Err(Nat44UdpCommitError::RuntimeEpochChanged)
             );
-            assert_eq!(runtime.mappings(), &[before_mapping]);
-            assert_eq!(runtime.peers(), &[before_peer]);
+            assert_eq!(runtime.mappings(), before_mappings);
+            assert_eq!(runtime.peers(), before_peers);
             assert_eq!(
                 before_counters.reconciliations.saturating_add(1),
                 runtime.counters().reconciliations
@@ -6666,6 +7749,37 @@ mod tests {
             );
             assert!(replacement.publication_binding_matches(config, rotated_udp_hash_key()));
             assert_eq!(replacement.validate_indexes(), Ok(()));
+        });
+    }
+
+    #[test]
+    fn udp_stale_plan_is_rejected_after_same_backing_runtime_recreation() {
+        with_port_config(Nat44UdpPolicy::default(), 40_000, 40_000, |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+
+            let stale = {
+                let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+                let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+                runtime.commit_outbound(first, 0).unwrap();
+                runtime.plan_inbound_read_only(40_000, REMOTE1, 0).unwrap()
+            };
+
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let replacement = runtime
+                .plan_outbound(INTERNAL2, 40_001, REMOTE2, 0)
+                .unwrap();
+            runtime.commit_outbound(replacement, 0).unwrap();
+
+            let result = runtime.commit_inbound(stale, 0);
+            assert!(
+                result.is_err(),
+                "same-backing runtime recreation accepted stale UDP plan: {result:?}"
+            );
+            assert_eq!(runtime.mappings()[0].internal_address(), INTERNAL2);
+            assert_eq!(runtime.peers()[0].remote_address(), REMOTE2);
+            assert_eq!(runtime.validate_indexes(), Ok(()));
         });
     }
 

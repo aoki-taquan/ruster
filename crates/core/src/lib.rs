@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![doc = "A small, allocation-free IPv4 and ARP packet-processing core."]
 
 mod checksum;
@@ -19,14 +19,15 @@ pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
 pub use firewall::take_full_firewall_validation_count;
 pub use firewall::{
     validate_firewall_rules, FirewallAction, FirewallAuditBuffer, FirewallAuditRecord,
-    FirewallCommitError, FirewallConfig, FirewallConfigError, FirewallConnectionClass,
-    FirewallCounters, FirewallDisposition, FirewallFailure, FirewallHashKey, FirewallHashKeyError,
-    FirewallInterface, FirewallIpv4Prefix, FirewallIpv4PrefixError, FirewallPlanError,
-    FirewallPolicy, FirewallPolicyError, FirewallPolicySource, FirewallPortRange,
-    FirewallPortRangeError, FirewallProtocol, FirewallReconcileError, FirewallReconcilePermit,
-    FirewallReconcileReport, FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow, FirewallRule,
-    FirewallRuleId, FirewallRuntime, FirewallStateSlot, FirewallTcpPhase, FirewallVerdict,
-    ValidatedFirewallOwner, FIREWALL_MAX_IDLE_TTL_MS, FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS,
+    FirewallAuthorityEvidence, FirewallCommitError, FirewallConfig, FirewallConfigError,
+    FirewallConnectionClass, FirewallCounters, FirewallDisposition, FirewallFailure,
+    FirewallHashKey, FirewallHashKeyError, FirewallInterface, FirewallIpv4Prefix,
+    FirewallIpv4PrefixError, FirewallPlanError, FirewallPolicy, FirewallPolicyError,
+    FirewallPolicySource, FirewallPortRange, FirewallPortRangeError, FirewallProtocol,
+    FirewallReconcileError, FirewallReconcilePermit, FirewallReconcileReport,
+    FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow, FirewallRule, FirewallRuleId,
+    FirewallRuntime, FirewallStateSlot, FirewallTcpPhase, FirewallVerdict, ValidatedFirewallOwner,
+    FIREWALL_MAX_IDLE_TTL_MS, FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS,
     FIREWALL_TCP_ACTIVE_MIN_IDLE_TTL_MS, FIREWALL_TCP_OPENING_DEFAULT_IDLE_TTL_MS,
     FIREWALL_TCP_OPENING_MIN_IDLE_TTL_MS, FIREWALL_UDP_DEFAULT_IDLE_TTL_MS,
     FIREWALL_UDP_MIN_IDLE_TTL_MS,
@@ -65,22 +66,25 @@ pub use icmpv4_error::{
     ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN, ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN,
 };
 pub use io::{
-    BatchCompletion, ConsumeReason, PacketBatch, PacketIo, PacketLease, PacketSlot,
-    PublicationQuiescence, PublicationQuiescenceDisposition, PublicationQuiescenceGuard,
-    PublicationQuiescenceWitness, SlotCompletion,
+    bind_publication_backend, BatchCompletion, BoundPublicationBackend, ConsumeReason,
+    MatchedPublicationQuiescenceGuard, PacketBatch, PacketIo, PacketLease, PacketSlot,
+    PublicationBackendAuthority, PublicationBackendControl, PublicationBindingIdentityExhausted,
+    PublicationOwnerBinding, PublicationQuiescence, PublicationQuiescenceBackend,
+    PublicationQuiescenceDisposition, PublicationQuiescenceGuard, SlotCompletion,
 };
 pub use nat44::{
-    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpCounters,
-    Nat44TcpDisposition, Nat44TcpHashKey, Nat44TcpHashKeyError, Nat44TcpIndexStorage,
-    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpReconcileError,
-    Nat44TcpReconcilePermit, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError,
-    Nat44TcpSessionSlot, Nat44TcpStorageShape, Nat44UdpConfig, Nat44UdpConfigError,
-    Nat44UdpCounters, Nat44UdpDisposition, Nat44UdpHashKey, Nat44UdpHashKeyError,
-    Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
-    Nat44UdpPolicyError, Nat44UdpReconcileError, Nat44UdpReconcilePermit, Nat44UdpReconcileReport,
-    Nat44UdpRuntime, Nat44UdpRuntimeConfigError, Nat44UdpStorageShape,
-    NAT44_TCP_DEFAULT_IDLE_TTL_MS, NAT44_TCP_MAX_IDLE_TTL_MS, NAT44_TCP_MIN_IDLE_TTL_MS,
-    NAT44_UDP_DEFAULT_IDLE_TTL_MS, NAT44_UDP_MAX_IDLE_TTL_MS, NAT44_UDP_MIN_IDLE_TTL_MS,
+    Nat44Icmpv4ErrorPolicy, Nat44TcpAuthorityEvidence, Nat44TcpConfig, Nat44TcpConfigError,
+    Nat44TcpCounters, Nat44TcpDisposition, Nat44TcpHashKey, Nat44TcpHashKeyError,
+    Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError,
+    Nat44TcpReconcileError, Nat44TcpReconcilePermit, Nat44TcpReconcileReport, Nat44TcpRuntime,
+    Nat44TcpRuntimeConfigError, Nat44TcpSessionSlot, Nat44TcpStorageShape,
+    Nat44UdpAuthorityEvidence, Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpCounters,
+    Nat44UdpDisposition, Nat44UdpHashKey, Nat44UdpHashKeyError, Nat44UdpIndexStorage,
+    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError,
+    Nat44UdpReconcileError, Nat44UdpReconcilePermit, Nat44UdpReconcileReport, Nat44UdpRuntime,
+    Nat44UdpRuntimeConfigError, Nat44UdpStorageShape, NAT44_TCP_DEFAULT_IDLE_TTL_MS,
+    NAT44_TCP_MAX_IDLE_TTL_MS, NAT44_TCP_MIN_IDLE_TTL_MS, NAT44_UDP_DEFAULT_IDLE_TTL_MS,
+    NAT44_UDP_MAX_IDLE_TTL_MS, NAT44_UDP_MIN_IDLE_TTL_MS,
 };
 pub use packet::{
     validate_arp, validate_arp_request, validate_ipv4_frame, ArpOpcode, MacAddress, ValidatedArp,
