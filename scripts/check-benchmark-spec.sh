@@ -1,6 +1,10 @@
 #!/bin/sh
 set -eu
 
+# This verifier is outside the benchmark identity inputs, so keep the
+# canonical digest anchor here rather than deriving it from either input.
+readonly canonical_sha256=573720cde7bbd522ee8f54868b41bbf25eee9e3cb227a94553b54411e120de9d
+
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
 spec=${1:-"$repo_root/docs/benchmark-spec-v0.2.md"}
@@ -89,6 +93,10 @@ fi
 
 if ! printf '%s\n' "$actual" | awk 'length($0) == 64 && $0 !~ /[^0-9a-f]/ { valid = 1 } END { exit !valid }'; then
     echo "benchmark specification digest calculation returned an invalid value" >&2
+    exit 1
+fi
+if [ "$actual" != "$canonical_sha256" ]; then
+    echo "benchmark specification canonical identity drift" >&2
     exit 1
 fi
 if LC_ALL=C grep -F "$actual" "$spec_snapshot" >/dev/null 2>&1; then
