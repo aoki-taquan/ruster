@@ -56,10 +56,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruster-cli"
+version = "0.2.0"
+dependencies = [
+ "ruster-config",
+ "ruster-control",
+ "ruster-core",
+ "ruster-integration",
+ "ruster-io-afpacket",
+ "ruster-io-sim",
+ "ruster-io-xdp-native",
+ "ruster-runtime",
+]
+
+[[package]]
 name = "ruster-config"
 version = "0.2.0"
 dependencies = [
  "ruster-core",
+ "ruster-io-xdp-native",
  "serde",
  "serde_path_to_error",
  "toml",
@@ -69,6 +84,7 @@ dependencies = [
 name = "ruster-control"
 version = "0.2.0"
 dependencies = [
+ "ruster-config",
  "ruster-core",
 ]
 
@@ -77,10 +93,25 @@ name = "ruster-core"
 version = "0.2.0"
 
 [[package]]
+name = "ruster-integration"
+version = "0.2.0"
+dependencies = [
+ "ruster-config",
+ "ruster-control",
+ "ruster-core",
+ "ruster-io-sim",
+ "ruster-runtime",
+]
+
+[[package]]
 name = "ruster-io-afpacket"
 version = "0.2.0"
 dependencies = [
+ "ruster-config",
+ "ruster-control",
  "ruster-core",
+ "ruster-integration",
+ "ruster-runtime",
 ]
 
 [[package]]
@@ -105,6 +136,9 @@ version = "0.2.0"
 [[package]]
 name = "ruster-io-xdp-native"
 version = "0.2.0"
+dependencies = [
+ "ruster-core",
+]
 
 [[package]]
 name = "ruster-runtime"
@@ -112,6 +146,18 @@ version = "0.2.0"
 dependencies = [
  "ruster-core",
  "ruster-io-sim",
+]
+
+[[package]]
+name = "ruster-sim-scenario"
+version = "0.2.0"
+dependencies = [
+ "ruster-config",
+ "ruster-control",
+ "ruster-core",
+ "ruster-integration",
+ "ruster-io-sim",
+ "ruster-runtime",
 ]
 
 [[package]]

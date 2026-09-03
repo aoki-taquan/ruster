@@ -1,15 +1,18 @@
 [workspace]
 members = [
     "crates/bench",
+    "crates/cli",
     "crates/config",
     "crates/control",
     "crates/core",
+    "crates/integration",
     "crates/io-afpacket",
     "crates/io-conformance",
     "crates/io-sim",
     "crates/io-xdp",
     "crates/io-xdp-native",
     "crates/runtime",
+    "crates/sim-scenario",
 ]
 resolver = "2"
 
