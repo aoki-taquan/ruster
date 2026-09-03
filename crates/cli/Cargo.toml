@@ -1,0 +1,20 @@
+[package]
+name = "ruster-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ruster"
+path = "src/main.rs"
+
+[dependencies]
+ruster-config = { path = "../config" }
+ruster-control = { path = "../control" }
+ruster-core = { path = "../core" }
+ruster-integration = { path = "../integration" }
+ruster-io-afpacket = { path = "../io-afpacket" }
+ruster-io-sim = { path = "../io-sim" }
+ruster-io-xdp-native = { path = "../io-xdp-native" }
+ruster-runtime = { path = "../runtime" }
