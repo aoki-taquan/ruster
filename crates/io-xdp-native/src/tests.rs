@@ -13,8 +13,9 @@ use crate::{
     },
     ensure_supported, validate_descriptor_options, AbiLayoutError, BindMode, CompletionConsumer,
     ConfigError, FillProducer, NativeRingError, NeedWakeup, RingConfig, RingEntries, RingField,
-    RingMapError, RingName, RxConsumer, TxProducer, UmemConfig, ValidatedBindFlags,
-    MIN_VISIBLE_FRAME_CAPACITY, SUPPORTED_ALIGNED_CHUNK_SIZES, XDP_PACKET_HEADROOM,
+    RingMapError, RingName, RxConsumer, TxProducer, UmemConfig, ValidatedBindFlags, MAX_UMEM_BYTES,
+    MAX_UMEM_FRAME_COUNT, MIN_VISIBLE_FRAME_CAPACITY, SUPPORTED_ALIGNED_CHUNK_SIZES,
+    XDP_PACKET_HEADROOM,
 };
 
 const TEST_RING_OFFSETS: XdpRingOffset = XdpRingOffset {
@@ -338,6 +339,43 @@ fn native_umem_capacity_accounts_fixed_kernel_headroom() {
 }
 
 #[test]
+fn native_umem_capacity_bounds_mapping_and_ledger_before_allocation() {
+    assert_eq!(MAX_UMEM_BYTES, 1 << 30);
+    assert_eq!(MAX_UMEM_FRAME_COUNT, 1 << 20);
+
+    let exact_byte_frame_count =
+        u32::try_from(MAX_UMEM_BYTES / 2_048).expect("exact byte-bound frame count fits u32");
+    let exact = UmemConfig::new(
+        exact_byte_frame_count,
+        2_048,
+        0,
+        1,
+        exact_byte_frame_count - 1,
+        0,
+    )
+    .expect("the exact byte bound remains valid");
+    assert_eq!(exact.byte_len(), MAX_UMEM_BYTES);
+
+    let over_bytes = exact_byte_frame_count + 1;
+    assert_eq!(
+        UmemConfig::new(over_bytes, 2_048, 0, 1, over_bytes - 1, 0),
+        Err(ConfigError::UmemByteLengthExceedsLimit {
+            byte_len: MAX_UMEM_BYTES + 2_048,
+            limit: MAX_UMEM_BYTES,
+        })
+    );
+
+    let over_frames = MAX_UMEM_FRAME_COUNT + 1;
+    assert_eq!(
+        UmemConfig::new(over_frames, 2_048, 0, 1, over_frames - 1, 0),
+        Err(ConfigError::UmemFrameCountExceedsLimit {
+            frame_count: over_frames,
+            limit: MAX_UMEM_FRAME_COUNT,
+        })
+    );
+}
+
+#[test]
 fn native_platform_support_is_typed() {
     #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
     assert_eq!(ensure_supported(), Ok(()));
@@ -591,4 +629,25 @@ fn native_corrupt_cursor_is_typed_and_atomic() {
     }
     assert_eq!(read_u32(&memory.0, 0), 5);
     assert_eq!(read_u32(&memory.0, 64), 0);
+}
+
+#[test]
+fn xdp_run_e2e_disables_veth_tx_checksum_offload() {
+    // Generic XDP executes before the skb transmit checksum helper can make a
+    // TCP checksum field wire-valid.  Keep the TCP fixture at the same
+    // byte-level contract as a physical wire or a real NIC RX path.  Linux
+    // v6.8's bpf/test_xdp_features.sh applies this exact setting to both
+    // ends of its veth/XDP test.
+    let script = include_str!("../../../scripts/run-netns-xdp-run-e2e.sh");
+    for command in [
+        "ip netns exec \"$sender_ns\" ethtool -K \"$sender_if\" tx-checksumming off",
+        "ip netns exec \"$daemon_ns\" ethtool -K \"$lan_if\" tx-checksumming off",
+        "ip netns exec \"$daemon_ns\" ethtool -K \"$wan_if\" tx-checksumming off",
+        "ip netns exec \"$receiver_ns\" ethtool -K \"$receiver_if\" tx-checksumming off",
+    ] {
+        assert!(
+            script.contains(command),
+            "AF_XDP daemon E2E must disable veth TX checksum offload: {command}"
+        );
+    }
 }

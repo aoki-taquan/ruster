@@ -9,6 +9,18 @@ pub const XDP_PACKET_HEADROOM: u32 = 256;
 pub const MIN_VISIBLE_FRAME_CAPACITY: u32 = 1;
 /// Aligned chunk sizes reviewed for the initial profile.
 pub const SUPPORTED_ALIGNED_CHUNK_SIZES: [u32; 2] = [2_048, 4_096];
+/// Maximum total byte length accepted for one AF_XDP UMEM mapping.
+///
+/// The 1 GiB ceiling follows the existing `VALIDATION_LIMITS`
+/// `max_runtime_bytes` budget. It bounds the caller-backed mapping and keeps a
+/// malformed configuration from requesting multi-terabyte virtual memory.
+pub const MAX_UMEM_BYTES: u64 = 1 << 30;
+/// Maximum number of frame/ledger entries accepted for one AF_XDP UMEM.
+///
+/// The 1,048,576-entry ceiling follows the existing `VALIDATION_LIMITS`
+/// `max_slots_per_table` budget. The ledger is a fixed `ChunkEntry` array, so
+/// this bound is enforced before its allocation.
+pub const MAX_UMEM_FRAME_COUNT: u32 = 1 << 20;
 
 /// AF_XDP bind-mode policy encoded in checked socket flags.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,7 +237,21 @@ impl UmemConfig {
                 generated_frames,
             });
         }
-        let byte_len = u64::from(frame_count) * u64::from(frame_size);
+        if frame_count > MAX_UMEM_FRAME_COUNT {
+            return Err(ConfigError::UmemFrameCountExceedsLimit {
+                frame_count,
+                limit: MAX_UMEM_FRAME_COUNT,
+            });
+        }
+        let byte_len = u64::from(frame_count)
+            .checked_mul(u64::from(frame_size))
+            .ok_or(ConfigError::UmemLengthOverflow)?;
+        if byte_len > MAX_UMEM_BYTES {
+            return Err(ConfigError::UmemByteLengthExceedsLimit {
+                byte_len,
+                limit: MAX_UMEM_BYTES,
+            });
+        }
 
         Ok(Self {
             frame_count,

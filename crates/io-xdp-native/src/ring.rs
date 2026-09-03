@@ -55,6 +55,16 @@ impl<'memory, T: RingValue> ProducerRing<'memory, T> {
         self.memory.capacity()
     }
 
+    fn need_wakeup(&self) -> Result<NeedWakeup, NativeRingError> {
+        self.memory.need_wakeup().map(|required| {
+            if required {
+                NeedWakeup::Required
+            } else {
+                NeedWakeup::NotRequired
+            }
+        })
+    }
+
     fn reserve(
         &mut self,
         len: u32,
@@ -104,13 +114,7 @@ impl<T: RingValue> ProducerReservation<'_, '_, T> {
         self.ring
             .memory
             .publish_producer(self.start.wrapping_add(self.len));
-        let need_wakeup = self.ring.memory.need_wakeup().map(|required| {
-            if required {
-                NeedWakeup::Required
-            } else {
-                NeedWakeup::NotRequired
-            }
-        });
+        let need_wakeup = self.ring.need_wakeup();
         Ok(ProducerPublication { need_wakeup })
     }
 
@@ -236,6 +240,11 @@ impl<'memory> FillProducer<'memory> {
         self.inner.capacity()
     }
 
+    /// Reads the kernel-owned need-wakeup flag without issuing a wakeup.
+    pub fn need_wakeup(&self) -> Result<NeedWakeup, NativeRingError> {
+        self.inner.need_wakeup()
+    }
+
     /// Reserves an unpublished range of UMEM addresses.
     pub fn reserve(&mut self, len: u32) -> Result<FillReservation<'_, 'memory>, NativeRingError> {
         Ok(FillReservation {
@@ -293,6 +302,11 @@ impl<'memory> TxProducer<'memory> {
     /// Returns the checked fixed capacity.
     pub const fn capacity(&self) -> u32 {
         self.inner.capacity()
+    }
+
+    /// Reads the kernel-owned need-wakeup flag without issuing a wakeup.
+    pub fn need_wakeup(&self) -> Result<NeedWakeup, NativeRingError> {
+        self.inner.need_wakeup()
     }
 
     /// Reserves an unpublished descriptor range.

@@ -5,12 +5,147 @@
 //! pointer access, socket operation, or memory mapping and therefore contains
 //! no unsafe code.
 
-use std::mem::{align_of, size_of};
+use std::mem::{align_of, offset_of, size_of};
 
 use crate::{AbiLayoutError, RingEntries, RingField};
 
 /// Pinned source of the C ABI facts in this module.
 pub const ABI_HEADER_PROFILE: &str = "Linux v6.8 include/uapi/linux/if_xdp.h";
+/// Exact UAPI source for `struct sockaddr_xdp`.
+pub const ABI_SOCKADDR_XDP_SOURCE: &str =
+    "/usr/src/linux-headers-6.8.0-137/include/uapi/linux/if_xdp.h:48-54";
+/// Exact UAPI source for the ring offset structures.
+pub const ABI_RING_OFFSETS_SOURCE: &str =
+    "/usr/src/linux-headers-6.8.0-137/include/uapi/linux/if_xdp.h:59-71";
+/// Exact UAPI source for `struct xdp_umem_reg`.
+pub const ABI_UMEM_REG_SOURCE: &str =
+    "/usr/src/linux-headers-6.8.0-137/include/uapi/linux/if_xdp.h:83-90";
+
+/// Pinned source of the reviewed eBPF UAPI facts in this module.
+pub const BPF_ABI_HEADER_PROFILE: &str =
+    "Linux v6.8 include/uapi/linux/bpf.h and x86_64 unistd_64.h";
+/// Exact x86_64 syscall-number source for `__NR_bpf`.
+pub const BPF_SYSCALL_SOURCE: &str =
+    "/usr/src/linux-headers-6.8.0-137-generic/arch/x86/include/generated/uapi/asm/unistd_64.h:325";
+/// Exact UAPI source for the map commands used by the XSKMAP seam.
+pub const BPF_COMMAND_SOURCE: &str =
+    "/usr/src/linux-headers-6.8.0-137/include/uapi/linux/bpf.h:883-887";
+/// Exact UAPI source for the XSKMAP map type enumerator.
+pub const BPF_MAP_TYPE_SOURCE: &str =
+    "/usr/src/linux-headers-6.8.0-137/include/uapi/linux/bpf.h:923-942";
+/// Exact UAPI source for the reviewed `union bpf_attr` variants and extent.
+pub const BPF_ATTR_SOURCE: &str =
+    "/usr/src/linux-headers-6.8.0-137/include/uapi/linux/bpf.h:1398-1738";
+/// Exact UAPI source for the eBPF instruction layout and register numbers.
+pub const BPF_INSN_SOURCE: &str = "/usr/src/linux-headers-6.8.0-137/include/uapi/linux/bpf.h:53-78";
+/// Exact UAPI source for the eBPF instruction-class/field values included by
+/// `linux/bpf.h`.
+pub const BPF_COMMON_SOURCE: &str =
+    "/usr/src/linux-headers-6.8.0-137/include/uapi/linux/bpf_common.h:5-27,44-51 (included by bpf.h:11-12)";
+/// Exact UAPI source for the program-load command and XDP program type.
+pub const BPF_PROGRAM_SOURCE: &str =
+    "/usr/src/linux-headers-6.8.0-137/include/uapi/linux/bpf.h:883-890,981-989";
+/// Exact UAPI source for the map-fd pseudo-instruction extension.
+pub const BPF_PSEUDO_MAP_FD_SOURCE: &str =
+    "/usr/src/linux-headers-6.8.0-137/include/uapi/linux/bpf.h:1246-1258";
+/// Exact UAPI source for the `BPF_PROG_LOAD` attribute fields.
+pub const BPF_PROG_LOAD_ATTR_SOURCE: &str =
+    "/usr/src/linux-headers-6.8.0-137/include/uapi/linux/bpf.h:1456-1495";
+/// Exact UAPI source for the XDP return values and `struct xdp_md` fields.
+pub const XDP_PROGRAM_SOURCE: &str =
+    "/usr/src/linux-headers-6.8.0-137/include/uapi/linux/bpf.h:6335-6360";
+/// Exact UAPI source for the redirect-map helper id and signature.
+pub const BPF_REDIRECT_MAP_SOURCE: &str =
+    "/usr/src/linux-headers-6.8.0-137/include/uapi/linux/bpf.h:2831-2854,5705-5758";
+
+/// x86_64 Linux `__NR_bpf`.
+pub const BPF_SYSCALL_NUMBER: i32 = 321;
+/// `BPF_MAP_CREATE`, the first member of `enum bpf_cmd`.
+pub const BPF_MAP_CREATE: u32 = 0;
+/// `BPF_MAP_UPDATE_ELEM`, the third member of `enum bpf_cmd`.
+pub const BPF_MAP_UPDATE_ELEM: u32 = 2;
+/// `BPF_PROG_LOAD`, the sixth member of `enum bpf_cmd`.
+pub const BPF_PROG_LOAD: u32 = 5;
+/// `BPF_PROG_TYPE_XDP`, the seventh member of `enum bpf_prog_type`.
+pub const BPF_PROG_TYPE_XDP: u32 = 6;
+/// `BPF_MAP_TYPE_XSKMAP`, the eighteenth member of `enum bpf_map_type`.
+pub const BPF_MAP_TYPE_XSKMAP: u32 = 17;
+/// `BPF_ANY`, which creates or replaces an XSKMAP element.
+pub const BPF_ANY: u64 = 0;
+/// XSKMAP queue-id key width required by the UAPI map implementation.
+pub const BPF_XSKMAP_KEY_SIZE: u32 = 4;
+/// XSKMAP socket-fd value width required by the UAPI map implementation.
+pub const BPF_XSKMAP_VALUE_SIZE: u32 = 4;
+
+// The following values are copied from the reviewed Linux UAPI definitions,
+// rather than inferred from an eBPF assembler. `BPF_LD`, `BPF_LDX`, `BPF_W`,
+// `BPF_MEM`, `BPF_IMM`, `BPF_ALU64`, `BPF_MOV`, `BPF_X`, and `BPF_JMP` are
+// defined in bpf_common.h (included by bpf.h at line 12); BPF_CALL and
+// BPF_EXIT are defined directly in bpf.h. The low/high nibbles in a
+// `bpf_insn` register byte are encoded by [`crate::BpfInsn`].
+/// `BPF_LD` instruction class; `bpf_common.h:5-14`.
+pub const BPF_LD: u8 = 0x00;
+/// `BPF_LDX` instruction class; `bpf_common.h:5-14`.
+pub const BPF_LDX: u8 = 0x01;
+/// 32-bit load size `BPF_W`; `bpf_common.h:16-21`.
+pub const BPF_W: u8 = 0x00;
+/// Memory addressing mode `BPF_MEM`; `bpf_common.h:22-28`.
+pub const BPF_MEM: u8 = 0x60;
+/// Immediate source selector `BPF_K`; `bpf_common.h:49-51`.
+pub const BPF_K: u8 = 0x00;
+/// Register source selector `BPF_X`; `bpf_common.h:49-51`.
+pub const BPF_X: u8 = 0x08;
+/// 64-bit ALU instruction class; `bpf.h:16-18`.
+pub const BPF_ALU64: u8 = 0x07;
+/// Register-to-register move operation; `bpf.h:26-28`.
+pub const BPF_MOV: u8 = 0xb0;
+/// Jump instruction class; `bpf_common.h:5-14`.
+pub const BPF_JMP: u8 = 0x05;
+/// Helper-call operation; `bpf.h:37-46`.
+pub const BPF_CALL: u8 = 0x80;
+/// Program-exit operation; `bpf.h:37-46`.
+pub const BPF_EXIT: u8 = 0x90;
+/// Double-word immediate load size `BPF_DW`; `bpf.h:20-23`.
+pub const BPF_DW: u8 = 0x18;
+/// Immediate load mode `BPF_IMM`; `bpf_common.h:22-28`.
+pub const BPF_IMM: u8 = 0x00;
+/// Pseudo source-register value for a map fd load; `bpf.h:1246-1258`.
+pub const BPF_PSEUDO_MAP_FD: u8 = 1;
+/// `bpf_redirect_map` helper id; `bpf.h:5757` and `5926-5933`.
+pub const BPF_FUNC_REDIRECT_MAP: i32 = 51;
+/// XDP_PASS return action; `bpf.h:6335-6346`.
+pub const XDP_PASS: u32 = 2;
+/// `struct xdp_md::rx_queue_index` byte offset; `bpf.h:6351-6360`.
+pub const XDP_MD_RX_QUEUE_INDEX_OFFSET: i16 = 16;
+
+/// eBPF register numbers from `enum` at `bpf.h:53-67`.
+pub const BPF_REG_0: u8 = 0;
+/// eBPF register number from `bpf.h:53-67`.
+pub const BPF_REG_1: u8 = 1;
+/// eBPF register number from `bpf.h:53-67`.
+pub const BPF_REG_2: u8 = 2;
+/// eBPF register number from `bpf.h:53-67`.
+pub const BPF_REG_3: u8 = 3;
+/// eBPF register number from `bpf.h:53-67`.
+pub const BPF_REG_4: u8 = 4;
+/// eBPF register number from `bpf.h:53-67`.
+pub const BPF_REG_5: u8 = 5;
+/// eBPF register number from `bpf.h:53-67`.
+pub const BPF_REG_6: u8 = 6;
+/// eBPF register number from `bpf.h:53-67`.
+pub const BPF_REG_7: u8 = 7;
+/// eBPF register number from `bpf.h:53-67`.
+pub const BPF_REG_8: u8 = 8;
+/// eBPF register number from `bpf.h:53-67`.
+pub const BPF_REG_9: u8 = 9;
+/// eBPF register number from `bpf.h:53-67`.
+pub const BPF_REG_10: u8 = 10;
+/// C ABI size of the full `union bpf_attr` on the reviewed x86_64 profile.
+///
+/// The union is defined at [`BPF_ATTR_SOURCE`]. Its 144-byte extent is the
+/// `sizeof(union bpf_attr)` result of compiling that header for x86_64 Linux;
+/// the native seam zero-fills all bytes before selecting a command variant.
+pub const BPF_ATTR_SIZE: usize = 144;
 
 /// AF_XDP protocol family.
 pub const AF_XDP: i32 = 44;
@@ -72,7 +207,7 @@ pub const XDP_PKT_CONTD: u32 = 1 << 0;
 /// A TX packet carries metadata; unsupported initially.
 pub const XDP_TX_METADATA: u32 = 1 << 1;
 
-/// Linux `struct sockaddr_xdp`.
+/// Linux `struct sockaddr_xdp`, verified against [`ABI_SOCKADDR_XDP_SOURCE`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct SockAddrXdp {
@@ -88,7 +223,7 @@ pub struct SockAddrXdp {
     pub shared_umem_fd: u32,
 }
 
-/// Linux `struct xdp_ring_offset`.
+/// Linux `struct xdp_ring_offset`, verified against [`ABI_RING_OFFSETS_SOURCE`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct XdpRingOffset {
@@ -102,7 +237,7 @@ pub struct XdpRingOffset {
     pub flags: u64,
 }
 
-/// Linux `struct xdp_mmap_offsets`.
+/// Linux `struct xdp_mmap_offsets`, verified against [`ABI_RING_OFFSETS_SOURCE`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct XdpMmapOffsets {
@@ -116,22 +251,158 @@ pub struct XdpMmapOffsets {
     pub completion: XdpRingOffset,
 }
 
-/// Linux `struct xdp_umem_reg`.
+/// Linux `struct xdp_umem_reg`, verified against [`ABI_UMEM_REG_SOURCE`].
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct XdpUmemReg {
-    /// Start of the packet data area.
+    /// UAPI `addr`: start of the packet data area.
     pub address: u64,
-    /// Packet data area length.
+    /// UAPI `len`: packet data area length.
     pub len: u64,
-    /// Fixed chunk size.
+    /// UAPI `chunk_size`: fixed chunk size.
     pub chunk_size: u32,
-    /// Kernel-reserved headroom.
+    /// UAPI `headroom`: configured headroom before packet data.
     pub headroom: u32,
-    /// UMEM option flags.
+    /// UAPI `flags`: UMEM option flags.
     pub flags: u32,
-    /// Per-chunk TX metadata length.
+    /// UAPI `tx_metadata_len`: per-chunk TX metadata length.
     pub tx_metadata_len: u32,
+}
+
+// These assertions are compile-time guards for the field order used by the
+// dependency-free byte encoders below. The field definitions are sourced from
+// `/usr/src/linux-headers-6.8.0-137/include/uapi/linux/if_xdp.h:83-90`;
+// offsets are obtained from Rust's C-layout calculation, never guessed.
+const _: [(); 32] = [(); size_of::<XdpUmemReg>()];
+const _: [(); 8] = [(); align_of::<XdpUmemReg>()];
+const _: [(); 0] = [(); offset_of!(XdpUmemReg, address)];
+const _: [(); 8] = [(); offset_of!(XdpUmemReg, len)];
+const _: [(); 16] = [(); offset_of!(XdpUmemReg, chunk_size)];
+const _: [(); 20] = [(); offset_of!(XdpUmemReg, headroom)];
+const _: [(); 24] = [(); offset_of!(XdpUmemReg, flags)];
+const _: [(); 28] = [(); offset_of!(XdpUmemReg, tx_metadata_len)];
+
+const _: [(); 16] = [(); size_of::<SockAddrXdp>()];
+const _: [(); 0] = [(); offset_of!(SockAddrXdp, family)];
+const _: [(); 2] = [(); offset_of!(SockAddrXdp, flags)];
+const _: [(); 4] = [(); offset_of!(SockAddrXdp, ifindex)];
+const _: [(); 8] = [(); offset_of!(SockAddrXdp, queue_id)];
+const _: [(); 12] = [(); offset_of!(SockAddrXdp, shared_umem_fd)];
+
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + size_of::<u16>()].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + size_of::<u64>()].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_ne_bytes(
+        bytes[offset..offset + size_of::<u64>()]
+            .try_into()
+            .expect("checked C-layout field extent"),
+    )
+}
+
+/// Encodes `struct xdp_umem_reg` using its checked C-layout field offsets.
+pub(crate) fn encode_xdp_umem_reg(value: XdpUmemReg) -> [u8; size_of::<XdpUmemReg>()] {
+    let mut bytes = [0_u8; size_of::<XdpUmemReg>()];
+    write_u64(&mut bytes, offset_of!(XdpUmemReg, address), value.address);
+    write_u64(&mut bytes, offset_of!(XdpUmemReg, len), value.len);
+    write_u32(
+        &mut bytes,
+        offset_of!(XdpUmemReg, chunk_size),
+        value.chunk_size,
+    );
+    write_u32(&mut bytes, offset_of!(XdpUmemReg, headroom), value.headroom);
+    write_u32(&mut bytes, offset_of!(XdpUmemReg, flags), value.flags);
+    write_u32(
+        &mut bytes,
+        offset_of!(XdpUmemReg, tx_metadata_len),
+        value.tx_metadata_len,
+    );
+    bytes
+}
+
+/// Encodes `struct sockaddr_xdp` using its checked C-layout field offsets.
+pub(crate) fn encode_sockaddr_xdp(value: SockAddrXdp) -> [u8; size_of::<SockAddrXdp>()] {
+    let mut bytes = [0_u8; size_of::<SockAddrXdp>()];
+    write_u16(&mut bytes, offset_of!(SockAddrXdp, family), value.family);
+    write_u16(&mut bytes, offset_of!(SockAddrXdp, flags), value.flags);
+    write_u32(&mut bytes, offset_of!(SockAddrXdp, ifindex), value.ifindex);
+    write_u32(
+        &mut bytes,
+        offset_of!(SockAddrXdp, queue_id),
+        value.queue_id,
+    );
+    write_u32(
+        &mut bytes,
+        offset_of!(SockAddrXdp, shared_umem_fd),
+        value.shared_umem_fd,
+    );
+    bytes
+}
+
+#[cfg(test)]
+fn encode_ring_offset(bytes: &mut [u8], base: usize, value: XdpRingOffset) {
+    write_u64(
+        bytes,
+        base + offset_of!(XdpRingOffset, producer),
+        value.producer,
+    );
+    write_u64(
+        bytes,
+        base + offset_of!(XdpRingOffset, consumer),
+        value.consumer,
+    );
+    write_u64(
+        bytes,
+        base + offset_of!(XdpRingOffset, descriptors),
+        value.descriptors,
+    );
+    write_u64(bytes, base + offset_of!(XdpRingOffset, flags), value.flags);
+}
+
+/// Encodes a kernel-shaped `struct xdp_mmap_offsets` for seam tests.
+#[cfg(test)]
+pub(crate) fn encode_xdp_mmap_offsets(value: XdpMmapOffsets) -> [u8; size_of::<XdpMmapOffsets>()] {
+    let mut bytes = [0_u8; size_of::<XdpMmapOffsets>()];
+    encode_ring_offset(&mut bytes, offset_of!(XdpMmapOffsets, rx), value.rx);
+    encode_ring_offset(&mut bytes, offset_of!(XdpMmapOffsets, tx), value.tx);
+    encode_ring_offset(&mut bytes, offset_of!(XdpMmapOffsets, fill), value.fill);
+    encode_ring_offset(
+        &mut bytes,
+        offset_of!(XdpMmapOffsets, completion),
+        value.completion,
+    );
+    bytes
+}
+
+fn decode_ring_offset(bytes: &[u8], base: usize) -> XdpRingOffset {
+    XdpRingOffset {
+        producer: read_u64(bytes, base + offset_of!(XdpRingOffset, producer)),
+        consumer: read_u64(bytes, base + offset_of!(XdpRingOffset, consumer)),
+        descriptors: read_u64(bytes, base + offset_of!(XdpRingOffset, descriptors)),
+        flags: read_u64(bytes, base + offset_of!(XdpRingOffset, flags)),
+    }
+}
+
+/// Decodes a complete kernel `struct xdp_mmap_offsets` value.
+pub(crate) fn decode_xdp_mmap_offsets(bytes: &[u8]) -> Option<XdpMmapOffsets> {
+    if bytes.len() < size_of::<XdpMmapOffsets>() {
+        return None;
+    }
+    Some(XdpMmapOffsets {
+        rx: decode_ring_offset(bytes, offset_of!(XdpMmapOffsets, rx)),
+        tx: decode_ring_offset(bytes, offset_of!(XdpMmapOffsets, tx)),
+        fill: decode_ring_offset(bytes, offset_of!(XdpMmapOffsets, fill)),
+        completion: decode_ring_offset(bytes, offset_of!(XdpMmapOffsets, completion)),
+    })
 }
 
 /// Linux `struct xdp_statistics`.
