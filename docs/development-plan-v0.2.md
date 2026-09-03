@@ -1,6 +1,6 @@
 # v0.2 development plan
 
-この文書は、2026-07-30時点のactive v0.2 treeに対するrepository全体の並列監査を統合し、
+この文書は、2026-08-23時点のactive v0.2 treeに対するrepository全体の並列監査を統合し、
 「libraryとして検証できるpacket-processing core」から「自宅ラボで起動、設定、運用、
 測定できるrouter」までの実装順を定める。実装済み機能の詳細なRFC根拠は
 [`requirements-v0.2.md`](requirements-v0.2.md)、現在のdata-plane契約は
@@ -26,56 +26,107 @@
 
 ### 実装済み
 
-active workspaceは外部依存を持たない二つのlibrary crateからなる。
+active workspaceはpacket coreだけでなく、config、cold planning、bounded runtime、integration、
+sim/conformance、benchmark schema、AF_PACKET/AF_XDP scaffoldまでcrate境界を分離している。
+production dependencyは下位層から上位compositionへ逆流させない。
 
 - `ruster-core`
-  - backend-owned RX/generated bufferのGAT/RAII lease
-  - Ethernet II、IPv4 header/length/checksum、LPM、TTL/checksum/MAC rewrite
-  - static/dynamic ARP、retry、failure hold、generated ARP
-  - local ICMPv4 Echo、Time Exceeded、Network/Host Unreachable
-  - worker-local fixed-capacity UDP/TCP NAT44
-  - external ICMPv4 Type 3/Code 4 NAT translation
-  - opt-in stateful IPv4 UDP/TCP firewallとNAT RELATED照合
-- `ruster-io-sim`
-  - deterministic RX/TX/recycle FIFO
-  - received/generated partial TX、allocation failure、finish error
-  - lifecycle accountingとtyped trace
+  - backend-owned RX/generated bufferのGAT/RAII leaseとexactly-once terminal action
+  - unified ingress L2/martian admission、Ethernet II/IPv4/LPM、ARP、local/generated ICMPv4
+  - caller-backed bounded UDP/TCP NAT44、stateful firewall、NAT RELATED/full composition
+- `ruster-config` / `ruster-control`
+  - bounded versioned TOML parse、canonical semantic validation、full runtime storage shape/bytes
+  - `ValidatedConfigV1::into_parts`が返すpublic `ValidatedConfigV1Parts`の`#[non_exhaustive]` top-level transfer boundaryと、Resolution/ICMP、
+    UDP/TCP NAT、firewall、tick、runtime storage shapeのconfig-owned nested exact consuming seam。各nested
+    `Self` patternとcontrol plannerのreturned inventoryを省略せず、current behavior-bearing fieldの未転送を
+    compile failureへ寄せる。現行のvalue equality/pointer identity/source-contract testは、それぞれcurrent
+    runtime forwarding、owned allocation、exact source shapeの範囲だけを証明する
+  - `ValidatedFirewallV1::into_rules(self) -> Box<[FirewallRule]>`をlegacy rules-only caller向けpublic
+    compatibility seamとして維持。全current fieldをexact destructureし、policy/state_slotsをnamed discardする。
+    production plannerは`into_planning_parts`でrules/policy/state_slotsを全てforwardし、legacy seamとplanner
+    inventory seamを分離する
+  - caller generation/typed hash keyをbindしたcold full-service plan/candidate、missing-service ownership
+    recovery、value-free terminal candidate minting error、candidate-only `classify_successor`/
+    `plan_successor`。`PlanSectionDiff`、`PlanGenerationTransition`、Initial/InPlace/Restart/Rejectedの
+    value-only outcomeと、Rejectedでもdiffを保持するstatic planningを実装済み
+- `ruster-runtime`
+  - core-owned `BoundPublicationBackend<I>`とexact owner capabilityによるcandidate-preserving
+    publication/quiescence seam、typed apply report
+  - backend precheck、safe matched-guard gate、external `unsafe` authorized hook、foreign backendの
+    candidate-preserving全phase fail-close
+  - generationとtick budgetを不可分に束ねたsealed full-service view、publication後のactive viewを使う
+    single-worker tick
+  - `RX → resolution timer → failure dispatch → generated ARP → generated ICMPv4`のphase ordering
+  - candidate-safe reject/defer時の旧active継続、active invariant failureのpersistent stop latch、backend
+    disposition別skip/stop、steady-tick allocation zero evidence
+  - R15: allocation-freeでgeneration-tagged化された`observability` module（saturating counter/high
+    watermark、`active_status`から導出する`Readiness`、backend統計拡張点`BackendObservabilityStats`）。
+    snapshot生成自体はformatを行わずcold consumer専用
+- `ruster-integration`
+  - `control + core + runtime`へだけ依存するcomposition root
+  - active ownerからcontrol plannerへ委譲するallocation-free read-only `plan_successor`。raw candidateを
+    公開せず、owner/current runtime stateを変更しない
+  - candidate-boundな21 fixed backing arrayのfallible allocationとconcrete byte照合
+  - worker開始前のfive-service cold initial activation、backend-bound owner typestate、storage
+    lifetime-bound owner、sealed active view
+  - same-interface/same-shape successorのall-five preflight、失敗不能commit、candidate-last metadata切替、
+    guard解放後の旧candidate drop、service別flush report。interface/storage/Resolution/ICMP policyの
+    typed restart-required、candidate-preserving reject/deferとdynamic gateをstatic planから分離する境界
+  - validated configからplanner/activation/bound `SimIo` one tickまでのrootless integration evidence
+  - `FullServicePublicationOwner::observability_snapshot`でtickごとのobservability snapshotを取得
+- `ruster-sim-scenario`（R11）
+  - public full composition API（parse→validate→plan→initial activation→`bind_publication_backend`→
+    `run_tick`）だけを経由するdeterministic multi-tick scenario driver。呼び出し側が渡す論理clockだけを
+    使いwall clockを読まず、ingress/typed outcomeに`String`を使わない
+  - LAN内ARP解決/転送、WAN route経由のUDP/TCP NAT44、firewall allow/deny、複数tickのdynamic neighbor
+    解決、TTL超過とARP解決失敗（max-attempts消尽）によるICMPv4生成、同一scenarioのbyte/順序完全一致
+    replayをgolden fixtureとして保持。route-unreachable ICMPはfirewall route oracle抑制のためpublic
+    full composition API経由では原理的に再現不能なためscope外
+- I/O / test foundation
+  - `ruster-io-sim`のdeterministic RX/TX/recycle FIFO、partial/error lifecycle、inner backend向けquiescence
+    model。`SimIo::new`/`Default`はstandaloneで、publication pathは`bind_publication_backend`を使う
+  - backend conformance、AF_PACKET TPACKET_V3 checked scaffold/fixed-frame TX engine
+  - AF_XDP pure ownership/ring modelとnative UAPI/ring/syscall RAII scaffold
+  - deterministic security replay/property smokeとNIC-free benchmark artifact/plan validation
 - CI
   - format、clippy、workspace tests、doctests、rustdoc、check
-  - requirements ledgerが参照するtest IDの機械検証
+  - requirements ledgerが参照する一行一Test IDの機械検証
 
 NAT/FWはrewrite成功後、TX request前にstateをcommitし、backend rejectでも同一batch内の
 後続packetから見える。resolution、ICMP error、firewall、NATのmutable stateはcaller-backedで
-worker-localであり、live capacity pressureで別flowをevictしない。これらはreal backendへ
-持ち込む価値のある基盤である。
+worker-localであり、live capacity pressureで別flowをevictしない。cold initial activationでも
+candidate/storage/runtime lifetimeをsafe borrowで束ね、self-reference、leak、unsafe pointerを使わない。
+ICMPv4 error publication validationはstate/actionの双方向backreferenceによりaction 2 pass + state 1 passの
+`O(A + S)`で、nested searchとmutation-on-rejectionを持ちません。x86_64ではbackreference追加後のstate/action
+slotが32/592 bytes（各+8 bytes）で、config/control/integrationのrequired byte計算は`size_of`へ自動追随します。
 
 ### Partialまたは欠落
 
-- forwarded IPv4に対する統一されたingress L2 admissionとmartian source/destination policyが
-  ない。local ICMP、ARP、NATには個別防御があるが、plain forwardingを含む入口全体の境界ではない。
-- UDP/TCP NATはcaller-backed mapping/filter directoryとdirect public-port ownerへ移行済みで、
-  lookupはcapacity-bounded、allocatorは候補port数`P`だけをscanする。TCP mapping再生成も
-  generation+epochで旧sessionをlazyに無効化し、commitでsession全体をscanしない。
-- NAT+generated ICMP、FW+generated ICMP、NAT+FWのpublic wrapperはあるが、
-  UDP/TCP NAT+FW+generated ICMPを同時に選ぶfull composition wrapperがない。
-  private `forward_batch_inner`は全serviceを同時に受け取れるため、内部能力ではなくpublic
-  compositionの欠落である。
-- architecture順のbounded single-worker tickとgeneric publication seamは`ruster-runtime`に
-  ある。具体的なowned publication、設定parser、daemon、thread/signal lifecycleは後続taskである。
-- `ForwardingSnapshot`とNAT/FW configはborrowed sliceのpointer identityへbindされる。
-  owned configをmove/reallocateした後のsnapshot、runtimeより短命なrule slice、partial reloadは
-  fail closedまたはdangling設計を招く。Rustのborrowでmemory safetyは守れても、daemonの
-  publication lifetimeとatomic replacementを先に設計する必要がある。
-- declarative config、schema version、validate/plan/apply、rollback、daemon、CLI、signal処理、
-  privilege separation、persistent diagnosticsがない。
-- production backend、AF_PACKET、AF_XDP、libxdp FFI、XDP program lifecycle、multi-queue
-  worker ownershipがない。
-- countersを運用系へexportするsnapshot、structured log、health/readiness、queue saturation、
-  config generation表示がない。
-- parser/state machine/checksumのfuzz、property test、loom相当のownership model test、
-  sanitizer、long soak、failure injection matrixがCIへ組み込まれていない。
-- benchmark harness、packet-size/flow-count matrix、latency、cycles/packet、cache miss、
-  copy/zero-copy判定、10GbE acceptance threshold、hardware runnerがない。
+- integration ownerはcore-owned bound backendのexact owner capabilityへbindし、same-interface/same-shape
+  successorについて全5 runtimeをmutation-freeにpreflightする。matched quiescence guard保持中に失敗不能
+  commitして最後にgeneration/tick/authority candidateを置換し、guard解放後に旧candidateをdropする。
+  interface bindingまたはruntime storage shapeの変更は、exact candidate付きのtyped `RestartRequired`として
+  拒否する。candidate-bound prepared backend resourceのinstall、capacity変更のcold rebuild/restart実行、
+  native backendとのmetadata同時切替は未実装。
+- initial activationはshape/byte precheckまではmutation-freeだが、sequential constructor開始後の
+  late TCP failureで先行storage clearingとUDP process identityをrollbackしない。typed terminal境界で
+  あり、restart/rebuild policyは後続のcontrol/daemon workflowで定める。
+- config parse/validate、cold planner、candidate-only `classify_successor`/`plan_successor`、
+  semantic diff/generation transition、library-level apply境界は実装済み。initial/in-place/
+  restart/rejectedのstatic outcome、policy-only restart、actual publicationのcandidate-preserving
+  reject/defer、旧config contentをhigher generation/fresh keyで再planするrollback evidenceまで固定している。
+  残るのはbackend/storage resourceのrestart execution、reloadとoperator recovery workflow、
+  daemon/CLI/thread/signal lifecycle、persistent diagnostics。
+- AF_PACKETはPacketIo RX/live adapter未接続。AF_XDPはnative resource setup/session、UMEM登録、
+  XDP attach、core PacketIo接続、実completion drainが未実装。multi-queue worker ownershipも後続。
+- R15: allocation-freeでtyped counter snapshot（generation、readiness、firewall/UDP/TCP NAT44の
+  saturating累積/high watermark、backend統計拡張点）はruntimeライブラリとして実装済み。structured log、
+  queue/capacity high-watermark、drop reasonの内訳、backend mode、およびoperator向けのCLI/`run-sim`出力
+  表示（R12依存）は未実装。
+- security replay/property smokeはあるが、loom相当、sanitizer、長時間soak、網羅的failure injection、
+  privileged netns/hardware matrixは未完成。
+- benchmark schema/plan/math validatorはあるが、実packet driver、review済み性能threshold、latency、
+  cycles/packet、cache miss、copy/zero-copy判定、10GbE acceptance artifact、hardware runnerがない。
 
 ### Open issue hygiene
 
@@ -102,12 +153,12 @@ priorityは実装量ではなく、次milestoneを安全に開始できる順序
 
 | ID | Work | 理由 / 完了状態 |
 |---|---|---|
-| P0-INGRESS | ingress L2/martian admission | foreign unicast、invalid Ethernet source、IPv4 martianをplain/NAT/FW全pathでmutation/state/LPM前にtyped drop。local controlとARPの許可profileを別に保つ |
-| P0-NAT-INDEX | bounded NAT index/allocator | TCP `O(P*M*S)`とUDP `O(P*M)`をpacket pathから除去し、lookup、free-port、expiry/reuseを明示上限付きにする |
-| P0-PUBLICATION | publication lifetime contract | owned generationがsnapshot/config/runtimeより長生きし、apply失敗時に旧generationを継続。capacity変更とrollbackをtyped planにする |
-| P0-COMPOSE | full service composition | UDP/TCP NAT+FW+generated ICMPのunaudited/audited public APIとsim proofを追加 |
-| P0-BACKEND-CONTRACT | backend conformance suite | lease exactly-once、partial TX、finish error、generated accounting、batch abandonをbackend共通suiteで検証 |
-| P0-TICK | bounded worker tick | architecture順序をgeneric、allocation-free、明示budgetで固定し、RX borrow終了後だけgenerated sessionを開始 |
+| P0-INGRESS | ingress L2/martian admission | implemented。foreign unicast、invalid Ethernet source、IPv4 martianをplain/NAT/FW全pathでmutation/state前にtyped dropし、local control/ARP profileを分離 |
+| P0-NAT-INDEX | bounded NAT index/allocator | implemented。caller-backed keyed directory/direct ownerでlookup、free-port、expiry/reuseを明示上限化し、TCP mapping再生成はgeneration+epochで旧sessionをlazy invalidation |
+| P0-PUBLICATION | publication lifetime contract | partial。owned cold candidate、candidate-bound external storage、core-owned bound backend/exact owner capability、five-service backend-bound initial owner、candidate-only static plan/diff、active-owner read-only delegation、candidate-preserving reject/defer、sealed active view、safe matched-guard gate、same-interface/same-shape all-five successor apply、guard外旧candidate drop、typed flush reportは実装済み。prepared backend resource install、capacity/restart execution、reloadとoperator recovery workflowは未実装 |
+| P0-COMPOSE | full service composition | implemented。UDP/TCP NAT+FW+generated ICMPのunaudited/audited public API、sim proof、integration initial owner wiringを保持 |
+| P0-BACKEND-CONTRACT | backend conformance suite | implemented for Sim/conformance foundation。lease exactly-once、partial TX、finish error、generated accounting、batch abandon、inner backend quiescence hookとcore-owned identity wrapperを検証。production adapter適用は各backend milestoneで継続 |
+| P0-TICK | bounded worker tick | implemented。exact backend precheck、candidate-preserving publication、typed apply report、active failure persistent fail-close、allocation-free steady tick、generation-bound active viewから選ぶbudget/phase順を固定し、RX borrow終了後だけgenerated sessionを開始 |
 | P0-CI | baseline gate hardening | R00Cが現行workspaceのformat、clippy、test、doctest、rustdoc、check、requirementsを固定toolchainで実行し、backend contract testを通常CIへ追加する。fuzz/privileged/hardware jobはP1の専用PRへ分離 |
 
 ingress admissionは少なくとも次をblack-box testに固定する。
@@ -128,8 +179,8 @@ attachした時に「kernel/NICが先に捨てるはず」と仮定しない。
 
 | ID | Work | 完了状態 |
 |---|---|---|
-| P1-CONFIG | R09 versioned declarative config | interface、address、route、neighbor、NAT、FW、capacity、tick budgetをparseし、全semantic validation後だけpublication候補を作る |
-| P1-PLAN-APPLY | R10 validate → plan → apply | generation diff、state flush、restart-required、rollback-as-new-generationを表示し、tick boundaryでatomic apply |
+| P1-CONFIG | R09 versioned declarative config | implemented through cold candidate planning。interface、address、route、neighbor、NAT、FW、capacity、tick budgetをparse/validateし、public top-level `ValidatedConfigV1Parts`とnested exact consuming seamsでcurrent owned inventoryを保持する。caller generation/keyとbindしたcandidateを作る。CLI/daemon applyは別項 |
+| P1-PLAN-APPLY | R10 validate → plan → apply | library boundaryは実装済み。candidate-only static `PlanSectionDiff`/`PlanGenerationTransition`、initial/in-place/restart/rejected outcome、policy restart、all-five same-shape atomic apply、candidate-preserving actual reject/defer、higher-generation/fresh-key rollback re-planを固定する。R10-009〜012でnested/top-level exact inventory、planner forwarding、source-contract boundaryを、FW-025でlegacy `into_rules` compatibilityを固定する。CLI表示、backend/storage restart execution、reload orchestrationは後続 |
 | P1-DAEMON | R12 worker supervisor/CLI | `validate`、`plan`、`run-sim`、後の`run`、signal、ordered shutdown、nonzero exit、privilege boundary |
 | P1-OBS | R15 observability | typed counter snapshot、config generation、queue/capacity high-watermark、drop reason、backend mode、health/readiness |
 | P1-AF_PACKET | R13/R14 real-I/O correctness rung | preallocated backend-owned slots、multi-interface IfId mapping、partial send/recycle、veth/netns E2E。copy backendであることを明示 |
@@ -161,10 +212,10 @@ production backendの実装を安全に並列化できるcore/runtime境界を�
 |---|---|---|
 | P0-INGRESS | R01 | ledgerにmartian/L2 policyとdeviation、全pathのbyte/state/action atomic test、独立RFC/security approval |
 | P0-NAT-INDEX | R02→R03→R04 | frozen complexity contract、UDP/TCP capacity/property test、packet-path lookup/allocatorに`P*M*S` nested scanが無いことを示すreview |
-| P0-PUBLICATION | R06 | owned publication lifetime compile test、failed apply/rollback runtime test、独立lifecycle approval |
+| P0-PUBLICATION | R06→integration initial slice→successor apply | cold candidate/storage/initial owner lifetime、allocation-free exact backend binding、sealed/matched guard、candidate-preserving reject/defer/mismatch、rootless bound-backend one-tick、same-interface/same-shape all-five preflight/commit、preflight失敗時の旧active保持、guard外旧candidate drop、typed apply report、higher-generation/fresh-keyで旧config contentを再planするtestは実装済み。capacity/restart execution、prepared backend resource install、独立lifecycle approvalが残る |
 | P0-COMPOSE | R05→RI0 | R05がinternal wrapper behaviorを固定し、RI0がunaudited/audited re-export、public compile/full-service integration test、matching requirements rowを同時追加してAPI/security approvalを得る |
-| P0-BACKEND-CONTRACT | R07 | `ruster-io-sim`がRX/generated exactly-once、partial reject、finish error、abandon suiteに合格 |
-| P0-TICK | R08 | phase-order trace、全phase budget、RX borrow終了後generated開始、error accounting test |
+| P0-BACKEND-CONTRACT | R07 | `ruster-io-sim`がRX/generated exactly-once、partial reject、finish error、abandon、quiescence hook、foreign wrapper mismatch suiteに合格 |
+| P0-TICK | R08 | phase-order trace、全phase budget、RX borrow終了後generated開始、error accounting、active invariant current/next tick fail-close test |
 | P0-CI | R00C | pinned toolchainでREADMEの6 gate、requirements gate、R07 conformanceを通常CIの必須jobとして成功 |
 
 加えて、backend-facing traitにUMEM、raw pointer、headroom/capacity全体を公開せず、fast-path
@@ -181,8 +232,11 @@ rootやNICなしで、宣言的設定からrouter processを起動し、完全�
 exit criteria:
 
 - `ruster validate`、`ruster plan`、`ruster run-sim`がdocumented exampleで動く。
-- LAN/WAN、route、dynamic ARP、UDP/TCP NAT、FW allow/deny、TTL/route/host ICMPを含む
-  deterministic scenarioがpublic full composition APIを通る。
+- LAN/WAN、route、dynamic ARP、UDP/TCP NAT、FW allow/deny、TTL/host ICMPを含む
+  deterministic scenarioがpublic full composition APIを通る。route-unreachable ICMPは
+  production full-service candidateが常にfirewallを含む（PUB-001）ため、public full
+  composition APIでは意図的に再現不能（ICMP4-012G5、route topology oracle抑制）。この
+  1シナリオはpublic full composition API外のcore-levelテスト（ICMP4-012G）で担保する。
 - 同じconfig/scenarioはbyte/order-identical resultを返す。
 - invalid config/applyは旧publicationとruntimeを変更しない。
 - reloadはgeneration境界で行い、capacity変更はrestart-required、rollbackは新generationとなる。
@@ -190,6 +244,29 @@ exit criteria:
 - R15のcounter snapshot/health/config generationを`run-sim`出力でoperatorが確認できる。
 - R16のparser/state/publication property suiteとbounded fuzz smokeが必須CIで成功する。
 - R17がbenchmark specificationをcommitし、そのspec SHAをM1 release evidenceへ固定する。
+
+現在のM1基礎は、versioned configのparse/validate、cold full-service planner、candidate-bound
+external storage、five-service initial activation、core-owned bound `SimIo` one tickに加え、
+same-interface/same-shapeのsuccessorを全5 runtimeへpreflight/commitするlibrary transactionまで進んでいます。
+`classify_successor`/`plan_successor`はcandidate-onlyのstatic decisionをallocation-freeに返し、
+active ownerのread-only delegation、全successor outcomeのsemantic diff/generation transition、
+Resolution/ICMP policy-onlyのtyped restart-required、Rejectedを含むcandidate-preserving publicationを
+固定しています。rollbackは旧config contentをhigher generation/fresh keyで再planするlibrary evidenceがあり、
+全履歴key freshnessとcold generation persistenceはcaller責務です。
+config transferでは、top-level `ValidatedConfigV1Parts`のpublic `#[non_exhaustive]` boundaryと、nested
+Resolution/ICMP/NAT/firewall/tick/storageのexact consuming seamsを分けて維持しています。current sourceの
+exact `Self` destructureとplannerのreturned inventory destructureがcompile-time evolution boundaryを作り、
+実行時testはcurrent valuesとowned Box pointer identityをforwarding先で確認します。legacy
+`ValidatedFirewallV1::into_rules`はrules-only caller向けに復元済みですが、planner pathは
+`into_planning_parts`でfirewall rules/policy/state_slotsを全てforwardします。generation、hash key、runtime
+authorityのpublication責務はconfig transferの外側にあります。
+`run_tick`はpublication後のactive viewからgeneration-bound budgetを選ぶため、成功tickはnew budget、
+candidate-safe reject/defer tickはold budgetを使います。foreign backendはcandidate有無にかかわらず全phaseを
+skipし、active invariant failureは現tickからpersistentに停止します。R15のruntime `observability` module
+（allocation-free typed snapshot、generation、readiness、saturating high watermark、backend統計拡張点）と
+R11のdeterministic sim scenario driver（`ruster-sim-scenario`、public full composition API経由のgolden
+fixture 9件）も実装済みです。interface/backend resource swap、capacity restart execution、`run-sim`
+process（R15 snapshotのoperator向けCLI表示を含む）、reload orchestration、signal/shutdownは未実装です。
 
 ### M2: Operable AF_XDP static router
 
@@ -239,6 +316,14 @@ exit criteria:
   assertする。
 
 ## PR dependency graph
+
+次のgraphはwork packet間の設計依存を示す。現在のtreeはR01–R09の主要core/config/runtime基盤、
+R10のstatic planner、active-owner delegation、candidate-preserving publication、rollback re-plan evidence、
+integration initial activation、same-interface/same-shape successor applyまで進んでいる。graph上のR10は
+library boundaryの完了に加え、backend/storage restart execution、reload orchestration、operator向けの
+plan/apply/rollback transactionを含むwork packetとして扱う。`ruster-integration`
+追加時のworkspace memberとlockfileはRI-DEPの一方向依存規則に従い、lower crateからintegrationへの
+逆依存はない。
 
 ```text
 R00 workspace/new-crate scaffold
@@ -308,7 +393,7 @@ matching requirements rowを同じPRで完成させる。
 | R07 | new backend conformance crate/filesとsim adapter test | RX/generated exactly-once、partial reject、finish error、abandon | backend ownership |
 | R08 | RI0/R06/R07後。new runtime crateのtick module/test | phase順、全budget bounded、RX borrow後generated、error時pending保存 | lifecycle/performance |
 | R09 | R08後。config crateの`model`/`parse`/`validate` module | schema version、duplicate/unknown/canonicality/realm/capacityをmutation前にtyped reject | product/security |
-| R10 | R09後。config/runtimeの`plan`/`apply` module | dry-run diff、all-or-nothing apply、restart-required、new-generation rollback | failure atomicity |
+| R10 | R09後。config/runtimeの`plan`/`apply` module | static section diff/generation transition、initial/in-place/restart/rejected outcome、all-or-nothing same-shape apply、policy-only restart、candidate-preserving reject/defer、higher-generation/fresh-key rollback re-plan。backend/storage restart executionとreload orchestrationは後続 | failure atomicity |
 | R11 | R08後。sim scenario crate/moduleとgolden fixtures | deterministic timestamp/ingress/frame inputとtyped output。packet path Stringなし | test/product |
 | R15 | R09後（R09はR08依存）。runtime `observability` moduleと専用snapshot test | allocation-free typed snapshot、generation、health、core state/action/audit high-watermark、backend stats extension pointとsim実装、saturating counters。formatはcold consumerだけ | operations/performance |
 | R16 | R01/R03/R04/R05/R06/R08/R09後。`fuzz/`、new property tests、`.github/workflows/fuzz-smoke.yml`だけ | fixed seed/corpusと時間上限を記録し、parser/checksum/state/publication invariants、過去failure corpusをrequired unprivileged smokeで実行 | security/test |
@@ -345,27 +430,75 @@ full gateとする。
 
 ### Lifetime model
 
-`OwnedPublication`はinterface、binding、route、neighbor、firewall rule等のowned storageを持つ。
-そこから作る`ForwardingSnapshot`、NAT config、FirewallConfig、およびそれらを保持するruntimeは
-publicationを越えて生存できない。自己参照struct、leaked allocation、pointer identityの
-再構築でこの制約を回避しない。
+cold `FullServiceCandidateV1`はinterface、binding、route、neighbor、firewall rule等のowned
+storageとgeneration/key/tick/shape metadataを不可分に持つ。`ruster-integration`の
+`FullServiceRuntimeStorage`はcandidateの21-array shape/bytesにbindしてfallibleに確保し、
+`activate_initial`成功後はcandidateと全runtimeを`FullServicePublicationOwner`が所有する。initial ownerは
+backend未指定のtypestateで、`bind_publication_backend`がinner backendをconsumeして同時発行する
+`BoundPublicationBackend<I>`とexact owner capabilityへbindしたownerだけがruntime publication traitを
+実装する。checked allocation-free identityが枯渇した場合は`PublicationBindingIdentityExhausted`を返し、
+wrap/再利用しない。storage borrowはownerより長生きし、snapshot/config/rules borrowとmutable runtimeは
+ownerのsealed active view lifetimeへ短縮される。自己参照struct、leaked allocation、pointer identity再構築で
+この制約を回避しない。
 
-daemon workerはgeneration loopを使う。
+初回cold startで現在実装済みの流れは次です。
 
 ```text
-candidate parse/validate/allocate
-→ apply planを作成
-→ tick boundaryを待つ
-→ old runtime/snapshot borrowをdrop
-→ candidateをcurrent ownershipへmove
-→ new snapshot/config/runtimeをbind
-→ reconcile後にRX再開
+config parse/validate
+→ caller generation/keyでcold candidateをplan/mint
+→ candidate-bound external storageをfallibleに確保
+→ shape/concrete bytesをprecheck
+→ worker開始前にfive-service runtimeをactivate
+→ SimIo::new()をbind_publication_backendへconsumeしてexact wrapper/capabilityを作る
+→ initial ownerをcapabilityへbindし、sealed active viewをborrowしてbound Sim tickを実行
 ```
 
-apply前に失敗し得る検証とallocationを完了する。apply後に失敗し得るbackend operationがある
-場合は、backend resourceをcandidate側でprepareし、commit pointを一つにする。容量変更は
-in-place resizeせずrestart-requiredとする。rollbackは古いgeneration/hash keyを再利用せず、
-旧内容から新publicationを作る。
+shape/byte mismatchはconstructor前にexact candidateと無変更storageを返します。constructor開始後の
+late failureはcandidateを返してもstorage/process identityをrollbackしないterminal boundaryです。
+現行のsame-interface/same-shape successorはinitial helperでruntimeを再生成せず、既存21 backingと
+runtime identityを再利用して次のtransactionを実行します。
+
+```text
+successor candidateをmoveでrun_tickへ渡す
+→ candidate有無より先にexact owner/backend wrapperを照合する
+→ inner backendのquiescence check後、raw guardをownerへmatchしてopaque guardにする
+→ matched guard保持中にstatic successor、same interface、same storage shapeを検査
+→ Resolution → ICMPv4 error → UDP NAT → TCP NAT → firewallのpermitを全取得
+→ 全permitを失敗不能commitしてold worker-local stateをflush/rebind
+→ active candidateを最後に置換してgeneration/tick/authorityを同時にactive化
+→ matched guardを解放し、退避したold candidateをdropする
+→ typed apply reportを返し、new active viewのbudgetで同じtickのRXを再開
+```
+
+raw guardをexact ownerへ照合するsafe entryはruntime-owned `try_publish_candidate`だけです。照合済み
+`MatchedPublicationQuiescenceGuard`を受け取るexternal adapter hookは
+`unsafe fn publish_candidate_authorized`で、safe callerがmatchを省略するdirect pathはありません。inner backendの
+`PublicationQuiescenceBackend`実装が、事前alias、`Arc`/shared physical resource、interior mutabilityを含む
+全authoritative ownershipを`check_publication_quiescence`で、現在I/O可否を`current_io_disposition`で、check
+error後のI/O可否を`quiescence_error_disposition`で正確に報告し、一度返した`Stop`をbackend valueの寿命中
+terminalに保つことがsemantic trust境界です。shared stateをこれらの報告から隠してはなりません。inner traitは
+identity、guard constructor、binding accessorを持ちません。
+
+`BoundPublicationBackend`はimmutable inspection以外のgeneric `&mut I`、consuming extraction、whole innerの
+move/replace/swap seamをsafeに公開しません。backend固有のmutationは`unsafe trait PublicationBackendControl`の
+closed command/responseへ限定し、safeな`execute_backend_command`はaudited `unsafe impl`へ依存します。その
+Safety contractは、whole innerをmove/replace/swap/returnしないこと、authoritative stateへの独立mutable aliasを
+作らないこと、hidden/shared stateをquiescence対象から切り離さないこと、check/current/error dispositionを正しく
+分類すること、terminalな`Stop`となったbackend valueを再利用しないことです。したがってtyped commandの正当性は
+単なるsafe traitのsemantic trustではなく、publication authorityを保つunsafe implementation trust boundaryです。
+`SimIo`はclosed enumとquiescence visibilityを根拠に局所的な`SAFETY` comment付き`unsafe impl`を持ち、
+`BoundSimIoControl`はinject、RX/TX queue inspection、TX/recycle dequeueだけをsafeに公開します。
+
+preflight途中の失敗は先行permitを無変更でdropし、旧active/runtimeとexact candidate ownershipを
+保持してbackend guardを解放します。candidate入力だけに起因する`InvalidSuccessor`/`RestartRequired`は
+`ContinueOldIo`です。既存runtime/authorityのcoherence failureはcauseをownerへpersistentにlatchし、現tickと
+candidate-freeな後続tickの全phaseを`ActivePublicationInvalid`で停止します。foreign same-type backendは
+quiescenceより前にcandidateの有無を保った`BackendMismatch`となり、ownerをpoisonしません。
+interface bindingまたはstorage shapeが変わるcandidateはcommitせずtyped `RestartRequired`を返します。
+native interface/backend resourceを切り替える後続sliceでは、失敗し得るallocation、socket/mmap/bind/attachを
+candidate側でcold prepareし、guard下commitを失敗不能なowned resource swapだけに限定します。容量変更は
+in-place resizeせずrestart executionへ送り、rollbackは古いgeneration/hash keyを再利用せず、旧内容から
+higher generation/fresh keyの新publicationを作ります。
 
 ### Operability minimum
 
@@ -376,8 +509,10 @@ in-place resizeせずrestart-requiredとする。rollbackは古いgeneration/has
 - reload: plan、apply result、flushed state数、restart-required reason
 - shutdown: RX停止、generated/TX flushまたはtyped reject、descriptor回収、program detach policy
 
-packet pathでlog messageをformatしない。typed counters/eventsをworker-local fixed storageへ
-記録し、control threadがtick boundary後にsnapshotして文字列化する。
+library-level successor applyはprevious/new generationと全5 serviceのflush reportをtyped resultとして
+返します。operator向けsnapshot、structured log、CLI表示、persistent historyへのexportはR15/R12の
+後続です。packet pathでlog messageをformatせず、typed counters/eventsをworker-local fixed storageへ
+記録し、control threadがtick boundary後にsnapshotして文字列化します。
 
 ## Test、CI、benchmark progression
 

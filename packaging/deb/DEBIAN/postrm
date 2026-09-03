@@ -1,0 +1,27 @@
+#!/bin/sh
+set -e
+
+case "${1:-}" in
+    purge)
+        # A normal remove intentionally keeps the conffile.  Only an
+        # explicit purge removes it, and the directory is removed only when
+        # it is empty so unrelated operator files are retained.
+        rm -f /etc/ruster/config.toml
+        rmdir /etc/ruster 2>/dev/null || :
+        ;;
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|abort-deconfigure)
+        ;;
+esac
+
+case "${1:-}" in
+    remove|purge)
+        if command -v systemctl >/dev/null 2>&1 \
+            && [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || :
+        fi
+        ;;
+esac
+
+# The ruster service identity is intentionally retained.  It may own files
+# kept by an operator and preserving its UID/GID avoids reuse surprises.
+exit 0

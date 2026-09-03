@@ -1,0 +1,37 @@
+#!/bin/sh
+set -e
+
+case "${1:-}" in
+    configure|reconfigure)
+        if ! getent group ruster >/dev/null 2>&1; then
+            groupadd --system ruster
+        fi
+
+        if ! getent passwd ruster >/dev/null 2>&1; then
+            useradd --system \
+                --gid ruster \
+                --no-create-home \
+                --home-dir /nonexistent \
+                --shell /usr/sbin/nologin \
+                ruster
+        fi
+
+        install -d -o root -g ruster -m 0750 /etc/ruster
+        if [ -f /etc/ruster/config.toml ]; then
+            chown root:ruster /etc/ruster/config.toml
+            chmod 0640 /etc/ruster/config.toml
+        fi
+
+        # A package install must also work in a chroot or on a non-systemd
+        # host.  A failed reload is therefore non-fatal when systemd is not
+        # running; an operator can reload it after booting the host.
+        if command -v systemctl >/dev/null 2>&1 \
+            && [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || :
+        fi
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,86 @@
+[Unit]
+Description=ruster packet forwarding daemon
+# AF_PACKET binding needs the host's normal network setup to be available.
+Wants=network-online.target
+After=network-online.target
+
+# Do not start when the expected configuration file is absent.  This condition
+# checks existence only; ruster itself reports unreadable or invalid contents.
+# A missing configuration is an operator/setup issue, not a restartable crash.
+ConditionPathExists=/etc/ruster/config.toml
+
+# Bound automatic retries if an abnormal failure persists.  Manual starts are
+# still available after the limit and can be used once the cause is fixed.
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=notify
+# READY=1 and watchdog messages are emitted by the service's main process.
+NotifyAccess=main
+ExecStart=/usr/bin/ruster run /etc/ruster/config.toml
+ExecReload=/bin/kill -HUP $MAINPID
+
+# on-abnormal restarts crashes, watchdog expiry, and forced termination, but
+# does not loop on a clean SIGTERM/exit 0 or on a normal config/permission
+# error reported as a non-zero exit status.  RestartSec and the start limit
+# keep repeated abnormal failures from becoming a tight restart loop.
+Restart=on-abnormal
+RestartSec=5s
+
+# The daemon's SHUTDOWN_QUIESCENCE_TIMEOUT_SECS is currently 5s.  Ordered
+# shutdown may use all 5s while waiting for publication quiescence. 10s is
+# therefore 5s maximum wait + 5s margin for signal handling, final cleanup,
+# and scheduler/service-manager overhead, and is intentionally greater than
+# the daemon-side bound.
+TimeoutStopSec=10s
+# SIGTERM is the signal handled by the CLI's ordered-shutdown path, allowing
+# it to notify systemd with STOPPING=1 before waiting for quiescence.
+KillSignal=SIGTERM
+
+# systemd exports WATCHDOG_USEC=30,000,000 for this setting.  The CLI sends
+# WATCHDOG=1 at half that period (15s), leaving the other half as detection
+# margin.  Its heartbeat is tied to successful tick-loop progress.
+WatchdogSec=30s
+
+# AF_PACKET SOCK_RAW needs only CAP_NET_RAW.  No CAP_NET_ADMIN or root-wide
+# capability set is granted; if_nametoindex and notify's AF_UNIX datagram do
+# not require additional capabilities.
+User=ruster
+Group=ruster
+# The default control socket is created below /run/ruster.  Let systemd create
+# the runtime directory with the same owner/group before ExecStart.
+RuntimeDirectory=ruster
+RuntimeDirectoryMode=0750
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+
+# Prevent privilege gains through later execve calls while retaining the
+# explicitly assigned ambient CAP_NET_RAW needed by the packet backend.
+NoNewPrivileges=yes
+
+# The daemon reads its config and executable but does not need to modify the
+# host OS tree.  Keep /usr, /boot, and /etc read-only in its mount namespace.
+ProtectSystem=strict
+# The service has no need for user home directories or their credentials.
+ProtectHome=yes
+# Isolate temporary-file state without affecting the host network or notify
+# socket; the daemon has no required shared /tmp contract.
+PrivateTmp=yes
+
+# The daemon neither changes kernel tunables/modules/cgroups nor creates
+# namespaces.  These restrictions reduce unrelated kernel control surfaces.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+# No setuid/setgid transitions or personality changes are needed by ruster.
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+# Deliberately omit RestrictAddressFamilies: the backend needs AF_PACKET, the
+# notify protocol needs AF_UNIX, and libc's if_nametoindex may use AF_NETLINK.
+# An incomplete allow-list would make a valid interface bind fail.
+
+[Install]
+WantedBy=multi-user.target

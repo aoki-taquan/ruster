@@ -1,0 +1,83 @@
+name: R17 Benchmark Smoke
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  r17-deterministic:
+    name: R17 Deterministic Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+
+      - name: Verify canonical benchmark specification
+        run: scripts/check-benchmark-spec.sh
+
+      - name: Test benchmark specification verifier
+        run: scripts/test-check-benchmark-spec.sh
+
+      - name: Print compiled benchmark specification SHA
+        run: scripts/print-benchmark-spec.sh
+
+      - name: Run focused ruster-bench tests
+        run: timeout --signal=TERM --kill-after=30s 5m cargo test --locked -p ruster-bench --all-targets --all-features
+
+      - name: Generate two deterministic smoke artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="${RUNNER_TEMP}/r17-benchmark-smoke"
+          mkdir -p "${artifact_dir}"
+          timeout --signal=TERM --kill-after=30s 5m \
+            cargo run --locked --release -p ruster-bench -- \
+            --suite deterministic-smoke --format jsonl \
+            --seed 0x5eed020000000001 --logical-time-ms 1000 \
+            >"${artifact_dir}/run-1.jsonl"
+          timeout --signal=TERM --kill-after=30s 5m \
+            cargo run --locked --release -p ruster-bench -- \
+            --suite deterministic-smoke --format jsonl \
+            --seed 0x5eed020000000001 --logical-time-ms 1000 \
+            >"${artifact_dir}/run-2.jsonl"
+          cmp -- "${artifact_dir}/run-1.jsonl" "${artifact_dir}/run-2.jsonl"
+          echo "R17_SMOKE_ARTIFACT_DIR=${artifact_dir}" >>"${GITHUB_ENV}"
+
+      - name: Validate exact case order and spec binding
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=30s 2m \
+            cargo run --locked -p ruster-bench -- \
+            --validate-artifact "${R17_SMOKE_ARTIFACT_DIR}/run-1.jsonl"
+
+      - name: Upload deterministic smoke artifact
+        if: ${{ success() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: r17-deterministic-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.R17_SMOKE_ARTIFACT_DIR }}/run-1.jsonl
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          overwrite: false
+          include-hidden-files: false

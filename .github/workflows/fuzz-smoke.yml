@@ -49,7 +49,7 @@ jobs:
   r16a-bounded:
     name: R16A Bounded
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -63,9 +63,62 @@ jobs:
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' }}
         run: >-
           timeout --signal=TERM --kill-after=30s 8m
-          cargo test --locked -p ruster-io-sim
+          cargo +1.97.1 test --locked -p ruster-io-sim
           --test security_property_smoke r16a_bounded_smoke --
           --ignored --exact --nocapture --test-threads=1
+
+      - name: Run short R16A state contract
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' }}
+        run: >-
+          timeout --signal=TERM --kill-after=30s 3m
+          cargo +1.97.1 test --locked -p ruster-io-sim
+          --test security_property_smoke r16a_state_property_contract_smoke --
+          --exact --nocapture --test-threads=1
+
+      - name: Run NAT/FW state property smoke
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' }}
+        run: >-
+          timeout --signal=TERM --kill-after=30s 3m
+          cargo +1.97.1 test --locked -p ruster-io-sim
+          --test security_property_smoke r16a_state_property_smoke --
+          --ignored --exact --nocapture --test-threads=1
+
+      - name: Run publication property smoke
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' }}
+        run: >-
+          timeout --signal=TERM --kill-after=30s 3m
+          cargo +1.97.1 test --locked -p ruster-integration
+          --test r16_property_smoke r16_publication_property_smoke --
+          --ignored --exact --nocapture --test-threads=1
+
+      - name: Run publication transaction and terminal exact gates
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=30s 3m cargo +1.97.1 test --locked -p ruster-integration --lib tests::successful_successor_reuses_all_backings_flushes_old_state_and_reports_counts -- --exact --nocapture --test-threads=1
+          timeout --signal=TERM --kill-after=30s 3m cargo +1.97.1 test --locked -p ruster-integration --lib tests::firewall_preflight_failure_drops_prior_permits_and_preserves_transaction_state -- --exact --nocapture --test-threads=1
+          timeout --signal=TERM --kill-after=30s 3m cargo +1.97.1 test --locked -p ruster-integration --lib publication::tests::finish_publication_drops_quiescence_before_retired_value -- --exact --nocapture --test-threads=1
+          timeout --signal=TERM --kill-after=30s 3m cargo +1.97.1 test --locked -p ruster-integration --lib publication::tests::finish_publication_preserves_drop_order_during_guard_unwind -- --exact --nocapture --test-threads=1
+          timeout --signal=TERM --kill-after=30s 3m cargo +1.97.1 test --locked -p ruster-runtime --lib tests::applied_candidate_rechecks_terminal_backend_before_data_phases -- --exact --nocapture --test-threads=1
+          timeout --signal=TERM --kill-after=30s 3m cargo +1.97.1 test --locked -p ruster-runtime --lib tests::rejected_candidate_rechecks_terminal_backend_before_data_phases -- --exact --nocapture --test-threads=1
+
+      - name: Run quiescence exact gates
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=30s 3m cargo +1.97.1 test --locked -p ruster-io-sim --test publication_quiescence ordinary_batch_drop_releases_quiescence_without_scalar_proof -- --exact --nocapture --test-threads=1
+          timeout --signal=TERM --kill-after=30s 3m cargo +1.97.1 test --locked -p ruster-io-sim --test publication_quiescence forgotten_rx_batch_is_a_sticky_typed_quiescence_failure -- --exact --nocapture --test-threads=1
+          timeout --signal=TERM --kill-after=30s 3m cargo +1.97.1 test --locked -p ruster-io-sim --test publication_quiescence forgotten_generated_batch_is_a_sticky_typed_quiescence_failure -- --exact --nocapture --test-threads=1
+
+      - name: Run fixed regression corpus smoke
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' }}
+        run: >-
+          timeout --signal=TERM --kill-after=30s 3m
+          cargo +1.97.1 test --locked -p ruster-io-sim
+          --test security_property_smoke r16a_past_regression_corpus_is_exact --
+          --exact --nocapture --test-threads=1
 
       - name: Run exact seed range
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.target != 'all' }}
@@ -76,7 +129,7 @@ jobs:
           RUSTER_R16A_CASES: ${{ inputs.cases }}
         run: >-
           timeout --signal=TERM --kill-after=30s 8m
-          cargo test --locked -p ruster-io-sim
+          cargo +1.97.1 test --locked -p ruster-io-sim
           --test security_property_smoke r16a_bounded_smoke --
           --ignored --exact --nocapture --test-threads=1
 

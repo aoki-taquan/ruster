@@ -8,16 +8,28 @@ active treeは、そのコードを継承しないv0.2のゼロベース実装�
 ## v0.2 bootstrap
 
 active treeは、外部依存を持たないpacket core、bounded worker runtime、sim I/O、
-benchmark harness、I/O conformance、AF_XDP ownership modelで構成します。
-data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control-planeの
-`ruster-config`だけは、保守されているSerde/TOML parserを最小featureで利用します。
+benchmark harness、I/O conformance、AF_XDP ownership modelに加え、cold config/controlと
+one-wayなintegration composition layerで構成します。data-plane、runtime、integration、I/Oの
+library crateは外部依存を持ちません。cold control-planeの`ruster-config`だけは、保守されている
+Serde/TOML parserを最小featureで利用します。
 
 - `ruster-config`: 最大1 MiBのUTF-8 TOMLをschema versionでpredispatchし、V1の
   interface/address/route/neighbor/NAT44/firewall/capacity/tick budget DTOへexact decode
   する。unknown/duplicate field、runtime生成値、過大listをvalue-freeなtyped diagnosticで
   fail-closeする。cold semantic validationはcanonicalなowned core値、connected route、
   cross-reference/on-link検証、policy/NAT/firewall検証、全runtime storage shapeを作る。
-  publication identity、fresh secret、plan/applyはまだ持たない。
+  publication非依存の`into_parts`はvalidated table/rule Boxを再確保せず後段へmoveする。
+  generation、hash key、publication型、runtime allocation、activation、applyは持たない。
+- `ruster-control`: `ValidatedConfigV1`とcaller-supplied generation/typed hash keyをconsumeし、
+  forwarding tableとfirewall rulesをclone/reallocationなしで`PublicationPlan`へmoveする。
+  full-service欠落はstable typed failureで拒否してconfig/inputs ownershipを返す。interface metadata、
+  tick、required runtime bytesは同じgenerationへtagしたopaque planへ保持する。planner-produced
+  `FullServicePlanV1`では、metadataを保持するpublic consuming transitionは不可分なcandidate
+  transitionだけであり、publication authorityをmintしてmetadataと一緒に保持する。このplanner pathの
+  mint失敗はplanをconsumeする。public `FullServiceCandidateError`はprocess-lifetime terminalな
+  forwarding/firewall publication nonce exhaustionを区別し、その他のlower-level validation errorは
+  caller-correctableでないvalue-freeな`InternalInvariantViolation`へcollapseする。activation/apply
+  failureではない。key生成・全履歴freshness証明、activation、applyは未実装。
 - `ruster-core`: backend所有packetを借用し、Ethernet II / IPv4検証、LPM、
   TTL/checksum/MAC rewrite、local IPv4向けARP reply、static neighbor miss時の
   ARP Request生成action、fixed-capacity dynamic ARP cache、local ICMPv4 Echo
@@ -31,7 +43,9 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
   overlap/gap/overflow/実address alignmentまで検証し、後続state machine用metadataを
   resource取得前のcold pathで固定長preallocateする。内部TX engineはfixed frameへexact
   one-copyでpublishし、FIFO completionとendpoint単位のnonblocking kickをboundedに処理する。
-  現時点ではPacketIoとRX pathを未接続。
+  `AfPacketIo`としてcore `PacketIo`を実装し、USER所有TPACKET_V3 blockに対する
+  zero-copy RX leaseとTX engineを結合する。検証はscripted kernel seamによる
+  model levelのみで、実NIC/privileged netnsでの実測は未実施。
   64-bit Linux、SOCK_RAW Ethernet II、PACKET_RESERVEなしのstrict profileで、TX
   requestのretire timeout/private/feature fieldsはzeroに限定する。RX private areaは
   kernel同様に8-byte alignした`BLK_PLUS_PRIV`を使い、宣言した最大Ethernet frameを
@@ -54,9 +68,45 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
   constructor、UMEM登録、
   ring設定・bind transaction、live session、libxdp link、core `PacketIo`接続はまだ持たず、
   FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
-- `ruster-runtime`: genericなpublication seamから一つのactive generationを借用し、
-  `RX → resolution timer → failure dispatch → generated ARP → generated ICMPv4`を
-  明示budget付きのsingle-worker tickとして実行する。
+- `ruster-runtime`: core-ownedな`BoundPublicationBackend<I>`とexact owner capabilityへbindした
+  publication seamから一つのactive generationを借用する。
+  `RX → resolution timer → failure dispatch → generated ARP → generated ICMPv4`をsingle-worker tickとして
+  実行する。`TickBudgets`はcallerの
+  独立引数ではなく、publication後のtick-local `FullServiceView`がactive generationと一緒に所有する。
+  safeな`try_publish_candidate`だけがraw quiescence guardをownerへ照合し、成功時だけopaque matched
+  guardで`unsafe`なadapter hookを呼ぶ。candidate reject/deferではexact candidateをcallerへ返し、
+  candidate-safe errorは旧active generationを継続する。active invariant failureはpersistentにlatchして
+  現tick以降の全data phaseを停止し、exact backend照合後は後続candidateをbackend quiescenceより前に同じ
+  latched typed causeでrejectする。quiescenceを経てcandidateがApplied/Rejectedになった後もdata phase前に
+  backendのcurrent I/O dispositionを再取得し、terminal `Stop`ならdata phaseをskipする。成功時は
+  `PublicationOutcome::Applied`でadapter固有のtyped reportを返す。`FullServicePublication`は`unsafe trait`で、
+  candidate provenance、atomic install、binding安定性、必須のimmutable `active_status`
+  （`Absent`/`ContinueOldIo`/`StopOldPublication`）をimplementorの監査契約として課す。backend mismatch判定は
+  この`active_status`だけを参照しmutableな`active()`は呼ばない。viewはprivate fieldでmutable runtimeを封じ、
+  authorityだけをread-onlyに公開する。`observability`moduleはallocation-freeでgeneration付きの
+  typed snapshot（`readiness`、firewall/UDP/TCP NAT44のsaturating累積とtickごとのhigh watermark、
+  backend固有統計を運ぶ拡張点`BackendObservabilityStats`）を提供し、生成自体はcold consumer向けの
+  formatを一切行わない。
+- `ruster-integration`: `ruster-control`、`ruster-core`、`ruster-runtime`の上にだけ依存する
+  composition root。candidateの21-array concrete shape/byte metadataを照合してexternal fixed
+  storageをfallibleに確保し、Resolution、ICMPv4 error、UDP/TCP NAT44、firewallとcandidateをunboundな
+  `FullServicePublicationOwner`へcold activateする。worker開始前に`bind_backend<I>`がfactory発行のexact
+  owner capabilityとbackendを受け取り、exact identity照合・quiescence成功・`current_io_disposition`が
+  `ContinueOldIo`であることを検証できた場合だけbackend-bound typestateへ移すfallible transitionを実行する。
+  失敗時はunbound ownerとbinding capabilityを`InitialBackendBindFailure`からretry可能な形のまま回収できる。
+  bound ownerだけがruntimeの`FullServicePublication`を実装する。storageはownerより長生きし、active viewは
+  generation-coherentかつsealedである。same-interface/same-shape successorは5 runtimeすべてを
+  mutation-freeにpreflightし、全permitが揃った後だけinfallible commitしてcandidateを最後にswapする。
+  旧candidateの所有allocationはbackend quiescence guard解放後にdropする。`FullServiceApplyReport`は
+  旧/新generationと各serviceのflush reportを返す。interface bindingまたはstorage shape変更はexact
+  candidateを保持した`RestartRequired`であり、prepared backend/native interface resource swap、
+  AF_PACKET/XDP接続、capacity rebuild、rollback UXは後続である。
+- `ruster-sim-scenario`: `ruster-config`/`ruster-control`/`ruster-runtime`/`ruster-integration`/
+  `ruster-io-sim`のpublic full composition APIだけを経由してmulti-tickのdeterministic router
+  scenarioを駆動する。ingress frameとtyped outcomeはpacket pathに`String`を使わず、呼び出し側が
+  与える論理clock（`MonotonicMillis`）だけで進み、wall clockを読まない。LAN内ARP解決/転送、
+  WAN route経由のUDP/TCP NAT44、firewall allow/deny、複数tickのdynamic neighbor解決、TTL超過と
+  ARP解決失敗によるICMPv4生成、同一scenarioの完全なbyte/順序一致replayをgolden fixtureとして持つ。
 
 ```text
 inject Vec<u8>
@@ -209,27 +259,87 @@ UDP/TCP NAT44、firewall、router-originated ICMPv4 errorを同じworkerへbind�
 silentのままで、認可後のeligible TTL expiryはSNAT前の受信IPv4をquoteしてactionをqueueします。
 RX batchとgenerated TXは融合せず、既定のworker tick順どおりRX完了後に生成します。生成packet
 そのものはfirewallの対象外です。既存のICMP runtimeを取らないcombined APIは変更しません。
-`ruster-runtime`はcandidate publicationをtick先頭でatomicに試し、reject時は旧active
-publicationで継続します。active publicationがなければbackendへ触れず全data phaseをtyped
-skipします。RX batchはfull composition wrapperへmoveされ、そのborrowが終了した後だけ
-generated sessionを開始します。各phase reportは固定サイズで、RX errorとgenerated error、
-clock regression、budget exhaustion、allocation/build/finish/accounting failureを区別します。
-backendのTX acceptedはdescriptor publicationであり、wire送信やcompletion queue返却を
-意味しません。tick-local `FullServiceView`は非ゼロgenerationを持ち、UDP/TCP NAT44と
-firewallの各configを対応するoptional runtimeとnested viewで対にします。resolutionと
-generated ICMP runtimeは直接borrowのままです。現行core full wrapperは3 configを必須とする
-ため、service pair全体の不在表現はoptional-config composition seamを追加する後続作業です。
-candidateがあるtickだけ、backendはboundedな所有状態からpublication quiescenceを検証し、
-exact `&mut backend`を保持するsealed GAT guardをpublicationへ渡します。unfinished RX/generated
-batch、terminal action未完了のleased slot、またはcompletion待ちTXがあればcandidateを
-publicationへ渡さず、backendのtyped dispositionを伴う`Deferred`とします。Simではaccepted TX
-completion待ちだけが旧activeでI/Oを継続でき、unfinished batchまたはterminal未完了leaseは
-旧activeを保持したままRX、timer、failure、generatedの全data phaseをskipします。backendは
-candidateなしのtickにもboundedなread-only current-I/O dispositionを返し、明示的なownership
-回収まで`SkipIo`を維持し、`Stop`はbackend valueの寿命中terminalです。このためstickyな
-forgotten batch/leaseを次tickで再進入しません。未知errorは保守的にI/Oをskipし、candidateなしの
-steady tickはquiescence guard checkを行いません。Sim backendの出力queue完了は保守的なmodelで
-あり、AF_XDP CQ drainを実装・証明したものではありません。
+ICMPv4 error publication preflightはstate側の`action_slot`とaction側の`state_index`による双方向
+backreferenceを検証します。action arrayを2回、state arrayを1回だけ走査する`O(A + S)`境界で、
+nested searchを行いません。commitも各arrayを1回clearする線形処理で、corruption rejectionとpermit
+Dropはruntimeを変更しません。
+`ruster-runtime`はcandidate publicationをtick先頭でatomicに試し、成功時はadapter固有の
+typed apply reportを`PublicationOutcome::Applied(report)`で返します。candidate-safe rejectは旧active
+publicationで継続しますが、active runtime/authority invariant failureは`StopOldPublication`として
+persistentにlatchし、exact backend照合直後・quiescence要求より前にこのlatchを同じtyped causeで優先
+rejectします。rejectしたtickとcandidate-freeな後続tickの全data phaseをtyped skipします。quiescenceを
+経てcandidateがApplied/Rejectedになった後もdata phase前にbackendのcurrent I/O dispositionを再取得し、
+terminal `Stop`ならdata phaseをskipします。active publicationがなければpacket I/Oを開始せず同様に
+skipします。presence/skip判断は必須のimmutable`active_status`（`Absent`/`ContinueOldIo`/
+`StopOldPublication`）だけを参照し、mutableな`active()`は呼びません。RX batchはfull composition wrapperへ
+moveされ、そのborrowが終了した後だけgenerated sessionを開始します。
+各phase reportは固定サイズで、RX errorとgenerated error、clock regression、budget exhaustion、
+allocation/build/finish/accounting failureを区別します。backendのTX acceptedはdescriptor publicationで
+あり、wire送信やcompletion queue返却を意味しません。tick-local `FullServiceView`は非ゼロgenerationと
+そのgenerationの`TickBudgets`を48-byte値`ActiveTickAuthority`へ集約して1本の参照で持ち、
+`run_tick`はpublication phase後にborrowしたactive viewからbudgetを得ます。したがって同じtickでも
+Appliedは新generationのbudget、`ContinueOldIo`のRejected/DeferredとUnchangedは継続中generationのbudgetを
+使い、`StopOldPublication`および post-attempt `BackendStopped`ではdata phaseを実行しません。successor
+適用時はcandidate-last swap直前に`ActiveTickAuthority`全体を一体更新するため、generationとbudgetは常に
+coherentです。UDP/TCP NAT44とfirewallの各configは対応するoptional runtimeと
+nested viewで対にし、resolutionとgenerated ICMP runtimeは直接borrowのままです。現行core full wrapperは
+3 configを必須とするため、service pair全体の不在表現はoptional-config composition seamを追加する
+後続作業です。
+`ruster-integration`のinitial pathはvalidated planner candidateにbindしたexternal fixed storageを
+fallibleに確保し、shapeとconcrete byte totalをruntime constructorより前に照合します。成功時はまず
+5 service runtimeとcandidateをunbound ownerへcold activateし、worker開始前に
+`bind_publication_backend`が発行したexact owner capabilityとbackendを`bind_backend<I>`へ渡します。
+`bind_backend`はexact identity照合・backend quiescence成功・`current_io_disposition`が`ContinueOldIo`で
+あることを検証できた場合だけbackend-bound typestateへ移すfallible transitionで、失敗時はunbound owner/
+binding capabilityを`InitialBackendBindFailure`からretry可能な形のまま回収できます。このbound owner
+だけがruntime publicationを実装し、rootless`SimIo` tickから同じgenerationをborrowします。`SimIo::new`と
+`Default`はpacket/quiescence単体用途のstandalone inner backendであり、publication pathでは必ずfactoryが
+返す`BoundPublicationBackend<SimIo>`を使います。shape/byte precheck failureはstorageを変更せずexact
+candidateを返します。一方、constructor開始後のlate TCP failureではcandidate ownershipは返りますが、
+先行runtimeによるstorage初期化やUDP process identity消費はrollbackしないterminal boundaryです。
+successor pathは同じinterface bindingと21-array storage shapeに限定し、Resolution、ICMPv4 error、
+UDP/TCP NAT44、firewallの全preflightが成功するまで旧runtimeとcandidateを変更しません。その後の5
+commitはinfallibleで、active candidateを最後にswapし、旧candidateはbackend guard解放後にdropして、
+旧/新generationと各service flushをtyped reportで返します。interface/storage変更はcandidate-preserving
+`RestartRequired`です。prepared backend/native interface resource swap、AF_PACKET/XDP backend接続、
+capacity rebuild、rollback-as-new-generationのoperator UXは後続です。
+
+`bind_publication_backend`はinner backendをconsumeするcore-ownedな`BoundPublicationBackend<I>`と、
+そのexact wrapperだけに対応するmove-only owner capabilityを返します。private `NonZeroU64` identityの
+採番はallocation-freeなchecked monotonic counterで、最後の値の後はtyped
+`PublicationBindingIdentityExhausted`となり、wrap、回復、identity再利用によるABAを許しません。
+wrapperはimmutable inspection以外のgeneric `&mut I`やconsuming extractionをsafeに公開せず、whole innerを
+move、replace、swapするgeneric seamも持ちません。backend固有のmutationは
+`unsafe trait PublicationBackendControl`のclosed command/responseをsafeな`execute_backend_command`経由で
+実行します。このsafe methodはaudited `unsafe impl`へ依存します。各implementationはwhole innerの
+move/replace/swap/return、
+authoritative stateへの独立mutable alias、hidden/shared stateのquiescence対象からの切離し、
+`check_publication_quiescence`/`current_io_disposition`/`quiescence_error_disposition`の誤分類、一度`Stop`となった
+backend valueの再利用を禁止するpublication-authority contractを守らなければなりません。これはmemory safety
+ではなくunsafe implementation trust boundaryです。`SimIo`は局所的な`SAFETY`根拠を付けた`unsafe impl`を持ち、
+`BoundSimIoControl`はinject、RX/TX queue inspection、TX/recycle dequeueだけをsafeに公開して、owned `SimIo`や
+独立mutable aliasを返しません。
+
+runtimeはcandidate有無を調べる前にownerとbackendを照合します。same-typeのforeign wrapperなら
+candidateを`Option`のままexactに保持した`BackendMismatch`とし、quiescence、publication hook、RX、timer、
+failure、generatedの全phaseを実行せず、そのtickだけfail-closeします。ownerのactive healthはpoisonしません。
+
+exact backendにcandidateがあるtickだけ、sealedな`PublicationQuiescence`がinner backendの
+`PublicationQuiescenceBackend::check_publication_quiescence`を呼びます。inner `I`はfactoryへ渡す前から
+alias、`Arc`で共有したstate/physical resource、interior mutabilityを持ち得ます。backend実装がそれらを
+含むauthoritative ownershipを`check_publication_quiescence`で、現在I/O可否を
+`current_io_disposition`で、check error後のI/O可否を`quiescence_error_disposition`で正確に報告し、
+一度返した`Stop`をbackend valueの寿命中terminalに保つことがsemantic trust境界です。shared stateを
+これらの報告から隠してはなりません。check成功後、core-owned raw guardをowner capabilityがidentity
+照合してopaqueな`MatchedPublicationQuiescenceGuard`へ変換します。safeな
+`try_publish_candidate`だけがこの照合を行い、成功時だけexternal adapterの
+`unsafe fn publish_candidate_authorized`を呼べます。unfinished RX/generated batch、terminal action未完了の
+leased slot、またはcompletion待ちTXがあればcandidateをadapterへ渡さず、backendのtyped dispositionを伴う
+`Deferred`とします。Simではaccepted TX completion待ちだけが旧activeでI/Oを継続でき、unfinished batch
+またはterminal未完了leaseは旧activeを保持したまま全data phaseをskipします。candidateなしのtickはguardを
+取得せず、backendのboundedなread-only current-I/O dispositionを使います。`SkipIo`は明示的なownership
+回収まで継続し、`Stop`はbackend valueの寿命中terminalです。未知errorは保守的にI/Oをskipします。Sim
+backendの出力queue完了は保守的なmodelであり、AF_XDP CQ drainを実装・証明したものではありません。
 
 ## 開発
 

@@ -1,0 +1,10 @@
+Package: ruster
+Version: 0.2.0-1
+Section: net
+Priority: optional
+Architecture: amd64
+Depends: libc6, libgcc-s1
+Maintainer: Ruster developers <ruster@example.invalid>
+Description: packet forwarding daemon
+ ruster is a Rust packet forwarding daemon for Linux AF_PACKET interfaces.
+ It provides bounded packet processing with a systemd service integration.
