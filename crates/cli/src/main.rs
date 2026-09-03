@@ -422,11 +422,69 @@ fn successor_generation(current: NonZeroU64) -> Result<NonZeroU64, String> {
         .ok_or_else(|| "publication generation is exhausted".to_owned())
 }
 
+/// A validated reload input kept until the active identity comparison finishes.
+///
+/// The source bytes are retained only on the cold reload path. They are read
+/// and validated before the identity comparison, so an invalid file can never
+/// be treated as an unchanged reload.
+#[cfg(target_os = "linux")]
+struct LoadedReloadConfig {
+    source: Vec<u8>,
+    config: ValidatedConfigV1,
+}
+
+/// The active configuration identity used by the daemon reload boundary.
+///
+/// Identity is deliberately exact source bytes, after successful parse and
+/// semantic validation. This conservative rule treats formatting/comments or
+/// source-order changes as a changed reload; it avoids claiming equivalence
+/// that this layer cannot prove and keeps the active identity independent of
+/// publication keys and runtime storage. The bytes are compared only on the
+/// cold control path, never in packet processing.
+#[cfg(target_os = "linux")]
+struct ActiveConfigIdentity {
+    source: Box<[u8]>,
+}
+
+#[cfg(target_os = "linux")]
+impl ActiveConfigIdentity {
+    fn from_source(source: Vec<u8>) -> Self {
+        Self {
+            source: source.into_boxed_slice(),
+        }
+    }
+
+    fn matches(&self, source: &[u8]) -> bool {
+        self.source.as_ref() == source
+    }
+}
+
+/// A validated config comparison result. `Unchanged` is the reload equivalent
+/// of the runtime's candidate-free `PublicationOutcome::Unchanged`: it carries
+/// no candidate, key input, or storage allocation.
+#[cfg(target_os = "linux")]
+enum ReloadConfigPlan {
+    Unchanged,
+    Changed(Box<LoadedReloadConfig>),
+}
+
+#[cfg(target_os = "linux")]
+fn classify_reload_config(
+    active: &ActiveConfigIdentity,
+    loaded: LoadedReloadConfig,
+) -> ReloadConfigPlan {
+    if active.matches(&loaded.source) {
+        ReloadConfigPlan::Unchanged
+    } else {
+        ReloadConfigPlan::Changed(Box::new(loaded))
+    }
+}
+
 /// Test-only wrapper that derives fresh successor inputs before planning.
 ///
-/// The daemon loop calls `prepare_successor_candidate_with_inputs` directly so
-/// it can reuse one generator across reloads; this keeps the
-/// derive-then-plan sequence itself covered by tests.
+/// Production reloads compare a validated source identity before entering this
+/// helper. Tests for the changed path use it directly to retain coverage of
+/// the derive-then-plan sequence.
 #[cfg(all(target_os = "linux", test))]
 fn prepare_successor_candidate(
     path: &str,
@@ -436,23 +494,6 @@ fn prepare_successor_candidate(
     let config = load_and_validate(path)?;
     let plan_inputs = inputs.successor_inputs(generation)?;
     prepare_successor_candidate_from_config(config, plan_inputs)
-}
-
-#[cfg(target_os = "linux")]
-fn prepare_successor_candidate_with_inputs(
-    path: &str,
-    generation: NonZeroU64,
-    plan_inputs: FullServicePlanInputs,
-) -> Result<ruster_control::FullServiceCandidateV1, String> {
-    let config = load_and_validate(path)?;
-    let candidate = prepare_successor_candidate_from_config(config, plan_inputs)?;
-    if candidate.generation() != generation {
-        return Err(format!(
-            "reload candidate generation {} did not match requested generation {generation}",
-            candidate.generation()
-        ));
-    }
-    Ok(candidate)
 }
 
 #[cfg(target_os = "linux")]
@@ -467,24 +508,44 @@ fn prepare_successor_candidate_from_config(
 }
 
 #[cfg(target_os = "linux")]
-fn start_reload_preparation(
-    path: &str,
-    generation: NonZeroU64,
-    plan_inputs: FullServicePlanInputs,
-) -> Result<ReloadPreparation, String> {
+fn start_reload_preparation(path: &str) -> Result<ReloadPreparation, String> {
     let (sender, receiver) = mpsc::sync_channel(1);
     let path = path.to_owned();
     std::thread::Builder::new()
         .name("ruster-reload".to_owned())
         .spawn(move || {
-            let result = prepare_successor_candidate_with_inputs(&path, generation, plan_inputs);
+            let result = load_reload_config(&path);
             let _ = sender.send(result);
         })
         .map_err(|error| format!("cannot start reload worker: {error}"))?;
-    Ok(ReloadPreparation {
-        generation,
-        result: receiver,
-    })
+    Ok(ReloadPreparation::Config { result: receiver })
+}
+
+#[cfg(target_os = "linux")]
+fn start_reload_candidate_preparation(
+    config: ValidatedConfigV1,
+    generation: NonZeroU64,
+    plan_inputs: FullServicePlanInputs,
+) -> Result<std::sync::mpsc::Receiver<Result<ruster_control::FullServiceCandidateV1, String>>, String>
+{
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("ruster-reload-plan".to_owned())
+        .spawn(move || {
+            let result = prepare_successor_candidate_from_config(config, plan_inputs);
+            let result = result.and_then(|candidate| {
+                if candidate.generation() != generation {
+                    return Err(format!(
+                        "reload candidate generation {} did not match requested generation {generation}",
+                        candidate.generation()
+                    ));
+                }
+                Ok(candidate)
+            });
+            let _ = sender.send(result);
+        })
+        .map_err(|error| format!("cannot start reload planner: {error}"))?;
+    Ok(receiver)
 }
 
 /// Maps the static successor plan into the reload decisions handled by the
@@ -646,9 +707,15 @@ impl ReloadObservability {
 }
 
 #[cfg(target_os = "linux")]
-struct ReloadPreparation {
-    generation: NonZeroU64,
-    result: std::sync::mpsc::Receiver<Result<ruster_control::FullServiceCandidateV1, String>>,
+enum ReloadPreparation {
+    Config {
+        result: std::sync::mpsc::Receiver<Result<LoadedReloadConfig, String>>,
+    },
+    Candidate {
+        generation: NonZeroU64,
+        identity: ActiveConfigIdentity,
+        result: std::sync::mpsc::Receiver<Result<ruster_control::FullServiceCandidateV1, String>>,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -675,15 +742,26 @@ fn classify_reload_publication<C, Q, A>(
     }
 }
 
-fn load_and_validate(path: &str) -> Result<ValidatedConfigV1, String> {
-    let bytes = read_config_bytes(path)?;
-    let parsed = parse(&bytes).map_err(|error| format_config_diagnostic(&error))?;
+fn validate_config_source(source: &[u8]) -> Result<ValidatedConfigV1, String> {
+    let parsed = parse(source).map_err(|error| format_config_diagnostic(&error))?;
     let validated =
         validate(parsed, VALIDATION_LIMITS).map_err(|error| format_validation_error(&error))?;
     match validated {
         ValidatedConfig::V1(config) => Ok(config),
         _ => Err("configuration schema is not supported by this binary".to_owned()),
     }
+}
+
+fn load_and_validate(path: &str) -> Result<ValidatedConfigV1, String> {
+    let bytes = read_config_bytes(path)?;
+    validate_config_source(&bytes)
+}
+
+#[cfg(target_os = "linux")]
+fn load_reload_config(path: &str) -> Result<LoadedReloadConfig, String> {
+    let source = read_config_bytes(path)?;
+    let config = validate_config_source(&source)?;
+    Ok(LoadedReloadConfig { source, config })
 }
 
 fn read_config_bytes(path: &str) -> Result<Vec<u8>, String> {
@@ -914,7 +992,9 @@ fn parse_run_sim_options(options: &[String]) -> Result<usize, String> {
 #[cfg(target_os = "linux")]
 fn run_path(path: &str) -> Result<(), String> {
     let observability_interval = observability_interval()?;
-    let config = load_and_validate(path)?;
+    let loaded = load_reload_config(path)?;
+    let active_config_identity = ActiveConfigIdentity::from_source(loaded.source);
+    let config = loaded.config;
     let mut input_generator = PlanInputGenerator::open()?;
     let inputs = input_generator.initial_inputs()?;
     let plan = plan_full_service_v1(config, inputs)
@@ -960,6 +1040,7 @@ fn run_path(path: &str) -> Result<(), String> {
                 resolution_interval_ms,
                 icmpv4_interval_ms,
                 input_generator,
+                active_config_identity,
                 &mut publication,
                 &mut io,
                 &mut quiescence,
@@ -983,6 +1064,7 @@ fn run_path(path: &str) -> Result<(), String> {
                     resolution_interval_ms,
                     icmpv4_interval_ms,
                     input_generator,
+                    active_config_identity,
                     publication,
                     backend,
                 )
@@ -1006,12 +1088,17 @@ fn run_path(path: &str) -> Result<(), String> {
     target_arch = "x86_64",
     target_pointer_width = "64"
 ))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the AF_XDP wrapper passes explicit lifecycle state to the shared runner"
+)]
 fn run_xdp_backend<'storage>(
     path: &str,
     observability_interval: std::time::Duration,
     resolution_interval_ms: u64,
     icmpv4_interval_ms: u64,
     input_generator: PlanInputGenerator,
+    active_config_identity: ActiveConfigIdentity,
     publication: FullServicePublicationOwner<'storage>,
     backend: ruster_config::ValidatedAfXdpBackendV1,
 ) -> Result<(), String> {
@@ -1103,6 +1190,7 @@ fn run_xdp_backend<'storage>(
             resolution_interval_ms,
             icmpv4_interval_ms,
             input_generator,
+            active_config_identity,
             &mut publication,
             &mut io,
             &mut quiescence,
@@ -1171,12 +1259,17 @@ fn run_xdp_backend<'storage>(
     target_os = "linux",
     not(all(target_arch = "x86_64", target_pointer_width = "64"))
 ))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the unsupported AF_XDP wrapper mirrors the shared runner signature"
+)]
 fn run_xdp_backend<'storage>(
     _path: &str,
     _observability_interval: std::time::Duration,
     _resolution_interval_ms: u64,
     _icmpv4_interval_ms: u64,
     _input_generator: PlanInputGenerator,
+    _active_config_identity: ActiveConfigIdentity,
     _publication: FullServicePublicationOwner<'storage>,
     _backend: ruster_config::ValidatedAfXdpBackendV1,
 ) -> Result<(), String> {
@@ -1576,6 +1669,7 @@ fn run_backend<'storage, I, E>(
     resolution_interval_ms: u64,
     icmpv4_interval_ms: u64,
     mut input_generator: PlanInputGenerator,
+    mut active_config_identity: ActiveConfigIdentity,
     publication: &mut BoundFullServicePublicationOwner<'storage, I>,
     io: &mut ruster_core::BoundPublicationBackend<I>,
     quiescence: &mut ShutdownQuiescenceState,
@@ -1605,6 +1699,7 @@ where
     let mut recorder: ObservabilityRecorder = ObservabilityRecorder::new();
     let mut next_observability = std::time::Instant::now() + observability_interval;
     let mut pending_candidate: Option<ruster_control::FullServiceCandidateV1> = None;
+    let mut pending_identity: Option<ActiveConfigIdentity> = None;
     let mut reload_preparation: Option<ReloadPreparation> = None;
     let mut reload_observability = ReloadObservability::default();
     let loop_result = panic::catch_unwind(AssertUnwindSafe(|| -> Result<Health, String> {
@@ -1639,8 +1734,14 @@ where
             let submitted_generation = pending_candidate
                 .as_ref()
                 .map(ruster_control::FullServiceCandidateV1::generation);
+            let submitted_identity = pending_identity.take();
             let candidate_for_tick = pending_candidate.take();
             let reload_candidate_submitted = candidate_for_tick.is_some();
+            debug_assert_eq!(
+                reload_candidate_submitted,
+                submitted_identity.is_some(),
+                "a pending reload candidate must carry its source identity"
+            );
             let report = {
                 let mut trace = DaemonTrace::new(&mut recorder);
                 run_tick(publication, candidate_for_tick, io, now, &mut trace)
@@ -1706,57 +1807,153 @@ where
                     &mut reload_observability,
                 );
                 if let Some(generation) = applied_generation {
+                    let identity = submitted_identity.ok_or_else(|| {
+                        "applied reload candidate was missing its config identity".to_owned()
+                    })?;
                     input_generator
                         .activate_generation(generation)
                         .map_err(|error| {
                             format!("applied generation key history activation failed: {error}")
                         })?;
+                    // The source identity advances only after publication and
+                    // key-history activation both succeed. A deferred or
+                    // rejected candidate therefore cannot change this value.
+                    active_config_identity = identity;
+                } else if pending_candidate.is_some() {
+                    // Deferred and backend-mismatch outcomes return the exact
+                    // candidate. Keep its identity paired with it for retry.
+                    pending_identity = submitted_identity;
                 } else if pending_candidate.is_none() {
                     if let Some(generation) = submitted_generation {
                         input_generator.discard_generation(generation);
                     }
+                    drop(submitted_identity);
                 }
             }
 
             if let Some(preparation) = reload_preparation.take() {
-                match preparation.result.try_recv() {
-                    Ok(Ok(candidate)) => {
-                        let candidate_generation = candidate.generation();
-                        let static_outcome = publication.plan_successor(&candidate);
-                        pending_candidate = handle_reload_plan(
-                            candidate,
-                            static_outcome,
-                            publication.generation(),
-                            &mut reload_observability,
-                        );
-                        if pending_candidate.is_none() {
-                            input_generator.discard_generation(candidate_generation);
+                match preparation {
+                    ReloadPreparation::Config { result } => match result.try_recv() {
+                        Ok(Ok(loaded)) => {
+                            match classify_reload_config(&active_config_identity, loaded) {
+                                ReloadConfigPlan::Unchanged => {
+                                    record_reload_unchanged(
+                                        &mut reload_observability,
+                                        publication.generation(),
+                                    );
+                                }
+                                ReloadConfigPlan::Changed(loaded) => {
+                                    let current_generation = publication.generation();
+                                    match successor_generation(current_generation) {
+                                        Err(error) => record_reload_failure(
+                                            &mut reload_observability,
+                                            current_generation,
+                                            &error,
+                                        ),
+                                        Ok(generation) => {
+                                            let LoadedReloadConfig { source, config } = *loaded;
+                                            match input_generator.successor_inputs(generation) {
+                                                Err(error) => record_reload_failure(
+                                                    &mut reload_observability,
+                                                    current_generation,
+                                                    &error,
+                                                ),
+                                                Ok(inputs) => {
+                                                    match start_reload_candidate_preparation(
+                                                        config, generation, inputs,
+                                                    ) {
+                                                        Ok(result) => {
+                                                            reload_preparation = Some(
+                                                        ReloadPreparation::Candidate {
+                                                            generation,
+                                                            identity:
+                                                                ActiveConfigIdentity::from_source(
+                                                                    source,
+                                                                ),
+                                                            result,
+                                                        },
+                                                    );
+                                                        }
+                                                        Err(error) => {
+                                                            input_generator
+                                                                .discard_generation(generation);
+                                                            record_reload_failure(
+                                                                &mut reload_observability,
+                                                                current_generation,
+                                                                &error,
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                    }
-                    Ok(Err(error)) => {
-                        input_generator.discard_generation(preparation.generation);
-                        record_reload_failure(
+                        Ok(Err(error)) => record_reload_failure(
                             &mut reload_observability,
                             publication.generation(),
                             &error,
-                        );
-                    }
-                    Err(TryRecvError::Empty) => {
-                        reload_preparation = Some(preparation);
-                    }
-                    Err(TryRecvError::Disconnected) => {
-                        input_generator.discard_generation(preparation.generation);
-                        record_reload_failure(
+                        ),
+                        Err(TryRecvError::Empty) => {
+                            reload_preparation = Some(ReloadPreparation::Config { result });
+                        }
+                        Err(TryRecvError::Disconnected) => record_reload_failure(
                             &mut reload_observability,
                             publication.generation(),
                             "reload worker exited before returning a result",
-                        );
-                    }
+                        ),
+                    },
+                    ReloadPreparation::Candidate {
+                        generation,
+                        identity,
+                        result,
+                    } => match result.try_recv() {
+                        Ok(Ok(candidate)) => {
+                            let candidate_generation = candidate.generation();
+                            let static_outcome = publication.plan_successor(&candidate);
+                            pending_candidate = handle_reload_plan(
+                                candidate,
+                                static_outcome,
+                                publication.generation(),
+                                &mut reload_observability,
+                            );
+                            if pending_candidate.is_none() {
+                                input_generator.discard_generation(candidate_generation);
+                            } else {
+                                pending_identity = Some(identity);
+                            }
+                        }
+                        Ok(Err(error)) => {
+                            input_generator.discard_generation(generation);
+                            record_reload_failure(
+                                &mut reload_observability,
+                                publication.generation(),
+                                &error,
+                            );
+                        }
+                        Err(TryRecvError::Empty) => {
+                            reload_preparation = Some(ReloadPreparation::Candidate {
+                                generation,
+                                identity,
+                                result,
+                            });
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            input_generator.discard_generation(generation);
+                            record_reload_failure(
+                                &mut reload_observability,
+                                publication.generation(),
+                                "reload worker exited before returning a result",
+                            );
+                        }
+                    },
                 }
             }
 
-            // The request is consumed only after a completed tick. Config I/O and
-            // full-service planning run on the worker, while this thread continues
+            // The request is consumed only after a completed tick. Config I/O,
+            // validation, and full-service planning run on workers, while this thread continues
             // to call run_tick and send watchdog heartbeats.
             if !stop_requested()
                 && pending_candidate.is_none()
@@ -1769,47 +1966,16 @@ where
                     report_notify_result("WATCHDOG", result, true);
                 }
                 let current_generation = publication.generation();
-                match successor_generation(current_generation) {
+                match start_reload_preparation(path) {
+                    Ok(preparation) => reload_preparation = Some(preparation),
                     Err(error) => {
-                        record_reload_failure(
-                            &mut reload_observability,
-                            current_generation,
-                            &error,
-                        );
+                        record_reload_failure(&mut reload_observability, current_generation, &error)
                     }
-                    Ok(generation) => {
-                        match input_generator.successor_inputs(generation) {
-                            Err(error) => {
-                                record_reload_failure(
-                                    &mut reload_observability,
-                                    current_generation,
-                                    &error,
-                                );
-                            }
-                            Ok(inputs) => {
-                                match start_reload_preparation(path, generation, inputs) {
-                                    Ok(preparation) => {
-                                        reload_preparation = Some(preparation);
-                                    }
-                                    Err(error) => {
-                                        input_generator.discard_generation(generation);
-                                        record_reload_failure(
-                                            &mut reload_observability,
-                                            current_generation,
-                                            &error,
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        // If preparation involved enough work to reach a watchdog
-                        // deadline, give systemd a heartbeat before the next tick.
-                        if let Some(result) =
-                            notifier.watchdog_after_tick(std::time::Instant::now())
-                        {
-                            report_notify_result("WATCHDOG", result, true);
-                        }
-                    }
+                }
+                // If preparation involved enough work to reach a watchdog
+                // deadline, give systemd a heartbeat before the next tick.
+                if let Some(result) = notifier.watchdog_after_tick(std::time::Instant::now()) {
+                    report_notify_result("WATCHDOG", result, true);
                 }
             }
 
@@ -1888,6 +2054,7 @@ where
     // publication, backend, and its external runtime storage.
     let retired_values_result = catch_shutdown_result("retired publication values", || {
         drop(pending_candidate.take());
+        drop(pending_identity.take());
         drop(reload_preparation.take());
         Ok(())
     });
@@ -2971,6 +3138,18 @@ fn format_observability_line(
 }
 
 #[cfg(target_os = "linux")]
+fn record_reload_unchanged(
+    reload_observability: &mut ReloadObservability,
+    current_generation: NonZeroU64,
+) {
+    // This is the no-candidate reload form of
+    // `PublicationOutcome::Unchanged`: use the same typed classification and
+    // operator spelling while retaining the active publication untouched.
+    reload_observability.record_result(ReloadResultKind::Unchanged);
+    println!("ruster: reload result=unchanged generation={current_generation} action=continue-old");
+}
+
+#[cfg(target_os = "linux")]
 fn record_reload_failure(
     reload_observability: &mut ReloadObservability,
     current_generation: NonZeroU64,
@@ -3358,10 +3537,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn write_reload_test_config(source: &str) -> std::path::PathBuf {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.reloadwork");
-        fs::create_dir_all(&root).expect("reload test directory must be creatable");
         let id = NEXT_RELOAD_TEST_ID.fetch_add(1, Ordering::Relaxed);
-        let path = root.join(format!(
+        let path = std::env::temp_dir().join(format!(
             "ruster-cli-reload-{}-{id}.toml",
             std::process::id()
         ));
@@ -3761,6 +3938,331 @@ completion = 4
             policy_idle_wait_maximum(1_000, 1),
             std::time::Duration::from_millis(1)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    // The public candidate-free Unchanged tick path leaves active runtime state and session untouched.
+    fn same_config_reload_preflight_does_not_issue_fresh_keys() {
+        const RELOAD_COUNT: usize = 101;
+        let (entropy, entropy_path) = write_key_entropy(&[(1, 2), (3, 4), (5, 6)]);
+        let mut inputs = PlanInputGenerator::from_entropy(entropy);
+        inputs.initial_inputs().expect("initial generation inputs");
+        let active_generation = NonZeroU64::new(1).expect("initial generation");
+        inputs
+            .activate_generation(active_generation)
+            .expect("initial generation must activate");
+
+        let config_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../control/tests/full-service.toml");
+        let active_identity =
+            ActiveConfigIdentity::from_source(FULL_SERVICE_CONFIG.as_bytes().to_vec());
+        let mut reload_observability = ReloadObservability::default();
+        for _ in 0..RELOAD_COUNT {
+            reload_observability.record_request();
+            let loaded =
+                load_reload_config(config_path.to_str().expect("fixture path must be UTF-8"))
+                    .expect("same configuration must be valid");
+            assert!(matches!(
+                classify_reload_config(&active_identity, loaded),
+                ReloadConfigPlan::Unchanged
+            ));
+            record_reload_unchanged(&mut reload_observability, active_generation);
+            assert_eq!(inputs.issued_keys.len(), HASH_KEYS_PER_GENERATION);
+            assert_eq!(inputs.active_generation, Some(active_generation));
+        }
+
+        assert_eq!(reload_observability.requests, RELOAD_COUNT as u64);
+        assert_eq!(reload_observability.results, RELOAD_COUNT as u64);
+        assert_eq!(reload_observability.unchanged, RELOAD_COUNT as u64);
+        assert_eq!(reload_observability.applied, 0);
+        assert_eq!(reload_observability.rejected, 0);
+        assert_eq!(
+            reload_observability.last_result,
+            Some(ReloadResultKind::Unchanged)
+        );
+        assert_eq!(
+            inputs.issued_keys.len(),
+            HASH_KEYS_PER_GENERATION,
+            "unchanged reload must not mint a candidate generation"
+        );
+        assert_eq!(inputs.active_generation, Some(active_generation));
+        fs::remove_file(entropy_path).expect("key entropy fixture must be removable");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn same_config_reload_candidate_free_tick_preserves_active_nat_firewall_state() {
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../control/tests/full-service.toml");
+        let LoadedReloadConfig { source, config } =
+            load_reload_config(fixture_path.to_str().expect("fixture path must be UTF-8"))
+                .expect("initial configuration must be valid");
+        let active_identity = ActiveConfigIdentity::from_source(source);
+        let candidate = prepare_successor_candidate_from_config(
+            config,
+            full_service_plan_inputs().expect("fixed plan inputs must be constructible"),
+        )
+        .expect("initial candidate must be plannable");
+
+        // The simulation fixture's first frame is a stateful TCP flow. Build
+        // two independent fixture buffers so the second packet must use the
+        // state created by the first one; production packet handling remains
+        // backend-buffered and is not changed by this test.
+        let first_frame = build_sim_scenario(&candidate)
+            .ingress
+            .into_iter()
+            .next()
+            .expect("full-service fixture must produce a TCP ingress frame");
+        let second_frame = build_sim_scenario(&candidate)
+            .ingress
+            .into_iter()
+            .next()
+            .expect("full-service fixture must produce a second TCP ingress frame");
+
+        let mut storage = FullServiceRuntimeStorage::try_for_candidate(&candidate)
+            .expect("fixture runtime storage must be allocatable");
+        let owner = match activate_initial(&mut storage, candidate) {
+            Ok(owner) => owner,
+            Err(_) => panic!("fixture candidate must activate"),
+        };
+        let (owner_binding, mut io) =
+            bind_publication_backend(SimIo::new()).expect("simulator binding must be available");
+        let mut publication = match owner.bind_backend(owner_binding, &mut io) {
+            Ok(publication) => publication,
+            Err(_) => panic!("simulator must bind to the activated publication"),
+        };
+        let generation_before_reload = publication.generation();
+        let publication_identity_before_reload = (
+            publication.generation(),
+            publication.interfaces().as_ptr() as usize,
+            publication.interfaces().len(),
+            publication.tick(),
+            publication.required_runtime_bytes(),
+            publication.storage_shape(),
+        );
+        let firewall_key_before_reload = {
+            let view = publication.active_view();
+            view.firewall_config().hash_key()
+        };
+
+        io.inject(first_frame.interface, first_frame.bytes);
+        let mut recorder: ObservabilityRecorder = ObservabilityRecorder::new();
+        let first_report = {
+            let mut trace = DaemonTrace::new(&mut recorder);
+            run_tick(
+                &mut publication,
+                None,
+                &mut io,
+                MonotonicMillis(1),
+                &mut trace,
+            )
+        };
+        assert!(matches!(
+            &first_report.publication,
+            PublicationOutcome::Unchanged
+        ));
+        let RxPhaseReport::Completed(first_rx) = first_report.rx else {
+            panic!("state-seeding frame must complete: {:?}", first_report.rx);
+        };
+        assert_eq!(first_rx.completion.tx_accepted, 1);
+        assert!(
+            io.pop_tx().is_some(),
+            "state-seeding frame must be forwarded"
+        );
+
+        let seeded_state = {
+            let view = publication.active_view();
+            assert!(view.has_nat44_udp_runtime());
+            assert!(view.has_nat44_tcp_runtime());
+            assert!(view.has_firewall_runtime());
+            (
+                view.nat44_udp_counters()
+                    .expect("fixture must provide UDP runtime"),
+                view.nat44_tcp_counters()
+                    .expect("fixture must provide TCP runtime"),
+                view.firewall_counters()
+                    .expect("fixture must provide firewall runtime"),
+            )
+        };
+        assert!(seeded_state.1.mappings_created > 0);
+        assert!(seeded_state.1.sessions_created > 0);
+        assert!(seeded_state.2.allowed_new > 0);
+
+        // This test shares the reload boundary's cold steps: load one source
+        // snapshot, parse/validate it, and compare its exact bytes with the
+        // active identity. `Unchanged` carries no candidate, so the following
+        // run_tick(None) exercises the matching candidate-free publication
+        // outcome for that preflight result.
+        let reloaded =
+            load_reload_config(fixture_path.to_str().expect("fixture path must be UTF-8"))
+                .expect("same configuration must remain valid");
+        assert!(matches!(
+            classify_reload_config(&active_identity, reloaded),
+            ReloadConfigPlan::Unchanged
+        ));
+        let mut reload_observability = ReloadObservability::default();
+        record_reload_unchanged(&mut reload_observability, publication.generation());
+
+        io.inject(second_frame.interface, second_frame.bytes);
+        let second_report = {
+            let mut trace = DaemonTrace::new(&mut recorder);
+            run_tick(
+                &mut publication,
+                None,
+                &mut io,
+                MonotonicMillis(2),
+                &mut trace,
+            )
+        };
+        assert!(matches!(
+            &second_report.publication,
+            PublicationOutcome::Unchanged
+        ));
+        let RxPhaseReport::Completed(second_rx) = second_report.rx else {
+            panic!(
+                "repeated stateful frame must complete: {:?}",
+                second_report.rx
+            );
+        };
+        assert_eq!(second_rx.completion.tx_accepted, 1);
+        assert!(
+            io.pop_tx().is_some(),
+            "repeated stateful frame must still be forwarded"
+        );
+
+        let retained_state = {
+            let view = publication.active_view();
+            assert_eq!(view.generation(), generation_before_reload);
+            assert!(view.has_nat44_udp_runtime());
+            assert!(view.has_nat44_tcp_runtime());
+            assert!(view.has_firewall_runtime());
+            (
+                view.nat44_udp_counters()
+                    .expect("fixture must retain UDP runtime"),
+                view.nat44_tcp_counters()
+                    .expect("fixture must retain TCP runtime"),
+                view.firewall_counters()
+                    .expect("fixture must retain firewall runtime"),
+            )
+        };
+        let publication_identity_after_reload = (
+            publication.generation(),
+            publication.interfaces().as_ptr() as usize,
+            publication.interfaces().len(),
+            publication.tick(),
+            publication.required_runtime_bytes(),
+            publication.storage_shape(),
+        );
+        let firewall_key_after_reload = {
+            let view = publication.active_view();
+            view.firewall_config().hash_key()
+        };
+        assert_eq!(publication.generation(), generation_before_reload);
+        assert_eq!(
+            publication_identity_after_reload,
+            publication_identity_before_reload
+        );
+        // The public FullServiceView exposes the firewall hash identity. NAT
+        // hash keys remain intentionally sealed there; their identity is
+        // proven below by reusing the existing mapping/session state.
+        assert_eq!(firewall_key_after_reload, firewall_key_before_reload);
+        assert_eq!(retained_state.0, seeded_state.0);
+        assert_eq!(
+            retained_state.1.mappings_created,
+            seeded_state.1.mappings_created
+        );
+        assert_eq!(
+            retained_state.1.sessions_created,
+            seeded_state.1.sessions_created
+        );
+        assert!(retained_state.1.mappings_reused > seeded_state.1.mappings_reused);
+        assert!(retained_state.1.sessions_reused > seeded_state.1.sessions_reused);
+        assert_eq!(retained_state.2.allowed_new, seeded_state.2.allowed_new);
+        assert!(retained_state.2.allowed_established > seeded_state.2.allowed_established);
+        assert_eq!(reload_observability.results, 1);
+        assert_eq!(reload_observability.unchanged, 1);
+        assert_eq!(
+            reload_observability.last_result,
+            Some(ReloadResultKind::Unchanged)
+        );
+
+        drop(publication);
+        drop(io);
+        drop(storage);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn changed_config_reload_rotates_fresh_keys_before_candidate_planning() {
+        let (entropy, entropy_path) =
+            write_key_entropy(&[(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12)]);
+        let mut inputs = PlanInputGenerator::from_entropy(entropy);
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../control/tests/full-service.toml");
+        let initial_loaded =
+            load_reload_config(fixture_path.to_str().expect("fixture path must be UTF-8"))
+                .expect("initial configuration must be valid");
+        let initial_inputs = inputs.initial_inputs().expect("initial keys");
+        let initial_candidate =
+            prepare_successor_candidate_from_config(initial_loaded.config, initial_inputs)
+                .expect("initial candidate must be plannable");
+        let initial_generation = initial_candidate.generation();
+        inputs
+            .activate_generation(initial_generation)
+            .expect("initial generation must activate");
+
+        let changed_source = format!("# source identity changed\n{FULL_SERVICE_CONFIG}");
+        let changed_path = write_reload_test_config(&changed_source);
+        let loaded = load_reload_config(
+            changed_path
+                .to_str()
+                .expect("changed config path must be UTF-8"),
+        )
+        .expect("changed configuration must be valid");
+        let active_identity =
+            ActiveConfigIdentity::from_source(FULL_SERVICE_CONFIG.as_bytes().to_vec());
+        let loaded = match classify_reload_config(&active_identity, loaded) {
+            ReloadConfigPlan::Changed(loaded) => loaded,
+            ReloadConfigPlan::Unchanged => panic!("source-byte change must require reload"),
+        };
+        let generation = successor_generation(initial_generation).expect("successor generation");
+        let LoadedReloadConfig { source, config } = *loaded;
+        let plan_inputs = inputs
+            .successor_inputs(generation)
+            .expect("changed reload must mint fresh keys");
+        let candidate = prepare_successor_candidate_from_config(config, plan_inputs)
+            .expect("changed reload candidate must be plannable");
+        assert_eq!(candidate.generation(), generation);
+        assert_ne!(source.as_slice(), FULL_SERVICE_CONFIG.as_bytes());
+        assert_eq!(inputs.issued_keys.len(), MAX_ISSUED_KEYS);
+        assert_eq!(inputs.active_generation, Some(initial_generation));
+
+        let outcome = plan_successor(Some(&initial_candidate), &candidate);
+        assert_eq!(
+            classify_reload_plan(&outcome),
+            ReloadPlanClassification::InPlaceEligible
+        );
+        let mut reload_observability = ReloadObservability::default();
+        let pending = handle_reload_plan(
+            candidate,
+            outcome,
+            initial_generation,
+            &mut reload_observability,
+        );
+        assert!(
+            pending.is_some(),
+            "eligible changed candidate must be queued"
+        );
+        drop(pending);
+        inputs
+            .activate_generation(generation)
+            .expect("successful publication may activate the fresh generation");
+        assert_eq!(inputs.active_generation, Some(generation));
+        assert_eq!(inputs.issued_keys.len(), HASH_KEYS_PER_GENERATION);
+
+        fs::remove_file(changed_path).expect("changed config fixture must be removable");
+        fs::remove_file(entropy_path).expect("key entropy fixture must be removable");
     }
 
     #[cfg(target_os = "linux")]
