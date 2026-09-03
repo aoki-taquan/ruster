@@ -7,6 +7,22 @@ case "${1:-}" in
         # not disable the unit: enablement is an operator-owned decision.
         if command -v systemctl >/dev/null 2>&1 \
             && [ -d /run/systemd/system ]; then
+            if [ "${1:-}" = upgrade ] \
+                && systemctl is-active --quiet ruster.service \
+                && systemctl is-enabled --quiet ruster.service; then
+                upgrade_marker=/run/ruster-upgrade-needed
+                marker_tmp=$(mktemp /run/ruster-upgrade-needed.XXXXXX \
+                    2>/dev/null) || marker_tmp=
+                if [ -n "$marker_tmp" ]; then
+                    if chmod 0600 "$marker_tmp" \
+                        && chown root:root "$marker_tmp" \
+                        && mv -f -- "$marker_tmp" "$upgrade_marker"; then
+                        :
+                    else
+                        rm -f -- "$marker_tmp" || :
+                    fi
+                fi
+            fi
             systemctl stop ruster.service >/dev/null 2>&1 || :
         fi
         ;;
