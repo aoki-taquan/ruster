@@ -8,6 +8,7 @@ use crate::{
 
 pub const TP_STATUS_KERNEL: u32 = 0;
 pub const TP_STATUS_USER: u32 = 1;
+pub const TP_STATUS_BLK_TMO: u32 = 1 << 5;
 pub const TP_STATUS_AVAILABLE: u32 = 0;
 pub const TP_STATUS_SEND_REQUEST: u32 = 1;
 pub const TP_STATUS_SENDING: u32 = 2;
@@ -24,31 +25,11 @@ pub struct BlockDescriptor {
 
 impl BlockDescriptor {
     pub fn validate(self, layout: RingLayout) -> Result<(), GeometryError> {
-        if self.version != TPACKET_V3_VERSION {
-            return Err(GeometryError::UnsupportedBlockVersion {
-                version: self.version,
-            });
-        }
-        if self.offset_to_private != TPACKET_BLOCK_HEADER_LEN {
-            return Err(GeometryError::PrivateOffsetInvalid {
-                offset: self.offset_to_private,
-            });
-        }
+        self.validate_identity()?;
         if self.packet_count == 0 {
             return Err(GeometryError::PacketCountZero);
         }
-        if self.block_len < TPACKET_BLOCK_HEADER_LEN || self.block_len > layout.block_size() {
-            return Err(GeometryError::FirstPacketOffsetInvalid {
-                offset: self.first_packet_offset,
-            });
-        }
-        let expected = layout.block_plus_private();
-        if self.first_packet_offset != expected {
-            return Err(GeometryError::FirstPacketOffsetMismatch {
-                configured: self.first_packet_offset,
-                expected,
-            });
-        }
+        self.validate_layout(layout)?;
         let first_header_end = self
             .first_packet_offset
             .checked_add(TPACKET_V3_HEADER_LEN)
@@ -66,6 +47,50 @@ impl BlockDescriptor {
             return Err(GeometryError::PacketCountExceedsBlock {
                 packet_count: self.packet_count,
                 maximum,
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_empty_timeout(self, layout: RingLayout) -> Result<(), GeometryError> {
+        self.validate_identity()?;
+        if self.packet_count != 0 {
+            return Err(GeometryError::PacketCountZero);
+        }
+        self.validate_layout(layout)?;
+        if self.first_packet_offset > self.block_len {
+            return Err(GeometryError::PacketHeaderOutOfBounds {
+                offset: self.first_packet_offset,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_identity(self) -> Result<(), GeometryError> {
+        if self.version != TPACKET_V3_VERSION {
+            return Err(GeometryError::UnsupportedBlockVersion {
+                version: self.version,
+            });
+        }
+        if self.offset_to_private != TPACKET_BLOCK_HEADER_LEN {
+            return Err(GeometryError::PrivateOffsetInvalid {
+                offset: self.offset_to_private,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_layout(self, layout: RingLayout) -> Result<(), GeometryError> {
+        if self.block_len < TPACKET_BLOCK_HEADER_LEN || self.block_len > layout.block_size() {
+            return Err(GeometryError::FirstPacketOffsetInvalid {
+                offset: self.first_packet_offset,
+            });
+        }
+        let expected = layout.block_plus_private();
+        if self.first_packet_offset != expected {
+            return Err(GeometryError::FirstPacketOffsetMismatch {
+                configured: self.first_packet_offset,
+                expected,
             });
         }
         Ok(())
@@ -311,6 +336,16 @@ impl RxBlockModel {
         Ok(())
     }
 
+    pub fn acquire_empty_timeout(&mut self) -> Result<(), OwnershipError> {
+        if self.owner != RxOwnership::Kernel {
+            return Err(OwnershipError::RxAcquireWhileOwned { owner: self.owner });
+        }
+        self.owner = RxOwnership::User;
+        self.packets = 0;
+        self.completed = 0;
+        Ok(())
+    }
+
     pub fn complete_packet(&mut self) -> Result<(), OwnershipError> {
         if self.owner == RxOwnership::Kernel {
             return Err(OwnershipError::RxReleaseWhileKernelOwned);
@@ -445,6 +480,14 @@ impl TxFrameModel {
             TxOwnership::WrongFormat,
             TxOwnership::Available,
             TxOperation::RecycleWrongFormat,
+        )
+    }
+
+    pub fn retry_wrong_format(&mut self) -> Result<(), OwnershipError> {
+        self.transition(
+            TxOwnership::WrongFormat,
+            TxOwnership::SendRequest,
+            TxOperation::RetryWrongFormat,
         )
     }
 

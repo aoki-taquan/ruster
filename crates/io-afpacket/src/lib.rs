@@ -1,12 +1,12 @@
 #![deny(unsafe_code)]
 #![doc = "Linux AF_PACKET/TPACKET_V3 configuration and ownership primitives."]
 //!
-//! This crate currently provides checked configuration, fixed interface
-//! lookup, ring geometry, descriptor bounds, ownership state, and the Linux
-//! syscall/mmap boundary needed by the future AF_PACKET backend. Its private
-//! AP1 TX engine publishes fixed frames, scans FIFO completions, and batches
-//! nonblocking endpoint kicks. It does not yet implement
-//! [`ruster_core::PacketIo`] or expose a live adapter.
+//! This crate provides checked configuration, fixed interface lookup, ring
+//! geometry, descriptor bounds, ownership state, and a Linux syscall/mmap
+//! boundary for a live `AfPacketIo` implementation of
+//! [`ruster_core::PacketIo`] on Linux. Its TX engine publishes fixed frames, scans FIFO
+//! completions, and batches nonblocking endpoint kicks; the adapter couples it
+//! to zero-copy RX leases over USER-owned TPACKET_V3 blocks.
 //!
 //! The safe model is available on every target. Raw Linux UAPI access is
 //! confined to `sys`; [`AfPacketPlatform::ensure_supported`] returns
@@ -24,10 +24,10 @@
 //! the kernel's 48-byte minimum data offset rather than the larger RX Ethernet
 //! offset. The socket is opened with protocol zero and becomes active only when
 //! its validated `sockaddr_ll` is bound. Backend counters are fixed accumulators
-//! only. AP1-0 additionally fixes disjoint RX/TX extents within the combined
-//! mapping and cold-preallocates fixed metadata. AP1-TX uses that storage for
-//! an internal producer/completion/kick engine without exposing `PacketIo`,
-//! an RX path, poll integration, or cleanup telemetry.
+//! only. The combined mapping is split into checked, disjoint RX/TX extents
+//! and cold-preallocated metadata. RX block ownership is returned on finish,
+//! drop, and receive-time validation errors; accepted TX frames remain owned
+//! by the existing TX completion engine.
 
 #[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
 compile_error!("ruster-io-afpacket currently supports only 64-bit Linux targets");
@@ -50,13 +50,20 @@ pub use config::{
     TPACKET_V3_HDRLEN, TPACKET_V3_HEADER_LEN, TPACKET_V3_TX_DATA_OFFSET, TPACKET_V3_VERSION,
 };
 pub use error::{
-    ConfigError, Errno, GeometryError, MappingAccessError, OwnershipError, PlatformError,
-    SyscallStage, TxOperation,
+    AfPacketError, ConfigError, Errno, GeometryError, MappingAccessError, OwnershipError,
+    PlatformError, PublicationQuiescenceError, SyscallStage, TxCompletionError, TxOperation,
+    TxSubmitError,
 };
 pub use model::{
     validate_v3_block_chain, BlockDescriptor, PacketDescriptor, RxBlockModel, RxOwnership,
-    TxFrameModel, TxOwnership, ValidatedPacket, TP_STATUS_AVAILABLE, TP_STATUS_KERNEL,
-    TP_STATUS_SENDING, TP_STATUS_SEND_REQUEST, TP_STATUS_USER, TP_STATUS_WRONG_FORMAT,
+    TxFrameModel, TxOwnership, ValidatedPacket, TP_STATUS_AVAILABLE, TP_STATUS_BLK_TMO,
+    TP_STATUS_KERNEL, TP_STATUS_SENDING, TP_STATUS_SEND_REQUEST, TP_STATUS_USER,
+    TP_STATUS_WRONG_FORMAT,
 };
 pub use platform::{AfPacketPlatform, UapiLayout};
 pub use stats::{BackendStat, BackendStats, BackendStatsSnapshot};
+
+#[cfg(target_os = "linux")]
+pub use sys::{
+    AfPacketBatch, AfPacketGeneratedBatch, AfPacketGeneratedSlot, AfPacketIo, AfPacketSlot,
+};
