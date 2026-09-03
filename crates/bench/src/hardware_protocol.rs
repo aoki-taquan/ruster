@@ -7,14 +7,15 @@
 use std::fmt;
 
 use crate::{
+    hardware_plan::{fixed_l1_bit_count, hardware_plan_fingerprint, imix_l1_bit_count},
     validate_hardware_plan_v1, ArtifactHash, DirectionProfile, FrameHealth, HardwareCase,
     HardwareFrame, HardwarePlan, HardwarePlanError, HardwareRepeat, HardwareSummary,
     ImixAcceptedFrames, LifecycleOutcome, LifecyclePhase, LifecycleRecord, PlannedHardwareCase,
-    SchemaError, HARDWARE_PLAN_VERSION, HARDWARE_TOTAL_CASE_COUNT, RUSTER_IMIX_V1_CYCLE,
+    SchemaError, HARDWARE_PLAN_VERSION, HARDWARE_TOTAL_CASE_COUNT,
 };
 
 pub const HARDWARE_MEASUREMENT_PROTOCOL_VERSION: u32 = 1;
-pub const HARDWARE_PLAN_FINGERPRINT_V1: u64 = 0xf68c_80b7_2065_c023;
+pub use crate::hardware_plan::HARDWARE_PLAN_FINGERPRINT_V1;
 pub const MAX_HARDWARE_WARMUP_SECONDS: u32 = 600;
 pub const MAX_HARDWARE_DURATION_SECONDS: u32 = 600;
 pub const MAX_HARDWARE_REPEAT_COUNT: u16 = 31;
@@ -367,6 +368,11 @@ impl GitCommitId {
 pub struct Sha256Digest([u8; 32]);
 
 impl Sha256Digest {
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     pub fn parse(field: &'static str, value: &str) -> Result<Self, MeasurementProtocolError> {
         parse_lower_hex::<32>(value)
             .map(Self)
@@ -376,6 +382,17 @@ impl Sha256Digest {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    #[must_use]
+    pub fn to_lower_hex(self) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut output = String::with_capacity(64);
+        for byte in self.0 {
+            output.push(char::from(HEX[usize::from(byte >> 4)]));
+            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        output
     }
 }
 
@@ -764,13 +781,16 @@ impl<'a> BoundHardwareMeasurement<'a> {
     #[must_use]
     pub fn completeness(self) -> CompletenessMetadata {
         let repeat_count = self.protocol.timing.repeat_count;
+        let case_count = u16::try_from(HARDWARE_TOTAL_CASE_COUNT)
+            .expect("the frozen hardware case count fits u16");
+        let case_count_u32 = u32::from(case_count);
         CompletenessMetadata {
             plan_version: HARDWARE_PLAN_VERSION,
             plan_fingerprint: self.protocol.plan_fingerprint,
-            case_count: 237,
+            case_count,
             repeats_per_case: repeat_count,
-            expected_repeat_records: 237_u32 * u32::from(repeat_count),
-            expected_summary_records: 237,
+            expected_repeat_records: case_count_u32 * u32::from(repeat_count),
+            expected_summary_records: case_count,
         }
     }
 }
@@ -2110,71 +2130,17 @@ fn l1_bit_count(
     imix: Option<ImixAcceptedFrames>,
 ) -> Result<u128, MeasurementProtocolError> {
     match (frame, imix) {
-        (HardwareFrame::RusterImixV1, Some(evidence)) => {
-            let bytes = u128::from(evidence.eth64_packets)
-                .checked_mul(84)
-                .and_then(|value| {
-                    u128::from(evidence.eth512_packets)
-                        .checked_mul(532)
-                        .and_then(|part| value.checked_add(part))
-                })
-                .and_then(|value| {
-                    u128::from(evidence.ip_mtu1500_packets)
-                        .checked_mul(1_538)
-                        .and_then(|part| value.checked_add(part))
-                })
-                .ok_or(MeasurementProtocolError::ArithmeticOverflow(
-                    "IMIX L1 bytes",
-                ))?;
-            bytes
-                .checked_mul(8)
-                .ok_or(MeasurementProtocolError::ArithmeticOverflow("IMIX L1 bits"))
-        }
+        (HardwareFrame::RusterImixV1, Some(evidence)) => imix_l1_bit_count(evidence)
+            .map_err(|_| MeasurementProtocolError::ArithmeticOverflow("IMIX L1 bits")),
         (HardwareFrame::RusterImixV1, None) => Err(MeasurementProtocolError::MissingImixEvidence(
             DirectionProfile::Bidirectional,
         )),
-        (frame, None) => u128::from(accepted_packets)
-            .checked_mul(u128::from(frame.l1_bytes_with_preamble_ifg().ok_or(
-                MeasurementProtocolError::ArithmeticOverflow("fixed frame L1 bytes"),
-            )?))
-            .and_then(|value| value.checked_mul(8))
-            .ok_or(MeasurementProtocolError::ArithmeticOverflow(
-                "fixed frame L1 bits",
-            )),
+        (frame, None) => fixed_l1_bit_count(frame, accepted_packets)
+            .map_err(|_| MeasurementProtocolError::ArithmeticOverflow("fixed frame L1 bits")),
         (_, Some(_)) => Err(MeasurementProtocolError::UnexpectedImixEvidence(
             DirectionProfile::Bidirectional,
         )),
     }
-}
-
-fn hardware_plan_fingerprint(plan: &HardwarePlan) -> u64 {
-    let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in plan.version.to_be_bytes().into_iter().chain(*b"\n") {
-        fingerprint = fnv1a_byte(fingerprint, byte);
-    }
-    for frame in RUSTER_IMIX_V1_CYCLE {
-        for byte in frame.label().bytes().chain(*b"\n") {
-            fingerprint = fnv1a_byte(fingerprint, byte);
-        }
-    }
-    for planned in &plan.cases {
-        for byte in planned
-            .ordinal
-            .to_be_bytes()
-            .into_iter()
-            .chain(planned.seed.to_be_bytes())
-            .chain([planned.class as u8])
-            .chain(planned.case_id.bytes())
-            .chain(*b"\n")
-        {
-            fingerprint = fnv1a_byte(fingerprint, byte);
-        }
-    }
-    fingerprint
-}
-
-const fn fnv1a_byte(hash: u64, byte: u8) -> u64 {
-    (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01b3)
 }
 
 fn validate_sample_every(value: u32) -> Result<(), MeasurementProtocolError> {
@@ -2214,7 +2180,7 @@ const fn lower_hex_nibble(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hardware_plan_v1;
+    use crate::{frame_wire_model, hardware_plan_v1, FrameWireModel};
 
     const GIT_A: &str = "0123456789abcdef0123456789abcdef01234567";
     const GIT_B: &str = "89abcdef0123456789abcdef0123456789abcdef";
@@ -2272,11 +2238,15 @@ mod tests {
     }
 
     fn imix_evidence(counters: DirectionPacketCounters) -> ImixAcceptedFrames {
-        let cycles = counters.accepted_packets / 12;
+        let FrameWireModel::RusterImixV1(wire) = frame_wire_model(HardwareFrame::RusterImixV1)
+        else {
+            panic!("IMIX must have an IMIX wire model");
+        };
+        let cycles = counters.accepted_packets / u64::from(wire.cycle_packets);
         ImixAcceptedFrames {
-            eth64_packets: cycles * 7,
-            eth512_packets: cycles * 4,
-            ip_mtu1500_packets: cycles,
+            eth64_packets: cycles * u64::from(wire.eth64_packets),
+            eth512_packets: cycles * u64::from(wire.eth512_packets),
+            ip_mtu1500_packets: cycles * u64::from(wire.ip_mtu1500_packets),
         }
     }
 

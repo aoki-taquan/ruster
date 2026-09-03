@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use ruster_core::{GeneratedPacketBatch, GeneratedPacketIo, PublicationQuiescenceBackend};
 use ruster_io_conformance::{
     generated, rx, BufferToken, GeneratedCompletionHarness, GeneratedEvent, GeneratedEventKind,
     GeneratedFinishErrorHarness, GeneratedHarness, GeneratedReclaim, LeaseObserver, LiveFrame,
@@ -321,4 +322,120 @@ fn generated_partial_reject_with_finish_error_is_exact() {
 #[test]
 fn generated_completion_advances_the_exact_submitted_token() {
     generated::completion_advances_the_exact_submitted_token::<SimHarness>();
+}
+
+#[test]
+fn r15obs_015_dropped_generated_batch_recycles_pending_slots_exactly_once() {
+    let mut harness = <SimHarness as GeneratedHarness>::new();
+    harness.set_generated_allocation_budget(1);
+    let before = harness.io.stats();
+    let live = {
+        let (io, observer) = GeneratedHarness::io_and_observer(&mut harness);
+        let mut batch = io.begin_generated(CONFORMANCE_WAN);
+        let mut packet = batch.allocate(60).expect("generated allocation");
+        packet.bytes_mut().fill(0xd1);
+        let frame = observer.bind(packet.bytes_mut(), 60);
+        packet.commit();
+        drop(batch);
+        frame
+    };
+
+    let after_drop = harness.io.stats();
+    assert_eq!(after_drop.pending_generated_recycled, 1);
+    assert_eq!(
+        after_drop.generated_tx_rejected_total,
+        before.generated_tx_rejected_total + 1
+    );
+    assert_eq!(
+        after_drop.generated_abandoned_total,
+        before.generated_abandoned_total
+    );
+    assert_eq!(harness.io.check_publication_quiescence(), Ok(()));
+    harness.set_generated_allocation_budget(0);
+    let next = {
+        let (io, _) = GeneratedHarness::io_and_observer(&mut harness);
+        io.begin_generated(CONFORMANCE_LAN).finish()
+    };
+    assert_eq!(
+        (
+            next.attempts,
+            next.allocated,
+            next.failed,
+            next.requested,
+            next.cancelled,
+            next.abandoned,
+            next.accepted,
+            next.rejected,
+        ),
+        (0, 0, 0, 0, 0, 0, 0, 0)
+    );
+    assert_eq!(harness.io.stats().pending_generated_recycled, 1);
+    let events = harness.drain_generated_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].frame, live);
+    assert_eq!(events[0].egress, CONFORMANCE_WAN);
+    assert_eq!(events[0].bytes, vec![0xd1; 60]);
+    assert_eq!(
+        events[0].kind,
+        GeneratedEventKind::TxRejected {
+            attempted_egress: CONFORMANCE_WAN,
+            endpoint: Some(CONFORMANCE_WAN_ENDPOINT),
+        }
+    );
+    assert_eq!(harness.io.stats().pending_generated_recycled, 0);
+    assert_eq!(
+        harness.io.stats().generated_tx_rejected_total,
+        after_drop.generated_tx_rejected_total
+    );
+    assert!(harness.drain_generated_events().is_empty());
+    assert!(harness.complete_generated_submissions().is_empty());
+
+    harness.set_generated_allocation_budget(2);
+    let mut live = Vec::new();
+    {
+        let (io, observer) = GeneratedHarness::io_and_observer(&mut harness);
+        let mut batch = io.begin_generated(CONFORMANCE_LAN);
+        for (marker, frame_len) in [(0xd2_u8, 61), (0xd3_u8, 62)] {
+            let mut packet = batch.allocate(frame_len).expect("generated allocation");
+            packet.bytes_mut().fill(marker);
+            live.push(observer.bind(packet.bytes_mut(), frame_len));
+            packet.commit();
+        }
+        drop(batch);
+    }
+    let after_multiple_drop = harness.io.stats();
+    assert_eq!(after_multiple_drop.pending_generated_recycled, 2);
+    assert_eq!(
+        after_multiple_drop.generated_tx_rejected_total,
+        after_drop.generated_tx_rejected_total + 2
+    );
+    assert_eq!(
+        after_multiple_drop.generated_abandoned_total,
+        before.generated_abandoned_total
+    );
+    let events = harness.drain_generated_events();
+    assert_eq!(events.len(), 2);
+    for (((event, frame), marker), frame_len) in events
+        .iter()
+        .zip(live)
+        .zip([0xd2_u8, 0xd3])
+        .zip([61_usize, 62])
+    {
+        assert_eq!(event.frame, frame);
+        assert_eq!(event.egress, CONFORMANCE_LAN);
+        assert_eq!(event.bytes, vec![marker; frame_len]);
+        assert_eq!(
+            event.kind,
+            GeneratedEventKind::TxRejected {
+                attempted_egress: CONFORMANCE_LAN,
+                endpoint: Some(CONFORMANCE_LAN_ENDPOINT),
+            }
+        );
+    }
+    assert_eq!(harness.io.stats().pending_generated_recycled, 0);
+    assert_eq!(
+        harness.io.stats().generated_tx_rejected_total,
+        after_multiple_drop.generated_tx_rejected_total
+    );
+    assert!(harness.drain_generated_events().is_empty());
 }

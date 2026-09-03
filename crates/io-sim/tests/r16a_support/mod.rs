@@ -1,6 +1,9 @@
 pub mod artifact;
 pub mod corpus;
 pub mod envelope;
+pub mod state;
+#[path = "../support/mod.rs"]
+pub mod support;
 pub mod targets;
 
 use std::{

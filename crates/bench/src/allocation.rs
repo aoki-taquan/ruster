@@ -1,7 +1,13 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 
-struct CountingAllocator;
+/// Allocator used by the `ruster-bench` binary to count successful allocation
+/// and reallocation calls in timed regions.
+///
+/// The library does not install this allocator globally. Keeping the
+/// declaration in the binary lets a downstream identity-only consumer choose
+/// its own allocator without a linker-level global allocator conflict.
+pub struct CountingAllocator;
 
 thread_local! {
     static ALLOCATION_COUNT: Cell<u64> = const { Cell::new(0) };
@@ -46,8 +52,9 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 }
 
+#[cfg(test)]
 #[global_allocator]
-static GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
+static TEST_GLOBAL_ALLOCATOR: CountingAllocator = CountingAllocator;
 
 fn increment_count() {
     ALLOCATION_COUNT.with(|count| count.set(count.get().saturating_add(1)));
@@ -60,4 +67,17 @@ fn increment_count() {
 #[must_use]
 pub fn allocation_count() -> u64 {
     ALLOCATION_COUNT.with(Cell::get)
+}
+
+/// Checks that the process selected this crate's counting allocator before a
+/// run starts measuring. A library consumer is otherwise allowed to select a
+/// different global allocator, in which case `allocation_count` would remain
+/// at zero and an allocation-free result would be unverifiable.
+pub(crate) fn allocation_instrumentation_available() -> bool {
+    let before = allocation_count();
+    let probe = Vec::<u8>::with_capacity(1);
+    std::hint::black_box(&probe);
+    let after = allocation_count();
+    drop(probe);
+    after != before
 }

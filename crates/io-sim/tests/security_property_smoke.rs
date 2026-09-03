@@ -342,8 +342,49 @@ fn r16a_past_regression_corpus_is_exact() {
 }
 
 #[test]
+fn r16a_resolution_fixed_identity_fifo_invalid_future_regression() {
+    let case = r16a::corpus::past_regressions()
+        .into_iter()
+        .find(|case| case.name == "resolution-cancel-reuse-and-invalid-future")
+        .expect("fixed resolution regression");
+    assert_eq!(case.encoded[16..24], 7_u64.to_le_bytes());
+    assert_eq!(case.encoded[24..32], 100_u64.to_le_bytes());
+    assert_eq!(
+        &case.encoded[72..],
+        &[2, 2, 2, 6, 0, 0, 0, 0, 0, 1, 1, 0, 2, 7, 0, 2]
+    );
+    match r16a::envelope::parse(&case.encoded).unwrap().expected {
+        Expected::Resolution(summary) => assert_eq!(
+            summary,
+            r16a::envelope::ResolutionSummary {
+                pending_states: 2,
+                pending_actions: 2,
+                dynamic_neighbors: 1,
+                queued: 3,
+                suppressed: 1,
+                state_full: 0,
+                action_full: 0,
+                clock_regressions: 0,
+            }
+        ),
+        expected => panic!("fixed resolution expected value changed: {expected:?}"),
+    }
+    r16a::targets::run_resolution_fixed_identity_fifo_regression().unwrap();
+}
+
+#[test]
 fn r16a_short_seed_matrix_is_deterministic() {
     r16a::run_short_matrix();
+}
+
+#[test]
+fn r16a_state_property_contract_smoke() {
+    r16a::state::run_short_state_smoke();
+}
+
+#[test]
+fn r16a_combined_nat_firewall_fixed_transaction_regression() {
+    r16a::state::run_combined_nat_firewall_fixed_regression();
 }
 
 #[test]
@@ -495,6 +536,12 @@ fn r16a_environment_surface_is_fixed_and_cold_only() {
 #[ignore = "bounded R16A full smoke; invoke explicitly with the documented exact command"]
 fn r16a_bounded_smoke() {
     r16a::run_bounded_smoke();
+}
+
+#[test]
+#[ignore = "fixed-seed NAT/FW state property smoke; invoke explicitly with the documented exact command"]
+fn r16a_state_property_smoke() {
+    r16a::state::run_full_state_smoke();
 }
 
 fn stable_digest(bytes: &[u8]) -> u64 {

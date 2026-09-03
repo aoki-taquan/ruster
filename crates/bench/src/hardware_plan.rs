@@ -8,30 +8,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::{
-    AfxdpMode, DirectionProfile, HardwareCase, HardwareFrame, SchemaError, ServiceProfile,
-    TransportProfile,
+    AfxdpMode, DirectionProfile, HardwareCase, HardwareFrame, ImixAcceptedFrames, SchemaError,
+    ServiceProfile, TransportProfile,
 };
-
-pub const HARDWARE_PLAN_VERSION: u32 = 1;
-pub const HARDWARE_PRIMARY_CASE_COUNT: usize = 90;
-pub const HARDWARE_CONTROL_CASE_COUNT: usize = 147;
-pub const HARDWARE_TOTAL_CASE_COUNT: usize =
-    HARDWARE_PRIMARY_CASE_COUNT + HARDWARE_CONTROL_CASE_COUNT;
-
-pub const RUSTER_IMIX_V1_CYCLE: [HardwareFrame; 12] = [
-    HardwareFrame::Eth64,
-    HardwareFrame::Eth64,
-    HardwareFrame::Eth64,
-    HardwareFrame::Eth64,
-    HardwareFrame::Eth64,
-    HardwareFrame::Eth64,
-    HardwareFrame::Eth64,
-    HardwareFrame::Eth512,
-    HardwareFrame::Eth512,
-    HardwareFrame::Eth512,
-    HardwareFrame::Eth512,
-    HardwareFrame::Ipv4Mtu1500,
-];
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -44,6 +23,22 @@ pub enum HardwarePlanClass {
     StandaloneFirewall,
     UdpZero,
     BatchSweep,
+}
+
+impl HardwarePlanClass {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::FlowOne => "flow-one",
+            Self::Flow64Imix => "flow64-imix",
+            Self::SingleQueue => "single-queue",
+            Self::CopyMode => "copy-mode",
+            Self::StandaloneFirewall => "standalone-firewall",
+            Self::UdpZero => "udp-zero",
+            Self::BatchSweep => "batch-sweep",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -82,6 +77,265 @@ pub enum FrameWireModel {
     Fixed(FixedFrameWireModel),
     RusterImixV1(ImixWireModel),
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HardwareCaseSettings {
+    pub mode: AfxdpMode,
+    pub queue_count: u16,
+    pub batch_size: u16,
+    pub flow_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HardwareRateFormula {
+    FixedBitsPerSecondOverL1BytesTimesEight,
+    ImixBitsPerSecondTimesCyclePacketsOverCycleL1BytesTimesEight,
+}
+
+impl HardwareRateFormula {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::FixedBitsPerSecondOverL1BytesTimesEight => {
+                "bits-per-second/(l1-bytes*bits-per-byte)"
+            }
+            Self::ImixBitsPerSecondTimesCyclePacketsOverCycleL1BytesTimesEight => {
+                "bits-per-second*cycle-packets/(cycle-l1-bytes*bits-per-byte)"
+            }
+        }
+    }
+
+    const fn bits_per_byte(self) -> u8 {
+        match self {
+            Self::FixedBitsPerSecondOverL1BytesTimesEight
+            | Self::ImixBitsPerSecondTimesCyclePacketsOverCycleL1BytesTimesEight => 8,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HardwareWireModelDescriptor {
+    pub fixed_eth64: FixedFrameWireModel,
+    pub fixed_eth128: FixedFrameWireModel,
+    pub fixed_eth512: FixedFrameWireModel,
+    pub fixed_ip_mtu1500: FixedFrameWireModel,
+    pub imix: ImixWireModel,
+    pub imix_cycle: [HardwareFrame; 12],
+    pub reference_line_rate_bps: u64,
+    pub fixed_rate_formula: HardwareRateFormula,
+    pub imix_rate_formula: HardwareRateFormula,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HardwareNormativeDescriptor {
+    pub version: u32,
+    pub primary_case_count: usize,
+    pub control_case_count: usize,
+    pub total_case_count: usize,
+    pub primary_frames: [HardwareFrame; 5],
+    pub control_frames: [HardwareFrame; 3],
+    pub directions: [DirectionProfile; 3],
+    pub primary_services: [ServiceProfile; 3],
+    pub primary_transports: [TransportProfile; 2],
+    pub primary_settings: HardwareCaseSettings,
+    pub flow_one_settings: HardwareCaseSettings,
+    pub flow64_imix_settings: HardwareCaseSettings,
+    pub single_queue_settings: HardwareCaseSettings,
+    pub copy_mode_settings: HardwareCaseSettings,
+    pub standalone_firewall_settings: HardwareCaseSettings,
+    pub udp_zero_settings: [HardwareCaseSettings; 4],
+    pub batch_sweep_settings: HardwareCaseSettings,
+    pub batch_sweep_values: [u16; 3],
+    pub control_slice_order: [HardwarePlanClass; 7],
+    pub control_nesting: [&'static str; 7],
+    pub control_counts: [usize; 7],
+    pub wire: HardwareWireModelDescriptor,
+    pub setup_semantics: &'static str,
+    pub hash_role_semantics: &'static str,
+}
+
+pub const HARDWARE_NORMATIVE_DESCRIPTOR_V1: HardwareNormativeDescriptor =
+    HardwareNormativeDescriptor {
+        version: 1,
+        primary_case_count: 5 * 3 * 3 * 2,
+        control_case_count: 27 + 9 + 27 + 27 + 18 + 36 + 3,
+        total_case_count: (5 * 3 * 3 * 2) + (27 + 9 + 27 + 27 + 18 + 36 + 3),
+        primary_frames: [
+            HardwareFrame::Eth64,
+            HardwareFrame::Eth128,
+            HardwareFrame::Eth512,
+            HardwareFrame::Ipv4Mtu1500,
+            HardwareFrame::RusterImixV1,
+        ],
+        control_frames: [
+            HardwareFrame::Eth64,
+            HardwareFrame::Eth512,
+            HardwareFrame::Ipv4Mtu1500,
+        ],
+        directions: [
+            DirectionProfile::Outbound,
+            DirectionProfile::Inbound,
+            DirectionProfile::Bidirectional,
+        ],
+        primary_services: [
+            ServiceProfile::Plain,
+            ServiceProfile::Nat44,
+            ServiceProfile::Nat44Firewall,
+        ],
+        primary_transports: [TransportProfile::UdpChecksum, TransportProfile::TcpChecksum],
+        primary_settings: HardwareCaseSettings {
+            mode: AfxdpMode::ZeroCopy,
+            queue_count: 4,
+            batch_size: 64,
+            flow_count: 4_096,
+        },
+        flow_one_settings: HardwareCaseSettings {
+            mode: AfxdpMode::ZeroCopy,
+            queue_count: 4,
+            batch_size: 64,
+            flow_count: 1,
+        },
+        flow64_imix_settings: HardwareCaseSettings {
+            mode: AfxdpMode::ZeroCopy,
+            queue_count: 4,
+            batch_size: 64,
+            flow_count: 64,
+        },
+        single_queue_settings: HardwareCaseSettings {
+            mode: AfxdpMode::ZeroCopy,
+            queue_count: 1,
+            batch_size: 64,
+            flow_count: 4_096,
+        },
+        copy_mode_settings: HardwareCaseSettings {
+            mode: AfxdpMode::Copy,
+            queue_count: 4,
+            batch_size: 64,
+            flow_count: 4_096,
+        },
+        standalone_firewall_settings: HardwareCaseSettings {
+            mode: AfxdpMode::ZeroCopy,
+            queue_count: 4,
+            batch_size: 64,
+            flow_count: 4_096,
+        },
+        udp_zero_settings: [
+            HardwareCaseSettings {
+                mode: AfxdpMode::ZeroCopy,
+                queue_count: 4,
+                batch_size: 64,
+                flow_count: 1,
+            },
+            HardwareCaseSettings {
+                mode: AfxdpMode::ZeroCopy,
+                queue_count: 4,
+                batch_size: 64,
+                flow_count: 64,
+            },
+            HardwareCaseSettings {
+                mode: AfxdpMode::ZeroCopy,
+                queue_count: 1,
+                batch_size: 64,
+                flow_count: 4_096,
+            },
+            HardwareCaseSettings {
+                mode: AfxdpMode::Copy,
+                queue_count: 4,
+                batch_size: 64,
+                flow_count: 4_096,
+            },
+        ],
+        batch_sweep_settings: HardwareCaseSettings {
+            mode: AfxdpMode::ZeroCopy,
+            queue_count: 4,
+            batch_size: 64,
+            flow_count: 4_096,
+        },
+        batch_sweep_values: [1, 32, 256],
+        control_slice_order: [
+            HardwarePlanClass::FlowOne,
+            HardwarePlanClass::Flow64Imix,
+            HardwarePlanClass::SingleQueue,
+            HardwarePlanClass::CopyMode,
+            HardwarePlanClass::StandaloneFirewall,
+            HardwarePlanClass::UdpZero,
+            HardwarePlanClass::BatchSweep,
+        ],
+        control_nesting: [
+            "flow-one:frame>direction>service",
+            "flow64-imix:direction>service",
+            "single-queue:frame>direction>service",
+            "copy-mode:frame>direction>service",
+            "standalone-firewall:frame>direction>transport",
+            "udp-zero:profile>frame>direction",
+            "batch-sweep:value",
+        ],
+        control_counts: [27, 9, 27, 27, 18, 36, 3],
+        wire: HardwareWireModelDescriptor {
+            fixed_eth64: FixedFrameWireModel {
+                backend_bytes: 60,
+                ethernet_bytes_including_fcs: 64,
+                l1_bytes_with_preamble_ifg: 84,
+            },
+            fixed_eth128: FixedFrameWireModel {
+                backend_bytes: 124,
+                ethernet_bytes_including_fcs: 128,
+                l1_bytes_with_preamble_ifg: 148,
+            },
+            fixed_eth512: FixedFrameWireModel {
+                backend_bytes: 508,
+                ethernet_bytes_including_fcs: 512,
+                l1_bytes_with_preamble_ifg: 532,
+            },
+            fixed_ip_mtu1500: FixedFrameWireModel {
+                backend_bytes: 1_514,
+                ethernet_bytes_including_fcs: 1_518,
+                l1_bytes_with_preamble_ifg: 1_538,
+            },
+            imix: ImixWireModel {
+                cycle_packets: 12,
+                eth64_packets: 7,
+                eth512_packets: 4,
+                ip_mtu1500_packets: 1,
+                cycle_l1_bytes_with_preamble_ifg: 4_254,
+            },
+            imix_cycle: [
+                HardwareFrame::Eth64,
+                HardwareFrame::Eth64,
+                HardwareFrame::Eth64,
+                HardwareFrame::Eth64,
+                HardwareFrame::Eth64,
+                HardwareFrame::Eth64,
+                HardwareFrame::Eth64,
+                HardwareFrame::Eth512,
+                HardwareFrame::Eth512,
+                HardwareFrame::Eth512,
+                HardwareFrame::Eth512,
+                HardwareFrame::Ipv4Mtu1500,
+            ],
+            reference_line_rate_bps: 10_000_000_000,
+            fixed_rate_formula: HardwareRateFormula::FixedBitsPerSecondOverL1BytesTimesEight,
+            imix_rate_formula:
+                HardwareRateFormula::ImixBitsPerSecondTimesCyclePacketsOverCycleL1BytesTimesEight,
+        },
+        setup_semantics: "setup-before-measurement;udp-one-step;tcp-syn-syn-ack-ack",
+        hash_role_semantics:
+            "siphash-2-4;nat-udp-mapping-peer;nat-tcp-mapping-session;firewall-stateful-flow",
+    };
+
+pub const HARDWARE_PLAN_VERSION: u32 = HARDWARE_NORMATIVE_DESCRIPTOR_V1.version;
+pub const HARDWARE_PRIMARY_CASE_COUNT: usize = HARDWARE_NORMATIVE_DESCRIPTOR_V1.primary_case_count;
+pub const HARDWARE_CONTROL_CASE_COUNT: usize = HARDWARE_NORMATIVE_DESCRIPTOR_V1.control_case_count;
+pub const HARDWARE_TOTAL_CASE_COUNT: usize = HARDWARE_NORMATIVE_DESCRIPTOR_V1.total_case_count;
+/// Known answer for the complete v1 hardware descriptor and ordered plan.
+///
+/// This value is deliberately kept separate from the serializer below. It is
+/// the compatibility boundary used by the measurement protocol and its
+/// independent regression tests.
+pub const HARDWARE_PLAN_FINGERPRINT_V1: u64 = 0x7508_ce5c_f2cb_672e;
+
+pub const RUSTER_IMIX_V1_CYCLE: [HardwareFrame; 12] =
+    HARDWARE_NORMATIVE_DESCRIPTOR_V1.wire.imix_cycle;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 /// A reduced packet-rate fraction whose denominator is always nonzero.
@@ -231,34 +485,13 @@ impl std::error::Error for HardwarePlanError {}
 
 #[must_use]
 pub const fn frame_wire_model(frame: HardwareFrame) -> FrameWireModel {
+    let wire = HARDWARE_NORMATIVE_DESCRIPTOR_V1.wire;
     match frame {
-        HardwareFrame::Eth64 => FrameWireModel::Fixed(FixedFrameWireModel {
-            backend_bytes: 60,
-            ethernet_bytes_including_fcs: 64,
-            l1_bytes_with_preamble_ifg: 84,
-        }),
-        HardwareFrame::Eth128 => FrameWireModel::Fixed(FixedFrameWireModel {
-            backend_bytes: 124,
-            ethernet_bytes_including_fcs: 128,
-            l1_bytes_with_preamble_ifg: 148,
-        }),
-        HardwareFrame::Eth512 => FrameWireModel::Fixed(FixedFrameWireModel {
-            backend_bytes: 508,
-            ethernet_bytes_including_fcs: 512,
-            l1_bytes_with_preamble_ifg: 532,
-        }),
-        HardwareFrame::Ipv4Mtu1500 => FrameWireModel::Fixed(FixedFrameWireModel {
-            backend_bytes: 1_514,
-            ethernet_bytes_including_fcs: 1_518,
-            l1_bytes_with_preamble_ifg: 1_538,
-        }),
-        HardwareFrame::RusterImixV1 => FrameWireModel::RusterImixV1(ImixWireModel {
-            cycle_packets: 12,
-            eth64_packets: 7,
-            eth512_packets: 4,
-            ip_mtu1500_packets: 1,
-            cycle_l1_bytes_with_preamble_ifg: 4_254,
-        }),
+        HardwareFrame::Eth64 => FrameWireModel::Fixed(wire.fixed_eth64),
+        HardwareFrame::Eth128 => FrameWireModel::Fixed(wire.fixed_eth128),
+        HardwareFrame::Eth512 => FrameWireModel::Fixed(wire.fixed_eth512),
+        HardwareFrame::Ipv4Mtu1500 => FrameWireModel::Fixed(wire.fixed_ip_mtu1500),
+        HardwareFrame::RusterImixV1 => FrameWireModel::RusterImixV1(wire.imix),
     }
 }
 
@@ -272,21 +505,283 @@ pub fn line_rate_packet_rate(
     let (numerator, denominator) = match frame_wire_model(frame) {
         FrameWireModel::Fixed(model) => (
             u128::from(bits_per_second),
-            u128::from(model.l1_bytes_with_preamble_ifg) * 8,
+            u128::from(model.l1_bytes_with_preamble_ifg)
+                * u128::from(
+                    HARDWARE_NORMATIVE_DESCRIPTOR_V1
+                        .wire
+                        .fixed_rate_formula
+                        .bits_per_byte(),
+                ),
         ),
         FrameWireModel::RusterImixV1(model) => (
             u128::from(bits_per_second)
                 .checked_mul(u128::from(model.cycle_packets))
                 .ok_or(HardwarePlanError::ArithmeticOverflow)?,
-            u128::from(model.cycle_l1_bytes_with_preamble_ifg) * 8,
+            u128::from(model.cycle_l1_bytes_with_preamble_ifg)
+                * u128::from(
+                    HARDWARE_NORMATIVE_DESCRIPTOR_V1
+                        .wire
+                        .imix_rate_formula
+                        .bits_per_byte(),
+                ),
         ),
     };
     Ok(ExactPacketRate::reduced(numerator, denominator))
 }
 
+pub(crate) fn fixed_l1_bit_count(
+    frame: HardwareFrame,
+    accepted_packets: u64,
+) -> Result<u128, HardwarePlanError> {
+    let FrameWireModel::Fixed(model) = frame_wire_model(frame) else {
+        return Err(HardwarePlanError::ArithmeticOverflow);
+    };
+    u128::from(accepted_packets)
+        .checked_mul(u128::from(model.l1_bytes_with_preamble_ifg))
+        .and_then(|value| {
+            value.checked_mul(u128::from(
+                HARDWARE_NORMATIVE_DESCRIPTOR_V1
+                    .wire
+                    .fixed_rate_formula
+                    .bits_per_byte(),
+            ))
+        })
+        .ok_or(HardwarePlanError::ArithmeticOverflow)
+}
+
+pub(crate) fn imix_l1_bit_count(evidence: ImixAcceptedFrames) -> Result<u128, HardwarePlanError> {
+    let wire = HARDWARE_NORMATIVE_DESCRIPTOR_V1.wire;
+    let eth64 = u128::from(evidence.eth64_packets)
+        .checked_mul(u128::from(wire.fixed_eth64.l1_bytes_with_preamble_ifg));
+    let eth512 = u128::from(evidence.eth512_packets)
+        .checked_mul(u128::from(wire.fixed_eth512.l1_bytes_with_preamble_ifg));
+    let mtu = u128::from(evidence.ip_mtu1500_packets)
+        .checked_mul(u128::from(wire.fixed_ip_mtu1500.l1_bytes_with_preamble_ifg));
+    eth64
+        .and_then(|value| eth512.and_then(|part| value.checked_add(part)))
+        .and_then(|value| mtu.and_then(|part| value.checked_add(part)))
+        .and_then(|value| value.checked_mul(u128::from(wire.imix_rate_formula.bits_per_byte())))
+        .ok_or(HardwarePlanError::ArithmeticOverflow)
+}
+
+const FINGERPRINT_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FINGERPRINT_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fingerprint_byte(hash: u64, byte: u8) -> u64 {
+    (hash ^ u64::from(byte)).wrapping_mul(FINGERPRINT_PRIME)
+}
+
+fn fingerprint_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash = fingerprint_byte(hash, byte);
+    }
+    hash
+}
+
+fn fingerprint_u16(hash: u64, value: u16) -> u64 {
+    fingerprint_bytes(hash, &value.to_be_bytes())
+}
+
+fn fingerprint_u32(hash: u64, value: u32) -> u64 {
+    fingerprint_bytes(hash, &value.to_be_bytes())
+}
+
+fn fingerprint_u64(hash: u64, value: u64) -> u64 {
+    fingerprint_bytes(hash, &value.to_be_bytes())
+}
+
+fn fingerprint_usize(hash: u64, value: usize) -> u64 {
+    fingerprint_u64(hash, value as u64)
+}
+
+fn fingerprint_string(mut hash: u64, value: &str) -> u64 {
+    hash = fingerprint_usize(hash, value.len());
+    fingerprint_bytes(hash, value.as_bytes())
+}
+
+fn fingerprint_frame(hash: u64, frame: HardwareFrame) -> u64 {
+    fingerprint_string(hash, frame.label())
+}
+
+fn fingerprint_frame_sequence(mut hash: u64, frames: &[HardwareFrame]) -> u64 {
+    hash = fingerprint_usize(hash, frames.len());
+    for &frame in frames {
+        hash = fingerprint_frame(hash, frame);
+    }
+    hash
+}
+
+fn fingerprint_settings(mut hash: u64, label: &str, settings: HardwareCaseSettings) -> u64 {
+    hash = fingerprint_string(hash, label);
+    hash = fingerprint_string(hash, settings.mode.label());
+    hash = fingerprint_u16(hash, settings.queue_count);
+    hash = fingerprint_u16(hash, settings.batch_size);
+    fingerprint_u32(hash, settings.flow_count)
+}
+
+fn fingerprint_class_sequence(mut hash: u64, classes: &[HardwarePlanClass]) -> u64 {
+    hash = fingerprint_usize(hash, classes.len());
+    for &class in classes {
+        hash = fingerprint_string(hash, class.label());
+    }
+    hash
+}
+
+fn fingerprint_fixed_wire_model(mut hash: u64, label: &str, model: FixedFrameWireModel) -> u64 {
+    hash = fingerprint_string(hash, label);
+    hash = fingerprint_u16(hash, model.backend_bytes);
+    hash = fingerprint_u16(hash, model.ethernet_bytes_including_fcs);
+    fingerprint_u16(hash, model.l1_bytes_with_preamble_ifg)
+}
+
+fn fingerprint_imix_wire_model(mut hash: u64, model: ImixWireModel) -> u64 {
+    hash = fingerprint_string(hash, "imix");
+    hash = fingerprint_u16(hash, model.cycle_packets);
+    hash = fingerprint_u16(hash, model.eth64_packets);
+    hash = fingerprint_u16(hash, model.eth512_packets);
+    hash = fingerprint_u16(hash, model.ip_mtu1500_packets);
+    fingerprint_u16(hash, model.cycle_l1_bytes_with_preamble_ifg)
+}
+
+fn fingerprint_wire_descriptor(mut hash: u64, wire: HardwareWireModelDescriptor) -> u64 {
+    hash = fingerprint_string(hash, "wire/v1");
+    hash = fingerprint_fixed_wire_model(hash, "eth64", wire.fixed_eth64);
+    hash = fingerprint_fixed_wire_model(hash, "eth128", wire.fixed_eth128);
+    hash = fingerprint_fixed_wire_model(hash, "eth512", wire.fixed_eth512);
+    hash = fingerprint_fixed_wire_model(hash, "ip-mtu1500", wire.fixed_ip_mtu1500);
+    hash = fingerprint_imix_wire_model(hash, wire.imix);
+    hash = fingerprint_string(hash, "imix-cycle");
+    hash = fingerprint_frame_sequence(hash, &wire.imix_cycle);
+    hash = fingerprint_u64(hash, wire.reference_line_rate_bps);
+    hash = fingerprint_string(hash, wire.fixed_rate_formula.label());
+    hash = fingerprint_u8(hash, wire.fixed_rate_formula.bits_per_byte());
+    hash = fingerprint_string(hash, wire.imix_rate_formula.label());
+    fingerprint_u8(hash, wire.imix_rate_formula.bits_per_byte())
+}
+
+fn fingerprint_u8(hash: u64, value: u8) -> u64 {
+    fingerprint_byte(hash, value)
+}
+
+/// Returns the safe, non-cryptographic identity of the complete normative
+/// hardware descriptor. Every value and order that affects plan construction
+/// or wire/rate arithmetic is included; no caller may substitute a case-only
+/// fingerprint for this descriptor identity.
+pub(crate) fn hardware_normative_descriptor_fingerprint(
+    descriptor: &HardwareNormativeDescriptor,
+) -> u64 {
+    let mut hash = fingerprint_string(FINGERPRINT_OFFSET, "ruster.hardware.normative/v2");
+    hash = fingerprint_u32(hash, descriptor.version);
+    hash = fingerprint_usize(hash, descriptor.primary_case_count);
+    hash = fingerprint_usize(hash, descriptor.control_case_count);
+    hash = fingerprint_usize(hash, descriptor.total_case_count);
+
+    hash = fingerprint_string(hash, "primary-frames");
+    hash = fingerprint_frame_sequence(hash, &descriptor.primary_frames);
+    hash = fingerprint_string(hash, "control-frames");
+    hash = fingerprint_frame_sequence(hash, &descriptor.control_frames);
+    hash = fingerprint_string(hash, "directions");
+    hash = fingerprint_usize(hash, descriptor.directions.len());
+    for direction in descriptor.directions {
+        hash = fingerprint_string(hash, direction.label());
+    }
+    hash = fingerprint_string(hash, "primary-services");
+    hash = fingerprint_usize(hash, descriptor.primary_services.len());
+    for service in descriptor.primary_services {
+        hash = fingerprint_string(hash, service.label());
+    }
+    hash = fingerprint_string(hash, "primary-transports");
+    hash = fingerprint_usize(hash, descriptor.primary_transports.len());
+    for transport in descriptor.primary_transports {
+        hash = fingerprint_string(hash, transport.label());
+    }
+
+    hash = fingerprint_settings(hash, "primary-settings", descriptor.primary_settings);
+    hash = fingerprint_settings(hash, "flow-one-settings", descriptor.flow_one_settings);
+    hash = fingerprint_settings(
+        hash,
+        "flow64-imix-settings",
+        descriptor.flow64_imix_settings,
+    );
+    hash = fingerprint_settings(
+        hash,
+        "single-queue-settings",
+        descriptor.single_queue_settings,
+    );
+    hash = fingerprint_settings(hash, "copy-mode-settings", descriptor.copy_mode_settings);
+    hash = fingerprint_settings(
+        hash,
+        "standalone-firewall-settings",
+        descriptor.standalone_firewall_settings,
+    );
+    hash = fingerprint_string(hash, "udp-zero-settings");
+    hash = fingerprint_usize(hash, descriptor.udp_zero_settings.len());
+    for settings in descriptor.udp_zero_settings {
+        hash = fingerprint_settings(hash, "profile", settings);
+    }
+    hash = fingerprint_settings(
+        hash,
+        "batch-sweep-settings",
+        descriptor.batch_sweep_settings,
+    );
+    hash = fingerprint_string(hash, "batch-sweep-values");
+    hash = fingerprint_usize(hash, descriptor.batch_sweep_values.len());
+    for value in descriptor.batch_sweep_values {
+        hash = fingerprint_u16(hash, value);
+    }
+
+    hash = fingerprint_string(hash, "control-slice-order");
+    hash = fingerprint_class_sequence(hash, &descriptor.control_slice_order);
+    hash = fingerprint_string(hash, "control-nesting");
+    hash = fingerprint_usize(hash, descriptor.control_nesting.len());
+    for nesting in descriptor.control_nesting {
+        hash = fingerprint_string(hash, nesting);
+    }
+    hash = fingerprint_string(hash, "control-counts");
+    hash = fingerprint_usize(hash, descriptor.control_counts.len());
+    for count in descriptor.control_counts {
+        hash = fingerprint_usize(hash, count);
+    }
+
+    hash = fingerprint_wire_descriptor(hash, descriptor.wire);
+    hash = fingerprint_string(hash, "setup-semantics");
+    hash = fingerprint_string(hash, descriptor.setup_semantics);
+    hash = fingerprint_string(hash, "hash-role-semantics");
+    fingerprint_string(hash, descriptor.hash_role_semantics)
+}
+
+fn fingerprint_case(mut hash: u64, planned: &PlannedHardwareCase) -> u64 {
+    hash = fingerprint_u16(hash, planned.ordinal);
+    hash = fingerprint_u64(hash, planned.seed);
+    hash = fingerprint_string(hash, planned.class.label());
+    hash = fingerprint_string(hash, &planned.case_id);
+    hash = fingerprint_string(hash, planned.case.mode.label());
+    hash = fingerprint_u16(hash, planned.case.queue_count);
+    hash = fingerprint_u16(hash, planned.case.batch_size);
+    hash = fingerprint_frame(hash, planned.case.frame);
+    hash = fingerprint_u32(hash, planned.case.flow_count);
+    hash = fingerprint_string(hash, planned.case.direction.label());
+    hash = fingerprint_string(hash, planned.case.service.label());
+    fingerprint_string(hash, planned.case.transport.label())
+}
+
+/// Computes the compatibility identity for the descriptor and the complete
+/// ordered plan. This is the only plan fingerprint implementation used by
+/// the measurement protocol.
+pub(crate) fn hardware_plan_fingerprint(plan: &HardwarePlan) -> u64 {
+    let mut hash = hardware_normative_descriptor_fingerprint(&HARDWARE_NORMATIVE_DESCRIPTOR_V1);
+    hash = fingerprint_string(hash, "plan/v1");
+    hash = fingerprint_u32(hash, plan.version);
+    hash = fingerprint_usize(hash, plan.cases.len());
+    for planned in &plan.cases {
+        hash = fingerprint_case(hash, planned);
+    }
+    hash
+}
+
 pub fn hardware_plan_v1() -> Result<HardwarePlan, HardwarePlanError> {
     let plan = HardwarePlan {
-        version: 1,
+        version: HARDWARE_PLAN_VERSION,
         cases: build_hardware_plan_v1(),
     };
     validate_hardware_plan_v1(&plan)?;
@@ -294,9 +789,9 @@ pub fn hardware_plan_v1() -> Result<HardwarePlan, HardwarePlanError> {
 }
 
 pub fn validate_hardware_plan_v1(plan: &HardwarePlan) -> Result<(), HardwarePlanError> {
-    if plan.version != 1 {
+    if plan.version != HARDWARE_PLAN_VERSION {
         return Err(HardwarePlanError::UnsupportedVersion {
-            expected: 1,
+            expected: HARDWARE_PLAN_VERSION,
             actual: plan.version,
         });
     }
@@ -389,45 +884,18 @@ fn greatest_common_divisor(mut left: u128, mut right: u128) -> u128 {
 }
 
 fn build_hardware_plan_v1() -> Vec<PlannedHardwareCase> {
-    const ALL_FRAMES: [HardwareFrame; 5] = [
-        HardwareFrame::Eth64,
-        HardwareFrame::Eth128,
-        HardwareFrame::Eth512,
-        HardwareFrame::Ipv4Mtu1500,
-        HardwareFrame::RusterImixV1,
-    ];
-    const CONTROL_FRAMES: [HardwareFrame; 3] = [
-        HardwareFrame::Eth64,
-        HardwareFrame::Eth512,
-        HardwareFrame::Ipv4Mtu1500,
-    ];
-    const DIRECTIONS: [DirectionProfile; 3] = [
-        DirectionProfile::Outbound,
-        DirectionProfile::Inbound,
-        DirectionProfile::Bidirectional,
-    ];
-    const PRIMARY_SERVICES: [ServiceProfile; 3] = [
-        ServiceProfile::Plain,
-        ServiceProfile::Nat44,
-        ServiceProfile::Nat44Firewall,
-    ];
-    const PRIMARY_TRANSPORTS: [TransportProfile; 2] =
-        [TransportProfile::UdpChecksum, TransportProfile::TcpChecksum];
-
+    let descriptor = HARDWARE_NORMATIVE_DESCRIPTOR_V1;
     let mut cases = Vec::with_capacity(HARDWARE_TOTAL_CASE_COUNT);
-    for frame in ALL_FRAMES {
-        for direction in DIRECTIONS {
-            for service in PRIMARY_SERVICES {
-                for transport in PRIMARY_TRANSPORTS {
+    for frame in descriptor.primary_frames {
+        for direction in descriptor.directions {
+            for service in descriptor.primary_services {
+                for transport in descriptor.primary_transports {
                     push_case(
                         &mut cases,
                         HardwarePlanClass::Primary,
-                        case(
-                            AfxdpMode::ZeroCopy,
-                            4,
-                            64,
+                        case_from_settings(
+                            descriptor.primary_settings,
                             frame,
-                            4_096,
                             direction,
                             service,
                             transport,
@@ -438,18 +906,15 @@ fn build_hardware_plan_v1() -> Vec<PlannedHardwareCase> {
         }
     }
 
-    for frame in CONTROL_FRAMES {
-        for direction in DIRECTIONS {
-            for service in PRIMARY_SERVICES {
+    for frame in descriptor.control_frames {
+        for direction in descriptor.directions {
+            for service in descriptor.primary_services {
                 push_case(
                     &mut cases,
-                    HardwarePlanClass::FlowOne,
-                    case(
-                        AfxdpMode::ZeroCopy,
-                        4,
-                        64,
+                    descriptor.control_slice_order[0],
+                    case_from_settings(
+                        descriptor.flow_one_settings,
                         frame,
-                        1,
                         direction,
                         service,
                         TransportProfile::UdpChecksum,
@@ -459,17 +924,14 @@ fn build_hardware_plan_v1() -> Vec<PlannedHardwareCase> {
         }
     }
 
-    for direction in DIRECTIONS {
-        for service in PRIMARY_SERVICES {
+    for direction in descriptor.directions {
+        for service in descriptor.primary_services {
             push_case(
                 &mut cases,
-                HardwarePlanClass::Flow64Imix,
-                case(
-                    AfxdpMode::ZeroCopy,
-                    4,
-                    64,
+                descriptor.control_slice_order[1],
+                case_from_settings(
+                    descriptor.flow64_imix_settings,
                     HardwareFrame::RusterImixV1,
-                    64,
                     direction,
                     service,
                     TransportProfile::UdpChecksum,
@@ -478,18 +940,15 @@ fn build_hardware_plan_v1() -> Vec<PlannedHardwareCase> {
         }
     }
 
-    for frame in CONTROL_FRAMES {
-        for direction in DIRECTIONS {
-            for service in PRIMARY_SERVICES {
+    for frame in descriptor.control_frames {
+        for direction in descriptor.directions {
+            for service in descriptor.primary_services {
                 push_case(
                     &mut cases,
-                    HardwarePlanClass::SingleQueue,
-                    case(
-                        AfxdpMode::ZeroCopy,
-                        1,
-                        64,
+                    descriptor.control_slice_order[2],
+                    case_from_settings(
+                        descriptor.single_queue_settings,
                         frame,
-                        4_096,
                         direction,
                         service,
                         TransportProfile::UdpChecksum,
@@ -499,18 +958,15 @@ fn build_hardware_plan_v1() -> Vec<PlannedHardwareCase> {
         }
     }
 
-    for frame in CONTROL_FRAMES {
-        for direction in DIRECTIONS {
-            for service in PRIMARY_SERVICES {
+    for frame in descriptor.control_frames {
+        for direction in descriptor.directions {
+            for service in descriptor.primary_services {
                 push_case(
                     &mut cases,
-                    HardwarePlanClass::CopyMode,
-                    case(
-                        AfxdpMode::Copy,
-                        4,
-                        64,
+                    descriptor.control_slice_order[3],
+                    case_from_settings(
+                        descriptor.copy_mode_settings,
                         frame,
-                        4_096,
                         direction,
                         service,
                         TransportProfile::UdpChecksum,
@@ -520,18 +976,15 @@ fn build_hardware_plan_v1() -> Vec<PlannedHardwareCase> {
         }
     }
 
-    for frame in CONTROL_FRAMES {
-        for direction in DIRECTIONS {
-            for transport in PRIMARY_TRANSPORTS {
+    for frame in descriptor.control_frames {
+        for direction in descriptor.directions {
+            for transport in descriptor.primary_transports {
                 push_case(
                     &mut cases,
-                    HardwarePlanClass::StandaloneFirewall,
-                    case(
-                        AfxdpMode::ZeroCopy,
-                        4,
-                        64,
+                    descriptor.control_slice_order[4],
+                    case_from_settings(
+                        descriptor.standalone_firewall_settings,
                         frame,
-                        4_096,
                         direction,
                         ServiceProfile::Firewall,
                         transport,
@@ -541,23 +994,15 @@ fn build_hardware_plan_v1() -> Vec<PlannedHardwareCase> {
         }
     }
 
-    for (mode, queue_count, flow_count) in [
-        (AfxdpMode::ZeroCopy, 4, 1),
-        (AfxdpMode::ZeroCopy, 4, 64),
-        (AfxdpMode::ZeroCopy, 1, 4_096),
-        (AfxdpMode::Copy, 4, 4_096),
-    ] {
-        for frame in CONTROL_FRAMES {
-            for direction in DIRECTIONS {
+    for settings in descriptor.udp_zero_settings {
+        for frame in descriptor.control_frames {
+            for direction in descriptor.directions {
                 push_case(
                     &mut cases,
-                    HardwarePlanClass::UdpZero,
-                    case(
-                        mode,
-                        queue_count,
-                        64,
+                    descriptor.control_slice_order[5],
+                    case_from_settings(
+                        settings,
                         frame,
-                        flow_count,
                         direction,
                         ServiceProfile::Plain,
                         TransportProfile::UdpZero,
@@ -567,16 +1012,15 @@ fn build_hardware_plan_v1() -> Vec<PlannedHardwareCase> {
         }
     }
 
-    for batch_size in [1, 32, 256] {
+    for batch_size in descriptor.batch_sweep_values {
+        let mut settings = descriptor.batch_sweep_settings;
+        settings.batch_size = batch_size;
         push_case(
             &mut cases,
-            HardwarePlanClass::BatchSweep,
-            case(
-                AfxdpMode::ZeroCopy,
-                4,
-                batch_size,
+            descriptor.control_slice_order[6],
+            case_from_settings(
+                settings,
                 HardwareFrame::RusterImixV1,
-                4_096,
                 DirectionProfile::Bidirectional,
                 ServiceProfile::Nat44Firewall,
                 TransportProfile::UdpChecksum,
@@ -586,23 +1030,19 @@ fn build_hardware_plan_v1() -> Vec<PlannedHardwareCase> {
     cases
 }
 
-#[allow(clippy::too_many_arguments)]
-const fn case(
-    mode: AfxdpMode,
-    queue_count: u16,
-    batch_size: u16,
+const fn case_from_settings(
+    settings: HardwareCaseSettings,
     frame: HardwareFrame,
-    flow_count: u32,
     direction: DirectionProfile,
     service: ServiceProfile,
     transport: TransportProfile,
 ) -> HardwareCase {
     HardwareCase {
-        mode,
-        queue_count,
-        batch_size,
+        mode: settings.mode,
+        queue_count: settings.queue_count,
+        batch_size: settings.batch_size,
         frame,
-        flow_count,
+        flow_count: settings.flow_count,
         direction,
         service,
         transport,
@@ -660,32 +1100,7 @@ mod tests {
             "v1:zero-copy:q4:b256:ruster-imix-v1:f4096:bidirectional:nat44-firewall:udp-checksum"
         );
 
-        let mut fingerprint = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in first.version.to_be_bytes().into_iter().chain(*b"\n") {
-            fingerprint ^= u64::from(byte);
-            fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        for frame in RUSTER_IMIX_V1_CYCLE {
-            for byte in frame.label().bytes().chain(*b"\n") {
-                fingerprint ^= u64::from(byte);
-                fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        }
-        for planned in &first.cases {
-            for byte in planned
-                .ordinal
-                .to_be_bytes()
-                .into_iter()
-                .chain(planned.seed.to_be_bytes())
-                .chain([planned.class as u8])
-                .chain(planned.case_id.bytes())
-                .chain(*b"\n")
-            {
-                fingerprint ^= u64::from(byte);
-                fingerprint = fingerprint.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        }
-        assert_eq!(fingerprint, 0xf68c_80b7_2065_c023);
+        assert_eq!(hardware_plan_fingerprint(&first), 0x7508_ce5c_f2cb_672e);
     }
 
     #[test]
@@ -835,6 +1250,91 @@ mod tests {
         assert_eq!(
             line_rate_packet_rate(HardwareFrame::Eth64, 0),
             Err(HardwarePlanError::ZeroBitRate)
+        );
+    }
+
+    #[test]
+    fn r17_f08_normative_wire_descriptor_has_known_answer_and_numeric_boundaries() {
+        let descriptor = HARDWARE_NORMATIVE_DESCRIPTOR_V1;
+        assert_eq!(
+            hardware_normative_descriptor_fingerprint(&descriptor),
+            0xaa9b_ad5f_9e6d_8be7
+        );
+
+        for mutate in [
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor.wire.fixed_eth64.backend_bytes += 1
+            },
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor.wire.fixed_eth64.ethernet_bytes_including_fcs += 1
+            },
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor.wire.fixed_eth64.l1_bytes_with_preamble_ifg += 1
+            },
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor.wire.fixed_eth128.backend_bytes += 1
+            },
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor.wire.fixed_eth128.ethernet_bytes_including_fcs += 1
+            },
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor.wire.fixed_eth128.l1_bytes_with_preamble_ifg += 1
+            },
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor.wire.fixed_eth512.backend_bytes += 1
+            },
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor.wire.fixed_eth512.ethernet_bytes_including_fcs += 1
+            },
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor.wire.fixed_eth512.l1_bytes_with_preamble_ifg += 1
+            },
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor.wire.fixed_ip_mtu1500.backend_bytes += 1
+            },
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor
+                    .wire
+                    .fixed_ip_mtu1500
+                    .ethernet_bytes_including_fcs += 1
+            },
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor.wire.fixed_ip_mtu1500.l1_bytes_with_preamble_ifg += 1
+            },
+            |descriptor: &mut HardwareNormativeDescriptor| descriptor.wire.imix.cycle_packets += 1,
+            |descriptor: &mut HardwareNormativeDescriptor| descriptor.wire.imix.eth64_packets += 1,
+            |descriptor: &mut HardwareNormativeDescriptor| descriptor.wire.imix.eth512_packets += 1,
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor.wire.imix.ip_mtu1500_packets += 1
+            },
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor.wire.imix.cycle_l1_bytes_with_preamble_ifg += 1
+            },
+            |descriptor: &mut HardwareNormativeDescriptor| {
+                descriptor.wire.reference_line_rate_bps += 1
+            },
+        ] {
+            let mut mutated = descriptor;
+            mutate(&mut mutated);
+            assert_ne!(
+                hardware_normative_descriptor_fingerprint(&mutated),
+                hardware_normative_descriptor_fingerprint(&descriptor)
+            );
+        }
+
+        let mut formula = descriptor;
+        formula.wire.fixed_rate_formula =
+            HardwareRateFormula::ImixBitsPerSecondTimesCyclePacketsOverCycleL1BytesTimesEight;
+        assert_ne!(
+            hardware_normative_descriptor_fingerprint(&formula),
+            hardware_normative_descriptor_fingerprint(&descriptor)
+        );
+        let mut imix_formula = descriptor;
+        imix_formula.wire.imix_rate_formula =
+            HardwareRateFormula::FixedBitsPerSecondOverL1BytesTimesEight;
+        assert_ne!(
+            hardware_normative_descriptor_fingerprint(&imix_formula),
+            hardware_normative_descriptor_fingerprint(&descriptor)
         );
     }
 }

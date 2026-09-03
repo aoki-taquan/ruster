@@ -144,12 +144,11 @@ impl HardwareFrame {
 
     #[must_use]
     pub const fn l1_bytes_with_preamble_ifg(self) -> Option<u16> {
-        match self {
-            Self::Eth64 => Some(84),
-            Self::Eth128 => Some(148),
-            Self::Eth512 => Some(532),
-            Self::Ipv4Mtu1500 => Some(1_538),
-            Self::RusterImixV1 => None,
+        match crate::hardware_plan::frame_wire_model(self) {
+            crate::hardware_plan::FrameWireModel::Fixed(model) => {
+                Some(model.l1_bytes_with_preamble_ifg)
+            }
+            crate::hardware_plan::FrameWireModel::RusterImixV1(_) => None,
         }
     }
 
@@ -188,11 +187,9 @@ impl ImixAcceptedFrames {
         Ok(())
     }
 
-    fn l1_bit_count(self) -> u128 {
-        (u128::from(self.eth64_packets) * 84
-            + u128::from(self.eth512_packets) * 532
-            + u128::from(self.ip_mtu1500_packets) * 1_538)
-            * 8
+    fn l1_bit_count(self) -> Result<u128, SchemaError> {
+        crate::hardware_plan::imix_l1_bit_count(self)
+            .map_err(|_| SchemaError::InvalidField("imix_accepted_frames"))
     }
 
     fn to_json(self) -> JsonValue {
@@ -500,7 +497,7 @@ impl HardwareRepeat {
         let l1_bit_count = match (self.case.frame, self.imix_accepted_frames) {
             (HardwareFrame::RusterImixV1, Some(evidence)) => {
                 evidence.validate_total(self.accepted_packets)?;
-                evidence.l1_bit_count()
+                evidence.l1_bit_count()?
             }
             (HardwareFrame::RusterImixV1, None) => {
                 return Err(SchemaError::MissingField("imix_accepted_frames"));
@@ -508,15 +505,8 @@ impl HardwareRepeat {
             (_, Some(_)) => {
                 return Err(SchemaError::InvalidField("imix_accepted_frames"));
             }
-            (frame, None) => {
-                u128::from(self.accepted_packets)
-                    * u128::from(
-                        frame
-                            .l1_bytes_with_preamble_ifg()
-                            .expect("fixed frame has an L1 byte count"),
-                    )
-                    * 8
-            }
+            (frame, None) => crate::hardware_plan::fixed_l1_bit_count(frame, self.accepted_packets)
+                .map_err(|_| SchemaError::InvalidField("l1_gbps"))?,
         };
         let expected_l1_gbps =
             l1_bit_count as f64 / (f64::from(self.duration_seconds) * 1_000_000_000.0);

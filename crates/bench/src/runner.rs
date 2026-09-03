@@ -22,6 +22,7 @@ pub(crate) const MIN_AGGREGATE_REPETITIONS: usize = 64;
 pub enum Suite {
     Smoke,
     Datapath,
+    DeterministicSmoke,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,6 +69,8 @@ pub enum RunError {
     RepetitionOverflow,
     SetupControlExceededMeasured { setup: Duration, measured: Duration },
     TimedAllocations { case: &'static str, count: u64 },
+    AllocationInstrumentationUnavailable,
+    InvalidDeterministicSeed { expected: u64, actual: u64 },
     UnexpectedBatchReport,
     ForwardingOracle,
     InvalidStatistics,
@@ -87,6 +90,13 @@ impl fmt::Display for RunError {
             Self::TimedAllocations { case, count } => {
                 write!(formatter, "{case} allocated {count} times in timed regions")
             }
+            Self::AllocationInstrumentationUnavailable => formatter.write_str(
+                "allocation-free benchmark results require the ruster-bench counting allocator",
+            ),
+            Self::InvalidDeterministicSeed { expected, actual } => write!(
+                formatter,
+                "deterministic smoke seed must be {expected}, got {actual}"
+            ),
             Self::UnexpectedBatchReport => {
                 formatter.write_str("benchmark forwarding returned an unexpected batch report")
             }
@@ -109,8 +119,22 @@ pub(crate) struct Measurement {
 
 /// Executes the selected NIC-free cases and returns structured result rows.
 ///
-/// Formatting and artifact I/O are deliberately outside this function.
+/// Formatting and artifact I/O are deliberately outside this function. The
+/// timed and deterministic paths require the binary's [`crate::CountingAllocator`]
+/// (or an equivalent process-wide installation) so an allocation-free result
+/// cannot silently become a false zero in a downstream consumer.
 pub fn run(config: &RunConfig) -> Result<Vec<ResultRow>, RunError> {
+    if config.suite == Suite::DeterministicSmoke {
+        require_allocation_instrumentation()?;
+        if config.seed != crate::R17_DETERMINISTIC_SMOKE_SEED {
+            return Err(RunError::InvalidDeterministicSeed {
+                expected: crate::R17_DETERMINISTIC_SMOKE_SEED,
+                actual: config.seed,
+            });
+        }
+        return crate::matrix::run_deterministic_matrix(config);
+    }
+    require_allocation_instrumentation()?;
     validate_config(config)?;
     let rows_per_size = config
         .batches
@@ -441,6 +465,14 @@ pub(crate) fn ensure_no_allocations(case: &'static str, count: u64) -> Result<()
         Ok(())
     } else {
         Err(RunError::TimedAllocations { case, count })
+    }
+}
+
+pub(crate) fn require_allocation_instrumentation() -> Result<(), RunError> {
+    if crate::allocation::allocation_instrumentation_available() {
+        Ok(())
+    } else {
+        Err(RunError::AllocationInstrumentationUnavailable)
     }
 }
 

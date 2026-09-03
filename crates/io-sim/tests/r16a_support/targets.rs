@@ -1,8 +1,10 @@
 use ruster_core::{
-    forward_batch_with_resolution, internet_checksum, validate_ipv4_frame, DropReason,
-    DynamicNeighborSlot, ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
-    MacAddress, MonotonicMillis, Neighbor, NoTrace, PacketIo, ResolutionActionSlot,
-    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route, ETHERNET_HEADER_LEN,
+    forward_batch_with_resolution, internet_checksum, validate_ipv4_frame, ArpRequestAction,
+    DropReason, DynamicNeighborSlot, ForwardingSnapshot, IfId, Interface, Ipv4Address,
+    LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoTrace, PacketIo,
+    ResolutionActionSlot, ResolutionCounters, ResolutionFailureCounters, ResolutionPhase,
+    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, ResolutionStatus, Route,
+    ETHERNET_HEADER_LEN,
 };
 use ruster_io_sim::{RecycleCause, SimIo};
 
@@ -125,6 +127,18 @@ pub fn run_encoded(encoded: &[u8]) -> Result<(), CaseFailure> {
         Target::Admission => run_admission(&case),
         Target::Resolution => run_resolution(&case),
     }
+}
+
+/// Replays the concrete target/FIFO regression from the R16 fixed corpus.
+///
+/// Keeping this selector separate makes the identity and invalid-future
+/// contract runnable without relying on the surrounding matrix lane.
+pub fn run_resolution_fixed_identity_fifo_regression() -> Result<(), CaseFailure> {
+    let case = super::corpus::past_regressions()
+        .into_iter()
+        .find(|case| case.name == "resolution-cancel-reuse-and-invalid-future")
+        .ok_or_else(|| CaseFailure::new("fixed resolution regression is missing"))?;
+    run_encoded(&case.encoded)
 }
 
 fn generate_parser(seed: u64, case_index: u64) -> Result<Vec<u8>, CaseFailure> {
@@ -477,6 +491,7 @@ fn run_resolution(case: &CaseEnvelope<'_>) -> Result<(), CaseFailure> {
         &mut actions,
         &mut dynamic,
     );
+    let model = ResolutionModel::run(&operations, case.now);
 
     for (step, operation) in operations.operations.iter().copied().enumerate() {
         let now = case
@@ -524,8 +539,7 @@ fn run_resolution(case: &CaseEnvelope<'_>) -> Result<(), CaseFailure> {
                 let mut packet = resolution_ipv4(DESTINATION);
                 packet[0..6].copy_from_slice(&[0x02, 9, 9, 9, 9, 9]);
                 let original = packet.clone();
-                let before = runtime.counters();
-                let before_summary = visible_resolution_summary(&runtime)?;
+                let before_evidence = capture_resolution_evidence(&runtime);
                 let mut io = SimIo::new();
                 io.inject(LAN, packet);
                 let batch = io.receive(1).unwrap();
@@ -542,15 +556,13 @@ fn run_resolution(case: &CaseEnvelope<'_>) -> Result<(), CaseFailure> {
                 let recycled = io
                     .pop_recycled()
                     .ok_or_else(|| CaseFailure::new("invalid future packet missing recycle"))?;
-                if report.dropped != 1
-                    || recycled.bytes != original
-                    || runtime.counters() != before
-                    || visible_resolution_summary(&runtime)? != before_summary
-                {
+                let after = capture_resolution_evidence(&runtime);
+                if report.dropped != 1 || recycled.bytes != original {
                     return Err(CaseFailure::new(format!(
                         "invalid future packet mutated resolution state at step={step}"
                     )));
                 }
+                assert_resolution_invalid_future_preserves(&before_evidence, &after);
             }
         }
     }
@@ -558,6 +570,13 @@ fn run_resolution(case: &CaseEnvelope<'_>) -> Result<(), CaseFailure> {
     if actual != expected {
         return Err(CaseFailure::new(format!(
             "resolution summary mismatch expected={expected:?} actual={actual:?}"
+        )));
+    }
+    let actual_evidence = capture_resolution_evidence(&runtime);
+    let expected_evidence = model.evidence();
+    if actual_evidence != expected_evidence {
+        return Err(CaseFailure::new(format!(
+            "resolution typed evidence mismatch expected={expected_evidence:?} actual={actual_evidence:?}"
         )));
     }
     Ok(())
@@ -601,6 +620,398 @@ struct ResolutionOperations {
     operations: Vec<ResolutionOperation>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResolutionStateEvidence {
+    occupied: bool,
+    egress: IfId,
+    target: Ipv4Address,
+    action: ArpRequestAction,
+    generation: u64,
+    attempts: u16,
+    accepted_attempts: u16,
+    requested_at: MonotonicMillis,
+    failed_at: MonotonicMillis,
+    phase: ResolutionPhase,
+    failure_notified: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DynamicNeighborEvidence {
+    occupied: bool,
+    interface: IfId,
+    target: Ipv4Address,
+    mac: MacAddress,
+    refreshed_at: MonotonicMillis,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolutionEvidence {
+    state_slots: Vec<ResolutionStateEvidence>,
+    action_slots: Vec<Option<(ArpRequestAction, u64)>>,
+    dynamic_slots: Vec<DynamicNeighborEvidence>,
+    fifo_actions: Vec<(ArpRequestAction, u64)>,
+    statuses: Vec<Option<ResolutionStatus>>,
+    counters: ResolutionCounters,
+    failure_counters: ResolutionFailureCounters,
+    last_observed_at: Option<MonotonicMillis>,
+    publication_epoch: u128,
+}
+
+fn empty_action() -> ArpRequestAction {
+    ArpRequestAction {
+        egress: IfId(0),
+        source_mac: MacAddress([0; 6]),
+        source_ip: Ipv4Address::from_octets([0; 4]),
+        target_ip: Ipv4Address::from_octets([0; 4]),
+    }
+}
+
+fn empty_state(generation: u64) -> ResolutionStateEvidence {
+    ResolutionStateEvidence {
+        occupied: false,
+        egress: IfId(0),
+        target: Ipv4Address::from_octets([0; 4]),
+        action: empty_action(),
+        generation,
+        attempts: 0,
+        accepted_attempts: 0,
+        requested_at: MonotonicMillis(0),
+        failed_at: MonotonicMillis(0),
+        phase: ResolutionPhase::InitialQueued,
+        failure_notified: false,
+    }
+}
+
+fn state_evidence(slot: ResolutionStateSlot) -> ResolutionStateEvidence {
+    ResolutionStateEvidence {
+        occupied: slot.is_occupied(),
+        egress: slot.egress(),
+        target: slot.target(),
+        action: slot.action(),
+        generation: slot.generation(),
+        attempts: slot.attempts(),
+        accepted_attempts: slot.accepted_attempts(),
+        requested_at: slot.requested_at(),
+        failed_at: slot.failed_at(),
+        phase: slot.phase(),
+        failure_notified: slot.failure_notified(),
+    }
+}
+
+fn dynamic_neighbor_evidence(slot: DynamicNeighborSlot) -> DynamicNeighborEvidence {
+    DynamicNeighborEvidence {
+        occupied: slot.is_occupied(),
+        interface: slot.interface(),
+        target: slot.target(),
+        mac: slot.mac(),
+        refreshed_at: slot.refreshed_at(),
+    }
+}
+
+fn capture_resolution_evidence(runtime: &ResolutionRuntime<'_>) -> ResolutionEvidence {
+    ResolutionEvidence {
+        state_slots: runtime
+            .state_slots()
+            .iter()
+            .copied()
+            .map(state_evidence)
+            .collect(),
+        action_slots: runtime
+            .action_slots()
+            .iter()
+            .copied()
+            .map(ResolutionActionSlot::queued)
+            .collect(),
+        dynamic_slots: runtime
+            .dynamic_neighbor_slots()
+            .iter()
+            .copied()
+            .map(dynamic_neighbor_evidence)
+            .collect(),
+        fifo_actions: (0..runtime.pending_actions())
+            .map(|position| {
+                runtime
+                    .queued_action(position)
+                    .expect("resolution FIFO evidence is internally bounded")
+            })
+            .collect(),
+        statuses: (0..8)
+            .map(|index| runtime.status(WAN, target_address(index)))
+            .collect(),
+        counters: runtime.counters(),
+        failure_counters: runtime.failure_counters(),
+        last_observed_at: runtime.last_observed_at(),
+        publication_epoch: runtime.publication_epoch(),
+    }
+}
+
+struct ResolutionModel {
+    states: Vec<ResolutionStateEvidence>,
+    actions: Vec<Option<(ArpRequestAction, u64)>>,
+    dynamic: Vec<DynamicNeighborEvidence>,
+    counters: ResolutionCounters,
+    failure_counters: ResolutionFailureCounters,
+    last_observed_at: Option<MonotonicMillis>,
+    publication_epoch: u128,
+}
+
+impl ResolutionModel {
+    fn run(operations: &ResolutionOperations, start_now: u64) -> Self {
+        let mut model = Self {
+            states: vec![empty_state(0); usize::from(operations.state_capacity)],
+            actions: vec![None; usize::from(operations.action_capacity)],
+            dynamic: vec![
+                DynamicNeighborEvidence {
+                    occupied: false,
+                    interface: IfId(0),
+                    target: Ipv4Address::from_octets([0; 4]),
+                    mac: MacAddress([0; 6]),
+                    refreshed_at: MonotonicMillis(0),
+                };
+                usize::from(operations.dynamic_capacity)
+            ],
+            counters: ResolutionCounters::default(),
+            failure_counters: ResolutionFailureCounters::default(),
+            last_observed_at: None,
+            publication_epoch: 1,
+        };
+        for (step, operation) in operations.operations.iter().copied().enumerate() {
+            let now = MonotonicMillis(
+                start_now
+                    .checked_add(u64::try_from(step).expect("bounded resolution step fits u64"))
+                    .expect("bounded resolution time fits u64"),
+            );
+            match operation {
+                ResolutionOperation::Miss(target) => model.miss(target, now),
+                ResolutionOperation::Learn(target) => model.learn(target, now),
+                ResolutionOperation::InvalidFuture => {}
+            }
+        }
+        model
+    }
+
+    fn observe(&mut self, now: MonotonicMillis) -> bool {
+        if self.last_observed_at.is_some_and(|last| now < last) {
+            self.counters.clock_regressions += 1;
+            return false;
+        }
+        self.last_observed_at = Some(now);
+        true
+    }
+
+    fn miss(&mut self, target_index: u8, now: MonotonicMillis) {
+        let target = target_address(target_index);
+        if !self.observe(now) {
+            return;
+        }
+        if self
+            .dynamic
+            .iter()
+            .any(|slot| slot.occupied && slot.interface == WAN && slot.target == target)
+        {
+            return;
+        }
+        if let Some(state) = self
+            .states
+            .iter()
+            .find(|state| state.occupied && state.egress == WAN && state.target == target)
+        {
+            if matches!(
+                state.phase,
+                ResolutionPhase::InitialQueued | ResolutionPhase::RetryQueued
+            ) {
+                self.counters.suppressed += 1;
+                self.failure_counters.capture_full += 1;
+                return;
+            }
+        }
+        let Some(index) = self.states.iter().position(|state| !state.occupied) else {
+            self.counters.state_full += 1;
+            return;
+        };
+        if self.actions.iter().all(Option::is_some) {
+            self.counters.action_full += 1;
+            return;
+        }
+        let action = ArpRequestAction {
+            egress: WAN,
+            source_mac: WAN_MAC,
+            source_ip: RESOLUTION_LOCAL,
+            target_ip: target,
+        };
+        let generation = self.states[index].generation.wrapping_add(1);
+        self.states[index] = ResolutionStateEvidence {
+            occupied: true,
+            egress: WAN,
+            target,
+            action,
+            generation,
+            attempts: 0,
+            accepted_attempts: 0,
+            requested_at: MonotonicMillis(0),
+            failed_at: MonotonicMillis(0),
+            phase: ResolutionPhase::InitialQueued,
+            failure_notified: false,
+        };
+        let queue_index = self
+            .actions
+            .iter()
+            .position(Option::is_none)
+            .expect("model action capacity was checked");
+        self.actions[queue_index] = Some((action, generation));
+        self.counters.queued += 1;
+        if self.states.iter().any(|state| {
+            state.occupied
+                && state.egress == WAN
+                && state.target == target
+                && matches!(
+                    state.phase,
+                    ResolutionPhase::InitialQueued
+                        | ResolutionPhase::Waiting
+                        | ResolutionPhase::RetryQueued
+                )
+        }) {
+            // The production resolution composition attempts to retain an
+            // ICMP failure candidate after every eligible unresolved packet.
+            // This model has no failure-hold backing by design, so the
+            // bounded semantic result is a capture-full observation.
+            self.failure_counters.capture_full += 1;
+        }
+    }
+
+    fn learn(&mut self, target_index: u8, now: MonotonicMillis) {
+        let target = target_address(target_index);
+        if !self.observe(now) {
+            return;
+        }
+        if let Some(index) = self
+            .dynamic
+            .iter()
+            .position(|slot| slot.occupied && slot.interface == WAN && slot.target == target)
+        {
+            self.dynamic[index].mac = ARP_SHA;
+            self.dynamic[index].refreshed_at = now;
+            self.clear_resolution(target);
+            return;
+        }
+        let Some(index) = self.dynamic.iter().position(|slot| !slot.occupied) else {
+            return;
+        };
+        self.dynamic[index] = DynamicNeighborEvidence {
+            occupied: true,
+            interface: WAN,
+            target,
+            mac: ARP_SHA,
+            refreshed_at: now,
+        };
+        self.clear_resolution(target);
+    }
+
+    fn clear_resolution(&mut self, target: Ipv4Address) {
+        for state in &mut self.states {
+            if state.occupied && state.egress == WAN && state.target == target {
+                *state = empty_state(state.generation);
+            }
+        }
+        let retained: Vec<_> = self
+            .actions
+            .iter()
+            .copied()
+            .flatten()
+            .filter(|(action, _)| action.target_ip != target)
+            .collect();
+        self.actions.fill(None);
+        for (index, action) in retained.into_iter().enumerate().take(self.actions.len()) {
+            self.actions[index] = Some(action);
+        }
+    }
+
+    fn status(&self, target: Ipv4Address) -> Option<ResolutionStatus> {
+        self.states
+            .iter()
+            .find(|state| state.occupied && state.egress == WAN && state.target == target)
+            .map(|state| ResolutionStatus {
+                phase: state.phase,
+                attempts: state.attempts,
+                accepted_attempts: state.accepted_attempts,
+                generation: state.generation,
+                requested_at: (state.attempts != 0).then_some(state.requested_at),
+                failed_at: (state.phase == ResolutionPhase::Failed).then_some(state.failed_at),
+                terminal_notified: state.failure_notified,
+            })
+    }
+
+    fn evidence(&self) -> ResolutionEvidence {
+        ResolutionEvidence {
+            state_slots: self.states.clone(),
+            action_slots: self.actions.clone(),
+            dynamic_slots: self.dynamic.clone(),
+            fifo_actions: self.actions.iter().copied().flatten().collect(),
+            statuses: (0..8)
+                .map(|index| self.status(target_address(index)))
+                .collect(),
+            counters: self.counters,
+            failure_counters: self.failure_counters,
+            last_observed_at: self.last_observed_at,
+            publication_epoch: self.publication_epoch,
+        }
+    }
+
+    fn summary(&self) -> ResolutionSummary {
+        ResolutionSummary {
+            pending_states: u16::try_from(
+                self.states.iter().filter(|state| state.occupied).count(),
+            )
+            .expect("bounded resolution state count fits u16"),
+            pending_actions: u16::try_from(
+                self.actions.iter().filter(|slot| slot.is_some()).count(),
+            )
+            .expect("bounded resolution action count fits u16"),
+            dynamic_neighbors: u16::try_from(
+                self.dynamic.iter().filter(|slot| slot.occupied).count(),
+            )
+            .expect("bounded dynamic neighbor count fits u16"),
+            queued: u32::try_from(self.counters.queued).expect("bounded queued counter fits u32"),
+            suppressed: u32::try_from(self.counters.suppressed)
+                .expect("bounded suppressed counter fits u32"),
+            state_full: u32::try_from(self.counters.state_full)
+                .expect("bounded state-full counter fits u32"),
+            action_full: u32::try_from(self.counters.action_full)
+                .expect("bounded action-full counter fits u32"),
+            clock_regressions: u32::try_from(self.counters.clock_regressions)
+                .expect("bounded clock counter fits u32"),
+        }
+    }
+}
+
+fn assert_resolution_invalid_future_preserves(
+    before: &ResolutionEvidence,
+    after: &ResolutionEvidence,
+) {
+    assert_eq!(before.state_slots, after.state_slots);
+    assert_eq!(before.action_slots, after.action_slots);
+    assert_eq!(before.dynamic_slots, after.dynamic_slots);
+    assert_eq!(before.fifo_actions, after.fifo_actions);
+    assert_eq!(before.statuses, after.statuses);
+    assert_eq!(before.failure_counters, after.failure_counters);
+    assert_eq!(before.last_observed_at, after.last_observed_at);
+    assert_eq!(before.publication_epoch, after.publication_epoch);
+    assert!(
+        after.counters.clock_regressions >= before.counters.clock_regressions,
+        "clock-regression counter must not decrease"
+    );
+    let clock_delta = after.counters.clock_regressions - before.counters.clock_regressions;
+    assert!(
+        clock_delta <= 1,
+        "only one clock-regression counter may change"
+    );
+    let mut before_without_clock = before.counters;
+    let mut after_without_clock = after.counters;
+    before_without_clock.clock_regressions = 0;
+    after_without_clock.clock_regressions = 0;
+    assert_eq!(before_without_clock, after_without_clock);
+}
+
 fn parse_resolution_payload(payload: &[u8]) -> Result<ResolutionOperations, CaseFailure> {
     let header = payload
         .get(0..4)
@@ -638,46 +1049,7 @@ fn parse_resolution_payload(payload: &[u8]) -> Result<ResolutionOperations, Case
 
 fn model_resolution(payload: &[u8]) -> Result<ResolutionSummary, CaseFailure> {
     let operations = parse_resolution_payload(payload)?;
-    let mut pending = Vec::<u8>::new();
-    let mut dynamic = Vec::<u8>::new();
-    let mut summary = ResolutionSummary::default();
-    for operation in operations.operations {
-        match operation {
-            ResolutionOperation::Miss(target) => {
-                if dynamic.contains(&target) {
-                    continue;
-                }
-                if pending.contains(&target) {
-                    summary.suppressed += 1;
-                } else if pending.len() == usize::from(operations.state_capacity) {
-                    summary.state_full += 1;
-                } else if pending.len() == usize::from(operations.action_capacity) {
-                    summary.action_full += 1;
-                } else {
-                    pending.push(target);
-                    summary.queued += 1;
-                }
-            }
-            ResolutionOperation::Learn(target) => {
-                let learned = if dynamic.contains(&target) {
-                    true
-                } else if dynamic.len() < usize::from(operations.dynamic_capacity) {
-                    dynamic.push(target);
-                    true
-                } else {
-                    false
-                };
-                if learned {
-                    pending.retain(|candidate| *candidate != target);
-                }
-            }
-            ResolutionOperation::InvalidFuture => {}
-        }
-    }
-    summary.pending_states = u16::try_from(pending.len()).unwrap();
-    summary.pending_actions = summary.pending_states;
-    summary.dynamic_neighbors = u16::try_from(dynamic.len()).unwrap();
-    Ok(summary)
+    Ok(ResolutionModel::run(&operations, 100).summary())
 }
 
 fn drop_expected(reason: DropReason) -> Result<Expected, CaseFailure> {
