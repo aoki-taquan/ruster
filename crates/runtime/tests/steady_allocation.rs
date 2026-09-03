@@ -8,18 +8,21 @@ use std::{
 use std::mem::size_of;
 
 use ruster_core::{
-    FirewallConfig, FirewallHashKey, FirewallPolicy, ForwardingSnapshot, GeneratedIcmpv4Trace,
-    GeneratedIcmpv4TraceSink, GeneratedTraceSink, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy,
-    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
-    MacAddress, MonotonicMillis, Nat44TcpConfig, Nat44TcpPolicy, Nat44UdpConfig, Nat44UdpPolicy,
-    PublicationQuiescenceGuard, ResolutionActionSlot, ResolutionFailureHoldSlot,
-    ResolutionFailureTrace, ResolutionFailureTraceSink, ResolutionPolicy, ResolutionRuntime,
-    ResolutionStateSlot, ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent, TraceSink,
+    bind_publication_backend, BoundPublicationBackend, FirewallConfig, FirewallHashKey,
+    FirewallPolicy, ForwardingSnapshot, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink,
+    GeneratedTraceSink, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
+    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    MatchedPublicationQuiescenceGuard, MonotonicMillis, Nat44TcpConfig, Nat44TcpPolicy,
+    Nat44UdpConfig, Nat44UdpPolicy, PublicationOwnerBinding, ResolutionActionSlot,
+    ResolutionFailureHoldSlot, ResolutionFailureTrace, ResolutionFailureTraceSink,
+    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, ResolutionTimerTrace,
+    ResolutionTimerTraceSink, TraceEvent, TraceSink,
 };
 use ruster_io_sim::SimIo;
 use ruster_runtime::{
-    run_tick, FirewallServiceView, FullServicePublication, FullServiceView, Nat44TcpServiceView,
-    Nat44UdpServiceView, TickBudgets, TickPhaseTrace, TickPhaseTraceSink,
+    run_tick, ActivePublicationStatus, ActiveTickAuthority, FirewallServiceView,
+    FullServicePublication, FullServiceView, Nat44TcpServiceView, Nat44UdpServiceView,
+    PublicationRejection, TickBudgets, TickPhaseTrace, TickPhaseTraceSink,
 };
 
 struct CountingAllocator;
@@ -54,8 +57,11 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static GLOBAL: CountingAllocator = CountingAllocator;
 
+type Backend = BoundPublicationBackend<SimIo>;
+
 struct Publication<'view, 'storage> {
-    generation: NonZeroU64,
+    owner_binding: PublicationOwnerBinding<Backend>,
+    tick_authority: ActiveTickAuthority,
     active_calls: usize,
     semantic_validation_calls: usize,
     fingerprint_calls: usize,
@@ -69,15 +75,31 @@ struct Publication<'view, 'storage> {
     firewall_config: FirewallConfig<'storage>,
 }
 
-impl<'view, 'storage> FullServicePublication<'storage, SimIo> for Publication<'view, 'storage> {
+#[allow(unsafe_code)]
+unsafe impl<'view, 'storage> FullServicePublication<'storage, Backend>
+    for Publication<'view, 'storage>
+{
     type Candidate = ();
     type Reject = ();
+    type ApplyReport = ();
 
-    fn publish_candidate(
+    fn publication_owner_binding(&self) -> &PublicationOwnerBinding<Backend> {
+        &self.owner_binding
+    }
+
+    fn reject_candidate_if_active_stopped(
+        &self,
+        candidate: Self::Candidate,
+    ) -> Result<Self::Candidate, PublicationRejection<Self::Candidate, Self::Reject>> {
+        Ok(candidate)
+    }
+
+    #[allow(unsafe_code)]
+    unsafe fn publish_candidate_authorized(
         &mut self,
         _candidate: Self::Candidate,
-        _quiescence: PublicationQuiescenceGuard<'_, SimIo>,
-    ) -> Result<(), Self::Reject> {
+        _quiescence: MatchedPublicationQuiescenceGuard<'_, Backend>,
+    ) -> Result<Self::ApplyReport, PublicationRejection<Self::Candidate, Self::Reject>> {
         self.semantic_validation_calls += 1;
         self.fingerprint_calls += 1;
         self.hash_calls += 1;
@@ -85,26 +107,21 @@ impl<'view, 'storage> FullServicePublication<'storage, SimIo> for Publication<'v
         Ok(())
     }
 
-    fn active(&mut self) -> Option<FullServiceView<'_, 'storage>> {
+    fn active_status(&self) -> ActivePublicationStatus {
+        ActivePublicationStatus::ContinueOldIo
+    }
+
+    fn active(&mut self) -> FullServiceView<'_, 'storage> {
         self.active_calls += 1;
-        Some(FullServiceView {
-            generation: self.generation,
-            snapshot: *self.snapshot,
-            resolution: self.resolution,
-            icmpv4_errors: self.icmpv4_errors,
-            nat44_udp: Nat44UdpServiceView {
-                config: self.udp_config,
-                runtime: None,
-            },
-            nat44_tcp: Nat44TcpServiceView {
-                config: self.tcp_config,
-                runtime: None,
-            },
-            firewall: FirewallServiceView {
-                config: self.firewall_config,
-                runtime: None,
-            },
-        })
+        FullServiceView::new(
+            &self.tick_authority,
+            *self.snapshot,
+            self.resolution,
+            self.icmpv4_errors,
+            Nat44UdpServiceView::new(self.udp_config, None),
+            Nat44TcpServiceView::new(self.tcp_config, None),
+            FirewallServiceView::new(self.firewall_config, None),
+        )
     }
 }
 
@@ -215,8 +232,11 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         &mut icmp_states,
         &mut icmp_actions,
     );
+    let (owner_binding, mut io) = bind_publication_backend(SimIo::new())
+        .expect("steady-allocation publication binding identity");
     let mut publication = Publication {
-        generation: NonZeroU64::MIN,
+        owner_binding,
+        tick_authority: ActiveTickAuthority::new(NonZeroU64::MIN, TickBudgets::default()),
         active_calls: 0,
         semantic_validation_calls: 0,
         fingerprint_calls: 0,
@@ -229,7 +249,6 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         tcp_config,
         firewall_config,
     };
-    let mut io = SimIo::new();
     let mut trace = NoTrace;
 
     #[cfg(target_pointer_width = "64")]
@@ -241,7 +260,8 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         assert_eq!(size_of::<Nat44UdpServiceView<'static, 'static>>(), 120);
         assert_eq!(size_of::<Nat44TcpServiceView<'static, 'static>>(), 120);
         assert_eq!(size_of::<FirewallServiceView<'static, 'static>>(), 168);
-        assert!(size_of::<FullServiceView<'static, 'static>>() <= 576);
+        assert_eq!(size_of::<ActiveTickAuthority>(), 48);
+        assert_eq!(size_of::<FullServiceView<'static, 'static>>(), 576);
     }
 
     let before = ALLOCATIONS.load(Ordering::Relaxed);
@@ -251,7 +271,6 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
             None,
             &mut io,
             MonotonicMillis(tick),
-            TickBudgets::default(),
             &mut trace,
         );
         assert!(report.active);

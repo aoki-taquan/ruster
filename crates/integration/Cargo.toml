@@ -1,0 +1,15 @@
+[package]
+name = "ruster-integration"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ruster-control = { path = "../control" }
+ruster-core = { path = "../core" }
+ruster-runtime = { path = "../runtime" }
+
+[dev-dependencies]
+ruster-config = { path = "../config" }
+ruster-io-sim = { path = "../io-sim" }

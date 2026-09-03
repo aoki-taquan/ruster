@@ -15,8 +15,11 @@ use ruster_core::{
 };
 
 use crate::{
-    ConfigV1, FirewallActionV1, FirewallProtocolV1, Nat44Icmpv4ErrorsV1, SourcePath,
-    VersionedConfig,
+    BackendV1, ConfigV1, FirewallActionV1, FirewallProtocolV1, Nat44Icmpv4ErrorsV1, SourcePath,
+    VersionedConfig, XdpAttachModeV1,
+};
+use ruster_io_xdp_native::{
+    ConfigError as XdpConfigError, RingConfig, UmemConfig, ValidatedBindFlags, XdpAttachMode,
 };
 
 /// Caller-selected cold-path bounds for runtime storage requested by V1.
@@ -31,6 +34,16 @@ pub struct ValidationLimits {
 #[non_exhaustive]
 pub enum ValidationCode {
     InvalidSchemaVersion,
+    AfXdpUmem(XdpConfigError),
+    AfXdpRings(XdpConfigError),
+    AfXdpBindFlags(XdpConfigError),
+    AfXdpSharedUmemUnsupported,
+    AfXdpXskMapMaxEntriesZero,
+    AfXdpQueueIdOutOfRange { queue_id: u32, max_entries: u32 },
+    AfXdpUmemLengthNotRepresentable,
+    AfXdpRequiresTwoResources { actual: usize },
+    AfXdpDuplicateResourceInterface,
+    AfXdpInterfaceNotCovered,
     ListTooLong,
     TextTooLarge,
     EmptyInterfaceName,
@@ -205,6 +218,91 @@ pub struct Nat44TcpStorageShapeV1 {
     pub port_owners: u32,
 }
 
+impl ResolutionStorageShapeV1 {
+    #[allow(
+        clippy::type_complexity,
+        reason = "the tuple names every resolution storage slot"
+    )]
+    #[must_use]
+    pub const fn into_planning_parts(self) -> (u32, u32, u32, u32) {
+        let Self {
+            states,
+            actions,
+            dynamic_neighbors,
+            failure_holds,
+        } = self;
+        (states, actions, dynamic_neighbors, failure_holds)
+    }
+}
+
+impl Icmpv4ErrorStorageShapeV1 {
+    #[allow(
+        clippy::type_complexity,
+        reason = "the tuple names every ICMPv4 storage slot"
+    )]
+    #[must_use]
+    pub const fn into_planning_parts(self) -> (u32, u32) {
+        let Self { states, actions } = self;
+        (states, actions)
+    }
+}
+
+impl Nat44UdpStorageShapeV1 {
+    #[allow(
+        clippy::type_complexity,
+        reason = "the tuple names every UDP NAT storage and index slot"
+    )]
+    #[must_use]
+    pub const fn into_planning_parts(self) -> (u32, u32, u32, u32, u32, u32, u32) {
+        let Self {
+            mappings,
+            peers,
+            mapping_buckets,
+            mapping_nodes,
+            peer_buckets,
+            peer_nodes,
+            port_owners,
+        } = self;
+        (
+            mappings,
+            peers,
+            mapping_buckets,
+            mapping_nodes,
+            peer_buckets,
+            peer_nodes,
+            port_owners,
+        )
+    }
+}
+
+impl Nat44TcpStorageShapeV1 {
+    #[allow(
+        clippy::type_complexity,
+        reason = "the tuple names every TCP NAT storage and index slot"
+    )]
+    #[must_use]
+    pub const fn into_planning_parts(self) -> (u32, u32, u32, u32, u32, u32, u32) {
+        let Self {
+            mappings,
+            sessions,
+            mapping_buckets,
+            mapping_nodes,
+            session_buckets,
+            session_nodes,
+            port_owners,
+        } = self;
+        (
+            mappings,
+            sessions,
+            mapping_buckets,
+            mapping_nodes,
+            session_buckets,
+            session_nodes,
+            port_owners,
+        )
+    }
+}
+
 /// Complete caller-owned runtime storage requested by one V1 candidate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeStorageShapeV1 {
@@ -216,6 +314,148 @@ pub struct RuntimeStorageShapeV1 {
     pub required_bytes: usize,
 }
 
+/// One validated logical interface/queue retained by the V1 AF_XDP pair.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedAfXdpResourceV1 {
+    interface: IfId,
+    device: Box<str>,
+    queue_id: u32,
+}
+
+impl ValidatedAfXdpResourceV1 {
+    /// Returns the configured core interface identifier.
+    #[must_use]
+    pub const fn interface(&self) -> IfId {
+        self.interface
+    }
+
+    /// Returns the Linux device name used for ifindex resolution.
+    #[must_use]
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+
+    /// Returns the hardware queue passed to the native resource builder.
+    #[must_use]
+    pub const fn queue_id(&self) -> u32 {
+        self.queue_id
+    }
+}
+
+/// Validated AF_XDP setup values retained by the V1 backend selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedAfXdpBackendV1 {
+    resources: Box<[ValidatedAfXdpResourceV1]>,
+    xskmap_max_entries: u32,
+    umem: UmemConfig,
+    rings: RingConfig,
+    bind_flags: ValidatedBindFlags,
+    attach_mode: XdpAttachMode,
+}
+
+impl ValidatedAfXdpBackendV1 {
+    /// Returns the first configured core interface identifier.
+    ///
+    /// This accessor remains for callers written for the original single
+    /// resource API. New composition roots should iterate [`Self::resources`].
+    #[must_use]
+    pub const fn interface(&self) -> IfId {
+        self.resources[0].interface()
+    }
+
+    /// Returns the first device name used for runtime ifindex resolution.
+    #[must_use]
+    pub fn device(&self) -> &str {
+        self.resources[0].device()
+    }
+
+    /// Returns the first hardware queue passed to the native builder.
+    #[must_use]
+    pub const fn queue_id(&self) -> u32 {
+        self.resources[0].queue_id()
+    }
+
+    /// Returns both validated interface/queue resources in configuration order.
+    #[must_use]
+    pub fn resources(&self) -> &[ValidatedAfXdpResourceV1] {
+        &self.resources
+    }
+
+    /// Returns the XSKMAP capacity passed to the native map constructor.
+    #[must_use]
+    pub const fn xskmap_max_entries(&self) -> u32 {
+        self.xskmap_max_entries
+    }
+
+    /// Returns the validated UMEM geometry.
+    #[must_use]
+    pub const fn umem(&self) -> UmemConfig {
+        self.umem
+    }
+
+    /// Returns the validated four-ring geometry.
+    #[must_use]
+    pub const fn rings(&self) -> RingConfig {
+        self.rings
+    }
+
+    /// Returns the validated `sockaddr_xdp` bind flags.
+    #[must_use]
+    pub const fn bind_flags(&self) -> ValidatedBindFlags {
+        self.bind_flags
+    }
+
+    /// Returns the validated rtnetlink XDP attach mode.
+    #[must_use]
+    pub const fn attach_mode(&self) -> XdpAttachMode {
+        self.attach_mode
+    }
+}
+
+/// Validated packet backend selected by a versioned configuration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ValidatedBackendV1 {
+    /// The compatibility default when `backend` is omitted.
+    AfPacket,
+    /// Two checked AF_XDP interface/queue setups for the fixed pair backend.
+    AfXdp(ValidatedAfXdpBackendV1),
+}
+
+impl RuntimeStorageShapeV1 {
+    #[allow(
+        clippy::type_complexity,
+        reason = "the tuple names every runtime storage shape and byte total"
+    )]
+    #[must_use]
+    pub const fn into_planning_parts(
+        self,
+    ) -> (
+        Option<ResolutionStorageShapeV1>,
+        Option<Icmpv4ErrorStorageShapeV1>,
+        Option<Nat44UdpStorageShapeV1>,
+        Option<Nat44TcpStorageShapeV1>,
+        Option<u32>,
+        usize,
+    ) {
+        let Self {
+            resolution,
+            icmpv4_errors,
+            nat44_udp,
+            nat44_tcp,
+            firewall_states,
+            required_bytes,
+        } = self;
+        (
+            resolution,
+            icmpv4_errors,
+            nat44_udp,
+            nat44_tcp,
+            firewall_states,
+            required_bytes,
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TickBudgetsV1 {
     pub rx: u32,
@@ -223,6 +463,27 @@ pub struct TickBudgetsV1 {
     pub failure_dispatch_scans: u32,
     pub generated_arp: u32,
     pub generated_icmpv4: u32,
+}
+
+impl TickBudgetsV1 {
+    #[allow(clippy::type_complexity, reason = "the tuple names every tick budget")]
+    #[must_use]
+    pub const fn into_planning_parts(self) -> (u32, u32, u32, u32, u32) {
+        let Self {
+            rx,
+            resolution_timer_scans,
+            failure_dispatch_scans,
+            generated_arp,
+            generated_icmpv4,
+        } = self;
+        (
+            rx,
+            resolution_timer_scans,
+            failure_dispatch_scans,
+            generated_arp,
+            generated_icmpv4,
+        )
+    }
 }
 
 pub struct ValidatedResolutionV1 {
@@ -240,6 +501,12 @@ impl ValidatedResolutionV1 {
     pub const fn storage(&self) -> ResolutionStorageShapeV1 {
         self.storage
     }
+
+    #[must_use]
+    pub const fn into_planning_parts(self) -> (ResolutionPolicy, ResolutionStorageShapeV1) {
+        let Self { policy, storage } = self;
+        (policy, storage)
+    }
 }
 
 pub struct ValidatedIcmpv4ErrorV1 {
@@ -256,6 +523,12 @@ impl ValidatedIcmpv4ErrorV1 {
     #[must_use]
     pub const fn storage(&self) -> Icmpv4ErrorStorageShapeV1 {
         self.storage
+    }
+
+    #[must_use]
+    pub const fn into_planning_parts(self) -> (Icmpv4ErrorPolicy, Icmpv4ErrorStorageShapeV1) {
+        let Self { policy, storage } = self;
+        (policy, storage)
     }
 }
 
@@ -304,6 +577,42 @@ impl ValidatedNat44UdpV1 {
     pub const fn storage(&self) -> Nat44UdpStorageShapeV1 {
         self.storage
     }
+
+    #[allow(
+        clippy::type_complexity,
+        reason = "the tuple names the complete UDP NAT realm, policy, and storage"
+    )]
+    #[must_use]
+    pub const fn into_planning_parts(
+        self,
+    ) -> (
+        IfId,
+        IfId,
+        Ipv4Address,
+        u16,
+        u16,
+        Nat44UdpPolicy,
+        Nat44UdpStorageShapeV1,
+    ) {
+        let Self {
+            inside,
+            outside,
+            public_address,
+            first_port,
+            last_port,
+            policy,
+            storage,
+        } = self;
+        (
+            inside,
+            outside,
+            public_address,
+            first_port,
+            last_port,
+            policy,
+            storage,
+        )
+    }
 }
 
 pub struct ValidatedNat44TcpV1 {
@@ -351,6 +660,42 @@ impl ValidatedNat44TcpV1 {
     pub const fn storage(&self) -> Nat44TcpStorageShapeV1 {
         self.storage
     }
+
+    #[allow(
+        clippy::type_complexity,
+        reason = "the tuple names the complete TCP NAT realm, policy, and storage"
+    )]
+    #[must_use]
+    pub const fn into_planning_parts(
+        self,
+    ) -> (
+        IfId,
+        IfId,
+        Ipv4Address,
+        u16,
+        u16,
+        Nat44TcpPolicy,
+        Nat44TcpStorageShapeV1,
+    ) {
+        let Self {
+            inside,
+            outside,
+            public_address,
+            first_port,
+            last_port,
+            policy,
+            storage,
+        } = self;
+        (
+            inside,
+            outside,
+            public_address,
+            first_port,
+            last_port,
+            policy,
+            storage,
+        )
+    }
 }
 
 pub struct ValidatedNat44V1 {
@@ -367,6 +712,14 @@ impl ValidatedNat44V1 {
     #[must_use]
     pub const fn tcp(&self) -> Option<&ValidatedNat44TcpV1> {
         self.tcp.as_ref()
+    }
+
+    #[must_use]
+    pub const fn into_planning_parts(
+        self,
+    ) -> (Option<ValidatedNat44UdpV1>, Option<ValidatedNat44TcpV1>) {
+        let Self { udp, tcp } = self;
+        (udp, tcp)
     }
 }
 
@@ -390,6 +743,26 @@ impl ValidatedFirewallV1 {
     #[must_use]
     pub const fn state_slots(&self) -> u32 {
         self.state_slots
+    }
+
+    #[must_use]
+    pub fn into_rules(self) -> Box<[FirewallRule]> {
+        let Self {
+            rules,
+            policy: _policy,
+            state_slots: _state_slots,
+        } = self;
+        rules
+    }
+
+    #[must_use]
+    pub fn into_planning_parts(self) -> (Box<[FirewallRule]>, FirewallPolicy, u32) {
+        let Self {
+            rules,
+            policy,
+            state_slots,
+        } = self;
+        (rules, policy, state_slots)
     }
 }
 
@@ -418,6 +791,111 @@ pub struct ValidatedConfigV1 {
     firewall: Option<ValidatedFirewallV1>,
     tick: TickBudgetsV1,
     storage: RuntimeStorageShapeV1,
+    backend: ValidatedBackendV1,
+}
+
+/// Publication非依存のmove-only transfer parts。
+///
+/// `ValidatedConfigV1`が所有していたBoxと、validated service/storage inventoryを再確保せずに
+/// 移します。downstream crateでの構築を許さないtransfer-only型です。この型はtopologyや
+/// allocator seedを偶発的に複製またはformatしないため`Clone`と`Debug`を実装しません。
+///
+/// ```compile_fail
+/// use ruster_config::ValidatedConfigV1Parts;
+///
+/// fn require_debug<T: std::fmt::Debug>() {}
+/// require_debug::<ValidatedConfigV1Parts>();
+/// ```
+///
+/// ```compile_fail
+/// use ruster_config::ValidatedConfigV1Parts;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<ValidatedConfigV1Parts>();
+/// ```
+#[non_exhaustive]
+pub struct ValidatedConfigV1Parts {
+    pub interfaces: Box<[InterfaceBindingV1]>,
+    pub core_interfaces: Box<[Interface]>,
+    pub routes: Box<[Route]>,
+    pub neighbors: Box<[Neighbor]>,
+    pub local_ipv4: Box<[LocalIpv4Binding]>,
+    pub ipv4_origin: Ipv4OriginPolicy,
+    pub resolution: Option<ValidatedResolutionV1>,
+    pub icmpv4_errors: Option<ValidatedIcmpv4ErrorV1>,
+    pub nat44: Option<ValidatedNat44V1>,
+    pub firewall: Option<ValidatedFirewallV1>,
+    pub tick: TickBudgetsV1,
+    pub storage: RuntimeStorageShapeV1,
+    pub backend: ValidatedBackendV1,
+    pub required_runtime_bytes: usize,
+}
+
+impl ValidatedConfigV1Parts {
+    /// Consumes the versioned transfer object through an exact planning seam.
+    ///
+    /// The tuple is intentionally exhaustive at the control-plane call site.
+    /// Adding a validated V1, tick, or storage transfer field requires updating
+    /// this method and then causes downstream planners that destructure the
+    /// tuple to fail to compile until they account for the new field. The
+    /// public [`ValidatedConfigV1Parts`] struct remains non-exhaustive for
+    /// additive API evolution.
+    #[allow(
+        clippy::type_complexity,
+        reason = "the exact tuple is the compile-enforced planning inventory"
+    )]
+    #[must_use]
+    pub fn into_planning_parts(
+        self,
+    ) -> (
+        Box<[InterfaceBindingV1]>,
+        Box<[Interface]>,
+        Box<[Route]>,
+        Box<[Neighbor]>,
+        Box<[LocalIpv4Binding]>,
+        Ipv4OriginPolicy,
+        Option<ValidatedResolutionV1>,
+        Option<ValidatedIcmpv4ErrorV1>,
+        Option<ValidatedNat44V1>,
+        Option<ValidatedFirewallV1>,
+        TickBudgetsV1,
+        RuntimeStorageShapeV1,
+        ValidatedBackendV1,
+        usize,
+    ) {
+        let Self {
+            interfaces,
+            core_interfaces,
+            routes,
+            neighbors,
+            local_ipv4,
+            ipv4_origin,
+            resolution,
+            icmpv4_errors,
+            nat44,
+            firewall,
+            tick,
+            storage,
+            backend,
+            required_runtime_bytes,
+        } = self;
+        (
+            interfaces,
+            core_interfaces,
+            routes,
+            neighbors,
+            local_ipv4,
+            ipv4_origin,
+            resolution,
+            icmpv4_errors,
+            nat44,
+            firewall,
+            tick,
+            storage,
+            backend,
+            required_runtime_bytes,
+        )
+    }
 }
 
 impl ValidatedConfigV1 {
@@ -479,6 +957,48 @@ impl ValidatedConfigV1 {
     #[must_use]
     pub const fn storage_shape(&self) -> RuntimeStorageShapeV1 {
         self.storage
+    }
+
+    /// Returns the validated packet backend selection.
+    #[must_use]
+    pub const fn backend(&self) -> &ValidatedBackendV1 {
+        &self.backend
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> ValidatedConfigV1Parts {
+        let Self {
+            interfaces,
+            core_interfaces,
+            routes,
+            neighbors,
+            local_ipv4,
+            ipv4_origin,
+            resolution,
+            icmpv4_errors,
+            nat44,
+            firewall,
+            tick,
+            storage,
+            backend,
+        } = self;
+        let required_runtime_bytes = storage.required_bytes;
+        ValidatedConfigV1Parts {
+            interfaces,
+            core_interfaces,
+            routes,
+            neighbors,
+            local_ipv4,
+            ipv4_origin,
+            resolution,
+            icmpv4_errors,
+            nat44,
+            firewall,
+            tick,
+            storage,
+            backend,
+            required_runtime_bytes,
+        }
     }
 }
 
@@ -601,6 +1121,7 @@ fn validate_v1(
             .find(|(candidate, _)| candidate.as_ref() == name)
             .map(|(_, id)| *id)
     };
+    let backend = validate_backend(config.backend, &interface_records, &find_interface)?;
 
     let mut local_ipv4_with_paths = Vec::with_capacity(config.addresses.len());
     let mut connected = Vec::with_capacity(config.addresses.len());
@@ -1132,7 +1653,171 @@ fn validate_v1(
         firewall,
         tick,
         storage,
+        backend,
     })
+}
+
+fn validate_backend(
+    source: Option<BackendV1>,
+    interfaces: &[InterfaceRecord],
+    find_interface: &impl Fn(&str) -> Option<IfId>,
+) -> Result<ValidatedBackendV1, ValidationError> {
+    let Some(source) = source else {
+        return Ok(ValidatedBackendV1::AfPacket);
+    };
+    match source {
+        BackendV1::AfPacket => Ok(ValidatedBackendV1::AfPacket),
+        BackendV1::AfXdp {
+            resources,
+            xskmap_max_entries,
+            bind_flags,
+            attach_mode,
+            umem,
+            rings,
+        } => {
+            if interfaces.len() != 2 {
+                return Err(ValidationError::new(
+                    ValidationCode::AfXdpRequiresTwoResources {
+                        actual: interfaces.len(),
+                    },
+                    path(&["interfaces"]),
+                ));
+            }
+            if resources.len() != 2 {
+                return Err(ValidationError::new(
+                    ValidationCode::AfXdpRequiresTwoResources {
+                        actual: resources.len(),
+                    },
+                    path(&["backend", "resources"]),
+                ));
+            }
+
+            if xskmap_max_entries == 0 {
+                return Err(ValidationError::new(
+                    ValidationCode::AfXdpXskMapMaxEntriesZero,
+                    path(&["backend", "xskmap-max-entries"]),
+                ));
+            }
+            let umem = UmemConfig::new(
+                umem.frame_count,
+                umem.frame_size,
+                umem.headroom,
+                umem.rx_frames,
+                umem.generated_frames,
+                umem.raw_flags,
+            )
+            .map_err(|error| match error {
+                XdpConfigError::UmemFrameCountExceedsLimit { frame_count, limit } => {
+                    ValidationError::bounded(
+                        ValidationCode::AfXdpUmem(error),
+                        path(&["backend", "umem", "frame-count"]),
+                        u64::from(limit),
+                        u64::from(frame_count),
+                    )
+                }
+                XdpConfigError::UmemByteLengthExceedsLimit { byte_len, limit } => {
+                    ValidationError::bounded(
+                        ValidationCode::AfXdpUmem(error),
+                        path(&["backend", "umem", "frame-count"]),
+                        limit,
+                        byte_len,
+                    )
+                }
+                _ => ValidationError::new(
+                    ValidationCode::AfXdpUmem(error),
+                    path(&["backend", "umem"]),
+                ),
+            })?;
+            if usize::try_from(umem.byte_len()).is_err() {
+                return Err(ValidationError::new(
+                    ValidationCode::AfXdpUmemLengthNotRepresentable,
+                    path(&["backend", "umem", "frame-count"]),
+                ));
+            }
+            let rings = RingConfig::new(rings.fill, rings.rx, rings.tx, rings.completion).map_err(
+                |error| {
+                    ValidationError::new(
+                        ValidationCode::AfXdpRings(error),
+                        path(&["backend", "rings"]),
+                    )
+                },
+            )?;
+            let bind_flags = ValidatedBindFlags::new(bind_flags).map_err(|error| {
+                ValidationError::new(
+                    ValidationCode::AfXdpBindFlags(error),
+                    path(&["backend", "bind-flags"]),
+                )
+            })?;
+            if bind_flags.shared_umem() {
+                return Err(ValidationError::new(
+                    ValidationCode::AfXdpSharedUmemUnsupported,
+                    path(&["backend", "bind-flags"]),
+                ));
+            }
+            let attach_mode = match attach_mode {
+                XdpAttachModeV1::Skb => XdpAttachMode::Skb,
+                XdpAttachModeV1::Drv => XdpAttachMode::Drv,
+            };
+
+            let mut validated_resources = Vec::with_capacity(resources.len());
+            for (index, resource) in resources.into_iter().enumerate() {
+                let resource_path = indexed_nested_path("backend", "resources", index);
+                let interface_id = find_interface(&resource.interface).ok_or_else(|| {
+                    ValidationError::new(
+                        ValidationCode::UnknownInterface,
+                        child_path(&resource_path, "interface"),
+                    )
+                })?;
+                if validated_resources
+                    .iter()
+                    .any(|candidate: &ValidatedAfXdpResourceV1| candidate.interface == interface_id)
+                {
+                    return Err(ValidationError::new(
+                        ValidationCode::AfXdpDuplicateResourceInterface,
+                        child_path(&resource_path, "interface"),
+                    ));
+                }
+                if resource.queue_id >= xskmap_max_entries {
+                    return Err(ValidationError::new(
+                        ValidationCode::AfXdpQueueIdOutOfRange {
+                            queue_id: resource.queue_id,
+                            max_entries: xskmap_max_entries,
+                        },
+                        child_path(&resource_path, "queue-id"),
+                    ));
+                }
+                let record = interfaces
+                    .iter()
+                    .find(|record| record.binding.id == interface_id)
+                    .expect("backend resource interface was resolved from interface records");
+                validated_resources.push(ValidatedAfXdpResourceV1 {
+                    interface: interface_id,
+                    device: record.binding.device.clone(),
+                    queue_id: resource.queue_id,
+                });
+            }
+
+            if interfaces.iter().any(|record| {
+                !validated_resources
+                    .iter()
+                    .any(|resource| resource.interface == record.binding.id)
+            }) {
+                return Err(ValidationError::new(
+                    ValidationCode::AfXdpInterfaceNotCovered,
+                    path(&["backend", "resources"]),
+                ));
+            }
+
+            Ok(ValidatedBackendV1::AfXdp(ValidatedAfXdpBackendV1 {
+                resources: validated_resources.into_boxed_slice(),
+                xskmap_max_entries,
+                umem,
+                rings,
+                bind_flags,
+                attach_mode,
+            }))
+        }
+    }
 }
 
 fn preflight_public_dto(config: &ConfigV1) -> Result<(), ValidationError> {
@@ -1149,6 +1834,13 @@ fn preflight_public_dto(config: &ConfigV1) -> Result<(), ValidationError> {
             path(&["firewall", "rules"]),
             firewall.rules.len(),
             crate::MAX_FIREWALL_RULES,
+        )?;
+    }
+    if let Some(BackendV1::AfXdp { resources, .. }) = &config.backend {
+        check_list_bound(
+            path(&["backend", "resources"]),
+            resources.len(),
+            crate::MAX_AF_XDP_RESOURCES,
         )?;
     }
 
@@ -1196,6 +1888,12 @@ fn preflight_public_dto(config: &ConfigV1) -> Result<(), ValidationError> {
                 tcp.allocator_seed.expose(),
                 path(&["nat44", "tcp", "allocator-seed"]),
             )?;
+        }
+    }
+    if let Some(BackendV1::AfXdp { resources, .. }) = &config.backend {
+        for (index, resource) in resources.iter().enumerate() {
+            let resource_path = indexed_nested_path("backend", "resources", index);
+            text.add(&resource.interface, child_path(&resource_path, "interface"))?;
         }
     }
     if let Some(firewall) = &config.firewall {

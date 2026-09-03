@@ -1,51 +1,153 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![doc = "Allocation-free, bounded single-worker tick orchestration for ruster."]
 
 use ruster_core::{
     dispatch_host_unreachable_failures, execute_one_arp_request, execute_one_icmpv4_error,
     forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors, poll_resolution_timers,
-    ArpRequestBuildError, BatchReport, ExecuteArpRequestError, ExecuteIcmpv4Error, FirewallConfig,
-    FirewallRuntime, ForwardingSnapshot, GeneratedAllocationError, GeneratedIcmpv4TraceSink,
-    GeneratedPacketIo, GeneratedTraceSink, Icmpv4ErrorBuildError, Icmpv4ErrorRuntime,
-    MonotonicMillis, Nat44TcpConfig, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpRuntime, PacketIo,
-    PublicationQuiescence, PublicationQuiescenceDisposition, ResolutionFailureDispatchError,
-    ResolutionFailureDispatchReport, ResolutionFailureTraceSink, ResolutionRuntime,
-    ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTraceSink, TraceSink,
+    ArpRequestBuildError, BatchReport, BoundPublicationBackend, ExecuteArpRequestError,
+    ExecuteIcmpv4Error, FirewallConfig, FirewallCounters, FirewallRuntime, ForwardingSnapshot,
+    GeneratedAllocationError, GeneratedIcmpv4TraceSink, GeneratedPacketIo, GeneratedTraceSink,
+    Icmpv4ErrorBuildError, Icmpv4ErrorRuntime, MatchedPublicationQuiescenceGuard, MonotonicMillis,
+    Nat44TcpConfig, Nat44TcpCounters, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpCounters,
+    Nat44UdpRuntime, PacketIo, PublicationBackendAuthority, PublicationOwnerBinding,
+    PublicationQuiescence, PublicationQuiescenceBackend, PublicationQuiescenceDisposition,
+    PublicationQuiescenceGuard, ResolutionFailureDispatchError, ResolutionFailureDispatchReport,
+    ResolutionFailureTraceSink, ResolutionRuntime, ResolutionTimerError, ResolutionTimerReport,
+    ResolutionTimerTraceSink, TraceSink,
 };
-use std::num::NonZeroU64;
+use std::{fmt, num::NonZeroU64};
+
+pub mod observability;
 
 /// Tick-local UDP NAT44 authority and its optional worker-local runtime.
 ///
-/// Keeping these values in one view prevents downstream publication adapters
-/// from accidentally pairing a config with another service's runtime.
+/// The fields are private so downstream callers cannot reconcile the runtime
+/// behind the generation-tagged publication. Publication adapters can construct
+/// the paired view, while only this crate's tick engine can consume the mutable
+/// runtime borrow.
 pub struct Nat44UdpServiceView<'view, 'storage> {
-    pub config: Nat44UdpConfig,
-    pub runtime: Option<&'view mut Nat44UdpRuntime<'storage>>,
+    config: Nat44UdpConfig,
+    runtime: Option<&'view mut Nat44UdpRuntime<'storage>>,
+}
+
+impl<'view, 'storage> Nat44UdpServiceView<'view, 'storage> {
+    /// Pairs validated UDP authority with its worker-local runtime.
+    #[must_use]
+    pub const fn new(
+        config: Nat44UdpConfig,
+        runtime: Option<&'view mut Nat44UdpRuntime<'storage>>,
+    ) -> Self {
+        Self { config, runtime }
+    }
+
+    /// Returns the copied UDP authority without exposing mutable runtime state.
+    #[must_use]
+    pub const fn config(&self) -> Nat44UdpConfig {
+        self.config
+    }
+
+    /// Reports whether this publication supplied UDP runtime state.
+    #[must_use]
+    pub const fn has_runtime(&self) -> bool {
+        self.runtime.is_some()
+    }
+
+    /// Returns a copy of the cumulative saturating UDP NAT44 counters, or
+    /// `None` when this tick has no runtime state. Read-only: the runtime
+    /// borrow behind it remains sealed to this crate.
+    #[must_use]
+    pub fn counters(&self) -> Option<Nat44UdpCounters> {
+        self.runtime.as_deref().map(Nat44UdpRuntime::counters)
+    }
 }
 
 /// Tick-local TCP NAT44 authority and its optional worker-local runtime.
 ///
 /// The optional runtime preserves the existing fail-closed packet semantics
-/// when a configured service cannot supply mutable state for a tick.
+/// when a configured service cannot supply mutable state for a tick. Its borrow
+/// remains private so callers cannot rotate its key outside publication.
 pub struct Nat44TcpServiceView<'view, 'storage> {
-    pub config: Nat44TcpConfig,
-    pub runtime: Option<&'view mut Nat44TcpRuntime<'storage>>,
+    config: Nat44TcpConfig,
+    runtime: Option<&'view mut Nat44TcpRuntime<'storage>>,
+}
+
+impl<'view, 'storage> Nat44TcpServiceView<'view, 'storage> {
+    /// Pairs validated TCP authority with its worker-local runtime.
+    #[must_use]
+    pub const fn new(
+        config: Nat44TcpConfig,
+        runtime: Option<&'view mut Nat44TcpRuntime<'storage>>,
+    ) -> Self {
+        Self { config, runtime }
+    }
+
+    /// Returns the copied TCP authority without exposing mutable runtime state.
+    #[must_use]
+    pub const fn config(&self) -> Nat44TcpConfig {
+        self.config
+    }
+
+    /// Reports whether this publication supplied TCP runtime state.
+    #[must_use]
+    pub const fn has_runtime(&self) -> bool {
+        self.runtime.is_some()
+    }
+
+    /// Returns a copy of the cumulative saturating TCP NAT44 counters, or
+    /// `None` when this tick has no runtime state. Read-only: the runtime
+    /// borrow behind it remains sealed to this crate.
+    #[must_use]
+    pub fn counters(&self) -> Option<Nat44TcpCounters> {
+        self.runtime.as_deref().map(Nat44TcpRuntime::counters)
+    }
 }
 
 /// Tick-local firewall authority and its optional worker-local runtime.
 ///
 /// The config's borrowed rules and the runtime borrow are both shortened to
-/// the lifetime of the active publication view.
+/// the lifetime of the active publication view. The runtime remains private to
+/// the tick engine so the pair cannot be separated by downstream code.
 pub struct FirewallServiceView<'view, 'storage> {
-    pub config: FirewallConfig<'view>,
-    pub runtime: Option<&'view mut FirewallRuntime<'storage>>,
+    config: FirewallConfig<'view>,
+    runtime: Option<&'view mut FirewallRuntime<'storage>>,
+}
+
+impl<'view, 'storage> FirewallServiceView<'view, 'storage> {
+    /// Pairs validated firewall authority with its worker-local runtime.
+    #[must_use]
+    pub const fn new(
+        config: FirewallConfig<'view>,
+        runtime: Option<&'view mut FirewallRuntime<'storage>>,
+    ) -> Self {
+        Self { config, runtime }
+    }
+
+    /// Returns the copied firewall authority without exposing mutable state.
+    #[must_use]
+    pub const fn config(&self) -> FirewallConfig<'view> {
+        self.config
+    }
+
+    /// Reports whether this publication supplied firewall runtime state.
+    #[must_use]
+    pub const fn has_runtime(&self) -> bool {
+        self.runtime.is_some()
+    }
+
+    /// Returns a copy of the cumulative saturating firewall counters, or
+    /// `None` when this tick has no runtime state. Read-only: the runtime
+    /// borrow behind it remains sealed to this crate.
+    #[must_use]
+    pub fn counters(&self) -> Option<FirewallCounters> {
+        self.runtime.as_deref().map(FirewallRuntime::counters)
+    }
 }
 
 /// All immutable authority and mutable worker-local state required by the
 /// full UDP/TCP NAT44, firewall, resolution, and generated ICMP composition.
 ///
-/// The immutable snapshot and validated configs are copied into each
-/// tick-local view. Each NAT/firewall config is paired with its runtime in a
+/// The immutable snapshot, generation-bound tick budgets, and validated
+/// configs are copied into each tick-local view. Each NAT/firewall config is paired with its runtime in a
 /// service-specific nested view, and every borrowed slice is shortened to
 /// `'view`, so neither immutable authority nor mutable runtime state can
 /// escape the borrow of the publication adapter. `FullServiceView`
@@ -75,26 +177,30 @@ pub struct FirewallServiceView<'view, 'storage> {
 /// candidate cannot be published while that authority is still live:
 ///
 /// ```compile_fail
-/// use ruster_core::PublicationQuiescence;
-/// use ruster_runtime::{FullServicePublication, FullServiceView};
+/// use ruster_core::{
+///     BoundPublicationBackend, PublicationBackendAuthority, PublicationQuiescence,
+///     PublicationQuiescenceBackend,
+/// };
+/// use ruster_runtime::{
+///     try_publish_candidate, FullServicePublication, FullServiceView,
+/// };
 ///
 /// fn publish_while_authority_is_live<'storage, I, P>(
 ///     publication: &mut P,
-///     io: &mut I,
+///     io: &mut BoundPublicationBackend<I>,
 ///     candidate: P::Candidate,
 /// )
 /// where
-///     I: PublicationQuiescence,
-///     P: FullServicePublication<'storage, I>,
+///     I: PublicationBackendAuthority + PublicationQuiescenceBackend,
+///     P: FullServicePublication<'storage, BoundPublicationBackend<I>>,
 /// {
-///     let view: FullServiceView<'_, 'storage> =
-///         publication.active().expect("active publication");
-///     let snapshot = view.snapshot;
-///     let firewall_config = view.firewall.config;
+///     let view: FullServiceView<'_, 'storage> = publication.active();
+///     let snapshot = view.snapshot();
+///     let firewall_config = view.firewall_config();
 ///     let Ok(guard) = io.try_publication_quiescence() else {
 ///         return;
 ///     };
-///     let _result = publication.publish_candidate(candidate, guard);
+///     let _result = try_publish_candidate(publication, candidate, guard);
 ///     drop((snapshot, firewall_config));
 /// }
 /// ```
@@ -103,23 +209,26 @@ pub struct FirewallServiceView<'view, 'storage> {
 /// attempt:
 ///
 /// ```compile_fail
-/// use ruster_core::PublicationQuiescence;
-/// use ruster_runtime::FullServicePublication;
+/// use ruster_core::{
+///     BoundPublicationBackend, PublicationBackendAuthority, PublicationQuiescence,
+///     PublicationQuiescenceBackend,
+/// };
+/// use ruster_runtime::{try_publish_candidate, FullServicePublication};
 ///
 /// fn publish_while_old_view_is_live<'storage, I, P>(
 ///     publication: &mut P,
-///     io: &mut I,
+///     io: &mut BoundPublicationBackend<I>,
 ///     candidate: P::Candidate,
 /// )
 /// where
-///     I: PublicationQuiescence,
-///     P: FullServicePublication<'storage, I>,
+///     I: PublicationBackendAuthority + PublicationQuiescenceBackend,
+///     P: FullServicePublication<'storage, BoundPublicationBackend<I>>,
 /// {
-///     let old_view = publication.active().expect("active publication");
+///     let old_view = publication.active();
 ///     let Ok(guard) = io.try_publication_quiescence() else {
 ///         return;
 ///     };
-///     let _result = publication.publish_candidate(candidate, guard);
+///     let _result = try_publish_candidate(publication, candidate, guard);
 ///     drop(old_view);
 /// }
 /// ```
@@ -127,8 +236,8 @@ pub struct FirewallServiceView<'view, 'storage> {
 /// This paired, generation-tagged by-value layout is a pre-1.0 source break
 /// from the earlier flat config/runtime fields and the older
 /// `&ForwardingSnapshot` field. Downstream adapters construct the view with a
-/// copied `ForwardingSnapshot`, a nonzero generation, and the three nested
-/// service views.
+/// copied `ForwardingSnapshot`, a nonzero generation, generation-bound tick
+/// budgets, and the three nested service views.
 ///
 /// Existing code that extracts the removed flat fields no longer compiles:
 ///
@@ -146,68 +255,491 @@ pub struct FirewallServiceView<'view, 'storage> {
 /// }
 /// ```
 pub struct FullServiceView<'view, 'storage> {
-    pub generation: NonZeroU64,
-    pub snapshot: ForwardingSnapshot<'view>,
-    pub resolution: &'view mut ResolutionRuntime<'storage>,
-    pub icmpv4_errors: &'view mut Icmpv4ErrorRuntime<'storage>,
-    pub nat44_udp: Nat44UdpServiceView<'view, 'storage>,
-    pub nat44_tcp: Nat44TcpServiceView<'view, 'storage>,
-    pub firewall: FirewallServiceView<'view, 'storage>,
+    tick_authority: &'view ActiveTickAuthority,
+    snapshot: ForwardingSnapshot<'view>,
+    resolution: &'view mut ResolutionRuntime<'storage>,
+    icmpv4_errors: &'view mut Icmpv4ErrorRuntime<'storage>,
+    nat44_udp: Nat44UdpServiceView<'view, 'storage>,
+    nat44_tcp: Nat44TcpServiceView<'view, 'storage>,
+    firewall: FirewallServiceView<'view, 'storage>,
 }
 
-/// Atomic publication seam used by [`run_tick`].
+impl<'view, 'storage> FullServiceView<'view, 'storage> {
+    /// Constructs one coherent tick-local view for a publication adapter.
+    ///
+    /// Mutable runtime fields remain private after construction. This prevents
+    /// downstream code from reconciling a NAT runtime without also replacing
+    /// the generation-tagged candidate that supplied its authority.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one constructor binds all generation-local authority and runtime state"
+    )]
+    pub const fn new(
+        tick_authority: &'view ActiveTickAuthority,
+        snapshot: ForwardingSnapshot<'view>,
+        resolution: &'view mut ResolutionRuntime<'storage>,
+        icmpv4_errors: &'view mut Icmpv4ErrorRuntime<'storage>,
+        nat44_udp: Nat44UdpServiceView<'view, 'storage>,
+        nat44_tcp: Nat44TcpServiceView<'view, 'storage>,
+        firewall: FirewallServiceView<'view, 'storage>,
+    ) -> Self {
+        Self {
+            tick_authority,
+            snapshot,
+            resolution,
+            icmpv4_errors,
+            nat44_udp,
+            nat44_tcp,
+            firewall,
+        }
+    }
+
+    /// Returns the generation of all authority and state in this view.
+    #[must_use]
+    pub const fn generation(&self) -> NonZeroU64 {
+        self.tick_authority.generation()
+    }
+
+    /// Returns the budgets paired with this active generation.
+    #[must_use]
+    pub const fn tick_budgets(&self) -> TickBudgets {
+        self.tick_authority.tick_budgets()
+    }
+
+    /// Returns the copied forwarding authority.
+    #[must_use]
+    pub const fn snapshot(&self) -> ForwardingSnapshot<'view> {
+        self.snapshot
+    }
+
+    /// Returns the copied UDP NAT authority.
+    #[must_use]
+    pub const fn nat44_udp_config(&self) -> Nat44UdpConfig {
+        self.nat44_udp.config()
+    }
+
+    /// Returns the copied TCP NAT authority.
+    #[must_use]
+    pub const fn nat44_tcp_config(&self) -> Nat44TcpConfig {
+        self.nat44_tcp.config()
+    }
+
+    /// Returns the copied firewall authority.
+    #[must_use]
+    pub const fn firewall_config(&self) -> FirewallConfig<'view> {
+        self.firewall.config()
+    }
+
+    /// Reports whether this publication supplied UDP runtime state.
+    #[must_use]
+    pub const fn has_nat44_udp_runtime(&self) -> bool {
+        self.nat44_udp.has_runtime()
+    }
+
+    /// Reports whether this publication supplied TCP runtime state.
+    #[must_use]
+    pub const fn has_nat44_tcp_runtime(&self) -> bool {
+        self.nat44_tcp.has_runtime()
+    }
+
+    /// Reports whether this publication supplied firewall runtime state.
+    #[must_use]
+    pub const fn has_firewall_runtime(&self) -> bool {
+        self.firewall.has_runtime()
+    }
+
+    /// Returns a copy of the cumulative saturating UDP NAT44 counters, or
+    /// `None` when this tick has no UDP runtime state.
+    #[must_use]
+    pub fn nat44_udp_counters(&self) -> Option<Nat44UdpCounters> {
+        self.nat44_udp.counters()
+    }
+
+    /// Returns a copy of the cumulative saturating TCP NAT44 counters, or
+    /// `None` when this tick has no TCP runtime state.
+    #[must_use]
+    pub fn nat44_tcp_counters(&self) -> Option<Nat44TcpCounters> {
+        self.nat44_tcp.counters()
+    }
+
+    /// Returns a copy of the cumulative saturating firewall counters, or
+    /// `None` when this tick has no firewall runtime state.
+    #[must_use]
+    pub fn firewall_counters(&self) -> Option<FirewallCounters> {
+        self.firewall.counters()
+    }
+}
+
+/// A publication rejection that preserves ownership of the exact candidate.
 ///
-/// `publish_candidate` receives a move-only guard for the exact packet backend
-/// and must either install the entire candidate or leave the previous active
-/// publication unchanged. The guard cannot coexist with packet I/O and is
-/// dropped when the publication call returns. A rejected candidate continues
-/// with the old publication. A deferred candidate continues only when the
-/// backend classifies its exact error as `ContinueOldIo`; `SkipIo` and `Stop`
-/// retain the old active publication but suppress data phases. The active view
-/// returned for a tick must remain one coherent generation until the view is
-/// dropped.
-/// `active` is a steady-tick O(1) borrow: it must not repeat semantic
-/// validation, fingerprinting, hashing, slice scans, or allocation. Those
-/// cold-path operations belong to candidate construction/publication.
-/// The validated snapshot and NAT/firewall configs are copied into the view by
-/// value so an adapter never has to return references to temporary values.
-/// The generation is the identity of that coherent publication. A full view
-/// currently contains all three configured service pairs; representing a
-/// service as wholly absent requires a future core composition seam that
-/// accepts optional configs as well as optional runtimes.
+/// This wrapper only guarantees ownership preservation; the error taxonomy
+/// decides whether the operation is retryable or terminal. A publication adapter
+/// must return the same candidate ownership it received. The caller can inspect
+/// the error through [`Self::error`] and recover both values through
+/// [`Self::into_parts`] before deciding whether to retry, revise, or discard the
+/// candidate.
 ///
-/// Adding the exact backend type and guard parameter is an intentional
-/// pre-1.0 source break for publication adapters:
+/// Candidate authority can contain allocator seeds or other secrets, so this
+/// wrapper deliberately provides neither `Debug` nor `Clone`. Its fields remain
+/// private to prevent accidental partial extraction or logging.
 ///
 /// ```compile_fail
-/// use ruster_runtime::{FullServicePublication, FullServiceView};
+/// use ruster_runtime::PublicationRejection;
 ///
-/// struct OldAdapter;
+/// fn require_debug<T: std::fmt::Debug>() {}
+/// require_debug::<PublicationRejection<u8, ()>>();
+/// ```
 ///
-/// impl<'storage> FullServicePublication<'storage> for OldAdapter {
+/// ```compile_fail
+/// use ruster_runtime::PublicationRejection;
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<PublicationRejection<u8, ()>>();
+/// ```
+#[must_use = "a rejected candidate retains caller-owned authority"]
+#[derive(Eq, PartialEq)]
+pub struct PublicationRejection<C, E> {
+    candidate: C,
+    error: E,
+}
+
+impl<C, E> PublicationRejection<C, E> {
+    /// Creates a rejection from the exact candidate that was not published.
+    ///
+    /// Publication adapters use this constructor whenever a failed cold
+    /// boundary must return the exact candidate to a caller outside this crate.
+    pub const fn new(candidate: C, error: E) -> Self {
+        Self { candidate, error }
+    }
+
+    /// Returns the publication error without exposing the candidate.
+    #[must_use]
+    pub const fn error(&self) -> &E {
+        &self.error
+    }
+
+    /// Recovers the rejected candidate and its error without cloning either.
+    #[must_use]
+    pub fn into_parts(self) -> (C, E) {
+        (self.candidate, self.error)
+    }
+}
+
+/// Immutable status of the publication owner's active authority.
+///
+/// This is independent of [`PublicationQuiescenceDisposition`], which describes
+/// one packet backend. `StopOldPublication` asserts that an active publication
+/// still exists but has latched an authority invariant failure, so it must never
+/// be borrowed for data phases. There is deliberately no default: every adapter
+/// must classify absence, executable authority, and terminal authority explicitly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivePublicationStatus {
+    Absent,
+    ContinueOldIo,
+    StopOldPublication,
+}
+
+impl ActivePublicationStatus {
+    /// Reports whether the owner still contains an active publication.
+    #[must_use]
+    pub const fn is_present(self) -> bool {
+        !matches!(self, Self::Absent)
+    }
+}
+
+/// Failure returned by [`try_publish_candidate`] before a candidate is applied.
+///
+/// Both variants preserve ownership of the exact candidate. Candidate authority
+/// may contain allocator seeds or other secrets, so `Debug` redacts it.
+#[must_use = "a failed publication attempt retains caller-owned authority"]
+#[derive(Eq, PartialEq)]
+pub enum PublicationAttemptError<C, E> {
+    /// The raw quiescence guard belongs to another same-type backend instance.
+    BackendMismatch { candidate: C },
+    /// The authorized adapter rejected the candidate unchanged.
+    Rejected(PublicationRejection<C, E>),
+}
+
+impl<C, E> fmt::Debug for PublicationAttemptError<C, E>
+where
+    E: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BackendMismatch { .. } => formatter
+                .debug_struct("BackendMismatch")
+                .field("candidate", &"<redacted>")
+                .finish(),
+            Self::Rejected(rejection) => formatter
+                .debug_struct("Rejected")
+                .field("candidate", &"<redacted>")
+                .field("error", rejection.error())
+                .finish(),
+        }
+    }
+}
+
+/// Atomic publication seam used by [`run_tick`] and [`try_publish_candidate`].
+///
+/// The authorized hook receives a move-only guard that core matched to this
+/// owner's exact bound backend. Safe callers use [`try_publish_candidate`], which
+/// performs the owner match and preserves the candidate on mismatch. The guard
+/// cannot coexist with packet I/O and is dropped when the publication call
+/// returns.
+///
+/// # Safety
+///
+/// Implementing this trait accepts the publication-adapter authority boundary.
+/// Every implementation must uphold all of the following invariants:
+///
+/// - [`Self::publication_owner_binding`] is stable and belongs to the exact bound
+///   backend whose quiescence governs every active service runtime;
+/// - [`Self::active_status`] is immutable, O(1), and coherent: `Absent` means no
+///   active authority exists, `ContinueOldIo` means [`Self::active`] can borrow one
+///   complete coherent generation, and `StopOldPublication` means an authority
+///   still exists but may never be borrowed or executed;
+/// - `StopOldPublication` is terminal for this owner and retains the same typed
+///   cause returned by [`Self::reject_candidate_if_active_stopped`];
+/// - both rejection paths return the exact candidate value they received. They
+///   must never substitute, clone, reconstruct, or retain candidate authority;
+/// - a rejected publication leaves the previous active candidate, all service
+///   runtimes, and their backing storage unchanged, except that a detected active
+///   invariant failure may atomically latch `StopOldPublication` and its cause;
+/// - a successful publication installs the entire candidate and all associated
+///   runtime transitions atomically before reporting success; and
+/// - [`Self::active`] is allocation-free and O(1), performs no validation, scan,
+///   hash, or reconciliation work, and returns a view that remains one coherent
+///   generation until dropped.
+///
+/// Violating these semantic requirements can let safe runtime code publish or
+/// execute authority that was not covered by the matched backend proof.
+/// The validated snapshot and NAT/firewall configs are copied into the view by
+/// value so an adapter never has to return references to temporary values. A full
+/// view currently contains all three configured service pairs; representing a
+/// service as wholly absent requires a future core composition seam that accepts
+/// optional configs as well as optional runtimes.
+///
+/// Direct raw-guard publication is an intentional pre-1.0 source break:
+///
+/// ```compile_fail
+/// use ruster_core::{PublicationQuiescence, PublicationQuiescenceGuard};
+/// use ruster_runtime::FullServicePublication;
+///
+/// fn old_direct_call<'storage, I, P>(
+///     publication: &mut P,
+///     candidate: P::Candidate,
+///     raw: PublicationQuiescenceGuard<'_, I>,
+/// ) where
+///     I: PublicationQuiescence,
+///     P: FullServicePublication<'storage, I>,
+/// {
+///     publication.publish_candidate(candidate, raw);
+/// }
+/// ```
+///
+/// The typed apply report is an intentional pre-1.0 source break for
+/// publication adapters. An otherwise complete adapter must declare it:
+///
+/// ```compile_fail
+/// use ruster_core::{
+///     BoundPublicationBackend, MatchedPublicationQuiescenceGuard,
+///     PublicationOwnerBinding,
+/// };
+/// use ruster_io_sim::SimIo;
+///
+/// type Backend = BoundPublicationBackend<SimIo>;
+/// use ruster_runtime::{
+///     ActivePublicationStatus, FullServicePublication, FullServiceView,
+///     PublicationRejection,
+/// };
+///
+/// struct MissingApplyReport {
+///     owner_binding: PublicationOwnerBinding<Backend>,
+/// }
+///
+/// unsafe impl<'storage> FullServicePublication<'storage, Backend> for MissingApplyReport {
 ///     type Candidate = ();
 ///     type Reject = ();
 ///
-///     fn publish_candidate(&mut self, _: ()) -> Result<(), ()> {
-///         Ok(())
+///     fn publication_owner_binding(&self) -> &PublicationOwnerBinding<Backend> {
+///         &self.owner_binding
 ///     }
 ///
-///     fn active(&mut self) -> Option<FullServiceView<'_, 'storage>> {
-///         None
+///     unsafe fn publish_candidate_authorized(
+///         &mut self,
+///         _candidate: Self::Candidate,
+///         _quiescence: MatchedPublicationQuiescenceGuard<'_, Backend>,
+///     ) -> Result<
+///         Self::ApplyReport,
+///         PublicationRejection<Self::Candidate, Self::Reject>,
+///     > {
+///         unreachable!()
+///     }
+///
+///     fn reject_candidate_if_active_stopped(
+///         &self,
+///         candidate: Self::Candidate,
+///     ) -> Result<Self::Candidate, PublicationRejection<Self::Candidate, Self::Reject>> {
+///         Ok(candidate)
+///     }
+///
+///     fn active_status(&self) -> ActivePublicationStatus {
+///         ActivePublicationStatus::Absent
+///     }
+///
+///     fn active(&mut self) -> FullServiceView<'_, 'storage> {
+///         unreachable!()
 ///     }
 /// }
 /// ```
-pub trait FullServicePublication<'storage, I: PublicationQuiescence> {
+///
+/// Declaring an apply report while retaining the former unit success result is
+/// a separate source error:
+///
+/// ```compile_fail
+/// use ruster_core::{
+///     BoundPublicationBackend, MatchedPublicationQuiescenceGuard,
+///     PublicationOwnerBinding,
+/// };
+/// use ruster_io_sim::SimIo;
+///
+/// type Backend = BoundPublicationBackend<SimIo>;
+/// use ruster_runtime::{
+///     ActivePublicationStatus, FullServicePublication, FullServiceView,
+///     PublicationRejection,
+/// };
+///
+/// struct UnitResultAdapter {
+///     owner_binding: PublicationOwnerBinding<Backend>,
+/// }
+///
+/// unsafe impl<'storage> FullServicePublication<'storage, Backend> for UnitResultAdapter {
+///     type Candidate = ();
+///     type Reject = ();
+///     type ApplyReport = u8;
+///
+///     fn publication_owner_binding(&self) -> &PublicationOwnerBinding<Backend> {
+///         &self.owner_binding
+///     }
+///
+///     unsafe fn publish_candidate_authorized(
+///         &mut self,
+///         _candidate: Self::Candidate,
+///         _quiescence: MatchedPublicationQuiescenceGuard<'_, Backend>,
+///     ) -> Result<(), PublicationRejection<Self::Candidate, Self::Reject>> {
+///         Ok(())
+///     }
+///
+///     fn reject_candidate_if_active_stopped(
+///         &self,
+///         candidate: Self::Candidate,
+///     ) -> Result<Self::Candidate, PublicationRejection<Self::Candidate, Self::Reject>> {
+///         Ok(candidate)
+///     }
+///
+///     fn active_status(&self) -> ActivePublicationStatus {
+///         ActivePublicationStatus::Absent
+///     }
+///
+///     fn active(&mut self) -> FullServiceView<'_, 'storage> {
+///         unreachable!()
+///     }
+/// }
+/// ```
+#[allow(unsafe_code)]
+pub unsafe trait FullServicePublication<'storage, I: PublicationQuiescence> {
     type Candidate;
     type Reject;
+    type ApplyReport;
 
-    fn publish_candidate(
+    /// Returns the move-only owner capability paired with the exact backend
+    /// instance allowed to drive this publication owner.
+    fn publication_owner_binding(&self) -> &PublicationOwnerBinding<I>;
+
+    /// Applies one candidate after the caller authorizes exact-backend quiescence.
+    ///
+    /// # Safety
+    ///
+    /// The matched guard must have been produced for this exact publication
+    /// owner's binding and must retain the exclusive backend borrow for the whole
+    /// call. Safe code must call [`try_publish_candidate`] instead.
+    #[allow(unsafe_code)]
+    unsafe fn publish_candidate_authorized(
         &mut self,
         candidate: Self::Candidate,
-        quiescence: I::Guard<'_>,
-    ) -> Result<(), Self::Reject>;
+        quiescence: MatchedPublicationQuiescenceGuard<'_, I>,
+    ) -> Result<Self::ApplyReport, PublicationRejection<Self::Candidate, Self::Reject>>;
 
-    fn active(&mut self) -> Option<FullServiceView<'_, 'storage>>;
+    /// Rejects a candidate from an already stopped publication before backend
+    /// quiescence is requested.
+    ///
+    /// This check must be O(1), mutation-free, and preserve the exact candidate.
+    /// When [`Self::active_status`] is `StopOldPublication`, it must return the
+    /// same latched typed cause that the owner would return from
+    /// [`Self::publish_candidate_authorized`]. Otherwise it must return the
+    /// candidate unchanged. [`run_tick`] calls this only after exact backend
+    /// identity matching, and [`try_publish_candidate`] repeats it after raw guard
+    /// matching so neither safe entry can reach the adapter hook under a latch.
+    fn reject_candidate_if_active_stopped(
+        &self,
+        candidate: Self::Candidate,
+    ) -> Result<Self::Candidate, PublicationRejection<Self::Candidate, Self::Reject>>;
+
+    /// Returns the immutable, coherent active-authority status.
+    ///
+    /// This method must be O(1), mutation-free, and must not borrow any mutable
+    /// service runtime. [`run_tick`] uses it for backend mismatch and skip
+    /// decisions without calling [`Self::active`].
+    fn active_status(&self) -> ActivePublicationStatus;
+
+    /// Borrows the complete active generation.
+    ///
+    /// [`run_tick`] calls this method only after observing
+    /// [`ActivePublicationStatus::ContinueOldIo`] and a backend disposition that
+    /// permits data phases.
+    fn active(&mut self) -> FullServiceView<'_, 'storage>;
+}
+
+/// Safely authorizes and applies one candidate against a checked raw guard.
+///
+/// A guard from another same-type bound backend is rejected before the active
+/// latch is inspected. After an exact match, an already stopped publication
+/// rejects with its latched cause before the adapter hook runs. Both paths
+/// preserve the exact candidate and old active publication.
+#[allow(unsafe_code)]
+pub fn try_publish_candidate<'storage, P, I>(
+    publication: &mut P,
+    candidate: P::Candidate,
+    quiescence: PublicationQuiescenceGuard<'_, BoundPublicationBackend<I>>,
+) -> Result<P::ApplyReport, PublicationAttemptError<P::Candidate, P::Reject>>
+where
+    P: FullServicePublication<'storage, BoundPublicationBackend<I>>,
+    I: PublicationBackendAuthority + PublicationQuiescenceBackend,
+{
+    let quiescence = match publication
+        .publication_owner_binding()
+        .match_quiescence_guard(quiescence)
+    {
+        Ok(quiescence) => quiescence,
+        Err(quiescence) => {
+            drop(quiescence);
+            return Err(PublicationAttemptError::BackendMismatch { candidate });
+        }
+    };
+    let candidate = match publication.reject_candidate_if_active_stopped(candidate) {
+        Ok(candidate) => candidate,
+        Err(rejection) => {
+            drop(quiescence);
+            return Err(PublicationAttemptError::Rejected(rejection));
+        }
+    };
+
+    // SAFETY: the only safe entry point consumed the raw guard and matched its
+    // immutable core-owned identity against this exact publication owner. The
+    // mutation-free latch check also confirmed this candidate may reach the hook.
+    unsafe { publication.publish_candidate_authorized(candidate, quiescence) }
+        .map_err(PublicationAttemptError::Rejected)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -217,6 +749,43 @@ pub struct TickBudgets {
     pub failure_dispatch_scans: usize,
     pub generated_arp: usize,
     pub generated_icmpv4: usize,
+}
+
+/// One generation's identity paired with its tick budgets.
+///
+/// [`FullServiceView`] borrows this instead of embedding both values by
+/// value, so a coherent update of the pair is a single write at the owner
+/// and every view stays a plain reference. A publication adapter must keep
+/// exactly one instance of this type per active generation and update it
+/// atomically with the generation it identifies; it must never expose two
+/// different generations' budgets as members of the same instance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActiveTickAuthority {
+    generation: NonZeroU64,
+    tick_budgets: TickBudgets,
+}
+
+impl ActiveTickAuthority {
+    /// Pairs one generation identity with its tick budgets.
+    #[must_use]
+    pub const fn new(generation: NonZeroU64, tick_budgets: TickBudgets) -> Self {
+        Self {
+            generation,
+            tick_budgets,
+        }
+    }
+
+    /// Returns the paired generation identity.
+    #[must_use]
+    pub const fn generation(&self) -> NonZeroU64 {
+        self.generation
+    }
+
+    /// Returns the paired tick budgets.
+    #[must_use]
+    pub const fn tick_budgets(&self) -> TickBudgets {
+        self.tick_budgets
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,6 +801,8 @@ pub enum TickPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TickPhaseSkip {
     NoActivePublication,
+    BackendInstanceMismatch,
+    ActivePublicationInvalid,
     BackendIoNotReentrant,
     BackendStopped,
     BackendIoFailure,
@@ -263,17 +834,95 @@ impl TickPhaseTraceSink for NoTickPhaseTrace {
     fn record_tick_phase(&mut self, _event: TickPhaseTrace) {}
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub enum PublicationOutcome<E, Q> {
+/// Result of the publication phase, including any unconsumed candidate.
+///
+/// `Rejected`, `Deferred`, and candidate-bearing `BackendMismatch` preserve the
+/// exact candidate ownership supplied to [`run_tick`]. Rejection reports whether
+/// the old publication remains executable; the adapter's `E` taxonomy decides
+/// whether the candidate should be retried, revised, or discarded. A deferred
+/// candidate can be retried after the backend condition changes or with a replacement backend;
+/// `Stop` remains terminal for the backend value that reported it. The deferred
+/// disposition controls whether old-publication I/O may continue in the current
+/// tick and never consumes the candidate. `Applied` carries the adapter's typed
+/// report for the completed transaction.
+///
+/// `Debug` deliberately redacts candidates while retaining the error and
+/// disposition needed for operational diagnosis.
+///
+/// Ignoring an outcome can silently discard the exact rejected or deferred
+/// candidate, so the type is `must_use`:
+///
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// use ruster_runtime::PublicationOutcome;
+///
+/// fn discard(outcome: PublicationOutcome<(), (), ()>) {
+///     outcome;
+/// }
+/// ```
+///
+/// `Applied` now always carries the adapter's typed report. The former unit
+/// pattern is an intentional pre-1.0 source break:
+///
+/// ```compile_fail
+/// use ruster_runtime::PublicationOutcome;
+///
+/// fn use_old_unit_pattern(outcome: PublicationOutcome<(), (), (), u8>) {
+///     if let PublicationOutcome::Applied = outcome {}
+/// }
+/// ```
+#[must_use = "the publication outcome may retain an unconsumed candidate"]
+#[derive(Eq, PartialEq)]
+pub enum PublicationOutcome<C, E, Q, A = ()> {
     Unchanged,
-    Applied,
-    /// The backend refused quiescence. The candidate was not passed to the
-    /// publication adapter and was dropped unchanged.
+    Applied(A),
+    /// The supplied backend is not the instance paired with this publication.
+    BackendMismatch {
+        candidate: Option<C>,
+    },
+    /// The backend refused quiescence before the adapter saw the candidate.
     Deferred {
+        candidate: C,
         error: Q,
         disposition: PublicationQuiescenceDisposition,
     },
-    Rejected(E),
+    /// The adapter rejected publication and returned the candidate unchanged.
+    Rejected {
+        rejection: PublicationRejection<C, E>,
+        status: ActivePublicationStatus,
+    },
+}
+
+impl<C, E, Q, A> fmt::Debug for PublicationOutcome<C, E, Q, A>
+where
+    E: fmt::Debug,
+    Q: fmt::Debug,
+    A: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unchanged => formatter.write_str("Unchanged"),
+            Self::Applied(report) => formatter.debug_tuple("Applied").field(report).finish(),
+            Self::BackendMismatch { candidate } => formatter
+                .debug_struct("BackendMismatch")
+                .field("candidate", &candidate.as_ref().map(|_| "<redacted>"))
+                .finish(),
+            Self::Rejected { rejection, status } => formatter
+                .debug_struct("Rejected")
+                .field("candidate", &"<redacted>")
+                .field("error", rejection.error())
+                .field("status", status)
+                .finish(),
+            Self::Deferred {
+                error, disposition, ..
+            } => formatter
+                .debug_struct("Deferred")
+                .field("candidate", &"<redacted>")
+                .field("error", error)
+                .field("disposition", disposition)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -397,9 +1046,34 @@ pub struct GeneratedPhaseReport<S> {
     pub stop: S,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub struct TickReport<PublicationError, QuiescenceError, RxError, GeneratedError> {
-    pub publication: PublicationOutcome<PublicationError, QuiescenceError>,
+/// Complete bounded tick report.
+///
+/// Its `Debug` implementation inherits candidate redaction from
+/// [`PublicationOutcome`] and therefore does not require `Candidate: Debug`.
+/// The publication outcome may own an unconsumed candidate, so callers must
+/// inspect or deliberately bind the report rather than discard it implicitly.
+///
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// use ruster_runtime::TickReport;
+///
+/// fn discard<RxError, GeneratedError>(
+///     report: TickReport<(), (), (), RxError, GeneratedError>,
+/// ) {
+///     report;
+/// }
+/// ```
+#[must_use = "the tick report may retain an unconsumed publication candidate"]
+#[derive(Eq, PartialEq)]
+pub struct TickReport<
+    Candidate,
+    PublicationError,
+    QuiescenceError,
+    RxError,
+    GeneratedError,
+    ApplyReport = (),
+> {
+    pub publication: PublicationOutcome<Candidate, PublicationError, QuiescenceError, ApplyReport>,
     pub active: bool,
     pub rx: RxPhaseReport<RxError>,
     pub resolution_timers: PhaseReport<ResolutionTimerReport, ResolutionTimerError>,
@@ -413,6 +1087,28 @@ pub struct TickReport<PublicationError, QuiescenceError, RxError, GeneratedError
         GeneratedPhaseReport<GeneratedIcmpv4Stop<GeneratedError>>,
         core::convert::Infallible,
     >,
+}
+
+impl<C, E, Q, R, G, A> fmt::Debug for TickReport<C, E, Q, R, G, A>
+where
+    E: fmt::Debug,
+    Q: fmt::Debug,
+    R: fmt::Debug,
+    G: fmt::Debug,
+    A: fmt::Debug,
+{
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TickReport")
+            .field("publication", &self.publication)
+            .field("active", &self.active)
+            .field("rx", &self.rx)
+            .field("resolution_timers", &self.resolution_timers)
+            .field("failure_dispatch", &self.failure_dispatch)
+            .field("generated_arp", &self.generated_arp)
+            .field("generated_icmpv4", &self.generated_icmpv4)
+            .finish()
+    }
 }
 
 fn add_generated_accounting<E>(
@@ -646,15 +1342,51 @@ fn skip_phase<T: TickPhaseTraceSink>(trace: &mut T, phase: TickPhase, reason: Ti
     trace.record_tick_phase(TickPhaseTrace::PhaseSkipped { phase, reason });
 }
 
+/// Skips every post-publication phase for the same `reason` and finishes the
+/// tick trace, building the resulting all-`Skipped` [`TickReport`].
+fn skip_remaining_phases<T, C, E, Q, R, G, A>(
+    trace: &mut T,
+    reason: TickPhaseSkip,
+    publication: PublicationOutcome<C, E, Q, A>,
+    active: bool,
+) -> TickReport<C, E, Q, R, G, A>
+where
+    T: TickPhaseTraceSink,
+{
+    for phase in [
+        TickPhase::Rx,
+        TickPhase::ResolutionTimers,
+        TickPhase::FailureDispatch,
+        TickPhase::GeneratedArp,
+        TickPhase::GeneratedIcmpv4,
+    ] {
+        skip_phase(trace, phase, reason);
+    }
+    trace.record_tick_phase(TickPhaseTrace::TickFinished);
+    TickReport {
+        publication,
+        active,
+        rx: RxPhaseReport::Skipped(reason),
+        resolution_timers: PhaseReport::Skipped(reason),
+        failure_dispatch: PhaseReport::Skipped(reason),
+        generated_arp: PhaseReport::Skipped(reason),
+        generated_icmpv4: PhaseReport::Skipped(reason),
+    }
+}
+
 /// Runs one bounded, single-worker service tick.
 ///
-/// A candidate first requires backend-authoritative quiescence. Its successful
-/// guard is released before `active` or packet I/O. A failure is classified by
-/// the backend: `ContinueOldIo` may run the old publication, while `SkipIo`
-/// and `Stop` suppress every data phase. Unknown backend failures default to
-/// `SkipIo`. On candidate-free ticks the runtime reads the backend's bounded
-/// current-I/O disposition, so a sticky `SkipIo` or terminal `Stop` cannot be
-/// bypassed. This steady check does not request a quiescence guard.
+/// After exact backend identity matching, an already stopped active publication
+/// rejects a candidate with its latched typed cause before backend quiescence is
+/// requested. Otherwise a candidate requires backend-authoritative quiescence.
+/// Its successful guard is released before `active` or packet I/O, then the
+/// backend's bounded current-I/O disposition is re-read after an applied or
+/// rejected attempt. A quiescence failure is classified by the backend:
+/// `ContinueOldIo` may run the old publication, while `SkipIo` and `Stop` suppress
+/// every data phase. Unknown backend failures default to `SkipIo`. Candidate-free
+/// ticks perform the same bounded disposition read, so a sticky `SkipIo` or
+/// terminal `Stop` cannot be bypassed. This steady check does not request a
+/// quiescence guard.
 ///
 /// The phase order is publication, RX, resolution timers, failure dispatch,
 /// generated ARP, and generated ICMPv4. The RX batch is moved into the full
@@ -684,23 +1416,105 @@ fn skip_phase<T: TickPhaseTraceSink>(trace: &mut T, phase: TickPhase, reason: Ti
 ///     drop((rx, generated));
 /// }
 /// ```
-#[allow(clippy::too_many_arguments)]
+///
+/// Tick budgets now come from the post-publication active view. Supplying the
+/// former independent budget argument is an intentional pre-1.0 source break:
+///
+/// ```compile_fail
+/// use ruster_core::{
+///     BoundPublicationBackend, GeneratedIcmpv4TraceSink, GeneratedPacketIo,
+///     PublicationBackendAuthority,
+///     GeneratedTraceSink, MonotonicMillis, PacketIo,
+///     PublicationQuiescenceBackend, ResolutionFailureTraceSink,
+///     ResolutionTimerTraceSink, TraceSink,
+/// };
+/// use ruster_runtime::{
+///     run_tick, FullServicePublication, TickBudgets, TickPhaseTraceSink,
+/// };
+///
+/// fn old_external_budgets<'storage, P, I, T>(
+///     publication: &mut P,
+///     candidate: Option<P::Candidate>,
+///     io: &mut BoundPublicationBackend<I>,
+///     trace: &mut T,
+/// ) where
+///     P: FullServicePublication<'storage, BoundPublicationBackend<I>>,
+///     I: PacketIo + GeneratedPacketIo + PublicationBackendAuthority + PublicationQuiescenceBackend,
+///     T: TickPhaseTraceSink
+///         + TraceSink
+///         + ResolutionTimerTraceSink
+///         + ResolutionFailureTraceSink
+///         + GeneratedTraceSink
+///         + GeneratedIcmpv4TraceSink,
+/// {
+///     let _report = run_tick(
+///         publication,
+///         candidate,
+///         io,
+///         MonotonicMillis(0),
+///         TickBudgets::default(),
+///         trace,
+///     );
+/// }
+/// ```
+///
+/// The returned report can retain the exact rejected or deferred candidate and
+/// therefore cannot be discarded without an `unused_must_use` diagnostic:
+///
+/// ```compile_fail
+/// #![deny(unused_must_use)]
+/// use ruster_core::{
+///     BoundPublicationBackend, GeneratedIcmpv4TraceSink, GeneratedPacketIo,
+///     PublicationBackendAuthority,
+///     GeneratedTraceSink, MonotonicMillis, PacketIo,
+///     PublicationQuiescenceBackend, ResolutionFailureTraceSink,
+///     ResolutionTimerTraceSink, TraceSink,
+/// };
+/// use ruster_runtime::{run_tick, FullServicePublication, TickPhaseTraceSink};
+///
+/// fn discard<'storage, P, I, T>(
+///     publication: &mut P,
+///     candidate: Option<P::Candidate>,
+///     io: &mut BoundPublicationBackend<I>,
+///     trace: &mut T,
+/// ) where
+///     P: FullServicePublication<'storage, BoundPublicationBackend<I>>,
+///     I: PacketIo + GeneratedPacketIo + PublicationBackendAuthority + PublicationQuiescenceBackend,
+///     T: TickPhaseTraceSink
+///         + TraceSink
+///         + ResolutionTimerTraceSink
+///         + ResolutionFailureTraceSink
+///         + GeneratedTraceSink
+///         + GeneratedIcmpv4TraceSink,
+/// {
+///     run_tick(
+///         publication,
+///         candidate,
+///         io,
+///         MonotonicMillis(0),
+///         trace,
+///     );
+/// }
+/// ```
+#[must_use = "the tick report may retain an unconsumed publication candidate"]
+#[allow(clippy::type_complexity)]
 pub fn run_tick<'storage, P, I, T>(
     publication: &mut P,
     candidate: Option<P::Candidate>,
-    io: &mut I,
+    io: &mut BoundPublicationBackend<I>,
     now: MonotonicMillis,
-    budgets: TickBudgets,
     trace: &mut T,
 ) -> TickReport<
+    P::Candidate,
     P::Reject,
-    <I as PublicationQuiescence>::Error,
+    <I as PublicationQuiescenceBackend>::Error,
     <I as PacketIo>::Error,
     <I as GeneratedPacketIo>::Error,
+    P::ApplyReport,
 >
 where
-    P: FullServicePublication<'storage, I>,
-    I: PacketIo + GeneratedPacketIo + PublicationQuiescence,
+    P: FullServicePublication<'storage, BoundPublicationBackend<I>>,
+    I: PacketIo + GeneratedPacketIo + PublicationBackendAuthority + PublicationQuiescenceBackend,
     T: TickPhaseTraceSink
         + TraceSink
         + ResolutionTimerTraceSink
@@ -710,44 +1524,86 @@ where
 {
     trace.record_tick_phase(TickPhaseTrace::TickStarted);
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::Publication));
-    let mut io_disposition = candidate.is_none().then(|| io.current_io_disposition());
+    if !publication.publication_owner_binding().matches_backend(io) {
+        trace.record_tick_phase(TickPhaseTrace::PhaseFinished(TickPhase::Publication));
+        let active = publication.active_status().is_present();
+        return skip_remaining_phases(
+            trace,
+            TickPhaseSkip::BackendInstanceMismatch,
+            PublicationOutcome::BackendMismatch { candidate },
+            active,
+        );
+    }
+
+    let mut io_disposition = None;
     let publication_report = match candidate {
-        Some(candidate) => match io.try_publication_quiescence() {
-            Ok(quiescence) => match publication.publish_candidate(candidate, quiescence) {
-                Ok(()) => PublicationOutcome::Applied,
-                Err(error) => PublicationOutcome::Rejected(error),
+        Some(candidate) => match publication.reject_candidate_if_active_stopped(candidate) {
+            Err(rejection) => PublicationOutcome::Rejected {
+                rejection,
+                status: publication.active_status(),
             },
-            Err(error) => {
-                let disposition = I::quiescence_error_disposition(&error);
-                io_disposition = Some(disposition);
-                PublicationOutcome::Deferred { error, disposition }
-            }
+            Ok(candidate) => match io.try_publication_quiescence() {
+                Ok(quiescence) => match try_publish_candidate(publication, candidate, quiescence) {
+                    Ok(report) => PublicationOutcome::Applied(report),
+                    Err(PublicationAttemptError::Rejected(rejection)) => {
+                        PublicationOutcome::Rejected {
+                            rejection,
+                            status: publication.active_status(),
+                        }
+                    }
+                    Err(PublicationAttemptError::BackendMismatch { candidate }) => {
+                        trace.record_tick_phase(TickPhaseTrace::PhaseFinished(
+                            TickPhase::Publication,
+                        ));
+                        let active = publication.active_status().is_present();
+                        return skip_remaining_phases(
+                            trace,
+                            TickPhaseSkip::BackendInstanceMismatch,
+                            PublicationOutcome::BackendMismatch {
+                                candidate: Some(candidate),
+                            },
+                            active,
+                        );
+                    }
+                },
+                Err(error) => {
+                    let disposition = I::quiescence_error_disposition(&error);
+                    io_disposition = Some(disposition);
+                    PublicationOutcome::Deferred {
+                        candidate,
+                        error,
+                        disposition,
+                    }
+                }
+            },
         },
         None => PublicationOutcome::Unchanged,
     };
     trace.record_tick_phase(TickPhaseTrace::PhaseFinished(TickPhase::Publication));
 
-    let Some(view) = publication.active() else {
-        for phase in [
-            TickPhase::Rx,
-            TickPhase::ResolutionTimers,
-            TickPhase::FailureDispatch,
-            TickPhase::GeneratedArp,
-            TickPhase::GeneratedIcmpv4,
-        ] {
-            skip_phase(trace, phase, TickPhaseSkip::NoActivePublication);
+    match publication.active_status() {
+        ActivePublicationStatus::StopOldPublication => {
+            return skip_remaining_phases(
+                trace,
+                TickPhaseSkip::ActivePublicationInvalid,
+                publication_report,
+                true,
+            );
         }
-        trace.record_tick_phase(TickPhaseTrace::TickFinished);
-        return TickReport {
-            publication: publication_report,
-            active: false,
-            rx: RxPhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
-            resolution_timers: PhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
-            failure_dispatch: PhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
-            generated_arp: PhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
-            generated_icmpv4: PhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
-        };
-    };
+        ActivePublicationStatus::Absent => {
+            return skip_remaining_phases(
+                trace,
+                TickPhaseSkip::NoActivePublication,
+                publication_report,
+                false,
+            );
+        }
+        ActivePublicationStatus::ContinueOldIo => {}
+    }
+
+    if io_disposition.is_none() {
+        io_disposition = Some(io.current_io_disposition());
+    }
 
     if matches!(
         io_disposition,
@@ -758,29 +1614,12 @@ where
         } else {
             TickPhaseSkip::BackendIoNotReentrant
         };
-        for phase in [
-            TickPhase::Rx,
-            TickPhase::ResolutionTimers,
-            TickPhase::FailureDispatch,
-            TickPhase::GeneratedArp,
-            TickPhase::GeneratedIcmpv4,
-        ] {
-            skip_phase(trace, phase, reason);
-        }
-        trace.record_tick_phase(TickPhaseTrace::TickFinished);
-        return TickReport {
-            publication: publication_report,
-            active: true,
-            rx: RxPhaseReport::Skipped(reason),
-            resolution_timers: PhaseReport::Skipped(reason),
-            failure_dispatch: PhaseReport::Skipped(reason),
-            generated_arp: PhaseReport::Skipped(reason),
-            generated_icmpv4: PhaseReport::Skipped(reason),
-        };
+        return skip_remaining_phases(trace, reason, publication_report, true);
     }
 
+    let view = publication.active();
     let FullServiceView {
-        generation: _generation,
+        tick_authority,
         snapshot,
         resolution,
         icmpv4_errors,
@@ -800,6 +1639,7 @@ where
         config: firewall_config,
         runtime: firewall,
     } = firewall;
+    let budgets = tick_authority.tick_budgets();
 
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::Rx));
     let rx = match io.receive(budgets.rx) {
@@ -921,18 +1761,20 @@ where
 mod tests {
     use super::*;
     use ruster_core::{
-        forward_batch_with_resolution, forward_batch_with_resolution_and_icmpv4_errors,
-        ipv4_header_checksum, BatchCompletion, FirewallHashKey, FirewallPolicy,
-        GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketLease, GeneratedPacketSlot,
-        GeneratedSlotCompletion, GeneratedTraceSink, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy,
-        Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+        bind_publication_backend, forward_batch_with_resolution,
+        forward_batch_with_resolution_and_icmpv4_errors, ipv4_header_checksum, BatchCompletion,
+        BoundPublicationBackend, FirewallHashKey, FirewallPolicy, GeneratedBatchCompletion,
+        GeneratedPacketBatch, GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion,
+        GeneratedTraceSink, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorStateSlot, IfId,
+        Interface, Ipv4Address, LocalIpv4Binding, MacAddress, MatchedPublicationQuiescenceGuard,
         Nat44TcpPolicy, Nat44UdpPolicy, Neighbor, NoTrace, PacketBatch, PacketLease, PacketSlot,
-        PublicationQuiescenceGuard, ResolutionActionSlot, ResolutionFailureHoldSlot,
+        PublicationBackendAuthority, PublicationBackendControl, PublicationOwnerBinding,
+        PublicationQuiescenceBackend, ResolutionActionSlot, ResolutionFailureHoldSlot,
         ResolutionFailureTrace, ResolutionPolicy, ResolutionStateSlot, ResolutionTimerTrace, Route,
         SlotCompletion, TraceEvent,
     };
     use ruster_io_sim::{
-        FrameOrigin, SimBatch, SimGeneratedBatch, SimGeneratedError, SimIo,
+        BoundSimIoControl, FrameOrigin, SimBatch, SimGeneratedBatch, SimGeneratedError, SimIo,
         SimPublicationQuiescenceError,
     };
 
@@ -946,16 +1788,25 @@ mod tests {
     const WAN_IP: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 10]);
     const GATEWAY: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 1]);
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    type BoundTestIo = BoundPublicationBackend<TestIo>;
+    type BoundSimIo = BoundPublicationBackend<SimIo>;
+    type BoundCountingSimIo = BoundPublicationBackend<CountingSimIo>;
+
+    #[derive(Debug, Eq, PartialEq)]
     enum Candidate {
         Apply,
-        Reject,
+        ApplyOwned(Box<usize>),
+        ApplyWithBudgets(TickBudgets),
+        Reject(Box<usize>),
+        RejectActivePublication(Box<usize>),
     }
 
-    struct TestPublication<'view, 'storage> {
-        enabled: bool,
+    struct TestPublication<'view, 'storage, I> {
+        owner_binding: PublicationOwnerBinding<I>,
+        active_status: ActivePublicationStatus,
         applied: usize,
         active_calls: usize,
+        tick_authority: ActiveTickAuthority,
         steady_validation_scans: usize,
         snapshot: &'view ForwardingSnapshot<'storage>,
         resolution: &'view mut ResolutionRuntime<'storage>,
@@ -965,51 +1816,118 @@ mod tests {
         firewall_config: FirewallConfig<'storage>,
     }
 
-    impl<'view, 'storage, I> FullServicePublication<'storage, I> for TestPublication<'view, 'storage>
+    #[allow(unsafe_code)]
+    unsafe impl<'view, 'storage, I> FullServicePublication<'storage, I>
+        for TestPublication<'view, 'storage, I>
     where
         I: PublicationQuiescence,
     {
         type Candidate = Candidate;
         type Reject = &'static str;
+        type ApplyReport = usize;
 
-        fn publish_candidate(
-            &mut self,
+        fn publication_owner_binding(&self) -> &PublicationOwnerBinding<I> {
+            &self.owner_binding
+        }
+
+        fn reject_candidate_if_active_stopped(
+            &self,
             candidate: Self::Candidate,
-            _quiescence: I::Guard<'_>,
-        ) -> Result<(), Self::Reject> {
-            match candidate {
-                Candidate::Apply => {
-                    self.applied += 1;
-                    Ok(())
-                }
-                Candidate::Reject => Err("rejected"),
+        ) -> Result<Self::Candidate, PublicationRejection<Self::Candidate, Self::Reject>> {
+            if self.active_status == ActivePublicationStatus::StopOldPublication {
+                Err(PublicationRejection::new(
+                    candidate,
+                    "active publication invalid",
+                ))
+            } else {
+                Ok(candidate)
             }
         }
 
-        fn active(&mut self) -> Option<FullServiceView<'_, 'storage>> {
+        #[allow(unsafe_code)]
+        unsafe fn publish_candidate_authorized(
+            &mut self,
+            candidate: Self::Candidate,
+            _quiescence: MatchedPublicationQuiescenceGuard<'_, I>,
+        ) -> Result<Self::ApplyReport, PublicationRejection<Self::Candidate, Self::Reject>>
+        {
+            match candidate {
+                Candidate::Apply | Candidate::ApplyOwned(_) => {
+                    self.applied += 1;
+                    Ok(self.applied)
+                }
+                Candidate::ApplyWithBudgets(tick_budgets) => {
+                    self.tick_authority =
+                        ActiveTickAuthority::new(self.tick_authority.generation(), tick_budgets);
+                    self.applied += 1;
+                    Ok(self.applied)
+                }
+                Candidate::Reject(_) => Err(PublicationRejection::new(candidate, "rejected")),
+                Candidate::RejectActivePublication(_) => {
+                    self.active_status = ActivePublicationStatus::StopOldPublication;
+                    Err(PublicationRejection::new(
+                        candidate,
+                        "active publication invalid",
+                    ))
+                }
+            }
+        }
+
+        fn active_status(&self) -> ActivePublicationStatus {
+            self.active_status
+        }
+
+        fn active(&mut self) -> FullServiceView<'_, 'storage> {
             self.active_calls += 1;
-            self.enabled.then_some(FullServiceView {
-                generation: NonZeroU64::MIN,
-                snapshot: *self.snapshot,
-                resolution: self.resolution,
-                icmpv4_errors: self.icmpv4_errors,
-                nat44_udp: Nat44UdpServiceView {
-                    config: self.udp_config,
-                    runtime: None,
-                },
-                nat44_tcp: Nat44TcpServiceView {
-                    config: self.tcp_config,
-                    runtime: None,
-                },
-                firewall: FirewallServiceView {
-                    config: self.firewall_config,
-                    runtime: None,
-                },
-            })
+            FullServiceView::new(
+                &self.tick_authority,
+                *self.snapshot,
+                self.resolution,
+                self.icmpv4_errors,
+                Nat44UdpServiceView::new(self.udp_config, None),
+                Nat44TcpServiceView::new(self.tcp_config, None),
+                FirewallServiceView::new(self.firewall_config, None),
+            )
         }
     }
 
-    fn with_fixture(run: impl FnOnce(&mut TestPublication<'_, '_>, &mut TestIo, &mut TestTrace)) {
+    fn with_fixture(
+        run: impl FnOnce(&mut TestPublication<'_, '_, BoundTestIo>, &mut BoundTestIo, &mut TestTrace),
+    ) {
+        let (owner_binding, io) =
+            bind_publication_backend(TestIo::default()).expect("test publication binding identity");
+        with_backend_fixture(owner_binding, io, run);
+    }
+
+    fn with_sim_fixture(
+        run: impl FnOnce(&mut TestPublication<'_, '_, BoundSimIo>, &mut BoundSimIo, &mut TestTrace),
+    ) {
+        let (owner_binding, io) =
+            bind_publication_backend(SimIo::new()).expect("test publication binding identity");
+        with_backend_fixture(owner_binding, io, run);
+    }
+
+    fn with_counting_sim_fixture(
+        run: impl FnOnce(
+            &mut TestPublication<'_, '_, BoundCountingSimIo>,
+            &mut BoundCountingSimIo,
+            &mut TestTrace,
+        ),
+    ) {
+        let (owner_binding, io) = bind_publication_backend(CountingSimIo::default())
+            .expect("test publication binding identity");
+        with_backend_fixture(owner_binding, io, run);
+    }
+
+    fn with_backend_fixture<I>(
+        owner_binding: PublicationOwnerBinding<BoundPublicationBackend<I>>,
+        mut io: BoundPublicationBackend<I>,
+        run: impl FnOnce(
+            &mut TestPublication<'_, '_, BoundPublicationBackend<I>>,
+            &mut BoundPublicationBackend<I>,
+            &mut TestTrace,
+        ),
+    ) {
         let routes = [
             Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, LAN, None).unwrap(),
             Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, Some(GATEWAY)).unwrap(),
@@ -1087,9 +2005,11 @@ mod tests {
             &mut icmp_actions,
         );
         let mut publication = TestPublication {
-            enabled: true,
+            owner_binding,
+            active_status: ActivePublicationStatus::ContinueOldIo,
             applied: 0,
             active_calls: 0,
+            tick_authority: ActiveTickAuthority::new(NonZeroU64::MIN, TickBudgets::default()),
             steady_validation_scans: 0,
             snapshot: &snapshot,
             resolution: &mut resolution,
@@ -1098,12 +2018,44 @@ mod tests {
             tcp_config,
             firewall_config,
         };
-        let mut io = TestIo::default();
         let mut trace = TestTrace::default();
         run(&mut publication, &mut io, &mut trace);
     }
 
-    fn seed_resolution(publication: &mut TestPublication<'_, '_>, last: u8, now: u64) {
+    #[allow(clippy::type_complexity)]
+    fn run_test_tick<'storage, I, T>(
+        publication: &mut TestPublication<'_, 'storage, BoundPublicationBackend<I>>,
+        candidate: Option<Candidate>,
+        io: &mut BoundPublicationBackend<I>,
+        now: MonotonicMillis,
+        tick_budgets: TickBudgets,
+        trace: &mut T,
+    ) -> TickReport<
+        Candidate,
+        &'static str,
+        <I as PublicationQuiescenceBackend>::Error,
+        <I as PacketIo>::Error,
+        <I as GeneratedPacketIo>::Error,
+        usize,
+    >
+    where
+        I: PacketIo
+            + GeneratedPacketIo
+            + PublicationBackendAuthority
+            + PublicationQuiescenceBackend,
+        T: TickPhaseTraceSink
+            + TraceSink
+            + ResolutionTimerTraceSink
+            + ResolutionFailureTraceSink
+            + GeneratedTraceSink
+            + GeneratedIcmpv4TraceSink,
+    {
+        publication.tick_authority =
+            ActiveTickAuthority::new(publication.tick_authority.generation(), tick_budgets);
+        super::run_tick(publication, candidate, io, now, trace)
+    }
+
+    fn seed_resolution<I>(publication: &mut TestPublication<'_, '_, I>, last: u8, now: u64) {
         let mut frame = [0_u8; 34];
         frame[0..6].copy_from_slice(&WAN_MAC.0);
         frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 99]);
@@ -1130,7 +2082,7 @@ mod tests {
         assert!(report.invariants_hold());
     }
 
-    fn seed_icmpv4(publication: &mut TestPublication<'_, '_>, now: u64) {
+    fn seed_icmpv4<I>(publication: &mut TestPublication<'_, '_, I>, now: u64) {
         let mut frame = [0_u8; 34];
         frame[0..6].copy_from_slice(&LAN_MAC.0);
         frame[6..12].copy_from_slice(&HOST_MAC.0);
@@ -1216,10 +2168,12 @@ mod tests {
         generated_mode: GeneratedMode,
         batch_state: TestBatchState,
         quiescence_override: Option<TestPublicationQuiescenceError>,
+        current_disposition_override: Option<PublicationQuiescenceDisposition>,
         pending_tx: usize,
         generated_leases_live: usize,
         quiescence_calls: usize,
         receive_calls: usize,
+        last_receive_budget: Option<usize>,
         generated_calls: usize,
         frame: [u8; 590],
     }
@@ -1231,10 +2185,12 @@ mod tests {
                 generated_mode: GeneratedMode::Exact,
                 batch_state: TestBatchState::Idle,
                 quiescence_override: None,
+                current_disposition_override: None,
                 pending_tx: 0,
                 generated_leases_live: 0,
                 quiescence_calls: 0,
                 receive_calls: 0,
+                last_receive_budget: None,
                 generated_calls: 0,
                 frame: [0; 590],
             }
@@ -1251,11 +2207,10 @@ mod tests {
         Closing,
     }
 
-    impl PublicationQuiescence for TestIo {
+    impl PublicationQuiescenceBackend for TestIo {
         type Error = TestPublicationQuiescenceError;
-        type Guard<'backend> = PublicationQuiescenceGuard<'backend, Self>;
 
-        fn try_publication_quiescence(&mut self) -> Result<Self::Guard<'_>, Self::Error> {
+        fn check_publication_quiescence(&mut self) -> Result<(), Self::Error> {
             self.quiescence_calls += 1;
             if let Some(error) = self.quiescence_override {
                 return Err(error);
@@ -1275,10 +2230,22 @@ mod tests {
             if self.pending_tx != 0 {
                 return Err(TestPublicationQuiescenceError::TxCompletionPending);
             }
-            Ok(PublicationQuiescenceGuard::new(self))
+            Ok(())
         }
 
         fn current_io_disposition(&self) -> PublicationQuiescenceDisposition {
+            if matches!(
+                self.quiescence_override,
+                Some(
+                    TestPublicationQuiescenceError::OwnershipFault
+                        | TestPublicationQuiescenceError::Closing
+                )
+            ) {
+                return PublicationQuiescenceDisposition::Stop;
+            }
+            if let Some(disposition) = self.current_disposition_override {
+                return disposition;
+            }
             match self.quiescence_override {
                 Some(
                     TestPublicationQuiescenceError::OwnershipFault
@@ -1315,38 +2282,129 @@ mod tests {
         }
     }
 
-    impl TestIo {
-        fn complete_pending_tx(&mut self) {
-            self.pending_tx = 0;
+    enum TestIoCommand {
+        SetPendingTx(usize),
+        SetQuiescenceOverride(Option<TestPublicationQuiescenceError>),
+        SetCurrentDisposition(PublicationQuiescenceDisposition),
+        CompletePendingTx,
+        SetGeneratedMode(GeneratedMode),
+        SetRxMode(RxMode),
+    }
+
+    // SAFETY: every command mutates only fields of this exact `TestIo`, and the
+    // unit response cannot detach the backend or expose an authoritative alias.
+    // Once a quiescence override or current disposition is classified as `Stop`,
+    // later requests cannot make that terminal state reusable.
+    #[allow(unsafe_code)]
+    unsafe impl PublicationBackendControl for TestIo {
+        type Command = TestIoCommand;
+        type Response = ();
+
+        fn execute_publication_backend_command(
+            &mut self,
+            command: Self::Command,
+        ) -> Self::Response {
+            match command {
+                TestIoCommand::SetPendingTx(pending) => self.pending_tx = pending,
+                TestIoCommand::SetQuiescenceOverride(error) => {
+                    if !matches!(
+                        self.quiescence_override,
+                        Some(
+                            TestPublicationQuiescenceError::OwnershipFault
+                                | TestPublicationQuiescenceError::Closing
+                        )
+                    ) {
+                        self.quiescence_override = error;
+                    }
+                }
+                TestIoCommand::SetCurrentDisposition(disposition) => {
+                    if self.current_disposition_override
+                        != Some(PublicationQuiescenceDisposition::Stop)
+                    {
+                        self.current_disposition_override = Some(disposition);
+                    }
+                }
+                TestIoCommand::CompletePendingTx => self.pending_tx = 0,
+                TestIoCommand::SetGeneratedMode(mode) => self.generated_mode = mode,
+                TestIoCommand::SetRxMode(mode) => self.rx_mode = mode,
+            }
         }
     }
 
-    #[derive(Default)]
     struct CountingSimIo {
         inner: SimIo,
+        quiescence_calls: usize,
         receive_calls: usize,
         generated_calls: usize,
     }
 
-    impl CountingSimIo {
-        fn reset_calls(&mut self) {
-            self.receive_calls = 0;
-            self.generated_calls = 0;
+    impl Default for CountingSimIo {
+        fn default() -> Self {
+            Self {
+                inner: SimIo::new(),
+                quiescence_calls: 0,
+                receive_calls: 0,
+                generated_calls: 0,
+            }
         }
     }
 
-    impl PublicationQuiescence for CountingSimIo {
-        type Error = SimPublicationQuiescenceError;
-        type Guard<'backend> = PublicationQuiescenceGuard<'backend, Self>;
+    #[derive(Clone, Copy)]
+    enum CountingSimIoCommand {
+        ResetCalls,
+        ForgetRxBatch,
+        ForgetGeneratedBatch,
+        ForgetRxLease,
+        ForgetGeneratedLease,
+    }
 
-        fn try_publication_quiescence(&mut self) -> Result<Self::Guard<'_>, Self::Error> {
-            match self.inner.try_publication_quiescence() {
-                Ok(inner_guard) => {
-                    drop(inner_guard);
-                    Ok(PublicationQuiescenceGuard::new(self))
+    // SAFETY: commands retain this exact wrapper and return only `()`; forgotten
+    // batch/lease state remains recorded by the inner quiescence implementation.
+    #[allow(unsafe_code)]
+    unsafe impl PublicationBackendControl for CountingSimIo {
+        type Command = CountingSimIoCommand;
+        type Response = ();
+
+        fn execute_publication_backend_command(
+            &mut self,
+            command: Self::Command,
+        ) -> Self::Response {
+            match command {
+                CountingSimIoCommand::ResetCalls => {
+                    self.receive_calls = 0;
+                    self.generated_calls = 0;
                 }
-                Err(error) => Err(error),
+                CountingSimIoCommand::ForgetRxBatch => {
+                    let batch = self.receive(0).expect("empty RX batch");
+                    core::mem::forget(batch);
+                }
+                CountingSimIoCommand::ForgetGeneratedBatch => {
+                    let batch = self.begin_generated(WAN);
+                    core::mem::forget(batch);
+                }
+                CountingSimIoCommand::ForgetRxLease => {
+                    self.inner.inject(LAN, vec![0; 64]);
+                    let mut batch = self.receive(1).expect("infallible simulated RX");
+                    let lease = batch.next_packet().expect("one injected frame");
+                    core::mem::forget(lease);
+                    assert!(batch.finish().invariants_hold());
+                }
+                CountingSimIoCommand::ForgetGeneratedLease => {
+                    let mut batch = self.begin_generated(WAN);
+                    let lease = batch.allocate(64).expect("one generated frame");
+                    core::mem::forget(lease);
+                    assert!(!batch.finish().invariants_hold());
+                }
             }
+        }
+    }
+
+    impl PublicationQuiescenceBackend for CountingSimIo {
+        type Error = SimPublicationQuiescenceError;
+
+        fn check_publication_quiescence(&mut self) -> Result<(), Self::Error> {
+            self.quiescence_calls += 1;
+            self.inner.check_publication_quiescence()
         }
 
         fn current_io_disposition(&self) -> PublicationQuiescenceDisposition {
@@ -1377,6 +2435,12 @@ mod tests {
             self.inner.begin_generated(egress)
         }
     }
+
+    // SAFETY: both batch types retain exclusive borrows into the embedded SimIo,
+    // errors contain no backend state, and the audited control implementation
+    // cannot detach or independently alias the inner backend.
+    #[allow(unsafe_code)]
+    unsafe impl PublicationBackendAuthority for CountingSimIo {}
 
     struct EmptyRxSlot;
 
@@ -1432,8 +2496,9 @@ mod tests {
         type Error = RxError;
         type Batch<'a> = EmptyRxBatch<'a>;
 
-        fn receive(&mut self, _budget: usize) -> Result<Self::Batch<'_>, Self::Error> {
+        fn receive(&mut self, budget: usize) -> Result<Self::Batch<'_>, Self::Error> {
             self.receive_calls += 1;
+            self.last_receive_budget = Some(budget);
             if self.rx_mode == RxMode::Fail {
                 return Err(RxError::Injected);
             }
@@ -1580,6 +2645,12 @@ mod tests {
         }
     }
 
+    // SAFETY: RX and generated batches retain lifetime-bounded exclusive borrows
+    // into this exact value; all error types are detached enums, and the audited
+    // control implementation neither replaces the backend nor exposes an alias.
+    #[allow(unsafe_code)]
+    unsafe impl PublicationBackendAuthority for TestIo {}
+
     #[derive(Default)]
     struct TestTrace {
         phases: [Option<TickPhaseTrace>; 16],
@@ -1613,13 +2684,604 @@ mod tests {
         fn record_generated_icmpv4(&mut self, _event: ruster_core::GeneratedIcmpv4Trace) {}
     }
 
+    fn assert_all_data_phases_skipped<C, E, Q, R, G, A>(
+        report: &TickReport<C, E, Q, R, G, A>,
+        reason: TickPhaseSkip,
+    ) {
+        assert!(matches!(
+            &report.rx,
+            RxPhaseReport::Skipped(actual) if *actual == reason
+        ));
+        assert!(matches!(
+            &report.resolution_timers,
+            PhaseReport::Skipped(actual) if *actual == reason
+        ));
+        assert!(matches!(
+            &report.failure_dispatch,
+            PhaseReport::Skipped(actual) if *actual == reason
+        ));
+        assert!(matches!(
+            &report.generated_arp,
+            PhaseReport::Skipped(actual) if *actual == reason
+        ));
+        assert!(matches!(
+            &report.generated_icmpv4,
+            PhaseReport::Skipped(actual) if *actual == reason
+        ));
+    }
+
+    #[test]
+    fn publication_outcome_debug_redacts_unconsumed_candidates() {
+        struct OpaqueCandidate;
+        fn require_debug<T: fmt::Debug>() {}
+        require_debug::<PublicationOutcome<OpaqueCandidate, (), ()>>();
+        require_debug::<PublicationAttemptError<OpaqueCandidate, ()>>();
+        require_debug::<TickReport<OpaqueCandidate, (), (), (), ()>>();
+        require_debug::<TickReport<OpaqueCandidate, (), (), (), (), usize>>();
+
+        let attempt_mismatched: PublicationAttemptError<String, &'static str> =
+            PublicationAttemptError::BackendMismatch {
+                candidate: String::from("attempt-mismatch-secret"),
+            };
+        let attempt_rejected: PublicationAttemptError<String, &'static str> =
+            PublicationAttemptError::Rejected(PublicationRejection::new(
+                String::from("attempt-rejected-secret"),
+                "attempt rejected",
+            ));
+        let applied: PublicationOutcome<OpaqueCandidate, (), (), usize> =
+            PublicationOutcome::Applied(47);
+        let rejected: PublicationOutcome<String, _, TestPublicationQuiescenceError> =
+            PublicationOutcome::Rejected {
+                rejection: PublicationRejection::new(String::from("rejected-secret"), "rejected"),
+                status: ActivePublicationStatus::StopOldPublication,
+            };
+        let mismatched: PublicationOutcome<String, &'static str, TestPublicationQuiescenceError> =
+            PublicationOutcome::BackendMismatch {
+                candidate: Some(String::from("mismatch-secret")),
+            };
+        let mismatch_without_candidate: PublicationOutcome<
+            String,
+            &'static str,
+            TestPublicationQuiescenceError,
+        > = PublicationOutcome::BackendMismatch { candidate: None };
+        let deferred: PublicationOutcome<String, &'static str, _> = PublicationOutcome::Deferred {
+            candidate: String::from("deferred-secret"),
+            error: TestPublicationQuiescenceError::Closing,
+            disposition: PublicationQuiescenceDisposition::Stop,
+        };
+
+        let attempt_mismatched_debug = format!("{attempt_mismatched:?}");
+        let attempt_rejected_debug = format!("{attempt_rejected:?}");
+        let applied_debug = format!("{applied:?}");
+        let rejected_debug = format!("{rejected:?}");
+        let mismatched_debug = format!("{mismatched:?}");
+        let mismatch_without_candidate_debug = format!("{mismatch_without_candidate:?}");
+        let deferred_debug = format!("{deferred:?}");
+        assert_eq!(
+            attempt_mismatched_debug,
+            "BackendMismatch { candidate: \"<redacted>\" }"
+        );
+        assert_eq!(
+            attempt_rejected_debug,
+            "Rejected { candidate: \"<redacted>\", error: \"attempt rejected\" }"
+        );
+        assert_eq!(applied_debug, "Applied(47)");
+        assert_eq!(
+            rejected_debug,
+            "Rejected { candidate: \"<redacted>\", error: \"rejected\", status: StopOldPublication }"
+        );
+        assert_eq!(
+            mismatched_debug,
+            "BackendMismatch { candidate: Some(\"<redacted>\") }"
+        );
+        assert_eq!(
+            mismatch_without_candidate_debug,
+            "BackendMismatch { candidate: None }"
+        );
+        assert_eq!(
+            deferred_debug,
+            "Deferred { candidate: \"<redacted>\", error: Closing, disposition: Stop }"
+        );
+        assert!(!attempt_mismatched_debug.contains("attempt-mismatch-secret"));
+        assert!(!attempt_rejected_debug.contains("attempt-rejected-secret"));
+        assert!(!rejected_debug.contains("rejected-secret"));
+        assert!(!mismatched_debug.contains("mismatch-secret"));
+        assert!(!deferred_debug.contains("deferred-secret"));
+    }
+
+    #[test]
+    fn backend_instance_mismatch_precedes_quiescence_failure_and_preserves_candidate() {
+        with_fixture(|publication, paired_io, trace| {
+            let (_wrong_owner, mut wrong_io) = bind_publication_backend(TestIo {
+                pending_tx: 1,
+                ..TestIo::default()
+            })
+            .expect("wrong test backend binding identity");
+            let candidate = Box::new(48);
+            let candidate_pointer = core::ptr::from_ref(candidate.as_ref());
+            let report = run_test_tick(
+                publication,
+                Some(Candidate::ApplyOwned(candidate)),
+                &mut wrong_io,
+                MonotonicMillis(0),
+                TickBudgets {
+                    rx: usize::MAX,
+                    resolution_timer_scans: usize::MAX,
+                    failure_dispatch_scans: usize::MAX,
+                    generated_arp: usize::MAX,
+                    generated_icmpv4: usize::MAX,
+                },
+                trace,
+            );
+            let PublicationOutcome::BackendMismatch {
+                candidate: Some(Candidate::ApplyOwned(ref candidate)),
+            } = report.publication
+            else {
+                panic!("wrong backend must preserve the unconsumed candidate");
+            };
+            assert_eq!(candidate.as_ref(), &48);
+            assert_eq!(core::ptr::from_ref(candidate.as_ref()), candidate_pointer);
+            assert!(report.active);
+            assert_all_data_phases_skipped(&report, TickPhaseSkip::BackendInstanceMismatch);
+            assert_eq!(publication.applied, 0);
+            assert_eq!(publication.active_calls, 0);
+            assert_eq!(wrong_io.inner().quiescence_calls, 0);
+            assert_eq!(
+                (
+                    wrong_io.inner().receive_calls,
+                    wrong_io.inner().generated_calls
+                ),
+                (0, 0)
+            );
+            assert_eq!(paired_io.inner().quiescence_calls, 0);
+            assert_eq!(
+                (
+                    paired_io.inner().receive_calls,
+                    paired_io.inner().generated_calls
+                ),
+                (0, 0)
+            );
+            assert_eq!(trace.phase_len, 9);
+
+            *trace = TestTrace::default();
+            let report = run_test_tick(
+                publication,
+                None,
+                &mut wrong_io,
+                MonotonicMillis(1),
+                TickBudgets::default(),
+                trace,
+            );
+            assert_eq!(
+                report.publication,
+                PublicationOutcome::BackendMismatch { candidate: None }
+            );
+            assert!(report.active);
+            assert_all_data_phases_skipped(&report, TickPhaseSkip::BackendInstanceMismatch);
+            assert_eq!(publication.active_calls, 0);
+            assert_eq!(wrong_io.inner().quiescence_calls, 0);
+            assert_eq!(
+                (
+                    wrong_io.inner().receive_calls,
+                    wrong_io.inner().generated_calls
+                ),
+                (0, 0)
+            );
+            assert_eq!(trace.phase_len, 9);
+        });
+    }
+
+    #[test]
+    fn safe_gate_rejects_wrong_raw_guard_before_authorized_hook() {
+        with_fixture(|publication, paired_io, _trace| {
+            let (_wrong_owner, mut wrong_io) = bind_publication_backend(TestIo::default())
+                .expect("wrong raw-guard backend binding identity");
+            let raw = wrong_io
+                .try_publication_quiescence()
+                .expect("wrong test backend is locally quiescent");
+            let candidate = Box::new(50);
+            let candidate_pointer = core::ptr::from_ref(candidate.as_ref());
+
+            let error = try_publish_candidate(publication, Candidate::ApplyOwned(candidate), raw)
+                .expect_err("wrong raw guard must not reach the authorized hook");
+            let PublicationAttemptError::BackendMismatch {
+                candidate: Candidate::ApplyOwned(candidate),
+            } = error
+            else {
+                panic!("wrong raw guard must preserve the exact candidate");
+            };
+
+            assert_eq!(candidate.as_ref(), &50);
+            assert_eq!(core::ptr::from_ref(candidate.as_ref()), candidate_pointer);
+            assert_eq!(publication.applied, 0);
+            assert_eq!(wrong_io.inner().quiescence_calls, 1);
+            assert_eq!(paired_io.inner().quiescence_calls, 0);
+        });
+    }
+
+    #[test]
+    fn active_invariant_rejection_latches_fail_closed_across_candidate_free_ticks() {
+        with_fixture(|publication, io, trace| {
+            let candidate = Box::new(49);
+            let candidate_pointer = core::ptr::from_ref(candidate.as_ref());
+            let report = run_test_tick(
+                publication,
+                Some(Candidate::RejectActivePublication(candidate)),
+                io,
+                MonotonicMillis(0),
+                TickBudgets {
+                    rx: usize::MAX,
+                    resolution_timer_scans: usize::MAX,
+                    failure_dispatch_scans: usize::MAX,
+                    generated_arp: usize::MAX,
+                    generated_icmpv4: usize::MAX,
+                },
+                trace,
+            );
+            assert_all_data_phases_skipped(&report, TickPhaseSkip::ActivePublicationInvalid);
+            let PublicationOutcome::Rejected {
+                rejection,
+                status: ActivePublicationStatus::StopOldPublication,
+            } = report.publication
+            else {
+                panic!("active invariant failure must reject and stop the old publication");
+            };
+            assert_eq!(rejection.error(), &"active publication invalid");
+            let (candidate, error) = rejection.into_parts();
+            assert_eq!(error, "active publication invalid");
+            let Candidate::RejectActivePublication(candidate) = candidate else {
+                panic!("rejected candidate identity must be preserved");
+            };
+            assert_eq!(candidate.as_ref(), &49);
+            assert_eq!(core::ptr::from_ref(candidate.as_ref()), candidate_pointer);
+            assert!(report.active);
+            assert_eq!(publication.active_calls, 0);
+            assert_eq!(io.inner().quiescence_calls, 1);
+            assert_eq!(
+                (io.inner().receive_calls, io.inner().generated_calls),
+                (0, 0)
+            );
+            assert_eq!(trace.phase_len, 9);
+
+            io.execute_backend_command(TestIoCommand::SetPendingTx(1));
+            *trace = TestTrace::default();
+            let report = run_test_tick(
+                publication,
+                None,
+                io,
+                MonotonicMillis(1),
+                TickBudgets::default(),
+                trace,
+            );
+            assert_eq!(report.publication, PublicationOutcome::Unchanged);
+            assert!(report.active);
+            assert_all_data_phases_skipped(&report, TickPhaseSkip::ActivePublicationInvalid);
+            assert_eq!(publication.active_calls, 0);
+            assert_eq!(io.inner().quiescence_calls, 1);
+            assert_eq!(
+                (io.inner().receive_calls, io.inner().generated_calls),
+                (0, 0)
+            );
+            assert_eq!(trace.phase_len, 9);
+
+            let candidate = Box::new(51);
+            let candidate_pointer = core::ptr::from_ref(candidate.as_ref());
+            *trace = TestTrace::default();
+            let report = run_test_tick(
+                publication,
+                Some(Candidate::ApplyOwned(candidate)),
+                io,
+                MonotonicMillis(2),
+                TickBudgets::default(),
+                trace,
+            );
+            assert!(report.active);
+            assert_all_data_phases_skipped(&report, TickPhaseSkip::ActivePublicationInvalid);
+            let PublicationOutcome::Rejected {
+                rejection,
+                status: ActivePublicationStatus::StopOldPublication,
+            } = report.publication
+            else {
+                panic!("active stop latch must outrank backend quiescence");
+            };
+            assert_eq!(rejection.error(), &"active publication invalid");
+            let (candidate, error) = rejection.into_parts();
+            assert_eq!(error, "active publication invalid");
+            let Candidate::ApplyOwned(candidate) = candidate else {
+                panic!("latched rejection must retain the exact candidate");
+            };
+            assert_eq!(candidate.as_ref(), &51);
+            assert_eq!(core::ptr::from_ref(candidate.as_ref()), candidate_pointer);
+            assert_eq!(publication.active_calls, 0);
+            assert_eq!(
+                io.inner().quiescence_calls,
+                1,
+                "latched rejection must not request backend quiescence"
+            );
+            assert_eq!(
+                (io.inner().receive_calls, io.inner().generated_calls),
+                (0, 0)
+            );
+            assert_eq!(trace.phase_len, 9);
+        });
+    }
+
+    #[test]
+    fn safe_publication_gate_rejects_latched_candidate_before_adapter_hook() {
+        with_fixture(|publication, io, trace| {
+            let report = run_test_tick(
+                publication,
+                Some(Candidate::RejectActivePublication(Box::new(54))),
+                io,
+                MonotonicMillis(0),
+                TickBudgets::default(),
+                trace,
+            );
+            assert!(matches!(
+                report.publication,
+                PublicationOutcome::Rejected {
+                    status: ActivePublicationStatus::StopOldPublication,
+                    ..
+                }
+            ));
+            assert_eq!(publication.applied, 0);
+
+            let raw = io
+                .try_publication_quiescence()
+                .expect("test backend remains locally quiescent");
+            let candidate = Box::new(55);
+            let candidate_pointer = core::ptr::from_ref(candidate.as_ref());
+            let error = try_publish_candidate(publication, Candidate::ApplyOwned(candidate), raw)
+                .expect_err("latched candidate must not reach the adapter hook");
+            let PublicationAttemptError::Rejected(rejection) = error else {
+                panic!("exact matched guard must retain the active rejection");
+            };
+            assert_eq!(rejection.error(), &"active publication invalid");
+            let (candidate, rejected_error) = rejection.into_parts();
+            assert_eq!(rejected_error, "active publication invalid");
+            let Candidate::ApplyOwned(candidate) = candidate else {
+                panic!("safe gate must preserve the exact candidate");
+            };
+            assert_eq!(candidate.as_ref(), &55);
+            assert_eq!(core::ptr::from_ref(candidate.as_ref()), candidate_pointer);
+            assert_eq!(publication.applied, 0);
+            assert_eq!(io.inner().quiescence_calls, 2);
+        });
+    }
+
+    #[test]
+    fn active_stop_latch_outranks_backend_skip_and_stop_without_quiescence() {
+        for error in [
+            TestPublicationQuiescenceError::RxBatchNotFinished,
+            TestPublicationQuiescenceError::GeneratedBatchNotFinished,
+            TestPublicationQuiescenceError::GeneratedLeaseNotCompleted,
+            TestPublicationQuiescenceError::OwnershipFault,
+            TestPublicationQuiescenceError::Closing,
+        ] {
+            with_fixture(|publication, io, trace| {
+                let report = run_test_tick(
+                    publication,
+                    Some(Candidate::RejectActivePublication(Box::new(52))),
+                    io,
+                    MonotonicMillis(0),
+                    TickBudgets::default(),
+                    trace,
+                );
+                assert_all_data_phases_skipped(&report, TickPhaseSkip::ActivePublicationInvalid);
+                assert!(matches!(
+                    report.publication,
+                    PublicationOutcome::Rejected {
+                        status: ActivePublicationStatus::StopOldPublication,
+                        ..
+                    }
+                ));
+                assert_eq!(io.inner().quiescence_calls, 1);
+
+                io.execute_backend_command(TestIoCommand::SetQuiescenceOverride(Some(error)));
+                let candidate = Box::new(53);
+                let candidate_pointer = core::ptr::from_ref(candidate.as_ref());
+                *trace = TestTrace::default();
+                let report = run_test_tick(
+                    publication,
+                    Some(Candidate::ApplyOwned(candidate)),
+                    io,
+                    MonotonicMillis(1),
+                    TickBudgets::default(),
+                    trace,
+                );
+                assert_all_data_phases_skipped(&report, TickPhaseSkip::ActivePublicationInvalid);
+                let PublicationOutcome::Rejected {
+                    rejection,
+                    status: ActivePublicationStatus::StopOldPublication,
+                } = report.publication
+                else {
+                    panic!("latched active failure must outrank backend error {error:?}");
+                };
+                assert_eq!(rejection.error(), &"active publication invalid");
+                let (candidate, rejected_error) = rejection.into_parts();
+                assert_eq!(rejected_error, "active publication invalid");
+                let Candidate::ApplyOwned(candidate) = candidate else {
+                    panic!("latched rejection must retain the exact candidate");
+                };
+                assert_eq!(candidate.as_ref(), &53);
+                assert_eq!(core::ptr::from_ref(candidate.as_ref()), candidate_pointer);
+                assert!(report.active);
+                assert_eq!(publication.active_calls, 0);
+                assert_eq!(
+                    io.inner().quiescence_calls,
+                    1,
+                    "latched rejection must not observe backend error {error:?}"
+                );
+                assert_eq!(
+                    (io.inner().receive_calls, io.inner().generated_calls),
+                    (0, 0)
+                );
+                assert_eq!(trace.phase_len, 9);
+            });
+        }
+    }
+
+    #[test]
+    fn applied_candidate_rechecks_terminal_backend_before_data_phases() {
+        with_fixture(|publication, io, trace| {
+            io.execute_backend_command(TestIoCommand::SetCurrentDisposition(
+                PublicationQuiescenceDisposition::Stop,
+            ));
+
+            let report = run_test_tick(
+                publication,
+                Some(Candidate::Apply),
+                io,
+                MonotonicMillis(0),
+                TickBudgets {
+                    rx: usize::MAX,
+                    resolution_timer_scans: usize::MAX,
+                    failure_dispatch_scans: usize::MAX,
+                    generated_arp: usize::MAX,
+                    generated_icmpv4: usize::MAX,
+                },
+                trace,
+            );
+
+            assert_eq!(report.publication, PublicationOutcome::Applied(1));
+            assert!(report.active);
+            assert_all_data_phases_skipped(&report, TickPhaseSkip::BackendStopped);
+            assert_eq!(publication.applied, 1);
+            assert_eq!(publication.active_calls, 0);
+            assert_eq!(io.inner().quiescence_calls, 1);
+            assert_eq!(
+                (io.inner().receive_calls, io.inner().generated_calls),
+                (0, 0)
+            );
+            assert_eq!(trace.phase_len, 9);
+        });
+    }
+
+    #[test]
+    fn rejected_candidate_rechecks_terminal_backend_before_data_phases() {
+        with_fixture(|publication, io, trace| {
+            io.execute_backend_command(TestIoCommand::SetCurrentDisposition(
+                PublicationQuiescenceDisposition::Stop,
+            ));
+            let candidate = Box::new(56);
+            let candidate_pointer = core::ptr::from_ref(candidate.as_ref());
+
+            let report = run_test_tick(
+                publication,
+                Some(Candidate::Reject(candidate)),
+                io,
+                MonotonicMillis(0),
+                TickBudgets {
+                    rx: usize::MAX,
+                    resolution_timer_scans: usize::MAX,
+                    failure_dispatch_scans: usize::MAX,
+                    generated_arp: usize::MAX,
+                    generated_icmpv4: usize::MAX,
+                },
+                trace,
+            );
+
+            assert!(report.active);
+            assert_all_data_phases_skipped(&report, TickPhaseSkip::BackendStopped);
+            let PublicationOutcome::Rejected {
+                rejection,
+                status: ActivePublicationStatus::ContinueOldIo,
+            } = report.publication
+            else {
+                panic!("candidate rejection must survive terminal backend recheck");
+            };
+            assert_eq!(rejection.error(), &"rejected");
+            let (candidate, error) = rejection.into_parts();
+            assert_eq!(error, "rejected");
+            let Candidate::Reject(candidate) = candidate else {
+                panic!("terminal backend recheck must preserve the exact candidate");
+            };
+            assert_eq!(candidate.as_ref(), &56);
+            assert_eq!(core::ptr::from_ref(candidate.as_ref()), candidate_pointer);
+            assert_eq!(publication.applied, 0);
+            assert_eq!(publication.active_calls, 0);
+            assert_eq!(io.inner().quiescence_calls, 1);
+            assert_eq!(
+                (io.inner().receive_calls, io.inner().generated_calls),
+                (0, 0)
+            );
+            assert_eq!(trace.phase_len, 9);
+        });
+    }
+
+    #[test]
+    fn publication_result_selects_the_active_generations_budget_in_the_same_tick() {
+        with_fixture(|publication, io, trace| {
+            let next_budgets = TickBudgets {
+                rx: 7,
+                ..TickBudgets::default()
+            };
+            let report = super::run_tick(
+                publication,
+                Some(Candidate::ApplyWithBudgets(next_budgets)),
+                io,
+                MonotonicMillis(0),
+                trace,
+            );
+            assert_eq!(report.publication, PublicationOutcome::Applied(1));
+            assert_eq!(io.inner().last_receive_budget, Some(next_budgets.rx));
+            assert_eq!(publication.tick_authority.tick_budgets(), next_budgets);
+
+            *trace = TestTrace::default();
+            let report = super::run_tick(
+                publication,
+                Some(Candidate::Reject(Box::new(1))),
+                io,
+                MonotonicMillis(1),
+                trace,
+            );
+            assert!(matches!(
+                report.publication,
+                PublicationOutcome::Rejected {
+                    status: ActivePublicationStatus::ContinueOldIo,
+                    ..
+                }
+            ));
+            assert_eq!(io.inner().last_receive_budget, Some(next_budgets.rx));
+            assert_eq!(publication.tick_authority.tick_budgets(), next_budgets);
+
+            *trace = TestTrace::default();
+            io.execute_backend_command(TestIoCommand::SetQuiescenceOverride(Some(
+                TestPublicationQuiescenceError::TxCompletionPending,
+            )));
+            let deferred_budgets = TickBudgets {
+                rx: 11,
+                ..TickBudgets::default()
+            };
+            let report = super::run_tick(
+                publication,
+                Some(Candidate::ApplyWithBudgets(deferred_budgets)),
+                io,
+                MonotonicMillis(2),
+                trace,
+            );
+            assert!(matches!(
+                report.publication,
+                PublicationOutcome::Deferred {
+                    candidate: Candidate::ApplyWithBudgets(budgets),
+                    disposition: PublicationQuiescenceDisposition::ContinueOldIo,
+                    ..
+                } if budgets == deferred_budgets
+            ));
+            assert_eq!(io.inner().last_receive_budget, Some(next_budgets.rx));
+            assert_eq!(publication.tick_authority.tick_budgets(), next_budgets);
+        });
+    }
+
     #[test]
     fn rejected_candidate_keeps_old_view_and_phase_sentinels_are_exact() {
         with_fixture(|publication, io, trace| {
             seed_resolution(publication, 2, 0);
-            let report = run_tick(
+            let candidate = Box::new(41);
+            let candidate_pointer = core::ptr::from_ref(candidate.as_ref());
+            let report = run_test_tick(
                 publication,
-                Some(Candidate::Reject),
+                Some(Candidate::Reject(candidate)),
                 io,
                 MonotonicMillis(0),
                 TickBudgets {
@@ -1631,11 +3293,26 @@ mod tests {
                 },
                 trace,
             );
-            assert_eq!(report.publication, PublicationOutcome::Rejected("rejected"));
+            let PublicationOutcome::Rejected {
+                rejection,
+                status: disposition,
+            } = report.publication
+            else {
+                panic!("candidate must be rejected");
+            };
+            assert_eq!(disposition, ActivePublicationStatus::ContinueOldIo);
+            assert_eq!(rejection.error(), &"rejected");
+            let (candidate, error) = rejection.into_parts();
+            assert_eq!(error, "rejected");
+            let Candidate::Reject(candidate) = candidate else {
+                panic!("rejected candidate identity must be preserved");
+            };
+            assert_eq!(candidate.as_ref(), &41);
+            assert_eq!(core::ptr::from_ref(candidate.as_ref()), candidate_pointer);
             assert!(report.active);
-            assert_eq!(io.receive_calls, 1);
-            assert_eq!(io.generated_calls, 1);
-            assert_eq!(io.batch_state, TestBatchState::Idle);
+            assert_eq!(io.inner().receive_calls, 1);
+            assert_eq!(io.inner().generated_calls, 1);
+            assert_eq!(io.inner().batch_state, TestBatchState::Idle);
             assert!(matches!(
                 report.resolution_timers,
                 PhaseReport::Completed(ResolutionTimerReport {
@@ -1684,15 +3361,14 @@ mod tests {
 
     #[test]
     fn sim_full_composition_orders_rx_before_arp_and_icmp_generated_tx() {
-        with_fixture(|publication, _unused_io, trace| {
+        with_sim_fixture(|publication, io, trace| {
             seed_resolution(publication, 2, 0);
             seed_icmpv4(publication, 0);
-            let mut io = SimIo::new();
             io.inject(LAN, arp_request().into());
-            let report = run_tick(
+            let report = run_test_tick(
                 publication,
                 None,
-                &mut io,
+                io,
                 MonotonicMillis(0),
                 TickBudgets {
                     rx: 1,
@@ -1710,7 +3386,7 @@ mod tests {
                     ..
                 })
             ));
-            assert_eq!(io.pending_tx(), 3);
+            assert_eq!(io.inner().pending_tx(), 3);
             assert!(matches!(
                 io.pop_tx().unwrap().origin,
                 FrameOrigin::Received { ingress: LAN }
@@ -1723,8 +3399,8 @@ mod tests {
     #[test]
     fn no_active_publication_is_a_typed_skip_without_backend_access() {
         with_fixture(|publication, io, trace| {
-            publication.enabled = false;
-            let report = run_tick(
+            publication.active_status = ActivePublicationStatus::Absent;
+            let report = run_test_tick(
                 publication,
                 Some(Candidate::Apply),
                 io,
@@ -1738,9 +3414,12 @@ mod tests {
                 },
                 trace,
             );
-            assert_eq!(report.publication, PublicationOutcome::Applied);
+            assert_eq!(report.publication, PublicationOutcome::Applied(1));
             assert!(!report.active);
-            assert_eq!((io.receive_calls, io.generated_calls), (0, 0));
+            assert_eq!(
+                (io.inner().receive_calls, io.inner().generated_calls),
+                (0, 0)
+            );
             assert_eq!(
                 report.rx,
                 RxPhaseReport::Skipped(TickPhaseSkip::NoActivePublication)
@@ -1759,7 +3438,8 @@ mod tests {
 
     #[test]
     fn fake_quiescence_reports_each_unfinished_batch_state_exactly() {
-        let mut rx_io = TestIo::default();
+        let (_rx_owner, mut rx_io) =
+            bind_publication_backend(TestIo::default()).expect("RX-state test binding identity");
         let rx = rx_io.receive(0).expect("empty RX batch");
         core::mem::forget(rx);
         assert!(matches!(
@@ -1767,7 +3447,8 @@ mod tests {
             Err(TestPublicationQuiescenceError::RxBatchNotFinished)
         ));
 
-        let mut generated_io = TestIo::default();
+        let (_generated_owner, mut generated_io) = bind_publication_backend(TestIo::default())
+            .expect("generated-state test binding identity");
         let generated = generated_io.begin_generated(WAN);
         core::mem::forget(generated);
         assert!(matches!(
@@ -1775,7 +3456,8 @@ mod tests {
             Err(TestPublicationQuiescenceError::GeneratedBatchNotFinished)
         ));
 
-        let mut lease_io = TestIo::default();
+        let (_lease_owner, mut lease_io) =
+            bind_publication_backend(TestIo::default()).expect("lease-state test binding identity");
         let mut generated = lease_io.begin_generated(WAN);
         let lease = generated.allocate(64).expect("generated frame");
         core::mem::forget(lease);
@@ -1794,32 +3476,43 @@ mod tests {
             generated.allocate(64).expect("generated frame").commit();
             let completion = generated.finish();
             assert_eq!(completion.accepted, 1);
-            assert_eq!(io.pending_tx, 1);
+            assert_eq!(io.inner().pending_tx, 1);
 
-            let report = run_tick(
+            let candidate = Box::new(42);
+            let candidate_pointer = core::ptr::from_ref(candidate.as_ref());
+            let report = run_test_tick(
                 publication,
-                Some(Candidate::Apply),
+                Some(Candidate::ApplyOwned(candidate)),
                 io,
                 MonotonicMillis(0),
                 TickBudgets::default(),
                 trace,
             );
-            assert_eq!(
-                report.publication,
-                PublicationOutcome::Deferred {
-                    error: TestPublicationQuiescenceError::TxCompletionPending,
-                    disposition: PublicationQuiescenceDisposition::ContinueOldIo,
-                }
-            );
+            let PublicationOutcome::Deferred {
+                candidate,
+                error,
+                disposition,
+            } = report.publication
+            else {
+                panic!("candidate must be deferred");
+            };
+            assert_eq!(error, TestPublicationQuiescenceError::TxCompletionPending);
+            assert_eq!(disposition, PublicationQuiescenceDisposition::ContinueOldIo);
+            let Candidate::ApplyOwned(candidate) = candidate else {
+                panic!("deferred candidate identity must be preserved");
+            };
+            assert_eq!(candidate.as_ref(), &42);
+            assert_eq!(core::ptr::from_ref(candidate.as_ref()), candidate_pointer);
+            assert!(report.active);
             assert_eq!(publication.applied, 0);
             assert_eq!(publication.active_calls, 1);
-            assert_eq!(io.quiescence_calls, 1);
-            assert_eq!(io.receive_calls, 1);
-            assert_eq!(io.pending_tx, 1);
+            assert_eq!(io.inner().quiescence_calls, 1);
+            assert_eq!(io.inner().receive_calls, 1);
+            assert_eq!(io.inner().pending_tx, 1);
 
-            io.complete_pending_tx();
+            io.execute_backend_command(TestIoCommand::CompletePendingTx);
             *trace = TestTrace::default();
-            let report = run_tick(
+            let report = run_test_tick(
                 publication,
                 Some(Candidate::Apply),
                 io,
@@ -1827,162 +3520,158 @@ mod tests {
                 TickBudgets::default(),
                 trace,
             );
-            assert_eq!(report.publication, PublicationOutcome::Applied);
+            assert_eq!(report.publication, PublicationOutcome::Applied(1));
             assert_eq!(publication.applied, 1);
             assert_eq!(publication.active_calls, 2);
-            assert_eq!(io.quiescence_calls, 2);
-            assert_eq!(io.receive_calls, 2);
+            assert_eq!(io.inner().quiescence_calls, 2);
+            assert_eq!(io.inner().receive_calls, 2);
+        });
+    }
+
+    fn assert_forgotten_sim_state_skips_every_data_phase(
+        setup: CountingSimIoCommand,
+        expected_error: SimPublicationQuiescenceError,
+    ) {
+        with_counting_sim_fixture(|publication, io, trace| {
+            io.execute_backend_command(setup);
+            io.execute_backend_command(CountingSimIoCommand::ResetCalls);
+            let candidate = Box::new(43);
+            let candidate_pointer = core::ptr::from_ref(candidate.as_ref());
+            let report = run_test_tick(
+                publication,
+                Some(Candidate::ApplyOwned(candidate)),
+                io,
+                MonotonicMillis(0),
+                TickBudgets {
+                    rx: usize::MAX,
+                    resolution_timer_scans: usize::MAX,
+                    failure_dispatch_scans: usize::MAX,
+                    generated_arp: usize::MAX,
+                    generated_icmpv4: usize::MAX,
+                },
+                trace,
+            );
+            let PublicationOutcome::Deferred {
+                candidate,
+                error,
+                disposition,
+            } = report.publication
+            else {
+                panic!("candidate must be deferred");
+            };
+            assert_eq!(error, expected_error);
+            assert_eq!(disposition, PublicationQuiescenceDisposition::SkipIo);
+            let Candidate::ApplyOwned(candidate) = candidate else {
+                panic!("deferred candidate identity must be preserved");
+            };
+            assert_eq!(candidate.as_ref(), &43);
+            assert_eq!(core::ptr::from_ref(candidate.as_ref()), candidate_pointer);
+            assert!(report.active);
+            assert_eq!(
+                report.rx,
+                RxPhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+            );
+            assert!(matches!(
+                report.resolution_timers,
+                PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+            ));
+            assert!(matches!(
+                report.failure_dispatch,
+                PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+            ));
+            assert!(matches!(
+                report.generated_arp,
+                PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+            ));
+            assert!(matches!(
+                report.generated_icmpv4,
+                PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+            ));
+            assert_eq!(trace.phase_len, 9);
+            assert_eq!(
+                (io.inner().receive_calls, io.inner().generated_calls),
+                (0, 0)
+            );
+
+            *trace = TestTrace::default();
+            let report = run_test_tick(
+                publication,
+                None,
+                io,
+                MonotonicMillis(1),
+                TickBudgets {
+                    rx: usize::MAX,
+                    resolution_timer_scans: usize::MAX,
+                    failure_dispatch_scans: usize::MAX,
+                    generated_arp: usize::MAX,
+                    generated_icmpv4: usize::MAX,
+                },
+                trace,
+            );
+            assert_eq!(report.publication, PublicationOutcome::Unchanged);
+            assert!(report.active);
+            assert_eq!(
+                report.rx,
+                RxPhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+            );
+            assert!(matches!(
+                report.resolution_timers,
+                PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+            ));
+            assert!(matches!(
+                report.failure_dispatch,
+                PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+            ));
+            assert!(matches!(
+                report.generated_arp,
+                PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+            ));
+            assert!(matches!(
+                report.generated_icmpv4,
+                PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+            ));
+            assert_eq!(trace.phase_len, 9);
+            assert_eq!(
+                (io.inner().receive_calls, io.inner().generated_calls),
+                (0, 0)
+            );
+            assert_eq!(io.inner().quiescence_calls, 1);
+            assert_eq!(publication.applied, 0);
+            assert_eq!(publication.active_calls, 0);
         });
     }
 
     #[test]
     fn candidate_with_forgotten_sim_batch_or_lease_skips_every_data_phase() {
-        with_fixture(|publication, _unused_io, trace| {
-            macro_rules! assert_skipped {
-                ($io:ident, $error:expr) => {{
-                    $io.reset_calls();
-                    *trace = TestTrace::default();
-                    let report = run_tick(
-                        publication,
-                        Some(Candidate::Apply),
-                        &mut $io,
-                        MonotonicMillis(0),
-                        TickBudgets {
-                            rx: usize::MAX,
-                            resolution_timer_scans: usize::MAX,
-                            failure_dispatch_scans: usize::MAX,
-                            generated_arp: usize::MAX,
-                            generated_icmpv4: usize::MAX,
-                        },
-                        trace,
-                    );
-                    assert_eq!(
-                        report.publication,
-                        PublicationOutcome::Deferred {
-                            error: $error,
-                            disposition: PublicationQuiescenceDisposition::SkipIo,
-                        }
-                    );
-                    assert!(report.active);
-                    assert_eq!(
-                        report.rx,
-                        RxPhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
-                    );
-                    assert!(matches!(
-                        report.resolution_timers,
-                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
-                    ));
-                    assert!(matches!(
-                        report.failure_dispatch,
-                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
-                    ));
-                    assert!(matches!(
-                        report.generated_arp,
-                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
-                    ));
-                    assert!(matches!(
-                        report.generated_icmpv4,
-                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
-                    ));
-                    assert_eq!(trace.phase_len, 9);
-                    assert_eq!(($io.receive_calls, $io.generated_calls), (0, 0));
-
-                    *trace = TestTrace::default();
-                    let report = run_tick(
-                        publication,
-                        None,
-                        &mut $io,
-                        MonotonicMillis(1),
-                        TickBudgets {
-                            rx: usize::MAX,
-                            resolution_timer_scans: usize::MAX,
-                            failure_dispatch_scans: usize::MAX,
-                            generated_arp: usize::MAX,
-                            generated_icmpv4: usize::MAX,
-                        },
-                        trace,
-                    );
-                    assert_eq!(report.publication, PublicationOutcome::Unchanged);
-                    assert!(report.active);
-                    assert_eq!(
-                        report.rx,
-                        RxPhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
-                    );
-                    assert!(matches!(
-                        report.resolution_timers,
-                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
-                    ));
-                    assert!(matches!(
-                        report.failure_dispatch,
-                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
-                    ));
-                    assert!(matches!(
-                        report.generated_arp,
-                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
-                    ));
-                    assert!(matches!(
-                        report.generated_icmpv4,
-                        PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
-                    ));
-                    assert_eq!(trace.phase_len, 9);
-                    assert_eq!(($io.receive_calls, $io.generated_calls), (0, 0));
-                }};
-            }
-
-            let mut forgotten_rx_batch = CountingSimIo::default();
-            let batch = forgotten_rx_batch.receive(0).unwrap();
-            core::mem::forget(batch);
-            assert_skipped!(
-                forgotten_rx_batch,
-                SimPublicationQuiescenceError::RxBatchNotFinished
-            );
-
-            let mut forgotten_generated_batch = CountingSimIo::default();
-            let batch = forgotten_generated_batch.begin_generated(WAN);
-            core::mem::forget(batch);
-            assert_skipped!(
-                forgotten_generated_batch,
-                SimPublicationQuiescenceError::GeneratedBatchNotFinished
-            );
-
-            let mut forgotten_rx_lease = CountingSimIo::default();
-            forgotten_rx_lease.inner.inject(LAN, vec![0; 64]);
-            let mut batch = forgotten_rx_lease.receive(1).unwrap();
-            let lease = batch.next_packet().expect("one injected frame");
-            core::mem::forget(lease);
-            assert!(batch.finish().invariants_hold());
-            assert_skipped!(
-                forgotten_rx_lease,
-                SimPublicationQuiescenceError::RxLeaseNotCompleted
-            );
-
-            let mut forgotten_generated_lease = CountingSimIo::default();
-            let mut batch = forgotten_generated_lease.begin_generated(WAN);
-            let lease = batch.allocate(64).expect("one generated frame");
-            core::mem::forget(lease);
-            assert!(!batch.finish().invariants_hold());
-            assert_skipped!(
-                forgotten_generated_lease,
-                SimPublicationQuiescenceError::GeneratedLeaseNotCompleted
-            );
-
-            assert_eq!(publication.applied, 0);
-            assert_eq!(publication.active_calls, 8);
-        });
+        assert_forgotten_sim_state_skips_every_data_phase(
+            CountingSimIoCommand::ForgetRxBatch,
+            SimPublicationQuiescenceError::RxBatchNotFinished,
+        );
+        assert_forgotten_sim_state_skips_every_data_phase(
+            CountingSimIoCommand::ForgetGeneratedBatch,
+            SimPublicationQuiescenceError::GeneratedBatchNotFinished,
+        );
+        assert_forgotten_sim_state_skips_every_data_phase(
+            CountingSimIoCommand::ForgetRxLease,
+            SimPublicationQuiescenceError::RxLeaseNotCompleted,
+        );
+        assert_forgotten_sim_state_skips_every_data_phase(
+            CountingSimIoCommand::ForgetGeneratedLease,
+            SimPublicationQuiescenceError::GeneratedLeaseNotCompleted,
+        );
     }
 
     #[test]
     fn sim_pending_tx_defers_candidate_but_continues_old_io() {
-        with_fixture(|publication, _unused_io, trace| {
-            let mut io = SimIo::new();
+        with_sim_fixture(|publication, io, trace| {
             let mut generated = io.begin_generated(WAN);
             generated.allocate(64).expect("generated frame").commit();
             assert_eq!(generated.finish().accepted, 1);
 
-            let report = run_tick(
+            let report = run_test_tick(
                 publication,
                 Some(Candidate::Apply),
-                &mut io,
+                io,
                 MonotonicMillis(0),
                 TickBudgets::default(),
                 trace,
@@ -1990,6 +3679,7 @@ mod tests {
             assert_eq!(
                 report.publication,
                 PublicationOutcome::Deferred {
+                    candidate: Candidate::Apply,
                     error: SimPublicationQuiescenceError::TxCompletionPending,
                     disposition: PublicationQuiescenceDisposition::ContinueOldIo,
                 }
@@ -2006,8 +3696,48 @@ mod tests {
             assert!(matches!(report.failure_dispatch, PhaseReport::Completed(_)));
             assert!(matches!(report.generated_arp, PhaseReport::Completed(_)));
             assert!(matches!(report.generated_icmpv4, PhaseReport::Completed(_)));
-            assert_eq!(io.pending_tx(), 1);
+            assert_eq!(io.inner().pending_tx(), 1);
         });
+    }
+
+    #[test]
+    fn test_io_control_keeps_stop_terminal_after_clear_or_continue_requests() {
+        for terminal_error in [
+            TestPublicationQuiescenceError::OwnershipFault,
+            TestPublicationQuiescenceError::Closing,
+        ] {
+            let (_owner, mut io) = bind_publication_backend(TestIo::default())
+                .expect("test publication binding identity");
+
+            io.execute_backend_command(TestIoCommand::SetQuiescenceOverride(Some(terminal_error)));
+            assert_test_io_terminal_stop(&mut io, terminal_error);
+
+            io.execute_backend_command(TestIoCommand::SetQuiescenceOverride(None));
+            assert_test_io_terminal_stop(&mut io, terminal_error);
+
+            io.execute_backend_command(TestIoCommand::SetQuiescenceOverride(Some(
+                TestPublicationQuiescenceError::TxCompletionPending,
+            )));
+            assert_test_io_terminal_stop(&mut io, terminal_error);
+        }
+    }
+
+    fn assert_test_io_terminal_stop(
+        io: &mut BoundTestIo,
+        expected: TestPublicationQuiescenceError,
+    ) {
+        assert_eq!(
+            <BoundTestIo as PublicationQuiescence>::current_io_disposition(io),
+            PublicationQuiescenceDisposition::Stop
+        );
+        assert_eq!(
+            <BoundTestIo as PublicationQuiescence>::quiescence_error_disposition(&expected),
+            PublicationQuiescenceDisposition::Stop
+        );
+        match io.try_publication_quiescence() {
+            Err(error) => assert_eq!(error, expected),
+            Ok(_guard) => panic!("terminal test backend must not mint a quiescence guard"),
+        }
     }
 
     #[test]
@@ -2017,10 +3747,12 @@ mod tests {
             TestPublicationQuiescenceError::Closing,
         ] {
             with_fixture(|publication, io, trace| {
-                io.quiescence_override = Some(error);
-                let report = run_tick(
+                io.execute_backend_command(TestIoCommand::SetQuiescenceOverride(Some(error)));
+                let candidate = Box::new(44);
+                let candidate_pointer = core::ptr::from_ref(candidate.as_ref());
+                let report = run_test_tick(
                     publication,
-                    Some(Candidate::Apply),
+                    Some(Candidate::ApplyOwned(candidate)),
                     io,
                     MonotonicMillis(0),
                     TickBudgets {
@@ -2032,15 +3764,27 @@ mod tests {
                     },
                     trace,
                 );
-                assert_eq!(
-                    report.publication,
-                    PublicationOutcome::Deferred {
-                        error,
-                        disposition: PublicationQuiescenceDisposition::Stop,
-                    }
-                );
+                let PublicationOutcome::Deferred {
+                    candidate,
+                    error: deferred_error,
+                    disposition,
+                } = report.publication
+                else {
+                    panic!("candidate must be deferred");
+                };
+                assert_eq!(deferred_error, error);
+                assert_eq!(disposition, PublicationQuiescenceDisposition::Stop);
+                let Candidate::ApplyOwned(candidate) = candidate else {
+                    panic!("deferred candidate identity must be preserved");
+                };
+                assert_eq!(candidate.as_ref(), &44);
+                assert_eq!(core::ptr::from_ref(candidate.as_ref()), candidate_pointer);
+                assert!(report.active);
                 assert_eq!(publication.applied, 0);
-                assert_eq!((io.receive_calls, io.generated_calls), (0, 0));
+                assert_eq!(
+                    (io.inner().receive_calls, io.inner().generated_calls),
+                    (0, 0)
+                );
                 assert_eq!(
                     report.rx,
                     RxPhaseReport::Skipped(TickPhaseSkip::BackendStopped)
@@ -2063,7 +3807,7 @@ mod tests {
                 ));
 
                 *trace = TestTrace::default();
-                let report = run_tick(
+                let report = run_test_tick(
                     publication,
                     None,
                     io,
@@ -2078,9 +3822,12 @@ mod tests {
                     trace,
                 );
                 assert_eq!(report.publication, PublicationOutcome::Unchanged);
-                assert_eq!(publication.active_calls, 2);
-                assert_eq!(io.quiescence_calls, 1);
-                assert_eq!((io.receive_calls, io.generated_calls), (0, 0));
+                assert_eq!(publication.active_calls, 0);
+                assert_eq!(io.inner().quiescence_calls, 1);
+                assert_eq!(
+                    (io.inner().receive_calls, io.inner().generated_calls),
+                    (0, 0)
+                );
                 assert_eq!(
                     report.rx,
                     RxPhaseReport::Skipped(TickPhaseSkip::BackendStopped)
@@ -2113,7 +3860,7 @@ mod tests {
             let completion = generated.finish();
             assert_eq!(completion.accepted, 1);
 
-            let report = run_tick(
+            let report = run_test_tick(
                 publication,
                 None,
                 io,
@@ -2122,16 +3869,16 @@ mod tests {
                 trace,
             );
             assert_eq!(report.publication, PublicationOutcome::Unchanged);
-            assert_eq!(io.quiescence_calls, 0);
+            assert_eq!(io.inner().quiescence_calls, 0);
             assert_eq!(publication.active_calls, 1);
-            assert_eq!(io.receive_calls, 1);
+            assert_eq!(io.inner().receive_calls, 1);
         });
     }
 
     #[test]
     fn active_view_is_one_o1_borrow_without_revalidation_scans() {
         with_fixture(|publication, io, trace| {
-            let report = run_tick(
+            let report = run_test_tick(
                 publication,
                 None,
                 io,
@@ -2151,11 +3898,13 @@ mod tests {
             let udp = publication.udp_config;
             let tcp = publication.tcp_config;
             let firewall = publication.firewall_config;
-            let view = <TestPublication<'_, '_> as FullServicePublication<'_, TestIo>>::active(
-                publication,
-            )
-            .expect("active view");
-            assert_eq!(view.generation, NonZeroU64::MIN);
+            let view = <TestPublication<'_, '_, BoundTestIo> as FullServicePublication<
+                '_,
+                BoundTestIo,
+            >>::active(publication);
+            assert_eq!(view.tick_authority.generation(), NonZeroU64::MIN);
+            assert_eq!(view.tick_authority.tick_budgets(), TickBudgets::default());
+            assert_eq!(view.tick_budgets(), TickBudgets::default());
             assert_eq!(view.nat44_udp.config, udp);
             assert!(view.nat44_udp.runtime.is_none());
             assert_eq!(view.nat44_tcp.config, tcp);
@@ -2177,8 +3926,8 @@ mod tests {
                     seed_resolution(publication, last, 0);
                 }
                 seed_icmpv4(publication, 0);
-                io.generated_mode = mode;
-                let report = run_tick(
+                io.execute_backend_command(TestIoCommand::SetGeneratedMode(mode));
+                let report = run_test_tick(
                     publication,
                     None,
                     io,
@@ -2202,7 +3951,7 @@ mod tests {
                 assert!(matches!(arp.stop, GeneratedArpStop::Failed(_)));
                 match mode {
                     GeneratedMode::AllocationFailure => {
-                        assert_eq!(io.generated_calls, 2);
+                        assert_eq!(io.inner().generated_calls, 2);
                         assert_eq!(publication.icmpv4_errors.pending_actions(), 1);
                         assert!(matches!(
                             report.generated_icmpv4,
@@ -2216,7 +3965,7 @@ mod tests {
                         ));
                     }
                     GeneratedMode::WrongLength => {
-                        assert_eq!(io.generated_calls, 1);
+                        assert_eq!(io.inner().generated_calls, 1);
                         assert_eq!(publication.icmpv4_errors.pending_actions(), 1);
                         assert!(matches!(
                             report.generated_icmpv4,
@@ -2224,7 +3973,7 @@ mod tests {
                         ));
                     }
                     GeneratedMode::FinishError => {
-                        assert_eq!(io.generated_calls, 1);
+                        assert_eq!(io.inner().generated_calls, 1);
                         assert_eq!(publication.icmpv4_errors.pending_actions(), 1);
                         assert!(matches!(
                             report.generated_icmpv4,
@@ -2240,7 +3989,7 @@ mod tests {
             for last in [2, 3, 4] {
                 seed_resolution(publication, last, 0);
             }
-            let report = run_tick(
+            let report = run_test_tick(
                 publication,
                 None,
                 io,
@@ -2253,7 +4002,7 @@ mod tests {
                 },
                 trace,
             );
-            assert_eq!(io.generated_calls, 2);
+            assert_eq!(io.inner().generated_calls, 2);
             assert_eq!(publication.resolution.pending_actions(), 1);
             assert!(matches!(
                 report.resolution_timers,
@@ -2278,8 +4027,8 @@ mod tests {
         for mode in [RxMode::Fail, RxMode::FinishError] {
             with_fixture(|publication, io, trace| {
                 seed_resolution(publication, 2, 10);
-                io.rx_mode = mode;
-                let report = run_tick(
+                io.execute_backend_command(TestIoCommand::SetRxMode(mode));
+                let report = run_test_tick(
                     publication,
                     None,
                     io,
@@ -2323,7 +4072,7 @@ mod tests {
                     PhaseReport::Skipped(TickPhaseSkip::BackendIoFailure)
                 ));
                 assert_eq!(publication.resolution.pending_actions(), 1);
-                assert_eq!(io.generated_calls, 0);
+                assert_eq!(io.inner().generated_calls, 0);
             });
         }
     }
@@ -2333,7 +4082,7 @@ mod tests {
         with_fixture(|publication, io, trace| {
             seed_resolution(publication, 2, 10);
             seed_icmpv4(publication, 10);
-            let report = run_tick(
+            let report = run_test_tick(
                 publication,
                 None,
                 io,
@@ -2364,7 +4113,7 @@ mod tests {
             ));
             assert_eq!(publication.resolution.pending_actions(), 1);
             assert_eq!(publication.icmpv4_errors.pending_actions(), 1);
-            assert_eq!(io.generated_calls, 0);
+            assert_eq!(io.inner().generated_calls, 0);
         });
     }
 
@@ -2374,8 +4123,10 @@ mod tests {
             for last in [2, 3] {
                 seed_resolution(publication, last, 0);
             }
-            io.generated_mode = GeneratedMode::InvalidAccounting;
-            let report = run_tick(
+            io.execute_backend_command(TestIoCommand::SetGeneratedMode(
+                GeneratedMode::InvalidAccounting,
+            ));
+            let report = run_test_tick(
                 publication,
                 None,
                 io,
@@ -2387,7 +4138,7 @@ mod tests {
                 },
                 trace,
             );
-            assert_eq!(io.generated_calls, 1);
+            assert_eq!(io.inner().generated_calls, 1);
             assert_eq!(publication.resolution.pending_actions(), 1);
             let PhaseReport::Completed(GeneratedPhaseReport {
                 accounting,
@@ -2419,8 +4170,8 @@ mod tests {
     fn generated_icmpv4_build_failure_is_single_attempt_and_preserves_pending() {
         with_fixture(|publication, io, trace| {
             seed_icmpv4(publication, 0);
-            io.generated_mode = GeneratedMode::WrongLength;
-            let report = run_tick(
+            io.execute_backend_command(TestIoCommand::SetGeneratedMode(GeneratedMode::WrongLength));
+            let report = run_test_tick(
                 publication,
                 None,
                 io,
@@ -2431,7 +4182,7 @@ mod tests {
                 },
                 trace,
             );
-            assert_eq!(io.generated_calls, 1);
+            assert_eq!(io.inner().generated_calls, 1);
             assert_eq!(publication.icmpv4_errors.pending_actions(), 1);
             assert!(matches!(
                 report.generated_icmpv4,

@@ -2,7 +2,7 @@ use serde::de::IntoDeserializer;
 use serde_path_to_error::{Path, Segment};
 use toml::Value;
 
-use crate::{ConfigV1, Diagnostic, DiagnosticCode, SourcePath, VersionedConfig};
+use crate::{ConfigV1, Diagnostic, DiagnosticCode, PathSegment, SourcePath, VersionedConfig};
 
 pub const SCHEMA_VERSION_V1: u32 = 1;
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
@@ -11,6 +11,8 @@ pub const MAX_ADDRESSES: usize = 1024;
 pub const MAX_ROUTES: usize = 4096;
 pub const MAX_NEIGHBORS: usize = 4096;
 pub const MAX_FIREWALL_RULES: usize = 4096;
+/// The fixed native aggregate contains exactly two AF_XDP resources.
+pub const MAX_AF_XDP_RESOURCES: usize = 2;
 
 const FORBIDDEN_FIELDS: &[&str] = &[
     "config-generation",
@@ -40,7 +42,11 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "address",
     "addresses",
     "allocator-seed",
+    "attach-mode",
+    "backend",
+    "bind-flags",
     "capacity",
+    "completion",
     "default-ttl",
     "destination",
     "destination-ports",
@@ -49,7 +55,11 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "dynamic-neighbors",
     "egress",
     "failure-holds",
+    "fill",
     "firewall",
+    "flags",
+    "frame-count",
+    "frame-size",
     "first",
     "failure-dispatch-scans",
     "generated-arp",
@@ -68,6 +78,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "mac",
     "mappings",
     "max-attempts",
+    "generated-frames",
     "name",
     "nat44",
     "neighbors",
@@ -80,10 +91,12 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "public-address",
     "realm",
     "resolution",
+    "resources",
     "resolution-timer-scans",
     "routes",
     "rules",
     "rx",
+    "rx-frames",
     "schema-version",
     "sessions",
     "source",
@@ -97,6 +110,14 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "udp",
     "udp-idle-ttl-ms",
     "via",
+    "umem",
+    "headroom",
+    "raw-flags",
+    "ring",
+    "rings",
+    "queue-id",
+    "xskmap-max-entries",
+    "tx",
 ];
 
 /// Parses bounded UTF-8 TOML using schema-version predispatch and exact V1 DTOs.
@@ -150,7 +171,13 @@ fn deserialize_exact(value: Value) -> Result<ConfigV1, Diagnostic> {
     let deserializer = value.into_deserializer();
     serde_path_to_error::deserialize(deserializer).map_err(|error| {
         let code = classify_decode_error(error.inner());
-        Diagnostic::new(code, convert_path(error.path()))
+        let path = convert_path(error.path());
+        if code == DiagnosticCode::UnknownField {
+            if let Some(field) = extract_unknown_field(error.inner()) {
+                return Diagnostic::with_unknown_field(path, field);
+            }
+        }
+        Diagnostic::new(code, path)
     })
 }
 
@@ -165,6 +192,19 @@ fn classify_decode_error(error: &toml::de::Error) -> DiagnosticCode {
     } else {
         DiagnosticCode::InvalidType
     }
+}
+
+fn extract_unknown_field(error: &toml::de::Error) -> Option<String> {
+    let remainder = error.message().strip_prefix("unknown field ")?;
+    let delimiter = remainder.chars().next()?;
+    if !matches!(delimiter, '\u{0060}' | '\'' | '"') {
+        return None;
+    }
+    let field_start = delimiter.len_utf8();
+    let field = remainder[field_start..]
+        .find(delimiter)
+        .map(|end| &remainder[field_start..field_start + end])?;
+    (!field.is_empty()).then(|| field.to_owned())
 }
 
 fn convert_path(path: &Path) -> SourcePath {
@@ -193,7 +233,9 @@ fn reject_forbidden_fields(value: &Value, path: &mut SourcePath) -> Result<(), D
         Value::Table(table) => {
             for (field, value) in table {
                 let normalized = field.to_ascii_lowercase().replace('_', "-");
-                if FORBIDDEN_FIELDS.contains(&normalized.as_str()) {
+                if FORBIDDEN_FIELDS.contains(&normalized.as_str())
+                    && !backend_field_is_allowed(path, normalized.as_str())
+                {
                     path.push_field(normalized);
                     return Err(Diagnostic::new(
                         DiagnosticCode::ForbiddenField,
@@ -214,6 +256,23 @@ fn reject_forbidden_fields(value: &Value, path: &mut SourcePath) -> Result<(), D
     Ok(())
 }
 
+fn backend_field_is_allowed(path: &SourcePath, field: &str) -> bool {
+    let segments = path.segments();
+    match field {
+        "umem" => {
+            segments.len() == 1
+                && matches!(&segments[0], PathSegment::Field(value) if value == "backend")
+        }
+        "queue-id" => {
+            segments.len() == 3
+                && matches!(&segments[0], PathSegment::Field(value) if value == "backend")
+                && matches!(&segments[1], PathSegment::Field(value) if value == "resources")
+                && matches!(&segments[2], PathSegment::Index(_))
+        }
+        _ => false,
+    }
+}
+
 fn enforce_list_bounds(config: &ConfigV1) -> Result<(), Diagnostic> {
     check_list("interfaces", config.interfaces.len(), MAX_INTERFACES)?;
     check_list("addresses", config.addresses.len(), MAX_ADDRESSES)?;
@@ -223,6 +282,11 @@ fn enforce_list_bounds(config: &ConfigV1) -> Result<(), Diagnostic> {
         let mut path = SourcePath::root_field("firewall");
         path.push_field("rules");
         check_list_path(path, firewall.rules.len(), MAX_FIREWALL_RULES)?;
+    }
+    if let Some(crate::BackendV1::AfXdp { resources, .. }) = &config.backend {
+        let mut path = SourcePath::root_field("backend");
+        path.push_field("resources");
+        check_list_path(path, resources.len(), MAX_AF_XDP_RESOURCES)?;
     }
     Ok(())
 }

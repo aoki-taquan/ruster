@@ -1,9 +1,10 @@
 use std::mem::size_of;
 
 use ruster_config::{
-    parse, validate, ConfigV1, PathSegment, RuntimeStorageShapeV1, ValidatedConfig,
-    ValidatedConfigV1, ValidationCode, ValidationLimits, VersionedConfig, MAX_ADDRESSES,
-    MAX_CONFIG_BYTES, MAX_FIREWALL_RULES, MAX_INTERFACES, MAX_NEIGHBORS, MAX_ROUTES,
+    parse, validate, AfXdpResourceV1, BackendV1, ConfigV1, PathSegment, RuntimeStorageShapeV1,
+    ValidatedConfig, ValidatedConfigV1, ValidationCode, ValidationLimits, VersionedConfig,
+    XdpAttachModeV1, XdpRingsV1, XdpUmemV1, MAX_ADDRESSES, MAX_CONFIG_BYTES, MAX_FIREWALL_RULES,
+    MAX_INTERFACES, MAX_NEIGHBORS, MAX_ROUTES,
 };
 use ruster_core::{
     DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallRuleId, FirewallStateSlot,
@@ -11,6 +12,7 @@ use ruster_core::{
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot,
     ResolutionFailureHoldSlot, ResolutionStateSlot, RouteError,
 };
+use ruster_io_xdp_native::{ConfigError as XdpConfigError, MAX_UMEM_FRAME_COUNT};
 
 const VALID: &str = r#"
 schema-version = 1
@@ -185,6 +187,61 @@ fn dto_error(dto: ConfigV1) -> ruster_config::ValidationError {
 }
 
 #[test]
+fn af_xdp_rejects_unbounded_umem_before_ledger_allocation() {
+    let mut config = dto();
+    config.backend = Some(BackendV1::AfXdp {
+        resources: vec![
+            AfXdpResourceV1 {
+                interface: "wan".to_owned(),
+                queue_id: 0,
+            },
+            AfXdpResourceV1 {
+                interface: "lan".to_owned(),
+                queue_id: 1,
+            },
+        ],
+        xskmap_max_entries: 2,
+        bind_flags: 1 << 3,
+        attach_mode: XdpAttachModeV1::Skb,
+        umem: XdpUmemV1 {
+            frame_count: u32::MAX,
+            frame_size: 4_096,
+            headroom: 0,
+            rx_frames: 1,
+            generated_frames: u32::MAX - 1,
+            raw_flags: 0,
+        },
+        rings: XdpRingsV1 {
+            fill: 4,
+            rx: 4,
+            tx: 4,
+            completion: 4,
+        },
+    });
+
+    let error = validate(VersionedConfig::V1(config), GENEROUS)
+        .err()
+        .expect("a 16 TiB UMEM and a u32::MAX-entry ledger must be rejected");
+    assert_eq!(
+        error.code(),
+        ValidationCode::AfXdpUmem(XdpConfigError::UmemFrameCountExceedsLimit {
+            frame_count: u32::MAX,
+            limit: MAX_UMEM_FRAME_COUNT,
+        })
+    );
+    assert_eq!(
+        error.path().segments(),
+        &[
+            PathSegment::Field("backend".to_owned()),
+            PathSegment::Field("umem".to_owned()),
+            PathSegment::Field("frame-count".to_owned()),
+        ]
+    );
+    assert_eq!(error.limit(), Some(u64::from(MAX_UMEM_FRAME_COUNT)));
+    assert_eq!(error.actual(), Some(u64::from(u32::MAX)));
+}
+
+#[test]
 fn semantic_validation_canonicalizes_only_order_independent_tables() {
     let config = validated(VALID);
     assert_eq!(
@@ -305,6 +362,417 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
     assert_eq!(bounded.code(), ValidationCode::RuntimeStorageBytesExceeded);
     assert_eq!(bounded.limit(), Some((expected - 1) as u64));
     assert_eq!(bounded.actual(), Some(expected as u64));
+}
+
+#[test]
+fn validated_config_into_parts_preserves_owned_box_allocations() {
+    let config = validated(VALID);
+    let interfaces = config.interfaces().as_ptr();
+    let core_interfaces = config.core_interfaces().as_ptr();
+    let routes = config.routes().as_ptr();
+    let neighbors = config.neighbors().as_ptr();
+    let local_ipv4 = config.local_ipv4().as_ptr();
+    let ipv4_origin = config.ipv4_origin();
+    let required_runtime_bytes = config.storage_shape().required_bytes;
+    let resolution = config
+        .resolution()
+        .map(|service| (service.policy(), service.storage()));
+    let icmpv4_errors = config
+        .icmpv4_errors()
+        .map(|service| (service.policy(), service.storage()));
+    let nat44_udp = config.nat44().and_then(|nat44| nat44.udp()).map(|service| {
+        (
+            service.inside(),
+            service.outside(),
+            service.public_address(),
+            service.first_port(),
+            service.last_port(),
+            service.policy(),
+            service.storage(),
+        )
+    });
+    let nat44_tcp = config.nat44().and_then(|nat44| nat44.tcp()).map(|service| {
+        (
+            service.inside(),
+            service.outside(),
+            service.public_address(),
+            service.first_port(),
+            service.last_port(),
+            service.policy(),
+            service.storage(),
+        )
+    });
+    let firewall = config.firewall().unwrap();
+    let firewall_rules = firewall.rules().as_ptr();
+    let firewall_policy = firewall.policy();
+    let firewall_state_slots = firewall.state_slots();
+
+    let parts = config.into_parts();
+    assert_eq!(parts.interfaces.as_ptr(), interfaces);
+    assert_eq!(parts.core_interfaces.as_ptr(), core_interfaces);
+    assert_eq!(parts.routes.as_ptr(), routes);
+    assert_eq!(parts.neighbors.as_ptr(), neighbors);
+    assert_eq!(parts.local_ipv4.as_ptr(), local_ipv4);
+    assert_eq!(parts.ipv4_origin, ipv4_origin);
+    assert_eq!(parts.required_runtime_bytes, required_runtime_bytes);
+    assert_eq!(
+        parts
+            .resolution
+            .as_ref()
+            .map(|service| (service.policy(), service.storage())),
+        resolution
+    );
+    assert_eq!(
+        parts
+            .icmpv4_errors
+            .as_ref()
+            .map(|service| (service.policy(), service.storage())),
+        icmpv4_errors
+    );
+    let nat44 = parts.nat44.as_ref().expect("full fixture enables NAT44");
+    assert_eq!(
+        nat44.udp().map(|service| {
+            (
+                service.inside(),
+                service.outside(),
+                service.public_address(),
+                service.first_port(),
+                service.last_port(),
+                service.policy(),
+                service.storage(),
+            )
+        }),
+        nat44_udp
+    );
+    assert_eq!(
+        nat44.tcp().map(|service| {
+            (
+                service.inside(),
+                service.outside(),
+                service.public_address(),
+                service.first_port(),
+                service.last_port(),
+                service.policy(),
+                service.storage(),
+            )
+        }),
+        nat44_tcp
+    );
+    let firewall = parts.firewall.expect("full fixture enables firewall");
+    assert_eq!(firewall.rules().as_ptr(), firewall_rules);
+    assert_eq!(firewall.policy(), firewall_policy);
+    assert_eq!(firewall.state_slots(), firewall_state_slots);
+    let (moved_firewall_rules, moved_firewall_policy, moved_firewall_state_slots) =
+        firewall.into_planning_parts();
+    assert_eq!(moved_firewall_rules.as_ptr(), firewall_rules);
+    assert_eq!(moved_firewall_policy, firewall_policy);
+    assert_eq!(moved_firewall_state_slots, firewall_state_slots);
+}
+
+#[test]
+fn validated_firewall_into_rules_preserves_owned_rule_allocation() {
+    let config = validated(VALID);
+    let (expected_rules, expected_rule_ids) = {
+        let firewall = config.firewall().expect("fixture enables firewall");
+        (
+            firewall.rules().as_ptr(),
+            [firewall.rules()[0].id().0, firewall.rules()[1].id().0],
+        )
+    };
+
+    let firewall = config
+        .into_parts()
+        .firewall
+        .expect("fixture enables firewall");
+    let rules = firewall.into_rules();
+
+    assert_eq!(rules.as_ptr(), expected_rules);
+    assert_eq!(rules.len(), expected_rule_ids.len());
+    assert_eq!([rules[0].id().0, rules[1].id().0], expected_rule_ids);
+}
+
+#[test]
+fn validated_config_planning_parts_preserve_the_exhaustive_owned_inventory() {
+    let config = validated(VALID);
+    let pointers = [
+        config.interfaces().as_ptr() as usize,
+        config.core_interfaces().as_ptr() as usize,
+        config.routes().as_ptr() as usize,
+        config.neighbors().as_ptr() as usize,
+        config.local_ipv4().as_ptr() as usize,
+        config.firewall().unwrap().rules().as_ptr() as usize,
+    ];
+    let expected_origin = config.ipv4_origin();
+    let expected_tick = config.tick();
+    let expected_storage = config.storage_shape();
+    let expected_bytes = config.storage_shape().required_bytes;
+    let expected_backend = config.backend().clone();
+
+    let (
+        interfaces,
+        core_interfaces,
+        routes,
+        neighbors,
+        local_ipv4,
+        ipv4_origin,
+        resolution,
+        icmpv4_errors,
+        nat44,
+        firewall,
+        tick,
+        storage,
+        backend,
+        required_runtime_bytes,
+    ) = config.into_parts().into_planning_parts();
+
+    assert_eq!(interfaces.as_ptr() as usize, pointers[0]);
+    assert_eq!(core_interfaces.as_ptr() as usize, pointers[1]);
+    assert_eq!(routes.as_ptr() as usize, pointers[2]);
+    assert_eq!(neighbors.as_ptr() as usize, pointers[3]);
+    assert_eq!(local_ipv4.as_ptr() as usize, pointers[4]);
+    assert_eq!(ipv4_origin, expected_origin);
+    assert!(resolution.is_some());
+    assert!(icmpv4_errors.is_some());
+    assert!(nat44.is_some());
+    let firewall = firewall.expect("fixture enables firewall");
+    assert_eq!(firewall.rules().as_ptr() as usize, pointers[5]);
+    assert_eq!(tick, expected_tick);
+    assert_eq!(storage, expected_storage);
+    assert_eq!(backend, expected_backend);
+    assert_eq!(required_runtime_bytes, expected_bytes);
+}
+
+#[test]
+fn nested_validated_consuming_seams_preserve_full_inventory() {
+    let config = validated(VALID);
+    let expected_interfaces = config.interfaces().as_ptr();
+    let expected_core_interfaces = config.core_interfaces().as_ptr();
+    let expected_routes = config.routes().as_ptr();
+    let expected_neighbors = config.neighbors().as_ptr();
+    let expected_local_ipv4 = config.local_ipv4().as_ptr();
+    let expected_ipv4_origin = config.ipv4_origin();
+    let expected_tick = config.tick();
+    let expected_storage = config.storage_shape();
+    let expected_required_bytes = expected_storage.required_bytes;
+    let expected_backend = config.backend().clone();
+
+    let expected_resolution = config
+        .resolution()
+        .map(|service| (service.policy(), service.storage().into_planning_parts()))
+        .expect("fixture enables resolution");
+    let expected_icmpv4_errors = config
+        .icmpv4_errors()
+        .map(|service| (service.policy(), service.storage().into_planning_parts()))
+        .expect("fixture enables ICMPv4 errors");
+    let expected_udp = config
+        .nat44()
+        .and_then(|nat44| nat44.udp())
+        .map(|service| {
+            (
+                service.inside(),
+                service.outside(),
+                service.public_address(),
+                service.first_port(),
+                service.last_port(),
+                service.policy(),
+                service.storage().into_planning_parts(),
+            )
+        })
+        .expect("fixture enables UDP NAT");
+    let expected_tcp = config
+        .nat44()
+        .and_then(|nat44| nat44.tcp())
+        .map(|service| {
+            (
+                service.inside(),
+                service.outside(),
+                service.public_address(),
+                service.first_port(),
+                service.last_port(),
+                service.policy(),
+                service.storage().into_planning_parts(),
+            )
+        })
+        .expect("fixture enables TCP NAT");
+    let expected_firewall = config
+        .firewall()
+        .map(|firewall| {
+            (
+                firewall.rules().as_ptr(),
+                firewall.policy(),
+                firewall.state_slots(),
+            )
+        })
+        .expect("fixture enables firewall");
+
+    let (
+        interfaces,
+        core_interfaces,
+        routes,
+        neighbors,
+        local_ipv4,
+        ipv4_origin,
+        resolution,
+        icmpv4_errors,
+        nat44,
+        firewall,
+        tick,
+        storage,
+        backend,
+        required_runtime_bytes,
+    ) = config.into_parts().into_planning_parts();
+    assert_eq!(interfaces.as_ptr(), expected_interfaces);
+    assert_eq!(core_interfaces.as_ptr(), expected_core_interfaces);
+    assert_eq!(routes.as_ptr(), expected_routes);
+    assert_eq!(neighbors.as_ptr(), expected_neighbors);
+    assert_eq!(local_ipv4.as_ptr(), expected_local_ipv4);
+    assert_eq!(ipv4_origin, expected_ipv4_origin);
+    assert_eq!(backend, expected_backend);
+    assert_eq!(required_runtime_bytes, expected_required_bytes);
+
+    let (resolution_policy, resolution_storage) = resolution
+        .expect("fixture enables resolution")
+        .into_planning_parts();
+    let (resolution_states, resolution_actions, resolution_dynamic_neighbors, resolution_holds) =
+        resolution_storage.into_planning_parts();
+    assert_eq!(resolution_policy, expected_resolution.0);
+    assert_eq!(
+        (
+            resolution_states,
+            resolution_actions,
+            resolution_dynamic_neighbors,
+            resolution_holds,
+        ),
+        expected_resolution.1
+    );
+
+    let (icmpv4_error_policy, icmpv4_error_storage) = icmpv4_errors
+        .expect("fixture enables ICMPv4 errors")
+        .into_planning_parts();
+    let (icmpv4_error_states, icmpv4_error_actions) = icmpv4_error_storage.into_planning_parts();
+    assert_eq!(icmpv4_error_policy, expected_icmpv4_errors.0);
+    assert_eq!(
+        (icmpv4_error_states, icmpv4_error_actions),
+        expected_icmpv4_errors.1
+    );
+
+    let (udp, tcp) = nat44.expect("fixture enables NAT44").into_planning_parts();
+    let (
+        udp_inside,
+        udp_outside,
+        udp_public_address,
+        udp_first_port,
+        udp_last_port,
+        udp_policy,
+        udp_storage,
+    ) = udp.expect("fixture enables UDP NAT").into_planning_parts();
+    let udp_storage = udp_storage.into_planning_parts();
+    assert_eq!(
+        (
+            udp_inside,
+            udp_outside,
+            udp_public_address,
+            udp_first_port,
+            udp_last_port,
+            udp_policy,
+            udp_storage,
+        ),
+        expected_udp
+    );
+    let (
+        tcp_inside,
+        tcp_outside,
+        tcp_public_address,
+        tcp_first_port,
+        tcp_last_port,
+        tcp_policy,
+        tcp_storage,
+    ) = tcp.expect("fixture enables TCP NAT").into_planning_parts();
+    let tcp_storage = tcp_storage.into_planning_parts();
+    assert_eq!(
+        (
+            tcp_inside,
+            tcp_outside,
+            tcp_public_address,
+            tcp_first_port,
+            tcp_last_port,
+            tcp_policy,
+            tcp_storage,
+        ),
+        expected_tcp
+    );
+
+    let (firewall_rules, firewall_policy, firewall_state_slots) = firewall
+        .expect("fixture enables firewall")
+        .into_planning_parts();
+    assert_eq!(firewall_rules.as_ptr(), expected_firewall.0);
+    assert_eq!(firewall_policy, expected_firewall.1);
+    assert_eq!(firewall_state_slots, expected_firewall.2);
+
+    let (
+        tick_rx,
+        tick_resolution_timer_scans,
+        tick_failure_dispatch_scans,
+        tick_generated_arp,
+        tick_generated_icmpv4,
+    ) = tick.into_planning_parts();
+    assert_eq!(
+        (
+            tick_rx,
+            tick_resolution_timer_scans,
+            tick_failure_dispatch_scans,
+            tick_generated_arp,
+            tick_generated_icmpv4,
+        ),
+        expected_tick.into_planning_parts()
+    );
+
+    let (
+        runtime_resolution,
+        runtime_icmpv4_errors,
+        runtime_nat44_udp,
+        runtime_nat44_tcp,
+        runtime_firewall_states,
+        runtime_required_bytes,
+    ) = storage.into_planning_parts();
+    assert_eq!(
+        runtime_resolution
+            .expect("fixture enables resolution storage")
+            .into_planning_parts(),
+        expected_storage
+            .resolution
+            .expect("fixture enables resolution storage")
+            .into_planning_parts()
+    );
+    assert_eq!(
+        runtime_icmpv4_errors
+            .expect("fixture enables ICMPv4 error storage")
+            .into_planning_parts(),
+        expected_storage
+            .icmpv4_errors
+            .expect("fixture enables ICMPv4 error storage")
+            .into_planning_parts()
+    );
+    assert_eq!(
+        runtime_nat44_udp
+            .expect("fixture enables UDP NAT storage")
+            .into_planning_parts(),
+        expected_storage
+            .nat44_udp
+            .expect("fixture enables UDP NAT storage")
+            .into_planning_parts()
+    );
+    assert_eq!(
+        runtime_nat44_tcp
+            .expect("fixture enables TCP NAT storage")
+            .into_planning_parts(),
+        expected_storage
+            .nat44_tcp
+            .expect("fixture enables TCP NAT storage")
+            .into_planning_parts()
+    );
+    assert_eq!(runtime_firewall_states, expected_storage.firewall_states);
+    assert_eq!(runtime_required_bytes, expected_storage.required_bytes);
 }
 
 #[test]
@@ -521,9 +989,43 @@ fn diagnostics_and_assertion_panics_never_echo_secret_or_topology_values() {
 fn semantic_surface_has_no_runtime_dependency_or_secret_bearing_debug_derive() {
     let manifest = include_str!("../Cargo.toml");
     let source = include_str!("../src/validate.rs");
+    assert!(!manifest.contains("ruster-control"));
     assert!(!manifest.contains("ruster-runtime"));
+    assert!(!source.contains("ruster_control"));
     assert!(!source.contains("ruster_runtime"));
     assert!(!source.contains("ValidatedForwardingOwner"));
+    assert!(source.contains("#[non_exhaustive]\npub struct ValidatedConfigV1Parts"));
+    let parts = source
+        .split_once("pub struct ValidatedConfigV1Parts {")
+        .expect("transfer parts declaration exists")
+        .1
+        .split_once("\n}")
+        .expect("transfer parts declaration closes")
+        .0;
+    let fields = parts
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fields,
+        [
+            "pub interfaces: Box<[InterfaceBindingV1]>,",
+            "pub core_interfaces: Box<[Interface]>,",
+            "pub routes: Box<[Route]>,",
+            "pub neighbors: Box<[Neighbor]>,",
+            "pub local_ipv4: Box<[LocalIpv4Binding]>,",
+            "pub ipv4_origin: Ipv4OriginPolicy,",
+            "pub resolution: Option<ValidatedResolutionV1>,",
+            "pub icmpv4_errors: Option<ValidatedIcmpv4ErrorV1>,",
+            "pub nat44: Option<ValidatedNat44V1>,",
+            "pub firewall: Option<ValidatedFirewallV1>,",
+            "pub tick: TickBudgetsV1,",
+            "pub storage: RuntimeStorageShapeV1,",
+            "pub backend: ValidatedBackendV1,",
+            "pub required_runtime_bytes: usize,",
+        ]
+    );
 
     for declaration in [
         "pub struct InterfaceBindingV1",
@@ -534,6 +1036,7 @@ fn semantic_surface_has_no_runtime_dependency_or_secret_bearing_debug_derive() {
         "pub struct ValidatedNat44V1",
         "pub struct ValidatedFirewallV1",
         "pub struct ValidatedConfigV1",
+        "pub struct ValidatedConfigV1Parts",
         "pub enum ValidatedConfig",
     ] {
         let offset = source.find(declaration).expect("declaration exists");

@@ -1,6 +1,6 @@
 use ruster_config::{
-    parse, DiagnosticCode, PathSegment, VersionedConfig, MAX_ADDRESSES, MAX_CONFIG_BYTES,
-    MAX_FIREWALL_RULES, MAX_INTERFACES, MAX_NEIGHBORS, MAX_ROUTES,
+    parse, BackendV1, DiagnosticCode, PathSegment, VersionedConfig, MAX_ADDRESSES,
+    MAX_CONFIG_BYTES, MAX_FIREWALL_RULES, MAX_INTERFACES, MAX_NEIGHBORS, MAX_ROUTES,
 };
 
 const VALID_V1: &str = r#"
@@ -140,6 +140,52 @@ fn v1_exact_dto_decodes_every_roadmap_section() {
 }
 
 #[test]
+fn af_xdp_backend_table_with_internal_kind_tag_decodes() {
+    let source = r#"
+schema-version = 1
+
+[backend]
+kind = "af-xdp"
+xskmap-max-entries = 1
+bind-flags = 10
+attach-mode = "skb"
+
+[backend.umem]
+frame-count = 4
+frame-size = 2048
+headroom = 0
+rx-frames = 1
+generated-frames = 3
+raw-flags = 0
+
+[backend.rings]
+fill = 2
+rx = 2
+tx = 2
+completion = 2
+
+[[backend.resources]]
+interface = "wan"
+queue-id = 0
+
+[[backend.resources]]
+interface = "lan"
+queue-id = 0
+"#;
+
+    let config = match parse(source.as_bytes()).expect("AF_XDP table parses") {
+        VersionedConfig::V1(config) => config,
+        _ => panic!("the fixture must select schema V1"),
+    };
+    let Some(BackendV1::AfXdp { resources, .. }) = config.backend else {
+        panic!("the internal kind tag must select AF_XDP");
+    };
+    assert_eq!(resources.len(), 2);
+    assert_eq!(resources[0].interface, "wan");
+    assert_eq!(resources[1].interface, "lan");
+}
+
+#[test]
 fn schema_version_predispatch_precedes_v1_decode() {
     let input = br#"
 schema-version = 42
@@ -208,6 +254,21 @@ surprise = "DO_NOT_ECHO_UNKNOWN_VALUE"
             DiagnosticCode::DuplicateField
         );
     }
+}
+
+#[test]
+fn unknown_field_diagnostic_keeps_the_bad_key_name() {
+    let input = br#"
+schema-version = 1
+[[interfaces]]
+id = 1
+name = "lan"
+devicee = "eth0"
+mac = "02:00:00:00:00:01"
+"#;
+    let diagnostic = parse(input).unwrap_err();
+    assert_eq!(diagnostic.code(), DiagnosticCode::UnknownField);
+    assert_eq!(diagnostic.unknown_field(), Some("devicee"));
 }
 
 #[test]

@@ -1,22 +1,23 @@
-use std::num::NonZeroU64;
-
 use ruster_core::{
-    FirewallConfig, FirewallRuntime, ForwardingSnapshot, Icmpv4ErrorRuntime, Nat44TcpConfig,
-    Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpRuntime, PublicationQuiescenceGuard,
-    ResolutionRuntime,
+    BoundPublicationBackend, FirewallConfig, FirewallRuntime, ForwardingSnapshot,
+    Icmpv4ErrorRuntime, MatchedPublicationQuiescenceGuard, Nat44TcpConfig, Nat44TcpRuntime,
+    Nat44UdpConfig, Nat44UdpRuntime, PublicationOwnerBinding, ResolutionRuntime,
 };
 use ruster_io_sim::SimIo;
 use ruster_runtime::{
-    FirewallServiceView, FullServicePublication, FullServiceView, Nat44TcpServiceView,
-    Nat44UdpServiceView,
+    ActivePublicationStatus, ActiveTickAuthority, FirewallServiceView, FullServicePublication,
+    FullServiceView, Nat44TcpServiceView, Nat44UdpServiceView, PublicationRejection, TickBudgets,
 };
 
+type Backend = BoundPublicationBackend<SimIo>;
+
 /// A downstream crate's minimal adapter fixture. Keeping this as an
-/// integration test makes the public struct literal, exact backend guard, and
+/// integration test makes the public constructor, exact backend guard, and
 /// lifetime shortening compile through the same surface available to external
 /// users.
 struct ExternalPublication<'owner, 'storage> {
-    generation: NonZeroU64,
+    owner_binding: PublicationOwnerBinding<Backend>,
+    tick_authority: ActiveTickAuthority,
     snapshot: &'owner ForwardingSnapshot<'storage>,
     resolution: &'owner mut ResolutionRuntime<'storage>,
     icmpv4_errors: &'owner mut Icmpv4ErrorRuntime<'storage>,
@@ -28,45 +29,72 @@ struct ExternalPublication<'owner, 'storage> {
     firewall: Option<&'owner mut FirewallRuntime<'storage>>,
 }
 
-impl<'owner, 'storage> FullServicePublication<'storage, SimIo>
+#[allow(unsafe_code)]
+unsafe impl<'owner, 'storage> FullServicePublication<'storage, Backend>
     for ExternalPublication<'owner, 'storage>
 {
     type Candidate = ();
     type Reject = ();
+    type ApplyReport = ();
 
-    fn publish_candidate(
+    fn publication_owner_binding(&self) -> &PublicationOwnerBinding<Backend> {
+        &self.owner_binding
+    }
+
+    fn reject_candidate_if_active_stopped(
+        &self,
+        candidate: Self::Candidate,
+    ) -> Result<Self::Candidate, PublicationRejection<Self::Candidate, Self::Reject>> {
+        Ok(candidate)
+    }
+
+    #[allow(unsafe_code)]
+    unsafe fn publish_candidate_authorized(
         &mut self,
         _candidate: Self::Candidate,
-        _quiescence: PublicationQuiescenceGuard<'_, SimIo>,
-    ) -> Result<(), Self::Reject> {
+        _quiescence: MatchedPublicationQuiescenceGuard<'_, Backend>,
+    ) -> Result<Self::ApplyReport, PublicationRejection<Self::Candidate, Self::Reject>> {
         Ok(())
     }
 
-    fn active(&mut self) -> Option<FullServiceView<'_, 'storage>> {
-        Some(FullServiceView {
-            generation: self.generation,
-            snapshot: *self.snapshot,
-            resolution: self.resolution,
-            icmpv4_errors: self.icmpv4_errors,
-            nat44_udp: Nat44UdpServiceView {
-                config: self.udp_config,
-                runtime: self.nat44_udp.as_deref_mut(),
-            },
-            nat44_tcp: Nat44TcpServiceView {
-                config: self.tcp_config,
-                runtime: self.nat44_tcp.as_deref_mut(),
-            },
-            firewall: FirewallServiceView {
-                config: self.firewall_config,
-                runtime: self.firewall.as_deref_mut(),
-            },
-        })
+    fn active_status(&self) -> ActivePublicationStatus {
+        ActivePublicationStatus::ContinueOldIo
+    }
+
+    fn active(&mut self) -> FullServiceView<'_, 'storage> {
+        FullServiceView::new(
+            &self.tick_authority,
+            *self.snapshot,
+            self.resolution,
+            self.icmpv4_errors,
+            Nat44UdpServiceView::new(self.udp_config, self.nat44_udp.as_deref_mut()),
+            Nat44TcpServiceView::new(self.tcp_config, self.nat44_tcp.as_deref_mut()),
+            FirewallServiceView::new(self.firewall_config, self.firewall.as_deref_mut()),
+        )
     }
 }
 
-fn require_external_publication<P: FullServicePublication<'static, SimIo>>() {}
+fn require_external_publication<P: FullServicePublication<'static, Backend>>() {}
+
+fn copy_generation_bound_budgets(view: &FullServiceView<'_, '_>) -> TickBudgets {
+    view.tick_budgets()
+}
 
 #[test]
 fn external_adapter_compiles_with_paired_generation_and_exact_backend_guard() {
     require_external_publication::<ExternalPublication<'static, 'static>>();
+    let _accessor: fn(&FullServiceView<'_, '_>) -> TickBudgets = copy_generation_bound_budgets;
+}
+
+#[test]
+fn external_adapter_can_return_the_exact_rejected_candidate() {
+    let candidate = Box::new(47);
+    let candidate_pointer = core::ptr::from_ref(candidate.as_ref());
+    let rejection = PublicationRejection::new(candidate, "rejected");
+
+    assert_eq!(rejection.error(), &"rejected");
+    let (candidate, error) = rejection.into_parts();
+    assert_eq!(error, "rejected");
+    assert_eq!(candidate.as_ref(), &47);
+    assert_eq!(core::ptr::from_ref(candidate.as_ref()), candidate_pointer);
 }

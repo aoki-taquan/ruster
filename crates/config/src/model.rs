@@ -1,6 +1,6 @@
 use std::fmt;
 
-use serde::Deserialize;
+use serde::{de, Deserialize, Deserializer};
 
 /// A parsed configuration selected by its explicit schema version.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -14,6 +14,10 @@ pub enum VersionedConfig {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ConfigV1 {
     pub schema_version: u32,
+    /// Selects the packet I/O implementation. An omitted value is the
+    /// backwards-compatible AF_PACKET default.
+    #[serde(default)]
+    pub backend: Option<BackendV1>,
     #[serde(default)]
     pub interfaces: Vec<InterfaceV1>,
     #[serde(default)]
@@ -28,6 +32,154 @@ pub struct ConfigV1 {
     pub nat44: Option<Nat44V1>,
     pub firewall: Option<FirewallV1>,
     pub tick: Option<TickBudgetV1>,
+}
+
+/// Versioned packet-I/O backend selection.
+///
+/// The AF_XDP fields intentionally mirror the checked native setup seams:
+/// [`ruster_io_xdp_native::XdpResourceBuilder`], [`ruster_io_xdp_native::UmemConfig`],
+/// [`ruster_io_xdp_native::RingConfig`], [`ruster_io_xdp_native::ValidatedBindFlags`],
+/// [`ruster_io_xdp_native::XskMap`], and the XDP attach mode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BackendV1 {
+    /// Keep the existing AF_PACKET runtime behavior.
+    AfPacket,
+    /// Configure the two native AF_XDP queues used by the fixed LAN/WAN
+    /// aggregate. The common cold-path geometry is applied to each resource.
+    AfXdp {
+        /// Exactly two declared interfaces and their hardware queues. Each
+        /// entry becomes one independent `XdpResource` and one independent
+        /// XSKMAP/program/attachment. Equal queue ids are therefore valid when
+        /// they belong to different interfaces.
+        resources: Vec<AfXdpResourceV1>,
+        /// Maximum XSKMAP entries passed to `XskMap::new`.
+        xskmap_max_entries: u32,
+        /// Raw `sockaddr_xdp.sxdp_flags` checked by `ValidatedBindFlags::new`.
+        bind_flags: u16,
+        /// XDP execution mode selected for rtnetlink attachment.
+        attach_mode: XdpAttachModeV1,
+        /// UMEM geometry passed to `UmemConfig::new`.
+        umem: XdpUmemV1,
+        /// Four AF_XDP ring capacities passed to `RingConfig::new`.
+        rings: XdpRingsV1,
+    },
+}
+
+impl<'de> Deserialize<'de> for BackendV1 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // TOML's enum deserializer implements the externally tagged TOML
+        // representation, while the public configuration deliberately uses a
+        // stable `{ kind = ..., ... }` table. Decode that table as an ordinary
+        // struct first, then enforce the variant-specific field set here.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "kebab-case", deny_unknown_fields)]
+        struct RawBackend {
+            kind: BackendKind,
+            #[serde(default)]
+            resources: Option<Vec<AfXdpResourceV1>>,
+            #[serde(default, rename = "xskmap-max-entries")]
+            xskmap_max_entries: Option<u32>,
+            #[serde(default, rename = "bind-flags")]
+            bind_flags: Option<u16>,
+            #[serde(default, rename = "attach-mode")]
+            attach_mode: Option<XdpAttachModeV1>,
+            #[serde(default)]
+            umem: Option<XdpUmemV1>,
+            #[serde(default)]
+            rings: Option<XdpRingsV1>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "kebab-case")]
+        enum BackendKind {
+            AfPacket,
+            AfXdp,
+        }
+
+        let raw = RawBackend::deserialize(deserializer)?;
+        match raw.kind {
+            BackendKind::AfPacket => {
+                if raw.resources.is_some() {
+                    return Err(de::Error::unknown_field("resources", &["kind"]));
+                }
+                if raw.xskmap_max_entries.is_some() {
+                    return Err(de::Error::unknown_field("xskmap-max-entries", &["kind"]));
+                }
+                if raw.bind_flags.is_some() {
+                    return Err(de::Error::unknown_field("bind-flags", &["kind"]));
+                }
+                if raw.attach_mode.is_some() {
+                    return Err(de::Error::unknown_field("attach-mode", &["kind"]));
+                }
+                if raw.umem.is_some() {
+                    return Err(de::Error::unknown_field("umem", &["kind"]));
+                }
+                if raw.rings.is_some() {
+                    return Err(de::Error::unknown_field("rings", &["kind"]));
+                }
+                Ok(Self::AfPacket)
+            }
+            BackendKind::AfXdp => Ok(Self::AfXdp {
+                resources: raw
+                    .resources
+                    .ok_or_else(|| de::Error::missing_field("resources"))?,
+                xskmap_max_entries: raw
+                    .xskmap_max_entries
+                    .ok_or_else(|| de::Error::missing_field("xskmap-max-entries"))?,
+                bind_flags: raw
+                    .bind_flags
+                    .ok_or_else(|| de::Error::missing_field("bind-flags"))?,
+                attach_mode: raw
+                    .attach_mode
+                    .ok_or_else(|| de::Error::missing_field("attach-mode"))?,
+                umem: raw.umem.ok_or_else(|| de::Error::missing_field("umem"))?,
+                rings: raw.rings.ok_or_else(|| de::Error::missing_field("rings"))?,
+            }),
+        }
+    }
+}
+
+/// One logical interface/queue in the fixed AF_XDP pair.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AfXdpResourceV1 {
+    /// Name of a declared forwarding interface.
+    pub interface: String,
+    /// Hardware queue passed to `XdpResourceBuilder::new`.
+    pub queue_id: u32,
+}
+
+/// Raw versioned UMEM parameters for the AF_XDP backend.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct XdpUmemV1 {
+    pub frame_count: u32,
+    pub frame_size: u32,
+    pub headroom: u32,
+    pub rx_frames: u32,
+    pub generated_frames: u32,
+    pub raw_flags: u32,
+}
+
+/// Raw versioned AF_XDP ring capacities.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct XdpRingsV1 {
+    pub fill: u32,
+    pub rx: u32,
+    pub tx: u32,
+    pub completion: u32,
+}
+
+/// Versioned spelling of the native XDP attach mode.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum XdpAttachModeV1 {
+    Skb,
+    Drv,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

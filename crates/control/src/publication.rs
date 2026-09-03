@@ -617,6 +617,17 @@ impl ValidatedCandidate {
         self.storage_shape
     }
 
+    #[cfg(test)]
+    pub(crate) fn owned_box_pointers(&self) -> [usize; 5] {
+        [
+            self.forwarding.routes().as_ptr() as usize,
+            self.forwarding.interfaces().as_ptr() as usize,
+            self.forwarding.neighbors().as_ptr() as usize,
+            self.forwarding.local_ipv4().as_ptr() as usize,
+            self.firewall.rules().as_ptr() as usize,
+        ]
+    }
+
     /// Builds one O(1), lifetime-bound authority borrow.
     #[must_use]
     pub fn authority(&self) -> ValidatedAuthority<'_> {
