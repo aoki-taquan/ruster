@@ -947,6 +947,7 @@ fn run_path(path: &str) -> Result<(), String> {
             let io = AfPacketIo::open(afpacket_config).map_err(format_open_error)?;
             let (owner_binding, mut io) = bind_publication_backend(io)
                 .map_err(|_| "publication backend binding identity exhausted".to_owned())?;
+            let mut quiescence = ShutdownQuiescenceState::default();
             let mut publication =
                 publication
                     .bind_backend(owner_binding, &mut io)
@@ -961,6 +962,7 @@ fn run_path(path: &str) -> Result<(), String> {
                 input_generator,
                 &mut publication,
                 &mut io,
+                &mut quiescence,
                 ObservabilityBackend::AfPacket,
             );
             drop(publication);
@@ -1042,6 +1044,7 @@ fn run_xdp_backend<'storage>(
         }
     };
     let (pair, mut xdp_owner) = setup.into_parts();
+    let mut quiescence = ShutdownQuiescenceState::default();
     let (owner_binding, mut io) = match bind_publication_backend(pair) {
         Ok(bound) => bound,
         Err(_) => {
@@ -1060,7 +1063,7 @@ fn run_xdp_backend<'storage>(
             let error = format!("initial backend binding failed: {:?}", failure.error());
             let quiescence_result =
                 catch_shutdown_result("AF_XDP initial-binding publication quiescence", || {
-                    wait_for_quiescence(&mut io)
+                    wait_for_quiescence_once(&mut quiescence, &mut io)
                 });
             let publication_drop_result =
                 catch_shutdown_result("AF_XDP initial-binding publication drop", || {
@@ -1102,6 +1105,7 @@ fn run_xdp_backend<'storage>(
             input_generator,
             &mut publication,
             &mut io,
+            &mut quiescence,
             ObservabilityBackend::Xdp,
         )
     })) {
@@ -1113,12 +1117,12 @@ fn run_xdp_backend<'storage>(
         }
     };
 
-    // `run_backend` normally performs this check itself. Repeating it here
-    // is intentional: it also covers ControlListener::open failures and
-    // panics before run_backend reaches its ordered shutdown section. Every
-    // following phase is separately contained so a panic cannot skip detach.
+    // `run_backend` owns the normal shutdown wait. This fallback only performs
+    // it when the common runner panicked before entering its ordered shutdown
+    // section. The shared state reuses the same deadline and records an
+    // attempted wait, so this block cannot extend the shutdown timeout.
     let quiescence_result = catch_shutdown_result("AF_XDP publication quiescence", || {
-        wait_for_quiescence(&mut io)
+        wait_for_quiescence_once(&mut quiescence, &mut io)
     });
     let publication_drop_result = catch_shutdown_result("AF_XDP publication drop", || {
         drop(publication);
@@ -1574,6 +1578,7 @@ fn run_backend<'storage, I, E>(
     mut input_generator: PlanInputGenerator,
     publication: &mut BoundFullServicePublicationOwner<'storage, I>,
     io: &mut ruster_core::BoundPublicationBackend<I>,
+    quiescence: &mut ShutdownQuiescenceState,
     observability_backend: ObservabilityBackend,
 ) -> Result<ObservabilityActivitySnapshot, String>
 where
@@ -1857,11 +1862,12 @@ where
         println!("ruster: stop requested; waiting for publication quiescence");
         Ok(())
     });
-    // `run_backend` normally performs this check itself. Repeating it here
-    // is intentional: it also covers ControlListener::open failures and
-    // panics before run_backend reaches its ordered shutdown section.
-    let quiescence_result =
-        catch_shutdown_result("backend publication quiescence", || wait_for_quiescence(io));
+    // This is the single normal shutdown wait for the whole backend lifetime.
+    // The AF_XDP wrapper receives the same state and can therefore fall back
+    // only when this ordered section was never reached.
+    let quiescence_result = catch_shutdown_result("backend publication quiescence", || {
+        wait_for_quiescence_once(quiescence, io)
+    });
     let final_observability_result =
         catch_shutdown_result("final observability publication", || {
             let final_snapshot = publication.observability_snapshot(&mut recorder, ());
@@ -3162,13 +3168,53 @@ extern "C" fn signal_handler(signal: std::ffi::c_int) {
 }
 
 #[cfg(target_os = "linux")]
-fn wait_for_quiescence<I, E>(io: &mut ruster_core::BoundPublicationBackend<I>) -> Result<(), String>
+#[derive(Default)]
+struct ShutdownQuiescenceState {
+    deadline: Option<std::time::Instant>,
+    attempted: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl ShutdownQuiescenceState {
+    // The common runner calls this when its ordered shutdown begins. A caller
+    // that has to recover from a panic before then gets the same one-shot
+    // state and creates the fallback deadline at that recovery point.
+    fn begin_wait(&mut self) -> Option<std::time::Instant> {
+        if self.attempted {
+            return None;
+        }
+        self.attempted = true;
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(SHUTDOWN_QUIESCENCE_TIMEOUT_SECS);
+        self.deadline = Some(deadline);
+        Some(deadline)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_quiescence_once<I, E>(
+    state: &mut ShutdownQuiescenceState,
+    io: &mut ruster_core::BoundPublicationBackend<I>,
+) -> Result<(), String>
 where
     I: PacketIo<Error = E> + PublicationBackendAuthority + PublicationQuiescenceBackend<Error = E>,
     E: std::fmt::Debug,
 {
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(SHUTDOWN_QUIESCENCE_TIMEOUT_SECS);
+    let Some(deadline) = state.begin_wait() else {
+        return Ok(());
+    };
+    wait_for_quiescence(io, deadline)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_quiescence<I, E>(
+    io: &mut ruster_core::BoundPublicationBackend<I>,
+    deadline: std::time::Instant,
+) -> Result<(), String>
+where
+    I: PacketIo<Error = E> + PublicationBackendAuthority + PublicationQuiescenceBackend<Error = E>,
+    E: std::fmt::Debug,
+{
     loop {
         match io.try_publication_quiescence() {
             Ok(guard) => {
@@ -3400,6 +3446,59 @@ completion = 4
 "#,
         );
         source
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn af_xdp_wrapper_does_not_repeat_common_shutdown_quiescence_wait() {
+        let source = include_str!("../src/main.rs");
+        let wrapper = source
+            .split_once("fn run_xdp_backend<'storage>(")
+            .expect("the native AF_XDP wrapper must exist")
+            .1;
+        let common_call = wrapper
+            .split_once("let run_result =")
+            .expect("the AF_XDP wrapper must call the common backend runner")
+            .1
+            .split_once("}))")
+            .expect("the common backend runner call must be panic-contained")
+            .0;
+        let fallback = wrapper
+            .split_once("let run_result =")
+            .expect("the AF_XDP wrapper must call the common backend runner")
+            .1
+            .split_once("let publication_drop_result")
+            .expect("the AF_XDP wrapper must retain ordered cleanup")
+            .0;
+
+        assert!(
+            fallback.contains("wait_for_quiescence_once"),
+            "AF_XDP wrapper fallback must use the shared one-shot quiescence state"
+        );
+        assert!(
+            common_call.contains("&mut quiescence"),
+            "the common backend runner must receive the shared quiescence state"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_quiescence_state_creates_only_one_deadline() {
+        let mut state = ShutdownQuiescenceState::default();
+        let deadline = state
+            .begin_wait()
+            .expect("the first quiescence wait must create a deadline");
+
+        assert_eq!(state.deadline, Some(deadline));
+        assert!(
+            state.begin_wait().is_none(),
+            "a wrapper fallback must not start a second quiescence wait"
+        );
+        assert_eq!(state.deadline, Some(deadline));
     }
 
     #[cfg(target_os = "linux")]

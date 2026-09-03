@@ -44,20 +44,42 @@ Before starting, validate the configuration without requiring privileges:
 ## Permissions and networking
 
 The service runs with `User=ruster` and `Group=ruster`. Creating the
-AF_PACKET `SOCK_RAW` sockets requires `CAP_NET_RAW`, which the unit grants
-through `CapabilityBoundingSet` and `AmbientCapabilities`. It intentionally
-does not grant root or `CAP_NET_ADMIN`: the daemon resolves configured names
-with `if_nametoindex` and binds existing interfaces, but does not configure
-interfaces. The configured interfaces must exist and be visible in the
-service's host network namespace, and the service user must be able to read
-the configuration.
+AF_PACKET `SOCK_RAW` sockets require `CAP_NET_RAW`. The AF_XDP path also
+uses BPF objects and interface/XDP setup, so it requires `CAP_BPF` and
+`CAP_NET_ADMIN`; the unit grants exactly these three through both
+`CapabilityBoundingSet` and `AmbientCapabilities`. It intentionally does not
+grant `CAP_SYS_ADMIN` or a root-wide capability set. The configured interfaces
+must exist and be visible in the service's host network namespace, and the
+service user must be able to read the configuration.
 
-The unit keeps the default network namespace and does not restrict socket
-address families. This preserves AF_PACKET forwarding, libc interface-index
-lookup (which may use AF_NETLINK), and sd_notify's AF_UNIX datagram socket.
-`NoNewPrivileges`, `ProtectSystem`, `ProtectHome`, `PrivateTmp`, and the
-kernel-control restrictions are filesystem/process hardening that do not
-remove those networking operations.
+The unit uses the minimal address-family allow-list
+`AF_UNIX AF_PACKET AF_XDP AF_NETLINK`. `RestrictAddressFamilies=` is an
+allow-list unless prefixed with `~`, and systemd documents it as restricting
+families available through `socket(2)` (socket activation and `socketpair()`
+are separate cases). `AF_PACKET` and `AF_XDP` cover the two packet backends;
+`AF_NETLINK` is retained because libc's `if_nametoindex` may use netlink;
+`AF_UNIX` is required by the sd_notify datagram. systemd 255.4 in the
+development environment accepts all four names; target hosts must use a
+systemd build that recognizes `AF_XDP` and a kernel/libc stack that provides
+that family. `systemd.exec(5)` documents `RestrictAddressFamilies=` as
+available since systemd 211, while the exact family-name table is a systemd
+implementation compatibility point, so `systemd-analyze verify` must be run
+on the target host as described below.
+
+An AF_PACKET-only deployment can reduce the capability set to
+`CAP_NET_RAW` and the address-family list to `AF_UNIX AF_PACKET AF_NETLINK`
+in a separately maintained unit. This unit is intentionally shared by both
+backend choices: `backend.kind` is a runtime configuration value, and a
+single static unit cannot conditionally change its capability or address
+family sandbox after parsing that file. Keeping the AF_XDP permissions in the
+shared unit avoids a configuration-dependent startup failure; operators that
+need the tighter AF_PACKET-only boundary should install a distinct static
+unit and configuration contract.
+
+The unit keeps the default network namespace. `NoNewPrivileges`,
+`ProtectSystem`, `ProtectHome`, `PrivateTmp`, and the kernel-control
+restrictions are filesystem/process hardening that do not remove the listed
+networking operations.
 
 ## Lifecycle and watchdog
 
@@ -76,6 +98,15 @@ failures do not trigger an automatic restart. Automatic abnormal retries are
 also limited to three starts per 60 seconds by the unit's start limit.
 
 ## Verification
+
+Run the repository's static unit contract test from the checkout:
+
+```sh
+packaging/systemd/test-check-ruster-service.sh
+```
+
+It checks the exact capability and address-family values and rejects
+`CAP_SYS_ADMIN`; it does not silently skip when the unit is missing.
 
 Run the following on the target host after installing the unit:
 

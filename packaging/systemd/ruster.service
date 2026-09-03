@@ -43,20 +43,21 @@ KillSignal=SIGTERM
 # margin.  Its heartbeat is tied to successful tick-loop progress.
 WatchdogSec=30s
 
-# AF_PACKET SOCK_RAW needs only CAP_NET_RAW.  No CAP_NET_ADMIN or root-wide
-# capability set is granted; if_nametoindex and notify's AF_UNIX datagram do
-# not require additional capabilities.
+# AF_PACKET SOCK_RAW needs CAP_NET_RAW.  The AF_XDP setup also needs
+# CAP_BPF for its BPF objects and CAP_NET_ADMIN for interface/XDP setup.
+# Grant only those three capabilities; in particular, do not grant
+# an unrestricted administrative capability set.
 User=ruster
 Group=ruster
 # The default control socket is created below /run/ruster.  Let systemd create
 # the runtime directory with the same owner/group before ExecStart.
 RuntimeDirectory=ruster
 RuntimeDirectoryMode=0750
-CapabilityBoundingSet=CAP_NET_RAW
-AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_BPF CAP_NET_ADMIN CAP_NET_RAW
 
 # Prevent privilege gains through later execve calls while retaining the
-# explicitly assigned ambient CAP_NET_RAW needed by the packet backend.
+# explicitly assigned ambient capabilities needed by the selected backend.
 NoNewPrivileges=yes
 
 # The daemon reads its config and executable but does not need to modify the
@@ -78,9 +79,11 @@ RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 
-# Deliberately omit RestrictAddressFamilies: the backend needs AF_PACKET, the
-# notify protocol needs AF_UNIX, and libc's if_nametoindex may use AF_NETLINK.
-# An incomplete allow-list would make a valid interface bind fail.
+# Keep only the families used by either configured backend and the service
+# plumbing: AF_PACKET/AF_XDP for packet I/O, AF_NETLINK for interface-index
+# lookup, and AF_UNIX for sd_notify.  systemd's RestrictAddressFamilies is an
+# allow-list when not prefixed with '~'; see packaging/systemd/README.md.
+RestrictAddressFamilies=AF_UNIX AF_PACKET AF_XDP AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target
