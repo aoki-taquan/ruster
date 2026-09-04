@@ -181,3 +181,175 @@ pub(crate) fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     let word = bytes.get(offset..end)?;
     Some(u16::from_be_bytes([word[0], word[1]]))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::DropReason;
+
+    fn ipv4_frame_at_ethernet_minimum() -> Vec<u8> {
+        let mut frame = vec![0; ETHERNET_HEADER_LEN + IPV4_MIN_HEADER_LEN];
+        frame[12..14].copy_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+        frame[14] = 0x45;
+        frame[16..18].copy_from_slice(&(IPV4_MIN_HEADER_LEN as u16).to_be_bytes());
+        frame[22] = 64;
+        frame[23] = 17;
+        frame[26..30].copy_from_slice(&[192, 0, 2, 1]);
+        frame[30..34].copy_from_slice(&[198, 51, 100, 2]);
+        let checksum = crate::ipv4_header_checksum(&frame[14..]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        frame
+    }
+
+    fn arp_frame() -> Vec<u8> {
+        let mut frame = vec![0; ETHERNET_HEADER_LEN + ARP_PACKET_LEN];
+        frame[12..14].copy_from_slice(&ARP_ETHERTYPE.to_be_bytes());
+        frame[14..16].copy_from_slice(&1_u16.to_be_bytes());
+        frame[16..18].copy_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+        frame[18] = 6;
+        frame[19] = 4;
+        frame[20..22].copy_from_slice(&1_u16.to_be_bytes());
+        frame[22..28].copy_from_slice(&[0x02, 0, 0, 0, 0, 1]);
+        frame[28..32].copy_from_slice(&[192, 0, 2, 1]);
+        frame[32..38].copy_from_slice(&[0, 0, 0, 0, 0, 0]);
+        frame[38..42].copy_from_slice(&[192, 0, 2, 2]);
+        frame
+    }
+
+    #[test]
+    fn ipv4_exact_ethernet_header_is_not_treated_as_ethernet_truncated() {
+        // Protects the strict Ethernet lower-bound check from `==` and `<=` mutants.
+        let mut frame = vec![0; ETHERNET_HEADER_LEN];
+        frame[12..14].copy_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+
+        assert_eq!(
+            validate_ipv4_frame(&frame),
+            Err(DropReason::Ipv4HeaderTruncated)
+        );
+    }
+
+    #[test]
+    fn ipv4_minimum_available_header_is_accepted() {
+        // Protects the IPv4 available-length lower bound from `==` and `<=` mutants.
+        let frame = ipv4_frame_at_ethernet_minimum();
+
+        let validated = validate_ipv4_frame(&frame).unwrap();
+        assert_eq!(validated.header_len, IPV4_MIN_HEADER_LEN);
+        assert_eq!(validated.total_len, IPV4_MIN_HEADER_LEN);
+    }
+
+    #[test]
+    fn ipv4_validation_reports_the_checksum_field_at_its_header_offset() {
+        // Protects the checksum-field offset from the `+` to `-` mutant.
+        let frame = ipv4_frame_at_ethernet_minimum();
+        let expected_checksum = u16::from_be_bytes([frame[24], frame[25]]);
+        assert_ne!(expected_checksum, 0);
+
+        let validated = validate_ipv4_frame(&frame).unwrap();
+        assert_eq!(validated.checksum, expected_checksum);
+    }
+
+    #[test]
+    fn arp_exact_ethernet_header_is_reported_as_an_incomplete_arp_frame() {
+        // Protects the Ethernet lower-bound check from the `==` and `<=` mutants.
+        let mut frame = vec![0; ETHERNET_HEADER_LEN];
+        frame[12..14].copy_from_slice(&ARP_ETHERTYPE.to_be_bytes());
+
+        assert_eq!(validate_arp(&frame), Err(DropReason::ArpPacketTruncated));
+    }
+
+    #[test]
+    fn arp_longer_than_ethernet_header_reaches_the_arp_length_check() {
+        // Protects the Ethernet lower-bound check from the `>` mutant.
+        let mut frame = vec![0; ETHERNET_HEADER_LEN + 1];
+        frame[12..14].copy_from_slice(&ARP_ETHERTYPE.to_be_bytes());
+
+        assert_eq!(validate_arp(&frame), Err(DropReason::ArpPacketTruncated));
+    }
+
+    #[test]
+    fn arp_exact_wire_length_is_accepted() {
+        // Protects the exact ARP frame-size boundary from the `==` and `<=` mutants,
+        // and protects the ARP_FRAME_LEN addition from replacement with multiplication.
+        let frame = arp_frame();
+
+        assert_eq!(validate_arp(&frame).unwrap().opcode, ArpOpcode::Request);
+    }
+
+    #[test]
+    fn arp_short_frame_is_rejected_before_header_value_parsing() {
+        // Protects the short-frame branch from the `>` mutant at the ARP length check.
+        let mut frame = vec![0; ETHERNET_HEADER_LEN + 6];
+        frame[12..14].copy_from_slice(&ARP_ETHERTYPE.to_be_bytes());
+
+        assert_eq!(validate_arp(&frame), Err(DropReason::ArpPacketTruncated));
+    }
+
+    #[test]
+    fn arp_rejects_an_unsupported_hardware_type() {
+        // Protects the ARP hardware-type inequality from replacement with `==`.
+        let mut frame = arp_frame();
+        frame[14..16].copy_from_slice(&2_u16.to_be_bytes());
+
+        assert_eq!(
+            validate_arp(&frame),
+            Err(DropReason::ArpHardwareTypeUnsupported)
+        );
+    }
+
+    #[test]
+    fn arp_rejects_an_unsupported_ether_type() {
+        // Protects the ARP EtherType inequality from replacement with `==`.
+        let mut frame = arp_frame();
+        frame[12..14].copy_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+
+        assert_eq!(validate_arp(&frame), Err(DropReason::UnsupportedEtherType));
+    }
+
+    #[test]
+    fn arp_rejects_an_unsupported_protocol_type() {
+        // Protects the ARP protocol-type inequality from replacement with `==`.
+        let mut frame = arp_frame();
+        frame[16..18].copy_from_slice(&0x0801_u16.to_be_bytes());
+
+        assert_eq!(
+            validate_arp(&frame),
+            Err(DropReason::ArpProtocolTypeUnsupported)
+        );
+    }
+
+    #[test]
+    fn arp_rejects_an_unsupported_hardware_address_length() {
+        // Protects the ARP hardware-length inequality from replacement with `==`.
+        let mut frame = arp_frame();
+        frame[18] = 5;
+
+        assert_eq!(
+            validate_arp(&frame),
+            Err(DropReason::ArpHardwareLengthUnsupported)
+        );
+    }
+
+    #[test]
+    fn arp_rejects_an_unsupported_protocol_address_length() {
+        // Protects the ARP protocol-length inequality from replacement with `==`.
+        let mut frame = arp_frame();
+        frame[19] = 5;
+
+        assert_eq!(
+            validate_arp(&frame),
+            Err(DropReason::ArpProtocolLengthUnsupported)
+        );
+    }
+
+    #[test]
+    fn arp_request_validator_accepts_a_request_opcode() {
+        // Protects the request-only opcode comparison from `==` to `!=`.
+        let frame = arp_frame();
+
+        assert_eq!(
+            validate_arp_request(&frame).unwrap().opcode,
+            ArpOpcode::Request
+        );
+    }
+}

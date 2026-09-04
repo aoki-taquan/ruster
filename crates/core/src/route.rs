@@ -194,4 +194,23 @@ mod tests {
             assert!(!route.is_prefix_directed_broadcast(ip([198, 51, 100, 0])));
         }
     }
+
+    #[test]
+    fn unspecified_address_is_only_all_zeroes() {
+        // Protects Ipv4Address::is_unspecified from reporting every address as unspecified.
+        assert!(ip([0, 0, 0, 0]).is_unspecified());
+        assert!(!ip([0, 0, 0, 1]).is_unspecified());
+    }
+
+    #[test]
+    fn slash_thirty_prefix_has_a_directed_broadcast() {
+        // Protects the > 30 boundary so a /30 directed broadcast is still recognized.
+        let route = Route::new(ip([198, 51, 100, 0]), 30, IfId(1), None).unwrap();
+
+        assert!(route.is_prefix_directed_broadcast(ip([198, 51, 100, 3])));
+        assert!(!route.is_prefix_directed_broadcast(ip([198, 51, 100, 2])));
+    }
+
+    // The | -> ^ mutant is equivalent: Route::new rejects host bits in the prefix,
+    // so prefix.0 and !mask never share a set bit and OR equals XOR here.
 }
