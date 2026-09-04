@@ -3220,10 +3220,10 @@ mod tests {
     };
 
     use super::{
-        poll_timeout_ms, AfPacketError, AfPacketIoWithOps, LinuxOps, MmapRegion, PacketOps,
-        PacketRingResources, PacketSocket, PollFd, PollWaitResult, SockaddrLl, TxCompletionError,
-        TxCompletionReport, TxEngine, TxSubmitError, AF_PACKET, ETH_P_ALL, POLLIN, SOCK_CLOEXEC,
-        SOCK_RAW,
+        poll_timeout_ms, record_quiescence_error, AfPacketError, AfPacketIoWithOps, LinuxOps,
+        MmapRegion, PacketOps, PacketRingResources, PacketSocket, PollFd, PollWaitResult,
+        SockaddrLl, TxCompletionError, TxCompletionReport, TxEngine, TxSubmitError, AF_PACKET,
+        ETH_P_ALL, POLLIN, SOCK_CLOEXEC, SOCK_RAW,
     };
     use crate::{
         boundary::{ColdRingMetadata, CombinedRingExtents},
@@ -3663,6 +3663,38 @@ mod tests {
 
     fn install_rx_packets(ops: &ScriptedOps, mapping_index: usize, payloads: &[&[u8]]) {
         install_rx_packets_at(ops, mapping_index, 0, payloads);
+    }
+
+    fn populate_rx_block(bytes: &mut [u8], block_index: usize, payloads: &[&[u8]]) {
+        assert!(!payloads.is_empty(), "non-empty block fixture");
+        let block_start = block_index * 4_096;
+        let block = &mut bytes[block_start..block_start + 4_096];
+        block.fill(0);
+        write_u32(block, 0, 2);
+        write_u32(block, 4, 48);
+        write_u32(block, 8, TP_STATUS_USER);
+        write_u32(
+            block,
+            12,
+            u32::try_from(payloads.len()).expect("small packet fixture"),
+        );
+        write_u32(block, 16, 64);
+        write_u32(block, 20, 4_096);
+
+        for (index, payload) in payloads.iter().enumerate() {
+            let packet_offset = 64 + index * 256;
+            let next_offset = if index + 1 == payloads.len() { 0 } else { 256 };
+            write_u32(block, packet_offset, next_offset);
+            let payload_len = u32::try_from(payload.len()).expect("small packet fixture");
+            write_u32(block, packet_offset + 12, payload_len);
+            write_u32(block, packet_offset + 16, payload_len);
+            write_u32(block, packet_offset + 20, TP_STATUS_USER);
+            write_u16(block, packet_offset + 24, 82);
+            write_u16(block, packet_offset + 26, 96);
+            let data_start = packet_offset + 82;
+            let data_end = data_start + payload.len();
+            block[data_start..data_end].copy_from_slice(payload);
+        }
     }
 
     fn install_empty_timeout(ops: &ScriptedOps, mapping_index: usize) {
@@ -5734,5 +5766,562 @@ mod tests {
         let after = allocation_count();
         assert_eq!(after, before);
         assert_eq!(kicks.get(), 10_000);
+    }
+
+    #[test]
+    fn status33_timeout_block_acquire_release_is_explicitly_terminal() {
+        let mut backing = timeout_empty_ring();
+        // SAFETY: backing remains alive and is accessed only through this
+        // borrowed mapping for the duration of the block.
+        let mapping = unsafe {
+            MmapRegion::borrowed_for_test(
+                NonNull::new(backing.0.as_mut_ptr()).expect("status-33 backing"),
+                backing.0.len(),
+                LinuxOps,
+            )
+        };
+
+        // This protects the TPACKET_V3 empty-retirement interpretation:
+        // USER|BLK_TMO is acquired as an empty userspace block, then its
+        // status is published back to KERNEL exactly once.
+        let mut block = mapping
+            .view()
+            .acquire_user_block(rx_layout(), 0)
+            .expect("status-33 timeout block");
+        assert_eq!(block.packet_count, 0);
+        assert_eq!(block.ownership.owner(), RxOwnership::User);
+        assert!(!block.has_next_packet());
+        block.release().expect("status-33 release");
+        drop(block);
+        assert_eq!(mapping.view().load_status_acquire(8), Ok(TP_STATUS_KERNEL));
+    }
+
+    #[test]
+    fn status33_timeout_block_is_quiescent_for_bind_and_continues_io() {
+        let ops = ScriptedOps::new(None);
+        let mut io = AfPacketIo::open_with_ops(validated_config(&[IfId(7)]), ops.clone())
+            .expect("scripted packet IO");
+        install_empty_timeout(&ops, 0);
+
+        // This protects publication binding: a kernel-delivered empty timeout
+        // is not a userspace alias while no RX batch is active.
+        assert_eq!(io.check_publication_quiescence(), Ok(()));
+        assert_eq!(
+            io.current_io_disposition(),
+            PublicationQuiescenceDisposition::ContinueOldIo
+        );
+
+        let (_owner, mut bound) =
+            bind_publication_backend(io).expect("status-33 publication binding");
+        let guard = bound
+            .try_publication_quiescence()
+            .expect("status-33 block is quiescent");
+        drop(guard);
+        assert_eq!(
+            bound.current_io_disposition(),
+            PublicationQuiescenceDisposition::ContinueOldIo
+        );
+
+        // This protects the continuation path: the same timeout block remains
+        // receivable and is recycled before the following receive call.
+        let mut batch = bound.receive(1).expect("status-33 receive");
+        assert!(batch.next_packet().is_none());
+        let completion = batch.finish();
+        assert!(completion.error.is_none());
+        assert!(completion.invariants_hold());
+        assert_eq!(ops.mapping_u32(0, 8), TP_STATUS_KERNEL);
+
+        let mut next = bound.receive(1).expect("I/O continues after status-33");
+        assert!(next.next_packet().is_none());
+        let next_completion = next.finish();
+        assert!(next_completion.error.is_none());
+        assert!(next_completion.invariants_hold());
+    }
+
+    #[test]
+    fn quiescence_rejects_timeout_bit_without_user_bit() {
+        let ops = ScriptedOps::new(None);
+        let mut io = AfPacketIo::open_with_ops(validated_config(&[IfId(7)]), ops.clone())
+            .expect("scripted packet IO");
+        install_rx_packets(&ops, 0, &[&[0x31; 60]]);
+        let status = TP_STATUS_BLK_TMO;
+        ops.mutate_mapping(0, |bytes| write_u32(bytes, 8, status));
+
+        // This protects both sides of the ownership predicate: BLK_TMO by
+        // itself is not USER ownership and must be rejected as invalid.
+        assert_eq!(
+            io.check_publication_quiescence(),
+            Err(AfPacketError::Quiescence(
+                PublicationQuiescenceError::RxBlockInvalidStatus {
+                    interface: IfId(7),
+                    block_index: 0,
+                    status,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn quiescence_reports_unknown_user_bit_as_first_error() {
+        let ops = ScriptedOps::new(None);
+        let mut io = AfPacketIo::open_with_ops(validated_config(&[IfId(7)]), ops.clone())
+            .expect("scripted packet IO");
+        install_rx_packets(&ops, 0, &[&[0x32; 60]]);
+        let status = TP_STATUS_USER | 0x80;
+        ops.mutate_mapping(0, |bytes| write_u32(bytes, 8, status));
+
+        // This protects fail-closed classification of an unknown USER status
+        // and the first-error rule before the TX-frame scan can add errors.
+        let error = io
+            .check_publication_quiescence()
+            .expect_err("unknown USER status must be reported");
+        assert_eq!(
+            error,
+            AfPacketError::Quiescence(PublicationQuiescenceError::RxBlockUser {
+                interface: IfId(7),
+                block_index: 0,
+                status,
+            })
+        );
+        assert_eq!(
+            <AfPacketIo as PublicationQuiescenceBackend>::quiescence_error_disposition(&error),
+            PublicationQuiescenceDisposition::SkipIo
+        );
+    }
+
+    #[test]
+    fn quiescence_requires_inflight_for_tx_completion_pending() {
+        let ops = ScriptedOps::new(None);
+        let mut io = AfPacketIo::open_with_ops(validated_config(&[IfId(7)]), ops.clone())
+            .expect("scripted packet IO");
+        let mut tx = io.engine.begin_batch();
+        tx.submit(IfId(7), &[0x33; 64]).expect("TX frame");
+        tx.finish();
+        io.engine.states[0].in_flight = 0;
+
+        // This protects the `in_flight != 0` guard: a SEND_REQUEST frame with
+        // no endpoint accounting is a metadata mismatch, not a completion.
+        assert_eq!(
+            io.check_publication_quiescence(),
+            Err(AfPacketError::Quiescence(
+                PublicationQuiescenceError::TxOwnershipMismatch {
+                    interface: IfId(7),
+                    frame_index: 0,
+                    status: TP_STATUS_SEND_REQUEST,
+                    ownership: TxOwnership::SendRequest,
+                    in_flight: 0,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn quiescence_error_recording_promotes_non_pending_error() {
+        let pending = PublicationQuiescenceError::TxCompletionPending {
+            interface: IfId(7),
+            frame_index: 0,
+            status: TP_STATUS_SEND_REQUEST,
+            ownership: TxOwnership::SendRequest,
+        };
+        let mismatch = PublicationQuiescenceError::TxOwnershipMismatch {
+            interface: IfId(7),
+            frame_index: 1,
+            status: TP_STATUS_SEND_REQUEST,
+            ownership: TxOwnership::Available,
+            in_flight: 1,
+        };
+        let mut first_error = None;
+
+        // This protects the fail-closed priority rule: a later ownership
+        // mismatch must replace a previously observed asynchronous pending
+        // completion.
+        record_quiescence_error(&mut first_error, pending);
+        record_quiescence_error(&mut first_error, mismatch);
+        assert_eq!(first_error, Some(mismatch));
+    }
+
+    #[test]
+    fn quiescence_classifier_only_continues_tx_completion_pending() {
+        let pending = AfPacketError::Quiescence(PublicationQuiescenceError::TxCompletionPending {
+            interface: IfId(7),
+            frame_index: 0,
+            status: TP_STATUS_SEND_REQUEST,
+            ownership: TxOwnership::SendRequest,
+        });
+        let invalid = AfPacketError::Quiescence(PublicationQuiescenceError::RxBlockUser {
+            interface: IfId(7),
+            block_index: 0,
+            status: TP_STATUS_USER | 0x80,
+        });
+
+        // This protects the publication policy boundary: only an already
+        // asynchronous TX completion may continue the old publication.
+        assert_eq!(
+            <super::AfPacketIo as PublicationQuiescenceBackend>::quiescence_error_disposition(
+                &pending
+            ),
+            PublicationQuiescenceDisposition::ContinueOldIo
+        );
+        assert_eq!(
+            <super::AfPacketIo as PublicationQuiescenceBackend>::quiescence_error_disposition(
+                &invalid
+            ),
+            PublicationQuiescenceDisposition::SkipIo
+        );
+    }
+
+    #[test]
+    fn tx_submit_paths_accept_exact_configured_maximum() {
+        let ops = ScriptedOps::new(None);
+        let mut engine =
+            TxEngine::open_with_ops(validated_config(&[IfId(7)]), ops).expect("TX engine");
+        let payload = [0x34; 1_514];
+
+        // This protects the inclusive maximum-frame boundary for the copied
+        // TX path.
+        let mut batch = engine.begin_batch();
+        let submission = batch
+            .submit(IfId(7), &payload)
+            .expect("exact maximum copied frame");
+        assert_eq!(batch.finish().accepted, 1);
+        set_engine_tx_status(&mut engine, 0, submission.frame_index, TP_STATUS_AVAILABLE);
+        engine
+            .scan_completions(IfId(7), 1)
+            .expect("copied maximum frame completion");
+
+        // This protects the same inclusive boundary for the backend-owned
+        // generated-slot reservation path.
+        let mut generated = engine.begin_generated(IfId(7));
+        let mut lease = generated
+            .allocate(payload.len())
+            .expect("exact maximum generated frame");
+        assert_eq!(lease.bytes_mut().len(), payload.len());
+        lease.bytes_mut().copy_from_slice(&payload);
+        lease.commit();
+        let completion = generated.finish();
+        assert_eq!(completion.accepted, 1);
+        assert_eq!(completion.rejected, 0);
+    }
+
+    #[test]
+    fn completion_scan_rejects_sending_with_wrong_metadata_owner() {
+        let ops = ScriptedOps::new(None);
+        let mut engine =
+            TxEngine::open_with_ops(validated_config(&[IfId(7)]), ops).expect("TX engine");
+        let mut batch = engine.begin_batch();
+        let submission = batch.submit(IfId(7), &[0x35; 64]).expect("TX frame");
+        batch.finish();
+        engine.ports[0]
+            .tx_metadata_mut(submission.frame_index)
+            .ownership
+            .kernel_reject_format()
+            .expect("test wrong-format ownership");
+        set_engine_tx_status(&mut engine, 0, submission.frame_index, TP_STATUS_SENDING);
+
+        // This protects the non-SendRequest branch: SENDING paired with a
+        // WrongFormat model must be rejected, not silently treated as idle.
+        assert_eq!(
+            engine.scan_completions(IfId(7), 1),
+            Err(TxCompletionError::UnexpectedOwnership {
+                frame_index: submission.frame_index,
+                ownership: TxOwnership::WrongFormat,
+            })
+        );
+    }
+
+    #[test]
+    fn receive_scans_all_tx_completions_before_starting_batch() {
+        let ops = ScriptedOps::new(None);
+        let mut io = AfPacketIo::open_with_ops(validated_config(&[IfId(7)]), ops.clone())
+            .expect("scripted packet IO");
+        let mut tx = io.engine.begin_batch();
+        tx.submit(IfId(7), &[0x3a; 64]).expect("in-flight TX frame");
+        tx.finish();
+        let status_offset = validated_port().tx_map_offset() + 20;
+        ops.mutate_mapping(0, |bytes| write_u32(bytes, status_offset, 0x80));
+
+        // This protects the receive ordering: an invalid TX status is exposed
+        // as a completion error before an RX batch can be returned.
+        let error = match io.receive(0) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid TX status must prevent an RX batch"),
+        };
+        assert_eq!(
+            error,
+            AfPacketError::Completion {
+                interface: IfId(7),
+                source: TxCompletionError::InvalidStatus { status: 0x80 },
+            }
+        );
+    }
+
+    #[test]
+    fn rx_cursor_commits_normalized_round_robin_position() {
+        let ops = ScriptedOps::new(None);
+        let mut io = AfPacketIo::open_with_ops(validated_config(&[IfId(7), IfId(8)]), ops.clone())
+            .expect("two-port packet IO");
+        install_rx_packets(&ops, 0, &[&[0x36; 60]]);
+        install_rx_packets(&ops, 1, &[&[0x37; 60]]);
+
+        // This protects both RX cursors: ownership transfer from port 0 must
+        // commit the next-port cursor to port 1, and then wrap to port 0.
+        let mut first = io.receive(1).expect("port 0 receive");
+        first
+            .next_packet()
+            .expect("port 0 packet")
+            .recycle(DropReason::RouteMiss);
+        first.finish();
+        assert_eq!(io.rx.next_port, 1);
+
+        let mut second = io.receive(1).expect("port 1 receive");
+        assert_eq!(
+            second.next_packet().expect("port 1 packet").ingress(),
+            IfId(8)
+        );
+        second.next_packet();
+        // The lease above is intentionally abandoned by the batch cleanup;
+        // the cursor assertion is independent of packet accounting.
+        second.finish();
+        assert_eq!(io.rx.next_port, 0);
+    }
+
+    #[test]
+    fn packet_data_rejects_user_block_with_no_remaining_packets() {
+        let mut backing = one_packet_ring(0);
+        // SAFETY: backing remains alive and exclusively accessed through the
+        // borrowed mapping below.
+        let mapping = unsafe {
+            MmapRegion::borrowed_for_test(
+                NonNull::new(backing.0.as_mut_ptr()).expect("packet backing"),
+                backing.0.len(),
+                LinuxOps,
+            )
+        };
+        let mut block = mapping
+            .view()
+            .acquire_user_block(rx_layout(), 0)
+            .expect("one-packet block");
+        {
+            let packet = block.packet_data().expect("packet lease");
+            assert_eq!(packet.len(), 60);
+        }
+        block.complete_packet().expect("packet completion");
+        let expected = Err(MappingAccessError::Ownership(
+            crate::OwnershipError::RxReleaseWhileKernelOwned,
+        ));
+
+        // This protects the ownership short-circuit: USER ownership with no
+        // remaining packets must not re-read a stale descriptor.
+        assert_eq!(block.packet_data(), expected);
+        block.release().expect("empty user block release");
+        assert_eq!(block.packet_data(), expected);
+    }
+
+    #[test]
+    fn pending_packet_data_requires_pending_lease_and_preserves_bytes() {
+        let mut backing = one_packet_ring(0);
+        // SAFETY: backing remains alive and exclusively accessed through the
+        // borrowed mapping below.
+        let mapping = unsafe {
+            MmapRegion::borrowed_for_test(
+                NonNull::new(backing.0.as_mut_ptr()).expect("pending backing"),
+                backing.0.len(),
+                LinuxOps,
+            )
+        };
+        let mut block = mapping
+            .view()
+            .acquire_user_block(rx_layout(), 0)
+            .expect("one-packet block");
+
+        // This protects the no-lease error and the pending flag transition.
+        assert_eq!(
+            block.pending_packet_data(),
+            Err(MappingAccessError::PacketNotBorrowed)
+        );
+        assert!(!block.is_pending());
+        {
+            let packet = block.packet_data().expect("packet data");
+            assert_eq!(packet, &[0xa5; 60]);
+        }
+        assert!(block.is_pending());
+        let pending = block.pending_packet_data().expect("pending packet data");
+        assert_eq!(pending, &[0xa5; 60]);
+        let _ = pending;
+        block.complete_packet().expect("packet completion");
+        block.release().expect("block release");
+    }
+
+    #[test]
+    fn has_next_packet_requires_remaining_unborrowed_user_packet() {
+        let mut backing = one_packet_ring(0);
+        // SAFETY: backing remains alive and exclusively accessed through the
+        // borrowed mapping below.
+        let mapping = unsafe {
+            MmapRegion::borrowed_for_test(
+                NonNull::new(backing.0.as_mut_ptr()).expect("next-packet backing"),
+                backing.0.len(),
+                LinuxOps,
+            )
+        };
+        let mut block = mapping
+            .view()
+            .acquire_user_block(rx_layout(), 0)
+            .expect("one-packet block");
+
+        // This protects the three-state predicate: ownership, remaining
+        // packets, and the absence of an outstanding byte borrow are all
+        // required before another packet can be exposed.
+        assert!(block.has_next_packet());
+        {
+            let _packet = block.packet_data().expect("packet data");
+        }
+        assert!(!block.has_next_packet());
+        block.complete_packet().expect("packet completion");
+        assert!(!block.has_next_packet());
+        block.release().expect("block release");
+        assert!(!block.has_next_packet());
+    }
+
+    #[test]
+    fn complete_remaining_advances_packet_index_for_all_unleased_packets() {
+        let mut backing = AlignedRing([0; 4_096]);
+        populate_rx_block(&mut backing.0, 0, &[&[0x38; 60], &[0x39; 60]]);
+        // SAFETY: backing remains alive and exclusively accessed through the
+        // borrowed mapping below.
+        let mapping = unsafe {
+            MmapRegion::borrowed_for_test(
+                NonNull::new(backing.0.as_mut_ptr()).expect("remaining backing"),
+                backing.0.len(),
+                LinuxOps,
+            )
+        };
+        let mut block = mapping
+            .view()
+            .acquire_user_block(rx_layout(), 0)
+            .expect("two-packet block");
+        block
+            .complete_remaining()
+            .expect("complete unleased packets");
+
+        // This protects the discard loop's monotonic packet cursor and its
+        // exact two-completion count.
+        assert_eq!(block.packet_index, 2);
+        assert!(!block.has_next_packet());
+    }
+
+    #[test]
+    fn release_discarding_completes_nonpending_packets_and_reports_store_failure() {
+        let mut backing = one_packet_ring(0);
+        // SAFETY: backing remains alive and exclusively accessed through the
+        // borrowed mapping below.
+        let mapping = unsafe {
+            MmapRegion::borrowed_for_test(
+                NonNull::new(backing.0.as_mut_ptr()).expect("discard backing"),
+                backing.0.len(),
+                LinuxOps,
+            )
+        };
+
+        // This protects the non-pending cleanup branch: it must complete the
+        // packet before releasing the block.
+        let mut block = mapping
+            .view()
+            .acquire_user_block(rx_layout(), 0)
+            .expect("first discard block");
+        assert_eq!(block.release_discarding(), Ok(()));
+        drop(block);
+        assert_eq!(mapping.view().load_status_acquire(8), Ok(TP_STATUS_KERNEL));
+
+        mapping
+            .view()
+            .store_status_release(8, TP_STATUS_USER)
+            .expect("rearm discard block");
+        let mut block = mapping
+            .view()
+            .acquire_user_block(rx_layout(), 0)
+            .expect("second discard block");
+        block.status_offset = backing.0.len();
+
+        // This protects error propagation: a failed final status publication
+        // must remain visible even after ownership cleanup has completed.
+        assert_eq!(
+            block.release_discarding(),
+            Err(MappingAccessError::OffsetOutOfBounds {
+                offset: backing.0.len(),
+                length: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn mapping_view_accepts_an_exact_ring_endpoint() {
+        let port = validated_port();
+        let extents = CombinedRingExtents::for_port(port).expect("validated extents");
+        let mut backing = AlignedCombinedRing([0; 12_289]);
+        // SAFETY: backing remains alive and exclusively accessed through the
+        // borrowed mapping below.
+        let mapping = unsafe {
+            MmapRegion::borrowed_for_test(
+                NonNull::new(backing.0.as_mut_ptr()).expect("endpoint backing"),
+                port.combined_map_len(),
+                LinuxOps,
+            )
+        };
+        let offset = extents.rx().len() - 16;
+
+        // This protects the inclusive end boundary of a checked ring range.
+        let address = mapping
+            .ring_address(extents, RingKind::Rx, offset, 16, 1)
+            .expect("exact RX endpoint");
+        assert_eq!(address, backing.0.as_mut_ptr().wrapping_add(offset));
+    }
+
+    #[test]
+    fn mmap_map_rejects_zero_and_address_space_overflow_but_accepts_limit() {
+        let ops = QuietOps {
+            base: NonNull::dangling(),
+            kicks: Rc::new(Cell::new(0)),
+        };
+        let too_large = (isize::MAX as usize)
+            .checked_add(1)
+            .expect("usize can represent isize max plus one");
+
+        // This protects both invalid-length branches and the exact
+        // isize::MAX boundary before a backend map operation is attempted.
+        assert!(MmapRegion::map(ops.clone(), 71, 0).is_err());
+        assert!(MmapRegion::map(ops.clone(), 71, too_large).is_err());
+        let exact = MmapRegion::map(ops, 71, isize::MAX as usize)
+            .expect("isize::MAX mapping length is representable");
+        drop(exact);
+    }
+
+    #[test]
+    fn poll_result_requires_nonzero_result_and_polin_bit() {
+        let no_rx = [PollFd {
+            fd: 71,
+            events: POLLIN,
+            revents: 0x0008,
+        }];
+        let rx = [PollFd {
+            fd: 71,
+            events: POLLIN,
+            revents: POLLIN,
+        }];
+
+        // This protects all poll-result gates: a zero result is a timeout,
+        // non-POLLIN wakeups are not RX work, and POLLIN is readiness.
+        assert_eq!(
+            super::poll_result_from_revents(0, &rx),
+            PollWaitResult::TimedOut
+        );
+        assert_eq!(
+            super::poll_result_from_revents(1, &no_rx),
+            PollWaitResult::NoRxReady
+        );
+        assert_eq!(
+            super::poll_result_from_revents(1, &rx),
+            PollWaitResult::Ready
+        );
     }
 }

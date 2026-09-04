@@ -478,3 +478,297 @@ fn stats_are_fixed_saturating_counters_and_platform_is_explicit() {
         assert_eq!(layout.ethernet_mac_offset, 82);
     }
 }
+
+#[test]
+fn block_validation_accepts_exact_header_and_packet_count_boundaries() {
+    let layout = geometry().validate_rx(4_096, 1_514).expect("layout");
+    let block = BlockDescriptor {
+        version: 2,
+        offset_to_private: 48,
+        block_len: 112,
+        packet_count: 1,
+        first_packet_offset: 64,
+    };
+
+    // Protect strict `>` checks: an exactly fitting first header and packet count are valid.
+    block
+        .validate(layout)
+        .expect("one packet header exactly ends at the block boundary");
+}
+
+#[test]
+fn block_layout_rejects_short_blocks_and_preserves_the_header_lower_bound() {
+    let layout = geometry().validate_rx(4_096, 1_514).expect("layout");
+    let short = BlockDescriptor {
+        version: 2,
+        offset_to_private: 48,
+        block_len: 47,
+        packet_count: 1,
+        first_packet_offset: 64,
+    };
+    assert_eq!(
+        short.validate(layout),
+        Err(GeometryError::FirstPacketOffsetInvalid { offset: 64 })
+    );
+
+    let layout_without_private = RingGeometry {
+        private_size: 0,
+        ..geometry()
+    }
+    .validate_rx(4_096, 1_514)
+    .expect("layout without private bytes");
+    let header_sized = BlockDescriptor {
+        version: 2,
+        offset_to_private: 48,
+        block_len: 48,
+        packet_count: 1,
+        first_packet_offset: 48,
+    };
+
+    // Protect the strict block-header lower bound: 48 bytes reaches the next validation stage.
+    assert_eq!(
+        header_sized.validate(layout_without_private),
+        Err(GeometryError::PacketHeaderOutOfBounds { offset: 48 })
+    );
+}
+
+#[test]
+fn rx_geometry_accepts_exact_strict_frame_capacity() {
+    let exact = RingGeometry {
+        block_size: 4_096,
+        block_count: 1,
+        frame_size: 4_096,
+        frame_count: 1,
+        ..geometry()
+    };
+
+    // Protect the RX truncation guard: the maximum frame ending exactly at block_size is valid.
+    exact
+        .validate_rx(4_096, 3_950)
+        .expect("exact RX frame capacity");
+}
+
+#[test]
+fn geometry_rejects_non_power_of_two_pages_before_alignment_checks() {
+    let exact_multiple = RingGeometry {
+        block_size: 4_800,
+        block_count: 1,
+        frame_size: 1_600,
+        frame_count: 3,
+        ..geometry()
+    };
+
+    // Protect the page-size disjunction: a nonzero non-power-of-two page is rejected on its own.
+    assert_eq!(
+        exact_multiple.validate_rx(3, 1_514),
+        Err(GeometryError::PageSizeNotPowerOfTwo { page_size: 3 })
+    );
+}
+
+#[test]
+fn exact_kernel_limit_uses_the_following_alignment_error() {
+    let exact_limit = RingGeometry {
+        block_size: i32::MAX as u32,
+        ..geometry()
+    };
+
+    // Protect the strict kernel limit: equality is not that error, and reaches page alignment.
+    assert_eq!(
+        exact_limit.validate_rx(4_096, 1_514),
+        Err(GeometryError::BlockSizeNotPageAligned {
+            block_size: i32::MAX as u32,
+            page_size: 4_096,
+        })
+    );
+}
+
+#[cfg(target_pointer_width = "32")]
+#[test]
+fn ring_geometry_rejects_map_length_above_isize_max_directly() {
+    let geometry = RingGeometry {
+        block_size: 1_073_741_824,
+        block_count: 3,
+        frame_size: 1_073_741_824,
+        frame_count: 3,
+        retire_timeout_ms: 0,
+        private_size: 0,
+        feature_flags: 0,
+    };
+
+    // Protect the direct ring map-length guard before ValidatedConfig's combined-map check.
+    assert_eq!(
+        geometry.validate_rx(4_096, 1_514),
+        Err(GeometryError::MapLengthExceedsAddressSpace {
+            map_len: 3_221_225_472,
+        })
+    );
+}
+
+#[test]
+fn frame_size_accepts_the_exact_aligned_minimum() {
+    let exact = RingGeometry {
+        block_size: 4_096,
+        block_count: 1,
+        frame_size: 256,
+        frame_count: 16,
+        retire_timeout_ms: 0,
+        private_size: 0,
+        feature_flags: 0,
+    };
+
+    // Protect the strict frame-size minimum: an exactly aligned frame is large enough.
+    exact
+        .validate_tx(4_096, 193)
+        .expect("exact TX frame minimum");
+}
+
+#[test]
+fn validated_config_preserves_frame_limit_and_layout_counts() {
+    let config = ValidatedConfig::new(&[port(7, 3)], 4_096, 1_514).expect("configuration");
+    let validated = config.ports()[0];
+
+    // Protect cold-path accessors used by the TX size check and ring traversal.
+    assert_eq!(config.max_frame_len(), 1_514);
+    assert_eq!(validated.rx().frames_per_block(), 2);
+}
+
+#[test]
+fn packet_validation_distinguishes_header_and_data_end_boundaries() {
+    let header_boundary = PacketDescriptor {
+        packet_offset: 64,
+        next_offset: 0,
+        mac_offset: 82,
+        net_offset: 96,
+        snap_len: 0,
+        wire_len: 0,
+        is_last: true,
+    };
+    assert_eq!(
+        header_boundary.validate(112),
+        Err(GeometryError::PacketDataOutOfBounds {
+            offset: 146,
+            length: 0,
+        })
+    );
+
+    let data_boundary = PacketDescriptor {
+        packet_offset: 64,
+        next_offset: 0,
+        mac_offset: 82,
+        net_offset: 96,
+        snap_len: 110,
+        wire_len: 110,
+        is_last: true,
+    };
+
+    // Protect strict packet bounds and equality-based non-truncation at the block end.
+    let validated = data_boundary
+        .validate(256)
+        .expect("packet data exactly ends at block_size");
+    assert_eq!(validated.data(), 146..256);
+    assert!(!validated.is_truncated());
+}
+
+#[test]
+fn packet_validation_rejects_mac_offset_at_the_header_limit() {
+    let descriptor = PacketDescriptor {
+        packet_offset: 64,
+        next_offset: 0,
+        mac_offset: 68,
+        net_offset: 96,
+        snap_len: 0,
+        wire_len: 0,
+        is_last: true,
+    };
+
+    // Protect the strict MAC header lower bound: equality is checked by the Ethernet offset rule.
+    assert_eq!(
+        descriptor.validate(200),
+        Err(GeometryError::EthernetMacOffsetInvalid { mac_offset: 68 })
+    );
+}
+
+#[test]
+fn packet_validation_rejects_a_next_offset_at_the_header_limit() {
+    let descriptor = PacketDescriptor {
+        packet_offset: 64,
+        next_offset: 48,
+        mac_offset: 82,
+        net_offset: 96,
+        snap_len: 0,
+        wire_len: 0,
+        is_last: false,
+    };
+
+    // Protect the strict next-offset lower bound before the cross-packet check.
+    assert_eq!(
+        descriptor.validate(160),
+        Err(GeometryError::PacketCrossesNextOffset)
+    );
+}
+
+#[test]
+fn packet_chain_accepts_exact_next_header_and_data_boundaries() {
+    let descriptor = PacketDescriptor {
+        packet_offset: 64,
+        next_offset: 88,
+        mac_offset: 82,
+        net_offset: 96,
+        snap_len: 6,
+        wire_len: 6,
+        is_last: false,
+    };
+
+    // Protect exact `>` checks for the next header/data and preserve non-truncated packets.
+    let validated = descriptor
+        .validate(200)
+        .expect("next header and data end exactly at their boundaries");
+    assert_eq!(validated.next_packet_offset(), Some(152));
+    assert_eq!(validated.data(), 146..152);
+    assert!(!validated.is_truncated());
+}
+
+#[test]
+fn block_chain_rejects_descriptor_count_mismatch() {
+    let layout = geometry().validate_rx(4_096, 1_514).expect("layout");
+    let block = BlockDescriptor {
+        version: 2,
+        offset_to_private: 48,
+        block_len: 4_096,
+        packet_count: 1,
+        first_packet_offset: 64,
+    };
+
+    // Protect the chain validator from accepting a block whose descriptor count disagrees.
+    assert_eq!(
+        validate_v3_block_chain(block, &[], layout),
+        Err(GeometryError::PacketDescriptorCountMismatch {
+            packet_count: 1,
+            descriptors: 0,
+        })
+    );
+}
+
+#[test]
+fn tx_status_mapping_keeps_sending_and_wrong_format_states() {
+    // Protect both explicit TX status arms used by completion and retry handling.
+    assert_eq!(
+        TxOwnership::from_status(ruster_io_afpacket::TP_STATUS_SENDING),
+        Ok(TxOwnership::Sending)
+    );
+    assert_eq!(
+        TxOwnership::from_status(ruster_io_afpacket::TP_STATUS_WRONG_FORMAT),
+        Ok(TxOwnership::WrongFormat)
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn non_linux_af_packet_is_explicitly_unsupported() {
+    // Protect the target-specific support gate and its non-Linux error path.
+    assert!(!AfPacketPlatform::is_supported());
+    assert_eq!(
+        AfPacketPlatform::ensure_supported(),
+        Err(PlatformError::UnsupportedPlatform)
+    );
+}

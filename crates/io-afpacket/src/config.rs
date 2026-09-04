@@ -481,3 +481,43 @@ const fn align_up(value: usize, alignment: usize) -> Option<usize> {
         None => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table_ports(count: usize) -> Vec<PortConfig> {
+        let geometry = RingGeometry {
+            block_size: 4_096,
+            block_count: 1,
+            frame_size: 2_048,
+            frame_count: 2,
+            retire_timeout_ms: 0,
+            private_size: 0,
+            feature_flags: 0,
+        };
+        (0..count)
+            .map(|index| PortConfig {
+                interface: IfId(index as u16),
+                if_index: 0,
+                rx: geometry,
+                tx: geometry,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn port_table_enforces_the_exact_port_limit() {
+        // Protect the inclusive MAX_PORTS boundary and reject exactly one more entry.
+        let at_limit = table_ports(MAX_PORTS);
+        assert!(PortTable::build(&at_limit).is_ok());
+
+        let over_limit = table_ports(MAX_PORTS + 1);
+        assert_eq!(
+            PortTable::build(&over_limit),
+            Err(ConfigError::TooManyPorts {
+                count: MAX_PORTS + 1,
+            })
+        );
+    }
+}

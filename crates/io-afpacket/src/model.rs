@@ -507,3 +507,37 @@ impl TxFrameModel {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::RingGeometry;
+
+    #[test]
+    fn empty_timeout_rejects_a_first_packet_outside_the_short_block() {
+        let layout = RingGeometry {
+            block_size: 4_096,
+            block_count: 2,
+            frame_size: 2_048,
+            frame_count: 4,
+            retire_timeout_ms: 10,
+            private_size: 16,
+            feature_flags: 1,
+        }
+        .validate_rx(4_096, 1_514)
+        .expect("test RX layout");
+        let block = BlockDescriptor {
+            version: TPACKET_V3_VERSION,
+            offset_to_private: TPACKET_BLOCK_HEADER_LEN,
+            block_len: 63,
+            packet_count: 0,
+            first_packet_offset: layout.block_plus_private(),
+        };
+
+        // Protect BLK_TMO empty-block validation from accepting an out-of-bounds offset.
+        assert_eq!(
+            block.validate_empty_timeout(layout),
+            Err(GeometryError::PacketHeaderOutOfBounds { offset: 64 })
+        );
+    }
+}
