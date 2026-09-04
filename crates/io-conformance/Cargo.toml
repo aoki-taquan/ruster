@@ -7,3 +7,5 @@ publish.workspace = true
 
 [dependencies]
 ruster-core = { path = "../core" }
+ruster-io-afpacket = { path = "../io-afpacket" }
+ruster-io-xdp-native = { path = "../io-xdp-native" }
