@@ -1989,4 +1989,49 @@ mod tests {
             .expect("zero-copy flags");
         assert_eq!(zero.bind_flags().mode(), BindMode::ZeroCopyRequired);
     }
+
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    fn page_aligned_umem_reports_and_borrows_exact_mapping_length() {
+        // Protects the page-aligned UMEM owner from reporting a fabricated
+        // length or slice and verifies the non-empty mapping state.
+        let mut owner = PageAlignedUmem::new(4_096).expect("anonymous page mapping");
+        assert_eq!(owner.len(), 4_096);
+        assert!(!owner.is_empty());
+        let bytes = owner.as_mut_slice();
+        assert_eq!(bytes.len(), 4_096);
+        bytes[4_095] = 0xa5;
+        owner.close().expect("unmap page mapping");
+    }
+
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    fn page_aligned_umem_for_config_uses_the_checked_umem_byte_length() {
+        // Protects the config-to-mmap conversion boundary used by production
+        // callers, including the exact frame geometry returned by UmemConfig.
+        let (umem, _) = valid_config();
+        let owner = PageAlignedUmem::for_umem(umem).expect("configured mapping");
+        assert_eq!(owner.len(), umem.byte_len() as usize);
+        owner.close().expect("unmap configured mapping");
+    }
+
+    #[test]
+    fn builder_accessors_preserve_interface_and_queue_selection() {
+        // Protects the setup transaction's routing selectors before bind: the
+        // kernel ifindex and hardware queue must not be silently replaced.
+        let (umem, rings) = valid_config();
+        let builder = XdpResourceBuilder::new(umem, rings, 7, 3).expect("builder");
+        assert_eq!(builder.ifindex(), 7);
+        assert_eq!(builder.queue_id(), 3);
+        assert_eq!(builder.umem(), umem);
+        assert_eq!(builder.rings(), rings);
+    }
 }

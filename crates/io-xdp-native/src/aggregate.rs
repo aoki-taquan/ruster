@@ -1401,4 +1401,191 @@ mod tests {
             FRAME_COUNT - RX_FRAMES
         );
     }
+
+    #[test]
+    fn same_interface_commit_uses_ingress_tx_without_copying() {
+        // Protect same-interface routing: an ingress frame is submitted on
+        // its own TX ring and is not mistaken for a cross-interface copy.
+        let mut harness = PairHarness::new();
+        harness.initialize();
+        harness.first.kernel_publish_rx(0, 8);
+        let completion = {
+            let mut batch = harness.batch(1);
+            let packet = batch.next_packet().expect("first packet");
+            packet.commit(IfId(1));
+            batch.finish()
+        };
+        assert_eq!((completion.tx_accepted, completion.tx_rejected), (1, 0));
+        assert_eq!(harness.first.ring_occupied(&harness.first.tx), 1);
+        assert_eq!(harness.second.ring_occupied(&harness.second.tx), 0);
+        assert_eq!(
+            harness.first.tx.read_descriptor(192),
+            XdpDescriptor {
+                address: DATA_OFFSET as u64,
+                len: 8,
+                options: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn reverse_cross_interface_commit_uses_the_other_member_pair() {
+        // Protect the reverse members_mut_pair arm: second-to-first traffic
+        // copies into the first member's generated UMEM and TX ring.
+        let mut harness = PairHarness::new();
+        harness.initialize();
+        harness.second.kernel_publish_rx(0, 4);
+        let payload = [9, 8, 7, 6];
+        let completion = {
+            let mut batch = harness.batch(1);
+            let mut packet = batch.next_packet().expect("second packet");
+            packet.bytes_mut().copy_from_slice(&payload);
+            packet.commit(IfId(1));
+            batch.finish()
+        };
+        assert_eq!((completion.tx_accepted, completion.tx_rejected), (1, 0));
+        let address = RX_FRAMES as u64 * FRAME_SIZE as u64 + DATA_OFFSET as u64;
+        assert_eq!(
+            harness.first.tx.read_descriptor(192),
+            XdpDescriptor {
+                address,
+                len: payload.len() as u32,
+                options: 0,
+            }
+        );
+        assert_eq!(
+            &harness.first.umem[address as usize..address as usize + payload.len()],
+            &payload
+        );
+    }
+
+    #[test]
+    fn expected_full_ring_rejections_do_not_poison_same_or_cross_batches() {
+        // Protect expected TX rejection handling: both same- and
+        // cross-interface RingFull outcomes are counted and recycled without
+        // becoming a batch error.
+        let mut harness = PairHarness::new();
+        harness.initialize();
+        harness.first.kernel_publish_rx(0, 8);
+        harness.first.tx.write_u32(0, RING_ENTRIES);
+        let completion = {
+            let mut batch = harness.batch(1);
+            let packet = batch.next_packet().expect("same packet");
+            packet.commit(IfId(1));
+            batch.finish()
+        };
+        assert_eq!((completion.tx_accepted, completion.tx_rejected), (0, 1));
+        assert!(completion.error.is_none());
+
+        let mut harness = PairHarness::new();
+        harness.initialize();
+        harness.first.kernel_publish_rx(0, 8);
+        harness.second.tx.write_u32(0, RING_ENTRIES);
+        let completion = {
+            let mut batch = harness.batch(1);
+            let packet = batch.next_packet().expect("cross packet");
+            packet.commit(IfId(2));
+            batch.finish()
+        };
+        assert_eq!((completion.tx_accepted, completion.tx_rejected), (0, 1));
+        assert!(completion.error.is_none());
+        assert!(completion.invariants_hold());
+    }
+
+    #[test]
+    fn cross_rejection_when_generated_pool_is_empty_is_counted_once() {
+        // Protect cross rejection accounting: an exhausted destination pool
+        // recycles the source and increments rejection exactly once.
+        let mut harness = PairHarness::new();
+        harness.initialize();
+        {
+            let mut core = harness.second.core(BatchState::Maintenance);
+            for _ in RX_FRAMES..FRAME_COUNT {
+                core.reserve_generated_frame(8)
+                    .expect("reserve destination pool")
+                    .expect("generated frame");
+            }
+            core.release_state();
+        }
+        harness.first.kernel_publish_rx(0, 8);
+        let completion = {
+            let mut batch = harness.batch(1);
+            let packet = batch.next_packet().expect("source packet");
+            packet.commit(IfId(2));
+            batch.finish()
+        };
+        assert_eq!((completion.tx_accepted, completion.tx_rejected), (0, 1));
+        assert!(completion.error.is_none());
+        assert!(completion.invariants_hold());
+    }
+
+    #[test]
+    fn member_processing_error_is_retained_until_pair_finish() {
+        // Protect pair member error propagation: a malformed descriptor stops
+        // that member and is reported with its fixed pair position.
+        let mut harness = PairHarness::new();
+        harness.initialize();
+        harness.first.kernel_publish_rx(0, 0);
+        let completion = {
+            let mut batch = harness.batch(1);
+            assert!(batch.next_packet().is_none());
+            batch.finish()
+        };
+        assert!(matches!(
+            completion.error,
+            Some(XdpPairIoError::Resource {
+                resource: XdpResourcePairIndex::First,
+                ..
+            })
+        ));
+        assert!(completion.invariants_hold());
+    }
+
+    #[test]
+    fn missing_generated_egress_reports_attempt_and_failure() {
+        // Protect missing-egress generated state: allocation is unavailable,
+        // and both attempt and failure counters are observable at finish.
+        let mut batch = XdpPairGeneratedBatch::missing(IfId(99));
+        assert!(matches!(
+            batch.allocate(8),
+            Err(GeneratedAllocationError::Unavailable)
+        ));
+        let completion = batch.finish();
+        assert_eq!((completion.attempts, completion.failed), (1, 1));
+        assert!(matches!(
+            completion.error,
+            Some(XdpPairIoError::EgressNotFound { egress: IfId(99) })
+        ));
+    }
+
+    #[test]
+    fn expected_rejection_classifier_accepts_only_bounded_tx_failures() {
+        // Protect the rejection classifier: RingFull and interface mismatch
+        // are bounded routing outcomes; unrelated errors remain visible.
+        assert!(is_expected_tx_rejection(XdpIoError::Ring {
+            ring: crate::RingName::Tx,
+            source: crate::NativeRingError::RingFull,
+        }));
+        assert!(is_expected_tx_rejection(XdpIoError::InterfaceMismatch {
+            expected: IfId(1),
+            actual: IfId(2),
+        }));
+        assert!(!is_expected_tx_rejection(XdpIoError::BatchActive));
+    }
+
+    #[test]
+    fn disposition_combination_preserves_stop_then_skip_precedence() {
+        // Protect publication disposition precedence: Stop dominates every
+        // pair, SkipIo dominates ContinueOldIo, and Continue combines cleanly.
+        use PublicationQuiescenceDisposition::{ContinueOldIo, SkipIo, Stop};
+        assert_eq!(combine_disposition(Stop, ContinueOldIo), Stop);
+        assert_eq!(combine_disposition(ContinueOldIo, Stop), Stop);
+        assert_eq!(combine_disposition(SkipIo, ContinueOldIo), SkipIo);
+        assert_eq!(combine_disposition(ContinueOldIo, SkipIo), SkipIo);
+        assert_eq!(combine_disposition(SkipIo, Stop), Stop);
+        assert_eq!(
+            combine_disposition(ContinueOldIo, ContinueOldIo),
+            ContinueOldIo
+        );
+    }
 }

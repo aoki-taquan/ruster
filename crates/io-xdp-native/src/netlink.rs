@@ -1696,4 +1696,230 @@ mod tests {
         assert_eq!(sent_messages(&fake).len(), 2);
         assert_eq!(close_count(&fake), 2);
     }
+
+    #[test]
+    fn attach_flags_reject_every_missing_or_unsafe_mode_combination() {
+        // Protects the no-replace invariant and the rejection of unknown or
+        // conflicting XDP modes, including the TryFrom forwarding path.
+        assert_eq!(
+            ValidatedXdpAttachFlags::try_from(XDP_FLAGS_UPDATE_IF_NOEXIST),
+            Err(XdpAttachConfigError::MissingMode)
+        );
+        assert_eq!(
+            ValidatedXdpAttachFlags::try_from(XDP_FLAGS_UPDATE_IF_NOEXIST | XDP_FLAGS_REPLACE),
+            Err(XdpAttachConfigError::UnsupportedFlags(XDP_FLAGS_REPLACE))
+        );
+        assert_eq!(
+            ValidatedXdpAttachFlags::try_from(
+                XDP_FLAGS_UPDATE_IF_NOEXIST | XDP_FLAGS_SKB_MODE | XDP_FLAGS_DRV_MODE
+            ),
+            Err(XdpAttachConfigError::ConflictingModes)
+        );
+        assert_eq!(
+            ValidatedXdpAttachFlags::try_from(XDP_FLAGS_SKB_MODE),
+            Err(XdpAttachConfigError::UpdateIfNoExistRequired)
+        );
+    }
+
+    #[test]
+    fn ifindex_validation_rejects_zero_and_signed_index_overflow_only() {
+        // Protects the rtnetlink ifinfomsg signed-index boundary before any
+        // socket or duplicate-program-fd side effect occurs.
+        assert_eq!(
+            validate_ifindex(0),
+            Err(XdpAttachError::InvalidInterfaceIndex { ifindex: 0 })
+        );
+        assert_eq!(validate_ifindex(i32::MAX as u32), Ok(()));
+        assert_eq!(
+            validate_ifindex(i32::MAX as u32 + 1),
+            Err(XdpAttachError::InvalidInterfaceIndex {
+                ifindex: i32::MAX as u32 + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn detach_message_preserves_driver_mode_and_expected_fd_identity() {
+        // Protects the ABI detach contract: fd -1, REPLACE plus the selected
+        // mode, and IFLA_XDP_EXPECTED_FD type 8 with the owner fd value.
+        let message = encode_detach_message(9, XdpAttachMode::Drv, 91, 7, 0x5566_7788);
+        assert_eq!(message.len(), 60);
+        assert_eq!(i32::from_ne_bytes(message[40..44].try_into().unwrap()), -1);
+        assert_eq!(
+            u32::from_ne_bytes(message[48..52].try_into().unwrap()),
+            XDP_FLAGS_REPLACE | XDP_FLAGS_DRV_MODE
+        );
+        assert_eq!(u16::from_ne_bytes(message[52..54].try_into().unwrap()), 8);
+        assert_eq!(
+            u16::from_ne_bytes(message[54..56].try_into().unwrap()),
+            IFLA_XDP_EXPECTED_FD
+        );
+        assert_eq!(i32::from_ne_bytes(message[56..60].try_into().unwrap()), 91);
+    }
+
+    #[test]
+    fn inspect_ack_rejects_transport_and_protocol_length_boundaries() {
+        // Protects fail-closed ACK parsing for short receives, declared
+        // extents that need padding, and receives longer than the buffer.
+        let response = ack(4, 0);
+        assert_eq!(
+            inspect_ack(
+                &response.bytes,
+                RecvMessage {
+                    byte_len: NLMSG_HDRLEN - 1,
+                    flags: 0,
+                },
+                4,
+                XdpAttachOperation::Attach,
+            ),
+            Err(XdpAttachError::ResponseTooShort {
+                actual: NLMSG_HDRLEN - 1,
+                minimum: NLMSG_HDRLEN,
+            })
+        );
+        assert_eq!(
+            inspect_ack(
+                &response.bytes,
+                RecvMessage {
+                    byte_len: response.bytes.len() + 1,
+                    flags: 0,
+                },
+                4,
+                XdpAttachOperation::Attach,
+            ),
+            Err(XdpAttachError::ResponseLengthMismatch {
+                declared: response.bytes.len(),
+                actual: response.bytes.len() + 1,
+            })
+        );
+
+        let mut unaligned = response.bytes.clone();
+        write_u32(&mut unaligned, 0, (NLMSG_ERROR_MESSAGE_LEN + 1) as u32);
+        assert_eq!(
+            inspect_ack(
+                &unaligned,
+                RecvMessage {
+                    byte_len: NLMSG_ERROR_MESSAGE_LEN,
+                    flags: 0,
+                },
+                4,
+                XdpAttachOperation::Attach,
+            ),
+            Err(XdpAttachError::ResponseTooShort {
+                actual: NLMSG_ERROR_MESSAGE_LEN,
+                minimum: align4(NLMSG_ERROR_MESSAGE_LEN + 1),
+            })
+        );
+
+        let mut extra = response.bytes.clone();
+        extra.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(
+            inspect_ack(
+                &extra,
+                RecvMessage {
+                    byte_len: extra.len(),
+                    flags: 0,
+                },
+                4,
+                XdpAttachOperation::Attach,
+            ),
+            Err(XdpAttachError::ResponseLengthMismatch {
+                declared: NLMSG_ERROR_MESSAGE_LEN,
+                actual: NLMSG_ERROR_MESSAGE_LEN + 4,
+            })
+        );
+    }
+
+    #[test]
+    fn inspect_ack_requires_error_message_type_and_exact_sequence() {
+        // Protects ACK identity checks so an unrelated netlink message cannot
+        // be mistaken for a successful attach/detach transaction.
+        let mut wrong_type = ack(4, 0).bytes;
+        write_u16(&mut wrong_type, 4, 3);
+        assert_eq!(
+            inspect_ack(
+                &wrong_type,
+                RecvMessage {
+                    byte_len: wrong_type.len(),
+                    flags: 0,
+                },
+                4,
+                XdpAttachOperation::Attach,
+            ),
+            Err(XdpAttachError::UnexpectedMessageType { message_type: 3 })
+        );
+
+        let response = ack(5, 0);
+        assert_eq!(
+            inspect_ack(
+                &response.bytes,
+                RecvMessage {
+                    byte_len: response.bytes.len(),
+                    flags: 0,
+                },
+                4,
+                XdpAttachOperation::Attach,
+            ),
+            Err(XdpAttachError::UnexpectedSequence {
+                expected: 4,
+                actual: 5,
+            })
+        );
+    }
+
+    #[test]
+    fn attach_rejects_negative_program_fd_before_opening_netlink_socket() {
+        // Protects the raw-fd validation boundary and ensures invalid input
+        // has no observable syscall side effect.
+        let fake = FakeNetlinkSyscalls::new(Vec::new());
+        assert!(matches!(
+            attach_with_syscalls(&fake, -1, 7, ValidatedXdpAttachFlags::default()),
+            Err(XdpAttachError::InvalidProgramFileDescriptor { fd: -1 })
+        ));
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn netlink_open_binds_kernel_allocated_port_before_reading_portid() {
+        // Protects the control-plane socket initialization: the bind syscall
+        // must be issued with nl_pid zero before getsockname supplies portid.
+        let fake = FakeNetlinkSyscalls::new(Vec::new());
+        let socket = OwnedNetlinkSocket::open(&fake).expect("fake netlink socket");
+        let calls = fake.calls();
+        let bind_index = calls
+            .iter()
+            .position(|call| matches!(call, Call::Bind(_)))
+            .expect("bind transcript entry");
+        let getsockname_index = calls
+            .iter()
+            .position(|call| matches!(call, Call::GetSocketName))
+            .expect("getsockname transcript entry");
+        assert!(bind_index < getsockname_index);
+        assert!(calls.contains(&Call::Bind(encode_sockaddr_nl(0, 0).to_vec())));
+        drop(socket);
+    }
+
+    #[test]
+    fn sockaddr_nl_encoder_preserves_fixed_family_portid_and_groups_fields() {
+        // Protects sockaddr_nl ABI encoding independently of the encoder's
+        // implementation: family, port ID, groups, and zero padding are all
+        // checked against fixed little-endian bytes.
+        let encoded = encode_sockaddr_nl(0x1122_3344, 0x5566_7788);
+        assert_eq!(
+            encoded,
+            [0x10, 0x00, 0x00, 0x00, 0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55,]
+        );
+        assert_eq!(
+            u16::from_ne_bytes(encoded[0..2].try_into().unwrap()),
+            AF_NETLINK as u16
+        );
+        assert_eq!(
+            u32::from_ne_bytes(encoded[4..8].try_into().unwrap()),
+            0x1122_3344
+        );
+        assert_eq!(
+            u32::from_ne_bytes(encoded[8..12].try_into().unwrap()),
+            0x5566_7788
+        );
+    }
 }

@@ -474,6 +474,25 @@ mod tests {
         assert_eq!(instructions[3].src_reg(), BPF_REG_3);
     }
 
+    #[test]
+    fn redirect_opcode_construction_preserves_each_bit_field_and_alias() {
+        // Protects the intended opcode values and the bytecode alias. The
+        // listed `|` -> `^` mutants are equivalent here because every pair of
+        // combined UAPI constants has disjoint bits; the assertions still
+        // document that fixed ABI contract explicitly.
+        let instructions = xdp_redirect_instructions(0x1122_3344);
+        assert_eq!(instructions[0].code, BPF_LDX | BPF_MEM | BPF_W);
+        assert_eq!(instructions[1].code, BPF_LD | BPF_DW | BPF_IMM);
+        assert_eq!(instructions[3].code, BPF_ALU64 | BPF_MOV | BPF_X);
+        assert_eq!(instructions[4].code, BPF_ALU64 | BPF_MOV | BPF_K);
+        assert_eq!(instructions[5].code, BPF_JMP | BPF_CALL);
+        assert_eq!(instructions[6].code, BPF_JMP | BPF_EXIT);
+        assert_eq!(
+            xdp_redirect_program_bytecode(0x1122_3344),
+            encode_xdp_redirect_program(0x1122_3344)
+        );
+    }
+
     #[cfg(all(
         target_os = "linux",
         target_arch = "x86_64",

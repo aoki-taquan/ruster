@@ -2121,4 +2121,482 @@ mod tests {
         assert!(completion.invariants_hold());
         assert_eq!(harness.ring_occupied(&harness.fill), 0);
     }
+
+    fn fresh_ownership() -> XdpOwnership {
+        XdpOwnership::new(
+            UmemConfig::new(
+                FRAME_COUNT as u32,
+                FRAME_SIZE as u32,
+                HEADROOM as u32,
+                RX_FRAMES as u32,
+                (FRAME_COUNT - RX_FRAMES) as u32,
+                0,
+            )
+            .expect("test UMEM"),
+        )
+    }
+
+    #[test]
+    fn descriptor_validation_enforces_both_visible_boundaries() {
+        // Protect the descriptor contract: zero/options, headroom underflow,
+        // exact visible end, and frame overflow must be distinguished.
+        let ownership = fresh_ownership();
+        let visible_capacity = (FRAME_SIZE - DATA_OFFSET) as u64;
+        assert!(ownership
+            .validate_packet_descriptor(XdpDescriptor {
+                address: DATA_OFFSET as u64,
+                len: 0,
+                options: 0,
+            })
+            .is_err());
+        assert!(ownership
+            .validate_packet_descriptor(XdpDescriptor {
+                address: DATA_OFFSET as u64,
+                len: 1,
+                options: 1,
+            })
+            .is_err());
+        assert!(ownership
+            .validate_packet_descriptor(XdpDescriptor {
+                address: 0,
+                len: 1,
+                options: 0,
+            })
+            .is_err());
+        assert!(ownership
+            .validate_packet_descriptor(XdpDescriptor {
+                address: DATA_OFFSET as u64,
+                len: u32::try_from(visible_capacity + 1).expect("length fits"),
+                options: 0,
+            })
+            .is_err());
+        assert_eq!(
+            ownership
+                .validate_packet_descriptor(XdpDescriptor {
+                    address: DATA_OFFSET as u64,
+                    len: u32::try_from(visible_capacity).expect("length fits"),
+                    options: 0,
+                })
+                .expect("exact visible end is valid"),
+            0
+        );
+        assert_eq!(
+            ownership
+                .validate_packet_descriptor(XdpDescriptor {
+                    address: FRAME_SIZE as u64 + DATA_OFFSET as u64,
+                    len: 1,
+                    options: 0,
+                })
+                .expect("frame-one visible descriptor is valid"),
+            1
+        );
+    }
+
+    #[test]
+    fn cancel_and_quarantine_transitions_preserve_counts_and_states() {
+        // Protect rollback state transitions and quarantine idempotence: a
+        // cancelled reservation is reusable, while a bad kernel owner is not.
+        let mut ownership = fresh_ownership();
+        ownership.reserve_fill(0).expect("reserve fill");
+        ownership.cancel_fill(0).expect("cancel fill");
+        assert_eq!(ownership.state_kind(0), XdpChunkState::Free);
+        assert_eq!(ownership.count(XdpChunkState::Free), FRAME_COUNT);
+
+        ownership.reserve_fill(0).expect("reserve fill");
+        ownership.publish_fill(0).expect("publish fill");
+        ownership.quarantine(0);
+        assert_eq!(ownership.state_kind(0), XdpChunkState::Quarantined);
+        let quarantined = ownership.count(XdpChunkState::Quarantined);
+        ownership.quarantine(0);
+        assert_eq!(ownership.count(XdpChunkState::Quarantined), quarantined);
+        let free = ownership.count(XdpChunkState::Free);
+        ownership.quarantine(1);
+        assert_eq!(ownership.count(XdpChunkState::Free), free);
+    }
+
+    #[test]
+    fn malformed_rx_recovery_returns_only_visible_fill_chunks() {
+        // Protect RX recovery: a consumed malformed descriptor returns its
+        // visible Fill chunk, but an address in headroom quarantines it.
+        let mut ownership = fresh_ownership();
+        ownership.reserve_fill(0).expect("reserve fill");
+        ownership.publish_fill(0).expect("publish fill");
+        ownership.recover_rx_descriptor(XdpDescriptor {
+            address: DATA_OFFSET as u64,
+            len: 0,
+            options: 0,
+        });
+        assert_eq!(ownership.state_kind(0), XdpChunkState::Free);
+
+        ownership.reserve_fill(0).expect("reserve fill again");
+        ownership.publish_fill(0).expect("publish fill again");
+        ownership.recover_rx_descriptor(XdpDescriptor {
+            address: 0,
+            len: 64,
+            options: 0,
+        });
+        assert_eq!(ownership.state_kind(0), XdpChunkState::Quarantined);
+
+        ownership.reserve_fill(1).expect("reserve frame one");
+        ownership.publish_fill(1).expect("publish frame one");
+        ownership.recover_rx_descriptor(XdpDescriptor {
+            address: FRAME_SIZE as u64 + DATA_OFFSET as u64,
+            len: 0,
+            options: 0,
+        });
+        assert_eq!(ownership.state_kind(1), XdpChunkState::Free);
+
+        ownership.reserve_fill(1).expect("reserve frame one again");
+        ownership.publish_fill(1).expect("publish frame one again");
+        ownership.recover_rx_descriptor(XdpDescriptor {
+            address: FRAME_SIZE as u64,
+            len: 64,
+            options: 0,
+        });
+        assert_eq!(ownership.state_kind(1), XdpChunkState::Quarantined);
+    }
+
+    #[test]
+    fn generated_lease_rejects_rx_frames_and_accepts_the_first_generated_frame() {
+        // Protect generated-pool ownership boundaries: RX frames can never
+        // be leased as generated storage, while the first generated index can.
+        let mut ownership = fresh_ownership();
+        assert!(matches!(
+            ownership.lease_generated((RX_FRAMES - 1) as u32),
+            Err(XdpIoError::Ownership {
+                frame_index,
+                expected: XdpChunkState::Free,
+                actual: XdpChunkState::Free,
+            }) if frame_index == (RX_FRAMES - 1) as u32
+        ));
+        ownership
+            .lease_generated(RX_FRAMES as u32)
+            .expect("first generated frame");
+        assert_eq!(
+            ownership.state_kind(RX_FRAMES as u32),
+            XdpChunkState::Leased
+        );
+    }
+
+    #[test]
+    fn rollback_to_lease_unwinds_pending_and_reserved_tx() {
+        // Protect both rollback arms: a TxReserved frame must pass through
+        // PendingTx, and a PendingTx frame must return directly to Leased.
+        let mut harness = Harness::new();
+        initialize(&mut harness);
+        let descriptor = XdpDescriptor {
+            address: DATA_OFFSET as u64,
+            len: 64,
+            options: 0,
+        };
+        harness
+            .ownership
+            .lease_rx(descriptor)
+            .expect("lease reserved");
+        harness.ownership.stage_tx(0).expect("stage reserved");
+        harness.ownership.reserve_tx(0).expect("reserve tx");
+        harness
+            .ownership
+            .lease_rx(XdpDescriptor {
+                address: FRAME_SIZE as u64 + DATA_OFFSET as u64,
+                len: 64,
+                options: 0,
+            })
+            .expect("lease pending");
+        harness.ownership.stage_tx(1).expect("stage pending");
+        {
+            let mut core = harness.core(BatchState::Maintenance);
+            core.rollback_to_lease(0, XdpChunkState::TxReserved);
+            core.rollback_to_lease(1, XdpChunkState::PendingTx);
+            core.release_state();
+        }
+        assert_eq!(harness.ownership.state_kind(0), XdpChunkState::Leased);
+        assert_eq!(harness.ownership.state_kind(1), XdpChunkState::Leased);
+    }
+
+    #[test]
+    fn generated_reservation_rejects_invalid_lengths_without_leaking_frames() {
+        // Protect generated-frame bounds: zero and oversized requests reject,
+        // while the exact visible capacity leases the first generated frame.
+        let mut harness = Harness::new();
+        initialize(&mut harness);
+        let capacity = FRAME_SIZE - DATA_OFFSET;
+        {
+            let mut core = harness.core(BatchState::Maintenance);
+            assert!(core
+                .reserve_generated_frame(0)
+                .expect("zero probe")
+                .is_none());
+            assert!(core
+                .reserve_generated_frame(capacity + 1)
+                .expect("oversize probe")
+                .is_none());
+            let frame = core
+                .reserve_generated_frame(capacity)
+                .expect("exact probe")
+                .expect("generated frame");
+            assert_eq!(frame.frame_index, RX_FRAMES as u32);
+            assert_eq!(frame.address, (RX_FRAMES * FRAME_SIZE + DATA_OFFSET) as u64);
+            core.release_state();
+        }
+        assert_eq!(harness.ownership.count(XdpChunkState::Leased), 1);
+    }
+
+    #[test]
+    fn wake_without_socket_clears_each_pending_wakeup_flag() {
+        // Protect wake gating: either individual pending flag enters the
+        // no-socket cleanup branch and clears both flags.
+        let mut harness = Harness::new();
+        harness.fill_wakeup_pending = true;
+        {
+            let mut core = harness.core(BatchState::Maintenance);
+            core.wake_if_needed().expect("fill wake probe");
+            core.release_state();
+        }
+        assert!(!harness.fill_wakeup_pending && !harness.tx_wakeup_pending);
+
+        harness.tx_wakeup_pending = true;
+        {
+            let mut core = harness.core(BatchState::Maintenance);
+            core.wake_if_needed().expect("tx wake probe");
+            core.release_state();
+        }
+        assert!(!harness.fill_wakeup_pending && !harness.tx_wakeup_pending);
+    }
+
+    #[test]
+    fn housekeeping_and_expected_tx_rejection_are_observable() {
+        // Protect housekeeping and rejection classification: a completion
+        // error is retained, while an expected full-ring rejection is not.
+        let mut harness = Harness::new();
+        initialize(&mut harness);
+        harness.kernel_publish_completion(u64::MAX);
+        {
+            let core = harness.core(BatchState::Rx);
+            let mut batch = XdpPacketBatchWithOps::new(core, 0);
+            batch.start_housekeeping();
+            assert!(batch.error.is_some());
+            batch.finish_inner();
+        }
+
+        assert!(is_expected_tx_rejection(XdpIoError::Ring {
+            ring: RingName::Tx,
+            source: NativeRingError::RingFull,
+        }));
+        assert!(is_expected_tx_rejection(XdpIoError::InterfaceMismatch {
+            expected: IfId(1),
+            actual: IfId(2),
+        }));
+        assert!(!is_expected_tx_rejection(XdpIoError::BatchActive));
+    }
+
+    #[test]
+    fn generated_slots_count_completion_and_recycle_exactly() {
+        // Protect generated slot completion: bytes are borrowed from the
+        // leased UMEM frame and each terminal outcome recycles/counts once.
+        let mut harness = Harness::new();
+        initialize(&mut harness);
+        let completion = {
+            let core = harness.core(BatchState::Generated);
+            let mut batch = XdpGeneratedBatchWithOps::new(core, IfId(7));
+            let mut slot = batch.allocate_slot(8).expect("generated slot");
+            assert_eq!(slot.bytes_mut().len(), 8);
+            slot.bytes_mut().copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            slot.complete(GeneratedSlotCompletion::Cancelled);
+            let completion = batch.finish_inner();
+            assert_eq!(completion.cancelled, 1);
+            assert_eq!(completion.abandoned, 0);
+            completion
+        };
+        assert_eq!(completion.allocated, 1);
+        assert_eq!(
+            harness.ownership.count(XdpChunkState::Free),
+            FRAME_COUNT - RX_FRAMES
+        );
+
+        let completion = {
+            let core = harness.core(BatchState::Generated);
+            let mut batch = XdpGeneratedBatchWithOps::new(core, IfId(7));
+            {
+                let _slot = batch.allocate_slot(8).expect("generated slot");
+            }
+            batch.finish_inner()
+        };
+        assert_eq!(completion.abandoned, 1);
+        assert_eq!(completion.cancelled, 0);
+    }
+
+    #[test]
+    fn generated_abandoned_completion_recycles_frame_and_counts_abandoned() {
+        // Protect the explicit Abandoned completion branch: completing a
+        // generated slot as abandoned recycles its frame without TX activity.
+        let mut harness = Harness::new();
+        initialize(&mut harness);
+        let completion = {
+            let core = harness.core(BatchState::Generated);
+            let mut batch = XdpGeneratedBatchWithOps::new(core, IfId(7));
+            let slot = batch.allocate_slot(8).expect("generated slot");
+            slot.complete(GeneratedSlotCompletion::Abandoned);
+            batch.finish_inner()
+        };
+        assert_eq!(completion.abandoned, 1);
+        assert_eq!(completion.cancelled, 0);
+        assert_eq!(completion.requested, 0);
+        assert_eq!(completion.accepted, 0);
+        assert_eq!(completion.rejected, 0);
+        assert_eq!(harness.ring_occupied(&harness.tx), 0);
+        assert_eq!(harness.ownership.count(XdpChunkState::Leased), 0);
+        assert_eq!(
+            harness.ownership.count(XdpChunkState::Free),
+            FRAME_COUNT - RX_FRAMES
+        );
+    }
+
+    #[test]
+    fn generated_allocation_rejects_zero_large_mismatch_and_pending_requests() {
+        // Protect generated allocation state ordering and counters: each
+        // rejection class increments attempts/failed without allocating.
+        let mut harness = Harness::new();
+        initialize(&mut harness);
+        let completion = {
+            let core = harness.core(BatchState::Generated);
+            let mut batch = XdpGeneratedBatchWithOps::new(core, IfId(99));
+            assert!(matches!(
+                batch.allocate_slot(0),
+                Err(GeneratedAllocationError::ZeroLength)
+            ));
+            assert!(matches!(
+                batch.allocate_slot(FRAME_SIZE),
+                Err(GeneratedAllocationError::FrameTooLarge)
+            ));
+            assert!(matches!(
+                batch.allocate_slot(8),
+                Err(GeneratedAllocationError::Unavailable)
+            ));
+            assert!(matches!(
+                batch.error,
+                Some(XdpIoError::InterfaceMismatch { .. })
+            ));
+            batch.finish_inner()
+        };
+        assert_eq!(completion.attempts, 3);
+        assert_eq!(completion.failed, 3);
+        assert_eq!(completion.allocated, 0);
+    }
+
+    #[test]
+    fn generated_allocation_rejects_disabled_and_already_pending_batches() {
+        // Protect the generated batch state gate: disabled batches and a
+        // still-pending slot cannot allocate a second frame.
+        let mut harness = Harness::new();
+        initialize(&mut harness);
+        let completion = {
+            let core = harness.core(BatchState::Generated);
+            let mut batch = XdpGeneratedBatchWithOps::new(core, IfId(7));
+            batch.disabled = true;
+            assert!(matches!(
+                batch.allocate_slot(8),
+                Err(GeneratedAllocationError::Unavailable)
+            ));
+            batch.finish_inner()
+        };
+        assert_eq!((completion.attempts, completion.failed), (1, 1));
+
+        harness
+            .ownership
+            .lease_generated(RX_FRAMES as u32)
+            .expect("pending generated frame");
+        let completion = {
+            let core = harness.core(BatchState::Generated);
+            let mut batch = XdpGeneratedBatchWithOps::new(core, IfId(7));
+            batch.pending = Some(RX_FRAMES as u32);
+            assert!(matches!(
+                batch.allocate_slot(8),
+                Err(GeneratedAllocationError::Unavailable)
+            ));
+            batch.finish_inner()
+        };
+        assert_eq!((completion.attempts, completion.failed), (1, 1));
+        assert_eq!(
+            harness.ownership.count(XdpChunkState::Free),
+            FRAME_COUNT - RX_FRAMES
+        );
+    }
+
+    #[test]
+    fn nonquiescent_owner_reports_the_first_live_chunk_state() {
+        // Protect quiescence ownership reporting: every live ledger state is
+        // a publication blocker, while a fresh ledger has no owner.
+        let mut ownership = fresh_ownership();
+        assert_eq!(ownership.has_nonquiescent_owner(), None);
+        ownership.reserve_fill(0).expect("live fill reservation");
+        assert_eq!(
+            ownership.has_nonquiescent_owner(),
+            Some((0, XdpChunkState::FillReserved))
+        );
+    }
+
+    #[test]
+    fn generated_full_tx_rejection_is_counted_and_recycled_without_error() {
+        // Protect the expected-rejection branch in generated completion: a
+        // full TX ring rejects and recycles the frame without batch failure.
+        let mut harness = Harness::new();
+        initialize(&mut harness);
+        harness.tx.write_u32(0, RING_ENTRIES);
+        harness.tx.write_u32(64, 0);
+        let completion = {
+            let core = harness.core(BatchState::Generated);
+            let mut batch = XdpGeneratedBatchWithOps::new(core, IfId(7));
+            let slot = batch.allocate_slot(8).expect("generated slot");
+            slot.complete(GeneratedSlotCompletion::Transmit);
+            batch.finish_inner()
+        };
+        assert_eq!(
+            (
+                completion.requested,
+                completion.accepted,
+                completion.rejected
+            ),
+            (1, 0, 1)
+        );
+        assert!(completion.error.is_none());
+        assert_eq!(
+            harness.ownership.count(XdpChunkState::Free),
+            FRAME_COUNT - RX_FRAMES
+        );
+    }
+
+    #[test]
+    fn generated_transmit_success_publishes_descriptor_and_keeps_kernel_ownership() {
+        // Protect generated TX success: completion counts accepted exactly
+        // once, writes the selected frame descriptor, and leaves it kernel-owned.
+        let mut harness = Harness::new();
+        initialize(&mut harness);
+        let completion = {
+            let core = harness.core(BatchState::Generated);
+            let mut batch = XdpGeneratedBatchWithOps::new(core, IfId(7));
+            let slot = batch.allocate_slot(8).expect("generated slot");
+            slot.complete(GeneratedSlotCompletion::Transmit);
+            batch.finish_inner()
+        };
+        assert_eq!(
+            (
+                completion.requested,
+                completion.accepted,
+                completion.rejected
+            ),
+            (1, 1, 0)
+        );
+        assert!(completion.error.is_none());
+        assert_eq!(harness.ring_occupied(&harness.tx), 1);
+        assert_eq!(
+            harness.tx.read_descriptor(192),
+            XdpDescriptor {
+                address: (RX_FRAMES * FRAME_SIZE + DATA_OFFSET) as u64,
+                len: 8,
+                options: 0,
+            }
+        );
+        assert_eq!(harness.ownership.count(XdpChunkState::TxOwnedByKernel), 1);
+    }
 }
