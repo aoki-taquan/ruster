@@ -2349,6 +2349,8 @@ fn build_arp_request(frame: &mut [u8], action: ArpRequestAction) {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
     use super::*;
     use crate::{ForwardingSnapshot, Interface, LocalIpv4Binding, Neighbor, Route};
 
@@ -2448,6 +2450,236 @@ mod tests {
         let before = runtime_image(runtime);
         assert_eq!(runtime.preflight_publication().err(), Some(expected));
         assert_eq!(runtime_image(runtime), before);
+    }
+
+    const REVERSE_EGRESS: IfId = IfId(3);
+    const ORIGINAL_SOURCE: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 2]);
+    const REVERSE_SOURCE_IP: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 1]);
+    const FORWARD_PREFIX: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 0]);
+    const REVERSE_PREFIX: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 0]);
+    const REVERSE_MAC: MacAddress = MacAddress([3, 0, 0, 0, 0, 1]);
+
+    fn state_slot(
+        resolution_action: ArpRequestAction,
+        phase: ResolutionPhase,
+        attempts: u16,
+        accepted_attempts: u16,
+        generation: u64,
+    ) -> ResolutionStateSlot {
+        ResolutionStateSlot {
+            key: ResolutionKey {
+                egress: resolution_action.egress,
+                target: resolution_action.target_ip,
+            },
+            action: resolution_action,
+            generation,
+            attempts,
+            accepted_attempts,
+            requested_at: MonotonicMillis(0),
+            failed_at: MonotonicMillis(0),
+            occupied: true,
+            phase,
+            failure_notified: false,
+        }
+    }
+
+    fn failure_hold(
+        phase: ResolutionFailureHoldPhase,
+        forward: ResolutionGenerationToken,
+    ) -> ResolutionFailureHoldSlot {
+        let mut hold = ResolutionFailureHoldSlot {
+            phase,
+            forward,
+            reverse: ResolutionGenerationToken {
+                egress: REVERSE_EGRESS,
+                target: ORIGINAL_SOURCE,
+                generation: 1,
+            },
+            original_source: ORIGINAL_SOURCE,
+            original_destination: target(2),
+            forward_source_mac: SOURCE_MAC,
+            forward_source_ip: SOURCE_IP,
+            forward_prefix: FORWARD_PREFIX,
+            forward_prefix_len: 24,
+            original_tos: 0x12,
+            quote_len: 4,
+            ..ResolutionFailureHoldSlot::EMPTY
+        };
+        hold.quote[..4].copy_from_slice(&[0x45, 0, 0, 4]);
+        hold
+    }
+
+    struct FailureSnapshotFixture {
+        routes: Vec<Route>,
+        interfaces: Vec<Interface>,
+        neighbors: Vec<Neighbor>,
+        bindings: Vec<LocalIpv4Binding>,
+    }
+
+    impl FailureSnapshotFixture {
+        fn direct(with_reverse_neighbor: bool) -> Self {
+            Self {
+                routes: vec![
+                    Route::new(FORWARD_PREFIX, 24, WAN, None).unwrap(),
+                    Route::new(REVERSE_PREFIX, 24, REVERSE_EGRESS, None).unwrap(),
+                ],
+                interfaces: vec![
+                    Interface {
+                        id: WAN,
+                        mac: SOURCE_MAC,
+                    },
+                    Interface {
+                        id: REVERSE_EGRESS,
+                        mac: REVERSE_MAC,
+                    },
+                ],
+                neighbors: if with_reverse_neighbor {
+                    vec![Neighbor {
+                        interface: REVERSE_EGRESS,
+                        target: ORIGINAL_SOURCE,
+                        mac: MacAddress([9; 6]),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                bindings: vec![
+                    LocalIpv4Binding {
+                        interface: WAN,
+                        address: SOURCE_IP,
+                    },
+                    LocalIpv4Binding {
+                        interface: REVERSE_EGRESS,
+                        address: REVERSE_SOURCE_IP,
+                    },
+                ],
+            }
+        }
+
+        fn snapshot(&self) -> ForwardingSnapshot<'_> {
+            ForwardingSnapshot::new(
+                &self.routes,
+                &self.interfaces,
+                &self.neighbors,
+                &self.bindings,
+            )
+            .unwrap()
+        }
+    }
+
+    struct TestGeneratedIo;
+
+    struct TestGeneratedBatch;
+
+    struct TestGeneratedSlot {
+        bytes: Vec<u8>,
+    }
+
+    impl GeneratedPacketIo for TestGeneratedIo {
+        type Error = ();
+        type Batch<'a>
+            = TestGeneratedBatch
+        where
+            Self: 'a;
+
+        fn begin_generated(&mut self, _egress: IfId) -> Self::Batch<'_> {
+            TestGeneratedBatch
+        }
+    }
+
+    impl GeneratedPacketBatch for TestGeneratedBatch {
+        type Error = ();
+        type Slot<'a>
+            = TestGeneratedSlot
+        where
+            Self: 'a;
+
+        fn allocate(
+            &mut self,
+            frame_len: usize,
+        ) -> Result<crate::GeneratedPacketLease<Self::Slot<'_>>, GeneratedAllocationError> {
+            Ok(crate::GeneratedPacketLease::new(TestGeneratedSlot {
+                bytes: vec![0; frame_len],
+            }))
+        }
+
+        fn finish(self) -> GeneratedBatchCompletion<Self::Error> {
+            GeneratedBatchCompletion {
+                attempts: 1,
+                allocated: 1,
+                failed: 0,
+                requested: 1,
+                cancelled: 0,
+                abandoned: 0,
+                accepted: 1,
+                rejected: 0,
+                error: None,
+            }
+        }
+    }
+
+    impl crate::GeneratedPacketSlot for TestGeneratedSlot {
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut self.bytes
+        }
+
+        fn complete(self, _completion: crate::GeneratedSlotCompletion) {}
+    }
+
+    fn dispatch_failure_case(
+        fixture: &FailureSnapshotFixture,
+        hold: ResolutionFailureHoldSlot,
+        state_slots: &[ResolutionStateSlot],
+        dynamic_slots: &[DynamicNeighborSlot],
+    ) -> (
+        FailureDispatch,
+        ResolutionCounters,
+        Option<Icmpv4ErrorAction>,
+    ) {
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let mut states = state_slots.to_vec();
+        let mut actions = [ResolutionActionSlot::EMPTY; 2];
+        let mut dynamic_neighbors = dynamic_slots.to_vec();
+        let mut resolution = ResolutionRuntime::with_dynamic_neighbors(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut dynamic_neighbors,
+        );
+        resolution.states.copy_from_slice(state_slots);
+        resolution.pending_state_count = state_slots
+            .iter()
+            .filter(|state| state_is_pending(**state))
+            .count();
+
+        let mut icmp_states = [crate::Icmpv4ErrorStateSlot::EMPTY; 1];
+        let mut icmp_actions = [crate::Icmpv4ErrorActionSlot::EMPTY; 1];
+        let mut icmpv4_errors = Icmpv4ErrorRuntime::new(
+            crate::Icmpv4ErrorPolicy::default(),
+            &mut icmp_states,
+            &mut icmp_actions,
+        );
+        let snapshot = fixture.snapshot();
+        let outcome = dispatch_one_failure(
+            &mut resolution,
+            &mut icmpv4_errors,
+            &snapshot,
+            MonotonicMillis(0),
+            hold,
+        );
+        let action = if matches!(outcome, FailureDispatch::Queued(_)) {
+            let mut io = TestGeneratedIo;
+            crate::execute_one_icmpv4_error(
+                &mut io,
+                &mut icmpv4_errors,
+                MonotonicMillis(0),
+                &mut crate::NoGeneratedIcmpv4Trace,
+            )
+            .unwrap()
+            .map(|report| report.action)
+        } else {
+            None
+        };
+        (outcome, resolution.counters(), action)
     }
 
     #[derive(Default)]
@@ -2850,6 +3082,73 @@ mod tests {
         assert_eq!(status.attempts, 0);
         assert_eq!(status.generation, first_generation.wrapping_add(1));
         assert_eq!(runtime.counters().failures_expired, 1);
+    }
+
+    #[test]
+    fn schedule_expired_failed_state_clears_only_matching_failure_holds() {
+        // Protects #52-57 at the exact state-TTL boundary: live phase, forward-key,
+        // WaitingReverse-phase, and reverse-key checks must all be evaluated together.
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 4];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        let expired = ResolutionGenerationToken {
+            egress: WAN,
+            target: target(2),
+            generation: 1,
+        };
+        let unrelated_forward = ResolutionGenerationToken {
+            egress: WAN,
+            target: target(3),
+            generation: 1,
+        };
+        runtime.states[0] = state_slot(action(2), ResolutionPhase::Failed, 1, 1, 1);
+        runtime.states[0].failed_at = MonotonicMillis(0);
+
+        // A protects the non-empty phase and exact forward-key match branches.
+        let hold_a = failure_hold(ResolutionFailureHoldPhase::TerminalReady, expired);
+        // B protects TerminalReady from using a reverse match without WaitingReverse.
+        let mut hold_b = failure_hold(ResolutionFailureHoldPhase::TerminalReady, unrelated_forward);
+        hold_b.reverse = expired;
+        // C protects the WaitingReverse phase and exact reverse-key match branches.
+        let mut hold_c = failure_hold(
+            ResolutionFailureHoldPhase::WaitingReverse,
+            unrelated_forward,
+        );
+        hold_c.reverse = expired;
+        runtime.failure_holds[0] = hold_a;
+        runtime.failure_holds[1] = hold_b;
+        runtime.failure_holds[2] = hold_c;
+        // Protects #51's outer `phase != Empty && (...)` guard: an empty slot
+        // with only a matching forward token must be ignored; changing `&&`
+        // to `||` reaches clear_failure_hold and trips its live-slot assertion.
+        runtime.failure_holds[3] = ResolutionFailureHoldSlot::EMPTY;
+        runtime.failure_holds[3].forward = expired;
+        runtime.pending_failure_hold_count = 3;
+
+        assert_eq!(runtime.pending_failure_holds(), 3);
+        assert_eq!(
+            runtime.schedule(action(2), MonotonicMillis(1_000), false),
+            ResolutionResult::Queued
+        );
+
+        // A and C are cleared, while B remains because only its reverse key matches.
+        assert_eq!(runtime.pending_failure_holds(), 1);
+        assert_eq!(runtime.failure_holds[0], ResolutionFailureHoldSlot::EMPTY);
+        assert_eq!(runtime.failure_holds[1], hold_b);
+        assert_eq!(runtime.failure_holds[2], ResolutionFailureHoldSlot::EMPTY);
+        assert_eq!(
+            runtime.failure_holds[3].phase,
+            ResolutionFailureHoldPhase::Empty
+        );
+        assert_eq!(runtime.failure_holds[3].forward, expired);
     }
 
     #[test]
@@ -3637,5 +3936,1985 @@ mod tests {
         }
         assert_eq!(holds[0].quote_len, 0);
         assert!(holds[0].quote.iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn publication_validation_covers_empty_head_and_queue_window_boundaries() {
+        // Protects validation of a nonzero head in an empty action ring.
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let mut states = [];
+        let mut actions = [];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.head = 1;
+        assert_publication_error_is_atomic(
+            &mut runtime,
+            ResolutionPublicationError::ActionQueueHead,
+        );
+
+        // Protects the strict queue-window boundary when a nonempty ring has no queued slot.
+        let mut states = [];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        let permit = runtime.preflight_publication().unwrap();
+        assert_eq!(permit.preview(), ResolutionPublicationReport::default());
+        drop(permit);
+    }
+
+    #[test]
+    fn publication_reconciliation_matches_dynamic_neighbors_and_holds_exactly() {
+        // Protects interface/target conjunctions while removing static-shadowed dynamic neighbors.
+        for neighbor in [
+            Neighbor {
+                interface: REVERSE_EGRESS,
+                target: target(2),
+                mac: MacAddress([8; 6]),
+            },
+            Neighbor {
+                interface: WAN,
+                target: target(3),
+                mac: MacAddress([8; 6]),
+            },
+        ] {
+            let mut fixture = FailureSnapshotFixture::direct(false);
+            fixture.neighbors.push(neighbor);
+            let snapshot = fixture.snapshot();
+            let mut states = [];
+            let mut actions = [];
+            let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
+            let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+                ResolutionPolicy::new(1_000, 1_000).unwrap(),
+                &mut states,
+                &mut actions,
+                &mut dynamic,
+            );
+            runtime.reconcile_publication(&snapshot);
+            runtime.dynamic_neighbors[0] = DynamicNeighborSlot {
+                interface: WAN,
+                target: target(2),
+                mac: MacAddress([7; 6]),
+                refreshed_at: MonotonicMillis(0),
+                occupied: true,
+            };
+            assert_eq!(
+                runtime.reconcile_publication(&snapshot),
+                StaticReconcileReport::default()
+            );
+            assert!(runtime.dynamic_neighbors[0].is_occupied());
+        }
+        let mut fixture = FailureSnapshotFixture::direct(false);
+        fixture.neighbors.push(Neighbor {
+            interface: WAN,
+            target: target(2),
+            mac: MacAddress([8; 6]),
+        });
+        let snapshot = fixture.snapshot();
+        let mut states = [];
+        let mut actions = [];
+        let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+            ResolutionPolicy::new(1_000, 1_000).unwrap(),
+            &mut states,
+            &mut actions,
+            &mut dynamic,
+        );
+        runtime.reconcile_publication(&snapshot);
+        runtime.dynamic_neighbors[0] = DynamicNeighborSlot {
+            interface: WAN,
+            target: target(2),
+            mac: MacAddress([7; 6]),
+            refreshed_at: MonotonicMillis(0),
+            occupied: true,
+        };
+        assert_eq!(runtime.reconcile_publication(&snapshot).dynamic_removed, 1);
+        assert!(!runtime.dynamic_neighbors[0].is_occupied());
+
+        // Protects the valid-hold branch from being treated as invalid by a changed boolean join.
+        let fixture = FailureSnapshotFixture::direct(false);
+        let snapshot = fixture.snapshot();
+        let hold = failure_hold(
+            ResolutionFailureHoldPhase::TerminalReady,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: target(2),
+                generation: 1,
+            },
+        );
+        let mut states = [];
+        let mut actions = [];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            ResolutionPolicy::new(1_000, 1_000).unwrap(),
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        runtime.reconcile_publication(&snapshot);
+        runtime.failure_holds[0] = hold;
+        runtime.pending_failure_hold_count = 1;
+        assert_eq!(
+            runtime.reconcile_publication(&snapshot),
+            StaticReconcileReport::default()
+        );
+        assert_eq!(runtime.pending_failure_holds(), 1);
+
+        // Protects the empty-hold short circuit from incrementing cancellation accounting.
+        let empty_snapshot = ForwardingSnapshot::new(&[], &[], &[], &[]).unwrap();
+        let mut states = [];
+        let mut actions = [];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            ResolutionPolicy::new(1_000, 1_000).unwrap(),
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        runtime.reconcile_publication(&empty_snapshot);
+        assert_eq!(runtime.failure_counters.cancelled, 0);
+    }
+
+    #[test]
+    fn compact_publication_actions_resets_head_after_removing_last_action() {
+        // Protects ring-head normalization when publication compaction retains no actions.
+        let fixture = ForwardingSnapshot::new(&[], &[], &[], &[]).unwrap();
+        let mut states = [];
+        let mut actions = [ResolutionActionSlot::EMPTY; 2];
+        let mut runtime = ResolutionRuntime::new(
+            ResolutionPolicy::new(1_000, 1_000).unwrap(),
+            &mut states,
+            &mut actions,
+        );
+        runtime.head = 1;
+        runtime.len = 1;
+        runtime.actions[1].0 = Some(QueuedAction {
+            action: action(2),
+            generation: 1,
+        });
+        runtime.reconcile_publication(&fixture);
+        assert_eq!((runtime.head, runtime.len), (0, 0));
+    }
+
+    #[test]
+    fn cooldown_count_and_status_require_occupied_matching_states() {
+        // Protects cooldown counting from including active or empty slots.
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 3];
+        let mut actions = [];
+        let runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.states[0] = state_slot(action(2), ResolutionPhase::Waiting, 1, 0, 1);
+        runtime.states[1] = state_slot(action(4), ResolutionPhase::Cooldown, 1, 0, 2);
+        // Protects cooldown_count from counting an occupied non-Cooldown terminal state.
+        runtime.states[2] = state_slot(action(6), ResolutionPhase::Failed, 1, 0, 3);
+        assert_eq!(runtime.cooldown_count(), 1);
+
+        // Protects status lookup from matching an empty slot or a partially matching key.
+        assert_eq!(
+            runtime.status(IfId(0), Ipv4Address::from_octets([0; 4])),
+            None
+        );
+        assert_eq!(runtime.status(WAN, target(3)), None);
+        let status = runtime.status(WAN, target(2)).unwrap();
+        assert_eq!(
+            status,
+            ResolutionStatus {
+                phase: ResolutionPhase::Waiting,
+                attempts: 1,
+                accepted_attempts: 0,
+                generation: 1,
+                requested_at: Some(MonotonicMillis(0)),
+                failed_at: None,
+                terminal_notified: false,
+            }
+        );
+        runtime.states[0].phase = ResolutionPhase::Failed;
+        runtime.states[0].failed_at = MonotonicMillis(7);
+        runtime.states[0].failure_notified = true;
+        assert_eq!(
+            runtime.status(WAN, target(2)).unwrap().failed_at,
+            Some(MonotonicMillis(7))
+        );
+        assert!(runtime.status(WAN, target(2)).unwrap().terminal_notified);
+    }
+
+    #[test]
+    fn publication_hold_valid_requires_every_forwarding_authority_field() {
+        // Protects the valid publication-hold conjunction and both terminal rejection conditions.
+        let base_fixture = FailureSnapshotFixture::direct(false);
+        let base_snapshot = base_fixture.snapshot();
+        let base_hold = failure_hold(
+            ResolutionFailureHoldPhase::TerminalReady,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: target(2),
+                generation: 1,
+            },
+        );
+        assert!(publication_hold_valid(&base_snapshot, base_hold));
+
+        // Protects #129's neighbor-key `&&`: an interface-only match is not an exact
+        // static neighbor, so changing the inner conjunction to `||` must not reject it.
+        let mut fixture = FailureSnapshotFixture::direct(false);
+        fixture.neighbors.push(Neighbor {
+            interface: WAN,
+            target: target(3),
+            mac: MacAddress([8; 6]),
+        });
+        assert!(publication_hold_valid(&fixture.snapshot(), base_hold));
+        // Protects the other partial-key boundary: a target-only match is also valid.
+        let mut fixture = FailureSnapshotFixture::direct(false);
+        fixture.neighbors.push(Neighbor {
+            interface: REVERSE_EGRESS,
+            target: target(2),
+            mac: MacAddress([8; 6]),
+        });
+        assert!(publication_hold_valid(&fixture.snapshot(), base_hold));
+
+        // Protects every route component and route/interface boolean join.
+        let mut fixture = FailureSnapshotFixture::direct(false);
+        fixture.routes[0] = Route::new(FORWARD_PREFIX, 24, REVERSE_EGRESS, None).unwrap();
+        assert!(!publication_hold_valid(&fixture.snapshot(), base_hold));
+        let mut fixture = FailureSnapshotFixture::direct(false);
+        fixture.routes[0] = Route::new(FORWARD_PREFIX, 24, WAN, Some(target(9))).unwrap();
+        assert!(!publication_hold_valid(&fixture.snapshot(), base_hold));
+        let mut hold = base_hold;
+        hold.forward.target = target(3);
+        assert!(!publication_hold_valid(&base_snapshot, hold));
+        let mut hold = base_hold;
+        hold.forward_prefix = Ipv4Address::from_octets([192, 0, 3, 0]);
+        assert!(!publication_hold_valid(&base_snapshot, hold));
+        let mut hold = base_hold;
+        hold.forward_prefix_len = 23;
+        assert!(!publication_hold_valid(&base_snapshot, hold));
+
+        // Protects interface and local-binding identity joins and their comparisons.
+        let mut fixture = FailureSnapshotFixture::direct(false);
+        fixture.interfaces[0].mac = MacAddress([8; 6]);
+        assert!(!publication_hold_valid(&fixture.snapshot(), base_hold));
+        let mut fixture = FailureSnapshotFixture::direct(false);
+        fixture.bindings[0].address = target(9);
+        assert!(!publication_hold_valid(&fixture.snapshot(), base_hold));
+        // Protects the exact static-neighbor exclusion and host-forbidden exclusion separately.
+        let mut fixture = FailureSnapshotFixture::direct(false);
+        fixture.neighbors.push(Neighbor {
+            interface: WAN,
+            target: target(2),
+            mac: MacAddress([8; 6]),
+        });
+        assert!(!publication_hold_valid(&fixture.snapshot(), base_hold));
+        let mut fixture = FailureSnapshotFixture::direct(false);
+        fixture.bindings[0].address = target(2);
+        let mut hold = base_hold;
+        hold.forward_source_ip = target(2);
+        assert!(!publication_hold_valid(&fixture.snapshot(), hold));
+
+        // Protects route/interface and local-binding exact comparisons with a fully valid snapshot.
+        assert!(publication_hold_valid(&base_snapshot, base_hold));
+    }
+
+    #[test]
+    fn current_icmp_error_eligibility_covers_unicast_local_and_route_boundaries() {
+        // Protects the positive eligibility result and the constant replacement mutants.
+        let empty = ForwardingSnapshot::new(&[], &[], &[], &[]).unwrap();
+        let mut eligible = failure_hold(
+            ResolutionFailureHoldPhase::TerminalReady,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: target(2),
+                generation: 1,
+            },
+        );
+        eligible.original_source = ORIGINAL_SOURCE;
+        assert!(current_icmp_error_eligible(&empty, eligible));
+
+        // Protects unspecified, loopback, multicast, and each first-octet comparison.
+        for source in [
+            Ipv4Address::from_octets([0, 1, 2, 3]),
+            Ipv4Address::from_octets([127, 1, 2, 3]),
+            Ipv4Address::from_octets([224, 1, 2, 3]),
+        ] {
+            let mut hold = eligible;
+            hold.original_source = source;
+            assert!(!current_icmp_error_eligible(&empty, hold));
+        }
+        let mut below_multicast = eligible;
+        below_multicast.original_source = Ipv4Address::from_octets([223, 1, 2, 3]);
+        assert!(current_icmp_error_eligible(&empty, below_multicast));
+        let mut above_multicast = eligible;
+        above_multicast.original_source = Ipv4Address::from_octets([225, 1, 2, 3]);
+        assert!(!current_icmp_error_eligible(&empty, above_multicast));
+
+        // Protects suppression of ICMP errors for a local original source.
+        let interfaces = [Interface {
+            id: WAN,
+            mac: SOURCE_MAC,
+        }];
+        let bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: ORIGINAL_SOURCE,
+        }];
+        let local_snapshot = ForwardingSnapshot::new(&[], &interfaces, &[], &bindings).unwrap();
+        assert!(!current_icmp_error_eligible(&local_snapshot, eligible));
+
+        // Protects network-address and directed-broadcast route exclusions independently.
+        let routes = [Route::new(FORWARD_PREFIX, 24, WAN, None).unwrap()];
+        let route_snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &[]).unwrap();
+        for source in [FORWARD_PREFIX, Ipv4Address::from_octets([192, 0, 2, 255])] {
+            let mut hold = eligible;
+            hold.original_source = source;
+            assert!(!current_icmp_error_eligible(&route_snapshot, hold));
+        }
+
+        // Protects the local-source and route-source boolean joins with one false operand each.
+        assert!(!current_icmp_error_eligible(&local_snapshot, eligible));
+    }
+
+    #[test]
+    fn host_failure_target_forbidden_covers_address_and_connected_route_rules() {
+        // Protects the allowed ordinary host target and the constant replacement mutants.
+        let empty = ForwardingSnapshot::new(&[], &[], &[], &[]).unwrap();
+        let local = SOURCE_IP;
+        assert!(!host_failure_target_forbidden(
+            &empty,
+            WAN,
+            target(2),
+            local
+        ));
+        for target_ip in [
+            Ipv4Address::from_octets([0, 1, 2, 3]),
+            Ipv4Address::from_octets([127, 1, 2, 3]),
+            Ipv4Address::from_octets([224, 1, 2, 3]),
+            Ipv4Address::from_octets([255; 4]),
+        ] {
+            assert!(host_failure_target_forbidden(&empty, WAN, target_ip, local));
+        }
+        assert!(host_failure_target_forbidden(&empty, WAN, local, local));
+
+        // Protects every first-octet, broadcast, and local-address comparison on allowed input.
+        assert!(!host_failure_target_forbidden(
+            &empty,
+            WAN,
+            Ipv4Address::from_octets([192, 0, 2, 2]),
+            local,
+        ));
+        let interfaces = [Interface {
+            id: WAN,
+            mac: SOURCE_MAC,
+        }];
+        let local_target = target(9);
+        let bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: local_target,
+        }];
+        let local_snapshot = ForwardingSnapshot::new(&[], &interfaces, &[], &bindings).unwrap();
+        assert!(host_failure_target_forbidden(
+            &local_snapshot,
+            WAN,
+            local_target,
+            local,
+        ));
+
+        // Protects connected network/broadcast routes and requires the correct egress.
+        let routes = [Route::new(FORWARD_PREFIX, 24, WAN, None).unwrap()];
+        let route_snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &[]).unwrap();
+        assert!(host_failure_target_forbidden(
+            &route_snapshot,
+            WAN,
+            FORWARD_PREFIX,
+            local,
+        ));
+        assert!(host_failure_target_forbidden(
+            &route_snapshot,
+            WAN,
+            Ipv4Address::from_octets([192, 0, 2, 255]),
+            local,
+        ));
+        assert!(!host_failure_target_forbidden(
+            &route_snapshot,
+            REVERSE_EGRESS,
+            FORWARD_PREFIX,
+            local,
+        ));
+
+        // Protects both route subconditions when only one of network/broadcast is true.
+        assert!(host_failure_target_forbidden(
+            &route_snapshot,
+            WAN,
+            FORWARD_PREFIX,
+            local,
+        ));
+
+        // Protects the local-binding/route boolean join when the route alone forbids the target.
+        assert!(host_failure_target_forbidden(
+            &route_snapshot,
+            WAN,
+            FORWARD_PREFIX,
+            local,
+        ));
+    }
+
+    #[test]
+    fn forbidden_target_has_independent_first_octet_and_broadcast_guards() {
+        // Protects the standalone forbidden_target helper from a constant result.
+        assert!(!forbidden_target(target(2)));
+        for target_ip in [
+            Ipv4Address::from_octets([0, 1, 2, 3]),
+            Ipv4Address::from_octets([127, 1, 2, 3]),
+            Ipv4Address::from_octets([224, 1, 2, 3]),
+            Ipv4Address::from_octets([255; 4]),
+        ] {
+            assert!(forbidden_target(target_ip));
+        }
+    }
+
+    #[test]
+    fn next_generation_rejects_every_live_reverse_token_alias() {
+        // Protects reverse-hold phase, key, and generation conjunctions from aliasing a live token.
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let mut states = [];
+        let mut actions = [];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        let unrelated_forward = ResolutionGenerationToken {
+            egress: IfId(9),
+            target: Ipv4Address::from_octets([203, 0, 113, 9]),
+            generation: 99,
+        };
+        let reverse = ResolutionGenerationToken {
+            egress: WAN,
+            target: target(2),
+            generation: 1,
+        };
+        let mut exact = failure_hold(
+            ResolutionFailureHoldPhase::WaitingReverse,
+            unrelated_forward,
+        );
+        exact.reverse = reverse;
+        runtime.failure_holds[0] = exact;
+        assert_eq!(runtime.next_generation(WAN, target(2), 0), 2);
+
+        // Protects each reverse comparison when one field is deliberately mismatched.
+        let mut phase_mismatch = exact;
+        phase_mismatch.phase = ResolutionFailureHoldPhase::TerminalReady;
+        runtime.failure_holds[0] = phase_mismatch;
+        assert_eq!(runtime.next_generation(WAN, target(2), 0), 1);
+        let mut egress_mismatch = exact;
+        egress_mismatch.reverse.egress = REVERSE_EGRESS;
+        runtime.failure_holds[0] = egress_mismatch;
+        assert_eq!(runtime.next_generation(WAN, target(2), 0), 1);
+        let mut target_mismatch = exact;
+        target_mismatch.reverse.target = target(3);
+        runtime.failure_holds[0] = target_mismatch;
+        assert_eq!(runtime.next_generation(WAN, target(2), 0), 1);
+        let mut generation_mismatch = exact;
+        generation_mismatch.reverse.generation = 2;
+        runtime.failure_holds[0] = generation_mismatch;
+        assert_eq!(runtime.next_generation(WAN, target(2), 0), 1);
+
+        // Protects every reverse && operator from accepting an alias when one operand is false.
+        let mut phase_or_egress = exact;
+        phase_or_egress.reverse.egress = REVERSE_EGRESS;
+        runtime.failure_holds[0] = phase_or_egress;
+        assert_eq!(runtime.next_generation(WAN, target(2), 0), 1);
+        let mut egress_or_target = exact;
+        egress_or_target.reverse.target = target(3);
+        runtime.failure_holds[0] = egress_or_target;
+        assert_eq!(runtime.next_generation(WAN, target(2), 0), 1);
+        let mut target_or_generation = exact;
+        target_or_generation.reverse.generation = 2;
+        runtime.failure_holds[0] = target_or_generation;
+        assert_eq!(runtime.next_generation(WAN, target(2), 0), 1);
+    }
+
+    #[test]
+    fn poll_timers_reports_only_a_matching_no_accepted_candidate() {
+        // Protects no-accepted accounting and hold matching at terminal timeout.
+        let policy = ResolutionPolicy::with_retry(1_000, 1_000, 1).unwrap();
+        let token = ResolutionGenerationToken {
+            egress: WAN,
+            target: target(2),
+            generation: 1,
+        };
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        runtime.states[0] = state_slot(action(2), ResolutionPhase::Waiting, 1, 0, 1);
+        runtime.states[0].requested_at = MonotonicMillis(0);
+        runtime.pending_state_count = 1;
+        runtime.failure_holds[0] = failure_hold(ResolutionFailureHoldPhase::WaitingForward, token);
+        runtime.pending_failure_hold_count = 1;
+        let mut trace = TimerTrace::default();
+        let report = runtime
+            .poll_timers(MonotonicMillis(1_000), 1, &mut trace)
+            .unwrap();
+        assert_eq!((report.timed_out, report.no_accepted_arp_request), (1, 1));
+        assert_eq!(runtime.pending_failure_holds(), 0);
+        assert!(matches!(
+            trace.events[1],
+            Some(ResolutionTimerTrace::NoAcceptedArpRequest { .. })
+        ));
+
+        // Protects the any() predicate from accepting the right phase with the wrong token.
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        runtime.states[0] = state_slot(action(2), ResolutionPhase::Waiting, 1, 0, 1);
+        runtime.pending_state_count = 1;
+        runtime.failure_holds[0] = failure_hold(
+            ResolutionFailureHoldPhase::WaitingForward,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: target(3),
+                generation: 1,
+            },
+        );
+        runtime.pending_failure_hold_count = 1;
+        let report = runtime
+            .poll_timers(MonotonicMillis(1_000), 1, &mut NoResolutionTimerTrace)
+            .unwrap();
+        assert_eq!(report.no_accepted_arp_request, 0);
+        assert_eq!(runtime.pending_failure_holds(), 1);
+    }
+
+    #[test]
+    fn poll_timers_expires_forward_and_reverse_holds_only_on_exact_tokens() {
+        // Protects terminal expiry cleanup for a matching forward token.
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let token = ResolutionGenerationToken {
+            egress: WAN,
+            target: target(2),
+            generation: 1,
+        };
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 2];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        runtime.states[0] = state_slot(action(2), ResolutionPhase::Failed, 1, 1, 1);
+        runtime.states[0].failed_at = MonotonicMillis(0);
+        runtime.pending_state_count = 1;
+        runtime.failure_holds[0] = failure_hold(ResolutionFailureHoldPhase::TerminalReady, token);
+        runtime.pending_failure_hold_count = 1;
+        let report = runtime
+            .poll_timers(MonotonicMillis(1_000), 1, &mut NoResolutionTimerTrace)
+            .unwrap();
+        assert_eq!(report.failures_expired, 1);
+        assert_eq!(runtime.pending_failure_holds(), 0);
+
+        // Protects reverse-only cleanup from requiring the forward token to match as well.
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        runtime.states[0] = state_slot(action(2), ResolutionPhase::Failed, 1, 1, 1);
+        runtime.states[0].failed_at = MonotonicMillis(0);
+        runtime.pending_state_count = 1;
+        let mut reverse_hold = failure_hold(
+            ResolutionFailureHoldPhase::WaitingReverse,
+            ResolutionGenerationToken {
+                egress: REVERSE_EGRESS,
+                target: target(3),
+                generation: 7,
+            },
+        );
+        reverse_hold.reverse = token;
+        runtime.failure_holds[0] = reverse_hold;
+        runtime.pending_failure_hold_count = 1;
+        let report = runtime
+            .poll_timers(MonotonicMillis(1_000), 1, &mut NoResolutionTimerTrace)
+            .unwrap();
+        assert_eq!(report.failures_expired, 1);
+        assert_eq!(runtime.pending_failure_holds(), 0);
+
+        // Protects phase and reverse-field checks from clearing an unrelated reverse token.
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 2];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        runtime.states[0] = state_slot(action(2), ResolutionPhase::Failed, 1, 1, 1);
+        runtime.states[0].failed_at = MonotonicMillis(0);
+        runtime.pending_state_count = 1;
+        let mut unrelated_phase = failure_hold(
+            ResolutionFailureHoldPhase::TerminalReady,
+            ResolutionGenerationToken {
+                egress: REVERSE_EGRESS,
+                target: target(3),
+                generation: 7,
+            },
+        );
+        unrelated_phase.reverse = token;
+        runtime.failure_holds[0] = unrelated_phase;
+        runtime.failure_holds[1] = ResolutionFailureHoldSlot::EMPTY;
+        runtime.pending_failure_hold_count = 1;
+        let report = runtime
+            .poll_timers(MonotonicMillis(1_000), 1, &mut NoResolutionTimerTrace)
+            .unwrap();
+        assert_eq!(report.failures_expired, 1);
+        assert_eq!(runtime.pending_failure_holds(), 1);
+    }
+
+    #[test]
+    fn capture_failure_candidate_requires_an_active_exact_generation() {
+        // Protects capture from inactive, differently keyed, and duplicate candidates.
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let original_ipv4 = [0x45, 0, 0, 4];
+        let capture_args = |runtime: &mut ResolutionRuntime<'_>| {
+            runtime.capture_failure_candidate(
+                WAN,
+                target(2),
+                ORIGINAL_SOURCE,
+                target(2),
+                SOURCE_MAC,
+                SOURCE_IP,
+                FORWARD_PREFIX,
+                24,
+                0x12,
+                &original_ipv4,
+            )
+        };
+
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 2];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        runtime.states[0] = state_slot(action(2), ResolutionPhase::Waiting, 1, 0, 1);
+        runtime.pending_state_count = 1;
+        assert!(matches!(
+            capture_args(&mut runtime),
+            ResolutionFailureCapture::Captured(_)
+        ));
+        assert!(matches!(
+            capture_args(&mut runtime),
+            ResolutionFailureCapture::Existing(_)
+        ));
+
+        runtime.states[0].phase = ResolutionPhase::Failed;
+        assert_eq!(
+            capture_args(&mut runtime),
+            ResolutionFailureCapture::Inactive
+        );
+
+        // Each mismatch makes the original conjunction false while retaining the other fields.
+        for mismatch in 0..3 {
+            let mut states = [ResolutionStateSlot::EMPTY; 1];
+            let mut actions = [];
+            let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+            let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+                policy,
+                &mut states,
+                &mut actions,
+                &mut [],
+                &mut holds,
+            );
+            let mut candidate = state_slot(action(2), ResolutionPhase::Waiting, 1, 0, 1);
+            match mismatch {
+                0 => candidate.occupied = false,
+                1 => {
+                    candidate.key.egress = REVERSE_EGRESS;
+                    candidate.action.egress = REVERSE_EGRESS;
+                }
+                2 => {
+                    candidate.key.target = target(3);
+                    candidate.action.target_ip = target(3);
+                }
+                _ => unreachable!(),
+            }
+            runtime.states[0] = candidate;
+            assert_eq!(
+                capture_args(&mut runtime),
+                ResolutionFailureCapture::Inactive
+            );
+        }
+    }
+
+    #[test]
+    fn schedule_rejects_each_forbidden_target_reason_independently() {
+        // Protects the three independent forbidden-target checks from being joined with AND.
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 3];
+        let mut actions = [ResolutionActionSlot::EMPTY; 3];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        assert_eq!(
+            runtime.schedule(action(2), MonotonicMillis(0), true),
+            ResolutionResult::ForbiddenTarget
+        );
+
+        let mut self_target = action(3);
+        self_target.target_ip = self_target.source_ip;
+        assert_eq!(
+            runtime.schedule(self_target, MonotonicMillis(0), false),
+            ResolutionResult::ForbiddenTarget
+        );
+
+        let mut multicast = action(4);
+        multicast.target_ip = Ipv4Address::from_octets([224, 0, 0, 1]);
+        assert_eq!(
+            runtime.schedule(multicast, MonotonicMillis(0), false),
+            ResolutionResult::ForbiddenTarget
+        );
+        assert_eq!(runtime.counters().forbidden_target, 3);
+    }
+
+    #[test]
+    fn dynamic_lookup_and_merge_require_exact_keys_and_ttl_boundaries() {
+        // Protects dynamic lookup from matching an occupied slot on only one key component.
+        let policy = ResolutionPolicy::with_dynamic_neighbor_ttl(1_000, 1_000, 1_000).unwrap();
+        let dynamic_slot = DynamicNeighborSlot {
+            interface: WAN,
+            target: target(2),
+            mac: MacAddress([7; 6]),
+            refreshed_at: MonotonicMillis(0),
+            occupied: true,
+        };
+        let mut states = [];
+        let mut actions = [];
+        let mut dynamic = [dynamic_slot];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut dynamic,
+        );
+        runtime.dynamic_neighbors[0] = dynamic_slot;
+        assert_eq!(
+            runtime.lookup_dynamic(WAN, target(2), MonotonicMillis(1)),
+            DynamicLookup::Hit(MacAddress([7; 6]))
+        );
+        assert_eq!(
+            runtime.lookup_dynamic(REVERSE_EGRESS, target(2), MonotonicMillis(1)),
+            DynamicLookup::Miss
+        );
+        assert_eq!(
+            runtime.lookup_dynamic(WAN, target(3), MonotonicMillis(1)),
+            DynamicLookup::Miss
+        );
+
+        // Protects merge from treating an empty slot as an existing entry.
+        let mut states = [];
+        let mut actions = [];
+        let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut dynamic,
+        );
+        assert_eq!(
+            runtime.merge_dynamic(
+                IfId(0),
+                Ipv4Address::from_octets([0; 4]),
+                MacAddress([1; 6]),
+                true,
+                false,
+                MonotonicMillis(0),
+            ),
+            ControlDisposition::Inserted
+        );
+
+        // Protects exact-key updates and prevents a fresh mismatched entry from being updated.
+        let mut states = [];
+        let mut actions = [];
+        let mut dynamic = [dynamic_slot];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut dynamic,
+        );
+        runtime.dynamic_neighbors[0] = dynamic_slot;
+        assert_eq!(
+            runtime.merge_dynamic(
+                WAN,
+                target(2),
+                MacAddress([8; 6]),
+                true,
+                false,
+                MonotonicMillis(1),
+            ),
+            ControlDisposition::Updated
+        );
+        assert_eq!(
+            runtime.merge_dynamic(
+                REVERSE_EGRESS,
+                target(2),
+                MacAddress([9; 6]),
+                true,
+                false,
+                MonotonicMillis(1),
+            ),
+            ControlDisposition::CacheFull
+        );
+
+        // Protects strict expiration at equality and after the configured TTL.
+        for now in [1_000, 2_001] {
+            let mut states = [];
+            let mut actions = [];
+            let mut dynamic = [dynamic_slot];
+            let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+                policy,
+                &mut states,
+                &mut actions,
+                &mut dynamic,
+            );
+            runtime.dynamic_neighbors[0] = dynamic_slot;
+            assert_eq!(
+                runtime.merge_dynamic(
+                    WAN,
+                    target(2),
+                    MacAddress([8; 6]),
+                    true,
+                    false,
+                    MonotonicMillis(now),
+                ),
+                ControlDisposition::Inserted
+            );
+        }
+
+        // Protects reuse of a stale occupied slot for a different key.
+        let mut states = [];
+        let mut actions = [];
+        let mut dynamic = [dynamic_slot];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut dynamic,
+        );
+        runtime.dynamic_neighbors[0] = dynamic_slot;
+        assert_eq!(
+            runtime.merge_dynamic(
+                WAN,
+                target(3),
+                MacAddress([9; 6]),
+                true,
+                false,
+                MonotonicMillis(1_000),
+            ),
+            ControlDisposition::Inserted
+        );
+    }
+
+    #[test]
+    fn observe_control_clear_resolution_and_static_key_use_exact_keys() {
+        // Protects control-clock monotonicity independently of packet-resolution decisions.
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let mut states = [];
+        let mut actions = [];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        assert!(runtime.observe_control(MonotonicMillis(10)));
+        assert!(!runtime.observe_control(MonotonicMillis(9)));
+
+        // Protects clear_resolution from cancelling a state, action, or hold on a partial key.
+        let mut states = [ResolutionStateSlot::EMPTY; 3];
+        let mut actions = [ResolutionActionSlot::EMPTY; 3];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 3];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        let mut other_egress = action(2);
+        other_egress.egress = REVERSE_EGRESS;
+        runtime.states[0] = state_slot(other_egress, ResolutionPhase::Waiting, 0, 0, 1);
+        runtime.states[1] = state_slot(action(3), ResolutionPhase::Waiting, 0, 0, 1);
+        runtime.states[2] = state_slot(action(2), ResolutionPhase::Waiting, 0, 0, 1);
+        runtime.pending_state_count = 3;
+        runtime.actions[0].0 = Some(QueuedAction {
+            action: other_egress,
+            generation: 1,
+        });
+        runtime.actions[1].0 = Some(QueuedAction {
+            action: action(3),
+            generation: 1,
+        });
+        runtime.actions[2].0 = Some(QueuedAction {
+            action: action(2),
+            generation: 1,
+        });
+        runtime.len = 3;
+        runtime.failure_holds[0] = failure_hold(
+            ResolutionFailureHoldPhase::TerminalReady,
+            ResolutionGenerationToken {
+                egress: REVERSE_EGRESS,
+                target: target(2),
+                generation: 1,
+            },
+        );
+        runtime.failure_holds[1] = failure_hold(
+            ResolutionFailureHoldPhase::TerminalReady,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: target(3),
+                generation: 1,
+            },
+        );
+        runtime.failure_holds[2] = failure_hold(
+            ResolutionFailureHoldPhase::TerminalReady,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: target(2),
+                generation: 1,
+            },
+        );
+        runtime.pending_failure_hold_count = 3;
+        runtime.clear_resolution(WAN, target(2));
+        assert!(runtime.states[0].is_occupied());
+        assert!(runtime.states[1].is_occupied());
+        assert!(!runtime.states[2].is_occupied());
+        assert_eq!(runtime.pending_actions(), 2);
+        assert_eq!(runtime.pending_failure_holds(), 2);
+
+        // Protects reconcile_static_key from deleting a dynamic neighbor on a partial key.
+        let mut states = [];
+        let mut actions = [];
+        let mut dynamic = [DynamicNeighborSlot::EMPTY; 3];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut dynamic,
+        );
+        runtime.dynamic_neighbors[0] = DynamicNeighborSlot {
+            interface: REVERSE_EGRESS,
+            target: target(2),
+            mac: MacAddress([1; 6]),
+            refreshed_at: MonotonicMillis(0),
+            occupied: true,
+        };
+        runtime.dynamic_neighbors[1] = DynamicNeighborSlot {
+            interface: WAN,
+            target: target(3),
+            mac: MacAddress([2; 6]),
+            refreshed_at: MonotonicMillis(0),
+            occupied: true,
+        };
+        runtime.dynamic_neighbors[2] = DynamicNeighborSlot {
+            interface: WAN,
+            target: target(2),
+            mac: MacAddress([3; 6]),
+            refreshed_at: MonotonicMillis(0),
+            occupied: true,
+        };
+        runtime.reconcile_static_key(WAN, target(2));
+        assert!(runtime.dynamic_neighbors[0].is_occupied());
+        assert!(runtime.dynamic_neighbors[1].is_occupied());
+        assert!(!runtime.dynamic_neighbors[2].is_occupied());
+    }
+
+    #[test]
+    fn observe_and_execution_time_validation_preserve_regressions() {
+        // Protects execution-time validation from accepting a regressed timestamp or rejecting a valid one.
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let mut states = [];
+        let mut actions = [];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        assert!(runtime.execution_time_valid(MonotonicMillis(10)));
+        assert!(!runtime.execution_time_valid(MonotonicMillis(9)));
+    }
+
+    #[test]
+    fn mark_failed_filters_hold_phase_and_generation_for_both_acceptance_paths() {
+        // Protects no-accepted failure cleanup from clearing a hold with a different token.
+        let policy = ResolutionPolicy::with_retry(1_000, 1_000, 1).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 2];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        runtime.states[0] = state_slot(action(2), ResolutionPhase::Waiting, 1, 0, 1);
+        runtime.pending_state_count = 1;
+        runtime.failure_holds[0] = failure_hold(
+            ResolutionFailureHoldPhase::WaitingForward,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: target(2),
+                generation: 1,
+            },
+        );
+        runtime.failure_holds[1] = failure_hold(
+            ResolutionFailureHoldPhase::WaitingForward,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: target(3),
+                generation: 1,
+            },
+        );
+        runtime.pending_failure_hold_count = 2;
+        assert_eq!(
+            runtime.mark_failed(0, MonotonicMillis(1)),
+            ResolutionResult::TimedOut
+        );
+        assert_eq!(runtime.pending_failure_holds(), 1);
+        assert_eq!(
+            runtime.failure_holds[1].phase,
+            ResolutionFailureHoldPhase::WaitingForward
+        );
+        assert_eq!(runtime.failure_counters.no_accepted_arp_request, 1);
+
+        // Protects accepted failure promotion from promoting a hold for a different token.
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 2];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        runtime.states[0] = state_slot(action(2), ResolutionPhase::Waiting, 1, 1, 1);
+        runtime.pending_state_count = 1;
+        runtime.failure_holds[0] = failure_hold(
+            ResolutionFailureHoldPhase::WaitingForward,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: target(2),
+                generation: 1,
+            },
+        );
+        runtime.failure_holds[1] = failure_hold(
+            ResolutionFailureHoldPhase::WaitingForward,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: target(3),
+                generation: 1,
+            },
+        );
+        runtime.pending_failure_hold_count = 2;
+        assert_eq!(
+            runtime.mark_failed(0, MonotonicMillis(1)),
+            ResolutionResult::TimedOut
+        );
+        assert_eq!(
+            runtime.failure_holds[0].phase,
+            ResolutionFailureHoldPhase::TerminalReady
+        );
+        assert_eq!(
+            runtime.failure_holds[1].phase,
+            ResolutionFailureHoldPhase::WaitingForward
+        );
+        assert_eq!(runtime.failure_counters.promoted, 1);
+    }
+
+    #[test]
+    fn slot_accessors_report_occupancy_and_terminal_notification_exactly() {
+        // Protects the public slot accessors from returning constants instead of stored state.
+        let mut state = ResolutionStateSlot::EMPTY;
+        assert!(!state.is_occupied());
+        assert!(!state.failure_notified());
+        state.occupied = true;
+        state.failure_notified = true;
+        assert!(state.is_occupied());
+        assert!(state.failure_notified());
+
+        let mut neighbor = DynamicNeighborSlot::EMPTY;
+        assert!(!neighbor.is_occupied());
+        neighbor.occupied = true;
+        assert!(neighbor.is_occupied());
+    }
+
+    #[test]
+    fn queued_action_checks_both_position_window_and_storage_capacity() {
+        // Protects the empty-queue and out-of-window contracts of queued_action.
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        assert_eq!(runtime.queued_action(0), None);
+        runtime.schedule(action(2), MonotonicMillis(0), false);
+        assert_eq!(runtime.queued_action(0), Some((action(2), 1)));
+        assert_eq!(runtime.queued_action(1), None);
+
+        let mut states = [];
+        let mut actions = [];
+        let runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        assert_eq!(runtime.queued_action(0), None);
+    }
+
+    #[test]
+    fn is_pristine_checks_actions_dynamic_neighbors_and_failure_holds_independently() {
+        // Protects the exact-constructor predicate for each caller-owned storage class.
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        assert!(runtime.is_pristine());
+        runtime.actions[0].0 = Some(QueuedAction {
+            action: action(2),
+            generation: 1,
+        });
+        assert!(!runtime.is_pristine());
+
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
+        let runtime = ResolutionRuntime::with_dynamic_neighbors(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut dynamic,
+        );
+        assert!(runtime.is_pristine());
+        runtime.dynamic_neighbors[0].occupied = true;
+        assert!(!runtime.is_pristine());
+
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        assert!(runtime.is_pristine());
+        runtime.failure_holds[0].phase = ResolutionFailureHoldPhase::TerminalReady;
+        assert!(!runtime.is_pristine());
+    }
+
+    #[test]
+    fn reconcile_static_requires_exact_dynamic_state_action_and_hold_keys() {
+        // Protects dynamic-neighbor reconciliation from occupancy, interface, and target overmatching.
+        let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+        let dynamic_slot = DynamicNeighborSlot {
+            interface: WAN,
+            target: target(2),
+            mac: MacAddress([7; 6]),
+            refreshed_at: MonotonicMillis(0),
+            occupied: true,
+        };
+        for neighbor in [
+            Neighbor {
+                interface: IfId(3),
+                target: target(2),
+                mac: MacAddress([8; 6]),
+            },
+            Neighbor {
+                interface: WAN,
+                target: target(3),
+                mac: MacAddress([8; 6]),
+            },
+        ] {
+            let mut states = [];
+            let mut actions = [];
+            let mut dynamic = [dynamic_slot];
+            let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+                policy,
+                &mut states,
+                &mut actions,
+                &mut dynamic,
+            );
+            runtime.dynamic_neighbors[0] = dynamic_slot;
+            assert_eq!(
+                runtime.reconcile_static(&[neighbor]),
+                StaticReconcileReport::default()
+            );
+            assert!(runtime.dynamic_neighbors[0].is_occupied());
+        }
+        let mut states = [];
+        let mut actions = [];
+        let mut dynamic = [dynamic_slot];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut dynamic,
+        );
+        runtime.dynamic_neighbors[0] = dynamic_slot;
+        assert_eq!(
+            runtime.reconcile_static(&[Neighbor {
+                interface: WAN,
+                target: target(2),
+                mac: MacAddress([8; 6]),
+            }]),
+            StaticReconcileReport {
+                dynamic_removed: 1,
+                ..StaticReconcileReport::default()
+            }
+        );
+        assert!(!runtime.dynamic_neighbors[0].is_occupied());
+
+        // Protects state reconciliation from removing empty, cooldown, or differently keyed states.
+        let state = ResolutionStateSlot {
+            key: ResolutionKey {
+                egress: WAN,
+                target: target(2),
+            },
+            action: action(2),
+            generation: 1,
+            attempts: 1,
+            accepted_attempts: 0,
+            requested_at: MonotonicMillis(0),
+            failed_at: MonotonicMillis(0),
+            occupied: true,
+            phase: ResolutionPhase::Waiting,
+            failure_notified: false,
+        };
+        for neighbor in [
+            Neighbor {
+                interface: IfId(3),
+                target: target(2),
+                mac: MacAddress([8; 6]),
+            },
+            Neighbor {
+                interface: WAN,
+                target: target(3),
+                mac: MacAddress([8; 6]),
+            },
+        ] {
+            let mut states = [state];
+            let mut actions = [];
+            let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+            runtime.states[0] = state;
+            runtime.pending_state_count = 1;
+            assert_eq!(
+                runtime.reconcile_static(&[neighbor]),
+                StaticReconcileReport::default()
+            );
+            assert!(runtime.states[0].is_occupied());
+        }
+        let mut states = [state];
+        let mut actions = [];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.states[0] = state;
+        runtime.pending_state_count = 1;
+        assert_eq!(
+            runtime.reconcile_static(&[Neighbor {
+                interface: WAN,
+                target: target(2),
+                mac: MacAddress([8; 6]),
+            }]),
+            StaticReconcileReport {
+                states_removed: 1,
+                cooldowns_retained: 1,
+                ..StaticReconcileReport::default()
+            }
+        );
+        assert!(runtime.states[0].is_occupied());
+        assert_eq!(runtime.states[0].phase(), ResolutionPhase::Cooldown);
+
+        let mut cooldown = state;
+        cooldown.phase = ResolutionPhase::Cooldown;
+        let mut states = [cooldown];
+        let mut actions = [];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.states[0] = cooldown;
+        assert_eq!(
+            runtime.reconcile_static(&[Neighbor {
+                interface: WAN,
+                target: target(2),
+                mac: MacAddress([8; 6]),
+            }]),
+            StaticReconcileReport::default()
+        );
+        assert!(runtime.states[0].is_occupied());
+
+        // Protects action compaction from matching a neighbor on only one key component.
+        for neighbor in [
+            Neighbor {
+                interface: IfId(3),
+                target: target(2),
+                mac: MacAddress([8; 6]),
+            },
+            Neighbor {
+                interface: WAN,
+                target: target(3),
+                mac: MacAddress([8; 6]),
+            },
+        ] {
+            let mut states = [];
+            let mut actions = [ResolutionActionSlot(Some(QueuedAction {
+                action: action(2),
+                generation: 1,
+            }))];
+            let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+            runtime.actions[0].0 = Some(QueuedAction {
+                action: action(2),
+                generation: 1,
+            });
+            runtime.len = 1;
+            assert_eq!(runtime.reconcile_static(&[neighbor]).actions_removed, 0);
+            assert_eq!(runtime.pending_actions(), 1);
+        }
+        let mut states = [];
+        let mut actions = [ResolutionActionSlot(Some(QueuedAction {
+            action: action(2),
+            generation: 1,
+        }))];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.actions[0].0 = Some(QueuedAction {
+            action: action(2),
+            generation: 1,
+        });
+        runtime.len = 1;
+        assert_eq!(
+            runtime
+                .reconcile_static(&[Neighbor {
+                    interface: WAN,
+                    target: target(2),
+                    mac: MacAddress([8; 6]),
+                }])
+                .actions_removed,
+            1
+        );
+        assert_eq!(runtime.pending_actions(), 0);
+
+        // Protects failure-hold reconciliation from clearing a hold unless both key fields match.
+        let hold = ResolutionFailureHoldSlot {
+            phase: ResolutionFailureHoldPhase::TerminalReady,
+            forward: ResolutionGenerationToken {
+                egress: WAN,
+                target: target(2),
+                generation: 1,
+            },
+            ..ResolutionFailureHoldSlot::EMPTY
+        };
+        for neighbor in [
+            Neighbor {
+                interface: IfId(3),
+                target: target(2),
+                mac: MacAddress([8; 6]),
+            },
+            Neighbor {
+                interface: WAN,
+                target: target(3),
+                mac: MacAddress([8; 6]),
+            },
+        ] {
+            let mut states = [];
+            let mut actions = [];
+            let mut holds = [hold];
+            let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+                policy,
+                &mut states,
+                &mut actions,
+                &mut [],
+                &mut holds,
+            );
+            runtime.failure_holds[0] = hold;
+            runtime.pending_failure_hold_count = 1;
+            assert_eq!(
+                runtime.reconcile_static(&[neighbor]),
+                StaticReconcileReport::default()
+            );
+            assert_eq!(runtime.pending_failure_holds(), 1);
+        }
+        let mut states = [];
+        let mut actions = [];
+        let mut holds = [hold];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        runtime.failure_holds[0] = hold;
+        runtime.pending_failure_hold_count = 1;
+        runtime.reconcile_static(&[Neighbor {
+            interface: WAN,
+            target: target(2),
+            mac: MacAddress([8; 6]),
+        }]);
+        assert_eq!(runtime.pending_failure_holds(), 0);
+        assert_eq!(runtime.failure_counters.cancelled, 1);
+    }
+
+    #[test]
+    fn dispatch_one_failure_requires_current_failed_forward_status() {
+        // Protects the successful dispatch baseline used by every forward-status guard.
+        let fixture = FailureSnapshotFixture::direct(true);
+        let hold = failure_hold(
+            ResolutionFailureHoldPhase::TerminalReady,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: target(2),
+                generation: 1,
+            },
+        );
+        let valid_state = state_slot(action(2), ResolutionPhase::Failed, 1, 1, 1);
+        assert!(matches!(
+            dispatch_failure_case(&fixture, hold, &[valid_state], &[]).0,
+            FailureDispatch::Queued(REVERSE_EGRESS)
+        ));
+
+        // Protects generation identity: a stale failed generation cannot emit an ICMP error.
+        let mut generation_mismatch = valid_state;
+        generation_mismatch.generation = 2;
+        assert!(matches!(
+            dispatch_failure_case(&fixture, hold, &[generation_mismatch], &[]).0,
+            FailureDispatch::AuthorityLost
+        ));
+
+        // Protects the Failed phase requirement: Waiting is not terminal authority.
+        let mut phase_mismatch = valid_state;
+        phase_mismatch.phase = ResolutionPhase::Waiting;
+        assert!(matches!(
+            dispatch_failure_case(&fixture, hold, &[phase_mismatch], &[]).0,
+            FailureDispatch::AuthorityLost
+        ));
+
+        // Protects accepted-attempt evidence: a timeout without an accepted ARP is not dispatchable.
+        let mut accepted_mismatch = valid_state;
+        accepted_mismatch.accepted_attempts = 0;
+        assert!(matches!(
+            dispatch_failure_case(&fixture, hold, &[accepted_mismatch], &[]).0,
+            FailureDispatch::AuthorityLost
+        ));
+    }
+
+    #[test]
+    fn dispatch_one_failure_direct_call_queues_with_valid_authority() {
+        // Protects the direct dispatch entry point from losing the valid
+        // forward/reverse fixture before queueing a host-unreachable error.
+        let fixture = FailureSnapshotFixture::direct(true);
+        let snapshot = fixture.snapshot();
+        let hold = failure_hold(
+            ResolutionFailureHoldPhase::TerminalReady,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: target(2),
+                generation: 1,
+            },
+        );
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut resolution = ResolutionRuntime::new(
+            ResolutionPolicy::new(1_000, 1_000).unwrap(),
+            &mut states,
+            &mut actions,
+        );
+        resolution.states[0] = state_slot(action(2), ResolutionPhase::Failed, 1, 1, 1);
+        let mut icmp_states = [crate::Icmpv4ErrorStateSlot::EMPTY; 1];
+        let mut icmp_actions = [crate::Icmpv4ErrorActionSlot::EMPTY; 1];
+        let mut icmpv4_errors = Icmpv4ErrorRuntime::new(
+            crate::Icmpv4ErrorPolicy::default(),
+            &mut icmp_states,
+            &mut icmp_actions,
+        );
+
+        assert!(matches!(
+            dispatch_one_failure(
+                &mut resolution,
+                &mut icmpv4_errors,
+                &snapshot,
+                MonotonicMillis(0),
+                hold,
+            ),
+            FailureDispatch::Queued(REVERSE_EGRESS)
+        ));
+    }
+
+    #[test]
+    fn dispatch_one_failure_requires_each_forward_authority_field() {
+        let fixture = FailureSnapshotFixture::direct(true);
+        let hold = failure_hold(
+            ResolutionFailureHoldPhase::TerminalReady,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: target(2),
+                generation: 1,
+            },
+        );
+        let valid_state = state_slot(action(2), ResolutionPhase::Failed, 1, 1, 1);
+        let authority_lost = |fixture: &FailureSnapshotFixture,
+                              hold: ResolutionFailureHoldSlot,
+                              states: &[ResolutionStateSlot]| {
+            assert!(matches!(
+                dispatch_failure_case(fixture, hold, states, &[]).0,
+                FailureDispatch::AuthorityLost
+            ));
+        };
+
+        // Protects every forward-route comparison and the route/interface OR boundary.
+        let mut route_fixture = FailureSnapshotFixture::direct(true);
+        route_fixture.routes[0] = Route::new(FORWARD_PREFIX, 24, REVERSE_EGRESS, None).unwrap();
+        authority_lost(&route_fixture, hold, &[valid_state]);
+
+        let mut route_fixture = FailureSnapshotFixture::direct(true);
+        route_fixture.routes[0] = Route::new(FORWARD_PREFIX, 24, WAN, Some(target(9))).unwrap();
+        authority_lost(&route_fixture, hold, &[valid_state]);
+
+        let mut destination_mismatch = hold;
+        destination_mismatch.original_destination = target(3);
+        authority_lost(&fixture, destination_mismatch, &[valid_state]);
+
+        let mut prefix_mismatch = hold;
+        prefix_mismatch.forward_prefix = Ipv4Address::from_octets([192, 0, 3, 0]);
+        authority_lost(&fixture, prefix_mismatch, &[valid_state]);
+
+        let mut prefix_len_mismatch = hold;
+        prefix_len_mismatch.forward_prefix_len = 23;
+        authority_lost(&fixture, prefix_len_mismatch, &[valid_state]);
+
+        // Protects forward interface identity and MAC comparisons independently.
+        let mut interface_id_mismatch = FailureSnapshotFixture::direct(true);
+        interface_id_mismatch.interfaces[0].mac = MacAddress([8; 6]);
+        interface_id_mismatch.interfaces.push(Interface {
+            id: IfId(9),
+            mac: SOURCE_MAC,
+        });
+        authority_lost(&interface_id_mismatch, hold, &[valid_state]);
+
+        let mut interface_mac_mismatch = FailureSnapshotFixture::direct(true);
+        interface_mac_mismatch.interfaces[0].mac = MacAddress([8; 6]);
+        authority_lost(&interface_mac_mismatch, hold, &[valid_state]);
+
+        // Protects forward local-binding identity and address comparisons independently.
+        let mut binding_interface_mismatch = FailureSnapshotFixture::direct(true);
+        binding_interface_mismatch.bindings[0].address = target(9);
+        binding_interface_mismatch.bindings.push(LocalIpv4Binding {
+            interface: IfId(9),
+            address: SOURCE_IP,
+        });
+        binding_interface_mismatch.interfaces.push(Interface {
+            id: IfId(9),
+            mac: MacAddress([9; 6]),
+        });
+        authority_lost(&binding_interface_mismatch, hold, &[valid_state]);
+
+        let mut binding_address_mismatch = FailureSnapshotFixture::direct(true);
+        binding_address_mismatch.bindings[0].address = target(9);
+        authority_lost(&binding_address_mismatch, hold, &[valid_state]);
+
+        // Protects an exact forward static neighbor from being dispatched.
+        let mut static_neighbor = FailureSnapshotFixture::direct(true);
+        static_neighbor.neighbors.push(Neighbor {
+            interface: WAN,
+            target: target(2),
+            mac: MacAddress([8; 6]),
+        });
+        authority_lost(&static_neighbor, hold, &[valid_state]);
+
+        // Protects host-forbidden forward targets as a separate authority condition.
+        let mut forbidden_hold = hold;
+        forbidden_hold.forward.target = SOURCE_IP;
+        forbidden_hold.original_destination = SOURCE_IP;
+        let forbidden_state = state_slot(
+            ArpRequestAction {
+                egress: WAN,
+                source_mac: SOURCE_MAC,
+                source_ip: SOURCE_IP,
+                target_ip: SOURCE_IP,
+            },
+            ResolutionPhase::Failed,
+            1,
+            1,
+            1,
+        );
+        authority_lost(&fixture, forbidden_hold, &[forbidden_state]);
+
+        // Protects mismatched forward neighbors from being treated as exact matches.
+        for neighbor in [
+            Neighbor {
+                interface: WAN,
+                target: target(3),
+                mac: MacAddress([8; 6]),
+            },
+            Neighbor {
+                interface: REVERSE_EGRESS,
+                target: target(2),
+                mac: MacAddress([8; 6]),
+            },
+        ] {
+            let mut mismatch = FailureSnapshotFixture::direct(true);
+            mismatch.neighbors.push(neighbor);
+            let (outcome, _, generated) =
+                dispatch_failure_case(&mismatch, hold, &[valid_state], &[]);
+            assert!(matches!(outcome, FailureDispatch::Queued(REVERSE_EGRESS)));
+            let generated = generated.unwrap();
+            assert_eq!(generated.source_mac, REVERSE_MAC);
+            assert_eq!(generated.source_ip, REVERSE_SOURCE_IP);
+        }
+    }
+
+    #[test]
+    fn dispatch_one_failure_requires_reverse_authority_and_exact_neighbor_keys() {
+        let hold = failure_hold(
+            ResolutionFailureHoldPhase::TerminalReady,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: target(2),
+                generation: 1,
+            },
+        );
+        let forward_state = state_slot(action(2), ResolutionPhase::Failed, 1, 1, 1);
+
+        // Protects reverse interface selection; a changed comparison must alter the ICMP source MAC.
+        let fixture = FailureSnapshotFixture::direct(true);
+        let (outcome, _, generated) = dispatch_failure_case(&fixture, hold, &[forward_state], &[]);
+        assert!(matches!(outcome, FailureDispatch::Queued(REVERSE_EGRESS)));
+        assert_eq!(generated.unwrap().source_mac, REVERSE_MAC);
+
+        // Protects reverse binding selection; a changed comparison must alter the ICMP source IP.
+        let mut wrong_binding = FailureSnapshotFixture::direct(true);
+        wrong_binding.bindings.swap(0, 1);
+        let (outcome, _, generated) =
+            dispatch_failure_case(&wrong_binding, hold, &[forward_state], &[]);
+        assert!(matches!(outcome, FailureDispatch::Queued(REVERSE_EGRESS)));
+        assert_eq!(generated.unwrap().source_ip, REVERSE_SOURCE_IP);
+
+        // Protects SameFailedKey before reverse-neighbor lookup.
+        let same_key_fixture = FailureSnapshotFixture {
+            routes: vec![Route::new(FORWARD_PREFIX, 24, WAN, None).unwrap()],
+            interfaces: vec![Interface {
+                id: WAN,
+                mac: SOURCE_MAC,
+            }],
+            neighbors: Vec::new(),
+            bindings: vec![LocalIpv4Binding {
+                interface: WAN,
+                address: SOURCE_IP,
+            }],
+        };
+        let mut same_key_hold = hold;
+        same_key_hold.original_source = target(2);
+        let (outcome, _, _) =
+            dispatch_failure_case(&same_key_fixture, same_key_hold, &[forward_state], &[]);
+        assert!(matches!(outcome, FailureDispatch::SameFailedKey));
+
+        // Protects reverse-neighbor matching from accepting a target-only match.
+        let mut wrong_target_neighbor = FailureSnapshotFixture::direct(false);
+        wrong_target_neighbor.neighbors.push(Neighbor {
+            interface: REVERSE_EGRESS,
+            target: target(3),
+            mac: MacAddress([8; 6]),
+        });
+        let (outcome, _, _) = dispatch_failure_case(
+            &wrong_target_neighbor,
+            hold,
+            &[forward_state, ResolutionStateSlot::EMPTY],
+            &[],
+        );
+        assert!(matches!(outcome, FailureDispatch::WaitReverse { .. }));
+
+        // Protects reverse-neighbor matching from accepting an interface-only match.
+        let mut wrong_interface_neighbor = FailureSnapshotFixture::direct(false);
+        wrong_interface_neighbor.neighbors.push(Neighbor {
+            interface: WAN,
+            target: ORIGINAL_SOURCE,
+            mac: MacAddress([8; 6]),
+        });
+        let (outcome, _, _) = dispatch_failure_case(
+            &wrong_interface_neighbor,
+            hold,
+            &[forward_state, ResolutionStateSlot::EMPTY],
+            &[],
+        );
+        assert!(matches!(outcome, FailureDispatch::WaitReverse { .. }));
+    }
+
+    #[test]
+    fn dispatch_one_failure_requires_exact_waiting_reverse_token() {
+        let fixture = FailureSnapshotFixture::direct(false);
+        let forward_token = ResolutionGenerationToken {
+            egress: WAN,
+            target: target(2),
+            generation: 1,
+        };
+        let reverse_token = ResolutionGenerationToken {
+            egress: REVERSE_EGRESS,
+            target: ORIGINAL_SOURCE,
+            generation: 7,
+        };
+        let forward_state = state_slot(action(2), ResolutionPhase::Failed, 1, 1, 1);
+        let reverse_action = ArpRequestAction {
+            egress: REVERSE_EGRESS,
+            source_mac: REVERSE_MAC,
+            source_ip: REVERSE_SOURCE_IP,
+            target_ip: ORIGINAL_SOURCE,
+        };
+        let reverse_failed = state_slot(
+            reverse_action,
+            ResolutionPhase::Failed,
+            1,
+            1,
+            reverse_token.generation,
+        );
+
+        // Protects the successful WaitingReverse/Failed-token branch.
+        let mut exact = failure_hold(ResolutionFailureHoldPhase::WaitingReverse, forward_token);
+        exact.reverse = reverse_token;
+        let (outcome, _, _) =
+            dispatch_failure_case(&fixture, exact, &[forward_state, reverse_failed], &[]);
+        assert!(matches!(outcome, FailureDispatch::ReverseFailed(token) if token == reverse_token));
+
+        // Protects the hold phase check; TerminalReady must use the normal schedule path.
+        let mut phase_mismatch = exact;
+        phase_mismatch.phase = ResolutionFailureHoldPhase::TerminalReady;
+        let (outcome, counters, _) = dispatch_failure_case(
+            &fixture,
+            phase_mismatch,
+            &[forward_state, reverse_failed],
+            &[],
+        );
+        assert!(matches!(outcome, FailureDispatch::ReverseFailed(token) if token == reverse_token));
+        assert_eq!(counters.failed_hits, 1);
+
+        // Protects reverse-egress matching; a failed state at another egress is not an alias.
+        let mut egress_mismatch = exact;
+        egress_mismatch.reverse.egress = WAN;
+        let wrong_egress_state = state_slot(
+            ArpRequestAction {
+                egress: WAN,
+                source_mac: SOURCE_MAC,
+                source_ip: SOURCE_IP,
+                target_ip: ORIGINAL_SOURCE,
+            },
+            ResolutionPhase::Failed,
+            1,
+            1,
+            reverse_token.generation,
+        );
+        let (outcome, _, _) = dispatch_failure_case(
+            &fixture,
+            egress_mismatch,
+            &[
+                forward_state,
+                wrong_egress_state,
+                ResolutionStateSlot::EMPTY,
+            ],
+            &[],
+        );
+        assert!(matches!(outcome, FailureDispatch::WaitReverse { .. }));
+
+        // Protects reverse-target matching; a failed state for another target is not an alias.
+        let mut target_mismatch = exact;
+        target_mismatch.reverse.target = target(3);
+        let wrong_target_state = state_slot(
+            ArpRequestAction {
+                egress: REVERSE_EGRESS,
+                source_mac: REVERSE_MAC,
+                source_ip: REVERSE_SOURCE_IP,
+                target_ip: target(3),
+            },
+            ResolutionPhase::Failed,
+            1,
+            1,
+            reverse_token.generation,
+        );
+        let (outcome, _, _) = dispatch_failure_case(
+            &fixture,
+            target_mismatch,
+            &[
+                forward_state,
+                wrong_target_state,
+                ResolutionStateSlot::EMPTY,
+            ],
+            &[],
+        );
+        assert!(matches!(outcome, FailureDispatch::WaitReverse { .. }));
+
+        // Protects reverse generation matching and the status-generation conjunction.
+        let mut generation_mismatch = exact;
+        generation_mismatch.reverse.generation = 8;
+        let (outcome, _, _) = dispatch_failure_case(
+            &fixture,
+            generation_mismatch,
+            &[forward_state, reverse_failed],
+            &[],
+        );
+        assert!(matches!(outcome, FailureDispatch::ReverseFailed(token) if token == reverse_token));
+
+        // Protects status phase matching; Waiting remains a pending reverse resolution.
+        let reverse_waiting = state_slot(
+            reverse_action,
+            ResolutionPhase::Waiting,
+            1,
+            1,
+            reverse_token.generation,
+        );
+        let (outcome, _, _) =
+            dispatch_failure_case(&fixture, exact, &[forward_state, reverse_waiting], &[]);
+        assert!(matches!(outcome, FailureDispatch::WaitReverse { .. }));
+    }
+
+    #[test]
+    fn poll_timers_does_not_count_an_accepted_matching_forward_candidate() {
+        // Protects accepted_attempts == 0 && WaitingForward: an accepted ARP is not unaccepted.
+        let policy = ResolutionPolicy::with_retry(1_000, 1_000, 1).unwrap();
+        let token = ResolutionGenerationToken {
+            egress: WAN,
+            target: target(2),
+            generation: 1,
+        };
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        runtime.states[0] = state_slot(action(2), ResolutionPhase::Waiting, 1, 1, 1);
+        runtime.states[0].requested_at = MonotonicMillis(0);
+        runtime.pending_state_count = 1;
+        runtime.failure_holds[0] = failure_hold(ResolutionFailureHoldPhase::WaitingForward, token);
+        runtime.pending_failure_hold_count = 1;
+        let report = runtime
+            .poll_timers(MonotonicMillis(1_000), 1, &mut NoResolutionTimerTrace)
+            .unwrap();
+        assert_eq!(report.timed_out, 1);
+        assert_eq!(report.no_accepted_arp_request, 0);
+        assert_eq!(runtime.pending_failure_holds(), 1);
+    }
+
+    #[test]
+    fn poll_timers_ignores_an_empty_hold_even_when_its_stale_token_matches() {
+        // Protects the live-hold outer guard: an empty slot must never be cleared or counted.
+        let policy = ResolutionPolicy::with_retry(1_000, 1_000, 1).unwrap();
+        let token = ResolutionGenerationToken {
+            egress: WAN,
+            target: target(2),
+            generation: 1,
+        };
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        runtime.states[0] = state_slot(action(2), ResolutionPhase::Failed, 1, 1, 1);
+        runtime.states[0].failed_at = MonotonicMillis(0);
+        runtime.pending_state_count = 1;
+        runtime.failure_holds[0].forward = token;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.poll_timers(MonotonicMillis(1_000), 1, &mut NoResolutionTimerTrace)
+        }));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().unwrap().failures_expired, 1);
+        assert_eq!(runtime.pending_failure_holds(), 0);
+    }
+
+    struct ShortVisibleArpBatch {
+        completion: Rc<RefCell<Option<crate::GeneratedSlotCompletion>>>,
+    }
+
+    struct ShortVisibleArpSlot {
+        bytes: Vec<u8>,
+        completion: Rc<RefCell<Option<crate::GeneratedSlotCompletion>>>,
+    }
+
+    impl GeneratedPacketBatch for ShortVisibleArpBatch {
+        type Error = ();
+        type Slot<'a>
+            = ShortVisibleArpSlot
+        where
+            Self: 'a;
+
+        fn allocate(
+            &mut self,
+            frame_len: usize,
+        ) -> Result<crate::GeneratedPacketLease<Self::Slot<'_>>, GeneratedAllocationError> {
+            assert_eq!(frame_len, ARP_REQUEST_FRAME_LEN);
+            Ok(crate::GeneratedPacketLease::new(ShortVisibleArpSlot {
+                bytes: vec![0; frame_len - 1],
+                completion: Rc::clone(&self.completion),
+            }))
+        }
+
+        fn finish(self) -> GeneratedBatchCompletion<Self::Error> {
+            GeneratedBatchCompletion {
+                attempts: 0,
+                allocated: 0,
+                failed: 0,
+                requested: 0,
+                cancelled: 0,
+                abandoned: 0,
+                accepted: 0,
+                rejected: 0,
+                error: None,
+            }
+        }
+    }
+
+    impl crate::GeneratedPacketSlot for ShortVisibleArpSlot {
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut self.bytes
+        }
+
+        fn complete(self, completion: crate::GeneratedSlotCompletion) {
+            *self.completion.borrow_mut() = Some(completion);
+        }
+    }
+
+    #[test]
+    fn allocate_arp_request_rejects_short_visible_buffer_and_cancels_lease() {
+        // Protects the exact-length guard and ensures a short backend buffer is cancelled.
+        let completion = Rc::new(RefCell::new(None));
+        let mut batch = ShortVisibleArpBatch {
+            completion: Rc::clone(&completion),
+        };
+
+        let result = allocate_arp_request(&mut batch, action(2));
+
+        assert!(matches!(
+            result,
+            Err(ArpRequestGenerationError::Build(
+                ArpRequestBuildError::ExactLengthRequired
+            ))
+        ));
+        assert_eq!(
+            *completion.borrow(),
+            Some(crate::GeneratedSlotCompletion::Cancelled)
+        );
     }
 }
