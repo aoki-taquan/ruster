@@ -145,6 +145,43 @@ mod tcp_tests {
         .unwrap()
     }
 
+    fn link_and_assign_tcp_indexes(runtime: &mut Nat44TcpRuntime<'_>) {
+        for (index, mapping) in runtime.mappings.iter().copied().enumerate() {
+            if !mapping.occupied {
+                continue;
+            }
+            runtime
+                .mapping_directory
+                .link(
+                    index,
+                    DirectoryHashDomain::TcpMapping,
+                    &Nat44TcpRuntime::mapping_words(mapping),
+                )
+                .unwrap();
+            if mapping.port_owned {
+                runtime
+                    .port_owners
+                    .assign(
+                        mapping.public_port,
+                        Nat44TcpRuntime::mapping_owner_token(index, mapping).unwrap(),
+                    )
+                    .unwrap();
+            }
+        }
+        for (index, session) in runtime.sessions.iter().copied().enumerate() {
+            if session.occupied {
+                runtime
+                    .session_directory
+                    .link(
+                        index,
+                        DirectoryHashDomain::TcpSession,
+                        &Nat44TcpRuntime::session_words(session),
+                    )
+                    .unwrap();
+            }
+        }
+    }
+
     fn with_config<T>(
         policy: Nat44TcpPolicy,
         first: u16,
@@ -1722,6 +1759,670 @@ mod tcp_tests {
                 },
             );
         }
+    }
+    #[test]
+    fn tcp_config_authority_and_realm_require_exact_fields() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            let routes = [
+                Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, LAN, None).unwrap(),
+                Route::new(
+                    Ipv4Address::from_octets([0, 0, 0, 0]),
+                    0,
+                    WAN,
+                    Some(Ipv4Address::from_octets([203, 0, 113, 1])),
+                )
+                .unwrap(),
+            ];
+            let interfaces = [
+                Interface {
+                    id: LAN,
+                    mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                },
+                Interface {
+                    id: WAN,
+                    mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                },
+            ];
+            let neighbors = [Neighbor {
+                interface: WAN,
+                target: Ipv4Address::from_octets([203, 0, 113, 1]),
+                mac: MacAddress([2, 0, 0, 0, 0, 3]),
+            }];
+            let bindings = [
+                LocalIpv4Binding {
+                    interface: LAN,
+                    address: Ipv4Address::from_octets([10, 0, 0, 1]),
+                },
+                LocalIpv4Binding {
+                    interface: WAN,
+                    address: PUBLIC,
+                },
+            ];
+            let snapshot =
+                ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+            let mut identity_mismatch = config;
+            identity_mismatch.authority = snapshot_authority(&snapshot);
+            identity_mismatch.snapshot_identity = [usize::MAX; 8];
+            // Missed mutants 65-66: TCP authority_matches requires both authority and snapshot
+            // identity, even when the authority value itself matches.
+            assert!(!identity_mismatch.authority_matches(&snapshot));
+
+            let udp = Nat44UdpConfig {
+                inside: config.inside,
+                outside: config.outside,
+                public_address: config.public_address,
+                first_port: config.first_port,
+                last_port: config.last_port,
+                policy: Nat44UdpPolicy::default(),
+                authority: config.authority,
+                snapshot_identity: config.snapshot_identity,
+            };
+            assert!(config.realm_matches_udp(udp));
+            for (label, inside, outside, address) in [
+                ("inside", IfId(9), udp.outside, udp.public_address),
+                ("outside", udp.inside, IfId(9), udp.public_address),
+                (
+                    "address",
+                    udp.inside,
+                    udp.outside,
+                    Ipv4Address::from_octets([203, 0, 113, 11]),
+                ),
+            ] {
+                let changed = Nat44UdpConfig {
+                    inside,
+                    outside,
+                    public_address: address,
+                    ..udp
+                };
+                // Missed mutants 67-69: each realm conjunct must reject its own mismatch;
+                // replacing any && with || would accept this case.
+                assert!(!config.realm_matches_udp(changed), "{label} realm mismatch");
+            }
+        });
+    }
+
+    #[test]
+    fn tcp_mapping_slot_occupancy_and_authority_words_are_exact() {
+        // Missed mutant 70: TCP mapping occupancy must distinguish the default slot from a live
+        // slot (the true assertion kills the constant-false replacement).
+        assert!(!Nat44TcpMappingSlot::default().is_occupied());
+        let occupied = Nat44TcpMappingSlot {
+            occupied: true,
+            ..Nat44TcpMappingSlot::default()
+        };
+        assert!(occupied.is_occupied());
+
+        let mut coherent_words = [0; NAT44_AUTHORITY_WORDS];
+        coherent_words[26] = 1;
+        let coherent =
+            Nat44TcpAuthorityEvidence::from_expected_contract(1, 1, 1, 1, 1, 1, 1, coherent_words);
+        // Missed mutants 71-73: indexes_coherent accepts exactly word 26 == 1 and rejects zero.
+        assert!(coherent.indexes_coherent());
+        assert!(!Nat44TcpAuthorityEvidence::from_expected_contract(
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            [0; NAT44_AUTHORITY_WORDS],
+        )
+        .indexes_coherent());
+
+        let mut all = [0; NAT44_AUTHORITY_WORDS];
+        all[9] = 1;
+        all[15] = 1;
+        all[21] = 1;
+        // Missed mutants 74-80: all three directory verdict words must be one.
+        assert!(
+            Nat44TcpAuthorityEvidence::from_expected_contract(1, 1, 1, 1, 1, 1, 1, all)
+                .directories_coherent()
+        );
+        for missing in [9, 15, 21] {
+            let mut words = all;
+            words[missing] = 0;
+            assert!(
+                !Nat44TcpAuthorityEvidence::from_expected_contract(1, 1, 1, 1, 1, 1, 1, words)
+                    .directories_coherent(),
+                "directory word {missing} must be required"
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_authority_evidence_binding_and_generation_guards_are_strict() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            assert!(runtime.publication_binding_matches(config, test_tcp_hash_key()));
+            let mut changed_config = config;
+            changed_config.first_port += 1;
+            // Missed mutants 82-83: publication binding is exact for both config and hash key.
+            assert!(!runtime.publication_binding_matches(changed_config, test_tcp_hash_key()));
+            assert!(!runtime.publication_binding_matches(config, rotated_test_tcp_hash_key()));
+
+            let first = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                .unwrap();
+            runtime.commit_outbound(first, 0).unwrap();
+            assert!(runtime.authority_evidence().directories_coherent());
+            runtime.mappings[0].port_owned = false;
+            // Missed mutant 81: authority_evidence's port-owner contract is occupied && owned;
+            // an occupied mapping with a stale ownership bit is not coherent.
+            assert!(!runtime.authority_evidence().directories_coherent());
+        });
+
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            runtime.next_generation = 0;
+            // Missed mutant 84: either zero or MAX generation is exhausted; || cannot become &&.
+            assert!(matches!(
+                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0),
+                Err(Nat44TcpPlanError::GenerationExhausted)
+            ));
+
+            assert!(matches!(
+                runtime.plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 443, true, 0),
+                Err(Nat44TcpPlanError::GenerationExhausted)
+            ));
+        });
+
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            let plan = runtime
+                .plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                .unwrap();
+            runtime.mapping_directory.clear();
+            // Missed mutant 85: a stale mapping mutation must reject prevalidated outbound commit
+            // even when the session mutation remains current.
+            assert_eq!(
+                runtime.prevalidate_outbound_commit(plan, 0),
+                Err(Nat44TcpCommitError::StalePlan)
+            );
+        });
+    }
+
+    #[test]
+    fn tcp_commit_authority_requires_each_independent_fact() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            let plan = runtime
+                .plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                .unwrap();
+
+            let mut watermark = plan.authority;
+            watermark.watermark_ms = Some(1);
+            // Missed mutant 89: an authority watermark mismatch is stale on its own.
+            assert_eq!(
+                runtime.validate_commit_authority(watermark, 0, 0, 0),
+                Err(Nat44TcpCommitError::StalePlan)
+            );
+
+            let mut planned_time = plan.authority;
+            planned_time.planned_now_ms = 1;
+            // Missed mutant 88: a planned-time mismatch is stale on its own.
+            assert_eq!(
+                runtime.validate_commit_authority(planned_time, 0, 0, 0),
+                Err(Nat44TcpCommitError::StalePlan)
+            );
+
+            // Missed mutant 87: an absent mapping index is stale even when the timestamp facts
+            // all match.
+            assert_eq!(
+                runtime.validate_commit_authority(plan.authority, usize::MAX, 0, 0),
+                Err(Nat44TcpCommitError::StalePlan)
+            );
+            // Missed mutant 86: an absent session index is stale independently of mapping.
+            assert_eq!(
+                runtime.validate_commit_authority(plan.authority, 0, usize::MAX, 0),
+                Err(Nat44TcpCommitError::StalePlan)
+            );
+        });
+    }
+
+    #[test]
+    fn tcp_lookup_predicates_require_every_mapping_and_session_field() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            for (occupied, inside, address, port, label) in [
+                (false, config.inside, INTERNAL, 40_000, "occupied"),
+                (true, IfId(9), INTERNAL, 40_000, "inside"),
+                (true, config.inside, INTERNAL2, 40_000, "address"),
+                // Missed mutant 92: mapping lookup also requires the internal port.
+                (true, config.inside, INTERNAL, 40_001, "internal port"),
+            ] {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                runtime.mappings[0] = Nat44TcpMappingSlot {
+                    occupied,
+                    inside,
+                    internal_address: address,
+                    internal_port: port,
+                    ..Nat44TcpMappingSlot::default()
+                };
+                let words = Nat44TcpRuntime::mapping_lookup_words(config.inside, INTERNAL, 40_000);
+                runtime
+                    .mapping_directory
+                    .link(0, DirectoryHashDomain::TcpMapping, &words)
+                    .unwrap();
+                // Mapping lookup checks occupancy, inside, address, and internal port
+                // independently; a collision with any one mismatch must not match.
+                assert_eq!(runtime.find_mapping(INTERNAL, 40_000), Ok(None), "{label}");
+            }
+        });
+
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            for (occupied, mapping_index, generation, epoch, address, port, label) in [
+                (false, 0, 1, 1, REMOTE1, 443, "occupied"),
+                // Missed mutant 93: session lookup also requires the mapping index.
+                (true, 1, 1, 1, REMOTE1, 443, "mapping index"),
+                (true, 0, 2, 1, REMOTE1, 443, "generation"),
+                (true, 0, 1, 2, REMOTE1, 443, "lifecycle"),
+                (true, 0, 1, 1, REMOTE2, 443, "remote address"),
+                (true, 0, 1, 1, REMOTE1, 8443, "remote port"),
+            ] {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                runtime.sessions[0] = Nat44TcpSessionSlot {
+                    occupied,
+                    mapping_index,
+                    mapping_generation: generation,
+                    mapping_lifecycle_epoch: epoch,
+                    remote_address: address,
+                    remote_port: port,
+                    ..Nat44TcpSessionSlot::default()
+                };
+                let words = Nat44TcpRuntime::session_lookup_words(0, 1, 1, REMOTE1, 443);
+                runtime
+                    .session_directory
+                    .link(0, DirectoryHashDomain::TcpSession, &words)
+                    .unwrap();
+                // Session lookup rejects every independent mismatch in its key fields.
+                assert_eq!(
+                    runtime.find_session(0, 1, 1, REMOTE1, 443),
+                    Ok(None),
+                    "{label}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn tcp_reusable_session_and_port_owner_checks_are_independent() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            runtime.mappings[0] = Nat44TcpMappingSlot {
+                occupied: true,
+                generation: 1,
+                lifecycle_epoch: 1,
+                last_activity_ms: 0,
+                ..Nat44TcpMappingSlot::default()
+            };
+            runtime.sessions[0] = Nat44TcpSessionSlot {
+                occupied: true,
+                mapping_index: 0,
+                mapping_generation: 2,
+                mapping_lifecycle_epoch: 1,
+                last_activity_ms: 0,
+                ..Nat44TcpSessionSlot::default()
+            };
+            // Missed mutant 98: a live session whose generation is stale is reusable; the first
+            // inner || must not become &&.
+            assert_eq!(runtime.find_reusable_session(0), Some(0));
+        });
+
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            runtime.mappings[0] = Nat44TcpMappingSlot {
+                occupied: true,
+                generation: 1,
+                lifecycle_epoch: 1,
+                last_activity_ms: 0,
+                ..Nat44TcpMappingSlot::default()
+            };
+            runtime.sessions[0] = Nat44TcpSessionSlot {
+                occupied: true,
+                mapping_index: 0,
+                mapping_generation: 1,
+                mapping_lifecycle_epoch: 2,
+                last_activity_ms: 0,
+                ..Nat44TcpSessionSlot::default()
+            };
+            // Missed mutant 99: a lifecycle epoch mismatch independently makes a session reusable.
+            assert_eq!(runtime.find_reusable_session(0), Some(0));
+        });
+
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            let labels = ["occupied", "port_owned", "generation", "lifecycle"];
+            for label in labels {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                runtime.mappings[0] = Nat44TcpMappingSlot {
+                    occupied: true,
+                    generation: 1,
+                    lifecycle_epoch: 1,
+                    port_owned: true,
+                    public_port: 40_000,
+                    last_activity_ms: 0,
+                    ..Nat44TcpMappingSlot::default()
+                };
+                runtime
+                    .port_owners
+                    .assign(40_000, PortOwnerToken::new(0, 1, 1).unwrap())
+                    .unwrap();
+                match label {
+                    "occupied" => runtime.mappings[0].occupied = false,
+                    "port_owned" => runtime.mappings[0].port_owned = false,
+                    "generation" => runtime.mappings[0].generation += 1,
+                    "lifecycle" => runtime.mappings[0].lifecycle_epoch += 1,
+                    _ => unreachable!(),
+                }
+                // Missed mutants 100-103: direct public-port lookup validates each mapping-owner
+                // fact independently.
+                assert!(
+                    matches!(
+                        runtime.mapping_for_public_port(40_000, 0),
+                        Err(Nat44TcpPlanError::IndexCorrupt)
+                    ),
+                    "{label} mapping-owner mismatch"
+                );
+            }
+        });
+
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            for label in ["occupied", "port_owned", "generation", "lifecycle"] {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                runtime.mappings[0] = Nat44TcpMappingSlot {
+                    occupied: true,
+                    generation: 1,
+                    lifecycle_epoch: 1,
+                    port_owned: true,
+                    public_port: 40_000,
+                    last_activity_ms: 0,
+                    ..Nat44TcpMappingSlot::default()
+                };
+                runtime
+                    .port_owners
+                    .assign(40_000, PortOwnerToken::new(0, 1, 1).unwrap())
+                    .unwrap();
+                match label {
+                    "occupied" => runtime.mappings[0].occupied = false,
+                    "port_owned" => runtime.mappings[0].port_owned = false,
+                    "generation" => runtime.mappings[0].generation += 1,
+                    "lifecycle" => runtime.mappings[0].lifecycle_epoch += 1,
+                    _ => unreachable!(),
+                }
+                // Missed mutants 104-107: port selection rejects every owner mismatch before
+                // considering liveness.
+                assert!(
+                    matches!(
+                        runtime.select_port(40_000, 0),
+                        Err(Nat44TcpPlanError::IndexCorrupt)
+                    ),
+                    "{label} selected-port mismatch"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn tcp_prepared_mapping_and_session_mutations_must_match() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            let plan = runtime
+                .plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                .unwrap();
+            let mapping_mutation = plan.prepared.mapping.unwrap();
+            runtime.mapping_directory.clear();
+            // Missed mutant 108: a changed prepared mapping topology is not a match.
+            assert!(!runtime.mapping_mutation_matches(mapping_mutation));
+        });
+
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            let plan = runtime
+                .plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                .unwrap();
+            let session_mutation = plan.prepared.session.unwrap();
+            runtime.session_directory.clear();
+            // Missed mutant 109: a changed prepared session topology is not a match.
+            assert!(!runtime.session_mutation_matches(session_mutation));
+        });
+    }
+
+    #[test]
+    fn tcp_validate_indexes_checks_mapping_identity_fields() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            for (label, inside, address, port) in [
+                ("same key", LAN, INTERNAL, 40_000),
+                ("inside", IfId(9), INTERNAL, 40_000),
+                ("address", LAN, INTERNAL2, 40_000),
+                ("internal port", LAN, INTERNAL, 40_001),
+            ] {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 2];
+                let mut sessions = [];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                runtime.mappings[0] = Nat44TcpMappingSlot {
+                    occupied: true,
+                    generation: 1,
+                    lifecycle_epoch: 1,
+                    port_owned: true,
+                    inside: LAN,
+                    internal_address: INTERNAL,
+                    internal_port: 40_000,
+                    public_port: 40_000,
+                    ..Nat44TcpMappingSlot::default()
+                };
+                runtime.mappings[1] = Nat44TcpMappingSlot {
+                    occupied: true,
+                    generation: 2,
+                    lifecycle_epoch: 2,
+                    port_owned: true,
+                    inside,
+                    internal_address: address,
+                    internal_port: port,
+                    public_port: 40_001,
+                    ..Nat44TcpMappingSlot::default()
+                };
+                link_and_assign_tcp_indexes(&mut runtime);
+                // Missed mutants 110-113: duplicate mapping identity requires all three key
+                // fields; each single-field difference remains valid.
+                if label == "same key" {
+                    assert_eq!(
+                        runtime.validate_indexes(),
+                        Err(Nat44TcpIndexInvariantError::DuplicateMappingKey),
+                        "{label}"
+                    );
+                } else {
+                    assert_eq!(runtime.validate_indexes(), Ok(()), "{label}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn tcp_validate_indexes_checks_current_session_and_mapping_summary() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            let cases = [
+                ("without current session", None),
+                (
+                    "mapping index mismatch",
+                    Some(Nat44TcpSessionSlot {
+                        occupied: true,
+                        mapping_index: 1,
+                        mapping_generation: 1,
+                        mapping_lifecycle_epoch: 1,
+                        remote_address: REMOTE1,
+                        remote_port: 443,
+                        last_activity_ms: 100,
+                    }),
+                ),
+                (
+                    "generation mismatch",
+                    Some(Nat44TcpSessionSlot {
+                        occupied: true,
+                        mapping_index: 0,
+                        mapping_generation: 2,
+                        mapping_lifecycle_epoch: 1,
+                        remote_address: REMOTE1,
+                        remote_port: 443,
+                        last_activity_ms: 100,
+                    }),
+                ),
+                (
+                    "lifecycle mismatch",
+                    Some(Nat44TcpSessionSlot {
+                        occupied: true,
+                        mapping_index: 0,
+                        mapping_generation: 1,
+                        mapping_lifecycle_epoch: 2,
+                        remote_address: REMOTE1,
+                        remote_port: 443,
+                        last_activity_ms: 100,
+                    }),
+                ),
+                (
+                    "summary mismatch",
+                    Some(Nat44TcpSessionSlot {
+                        occupied: true,
+                        mapping_index: 0,
+                        mapping_generation: 1,
+                        mapping_lifecycle_epoch: 1,
+                        remote_address: REMOTE1,
+                        remote_port: 443,
+                        last_activity_ms: 101,
+                    }),
+                ),
+            ];
+            for (label, session) in cases {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                runtime.mappings[0] = Nat44TcpMappingSlot {
+                    occupied: true,
+                    generation: 1,
+                    lifecycle_epoch: 1,
+                    port_owned: true,
+                    inside: LAN,
+                    internal_address: INTERNAL,
+                    internal_port: 40_000,
+                    public_port: 40_000,
+                    last_activity_ms: 100,
+                };
+                runtime.watermark_ms = Some(100);
+                runtime.sessions[0] = session.unwrap_or_default();
+                link_and_assign_tcp_indexes(&mut runtime);
+                match label {
+                    "without current session" => {
+                        // A live mapping without a current session must fail.
+                        assert_eq!(
+                            runtime.validate_indexes(),
+                            Err(Nat44TcpIndexInvariantError::MappingWithoutCurrentSession),
+                            "{label}"
+                        );
+                    }
+                    "mapping index mismatch" | "generation mismatch" | "lifecycle mismatch" => {
+                        // Missed mutants 116/115/114: mapping index, generation, and lifecycle
+                        // must each match for a session to count as the mapping's current session.
+                        assert_eq!(
+                            runtime.validate_indexes(),
+                            Err(Nat44TcpIndexInvariantError::MappingWithoutCurrentSession),
+                            "{label}"
+                        );
+                    }
+                    "summary mismatch" => {
+                        // Additional invariant: the live mapping summary must equal the maximum
+                        // activity among its current sessions.
+                        assert_eq!(
+                            runtime.validate_indexes(),
+                            Err(Nat44TcpIndexInvariantError::MappingSummaryMismatch),
+                            "{label}"
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn tcp_validate_indexes_checks_session_identity_fields() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            for (label, mapping_index, lifecycle_epoch, remote_port) in [
+                ("mapping index", 1, 1, 443),
+                ("lifecycle epoch", 0, 2, 443),
+                ("remote port", 0, 1, 8443),
+                ("same key", 0, 1, 443),
+            ] {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 2];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                runtime.mappings[0] = Nat44TcpMappingSlot {
+                    occupied: true,
+                    generation: 1,
+                    lifecycle_epoch: 1,
+                    port_owned: true,
+                    inside: LAN,
+                    internal_address: INTERNAL,
+                    internal_port: 40_000,
+                    public_port: 40_000,
+                    ..Nat44TcpMappingSlot::default()
+                };
+                runtime.sessions[0] = Nat44TcpSessionSlot {
+                    occupied: true,
+                    mapping_index: 0,
+                    mapping_generation: 1,
+                    mapping_lifecycle_epoch: 1,
+                    remote_address: REMOTE1,
+                    remote_port: 443,
+                    ..Nat44TcpSessionSlot::default()
+                };
+                runtime.sessions[1] = Nat44TcpSessionSlot {
+                    occupied: true,
+                    mapping_index,
+                    mapping_generation: 1,
+                    mapping_lifecycle_epoch: lifecycle_epoch,
+                    remote_address: REMOTE1,
+                    remote_port,
+                    ..Nat44TcpSessionSlot::default()
+                };
+                link_and_assign_tcp_indexes(&mut runtime);
+                if label == "same key" {
+                    // Duplicate session key invariant: identical occupied session keys must be
+                    // rejected; this kills the equality reversal for each key field
+                    // (mutants 117/118/119).
+                    assert_eq!(
+                        runtime.validate_indexes(),
+                        Err(Nat44TcpIndexInvariantError::DuplicateSessionKey),
+                        "{label}"
+                    );
+                } else {
+                    // Mapping index, lifecycle epoch, and remote port are independently part of
+                    // the duplicate key, so a single difference remains valid.
+                    assert_eq!(runtime.validate_indexes(), Ok(()), "{label}");
+                }
+            }
+        });
     }
 }
 
@@ -8192,5 +8893,965 @@ mod tests {
             assert_ne!(config.inside(), config.outside());
             assert_ne!(config.first_port(), 0);
         });
+    }
+    #[test]
+    fn udp_config_authority_matches_requires_authority_and_snapshot_identity() {
+        with_port_config(Nat44UdpPolicy::default(), 40_000, 40_001, |config| {
+            let routes = [
+                Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, INSIDE, None).unwrap(),
+                Route::new(
+                    Ipv4Address::from_octets([0, 0, 0, 0]),
+                    0,
+                    OUTSIDE,
+                    Some(Ipv4Address::from_octets([203, 0, 113, 1])),
+                )
+                .unwrap(),
+            ];
+            let interfaces = [
+                Interface {
+                    id: INSIDE,
+                    mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                },
+                Interface {
+                    id: OUTSIDE,
+                    mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                },
+            ];
+            let neighbors = [Neighbor {
+                interface: OUTSIDE,
+                target: Ipv4Address::from_octets([203, 0, 113, 1]),
+                mac: MacAddress([2, 0, 0, 0, 0, 3]),
+            }];
+            let bindings = [
+                LocalIpv4Binding {
+                    interface: INSIDE,
+                    address: Ipv4Address::from_octets([10, 0, 0, 1]),
+                },
+                LocalIpv4Binding {
+                    interface: OUTSIDE,
+                    address: PUBLIC,
+                },
+            ];
+            let snapshot =
+                ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+
+            let mut authority_match_only = config;
+            authority_match_only.authority = snapshot_authority(&snapshot);
+            authority_match_only.snapshot_identity = [usize::MAX; 8];
+            // Missed mutant: Nat44UdpConfig::authority_matches authority comparison; the
+            // authority conjunct must be part of the exact-owner authorization contract.
+            // Missed mutant: Nat44UdpConfig::authority_matches snapshot_identity comparison;
+            // an identity mismatch must reject even when the authority matches.
+            assert!(!authority_match_only.authority_matches(&snapshot));
+        });
+    }
+
+    #[test]
+    fn udp_slots_is_occupied_distinguishes_default_and_occupied() {
+        // Missed mutant: Nat44UdpMappingSlot::is_occupied must report false for a default slot.
+        assert!(!Nat44UdpMappingSlot::default().is_occupied());
+
+        let occupied_mapping = Nat44UdpMappingSlot {
+            occupied: true,
+            ..Nat44UdpMappingSlot::default()
+        };
+        // Missed mutant: Nat44UdpMappingSlot::is_occupied must report true for an occupied slot.
+        assert!(occupied_mapping.is_occupied());
+
+        // Missed mutant: Nat44UdpPeerSlot::is_occupied must report false for a default slot.
+        assert!(!Nat44UdpPeerSlot::default().is_occupied());
+
+        let occupied_peer = Nat44UdpPeerSlot {
+            occupied: true,
+            ..Nat44UdpPeerSlot::default()
+        };
+        // Missed mutant: Nat44UdpPeerSlot::is_occupied must report true for an occupied slot.
+        assert!(occupied_peer.is_occupied());
+    }
+
+    #[test]
+    fn udp_authority_evidence_indexes_coherent_checks_word_26() {
+        let mut coherent_words = [0; NAT44_AUTHORITY_WORDS];
+        coherent_words[26] = 1;
+        let coherent =
+            Nat44UdpAuthorityEvidence::from_expected_contract(1, 1, 1, 1, 1, 1, 1, coherent_words);
+        // Missed mutant: Nat44UdpAuthorityEvidence::indexes_coherent must accept words[26] == 1,
+        // killing the constant-false and ==/!= mutants.
+        assert!(coherent.indexes_coherent());
+
+        let incoherent_words = [0; NAT44_AUTHORITY_WORDS];
+        let incoherent = Nat44UdpAuthorityEvidence::from_expected_contract(
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            incoherent_words,
+        );
+        // Missed mutant: Nat44UdpAuthorityEvidence::indexes_coherent must reject words[26] != 1,
+        // killing the constant-true mutant and the reversed equality mutant.
+        assert!(!incoherent.indexes_coherent());
+    }
+
+    #[test]
+    fn udp_authority_evidence_directories_coherent_checks_all_directory_words() {
+        let mut all_coherent_words = [0; NAT44_AUTHORITY_WORDS];
+        all_coherent_words[9] = 1;
+        all_coherent_words[15] = 1;
+        all_coherent_words[21] = 1;
+        let all_coherent = Nat44UdpAuthorityEvidence::from_expected_contract(
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            all_coherent_words,
+        );
+        // Missed mutants: Nat44UdpAuthorityEvidence::directories_coherent constant-false and the
+        // three words[9]/[15]/[21] ==/!= checks; all three directory words equal to one must pass.
+        assert!(all_coherent.directories_coherent());
+
+        let mut first_incoherent_words = [0; NAT44_AUTHORITY_WORDS];
+        first_incoherent_words[15] = 1;
+        first_incoherent_words[21] = 1;
+        let first_incoherent = Nat44UdpAuthorityEvidence::from_expected_contract(
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            first_incoherent_words,
+        );
+        // Missed mutant: directories_coherent's first && and words[9] ==/!= check; words[9] != 1
+        // must make the aggregate verdict false.
+        assert!(!first_incoherent.directories_coherent());
+
+        let mut second_incoherent_words = [0; NAT44_AUTHORITY_WORDS];
+        second_incoherent_words[9] = 1;
+        second_incoherent_words[21] = 1;
+        let second_incoherent = Nat44UdpAuthorityEvidence::from_expected_contract(
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            second_incoherent_words,
+        );
+        // Missed mutant: directories_coherent's second && and words[15] ==/!= check; words[15] != 1
+        // must make the aggregate verdict false.
+        assert!(!second_incoherent.directories_coherent());
+
+        let mut third_incoherent_words = [0; NAT44_AUTHORITY_WORDS];
+        third_incoherent_words[9] = 1;
+        third_incoherent_words[15] = 1;
+        let third_incoherent = Nat44UdpAuthorityEvidence::from_expected_contract(
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            third_incoherent_words,
+        );
+        // Missed mutant: directories_coherent's third && and words[21] ==/!= check; words[21] != 1
+        // must make the aggregate verdict false.
+        assert!(!third_incoherent.directories_coherent());
+    }
+
+    #[test]
+    fn udp_authority_words_bound_link_and_port_masks_and_validate_lookup() {
+        // Missed mutants 17-20: directory_authority_words must set a bit only for a linked
+        // node whose index is strictly below 64.  These three shapes distinguish &&, ==, >,
+        // and <= replacements, including the index-64 boundary.
+        let mut empty_buckets = [DirectoryBucket::default(); 1];
+        let mut empty_nodes = [DirectoryNode::default(); 1];
+        let empty_directory =
+            FixedDirectory::new(&mut empty_buckets, &mut empty_nodes, test_udp_hash_key().0)
+                .unwrap();
+        assert_eq!(
+            directory_authority_words(&empty_directory, |_| None)[4],
+            0,
+            "an unlinked node must not set the link mask"
+        );
+
+        let mut low_buckets = [DirectoryBucket::default(); 1];
+        let mut low_nodes = [DirectoryNode::default(); 1];
+        let mut low_directory =
+            FixedDirectory::new(&mut low_buckets, &mut low_nodes, test_udp_hash_key().0).unwrap();
+        low_directory
+            .link(0, DirectoryHashDomain::UdpMapping, &[1])
+            .unwrap();
+        assert_eq!(
+            directory_authority_words(&low_directory, |_| None)[4],
+            1,
+            "linked index zero must set bit zero"
+        );
+
+        let mut boundary_buckets = vec![DirectoryBucket::default(); 128];
+        let mut boundary_nodes = vec![DirectoryNode::default(); 65];
+        let mut boundary_directory = FixedDirectory::new(
+            &mut boundary_buckets,
+            &mut boundary_nodes,
+            test_udp_hash_key().0,
+        )
+        .unwrap();
+        boundary_directory
+            .link(64, DirectoryHashDomain::UdpMapping, &[2])
+            .unwrap();
+        assert_eq!(
+            directory_authority_words(&boundary_directory, |_| None)[4],
+            0,
+            "index 64 is outside the u64 link mask"
+        );
+
+        // Missed mutants 21-23: port_owner_authority_words uses the same strict boundary.
+        let mut owner_slots = [PortOwnerSlot::default(); 1];
+        let mut owner_table = PortOwnerTable::new(&mut owner_slots, 40_000, 40_000, 1).unwrap();
+        owner_table
+            .assign(40_000, PortOwnerToken::new(0, 1, 1).unwrap())
+            .unwrap();
+        let owner_words = port_owner_authority_words(&owner_table, 40_000, |_| {
+            Some(PortOwnerExpectation {
+                port: 40_000,
+                state_generation: 1,
+                runtime_epoch: 1,
+            })
+        });
+        assert_eq!(
+            owner_words[3], 1,
+            "offset zero must set the assignment mask"
+        );
+
+        let mut boundary_owner_slots = vec![PortOwnerSlot::default(); 65];
+        let mut boundary_owner_table =
+            PortOwnerTable::new(&mut boundary_owner_slots, 40_000, 40_064, 1).unwrap();
+        boundary_owner_table
+            .assign(40_064, PortOwnerToken::new(0, 1, 1).unwrap())
+            .unwrap();
+        let boundary_owner_words =
+            port_owner_authority_words(&boundary_owner_table, 40_000, |offset| {
+                (offset == 64).then_some(PortOwnerExpectation {
+                    port: 40_064,
+                    state_generation: 1,
+                    runtime_epoch: 1,
+                })
+            });
+        assert_eq!(
+            boundary_owner_words[3], 0,
+            "offset 64 must not be represented in the u64 assignment mask"
+        );
+
+        // Missed mutant 24: a valid owner lookup with an invalid expected-owner semantic report
+        // must make the aggregate validity false; && cannot become || here.
+        let mut invalid_expectation_slots = [PortOwnerSlot::default(); 1];
+        let invalid_expectation_table =
+            PortOwnerTable::new(&mut invalid_expectation_slots, 40_000, 40_000, 1).unwrap();
+        assert_eq!(
+            port_owner_authority_words(&invalid_expectation_table, 40_000, |_| {
+                Some(PortOwnerExpectation {
+                    port: 40_000,
+                    state_generation: 1,
+                    runtime_epoch: 1,
+                })
+            })[0],
+            0
+        );
+    }
+
+    #[test]
+    fn udp_directory_authority_commitment_includes_live_node_bucket() {
+        let mut buckets = [DirectoryBucket::default(); 1];
+        let mut nodes = [DirectoryNode::default(); 1];
+        let mut directory =
+            FixedDirectory::new(&mut buckets, &mut nodes, test_udp_hash_key().0).unwrap();
+        let key_words = [42_u64];
+        let hash = directory.hash_words(DirectoryHashDomain::UdpMapping, &key_words);
+        directory
+            .link(0, DirectoryHashDomain::UdpMapping, &key_words)
+            .unwrap();
+
+        // Missed mutant 25: for a non-empty directory the zero-mask bucket must be selected by
+        // `bucket_count == 0`'s false arm, so == cannot be replaced with !=.
+        let actual =
+            directory_authority_commitment(&directory, DirectoryHashDomain::UdpMapping, |_| {
+                Some(hash)
+            });
+        let mut expected = directory.hash_words(
+            DirectoryHashDomain::UdpMapping,
+            &[NAT44_AUTHORITY_COMMITMENT_TAG, 1, 1],
+        );
+        expected = authority_digest_step(expected, 0);
+        expected = authority_digest_step(expected, 1);
+        expected = authority_digest_step(expected, 1);
+        expected = authority_digest_step(expected, hash);
+        expected = authority_digest_step(expected, 0);
+        expected = authority_digest_step(expected, 1);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn udp_authority_evidence_requires_port_owned_mapping_for_owner_semantics() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let plan = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(plan, 0).unwrap();
+            assert!(runtime.authority_evidence().directories_coherent());
+
+            // Missed mutant 26: authority_evidence must use occupied && port_owned.  Keeping
+            // the mapping occupied but clearing port_owned invalidates only the owner evidence.
+            runtime.mappings[0].port_owned = false;
+            assert!(!runtime.authority_evidence().directories_coherent());
+        });
+    }
+
+    #[test]
+    fn udp_commit_inbound_rejects_revision_time_and_mapping_slot_changes() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(first, 0).unwrap();
+
+            let stale_revision = runtime.plan_inbound_read_only(40_000, REMOTE1, 1).unwrap();
+            let refresh = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 1).unwrap();
+            runtime.commit_outbound(refresh, 1).unwrap();
+            // Missed mutant 27: a changed state revision must be rejected, not accepted when
+            // the comparison is reversed.
+            assert_eq!(
+                runtime.commit_inbound(stale_revision, 1),
+                Err(Nat44UdpCommitError::StateRevisionChanged)
+            );
+
+            let stale_time = runtime.plan_inbound_read_only(40_000, REMOTE1, 1).unwrap();
+            // Missed mutant 28: an inbound plan is tied to its exact planning timestamp.
+            assert_eq!(
+                runtime.commit_inbound(stale_time, 2),
+                Err(Nat44UdpCommitError::CommitTimeChanged)
+            );
+        });
+
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let outbound = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(outbound, 0).unwrap();
+
+            let slot_changed = runtime.plan_inbound_read_only(40_000, REMOTE1, 0).unwrap();
+            runtime.mappings[0].occupied = false;
+            // Missed mutant 29: occupied && generation must reject an unoccupied slot even when
+            // its generation is retained.
+            assert_eq!(
+                runtime.commit_inbound(slot_changed, 0),
+                Err(Nat44UdpCommitError::MappingSlotChanged)
+            );
+        });
+
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let outbound = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(outbound, 0).unwrap();
+            let generation_changed = runtime.plan_inbound_read_only(40_000, REMOTE1, 0).unwrap();
+            runtime.mappings[0].generation += 1;
+            // Missed mutant 30: occupied && generation equality must reject a changed generation.
+            assert_eq!(
+                runtime.commit_inbound(generation_changed, 0),
+                Err(Nat44UdpCommitError::MappingSlotChanged)
+            );
+        });
+    }
+
+    #[test]
+    fn udp_read_only_error_and_prepare_guards_keep_or_constraints() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            // Missed mutant 31: only ClockRegression gets the read-only clock counter.
+            runtime.record_read_only_plan_error(Nat44UdpPlanError::ClockRegression);
+            assert_eq!(runtime.counters().clock_regressions, 1);
+
+            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(first, 0).unwrap();
+
+            let mut refresh = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            refresh.displaced_port_mapping_index = 0;
+
+            runtime.mappings[0].occupied = false;
+            runtime.mappings[0].port_owned = true;
+            // Missed mutant 33: !occupied alone must reject a displaced mapping.
+            assert!(matches!(
+                runtime.prepare_outbound_index_mutations(refresh, None, 0),
+                Err(Nat44UdpCommitError::MappingSlotChanged)
+            ));
+
+            runtime.mappings[0].occupied = true;
+            runtime.mappings[0].port_owned = false;
+            runtime.mappings[0].last_outbound_ms = 1;
+            // Missed mutant 32: !port_owned alone must reject a displaced mapping.
+            assert!(matches!(
+                runtime.prepare_outbound_index_mutations(refresh, None, 0),
+                Err(Nat44UdpCommitError::MappingSlotChanged)
+            ));
+        });
+
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            runtime.commit_outbound(first, 0).unwrap();
+            let mut replacement = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            replacement.mapping_created = true;
+            replacement.mapping_index = 0;
+            replacement.mapping.public_port = 40_000;
+            replacement.mapping.generation = 1;
+            replacement.mapping.lifecycle_epoch = 1;
+            replacement.peer_index = UDP_INDEX_NONE;
+            replacement.peer = None;
+            replacement.prepared = PreparedNat44UdpOutboundCommit::EMPTY;
+
+            let fake_old = Nat44UdpMappingSlot {
+                occupied: false,
+                port_owned: true,
+                generation: 1,
+                lifecycle_epoch: 1,
+                public_port: 40_001,
+                ..Nat44UdpMappingSlot::default()
+            };
+            runtime.mappings[0] = fake_old;
+            runtime.mapping_directory.clear();
+            runtime.port_owners.clear();
+            runtime
+                .port_owners
+                .assign(40_001, PortOwnerToken::new(0, 1, 1).unwrap())
+                .unwrap();
+            let prepared = runtime
+                .prepare_outbound_index_mutations(replacement, None, 0)
+                .unwrap();
+            // Missed mutant 34: an unoccupied mapping cannot supply an old owner even if its
+            // port_owned bit is stale; && must not become ||.
+            let owner = prepared.owner.unwrap();
+            runtime.port_owners.apply_prepared_move_topology(
+                owner,
+                PortOwnerToken::new(
+                    0,
+                    replacement.mapping.generation,
+                    replacement.mapping.lifecycle_epoch,
+                )
+                .unwrap(),
+            );
+            assert!(
+                runtime.port_owners.owner(40_001).unwrap().is_some(),
+                "unoccupied stale owner must not be cleared"
+            );
+        });
+    }
+
+    #[test]
+    fn udp_revalidate_rejects_one_stale_prepared_index() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let plan = runtime
+                .plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 0)
+                .unwrap();
+            runtime.mapping_directory.clear();
+            // Missed mutant 36: revalidation must apply the same independent mapping guard.
+            assert_eq!(
+                runtime.revalidate_outbound_commit(plan, 0),
+                Err(Nat44UdpCommitError::IndexCorrupt)
+            );
+        });
+
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let plan = runtime
+                .plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 0)
+                .unwrap();
+            runtime.peer_directory.clear();
+            // Missed mutant 38: revalidation must reject a missing prepared peer directory entry.
+            assert_eq!(
+                runtime.revalidate_outbound_commit(plan, 0),
+                Err(Nat44UdpCommitError::IndexCorrupt)
+            );
+        });
+    }
+
+    #[test]
+    fn udp_mapping_for_public_port_checks_each_owner_binding() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            for name in ["occupied", "port_owned", "generation", "lifecycle"] {
+                let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+                let mut peers = [Nat44UdpPeerSlot::default(); 1];
+                let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+                let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+                let plan = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+                runtime.commit_outbound(plan, 0).unwrap();
+                match name {
+                    "occupied" => runtime.mappings[0].occupied = false,
+                    "port_owned" => runtime.mappings[0].port_owned = false,
+                    "generation" => runtime.mappings[0].generation += 1,
+                    "lifecycle" => runtime.mappings[0].lifecycle_epoch += 1,
+                    _ => unreachable!(),
+                }
+                // Missed mutants 39-42: every mapping/owner conjunct must be enforced.
+                assert_eq!(
+                    runtime.mapping_for_public_port(40_000, 0),
+                    Err(Nat44UdpPlanError::IndexCorrupt),
+                    "mapping_for_public_port must reject {name} mismatch"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn udp_validate_indexes_checks_mapping_and_peer_identity_fields() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 2];
+            let mut peers = [Nat44UdpPeerSlot::default(); 2];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let map0 = Nat44UdpMappingSlot {
+                occupied: true,
+                generation: 1,
+                lifecycle_epoch: 1,
+                port_owned: true,
+                inside: INSIDE,
+                internal_address: INTERNAL,
+                internal_port: 40_000,
+                public_port: 40_000,
+                ..Nat44UdpMappingSlot::default()
+            };
+            let map1 = Nat44UdpMappingSlot { ..map0 };
+            runtime.mappings[0] = map0;
+            runtime.mappings[1] = map1;
+            runtime
+                .mapping_directory
+                .link(
+                    0,
+                    DirectoryHashDomain::UdpMapping,
+                    &Nat44UdpRuntime::mapping_words(map0),
+                )
+                .unwrap();
+            runtime
+                .mapping_directory
+                .link(
+                    1,
+                    DirectoryHashDomain::UdpMapping,
+                    &Nat44UdpRuntime::mapping_words(map1),
+                )
+                .unwrap();
+            runtime
+                .port_owners
+                .assign(40_000, PortOwnerToken::new(0, 1, 1).unwrap())
+                .unwrap();
+            runtime
+                .port_owners
+                .assign(40_001, PortOwnerToken::new(1, 1, 1).unwrap())
+                .unwrap();
+            runtime.mappings[1].public_port = 40_001;
+            // The owner expectation for slot one uses the changed public port; mapping directory
+            // keys intentionally remain equal for the duplicate-key invariant test.
+            assert_eq!(
+                runtime.validate_indexes(),
+                Err(Nat44UdpIndexInvariantError::DuplicateMappingKey)
+            );
+        });
+
+        for (inside, address, label) in [
+            (IfId(9), INTERNAL, "inside"),
+            (INSIDE, INTERNAL2, "address"),
+        ] {
+            with_config(Nat44UdpPolicy::default(), |config| {
+                let mut mappings = [Nat44UdpMappingSlot::default(); 2];
+                let mut peers = [Nat44UdpPeerSlot::default(); 2];
+                let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+                let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+                let first = Nat44UdpMappingSlot {
+                    occupied: true,
+                    generation: 1,
+                    lifecycle_epoch: 1,
+                    port_owned: true,
+                    inside: INSIDE,
+                    internal_address: INTERNAL,
+                    internal_port: 40_000,
+                    public_port: 40_000,
+                    ..Nat44UdpMappingSlot::default()
+                };
+                let second = Nat44UdpMappingSlot {
+                    inside,
+                    internal_address: address,
+                    public_port: 40_001,
+                    ..first
+                };
+                runtime.mappings[0] = first;
+                runtime.mappings[1] = second;
+                runtime
+                    .mapping_directory
+                    .link(
+                        0,
+                        DirectoryHashDomain::UdpMapping,
+                        &Nat44UdpRuntime::mapping_words(first),
+                    )
+                    .unwrap();
+                runtime
+                    .mapping_directory
+                    .link(
+                        1,
+                        DirectoryHashDomain::UdpMapping,
+                        &Nat44UdpRuntime::mapping_words(second),
+                    )
+                    .unwrap();
+                runtime
+                    .port_owners
+                    .assign(40_000, PortOwnerToken::new(0, 1, 1).unwrap())
+                    .unwrap();
+                runtime
+                    .port_owners
+                    .assign(40_001, PortOwnerToken::new(1, 1, 1).unwrap())
+                    .unwrap();
+                // Missed mutant 43: a differing mapping key field must not be mistaken for a
+                // duplicate when its equality is reversed.
+                assert_eq!(runtime.validate_indexes(), Ok(()), "{label} differs");
+            });
+        }
+
+        for (generation, lifecycle, label) in [(2, 1, "generation"), (1, 2, "lifecycle")] {
+            with_config(Nat44UdpPolicy::default(), |config| {
+                let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+                let mut peers = [Nat44UdpPeerSlot::default(); 2];
+                let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+                let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+                let peer0 = Nat44UdpPeerSlot {
+                    occupied: true,
+                    mapping_index: 0,
+                    mapping_generation: 1,
+                    mapping_lifecycle_epoch: 1,
+                    remote_address: REMOTE1,
+                };
+                let peer1 = Nat44UdpPeerSlot {
+                    mapping_generation: generation,
+                    mapping_lifecycle_epoch: lifecycle,
+                    ..peer0
+                };
+                runtime.peers[0] = peer0;
+                runtime.peers[1] = peer1;
+                runtime
+                    .peer_directory
+                    .link(
+                        0,
+                        DirectoryHashDomain::UdpPeer,
+                        &Nat44UdpRuntime::peer_words(peer0),
+                    )
+                    .unwrap();
+                runtime
+                    .peer_directory
+                    .link(
+                        1,
+                        DirectoryHashDomain::UdpPeer,
+                        &Nat44UdpRuntime::peer_words(peer1),
+                    )
+                    .unwrap();
+                // Missed mutant 45: peer lifecycle identity uses equality, so a differing field
+                // is not a duplicate. Mutant 44 (mapping index) is covered by the block below.
+                assert_eq!(runtime.validate_indexes(), Ok(()), "{label} differs");
+            });
+        }
+
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 2];
+            let mut peers = [Nat44UdpPeerSlot::default(); 2];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let peer0 = Nat44UdpPeerSlot {
+                occupied: true,
+                mapping_index: 0,
+                mapping_generation: 1,
+                mapping_lifecycle_epoch: 1,
+                remote_address: REMOTE1,
+            };
+            let peer1 = Nat44UdpPeerSlot {
+                mapping_index: 1,
+                ..peer0
+            };
+            runtime.peers[0] = peer0;
+            runtime.peers[1] = peer1;
+            runtime
+                .peer_directory
+                .link(
+                    0,
+                    DirectoryHashDomain::UdpPeer,
+                    &Nat44UdpRuntime::peer_words(peer0),
+                )
+                .unwrap();
+            runtime
+                .peer_directory
+                .link(
+                    1,
+                    DirectoryHashDomain::UdpPeer,
+                    &Nat44UdpRuntime::peer_words(peer1),
+                )
+                .unwrap();
+            // Missed mutant 44: a differing peer mapping index is not a duplicate.
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+    }
+
+    #[test]
+    fn udp_find_mapping_and_peer_require_every_lookup_key_field() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            for (inside, address, port, label) in [
+                (OUTSIDE, INTERNAL, 40_000, "inside"),
+                (INSIDE, INTERNAL2, 40_000, "address"),
+                (INSIDE, INTERNAL, 40_001, "port"),
+            ] {
+                let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+                let mut peers = [Nat44UdpPeerSlot::default(); 1];
+                let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+                let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+                runtime.mappings[0] = Nat44UdpMappingSlot {
+                    occupied: true,
+                    generation: 1,
+                    lifecycle_epoch: 1,
+                    port_owned: true,
+                    inside,
+                    internal_address: address,
+                    internal_port: port,
+                    public_port: 40_000,
+                    ..Nat44UdpMappingSlot::default()
+                };
+                let query_words = Nat44UdpRuntime::mapping_lookup_words(INSIDE, INTERNAL, 40_000);
+                runtime
+                    .mapping_directory
+                    .link(0, DirectoryHashDomain::UdpMapping, &query_words)
+                    .unwrap();
+                // Missed mutants 46-48: a hash collision must still require each mapping tuple
+                // field; replacing any && with || would return this mismatching slot.
+                assert_eq!(runtime.find_mapping(INTERNAL, 40_000), Ok(None), "{label}");
+            }
+        });
+
+        with_config(Nat44UdpPolicy::default(), |config| {
+            for (mapping_index, generation, epoch, remote, label) in [
+                (1, 1, 1, REMOTE1, "mapping index"),
+                (0, 2, 1, REMOTE1, "generation"),
+                (0, 1, 2, REMOTE1, "lifecycle"),
+                (0, 1, 1, REMOTE2, "remote"),
+            ] {
+                let mut mappings = [Nat44UdpMappingSlot::default(); 2];
+                let mut peers = [Nat44UdpPeerSlot::default(); 1];
+                let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+                let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+                runtime.mappings[0] = Nat44UdpMappingSlot {
+                    occupied: true,
+                    generation: 1,
+                    lifecycle_epoch: 1,
+                    port_owned: true,
+                    inside: INSIDE,
+                    internal_address: INTERNAL,
+                    internal_port: 40_000,
+                    public_port: 40_000,
+                    ..Nat44UdpMappingSlot::default()
+                };
+                let query_words = Nat44UdpRuntime::peer_lookup_words(0, 1, 1, REMOTE1);
+                runtime.peers[0] = Nat44UdpPeerSlot {
+                    occupied: true,
+                    mapping_index,
+                    mapping_generation: generation,
+                    mapping_lifecycle_epoch: epoch,
+                    remote_address: remote,
+                };
+                runtime
+                    .peer_directory
+                    .link(0, DirectoryHashDomain::UdpPeer, &query_words)
+                    .unwrap();
+                // Missed mutants 50-53: peer lookup must enforce index, generation, epoch, and
+                // remote address independently.
+                assert_eq!(
+                    runtime.peer_exists(0, 1, REMOTE1),
+                    Ok(false),
+                    "{label} mismatch must not match"
+                );
+            }
+        });
+
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            runtime.mappings[0] = Nat44UdpMappingSlot {
+                generation: 1,
+                ..Nat44UdpMappingSlot::default()
+            };
+            // Missed mutant 49: peer lookup requires an occupied mapping even when generation
+            // matches the request.
+            assert_eq!(
+                runtime.peer_exists(0, 1, REMOTE1),
+                Err(Nat44UdpPlanError::IndexCorrupt)
+            );
+        });
+    }
+
+    #[test]
+    fn udp_reusable_peer_and_port_selection_reject_live_or_mismatched_state() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            runtime.mappings[0] = Nat44UdpMappingSlot {
+                occupied: true,
+                generation: 1,
+                lifecycle_epoch: 1,
+                last_outbound_ms: 0,
+                ..Nat44UdpMappingSlot::default()
+            };
+            runtime.peers[0] = Nat44UdpPeerSlot {
+                occupied: true,
+                mapping_index: 0,
+                mapping_generation: 2,
+                mapping_lifecycle_epoch: 1,
+                ..Nat44UdpPeerSlot::default()
+            };
+            // Missed mutant 54: a generation mismatch makes an occupied peer reusable even if
+            // the referenced mapping is live.
+            assert_eq!(runtime.find_reusable_peer(0), Some(0));
+        });
+
+        with_config(Nat44UdpPolicy::default(), |config| {
+            for label in ["occupied", "port owned", "generation", "lifecycle"] {
+                let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+                let mut peers = [Nat44UdpPeerSlot::default(); 1];
+                let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+                let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+                let mapping = Nat44UdpMappingSlot {
+                    occupied: true,
+                    generation: 1,
+                    lifecycle_epoch: 1,
+                    port_owned: true,
+                    inside: INSIDE,
+                    internal_address: INTERNAL,
+                    internal_port: 40_000,
+                    public_port: 40_000,
+                    last_outbound_ms: 0,
+                };
+                runtime.mappings[0] = mapping;
+                runtime
+                    .port_owners
+                    .assign(40_000, PortOwnerToken::new(0, 1, 1).unwrap())
+                    .unwrap();
+                match label {
+                    "occupied" => runtime.mappings[0].occupied = false,
+                    "port owned" => runtime.mappings[0].port_owned = false,
+                    "generation" => runtime.mappings[0].generation += 1,
+                    "lifecycle" => runtime.mappings[0].lifecycle_epoch += 1,
+                    _ => unreachable!(),
+                }
+                // Missed mutants 55-58: each public-port owner field is independently required.
+                assert!(
+                    matches!(
+                        runtime.select_port(40_000, 0),
+                        Err(Nat44UdpPlanError::IndexCorrupt)
+                    ),
+                    "{label} owner mismatch"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn udp_read_only_clock_and_address_admission_keep_strict_boundaries() {
+        with_config(Nat44UdpPolicy::default(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            runtime.watermark_ms = Some(10);
+            // Missed mutant 59: read-only time 9 is a regression; reversing < to > accepts it.
+            assert_eq!(
+                runtime.check_now_read_only(9),
+                Err(Nat44UdpPlanError::ClockRegression)
+            );
+        });
+
+        let routes = [
+            Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, INSIDE, None).unwrap(),
+            Route::new(
+                Ipv4Address::from_octets([0, 0, 0, 0]),
+                0,
+                OUTSIDE,
+                Some(Ipv4Address::from_octets([203, 0, 113, 1])),
+            )
+            .unwrap(),
+        ];
+        let interfaces = [
+            Interface {
+                id: INSIDE,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: OUTSIDE,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let neighbors = [Neighbor {
+            interface: OUTSIDE,
+            target: Ipv4Address::from_octets([203, 0, 113, 1]),
+            mac: MacAddress([2, 0, 0, 0, 0, 3]),
+        }];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: INSIDE,
+                address: Ipv4Address::from_octets([10, 0, 0, 1]),
+            },
+            LocalIpv4Binding {
+                interface: OUTSIDE,
+                address: PUBLIC,
+            },
+        ];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        for (address, label) in [
+            (Ipv4Address::from_octets([0, 1, 1, 1]), "0/8"),
+            (Ipv4Address::from_octets([127, 1, 1, 1]), "127/8"),
+            (Ipv4Address::from_octets([224, 1, 1, 1]), "multicast"),
+        ] {
+            // Missed mutants 60-63: each special-address disjunct must independently reject
+            // its class; replacing any || with && admits the address.
+            assert!(!address_is_host_unicast(&snapshot, address), "{label}");
+        }
+        // Missed mutant 64: a route network address is rejected when either network/broadcast
+        // predicate is true, so the final || cannot become &&.
+        assert!(!address_is_host_unicast(
+            &snapshot,
+            Ipv4Address::from_octets([10, 0, 0, 0])
+        ));
     }
 }
