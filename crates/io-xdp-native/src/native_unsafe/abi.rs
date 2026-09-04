@@ -606,3 +606,152 @@ fn checked_extent(
         end,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::RingName;
+
+    use super::*;
+
+    #[test]
+    fn abi_flag_masks_preserve_each_independent_bit() {
+        // Protects the UAPI bit shifts and the bind-mask OR operations from
+        // silently dropping one of the independently meaningful flags.
+        assert_eq!(XDP_SHARED_UMEM, 1);
+        assert_eq!(XDP_COPY, 2);
+        assert_eq!(XDP_ZEROCOPY, 4);
+        assert_eq!(XDP_USE_NEED_WAKEUP, 8);
+        assert_eq!(XDP_USE_SG, 16);
+        assert_eq!(XDP_SUPPORTED_BIND_FLAGS, 1 | 2 | 4 | 8);
+        assert_eq!(XDP_UMEM_UNALIGNED_CHUNK_FLAG, 1);
+        assert_eq!(XDP_UMEM_TX_SW_CSUM, 2);
+        assert_eq!(XDP_OPTIONS_ZEROCOPY, 1);
+        assert_eq!(XDP_PKT_CONTD, 1);
+        assert_eq!(XDP_TX_METADATA, 2);
+    }
+
+    #[test]
+    fn abi_encoders_write_every_c_layout_field() {
+        // Protects the field writers and zero-initialized encoders: every
+        // native-endian byte must come from the corresponding UAPI field.
+        let umem = XdpUmemReg {
+            address: 0x0102_0304_0506_0708,
+            len: 0x1112_1314_1516_1718,
+            chunk_size: 0x2122_2324,
+            headroom: 0x3132_3334,
+            flags: 0x4142_4344,
+            tx_metadata_len: 0x5152_5354,
+        };
+        let mut expected = [0_u8; size_of::<XdpUmemReg>()];
+        expected[0..8].copy_from_slice(&umem.address.to_ne_bytes());
+        expected[8..16].copy_from_slice(&umem.len.to_ne_bytes());
+        expected[16..20].copy_from_slice(&umem.chunk_size.to_ne_bytes());
+        expected[20..24].copy_from_slice(&umem.headroom.to_ne_bytes());
+        expected[24..28].copy_from_slice(&umem.flags.to_ne_bytes());
+        expected[28..32].copy_from_slice(&umem.tx_metadata_len.to_ne_bytes());
+        assert_eq!(encode_xdp_umem_reg(umem), expected);
+
+        let sockaddr = SockAddrXdp {
+            family: 0x0102,
+            flags: 0x0304,
+            ifindex: 0x0506_0708,
+            queue_id: 0x090a_0b0c,
+            shared_umem_fd: 0x0d0e_0f10,
+        };
+        let mut expected = [0_u8; size_of::<SockAddrXdp>()];
+        expected[0..2].copy_from_slice(&sockaddr.family.to_ne_bytes());
+        expected[2..4].copy_from_slice(&sockaddr.flags.to_ne_bytes());
+        expected[4..8].copy_from_slice(&sockaddr.ifindex.to_ne_bytes());
+        expected[8..12].copy_from_slice(&sockaddr.queue_id.to_ne_bytes());
+        expected[12..16].copy_from_slice(&sockaddr.shared_umem_fd.to_ne_bytes());
+        assert_eq!(encode_sockaddr_xdp(sockaddr), expected);
+    }
+
+    #[test]
+    fn abi_mmap_offsets_decode_all_rings_at_distinct_bases() {
+        // Protects decode offset addition: each ring and each field must be
+        // read from its own C-layout base, rather than from a shifted address.
+        let offsets = XdpMmapOffsets {
+            rx: XdpRingOffset {
+                producer: 1,
+                consumer: 2,
+                descriptors: 3,
+                flags: 4,
+            },
+            tx: XdpRingOffset {
+                producer: 11,
+                consumer: 12,
+                descriptors: 13,
+                flags: 14,
+            },
+            fill: XdpRingOffset {
+                producer: 21,
+                consumer: 22,
+                descriptors: 23,
+                flags: 24,
+            },
+            completion: XdpRingOffset {
+                producer: 31,
+                consumer: 32,
+                descriptors: 33,
+                flags: 34,
+            },
+        };
+        assert_eq!(
+            decode_xdp_mmap_offsets(&encode_xdp_mmap_offsets(offsets)),
+            Some(offsets)
+        );
+    }
+
+    #[test]
+    fn abi_mmap_offsets_require_the_complete_kernel_struct() {
+        // Protects the length boundary: a truncated getsockopt result must be
+        // rejected, while an exact result is accepted.
+        let bytes = encode_xdp_mmap_offsets(XdpMmapOffsets::default());
+        assert_eq!(decode_xdp_mmap_offsets(&bytes[..bytes.len() - 1]), None);
+        assert_eq!(
+            decode_xdp_mmap_offsets(&bytes),
+            Some(XdpMmapOffsets::default())
+        );
+        assert_eq!(
+            decode_xdp_mmap_offsets(&[0_u8; size_of::<XdpMmapOffsets>() + 1]),
+            Some(XdpMmapOffsets::default())
+        );
+    }
+
+    #[test]
+    fn abi_layout_checks_descriptor_alignment_and_keeps_nonzero_accessors() {
+        // Protects descriptor alignment validation and the producer accessor;
+        // both cases are otherwise easy to mask with zero-valued fixtures.
+        let entries = RingEntries::new(RingName::Rx, 1).expect("valid entries");
+        let raw = XdpRingOffset {
+            producer: 4,
+            consumer: 64,
+            flags: 128,
+            descriptors: 196,
+        };
+        assert_eq!(
+            RingMmapLayout::new(raw, entries, RingElement::UmemAddress),
+            Err(AbiLayoutError::MisalignedOffset {
+                field: RingField::Descriptors,
+                offset: 196,
+                alignment: 8,
+            })
+        );
+
+        let valid = RingMmapLayout::new(
+            XdpRingOffset {
+                descriptors: 200,
+                ..raw
+            },
+            entries,
+            RingElement::UmemAddress,
+        )
+        .expect("non-overlapping aligned layout");
+        assert_eq!(valid.producer(), 4);
+        assert_eq!(valid.consumer(), 64);
+        assert_eq!(valid.flags(), 128);
+        assert_eq!(valid.descriptors(), 200);
+        assert_eq!(valid.byte_len(), 208);
+    }
+}

@@ -445,3 +445,20 @@ impl CompletionAcquisition<'_, '_> {
         self.inner.release_cancel();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ring_length_validation_distinguishes_zero_excess_and_valid() {
+        // Protects validate_len's boundary predicates: zero is invalid,
+        // capacity-plus-one is too large, and an in-range length is accepted.
+        assert_eq!(validate_len(0, 4), Err(NativeRingError::ZeroLength));
+        assert_eq!(
+            validate_len(5, 4),
+            Err(NativeRingError::LengthExceedsCapacity)
+        );
+        assert_eq!(validate_len(4, 4), Ok(()));
+    }
+}

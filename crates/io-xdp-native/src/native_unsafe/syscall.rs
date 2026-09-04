@@ -1748,6 +1748,106 @@ mod tests {
         }
     }
 
+    /// Dedicated seam for the fd-sign validation test.  The existing
+    /// `FakeSyscalls` transcript deliberately remains unchanged so its
+    /// established tests continue to exercise the original fixed fd 17.
+    struct FdBoundarySyscalls {
+        inner: FakeSyscalls,
+        socket_result: RawFd,
+    }
+
+    impl FdBoundarySyscalls {
+        fn new(socket_result: RawFd) -> Self {
+            Self {
+                inner: FakeSyscalls::new(),
+                socket_result,
+            }
+        }
+    }
+
+    impl sealed::Sealed for FdBoundarySyscalls {}
+
+    impl Syscalls for FdBoundarySyscalls {
+        fn socket(&self, domain: c_int, kind: c_int, protocol: c_int) -> Result<RawFd, Errno> {
+            self.inner.record(Call::Socket {
+                domain,
+                kind,
+                protocol,
+            });
+            self.inner
+                .result(SyscallStage::OpenSocket)
+                .map(|()| self.socket_result)
+        }
+
+        fn set_socket_option(
+            &self,
+            fd: RawFd,
+            level: c_int,
+            name: c_int,
+            value: &[u8],
+            length: SockLen,
+        ) -> Result<(), Errno> {
+            <FakeSyscalls as Syscalls>::set_socket_option(
+                &self.inner,
+                fd,
+                level,
+                name,
+                value,
+                length,
+            )
+        }
+
+        fn get_socket_option(
+            &self,
+            fd: RawFd,
+            level: c_int,
+            name: c_int,
+            value: &mut [u8],
+            length: &mut SockLen,
+        ) -> Result<(), Errno> {
+            <FakeSyscalls as Syscalls>::get_socket_option(
+                &self.inner,
+                fd,
+                level,
+                name,
+                value,
+                length,
+            )
+        }
+
+        fn mmap(&self, request: MapRequest) -> Result<*mut c_void, Errno> {
+            <FakeSyscalls as Syscalls>::mmap(&self.inner, request)
+        }
+
+        fn munmap(&self, address: *mut c_void, byte_len: usize) -> Result<(), Errno> {
+            <FakeSyscalls as Syscalls>::munmap(&self.inner, address, byte_len)
+        }
+
+        fn bind(&self, fd: RawFd, address: &[u8], length: SockLen) -> Result<(), Errno> {
+            <FakeSyscalls as Syscalls>::bind(&self.inner, fd, address, length)
+        }
+
+        fn poll(
+            &self,
+            descriptor: &mut PollDescriptor,
+            timeout_millis: c_int,
+        ) -> Result<u32, Errno> {
+            <FakeSyscalls as Syscalls>::poll(&self.inner, descriptor, timeout_millis)
+        }
+
+        fn send_to_wakeup(&self, fd: RawFd) -> Result<(), Errno> {
+            <FakeSyscalls as Syscalls>::send_to_wakeup(&self.inner, fd)
+        }
+
+        fn bpf(&self, command: u32, attr: &mut [u8]) -> Result<c_long, Errno> {
+            <FakeSyscalls as Syscalls>::bpf(&self.inner, command, attr)
+        }
+
+        fn close(&self, fd: RawFd) -> Result<(), Errno> {
+            <FakeSyscalls as Syscalls>::close(&self.inner, fd)
+        }
+    }
+
     fn assert_static_syscalls<T: Syscalls>() {}
 
     fn attr_u32(attr: &[u8; BPF_ATTR_SIZE], offset: usize) -> u32 {
@@ -2298,5 +2398,268 @@ mod tests {
             *ffi::__errno_location() = 12;
         }
         assert_eq!(decode_mmap_result(MAP_FAILED), Err(Errno::Linux(12)));
+    }
+
+    #[test]
+    fn native_errno_debug_and_minus_one_decoders_are_exact() {
+        // Protects errno formatting and all three libc return-value adapters:
+        // only the ABI sentinel -1 is an error, while zero and positive values
+        // remain successful results.
+        assert_eq!(format!("{:?}", Errno::Linux(13)), "Errno(13)");
+        assert_eq!(
+            format!("{:?}", Errno::InvalidCapture),
+            "Errno(<invalid-capture>)"
+        );
+
+        unsafe {
+            *ffi::__errno_location() = 13;
+        }
+        assert_eq!(result_from_minus_one(-1), Err(Errno::Linux(13)));
+        assert_eq!(result_from_minus_one(0), Ok(0));
+        assert_eq!(result_from_minus_one(7), Ok(7));
+        assert_eq!(result_from_ssize_minus_one(-1), Err(Errno::Linux(13)));
+        assert_eq!(result_from_ssize_minus_one(0), Ok(0));
+        assert_eq!(result_from_ssize_minus_one(7), Ok(7));
+        assert_eq!(result_from_long_minus_one(-1), Err(Errno::Linux(13)));
+        assert_eq!(result_from_long_minus_one(0), Ok(0));
+        assert_eq!(result_from_long_minus_one(7), Ok(7));
+    }
+
+    #[test]
+    fn native_verifier_log_uses_reported_size_only_when_present() {
+        // Protects the verifier-log boundary: zero means the whole supplied
+        // buffer is usable, nonzero is capped, and the first NUL terminates it.
+        assert_eq!(VERIFIER_LOG_SIZE, 64 * 1024);
+        let attr = [0_u8; BPF_ATTR_SIZE];
+        assert_eq!(
+            verifier_log_from_attr(&attr, b"complete log"),
+            "complete log"
+        );
+
+        let mut attr = [0_u8; BPF_ATTR_SIZE];
+        attr[140..144].copy_from_slice(&2_u32.to_ne_bytes());
+        assert_eq!(verifier_log_from_attr(&attr, b"abc\0tail"), "ab");
+    }
+
+    #[test]
+    fn native_mmap_length_checks_include_the_isize_boundary() {
+        // Protects the mmap length boundary: exactly isize::MAX is representable
+        // to from_raw_parts_mut, while one byte more must be rejected first.
+        assert_eq!(checked_mmap_length(isize::MAX as usize), Ok(()));
+        assert_eq!(
+            checked_mmap_length(isize::MAX as usize + 1),
+            Err(SyscallArgumentError::LengthDoesNotFitAddressSpace {
+                stage: SyscallStage::MapMemory,
+                length: isize::MAX as usize + 1,
+            })
+        );
+    }
+
+    #[test]
+    fn native_owned_fd_rejects_negative_and_accepts_zero() {
+        // Protects the ownership boundary: -1 is never an owned descriptor,
+        // while descriptor zero is valid and must not be rejected.
+        let negative = FdBoundarySyscalls::new(-1);
+        assert!(matches!(
+            OwnedXdpFd::open(&negative),
+            Err(ResourceError::Argument(
+                SyscallArgumentError::InvalidFileDescriptor
+            ))
+        ));
+
+        let zero = FdBoundarySyscalls::new(0);
+        let socket = OwnedXdpFd::open(&zero).expect("fd zero is owned");
+        assert_eq!(socket.raw(), 0);
+        drop(socket);
+        assert_eq!(
+            zero.inner
+                .count(|call| matches!(call, Call::Close { fd: 0 })),
+            1
+        );
+    }
+
+    #[test]
+    fn native_owned_close_methods_propagate_errors() {
+        // Protects explicit close methods from discarding close errors; the
+        // returned error is the caller's only indication of a failed release.
+        let socket_syscalls = FakeSyscalls::new();
+        let socket = OwnedXdpFd::open(&socket_syscalls).expect("fake socket");
+        socket_syscalls.fail.set(Some(SyscallStage::CloseSocket));
+        assert!(matches!(
+            socket.close(),
+            Err(ResourceError::Syscall(SyscallError {
+                stage: SyscallStage::CloseSocket,
+                errno: TEST_ERRNO,
+            }))
+        ));
+
+        let map_syscalls = FakeSyscalls::new();
+        let map = OwnedBpfMap::create(&map_syscalls, 1).expect("fake map");
+        map_syscalls.fail.set(Some(SyscallStage::CloseSocket));
+        assert!(matches!(
+            map.close(),
+            Err(BpfResourceError::Syscall {
+                operation: XskMapOperation::Close,
+                errno: TEST_ERRNO,
+            })
+        ));
+    }
+
+    #[test]
+    fn native_program_accessors_debug_and_drop_preserve_ownership() {
+        // Protects the program raw/debug accessors and Drop cleanup path. A
+        // successful load still owns fd 23 and must close it exactly once.
+        let syscalls = FakeSyscalls::new();
+        let program =
+            OwnedBpfProgram::load(&syscalls, &[0_u8; BPF_INSN_SIZE], 1).expect("fake program");
+        assert_eq!(program.raw(), 23);
+        assert_eq!(
+            format!("{program:?}"),
+            "OwnedBpfProgram { fd: \"<redacted>\", active: true }"
+        );
+        drop(program);
+        assert_eq!(
+            syscalls.count(|call| matches!(call, Call::Close { fd: 23 })),
+            1
+        );
+
+        let map = OwnedBpfMap::create(&syscalls, 1).expect("fake map");
+        assert_eq!(
+            format!("{map:?}"),
+            "OwnedBpfMap { fd: \"<redacted>\", max_entries: 1, active: true }"
+        );
+        drop(map);
+    }
+
+    #[test]
+    fn native_mapping_accessors_alignment_and_bytes_have_stateful_contracts() {
+        // Protects mmap metadata accessors, page-alignment reporting, and the
+        // active/non-null checks around the mutable mapping view.
+        let syscalls = FakeSyscalls::new();
+        let mut aligned = MappedRegion::map_anonymous(&syscalls, 8).expect("fake map");
+        assert_eq!(aligned.address(), 0x1_0000);
+        assert_eq!(aligned.byte_len(), 8);
+        assert!(aligned.address_is_page_aligned());
+        aligned.unmap_once().expect("fake unmap");
+
+        syscalls.next_address.set(0x1_0001);
+        let unaligned = MappedRegion::map_anonymous(&syscalls, 8).expect("fake map");
+        assert!(!unaligned.address_is_page_aligned());
+        drop(unaligned);
+
+        let mut storage = Box::new([0_u8; 8]);
+        let address = storage.as_mut_ptr().cast::<c_void>();
+        let mut active = MappedRegion {
+            syscalls: &syscalls,
+            address,
+            byte_len: storage.len(),
+            active: true,
+        };
+        let bytes = active.as_mut_bytes().expect("active non-null map");
+        bytes[0] = 0x5a;
+        assert_eq!(storage[0], 0x5a);
+        active.active = false;
+        assert!(active.as_mut_bytes().is_none());
+        drop(active);
+    }
+
+    #[test]
+    fn native_mapping_unmap_method_propagates_failure() {
+        // Protects the consuming unmap method from turning a kernel munmap
+        // failure into a false success.
+        let syscalls = FakeSyscalls::new();
+        let mapping = MappedRegion::map_anonymous(&syscalls, 4_096).expect("fake map");
+        syscalls.fail.set(Some(SyscallStage::UnmapMemory));
+        assert!(matches!(
+            mapping.unmap(),
+            Err(ResourceError::Syscall(SyscallError {
+                stage: SyscallStage::UnmapMemory,
+                errno: TEST_ERRNO,
+            }))
+        ));
+    }
+
+    #[test]
+    fn native_linux_wrappers_report_kernel_errors_and_poll_counts() {
+        // Protects every production libc wrapper from accepting a failed
+        // syscall, and checks both possible poll return values (ready and
+        // timeout) so fabricated Ok(0)/Ok(1) replacements are observable.
+        let linux = LinuxSyscalls;
+        assert!(<LinuxSyscalls as Syscalls>::socket(&linux, -1, 0, 0).is_err());
+        assert!(<LinuxSyscalls as Syscalls>::set_socket_option(&linux, -1, 0, 0, &[1], 1).is_err());
+        let mut option = [0_u8; 4];
+        let mut option_len = 4;
+        assert!(<LinuxSyscalls as Syscalls>::get_socket_option(
+            &linux,
+            -1,
+            0,
+            0,
+            &mut option,
+            &mut option_len,
+        )
+        .is_err());
+        assert!(<LinuxSyscalls as Syscalls>::bind(&linux, -1, &[0], 1).is_err());
+        assert!(<LinuxSyscalls as Syscalls>::send_to_wakeup(&linux, -1).is_err());
+        assert!(<LinuxSyscalls as Syscalls>::close(&linux, -1).is_err());
+
+        let mut descriptor = PollDescriptor::new(-1, 1);
+        assert_eq!(
+            <LinuxSyscalls as Syscalls>::poll(&linux, &mut descriptor, 0),
+            Ok(0)
+        );
+
+        use std::os::fd::AsRawFd;
+        let ready = std::fs::File::open("/dev/null").expect("dev null");
+        let mut descriptor = PollDescriptor::new(ready.as_raw_fd(), 1);
+        assert_eq!(
+            <LinuxSyscalls as Syscalls>::poll(&linux, &mut descriptor, 0),
+            Ok(1)
+        );
+
+        let mut attr = [0_u8; BPF_ATTR_SIZE];
+        assert!(<LinuxSyscalls as Syscalls>::bpf(&linux, BPF_MAP_CREATE, &mut attr).is_err());
+        assert!(
+            <LinuxSyscalls as Syscalls>::munmap(&linux, std::ptr::dangling_mut(), 4_096).is_err()
+        );
+    }
+
+    #[test]
+    fn native_linux_anonymous_mmap_is_writable_and_uses_a_real_mapping() {
+        // Protects the production mmap result, anonymous flags, and read/write
+        // protection. The write is intentionally part of the ABI contract.
+        let linux = LinuxSyscalls;
+        let address =
+            <LinuxSyscalls as Syscalls>::mmap(&linux, MapRequest::Anonymous { byte_len: 4_096 })
+                .expect("anonymous mmap");
+        assert!(!address.is_null());
+        // SAFETY: the preceding mmap returned a non-null successful mapping
+        // with the requested writable protection and one page of extent.
+        unsafe {
+            address.cast::<u8>().write(0x5a);
+        }
+        <LinuxSyscalls as Syscalls>::munmap(&linux, address, 4_096).expect("anonymous munmap");
+    }
+
+    #[test]
+    fn native_linux_netlink_wrappers_report_invalid_descriptor_errors() {
+        // Protects the separate netlink libc seam, including send length
+        // conversion and fd duplication, from fabricated successful returns.
+        let linux = LinuxSyscalls;
+        assert!(<LinuxSyscalls as NetlinkSyscalls>::socket(&linux, -1, 0, 0).is_err());
+        assert!(<LinuxSyscalls as NetlinkSyscalls>::bind(&linux, -1, &[0], 1).is_err());
+        let mut address = [0_u8; 12];
+        let mut length = 12;
+        assert!(<LinuxSyscalls as NetlinkSyscalls>::getsockname(
+            &linux,
+            -1,
+            &mut address,
+            &mut length,
+        )
+        .is_err());
+        assert!(<LinuxSyscalls as NetlinkSyscalls>::dup_cloexec(&linux, -1).is_err());
+        assert!(
+            <LinuxSyscalls as NetlinkSyscalls>::send_netlink(&linux, -1, &[1], &[0; 12]).is_err()
+        );
+        assert!(<LinuxSyscalls as NetlinkSyscalls>::close(&linux, -1).is_err());
     }
 }

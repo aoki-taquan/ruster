@@ -53,6 +53,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn public_platform_gate_matches_the_compiled_target_contract() {
+        // Protects the target-specific ensure_supported branches: unsupported
+        // operating systems and pointer widths must fail before acquisition.
+        #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+        assert_eq!(ensure_supported(), Ok(()));
+
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            ensure_supported(),
+            Err(PlatformError::UnsupportedOperatingSystem)
+        );
+
+        #[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
+        assert_eq!(
+            ensure_supported(),
+            Err(PlatformError::UnsupportedPointerWidth)
+        );
+    }
+
+    #[test]
     fn native_syscall_platform_profile_is_exact_and_typed() {
         assert_eq!(
             native_syscall_support(false, true, true),

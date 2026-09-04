@@ -1213,3 +1213,127 @@ impl fmt::Display for NativeSyscallPlatformError {
 }
 
 impl Error for NativeSyscallPlatformError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_contracts_keep_error_identity_and_payloads() {
+        // Protects the formatter mutants for every error type in this file:
+        // diagnostics must not collapse to an empty/default result.
+        assert!(ConfigError::InvalidFrameSize(2048)
+            .to_string()
+            .contains("InvalidFrameSize"));
+        assert!(XdpSetupError::InvalidInterfaceIndex { ifindex: 7 }
+            .to_string()
+            .contains("InvalidInterfaceIndex"));
+        assert!(XdpIoError::Wakeup { errno: Some(11) }
+            .to_string()
+            .contains("Wakeup"));
+        assert!(XdpResourcePairError::DuplicateIfindex { ifindex: 7 }
+            .to_string()
+            .contains("DuplicateIfindex"));
+        assert!(XdpPairIoError::EgressNotFound { egress: IfId(7) }
+            .to_string()
+            .contains("EgressNotFound"));
+        assert_eq!(
+            XskMapOperation::UpdateElem.to_string(),
+            "XSKMAP element update"
+        );
+        assert_eq!(XdpProgramOperation::Close.to_string(), "XDP program close");
+        assert_eq!(
+            XdpAttachOperation::Detach.to_string(),
+            "XDP interface detach"
+        );
+        assert!(XdpAttachConfigError::UnsupportedFlags(0x12)
+            .to_string()
+            .contains("0x00000012"));
+        assert!(XdpAttachError::InvalidInterfaceIndex { ifindex: 7 }
+            .to_string()
+            .contains("7"));
+        assert!(AbiLayoutError::ExtentDoesNotFitUsize
+            .to_string()
+            .contains("ExtentDoesNotFitUsize"));
+        assert!(RingMapError::MappingInactive
+            .to_string()
+            .contains("MappingInactive"));
+        assert!(NativeRingError::UnsupportedRingFlags(2)
+            .to_string()
+            .contains("UnsupportedRingFlags"));
+        assert!(PlatformError::UnsupportedPointerWidth
+            .to_string()
+            .contains("UnsupportedPointerWidth"));
+        assert!(NativeSyscallPlatformError::UnsupportedArchitecture
+            .to_string()
+            .contains("UnsupportedArchitecture"));
+    }
+
+    #[test]
+    fn permission_helpers_reject_non_permission_failures() {
+        // Protects each permission predicate's false branch; a constant true
+        // replacement would incorrectly classify ordinary syscall failures.
+        assert!(!XskMapError::Syscall {
+            operation: XskMapOperation::UpdateElem,
+            errno: Some(5),
+        }
+        .is_permission_denied());
+        assert!(!XdpProgramError::Syscall {
+            operation: XdpProgramOperation::Load,
+            errno: Some(5),
+            verifier_log: String::new(),
+        }
+        .is_permission_denied());
+        assert!(!XdpAttachError::Syscall {
+            operation: XdpAttachOperation::Attach,
+            errno: Some(5),
+        }
+        .is_permission_denied());
+    }
+
+    #[test]
+    fn program_error_display_only_includes_verifier_log_for_load() {
+        // Protects the three `operation == Load` display branches: verifier
+        // output belongs to load diagnostics, not close diagnostics.
+        let load_log = "load verifier detail";
+        let close_log = "close should be omitted";
+        let load_errors = [
+            XdpProgramError::Syscall {
+                operation: XdpProgramOperation::Load,
+                errno: Some(5),
+                verifier_log: load_log.to_owned(),
+            },
+            XdpProgramError::InvalidFileDescriptor {
+                operation: XdpProgramOperation::Load,
+                verifier_log: load_log.to_owned(),
+            },
+            XdpProgramError::UnexpectedReturn {
+                operation: XdpProgramOperation::Load,
+                value: -1,
+                verifier_log: load_log.to_owned(),
+            },
+        ];
+        let close_errors = [
+            XdpProgramError::Syscall {
+                operation: XdpProgramOperation::Close,
+                errno: Some(5),
+                verifier_log: close_log.to_owned(),
+            },
+            XdpProgramError::InvalidFileDescriptor {
+                operation: XdpProgramOperation::Close,
+                verifier_log: close_log.to_owned(),
+            },
+            XdpProgramError::UnexpectedReturn {
+                operation: XdpProgramOperation::Close,
+                value: -1,
+                verifier_log: close_log.to_owned(),
+            },
+        ];
+        for error in load_errors {
+            assert!(error.to_string().contains(load_log));
+        }
+        for error in close_errors {
+            assert!(!error.to_string().contains(close_log));
+        }
+    }
+}

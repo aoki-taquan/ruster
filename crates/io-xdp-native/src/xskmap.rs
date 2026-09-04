@@ -238,6 +238,24 @@ mod tests {
     }
 
     #[test]
+    fn non_eperm_map_failure_remains_a_regular_syscall_error() {
+        // Protects the permission boundary: only EPERM is privileged denial;
+        // another errno must remain observable as the original syscall error.
+        let error = map_bpf_error(BpfResourceError::Syscall {
+            operation: XskMapOperation::UpdateElem,
+            errno: Errno::Linux(5),
+        });
+        assert_eq!(
+            error,
+            XskMapError::Syscall {
+                operation: XskMapOperation::UpdateElem,
+                errno: Some(5),
+            }
+        );
+        assert!(!error.is_permission_denied());
+    }
+
+    #[test]
     fn public_constructor_rejects_zero_max_entries_without_bpf_call() {
         assert!(matches!(
             XskMap::new(0),
