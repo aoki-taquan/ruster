@@ -5199,25 +5199,28 @@ fn apply_icmpv4_echo_reply(
 
 #[cfg(test)]
 mod tests {
+    use super::DropReason::*;
     use super::{
         decide_ipv4, forward_batch, forward_batch_with_nat44_udp_and_tcp_and_firewall,
         forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_audited,
-        next_publication_nonce_from, BatchReport, DropReason, FirewallPacket, Ipv4OriginPolicy,
-        ValidatedForwardingOwner, FULL_FORWARDING_VALIDATIONS, VALIDATED_OWNER_AUTHORITY_BIT,
+        next_publication_nonce_from, validate_ethernet_ingress, BatchReport, DropReason,
+        FirewallPacket, Ipv4OriginPolicy, ResolutionActionAuthority, ValidatedForwardingOwner,
+        FULL_FORWARDING_VALIDATIONS, VALIDATED_OWNER_AUTHORITY_BIT,
     };
     use crate::{
-        internet_checksum, ipv4_header_checksum, BatchCompletion, DirectoryBucket, DirectoryNode,
-        FirewallAction, FirewallAuditBuffer, FirewallAuditRecord, FirewallConfig, FirewallHashKey,
-        FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange, FirewallProtocol,
-        FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot, FirewallVerdict,
-        ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorDisposition, Icmpv4ErrorPolicy,
-        Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
-        MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpHashKey,
-        Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime,
-        Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
-        NoTrace, PacketBatch, PacketLease, PacketSlot, PortOwnerSlot, ResolutionActionSlot,
-        ResolutionFailureHoldSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
-        SlotCompletion, TraceEvent, TraceSink,
+        internet_checksum, ipv4_header_checksum, ArpRequestAction, BatchCompletion,
+        DirectoryBucket, DirectoryNode, FirewallAction, FirewallAuditBuffer, FirewallAuditRecord,
+        FirewallConfig, FirewallHashKey, FirewallInterface, FirewallIpv4Prefix, FirewallPolicy,
+        FirewallPortRange, FirewallProtocol, FirewallRule, FirewallRuleId, FirewallRuntime,
+        FirewallStateSlot, FirewallVerdict, ForwardingSnapshot, Icmpv4ErrorActionSlot,
+        Icmpv4ErrorDisposition, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId,
+        Interface, Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis,
+        Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpHashKey, Nat44TcpIndexStorage,
+        Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig,
+        Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Neighbor, NoTrace, PacketBatch,
+        PacketLease, PacketSlot, PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot,
+        ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route, SlotCompletion,
+        TraceEvent, TraceSink, ARP_ETHERTYPE, IPV4_ETHERTYPE,
     };
     use std::{
         cell::Cell,
@@ -5227,9 +5230,11 @@ mod tests {
     const LAN: IfId = IfId(1);
     const WAN: IfId = IfId(2);
     const PUBLIC: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 10]);
+    const PUBLIC2: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 11]);
     const INTERNAL: Ipv4Address = Ipv4Address::from_octets([10, 0, 0, 10]);
     const REMOTE: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 20]);
     const ROUTER: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 1]);
+    const DMZ: IfId = IfId(3);
 
     fn empty_validated_owner() -> ValidatedForwardingOwner {
         ValidatedForwardingOwner::new(
@@ -6703,5 +6708,2293 @@ mod tests {
             assert_eq!(*reason as u16, discriminant);
             assert_eq!(reason.code(), code);
         }
+    }
+
+    // Contract: a snapshot accepts only unique route keys, known egress
+    // interfaces, and at most one local address per interface or address.
+    #[test]
+    fn snapshot_validation_rejects_forwarding_table_key_collisions() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let route = Route::new(Ipv4Address::from_octets([198, 51, 100, 0]), 24, WAN, None).unwrap();
+        assert!(matches!(
+            ForwardingSnapshot::with_ipv4_origin_policy(
+                &[route, route],
+                &interfaces,
+                &[],
+                &[],
+                Ipv4OriginPolicy::default(),
+            ),
+            Err(crate::SnapshotError::DuplicateRoute)
+        ));
+
+        let same_prefix_different_lengths = [
+            Route::new(Ipv4Address::from_octets([198, 51, 100, 0]), 24, WAN, None).unwrap(),
+            Route::new(Ipv4Address::from_octets([198, 51, 100, 0]), 25, WAN, None).unwrap(),
+        ];
+        // Contract: route identity includes both the prefix and prefix length;
+        // equal prefixes with different lengths are distinct routes.
+        assert!(ForwardingSnapshot::with_ipv4_origin_policy(
+            &same_prefix_different_lengths,
+            &interfaces,
+            &[],
+            &[],
+            Ipv4OriginPolicy::default(),
+        )
+        .is_ok());
+
+        let unknown_interface_route =
+            Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, IfId(99), None).unwrap();
+        assert!(matches!(
+            ForwardingSnapshot::with_ipv4_origin_policy(
+                &[unknown_interface_route],
+                &interfaces,
+                &[],
+                &[],
+                Ipv4OriginPolicy::default(),
+            ),
+            Err(crate::SnapshotError::RouteUnknownInterface)
+        ));
+
+        let duplicate_neighbors = [
+            crate::Neighbor {
+                interface: WAN,
+                target: REMOTE,
+                mac: MacAddress([2, 0, 0, 0, 0, 20]),
+            },
+            crate::Neighbor {
+                interface: WAN,
+                target: REMOTE,
+                mac: MacAddress([2, 0, 0, 0, 0, 21]),
+            },
+        ];
+        // Contract: a neighbor key is the exact (interface, target) pair,
+        // regardless of the MAC stored for that key.
+        assert!(matches!(
+            ForwardingSnapshot::with_ipv4_origin_policy(
+                &[],
+                &interfaces,
+                &duplicate_neighbors,
+                &[],
+                Ipv4OriginPolicy::default(),
+            ),
+            Err(crate::SnapshotError::DuplicateNeighbor)
+        ));
+
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: Ipv4Address::from_octets([10, 0, 0, 1]),
+            },
+            LocalIpv4Binding {
+                interface: LAN,
+                address: Ipv4Address::from_octets([10, 0, 0, 2]),
+            },
+        ];
+        assert!(matches!(
+            ForwardingSnapshot::with_ipv4_origin_policy(
+                &[],
+                &interfaces,
+                &[],
+                &bindings,
+                Ipv4OriginPolicy::default(),
+            ),
+            Err(crate::SnapshotError::DuplicateLocalIpv4Binding)
+        ));
+
+        let same_address_different_interfaces = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: Ipv4Address::from_octets([10, 0, 0, 9]),
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: Ipv4Address::from_octets([10, 0, 0, 9]),
+            },
+        ];
+        // Contract: an IPv4 address can have only one owning interface, even
+        // when the two conflicting bindings use different interfaces.
+        assert!(matches!(
+            ForwardingSnapshot::with_ipv4_origin_policy(
+                &[],
+                &interfaces,
+                &[],
+                &same_address_different_interfaces,
+                Ipv4OriginPolicy::default(),
+            ),
+            Err(crate::SnapshotError::DuplicateLocalIpv4Binding)
+        ));
+
+        let policy = Ipv4OriginPolicy::new(37).unwrap();
+        let snapshot =
+            ForwardingSnapshot::with_ipv4_origin_policy(&[], &interfaces, &[], &[], policy)
+                .unwrap();
+        assert_eq!(snapshot.ipv4_origin_policy(), policy);
+    }
+
+    // Contract: ARP resolution authority must reject an action whose source
+    // interface/MAC or source IPv4 binding is not an exact local pair.
+    #[test]
+    fn resolution_authority_requires_exact_local_source_identity() {
+        let interfaces = [Interface {
+            id: WAN,
+            mac: MacAddress([2, 0, 0, 0, 0, 2]),
+        }];
+        let bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: PUBLIC,
+        }];
+        let routes =
+            [Route::new(Ipv4Address::from_octets([0, 0, 0, 0]), 0, WAN, Some(REMOTE)).unwrap()];
+
+        let wrong_mac = ArpRequestAction {
+            egress: WAN,
+            source_mac: MacAddress([2, 0, 0, 0, 0, 3]),
+            source_ip: PUBLIC,
+            target_ip: REMOTE,
+        };
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+        assert_eq!(
+            snapshot.resolution_action_authority(wrong_mac),
+            ResolutionActionAuthority::Invalid
+        );
+
+        let wrong_source_ip = ArpRequestAction {
+            egress: WAN,
+            source_mac: interfaces[0].mac,
+            source_ip: Ipv4Address::from_octets([203, 0, 113, 11]),
+            target_ip: REMOTE,
+        };
+        assert_eq!(
+            snapshot.resolution_action_authority(wrong_source_ip),
+            ResolutionActionAuthority::Invalid
+        );
+    }
+
+    // Contract: resolution may never authorize ARP for special, local,
+    // connected-network, or connected-directed-broadcast targets.
+    #[test]
+    fn resolution_authority_rejects_every_forbidden_target_class() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+        ];
+        let target_zero = Ipv4Address::from_octets([0, 1, 2, 3]);
+        let target_loopback = Ipv4Address::from_octets([127, 0, 0, 1]);
+        let target_multicast = Ipv4Address::from_octets([224, 0, 0, 1]);
+        let target_broadcast = Ipv4Address::from_octets([255, 255, 255, 255]);
+        let target_network = Ipv4Address::from_octets([198, 51, 100, 0]);
+        let target_directed_broadcast = Ipv4Address::from_octets([198, 51, 100, 255]);
+        let routes = [
+            Route::new(target_zero, 32, WAN, Some(target_zero)).unwrap(),
+            Route::new(target_loopback, 32, WAN, Some(target_loopback)).unwrap(),
+            Route::new(target_multicast, 32, WAN, Some(target_multicast)).unwrap(),
+            Route::new(target_broadcast, 32, WAN, Some(target_broadcast)).unwrap(),
+            Route::new(INTERNAL, 32, WAN, Some(INTERNAL)).unwrap(),
+            Route::new(target_network, 24, WAN, None).unwrap(),
+        ];
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+        let action = |target_ip| ArpRequestAction {
+            egress: WAN,
+            source_mac: interfaces[1].mac,
+            source_ip: PUBLIC,
+            target_ip,
+        };
+
+        for target in [
+            target_zero,
+            target_loopback,
+            target_multicast,
+            target_broadcast,
+            INTERNAL,
+            target_network,
+            target_directed_broadcast,
+        ] {
+            assert_eq!(
+                snapshot.resolution_action_authority(action(target)),
+                ResolutionActionAuthority::Invalid,
+                "forbidden target {target:?} must not be authorized",
+            );
+        }
+    }
+
+    // Contract: route authorization requires the exact egress/next-hop pair,
+    // while a connected host route authorizes only its ordinary host target.
+    #[test]
+    fn resolution_authority_requires_exact_route_evidence() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: PUBLIC,
+        }];
+        let action = |target_ip| ArpRequestAction {
+            egress: WAN,
+            source_mac: interfaces[1].mac,
+            source_ip: PUBLIC,
+            target_ip,
+        };
+
+        let target = REMOTE;
+        let wrong_egress = [Route::new(target, 32, LAN, Some(target)).unwrap()];
+        let snapshot = ForwardingSnapshot::new(&wrong_egress, &interfaces, &[], &bindings).unwrap();
+        assert_eq!(
+            snapshot.resolution_action_authority(action(target)),
+            ResolutionActionAuthority::Invalid
+        );
+
+        let exact_next_hop = [Route::new(target, 32, WAN, Some(target)).unwrap()];
+        let snapshot =
+            ForwardingSnapshot::new(&exact_next_hop, &interfaces, &[], &bindings).unwrap();
+        assert_eq!(
+            snapshot.resolution_action_authority(action(target)),
+            ResolutionActionAuthority::Valid
+        );
+
+        let different_next_hop = [Route::new(target, 32, WAN, Some(ROUTER)).unwrap()];
+        let snapshot =
+            ForwardingSnapshot::new(&different_next_hop, &interfaces, &[], &bindings).unwrap();
+        assert_eq!(
+            snapshot.resolution_action_authority(action(target)),
+            ResolutionActionAuthority::Invalid
+        );
+
+        let connected_host = [Route::new(target, 32, WAN, None).unwrap()];
+        let snapshot =
+            ForwardingSnapshot::new(&connected_host, &interfaces, &[], &bindings).unwrap();
+        assert_eq!(
+            snapshot.resolution_action_authority(action(target)),
+            ResolutionActionAuthority::Valid
+        );
+    }
+
+    // Contract: IPv4 accepts only a local ingress interface, unicast source,
+    // and either a local unicast destination or a valid Ethernet destination;
+    // ARP additionally permits an Ethernet broadcast destination.
+    #[test]
+    fn ethernet_ingress_distinguishes_ipv4_and_arp_mac_contracts() {
+        let interface = Interface {
+            id: LAN,
+            mac: MacAddress([2, 0, 0, 0, 0, 1]),
+        };
+        let interfaces = [interface];
+        let snapshot = ForwardingSnapshot::new(&[], &interfaces, &[], &[]).unwrap();
+        let normal_source = [2, 0, 0, 0, 0, 9];
+        let normal_destination = interface.mac.0;
+        let frame = |destination: [u8; 6], source: [u8; 6]| {
+            let mut frame = vec![0_u8; 14];
+            frame[0..6].copy_from_slice(&destination);
+            frame[6..12].copy_from_slice(&source);
+            frame
+        };
+
+        assert_eq!(
+            validate_ethernet_ingress(
+                &frame(normal_destination, normal_source),
+                &snapshot,
+                WAN,
+                IPV4_ETHERTYPE
+            ),
+            Err(Ipv4IngressInterfaceUnknown)
+        );
+        assert_eq!(
+            validate_ethernet_ingress(
+                &frame([0xff; 6], normal_source),
+                &snapshot,
+                LAN,
+                ARP_ETHERTYPE
+            ),
+            Ok(())
+        );
+
+        for source in [[0; 6], [0xff; 6], [1, 0, 0, 0, 0, 9]] {
+            let expected = if source == [0; 6] {
+                ArpEthernetSourceZero
+            } else if source == [0xff; 6] {
+                ArpEthernetSourceBroadcast
+            } else {
+                ArpEthernetSourceMulticast
+            };
+            assert_eq!(
+                validate_ethernet_ingress(
+                    &frame(normal_destination, source),
+                    &snapshot,
+                    LAN,
+                    ARP_ETHERTYPE,
+                ),
+                Err(expected)
+            );
+        }
+
+        for destination in [[0; 6], [1, 0, 0, 0, 0, 9]] {
+            let expected = if destination == [0; 6] {
+                ArpEthernetDestinationZero
+            } else {
+                ArpEthernetDestinationMulticast
+            };
+            assert_eq!(
+                validate_ethernet_ingress(
+                    &frame(destination, normal_source),
+                    &snapshot,
+                    LAN,
+                    ARP_ETHERTYPE,
+                ),
+                Err(expected)
+            );
+        }
+        assert_eq!(
+            validate_ethernet_ingress(
+                &frame([0xff; 6], normal_source),
+                &snapshot,
+                LAN,
+                ARP_ETHERTYPE
+            ),
+            Ok(())
+        );
+    }
+
+    fn ipv4_decision_frame(
+        source: Ipv4Address,
+        destination: Ipv4Address,
+        protocol: u8,
+        ttl: u8,
+        ihl_words: u8,
+    ) -> Vec<u8> {
+        let header_len = usize::from(ihl_words) * 4;
+        let mut frame = vec![0_u8; 14 + header_len];
+        frame[0..6].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
+        frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 9]);
+        frame[12..14].copy_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+        frame[14] = 0x40 | ihl_words;
+        frame[16..18].copy_from_slice(&(header_len as u16).to_be_bytes());
+        frame[20..22].copy_from_slice(&0x4000_u16.to_be_bytes());
+        frame[22] = ttl;
+        frame[23] = protocol;
+        frame[26..30].copy_from_slice(&source.octets());
+        frame[30..34].copy_from_slice(&destination.octets());
+        let checksum = ipv4_header_checksum(&frame[14..14 + header_len]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        frame
+    }
+
+    fn decide_ipv4_without_services(
+        frame: &[u8],
+        snapshot: &ForwardingSnapshot<'_>,
+        ingress: IfId,
+    ) -> Result<super::PacketDecision, DropReason> {
+        let mut resolution = None;
+        let mut icmpv4_errors = None;
+        let mut nat44_udp = None;
+        let mut nat44_tcp = None;
+        let mut firewall = None;
+        let mut firewall_audit = None;
+        let mut firewall_plan = None;
+        decide_ipv4(
+            frame,
+            snapshot,
+            ingress,
+            &mut resolution,
+            &mut icmpv4_errors,
+            None,
+            &mut nat44_udp,
+            None,
+            &mut nat44_tcp,
+            None,
+            &mut firewall,
+            &mut firewall_audit,
+            &mut firewall_plan,
+            &mut NoTrace,
+        )
+    }
+
+    fn decide_ipv4_with_services(
+        frame: &[u8],
+        snapshot: &ForwardingSnapshot<'_>,
+        ingress: IfId,
+        udp_config: Option<&Nat44UdpConfig>,
+        tcp_config: Option<&Nat44TcpConfig>,
+        firewall_config: Option<&FirewallConfig<'_>>,
+    ) -> Result<super::PacketDecision, DropReason> {
+        let mut resolution = None;
+        let mut icmpv4_errors = None;
+        let mut nat44_udp = None;
+        let mut nat44_tcp = None;
+        let mut firewall = None;
+        let mut firewall_audit = None;
+        let mut firewall_plan = None;
+        decide_ipv4(
+            frame,
+            snapshot,
+            ingress,
+            &mut resolution,
+            &mut icmpv4_errors,
+            udp_config,
+            &mut nat44_udp,
+            tcp_config,
+            &mut nat44_tcp,
+            firewall_config,
+            &mut firewall,
+            &mut firewall_audit,
+            &mut firewall_plan,
+            &mut NoTrace,
+        )
+    }
+
+    fn decide_ipv4_with_mismatched_tcp_runtime(
+        frame: &[u8],
+        snapshot: &ForwardingSnapshot<'_>,
+        ingress: IfId,
+        udp_config: Option<&Nat44UdpConfig>,
+        tcp_config: &Nat44TcpConfig,
+        runtime_config: Nat44TcpConfig,
+    ) -> Result<super::PacketDecision, DropReason> {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+        let mut mapping_buckets = [DirectoryBucket::default(); 1];
+        let mut mapping_nodes = [DirectoryNode::default(); 1];
+        let mut session_buckets = [DirectoryBucket::default(); 1];
+        let mut session_nodes = [DirectoryNode::default(); 1];
+        let mut owners = [PortOwnerSlot::default(); 1];
+        let mut runtime = Nat44TcpRuntime::new(
+            runtime_config,
+            &mut mappings,
+            &mut sessions,
+            Nat44TcpIndexStorage::new(
+                &mut mapping_buckets,
+                &mut mapping_nodes,
+                &mut session_buckets,
+                &mut session_nodes,
+                &mut owners,
+            ),
+            Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0).unwrap(),
+        )
+        .unwrap();
+        let mut resolution = None;
+        let mut icmpv4_errors = None;
+        let mut nat44_udp = None;
+        let mut nat44_tcp = Some(&mut runtime);
+        let mut firewall = None;
+        let mut firewall_audit = None;
+        let mut firewall_plan = None;
+        decide_ipv4(
+            frame,
+            snapshot,
+            ingress,
+            &mut resolution,
+            &mut icmpv4_errors,
+            udp_config,
+            &mut nat44_udp,
+            Some(tcp_config),
+            &mut nat44_tcp,
+            None,
+            &mut firewall,
+            &mut firewall_audit,
+            &mut firewall_plan,
+            &mut NoTrace,
+        )
+    }
+
+    // Contract: a local IPv4 address is local only on the interface owning
+    // that address; a same-address binding on another interface must route.
+    #[test]
+    fn decide_ipv4_binds_local_delivery_to_the_ingress_interface() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+        ];
+        let routes = [Route::new(PUBLIC, 32, WAN, None).unwrap()];
+        let neighbors = [crate::Neighbor {
+            interface: WAN,
+            target: PUBLIC,
+            mac: MacAddress([2, 0, 0, 0, 0, 20]),
+        }];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let frame = ipv4_decision_frame(REMOTE, PUBLIC, 6, 64, 5);
+        let decision = decide_ipv4_without_services(&frame, &snapshot, LAN).unwrap();
+        assert!(matches!(decision, super::PacketDecision::Ipv4(_)));
+    }
+
+    // Contract: forwarded IPv4 packets carrying options are rejected before
+    // route rewriting, rather than being accepted by an inverted comparison.
+    #[test]
+    fn decide_ipv4_rejects_forwarded_ipv4_options() {
+        let interfaces = [Interface {
+            id: WAN,
+            mac: MacAddress([2, 0, 0, 0, 0, 2]),
+        }];
+        let routes = [Route::new(REMOTE, 32, WAN, None).unwrap()];
+        let neighbors = [crate::Neighbor {
+            interface: WAN,
+            target: REMOTE,
+            mac: MacAddress([2, 0, 0, 0, 0, 20]),
+        }];
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
+        let frame = ipv4_decision_frame(INTERNAL, REMOTE, 6, 64, 6);
+        assert!(matches!(
+            decide_ipv4_without_services(&frame, &snapshot, WAN),
+            Err(Ipv4OptionsUnsupported)
+        ));
+    }
+
+    // Contract: a static neighbor is usable only when both its interface and
+    // target match the selected route.
+    #[test]
+    fn decide_ipv4_requires_static_neighbor_interface_and_target() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let routes = [Route::new(REMOTE, 32, WAN, None).unwrap()];
+        let neighbors = [Neighbor {
+            interface: LAN,
+            target: REMOTE,
+            mac: MacAddress([2, 0, 0, 0, 0, 20]),
+        }];
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
+        let frame = ipv4_decision_frame(INTERNAL, REMOTE, 6, 64, 5);
+
+        assert!(matches!(
+            decide_ipv4_without_services(&frame, &snapshot, WAN),
+            Err(NeighborUnresolved)
+        ));
+    }
+
+    // Contract: a dynamic ARP request needs a local source binding on the
+    // selected egress, and a normal target must be queued for resolution.
+    #[test]
+    fn decide_ipv4_schedules_dynamic_resolution_from_selected_egress() {
+        let interfaces = [Interface {
+            id: WAN,
+            mac: MacAddress([2, 0, 0, 0, 0, 2]),
+        }];
+        let routes = [Route::new(REMOTE, 32, WAN, None).unwrap()];
+        let bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: PUBLIC,
+        }];
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(
+            ResolutionPolicy::new(1_000, 2_000).unwrap(),
+            &mut states,
+            &mut actions,
+        );
+        let frame = ipv4_decision_frame(INTERNAL, REMOTE, 6, 64, 5);
+        let mut resolution = Some((&mut runtime, MonotonicMillis(0)));
+        let mut icmpv4_errors = None;
+        let mut nat44_udp = None;
+        let mut nat44_tcp = None;
+        let mut firewall = None;
+        let mut firewall_audit = None;
+        let mut firewall_plan = None;
+        let result = decide_ipv4(
+            &frame,
+            &snapshot,
+            WAN,
+            &mut resolution,
+            &mut icmpv4_errors,
+            None,
+            &mut nat44_udp,
+            None,
+            &mut nat44_tcp,
+            None,
+            &mut firewall,
+            &mut firewall_audit,
+            &mut firewall_plan,
+            &mut NoTrace,
+        );
+
+        assert!(matches!(result, Err(NeighborUnresolved)));
+        assert_eq!(runtime.pending_actions(), 1);
+        assert_eq!(runtime.queued_action(0).unwrap().0.target_ip, REMOTE);
+        assert_eq!(runtime.queued_action(0).unwrap().0.source_ip, PUBLIC);
+    }
+
+    // Contract: a target already owned by any local binding is forbidden for
+    // dynamic resolution even when the selected route itself is a host route.
+    #[test]
+    fn decide_ipv4_does_not_schedule_a_local_target() {
+        let target = Ipv4Address::from_octets([192, 0, 2, 99]);
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let routes = [Route::new(target, 32, WAN, None).unwrap()];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+            LocalIpv4Binding {
+                interface: LAN,
+                address: target,
+            },
+        ];
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(
+            ResolutionPolicy::new(1_000, 2_000).unwrap(),
+            &mut states,
+            &mut actions,
+        );
+        let frame = ipv4_decision_frame(INTERNAL, target, 6, 64, 5);
+        let mut resolution = Some((&mut runtime, MonotonicMillis(0)));
+        let mut icmpv4_errors = None;
+        let mut nat44_udp = None;
+        let mut nat44_tcp = None;
+        let mut firewall = None;
+        let mut firewall_audit = None;
+        let mut firewall_plan = None;
+        let result = decide_ipv4(
+            &frame,
+            &snapshot,
+            WAN,
+            &mut resolution,
+            &mut icmpv4_errors,
+            None,
+            &mut nat44_udp,
+            None,
+            &mut nat44_tcp,
+            None,
+            &mut firewall,
+            &mut firewall_audit,
+            &mut firewall_plan,
+            &mut NoTrace,
+        );
+
+        assert!(matches!(result, Err(NeighborUnresolved)));
+        assert_eq!(runtime.pending_actions(), 0);
+    }
+
+    // Contract: connected-network and directed-broadcast evidence forbids a
+    // request only when it belongs to the selected route's egress interface.
+    #[test]
+    fn decide_ipv4_resolution_checks_connected_route_evidence_exactly() {
+        let directed_broadcast = Ipv4Address::from_octets([198, 51, 100, 255]);
+        let directed_interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let directed_routes = [
+            Route::new(directed_broadcast, 32, WAN, None).unwrap(),
+            Route::new(Ipv4Address::from_octets([198, 51, 100, 0]), 24, LAN, None).unwrap(),
+        ];
+        let directed_bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: PUBLIC,
+        }];
+        let directed_snapshot = ForwardingSnapshot::new(
+            &directed_routes,
+            &directed_interfaces,
+            &[],
+            &directed_bindings,
+        )
+        .unwrap();
+        let mut directed_states = [ResolutionStateSlot::EMPTY; 1];
+        let mut directed_actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut directed_runtime = ResolutionRuntime::new(
+            ResolutionPolicy::new(1_000, 2_000).unwrap(),
+            &mut directed_states,
+            &mut directed_actions,
+        );
+        let directed_frame = ipv4_decision_frame(INTERNAL, directed_broadcast, 6, 64, 5);
+        let mut directed_resolution = Some((&mut directed_runtime, MonotonicMillis(0)));
+        let mut icmpv4_errors = None;
+        let mut nat44_udp = None;
+        let mut nat44_tcp = None;
+        let mut firewall = None;
+        let mut firewall_audit = None;
+        let mut firewall_plan = None;
+        let directed_result = decide_ipv4(
+            &directed_frame,
+            &directed_snapshot,
+            WAN,
+            &mut directed_resolution,
+            &mut icmpv4_errors,
+            None,
+            &mut nat44_udp,
+            None,
+            &mut nat44_tcp,
+            None,
+            &mut firewall,
+            &mut firewall_audit,
+            &mut firewall_plan,
+            &mut NoTrace,
+        );
+        assert!(matches!(directed_result, Err(NeighborUnresolved)));
+        assert_eq!(directed_runtime.pending_actions(), 1);
+
+        let network = Ipv4Address::from_octets([198, 51, 101, 0]);
+        let network_routes = [
+            Route::new(network, 32, WAN, None).unwrap(),
+            Route::new(Ipv4Address::from_octets([198, 51, 101, 0]), 24, WAN, None).unwrap(),
+        ];
+        let network_snapshot = ForwardingSnapshot::new(
+            &network_routes,
+            &directed_interfaces,
+            &[],
+            &directed_bindings,
+        )
+        .unwrap();
+        let mut network_states = [ResolutionStateSlot::EMPTY; 1];
+        let mut network_actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut network_runtime = ResolutionRuntime::new(
+            ResolutionPolicy::new(1_000, 2_000).unwrap(),
+            &mut network_states,
+            &mut network_actions,
+        );
+        let network_frame = ipv4_decision_frame(INTERNAL, network, 6, 64, 5);
+        let mut network_resolution = Some((&mut network_runtime, MonotonicMillis(0)));
+        let mut icmpv4_errors = None;
+        let mut nat44_udp = None;
+        let mut nat44_tcp = None;
+        let mut firewall = None;
+        let mut firewall_audit = None;
+        let mut firewall_plan = None;
+        let network_result = decide_ipv4(
+            &network_frame,
+            &network_snapshot,
+            WAN,
+            &mut network_resolution,
+            &mut icmpv4_errors,
+            None,
+            &mut nat44_udp,
+            None,
+            &mut nat44_tcp,
+            None,
+            &mut firewall,
+            &mut firewall_audit,
+            &mut firewall_plan,
+            &mut NoTrace,
+        );
+        assert!(matches!(network_result, Err(NeighborUnresolved)));
+        assert_eq!(network_runtime.pending_actions(), 0);
+    }
+
+    // Contract: a direct-route neighbor miss captures an eligible ICMP error
+    // candidate only when its resolution target is the packet destination.
+    #[test]
+    fn decide_ipv4_captures_direct_route_failure_candidate() {
+        let target = Ipv4Address::from_octets([192, 0, 2, 99]);
+        let interfaces = [Interface {
+            id: WAN,
+            mac: MacAddress([2, 0, 0, 0, 0, 2]),
+        }];
+        let routes = [Route::new(target, 32, WAN, None).unwrap()];
+        let bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: PUBLIC,
+        }];
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut resolution = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            ResolutionPolicy::new(1_000, 2_000).unwrap(),
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        let mut frame = zero_identifier_echo_request();
+        frame[30..34].copy_from_slice(&target.octets());
+        frame[24..26].fill(0);
+        let checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        let mut resolution_option = Some((&mut resolution, MonotonicMillis(0)));
+        let mut icmpv4_errors = None;
+        let mut nat44_udp = None;
+        let mut nat44_tcp = None;
+        let mut firewall = None;
+        let mut firewall_audit = None;
+        let mut firewall_plan = None;
+        let result = decide_ipv4(
+            &frame,
+            &snapshot,
+            WAN,
+            &mut resolution_option,
+            &mut icmpv4_errors,
+            None,
+            &mut nat44_udp,
+            None,
+            &mut nat44_tcp,
+            None,
+            &mut firewall,
+            &mut firewall_audit,
+            &mut firewall_plan,
+            &mut NoTrace,
+        );
+
+        assert_eq!(result.err(), Some(NeighborUnresolved));
+        assert_eq!(resolution.failure_counters().captured, 1);
+        assert_eq!(resolution.pending_failure_holds(), 1);
+    }
+
+    // Contract: a firewall must be preflighted for an inbound NAT candidate
+    // only when the destination and transport protocol match that NAT.
+    #[test]
+    fn decide_ipv4_nat_candidate_requires_matching_transport_protocol() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+            Interface {
+                id: DMZ,
+                mac: MacAddress([2, 0, 0, 0, 0, 3]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+            LocalIpv4Binding {
+                interface: DMZ,
+                address: PUBLIC2,
+            },
+        ];
+        let snapshot = ForwardingSnapshot::new(&[], &interfaces, &[], &bindings).unwrap();
+        let udp_config = Nat44UdpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44UdpPolicy::default(),
+        )
+        .unwrap();
+        let tcp_config = Nat44TcpConfig::new(
+            &snapshot,
+            LAN,
+            DMZ,
+            PUBLIC2,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+        let firewall_config = FirewallConfig::new(
+            &snapshot,
+            &[],
+            FirewallPolicy::default(),
+            1,
+            FirewallHashKey::new(1, 2).unwrap(),
+        )
+        .unwrap();
+
+        let udp_destination_with_tcp = ipv4_decision_frame(REMOTE, PUBLIC, 6, 64, 5);
+        assert!(matches!(
+            decide_ipv4_with_services(
+                &udp_destination_with_tcp,
+                &snapshot,
+                WAN,
+                Some(&udp_config),
+                None,
+                Some(&firewall_config),
+            ),
+            Ok(super::PacketDecision::ConsumeIpv4Local)
+        ));
+
+        let tcp_destination_with_udp = ipv4_decision_frame(REMOTE, PUBLIC2, 17, 64, 5);
+        assert!(matches!(
+            decide_ipv4_with_services(
+                &tcp_destination_with_udp,
+                &snapshot,
+                DMZ,
+                None,
+                Some(&tcp_config),
+                Some(&firewall_config),
+            ),
+            Ok(super::PacketDecision::ConsumeIpv4Local)
+        ));
+    }
+
+    // Contract: combined NAT realm mismatch is rejected only for a TCP/UDP
+    // packet addressed to either configured public address.
+    #[test]
+    fn decide_ipv4_rejects_combined_nat_realm_mismatch_for_either_public_address() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+            Interface {
+                id: DMZ,
+                mac: MacAddress([2, 0, 0, 0, 0, 3]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+            LocalIpv4Binding {
+                interface: DMZ,
+                address: PUBLIC2,
+            },
+        ];
+        let snapshot = ForwardingSnapshot::new(&[], &interfaces, &[], &bindings).unwrap();
+        let udp_config = Nat44UdpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44UdpPolicy::default(),
+        )
+        .unwrap();
+        let tcp_config = Nat44TcpConfig::new(
+            &snapshot,
+            LAN,
+            DMZ,
+            PUBLIC2,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+
+        for (destination, protocol) in [(PUBLIC, 17), (PUBLIC2, 6)] {
+            let frame = ipv4_decision_frame(REMOTE, destination, protocol, 64, 5);
+            assert!(matches!(
+                decide_ipv4_with_services(
+                    &frame,
+                    &snapshot,
+                    LAN,
+                    Some(&udp_config),
+                    Some(&tcp_config),
+                    None,
+                ),
+                Err(Nat44CombinedRealmMismatch)
+            ));
+        }
+    }
+
+    // Contract: combined NAT realms reject exactly the configured forward or
+    // reverse crossing, while partial matches remain ordinary forwarding.
+    #[test]
+    fn decide_ipv4_combined_realm_crossing_guards_are_directional() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+            Interface {
+                id: DMZ,
+                mac: MacAddress([2, 0, 0, 0, 0, 3]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+            LocalIpv4Binding {
+                interface: DMZ,
+                address: PUBLIC2,
+            },
+        ];
+        let targets = [
+            Ipv4Address::from_octets([192, 0, 2, 101]),
+            Ipv4Address::from_octets([192, 0, 2, 102]),
+            Ipv4Address::from_octets([192, 0, 2, 103]),
+            Ipv4Address::from_octets([192, 0, 2, 104]),
+            Ipv4Address::from_octets([192, 0, 2, 105]),
+            Ipv4Address::from_octets([192, 0, 2, 106]),
+            Ipv4Address::from_octets([192, 0, 2, 107]),
+            Ipv4Address::from_octets([192, 0, 2, 108]),
+            Ipv4Address::from_octets([192, 0, 2, 109]),
+            Ipv4Address::from_octets([192, 0, 2, 110]),
+            Ipv4Address::from_octets([192, 0, 2, 111]),
+            Ipv4Address::from_octets([192, 0, 2, 112]),
+            Ipv4Address::from_octets([192, 0, 2, 113]),
+            Ipv4Address::from_octets([192, 0, 2, 114]),
+            Ipv4Address::from_octets([192, 0, 2, 115]),
+        ];
+        let egresses = [
+            WAN, LAN, LAN, DMZ, DMZ, DMZ, LAN, DMZ, LAN, DMZ, WAN, LAN, DMZ, LAN, LAN,
+        ];
+        let routes: Vec<_> = targets
+            .iter()
+            .zip(egresses)
+            .map(|(&target, egress)| Route::new(target, 32, egress, None).unwrap())
+            .collect();
+        let neighbors: Vec<_> = targets
+            .iter()
+            .zip(egresses)
+            .map(|(&target, interface)| Neighbor {
+                interface,
+                target,
+                mac: MacAddress([2, 0, 0, 0, 1, interface.0 as u8]),
+            })
+            .collect();
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let udp_config = Nat44UdpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44UdpPolicy::default(),
+        )
+        .unwrap();
+        let tcp_config = Nat44TcpConfig::new(
+            &snapshot,
+            LAN,
+            DMZ,
+            PUBLIC2,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+        let run = |target, ingress, protocol| {
+            let frame = ipv4_decision_frame(REMOTE, target, protocol, 64, 5);
+            decide_ipv4_with_services(
+                &frame,
+                &snapshot,
+                ingress,
+                Some(&udp_config),
+                Some(&tcp_config),
+                None,
+            )
+        };
+
+        assert!(matches!(
+            run(targets[0], LAN, 17),
+            Err(Nat44CombinedRealmMismatch)
+        ));
+        assert!(matches!(
+            run(targets[1], WAN, 17),
+            Err(Nat44CombinedRealmMismatch)
+        ));
+        assert!(matches!(
+            run(targets[2], LAN, 17),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+        assert!(matches!(
+            run(targets[3], LAN, 6),
+            Err(Nat44CombinedRealmMismatch)
+        ));
+        assert!(matches!(
+            run(targets[4], WAN, 17),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+        assert!(matches!(
+            run(targets[5], DMZ, 6),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+        assert!(matches!(
+            run(targets[14], DMZ, 6),
+            Err(Nat44CombinedRealmMismatch)
+        ));
+
+        assert!(matches!(
+            run(targets[6], WAN, 1),
+            Err(Nat44ExternalToInternalBypass)
+        ));
+        assert!(matches!(
+            run(targets[7], WAN, 1),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+        assert!(matches!(
+            run(targets[8], DMZ, 1),
+            Err(Nat44ExternalToInternalBypass)
+        ));
+        assert!(matches!(
+            run(targets[9], DMZ, 1),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+
+        assert!(matches!(
+            run(targets[10], LAN, 1),
+            Err(Nat44UdpUnsupportedTransport)
+        ));
+        assert!(matches!(
+            run(targets[11], LAN, 1),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+        assert!(matches!(
+            run(targets[12], LAN, 1),
+            Err(Nat44UdpUnsupportedTransport)
+        ));
+        assert!(matches!(
+            run(targets[13], LAN, 1),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+    }
+
+    // Contract: the TCP candidate observer runs exactly for an eligible TCP
+    // packet, an inside ingress or public destination, a matching realm, and
+    // a path without firewall preflight.
+    #[test]
+    fn decide_ipv4_tcp_candidate_observation_preserves_all_four_guards() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+            Interface {
+                id: DMZ,
+                mac: MacAddress([2, 0, 0, 0, 0, 3]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+            LocalIpv4Binding {
+                interface: DMZ,
+                address: PUBLIC2,
+            },
+        ];
+        let routes = [Route::new(REMOTE, 32, LAN, None).unwrap()];
+        let neighbors = [crate::Neighbor {
+            interface: LAN,
+            target: REMOTE,
+            mac: MacAddress([2, 0, 0, 0, 0, 20]),
+        }];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let tcp_config = Nat44TcpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+        let mismatched_runtime_config = Nat44TcpConfig::new(
+            &snapshot,
+            DMZ,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+
+        let inside_tcp = ipv4_decision_frame(REMOTE, REMOTE, 6, 64, 5);
+        assert!(matches!(
+            decide_ipv4_with_mismatched_tcp_runtime(
+                &inside_tcp,
+                &snapshot,
+                LAN,
+                None,
+                &tcp_config,
+                mismatched_runtime_config,
+            ),
+            Err(Nat44TcpConfigMismatch)
+        ));
+
+        // Contract: a TCP candidate requires either inside ingress or the
+        // configured public destination; a wrong-ingress private destination
+        // must not trigger candidate observation.
+        assert!(matches!(
+            decide_ipv4_with_mismatched_tcp_runtime(
+                &inside_tcp,
+                &snapshot,
+                DMZ,
+                None,
+                &tcp_config,
+                mismatched_runtime_config,
+            ),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+
+        let public_route = [Route::new(PUBLIC, 32, LAN, None).unwrap()];
+        let public_neighbor = [crate::Neighbor {
+            interface: LAN,
+            target: PUBLIC,
+            mac: MacAddress([2, 0, 0, 0, 0, 21]),
+        }];
+        let public_snapshot =
+            ForwardingSnapshot::new(&public_route, &interfaces, &public_neighbor, &bindings)
+                .unwrap();
+        let public_tcp = ipv4_decision_frame(REMOTE, PUBLIC, 6, 64, 5);
+        assert!(matches!(
+            decide_ipv4_with_mismatched_tcp_runtime(
+                &public_tcp,
+                &public_snapshot,
+                DMZ,
+                None,
+                &tcp_config,
+                mismatched_runtime_config,
+            ),
+            Err(Nat44TcpConfigMismatch)
+        ));
+
+        let udp_config = Nat44UdpConfig::new(
+            &snapshot,
+            LAN,
+            DMZ,
+            PUBLIC2,
+            40_000,
+            40_000,
+            Nat44UdpPolicy::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            decide_ipv4_with_mismatched_tcp_runtime(
+                &inside_tcp,
+                &snapshot,
+                LAN,
+                Some(&udp_config),
+                &tcp_config,
+                mismatched_runtime_config,
+            ),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+
+        let udp_frame = ipv4_decision_frame(REMOTE, REMOTE, 17, 64, 5);
+        assert!(matches!(
+            decide_ipv4_with_mismatched_tcp_runtime(
+                &udp_frame,
+                &snapshot,
+                LAN,
+                None,
+                &tcp_config,
+                mismatched_runtime_config,
+            ),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+    }
+
+    // Contract: NAT hairpin detection distinguishes each supported transport
+    // and never changes a wrong-ingress, unsupported, or runtime outcome.
+    #[test]
+    fn decide_ipv4_nat_hairpin_guards_distinguish_transport_and_configuration() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+        ];
+        let routes = [Route::new(PUBLIC, 32, WAN, None).unwrap()];
+        let neighbors = [crate::Neighbor {
+            interface: WAN,
+            target: PUBLIC,
+            mac: MacAddress([2, 0, 0, 0, 0, 20]),
+        }];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let udp_config = Nat44UdpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44UdpPolicy::default(),
+        )
+        .unwrap();
+        let tcp_config = Nat44TcpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+
+        let udp_frame = ipv4_decision_frame(REMOTE, PUBLIC, 17, 64, 5);
+        assert!(matches!(
+            decide_ipv4_with_services(&udp_frame, &snapshot, LAN, Some(&udp_config), None, None,),
+            Err(Nat44UdpHairpinUnsupported)
+        ));
+
+        let tcp_frame = ipv4_decision_frame(REMOTE, PUBLIC, 6, 64, 5);
+        assert!(matches!(
+            decide_ipv4_with_services(
+                &tcp_frame,
+                &snapshot,
+                LAN,
+                Some(&udp_config),
+                Some(&tcp_config),
+                None,
+            ),
+            Err(Nat44TcpHairpinUnsupported)
+        ));
+        assert!(matches!(
+            decide_ipv4_with_services(&tcp_frame, &snapshot, LAN, Some(&udp_config), None, None,),
+            Err(Nat44UdpHairpinUnsupported)
+        ));
+
+        let unsupported_frame = ipv4_decision_frame(REMOTE, PUBLIC, 1, 64, 5);
+        assert!(matches!(
+            decide_ipv4_with_services(
+                &unsupported_frame,
+                &snapshot,
+                LAN,
+                None,
+                Some(&tcp_config),
+                None,
+            ),
+            Err(Nat44TcpUnsupportedTransport)
+        ));
+    }
+
+    // Contract: with only TCP NAT configured, an inside UDP packet targeting
+    // the TCP public address is rejected as an unsupported TCP hairpin before
+    // the absent TCP runtime is required.
+    #[test]
+    fn decide_ipv4_tcp_hairpin_udp_without_udp_config_is_unsupported() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+        ];
+        let routes = [Route::new(PUBLIC, 32, WAN, None).unwrap()];
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+        let tcp_config = Nat44TcpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+        let frame = ipv4_decision_frame(REMOTE, PUBLIC, 17, 64, 5);
+
+        assert!(matches!(
+            decide_ipv4_with_services(&frame, &snapshot, LAN, None, Some(&tcp_config), None,),
+            Err(Nat44TcpHairpinUnsupported)
+        ));
+    }
+
+    // Contract: a connected route is resolution evidence only on the route's
+    // selected egress; an otherwise identical route on another interface is
+    // not sufficient authority.
+    #[test]
+    fn resolution_authority_rejects_connected_route_on_wrong_egress() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: PUBLIC,
+        }];
+        let target = Ipv4Address::from_octets([198, 51, 100, 42]);
+        let route = Route::new(Ipv4Address::from_octets([198, 51, 100, 0]), 24, LAN, None).unwrap();
+        let routes = [route];
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+        let action = ArpRequestAction {
+            egress: WAN,
+            source_mac: interfaces[1].mac,
+            source_ip: PUBLIC,
+            target_ip: target,
+        };
+        assert_eq!(
+            snapshot.resolution_action_authority(action),
+            ResolutionActionAuthority::Invalid
+        );
+    }
+
+    // Contract: an address bound on the ingress interface is delivered
+    // locally even when a route also contains the same address.
+    #[test]
+    fn decide_ipv4_local_target_requires_only_the_matching_local_binding() {
+        let interfaces = [Interface {
+            id: LAN,
+            mac: MacAddress([2, 0, 0, 0, 0, 1]),
+        }];
+        let bindings = [LocalIpv4Binding {
+            interface: LAN,
+            address: REMOTE,
+        }];
+        let routes = [Route::new(REMOTE, 32, LAN, None).unwrap()];
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+        let frame = ipv4_decision_frame(INTERNAL, REMOTE, 6, 64, 5);
+        assert!(matches!(
+            decide_ipv4_without_services(&frame, &snapshot, LAN),
+            Ok(super::PacketDecision::ConsumeIpv4Local)
+        ));
+    }
+
+    // Contract: NAT outbound selection requires the configured inside ingress,
+    // configured outside egress, and the configured transport protocol.
+    #[test]
+    fn decide_ipv4_nat_outbound_guards_reject_wrong_path_and_protocol() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+        ];
+        let route_on_lan = [Route::new(REMOTE, 32, LAN, None).unwrap()];
+        let lan_neighbor = [Neighbor {
+            interface: LAN,
+            target: REMOTE,
+            mac: MacAddress([2, 0, 0, 0, 0, 20]),
+        }];
+        let snapshot =
+            ForwardingSnapshot::new(&route_on_lan, &interfaces, &lan_neighbor, &bindings).unwrap();
+        let udp = Nat44UdpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44UdpPolicy::default(),
+        )
+        .unwrap();
+        let tcp = Nat44TcpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+
+        // Wrong UDP egress must remain ordinary forwarding.
+        let udp_frame = ipv4_decision_frame(ROUTER, REMOTE, 17, 64, 5);
+        let outbound_result =
+            decide_ipv4_with_services(&udp_frame, &snapshot, LAN, Some(&udp), None, None);
+        assert!(matches!(
+            outbound_result,
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+
+        // A TCP configuration must not claim a UDP packet through its
+        // protocol fallback when the UDP service is absent.
+        assert!(matches!(
+            decide_ipv4_with_services(&udp_frame, &snapshot, LAN, None, Some(&tcp), None),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+
+        // Contract: a TCP packet crossing the UDP-only NAT realm is rejected
+        // only when both the protocol and the configured path match.
+        let tcp_crossing_frame = ipv4_decision_frame(ROUTER, REMOTE, 6, 64, 5);
+        assert!(matches!(
+            decide_ipv4_with_services(&tcp_crossing_frame, &snapshot, LAN, Some(&udp), None, None),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+
+        // Contract: a UDP packet crossing the TCP-only NAT realm is likewise
+        // ordinary forwarding when the selected route is not the outside.
+        let udp_crossing_frame = ipv4_decision_frame(ROUTER, REMOTE, 17, 64, 5);
+        assert!(matches!(
+            decide_ipv4_with_services(&udp_crossing_frame, &snapshot, LAN, None, Some(&tcp), None),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+
+        let route_on_wan = [Route::new(REMOTE, 32, WAN, None).unwrap()];
+        let wan_neighbor = [Neighbor {
+            interface: WAN,
+            target: REMOTE,
+            mac: MacAddress([2, 0, 0, 0, 0, 21]),
+        }];
+        let wan_snapshot =
+            ForwardingSnapshot::new(&route_on_wan, &interfaces, &wan_neighbor, &bindings).unwrap();
+        let tcp_wan = Nat44TcpConfig::new(
+            &wan_snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+        let tcp_frame = ipv4_decision_frame(REMOTE, REMOTE, 6, 64, 5);
+
+        // Wrong TCP ingress must not select outbound NAT.
+        assert!(matches!(
+            decide_ipv4_with_services(&tcp_frame, &wan_snapshot, WAN, None, Some(&tcp_wan), None),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+
+        // A matching TCP outbound path must require a runtime; changing the
+        // protocol equality would incorrectly bypass this NAT decision.
+        let outbound_frame = ipv4_decision_frame(ROUTER, REMOTE, 6, 64, 5);
+        assert!(matches!(
+            decide_ipv4_with_services(
+                &outbound_frame,
+                &wan_snapshot,
+                LAN,
+                None,
+                Some(&tcp_wan),
+                None,
+            ),
+            Err(Nat44TcpRuntimeUnavailable)
+        ));
+    }
+
+    // Contract: on the exact inside-to-outside path, a TCP packet with only
+    // UDP NAT configured must take the UDP fallback and report its missing
+    // runtime, rather than being classified as unsupported crossing traffic.
+    #[test]
+    fn decide_ipv4_udp_nat_fallback_claims_tcp_on_exact_outbound_path() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+        ];
+        let routes = [Route::new(REMOTE, 32, WAN, None).unwrap()];
+        let neighbors = [Neighbor {
+            interface: WAN,
+            target: REMOTE,
+            mac: MacAddress([2, 0, 0, 0, 0, 20]),
+        }];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let udp_config = Nat44UdpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44UdpPolicy::default(),
+        )
+        .unwrap();
+        let frame = ipv4_decision_frame(ROUTER, REMOTE, 6, 64, 5);
+
+        assert!(matches!(
+            decide_ipv4_with_services(&frame, &snapshot, LAN, Some(&udp_config), None, None),
+            Err(Nat44UdpRuntimeUnavailable)
+        ));
+    }
+
+    // Contract: the UDP-only crossing guard requires the packet to enter on
+    // the configured inside interface; an outside-ingress packet using the
+    // outside egress remains ordinary forwarding.
+    #[test]
+    fn decide_ipv4_udp_only_crossing_requires_inside_ingress() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+        ];
+        let routes = [Route::new(REMOTE, 32, WAN, None).unwrap()];
+        let neighbors = [Neighbor {
+            interface: WAN,
+            target: REMOTE,
+            mac: MacAddress([2, 0, 0, 0, 0, 20]),
+        }];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let udp_config = Nat44UdpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44UdpPolicy::default(),
+        )
+        .unwrap();
+        let frame = ipv4_decision_frame(ROUTER, REMOTE, 6, 64, 5);
+
+        assert!(matches!(
+            decide_ipv4_with_services(&frame, &snapshot, WAN, Some(&udp_config), None, None),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+    }
+
+    // Contract: the TCP-only crossing guard requires the packet to enter on
+    // the configured inside interface; an outside-ingress UDP packet using
+    // the outside egress remains ordinary forwarding.
+    #[test]
+    fn decide_ipv4_tcp_only_crossing_requires_inside_ingress() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+        ];
+        let routes = [Route::new(REMOTE, 32, WAN, None).unwrap()];
+        let neighbors = [Neighbor {
+            interface: WAN,
+            target: REMOTE,
+            mac: MacAddress([2, 0, 0, 0, 0, 20]),
+        }];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let tcp_config = Nat44TcpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+        let frame = ipv4_decision_frame(ROUTER, REMOTE, 17, 64, 5);
+
+        assert!(matches!(
+            decide_ipv4_with_services(&frame, &snapshot, WAN, None, Some(&tcp_config), None),
+            Ok(super::PacketDecision::Ipv4(_))
+        ));
+    }
+
+    // Contract: a target owned by another interface is still local for ARP
+    // scheduling; resolution must not enqueue a request for it.
+    #[test]
+    fn decide_ipv4_does_not_schedule_target_owned_on_egress_only() {
+        let target = Ipv4Address::from_octets([192, 0, 2, 99]);
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [LocalIpv4Binding {
+            interface: WAN,
+            address: target,
+        }];
+        let routes = [Route::new(target, 32, WAN, None).unwrap()];
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(
+            ResolutionPolicy::new(1_000, 2_000).unwrap(),
+            &mut states,
+            &mut actions,
+        );
+        let frame = ipv4_decision_frame(INTERNAL, target, 6, 64, 5);
+        let mut resolution = Some((&mut runtime, MonotonicMillis(0)));
+        let mut icmpv4_errors = None;
+        let mut nat44_udp = None;
+        let mut nat44_tcp = None;
+        let mut firewall = None;
+        let mut firewall_audit = None;
+        let mut firewall_plan = None;
+        let result = decide_ipv4(
+            &frame,
+            &snapshot,
+            LAN,
+            &mut resolution,
+            &mut icmpv4_errors,
+            None,
+            &mut nat44_udp,
+            None,
+            &mut nat44_tcp,
+            None,
+            &mut firewall,
+            &mut firewall_audit,
+            &mut firewall_plan,
+            &mut NoTrace,
+        );
+        assert!(matches!(result, Err(NeighborUnresolved)));
+        assert_eq!(runtime.pending_actions(), 0);
+    }
+
+    // Contract: a configured firewall suppresses the TCP candidate observer
+    // when no firewall runtime is supplied; the firewall guard is decisive.
+    #[test]
+    fn decide_ipv4_firewall_guard_precedes_tcp_candidate_observation() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+            Interface {
+                id: DMZ,
+                mac: MacAddress([2, 0, 0, 0, 0, 3]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+        ];
+        let routes = [Route::new(REMOTE, 32, LAN, None).unwrap()];
+        let neighbors = [Neighbor {
+            interface: LAN,
+            target: REMOTE,
+            mac: MacAddress([2, 0, 0, 0, 0, 20]),
+        }];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let any_prefix = FirewallIpv4Prefix::new(Ipv4Address::from_octets([0; 4]), 0).unwrap();
+        let any_ports = FirewallPortRange::new(1, u16::MAX).unwrap();
+        let rules = [FirewallRule::new(
+            FirewallRuleId(1),
+            FirewallInterface::Interface(LAN),
+            FirewallInterface::Interface(LAN),
+            any_prefix,
+            any_prefix,
+            FirewallProtocol::Tcp,
+            any_ports,
+            any_ports,
+            FirewallAction::AllowStateful,
+        )];
+        let firewall_config = FirewallConfig::new(
+            &snapshot,
+            &rules,
+            FirewallPolicy::default(),
+            1,
+            FirewallHashKey::new(1, 2).unwrap(),
+        )
+        .unwrap();
+        let mut firewall_states = [FirewallStateSlot::default(); 1];
+        let mut firewall_runtime = FirewallRuntime::new(firewall_config, &mut firewall_states);
+        let runtime_config = Nat44TcpConfig::new(
+            &snapshot,
+            DMZ,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+        let tcp_config = Nat44TcpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+        let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+        let mut mapping_buckets = [DirectoryBucket::default(); 1];
+        let mut mapping_nodes = [DirectoryNode::default(); 1];
+        let mut session_buckets = [DirectoryBucket::default(); 1];
+        let mut session_nodes = [DirectoryNode::default(); 1];
+        let mut owners = [PortOwnerSlot::default(); 1];
+        let mut tcp_runtime = Nat44TcpRuntime::new(
+            runtime_config,
+            &mut mappings,
+            &mut sessions,
+            Nat44TcpIndexStorage::new(
+                &mut mapping_buckets,
+                &mut mapping_nodes,
+                &mut session_buckets,
+                &mut session_nodes,
+                &mut owners,
+            ),
+            Nat44TcpHashKey::new(3, 4).unwrap(),
+        )
+        .unwrap();
+        // The local destination bypasses firewall preflight, leaving the
+        // TCP-candidate guard itself observable.
+        let frame = ipv4_decision_frame(REMOTE, INTERNAL, 6, 64, 5);
+        let mut resolution = None;
+        let mut icmpv4_errors = None;
+        let mut nat44_udp = None;
+        let mut nat44_tcp = Some(&mut tcp_runtime);
+        let mut firewall = Some(&mut firewall_runtime);
+        let mut firewall_audit = None;
+        let mut firewall_plan = None;
+        let result = decide_ipv4(
+            &frame,
+            &snapshot,
+            LAN,
+            &mut resolution,
+            &mut icmpv4_errors,
+            None,
+            &mut nat44_udp,
+            Some(&tcp_config),
+            &mut nat44_tcp,
+            Some(&firewall_config),
+            &mut firewall,
+            &mut firewall_audit,
+            &mut firewall_plan,
+            &mut NoTrace,
+        );
+        assert!(matches!(
+            result,
+            Ok(super::PacketDecision::ConsumeIpv4Local)
+        ));
+    }
+
+    fn decide_with_firewall_runtime(
+        frame: &[u8],
+        snapshot: &ForwardingSnapshot<'_>,
+        ingress: IfId,
+        udp_config: Option<&Nat44UdpConfig>,
+        tcp_config: Option<&Nat44TcpConfig>,
+        firewall_config: FirewallConfig<'_>,
+    ) -> Result<super::PacketDecision, DropReason> {
+        let mut states = [FirewallStateSlot::default(); 1];
+        let mut runtime = FirewallRuntime::new(firewall_config, &mut states);
+        let mut resolution = None;
+        let mut icmpv4_errors = None;
+        let mut nat44_udp = None;
+        let mut nat44_tcp = None;
+        let mut firewall = Some(&mut runtime);
+        let mut firewall_audit = None;
+        let mut firewall_plan = None;
+        decide_ipv4(
+            frame,
+            snapshot,
+            ingress,
+            &mut resolution,
+            &mut icmpv4_errors,
+            udp_config,
+            &mut nat44_udp,
+            tcp_config,
+            &mut nat44_tcp,
+            Some(&firewall_config),
+            &mut firewall,
+            &mut firewall_audit,
+            &mut firewall_plan,
+            &mut NoTrace,
+        )
+    }
+
+    // Contract: firewall preflight must not turn a false NAT path guard into
+    // a NAT runtime lookup; with TTL one, the original path reaches expiry.
+    #[test]
+    fn decide_ipv4_firewall_precheck_guards_ingress_and_tcp_path() {
+        let any = FirewallIpv4Prefix::new(Ipv4Address::from_octets([0; 4]), 0).unwrap();
+        let ports = FirewallPortRange::new(1, u16::MAX).unwrap();
+
+        // UDP: ingress differs from inside (line 2321).
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+        ];
+        let routes = [Route::new(REMOTE, 32, WAN, None).unwrap()];
+        let neighbor = [Neighbor {
+            interface: WAN,
+            target: REMOTE,
+            mac: MacAddress([2, 0, 0, 0, 0, 20]),
+        }];
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbor, &bindings).unwrap();
+        let udp = Nat44UdpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44UdpPolicy::default(),
+        )
+        .unwrap();
+        let udp_rule = [FirewallRule::new(
+            FirewallRuleId(1),
+            FirewallInterface::Interface(WAN),
+            FirewallInterface::Interface(WAN),
+            any,
+            any,
+            FirewallProtocol::Udp,
+            ports,
+            ports,
+            FirewallAction::AllowStateful,
+        )];
+        let firewall = FirewallConfig::new(
+            &snapshot,
+            &udp_rule,
+            FirewallPolicy::default(),
+            1,
+            FirewallHashKey::new(5, 6).unwrap(),
+        )
+        .unwrap();
+        let mut udp_frame = nat_inbound_ttl_frame(FirewallProtocol::Udp);
+        udp_frame[26..30].copy_from_slice(&ROUTER.octets());
+        udp_frame[30..34].copy_from_slice(&REMOTE.octets());
+        udp_frame[40..42].fill(0);
+        udp_frame[24..26].fill(0);
+        let checksum = ipv4_header_checksum(&udp_frame[14..34]);
+        udp_frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        let precheck_result =
+            decide_with_firewall_runtime(&udp_frame, &snapshot, WAN, Some(&udp), None, firewall);
+        assert!(matches!(precheck_result, Err(Ipv4TtlExpired)));
+
+        // TCP: the && guard must require both ingress and egress matches (line 2330).
+        let routes = [Route::new(REMOTE, 32, WAN, None).unwrap()];
+        let neighbor = [Neighbor {
+            interface: WAN,
+            target: REMOTE,
+            mac: MacAddress([2, 0, 0, 0, 0, 20]),
+        }];
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbor, &bindings).unwrap();
+        let tcp = Nat44TcpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+        let tcp_rule = [FirewallRule::new(
+            FirewallRuleId(1),
+            FirewallInterface::Interface(WAN),
+            FirewallInterface::Interface(WAN),
+            any,
+            any,
+            FirewallProtocol::Tcp,
+            ports,
+            ports,
+            FirewallAction::AllowStateful,
+        )];
+        let firewall = FirewallConfig::new(
+            &snapshot,
+            &tcp_rule,
+            FirewallPolicy::default(),
+            1,
+            FirewallHashKey::new(9, 10).unwrap(),
+        )
+        .unwrap();
+        let mut tcp_frame = tcp_syn_frame();
+        tcp_frame[26..30].copy_from_slice(&ROUTER.octets());
+        tcp_frame[50..52].fill(0);
+        let mut pseudo = Vec::with_capacity(32);
+        pseudo.extend_from_slice(&ROUTER.octets());
+        pseudo.extend_from_slice(&REMOTE.octets());
+        pseudo.extend_from_slice(&[0, 6]);
+        pseudo.extend_from_slice(&20_u16.to_be_bytes());
+        pseudo.extend_from_slice(&tcp_frame[34..54]);
+        let tcp_checksum = internet_checksum(&pseudo);
+        tcp_frame[50..52].copy_from_slice(&tcp_checksum.to_be_bytes());
+        tcp_frame[22] = 1;
+        tcp_frame[24..26].fill(0);
+        let checksum = ipv4_header_checksum(&tcp_frame[14..34]);
+        tcp_frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        assert!(matches!(
+            decide_with_firewall_runtime(&tcp_frame, &snapshot, WAN, None, Some(&tcp), firewall),
+            Err(Ipv4TtlExpired)
+        ));
+    }
+
+    // Contract: a TCP-only firewall precheck is protocol-specific; a valid
+    // UDP packet must reach the final TCP fallback after firewall planning.
+    #[test]
+    fn decide_ipv4_firewall_plan_precedes_tcp_udp_fallback_runtime_check() {
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: WAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: INTERNAL,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: PUBLIC,
+            },
+        ];
+        let routes = [Route::new(REMOTE, 32, WAN, None).unwrap()];
+        let neighbors = [Neighbor {
+            interface: WAN,
+            target: REMOTE,
+            mac: MacAddress([2, 0, 0, 0, 0, 20]),
+        }];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let tcp = Nat44TcpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            40_000,
+            40_000,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+        let any_prefix = FirewallIpv4Prefix::new(Ipv4Address::from_octets([0; 4]), 0).unwrap();
+        let any_ports = FirewallPortRange::new(1, u16::MAX).unwrap();
+        let rules = [FirewallRule::new(
+            FirewallRuleId(1),
+            FirewallInterface::Interface(LAN),
+            FirewallInterface::Interface(WAN),
+            any_prefix,
+            any_prefix,
+            FirewallProtocol::Udp,
+            any_ports,
+            any_ports,
+            FirewallAction::AllowStateful,
+        )];
+        let firewall_config = FirewallConfig::new(
+            &snapshot,
+            &rules,
+            FirewallPolicy::default(),
+            1,
+            FirewallHashKey::new(11, 12).unwrap(),
+        )
+        .unwrap();
+        let mut firewall_states = [FirewallStateSlot::default(); 1];
+        let mut firewall_runtime = FirewallRuntime::new(firewall_config, &mut firewall_states);
+        let mut frame = nat_inbound_ttl_frame(FirewallProtocol::Udp);
+        frame[26..30].copy_from_slice(&ROUTER.octets());
+        frame[30..34].copy_from_slice(&REMOTE.octets());
+        frame[40..42].fill(0);
+        frame[22] = 64;
+        frame[24..26].fill(0);
+        let checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+
+        let mut resolution = None;
+        let mut icmpv4_errors = None;
+        let mut nat44_udp = None;
+        let mut nat44_tcp = None;
+        let mut firewall = Some(&mut firewall_runtime);
+        let mut firewall_audit = None;
+        let mut firewall_plan = None;
+        let result = decide_ipv4(
+            &frame,
+            &snapshot,
+            LAN,
+            &mut resolution,
+            &mut icmpv4_errors,
+            None,
+            &mut nat44_udp,
+            Some(&tcp),
+            &mut nat44_tcp,
+            Some(&firewall_config),
+            &mut firewall,
+            &mut firewall_audit,
+            &mut firewall_plan,
+            &mut NoTrace,
+        );
+        assert!(matches!(result, Err(Nat44TcpRuntimeUnavailable)));
+        assert!(firewall_plan.is_some());
     }
 }
