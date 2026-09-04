@@ -552,6 +552,73 @@ mod tests {
     }
 
     #[test]
+    fn notify_socket_type_keeps_both_socket_flags() {
+        // Protects the contract that notification sockets are both datagram
+        // sockets and nonblocking; XOR would silently drop that combination.
+        assert_eq!(NOTIFY_SOCKET_TYPE, SOCK_DGRAM | SOCK_NONBLOCK);
+    }
+
+    #[test]
+    fn abstract_address_rejects_an_empty_name() {
+        // Protects the validation that `@` without a namespace name is not a
+        // usable abstract AF_UNIX destination.
+        assert!(NotifyAddress::from_bytes(b"@").is_none());
+    }
+
+    #[test]
+    fn abstract_address_rejects_an_embedded_nul() {
+        // Protects the validation that an abstract socket name cannot contain
+        // a NUL byte, which would truncate the kernel-visible name.
+        assert!(NotifyAddress::from_bytes(b"@name\0suffix").is_none());
+    }
+
+    #[test]
+    fn abstract_address_rejects_a_name_that_fills_sun_path() {
+        let mut value = vec![b'@'];
+        value.extend([b'x'; SUN_PATH_LEN]);
+
+        // Protects the strict abstract-name size boundary required to leave
+        // room for the namespace marker in sun_path.
+        assert!(NotifyAddress::from_bytes(&value).is_none());
+    }
+
+    #[test]
+    fn abstract_address_has_the_expected_layout_and_length() {
+        let address = NotifyAddress::from_bytes(b"@abc").expect("abstract address must parse");
+
+        // Protects the abstract namespace marker, copied name, and sockaddr
+        // length arithmetic; each byte and the trailing length are ABI data.
+        assert_eq!(address.sockaddr.sun_family, AF_UNIX as u16);
+        assert_eq!(&address.sockaddr.sun_path[..5], b"\0abc\0");
+        assert_eq!(address.length, (SUN_PATH_OFFSET + 3 + 1) as u32);
+    }
+
+    #[test]
+    fn pathname_address_rejects_an_embedded_nul() {
+        // Protects the pathname validation that rejects embedded NUL bytes
+        // instead of allowing the kernel to see a shorter path.
+        assert!(NotifyAddress::from_bytes(b"/tmp\0notify.sock").is_none());
+    }
+
+    #[test]
+    fn pathname_address_rejects_a_path_that_fills_sun_path() {
+        // Protects the strict pathname size boundary needed for its trailing
+        // NUL terminator.
+        assert!(NotifyAddress::from_bytes(&[b'x'; SUN_PATH_LEN]).is_none());
+    }
+
+    #[test]
+    fn pathname_address_has_the_expected_layout_and_length() {
+        let address = NotifyAddress::from_bytes(b"abc").expect("pathname address must parse");
+
+        // Protects pathname copying, its terminator, and sockaddr length
+        // arithmetic used by sendto and bind.
+        assert_eq!(address.sockaddr.sun_family, AF_UNIX as u16);
+        assert_eq!(&address.sockaddr.sun_path[..4], b"abc\0");
+        assert_eq!(address.length, (SUN_PATH_OFFSET + 3 + 1) as u32);
+    }
+
+    #[test]
     fn ready_is_received_on_path_socket() {
         let path = unique_path();
         let path_string = path.to_str().expect("test path must be UTF-8");
@@ -639,6 +706,32 @@ mod tests {
             Some(NotifySendResult::Failed { errno }) if matches!(errno, 1 | 2 | 13)
         ));
         assert_eq!(notifier.next_watchdog, Some(deadline));
+    }
+
+    #[test]
+    fn watchdog_sends_at_the_deadline_but_not_before_it() {
+        let _environment = NotifyEnv::new(None, Some("200000"), None);
+        let mut notifier = Notifier::from_env();
+        let deadline = notifier
+            .next_watchdog
+            .expect("watchdog deadline must be configured");
+
+        // Protects the strict pre-deadline check: a completed tick before the
+        // deadline must not emit a heartbeat.
+        assert_eq!(
+            notifier.watchdog_after_tick(deadline - Duration::from_nanos(1)),
+            None
+        );
+        // Protects the inclusive deadline boundary: the tick exactly at the
+        // deadline must be processed and schedule the next interval.
+        assert_eq!(
+            notifier.watchdog_after_tick(deadline),
+            Some(NotifySendResult::Disabled)
+        );
+        assert_eq!(
+            notifier.next_watchdog,
+            deadline.checked_add(Duration::from_micros(100_000))
+        );
     }
 
     #[test]
@@ -816,6 +909,19 @@ mod tests {
     }
 
     #[test]
+    fn idle_wait_clamps_observability_interval_to_one_quarter() {
+        let _environment = NotifyEnv::new(None, None, None);
+        let notifier = Notifier::from_env();
+
+        // Protects the observability cadence bound: without a watchdog, the
+        // wait is one quarter of observability_interval when that is tighter.
+        assert_eq!(
+            notifier.idle_wait_timeout(Duration::from_secs(8), Duration::from_secs(10)),
+            Duration::from_secs(2)
+        );
+    }
+
+    #[test]
     fn watchdog_idle_wait_has_a_millisecond_floor() {
         let _environment = NotifyEnv::new(None, Some("4"), None);
         let notifier = Notifier::from_env();
@@ -836,6 +942,53 @@ mod tests {
             notifier.idle_wait_timeout(Duration::from_secs(10), Duration::from_secs(1)),
             Duration::from_millis(1)
         );
+    }
+
+    #[test]
+    fn send_fields_accepts_a_zero_socket_descriptor() {
+        const CHILD_ENV: &str = "RUSTER_SD_NOTIFY_FD_ZERO_CHILD";
+
+        if env::var(CHILD_ENV).ok().as_deref() == Some("1") {
+            let path = unique_path();
+            let path_string = path.to_str().expect("test path must be UTF-8");
+            assert!(!path.exists(), "fd-zero notify path must not exist");
+            let address =
+                NotifyAddress::from_bytes(path_string.as_bytes()).expect("pathname must parse");
+            let notifier = Notifier {
+                address: Some(address),
+                watchdog_interval: None,
+                next_watchdog: None,
+            };
+
+            // Protects the socket error boundary in an isolated child: fd 0
+            // is valid and must proceed to sendto rather than be rejected;
+            // sendto then reports an error for this deliberately absent path.
+            // Setting EBADF before and after close(0) makes the <=0/==0
+            // mutants observably return before sendto, with errno 9.
+            let _ = unsafe { close(-1) };
+            assert_eq!(unsafe { close(0) }, 0, "child standard input must close");
+            let _ = unsafe { close(-1) };
+            match notifier.ready() {
+                NotifySendResult::Failed { errno } => {
+                    assert_ne!(errno, 9, "sendto must run with valid fd 0");
+                }
+                other => panic!("missing pathname must fail to send: {other:?}"),
+            }
+            return;
+        }
+
+        let executable = env::current_exe().expect("sd_notify test executable must be found");
+        let status = process::Command::new(executable)
+            .arg("--exact")
+            .arg("sd_notify::tests::send_fields_accepts_a_zero_socket_descriptor")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("fd-zero sd_notify child must start");
+
+        // Protects the fd-zero path without changing any descriptor in the
+        // parent test process; only the child performs the socket operation.
+        assert!(status.success(), "fd-zero sd_notify child must succeed");
     }
 
     unsafe extern "C" {

@@ -4772,4 +4772,769 @@ completion = 4
         assert_eq!(reload_observability.deferred, 2);
         assert_eq!(reload_observability.rejected, 1);
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reload_result_strings_and_initial_activation_are_fail_closed() {
+        // Protects the operator-visible spelling of every reload result and
+        // ensures a cold-start plan is never treated as a successor apply.
+        let cases = [
+            (ReloadResultKind::Applied, "applied"),
+            (ReloadResultKind::Rejected, "rejected"),
+            (ReloadResultKind::RestartRequired, "restart-required"),
+            (ReloadResultKind::Unchanged, "unchanged"),
+            (ReloadResultKind::Deferred, "deferred"),
+            (ReloadResultKind::BackendMismatch, "backend-mismatch"),
+        ];
+        for (kind, expected) in cases {
+            assert_eq!(kind.as_str(), expected);
+        }
+
+        let candidate = planned_test_candidate(FULL_SERVICE_CONFIG, 1, 10);
+        let outcome = plan_successor(None, &candidate);
+        assert_eq!(
+            classify_reload_plan(&outcome),
+            ReloadPlanClassification::InitialActivation
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn run_sim_options_reject_invalid_or_zero_ticks() {
+        // Protects the CLI boundary from accepting malformed, missing, or
+        // zero simulation budgets that would otherwise silently do no work.
+        assert_eq!(
+            parse_run_sim_options(&[]).expect("default simulation budget"),
+            DEFAULT_SIM_TICKS
+        );
+        assert_eq!(
+            parse_run_sim_options(&["--ticks".to_owned(), "7".to_owned()])
+                .expect("positive simulation budget"),
+            7
+        );
+        assert!(parse_run_sim_options(&["--ticks".to_owned()]).is_err());
+        assert!(parse_run_sim_options(&["--ticks".to_owned(), "0".to_owned()]).is_err());
+        assert!(parse_run_sim_options(&["--other".to_owned(), "1".to_owned()]).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    fn healthy_tick_report() -> ruster_runtime::TickReport<(), (), (), (), (), ()> {
+        idle_tick_report()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn health_classifier_distinguishes_readiness_and_active_state() {
+        // Protects the fail-closed health contract: cold is unavailable and
+        // either degraded readiness or an inactive publication is degraded.
+        let report = healthy_tick_report();
+        assert_eq!(
+            health_for_tick(Readiness::Cold, &report),
+            Health::Unavailable
+        );
+        assert_eq!(
+            health_for_tick(Readiness::Degraded, &report),
+            Health::Degraded
+        );
+
+        let mut inactive = healthy_tick_report();
+        inactive.active = false;
+        assert_eq!(
+            health_for_tick(Readiness::Ready, &inactive),
+            Health::Degraded
+        );
+        assert_eq!(health_for_tick(Readiness::Ready, &report), Health::Healthy);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn health_classifier_requires_every_tick_phase_to_be_healthy() {
+        // Protects each independent health prerequisite; one failed phase
+        // must never be hidden by the other four successful phases.
+        let mut report = healthy_tick_report();
+        report.rx = RxPhaseReport::Completed(ruster_core::BatchReport {
+            received: 1,
+            tx_requested: 0,
+            dropped: 0,
+            consumed: 0,
+            completion: ruster_core::BatchCompletion {
+                tx_requested: 0,
+                tx_accepted: 0,
+                tx_rejected: 0,
+                recycled: 0,
+                error: None,
+            },
+        });
+        assert_eq!(health_for_tick(Readiness::Ready, &report), Health::Degraded);
+
+        let mut report = healthy_tick_report();
+        report.rx = RxPhaseReport::Completed(ruster_core::BatchReport {
+            received: 0,
+            tx_requested: 0,
+            dropped: 0,
+            consumed: 0,
+            completion: ruster_core::BatchCompletion {
+                tx_requested: 0,
+                tx_accepted: 0,
+                tx_rejected: 0,
+                recycled: 0,
+                error: Some(()),
+            },
+        });
+        assert_eq!(health_for_tick(Readiness::Ready, &report), Health::Degraded);
+
+        let mut report = healthy_tick_report();
+        report.resolution_timers =
+            ruster_runtime::PhaseReport::Failed(ruster_core::ResolutionTimerError::ClockRegression);
+        assert_eq!(health_for_tick(Readiness::Ready, &report), Health::Degraded);
+
+        let mut report = healthy_tick_report();
+        report.failure_dispatch = ruster_runtime::PhaseReport::Failed(
+            ruster_core::ResolutionFailureDispatchError::ClockRegression,
+        );
+        assert_eq!(health_for_tick(Readiness::Ready, &report), Health::Degraded);
+
+        let mut report = healthy_tick_report();
+        report.generated_arp =
+            ruster_runtime::PhaseReport::Completed(ruster_runtime::GeneratedPhaseReport {
+                accounting: ruster_runtime::GeneratedAccounting::default(),
+                stop: ruster_runtime::GeneratedArpStop::ClockRegression,
+            });
+        assert_eq!(health_for_tick(Readiness::Ready, &report), Health::Degraded);
+
+        let mut report = healthy_tick_report();
+        report.generated_icmpv4 =
+            ruster_runtime::PhaseReport::Completed(ruster_runtime::GeneratedPhaseReport {
+                accounting: ruster_runtime::GeneratedAccounting::default(),
+                stop: ruster_runtime::GeneratedIcmpv4Stop::ClockRegression,
+            });
+        assert_eq!(health_for_tick(Readiness::Ready, &report), Health::Degraded);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tick_work_classifier_reports_each_rx_counter() {
+        // Protects every RX activity counter from being ignored by the idle
+        // watchdog decision.
+        let mut reports: Vec<_> = (0..9).map(|_| healthy_tick_report()).collect();
+        reports[0].rx = RxPhaseReport::Completed(ruster_core::BatchReport {
+            received: 1,
+            ..idle_tick_batch_report()
+        });
+        reports[1].rx = RxPhaseReport::Completed(ruster_core::BatchReport {
+            tx_requested: 1,
+            ..idle_tick_batch_report()
+        });
+        reports[2].rx = RxPhaseReport::Completed(ruster_core::BatchReport {
+            dropped: 1,
+            ..idle_tick_batch_report()
+        });
+        reports[3].rx = RxPhaseReport::Completed(ruster_core::BatchReport {
+            consumed: 1,
+            ..idle_tick_batch_report()
+        });
+        reports[4].rx = RxPhaseReport::Completed(ruster_core::BatchReport {
+            completion: ruster_core::BatchCompletion {
+                tx_requested: 1,
+                tx_accepted: 0,
+                tx_rejected: 0,
+                recycled: 0,
+                error: None,
+            },
+            ..idle_tick_batch_report()
+        });
+        reports[5].rx = RxPhaseReport::Completed(ruster_core::BatchReport {
+            completion: ruster_core::BatchCompletion {
+                tx_requested: 0,
+                tx_accepted: 1,
+                tx_rejected: 0,
+                recycled: 0,
+                error: None,
+            },
+            ..idle_tick_batch_report()
+        });
+        reports[6].rx = RxPhaseReport::Completed(ruster_core::BatchReport {
+            completion: ruster_core::BatchCompletion {
+                tx_requested: 0,
+                tx_accepted: 0,
+                tx_rejected: 1,
+                recycled: 0,
+                error: None,
+            },
+            ..idle_tick_batch_report()
+        });
+        reports[7].rx = RxPhaseReport::Completed(ruster_core::BatchReport {
+            completion: ruster_core::BatchCompletion {
+                tx_requested: 0,
+                tx_accepted: 0,
+                tx_rejected: 0,
+                recycled: 1,
+                error: None,
+            },
+            ..idle_tick_batch_report()
+        });
+        reports[8].rx = RxPhaseReport::Completed(ruster_core::BatchReport {
+            completion: ruster_core::BatchCompletion {
+                tx_requested: 0,
+                tx_accepted: 0,
+                tx_rejected: 0,
+                recycled: 0,
+                error: Some(()),
+            },
+            ..idle_tick_batch_report()
+        });
+        for report in reports {
+            assert!(tick_report_has_work(&report));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn idle_tick_batch_report() -> ruster_core::BatchReport<()> {
+        ruster_core::BatchReport {
+            received: 0,
+            tx_requested: 0,
+            dropped: 0,
+            consumed: 0,
+            completion: idle_batch_completion(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn idle_batch_completion() -> ruster_core::BatchCompletion<()> {
+        ruster_core::BatchCompletion {
+            tx_requested: 0,
+            tx_accepted: 0,
+            tx_rejected: 0,
+            recycled: 0,
+            error: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tick_work_classifier_reports_timer_dispatch_and_phase_failures() {
+        // Protects timer, failure-dispatch, and terminal phase outcomes from
+        // being mistaken for an idle tick.
+        let mut report = healthy_tick_report();
+        for timer in [
+            ruster_core::ResolutionTimerReport {
+                retries_queued: 1,
+                ..Default::default()
+            },
+            ruster_core::ResolutionTimerReport {
+                timed_out: 1,
+                ..Default::default()
+            },
+            ruster_core::ResolutionTimerReport {
+                no_accepted_arp_request: 1,
+                ..Default::default()
+            },
+            ruster_core::ResolutionTimerReport {
+                failures_expired: 1,
+                ..Default::default()
+            },
+        ] {
+            report.resolution_timers = ruster_runtime::PhaseReport::Completed(timer);
+            assert!(tick_report_has_work(&report));
+        }
+        for dispatch in [
+            ruster_core::ResolutionFailureDispatchReport {
+                queued: 1,
+                ..Default::default()
+            },
+            ruster_core::ResolutionFailureDispatchReport {
+                retired: 1,
+                ..Default::default()
+            },
+            ruster_core::ResolutionFailureDispatchReport {
+                reverse_arp_scheduled: 1,
+                ..Default::default()
+            },
+        ] {
+            report.failure_dispatch = ruster_runtime::PhaseReport::Completed(dispatch);
+            assert!(tick_report_has_work(&report));
+        }
+        report.resolution_timers =
+            ruster_runtime::PhaseReport::Failed(ruster_core::ResolutionTimerError::ClockRegression);
+        assert!(tick_report_has_work(&report));
+        report.failure_dispatch = ruster_runtime::PhaseReport::Failed(
+            ruster_core::ResolutionFailureDispatchError::ClockRegression,
+        );
+        assert!(tick_report_has_work(&report));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn generated_work_requires_progress_and_positive_pending_budget() {
+        // Protects generated watchdog work from counting a pending queue when
+        // no frame progressed, and covers the zero/one/multiple pending cases.
+        let fields = [
+            (
+                "allocated",
+                ruster_runtime::GeneratedAccounting {
+                    allocated: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "tx_requested",
+                ruster_runtime::GeneratedAccounting {
+                    tx_requested: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "cancelled",
+                ruster_runtime::GeneratedAccounting {
+                    cancelled: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "abandoned",
+                ruster_runtime::GeneratedAccounting {
+                    abandoned: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "tx_accepted",
+                ruster_runtime::GeneratedAccounting {
+                    tx_accepted: 1,
+                    ..Default::default()
+                },
+            ),
+            (
+                "tx_rejected",
+                ruster_runtime::GeneratedAccounting {
+                    tx_rejected: 1,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (name, accounting) in fields {
+            assert!(
+                generated_accounting_has_progress(&accounting),
+                "{name} is progress"
+            );
+            let mut report = healthy_tick_report();
+            report.generated_arp =
+                ruster_runtime::PhaseReport::Completed(ruster_runtime::GeneratedPhaseReport {
+                    accounting,
+                    stop: ruster_runtime::GeneratedArpStop::QueueEmpty,
+                });
+            assert!(tick_report_has_work(&report));
+        }
+
+        let mut report = healthy_tick_report();
+        report.generated_arp =
+            ruster_runtime::PhaseReport::Completed(ruster_runtime::GeneratedPhaseReport {
+                accounting: fields[0].1,
+                stop: ruster_runtime::GeneratedArpStop::BudgetExhausted { pending: 0 },
+            });
+        assert!(!tick_report_has_work(&report));
+        for pending in [1, 2] {
+            report.generated_arp =
+                ruster_runtime::PhaseReport::Completed(ruster_runtime::GeneratedPhaseReport {
+                    accounting: fields[0].1,
+                    stop: ruster_runtime::GeneratedArpStop::BudgetExhausted { pending },
+                });
+            assert!(tick_report_has_work(&report));
+        }
+        report.generated_arp =
+            ruster_runtime::PhaseReport::Completed(ruster_runtime::GeneratedPhaseReport {
+                accounting: ruster_runtime::GeneratedAccounting::default(),
+                stop: ruster_runtime::GeneratedArpStop::QueueEmpty,
+            });
+        for (pending, expected) in [(0, false), (1, true), (2, true)] {
+            report.generated_icmpv4 =
+                ruster_runtime::PhaseReport::Completed(ruster_runtime::GeneratedPhaseReport {
+                    accounting: fields[0].1,
+                    stop: ruster_runtime::GeneratedIcmpv4Stop::BudgetExhausted { pending },
+                });
+            assert_eq!(tick_report_has_work(&report), expected);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tick_work_classifier_marks_inactive_and_non_unchanged_publication_busy() {
+        // Protects the top-level watchdog short circuit for inactive or
+        // publication-changing ticks, even when all phase counters are zero.
+        let mut report = healthy_tick_report();
+        report.active = false;
+        assert!(tick_report_has_work(&report));
+        report.active = true;
+        report.publication = ruster_runtime::PublicationOutcome::Applied(());
+        assert!(tick_report_has_work(&report));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ip(octets: [u8; 4]) -> ruster_core::Ipv4Address {
+        ruster_core::Ipv4Address::from_octets(octets)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prefix(octets: [u8; 4], length: u8) -> ruster_core::FirewallIpv4Prefix {
+        ruster_core::FirewallIpv4Prefix::new(ip(octets), length).expect("valid test prefix")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn simulation_ipv4_masks_and_usable_boundaries_are_explicit() {
+        // Protects route-mask arithmetic and excludes unspecified, loopback,
+        // multicast, and limited-broadcast addresses from generated traffic.
+        assert_eq!(sim_prefix_mask(0), 0);
+        assert_eq!(sim_prefix_mask(1), 0x8000_0000);
+        assert_eq!(sim_prefix_mask(24), 0xffff_ff00);
+        assert_eq!(sim_prefix_mask(32), u32::MAX);
+        assert_eq!(sim_prefix_mask(33), 0);
+        assert_eq!(sim_host_mask(24), 0x0000_00ff);
+
+        for address in [
+            [0, 0, 0, 0],
+            [0, 1, 2, 3],
+            [127, 0, 0, 1],
+            [224, 0, 0, 1],
+            [255, 255, 255, 255],
+        ] {
+            assert!(
+                !sim_usable_ipv4(ip(address)),
+                "{address:?} must be unusable"
+            );
+        }
+        for address in [
+            [1, 0, 0, 1],
+            [126, 1, 2, 3],
+            [128, 0, 0, 1],
+            [223, 255, 255, 254],
+        ] {
+            assert!(sim_usable_ipv4(ip(address)), "{address:?} must be usable");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn simulation_firewall_matching_and_port_selection_are_fail_closed() {
+        // Protects firewall interface/prefix matching, representative source
+        // selection, and preferred-port fallback used by run-sim.
+        let ingress = ruster_core::IfId(1);
+        let egress = ruster_core::IfId(2);
+        assert!(sim_firewall_interface_matches(
+            ruster_core::FirewallInterface::Any,
+            ingress
+        ));
+        assert!(sim_firewall_interface_matches(
+            ruster_core::FirewallInterface::Interface(ingress),
+            ingress
+        ));
+        assert!(!sim_firewall_interface_matches(
+            ruster_core::FirewallInterface::Interface(egress),
+            ingress
+        ));
+        let network = prefix([192, 0, 2, 0], 24);
+        assert!(sim_firewall_prefix_matches(network, ip([192, 0, 2, 7])));
+        assert!(!sim_firewall_prefix_matches(network, ip([192, 0, 3, 7])));
+        assert_eq!(
+            sim_firewall_prefix_representative(network),
+            Some(ip([192, 0, 2, 1]))
+        );
+        assert_eq!(
+            sim_firewall_prefix_representative(prefix([127, 0, 0, 0], 8)),
+            None
+        );
+
+        let inside = ruster_core::FirewallPortRange::new(50_000, 52_000).unwrap();
+        let outside = ruster_core::FirewallPortRange::new(80, 90).unwrap();
+        assert_eq!(sim_port(inside, 51_000), 51_000);
+        assert_eq!(sim_port(outside, 443), 80);
+
+        let rule = ruster_core::FirewallRule::new(
+            ruster_core::FirewallRuleId(1),
+            ruster_core::FirewallInterface::Interface(ingress),
+            ruster_core::FirewallInterface::Interface(egress),
+            prefix([192, 0, 2, 0], 24),
+            prefix([203, 0, 113, 0], 24),
+            ruster_core::FirewallProtocol::Tcp,
+            inside,
+            ruster_core::FirewallPortRange::new(443, 443).unwrap(),
+            ruster_core::FirewallAction::AllowStateful,
+        );
+        let allowed = sim_allowed_transport(
+            &[rule],
+            ingress,
+            egress,
+            ip([192, 0, 2, 7]),
+            ip([203, 0, 113, 5]),
+        )
+        .expect("matching TCP rule must allow");
+        assert_eq!(allowed.protocol, 6);
+        assert_eq!(allowed.source, ip([192, 0, 2, 7]));
+        assert_eq!(allowed.source_port, 51_000);
+        assert_eq!(allowed.destination_port, 443);
+        assert!(sim_allowed_transport(
+            &[ruster_core::FirewallRule::new(
+                ruster_core::FirewallRuleId(2),
+                ruster_core::FirewallInterface::Any,
+                ruster_core::FirewallInterface::Any,
+                prefix([192, 0, 2, 0], 24),
+                prefix([203, 0, 113, 0], 24),
+                ruster_core::FirewallProtocol::Udp,
+                inside,
+                outside,
+                ruster_core::FirewallAction::AllowStateful,
+            )],
+            ingress,
+            egress,
+            ip([192, 0, 2, 7]),
+            ip([203, 0, 113, 5]),
+        )
+        .is_some());
+        assert!(sim_allowed_transport(
+            &[ruster_core::FirewallRule::new(
+                ruster_core::FirewallRuleId(3),
+                ruster_core::FirewallInterface::Any,
+                ruster_core::FirewallInterface::Any,
+                prefix([127, 0, 0, 0], 8),
+                prefix([203, 0, 113, 0], 24),
+                ruster_core::FirewallProtocol::Tcp,
+                inside,
+                outside,
+                ruster_core::FirewallAction::AllowStateful,
+            )],
+            ingress,
+            egress,
+            ip([192, 0, 2, 7]),
+            ip([203, 0, 113, 5]),
+        )
+        .is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn simulation_source_and_path_selection_reject_local_or_foreign_values() {
+        // Protects simulation source selection from using local addresses,
+        // wrong interfaces, missing neighbors, or a less-specific route.
+        let ingress = ruster_core::IfId(1);
+        let neighbor = ruster_core::Neighbor {
+            interface: ingress,
+            target: ip([192, 0, 2, 9]),
+            mac: ruster_core::MacAddress([2, 0, 0, 0, 0, 1]),
+        };
+        let local = [ruster_core::LocalIpv4Binding {
+            interface: ingress,
+            address: ip([192, 0, 2, 1]),
+        }];
+        assert_eq!(
+            sim_source_address(Some(&neighbor), ingress, &local),
+            Some(ip([192, 0, 2, 9]))
+        );
+        let local_neighbor = ruster_core::Neighbor {
+            target: ip([192, 0, 2, 1]),
+            ..neighbor
+        };
+        assert_eq!(
+            sim_source_address(Some(&local_neighbor), ingress, &local),
+            Some(ip([192, 0, 2, 2]))
+        );
+        assert_eq!(
+            sim_source_address(
+                None,
+                ingress,
+                &[ruster_core::LocalIpv4Binding {
+                    interface: ruster_core::IfId(9),
+                    address: ip([192, 0, 2, 1]),
+                }]
+            ),
+            None
+        );
+
+        let egress = ruster_core::IfId(2);
+        let route = ruster_core::Route::new(ip([203, 0, 113, 0]), 24, egress, None)
+            .expect("valid direct test route");
+        let route_neighbor = ruster_core::Neighbor {
+            interface: egress,
+            target: ip([203, 0, 113, 5]),
+            mac: ruster_core::MacAddress([2, 0, 0, 0, 0, 2]),
+        };
+        let paths = sim_paths(&[route], &[route_neighbor], egress, &[]);
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].destination, ip([203, 0, 113, 5]));
+        assert!(sim_paths(&[route], &[], egress, &[]).is_empty());
+        assert!(sim_paths(&[route], &[route_neighbor], ingress, &[]).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug)]
+    enum QuiescenceTestError {
+        Continue,
+        Completion,
+    }
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy)]
+    enum QuiescenceCheck {
+        AlwaysContinue,
+        ContinueOnce,
+        Ready,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct EmptyShutdownBatch {
+        completion: ruster_core::BatchCompletion<QuiescenceTestError>,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct EmptyShutdownSlot;
+
+    #[cfg(target_os = "linux")]
+    impl ruster_core::PacketSlot for EmptyShutdownSlot {
+        fn ingress(&self) -> ruster_core::IfId {
+            ruster_core::IfId(0)
+        }
+
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut []
+        }
+
+        fn complete(self, _completion: ruster_core::SlotCompletion) {}
+    }
+
+    #[cfg(target_os = "linux")]
+    impl ruster_core::PacketBatch for EmptyShutdownBatch {
+        type Error = QuiescenceTestError;
+        type Slot<'a> = EmptyShutdownSlot;
+
+        fn next_packet(&mut self) -> Option<ruster_core::PacketLease<Self::Slot<'_>>> {
+            None
+        }
+
+        fn finish(self) -> ruster_core::BatchCompletion<Self::Error> {
+            self.completion
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    struct ShutdownTestIo {
+        check: QuiescenceCheck,
+        checks: usize,
+        invalid_completion: bool,
+        completion_error: Option<QuiescenceTestError>,
+    }
+
+    #[cfg(target_os = "linux")]
+    unsafe impl PublicationBackendAuthority for ShutdownTestIo {}
+
+    #[cfg(target_os = "linux")]
+    impl PublicationQuiescenceBackend for ShutdownTestIo {
+        type Error = QuiescenceTestError;
+
+        fn check_publication_quiescence(&mut self) -> Result<(), Self::Error> {
+            match self.check {
+                QuiescenceCheck::AlwaysContinue => Err(QuiescenceTestError::Continue),
+                QuiescenceCheck::ContinueOnce if self.checks == 0 => {
+                    self.checks += 1;
+                    Err(QuiescenceTestError::Continue)
+                }
+                QuiescenceCheck::ContinueOnce | QuiescenceCheck::Ready => Ok(()),
+            }
+        }
+
+        fn current_io_disposition(&self) -> PublicationQuiescenceDisposition {
+            PublicationQuiescenceDisposition::ContinueOldIo
+        }
+
+        fn quiescence_error_disposition(_error: &Self::Error) -> PublicationQuiescenceDisposition {
+            PublicationQuiescenceDisposition::ContinueOldIo
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl PacketIo for ShutdownTestIo {
+        type Error = QuiescenceTestError;
+        type Batch<'a> = EmptyShutdownBatch;
+
+        fn receive(&mut self, _budget: usize) -> Result<Self::Batch<'_>, Self::Error> {
+            Ok(EmptyShutdownBatch {
+                completion: ruster_core::BatchCompletion {
+                    tx_requested: usize::from(self.invalid_completion),
+                    tx_accepted: 0,
+                    tx_rejected: 0,
+                    recycled: 0,
+                    error: self.completion_error,
+                },
+            })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_quiescence_accepts_only_continue_old_io_and_deadline_is_enforced() {
+        // Protects shutdown from entering a non-reusable backend state and
+        // from treating a completed quiescence check as a timeout.
+        let (_owner, mut io) = bind_publication_backend(ShutdownTestIo {
+            check: QuiescenceCheck::Ready,
+            checks: 0,
+            invalid_completion: false,
+            completion_error: None,
+        })
+        .expect("shutdown test binding");
+        assert_eq!(
+            wait_for_quiescence(&mut io, std::time::Instant::now()),
+            Ok(())
+        );
+
+        let (_owner, mut io) = bind_publication_backend(ShutdownTestIo {
+            check: QuiescenceCheck::AlwaysContinue,
+            checks: 0,
+            invalid_completion: false,
+            completion_error: None,
+        })
+        .expect("shutdown test binding");
+        let error = wait_for_quiescence(&mut io, std::time::Instant::now())
+            .expect_err("expired retry must report timeout");
+        assert!(error.contains("timed out"));
+
+        let (_owner, mut io) = bind_publication_backend(ShutdownTestIo {
+            check: QuiescenceCheck::ContinueOnce,
+            checks: 0,
+            invalid_completion: true,
+            completion_error: None,
+        })
+        .expect("shutdown test binding");
+        let error = wait_for_quiescence(
+            &mut io,
+            std::time::Instant::now() + std::time::Duration::from_millis(20),
+        )
+        .expect_err("invalid shutdown accounting must be rejected");
+        assert!(error.contains("violated batch accounting invariants"));
+
+        let (_owner, mut io) = bind_publication_backend(ShutdownTestIo {
+            check: QuiescenceCheck::ContinueOnce,
+            checks: 0,
+            invalid_completion: false,
+            completion_error: Some(QuiescenceTestError::Completion),
+        })
+        .expect("shutdown test binding");
+        assert_eq!(
+            wait_for_quiescence(
+                &mut io,
+                std::time::Instant::now() + std::time::Duration::from_secs(1)
+            ),
+            Ok(())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shutdown_quiescence_deadline_is_in_the_future() {
+        // Protects the bounded shutdown wait: the first attempt must create a
+        // deadline after the configured timeout, never before the wait starts.
+        let before = std::time::Instant::now();
+        let mut state = ShutdownQuiescenceState::default();
+        let deadline = state.begin_wait().expect("first wait creates deadline");
+        assert!(
+            deadline >= before + std::time::Duration::from_secs(SHUTDOWN_QUIESCENCE_TIMEOUT_SECS)
+        );
+    }
 }

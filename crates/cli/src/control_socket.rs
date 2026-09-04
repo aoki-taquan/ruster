@@ -2422,4 +2422,536 @@ mod tests {
     unsafe extern "C" {
         fn shutdown(socket: std::ffi::c_int, how: std::ffi::c_int) -> std::ffi::c_int;
     }
+
+    #[cfg(test)]
+    mod added_tests {
+        use super::*;
+        use std::{
+            ffi::CString,
+            fs::File,
+            os::{
+                fd::AsRawFd,
+                unix::{ffi::OsStrExt, fs::symlink},
+            },
+            process::Command,
+            thread,
+        };
+
+        unsafe extern "C" {
+            fn chown(path: *const std::ffi::c_char, owner: u32, group: u32) -> std::ffi::c_int;
+        }
+
+        #[test]
+        fn control_address_rejects_empty_nul_and_preserves_path_length() {
+            // Protects the pathname ABI preconditions: an empty or NUL-containing
+            // name must be rejected, and the sockaddr length must include exactly
+            // the path bytes plus its terminating NUL.
+            assert!(ControlAddress::from_bytes(&[]).is_err());
+            assert!(ControlAddress::from_bytes(b"control\0socket").is_err());
+            let address = ControlAddress::from_bytes(b"x").expect("one-byte path is valid");
+            assert_eq!(address.length as usize, SUN_PATH_OFFSET + 2);
+            assert_eq!(address.sockaddr.sun_family, AF_UNIX as u16);
+            assert_eq!(address.sockaddr.sun_path[0], b'x');
+            assert_eq!(address.sockaddr.sun_path[1], 0);
+        }
+
+        #[test]
+        fn validate_ancestors_rejects_untrusted_owner() {
+            // Protects the privileged-daemon boundary: an ancestor owned by
+            // neither root nor the daemon uid must fail before any bind occurs.
+            let parent = unique_path().with_extension("untrusted-parent");
+            fs::create_dir(&parent).expect("untrusted parent must be created");
+            let original = fs::symlink_metadata(&parent).expect("parent metadata must be readable");
+            let (daemon_uid, owner) = if original.uid() == 0 {
+                // SAFETY: this is test-only setup of a private temporary
+                // directory; root must make the parent genuinely non-root so
+                // the authorization predicate is exercised under root too.
+                let path = CString::new(parent.as_os_str().as_bytes())
+                    .expect("temporary parent path must not contain NUL");
+                let result = unsafe { chown(path.as_ptr(), 65_534, original.gid()) };
+                assert_eq!(result, 0, "test-only chown must make parent non-root");
+                (0, 65_534)
+            } else {
+                let daemon_uid = if original.uid() == u32::MAX {
+                    0
+                } else {
+                    u32::MAX
+                };
+                (daemon_uid, original.uid())
+            };
+            let error = validate_trusted_ancestors(&parent, daemon_uid)
+                .expect_err("a non-daemon owner must not be trusted");
+            assert!(error.contains("owned by uid"), "error={error}");
+            assert!(error.contains(&owner.to_string()), "error={error}");
+            fs::remove_dir(&parent).expect("untrusted parent must be removed");
+        }
+
+        #[test]
+        fn open_directory_fd_does_not_follow_final_symlink() {
+            // Protects the path-pinning rule: opening the parent through an
+            // attacker-inserted final symlink must fail closed.
+            let target = unique_path().with_extension("directory");
+            fs::create_dir(&target).expect("symlink target directory must be created");
+            let link = unique_path();
+            symlink(&target, &link).expect("directory symlink must be created");
+            let error = open_directory_fd(&link).expect_err("final symlink must not be followed");
+            assert!(error.contains("pin control socket parent"), "error={error}");
+            fs::remove_file(&link).expect("directory symlink must be removed");
+            fs::remove_dir(&target).expect("symlink target directory must be removed");
+        }
+
+        #[test]
+        fn open_directory_fd_accepts_valid_fd_zero() {
+            // Protects valid descriptor handling: run the global stdin
+            // mutation in a child so concurrent tests in the parent process
+            // cannot observe or reuse fd 0 while it is intentionally closed.
+            if std::env::var_os("RUSTER_FD_ZERO_TEST_CHILD").is_none() {
+                let executable = std::env::current_exe().expect("test executable path must exist");
+                let status = Command::new(executable)
+                    .arg("--exact")
+                    .arg("control_socket::tests::added_tests::open_directory_fd_accepts_valid_fd_zero")
+                    .arg("--nocapture")
+                    .env("RUSTER_FD_ZERO_TEST_CHILD", "1")
+                    .status()
+                    .expect("fd-zero child test must start");
+                assert!(status.success(), "fd-zero child test must pass: {status}");
+                return;
+            }
+
+            assert_eq!(
+                unsafe { close(0) },
+                0,
+                "child stdin must close for fd-zero test"
+            );
+            let path = unique_path();
+            let parent = path.parent().expect("test path must have a parent");
+            let opened = open_directory_fd(parent).expect("fd zero is a valid directory fd");
+            assert_eq!(
+                opened.as_raw_fd(),
+                0,
+                "openat must be allowed to return fd zero"
+            );
+        }
+
+        #[test]
+        fn unlink_at_reports_missing_path_as_an_error() {
+            // Protects cleanup fail-closed behavior: a failed unlink must not be
+            // reported as successful, since callers rely on the result to decide
+            // whether pathname cleanup completed.
+            let path = unique_path();
+            let parent = path.parent().expect("test path must have a parent");
+            let parent_fd = open_directory_fd(parent).expect("test parent must open");
+            let name = path.file_name().unwrap().as_bytes();
+            let error = unlink_at(parent_fd.as_raw_fd(), name)
+                .expect_err("unlinking a missing control path must fail");
+            assert_eq!(error.raw_os_error(), Some(ENOENT));
+        }
+
+        #[test]
+        fn existing_live_socket_is_never_replaced() {
+            // Protects stale-path authorization: a successful connect probe means
+            // an existing endpoint is live and its pathname must be retained.
+            let path = unique_path();
+            let Some(listener) = listener_or_skip(&path) else {
+                return;
+            };
+            let error = match ControlListener::bind_path(&path) {
+                Ok(listener) => {
+                    drop(listener);
+                    panic!("a live control endpoint must prevent replacement");
+                }
+                Err(error) => error,
+            };
+            assert!(error.contains("already in use"), "error={error}");
+            assert!(path.exists(), "the live endpoint pathname must remain");
+            drop(listener);
+        }
+
+        #[test]
+        fn peer_credentials_failure_rejects_invalid_descriptor() {
+            // Protects SO_PEERCRED failure handling: credentials must never be
+            // fabricated when the kernel rejects the descriptor query.
+            assert!(peer_credentials(-1).is_err(), "invalid peer fd must fail");
+        }
+
+        #[test]
+        fn connect_probe_stop_is_conservative_before_connect() {
+            // Protects the fail-closed probe rule: shutdown before connect must
+            // retain the pathname rather than proving it stale.
+            let address = ControlAddress::from_bytes(b"/tmp/ruster-probe-stop-test")
+                .expect("probe test path must be valid");
+            match connect_probe_outcome(address, SOCK_SEQPACKET, || true) {
+                ConnectProbeOutcome::Conservative(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+                }
+                _ => panic!("stopped probe must be conservative"),
+            }
+        }
+
+        #[test]
+        fn connect_probe_reports_socket_creation_failure() {
+            // Protects probe setup failure handling: an invalid socket type
+            // must be reported as failure, never treated as a stale endpoint.
+            let address = ControlAddress::from_bytes(b"/tmp/ruster-probe-failure-test")
+                .expect("probe test path must be valid");
+            match connect_probe_outcome(address, 0, || false) {
+                ConnectProbeOutcome::Failed(error) => {
+                    assert_ne!(error.raw_os_error(), Some(9));
+                }
+                _ => panic!("socket creation failure must be reported"),
+            }
+        }
+
+        #[test]
+        fn wait_for_probe_connect_rejects_invalid_descriptor_conservatively() {
+            // Protects the probe's invalid-fd handling: POLLNVAL is uncertainty,
+            // never evidence that an endpoint is stale.
+            let fd = unsafe { socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0) };
+            assert!(fd >= 0, "probe test socket must be created");
+            let close_result = unsafe { close(fd) };
+            assert_eq!(close_result, 0, "probe test socket must close");
+            match wait_for_probe_connect(fd, Instant::now() + Duration::from_secs(1), || false) {
+                ConnectProbeOutcome::Conservative(error) => {
+                    assert!(error.to_string().contains("invalid descriptor"));
+                }
+                _ => panic!("invalid descriptor must be conservative"),
+            }
+        }
+
+        #[test]
+        fn poll_timeout_millis_is_positive_and_rounds_up() {
+            // Protects the finite poll budget: zero and sub-millisecond remaining
+            // durations must still get a positive timeout, with one millisecond
+            // of rounding so the deadline is not truncated early.
+            assert_eq!(poll_timeout_millis(Duration::ZERO), 1);
+            assert_eq!(poll_timeout_millis(Duration::from_millis(1)), 2);
+            assert_eq!(poll_timeout_millis(Duration::from_secs(1)), 1001);
+            assert_eq!(poll_timeout_millis(Duration::MAX), i32::MAX);
+        }
+
+        #[test]
+        fn process_without_clients_is_a_noop() {
+            // Protects the process-loop boundary: an empty client queue must not
+            // perform an out-of-bounds iteration or fabricate a request.
+            let path = unique_path();
+            let Some(mut listener) = listener_or_skip(&path) else {
+                return;
+            };
+            let result = listener.process(|| "unused".to_owned());
+            assert_eq!(result, ControlProcessResult::default());
+        }
+
+        #[test]
+        fn process_closes_idle_clients_after_the_timeout() {
+            // Protects the watchdog for accepted clients: a peer that has waited
+            // past the timeout must be removed instead of retained forever.
+            let path = unique_path();
+            let Some(mut listener) = listener_or_skip(&path) else {
+                return;
+            };
+            let fd = client(&path);
+            listener.accept_connections();
+            assert_eq!(listener.clients.len(), 1);
+            listener.clients[0].accepted_at = Instant::now()
+                .checked_sub(CONTROL_CLIENT_TIMEOUT + Duration::from_secs(1))
+                .expect("test instant must have a representable past");
+            let result = listener.process(|| "unused".to_owned());
+            assert_eq!(result.requests_seen, 0);
+            assert!(listener.clients.is_empty(), "expired client must be closed");
+            let _ = unsafe { close(fd) };
+        }
+
+        #[test]
+        fn process_counts_reload_and_invalid_requests_and_replies_to_reload() {
+            // Protects request accounting and command dispatch: every complete
+            // packet counts once, reload sets its flag, and unknown commands get
+            // no response while authorized reloads receive the fixed reply.
+            let path = unique_path();
+            let Some(mut listener) = listener_or_skip(&path) else {
+                return;
+            };
+            let reload = client(&path);
+            let invalid = client(&path);
+            send_test_packet(reload, b"reload", &[]);
+            send_test_packet(invalid, b"unknown", &[]);
+            let result = listener.process(|| "unused".to_owned());
+            assert_eq!(result.requests_seen, 2);
+            assert!(result.reload_requested);
+            assert_eq!(
+                receive_response(reload).expect("reload response must be received"),
+                b"reload requested"
+            );
+            expect_no_response(invalid);
+            let _ = unsafe { close(reload) };
+            let _ = unsafe { close(invalid) };
+        }
+
+        #[test]
+        fn exact_maximum_status_response_is_accepted() {
+            // Protects the strict response-size boundary: exactly the configured
+            // maximum is valid, while only larger status lines are rejected.
+            let path = unique_path();
+            let Some(mut listener) = listener_or_skip(&path) else {
+                return;
+            };
+            let fd = client(&path);
+            send_test_packet(fd, b"status", &[]);
+            let status = "s".repeat(MAX_RESPONSE_BYTES);
+            let result = listener.process(|| status.clone());
+            assert_eq!(result.requests_seen, 1);
+            assert_eq!(
+                receive_response(fd)
+                    .expect("maximum status must be sent")
+                    .len(),
+                MAX_RESPONSE_BYTES
+            );
+            let _ = unsafe { close(fd) };
+        }
+
+        #[test]
+        fn oversized_status_response_is_not_sent() {
+            // Protects the response-size authorization boundary: the daemon must
+            // not emit an unbounded status response to a local IPC client.
+            let path = unique_path();
+            let Some(mut listener) = listener_or_skip(&path) else {
+                return;
+            };
+            let fd = client(&path);
+            send_test_packet(fd, b"status", &[]);
+            let result = listener.process(|| "s".repeat(MAX_RESPONSE_BYTES + 1));
+            assert_eq!(result.requests_seen, 1);
+            expect_no_response(fd);
+            let _ = unsafe { close(fd) };
+        }
+
+        #[test]
+        fn truncated_request_reasons_distinguish_payload_and_ancillary_flags() {
+            // Protects rejection diagnostics and the combined-flag predicate:
+            // payload truncation, ancillary truncation, and both together must all
+            // be rejected with the matching reason without partial processing.
+            {
+                let path = unique_path();
+                let Some(mut listener) = listener_or_skip(&path) else {
+                    return;
+                };
+                let fd = client(&path);
+                send_test_packet(fd, &[b'x'; MAX_REQUEST_BYTES + 1], &[]);
+                listener.accept_connections();
+                let accepted = listener.clients[0].fd;
+                match receive_request(accepted) {
+                    ControlReceive::Rejected(reason) => assert_eq!(reason, "MSG_TRUNC"),
+                    _ => panic!("payload truncation must be rejected as MSG_TRUNC"),
+                }
+                let _ = unsafe { close(fd) };
+            }
+
+            {
+                let path = unique_path();
+                let Some(mut listener) = listener_or_skip(&path) else {
+                    return;
+                };
+                let fd = client(&path);
+                let source =
+                    File::open("/dev/null").expect("ancillary truncation source must open");
+                let control = build_rights_control(&vec![source.as_raw_fd(); 64]);
+                send_test_packet(fd, b"status", &control);
+                listener.accept_connections();
+                let accepted = listener.clients[0].fd;
+                match receive_request(accepted) {
+                    ControlReceive::Rejected(reason) => assert_eq!(reason, "MSG_CTRUNC"),
+                    _ => panic!("ancillary truncation must be rejected as MSG_CTRUNC"),
+                }
+                let _ = unsafe { close(fd) };
+            }
+
+            let path = unique_path();
+            let Some(mut listener) = listener_or_skip(&path) else {
+                return;
+            };
+            let fd = client(&path);
+            let source = File::open("/dev/null").expect("combined truncation source must open");
+            let rights = build_rights_control(&vec![source.as_raw_fd(); 64]);
+            send_test_packet(fd, &[b'x'; MAX_REQUEST_BYTES + 1], &rights);
+            listener.accept_connections();
+            let accepted = listener.clients[0].fd;
+            match receive_request(accepted) {
+                ControlReceive::Rejected(reason) => assert_eq!(reason, "MSG_TRUNC and MSG_CTRUNC"),
+                _ => panic!("combined truncation must be rejected with both flags"),
+            }
+            let _ = unsafe { close(fd) };
+        }
+
+        #[test]
+        fn receive_request_classifies_empty_invalid_and_no_message() {
+            // Protects the IPC request state machine: an idle nonblocking peer is
+            // retained, an orderly close is closed, and unknown payloads are
+            // invalid commands rather than accepted operations.
+            assert!(matches!(
+                receive_request(-1),
+                ControlReceive::ReceiveError(_)
+            ));
+            let path = unique_path();
+            let Some(mut listener) = listener_or_skip(&path) else {
+                return;
+            };
+            let idle = client(&path);
+            listener.accept_connections();
+            let accepted = listener.clients[0].fd;
+            assert!(matches!(
+                receive_request(accepted),
+                ControlReceive::NoMessage
+            ));
+            let _ = unsafe { close(idle) };
+            assert!(matches!(receive_request(accepted), ControlReceive::Closed));
+            listener.remove_client(0);
+
+            let invalid = client(&path);
+            send_test_packet(invalid, b"wat", &[]);
+            listener.accept_connections();
+            let accepted = listener.clients[0].fd;
+            assert!(matches!(
+                receive_request(accepted),
+                ControlReceive::Command(ControlCommand::Invalid)
+            ));
+            let _ = unsafe { close(invalid) };
+        }
+
+        #[test]
+        fn receive_response_rejects_truncated_payload() {
+            // Protects the client-side response limit: MSG_TRUNC must produce an
+            // invalid-data error instead of returning a silently partial status.
+            let path = unique_path();
+            let Some(mut listener) = listener_or_skip(&path) else {
+                return;
+            };
+            let fd = client(&path);
+            listener.accept_connections();
+            let accepted = listener.clients[0].fd;
+            let response = vec![b'r'; MAX_RESPONSE_BYTES + 1];
+            send_response(accepted, &response).expect("test response must be sent");
+            let error = receive_response(fd).expect_err("oversized response must be rejected");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            let _ = unsafe { close(fd) };
+        }
+
+        #[test]
+        fn request_path_performs_full_request_and_response_exchange() {
+            // Protects the client IPC sequence: a valid path creates the expected
+            // socket, connects, sends exactly one request, and returns the daemon
+            // response rather than a default or fabricated vector.
+            let path = unique_path();
+            let Some(mut listener) = listener_or_skip(&path) else {
+                return;
+            };
+            let client_path = path.clone();
+            let request = thread::spawn(move || request_path(&client_path, b"status"));
+            let mut processed = false;
+            for _ in 0..1000 {
+                let result = listener.process(|| "record_type=observability".to_owned());
+                if result.requests_seen != 0 {
+                    processed = true;
+                    break;
+                }
+                thread::yield_now();
+            }
+            assert!(processed, "request_path peer must be processed");
+            assert_eq!(
+                request.join().expect("request thread must finish").unwrap(),
+                b"record_type=observability"
+            );
+        }
+
+        #[test]
+        fn request_path_rejects_oversized_request_before_socket_creation() {
+            // Protects the client-side request limit: oversized commands must
+            // fail before creating or connecting a control socket.
+            let error = request_path(
+                Path::new("/tmp/control.sock"),
+                &[b'x'; MAX_REQUEST_BYTES + 1],
+            )
+            .expect_err("oversized control request must fail");
+            assert!(error.contains("too long"), "error={error}");
+        }
+
+        #[test]
+        fn peer_disconnect_detection_is_limited_to_expected_errors() {
+            // Protects response error handling: only EPIPE and ECONNRESET are
+            // peer disconnects; all other errors remain observable failures.
+            assert!(is_peer_disconnect(&io::Error::from_raw_os_error(EPIPE)));
+            assert!(is_peer_disconnect(&io::Error::from_raw_os_error(
+                ECONNRESET
+            )));
+            assert!(!is_peer_disconnect(&io::Error::from_raw_os_error(ENOENT)));
+            assert!(!is_peer_disconnect(&io::Error::from(io::ErrorKind::Other)));
+        }
+
+        #[test]
+        fn close_received_fds_closes_only_rights_descriptors_and_handles_truncation() {
+            // Protects ancillary-message authorization: passed descriptors are
+            // never accepted, including a complete descriptor in a truncated cmsg;
+            // unrelated cmsg types must not close arbitrary descriptors.
+            let source = File::open("/dev/null").expect("source fd must open");
+            let rights = build_rights_control(&[source.as_raw_fd()]);
+            close_received_fds(&rights);
+            let close_source = unsafe { close(source.as_raw_fd()) };
+            assert_eq!(close_source, -1, "SCM_RIGHTS descriptor must be closed");
+            std::mem::forget(source);
+
+            let source = File::open("/dev/null").expect("second source fd must open");
+            let mut unrelated = build_rights_control(&[source.as_raw_fd()]);
+            let header = CmsgHdr {
+                cmsg_len: std::mem::size_of::<CmsgHdr>() + std::mem::size_of::<std::ffi::c_int>(),
+                cmsg_level: SOL_SOCKET,
+                cmsg_type: SCM_RIGHTS + 1,
+            };
+            unsafe { ptr::write_unaligned(unrelated.as_mut_ptr().cast::<CmsgHdr>(), header) };
+            close_received_fds(&unrelated);
+            assert_eq!(
+                unsafe { close(source.as_raw_fd()) },
+                0,
+                "unrelated cmsg must not close fd"
+            );
+            std::mem::forget(source);
+
+            let source = File::open("/dev/null").expect("wrong-level source fd must open");
+            let mut wrong_level = build_rights_control(&[source.as_raw_fd()]);
+            let header = CmsgHdr {
+                cmsg_len: std::mem::size_of::<CmsgHdr>() + std::mem::size_of::<std::ffi::c_int>(),
+                cmsg_level: SOL_SOCKET + 1,
+                cmsg_type: SCM_RIGHTS,
+            };
+            unsafe { ptr::write_unaligned(wrong_level.as_mut_ptr().cast::<CmsgHdr>(), header) };
+            close_received_fds(&wrong_level);
+            assert_eq!(
+                unsafe { close(source.as_raw_fd()) },
+                0,
+                "wrong-level cmsg must not close fd"
+            );
+            std::mem::forget(source);
+
+            let source = File::open("/dev/null").expect("truncated source fd must open");
+            let mut truncated = build_rights_control(&[source.as_raw_fd()]);
+            truncated
+                .truncate(std::mem::size_of::<CmsgHdr>() + std::mem::size_of::<std::ffi::c_int>());
+            close_received_fds(&truncated);
+            assert_eq!(
+                unsafe { close(source.as_raw_fd()) },
+                -1,
+                "complete fd bytes must be closed even when cmsg is truncated"
+            );
+            std::mem::forget(source);
+        }
+
+        #[test]
+        fn cmsg_align_rounds_up_and_reports_overflow() {
+            // Protects ancillary traversal arithmetic: alignment rounds upward,
+            // preserves already aligned lengths, and does not wrap on overflow.
+            let alignment = std::mem::size_of::<usize>();
+            assert_eq!(cmsg_align(0), Some(0));
+            assert_eq!(cmsg_align(1), Some(alignment));
+            assert_eq!(cmsg_align(alignment - 1), Some(alignment));
+            assert_eq!(cmsg_align(alignment), Some(alignment));
+            assert_eq!(cmsg_align(usize::MAX), None);
+        }
+    }
 }
