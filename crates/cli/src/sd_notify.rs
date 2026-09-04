@@ -991,6 +991,22 @@ mod tests {
         assert!(status.success(), "fd-zero sd_notify child must succeed");
     }
 
+    mod mutation_sd_notify_line_26 {
+        use super::*;
+
+        #[test]
+        fn notify_socket_type_has_the_complete_socket_abi_flags() {
+            // The datagram and nonblocking flags are both required by the
+            // notification socket ABI. Their disjoint bit patterns also make
+            // `|` and `^` semantically equivalent for this constant.
+            assert_eq!(SOCK_DGRAM, 2);
+            assert_eq!(SOCK_NONBLOCK, 0x800);
+            assert_eq!(NOTIFY_SOCKET_TYPE, 0x802);
+            assert_eq!(NOTIFY_SOCKET_TYPE & SOCK_DGRAM, SOCK_DGRAM);
+            assert_eq!(NOTIFY_SOCKET_TYPE & SOCK_NONBLOCK, SOCK_NONBLOCK);
+        }
+    }
+
     unsafe extern "C" {
         fn bind(socket: c_int, address: *const SockAddrUn, address_length: u32) -> c_int;
         fn setsockopt(

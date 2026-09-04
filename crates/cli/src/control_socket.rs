@@ -2087,6 +2087,417 @@ mod tests {
         assert!(!path.exists(), "listener drop must unlink its own socket");
     }
 
+    #[cfg(test)]
+    mod control_socket_path_security_publication_peer_authorization_tests {
+        use super::*;
+        use std::{
+            fs::File,
+            os::{
+                fd::AsRawFd,
+                unix::{ffi::OsStrExt, fs::symlink},
+            },
+            process::Command,
+        };
+
+        unsafe extern "C" {
+            fn socketpair(
+                domain: std::ffi::c_int,
+                socket_type: std::ffi::c_int,
+                protocol: std::ffi::c_int,
+                sockets: *mut std::ffi::c_int,
+            ) -> std::ffi::c_int;
+        }
+
+        const TEST_CONTROL_PATH: &str = "/tmp/ruster-control-configured-path-test.sock";
+        const CHILD_ENV: &str = "RUSTER_CONTROL_PATH_SECURITY_TEST_CHILD";
+
+        fn run_child(test_name: &str, mode: &str) -> std::process::Output {
+            let executable = std::env::current_exe().expect("test executable path must exist");
+            Command::new(executable)
+                .arg("--exact")
+                .arg(test_name)
+                .arg("--nocapture")
+                .env(CHILD_ENV, mode)
+                .output()
+                .expect("control socket child test must start")
+        }
+
+        fn candidate_name_length(sequence: u64) -> usize {
+            format!(".ruster-control-{:x}-{:x}", process::id(), sequence).len()
+        }
+
+        fn stable_candidate_name_length() -> usize {
+            let parent_fd = open_directory_fd(Path::new("/tmp"))
+                .expect("temporary-name length probe parent must open");
+            loop {
+                let sequence = NEXT_CONTROL_TEMP.load(Ordering::Relaxed);
+                let length = candidate_name_length(sequence);
+                if length == candidate_name_length(sequence.saturating_add(1)) {
+                    return length;
+                }
+                let _ =
+                    temporary_socket_path(parent_fd.as_raw_fd(), Path::new("/tmp/control.sock"))
+                        .expect("temporary-name length probe must allocate a candidate");
+            }
+        }
+
+        fn path_with_parent_length(parent_length: usize) -> PathBuf {
+            assert!(parent_length >= 1, "test parent path must have a root");
+            PathBuf::from("/")
+                .join("p".repeat(parent_length - 1))
+                .join("control.sock")
+        }
+
+        #[test]
+        fn control_socket_path_honors_configured_path() {
+            if std::env::var_os(CHILD_ENV).is_none() {
+                let executable = std::env::current_exe().expect("test executable path must exist");
+                let status = Command::new(executable)
+                    .arg("--exact")
+                    .arg("control_socket::tests::control_socket_path_security_publication_peer_authorization_tests::control_socket_path_honors_configured_path")
+                    .arg("--nocapture")
+                    .env(CHILD_ENV, "configured-path")
+                    .env(CONTROL_SOCKET_ENV, TEST_CONTROL_PATH)
+                    .status()
+                    .expect("configured-path child test must start");
+                assert!(
+                    status.success(),
+                    "configured-path child test must pass: {status}"
+                );
+                return;
+            }
+
+            assert_eq!(
+                control_socket_path().expect("configured control path must be accepted"),
+                PathBuf::from(TEST_CONTROL_PATH)
+            );
+        }
+
+        #[test]
+        fn open_directory_fd_uses_at_fdcwd_for_relative_paths() {
+            if std::env::var_os(CHILD_ENV).is_none() {
+                let executable = std::env::current_exe().expect("test executable path must exist");
+                let status = Command::new(executable)
+                    .arg("--exact")
+                    .arg("control_socket::tests::control_socket_path_security_publication_peer_authorization_tests::open_directory_fd_uses_at_fdcwd_for_relative_paths")
+                    .arg("--nocapture")
+                    .env(CHILD_ENV, "relative-open")
+                    .status()
+                    .expect("relative-open child test must start");
+                assert!(
+                    status.success(),
+                    "relative-open child test must pass: {status}"
+                );
+                return;
+            }
+
+            // Keep the mutated positive fd unavailable in the child, so the
+            // relative pathname must use the AT_FDCWD sentinel rather than an
+            // unrelated inherited descriptor.
+            let _ = unsafe { close(100) };
+            let opened = open_directory_fd(Path::new("."))
+                .expect("AT_FDCWD must open the current directory");
+            let expected = fs::metadata(".").expect("current-directory metadata must exist");
+            let actual = opened
+                .metadata()
+                .expect("opened current-directory metadata must exist");
+            assert_eq!(
+                SocketIdentity::from_metadata(&actual),
+                SocketIdentity::from_metadata(&expected)
+            );
+        }
+
+        #[test]
+        fn configured_response_limit_accepts_literal_sixteen_kibibytes() {
+            let mut sockets = [-1; 2];
+            let result = unsafe {
+                socketpair(
+                    AF_UNIX,
+                    SOCK_SEQPACKET | SOCK_CLOEXEC,
+                    0,
+                    sockets.as_mut_ptr(),
+                )
+            };
+            assert_eq!(result, 0, "response test socketpair must be created");
+            let response = vec![b's'; 16 * 1024];
+            send_response(sockets[0], &response).expect("maximum response must be sent");
+            assert_eq!(
+                receive_response(sockets[1]).expect("the configured maximum response must fit"),
+                response
+            );
+            assert_eq!(unsafe { close(sockets[0]) }, 0);
+            assert_eq!(unsafe { close(sockets[1]) }, 0);
+        }
+
+        #[test]
+        fn metadata_at_does_not_follow_final_symlink() {
+            let target = unique_path().with_extension("metadata-target");
+            let link = unique_path().with_extension("metadata-link");
+            File::create(&target).expect("metadata target must be created");
+            symlink(&target, &link).expect("metadata symlink must be created");
+            let parent = link.parent().expect("metadata link must have a parent");
+            let parent_fd = open_directory_fd(parent).expect("metadata parent must open");
+            let name = link
+                .file_name()
+                .expect("metadata link must have a name")
+                .as_bytes();
+            let metadata = metadata_at(parent_fd.as_raw_fd(), name)
+                .expect("O_PATH|O_NOFOLLOW must inspect the symlink itself");
+            assert!(
+                metadata.file_type().is_symlink(),
+                "metadata_at must not follow a final symlink"
+            );
+            fs::remove_file(&link).expect("metadata symlink must be removed");
+            fs::remove_file(&target).expect("metadata target must be removed");
+        }
+
+        #[test]
+        fn metadata_at_accepts_a_valid_zero_descriptor() {
+            if std::env::var_os(CHILD_ENV).is_none() {
+                let executable = std::env::current_exe().expect("test executable path must exist");
+                let status = Command::new(executable)
+                    .arg("--exact")
+                    .arg("control_socket::tests::control_socket_path_security_publication_peer_authorization_tests::metadata_at_accepts_a_valid_zero_descriptor")
+                    .arg("--nocapture")
+                    .env(CHILD_ENV, "metadata-fd-zero")
+                    .status()
+                    .expect("metadata-fd-zero child test must start");
+                assert!(
+                    status.success(),
+                    "metadata-fd-zero child test must pass: {status}"
+                );
+                return;
+            }
+
+            let _ = unsafe { close(0) };
+            let stdin_keeper = File::open("/dev/null").expect("test stdin replacement must open");
+            assert_eq!(
+                stdin_keeper.as_raw_fd(),
+                0,
+                "the child must reserve descriptor zero"
+            );
+            let path = unique_path().with_extension("metadata-fd-zero");
+            File::create(&path).expect("metadata fd-zero target must be created");
+            let parent = path
+                .parent()
+                .expect("metadata fd-zero path must have a parent");
+            let parent_fd = open_directory_fd(parent).expect("metadata fd-zero parent must open");
+            assert_ne!(parent_fd.as_raw_fd(), 0);
+            let name = path
+                .file_name()
+                .expect("metadata fd-zero path must have a name")
+                .as_bytes();
+            let close_result = unsafe { close(stdin_keeper.as_raw_fd()) };
+            assert_eq!(close_result, 0, "reserved descriptor zero must close");
+            std::mem::forget(stdin_keeper);
+            let metadata = metadata_at(parent_fd.as_raw_fd(), name)
+                .expect("metadata_at must accept a valid descriptor zero");
+            assert!(metadata.is_file(), "metadata fd-zero target must be a file");
+            fs::remove_file(&path).expect("metadata fd-zero target must be removed");
+        }
+
+        #[test]
+        fn temporary_socket_path_rejects_one_byte_available() {
+            let path = path_with_parent_length(105);
+            let error = temporary_socket_path(-1, &path)
+                .expect_err("one available pathname byte is not a unique temporary name");
+            assert!(
+                error.contains("no unique temporary socket name"),
+                "error={error}"
+            );
+        }
+
+        #[test]
+        fn temporary_socket_path_enforces_two_byte_minimum() {
+            let path = path_with_parent_length(104);
+            let error = temporary_socket_path(-1, &path)
+                .expect_err("the candidate is larger than the two-byte boundary");
+            assert!(
+                error.contains("insufficient pathname space"),
+                "error={error}"
+            );
+        }
+
+        #[test]
+        fn temporary_socket_path_checks_candidate_length_strictly() {
+            let candidate_length = stable_candidate_name_length();
+            let parent_length = 106usize
+                .checked_sub(candidate_length)
+                .expect("test candidate must leave a positive parent length");
+            let path = path_with_parent_length(parent_length);
+            let error = temporary_socket_path(-1, &path)
+                .expect_err("a candidate exactly at the available length must be inspected");
+            assert!(
+                error.contains("cannot inspect temporary control socket path"),
+                "error={error}"
+            );
+        }
+
+        #[test]
+        fn temporary_socket_path_does_not_treat_non_enoent_as_free() {
+            let path = Path::new("/tmp/control.sock");
+            let error = temporary_socket_path(-1, path)
+                .expect_err("an invalid parent fd is not an available temporary pathname");
+            assert!(
+                error.contains("cannot inspect temporary control socket path"),
+                "error={error}"
+            );
+        }
+
+        #[test]
+        fn remove_socket_cleanup_distinguishes_enoent_from_other_errors() {
+            let test_name = "control_socket::tests::control_socket_path_security_publication_peer_authorization_tests::remove_socket_cleanup_child_body";
+            let non_enoent = run_child(test_name, "non-enoent");
+            assert!(
+                non_enoent.status.success(),
+                "non-ENOENT cleanup child must pass: {}",
+                String::from_utf8_lossy(&non_enoent.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&non_enoent.stderr).contains("during cleanup"),
+                "non-ENOENT metadata errors must remain observable: stderr={:?}",
+                String::from_utf8_lossy(&non_enoent.stderr)
+            );
+
+            let enoent = run_child(test_name, "enoent");
+            assert!(
+                enoent.status.success(),
+                "ENOENT cleanup child must pass: {}",
+                String::from_utf8_lossy(&enoent.stderr)
+            );
+            assert!(
+                !String::from_utf8_lossy(&enoent.stderr).contains("during cleanup"),
+                "missing cleanup paths must be silent: stderr={:?}",
+                String::from_utf8_lossy(&enoent.stderr)
+            );
+        }
+
+        #[test]
+        fn publish_socket_path_at_accepts_successful_rename() {
+            let path = unique_path().with_extension("published");
+            let temporary = path
+                .parent()
+                .expect("publication path must have a parent")
+                .join(format!(
+                    ".ruster-publication-success-{}",
+                    NEXT_TEST_SOCKET.fetch_add(1, Ordering::Relaxed)
+                ));
+            File::create(&temporary).expect("publication temporary file must be created");
+            let parent = path.parent().expect("publication path must have a parent");
+            let parent_fd = open_directory_fd(parent).expect("publication parent must open");
+            let temporary_name = temporary
+                .file_name()
+                .expect("publication temporary file must have a name")
+                .as_bytes();
+            let file_name = path
+                .file_name()
+                .expect("publication destination must have a name")
+                .as_bytes();
+            publish_socket_path_at(parent_fd.as_raw_fd(), temporary_name, file_name)
+                .expect("a successful renameat2 must be reported as success");
+            assert!(path.exists(), "published destination must exist");
+            assert!(!temporary.exists(), "published temporary name must be gone");
+            fs::remove_file(&path).expect("published destination must be removed");
+        }
+
+        #[test]
+        fn publish_socket_path_at_preserves_negative_rename_errors() {
+            let destination = unique_path().with_extension("missing-source-destination");
+            let parent = destination
+                .parent()
+                .expect("missing-source destination must have a parent");
+            let parent_fd = open_directory_fd(parent).expect("publication parent must open");
+            let destination_name = destination
+                .file_name()
+                .expect("missing-source destination must have a name")
+                .as_bytes();
+            let error = publish_socket_path_at(
+                parent_fd.as_raw_fd(),
+                b"ruster-control-source-that-does-not-exist",
+                destination_name,
+            )
+            .expect_err("a negative rename result must remain an error");
+            assert_eq!(error.raw_os_error(), Some(ENOENT), "error={error}");
+            assert!(
+                !destination.exists(),
+                "a failed publication must not create the destination"
+            );
+        }
+
+        #[test]
+        fn prepare_socket_path_rejects_non_enoent_inspection_error() {
+            let path = Path::new("/tmp/control.sock");
+            let address = ControlAddress::from_path(path).expect("prepare path must be valid");
+            let error = prepare_socket_path(-1, b"control.sock", path, address)
+                .expect_err("an invalid parent fd must not look like an absent path");
+            assert!(
+                error.contains("cannot inspect control socket path"),
+                "error={error}"
+            );
+        }
+
+        #[test]
+        fn peer_credentials_accepts_the_kernel_sized_ucred() {
+            let mut sockets = [-1; 2];
+            let result =
+                unsafe { socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets.as_mut_ptr()) };
+            assert_eq!(result, 0, "SO_PEERCRED test socketpair must be created");
+            let credentials = match peer_credentials(sockets[0]) {
+                Ok(credentials) => credentials,
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                    println!("control socket test skipped: sandbox denies SO_PEERCRED: {error}");
+                    let _ = unsafe { close(sockets[0]) };
+                    let _ = unsafe { close(sockets[1]) };
+                    return;
+                }
+                Err(error) => panic!("SO_PEERCRED must accept the kernel-sized ucred: {error}"),
+            };
+            assert_eq!(credentials.uid, unsafe { geteuid() });
+            assert_eq!(credentials.gid, unsafe { getegid() });
+            assert_eq!(unsafe { close(sockets[0]) }, 0);
+            assert_eq!(unsafe { close(sockets[1]) }, 0);
+        }
+
+        #[test]
+        fn remove_socket_cleanup_child_body() {
+            let Some(mode) = std::env::var_os(CHILD_ENV) else {
+                return;
+            };
+            match mode.to_string_lossy().as_ref() {
+                "non-enoent" => {
+                    remove_socket_if_identity_at(
+                        -1,
+                        Path::new("/tmp/control-cleanup-invalid-parent.sock"),
+                        b"control.sock",
+                        SocketIdentity {
+                            device: 0,
+                            inode: 0,
+                        },
+                    );
+                }
+                "enoent" => {
+                    let path = unique_path().with_extension("cleanup-missing");
+                    let parent = path.parent().expect("cleanup path must have a parent");
+                    let parent_fd = open_directory_fd(parent).expect("cleanup parent must open");
+                    let name = path
+                        .file_name()
+                        .expect("cleanup path must have a name")
+                        .as_bytes();
+                    remove_socket_if_identity_at(
+                        parent_fd.as_raw_fd(),
+                        &path,
+                        name,
+                        SocketIdentity {
+                            device: 0,
+                            inode: 0,
+                        },
+                    );
+                }
+                value => panic!("unknown cleanup child mode {value:?}"),
+            }
+        }
+    }
+
     #[test]
     fn authorization_predicate_matches_uid_gid_policy() {
         assert!(peer_is_authorized(0, 9999, 1000, 1001));
@@ -2357,6 +2768,753 @@ mod tests {
         let _ = unsafe { close(fd) };
         drop(listener);
         assert!(!path.exists());
+    }
+
+    #[cfg(test)]
+    mod control_socket_probe_listener_request_tests {
+        use super::*;
+        use std::{
+            cell::Cell,
+            io::{Read, Write},
+            os::{
+                fd::{AsRawFd, IntoRawFd},
+                unix::net::{UnixListener, UnixStream},
+            },
+            process::{self, Command, Output},
+            thread,
+        };
+
+        const POLLIN: std::ffi::c_short = 0x0001;
+        const SIGUSR1: std::ffi::c_int = 10;
+        const ENOTSOCK: i32 = 88;
+
+        static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct TestSigSet {
+            values: [u64; 16],
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct TestSigAction {
+            handler: usize,
+            mask: TestSigSet,
+            flags: usize,
+            restorer: usize,
+        }
+
+        unsafe extern "C" {
+            fn pipe(file_descriptors: *mut std::ffi::c_int) -> std::ffi::c_int;
+            fn pthread_kill(thread: usize, signal: std::ffi::c_int) -> std::ffi::c_int;
+            fn pthread_self() -> usize;
+            fn __errno_location() -> *mut std::ffi::c_int;
+            fn sigaction(
+                signal: std::ffi::c_int,
+                action: *const TestSigAction,
+                old_action: *mut TestSigAction,
+            ) -> std::ffi::c_int;
+        }
+
+        extern "C" fn test_signal_handler(_: std::ffi::c_int) {}
+
+        fn workspace_target() -> PathBuf {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("cli manifest must have a crates parent")
+                .parent()
+                .expect("workspace crates directory must have a root")
+                .join("target")
+        }
+
+        fn case_path(label: &str) -> PathBuf {
+            workspace_target().join(format!(
+                ".ruster-control-{label}-{}-{}.sock",
+                process::id(),
+                NEXT_CASE.fetch_add(1, Ordering::Relaxed)
+            ))
+        }
+
+        fn synthetic_listener(path: &Path) -> (ControlListener, UnixStream) {
+            let (listener_socket, peer) =
+                UnixStream::pair().expect("listener socketpair must open");
+            let parent = path.parent().expect("synthetic path must have a parent");
+            let parent_fd = open_directory_fd(parent).expect("synthetic parent must open");
+            let file_name = path
+                .file_name()
+                .expect("synthetic path must have a file name")
+                .as_bytes()
+                .to_vec();
+            let listener = ControlListener {
+                fd: listener_socket.into_raw_fd(),
+                path: path.to_owned(),
+                file_name,
+                parent_fd,
+                identity: SocketIdentity {
+                    device: 0,
+                    inode: 0,
+                },
+                daemon_uid: unsafe { geteuid() },
+                daemon_gid: unsafe { getegid() },
+                clients: Vec::new(),
+            };
+            (listener, peer)
+        }
+
+        fn child_output(test_name: &str, marker: &str) -> Output {
+            let executable = std::env::current_exe().expect("test executable must exist");
+            Command::new(executable)
+                .arg("--exact")
+                .arg(format!(
+                    "control_socket::tests::control_socket_probe_listener_request_tests::{test_name}"
+                ))
+                .arg("--nocapture")
+                .env(marker, "1")
+                .output()
+                .expect("isolated control socket child must start")
+        }
+
+        fn install_nonrestarting_signal_handler() {
+            let action = TestSigAction {
+                handler: test_signal_handler as *const () as usize,
+                mask: TestSigSet { values: [0; 16] },
+                flags: 0,
+                restorer: 0,
+            };
+            // SAFETY: action is initialized for the Linux sigaction ABI and
+            // omits SA_RESTART so blocking calls expose EINTR.
+            let result = unsafe { sigaction(SIGUSR1, &action, ptr::null_mut()) };
+            assert_eq!(result, 0, "SIGUSR1 handler installation must succeed");
+        }
+
+        fn signal_current_thread_after(delay: Duration) -> thread::JoinHandle<()> {
+            // SAFETY: pthread_self returns the current test thread identifier.
+            let target = unsafe { pthread_self() };
+            thread::spawn(move || {
+                thread::sleep(delay);
+                // SAFETY: target remains live while the caller is blocked.
+                let result = unsafe { pthread_kill(target, SIGUSR1) };
+                assert_eq!(result, 0, "test signal must reach the blocked thread");
+            })
+        }
+
+        fn fill_until_would_block(stream: &mut UnixStream) -> bool {
+            stream
+                .set_nonblocking(true)
+                .expect("test stream must become nonblocking");
+            let chunk = [0_u8; 16 * 1024];
+            let mut wrote = 0;
+            loop {
+                match stream.write(&chunk) {
+                    Ok(length) => wrote += length,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if matches!(error.raw_os_error(), Some(1 | 13)) => {
+                        println!("control socket test skipped: stream writes unavailable: {error}");
+                        return false;
+                    }
+                    Err(error) => panic!("test stream fill must reach WouldBlock: {error}"),
+                }
+            }
+            assert!(wrote > 0, "test stream send buffer must accept some bytes");
+            true
+        }
+
+        fn drain_after(delay: Duration, mut stream: UnixStream) -> thread::JoinHandle<()> {
+            thread::spawn(move || {
+                thread::sleep(delay);
+                stream
+                    .set_nonblocking(true)
+                    .expect("draining stream must become nonblocking");
+                let mut buffer = [0_u8; 16 * 1024];
+                loop {
+                    match stream.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(_) => {}
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("test stream drain must read: {error}"),
+                    }
+                }
+            })
+        }
+
+        fn unix_stream_writes_allowed() -> bool {
+            let (mut sender, receiver) =
+                UnixStream::pair().expect("write capability pair must open");
+            match sender.write(b"probe") {
+                Ok(length) => {
+                    assert_eq!(length, 5, "write capability probe must be complete");
+                    drop(receiver);
+                    true
+                }
+                Err(error) if matches!(error.raw_os_error(), Some(1 | 13)) => {
+                    println!("control socket test skipped: stream writes unavailable: {error}");
+                    false
+                }
+                Err(error) => panic!("write capability probe must succeed: {error}"),
+            }
+        }
+
+        fn build_cmsg(level: std::ffi::c_int, kind: std::ffi::c_int, data: &[RawFd]) -> Vec<u8> {
+            let data_len = data
+                .len()
+                .checked_mul(std::mem::size_of::<std::ffi::c_int>())
+                .expect("test cmsg data length must fit");
+            let cmsg_len = std::mem::size_of::<CmsgHdr>() + data_len;
+            let aligned_len = cmsg_align(cmsg_len).expect("test cmsg length must align");
+            let mut control = vec![0_u8; aligned_len];
+            let header = CmsgHdr {
+                cmsg_len,
+                cmsg_level: level,
+                cmsg_type: kind,
+            };
+            // SAFETY: control has room for its complete cmsg header and data.
+            unsafe {
+                ptr::write_unaligned(control.as_mut_ptr().cast::<CmsgHdr>(), header);
+            }
+            for (index, fd) in data.iter().copied().enumerate() {
+                let offset =
+                    std::mem::size_of::<CmsgHdr>() + index * std::mem::size_of::<std::ffi::c_int>();
+                // SAFETY: each integer offset lies in the allocated cmsg data
+                // area and unaligned writes match the ancillary ABI.
+                unsafe {
+                    ptr::write_unaligned(
+                        control.as_mut_ptr().add(offset).cast::<std::ffi::c_int>(),
+                        fd,
+                    );
+                }
+            }
+            control
+        }
+
+        fn assert_closed(fd: RawFd, message: &str) {
+            // SAFETY: ownership of this test descriptor is transferred here.
+            assert_eq!(unsafe { close(fd) }, -1, "{message}");
+        }
+
+        #[test]
+        fn publish_socket_path_at_reports_missing_temporary_name() {
+            let parent = workspace_target();
+            let parent_fd = open_directory_fd(&parent).expect("publication parent must open");
+            let error = publish_socket_path_at(
+                parent_fd.as_raw_fd(),
+                b".ruster-publication-source-does-not-exist",
+                b".ruster-publication-destination-does-not-exist",
+            )
+            .expect_err("rename of a missing temporary name must fail");
+            assert!(
+                matches!(error.raw_os_error(), Some(ENOENT | 1 | 13)),
+                "missing temporary name must remain an observable rename error: {error}"
+            );
+        }
+
+        #[test]
+        fn connect_probe_accepts_fd_zero_and_reaches_connect() {
+            const MARKER: &str = "RUSTER_CONTROL_PROBE_FD_ZERO_CHILD";
+            if std::env::var_os(MARKER).is_none() {
+                let output =
+                    child_output("connect_probe_accepts_fd_zero_and_reaches_connect", MARKER);
+                assert!(
+                    output.status.success(),
+                    "fd-zero probe child failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+
+            assert_eq!(unsafe { close(0) }, 0, "child stdin must be closed");
+            // SAFETY: errno is a writable thread-local libc slot used only to
+            // make the mutated early-return path distinguishable.
+            unsafe { *__errno_location() = 123 };
+            let address = ControlAddress::from_path(&case_path("probe-fd-zero"))
+                .expect("probe path must be valid");
+            match connect_probe_outcome(address, SOCK_SEQPACKET, || false) {
+                ConnectProbeOutcome::Failed(error) => {
+                    assert!(
+                        matches!(error.raw_os_error(), Some(ENOENT | 1)),
+                        "absent endpoint must report ENOENT or sandbox EPERM: {error}"
+                    );
+                }
+                _ => panic!("absent endpoint must report connect failure"),
+            }
+        }
+
+        #[test]
+        fn connect_probe_connected_path_checks_stop_after_connect() {
+            let path = case_path("probe-stop-after-connect");
+            let listener = match UnixListener::bind(&path) {
+                Ok(listener) => listener,
+                Err(error) if matches!(error.raw_os_error(), Some(1 | 13)) => {
+                    println!("control socket test skipped: pathname bind unavailable: {error}");
+                    return;
+                }
+                Err(error) => panic!("probe listener must bind: {error}"),
+            };
+            let address = ControlAddress::from_path(&path).expect("probe path must be valid");
+            let calls = Cell::new(0);
+            let result = connect_probe_outcome(address, SOCK_STREAM, || {
+                let call = calls.get();
+                calls.set(call + 1);
+                call != 0
+            });
+            match result {
+                ConnectProbeOutcome::Conservative(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                }
+                _ => panic!("stop after a completed connect must be conservative"),
+            }
+            drop(listener);
+        }
+
+        #[test]
+        fn connect_probe_connected_path_requires_deadline_to_be_unexpired() {
+            let path = case_path("probe-deadline");
+            let listener = match UnixListener::bind(&path) {
+                Ok(listener) => listener,
+                Err(error) if matches!(error.raw_os_error(), Some(1 | 13)) => {
+                    println!("control socket test skipped: pathname bind unavailable: {error}");
+                    return;
+                }
+                Err(error) => panic!("probe listener must bind: {error}"),
+            };
+            let address = ControlAddress::from_path(&path).expect("probe path must be valid");
+            assert!(
+                matches!(
+                    connect_probe_outcome(address, SOCK_STREAM, || false),
+                    ConnectProbeOutcome::Connected
+                ),
+                "a live listener must be reported as connected before the deadline"
+            );
+            drop(listener);
+        }
+
+        #[test]
+        fn wait_for_probe_connect_accepts_connected_socket_pollout() {
+            let (socket, peer) = UnixStream::pair().expect("connected probe pair must open");
+            let result = wait_for_probe_connect(
+                socket.as_raw_fd(),
+                Instant::now() + Duration::from_secs(1),
+                || false,
+            );
+            match result {
+                ConnectProbeOutcome::Connected => {}
+                ConnectProbeOutcome::Conservative(error)
+                    if matches!(error.raw_os_error(), Some(1 | 13)) =>
+                {
+                    println!("control socket test skipped: SO_ERROR unavailable: {error}");
+                    return;
+                }
+                _ => panic!("a writable connected socket must report Connected"),
+            }
+            drop(peer);
+        }
+
+        #[test]
+        fn wait_for_probe_connect_rejects_invalid_descriptor_without_polling_as_timeout() {
+            let (socket, peer) = UnixStream::pair().expect("invalid-fd probe pair must open");
+            let fd = socket.into_raw_fd();
+            drop(peer);
+            assert_eq!(
+                unsafe { close(fd) },
+                0,
+                "probe fd must close before polling"
+            );
+            match wait_for_probe_connect(fd, Instant::now() + Duration::from_secs(1), || false) {
+                ConnectProbeOutcome::Conservative(error) => {
+                    assert!(error.to_string().contains("invalid descriptor"));
+                }
+                _ => panic!("POLLNVAL must be conservative"),
+            }
+        }
+
+        #[test]
+        fn wait_for_probe_connect_treats_poll_timeout_as_conservative() {
+            let (mut socket, peer) = UnixStream::pair().expect("timeout probe pair must open");
+            if !fill_until_would_block(&mut socket) {
+                drop(peer);
+                return;
+            }
+            let _ = unsafe { close(-1) };
+            let result = wait_for_probe_connect(
+                socket.as_raw_fd(),
+                Instant::now() + Duration::from_millis(15),
+                || false,
+            );
+            match result {
+                ConnectProbeOutcome::Conservative(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                }
+                _ => panic!("a poll timeout must be conservative"),
+            }
+            drop(peer);
+        }
+
+        #[test]
+        fn wait_for_probe_connect_ignores_pollin_without_requested_events() {
+            let (mut socket, mut peer) =
+                UnixStream::pair().expect("unrequested-event probe pair must open");
+            if !fill_until_would_block(&mut socket) {
+                drop(peer);
+                return;
+            }
+            peer.write_all(b"incoming")
+                .expect("probe peer must provide POLLIN");
+            let mut poll_fd = PollFd {
+                fd: socket.as_raw_fd(),
+                events: POLLOUT,
+                revents: 0,
+            };
+            let polled = unsafe { poll(&mut poll_fd, 1, 0) };
+            assert_eq!(polled, 1, "probe setup must produce a poll event");
+            assert_eq!(
+                poll_fd.revents & POLLOUT,
+                0,
+                "probe setup must suppress POLLOUT"
+            );
+            assert_ne!(
+                poll_fd.revents & POLLIN,
+                0,
+                "probe setup must produce POLLIN"
+            );
+
+            let result = wait_for_probe_connect(
+                socket.as_raw_fd(),
+                Instant::now() + Duration::from_millis(15),
+                || false,
+            );
+            match result {
+                ConnectProbeOutcome::Conservative(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                }
+                _ => panic!("unrequested POLLIN must not complete a probe"),
+            }
+        }
+
+        #[test]
+        fn wait_for_probe_connect_processes_pollerr_as_a_socket_error() {
+            let mut descriptors = [-1; 2];
+            assert_eq!(
+                unsafe { pipe(descriptors.as_mut_ptr()) },
+                0,
+                "probe error pipe must open"
+            );
+            assert_eq!(
+                unsafe { close(descriptors[0]) },
+                0,
+                "probe read end must close"
+            );
+            let result = wait_for_probe_connect(
+                descriptors[1],
+                Instant::now() + Duration::from_millis(100),
+                || false,
+            );
+            assert!(
+                matches!(
+                    result,
+                    ConnectProbeOutcome::Conservative(error)
+                        if matches!(error.raw_os_error(), Some(ENOTSOCK | 1 | 13))
+                ),
+                "POLLERR must reach SO_ERROR handling"
+            );
+            let _ = unsafe { close(descriptors[1]) };
+        }
+
+        #[test]
+        fn wait_for_probe_connect_retries_poll_eintr() {
+            const MARKER: &str = "RUSTER_CONTROL_WAIT_POLL_EINTR_CHILD";
+            if std::env::var_os(MARKER).is_none() {
+                let output = child_output("wait_for_probe_connect_retries_poll_eintr", MARKER);
+                assert!(
+                    output.status.success(),
+                    "poll EINTR child failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+
+            install_nonrestarting_signal_handler();
+            let (mut socket, peer) = UnixStream::pair().expect("poll EINTR pair must open");
+            if !fill_until_would_block(&mut socket) {
+                drop(peer);
+                return;
+            }
+            let signal = signal_current_thread_after(Duration::from_millis(10));
+            let result = wait_for_probe_connect(
+                socket.as_raw_fd(),
+                Instant::now() + Duration::from_millis(50),
+                || false,
+            );
+            signal.join().expect("poll signal helper must finish");
+            drop(peer);
+            match result {
+                ConnectProbeOutcome::Conservative(error) => {
+                    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                }
+                _ => panic!("poll EINTR must be retried to the deadline"),
+            }
+        }
+
+        #[test]
+        fn process_empty_queue_returns_without_indexing_past_the_end() {
+            let path = case_path("process-empty");
+            let (mut listener, peer) = synthetic_listener(&path);
+            assert_eq!(
+                listener.process(|| "unused".to_owned()),
+                ControlProcessResult::default()
+            );
+            drop(peer);
+        }
+
+        #[test]
+        fn process_idle_client_advances_index_once() {
+            const MARKER: &str = "RUSTER_CONTROL_PROCESS_IDLE_CHILD";
+            if std::env::var_os(MARKER).is_none() {
+                let mut child = Command::new(
+                    std::env::current_exe().expect("test executable must exist"),
+                )
+                .arg("--exact")
+                .arg("control_socket::tests::control_socket_probe_listener_request_tests::process_idle_client_advances_index_once")
+                .arg("--nocapture")
+                .env(MARKER, "1")
+                .spawn()
+                .expect("idle-process child must start");
+                let deadline = Instant::now() + Duration::from_secs(1);
+                loop {
+                    if let Some(status) = child.try_wait().expect("idle child status must work") {
+                        assert!(status.success(), "idle-process child failed: {status}");
+                        return;
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("idle process did not return within one second");
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+
+            let path = case_path("process-idle");
+            let (mut listener, peer) = synthetic_listener(&path);
+            let (client, daemon) = UnixStream::pair().expect("idle client pair must open");
+            daemon
+                .set_nonblocking(true)
+                .expect("idle daemon must become nonblocking");
+            listener.clients.push(PendingClient {
+                fd: daemon.into_raw_fd(),
+                accepted_at: Instant::now(),
+            });
+            assert_eq!(listener.process(|| "unused".to_owned()).requests_seen, 0);
+            drop(client);
+            drop(peer);
+        }
+
+        #[test]
+        fn process_counts_only_eight_complete_requests_per_tick() {
+            let path = case_path("process-limit");
+            let (mut listener, peer) = synthetic_listener(&path);
+            let mut clients = Vec::new();
+            for _ in 0..(MAX_REQUESTS_PER_TICK + 1) {
+                let (client, daemon) = UnixStream::pair().expect("process client pair must open");
+                send_test_packet(client.as_raw_fd(), b"reload", &[]);
+                listener.clients.push(PendingClient {
+                    fd: daemon.into_raw_fd(),
+                    accepted_at: Instant::now(),
+                });
+                clients.push(client);
+            }
+            let result = listener.process(|| "unused".to_owned());
+            assert_eq!(result.requests_seen, MAX_REQUESTS_PER_TICK);
+            assert_eq!(listener.clients.len(), 1);
+            drop(clients);
+            drop(peer);
+        }
+
+        #[test]
+        fn close_received_fds_continues_across_complete_control_messages() {
+            let source = File::open("/dev/null").expect("continuation source fd must open");
+            let first = build_cmsg(SOL_SOCKET, SCM_RIGHTS + 1, &[]);
+            let second = build_cmsg(SOL_SOCKET, SCM_RIGHTS, &[source.as_raw_fd()]);
+            let mut control = first;
+            control.extend_from_slice(&second);
+            close_received_fds(&control);
+            assert_closed(
+                source.as_raw_fd(),
+                "the second complete SCM_RIGHTS message must be closed",
+            );
+            std::mem::forget(source);
+        }
+
+        #[test]
+        fn close_received_fds_stops_on_a_short_cmsg_header() {
+            let header_len = std::mem::size_of::<CmsgHdr>();
+            let mut control = vec![0_u8; header_len];
+            let header = CmsgHdr {
+                cmsg_len: header_len - 1,
+                cmsg_level: SOL_SOCKET,
+                cmsg_type: SCM_RIGHTS,
+            };
+            // SAFETY: control is exactly large enough for this malformed header.
+            unsafe { ptr::write_unaligned(control.as_mut_ptr().cast::<CmsgHdr>(), header) };
+            close_received_fds(&control);
+        }
+
+        #[test]
+        fn send_response_returns_eagain_for_a_full_nonblocking_socket() {
+            let (mut sender, receiver) = UnixStream::pair().expect("response pair must open");
+            if !fill_until_would_block(&mut sender) {
+                return;
+            }
+            let drain = drain_after(Duration::from_millis(25), receiver);
+            let error = send_response(sender.as_raw_fd(), b"response")
+                .expect_err("a nonblocking full response socket must return EAGAIN");
+            drain.join().expect("response drain helper must finish");
+            assert_eq!(error.raw_os_error(), Some(EAGAIN));
+        }
+
+        #[test]
+        fn send_response_retries_one_eintr_before_success() {
+            const MARKER: &str = "RUSTER_CONTROL_SEND_RESPONSE_EINTR_CHILD";
+            if std::env::var_os(MARKER).is_none() {
+                let output = child_output("send_response_retries_one_eintr_before_success", MARKER);
+                assert!(
+                    output.status.success(),
+                    "send_response EINTR child failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+
+            install_nonrestarting_signal_handler();
+            let (mut sender, receiver) = UnixStream::pair().expect("response EINTR pair must open");
+            if !fill_until_would_block(&mut sender) {
+                return;
+            }
+            sender
+                .set_nonblocking(false)
+                .expect("response sender must become blocking");
+            let signal = signal_current_thread_after(Duration::from_millis(10));
+            let drain = drain_after(Duration::from_millis(35), receiver);
+            let result = send_response(sender.as_raw_fd(), b"response");
+            signal.join().expect("response signal helper must finish");
+            drain.join().expect("response drain helper must finish");
+            assert!(result.is_ok(), "one EINTR must be retried");
+        }
+
+        #[test]
+        fn receive_response_retries_eintr_before_reading_payload() {
+            const MARKER: &str = "RUSTER_CONTROL_RECEIVE_RESPONSE_EINTR_CHILD";
+            if std::env::var_os(MARKER).is_none() {
+                let output = child_output(
+                    "receive_response_retries_eintr_before_reading_payload",
+                    MARKER,
+                );
+                assert!(
+                    output.status.success(),
+                    "receive_response EINTR child failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+
+            install_nonrestarting_signal_handler();
+            if !unix_stream_writes_allowed() {
+                return;
+            }
+            let (receiver, mut sender) =
+                UnixStream::pair().expect("response receive pair must open");
+            let signal = signal_current_thread_after(Duration::from_millis(10));
+            let writer = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(35));
+                sender
+                    .write_all(b"response")
+                    .expect("response payload must be written");
+            });
+            let result = receive_response(receiver.as_raw_fd());
+            signal.join().expect("receive signal helper must finish");
+            writer.join().expect("response writer must finish");
+            assert_eq!(result.expect("EINTR response must be retried"), b"response");
+        }
+
+        #[test]
+        fn request_path_accepts_a_request_at_the_exact_size_limit() {
+            let path = case_path("request-exact-limit");
+            let error = request_path(&path, &[b'x'; MAX_REQUEST_BYTES])
+                .expect_err("absent endpoint must fail after exact-size validation");
+            assert!(
+                !error.contains("too long"),
+                "exactly MAX_REQUEST_BYTES must reach connect, error={error}"
+            );
+        }
+
+        #[test]
+        fn request_path_accepts_client_fd_zero_before_connecting() {
+            const MARKER: &str = "RUSTER_CONTROL_REQUEST_FD_ZERO_CHILD";
+            if std::env::var_os(MARKER).is_none() {
+                let output = child_output(
+                    "request_path_accepts_client_fd_zero_before_connecting",
+                    MARKER,
+                );
+                assert!(
+                    output.status.success(),
+                    "request fd-zero child failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+
+            assert_eq!(unsafe { close(0) }, 0, "child stdin must be closed");
+            // SAFETY: errno is a writable thread-local libc slot used only to
+            // make the mutated early-return path distinguishable.
+            unsafe { *__errno_location() = 123 };
+            let error = request_path(&case_path("request-fd-zero"), b"status")
+                .expect_err("absent endpoint must fail at connect, not socket creation");
+            assert!(error.contains("cannot connect"), "error={error}");
+        }
+
+        #[test]
+        fn send_client_request_returns_eagain_for_a_full_nonblocking_socket() {
+            let (mut sender, receiver) = UnixStream::pair().expect("request pair must open");
+            if !fill_until_would_block(&mut sender) {
+                return;
+            }
+            let drain = drain_after(Duration::from_millis(25), receiver);
+            let error = send_client_request(sender.as_raw_fd(), b"request")
+                .expect_err("a nonblocking full request socket must return EAGAIN");
+            drain.join().expect("request drain helper must finish");
+            assert_eq!(error.raw_os_error(), Some(EAGAIN));
+        }
+
+        #[test]
+        fn send_client_request_retries_one_eintr_before_success() {
+            const MARKER: &str = "RUSTER_CONTROL_SEND_CLIENT_EINTR_CHILD";
+            if std::env::var_os(MARKER).is_none() {
+                let output = child_output(
+                    "send_client_request_retries_one_eintr_before_success",
+                    MARKER,
+                );
+                assert!(
+                    output.status.success(),
+                    "send_client_request EINTR child failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                return;
+            }
+
+            install_nonrestarting_signal_handler();
+            let (mut sender, receiver) = UnixStream::pair().expect("request EINTR pair must open");
+            if !fill_until_would_block(&mut sender) {
+                return;
+            }
+            sender
+                .set_nonblocking(false)
+                .expect("request sender must become blocking");
+            let signal = signal_current_thread_after(Duration::from_millis(10));
+            let drain = drain_after(Duration::from_millis(35), receiver);
+            let result = send_client_request(sender.as_raw_fd(), b"request");
+            signal.join().expect("request signal helper must finish");
+            drain.join().expect("request drain helper must finish");
+            assert!(result.is_ok(), "one EINTR must be retried");
+        }
     }
 
     #[test]

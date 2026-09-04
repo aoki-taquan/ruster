@@ -3662,6 +3662,273 @@ completion = 4
         );
     }
 
+    #[cfg(test)]
+    mod af_xdp_setup_resource_ownership_tests {
+        use super::super::{
+            activate_initial, build_xdp_setup_transaction, ActiveConfigIdentity,
+            FullServiceRuntimeStorage, PlanInputGenerator, ValidatedBackendV1, XdpSetupGuard,
+        };
+        use super::{af_xdp_reload_test_source, planned_test_candidate};
+
+        fn production_source() -> &'static str {
+            include_str!("../src/main.rs")
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .expect("the production source must precede the test module")
+                .0
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        ))]
+        fn run_aligned_xdp_setup_with_invalid_device() -> String {
+            let source = af_xdp_reload_test_source().replace(
+                "device = \"eth1\"",
+                "device = \"ruster-no-such-xdp-device\"",
+            );
+            let candidate = planned_test_candidate(&source, 1, 100);
+            let backend = match candidate.backend() {
+                ValidatedBackendV1::AfXdp(backend) => backend.clone(),
+                ValidatedBackendV1::AfPacket => unreachable!("fixture selects AF_XDP"),
+            };
+            let mut storage = FullServiceRuntimeStorage::try_for_candidate(&candidate)
+                .expect("AF_XDP fixture storage must allocate");
+            let publication = match activate_initial(&mut storage, candidate) {
+                Ok(publication) => publication,
+                Err(_) => panic!("AF_XDP fixture publication must activate"),
+            };
+            super::super::run_xdp_backend(
+                "unused-config-path",
+                std::time::Duration::ZERO,
+                0,
+                0,
+                PlanInputGenerator::open().expect("system entropy must be available"),
+                ActiveConfigIdentity::from_source(source.into_bytes()),
+                publication,
+                backend,
+            )
+            .expect_err("the invalid device must stop setup before the run loop")
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        ))]
+        #[test]
+        fn aligned_umem_reaches_setup_instead_of_page_remainder_error() {
+            // Protects all three operators at main.rs:1109.  The fixture's
+            // 4,096-byte UMEM is page-aligned; an unresolvable device then
+            // provides a deterministic, unprivileged stop after that check.
+            let error = run_aligned_xdp_setup_with_invalid_device();
+            assert!(
+                error.contains("cannot resolve interface \"ruster-no-such-xdp-device\""),
+                "aligned setup must reach the invalid-device path: {error}"
+            );
+        }
+
+        #[test]
+        fn unsupported_xdp_wrapper_retains_fail_closed_result() {
+            // Protects main.rs:1276.  The native profile is cfg-excluded on
+            // unsupported targets, so inspect only the production function and
+            // ensure its result is still an explicit error rather than Ok(()).
+            let source = production_source();
+            let unsupported = source
+                .rsplit_once("fn run_xdp_backend<'storage>(")
+                .expect("the unsupported AF_XDP wrapper must exist")
+                .1;
+            assert!(
+                unsupported
+                    .contains("Err(\"AF_XDP live backend requires 64-bit x86 Linux\".to_owned())"),
+                "unsupported AF_XDP must remain fail-closed"
+            );
+        }
+
+        #[test]
+        fn xdp_ownership_hooks_are_not_noops() {
+            // The kernel-backed map/program/attachment types intentionally have
+            // no safe fake constructors in this crate. These production-only
+            // assertions therefore verify the exact ownership operations without
+            // fabricating kernel handles or requiring CAP_BPF/CAP_NET_ADMIN.
+            let source = production_source();
+
+            let cold_push = source
+                .split_once("fn push(&mut self, map: XskMap")
+                .expect("XdpColdOwner::push must exist")
+                .1
+                .split_once("\n    fn detach(")
+                .expect("XdpColdOwner::push must precede detach")
+                .0;
+            assert!(cold_push.contains("self.maps.push(map)"));
+            assert!(cold_push.contains("self.programs.push(program)"));
+            assert!(cold_push.contains("self.attachments.push(attachment)"));
+
+            let cold_close = source
+                .split_once("fn close_program_and_map(&mut self) -> Result<(), String>")
+                .expect("XdpColdOwner::close_program_and_map must exist")
+                .1
+                .split_once("\n    fn cleanup_all(")
+                .expect("close_program_and_map must precede cleanup_all")
+                .0;
+            assert!(cold_close.contains("self.programs.drain(..)"));
+            assert!(cold_close.contains("self.maps.drain(..)"));
+            assert!(cold_close.contains("first_error.map_or(Ok(()), Err)"));
+
+            assert!(
+                source.contains("merge_unit_results(self.detach(), self.close_program_and_map())")
+            );
+
+            let cold_drop = source
+                .split_once("impl Drop for XdpColdOwner")
+                .expect("XdpColdOwner::drop must exist")
+                .1
+                .split_once("struct XdpSetupGuard")
+                .expect("XdpColdOwner::drop must precede XdpSetupGuard")
+                .0;
+            assert!(cold_drop.contains("self.detach()"));
+            assert!(cold_drop.contains("self.close_program_and_map()"));
+
+            let setup_push = source
+                .split_once("fn push(\n        &mut self,\n        resource: XdpResource<'umem>,")
+                .expect("XdpSetupGuard::push must exist")
+                .1
+                .split_once("\n    fn into_parts(")
+                .expect("XdpSetupGuard::push must precede into_parts")
+                .0;
+            assert!(setup_push.contains(".push(resource)"));
+            assert!(setup_push.contains(".push(map, program, attachment)"));
+
+            assert!(source.contains(
+                "merge_unit_results(\n            detach_result,\n            merge_unit_results(\n                pair_drop_result,\n                merge_unit_results(resource_drop_result, close_result),\n            ),\n        )"
+            ));
+
+            let setup_drop = source
+                .split_once("impl Drop for XdpSetupGuard<'_>")
+                .expect("XdpSetupGuard::drop must exist")
+                .1
+                .split_once("fn build_xdp_setup<'umem>(")
+                .expect("XdpSetupGuard::drop must precede setup construction")
+                .0;
+            assert!(setup_drop.contains("self.cleanup()"));
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        ))]
+        #[test]
+        fn setup_guard_fail_preserves_original_setup_error() {
+            // Protects main.rs:1426.  An empty guard has no kernel handles, so
+            // cleanup succeeds and fail() must return the caller's exact error.
+            let error = XdpSetupGuard::with_capacity(0).fail("original setup error".to_owned());
+            assert_eq!(error, "original setup error");
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        ))]
+        fn xdp_backend_for_invalid_setup() -> ruster_config::ValidatedAfXdpBackendV1 {
+            let source = af_xdp_reload_test_source().replace(
+                "device = \"eth1\"",
+                "device = \"ruster-no-such-xdp-device\"",
+            );
+            let candidate = planned_test_candidate(&source, 2, 200);
+            match candidate.backend() {
+                ValidatedBackendV1::AfXdp(backend) => backend.clone(),
+                ValidatedBackendV1::AfPacket => unreachable!("fixture selects AF_XDP"),
+            }
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        ))]
+        #[test]
+        fn setup_transaction_rejects_wrong_resource_count_before_setup() {
+            // Protects main.rs:1515 and the resource-count guard at 1516.
+            let backend = xdp_backend_for_invalid_setup();
+            let mut first = [0_u8; 4_096];
+            let mut second = [0_u8; 4_096];
+            let mut setup = XdpSetupGuard::with_capacity(0);
+            let error = build_xdp_setup_transaction(
+                &mut setup,
+                &mut first,
+                &mut second,
+                4_096,
+                &[],
+                &backend,
+            )
+            .expect_err("a resource transaction must require exactly two resources");
+            assert_eq!(
+                error,
+                "AF_XDP resource pair requires exactly two resources, got 0"
+            );
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        ))]
+        #[test]
+        fn setup_transaction_rejects_first_memory_length_mismatch() {
+            // Protects the first comparison at main.rs:1523 and the `||`
+            // join. The second slice is correct, so changing the first `!=` or
+            // replacing `||` must incorrectly enter device setup.
+            let backend = xdp_backend_for_invalid_setup();
+            let mut first = [0_u8; 2_048];
+            let mut second = [0_u8; 4_096];
+            let mut setup = XdpSetupGuard::with_capacity(2);
+            let error = build_xdp_setup_transaction(
+                &mut setup,
+                &mut first,
+                &mut second,
+                4_096,
+                backend.resources(),
+                &backend,
+            )
+            .expect_err("the first UMEM slice length must be checked");
+            assert_eq!(
+                error,
+                "AF_XDP page-aligned UMEM length mismatch: first=2048 second=4096 expected=4096"
+            );
+        }
+
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        ))]
+        #[test]
+        fn setup_transaction_rejects_second_memory_length_mismatch() {
+            // Protects the second comparison at main.rs:1523 and the `||`
+            // join. The first slice is correct, so changing the second `!=`
+            // or replacing `||` must incorrectly enter device setup.
+            let backend = xdp_backend_for_invalid_setup();
+            let mut first = [0_u8; 4_096];
+            let mut second = [0_u8; 2_048];
+            let mut setup = XdpSetupGuard::with_capacity(2);
+            let error = build_xdp_setup_transaction(
+                &mut setup,
+                &mut first,
+                &mut second,
+                4_096,
+                backend.resources(),
+                &backend,
+            )
+            .expect_err("the second UMEM slice length must be checked");
+            assert_eq!(
+                error,
+                "AF_XDP page-aligned UMEM length mismatch: first=4096 second=2048 expected=4096"
+            );
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn shutdown_quiescence_state_creates_only_one_deadline() {
@@ -4774,6 +5041,650 @@ completion = 4
     }
 
     #[cfg(target_os = "linux")]
+    mod mutation_remaining_backend_orchestration_tests {
+        use super::*;
+        use ruster_core::{
+            BatchCompletion, GeneratedAllocationError, GeneratedBatchCompletion,
+            GeneratedPacketBatch, GeneratedPacketIo, GeneratedPacketLease, GeneratedPacketSlot,
+            GeneratedSlotCompletion, PacketBatch, PacketLease, PacketSlot, SlotCompletion,
+        };
+        use std::{
+            env,
+            ffi::OsString,
+            path::{Path, PathBuf},
+            process::{Command, Output},
+            sync::Mutex,
+            time::Duration,
+        };
+
+        static GLOBAL_STATE_LOCK: Mutex<()> = Mutex::new(());
+        const NOTIFY_CHILD_ENV: &str = "RUSTER_CLI_NOTIFY_CHILD";
+        const RELOAD_CHILD_ENV: &str = "RUSTER_CLI_RELOAD_CHILD";
+
+        struct FlagRestore {
+            stop: bool,
+            reload: bool,
+        }
+
+        impl FlagRestore {
+            fn capture() -> Self {
+                Self {
+                    stop: STOP_REQUESTED.load(Ordering::Relaxed),
+                    reload: RELOAD_REQUESTED.load(Ordering::Relaxed),
+                }
+            }
+        }
+
+        impl Drop for FlagRestore {
+            fn drop(&mut self) {
+                STOP_REQUESTED.store(self.stop, Ordering::Relaxed);
+                RELOAD_REQUESTED.store(self.reload, Ordering::Relaxed);
+            }
+        }
+
+        struct ControlSocketEnvRestore {
+            previous: Option<OsString>,
+        }
+
+        impl ControlSocketEnvRestore {
+            fn set(path: &Path) -> Self {
+                let previous = env::var_os(control_socket::CONTROL_SOCKET_ENV);
+                env::set_var(control_socket::CONTROL_SOCKET_ENV, path);
+                Self { previous }
+            }
+        }
+
+        impl Drop for ControlSocketEnvRestore {
+            fn drop(&mut self) {
+                match &self.previous {
+                    Some(value) => env::set_var(control_socket::CONTROL_SOCKET_ENV, value),
+                    None => env::remove_var(control_socket::CONTROL_SOCKET_ENV),
+                }
+            }
+        }
+
+        struct EmptyPacketSlot;
+
+        impl PacketSlot for EmptyPacketSlot {
+            fn ingress(&self) -> ruster_core::IfId {
+                ruster_core::IfId(0)
+            }
+
+            fn bytes_mut(&mut self) -> &mut [u8] {
+                &mut []
+            }
+
+            fn complete(self, _completion: SlotCompletion) {}
+        }
+
+        struct EmptyPacketBatch<E> {
+            _error: std::marker::PhantomData<fn() -> E>,
+        }
+
+        impl<E> EmptyPacketBatch<E> {
+            const fn new() -> Self {
+                Self {
+                    _error: std::marker::PhantomData,
+                }
+            }
+        }
+
+        impl<E> PacketBatch for EmptyPacketBatch<E> {
+            type Error = E;
+            type Slot<'a>
+                = EmptyPacketSlot
+            where
+                Self: 'a;
+
+            fn next_packet(&mut self) -> Option<PacketLease<Self::Slot<'_>>> {
+                None
+            }
+
+            fn finish(self) -> BatchCompletion<Self::Error> {
+                BatchCompletion {
+                    tx_requested: 0,
+                    tx_accepted: 0,
+                    tx_rejected: 0,
+                    recycled: 0,
+                    error: None,
+                }
+            }
+        }
+
+        struct EmptyGeneratedSlot;
+
+        impl GeneratedPacketSlot for EmptyGeneratedSlot {
+            fn bytes_mut(&mut self) -> &mut [u8] {
+                &mut []
+            }
+
+            fn complete(self, _completion: GeneratedSlotCompletion) {}
+        }
+
+        struct EmptyGeneratedBatch<E> {
+            _error: std::marker::PhantomData<fn() -> E>,
+        }
+
+        impl<E> EmptyGeneratedBatch<E> {
+            const fn new() -> Self {
+                Self {
+                    _error: std::marker::PhantomData,
+                }
+            }
+        }
+
+        impl<E> GeneratedPacketBatch for EmptyGeneratedBatch<E> {
+            type Error = E;
+            type Slot<'a>
+                = EmptyGeneratedSlot
+            where
+                Self: 'a;
+
+            fn allocate(
+                &mut self,
+                _frame_len: usize,
+            ) -> Result<GeneratedPacketLease<Self::Slot<'_>>, GeneratedAllocationError>
+            {
+                Err(GeneratedAllocationError::Unavailable)
+            }
+
+            fn finish(self) -> GeneratedBatchCompletion<Self::Error> {
+                GeneratedBatchCompletion {
+                    attempts: 0,
+                    allocated: 0,
+                    failed: 0,
+                    requested: 0,
+                    cancelled: 0,
+                    abandoned: 0,
+                    accepted: 0,
+                    rejected: 0,
+                    error: None,
+                }
+            }
+        }
+
+        #[derive(Debug)]
+        struct RunBackendError;
+
+        struct RunBackendTestIo {
+            fail_first_receive: bool,
+            receive_calls: usize,
+            wait_calls: usize,
+            wait_delays: [Duration; 3],
+            stop_after_wait: Option<usize>,
+        }
+
+        impl PacketIo for RunBackendTestIo {
+            type Error = RunBackendError;
+            type Batch<'a> = EmptyPacketBatch<RunBackendError>;
+
+            fn receive(&mut self, _budget: usize) -> Result<Self::Batch<'_>, Self::Error> {
+                self.receive_calls += 1;
+                if self.fail_first_receive && self.receive_calls == 1 {
+                    Err(RunBackendError)
+                } else {
+                    Ok(EmptyPacketBatch::new())
+                }
+            }
+        }
+
+        impl GeneratedPacketIo for RunBackendTestIo {
+            type Error = RunBackendError;
+            type Batch<'a> = EmptyGeneratedBatch<RunBackendError>;
+
+            fn begin_generated(&mut self, _egress: ruster_core::IfId) -> Self::Batch<'_> {
+                EmptyGeneratedBatch::new()
+            }
+        }
+
+        impl PublicationQuiescenceBackend for RunBackendTestIo {
+            type Error = RunBackendError;
+
+            fn check_publication_quiescence(&mut self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+
+            fn current_io_disposition(&self) -> PublicationQuiescenceDisposition {
+                PublicationQuiescenceDisposition::ContinueOldIo
+            }
+
+            fn quiescence_error_disposition(
+                _error: &Self::Error,
+            ) -> PublicationQuiescenceDisposition {
+                PublicationQuiescenceDisposition::ContinueOldIo
+            }
+        }
+
+        // SAFETY: this fixture's batch and command outputs borrow no backend
+        // state and its command only updates fields on this exact value.
+        #[allow(unsafe_code)]
+        unsafe impl PublicationBackendAuthority for RunBackendTestIo {}
+
+        // SAFETY: the command retains the exact backend value and returns no
+        // alias or owned backend state.
+        #[allow(unsafe_code)]
+        unsafe impl PublicationBackendControl for RunBackendTestIo {
+            type Command = Duration;
+            type Response = Result<bool, RunBackendError>;
+
+            fn execute_publication_backend_command(
+                &mut self,
+                _command: Self::Command,
+            ) -> Self::Response {
+                self.wait_calls += 1;
+                if let Some(delay) = self.wait_delays.get(self.wait_calls - 1) {
+                    std::thread::sleep(*delay);
+                }
+                if self.stop_after_wait == Some(self.wait_calls) {
+                    STOP_REQUESTED.store(true, Ordering::Relaxed);
+                }
+                Ok(true)
+            }
+        }
+
+        #[derive(Clone, Copy, Debug)]
+        struct MixedQuiescenceError {
+            disposition: PublicationQuiescenceDisposition,
+        }
+
+        struct MixedQuiescenceIo {
+            current: PublicationQuiescenceDisposition,
+            error: PublicationQuiescenceDisposition,
+        }
+
+        impl PacketIo for MixedQuiescenceIo {
+            type Error = MixedQuiescenceError;
+            type Batch<'a> = EmptyPacketBatch<MixedQuiescenceError>;
+
+            fn receive(&mut self, _budget: usize) -> Result<Self::Batch<'_>, Self::Error> {
+                Ok(EmptyPacketBatch::new())
+            }
+        }
+
+        impl PublicationQuiescenceBackend for MixedQuiescenceIo {
+            type Error = MixedQuiescenceError;
+
+            fn check_publication_quiescence(&mut self) -> Result<(), Self::Error> {
+                Err(MixedQuiescenceError {
+                    disposition: self.error,
+                })
+            }
+
+            fn current_io_disposition(&self) -> PublicationQuiescenceDisposition {
+                self.current
+            }
+
+            fn quiescence_error_disposition(
+                error: &Self::Error,
+            ) -> PublicationQuiescenceDisposition {
+                error.disposition
+            }
+        }
+
+        // SAFETY: this fixture has no detached state or alias-producing
+        // operation; all batches borrow only the exact backend value.
+        #[allow(unsafe_code)]
+        unsafe impl PublicationBackendAuthority for MixedQuiescenceIo {}
+
+        fn run_backend_fixture(
+            io: RunBackendTestIo,
+            observability_interval: Duration,
+            initial_stop: bool,
+            initial_reload: bool,
+        ) -> (
+            Result<ObservabilityActivitySnapshot, String>,
+            usize,
+            usize,
+            bool,
+        ) {
+            let id = NEXT_RELOAD_TEST_ID.fetch_add(1, Ordering::Relaxed);
+            let socket_path = PathBuf::from(format!(
+                "/tmp/ruster-cli-backend-{}-{id}.sock",
+                std::process::id()
+            ));
+            let _socket_env = ControlSocketEnvRestore::set(&socket_path);
+            let _flags = FlagRestore::capture();
+            STOP_REQUESTED.store(initial_stop, Ordering::Relaxed);
+            RELOAD_REQUESTED.store(initial_reload, Ordering::Relaxed);
+
+            let candidate = planned_test_candidate(FULL_SERVICE_CONFIG, 1, 10);
+            let mut storage = FullServiceRuntimeStorage::try_for_candidate(&candidate)
+                .expect("backend fixture storage must be allocatable");
+            let (result, wait_calls, receive_calls, reload_after) = {
+                let owner = match activate_initial(&mut storage, candidate) {
+                    Ok(owner) => owner,
+                    Err(_) => panic!("backend fixture publication must activate"),
+                };
+                let (owner_binding, mut io) = match bind_publication_backend(io) {
+                    Ok(binding) => binding,
+                    Err(_) => panic!("backend fixture binding must be available"),
+                };
+                let mut publication = match owner.bind_backend(owner_binding, &mut io) {
+                    Ok(publication) => publication,
+                    Err(_) => panic!("backend fixture publication must bind"),
+                };
+                let mut quiescence = ShutdownQuiescenceState::default();
+                let result = run_backend(
+                    "/dev/null",
+                    observability_interval,
+                    1_000,
+                    100,
+                    PlanInputGenerator::open().expect("backend fixture entropy must be available"),
+                    ActiveConfigIdentity::from_source(FULL_SERVICE_CONFIG.as_bytes().to_vec()),
+                    &mut publication,
+                    &mut io,
+                    &mut quiescence,
+                    ObservabilityBackend::Sim,
+                );
+                let wait_calls = io.inner().wait_calls;
+                let receive_calls = io.inner().receive_calls;
+                let reload_after = RELOAD_REQUESTED.load(Ordering::Relaxed);
+                (result, wait_calls, receive_calls, reload_after)
+            };
+            (result, wait_calls, receive_calls, reload_after)
+        }
+
+        fn child_output(test_name: &str, key: &str, value: &str) -> Output {
+            Command::new(std::env::current_exe().expect("test executable path must exist"))
+                .args(["--exact", test_name, "--nocapture"])
+                .env(key, value)
+                .env_remove(control_socket::CONTROL_SOCKET_ENV)
+                .output()
+                .expect("child test process must start")
+        }
+
+        fn output_text(output: &Output) -> String {
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            text
+        }
+
+        #[test]
+        fn result_combinators_and_panic_boundary_keep_shutdown_failures() {
+            assert_eq!(
+                merge_unit_results(Err("first".to_owned()), Ok(())),
+                Err("first".to_owned())
+            );
+            assert_eq!(
+                merge_unit_results(Ok(()), Err("second".to_owned())),
+                Err("second".to_owned())
+            );
+            assert_eq!(
+                merge_unit_results(Err("first".to_owned()), Err("second".to_owned())),
+                Err("first; second".to_owned())
+            );
+
+            let mut recorder: ObservabilityRecorder = ObservabilityRecorder::new();
+            recorder.record_tick_report(&idle_tick_report());
+            let activity = recorder.activity_snapshot();
+            assert_eq!(activity.ticks.get(), 1);
+            assert_eq!(merge_backend_result(Ok(activity), Ok(())), Ok(activity));
+            assert_eq!(
+                merge_backend_result(Ok(activity), Err("cleanup".to_owned())),
+                Err("cleanup".to_owned())
+            );
+            assert_eq!(
+                merge_backend_result(Err("run".to_owned()), Err("cleanup".to_owned())),
+                Err("run; cleanup failed: cleanup".to_owned())
+            );
+
+            assert_eq!(
+                catch_shutdown_result("operation", || -> Result<(), String> {
+                    Err("operation failed".to_owned())
+                }),
+                Err("operation failed".to_owned())
+            );
+            assert_eq!(
+                catch_shutdown_result("panic", || -> Result<(), String> { panic!("test panic") }),
+                Err("panic panicked; continuing ordered shutdown".to_owned())
+            );
+        }
+
+        #[test]
+        fn backend_runner_propagates_control_socket_open_failure() {
+            let _lock = GLOBAL_STATE_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let (result, wait_calls, receive_calls, reload_after) = run_backend_fixture(
+                RunBackendTestIo {
+                    fail_first_receive: false,
+                    receive_calls: 0,
+                    wait_calls: 0,
+                    wait_delays: [Duration::ZERO; 3],
+                    stop_after_wait: None,
+                },
+                Duration::from_secs(1),
+                true,
+                false,
+            );
+            let error = result.expect_err("control socket setup failure must reach the caller");
+            assert!(error.contains("control socket"));
+            assert_eq!(wait_calls, 0);
+            assert_eq!(receive_calls, 0);
+            assert!(!reload_after);
+        }
+
+        #[test]
+        fn backend_loop_conditions_remain_ordered_and_scheduler_based() {
+            let source = include_str!("../src/main.rs");
+            let runner = source
+                .split_once("fn run_backend<'storage, I, E>(")
+                .expect("the common backend runner must exist")
+                .1
+                .split_once("\n#[cfg(not(target_os = \"linux\"))]")
+                .expect("the common backend runner must have a bounded function body")
+                .0;
+
+            assert!(runner.contains(
+                "let mut next_observability = std::time::Instant::now() + observability_interval;"
+            ));
+            assert!(runner.contains("if tick_observed_at >= next_observability"));
+            assert!(
+                runner.contains("next_observability = tick_observed_at + observability_interval;")
+            );
+            assert!(runner.contains(
+                "if !stop_requested()\n                && pending_candidate.is_none()\n                && reload_preparation.is_none()\n                && take_reload_request()"
+            ));
+            assert!(runner.contains("if pending_candidate.is_some() || tick_has_work"));
+        }
+
+        #[test]
+        fn observability_names_and_backend_copy_modes_are_exact() {
+            assert_eq!(readiness_name(Readiness::Cold), "cold");
+            assert_eq!(readiness_name(Readiness::Ready), "ready");
+            assert_eq!(readiness_name(Readiness::Degraded), "degraded");
+
+            assert!(ObservabilityBackend::AfPacket.copy());
+            assert!(!ObservabilityBackend::Xdp.copy());
+            assert!(!ObservabilityBackend::Sim.copy());
+        }
+
+        #[test]
+        fn failure_dispatch_work_requires_each_independent_counter() {
+            let mut queued = idle_tick_report();
+            queued.failure_dispatch = ruster_runtime::PhaseReport::Completed(
+                ruster_core::ResolutionFailureDispatchReport {
+                    queued: 1,
+                    ..Default::default()
+                },
+            );
+            assert!(tick_report_has_work(&queued));
+
+            let mut retired = idle_tick_report();
+            retired.failure_dispatch = ruster_runtime::PhaseReport::Completed(
+                ruster_core::ResolutionFailureDispatchReport {
+                    retired: 1,
+                    ..Default::default()
+                },
+            );
+            assert!(tick_report_has_work(&retired));
+        }
+
+        #[test]
+        fn notify_result_reports_both_advisory_failure_contexts() {
+            if env::var_os(NOTIFY_CHILD_ENV).is_some() {
+                report_notify_result("WATCHDOG", sd_notify::NotifySendResult::WouldBlock, true);
+                report_notify_result(
+                    "STOPPING",
+                    sd_notify::NotifySendResult::Failed { errno: 111 },
+                    false,
+                );
+                return;
+            }
+
+            let output = child_output(
+                "tests::mutation_remaining_backend_orchestration_tests::notify_result_reports_both_advisory_failure_contexts",
+                NOTIFY_CHILD_ENV,
+                "1",
+            );
+            assert!(
+                output.status.success(),
+                "notify child failed: {}",
+                output_text(&output)
+            );
+            let text = output_text(&output);
+            assert!(text.contains(
+                "systemd WATCHDOG notification was not sent because the notify queue is full; watchdog will retry on the next completed tick"
+            ));
+            assert!(text.contains(
+                "systemd STOPPING notification failed with errno=111; daemon continues because systemd notification is advisory"
+            ));
+        }
+
+        #[test]
+        fn reload_output_preserves_status_action_and_restart_classification() {
+            if env::var_os(RELOAD_CHILD_ENV).is_some() {
+                let mut reload_observability = ReloadObservability::default();
+                let rejected_candidate = planned_test_candidate(FULL_SERVICE_CONFIG, 2, 30);
+                handle_reload_publication::<AfPacketError>(
+                    PublicationOutcome::Rejected {
+                        rejection: ruster_runtime::PublicationRejection::new(
+                            rejected_candidate,
+                            FullServicePublishError::InvalidSuccessor(
+                                SuccessorError::GenerationNotIncreasing,
+                            ),
+                        ),
+                        status: ruster_runtime::ActivePublicationStatus::ContinueOldIo,
+                    },
+                    NonZeroU64::new(1).expect("current generation is nonzero"),
+                    &mut reload_observability,
+                );
+
+                let restart_candidate = planned_test_candidate(FULL_SERVICE_CONFIG, 2, 31);
+                handle_reload_publication::<AfPacketError>(
+                    PublicationOutcome::Rejected {
+                        rejection: ruster_runtime::PublicationRejection::new(
+                            restart_candidate,
+                            FullServicePublishError::RestartRequired(
+                                ruster_integration::FullServiceRestartRequired::InterfaceBindingsChanged,
+                            ),
+                        ),
+                        status: ruster_runtime::ActivePublicationStatus::ContinueOldIo,
+                    },
+                    NonZeroU64::new(1).expect("current generation is nonzero"),
+                    &mut reload_observability,
+                );
+                return;
+            }
+
+            let output = child_output(
+                "tests::mutation_remaining_backend_orchestration_tests::reload_output_preserves_status_action_and_restart_classification",
+                RELOAD_CHILD_ENV,
+                "1",
+            );
+            assert!(
+                output.status.success(),
+                "reload child failed: {}",
+                output_text(&output)
+            );
+            let text = output_text(&output);
+            assert!(text
+                .contains("reason=InvalidSuccessor(GenerationNotIncreasing) action=continue-old"));
+            assert!(text.contains("ruster: reload result=restart-required generation=2"));
+            assert!(!text
+                .contains("ruster: reload rejection left old publication status=ContinueOldIo"));
+        }
+
+        #[test]
+        fn signal_installation_resets_flags_and_handles_both_termination_signals() {
+            let _lock = GLOBAL_STATE_LOCK
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let _flags = FlagRestore::capture();
+            STOP_REQUESTED.store(true, Ordering::Relaxed);
+            RELOAD_REQUESTED.store(true, Ordering::Relaxed);
+
+            assert!(install_signal_handlers().is_ok());
+            assert!(!stop_requested());
+            assert!(!take_reload_request());
+
+            signal_handler(SIGINT);
+            assert!(stop_requested());
+            STOP_REQUESTED.store(false, Ordering::Relaxed);
+            signal_handler(SIGTERM);
+            assert!(stop_requested());
+
+            STOP_REQUESTED.store(false, Ordering::Relaxed);
+            signal_handler(SIGHUP);
+            assert!(take_reload_request());
+            assert!(!take_reload_request());
+        }
+
+        #[test]
+        fn shutdown_quiescence_rejects_either_nonreusable_disposition() {
+            let (_owner, mut io) = bind_publication_backend(MixedQuiescenceIo {
+                current: PublicationQuiescenceDisposition::Stop,
+                error: PublicationQuiescenceDisposition::ContinueOldIo,
+            })
+            .expect("mixed quiescence fixture must bind");
+            let error = wait_for_quiescence(&mut io, std::time::Instant::now())
+                .expect_err("nonreusable current disposition must fail immediately");
+            assert!(error.contains("non-reusable I/O disposition"));
+            assert!(error.contains("current=Stop"));
+
+            let (_owner, mut io) = bind_publication_backend(MixedQuiescenceIo {
+                current: PublicationQuiescenceDisposition::ContinueOldIo,
+                error: PublicationQuiescenceDisposition::SkipIo,
+            })
+            .expect("mixed quiescence fixture must bind");
+            let error = wait_for_quiescence(&mut io, std::time::Instant::now())
+                .expect_err("nonreusable error disposition must fail immediately");
+            assert!(error.contains("non-reusable I/O disposition"));
+            assert!(error.contains("error=SkipIo"));
+        }
+
+        #[test]
+        fn daemon_trace_records_only_forwarding_drop_reasons() {
+            let mut recorder = ObservabilityRecorder::new();
+            {
+                let mut trace = DaemonTrace::new(&mut recorder);
+                TraceSink::record(
+                    &mut trace,
+                    TraceEvent::Dropped {
+                        ingress: ruster_core::IfId(1),
+                        reason: ruster_core::DropReason::UnsupportedEtherType,
+                    },
+                );
+                TraceSink::record(
+                    &mut trace,
+                    TraceEvent::Ipv4Validated {
+                        ingress: ruster_core::IfId(1),
+                        destination: ruster_core::Ipv4Address::from_octets([192, 0, 2, 1]),
+                    },
+                );
+            }
+            let activity = recorder.activity_snapshot();
+            assert_eq!(
+                activity
+                    .drop_reasons
+                    .count(ruster_core::DropReason::UnsupportedEtherType),
+                1
+            );
+            assert_eq!(activity.drop_reasons.total(), 1);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn reload_result_strings_and_initial_activation_are_fail_closed() {
         // Protects the operator-visible spelling of every reload result and
@@ -4796,6 +5707,589 @@ completion = 4
             classify_reload_plan(&outcome),
             ReloadPlanClassification::InitialActivation
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    mod cli_configuration_reload_diagnostic_mutation_tests {
+        use super::super::{
+            format_validation_error, parse, read_config_bytes, run,
+            start_reload_candidate_preparation, validate, validation_reason, FullServicePlanInputs,
+            NonZeroU64, VALIDATION_LIMITS,
+        };
+        use super::{FULL_SERVICE_CONFIG, NEXT_RELOAD_TEST_ID};
+        use ruster_config::{
+            AfXdpResourceV1, BackendV1, ConfigV1, ValidatedConfig, ValidatedConfigV1,
+            ValidationCode, ValidationError, ValidationLimits, VersionedConfig, XdpAttachModeV1,
+            XdpRingsV1, XdpUmemV1, MAX_CONFIG_BYTES,
+        };
+        use std::{
+            ffi::{c_char, CString},
+            fs::{self, OpenOptions},
+            io,
+            os::unix::fs::OpenOptionsExt,
+            path::PathBuf,
+            process::{self, Command},
+            sync::atomic::Ordering,
+            time::Instant,
+        };
+
+        const USAGE: &str =
+            "usage: ruster <validate|plan|run> <config-path> | ruster status | ruster run-sim <config-path> [--ticks <N>]";
+
+        fn valid_config() -> ConfigV1 {
+            let VersionedConfig::V1(config) =
+                parse(FULL_SERVICE_CONFIG.as_bytes()).expect("full-service fixture must parse")
+            else {
+                unreachable!("the fixture uses schema V1");
+            };
+            config
+        }
+
+        fn validation_error(config: ConfigV1, limits: ValidationLimits) -> ValidationError {
+            validate(VersionedConfig::V1(config), limits)
+                .err()
+                .unwrap_or_else(|| panic!("fixture must fail semantic validation"))
+        }
+
+        fn validation_error_from_source(source: &str, limits: ValidationLimits) -> ValidationError {
+            let VersionedConfig::V1(config) =
+                parse(source.as_bytes()).expect("semantic fixture must parse")
+            else {
+                unreachable!("the fixture uses schema V1");
+            };
+            validation_error(config, limits)
+        }
+
+        fn valid_validated_config() -> ValidatedConfigV1 {
+            match validate(VersionedConfig::V1(valid_config()), VALIDATION_LIMITS) {
+                Ok(ValidatedConfig::V1(config)) => config,
+                _ => panic!("full-service fixture must validate as schema V1"),
+            }
+        }
+
+        fn assert_reason(config: ConfigV1, expected: &str) {
+            let error = validation_error(config, VALIDATION_LIMITS);
+            assert_eq!(validation_reason(&error), expected);
+        }
+
+        fn assert_source_reason(source: &str, expected: &str) {
+            let error = validation_error_from_source(source, VALIDATION_LIMITS);
+            assert_eq!(validation_reason(&error), expected);
+        }
+
+        fn af_xdp_config() -> ConfigV1 {
+            let mut config = valid_config();
+            config.backend = Some(BackendV1::AfXdp {
+                resources: vec![
+                    AfXdpResourceV1 {
+                        interface: "wan".to_owned(),
+                        queue_id: 0,
+                    },
+                    AfXdpResourceV1 {
+                        interface: "lan".to_owned(),
+                        queue_id: 1,
+                    },
+                ],
+                xskmap_max_entries: 2,
+                bind_flags: 8,
+                attach_mode: XdpAttachModeV1::Skb,
+                umem: XdpUmemV1 {
+                    frame_count: 2,
+                    frame_size: 2_048,
+                    headroom: 256,
+                    rx_frames: 1,
+                    generated_frames: 1,
+                    raw_flags: 0,
+                },
+                rings: XdpRingsV1 {
+                    fill: 4,
+                    rx: 4,
+                    tx: 4,
+                    completion: 4,
+                },
+            });
+            config
+        }
+
+        fn unique_path(label: &str) -> PathBuf {
+            let id = NEXT_RELOAD_TEST_ID.fetch_add(1, Ordering::Relaxed);
+            std::env::temp_dir().join(format!("ruster-cli-{label}-{}-{id}", process::id()))
+        }
+
+        struct PathCleanup(PathBuf);
+
+        impl Drop for PathCleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+                let _ = fs::remove_dir(&self.0);
+            }
+        }
+
+        unsafe extern "C" {
+            fn mkfifo(path: *const c_char, mode: u32) -> i32;
+        }
+
+        fn new_fifo() -> (PathBuf, PathCleanup) {
+            let path = unique_path("read-config-fifo");
+            let path_string = path.to_str().expect("fixture path must be UTF-8");
+            let path_c = CString::new(path_string).expect("fixture path must not contain NUL");
+            // SAFETY: `path_c` is a valid NUL-terminated pathname and the
+            // mode is a normal permission mask for this private test FIFO.
+            let result = unsafe { mkfifo(path_c.as_ptr(), 0o600) };
+            assert_eq!(
+                result,
+                0,
+                "test FIFO must be created: {}",
+                io::Error::last_os_error()
+            );
+            (path.clone(), PathCleanup(path))
+        }
+
+        fn idle_fifo() -> (PathBuf, PathCleanup, fs::File, fs::File) {
+            let (path, cleanup) = new_fifo();
+            let reader = OpenOptions::new()
+                .read(true)
+                .custom_flags(super::super::CONFIG_OPEN_NONBLOCK)
+                .open(&path)
+                .expect("FIFO reader must open without a writer");
+            let writer = OpenOptions::new()
+                .write(true)
+                .custom_flags(super::super::CONFIG_OPEN_NONBLOCK)
+                .open(&path)
+                .expect("FIFO writer must open with the reader held");
+            (path, cleanup, reader, writer)
+        }
+
+        #[test]
+        fn cli_parser_keeps_status_outside_the_usage_fallback() {
+            // main.rs:145: `status` must enter the control-socket request
+            // path. Replacing == with != falls through to this exact usage
+            // string instead.
+            assert_ne!(run(vec!["status".to_owned()]), Err(USAGE.to_owned()));
+        }
+
+        #[test]
+        fn cli_parser_rejects_unknown_two_argument_commands() {
+            // main.rs:158: an unknown two-argument command must be rejected
+            // before the dispatch match can reach its unreachable arm.
+            assert_eq!(
+                run(vec!["not-a-command".to_owned(), "unused.toml".to_owned()]),
+                Err(USAGE.to_owned())
+            );
+        }
+
+        #[test]
+        fn cli_parser_accepts_both_help_spellings() {
+            // main.rs:161: both recognized spellings must take the help arm;
+            // a false guard turns either call into the usage error, while a
+            // true guard would incorrectly accept an arbitrary command.
+            assert_eq!(run(vec!["--help".to_owned()]), Ok(()));
+            assert_eq!(run(vec!["-h".to_owned()]), Ok(()));
+            assert_eq!(run(vec!["not-help".to_owned()]), Err(USAGE.to_owned()));
+        }
+
+        #[test]
+        fn cli_help_dispatch_renders_the_usage_text() {
+            const CHILD_ENV: &str = "RUSTER_CLI_HELP_RENDER_CHILD";
+
+            if std::env::var_os(CHILD_ENV).is_some() {
+                assert_eq!(run(vec!["--help".to_owned()]), Ok(()));
+                return;
+            }
+
+            let executable = std::env::current_exe().expect("CLI test executable must exist");
+            let output = Command::new(executable)
+                .arg("--exact")
+                .arg(
+                    "tests::cli_configuration_reload_diagnostic_mutation_tests::cli_help_dispatch_renders_the_usage_text",
+                )
+                .arg("--nocapture")
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("CLI help child must start");
+            assert!(
+                output.status.success(),
+                "CLI help child failed: stdout={:?} stderr={:?}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(USAGE),
+                "help must render the complete usage text: stdout={:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+
+        #[test]
+        fn reload_candidate_preparation_accepts_the_requested_generation() {
+            // main.rs:537: a correctly generated candidate must pass the
+            // equality check. Replacing != with == rejects this valid result.
+            let generation = NonZeroU64::new(2).expect("test generation is nonzero");
+            let config = valid_validated_config();
+            let inputs = FullServicePlanInputs::new(
+                generation,
+                super::super::Nat44UdpHashKey::new(0x10, 0x11).expect("UDP key"),
+                super::super::Nat44TcpHashKey::new(0x20, 0x21).expect("TCP key"),
+                super::super::FirewallHashKey::new(0x30, 0x31).expect("firewall key"),
+            );
+            let receiver = start_reload_candidate_preparation(config, generation, inputs)
+                .expect("reload planner thread must start");
+            let candidate = receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .expect("reload planner must return")
+                .expect("matching generation must be accepted");
+            assert_eq!(candidate.generation(), generation);
+        }
+
+        #[test]
+        fn read_config_retries_would_block_until_the_idle_deadline() {
+            // main.rs:795 and :799: WouldBlock must use the bounded retry
+            // path, and the timeout must not fire before 100 ms. This one
+            // input kills the false guard, != guard, and < timeout mutants.
+            let (path, _cleanup, _reader, _writer) = idle_fifo();
+            let started = Instant::now();
+            let error = read_config_bytes(path.to_str().expect("FIFO path must be UTF-8"))
+                .expect_err("an idle FIFO must hit the bounded read timeout");
+            let elapsed = started.elapsed();
+            assert!(
+                error.contains("configuration input stalled before EOF or size limit"),
+                "WouldBlock must be reported as a bounded stall: {error}"
+            );
+            assert!(
+                elapsed >= std::time::Duration::from_millis(80),
+                "the idle deadline must not fire early: elapsed={elapsed:?}"
+            );
+        }
+
+        #[test]
+        fn read_config_keeps_non_would_block_errors_on_the_error_path() {
+            // main.rs:795: an EISDIR read error is not WouldBlock. Replacing
+            // the guard with true incorrectly rewrites it as a timeout.
+            let path = unique_path("read-config-directory");
+            fs::create_dir(&path).expect("test directory must be created");
+            let _cleanup = PathCleanup(path.clone());
+            let error = read_config_bytes(path.to_str().expect("directory path must be UTF-8"))
+                .expect_err("reading a directory must fail");
+            assert!(
+                error.starts_with(&format!("cannot read {}:", path.display())),
+                "non-WouldBlock errors must retain the read error: {error}"
+            );
+            assert!(!error.contains("configuration input stalled"));
+        }
+
+        #[test]
+        fn validation_reason_reports_schema_and_af_xdp_rejections() {
+            let mut schema = valid_config();
+            schema.schema_version = 2;
+            assert_reason(schema, "schema-version is invalid");
+
+            let mut umem = af_xdp_config();
+            if let Some(BackendV1::AfXdp { umem, .. }) = umem.backend.as_mut() {
+                umem.frame_count = 0;
+            }
+            assert_reason(umem, "AF_XDP UMEM configuration is invalid");
+
+            let mut rings = af_xdp_config();
+            if let Some(BackendV1::AfXdp { rings, .. }) = rings.backend.as_mut() {
+                rings.fill = 3;
+            }
+            assert_reason(rings, "AF_XDP ring configuration is invalid");
+
+            let mut bind_flags = af_xdp_config();
+            if let Some(BackendV1::AfXdp { bind_flags, .. }) = bind_flags.backend.as_mut() {
+                *bind_flags = 0;
+            }
+            assert_reason(bind_flags, "AF_XDP bind flags are invalid");
+
+            let mut xskmap = af_xdp_config();
+            if let Some(BackendV1::AfXdp {
+                xskmap_max_entries, ..
+            }) = xskmap.backend.as_mut()
+            {
+                *xskmap_max_entries = 0;
+            }
+            assert_reason(xskmap, "XSKMAP must have at least one entry");
+
+            let mut queue = af_xdp_config();
+            if let Some(BackendV1::AfXdp { resources, .. }) = queue.backend.as_mut() {
+                resources[0].queue_id = 2;
+            }
+            assert_reason(queue, "queue id 2 is outside XSKMAP entries 0..2");
+
+            let mut resource_count = af_xdp_config();
+            if let Some(BackendV1::AfXdp { resources, .. }) = resource_count.backend.as_mut() {
+                resources.pop();
+            }
+            assert_reason(
+                resource_count,
+                "AF_XDP requires exactly two resources, got 1",
+            );
+
+            let mut duplicate_resource = af_xdp_config();
+            if let Some(BackendV1::AfXdp { resources, .. }) = duplicate_resource.backend.as_mut() {
+                resources[1].interface = "wan".to_owned();
+            }
+            assert_reason(
+                duplicate_resource,
+                "AF_XDP resources must use distinct interfaces",
+            );
+        }
+
+        #[test]
+        fn validation_reason_reports_interface_and_address_rejections() {
+            let mut oversized = valid_config();
+            oversized.interfaces[0].name = "x".repeat(MAX_CONFIG_BYTES);
+            let oversized_error = validation_error(oversized, VALIDATION_LIMITS);
+            assert_eq!(oversized_error.code(), ValidationCode::TextTooLarge);
+            let actual = oversized_error
+                .actual()
+                .expect("text error has an actual size");
+            assert_eq!(
+                validation_reason(&oversized_error),
+                format!("text has {actual} bytes; maximum is {MAX_CONFIG_BYTES}")
+            );
+
+            let mut empty_interface = valid_config();
+            empty_interface.interfaces[0].name.clear();
+            assert_reason(empty_interface, "interface name must not be empty");
+
+            let mut empty_device = valid_config();
+            empty_device.interfaces[0].device.clear();
+            assert_reason(empty_device, "device name must not be empty");
+
+            let mut duplicate_id = valid_config();
+            duplicate_id.interfaces[1].id = duplicate_id.interfaces[0].id;
+            assert_reason(duplicate_id, "interface ids must be unique");
+
+            let mut duplicate_name = valid_config();
+            duplicate_name.interfaces[1].name = duplicate_name.interfaces[0].name.clone();
+            assert_reason(duplicate_name, "interface names must be unique");
+
+            let mut invalid_mac = valid_config();
+            invalid_mac.interfaces[0].mac = "not-a-mac".to_owned();
+            assert_reason(invalid_mac, "MAC address is invalid");
+
+            let mut noncanonical_mac = valid_config();
+            noncanonical_mac.interfaces[0].mac = "02:00:00:00:00:0A".to_owned();
+            assert_reason(noncanonical_mac, "MAC address is not canonical");
+
+            let mut multicast_mac = valid_config();
+            multicast_mac.interfaces[0].mac = "01:00:00:00:00:02".to_owned();
+            assert_reason(multicast_mac, "MAC address must be unicast");
+
+            let mut invalid_ipv4 = valid_config();
+            invalid_ipv4.addresses[0].ipv4 = "not-an-ip/24".to_owned();
+            assert_reason(invalid_ipv4, "IPv4 address is invalid");
+
+            let mut invalid_ipv4_prefix = valid_config();
+            invalid_ipv4_prefix.addresses[0].ipv4 = "198.51.100.10/33".to_owned();
+            assert_reason(invalid_ipv4_prefix, "IPv4 prefix is invalid");
+
+            let mut unknown = valid_config();
+            unknown.addresses[0].interface = "not-declared".to_owned();
+            assert_reason(unknown, "interface is not declared");
+
+            let mut duplicate_local = valid_config();
+            duplicate_local.addresses[1].ipv4 = duplicate_local.addresses[0].ipv4.clone();
+            assert_reason(duplicate_local, "local IPv4 addresses must be unique");
+
+            let mut duplicate_interface_address = valid_config();
+            duplicate_interface_address.addresses[1].interface = "wan".to_owned();
+            assert_reason(
+                duplicate_interface_address,
+                "an interface cannot have duplicate addresses",
+            );
+        }
+
+        #[test]
+        fn validation_reason_reports_route_and_neighbor_rejections() {
+            let mut invalid_route = valid_config();
+            invalid_route.routes[0].prefix = "10.0.0.1/8".to_owned();
+            assert_reason(invalid_route, "route is invalid");
+
+            let mut duplicate_route = valid_config();
+            duplicate_route.routes[0].prefix = "198.51.100.0/24".to_owned();
+            assert_reason(duplicate_route, "routes must be unique");
+
+            let mut gateway_not_host = valid_config();
+            gateway_not_host.routes[0].via = Some("0.0.0.0".to_owned());
+            assert_reason(gateway_not_host, "route gateway must be a host address");
+
+            let mut gateway_not_on_link = valid_config();
+            gateway_not_on_link.routes[0].via = Some("203.0.113.1".to_owned());
+            assert_reason(
+                gateway_not_on_link,
+                "route gateway is not on the egress link",
+            );
+
+            let duplicate_neighbor = {
+                let mut config = valid_config();
+                let neighbor = config.neighbors[0].clone();
+                config.neighbors.push(neighbor);
+                config
+            };
+            assert_reason(duplicate_neighbor, "neighbors must be unique");
+
+            let mut neighbor_not_host = valid_config();
+            neighbor_not_host.neighbors[0].address = "0.0.0.0".to_owned();
+            assert_reason(neighbor_not_host, "neighbor address must be a host address");
+        }
+
+        #[test]
+        fn validation_reason_reports_policy_and_nat_rejections() {
+            let mut icmp_policy = valid_config();
+            icmp_policy
+                .icmpv4_errors
+                .as_mut()
+                .expect("fixture enables ICMPv4 errors")
+                .policy
+                .interval_ms = 0;
+            assert_reason(icmp_policy, "ICMPv4 error policy is invalid");
+
+            let noncanonical_seed =
+                FULL_SERVICE_CONFIG.replace("allocator-seed = \"7\"", "allocator-seed = \"07\"");
+            assert_source_reason(&noncanonical_seed, "allocator seed is not canonical");
+
+            let no_protocol = {
+                let mut config = valid_config();
+                let nat = config.nat44.as_mut().expect("fixture enables NAT44");
+                nat.udp = None;
+                nat.tcp = None;
+                config
+            };
+            assert_reason(no_protocol, "NAT44 realm requires a protocol");
+
+            let mut udp_config = valid_config();
+            udp_config
+                .nat44
+                .as_mut()
+                .expect("fixture enables NAT44")
+                .realm
+                .inside = "wan".to_owned();
+            assert_reason(udp_config, "NAT44 UDP configuration is invalid");
+
+            let tcp_config = {
+                let mut config = valid_config();
+                let nat = config.nat44.as_mut().expect("fixture enables NAT44");
+                nat.udp = None;
+                nat.realm.inside = "wan".to_owned();
+                config
+            };
+            assert_reason(tcp_config, "NAT44 TCP configuration is invalid");
+        }
+
+        #[test]
+        fn validation_reason_reports_firewall_rejections() {
+            let mut prefix = valid_config();
+            prefix
+                .firewall
+                .as_mut()
+                .expect("fixture enables firewall")
+                .rules[0]
+                .source = "192.0.2.1/24".to_owned();
+            assert_reason(prefix, "firewall prefix is invalid");
+
+            let mut ports = valid_config();
+            ports
+                .firewall
+                .as_mut()
+                .expect("fixture enables firewall")
+                .rules[0]
+                .source_ports
+                .first = 65_535;
+            ports
+                .firewall
+                .as_mut()
+                .expect("fixture enables firewall")
+                .rules[0]
+                .source_ports
+                .last = 0;
+            assert_reason(ports, "firewall port range is invalid");
+
+            let mut policy = valid_config();
+            policy
+                .firewall
+                .as_mut()
+                .expect("fixture enables firewall")
+                .policy
+                .udp_idle_ttl_ms = 0;
+            assert_reason(policy, "firewall policy is invalid");
+
+            let mut rules = valid_config();
+            rules
+                .firewall
+                .as_mut()
+                .expect("fixture enables firewall")
+                .rules[0]
+                .id = 0;
+            assert_reason(rules, "firewall rules are invalid");
+        }
+
+        #[test]
+        fn validation_reason_reports_capacity_and_runtime_rejections() {
+            let capacity_error = validation_error(
+                valid_config(),
+                ValidationLimits {
+                    max_slots_per_table: 0,
+                    max_runtime_bytes: usize::MAX,
+                },
+            );
+            assert_eq!(capacity_error.code(), ValidationCode::CapacityLimitExceeded);
+            assert_eq!(
+                validation_reason(&capacity_error),
+                "capacity exceeds the configured limit"
+            );
+
+            let mut not_representable = valid_config();
+            not_representable
+                .nat44
+                .as_mut()
+                .expect("fixture enables NAT44")
+                .udp
+                .as_mut()
+                .expect("fixture enables UDP NAT")
+                .capacity
+                .mappings = 2_147_483_649;
+            let not_representable_error = validation_error(
+                not_representable,
+                ValidationLimits {
+                    max_slots_per_table: u32::MAX,
+                    max_runtime_bytes: usize::MAX,
+                },
+            );
+            assert_eq!(
+                not_representable_error.code(),
+                ValidationCode::CapacityNotRepresentable
+            );
+            assert_eq!(
+                validation_reason(&not_representable_error),
+                "capacity is not representable"
+            );
+
+            let runtime_error = validation_error(
+                valid_config(),
+                ValidationLimits {
+                    max_slots_per_table: VALIDATION_LIMITS.max_slots_per_table,
+                    max_runtime_bytes: 0,
+                },
+            );
+            assert_eq!(
+                runtime_error.code(),
+                ValidationCode::RuntimeStorageBytesExceeded
+            );
+            let actual = runtime_error
+                .actual()
+                .expect("runtime error has an actual size");
+            assert_eq!(runtime_error.limit(), Some(0));
+            assert_eq!(
+                validation_reason(&runtime_error),
+                format!("runtime storage requires {actual} bytes; maximum is 0")
+            );
+            assert!(
+                format_validation_error(&runtime_error).contains("runtime storage requires "),
+                "bounded runtime detail must be retained"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -5362,6 +6856,348 @@ completion = 4
         assert_eq!(paths[0].destination, ip([203, 0, 113, 5]));
         assert!(sim_paths(&[route], &[], egress, &[]).is_empty());
         assert!(sim_paths(&[route], &[route_neighbor], ingress, &[]).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    mod mutation_remainder_simulation_packet_health_helpers {
+        use super::*;
+
+        fn address(octets: [u8; 4]) -> ruster_core::Ipv4Address {
+            ruster_core::Ipv4Address::from_octets(octets)
+        }
+
+        fn prefix(octets: [u8; 4], prefix_len: u8) -> ruster_core::FirewallIpv4Prefix {
+            ruster_core::FirewallIpv4Prefix::new(address(octets), prefix_len)
+                .expect("test prefix must be canonical")
+        }
+
+        fn allow_rule(
+            id: u32,
+            ingress: ruster_core::FirewallInterface,
+            egress: ruster_core::FirewallInterface,
+            source: ruster_core::FirewallIpv4Prefix,
+            destination: ruster_core::FirewallIpv4Prefix,
+        ) -> ruster_core::FirewallRule {
+            ruster_core::FirewallRule::new(
+                ruster_core::FirewallRuleId(id),
+                ingress,
+                egress,
+                source,
+                destination,
+                ruster_core::FirewallProtocol::Tcp,
+                ruster_core::FirewallPortRange::new(0, u16::MAX)
+                    .expect("full source port range must be valid"),
+                ruster_core::FirewallPortRange::new(443, 443)
+                    .expect("single destination port must be valid"),
+                ruster_core::FirewallAction::AllowStateful,
+            )
+        }
+
+        #[test]
+        fn run_sim_injects_the_scenario_on_the_first_tick() {
+            const CHILD_ENV: &str = "RUSTER_CLI_SIM_FIRST_TICK_CHILD";
+            let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../control/tests/full-service.toml");
+            if std::env::var_os(CHILD_ENV).is_some() {
+                run_sim_path(config.to_str().expect("fixture path must be UTF-8"), 1)
+                    .expect("one-tick run-sim must succeed");
+                return;
+            }
+
+            let output = std::process::Command::new(
+                std::env::current_exe().expect("test executable path"),
+            )
+            .arg("--exact")
+            .arg(
+                "tests::mutation_remainder_simulation_packet_health_helpers::run_sim_injects_the_scenario_on_the_first_tick",
+            )
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("run-sim child test must start");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "one-tick run-sim must succeed; stdout={stdout:?} stderr={:?}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let record = stdout
+                .lines()
+                .find(|line| line.starts_with("record_type=observability "))
+                .expect("run-sim must emit an observability record");
+            let forwarded = record
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("forwarded="))
+                .expect("observability record must contain forwarded");
+            assert_eq!(
+                forwarded, "1",
+                "the first tick must process the generated forwarding frame: {record}"
+            );
+        }
+
+        #[test]
+        fn simulation_forwarding_uses_the_inside_usable_neighbor() {
+            let candidate = planned_test_candidate(FULL_SERVICE_CONFIG, 1, 101);
+            let authority = candidate.authority();
+            let snapshot = authority.snapshot();
+            let plan = sim_forwarding_plan(&candidate, &authority, &snapshot)
+                .expect("full-service fixture must produce a forwarding plan");
+
+            assert_eq!(plan.ingress, ruster_core::IfId(1));
+            assert_eq!(plan.source, address([192, 0, 2, 20]));
+            assert_eq!(plan.source_mac, [2, 0, 0, 0, 0, 4]);
+        }
+
+        #[test]
+        fn simulation_source_does_not_choose_an_unusable_non_local_candidate() {
+            let result = sim_source_address(
+                None,
+                ruster_core::IfId(7),
+                &[ruster_core::LocalIpv4Binding {
+                    interface: ruster_core::IfId(7),
+                    address: address([224, 0, 0, 0]),
+                }],
+            );
+
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn simulation_paths_reject_a_local_destination_even_when_the_route_matches() {
+            let egress = ruster_core::IfId(2);
+            let route = ruster_core::Route::new(address([203, 0, 113, 0]), 24, egress, None)
+                .expect("test route must be valid");
+            let destination = address([203, 0, 113, 255]);
+            let neighbor = ruster_core::Neighbor {
+                interface: egress,
+                target: destination,
+                mac: ruster_core::MacAddress([2, 0, 0, 0, 0, 2]),
+            };
+            let local = [ruster_core::LocalIpv4Binding {
+                interface: egress,
+                address: destination,
+            }];
+
+            assert!(sim_paths(&[route], &[neighbor], egress, &local).is_empty());
+        }
+
+        #[test]
+        fn simulation_paths_require_all_selected_route_identity_fields() {
+            let egress = ruster_core::IfId(2);
+            let broad = ruster_core::Route::new(address([10, 0, 0, 0]), 8, egress, None)
+                .expect("broad test route must be valid");
+            let narrow = ruster_core::Route::new(address([10, 0, 0, 0]), 16, egress, None)
+                .expect("narrow test route must be valid");
+            let neighbors = [
+                ruster_core::Neighbor {
+                    interface: egress,
+                    target: address([10, 0, 0, 2]),
+                    mac: ruster_core::MacAddress([2, 0, 0, 0, 0, 2]),
+                },
+                ruster_core::Neighbor {
+                    interface: egress,
+                    target: address([10, 0, 255, 255]),
+                    mac: ruster_core::MacAddress([2, 0, 0, 0, 0, 3]),
+                },
+            ];
+
+            let paths = sim_paths(&[broad, narrow], &neighbors, egress, &[]);
+            assert_eq!(paths.len(), 1);
+            assert_eq!(paths[0].destination, address([10, 0, 255, 255]));
+        }
+
+        #[test]
+        fn simulation_paths_reject_a_route_with_a_different_next_hop() {
+            let egress = ruster_core::IfId(2);
+            let selected = ruster_core::Route::new(
+                address([203, 0, 113, 0]),
+                24,
+                egress,
+                Some(address([198, 51, 100, 1])),
+            )
+            .expect("selected route must be valid");
+            let candidate = ruster_core::Route::new(
+                address([203, 0, 113, 0]),
+                24,
+                egress,
+                Some(address([198, 51, 100, 2])),
+            )
+            .expect("candidate route must be valid");
+            let neighbor = ruster_core::Neighbor {
+                interface: egress,
+                target: address([198, 51, 100, 2]),
+                mac: ruster_core::MacAddress([2, 0, 0, 0, 0, 2]),
+            };
+
+            assert!(sim_paths(&[candidate, selected], &[neighbor], egress, &[]).is_empty());
+        }
+
+        #[test]
+        fn simulation_paths_do_not_duplicate_a_destination() {
+            let egress = ruster_core::IfId(2);
+            let route = ruster_core::Route::new(address([203, 0, 113, 0]), 24, egress, None)
+                .expect("test route must be valid");
+            let neighbor = ruster_core::Neighbor {
+                interface: egress,
+                target: address([203, 0, 113, 5]),
+                mac: ruster_core::MacAddress([2, 0, 0, 0, 0, 2]),
+            };
+
+            let paths = sim_paths(&[route, route], &[neighbor], egress, &[]);
+            assert_eq!(paths.len(), 1);
+            assert_eq!(paths[0].destination, address([203, 0, 113, 5]));
+        }
+
+        #[test]
+        fn simulation_destination_candidates_preserve_host_bits() {
+            let route =
+                ruster_core::Route::new(address([192, 0, 2, 0]), 24, ruster_core::IfId(2), None)
+                    .expect("test route must be valid");
+
+            assert_eq!(
+                sim_destination_candidates(route),
+                [
+                    address([192, 0, 2, 255]),
+                    address([192, 0, 2, 2]),
+                    address([203, 0, 113, 5]),
+                ]
+            );
+        }
+
+        #[test]
+        fn simulation_allowed_transport_requires_each_firewall_match() {
+            let ingress = ruster_core::IfId(1);
+            let egress = ruster_core::IfId(2);
+            let wrong = ruster_core::IfId(9);
+            let source = address([192, 0, 2, 7]);
+            let destination = address([203, 0, 113, 5]);
+            let source_prefix = prefix([192, 0, 2, 0], 24);
+            let destination_prefix = prefix([203, 0, 113, 0], 24);
+
+            let cases = [
+                allow_rule(
+                    1,
+                    ruster_core::FirewallInterface::Interface(wrong),
+                    ruster_core::FirewallInterface::Interface(egress),
+                    source_prefix,
+                    destination_prefix,
+                ),
+                allow_rule(
+                    2,
+                    ruster_core::FirewallInterface::Interface(ingress),
+                    ruster_core::FirewallInterface::Interface(wrong),
+                    source_prefix,
+                    destination_prefix,
+                ),
+                allow_rule(
+                    3,
+                    ruster_core::FirewallInterface::Interface(ingress),
+                    ruster_core::FirewallInterface::Interface(egress),
+                    source_prefix,
+                    prefix([198, 51, 100, 0], 24),
+                ),
+            ];
+
+            for (index, rule) in cases.into_iter().enumerate() {
+                assert!(
+                    sim_allowed_transport(&[rule], ingress, egress, source, destination).is_none(),
+                    "firewall mismatch case {index} must remain denied"
+                );
+            }
+        }
+
+        #[test]
+        fn simulation_udp_frame_lengths_match_the_payload() {
+            let plan = SimForwardingPlan {
+                ingress: ruster_core::IfId(1),
+                router_mac: [2, 0, 0, 0, 0, 1],
+                source_mac: [2, 0, 0, 0, 0, 2],
+                source: address([192, 0, 2, 7]),
+                destination: address([203, 0, 113, 5]),
+                protocol: 17,
+                source_port: 51_000,
+                destination_port: 443,
+            };
+            let frame = build_sim_transport_frame(plan);
+            let payload_len = b"ruster-sim".len();
+            let udp_len = 8 + payload_len;
+
+            assert_eq!(frame.len(), 14 + 20 + udp_len);
+            assert_eq!(
+                u16::from_be_bytes([frame[16], frame[17]]) as usize,
+                20 + udp_len
+            );
+            let udp_offset = 14 + 20;
+            assert_eq!(
+                u16::from_be_bytes([frame[udp_offset + 4], frame[udp_offset + 5]]) as usize,
+                udp_len
+            );
+        }
+
+        #[test]
+        fn simulation_unsupported_frame_has_the_expected_ethernet_header() {
+            let router_mac = [2, 0, 0, 0, 0, 1];
+            assert_eq!(
+                build_sim_unsupported_frame(router_mac),
+                vec![2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0xfe, 0x88, 0xb5]
+            );
+        }
+
+        #[test]
+        fn simulation_tick_error_classifier_keeps_each_failure_independent() {
+            let mut inactive = healthy_tick_report();
+            inactive.active = false;
+            assert!(sim_tick_has_internal_error(&inactive));
+
+            let mut arp = healthy_tick_report();
+            arp.generated_arp =
+                ruster_runtime::PhaseReport::Completed(ruster_runtime::GeneratedPhaseReport {
+                    accounting: ruster_runtime::GeneratedAccounting::default(),
+                    stop: ruster_runtime::GeneratedArpStop::ClockRegression,
+                });
+            assert!(sim_tick_has_internal_error(&arp));
+
+            let mut icmp = healthy_tick_report();
+            icmp.generated_icmpv4 =
+                ruster_runtime::PhaseReport::Completed(ruster_runtime::GeneratedPhaseReport {
+                    accounting: ruster_runtime::GeneratedAccounting::default(),
+                    stop: ruster_runtime::GeneratedIcmpv4Stop::ClockRegression,
+                });
+            assert!(sim_tick_has_internal_error(&icmp));
+
+            let mut timers = healthy_tick_report();
+            timers.resolution_timers = ruster_runtime::PhaseReport::Failed(
+                ruster_core::ResolutionTimerError::ClockRegression,
+            );
+            assert!(sim_tick_has_internal_error(&timers));
+
+            let mut dispatch = healthy_tick_report();
+            dispatch.failure_dispatch = ruster_runtime::PhaseReport::Failed(
+                ruster_core::ResolutionFailureDispatchError::ClockRegression,
+            );
+            assert!(sim_tick_has_internal_error(&dispatch));
+        }
+
+        #[test]
+        fn system_page_size_is_a_real_positive_page_size() {
+            let page_size = system_page_size().expect("Linux page size must be available");
+            assert!(page_size > 1);
+            assert!(page_size.is_power_of_two());
+        }
+
+        #[test]
+        fn usize_from_u32_preserves_zero_one_and_maximum() {
+            assert_eq!(usize_from_u32(0), 0);
+            assert_eq!(usize_from_u32(1), 1);
+            assert_eq!(usize_from_u32(u32::MAX), u32::MAX as usize);
+        }
+
+        #[test]
+        fn health_strings_are_stable_for_all_states() {
+            assert_eq!(Health::Healthy.as_str(), "healthy");
+            assert_eq!(Health::Degraded.as_str(), "degraded");
+            assert_eq!(Health::Unavailable.as_str(), "unavailable");
+        }
     }
 
     #[cfg(target_os = "linux")]
