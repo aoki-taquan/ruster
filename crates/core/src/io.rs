@@ -856,13 +856,36 @@ impl<E> BatchCompletion<E> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{
+        cell::Cell,
+        rc::Rc,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     use super::{
-        bind_publication_backend, bind_publication_backend_from, BatchCompletion,
-        PublicationBackendAuthority, PublicationBindingIdentityExhausted, PublicationQuiescence,
-        PublicationQuiescenceBackend, PublicationQuiescenceDisposition,
+        bind_publication_backend, bind_publication_backend_from, BatchCompletion, ConsumeReason,
+        PacketLease, PacketSlot, PublicationBackendAuthority, PublicationBindingIdentityExhausted,
+        PublicationQuiescence, PublicationQuiescenceBackend, PublicationQuiescenceDisposition,
+        SlotCompletion,
     };
+
+    struct RecordingSlot {
+        completion: Rc<Cell<Option<SlotCompletion>>>,
+    }
+
+    impl PacketSlot for RecordingSlot {
+        fn ingress(&self) -> crate::IfId {
+            crate::IfId(0)
+        }
+
+        fn bytes_mut(&mut self) -> &mut [u8] {
+            &mut []
+        }
+
+        fn complete(self, completion: SlotCompletion) {
+            self.completion.set(Some(completion));
+        }
+    }
 
     struct TestBackend {
         quiescent: bool,
@@ -1015,5 +1038,37 @@ mod tests {
             error: None::<()>,
         };
         assert!(!completion.invariants_hold());
+    }
+
+    #[test]
+    fn consuming_a_packet_lease_reports_the_consume_reason() {
+        // Protects PacketLease::consume from becoming a no-op and verifies the
+        // requested ConsumeReason reaches the backend slot.
+        let completion = Rc::new(Cell::new(None));
+        let slot = RecordingSlot {
+            completion: Rc::clone(&completion),
+        };
+
+        PacketLease::new(slot).consume(ConsumeReason::ArpControl);
+
+        assert_eq!(
+            completion.get(),
+            Some(SlotCompletion::Consume(ConsumeReason::ArpControl))
+        );
+    }
+
+    #[test]
+    fn dropping_a_live_packet_lease_reports_abandonment() {
+        // Protects PacketLease's Drop implementation from becoming a no-op and
+        // verifies an unfinished lease is returned as LeaseAbandoned.
+        let completion = Rc::new(Cell::new(None));
+        let slot = RecordingSlot {
+            completion: Rc::clone(&completion),
+        };
+        let lease = PacketLease::new(slot);
+
+        drop(lease);
+
+        assert_eq!(completion.get(), Some(SlotCompletion::LeaseAbandoned));
     }
 }
