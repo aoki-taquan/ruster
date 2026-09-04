@@ -136,8 +136,67 @@ pub struct GeneratedBatchCompletion<E> {
 impl<E> GeneratedBatchCompletion<E> {
     #[must_use]
     pub const fn invariants_hold(&self) -> bool {
-        self.attempts == self.allocated + self.failed
-            && self.allocated == self.requested + self.cancelled + self.abandoned
-            && self.accepted + self.rejected == self.requested
+        let Some(attempts) = self.allocated.checked_add(self.failed) else {
+            return false;
+        };
+        let Some(allocated_without_abandoned) = self.requested.checked_add(self.cancelled) else {
+            return false;
+        };
+        let Some(allocated) = allocated_without_abandoned.checked_add(self.abandoned) else {
+            return false;
+        };
+        let Some(accepted) = self.accepted.checked_add(self.rejected) else {
+            return false;
+        };
+
+        self.attempts == attempts && self.allocated == allocated && accepted == self.requested
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GeneratedBatchCompletion;
+
+    fn completion(counters: [usize; 8]) -> GeneratedBatchCompletion<()> {
+        let [attempts, allocated, failed, requested, cancelled, abandoned, accepted, rejected] =
+            counters;
+        GeneratedBatchCompletion {
+            attempts,
+            allocated,
+            failed,
+            requested,
+            cancelled,
+            abandoned,
+            accepted,
+            rejected,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn generated_batch_completion_rejects_attempts_counter_overflow() {
+        let attempts_overflow = completion([0, usize::MAX, 1, usize::MAX, 0, 0, usize::MAX, 0]);
+        assert!(!attempts_overflow.invariants_hold());
+    }
+
+    #[test]
+    fn generated_batch_completion_rejects_allocation_counter_overflow() {
+        let allocation_overflow = completion([
+            usize::MAX,
+            usize::MAX,
+            0,
+            usize::MAX,
+            1,
+            usize::MAX,
+            usize::MAX,
+            0,
+        ]);
+        assert!(!allocation_overflow.invariants_hold());
+    }
+
+    #[test]
+    fn generated_batch_completion_rejects_acceptance_counter_overflow() {
+        let acceptance_overflow = completion([0, 0, 0, 0, 0, 0, usize::MAX, 1]);
+        assert!(!acceptance_overflow.invariants_hold());
     }
 }

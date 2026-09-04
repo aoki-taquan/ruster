@@ -1,6 +1,7 @@
 use std::{
     cell::RefCell,
     collections::{BTreeMap, VecDeque},
+    marker::PhantomData,
     rc::Rc,
 };
 
@@ -18,7 +19,7 @@ use super::{
         RxCopyAdversarialHarness, RxCopyCompletionHarness, RxCopyFinishErrorHarness, RxCopyHarness,
         RxCopyKickErrorHarness, RxCopyPayloadHarness, RxCopyUnknownEgressHarness,
     },
-    RxReclaim, TxEndpoint, CONFORMANCE_LAN_ENDPOINT, CONFORMANCE_WAN_ENDPOINT,
+    RxReclaim, TxEndpoint, CONFORMANCE_LAN_ENDPOINT, CONFORMANCE_WAN, CONFORMANCE_WAN_ENDPOINT,
 };
 
 const TX_FRAME_CAPACITY: usize = 128;
@@ -28,6 +29,13 @@ const TX_FRAME_COUNT: usize = 4;
 enum CopyFakeError {
     InjectedFinish,
     Kick(CopyErrno),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CopyUnsafeCleanupFault {
+    MissingSourceTerminal,
+    MissingBlockReturn,
+    RetainedPackets,
 }
 
 struct SourcePacket {
@@ -111,6 +119,8 @@ struct CopyState {
     block_returns: Vec<CopyRxBlockReturn>,
     kicks: Vec<CopyKickEvent>,
     tx_accept_budget: usize,
+    ingress_override: Option<ruster_core::IfId>,
+    unsafe_cleanup_fault: Option<CopyUnsafeCleanupFault>,
     fail_next_finish: bool,
     fail_next_kick: Option<CopyErrno>,
 }
@@ -140,6 +150,8 @@ impl CopyState {
             block_returns: Vec::new(),
             kicks: Vec::new(),
             tx_accept_budget: usize::MAX,
+            ingress_override: None,
+            unsafe_cleanup_fault: None,
             fail_next_finish: false,
             fail_next_kick: None,
         }
@@ -276,7 +288,7 @@ impl CopyState {
         );
         self.source_events.push(CopySourceEvent {
             source: packet.live,
-            ingress: packet.ingress,
+            ingress: self.ingress_override.unwrap_or(packet.ingress),
             disposition,
         });
         let block = self
@@ -311,6 +323,15 @@ impl CopyState {
     }
 
     fn terminal_unsafe_block(&mut self, token: CopyRxBlockToken, packet_index: usize) {
+        let cleanup_fault = self.unsafe_cleanup_fault;
+        if cleanup_fault == Some(CopyUnsafeCleanupFault::RetainedPackets) {
+            self.rx_faults.push(CopyRxFaultEvent {
+                block: token,
+                packet_index,
+                fault: CopyRxDescriptorFault::UnsafeChain,
+            });
+            return;
+        }
         let index = self
             .blocks
             .iter()
@@ -322,22 +343,28 @@ impl CopyState {
                 self.source_live.remove(&packet.live.visible_address),
                 Some(packet.live)
             );
-            self.source_events.push(CopySourceEvent {
-                source: packet.live,
-                ingress: packet.ingress,
-                disposition: CopySourceDisposition::RxInvalid(CopyRxDescriptorFault::UnsafeChain),
-            });
+            if cleanup_fault != Some(CopyUnsafeCleanupFault::MissingSourceTerminal) {
+                self.source_events.push(CopySourceEvent {
+                    source: packet.live,
+                    ingress: self.ingress_override.unwrap_or(packet.ingress),
+                    disposition: CopySourceDisposition::RxInvalid(
+                        CopyRxDescriptorFault::UnsafeChain,
+                    ),
+                });
+            }
         }
         self.rx_faults.push(CopyRxFaultEvent {
             block: token,
             packet_index,
             fault: CopyRxDescriptorFault::UnsafeChain,
         });
-        self.free_rx_block_ids.push(token.block_id);
-        self.block_returns.push(CopyRxBlockReturn {
-            block: token,
-            packet_count: block.packets.len(),
-        });
+        if cleanup_fault != Some(CopyUnsafeCleanupFault::MissingBlockReturn) {
+            self.free_rx_block_ids.push(token.block_id);
+            self.block_returns.push(CopyRxBlockReturn {
+                block: token,
+                packet_count: block.packets.len(),
+            });
+        }
     }
 }
 
@@ -431,7 +458,11 @@ struct CopyFakeSlot {
 
 impl PacketSlot for CopyFakeSlot {
     fn ingress(&self) -> ruster_core::IfId {
-        self.packet.as_ref().expect("live source slot").ingress
+        let packet = self.packet.as_ref().expect("live source slot");
+        self.state
+            .borrow()
+            .ingress_override
+            .unwrap_or(packet.ingress)
     }
 
     fn bytes_mut(&mut self) -> &mut [u8] {
@@ -861,6 +892,243 @@ impl RxCopyAdversarialHarness for CopyFakeHarness {
     fn drain_copy_rx_faults(&mut self) -> Vec<CopyRxFaultEvent> {
         std::mem::take(&mut self.io.0.borrow_mut().rx_faults)
     }
+}
+
+trait CopyFaultConfiguration {
+    fn configure(state: &mut CopyState);
+
+    fn mutate_tx_events(_events: &mut Vec<CopyTxEvent>) {}
+}
+
+struct SwapTxEventSources;
+
+impl CopyFaultConfiguration for SwapTxEventSources {
+    fn configure(_state: &mut CopyState) {}
+
+    fn mutate_tx_events(events: &mut Vec<CopyTxEvent>) {
+        assert!(
+            events.len() >= 2,
+            "partial-reject fixture needs two TX events"
+        );
+        let first_source = events[0].source;
+        events[0].source = events[1].source;
+        events[1].source = first_source;
+    }
+}
+
+struct WrongRxIngress;
+
+impl CopyFaultConfiguration for WrongRxIngress {
+    fn configure(state: &mut CopyState) {
+        state.ingress_override = Some(CONFORMANCE_WAN);
+    }
+}
+
+struct MissingUnsafeSourceTerminal;
+
+impl CopyFaultConfiguration for MissingUnsafeSourceTerminal {
+    fn configure(state: &mut CopyState) {
+        state.unsafe_cleanup_fault = Some(CopyUnsafeCleanupFault::MissingSourceTerminal);
+    }
+}
+
+struct MissingUnsafeBlockReturn;
+
+impl CopyFaultConfiguration for MissingUnsafeBlockReturn {
+    fn configure(state: &mut CopyState) {
+        state.unsafe_cleanup_fault = Some(CopyUnsafeCleanupFault::MissingBlockReturn);
+    }
+}
+
+struct RetainedUnsafePackets;
+
+impl CopyFaultConfiguration for RetainedUnsafePackets {
+    fn configure(state: &mut CopyState) {
+        state.unsafe_cleanup_fault = Some(CopyUnsafeCleanupFault::RetainedPackets);
+    }
+}
+
+struct FaultyCopyHarness<F> {
+    inner: CopyFakeHarness,
+    _fault: PhantomData<F>,
+}
+
+impl<F: CopyFaultConfiguration> FaultyCopyHarness<F> {
+    fn configured() -> Self {
+        let inner = CopyFakeHarness::shared();
+        F::configure(&mut inner.io.0.borrow_mut());
+        Self {
+            inner,
+            _fault: PhantomData,
+        }
+    }
+}
+
+impl<F: CopyFaultConfiguration> RxCopyHarness for FaultyCopyHarness<F> {
+    type Io = CopyFakeIo;
+    type Observer = CopyFakeObserver;
+
+    fn new() -> Self {
+        Self::configured()
+    }
+
+    fn io_and_observer(&mut self) -> (&mut Self::Io, &mut Self::Observer) {
+        (&mut self.inner.io, &mut self.inner.observer)
+    }
+
+    fn inject_rx_block(
+        &mut self,
+        ingress: ruster_core::IfId,
+        packets: Vec<Vec<u8>>,
+    ) -> InjectedCopyRxBlock {
+        self.inner.inject_with_fault(ingress, packets, None)
+    }
+
+    fn set_copy_tx_accept_budget(&mut self, budget: usize) {
+        self.inner.io.0.borrow_mut().tx_accept_budget = budget;
+    }
+
+    fn set_copy_operation_budgets(&mut self, budgets: CopyOperationBudgets) {
+        self.inner.io.0.borrow_mut().operation_budgets = budgets;
+    }
+
+    fn pending_copy_rx_packets(&self) -> usize {
+        <CopyFakeHarness as RxCopyHarness>::pending_copy_rx_packets(&self.inner)
+    }
+
+    fn free_copy_tx_frames(&self) -> usize {
+        <CopyFakeHarness as RxCopyHarness>::free_copy_tx_frames(&self.inner)
+    }
+
+    fn inflight_copy_tx_frames(&self) -> usize {
+        <CopyFakeHarness as RxCopyHarness>::inflight_copy_tx_frames(&self.inner)
+    }
+
+    fn copy_operation_counters(&self) -> CopyOperationCounters {
+        <CopyFakeHarness as RxCopyHarness>::copy_operation_counters(&self.inner)
+    }
+
+    fn production_payload_hook_enabled(&self) -> bool {
+        <CopyFakeHarness as RxCopyHarness>::production_payload_hook_enabled(&self.inner)
+    }
+
+    fn copy_rx_scan_observation(&self, block: CopyRxBlockToken) -> CopyRxScanObservation {
+        <CopyFakeHarness as RxCopyHarness>::copy_rx_scan_observation(&self.inner, block)
+    }
+
+    fn drain_copy_source_events(&mut self) -> Vec<CopySourceEvent> {
+        <CopyFakeHarness as RxCopyHarness>::drain_copy_source_events(&mut self.inner)
+    }
+
+    fn drain_copy_tx_events(&mut self) -> Vec<CopyTxEvent> {
+        let mut events = <CopyFakeHarness as RxCopyHarness>::drain_copy_tx_events(&mut self.inner);
+        F::mutate_tx_events(&mut events);
+        events
+    }
+
+    fn drain_copy_rx_block_returns(&mut self) -> Vec<CopyRxBlockReturn> {
+        <CopyFakeHarness as RxCopyHarness>::drain_copy_rx_block_returns(&mut self.inner)
+    }
+
+    fn drain_copy_tx_kicks(&mut self) -> Vec<CopyKickEvent> {
+        <CopyFakeHarness as RxCopyHarness>::drain_copy_tx_kicks(&mut self.inner)
+    }
+}
+
+impl<F: CopyFaultConfiguration> RxCopyCompletionHarness for FaultyCopyHarness<F> {
+    fn complete_copy_submissions(&mut self) -> Vec<CopyTxCompletion> {
+        <CopyFakeHarness as RxCopyCompletionHarness>::complete_copy_submissions(&mut self.inner)
+    }
+
+    fn prefer_copy_tx_frame(&mut self, frame_id: u64) {
+        <CopyFakeHarness as RxCopyCompletionHarness>::prefer_copy_tx_frame(
+            &mut self.inner,
+            frame_id,
+        );
+    }
+
+    fn prefer_copy_rx_block(&mut self, block_id: u64) {
+        <CopyFakeHarness as RxCopyCompletionHarness>::prefer_copy_rx_block(
+            &mut self.inner,
+            block_id,
+        );
+    }
+
+    fn set_copy_completion_head_sending(&mut self, sending: bool) {
+        <CopyFakeHarness as RxCopyCompletionHarness>::set_copy_completion_head_sending(
+            &mut self.inner,
+            sending,
+        );
+    }
+}
+
+impl<F: CopyFaultConfiguration> RxCopyAdversarialHarness for FaultyCopyHarness<F> {
+    fn inject_rx_block_with_fault(
+        &mut self,
+        ingress: ruster_core::IfId,
+        packets: Vec<Vec<u8>>,
+        packet_index: usize,
+        fault: CopyRxDescriptorFault,
+    ) -> InjectedCopyRxBlock {
+        self.inner
+            .inject_with_fault(ingress, packets, Some((packet_index, fault)))
+    }
+
+    fn drain_copy_rx_faults(&mut self) -> Vec<CopyRxFaultEvent> {
+        <CopyFakeHarness as RxCopyAdversarialHarness>::drain_copy_rx_faults(&mut self.inner)
+    }
+}
+
+fn assert_conformance_rejects_fault(run: impl FnOnce()) {
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).is_err(),
+        "conformance accepted the deliberately faulty fake"
+    );
+}
+
+#[test]
+fn copy_conformance_detects_tx_source_event_misbinding() {
+    assert_conformance_rejects_fault(|| {
+        rx_copy::partial_reject_reclaims_tx_and_terminals_source::<
+            FaultyCopyHarness<SwapTxEventSources>,
+        >();
+    });
+}
+
+#[test]
+fn copy_conformance_detects_unsafe_chain_missing_source_terminal() {
+    assert_conformance_rejects_fault(|| {
+        rx_copy::validation_budgets_and_fault_advance_are_bounded::<
+            FaultyCopyHarness<MissingUnsafeSourceTerminal>,
+        >();
+    });
+}
+
+#[test]
+fn copy_conformance_detects_unsafe_chain_missing_block_return() {
+    assert_conformance_rejects_fault(|| {
+        rx_copy::validation_budgets_and_fault_advance_are_bounded::<
+            FaultyCopyHarness<MissingUnsafeBlockReturn>,
+        >();
+    });
+}
+
+#[test]
+fn copy_conformance_detects_unsafe_chain_retained_packets() {
+    assert_conformance_rejects_fault(|| {
+        rx_copy::validation_budgets_and_fault_advance_are_bounded::<
+            FaultyCopyHarness<RetainedUnsafePackets>,
+        >();
+    });
+}
+
+#[test]
+fn copy_conformance_detects_wrong_rx_ingress() {
+    assert_conformance_rejects_fault(|| {
+        rx_copy::split_budgets_resume_without_rescan_or_early_block_return::<
+            FaultyCopyHarness<WrongRxIngress>,
+        >();
+    });
 }
 
 #[test]

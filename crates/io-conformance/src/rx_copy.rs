@@ -284,6 +284,106 @@ fn assert_source_bindings(expected: &[LiveCopyRxPacket], events: &[CopySourceEve
             "source terminal changed its lease-time binding"
         );
     }
+    for event in events {
+        assert_eq!(
+            event.ingress, CONFORMANCE_LAN,
+            "source terminal changed the injected RX ingress"
+        );
+    }
+}
+
+fn assert_tx_source_bindings(sources: &[CopySourceEvent], tx_events: &[CopyTxEvent]) {
+    for source_event in sources {
+        match source_event.disposition {
+            CopySourceDisposition::TxAccepted { tx, endpoint } => {
+                let matches = tx_events
+                    .iter()
+                    .filter(|event| {
+                        event.source == source_event.source
+                            && event.tx == tx
+                            && event.endpoint == endpoint
+                            && event.disposition == CopyTxDisposition::Submitted
+                    })
+                    .count();
+                assert_eq!(
+                    matches, 1,
+                    "accepted source does not have exactly one matching TX event"
+                );
+            }
+            CopySourceDisposition::TxRejected {
+                tx: Some(tx),
+                endpoint: Some(endpoint),
+                ..
+            } => {
+                let matches = tx_events
+                    .iter()
+                    .filter(|event| {
+                        event.source == source_event.source
+                            && event.tx == tx
+                            && event.endpoint == endpoint
+                            && event.disposition == CopyTxDisposition::Rejected
+                    })
+                    .count();
+                assert_eq!(
+                    matches, 1,
+                    "rejected source does not have exactly one matching TX event"
+                );
+            }
+            CopySourceDisposition::TxRejected {
+                tx: Some(_),
+                endpoint: None,
+                ..
+            } => panic!("rejected source retained a TX frame without an endpoint"),
+            CopySourceDisposition::TxRejected { tx: None, .. }
+            | CopySourceDisposition::RxInvalid(_)
+            | CopySourceDisposition::Reclaimed(_) => {
+                assert!(
+                    tx_events
+                        .iter()
+                        .all(|event| event.source != source_event.source),
+                    "non-submitted source has a TX event"
+                );
+            }
+        }
+    }
+
+    for tx_event in tx_events {
+        let matching_sources = sources
+            .iter()
+            .filter(|source_event| source_event.source == tx_event.source)
+            .count();
+        assert_eq!(
+            matching_sources, 1,
+            "TX event source has no unique source terminal event"
+        );
+        let source_event = sources
+            .iter()
+            .find(|source_event| source_event.source == tx_event.source)
+            .expect("TX event source terminal");
+        match source_event.disposition {
+            CopySourceDisposition::TxAccepted { tx, endpoint } => {
+                assert_eq!(tx_event.source, source_event.source);
+                assert_eq!(tx_event.tx, tx);
+                assert_eq!(tx_event.endpoint, endpoint);
+                assert_eq!(tx_event.disposition, CopyTxDisposition::Submitted);
+            }
+            CopySourceDisposition::TxRejected {
+                tx: Some(tx),
+                endpoint: Some(endpoint),
+                ..
+            } => {
+                assert_eq!(tx_event.source, source_event.source);
+                assert_eq!(tx_event.tx, tx);
+                assert_eq!(tx_event.endpoint, endpoint);
+                assert_eq!(tx_event.disposition, CopyTxDisposition::Rejected);
+            }
+            CopySourceDisposition::TxRejected { .. }
+            | CopySourceDisposition::RxInvalid(_)
+            | CopySourceDisposition::Reclaimed(_) => {
+                panic!("TX event does not match its source disposition")
+            }
+        }
+    }
 }
 
 /// Zero budget cannot acquire or validate a block.
@@ -329,6 +429,7 @@ pub fn split_budgets_resume_without_rescan_or_early_block_return<H: RxCopyHarnes
                 .receive(1)
                 .unwrap_or_else(|_| panic!("RX receive failed"));
             let mut packet = batch.next_packet().expect("saved-cursor packet");
+            assert_eq!(packet.ingress(), CONFORMANCE_LAN);
             observed.push(observer.observe_source(packet.bytes_mut()));
             packet.recycle(DropReason::RouteMiss);
             assert!(batch.next_packet().is_none());
@@ -418,6 +519,7 @@ pub fn transmit_uses_distinct_tx_storage_and_exact_payload<H: RxCopyPayloadHarne
             .receive(1)
             .unwrap_or_else(|_| panic!("RX receive failed"));
         let mut packet = batch.next_packet().expect("source packet");
+        assert_eq!(packet.ingress(), CONFORMANCE_LAN);
         assert_eq!(
             observer.observe_source(packet.bytes_mut()),
             injected.packets[0]
@@ -446,6 +548,7 @@ pub fn transmit_uses_distinct_tx_storage_and_exact_payload<H: RxCopyPayloadHarne
         "copy backend submitted source storage in place"
     );
     let tx_events = harness.drain_copy_tx_events();
+    assert_tx_source_bindings(&source_events, &tx_events);
     assert_eq!(tx_events.len(), 1);
     assert_eq!(tx_events[0].source, injected.packets[0]);
     assert_eq!(tx_events[0].tx, tx);
@@ -524,6 +627,7 @@ pub fn partial_reject_reclaims_tx_and_terminals_source<H: RxCopyHarness>() {
             .count(),
         2
     );
+    assert_tx_source_bindings(&source_events, &tx_events);
     for event in &tx_events {
         assert_eq!(
             tx_events
@@ -676,6 +780,7 @@ where
         })
         .expect("one accepted TX");
     let tx_events = harness.drain_copy_tx_events();
+    assert_tx_source_bindings(&sources, &tx_events);
     assert_eq!(
         tx_events
             .iter()
@@ -974,6 +1079,8 @@ pub fn validation_budgets_and_fault_advance_are_bounded<H: RxCopyAdversarialHarn
             packet_count: 3,
         }]
     );
+    let safe_source_events = harness.drain_copy_source_events();
+    assert_source_bindings(&safe.packets, &safe_source_events);
 
     harness.set_copy_operation_budgets(CopyOperationBudgets {
         rx_block_status_reads: 1,
@@ -1016,6 +1123,22 @@ pub fn validation_budgets_and_fault_advance_are_bounded<H: RxCopyAdversarialHarn
             block: unsafe_block.block,
             packet_index: 1,
             fault: CopyRxDescriptorFault::UnsafeChain,
+        }]
+    );
+    assert_eq!(harness.pending_copy_rx_packets(), 0);
+    let unsafe_source_events = harness.drain_copy_source_events();
+    assert_source_bindings(&unsafe_block.packets, &unsafe_source_events);
+    for event in unsafe_source_events {
+        assert_eq!(
+            event.disposition,
+            CopySourceDisposition::RxInvalid(CopyRxDescriptorFault::UnsafeChain)
+        );
+    }
+    assert_eq!(
+        harness.drain_copy_rx_block_returns(),
+        [CopyRxBlockReturn {
+            block: unsafe_block.block,
+            packet_count: 4_096,
         }]
     );
 }

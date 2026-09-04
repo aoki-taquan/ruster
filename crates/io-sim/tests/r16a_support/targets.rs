@@ -1,12 +1,14 @@
+use std::convert::Infallible;
+
 use ruster_core::{
     forward_batch_with_resolution, internet_checksum, validate_ipv4_frame, ArpRequestAction,
-    DropReason, DynamicNeighborSlot, ForwardingSnapshot, IfId, Interface, Ipv4Address,
-    LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoTrace, PacketIo,
-    ResolutionActionSlot, ResolutionCounters, ResolutionFailureCounters, ResolutionPhase,
-    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, ResolutionStatus, Route,
-    ETHERNET_HEADER_LEN,
+    BatchCompletion, BatchReport, ConsumeReason, DropReason, DynamicNeighborSlot,
+    ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    MonotonicMillis, Neighbor, NoTrace, PacketIo, ResolutionActionSlot, ResolutionCounters,
+    ResolutionFailureCounters, ResolutionPhase, ResolutionPolicy, ResolutionRuntime,
+    ResolutionStateSlot, ResolutionStatus, Route, ETHERNET_HEADER_LEN,
 };
-use ruster_io_sim::{RecycleCause, SimIo};
+use ruster_io_sim::{RecycleCause, RecycledFrame, SimIo};
 
 use super::envelope::{
     parse, CaseEnvelope, DropCode, Expected, ParserAccept, ResolutionSummary, Target,
@@ -474,6 +476,13 @@ fn run_admission(case: &CaseEnvelope<'_>) -> Result<(), CaseFailure> {
 }
 
 fn run_resolution(case: &CaseEnvelope<'_>) -> Result<(), CaseFailure> {
+    run_resolution_with_fault(case, ResolutionFault::None)
+}
+
+fn run_resolution_with_fault(
+    case: &CaseEnvelope<'_>,
+    fault: ResolutionFault,
+) -> Result<(), CaseFailure> {
     let Expected::Resolution(expected) = case.expected else {
         return Err(CaseFailure::new(
             "resolution target has non-resolution expected value",
@@ -500,21 +509,32 @@ fn run_resolution(case: &CaseEnvelope<'_>) -> Result<(), CaseFailure> {
             .ok_or_else(|| CaseFailure::new("resolution operation time overflow"))?;
         match operation {
             ResolutionOperation::Miss(target) => {
-                let packet = resolution_ipv4(target_address(target));
+                let target_ip = target_address(target);
+                let dynamic_hit = resolution_dynamic_hit(&runtime, target_ip, MonotonicMillis(now));
+                let packet = resolution_ipv4(target_ip);
                 let mut io = SimIo::new();
                 io.inject(LAN, packet);
                 let batch = io.receive(1).unwrap();
-                let report = forward_batch_with_resolution(
+                let mut report = forward_batch_with_resolution(
                     batch,
                     &snapshot,
                     &mut runtime,
                     MonotonicMillis(now),
                     &mut NoTrace,
                 );
-                if !report.invariants_hold() {
-                    return Err(CaseFailure::new(format!(
-                        "resolution miss report invariant failed at step={step}"
-                    )));
+                let mut recycled = io.pop_recycled();
+                apply_resolution_fault(fault, &mut report, &mut recycled);
+                // A Miss after a successful Learn is a legitimate cache hit;
+                // the typed recycle oracle applies to unresolved misses.
+                if dynamic_hit {
+                    assert_resolution_miss_forwarded(&report, &mut io, step)?;
+                } else {
+                    assert_resolution_disposition(
+                        operation,
+                        &report,
+                        recycled.as_ref().map(|frame| frame.cause),
+                        step,
+                    )?;
                 }
             }
             ResolutionOperation::Learn(target) => {
@@ -522,18 +542,21 @@ fn run_resolution(case: &CaseEnvelope<'_>) -> Result<(), CaseFailure> {
                 let mut io = SimIo::new();
                 io.inject(WAN, packet);
                 let batch = io.receive(1).unwrap();
-                let report = forward_batch_with_resolution(
+                let mut report = forward_batch_with_resolution(
                     batch,
                     &snapshot,
                     &mut runtime,
                     MonotonicMillis(now),
                     &mut NoTrace,
                 );
-                if !report.invariants_hold() || report.consumed != 1 {
-                    return Err(CaseFailure::new(format!(
-                        "resolution learn disposition failed at step={step}"
-                    )));
-                }
+                let mut recycled = io.pop_recycled();
+                apply_resolution_fault(fault, &mut report, &mut recycled);
+                assert_resolution_disposition(
+                    operation,
+                    &report,
+                    recycled.as_ref().map(|frame| frame.cause),
+                    step,
+                )?;
             }
             ResolutionOperation::InvalidFuture => {
                 let mut packet = resolution_ipv4(DESTINATION);
@@ -543,7 +566,7 @@ fn run_resolution(case: &CaseEnvelope<'_>) -> Result<(), CaseFailure> {
                 let mut io = SimIo::new();
                 io.inject(LAN, packet);
                 let batch = io.receive(1).unwrap();
-                let report = forward_batch_with_resolution(
+                let mut report = forward_batch_with_resolution(
                     batch,
                     &snapshot,
                     &mut runtime,
@@ -553,14 +576,21 @@ fn run_resolution(case: &CaseEnvelope<'_>) -> Result<(), CaseFailure> {
                     ),
                     &mut NoTrace,
                 );
-                let recycled = io
-                    .pop_recycled()
-                    .ok_or_else(|| CaseFailure::new("invalid future packet missing recycle"))?;
+                let mut recycled = io.pop_recycled();
+                apply_resolution_fault(fault, &mut report, &mut recycled);
                 let after = capture_resolution_evidence(&runtime);
-                if report.dropped != 1 || recycled.bytes != original {
-                    return Err(CaseFailure::new(format!(
-                        "invalid future packet mutated resolution state at step={step}"
-                    )));
+                assert_resolution_disposition(
+                    operation,
+                    &report,
+                    recycled.as_ref().map(|frame| frame.cause),
+                    step,
+                )?;
+                if let Some(recycled) = recycled {
+                    if recycled.bytes != original {
+                        return Err(CaseFailure::new(format!(
+                            "invalid future packet mutated resolution state at step={step}"
+                        )));
+                    }
                 }
                 assert_resolution_invalid_future_preserves(&before_evidence, &after);
             }
@@ -577,6 +607,95 @@ fn run_resolution(case: &CaseEnvelope<'_>) -> Result<(), CaseFailure> {
     if actual_evidence != expected_evidence {
         return Err(CaseFailure::new(format!(
             "resolution typed evidence mismatch expected={expected_evidence:?} actual={actual_evidence:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn resolution_dynamic_hit(
+    runtime: &ResolutionRuntime<'_>,
+    target: Ipv4Address,
+    now: MonotonicMillis,
+) -> bool {
+    runtime.dynamic_neighbor_slots().iter().any(|slot| {
+        slot.is_occupied()
+            && slot.interface() == WAN
+            && slot.target() == target
+            && now.0 >= slot.refreshed_at().0
+            && now.0 - slot.refreshed_at().0 < 60_000
+    })
+}
+
+fn assert_resolution_miss_forwarded<E>(
+    report: &BatchReport<E>,
+    io: &mut SimIo,
+    step: usize,
+) -> Result<(), CaseFailure> {
+    if !report.invariants_hold() {
+        return Err(CaseFailure::new(format!(
+            "resolution resolved miss report invariant failed at step={step}"
+        )));
+    }
+    let actual_counts = (report.tx_requested, report.dropped, report.consumed);
+    if actual_counts != (1, 0, 0) {
+        return Err(CaseFailure::new(format!(
+            "resolution resolved miss disposition counts mismatch at step={step}: expected=(1, 0, 0) actual={actual_counts:?}"
+        )));
+    }
+    let tx = io
+        .pop_tx()
+        .ok_or_else(|| CaseFailure::new("resolution resolved miss missing TX"))?;
+    if tx.egress != WAN {
+        return Err(CaseFailure::new(format!(
+            "resolution resolved miss egress mismatch at step={step}: expected={WAN:?} actual={:?}",
+            tx.egress
+        )));
+    }
+    Ok(())
+}
+
+fn assert_resolution_disposition<E>(
+    operation: ResolutionOperation,
+    report: &BatchReport<E>,
+    recycled_cause: Option<RecycleCause>,
+    step: usize,
+) -> Result<(), CaseFailure> {
+    let (operation_name, expected_counts, expected_cause) = match operation {
+        ResolutionOperation::Miss(_) => (
+            "miss",
+            (0, 1, 0),
+            RecycleCause::Forwarding(DropReason::NeighborUnresolved),
+        ),
+        ResolutionOperation::Learn(_) => (
+            "learn",
+            (0, 0, 1),
+            RecycleCause::Consumed(ConsumeReason::ArpControl),
+        ),
+        ResolutionOperation::InvalidFuture => (
+            "invalid future",
+            (0, 1, 0),
+            RecycleCause::Forwarding(DropReason::EthernetDestinationNotLocal),
+        ),
+    };
+    if !report.invariants_hold() {
+        return Err(CaseFailure::new(format!(
+            "resolution {operation_name} report invariant failed at step={step}"
+        )));
+    }
+    let actual_counts = (report.tx_requested, report.dropped, report.consumed);
+    if actual_counts != expected_counts {
+        return Err(CaseFailure::new(format!(
+            "resolution {operation_name} disposition counts mismatch at step={step}: expected={expected_counts:?} actual={actual_counts:?}"
+        )));
+    }
+    let Some(actual_cause) = recycled_cause else {
+        return Err(CaseFailure::new(format!(
+            "resolution {operation_name} missing recycle at step={step}"
+        )));
+    };
+    if actual_cause != expected_cause {
+        return Err(CaseFailure::new(format!(
+            "resolution {operation_name} recycle cause mismatch at step={step}: expected={expected_cause:?} actual={actual_cause:?}"
         )));
     }
     Ok(())
@@ -611,6 +730,42 @@ enum ResolutionOperation {
     Miss(u8),
     Learn(u8),
     InvalidFuture,
+}
+
+#[derive(Clone, Copy)]
+enum ResolutionFault {
+    None,
+    RecycleCause(RecycleCause),
+    OmitRecycle,
+    MalformedCompletion,
+    UnexpectedConsumedCount,
+}
+
+fn apply_resolution_fault(
+    fault: ResolutionFault,
+    report: &mut BatchReport<Infallible>,
+    recycled: &mut Option<RecycledFrame>,
+) {
+    match fault {
+        ResolutionFault::None => {}
+        ResolutionFault::RecycleCause(cause) => {
+            if let Some(frame) = recycled.as_mut() {
+                frame.cause = cause;
+            }
+        }
+        ResolutionFault::OmitRecycle => *recycled = None,
+        ResolutionFault::MalformedCompletion => {
+            report.completion.tx_requested = 1;
+            report.completion.tx_accepted = 1;
+            report.completion.tx_rejected = 1;
+            report.completion.recycled = 1;
+        }
+        ResolutionFault::UnexpectedConsumedCount => {
+            report.received = 2;
+            report.consumed = 1;
+            report.completion.recycled = 2;
+        }
+    }
 }
 
 struct ResolutionOperations {
@@ -1299,4 +1454,255 @@ fn resolution_topology() -> ([Route; 1], [Interface; 2], [LocalIpv4Binding; 2]) 
 fn read_be_u16(bytes: &[u8], offset: usize) -> Option<u16> {
     let word = bytes.get(offset..offset.checked_add(2)?)?;
     Some(u16::from_be_bytes(word.try_into().unwrap()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn explicit_resolution_case<'a>(payload: &'a [u8]) -> CaseEnvelope<'a> {
+        CaseEnvelope {
+            target: Target::Resolution,
+            seed: V1_SEEDS[0],
+            case_index: 0,
+            now: 100,
+            ingress: LAN.0,
+            expected: Expected::Resolution(model_resolution(payload).unwrap()),
+            payload,
+        }
+    }
+
+    fn assert_runtime_fault_detected(payload: &[u8], fault: ResolutionFault, description: &str) {
+        let case = explicit_resolution_case(payload);
+        let result = run_resolution_with_fault(&case, fault);
+        assert!(
+            result.is_err(),
+            "runtime resolution oracle accepted {description} payload={payload:?}"
+        );
+    }
+
+    fn resolution_operation_from_payload(payload: &[u8]) -> ResolutionOperation {
+        let operations = parse_resolution_payload(payload).unwrap();
+        assert_eq!(operations.operations.len(), 1);
+        operations.operations[0]
+    }
+
+    fn synthetic_report(
+        received: usize,
+        dropped: usize,
+        consumed: usize,
+        recycled: usize,
+    ) -> BatchReport<()> {
+        synthetic_report_with_completion(received, dropped, consumed, 0, 0, 0, recycled)
+    }
+
+    fn synthetic_report_with_completion(
+        received: usize,
+        dropped: usize,
+        consumed: usize,
+        tx_requested: usize,
+        tx_accepted: usize,
+        tx_rejected: usize,
+        recycled: usize,
+    ) -> BatchReport<()> {
+        BatchReport {
+            received,
+            tx_requested,
+            dropped,
+            consumed,
+            completion: BatchCompletion {
+                tx_requested,
+                tx_accepted,
+                tx_rejected,
+                recycled,
+                error: None,
+            },
+        }
+    }
+
+    #[test]
+    fn resolution_miss_oracle_rejects_adversarial_recycle_causes() {
+        let report = synthetic_report(1, 1, 0, 1);
+        for cause in [
+            RecycleCause::Consumed(ConsumeReason::Ipv4LocalUnsupported),
+            RecycleCause::Forwarding(DropReason::RouteMiss),
+        ] {
+            let result = assert_resolution_disposition(
+                ResolutionOperation::Miss(0),
+                &report,
+                Some(cause),
+                0,
+            );
+            assert!(
+                result.is_err(),
+                "miss oracle accepted adversarial cause {cause:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolution_learn_oracle_rejects_wrong_consume_reason() {
+        let report = synthetic_report(1, 0, 1, 1);
+        let result = assert_resolution_disposition(
+            ResolutionOperation::Learn(0),
+            &report,
+            Some(RecycleCause::Consumed(ConsumeReason::Ipv4LocalUnsupported)),
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "learn oracle accepted wrong consume reason"
+        );
+    }
+
+    #[test]
+    fn resolution_invalid_future_oracle_rejects_wrong_drop_cause() {
+        let report = synthetic_report(1, 1, 0, 1);
+        let result = assert_resolution_disposition(
+            ResolutionOperation::InvalidFuture,
+            &report,
+            Some(RecycleCause::Forwarding(DropReason::RouteMiss)),
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "invalid-future oracle accepted wrong cause"
+        );
+    }
+
+    #[test]
+    fn resolution_invalid_future_oracle_rejects_wrong_consumed_count() {
+        let report = synthetic_report(2, 1, 1, 2);
+        let result = assert_resolution_disposition(
+            ResolutionOperation::InvalidFuture,
+            &report,
+            Some(RecycleCause::Forwarding(
+                DropReason::EthernetDestinationNotLocal,
+            )),
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "invalid-future oracle accepted unexpected consumed count"
+        );
+    }
+
+    #[test]
+    fn resolution_invalid_future_oracle_rejects_broken_report_invariants() {
+        let report = synthetic_report(1, 1, 0, 0);
+        let result = assert_resolution_disposition(
+            ResolutionOperation::InvalidFuture,
+            &report,
+            Some(RecycleCause::Forwarding(
+                DropReason::EthernetDestinationNotLocal,
+            )),
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "invalid-future oracle accepted broken report accounting"
+        );
+    }
+
+    #[test]
+    fn resolution_oracle_rejects_missing_recycle() {
+        let cases = [
+            (ResolutionOperation::Miss(0), synthetic_report(1, 1, 0, 1)),
+            (ResolutionOperation::Learn(0), synthetic_report(1, 0, 1, 1)),
+            (
+                ResolutionOperation::InvalidFuture,
+                synthetic_report(1, 1, 0, 1),
+            ),
+        ];
+        for (operation, report) in cases {
+            let result = assert_resolution_disposition(operation, &report, None, 0);
+            assert!(
+                result.is_err(),
+                "resolution oracle accepted missing recycle"
+            );
+        }
+    }
+
+    #[test]
+    fn resolution_miss_runtime_oracle_rejects_wrong_recycle_cause() {
+        assert_runtime_fault_detected(
+            &[1, 1, 0, 1, 0, 0],
+            ResolutionFault::RecycleCause(RecycleCause::Consumed(
+                ConsumeReason::Ipv4LocalUnsupported,
+            )),
+            "Miss wrong recycle cause",
+        );
+    }
+
+    #[test]
+    fn resolution_learn_runtime_oracle_rejects_wrong_consume_reason() {
+        assert_runtime_fault_detected(
+            &[1, 1, 1, 1, 1, 0],
+            ResolutionFault::RecycleCause(RecycleCause::Consumed(
+                ConsumeReason::Ipv4LocalUnsupported,
+            )),
+            "Learn wrong consume reason",
+        );
+    }
+
+    #[test]
+    fn resolution_invalid_future_runtime_oracle_rejects_wrong_drop_cause() {
+        assert_runtime_fault_detected(
+            &[1, 1, 0, 1, 2, 0],
+            ResolutionFault::RecycleCause(RecycleCause::Forwarding(DropReason::RouteMiss)),
+            "InvalidFuture wrong drop cause",
+        );
+    }
+
+    #[test]
+    fn resolution_invalid_future_runtime_oracle_rejects_wrong_consumed_count() {
+        assert_runtime_fault_detected(
+            &[1, 1, 0, 1, 2, 0],
+            ResolutionFault::UnexpectedConsumedCount,
+            "InvalidFuture wrong consumed count",
+        );
+    }
+
+    #[test]
+    fn resolution_invalid_future_runtime_oracle_rejects_malformed_completion_partition() {
+        assert_runtime_fault_detected(
+            &[1, 1, 0, 1, 2, 0],
+            ResolutionFault::MalformedCompletion,
+            "InvalidFuture malformed accepted/rejected completion",
+        );
+    }
+
+    #[test]
+    fn resolution_runtime_oracle_rejects_missing_recycle() {
+        for payload in [
+            &[1, 1, 0, 1, 0, 0][..],
+            &[1, 1, 1, 1, 1, 0][..],
+            &[1, 1, 0, 1, 2, 0][..],
+        ] {
+            assert_runtime_fault_detected(
+                payload,
+                ResolutionFault::OmitRecycle,
+                "resolution missing recycle",
+            );
+        }
+    }
+
+    #[test]
+    fn resolution_invalid_future_oracle_rejects_payload_completion_partition() {
+        let payload = [1, 1, 0, 1, 2, 0];
+        let operation = resolution_operation_from_payload(&payload);
+        let report = synthetic_report_with_completion(1, 1, 0, 1, 0, 0, 1);
+        let result = assert_resolution_disposition(
+            operation,
+            &report,
+            Some(RecycleCause::Forwarding(
+                DropReason::EthernetDestinationNotLocal,
+            )),
+            0,
+        );
+        assert!(
+            result.is_err(),
+            "InvalidFuture payload accepted malformed completion partition"
+        );
+    }
 }

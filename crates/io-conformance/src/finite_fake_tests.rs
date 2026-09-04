@@ -29,6 +29,10 @@ const WRONG_RING: u8 = 5;
 const TOKEN_INVENTION: u8 = 6;
 const RX_BATCH_DROP_LEAK: u8 = 7;
 const GENERATED_STALE_CARRYOVER: u8 = 8;
+const RX_INVALID_RECLAIM_ACCOUNTING: u8 = 9;
+const RX_INVALID_UNKNOWN_EGRESS_ACCOUNTING: u8 = 10;
+const GENERATED_INVALID_ACCOUNTING: u8 = 11;
+const VISIBLE_ADDRESS_ALIAS: u8 = 12;
 const FRAME_CAPACITY: usize = 128;
 const FRAME_COUNT: usize = 4;
 
@@ -125,15 +129,24 @@ impl<const FAULT: u8> State<FAULT> {
 
     fn bind(&mut self, bytes: &[u8], requested_len: usize) -> LiveFrame {
         assert_eq!(bytes.len(), requested_len);
-        let visible_address = bytes.as_ptr() as usize;
+        let physical_address = bytes.as_ptr() as usize;
         assert!(
-            !self.live.contains_key(&visible_address),
+            !self.live.contains_key(&physical_address),
             "address already has a live ownership cycle"
         );
         let physical_id = *self
             .physical_by_address
-            .get(&visible_address)
+            .get(&physical_address)
             .expect("binding points at a fake physical frame");
+        let visible_address = if FAULT == VISIBLE_ADDRESS_ALIAS {
+            *self
+                .physical_by_address
+                .keys()
+                .next()
+                .expect("fake physical pool is not empty")
+        } else {
+            physical_address
+        };
         let frame_id = if FAULT == ALIAS { 1 } else { physical_id };
         let generation = if FAULT == STALE_GENERATION {
             1
@@ -147,7 +160,7 @@ impl<const FAULT: u8> State<FAULT> {
             visible_address,
             requested_len,
         };
-        self.live.insert(visible_address, frame);
+        self.live.insert(physical_address, frame);
         frame
     }
 
@@ -160,7 +173,8 @@ impl<const FAULT: u8> State<FAULT> {
 
     fn retire(&mut self, bytes: &[u8]) -> LiveFrame {
         let frame = self.observe(bytes);
-        assert_eq!(self.live.remove(&frame.visible_address), Some(frame));
+        let physical_address = bytes.as_ptr() as usize;
+        assert_eq!(self.live.remove(&physical_address), Some(frame));
         frame
     }
 
@@ -292,8 +306,18 @@ impl<const FAULT: u8> PacketBatch for FakeRxBatch<FAULT> {
     fn finish(self) -> BatchCompletion<Self::Error> {
         assert!(self.leased.is_empty(), "fake batch left unleased frames");
         let counters = self.counters.borrow();
+        let tx_requested = if FAULT == RX_INVALID_RECLAIM_ACCOUNTING
+            && counters.tx_requested == 0
+            && counters.recycled != 0
+        {
+            1
+        } else if FAULT == RX_INVALID_UNKNOWN_EGRESS_ACCOUNTING && counters.tx_rejected != 0 {
+            0
+        } else {
+            counters.tx_requested
+        };
         BatchCompletion {
-            tx_requested: counters.tx_requested,
+            tx_requested,
             tx_accepted: counters.tx_accepted,
             tx_rejected: counters.tx_rejected,
             recycled: counters.recycled,
@@ -542,11 +566,16 @@ impl<const FAULT: u8> GeneratedPacketBatch for FakeGeneratedBatch<FAULT> {
             }
         }
         let counters = self.counters.borrow();
+        let requested = if FAULT == GENERATED_INVALID_ACCOUNTING {
+            0
+        } else {
+            counters.requested
+        };
         GeneratedBatchCompletion {
             attempts: counters.attempts,
             allocated: counters.allocated,
             failed: counters.failed,
-            requested: counters.requested,
+            requested,
             cancelled: counters.cancelled,
             abandoned: counters.abandoned,
             accepted,
@@ -861,5 +890,49 @@ fn conformance_detects_generated_whole_batch_stale_carryover() {
         generated::dropped_batch_accounts_generated_and_cannot_carry_to_next_egress::<
             FakeHarness<GENERATED_STALE_CARRYOVER>,
         >,
+    );
+}
+
+#[test]
+fn conformance_detects_invalid_rx_reclaim_accounting() {
+    assert_detected(
+        rx::recycle_consume_and_abandon_are_distinct::<FakeHarness<RX_INVALID_RECLAIM_ACCOUNTING>>,
+    );
+}
+
+#[test]
+fn conformance_detects_invalid_rx_unknown_egress_accounting() {
+    assert_detected(
+        rx::unknown_egress_is_rejected_without_submission::<
+            FakeHarness<RX_INVALID_UNKNOWN_EGRESS_ACCOUNTING>,
+        >,
+    );
+}
+
+#[test]
+fn conformance_detects_invalid_generated_accounting() {
+    assert_detected(
+        generated::partial_reject_reclaims_exact_tokens::<FakeHarness<GENERATED_INVALID_ACCOUNTING>>,
+    );
+}
+
+#[test]
+fn conformance_detects_invalid_generated_unknown_egress_accounting() {
+    assert_detected(
+        generated::unknown_egress_is_rejected_without_submission::<
+            FakeHarness<GENERATED_INVALID_ACCOUNTING>,
+        >,
+    );
+}
+
+#[test]
+fn conformance_detects_rx_visible_address_aliasing() {
+    assert_detected(rx::budget_and_unleased_slots_are_exact::<FakeHarness<VISIBLE_ADDRESS_ALIAS>>);
+}
+
+#[test]
+fn conformance_detects_generated_visible_address_aliasing() {
+    assert_detected(
+        generated::partial_reject_reclaims_exact_tokens::<FakeHarness<VISIBLE_ADDRESS_ALIAS>>,
     );
 }

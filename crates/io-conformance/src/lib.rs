@@ -258,8 +258,15 @@ pub mod rx {
     fn assert_distinct_live(frames: &[LiveFrame]) {
         let frame_ids: BTreeSet<_> = frames.iter().map(|frame| frame.token.frame_id).collect();
         let tokens: BTreeSet<_> = frames.iter().map(|frame| frame.token).collect();
+        let visible_addresses: BTreeSet<_> =
+            frames.iter().map(|frame| frame.visible_address).collect();
         assert_eq!(frame_ids.len(), frames.len(), "live RX frame alias");
         assert_eq!(tokens.len(), frames.len(), "duplicate live RX token");
+        assert_eq!(
+            visible_addresses.len(),
+            frames.len(),
+            "live RX visible address alias"
+        );
         assert!(frames.iter().all(|frame| frame.token.generation != 0));
     }
 
@@ -309,6 +316,7 @@ pub mod rx {
             assert!(batch.next_packet().is_none());
             batch.finish()
         };
+        assert!(completion.invariants_hold());
         assert_eq!(
             (
                 completion.tx_requested,
@@ -334,6 +342,7 @@ pub mod rx {
             }
             batch.finish()
         };
+        assert!(completion.invariants_hold());
         assert_eq!(completion.recycled, 2);
         assert_eq!(harness.pending_rx(), 1);
 
@@ -350,6 +359,7 @@ pub mod rx {
             assert!(batch.next_packet().is_none());
             batch.finish()
         };
+        assert!(completion.invariants_hold());
         assert_eq!(completion.recycled, 1);
         assert_eq!(
             leased_tokens,
@@ -377,6 +387,7 @@ pub mod rx {
             packet.commit(WAN);
             batch.finish()
         };
+        assert!(completion.invariants_hold());
         assert_eq!(
             (
                 completion.tx_requested,
@@ -424,6 +435,7 @@ pub mod rx {
             }
             batch.finish()
         };
+        assert!(completion.invariants_hold());
         assert_eq!(completion.recycled, 3);
         let events = harness.drain_rx_events();
         assert_event_bindings(&injected, &events);
@@ -461,6 +473,7 @@ pub mod rx {
             }
             batch.finish()
         };
+        assert!(completion.invariants_hold());
         assert_eq!(
             (
                 completion.tx_requested,
@@ -521,6 +534,7 @@ pub mod rx {
             packet.recycle(DropReason::RouteMiss);
             batch.finish()
         };
+        assert!(completion.invariants_hold());
         assert_eq!(completion.recycled, 1);
         assert_event_bindings(&[injected], &harness.drain_rx_events());
     }
@@ -565,7 +579,9 @@ pub mod rx {
             let mut packet = batch.next_packet().expect("RX lease");
             assert_eq!(observer.observe(packet.bytes_mut()), injected);
             packet.commit(WAN);
-            assert_eq!(batch.finish().tx_accepted, 1);
+            let completion = batch.finish();
+            assert!(completion.invariants_hold());
+            assert_eq!(completion.tx_accepted, 1);
         }
         let events = harness.drain_rx_events();
         assert!(matches!(events[0].kind, RxEventKind::TxSubmitted { .. }));
@@ -610,7 +626,9 @@ pub mod rx {
                     assert!(injected.contains(&observer.observe(packet.bytes_mut())));
                     packet.commit(WAN);
                 }
-                assert_eq!(batch.finish().tx_rejected, 2);
+                let completion = batch.finish();
+                assert!(completion.invariants_hold());
+                assert_eq!(completion.tx_rejected, 2);
             }
             assert_eq!(
                 harness.free_rx_frames(),
@@ -637,6 +655,7 @@ pub mod rx {
             packet.commit(unknown);
             batch.finish()
         };
+        assert!(completion.invariants_hold());
         assert_eq!((completion.tx_accepted, completion.tx_rejected), (0, 1));
         let events = harness.drain_rx_events();
         assert_event_bindings(&[injected], &events);
@@ -665,7 +684,9 @@ pub mod rx {
             let mut packet = batch.next_packet().expect("RX lease");
             assert_eq!(observer.observe(packet.bytes_mut()), first);
             packet.commit(WAN);
-            assert_eq!(batch.finish().tx_accepted, 1);
+            let completion = batch.finish();
+            assert!(completion.invariants_hold());
+            assert_eq!(completion.tx_accepted, 1);
         }
         let events = harness.drain_rx_events();
         assert_event_bindings(&[first], &events);
@@ -710,7 +731,9 @@ pub mod rx {
             let mut packet = batch.next_packet().expect("re-leased RX frame");
             assert_eq!(observer.observe(packet.bytes_mut()), second);
             packet.recycle(DropReason::RouteMiss);
-            assert_eq!(batch.finish().recycled, 1);
+            let completion = batch.finish();
+            assert!(completion.invariants_hold());
+            assert_eq!(completion.recycled, 1);
         }
         assert_eq!(harness.free_rx_frames(), baseline);
         let events = harness.drain_rx_events();
@@ -790,7 +813,9 @@ pub mod rx {
                 reobserved.push(observer.observe(packet.bytes_mut()));
                 packet.recycle(DropReason::RouteMiss);
             }
-            assert_eq!(batch.finish().recycled, 2);
+            let completion = batch.finish();
+            assert!(completion.invariants_hold());
+            assert_eq!(completion.recycled, 2);
         }
         assert_eq!(
             reobserved
@@ -856,8 +881,15 @@ pub mod generated {
     fn assert_distinct_live(frames: &[LiveFrame]) {
         let frame_ids: BTreeSet<_> = frames.iter().map(|frame| frame.token.frame_id).collect();
         let tokens: BTreeSet<_> = frames.iter().map(|frame| frame.token).collect();
+        let visible_addresses: BTreeSet<_> =
+            frames.iter().map(|frame| frame.visible_address).collect();
         assert_eq!(frame_ids.len(), frames.len(), "live generated frame alias");
         assert_eq!(tokens.len(), frames.len(), "duplicate generated token");
+        assert_eq!(
+            visible_addresses.len(),
+            frames.len(),
+            "live generated visible address alias"
+        );
         assert!(frames.iter().all(|frame| frame.token.generation != 0));
     }
 
@@ -947,6 +979,7 @@ pub mod generated {
             ));
             batch.finish()
         };
+        assert!(completion.invariants_hold());
         assert_eq!(
             (
                 completion.attempts,
@@ -1005,6 +1038,7 @@ pub mod generated {
             }
             batch.finish()
         };
+        assert!(completion.invariants_hold());
         assert_eq!(
             (
                 completion.requested,
@@ -1049,6 +1083,7 @@ pub mod generated {
             assert_distinct_live(&live);
             batch.finish()
         };
+        assert!(completion.invariants_hold());
         assert_eq!((completion.accepted, completion.rejected), (1, 2));
         let events = harness.drain_generated_events();
         assert_event_bindings(&live, &events);
@@ -1098,6 +1133,7 @@ pub mod generated {
                 packet.commit();
                 batch.finish()
             };
+            assert!(completion.invariants_hold());
             assert_eq!(completion.accepted, 1);
         }
         assert_distinct_live(&live);
@@ -1153,7 +1189,9 @@ pub mod generated {
             packet.bytes_mut().fill(9);
             let frame = observer.bind(packet.bytes_mut(), 60);
             packet.commit();
-            assert_eq!(batch.finish().accepted, 1);
+            let completion = batch.finish();
+            assert!(completion.invariants_hold());
+            assert_eq!(completion.accepted, 1);
             frame
         };
         let events = harness.drain_generated_events();
@@ -1194,7 +1232,9 @@ pub mod generated {
                     packet.commit();
                 }
                 assert_distinct_live(&live);
-                assert_eq!(batch.finish().rejected, 2);
+                let completion = batch.finish();
+                assert!(completion.invariants_hold());
+                assert_eq!(completion.rejected, 2);
             }
             assert_eq!(
                 harness.free_generated_frames(),
@@ -1218,6 +1258,7 @@ pub mod generated {
             let frame = observer.bind(packet.bytes_mut(), 60);
             packet.commit();
             let completion = batch.finish();
+            assert!(completion.invariants_hold());
             assert_eq!((completion.accepted, completion.rejected), (0, 1));
             frame
         };
@@ -1247,7 +1288,9 @@ pub mod generated {
             packet.bytes_mut().fill(0xb1);
             let frame = observer.bind(packet.bytes_mut(), 60);
             packet.commit();
-            assert_eq!(batch.finish().accepted, 1);
+            let completion = batch.finish();
+            assert!(completion.invariants_hold());
+            assert_eq!(completion.accepted, 1);
             frame
         };
         let events = harness.drain_generated_events();
@@ -1286,7 +1329,9 @@ pub mod generated {
             packet.bytes_mut().fill(0xb2);
             let frame = observer.bind(packet.bytes_mut(), 60);
             packet.cancel();
-            assert_eq!(batch.finish().cancelled, 1);
+            let completion = batch.finish();
+            assert!(completion.invariants_hold());
+            assert_eq!(completion.cancelled, 1);
             frame
         };
         assert_eq!(second.token.frame_id, first.token.frame_id);
@@ -1373,6 +1418,7 @@ pub mod generated {
             let (io, _) = harness.io_and_observer();
             io.begin_generated(LAN).finish()
         };
+        assert!(next.invariants_hold());
         assert_eq!(
             (
                 next.attempts,
