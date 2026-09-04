@@ -1166,3 +1166,562 @@ fn route_host_bits_and_error_path_are_exact() {
         ]
     );
 }
+
+// Protects validate.rs:228, 245, 257, 285, and 472.  The expected tuples are
+// independent constants, so replacing an accessor with any zero/one tuple is
+// observable instead of being repeated on both sides of an assertion.
+#[test]
+fn planning_parts_preserve_each_validated_storage_and_tick_field() {
+    let config = validated(VALID);
+
+    assert_eq!(
+        config
+            .resolution()
+            .expect("fixture enables resolution")
+            .storage()
+            .into_planning_parts(),
+        (2, 3, 4, 5)
+    );
+    assert_eq!(
+        config
+            .icmpv4_errors()
+            .expect("fixture enables ICMPv4 errors")
+            .storage()
+            .into_planning_parts(),
+        (2, 3)
+    );
+    assert_eq!(
+        config
+            .nat44()
+            .expect("fixture enables NAT44")
+            .udp()
+            .expect("fixture enables UDP NAT")
+            .storage()
+            .into_planning_parts(),
+        (3, 5, 4, 3, 8, 5, 8)
+    );
+    assert_eq!(
+        config
+            .nat44()
+            .expect("fixture enables NAT44")
+            .tcp()
+            .expect("fixture enables TCP NAT")
+            .storage()
+            .into_planning_parts(),
+        (3, 5, 4, 3, 8, 5, 8)
+    );
+    assert_eq!(config.tick().into_planning_parts(), (64, 16, 8, 4, 2));
+}
+
+fn af_xdp_backend(resources: Vec<AfXdpResourceV1>) -> BackendV1 {
+    BackendV1::AfXdp {
+        resources,
+        xskmap_max_entries: 8,
+        bind_flags: 1 << 3,
+        attach_mode: XdpAttachModeV1::Skb,
+        umem: XdpUmemV1 {
+            frame_count: 8,
+            frame_size: 4_096,
+            headroom: 0,
+            rx_frames: 3,
+            generated_frames: 5,
+            raw_flags: 0,
+        },
+        rings: XdpRingsV1 {
+            fill: 4,
+            rx: 4,
+            tx: 4,
+            completion: 4,
+        },
+    }
+}
+
+// Protects validate.rs:335, 341, 369, 375, 381, 387, 1780, 1791, and 1801.
+// This uses non-binary queue ids and checks each retained resource directly;
+// it therefore catches both wrong accessor constants and a cross-resource
+// device lookup.  A valid pair also proves the coverage predicate accepts all
+// declared interfaces.
+#[test]
+fn af_xdp_valid_pair_retains_independent_devices_queues_and_capacity() {
+    let mut dto = dto();
+    dto.backend = Some(af_xdp_backend(vec![
+        AfXdpResourceV1 {
+            interface: "wan".to_owned(),
+            queue_id: 3,
+        },
+        AfXdpResourceV1 {
+            interface: "lan".to_owned(),
+            queue_id: 5,
+        },
+    ]));
+
+    let config = match validate(VersionedConfig::V1(dto), GENEROUS).expect("valid AF_XDP pair") {
+        ValidatedConfig::V1(config) => config,
+        _ => unreachable!("only schema V1 exists"),
+    };
+    let ruster_config::ValidatedBackendV1::AfXdp(backend) = config.backend() else {
+        unreachable!("fixture selects AF_XDP");
+    };
+
+    assert_eq!(backend.device(), "eth1");
+    assert_eq!(backend.queue_id(), 3);
+    assert_eq!(backend.xskmap_max_entries(), 8);
+    assert_eq!(backend.resources().len(), 2);
+    assert_eq!(
+        backend
+            .resources()
+            .iter()
+            .map(|resource| (
+                resource.interface().0,
+                resource.device(),
+                resource.queue_id()
+            ))
+            .collect::<Vec<_>>(),
+        vec![(2, "eth1", 3), (1, "eth0", 5)]
+    );
+}
+
+// Protects validate.rs:1773.  Two resource entries naming one interface are
+// rejected before the later coverage check can reinterpret the duplicate.
+#[test]
+fn af_xdp_rejects_duplicate_resource_interface() {
+    let mut dto = dto();
+    dto.backend = Some(af_xdp_backend(vec![
+        AfXdpResourceV1 {
+            interface: "wan".to_owned(),
+            queue_id: 3,
+        },
+        AfXdpResourceV1 {
+            interface: "wan".to_owned(),
+            queue_id: 5,
+        },
+    ]));
+
+    let error = dto_error(dto);
+    assert_eq!(
+        error.code(),
+        ValidationCode::AfXdpDuplicateResourceInterface
+    );
+    assert_eq!(
+        error.path().segments(),
+        &[
+            PathSegment::Field("backend".to_owned()),
+            PathSegment::Field("resources".to_owned()),
+            PathSegment::Index(1),
+            PathSegment::Field("interface".to_owned()),
+        ]
+    );
+}
+
+// Protects validate.rs:1718.  The frame count is below the native frame
+// ceiling, while the 4096-byte product is just above the 1 GiB byte ceiling;
+// the typed byte-limit arm and its bounded diagnostics must be preserved.
+#[test]
+fn af_xdp_reports_umem_byte_limit_separately_from_frame_limit() {
+    let frame_count = 262_145_u32;
+    let byte_len = u64::from(frame_count) * 4_096;
+    let mut dto = dto();
+    dto.backend = Some(BackendV1::AfXdp {
+        resources: vec![
+            AfXdpResourceV1 {
+                interface: "wan".to_owned(),
+                queue_id: 3,
+            },
+            AfXdpResourceV1 {
+                interface: "lan".to_owned(),
+                queue_id: 5,
+            },
+        ],
+        xskmap_max_entries: 8,
+        bind_flags: 1 << 3,
+        attach_mode: XdpAttachModeV1::Skb,
+        umem: XdpUmemV1 {
+            frame_count,
+            frame_size: 4_096,
+            headroom: 0,
+            rx_frames: 1,
+            generated_frames: frame_count - 1,
+            raw_flags: 0,
+        },
+        rings: XdpRingsV1 {
+            fill: 4,
+            rx: 4,
+            tx: 4,
+            completion: 4,
+        },
+    });
+
+    let error = dto_error(dto);
+    assert_eq!(
+        error.code(),
+        ValidationCode::AfXdpUmem(XdpConfigError::UmemByteLengthExceedsLimit {
+            byte_len,
+            limit: 1 << 30,
+        })
+    );
+    assert_eq!(error.limit(), Some(1 << 30));
+    assert_eq!(error.actual(), Some(byte_len));
+    assert_eq!(
+        error.path().segments(),
+        &[
+            PathSegment::Field("backend".to_owned()),
+            PathSegment::Field("umem".to_owned()),
+            PathSegment::Field("frame-count".to_owned()),
+        ]
+    );
+}
+
+// Protects validate.rs:1214.  The gateway is reachable through the WAN
+// connected route, but the configured route deliberately selects LAN; both
+// predicates in the selected-egress check are therefore required.
+#[test]
+fn gateway_must_be_on_the_selected_egress_link() {
+    let wrong_egress = VALID.replacen("egress = \"wan\"", "egress = \"lan\"", 1);
+    let error = error(&wrong_egress);
+    assert_eq!(error.code(), ValidationCode::GatewayNotOnLink);
+    assert_eq!(
+        error.path().segments(),
+        &[
+            PathSegment::Field("routes".to_owned()),
+            PathSegment::Index(0),
+            PathSegment::Field("via".to_owned()),
+        ]
+    );
+}
+
+// Protects validate.rs:1269.  A second neighbor on the same interface is
+// valid when its target address differs; the duplicate key is the pair, not
+// either component independently.
+#[test]
+fn neighbors_allow_distinct_targets_on_one_interface() {
+    let source = VALID.replace(
+        "[ipv4-origin]",
+        "[[neighbors]]\ninterface = \"wan\"\naddress = \"198.51.100.2\"\nmac = \"02:00:00:00:00:05\"\n\n[ipv4-origin]",
+    );
+    let config = validated(&source);
+    assert_eq!(config.neighbors().len(), 3);
+    assert_eq!(
+        config
+            .neighbors()
+            .iter()
+            .filter(|neighbor| neighbor.interface.0 == 2)
+            .count(),
+        2
+    );
+}
+
+// Protects validate.rs:1379 and 1601.  UDP-only NAT is a valid composition;
+// the realm guard must not require TCP, and the resulting optional aggregate
+// must remain present when either protocol is configured.
+#[test]
+fn udp_only_nat_remains_present_in_the_validated_aggregate() {
+    let mut dto = dto();
+    dto.nat44.as_mut().expect("fixture enables NAT44").tcp = None;
+    let config = match validate(VersionedConfig::V1(dto), GENEROUS).expect("valid UDP-only NAT") {
+        ValidatedConfig::V1(config) => config,
+        _ => unreachable!("only schema V1 exists"),
+    };
+    let nat44 = config.nat44().expect("UDP-only NAT remains present");
+    assert!(nat44.udp().is_some());
+    assert!(nat44.tcp().is_none());
+}
+
+// Protects validate.rs:1941.  Build a direct DTO whose cumulative text
+// values end exactly at MAX_CONFIG_BYTES; equality is accepted, while the
+// mutated strict-boundary check rejects it.
+#[test]
+fn direct_dto_text_budget_accepts_exactly_the_configured_limit() {
+    let mut dto = dto();
+    let used = dto
+        .interfaces
+        .iter()
+        .map(|interface| interface.name.len() + interface.device.len() + interface.mac.len())
+        .sum::<usize>()
+        + dto
+            .addresses
+            .iter()
+            .map(|address| address.interface.len() + address.ipv4.len())
+            .sum::<usize>()
+        + dto
+            .routes
+            .iter()
+            .map(|route| {
+                route.prefix.len() + route.egress.len() + route.via.as_deref().map_or(0, str::len)
+            })
+            .sum::<usize>()
+        + dto
+            .neighbors
+            .iter()
+            .map(|neighbor| neighbor.interface.len() + neighbor.address.len() + neighbor.mac.len())
+            .sum::<usize>()
+        + dto.nat44.as_ref().map_or(0, |nat44| {
+            nat44.realm.inside.len()
+                + nat44.realm.outside.len()
+                + nat44.realm.public_address.len()
+                + nat44
+                    .udp
+                    .as_ref()
+                    .map_or(0, |udp| udp.allocator_seed.expose().len())
+                + nat44
+                    .tcp
+                    .as_ref()
+                    .map_or(0, |tcp| tcp.allocator_seed.expose().len())
+        })
+        + dto.firewall.as_ref().map_or(0, |firewall| {
+            firewall
+                .rules
+                .iter()
+                .map(|rule| {
+                    rule.ingress.as_deref().map_or(0, str::len)
+                        + rule.egress.as_deref().map_or(0, str::len)
+                        + rule.source.len()
+                        + rule.destination.len()
+                })
+                .sum::<usize>()
+        });
+    let old_device_len = dto.interfaces[0].device.len();
+    dto.interfaces[0].device = "x".repeat(MAX_CONFIG_BYTES - used + old_device_len);
+
+    assert!(
+        validate(VersionedConfig::V1(dto), GENEROUS).is_ok(),
+        "the exact aggregate text limit is valid"
+    );
+}
+
+// Protects validate.rs:2206 by checking both mapping branches against the
+// core policy value rather than merely checking that validation succeeds.
+#[test]
+fn nat_icmp_error_policy_mapping_preserves_udp_and_tcp_modes() {
+    let config = validated(VALID);
+    assert_eq!(
+        config
+            .nat44()
+            .expect("fixture enables NAT44")
+            .udp()
+            .expect("fixture enables UDP NAT")
+            .policy()
+            .icmpv4_errors(),
+        ruster_core::Nat44Icmpv4ErrorPolicy::ExternalOnly
+    );
+    assert_eq!(
+        config
+            .nat44()
+            .expect("fixture enables NAT44")
+            .tcp()
+            .expect("fixture enables TCP NAT")
+            .policy()
+            .icmpv4_errors(),
+        ruster_core::Nat44Icmpv4ErrorPolicy::Disabled
+    );
+}
+
+// Protects validate.rs:2213.  A leading plus is not part of the accepted
+// decimal seed spelling.  Integer parsing may accept it, so the lexical
+// digit guard must reject it before canonicalization changes the error.
+#[test]
+fn allocator_seed_rejects_non_digit_spelling_before_integer_parsing() {
+    let error = error(&VALID.replacen("allocator-seed = \"7\"", "allocator-seed = \"+7\"", 1));
+    assert_eq!(error.code(), ValidationCode::InvalidAllocatorSeed);
+}
+
+// Protects validate.rs:2236.  A one-digit hexadecimal component is parseable
+// by u8, but it is not a canonical six-component MAC spelling.
+#[test]
+fn mac_parser_rejects_a_short_hex_component() {
+    let error = error(&VALID.replacen(
+        "mac = \"02:00:00:00:00:01\"",
+        "mac = \"2:00:00:00:00:01\"",
+        1,
+    ));
+    assert_eq!(error.code(), ValidationCode::InvalidMac);
+}
+
+// Protects validate.rs:2234.  Five correctly formatted hexadecimal
+// components must still be rejected by the independent component-count
+// check; the shortened component is not also malformed in this case.
+#[test]
+fn mac_parser_rejects_a_five_component_address() {
+    let error =
+        error(&VALID.replacen("mac = \"02:00:00:00:00:01\"", "mac = \"02:00:00:00:00\"", 1));
+    assert_eq!(error.code(), ValidationCode::InvalidMac);
+}
+
+// Protects validate.rs:2248 first and second disjunctions.  All-zero and
+// all-ones hardware addresses are invalid unicast values independently of
+// the multicast-bit test.
+#[test]
+fn mac_parser_rejects_zero_and_all_ones_addresses() {
+    for (replacement, expected) in [
+        ("00:00:00:00:00:00", ValidationCode::MacNotUnicast),
+        ("ff:ff:ff:ff:ff:ff", ValidationCode::MacNotUnicast),
+    ] {
+        let source = VALID.replacen(
+            "mac = \"02:00:00:00:00:01\"",
+            &format!("mac = \"{replacement}\""),
+            1,
+        );
+        assert_eq!(error(&source).code(), expected);
+    }
+}
+
+// Protects validate.rs:2269.  A nonempty, non-digit prefix is classified as
+// noncanonical before the numeric range parser is attempted.
+#[test]
+fn cidr_parser_rejects_a_non_digit_prefix_as_noncanonical() {
+    let source = VALID.replacen("prefix = \"0.0.0.0/0\"", "prefix = \"0.0.0.0/x\"", 1);
+    assert_eq!(
+        error(&source).code(),
+        ValidationCode::NonCanonicalIpv4Prefix
+    );
+}
+
+// Protects validate.rs:2289, 2291, and 2294.  Zero as the first octet is not
+// a usable host when the whole address is not the unspecified value; either
+// disjunction mutant would incorrectly admit this address.
+#[test]
+fn basic_host_rejects_non_unspecified_zero_first_octet() {
+    let source = VALID.replacen("ipv4 = \"198.51.100.10/24\"", "ipv4 = \"0.1.2.3/24\"", 1);
+    assert_eq!(error(&source).code(), ValidationCode::AddressNotHost);
+}
+
+// Protects validate.rs:2292.  The loopback first-octet boundary is excluded
+// even for a nonzero host address.
+#[test]
+fn basic_host_rejects_loopback_first_octet() {
+    let source = VALID.replacen("ipv4 = \"198.51.100.10/24\"", "ipv4 = \"127.1.2.3/24\"", 1);
+    assert_eq!(error(&source).code(), ValidationCode::AddressNotHost);
+}
+
+// Protects validate.rs:2293 and its < to <= boundary mutant.  224 is the
+// first multicast first octet and must not be treated as a host.
+#[test]
+fn basic_host_rejects_the_first_multicast_octet() {
+    let source = VALID.replacen("ipv4 = \"198.51.100.10/24\"", "ipv4 = \"224.1.2.3/24\"", 1);
+    assert_eq!(error(&source).code(), ValidationCode::AddressNotHost);
+}
+
+// Protects validate.rs:2298, 2301, 2306 first comparison, both bitwise
+// replacements there, and deletion of the ! before the broadcast comparison.
+// A network address has neither host-side bit nor directed-broadcast value.
+#[test]
+fn host_for_prefix_rejects_a_network_address() {
+    let source = VALID.replacen("ipv4 = \"198.51.100.10/24\"", "ipv4 = \"192.0.2.0/24\"", 1);
+    assert_eq!(error(&source).code(), ValidationCode::AddressNotHost);
+}
+
+// Protects validate.rs:2306 deletion of !.  A normal host may have network
+// bits set for a broad /1 prefix; removing ! incorrectly treats it as a
+// broadcast and rejects an otherwise valid direct DTO.
+#[test]
+fn host_for_prefix_accepts_a_host_with_network_bits_for_prefix_one() {
+    let mut dto = dto();
+    dto.addresses[0].ipv4 = "192.0.2.2/1".to_owned();
+    dto.nat44
+        .as_mut()
+        .expect("fixture enables NAT44")
+        .realm
+        .public_address = "192.0.2.2".to_owned();
+    assert!(
+        validate(VersionedConfig::V1(dto), GENEROUS).is_ok(),
+        "a host address is valid for /1 when it is neither network nor broadcast"
+    );
+}
+
+// Protects validate.rs:2301.  Both addresses in an RFC 3021 /31 are usable
+// hosts, so validation must take the short-circuit branch for this prefix.
+#[test]
+fn host_for_prefix_accepts_a_normal_host_on_a_slash31_prefix() {
+    let mut dto = dto();
+    dto.addresses[0].ipv4 = "198.51.100.2/31".to_owned();
+    dto.routes[0].via = Some("198.51.100.3".to_owned());
+    dto.neighbors[0].address = "198.51.100.3".to_owned();
+    dto.nat44
+        .as_mut()
+        .expect("fixture enables NAT44")
+        .realm
+        .public_address = "198.51.100.2".to_owned();
+    assert!(
+        validate(VersionedConfig::V1(dto), GENEROUS).is_ok(),
+        "a normal host address is valid on an RFC 3021 /31 network"
+    );
+}
+
+// Protects validate.rs:2306 second comparison and both replacements of its
+// bitwise OR.  A directed broadcast is not a host even though is_basic_host
+// accepts its octets.
+#[test]
+fn host_for_prefix_rejects_a_directed_broadcast() {
+    let source = VALID.replacen(
+        "ipv4 = \"198.51.100.10/24\"",
+        "ipv4 = \"192.0.2.255/24\"",
+        1,
+    );
+    assert_eq!(error(&source).code(), ValidationCode::AddressNotHost);
+}
+
+// Protects validate.rs:2338.  Route ordering must be based on the complete
+// semantic sort key rather than an all-equal replacement tuple.
+#[test]
+fn route_order_is_canonical() {
+    let config = validated(VALID);
+    let routes = config
+        .routes()
+        .iter()
+        .map(|route| {
+            (
+                route.prefix().octets(),
+                route.prefix_len(),
+                route.egress().0,
+                route.next_hop().map(|address| address.octets()),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        routes,
+        vec![
+            ([0, 0, 0, 0], 0, 2, Some([198, 51, 100, 1])),
+            ([192, 0, 2, 0], 24, 1, None),
+            ([198, 51, 100, 0], 24, 2, None),
+        ]
+    );
+}
+
+// Protects validate.rs:2324.  This direct DTO has a valid connected /0
+// address and removes the fixture's configured /0 route to avoid a duplicate
+// route; validation must call the zero-prefix mask arm and still succeed.
+#[test]
+fn direct_dto_accepts_a_valid_connected_zero_prefix_without_duplicate_route() {
+    let mut dto = dto();
+    dto.addresses[0].ipv4 = "198.51.100.10/0".to_owned();
+    dto.routes.clear();
+    assert!(
+        validate(VersionedConfig::V1(dto), GENEROUS).is_ok(),
+        "a normal host address is valid on a connected /0 network"
+    );
+}
+
+// Protects validate.rs:2363.  Nested firewall diagnostics must retain their
+// table name and index so an error cannot be detached from attacker input.
+#[test]
+fn firewall_nested_error_path_retains_table_and_index() {
+    let mut dto = dto();
+    dto.firewall
+        .as_mut()
+        .expect("fixture enables firewall")
+        .rules[0]
+        .source = "192.0.2.1/24".to_owned();
+    let error = dto_error(dto);
+    assert_eq!(
+        error.code(),
+        ValidationCode::FirewallPrefix(ruster_core::FirewallIpv4PrefixError::HostBitsSet)
+    );
+    assert_eq!(
+        error.path().segments(),
+        &[
+            PathSegment::Field("firewall".to_owned()),
+            PathSegment::Field("rules".to_owned()),
+            PathSegment::Index(0),
+            PathSegment::Field("source".to_owned()),
+        ]
+    );
+}
