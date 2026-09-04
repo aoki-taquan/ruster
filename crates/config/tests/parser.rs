@@ -457,6 +457,144 @@ fn versioned_config_parser_is_exact_bounded_and_redacted() {
     );
 }
 
+#[test]
+fn indexed_decode_diagnostics_keep_safe_paths_and_render_stably() {
+    // 守る性質: 型エラーの診断は安全なフィールド名と配列添字を保持し、
+    // SourcePath の Display、Diagnostic の Display/Debug が空にならない。
+    let input = br#"
+schema-version = 1
+interfaces = [
+  { id = "not-an-integer", name = "lan", device = "eth0", mac = "02:00:00:00:00:01" },
+]
+"#;
+    let diagnostic = parse(input).unwrap_err();
+
+    assert_eq!(diagnostic.code(), DiagnosticCode::InvalidType);
+    assert_eq!(
+        diagnostic.path().segments(),
+        &[
+            PathSegment::Field("interfaces".to_owned()),
+            PathSegment::Index(0),
+            PathSegment::Field("id".to_owned()),
+        ]
+    );
+    assert_eq!(format!("{}", diagnostic.path()), "interfaces[0].id");
+    assert_eq!(
+        format!("{diagnostic}"),
+        "configuration invalid at interfaces[0].id: value has the wrong type"
+    );
+    assert_eq!(
+        format!("{diagnostic:?}"),
+        "Diagnostic { code: InvalidType, path: [Field(\"interfaces\"), Index(0), Field(\"id\")], limit: None, actual: None }"
+    );
+}
+
+#[test]
+fn forbidden_fields_inside_array_entries_are_rejected_before_decode() {
+    // 守る性質: 配列要素の内部も再帰的に検査し、DTO の unknown field に
+    // 到達する前に forbidden field として拒否する。
+    let input = br#"
+schema-version = 1
+interfaces = [{ id = 1, name = "lan", device = "eth0", mac = "02:00:00:00:00:01", generation = "DO_NOT_ACCEPT_RUNTIME_FIELD" }]
+"#;
+    let diagnostic = parse(input).unwrap_err();
+
+    assert_eq!(diagnostic.code(), DiagnosticCode::ForbiddenField);
+    assert_eq!(
+        diagnostic.path().segments(),
+        &[
+            PathSegment::Field("interfaces".to_owned()),
+            PathSegment::Index(0),
+            PathSegment::Field("generation".to_owned()),
+        ]
+    );
+}
+
+#[test]
+fn input_too_large_diagnostic_displays_both_bounds() {
+    // 守る性質: 入力サイズ超過の利用者向け診断は、制限値と実際のサイズを
+    // 省略せず表示する。
+    let input = vec![b' '; MAX_CONFIG_BYTES + 1];
+    let diagnostic = parse(&input).unwrap_err();
+
+    assert_eq!(diagnostic.code(), DiagnosticCode::InputTooLarge);
+    assert_eq!(
+        format!("{diagnostic}"),
+        format!(
+            "configuration invalid at <input>: input exceeds {MAX_CONFIG_BYTES} bytes (read at least {})",
+            MAX_CONFIG_BYTES + 1
+        )
+    );
+}
+
+#[test]
+fn list_too_long_diagnostic_displays_both_bounds() {
+    // 守る性質: リスト長超過の利用者向け診断は、実際の件数と最大件数を
+    // 省略せず表示する。
+    let mut input = String::from("schema-version=1\ninterfaces=[");
+    for index in 0..=MAX_INTERFACES {
+        if index != 0 {
+            input.push(',');
+        }
+        input.push_str("{id=1,name=\"x\",device=\"x\",mac=\"x\"}");
+    }
+    input.push_str("]\n");
+
+    let diagnostic = parse(input.as_bytes()).unwrap_err();
+    assert_eq!(diagnostic.code(), DiagnosticCode::ListTooLong);
+    assert_eq!(
+        format!("{diagnostic}"),
+        format!(
+            "configuration invalid at interfaces: list has {} entries; maximum is {MAX_INTERFACES}",
+            MAX_INTERFACES + 1
+        )
+    );
+}
+
+#[test]
+fn queue_id_is_forbidden_outside_backend_resource_array_entries() {
+    // 守る性質: queue-id の例外は backend.resources の配列要素だけに限定し、
+    // 各パス要素の長さ・名称・配列添字の検査を独立に要求する。
+    let cases = [
+        (
+            "schema-version=1\n[nat44]\nresources=[{queue-id=0}]\n",
+            // backend ではない先頭要素は、長さが正しくても許可しない。
+            [
+                PathSegment::Field("nat44".to_owned()),
+                PathSegment::Field("resources".to_owned()),
+                PathSegment::Index(0),
+                PathSegment::Field("queue-id".to_owned()),
+            ],
+        ),
+        (
+            "schema-version=1\n[backend]\ninterfaces=[{queue-id=0}]\n",
+            // 先頭が backend でも、resources 以外の二番目の要素は許可しない。
+            [
+                PathSegment::Field("backend".to_owned()),
+                PathSegment::Field("interfaces".to_owned()),
+                PathSegment::Index(0),
+                PathSegment::Field("queue-id".to_owned()),
+            ],
+        ),
+        (
+            "schema-version=1\n[backend.resources.interface]\nqueue-id=0\n",
+            // backend.resources 配下でも、三番目の要素が配列添字でなければ許可しない。
+            [
+                PathSegment::Field("backend".to_owned()),
+                PathSegment::Field("resources".to_owned()),
+                PathSegment::Field("interface".to_owned()),
+                PathSegment::Field("queue-id".to_owned()),
+            ],
+        ),
+    ];
+
+    for (input, expected_path) in cases {
+        let diagnostic = parse(input.as_bytes()).unwrap_err();
+        assert_eq!(diagnostic.code(), DiagnosticCode::ForbiddenField);
+        assert_eq!(diagnostic.path().segments(), expected_path);
+    }
+}
+
 fn assert_list_limit(field: &str, item: &str, limit: usize, prefix: &str) {
     let mut input = String::from("schema-version=1\n");
     input.push_str(prefix);
