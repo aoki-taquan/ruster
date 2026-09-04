@@ -864,3 +864,28 @@ fn directory_shape_valid(bucket_count: u32, node_count: u32) -> bool {
             .checked_next_power_of_two()
             .is_some_and(|minimum| bucket_count >= minimum)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::directory_shape_valid;
+
+    #[test]
+    fn directory_shape_valid_requires_zero_pair_and_sufficient_power_of_two_buckets() {
+        // Protects the empty-directory special case, the non-zero power-of-
+        // two requirement, and the minimum bucket capacity for nodes.
+        for (bucket_count, node_count, expected) in [
+            (0, 0, true),
+            (1, 0, false),
+            (3, 1, false),
+            (1, 2, false),
+            (4, 3, true),
+            (8, 4, true),
+        ] {
+            assert_eq!(
+                directory_shape_valid(bucket_count, node_count),
+                expected,
+                "bucket_count={bucket_count}, node_count={node_count}"
+            );
+        }
+    }
+}

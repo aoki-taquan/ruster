@@ -1763,15 +1763,18 @@ mod tests {
     use ruster_core::{
         bind_publication_backend, forward_batch_with_resolution,
         forward_batch_with_resolution_and_icmpv4_errors, ipv4_header_checksum, BatchCompletion,
-        BoundPublicationBackend, FirewallHashKey, FirewallPolicy, GeneratedBatchCompletion,
-        GeneratedPacketBatch, GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion,
-        GeneratedTraceSink, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorStateSlot, IfId,
-        Interface, Ipv4Address, LocalIpv4Binding, MacAddress, MatchedPublicationQuiescenceGuard,
-        Nat44TcpPolicy, Nat44UdpPolicy, Neighbor, NoTrace, PacketBatch, PacketLease, PacketSlot,
-        PublicationBackendAuthority, PublicationBackendControl, PublicationOwnerBinding,
-        PublicationQuiescenceBackend, ResolutionActionSlot, ResolutionFailureHoldSlot,
-        ResolutionFailureTrace, ResolutionPolicy, ResolutionStateSlot, ResolutionTimerTrace, Route,
-        SlotCompletion, TraceEvent,
+        BoundPublicationBackend, DirectoryBucket, DirectoryNode, FirewallHashKey, FirewallPolicy,
+        FirewallRuntime, FirewallStateSlot, GeneratedBatchCompletion, GeneratedPacketBatch,
+        GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion, GeneratedTraceSink,
+        Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorStateSlot, IfId, Interface,
+        Ipv4Address, LocalIpv4Binding, MacAddress, MatchedPublicationQuiescenceGuard,
+        Nat44TcpHashKey, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy,
+        Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpHashKey, Nat44UdpIndexStorage,
+        Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace,
+        PacketBatch, PacketLease, PacketSlot, PortOwnerSlot, PublicationBackendAuthority,
+        PublicationBackendControl, PublicationOwnerBinding, PublicationQuiescenceBackend,
+        ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionFailureTrace, ResolutionPolicy,
+        ResolutionStateSlot, ResolutionTimerTrace, Route, SlotCompletion, TraceEvent,
     };
     use ruster_io_sim::{
         BoundSimIoControl, FrameOrigin, SimBatch, SimGeneratedBatch, SimGeneratedError, SimIo,
@@ -4196,6 +4199,269 @@ mod tests {
                         build: Some(Icmpv4ErrorBuildError::ExactLengthRequired),
                         ..
                     }),
+                })
+            ));
+        });
+    }
+
+    #[test]
+    fn optional_service_views_distinguish_absent_runtime_from_absent_counters() {
+        // Protects every optional service-view presence and counter accessor
+        // from manufacturing a runtime or counters when the publication
+        // supplied neither, including the nested view implementations.
+        with_fixture(|publication, _io, _trace| {
+            let view = <TestPublication<'_, '_, BoundTestIo> as FullServicePublication<
+                '_,
+                BoundTestIo,
+            >>::active(publication);
+
+            assert!(!view.has_nat44_udp_runtime());
+            assert!(!view.has_nat44_tcp_runtime());
+            assert!(!view.has_firewall_runtime());
+            assert_eq!(view.nat44_udp_counters(), None);
+            assert_eq!(view.nat44_tcp_counters(), None);
+            assert_eq!(view.firewall_counters(), None);
+        });
+    }
+
+    #[test]
+    fn optional_service_views_preserve_present_runtime_and_live_counters() {
+        // Protects every optional service-view accessor from replacing a
+        // present runtime with a constant result and from replacing its live
+        // non-default counters with `None` or `Default`.
+        let routes = [
+            Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, LAN, None).unwrap(),
+            Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, Some(GATEWAY)).unwrap(),
+        ];
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: LAN_MAC,
+            },
+            Interface {
+                id: WAN,
+                mac: WAN_MAC,
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: LAN_IP,
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: WAN_IP,
+            },
+        ];
+        let neighbors = [Neighbor {
+            interface: LAN,
+            target: HOST_IP,
+            mac: HOST_MAC,
+        }];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let udp_config = Nat44UdpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            WAN_IP,
+            40_000,
+            40_003,
+            Nat44UdpPolicy::default(),
+        )
+        .unwrap();
+        let tcp_config = Nat44TcpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            WAN_IP,
+            40_000,
+            40_003,
+            Nat44TcpPolicy::default(),
+        )
+        .unwrap();
+        let firewall_rules = [];
+        let firewall_config = FirewallConfig::new(
+            &snapshot,
+            &firewall_rules,
+            FirewallPolicy::default(),
+            1,
+            FirewallHashKey::new(1, 2).unwrap(),
+        )
+        .unwrap();
+        let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+        let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut resolution = ResolutionRuntime::new(
+            ResolutionPolicy::new(1_000, 2_000).unwrap(),
+            &mut resolution_states,
+            &mut resolution_actions,
+        );
+        let mut icmp_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+        let mut icmp_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+        let mut icmpv4_errors = Icmpv4ErrorRuntime::new(
+            Icmpv4ErrorPolicy::default(),
+            &mut icmp_states,
+            &mut icmp_actions,
+        );
+        let tick_authority = ActiveTickAuthority::new(NonZeroU64::MIN, TickBudgets::default());
+
+        {
+            let mut udp_mappings = [Nat44UdpMappingSlot::default(); 1];
+            let mut udp_peers = [Nat44UdpPeerSlot::default(); 1];
+            let mut udp_mapping_buckets = [DirectoryBucket::default(); 1];
+            let mut udp_mapping_nodes = [DirectoryNode::default(); 1];
+            let mut udp_peer_buckets = [DirectoryBucket::default(); 1];
+            let mut udp_peer_nodes = [DirectoryNode::default(); 1];
+            let mut udp_port_owners = [PortOwnerSlot::default(); 4];
+            let udp_hash_key = Nat44UdpHashKey::new(1, 2).unwrap();
+            let mut udp_runtime = Nat44UdpRuntime::new(
+                udp_config,
+                &mut udp_mappings,
+                &mut udp_peers,
+                Nat44UdpIndexStorage::new(
+                    &mut udp_mapping_buckets,
+                    &mut udp_mapping_nodes,
+                    &mut udp_peer_buckets,
+                    &mut udp_peer_nodes,
+                    &mut udp_port_owners,
+                ),
+                udp_hash_key,
+            )
+            .unwrap();
+            udp_runtime
+                .reconcile(udp_config, Nat44UdpHashKey::new(3, 4).unwrap())
+                .unwrap();
+            let udp_counters = udp_runtime.counters();
+            assert!(udp_counters.reconciliations > 0);
+
+            let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
+            let mut tcp_mapping_buckets = [DirectoryBucket::default(); 1];
+            let mut tcp_mapping_nodes = [DirectoryNode::default(); 1];
+            let mut tcp_session_buckets = [DirectoryBucket::default(); 1];
+            let mut tcp_session_nodes = [DirectoryNode::default(); 1];
+            let mut tcp_port_owners = [PortOwnerSlot::default(); 4];
+            let tcp_hash_key = Nat44TcpHashKey::new(5, 6).unwrap();
+            let mut tcp_runtime = Nat44TcpRuntime::new(
+                tcp_config,
+                &mut tcp_mappings,
+                &mut tcp_sessions,
+                Nat44TcpIndexStorage::new(
+                    &mut tcp_mapping_buckets,
+                    &mut tcp_mapping_nodes,
+                    &mut tcp_session_buckets,
+                    &mut tcp_session_nodes,
+                    &mut tcp_port_owners,
+                ),
+                tcp_hash_key,
+            )
+            .unwrap();
+            tcp_runtime
+                .reconcile(tcp_config, Nat44TcpHashKey::new(7, 8).unwrap())
+                .unwrap();
+            let tcp_counters = tcp_runtime.counters();
+            assert!(tcp_counters.reconciliations > 0);
+
+            let mut firewall_states = [FirewallStateSlot::default(); 1];
+            let mut firewall_runtime = FirewallRuntime::new(firewall_config, &mut firewall_states);
+            let next_firewall_config = FirewallConfig::new(
+                &snapshot,
+                firewall_config.rules(),
+                firewall_config.policy(),
+                firewall_config.generation() + 1,
+                FirewallHashKey::new(9, 10).unwrap(),
+            )
+            .unwrap();
+            firewall_runtime.reconcile(next_firewall_config).unwrap();
+            let firewall_counters = firewall_runtime.counters();
+            assert!(firewall_counters.reconciliations > 0);
+
+            let view = FullServiceView::new(
+                &tick_authority,
+                snapshot,
+                &mut resolution,
+                &mut icmpv4_errors,
+                Nat44UdpServiceView::new(udp_config, Some(&mut udp_runtime)),
+                Nat44TcpServiceView::new(tcp_config, Some(&mut tcp_runtime)),
+                FirewallServiceView::new(next_firewall_config, Some(&mut firewall_runtime)),
+            );
+
+            assert!(view.has_nat44_udp_runtime());
+            assert!(view.has_nat44_tcp_runtime());
+            assert!(view.has_firewall_runtime());
+            assert_eq!(view.nat44_udp_counters(), Some(udp_counters));
+            assert_eq!(view.nat44_tcp_counters(), Some(tcp_counters));
+            assert_eq!(view.firewall_counters(), Some(firewall_counters));
+        }
+    }
+
+    #[test]
+    fn active_publication_status_presence_is_false_only_when_absent() {
+        // Protects the publication-presence predicate from treating an absent
+        // owner as present; the two active states must remain present.
+        assert!(!ActivePublicationStatus::Absent.is_present());
+        assert!(ActivePublicationStatus::ContinueOldIo.is_present());
+        assert!(ActivePublicationStatus::StopOldPublication.is_present());
+    }
+
+    #[test]
+    fn tick_report_debug_includes_the_report_fields() {
+        // Protects TickReport's structured Debug implementation from silently
+        // returning success without writing any report representation.
+        let report: TickReport<(), (), (), (), (), ()> = TickReport {
+            publication: PublicationOutcome::Unchanged,
+            active: false,
+            rx: RxPhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
+            resolution_timers: PhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
+            failure_dispatch: PhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
+            generated_arp: PhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
+            generated_icmpv4: PhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
+        };
+
+        let debug = format!("{report:?}");
+        assert!(debug.starts_with("TickReport {"));
+        assert!(debug.contains("active: false"));
+        assert!(debug.contains("rx: Skipped(NoActivePublication)"));
+    }
+
+    #[test]
+    fn generated_icmpv4_distinguishes_empty_queue_from_budget_exhaustion() {
+        // Protects the generated-ICMPv4 terminal boundary: zero pending
+        // actions is QueueEmpty, while a zero budget with pending work is
+        // BudgetExhausted and must retain the pending count.
+        with_fixture(|publication, io, trace| {
+            let report = run_test_tick(
+                publication,
+                None,
+                io,
+                MonotonicMillis(0),
+                TickBudgets::default(),
+                trace,
+            );
+            assert!(matches!(
+                report.generated_icmpv4,
+                PhaseReport::Completed(GeneratedPhaseReport {
+                    stop: GeneratedIcmpv4Stop::QueueEmpty,
+                    ..
+                })
+            ));
+        });
+
+        with_fixture(|publication, io, trace| {
+            seed_icmpv4(publication, 0);
+            let report = run_test_tick(
+                publication,
+                None,
+                io,
+                MonotonicMillis(0),
+                TickBudgets::default(),
+                trace,
+            );
+            assert!(matches!(
+                report.generated_icmpv4,
+                PhaseReport::Completed(GeneratedPhaseReport {
+                    stop: GeneratedIcmpv4Stop::BudgetExhausted { pending: 1 },
+                    ..
                 })
             ));
         });

@@ -1360,4 +1360,75 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn section_diff_accessors_return_their_stored_values() {
+        // Protects every PlanSectionDiff accessor from losing either the true
+        // value of a changed section or the false value of an unchanged one.
+        let all_true = PlanSectionDiff {
+            interfaces_changed: true,
+            routes_changed: true,
+            neighbors_changed: true,
+            local_ipv4_bindings_changed: true,
+            ipv4_origin_policy_changed: true,
+            tick_budgets_changed: true,
+            resolution_policy_changed: true,
+            icmpv4_error_policy_changed: true,
+            nat44_udp_config_changed: true,
+            nat44_udp_hash_key_changed: true,
+            nat44_tcp_config_changed: true,
+            nat44_tcp_hash_key_changed: true,
+            firewall_config_changed: true,
+            firewall_hash_key_changed: true,
+            storage_shape_changed: true,
+            backend_changed: true,
+        };
+        assert!(all_true.interfaces_changed());
+        assert!(all_true.routes_changed());
+        assert!(all_true.neighbors_changed());
+        assert!(all_true.local_ipv4_bindings_changed());
+        assert!(all_true.ipv4_origin_policy_changed());
+        assert!(all_true.tick_budgets_changed());
+        assert!(all_true.resolution_policy_changed());
+        assert!(all_true.icmpv4_error_policy_changed());
+        assert!(all_true.nat44_udp_config_changed());
+        assert!(all_true.nat44_udp_hash_key_changed());
+        assert!(all_true.nat44_tcp_config_changed());
+        assert!(all_true.nat44_tcp_hash_key_changed());
+        assert!(all_true.firewall_config_changed());
+        assert!(all_true.firewall_hash_key_changed());
+        assert!(all_true.storage_shape_changed());
+        assert!(all_true.backend_changed());
+
+        let all_false = PlanSectionDiff::default();
+        assert!(!all_false.interfaces_changed());
+        assert!(!all_false.routes_changed());
+        assert!(!all_false.neighbors_changed());
+        assert!(!all_false.local_ipv4_bindings_changed());
+        assert!(!all_false.ipv4_origin_policy_changed());
+        assert!(!all_false.tick_budgets_changed());
+        assert!(!all_false.resolution_policy_changed());
+        assert!(!all_false.icmpv4_error_policy_changed());
+        assert!(!all_false.nat44_udp_config_changed());
+        assert!(!all_false.nat44_udp_hash_key_changed());
+        assert!(!all_false.nat44_tcp_config_changed());
+        assert!(!all_false.nat44_tcp_hash_key_changed());
+        assert!(!all_false.firewall_config_changed());
+        assert!(!all_false.firewall_hash_key_changed());
+        assert!(!all_false.storage_shape_changed());
+        assert!(!all_false.backend_changed());
+    }
+
+    #[test]
+    fn generation_transition_is_initial_only_without_a_previous_generation() {
+        // Protects the initial/successor distinction used by callers to tell
+        // first activation apart from replacing an active generation.
+        let initial = PlanGenerationTransition::initial(NonZeroU64::new(1).unwrap());
+        let successor = PlanGenerationTransition::successor(
+            NonZeroU64::new(1).unwrap(),
+            NonZeroU64::new(2).unwrap(),
+        );
+        assert!(initial.is_initial());
+        assert!(!successor.is_initial());
+    }
 }

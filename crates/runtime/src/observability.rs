@@ -1118,4 +1118,32 @@ mod tests {
             Some((DropReason::Nat44ExternalToInternalBypass, 2))
         );
     }
+
+    #[test]
+    fn drop_reason_entry_rejects_the_first_index_after_the_reserved_table() {
+        // Protects the bounded entry lookup from accepting the first
+        // out-of-range index and indexing past the fixed reason table.
+        let counts = DropReasonCounts::zero();
+        assert_eq!(counts.entry(DROP_REASON_SLOTS), None);
+    }
+
+    #[test]
+    fn saturating_sum_marks_an_exact_maximum_as_saturated() {
+        // Protects the saturation marker when a sum reaches u64::MAX exactly,
+        // including the one-element case where no checked-add overflow occurs.
+        assert_eq!(
+            saturating_sum(&[u64::MAX]),
+            SaturatingSum {
+                value: u64::MAX,
+                saturated: true,
+            }
+        );
+        assert_eq!(
+            saturating_sum(&[u64::MAX - 1, 1]),
+            SaturatingSum {
+                value: u64::MAX,
+                saturated: true,
+            }
+        );
+    }
 }

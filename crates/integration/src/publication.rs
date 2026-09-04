@@ -1466,4 +1466,22 @@ mod tests {
             "UnsupportedStaticClassification"
         );
     }
+
+    #[test]
+    fn publish_error_disposition_continues_old_io_for_retryable_publication_errors() {
+        // Protects the contract that an invalid successor or a restart-required
+        // successor leaves the active backend running while the candidate is retried.
+        for error in [
+            FullServicePublishError::InvalidSuccessor(SuccessorError::GenerationNotIncreasing),
+            FullServicePublishError::RestartRequired(
+                FullServiceRestartRequired::InterfaceBindingsChanged,
+            ),
+        ] {
+            assert_eq!(
+                publish_error_disposition(error),
+                ActivePublicationStatus::ContinueOldIo,
+                "retryable publication errors must preserve the old I/O path: {error:?}"
+            );
+        }
+    }
 }
