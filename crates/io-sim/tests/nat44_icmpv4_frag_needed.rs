@@ -1169,9 +1169,14 @@ fn combined_realm_mismatch_is_candidate_only_and_precedes_lookup_without_counter
     assert_eq!(udp.counters(), udp_counters);
     assert_eq!(tcp.counters(), tcp_counters);
 
+    // Destination Unreachable of any code, Time Exceeded and Parameter
+    // Problem all reach NAT translation now, so the message that still falls
+    // to the legacy path is a Redirect: it names a better first hop on the
+    // link it arrived from, which means nothing across a NAT.
     let ordinary = frag_needed(&quote, 64, 0, &[]);
     let mut non_candidate = ordinary.clone();
-    non_candidate[35] = 3;
+    non_candidate[34] = 5;
+    non_candidate[35] = 0;
     refresh_icmp_and_outer_checksums(&mut non_candidate);
     io.inject(WAN, non_candidate);
     let report = io
@@ -1763,4 +1768,128 @@ fn unresolved_inside_neighbor_schedules_arp_then_dynamic_learning_allows_transla
     let translated = io.pop_tx().unwrap();
     assert_eq!(translated.egress, LAN);
     assert_eq!(&translated.bytes[0..6], &HOST_MAC.0);
+}
+
+#[test]
+fn every_translatable_icmp_error_type_reaches_the_inside_host() {
+    // RFC 5508 REQ-3: an ICMP error whose quoted packet matches a mapping must
+    // be carried back to the host that sent the datagram, whatever the error
+    // says. Only Fragmentation Needed used to be, so an inside host never
+    // learned that its datagram had died in transit or been refused.
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let config = udp_config(&snapshot, true);
+
+    for (icmp_type, code, label) in [
+        (3_u8, 0_u8, "network unreachable"),
+        (3, 1, "host unreachable"),
+        (3, 3, "port unreachable"),
+        (3, 4, "fragmentation needed"),
+        (11, 0, "time exceeded in transit"),
+        (12, 0, "parameter problem"),
+    ] {
+        let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+        let mut peers = [Nat44UdpPeerSlot::default(); 1];
+        let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
+        let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut resolution = resolution(&mut states, &mut actions);
+        let mut io = SimIo::new();
+
+        io.inject(LAN, udp_frame(REMOTE, 53, 0));
+        io.run_nat44_udp_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(&mut nat),
+            MonotonicMillis(10),
+            &mut NoTrace,
+        )
+        .unwrap();
+        let outbound = io
+            .pop_tx()
+            .expect("the outbound datagram creates the mapping");
+        let quote = outbound.bytes[14..42].to_vec();
+
+        let mut error = frag_needed(&quote, 64, 0, &[]);
+        error[34] = icmp_type;
+        error[35] = code;
+        refresh_icmp_and_outer_checksums(&mut error);
+        io.inject(WAN, error);
+        io.run_nat44_udp_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(&mut nat),
+            MonotonicMillis(20),
+            &mut NoTrace,
+        )
+        .unwrap();
+        let translated = io
+            .pop_tx()
+            .unwrap_or_else(|| panic!("{label} must be carried to the inside host"));
+        assert_eq!(translated.egress, LAN, "{label} egress");
+        assert_eq!(
+            (translated.bytes[34], translated.bytes[35]),
+            (icmp_type, code),
+            "{label} keeps its own type and code"
+        );
+    }
+}
+
+#[test]
+fn a_redirect_is_not_carried_across_the_boundary() {
+    // A Redirect names a better first hop on the link it arrived from. Across
+    // a NAT that is meaningless, and carrying one would let an outside station
+    // steer an inside host's routing.
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let config = udp_config(&snapshot, true);
+    let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+    let mut peers = [Nat44UdpPeerSlot::default(); 1];
+    let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
+    let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut states, &mut actions);
+    let mut io = SimIo::new();
+
+    io.inject(LAN, udp_frame(REMOTE, 53, 0));
+    io.run_nat44_udp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut nat),
+        MonotonicMillis(10),
+        &mut NoTrace,
+    )
+    .unwrap();
+    let outbound = io
+        .pop_tx()
+        .expect("the outbound datagram creates the mapping");
+    let quote = outbound.bytes[14..42].to_vec();
+
+    let mut redirect = frag_needed(&quote, 64, 0, &[]);
+    redirect[34] = 5;
+    redirect[35] = 1;
+    refresh_icmp_and_outer_checksums(&mut redirect);
+    io.inject(WAN, redirect);
+    io.run_nat44_udp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut nat),
+        MonotonicMillis(20),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert!(
+        io.pop_tx().is_none(),
+        "a Redirect must not be translated to the inside host"
+    );
 }

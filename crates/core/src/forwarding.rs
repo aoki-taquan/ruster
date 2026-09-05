@@ -2688,6 +2688,25 @@ fn decide_ipv4<T: TraceSink>(
     Ok(PacketDecision::Ipv4(forwarding))
 }
 
+/// Whether a NAT should carry this ICMP error across the boundary.
+///
+/// RFC 5508 REQ-3 asks a NAT to translate an ICMP error whose embedded packet
+/// matches one of its mappings, so the sender learns what happened to its own
+/// datagram. Only these three types report something about a datagram this
+/// router forwarded:
+///
+///   3   Destination Unreachable, all codes
+///   11  Time Exceeded
+///   12  Parameter Problem
+///
+/// Redirect is deliberately absent. It names a better first hop on the link
+/// it arrived from, which means nothing to a host on the other side of a NAT,
+/// and forwarding one would let an outside station steer an inside host's
+/// routing. Source Quench is absent because RFC 6633 deprecated it.
+const fn nat44_translatable_icmpv4_error(icmp_type: u8) -> bool {
+    matches!(icmp_type, 3 | 11 | 12)
+}
+
 fn is_nat44_icmpv4_candidate(
     frame: &[u8],
     ipv4: packet::ValidatedIpv4,
@@ -2706,8 +2725,13 @@ fn is_nat44_icmpv4_candidate(
     let Some(type_code_end) = icmp_offset.checked_add(2) else {
         return false;
     };
-    if type_code_end > ipv4_end || frame.get(icmp_offset..type_code_end) != Some([3, 4].as_slice())
-    {
+    if type_code_end > ipv4_end {
+        return false;
+    }
+    let Some(type_code) = frame.get(icmp_offset..type_code_end) else {
+        return false;
+    };
+    if !nat44_translatable_icmpv4_error(type_code[0]) {
         return false;
     }
 
@@ -10480,17 +10504,43 @@ mod tests {
             with_nat_configs(|_snapshot, udp, tcp| {
                 let frame = frag_needed_frame_with_quote(17, 5, 28);
                 let ipv4 = validate_ipv4_frame(&frame).unwrap();
-                // Contract: only ICMPv4 Fragmentation Needed (type 3/code 4)
-                // reaches NAT error translation (mutants at 2547).
-                let mut wrong_type = frame.clone();
-                wrong_type[34] = 3;
-                wrong_type[35] = 3;
-                assert!(!super::super::is_nat44_icmpv4_candidate(
-                    &wrong_type,
-                    ipv4,
-                    Some(&udp),
-                    Some(&tcp),
-                ));
+                // Contract: RFC 5508 REQ-3 carries an ICMP error whose quoted
+                // packet matches a mapping. Destination Unreachable of any
+                // code, Time Exceeded and Parameter Problem all report on a
+                // datagram this router forwarded, so all three reach NAT error
+                // translation.
+                for (icmp_type, code) in [(3_u8, 0_u8), (3, 1), (3, 3), (11, 0), (12, 0)] {
+                    let mut carried = frame.clone();
+                    carried[34] = icmp_type;
+                    carried[35] = code;
+                    assert!(
+                        super::super::is_nat44_icmpv4_candidate(
+                            &carried,
+                            ipv4,
+                            Some(&udp),
+                            Some(&tcp),
+                        ),
+                        "type {icmp_type} code {code} must reach NAT translation"
+                    );
+                }
+                // Redirect names a better first hop on the link it arrived
+                // from, which means nothing across a NAT and would let an
+                // outside station steer an inside host. Source Quench is
+                // deprecated by RFC 6633. Echo is not an error at all.
+                for icmp_type in [0_u8, 4, 5, 8, 13] {
+                    let mut refused = frame.clone();
+                    refused[34] = icmp_type;
+                    refused[35] = 0;
+                    assert!(
+                        !super::super::is_nat44_icmpv4_candidate(
+                            &refused,
+                            ipv4,
+                            Some(&udp),
+                            Some(&tcp),
+                        ),
+                        "type {icmp_type} must not reach NAT translation"
+                    );
+                }
                 // Contract: ExternalOnly and the configured public address are
                 // both required independently for UDP and TCP (2554/2558).
                 let disabled = Nat44UdpConfig::new(
