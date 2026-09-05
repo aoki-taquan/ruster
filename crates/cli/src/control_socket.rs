@@ -1913,13 +1913,54 @@ mod tests {
             && error.contains("; refusing to bind")
     }
 
+    /// The directory this process mints control socket paths in.
+    ///
+    /// A process id alone is not unique over time: reruns of this binary reuse
+    /// ids, inherit the previous run's sockets, and then fail to bind with
+    /// "Protocol wrong type for socket" against a stale socket of another
+    /// type. The start instant makes the name unique per run, and the stale
+    /// directories of earlier runs that shared this id are removed on the way
+    /// past so they do not accumulate.
+    fn test_socket_root() -> &'static Path {
+        static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| {
+            let temporary = std::env::temp_dir();
+            let prefix = format!("ruster-control-tests-{}", process::id());
+            if let Ok(entries) = fs::read_dir(&temporary) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let Some(name) = name.to_str() else {
+                        continue;
+                    };
+                    if name == prefix || name.starts_with(&format!("{prefix}-")) {
+                        let _ = fs::remove_dir_all(entry.path());
+                    }
+                }
+            }
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            temporary.join(format!("{prefix}-{nonce:x}"))
+        })
+        .as_path()
+    }
+
     fn unique_path() -> PathBuf {
-        let root = std::env::temp_dir().join(format!("ruster-control-tests-{}", process::id()));
-        fs::create_dir_all(&root).expect("control socket test directory must exist");
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+        let root = test_socket_root();
+        fs::create_dir_all(root).expect("control socket test directory must exist");
+        fs::set_permissions(root, fs::Permissions::from_mode(0o700))
             .expect("control socket test directory must be private");
         let id = NEXT_TEST_SOCKET.fetch_add(1, Ordering::Relaxed);
-        root.join(format!("ruster-control-{id}.sock"))
+        let path = root.join(format!("ruster-control-{id}.sock"));
+        // The counter is process-wide and the directory is unique to this run,
+        // so a minted path must be free. Saying so here turns a later "cannot
+        // probe existing control socket path" into a report that names the
+        // collision instead of the symptom.
+        assert!(
+            !path.exists(),
+            "a freshly minted control socket path must not already exist: {path:?}"
+        );
+        path
     }
 
     fn listener_or_skip(path: &Path) -> Option<ControlListener> {
@@ -2491,17 +2532,28 @@ mod tests {
 
         #[test]
         fn temporary_socket_path_checks_candidate_length_strictly() {
-            let candidate_length = stable_candidate_name_length();
-            let parent_length = 106usize
-                .checked_sub(candidate_length)
-                .expect("test candidate must leave a positive parent length");
-            let path = path_with_parent_length(parent_length);
-            let error = temporary_socket_path(-1, &path)
-                .expect_err("a candidate exactly at the available length must be inspected");
-            assert!(
-                error.contains("cannot inspect temporary control socket path"),
-                "error={error}"
-            );
+            // The candidate name embeds a shared sequence number, so another
+            // test thread can carry it past a hex-width boundary between
+            // measuring the length and using it. When that happens the call
+            // refuses for length rather than reaching the inspection this test
+            // is about, so the measurement is retaken rather than asserted on.
+            for attempt in 0..64 {
+                let candidate_length = stable_candidate_name_length();
+                let parent_length = 106usize
+                    .checked_sub(candidate_length)
+                    .expect("test candidate must leave a positive parent length");
+                let path = path_with_parent_length(parent_length);
+                let error = temporary_socket_path(-1, &path)
+                    .expect_err("a candidate exactly at the available length must be inspected");
+                if error.contains("cannot inspect temporary control socket path") {
+                    return;
+                }
+                assert!(
+                    error.contains("insufficient pathname space"),
+                    "attempt={attempt} error={error}"
+                );
+            }
+            panic!("the candidate name length never held still long enough to inspect");
         }
 
         #[test]
@@ -2942,6 +2994,107 @@ mod tests {
     }
 
     #[cfg(test)]
+    const F_GETFD_COMMAND: std::ffi::c_int = 1;
+    const O_CLOEXEC_FLAG: std::ffi::c_int = 0o2_000_000;
+
+    static NEXT_RESERVED_DESCRIPTOR: AtomicU64 = AtomicU64::new(0);
+
+    unsafe fn fcntl_getfd(fd: RawFd) -> std::ffi::c_int {
+        // SAFETY: F_GETFD takes no argument; the zero is ignored.
+        unsafe { fcntl_with_argument(fd, F_GETFD_COMMAND, 0) }
+    }
+
+    unsafe extern "C" {
+        #[link_name = "fcntl"]
+        fn fcntl_with_argument(
+            fd: RawFd,
+            command: std::ffi::c_int,
+            argument: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+        fn dup3(old: RawFd, new: RawFd, flags: std::ffi::c_int) -> std::ffi::c_int;
+    }
+
+    /// Reports whether the process currently holds this descriptor.
+    ///
+    /// Queried with `F_GETFD`, which never closes or replaces anything, so it
+    /// is safe to ask about a number this test does not own.
+    fn descriptor_is_open(fd: RawFd) -> bool {
+        // SAFETY: F_GETFD only reads the flags of the queried descriptor.
+        (unsafe { fcntl_getfd(fd) }) != -1
+    }
+
+    /// A descriptor parked at a number the kernel will not hand out.
+    ///
+    /// Linux allocates the lowest free descriptor, so a number far above
+    /// what this process uses is never handed to another test thread.
+    /// That makes "is this descriptor still open?" answerable without
+    /// closing it.
+    ///
+    /// The previous helper answered that question by calling `close` and
+    /// asserting it failed. When another thread had reused the number,
+    /// that closed a descriptor this test did not own: the owner's drop
+    /// then aborted the whole binary with an IO-safety violation, and
+    /// unrelated tests saw a socket of the wrong type or a zero-length
+    /// read from `/dev/urandom`. Never close a descriptor to probe it.
+    struct ReservedDescriptor {
+        fd: RawFd,
+    }
+
+    impl ReservedDescriptor {
+        /// Duplicates `source` to a descriptor number reserved for this value
+        /// alone.
+        ///
+        /// The number is exact and never reissued, so once the code under test
+        /// closes it, nothing else can take it and make the check read as
+        /// still open. Asking for "the lowest free number above a base" is not
+        /// enough: two tests share a number as soon as the first one closes
+        /// it, which is how this check still failed 6 times in 300 runs.
+        fn park(source: &File) -> Self {
+            const RESERVED_BASE: std::ffi::c_int = 1 << 16;
+            let slot = NEXT_RESERVED_DESCRIPTOR.fetch_add(1, Ordering::Relaxed);
+            let slot = std::ffi::c_int::try_from(slot)
+                .expect("reserved descriptor slots stay well inside c_int");
+            let fd = RESERVED_BASE + slot;
+            assert!(
+                !descriptor_is_open(fd),
+                "a reserved descriptor number must never be reissued"
+            );
+            // SAFETY: dup3 places the duplicate at exactly `fd`, which no other
+            // value in this process has claimed.
+            let duplicated = unsafe { dup3(source.as_raw_fd(), fd, O_CLOEXEC_FLAG) };
+            assert_eq!(duplicated, fd, "reserved descriptor must be placed exactly");
+            Self { fd }
+        }
+
+        fn raw(&self) -> RawFd {
+            self.fd
+        }
+
+        fn is_open(&self) -> bool {
+            // SAFETY: F_GETFD only reads the flags of the queried
+            // descriptor and never closes or replaces anything.
+            (unsafe { fcntl_getfd(self.fd) }) != -1
+        }
+
+        fn assert_closed(&self, message: &str) {
+            assert!(!self.is_open(), "{message}");
+        }
+
+        fn assert_open(&self, message: &str) {
+            assert!(self.is_open(), "{message}");
+        }
+    }
+
+    impl Drop for ReservedDescriptor {
+        fn drop(&mut self) {
+            if self.is_open() {
+                // SAFETY: the reserved number is owned by this value and
+                // was confirmed open immediately above.
+                let _ = unsafe { close(self.fd) };
+            }
+        }
+    }
+
     mod control_socket_probe_listener_request_tests {
         use super::*;
         use std::{
@@ -2957,6 +3110,7 @@ mod tests {
         };
 
         const POLLIN: std::ffi::c_short = 0x0001;
+
         const ENOTSOCK: i32 = 88;
 
         static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
@@ -3110,11 +3264,6 @@ mod tests {
             control
         }
 
-        fn assert_closed(fd: RawFd, message: &str) {
-            // SAFETY: ownership of this test descriptor is transferred here.
-            assert_eq!(unsafe { close(fd) }, -1, "{message}");
-        }
-
         #[test]
         fn publish_socket_path_at_reports_missing_temporary_name() {
             let parent = workspace_target();
@@ -3234,14 +3383,16 @@ mod tests {
 
         #[test]
         fn wait_for_probe_connect_rejects_invalid_descriptor_without_polling_as_timeout() {
-            let (socket, peer) = UnixStream::pair().expect("invalid-fd probe pair must open");
-            let fd = socket.into_raw_fd();
-            drop(peer);
-            assert_eq!(
-                unsafe { close(fd) },
-                0,
-                "probe fd must close before polling"
+            // Polling a descriptor number that was closed races the other test
+            // threads: any of them can reopen that number before poll runs,
+            // and then POLLNVAL never arrives. A number the process can never
+            // have open gives the same POLLNVAL deterministically.
+            const UNOPENED_FD: RawFd = 1 << 20;
+            assert!(
+                !descriptor_is_open(UNOPENED_FD),
+                "probe test descriptor must not be open"
             );
+            let fd = UNOPENED_FD;
             match wait_for_probe_connect(fd, Instant::now() + Duration::from_secs(1), || false) {
                 ConnectProbeOutcome::Conservative(error) => {
                     assert!(error.to_string().contains("invalid descriptor"));
@@ -3465,16 +3616,13 @@ mod tests {
         #[test]
         fn close_received_fds_continues_across_complete_control_messages() {
             let source = File::open("/dev/null").expect("continuation source fd must open");
+            let reserved = ReservedDescriptor::park(&source);
             let first = build_cmsg(SOL_SOCKET, SCM_RIGHTS + 1, &[]);
-            let second = build_cmsg(SOL_SOCKET, SCM_RIGHTS, &[source.as_raw_fd()]);
+            let second = build_cmsg(SOL_SOCKET, SCM_RIGHTS, &[reserved.raw()]);
             let mut control = first;
             control.extend_from_slice(&second);
             close_received_fds(&control);
-            assert_closed(
-                source.as_raw_fd(),
-                "the second complete SCM_RIGHTS message must be closed",
-            );
-            std::mem::forget(source);
+            reserved.assert_closed("the second complete SCM_RIGHTS message must be closed");
         }
 
         #[test]
@@ -3707,12 +3855,6 @@ mod tests {
             thread,
         };
 
-        const F_GETFD: std::ffi::c_int = 1;
-
-        unsafe extern "C" {
-            fn fcntl(fd: RawFd, command: std::ffi::c_int) -> std::ffi::c_int;
-        }
-
         unsafe extern "C" {
             fn chown(path: *const std::ffi::c_char, owner: u32, group: u32) -> std::ffi::c_int;
         }
@@ -3888,9 +4030,8 @@ mod tests {
             // poll runs. A number far above the descriptor limit cannot be
             // reused, and F_GETFD confirms it is closed at the moment of use.
             const UNOPENED_FD: RawFd = 1 << 20;
-            assert_eq!(
-                unsafe { fcntl(UNOPENED_FD, F_GETFD) },
-                -1,
+            assert!(
+                !descriptor_is_open(UNOPENED_FD),
                 "probe test descriptor must not be open"
             );
             match wait_for_probe_connect(
@@ -4089,7 +4230,19 @@ mod tests {
                 ControlReceive::NoMessage
             ));
             let _ = unsafe { close(idle) };
-            assert!(matches!(receive_request(accepted), ControlReceive::Closed));
+            // The peer's orderly close must be reported as Closed. Observing it
+            // on the very first call is not part of that property, and under a
+            // loaded binary the first call still saw NoMessage.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut closed = false;
+            while Instant::now() < deadline {
+                if matches!(receive_request(accepted), ControlReceive::Closed) {
+                    closed = true;
+                    break;
+                }
+                thread::yield_now();
+            }
+            assert!(closed, "an orderly peer close must be reported as Closed");
             listener.remove_client(0);
 
             let invalid = client(&path);
@@ -4132,8 +4285,12 @@ mod tests {
             };
             let client_path = path.clone();
             let request = thread::spawn(move || request_path(&client_path, b"status"));
+            // A fixed iteration count is a bet on how much CPU this thread
+            // gets. Under a loaded test binary the peer had not connected yet
+            // after a thousand turns, so the budget is wall-clock instead.
+            let deadline = Instant::now() + Duration::from_secs(10);
             let mut processed = false;
-            for _ in 0..1000 {
+            while Instant::now() < deadline {
                 let result = listener.process(|| "record_type=observability".to_owned());
                 if result.requests_seen != 0 {
                     processed = true;
@@ -4177,15 +4334,17 @@ mod tests {
             // Protects ancillary-message authorization: passed descriptors are
             // never accepted, including a complete descriptor in a truncated cmsg;
             // unrelated cmsg types must not close arbitrary descriptors.
+            // Each descriptor under test is parked at a reserved number so
+            // that checking whether it is still open cannot close, or be
+            // confused by, a descriptor belonging to another test thread.
             let source = File::open("/dev/null").expect("source fd must open");
-            let rights = build_rights_control(&[source.as_raw_fd()]);
+            let rights_fd = ReservedDescriptor::park(&source);
+            let rights = build_rights_control(&[rights_fd.raw()]);
             close_received_fds(&rights);
-            let close_source = unsafe { close(source.as_raw_fd()) };
-            assert_eq!(close_source, -1, "SCM_RIGHTS descriptor must be closed");
-            std::mem::forget(source);
+            rights_fd.assert_closed("SCM_RIGHTS descriptor must be closed");
 
-            let source = File::open("/dev/null").expect("second source fd must open");
-            let mut unrelated = build_rights_control(&[source.as_raw_fd()]);
+            let unrelated_fd = ReservedDescriptor::park(&source);
+            let mut unrelated = build_rights_control(&[unrelated_fd.raw()]);
             let header = CmsgHdr {
                 cmsg_len: std::mem::size_of::<CmsgHdr>() + std::mem::size_of::<std::ffi::c_int>(),
                 cmsg_level: SOL_SOCKET,
@@ -4193,15 +4352,10 @@ mod tests {
             };
             unsafe { ptr::write_unaligned(unrelated.as_mut_ptr().cast::<CmsgHdr>(), header) };
             close_received_fds(&unrelated);
-            assert_eq!(
-                unsafe { close(source.as_raw_fd()) },
-                0,
-                "unrelated cmsg must not close fd"
-            );
-            std::mem::forget(source);
+            unrelated_fd.assert_open("unrelated cmsg must not close fd");
 
-            let source = File::open("/dev/null").expect("wrong-level source fd must open");
-            let mut wrong_level = build_rights_control(&[source.as_raw_fd()]);
+            let wrong_level_fd = ReservedDescriptor::park(&source);
+            let mut wrong_level = build_rights_control(&[wrong_level_fd.raw()]);
             let header = CmsgHdr {
                 cmsg_len: std::mem::size_of::<CmsgHdr>() + std::mem::size_of::<std::ffi::c_int>(),
                 cmsg_level: SOL_SOCKET + 1,
@@ -4209,24 +4363,15 @@ mod tests {
             };
             unsafe { ptr::write_unaligned(wrong_level.as_mut_ptr().cast::<CmsgHdr>(), header) };
             close_received_fds(&wrong_level);
-            assert_eq!(
-                unsafe { close(source.as_raw_fd()) },
-                0,
-                "wrong-level cmsg must not close fd"
-            );
-            std::mem::forget(source);
+            wrong_level_fd.assert_open("wrong-level cmsg must not close fd");
 
-            let source = File::open("/dev/null").expect("truncated source fd must open");
-            let mut truncated = build_rights_control(&[source.as_raw_fd()]);
+            let truncated_fd = ReservedDescriptor::park(&source);
+            let mut truncated = build_rights_control(&[truncated_fd.raw()]);
             truncated
                 .truncate(std::mem::size_of::<CmsgHdr>() + std::mem::size_of::<std::ffi::c_int>());
             close_received_fds(&truncated);
-            assert_eq!(
-                unsafe { close(source.as_raw_fd()) },
-                -1,
-                "complete fd bytes must be closed even when cmsg is truncated"
-            );
-            std::mem::forget(source);
+            truncated_fd
+                .assert_closed("complete fd bytes must be closed even when cmsg is truncated");
         }
 
         #[test]
