@@ -1951,7 +1951,15 @@ mod tests {
         fs::set_permissions(root, fs::Permissions::from_mode(0o700))
             .expect("control socket test directory must be private");
         let id = NEXT_TEST_SOCKET.fetch_add(1, Ordering::Relaxed);
-        let path = root.join(format!("ruster-control-{id}.sock"));
+        // The counter alone proved not to be enough: a path was observed
+        // carrying a live listener of another socket type, which only happens
+        // when two tests reach the same name. The instant makes the name
+        // unique whatever the cause, and the check below still reports a
+        // genuine repeat rather than hiding it.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let path = root.join(format!("ruster-control-{id}-{nonce:x}.sock"));
         // The counter is process-wide and the directory is unique to this run,
         // so a minted path must be free. Saying so here turns a later "cannot
         // probe existing control socket path" into a report that names the
@@ -2291,8 +2299,41 @@ mod tests {
         // pathname behind without an accepting endpoint.
         let _ = unsafe { close(fd) };
 
-        let Some(listener) = listener_or_skip(&path) else {
-            return;
+        // Closing the descriptor here does not always end the socket: another
+        // test forking a child duplicates every descriptor until that child
+        // reaches execve, and `SOCK_CLOEXEC` only closes the copy at that
+        // point. While a copy lives, the pathname still carries a seqpacket
+        // endpoint, and the probe correctly refuses to unlink it — connecting
+        // with SOCK_STREAM then reports EPROTOTYPE rather than ECONNREFUSED.
+        // Measured directly: 4000 of 4000 connects to a closed seqpacket path
+        // gave ECONNREFUSED, and 200 of 200 to an open one gave EPROTOTYPE.
+        //
+        // The property under test is that a *refused* probe authorises
+        // removal, so the test waits for its own precondition instead of
+        // assuming the fork window is closed.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let listener = loop {
+            match ControlListener::bind_path(&path) {
+                Ok(listener) => break listener,
+                Err(error)
+                    if error.contains("Operation not permitted")
+                        || error.contains("Permission denied")
+                        || is_sandbox_ancestor_ownership_error(&error) =>
+                {
+                    println!(
+                        "control socket test skipped: SOCK_SEQPACKET bind is unavailable: {error}"
+                    );
+                    return;
+                }
+                Err(error) if error.contains("refusing to unlink it") => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "a stale pathname must become removable once no endpoint holds it: {error}"
+                    );
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("control listener must bind: {error}"),
+            }
         };
         assert!(path.exists(), "new listener must own a pathname socket");
         drop(listener);
@@ -3004,7 +3045,16 @@ mod tests {
         unsafe { fcntl_with_argument(fd, F_GETFD_COMMAND, 0) }
     }
 
+    const RLIMIT_NOFILE: std::ffi::c_int = 7;
+
+    #[repr(C)]
+    struct RLimit {
+        soft: u64,
+        hard: u64,
+    }
+
     unsafe extern "C" {
+        fn getrlimit(resource: std::ffi::c_int, limit: *mut RLimit) -> std::ffi::c_int;
         #[link_name = "fcntl"]
         fn fcntl_with_argument(
             fd: RawFd,
@@ -3012,6 +3062,34 @@ mod tests {
             argument: std::ffi::c_int,
         ) -> std::ffi::c_int;
         fn dup3(old: RawFd, new: RawFd, flags: std::ffi::c_int) -> std::ffi::c_int;
+    }
+
+    /// The soft limit on descriptor numbers this process may hold.
+    ///
+    /// Read once: raising it mid-run would move the reserved numbers.
+    fn descriptor_limit() -> std::ffi::c_int {
+        static LIMIT: std::sync::OnceLock<std::ffi::c_int> = std::sync::OnceLock::new();
+        *LIMIT.get_or_init(|| {
+            let mut limit = RLimit { soft: 0, hard: 0 };
+            // SAFETY: getrlimit writes exactly one initialized RLimit.
+            let result = unsafe { getrlimit(RLIMIT_NOFILE, &mut limit) };
+            assert_eq!(result, 0, "the descriptor limit must be readable");
+            std::ffi::c_int::try_from(limit.soft).unwrap_or(std::ffi::c_int::MAX)
+        })
+    }
+
+    /// A descriptor number this process cannot have open.
+    ///
+    /// One past the soft limit is out of range for every descriptor the
+    /// process may hold, so `poll` reports POLLNVAL for it deterministically
+    /// and no thread can reopen it underneath the caller.
+    fn unopened_descriptor() -> RawFd {
+        let fd = descriptor_limit();
+        assert!(
+            !descriptor_is_open(fd),
+            "a descriptor at the limit must never be open"
+        );
+        fd
     }
 
     /// Reports whether the process currently holds this descriptor.
@@ -3050,11 +3128,20 @@ mod tests {
         /// enough: two tests share a number as soon as the first one closes
         /// it, which is how this check still failed 6 times in 300 runs.
         fn park(source: &File) -> Self {
-            const RESERVED_BASE: std::ffi::c_int = 1 << 16;
+            // Counting down from the descriptor limit rather than up from a
+            // fixed base: a soft limit of 1024 is common, and a fixed base of
+            // 65536 made `dup3` fail with EBADF on any machine that has one.
+            // The kernel hands out the lowest free number, so the top of the
+            // table is never taken while this process uses a handful.
             let slot = NEXT_RESERVED_DESCRIPTOR.fetch_add(1, Ordering::Relaxed);
             let slot = std::ffi::c_int::try_from(slot)
                 .expect("reserved descriptor slots stay well inside c_int");
-            let fd = RESERVED_BASE + slot;
+            let limit = descriptor_limit();
+            let fd = limit
+                .checked_sub(1)
+                .and_then(|top| top.checked_sub(slot))
+                .filter(|fd| *fd > 2)
+                .expect("the descriptor table must have room to reserve a number");
             assert!(
                 !descriptor_is_open(fd),
                 "a reserved descriptor number must never be reissued"
@@ -3387,12 +3474,7 @@ mod tests {
             // threads: any of them can reopen that number before poll runs,
             // and then POLLNVAL never arrives. A number the process can never
             // have open gives the same POLLNVAL deterministically.
-            const UNOPENED_FD: RawFd = 1 << 20;
-            assert!(
-                !descriptor_is_open(UNOPENED_FD),
-                "probe test descriptor must not be open"
-            );
-            let fd = UNOPENED_FD;
+            let fd = unopened_descriptor();
             match wait_for_probe_connect(fd, Instant::now() + Duration::from_secs(1), || false) {
                 ConnectProbeOutcome::Conservative(error) => {
                     assert!(error.to_string().contains("invalid descriptor"));
@@ -4029,13 +4111,8 @@ mod tests {
             // test threads in this binary, which can reopen that number before
             // poll runs. A number far above the descriptor limit cannot be
             // reused, and F_GETFD confirms it is closed at the moment of use.
-            const UNOPENED_FD: RawFd = 1 << 20;
-            assert!(
-                !descriptor_is_open(UNOPENED_FD),
-                "probe test descriptor must not be open"
-            );
             match wait_for_probe_connect(
-                UNOPENED_FD,
+                unopened_descriptor(),
                 Instant::now() + Duration::from_secs(1),
                 || false,
             ) {
