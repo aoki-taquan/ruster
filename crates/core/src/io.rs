@@ -738,6 +738,10 @@ pub enum ConsumeReason {
     /// Valid local IPv4 traffic that this deliberately small control plane
     /// does not implement. It must not fall through to router forwarding.
     Ipv4LocalUnsupported,
+    /// A datagram copied into the hold queue to be split (RFC 791 §3.2). It
+    /// leaves as several frames from the generated path, so the received frame
+    /// is consumed rather than forwarded or dropped.
+    Ipv4Fragmented,
 }
 
 /// A core-owned, worker-local RAII lease.

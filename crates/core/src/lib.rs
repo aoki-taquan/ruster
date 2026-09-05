@@ -95,8 +95,8 @@ pub use resolution::{
     poll_resolution_timers, ArpRequestAction, ArpRequestBuildError, ControlDisposition,
     DynamicNeighborSlot, ExecuteArpRequestError, ExecuteHeldDatagramError, GeneratedArpReport,
     GeneratedArpTrace, GeneratedHeldDatagramTrace, GeneratedHeldDatagramTraceSink,
-    GeneratedTraceSink, HeldDatagramBuildError, HeldDatagramReport, MonotonicMillis,
-    NoGeneratedHeldDatagramTrace, NoGeneratedTrace, NoResolutionFailureTrace,
+    GeneratedTraceSink, HeldDatagramBuildError, HeldDatagramReport, HoldDestination,
+    MonotonicMillis, NoGeneratedHeldDatagramTrace, NoGeneratedTrace, NoResolutionFailureTrace,
     NoResolutionTimerTrace, ResolutionActionSlot, ResolutionCounters, ResolutionDatagramHoldSlot,
     ResolutionFailureCapture, ResolutionFailureCounters, ResolutionFailureDispatchError,
     ResolutionFailureDispatchReport, ResolutionFailureHoldPhase, ResolutionFailureHoldSlot,
@@ -106,7 +106,7 @@ pub use resolution::{
     ResolutionPublicationReport, ResolutionResult, ResolutionRuntime, ResolutionStateSlot,
     ResolutionStatus, ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTrace,
     ResolutionTimerTraceSink, StaticReconcileReport, ARP_REQUEST_FRAME_LEN,
-    RESOLUTION_HOLD_MAX_FRAME_LEN,
+    MAX_FRAGMENTS_PER_DATAGRAM, RESOLUTION_HOLD_MAX_FRAME_LEN,
 };
 pub use route::{
     IfId, Interface, Ipv4Address, Ipv4Mtu, Ipv4MtuError, LocalIpv4Binding, Neighbor, Route,

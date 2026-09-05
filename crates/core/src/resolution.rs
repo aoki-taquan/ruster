@@ -325,11 +325,23 @@ pub const RESOLUTION_HOLD_MAX_FRAME_LEN: usize = 1_514;
 /// — the TTL is decremented and the header checksum updated exactly once, at
 /// the moment the datagram arrived — leaving only the destination MAC to fill
 /// in when the address is learned.
+/// What a held datagram is waiting for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HoldDestination {
+    /// The next hop is being resolved; the MAC is not known yet.
+    Pending(Ipv4Address),
+    /// The next hop is already known, so only the send is outstanding.
+    Known(MacAddress),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolutionDatagramHoldSlot {
     occupied: bool,
     egress: IfId,
     target: Ipv4Address,
+    destination: HoldDestination,
+    /// The egress MTU this datagram must be split to, or zero when it fits.
+    fragment_to: u16,
     held_at: MonotonicMillis,
     len: u16,
     frame: [u8; RESOLUTION_HOLD_MAX_FRAME_LEN],
@@ -340,6 +352,8 @@ impl ResolutionDatagramHoldSlot {
         occupied: false,
         egress: IfId(0),
         target: Ipv4Address::from_octets([0; 4]),
+        destination: HoldDestination::Pending(Ipv4Address::from_octets([0; 4])),
+        fragment_to: 0,
         held_at: MonotonicMillis(0),
         len: 0,
         frame: [0; RESOLUTION_HOLD_MAX_FRAME_LEN],
@@ -368,6 +382,16 @@ impl ResolutionDatagramHoldSlot {
     #[must_use]
     pub const fn target(&self) -> Ipv4Address {
         self.target
+    }
+
+    /// The egress MTU this datagram must be split to, or `None` when it fits.
+    #[must_use]
+    pub const fn fragment_to(&self) -> Option<u16> {
+        if self.fragment_to == 0 {
+            None
+        } else {
+            Some(self.fragment_to)
+        }
     }
 
     /// The held frame, still missing its destination MAC.
@@ -887,6 +911,68 @@ impl<'a> ResolutionRuntime<'a> {
         frame: &[u8],
         now: MonotonicMillis,
     ) -> ResolutionHoldDisposition {
+        self.hold_datagram_for(
+            egress,
+            target,
+            HoldDestination::Pending(target),
+            0,
+            frame,
+            now,
+        )
+    }
+
+    /// Keeps a datagram whose next hop is known but which cannot be sent as
+    /// one frame.
+    ///
+    /// `fragment_to` is the egress MTU the datagram must be split to.
+    pub fn hold_datagram_for_fragmentation(
+        &mut self,
+        egress: IfId,
+        target: Ipv4Address,
+        destination_mac: MacAddress,
+        fragment_to: u16,
+        frame: &[u8],
+        now: MonotonicMillis,
+    ) -> ResolutionHoldDisposition {
+        self.hold_datagram_for(
+            egress,
+            target,
+            HoldDestination::Known(destination_mac),
+            fragment_to,
+            frame,
+            now,
+        )
+    }
+
+    /// Keeps a datagram whose next hop is still being resolved and which will
+    /// also need splitting once it is known.
+    pub fn hold_datagram_awaiting_fragmentation(
+        &mut self,
+        egress: IfId,
+        target: Ipv4Address,
+        fragment_to: u16,
+        frame: &[u8],
+        now: MonotonicMillis,
+    ) -> ResolutionHoldDisposition {
+        self.hold_datagram_for(
+            egress,
+            target,
+            HoldDestination::Pending(target),
+            fragment_to,
+            frame,
+            now,
+        )
+    }
+
+    fn hold_datagram_for(
+        &mut self,
+        egress: IfId,
+        target: Ipv4Address,
+        destination: HoldDestination,
+        fragment_to: u16,
+        frame: &[u8],
+        now: MonotonicMillis,
+    ) -> ResolutionHoldDisposition {
         if !self.observe_now(now) {
             return ResolutionHoldDisposition::ClockRegression;
         }
@@ -920,6 +1006,8 @@ impl<'a> ResolutionRuntime<'a> {
         slot.occupied = true;
         slot.egress = egress;
         slot.target = target;
+        slot.destination = destination;
+        slot.fragment_to = fragment_to;
         slot.held_at = now;
         slot.len = u16::try_from(len).expect("the length was bounded above");
         slot.frame[..len].copy_from_slice(frame);
@@ -941,7 +1029,7 @@ impl<'a> ResolutionRuntime<'a> {
     pub fn take_resolved_datagram(
         &mut self,
         now: MonotonicMillis,
-    ) -> Option<(IfId, MacAddress, &[u8])> {
+    ) -> Option<(IfId, MacAddress, Option<u16>, &[u8])> {
         if !self.observe_now(now) {
             return None;
         }
@@ -956,17 +1044,27 @@ impl<'a> ResolutionRuntime<'a> {
                 self.hold_counters.expired += 1;
                 continue;
             }
-            if let Some(mac) = self.resolved_mac(slot.egress, slot.target, now) {
+            let mac = match slot.destination {
+                HoldDestination::Known(mac) => Some(mac),
+                HoldDestination::Pending(target) => self.resolved_mac(slot.egress, target, now),
+            };
+            if let Some(mac) = mac {
                 found = Some((index, mac));
                 break;
             }
         }
         let (index, mac) = found?;
         let egress = self.datagram_holds[index].egress;
+        let fragment_to = self.datagram_holds[index].fragment_to();
         self.datagram_holds[index].occupied = false;
         self.hold_counters.replayed += 1;
         let len = self.datagram_holds[index].len();
-        Some((egress, mac, &self.datagram_holds[index].frame[..len]))
+        Some((
+            egress,
+            mac,
+            fragment_to,
+            &self.datagram_holds[index].frame[..len],
+        ))
     }
 
     /// The MAC currently known for one unresolved-address key, if any.
@@ -2599,7 +2697,8 @@ where
     if !runtime.execution_time_valid(now) {
         return Err(ExecuteHeldDatagramError::ClockRegression);
     }
-    let Some((egress, destination_mac, frame)) = runtime.take_resolved_datagram(now) else {
+    let Some((egress, destination_mac, fragment_to, frame)) = runtime.take_resolved_datagram(now)
+    else {
         return Ok(None);
     };
     let len = frame.len();
@@ -2608,7 +2707,11 @@ where
     staged[0..6].copy_from_slice(&destination_mac.0);
 
     let mut batch = io.begin_generated(egress);
-    let (allocation_error, build_error) = match allocate_held_datagram(&mut batch, &staged[..len]) {
+    let outcome = match fragment_to {
+        None => allocate_held_datagram(&mut batch, &staged[..len]),
+        Some(mtu) => allocate_fragments(&mut batch, &staged[..len], mtu),
+    };
+    let (allocation_error, build_error) = match outcome {
         Ok(()) => {
             trace.record_generated_held_datagram(GeneratedHeldDatagramTrace::TxRequested {
                 egress,
@@ -2645,6 +2748,74 @@ where
 enum HeldDatagramGenerationError {
     Allocation(GeneratedAllocationError),
     Build(HeldDatagramBuildError),
+}
+
+/// The largest number of fragments one datagram may be split into.
+///
+/// A bound is needed: without one a single datagram could ask the backend for
+/// as many frames as the transmit budget holds. Sixteen covers a full-MTU
+/// datagram split to the 576-byte path every IPv4 host must accept.
+pub const MAX_FRAGMENTS_PER_DATAGRAM: usize = 16;
+
+/// Splits one datagram into fragments that each fit `mtu` (RFC 791 §3.2).
+///
+/// The datagram is expected to carry no options: fragmenting a header with
+/// options requires copying only those whose copied bit is set, which changes
+/// the header length per fragment. The caller refuses that case instead, so
+/// every fragment here repeats the same twenty-octet header.
+fn allocate_fragments<B: GeneratedPacketBatch>(
+    batch: &mut B,
+    frame: &[u8],
+    mtu: u16,
+) -> Result<(), HeldDatagramGenerationError> {
+    const ETHERNET: usize = 14;
+    const HEADER: usize = 20;
+    let mtu = usize::from(mtu);
+    debug_assert!(mtu > HEADER);
+    // Fragment offsets count eight-octet units, so every fragment but the last
+    // carries a payload that is a multiple of eight.
+    let per_fragment = ((mtu - HEADER) / 8) * 8;
+    if per_fragment == 0 {
+        return Err(HeldDatagramGenerationError::Build(
+            HeldDatagramBuildError::ExactLengthRequired,
+        ));
+    }
+    let payload = &frame[ETHERNET + HEADER..];
+
+    let mut offset = 0;
+    while offset < payload.len() {
+        let chunk = per_fragment.min(payload.len() - offset);
+        let more = offset + chunk < payload.len();
+        let total_len = HEADER + chunk;
+        let frame_len = ETHERNET + total_len;
+        let mut lease = batch
+            .allocate(frame_len)
+            .map_err(HeldDatagramGenerationError::Allocation)?;
+        if lease.bytes_mut().len() != frame_len {
+            lease.cancel();
+            return Err(HeldDatagramGenerationError::Build(
+                HeldDatagramBuildError::ExactLengthRequired,
+            ));
+        }
+        let out = lease.bytes_mut();
+        // The whole header is copied first, so the identification, addresses,
+        // protocol and TTL all carry over; only the three fields a fragment
+        // owns are rewritten below.
+        out[..ETHERNET + HEADER].copy_from_slice(&frame[..ETHERNET + HEADER]);
+        out[ETHERNET + 2..ETHERNET + 4]
+            .copy_from_slice(&u16::try_from(total_len).unwrap_or(u16::MAX).to_be_bytes());
+        // Don't Fragment stays clear, More Fragments follows the split, and the
+        // offset is the payload position in eight-octet units.
+        let flags_offset = u16::try_from(offset / 8).unwrap_or(0) | if more { 0x2000 } else { 0 };
+        out[ETHERNET + 6..ETHERNET + 8].copy_from_slice(&flags_offset.to_be_bytes());
+        out[ETHERNET + 10..ETHERNET + 12].fill(0);
+        out[ETHERNET + HEADER..].copy_from_slice(&payload[offset..offset + chunk]);
+        let checksum = crate::ipv4_header_checksum(&out[ETHERNET..ETHERNET + HEADER]);
+        out[ETHERNET + 10..ETHERNET + 12].copy_from_slice(&checksum.to_be_bytes());
+        lease.commit();
+        offset += chunk;
+    }
+    Ok(())
 }
 
 fn allocate_held_datagram<B: GeneratedPacketBatch>(
@@ -6396,7 +6567,7 @@ mod tests {
             false,
             MonotonicMillis(20),
         );
-        let (egress, mac, replayed) = runtime
+        let (egress, mac, _split, replayed) = runtime
             .take_resolved_datagram(MonotonicMillis(20))
             .expect("a resolved hop must release its held datagram");
         assert_eq!(egress, HOLD_EGRESS);
@@ -6450,7 +6621,7 @@ mod tests {
             false,
             MonotonicMillis(2),
         );
-        let (_, _, replayed) = runtime
+        let (_, _, _split, replayed) = runtime
             .take_resolved_datagram(MonotonicMillis(2))
             .expect("the surviving datagram must be released");
         assert_eq!(replayed, second.as_slice(), "the newest datagram survives");

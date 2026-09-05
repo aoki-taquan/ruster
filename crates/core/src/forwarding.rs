@@ -1102,6 +1102,9 @@ enum PacketDecision {
     Icmpv4EchoReply(Icmpv4EchoReplyDecision),
     ConsumeArp(ControlDisposition),
     ConsumeIpv4Local,
+    /// The datagram was copied into the hold queue to be split (RFC 791 §3.2)
+    /// and will leave as several frames from the generated path.
+    ConsumeIpv4ForFragmentation,
 }
 
 #[derive(Clone, Copy)]
@@ -1119,7 +1122,7 @@ impl PacketDecision {
             Self::Nat44Icmpv4(decision) => decision.egress,
             Self::ArpReply(decision) => decision.egress,
             Self::Icmpv4EchoReply(decision) => decision.egress,
-            Self::ConsumeArp(_) | Self::ConsumeIpv4Local => {
+            Self::ConsumeArp(_) | Self::ConsumeIpv4Local | Self::ConsumeIpv4ForFragmentation => {
                 unreachable!("consumed controls have no egress")
             }
         }
@@ -1785,7 +1788,9 @@ where
                 }
                 if matches!(
                     decision,
-                    PacketDecision::ConsumeArp(_) | PacketDecision::ConsumeIpv4Local
+                    PacketDecision::ConsumeArp(_)
+                        | PacketDecision::ConsumeIpv4Local
+                        | PacketDecision::ConsumeIpv4ForFragmentation
                 ) {
                     Ok(decision)
                 } else {
@@ -1808,6 +1813,17 @@ where
                     ingress,
                     reason: ConsumeReason::ArpControl,
                     disposition,
+                });
+            }
+            Ok(PlannedPacket {
+                decision: PacketDecision::ConsumeIpv4ForFragmentation,
+                ..
+            }) => {
+                packet.consume(ConsumeReason::Ipv4Fragmented);
+                consumed += 1;
+                trace.record(TraceEvent::Ipv4LocalConsumed {
+                    ingress,
+                    reason: ConsumeReason::Ipv4Fragmented,
                 });
             }
             Ok(PlannedPacket {
@@ -2420,37 +2436,56 @@ fn decide_ipv4<T: TraceSink>(
     // RFC 1812 §4.2.2.7: a datagram larger than the egress MTU must not be
     // put on the link. Before this check the oversized frame was handed to
     // the backend unchanged, which a real driver rejects.
+    let mut split_to = None;
     if ipv4.total_len > interface.mtu.as_len() {
         let dont_fragment = packet::read_u16(frame, ipv4.header_offset + 6)
             .ok_or(Ipv4HeaderTruncated)?
             & IPV4_DONT_FRAGMENT_FLAG
             != 0;
         if !dont_fragment {
-            // RFC 1812 §5.2.7 fragmentation is not implemented yet, so the
-            // datagram is dropped with a reason of its own rather than being
-            // emitted at a length the link cannot carry.
-            return Err(Ipv4FragmentationRequired);
+            // RFC 1812 §5.2.7: split it, once the next hop is known. Splitting
+            // a header that carries options needs the copied-bit rule and a
+            // per-fragment header length, which is not implemented, so that
+            // combination is still refused rather than emitted at a length the
+            // link cannot carry.
+            if ipv4.header_len != 20 || resolution.is_none() {
+                return Err(Ipv4FragmentationRequired);
+            }
+            let mtu = interface.mtu.bytes();
+            // The same arithmetic the splitter uses: fragment offsets count
+            // eight-octet units, so every fragment but the last carries a
+            // payload that is a multiple of eight.
+            let per_fragment = ((usize::from(mtu) - 20) / 8) * 8;
+            let payload_len = ipv4.total_len.saturating_sub(ipv4.header_len);
+            if per_fragment == 0
+                || payload_len.div_ceil(per_fragment)
+                    > crate::resolution::MAX_FRAGMENTS_PER_DATAGRAM
+            {
+                return Err(Ipv4FragmentationRequired);
+            }
+            split_to = Some(mtu);
+        } else {
+            if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+                let disposition = decide_icmpv4_error(
+                    frame,
+                    snapshot,
+                    ipv4,
+                    Some(route),
+                    Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded {
+                        next_hop_mtu: interface.mtu.bytes(),
+                    },
+                    resolution,
+                    runtime,
+                    *now,
+                    trace,
+                );
+                trace.record(TraceEvent::Icmpv4TimeExceededDisposition {
+                    ingress,
+                    disposition,
+                });
+            }
+            return Err(Ipv4FragmentationNeeded);
         }
-        if let Some((runtime, now)) = icmpv4_errors.as_mut() {
-            let disposition = decide_icmpv4_error(
-                frame,
-                snapshot,
-                ipv4,
-                Some(route),
-                Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded {
-                    next_hop_mtu: interface.mtu.bytes(),
-                },
-                resolution,
-                runtime,
-                *now,
-                trace,
-            );
-            trace.record(TraceEvent::Icmpv4TimeExceededDisposition {
-                ingress,
-                disposition,
-            });
-        }
-        return Err(Ipv4FragmentationNeeded);
     }
     let static_neighbor = snapshot
         .neighbors
@@ -2513,6 +2548,7 @@ fn decide_ipv4<T: TraceSink>(
                             route.egress(),
                             target,
                             interface.mac,
+                            split_to,
                             runtime,
                             *now,
                         );
@@ -2553,6 +2589,33 @@ fn decide_ipv4<T: TraceSink>(
     let checksum_end = checksum_offset
         .checked_add(2)
         .ok_or(Ipv4HeaderLengthExceedsPacket)?;
+    if let Some(mtu) = split_to {
+        let Some((runtime, now)) = resolution.as_mut() else {
+            return Err(Ipv4FragmentationRequired);
+        };
+        let held = hold_datagram_for_split(
+            frame,
+            ipv4,
+            route.egress(),
+            target,
+            interface.mac,
+            destination_mac,
+            mtu,
+            runtime,
+            *now,
+        );
+        if !matches!(
+            held,
+            ResolutionHoldDisposition::Held { .. } | ResolutionHoldDisposition::Replaced { .. }
+        ) {
+            return Err(Ipv4FragmentationRequired);
+        }
+        trace.record(TraceEvent::Routed {
+            egress: route.egress(),
+            neighbor_target: target,
+        });
+        return Ok(PacketDecision::ConsumeIpv4ForFragmentation);
+    }
     trace.record(TraceEvent::Routed {
         egress: route.egress(),
         neighbor_target: target,
@@ -5106,7 +5169,9 @@ fn apply_decision(frame: &mut [u8], decision: PacketDecision) -> Result<(), Drop
         PacketDecision::Nat44Icmpv4(nat) => apply_nat44_icmpv4_rewrite(frame, nat),
         PacketDecision::ArpReply(arp) => apply_arp_reply(frame, arp),
         PacketDecision::Icmpv4EchoReply(icmp) => apply_icmpv4_echo_reply(frame, icmp),
-        PacketDecision::ConsumeArp(_) | PacketDecision::ConsumeIpv4Local => {
+        PacketDecision::ConsumeArp(_)
+        | PacketDecision::ConsumeIpv4Local
+        | PacketDecision::ConsumeIpv4ForFragmentation => {
             unreachable!("consume decisions are never rewritten")
         }
     }
@@ -5312,6 +5377,57 @@ fn validate_ipv4_options(
     Ok(())
 }
 
+/// Copies a datagram that must be split into the hold queue.
+///
+/// Like the unresolved-hop hold, the copy carries the forwarding rewrite with
+/// the TTL already decremented, so every fragment leaves with the TTL an
+/// immediate forward would have used. The destination MAC is filled in when
+/// known and left for the resolution to supply when it is not, which is what
+/// keeps an oversized datagram from being replayed whole later.
+#[allow(clippy::too_many_arguments)]
+fn hold_datagram_for_split(
+    frame: &[u8],
+    ipv4: packet::ValidatedIpv4,
+    egress: IfId,
+    target: crate::Ipv4Address,
+    source_mac: MacAddress,
+    destination_mac: MacAddress,
+    mtu: u16,
+    runtime: &mut ResolutionRuntime<'_>,
+    now: MonotonicMillis,
+) -> ResolutionHoldDisposition {
+    let mut staged = [0_u8; RESOLUTION_HOLD_MAX_FRAME_LEN];
+    let len = frame.len();
+    if len > RESOLUTION_HOLD_MAX_FRAME_LEN {
+        return ResolutionHoldDisposition::FrameTooLong { len };
+    }
+    staged[..len].copy_from_slice(frame);
+    staged[0..6].fill(0);
+    if let Some(slot) = staged.get_mut(6..12) {
+        slot.copy_from_slice(&source_mac.0);
+    }
+    let Some(ttl_offset) = ipv4.header_offset.checked_add(8) else {
+        return ResolutionHoldDisposition::FrameTooLong { len };
+    };
+    let Some(checksum_offset) = ipv4.header_offset.checked_add(10) else {
+        return ResolutionHoldDisposition::FrameTooLong { len };
+    };
+    if ipv4.ttl == 0 || ttl_offset >= len || checksum_offset + 2 > len {
+        return ResolutionHoldDisposition::FrameTooLong { len };
+    }
+    staged[ttl_offset] = ipv4.ttl - 1;
+    // Every fragment recomputes its own header checksum, so the copy only
+    // needs a consistent TTL here.
+    runtime.hold_datagram_for_fragmentation(
+        egress,
+        target,
+        destination_mac,
+        mtu,
+        &staged[..len],
+        now,
+    )
+}
+
 /// Copies a datagram whose next hop is unresolved into the hold queue.
 ///
 /// The copy carries the forwarding rewrite already applied — TTL decremented
@@ -5319,12 +5435,14 @@ fn validate_ipv4_options(
 /// left zero, so releasing it later sends exactly what an immediate forward
 /// would have sent. Nothing here holds an RX lease: the caller recycles the
 /// received frame as usual.
+#[allow(clippy::too_many_arguments)]
 fn hold_unresolved_datagram(
     frame: &[u8],
     ipv4: packet::ValidatedIpv4,
     egress: IfId,
     target: crate::Ipv4Address,
     source_mac: MacAddress,
+    split_to: Option<u16>,
     runtime: &mut ResolutionRuntime<'_>,
     now: MonotonicMillis,
 ) -> ResolutionHoldDisposition {
@@ -5356,7 +5474,15 @@ fn hold_unresolved_datagram(
         u16::from_be_bytes([ipv4.ttl - 1, ipv4.protocol]),
     );
     staged[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
-    runtime.hold_datagram(egress, target, &staged[..len], now)
+    match split_to {
+        // An oversized datagram must still be split when its hop resolves;
+        // replaying it whole would put a frame on the link that cannot carry
+        // it.
+        Some(mtu) => {
+            runtime.hold_datagram_awaiting_fragmentation(egress, target, mtu, &staged[..len], now)
+        }
+        None => runtime.hold_datagram(egress, target, &staged[..len], now),
+    }
 }
 
 fn apply_ipv4_rewrite(frame: &mut [u8], decision: Ipv4RewriteDecision) -> Result<(), DropReason> {
@@ -5549,6 +5675,7 @@ mod tests {
                 IfId(2),
                 ipv4.destination,
                 egress_mac,
+                None,
                 &mut runtime,
                 MonotonicMillis(0),
             );
