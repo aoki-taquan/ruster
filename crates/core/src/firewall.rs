@@ -3879,4 +3879,148 @@ mod tests {
             }
         });
     }
+
+    #[test]
+    fn an_ack_on_an_established_tcp_flow_refreshes_it_and_a_reset_does_not() {
+        // Only a reset stops a packet from refreshing the flow it belongs to.
+        // Treating every segment as a reset would freeze `last_activity_ms`,
+        // so a busy connection would expire while it was still in use, and no
+        // connection would ever reach the active phase.
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                9,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Tcp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 4];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+
+            // SYN opens the flow.
+            let syn = packet(FirewallProtocol::Tcp, 0x02);
+            let plan = runtime.plan_packet(&config, syn, 10).unwrap();
+            runtime.commit(plan).unwrap();
+            let opened = runtime
+                .states()
+                .iter()
+                .find(|slot| slot.occupied)
+                .copied()
+                .unwrap();
+            assert_eq!(opened.last_activity_ms(), 10);
+            assert_eq!(opened.tcp_phase(), FirewallTcpPhase::Opening);
+
+            // An ACK in the forward direction refreshes the flow.
+            let forward_ack = packet(FirewallProtocol::Tcp, 0x10);
+            let plan = runtime.plan_packet(&config, forward_ack, 20).unwrap();
+            runtime.commit(plan).unwrap();
+            let after_forward = runtime
+                .states()
+                .iter()
+                .find(|slot| slot.occupied)
+                .copied()
+                .unwrap();
+            assert_eq!(
+                after_forward.last_activity_ms(),
+                20,
+                "an ordinary segment must refresh the flow"
+            );
+
+            // An ACK in the reverse direction completes the handshake.
+            let mut reverse_ack = packet(FirewallProtocol::Tcp, 0x10);
+            std::mem::swap(&mut reverse_ack.source, &mut reverse_ack.destination);
+            std::mem::swap(
+                &mut reverse_ack.source_port,
+                &mut reverse_ack.destination_port,
+            );
+            std::mem::swap(&mut reverse_ack.ingress, &mut reverse_ack.egress);
+            let plan = runtime.plan_packet(&config, reverse_ack, 30).unwrap();
+            runtime.commit(plan).unwrap();
+            let after_reverse = runtime
+                .states()
+                .iter()
+                .find(|slot| slot.occupied)
+                .copied()
+                .unwrap();
+            assert_eq!(after_reverse.last_activity_ms(), 30);
+            assert_eq!(
+                after_reverse.tcp_phase(),
+                FirewallTcpPhase::Active,
+                "both directions acknowledged makes the flow active"
+            );
+
+            // A reset is the one segment that does not refresh.
+            let reset = packet(FirewallProtocol::Tcp, 0x04);
+            let plan = runtime.plan_packet(&config, reset, 40).unwrap();
+            runtime.commit(plan).unwrap();
+            let after_reset = runtime
+                .states()
+                .iter()
+                .find(|slot| slot.occupied)
+                .copied()
+                .unwrap();
+            assert_eq!(
+                after_reset.last_activity_ms(),
+                30,
+                "a reset must not extend the flow's life"
+            );
+        });
+    }
+
+    #[test]
+    fn every_refusal_the_firewall_records_reaches_its_own_counter() {
+        // These counters are how an operator sees why traffic is being
+        // refused. A recorder that does nothing leaves a firewall that drops
+        // silently, which is indistinguishable from one that is not dropping.
+        with_snapshot(|snapshot| {
+            let rules = [
+                rule(1, FirewallAction::Deny, FirewallProtocol::Tcp),
+                rule(2, FirewallAction::AllowStateful, FirewallProtocol::Udp),
+            ];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 4];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            assert_eq!(runtime.counters(), FirewallCounters::default());
+
+            runtime.record_config_mismatch();
+            assert_eq!(
+                runtime.counters().config_mismatches,
+                1,
+                "a configuration mismatch must be counted"
+            );
+
+            runtime.record_invalid_packet();
+            assert_eq!(
+                runtime.counters().invalid_packets,
+                1,
+                "a packet the firewall could not validate must be counted"
+            );
+
+            // A rule that denies, and the default deny, are separate reasons
+            // and must not share a counter.
+            let denied = packet(FirewallProtocol::Tcp, 0x02);
+            let error = runtime
+                .plan_packet(&config, denied, 10)
+                .expect_err("the deny rule must refuse this packet");
+            runtime.record_plan_error(error);
+            assert_eq!(runtime.counters().denied_by_rule, 1);
+            assert_eq!(runtime.counters().denied_default, 0);
+
+            let mut unmatched = packet(FirewallProtocol::Udp, 0);
+            unmatched.destination_port = 0;
+            let error = runtime
+                .plan_packet(&config, unmatched, 10)
+                .expect_err("no rule matches this packet");
+            runtime.record_plan_error(error);
+            assert_eq!(runtime.counters().denied_default, 1);
+            assert_eq!(
+                runtime.counters().denied_by_rule,
+                1,
+                "the default deny must not be counted as a rule deny"
+            );
+        });
+    }
 }
