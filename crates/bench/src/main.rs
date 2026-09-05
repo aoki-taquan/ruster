@@ -4328,4 +4328,200 @@ mod tests {
         drop(file);
         remove_file(path).unwrap();
     }
+
+    /// The shape of a real identity source, with `{extra}` spliced in.
+    ///
+    /// `parse_identity_source` needs both declarations to be present before
+    /// the expansion question is even asked, so every case here keeps them.
+    fn identity_source_with(extra: &str) -> Vec<u8> {
+        format!(
+            "{extra}pub const R17_BENCHMARK_SPEC_SHA256_HEX: &str = \"00\";\n\
+             pub const R17_BENCHMARK_SPEC_SHA256: [u8; 32] = [0; 32];\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_plain_identity_source_needs_no_expansion() {
+        assert_eq!(
+            identity_source_uses_expansion(&identity_source_with("")),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn an_include_makes_the_source_depend_on_expansion() {
+        // `include!` can substitute whole items, so the lexical reading of the
+        // file is not what the compiler sees.
+        assert_eq!(
+            identity_source_uses_expansion(&identity_source_with("include!(\"other.rs\");\n")),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn an_identity_value_that_comes_from_a_file_is_refused_before_the_expansion_question() {
+        // `include_bytes!` and `include_str!` are not treated as expansion,
+        // because they cannot substitute an item. Used as the *value* of an
+        // identity they would still hide the real constant, so the check that
+        // matters is that the lexical parser refuses them outright.
+        for source in [
+            "pub const R17_BENCHMARK_SPEC_SHA256_HEX: &str = include_str!(\"x\");\n\
+             pub const R17_BENCHMARK_SPEC_SHA256: [u8; 32] = [0; 32];\n",
+            "pub const R17_BENCHMARK_SPEC_SHA256_HEX: &str = \"00\";\n\
+             pub const R17_BENCHMARK_SPEC_SHA256: [u8; 32] = *include_bytes!(\"x\");\n",
+        ] {
+            assert!(
+                parse_identity_source(source.as_bytes()).is_err(),
+                "an identity read from another file must not parse: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cfg_on_the_second_identity_declaration_is_found_by_its_own_scan() {
+        // Two guards can report a conditional identity: a top-level cfg seen
+        // before any identity declaration, and a cfg attached to an identity
+        // declaration. Only the second applies here, because the first
+        // declaration has already been seen by the time this attribute
+        // appears.
+        let source = "pub const R17_BENCHMARK_SPEC_SHA256_HEX: &str = \"00\";\n\
+                      #[cfg(feature = \"x\")]\n\
+                      pub const R17_BENCHMARK_SPEC_SHA256: [u8; 32] = [0; 32];\n";
+        assert_eq!(
+            identity_source_uses_expansion(source.as_bytes()),
+            Ok(true),
+            "a cfg on the second identity declaration must be found"
+        );
+    }
+
+    #[test]
+    fn a_cfg_on_the_second_identity_declaration_is_found_behind_other_attributes() {
+        // The scan walks back over whole attribute groups, so a cfg that is
+        // not the nearest attribute must still be found, and nested brackets
+        // inside an attribute must not confuse the walk.
+        let source = "pub const R17_BENCHMARK_SPEC_SHA256_HEX: &str = \"00\";\n\
+                      #[cfg(feature = \"x\")]\n\
+                      #[allow(clippy::type_complexity)]\n\
+                      #[doc = \"[not an attribute]\"]\n\
+                      pub const R17_BENCHMARK_SPEC_SHA256: [u8; 32] = [0; 32];\n";
+        assert_eq!(identity_source_uses_expansion(source.as_bytes()), Ok(true));
+    }
+
+    #[test]
+    fn ordinary_attributes_on_the_second_identity_declaration_are_not_conditional() {
+        let source = "pub const R17_BENCHMARK_SPEC_SHA256_HEX: &str = \"00\";\n\
+                      #[allow(dead_code)]\n\
+                      #[inline]\n\
+                      pub const R17_BENCHMARK_SPEC_SHA256: [u8; 32] = [0; 32];\n";
+        assert_eq!(identity_source_uses_expansion(source.as_bytes()), Ok(false));
+    }
+
+    #[test]
+    fn a_cfg_on_an_unrelated_item_before_the_identities_is_found_by_the_other_scan() {
+        // The mirror case: only the top-level scan applies, because no
+        // identity declaration has been seen yet and the attribute belongs to
+        // something else entirely.
+        let source = "#[cfg(feature = \"x\")]\n\
+                      fn unrelated() {}\n\
+                      pub const R17_BENCHMARK_SPEC_SHA256_HEX: &str = \"00\";\n\
+                      pub const R17_BENCHMARK_SPEC_SHA256: [u8; 32] = [0; 32];\n";
+        assert_eq!(identity_source_uses_expansion(source.as_bytes()), Ok(true));
+    }
+
+    #[test]
+    fn an_unbalanced_attribute_bracket_is_not_read_as_a_cfg() {
+        // The walk back from a declaration counts brackets to find where the
+        // attribute began. If it runs off the front of the token stream the
+        // answer is unknown, and reporting "no cfg here" on a guess would let
+        // a conditional identity through the integrity check.
+        let source = "pub const R17_BENCHMARK_SPEC_SHA256_HEX: &str = \"00\";\n\
+                      cfg]\n\
+                      pub const R17_BENCHMARK_SPEC_SHA256: [u8; 32] = [0; 32];\n";
+        // The stray bracket is unbalanced, so the source is refused outright
+        // rather than being read as an attribute that happens to say cfg.
+        assert!(identity_source_uses_expansion(source.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_cfg_attr_on_the_second_identity_declaration_counts_too() {
+        // `cfg_attr` can attach a further attribute conditionally, so it can
+        // select behaviour just as `cfg` selects presence.
+        let source = "pub const R17_BENCHMARK_SPEC_SHA256_HEX: &str = \"00\";\n\
+                      #[cfg_attr(feature = \"x\", allow(dead_code))]\n\
+                      pub const R17_BENCHMARK_SPEC_SHA256: [u8; 32] = [0; 32];\n";
+        assert_eq!(identity_source_uses_expansion(source.as_bytes()), Ok(true));
+    }
+
+    #[test]
+    fn a_cfg_attribute_before_the_declaration_makes_it_conditional() {
+        // Anything that can select between declarations must force the
+        // compiled comparison, or a build could ship a different constant
+        // than the one this file appears to declare.
+        for attribute in [
+            "#[cfg(feature = \"x\")]\n",
+            "#[cfg_attr(feature = \"x\", allow(dead_code))]\n",
+            "#![cfg(feature = \"x\")]\n",
+            "#[inline]\n#[cfg(feature = \"x\")]\n",
+            "#[cfg(feature = \"x\")]\n#[inline]\n",
+        ] {
+            assert_eq!(
+                identity_source_uses_expansion(&identity_source_with(attribute)),
+                Ok(true),
+                "attribute={attribute}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_attribute_that_cannot_select_a_declaration_is_not_expansion() {
+        for attribute in [
+            "#[inline]\n",
+            "#[allow(dead_code)]\n",
+            "#[doc = \"text\"]\n",
+        ] {
+            assert_eq!(
+                identity_source_uses_expansion(&identity_source_with(attribute)),
+                Ok(false),
+                "attribute={attribute}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cfg_inside_a_body_does_not_make_the_declarations_conditional() {
+        // Only a top-level attribute can select the declaration; one nested in
+        // a function body decides something else entirely.
+        let source = "fn helper() {\n    #[cfg(feature = \"x\")]\n    let _ = 1;\n}\n";
+        assert_eq!(
+            identity_source_uses_expansion(&identity_source_with(source)),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn a_word_that_merely_starts_with_include_is_not_an_include() {
+        let source = "fn included_helper() {}\n";
+        assert_eq!(
+            identity_source_uses_expansion(&identity_source_with(source)),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn an_identity_source_that_is_not_utf8_is_refused() {
+        assert!(identity_source_uses_expansion(&[0xff, 0xfe]).is_err());
+    }
+
+    #[test]
+    fn a_cfg_attribute_after_the_declaration_is_not_expansion_of_it() {
+        // The guard asks whether the *identity* declaration is conditional.
+        // An attribute that appears only after both declarations cannot
+        // select them.
+        let source = "pub const R17_BENCHMARK_SPEC_SHA256_HEX: &str = \"00\";\n\
+                      pub const R17_BENCHMARK_SPEC_SHA256: [u8; 32] = [0; 32];\n\
+                      #[cfg(feature = \"x\")]\n\
+                      fn unrelated() {}\n";
+        assert_eq!(identity_source_uses_expansion(source.as_bytes()), Ok(false));
+    }
 }
