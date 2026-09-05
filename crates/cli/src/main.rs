@@ -28,6 +28,8 @@ use std::panic::{self, AssertUnwindSafe};
 #[cfg(target_os = "linux")]
 mod sd_notify;
 
+mod test_env;
+
 #[cfg(target_os = "linux")]
 mod control_socket;
 
@@ -5050,7 +5052,6 @@ completion = 4
         };
         use std::{
             env,
-            ffi::OsString,
             path::{Path, PathBuf},
             process::{Command, Output},
             sync::Mutex,
@@ -5082,23 +5083,22 @@ completion = 4
             }
         }
 
+        /// Points this thread's control socket lookup at a test path.
+        ///
+        /// See `test_env` for why the process environment must not be written
+        /// from a test: another thread reading it concurrently can observe a
+        /// torn value.
         struct ControlSocketEnvRestore {
-            previous: Option<OsString>,
+            _override: crate::test_env::EnvOverrideGuard,
         }
 
         impl ControlSocketEnvRestore {
             fn set(path: &Path) -> Self {
-                let previous = env::var_os(control_socket::CONTROL_SOCKET_ENV);
-                env::set_var(control_socket::CONTROL_SOCKET_ENV, path);
-                Self { previous }
-            }
-        }
-
-        impl Drop for ControlSocketEnvRestore {
-            fn drop(&mut self) {
-                match &self.previous {
-                    Some(value) => env::set_var(control_socket::CONTROL_SOCKET_ENV, value),
-                    None => env::remove_var(control_socket::CONTROL_SOCKET_ENV),
+                Self {
+                    _override: crate::test_env::override_for_thread(
+                        control_socket::CONTROL_SOCKET_ENV,
+                        Some(path.as_os_str()),
+                    ),
                 }
             }
         }
