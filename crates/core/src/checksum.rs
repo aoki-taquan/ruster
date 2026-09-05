@@ -76,10 +76,16 @@ pub fn rfc1624_update(checksum: u16, old_word: u16, new_word: u16) -> u16 {
     !fold_sum(sum)
 }
 
-pub(crate) fn fold_u64(mut sum: u64) -> u16 {
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
+pub(crate) fn fold_u64(sum: u64) -> u16 {
+    // A fixed sequence rather than a loop, because the bound is provable and a
+    // loop here can only be exited by a comparison: one wide fold leaves the
+    // sum below 2^33, and three narrow folds then reach 16 bits from that.
+    // Nothing can make this run twice, let alone forever.
+    let sum = (sum >> 32) + (sum & 0xffff_ffff);
+    let sum = (sum >> 16) + (sum & 0xffff);
+    let sum = (sum >> 16) + (sum & 0xffff);
+    let sum = (sum >> 16) + (sum & 0xffff);
+    debug_assert!(sum <= 0xffff, "the fold sequence must reach 16 bits");
     sum as u16
 }
 
@@ -189,6 +195,40 @@ mod tests {
     fn internet_checksum_folds_carry_for_large_odd_messages() {
         let bytes = vec![0xff; 200_001];
         assert_eq!(internet_checksum(&bytes), 0x00ff);
+    }
+
+    #[test]
+    fn the_fold_sequence_reaches_sixteen_bits_from_every_shape_of_input() {
+        // The fold used to loop until the sum fit. Replacing it with a fixed
+        // sequence is only safe if that sequence is enough for every input, so
+        // the boundaries and a seeded sample are checked directly against the
+        // loop it replaced.
+        fn folding_loop(mut sum: u64) -> u16 {
+            while sum > 0xffff {
+                sum = (sum & 0xffff) + (sum >> 16);
+            }
+            sum as u16
+        }
+
+        let mut rng = DeterministicRng::seeded();
+        let mut cases = vec![
+            0,
+            1,
+            0xffff,
+            0x1_0000,
+            0x1_ffff,
+            0xffff_ffff,
+            0x1_0000_0000,
+            0xffff_ffff_ffff,
+            u64::MAX,
+            u64::MAX - 1,
+        ];
+        cases.extend((0..4_096).map(|_| rng.next_u64()));
+        // The accumulator's own reachable maximum: every lane saturated.
+        cases.push(u64::from(u32::MAX) * 4 * u64::from(u16::MAX));
+        for sum in cases {
+            assert_eq!(fold_u64(sum), folding_loop(sum), "sum={sum:#018x}");
+        }
     }
 
     #[test]
