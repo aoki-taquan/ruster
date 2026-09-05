@@ -239,6 +239,13 @@ pub struct ResolutionCapacityV1 {
     pub actions: u32,
     pub dynamic_neighbors: u32,
     pub failure_holds: u32,
+    /// Datagrams held while their next hop resolves (FWD-008).
+    ///
+    /// Absent means none, which drops the first datagram to every unresolved
+    /// next hop — the behaviour of every configuration written before this
+    /// field existed.
+    #[serde(default)]
+    pub datagram_holds: u32,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]

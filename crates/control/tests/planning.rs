@@ -92,7 +92,7 @@ fn consumed_validated_config_moves_full_service_plan_with_caller_supplied_keys()
     assert_eq!(
         first.storage_shape(),
         FullServiceStorageShape::new(
-            ResolutionStorageShape::new(2, 3, 4, 5),
+            ResolutionStorageShape::new(2, 3, 4, 5, 6),
             Icmpv4ErrorStorageShape::new(6, 7),
             Nat44UdpStoragePlan::new(3, 9, 4, 3, 16, 9, 13),
             Nat44TcpStoragePlan::new(5, 17, 8, 5, 32, 17, 13),
@@ -445,7 +445,7 @@ fn nested_planning_source_contract_has_exact_seams_and_inventory() {
         "let Self {\n            rules,\n            policy,\n            state_slots,\n        } = self;",
         "let Self {\n            resolution,\n            icmpv4_errors,\n            nat44_udp,\n            nat44_tcp,\n            firewall_states,\n            required_bytes,\n        } = self;",
         "let Self {\n            rx,\n            resolution_timer_scans,\n            failure_dispatch_scans,\n            generated_arp,\n            generated_icmpv4,\n        } = self;",
-        "let Self {\n            states,\n            actions,\n            dynamic_neighbors,\n            failure_holds,\n        } = self;",
+        "let Self {\n            states,\n            actions,\n            dynamic_neighbors,\n            failure_holds,\n            datagram_holds,\n        } = self;",
         "let Self {\n            mappings,\n            peers,\n            mapping_buckets,\n            mapping_nodes,\n            peer_buckets,\n            peer_nodes,\n            port_owners,\n        } = self;",
         "let Self {\n            mappings,\n            sessions,\n            mapping_buckets,\n            mapping_nodes,\n            session_buckets,\n            session_nodes,\n            port_owners,\n        } = self;",
         "let Self {\n            interfaces,\n            core_interfaces,\n            routes,\n            neighbors,\n            local_ipv4,\n            ipv4_origin,\n            resolution,\n            icmpv4_errors,\n            nat44,\n            firewall,\n            tick,\n            storage,\n            backend,\n            required_runtime_bytes,\n        } = self;",

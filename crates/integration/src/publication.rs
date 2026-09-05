@@ -344,7 +344,7 @@ pub struct FullServicePublicationOwner<'storage, Binding = UnboundPublicationOwn
     runtimes: FullServiceRuntimeSet<'storage>,
     active_failure: Option<FullServicePublishError>,
     #[cfg(test)]
-    backing_pointers: [usize; 21],
+    backing_pointers: [usize; 22],
 }
 
 /// Backend-bound owner accepted by [`ruster_runtime::run_tick`].
@@ -468,7 +468,7 @@ impl<'storage> Nat44TcpRuntimeStorage<'storage> {
 struct ActivatedRuntimes<'storage> {
     runtimes: FullServiceRuntimeSet<'storage>,
     #[cfg(test)]
-    backing_pointers: [usize; 21],
+    backing_pointers: [usize; 22],
 }
 
 fn activate_runtimes<'storage>(
@@ -480,6 +480,7 @@ fn activate_runtimes<'storage>(
         resolution_actions,
         resolution_dynamic_neighbors,
         resolution_failure_holds,
+        resolution_datagram_holds,
         icmpv4_error_states,
         icmpv4_error_actions,
         nat44_udp_mappings,
@@ -504,17 +505,19 @@ fn activate_runtimes<'storage>(
         resolution_actions.as_ptr() as usize,
         resolution_dynamic_neighbors.as_ptr() as usize,
         resolution_failure_holds.as_ptr() as usize,
+        resolution_datagram_holds.as_ptr() as usize,
         icmpv4_error_states.as_ptr() as usize,
         icmpv4_error_actions.as_ptr() as usize,
         firewall_states.as_ptr() as usize,
     ];
     let authority = candidate.authority();
-    let resolution = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+    let resolution = ResolutionRuntime::with_dynamic_neighbors_failure_holds_and_datagram_holds(
         authority.resolution_policy(),
         resolution_states,
         resolution_actions,
         resolution_dynamic_neighbors,
         resolution_failure_holds,
+        resolution_datagram_holds,
     );
     let icmpv4_errors = Icmpv4ErrorRuntime::new(
         authority.icmpv4_error_policy(),
@@ -561,6 +564,7 @@ fn activate_runtimes<'storage>(
             fixed_service_pointers[3],
             fixed_service_pointers[4],
             fixed_service_pointers[5],
+            fixed_service_pointers[6],
             udp.backing_pointers[0],
             udp.backing_pointers[1],
             udp.backing_pointers[2],
@@ -575,7 +579,7 @@ fn activate_runtimes<'storage>(
             tcp.backing_pointers[4],
             tcp.backing_pointers[5],
             tcp.backing_pointers[6],
-            fixed_service_pointers[6],
+            fixed_service_pointers[7],
         ],
     })
 }
@@ -1130,7 +1134,7 @@ unsafe impl<'storage, I: PublicationBackendAuthority + PublicationQuiescenceBack
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ActiveRuntimeEvidence {
     pub(crate) pointers: [usize; 10],
-    pub(crate) backing_pointers: [usize; 21],
+    pub(crate) backing_pointers: [usize; 22],
     pub(crate) storage_shape: FullServiceStorageShape,
     pub(crate) publication_bindings_match: bool,
     pub(crate) resolution_pending_states: usize,
@@ -1206,6 +1210,7 @@ impl<Binding> FullServicePublicationOwner<'_, Binding> {
                 u32::try_from(resolution.action_capacity()).expect("validated capacity"),
                 u32::try_from(resolution.dynamic_neighbor_capacity()).expect("validated capacity"),
                 u32::try_from(resolution.failure_hold_capacity()).expect("validated capacity"),
+                u32::try_from(resolution.datagram_hold_capacity()).expect("validated capacity"),
             ),
             Icmpv4ErrorStorageShape::new(
                 u32::try_from(icmpv4_errors.state_capacity()).expect("validated capacity"),

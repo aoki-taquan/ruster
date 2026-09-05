@@ -404,6 +404,7 @@ fn full_service_storage_shape(
         resolution_actions,
         resolution_dynamic_neighbors,
         resolution_failure_holds,
+        resolution_datagram_holds,
     ) = resolution.into_planning_parts();
     let (icmpv4_error_states, icmpv4_error_actions) = icmpv4_errors.into_planning_parts();
     let (
@@ -430,6 +431,7 @@ fn full_service_storage_shape(
             resolution_actions,
             resolution_dynamic_neighbors,
             resolution_failure_holds,
+            resolution_datagram_holds,
         ),
         Icmpv4ErrorStorageShape::new(icmpv4_error_states, icmpv4_error_actions),
         Nat44UdpStoragePlan::new(
@@ -803,7 +805,7 @@ mod tests {
         assert_eq!(
             first.storage_shape(),
             FullServiceStorageShape::new(
-                ResolutionStorageShape::new(2, 3, 4, 5),
+                ResolutionStorageShape::new(2, 3, 4, 5, 6),
                 Icmpv4ErrorStorageShape::new(6, 7),
                 Nat44UdpStoragePlan::new(3, 9, 4, 3, 16, 9, 13),
                 Nat44TcpStoragePlan::new(5, 17, 8, 5, 32, 17, 13),

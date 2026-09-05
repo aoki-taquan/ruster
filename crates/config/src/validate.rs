@@ -10,8 +10,8 @@ use ruster_core::{
     MacAddress, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpMappingSlot,
     Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpConfigError,
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor,
-    PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy,
-    ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
+    PortOwnerSlot, ResolutionActionSlot, ResolutionDatagramHoldSlot, ResolutionFailureHoldSlot,
+    ResolutionPolicy, ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
 };
 
 use crate::{
@@ -189,6 +189,7 @@ pub struct ResolutionStorageShapeV1 {
     pub actions: u32,
     pub dynamic_neighbors: u32,
     pub failure_holds: u32,
+    pub datagram_holds: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -225,14 +226,21 @@ impl ResolutionStorageShapeV1 {
         reason = "the tuple names every resolution storage slot"
     )]
     #[must_use]
-    pub const fn into_planning_parts(self) -> (u32, u32, u32, u32) {
+    pub const fn into_planning_parts(self) -> (u32, u32, u32, u32, u32) {
         let Self {
             states,
             actions,
             dynamic_neighbors,
             failure_holds,
+            datagram_holds,
         } = self;
-        (states, actions, dynamic_neighbors, failure_holds)
+        (
+            states,
+            actions,
+            dynamic_neighbors,
+            failure_holds,
+            datagram_holds,
+        )
     }
 }
 
@@ -1984,6 +1992,7 @@ fn build_storage_shape(
                 ("actions", capacity.actions),
                 ("dynamic-neighbors", capacity.dynamic_neighbors),
                 ("failure-holds", capacity.failure_holds),
+                ("datagram-holds", capacity.datagram_holds),
             ] {
                 check_slots(value, limits, path(&["resolution", "capacity", field]))?;
             }
@@ -2007,11 +2016,17 @@ fn build_storage_shape(
                 capacity.failure_holds,
                 path(&["resolution", "capacity", "failure-holds"]),
             )?;
+            add_bytes::<ResolutionDatagramHoldSlot>(
+                &mut bytes,
+                capacity.datagram_holds,
+                path(&["resolution", "capacity", "datagram-holds"]),
+            )?;
             Ok(ResolutionStorageShapeV1 {
                 states: capacity.states,
                 actions: capacity.actions,
                 dynamic_neighbors: capacity.dynamic_neighbors,
                 failure_holds: capacity.failure_holds,
+                datagram_holds: capacity.datagram_holds,
             })
         })
         .transpose()?;

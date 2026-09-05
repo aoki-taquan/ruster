@@ -15,6 +15,7 @@ pub struct ResolutionStorageShape {
     action_slots: u32,
     dynamic_neighbor_slots: u32,
     failure_hold_slots: u32,
+    datagram_hold_slots: u32,
 }
 
 impl ResolutionStorageShape {
@@ -24,12 +25,14 @@ impl ResolutionStorageShape {
         action_slots: u32,
         dynamic_neighbor_slots: u32,
         failure_hold_slots: u32,
+        datagram_hold_slots: u32,
     ) -> Self {
         Self {
             state_slots,
             action_slots,
             dynamic_neighbor_slots,
             failure_hold_slots,
+            datagram_hold_slots,
         }
     }
 
@@ -51,6 +54,12 @@ impl ResolutionStorageShape {
     #[must_use]
     pub const fn failure_hold_slots(self) -> u32 {
         self.failure_hold_slots
+    }
+
+    /// Slots for datagrams held while their next hop resolves (FWD-008).
+    #[must_use]
+    pub const fn datagram_hold_slots(self) -> u32 {
+        self.datagram_hold_slots
     }
 }
 

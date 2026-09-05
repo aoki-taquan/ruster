@@ -21,7 +21,7 @@ const PUBLIC: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 10]);
 
 fn exact_shape() -> FullServiceStorageShape {
     FullServiceStorageShape::new(
-        ResolutionStorageShape::new(1, 1, 1, 1),
+        ResolutionStorageShape::new(1, 1, 1, 1, 1),
         Icmpv4ErrorStorageShape::new(1, 1),
         Nat44UdpStoragePlan::new(1, 1, 1, 1, 1, 1, 1),
         Nat44TcpStoragePlan::new(1, 1, 1, 1, 1, 1, 1),
@@ -208,7 +208,7 @@ fn candidate_rejects_missing_services_shapes_and_realm_before_runtime() {
     );
 
     let invalid_shape = FullServiceStorageShape::new(
-        ResolutionStorageShape::new(1, 1, 1, 1),
+        ResolutionStorageShape::new(1, 1, 1, 1, 1),
         Icmpv4ErrorStorageShape::new(1, 1),
         Nat44UdpStoragePlan::new(1, 1, 1, 0, 1, 1, 1),
         Nat44TcpStoragePlan::new(1, 1, 1, 1, 1, 1, 1),
@@ -239,7 +239,7 @@ fn candidate_rejects_missing_services_shapes_and_realm_before_runtime() {
 
 #[test]
 fn every_nat_storage_shape_component_is_validated_exactly() {
-    let resolution = ResolutionStorageShape::new(1, 1, 1, 1);
+    let resolution = ResolutionStorageShape::new(1, 1, 1, 1, 1);
     let icmp = Icmpv4ErrorStorageShape::new(1, 1);
     let udp = Nat44UdpStoragePlan::new(1, 1, 1, 1, 1, 1, 1);
     let tcp = Nat44TcpStoragePlan::new(1, 1, 1, 1, 1, 1, 1);

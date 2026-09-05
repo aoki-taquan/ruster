@@ -58,6 +58,7 @@ states = 2
 actions = 3
 dynamic-neighbors = 4
 failure-holds = 5
+datagram-holds = 6
 "#;
 
 const ICMPV4_ERRORS: &str = r#"

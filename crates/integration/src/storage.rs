@@ -4,8 +4,8 @@ use ruster_control::{FullServiceCandidateV1, FullServiceStorageShape};
 use ruster_core::{
     DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallStateSlot, Icmpv4ErrorActionSlot,
     Icmpv4ErrorStateSlot, Nat44TcpMappingSlot, Nat44TcpSessionSlot, Nat44UdpMappingSlot,
-    Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot,
-    ResolutionStateSlot,
+    Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot, ResolutionDatagramHoldSlot,
+    ResolutionFailureHoldSlot, ResolutionStateSlot,
 };
 
 /// Cold-path fixed runtime storage could not be allocated coherently.
@@ -19,9 +19,9 @@ pub enum RuntimeStorageAllocationError {
     Unavailable,
     /// Exact reservation returned excess capacity, so boxing could reallocate.
     AllocatorCapacityMismatch,
-    /// The checked byte total for the 21 backing arrays overflowed `usize`.
+    /// The checked byte total for the 22 backing arrays overflowed `usize`.
     ByteCountOverflow,
-    /// Candidate byte metadata does not match its concrete 21-array shape.
+    /// Candidate byte metadata does not match its concrete 22-array shape.
     RequiredBytesMismatch,
 }
 
@@ -30,7 +30,7 @@ pub enum RuntimeStorageAllocationError {
 /// Every backing array is private so it can only be lent to an activation owner
 /// as one coherent set. The storage must outlive the returned publication owner.
 /// Public construction is candidate-bound through [`Self::try_for_candidate`],
-/// which checks the concrete 21-array byte total before allocating.
+/// which checks the concrete 22-array byte total before allocating.
 ///
 /// ```compile_fail
 /// use ruster_integration::FullServiceRuntimeStorage;
@@ -56,6 +56,7 @@ pub struct FullServiceRuntimeStorage {
     resolution_actions: Box<[ResolutionActionSlot]>,
     resolution_dynamic_neighbors: Box<[DynamicNeighborSlot]>,
     resolution_failure_holds: Box<[ResolutionFailureHoldSlot]>,
+    resolution_datagram_holds: Box<[ResolutionDatagramHoldSlot]>,
     icmpv4_error_states: Box<[Icmpv4ErrorStateSlot]>,
     icmpv4_error_actions: Box<[Icmpv4ErrorActionSlot]>,
     nat44_udp_mappings: Box<[Nat44UdpMappingSlot]>,
@@ -79,7 +80,7 @@ impl FullServiceRuntimeStorage {
     /// Fallibly allocates all backing for one exact full-service candidate.
     ///
     /// The candidate's shape is independently converted into the concrete byte
-    /// total of all 21 backing arrays. A mismatch with validated metadata fails
+    /// total of all 22 backing arrays. A mismatch with validated metadata fails
     /// before allocation. Each array is boxed only when its reserved capacity is
     /// exactly its requested length, preventing an infallible shrink/reallocation
     /// from hiding an allocation failure.
@@ -141,6 +142,10 @@ impl FullServiceRuntimeStorage {
             resolution_failure_holds: fixed_storage(
                 resolution.failure_hold_slots(),
                 ResolutionFailureHoldSlot::EMPTY,
+            )?,
+            resolution_datagram_holds: fixed_storage(
+                resolution.datagram_hold_slots(),
+                ResolutionDatagramHoldSlot::EMPTY,
             )?,
             icmpv4_error_states: fixed_storage(
                 icmpv4_errors.state_slots(),
@@ -233,6 +238,7 @@ fn checked_required_runtime_bytes(
     add_array_bytes::<ResolutionActionSlot>(&mut bytes, resolution.action_slots())?;
     add_array_bytes::<DynamicNeighborSlot>(&mut bytes, resolution.dynamic_neighbor_slots())?;
     add_array_bytes::<ResolutionFailureHoldSlot>(&mut bytes, resolution.failure_hold_slots())?;
+    add_array_bytes::<ResolutionDatagramHoldSlot>(&mut bytes, resolution.datagram_hold_slots())?;
     add_array_bytes::<Icmpv4ErrorStateSlot>(&mut bytes, icmpv4_errors.state_slots())?;
     add_array_bytes::<Icmpv4ErrorActionSlot>(&mut bytes, icmpv4_errors.action_slots())?;
     add_array_bytes::<Nat44UdpMappingSlot>(&mut bytes, nat44_udp.mapping_slots())?;
@@ -363,12 +369,13 @@ fn non_default_count<T: Default + PartialEq>(storage: &[T]) -> usize {
 
 #[cfg(test)]
 impl FullServiceRuntimeStorage {
-    pub(super) fn pointer_identities(&self) -> [usize; 21] {
+    pub(super) fn pointer_identities(&self) -> [usize; 22] {
         [
             self.resolution_states.as_ptr() as usize,
             self.resolution_actions.as_ptr() as usize,
             self.resolution_dynamic_neighbors.as_ptr() as usize,
             self.resolution_failure_holds.as_ptr() as usize,
+            self.resolution_datagram_holds.as_ptr() as usize,
             self.icmpv4_error_states.as_ptr() as usize,
             self.icmpv4_error_actions.as_ptr() as usize,
             self.nat44_udp_mappings.as_ptr() as usize,
@@ -408,12 +415,13 @@ impl FullServiceRuntimeStorage {
         }
     }
 
-    pub(super) fn lengths(&self) -> [usize; 21] {
+    pub(super) fn lengths(&self) -> [usize; 22] {
         [
             self.resolution_states.len(),
             self.resolution_actions.len(),
             self.resolution_dynamic_neighbors.len(),
             self.resolution_failure_holds.len(),
+            self.resolution_datagram_holds.len(),
             self.icmpv4_error_states.len(),
             self.icmpv4_error_actions.len(),
             self.nat44_udp_mappings.len(),
@@ -444,6 +452,7 @@ pub(super) struct RuntimeStorageSlices<'storage> {
     pub(super) resolution_actions: &'storage mut [ResolutionActionSlot],
     pub(super) resolution_dynamic_neighbors: &'storage mut [DynamicNeighborSlot],
     pub(super) resolution_failure_holds: &'storage mut [ResolutionFailureHoldSlot],
+    pub(super) resolution_datagram_holds: &'storage mut [ResolutionDatagramHoldSlot],
     pub(super) icmpv4_error_states: &'storage mut [Icmpv4ErrorStateSlot],
     pub(super) icmpv4_error_actions: &'storage mut [Icmpv4ErrorActionSlot],
     pub(super) nat44_udp_mappings: &'storage mut [Nat44UdpMappingSlot],
@@ -470,6 +479,7 @@ impl FullServiceRuntimeStorage {
             resolution_actions: &mut self.resolution_actions,
             resolution_dynamic_neighbors: &mut self.resolution_dynamic_neighbors,
             resolution_failure_holds: &mut self.resolution_failure_holds,
+            resolution_datagram_holds: &mut self.resolution_datagram_holds,
             icmpv4_error_states: &mut self.icmpv4_error_states,
             icmpv4_error_actions: &mut self.icmpv4_error_actions,
             nat44_udp_mappings: &mut self.nat44_udp_mappings,
@@ -500,7 +510,7 @@ mod tests {
 
     fn shape() -> FullServiceStorageShape {
         FullServiceStorageShape::new(
-            ResolutionStorageShape::new(2, 3, 4, 5),
+            ResolutionStorageShape::new(2, 3, 4, 5, 6),
             Icmpv4ErrorStorageShape::new(6, 7),
             Nat44UdpStoragePlan::new(3, 9, 4, 3, 16, 9, 13),
             Nat44TcpStoragePlan::new(5, 17, 8, 5, 32, 17, 13),

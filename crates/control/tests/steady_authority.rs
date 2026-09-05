@@ -103,7 +103,7 @@ fn validated_candidate_builds_1024_static_authority_views_without_work() {
         },
     ];
     let shape = FullServiceStorageShape::new(
-        ResolutionStorageShape::new(1, 1, 1, 1),
+        ResolutionStorageShape::new(1, 1, 1, 1, 1),
         Icmpv4ErrorStorageShape::new(1, 1),
         Nat44UdpStoragePlan::new(1, 1, 1, 1, 1, 1, 1),
         Nat44TcpStoragePlan::new(1, 1, 1, 1, 1, 1, 1),

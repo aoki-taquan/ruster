@@ -10,7 +10,7 @@ use ruster_core::{
     DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallRuleId, FirewallStateSlot,
     Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Ipv4Mtu, Nat44TcpMappingSlot, Nat44TcpSessionSlot,
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot,
-    ResolutionFailureHoldSlot, ResolutionStateSlot, RouteError,
+    ResolutionDatagramHoldSlot, ResolutionFailureHoldSlot, ResolutionStateSlot, RouteError,
 };
 use ruster_io_xdp_native::{ConfigError as XdpConfigError, MAX_UMEM_FRAME_COUNT};
 
@@ -66,6 +66,7 @@ states = 2
 actions = 3
 dynamic-neighbors = 4
 failure-holds = 5
+datagram-holds = 6
 
 [icmpv4-errors.policy]
 interval-ms = 100
@@ -296,6 +297,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 actions: 3,
                 dynamic_neighbors: 4,
                 failure_holds: 5,
+                datagram_holds: 6,
             }),
             icmpv4_errors: Some(ruster_config::Icmpv4ErrorStorageShapeV1 {
                 states: 2,
@@ -327,6 +329,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         + 3 * size_of::<ResolutionActionSlot>()
         + 4 * size_of::<DynamicNeighborSlot>()
         + 5 * size_of::<ResolutionFailureHoldSlot>()
+        + 6 * size_of::<ResolutionDatagramHoldSlot>()
         + 2 * size_of::<Icmpv4ErrorStateSlot>()
         + 3 * size_of::<Icmpv4ErrorActionSlot>()
         + 3 * size_of::<Nat44UdpMappingSlot>()
@@ -633,8 +636,13 @@ fn nested_validated_consuming_seams_preserve_full_inventory() {
     let (resolution_policy, resolution_storage) = resolution
         .expect("fixture enables resolution")
         .into_planning_parts();
-    let (resolution_states, resolution_actions, resolution_dynamic_neighbors, resolution_holds) =
-        resolution_storage.into_planning_parts();
+    let (
+        resolution_states,
+        resolution_actions,
+        resolution_dynamic_neighbors,
+        resolution_holds,
+        resolution_datagram_holds,
+    ) = resolution_storage.into_planning_parts();
     assert_eq!(resolution_policy, expected_resolution.0);
     assert_eq!(
         (
@@ -642,6 +650,7 @@ fn nested_validated_consuming_seams_preserve_full_inventory() {
             resolution_actions,
             resolution_dynamic_neighbors,
             resolution_holds,
+            resolution_datagram_holds,
         ),
         expected_resolution.1
     );
@@ -1180,7 +1189,7 @@ fn planning_parts_preserve_each_validated_storage_and_tick_field() {
             .expect("fixture enables resolution")
             .storage()
             .into_planning_parts(),
-        (2, 3, 4, 5)
+        (2, 3, 4, 5, 6)
     );
     assert_eq!(
         config
@@ -1788,4 +1797,44 @@ fn an_mtu_of_zero_is_rejected_rather_than_read_as_absent() {
         1,
     );
     assert_eq!(error(&source).code(), ValidationCode::MtuBelowIpv4Minimum);
+}
+
+// FWD-008: the hold capacity has to survive the whole path from configuration
+// to the storage shape, or the datagram that triggers a resolution is still
+// dropped no matter what the file asks for.
+#[test]
+fn the_datagram_hold_capacity_reaches_the_storage_shape() {
+    let shape = validated(VALID).storage_shape();
+    let resolution = shape.resolution.expect("fixture enables resolution");
+    assert_eq!(resolution.datagram_holds, 6);
+    assert_eq!(
+        resolution.into_planning_parts().4,
+        6,
+        "the planning tuple must carry the hold capacity"
+    );
+}
+
+#[test]
+fn an_absent_datagram_hold_capacity_means_none() {
+    // A configuration written before this field existed keeps the behaviour it
+    // had: no slots, so the first datagram to an unresolved hop is dropped.
+    let source = VALID.replacen("datagram-holds = 6\n", "", 1);
+    let shape = validated(&source).storage_shape();
+    let resolution = shape.resolution.expect("fixture enables resolution");
+    assert_eq!(resolution.datagram_holds, 0);
+}
+
+#[test]
+fn a_datagram_hold_capacity_past_the_slot_limit_is_rejected() {
+    let source = VALID.replacen("datagram-holds = 6", "datagram-holds = 4294967295", 1);
+    let Err(error) = validated_with(
+        &source,
+        ValidationLimits {
+            max_slots_per_table: 8,
+            max_runtime_bytes: 1 << 30,
+        },
+    ) else {
+        panic!("a capacity past the slot limit must be rejected");
+    };
+    assert_eq!(error.code(), ValidationCode::CapacityLimitExceeded);
 }

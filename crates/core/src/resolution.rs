@@ -1074,6 +1074,12 @@ impl<'a> ResolutionRuntime<'a> {
         self.failure_holds.len()
     }
 
+    /// Slots available for datagrams held while their next hop resolves.
+    #[must_use]
+    pub const fn datagram_hold_capacity(&self) -> usize {
+        self.datagram_holds.len()
+    }
+
     /// Returns whether this runtime is still in its exact constructor state.
     #[must_use]
     pub fn is_pristine(&self) -> bool {
