@@ -730,6 +730,84 @@ fn tcp_total_length_prevents_opaque_trailing_bytes_from_becoming_a_checksum() {
 }
 
 #[test]
+fn rfc4884_extension_structure_survives_translation_with_valid_checksum() {
+    // NAT44-019N / RFC 5508 REQ-3(d): a well-formed RFC 4884 extension
+    // structure appended after the padded original datagram must come
+    // through NAT44 translation byte-for-byte, checksum included, exactly
+    // as the opaque trailing bytes above do — translation never reads or
+    // writes past the quoted datagram's own declared Total Length.
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let config = tcp_config(&snapshot, true);
+    let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+    let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+    let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut states, &mut actions);
+    let mut io = SimIo::new();
+    io.inject(LAN, tcp_frame(REMOTE, 443, 0));
+    io.run_nat44_tcp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut nat),
+        MonotonicMillis(0),
+        &mut NoTrace,
+    )
+    .unwrap();
+    let outbound = io.pop_tx().unwrap();
+    let mut quote = outbound.bytes[14..42].to_vec();
+    quote[2..4].copy_from_slice(&28_u16.to_be_bytes());
+    refresh_inner_checksum(&mut quote);
+
+    // RFC 4884 §5.1: the original datagram field is zero-padded out to the
+    // declared length — 128 octets, the minimum — and the extension
+    // structure follows: a 4-octet header (version 2, reserved, checksum)
+    // and one object.
+    const PADDED_LEN: usize = 128;
+    let mut trailing = vec![0_u8; PADDED_LEN - quote.len()];
+    let mut extension = vec![0x20_u8, 0, 0, 0];
+    extension.extend_from_slice(&[0, 8, 1, 1, 9, 8, 7, 6]);
+    let checksum = internet_checksum(&extension);
+    extension[2..4].copy_from_slice(&checksum.to_be_bytes());
+    trailing.extend_from_slice(&extension);
+
+    let mut error = frag_needed(&quote, 64, 0, &trailing);
+    // The Length octet: the padded original datagram, in 32-bit words.
+    error[39] = u8::try_from(PADDED_LEN / 4).unwrap();
+    refresh_icmp_and_outer_checksums(&mut error);
+
+    let extension_offset = 42 + PADDED_LEN;
+    assert_eq!(
+        internet_checksum(&error[extension_offset..extension_offset + extension.len()]),
+        0
+    );
+
+    io.inject(WAN, error);
+    io.run_nat44_tcp_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut nat),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    let translated = io.pop_tx().unwrap();
+    assert_eq!(
+        &translated.bytes[extension_offset..extension_offset + extension.len()],
+        &extension[..]
+    );
+    assert_eq!(
+        internet_checksum(&translated.bytes[extension_offset..extension_offset + extension.len()]),
+        0
+    );
+}
+
+#[test]
 fn disabled_policy_preserves_local_consume_and_candidate_drops_are_atomic() {
     let (routes, interfaces, neighbors, bindings) = topology();
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();

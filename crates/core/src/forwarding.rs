@@ -1,4 +1,5 @@
 use crate::firewall::{FirewallPacket, FirewallPlan, FirewallPlanError};
+use crate::icmpv4_ext::{classify_icmpv4_multipart, Icmpv4MultipartOutcome};
 use crate::nat44::{
     Nat44TcpInboundPlan, Nat44TcpOutboundPlan, Nat44TcpPlanError, Nat44UdpInboundPlan,
     Nat44UdpOutboundPlan, Nat44UdpPlanError,
@@ -3007,6 +3008,15 @@ struct ParsedNat44Icmpv4Quote {
     transport_checksum: Option<u16>,
     icmp_checksum_offset: usize,
     icmp_checksum: u16,
+    /// RFC 4884 classification of the ICMP message this quote came from
+    /// (NAT44-019N). NAT44 translation never consults this: the embedded
+    /// datagram's own IP header, not the RFC 4884 Length octet, is what
+    /// already bounds every offset the rewrite touches, so any extension
+    /// structure and its padding survive translation whether or not they
+    /// parse (RFC 5508 REQ-3(d)). It is kept here so parsing is observable
+    /// in tests rather than discarded immediately after being computed.
+    #[allow(dead_code)] // Read by tests only; see the doc comment above.
+    multipart: Icmpv4MultipartOutcome,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3328,6 +3338,10 @@ fn parse_nat44_icmpv4_frag_needed(
     if crate::internet_checksum(icmp) != 0 {
         return Err(Nat44Icmpv4ChecksumInvalid);
     }
+    // RFC 4884 §5.2: a message that looks multi-part but does not validate
+    // is classified `LegacyFallback` rather than rejected, so this never
+    // narrows what the quote parsing below accepts.
+    let multipart = classify_icmpv4_multipart(icmp);
     let quote_offset = icmp_offset + 8;
     let quote = frame
         .get(quote_offset..icmp_end)
@@ -3417,6 +3431,7 @@ fn parse_nat44_icmpv4_frag_needed(
         icmp_checksum_offset: icmp_offset + 2,
         icmp_checksum: packet::read_u16(frame, icmp_offset + 2)
             .ok_or(Nat44Icmpv4HeaderTruncated)?,
+        multipart,
     })
 }
 
@@ -10047,6 +10062,7 @@ mod tests {
                     && self.transport_checksum == other.transport_checksum
                     && self.icmp_checksum_offset == other.icmp_checksum_offset
                     && self.icmp_checksum == other.icmp_checksum
+                    && self.multipart == other.multipart
             }
         }
 
@@ -10287,6 +10303,66 @@ mod tests {
             frame
         }
 
+        /// Like `frag_needed_frame_with_quote`, but the original datagram
+        /// field is zero-padded out to `padded_original_datagram_len`
+        /// octets and `extension` (a complete RFC 4884 extension structure,
+        /// checksum included) follows it. The ICMP header's Length octet is
+        /// set to match.
+        fn frag_needed_frame_with_padded_extension(
+            protocol: u8,
+            inner_ihl_words: u8,
+            inner_total_len: usize,
+            padded_original_datagram_len: usize,
+            extension: &[u8],
+        ) -> Vec<u8> {
+            let icmp_len = 8 + padded_original_datagram_len + extension.len();
+            let outer_total_len = 20 + icmp_len;
+            let mut frame = vec![0_u8; 14 + outer_total_len];
+            frame[0..6].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
+            frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 3]);
+            frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+            frame[14] = 0x45;
+            frame[16..18].copy_from_slice(&(outer_total_len as u16).to_be_bytes());
+            frame[20..22].copy_from_slice(&0x4000_u16.to_be_bytes());
+            frame[22] = 64;
+            frame[23] = 1;
+            frame[26..30].copy_from_slice(&ROUTER.octets());
+            frame[30..34].copy_from_slice(&PUBLIC.octets());
+            frame[34..36].copy_from_slice(&[3, 4]);
+            frame[39] = u8::try_from(padded_original_datagram_len / 4).unwrap();
+            let quote_offset = 42;
+            let inner_header_len = usize::from(inner_ihl_words) * 4;
+            frame[quote_offset] = (4 << 4) | inner_ihl_words;
+            frame[quote_offset + 2..quote_offset + 4]
+                .copy_from_slice(&(inner_total_len as u16).to_be_bytes());
+            frame[quote_offset + 6..quote_offset + 8].copy_from_slice(&0x4000_u16.to_be_bytes());
+            frame[quote_offset + 8] = 64;
+            frame[quote_offset + 9] = protocol;
+            frame[quote_offset + 12..quote_offset + 16].copy_from_slice(&PUBLIC.octets());
+            frame[quote_offset + 16..quote_offset + 20].copy_from_slice(&REMOTE.octets());
+            let checksum =
+                ipv4_header_checksum(&frame[quote_offset..quote_offset + inner_header_len]);
+            frame[quote_offset + 10..quote_offset + 12].copy_from_slice(&checksum.to_be_bytes());
+            let transport_offset = quote_offset + inner_header_len;
+            frame[transport_offset..transport_offset + 2]
+                .copy_from_slice(&40_000_u16.to_be_bytes());
+            frame[transport_offset + 2..transport_offset + 4]
+                .copy_from_slice(&53_u16.to_be_bytes());
+            if protocol == 17 {
+                frame[transport_offset + 4..transport_offset + 6]
+                    .copy_from_slice(&8_u16.to_be_bytes());
+                frame[transport_offset + 6..transport_offset + 8]
+                    .copy_from_slice(&0x1111_u16.to_be_bytes());
+            }
+            let extension_offset = quote_offset + padded_original_datagram_len;
+            frame[extension_offset..extension_offset + extension.len()].copy_from_slice(extension);
+            let checksum = internet_checksum(&frame[34..14 + outer_total_len]);
+            frame[36..38].copy_from_slice(&checksum.to_be_bytes());
+            let checksum = ipv4_header_checksum(&frame[14..34]);
+            frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+            frame
+        }
+
         fn parsed_quote(
             protocol: u8,
             transport_checksum: Option<u16>,
@@ -10305,6 +10381,7 @@ mod tests {
                 transport_checksum,
                 icmp_checksum_offset: 36,
                 icmp_checksum: 0x3333,
+                multipart: crate::icmpv4_ext::Icmpv4MultipartOutcome::SinglePart,
             }
         }
 
@@ -11169,6 +11246,47 @@ mod tests {
                 super::super::parse_nat44_icmpv4_frag_needed(&partial, partial_outer),
                 Err(Nat44Icmpv4TcpChecksumPartial)
             );
+        }
+
+        #[test]
+        fn rest_parse_nat44_icmpv4_frag_needed_recognises_a_valid_rfc4884_extension() {
+            // NAT44-019N: an ICMP message whose Length octet declares a
+            // padded 128-octet original datagram, followed by one valid
+            // extension object, is recognised as RFC 4884 multi-part.
+            let mut extension = vec![0x20_u8, 0, 0, 0];
+            extension.extend_from_slice(&[0, 8, 1, 1, 9, 8, 7, 6]);
+            let checksum = internet_checksum(&extension);
+            extension[2..4].copy_from_slice(&checksum.to_be_bytes());
+            let frame = frag_needed_frame_with_padded_extension(17, 5, 28, 128, &extension);
+            let outer = validate_ipv4_frame(&frame).unwrap();
+            let parsed = super::super::parse_nat44_icmpv4_frag_needed(&frame, outer).unwrap();
+            assert_eq!(
+                parsed.multipart,
+                crate::icmpv4_ext::Icmpv4MultipartOutcome::Multipart(
+                    crate::icmpv4_ext::Icmpv4ExtensionStructure {
+                        extension_offset: 136,
+                        extension_len: 12,
+                        padded_original_datagram_len: 128,
+                    }
+                )
+            );
+            // Contract: the real quoted datagram's own Total Length bounds
+            // transport parsing, so the 100 octets of RFC 4884 padding
+            // between the 28-octet real datagram and the extension are
+            // never mistaken for transport bytes (RFC 5508 REQ-3(d)).
+            assert_eq!(parsed.transport_checksum, Some(0x1111));
+
+            // Contract: RFC 4884 §5.2 — a Length octet declaring a padded
+            // field shorter than 128 octets falls back to legacy handling
+            // rather than failing the whole message.
+            let short_frame = frag_needed_frame_with_padded_extension(17, 5, 28, 32, &[]);
+            let short_outer = validate_ipv4_frame(&short_frame).unwrap();
+            let short_parsed =
+                super::super::parse_nat44_icmpv4_frag_needed(&short_frame, short_outer).unwrap();
+            assert!(matches!(
+                short_parsed.multipart,
+                crate::icmpv4_ext::Icmpv4MultipartOutcome::LegacyFallback(_)
+            ));
         }
 
         #[test]

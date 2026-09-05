@@ -7,6 +7,7 @@ mod fixed_directory;
 mod forwarding;
 mod generated;
 mod icmpv4_error;
+mod icmpv4_ext;
 mod io;
 mod nat44;
 mod packet;
