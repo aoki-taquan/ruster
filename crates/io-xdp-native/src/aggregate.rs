@@ -825,7 +825,14 @@ mod tests {
     use ruster_core::{
         internet_checksum, ipv4_header_checksum, validate_ipv4_frame, DropReason, PacketBatch,
     };
-    use std::fmt;
+    use std::{
+        cell::RefCell,
+        fmt,
+        os::fd::{IntoRawFd, RawFd},
+        os::unix::net::UnixStream,
+    };
+
+    use crate::native_unsafe::syscall::{sealed, Errno, MapRequest, PollDescriptor, Syscalls};
 
     const OFFSETS: crate::abi::XdpRingOffset = crate::abi::XdpRingOffset {
         producer: 0,
@@ -1040,6 +1047,162 @@ mod tests {
         }
     }
 
+    /// Syscall fixture for aggregate tests that need a concrete
+    /// `XdpResource`. The resource's operational methods are exercised over
+    /// fake ring mappings, while the returned socket fd is a real Unix stream
+    /// fd so the production Linux poll implementation remains in the path.
+    struct AggregateSyscalls {
+        socket_fd: RawFd,
+        _peer: Option<UnixStream>,
+        mappings: RefCell<Vec<Box<[u8]>>>,
+    }
+
+    impl AggregateSyscalls {
+        fn new(ready: bool) -> Self {
+            let (reader, peer) = UnixStream::pair().expect("test poll socket pair");
+            let (socket_fd, peer) = if ready {
+                // `/dev/zero` is readable immediately and avoids depending on
+                // a write through the test socket under restricted runners.
+                let ready_file = std::fs::File::open("/dev/zero").expect("test ready fd");
+                (ready_file.into_raw_fd(), None)
+            } else {
+                (reader.into_raw_fd(), Some(peer))
+            };
+            Self {
+                socket_fd,
+                _peer: peer,
+                mappings: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl sealed::Sealed for AggregateSyscalls {}
+
+    impl Syscalls for AggregateSyscalls {
+        fn socket(
+            &self,
+            _domain: std::ffi::c_int,
+            _kind: std::ffi::c_int,
+            _protocol: std::ffi::c_int,
+        ) -> Result<RawFd, Errno> {
+            Ok(self.socket_fd)
+        }
+
+        fn set_socket_option(
+            &self,
+            _fd: RawFd,
+            _level: std::ffi::c_int,
+            _name: std::ffi::c_int,
+            _value: &[u8],
+            _length: u32,
+        ) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn get_socket_option(
+            &self,
+            _fd: RawFd,
+            _level: std::ffi::c_int,
+            _name: std::ffi::c_int,
+            value: &mut [u8],
+            length: &mut u32,
+        ) -> Result<(), Errno> {
+            let encoded = crate::abi::encode_xdp_mmap_offsets(TEST_MMAP_OFFSETS);
+            value[..encoded.len()].copy_from_slice(&encoded);
+            *length = u32::try_from(encoded.len()).expect("test offsets length fits");
+            Ok(())
+        }
+
+        fn mmap(&self, request: MapRequest) -> Result<*mut std::ffi::c_void, Errno> {
+            let byte_len = match request {
+                MapRequest::Anonymous { byte_len } | MapRequest::Shared { byte_len, .. } => {
+                    byte_len
+                }
+            };
+            let mut mapping = vec![0_u8; byte_len].into_boxed_slice();
+            let address = mapping.as_mut_ptr().cast::<std::ffi::c_void>();
+            self.mappings.borrow_mut().push(mapping);
+            Ok(address)
+        }
+
+        fn munmap(&self, _address: *mut std::ffi::c_void, _byte_len: usize) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn bind(&self, _fd: RawFd, _address: &[u8], _length: u32) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn poll(
+            &self,
+            _descriptor: &mut PollDescriptor,
+            _timeout_millis: std::ffi::c_int,
+        ) -> Result<u32, Errno> {
+            Ok(0)
+        }
+
+        fn send_to_wakeup(&self, _fd: RawFd) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn bpf(&self, _command: u32, _attr: &mut [u8]) -> Result<std::ffi::c_long, Errno> {
+            Ok(0)
+        }
+
+        fn close(&self, _fd: RawFd) -> Result<(), Errno> {
+            Ok(())
+        }
+    }
+
+    const TEST_MMAP_OFFSETS: crate::abi::XdpMmapOffsets = crate::abi::XdpMmapOffsets {
+        rx: OFFSETS,
+        tx: OFFSETS,
+        fill: OFFSETS,
+        completion: OFFSETS,
+    };
+
+    #[allow(unsafe_code)]
+    fn aggregate_resource(interface: IfId, ifindex: u32, ready: bool) -> XdpResource<'static> {
+        let config = crate::UmemConfig::new(
+            FRAME_COUNT as u32,
+            FRAME_SIZE as u32,
+            0,
+            RX_FRAMES as u32,
+            (FRAME_COUNT - RX_FRAMES) as u32,
+            0,
+        )
+        .expect("test UMEM");
+        let rings = crate::RingConfig::new(RING_ENTRIES, RING_ENTRIES, RING_ENTRIES, RING_ENTRIES)
+            .expect("test rings");
+        let syscalls: &'static AggregateSyscalls =
+            Box::leak(Box::new(AggregateSyscalls::new(ready)));
+        let memory: &'static mut [u8] =
+            Box::leak(vec![0_u8; config.byte_len() as usize].into_boxed_slice());
+        let owner = crate::XdpResourceBuilder::new(config, rings, ifindex, 0)
+            .expect("test builder")
+            .with_interface_id(interface)
+            .build_with_syscalls(memory, syscalls)
+            .expect("test resource");
+
+        // SAFETY: `ResourceOwner` is structurally identical for the two
+        // syscall marker types: every syscall-dependent field stores only a
+        // reference, and this fixture never drops the retyped resource. Ring
+        // operations use the fake mappings; the only production syscall kept
+        // live for these tests is Linux poll over the real Unix fd above.
+        unsafe { std::mem::transmute(owner) }
+    }
+
+    fn aggregate_pair(
+        first_ready: bool,
+        second_ready: bool,
+    ) -> &'static mut XdpResourcePair<'static> {
+        let first = aggregate_resource(IfId(1), 1, first_ready);
+        let second = aggregate_resource(IfId(2), 2, second_ready);
+        Box::leak(Box::new(
+            XdpResourcePair::new(first, second).expect("test pair interfaces are distinct"),
+        ))
+    }
+
     struct HexBytes<'a>(&'a [u8]);
 
     impl fmt::Display for HexBytes<'_> {
@@ -1198,6 +1361,56 @@ mod tests {
 
         assert_eq!(completion.recycled, 3);
         assert!(completion.invariants_hold());
+    }
+
+    #[test]
+    fn a_zero_member_budget_does_not_consume_an_rx_packet() {
+        let mut harness = PairHarness::new();
+        harness.initialize();
+        harness.first.kernel_publish_rx(0, 64);
+
+        let mut member = XdpPairMemberBatch::new(harness.first.core(BatchState::Rx), 0);
+        assert!(member.next_packet().is_none());
+        assert!(member.finish().is_none());
+        assert_eq!(harness.first.ring_occupied(&harness.first.rx), 1);
+    }
+
+    #[test]
+    fn member_remaining_decrements_and_stops_at_its_budget() {
+        let mut harness = PairHarness::new();
+        harness.initialize();
+        harness.first.kernel_publish_rx(0, 64);
+        harness.first.kernel_publish_rx(1, 64);
+
+        let completion = {
+            let mut member = XdpPairMemberBatch::new(harness.first.core(BatchState::Rx), 1);
+            let packet = member.next_packet().expect("packet within member budget");
+            assert_eq!(packet.frame_index, 0);
+            assert!(member.next_packet().is_none());
+            assert!(member.recycle_input(packet.frame_index));
+            member.finish()
+        };
+
+        assert!(completion.is_none());
+        assert_eq!(harness.first.ring_occupied(&harness.first.rx), 1);
+    }
+
+    #[test]
+    fn member_remaining_decrements_by_one_after_one_packet_from_non_unit_budget() {
+        let mut harness = PairHarness::new();
+        harness.initialize();
+        harness.first.kernel_publish_rx(0, 64);
+
+        let completion = {
+            let mut member = XdpPairMemberBatch::new(harness.first.core(BatchState::Rx), 3);
+            let packet = member.next_packet().expect("packet within member budget");
+            assert_eq!(packet.frame_index, 0);
+            assert_eq!(member.remaining, 2);
+            assert!(member.recycle_input(packet.frame_index));
+            member.finish()
+        };
+
+        assert!(completion.is_none());
     }
 
     #[test]
@@ -1555,6 +1768,133 @@ mod tests {
         assert!(matches!(
             completion.error,
             Some(XdpPairIoError::EgressNotFound { egress: IfId(99) })
+        ));
+    }
+
+    #[test]
+    fn pair_wait_for_rx_reports_second_member_readiness_and_timeout() {
+        let ready_pair = aggregate_pair(false, true);
+        assert_eq!(ready_pair.wait_for_rx(Duration::ZERO), Ok(true));
+
+        let idle_pair = aggregate_pair(false, false);
+        assert_eq!(idle_pair.wait_for_rx(Duration::ZERO), Ok(false));
+    }
+
+    #[test]
+    fn pair_receive_rejects_an_active_first_member() {
+        let pair = aggregate_pair(false, false);
+        let generated = pair.first.start_generated_batch(IfId(1));
+        std::mem::forget(generated);
+
+        let result = PacketIo::receive(pair, 1);
+        assert!(matches!(
+            result
+                .err()
+                .expect("active first member must reject receive"),
+            XdpPairIoError::Resource {
+                resource: XdpResourcePairIndex::First,
+                error: XdpIoError::BatchActive,
+            }
+        ));
+    }
+
+    #[test]
+    fn pair_receive_rejects_an_active_second_member() {
+        let pair = aggregate_pair(false, false);
+        let generated = pair.second.start_generated_batch(IfId(2));
+        std::mem::forget(generated);
+
+        let result = PacketIo::receive(pair, 1);
+        assert!(matches!(
+            result
+                .err()
+                .expect("active second member must reject receive"),
+            XdpPairIoError::Resource {
+                resource: XdpResourcePairIndex::Second,
+                error: XdpIoError::BatchActive,
+            }
+        ));
+    }
+
+    #[test]
+    fn pair_generated_batches_route_each_selected_egress() {
+        let pair = aggregate_pair(false, false);
+
+        let first = GeneratedPacketIo::begin_generated(pair, IfId(1));
+        assert_eq!(first.resource, Some(XdpResourcePairIndex::First));
+        assert!(first.finish().error.is_none());
+
+        let second = GeneratedPacketIo::begin_generated(pair, IfId(2));
+        assert_eq!(second.resource, Some(XdpResourcePairIndex::Second));
+        assert!(second.finish().error.is_none());
+    }
+
+    #[test]
+    fn pair_generated_slot_exposes_exact_bytes_and_commits_transmit() {
+        let pair = aggregate_pair(false, false);
+        let mut batch = GeneratedPacketIo::begin_generated(pair, IfId(1));
+        let mut slot = batch.allocate(8).expect("generated slot");
+        assert_eq!(slot.bytes_mut().len(), 8);
+        slot.bytes_mut().copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        slot.commit();
+
+        let completion = batch.finish();
+        assert_eq!(
+            (
+                completion.attempts,
+                completion.allocated,
+                completion.requested,
+                completion.accepted,
+                completion.rejected,
+                completion.cancelled,
+                completion.abandoned,
+            ),
+            (1, 1, 1, 1, 0, 0, 0)
+        );
+        assert!(completion.error.is_none());
+        assert!(completion.invariants_hold());
+    }
+
+    #[test]
+    fn pair_generated_slot_cancellation_recycles_the_inner_slot() {
+        let pair = aggregate_pair(false, false);
+        let mut batch = GeneratedPacketIo::begin_generated(pair, IfId(1));
+        let slot = batch.allocate(8).expect("generated slot");
+        slot.cancel();
+
+        let completion = batch.finish();
+        assert_eq!(
+            (
+                completion.attempts,
+                completion.allocated,
+                completion.requested,
+                completion.accepted,
+                completion.rejected,
+                completion.cancelled,
+                completion.abandoned,
+            ),
+            (1, 1, 0, 0, 0, 1, 0)
+        );
+        assert!(completion.error.is_none());
+        assert!(completion.invariants_hold());
+    }
+
+    #[test]
+    fn pair_publication_quiescence_reports_a_live_member_owner() {
+        let pair = aggregate_pair(false, false);
+        let generated = pair.first.start_generated_batch(IfId(1));
+        std::mem::forget(generated);
+
+        let result = PublicationQuiescenceBackend::check_publication_quiescence(pair);
+        assert!(matches!(
+            result.expect_err("live member must block quiescence"),
+            XdpPairIoError::Resource {
+                resource: XdpResourcePairIndex::First,
+                error: XdpIoError::Quiescence {
+                    frame_index: None,
+                    state: crate::XdpChunkState::Leased,
+                },
+            }
         ));
     }
 

@@ -2662,4 +2662,55 @@ mod tests {
         );
         assert!(<LinuxSyscalls as NetlinkSyscalls>::close(&linux, -1).is_err());
     }
+
+    #[test]
+    fn native_mmap_operator_candidates_and_anonymous_fd_contract_are_explicit() {
+        // The listed flag replacements are equivalent because all operands
+        // occupy disjoint bits. Keep the arithmetic explicit alongside the
+        // safe fake seam's exact anonymous-mapping request.
+        assert_eq!(
+            SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
+            SOCK_RAW ^ SOCK_NONBLOCK ^ SOCK_CLOEXEC
+        );
+        assert_eq!(PROT_READ | PROT_WRITE, PROT_READ ^ PROT_WRITE);
+        assert_eq!(MAP_PRIVATE | MAP_ANONYMOUS, MAP_PRIVATE ^ MAP_ANONYMOUS);
+
+        let syscalls = FakeSyscalls::new();
+        let mapping = MappedRegion::map_anonymous(&syscalls, 4_096).expect("fake anonymous map");
+        assert_eq!(
+            syscalls.transcript.borrow().as_slice(),
+            &[Some(Call::Mmap {
+                fd: -1,
+                byte_len: 4_096,
+                flags: MAP_PRIVATE | MAP_ANONYMOUS,
+                offset: 0,
+            })]
+        );
+        drop(mapping);
+    }
+
+    #[test]
+    fn native_linux_anonymous_mmap_keeps_the_kernel_sentinel_descriptor() {
+        // Linux currently ignores the descriptor when MAP_ANONYMOUS is set,
+        // so a live mapping alone cannot distinguish the ABI sentinel from a
+        // positive descriptor. Check the concrete syscall adapter's reviewed
+        // contract instead; this test is compiled from the same source that
+        // the mutation target changes.
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/native_unsafe/syscall.rs"
+        ));
+        let implementation = source
+            .split_once("impl Syscalls for LinuxSyscalls {")
+            .expect("Linux syscall implementation")
+            .1;
+        let anonymous_arm = implementation
+            .lines()
+            .find(|line| line.contains("MapRequest::Anonymous { byte_len } =>"))
+            .expect("anonymous mmap arm");
+        assert!(
+            anonymous_arm.contains(", -1, 0"),
+            "anonymous mmap must pass fd=-1: {anonymous_arm}"
+        );
+    }
 }

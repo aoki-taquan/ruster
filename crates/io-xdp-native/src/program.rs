@@ -416,8 +416,150 @@ fn unsupported_platform_error() -> NativeSyscallPlatformError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    use std::{
+        ffi::{c_int, c_long, c_void},
+        mem::ManuallyDrop,
+        os::fd::RawFd,
+    };
+
     use super::*;
     use crate::XdpProgramOperation;
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    struct BpfOnlySyscalls {
+        bpf_return: c_long,
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    impl BpfOnlySyscalls {
+        fn new(bpf_return: c_long) -> Self {
+            Self { bpf_return }
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    impl crate::native_unsafe::syscall::sealed::Sealed for BpfOnlySyscalls {}
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    impl crate::native_unsafe::syscall::Syscalls for BpfOnlySyscalls {
+        fn socket(
+            &self,
+            _domain: c_int,
+            _kind: c_int,
+            _protocol: c_int,
+        ) -> Result<RawFd, crate::native_unsafe::syscall::Errno> {
+            Err(crate::native_unsafe::syscall::Errno::Linux(38))
+        }
+
+        fn set_socket_option(
+            &self,
+            _fd: RawFd,
+            _level: c_int,
+            _name: c_int,
+            _value: &[u8],
+            _length: u32,
+        ) -> Result<(), crate::native_unsafe::syscall::Errno> {
+            Err(crate::native_unsafe::syscall::Errno::Linux(38))
+        }
+
+        fn get_socket_option(
+            &self,
+            _fd: RawFd,
+            _level: c_int,
+            _name: c_int,
+            _value: &mut [u8],
+            _length: &mut u32,
+        ) -> Result<(), crate::native_unsafe::syscall::Errno> {
+            Err(crate::native_unsafe::syscall::Errno::Linux(38))
+        }
+
+        fn mmap(
+            &self,
+            _request: crate::native_unsafe::syscall::MapRequest,
+        ) -> Result<*mut c_void, crate::native_unsafe::syscall::Errno> {
+            Err(crate::native_unsafe::syscall::Errno::Linux(38))
+        }
+
+        fn munmap(
+            &self,
+            _address: *mut c_void,
+            _byte_len: usize,
+        ) -> Result<(), crate::native_unsafe::syscall::Errno> {
+            Err(crate::native_unsafe::syscall::Errno::Linux(38))
+        }
+
+        fn bind(
+            &self,
+            _fd: RawFd,
+            _address: &[u8],
+            _length: u32,
+        ) -> Result<(), crate::native_unsafe::syscall::Errno> {
+            Err(crate::native_unsafe::syscall::Errno::Linux(38))
+        }
+
+        fn poll(
+            &self,
+            _descriptor: &mut crate::native_unsafe::syscall::PollDescriptor,
+            _timeout_millis: c_int,
+        ) -> Result<u32, crate::native_unsafe::syscall::Errno> {
+            Err(crate::native_unsafe::syscall::Errno::Linux(38))
+        }
+
+        fn send_to_wakeup(&self, _fd: RawFd) -> Result<(), crate::native_unsafe::syscall::Errno> {
+            Err(crate::native_unsafe::syscall::Errno::Linux(38))
+        }
+
+        fn bpf(
+            &self,
+            _command: u32,
+            _attr: &mut [u8],
+        ) -> Result<c_long, crate::native_unsafe::syscall::Errno> {
+            Ok(self.bpf_return)
+        }
+
+        fn close(&self, _fd: RawFd) -> Result<(), crate::native_unsafe::syscall::Errno> {
+            Err(crate::native_unsafe::syscall::Errno::Linux(38))
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    #[allow(unsafe_code)]
+    fn program_for_observation(fd: c_long) -> ManuallyDrop<XdpRedirectProgram> {
+        let syscalls: &'static BpfOnlySyscalls = Box::leak(Box::new(BpfOnlySyscalls::new(fd)));
+        let inner = OwnedBpfProgram::load(syscalls, &[0_u8; 8], 1).expect("fake program");
+        let inner = unsafe {
+            std::mem::transmute::<
+                OwnedBpfProgram<'static, BpfOnlySyscalls>,
+                OwnedBpfProgram<'static, LinuxSyscalls>,
+            >(inner)
+        };
+        ManuallyDrop::new(XdpRedirectProgram { inner })
+    }
 
     #[test]
     fn bpf_insn_layout_packs_register_nibbles_and_little_endian_fields() {
@@ -509,5 +651,116 @@ mod tests {
         assert_eq!(error.verifier_log(), Some("permission boundary"));
         assert!(error.to_string().contains("CAP_BPF"));
         assert!(error.to_string().contains("permission boundary"));
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn program_raw_fd_returns_the_owned_descriptor() {
+        let program = program_for_observation(-7);
+        assert_eq!(program.raw_fd(), -7);
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn program_close_propagates_a_real_close_failure() {
+        let program = ManuallyDrop::into_inner(program_for_observation(-1));
+        assert_eq!(
+            program.close(),
+            Err(XdpProgramError::Syscall {
+                operation: XdpProgramOperation::Close,
+                errno: Some(9),
+                verifier_log: String::new(),
+            })
+        );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn program_error_mapping_preserves_close_and_nonpermission_payloads() {
+        let platform = map_program_error(BpfProgramResourceError::Platform(
+            crate::NativeSyscallPlatformError::UnsupportedArchitecture,
+        ));
+        assert_eq!(
+            platform,
+            XdpProgramError::Platform(crate::NativeSyscallPlatformError::UnsupportedArchitecture)
+        );
+
+        let argument = map_program_error(BpfProgramResourceError::Argument(
+            BpfProgramArgumentError::InstructionCountMismatch {
+                insn_cnt: 7,
+                byte_len: 55,
+            },
+        ));
+        assert_eq!(
+            argument,
+            XdpProgramError::InstructionCountMismatch {
+                insn_cnt: 7,
+                byte_len: 55,
+            }
+        );
+
+        let close_error = map_program_error(BpfProgramResourceError::Syscall {
+            operation: XdpProgramOperation::Close,
+            errno: crate::native_unsafe::syscall::Errno::Linux(9),
+            verifier_log: String::new(),
+        });
+        assert_eq!(
+            close_error,
+            XdpProgramError::Syscall {
+                operation: XdpProgramOperation::Close,
+                errno: Some(9),
+                verifier_log: String::new(),
+            }
+        );
+        assert!(!close_error.is_permission_denied());
+        assert_eq!(close_error.verifier_log(), Some(""));
+
+        let invalid_fd = map_program_error(BpfProgramResourceError::InvalidFileDescriptor {
+            operation: XdpProgramOperation::Load,
+            verifier_log: "invalid fd".to_owned(),
+        });
+        assert_eq!(
+            invalid_fd,
+            XdpProgramError::InvalidFileDescriptor {
+                operation: XdpProgramOperation::Load,
+                verifier_log: "invalid fd".to_owned(),
+            }
+        );
+        assert_eq!(invalid_fd.verifier_log(), Some("invalid fd"));
+    }
+}
+
+#[cfg(not(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+)))]
+#[cfg(test)]
+mod unsupported_tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_program_error_reports_the_native_platform_reason() {
+        let expected = crate::ensure_native_syscall_supported()
+            .expect_err("this test only runs on an unsupported native target");
+        assert_eq!(unsupported_platform_error(), expected);
+    }
+
+    #[test]
+    fn unsupported_program_close_does_not_claim_a_resource_error() {
+        let program = XdpRedirectProgram { _unsupported: () };
+        assert_eq!(program.close(), Ok(()));
     }
 }
