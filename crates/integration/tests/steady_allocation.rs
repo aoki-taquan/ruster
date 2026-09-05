@@ -11,10 +11,10 @@ use ruster_control::{
 };
 use ruster_core::{
     bind_publication_backend, internet_checksum, ipv4_header_checksum, FirewallHashKey,
-    GeneratedArpTrace, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedTraceSink, IfId,
-    Ipv4Address, MonotonicMillis, Nat44TcpHashKey, Nat44UdpHashKey, ResolutionFailureTrace,
-    ResolutionFailureTraceSink, ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent,
-    TraceSink,
+    GeneratedArpTrace, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedTraceSink,
+    Icmpv4TimestampClock, IfId, Ipv4Address, MonotonicMillis, Nat44TcpHashKey, Nat44UdpHashKey,
+    ResolutionFailureTrace, ResolutionFailureTraceSink, ResolutionTimerTrace,
+    ResolutionTimerTraceSink, TraceEvent, TraceSink,
 };
 use ruster_integration::{activate_initial, FullServiceRuntimeStorage};
 use ruster_io_sim::{BoundSimIoControl, SimIo};
@@ -353,7 +353,14 @@ fn activated_owner_steady_ticks_are_allocation_free() {
     {
         let udp_sequence = io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53));
         let tcp_sequence = io.inject(LAN, tcp_frame(HOST, REMOTE, 12_346, 443, 0x02));
-        let report = run_tick(&mut owner, None, &mut io, MonotonicMillis(now), &mut trace);
+        let report = run_tick(
+            &mut owner,
+            None,
+            &mut io,
+            MonotonicMillis(now),
+            Icmpv4TimestampClock(u32::try_from(now % 86_400_000).unwrap()),
+            &mut trace,
+        );
         assert!(matches!(&report.publication, PublicationOutcome::Unchanged));
         let RxPhaseReport::Completed(rx) = report.rx else {
             panic!("dirtying packet batch must complete: {:?}", report.rx);
@@ -381,6 +388,7 @@ fn activated_owner_steady_ticks_are_allocation_free() {
             Some(successor),
             &mut io,
             MonotonicMillis(now),
+            Icmpv4TimestampClock(u32::try_from(now % 86_400_000).unwrap()),
             &mut trace,
         );
         let apply = match &report.publication {
@@ -401,7 +409,14 @@ fn activated_owner_steady_ticks_are_allocation_free() {
         now += 1;
     }
     for _ in 0..1_024 {
-        let report = run_tick(&mut owner, None, &mut io, MonotonicMillis(now), &mut trace);
+        let report = run_tick(
+            &mut owner,
+            None,
+            &mut io,
+            MonotonicMillis(now),
+            Icmpv4TimestampClock(u32::try_from(now % 86_400_000).unwrap()),
+            &mut trace,
+        );
         assert!(matches!(&report.publication, PublicationOutcome::Unchanged));
         assert!(report.active);
         now += 1;

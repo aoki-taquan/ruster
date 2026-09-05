@@ -174,6 +174,7 @@ pub enum DropReason {
     Icmpv4PortUnreachable = 151,
     Icmpv4TimestampCodeInvalid = 152,
     Icmpv4TimestampHeaderTruncated = 153,
+    FirewallRuleRejected = 154,
 }
 
 /// The IPv4 Don't Fragment flag inside the flags-and-offset field (RFC 791).
@@ -186,7 +187,7 @@ impl DropReason {
     ///
     /// Anything serialising a reason by number needs this bound, and deriving
     /// it here keeps such a check from going stale when a reason is added.
-    pub const LARGEST_CODE: u16 = Self::Icmpv4TimestampHeaderTruncated as u16;
+    pub const LARGEST_CODE: u16 = Self::FirewallRuleRejected as u16;
 
     #[must_use]
     pub const fn code(self) -> &'static str {
@@ -346,6 +347,7 @@ impl DropReason {
             Icmpv4PortUnreachable => "ICMPV4_PORT_UNREACHABLE",
             Icmpv4TimestampCodeInvalid => "ICMPV4_TIMESTAMP_CODE_INVALID",
             Icmpv4TimestampHeaderTruncated => "ICMPV4_TIMESTAMP_HEADER_TRUNCATED",
+            FirewallRuleRejected => "FIREWALL_RULE_REJECTED",
         }
     }
 }
@@ -1781,6 +1783,49 @@ where
     )
 }
 
+/// [`forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors`],
+/// additionally answering an ICMPv4 Timestamp request addressed to one of
+/// this router's own addresses (RFC 792, RFC 1812 §4.3.2.9). `clock` is
+/// milliseconds since UTC midnight; the caller supplies it the same way it
+/// supplies `now` to every other variant, since the datapath never reads a
+/// clock of its own.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_and_timestamp<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    udp_config: &Nat44UdpConfig,
+    nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+    tcp_config: &Nat44TcpConfig,
+    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    firewall_config: &FirewallConfig<'_>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
+    now: MonotonicMillis,
+    clock: Icmpv4TimestampClock,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        Some((icmpv4_errors, now)),
+        Some(udp_config),
+        nat44_udp,
+        Some(tcp_config),
+        nat44_tcp,
+        Some(firewall_config),
+        firewall,
+        None,
+        Some(clock),
+        trace,
+    )
+}
+
 /// Audited variant of
 /// [`forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors`].
 #[allow(clippy::too_many_arguments)]
@@ -2287,6 +2332,7 @@ fn decide_ipv4<T: TraceSink>(
                 return Err(match error {
                     FirewallPlanError::ClockRegression => FirewallClockRegression,
                     FirewallPlanError::RuleDenied(_)
+                    | FirewallPlanError::RuleRejected(_)
                     | FirewallPlanError::DefaultDenied
                     | FirewallPlanError::InvalidInitialTcp(_)
                     | FirewallPlanError::StateFull(_) => {
@@ -2520,13 +2566,7 @@ fn decide_ipv4<T: TraceSink>(
             }
         }
         let runtime = require_firewall_runtime(snapshot, config, firewall)?;
-        // A packet filter's denial is reported silently: RFC 1812 §4.3.3.9
-        // makes Communication Administratively Prohibited optional exactly
-        // so a filter is not forced into confirming its own rules to
-        // whoever it is filtering (see the `never_queues_icmp_or_arp`
-        // firewall contract). That code is still available for a caller
-        // that wants it, through `Icmpv4ErrorKind::DestinationUnreachableCommAdminProhibited`.
-        *firewall_plan = Some(plan_firewall(
+        match plan_firewall(
             ingress,
             route.egress(),
             ipv4,
@@ -2536,7 +2576,36 @@ fn decide_ipv4<T: TraceSink>(
             runtime,
             firewall_audit,
             nat_now.0,
-        )?);
+        ) {
+            Ok(plan) => *firewall_plan = Some(plan),
+            // A plain deny is reported silently: RFC 1812 §4.3.3.9 makes
+            // Communication Administratively Prohibited optional exactly so
+            // a filter is not forced into confirming its own rules to
+            // whoever it is filtering (see the
+            // `never_queues_icmp_or_arp_on_failures` firewall contract). A
+            // rule whose action is explicitly `reject` asks for that report.
+            Err(reason @ FirewallRuleRejected) => {
+                if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+                    let disposition = decide_icmpv4_error(
+                        frame,
+                        snapshot,
+                        ipv4,
+                        Some(route),
+                        Icmpv4ErrorKind::DestinationUnreachableCommAdminProhibited,
+                        resolution,
+                        runtime,
+                        *now,
+                        trace,
+                    );
+                    trace.record(TraceEvent::Icmpv4TimeExceededDisposition {
+                        ingress,
+                        disposition,
+                    });
+                }
+                return Err(reason);
+            }
+            Err(reason) => return Err(reason),
+        }
     }
     if ipv4.ttl <= 1 {
         if let Some((runtime, now)) = icmpv4_errors.as_mut() {
@@ -3546,6 +3615,13 @@ fn plan_firewall(
                     matched_action: Some(FirewallAction::Deny),
                     failure: None,
                 },
+                FirewallPlanError::RuleRejected(rule_id) => FirewallDisposition {
+                    verdict: FirewallVerdict::Drop,
+                    class: FirewallConnectionClass::New,
+                    source: FirewallPolicySource::Rule(rule_id),
+                    matched_action: Some(FirewallAction::Reject),
+                    failure: None,
+                },
                 FirewallPlanError::DefaultDenied => FirewallDisposition {
                     verdict: FirewallVerdict::Drop,
                     class: FirewallConnectionClass::New,
@@ -3571,6 +3647,7 @@ fn plan_firewall(
                     return Err(match error {
                         FirewallPlanError::ClockRegression => FirewallClockRegression,
                         FirewallPlanError::RuleDenied(_)
+                        | FirewallPlanError::RuleRejected(_)
                         | FirewallPlanError::DefaultDenied
                         | FirewallPlanError::InvalidInitialTcp(_)
                         | FirewallPlanError::StateFull(_) => {
@@ -3584,6 +3661,7 @@ fn plan_firewall(
             }
             Err(match error {
                 FirewallPlanError::RuleDenied(_) => FirewallRuleDenied,
+                FirewallPlanError::RuleRejected(_) => FirewallRuleRejected,
                 FirewallPlanError::DefaultDenied => FirewallDefaultDenied,
                 FirewallPlanError::InvalidInitialTcp(_) => FirewallTcpInvalidInitialFlags,
                 FirewallPlanError::StateFull(_) => FirewallStateTableFull,

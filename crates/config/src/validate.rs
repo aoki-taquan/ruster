@@ -1586,6 +1586,7 @@ fn validate_v1(
                 match source_rule.action {
                     FirewallActionV1::AllowStateful => FirewallAction::AllowStateful,
                     FirewallActionV1::Deny => FirewallAction::Deny,
+                    FirewallActionV1::Reject => FirewallAction::Reject,
                 },
             ));
         }

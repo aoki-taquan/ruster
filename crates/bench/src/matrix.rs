@@ -155,6 +155,7 @@ fn fingerprint_firewall_rule(hash: u64, rule: FirewallRule) -> u64 {
         match rule.action() {
             FirewallAction::AllowStateful => 1,
             FirewallAction::Deny => 0,
+            FirewallAction::Reject => 2,
         },
     )
 }

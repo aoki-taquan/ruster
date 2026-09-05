@@ -11,12 +11,12 @@ use ruster_core::{
     bind_publication_backend, BoundPublicationBackend, FirewallConfig, FirewallHashKey,
     FirewallPolicy, ForwardingSnapshot, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink,
     GeneratedTraceSink, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
-    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4Mtu, LocalIpv4Binding, MacAddress,
-    MatchedPublicationQuiescenceGuard, MonotonicMillis, Nat44TcpConfig, Nat44TcpPolicy,
-    Nat44UdpConfig, Nat44UdpPolicy, PublicationOwnerBinding, ResolutionActionSlot,
-    ResolutionFailureHoldSlot, ResolutionFailureTrace, ResolutionFailureTraceSink,
-    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, ResolutionTimerTrace,
-    ResolutionTimerTraceSink, TraceEvent, TraceSink,
+    Icmpv4ErrorStateSlot, Icmpv4TimestampClock, IfId, Interface, Ipv4Address, Ipv4Mtu,
+    LocalIpv4Binding, MacAddress, MatchedPublicationQuiescenceGuard, MonotonicMillis,
+    Nat44TcpConfig, Nat44TcpPolicy, Nat44UdpConfig, Nat44UdpPolicy, PublicationOwnerBinding,
+    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionFailureTrace,
+    ResolutionFailureTraceSink, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot,
+    ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent, TraceSink,
 };
 use ruster_io_sim::SimIo;
 use ruster_runtime::{
@@ -287,6 +287,7 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
             None,
             &mut io,
             MonotonicMillis(tick),
+            Icmpv4TimestampClock(u32::try_from(tick).unwrap()),
             &mut trace,
         );
         assert!(report.active);

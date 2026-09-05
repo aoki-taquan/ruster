@@ -36,10 +36,11 @@ mod control_socket;
 #[cfg(target_os = "linux")]
 use ruster_core::{
     bind_publication_backend, GeneratedArpTrace, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink,
-    GeneratedPacketIo, GeneratedTraceSink, MonotonicMillis, PacketIo, PublicationBackendAuthority,
-    PublicationBackendControl, PublicationQuiescence, PublicationQuiescenceBackend,
-    PublicationQuiescenceDisposition, ResolutionFailureTrace, ResolutionFailureTraceSink,
-    ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent, TraceSink,
+    GeneratedPacketIo, GeneratedTraceSink, Icmpv4TimestampClock, MonotonicMillis, PacketIo,
+    PublicationBackendAuthority, PublicationBackendControl, PublicationQuiescence,
+    PublicationQuiescenceBackend, PublicationQuiescenceDisposition, ResolutionFailureTrace,
+    ResolutionFailureTraceSink, ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent,
+    TraceSink,
 };
 #[cfg(target_os = "linux")]
 use ruster_integration::{
@@ -1749,7 +1750,14 @@ where
             );
             let report = {
                 let mut trace = DaemonTrace::new(&mut recorder);
-                run_tick(publication, candidate_for_tick, io, now, &mut trace)
+                run_tick(
+                    publication,
+                    candidate_for_tick,
+                    io,
+                    now,
+                    utc_midnight_clock_now(),
+                    &mut trace,
+                )
             };
             let tick_finished_at = std::time::Instant::now();
 
@@ -2176,7 +2184,19 @@ fn run_sim_path(path: &str, ticks: usize) -> Result<(), String> {
 
         let report = {
             let mut trace = DaemonTrace::new(&mut recorder);
-            run_tick(&mut publication, None, &mut io, now, &mut trace)
+            // `run-sim` replay must stay wall-clock free (see
+            // `sim_tick_time`), so the Timestamp clock is derived from the
+            // same deterministic logical clock rather than read live.
+            let timestamp_clock =
+                Icmpv4TimestampClock(u32::try_from(now.0 % 86_400_000).unwrap_or(0));
+            run_tick(
+                &mut publication,
+                None,
+                &mut io,
+                now,
+                timestamp_clock,
+                &mut trace,
+            )
         };
         let tick_failed = sim_tick_has_internal_error(&report);
         recorder.record_tick_report(&report);
@@ -2243,6 +2263,24 @@ fn run_sim_path(path: &str, ticks: usize) -> Result<(), String> {
 #[cfg(not(target_os = "linux"))]
 fn run_sim_path(_path: &str, _ticks: usize) -> Result<(), String> {
     Err("ruster run-sim requires the Linux build in this binary".to_owned())
+}
+
+/// Milliseconds since UTC midnight, for the one ICMPv4 Timestamp field RFC
+/// 792 asks a router to fill in from its own clock.
+///
+/// This is the only place in the daemon that reads a wall clock; every other
+/// timed decision uses the monotonic `now` derived from `start.elapsed()`
+/// beside this call. `SystemTime::now()` predating the Unix epoch is not a
+/// real failure mode on a running system, so it degrades to zero rather than
+/// stopping the tick loop over a clock question RFC 792 does not require an
+/// answer to.
+#[cfg(target_os = "linux")]
+fn utc_midnight_clock_now() -> Icmpv4TimestampClock {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let millis_since_midnight = (since_epoch.as_millis() % 86_400_000) as u32;
+    Icmpv4TimestampClock(millis_since_midnight)
 }
 
 #[cfg(target_os = "linux")]
@@ -4327,6 +4365,7 @@ completion = 4
                 None,
                 &mut io,
                 MonotonicMillis(1),
+                Icmpv4TimestampClock(1),
                 &mut trace,
             )
         };
@@ -4384,6 +4423,7 @@ completion = 4
                 None,
                 &mut io,
                 MonotonicMillis(2),
+                Icmpv4TimestampClock(1),
                 &mut trace,
             )
         };

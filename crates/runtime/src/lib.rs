@@ -3,17 +3,18 @@
 
 use ruster_core::{
     dispatch_host_unreachable_failures, execute_one_arp_request, execute_one_icmpv4_error,
-    forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors, poll_resolution_timers,
-    ArpRequestBuildError, BatchReport, BoundPublicationBackend, ExecuteArpRequestError,
-    ExecuteIcmpv4Error, FirewallConfig, FirewallCounters, FirewallRuntime, ForwardingSnapshot,
-    GeneratedAllocationError, GeneratedIcmpv4TraceSink, GeneratedPacketIo, GeneratedTraceSink,
-    Icmpv4ErrorBuildError, Icmpv4ErrorRuntime, MatchedPublicationQuiescenceGuard, MonotonicMillis,
-    Nat44TcpConfig, Nat44TcpCounters, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpCounters,
-    Nat44UdpRuntime, PacketIo, PublicationBackendAuthority, PublicationOwnerBinding,
-    PublicationQuiescence, PublicationQuiescenceBackend, PublicationQuiescenceDisposition,
-    PublicationQuiescenceGuard, ResolutionFailureDispatchError, ResolutionFailureDispatchReport,
-    ResolutionFailureTraceSink, ResolutionRuntime, ResolutionTimerError, ResolutionTimerReport,
-    ResolutionTimerTraceSink, TraceSink,
+    forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_and_timestamp,
+    poll_resolution_timers, ArpRequestBuildError, BatchReport, BoundPublicationBackend,
+    ExecuteArpRequestError, ExecuteIcmpv4Error, FirewallConfig, FirewallCounters, FirewallRuntime,
+    ForwardingSnapshot, GeneratedAllocationError, GeneratedIcmpv4TraceSink, GeneratedPacketIo,
+    GeneratedTraceSink, Icmpv4ErrorBuildError, Icmpv4ErrorRuntime, Icmpv4TimestampClock,
+    MatchedPublicationQuiescenceGuard, MonotonicMillis, Nat44TcpConfig, Nat44TcpCounters,
+    Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpCounters, Nat44UdpRuntime, PacketIo,
+    PublicationBackendAuthority, PublicationOwnerBinding, PublicationQuiescence,
+    PublicationQuiescenceBackend, PublicationQuiescenceDisposition, PublicationQuiescenceGuard,
+    ResolutionFailureDispatchError, ResolutionFailureDispatchReport, ResolutionFailureTraceSink,
+    ResolutionRuntime, ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTraceSink,
+    TraceSink,
 };
 use std::{fmt, num::NonZeroU64};
 
@@ -1503,6 +1504,7 @@ pub fn run_tick<'storage, P, I, T>(
     candidate: Option<P::Candidate>,
     io: &mut BoundPublicationBackend<I>,
     now: MonotonicMillis,
+    timestamp_clock: Icmpv4TimestampClock,
     trace: &mut T,
 ) -> TickReport<
     P::Candidate,
@@ -1644,20 +1646,22 @@ where
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::Rx));
     let rx = match io.receive(budgets.rx) {
         Ok(batch) => {
-            let report = forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors(
-                batch,
-                &snapshot,
-                resolution,
-                icmpv4_errors,
-                &udp_config,
-                nat44_udp,
-                &tcp_config,
-                nat44_tcp,
-                &firewall_config,
-                firewall,
-                now,
-                trace,
-            );
+            let report =
+                forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_and_timestamp(
+                    batch,
+                    &snapshot,
+                    resolution,
+                    icmpv4_errors,
+                    &udp_config,
+                    nat44_udp,
+                    &tcp_config,
+                    nat44_tcp,
+                    &firewall_config,
+                    firewall,
+                    now,
+                    timestamp_clock,
+                    trace,
+                );
             if report.invariants_hold() {
                 RxPhaseReport::Completed(report)
             } else {
@@ -1762,19 +1766,20 @@ mod tests {
     use super::*;
     use ruster_core::{
         bind_publication_backend, forward_batch_with_resolution,
-        forward_batch_with_resolution_and_icmpv4_errors, ipv4_header_checksum, BatchCompletion,
-        BoundPublicationBackend, DirectoryBucket, DirectoryNode, FirewallHashKey, FirewallPolicy,
-        FirewallRuntime, FirewallStateSlot, GeneratedBatchCompletion, GeneratedPacketBatch,
-        GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion, GeneratedTraceSink,
-        Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorStateSlot, IfId, Interface,
-        Ipv4Address, Ipv4Mtu, LocalIpv4Binding, MacAddress, MatchedPublicationQuiescenceGuard,
-        Nat44TcpHashKey, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy,
-        Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpHashKey, Nat44UdpIndexStorage,
-        Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace,
-        PacketBatch, PacketLease, PacketSlot, PortOwnerSlot, PublicationBackendAuthority,
-        PublicationBackendControl, PublicationOwnerBinding, PublicationQuiescenceBackend,
-        ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionFailureTrace, ResolutionPolicy,
-        ResolutionStateSlot, ResolutionTimerTrace, Route, SlotCompletion, TraceEvent,
+        forward_batch_with_resolution_and_icmpv4_errors, internet_checksum, ipv4_header_checksum,
+        BatchCompletion, BoundPublicationBackend, DirectoryBucket, DirectoryNode, FirewallHashKey,
+        FirewallPolicy, FirewallRuntime, FirewallStateSlot, GeneratedBatchCompletion,
+        GeneratedPacketBatch, GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion,
+        GeneratedTraceSink, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorStateSlot, IfId,
+        Interface, Ipv4Address, Ipv4Mtu, LocalIpv4Binding, MacAddress,
+        MatchedPublicationQuiescenceGuard, Nat44TcpHashKey, Nat44TcpIndexStorage,
+        Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpHashKey,
+        Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
+        Nat44UdpRuntime, Neighbor, NoTrace, PacketBatch, PacketLease, PacketSlot, PortOwnerSlot,
+        PublicationBackendAuthority, PublicationBackendControl, PublicationOwnerBinding,
+        PublicationQuiescenceBackend, ResolutionActionSlot, ResolutionFailureHoldSlot,
+        ResolutionFailureTrace, ResolutionPolicy, ResolutionStateSlot, ResolutionTimerTrace, Route,
+        SlotCompletion, TraceEvent,
     };
     use ruster_io_sim::{
         BoundSimIoControl, FrameOrigin, SimBatch, SimGeneratedBatch, SimGeneratedError, SimIo,
@@ -2057,7 +2062,13 @@ mod tests {
     {
         publication.tick_authority =
             ActiveTickAuthority::new(publication.tick_authority.generation(), tick_budgets);
-        super::run_tick(publication, candidate, io, now, trace)
+        // Deterministic tests have no wall clock of their own; this derives
+        // one straight from `now` so a Timestamp Reply in a test is exact
+        // and reproducible without adding a second clock to this helper's
+        // signature (and every one of its many call sites).
+        let timestamp_clock =
+            Icmpv4TimestampClock(u32::try_from(now.0 % 86_400_000).expect("bounded by modulus"));
+        super::run_tick(publication, candidate, io, now, timestamp_clock, trace)
     }
 
     fn seed_resolution<I>(publication: &mut TestPublication<'_, '_, I>, last: u8, now: u64) {
@@ -3226,6 +3237,7 @@ mod tests {
                 Some(Candidate::ApplyWithBudgets(next_budgets)),
                 io,
                 MonotonicMillis(0),
+                Icmpv4TimestampClock(1),
                 trace,
             );
             assert_eq!(report.publication, PublicationOutcome::Applied(1));
@@ -3238,6 +3250,7 @@ mod tests {
                 Some(Candidate::Reject(Box::new(1))),
                 io,
                 MonotonicMillis(1),
+                Icmpv4TimestampClock(1),
                 trace,
             );
             assert!(matches!(
@@ -3263,6 +3276,7 @@ mod tests {
                 Some(Candidate::ApplyWithBudgets(deferred_budgets)),
                 io,
                 MonotonicMillis(2),
+                Icmpv4TimestampClock(1),
                 trace,
             );
             assert!(matches!(
@@ -3398,6 +3412,69 @@ mod tests {
             ));
             assert_eq!(io.pop_tx().unwrap().origin, FrameOrigin::Generated);
             assert_eq!(io.pop_tx().unwrap().origin, FrameOrigin::Generated);
+        });
+    }
+
+    fn timestamp_request() -> Vec<u8> {
+        let mut frame = vec![0_u8; 14 + 20 + 20];
+        frame[0..6].copy_from_slice(&LAN_MAC.0);
+        frame[6..12].copy_from_slice(&HOST_MAC.0);
+        frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+        frame[14] = 0x45;
+        frame[16..18].copy_from_slice(&40_u16.to_be_bytes());
+        frame[20..22].copy_from_slice(&0x4000_u16.to_be_bytes());
+        frame[22] = 64;
+        frame[23] = 1;
+        frame[26..30].copy_from_slice(&HOST_IP.octets());
+        frame[30..34].copy_from_slice(&LAN_IP.octets());
+        frame[34] = 13;
+        let checksum = internet_checksum(&frame[34..54]);
+        frame[36..38].copy_from_slice(&checksum.to_be_bytes());
+        let ipv4_checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&ipv4_checksum.to_be_bytes());
+        frame
+    }
+
+    /// RFC 792 / RFC 1812 §4.3.2.9, wired end to end through `run_tick`: a
+    /// Timestamp request addressed to the router's own LAN address draws a
+    /// Timestamp Reply carrying `run_test_tick`'s clock, proving the whole
+    /// assembled router (not just the core forwarding function) answers one.
+    #[test]
+    fn assembled_router_answers_a_timestamp_request_with_the_tick_clock() {
+        with_sim_fixture(|publication, io, trace| {
+            io.inject(LAN, timestamp_request());
+            let report = run_test_tick(
+                publication,
+                None,
+                io,
+                MonotonicMillis(5_000),
+                TickBudgets {
+                    rx: 1,
+                    ..TickBudgets::default()
+                },
+                trace,
+            );
+            assert!(matches!(
+                report.rx,
+                RxPhaseReport::Completed(BatchReport {
+                    received: 1,
+                    tx_requested: 1,
+                    ..
+                })
+            ));
+            let reply = io.pop_tx().unwrap();
+            assert_eq!(reply.origin, FrameOrigin::Received { ingress: LAN });
+            assert_eq!(&reply.bytes[0..6], &HOST_MAC.0);
+            assert_eq!(&reply.bytes[6..12], &LAN_MAC.0);
+            assert_eq!(&reply.bytes[26..30], &LAN_IP.octets());
+            assert_eq!(&reply.bytes[30..34], &HOST_IP.octets());
+            assert_eq!(reply.bytes[34], 14, "Timestamp Reply");
+            assert_eq!(reply.bytes[35], 0);
+            // `run_test_tick` derives its clock as `now % 86_400_000`, and
+            // 5_000 is already inside that range.
+            assert_eq!(&reply.bytes[46..50], &5_000_u32.to_be_bytes());
+            assert_eq!(&reply.bytes[50..54], &5_000_u32.to_be_bytes());
+            assert_eq!(internet_checksum(&reply.bytes[34..54]), 0);
         });
     }
 

@@ -12,10 +12,10 @@ use ruster_config::{parse, validate, ValidatedConfig, ValidationLimits};
 use ruster_control::{plan_full_service_v1, FullServiceCandidateV1, FullServicePlanInputs};
 use ruster_core::{
     bind_publication_backend, internet_checksum, ipv4_header_checksum, FirewallHashKey,
-    GeneratedArpTrace, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedTraceSink, IfId,
-    Ipv4Address, MonotonicMillis, Nat44TcpHashKey, Nat44UdpHashKey, ResolutionFailureTrace,
-    ResolutionFailureTraceSink, ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent,
-    TraceSink,
+    GeneratedArpTrace, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedTraceSink,
+    Icmpv4TimestampClock, IfId, Ipv4Address, MonotonicMillis, Nat44TcpHashKey, Nat44UdpHashKey,
+    ResolutionFailureTrace, ResolutionFailureTraceSink, ResolutionTimerTrace,
+    ResolutionTimerTraceSink, TraceEvent, TraceSink,
 };
 use ruster_integration::{activate_initial, FullServiceRuntimeStorage};
 use ruster_io_sim::{BoundSimIoControl, SimIo};
@@ -282,7 +282,14 @@ fn real_traffic_produces_a_coherent_generation_tagged_snapshot() {
     // Real allowed UDP + TCP traffic through one tick.
     io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53));
     io.inject(LAN, tcp_frame(HOST, REMOTE, 12_346, 443, 0x02));
-    let report = run_tick(&mut owner, None, &mut io, MonotonicMillis(now), &mut trace);
+    let report = run_tick(
+        &mut owner,
+        None,
+        &mut io,
+        MonotonicMillis(now),
+        Icmpv4TimestampClock(u32::try_from((now) % 86_400_000).unwrap_or(0)),
+        &mut trace,
+    );
     assert!(matches!(&report.publication, PublicationOutcome::Unchanged));
     let RxPhaseReport::Completed(rx) = report.rx else {
         panic!("dirtying packet batch must complete: {:?}", report.rx);
@@ -317,7 +324,14 @@ fn real_traffic_produces_a_coherent_generation_tagged_snapshot() {
 
     // A later candidate-free tick with no new traffic: cumulative totals and
     // high watermarks never fall below their prior peak.
-    let report = run_tick(&mut owner, None, &mut io, MonotonicMillis(now), &mut trace);
+    let report = run_tick(
+        &mut owner,
+        None,
+        &mut io,
+        MonotonicMillis(now),
+        Icmpv4TimestampClock(u32::try_from((now) % 86_400_000).unwrap_or(0)),
+        &mut trace,
+    );
     assert!(matches!(&report.publication, PublicationOutcome::Unchanged));
     let quiet = owner.observability_snapshot(
         &mut recorder,
@@ -358,7 +372,14 @@ fn steady_snapshots_are_allocation_free() {
 
     reset_allocation_count();
     for tick in 0..1_024_u64 {
-        let report = run_tick(&mut owner, None, &mut io, MonotonicMillis(tick), &mut trace);
+        let report = run_tick(
+            &mut owner,
+            None,
+            &mut io,
+            MonotonicMillis(tick),
+            Icmpv4TimestampClock(u32::try_from((tick) % 86_400_000).unwrap_or(0)),
+            &mut trace,
+        );
         assert!(matches!(&report.publication, PublicationOutcome::Unchanged));
         let snapshot = owner.observability_snapshot(&mut recorder, ());
         assert_eq!(snapshot.core.nat44_udp.processed.get(), 0);

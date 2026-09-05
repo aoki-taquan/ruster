@@ -44,6 +44,7 @@ pub use forwarding::{
     forward_batch_with_nat44_udp_and_icmpv4_errors, forward_batch_with_nat44_udp_and_tcp,
     forward_batch_with_nat44_udp_and_tcp_and_firewall,
     forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors,
+    forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_and_timestamp,
     forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_audited,
     forward_batch_with_nat44_udp_and_tcp_and_firewall_audited,
     forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors, forward_batch_with_resolution,

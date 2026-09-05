@@ -3129,6 +3129,83 @@ fn firewall_preflight_hides_route_oracles_and_never_queues_icmp_or_arp_on_failur
     assert_eq!(resolution.pending_actions(), 0);
 }
 
+/// RFC 1812 §4.3.3.9: unlike a plain `deny` (pinned above as silent), a rule
+/// whose action is `reject` draws an exact Type 3 Code 13 Communication
+/// Administratively Prohibited message back to the sender.
+#[test]
+fn reject_rule_denial_generates_exact_type3_code13_while_deny_stays_silent() {
+    let (all_routes, interfaces, neighbors, bindings) = topology();
+    let snapshot =
+        ForwardingSnapshot::new(&all_routes, &interfaces, &neighbors, &bindings).unwrap();
+    let reject_rules = [rule(
+        7,
+        FirewallInterface::Any,
+        FirewallInterface::Any,
+        any_prefix(),
+        any_prefix(),
+        FirewallProtocol::Udp,
+        ports(12_345, 12_345),
+        ports(53, 53),
+        FirewallAction::Reject,
+    )];
+    let reject_config = firewall_config(&snapshot, &reject_rules, 1);
+    let mut reject_slots = [FirewallStateSlot::default(); 1];
+    let mut reject_runtime = FirewallRuntime::new(reject_config, &mut reject_slots);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(
+        Icmpv4ErrorPolicy::default(),
+        &mut error_states,
+        &mut error_actions,
+    );
+    let mut io = SimIo::new();
+    let explicit = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
+    io.inject(LAN, explicit.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        &reject_config,
+        Some(&mut reject_runtime),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallRuleRejected, &explicit);
+    assert_eq!(errors.pending_actions(), 1);
+
+    let generated = execute_one_icmpv4_error(
+        &mut io,
+        &mut errors,
+        MonotonicMillis(1),
+        &mut NoGeneratedIcmpv4Trace,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        generated.action.kind,
+        ruster_core::Icmpv4ErrorKind::DestinationUnreachableCommAdminProhibited
+    );
+    let tx = io.pop_tx().unwrap();
+    assert_eq!(&tx.bytes[0..6], &HOST_MAC.0);
+    assert_eq!(&tx.bytes[6..12], &LAN_MAC.0);
+    assert_eq!(&tx.bytes[26..30], &LAN_LOCAL.octets());
+    assert_eq!(&tx.bytes[30..34], &HOST.octets());
+    assert_eq!(ipv4_header_checksum(&tx.bytes[14..34]), 0);
+    assert_eq!(tx.bytes[34], 3, "Destination Unreachable");
+    assert_eq!(
+        tx.bytes[35], 13,
+        "code 13: communication administratively prohibited"
+    );
+    assert_eq!(internet_checksum(&tx.bytes[34..]), 0);
+    let quoted_len = usize::from(u16::from_be_bytes([explicit[16], explicit[17]]));
+    assert_eq!(&tx.bytes[42..], &explicit[14..14 + quoted_len]);
+}
+
 #[test]
 fn unfragmented_transport_boundary_matrix_is_typed_and_byte_atomic() {
     let (routes, interfaces, neighbors, bindings) = topology();

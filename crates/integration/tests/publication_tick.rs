@@ -12,8 +12,8 @@ use ruster_control::{
 use ruster_core::{
     bind_publication_backend, internet_checksum, ipv4_header_checksum, BoundPublicationBackend,
     DropReason, FirewallHashKey, GeneratedArpTrace, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink,
-    GeneratedTraceSink, IfId, Ipv4Address, MonotonicMillis, Nat44TcpConfig, Nat44TcpHashKey,
-    Nat44UdpConfig, Nat44UdpHashKey, PacketBatch, PacketIo, PublicationQuiescence,
+    GeneratedTraceSink, Icmpv4TimestampClock, IfId, Ipv4Address, MonotonicMillis, Nat44TcpConfig,
+    Nat44TcpHashKey, Nat44UdpConfig, Nat44UdpHashKey, PacketBatch, PacketIo, PublicationQuiescence,
     PublicationQuiescenceDisposition, ResolutionFailureTrace, ResolutionFailureTraceSink,
     ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent, TraceSink,
 };
@@ -619,7 +619,14 @@ fn seed_live_tcp_state(
     now: MonotonicMillis,
 ) -> u16 {
     io.inject(LAN, tcp_frame(HOST, REMOTE, 12_345, 443, 0x02));
-    let report = run_tick(owner, None, io, now, trace);
+    let report = run_tick(
+        owner,
+        None,
+        io,
+        now,
+        Icmpv4TimestampClock(u32::try_from(now.0 % 86_400_000).unwrap_or(0)),
+        trace,
+    );
     let RxPhaseReport::Completed(rx) = report.rx else {
         panic!("outbound SYN must complete: {:?}", report.rx);
     };
@@ -681,6 +688,7 @@ fn run_tick_applies_same_interface_same_shape_successor_and_uses_new_authority_s
         Some(successor),
         &mut io,
         MonotonicMillis(2),
+        Icmpv4TimestampClock(2),
         &mut trace,
     );
 
@@ -774,6 +782,7 @@ fn run_tick_rollback_to_prior_generation_source_restores_behavior_and_rejects_re
         Some(changed),
         &mut io,
         MonotonicMillis(2),
+        Icmpv4TimestampClock(2),
         &mut trace,
     );
     match report.publication {
@@ -785,7 +794,14 @@ fn run_tick_rollback_to_prior_generation_source_restores_behavior_and_rejects_re
     // Generation 2 remapped NAT/firewall to port 8443 (not 443), so a fresh
     // probe must target the changed port to prove the new content is live.
     io.inject(LAN, tcp_frame(HOST, REMOTE, 12_346, 8443, 0x02));
-    let report = run_tick(&mut owner, None, &mut io, MonotonicMillis(3), &mut trace);
+    let report = run_tick(
+        &mut owner,
+        None,
+        &mut io,
+        MonotonicMillis(3),
+        Icmpv4TimestampClock(3),
+        &mut trace,
+    );
     let RxPhaseReport::Completed(rx) = report.rx else {
         panic!("generation-2 SYN must complete: {:?}", report.rx);
     };
@@ -809,6 +825,7 @@ fn run_tick_rollback_to_prior_generation_source_restores_behavior_and_rejects_re
         Some(rollback),
         &mut io,
         MonotonicMillis(4),
+        Icmpv4TimestampClock(4),
         &mut trace,
     );
     match report.publication {
@@ -844,6 +861,7 @@ fn run_tick_rollback_to_prior_generation_source_restores_behavior_and_rejects_re
         Some(regression),
         &mut io,
         MonotonicMillis(6),
+        Icmpv4TimestampClock(6),
         &mut trace,
     );
     let rejection = match report.publication {
@@ -925,6 +943,7 @@ fn run_tick_foreign_backend_some_and_none_preserve_queues_and_skip_data_phases()
         Some(successor),
         &mut foreign_io,
         MonotonicMillis(1),
+        Icmpv4TimestampClock(1),
         &mut trace,
     );
     let successor = match report.publication {
@@ -966,6 +985,7 @@ fn run_tick_foreign_backend_some_and_none_preserve_queues_and_skip_data_phases()
         None,
         &mut foreign_io,
         MonotonicMillis(2),
+        Icmpv4TimestampClock(2),
         &mut trace,
     );
     assert!(matches!(
@@ -1003,6 +1023,7 @@ fn run_tick_foreign_backend_some_and_none_preserve_queues_and_skip_data_phases()
         None,
         &mut paired_io,
         MonotonicMillis(3),
+        Icmpv4TimestampClock(3),
         &mut trace,
     );
     assert!(matches!(report.publication, PublicationOutcome::Unchanged));
@@ -1041,6 +1062,7 @@ fn run_tick_invalid_successor_keeps_exact_candidate_old_budget_and_live_state() 
         Some(invalid),
         &mut io,
         MonotonicMillis(2),
+        Icmpv4TimestampClock(2),
         &mut trace,
     );
 
@@ -1130,6 +1152,7 @@ fn run_tick_restart_required_table_keeps_exact_candidate_old_budget_and_live_sta
             Some(successor),
             &mut io,
             MonotonicMillis(2),
+            Icmpv4TimestampClock(2),
             &mut trace,
         );
 
@@ -1201,6 +1224,7 @@ fn run_tick_continue_old_io_defer_uses_old_budget_then_retries_same_candidate_ap
         Some(successor),
         &mut io,
         MonotonicMillis(1),
+        Icmpv4TimestampClock(1),
         &mut trace,
     );
     let successor = match report.publication {
@@ -1232,6 +1256,7 @@ fn run_tick_continue_old_io_defer_uses_old_budget_then_retries_same_candidate_ap
         Some(successor),
         &mut io,
         MonotonicMillis(2),
+        Icmpv4TimestampClock(2),
         &mut trace,
     );
     let applied = match report.publication {
@@ -1267,6 +1292,7 @@ fn run_tick_skip_io_defer_preserves_exact_candidate_and_skips_data_phases() {
         Some(successor),
         &mut io,
         MonotonicMillis(1),
+        Icmpv4TimestampClock(1),
         &mut trace,
     );
     let candidate = match report.publication {

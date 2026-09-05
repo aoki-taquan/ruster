@@ -7,10 +7,11 @@ use ruster_config::{
     MAX_INTERFACES, MAX_NEIGHBORS, MAX_ROUTES,
 };
 use ruster_core::{
-    DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallRuleId, FirewallStateSlot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Ipv4Mtu, Nat44TcpMappingSlot, Nat44TcpSessionSlot,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot,
-    ResolutionDatagramHoldSlot, ResolutionFailureHoldSlot, ResolutionStateSlot, RouteError,
+    DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallAction, FirewallRuleId,
+    FirewallStateSlot, Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Ipv4Mtu, Nat44TcpMappingSlot,
+    Nat44TcpSessionSlot, Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot,
+    ResolutionActionSlot, ResolutionDatagramHoldSlot, ResolutionFailureHoldSlot,
+    ResolutionStateSlot, RouteError,
 };
 use ruster_io_xdp_native::{ConfigError as XdpConfigError, MAX_UMEM_FRAME_COUNT};
 
@@ -492,6 +493,19 @@ fn validated_firewall_into_rules_preserves_owned_rule_allocation() {
     assert_eq!(rules.as_ptr(), expected_rules);
     assert_eq!(rules.len(), expected_rule_ids.len());
     assert_eq!([rules[0].id().0, rules[1].id().0], expected_rule_ids);
+}
+
+#[test]
+fn firewall_rule_action_reject_parses_and_validates_distinctly_from_deny() {
+    let source = VALID.replacen("action = \"deny\"", "action = \"reject\"", 1);
+    let config = validated(&source);
+    let firewall = config.firewall().expect("fixture enables firewall");
+    let rejecting = firewall
+        .rules()
+        .iter()
+        .find(|rule| rule.id() == FirewallRuleId(1))
+        .expect("fixture rule 1 exists");
+    assert_eq!(rejecting.action(), FirewallAction::Reject);
 }
 
 #[test]

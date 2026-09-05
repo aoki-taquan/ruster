@@ -28,8 +28,8 @@ mod tests {
     use ruster_core::{
         bind_publication_backend, internet_checksum, ipv4_header_checksum, BoundPublicationBackend,
         FirewallHashKey, GeneratedArpTrace, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink,
-        GeneratedPacketBatch, GeneratedPacketIo, GeneratedTraceSink, IfId, Ipv4Address,
-        MonotonicMillis, Nat44TcpHashKey, Nat44TcpRuntimeConfigError, Nat44UdpHashKey,
+        GeneratedPacketBatch, GeneratedPacketIo, GeneratedTraceSink, Icmpv4TimestampClock, IfId,
+        Ipv4Address, MonotonicMillis, Nat44TcpHashKey, Nat44TcpRuntimeConfigError, Nat44UdpHashKey,
         Nat44UdpRuntimeConfigError, PublicationBackendAuthority, PublicationQuiescence,
         PublicationQuiescenceBackend, PublicationQuiescenceDisposition, ResolutionFailureTrace,
         ResolutionFailureTraceSink, ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent,
@@ -252,7 +252,14 @@ mod tests {
     ) {
         io.inject(LAN, frame);
         let mut trace = NoTrace;
-        let report = run_tick(owner, None, io, MonotonicMillis(now_ms), &mut trace);
+        let report = run_tick(
+            owner,
+            None,
+            io,
+            MonotonicMillis(now_ms),
+            Icmpv4TimestampClock(u32::try_from((now_ms) % 86_400_000).unwrap_or(0)),
+            &mut trace,
+        );
         let RxPhaseReport::Completed(rx) = report.rx else {
             panic!("fixture frame must complete: {:?}", report.rx);
         };
@@ -269,7 +276,14 @@ mod tests {
     ) {
         io.inject(ingress, frame);
         let mut trace = NoTrace;
-        let report = run_tick(owner, None, io, MonotonicMillis(now_ms), &mut trace);
+        let report = run_tick(
+            owner,
+            None,
+            io,
+            MonotonicMillis(now_ms),
+            Icmpv4TimestampClock(u32::try_from((now_ms) % 86_400_000).unwrap_or(0)),
+            &mut trace,
+        );
         let RxPhaseReport::Completed(rx) = report.rx else {
             panic!("state-seeding frame must complete: {:?}", report.rx);
         };
@@ -948,6 +962,7 @@ mod tests {
             Some(successor),
             &mut io,
             MonotonicMillis(5),
+            Icmpv4TimestampClock(5),
             &mut trace,
         );
         assert!(report.active);
@@ -1058,6 +1073,7 @@ mod tests {
             Some(later_candidate),
             &mut io,
             MonotonicMillis(6),
+            Icmpv4TimestampClock(6),
             &mut trace,
         );
         assert!(report.active);
@@ -1083,7 +1099,14 @@ mod tests {
         );
         before.assert_matches(&owner);
 
-        let report = run_tick(&mut owner, None, &mut io, MonotonicMillis(7), &mut trace);
+        let report = run_tick(
+            &mut owner,
+            None,
+            &mut io,
+            MonotonicMillis(7),
+            Icmpv4TimestampClock(7),
+            &mut trace,
+        );
         assert!(matches!(report.publication, PublicationOutcome::Unchanged));
         assert!(report.active);
         assert!(matches!(

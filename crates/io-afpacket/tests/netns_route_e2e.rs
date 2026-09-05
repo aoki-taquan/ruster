@@ -4,9 +4,10 @@ use ruster_config::{parse, validate, ValidatedConfig, ValidationLimits};
 use ruster_control::{plan_full_service_v1, FullServicePlanInputs};
 use ruster_core::{
     bind_publication_backend, DropReason, FirewallHashKey, GeneratedArpTrace, GeneratedIcmpv4Trace,
-    GeneratedIcmpv4TraceSink, GeneratedTraceSink, IfId, MonotonicMillis, Nat44TcpHashKey,
-    Nat44UdpDisposition, Nat44UdpHashKey, ResolutionFailureTrace, ResolutionFailureTraceSink,
-    ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent, TraceSink,
+    GeneratedIcmpv4TraceSink, GeneratedTraceSink, Icmpv4TimestampClock, IfId, MonotonicMillis,
+    Nat44TcpHashKey, Nat44UdpDisposition, Nat44UdpHashKey, ResolutionFailureTrace,
+    ResolutionFailureTraceSink, ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent,
+    TraceSink,
 };
 use ruster_integration::{activate_initial, FullServiceRuntimeStorage};
 use ruster_io_afpacket::{
@@ -217,7 +218,14 @@ fn run_router() {
             None
         };
         tick = tick.saturating_add(1);
-        let report = run_tick(&mut publication, candidate, &mut io, now, &mut trace);
+        let report = run_tick(
+            &mut publication,
+            candidate,
+            &mut io,
+            now,
+            Icmpv4TimestampClock(u32::try_from(now.0 % 86_400_000).unwrap_or(0)),
+            &mut trace,
+        );
         trace.dump_tick_diagnostics(tick, now, &report);
         if applying_successor {
             match report.publication {

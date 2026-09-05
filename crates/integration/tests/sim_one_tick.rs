@@ -4,9 +4,9 @@ use ruster_config::{parse, validate, ValidatedConfig, ValidationLimits};
 use ruster_control::{plan_full_service_v1, FullServiceCandidateV1, FullServicePlanInputs};
 use ruster_core::{
     bind_publication_backend, FirewallHashKey, GeneratedArpTrace, GeneratedIcmpv4Trace,
-    GeneratedIcmpv4TraceSink, GeneratedTraceSink, IfId, MonotonicMillis, Nat44TcpHashKey,
-    Nat44UdpHashKey, ResolutionFailureTrace, ResolutionFailureTraceSink, ResolutionTimerTrace,
-    ResolutionTimerTraceSink, TraceEvent, TraceSink,
+    GeneratedIcmpv4TraceSink, GeneratedTraceSink, Icmpv4TimestampClock, IfId, MonotonicMillis,
+    Nat44TcpHashKey, Nat44UdpHashKey, ResolutionFailureTrace, ResolutionFailureTraceSink,
+    ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent, TraceSink,
 };
 use ruster_integration::{activate_initial, FullServiceRuntimeStorage};
 use ruster_io_sim::{BoundSimIoControl, FrameOrigin, SimIo};
@@ -125,6 +125,7 @@ fn planned_initial_activation_runs_one_rootless_sim_tick() {
         Some(successor),
         &mut io,
         MonotonicMillis(0),
+        Icmpv4TimestampClock(0),
         &mut trace,
     );
 

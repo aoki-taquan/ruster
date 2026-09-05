@@ -409,6 +409,11 @@ pub enum FirewallProtocolV1 {
 pub enum FirewallActionV1 {
     AllowStateful,
     Deny,
+    /// Like `Deny`, but the router additionally reports RFC 1812 §4.3.3.9
+    /// Communication Administratively Prohibited to the sender. `Deny` stays
+    /// silent by default so a filter is not forced into confirming its own
+    /// rules to whoever it is filtering.
+    Reject,
 }
 
 /// Per-phase worker limits. Values are syntax only until runtime validation.

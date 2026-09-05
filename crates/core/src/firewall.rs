@@ -149,6 +149,10 @@ impl FirewallProtocol {
 pub enum FirewallAction {
     AllowStateful,
     Deny,
+    /// Like `Deny`, but reports RFC 1812 §4.3.3.9 Communication
+    /// Administratively Prohibited to the sender instead of dropping
+    /// silently.
+    Reject,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -740,6 +744,7 @@ fn rules_fingerprint(rules: &[FirewallRule]) -> u64 {
             match rule.action {
                 FirewallAction::AllowStateful => 1,
                 FirewallAction::Deny => 0,
+                FirewallAction::Reject => 2,
             },
         );
     }
@@ -976,6 +981,7 @@ pub struct FirewallCounters {
     pub allowed_new: u64,
     pub allowed_established: u64,
     pub denied_by_rule: u64,
+    pub rejected_by_rule: u64,
     pub denied_default: u64,
     pub invalid_packets: u64,
     pub state_full: u64,
@@ -1109,6 +1115,10 @@ impl<'a> FirewallAuditBuffer<'a> {
 #[non_exhaustive]
 pub enum FirewallPlanError {
     RuleDenied(FirewallRuleId),
+    /// Like `RuleDenied`, but the rule's action was `Reject`: the caller
+    /// should report RFC 1812 §4.3.3.9 Communication Administratively
+    /// Prohibited rather than dropping silently.
+    RuleRejected(FirewallRuleId),
     DefaultDenied,
     InvalidInitialTcp(FirewallRuleId),
     StateFull(FirewallRuleId),
@@ -1609,6 +1619,9 @@ impl<'state> FirewallRuntime<'state> {
             FirewallPlanError::RuleDenied(_) => {
                 self.counters.denied_by_rule = self.counters.denied_by_rule.saturating_add(1);
             }
+            FirewallPlanError::RuleRejected(_) => {
+                self.counters.rejected_by_rule = self.counters.rejected_by_rule.saturating_add(1);
+            }
             FirewallPlanError::DefaultDenied => {
                 self.counters.denied_default = self.counters.denied_default.saturating_add(1);
             }
@@ -1684,6 +1697,9 @@ impl<'state> FirewallRuntime<'state> {
         match matched {
             Some(rule) if rule.action == FirewallAction::Deny => {
                 return Err(FirewallPlanError::RuleDenied(rule.id));
+            }
+            Some(rule) if rule.action == FirewallAction::Reject => {
+                return Err(FirewallPlanError::RuleRejected(rule.id));
             }
             None => return Err(FirewallPlanError::DefaultDenied),
             Some(_) => {}
@@ -2503,6 +2519,31 @@ mod tests {
                 runtime.plan_packet(&config, packet(FirewallProtocol::Udp, 0), 0),
                 Err(FirewallPlanError::RuleDenied(FirewallRuleId(1)))
             );
+        });
+    }
+
+    /// Contract: `reject` is planned and counted distinctly from a plain
+    /// `deny`, so a caller can tell whether to report Communication
+    /// Administratively Prohibited (RFC 1812 §4.3.3.9) for this denial.
+    #[test]
+    fn reject_action_is_planned_and_counted_distinctly_from_deny() {
+        with_snapshot(|snapshot| {
+            let rules = [
+                rule(1, FirewallAction::Reject, FirewallProtocol::Udp),
+                rule(2, FirewallAction::AllowStateful, FirewallProtocol::Tcp),
+            ];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 1];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let error = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Udp, 0), 0)
+                .unwrap_err();
+            assert_eq!(error, FirewallPlanError::RuleRejected(FirewallRuleId(1)));
+            runtime.record_plan_error(error);
+            assert_eq!(runtime.counters().rejected_by_rule, 1);
+            assert_eq!(runtime.counters().denied_by_rule, 0);
         });
     }
 

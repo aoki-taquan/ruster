@@ -18,9 +18,9 @@ pub use ruster_core::MonotonicMillis;
 use ruster_core::{bind_publication_backend, PublicationQuiescenceDisposition};
 use ruster_core::{
     FirewallHashKey, GeneratedArpTrace, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink,
-    GeneratedTraceSink, IfId, Nat44TcpHashKey, Nat44UdpHashKey, ResolutionFailureTrace,
-    ResolutionFailureTraceSink, ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent,
-    TraceSink,
+    GeneratedTraceSink, Icmpv4TimestampClock, IfId, Nat44TcpHashKey, Nat44UdpHashKey,
+    ResolutionFailureTrace, ResolutionFailureTraceSink, ResolutionTimerTrace,
+    ResolutionTimerTraceSink, TraceEvent, TraceSink,
 };
 use ruster_integration::{
     activate_initial, FullServiceApplyReport, FullServicePublishError, FullServiceRestartRequired,
@@ -1099,6 +1099,15 @@ pub(crate) mod test_observer {
     }
 }
 
+/// Derives an ICMPv4 Timestamp clock from a scenario's own logical clock.
+///
+/// A scenario never reads the wall clock (module docs above), so replaying
+/// the same scenario stays byte-for-byte exact; this keeps a Timestamp Reply
+/// inside that same replay guarantee instead of reading `SystemTime::now()`.
+fn deterministic_timestamp_clock(now: MonotonicMillis) -> Icmpv4TimestampClock {
+    Icmpv4TimestampClock(u32::try_from(now.0 % 86_400_000).unwrap_or(0))
+}
+
 /// Plans a full-service candidate from scenario config text and identity
 /// inputs, using the same public parse/validate/plan path as production.
 fn plan_candidate(
@@ -1163,6 +1172,7 @@ pub fn attempt_publication(
         Some(successor),
         &mut io,
         MonotonicMillis(0),
+        deterministic_timestamp_clock(MonotonicMillis(0)),
         &mut trace,
     );
     let publication_summary = summarize_outcome(&report.publication);
@@ -1304,6 +1314,7 @@ where
             event_candidate,
             &mut io,
             tick.now,
+            deterministic_timestamp_clock(tick.now),
             &mut trace,
         );
         #[cfg(test)]
