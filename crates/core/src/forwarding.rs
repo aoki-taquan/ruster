@@ -11,9 +11,10 @@ use crate::{
     FirewallPolicySource, FirewallProtocol, FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow,
     FirewallRuntime, FirewallVerdict, Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind,
     Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface, LocalIpv4Binding,
-    MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition, Nat44TcpRuntime,
-    Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, ResolutionResult,
-    ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
+    MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition,
+    Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch,
+    ResolutionHoldDisposition, ResolutionResult, ResolutionRuntime, Route, ARP_ETHERTYPE,
+    IPV4_ETHERTYPE, RESOLUTION_HOLD_MAX_FRAME_LEN,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2460,6 +2461,25 @@ fn decide_ipv4<T: TraceSink>(
                         target,
                         result,
                     });
+                    // RFC 1122 §2.3.2.2: save the datagram that triggered this
+                    // resolution rather than discarding it. A runtime built
+                    // without hold slots refuses, which is the old behaviour.
+                    if matches!(
+                        result,
+                        ResolutionResult::Queued
+                            | ResolutionResult::RetryQueued
+                            | ResolutionResult::Suppressed
+                    ) {
+                        let _ = hold_unresolved_datagram(
+                            frame,
+                            ipv4,
+                            route.egress(),
+                            target,
+                            interface.mac,
+                            runtime,
+                            *now,
+                        );
+                    }
                     if route.next_hop().is_none()
                         && target == ipv4.destination
                         && icmp_error_candidate_eligible(frame, snapshot, ipv4, Some(route))
@@ -5162,6 +5182,53 @@ fn apply_nat44_udp_rewrite(
     Ok(())
 }
 
+/// Copies a datagram whose next hop is unresolved into the hold queue.
+///
+/// The copy carries the forwarding rewrite already applied — TTL decremented
+/// once, header checksum updated, source MAC set — with the destination MAC
+/// left zero, so releasing it later sends exactly what an immediate forward
+/// would have sent. Nothing here holds an RX lease: the caller recycles the
+/// received frame as usual.
+fn hold_unresolved_datagram(
+    frame: &[u8],
+    ipv4: packet::ValidatedIpv4,
+    egress: IfId,
+    target: crate::Ipv4Address,
+    source_mac: MacAddress,
+    runtime: &mut ResolutionRuntime<'_>,
+    now: MonotonicMillis,
+) -> ResolutionHoldDisposition {
+    if frame.len() > RESOLUTION_HOLD_MAX_FRAME_LEN {
+        // Offered as-is so the refusal, and its counter, name the real length.
+        return runtime.hold_datagram(egress, target, frame, now);
+    }
+    let mut staged = [0_u8; RESOLUTION_HOLD_MAX_FRAME_LEN];
+    let len = frame.len();
+    staged[..len].copy_from_slice(frame);
+    // The destination MAC is the one field the hold cannot know yet.
+    staged[0..6].fill(0);
+    if let Some(slot) = staged.get_mut(6..12) {
+        slot.copy_from_slice(&source_mac.0);
+    }
+    let Some(ttl_offset) = ipv4.header_offset.checked_add(8) else {
+        return ResolutionHoldDisposition::FrameTooLong { len };
+    };
+    let Some(checksum_offset) = ipv4.header_offset.checked_add(10) else {
+        return ResolutionHoldDisposition::FrameTooLong { len };
+    };
+    if ipv4.ttl == 0 || ttl_offset >= len || checksum_offset + 2 > len {
+        return ResolutionHoldDisposition::FrameTooLong { len };
+    }
+    staged[ttl_offset] = ipv4.ttl - 1;
+    let checksum = rfc1624_update(
+        ipv4.checksum,
+        u16::from_be_bytes([ipv4.ttl, ipv4.protocol]),
+        u16::from_be_bytes([ipv4.ttl - 1, ipv4.protocol]),
+    );
+    staged[checksum_offset..checksum_offset + 2].copy_from_slice(&checksum.to_be_bytes());
+    runtime.hold_datagram(egress, target, &staged[..len], now)
+}
+
 fn apply_ipv4_rewrite(frame: &mut [u8], decision: Ipv4RewriteDecision) -> Result<(), DropReason> {
     if frame.get(0..6).is_none()
         || frame.get(6..12).is_none()
@@ -5295,6 +5362,82 @@ mod tests {
                 error: None,
             },
         }
+    }
+
+    #[test]
+    fn a_held_datagram_carries_no_destination_mac_and_one_ttl_decrement() {
+        // The hold is a copy of the frame with everything the forward already
+        //decided applied. Its destination MAC is the single unknown, and it is
+        // cleared rather than left carrying the previous hop's address: the
+        // slot is public through `frame()`, so what it holds is observable.
+        use super::hold_unresolved_datagram;
+        use crate::{
+            DynamicNeighborSlot, ResolutionDatagramHoldSlot, ResolutionFailureHoldSlot,
+            ResolutionPolicy,
+        };
+
+        let mut frame = vec![0_u8; 14 + 20 + 8];
+        frame[0..6].copy_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]);
+        frame[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xaa]);
+        frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+        frame[14] = 0x45;
+        frame[16..18].copy_from_slice(&28_u16.to_be_bytes());
+        frame[22] = 64;
+        frame[23] = 17;
+        let checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        let ipv4 = crate::packet::ValidatedIpv4 {
+            header_offset: 14,
+            header_len: 20,
+            total_len: 28,
+            ttl: 64,
+            protocol: 17,
+            source: crate::Ipv4Address::from_octets([192, 0, 2, 50]),
+            destination: crate::Ipv4Address::from_octets([198, 51, 100, 9]),
+            checksum,
+        };
+
+        let mut states = [crate::ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [crate::ResolutionActionSlot::EMPTY; 1];
+        let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
+        let mut failure_holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut holds = [ResolutionDatagramHoldSlot::EMPTY; 1];
+        let egress_mac = crate::MacAddress([0x02, 0, 0, 0, 0, 0x02]);
+        {
+            let mut runtime =
+                ResolutionRuntime::with_dynamic_neighbors_failure_holds_and_datagram_holds(
+                    ResolutionPolicy::with_dynamic_neighbor_ttl(1_000, 60_000, 60_000).unwrap(),
+                    &mut states,
+                    &mut actions,
+                    &mut dynamic,
+                    &mut failure_holds,
+                    &mut holds,
+                );
+            let disposition = hold_unresolved_datagram(
+                &frame,
+                ipv4,
+                IfId(2),
+                ipv4.destination,
+                egress_mac,
+                &mut runtime,
+                MonotonicMillis(0),
+            );
+            assert!(matches!(
+                disposition,
+                crate::ResolutionHoldDisposition::Held { .. }
+            ));
+        }
+
+        let held = holds[0].frame();
+        assert_eq!(&held[0..6], &[0; 6], "the destination MAC is not yet known");
+        assert_eq!(&held[6..12], &egress_mac.0, "the egress interface is set");
+        assert_eq!(held[22], 63, "the TTL is decremented exactly once");
+        assert_eq!(
+            ipv4_header_checksum(&held[14..34]),
+            0,
+            "the header checksum matches the decremented TTL"
+        );
+        assert_eq!(&held[34..], &frame[34..], "the payload is unchanged");
     }
 
     #[test]

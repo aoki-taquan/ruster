@@ -2534,6 +2534,131 @@ pub struct GeneratedArpReport<E> {
     pub completion: GeneratedBatchCompletion<E>,
 }
 
+/// What one replay attempt did.
+#[derive(Debug, Eq, PartialEq)]
+pub struct HeldDatagramReport<E> {
+    pub egress: IfId,
+    pub destination_mac: MacAddress,
+    pub len: usize,
+    pub allocation_error: Option<GeneratedAllocationError>,
+    pub build_error: Option<HeldDatagramBuildError>,
+    pub completion: GeneratedBatchCompletion<E>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HeldDatagramBuildError {
+    ExactLengthRequired,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecuteHeldDatagramError {
+    ClockRegression,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GeneratedHeldDatagramTrace {
+    TxRequested { egress: IfId, len: usize },
+    AllocationFailed(GeneratedAllocationError),
+    BuildFailed(HeldDatagramBuildError),
+    BatchCompleted { accepted: usize, rejected: usize },
+}
+
+pub trait GeneratedHeldDatagramTraceSink {
+    fn record_generated_held_datagram(&mut self, event: GeneratedHeldDatagramTrace);
+}
+
+#[derive(Default)]
+pub struct NoGeneratedHeldDatagramTrace;
+
+impl GeneratedHeldDatagramTraceSink for NoGeneratedHeldDatagramTrace {
+    fn record_generated_held_datagram(&mut self, _event: GeneratedHeldDatagramTrace) {}
+}
+
+/// Sends at most one held datagram whose next hop has become known.
+///
+/// The datagram is released from its slot before the send is attempted, so a
+/// backend that rejects the frame drops it rather than replaying it forever:
+/// the sender's own retransmission is the recovery path, and this router
+/// promised only to save the packet, not to deliver it.
+pub fn execute_one_held_datagram<I, T>(
+    io: &mut I,
+    runtime: &mut ResolutionRuntime<'_>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> Result<Option<HeldDatagramReport<I::Error>>, ExecuteHeldDatagramError>
+where
+    I: GeneratedPacketIo,
+    T: GeneratedHeldDatagramTraceSink,
+{
+    if !runtime.execution_time_valid(now) {
+        return Err(ExecuteHeldDatagramError::ClockRegression);
+    }
+    let Some((egress, destination_mac, frame)) = runtime.take_resolved_datagram(now) else {
+        return Ok(None);
+    };
+    let len = frame.len();
+    let mut staged = [0_u8; RESOLUTION_HOLD_MAX_FRAME_LEN];
+    staged[..len].copy_from_slice(frame);
+    staged[0..6].copy_from_slice(&destination_mac.0);
+
+    let mut batch = io.begin_generated(egress);
+    let (allocation_error, build_error) = match allocate_held_datagram(&mut batch, &staged[..len]) {
+        Ok(()) => {
+            trace.record_generated_held_datagram(GeneratedHeldDatagramTrace::TxRequested {
+                egress,
+                len,
+            });
+            (None, None)
+        }
+        Err(HeldDatagramGenerationError::Allocation(error)) => {
+            trace.record_generated_held_datagram(GeneratedHeldDatagramTrace::AllocationFailed(
+                error,
+            ));
+            (Some(error), None)
+        }
+        Err(HeldDatagramGenerationError::Build(error)) => {
+            trace.record_generated_held_datagram(GeneratedHeldDatagramTrace::BuildFailed(error));
+            (None, Some(error))
+        }
+    };
+    let completion = batch.finish();
+    trace.record_generated_held_datagram(GeneratedHeldDatagramTrace::BatchCompleted {
+        accepted: completion.accepted,
+        rejected: completion.rejected,
+    });
+    Ok(Some(HeldDatagramReport {
+        egress,
+        destination_mac,
+        len,
+        allocation_error,
+        build_error,
+        completion,
+    }))
+}
+
+enum HeldDatagramGenerationError {
+    Allocation(GeneratedAllocationError),
+    Build(HeldDatagramBuildError),
+}
+
+fn allocate_held_datagram<B: GeneratedPacketBatch>(
+    batch: &mut B,
+    frame: &[u8],
+) -> Result<(), HeldDatagramGenerationError> {
+    let mut lease = batch
+        .allocate(frame.len())
+        .map_err(HeldDatagramGenerationError::Allocation)?;
+    if lease.bytes_mut().len() != frame.len() {
+        lease.cancel();
+        return Err(HeldDatagramGenerationError::Build(
+            HeldDatagramBuildError::ExactLengthRequired,
+        ));
+    }
+    lease.bytes_mut().copy_from_slice(frame);
+    lease.commit();
+    Ok(())
+}
+
 /// Executes at most one queued action. Allocation failure retains the action.
 pub fn execute_one_arp_request<I, T>(
     io: &mut I,
