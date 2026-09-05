@@ -2278,7 +2278,36 @@ fn decide_ipv4<T: TraceSink>(
     if local {
         return decide_local_ipv4(frame, snapshot, ingress, ipv4, trace);
     }
-    validate_ipv4_options(frame, ipv4)?;
+    if let Err(refusal) = validate_ipv4_options(frame, ipv4) {
+        // RFC 1812 §4.3.2 asks a router to say why it refused a header rather
+        // than dropping it silently: a bad option gets Parameter Problem with
+        // the pointer, and a refused source route gets Source Route Failed.
+        if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+            let kind = if refusal.reason == Ipv4SourceRouteUnsupported {
+                Icmpv4ErrorKind::DestinationUnreachableSourceRouteFailed
+            } else {
+                Icmpv4ErrorKind::ParameterProblem {
+                    pointer: refusal.pointer,
+                }
+            };
+            let disposition = decide_icmpv4_error(
+                frame,
+                snapshot,
+                ipv4,
+                selected_route,
+                kind,
+                resolution,
+                runtime,
+                *now,
+                trace,
+            );
+            trace.record(TraceEvent::Icmpv4TimeExceededDisposition {
+                ingress,
+                disposition,
+            });
+        }
+        return Err(refusal.reason);
+    }
     let Some(route) = selected_route else {
         if firewall_config.is_some() {
             return Err(FirewallRouteUnavailable);
@@ -3345,8 +3374,8 @@ fn validate_firewall_transport(
     // The transport validators below already locate the header at
     // `header_offset + header_len`, so options only need to be well formed and
     // free of source routing — the same test the forwarding decision applies.
-    validate_ipv4_options(frame, ipv4).map_err(|reason| match reason {
-        Ipv4OptionsMalformed | Ipv4SourceRouteUnsupported => reason,
+    validate_ipv4_options(frame, ipv4).map_err(|refusal| match refusal.reason {
+        Ipv4OptionsMalformed | Ipv4SourceRouteUnsupported => refusal.reason,
         _ => FirewallIpv4OptionsUnsupported,
     })?;
     let flags_fragment =
@@ -5207,6 +5236,16 @@ const IPV4_OPTION_STRICT_SOURCE_ROUTE: u8 = 137;
 const IPV4_OPTION_END_OF_LIST: u8 = 0;
 const IPV4_OPTION_NO_OPERATION: u8 = 1;
 
+/// Why this router refused a header, and the octet that caused it.
+///
+/// RFC 792 reports a bad header field with a pointer to its first octet,
+/// counted from the start of the IPv4 header, so the refusal carries one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Ipv4OptionRefusal {
+    reason: DropReason,
+    pointer: u8,
+}
+
 /// Checks the option area of a header this router is about to forward.
 ///
 /// RFC 1812 §5.2.5 requires a router to forward a datagram whose options it
@@ -5214,16 +5253,27 @@ const IPV4_OPTION_NO_OPERATION: u8 = 1;
 /// and not a source route is accepted here and copied by the ordinary forward.
 /// Record Route and Timestamp are carried without being filled in, which is
 /// the same treatment an unrecognised option gets.
-fn validate_ipv4_options(frame: &[u8], ipv4: packet::ValidatedIpv4) -> Result<(), DropReason> {
+fn validate_ipv4_options(
+    frame: &[u8],
+    ipv4: packet::ValidatedIpv4,
+) -> Result<(), Ipv4OptionRefusal> {
+    let refuse = |reason, offset: usize| Ipv4OptionRefusal {
+        reason,
+        // The pointer counts from the start of the IPv4 header, and the
+        // option area begins twenty octets in.
+        pointer: u8::try_from(20 + offset).unwrap_or(u8::MAX),
+    };
     let start = ipv4
         .header_offset
         .checked_add(20)
-        .ok_or(Ipv4HeaderLengthExceedsPacket)?;
+        .ok_or(refuse(Ipv4HeaderLengthExceedsPacket, 0))?;
     let end = ipv4
         .header_offset
         .checked_add(ipv4.header_len)
-        .ok_or(Ipv4HeaderLengthExceedsPacket)?;
-    let options = frame.get(start..end).ok_or(Ipv4HeaderLengthExceedsPacket)?;
+        .ok_or(refuse(Ipv4HeaderLengthExceedsPacket, 0))?;
+    let options = frame
+        .get(start..end)
+        .ok_or(refuse(Ipv4HeaderLengthExceedsPacket, 0))?;
 
     let mut offset = 0;
     while offset < options.len() {
@@ -5239,23 +5289,23 @@ fn validate_ipv4_options(frame: &[u8], ipv4: packet::ValidatedIpv4) -> Result<()
         // Every other option carries its own length, which must cover at
         // least the type and length octets and must not run past the header.
         let Some(&length) = options.get(offset + 1) else {
-            return Err(Ipv4OptionsMalformed);
+            return Err(refuse(Ipv4OptionsMalformed, offset));
         };
         let length = usize::from(length);
         if length < 2 {
-            return Err(Ipv4OptionsMalformed);
+            return Err(refuse(Ipv4OptionsMalformed, offset + 1));
         }
         let Some(next) = offset.checked_add(length) else {
-            return Err(Ipv4OptionsMalformed);
+            return Err(refuse(Ipv4OptionsMalformed, offset + 1));
         };
         if next > options.len() {
-            return Err(Ipv4OptionsMalformed);
+            return Err(refuse(Ipv4OptionsMalformed, offset + 1));
         }
         if matches!(
             option_type,
             IPV4_OPTION_LOOSE_SOURCE_ROUTE | IPV4_OPTION_STRICT_SOURCE_ROUTE
         ) {
-            return Err(Ipv4SourceRouteUnsupported);
+            return Err(refuse(Ipv4SourceRouteUnsupported, offset));
         }
         offset = next;
     }

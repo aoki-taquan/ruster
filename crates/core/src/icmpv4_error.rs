@@ -24,6 +24,13 @@ pub enum Icmpv4ErrorKind {
     DestinationUnreachableFragmentationNeeded {
         next_hop_mtu: u16,
     },
+    /// RFC 792: the datagram asked for source routing this router refuses.
+    DestinationUnreachableSourceRouteFailed,
+    /// RFC 792: a header field is wrong, and `pointer` is the octet offset of
+    /// the first byte that is.
+    ParameterProblem {
+        pointer: u8,
+    },
 }
 
 impl Icmpv4ErrorKind {
@@ -32,7 +39,9 @@ impl Icmpv4ErrorKind {
             Self::TimeExceededTtl => 11,
             Self::DestinationUnreachableNetwork
             | Self::DestinationUnreachableHost
-            | Self::DestinationUnreachableFragmentationNeeded { .. } => 3,
+            | Self::DestinationUnreachableFragmentationNeeded { .. }
+            | Self::DestinationUnreachableSourceRouteFailed => 3,
+            Self::ParameterProblem { .. } => 12,
         }
     }
 
@@ -40,7 +49,25 @@ impl Icmpv4ErrorKind {
         match self {
             Self::DestinationUnreachableHost => 1,
             Self::DestinationUnreachableFragmentationNeeded { .. } => 4,
-            Self::TimeExceededTtl | Self::DestinationUnreachableNetwork => 0,
+            Self::DestinationUnreachableSourceRouteFailed => 5,
+            Self::TimeExceededTtl
+            | Self::DestinationUnreachableNetwork
+            | Self::ParameterProblem { .. } => 0,
+        }
+    }
+
+    /// The octet a Parameter Problem points at, or zero for other kinds.
+    ///
+    /// RFC 792 places the pointer in the first octet after the checksum, where
+    /// the other error types keep four unused octets.
+    const fn parameter_pointer(self) -> u8 {
+        match self {
+            Self::ParameterProblem { pointer } => pointer,
+            Self::TimeExceededTtl
+            | Self::DestinationUnreachableNetwork
+            | Self::DestinationUnreachableHost
+            | Self::DestinationUnreachableFragmentationNeeded { .. }
+            | Self::DestinationUnreachableSourceRouteFailed => 0,
         }
     }
 
@@ -53,7 +80,9 @@ impl Icmpv4ErrorKind {
             Self::DestinationUnreachableFragmentationNeeded { next_hop_mtu } => next_hop_mtu,
             Self::TimeExceededTtl
             | Self::DestinationUnreachableNetwork
-            | Self::DestinationUnreachableHost => 0,
+            | Self::DestinationUnreachableHost
+            | Self::DestinationUnreachableSourceRouteFailed
+            | Self::ParameterProblem { .. } => 0,
         }
     }
 }
@@ -251,6 +280,12 @@ pub enum Icmpv4ErrorDisposition {
         egress: IfId,
         quote_len: usize,
     },
+    /// A datagram this router refused on its header: a source route it will
+    /// not follow, or an option it cannot parse.
+    HeaderRefusalQueued {
+        egress: IfId,
+        quote_len: usize,
+    },
     Pending {
         egress: IfId,
     },
@@ -297,6 +332,7 @@ pub struct Icmpv4ErrorCounters {
     pub queued_destination_unreachable: usize,
     pub queued_host_unreachable: usize,
     pub queued_fragmentation_needed: usize,
+    pub queued_header_refusal: usize,
     pub pending: usize,
     pub rate_limited: usize,
     pub state_full: usize,
@@ -322,6 +358,7 @@ pub struct Icmpv4ErrorCounters {
     pub dequeued_destination_unreachable: usize,
     pub dequeued_host_unreachable: usize,
     pub dequeued_fragmentation_needed: usize,
+    pub dequeued_header_refusal: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -586,6 +623,10 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 self.counters.queued += 1;
                 self.counters.queued_fragmentation_needed += 1;
             }
+            Icmpv4ErrorDisposition::HeaderRefusalQueued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_header_refusal += 1;
+            }
             Icmpv4ErrorDisposition::Pending { .. } => self.counters.pending += 1,
             Icmpv4ErrorDisposition::RateLimited { .. } => {
                 self.counters.rate_limited += 1;
@@ -732,6 +773,13 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                     quote_len: action.quote_len(),
                 }
             }
+            Icmpv4ErrorKind::DestinationUnreachableSourceRouteFailed
+            | Icmpv4ErrorKind::ParameterProblem { .. } => {
+                Icmpv4ErrorDisposition::HeaderRefusalQueued {
+                    egress: action.egress,
+                    quote_len: action.quote_len(),
+                }
+            }
         };
         self.record_suppression(disposition)
     }
@@ -781,6 +829,10 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             }
             Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded { .. } => {
                 self.counters.dequeued_fragmentation_needed += 1;
+            }
+            Icmpv4ErrorKind::DestinationUnreachableSourceRouteFailed
+            | Icmpv4ErrorKind::ParameterProblem { .. } => {
+                self.counters.dequeued_header_refusal += 1;
             }
         }
         if let Some(state) = self.states.get_mut(queued.state_index).filter(|state| {
@@ -835,10 +887,13 @@ pub enum GeneratedIcmpv4Trace {
     HostUnreachableBuildFailed(Icmpv4ErrorBuildError),
     FragmentationNeededAllocationFailed(GeneratedAllocationError),
     FragmentationNeededBuildFailed(Icmpv4ErrorBuildError),
+    HeaderRefusalAllocationFailed(GeneratedAllocationError),
+    HeaderRefusalBuildFailed(Icmpv4ErrorBuildError),
     ClockRegression,
     DestinationUnreachableClockRegression,
     HostUnreachableClockRegression,
     FragmentationNeededClockRegression,
+    HeaderRefusalClockRegression,
     TxRequested {
         egress: IfId,
         destination: Ipv4Address,
@@ -855,6 +910,10 @@ pub enum GeneratedIcmpv4Trace {
         egress: IfId,
         destination: Ipv4Address,
     },
+    HeaderRefusalTxRequested {
+        egress: IfId,
+        destination: Ipv4Address,
+    },
     BatchCompleted {
         accepted: usize,
         rejected: usize,
@@ -868,6 +927,10 @@ pub enum GeneratedIcmpv4Trace {
         rejected: usize,
     },
     FragmentationNeededBatchCompleted {
+        accepted: usize,
+        rejected: usize,
+    },
+    HeaderRefusalBatchCompleted {
         accepted: usize,
         rejected: usize,
     },
@@ -930,6 +993,10 @@ where
             Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded { .. } => {
                 GeneratedIcmpv4Trace::FragmentationNeededClockRegression
             }
+            Icmpv4ErrorKind::DestinationUnreachableSourceRouteFailed
+            | Icmpv4ErrorKind::ParameterProblem { .. } => {
+                GeneratedIcmpv4Trace::HeaderRefusalClockRegression
+            }
         };
         trace.record_generated_icmpv4(event);
         return Err(ExecuteIcmpv4TimeExceededError::ClockRegression);
@@ -961,6 +1028,13 @@ where
                         destination: queued.action.destination_ip,
                     }
                 }
+                Icmpv4ErrorKind::DestinationUnreachableSourceRouteFailed
+                | Icmpv4ErrorKind::ParameterProblem { .. } => {
+                    GeneratedIcmpv4Trace::HeaderRefusalTxRequested {
+                        egress: queued.action.egress,
+                        destination: queued.action.destination_ip,
+                    }
+                }
             };
             trace.record_generated_icmpv4(event);
             (None, None)
@@ -977,6 +1051,10 @@ where
                 Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded { .. } => {
                     GeneratedIcmpv4Trace::FragmentationNeededAllocationFailed(error)
                 }
+                Icmpv4ErrorKind::DestinationUnreachableSourceRouteFailed
+                | Icmpv4ErrorKind::ParameterProblem { .. } => {
+                    GeneratedIcmpv4Trace::HeaderRefusalAllocationFailed(error)
+                }
             };
             trace.record_generated_icmpv4(event);
             (Some(error), None)
@@ -992,6 +1070,10 @@ where
                 }
                 Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded { .. } => {
                     GeneratedIcmpv4Trace::FragmentationNeededBuildFailed(error)
+                }
+                Icmpv4ErrorKind::DestinationUnreachableSourceRouteFailed
+                | Icmpv4ErrorKind::ParameterProblem { .. } => {
+                    GeneratedIcmpv4Trace::HeaderRefusalBuildFailed(error)
                 }
             };
             trace.record_generated_icmpv4(event);
@@ -1018,6 +1100,13 @@ where
         }
         Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded { .. } => {
             GeneratedIcmpv4Trace::FragmentationNeededBatchCompleted {
+                accepted: completion.accepted,
+                rejected: completion.rejected,
+            }
+        }
+        Icmpv4ErrorKind::DestinationUnreachableSourceRouteFailed
+        | Icmpv4ErrorKind::ParameterProblem { .. } => {
+            GeneratedIcmpv4Trace::HeaderRefusalBatchCompleted {
                 accepted: completion.accepted,
                 rejected: completion.rejected,
             }
@@ -1077,6 +1166,7 @@ fn build_icmpv4_error(frame: &mut [u8], action: &Icmpv4ErrorAction) {
     frame[24..26].copy_from_slice(&header_checksum.to_be_bytes());
     frame[34] = action.kind.icmp_type();
     frame[35] = action.kind.icmp_code();
+    frame[38] = action.kind.parameter_pointer();
     frame[40..42].copy_from_slice(&action.kind.next_hop_mtu().to_be_bytes());
     frame[42..icmp_end].copy_from_slice(action.quote());
     let icmp_checksum = internet_checksum(&frame[34..icmp_end]);

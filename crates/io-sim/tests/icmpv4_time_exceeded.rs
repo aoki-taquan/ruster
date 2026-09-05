@@ -932,9 +932,12 @@ fn ethernet_group_destination_and_options_suppress_without_mutation() {
     source_route.splice(34..34, [131, 4, 4, 0]);
     source_route[14] = 0x46;
     replace_ipv4_word(&mut source_route, 16, 24);
-    for (original, reason) in [
-        (group, DropReason::Ipv4EthernetDestinationMulticast),
-        (source_route, DropReason::Ipv4SourceRouteUnsupported),
+    // A group destination is suppressed entirely (RFC 1812 §4.3.2.7); a refused
+    // source route is reported with Code 5, because the report says the option
+    // failed rather than anything about the destination.
+    for (original, reason, expected_pending) in [
+        (group, DropReason::Ipv4EthernetDestinationMulticast, 0),
+        (source_route, DropReason::Ipv4SourceRouteUnsupported, 1),
     ] {
         let mut rs = [ResolutionStateSlot::EMPTY; 1];
         let mut ra = [ResolutionActionSlot::EMPTY; 1];
@@ -956,7 +959,7 @@ fn ethernet_group_destination_and_options_suppress_without_mutation() {
         let recycled = io.pop_recycled().unwrap();
         assert_eq!(recycled.cause, RecycleCause::Forwarding(reason));
         assert_eq!(recycled.bytes, original);
-        assert_eq!(errors.pending_actions(), 0);
+        assert_eq!(errors.pending_actions(), expected_pending);
     }
 }
 

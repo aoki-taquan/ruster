@@ -354,3 +354,113 @@ fn the_drop_reason_names_are_stable() {
     );
     let _ = NoTrace;
 }
+
+/// Builds a forwardable datagram carrying `options` in its header.
+fn frame_with_options(options: &[u8]) -> Vec<u8> {
+    assert_eq!(options.len() % 4, 0);
+    let header_len = 20 + options.len();
+    let total_len = header_len + 8;
+    let mut bytes = vec![0; 14 + total_len];
+    bytes[0..6].copy_from_slice(&LAN_MAC.0);
+    bytes[6..12].copy_from_slice(&PREVIOUS_HOP_MAC);
+    bytes[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+    bytes[14] = 0x40 | u8::try_from(header_len / 4).unwrap();
+    bytes[16..18].copy_from_slice(&u16::try_from(total_len).unwrap().to_be_bytes());
+    bytes[20..22].copy_from_slice(&DONT_FRAGMENT.to_be_bytes());
+    bytes[22] = 64;
+    bytes[23] = 17;
+    bytes[26..30].copy_from_slice(&SOURCE.octets());
+    bytes[30..34].copy_from_slice(&DESTINATION.octets());
+    bytes[34..34 + options.len()].copy_from_slice(options);
+    let checksum = ipv4_header_checksum(&bytes[14..14 + header_len]);
+    bytes[24..26].copy_from_slice(&checksum.to_be_bytes());
+    bytes
+}
+
+/// Runs one datagram and returns the ICMP frame it caused, if any.
+fn generated_icmp_for(packet: Vec<u8>) -> Option<Vec<u8>> {
+    let interfaces = interfaces();
+    let bindings = bindings();
+    let routes = routes();
+    let neighbors = neighbors();
+    let snapshot = ForwardingSnapshot::with_ipv4_origin_policy(
+        &routes,
+        &interfaces,
+        &neighbors,
+        &bindings,
+        Ipv4OriginPolicy::new(64).unwrap(),
+    )
+    .unwrap();
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = ResolutionRuntime::new(
+        ResolutionPolicy::new(1_000, 60_000).unwrap(),
+        &mut resolution_states,
+        &mut resolution_actions,
+    );
+    let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(
+        Icmpv4ErrorPolicy::default(),
+        &mut error_states,
+        &mut error_actions,
+    );
+    let mut io = SimIo::new();
+    io.inject(LAN, packet);
+    let batch = io.receive(1).unwrap();
+    forward_batch_with_resolution_and_icmpv4_errors(
+        batch,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        MonotonicMillis(1_000),
+        &mut NoTrace,
+    );
+    let _ = io.pop_recycled();
+    let mut generated_trace = VecGeneratedIcmpv4Trace::default();
+    execute_one_icmpv4_time_exceeded(
+        &mut io,
+        &mut errors,
+        MonotonicMillis(1_000),
+        &mut generated_trace,
+    )
+    .unwrap()?;
+    io.pop_tx().map(|tx| tx.bytes)
+}
+
+#[test]
+fn a_refused_source_route_is_reported_as_source_route_failed() {
+    // RFC 792 Destination Unreachable Code 5.
+    let bytes = generated_icmp_for(frame_with_options(&[131, 4, 4, 0]))
+        .expect("a refused source route must be reported");
+    assert_eq!(bytes[34], 3, "Destination Unreachable");
+    assert_eq!(bytes[35], 5, "Source Route Failed");
+    assert_eq!(&bytes[38..42], &[0, 0, 0, 0], "the unused field stays zero");
+    assert_eq!(internet_checksum(&bytes[34..]), 0);
+}
+
+#[test]
+fn a_malformed_option_is_reported_as_a_parameter_problem_with_its_pointer() {
+    // RFC 792 Parameter Problem: the pointer counts octets from the start of
+    // the IPv4 header, so an option length at header offset 21 reports 21.
+    let bytes = generated_icmp_for(frame_with_options(&[7, 1, 0, 0]))
+        .expect("a malformed option must be reported");
+    assert_eq!(bytes[34], 12, "Parameter Problem");
+    assert_eq!(bytes[35], 0, "pointer indicates the error");
+    assert_eq!(bytes[38], 21, "the pointer names the bad length octet");
+    assert_eq!(
+        &bytes[39..42],
+        &[0, 0, 0],
+        "the rest of the field stays zero"
+    );
+    assert_eq!(internet_checksum(&bytes[34..]), 0);
+}
+
+#[test]
+fn a_malformed_option_after_padding_points_past_the_padding() {
+    // Two no-operations then a bad length: the pointer must count them.
+    let bytes = generated_icmp_for(frame_with_options(&[1, 1, 7, 1]))
+        .expect("a malformed option must be reported");
+    assert_eq!(bytes[34], 12);
+    assert_eq!(bytes[38], 23, "the pointer follows the two padding octets");
+}

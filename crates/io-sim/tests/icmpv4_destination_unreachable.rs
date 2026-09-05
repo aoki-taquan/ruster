@@ -632,7 +632,9 @@ fn route_miss_suppression_matrix_and_options_are_atomic() {
     let source_route = source_route_frame();
     for (original, expected_pending, expected_reason) in [
         (first, 1, DropReason::RouteMiss),
-        (source_route, 0, DropReason::Ipv4SourceRouteUnsupported),
+        // RFC 792 Code 5: a refused source route is reported, and the report
+        // says the option failed rather than anything about the route table.
+        (source_route, 1, DropReason::Ipv4SourceRouteUnsupported),
     ] {
         let mut rs = [ResolutionStateSlot::EMPTY; 1];
         let mut ra = [ResolutionActionSlot::EMPTY; 1];
