@@ -22,7 +22,7 @@ use std::{
 };
 
 use ruster_core::{
-    forward_batch, ipv4_header_checksum, ForwardingSnapshot, IfId, Interface, Ipv4Mtu, Ipv4Address,
+    forward_batch, ipv4_header_checksum, ForwardingSnapshot, IfId, Interface, Ipv4Address, Ipv4Mtu,
     MacAddress, Neighbor, PacketIo, PublicationQuiescenceBackend, Route,
 };
 use ruster_io_conformance::{

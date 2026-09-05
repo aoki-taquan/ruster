@@ -4,10 +4,10 @@ use ruster_core::{
     internet_checksum, ipv4_header_checksum, DropReason, DynamicNeighborSlot, ExecuteIcmpv4Error,
     ForwardingSnapshot, GeneratedAllocationError, GeneratedIcmpv4Trace, Icmpv4ErrorActionSlot,
     Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
-    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Mtu, Ipv4Address, Ipv4OriginPolicy, LocalIpv4Binding,
-    MacAddress, MonotonicMillis, Neighbor, NoGeneratedIcmpv4Trace, NoTrace, PacketIo,
-    ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
-    TraceEvent,
+    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4Mtu, Ipv4OriginPolicy,
+    LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoGeneratedIcmpv4Trace, NoTrace,
+    PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot,
+    Route, TraceEvent,
 };
 use ruster_io_sim::{FrameOrigin, RecycleCause, SimIo, VecGeneratedIcmpv4Trace, VecTrace};
 

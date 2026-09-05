@@ -2,12 +2,12 @@ use std::{fmt, mem::size_of, net::Ipv4Addr, num::ParseIntError};
 
 use ruster_core::{
     validate_firewall_rules, DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallAction,
-    FirewallConfigError, FirewallInterface, Ipv4Mtu, FirewallIpv4Prefix, FirewallIpv4PrefixError,
+    FirewallConfigError, FirewallInterface, FirewallIpv4Prefix, FirewallIpv4PrefixError,
     FirewallPolicy, FirewallPolicyError, FirewallPortRange, FirewallPortRangeError,
     FirewallProtocol, FirewallRule, FirewallRuleId, FirewallStateSlot, ForwardingSnapshot,
     Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, Icmpv4ErrorStateSlot, IfId,
-    Interface, Ipv4Address, Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding, MacAddress,
-    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpMappingSlot,
+    Interface, Ipv4Address, Ipv4Mtu, Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding,
+    MacAddress, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpMappingSlot,
     Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpConfigError,
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor,
     PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy,

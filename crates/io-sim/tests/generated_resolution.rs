@@ -5,7 +5,7 @@ use ruster_core::{
     poll_resolution_timers, ArpRequestBuildError, BatchCompletion, DropReason,
     ExecuteArpRequestError, ForwardingSnapshot, GeneratedAllocationError, GeneratedBatchCompletion,
     GeneratedPacketBatch, GeneratedPacketIo, GeneratedPacketLease, GeneratedPacketSlot,
-    GeneratedSlotCompletion, IfId, Interface, Ipv4Mtu, Ipv4Address, LocalIpv4Binding, MacAddress,
+    GeneratedSlotCompletion, IfId, Interface, Ipv4Address, Ipv4Mtu, LocalIpv4Binding, MacAddress,
     MonotonicMillis, Neighbor, NoResolutionTimerTrace, NoTrace, PacketIo, ResolutionActionSlot,
     ResolutionPolicy, ResolutionPolicyError, ResolutionResult, ResolutionRuntime,
     ResolutionStateSlot, Route, TraceEvent, ETHERNET_HEADER_LEN,

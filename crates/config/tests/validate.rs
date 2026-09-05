@@ -8,7 +8,7 @@ use ruster_config::{
 };
 use ruster_core::{
     DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallRuleId, FirewallStateSlot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Nat44TcpMappingSlot, Nat44TcpSessionSlot,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Ipv4Mtu, Nat44TcpMappingSlot, Nat44TcpSessionSlot,
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot,
     ResolutionFailureHoldSlot, ResolutionStateSlot, RouteError,
 };
@@ -1724,4 +1724,68 @@ fn firewall_nested_error_path_retains_table_and_index() {
             PathSegment::Field("source".to_owned()),
         ]
     );
+}
+
+// The MTU field was added after this schema shipped, so an interface that
+// does not state one must keep meaning exactly what it meant before: a
+// standard Ethernet link.
+#[test]
+fn an_interface_without_an_mtu_keeps_the_ethernet_default() {
+    let config = validated(VALID);
+    for interface in config.core_interfaces() {
+        assert_eq!(interface.mtu, Ipv4Mtu::ETHERNET);
+    }
+}
+
+#[test]
+fn a_stated_mtu_reaches_the_core_interface() {
+    let source = VALID.replacen(
+        "mac = \"02:00:00:00:00:02\"",
+        "mac = \"02:00:00:00:00:02\"\nmtu = 9000",
+        1,
+    );
+    let config = validated(&source);
+    let wan = config
+        .interfaces()
+        .iter()
+        .position(|binding| binding.name() == "wan")
+        .expect("fixture has a wan interface");
+    assert_eq!(config.core_interfaces()[wan].mtu.bytes(), 9000);
+}
+
+// RFC 791 §3.2: every IPv4 implementation must be able to forward a 68-byte
+// datagram, so a link that declares less cannot carry IPv4 at all. The
+// boundary is checked from both sides so the comparison cannot be off by one.
+#[test]
+fn an_mtu_below_the_ipv4_minimum_is_rejected_and_the_minimum_is_accepted() {
+    let below = VALID.replacen(
+        "mac = \"02:00:00:00:00:02\"",
+        "mac = \"02:00:00:00:00:02\"\nmtu = 67",
+        1,
+    );
+    let error = error(&below);
+    assert_eq!(error.code(), ValidationCode::MtuBelowIpv4Minimum);
+
+    let exact = VALID.replacen(
+        "mac = \"02:00:00:00:00:02\"",
+        "mac = \"02:00:00:00:00:02\"\nmtu = 68",
+        1,
+    );
+    let config = validated(&exact);
+    let wan = config
+        .interfaces()
+        .iter()
+        .position(|binding| binding.name() == "wan")
+        .expect("fixture has a wan interface");
+    assert_eq!(config.core_interfaces()[wan].mtu, Ipv4Mtu::MINIMUM);
+}
+
+#[test]
+fn an_mtu_of_zero_is_rejected_rather_than_read_as_absent() {
+    let source = VALID.replacen(
+        "mac = \"02:00:00:00:00:02\"",
+        "mac = \"02:00:00:00:00:02\"\nmtu = 0",
+        1,
+    );
+    assert_eq!(error(&source).code(), ValidationCode::MtuBelowIpv4Minimum);
 }

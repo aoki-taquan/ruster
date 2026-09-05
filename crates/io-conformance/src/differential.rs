@@ -9,8 +9,8 @@
 //! [`crate::differential_live`] and owns the real native backend setup.
 
 use ruster_core::{
-    forward_batch, BatchCompletion, DropReason, ForwardingSnapshot, IfId, Interface, Ipv4Mtu, Ipv4Address,
-    MacAddress, Neighbor, NoTrace, PacketBatch, PacketLease, PacketSlot,
+    forward_batch, BatchCompletion, DropReason, ForwardingSnapshot, IfId, Interface, Ipv4Address,
+    Ipv4Mtu, MacAddress, Neighbor, NoTrace, PacketBatch, PacketLease, PacketSlot,
     PublicationQuiescenceDisposition, Route, SlotCompletion,
 };
 use ruster_io_afpacket::{TxFrameModel, TxOwnership};

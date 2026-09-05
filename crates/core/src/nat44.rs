@@ -7124,7 +7124,7 @@ impl<'a> Nat44TcpRuntime<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Interface, LocalIpv4Binding, MacAddress, Neighbor, Route};
+    use crate::{Interface, Ipv4Mtu, LocalIpv4Binding, MacAddress, Neighbor, Route};
 
     const INSIDE: IfId = IfId(1);
     const OUTSIDE: IfId = IfId(2);

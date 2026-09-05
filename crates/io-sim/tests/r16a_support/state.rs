@@ -2,9 +2,9 @@ use super::{support::UdpTestIndexes, targets::V1_SEEDS};
 use ruster_core::{
     internet_checksum, ipv4_header_checksum, DropReason, DynamicNeighborSlot, FirewallAction,
     FirewallAuthorityEvidence, FirewallConfig, FirewallCounters, FirewallHashKey,
-    FirewallInterface, Ipv4Mtu, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange, FirewallProtocol,
+    FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange, FirewallProtocol,
     FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot, ForwardingSnapshot, IfId,
-    Interface, Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis,
+    Interface, Ipv4Address, Ipv4Mtu, LocalIpv4Binding, MacAddress, MonotonicMillis,
     Nat44TcpAuthorityEvidence, Nat44TcpConfig, Nat44TcpCounters, Nat44TcpMappingSlot,
     Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpAuthorityEvidence,
     Nat44UdpConfig, Nat44UdpCounters, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,

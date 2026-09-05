@@ -2,11 +2,11 @@ mod support;
 
 use ruster_core::{
     internet_checksum, ipv4_header_checksum, rfc1624_update, ConsumeReason, DropReason,
-    DynamicNeighborSlot, ForwardingSnapshot, IfId, Interface, Ipv4Mtu, Ipv4Address, LocalIpv4Binding,
-    MacAddress, MonotonicMillis, Nat44Icmpv4Disposition, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
-    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot,
-    Nat44UdpPeerSlot, Nat44UdpPolicy, Neighbor, NoTrace, ResolutionActionSlot, ResolutionPolicy,
-    ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent,
+    DynamicNeighborSlot, ForwardingSnapshot, IfId, Interface, Ipv4Address, Ipv4Mtu,
+    LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Icmpv4Disposition, Nat44Icmpv4ErrorPolicy,
+    Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpSessionSlot, Nat44UdpConfig,
+    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Neighbor, NoTrace, ResolutionActionSlot,
+    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 use support::UdpTestIndexes;

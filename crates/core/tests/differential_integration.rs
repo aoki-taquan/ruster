@@ -12,8 +12,7 @@ use std::cell::RefCell;
 use ruster_core::{
     forward_batch, ipv4_header_checksum, BatchCompletion, ForwardingSnapshot, IfId, Ipv4Address,
     Ipv4Mtu, MacAddress, NoTrace, PacketBatch, PacketLease, PacketSlot,
-    PublicationQuiescenceDisposition,
-    Route, SlotCompletion,
+    PublicationQuiescenceDisposition, Route, SlotCompletion,
 };
 
 const LAN: IfId = IfId(11);

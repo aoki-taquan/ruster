@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use ruster_core::{
     forward_batch_with_resolution, internet_checksum, validate_ipv4_frame, ArpRequestAction,
     BatchCompletion, BatchReport, ConsumeReason, DropReason, DynamicNeighborSlot,
-    ForwardingSnapshot, IfId, Interface, Ipv4Mtu, Ipv4Address, LocalIpv4Binding, MacAddress,
+    ForwardingSnapshot, IfId, Interface, Ipv4Address, Ipv4Mtu, LocalIpv4Binding, MacAddress,
     MonotonicMillis, Neighbor, NoTrace, PacketIo, ResolutionActionSlot, ResolutionCounters,
     ResolutionFailureCounters, ResolutionPhase, ResolutionPolicy, ResolutionRuntime,
     ResolutionStateSlot, ResolutionStatus, Route, ETHERNET_HEADER_LEN,

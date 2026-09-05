@@ -21,7 +21,9 @@ pub enum Icmpv4ErrorKind {
     /// it and the sender set DF. `next_hop_mtu` is the MTU of the link the
     /// datagram could not cross, reported so the sender can lower its path
     /// MTU without probing.
-    DestinationUnreachableFragmentationNeeded { next_hop_mtu: u16 },
+    DestinationUnreachableFragmentationNeeded {
+        next_hop_mtu: u16,
+    },
 }
 
 impl Icmpv4ErrorKind {
@@ -245,6 +247,10 @@ pub enum Icmpv4ErrorDisposition {
         egress: IfId,
         quote_len: usize,
     },
+    FragmentationNeededQueued {
+        egress: IfId,
+        quote_len: usize,
+    },
     Pending {
         egress: IfId,
     },
@@ -290,6 +296,7 @@ pub struct Icmpv4ErrorCounters {
     pub queued_time_exceeded: usize,
     pub queued_destination_unreachable: usize,
     pub queued_host_unreachable: usize,
+    pub queued_fragmentation_needed: usize,
     pub pending: usize,
     pub rate_limited: usize,
     pub state_full: usize,
@@ -314,6 +321,7 @@ pub struct Icmpv4ErrorCounters {
     pub dequeued_time_exceeded: usize,
     pub dequeued_destination_unreachable: usize,
     pub dequeued_host_unreachable: usize,
+    pub dequeued_fragmentation_needed: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -574,6 +582,10 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 self.counters.queued += 1;
                 self.counters.queued_host_unreachable += 1;
             }
+            Icmpv4ErrorDisposition::FragmentationNeededQueued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_fragmentation_needed += 1;
+            }
             Icmpv4ErrorDisposition::Pending { .. } => self.counters.pending += 1,
             Icmpv4ErrorDisposition::RateLimited { .. } => {
                 self.counters.rate_limited += 1;
@@ -714,6 +726,12 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                     quote_len: action.quote_len(),
                 }
             }
+            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded { .. } => {
+                Icmpv4ErrorDisposition::FragmentationNeededQueued {
+                    egress: action.egress,
+                    quote_len: action.quote_len(),
+                }
+            }
         };
         self.record_suppression(disposition)
     }
@@ -760,6 +778,9 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             }
             Icmpv4ErrorKind::DestinationUnreachableHost => {
                 self.counters.dequeued_host_unreachable += 1;
+            }
+            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded { .. } => {
+                self.counters.dequeued_fragmentation_needed += 1;
             }
         }
         if let Some(state) = self.states.get_mut(queued.state_index).filter(|state| {
@@ -812,9 +833,12 @@ pub enum GeneratedIcmpv4Trace {
     DestinationUnreachableBuildFailed(Icmpv4ErrorBuildError),
     HostUnreachableAllocationFailed(GeneratedAllocationError),
     HostUnreachableBuildFailed(Icmpv4ErrorBuildError),
+    FragmentationNeededAllocationFailed(GeneratedAllocationError),
+    FragmentationNeededBuildFailed(Icmpv4ErrorBuildError),
     ClockRegression,
     DestinationUnreachableClockRegression,
     HostUnreachableClockRegression,
+    FragmentationNeededClockRegression,
     TxRequested {
         egress: IfId,
         destination: Ipv4Address,
@@ -827,6 +851,10 @@ pub enum GeneratedIcmpv4Trace {
         egress: IfId,
         destination: Ipv4Address,
     },
+    FragmentationNeededTxRequested {
+        egress: IfId,
+        destination: Ipv4Address,
+    },
     BatchCompleted {
         accepted: usize,
         rejected: usize,
@@ -836,6 +864,10 @@ pub enum GeneratedIcmpv4Trace {
         rejected: usize,
     },
     HostUnreachableBatchCompleted {
+        accepted: usize,
+        rejected: usize,
+    },
+    FragmentationNeededBatchCompleted {
         accepted: usize,
         rejected: usize,
     },
@@ -895,6 +927,9 @@ where
             Icmpv4ErrorKind::DestinationUnreachableHost => {
                 GeneratedIcmpv4Trace::HostUnreachableClockRegression
             }
+            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded { .. } => {
+                GeneratedIcmpv4Trace::FragmentationNeededClockRegression
+            }
         };
         trace.record_generated_icmpv4(event);
         return Err(ExecuteIcmpv4TimeExceededError::ClockRegression);
@@ -920,6 +955,12 @@ where
                         destination: queued.action.destination_ip,
                     }
                 }
+                Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded { .. } => {
+                    GeneratedIcmpv4Trace::FragmentationNeededTxRequested {
+                        egress: queued.action.egress,
+                        destination: queued.action.destination_ip,
+                    }
+                }
             };
             trace.record_generated_icmpv4(event);
             (None, None)
@@ -933,6 +974,9 @@ where
                 Icmpv4ErrorKind::DestinationUnreachableHost => {
                     GeneratedIcmpv4Trace::HostUnreachableAllocationFailed(error)
                 }
+                Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded { .. } => {
+                    GeneratedIcmpv4Trace::FragmentationNeededAllocationFailed(error)
+                }
             };
             trace.record_generated_icmpv4(event);
             (Some(error), None)
@@ -945,6 +989,9 @@ where
                 }
                 Icmpv4ErrorKind::DestinationUnreachableHost => {
                     GeneratedIcmpv4Trace::HostUnreachableBuildFailed(error)
+                }
+                Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded { .. } => {
+                    GeneratedIcmpv4Trace::FragmentationNeededBuildFailed(error)
                 }
             };
             trace.record_generated_icmpv4(event);
@@ -965,6 +1012,12 @@ where
         }
         Icmpv4ErrorKind::DestinationUnreachableHost => {
             GeneratedIcmpv4Trace::HostUnreachableBatchCompleted {
+                accepted: completion.accepted,
+                rejected: completion.rejected,
+            }
+        }
+        Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded { .. } => {
+            GeneratedIcmpv4Trace::FragmentationNeededBatchCompleted {
                 accepted: completion.accepted,
                 rejected: completion.rejected,
             }

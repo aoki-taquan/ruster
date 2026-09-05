@@ -1,6 +1,6 @@
 use ruster_core::{
     forward_batch_with_resolution, validate_ipv4_frame, DropReason, DynamicNeighborSlot,
-    ForwardingSnapshot, IfId, Interface, Ipv4Mtu, Ipv4Address, LocalIpv4Binding, MacAddress,
+    ForwardingSnapshot, IfId, Interface, Ipv4Address, Ipv4Mtu, LocalIpv4Binding, MacAddress,
     MonotonicMillis, Neighbor, NoTrace, PacketIo, ResolutionActionSlot, ResolutionPolicy,
     ResolutionRuntime, ResolutionStateSlot, Route, ETHERNET_HEADER_LEN,
 };

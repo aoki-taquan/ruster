@@ -7,7 +7,7 @@ use ruster_core::{
     GeneratedBatchCompletion, GeneratedIcmpv4Trace, GeneratedPacketBatch, GeneratedPacketIo,
     GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion, Icmpv4ErrorActionSlot,
     Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Icmpv4TimeExceededBuildError,
-    Icmpv4TimeExceededDisposition, IfId, Interface, Ipv4Mtu, Ipv4Address, Ipv4OriginPolicy,
+    Icmpv4TimeExceededDisposition, IfId, Interface, Ipv4Address, Ipv4Mtu, Ipv4OriginPolicy,
     LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoGeneratedIcmpv4Trace,
     NoGeneratedTrace, NoTrace, PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime,
     ResolutionStateSlot, Route, TraceEvent,

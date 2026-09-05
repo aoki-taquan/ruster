@@ -3,8 +3,8 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use ruster_core::{
-    forward_batch, internet_checksum, validate_ipv4_frame, ForwardingSnapshot, IfId, Interface, Ipv4Mtu,
-    Ipv4Address, LocalIpv4Binding, MacAddress, Neighbor, NoTrace, PacketIo, Route,
+    forward_batch, internet_checksum, validate_ipv4_frame, ForwardingSnapshot, IfId, Interface,
+    Ipv4Address, Ipv4Mtu, LocalIpv4Binding, MacAddress, Neighbor, NoTrace, PacketIo, Route,
 };
 
 use crate::{

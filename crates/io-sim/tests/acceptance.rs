@@ -1,8 +1,8 @@
 use ruster_core::{
     forward_batch, ipv4_header_checksum, validate_ipv4_frame, BatchCompletion, ConsumeReason,
-    DropReason, ForwardingSnapshot, IfId, Interface, Ipv4Mtu, Ipv4Address, LocalIpv4Binding, MacAddress,
-    Neighbor, NoTrace, PacketBatch, PacketIo, PacketLease, PacketSlot, Route, SlotCompletion,
-    SnapshotError, TraceEvent, ETHERNET_HEADER_LEN,
+    DropReason, ForwardingSnapshot, IfId, Interface, Ipv4Address, Ipv4Mtu, LocalIpv4Binding,
+    MacAddress, Neighbor, NoTrace, PacketBatch, PacketIo, PacketLease, PacketSlot, Route,
+    SlotCompletion, SnapshotError, TraceEvent, ETHERNET_HEADER_LEN,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 

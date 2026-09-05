@@ -11,7 +11,7 @@ use ruster_core::{
     bind_publication_backend, BoundPublicationBackend, FirewallConfig, FirewallHashKey,
     FirewallPolicy, ForwardingSnapshot, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink,
     GeneratedTraceSink, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
-    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Mtu, Ipv4Address, LocalIpv4Binding, MacAddress,
+    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4Mtu, LocalIpv4Binding, MacAddress,
     MatchedPublicationQuiescenceGuard, MonotonicMillis, Nat44TcpConfig, Nat44TcpPolicy,
     Nat44UdpConfig, Nat44UdpPolicy, PublicationOwnerBinding, ResolutionActionSlot,
     ResolutionFailureHoldSlot, ResolutionFailureTrace, ResolutionFailureTraceSink,

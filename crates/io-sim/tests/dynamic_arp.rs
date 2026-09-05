@@ -1,7 +1,7 @@
 use ruster_core::{
     execute_one_arp_request, forward_batch_with_resolution, ipv4_header_checksum, BatchReport,
     ConsumeReason, ControlDisposition, DropReason, DynamicNeighborSlot, ForwardingSnapshot, IfId,
-    Interface, Ipv4Mtu, Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor,
+    Interface, Ipv4Address, Ipv4Mtu, LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor,
     NoGeneratedTrace, PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionPolicyError,
     ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent,
 };

@@ -280,8 +280,9 @@ Statusは`implemented`、`deferred`、`deviation`のいずれかです。test名
 | NAT44-019H private-to-external ICMP error translation | RFC 5508 REQ-5 | — | deferred | ExternalOnly profileの逆方向は未実装 |
 | NAT44-019I hairpin ICMP error traversal | RFC 5508 REQ-7 | — | deferred | hairpin NAT自体とouter/引用の二重変換を未実装 |
 | NAT44-019J other ICMP error type/code translation | RFC 5508 REQ-3/4 | — | deferred | Type 3/Code 4以外はlegacy local control path |
-| NAT44-019K local Packet Too Big generation | RFC 1191 §4, RFC 5508 §7.1.1 | — | deferred | local egress MTU判定とType 3/Code 4生成を未実装 |
-| NAT44-019L DF-zero fragmentation | RFC 5508 §7.1.1, RFC 1812 §5.2.7 | — | deferred | forwarding MTU超過時のIPv4 fragmentation未実装 |
+| IF-001 per-interface IPv4 MTU | RFC 791 §3.2, RFC 1812 §4.2.2.7 | `an_mtu_below_the_ipv4_minimum_is_rejected_and_the_minimum_is_accepted` | implemented | `[[interfaces]] mtu`は省略時1500。68未満は`MtuBelowIpv4Minimum`でtyped reject。egress MTU超過のdatagramをlinkへ出さない |
+| NAT44-019K local Packet Too Big generation | RFC 1191 §4, RFC 5508 §7.1.1 | `an_oversized_datagram_with_dont_fragment_reports_the_next_hop_mtu` | implemented | per-interface MTUをconfigから受け、egress MTU超過かつDF=1をType 3/Code 4で報告する。RFC 1191 §4に従いnext-hop MTUをunused下位16 bitへ入れ、前半2オクテットは0のまま。既存のICMP error suppressionを共有 |
+| NAT44-019L DF-zero fragmentation | RFC 5508 §7.1.1, RFC 1812 §5.2.7 | `an_oversized_datagram_without_dont_fragment_is_dropped_with_its_own_reason` | deferred | fragmentation未実装。`PacketDecision`が1 RX 1 decisionのため1 datagramからN frameを出す経路が無い。MTU超過かつDF=0は`IPV4_FRAGMENTATION_REQUIRED`でtyped dropし、リンクが運べない長さのまま送出しない |
 | NAT44-019M PMTU cache and plateau fallback | RFC 1191 §§5–7 | — | deferred | received MTUによるcache更新、timer、MTU 0推定を未実装 |
 | NAT44-019N RFC 4884 extension parsing | RFC 5508 REQ-3(d), RFC 4884 | — | deferred | optional paddingとextension objectを識別・変換するfull support未実装 |
 | NAT44-020 other transports/features | RFC 3022, RFC 4787, RFC 7857 | — | deferred | ICMP query NAT、static forwards、multi-public、port randomization/parity、minimal stateful sliceを越えるfull packet filter |
