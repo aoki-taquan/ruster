@@ -799,6 +799,7 @@ pub struct ResolutionRuntime<'a> {
     pending_state_count: usize,
     pending_failure_hold_count: usize,
     poll_cursor: usize,
+    neighbor_cursor: usize,
     failure_cursor: usize,
     last_now: Option<MonotonicMillis>,
     last_interface_identity: Option<u64>,
@@ -807,6 +808,14 @@ pub struct ResolutionRuntime<'a> {
     failure_counters: ResolutionFailureCounters,
     hold_counters: ResolutionHoldCounters,
     _worker_local: PhantomData<Rc<()>>,
+}
+
+/// What one bounded pass over the dynamic neighbour cache did.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DynamicNeighborScanReport {
+    pub scanned: usize,
+    pub expired: usize,
+    pub occupied: usize,
 }
 
 impl<'a> ResolutionRuntime<'a> {
@@ -883,6 +892,7 @@ impl<'a> ResolutionRuntime<'a> {
             pending_state_count: 0,
             pending_failure_hold_count: 0,
             poll_cursor: 0,
+            neighbor_cursor: 0,
             failure_cursor: 0,
             last_now: None,
             last_interface_identity: None,
@@ -1097,6 +1107,59 @@ impl<'a> ResolutionRuntime<'a> {
             .iter()
             .filter(|slot| slot.occupied)
             .count()
+    }
+
+    /// Releases dynamic neighbours whose lifetime has run out.
+    ///
+    /// Expiry used to happen only when an entry was looked up or replaced, so
+    /// a neighbour that stopped being addressed kept its slot until something
+    /// else needed it. A bounded round-robin pass keeps the cache honest
+    /// without ever walking the whole table in one tick.
+    pub fn poll_dynamic_neighbors(
+        &mut self,
+        now: MonotonicMillis,
+        scan_budget: usize,
+    ) -> DynamicNeighborScanReport {
+        let mut report = DynamicNeighborScanReport::default();
+        if !self.observe_now(now) || self.dynamic_neighbors.is_empty() || scan_budget == 0 {
+            report.occupied = self.dynamic_neighbor_count();
+            return report;
+        }
+        let scans = scan_budget.min(self.dynamic_neighbors.len());
+        for _ in 0..scans {
+            let index = self.neighbor_cursor;
+            self.neighbor_cursor = (self.neighbor_cursor + 1) % self.dynamic_neighbors.len();
+            report.scanned += 1;
+            let slot = self.dynamic_neighbors[index];
+            if !slot.occupied {
+                continue;
+            }
+            if now.0.saturating_sub(slot.refreshed_at.0) >= self.policy.dynamic_neighbor_ttl_ms {
+                self.dynamic_neighbors[index] = DynamicNeighborSlot::EMPTY;
+                report.expired += 1;
+            }
+        }
+        report.occupied = self.dynamic_neighbor_count();
+        report
+    }
+
+    /// Drops learned neighbours on demand, and reports how many went.
+    ///
+    /// `interface` selects one link; `None` clears every learned neighbour.
+    /// Static neighbours live in the forwarding snapshot and are untouched.
+    pub fn flush_dynamic_neighbors(&mut self, interface: Option<IfId>) -> usize {
+        let mut flushed = 0;
+        for slot in self.dynamic_neighbors.iter_mut() {
+            if !slot.occupied {
+                continue;
+            }
+            if interface.is_some_and(|selected| selected != slot.interface) {
+                continue;
+            }
+            *slot = DynamicNeighborSlot::EMPTY;
+            flushed += 1;
+        }
+        flushed
     }
 
     #[must_use]
@@ -6818,5 +6881,151 @@ mod tests {
             runtime.hold_datagram(HOLD_EGRESS, target(10), &frame, MonotonicMillis(99)),
             ResolutionHoldDisposition::ClockRegression
         );
+    }
+
+    #[test]
+    fn an_eager_scan_releases_only_neighbours_past_their_lifetime() {
+        // The cache used to keep an entry until something looked it up, so a
+        // neighbour that stopped being addressed held its slot indefinitely.
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut neighbors = [DynamicNeighborSlot::EMPTY; 4];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+            hold_policy(),
+            &mut states,
+            &mut actions,
+            &mut neighbors,
+        );
+        for last in 1..=3 {
+            runtime.merge_dynamic(
+                HOLD_EGRESS,
+                target(last),
+                HOLD_MAC,
+                true,
+                false,
+                MonotonicMillis(0),
+            );
+        }
+        assert_eq!(runtime.dynamic_neighbor_count(), 3);
+
+        // One millisecond before the lifetime nothing is released, however
+        // much budget the scan is given.
+        let report = runtime.poll_dynamic_neighbors(MonotonicMillis(59_999), 16);
+        assert_eq!(report.expired, 0);
+        assert_eq!(report.occupied, 3);
+
+        // At the lifetime the pass releases what it reaches, and no more.
+        let report = runtime.poll_dynamic_neighbors(MonotonicMillis(60_000), 2);
+        assert_eq!(report.scanned, 2, "the budget bounds the pass");
+        assert_eq!(report.expired, 2);
+        assert_eq!(report.occupied, 1);
+
+        let report = runtime.poll_dynamic_neighbors(MonotonicMillis(60_000), 4);
+        assert_eq!(report.expired, 1);
+        assert_eq!(report.occupied, 0);
+    }
+
+    #[test]
+    fn an_eager_scan_resumes_where_the_last_one_stopped() {
+        // A cursor that restarted would starve the far end of the table.
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut neighbors = [DynamicNeighborSlot::EMPTY; 4];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+            hold_policy(),
+            &mut states,
+            &mut actions,
+            &mut neighbors,
+        );
+        for last in 1..=4 {
+            runtime.merge_dynamic(
+                HOLD_EGRESS,
+                target(last),
+                HOLD_MAC,
+                true,
+                false,
+                MonotonicMillis(0),
+            );
+        }
+        for _ in 0..4 {
+            let report = runtime.poll_dynamic_neighbors(MonotonicMillis(60_000), 1);
+            assert_eq!(report.scanned, 1);
+            assert_eq!(report.expired, 1, "each pass reaches a fresh slot");
+        }
+        assert_eq!(runtime.dynamic_neighbor_count(), 0);
+    }
+
+    #[test]
+    fn an_administrative_flush_selects_one_interface_or_all_of_them() {
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut neighbors = [DynamicNeighborSlot::EMPTY; 4];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+            hold_policy(),
+            &mut states,
+            &mut actions,
+            &mut neighbors,
+        );
+        runtime.merge_dynamic(
+            HOLD_EGRESS,
+            target(1),
+            HOLD_MAC,
+            true,
+            false,
+            MonotonicMillis(0),
+        );
+        runtime.merge_dynamic(
+            HOLD_EGRESS,
+            target(2),
+            HOLD_MAC,
+            true,
+            false,
+            MonotonicMillis(0),
+        );
+        runtime.merge_dynamic(
+            IfId(9),
+            target(3),
+            HOLD_MAC,
+            true,
+            false,
+            MonotonicMillis(0),
+        );
+        assert_eq!(runtime.dynamic_neighbor_count(), 3);
+
+        assert_eq!(runtime.flush_dynamic_neighbors(Some(IfId(9))), 1);
+        assert_eq!(runtime.dynamic_neighbor_count(), 2);
+        assert_eq!(
+            runtime.flush_dynamic_neighbors(Some(IfId(9))),
+            0,
+            "a second flush of the same link has nothing to do"
+        );
+
+        assert_eq!(runtime.flush_dynamic_neighbors(None), 2);
+        assert_eq!(runtime.dynamic_neighbor_count(), 0);
+    }
+
+    #[test]
+    fn an_eager_scan_with_time_moving_backwards_changes_nothing() {
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut neighbors = [DynamicNeighborSlot::EMPTY; 2];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+            hold_policy(),
+            &mut states,
+            &mut actions,
+            &mut neighbors,
+        );
+        runtime.merge_dynamic(
+            HOLD_EGRESS,
+            target(1),
+            HOLD_MAC,
+            true,
+            false,
+            MonotonicMillis(100_000),
+        );
+        let report = runtime.poll_dynamic_neighbors(MonotonicMillis(99_999), 4);
+        assert_eq!(report.scanned, 0);
+        assert_eq!(report.expired, 0);
+        assert_eq!(runtime.dynamic_neighbor_count(), 1);
     }
 }
