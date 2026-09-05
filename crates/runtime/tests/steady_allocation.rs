@@ -1,7 +1,7 @@
 use std::{
     alloc::{GlobalAlloc, Layout, System},
+    cell::Cell,
     num::NonZeroU64,
-    sync::atomic::{AtomicUsize, Ordering},
 };
 
 #[cfg(target_pointer_width = "64")]
@@ -27,11 +27,25 @@ use ruster_runtime::{
 
 struct CountingAllocator;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+// The count is per thread, matching every other allocation suite in this
+// workspace. A process-wide counter also observes allocations made by other
+// threads in the binary, which made this assertion fail under load without
+// any allocation on the measured path.
+thread_local! {
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn record_allocation() {
+    ALLOCATIONS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+fn allocation_count() -> usize {
+    ALLOCATIONS.with(Cell::get)
+}
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        record_allocation();
         // SAFETY: `layout` is the allocator contract supplied by the caller.
         unsafe { System.alloc(layout) }
     }
@@ -42,13 +56,13 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        record_allocation();
         // SAFETY: `layout` is the allocator contract supplied by the caller.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        record_allocation();
         // SAFETY: `pointer` and `layout` came from this allocator.
         unsafe { System.realloc(pointer, layout, size) }
     }
@@ -264,7 +278,7 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         assert_eq!(size_of::<FullServiceView<'static, 'static>>(), 576);
     }
 
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let before = allocation_count();
     for tick in 0..1_024 {
         let report = run_tick(
             &mut publication,
@@ -275,7 +289,7 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         );
         assert!(report.active);
     }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    let after = allocation_count();
 
     assert_eq!(publication.active_calls, 1_024);
     assert_eq!(publication.semantic_validation_calls, 0);
