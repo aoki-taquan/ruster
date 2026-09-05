@@ -496,6 +496,18 @@ pub struct XdpResource<'umem> {
     target_pointer_width = "64"
 )))]
 impl XdpResource<'_> {
+    #[cfg(all(
+        test,
+        not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        ))
+    ))]
+    pub(crate) const fn test_placeholder() -> XdpResource<'static> {
+        XdpResource { _umem: PhantomData }
+    }
+
     /// Explicit teardown is a no-op because unsupported targets never create
     /// an operating-system resource through [`XdpResourceBuilder::build`].
     pub fn close(self) -> Result<(), XdpSetupError> {
@@ -1413,6 +1425,84 @@ mod tests {
         XdpResourceBuilder::new(umem, rings, 7, 3).expect("builder")
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    #[allow(unsafe_code)]
+    fn resource_for_observation(ifindex: u32, queue_id: u32) -> &'static mut XdpResource<'static> {
+        let (umem, _) = valid_config();
+        let rings = RingConfig::new(4, 4, 4, 4).expect("ring config");
+        let fill_layout =
+            RingMmapLayout::new(TEST_OFFSETS.fill, rings.fill(), RingElement::UmemAddress)
+                .expect("fill layout");
+        let completion_layout = RingMmapLayout::new(
+            TEST_OFFSETS.completion,
+            rings.completion(),
+            RingElement::UmemAddress,
+        )
+        .expect("completion layout");
+        let rx_layout =
+            RingMmapLayout::new(TEST_OFFSETS.rx, rings.rx(), RingElement::PacketDescriptor)
+                .expect("rx layout");
+        let tx_layout =
+            RingMmapLayout::new(TEST_OFFSETS.tx, rings.tx(), RingElement::PacketDescriptor)
+                .expect("tx layout");
+
+        let syscalls: &'static FakeSyscalls = Box::leak(Box::new(FakeSyscalls::new()));
+        let fill_mapping =
+            MappedRegion::map_anonymous(syscalls, fill_layout.byte_len()).expect("fill mapping");
+        let completion_mapping =
+            MappedRegion::map_anonymous(syscalls, completion_layout.byte_len())
+                .expect("completion mapping");
+        let rx_mapping =
+            MappedRegion::map_anonymous(syscalls, rx_layout.byte_len()).expect("rx mapping");
+        let tx_mapping =
+            MappedRegion::map_anonymous(syscalls, tx_layout.byte_len()).expect("tx mapping");
+        let socket = OwnedXdpFd::open(syscalls).expect("AF_XDP socket");
+        let bind_flags =
+            ValidatedBindFlags::new(XDP_USE_NEED_WAKEUP).expect("automatic bind flags");
+        let memory: &'static mut [u8] =
+            Box::leak(vec![0_u8; umem.byte_len() as usize].into_boxed_slice());
+
+        let owner: ResourceOwner<'static, 'static, FakeSyscalls> = ResourceOwner {
+            _fill_mapping: fill_mapping,
+            _completion_mapping: completion_mapping,
+            _rx_mapping: rx_mapping,
+            _tx_mapping: tx_mapping,
+            socket,
+            umem_memory: memory,
+            umem,
+            rings,
+            ifindex,
+            queue_id,
+            interface: IfId(11),
+            bind_flags,
+            offsets: TEST_OFFSETS,
+            fill_layout,
+            completion_layout,
+            rx_layout,
+            tx_layout,
+            ownership: XdpOwnership::new(umem),
+            batch_state: BatchState::Idle,
+            fill_wakeup_pending: false,
+            tx_wakeup_pending: false,
+            raw_views_exposed: false,
+        };
+
+        // SAFETY: `ResourceOwner` stores the syscall seam only as references,
+        // so the two monomorphizations have the same representation. These
+        // observations never invoke the retyped syscall methods, and the
+        // returned value is deliberately leaked because its concrete Drop
+        // implementation would dispatch Linux syscalls on fake state.
+        Box::leak(Box::new(unsafe {
+            std::mem::transmute::<ResourceOwner<'static, 'static, FakeSyscalls>, XdpResource<'static>>(
+                owner,
+            )
+        }))
+    }
+
     fn write_u32(memory: &mut [u8], offset: usize, value: u32) {
         memory[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_ne_bytes());
     }
@@ -2033,5 +2123,207 @@ mod tests {
         assert_eq!(builder.queue_id(), 3);
         assert_eq!(builder.umem(), umem);
         assert_eq!(builder.rings(), rings);
+    }
+
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    fn page_aligned_umem_rejects_zero_length_before_an_owner_exists() {
+        // A live Linux PageAlignedUmem is necessarily non-empty because the
+        // mmap seam rejects zero lengths before constructing the owner. This
+        // pins down the invariant behind the Linux is_empty implementation.
+        assert_eq!(
+            PageAlignedUmem::new(0).err(),
+            Some(XdpSetupError::SyscallArgument(
+                XdpSetupArgumentError::ZeroLength {
+                    stage: XdpSetupStage::MapMemory,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    fn resource_accessors_keep_the_bound_setup_identity() {
+        let (umem, _) = valid_config();
+        let resource = resource_for_observation(17, 5);
+
+        assert_eq!(resource.umem(), umem);
+        assert_eq!(
+            resource.rings(),
+            RingConfig::new(4, 4, 4, 4).expect("ring config")
+        );
+        assert_eq!(resource.ifindex(), 17);
+        assert_eq!(resource.interface_id(), IfId(11));
+        assert_eq!(resource.queue_id(), 5);
+        assert_eq!(resource.bind_flags().raw(), XDP_USE_NEED_WAKEUP);
+        assert_eq!(resource.mmap_offsets(), TEST_OFFSETS);
+    }
+
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    fn resource_data_path_observations_follow_batch_views_and_ownership() {
+        let resource = resource_for_observation(7, 3);
+
+        assert!(resource.data_path_is_idle());
+        assert!(!resource.data_path_raw_views_exposed());
+        assert_eq!(resource.data_path_nonquiescent_owner(), None);
+
+        resource.inner.batch_state = BatchState::Rx;
+        assert!(!resource.data_path_is_idle());
+        resource.inner.batch_state = BatchState::Idle;
+
+        resource.inner.raw_views_exposed = true;
+        assert!(resource.data_path_raw_views_exposed());
+        resource.inner.raw_views_exposed = false;
+
+        resource
+            .inner
+            .initialize_data_path()
+            .expect("initial fill publication");
+        assert_eq!(resource.data_path_nonquiescent_owner(), None);
+
+        {
+            let mut core = resource
+                .inner
+                .make_data_path_core(BatchState::Maintenance)
+                .expect("test data path core");
+            core.reserve_generated_frame(8)
+                .expect("reserve generated frame")
+                .expect("generated frame available");
+            core.release_state();
+        }
+        assert_eq!(
+            resource.data_path_nonquiescent_owner(),
+            Some((1, crate::XdpChunkState::Leased))
+        );
+    }
+
+    #[test]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    fn map_ring_rejects_a_length_beyond_the_native_address_space_before_mmap() {
+        let syscalls = FakeSyscalls::new();
+        let socket = OwnedXdpFd::open(&syscalls).expect("fake socket");
+        let layout = RingMmapLayout::new(
+            XdpRingOffset {
+                descriptors: u64::try_from(i64::MAX).expect("i64 max") - 7,
+                ..TEST_OFFSETS.fill
+            },
+            RingEntries::new(RingName::Fill, 1).expect("one entry"),
+            RingElement::UmemAddress,
+        )
+        .expect("checked large layout");
+        let length = layout.byte_len();
+        assert_eq!(length, usize::try_from(i64::MAX).expect("usize") + 1);
+
+        assert_eq!(
+            map_ring(&socket, RingName::Fill, layout, 0).err(),
+            Some(XdpSetupError::RingMmapLengthExceedsAddressSpace {
+                ring: RingName::Fill,
+                length,
+            })
+        );
+        assert!(!syscalls
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::Mmap { .. })));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    fn map_ring_accepts_a_length_equal_to_the_native_address_space() {
+        let syscalls = FakeSyscalls::new();
+        let socket = OwnedXdpFd::open(&syscalls).expect("fake socket");
+        let length = isize::MAX as usize;
+
+        // All valid kernel ring extents end on an alignment boundary, so an
+        // ordinary checked layout cannot end at odd `isize::MAX`. Construct a
+        // test-only layout with the exact length to exercise map_ring's own
+        // address-space guard without allocating that enormous mapping.
+        let layout =
+            unsafe { std::mem::transmute::<[usize; 5], RingMmapLayout>([0, 64, 128, 192, length]) };
+        assert_eq!(
+            (
+                layout.producer(),
+                layout.consumer(),
+                layout.flags(),
+                layout.descriptors(),
+                layout.byte_len(),
+            ),
+            (0, 64, 128, 192, length)
+        );
+
+        syscalls.set_next_mmap_address(0);
+        let mapping = map_ring(&socket, RingName::Fill, layout, 0)
+            .expect("isize::MAX ring length is representable");
+        assert_eq!(mapping.byte_len(), length);
+        assert!(syscalls.calls().iter().any(|call| {
+            matches!(
+                call,
+                Call::Mmap {
+                    fd: 17,
+                    byte_len,
+                    offset: 0,
+                } if *byte_len == length
+            )
+        }));
+    }
+
+    #[test]
+    #[cfg(not(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    )))]
+    fn unsupported_platform_placeholders_keep_their_contract() {
+        let expected = if !cfg!(target_os = "linux") {
+            crate::NativeSyscallPlatformError::UnsupportedOperatingSystem
+        } else if !cfg!(target_pointer_width = "64") {
+            crate::NativeSyscallPlatformError::UnsupportedPointerWidth
+        } else {
+            crate::NativeSyscallPlatformError::UnsupportedArchitecture
+        };
+        assert_eq!(native_platform_error(), expected);
+
+        let (umem, rings) = valid_config();
+        let builder = XdpResourceBuilder::new(umem, rings, 7, 3).expect("builder");
+        let mut memory = vec![0_u8; umem.byte_len() as usize];
+        assert_eq!(
+            builder.build(&mut memory),
+            Err(XdpSetupError::Platform(expected))
+        );
+
+        let mut owner = PageAlignedUmem {
+            _unsupported: std::marker::PhantomData,
+        };
+        assert_eq!(owner.len(), 0);
+        assert!(owner.is_empty());
+        assert!(owner.as_mut_slice().is_empty());
+        assert_eq!(owner.close(), Ok(()));
+
+        let resource = XdpResource {
+            _umem: std::marker::PhantomData,
+        };
+        assert_eq!(resource.close(), Ok(()));
     }
 }

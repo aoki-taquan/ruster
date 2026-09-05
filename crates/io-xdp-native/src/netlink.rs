@@ -1354,6 +1354,125 @@ mod tests {
         }
     }
 
+    struct ConfigurableNetlinkSyscalls {
+        calls: RefCell<Vec<Call>>,
+        responses: RefCell<Vec<FakeReceive>>,
+        portid: u32,
+        socket_fd: RawFd,
+        duplicate_fd: RawFd,
+        address_length: u32,
+        close_error: Option<Errno>,
+    }
+
+    impl ConfigurableNetlinkSyscalls {
+        fn new(responses: Vec<FakeResponse>) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                responses: RefCell::new(responses.into_iter().map(FakeReceive::Response).collect()),
+                portid: 0x1122_3344,
+                socket_fd: 77,
+                duplicate_fd: 88,
+                address_length: SOCKADDR_NL_LEN as u32,
+                close_error: None,
+            }
+        }
+
+        fn calls(&self) -> Vec<Call> {
+            self.calls.borrow().clone()
+        }
+
+        fn with_socket_fd(mut self, socket_fd: RawFd) -> Self {
+            self.socket_fd = socket_fd;
+            self
+        }
+
+        fn with_duplicate_fd(mut self, duplicate_fd: RawFd) -> Self {
+            self.duplicate_fd = duplicate_fd;
+            self
+        }
+
+        fn with_address_length(mut self, address_length: u32) -> Self {
+            self.address_length = address_length;
+            self
+        }
+
+        fn with_close_error(mut self, close_error: Errno) -> Self {
+            self.close_error = Some(close_error);
+            self
+        }
+    }
+
+    impl sealed::Sealed for ConfigurableNetlinkSyscalls {}
+
+    impl NetlinkSyscalls for ConfigurableNetlinkSyscalls {
+        fn socket(&self, domain: i32, kind: i32, protocol: i32) -> Result<RawFd, Errno> {
+            self.calls.borrow_mut().push(Call::Socket {
+                domain,
+                kind,
+                protocol,
+            });
+            Ok(self.socket_fd)
+        }
+
+        fn bind(&self, _fd: RawFd, address: &[u8], _length: u32) -> Result<(), Errno> {
+            self.calls.borrow_mut().push(Call::Bind(address.to_vec()));
+            Ok(())
+        }
+
+        fn getsockname(
+            &self,
+            _fd: RawFd,
+            address: &mut [u8],
+            length: &mut u32,
+        ) -> Result<(), Errno> {
+            self.calls.borrow_mut().push(Call::GetSocketName);
+            address.fill(0);
+            write_u16(address, 0, AF_NETLINK as u16);
+            write_u32(address, 4, self.portid);
+            *length = self.address_length;
+            Ok(())
+        }
+
+        fn dup_cloexec(&self, fd: RawFd) -> Result<RawFd, Errno> {
+            self.calls.borrow_mut().push(Call::Duplicate { fd });
+            Ok(self.duplicate_fd)
+        }
+
+        fn send_netlink(
+            &self,
+            _fd: RawFd,
+            message: &[u8],
+            _destination: &[u8],
+        ) -> Result<usize, Errno> {
+            self.calls.borrow_mut().push(Call::Send(message.to_vec()));
+            Ok(message.len())
+        }
+
+        fn recvmsg(&self, _fd: RawFd, buffer: &mut [u8]) -> Result<RecvMessage, Errno> {
+            self.calls.borrow_mut().push(Call::Receive);
+            let response = self.responses.borrow_mut().remove(0);
+            match response {
+                FakeReceive::Error(error) => Err(error),
+                FakeReceive::Response(response) => {
+                    let copy_len = response.bytes.len().min(buffer.len());
+                    buffer[..copy_len].copy_from_slice(&response.bytes[..copy_len]);
+                    Ok(RecvMessage {
+                        byte_len: response.byte_len,
+                        flags: response.flags,
+                    })
+                }
+            }
+        }
+
+        fn close(&self, fd: RawFd) -> Result<(), Errno> {
+            self.calls.borrow_mut().push(Call::Close { fd });
+            match self.close_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        }
+    }
+
     fn ack(sequence: u32, error: i32) -> FakeResponse {
         let mut bytes = vec![0_u8; NLMSG_ERROR_MESSAGE_LEN];
         write_u32(&mut bytes, 0, NLMSG_ERROR_MESSAGE_LEN as u32);
@@ -1382,6 +1501,26 @@ mod tests {
             .into_iter()
             .filter(|call| matches!(call, Call::Close { .. }))
             .count()
+    }
+
+    fn public_attachment(ifindex: u32, active: bool) -> XdpAttachment {
+        let mode = XdpAttachMode::Skb;
+        XdpAttachment {
+            ifindex,
+            mode,
+            inner: NetlinkAttachment {
+                socket: OwnedNetlinkSocket {
+                    syscalls: &NETLINK_SYSCALLS,
+                    fd: None,
+                    portid: 0,
+                    next_sequence: 1,
+                },
+                ifindex,
+                mode,
+                expected_program_fd: None,
+                active,
+            },
+        }
     }
 
     #[test]
@@ -1921,5 +2060,205 @@ mod tests {
             u32::from_ne_bytes(encoded[8..12].try_into().unwrap()),
             0x5566_7788
         );
+    }
+
+    #[test]
+    fn public_attachment_accessors_preserve_identity_and_active_state() {
+        let mut attachment = public_attachment(37, true);
+        assert_eq!(attachment.ifindex(), 37);
+        let was_active = attachment.is_attached();
+
+        // Make the test-owned value safe to drop without issuing a real
+        // detach request after both active states have been observed.
+        attachment.inner.active = false;
+        assert!(was_active);
+        assert!(!attachment.is_attached());
+    }
+
+    #[test]
+    fn public_detach_propagates_send_failure_and_retains_active_state() {
+        let mode = XdpAttachMode::Skb;
+        let mut attachment = XdpAttachment {
+            ifindex: 1,
+            mode,
+            inner: NetlinkAttachment {
+                socket: OwnedNetlinkSocket {
+                    syscalls: &NETLINK_SYSCALLS,
+                    fd: Some(-1),
+                    portid: 0,
+                    next_sequence: 1,
+                },
+                ifindex: 1,
+                mode,
+                expected_program_fd: Some(-1),
+                active: true,
+            },
+        };
+
+        let result = attachment.detach();
+        assert!(matches!(
+            result,
+            Err(XdpAttachError::Syscall {
+                operation: XdpAttachOperation::SendMessage,
+                ..
+            }) | Err(XdpAttachError::PermissionDenied {
+                operation: XdpAttachOperation::SendMessage,
+            })
+        ));
+        assert!(attachment.is_attached());
+
+        attachment.inner.active = false;
+        attachment.inner.expected_program_fd = None;
+        attachment.inner.socket.fd = None;
+    }
+
+    #[test]
+    fn close_expected_program_fd_reports_close_failure_after_ack() {
+        let fake =
+            ConfigurableNetlinkSyscalls::new(vec![ack(1, 0)]).with_close_error(Errno::Linux(9));
+        let mut attachment = NetlinkAttachment {
+            socket: OwnedNetlinkSocket {
+                syscalls: &fake,
+                fd: Some(77),
+                portid: 0x1122_3344,
+                next_sequence: 1,
+            },
+            ifindex: 7,
+            mode: XdpAttachMode::Skb,
+            expected_program_fd: Some(88),
+            active: true,
+        };
+
+        let result = attachment.detach();
+        assert_eq!(
+            result,
+            Err(XdpAttachError::Syscall {
+                operation: XdpAttachOperation::CloseExpectedProgramFd,
+                errno: Some(9),
+            })
+        );
+        assert!(!attachment.active);
+        assert_eq!(attachment.expected_program_fd, None);
+
+        // Avoid a second best-effort close from this test's owner drop.
+        attachment.socket.fd = None;
+    }
+
+    #[test]
+    fn attach_accepts_zero_program_fd_at_signed_boundary() {
+        let fake = ConfigurableNetlinkSyscalls::new(vec![ack(1, 0), ack(2, 0)]);
+        let mut attachment = attach_with_syscalls(&fake, 0, 7, ValidatedXdpAttachFlags::default())
+            .expect("fd zero is a valid nonnegative input");
+
+        attachment.detach().expect("fake detach ACK");
+    }
+
+    #[test]
+    fn attach_accepts_zero_duplicate_fd_as_an_owned_identity() {
+        let fake =
+            ConfigurableNetlinkSyscalls::new(vec![ack(1, 0), ack(2, 0)]).with_duplicate_fd(0);
+        let mut attachment = attach_with_syscalls(&fake, 23, 7, ValidatedXdpAttachFlags::default())
+            .expect("duplicate fd zero is accepted by the nonnegative contract");
+
+        assert_eq!(attachment.expected_program_fd, Some(0));
+        attachment.detach().expect("fake detach ACK");
+        assert!(fake.calls().contains(&Call::Close { fd: 0 }));
+    }
+
+    #[test]
+    fn socket_open_accepts_zero_fd_and_raw_returns_the_owned_value() {
+        let fake = ConfigurableNetlinkSyscalls::new(Vec::new()).with_socket_fd(0);
+        let socket = OwnedNetlinkSocket::open(&fake).expect("fd zero is a valid socket value");
+        assert_eq!(socket.raw(), 0);
+        drop(socket);
+
+        let fake = ConfigurableNetlinkSyscalls::new(Vec::new()).with_socket_fd(123);
+        let socket = OwnedNetlinkSocket::open(&fake).expect("fake socket open");
+        assert_eq!(socket.raw(), 123);
+        drop(socket);
+    }
+
+    #[test]
+    fn socket_open_rejects_address_lengths_outside_the_checked_buffer() {
+        let too_long = ConfigurableNetlinkSyscalls::new(Vec::new())
+            .with_address_length((SOCKADDR_NL_LEN + 1) as u32);
+        assert!(matches!(
+            OwnedNetlinkSocket::open(&too_long),
+            Err(XdpAttachError::PortIdResponseTooLong { .. })
+        ));
+
+        let too_short = ConfigurableNetlinkSyscalls::new(Vec::new())
+            .with_address_length((SOCKADDR_NL_LEN - 1) as u32);
+        assert!(matches!(
+            OwnedNetlinkSocket::open(&too_short),
+            Err(XdpAttachError::PortIdResponseTooShort { .. })
+        ));
+    }
+
+    #[test]
+    fn netlink_error_message_extent_is_the_fixed_header_plus_error_size() {
+        assert_eq!(NLMSG_HDRLEN, 16);
+        assert_eq!(NLMSGERR_LEN, 20);
+        assert_eq!(NLMSG_ERROR_MESSAGE_LEN, 36);
+        assert_eq!(ack(1, 0).bytes.len(), 36);
+    }
+
+    #[test]
+    fn inspect_ack_accepts_zero_but_rejects_positive_error_codes() {
+        let success = ack(11, 0);
+        assert_eq!(
+            inspect_ack(
+                &success.bytes,
+                RecvMessage {
+                    byte_len: success.byte_len,
+                    flags: success.flags,
+                },
+                11,
+                XdpAttachOperation::Attach,
+            ),
+            Ok(())
+        );
+
+        let malformed = ack(12, 1);
+        assert_eq!(
+            inspect_ack(
+                &malformed.bytes,
+                RecvMessage {
+                    byte_len: malformed.byte_len,
+                    flags: malformed.flags,
+                },
+                12,
+                XdpAttachOperation::Attach,
+            ),
+            Err(XdpAttachError::InvalidErrorCode { code: 1 })
+        );
+    }
+
+    #[test]
+    fn report_drop_error_writes_context_and_error_to_stderr() {
+        const CHILD_ENV: &str = "RUSTER_NETLINK_REPORT_DROP_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            report_drop_error(
+                "netlink-drop-test",
+                &XdpAttachError::Syscall {
+                    operation: XdpAttachOperation::CloseSocket,
+                    errno: Some(9),
+                },
+            );
+            return;
+        }
+
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("the unit-test executable is available"),
+        )
+        .arg("report_drop_error_writes_context_and_error_to_stderr")
+        .arg("--nocapture")
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("spawn report child");
+        assert!(output.status.success(), "child failed: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("netlink-drop-test"), "stderr: {stderr}");
+        assert!(stderr.contains("errno 9"), "stderr: {stderr}");
     }
 }

@@ -754,4 +754,56 @@ mod tests {
         assert_eq!(valid.descriptors(), 200);
         assert_eq!(valid.byte_len(), 208);
     }
+
+    #[test]
+    fn abi_remaining_operator_candidates_have_nonoverlapping_bit_contracts() {
+        // The listed shift-by-zero and OR-to-XOR candidates are equivalent for
+        // these UAPI values. Keep the equivalence explicit: every singleton is
+        // one bit, and the bind-mask operands do not overlap.
+        assert_eq!(
+            [
+                XDP_SHARED_UMEM,
+                XDP_UMEM_UNALIGNED_CHUNK_FLAG as u16,
+                XDP_RING_NEED_WAKEUP as u16,
+                XDP_OPTIONS_ZEROCOPY as u16,
+                XDP_PKT_CONTD as u16,
+            ],
+            [1, 1, 1, 1, 1]
+        );
+
+        let bind_bits = [XDP_SHARED_UMEM, XDP_COPY, XDP_ZEROCOPY, XDP_USE_NEED_WAKEUP];
+        for (index, bit) in bind_bits.iter().copied().enumerate() {
+            assert_eq!(bit.count_ones(), 1);
+            assert!(bind_bits[..index].iter().all(|prior| *prior & bit == 0));
+        }
+        let or_mask = bind_bits
+            .iter()
+            .copied()
+            .fold(0_u16, |mask, bit| mask | bit);
+        let xor_mask = bind_bits
+            .iter()
+            .copied()
+            .fold(0_u16, |mask, bit| mask ^ bit);
+        assert_eq!(or_mask, XDP_SUPPORTED_BIND_FLAGS);
+        assert_eq!(xor_mask, XDP_SUPPORTED_BIND_FLAGS);
+
+        // `producer` is the first C-layout field, so `base + 0` and `base - 0`
+        // are the same address for every ring base.
+        assert_eq!(std::mem::offset_of!(XdpRingOffset, producer), 0);
+        let offsets = XdpMmapOffsets {
+            rx: XdpRingOffset {
+                producer: 0x1111,
+                ..XdpRingOffset::default()
+            },
+            tx: XdpRingOffset {
+                producer: 0x2222,
+                ..XdpRingOffset::default()
+            },
+            ..XdpMmapOffsets::default()
+        };
+        assert_eq!(
+            decode_xdp_mmap_offsets(&encode_xdp_mmap_offsets(offsets)),
+            Some(offsets)
+        );
+    }
 }
