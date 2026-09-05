@@ -168,6 +168,8 @@ pub enum DropReason {
     Ipv4SourceLocalAddress = 145,
     Ipv4FragmentationNeeded = 146,
     Ipv4FragmentationRequired = 147,
+    Ipv4SourceRouteUnsupported = 148,
+    Ipv4OptionsMalformed = 149,
 }
 
 /// The IPv4 Don't Fragment flag inside the flags-and-offset field (RFC 791).
@@ -176,6 +178,12 @@ const IPV4_DONT_FRAGMENT_FLAG: u16 = 0x4000;
 use DropReason::*;
 
 impl DropReason {
+    /// The largest discriminant this enum assigns.
+    ///
+    /// Anything serialising a reason by number needs this bound, and deriving
+    /// it here keeps such a check from going stale when a reason is added.
+    pub const LARGEST_CODE: u16 = Self::Ipv4OptionsMalformed as u16;
+
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
@@ -328,6 +336,8 @@ impl DropReason {
             Ipv4SourceLocalAddress => "IPV4_SOURCE_LOCAL_ADDRESS",
             Ipv4FragmentationNeeded => "IPV4_FRAGMENTATION_NEEDED",
             Ipv4FragmentationRequired => "IPV4_FRAGMENTATION_REQUIRED",
+            Ipv4SourceRouteUnsupported => "IPV4_SOURCE_ROUTE_UNSUPPORTED",
+            Ipv4OptionsMalformed => "IPV4_OPTIONS_MALFORMED",
         }
     }
 }
@@ -2268,9 +2278,7 @@ fn decide_ipv4<T: TraceSink>(
     if local {
         return decide_local_ipv4(frame, snapshot, ingress, ipv4, trace);
     }
-    if ipv4.header_len > 20 {
-        return Err(Ipv4OptionsUnsupported);
-    }
+    validate_ipv4_options(frame, ipv4)?;
     let Some(route) = selected_route else {
         if firewall_config.is_some() {
             return Err(FirewallRouteUnavailable);
@@ -3334,9 +3342,13 @@ fn validate_firewall_transport(
     frame: &[u8],
     ipv4: packet::ValidatedIpv4,
 ) -> Result<ValidatedFirewallTransport, DropReason> {
-    if ipv4.header_len != 20 {
-        return Err(FirewallIpv4OptionsUnsupported);
-    }
+    // The transport validators below already locate the header at
+    // `header_offset + header_len`, so options only need to be well formed and
+    // free of source routing — the same test the forwarding decision applies.
+    validate_ipv4_options(frame, ipv4).map_err(|reason| match reason {
+        Ipv4OptionsMalformed | Ipv4SourceRouteUnsupported => reason,
+        _ => FirewallIpv4OptionsUnsupported,
+    })?;
     let flags_fragment =
         packet::read_u16(frame, ipv4.header_offset + 6).ok_or(FirewallFragmentUnsupported)?;
     if !matches!(flags_fragment & 0x7fff, 0 | 0x4000) {
@@ -5179,6 +5191,74 @@ fn apply_nat44_udp_rewrite(
         .copy_from_slice(&decision.new_port.to_be_bytes());
     frame[decision.udp_checksum_offset..decision.udp_checksum_end]
         .copy_from_slice(&decision.udp_checksum.to_be_bytes());
+    Ok(())
+}
+
+/// The IPv4 option types this router refuses to carry.
+///
+/// Loose and strict source routing ask a router to forward along a path the
+/// sender chose. RFC 1812 §4.2.2.11 lets a router refuse them, and refusing is
+/// what a router on an untrusted network should do: honouring them lets a
+/// sender steer traffic past filtering that assumes the routing table decides
+/// the path. This router also has no source-route reversal, so it could not
+/// answer such a datagram correctly even if it carried it.
+const IPV4_OPTION_LOOSE_SOURCE_ROUTE: u8 = 131;
+const IPV4_OPTION_STRICT_SOURCE_ROUTE: u8 = 137;
+const IPV4_OPTION_END_OF_LIST: u8 = 0;
+const IPV4_OPTION_NO_OPERATION: u8 = 1;
+
+/// Checks the option area of a header this router is about to forward.
+///
+/// RFC 1812 §5.2.5 requires a router to forward a datagram whose options it
+/// does not recognise, passing them through unchanged, so anything well formed
+/// and not a source route is accepted here and copied by the ordinary forward.
+/// Record Route and Timestamp are carried without being filled in, which is
+/// the same treatment an unrecognised option gets.
+fn validate_ipv4_options(frame: &[u8], ipv4: packet::ValidatedIpv4) -> Result<(), DropReason> {
+    let start = ipv4
+        .header_offset
+        .checked_add(20)
+        .ok_or(Ipv4HeaderLengthExceedsPacket)?;
+    let end = ipv4
+        .header_offset
+        .checked_add(ipv4.header_len)
+        .ok_or(Ipv4HeaderLengthExceedsPacket)?;
+    let options = frame.get(start..end).ok_or(Ipv4HeaderLengthExceedsPacket)?;
+
+    let mut offset = 0;
+    while offset < options.len() {
+        let option_type = options[offset];
+        if option_type == IPV4_OPTION_END_OF_LIST {
+            // Everything after the end of the list is padding.
+            return Ok(());
+        }
+        if option_type == IPV4_OPTION_NO_OPERATION {
+            offset += 1;
+            continue;
+        }
+        // Every other option carries its own length, which must cover at
+        // least the type and length octets and must not run past the header.
+        let Some(&length) = options.get(offset + 1) else {
+            return Err(Ipv4OptionsMalformed);
+        };
+        let length = usize::from(length);
+        if length < 2 {
+            return Err(Ipv4OptionsMalformed);
+        }
+        let Some(next) = offset.checked_add(length) else {
+            return Err(Ipv4OptionsMalformed);
+        };
+        if next > options.len() {
+            return Err(Ipv4OptionsMalformed);
+        }
+        if matches!(
+            option_type,
+            IPV4_OPTION_LOOSE_SOURCE_ROUTE | IPV4_OPTION_STRICT_SOURCE_ROUTE
+        ) {
+            return Err(Ipv4SourceRouteUnsupported);
+        }
+        offset = next;
+    }
     Ok(())
 }
 
@@ -7455,10 +7535,13 @@ mod tests {
         assert!(matches!(decision, super::PacketDecision::Ipv4(_)));
     }
 
-    // Contract: forwarded IPv4 packets carrying options are rejected before
-    // route rewriting, rather than being accepted by an inverted comparison.
+    // Contract: RFC 1812 §5.2.5 requires a router to forward a datagram whose
+    // options it does not recognise, passing them through unchanged. Source
+    // routing is refused instead — RFC 1812 §4.2.2.11 allows that, this router
+    // has no source-route reversal, and honouring it would let a sender steer
+    // traffic past filtering that assumes the routing table decides the path.
     #[test]
-    fn decide_ipv4_rejects_forwarded_ipv4_options() {
+    fn forwarded_ipv4_options_are_carried_unless_they_route_or_are_malformed() {
         let interfaces = [Interface {
             id: WAN,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
@@ -7471,11 +7554,73 @@ mod tests {
             mac: MacAddress([2, 0, 0, 0, 0, 20]),
         }];
         let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
-        let frame = ipv4_decision_frame(INTERNAL, REMOTE, 6, 64, 6);
-        assert!(matches!(
-            decide_ipv4_without_services(&frame, &snapshot, WAN),
-            Err(Ipv4OptionsUnsupported)
-        ));
+
+        let carried: [(&str, [u8; 8]); 4] = [
+            ("end of list then padding", [0, 0, 0, 0, 0, 0, 0, 0]),
+            ("no-operation padding", [1, 1, 1, 1, 1, 1, 1, 0]),
+            // Record Route, type 7, length 7: carried without being filled in.
+            ("record route", [7, 7, 4, 0, 0, 0, 0, 0]),
+            // An option this router does not know, which must still be carried.
+            ("unrecognised option", [222, 4, 0, 0, 0, 0, 0, 0]),
+        ];
+        for (label, options) in carried {
+            let mut frame = ipv4_decision_frame(INTERNAL, REMOTE, 6, 64, 7);
+            frame[34..42].copy_from_slice(&options);
+            frame[24..26].fill(0);
+            let checksum = ipv4_header_checksum(&frame[14..42]);
+            frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+            let outcome = decide_ipv4_without_services(&frame, &snapshot, WAN);
+            assert!(
+                matches!(outcome, Ok(super::PacketDecision::Ipv4(_))),
+                "{label} must be forwarded, got {:?}",
+                outcome.err()
+            );
+        }
+
+        let refused: [(&str, [u8; 8], DropReason); 5] = [
+            // Loose source route, type 131.
+            (
+                "loose source route",
+                [131, 7, 4, 0, 0, 0, 0, 0],
+                Ipv4SourceRouteUnsupported,
+            ),
+            // Strict source route, type 137.
+            (
+                "strict source route",
+                [137, 7, 4, 0, 0, 0, 0, 0],
+                Ipv4SourceRouteUnsupported,
+            ),
+            // A source route reached only after skipping a no-operation.
+            (
+                "source route behind padding",
+                [1, 131, 7, 4, 0, 0, 0, 0],
+                Ipv4SourceRouteUnsupported,
+            ),
+            // A length that cannot cover its own two octets.
+            (
+                "length below two",
+                [7, 1, 0, 0, 0, 0, 0, 0],
+                Ipv4OptionsMalformed,
+            ),
+            // A length that runs past the end of the header.
+            (
+                "length past the header",
+                [7, 9, 0, 0, 0, 0, 0, 0],
+                Ipv4OptionsMalformed,
+            ),
+        ];
+        for (label, options, expected) in refused {
+            let mut frame = ipv4_decision_frame(INTERNAL, REMOTE, 6, 64, 7);
+            frame[34..42].copy_from_slice(&options);
+            frame[24..26].fill(0);
+            let checksum = ipv4_header_checksum(&frame[14..42]);
+            frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+            assert_eq!(
+                decide_ipv4_without_services(&frame, &snapshot, WAN).err(),
+                Some(expected),
+                "{label}"
+            );
+        }
     }
 
     // Contract: a static neighbor is usable only when both its interface and

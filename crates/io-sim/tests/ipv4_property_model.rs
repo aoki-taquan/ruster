@@ -608,12 +608,23 @@ fn parser_and_ingress_rejections_are_byte_and_resolution_state_atomic() {
         LAN,
         DropReason::Ipv4HeaderChecksumInvalid,
     ));
-    let options = ipv4_frame(6, 0, 0, 0x4000, 64, PEER_IP, DESTINATION);
+    // The builder fills the option area with a pseudo-random pattern, which
+    // here declares a Record Route running past the end of the header.
+    let malformed_options = ipv4_frame(6, 0, 0, 0x4000, 64, PEER_IP, DESTINATION);
     explicit_cases.push((
-        "validated options remain unsupported",
-        options,
+        "an option length past the header is refused",
+        malformed_options,
         LAN,
-        DropReason::Ipv4OptionsUnsupported,
+        DropReason::Ipv4OptionsMalformed,
+    ));
+    let mut source_route = ipv4_frame(6, 0, 0, 0x4000, 64, PEER_IP, DESTINATION);
+    source_route[34..38].copy_from_slice(&[131, 4, 4, 0]);
+    install_oracle_checksum(&mut source_route);
+    explicit_cases.push((
+        "a source route is refused",
+        source_route,
+        LAN,
+        DropReason::Ipv4SourceRouteUnsupported,
     ));
     for ttl in [0_u8, 1] {
         explicit_cases.push((

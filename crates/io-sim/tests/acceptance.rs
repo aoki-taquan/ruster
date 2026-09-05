@@ -574,7 +574,10 @@ fn all_validation_and_decision_drops_are_granular_and_atomic() {
     total_large[16..18].copy_from_slice(&100_u16.to_be_bytes());
     let mut checksum = frame(8, &[]);
     checksum[26] ^= 1;
-    let options = frame_with_options(8, &[], &[1, 1, 0, 0]);
+    // RFC 1812 §5.2.5 carries an option it does not recognise; only a source
+    // route is refused, and the routing table still decides the path.
+    let source_route = frame_with_options(8, &[], &[131, 7, 4, 0, 0, 0, 0, 0]);
+    let malformed_options = frame_with_options(8, &[], &[7, 1, 0, 0]);
 
     let cases = [
         (vec![0; 13], DropReason::EthernetHeaderTruncated),
@@ -588,7 +591,8 @@ fn all_validation_and_decision_drops_are_granular_and_atomic() {
         (total_small, DropReason::Ipv4TotalLengthTooSmall),
         (total_large, DropReason::Ipv4TotalLengthExceedsPacket),
         (checksum, DropReason::Ipv4HeaderChecksumInvalid),
-        (options, DropReason::Ipv4OptionsUnsupported),
+        (source_route, DropReason::Ipv4SourceRouteUnsupported),
+        (malformed_options, DropReason::Ipv4OptionsMalformed),
         (frame(1, &[]), DropReason::Ipv4TtlExpired),
     ];
     for (packet, reason) in cases {
@@ -602,9 +606,28 @@ fn all_validation_and_decision_drops_are_granular_and_atomic() {
 }
 
 #[test]
-fn options_header_is_valid_but_forwarding_is_explicitly_unsupported() {
-    let packet = frame_with_options(8, &[], &[1, 1, 0, 0]);
-    assert_eq!(validate_ipv4_frame(&packet).unwrap().header_len, 24);
+fn an_option_this_router_does_not_recognise_is_forwarded_unchanged() {
+    // RFC 1812 §5.2.5: a router forwards a datagram whose options it does not
+    // recognise and passes them through untouched.
+    let routes = [gateway_route()];
+    let interfaces = [local_interface(), interface()];
+    let neighbors = [gateway_neighbor()];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).unwrap();
+    let options = [222_u8, 4, 0xab, 0xcd, 1, 1, 1, 0];
+    let packet = frame_with_options(8, &[9, 9], &options);
+    assert_eq!(validate_ipv4_frame(&packet).unwrap().header_len, 28);
+
+    let mut io = SimIo::new();
+    io.inject(LAN, packet.clone());
+    io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    let tx = io.pop_tx().expect("an options datagram must be forwarded");
+    assert_eq!(
+        &tx.bytes[34..42],
+        &options,
+        "the option bytes must reach the wire unchanged"
+    );
+    assert_eq!(tx.bytes[22], packet[22] - 1, "the TTL is decremented once");
+    assert_eq!(&tx.bytes[42..], &packet[42..], "the payload is unchanged");
 }
 
 #[test]

@@ -102,9 +102,15 @@ fn ipv4_frame(
     frame
 }
 
-fn options_frame() -> Vec<u8> {
+/// A datagram this router refuses before it consults the routing table.
+///
+/// Benign options are carried now (RFC 1812 §5.2.5), so the option that still
+/// stops a datagram early is a source route. The suppression property this
+/// exercises is unchanged: a refusal before the LPM must not report the route
+/// table's contents through an ICMP error.
+fn source_route_frame() -> Vec<u8> {
     let mut frame = ipv4_frame(SOURCE, MISSING, 64, 17, 0, 0, &[], &[]);
-    frame.splice(34..34, [0, 0, 0, 0]);
+    frame.splice(34..34, [131, 4, 4, 0]);
     frame[14] = 0x46;
     frame[16..18].copy_from_slice(&24_u16.to_be_bytes());
     frame[24..26].fill(0);
@@ -623,10 +629,10 @@ fn route_miss_suppression_matrix_and_options_are_atomic() {
     }
 
     let first = ipv4_frame(SOURCE, MISSING, 64, 1, 0x2000, 0, &[8], &[]);
-    let options = options_frame();
+    let source_route = source_route_frame();
     for (original, expected_pending, expected_reason) in [
         (first, 1, DropReason::RouteMiss),
-        (options, 0, DropReason::Ipv4OptionsUnsupported),
+        (source_route, 0, DropReason::Ipv4SourceRouteUnsupported),
     ] {
         let mut rs = [ResolutionStateSlot::EMPTY; 1];
         let mut ra = [ResolutionActionSlot::EMPTY; 1];

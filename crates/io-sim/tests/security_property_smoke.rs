@@ -259,7 +259,7 @@ fn r16a_v1_generation_is_exact_case_replayable() {
             V1_SEEDS[3],
             2_047,
             110,
-            0xb30b_be36_f61f_26b9,
+            0x55df_50e5_9d5a_352a,
         ),
         (
             Target::Resolution,

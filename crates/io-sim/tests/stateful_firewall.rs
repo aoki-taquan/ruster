@@ -929,14 +929,17 @@ fn firewall_transport_options_ports_checksums_and_ttl_fail_closed_before_state()
     .unwrap();
     assert_drop(&mut io, DropReason::FirewallTcpPortZero, &zero_tcp_port);
 
-    let mut options = udp_frame(HOST, REMOTE, 12_346, 53, 0, false);
-    options.splice(34..34, [1, 1, 0, 0]);
-    options[14] = 0x46;
-    options[16..18].copy_from_slice(&35_u16.to_be_bytes());
-    options[24..26].fill(0);
-    let checksum = ipv4_header_checksum(&options[14..38]);
-    options[24..26].copy_from_slice(&checksum.to_be_bytes());
-    io.inject(LAN, options.clone());
+    // A source route is refused before any firewall state is touched. Benign
+    // options are carried (RFC 1812 §5.2.5) and the transport header is still
+    // located past them, which the accepted case below proves.
+    let mut source_route = udp_frame(HOST, REMOTE, 12_346, 53, 0, false);
+    source_route.splice(34..34, [131, 4, 4, 0]);
+    source_route[14] = 0x46;
+    source_route[16..18].copy_from_slice(&35_u16.to_be_bytes());
+    source_route[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&source_route[14..38]);
+    source_route[24..26].copy_from_slice(&checksum.to_be_bytes());
+    io.inject(LAN, source_route.clone());
     io.run_firewall_once(
         1,
         &snapshot,
@@ -949,8 +952,8 @@ fn firewall_transport_options_ports_checksums_and_ttl_fail_closed_before_state()
     .unwrap();
     assert_drop(
         &mut io,
-        DropReason::FirewallIpv4OptionsUnsupported,
-        &options,
+        DropReason::Ipv4SourceRouteUnsupported,
+        &source_route,
     );
 
     let mut ttl = udp_frame(HOST, OTHER_REMOTE, 12_347, 53, 0, false);
@@ -3545,4 +3548,115 @@ fn ipv4_ingress_admission_precedes_nat_firewall_time_state_audit_and_actions() {
         assert!(io.pop_tx().is_some());
         assert_eq!(audit.records().len(), 2);
     }
+}
+
+#[test]
+fn a_datagram_with_benign_options_is_matched_on_its_real_ports() {
+    // RFC 1812 §5.2.5 carries an option this router does not recognise. The
+    // firewall then has to read the transport header at
+    // `header_offset + header_len` rather than twenty bytes in, or it would
+    // match the option bytes as ports.
+
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let rules = [allow(FirewallProtocol::Udp), allow(FirewallProtocol::Tcp)];
+    let config = FirewallConfig::new(
+        &snapshot,
+        &rules,
+        FirewallPolicy::default(),
+        1,
+        firewall_hash_key(),
+    )
+    .unwrap();
+    let mut slots = [FirewallStateSlot::default(); 2];
+    let mut firewall = FirewallRuntime::new(config, &mut slots);
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut states, &mut actions);
+    let mut io = SimIo::new();
+
+    let source_zero = udp_frame(HOST, REMOTE, 0, 53, 0, false);
+    io.inject(LAN, source_zero);
+    io.run_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut firewall),
+        MonotonicMillis(0),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_eq!(io.pop_tx().unwrap().egress, WAN);
+    assert_eq!(firewall.states()[0].initiator_port(), 0);
+
+    let destination_zero = udp_frame(HOST, REMOTE, 12_345, 0, 0, false);
+    io.inject(LAN, destination_zero.clone());
+    io.run_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut firewall),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(
+        &mut io,
+        DropReason::FirewallUdpDestinationPortZero,
+        &destination_zero,
+    );
+
+    let mut bad_tcp = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0);
+    bad_tcp[50] ^= 1;
+    io.inject(LAN, bad_tcp.clone());
+    io.run_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut firewall),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallTcpChecksumInvalid, &bad_tcp);
+
+    let mut carried_options = udp_frame(HOST, REMOTE, 12_346, 53, 0, false);
+    carried_options.splice(34..34, [1, 1, 1, 0]);
+    carried_options[14] = 0x46;
+    carried_options[16..18].copy_from_slice(&35_u16.to_be_bytes());
+    carried_options[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&carried_options[14..38]);
+    carried_options[24..26].copy_from_slice(&checksum.to_be_bytes());
+    io.inject(LAN, carried_options.clone());
+    io.run_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut firewall),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    let forwarded = io
+        .pop_tx()
+        .expect("a datagram with benign options must be forwarded");
+    assert_eq!(
+        &forwarded.bytes[34..38],
+        &[1, 1, 1, 0],
+        "the option bytes must reach the wire unchanged"
+    );
+    assert_eq!(
+        u16::from_be_bytes([forwarded.bytes[38], forwarded.bytes[39]]),
+        12_346,
+        "the source port must be read past the options"
+    );
+    assert_eq!(
+        u16::from_be_bytes([forwarded.bytes[40], forwarded.bytes[41]]),
+        53,
+        "the destination port must be read past the options"
+    );
 }

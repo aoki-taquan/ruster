@@ -247,8 +247,10 @@ fn generate_admission(seed: u64, case_index: u64) -> Result<Vec<u8>, CaseFailure
             (frame, drop_expected(DropReason::Ipv4HeaderChecksumInvalid)?)
         }
         4 => (
+            // The option area carries the builder's pseudo-random pattern,
+            // which declares a length running past the end of the header.
             ipv4_frame(6, 0, 0, 0x4000, 64, LAN_PEER, DESTINATION),
-            drop_expected(DropReason::Ipv4OptionsUnsupported)?,
+            drop_expected(DropReason::Ipv4OptionsMalformed)?,
         ),
         5 => (
             ipv4_frame(5, 0, 0, 0x4000, 1, LAN_PEER, DESTINATION),

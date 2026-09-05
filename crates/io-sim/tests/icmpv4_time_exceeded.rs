@@ -926,13 +926,15 @@ fn ethernet_group_destination_and_options_suppress_without_mutation() {
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
     let mut group = frame(SOURCE, DESTINATION, 1, 17, 0, 0, &[], &[]);
     group[0] = 0x01;
-    let mut options = frame(SOURCE, DESTINATION, 1, 17, 0, 0, &[], &[]);
-    options.splice(34..34, [0, 0, 0, 0]);
-    options[14] = 0x46;
-    replace_ipv4_word(&mut options, 16, 24);
+    // Benign options are carried now (RFC 1812 §5.2.5); the option that still
+    // stops a datagram before the TTL decision is a source route.
+    let mut source_route = frame(SOURCE, DESTINATION, 1, 17, 0, 0, &[], &[]);
+    source_route.splice(34..34, [131, 4, 4, 0]);
+    source_route[14] = 0x46;
+    replace_ipv4_word(&mut source_route, 16, 24);
     for (original, reason) in [
         (group, DropReason::Ipv4EthernetDestinationMulticast),
-        (options, DropReason::Ipv4OptionsUnsupported),
+        (source_route, DropReason::Ipv4SourceRouteUnsupported),
     ] {
         let mut rs = [ResolutionStateSlot::EMPTY; 1];
         let mut ra = [ResolutionActionSlot::EMPTY; 1];

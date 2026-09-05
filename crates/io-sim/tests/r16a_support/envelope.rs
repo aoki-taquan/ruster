@@ -63,8 +63,15 @@ impl Target {
 pub struct DropCode(u16);
 
 impl DropCode {
+    /// The largest discriminant `DropReason` currently assigns.
+    ///
+    /// Taken from the enum rather than written out, so adding a reason cannot
+    /// leave this envelope silently rejecting it as unknown — which is exactly
+    /// what a hard-coded 145 did when new reasons arrived.
+    const LARGEST: u16 = ruster_core::DropReason::LARGEST_CODE;
+
     pub fn new(value: u16) -> Result<Self, EnvelopeError> {
-        if (1..=145).contains(&value) {
+        if (1..=Self::LARGEST).contains(&value) {
             Ok(Self(value))
         } else {
             Err(EnvelopeError::UnknownDropCode)
