@@ -448,7 +448,28 @@ impl CompletionAcquisition<'_, '_> {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::size_of;
+
+    use crate::{abi::XdpDescriptor, RingName};
+
     use super::*;
+
+    fn test_offsets() -> XdpRingOffset {
+        XdpRingOffset {
+            producer: 0,
+            consumer: 64,
+            flags: 128,
+            descriptors: 192,
+        }
+    }
+
+    fn read_cursor(memory: &[u8], offset: usize) -> u32 {
+        u32::from_ne_bytes(
+            memory[offset..offset + size_of::<u32>()]
+                .try_into()
+                .expect("cursor is four bytes"),
+        )
+    }
 
     #[test]
     fn ring_length_validation_distinguishes_zero_excess_and_valid() {
@@ -460,5 +481,123 @@ mod tests {
             Err(NativeRingError::LengthExceedsCapacity)
         );
         assert_eq!(validate_len(4, 4), Ok(()));
+    }
+
+    #[test]
+    fn fill_release_cancel_keeps_the_producer_cursor_unpublished() {
+        let entries = RingEntries::new(RingName::Fill, 4).expect("valid entries");
+        let mut memory = [0_u8; 256];
+        let offsets = test_offsets();
+        {
+            let mut fill = FillProducer::new(&mut memory, offsets, entries).expect("fill view");
+            let mut cancelled = fill.reserve(1).expect("reservation");
+            cancelled.write(0xfeed).expect("fill address");
+            cancelled.release_cancel();
+        }
+        assert_eq!(read_cursor(&memory, offsets.producer as usize), 0);
+
+        {
+            let mut fill = FillProducer::new(&mut memory, offsets, entries).expect("fill view");
+            let mut submitted = fill.reserve(1).expect("same unpublished range");
+            submitted.write(0xbeef).expect("fill address");
+            let _ = submitted.release_submit().expect("complete reservation");
+        }
+        assert_eq!(read_cursor(&memory, offsets.producer as usize), 1);
+    }
+
+    #[test]
+    fn tx_release_cancel_keeps_the_producer_cursor_unpublished() {
+        let entries = RingEntries::new(RingName::Tx, 4).expect("valid entries");
+        let mut memory = [0_u8; 256];
+        let offsets = test_offsets();
+        let descriptor = XdpDescriptor {
+            address: 0x100,
+            len: 64,
+            options: 0,
+        };
+
+        {
+            let mut tx = TxProducer::new(&mut memory, offsets, entries).expect("tx view");
+            let mut cancelled = tx.reserve(1).expect("reservation");
+            cancelled.write(descriptor).expect("tx descriptor");
+            cancelled.release_cancel();
+        }
+        assert_eq!(read_cursor(&memory, offsets.producer as usize), 0);
+
+        {
+            let mut tx = TxProducer::new(&mut memory, offsets, entries).expect("tx view");
+            let mut submitted = tx.reserve(1).expect("same unpublished range");
+            submitted.write(descriptor).expect("tx descriptor");
+            let _ = submitted.release_submit().expect("complete reservation");
+        }
+        assert_eq!(read_cursor(&memory, offsets.producer as usize), 1);
+    }
+
+    #[test]
+    fn rx_release_cancel_keeps_the_consumer_cursor_unpublished() {
+        let entries = RingEntries::new(RingName::Tx, 4).expect("valid entries");
+        let mut memory = [0_u8; 256];
+        let offsets = test_offsets();
+        let descriptor = XdpDescriptor {
+            address: 0x200,
+            len: 96,
+            options: 0,
+        };
+
+        {
+            let mut tx = TxProducer::new(&mut memory, offsets, entries).expect("tx view");
+            let mut reservation = tx.reserve(1).expect("seed reservation");
+            reservation.write(descriptor).expect("seed descriptor");
+            let _ = reservation.release_submit().expect("seed publication");
+        }
+
+        let rx_entries = RingEntries::new(RingName::Rx, 4).expect("valid entries");
+        {
+            let mut rx = RxConsumer::new(&mut memory, offsets, rx_entries).expect("rx view");
+            let mut cancelled = rx.acquire(1).expect("acquisition");
+            assert_eq!(cancelled.read(), Ok(descriptor));
+            cancelled.release_cancel();
+        }
+        assert_eq!(read_cursor(&memory, offsets.consumer as usize), 0);
+
+        {
+            let mut rx = RxConsumer::new(&mut memory, offsets, rx_entries).expect("rx view");
+            let mut consumed = rx.acquire(1).expect("same unpublished range");
+            assert_eq!(consumed.read(), Ok(descriptor));
+            consumed.release_consume().expect("complete acquisition");
+        }
+        assert_eq!(read_cursor(&memory, offsets.consumer as usize), 1);
+    }
+
+    #[test]
+    fn completion_release_cancel_keeps_the_consumer_cursor_unpublished() {
+        let entries = RingEntries::new(RingName::Fill, 4).expect("valid entries");
+        let mut memory = [0_u8; 256];
+        let offsets = test_offsets();
+        {
+            let mut fill = FillProducer::new(&mut memory, offsets, entries).expect("fill view");
+            let mut reservation = fill.reserve(1).expect("seed reservation");
+            reservation.write(0x300).expect("seed address");
+            let _ = reservation.release_submit().expect("seed publication");
+        }
+
+        let completion_entries = RingEntries::new(RingName::Completion, 4).expect("valid entries");
+        {
+            let mut completion = CompletionConsumer::new(&mut memory, offsets, completion_entries)
+                .expect("completion view");
+            let mut cancelled = completion.acquire(1).expect("acquisition");
+            assert_eq!(cancelled.read(), Ok(0x300));
+            cancelled.release_cancel();
+        }
+        assert_eq!(read_cursor(&memory, offsets.consumer as usize), 0);
+
+        {
+            let mut completion = CompletionConsumer::new(&mut memory, offsets, completion_entries)
+                .expect("completion view");
+            let mut consumed = completion.acquire(1).expect("same unpublished range");
+            assert_eq!(consumed.read(), Ok(0x300));
+            consumed.release_consume().expect("complete acquisition");
+        }
+        assert_eq!(read_cursor(&memory, offsets.consumer as usize), 1);
     }
 }

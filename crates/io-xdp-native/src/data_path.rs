@@ -1674,7 +1674,15 @@ const fn map_syscall_stage(stage: SyscallStage) -> crate::XdpSetupStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_unsafe::syscall::{sealed, Errno, MapRequest, PollDescriptor};
     use ruster_core::{ConsumeReason, DropReason};
+    use std::{
+        cell::RefCell,
+        fs::File,
+        mem::ManuallyDrop,
+        os::fd::{IntoRawFd, RawFd},
+        os::unix::net::UnixStream,
+    };
 
     // The model tests below use the same native role-typed ring views as the
     // live path. Kernel-side producer/consumer cursor changes are performed by
@@ -1867,6 +1875,161 @@ mod tests {
         fn ring_occupied(&self, ring: &RingMemory) -> u32 {
             ring.read_u32(0).wrapping_sub(ring.read_u32(64))
         }
+    }
+
+    struct ResourceSyscalls {
+        socket_fd: RawFd,
+        _peer: Option<UnixStream>,
+        mappings: RefCell<Vec<Box<[u8]>>>,
+    }
+
+    impl ResourceSyscalls {
+        fn new(ready: bool, hangup: bool) -> Self {
+            if ready {
+                let reader = File::open("/dev/null").expect("test readable poll fd");
+                return Self {
+                    socket_fd: reader.into_raw_fd(),
+                    _peer: None,
+                    mappings: RefCell::new(Vec::new()),
+                };
+            }
+            if hangup {
+                return Self {
+                    // An invalid descriptor yields POLLNVAL without also
+                    // setting POLLIN. This keeps the non-RX readiness case
+                    // independent of platform-specific hangup semantics.
+                    socket_fd: i32::MAX,
+                    _peer: None,
+                    mappings: RefCell::new(Vec::new()),
+                };
+            }
+            let (reader, peer) = UnixStream::pair().expect("test poll socket pair");
+            Self {
+                socket_fd: reader.into_raw_fd(),
+                _peer: Some(peer),
+                mappings: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl sealed::Sealed for ResourceSyscalls {}
+
+    impl Syscalls for ResourceSyscalls {
+        fn socket(
+            &self,
+            _domain: std::ffi::c_int,
+            _kind: std::ffi::c_int,
+            _protocol: std::ffi::c_int,
+        ) -> Result<RawFd, Errno> {
+            Ok(self.socket_fd)
+        }
+
+        fn set_socket_option(
+            &self,
+            _fd: RawFd,
+            _level: std::ffi::c_int,
+            _name: std::ffi::c_int,
+            _value: &[u8],
+            _length: u32,
+        ) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn get_socket_option(
+            &self,
+            _fd: RawFd,
+            _level: std::ffi::c_int,
+            _name: std::ffi::c_int,
+            value: &mut [u8],
+            length: &mut u32,
+        ) -> Result<(), Errno> {
+            let offsets = crate::abi::XdpMmapOffsets {
+                rx: OFFSETS,
+                tx: OFFSETS,
+                fill: OFFSETS,
+                completion: OFFSETS,
+            };
+            let encoded = crate::abi::encode_xdp_mmap_offsets(offsets);
+            value[..encoded.len()].copy_from_slice(&encoded);
+            *length = u32::try_from(encoded.len()).expect("test offsets length fits");
+            Ok(())
+        }
+
+        fn mmap(&self, request: MapRequest) -> Result<*mut std::ffi::c_void, Errno> {
+            let byte_len = match request {
+                MapRequest::Anonymous { byte_len } | MapRequest::Shared { byte_len, .. } => {
+                    byte_len
+                }
+            };
+            let mut mapping = vec![0_u8; byte_len].into_boxed_slice();
+            let address = mapping.as_mut_ptr().cast::<std::ffi::c_void>();
+            self.mappings.borrow_mut().push(mapping);
+            Ok(address)
+        }
+
+        fn munmap(&self, _address: *mut std::ffi::c_void, _byte_len: usize) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn bind(&self, _fd: RawFd, _address: &[u8], _length: u32) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn poll(
+            &self,
+            _descriptor: &mut PollDescriptor,
+            _timeout_millis: std::ffi::c_int,
+        ) -> Result<u32, Errno> {
+            Ok(0)
+        }
+
+        fn send_to_wakeup(&self, _fd: RawFd) -> Result<(), Errno> {
+            Ok(())
+        }
+
+        fn bpf(&self, _command: u32, _attr: &mut [u8]) -> Result<std::ffi::c_long, Errno> {
+            Ok(0)
+        }
+
+        fn close(&self, _fd: RawFd) -> Result<(), Errno> {
+            Ok(())
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn resource_fixture(ready: bool, hangup: bool) -> ManuallyDrop<XdpResource<'static>> {
+        let config = UmemConfig::new(
+            FRAME_COUNT as u32,
+            FRAME_SIZE as u32,
+            HEADROOM as u32,
+            RX_FRAMES as u32,
+            (FRAME_COUNT - RX_FRAMES) as u32,
+            0,
+        )
+        .expect("test UMEM");
+        let rings = crate::RingConfig::new(RING_ENTRIES, RING_ENTRIES, RING_ENTRIES, RING_ENTRIES)
+            .expect("test rings");
+        let syscalls: &'static ResourceSyscalls =
+            Box::leak(Box::new(ResourceSyscalls::new(ready, hangup)));
+        let memory: &'static mut [u8] =
+            Box::leak(vec![0_u8; config.byte_len() as usize].into_boxed_slice());
+        let owner = crate::XdpResourceBuilder::new(config, rings, 1, 0)
+            .expect("test builder")
+            .with_interface_id(IfId(7))
+            .build_with_syscalls(memory, syscalls)
+            .expect("test resource");
+
+        // SAFETY: ResourceOwner is structurally identical for the two syscall
+        // marker types. Every syscall-dependent field stores only a reference,
+        // and this fixture never drops the retyped resource. Ring operations
+        // use the fake mappings; wait_for_rx uses the real Unix fd retained by
+        // the fake socket fixture.
+        ManuallyDrop::new(unsafe {
+            std::mem::transmute::<
+                crate::setup::ResourceOwner<'static, 'static, ResourceSyscalls>,
+                crate::setup::XdpResource<'static>,
+            >(owner)
+        })
     }
 
     fn initialize(harness: &mut Harness) {
@@ -2598,5 +2761,448 @@ mod tests {
             }
         );
         assert_eq!(harness.ownership.count(XdpChunkState::TxOwnedByKernel), 1);
+    }
+
+    #[test]
+    fn descriptor_offset_is_relative_to_the_selected_frame() {
+        let ownership = fresh_ownership();
+        let capacity = (FRAME_SIZE - DATA_OFFSET) as u32;
+        let second_frame_address = FRAME_SIZE as u64 + DATA_OFFSET as u64;
+
+        assert_eq!(
+            ownership.validate_packet_descriptor(XdpDescriptor {
+                address: second_frame_address,
+                len: capacity,
+                options: 0,
+            }),
+            Ok(1)
+        );
+        assert!(ownership
+            .validate_packet_descriptor(XdpDescriptor {
+                address: second_frame_address - 1,
+                len: 1,
+                options: 0,
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn quarantine_updates_the_source_and_destination_counts() {
+        let mut ownership = fresh_ownership();
+        for frame_index in 0..3 {
+            ownership.reserve_fill(frame_index).expect("reserve fill");
+            ownership.publish_fill(frame_index).expect("publish fill");
+        }
+        assert_eq!(
+            ownership.count(XdpChunkState::FillOwnedByKernel),
+            3,
+            "the division mutant must not be masked by a source count of one"
+        );
+
+        ownership.quarantine(0);
+
+        assert_eq!(
+            ownership.count(XdpChunkState::FillOwnedByKernel),
+            2,
+            "quarantine removes exactly one live source owner"
+        );
+        assert_eq!(ownership.count(XdpChunkState::Quarantined), 1);
+    }
+
+    #[test]
+    fn recovery_does_not_release_or_quarantine_the_generated_boundary_frame() {
+        let mut ownership = fresh_ownership();
+        let generated_boundary = RX_FRAMES as u32;
+        ownership
+            .reserve_fill(generated_boundary)
+            .expect("test boundary owner");
+        ownership
+            .publish_fill(generated_boundary)
+            .expect("test boundary publication");
+
+        ownership.recover_rx_descriptor(XdpDescriptor {
+            address: RX_FRAMES as u64 * FRAME_SIZE as u64 + DATA_OFFSET as u64,
+            len: 0,
+            options: 0,
+        });
+
+        assert_eq!(
+            ownership.state_kind(generated_boundary),
+            XdpChunkState::FillOwnedByKernel
+        );
+        assert_eq!(ownership.count(XdpChunkState::Quarantined), 0);
+    }
+
+    #[test]
+    fn publication_observation_records_wakeup_flags_and_ring_errors() {
+        let mut harness = Harness::new();
+        {
+            let mut core = harness.core(BatchState::Maintenance);
+            core.observe_publication(RingName::Fill, Ok(NeedWakeup::Required))
+                .expect("fill wakeup observation");
+            core.observe_publication(RingName::Tx, Ok(NeedWakeup::Required))
+                .expect("tx wakeup observation");
+            core.observe_publication(RingName::Fill, Ok(NeedWakeup::NotRequired))
+                .expect("non-wakeup observation");
+            assert!(matches!(
+                core.observe_publication(
+                    RingName::Completion,
+                    Err(NativeRingError::UnsupportedRingFlags(2))
+                ),
+                Err(XdpIoError::Ring {
+                    ring: RingName::Completion,
+                    source: NativeRingError::UnsupportedRingFlags(2),
+                })
+            ));
+            core.release_state();
+        }
+        assert!(harness.fill_wakeup_pending);
+        assert!(harness.tx_wakeup_pending);
+    }
+
+    #[test]
+    fn core_drop_reclaims_its_non_idle_state() {
+        let mut harness = Harness::new();
+        {
+            let core = harness.core(BatchState::Maintenance);
+            drop(core);
+        }
+
+        assert_eq!(harness.state, BatchState::Idle);
+        assert_eq!(
+            harness.ownership.count(XdpChunkState::FillOwnedByKernel),
+            RX_FRAMES
+        );
+        assert_eq!(harness.ring_occupied(&harness.fill), RX_FRAMES as u32);
+    }
+
+    #[test]
+    fn packet_expected_tx_rejection_is_counted_without_poisoning_the_batch() {
+        let mut harness = Harness::new();
+        initialize(&mut harness);
+        harness.kernel_publish_rx(0, 64);
+        harness.tx.write_u32(0, RING_ENTRIES);
+        harness.tx.write_u32(64, 0);
+        let interface = harness.interface;
+        let completion = {
+            let core = harness.core(BatchState::Rx);
+            let mut batch = XdpPacketBatchWithOps::new(core, 1);
+            let slot = batch.next_slot().expect("RX slot");
+            slot.complete(SlotCompletion::Transmit(interface));
+            batch.finish_inner()
+        };
+
+        assert_eq!((completion.tx_rejected, completion.tx_accepted), (1, 0));
+        assert!(completion.error.is_none());
+        assert!(completion.invariants_hold());
+    }
+
+    #[test]
+    fn generated_allocation_accepts_the_exact_visible_capacity() {
+        let mut harness = Harness::new();
+        let capacity = FRAME_SIZE - DATA_OFFSET;
+        let interface = harness.interface;
+        let completion = {
+            let core = harness.core(BatchState::Generated);
+            let mut batch = XdpGeneratedBatchWithOps::new(core, interface);
+            let slot = batch
+                .allocate_slot(capacity)
+                .expect("exact visible capacity is allocatable");
+            slot.complete(GeneratedSlotCompletion::Cancelled);
+            batch.finish_inner()
+        };
+
+        assert_eq!((completion.allocated, completion.failed), (1, 0));
+        assert_eq!(completion.cancelled, 1);
+    }
+
+    #[test]
+    fn generated_allocation_failure_increments_failed_when_the_pool_is_empty() {
+        let mut harness = Harness::new();
+        for frame_index in RX_FRAMES..FRAME_COUNT {
+            harness
+                .ownership
+                .lease_generated(frame_index as u32)
+                .expect("reserve generated frame");
+        }
+        let completion = {
+            let interface = harness.interface;
+            let core = harness.core(BatchState::Generated);
+            let mut batch = XdpGeneratedBatchWithOps::new(core, interface);
+            assert!(matches!(
+                batch.allocate_slot(8),
+                Err(GeneratedAllocationError::Unavailable)
+            ));
+            batch.finish_inner()
+        };
+
+        assert_eq!((completion.attempts, completion.allocated), (1, 0));
+        assert_eq!(completion.failed, 1);
+    }
+
+    #[test]
+    fn generated_invalid_u32_length_rejection_is_counted_and_recycled() {
+        let mut harness = Harness::new();
+        let frame_index = RX_FRAMES as u32;
+        harness
+            .ownership
+            .lease_generated(frame_index)
+            .expect("generated frame");
+        let completion = {
+            let interface = harness.interface;
+            let core = harness.core(BatchState::Generated);
+            let mut batch = XdpGeneratedBatchWithOps::new(core, interface);
+            batch.pending = Some(frame_index);
+            batch.complete_slot(
+                frame_index,
+                (RX_FRAMES * FRAME_SIZE + DATA_OFFSET) as u64,
+                u32::MAX as usize + 1,
+                GeneratedSlotCompletion::Transmit,
+            );
+            batch.finish_inner()
+        };
+
+        assert_eq!((completion.requested, completion.rejected), (1, 1));
+        assert_eq!(completion.abandoned, 0);
+        assert!(matches!(
+            completion.error,
+            Some(XdpIoError::InvalidDescriptor { len: u32::MAX, .. })
+        ));
+        assert_eq!(harness.ownership.count(XdpChunkState::Leased), 0);
+    }
+
+    #[test]
+    fn generated_batch_drop_recycles_a_pending_frame_before_releasing_state() {
+        let mut harness = Harness::new();
+        let frame_index = RX_FRAMES as u32;
+        harness
+            .ownership
+            .lease_generated(frame_index)
+            .expect("pending generated frame");
+        let interface = harness.interface;
+        {
+            let core = harness.core(BatchState::Generated);
+            let mut batch = XdpGeneratedBatchWithOps::new(core, interface);
+            batch.pending = Some(frame_index);
+            drop(batch);
+        }
+
+        assert_eq!(harness.state, BatchState::Idle);
+        assert_eq!(harness.ownership.count(XdpChunkState::Leased), 0);
+        assert_eq!(
+            harness.ownership.count(XdpChunkState::FillOwnedByKernel),
+            RX_FRAMES
+        );
+    }
+
+    #[test]
+    fn public_generated_slot_delegates_bytes_and_completion() {
+        let mut harness = Harness::new();
+        let address = (RX_FRAMES * FRAME_SIZE + DATA_OFFSET) as u64;
+        let interface = harness.interface;
+        let completion = {
+            let core = harness.core(BatchState::Generated);
+            let mut batch = XdpGeneratedBatchWithOps::new(core, interface);
+            let slot = batch.allocate_slot(8).expect("generated slot");
+            let mut public_slot = XdpGeneratedSlot { inner: slot };
+            assert_eq!(public_slot.bytes_mut().len(), 8);
+            public_slot
+                .bytes_mut()
+                .copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+            public_slot.complete(GeneratedSlotCompletion::Cancelled);
+            batch.finish_inner()
+        };
+
+        assert_eq!((completion.cancelled, completion.abandoned), (1, 0));
+        assert_eq!(
+            &harness.umem[address as usize..address as usize + 8],
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
+    }
+
+    #[test]
+    fn poll_timeout_preserves_zero_and_nontrivial_duration_boundaries() {
+        assert_eq!(poll_timeout_ms(Duration::ZERO), 0);
+        assert_eq!(poll_timeout_ms(Duration::from_millis(2)), 2);
+        assert_eq!(
+            poll_timeout_ms(Duration::from_millis(i32::MAX as u64 + 1)),
+            i32::MAX
+        );
+    }
+
+    #[test]
+    fn quiescence_error_disposition_keeps_kernel_owned_completion_paths_running() {
+        assert_eq!(
+            <XdpResource<'static> as PublicationQuiescenceBackend>::quiescence_error_disposition(
+                &XdpIoError::Quiescence {
+                    frame_index: Some(3),
+                    state: XdpChunkState::TxOwnedByKernel,
+                }
+            ),
+            PublicationQuiescenceDisposition::ContinueOldIo
+        );
+        assert_eq!(
+            <XdpResource<'static> as PublicationQuiescenceBackend>::quiescence_error_disposition(
+                &XdpIoError::Quiescence {
+                    frame_index: Some(3),
+                    state: XdpChunkState::CompletionAvailable,
+                }
+            ),
+            PublicationQuiescenceDisposition::ContinueOldIo
+        );
+        assert_eq!(
+            <XdpResource<'static> as PublicationQuiescenceBackend>::quiescence_error_disposition(
+                &XdpIoError::Quiescence {
+                    frame_index: Some(3),
+                    state: XdpChunkState::Leased,
+                }
+            ),
+            PublicationQuiescenceDisposition::SkipIo
+        );
+        assert_eq!(
+            <XdpResource<'static> as PublicationQuiescenceBackend>::quiescence_error_disposition(
+                &XdpIoError::BatchActive
+            ),
+            PublicationQuiescenceDisposition::SkipIo
+        );
+    }
+
+    #[test]
+    fn resource_packet_start_rejects_active_batches_but_accepts_idle_batches() {
+        let mut idle_resource = resource_fixture(false, false);
+        let batch = idle_resource
+            .start_packet_batch(0)
+            .expect("idle resource accepts packet batch");
+        let completion = batch.finish();
+        assert!(completion.invariants_hold());
+
+        let mut active_resource = resource_fixture(false, false);
+        let generated = active_resource.start_generated_batch(IfId(7));
+        std::mem::forget(generated);
+        assert!(matches!(
+            active_resource.start_packet_batch(0),
+            Err(XdpIoError::BatchActive)
+        ));
+    }
+
+    #[test]
+    fn resource_generated_start_distinguishes_raw_views_from_idle_state() {
+        let mut raw_resource = resource_fixture(false, false);
+        {
+            let _views = raw_resource.ring_views().expect("test ring views");
+        }
+        let mut disabled = raw_resource.start_generated_batch(IfId(7));
+        assert!(matches!(
+            ruster_core::GeneratedPacketBatch::allocate(&mut disabled, 8),
+            Err(GeneratedAllocationError::Unavailable)
+        ));
+        let disabled_completion = ruster_core::GeneratedPacketBatch::finish(disabled);
+        assert!(matches!(
+            disabled_completion.error,
+            Some(XdpIoError::RawRingViewsExposed)
+        ));
+
+        let mut idle_resource = resource_fixture(false, false);
+        let mut enabled = idle_resource.start_generated_batch(IfId(7));
+        let slot = ruster_core::GeneratedPacketBatch::allocate(&mut enabled, 8)
+            .expect("idle resource enables generated allocation");
+        slot.cancel();
+        let enabled_completion = ruster_core::GeneratedPacketBatch::finish(enabled);
+        assert_eq!(
+            (enabled_completion.allocated, enabled_completion.cancelled),
+            (1, 1)
+        );
+        assert!(enabled_completion.error.is_none());
+    }
+
+    #[test]
+    fn resource_quiescence_reports_raw_views_active_batches_and_live_owners() {
+        let mut raw_resource = resource_fixture(false, false);
+        {
+            let _views = raw_resource.ring_views().expect("test ring views");
+        }
+        assert!(matches!(
+            PublicationQuiescenceBackend::check_publication_quiescence(&mut *raw_resource),
+            Err(XdpIoError::RawRingViewsExposed)
+        ));
+
+        let mut active_resource = resource_fixture(false, false);
+        let generated = active_resource.start_generated_batch(IfId(7));
+        std::mem::forget(generated);
+        assert!(matches!(
+            PublicationQuiescenceBackend::check_publication_quiescence(&mut *active_resource),
+            Err(XdpIoError::Quiescence {
+                frame_index: None,
+                state: XdpChunkState::Leased,
+            })
+        ));
+
+        let mut owner_resource = resource_fixture(false, false);
+        {
+            let mut core = owner_resource
+                .make_data_path_core(BatchState::Maintenance)
+                .expect("test data path core");
+            core.reserve_generated_frame(8)
+                .expect("reserve generated owner")
+                .expect("generated frame");
+            core.release_state();
+        }
+        assert!(matches!(
+            PublicationQuiescenceBackend::check_publication_quiescence(&mut *owner_resource),
+            Err(XdpIoError::Quiescence {
+                frame_index: Some(frame_index),
+                state: XdpChunkState::Leased,
+            }) if frame_index == RX_FRAMES as u32
+        ));
+    }
+
+    #[test]
+    fn resource_io_disposition_skips_only_non_idle_or_raw_resources() {
+        let idle_resource = resource_fixture(false, false);
+        assert_eq!(
+            PublicationQuiescenceBackend::current_io_disposition(&*idle_resource),
+            PublicationQuiescenceDisposition::ContinueOldIo
+        );
+
+        let mut raw_resource = resource_fixture(false, false);
+        {
+            let _views = raw_resource.ring_views().expect("test ring views");
+        }
+        assert_eq!(
+            PublicationQuiescenceBackend::current_io_disposition(&*raw_resource),
+            PublicationQuiescenceDisposition::SkipIo
+        );
+
+        let mut active_resource = resource_fixture(false, false);
+        let generated = active_resource.start_generated_batch(IfId(7));
+        std::mem::forget(generated);
+        assert_eq!(
+            PublicationQuiescenceBackend::current_io_disposition(&*active_resource),
+            PublicationQuiescenceDisposition::SkipIo
+        );
+    }
+
+    #[test]
+    fn resource_wait_for_rx_requires_readiness_and_the_rx_event_bit() {
+        let mut ready_resource = resource_fixture(true, false);
+        assert_eq!(
+            ready_resource.wait_for_rx(Duration::ZERO),
+            Ok(true),
+            "a readable socket produces the RX-ready result"
+        );
+
+        let mut idle_resource = resource_fixture(false, false);
+        assert_eq!(
+            idle_resource.wait_for_rx(Duration::ZERO),
+            Ok(false),
+            "an idle socket has neither readiness nor an RX event"
+        );
+
+        let mut hangup_resource = resource_fixture(false, true);
+        assert_eq!(
+            hangup_resource.wait_for_rx(Duration::ZERO),
+            Ok(false),
+            "non-RX readiness must not be reported as an RX event"
+        );
     }
 }

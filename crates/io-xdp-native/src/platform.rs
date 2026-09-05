@@ -117,4 +117,16 @@ mod tests {
             Err(NativeSyscallPlatformError::UnsupportedArchitecture)
         );
     }
+
+    #[test]
+    fn native_syscall_gate_uses_the_compiled_target_dimensions() {
+        assert_eq!(
+            ensure_native_syscall_supported(),
+            native_syscall_support(
+                cfg!(target_os = "linux"),
+                cfg!(target_pointer_width = "64"),
+                cfg!(target_arch = "x86_64"),
+            )
+        );
+    }
 }

@@ -6,7 +6,6 @@
 //! very small interface.
 
 use std::{
-    env,
     ffi::{c_int, c_void},
     os::unix::ffi::OsStrExt,
     process,
@@ -48,7 +47,7 @@ struct NotifyAddress {
 
 impl NotifyAddress {
     fn from_env() -> Option<Self> {
-        let value = env::var_os(NOTIFY_SOCKET_ENV)?;
+        let value = crate::test_env::var_os(NOTIFY_SOCKET_ENV)?;
         Self::from_bytes(value.as_os_str().as_bytes())
     }
 
@@ -223,7 +222,10 @@ fn classify_send_errno(errno: i32) -> NotifySendResult {
 }
 
 fn watchdog_interval_from_env() -> Option<Duration> {
-    let usec = env::var(WATCHDOG_USEC_ENV).ok()?.parse::<u64>().ok()?;
+    let usec = crate::test_env::var_os(WATCHDOG_USEC_ENV)?
+        .to_str()?
+        .parse::<u64>()
+        .ok()?;
     let half_usec = usec / 2;
     if half_usec == 0 || !watchdog_pid_matches() {
         return None;
@@ -232,10 +234,13 @@ fn watchdog_interval_from_env() -> Option<Duration> {
 }
 
 fn watchdog_pid_matches() -> bool {
-    match env::var(WATCHDOG_PID_ENV) {
-        Ok(value) => value.parse::<u32>().ok() == Some(process::id()),
-        Err(env::VarError::NotPresent) => true,
-        Err(env::VarError::NotUnicode(_)) => false,
+    // An absent variable means systemd did not scope the watchdog to a PID.
+    // A non-Unicode value is not a PID, so it can never match this process.
+    match crate::test_env::var_os(WATCHDOG_PID_ENV) {
+        None => true,
+        Some(value) => value
+            .to_str()
+            .is_some_and(|value| value.parse::<u32>().ok() == Some(process::id())),
     }
 }
 
@@ -269,60 +274,47 @@ unsafe extern "C" {
 mod tests {
     use super::*;
     use std::{
+        env,
+        ffi::OsStr,
         fs,
         path::{Path, PathBuf},
-        sync::{atomic::AtomicU64, Mutex, MutexGuard, OnceLock},
+        sync::atomic::AtomicU64,
     };
 
     const POLLIN: i16 = 0x0001;
-    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     static NEXT_SOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
-    struct NotifyEnv<'lock> {
-        _lock: MutexGuard<'lock, ()>,
-        old_values: [(&'static str, Option<std::ffi::OsString>); 3],
+    /// Gives one test its own view of the three systemd variables.
+    ///
+    /// The override is per thread, so tests need no shared lock and one
+    /// failing test cannot poison another. See `test_env` for why the process
+    /// environment must not be written from a test.
+    struct NotifyEnv {
+        _overrides: [crate::test_env::EnvOverrideGuard; 3],
     }
 
-    impl NotifyEnv<'_> {
+    impl NotifyEnv {
         fn new(
             notify_socket: Option<&str>,
             watchdog_usec: Option<&str>,
             watchdog_pid: Option<&str>,
         ) -> Self {
-            let lock = TEST_ENV_LOCK
-                .get_or_init(|| Mutex::new(()))
-                .lock()
-                .expect("sd_notify test environment lock must not be poisoned");
-            let old_values = [
-                (NOTIFY_SOCKET_ENV, env::var_os(NOTIFY_SOCKET_ENV)),
-                (WATCHDOG_USEC_ENV, env::var_os(WATCHDOG_USEC_ENV)),
-                (WATCHDOG_PID_ENV, env::var_os(WATCHDOG_PID_ENV)),
-            ];
-            set_or_remove(NOTIFY_SOCKET_ENV, notify_socket);
-            set_or_remove(WATCHDOG_USEC_ENV, watchdog_usec);
-            set_or_remove(WATCHDOG_PID_ENV, watchdog_pid);
             Self {
-                _lock: lock,
-                old_values,
+                _overrides: [
+                    crate::test_env::override_for_thread(
+                        NOTIFY_SOCKET_ENV,
+                        notify_socket.map(OsStr::new),
+                    ),
+                    crate::test_env::override_for_thread(
+                        WATCHDOG_USEC_ENV,
+                        watchdog_usec.map(OsStr::new),
+                    ),
+                    crate::test_env::override_for_thread(
+                        WATCHDOG_PID_ENV,
+                        watchdog_pid.map(OsStr::new),
+                    ),
+                ],
             }
-        }
-    }
-
-    impl Drop for NotifyEnv<'_> {
-        fn drop(&mut self) {
-            for (key, value) in &self.old_values {
-                match value {
-                    Some(value) => env::set_var(key, value),
-                    None => env::remove_var(key),
-                }
-            }
-        }
-    }
-
-    fn set_or_remove(key: &str, value: Option<&str>) {
-        match value {
-            Some(value) => env::set_var(key, value),
-            None => env::remove_var(key),
         }
     }
 
@@ -868,9 +860,14 @@ mod tests {
         );
 
         let _environment = NotifyEnv::new(Some(path_string), None, None);
+        // The notifier is built here rather than inside the worker: the test
+        // environment override is scoped to this thread, and the property
+        // under test is that the *send* does not block, not where the address
+        // is read.
+        let notifier = Notifier::from_env();
         let (done_sender, done_receiver) = std::sync::mpsc::channel();
         let _worker = std::thread::spawn(move || {
-            let _ = done_sender.send(Notifier::from_env().ready());
+            let _ = done_sender.send(notifier.ready());
         });
         let result = done_receiver
             .recv_timeout(Duration::from_millis(100))
@@ -989,6 +986,22 @@ mod tests {
         // Protects the fd-zero path without changing any descriptor in the
         // parent test process; only the child performs the socket operation.
         assert!(status.success(), "fd-zero sd_notify child must succeed");
+    }
+
+    mod mutation_sd_notify_line_26 {
+        use super::*;
+
+        #[test]
+        fn notify_socket_type_has_the_complete_socket_abi_flags() {
+            // The datagram and nonblocking flags are both required by the
+            // notification socket ABI. Their disjoint bit patterns also make
+            // `|` and `^` semantically equivalent for this constant.
+            assert_eq!(SOCK_DGRAM, 2);
+            assert_eq!(SOCK_NONBLOCK, 0x800);
+            assert_eq!(NOTIFY_SOCKET_TYPE, 0x802);
+            assert_eq!(NOTIFY_SOCKET_TYPE & SOCK_DGRAM, SOCK_DGRAM);
+            assert_eq!(NOTIFY_SOCKET_TYPE & SOCK_NONBLOCK, SOCK_NONBLOCK);
+        }
     }
 
     unsafe extern "C" {

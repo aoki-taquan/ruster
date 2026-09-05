@@ -2,8 +2,8 @@
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
+    cell::Cell,
     num::NonZeroU64,
-    sync::atomic::{AtomicUsize, Ordering},
 };
 
 use ruster_control::{
@@ -20,11 +20,25 @@ use ruster_core::{
 
 struct CountingAllocator;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+// The count is per thread, matching every other allocation suite in this
+// workspace. A process-wide counter also observes allocations made by other
+// threads in the binary, which made this assertion fail under load without
+// any allocation on the measured path.
+thread_local! {
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn record_allocation() {
+    ALLOCATIONS.with(|count| count.set(count.get().saturating_add(1)));
+}
+
+fn allocation_count() -> usize {
+    ALLOCATIONS.with(Cell::get)
+}
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        record_allocation();
         // SAFETY: `layout` is supplied by the allocator contract.
         unsafe { System.alloc(layout) }
     }
@@ -35,13 +49,13 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        record_allocation();
         // SAFETY: `layout` is supplied by the allocator contract.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        record_allocation();
         // SAFETY: `pointer` and `layout` came from this allocator.
         unsafe { System.realloc(pointer, layout, size) }
     }
@@ -133,7 +147,7 @@ fn validated_candidate_builds_1024_static_authority_views_without_work() {
 
     assert_eq!(take_full_forwarding_validation_count(), 1);
     assert_eq!(take_full_firewall_validation_count(), 1);
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let before = allocation_count();
     for _ in 0..1_024 {
         let authority = candidate.authority();
         assert_eq!(authority.generation(), NonZeroU64::MIN);
@@ -141,7 +155,7 @@ fn validated_candidate_builds_1024_static_authority_views_without_work() {
         assert_eq!(authority.nat44_tcp_config().outside(), WAN);
         assert_eq!(authority.firewall_config().generation(), 1);
     }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
+    let after = allocation_count();
     assert_eq!(after, before);
     assert_eq!(take_full_forwarding_validation_count(), 0);
     assert_eq!(take_full_firewall_validation_count(), 0);
