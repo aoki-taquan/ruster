@@ -4,26 +4,33 @@
 //! does not depend on the benchmark crate or on the simulator backend.
 
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     fmt,
     panic::{catch_unwind, AssertUnwindSafe},
+    rc::Rc,
 };
 
 use ruster_core::{
-    forward_batch, forward_batch_with_firewall, forward_batch_with_nat44_udp_and_tcp,
-    forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors, internet_checksum,
-    ipv4_header_checksum, validate_arp, validate_arp_request, validate_ipv4_frame, BatchCompletion,
-    FirewallAction, FirewallConfig, FirewallHashKey, FirewallInterface, FirewallIpv4Prefix,
-    FirewallPolicy, FirewallPortRange, FirewallProtocol, FirewallRule, FirewallRuleId,
-    FirewallRuntime, FirewallStateSlot, ForwardingSnapshot, Icmpv4ErrorActionSlot,
-    Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
-    Ipv4Mtu, LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Icmpv4Disposition,
-    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpHashKey, Nat44TcpIndexStorage,
-    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig,
-    Nat44UdpHashKey, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
-    Nat44UdpRuntime, Neighbor, NoTrace, PacketBatch, PacketLease, PacketSlot, ResolutionActionSlot,
-    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route, SlotCompletion, TraceEvent,
-    TraceSink, IPV4_ETHERTYPE,
+    execute_one_held_datagram, forward_batch, forward_batch_with_firewall,
+    forward_batch_with_nat44_udp_and_tcp, forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors,
+    internet_checksum, ipv4_header_checksum, validate_arp, validate_arp_request,
+    validate_ipv4_frame, BatchCompletion, DynamicNeighborSlot, FirewallAction, FirewallConfig,
+    FirewallHashKey, FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange,
+    FirewallProtocol, FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot,
+    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
+    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4Mtu, LocalIpv4Binding, MacAddress,
+    MonotonicMillis, Nat44Icmpv4Disposition, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
+    Nat44TcpHashKey, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime,
+    Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpIndexStorage,
+    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace,
+    PacketBatch, PacketLease, PacketSlot, ResolutionActionSlot, ResolutionDatagramHoldSlot,
+    ResolutionFailureHoldSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
+    SlotCompletion, TraceEvent, TraceSink, IPV4_ETHERTYPE,
+};
+use ruster_core::{
+    forward_batch_with_resolution, GeneratedAllocationError, GeneratedBatchCompletion,
+    GeneratedHeldDatagramTrace, GeneratedHeldDatagramTraceSink, GeneratedPacketBatch,
+    GeneratedPacketIo, GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion,
 };
 
 const LAN: IfId = IfId(1);
@@ -41,6 +48,30 @@ const GATEWAY: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 1]);
 
 const RANDOM_SEED: u64 = 0x7261_6e64_6f6d_0001;
 const STRUCTURED_SEED: u64 = 0x7374_7275_6374_0001;
+const NARROW_EGRESS_SEED: u64 = 0x6e61_7272_6f77_0001;
+const NARROW_EGRESS_MTU: usize = 576;
+thread_local! {
+    static NARROW_EMITTED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Lengths around the 576-byte egress link and the eight-octet fragment
+/// boundary, so the split arithmetic is met head on rather than by chance.
+const NARROW_EGRESS_LENGTHS: [usize; 14] = [
+    14 + 575,
+    14 + 576,
+    14 + 577,
+    14 + 596,
+    14 + 596 + 1,
+    14 + 596 + 7,
+    14 + 596 + 8,
+    14 + 1_128,
+    14 + 1_129,
+    14 + 1_148,
+    14 + 1_400,
+    14 + 1_480,
+    14 + 1_500,
+    14 + 20,
+];
 const DEFAULT_ITERATIONS: usize = 50_000;
 const MAX_ITERATIONS: usize = 5_000_000;
 
@@ -1185,4 +1216,278 @@ fn tcp_config(snapshot: &ForwardingSnapshot<'_>) -> Nat44TcpConfig {
         Nat44TcpPolicy::default().with_icmpv4_errors(Nat44Icmpv4ErrorPolicy::ExternalOnly),
     )
     .unwrap()
+}
+
+/// A topology whose egress link is narrower than its ingress link.
+///
+/// The default fuzz topology gives both interfaces a 1500-byte MTU, so no
+/// generated frame can ever exceed the egress link and the MTU, fragmentation
+/// and hold paths are never entered. This one can.
+fn narrow_egress_topology() -> (
+    [Route; 2],
+    [Interface; 2],
+    [Neighbor; 2],
+    [LocalIpv4Binding; 2],
+) {
+    let (routes, _, neighbors, bindings) = topology();
+    (
+        routes,
+        [
+            Interface {
+                id: LAN,
+                mac: LAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
+            },
+            Interface {
+                id: WAN,
+                mac: WAN_MAC,
+                mtu: Ipv4Mtu::new(u16::try_from(NARROW_EGRESS_MTU).unwrap())
+                    .expect("the fuzz MTU is above the IPv4 minimum"),
+            },
+        ],
+        neighbors,
+        bindings,
+    )
+}
+
+/// A generated-packet backend that accepts every frame and keeps the bytes.
+///
+/// The fuzz driver only needs somewhere for a replay or a split to go; the
+/// accounting invariants it reports are what the assertions check.
+#[derive(Default)]
+struct GeneratedFuzzIo {
+    transmitted: Rc<RefCell<Vec<Vec<u8>>>>,
+}
+
+struct GeneratedFuzzBatch<'io> {
+    io: &'io mut GeneratedFuzzIo,
+    accepted: usize,
+}
+
+struct GeneratedFuzzSlot {
+    bytes: Vec<u8>,
+    transmitted: Rc<RefCell<Vec<Vec<u8>>>>,
+}
+
+impl GeneratedPacketIo for GeneratedFuzzIo {
+    type Error = ();
+    type Batch<'a>
+        = GeneratedFuzzBatch<'a>
+    where
+        Self: 'a;
+
+    fn begin_generated(&mut self, _egress: IfId) -> Self::Batch<'_> {
+        GeneratedFuzzBatch {
+            io: self,
+            accepted: 0,
+        }
+    }
+}
+
+impl GeneratedPacketBatch for GeneratedFuzzBatch<'_> {
+    type Error = ();
+    type Slot<'a>
+        = GeneratedFuzzSlot
+    where
+        Self: 'a;
+
+    fn allocate(
+        &mut self,
+        frame_len: usize,
+    ) -> Result<GeneratedPacketLease<Self::Slot<'_>>, GeneratedAllocationError> {
+        if frame_len == 0 {
+            return Err(GeneratedAllocationError::ZeroLength);
+        }
+        self.accepted += 1;
+        Ok(GeneratedPacketLease::new(GeneratedFuzzSlot {
+            bytes: vec![0; frame_len],
+            transmitted: Rc::clone(&self.io.transmitted),
+        }))
+    }
+
+    fn finish(self) -> GeneratedBatchCompletion<Self::Error> {
+        let accepted = self.accepted;
+        GeneratedBatchCompletion {
+            attempts: accepted,
+            allocated: accepted,
+            failed: 0,
+            requested: accepted,
+            cancelled: 0,
+            abandoned: 0,
+            accepted,
+            rejected: 0,
+            error: None,
+        }
+    }
+}
+
+impl GeneratedPacketSlot for GeneratedFuzzSlot {
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
+    }
+
+    fn complete(self, completion: GeneratedSlotCompletion) {
+        if matches!(completion, GeneratedSlotCompletion::Transmit) {
+            self.transmitted.borrow_mut().push(self.bytes);
+        }
+    }
+}
+
+#[derive(Default)]
+struct CountingHeldTrace {
+    events: usize,
+}
+
+impl GeneratedHeldDatagramTraceSink for CountingHeldTrace {
+    fn record_generated_held_datagram(&mut self, _event: GeneratedHeldDatagramTrace) {
+        self.events += 1;
+    }
+}
+
+fn run_narrow_egress_forwarding(frame: &[u8], snapshot: &ForwardingSnapshot<'_>) {
+    let mut packet = frame.to_vec();
+    let completion = Cell::new(None);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 2];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 2];
+    let mut dynamic = [DynamicNeighborSlot::EMPTY; 2];
+    let mut failure_holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+    let mut datagram_holds = [ResolutionDatagramHoldSlot::EMPTY; 2];
+    let mut resolution = ResolutionRuntime::with_dynamic_neighbors_failure_holds_and_datagram_holds(
+        ResolutionPolicy::with_dynamic_neighbor_ttl(1_000, 60_000, 60_000).unwrap(),
+        &mut resolution_states,
+        &mut resolution_actions,
+        &mut dynamic,
+        &mut failure_holds,
+        &mut datagram_holds,
+    );
+    let report = forward_batch_with_resolution(
+        SinglePacketBatch {
+            ingress: LAN,
+            frame: Some(packet.as_mut_slice()),
+            completion: &completion,
+        },
+        snapshot,
+        &mut resolution,
+        MonotonicMillis(1_000),
+        &mut NoTrace,
+    );
+    assert_batch_invariants(&report.completion);
+    assert!(report.invariants_hold());
+    assert!(completion.get().is_some());
+
+    // Whatever the datagram was, draining the hold queue must not panic and
+    // must leave the queue empty: a slot that stayed occupied would be a
+    // datagram this router had promised to send and then kept.
+    let mut io = GeneratedFuzzIo::default();
+    let mut trace = CountingHeldTrace::default();
+    for _ in 0..8 {
+        match execute_one_held_datagram(
+            &mut io,
+            &mut resolution,
+            MonotonicMillis(1_000),
+            &mut trace,
+        ) {
+            Ok(Some(report)) => assert!(report.completion.invariants_hold()),
+            Ok(None) | Err(_) => break,
+        }
+    }
+
+    // Whatever the router chose to emit, it must fit the link it chose to emit
+    // it on. That is the property fragmentation exists to keep, checked here
+    // against every frame this corpus can produce.
+    NARROW_EMITTED.with(|count| count.set(count.get() + io.transmitted.borrow().len()));
+    for frame in io.transmitted.borrow().iter() {
+        assert!(
+            frame.len() >= 34,
+            "an emitted frame must carry an IPv4 header"
+        );
+        let total_len = usize::from(u16::from_be_bytes([frame[16], frame[17]]));
+        assert!(
+            total_len <= NARROW_EGRESS_MTU,
+            "an emitted datagram of {total_len} bytes cannot cross a {NARROW_EGRESS_MTU}-byte link"
+        );
+        assert_eq!(
+            total_len,
+            frame.len() - 14,
+            "the stated total length must match the frame"
+        );
+    }
+}
+
+#[test]
+fn deterministic_fuzz_narrow_egress_link_does_not_panic() {
+    let iterations = configured_iterations();
+    let (routes, interfaces, neighbors, bindings) = narrow_egress_topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let mut stream = XorShift64::new(NARROW_EGRESS_SEED);
+
+    for iteration in 0..iterations {
+        let case_seed = stream.next_u64();
+        let mut case_rng = XorShift64::new(case_seed);
+        // A wholly random byte string almost never parses as a routable IPv4
+        // datagram, so it could not reach the oversize decision at all. The
+        // corpus is therefore a valid oversized datagram with a light mutation
+        // on top: most cases stay routable and exercise the split, and the
+        // mutated ones probe its edges.
+        let length = NARROW_EGRESS_LENGTHS
+            .get(iteration)
+            .copied()
+            .unwrap_or_else(|| 14 + 20 + 8 + case_rng.index(1_400));
+        let frame = oversized_forwardable_frame(length, &mut case_rng);
+        run_case(NARROW_EGRESS_SEED, case_seed, iteration, &frame, || {
+            run_narrow_egress_forwarding(&frame, &snapshot);
+        });
+    }
+
+    NARROW_EMITTED.with(|emitted| {
+        // The corpus is only worth running if it reaches the split at all, so
+        // the count is both reported and required to be non-zero. A random
+        // byte string almost never parses as a routable datagram, and an
+        // earlier version of this driver reached the path zero times.
+        assert!(
+            emitted.get() > 0,
+            "the narrow-egress corpus must reach the fragmentation path"
+        );
+        println!(
+            "deterministic fuzz smoke: strategy=narrow-egress seed=0x{NARROW_EGRESS_SEED:016x} inputs={iterations} frames_emitted={}",
+            emitted.get()
+        );
+    });
+}
+
+/// A datagram that routes out of the narrow link, with a light mutation.
+///
+/// Don't Fragment is clear, so an oversized one must be split rather than
+/// reported. The mutation is applied after the header checksum is sealed only
+/// one time in eight, which keeps most of the corpus routable while still
+/// probing what happens when it is not.
+fn oversized_forwardable_frame(length: usize, rng: &mut XorShift64) -> Vec<u8> {
+    let length = length.max(14 + 28);
+    let total_len = u16::try_from(length - 14).unwrap_or(u16::MAX);
+    let mut frame = vec![0_u8; length];
+    frame[0..6].copy_from_slice(&LAN_MAC.0);
+    frame[6..12].copy_from_slice(&HOST_MAC.0);
+    frame[12..14].copy_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+    frame[14] = 0x45;
+    frame[16..18].copy_from_slice(&total_len.to_be_bytes());
+    frame[18..20].copy_from_slice(&(rng.next_u64() as u16).to_be_bytes());
+    // Don't Fragment clear, no offset: this datagram may be split.
+    frame[20..22].copy_from_slice(&0_u16.to_be_bytes());
+    frame[22] = 64;
+    frame[23] = 17;
+    frame[26..30].copy_from_slice(&HOST.octets());
+    frame[30..34].copy_from_slice(&REMOTE.octets());
+    let udp_len = u16::try_from(length - 14 - 20).unwrap_or(u16::MAX);
+    frame[34..36].copy_from_slice(&1_u16.to_be_bytes());
+    frame[36..38].copy_from_slice(&53_u16.to_be_bytes());
+    frame[38..40].copy_from_slice(&udp_len.to_be_bytes());
+    for (index, byte) in frame[42..].iter_mut().enumerate() {
+        *byte = u8::try_from(index % 251).unwrap_or(0);
+    }
+    refresh_ipv4_checksum(&mut frame, 14);
+    if rng.index(8) == 0 {
+        let index = rng.index(frame.len());
+        frame[index] ^= 1 << rng.index(8);
+    }
+    frame
 }
