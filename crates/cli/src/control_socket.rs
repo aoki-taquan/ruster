@@ -7,7 +7,7 @@
 //! non-blocking.
 
 use std::{
-    env, fs, io,
+    fs, io,
     os::{
         fd::{AsRawFd, FromRawFd, RawFd},
         unix::{
@@ -212,7 +212,7 @@ enum ExistingSocketProbe {
 }
 
 fn control_socket_path() -> Result<PathBuf, String> {
-    let path = env::var_os(CONTROL_SOCKET_ENV)
+    let path = crate::test_env::var_os(CONTROL_SOCKET_ENV)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONTROL_SOCKET));
     ControlAddress::from_path(&path)?;
@@ -773,8 +773,13 @@ fn wait_for_probe_connect(
             revents: 0,
         };
         let timeout_ms = poll_timeout_millis(remaining);
+        // Test builds use the deterministic sequence here; normal builds call
+        // the libc syscall directly.
+        #[cfg(test)]
+        let polled = test_poll_with_eintr_seam(&mut poll_fd, timeout_ms);
         // SAFETY: poll_fd points to one initialized pollfd for this call and
         // the timeout is finite; poll never retains the pointer.
+        #[cfg(not(test))]
         let polled = unsafe { poll(&mut poll_fd, 1, timeout_ms) };
         if polled < 0 {
             let error = io::Error::last_os_error();
@@ -1407,8 +1412,13 @@ fn send_response(fd: RawFd, response: &[u8]) -> io::Result<()> {
         // MSG_NOSIGNAL is per-send and cannot alter the daemon's signal
         // disposition for unrelated code.  It guarantees a disconnected
         // status client produces EPIPE/ECONNRESET rather than SIGPIPE death.
+        // Test builds use the shared deterministic sequence here; normal
+        // builds call the libc syscall directly.
+        #[cfg(test)]
+        let sent = test_sendmsg_with_eintr_seam(fd, &message);
         // SAFETY: the message points to the live response/iovec buffers and
         // the fd is an accepted socket owned by this listener.
+        #[cfg(not(test))]
         let sent = unsafe { sendmsg(fd, &message, MSG_NOSIGNAL) };
         if sent >= 0 {
             break sent;
@@ -1448,8 +1458,13 @@ fn receive_response(fd: RawFd) -> io::Result<Vec<u8>> {
     };
 
     let length = loop {
+        // Test builds use the deterministic sequence here; normal builds call
+        // the libc syscall directly.
+        #[cfg(test)]
+        let length = test_recvmsg_with_eintr_seam(fd, &mut message);
         // SAFETY: the response buffers and MsgHdr are live for this blocking
         // client call; MSG_CMSG_CLOEXEC protects any unexpected passed fd.
+        #[cfg(not(test))]
         let length = unsafe { recvmsg(fd, &mut message, MSG_CMSG_CLOEXEC) };
         if length >= 0 {
             break length;
@@ -1546,6 +1561,11 @@ fn send_client_request(fd: RawFd, request: &[u8]) -> io::Result<()> {
     let sent = loop {
         // SAFETY: request and iovec remain live for this sendmsg call; the
         // client fd is owned by the caller.
+        // Test builds use a per-thread deterministic sequence here; normal
+        // builds call the libc syscall directly.
+        #[cfg(test)]
+        let sent = test_sendmsg_with_eintr_seam(fd, &message);
+        #[cfg(not(test))]
         let sent = unsafe { sendmsg(fd, &message, MSG_NOSIGNAL) };
         if sent >= 0 {
             break sent;
@@ -1564,6 +1584,157 @@ fn send_client_request(fd: RawFd, request: &[u8]) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Sentinel success length that makes the seam return EINTR on every call.
+#[cfg(test)]
+const ALWAYS_EINTR: isize = -1;
+
+#[cfg(test)]
+std::thread_local! {
+    // The optional state makes the real syscall the default and confines the
+    // deterministic EINTR sequence to the test thread that arms it.
+    static TEST_SENDMSG_EINTR_ONCE: std::cell::Cell<Option<(usize, isize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+unsafe extern "C" {
+    #[link_name = "__errno_location"]
+    fn test_errno_location() -> *mut std::ffi::c_int;
+}
+
+#[cfg(test)]
+fn arm_test_sendmsg_eintr(success_length: usize) {
+    let success_length =
+        isize::try_from(success_length).expect("test sendmsg success length must fit in ssize_t");
+    TEST_SENDMSG_EINTR_ONCE.with(|state| {
+        state.set(Some((0, success_length)));
+    });
+}
+
+#[cfg(test)]
+fn arm_test_sendmsg_eintr_always() {
+    TEST_SENDMSG_EINTR_ONCE.with(|state| {
+        state.set(Some((0, ALWAYS_EINTR)));
+    });
+}
+
+#[cfg(test)]
+fn disarm_test_sendmsg_eintr() -> usize {
+    TEST_SENDMSG_EINTR_ONCE
+        .with(std::cell::Cell::take)
+        .map_or(0, |(calls, _)| calls)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    // Counts calls and the number of synthetic EINTR results still owed. The
+    // optional state keeps the real syscall as the default for every test
+    // that does not arm it.
+    static TEST_RECVMSG_EINTR: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_POLL_EINTR: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn arm_test_recvmsg_eintr(count: usize) {
+    TEST_RECVMSG_EINTR.with(|state| state.set(Some((0, count))));
+}
+
+#[cfg(test)]
+fn disarm_test_recvmsg_eintr() -> usize {
+    TEST_RECVMSG_EINTR
+        .with(std::cell::Cell::take)
+        .map_or(0, |(calls, _)| calls)
+}
+
+#[cfg(test)]
+fn arm_test_poll_eintr(count: usize) {
+    TEST_POLL_EINTR.with(|state| state.set(Some((0, count))));
+}
+
+#[cfg(test)]
+fn disarm_test_poll_eintr() -> usize {
+    TEST_POLL_EINTR
+        .with(std::cell::Cell::take)
+        .map_or(0, |(calls, _)| calls)
+}
+
+#[cfg(test)]
+fn take_synthetic_eintr(
+    state: &'static std::thread::LocalKey<std::cell::Cell<Option<(usize, usize)>>>,
+) -> Option<bool> {
+    state.with(|state| {
+        let (calls, owed) = state.get()?;
+        let calls = calls.saturating_add(1);
+        if owed == 0 {
+            state.set(Some((calls, 0)));
+            return Some(false);
+        }
+        state.set(Some((calls, owed - 1)));
+        Some(true)
+    })
+}
+
+#[cfg(test)]
+fn set_test_errno(error: std::ffi::c_int) {
+    // SAFETY: the libc errno location belongs to the calling test thread and
+    // is writable for this synthetic result.
+    unsafe { *test_errno_location() = error };
+}
+
+#[cfg(test)]
+fn test_recvmsg_with_eintr_seam(fd: RawFd, message: *mut MsgHdr) -> isize {
+    if take_synthetic_eintr(&TEST_RECVMSG_EINTR) == Some(true) {
+        set_test_errno(EINTR);
+        return -1;
+    }
+    // SAFETY: the caller owns the live response buffers and MsgHdr; this is
+    // the real syscall whenever the seam owes no synthetic result.
+    unsafe { recvmsg(fd, message, MSG_CMSG_CLOEXEC) }
+}
+
+#[cfg(test)]
+fn test_poll_with_eintr_seam(poll_fd: *mut PollFd, timeout_ms: i32) -> i32 {
+    if take_synthetic_eintr(&TEST_POLL_EINTR) == Some(true) {
+        set_test_errno(EINTR);
+        return -1;
+    }
+    // SAFETY: the caller owns one initialized pollfd for this call; this is
+    // the real syscall whenever the seam owes no synthetic result.
+    unsafe { poll(poll_fd, 1, timeout_ms) }
+}
+
+#[cfg(test)]
+fn test_sendmsg_with_eintr_seam(fd: RawFd, message: *const MsgHdr) -> isize {
+    let fake_result = TEST_SENDMSG_EINTR_ONCE.with(|state| {
+        let (calls, success_length) = state.get()?;
+        let calls = calls.saturating_add(1);
+        state.set(Some((calls, success_length)));
+        Some(if calls == 1 || success_length == ALWAYS_EINTR {
+            Err(EINTR)
+        } else {
+            Ok(success_length)
+        })
+    });
+
+    match fake_result {
+        Some(Err(error)) => {
+            // SAFETY: the libc errno location belongs to the calling test
+            // thread and is writable for this synthetic EINTR result.
+            unsafe { *test_errno_location() = error };
+            -1
+        }
+        Some(Ok(sent)) => sent,
+        None => {
+            // SAFETY: the message points to the live caller-owned message and
+            // iovec buffers; this fallback is the real syscall when the seam
+            // is idle, which is every call outside a test that armed it.
+            unsafe { sendmsg(fd, message, MSG_NOSIGNAL) }
+        }
+    }
 }
 
 pub(crate) fn request_status() -> Result<(), String> {
@@ -2775,9 +2946,10 @@ mod tests {
         use super::*;
         use std::{
             cell::Cell,
+            fs::File,
             io::{Read, Write},
             os::{
-                fd::{AsRawFd, IntoRawFd},
+                fd::{AsRawFd, FromRawFd, IntoRawFd},
                 unix::net::{UnixListener, UnixStream},
             },
             process::{self, Command, Output},
@@ -2785,39 +2957,14 @@ mod tests {
         };
 
         const POLLIN: std::ffi::c_short = 0x0001;
-        const SIGUSR1: std::ffi::c_int = 10;
         const ENOTSOCK: i32 = 88;
 
         static NEXT_CASE: AtomicU64 = AtomicU64::new(0);
 
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct TestSigSet {
-            values: [u64; 16],
-        }
-
-        #[repr(C)]
-        #[derive(Clone, Copy)]
-        struct TestSigAction {
-            handler: usize,
-            mask: TestSigSet,
-            flags: usize,
-            restorer: usize,
-        }
-
         unsafe extern "C" {
             fn pipe(file_descriptors: *mut std::ffi::c_int) -> std::ffi::c_int;
-            fn pthread_kill(thread: usize, signal: std::ffi::c_int) -> std::ffi::c_int;
-            fn pthread_self() -> usize;
             fn __errno_location() -> *mut std::ffi::c_int;
-            fn sigaction(
-                signal: std::ffi::c_int,
-                action: *const TestSigAction,
-                old_action: *mut TestSigAction,
-            ) -> std::ffi::c_int;
         }
-
-        extern "C" fn test_signal_handler(_: std::ffi::c_int) {}
 
         fn workspace_target() -> PathBuf {
             Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2873,30 +3020,6 @@ mod tests {
                 .env(marker, "1")
                 .output()
                 .expect("isolated control socket child must start")
-        }
-
-        fn install_nonrestarting_signal_handler() {
-            let action = TestSigAction {
-                handler: test_signal_handler as *const () as usize,
-                mask: TestSigSet { values: [0; 16] },
-                flags: 0,
-                restorer: 0,
-            };
-            // SAFETY: action is initialized for the Linux sigaction ABI and
-            // omits SA_RESTART so blocking calls expose EINTR.
-            let result = unsafe { sigaction(SIGUSR1, &action, ptr::null_mut()) };
-            assert_eq!(result, 0, "SIGUSR1 handler installation must succeed");
-        }
-
-        fn signal_current_thread_after(delay: Duration) -> thread::JoinHandle<()> {
-            // SAFETY: pthread_self returns the current test thread identifier.
-            let target = unsafe { pthread_self() };
-            thread::spawn(move || {
-                thread::sleep(delay);
-                // SAFETY: target remains live while the caller is blocked.
-                let result = unsafe { pthread_kill(target, SIGUSR1) };
-                assert_eq!(result, 0, "test signal must reach the blocked thread");
-            })
         }
 
         fn fill_until_would_block(stream: &mut UnixStream) -> bool {
@@ -3151,20 +3274,27 @@ mod tests {
 
         #[test]
         fn wait_for_probe_connect_ignores_pollin_without_requested_events() {
-            let (mut socket, mut peer) =
-                UnixStream::pair().expect("unrequested-event probe pair must open");
-            if !fill_until_would_block(&mut socket) {
-                drop(peer);
-                return;
-            }
-            peer.write_all(b"incoming")
-                .expect("probe peer must provide POLLIN");
+            let mut descriptors = [-1; 2];
+            assert_eq!(
+                unsafe { pipe(descriptors.as_mut_ptr()) },
+                0,
+                "unrequested-event probe pipe must open"
+            );
+            // SAFETY: pipe returned two owned, initialized descriptors; each
+            // is transferred exactly once into a File owner below.
+            let reader = unsafe { File::from_raw_fd(descriptors[0]) };
+            let mut writer = unsafe { File::from_raw_fd(descriptors[1]) };
+            writer
+                .write_all(b"incoming")
+                .expect("probe pipe must provide POLLIN");
             let mut poll_fd = PollFd {
-                fd: socket.as_raw_fd(),
-                events: POLLOUT,
+                fd: reader.as_raw_fd(),
+                // Request both readiness bits so this setup poll has a
+                // deterministic, explicitly requested event to report.
+                events: POLLIN | POLLOUT,
                 revents: 0,
             };
-            let polled = unsafe { poll(&mut poll_fd, 1, 0) };
+            let polled = unsafe { poll(&mut poll_fd, 1, 100) };
             assert_eq!(polled, 1, "probe setup must produce a poll event");
             assert_eq!(
                 poll_fd.revents & POLLOUT,
@@ -3178,7 +3308,7 @@ mod tests {
             );
 
             let result = wait_for_probe_connect(
-                socket.as_raw_fd(),
+                reader.as_raw_fd(),
                 Instant::now() + Duration::from_millis(15),
                 || false,
             );
@@ -3232,19 +3362,21 @@ mod tests {
                 return;
             }
 
-            install_nonrestarting_signal_handler();
             let (mut socket, peer) = UnixStream::pair().expect("poll EINTR pair must open");
             if !fill_until_would_block(&mut socket) {
                 drop(peer);
                 return;
             }
-            let signal = signal_current_thread_after(Duration::from_millis(10));
+            // Two synthetic EINTRs are owed, so a poll that gave up on the
+            // first interruption could not reach the deadline and could not
+            // record three calls.
+            arm_test_poll_eintr(2);
             let result = wait_for_probe_connect(
                 socket.as_raw_fd(),
                 Instant::now() + Duration::from_millis(50),
                 || false,
             );
-            signal.join().expect("poll signal helper must finish");
+            let calls = disarm_test_poll_eintr();
             drop(peer);
             match result {
                 ConnectProbeOutcome::Conservative(error) => {
@@ -3252,6 +3384,7 @@ mod tests {
                 }
                 _ => panic!("poll EINTR must be retried to the deadline"),
             }
+            assert_eq!(calls, 3, "both EINTRs must be retried before the deadline");
         }
 
         #[test]
@@ -3373,31 +3506,33 @@ mod tests {
 
         #[test]
         fn send_response_retries_one_eintr_before_success() {
-            const MARKER: &str = "RUSTER_CONTROL_SEND_RESPONSE_EINTR_CHILD";
-            if std::env::var_os(MARKER).is_none() {
-                let output = child_output("send_response_retries_one_eintr_before_success", MARKER);
-                assert!(
-                    output.status.success(),
-                    "send_response EINTR child failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                return;
-            }
-
-            install_nonrestarting_signal_handler();
-            let (mut sender, receiver) = UnixStream::pair().expect("response EINTR pair must open");
-            if !fill_until_would_block(&mut sender) {
-                return;
-            }
-            sender
-                .set_nonblocking(false)
-                .expect("response sender must become blocking");
-            let signal = signal_current_thread_after(Duration::from_millis(10));
-            let drain = drain_after(Duration::from_millis(35), receiver);
-            let result = send_response(sender.as_raw_fd(), b"response");
-            signal.join().expect("response signal helper must finish");
-            drain.join().expect("response drain helper must finish");
+            // A real signal racing a blocking sendmsg made this test depend on
+            // the scheduler: it failed three times in five workspace runs while
+            // passing alone. The seam keeps the property under test (one EINTR
+            // is retried exactly once) and drops only the race.
+            let response = b"response";
+            arm_test_sendmsg_eintr(response.len());
+            let result = send_response(-1, response);
+            let calls = disarm_test_sendmsg_eintr();
             assert!(result.is_ok(), "one EINTR must be retried");
+            assert_eq!(calls, 2, "sendmsg must be called once and retried once");
+        }
+
+        #[test]
+        fn send_response_reports_a_second_eintr_without_a_third_send() {
+            // The retry is deliberately one-shot: a second EINTR must surface
+            // rather than loop, so a signal storm cannot pin the listener.
+            let response = b"response";
+            arm_test_sendmsg_eintr_always();
+            let result = send_response(-1, response);
+            let calls = disarm_test_sendmsg_eintr();
+            assert_eq!(
+                result
+                    .expect_err("a second EINTR must not be retried")
+                    .raw_os_error(),
+                Some(EINTR)
+            );
+            assert_eq!(calls, 2, "the one-shot retry must stop after two sends");
         }
 
         #[test]
@@ -3416,23 +3551,22 @@ mod tests {
                 return;
             }
 
-            install_nonrestarting_signal_handler();
             if !unix_stream_writes_allowed() {
                 return;
             }
+            // The payload is already queued, so the only reason recvmsg can
+            // fail is the synthetic EINTR: reaching the payload proves the
+            // retry ran, and the call count proves it ran exactly twice.
             let (receiver, mut sender) =
                 UnixStream::pair().expect("response receive pair must open");
-            let signal = signal_current_thread_after(Duration::from_millis(10));
-            let writer = thread::spawn(move || {
-                thread::sleep(Duration::from_millis(35));
-                sender
-                    .write_all(b"response")
-                    .expect("response payload must be written");
-            });
+            sender
+                .write_all(b"response")
+                .expect("response payload must be written");
+            arm_test_recvmsg_eintr(1);
             let result = receive_response(receiver.as_raw_fd());
-            signal.join().expect("receive signal helper must finish");
-            writer.join().expect("response writer must finish");
+            let calls = disarm_test_recvmsg_eintr();
             assert_eq!(result.expect("EINTR response must be retried"), b"response");
+            assert_eq!(calls, 2, "recvmsg must be called once and retried once");
         }
 
         #[test]
@@ -3486,34 +3620,12 @@ mod tests {
 
         #[test]
         fn send_client_request_retries_one_eintr_before_success() {
-            const MARKER: &str = "RUSTER_CONTROL_SEND_CLIENT_EINTR_CHILD";
-            if std::env::var_os(MARKER).is_none() {
-                let output = child_output(
-                    "send_client_request_retries_one_eintr_before_success",
-                    MARKER,
-                );
-                assert!(
-                    output.status.success(),
-                    "send_client_request EINTR child failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                return;
-            }
-
-            install_nonrestarting_signal_handler();
-            let (mut sender, receiver) = UnixStream::pair().expect("request EINTR pair must open");
-            if !fill_until_would_block(&mut sender) {
-                return;
-            }
-            sender
-                .set_nonblocking(false)
-                .expect("request sender must become blocking");
-            let signal = signal_current_thread_after(Duration::from_millis(10));
-            let drain = drain_after(Duration::from_millis(35), receiver);
-            let result = send_client_request(sender.as_raw_fd(), b"request");
-            signal.join().expect("request signal helper must finish");
-            drain.join().expect("request drain helper must finish");
+            let request = b"request";
+            arm_test_sendmsg_eintr(request.len());
+            let result = send_client_request(-1, request);
+            let calls = disarm_test_sendmsg_eintr();
             assert!(result.is_ok(), "one EINTR must be retried");
+            assert_eq!(calls, 2, "sendmsg must be called once and retried once");
         }
     }
 
@@ -3594,6 +3706,12 @@ mod tests {
             process::Command,
             thread,
         };
+
+        const F_GETFD: std::ffi::c_int = 1;
+
+        unsafe extern "C" {
+            fn fcntl(fd: RawFd, command: std::ffi::c_int) -> std::ffi::c_int;
+        }
 
         unsafe extern "C" {
             fn chown(path: *const std::ffi::c_char, owner: u32, group: u32) -> std::ffi::c_int;
@@ -3764,11 +3882,22 @@ mod tests {
         fn wait_for_probe_connect_rejects_invalid_descriptor_conservatively() {
             // Protects the probe's invalid-fd handling: POLLNVAL is uncertainty,
             // never evidence that an endpoint is stale.
-            let fd = unsafe { socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0) };
-            assert!(fd >= 0, "probe test socket must be created");
-            let close_result = unsafe { close(fd) };
-            assert_eq!(close_result, 0, "probe test socket must close");
-            match wait_for_probe_connect(fd, Instant::now() + Duration::from_secs(1), || false) {
+            //
+            // Closing a descriptor and polling the stale number races the other
+            // test threads in this binary, which can reopen that number before
+            // poll runs. A number far above the descriptor limit cannot be
+            // reused, and F_GETFD confirms it is closed at the moment of use.
+            const UNOPENED_FD: RawFd = 1 << 20;
+            assert_eq!(
+                unsafe { fcntl(UNOPENED_FD, F_GETFD) },
+                -1,
+                "probe test descriptor must not be open"
+            );
+            match wait_for_probe_connect(
+                UNOPENED_FD,
+                Instant::now() + Duration::from_secs(1),
+                || false,
+            ) {
                 ConnectProbeOutcome::Conservative(error) => {
                     assert!(error.to_string().contains("invalid descriptor"));
                 }
