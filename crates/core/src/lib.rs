@@ -91,9 +91,10 @@ pub use packet::{
     ValidatedArpRequest, ValidatedIpv4, ARP_ETHERTYPE, ETHERNET_HEADER_LEN, IPV4_ETHERTYPE,
 };
 pub use resolution::{
-    dispatch_host_unreachable_failures, execute_one_arp_request, execute_one_held_datagram,
-    poll_resolution_timers, ArpRequestAction, ArpRequestBuildError, ControlDisposition,
-    DynamicNeighborScanReport, DynamicNeighborSlot, ExecuteArpRequestError,
+    build_arp_announcement, dispatch_host_unreachable_failures, execute_arp_announcement,
+    execute_one_arp_request, execute_one_held_datagram, poll_resolution_timers,
+    ArpAnnouncementAction, ArpAnnouncementKind, ArpRequestAction, ArpRequestBuildError,
+    ControlDisposition, DynamicNeighborScanReport, DynamicNeighborSlot, ExecuteArpRequestError,
     ExecuteHeldDatagramError, GeneratedArpReport, GeneratedArpTrace, GeneratedHeldDatagramTrace,
     GeneratedHeldDatagramTraceSink, GeneratedTraceSink, HeldDatagramBuildError, HeldDatagramReport,
     HoldDestination, MonotonicMillis, NoGeneratedHeldDatagramTrace, NoGeneratedTrace,

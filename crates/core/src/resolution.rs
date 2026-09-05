@@ -2976,6 +2976,119 @@ fn allocate_arp_request<B: GeneratedPacketBatch>(
     Ok(())
 }
 
+/// The ARP frames RFC 5227 defines for claiming an address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ArpAnnouncementKind {
+    /// RFC 5227 §2.1.1 Probe: asks whether anyone already holds the address.
+    ///
+    /// The sender protocol address is all-zero so a host that already holds
+    /// the address does not pollute its own cache with the prober's mapping,
+    /// and so the probe cannot be mistaken for a claim.
+    Probe,
+    /// RFC 5227 §2.3 Announcement, also called a gratuitous ARP.
+    ///
+    /// Sender and target protocol addresses are both the claimed address, so
+    /// every listener refreshes its cache. This is what a neighbour needs
+    /// after the address moves to a different link layer address.
+    Announcement,
+}
+
+/// One ARP frame claiming or probing an address on a link.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArpAnnouncementAction {
+    pub kind: ArpAnnouncementKind,
+    pub egress: IfId,
+    pub source_mac: MacAddress,
+    pub address: Ipv4Address,
+}
+
+/// Builds one probe or announcement.
+///
+/// Both are ARP Requests broadcast on the link, and both leave the target
+/// hardware address zero: RFC 5227 §2.1.1 and §2.3 specify it that way
+/// because neither frame is asking for a reply from a particular station.
+pub fn build_arp_announcement(frame: &mut [u8], action: ArpAnnouncementAction) {
+    debug_assert_eq!(frame.len(), ARP_REQUEST_FRAME_LEN);
+    frame.fill(0);
+    frame[0..6].fill(0xff);
+    frame[6..12].copy_from_slice(&action.source_mac.0);
+    frame[12..14].copy_from_slice(&ARP_ETHERTYPE.to_be_bytes());
+    frame[14..16].copy_from_slice(&1_u16.to_be_bytes());
+    frame[16..18].copy_from_slice(&IPV4_ETHERTYPE.to_be_bytes());
+    frame[18] = 6;
+    frame[19] = 4;
+    frame[20..22].copy_from_slice(&1_u16.to_be_bytes());
+    frame[22..28].copy_from_slice(&action.source_mac.0);
+    if matches!(action.kind, ArpAnnouncementKind::Announcement) {
+        frame[28..32].copy_from_slice(&action.address.octets());
+    }
+    frame[38..42].copy_from_slice(&action.address.octets());
+}
+
+/// Sends one probe or announcement through the generated path.
+pub fn execute_arp_announcement<I, T>(
+    io: &mut I,
+    action: ArpAnnouncementAction,
+    trace: &mut T,
+) -> GeneratedArpReport<I::Error>
+where
+    I: GeneratedPacketIo,
+    T: GeneratedTraceSink,
+{
+    let mut batch = io.begin_generated(action.egress);
+    let (allocation_error, build_error) = match allocate_arp_announcement(&mut batch, action) {
+        Ok(()) => {
+            trace.record_generated(GeneratedArpTrace::TxRequested {
+                egress: action.egress,
+                target: action.address,
+            });
+            (None, None)
+        }
+        Err(ArpRequestGenerationError::Allocation(error)) => {
+            trace.record_generated(GeneratedArpTrace::AllocationFailed(error));
+            (Some(error), None)
+        }
+        Err(ArpRequestGenerationError::Build(error)) => {
+            trace.record_generated(GeneratedArpTrace::BuildFailed(error));
+            (None, Some(error))
+        }
+    };
+    let completion = batch.finish();
+    trace.record_generated(GeneratedArpTrace::BatchCompleted {
+        accepted: completion.accepted,
+        rejected: completion.rejected,
+    });
+    GeneratedArpReport {
+        action: ArpRequestAction {
+            egress: action.egress,
+            source_mac: action.source_mac,
+            source_ip: action.address,
+            target_ip: action.address,
+        },
+        allocation_error,
+        build_error,
+        completion,
+    }
+}
+
+fn allocate_arp_announcement<B: GeneratedPacketBatch>(
+    batch: &mut B,
+    action: ArpAnnouncementAction,
+) -> Result<(), ArpRequestGenerationError> {
+    let mut lease = batch
+        .allocate(ARP_REQUEST_FRAME_LEN)
+        .map_err(ArpRequestGenerationError::Allocation)?;
+    if lease.bytes_mut().len() != ARP_REQUEST_FRAME_LEN {
+        lease.cancel();
+        return Err(ArpRequestGenerationError::Build(
+            ArpRequestBuildError::ExactLengthRequired,
+        ));
+    }
+    build_arp_announcement(lease.bytes_mut(), action);
+    lease.commit();
+    Ok(())
+}
+
 fn build_arp_request(frame: &mut [u8], action: ArpRequestAction) {
     debug_assert_eq!(frame.len(), ARP_REQUEST_FRAME_LEN);
     frame.fill(0);
