@@ -17,6 +17,13 @@ pub enum Icmpv4ErrorKind {
     TimeExceededTtl,
     DestinationUnreachableNetwork,
     DestinationUnreachableHost,
+    /// RFC 1812 §4.3.3.3: the datagram was addressed to this router but named
+    /// a transport it has no service for (not ICMP, not TCP, and not UDP).
+    DestinationUnreachableProtocol,
+    /// RFC 1812 §4.3.3.3: the datagram was addressed to this router over UDP
+    /// but named a port nothing is listening on. TCP uses RST instead, so
+    /// this kind is UDP-only.
+    DestinationUnreachablePort,
     /// RFC 1191 §4: the datagram could not be forwarded without fragmenting
     /// it and the sender set DF. `next_hop_mtu` is the MTU of the link the
     /// datagram could not cross, reported so the sender can lower its path
@@ -26,10 +33,20 @@ pub enum Icmpv4ErrorKind {
     },
     /// RFC 792: the datagram asked for source routing this router refuses.
     DestinationUnreachableSourceRouteFailed,
+    /// RFC 1812 §4.3.3.9: a packet filter denied the datagram. This is the
+    /// filtering-independent code that replaced the old network/host
+    /// administratively-prohibited codes 9 and 10.
+    DestinationUnreachableCommAdminProhibited,
     /// RFC 792: a header field is wrong, and `pointer` is the octet offset of
     /// the first byte that is.
     ParameterProblem {
         pointer: u8,
+    },
+    /// RFC 1812 §5.2.7.2: a better first hop for this datagram is `gateway`,
+    /// on the same link the datagram arrived from. Routers only ever use
+    /// code 1, redirect for host.
+    Redirect {
+        gateway: Ipv4Address,
     },
 }
 
@@ -39,17 +56,25 @@ impl Icmpv4ErrorKind {
             Self::TimeExceededTtl => 11,
             Self::DestinationUnreachableNetwork
             | Self::DestinationUnreachableHost
+            | Self::DestinationUnreachableProtocol
+            | Self::DestinationUnreachablePort
             | Self::DestinationUnreachableFragmentationNeeded { .. }
-            | Self::DestinationUnreachableSourceRouteFailed => 3,
+            | Self::DestinationUnreachableSourceRouteFailed
+            | Self::DestinationUnreachableCommAdminProhibited => 3,
             Self::ParameterProblem { .. } => 12,
+            Self::Redirect { .. } => 5,
         }
     }
 
     const fn icmp_code(self) -> u8 {
         match self {
             Self::DestinationUnreachableHost => 1,
+            Self::DestinationUnreachableProtocol => 2,
+            Self::DestinationUnreachablePort => 3,
             Self::DestinationUnreachableFragmentationNeeded { .. } => 4,
             Self::DestinationUnreachableSourceRouteFailed => 5,
+            Self::DestinationUnreachableCommAdminProhibited => 13,
+            Self::Redirect { .. } => 1,
             Self::TimeExceededTtl
             | Self::DestinationUnreachableNetwork
             | Self::ParameterProblem { .. } => 0,
@@ -59,15 +84,20 @@ impl Icmpv4ErrorKind {
     /// The octet a Parameter Problem points at, or zero for other kinds.
     ///
     /// RFC 792 places the pointer in the first octet after the checksum, where
-    /// the other error types keep four unused octets.
+    /// the other error types keep four unused octets. A Redirect uses those
+    /// four octets for its gateway address instead; see [`Self::gateway`].
     const fn parameter_pointer(self) -> u8 {
         match self {
             Self::ParameterProblem { pointer } => pointer,
             Self::TimeExceededTtl
             | Self::DestinationUnreachableNetwork
             | Self::DestinationUnreachableHost
+            | Self::DestinationUnreachableProtocol
+            | Self::DestinationUnreachablePort
             | Self::DestinationUnreachableFragmentationNeeded { .. }
-            | Self::DestinationUnreachableSourceRouteFailed => 0,
+            | Self::DestinationUnreachableSourceRouteFailed
+            | Self::DestinationUnreachableCommAdminProhibited
+            | Self::Redirect { .. } => 0,
         }
     }
 
@@ -81,8 +111,32 @@ impl Icmpv4ErrorKind {
             Self::TimeExceededTtl
             | Self::DestinationUnreachableNetwork
             | Self::DestinationUnreachableHost
+            | Self::DestinationUnreachableProtocol
+            | Self::DestinationUnreachablePort
             | Self::DestinationUnreachableSourceRouteFailed
-            | Self::ParameterProblem { .. } => 0,
+            | Self::DestinationUnreachableCommAdminProhibited
+            | Self::ParameterProblem { .. }
+            | Self::Redirect { .. } => 0,
+        }
+    }
+
+    /// The gateway a Redirect names, or none for other kinds.
+    ///
+    /// RFC 792 places a Redirect's gateway Internet address across all four
+    /// octets RFC 792 otherwise leaves unused, which is why it overlaps both
+    /// [`Self::parameter_pointer`] and [`Self::next_hop_mtu`].
+    const fn gateway(self) -> Option<Ipv4Address> {
+        match self {
+            Self::Redirect { gateway } => Some(gateway),
+            Self::TimeExceededTtl
+            | Self::DestinationUnreachableNetwork
+            | Self::DestinationUnreachableHost
+            | Self::DestinationUnreachableProtocol
+            | Self::DestinationUnreachablePort
+            | Self::DestinationUnreachableFragmentationNeeded { .. }
+            | Self::DestinationUnreachableSourceRouteFailed
+            | Self::DestinationUnreachableCommAdminProhibited
+            | Self::ParameterProblem { .. } => None,
         }
     }
 }
@@ -286,6 +340,21 @@ pub enum Icmpv4ErrorDisposition {
         egress: IfId,
         quote_len: usize,
     },
+    /// A datagram addressed to this router named a transport or UDP port it
+    /// has no service for.
+    ServiceUnreachableQueued {
+        egress: IfId,
+        quote_len: usize,
+    },
+    /// A packet filter denied a datagram this router would otherwise forward.
+    AdministrativelyProhibitedQueued {
+        egress: IfId,
+        quote_len: usize,
+    },
+    RedirectQueued {
+        egress: IfId,
+        quote_len: usize,
+    },
     Pending {
         egress: IfId,
     },
@@ -333,6 +402,9 @@ pub struct Icmpv4ErrorCounters {
     pub queued_host_unreachable: usize,
     pub queued_fragmentation_needed: usize,
     pub queued_header_refusal: usize,
+    pub queued_service_unreachable: usize,
+    pub queued_administratively_prohibited: usize,
+    pub queued_redirect: usize,
     pub pending: usize,
     pub rate_limited: usize,
     pub state_full: usize,
@@ -359,6 +431,9 @@ pub struct Icmpv4ErrorCounters {
     pub dequeued_host_unreachable: usize,
     pub dequeued_fragmentation_needed: usize,
     pub dequeued_header_refusal: usize,
+    pub dequeued_service_unreachable: usize,
+    pub dequeued_administratively_prohibited: usize,
+    pub dequeued_redirect: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -627,6 +702,18 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 self.counters.queued += 1;
                 self.counters.queued_header_refusal += 1;
             }
+            Icmpv4ErrorDisposition::ServiceUnreachableQueued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_service_unreachable += 1;
+            }
+            Icmpv4ErrorDisposition::AdministrativelyProhibitedQueued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_administratively_prohibited += 1;
+            }
+            Icmpv4ErrorDisposition::RedirectQueued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_redirect += 1;
+            }
             Icmpv4ErrorDisposition::Pending { .. } => self.counters.pending += 1,
             Icmpv4ErrorDisposition::RateLimited { .. } => {
                 self.counters.rate_limited += 1;
@@ -780,6 +867,23 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                     quote_len: action.quote_len(),
                 }
             }
+            Icmpv4ErrorKind::DestinationUnreachableProtocol
+            | Icmpv4ErrorKind::DestinationUnreachablePort => {
+                Icmpv4ErrorDisposition::ServiceUnreachableQueued {
+                    egress: action.egress,
+                    quote_len: action.quote_len(),
+                }
+            }
+            Icmpv4ErrorKind::DestinationUnreachableCommAdminProhibited => {
+                Icmpv4ErrorDisposition::AdministrativelyProhibitedQueued {
+                    egress: action.egress,
+                    quote_len: action.quote_len(),
+                }
+            }
+            Icmpv4ErrorKind::Redirect { .. } => Icmpv4ErrorDisposition::RedirectQueued {
+                egress: action.egress,
+                quote_len: action.quote_len(),
+            },
         };
         self.record_suppression(disposition)
     }
@@ -834,6 +938,14 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             | Icmpv4ErrorKind::ParameterProblem { .. } => {
                 self.counters.dequeued_header_refusal += 1;
             }
+            Icmpv4ErrorKind::DestinationUnreachableProtocol
+            | Icmpv4ErrorKind::DestinationUnreachablePort => {
+                self.counters.dequeued_service_unreachable += 1;
+            }
+            Icmpv4ErrorKind::DestinationUnreachableCommAdminProhibited => {
+                self.counters.dequeued_administratively_prohibited += 1;
+            }
+            Icmpv4ErrorKind::Redirect { .. } => self.counters.dequeued_redirect += 1,
         }
         if let Some(state) = self.states.get_mut(queued.state_index).filter(|state| {
             state.occupied
@@ -889,11 +1001,20 @@ pub enum GeneratedIcmpv4Trace {
     FragmentationNeededBuildFailed(Icmpv4ErrorBuildError),
     HeaderRefusalAllocationFailed(GeneratedAllocationError),
     HeaderRefusalBuildFailed(Icmpv4ErrorBuildError),
+    ServiceUnreachableAllocationFailed(GeneratedAllocationError),
+    ServiceUnreachableBuildFailed(Icmpv4ErrorBuildError),
+    AdministrativelyProhibitedAllocationFailed(GeneratedAllocationError),
+    AdministrativelyProhibitedBuildFailed(Icmpv4ErrorBuildError),
+    RedirectAllocationFailed(GeneratedAllocationError),
+    RedirectBuildFailed(Icmpv4ErrorBuildError),
     ClockRegression,
     DestinationUnreachableClockRegression,
     HostUnreachableClockRegression,
     FragmentationNeededClockRegression,
     HeaderRefusalClockRegression,
+    ServiceUnreachableClockRegression,
+    AdministrativelyProhibitedClockRegression,
+    RedirectClockRegression,
     TxRequested {
         egress: IfId,
         destination: Ipv4Address,
@@ -914,6 +1035,18 @@ pub enum GeneratedIcmpv4Trace {
         egress: IfId,
         destination: Ipv4Address,
     },
+    ServiceUnreachableTxRequested {
+        egress: IfId,
+        destination: Ipv4Address,
+    },
+    AdministrativelyProhibitedTxRequested {
+        egress: IfId,
+        destination: Ipv4Address,
+    },
+    RedirectTxRequested {
+        egress: IfId,
+        destination: Ipv4Address,
+    },
     BatchCompleted {
         accepted: usize,
         rejected: usize,
@@ -931,6 +1064,18 @@ pub enum GeneratedIcmpv4Trace {
         rejected: usize,
     },
     HeaderRefusalBatchCompleted {
+        accepted: usize,
+        rejected: usize,
+    },
+    ServiceUnreachableBatchCompleted {
+        accepted: usize,
+        rejected: usize,
+    },
+    AdministrativelyProhibitedBatchCompleted {
+        accepted: usize,
+        rejected: usize,
+    },
+    RedirectBatchCompleted {
         accepted: usize,
         rejected: usize,
     },
@@ -997,6 +1142,14 @@ where
             | Icmpv4ErrorKind::ParameterProblem { .. } => {
                 GeneratedIcmpv4Trace::HeaderRefusalClockRegression
             }
+            Icmpv4ErrorKind::DestinationUnreachableProtocol
+            | Icmpv4ErrorKind::DestinationUnreachablePort => {
+                GeneratedIcmpv4Trace::ServiceUnreachableClockRegression
+            }
+            Icmpv4ErrorKind::DestinationUnreachableCommAdminProhibited => {
+                GeneratedIcmpv4Trace::AdministrativelyProhibitedClockRegression
+            }
+            Icmpv4ErrorKind::Redirect { .. } => GeneratedIcmpv4Trace::RedirectClockRegression,
         };
         trace.record_generated_icmpv4(event);
         return Err(ExecuteIcmpv4TimeExceededError::ClockRegression);
@@ -1035,6 +1188,23 @@ where
                         destination: queued.action.destination_ip,
                     }
                 }
+                Icmpv4ErrorKind::DestinationUnreachableProtocol
+                | Icmpv4ErrorKind::DestinationUnreachablePort => {
+                    GeneratedIcmpv4Trace::ServiceUnreachableTxRequested {
+                        egress: queued.action.egress,
+                        destination: queued.action.destination_ip,
+                    }
+                }
+                Icmpv4ErrorKind::DestinationUnreachableCommAdminProhibited => {
+                    GeneratedIcmpv4Trace::AdministrativelyProhibitedTxRequested {
+                        egress: queued.action.egress,
+                        destination: queued.action.destination_ip,
+                    }
+                }
+                Icmpv4ErrorKind::Redirect { .. } => GeneratedIcmpv4Trace::RedirectTxRequested {
+                    egress: queued.action.egress,
+                    destination: queued.action.destination_ip,
+                },
             };
             trace.record_generated_icmpv4(event);
             (None, None)
@@ -1055,6 +1225,16 @@ where
                 | Icmpv4ErrorKind::ParameterProblem { .. } => {
                     GeneratedIcmpv4Trace::HeaderRefusalAllocationFailed(error)
                 }
+                Icmpv4ErrorKind::DestinationUnreachableProtocol
+                | Icmpv4ErrorKind::DestinationUnreachablePort => {
+                    GeneratedIcmpv4Trace::ServiceUnreachableAllocationFailed(error)
+                }
+                Icmpv4ErrorKind::DestinationUnreachableCommAdminProhibited => {
+                    GeneratedIcmpv4Trace::AdministrativelyProhibitedAllocationFailed(error)
+                }
+                Icmpv4ErrorKind::Redirect { .. } => {
+                    GeneratedIcmpv4Trace::RedirectAllocationFailed(error)
+                }
             };
             trace.record_generated_icmpv4(event);
             (Some(error), None)
@@ -1074,6 +1254,16 @@ where
                 Icmpv4ErrorKind::DestinationUnreachableSourceRouteFailed
                 | Icmpv4ErrorKind::ParameterProblem { .. } => {
                     GeneratedIcmpv4Trace::HeaderRefusalBuildFailed(error)
+                }
+                Icmpv4ErrorKind::DestinationUnreachableProtocol
+                | Icmpv4ErrorKind::DestinationUnreachablePort => {
+                    GeneratedIcmpv4Trace::ServiceUnreachableBuildFailed(error)
+                }
+                Icmpv4ErrorKind::DestinationUnreachableCommAdminProhibited => {
+                    GeneratedIcmpv4Trace::AdministrativelyProhibitedBuildFailed(error)
+                }
+                Icmpv4ErrorKind::Redirect { .. } => {
+                    GeneratedIcmpv4Trace::RedirectBuildFailed(error)
                 }
             };
             trace.record_generated_icmpv4(event);
@@ -1111,6 +1301,23 @@ where
                 rejected: completion.rejected,
             }
         }
+        Icmpv4ErrorKind::DestinationUnreachableProtocol
+        | Icmpv4ErrorKind::DestinationUnreachablePort => {
+            GeneratedIcmpv4Trace::ServiceUnreachableBatchCompleted {
+                accepted: completion.accepted,
+                rejected: completion.rejected,
+            }
+        }
+        Icmpv4ErrorKind::DestinationUnreachableCommAdminProhibited => {
+            GeneratedIcmpv4Trace::AdministrativelyProhibitedBatchCompleted {
+                accepted: completion.accepted,
+                rejected: completion.rejected,
+            }
+        }
+        Icmpv4ErrorKind::Redirect { .. } => GeneratedIcmpv4Trace::RedirectBatchCompleted {
+            accepted: completion.accepted,
+            rejected: completion.rejected,
+        },
     };
     trace.record_generated_icmpv4(event);
     Ok(Some(GeneratedIcmpv4Report {
@@ -1166,8 +1373,12 @@ fn build_icmpv4_error(frame: &mut [u8], action: &Icmpv4ErrorAction) {
     frame[24..26].copy_from_slice(&header_checksum.to_be_bytes());
     frame[34] = action.kind.icmp_type();
     frame[35] = action.kind.icmp_code();
-    frame[38] = action.kind.parameter_pointer();
-    frame[40..42].copy_from_slice(&action.kind.next_hop_mtu().to_be_bytes());
+    if let Some(gateway) = action.kind.gateway() {
+        frame[38..42].copy_from_slice(&gateway.octets());
+    } else {
+        frame[38] = action.kind.parameter_pointer();
+        frame[40..42].copy_from_slice(&action.kind.next_hop_mtu().to_be_bytes());
+    }
     frame[42..icmp_end].copy_from_slice(action.quote());
     let icmp_checksum = internet_checksum(&frame[34..icmp_end]);
     let icmp_checksum = if icmp_checksum == 0 {
@@ -1622,6 +1833,127 @@ mod tests {
     }
 
     #[test]
+    fn protocol_and_port_unreachable_are_type3_codes_2_and_3_with_unused_octets_zero() {
+        let protocol = action_kind(Icmpv4ErrorKind::DestinationUnreachableProtocol, 1, 20);
+        let mut protocol_frame = [0xa5; 62];
+        build_icmpv4_error(&mut protocol_frame, &protocol);
+        assert_eq!(&protocol_frame[34..36], &[3, 2]);
+        assert_eq!(&protocol_frame[38..42], &[0; 4]);
+        assert_eq!(ipv4_header_checksum(&protocol_frame[14..34]), 0);
+        assert_eq!(internet_checksum(&protocol_frame[34..]), 0);
+
+        let port = action_kind(Icmpv4ErrorKind::DestinationUnreachablePort, 1, 20);
+        let mut port_frame = [0xa5; 62];
+        build_icmpv4_error(&mut port_frame, &port);
+        assert_eq!(&port_frame[34..36], &[3, 3]);
+        assert_eq!(&port_frame[38..42], &[0; 4]);
+        assert_eq!(ipv4_header_checksum(&port_frame[14..34]), 0);
+        assert_eq!(internet_checksum(&port_frame[34..]), 0);
+    }
+
+    #[test]
+    fn communication_administratively_prohibited_is_type3_code13() {
+        let action = action_kind(
+            Icmpv4ErrorKind::DestinationUnreachableCommAdminProhibited,
+            1,
+            20,
+        );
+        let mut frame = [0xa5; 62];
+        build_icmpv4_error(&mut frame, &action);
+        assert_eq!(&frame[34..36], &[3, 13]);
+        assert_eq!(&frame[38..42], &[0; 4]);
+        assert_eq!(ipv4_header_checksum(&frame[14..34]), 0);
+        assert_eq!(internet_checksum(&frame[34..]), 0);
+    }
+
+    #[test]
+    fn redirect_is_type5_code1_and_carries_the_gateway_across_all_four_unused_octets() {
+        let gateway = Ipv4Address::from_octets([198, 51, 100, 254]);
+        let action = Icmpv4ErrorAction::new_with_kind(
+            Icmpv4ErrorKind::Redirect { gateway },
+            IfId(1),
+            MacAddress([2, 0, 0, 0, 0, 1]),
+            MacAddress([2, 0, 0, 0, 0, 2]),
+            Ipv4Address::from_octets([192, 0, 2, 1]),
+            Ipv4Address::from_octets([198, 51, 100, 1]),
+            0,
+            64,
+            &[0x5a; 20],
+        );
+        let mut frame = [0xa5; 62];
+        build_icmpv4_error(&mut frame, &action);
+        assert_eq!(&frame[34..36], &[5, 1]);
+        assert_eq!(&frame[38..42], &gateway.octets());
+        assert_eq!(ipv4_header_checksum(&frame[14..34]), 0);
+        assert_eq!(internet_checksum(&frame[34..]), 0);
+    }
+
+    #[test]
+    fn redirect_service_and_administrative_dispositions_and_counters_are_exact() {
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; 3];
+        let mut slots = [Icmpv4ErrorActionSlot::EMPTY; 3];
+        let mut runtime =
+            Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut states, &mut slots);
+
+        let redirect = action_kind(
+            Icmpv4ErrorKind::Redirect {
+                gateway: Ipv4Address::from_octets([192, 0, 2, 254]),
+            },
+            1,
+            20,
+        );
+        assert!(matches!(
+            runtime.schedule(redirect, MonotonicMillis(0)),
+            Icmpv4ErrorDisposition::RedirectQueued { .. }
+        ));
+        let queued = runtime.front().unwrap();
+        runtime.committed(queued, MonotonicMillis(0));
+
+        let protocol = action_kind(Icmpv4ErrorKind::DestinationUnreachableProtocol, 2, 20);
+        assert!(matches!(
+            runtime.schedule(protocol, MonotonicMillis(0)),
+            Icmpv4ErrorDisposition::ServiceUnreachableQueued { .. }
+        ));
+        let queued = runtime.front().unwrap();
+        runtime.committed(queued, MonotonicMillis(0));
+
+        let port = action_kind(Icmpv4ErrorKind::DestinationUnreachablePort, 2, 20);
+        assert!(matches!(
+            runtime.schedule(port, MonotonicMillis(2_000)),
+            Icmpv4ErrorDisposition::ServiceUnreachableQueued { .. }
+        ));
+        let queued = runtime.front().unwrap();
+        runtime.committed(queued, MonotonicMillis(2_000));
+
+        let prohibited = action_kind(
+            Icmpv4ErrorKind::DestinationUnreachableCommAdminProhibited,
+            3,
+            20,
+        );
+        assert!(matches!(
+            runtime.schedule(prohibited, MonotonicMillis(2_000)),
+            Icmpv4ErrorDisposition::AdministrativelyProhibitedQueued { .. }
+        ));
+        let queued = runtime.front().unwrap();
+        runtime.committed(queued, MonotonicMillis(0));
+
+        assert_eq!(
+            runtime.counters(),
+            Icmpv4ErrorCounters {
+                queued: 4,
+                queued_redirect: 1,
+                queued_service_unreachable: 2,
+                queued_administratively_prohibited: 1,
+                dequeued: 4,
+                dequeued_redirect: 1,
+                dequeued_service_unreachable: 2,
+                dequeued_administratively_prohibited: 1,
+                ..Icmpv4ErrorCounters::default()
+            }
+        );
+    }
+
+    #[test]
     fn host_unreachable_math_zero_checksum_uses_icmp_negative_zero() {
         let original_ipv4 = [
             0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, 0x40, 0x01, 0x4e, 0xab, 0xc0, 0x00,
@@ -1836,6 +2168,20 @@ mod tests {
             (Icmpv4ErrorKind::TimeExceededTtl, 11, 0),
             (Icmpv4ErrorKind::DestinationUnreachableNetwork, 3, 0),
             (Icmpv4ErrorKind::DestinationUnreachableHost, 3, 1),
+            (Icmpv4ErrorKind::DestinationUnreachableProtocol, 3, 2),
+            (Icmpv4ErrorKind::DestinationUnreachablePort, 3, 3),
+            (
+                Icmpv4ErrorKind::DestinationUnreachableCommAdminProhibited,
+                3,
+                13,
+            ),
+            (
+                Icmpv4ErrorKind::Redirect {
+                    gateway: Ipv4Address::from_octets([192, 0, 2, 254]),
+                },
+                5,
+                1,
+            ),
         ] {
             let action = action_kind(kind, 1, 0);
             let mut frame = [0; ETHERNET_MIN_FRAME_LEN];

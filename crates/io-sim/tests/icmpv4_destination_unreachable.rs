@@ -1,13 +1,13 @@
 use ruster_core::{
     execute_one_arp_request, execute_one_icmpv4_error, execute_one_icmpv4_time_exceeded,
     forward_batch, forward_batch_with_resolution, forward_batch_with_resolution_and_icmpv4_errors,
-    internet_checksum, ipv4_header_checksum, DropReason, DynamicNeighborSlot, ExecuteIcmpv4Error,
-    ForwardingSnapshot, GeneratedAllocationError, GeneratedIcmpv4Trace, Icmpv4ErrorActionSlot,
-    Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
-    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4Mtu, Ipv4OriginPolicy,
-    LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoGeneratedIcmpv4Trace, NoTrace,
-    PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot,
-    Route, TraceEvent,
+    internet_checksum, ipv4_header_checksum, ConsumeReason, DropReason, DynamicNeighborSlot,
+    ExecuteIcmpv4Error, ForwardingSnapshot, GeneratedAllocationError, GeneratedIcmpv4Trace,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorPolicy,
+    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4Mtu,
+    Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor,
+    NoGeneratedIcmpv4Trace, NoTrace, PacketIo, ResolutionActionSlot, ResolutionPolicy,
+    ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent,
 };
 use ruster_io_sim::{FrameOrigin, RecycleCause, SimIo, VecGeneratedIcmpv4Trace, VecTrace};
 
@@ -821,4 +821,190 @@ fn destination_unreachable_allocation_reject_finish_and_clock_lifecycle_is_exact
         );
         assert_eq!(errors.pending_actions(), expected_pending);
     }
+}
+
+/// RFC 1812 §4.3.3.3: a UDP datagram addressed to this router's own address
+/// with no service listening draws Port Unreachable.
+#[test]
+fn locally_addressed_udp_with_no_service_generates_exact_type3_code3() {
+    let interfaces = interfaces();
+    let bindings = bindings();
+    let routes = [reverse_gateway()];
+    let neighbors = [Neighbor {
+        interface: WAN,
+        target: GATEWAY,
+        mac: GATEWAY_MAC,
+    }];
+    let snapshot = ForwardingSnapshot::with_ipv4_origin_policy(
+        &routes,
+        &interfaces,
+        &neighbors,
+        &bindings,
+        Ipv4OriginPolicy::new(37).unwrap(),
+    )
+    .unwrap();
+    let original = ipv4_frame(SOURCE, LAN_IP, 64, 17, 0, 0, &[0; 8], &[]);
+    let mut rs = [ResolutionStateSlot::EMPTY; 1];
+    let mut ra = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = ResolutionRuntime::new(resolution_policy(), &mut rs, &mut ra);
+    let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut es, &mut ea);
+    let mut io = SimIo::new();
+    io.inject(LAN, original.clone());
+    let mut trace = VecTrace::default();
+    let batch = io.receive(1).unwrap();
+    let report = forward_batch_with_resolution_and_icmpv4_errors(
+        batch,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        MonotonicMillis(10),
+        &mut trace,
+    );
+    assert_eq!((report.dropped, report.tx_requested), (1, 0));
+    let recycled = io.pop_recycled().unwrap();
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Forwarding(DropReason::Icmpv4PortUnreachable)
+    );
+    assert_eq!(recycled.bytes, original);
+    assert!(trace.events().iter().any(|event| matches!(
+        event,
+        TraceEvent::Icmpv4DestinationUnreachableDisposition {
+            disposition: Icmpv4ErrorDisposition::ServiceUnreachableQueued { egress: WAN, .. },
+            ..
+        }
+    )));
+
+    let generated = execute_one_icmpv4_error(
+        &mut io,
+        &mut errors,
+        MonotonicMillis(10),
+        &mut NoGeneratedIcmpv4Trace,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        generated.action.kind,
+        Icmpv4ErrorKind::DestinationUnreachablePort
+    );
+    let tx = io.pop_tx().unwrap();
+    assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC.0);
+    assert_eq!(&tx.bytes[6..12], &WAN_MAC.0);
+    assert_eq!(&tx.bytes[26..30], &WAN_IP.octets());
+    assert_eq!(&tx.bytes[30..34], &SOURCE.octets());
+    assert_eq!(ipv4_header_checksum(&tx.bytes[14..34]), 0);
+    assert_eq!(
+        &tx.bytes[34..42],
+        &[3, 3, tx.bytes[36], tx.bytes[37], 0, 0, 0, 0]
+    );
+    assert_eq!(internet_checksum(&tx.bytes[34..]), 0);
+    assert_eq!(&tx.bytes[42..], &original[14..42]);
+}
+
+/// RFC 1812 §4.3.3.3: a datagram addressed to this router's own address
+/// naming a transport that is not ICMP, TCP, or UDP draws Protocol
+/// Unreachable.
+#[test]
+fn locally_addressed_unsupported_transport_generates_exact_type3_code2() {
+    let interfaces = interfaces();
+    let bindings = bindings();
+    let routes = [reverse_gateway()];
+    let neighbors = [Neighbor {
+        interface: WAN,
+        target: GATEWAY,
+        mac: GATEWAY_MAC,
+    }];
+    let snapshot = ForwardingSnapshot::with_ipv4_origin_policy(
+        &routes,
+        &interfaces,
+        &neighbors,
+        &bindings,
+        Ipv4OriginPolicy::new(37).unwrap(),
+    )
+    .unwrap();
+    let original = ipv4_frame(SOURCE, LAN_IP, 64, 47, 0, 0, &[0; 8], &[]);
+    let mut rs = [ResolutionStateSlot::EMPTY; 1];
+    let mut ra = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = ResolutionRuntime::new(resolution_policy(), &mut rs, &mut ra);
+    let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut es, &mut ea);
+    let mut io = SimIo::new();
+    io.inject(LAN, original.clone());
+    let batch = io.receive(1).unwrap();
+    let report = forward_batch_with_resolution_and_icmpv4_errors(
+        batch,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        MonotonicMillis(10),
+        &mut NoTrace,
+    );
+    assert_eq!((report.dropped, report.tx_requested), (1, 0));
+    let recycled = io.pop_recycled().unwrap();
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Forwarding(DropReason::Icmpv4ProtocolUnreachable)
+    );
+    assert_eq!(recycled.bytes, original);
+
+    let generated = execute_one_icmpv4_error(
+        &mut io,
+        &mut errors,
+        MonotonicMillis(10),
+        &mut NoGeneratedIcmpv4Trace,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        generated.action.kind,
+        Icmpv4ErrorKind::DestinationUnreachableProtocol
+    );
+    let tx = io.pop_tx().unwrap();
+    assert_eq!(
+        &tx.bytes[34..42],
+        &[3, 2, tx.bytes[36], tx.bytes[37], 0, 0, 0, 0]
+    );
+    assert_eq!(internet_checksum(&tx.bytes[34..]), 0);
+    assert_eq!(&tx.bytes[42..], &original[14..42]);
+}
+
+/// A TCP segment addressed to this router still draws no ICMP response: a
+/// closed TCP port answers with RST at the transport layer, never ICMP.
+#[test]
+fn locally_addressed_tcp_is_still_consumed_without_an_icmp_error() {
+    let interfaces = interfaces();
+    let bindings = bindings();
+    let routes = [reverse_gateway()];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+    let original = ipv4_frame(SOURCE, LAN_IP, 64, 6, 0, 0, &[0; 8], &[]);
+    let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut es, &mut ea);
+    let mut rs = [ResolutionStateSlot::EMPTY; 1];
+    let mut ra = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = ResolutionRuntime::new(resolution_policy(), &mut rs, &mut ra);
+    let mut io = SimIo::new();
+    io.inject(LAN, original.clone());
+    let batch = io.receive(1).unwrap();
+    let report = forward_batch_with_resolution_and_icmpv4_errors(
+        batch,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        MonotonicMillis(10),
+        &mut NoTrace,
+    );
+    assert_eq!(
+        (report.dropped, report.consumed, report.tx_requested),
+        (0, 1, 0)
+    );
+    assert_eq!(errors.pending_actions(), 0);
+    let recycled = io.pop_recycled().unwrap();
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Consumed(ConsumeReason::Ipv4LocalUnsupported)
+    );
 }

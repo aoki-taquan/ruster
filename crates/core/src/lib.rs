@@ -39,16 +39,17 @@ pub use forwarding::take_full_forwarding_validation_count;
 pub use forwarding::{
     forward_batch, forward_batch_with_firewall, forward_batch_with_firewall_and_icmpv4_errors,
     forward_batch_with_firewall_and_icmpv4_errors_audited, forward_batch_with_firewall_audited,
-    forward_batch_with_nat44_tcp, forward_batch_with_nat44_tcp_and_icmpv4_errors,
-    forward_batch_with_nat44_udp, forward_batch_with_nat44_udp_and_icmpv4_errors,
-    forward_batch_with_nat44_udp_and_tcp, forward_batch_with_nat44_udp_and_tcp_and_firewall,
+    forward_batch_with_icmpv4_timestamp, forward_batch_with_nat44_tcp,
+    forward_batch_with_nat44_tcp_and_icmpv4_errors, forward_batch_with_nat44_udp,
+    forward_batch_with_nat44_udp_and_icmpv4_errors, forward_batch_with_nat44_udp_and_tcp,
+    forward_batch_with_nat44_udp_and_tcp_and_firewall,
     forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors,
     forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_audited,
     forward_batch_with_nat44_udp_and_tcp_and_firewall_audited,
     forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors, forward_batch_with_resolution,
     forward_batch_with_resolution_and_icmpv4_errors, BatchReport, DropReason, ForwardingSnapshot,
-    Ipv4OriginPolicy, Ipv4OriginPolicyError, Nat44Icmpv4Disposition, NoTrace, SnapshotError,
-    TraceEvent, TraceSink, ValidatedForwardingOwner, ValidatedForwardingOwnerError,
+    Icmpv4TimestampClock, Ipv4OriginPolicy, Ipv4OriginPolicyError, Nat44Icmpv4Disposition, NoTrace,
+    SnapshotError, TraceEvent, TraceSink, ValidatedForwardingOwner, ValidatedForwardingOwnerError,
 };
 pub use generated::{
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,

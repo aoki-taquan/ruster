@@ -170,6 +170,10 @@ pub enum DropReason {
     Ipv4FragmentationRequired = 147,
     Ipv4SourceRouteUnsupported = 148,
     Ipv4OptionsMalformed = 149,
+    Icmpv4ProtocolUnreachable = 150,
+    Icmpv4PortUnreachable = 151,
+    Icmpv4TimestampCodeInvalid = 152,
+    Icmpv4TimestampHeaderTruncated = 153,
 }
 
 /// The IPv4 Don't Fragment flag inside the flags-and-offset field (RFC 791).
@@ -182,7 +186,7 @@ impl DropReason {
     ///
     /// Anything serialising a reason by number needs this bound, and deriving
     /// it here keeps such a check from going stale when a reason is added.
-    pub const LARGEST_CODE: u16 = Self::Ipv4OptionsMalformed as u16;
+    pub const LARGEST_CODE: u16 = Self::Icmpv4TimestampHeaderTruncated as u16;
 
     #[must_use]
     pub const fn code(self) -> &'static str {
@@ -338,6 +342,10 @@ impl DropReason {
             Ipv4FragmentationRequired => "IPV4_FRAGMENTATION_REQUIRED",
             Ipv4SourceRouteUnsupported => "IPV4_SOURCE_ROUTE_UNSUPPORTED",
             Ipv4OptionsMalformed => "IPV4_OPTIONS_MALFORMED",
+            Icmpv4ProtocolUnreachable => "ICMPV4_PROTOCOL_UNREACHABLE",
+            Icmpv4PortUnreachable => "ICMPV4_PORT_UNREACHABLE",
+            Icmpv4TimestampCodeInvalid => "ICMPV4_TIMESTAMP_CODE_INVALID",
+            Icmpv4TimestampHeaderTruncated => "ICMPV4_TIMESTAMP_HEADER_TRUNCATED",
         }
     }
 }
@@ -854,6 +862,11 @@ pub enum TraceEvent {
         source: crate::Ipv4Address,
         destination: crate::Ipv4Address,
     },
+    Icmpv4TimestampRequestValidated {
+        ingress: IfId,
+        source: crate::Ipv4Address,
+        destination: crate::Ipv4Address,
+    },
     Icmpv4TimeExceededDisposition {
         ingress: IfId,
         disposition: Icmpv4ErrorDisposition,
@@ -894,6 +907,11 @@ pub enum TraceEvent {
         target_protocol: crate::Ipv4Address,
     },
     Icmpv4EchoReplyRequested {
+        egress: IfId,
+        source: crate::Ipv4Address,
+        destination: crate::Ipv4Address,
+    },
+    Icmpv4TimestampReplyRequested {
         egress: IfId,
         source: crate::Ipv4Address,
         destination: crate::Ipv4Address,
@@ -1024,6 +1042,31 @@ struct Icmpv4EchoReplyDecision {
     icmp_end: usize,
 }
 
+/// Milliseconds since UTC midnight, per RFC 792's Timestamp message fields.
+///
+/// The datapath never reads a clock itself; the caller supplies this value
+/// the same way it supplies [`MonotonicMillis`] elsewhere, which keeps replay
+/// deterministic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Icmpv4TimestampClock(pub u32);
+
+#[derive(Clone, Copy)]
+struct Icmpv4TimestampReplyDecision {
+    egress: IfId,
+    local_mac: [u8; 6],
+    requester_mac: [u8; 6],
+    local_ip: [u8; 4],
+    requester_ip: [u8; 4],
+    ipv4_checksum: u16,
+    icmp_checksum: u16,
+    reply_ttl: u8,
+    icmp_offset: usize,
+    icmp_end: usize,
+    /// The receive and transmit timestamp this reply carries in both fields,
+    /// since the reply is built and sent in the same step.
+    clock_word: u32,
+}
+
 #[derive(Clone, Copy)]
 enum Nat44UdpTransition {
     Outbound(Nat44UdpOutboundPlan),
@@ -1100,6 +1143,7 @@ enum PacketDecision {
     Nat44Icmpv4(Nat44Icmpv4RewriteDecision),
     ArpReply(ArpReplyDecision),
     Icmpv4EchoReply(Icmpv4EchoReplyDecision),
+    Icmpv4TimestampReply(Icmpv4TimestampReplyDecision),
     ConsumeArp(ControlDisposition),
     ConsumeIpv4Local,
     /// The datagram was copied into the hold queue to be split (RFC 791 §3.2)
@@ -1122,6 +1166,7 @@ impl PacketDecision {
             Self::Nat44Icmpv4(decision) => decision.egress,
             Self::ArpReply(decision) => decision.egress,
             Self::Icmpv4EchoReply(decision) => decision.egress,
+            Self::Icmpv4TimestampReply(decision) => decision.egress,
             Self::ConsumeArp(_) | Self::ConsumeIpv4Local | Self::ConsumeIpv4ForFragmentation => {
                 unreachable!("consumed controls have no egress")
             }
@@ -1148,7 +1193,40 @@ where
     T: TraceSink,
 {
     forward_batch_inner(
-        batch, snapshot, None, None, None, None, None, None, None, None, None, trace,
+        batch, snapshot, None, None, None, None, None, None, None, None, None, None, trace,
+    )
+}
+
+/// Forwards RX packets, additionally answering an ICMPv4 Timestamp request
+/// addressed to one of this router's own addresses (RFC 792, RFC 1812
+/// §4.3.2.9). `clock` is milliseconds since UTC midnight; the caller supplies
+/// it the same way it supplies [`MonotonicMillis`] to the other variants.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
+pub fn forward_batch_with_icmpv4_timestamp<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    clock: Icmpv4TimestampClock,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(clock),
+        trace,
     )
 }
 
@@ -1171,6 +1249,7 @@ where
         batch,
         snapshot,
         Some((runtime, now)),
+        None,
         None,
         None,
         None,
@@ -1206,6 +1285,7 @@ where
         snapshot,
         Some((resolution, now)),
         Some((icmpv4_errors, now)),
+        None,
         None,
         None,
         None,
@@ -1251,6 +1331,7 @@ where
         None,
         None,
         None,
+        None,
         trace,
     )
 }
@@ -1290,6 +1371,7 @@ where
         None,
         None,
         None,
+        None,
         trace,
     )
 }
@@ -1319,6 +1401,7 @@ where
         None,
         Some(config),
         nat44_tcp,
+        None,
         None,
         None,
         None,
@@ -1356,6 +1439,7 @@ where
         None,
         None,
         None,
+        None,
         trace,
     )
 }
@@ -1388,6 +1472,7 @@ where
         nat44_udp,
         Some(tcp_config),
         nat44_tcp,
+        None,
         None,
         None,
         None,
@@ -1427,6 +1512,7 @@ where
         None,
         None,
         None,
+        None,
         trace,
     )
 }
@@ -1463,6 +1549,7 @@ where
         Some(config),
         firewall,
         None,
+        None,
         trace,
     )
 }
@@ -1498,6 +1585,7 @@ where
         Some(config),
         firewall,
         Some(audit),
+        None,
         trace,
     )
 }
@@ -1532,6 +1620,7 @@ where
         None,
         Some(config),
         firewall,
+        None,
         None,
         trace,
     )
@@ -1568,6 +1657,7 @@ where
         Some(config),
         firewall,
         Some(audit),
+        None,
         trace,
     )
 }
@@ -1604,6 +1694,7 @@ where
         nat44_tcp,
         Some(firewall_config),
         firewall,
+        None,
         None,
         trace,
     )
@@ -1644,6 +1735,7 @@ where
         Some(firewall_config),
         firewall,
         Some(audit),
+        None,
         trace,
     )
 }
@@ -1684,6 +1776,7 @@ where
         Some(firewall_config),
         firewall,
         None,
+        None,
         trace,
     )
 }
@@ -1722,6 +1815,7 @@ where
         Some(firewall_config),
         firewall,
         Some(audit),
+        None,
         trace,
     )
 }
@@ -1739,6 +1833,7 @@ fn forward_batch_inner<B, T>(
     firewall_config: Option<&FirewallConfig<'_>>,
     mut firewall: Option<&mut FirewallRuntime<'_>>,
     mut firewall_audit: Option<&mut FirewallAuditBuffer<'_>>,
+    timestamp_clock: Option<Icmpv4TimestampClock>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
 where
@@ -1770,6 +1865,7 @@ where
                 &mut firewall,
                 &mut firewall_audit,
                 &mut firewall_plan,
+                timestamp_clock,
                 trace,
             )
             .and_then(|decision| {
@@ -1905,6 +2001,13 @@ where
                         destination: crate::Ipv4Address::from_octets(icmp.requester_ip),
                     });
                 }
+                if let PacketDecision::Icmpv4TimestampReply(icmp) = decision {
+                    trace.record(TraceEvent::Icmpv4TimestampReplyRequested {
+                        egress,
+                        source: crate::Ipv4Address::from_octets(icmp.local_ip),
+                        destination: crate::Ipv4Address::from_octets(icmp.requester_ip),
+                    });
+                }
                 trace.record(TraceEvent::TxRequested { egress });
             }
             Err(reason) => {
@@ -1951,6 +2054,7 @@ fn decide<T: TraceSink>(
     firewall: &mut Option<&mut FirewallRuntime<'_>>,
     firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
     firewall_plan: &mut Option<FirewallPlan>,
+    timestamp_clock: Option<Icmpv4TimestampClock>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     let ether_type = packet::read_u16(frame, 12).ok_or(EthernetHeaderTruncated)?;
@@ -1970,6 +2074,7 @@ fn decide<T: TraceSink>(
             firewall,
             firewall_audit,
             firewall_plan,
+            timestamp_clock,
             trace,
         ),
         ARP_ETHERTYPE => decide_arp(frame, snapshot, ingress, resolution, trace),
@@ -2116,6 +2221,7 @@ fn decide_ipv4<T: TraceSink>(
     firewall: &mut Option<&mut FirewallRuntime<'_>>,
     firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
     firewall_plan: &mut Option<FirewallPlan>,
+    timestamp_clock: Option<Icmpv4TimestampClock>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     let ipv4 = validate_ipv4_frame(frame)?;
@@ -2292,7 +2398,26 @@ fn decide_ipv4<T: TraceSink>(
         }
     }
     if local {
-        return decide_local_ipv4(frame, snapshot, ingress, ipv4, trace);
+        let decision = decide_local_ipv4(frame, snapshot, ingress, ipv4, timestamp_clock, trace);
+        // RFC 1812 §4.3.3.3: a router without a service for the addressed
+        // transport or UDP port reports so, the same as any other host.
+        if let Err(reason @ (Icmpv4ProtocolUnreachable | Icmpv4PortUnreachable)) = decision {
+            if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+                let kind = if reason == Icmpv4PortUnreachable {
+                    Icmpv4ErrorKind::DestinationUnreachablePort
+                } else {
+                    Icmpv4ErrorKind::DestinationUnreachableProtocol
+                };
+                let disposition = decide_icmpv4_error(
+                    frame, snapshot, ipv4, None, kind, resolution, runtime, *now, trace,
+                );
+                trace.record(TraceEvent::Icmpv4DestinationUnreachableDisposition {
+                    ingress,
+                    disposition,
+                });
+            }
+        }
+        return decision;
     }
     if let Err(refusal) = validate_ipv4_options(frame, ipv4) {
         // RFC 1812 §4.3.2 asks a router to say why it refused a header rather
@@ -2395,6 +2520,12 @@ fn decide_ipv4<T: TraceSink>(
             }
         }
         let runtime = require_firewall_runtime(snapshot, config, firewall)?;
+        // A packet filter's denial is reported silently: RFC 1812 §4.3.3.9
+        // makes Communication Administratively Prohibited optional exactly
+        // so a filter is not forced into confirming its own rules to
+        // whoever it is filtering (see the `never_queues_icmp_or_arp`
+        // firewall contract). That code is still available for a caller
+        // that wants it, through `Icmpv4ErrorKind::DestinationUnreachableCommAdminProhibited`.
         *firewall_plan = Some(plan_firewall(
             ingress,
             route.egress(),
@@ -2433,6 +2564,43 @@ fn decide_ipv4<T: TraceSink>(
         .iter()
         .find(|item| item.id == route.egress())
         .ok_or(InterfaceMiss)?;
+    // RFC 1812 §5.2.7.2: tell the sender a better first hop exists when this
+    // datagram leaves by the same interface it arrived on, toward a next hop
+    // on the same subnet as the sender itself. The datagram is still
+    // forwarded normally; a Redirect is advisory, not a substitute. A
+    // datagram carrying a source route never reaches here: it was already
+    // refused above by `validate_ipv4_options`.
+    if route.egress() == ingress
+        && !snapshot
+            .local_ipv4
+            .iter()
+            .any(|binding| binding.address == target)
+    {
+        let connected_subnet = snapshot.routes.iter().find(|candidate| {
+            candidate.egress() == route.egress()
+                && candidate.next_hop().is_none()
+                && candidate.matches(target)
+        });
+        if connected_subnet.is_some_and(|connected| connected.matches(ipv4.source)) {
+            if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+                let disposition = decide_icmpv4_error(
+                    frame,
+                    snapshot,
+                    ipv4,
+                    Some(route),
+                    Icmpv4ErrorKind::Redirect { gateway: target },
+                    resolution,
+                    runtime,
+                    *now,
+                    trace,
+                );
+                trace.record(TraceEvent::Icmpv4TimeExceededDisposition {
+                    ingress,
+                    disposition,
+                });
+            }
+        }
+    }
     // RFC 1812 §4.2.2.7: a datagram larger than the egress MTU must not be
     // put on the link. Before this check the oversized frame was handed to
     // the backend unchanged, which a real driver rejects.
@@ -4949,13 +5117,22 @@ fn decide_local_ipv4<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
+    timestamp_clock: Option<Icmpv4TimestampClock>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     if ipv4.header_len > 20 {
         return Err(Ipv4OptionsUnsupported);
     }
     if ipv4.protocol != 1 {
-        return Ok(PacketDecision::ConsumeIpv4Local);
+        // RFC 1812 §4.3.3.3: a router is a host for traffic addressed to
+        // itself, and answers a transport it has no service for the same way
+        // any host would. TCP is the one exception: a closed TCP port
+        // answers with RST at the transport layer, never with ICMP.
+        return match ipv4.protocol {
+            6 => Ok(PacketDecision::ConsumeIpv4Local),
+            17 => Err(Icmpv4PortUnreachable),
+            _ => Err(Icmpv4ProtocolUnreachable),
+        };
     }
 
     let flags_fragment =
@@ -4977,6 +5154,20 @@ fn decide_local_ipv4<T: TraceSink>(
         .ok_or(Ipv4TotalLengthExceedsPacket)?;
     if icmp.len() < 4 {
         return Err(Icmpv4HeaderTruncated);
+    }
+    if icmp[0] == 13 {
+        return decide_local_icmpv4_timestamp(
+            frame,
+            snapshot,
+            ingress,
+            ipv4,
+            flags_fragment,
+            icmp_offset,
+            icmp_end,
+            icmp,
+            timestamp_clock,
+            trace,
+        );
     }
     if icmp[0] != 8 {
         if crate::internet_checksum(icmp) != 0 {
@@ -5054,6 +5245,115 @@ fn decide_local_ipv4<T: TraceSink>(
         icmp_offset,
         icmp_end,
     }))
+}
+
+/// RFC 792 / RFC 1812 §4.3.2.9: answer a Timestamp request addressed to one
+/// of this router's own addresses with a Timestamp Reply. `timestamp_clock`
+/// is `None` when the caller has no wall clock to offer; the datapath never
+/// reads one itself, so the request is simply consumed unanswered rather
+/// than reported as invalid.
+#[allow(clippy::too_many_arguments)]
+fn decide_local_icmpv4_timestamp<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    ipv4: packet::ValidatedIpv4,
+    flags_fragment: u16,
+    icmp_offset: usize,
+    icmp_end: usize,
+    icmp: &[u8],
+    timestamp_clock: Option<Icmpv4TimestampClock>,
+    trace: &mut T,
+) -> Result<PacketDecision, DropReason> {
+    if icmp[1] != 0 {
+        return Err(Icmpv4TimestampCodeInvalid);
+    }
+    if icmp.len() < 20 {
+        return Err(Icmpv4TimestampHeaderTruncated);
+    }
+    if crate::internet_checksum(icmp) != 0 {
+        return Err(Icmpv4ChecksumInvalid);
+    }
+    let Some(clock) = timestamp_clock else {
+        return Ok(PacketDecision::ConsumeIpv4Local);
+    };
+
+    let interface = snapshot
+        .interfaces
+        .iter()
+        .find(|item| item.id == ingress)
+        .ok_or(InterfaceMiss)?;
+    if !sender_is_host(snapshot, ingress, ipv4.source)
+        || snapshot
+            .local_ipv4
+            .iter()
+            .any(|binding| binding.interface == ingress && binding.address == ipv4.source)
+    {
+        return Err(Icmpv4SourceNotUnicast);
+    }
+    let requester_mac: [u8; 6] = frame
+        .get(6..12)
+        .ok_or(EthernetHeaderTruncated)?
+        .try_into()
+        .map_err(|_| EthernetHeaderTruncated)?;
+    if requester_mac == [0; 6] || requester_mac[0] & 1 != 0 {
+        return Err(Icmpv4EthernetSourceInvalid);
+    }
+    if frame.get(0..6) != Some(interface.mac.0.as_slice()) {
+        return Err(Icmpv4EthernetDestinationNotLocal);
+    }
+    let old_icmp_checksum =
+        packet::read_u16(frame, icmp_offset + 2).ok_or(Icmpv4HeaderTruncated)?;
+    let ipv4_id =
+        packet::read_u16(frame, ipv4.header_offset + 4).ok_or(Ipv4HeaderLengthExceedsPacket)?;
+    let ipv4_checksum = rfc1624_update(
+        ipv4.checksum,
+        u16::from_be_bytes([ipv4.ttl, ipv4.protocol]),
+        u16::from_be_bytes([snapshot.ipv4_origin.default_ttl(), ipv4.protocol]),
+    );
+    let ipv4_checksum = rfc1624_update(ipv4_checksum, ipv4_id, 0);
+    let ipv4_checksum = rfc1624_update(ipv4_checksum, flags_fragment, 0x4000);
+
+    let old_receive = packet::read_u16(frame, icmp_offset + 12).ok_or(Icmpv4HeaderTruncated)?;
+    let old_receive_low = packet::read_u16(frame, icmp_offset + 14).ok_or(Icmpv4HeaderTruncated)?;
+    let old_transmit = packet::read_u16(frame, icmp_offset + 16).ok_or(Icmpv4HeaderTruncated)?;
+    let old_transmit_low =
+        packet::read_u16(frame, icmp_offset + 18).ok_or(Icmpv4HeaderTruncated)?;
+    let clock_word = clock.0;
+    let new_high = (clock_word >> 16) as u16;
+    let new_low = (clock_word & 0xffff) as u16;
+    let icmp_checksum = rfc1624_update(old_icmp_checksum, 0x0d00, 0x0e00);
+    let icmp_checksum = rfc1624_update(icmp_checksum, old_receive, new_high);
+    let icmp_checksum = rfc1624_update(icmp_checksum, old_receive_low, new_low);
+    let icmp_checksum = rfc1624_update(icmp_checksum, old_transmit, new_high);
+    let icmp_checksum = rfc1624_update(icmp_checksum, old_transmit_low, new_low);
+    let icmp_checksum = if icmp_checksum == 0 {
+        // RFC 1624 returns +0 for this mathematical-zero update. ICMP stores
+        // the equivalent one's-complement -0 as 0xffff on the wire.
+        0xffff
+    } else {
+        icmp_checksum
+    };
+    trace.record(TraceEvent::Icmpv4TimestampRequestValidated {
+        ingress,
+        source: ipv4.source,
+        destination: ipv4.destination,
+    });
+    Ok(PacketDecision::Icmpv4TimestampReply(
+        Icmpv4TimestampReplyDecision {
+            egress: ingress,
+            local_mac: interface.mac.0,
+            requester_mac,
+            local_ip: ipv4.destination.octets(),
+            requester_ip: ipv4.source.octets(),
+            ipv4_checksum,
+            icmp_checksum,
+            reply_ttl: snapshot.ipv4_origin.default_ttl(),
+            icmp_offset,
+            icmp_end,
+            clock_word,
+        },
+    ))
 }
 
 fn decide_arp<T: TraceSink>(
@@ -5193,6 +5493,7 @@ fn apply_decision(frame: &mut [u8], decision: PacketDecision) -> Result<(), Drop
         PacketDecision::Nat44Icmpv4(nat) => apply_nat44_icmpv4_rewrite(frame, nat),
         PacketDecision::ArpReply(arp) => apply_arp_reply(frame, arp),
         PacketDecision::Icmpv4EchoReply(icmp) => apply_icmpv4_echo_reply(frame, icmp),
+        PacketDecision::Icmpv4TimestampReply(icmp) => apply_icmpv4_timestamp_reply(frame, icmp),
         PacketDecision::ConsumeArp(_)
         | PacketDecision::ConsumeIpv4Local
         | PacketDecision::ConsumeIpv4ForFragmentation => {
@@ -5570,6 +5871,38 @@ fn apply_icmpv4_echo_reply(
     frame[decision.icmp_offset] = 0;
     frame[decision.icmp_offset + 2..decision.icmp_offset + 4]
         .copy_from_slice(&decision.icmp_checksum.to_be_bytes());
+    Ok(())
+}
+
+fn apply_icmpv4_timestamp_reply(
+    frame: &mut [u8],
+    decision: Icmpv4TimestampReplyDecision,
+) -> Result<(), DropReason> {
+    if frame.get(0..12).is_none()
+        || frame.get(14..34).is_none()
+        || frame.get(decision.icmp_offset..decision.icmp_end).is_none()
+        || frame
+            .get(decision.icmp_offset..decision.icmp_offset + 20)
+            .is_none()
+    {
+        return Err(Ipv4TotalLengthExceedsPacket);
+    }
+
+    frame[0..6].copy_from_slice(&decision.requester_mac);
+    frame[6..12].copy_from_slice(&decision.local_mac);
+    frame[18..20].copy_from_slice(&0_u16.to_be_bytes());
+    frame[20..22].copy_from_slice(&0x4000_u16.to_be_bytes());
+    frame[22] = decision.reply_ttl;
+    frame[24..26].copy_from_slice(&decision.ipv4_checksum.to_be_bytes());
+    frame[26..30].copy_from_slice(&decision.local_ip);
+    frame[30..34].copy_from_slice(&decision.requester_ip);
+    frame[decision.icmp_offset] = 14;
+    frame[decision.icmp_offset + 2..decision.icmp_offset + 4]
+        .copy_from_slice(&decision.icmp_checksum.to_be_bytes());
+    frame[decision.icmp_offset + 12..decision.icmp_offset + 16]
+        .copy_from_slice(&decision.clock_word.to_be_bytes());
+    frame[decision.icmp_offset + 16..decision.icmp_offset + 20]
+        .copy_from_slice(&decision.clock_word.to_be_bytes());
     Ok(())
 }
 
@@ -6071,7 +6404,8 @@ mod tests {
         let ipv4 = crate::validate_ipv4_frame(&frame).unwrap();
         let mut trace = RecordingTrace::default();
 
-        let decision = super::decide_local_ipv4(&frame, &snapshot, LAN, ipv4, &mut trace).unwrap();
+        let decision =
+            super::decide_local_ipv4(&frame, &snapshot, LAN, ipv4, None, &mut trace).unwrap();
         super::apply_decision(&mut frame, decision).unwrap();
 
         assert_eq!(
@@ -6484,6 +6818,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut trace,
         );
         let disposition = trace.events.iter().find_map(|event| match event {
@@ -6549,6 +6884,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut trace,
         );
         eprintln!(
@@ -6854,6 +7190,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut NoTrace,
         );
         assert!(matches!(result, Err(reason) if reason == expected));
@@ -7606,6 +7943,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut NoTrace,
         )
     }
@@ -7639,6 +7977,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut NoTrace,
         )
     }
@@ -7693,6 +8032,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut NoTrace,
         )
     }
@@ -7899,6 +8239,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut NoTrace,
         );
 
@@ -7966,6 +8307,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut NoTrace,
         );
 
@@ -8034,6 +8376,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut NoTrace,
         );
         assert!(matches!(directed_result, Err(NeighborUnresolved)));
@@ -8080,6 +8423,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut NoTrace,
         );
         assert!(matches!(network_result, Err(NeighborUnresolved)));
@@ -8138,6 +8482,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut NoTrace,
         );
 
@@ -8224,6 +8569,10 @@ mod tests {
             Ok(super::PacketDecision::ConsumeIpv4Local)
         ));
 
+        // Contract: a UDP packet that misses every NAT candidacy check falls
+        // to local delivery, which now answers a locally-addressed UDP
+        // packet with Port Unreachable (RFC 1812 §4.3.3.3) rather than
+        // silently consuming it.
         let tcp_destination_with_udp = ipv4_decision_frame(REMOTE, PUBLIC2, 17, 64, 5);
         assert!(matches!(
             decide_ipv4_with_services(
@@ -8234,7 +8583,7 @@ mod tests {
                 Some(&tcp_config),
                 Some(&firewall_config),
             ),
-            Ok(super::PacketDecision::ConsumeIpv4Local)
+            Err(super::DropReason::Icmpv4PortUnreachable)
         ));
     }
 
@@ -9167,6 +9516,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut NoTrace,
         );
         assert!(matches!(result, Err(NeighborUnresolved)));
@@ -9300,6 +9650,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut NoTrace,
         );
         assert!(matches!(
@@ -9339,6 +9690,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut NoTrace,
         )
     }
@@ -9575,6 +9927,7 @@ mod tests {
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
+            None,
             &mut NoTrace,
         );
         assert!(matches!(result, Err(Nat44TcpRuntimeUnavailable)));
@@ -13200,6 +13553,7 @@ mod tests {
                         snapshot,
                         LAN,
                         options_ipv4,
+                        None,
                         &mut trace,
                     ),
                     Err(Ipv4OptionsUnsupported)
@@ -13216,6 +13570,7 @@ mod tests {
                         snapshot,
                         LAN,
                         short_ipv4,
+                        None,
                         &mut trace,
                     ),
                     Err(Icmpv4HeaderTruncated)
@@ -13232,6 +13587,7 @@ mod tests {
                         snapshot,
                         LAN,
                         exact_ipv4,
+                        None,
                         &mut trace,
                     ),
                     Ok(super::super::PacketDecision::ConsumeIpv4Local)
@@ -13248,6 +13604,7 @@ mod tests {
                         snapshot,
                         LAN,
                         invalid_non_echo_ipv4,
+                        None,
                         &mut trace,
                     ),
                     Err(Icmpv4ChecksumInvalid)
@@ -13265,6 +13622,7 @@ mod tests {
                         snapshot,
                         LAN,
                         short_echo_ipv4,
+                        None,
                         &mut trace,
                     ),
                     Err(Icmpv4EchoHeaderTruncated)
@@ -13289,7 +13647,7 @@ mod tests {
                 // accepted merely because no local binding matches it
                 // (4825 `||`, mutant 115).
                 assert!(matches!(
-                    super::super::decide_local_ipv4(&frame, snapshot, LAN, ipv4, &mut trace,),
+                    super::super::decide_local_ipv4(&frame, snapshot, LAN, ipv4, None, &mut trace,),
                     Err(Icmpv4SourceNotUnicast)
                 ));
 
@@ -13303,7 +13661,9 @@ mod tests {
                     // Contract: a source bound on the ingress interface is
                     // rejected (4829 equality, mutant 116).
                     assert!(matches!(
-                        super::super::decide_local_ipv4(&frame, snapshot, LAN, ipv4, &mut trace,),
+                        super::super::decide_local_ipv4(
+                            &frame, snapshot, LAN, ipv4, None, &mut trace,
+                        ),
                         Err(Icmpv4SourceNotUnicast)
                     ));
                 });
@@ -13321,6 +13681,7 @@ mod tests {
                         snapshot,
                         LAN,
                         ipv4,
+                        None,
                         &mut trace,
                     ),
                     Err(Icmpv4EthernetSourceInvalid)
@@ -13337,9 +13698,48 @@ mod tests {
                         snapshot,
                         LAN,
                         ipv4,
+                        None,
                         &mut trace,
                     ),
                     Err(Icmpv4EthernetDestinationNotLocal)
+                ));
+            });
+        }
+
+        #[test]
+        fn rest_decide_local_ipv4_checks_the_timestamp_request_source_guard() {
+            // Contract: a Timestamp request shares the same unicast-source
+            // guard an Echo request already enforces (RFC 1812 §4.3.2.9).
+            let destination = INTERNAL;
+            let interface = [Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
+            }];
+            let destination_binding = [LocalIpv4Binding {
+                interface: LAN,
+                address: destination,
+            }];
+            with_snapshot(&[], &interface, &[], &destination_binding, |snapshot| {
+                let mut frame = vec![0_u8; 54];
+                frame[0..6].copy_from_slice(&[2, 0, 0, 0, 0, 1]);
+                frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 9]);
+                frame[34] = 13;
+                let checksum = internet_checksum(&frame[34..54]);
+                frame[36..38].copy_from_slice(&checksum.to_be_bytes());
+                let ipv4 =
+                    synthetic_ipv4(1, Ipv4Address::from_octets([0, 0, 0, 1]), destination, 40);
+                let mut trace = NoTrace;
+                assert!(matches!(
+                    super::super::decide_local_ipv4(
+                        &frame,
+                        snapshot,
+                        LAN,
+                        ipv4,
+                        Some(super::super::Icmpv4TimestampClock(0)),
+                        &mut trace,
+                    ),
+                    Err(Icmpv4SourceNotUnicast)
                 ));
             });
         }

@@ -505,11 +505,14 @@ fn valid_unsupported_local_traffic_is_consumed_without_routing() {
     let interfaces = interfaces();
     let bindings = [local_binding(LAN)];
     let snapshot = local_snapshot(&interfaces, &bindings);
-    let udp = ipv4_frame(LOCAL_IP, 17, 64, 0, &[0; 8], &[]);
+    // RFC 1812 §4.3.3.3: a locally-addressed TCP segment gets no ICMP
+    // response (a closed port answers with RST at the transport layer), so
+    // TCP is still the one protocol this router silently consumes.
+    let tcp = ipv4_frame(LOCAL_IP, 6, 64, 0, &[0; 8], &[]);
     let unreachable = ipv4_frame(LOCAL_IP, 1, 64, 0, &icmp_message(3, 0, &[]), &[]);
-    let originals = [udp.clone(), unreachable.clone()];
+    let originals = [tcp.clone(), unreachable.clone()];
     let mut io = SimIo::new();
-    io.inject(LAN, udp);
+    io.inject(LAN, tcp);
     io.inject(LAN, unreachable);
     let mut trace = VecTrace::default();
 
@@ -555,6 +558,48 @@ fn valid_unsupported_local_traffic_is_consumed_without_routing() {
             TraceEvent::Ipv4LocalConsumed {
                 ingress: LAN,
                 reason: ConsumeReason::Ipv4LocalUnsupported
+            },
+            TraceEvent::BatchCompleted {
+                tx_accepted: 0,
+                tx_rejected: 0
+            }
+        ]
+    ));
+}
+
+#[test]
+fn valid_udp_to_a_local_address_is_dropped_port_unreachable_without_routing() {
+    let interfaces = interfaces();
+    let bindings = [local_binding(LAN)];
+    let snapshot = local_snapshot(&interfaces, &bindings);
+    let udp = ipv4_frame(LOCAL_IP, 17, 64, 0, &[0; 8], &[]);
+    let original = udp.clone();
+    let mut io = SimIo::new();
+    io.inject(LAN, udp);
+    let mut trace = VecTrace::default();
+
+    let report = io.run_once(1, &snapshot, &mut trace).unwrap();
+
+    assert_eq!(report.received, 1);
+    assert_eq!(report.tx_requested, 0);
+    assert_eq!(report.dropped, 1);
+    assert_eq!(report.consumed, 0);
+    let recycled = io.pop_recycled().unwrap();
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Forwarding(DropReason::Icmpv4PortUnreachable)
+    );
+    assert_eq!(recycled.bytes, original);
+    assert!(matches!(
+        trace.events(),
+        [
+            TraceEvent::Ipv4Validated {
+                ingress: LAN,
+                destination: LOCAL_IP
+            },
+            TraceEvent::Dropped {
+                ingress: LAN,
+                reason: DropReason::Icmpv4PortUnreachable
             },
             TraceEvent::BatchCompleted {
                 tx_accepted: 0,
@@ -613,6 +658,8 @@ fn local_echo_and_consume_leave_resolution_runtime_untouched() {
     assert_eq!(runtime.pending_actions(), 2);
 
     io.inject(LAN, echo_request(&[], &[]));
+    // RFC 1812 §4.3.3.3: a locally-addressed UDP datagram now draws Port
+    // Unreachable, so it is dropped rather than silently consumed.
     io.inject(LAN, ipv4_frame(LOCAL_IP, 17, 64, 0, &[0; 8], &[]));
     let batch = io.receive(2).unwrap();
     let local = forward_batch_with_resolution(
@@ -632,7 +679,7 @@ fn local_echo_and_consume_leave_resolution_runtime_untouched() {
             runtime.pending_actions(),
             runtime.counters()
         ),
-        (1, 1, 0, 1, 2, counters_before)
+        (1, 0, 1, 1, 2, counters_before)
     );
     io.pop_tx();
     io.pop_recycled();
