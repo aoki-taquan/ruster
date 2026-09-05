@@ -4,7 +4,7 @@ use ruster_core::{
     execute_one_icmpv4_error, internet_checksum, ipv4_header_checksum, DropReason,
     DynamicNeighborSlot, FirewallAction, FirewallAuditBuffer, FirewallAuditRecord, FirewallConfig,
     FirewallConnectionClass, FirewallDisposition, FirewallFailure, FirewallHashKey,
-    FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPolicySource, FirewallPortRange,
+    FirewallInterface, Ipv4Mtu, FirewallIpv4Prefix, FirewallPolicy, FirewallPolicySource, FirewallPortRange,
     FirewallProtocol, FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot,
     FirewallTcpPhase, FirewallVerdict, ForwardingSnapshot, Icmpv4ErrorActionSlot,
     Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
@@ -64,10 +64,12 @@ fn topology() -> (
             Interface {
                 id: LAN,
                 mac: LAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: WAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ],
         [

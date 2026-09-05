@@ -13,7 +13,7 @@ use ruster_core::{
     forward_batch, forward_batch_with_firewall, forward_batch_with_nat44_udp_and_tcp,
     forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors, internet_checksum,
     ipv4_header_checksum, validate_arp, validate_arp_request, validate_ipv4_frame, BatchCompletion,
-    FirewallAction, FirewallConfig, FirewallHashKey, FirewallInterface, FirewallIpv4Prefix,
+    FirewallAction, FirewallConfig, FirewallHashKey, FirewallInterface, Ipv4Mtu, FirewallIpv4Prefix,
     FirewallPolicy, FirewallPortRange, FirewallProtocol, FirewallRule, FirewallRuleId,
     FirewallRuntime, FirewallStateSlot, ForwardingSnapshot, Icmpv4ErrorActionSlot,
     Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
@@ -1085,10 +1085,12 @@ fn topology() -> (
             Interface {
                 id: LAN,
                 mac: LAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: WAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ],
         [

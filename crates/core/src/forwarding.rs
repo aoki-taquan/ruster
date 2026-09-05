@@ -10,7 +10,7 @@ use crate::{
     FirewallConfig, FirewallConnectionClass, FirewallDisposition, FirewallFailure,
     FirewallPolicySource, FirewallProtocol, FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow,
     FirewallRuntime, FirewallVerdict, Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind,
-    Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface, LocalIpv4Binding,
+    Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface, Ipv4Mtu, LocalIpv4Binding,
     MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition, Nat44TcpRuntime,
     Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, ResolutionResult,
     ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
@@ -165,7 +165,12 @@ pub enum DropReason {
     ArpEthernetDestinationZero = 143,
     ArpEthernetDestinationMulticast = 144,
     Ipv4SourceLocalAddress = 145,
+    Ipv4FragmentationNeeded = 146,
+    Ipv4FragmentationRequired = 147,
 }
+
+/// The IPv4 Don't Fragment flag inside the flags-and-offset field (RFC 791).
+const IPV4_DONT_FRAGMENT_FLAG: u16 = 0x4000;
 
 use DropReason::*;
 
@@ -320,6 +325,8 @@ impl DropReason {
             ArpEthernetDestinationZero => "ARP_ETHERNET_DESTINATION_ZERO",
             ArpEthernetDestinationMulticast => "ARP_ETHERNET_DESTINATION_MULTICAST",
             Ipv4SourceLocalAddress => "IPV4_SOURCE_LOCAL_ADDRESS",
+            Ipv4FragmentationNeeded => "IPV4_FRAGMENTATION_NEEDED",
+            Ipv4FragmentationRequired => "IPV4_FRAGMENTATION_REQUIRED",
         }
     }
 }
@@ -2372,6 +2379,41 @@ fn decide_ipv4<T: TraceSink>(
         .iter()
         .find(|item| item.id == route.egress())
         .ok_or(InterfaceMiss)?;
+    // RFC 1812 §4.2.2.7: a datagram larger than the egress MTU must not be
+    // put on the link. Before this check the oversized frame was handed to
+    // the backend unchanged, which a real driver rejects.
+    if ipv4.total_len > interface.mtu.as_len() {
+        let dont_fragment = packet::read_u16(frame, ipv4.header_offset + 6)
+            .ok_or(Ipv4HeaderTruncated)?
+            & IPV4_DONT_FRAGMENT_FLAG
+            != 0;
+        if !dont_fragment {
+            // RFC 1812 §5.2.7 fragmentation is not implemented yet, so the
+            // datagram is dropped with a reason of its own rather than being
+            // emitted at a length the link cannot carry.
+            return Err(Ipv4FragmentationRequired);
+        }
+        if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+            let disposition = decide_icmpv4_error(
+                frame,
+                snapshot,
+                ipv4,
+                Some(route),
+                Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded {
+                    next_hop_mtu: interface.mtu.bytes(),
+                },
+                resolution,
+                runtime,
+                *now,
+                trace,
+            );
+            trace.record(TraceEvent::Icmpv4TimeExceededDisposition {
+                ingress,
+                disposition,
+            });
+        }
+        return Err(Ipv4FragmentationNeeded);
+    }
     let static_neighbor = snapshot
         .neighbors
         .iter()
@@ -5340,6 +5382,7 @@ mod tests {
         let interfaces = [Interface {
             id: LAN,
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let neighbors = [crate::Neighbor {
             interface: LAN,
@@ -5606,6 +5649,7 @@ mod tests {
         let interfaces = [Interface {
             id: LAN,
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let bindings = [LocalIpv4Binding {
             interface: LAN,
@@ -5691,10 +5735,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let neighbors = [
@@ -5985,6 +6031,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let neighbors = [crate::Neighbor {
             interface: WAN,
@@ -6051,6 +6098,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,
@@ -6119,10 +6167,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let neighbors = [
@@ -6326,10 +6376,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -6718,10 +6770,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let route = Route::new(Ipv4Address::from_octets([198, 51, 100, 0]), 24, WAN, None).unwrap();
@@ -6847,6 +6901,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,
@@ -6887,10 +6942,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -6950,10 +7007,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [LocalIpv4Binding {
@@ -7008,6 +7067,7 @@ mod tests {
         let interface = Interface {
             id: LAN,
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: Ipv4Mtu::ETHERNET,
         };
         let interfaces = [interface];
         let snapshot = ForwardingSnapshot::new(&[], &interfaces, &[], &[]).unwrap();
@@ -7234,10 +7294,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -7270,6 +7332,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let routes = [Route::new(REMOTE, 32, WAN, None).unwrap()];
         let neighbors = [crate::Neighbor {
@@ -7293,10 +7356,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let routes = [Route::new(REMOTE, 32, WAN, None).unwrap()];
@@ -7321,6 +7386,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let routes = [Route::new(REMOTE, 32, WAN, None).unwrap()];
         let bindings = [LocalIpv4Binding {
@@ -7375,10 +7441,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let routes = [Route::new(target, 32, WAN, None).unwrap()];
@@ -7438,10 +7506,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let directed_routes = [
@@ -7548,6 +7618,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let routes = [Route::new(target, 32, WAN, None).unwrap()];
         let bindings = [LocalIpv4Binding {
@@ -7607,14 +7678,17 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: DMZ,
                 mac: MacAddress([2, 0, 0, 0, 0, 3]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -7696,14 +7770,17 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: DMZ,
                 mac: MacAddress([2, 0, 0, 0, 0, 3]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -7766,14 +7843,17 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: DMZ,
                 mac: MacAddress([2, 0, 0, 0, 0, 3]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -7931,14 +8011,17 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: DMZ,
                 mac: MacAddress([2, 0, 0, 0, 0, 3]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -8078,10 +8161,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -8169,10 +8254,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -8214,10 +8301,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [LocalIpv4Binding {
@@ -8247,6 +8336,7 @@ mod tests {
         let interfaces = [Interface {
             id: LAN,
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let bindings = [LocalIpv4Binding {
             interface: LAN,
@@ -8269,10 +8359,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -8397,10 +8489,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -8448,10 +8542,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -8499,10 +8595,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -8550,10 +8648,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [LocalIpv4Binding {
@@ -8605,14 +8705,17 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: DMZ,
                 mac: MacAddress([2, 0, 0, 0, 0, 3]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -8776,10 +8879,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -8905,10 +9010,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -9305,10 +9412,12 @@ mod tests {
                 Interface {
                     id: LAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: WAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             let bindings = [
@@ -9356,10 +9465,12 @@ mod tests {
                 Interface {
                     id: LAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: WAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             let bindings = [
@@ -9401,10 +9512,12 @@ mod tests {
                 Interface {
                     id: LAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: WAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             let bindings = [
@@ -9469,10 +9582,12 @@ mod tests {
                 Interface {
                     id: LAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: WAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             let bindings = [
@@ -9513,10 +9628,12 @@ mod tests {
                 Interface {
                     id: LAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: WAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             let bindings = [
@@ -11757,10 +11874,12 @@ mod tests {
                 Interface {
                     id: LAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: WAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             let bindings = [
@@ -11991,10 +12110,12 @@ mod tests {
                 Interface {
                     id: LAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: WAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             let bindings = [
@@ -12117,10 +12238,12 @@ mod tests {
                 Interface {
                     id: LAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: WAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             let bindings = [
@@ -12217,6 +12340,7 @@ mod tests {
             let wan_interfaces = [Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             }];
             let wan_binding = [LocalIpv4Binding {
                 interface: WAN,
@@ -12305,6 +12429,7 @@ mod tests {
             let interfaces = [Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             }];
             with_snapshot(&routes, &interfaces, &[], &[], |snapshot| {
                 for (octets, expected) in [
@@ -12346,6 +12471,7 @@ mod tests {
             let local_interface = [Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             }];
             let local_source = [LocalIpv4Binding {
                 interface: LAN,
@@ -12377,6 +12503,7 @@ mod tests {
             let selected_interface = [Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             }];
             with_snapshot(
                 std::slice::from_ref(&selected_route),
@@ -12499,6 +12626,7 @@ mod tests {
             let local_interface = [Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             }];
             let target_binding = [LocalIpv4Binding {
                 interface: LAN,
@@ -12644,6 +12772,7 @@ mod tests {
             let interface = [Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             }];
             let destination_binding = [LocalIpv4Binding {
                 interface: LAN,
@@ -12718,6 +12847,7 @@ mod tests {
             let interfaces = [Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             }];
             with_snapshot(&[], &interfaces, &[], &[], |snapshot| {
                 // Contract: an all-zero ARP sender hardware address is
@@ -12762,6 +12892,7 @@ mod tests {
             let interface = Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             };
             let binding = [LocalIpv4Binding {
                 interface: LAN,
@@ -12811,10 +12942,12 @@ mod tests {
                 Interface {
                     id: LAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: WAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             let target = arp_frame(ArpOpcode::Request, [2, 0, 0, 0, 0, 9], REMOTE, INTERNAL);
@@ -12855,6 +12988,7 @@ mod tests {
             let interfaces_without_ingress = [Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             }];
             let binding_without_ingress = [LocalIpv4Binding {
                 interface: WAN,
@@ -12883,10 +13017,12 @@ mod tests {
                 Interface {
                     id: LAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: WAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             let frame = arp_frame(ArpOpcode::Request, [2, 0, 0, 0, 0, 9], REMOTE, PUBLIC);
@@ -13027,10 +13163,12 @@ mod tests {
                 Interface {
                     id: LAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: WAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             with_snapshot(&[], &interfaces, &[], &[], |snapshot| {
@@ -13094,10 +13232,12 @@ mod tests {
                 Interface {
                     id: LAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: WAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             let target = Ipv4Address::from_octets([198, 51, 100, 21]);
@@ -13173,10 +13313,12 @@ mod tests {
                 Interface {
                     id: LAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: WAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             let bindings = [LocalIpv4Binding {

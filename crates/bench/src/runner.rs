@@ -3,7 +3,7 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use ruster_core::{
-    forward_batch, internet_checksum, validate_ipv4_frame, ForwardingSnapshot, IfId, Interface,
+    forward_batch, internet_checksum, validate_ipv4_frame, ForwardingSnapshot, IfId, Interface, Ipv4Mtu,
     Ipv4Address, LocalIpv4Binding, MacAddress, Neighbor, NoTrace, PacketIo, Route,
 };
 
@@ -190,10 +190,12 @@ fn run_plain_case(
         Interface {
             id: LAN,
             mac: MacAddress([0x02, 0, 0, 0, 0, 1]),
+            mtu: Ipv4Mtu::ETHERNET,
         },
         Interface {
             id: WAN,
             mac: WAN_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
     ];
     let neighbors = [Neighbor {

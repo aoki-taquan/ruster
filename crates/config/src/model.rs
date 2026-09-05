@@ -189,6 +189,9 @@ pub struct InterfaceV1 {
     pub name: String,
     pub device: String,
     pub mac: String,
+    /// The link MTU in bytes. Absent means the Ethernet default of 1500, so an
+    /// existing configuration keeps the behaviour it had before MTU existed.
+    pub mtu: Option<u16>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

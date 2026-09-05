@@ -13,7 +13,7 @@ use ruster_control::{
 };
 use ruster_core::{
     take_full_firewall_validation_count, take_full_forwarding_validation_count, FirewallHashKey,
-    FirewallPolicy, Icmpv4ErrorPolicy, IfId, Interface, Ipv4Address, Ipv4OriginPolicy,
+    FirewallPolicy, Icmpv4ErrorPolicy, IfId, Interface, Ipv4Mtu, Ipv4Address, Ipv4OriginPolicy,
     LocalIpv4Binding, MacAddress, Nat44TcpHashKey, Nat44TcpPolicy, Nat44UdpHashKey, Nat44UdpPolicy,
     ResolutionPolicy, Route,
 };
@@ -70,10 +70,12 @@ fn validated_candidate_builds_1024_static_authority_views_without_work() {
         Interface {
             id: LAN,
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: Ipv4Mtu::ETHERNET,
         },
         Interface {
             id: WAN,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: Ipv4Mtu::ETHERNET,
         },
     ];
     let bindings = [

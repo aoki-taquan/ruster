@@ -2,7 +2,7 @@ mod support;
 
 use ruster_core::{
     internet_checksum, ipv4_header_checksum, rfc1624_update, DropReason, DynamicNeighborSlot,
-    ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    ForwardingSnapshot, IfId, Interface, Ipv4Mtu, Ipv4Address, LocalIpv4Binding, MacAddress,
     MonotonicMillis, Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpDisposition, Nat44UdpMappingSlot,
     Nat44UdpPeerSlot, Nat44UdpPolicy, Neighbor, NoTrace, ResolutionActionSlot, ResolutionPolicy,
     ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent, NAT44_UDP_MIN_IDLE_TTL_MS,
@@ -47,14 +47,17 @@ fn base() -> (
             Interface {
                 id: LAN,
                 mac: LAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: WAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: DMZ,
                 mac: DMZ_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ],
         [

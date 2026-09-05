@@ -8,7 +8,7 @@ use ruster_control::{
 };
 use ruster_core::{
     DirectoryBucket, DirectoryNode, FirewallHashKey, FirewallPolicy, FirewallRuntime,
-    FirewallStateSlot, Icmpv4ErrorPolicy, IfId, Interface, Ipv4Address, Ipv4OriginPolicy,
+    FirewallStateSlot, Icmpv4ErrorPolicy, IfId, Interface, Ipv4Mtu, Ipv4Address, Ipv4OriginPolicy,
     LocalIpv4Binding, MacAddress, Nat44TcpHashKey, Nat44TcpIndexStorage, Nat44TcpMappingSlot,
     Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpHashKey, Nat44UdpIndexStorage,
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, PortOwnerSlot,
@@ -83,10 +83,12 @@ fn base_plan(
         Interface {
             id: LAN,
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: Ipv4Mtu::ETHERNET,
         },
         Interface {
             id: WAN,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: Ipv4Mtu::ETHERNET,
         },
     ];
     let bindings = [

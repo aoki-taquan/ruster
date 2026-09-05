@@ -5,7 +5,7 @@ use ruster_core::{
     poll_resolution_timers, ArpRequestBuildError, BatchCompletion, DropReason,
     ExecuteArpRequestError, ForwardingSnapshot, GeneratedAllocationError, GeneratedBatchCompletion,
     GeneratedPacketBatch, GeneratedPacketIo, GeneratedPacketLease, GeneratedPacketSlot,
-    GeneratedSlotCompletion, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    GeneratedSlotCompletion, IfId, Interface, Ipv4Mtu, Ipv4Address, LocalIpv4Binding, MacAddress,
     MonotonicMillis, Neighbor, NoResolutionTimerTrace, NoTrace, PacketIo, ResolutionActionSlot,
     ResolutionPolicy, ResolutionPolicyError, ResolutionResult, ResolutionRuntime,
     ResolutionStateSlot, Route, TraceEvent, ETHERNET_HEADER_LEN,
@@ -41,6 +41,7 @@ fn interface() -> Interface {
     Interface {
         id: WAN,
         mac: ROUTER_MAC,
+        mtu: Ipv4Mtu::ETHERNET,
     }
 }
 
@@ -49,6 +50,7 @@ fn interfaces() -> [Interface; 2] {
         Interface {
             id: LAN,
             mac: MacAddress([0x02, 0, 0, 0, 0, 1]),
+            mtu: Ipv4Mtu::ETHERNET,
         },
         interface(),
     ]
@@ -370,6 +372,7 @@ fn resolution_keys_are_independent_by_interface_and_target() {
     let other_interface = Interface {
         id: IfId(3),
         mac: MacAddress([3; 6]),
+        mtu: Ipv4Mtu::ETHERNET,
     };
     let other_route = Route::new(
         Ipv4Address::from_octets([198, 51, 100, 10]),
@@ -387,6 +390,7 @@ fn resolution_keys_are_independent_by_interface_and_target() {
         Interface {
             id: LAN,
             mac: MacAddress([0x02, 0, 0, 0, 0, 1]),
+            mtu: Ipv4Mtu::ETHERNET,
         },
         other_interface,
     ];

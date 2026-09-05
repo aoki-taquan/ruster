@@ -14,7 +14,7 @@ use ruster_control::{
     plan_full_service_v1, plan_successor, FullServicePlanInputs, PlanOutcome, PlanRestartRequired,
     SuccessorError,
 };
-use ruster_core::{FirewallHashKey, Nat44TcpHashKey, Nat44UdpHashKey};
+use ruster_core::{FirewallHashKey, Nat44TcpHashKey, Nat44UdpHashKey, IPV4_MINIMUM_MTU};
 
 #[cfg(target_os = "linux")]
 use std::sync::mpsc::{self, TryRecvError};
@@ -904,6 +904,9 @@ fn validation_reason(error: &ValidationError) -> String {
         ValidationCode::InvalidMac => "MAC address is invalid".to_owned(),
         ValidationCode::NonCanonicalMac => "MAC address is not canonical".to_owned(),
         ValidationCode::MacNotUnicast => "MAC address must be unicast".to_owned(),
+        ValidationCode::MtuBelowIpv4Minimum => {
+            format!("interface MTU must be at least {IPV4_MINIMUM_MTU} bytes")
+        }
         ValidationCode::InvalidIpv4 => "IPv4 address is invalid".to_owned(),
         ValidationCode::NonCanonicalIpv4 => "IPv4 address is not canonical".to_owned(),
         ValidationCode::InvalidIpv4Prefix => "IPv4 prefix is invalid".to_owned(),

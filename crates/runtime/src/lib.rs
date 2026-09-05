@@ -1766,7 +1766,7 @@ mod tests {
         BoundPublicationBackend, DirectoryBucket, DirectoryNode, FirewallHashKey, FirewallPolicy,
         FirewallRuntime, FirewallStateSlot, GeneratedBatchCompletion, GeneratedPacketBatch,
         GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion, GeneratedTraceSink,
-        Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorStateSlot, IfId, Interface,
+        Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Mtu,
         Ipv4Address, LocalIpv4Binding, MacAddress, MatchedPublicationQuiescenceGuard,
         Nat44TcpHashKey, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy,
         Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpHashKey, Nat44UdpIndexStorage,
@@ -1939,10 +1939,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: LAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: WAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [
@@ -4237,10 +4239,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: LAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: WAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let bindings = [

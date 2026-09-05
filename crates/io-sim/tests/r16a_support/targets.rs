@@ -3,7 +3,7 @@ use std::convert::Infallible;
 use ruster_core::{
     forward_batch_with_resolution, internet_checksum, validate_ipv4_frame, ArpRequestAction,
     BatchCompletion, BatchReport, ConsumeReason, DropReason, DynamicNeighborSlot,
-    ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    ForwardingSnapshot, IfId, Interface, Ipv4Mtu, Ipv4Address, LocalIpv4Binding, MacAddress,
     MonotonicMillis, Neighbor, NoTrace, PacketIo, ResolutionActionSlot, ResolutionCounters,
     ResolutionFailureCounters, ResolutionPhase, ResolutionPolicy, ResolutionRuntime,
     ResolutionStateSlot, ResolutionStatus, Route, ETHERNET_HEADER_LEN,
@@ -1407,10 +1407,12 @@ fn admission_topology() -> (
             Interface {
                 id: LAN,
                 mac: LAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: WAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ],
         [Neighbor {
@@ -1432,10 +1434,12 @@ fn resolution_topology() -> ([Route; 1], [Interface; 2], [LocalIpv4Binding; 2]) 
             Interface {
                 id: LAN,
                 mac: LAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: WAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ],
         [

@@ -23,10 +23,56 @@ impl Ipv4Address {
     }
 }
 
+/// The largest IPv4 datagram, in bytes, one interface will transmit.
+///
+/// The lower bound is the 68 bytes every IPv4 implementation must be able to
+/// forward (RFC 791 §3.2); the upper bound is the largest total length an
+/// IPv4 header can express. The value counts the IPv4 datagram only, never
+/// the link-layer header, so it is directly comparable to `total_len`.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Ipv4Mtu(u16);
+
+/// The smallest IPv4 MTU a link may declare (RFC 791 §3.2).
+pub const IPV4_MINIMUM_MTU: u16 = 68;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Ipv4MtuError {
+    BelowMinimum { bytes: u16 },
+}
+
+impl Ipv4Mtu {
+    /// The MTU of a standard Ethernet link, and the default for an interface
+    /// whose configuration does not state one.
+    pub const ETHERNET: Self = Self(1_500);
+
+    /// The smallest MTU this router accepts.
+    pub const MINIMUM: Self = Self(IPV4_MINIMUM_MTU);
+
+    /// Checks a configured MTU against the IPv4 minimum.
+    pub const fn new(bytes: u16) -> Result<Self, Ipv4MtuError> {
+        if bytes < IPV4_MINIMUM_MTU {
+            return Err(Ipv4MtuError::BelowMinimum { bytes });
+        }
+        Ok(Self(bytes))
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> u16 {
+        self.0
+    }
+
+    /// Returns the MTU as a length comparable to a validated `total_len`.
+    #[must_use]
+    pub const fn as_len(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Interface {
     pub id: IfId,
     pub mac: MacAddress,
+    pub mtu: Ipv4Mtu,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

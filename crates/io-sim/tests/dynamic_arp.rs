@@ -1,7 +1,7 @@
 use ruster_core::{
     execute_one_arp_request, forward_batch_with_resolution, ipv4_header_checksum, BatchReport,
     ConsumeReason, ControlDisposition, DropReason, DynamicNeighborSlot, ForwardingSnapshot, IfId,
-    Interface, Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor,
+    Interface, Ipv4Mtu, Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor,
     NoGeneratedTrace, PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionPolicyError,
     ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent,
 };
@@ -34,6 +34,7 @@ fn base() -> ([Route; 1], [Interface; 1], [LocalIpv4Binding; 1]) {
         [Interface {
             id: IFACE,
             mac: LOCAL_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         }],
         [LocalIpv4Binding {
             interface: IFACE,
@@ -412,6 +413,7 @@ fn point_to_point_prefix_endpoints_are_learnable() {
     let interfaces = [Interface {
         id: IFACE,
         mac: LOCAL_MAC,
+        mtu: Ipv4Mtu::ETHERNET,
     }];
     let bindings = [LocalIpv4Binding {
         interface: IFACE,
@@ -446,10 +448,12 @@ fn local_address_value_on_another_interface_is_learnable_on_ingress() {
         Interface {
             id: IFACE,
             mac: LOCAL_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
         Interface {
             id: IfId(2),
             mac: NEW_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
     ];
     let bindings = [
@@ -649,6 +653,7 @@ fn reply_before_generated_execution_cancels_only_matching_fifo_action() {
     let second_interfaces = [Interface {
         id: second_if,
         mac: NEW_MAC,
+        mtu: Ipv4Mtu::ETHERNET,
     }];
     let second_bindings = [LocalIpv4Binding {
         interface: second_if,
@@ -701,6 +706,7 @@ fn reconcile_static_clears_stale_cache_and_wrapped_middle_action_fifo() {
     let second_interfaces = [Interface {
         id: second_if,
         mac: NEW_MAC,
+        mtu: Ipv4Mtu::ETHERNET,
     }];
     let second_bindings = [LocalIpv4Binding {
         interface: second_if,

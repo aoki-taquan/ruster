@@ -17,20 +17,41 @@ pub enum Icmpv4ErrorKind {
     TimeExceededTtl,
     DestinationUnreachableNetwork,
     DestinationUnreachableHost,
+    /// RFC 1191 §4: the datagram could not be forwarded without fragmenting
+    /// it and the sender set DF. `next_hop_mtu` is the MTU of the link the
+    /// datagram could not cross, reported so the sender can lower its path
+    /// MTU without probing.
+    DestinationUnreachableFragmentationNeeded { next_hop_mtu: u16 },
 }
 
 impl Icmpv4ErrorKind {
     const fn icmp_type(self) -> u8 {
         match self {
             Self::TimeExceededTtl => 11,
-            Self::DestinationUnreachableNetwork | Self::DestinationUnreachableHost => 3,
+            Self::DestinationUnreachableNetwork
+            | Self::DestinationUnreachableHost
+            | Self::DestinationUnreachableFragmentationNeeded { .. } => 3,
         }
     }
 
     const fn icmp_code(self) -> u8 {
         match self {
             Self::DestinationUnreachableHost => 1,
+            Self::DestinationUnreachableFragmentationNeeded { .. } => 4,
             Self::TimeExceededTtl | Self::DestinationUnreachableNetwork => 0,
+        }
+    }
+
+    /// The next-hop MTU this error reports, or zero when the kind carries none.
+    ///
+    /// RFC 1191 §4 places the value in the low half of the four octets RFC 792
+    /// left unused, so a receiver that predates RFC 1191 still reads zero there.
+    const fn next_hop_mtu(self) -> u16 {
+        match self {
+            Self::DestinationUnreachableFragmentationNeeded { next_hop_mtu } => next_hop_mtu,
+            Self::TimeExceededTtl
+            | Self::DestinationUnreachableNetwork
+            | Self::DestinationUnreachableHost => 0,
         }
     }
 }
@@ -1003,6 +1024,7 @@ fn build_icmpv4_error(frame: &mut [u8], action: &Icmpv4ErrorAction) {
     frame[24..26].copy_from_slice(&header_checksum.to_be_bytes());
     frame[34] = action.kind.icmp_type();
     frame[35] = action.kind.icmp_code();
+    frame[40..42].copy_from_slice(&action.kind.next_hop_mtu().to_be_bytes());
     frame[42..icmp_end].copy_from_slice(action.quote());
     let icmp_checksum = internet_checksum(&frame[34..icmp_end]);
     let icmp_checksum = if icmp_checksum == 0 {

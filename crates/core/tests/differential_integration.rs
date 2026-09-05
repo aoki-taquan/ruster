@@ -11,7 +11,8 @@ use std::cell::RefCell;
 
 use ruster_core::{
     forward_batch, ipv4_header_checksum, BatchCompletion, ForwardingSnapshot, IfId, Ipv4Address,
-    MacAddress, NoTrace, PacketBatch, PacketLease, PacketSlot, PublicationQuiescenceDisposition,
+    Ipv4Mtu, MacAddress, NoTrace, PacketBatch, PacketLease, PacketSlot,
+    PublicationQuiescenceDisposition,
     Route, SlotCompletion,
 };
 
@@ -203,14 +204,17 @@ fn core_contract_snapshot() -> ForwardingSnapshot<'static> {
         ruster_core::Interface {
             id: LAN,
             mac: LAN_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
         ruster_core::Interface {
             id: WAN,
             mac: WAN_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
         ruster_core::Interface {
             id: UNKNOWN,
             mac: UNKNOWN_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
     ]));
     let neighbors = Box::leak(Box::new([ruster_core::Neighbor {

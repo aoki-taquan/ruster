@@ -1,6 +1,6 @@
 use ruster_core::{
     forward_batch, ipv4_header_checksum, validate_ipv4_frame, BatchCompletion, ConsumeReason,
-    DropReason, ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    DropReason, ForwardingSnapshot, IfId, Interface, Ipv4Mtu, Ipv4Address, LocalIpv4Binding, MacAddress,
     Neighbor, NoTrace, PacketBatch, PacketIo, PacketLease, PacketSlot, Route, SlotCompletion,
     SnapshotError, TraceEvent, ETHERNET_HEADER_LEN,
 };
@@ -32,6 +32,7 @@ fn interface() -> Interface {
     Interface {
         id: WAN,
         mac: ROUTER_MAC,
+        mtu: Ipv4Mtu::ETHERNET,
     }
 }
 
@@ -51,6 +52,7 @@ fn local_interface() -> Interface {
     Interface {
         id: LAN,
         mac: LAN_MAC,
+        mtu: Ipv4Mtu::ETHERNET,
     }
 }
 
@@ -431,6 +433,7 @@ fn lpm_supports_default_and_host_routes() {
         Interface {
             id: IfId(3),
             mac: MacAddress([3; 6]),
+            mtu: Ipv4Mtu::ETHERNET,
         },
     ];
     let neighbors = [
@@ -494,6 +497,7 @@ fn arp_snapshot_rejects_duplicate_or_unknown_local_addresses() {
         Interface {
             id: WAN,
             mac: ROUTER_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
     ];
     let duplicate = [local_binding(), local_binding()];

@@ -86,7 +86,7 @@ impl std::fmt::Debug for Nat44UdpPolicy {
 #[cfg(test)]
 mod tcp_tests {
     use super::*;
-    use crate::{Interface, LocalIpv4Binding, MacAddress, Neighbor, Route};
+    use crate::{Interface, Ipv4Mtu, LocalIpv4Binding, MacAddress, Neighbor, Route};
 
     const LAN: IfId = IfId(1);
     const WAN: IfId = IfId(2);
@@ -202,10 +202,12 @@ mod tcp_tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let neighbors = [Neighbor {
@@ -1777,10 +1779,12 @@ mod tcp_tests {
                 Interface {
                     id: LAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: WAN,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             let neighbors = [Neighbor {
@@ -7158,10 +7162,12 @@ mod tests {
             Interface {
                 id: INSIDE,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: OUTSIDE,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let neighbors = [Neighbor {
@@ -8911,10 +8917,12 @@ mod tests {
                 Interface {
                     id: INSIDE,
                     mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
                 Interface {
                     id: OUTSIDE,
                     mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: Ipv4Mtu::ETHERNET,
                 },
             ];
             let neighbors = [Neighbor {
@@ -9815,10 +9823,12 @@ mod tests {
             Interface {
                 id: INSIDE,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: OUTSIDE,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let neighbors = [Neighbor {

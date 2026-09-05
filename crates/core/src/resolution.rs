@@ -2352,7 +2352,7 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use super::*;
-    use crate::{ForwardingSnapshot, Interface, LocalIpv4Binding, Neighbor, Route};
+    use crate::{ForwardingSnapshot, Interface, Ipv4Mtu, LocalIpv4Binding, Neighbor, Route};
 
     const WAN: IfId = IfId(2);
     const SOURCE_IP: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 1]);
@@ -2527,10 +2527,12 @@ mod tests {
                     Interface {
                         id: WAN,
                         mac: SOURCE_MAC,
+                        mtu: Ipv4Mtu::ETHERNET,
                     },
                     Interface {
                         id: REVERSE_EGRESS,
                         mac: REVERSE_MAC,
+                        mtu: Ipv4Mtu::ETHERNET,
                     },
                 ],
                 neighbors: if with_reverse_neighbor {
@@ -3323,6 +3325,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: SOURCE_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,
@@ -3346,6 +3349,7 @@ mod tests {
         let changed_interfaces = [Interface {
             id: WAN,
             mac: MacAddress([7; 6]),
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let changed =
             ForwardingSnapshot::new(&routes, &changed_interfaces, &[], &bindings).unwrap();
@@ -3370,6 +3374,7 @@ mod tests {
         let old_interface = [Interface {
             id: WAN,
             mac: SOURCE_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let old_snapshot = ForwardingSnapshot::new(&[], &old_interface, &[], &[]).unwrap();
         assert_eq!(
@@ -3404,6 +3409,7 @@ mod tests {
         let reused_interface = [Interface {
             id: WAN,
             mac: MacAddress([7; 6]),
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let reused_snapshot = ForwardingSnapshot::new(&[], &reused_interface, &[], &[]).unwrap();
         let report = runtime.reconcile_publication(&reused_snapshot);
@@ -3552,6 +3558,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: SOURCE_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,
@@ -3644,6 +3651,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: new_mac,
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,
@@ -3737,6 +3745,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: SOURCE_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,
@@ -4248,6 +4257,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: SOURCE_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,
@@ -4300,6 +4310,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: SOURCE_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         }];
         let local_target = target(9);
         let bindings = [LocalIpv4Binding {
@@ -5505,6 +5516,7 @@ mod tests {
         interface_id_mismatch.interfaces.push(Interface {
             id: IfId(9),
             mac: SOURCE_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         });
         authority_lost(&interface_id_mismatch, hold, &[valid_state]);
 
@@ -5522,6 +5534,7 @@ mod tests {
         binding_interface_mismatch.interfaces.push(Interface {
             id: IfId(9),
             mac: MacAddress([9; 6]),
+            mtu: Ipv4Mtu::ETHERNET,
         });
         authority_lost(&binding_interface_mismatch, hold, &[valid_state]);
 
@@ -5612,6 +5625,7 @@ mod tests {
             interfaces: vec![Interface {
                 id: WAN,
                 mac: SOURCE_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             }],
             neighbors: Vec::new(),
             bindings: vec![LocalIpv4Binding {

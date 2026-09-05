@@ -2,7 +2,7 @@ use super::{support::UdpTestIndexes, targets::V1_SEEDS};
 use ruster_core::{
     internet_checksum, ipv4_header_checksum, DropReason, DynamicNeighborSlot, FirewallAction,
     FirewallAuthorityEvidence, FirewallConfig, FirewallCounters, FirewallHashKey,
-    FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange, FirewallProtocol,
+    FirewallInterface, Ipv4Mtu, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange, FirewallProtocol,
     FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot, ForwardingSnapshot, IfId,
     Interface, Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis,
     Nat44TcpAuthorityEvidence, Nat44TcpConfig, Nat44TcpCounters, Nat44TcpMappingSlot,
@@ -1634,10 +1634,12 @@ fn topology() -> (
             Interface {
                 id: LAN,
                 mac: LAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: WAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ],
         [

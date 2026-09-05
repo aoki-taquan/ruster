@@ -9,7 +9,7 @@
 //! [`crate::differential_live`] and owns the real native backend setup.
 
 use ruster_core::{
-    forward_batch, BatchCompletion, DropReason, ForwardingSnapshot, IfId, Interface, Ipv4Address,
+    forward_batch, BatchCompletion, DropReason, ForwardingSnapshot, IfId, Interface, Ipv4Mtu, Ipv4Address,
     MacAddress, Neighbor, NoTrace, PacketBatch, PacketLease, PacketSlot,
     PublicationQuiescenceDisposition, Route, SlotCompletion,
 };
@@ -231,14 +231,17 @@ pub fn snapshot() -> ForwardingSnapshot<'static> {
         Interface {
             id: LAN,
             mac: LAN_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
         Interface {
             id: WAN,
             mac: WAN_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
         Interface {
             id: UNKNOWN,
             mac: UNKNOWN_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
     ]));
     let neighbors = Box::leak(Box::new([Neighbor {

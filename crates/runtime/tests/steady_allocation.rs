@@ -11,7 +11,7 @@ use ruster_core::{
     bind_publication_backend, BoundPublicationBackend, FirewallConfig, FirewallHashKey,
     FirewallPolicy, ForwardingSnapshot, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink,
     GeneratedTraceSink, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
-    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Mtu, Ipv4Address, LocalIpv4Binding, MacAddress,
     MatchedPublicationQuiescenceGuard, MonotonicMillis, Nat44TcpConfig, Nat44TcpPolicy,
     Nat44UdpConfig, Nat44UdpPolicy, PublicationOwnerBinding, ResolutionActionSlot,
     ResolutionFailureHoldSlot, ResolutionFailureTrace, ResolutionFailureTraceSink,
@@ -170,10 +170,12 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         Interface {
             id: LAN,
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: Ipv4Mtu::ETHERNET,
         },
         Interface {
             id: WAN,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: Ipv4Mtu::ETHERNET,
         },
     ];
     let bindings = [

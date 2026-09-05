@@ -4,7 +4,7 @@ use ruster_core::{
     internet_checksum, ipv4_header_checksum, DropReason, DynamicNeighborSlot, ExecuteIcmpv4Error,
     ForwardingSnapshot, GeneratedAllocationError, GeneratedIcmpv4Trace, Icmpv4ErrorActionSlot,
     Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
-    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4OriginPolicy, LocalIpv4Binding,
+    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Mtu, Ipv4Address, Ipv4OriginPolicy, LocalIpv4Binding,
     MacAddress, MonotonicMillis, Neighbor, NoGeneratedIcmpv4Trace, NoTrace, PacketIo,
     ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
     TraceEvent,
@@ -29,10 +29,12 @@ fn interfaces() -> [Interface; 2] {
         Interface {
             id: LAN,
             mac: LAN_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
         Interface {
             id: WAN,
             mac: WAN_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
     ]
 }

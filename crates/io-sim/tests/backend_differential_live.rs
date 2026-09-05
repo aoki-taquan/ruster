@@ -22,7 +22,7 @@ use std::{
 };
 
 use ruster_core::{
-    forward_batch, ipv4_header_checksum, ForwardingSnapshot, IfId, Interface, Ipv4Address,
+    forward_batch, ipv4_header_checksum, ForwardingSnapshot, IfId, Interface, Ipv4Mtu, Ipv4Address,
     MacAddress, Neighbor, PacketIo, PublicationQuiescenceBackend, Route,
 };
 use ruster_io_conformance::{
@@ -332,6 +332,7 @@ fn differential_snapshot(
     let interfaces = Box::leak(Box::new([Interface {
         id: target_interface,
         mac: target_mac,
+        mtu: Ipv4Mtu::ETHERNET,
     }]));
     let neighbors = Box::leak(Box::new([Neighbor {
         interface: target_interface,

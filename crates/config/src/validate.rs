@@ -2,7 +2,7 @@ use std::{fmt, mem::size_of, net::Ipv4Addr, num::ParseIntError};
 
 use ruster_core::{
     validate_firewall_rules, DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallAction,
-    FirewallConfigError, FirewallInterface, FirewallIpv4Prefix, FirewallIpv4PrefixError,
+    FirewallConfigError, FirewallInterface, Ipv4Mtu, FirewallIpv4Prefix, FirewallIpv4PrefixError,
     FirewallPolicy, FirewallPolicyError, FirewallPortRange, FirewallPortRangeError,
     FirewallProtocol, FirewallRule, FirewallRuleId, FirewallStateSlot, ForwardingSnapshot,
     Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, Icmpv4ErrorStateSlot, IfId,
@@ -54,6 +54,7 @@ pub enum ValidationCode {
     InvalidMac,
     NonCanonicalMac,
     MacNotUnicast,
+    MtuBelowIpv4Minimum,
     InvalidIpv4,
     NonCanonicalIpv4,
     InvalidIpv4Prefix,
@@ -1096,6 +1097,17 @@ fn validate_v1(
             ));
         }
         let mac = parse_mac(&source.mac, child_path(&base, "mac"))?;
+        // An absent MTU keeps the Ethernet default, so a configuration written
+        // before this field existed continues to mean what it meant.
+        let mtu = match source.mtu {
+            None => Ipv4Mtu::ETHERNET,
+            Some(bytes) => Ipv4Mtu::new(bytes).map_err(|_| {
+                ValidationError::new(
+                    ValidationCode::MtuBelowIpv4Minimum,
+                    child_path(&base, "mtu"),
+                )
+            })?,
+        };
         let binding = InterfaceBindingV1 {
             id: IfId(source.id),
             name: source.name.into_boxed_str(),
@@ -1106,6 +1118,7 @@ fn validate_v1(
             core: Interface {
                 id: binding.id,
                 mac,
+                mtu,
             },
             binding,
         });

@@ -2,7 +2,7 @@ mod support;
 
 use ruster_core::{
     internet_checksum, ipv4_header_checksum, rfc1624_update, ConsumeReason, DropReason,
-    DynamicNeighborSlot, ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
+    DynamicNeighborSlot, ForwardingSnapshot, IfId, Interface, Ipv4Mtu, Ipv4Address, LocalIpv4Binding,
     MacAddress, MonotonicMillis, Nat44Icmpv4Disposition, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
     Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot,
     Nat44UdpPeerSlot, Nat44UdpPolicy, Neighbor, NoTrace, ResolutionActionSlot, ResolutionPolicy,
@@ -43,10 +43,12 @@ fn topology() -> (
             Interface {
                 id: LAN,
                 mac: LAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: WAN_MAC,
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ],
         [
@@ -1080,14 +1082,17 @@ fn combined_realm_mismatch_is_candidate_only_and_precedes_lookup_without_counter
         Interface {
             id: LAN,
             mac: LAN_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
         Interface {
             id: WAN,
             mac: WAN_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
         Interface {
             id: DMZ,
             mac: MacAddress([2, 0, 0, 0, 0, 3]),
+            mtu: Ipv4Mtu::ETHERNET,
         },
     ];
     let neighbors = [
@@ -1198,10 +1203,12 @@ fn outer_source_admission_rejects_non_hosts_local_and_inside_routes_atomically()
         Interface {
             id: LAN,
             mac: LAN_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
         Interface {
             id: WAN,
             mac: WAN_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
     ];
     let neighbors = [

@@ -1968,7 +1968,7 @@ impl FirewallReconcilePermit<'_, '_> {
 mod tests {
     use super::*;
     use crate::{
-        Interface, Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, Neighbor, Route,
+        Interface, Ipv4Mtu, Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, Neighbor, Route,
         ValidatedForwardingOwner,
     };
 
@@ -1992,10 +1992,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let neighbors = [Neighbor {
@@ -2027,10 +2029,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: Ipv4Mtu::ETHERNET,
             },
         ];
         let neighbors = [Neighbor {

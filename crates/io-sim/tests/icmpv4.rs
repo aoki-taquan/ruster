@@ -1,7 +1,7 @@
 use ruster_core::{
     execute_one_arp_request, forward_batch, forward_batch_with_resolution, internet_checksum,
     ipv4_header_checksum, BatchCompletion, ConsumeReason, DropReason, DynamicNeighborSlot,
-    ForwardingSnapshot, IfId, Interface, Ipv4Address, Ipv4OriginPolicy, Ipv4OriginPolicyError,
+    ForwardingSnapshot, IfId, Interface, Ipv4Mtu, Ipv4Address, Ipv4OriginPolicy, Ipv4OriginPolicyError,
     LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoGeneratedTrace, NoTrace,
     PacketBatch, PacketIo, PacketLease, PacketSlot, ResolutionActionSlot, ResolutionPolicy,
     ResolutionRuntime, ResolutionStateSlot, Route, SlotCompletion, TraceEvent,
@@ -22,10 +22,12 @@ fn interfaces() -> [Interface; 2] {
         Interface {
             id: LAN,
             mac: LOCAL_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
         Interface {
             id: WAN,
             mac: WAN_MAC,
+            mtu: Ipv4Mtu::ETHERNET,
         },
     ]
 }
