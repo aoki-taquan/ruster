@@ -28,6 +28,16 @@ pub struct ResolutionPolicy {
 }
 
 impl ResolutionPolicy {
+    /// Whether a value stamped at `held_at` has outlived the resolution TTL.
+    ///
+    /// A held datagram shares the lifetime of the resolution that holds it up:
+    /// once the resolution itself has expired, nothing is coming to release
+    /// the datagram and sending it later would surprise the sender.
+    #[must_use]
+    pub(crate) const fn is_expired(&self, held_at: MonotonicMillis, now: MonotonicMillis) -> bool {
+        now.0.saturating_sub(held_at.0) >= self.state_ttl_ms
+    }
+
     pub fn new(interval_ms: u64, state_ttl_ms: u64) -> Result<Self, ResolutionPolicyError> {
         if interval_ms < 1_000 {
             return Err(ResolutionPolicyError::IntervalTooShort);
@@ -293,6 +303,117 @@ pub(crate) enum DynamicLookup {
     Hit(MacAddress),
     Miss,
     ClockRegression,
+}
+
+/// The largest frame this router holds while its next hop resolves.
+///
+/// One standard Ethernet frame. A datagram larger than this is forwarded the
+/// moment its next hop is known but is not held meanwhile, which keeps the
+/// per-slot storage fixed and small enough to sit beside the other resolution
+/// arrays.
+pub const RESOLUTION_HOLD_MAX_FRAME_LEN: usize = 1_514;
+
+/// One datagram kept while the next hop it needs is being resolved.
+///
+/// RFC 1122 §2.3.2.2 asks the link layer to save, rather than discard, at
+/// least one packet per unresolved address, and RFC 1812 §3.3.2 repeats it
+/// for routers. Without this the first datagram to every new destination is
+/// lost even though the resolution it triggered succeeds.
+///
+/// The slot never owns an RX lease: holding one would stall the receive ring.
+/// It stores a copy of the frame with the forwarding rewrite already applied
+/// — the TTL is decremented and the header checksum updated exactly once, at
+/// the moment the datagram arrived — leaving only the destination MAC to fill
+/// in when the address is learned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ResolutionDatagramHoldSlot {
+    occupied: bool,
+    egress: IfId,
+    target: Ipv4Address,
+    held_at: MonotonicMillis,
+    len: u16,
+    frame: [u8; RESOLUTION_HOLD_MAX_FRAME_LEN],
+}
+
+impl ResolutionDatagramHoldSlot {
+    pub const EMPTY: Self = Self {
+        occupied: false,
+        egress: IfId(0),
+        target: Ipv4Address::from_octets([0; 4]),
+        held_at: MonotonicMillis(0),
+        len: 0,
+        frame: [0; RESOLUTION_HOLD_MAX_FRAME_LEN],
+    };
+
+    #[must_use]
+    pub const fn is_occupied(&self) -> bool {
+        self.occupied
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    #[must_use]
+    pub const fn egress(&self) -> IfId {
+        self.egress
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> Ipv4Address {
+        self.target
+    }
+
+    /// The held frame, still missing its destination MAC.
+    #[must_use]
+    pub fn frame(&self) -> &[u8] {
+        &self.frame[..self.len()]
+    }
+
+    /// The slot storage past the held frame.
+    ///
+    /// A slot outlives the datagrams that pass through it, so the bytes past
+    /// the current one are cleared rather than left holding another flow's
+    /// payload. Nothing sends them — [`Self::frame`] stops at the length —
+    /// but retaining them would be needless.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn storage_past_frame(&self) -> &[u8] {
+        &self.frame[self.len()..]
+    }
+}
+
+/// What became of a datagram offered to the hold queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolutionHoldDisposition {
+    /// The datagram is held and will be sent when the address is learned.
+    Held { egress: IfId, len: usize },
+    /// An earlier datagram for this key was replaced. RFC 1122 requires only
+    /// that at least one packet be saved, and the newest is the one most
+    /// likely still to be wanted.
+    Replaced { egress: IfId, len: usize },
+    /// The frame does not fit a hold slot.
+    FrameTooLong { len: usize },
+    /// Every slot holds a datagram for a different unresolved address.
+    QueueFull,
+    /// Time moved backwards, so no lifetime can be established.
+    ClockRegression,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResolutionHoldCounters {
+    pub held: usize,
+    pub replaced: usize,
+    pub frame_too_long: usize,
+    pub queue_full: usize,
+    pub replayed: usize,
+    pub expired: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -648,6 +769,7 @@ pub struct ResolutionRuntime<'a> {
     actions: &'a mut [ResolutionActionSlot],
     dynamic_neighbors: &'a mut [DynamicNeighborSlot],
     failure_holds: &'a mut [ResolutionFailureHoldSlot],
+    datagram_holds: &'a mut [ResolutionDatagramHoldSlot],
     head: usize,
     len: usize,
     pending_state_count: usize,
@@ -659,6 +781,7 @@ pub struct ResolutionRuntime<'a> {
     publication_epoch: u128,
     counters: ResolutionCounters,
     failure_counters: ResolutionFailureCounters,
+    hold_counters: ResolutionHoldCounters,
     _worker_local: PhantomData<Rc<()>>,
 }
 
@@ -696,16 +819,41 @@ impl<'a> ResolutionRuntime<'a> {
         dynamic_neighbors: &'a mut [DynamicNeighborSlot],
         failure_holds: &'a mut [ResolutionFailureHoldSlot],
     ) -> Self {
+        Self::with_dynamic_neighbors_failure_holds_and_datagram_holds(
+            policy,
+            states,
+            action_storage,
+            dynamic_neighbors,
+            failure_holds,
+            &mut [],
+        )
+    }
+
+    /// Builds a runtime that also holds datagrams for unresolved next hops.
+    ///
+    /// With no hold slots the first datagram to an unresolved address is
+    /// dropped, which is the behaviour every constructor above keeps.
+    #[must_use]
+    pub fn with_dynamic_neighbors_failure_holds_and_datagram_holds(
+        policy: ResolutionPolicy,
+        states: &'a mut [ResolutionStateSlot],
+        action_storage: &'a mut [ResolutionActionSlot],
+        dynamic_neighbors: &'a mut [DynamicNeighborSlot],
+        failure_holds: &'a mut [ResolutionFailureHoldSlot],
+        datagram_holds: &'a mut [ResolutionDatagramHoldSlot],
+    ) -> Self {
         states.fill(ResolutionStateSlot::EMPTY);
         action_storage.fill(ResolutionActionSlot::EMPTY);
         dynamic_neighbors.fill(DynamicNeighborSlot::EMPTY);
         failure_holds.fill(ResolutionFailureHoldSlot::EMPTY);
+        datagram_holds.fill(ResolutionDatagramHoldSlot::EMPTY);
         Self {
             policy,
             states,
             actions: action_storage,
             dynamic_neighbors,
             failure_holds,
+            datagram_holds,
             head: 0,
             len: 0,
             pending_state_count: 0,
@@ -717,8 +865,140 @@ impl<'a> ResolutionRuntime<'a> {
             publication_epoch: 1,
             counters: ResolutionCounters::default(),
             failure_counters: ResolutionFailureCounters::default(),
+            hold_counters: ResolutionHoldCounters::default(),
             _worker_local: PhantomData,
         }
+    }
+
+    /// Keeps one datagram for an address that is being resolved.
+    ///
+    /// `frame` must already carry the forwarding rewrite with its destination
+    /// MAC left unset: the TTL is decremented and the header checksum updated
+    /// once, when the datagram arrives, so a replay is byte-for-byte what an
+    /// immediate forward would have sent.
+    ///
+    /// One datagram per unresolved address is kept, which is what RFC 1122
+    /// §2.3.2.2 asks for. A second datagram for the same address replaces the
+    /// first: the newest is the one whose sender is most likely still waiting.
+    pub fn hold_datagram(
+        &mut self,
+        egress: IfId,
+        target: Ipv4Address,
+        frame: &[u8],
+        now: MonotonicMillis,
+    ) -> ResolutionHoldDisposition {
+        if !self.observe_now(now) {
+            return ResolutionHoldDisposition::ClockRegression;
+        }
+        let len = frame.len();
+        if len > RESOLUTION_HOLD_MAX_FRAME_LEN {
+            self.hold_counters.frame_too_long += 1;
+            return ResolutionHoldDisposition::FrameTooLong { len };
+        }
+        let existing = self
+            .datagram_holds
+            .iter()
+            .position(|slot| slot.occupied && slot.egress == egress && slot.target == target);
+        let (index, replaced) = match existing {
+            Some(index) => (index, true),
+            None => {
+                let free = self
+                    .datagram_holds
+                    .iter()
+                    .position(|slot| !slot.occupied || self.policy.is_expired(slot.held_at, now));
+                let Some(index) = free else {
+                    self.hold_counters.queue_full += 1;
+                    return ResolutionHoldDisposition::QueueFull;
+                };
+                if self.datagram_holds[index].occupied {
+                    self.hold_counters.expired += 1;
+                }
+                (index, false)
+            }
+        };
+        let slot = &mut self.datagram_holds[index];
+        slot.occupied = true;
+        slot.egress = egress;
+        slot.target = target;
+        slot.held_at = now;
+        slot.len = u16::try_from(len).expect("the length was bounded above");
+        slot.frame[..len].copy_from_slice(frame);
+        slot.frame[len..].fill(0);
+        if replaced {
+            self.hold_counters.replaced += 1;
+            ResolutionHoldDisposition::Replaced { egress, len }
+        } else {
+            self.hold_counters.held += 1;
+            ResolutionHoldDisposition::Held { egress, len }
+        }
+    }
+
+    /// Takes the next held datagram whose address is now known.
+    ///
+    /// Returns the egress, the learned MAC and the held frame. Expired holds
+    /// are released as they are passed over, so a datagram is never sent after
+    /// the sender has certainly given up on it.
+    pub fn take_resolved_datagram(
+        &mut self,
+        now: MonotonicMillis,
+    ) -> Option<(IfId, MacAddress, &[u8])> {
+        if !self.observe_now(now) {
+            return None;
+        }
+        let mut found = None;
+        for index in 0..self.datagram_holds.len() {
+            let slot = self.datagram_holds[index];
+            if !slot.occupied {
+                continue;
+            }
+            if self.policy.is_expired(slot.held_at, now) {
+                self.datagram_holds[index] = ResolutionDatagramHoldSlot::EMPTY;
+                self.hold_counters.expired += 1;
+                continue;
+            }
+            if let Some(mac) = self.resolved_mac(slot.egress, slot.target, now) {
+                found = Some((index, mac));
+                break;
+            }
+        }
+        let (index, mac) = found?;
+        let egress = self.datagram_holds[index].egress;
+        self.datagram_holds[index].occupied = false;
+        self.hold_counters.replayed += 1;
+        let len = self.datagram_holds[index].len();
+        Some((egress, mac, &self.datagram_holds[index].frame[..len]))
+    }
+
+    /// The MAC currently known for one unresolved-address key, if any.
+    fn resolved_mac(
+        &self,
+        egress: IfId,
+        target: Ipv4Address,
+        now: MonotonicMillis,
+    ) -> Option<MacAddress> {
+        self.dynamic_neighbors
+            .iter()
+            .find(|slot| {
+                slot.occupied
+                    && slot.interface == egress
+                    && slot.target == target
+                    && now.0.saturating_sub(slot.refreshed_at.0)
+                        < self.policy.dynamic_neighbor_ttl_ms
+            })
+            .map(|slot| slot.mac)
+    }
+
+    #[must_use]
+    pub fn hold_counters(&self) -> ResolutionHoldCounters {
+        self.hold_counters
+    }
+
+    #[must_use]
+    pub fn held_datagram_count(&self) -> usize {
+        self.datagram_holds
+            .iter()
+            .filter(|slot| slot.occupied)
+            .count()
     }
 
     #[must_use]
@@ -5929,6 +6209,312 @@ mod tests {
         assert_eq!(
             *completion.borrow(),
             Some(crate::GeneratedSlotCompletion::Cancelled)
+        );
+    }
+
+    const HOLD_EGRESS: IfId = IfId(2);
+    const HOLD_MAC: MacAddress = MacAddress([2, 0, 0, 0, 0, 0xcc]);
+
+    fn hold_policy() -> ResolutionPolicy {
+        ResolutionPolicy::with_dynamic_neighbor_ttl(1_000, 3_000, 60_000).unwrap()
+    }
+
+    fn held_frame(marker: u8, len: usize) -> Vec<u8> {
+        let mut frame = vec![marker; len];
+        // The destination MAC is the one field a held frame still lacks.
+        frame[0..6].fill(0);
+        frame
+    }
+
+    #[test]
+    fn a_datagram_held_for_an_unresolved_hop_is_returned_once_the_hop_resolves() {
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut neighbors = [DynamicNeighborSlot::EMPTY; 1];
+        let mut failure_holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut datagram_holds = [ResolutionDatagramHoldSlot::EMPTY; 2];
+        let mut runtime =
+            ResolutionRuntime::with_dynamic_neighbors_failure_holds_and_datagram_holds(
+                hold_policy(),
+                &mut states,
+                &mut actions,
+                &mut neighbors,
+                &mut failure_holds,
+                &mut datagram_holds,
+            );
+
+        let frame = held_frame(0xa5, 64);
+        assert_eq!(
+            runtime.hold_datagram(HOLD_EGRESS, target(9), &frame, MonotonicMillis(0)),
+            ResolutionHoldDisposition::Held {
+                egress: HOLD_EGRESS,
+                len: 64
+            }
+        );
+        assert_eq!(runtime.held_datagram_count(), 1);
+        // Nothing is released while the address is still unknown.
+        assert!(runtime
+            .take_resolved_datagram(MonotonicMillis(10))
+            .is_none());
+
+        runtime.merge_dynamic(
+            HOLD_EGRESS,
+            target(9),
+            HOLD_MAC,
+            true,
+            false,
+            MonotonicMillis(20),
+        );
+        let (egress, mac, replayed) = runtime
+            .take_resolved_datagram(MonotonicMillis(20))
+            .expect("a resolved hop must release its held datagram");
+        assert_eq!(egress, HOLD_EGRESS);
+        assert_eq!(mac, HOLD_MAC);
+        assert_eq!(replayed, frame.as_slice());
+        assert_eq!(runtime.held_datagram_count(), 0);
+        assert_eq!(runtime.hold_counters().held, 1);
+        assert_eq!(runtime.hold_counters().replayed, 1);
+    }
+
+    #[test]
+    fn a_second_datagram_for_the_same_hop_replaces_the_first() {
+        // RFC 1122 §2.3.2.2 asks for at least one packet to be saved. Keeping
+        // the newest is what a sender that is still retrying expects to see.
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut neighbors = [DynamicNeighborSlot::EMPTY; 1];
+        let mut failure_holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut datagram_holds = [ResolutionDatagramHoldSlot::EMPTY; 2];
+        let mut runtime =
+            ResolutionRuntime::with_dynamic_neighbors_failure_holds_and_datagram_holds(
+                hold_policy(),
+                &mut states,
+                &mut actions,
+                &mut neighbors,
+                &mut failure_holds,
+                &mut datagram_holds,
+            );
+
+        let first = held_frame(0x11, 64);
+        let second = held_frame(0x22, 96);
+        runtime.hold_datagram(HOLD_EGRESS, target(9), &first, MonotonicMillis(0));
+        assert_eq!(
+            runtime.hold_datagram(HOLD_EGRESS, target(9), &second, MonotonicMillis(1)),
+            ResolutionHoldDisposition::Replaced {
+                egress: HOLD_EGRESS,
+                len: 96
+            }
+        );
+        assert_eq!(
+            runtime.held_datagram_count(),
+            1,
+            "the key holds one datagram"
+        );
+
+        runtime.merge_dynamic(
+            HOLD_EGRESS,
+            target(9),
+            HOLD_MAC,
+            true,
+            false,
+            MonotonicMillis(2),
+        );
+        let (_, _, replayed) = runtime
+            .take_resolved_datagram(MonotonicMillis(2))
+            .expect("the surviving datagram must be released");
+        assert_eq!(replayed, second.as_slice(), "the newest datagram survives");
+        assert_eq!(runtime.hold_counters().replaced, 1);
+    }
+
+    #[test]
+    fn a_full_hold_queue_refuses_a_further_address_without_evicting_one() {
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut neighbors = [DynamicNeighborSlot::EMPTY; 2];
+        let mut failure_holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut datagram_holds = [ResolutionDatagramHoldSlot::EMPTY; 1];
+        let mut runtime =
+            ResolutionRuntime::with_dynamic_neighbors_failure_holds_and_datagram_holds(
+                hold_policy(),
+                &mut states,
+                &mut actions,
+                &mut neighbors,
+                &mut failure_holds,
+                &mut datagram_holds,
+            );
+
+        let first = held_frame(0x33, 64);
+        runtime.hold_datagram(HOLD_EGRESS, target(9), &first, MonotonicMillis(0));
+        assert_eq!(
+            runtime.hold_datagram(HOLD_EGRESS, target(10), &first, MonotonicMillis(0)),
+            ResolutionHoldDisposition::QueueFull
+        );
+        assert_eq!(runtime.hold_counters().queue_full, 1);
+
+        // The datagram already held is untouched by the refusal.
+        runtime.merge_dynamic(
+            HOLD_EGRESS,
+            target(9),
+            HOLD_MAC,
+            true,
+            false,
+            MonotonicMillis(1),
+        );
+        assert!(runtime.take_resolved_datagram(MonotonicMillis(1)).is_some());
+    }
+
+    #[test]
+    fn a_frame_larger_than_a_hold_slot_is_refused_rather_than_truncated() {
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut neighbors = [DynamicNeighborSlot::EMPTY; 1];
+        let mut failure_holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut datagram_holds = [ResolutionDatagramHoldSlot::EMPTY; 1];
+        let mut runtime =
+            ResolutionRuntime::with_dynamic_neighbors_failure_holds_and_datagram_holds(
+                hold_policy(),
+                &mut states,
+                &mut actions,
+                &mut neighbors,
+                &mut failure_holds,
+                &mut datagram_holds,
+            );
+
+        let exact = held_frame(0x44, RESOLUTION_HOLD_MAX_FRAME_LEN);
+        assert_eq!(
+            runtime.hold_datagram(HOLD_EGRESS, target(9), &exact, MonotonicMillis(0)),
+            ResolutionHoldDisposition::Held {
+                egress: HOLD_EGRESS,
+                len: RESOLUTION_HOLD_MAX_FRAME_LEN
+            },
+            "a frame of exactly the slot size is held whole"
+        );
+
+        let oversized = held_frame(0x55, RESOLUTION_HOLD_MAX_FRAME_LEN + 1);
+        assert_eq!(
+            runtime.hold_datagram(HOLD_EGRESS, target(10), &oversized, MonotonicMillis(0)),
+            ResolutionHoldDisposition::FrameTooLong {
+                len: RESOLUTION_HOLD_MAX_FRAME_LEN + 1
+            }
+        );
+        assert_eq!(runtime.hold_counters().frame_too_long, 1);
+    }
+
+    #[test]
+    fn a_hold_that_outlives_its_resolution_is_released_rather_than_sent() {
+        // Sending a datagram after the sender has certainly given up on it is
+        // worse than dropping it: the reply would arrive unsolicited.
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut neighbors = [DynamicNeighborSlot::EMPTY; 1];
+        let mut failure_holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut datagram_holds = [ResolutionDatagramHoldSlot::EMPTY; 1];
+        let mut runtime =
+            ResolutionRuntime::with_dynamic_neighbors_failure_holds_and_datagram_holds(
+                hold_policy(),
+                &mut states,
+                &mut actions,
+                &mut neighbors,
+                &mut failure_holds,
+                &mut datagram_holds,
+            );
+
+        let frame = held_frame(0x66, 64);
+        runtime.hold_datagram(HOLD_EGRESS, target(9), &frame, MonotonicMillis(0));
+        runtime.merge_dynamic(
+            HOLD_EGRESS,
+            target(9),
+            HOLD_MAC,
+            true,
+            false,
+            MonotonicMillis(2_999),
+        );
+        // One millisecond before the TTL the datagram is still eligible.
+        assert!(runtime
+            .take_resolved_datagram(MonotonicMillis(2_999))
+            .is_some());
+
+        runtime.hold_datagram(HOLD_EGRESS, target(9), &frame, MonotonicMillis(3_000));
+        assert!(
+            runtime
+                .take_resolved_datagram(MonotonicMillis(6_000))
+                .is_none(),
+            "a hold at or past the resolution TTL must not be sent"
+        );
+        assert_eq!(runtime.held_datagram_count(), 0);
+        assert_eq!(runtime.hold_counters().expired, 1);
+    }
+
+    #[test]
+    fn a_runtime_without_hold_slots_keeps_the_earlier_drop_behaviour() {
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::new(hold_policy(), &mut states, &mut actions);
+        let frame = held_frame(0x77, 64);
+        assert_eq!(
+            runtime.hold_datagram(HOLD_EGRESS, target(9), &frame, MonotonicMillis(0)),
+            ResolutionHoldDisposition::QueueFull
+        );
+        assert_eq!(runtime.held_datagram_count(), 0);
+    }
+
+    #[test]
+    fn a_shorter_datagram_does_not_leave_the_previous_one_in_the_slot() {
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut neighbors = [DynamicNeighborSlot::EMPTY; 1];
+        let mut failure_holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut datagram_holds = [ResolutionDatagramHoldSlot::EMPTY; 1];
+        let mut runtime =
+            ResolutionRuntime::with_dynamic_neighbors_failure_holds_and_datagram_holds(
+                hold_policy(),
+                &mut states,
+                &mut actions,
+                &mut neighbors,
+                &mut failure_holds,
+                &mut datagram_holds,
+            );
+
+        runtime.hold_datagram(
+            HOLD_EGRESS,
+            target(9),
+            &held_frame(0x9c, 512),
+            MonotonicMillis(0),
+        );
+        let short = held_frame(0x3e, 64);
+        runtime.hold_datagram(HOLD_EGRESS, target(9), &short, MonotonicMillis(1));
+        // The runtime borrows the storage, so its borrow ends here before the
+        // slot itself is inspected.
+        let _ = runtime.held_datagram_count();
+        let slot = datagram_holds[0];
+        assert_eq!(slot.frame(), short.as_slice());
+        assert!(
+            slot.storage_past_frame().iter().all(|byte| *byte == 0),
+            "a slot must not keep the payload of the datagram it replaced"
+        );
+    }
+
+    #[test]
+    fn a_hold_offered_with_time_moving_backwards_is_refused() {
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut neighbors = [DynamicNeighborSlot::EMPTY; 1];
+        let mut failure_holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut datagram_holds = [ResolutionDatagramHoldSlot::EMPTY; 1];
+        let mut runtime =
+            ResolutionRuntime::with_dynamic_neighbors_failure_holds_and_datagram_holds(
+                hold_policy(),
+                &mut states,
+                &mut actions,
+                &mut neighbors,
+                &mut failure_holds,
+                &mut datagram_holds,
+            );
+        let frame = held_frame(0x88, 64);
+        runtime.hold_datagram(HOLD_EGRESS, target(9), &frame, MonotonicMillis(100));
+        assert_eq!(
+            runtime.hold_datagram(HOLD_EGRESS, target(10), &frame, MonotonicMillis(99)),
+            ResolutionHoldDisposition::ClockRegression
         );
     }
 }
