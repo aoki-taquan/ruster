@@ -28,3 +28,12 @@ ruster-io-conformance = { path = "../io-conformance" }
 name = "backend_conformance"
 path = "tests/backend_conformance.rs"
 required-features = ["dpdk", "test-hooks"]
+
+# `test-hooks` deliberately off: its event log allocates (a `to_vec()` per
+# disposition) unconditionally at compile time, which would make this
+# measure the harness instead of the production hot path. See the module
+# docs in the test file itself.
+[[test]]
+name = "steady_allocation"
+path = "tests/steady_allocation.rs"
+required-features = ["dpdk"]

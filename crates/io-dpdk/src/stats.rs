@@ -1,10 +1,17 @@
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BackendStat {
     AllocationFailed,
+    /// Shared by both directions: a generated frame or an RX-forwarded
+    /// frame that `tx_burst` accepted.
     TxAccepted,
+    /// Shared by both directions: a committed frame `tx_burst` never
+    /// touched (dropped batch, unknown egress, or driver rejection).
     TxRejected,
     Cancelled,
     Abandoned,
+    /// An RX slot completed with `Recycle`, `Consume`, or `LeaseAbandoned`
+    /// (including a leftover un-leased slot recycled at batch end).
+    RxRecycled,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -14,6 +21,7 @@ pub struct BackendStats {
     tx_rejected: u64,
     cancelled: u64,
     abandoned: u64,
+    rx_recycled: u64,
 }
 
 impl BackendStats {
@@ -25,6 +33,7 @@ impl BackendStats {
             tx_rejected: 0,
             cancelled: 0,
             abandoned: 0,
+            rx_recycled: 0,
         }
     }
 
@@ -35,6 +44,7 @@ impl BackendStats {
             BackendStat::TxRejected => &mut self.tx_rejected,
             BackendStat::Cancelled => &mut self.cancelled,
             BackendStat::Abandoned => &mut self.abandoned,
+            BackendStat::RxRecycled => &mut self.rx_recycled,
         };
         *counter = counter.saturating_add(1);
     }
@@ -47,6 +57,7 @@ impl BackendStats {
             tx_rejected: self.tx_rejected,
             cancelled: self.cancelled,
             abandoned: self.abandoned,
+            rx_recycled: self.rx_recycled,
         }
     }
 }
@@ -58,6 +69,7 @@ pub struct BackendStatsSnapshot {
     pub tx_rejected: u64,
     pub cancelled: u64,
     pub abandoned: u64,
+    pub rx_recycled: u64,
 }
 
 #[cfg(test)]

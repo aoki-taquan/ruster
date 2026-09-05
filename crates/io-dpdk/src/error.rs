@@ -35,6 +35,7 @@ pub enum ConfigError {
         data_room: u16,
     },
     ZeroTxRingDescriptors,
+    ZeroRxRingDescriptors,
 }
 
 impl fmt::Display for ConfigError {
@@ -59,6 +60,9 @@ impl fmt::Display for ConfigError {
             Self::ZeroTxRingDescriptors => {
                 formatter.write_str("tx_ring_descriptors cannot be zero")
             }
+            Self::ZeroRxRingDescriptors => {
+                formatter.write_str("rx_ring_descriptors cannot be zero")
+            }
         }
     }
 }
@@ -73,6 +77,7 @@ pub enum EalStage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EthdevStage {
     Configure,
+    RxQueueSetup,
     TxQueueSetup,
     Start,
 }
@@ -104,10 +109,16 @@ pub enum DpdkError {
     /// counted), but `finish()` always rejects it without ever calling
     /// `tx_burst`.
     UnknownEgress(IfId),
-    /// `test-hooks` only: `finish()` reports this injected failure once,
-    /// after performing every real reclaim/free it would have done anyway.
+    /// `test-hooks` only: a generated- or RX-batch `finish()` reports this
+    /// injected failure once, after performing every real reclaim/free it
+    /// would have done anyway.
     #[cfg(feature = "test-hooks")]
     InjectedFinishFailure,
+    /// `test-hooks` only: `receive()` reports this injected failure once,
+    /// without calling `rte_eth_rx_burst` at all, so nothing already queued
+    /// on the wire is consumed.
+    #[cfg(feature = "test-hooks")]
+    InjectedReceiveFailure,
 }
 
 impl fmt::Display for DpdkError {
@@ -136,7 +147,11 @@ impl fmt::Display for DpdkError {
             }
             #[cfg(feature = "test-hooks")]
             Self::InjectedFinishFailure => {
-                formatter.write_str("test-hooks: injected generated-batch finish failure")
+                formatter.write_str("test-hooks: injected batch finish failure")
+            }
+            #[cfg(feature = "test-hooks")]
+            Self::InjectedReceiveFailure => {
+                formatter.write_str("test-hooks: injected receive failure")
             }
         }
     }

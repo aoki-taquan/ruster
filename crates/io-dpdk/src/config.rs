@@ -36,6 +36,7 @@ pub struct DpdkConfig {
     /// Largest payload `allocate()` will hand out.
     pub max_frame_len: u16,
     pub tx_ring_descriptors: u16,
+    pub rx_ring_descriptors: u16,
 }
 
 /// A [`DpdkConfig`] checked for internal consistency before any EAL or
@@ -49,6 +50,7 @@ pub struct ValidatedConfig {
     max_frame_len: u16,
     data_room_size: u16,
     tx_ring_descriptors: u16,
+    rx_ring_descriptors: u16,
 }
 
 impl ValidatedConfig {
@@ -60,6 +62,7 @@ impl ValidatedConfig {
             pool_cache_size,
             max_frame_len,
             tx_ring_descriptors,
+            rx_ring_descriptors,
         } = config;
 
         if ports.is_empty() {
@@ -84,6 +87,9 @@ impl ValidatedConfig {
         if tx_ring_descriptors == 0 {
             return Err(ConfigError::ZeroTxRingDescriptors);
         }
+        if rx_ring_descriptors == 0 {
+            return Err(ConfigError::ZeroRxRingDescriptors);
+        }
         let data_room_size = u32::from(DEFAULT_MBUF_HEADROOM)
             .checked_add(u32::from(max_frame_len))
             .and_then(|room| u16::try_from(room).ok())
@@ -100,6 +106,7 @@ impl ValidatedConfig {
             max_frame_len,
             data_room_size,
             tx_ring_descriptors,
+            rx_ring_descriptors,
         })
     }
 
@@ -137,6 +144,11 @@ impl ValidatedConfig {
     pub const fn tx_ring_descriptors(&self) -> u16 {
         self.tx_ring_descriptors
     }
+
+    #[must_use]
+    pub const fn rx_ring_descriptors(&self) -> u16 {
+        self.rx_ring_descriptors
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +167,7 @@ mod tests {
             pool_cache_size: 32,
             max_frame_len: 1500,
             tx_ring_descriptors: 128,
+            rx_ring_descriptors: 128,
         }
     }
 
@@ -223,6 +236,18 @@ mod tests {
         assert_eq!(
             ValidatedConfig::new(config),
             Err(ConfigError::ZeroTxRingDescriptors)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_rx_ring_descriptors() {
+        let config = DpdkConfig {
+            rx_ring_descriptors: 0,
+            ..base_config()
+        };
+        assert_eq!(
+            ValidatedConfig::new(config),
+            Err(ConfigError::ZeroRxRingDescriptors)
         );
     }
 

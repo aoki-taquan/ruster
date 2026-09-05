@@ -11,18 +11,18 @@
 //! from `src/shim.c`, which includes the real DPDK headers. `rte_eal_init`,
 //! `rte_eal_cleanup`, `rte_pktmbuf_pool_create`, `rte_eth_dev_count_avail`,
 //! and `rte_eth_dev_start/stop/close` are genuine exported DPDK symbols and
-//! are declared directly; `rte_eth_tx_burst`,
+//! are declared directly; `rte_eth_rx_burst`, `rte_eth_tx_burst`,
 //! `rte_pktmbuf_alloc`, `rte_pktmbuf_free`, and `rte_pktmbuf_append` are
 //! `static inline` in the DPDK headers and have no linkable symbol of their
-//! own, so `src/shim.c` gives each one a real one (it does the same for
-//! `rte_eth_rx_burst`, unused today but kept so a future RX path does not
-//! need a second shim pass).
+//! own, so `src/shim.c` gives each one a real one; likewise `rte_pktmbuf_mtod`
+//! and the mbuf `data_len` field read (both macros/direct field access, not
+//! functions) get shim wrappers of their own.
 //!
-//! Scope: only `GeneratedPacketIo`/`GeneratedPacketBatch`/`GeneratedPacketSlot`
-//! (TX-only frame generation) are implemented here, matching requirement
-//! IO-009. There is no `PacketIo`/RX path: DPDK ports are configured with
-//! zero RX queues, and neither `rte_eth_rx_burst` nor any mbuf-reading
-//! accessor is declared, since nothing in this crate calls them.
+//! Implements both directions of the backend contract: `GeneratedPacketIo`
+//! (TX-only frame generation, requirement IO-009) over `rte_pktmbuf_alloc`/
+//! `rte_eth_tx_burst`, and `PacketIo` (receive, forward, recycle/consume)
+//! over `rte_eth_rx_burst`/`rte_eth_tx_burst`. Every port is configured with
+//! one RX queue and one TX queue.
 
 use std::{
     ffi::{c_char, c_int, c_uint, CString},
@@ -61,7 +61,19 @@ extern "C" {
     fn rte_eth_dev_close(port_id: u16) -> c_int;
 
     fn ruster_dpdk_eth_dev_configure(port_id: u16, nb_rx_q: u16, nb_tx_q: u16) -> c_int;
+    fn ruster_dpdk_eth_rx_queue_setup(
+        port_id: u16,
+        queue_id: u16,
+        nb_desc: u16,
+        pool: *mut RteMempool,
+    ) -> c_int;
     fn ruster_dpdk_eth_tx_queue_setup(port_id: u16, queue_id: u16, nb_desc: u16) -> c_int;
+    fn ruster_dpdk_rx_burst(
+        port_id: u16,
+        queue_id: u16,
+        pkts: *mut *mut RteMbuf,
+        nb_pkts: u16,
+    ) -> u16;
     fn ruster_dpdk_tx_burst(
         port_id: u16,
         queue_id: u16,
@@ -71,6 +83,8 @@ extern "C" {
     fn ruster_dpdk_pktmbuf_alloc(pool: *mut RteMempool) -> *mut RteMbuf;
     fn ruster_dpdk_pktmbuf_free(mbuf: *mut RteMbuf);
     fn ruster_dpdk_pktmbuf_append(mbuf: *mut RteMbuf, len: u16) -> *mut u8;
+    fn ruster_dpdk_pktmbuf_data(mbuf: *mut RteMbuf) -> *mut u8;
+    fn ruster_dpdk_pktmbuf_data_len(mbuf: *const RteMbuf) -> u16;
     #[cfg(feature = "test-hooks")]
     fn ruster_dpdk_mempool_avail_count(pool: *const RteMempool) -> c_uint;
     fn ruster_dpdk_rte_errno() -> c_int;
@@ -141,10 +155,25 @@ pub(crate) fn pool_create(
     NonNull::new(pool).ok_or(DpdkError::PoolCreateFailed)
 }
 
-pub(crate) fn eth_dev_configure(port_id: u16, nb_tx_queues: u16) -> Result<(), DpdkError> {
+pub(crate) fn eth_dev_configure(
+    port_id: u16,
+    nb_rx_queues: u16,
+    nb_tx_queues: u16,
+) -> Result<(), DpdkError> {
     // SAFETY: no pointer arguments beyond the shim's own stack-local config.
-    let rc = unsafe { ruster_dpdk_eth_dev_configure(port_id, 0, nb_tx_queues) };
+    let rc = unsafe { ruster_dpdk_eth_dev_configure(port_id, nb_rx_queues, nb_tx_queues) };
     ethdev_result(EthdevStage::Configure, port_id, rc)
+}
+
+pub(crate) fn eth_rx_queue_setup(
+    port_id: u16,
+    nb_desc: u16,
+    pool: NonNull<RteMempool>,
+) -> Result<(), DpdkError> {
+    // SAFETY: `pool` was returned live by `pool_create` and outlives every
+    // call made through this handle; queue 0 is this backend's only RX queue.
+    let rc = unsafe { ruster_dpdk_eth_rx_queue_setup(port_id, 0, nb_desc, pool.as_ptr()) };
+    ethdev_result(EthdevStage::RxQueueSetup, port_id, rc)
 }
 
 pub(crate) fn eth_tx_queue_setup(port_id: u16, nb_desc: u16) -> Result<(), DpdkError> {
@@ -209,6 +238,21 @@ pub(crate) fn pktmbuf_append(mbuf: NonNull<RteMbuf>, len: u16) -> Option<NonNull
     NonNull::new(data)
 }
 
+/// The writable data pointer of a live mbuf (received or freshly appended).
+pub(crate) fn pktmbuf_data(mbuf: NonNull<RteMbuf>) -> NonNull<u8> {
+    // SAFETY: `mbuf` is live and owned by the caller for the duration of
+    // this call.
+    let data = unsafe { ruster_dpdk_pktmbuf_data(mbuf.as_ptr()) };
+    NonNull::new(data).expect("a live mbuf always has a data pointer")
+}
+
+/// The mbuf's current `data_len` (its live, in-use payload length).
+pub(crate) fn pktmbuf_data_len(mbuf: NonNull<RteMbuf>) -> u16 {
+    // SAFETY: `mbuf` is live and owned by the caller for the duration of
+    // this call.
+    unsafe { ruster_dpdk_pktmbuf_data_len(mbuf.as_ptr()) }
+}
+
 #[cfg(feature = "test-hooks")]
 #[must_use]
 pub(crate) fn mempool_avail_count(pool: NonNull<RteMempool>) -> u32 {
@@ -225,6 +269,16 @@ pub(crate) fn tx_burst(port_id: u16, pkts: &mut [NonNull<RteMbuf>]) -> u16 {
     // SAFETY: `pkts` is a live, exclusively-borrowed array of `len` valid
     // mbuf pointers; queue 0 is this backend's only TX queue.
     unsafe { ruster_dpdk_tx_burst(port_id, 0, pkts.as_mut_ptr().cast(), len) }
+}
+
+/// Fills the front of `pkts` with up to `pkts.len()` newly received mbufs
+/// and returns how many; the rest of `pkts` is left untouched. Queue 0 is
+/// this backend's only RX queue.
+pub(crate) fn rx_burst(port_id: u16, pkts: &mut [*mut RteMbuf]) -> u16 {
+    let len = u16::try_from(pkts.len()).expect("RX batch fits a u16 burst");
+    // SAFETY: `pkts` is a live, exclusively-borrowed array of `len` mbuf
+    // pointer slots for the driver to fill.
+    unsafe { ruster_dpdk_rx_burst(port_id, 0, pkts.as_mut_ptr(), len) }
 }
 
 /// Builds a `&mut [u8]` over `len` bytes at `data`.
@@ -249,9 +303,15 @@ fn mbuf_bytes_mut<'a>(data: NonNull<u8>, len: usize) -> &'a mut [u8] {
 use std::collections::VecDeque;
 
 use ruster_core::{
-    GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,
-    GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion, IfId,
+    BatchCompletion, GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch,
+    GeneratedPacketIo, GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion, IfId,
+    PacketBatch, PacketIo, PacketLease, PacketSlot, SlotCompletion,
 };
+// Named only in `RecordedRxDisposition`'s definition below, which is
+// test-hooks only: `SlotCompletion::Recycle`/`Consume`'s payload type is
+// otherwise inferred at the pattern-match site without naming it.
+#[cfg(feature = "test-hooks")]
+use ruster_core::{ConsumeReason, DropReason};
 
 use crate::{
     config::ValidatedConfig,
@@ -259,17 +319,42 @@ use crate::{
 };
 
 /// Upper bound on how many frames one `finish()` ever hands to a single
-/// `rte_eth_tx_burst` call. Sizes `DpdkIo::scratch`'s one-time reservation,
-/// so accumulating commits inside a batch never allocates.
-const MAX_GENERATED_BATCH: usize = 64;
+/// `rte_eth_tx_burst` call. Sizes `DpdkIo::scratch`'s one-time reservation
+/// (used by a generated batch, which only ever touches one port) and each
+/// `PortState::tx_pending`'s (used by an RX-forwarding batch, which can
+/// touch more than one port at once), so accumulating commits never
+/// allocates.
+const MAX_TX_PENDING: usize = 64;
+
+/// Upper bound on how many mbufs one `receive()` ever pulls from
+/// `rte_eth_rx_burst` in total across every port it polls. Sizes
+/// `DpdkIo::rx_scratch`'s one-time reservation.
+const MAX_RX_BURST: usize = 64;
 
 struct PortState {
     interface: IfId,
     port_id: u16,
+    /// RX-forwarded commits queued for this port's one `tx_burst` call at
+    /// the owning `DpdkPacketBatch::finish()`. Reserved once; never
+    /// reallocated afterward. (The generated-frame path uses `DpdkIo::scratch`
+    /// instead, since one generated batch only ever has one egress.)
+    tx_pending: Vec<NonNull<RteMbuf>>,
+    /// Parallel to `tx_pending`, test-hooks only: see
+    /// `DpdkGeneratedBatch`'s `pending_meta` for the same pattern.
+    #[cfg(feature = "test-hooks")]
+    tx_pending_meta: Vec<(NonNull<u8>, usize, IfId)>,
 }
 
-/// A live DPDK generated-frame backend: one shared mbuf pool and one or more
-/// single-TX-queue ports, each bound to a Ruster interface.
+/// One mbuf `receive()` pulled off the wire, tagged with which port it came
+/// from.
+#[derive(Clone, Copy)]
+struct RxFrame {
+    mbuf: NonNull<RteMbuf>,
+    ingress: IfId,
+}
+
+/// A live DPDK backend: one shared mbuf pool and one or more ports (one RX
+/// queue, one TX queue each), each bound to a Ruster interface.
 ///
 /// Owns EAL initialization itself: DPDK's EAL is a process-global singleton,
 /// so at most one `DpdkIo` may exist per process, and `Drop` runs
@@ -279,16 +364,34 @@ pub struct DpdkIo {
     ports: Box<[PortState]>,
     max_frame_len: u16,
     stats: BackendStats,
-    /// Committed mbufs waiting for the one `tx_burst` call `finish()` makes.
-    /// Reserved once at construction; never reallocated afterward.
+    /// Committed mbufs waiting for the one `tx_burst` call a generated
+    /// batch's `finish()` makes. Reserved once at construction; never
+    /// reallocated afterward.
     scratch: Vec<NonNull<RteMbuf>>,
+    /// Mbufs `receive()` has pulled off the wire for the current RX batch,
+    /// not yet leased via `next_packet()`. Reserved once; cleared (not
+    /// reallocated) at the start of every `receive()` call.
+    rx_scratch: Vec<RxFrame>,
+    /// Round-robin starting point for `receive()`'s port poll order, so
+    /// repeated small-budget calls do not always favor the same port.
+    rx_cursor: usize,
+    /// Distinct `tx_pending` port indices touched during the current RX
+    /// batch, so `finish()` flushes each with exactly one `tx_burst` call.
+    /// Reserved to `ports.len()`; cleared at the start of every `receive()`.
+    touched_scratch: Vec<usize>,
     #[cfg(feature = "test-hooks")]
     hooks: TestHooks,
 }
 
-fn configure_and_start_port(port_id: u16, nb_tx_desc: u16) -> Result<(), DpdkError> {
-    eth_dev_configure(port_id, 1)?;
-    eth_tx_queue_setup(port_id, nb_tx_desc)?;
+fn configure_and_start_port(
+    port_id: u16,
+    rx_desc: u16,
+    tx_desc: u16,
+    pool: NonNull<RteMempool>,
+) -> Result<(), DpdkError> {
+    eth_dev_configure(port_id, 1, 1)?;
+    eth_rx_queue_setup(port_id, rx_desc, pool)?;
+    eth_tx_queue_setup(port_id, tx_desc)?;
     eth_dev_start(port_id)?;
     Ok(())
 }
@@ -322,7 +425,12 @@ impl DpdkIo {
                     available,
                 })
             } else {
-                configure_and_start_port(port.port_id, config.tx_ring_descriptors())
+                configure_and_start_port(
+                    port.port_id,
+                    config.rx_ring_descriptors(),
+                    config.tx_ring_descriptors(),
+                    pool,
+                )
             };
             if let Err(source) = result {
                 for port_id in started {
@@ -341,15 +449,22 @@ impl DpdkIo {
             .map(|port| PortState {
                 interface: port.interface,
                 port_id: port.port_id,
+                tx_pending: Vec::with_capacity(MAX_TX_PENDING),
+                #[cfg(feature = "test-hooks")]
+                tx_pending_meta: Vec::with_capacity(MAX_TX_PENDING),
             })
             .collect();
+        let num_ports = config.ports().len();
 
         Ok(Self {
             pool,
             ports,
             max_frame_len: config.max_frame_len(),
             stats: BackendStats::new(),
-            scratch: Vec::with_capacity(MAX_GENERATED_BATCH),
+            scratch: Vec::with_capacity(MAX_TX_PENDING),
+            rx_scratch: Vec::with_capacity(MAX_RX_BURST),
+            rx_cursor: 0,
+            touched_scratch: Vec::with_capacity(num_ports),
             #[cfg(feature = "test-hooks")]
             hooks: TestHooks::default(),
         })
@@ -724,6 +839,415 @@ impl GeneratedPacketSlot for DpdkGeneratedSlot<'_, '_> {
     }
 }
 
+impl PacketIo for DpdkIo {
+    type Error = DpdkError;
+    type Batch<'a>
+        = DpdkPacketBatch<'a>
+    where
+        Self: 'a;
+
+    fn receive(&mut self, budget: usize) -> Result<Self::Batch<'_>, Self::Error> {
+        #[cfg(feature = "test-hooks")]
+        if self.hooks.fail_next_receive {
+            self.hooks.fail_next_receive = false;
+            return Err(DpdkError::InjectedReceiveFailure);
+        }
+        self.rx_scratch.clear();
+        self.touched_scratch.clear();
+        let mut remaining = budget.min(MAX_RX_BURST);
+        let num_ports = self.ports.len();
+        if num_ports > 0 && remaining > 0 {
+            for offset in 0..num_ports {
+                if remaining == 0 {
+                    break;
+                }
+                let port_index = (self.rx_cursor + offset) % num_ports;
+                let port_id = self.ports[port_index].port_id;
+                let interface = self.ports[port_index].interface;
+                let want = remaining.min(MAX_RX_BURST);
+                // Stack-local, not a heap allocation: `rx_burst` fills the
+                // front `want` slots and this array never outlives the loop
+                // body.
+                let mut raw: [*mut RteMbuf; MAX_RX_BURST] = [std::ptr::null_mut(); MAX_RX_BURST];
+                let received = usize::from(rx_burst(port_id, &mut raw[..want]));
+                for slot in raw.iter().take(received) {
+                    let mbuf = NonNull::new(*slot).expect("rx_burst filled this slot");
+                    self.rx_scratch.push(RxFrame {
+                        mbuf,
+                        ingress: interface,
+                    });
+                }
+                #[cfg(feature = "test-hooks")]
+                {
+                    self.hooks.rx_pulled_total =
+                        self.hooks.rx_pulled_total.saturating_add(received as u64);
+                }
+                remaining -= received;
+            }
+            self.rx_cursor = (self.rx_cursor + 1) % num_ports;
+        }
+        Ok(DpdkPacketBatch {
+            io: self,
+            cursor: 0,
+            counters: PacketCounters::default(),
+            error: None,
+            finished: false,
+        })
+    }
+}
+
+#[derive(Default)]
+struct PacketCounters {
+    tx_requested: usize,
+    tx_accepted: usize,
+    tx_rejected: usize,
+    recycled: usize,
+}
+
+/// Core-facing RX batch for the live DPDK backend.
+///
+/// Forwarded (`commit`) frames accumulate per egress port in that port's
+/// `PortState::tx_pending` and reach `rte_eth_tx_burst` only once per
+/// touched port, in `finish()` (or are freed, never transmitted, if the
+/// batch is dropped without calling it): at most one kick per touched
+/// egress per batch. A received frame the caller never leases via
+/// `next_packet()` before ending the batch is recycled the same way.
+pub struct DpdkPacketBatch<'a> {
+    io: &'a mut DpdkIo,
+    cursor: usize,
+    counters: PacketCounters,
+    error: Option<DpdkError>,
+    finished: bool,
+}
+
+impl DpdkPacketBatch<'_> {
+    fn record_error(&mut self, error: DpdkError) {
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+    }
+
+    fn touch(&mut self, port_index: usize) {
+        if !self.io.touched_scratch.contains(&port_index) {
+            self.io.touched_scratch.push(port_index);
+        }
+    }
+
+    /// Recycles every received frame still sitting in `io.rx_scratch` past
+    /// this batch's cursor (the caller stopped calling `next_packet()`
+    /// before the batch ended).
+    fn recycle_unleased(&mut self) {
+        while self.cursor < self.io.rx_scratch.len() {
+            let frame = self.io.rx_scratch[self.cursor];
+            self.cursor += 1;
+            #[cfg(feature = "test-hooks")]
+            {
+                let data = pktmbuf_data(frame.mbuf);
+                let len = usize::from(pktmbuf_data_len(frame.mbuf));
+                self.io.hooks.record_rx_event(
+                    frame.ingress,
+                    None,
+                    data,
+                    len,
+                    RecordedRxDisposition::Abandoned,
+                );
+            }
+            pktmbuf_free(frame.mbuf);
+            self.counters.recycled = self
+                .counters
+                .recycled
+                .checked_add(1)
+                .expect("recycled count cannot overflow");
+            self.io.stats.record(BackendStat::RxRecycled);
+        }
+    }
+
+    /// Sends every mbuf `port_index` has queued in one real `tx_burst`
+    /// call, freeing whatever it doesn't accept. Used only by `finish()`.
+    fn flush_port(&mut self, port_index: usize) {
+        // test-hooks only: caps how many of the committed frames this
+        // `finish()` even offers to the real `tx_burst` call for this port.
+        // The production path never does this.
+        #[cfg(feature = "test-hooks")]
+        if let Some(cap) = self.io.hooks.rx_accept_cap {
+            while self.io.ports[port_index].tx_pending.len() > cap {
+                let mbuf = self.io.ports[port_index]
+                    .tx_pending
+                    .pop()
+                    .expect("checked non-empty above");
+                self.record_port_pending_event_back(port_index, RecordedRxDisposition::TxRejected);
+                pktmbuf_free(mbuf);
+                self.counters.tx_rejected = self
+                    .counters
+                    .tx_rejected
+                    .checked_add(1)
+                    .expect("tx_rejected count cannot overflow");
+                self.io.stats.record(BackendStat::TxRejected);
+            }
+        }
+        if self.io.ports[port_index].tx_pending.is_empty() {
+            return;
+        }
+        let port_id = self.io.ports[port_index].port_id;
+        let sent = usize::from(tx_burst(port_id, &mut self.io.ports[port_index].tx_pending));
+        self.counters.tx_accepted = self
+            .counters
+            .tx_accepted
+            .checked_add(sent)
+            .expect("tx_accepted count cannot overflow");
+        // `tx_burst` took ownership of exactly the first `sent` mbufs; only
+        // the tail from index `sent` onward is still ours to record and free.
+        self.io.ports[port_index]
+            .tx_pending
+            .drain(..sent)
+            .for_each(drop);
+        #[cfg(feature = "test-hooks")]
+        for _ in 0..sent {
+            self.record_port_pending_event_front(port_index, RecordedRxDisposition::TxSubmitted);
+        }
+        for _ in 0..sent {
+            self.io.stats.record(BackendStat::TxAccepted);
+        }
+        self.reject_port(port_index);
+    }
+
+    /// Frees every mbuf still queued for `port_index`, without ever calling
+    /// `tx_burst`. Used by `flush_port` for the tail it did not send, and
+    /// by `Drop` for a batch that never called `finish()`.
+    fn reject_port(&mut self, port_index: usize) {
+        while let Some(mbuf) = self.io.ports[port_index].tx_pending.pop() {
+            #[cfg(feature = "test-hooks")]
+            self.record_port_pending_event_back(port_index, RecordedRxDisposition::TxRejected);
+            pktmbuf_free(mbuf);
+            self.counters.tx_rejected = self
+                .counters
+                .tx_rejected
+                .checked_add(1)
+                .expect("tx_rejected count cannot overflow");
+            self.io.stats.record(BackendStat::TxRejected);
+        }
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn record_port_pending_event_back(&mut self, port_index: usize, kind: RecordedRxDisposition) {
+        let Some((data, len, ingress)) = self.io.ports[port_index].tx_pending_meta.pop() else {
+            return;
+        };
+        let egress = self.io.ports[port_index].interface;
+        self.io
+            .hooks
+            .record_rx_event(ingress, Some(egress), data, len, kind);
+    }
+
+    /// Same as `record_port_pending_event_back`, but for an entry consumed
+    /// from the *front* of `tx_pending` (the accepted prefix `tx_burst`
+    /// took), so it must also come from the front of the parallel
+    /// `tx_pending_meta` log.
+    #[cfg(feature = "test-hooks")]
+    fn record_port_pending_event_front(&mut self, port_index: usize, kind: RecordedRxDisposition) {
+        if self.io.ports[port_index].tx_pending_meta.is_empty() {
+            return;
+        }
+        let (data, len, ingress) = self.io.ports[port_index].tx_pending_meta.remove(0);
+        let egress = self.io.ports[port_index].interface;
+        self.io
+            .hooks
+            .record_rx_event(ingress, Some(egress), data, len, kind);
+    }
+
+    fn finish_inner(&mut self) -> BatchCompletion<DpdkError> {
+        self.recycle_unleased();
+        while let Some(port_index) = self.io.touched_scratch.pop() {
+            self.flush_port(port_index);
+        }
+        #[cfg(feature = "test-hooks")]
+        if self.io.hooks.fail_next_rx_finish {
+            self.io.hooks.fail_next_rx_finish = false;
+            self.record_error(DpdkError::InjectedFinishFailure);
+        }
+        self.finished = true;
+        BatchCompletion {
+            tx_requested: self.counters.tx_requested,
+            tx_accepted: self.counters.tx_accepted,
+            tx_rejected: self.counters.tx_rejected,
+            recycled: self.counters.recycled,
+            error: self.error.take(),
+        }
+    }
+}
+
+impl<'batch> PacketBatch for DpdkPacketBatch<'batch> {
+    type Error = DpdkError;
+    type Slot<'slot>
+        = DpdkPacketSlot<'slot, 'batch>
+    where
+        Self: 'slot;
+
+    fn next_packet(&mut self) -> Option<PacketLease<Self::Slot<'_>>> {
+        if self.cursor >= self.io.rx_scratch.len() {
+            return None;
+        }
+        let frame = self.io.rx_scratch[self.cursor];
+        self.cursor += 1;
+        let data = pktmbuf_data(frame.mbuf);
+        let len = usize::from(pktmbuf_data_len(frame.mbuf));
+        Some(PacketLease::new(DpdkPacketSlot {
+            batch: self,
+            mbuf: frame.mbuf,
+            ingress: frame.ingress,
+            data,
+            len,
+        }))
+    }
+
+    fn finish(mut self) -> BatchCompletion<Self::Error> {
+        self.finish_inner()
+    }
+}
+
+impl Drop for DpdkPacketBatch<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.recycle_unleased();
+        while let Some(port_index) = self.io.touched_scratch.pop() {
+            self.reject_port(port_index);
+        }
+        self.finished = true;
+    }
+}
+
+/// Core-facing RX slot for the live DPDK backend.
+pub struct DpdkPacketSlot<'slot, 'batch> {
+    batch: &'slot mut DpdkPacketBatch<'batch>,
+    mbuf: NonNull<RteMbuf>,
+    ingress: IfId,
+    data: NonNull<u8>,
+    len: usize,
+}
+
+impl PacketSlot for DpdkPacketSlot<'_, '_> {
+    fn ingress(&self) -> IfId {
+        self.ingress
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        mbuf_bytes_mut(self.data, self.len)
+    }
+
+    fn complete(self, completion: SlotCompletion) {
+        let Self {
+            batch,
+            mbuf,
+            ingress,
+            data,
+            len,
+        } = self;
+        // `data`/`len`/`ingress` are only read under `test-hooks` (or, for
+        // `ingress`, also on the unknown-egress path below); this keeps
+        // every binding used (they are `Copy`) regardless of the feature.
+        let _ = (data, len, ingress);
+        match completion {
+            SlotCompletion::Transmit(egress) => {
+                batch.counters.tx_requested = batch
+                    .counters
+                    .tx_requested
+                    .checked_add(1)
+                    .expect("tx_requested count cannot overflow");
+                match batch
+                    .io
+                    .ports
+                    .iter()
+                    .position(|port| port.interface == egress)
+                {
+                    Some(port_index) => {
+                        batch.io.ports[port_index].tx_pending.push(mbuf);
+                        #[cfg(feature = "test-hooks")]
+                        batch.io.ports[port_index]
+                            .tx_pending_meta
+                            .push((data, len, ingress));
+                        batch.touch(port_index);
+                    }
+                    None => {
+                        batch.record_error(DpdkError::UnknownEgress(egress));
+                        #[cfg(feature = "test-hooks")]
+                        batch.io.hooks.record_rx_event(
+                            ingress,
+                            Some(egress),
+                            data,
+                            len,
+                            RecordedRxDisposition::TxRejected,
+                        );
+                        pktmbuf_free(mbuf);
+                        batch.counters.tx_rejected = batch
+                            .counters
+                            .tx_rejected
+                            .checked_add(1)
+                            .expect("tx_rejected count cannot overflow");
+                        batch.io.stats.record(BackendStat::TxRejected);
+                    }
+                }
+            }
+            SlotCompletion::Recycle(reason) => {
+                #[cfg(feature = "test-hooks")]
+                batch.io.hooks.record_rx_event(
+                    ingress,
+                    None,
+                    data,
+                    len,
+                    RecordedRxDisposition::Recycled(reason),
+                );
+                #[cfg(not(feature = "test-hooks"))]
+                let _ = reason;
+                pktmbuf_free(mbuf);
+                batch.counters.recycled = batch
+                    .counters
+                    .recycled
+                    .checked_add(1)
+                    .expect("recycled count cannot overflow");
+                batch.io.stats.record(BackendStat::RxRecycled);
+            }
+            SlotCompletion::Consume(reason) => {
+                #[cfg(feature = "test-hooks")]
+                batch.io.hooks.record_rx_event(
+                    ingress,
+                    None,
+                    data,
+                    len,
+                    RecordedRxDisposition::Consumed(reason),
+                );
+                #[cfg(not(feature = "test-hooks"))]
+                let _ = reason;
+                pktmbuf_free(mbuf);
+                batch.counters.recycled = batch
+                    .counters
+                    .recycled
+                    .checked_add(1)
+                    .expect("recycled count cannot overflow");
+                batch.io.stats.record(BackendStat::RxRecycled);
+            }
+            SlotCompletion::LeaseAbandoned => {
+                #[cfg(feature = "test-hooks")]
+                batch.io.hooks.record_rx_event(
+                    ingress,
+                    None,
+                    data,
+                    len,
+                    RecordedRxDisposition::Abandoned,
+                );
+                pktmbuf_free(mbuf);
+                batch.counters.recycled = batch
+                    .counters
+                    .recycled
+                    .checked_add(1)
+                    .expect("recycled count cannot overflow");
+                batch.io.stats.record(BackendStat::RxRecycled);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // test-hooks: real pool-backed finite capacity, deterministic partial
 // accept, injected finish failure, and an address-identified disposition
@@ -758,6 +1282,32 @@ pub struct RecordedGeneratedEvent {
     pub kind: RecordedDisposition,
 }
 
+/// RX counterpart of [`RecordedDisposition`]: the two shared TX outcomes,
+/// plus the three RX-only reclaim reasons `SlotCompletion` distinguishes.
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecordedRxDisposition {
+    TxSubmitted,
+    TxRejected,
+    Recycled(DropReason),
+    Consumed(ConsumeReason),
+    Abandoned,
+}
+
+/// RX counterpart of [`RecordedGeneratedEvent`]. `egress` is `Some` only for
+/// `TxSubmitted`/`TxRejected` (the interface the commit named); reclaim
+/// dispositions carry only `ingress`, the frame's origin.
+#[cfg(feature = "test-hooks")]
+#[derive(Clone, Debug)]
+pub struct RecordedRxEvent {
+    pub ingress: IfId,
+    pub egress: Option<IfId>,
+    pub address: usize,
+    pub len: usize,
+    pub bytes: Vec<u8>,
+    pub kind: RecordedRxDisposition,
+}
+
 #[cfg(feature = "test-hooks")]
 #[derive(Default)]
 struct TestHooks {
@@ -769,13 +1319,30 @@ struct TestHooks {
     /// Sticky cap on how many committed frames one `finish()` offers to the
     /// real `tx_burst` call. See `DpdkGeneratedBatch::flush_pending`.
     accept_cap: Option<usize>,
-    /// One-shot: consumed by the next `finish()` that runs.
+    /// One-shot: consumed by the next generated-batch `finish()` that runs.
     fail_next_finish: bool,
     /// Parallel to `DpdkIo::scratch`: pushed and drained in the same order
     /// and at the same points, so index `i` here always describes the mbuf
     /// at index `i` there.
     pending_meta: Vec<(NonNull<u8>, usize)>,
     events: VecDeque<RecordedGeneratedEvent>,
+    /// Sticky cap on how many RX-forwarded commits one `finish()` offers to
+    /// the real `tx_burst` call for a given port. See
+    /// `DpdkPacketBatch::flush_port`.
+    rx_accept_cap: Option<usize>,
+    /// One-shot: consumed by the next `receive()` call, before it touches
+    /// hardware at all.
+    fail_next_receive: bool,
+    /// One-shot: consumed by the next RX-batch `finish()` that runs.
+    fail_next_rx_finish: bool,
+    /// Cumulative count of mbufs `receive()` has ever actually pulled off
+    /// the wire via `rte_eth_rx_burst`, across every port. The reusable
+    /// suite's `pending_rx()` is `frames injected - this`, which only holds
+    /// in a test environment with no other traffic source on the same
+    /// veth/port (true for the dedicated veth pairs this backend is
+    /// verified against).
+    rx_pulled_total: u64,
+    rx_events: VecDeque<RecordedRxEvent>,
 }
 
 #[cfg(feature = "test-hooks")]
@@ -793,6 +1360,26 @@ impl TestHooks {
         // reference: nothing later dereferences `data` itself.
         let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr(), len) }.to_vec();
         self.events.push_back(RecordedGeneratedEvent {
+            egress,
+            address: data.as_ptr() as usize,
+            len,
+            bytes,
+            kind,
+        });
+    }
+
+    fn record_rx_event(
+        &mut self,
+        ingress: IfId,
+        egress: Option<IfId>,
+        data: NonNull<u8>,
+        len: usize,
+        kind: RecordedRxDisposition,
+    ) {
+        // SAFETY: same as `record_event`, above.
+        let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr(), len) }.to_vec();
+        self.rx_events.push_back(RecordedRxEvent {
+            ingress,
             egress,
             address: data.as_ptr() as usize,
             len,
@@ -818,17 +1405,6 @@ impl DpdkIo {
         self.hooks.accept_cap = Some(budget);
     }
 
-    /// Clears every sticky/one-shot test seam back to its default
-    /// (unlimited allocation, unlimited accept, no injected finish
-    /// failure). Used by the reusable conformance suite's harness at the
-    /// start of every `#[test]`, since all of them share one process-wide
-    /// `DpdkIo` behind DPDK's single EAL.
-    pub fn reset_generated_test_hooks_for_test(&mut self) {
-        self.hooks.allocation_budget = None;
-        self.hooks.accept_cap = None;
-        self.hooks.fail_next_finish = false;
-    }
-
     pub fn fail_next_generated_finish_for_test(&mut self) {
         self.hooks.fail_next_finish = true;
     }
@@ -840,5 +1416,44 @@ impl DpdkIo {
 
     pub fn drain_generated_events_for_test(&mut self) -> Vec<RecordedGeneratedEvent> {
         self.hooks.events.drain(..).collect()
+    }
+
+    /// Every RX-batch `finish()` from now on offers only the first `budget`
+    /// commits to the real `tx_burst` call for whichever port they target,
+    /// until changed again. See `DpdkPacketBatch::flush_port`.
+    pub fn set_rx_accept_budget_for_test(&mut self, budget: usize) {
+        self.hooks.rx_accept_cap = Some(budget);
+    }
+
+    pub fn fail_next_receive_for_test(&mut self) {
+        self.hooks.fail_next_receive = true;
+    }
+
+    pub fn fail_next_rx_finish_for_test(&mut self) {
+        self.hooks.fail_next_rx_finish = true;
+    }
+
+    #[must_use]
+    pub fn rx_pulled_total_for_test(&self) -> u64 {
+        self.hooks.rx_pulled_total
+    }
+
+    pub fn drain_rx_events_for_test(&mut self) -> Vec<RecordedRxEvent> {
+        self.hooks.rx_events.drain(..).collect()
+    }
+
+    /// Clears every sticky/one-shot test seam (both generated and RX) back
+    /// to its default (unlimited allocation/accept, no injected failures,
+    /// zero cumulative RX pulls). Used by the reusable conformance suite's
+    /// harness at the start of every `#[test]`, since all of them share one
+    /// process-wide `DpdkIo` behind DPDK's single EAL.
+    pub fn reset_test_hooks_for_test(&mut self) {
+        self.hooks.allocation_budget = None;
+        self.hooks.accept_cap = None;
+        self.hooks.fail_next_finish = false;
+        self.hooks.rx_accept_cap = None;
+        self.hooks.fail_next_receive = false;
+        self.hooks.fail_next_rx_finish = false;
+        self.hooks.rx_pulled_total = 0;
     }
 }

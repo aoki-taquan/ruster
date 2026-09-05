@@ -1,14 +1,11 @@
 #![deny(unsafe_code)]
-#![doc = "DPDK TX-only generated-packet backend, behind the `dpdk` Cargo feature."]
+#![doc = "DPDK packet-IO backend behind the `dpdk` Cargo feature."]
 //!
-//! This crate implements [`ruster_core::GeneratedPacketIo`] /
-//! [`ruster_core::GeneratedPacketBatch`] / [`ruster_core::GeneratedPacketSlot`]
-//! over a real DPDK port using `rte_pktmbuf_alloc`/`rte_eth_tx_burst`, for
-//! requirement IO-009 ("real generated backend"). It does not implement
-//! [`ruster_core::PacketIo`]: there is no RX path, because
-//! `GeneratedPacketIo` is Ruster's TX-only fresh-frame generation API (used
-//! for router-originated traffic such as ICMP replies or ARP requests), and
-//! that is the half of IO-009 this crate closes.
+//! This crate implements both halves of the backend contract over a real
+//! DPDK port: [`ruster_core::GeneratedPacketIo`] (TX-only fresh-frame
+//! generation, requirement IO-009) over `rte_pktmbuf_alloc`/`rte_eth_tx_burst`,
+//! and [`ruster_core::PacketIo`] (receive, forward, recycle/consume) over
+//! `rte_eth_rx_burst`/`rte_eth_tx_burst`.
 //!
 //! Proven environment: DPDK 23.11.4, the `af_packet` PMD bound to a Linux
 //! veth with `--no-huge --no-pci`, no physical NIC and no hugepages
@@ -32,15 +29,16 @@
 //! `ruster-io-afpacket`'s syscall-level fake): DPDK's FFI surface does not
 //! lend itself to a lightweight software double without reimplementing
 //! meaningful driver internals. Correctness is instead validated by running
-//! the real `ruster-io-conformance` generated suite against real hardware
-//! (see the crate-level test file), gated on `dpdk`.
+//! the real `ruster-io-conformance` generated and RX suites against real
+//! hardware (see the crate-level test file), gated on `dpdk`.
 //!
-//! `GeneratedCompletionHarness`/`GeneratedCqPoolHarness` (frame-level TX
-//! completion identity) are not implemented: DPDK's generic ethdev
-//! `rte_eth_tx_burst` reclaims transmitted mbufs back into the pool
-//! internally, with no public API that reports *which* mbuf a given
-//! reclaim corresponds to. That is unlike AF_XDP's explicit completion
-//! ring, which is exactly what those two capabilities model.
+//! `GeneratedCompletionHarness`/`GeneratedCqPoolHarness`/`RxCompletionHarness`/
+//! `RxCqPoolHarness` (frame-level TX completion identity) are not
+//! implemented: DPDK's generic ethdev `rte_eth_tx_burst` reclaims
+//! transmitted mbufs back into the pool internally, with no public API that
+//! reports *which* mbuf a given reclaim corresponds to. That is unlike
+//! AF_XDP's explicit completion ring, which is exactly what those
+//! capabilities model.
 
 mod config;
 mod error;
@@ -57,7 +55,9 @@ pub use platform::DpdkPlatform;
 pub use stats::{BackendStat, BackendStats, BackendStatsSnapshot};
 
 #[cfg(dpdk_available)]
-pub use sys::{DpdkGeneratedBatch, DpdkGeneratedSlot, DpdkIo};
+pub use sys::{DpdkGeneratedBatch, DpdkGeneratedSlot, DpdkIo, DpdkPacketBatch, DpdkPacketSlot};
 
 #[cfg(all(feature = "test-hooks", dpdk_available))]
-pub use sys::{RecordedDisposition, RecordedGeneratedEvent};
+pub use sys::{
+    RecordedDisposition, RecordedGeneratedEvent, RecordedRxDisposition, RecordedRxEvent,
+};
