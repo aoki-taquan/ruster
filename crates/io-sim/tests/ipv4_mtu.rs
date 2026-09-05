@@ -9,12 +9,13 @@
 
 use ruster_core::{
     execute_one_icmpv4_time_exceeded, forward_batch_with_resolution_and_icmpv4_errors,
-    internet_checksum, ipv4_header_checksum, DropReason, ForwardingSnapshot, GeneratedIcmpv4Trace,
+    forward_batch_with_resolution_and_icmpv4_errors_and_pmtu, internet_checksum,
+    ipv4_header_checksum, DropReason, ForwardingSnapshot, GeneratedIcmpv4Trace,
     Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot,
     Icmpv4TimeExceededDisposition, IfId, Interface, Ipv4Address, Ipv4Mtu, Ipv4OriginPolicy,
-    LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoTrace, PacketIo,
-    ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
-    TraceEvent,
+    LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoTrace, PacketIo, PmtuCache,
+    PmtuLearnOutcome, PmtuSlot, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime,
+    ResolutionStateSlot, Route, TraceEvent, PMTU_STALE_MS,
 };
 use ruster_io_sim::{FrameOrigin, RecycleCause, SimIo, VecGeneratedIcmpv4Trace, VecTrace};
 
@@ -353,6 +354,115 @@ fn the_drop_reason_names_are_stable() {
         "IPV4_FRAGMENTATION_REQUIRED"
     );
     let _ = NoTrace;
+}
+
+/// Like [`forward`], but with a caller-supplied path-MTU cache and clock so
+/// RFC 1191 §5 pmtu behaviour can be observed on top of the plain egress MTU
+/// check the other tests in this file fix.
+fn forward_with_pmtu(
+    packet: Vec<u8>,
+    errors: &mut Icmpv4ErrorRuntime<'_>,
+    pmtu: &mut PmtuCache<'_>,
+    now: MonotonicMillis,
+) -> Fixture {
+    let interfaces = interfaces();
+    let bindings = bindings();
+    let routes = routes();
+    let neighbors = neighbors();
+    let snapshot = ForwardingSnapshot::with_ipv4_origin_policy(
+        &routes,
+        &interfaces,
+        &neighbors,
+        &bindings,
+        Ipv4OriginPolicy::new(64).unwrap(),
+    )
+    .unwrap();
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = ResolutionRuntime::new(
+        ResolutionPolicy::new(1_000, 60_000).unwrap(),
+        &mut resolution_states,
+        &mut resolution_actions,
+    );
+    let mut io = SimIo::new();
+    io.inject(LAN, packet);
+    let mut trace = VecTrace::default();
+    let batch = io.receive(1).unwrap();
+    let report = forward_batch_with_resolution_and_icmpv4_errors_and_pmtu(
+        batch,
+        &snapshot,
+        &mut resolution,
+        errors,
+        pmtu,
+        now,
+        &mut trace,
+    );
+    Fixture {
+        io,
+        trace,
+        dropped: report.dropped,
+        tx_requested: report.tx_requested,
+    }
+}
+
+#[test]
+fn a_cached_pmtu_lowers_the_fragmentation_threshold_below_the_interface_mtu() {
+    // Without a cached estimate, 400 bytes of UDP payload comfortably clears
+    // the 576-byte WAN interface MTU (`a_datagram_of_exactly_the_egress_mtu_is_forwarded`
+    // exercises the same interface at its true limit). A router further down
+    // the path having reported a narrower next-hop MTU for this destination
+    // must make the very same datagram fail here instead.
+    let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(
+        Icmpv4ErrorPolicy::default(),
+        &mut error_states,
+        &mut error_actions,
+    );
+    let mut pmtu_slots = [PmtuSlot::EMPTY; 1];
+    let mut pmtu = PmtuCache::new(&mut pmtu_slots);
+    assert_eq!(
+        pmtu.learn(DESTINATION, 400, 1500, MonotonicMillis(0)),
+        PmtuLearnOutcome::Inserted
+    );
+
+    let original = frame(400, DONT_FRAGMENT);
+    let mut fixture =
+        forward_with_pmtu(original.clone(), &mut errors, &mut pmtu, MonotonicMillis(0));
+
+    assert_eq!((fixture.dropped, fixture.tx_requested), (1, 0));
+    assert_eq!(
+        fixture.io.pop_recycled().unwrap().cause,
+        RecycleCause::Forwarding(DropReason::Ipv4FragmentationNeeded)
+    );
+    assert_eq!(errors.counters().queued_fragmentation_needed, 1);
+}
+
+#[test]
+fn an_aged_out_pmtu_estimate_restores_the_interface_mtu() {
+    // The same datagram that a live estimate would reject must be forwarded
+    // again once that estimate has gone unconfirmed for `PMTU_STALE_MS`.
+    let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(
+        Icmpv4ErrorPolicy::default(),
+        &mut error_states,
+        &mut error_actions,
+    );
+    let mut pmtu_slots = [PmtuSlot::EMPTY; 1];
+    let mut pmtu = PmtuCache::new(&mut pmtu_slots);
+    pmtu.learn(DESTINATION, 400, 1500, MonotonicMillis(0));
+
+    let original = frame(400, DONT_FRAGMENT);
+    let fixture = forward_with_pmtu(
+        original,
+        &mut errors,
+        &mut pmtu,
+        MonotonicMillis(PMTU_STALE_MS),
+    );
+
+    assert_eq!((fixture.dropped, fixture.tx_requested), (0, 1));
+    assert_eq!(pmtu.occupied_count(), 0);
 }
 
 /// Builds a forwardable datagram carrying `options` in its header.

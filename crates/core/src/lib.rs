@@ -11,6 +11,7 @@ mod icmpv4_ext;
 mod io;
 mod nat44;
 mod packet;
+mod pmtu;
 mod resolution;
 mod route;
 
@@ -48,10 +49,13 @@ pub use forwarding::{
     forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_and_timestamp,
     forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_audited,
     forward_batch_with_nat44_udp_and_tcp_and_firewall_audited,
-    forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors, forward_batch_with_resolution,
-    forward_batch_with_resolution_and_icmpv4_errors, BatchReport, DropReason, ForwardingSnapshot,
-    Icmpv4TimestampClock, Ipv4OriginPolicy, Ipv4OriginPolicyError, Nat44Icmpv4Disposition, NoTrace,
-    SnapshotError, TraceEvent, TraceSink, ValidatedForwardingOwner, ValidatedForwardingOwnerError,
+    forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors,
+    forward_batch_with_nat44_udp_and_tcp_and_pmtu, forward_batch_with_resolution,
+    forward_batch_with_resolution_and_icmpv4_errors,
+    forward_batch_with_resolution_and_icmpv4_errors_and_pmtu, BatchReport, DropReason,
+    ForwardingSnapshot, Icmpv4TimestampClock, Ipv4OriginPolicy, Ipv4OriginPolicyError,
+    Nat44Icmpv4Disposition, NoTrace, SnapshotError, TraceEvent, TraceSink,
+    ValidatedForwardingOwner, ValidatedForwardingOwnerError,
 };
 pub use generated::{
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,
@@ -93,6 +97,7 @@ pub use packet::{
     validate_arp, validate_arp_request, validate_ipv4_frame, ArpOpcode, MacAddress, ValidatedArp,
     ValidatedArpRequest, ValidatedIpv4, ARP_ETHERTYPE, ETHERNET_HEADER_LEN, IPV4_ETHERTYPE,
 };
+pub use pmtu::{PmtuCache, PmtuLearnOutcome, PmtuSlot, PMTU_STALE_MS};
 pub use resolution::{
     build_arp_announcement, dispatch_host_unreachable_failures, execute_arp_announcement,
     execute_one_arp_request, execute_one_held_datagram, poll_resolution_timers,

@@ -14,8 +14,8 @@ use crate::{
     Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface, LocalIpv4Binding,
     MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition,
     Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch,
-    ResolutionHoldDisposition, ResolutionResult, ResolutionRuntime, Route, ARP_ETHERTYPE,
-    IPV4_ETHERTYPE, RESOLUTION_HOLD_MAX_FRAME_LEN,
+    PmtuCache, ResolutionHoldDisposition, ResolutionResult, ResolutionRuntime, Route,
+    ARP_ETHERTYPE, IPV4_ETHERTYPE, RESOLUTION_HOLD_MAX_FRAME_LEN,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1196,7 +1196,7 @@ where
     T: TraceSink,
 {
     forward_batch_inner(
-        batch, snapshot, None, None, None, None, None, None, None, None, None, None, trace,
+        batch, snapshot, None, None, None, None, None, None, None, None, None, None, None, trace,
     )
 }
 
@@ -1229,6 +1229,7 @@ where
         None,
         None,
         Some(clock),
+        None,
         trace,
     )
 }
@@ -1252,6 +1253,7 @@ where
         batch,
         snapshot,
         Some((runtime, now)),
+        None,
         None,
         None,
         None,
@@ -1296,6 +1298,45 @@ where
         None,
         None,
         None,
+        None,
+        trace,
+    )
+}
+
+/// Forwards RX packets while queueing ARP resolution and eligible ICMPv4
+/// error actions, and applying a cached RFC 1191 path-MTU estimate to the
+/// egress fragmentation decision.
+///
+/// Generated packet execution must happen after this function returns.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
+pub fn forward_batch_with_resolution_and_icmpv4_errors_and_pmtu<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    pmtu: &mut PmtuCache<'_>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        Some((icmpv4_errors, now)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(pmtu),
         trace,
     )
 }
@@ -1329,6 +1370,7 @@ where
         None,
         Some(config),
         nat44_udp,
+        None,
         None,
         None,
         None,
@@ -1375,6 +1417,7 @@ where
         None,
         None,
         None,
+        None,
         trace,
     )
 }
@@ -1404,6 +1447,7 @@ where
         None,
         Some(config),
         nat44_tcp,
+        None,
         None,
         None,
         None,
@@ -1439,6 +1483,7 @@ where
         None,
         Some(config),
         nat44_tcp,
+        None,
         None,
         None,
         None,
@@ -1479,6 +1524,48 @@ where
         None,
         None,
         None,
+        None,
+        trace,
+    )
+}
+
+/// Runs independent UDP and TCP NAPT state for one matching address realm,
+/// additionally applying a cached RFC 1191 path-MTU estimate to the egress
+/// fragmentation decision and learning from inbound Fragmentation Needed
+/// reports quoting a translated flow.
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_with_nat44_udp_and_tcp_and_pmtu<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    udp_config: &Nat44UdpConfig,
+    nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+    tcp_config: &Nat44TcpConfig,
+    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    pmtu: &mut PmtuCache<'_>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        None,
+        Some(udp_config),
+        nat44_udp,
+        Some(tcp_config),
+        nat44_tcp,
+        None,
+        None,
+        None,
+        None,
+        Some(pmtu),
         trace,
     )
 }
@@ -1512,6 +1599,7 @@ where
         nat44_udp,
         Some(tcp_config),
         nat44_tcp,
+        None,
         None,
         None,
         None,
@@ -1553,6 +1641,7 @@ where
         firewall,
         None,
         None,
+        None,
         trace,
     )
 }
@@ -1589,6 +1678,7 @@ where
         firewall,
         Some(audit),
         None,
+        None,
         trace,
     )
 }
@@ -1623,6 +1713,7 @@ where
         None,
         Some(config),
         firewall,
+        None,
         None,
         None,
         trace,
@@ -1661,6 +1752,7 @@ where
         firewall,
         Some(audit),
         None,
+        None,
         trace,
     )
 }
@@ -1697,6 +1789,7 @@ where
         nat44_tcp,
         Some(firewall_config),
         firewall,
+        None,
         None,
         None,
         trace,
@@ -1739,6 +1832,7 @@ where
         firewall,
         Some(audit),
         None,
+        None,
         trace,
     )
 }
@@ -1778,6 +1872,7 @@ where
         nat44_tcp,
         Some(firewall_config),
         firewall,
+        None,
         None,
         None,
         trace,
@@ -1823,6 +1918,7 @@ where
         firewall,
         None,
         Some(clock),
+        None,
         trace,
     )
 }
@@ -1862,6 +1958,7 @@ where
         firewall,
         Some(audit),
         None,
+        None,
         trace,
     )
 }
@@ -1880,6 +1977,7 @@ fn forward_batch_inner<B, T>(
     mut firewall: Option<&mut FirewallRuntime<'_>>,
     mut firewall_audit: Option<&mut FirewallAuditBuffer<'_>>,
     timestamp_clock: Option<Icmpv4TimestampClock>,
+    mut pmtu: Option<&mut PmtuCache<'_>>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
 where
@@ -1912,6 +2010,7 @@ where
                 &mut firewall_audit,
                 &mut firewall_plan,
                 timestamp_clock,
+                &mut pmtu,
                 trace,
             )
             .and_then(|decision| {
@@ -2101,6 +2200,7 @@ fn decide<T: TraceSink>(
     firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
     firewall_plan: &mut Option<FirewallPlan>,
     timestamp_clock: Option<Icmpv4TimestampClock>,
+    pmtu: &mut Option<&mut PmtuCache<'_>>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     let ether_type = packet::read_u16(frame, 12).ok_or(EthernetHeaderTruncated)?;
@@ -2121,6 +2221,7 @@ fn decide<T: TraceSink>(
             firewall_audit,
             firewall_plan,
             timestamp_clock,
+            pmtu,
             trace,
         ),
         ARP_ETHERTYPE => decide_arp(frame, snapshot, ingress, resolution, trace),
@@ -2268,6 +2369,7 @@ fn decide_ipv4<T: TraceSink>(
     firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
     firewall_plan: &mut Option<FirewallPlan>,
     timestamp_clock: Option<Icmpv4TimestampClock>,
+    pmtu: &mut Option<&mut PmtuCache<'_>>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     let ipv4 = validate_ipv4_frame(frame)?;
@@ -2310,6 +2412,7 @@ fn decide_ipv4<T: TraceSink>(
             combined_realm_mismatch,
             related_firewall,
             firewall_audit,
+            pmtu,
             trace,
         );
     }
@@ -2674,8 +2777,17 @@ fn decide_ipv4<T: TraceSink>(
     // RFC 1812 §4.2.2.7: a datagram larger than the egress MTU must not be
     // put on the link. Before this check the oversized frame was handed to
     // the backend unchanged, which a real driver rejects.
+    //
+    // RFC 1191 §5: a link further down the path can be narrower than this
+    // interface's own MTU, and a router beyond the next hop is the only one
+    // that can see that. `pmtu` holds what that router's Fragmentation
+    // Needed reports have taught this cache about `ipv4.destination`; the
+    // smaller of the two is what actually fits end to end.
+    let effective_mtu = pmtu.as_mut().map_or(interface.mtu, |cache| {
+        cache.effective_mtu(ipv4.destination, interface.mtu, nat_now)
+    });
     let mut split_to = None;
-    if ipv4.total_len > interface.mtu.as_len() {
+    if ipv4.total_len > effective_mtu.as_len() {
         let dont_fragment = packet::read_u16(frame, ipv4.header_offset + 6)
             .ok_or(Ipv4HeaderTruncated)?
             & IPV4_DONT_FRAGMENT_FLAG
@@ -2689,7 +2801,7 @@ fn decide_ipv4<T: TraceSink>(
             if ipv4.header_len != 20 || resolution.is_none() {
                 return Err(Ipv4FragmentationRequired);
             }
-            let mtu = interface.mtu.bytes();
+            let mtu = effective_mtu.bytes();
             // The same arithmetic the splitter uses: fragment offsets count
             // eight-octet units, so every fragment but the last carries a
             // payload that is a multiple of eight.
@@ -2710,7 +2822,7 @@ fn decide_ipv4<T: TraceSink>(
                     ipv4,
                     Some(route),
                     Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded {
-                        next_hop_mtu: interface.mtu.bytes(),
+                        next_hop_mtu: effective_mtu.bytes(),
                     },
                     resolution,
                     runtime,
@@ -3017,6 +3129,16 @@ struct ParsedNat44Icmpv4Quote {
     /// in tests rather than discarded immediately after being computed.
     #[allow(dead_code)] // Read by tests only; see the doc comment above.
     multipart: Icmpv4MultipartOutcome,
+    icmp_type: u8,
+    icmp_code: u8,
+    /// RFC 1191 §5's next-hop MTU field. Only meaningful when
+    /// `icmp_type`/`icmp_code` is 3/4; zero for every other translatable
+    /// error and for a router that predates RFC 1191.
+    next_hop_mtu: u16,
+    /// The total length of the datagram quoted inside the ICMP message —
+    /// the one that did not make it through — used by RFC 1191 §7's
+    /// plateau fallback when `next_hop_mtu` is zero.
+    quoted_total_len: u16,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3034,10 +3156,26 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
     combined_realm_mismatch: bool,
     related_firewall: Option<&mut FirewallRuntime<'_>>,
     firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
+    pmtu: &mut Option<&mut PmtuCache<'_>>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     let quote = parse_nat44_icmpv4_frag_needed(frame, outer)
         .map_err(|reason| trace_nat44_icmpv4_drop(ingress, reason, trace))?;
+    // RFC 1191 §5/§7: this is the one place a genuine Fragmentation Needed
+    // report is decoded with its next-hop MTU field in hand, so it is where
+    // the path-MTU cache learns from it — independently of whether the
+    // quoted flow below is still translatable. A report for a mapping that
+    // has since expired is still real evidence about the path.
+    if quote.icmp_type == 3 && quote.icmp_code == 4 {
+        if let Some(cache) = pmtu.as_mut() {
+            cache.learn(
+                quote.remote_address,
+                quote.next_hop_mtu,
+                quote.quoted_total_len,
+                now,
+            );
+        }
+    }
     if !icmp_error_source_is_host(snapshot, outer.source)
         || snapshot
             .local_ipv4
@@ -3342,6 +3480,9 @@ fn parse_nat44_icmpv4_frag_needed(
     // is classified `LegacyFallback` rather than rejected, so this never
     // narrows what the quote parsing below accepts.
     let multipart = classify_icmpv4_multipart(icmp);
+    let icmp_type = icmp[0];
+    let icmp_code = icmp[1];
+    let next_hop_mtu = packet::read_u16(icmp, 6).ok_or(Nat44Icmpv4HeaderTruncated)?;
     let quote_offset = icmp_offset + 8;
     let quote = frame
         .get(quote_offset..icmp_end)
@@ -3432,6 +3573,11 @@ fn parse_nat44_icmpv4_frag_needed(
         icmp_checksum: packet::read_u16(frame, icmp_offset + 2)
             .ok_or(Nat44Icmpv4HeaderTruncated)?,
         multipart,
+        icmp_type,
+        icmp_code,
+        next_hop_mtu,
+        quoted_total_len: u16::try_from(inner_total_len)
+            .expect("quoted total length was read as a u16 field"),
     })
 }
 
@@ -6912,6 +7058,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut trace,
         );
         let disposition = trace.events.iter().find_map(|event| match event {
@@ -6978,6 +7125,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut trace,
         );
         eprintln!(
@@ -7284,6 +7432,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut NoTrace,
         );
         assert!(matches!(result, Err(reason) if reason == expected));
@@ -8037,6 +8186,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut NoTrace,
         )
     }
@@ -8071,6 +8221,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut NoTrace,
         )
     }
@@ -8126,6 +8277,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut NoTrace,
         )
     }
@@ -8333,6 +8485,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut NoTrace,
         );
 
@@ -8401,6 +8554,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut NoTrace,
         );
 
@@ -8470,6 +8624,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut NoTrace,
         );
         assert!(matches!(directed_result, Err(NeighborUnresolved)));
@@ -8517,6 +8672,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut NoTrace,
         );
         assert!(matches!(network_result, Err(NeighborUnresolved)));
@@ -8576,6 +8732,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut NoTrace,
         );
 
@@ -9610,6 +9767,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut NoTrace,
         );
         assert!(matches!(result, Err(NeighborUnresolved)));
@@ -9744,6 +9902,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut NoTrace,
         );
         assert!(matches!(
@@ -9784,6 +9943,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut NoTrace,
         )
     }
@@ -10021,6 +10181,7 @@ mod tests {
             &mut firewall_audit,
             &mut firewall_plan,
             None,
+            &mut None,
             &mut NoTrace,
         );
         assert!(matches!(result, Err(Nat44TcpRuntimeUnavailable)));
@@ -10063,6 +10224,10 @@ mod tests {
                     && self.icmp_checksum_offset == other.icmp_checksum_offset
                     && self.icmp_checksum == other.icmp_checksum
                     && self.multipart == other.multipart
+                    && self.icmp_type == other.icmp_type
+                    && self.icmp_code == other.icmp_code
+                    && self.next_hop_mtu == other.next_hop_mtu
+                    && self.quoted_total_len == other.quoted_total_len
             }
         }
 
@@ -10382,6 +10547,10 @@ mod tests {
                 icmp_checksum_offset: 36,
                 icmp_checksum: 0x3333,
                 multipart: crate::icmpv4_ext::Icmpv4MultipartOutcome::SinglePart,
+                icmp_type: 3,
+                icmp_code: 4,
+                next_hop_mtu: 0,
+                quoted_total_len: 0,
             }
         }
 
@@ -10724,6 +10893,7 @@ mod tests {
                 false,
                 None,
                 &mut firewall_audit,
+                &mut None,
                 &mut NoTrace,
             )
         }
@@ -10753,8 +10923,108 @@ mod tests {
                 false,
                 None,
                 &mut firewall_audit,
+                &mut None,
                 &mut NoTrace,
             )
+        }
+
+        #[test]
+        fn rest_decide_frag_needed_learns_the_reported_next_hop_mtu() {
+            // RFC 1191 §5: a genuine Fragmentation Needed report's next-hop
+            // MTU updates the path-MTU cache for the quoted flow's remote
+            // destination, independently of the translated rewrite it also
+            // produces.
+            let routes = standard_nat_routes();
+            let neighbors = [Neighbor {
+                interface: LAN,
+                target: INTERNAL,
+                mac: MacAddress([2, 0, 0, 0, 0, 20]),
+            }];
+            with_udp_runtime_on(&routes, &neighbors, |snapshot, config, runtime| {
+                seed_udp_mapping(runtime, INTERNAL, REMOTE);
+                let mut frame = frag_needed_frame_with_quote(17, 5, 28);
+                frame[40..42].copy_from_slice(&1200_u16.to_be_bytes());
+                frame[36..38].fill(0);
+                let icmp_end = 14 + usize::from(u16::from_be_bytes([frame[16], frame[17]]));
+                let icmp_checksum = internet_checksum(&frame[34..icmp_end]);
+                frame[36..38].copy_from_slice(&icmp_checksum.to_be_bytes());
+                let outer = validate_ipv4_frame(&frame).unwrap();
+                let mut resolution = None;
+                let mut nat44_udp = Some(runtime);
+                let mut nat44_tcp = None;
+                let mut firewall_audit = None;
+                let mut pmtu_slots = [crate::PmtuSlot::EMPTY; 1];
+                let mut cache = super::super::PmtuCache::new(&mut pmtu_slots);
+                let mut pmtu = Some(&mut cache);
+                let decision = super::super::decide_nat44_icmpv4_frag_needed(
+                    &frame,
+                    snapshot,
+                    WAN,
+                    outer,
+                    &mut resolution,
+                    Some(&config),
+                    &mut nat44_udp,
+                    None,
+                    &mut nat44_tcp,
+                    MonotonicMillis(0),
+                    false,
+                    None,
+                    &mut firewall_audit,
+                    &mut pmtu,
+                    &mut NoTrace,
+                );
+                assert!(decision.is_ok());
+                let effective = cache.effective_mtu(REMOTE, Ipv4Mtu::ETHERNET, MonotonicMillis(1));
+                assert_eq!(effective.bytes(), 1200);
+            });
+        }
+
+        #[test]
+        fn rest_decide_frag_needed_zero_mtu_learns_the_plateau_below_the_quote() {
+            // RFC 1191 §7: a router that predates RFC 1191 reports a zero
+            // next-hop MTU, so the plateau fallback keyed on the quoted
+            // datagram's own total length is what the cache must learn.
+            let routes = standard_nat_routes();
+            let neighbors = [Neighbor {
+                interface: LAN,
+                target: INTERNAL,
+                mac: MacAddress([2, 0, 0, 0, 0, 20]),
+            }];
+            with_udp_runtime_on(&routes, &neighbors, |snapshot, config, runtime| {
+                seed_udp_mapping(runtime, INTERNAL, REMOTE);
+                // The quoted UDP datagram is 28 bytes total, smaller than
+                // every RFC 1191 §7 plateau, so the estimate floors at the
+                // IPv4 minimum.
+                let frame = frag_needed_frame_with_quote(17, 5, 28);
+                let outer = validate_ipv4_frame(&frame).unwrap();
+                let mut resolution = None;
+                let mut nat44_udp = Some(runtime);
+                let mut nat44_tcp = None;
+                let mut firewall_audit = None;
+                let mut pmtu_slots = [crate::PmtuSlot::EMPTY; 1];
+                let mut cache = super::super::PmtuCache::new(&mut pmtu_slots);
+                let mut pmtu = Some(&mut cache);
+                let decision = super::super::decide_nat44_icmpv4_frag_needed(
+                    &frame,
+                    snapshot,
+                    WAN,
+                    outer,
+                    &mut resolution,
+                    Some(&config),
+                    &mut nat44_udp,
+                    None,
+                    &mut nat44_tcp,
+                    MonotonicMillis(0),
+                    false,
+                    None,
+                    &mut firewall_audit,
+                    &mut pmtu,
+                    &mut NoTrace,
+                );
+                assert!(decision.is_ok());
+                let effective = cache.effective_mtu(REMOTE, Ipv4Mtu::ETHERNET, MonotonicMillis(1));
+                assert_eq!(effective.bytes(), crate::IPV4_MINIMUM_MTU);
+            });
         }
 
         fn decide_udp_outbound(
