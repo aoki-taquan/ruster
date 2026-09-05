@@ -124,6 +124,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruster-io-dpdk"
+version = "0.2.0"
+dependencies = [
+ "ruster-core",
+ "ruster-io-conformance",
+]
+
+[[package]]
 name = "ruster-io-sim"
 version = "0.2.0"
 dependencies = [

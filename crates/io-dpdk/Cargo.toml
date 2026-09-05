@@ -1,0 +1,30 @@
+[package]
+name = "ruster-io-dpdk"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[features]
+# Off by default so the workspace builds, lints, and tests cleanly on any
+# host without libdpdk installed. With the feature on but libdpdk absent,
+# `build.rs` still degrades to a stub rather than failing the build.
+dpdk = []
+# Adds a bounded, address-identified disposition log and pool-pinning/finish-
+# fault seams used only by the reusable conformance suite in
+# `crates/io-conformance`. Never present in a production build.
+test-hooks = []
+
+[dependencies]
+ruster-core = { path = "../core" }
+
+[dev-dependencies]
+ruster-io-conformance = { path = "../io-conformance" }
+
+# Only built/run with both features on (see the module docs for why that is
+# necessary but not sufficient: it also needs a real libdpdk).
+[[test]]
+name = "backend_conformance"
+path = "tests/backend_conformance.rs"
+required-features = ["dpdk", "test-hooks"]

@@ -8,6 +8,7 @@ members = [
     "crates/integration",
     "crates/io-afpacket",
     "crates/io-conformance",
+    "crates/io-dpdk",
     "crates/io-sim",
     "crates/io-xdp",
     "crates/io-xdp-native",
