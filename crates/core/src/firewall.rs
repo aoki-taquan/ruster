@@ -3697,4 +3697,186 @@ mod tests {
             .unwrap()
         );
     }
+
+    #[test]
+    fn probe_distance_counts_forward_including_the_wrap() {
+        // Robin-hood insertion compares how far each entry sits from its home
+        // slot. Getting the wrapped case wrong makes a displaced entry look
+        // closer to home than it is, and the table stops being searchable.
+        assert_eq!(super::probe_distance(3, 5, 8), 2, "no wrap");
+        assert_eq!(super::probe_distance(3, 3, 8), 0, "at home");
+        assert_eq!(super::probe_distance(6, 1, 8), 3, "wrapped past the end");
+        assert_eq!(super::probe_distance(7, 0, 8), 1, "wrapped by one");
+        assert_eq!(super::probe_distance(1, 0, 8), 7, "the longest wrap");
+    }
+
+    #[test]
+    fn an_empty_state_table_has_no_usable_capacity() {
+        // Every other size reserves headroom; zero has nothing to reserve from
+        // and must not underflow into a huge capacity.
+        assert_eq!(super::usable_state_capacity(0), 0);
+        assert_eq!(super::usable_state_capacity(1), 1);
+        assert_eq!(super::usable_state_capacity(3), 3);
+        assert_eq!(super::usable_state_capacity(4), 3);
+        assert_eq!(super::usable_state_capacity(8), 6);
+    }
+
+    #[test]
+    fn the_rules_fingerprint_distinguishes_every_field_it_covers() {
+        // The fingerprint is what tells a successor publication that the rule
+        // set changed. A field it does not cover is a rule change that could
+        // be applied without anyone noticing.
+        let base = [rule(
+            1,
+            FirewallAction::AllowStateful,
+            FirewallProtocol::Tcp,
+        )];
+        let baseline = super::rules_fingerprint(&base);
+
+        let same = [rule(
+            1,
+            FirewallAction::AllowStateful,
+            FirewallProtocol::Tcp,
+        )];
+        assert_eq!(
+            super::rules_fingerprint(&same),
+            baseline,
+            "an identical rule set must fingerprint identically"
+        );
+
+        for (label, rules) in [
+            (
+                "id",
+                [rule(
+                    2,
+                    FirewallAction::AllowStateful,
+                    FirewallProtocol::Tcp,
+                )],
+            ),
+            (
+                "action",
+                [rule(1, FirewallAction::Deny, FirewallProtocol::Tcp)],
+            ),
+            (
+                "protocol",
+                [rule(
+                    1,
+                    FirewallAction::AllowStateful,
+                    FirewallProtocol::Udp,
+                )],
+            ),
+        ] {
+            assert_ne!(
+                super::rules_fingerprint(&rules),
+                baseline,
+                "a change of {label} must change the fingerprint"
+            );
+        }
+
+        assert_ne!(
+            super::rules_fingerprint(&[]),
+            baseline,
+            "an empty rule set must not fingerprint as a populated one"
+        );
+        assert_ne!(
+            super::rules_fingerprint(&[
+                rule(1, FirewallAction::AllowStateful, FirewallProtocol::Tcp),
+                rule(2, FirewallAction::AllowStateful, FirewallProtocol::Tcp),
+            ]),
+            baseline,
+            "an appended rule must change the fingerprint"
+        );
+    }
+
+    #[test]
+    fn the_rules_fingerprint_is_order_sensitive() {
+        // Two rule sets with the same rules in a different order decide
+        // different things, so they must not share a fingerprint.
+        let ascending = [
+            rule(1, FirewallAction::AllowStateful, FirewallProtocol::Tcp),
+            rule(2, FirewallAction::Deny, FirewallProtocol::Udp),
+        ];
+        let descending = [
+            rule(2, FirewallAction::Deny, FirewallProtocol::Udp),
+            rule(1, FirewallAction::AllowStateful, FirewallProtocol::Tcp),
+        ];
+        assert_ne!(
+            super::rules_fingerprint(&ascending),
+            super::rules_fingerprint(&descending)
+        );
+    }
+
+    #[test]
+    fn related_inspection_finds_a_flow_that_collided_into_a_later_slot() {
+        // The lookup walks forward from the flow's home slot. Several flows
+        // share a home in a small table, so a flow that landed behind another
+        // is only findable if the walk goes the right way — and going the
+        // wrong way in a `usize` index also runs off the front of the table.
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                7,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 4];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+
+            // A colliding pair is searched for rather than hoped for: without
+            // one the walk never takes a step and the direction it takes could
+            // not be observed.
+            let capacity = 4_usize;
+            let home = |source_port: u16| {
+                let mut origin = packet(FirewallProtocol::Udp, 0);
+                origin.source_port = source_port;
+                super::flow_hash(origin, 1, hash_key()) as usize % capacity
+            };
+            let first_port = 1_000_u16;
+            let first_home = home(first_port);
+            let second_port = (first_port + 1..first_port + 500)
+                .find(|port| home(*port) == first_home)
+                .expect("a colliding source port must exist in a four-slot table");
+
+            let mut origins = Vec::new();
+            for source_port in [first_port, second_port] {
+                let mut origin = packet(FirewallProtocol::Udp, 0);
+                origin.source_port = source_port;
+                let plan = runtime
+                    .plan_packet(&config, origin, 10)
+                    .expect("each distinct flow must be admitted");
+                runtime.commit(plan).expect("each plan must commit");
+                origins.push(origin);
+            }
+            assert_eq!(
+                runtime.states().iter().filter(|slot| slot.occupied).count(),
+                2
+            );
+            assert_eq!(
+                home(first_port),
+                home(second_port),
+                "the two flows must share a home slot"
+            );
+
+            for origin in origins {
+                let flow = FirewallRelatedIcmpv4Flow::new(
+                    origin.ingress,
+                    origin.egress,
+                    origin.source,
+                    origin.destination,
+                    origin.protocol,
+                    origin.source_port,
+                    origin.destination_port,
+                );
+                assert_eq!(
+                    runtime.inspect_related_icmpv4(flow, 10),
+                    Ok(FirewallRuleId(7)),
+                    "a committed flow must be findable from its home slot, \
+                     source_port={}",
+                    origin.source_port
+                );
+            }
+        });
+    }
 }
