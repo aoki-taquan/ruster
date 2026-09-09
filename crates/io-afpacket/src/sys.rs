@@ -4080,6 +4080,13 @@ mod tests {
     }
 
     #[test]
+    fn poll_timeout_ms_clamps_duration_too_large_for_i32() {
+        let oversized = Duration::from_millis(i32::MAX as u64 + 1);
+
+        assert_eq!(poll_timeout_ms(oversized), i32::MAX);
+    }
+
+    #[test]
     fn bound_backend_command_bridge_uses_backend_owned_wait() {
         let ops = ScriptedOps::new(None);
         ops.set_poll_result(PollWaitResult::Ready);
@@ -5937,6 +5944,27 @@ mod tests {
         // completion.
         record_quiescence_error(&mut first_error, pending);
         record_quiescence_error(&mut first_error, mismatch);
+        assert_eq!(first_error, Some(mismatch));
+    }
+
+    #[test]
+    fn quiescence_error_recording_preserves_existing_non_pending_error() {
+        let mismatch = PublicationQuiescenceError::RxBlockInvalidStatus {
+            interface: IfId(7),
+            block_index: 0,
+            status: TP_STATUS_USER | 0x80,
+        };
+        let pending = PublicationQuiescenceError::TxCompletionPending {
+            interface: IfId(7),
+            frame_index: 0,
+            status: TP_STATUS_SEND_REQUEST,
+            ownership: TxOwnership::SendRequest,
+        };
+        let mut first_error = Some(mismatch);
+
+        // This protects the `Some(_) => false` branch: non-pending errors are not
+        // replaced by later pending errors.
+        record_quiescence_error(&mut first_error, pending);
         assert_eq!(first_error, Some(mismatch));
     }
 

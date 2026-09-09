@@ -540,4 +540,117 @@ mod tests {
             Err(GeometryError::PacketHeaderOutOfBounds { offset: 64 })
         );
     }
+
+    #[test]
+    fn validate_packet_requires_next_offset_when_not_last() {
+        let packet = PacketDescriptor {
+            packet_offset: TPACKET_BLOCK_HEADER_LEN,
+            next_offset: 0,
+            mac_offset: TPACKET_V3_ETHERNET_MAC_OFFSET,
+            net_offset: TPACKET_V3_ETHERNET_NETWORK_OFFSET,
+            snap_len: 60,
+            wire_len: 60,
+            is_last: false,
+        };
+
+        assert_eq!(
+            packet.validate(4_096),
+            Err(GeometryError::MissingNextPacketOffset)
+        );
+    }
+
+    #[test]
+    fn validate_packet_disallows_next_offset_for_terminal_packet() {
+        let packet = PacketDescriptor {
+            packet_offset: TPACKET_BLOCK_HEADER_LEN,
+            next_offset: 48,
+            mac_offset: TPACKET_V3_ETHERNET_MAC_OFFSET,
+            net_offset: TPACKET_V3_ETHERNET_NETWORK_OFFSET,
+            snap_len: 60,
+            wire_len: 60,
+            is_last: true,
+        };
+
+        assert_eq!(
+            packet.validate(4_096),
+            Err(GeometryError::TerminalPacketHasNextOffset { offset: 48 })
+        );
+    }
+
+    #[test]
+    fn validate_block_descriptor_accepts_header_at_block_tail() {
+        let geometry = RingGeometry {
+            block_size: 256,
+            block_count: 1,
+            frame_size: 128,
+            frame_count: 2,
+            retire_timeout_ms: 0,
+            private_size: 75,
+            feature_flags: 1,
+        }
+        .validate_rx(4, 1)
+        .expect("minimum-tail layout");
+
+        let block = BlockDescriptor {
+            version: TPACKET_V3_VERSION,
+            offset_to_private: TPACKET_BLOCK_HEADER_LEN,
+            block_len: 176,
+            packet_count: 1,
+            first_packet_offset: 128,
+        };
+
+        assert_eq!(block.validate(geometry), Ok(()));
+    }
+
+    #[test]
+    fn validate_empty_timeout_allows_packet_offset_equal_to_block_len() {
+        let geometry = RingGeometry {
+            block_size: 256,
+            block_count: 1,
+            frame_size: 128,
+            frame_count: 2,
+            retire_timeout_ms: 10,
+            private_size: 16,
+            feature_flags: 1,
+        }
+        .validate_rx(4, 1)
+        .expect("empty-timeout layout");
+
+        let block = BlockDescriptor {
+            version: TPACKET_V3_VERSION,
+            offset_to_private: TPACKET_BLOCK_HEADER_LEN,
+            block_len: 96,
+            packet_count: 0,
+            first_packet_offset: 64,
+        };
+
+        assert_eq!(block.validate_empty_timeout(geometry), Ok(()));
+    }
+
+    #[test]
+    fn packet_validate_reports_non_truncated_data_path() {
+        let packet = PacketDescriptor {
+            packet_offset: TPACKET_BLOCK_HEADER_LEN,
+            next_offset: 0,
+            mac_offset: TPACKET_V3_ETHERNET_MAC_OFFSET,
+            net_offset: TPACKET_V3_ETHERNET_NETWORK_OFFSET,
+            snap_len: 60,
+            wire_len: 60,
+            is_last: true,
+        };
+
+        let validated = packet
+            .validate(1 << 16)
+            .expect("packet with equal snap/wire lengths");
+        assert_eq!(validated.is_truncated(), false);
+    }
+
+    #[test]
+    fn tx_ownership_rejects_unknown_tx_status() {
+        assert_eq!(
+            TxOwnership::from_status(0x80),
+            Err(GeometryError::InvalidTxStatus { status: 0x80 })
+        );
+        assert_eq!(TxOwnership::from_status(TP_STATUS_SENDING), Ok(TxOwnership::Sending));
+    }
 }

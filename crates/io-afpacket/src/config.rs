@@ -520,4 +520,90 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn validate_rx_rejects_zero_max_frame_length() {
+        let geometry = RingGeometry {
+            block_size: 4_096,
+            block_count: 1,
+            frame_size: 2_048,
+            frame_count: 2,
+            retire_timeout_ms: 0,
+            private_size: 0,
+            feature_flags: 1,
+        };
+
+        assert_eq!(
+            geometry.validate_rx(4_096, 0),
+            Err(GeometryError::ZeroMaxFrameLength)
+        );
+    }
+
+    #[test]
+    fn validate_tx_rejects_private_area() {
+        let geometry = RingGeometry {
+            block_size: 4_096,
+            block_count: 1,
+            frame_size: 2_048,
+            frame_count: 2,
+            retire_timeout_ms: 0,
+            private_size: 16,
+            feature_flags: 0,
+        };
+
+        assert_eq!(
+            geometry.validate_tx(4_096, 1_514),
+            Err(GeometryError::PrivateAreaUnsupportedForTx { private_size: 16 })
+        );
+    }
+
+    #[test]
+    fn validate_common_rejects_non_power_of_two_page_size() {
+        let geometry = RingGeometry {
+            block_size: 4_096,
+            block_count: 1,
+            frame_size: 2_048,
+            frame_count: 2,
+            retire_timeout_ms: 0,
+            private_size: 0,
+            feature_flags: 1,
+        };
+
+        assert_eq!(
+            geometry.validate_rx(6, 1_514),
+            Err(GeometryError::PageSizeNotPowerOfTwo { page_size: 6 })
+        );
+    }
+
+    #[test]
+    fn validate_rx_allows_a_block_that_hits_the_strict_minimum() {
+        let geometry = RingGeometry {
+            block_size: 4_096,
+            block_count: 1,
+            frame_size: 256,
+            frame_count: 16,
+            retire_timeout_ms: 0,
+            // align_to_8(private_size) == 3_952, so block_plus_private == 4_000.
+            // strict minimum with max_frame_len == 1 becomes exactly 4_096.
+            private_size: 3_945,
+            feature_flags: 1,
+        };
+
+        assert!(geometry.validate_rx(4, 1).is_ok());
+    }
+
+    #[test]
+    fn validate_common_allows_frame_size_at_minimum() {
+        let geometry = RingGeometry {
+            block_size: 192,
+            block_count: 1,
+            frame_size: 96,
+            frame_count: 2,
+            retire_timeout_ms: 0,
+            private_size: 0,
+            feature_flags: 1,
+        };
+
+        assert!(geometry.validate_rx(4, 1).is_ok());
+    }
 }
