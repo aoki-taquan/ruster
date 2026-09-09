@@ -159,6 +159,16 @@ impl XdpOwnership {
             .find(|&index| self.state_kind(index) == XdpChunkState::Free)
     }
 
+    /// Counts free generated-pool frames. Test-only: production code never
+    /// needs the count, only whether a next free frame exists
+    /// ([`Self::next_free_generated`]).
+    #[cfg(test)]
+    fn free_generated_count(&self) -> usize {
+        (self.rx_frames..self.frame_count)
+            .filter(|&index| self.state_kind(index) == XdpChunkState::Free)
+            .count()
+    }
+
     fn reserve_fill(&mut self, frame_index: u32) -> Result<(), XdpIoError> {
         self.transition(frame_index, XdpChunkState::Free, ChunkState::FillReserved)
     }
@@ -1765,21 +1775,41 @@ mod tests {
         fill_wakeup_pending: bool,
         tx_wakeup_pending: bool,
         interface: IfId,
+        /// TX ring capacity. Fixed at [`RING_ENTRIES`] for every existing
+        /// fixture in this module; the reusable conformance suite wiring
+        /// further down uses [`Harness::with_geometry`] to shrink this so a
+        /// real, ring-full rejection is deterministic instead of simulated.
+        tx_ring_entries: u32,
     }
 
     impl Harness {
         fn new() -> Self {
-            let config = UmemConfig::new(
-                FRAME_COUNT as u32,
-                FRAME_SIZE as u32,
-                HEADROOM as u32,
+            Self::with_geometry(
+                IfId(7),
                 RX_FRAMES as u32,
                 (FRAME_COUNT - RX_FRAMES) as u32,
+                RING_ENTRIES,
+            )
+        }
+
+        fn with_geometry(
+            interface: IfId,
+            rx_frames: u32,
+            generated_frames: u32,
+            tx_ring_entries: u32,
+        ) -> Self {
+            let frame_count = rx_frames + generated_frames;
+            let config = UmemConfig::new(
+                frame_count,
+                FRAME_SIZE as u32,
+                HEADROOM as u32,
+                rx_frames,
+                generated_frames,
                 0,
             )
             .expect("test UMEM");
             Self {
-                umem: vec![0; FRAME_COUNT * FRAME_SIZE].into_boxed_slice(),
+                umem: vec![0; frame_count as usize * FRAME_SIZE].into_boxed_slice(),
                 fill: RingMemory::new(),
                 completion: RingMemory::new(),
                 rx: RingMemory::new(),
@@ -1788,12 +1818,14 @@ mod tests {
                 state: BatchState::Idle,
                 fill_wakeup_pending: false,
                 tx_wakeup_pending: false,
-                interface: IfId(7),
+                interface,
+                tx_ring_entries,
             }
         }
 
         fn core(&mut self, kind: BatchState) -> XdpBatchCore<'_, 'static, LinuxSyscalls> {
             let interface = self.interface;
+            let tx_ring_entries = self.tx_ring_entries;
             let Harness {
                 umem,
                 fill,
@@ -1831,7 +1863,8 @@ mod tests {
                     tx: TxProducer::new(
                         &mut tx.0,
                         OFFSETS,
-                        crate::RingEntries::new(RingName::Tx, RING_ENTRIES).expect("tx capacity"),
+                        crate::RingEntries::new(RingName::Tx, tx_ring_entries)
+                            .expect("tx capacity"),
                     )
                     .expect("tx view"),
                 },
@@ -3204,5 +3237,634 @@ mod tests {
             Ok(false),
             "non-RX readiness must not be reported as an RX event"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Reusable generated-suite conformance wiring (IO-009).
+    //
+    // Runs the same `ruster-io-conformance` generated suite that
+    // `ruster-io-sim` and `ruster-io-dpdk` run, driven entirely by the
+    // finite in-memory ring fixture above (`Harness`/`XdpBatchCore` with
+    // `socket: None`): no real socket, no root, no interface. The generated
+    // data path never touches a real syscall in the first place (only
+    // `wake_if_needed`'s doorbell would, and that is a documented no-op
+    // without a socket), so this needed no fake-syscalls layer, just two
+    // independent `Harness` fixtures (one per conformance interface) reused
+    // exactly as the crate's own unit tests above already do.
+    //
+    // `XdpGeneratedBatchWithOps`/`XdpGeneratedSlotWithOps` have no event log
+    // (unlike `ruster-io-dpdk`'s `test-hooks` feature): every
+    // `RecordedGeneratedEvent` below is derived by this harness itself, by
+    // reading `GeneratedCounters` before and after calling the crate's own
+    // `complete_slot`, entirely without modifying any crate behavior.
+    //
+    // Three capabilities from the full suite are deliberately not wired
+    // here:
+    //
+    // - `GeneratedUnknownEgressHarness`: see the doc comment on
+    //   `FakeGeneratedIo::resource_for` below.
+    //
+    // - `GeneratedFinishErrorHarness`: this would require making a
+    //   real, already-submitted TX descriptor fail at completion time
+    //   (i.e. the kernel reporting the frame back on the completion
+    //   ring as failed). Nothing in `XdpBatchCore`/`XdpGeneratedBatchWithOps`
+    //   exposes a seam for that — completion success is a property of
+    //   the real ring transaction, not a decision this crate's own code
+    //   makes, so there is no equivalent of `ruster-io-dpdk`'s
+    //   `test-hooks`-feature error injection to reuse. Simulating it
+    //   would mean inventing ring-state behavior no real NIC/kernel
+    //   driver actually produces, which risks asserting something
+    //   false about AF_XDP rather than testing this crate. Left
+    //   unwired rather than faked.
+    //
+    // - `partial_reject_reclaims_exact_tokens` (part of the base
+    //   `GeneratedHarness` suite, not a separate capability trait):
+    //   `XdpOwnership::next_free_generated`'s lowest-free-index-first
+    //   allocation strategy deterministically reuses a just-rejected
+    //   frame's address for the very next allocation, which this one
+    //   test's strict `assert_distinct_live` check does not tolerate.
+    //   See the comment above the (absent) wiring for this test,
+    //   further down in this module.
+    mod generated_conformance {
+        use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+
+        use ruster_io_conformance::{
+            generated, BufferToken, GeneratedCompletionHarness, GeneratedCqPoolHarness,
+            GeneratedEvent, GeneratedEventKind, GeneratedFinitePoolHarness, GeneratedHarness,
+            GeneratedReclaim, LeaseObserver, LiveFrame, TxCompletion, TxEndpoint, CONFORMANCE_LAN,
+            CONFORMANCE_LAN_ENDPOINT, CONFORMANCE_WAN, CONFORMANCE_WAN_ENDPOINT,
+        };
+
+        use super::*;
+
+        /// Generated pool sized well past the largest `baseline >= N` this
+        /// suite asks for (`dropped_batch_accounts_generated_and_cannot_carry_to_next_egress`
+        /// needs `baseline >= 3`); one RX frame is the minimum `UmemConfig`
+        /// accepts even though this wiring never receives anything.
+        const GENERATED_FRAMES: u32 = 8;
+        const RX_FRAMES: u32 = 1;
+        /// Every `set_generated_accept_budget` call in the suite that this
+        /// harness wires uses `1`; a real one-entry TX ring accepts exactly
+        /// the first commit in a batch and genuinely rejects (ring full) any
+        /// more, so `set_generated_accept_budget` itself only asserts that —
+        /// the ring is always already exactly that size. No test this
+        /// harness runs ever needs more than one live commit per interface,
+        /// so this is not a hidden limitation of the tests actually wired.
+        const TX_RING_ENTRIES: u32 = 1;
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum Resource {
+            Lan,
+            Wan,
+        }
+
+        impl Resource {
+            fn endpoint(self) -> TxEndpoint {
+                match self {
+                    Self::Lan => CONFORMANCE_LAN_ENDPOINT,
+                    Self::Wan => CONFORMANCE_WAN_ENDPOINT,
+                }
+            }
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum RecordedKind {
+            TxSubmitted,
+            TxRejected,
+            Cancelled,
+            Abandoned,
+        }
+
+        struct RecordedGeneratedEvent {
+            egress: IfId,
+            resource: Resource,
+            frame: LiveFrame,
+            bytes: Vec<u8>,
+            kind: RecordedKind,
+        }
+
+        struct PendingSubmission {
+            resource: Resource,
+            address: u64,
+            frame: LiveFrame,
+        }
+
+        #[derive(Default)]
+        struct Observer {
+            generations: std::collections::BTreeMap<u64, u64>,
+            live: std::collections::BTreeMap<usize, LiveFrame>,
+        }
+
+        impl LeaseObserver for Observer {
+            fn bind(&mut self, bytes: &[u8], requested_len: usize) -> LiveFrame {
+                assert_eq!(bytes.len(), requested_len);
+                let visible_address = bytes.as_ptr() as usize;
+                let frame_id = visible_address as u64;
+                assert!(
+                    !self.live.contains_key(&visible_address),
+                    "AF_XDP allocation address is already live"
+                );
+                let generation = self.generations.entry(frame_id).or_default();
+                *generation = generation
+                    .checked_add(1)
+                    .expect("AF_XDP generation overflow");
+                let frame = LiveFrame {
+                    token: BufferToken::new(frame_id, *generation),
+                    visible_address,
+                    requested_len,
+                };
+                self.live.insert(visible_address, frame);
+                frame
+            }
+
+            fn observe(&self, bytes: &[u8]) -> LiveFrame {
+                let address = bytes.as_ptr() as usize;
+                let frame = *self
+                    .live
+                    .get(&address)
+                    .expect("AF_XDP terminal event has no lease-time identity");
+                assert_eq!(bytes.len(), frame.requested_len);
+                frame
+            }
+        }
+
+        impl Observer {
+            fn terminal(&mut self, bytes: &[u8]) -> LiveFrame {
+                let frame = self.observe(bytes);
+                assert_eq!(self.live.remove(&frame.visible_address), Some(frame));
+                frame
+            }
+
+            /// Same release as [`Self::terminal`], but by an already-known
+            /// `visible_address` (captured earlier via `observe`) instead of
+            /// re-deriving one from a live byte slice. Used by
+            /// `complete_generated_submissions`, since by the time a
+            /// submission actually completes, a later allocation may
+            /// already have reused the same UMEM bytes.
+            fn release(&mut self, visible_address: usize) -> LiveFrame {
+                self.live
+                    .remove(&visible_address)
+                    .expect("AF_XDP completion has no lease-time identity")
+            }
+        }
+
+        /// Two independent fixed AF_XDP resources, one per conformance
+        /// interface, matching `ruster_io_dpdk`'s two-port design and this
+        /// crate's own `XdpResourcePair` (which this wiring does not use
+        /// directly: the pair's cross-link copy path is unrelated to
+        /// generated-frame testing, and reusing plain `Harness` fixtures
+        /// keeps this wiring privilege-free). `observer` is shared
+        /// (`Rc<RefCell<_>>`) with every batch/slot this IO hands out, since
+        /// a cancelled/abandoned/rejected frame's binding must be released
+        /// immediately — see the module doc comment above.
+        struct FakeGeneratedIo {
+            lan: Harness,
+            wan: Harness,
+            allocation_budget: Option<usize>,
+            max_frame: Option<usize>,
+            observer: Rc<RefCell<Observer>>,
+            events: Rc<RefCell<VecDeque<RecordedGeneratedEvent>>>,
+            pending: Rc<RefCell<VecDeque<PendingSubmission>>>,
+        }
+
+        impl FakeGeneratedIo {
+            fn new(observer: Rc<RefCell<Observer>>) -> Self {
+                Self {
+                    lan: Harness::with_geometry(
+                        CONFORMANCE_LAN,
+                        RX_FRAMES,
+                        GENERATED_FRAMES,
+                        TX_RING_ENTRIES,
+                    ),
+                    wan: Harness::with_geometry(
+                        CONFORMANCE_WAN,
+                        RX_FRAMES,
+                        GENERATED_FRAMES,
+                        TX_RING_ENTRIES,
+                    ),
+                    allocation_budget: None,
+                    max_frame: None,
+                    observer,
+                    events: Rc::new(RefCell::new(VecDeque::new())),
+                    pending: Rc::new(RefCell::new(VecDeque::new())),
+                }
+            }
+
+            fn resource_mut(&mut self, resource: Resource) -> &mut Harness {
+                match resource {
+                    Resource::Lan => &mut self.lan,
+                    Resource::Wan => &mut self.wan,
+                }
+            }
+
+            /// `GeneratedUnknownEgressHarness` is deliberately not wired:
+            /// this crate's `XdpPairGeneratedBatch::allocate` (`aggregate.rs`)
+            /// already fails `allocate()` itself for an egress that matches
+            /// neither pair member (`GeneratedAllocationError::Unavailable`,
+            /// before ever calling into the resource), while the reusable
+            /// suite's `unknown_egress_is_rejected_without_submission`
+            /// expects `allocate()` to succeed and only the eventual
+            /// commit/finish to reject. That is a real, confirmed
+            /// disagreement between this crate's existing pair-level
+            /// behavior and the shared contract every other wired backend
+            /// (`ruster-io-sim`, `ruster-io-dpdk`) already satisfies — not
+            /// something this test-only wiring can or should paper over by
+            /// picking a fallback resource here. See the written report.
+            fn resource_for(&mut self, egress: IfId) -> Resource {
+                if self.wan.interface == egress {
+                    Resource::Wan
+                } else {
+                    Resource::Lan
+                }
+            }
+        }
+
+        impl GeneratedPacketIo for FakeGeneratedIo {
+            type Error = XdpIoError;
+            type Batch<'a>
+                = FakeGeneratedBatch<'a>
+            where
+                Self: 'a;
+
+            fn begin_generated(&mut self, egress: IfId) -> Self::Batch<'_> {
+                let allocation_remaining = self.allocation_budget;
+                let max_frame = self.max_frame;
+                let observer = Rc::clone(&self.observer);
+                let events = Rc::clone(&self.events);
+                let pending = Rc::clone(&self.pending);
+                let resource = self.resource_for(egress);
+                let core = self.resource_mut(resource).core(BatchState::Generated);
+                FakeGeneratedBatch {
+                    inner: XdpGeneratedBatchWithOps::new(core, egress),
+                    egress,
+                    resource,
+                    observer,
+                    events,
+                    pending,
+                    allocation_remaining,
+                    max_frame,
+                }
+            }
+        }
+
+        struct FakeGeneratedBatch<'batch> {
+            inner: XdpGeneratedBatchWithOps<'batch, 'static, LinuxSyscalls>,
+            egress: IfId,
+            resource: Resource,
+            observer: Rc<RefCell<Observer>>,
+            events: Rc<RefCell<VecDeque<RecordedGeneratedEvent>>>,
+            pending: Rc<RefCell<VecDeque<PendingSubmission>>>,
+            allocation_remaining: Option<usize>,
+            max_frame: Option<usize>,
+        }
+
+        impl<'batch> GeneratedPacketBatch for FakeGeneratedBatch<'batch> {
+            type Error = XdpIoError;
+            type Slot<'slot>
+                = FakeGeneratedSlot<'slot, 'batch>
+            where
+                Self: 'slot;
+
+            fn allocate(
+                &mut self,
+                frame_len: usize,
+            ) -> Result<GeneratedPacketLease<Self::Slot<'_>>, GeneratedAllocationError>
+            {
+                // test-only: `set_generated_max_frame` has no equivalent on
+                // the real, unmodified `allocate_slot` (whose own cap is
+                // this fixture's fixed visible frame capacity, far larger
+                // than what this suite probes with); this sticky override
+                // on `FakeGeneratedIo` layers the exact suite requirement on
+                // top without touching crate code. `allocate_slot` itself
+                // still separately enforces zero-length and its own real
+                // capacity, and still owns `counters.attempts`/`failed` for
+                // those and for genuine pool exhaustion.
+                if let Some(max_frame) = self.max_frame {
+                    if frame_len != 0 && frame_len > max_frame {
+                        self.inner.counters.attempts += 1;
+                        self.inner.counters.failed += 1;
+                        return Err(GeneratedAllocationError::FrameTooLarge);
+                    }
+                }
+                // test-only: an artificial per-session cap on successful
+                // allocations, sticky on `FakeGeneratedIo` and copied fresh
+                // into each new batch, exactly mirroring what
+                // `ruster-io-dpdk`'s `test-hooks` feature does for the same
+                // reusable-suite requirement. Real AF_XDP pool exhaustion
+                // (`allocate_slot` returning `Unavailable` on its own) is
+                // unaffected and still exercised whenever this cap does not
+                // apply.
+                if self.allocation_remaining == Some(0) {
+                    self.inner.counters.attempts += 1;
+                    self.inner.counters.failed += 1;
+                    return Err(GeneratedAllocationError::Unavailable);
+                }
+                let slot = self.inner.allocate_slot(frame_len)?;
+                if let Some(remaining) = self.allocation_remaining.as_mut() {
+                    *remaining -= 1;
+                }
+                Ok(GeneratedPacketLease::new(FakeGeneratedSlot {
+                    inner: slot,
+                    egress: self.egress,
+                    resource: self.resource,
+                    observer: Rc::clone(&self.observer),
+                    events: Rc::clone(&self.events),
+                    pending: Rc::clone(&self.pending),
+                }))
+            }
+
+            fn finish(mut self) -> GeneratedBatchCompletion<Self::Error> {
+                self.inner.finish_inner()
+            }
+        }
+
+        struct FakeGeneratedSlot<'slot, 'batch> {
+            inner: XdpGeneratedSlotWithOps<'slot, 'batch, 'static, LinuxSyscalls>,
+            egress: IfId,
+            resource: Resource,
+            observer: Rc<RefCell<Observer>>,
+            events: Rc<RefCell<VecDeque<RecordedGeneratedEvent>>>,
+            pending: Rc<RefCell<VecDeque<PendingSubmission>>>,
+        }
+
+        impl GeneratedPacketSlot for FakeGeneratedSlot<'_, '_> {
+            fn bytes_mut(&mut self) -> &mut [u8] {
+                self.inner.bytes_mut()
+            }
+
+            fn complete(self, completion: GeneratedSlotCompletion) {
+                let Self {
+                    inner,
+                    egress,
+                    resource,
+                    observer,
+                    events,
+                    pending,
+                } = self;
+                let XdpGeneratedSlotWithOps {
+                    batch,
+                    frame_index,
+                    address,
+                    frame_len,
+                } = inner;
+                let start = usize::try_from(address).expect("validated AF_XDP address fits usize");
+                let end = start
+                    .checked_add(frame_len)
+                    .expect("validated AF_XDP generated range cannot overflow");
+                // A real content snapshot, taken now: a rejected, cancelled,
+                // or abandoned frame is released back to the pool below and
+                // may be overwritten by a later allocation in the same test
+                // before this harness's `drain_generated_events` ever runs.
+                let bytes = batch.core.umem[start..end].to_vec();
+                let before = (
+                    batch.counters.accepted,
+                    batch.counters.rejected,
+                    batch.counters.cancelled,
+                    batch.counters.abandoned,
+                );
+                batch.complete_slot(frame_index, address, frame_len, completion);
+                let after = (
+                    batch.counters.accepted,
+                    batch.counters.rejected,
+                    batch.counters.cancelled,
+                    batch.counters.abandoned,
+                );
+                let kind = if after.0 > before.0 {
+                    RecordedKind::TxSubmitted
+                } else if after.1 > before.1 {
+                    RecordedKind::TxRejected
+                } else if after.2 > before.2 {
+                    RecordedKind::Cancelled
+                } else if after.3 > before.3 {
+                    RecordedKind::Abandoned
+                } else {
+                    unreachable!("complete_slot always advances exactly one counter")
+                };
+                // Resolve identity now, against the still-fresh slice,
+                // rather than deferring to `drain_generated_events`: a
+                // submitted frame stays live (only
+                // `complete_generated_submissions` later releases it, once
+                // the simulated hardware actually completes it), but a
+                // rejected/cancelled/abandoned one is released immediately,
+                // matching the real pool taking it back immediately — the
+                // very next `allocate()` in the same batch may reuse the
+                // same address, as the suite's own
+                // `commit_cancel_and_abandon_bind_exact_lengths` expects.
+                let identity = &batch.core.umem[start..end];
+                let frame = if kind == RecordedKind::TxSubmitted {
+                    observer.borrow().observe(identity)
+                } else {
+                    observer.borrow_mut().terminal(identity)
+                };
+                if kind == RecordedKind::TxSubmitted {
+                    pending.borrow_mut().push_back(PendingSubmission {
+                        resource,
+                        address,
+                        frame,
+                    });
+                }
+                events.borrow_mut().push_back(RecordedGeneratedEvent {
+                    egress,
+                    resource,
+                    frame,
+                    bytes,
+                    kind,
+                });
+            }
+        }
+
+        /// Thin `LeaseObserver` delegate to the same `Rc<RefCell<Observer>>`
+        /// every batch/slot `FakeGeneratedIo` hands out already shares —
+        /// identity must be one single shared table, not a second, unrelated
+        /// one, since `complete()` above already binds/releases through it
+        /// directly. A distinct type (rather than implementing
+        /// `LeaseObserver` on `FakeGeneratedIo` itself) is what lets
+        /// `io_and_observer` below return two disjoint field borrows instead
+        /// of trying to mutably borrow one field twice.
+        struct ObserverHandle(Rc<RefCell<Observer>>);
+
+        impl LeaseObserver for ObserverHandle {
+            fn bind(&mut self, bytes: &[u8], requested_len: usize) -> LiveFrame {
+                self.0.borrow_mut().bind(bytes, requested_len)
+            }
+
+            fn observe(&self, bytes: &[u8]) -> LiveFrame {
+                self.0.borrow().observe(bytes)
+            }
+        }
+
+        struct XdpGeneratedHarness {
+            io: FakeGeneratedIo,
+            observer: ObserverHandle,
+        }
+
+        impl GeneratedHarness for XdpGeneratedHarness {
+            type Io = FakeGeneratedIo;
+            type Observer = ObserverHandle;
+
+            fn new() -> Self {
+                let observer = Rc::new(RefCell::new(Observer::default()));
+                Self {
+                    io: FakeGeneratedIo::new(Rc::clone(&observer)),
+                    observer: ObserverHandle(observer),
+                }
+            }
+
+            fn io_and_observer(&mut self) -> (&mut Self::Io, &mut Self::Observer) {
+                (&mut self.io, &mut self.observer)
+            }
+
+            fn set_generated_allocation_budget(&mut self, budget: usize) {
+                self.io.allocation_budget = Some(budget);
+            }
+
+            fn set_generated_max_frame(&mut self, max_frame: usize) {
+                self.io.max_frame = Some(max_frame);
+            }
+
+            fn set_generated_accept_budget(&mut self, budget: usize) {
+                assert_eq!(
+                    budget, 1,
+                    "this harness's TX ring is fixed at capacity 1 (see TX_RING_ENTRIES); \
+                     every wired test asks for exactly that budget"
+                );
+            }
+
+            fn drain_generated_events(&mut self) -> Vec<GeneratedEvent> {
+                let recorded: Vec<RecordedGeneratedEvent> =
+                    self.io.events.borrow_mut().drain(..).collect();
+                recorded
+                    .into_iter()
+                    .map(|event| {
+                        let kind = match event.kind {
+                            RecordedKind::TxSubmitted => GeneratedEventKind::TxSubmitted {
+                                endpoint: event.resource.endpoint(),
+                                descriptor_len: event.bytes.len(),
+                            },
+                            RecordedKind::TxRejected => GeneratedEventKind::TxRejected {
+                                attempted_egress: event.egress,
+                                endpoint: Some(event.resource.endpoint()),
+                            },
+                            RecordedKind::Cancelled => {
+                                GeneratedEventKind::Reclaimed(GeneratedReclaim::Cancelled)
+                            }
+                            RecordedKind::Abandoned => {
+                                GeneratedEventKind::Reclaimed(GeneratedReclaim::Abandoned)
+                            }
+                        };
+                        GeneratedEvent {
+                            frame: event.frame,
+                            egress: event.egress,
+                            bytes: event.bytes,
+                            kind,
+                        }
+                    })
+                    .collect()
+            }
+        }
+
+        impl GeneratedCompletionHarness for XdpGeneratedHarness {
+            fn complete_generated_submissions(&mut self) -> Vec<TxCompletion> {
+                let pending: Vec<PendingSubmission> =
+                    self.io.pending.borrow_mut().drain(..).collect();
+                let mut completions = Vec::with_capacity(pending.len());
+                for submission in pending {
+                    let harness = self.io.resource_mut(submission.resource);
+                    // Simulates the kernel acknowledging the TX descriptor:
+                    // writes the frame's address into the completion ring,
+                    // exactly as `Harness::kernel_publish_rx` simulates an
+                    // RX descriptor above. `reclaim_completions` is the same
+                    // production method the live resource calls every batch.
+                    harness.kernel_publish_completion(submission.address);
+                    let mut core = harness.core(BatchState::Maintenance);
+                    core.reclaim_completions()
+                        .expect("simulated completion ring entry is always well-formed");
+                    self.observer
+                        .0
+                        .borrow_mut()
+                        .release(submission.frame.visible_address);
+                    completions.push(TxCompletion {
+                        frame: submission.frame,
+                        endpoint: submission.resource.endpoint(),
+                    });
+                }
+                completions
+            }
+        }
+
+        impl GeneratedFinitePoolHarness for XdpGeneratedHarness {
+            fn free_generated_frames(&self) -> usize {
+                self.io.lan.ownership.free_generated_count()
+                    + self.io.wan.ownership.free_generated_count()
+            }
+        }
+
+        impl GeneratedCqPoolHarness for XdpGeneratedHarness {
+            fn prefer_generated_frame(&mut self, _frame_id: u64) {
+                // Not needed: `XdpOwnership::next_free_generated` always
+                // returns the lowest free generated-pool index, and every
+                // `GeneratedCqPoolHarness` case this harness wires only ever
+                // has one frame free at the point it calls this (the one it
+                // just observed returning to the pool), so that frame is
+                // already the only, and therefore preferred, candidate.
+            }
+        }
+
+        #[test]
+        fn generated_empty_session_has_zero_accounting() {
+            generated::empty_session_has_zero_accounting::<XdpGeneratedHarness>();
+        }
+
+        #[test]
+        fn generated_allocation_failures_bind_only_successful_ownership() {
+            generated::allocation_failures_bind_only_successful_ownership::<XdpGeneratedHarness>();
+        }
+
+        #[test]
+        fn generated_commit_cancel_and_abandon_bind_exact_lengths() {
+            generated::commit_cancel_and_abandon_bind_exact_lengths::<XdpGeneratedHarness>();
+        }
+
+        // `generated::partial_reject_reclaims_exact_tokens` is deliberately
+        // not wired. It commits 3 frames back-to-back with `set_generated_
+        // accept_budget(1)`, expecting `assert_distinct_live` — a *strict*
+        // check that all 3 addresses differ, unlike
+        // `commit_cancel_and_abandon_bind_exact_lengths`'s own reuse-
+        // tolerant `assert_distinct_cycles`. `XdpOwnership::
+        // next_free_generated` always returns the lowest free generated-
+        // pool index; commit #2's real, immediate ring-full rejection frees
+        // its frame back to the pool before `allocate()` #3 runs, and that
+        // freed index is always lower than every still-untouched one, so
+        // #3 always reuses it — a real, deterministic, pool-size-
+        // independent property of this crate's own allocator, not an
+        // artifact of this wiring's fixed one-entry TX ring. A pool that
+        // returns freed frames to the *back* of a FIFO order instead (as
+        // `ruster-io-dpdk`'s ring-backed mempool does, which is why the
+        // same scenario there never reuses a frame within one small test)
+        // would not hit this. See the written report.
+
+        #[test]
+        fn generated_sessions_bind_concrete_endpoints() {
+            generated::sessions_bind_concrete_endpoints::<XdpGeneratedHarness>();
+        }
+
+        #[test]
+        fn generated_completion_advances_the_exact_submitted_token() {
+            generated::completion_advances_the_exact_submitted_token::<XdpGeneratedHarness>();
+        }
+
+        #[test]
+        fn generated_cq_return_releases_same_generated_frame_with_new_generation() {
+            generated::cq_return_releases_same_generated_frame_with_new_generation::<
+                XdpGeneratedHarness,
+            >();
+        }
+
+        #[test]
+        fn generated_dropped_batch_accounts_generated_and_cannot_carry_to_next_egress() {
+            generated::dropped_batch_accounts_generated_and_cannot_carry_to_next_egress::<
+                XdpGeneratedHarness,
+            >();
+        }
     }
 }

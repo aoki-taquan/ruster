@@ -7,3 +7,6 @@ publish.workspace = true
 
 [dependencies]
 ruster-core = { path = "../core" }
+
+[dev-dependencies]
+ruster-io-conformance = { path = "../io-conformance" }
