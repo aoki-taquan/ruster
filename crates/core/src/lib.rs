@@ -100,9 +100,10 @@ pub use packet::{
 pub use pmtu::{PmtuCache, PmtuLearnOutcome, PmtuSlot, PMTU_STALE_MS};
 pub use resolution::{
     build_arp_announcement, dispatch_host_unreachable_failures, execute_arp_announcement,
-    execute_one_arp_request, execute_one_held_datagram, poll_resolution_timers,
-    ArpAnnouncementAction, ArpAnnouncementKind, ArpRequestAction, ArpRequestBuildError,
-    ControlDisposition, DynamicNeighborScanReport, DynamicNeighborSlot, ExecuteArpRequestError,
+    execute_one_arp_request, execute_one_held_datagram, poll_resolution_timers, AcdClaim,
+    AcdConflictEvent, AcdCounters, AcdPhase, AcdRandom, AcdStartError, ArpAnnouncementAction,
+    ArpAnnouncementKind, ArpRequestAction, ArpRequestBuildError, ControlDisposition,
+    DynamicNeighborScanReport, DynamicNeighborSlot, ExecuteArpRequestError,
     ExecuteHeldDatagramError, GeneratedArpReport, GeneratedArpTrace, GeneratedHeldDatagramTrace,
     GeneratedHeldDatagramTraceSink, GeneratedTraceSink, HeldDatagramBuildError, HeldDatagramReport,
     HoldDestination, MonotonicMillis, NoGeneratedHeldDatagramTrace, NoGeneratedTrace,
@@ -114,8 +115,11 @@ pub use resolution::{
     ResolutionPolicy, ResolutionPolicyError, ResolutionPublicationError,
     ResolutionPublicationPermit, ResolutionPublicationReport, ResolutionResult, ResolutionRuntime,
     ResolutionStateSlot, ResolutionStatus, ResolutionTimerError, ResolutionTimerReport,
-    ResolutionTimerTrace, ResolutionTimerTraceSink, StaticReconcileReport, ARP_REQUEST_FRAME_LEN,
-    MAX_FRAGMENTS_PER_DATAGRAM, RESOLUTION_HOLD_MAX_FRAME_LEN,
+    ResolutionTimerTrace, ResolutionTimerTraceSink, StaticReconcileReport,
+    ACD_ANNOUNCE_INTERVAL_MS, ACD_ANNOUNCE_NUM, ACD_ANNOUNCE_WAIT_MS, ACD_DEFEND_INTERVAL_MS,
+    ACD_MAX_CONFLICTS, ACD_PROBE_MAX_MS, ACD_PROBE_MIN_MS, ACD_PROBE_NUM, ACD_PROBE_WAIT_MS,
+    ACD_RATE_LIMIT_INTERVAL_MS, ARP_REQUEST_FRAME_LEN, MAX_FRAGMENTS_PER_DATAGRAM,
+    RESOLUTION_HOLD_MAX_FRAME_LEN,
 };
 pub use route::{
     IfId, Interface, Ipv4Address, Ipv4Mtu, Ipv4MtuError, LocalIpv4Binding, Neighbor, Route,

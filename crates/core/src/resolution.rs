@@ -3,7 +3,8 @@ use std::{marker::PhantomData, rc::Rc};
 use crate::{
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,
     Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorRuntime, IfId,
-    Ipv4Address, MacAddress, ARP_ETHERTYPE, ICMPV4_ERROR_MAX_QUOTE_LEN, IPV4_ETHERTYPE,
+    Ipv4Address, MacAddress, ValidatedArp, ARP_ETHERTYPE, ICMPV4_ERROR_MAX_QUOTE_LEN,
+    IPV4_ETHERTYPE,
 };
 
 pub const ARP_REQUEST_FRAME_LEN: usize = 60;
@@ -3105,12 +3106,387 @@ fn build_arp_request(frame: &mut [u8], action: ArpRequestAction) {
     frame[38..42].copy_from_slice(&action.target_ip.octets());
 }
 
+/// RFC 5227 §2.1 fixed ACD timing parameters, in milliseconds (and counts).
+///
+/// These are the RFC's own constants, not deployment policy: unlike
+/// [`ResolutionPolicy`] they are not configurable.
+pub const ACD_PROBE_WAIT_MS: u64 = 1_000;
+pub const ACD_PROBE_NUM: u32 = 3;
+pub const ACD_PROBE_MIN_MS: u64 = 1_000;
+pub const ACD_PROBE_MAX_MS: u64 = 2_000;
+pub const ACD_ANNOUNCE_WAIT_MS: u64 = 2_000;
+pub const ACD_ANNOUNCE_NUM: u32 = 2;
+pub const ACD_ANNOUNCE_INTERVAL_MS: u64 = 2_000;
+/// RFC 5227 §2.4: at most one defending announcement per address per this
+/// many milliseconds.
+pub const ACD_DEFEND_INTERVAL_MS: u64 = 10_000;
+/// RFC 5227 §2.1: once a claim has hit this many conflicts, the next
+/// [`AcdClaim::start`] is limited to once per [`ACD_RATE_LIMIT_INTERVAL_MS`].
+pub const ACD_MAX_CONFLICTS: u32 = 10;
+pub const ACD_RATE_LIMIT_INTERVAL_MS: u64 = 60_000;
+
+/// A deterministic, explicitly-seeded source for the RFC 5227 §2.1 random
+/// probe delays.
+///
+/// The datapath must never consult a global or wall-clock RNG, so every
+/// [`AcdClaim`] carries its own seed and produces a reproducible sequence
+/// from it. This is the same xorshift64 construction the deterministic fuzz
+/// tests use (see `deterministic_fuzz_smoke.rs`), so a caller that reuses a
+/// seed can predict the exact delay sequence in a test.
+#[derive(Clone, Copy, Debug)]
+pub struct AcdRandom {
+    state: u64,
+}
+
+impl AcdRandom {
+    /// Builds a generator from `seed`. Zero is folded to a fixed nonzero
+    /// value: xorshift64 never leaves the all-zero state, so a zero seed
+    /// would freeze the sequence.
+    #[must_use]
+    pub const fn new(seed: u64) -> Self {
+        Self {
+            state: if seed == 0 {
+                0x9e37_79b9_7f4a_7c15
+            } else {
+                seed
+            },
+        }
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let mut value = self.state;
+        value ^= value << 13;
+        value ^= value >> 7;
+        value ^= value << 17;
+        self.state = value;
+        value
+    }
+
+    /// One draw uniform in `[low, high]` milliseconds.
+    fn uniform_ms(&mut self, low: u64, high: u64) -> u64 {
+        let span = high - low + 1;
+        low + self.next_u64() % span
+    }
+}
+
+/// RFC 5227 §2.1 Address Conflict Detection state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcdPhase {
+    /// Not attempting to acquire or defend the address.
+    Idle,
+    /// Sending [`ACD_PROBE_NUM`] probes, [`ACD_PROBE_MIN_MS`]..
+    /// [`ACD_PROBE_MAX_MS`] apart.
+    Probing,
+    /// Probing found no conflict; sending [`ACD_ANNOUNCE_NUM`]
+    /// announcements [`ACD_ANNOUNCE_INTERVAL_MS`] apart.
+    Announcing,
+    /// Announcing completed: the address is in use on this link and is
+    /// defended per RFC 5227 §2.4.
+    Claimed,
+    /// A conflict ended the claim (probing/announcing conflict, or ceding a
+    /// claim per §2.4 (b)). [`AcdClaim::start`] is subject to §2.1 rate
+    /// limiting once [`ACD_MAX_CONFLICTS`] is reached.
+    Conflicted,
+}
+
+/// Typed counters for every [`AcdClaim`] state transition.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AcdCounters {
+    pub probes_sent: usize,
+    pub announcements_sent: usize,
+    pub claimed: usize,
+    pub probe_conflicts: usize,
+    pub defends_sent: usize,
+    pub ceded: usize,
+    pub rate_limited_starts: usize,
+    pub clock_regressions: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcdStartError {
+    /// RFC 5227 §2.1: [`ACD_MAX_CONFLICTS`] was reached and less than
+    /// [`ACD_RATE_LIMIT_INTERVAL_MS`] has passed since the last attempt.
+    RateLimited,
+    /// Time moved backwards, so no delay from `now` can be scheduled.
+    ClockRegression,
+}
+
+/// What [`AcdClaim::observe_arp`] did with one inbound ARP packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AcdConflictEvent {
+    /// The packet was not a conflict for this claim's address.
+    NoConflict,
+    /// RFC 5227 §2.1.1: a conflict arrived while probing or announcing, so
+    /// the address must not be claimed.
+    ProbeConflict,
+    /// RFC 5227 §2.4 (a): a single defending announcement was sent.
+    Defended(ArpAnnouncementAction),
+    /// RFC 5227 §2.4 (b): a second conflict inside [`ACD_DEFEND_INTERVAL_MS`]
+    /// of the last defence, so the address is ceded instead of defended
+    /// again.
+    Ceded,
+}
+
+/// RFC 5227 Address Conflict Detection for one address on one link.
+///
+/// Owns no packet storage: [`AcdClaim::poll`] and [`AcdClaim::observe_arp`]
+/// return the [`ArpAnnouncementAction`] to send, and the caller drives it
+/// through [`execute_arp_announcement`] exactly as it already does for a
+/// plain probe or announcement. Scheduling follows the same explicit-tick,
+/// caller-supplied-[`MonotonicMillis`] idiom as
+/// [`ResolutionRuntime::poll_dynamic_neighbors`]: nothing here reads a wall
+/// clock, and [`AcdRandom`] stands in for the RFC's random delays so the
+/// whole sequence stays reproducible from a seed.
+#[derive(Clone, Copy, Debug)]
+pub struct AcdClaim {
+    egress: IfId,
+    source_mac: MacAddress,
+    address: Ipv4Address,
+    phase: AcdPhase,
+    rng: AcdRandom,
+    next_action_at: Option<MonotonicMillis>,
+    probes_sent: u32,
+    announcements_sent: u32,
+    last_defended_at: Option<MonotonicMillis>,
+    last_restart_at: Option<MonotonicMillis>,
+    conflicts: u32,
+    last_now: Option<MonotonicMillis>,
+    counters: AcdCounters,
+}
+
+impl AcdClaim {
+    /// Builds an idle claim for `address` on `egress`. Call
+    /// [`AcdClaim::start`] to begin probing.
+    ///
+    /// `seed` feeds the injected RNG behind the RFC 5227 §2.1 probe delays;
+    /// see [`AcdRandom`].
+    #[must_use]
+    pub const fn new(
+        egress: IfId,
+        source_mac: MacAddress,
+        address: Ipv4Address,
+        seed: u64,
+    ) -> Self {
+        Self {
+            egress,
+            source_mac,
+            address,
+            phase: AcdPhase::Idle,
+            rng: AcdRandom::new(seed),
+            next_action_at: None,
+            probes_sent: 0,
+            announcements_sent: 0,
+            last_defended_at: None,
+            last_restart_at: None,
+            conflicts: 0,
+            last_now: None,
+            counters: AcdCounters {
+                probes_sent: 0,
+                announcements_sent: 0,
+                claimed: 0,
+                probe_conflicts: 0,
+                defends_sent: 0,
+                ceded: 0,
+                rate_limited_starts: 0,
+                clock_regressions: 0,
+            },
+        }
+    }
+
+    fn observe(&mut self, now: MonotonicMillis) -> bool {
+        if self.last_now.is_some_and(|last| now < last) {
+            self.counters.clock_regressions += 1;
+            return false;
+        }
+        self.last_now = Some(now);
+        true
+    }
+
+    /// (Re)starts §2.1 probing from `now`.
+    ///
+    /// The wait before the first probe is a random draw in
+    /// `[0, PROBE_WAIT]`, the RFC's own jitter to keep a fleet of hosts that
+    /// boot together from probing in lockstep. Once this claim has
+    /// accumulated [`ACD_MAX_CONFLICTS`] conflicts, restarts are limited to
+    /// one per [`ACD_RATE_LIMIT_INTERVAL_MS`].
+    pub fn start(&mut self, now: MonotonicMillis) -> Result<(), AcdStartError> {
+        if !self.observe(now) {
+            return Err(AcdStartError::ClockRegression);
+        }
+        if self.conflicts >= ACD_MAX_CONFLICTS {
+            if let Some(last) = self.last_restart_at {
+                if now.0.saturating_sub(last.0) < ACD_RATE_LIMIT_INTERVAL_MS {
+                    self.counters.rate_limited_starts += 1;
+                    return Err(AcdStartError::RateLimited);
+                }
+            }
+        }
+        self.last_restart_at = Some(now);
+        self.phase = AcdPhase::Probing;
+        self.probes_sent = 0;
+        self.announcements_sent = 0;
+        self.next_action_at = Some(MonotonicMillis(
+            now.0
+                .saturating_add(self.rng.uniform_ms(0, ACD_PROBE_WAIT_MS)),
+        ));
+        Ok(())
+    }
+
+    fn action(&self, kind: ArpAnnouncementKind) -> ArpAnnouncementAction {
+        ArpAnnouncementAction {
+            kind,
+            egress: self.egress,
+            source_mac: self.source_mac,
+            address: self.address,
+        }
+    }
+
+    /// Advances the state machine to `now` and returns the probe or
+    /// announcement due to be sent, if any.
+    ///
+    /// Call this on every timer tick, the way
+    /// [`ResolutionRuntime::poll_dynamic_neighbors`] is polled. It is a
+    /// no-op outside [`AcdPhase::Probing`]/[`AcdPhase::Announcing`], or
+    /// before the next scheduled action is due.
+    pub fn poll(&mut self, now: MonotonicMillis) -> Option<ArpAnnouncementAction> {
+        if !self.observe(now) {
+            return None;
+        }
+        let deadline = self.next_action_at?;
+        if now < deadline {
+            return None;
+        }
+        match self.phase {
+            AcdPhase::Probing => {
+                self.probes_sent += 1;
+                self.counters.probes_sent += 1;
+                let action = self.action(ArpAnnouncementKind::Probe);
+                if self.probes_sent >= ACD_PROBE_NUM {
+                    self.phase = AcdPhase::Announcing;
+                    self.next_action_at =
+                        Some(MonotonicMillis(now.0.saturating_add(ACD_ANNOUNCE_WAIT_MS)));
+                } else {
+                    self.next_action_at =
+                        Some(MonotonicMillis(now.0.saturating_add(
+                            self.rng.uniform_ms(ACD_PROBE_MIN_MS, ACD_PROBE_MAX_MS),
+                        )));
+                }
+                Some(action)
+            }
+            AcdPhase::Announcing => {
+                self.announcements_sent += 1;
+                self.counters.announcements_sent += 1;
+                let action = self.action(ArpAnnouncementKind::Announcement);
+                if self.announcements_sent >= ACD_ANNOUNCE_NUM {
+                    self.phase = AcdPhase::Claimed;
+                    self.next_action_at = None;
+                    self.counters.claimed += 1;
+                } else {
+                    self.next_action_at = Some(MonotonicMillis(
+                        now.0.saturating_add(ACD_ANNOUNCE_INTERVAL_MS),
+                    ));
+                }
+                Some(action)
+            }
+            AcdPhase::Idle | AcdPhase::Claimed | AcdPhase::Conflicted => None,
+        }
+    }
+
+    /// RFC 5227 §2.1.1: whether `arp` conflicts with the address this claim
+    /// is probing for or holds.
+    ///
+    /// A conflict is either an ordinary ARP packet (request or reply) whose
+    /// sender protocol address is this claim's address, or an ARP probe
+    /// (sender protocol all-zero) whose target protocol address is this
+    /// claim's address and whose sender hardware address is not ours —
+    /// another host probing for the same address concurrently.
+    fn conflicts_with(&self, arp: &ValidatedArp) -> bool {
+        if arp.sender_protocol == self.address {
+            return true;
+        }
+        arp.sender_protocol.is_unspecified()
+            && arp.target_protocol == self.address
+            && arp.sender_hardware != self.source_mac
+    }
+
+    /// RFC 5227 §2.1.1 conflict detection and §2.4 defend policy.
+    ///
+    /// While probing or announcing, any conflict ends the claim before it is
+    /// made: the address must not be used. Once [`AcdPhase::Claimed`], a
+    /// conflict is defended once per [`ACD_DEFEND_INTERVAL_MS`]; a further
+    /// conflict inside that window cedes the address instead of defending
+    /// again (RFC 5227 §2.4 (b)).
+    pub fn observe_arp(&mut self, arp: &ValidatedArp, now: MonotonicMillis) -> AcdConflictEvent {
+        if !self.observe(now) {
+            return AcdConflictEvent::NoConflict;
+        }
+        if !self.conflicts_with(arp) {
+            return AcdConflictEvent::NoConflict;
+        }
+        match self.phase {
+            AcdPhase::Probing | AcdPhase::Announcing => {
+                self.phase = AcdPhase::Conflicted;
+                self.next_action_at = None;
+                self.conflicts += 1;
+                self.counters.probe_conflicts += 1;
+                AcdConflictEvent::ProbeConflict
+            }
+            AcdPhase::Claimed => {
+                self.conflicts += 1;
+                let must_cede = self
+                    .last_defended_at
+                    .is_some_and(|last| now.0.saturating_sub(last.0) < ACD_DEFEND_INTERVAL_MS);
+                if must_cede {
+                    self.phase = AcdPhase::Conflicted;
+                    self.counters.ceded += 1;
+                    AcdConflictEvent::Ceded
+                } else {
+                    self.last_defended_at = Some(now);
+                    self.counters.defends_sent += 1;
+                    AcdConflictEvent::Defended(self.action(ArpAnnouncementKind::Announcement))
+                }
+            }
+            AcdPhase::Idle | AcdPhase::Conflicted => AcdConflictEvent::NoConflict,
+        }
+    }
+
+    #[must_use]
+    pub const fn phase(&self) -> AcdPhase {
+        self.phase
+    }
+
+    #[must_use]
+    pub const fn address(&self) -> Ipv4Address {
+        self.address
+    }
+
+    #[must_use]
+    pub const fn egress(&self) -> IfId {
+        self.egress
+    }
+
+    #[must_use]
+    pub const fn counters(&self) -> AcdCounters {
+        self.counters
+    }
+
+    /// Total conflicts observed across the life of this claim, including
+    /// ones from before the most recent [`AcdClaim::start`]. Drives the
+    /// [`ACD_MAX_CONFLICTS`] rate limit.
+    #[must_use]
+    pub const fn conflict_count(&self) -> u32 {
+        self.conflicts
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use super::*;
-    use crate::{ForwardingSnapshot, Interface, Ipv4Mtu, LocalIpv4Binding, Neighbor, Route};
+    use crate::{
+        ArpOpcode, ForwardingSnapshot, Interface, Ipv4Mtu, LocalIpv4Binding, Neighbor, Route,
+    };
 
     const WAN: IfId = IfId(2);
     const SOURCE_IP: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 1]);
@@ -7140,5 +7516,264 @@ mod tests {
         assert_eq!(report.scanned, 0);
         assert_eq!(report.expired, 0);
         assert_eq!(runtime.dynamic_neighbor_count(), 1);
+    }
+
+    fn conflict_from(address: Ipv4Address, sender_hardware: MacAddress) -> ValidatedArp {
+        ValidatedArp {
+            opcode: ArpOpcode::Reply,
+            sender_hardware,
+            sender_protocol: address,
+            target_protocol: SOURCE_IP,
+        }
+    }
+
+    /// Drives a fresh claim past every timing gate to `Claimed`, without
+    /// caring about the exact jittered deadlines: each step advances by more
+    /// than the longest possible gap (`ACD_PROBE_MAX_MS` or
+    /// `ACD_ANNOUNCE_INTERVAL_MS`), so every deadline is always already due.
+    ///
+    /// Returns the `now` the claim last observed, since [`AcdClaim`] rejects
+    /// any earlier timestamp as a clock regression: a caller driving this
+    /// claim further must keep advancing from here, not restart from zero.
+    fn run_to_claimed(address: Ipv4Address, seed: u64) -> (AcdClaim, u64) {
+        let mut claim = AcdClaim::new(WAN, SOURCE_MAC, address, seed);
+        claim.start(MonotonicMillis(0)).expect("clean start");
+        let mut now = 0u64;
+        for _ in 0..(ACD_PROBE_NUM + ACD_ANNOUNCE_NUM + 1) {
+            now += 5_000;
+            claim.poll(MonotonicMillis(now));
+            if claim.phase() == AcdPhase::Claimed {
+                break;
+            }
+        }
+        assert_eq!(
+            claim.phase(),
+            AcdPhase::Claimed,
+            "helper must reach Claimed"
+        );
+        (claim, now)
+    }
+
+    #[test]
+    fn full_probe_announce_claim_sequence_matches_rfc5227_timing_and_bytes() {
+        let seed = 0x0acd_0000_0000_0001;
+        let mut claim = AcdClaim::new(WAN, SOURCE_MAC, target(50), seed);
+        claim.start(MonotonicMillis(0)).expect("clean start");
+        assert_eq!(claim.phase(), AcdPhase::Probing);
+
+        // Mirror the injected RNG so the exact draws this claim will make
+        // are known, pinning both the state sequence and the timing.
+        let mut rng = AcdRandom::new(seed);
+        let first_wait = rng.uniform_ms(0, ACD_PROBE_WAIT_MS);
+        let probe_gap_1 = rng.uniform_ms(ACD_PROBE_MIN_MS, ACD_PROBE_MAX_MS);
+        let probe_gap_2 = rng.uniform_ms(ACD_PROBE_MIN_MS, ACD_PROBE_MAX_MS);
+        assert!(first_wait <= ACD_PROBE_WAIT_MS);
+        assert!((ACD_PROBE_MIN_MS..=ACD_PROBE_MAX_MS).contains(&probe_gap_1));
+        assert!((ACD_PROBE_MIN_MS..=ACD_PROBE_MAX_MS).contains(&probe_gap_2));
+
+        let mut now = first_wait;
+        let probe1 = claim
+            .poll(MonotonicMillis(now))
+            .expect("PROBE_WAIT elapsed");
+        assert_eq!(probe1.kind, ArpAnnouncementKind::Probe);
+        assert_eq!(probe1.address, target(50));
+        let mut frame = [0u8; ARP_REQUEST_FRAME_LEN];
+        build_arp_announcement(&mut frame, probe1);
+        assert_eq!(
+            &frame[28..32],
+            &[0, 0, 0, 0],
+            "a probe's sender protocol address is all-zero, RFC 5227 §2.1.1"
+        );
+        assert_eq!(
+            &frame[38..42],
+            &target(50).octets(),
+            "the address under probe"
+        );
+        assert_eq!(claim.phase(), AcdPhase::Probing);
+        assert_eq!(claim.counters().probes_sent, 1);
+
+        assert_eq!(
+            claim.poll(MonotonicMillis(now + probe_gap_1 - 1)),
+            None,
+            "PROBE_MIN has not elapsed"
+        );
+        now += probe_gap_1;
+        let probe2 = claim.poll(MonotonicMillis(now)).expect("second probe due");
+        assert_eq!(probe2.kind, ArpAnnouncementKind::Probe);
+        assert_eq!(claim.phase(), AcdPhase::Probing);
+        assert_eq!(claim.counters().probes_sent, 2);
+
+        now += probe_gap_2;
+        let probe3 = claim.poll(MonotonicMillis(now)).expect("third probe due");
+        assert_eq!(probe3.kind, ArpAnnouncementKind::Probe);
+        assert_eq!(claim.counters().probes_sent, 3, "exactly PROBE_NUM probes");
+        assert_eq!(claim.phase(), AcdPhase::Announcing, "probing is complete");
+
+        assert_eq!(
+            claim.poll(MonotonicMillis(now + ACD_ANNOUNCE_WAIT_MS - 1)),
+            None,
+            "ANNOUNCE_WAIT has not elapsed"
+        );
+        now += ACD_ANNOUNCE_WAIT_MS;
+        let announce1 = claim
+            .poll(MonotonicMillis(now))
+            .expect("first announcement due");
+        assert_eq!(announce1.kind, ArpAnnouncementKind::Announcement);
+        let mut frame = [0u8; ARP_REQUEST_FRAME_LEN];
+        build_arp_announcement(&mut frame, announce1);
+        assert_eq!(
+            &frame[28..32],
+            &target(50).octets(),
+            "an announcement's sender protocol is the claimed address, RFC 5227 §2.3"
+        );
+        assert_eq!(&frame[38..42], &target(50).octets());
+        assert_eq!(claim.phase(), AcdPhase::Announcing);
+        assert_eq!(claim.counters().announcements_sent, 1);
+
+        assert_eq!(
+            claim.poll(MonotonicMillis(now + ACD_ANNOUNCE_INTERVAL_MS - 1)),
+            None,
+            "ANNOUNCE_INTERVAL has not elapsed"
+        );
+        now += ACD_ANNOUNCE_INTERVAL_MS;
+        let announce2 = claim
+            .poll(MonotonicMillis(now))
+            .expect("second announcement due");
+        assert_eq!(announce2.kind, ArpAnnouncementKind::Announcement);
+        assert_eq!(
+            claim.counters().announcements_sent,
+            2,
+            "exactly ANNOUNCE_NUM announcements"
+        );
+        assert_eq!(claim.phase(), AcdPhase::Claimed);
+        assert_eq!(claim.counters().claimed, 1);
+
+        assert_eq!(
+            claim.poll(MonotonicMillis(now + 1_000_000)),
+            None,
+            "a claimed address has nothing further scheduled"
+        );
+    }
+
+    #[test]
+    fn a_conflict_while_probing_prevents_the_claim() {
+        let mut claim = AcdClaim::new(WAN, SOURCE_MAC, target(51), 0x1111_2222_3333_4444);
+        claim.start(MonotonicMillis(0)).expect("clean start");
+        claim.poll(MonotonicMillis(10_000));
+        assert_eq!(claim.phase(), AcdPhase::Probing);
+
+        let attacker = MacAddress([9, 9, 9, 9, 9, 9]);
+        let event = claim.observe_arp(
+            &conflict_from(target(51), attacker),
+            MonotonicMillis(10_500),
+        );
+        assert_eq!(event, AcdConflictEvent::ProbeConflict);
+        assert_eq!(claim.phase(), AcdPhase::Conflicted);
+        assert_eq!(claim.counters().probe_conflicts, 1);
+        assert_eq!(claim.conflict_count(), 1);
+
+        assert_eq!(
+            claim.poll(MonotonicMillis(10_000_000)),
+            None,
+            "a conflicted probe never reaches Claimed"
+        );
+        assert_eq!(claim.counters().claimed, 0);
+    }
+
+    #[test]
+    fn a_single_conflict_while_claimed_produces_exactly_one_defence() {
+        let (mut claim, now) = run_to_claimed(target(52), 0x2222_3333_4444_5555);
+        let attacker = MacAddress([7, 7, 7, 7, 7, 7]);
+
+        let event = claim.observe_arp(
+            &conflict_from(target(52), attacker),
+            MonotonicMillis(now + 1),
+        );
+        match event {
+            AcdConflictEvent::Defended(action) => {
+                assert_eq!(action.kind, ArpAnnouncementKind::Announcement);
+                assert_eq!(action.address, target(52));
+            }
+            other => panic!("expected a defence, got {other:?}"),
+        }
+        assert_eq!(
+            claim.phase(),
+            AcdPhase::Claimed,
+            "defending keeps the claim"
+        );
+        assert_eq!(claim.counters().defends_sent, 1);
+        assert_eq!(claim.counters().ceded, 0);
+    }
+
+    #[test]
+    fn a_second_conflict_inside_defend_interval_cedes_instead_of_defending_again() {
+        let (mut claim, now) = run_to_claimed(target(53), 0x3333_4444_5555_6666);
+        let attacker = MacAddress([7, 7, 7, 7, 7, 7]);
+
+        let first = claim.observe_arp(&conflict_from(target(53), attacker), MonotonicMillis(now));
+        assert!(matches!(first, AcdConflictEvent::Defended(_)));
+
+        let second = claim.observe_arp(
+            &conflict_from(target(53), attacker),
+            MonotonicMillis(now + ACD_DEFEND_INTERVAL_MS - 1),
+        );
+        assert_eq!(second, AcdConflictEvent::Ceded, "RFC 5227 §2.4 (b)");
+        assert_eq!(claim.phase(), AcdPhase::Conflicted);
+        assert_eq!(claim.counters().defends_sent, 1);
+        assert_eq!(claim.counters().ceded, 1);
+    }
+
+    #[test]
+    fn a_conflict_after_defend_interval_defends_again() {
+        let (mut claim, now) = run_to_claimed(target(54), 0x4444_5555_6666_7777);
+        let attacker = MacAddress([7, 7, 7, 7, 7, 7]);
+
+        let first = claim.observe_arp(&conflict_from(target(54), attacker), MonotonicMillis(now));
+        assert!(matches!(first, AcdConflictEvent::Defended(_)));
+
+        let second = claim.observe_arp(
+            &conflict_from(target(54), attacker),
+            MonotonicMillis(now + ACD_DEFEND_INTERVAL_MS),
+        );
+        assert!(
+            matches!(second, AcdConflictEvent::Defended(_)),
+            "DEFEND_INTERVAL has fully elapsed since the last defence"
+        );
+        assert_eq!(claim.phase(), AcdPhase::Claimed);
+        assert_eq!(claim.counters().defends_sent, 2);
+        assert_eq!(claim.counters().ceded, 0);
+    }
+
+    #[test]
+    fn max_conflicts_engages_the_rate_limit_on_the_next_start() {
+        let mut claim = AcdClaim::new(WAN, SOURCE_MAC, target(55), 0x5555_6666_7777_8888);
+        let attacker = MacAddress([7, 7, 7, 7, 7, 7]);
+        let mut now = 0u64;
+        for _ in 0..ACD_MAX_CONFLICTS {
+            claim
+                .start(MonotonicMillis(now))
+                .expect("not yet rate limited");
+            now += 1;
+            let event =
+                claim.observe_arp(&conflict_from(target(55), attacker), MonotonicMillis(now));
+            assert_eq!(event, AcdConflictEvent::ProbeConflict);
+            now += 1;
+        }
+        assert_eq!(claim.conflict_count(), ACD_MAX_CONFLICTS);
+
+        let limited = claim.start(MonotonicMillis(now));
+        assert_eq!(limited, Err(AcdStartError::RateLimited));
+        assert_eq!(claim.counters().rate_limited_starts, 1);
+        assert_eq!(
+            claim.phase(),
+            AcdPhase::Conflicted,
+            "a rate-limited start leaves the claim exactly where it was"
+        );
+
+        now += ACD_RATE_LIMIT_INTERVAL_MS;
+        claim
+            .start(MonotonicMillis(now))
+            .expect("RATE_LIMIT_INTERVAL has elapsed");
+        assert_eq!(claim.phase(), AcdPhase::Probing);
     }
 }
