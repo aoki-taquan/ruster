@@ -642,7 +642,7 @@ mod tests {
         let validated = packet
             .validate(1 << 16)
             .expect("packet with equal snap/wire lengths");
-        assert_eq!(validated.is_truncated(), false);
+        assert!(!validated.is_truncated());
     }
 
     #[test]
@@ -651,6 +651,9 @@ mod tests {
             TxOwnership::from_status(0x80),
             Err(GeometryError::InvalidTxStatus { status: 0x80 })
         );
-        assert_eq!(TxOwnership::from_status(TP_STATUS_SENDING), Ok(TxOwnership::Sending));
+        assert_eq!(
+            TxOwnership::from_status(TP_STATUS_SENDING),
+            Ok(TxOwnership::Sending)
+        );
     }
 }

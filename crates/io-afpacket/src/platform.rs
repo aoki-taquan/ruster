@@ -28,6 +28,16 @@ impl AfPacketPlatform {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn platform_uapi_layout() -> Result<UapiLayout, PlatformError> {
+    crate::sys::validated_uapi_layout()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_uapi_layout() -> Result<UapiLayout, PlatformError> {
+    Err(PlatformError::UnsupportedPlatform)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AfPacketPlatform, UapiLayout};
@@ -62,14 +72,4 @@ mod tests {
 
         assert_eq!(layout, expected);
     }
-}
-
-#[cfg(target_os = "linux")]
-fn platform_uapi_layout() -> Result<UapiLayout, PlatformError> {
-    crate::sys::validated_uapi_layout()
-}
-
-#[cfg(not(target_os = "linux"))]
-fn platform_uapi_layout() -> Result<UapiLayout, PlatformError> {
-    Err(PlatformError::UnsupportedPlatform)
 }
