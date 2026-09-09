@@ -11,6 +11,17 @@
 //! binary exercises `GeneratedPacketIo` and `PacketIo` directly, with no
 //! test-hook methods at all.
 //!
+//! `#![cfg(all(dpdk_available, not(feature = "test-hooks")))]` below makes
+//! this structural rather than a documentation note to remember: Cargo
+//! unifies features workspace-wide per invocation, so
+//! `cargo test --features dpdk,test-hooks` (the command
+//! `tests/backend_conformance.rs` needs) would otherwise silently link this
+//! binary against the test-hooks-instrumented library too and turn a real
+//! measurement into a false, if fully reproducible, failure. With the cfg
+//! gate, that same invocation instead compiles this file to zero tests, and
+//! the correct measuring invocation (below) is the only way to actually run
+//! it.
+//!
 //! # Scope of this measurement
 //!
 //! This can only speak for `ruster-io-dpdk`'s own Rust code, which is
@@ -38,16 +49,12 @@
 //! ```
 //!
 //! Build this target with **exactly** `--features dpdk` in its own
-//! `cargo test`/`--no-run` invocation, never combined with `test-hooks` in
-//! the same command. Cargo unifies features workspace-wide per invocation:
-//! `cargo test --features dpdk,test-hooks` (as used for
-//! `tests/backend_conformance.rs`) would silently link this binary against
-//! the test-hooks-instrumented library too, whose disposition event log
-//! really does allocate once per commit — and this measurement would then
-//! be reporting that instrumentation's cost, not the production hot path,
-//! without any build error to say so.
+//! `cargo test`/`--no-run` invocation. Building it together with
+//! `test-hooks` (as `tests/backend_conformance.rs` needs) does not fail and
+//! does not measure anything either: the cfg gate below degrades it to zero
+//! tests in that configuration instead.
 
-#![cfg(dpdk_available)]
+#![cfg(all(dpdk_available, not(feature = "test-hooks")))]
 #![allow(unsafe_code)]
 
 use std::{
