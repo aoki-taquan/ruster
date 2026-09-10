@@ -419,7 +419,7 @@ std::thread_local! {
 }
 
 /// Returns and resets the current thread's full firewall validation count.
-#[cfg(feature = "validation-test-hooks")]
+#[cfg(any(test, feature = "validation-test-hooks"))]
 #[doc(hidden)]
 pub fn take_full_firewall_validation_count() -> usize {
     FULL_FIREWALL_VALIDATIONS.with(|count| count.replace(0))
@@ -2129,6 +2129,229 @@ mod tests {
             hash_key,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn firewall_ipv4_prefix_prefix_len_returns_the_exact_value() {
+        // Contract: the accessor must return the stored length, not merely a truthy value.
+        let prefix = FirewallIpv4Prefix::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24).unwrap();
+        assert_eq!(prefix.prefix_len(), 24);
+    }
+
+    #[test]
+    fn firewall_port_range_first_and_last_return_the_exact_values() {
+        // Contract: both bounds must be reported exactly, independently of each other.
+        let range = FirewallPortRange::new(1000, 2000).unwrap();
+        assert_eq!(range.first(), 1000);
+        assert_eq!(range.last(), 2000);
+    }
+
+    #[test]
+    fn firewall_config_generation_returns_the_exact_value() {
+        // Contract: `generation()` must echo the constructor argument, not a fixed sentinel.
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 7, hash_key())
+                    .unwrap();
+            assert_eq!(config.generation(), 7);
+        });
+    }
+
+    #[test]
+    fn validated_firewall_owner_rules_returns_the_stored_rules() {
+        // Contract: `rules()` must expose the owner's actual rules, not an empty stand-in.
+        let forwarding = validated_forwarding_owner();
+        let snapshot = forwarding.snapshot();
+        let owner = validated_firewall_owner(&snapshot, 1, hash_key());
+        assert_eq!(
+            owner.rules(),
+            &[rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp
+            )]
+        );
+    }
+
+    #[test]
+    fn take_full_firewall_validation_count_reports_the_exact_call_count() {
+        // Contract: the counter must track the exact number of full validations, and reset to
+        // zero once read, not merely report "some" nonzero value.
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            for _ in 0..3 {
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            }
+            assert_eq!(take_full_firewall_validation_count(), 3);
+            assert_eq!(take_full_firewall_validation_count(), 0);
+        });
+    }
+
+    #[test]
+    fn firewall_state_slot_records_exact_config_generation_and_responder_port() {
+        // Contract: a committed slot must retain the exact publication generation and the
+        // exact responder port from the originating packet, not a fixed sentinel value.
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 7, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 1];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let plan = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Udp, 0), 0)
+                .unwrap();
+            runtime.commit(plan).unwrap();
+            assert_eq!(runtime.states()[0].config_generation(), 7);
+            assert_eq!(runtime.states()[0].responder_port(), 443);
+        });
+    }
+
+    #[test]
+    fn firewall_authority_commitment_binds_the_hash_key() {
+        // Contract: the commitment word is a keyed digest, not a fixed sentinel: two runtimes
+        // that are pristine and identical except for their hash key must disagree on it.
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config_a =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let config_b = FirewallConfig::new(
+                snapshot,
+                &rules,
+                FirewallPolicy::default(),
+                1,
+                rotated_hash_key(),
+            )
+            .unwrap();
+            let mut slots_a = [FirewallStateSlot::default(); 2];
+            let mut slots_b = [FirewallStateSlot::default(); 2];
+            let evidence_a = FirewallRuntime::new(config_a, &mut slots_a).authority_evidence();
+            let evidence_b = FirewallRuntime::new(config_b, &mut slots_b).authority_evidence();
+            assert_ne!(evidence_a.words[6], 0);
+            assert_ne!(evidence_a.words[6], 1);
+            assert_ne!(evidence_a.words[6], evidence_b.words[6]);
+        });
+    }
+
+    #[test]
+    fn firewall_authority_commitment_binds_the_occupied_state_content() {
+        // Contract: the commitment must reflect the actual occupied flows, not merely the hash
+        // key and the lifecycle counters that already appear in the other authority-evidence
+        // words. Two runtimes that reach identical lifecycle words (watermark, runtime epoch,
+        // next slot generation, maintained/recomputed occupied counts) via different flows must
+        // still disagree on the commitment: a commitment that only mixed the hash key and those
+        // counters would pass a weaker version of this test that never varies the flow content.
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots_a = [FirewallStateSlot::default(); 1];
+            let mut slots_b = [FirewallStateSlot::default(); 1];
+            let mut runtime_a = FirewallRuntime::new(config, &mut slots_a);
+            let mut runtime_b = FirewallRuntime::new(config, &mut slots_b);
+
+            let mut packet_b = packet(FirewallProtocol::Udp, 0);
+            packet_b.source_port = 54_321;
+
+            let plan_a = runtime_a
+                .plan_packet(&config, packet(FirewallProtocol::Udp, 0), 0)
+                .unwrap();
+            runtime_a.commit(plan_a).unwrap();
+            let plan_b = runtime_b.plan_packet(&config, packet_b, 0).unwrap();
+            runtime_b.commit(plan_b).unwrap();
+
+            let evidence_a = runtime_a.authority_evidence();
+            let evidence_b = runtime_b.authority_evidence();
+            assert_eq!(&evidence_a.words[..6], &evidence_b.words[..6]);
+            assert_ne!(evidence_a.words[6], evidence_b.words[6]);
+        });
+    }
+
+    #[test]
+    fn firewall_audit_buffer_drop_count_and_clear_are_exact() {
+        // Contract: `dropped_records` must count exactly the records that overflowed capacity,
+        // and `clear` must actually reset both the record log and the drop counter, not be a
+        // no-op.
+        let disposition = FirewallDisposition {
+            verdict: FirewallVerdict::Allow,
+            class: FirewallConnectionClass::New,
+            source: FirewallPolicySource::Rule(FirewallRuleId(1)),
+            matched_action: Some(FirewallAction::AllowStateful),
+            failure: None,
+        };
+        let mut storage = [FirewallAuditRecord::default(); 2];
+        let mut buffer = FirewallAuditBuffer::new(&mut storage);
+        for _ in 0..4 {
+            buffer.record(packet(FirewallProtocol::Udp, 0), disposition);
+        }
+        assert_eq!(buffer.records().len(), 2);
+        assert_eq!(buffer.dropped_records(), 2);
+
+        buffer.clear();
+        assert_eq!(buffer.dropped_records(), 0);
+        assert!(buffer.records().is_empty());
+
+        buffer.record(packet(FirewallProtocol::Udp, 0), disposition);
+        assert_eq!(buffer.records().len(), 1);
+    }
+
+    #[test]
+    fn firewall_plan_packet_live_flow_requires_the_ack_bit_not_any_flag() {
+        // Contract: only an actual ACK bit (0x10) on a live TCP flow may set the forward/reverse
+        // ack observation. A packet carrying unrelated flags (but not ACK) must not be treated
+        // as if it acknowledged the handshake.
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Tcp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 1];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+
+            let opening = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Tcp, 0x02), 0)
+                .unwrap();
+            runtime.commit(opening).unwrap();
+            assert!(!runtime.states()[0].tcp_forward_ack);
+
+            // PSH only, no ACK bit: the live-flow branch runs but must leave both ack
+            // observations untouched.
+            let no_ack = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Tcp, 0x08), 1)
+                .unwrap();
+            runtime.commit(no_ack).unwrap();
+            assert!(!runtime.states()[0].tcp_forward_ack);
+            assert!(!runtime.states()[0].tcp_reverse_ack);
+            assert_eq!(runtime.states()[0].tcp_phase(), FirewallTcpPhase::Opening);
+        });
     }
 
     #[test]
