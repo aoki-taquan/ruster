@@ -748,6 +748,13 @@ impl<'batch, 'syscalls, S: Syscalls> XdpBatchCore<'batch, 'syscalls, S> {
         &mut self.umem[start..end]
     }
 
+    /// Visible payload capacity of one frame: the raw frame size minus the
+    /// data offset every AF_XDP descriptor must start at.
+    pub(crate) fn visible_frame_capacity(&self) -> usize {
+        usize::try_from(self.ownership.frame_size - self.ownership.data_offset)
+            .expect("validated UMEM frame size fits usize")
+    }
+
     /// Borrows the visible bytes of a generated frame reserved by
     /// `reserve_generated_frame`.
     pub(crate) fn generated_bytes_mut(&mut self, address: u64, frame_len: usize) -> &mut [u8] {
@@ -1217,10 +1224,7 @@ impl<'batch, 'syscalls, S: Syscalls> XdpGeneratedBatchWithOps<'batch, 'syscalls,
             self.counters.failed += 1;
             return Err(GeneratedAllocationError::ZeroLength);
         }
-        let visible_capacity =
-            usize::try_from(self.core.ownership.frame_size - self.core.ownership.data_offset)
-                .expect("visible frame size fits");
-        if frame_len > visible_capacity {
+        if frame_len > self.core.visible_frame_capacity() {
             self.counters.failed += 1;
             return Err(GeneratedAllocationError::FrameTooLarge);
         }
@@ -3457,19 +3461,25 @@ mod tests {
                 }
             }
 
-            /// `GeneratedUnknownEgressHarness` is deliberately not wired:
-            /// this crate's `XdpPairGeneratedBatch::allocate` (`aggregate.rs`)
-            /// already fails `allocate()` itself for an egress that matches
-            /// neither pair member (`GeneratedAllocationError::Unavailable`,
-            /// before ever calling into the resource), while the reusable
-            /// suite's `unknown_egress_is_rejected_without_submission`
-            /// expects `allocate()` to succeed and only the eventual
-            /// commit/finish to reject. That is a real, confirmed
-            /// disagreement between this crate's existing pair-level
-            /// behavior and the shared contract every other wired backend
-            /// (`ruster-io-sim`, `ruster-io-dpdk`) already satisfies — not
-            /// something this test-only wiring can or should paper over by
-            /// picking a fallback resource here. See the written report.
+            /// `GeneratedUnknownEgressHarness` is not wired at this
+            /// single-resource layer: this fixture always maps an egress to
+            /// one of its two real resources (falling back to LAN), so it
+            /// never constructs a batch bound to a mismatched egress in the
+            /// first place. `XdpPairGeneratedBatch::allocate` (`aggregate.rs`)
+            /// used to fail `allocate()` itself for an egress that matched
+            /// neither pair member — a real, confirmed disagreement with
+            /// the shared suite's `unknown_egress_is_rejected_without_
+            /// submission`, which expects `allocate()` to succeed and only
+            /// the eventual commit/finish to reject. That has since been
+            /// fixed at the pair level (a real carrier frame is drawn from
+            /// one member so `allocate` succeeds, and the commit is
+            /// rejected without reaching any ring); see
+            /// `aggregate::tests::generated_unknown_egress`, which wires
+            /// `GeneratedUnknownEgressHarness` against the real
+            /// `XdpResourcePair` and runs the unmodified shared suite
+            /// function. This single-resource fixture has no equivalent
+            /// scenario to wire, since it never fabricates a mismatched
+            /// egress for a lone resource.
             fn resource_for(&mut self, egress: IfId) -> Resource {
                 if self.wan.interface == egress {
                     Resource::Wan

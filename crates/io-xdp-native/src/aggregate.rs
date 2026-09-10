@@ -18,7 +18,7 @@ use ruster_core::{
 };
 
 use crate::{
-    data_path::{BatchState, XdpBatchCore, XdpReceivedPacket},
+    data_path::{BatchState, XdpBatchCore, XdpGeneratedFrame, XdpReceivedPacket},
     native_unsafe::syscall::LinuxSyscalls,
     XdpGeneratedBatch, XdpGeneratedSlot, XdpIoError, XdpPairIoError, XdpResource,
     XdpResourcePairError, XdpResourcePairIndex,
@@ -623,37 +623,58 @@ impl GeneratedPacketIo for XdpResourcePair<'_> {
                 self.second.start_generated_batch(egress),
             );
         }
-        XdpPairGeneratedBatch::missing(egress)
+        // Neither member matches. `first` still lends a real UMEM frame
+        // purely as a carrier, so `allocate` succeeds exactly as the shared
+        // generated-packet contract requires; the eventual commit is
+        // rejected and the frame is recycled without ever reaching a TX
+        // ring or issuing a doorbell. See `XdpUnknownEgressBatch`.
+        XdpPairGeneratedBatch::unknown(egress, XdpResourcePairIndex::First, &mut self.first)
     }
 }
 
-/// Generated-packet batch routed to one selected pair member.
+/// Generated-packet batch routed to one selected pair member, or to a
+/// carrier frame when the requested egress matches neither.
 pub struct XdpPairGeneratedBatch<'batch> {
-    inner: Option<XdpGeneratedBatch<'batch>>,
-    resource: Option<XdpResourcePairIndex>,
-    attempts: usize,
-    failed: usize,
-    error: Option<XdpPairIoError>,
+    route: XdpPairGeneratedRoute<'batch>,
+}
+
+enum XdpPairGeneratedRoute<'batch> {
+    Member {
+        resource: XdpResourcePairIndex,
+        batch: XdpGeneratedBatch<'batch>,
+    },
+    Unknown(XdpUnknownEgressBatch<'batch>),
 }
 
 impl<'batch> XdpPairGeneratedBatch<'batch> {
     fn member(resource: XdpResourcePairIndex, inner: XdpGeneratedBatch<'batch>) -> Self {
         Self {
-            inner: Some(inner),
-            resource: Some(resource),
-            attempts: 0,
-            failed: 0,
-            error: None,
+            route: XdpPairGeneratedRoute::Member {
+                resource,
+                batch: inner,
+            },
         }
     }
 
-    fn missing(egress: IfId) -> Self {
+    fn unknown(
+        egress: IfId,
+        carrier: XdpResourcePairIndex,
+        resource: &'batch mut XdpResource<'_>,
+    ) -> Self {
         Self {
-            inner: None,
-            resource: None,
-            attempts: 0,
-            failed: 0,
-            error: Some(XdpPairIoError::EgressNotFound { egress }),
+            route: XdpPairGeneratedRoute::Unknown(XdpUnknownEgressBatch::new(
+                egress, carrier, resource,
+            )),
+        }
+    }
+
+    /// The pair member this batch is bound to, or `None` when it is routed
+    /// to an unknown egress and only borrowing a carrier frame.
+    #[cfg(test)]
+    fn resource(&self) -> Option<XdpResourcePairIndex> {
+        match &self.route {
+            XdpPairGeneratedRoute::Member { resource, .. } => Some(*resource),
+            XdpPairGeneratedRoute::Unknown(_) => None,
         }
     }
 }
@@ -669,75 +690,362 @@ impl<'batch> GeneratedPacketBatch for XdpPairGeneratedBatch<'batch> {
         &mut self,
         frame_len: usize,
     ) -> Result<GeneratedPacketLease<Self::Slot<'_>>, GeneratedAllocationError> {
-        let Some(inner) = self.inner.as_mut() else {
-            self.attempts = self.attempts.saturating_add(1);
-            self.failed = self.failed.saturating_add(1);
-            return Err(GeneratedAllocationError::Unavailable);
-        };
-        let slot = inner.allocate(frame_len)?;
-        Ok(GeneratedPacketLease::new(XdpPairGeneratedSlot {
-            inner: slot,
-        }))
+        match &mut self.route {
+            XdpPairGeneratedRoute::Member { batch, .. } => {
+                let slot = batch.allocate(frame_len)?;
+                Ok(GeneratedPacketLease::new(XdpPairGeneratedSlot {
+                    route: XdpPairGeneratedSlotRoute::Member(slot),
+                }))
+            }
+            XdpPairGeneratedRoute::Unknown(batch) => {
+                let frame = batch.allocate(frame_len)?;
+                Ok(GeneratedPacketLease::new(XdpPairGeneratedSlot {
+                    route: XdpPairGeneratedSlotRoute::Unknown(GeneratedPacketLease::new(
+                        XdpUnknownEgressSlot {
+                            batch,
+                            frame,
+                            frame_len,
+                        },
+                    )),
+                }))
+            }
+        }
     }
 
     fn finish(self) -> GeneratedBatchCompletion<Self::Error> {
-        let Self {
-            inner,
-            resource,
-            attempts,
-            failed,
-            error,
-        } = self;
-        let Some(inner) = inner else {
-            return GeneratedBatchCompletion {
-                attempts,
-                allocated: 0,
-                failed,
-                requested: 0,
-                cancelled: 0,
-                abandoned: 0,
-                accepted: 0,
-                rejected: 0,
-                error,
-            };
-        };
-        let completion = inner.finish();
-        let inner_error = completion.error.map(|inner_error| {
-            pair_error(
-                resource.expect("a member batch always has a pair position"),
-                inner_error,
-            )
-        });
-        GeneratedBatchCompletion {
-            attempts: completion.attempts,
-            allocated: completion.allocated,
-            failed: completion.failed,
-            requested: completion.requested,
-            cancelled: completion.cancelled,
-            abandoned: completion.abandoned,
-            accepted: completion.accepted,
-            rejected: completion.rejected,
-            error: error.or(inner_error),
+        match self.route {
+            XdpPairGeneratedRoute::Member { resource, batch } => {
+                let completion = batch.finish();
+                let inner_error = completion
+                    .error
+                    .map(|inner_error| pair_error(resource, inner_error));
+                GeneratedBatchCompletion {
+                    attempts: completion.attempts,
+                    allocated: completion.allocated,
+                    failed: completion.failed,
+                    requested: completion.requested,
+                    cancelled: completion.cancelled,
+                    abandoned: completion.abandoned,
+                    accepted: completion.accepted,
+                    rejected: completion.rejected,
+                    error: inner_error,
+                }
+            }
+            XdpPairGeneratedRoute::Unknown(batch) => {
+                let egress = batch.egress;
+                let carrier = batch.carrier;
+                let completion = batch.finish_inner();
+                // An unexpected carrier-side error (e.g. the carrier was
+                // already mid-batch) takes priority over the routine
+                // "no such egress" signal every rejected commit already
+                // carries.
+                let error = completion
+                    .error
+                    .map(|source| pair_error(carrier, source))
+                    .or(Some(XdpPairIoError::EgressNotFound { egress }));
+                GeneratedBatchCompletion {
+                    attempts: completion.attempts,
+                    allocated: completion.allocated,
+                    failed: completion.failed,
+                    requested: completion.requested,
+                    cancelled: completion.cancelled,
+                    abandoned: completion.abandoned,
+                    accepted: completion.accepted,
+                    rejected: completion.rejected,
+                    error,
+                }
+            }
         }
     }
 }
 
-/// Generated slot that delegates its UMEM borrow to one selected resource.
+/// Generated slot that delegates its UMEM borrow to one selected resource,
+/// or to a carrier frame borrowed on behalf of an unknown egress.
 pub struct XdpPairGeneratedSlot<'slot, 'batch> {
-    inner: GeneratedPacketLease<XdpGeneratedSlot<'slot, 'batch>>,
+    route: XdpPairGeneratedSlotRoute<'slot, 'batch>,
+}
+
+enum XdpPairGeneratedSlotRoute<'slot, 'batch> {
+    Member(GeneratedPacketLease<XdpGeneratedSlot<'slot, 'batch>>),
+    Unknown(GeneratedPacketLease<XdpUnknownEgressSlot<'slot, 'batch>>),
 }
 
 impl GeneratedPacketSlot for XdpPairGeneratedSlot<'_, '_> {
     fn bytes_mut(&mut self) -> &mut [u8] {
-        self.inner.bytes_mut()
+        match &mut self.route {
+            XdpPairGeneratedSlotRoute::Member(inner) => inner.bytes_mut(),
+            XdpPairGeneratedSlotRoute::Unknown(inner) => inner.bytes_mut(),
+        }
     }
 
     fn complete(self, completion: GeneratedSlotCompletion) {
-        match completion {
-            GeneratedSlotCompletion::Transmit => self.inner.commit(),
-            GeneratedSlotCompletion::Cancelled => self.inner.cancel(),
-            GeneratedSlotCompletion::Abandoned => drop(self.inner),
+        match self.route {
+            XdpPairGeneratedSlotRoute::Member(inner) => complete_lease(inner, completion),
+            XdpPairGeneratedSlotRoute::Unknown(inner) => complete_lease(inner, completion),
         }
+    }
+}
+
+fn complete_lease<S: GeneratedPacketSlot>(
+    lease: GeneratedPacketLease<S>,
+    completion: GeneratedSlotCompletion,
+) {
+    match completion {
+        GeneratedSlotCompletion::Transmit => lease.commit(),
+        GeneratedSlotCompletion::Cancelled => lease.cancel(),
+        GeneratedSlotCompletion::Abandoned => drop(lease),
+    }
+}
+
+/// A generated batch whose egress matches neither pair member.
+///
+/// A real frame is still drawn from `carrier`'s own generated pool so
+/// `allocate` succeeds exactly as the shared generated-packet contract
+/// requires (unlike a plain, immediate `allocate` failure, which loses the
+/// `TxRejected` observability signal every other backend gives an operator
+/// for this case). `carrier`'s TX ring, completion ring, and doorbell are
+/// never touched: a `Transmit` completion always recycles the frame back to
+/// `carrier`'s free pool and is counted as a rejection, exactly mirroring
+/// how [`XdpPairPacketBatch::complete_slot`] already treats an unknown
+/// egress on the RX/forward path.
+struct XdpUnknownEgressBatch<'batch> {
+    core: XdpBatchCore<'batch, 'static, LinuxSyscalls>,
+    carrier: XdpResourcePairIndex,
+    egress: IfId,
+    pending: Option<XdpGeneratedFrame>,
+    attempts: usize,
+    allocated: usize,
+    failed: usize,
+    requested: usize,
+    cancelled: usize,
+    abandoned: usize,
+    rejected: usize,
+    error: Option<XdpIoError>,
+    finished: bool,
+    disabled: bool,
+}
+
+impl<'batch> XdpUnknownEgressBatch<'batch> {
+    /// Mirrors `XdpResource::start_generated_batch`'s own busy/raw-view
+    /// degrade path: a carrier that cannot accept a batch right now still
+    /// yields one (`disabled`), so every `allocate` on it fails and
+    /// `finish` reports the reason, exactly like a member batch would.
+    fn new(
+        egress: IfId,
+        carrier: XdpResourcePairIndex,
+        resource: &'batch mut XdpResource<'_>,
+    ) -> Self {
+        let raw_views_exposed = resource.data_path_raw_views_exposed();
+        if !resource.data_path_is_idle() || raw_views_exposed {
+            let core = resource
+                .make_data_path_core(BatchState::Generated)
+                .expect("checked native ring mappings remain available");
+            let mut batch = Self::bare(core, carrier, egress);
+            batch.disabled = true;
+            batch.record_error(if raw_views_exposed {
+                XdpIoError::RawRingViewsExposed
+            } else {
+                XdpIoError::BatchActive
+            });
+            return batch;
+        }
+        let mut core = resource
+            .make_data_path_core(BatchState::Generated)
+            .expect("checked native ring mappings remain available");
+        if let Err(source) = core.reclaim_completions() {
+            let mut batch = Self::bare(core, carrier, egress);
+            batch.record_error(source);
+            return batch;
+        }
+        if let Err(source) = core.refill_fill() {
+            let mut batch = Self::bare(core, carrier, egress);
+            batch.record_error(source);
+            return batch;
+        }
+        Self::bare(core, carrier, egress)
+    }
+
+    fn bare(
+        core: XdpBatchCore<'batch, 'static, LinuxSyscalls>,
+        carrier: XdpResourcePairIndex,
+        egress: IfId,
+    ) -> Self {
+        Self {
+            core,
+            carrier,
+            egress,
+            pending: None,
+            attempts: 0,
+            allocated: 0,
+            failed: 0,
+            requested: 0,
+            cancelled: 0,
+            abandoned: 0,
+            rejected: 0,
+            error: None,
+            finished: false,
+            disabled: false,
+        }
+    }
+
+    fn record_error(&mut self, source: XdpIoError) {
+        if self.error.is_none() {
+            self.error = Some(source);
+        }
+    }
+
+    fn allocate(
+        &mut self,
+        frame_len: usize,
+    ) -> Result<XdpGeneratedFrame, GeneratedAllocationError> {
+        self.attempts = self.attempts.saturating_add(1);
+        if self.disabled {
+            self.failed = self.failed.saturating_add(1);
+            return Err(GeneratedAllocationError::Unavailable);
+        }
+        if frame_len == 0 {
+            self.failed = self.failed.saturating_add(1);
+            return Err(GeneratedAllocationError::ZeroLength);
+        }
+        if frame_len > self.core.visible_frame_capacity() {
+            self.failed = self.failed.saturating_add(1);
+            return Err(GeneratedAllocationError::FrameTooLarge);
+        }
+        if self.pending.is_some() {
+            self.failed = self.failed.saturating_add(1);
+            return Err(GeneratedAllocationError::Unavailable);
+        }
+        match self.core.reserve_generated_frame(frame_len) {
+            Ok(Some(frame)) => {
+                self.pending = Some(frame);
+                self.allocated = self.allocated.saturating_add(1);
+                Ok(frame)
+            }
+            Ok(None) => {
+                self.failed = self.failed.saturating_add(1);
+                Err(GeneratedAllocationError::Unavailable)
+            }
+            Err(source) => {
+                self.failed = self.failed.saturating_add(1);
+                self.record_error(source);
+                Err(GeneratedAllocationError::Unavailable)
+            }
+        }
+    }
+
+    /// Never accepts: a carrier frame exists only to be filled and then
+    /// rejected. `Transmit` is the routine "no such egress" case; `Cancelled`
+    /// and `Abandoned` are the caller's own choice not to send at all. All
+    /// three release the frame the same way, without touching any ring.
+    fn complete_slot(&mut self, frame: XdpGeneratedFrame, completion: GeneratedSlotCompletion) {
+        match completion {
+            GeneratedSlotCompletion::Transmit => {
+                self.requested = self.requested.saturating_add(1);
+                self.rejected = self.rejected.saturating_add(1);
+            }
+            GeneratedSlotCompletion::Cancelled => {
+                self.cancelled = self.cancelled.saturating_add(1);
+            }
+            GeneratedSlotCompletion::Abandoned => {
+                self.abandoned = self.abandoned.saturating_add(1);
+            }
+        }
+        if let Err(source) = self.core.recycle_frame(frame.frame_index) {
+            self.record_error(source);
+        }
+        self.pending = None;
+    }
+
+    fn recycle_pending(&mut self) {
+        let Some(frame) = self.pending.take() else {
+            return;
+        };
+        self.abandoned = self.abandoned.saturating_add(1);
+        if let Err(source) = self.core.recycle_frame(frame.frame_index) {
+            self.record_error(source);
+        }
+    }
+
+    fn finish_inner(mut self) -> GeneratedBatchCompletion<XdpIoError> {
+        if self.disabled {
+            self.core.release_state();
+            self.finished = true;
+            return GeneratedBatchCompletion {
+                attempts: self.attempts,
+                allocated: self.allocated,
+                failed: self.failed,
+                requested: self.requested,
+                cancelled: self.cancelled,
+                abandoned: self.abandoned,
+                accepted: 0,
+                rejected: self.rejected,
+                error: self.error,
+            };
+        }
+        self.recycle_pending();
+        if let Err(source) = self.core.reclaim_completions() {
+            self.record_error(source);
+        }
+        if let Err(source) = self.core.refill_fill() {
+            self.record_error(source);
+        }
+        // No frame was ever submitted, so `tx_wakeup_pending` was never
+        // armed and this issues no doorbell; it still reclaims any RX/CQ
+        // housekeeping the carrier's own batches would have.
+        if let Err(source) = self.core.wake_if_needed() {
+            self.record_error(source);
+        }
+        self.core.release_state();
+        self.finished = true;
+        GeneratedBatchCompletion {
+            attempts: self.attempts,
+            allocated: self.allocated,
+            failed: self.failed,
+            requested: self.requested,
+            cancelled: self.cancelled,
+            abandoned: self.abandoned,
+            accepted: 0,
+            rejected: self.rejected,
+            error: self.error,
+        }
+    }
+}
+
+impl Drop for XdpUnknownEgressBatch<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        self.recycle_pending();
+        if self.disabled {
+            self.core.release_state();
+            self.finished = true;
+            return;
+        }
+        let _ = self.core.reclaim_completions();
+        let _ = self.core.refill_fill();
+        let _ = self.core.wake_if_needed();
+        self.core.release_state();
+        self.finished = true;
+    }
+}
+
+/// Slot leased from `XdpUnknownEgressBatch`'s carrier frame.
+struct XdpUnknownEgressSlot<'slot, 'batch> {
+    batch: &'slot mut XdpUnknownEgressBatch<'batch>,
+    frame: XdpGeneratedFrame,
+    frame_len: usize,
+}
+
+impl GeneratedPacketSlot for XdpUnknownEgressSlot<'_, '_> {
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        self.batch
+            .core
+            .generated_bytes_mut(self.frame.address, self.frame_len)
+    }
+
+    fn complete(self, completion: GeneratedSlotCompletion) {
+        self.batch.complete_slot(self.frame, completion);
     }
 }
 
@@ -1755,20 +2063,151 @@ mod tests {
     }
 
     #[test]
-    fn missing_generated_egress_reports_attempt_and_failure() {
-        // Protect missing-egress generated state: allocation is unavailable,
-        // and both attempt and failure counters are observable at finish.
-        let mut batch = XdpPairGeneratedBatch::missing(IfId(99));
-        assert!(matches!(
-            batch.allocate(8),
-            Err(GeneratedAllocationError::Unavailable)
-        ));
+    fn unknown_egress_generated_allocation_succeeds_and_commit_is_rejected() {
+        // Protect the unknown-egress fix (IO-009): unlike the old
+        // immediate-`allocate`-failure behavior, a carrier frame is real,
+        // so `allocate` succeeds; only the eventual `Transmit` commit is
+        // rejected, and the frame goes back to the carrier's own free pool
+        // rather than to any ring. `check_publication_quiescence` fails
+        // closed the moment any frame is left `TxReserved`/`PendingTx`, so
+        // a clean `Ok(())` right after `finish` is direct evidence that
+        // nothing was ever handed to a ring.
+        let pair = aggregate_pair(false, false);
+        let baseline = pair.first.free_generated_count();
+        let mut batch = GeneratedPacketIo::begin_generated(pair, IfId(99));
+        assert_eq!(batch.resource(), None);
+        let mut slot = batch.allocate(8).expect("carrier allocation succeeds");
+        assert_eq!(slot.bytes_mut().len(), 8);
+        slot.bytes_mut().fill(0xa1);
+        slot.commit();
+
         let completion = batch.finish();
-        assert_eq!((completion.attempts, completion.failed), (1, 1));
+        assert_eq!(
+            (
+                completion.attempts,
+                completion.allocated,
+                completion.failed,
+                completion.requested,
+                completion.accepted,
+                completion.rejected,
+            ),
+            (1, 1, 0, 1, 0, 1)
+        );
+        assert!(completion.invariants_hold());
         assert!(matches!(
             completion.error,
             Some(XdpPairIoError::EgressNotFound { egress: IfId(99) })
         ));
+        assert_eq!(
+            pair.first.free_generated_count(),
+            baseline,
+            "the carrier frame must return to the free pool exactly once"
+        );
+        assert_eq!(
+            PublicationQuiescenceBackend::check_publication_quiescence(pair),
+            Ok(()),
+            "no frame may be left mid-flight toward a ring"
+        );
+    }
+
+    #[test]
+    fn repeated_unknown_egress_rejects_never_leak_or_double_free_the_carrier_pool() {
+        // Adversarial proof for the unknown-egress fix: many back-to-back
+        // allocate/commit cycles against the *same* carrier must each
+        // return their frame exactly once. A leak would shrink the free
+        // count over iterations; a double free would raise it, corrupt the
+        // ownership ledger, or panic outright; a stray ring submission
+        // would leave a frame `TxReserved`/`PendingTx` and fail the
+        // quiescence check below.
+        let pair = aggregate_pair(false, false);
+        let baseline = pair.first.free_generated_count();
+        assert!(baseline >= 1);
+        for _ in 0..(baseline * 3) {
+            let mut batch = GeneratedPacketIo::begin_generated(pair, IfId(99));
+            let mut slot = batch
+                .allocate(8)
+                .expect("carrier pool must not be exhausted");
+            slot.bytes_mut().fill(0xa2);
+            slot.commit();
+            let completion = batch.finish();
+            assert_eq!((completion.accepted, completion.rejected), (0, 1));
+            assert!(completion.invariants_hold());
+            assert_eq!(
+                pair.first.free_generated_count(),
+                baseline,
+                "free pool must be restored after every single reject"
+            );
+            assert_eq!(
+                PublicationQuiescenceBackend::check_publication_quiescence(pair),
+                Ok(())
+            );
+        }
+
+        // A final, independent proof that the carrier's own generated pool
+        // and TX ring were never written to by the cycles above: a
+        // legitimate same-interface batch can still allocate and submit
+        // every one of the carrier's `baseline` generated frames (the
+        // pool is smaller than `RING_ENTRIES` in this fixture, so this is
+        // the full available capacity) without a single rejection. If any
+        // prior cycle had leaked a frame or a descriptor, this would come
+        // up short or hit `RingFull`.
+        let mut batch = GeneratedPacketIo::begin_generated(pair, IfId(1));
+        for _ in 0..baseline {
+            let mut slot = batch
+                .allocate(8)
+                .expect("carrier's generated pool must have its full baseline capacity");
+            slot.bytes_mut().fill(0xa3);
+            slot.commit();
+        }
+        let completion = batch.finish();
+        assert_eq!(
+            (completion.accepted, completion.rejected),
+            (baseline, 0),
+            "the carrier's TX path must still have its full native capacity available"
+        );
+        assert!(completion.invariants_hold());
+    }
+
+    #[test]
+    fn unknown_egress_generated_cancel_and_abandon_also_recycle_without_leaking() {
+        // Cancel and abandon (drop) must recycle the carrier frame exactly
+        // like a rejected commit, and must never count as accepted.
+        let pair = aggregate_pair(false, false);
+        let baseline = pair.first.free_generated_count();
+
+        let mut batch = GeneratedPacketIo::begin_generated(pair, IfId(99));
+        let slot = batch.allocate(8).expect("carrier allocation succeeds");
+        slot.cancel();
+        let completion = batch.finish();
+        assert_eq!(
+            (
+                completion.cancelled,
+                completion.accepted,
+                completion.rejected
+            ),
+            (1, 0, 0)
+        );
+        assert!(completion.invariants_hold());
+        assert_eq!(pair.first.free_generated_count(), baseline);
+
+        let mut batch = GeneratedPacketIo::begin_generated(pair, IfId(99));
+        let slot = batch.allocate(8).expect("carrier allocation succeeds");
+        drop(slot);
+        let completion = batch.finish();
+        assert_eq!(
+            (
+                completion.abandoned,
+                completion.accepted,
+                completion.rejected
+            ),
+            (1, 0, 0)
+        );
+        assert!(completion.invariants_hold());
+        assert_eq!(pair.first.free_generated_count(), baseline);
+        assert_eq!(
+            PublicationQuiescenceBackend::check_publication_quiescence(pair),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1821,11 +2260,11 @@ mod tests {
         let pair = aggregate_pair(false, false);
 
         let first = GeneratedPacketIo::begin_generated(pair, IfId(1));
-        assert_eq!(first.resource, Some(XdpResourcePairIndex::First));
+        assert_eq!(first.resource(), Some(XdpResourcePairIndex::First));
         assert!(first.finish().error.is_none());
 
         let second = GeneratedPacketIo::begin_generated(pair, IfId(2));
-        assert_eq!(second.resource, Some(XdpResourcePairIndex::Second));
+        assert_eq!(second.resource(), Some(XdpResourcePairIndex::Second));
         assert!(second.finish().error.is_none());
     }
 
@@ -1927,5 +2366,263 @@ mod tests {
             combine_disposition(ContinueOldIo, ContinueOldIo),
             ContinueOldIo
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Reusable generated-suite wiring for the unknown-egress fix (IO-009).
+    //
+    // Unlike the single-resource wiring in `data_path.rs`, this drives the
+    // real `XdpResourcePair`/`XdpPairGeneratedBatch` production types
+    // directly (via `aggregate_pair`'s fake-syscalls fixture above: no
+    // root, no real interface), because the unknown-egress behavior lives
+    // specifically at the pair level. It implements only the base
+    // `GeneratedHarness` surface plus `GeneratedUnknownEgressHarness` (a
+    // marker trait with no extra methods) — the completion/finite-pool/CQ
+    // capabilities are already proven against the single-resource surface
+    // in `data_path.rs` and are not re-derived here.
+    mod generated_unknown_egress {
+        use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+
+        use ruster_io_conformance::{
+            generated, BufferToken, GeneratedEvent, GeneratedEventKind, GeneratedHarness,
+            GeneratedReclaim, GeneratedUnknownEgressHarness, LeaseObserver, LiveFrame,
+        };
+
+        use super::*;
+
+        #[derive(Default)]
+        struct Observer {
+            generations: std::collections::BTreeMap<u64, u64>,
+            live: std::collections::BTreeMap<usize, LiveFrame>,
+        }
+
+        impl LeaseObserver for Observer {
+            fn bind(&mut self, bytes: &[u8], requested_len: usize) -> LiveFrame {
+                assert_eq!(bytes.len(), requested_len);
+                let visible_address = bytes.as_ptr() as usize;
+                let frame_id = visible_address as u64;
+                assert!(
+                    !self.live.contains_key(&visible_address),
+                    "AF_XDP allocation address is already live"
+                );
+                let generation = self.generations.entry(frame_id).or_default();
+                *generation = generation
+                    .checked_add(1)
+                    .expect("AF_XDP generation overflow");
+                let frame = LiveFrame {
+                    token: BufferToken::new(frame_id, *generation),
+                    visible_address,
+                    requested_len,
+                };
+                self.live.insert(visible_address, frame);
+                frame
+            }
+
+            fn observe(&self, bytes: &[u8]) -> LiveFrame {
+                let address = bytes.as_ptr() as usize;
+                let frame = *self
+                    .live
+                    .get(&address)
+                    .expect("AF_XDP terminal event has no lease-time identity");
+                assert_eq!(bytes.len(), frame.requested_len);
+                frame
+            }
+        }
+
+        impl Observer {
+            fn terminal(&mut self, bytes: &[u8]) -> LiveFrame {
+                let frame = self.observe(bytes);
+                assert_eq!(self.live.remove(&frame.visible_address), Some(frame));
+                frame
+            }
+        }
+
+        struct ObserverHandle(Rc<RefCell<Observer>>);
+
+        impl LeaseObserver for ObserverHandle {
+            fn bind(&mut self, bytes: &[u8], requested_len: usize) -> LiveFrame {
+                self.0.borrow_mut().bind(bytes, requested_len)
+            }
+
+            fn observe(&self, bytes: &[u8]) -> LiveFrame {
+                self.0.borrow().observe(bytes)
+            }
+        }
+
+        /// Wraps the real, leaked `XdpResourcePair` purely to observe each
+        /// slot completion and derive a `GeneratedEvent`; it changes no
+        /// behavior of the pair itself, and every `allocate`/`finish` call
+        /// reaches the unmodified production code directly.
+        struct RecordingIo {
+            pair: &'static mut XdpResourcePair<'static>,
+            observer: Rc<RefCell<Observer>>,
+            events: Rc<RefCell<VecDeque<GeneratedEvent>>>,
+        }
+
+        impl GeneratedPacketIo for RecordingIo {
+            type Error = XdpPairIoError;
+            type Batch<'a>
+                = RecordingBatch<'a>
+            where
+                Self: 'a;
+
+            fn begin_generated(&mut self, egress: IfId) -> Self::Batch<'_> {
+                RecordingBatch {
+                    inner: self.pair.begin_generated(egress),
+                    egress,
+                    observer: Rc::clone(&self.observer),
+                    events: Rc::clone(&self.events),
+                }
+            }
+        }
+
+        struct RecordingBatch<'a> {
+            inner: XdpPairGeneratedBatch<'a>,
+            egress: IfId,
+            observer: Rc<RefCell<Observer>>,
+            events: Rc<RefCell<VecDeque<GeneratedEvent>>>,
+        }
+
+        impl<'a> GeneratedPacketBatch for RecordingBatch<'a> {
+            type Error = XdpPairIoError;
+            type Slot<'s>
+                = RecordingSlot<'s, 'a>
+            where
+                Self: 's;
+
+            fn allocate(
+                &mut self,
+                frame_len: usize,
+            ) -> Result<GeneratedPacketLease<Self::Slot<'_>>, GeneratedAllocationError>
+            {
+                let slot = self.inner.allocate(frame_len)?;
+                Ok(GeneratedPacketLease::new(RecordingSlot {
+                    inner: slot,
+                    egress: self.egress,
+                    observer: Rc::clone(&self.observer),
+                    events: Rc::clone(&self.events),
+                }))
+            }
+
+            fn finish(self) -> GeneratedBatchCompletion<Self::Error> {
+                self.inner.finish()
+            }
+        }
+
+        struct RecordingSlot<'s, 'a> {
+            inner: GeneratedPacketLease<XdpPairGeneratedSlot<'s, 'a>>,
+            egress: IfId,
+            observer: Rc<RefCell<Observer>>,
+            events: Rc<RefCell<VecDeque<GeneratedEvent>>>,
+        }
+
+        impl GeneratedPacketSlot for RecordingSlot<'_, '_> {
+            fn bytes_mut(&mut self) -> &mut [u8] {
+                self.inner.bytes_mut()
+            }
+
+            /// Scope note: this recorder is driven only against an unknown
+            /// egress (see `wired_unknown_egress_is_rejected_without_
+            /// submission` below), where the pair's own production code
+            /// (`XdpUnknownEgressBatch::complete_slot`) guarantees a
+            /// `Transmit` completion is always a rejection and never a
+            /// real submission. It is not a general-purpose recorder for
+            /// the routed member path — that path's completion/finite-pool
+            /// capabilities are already proven against the single-resource
+            /// harness in `data_path.rs`.
+            fn complete(self, completion: GeneratedSlotCompletion) {
+                let Self {
+                    mut inner,
+                    egress,
+                    observer,
+                    events,
+                } = self;
+                let bytes = inner.bytes_mut().to_vec();
+                let frame = observer.borrow_mut().terminal(inner.bytes_mut());
+                let kind = match completion {
+                    GeneratedSlotCompletion::Transmit => GeneratedEventKind::TxRejected {
+                        attempted_egress: egress,
+                        endpoint: None,
+                    },
+                    GeneratedSlotCompletion::Cancelled => {
+                        GeneratedEventKind::Reclaimed(GeneratedReclaim::Cancelled)
+                    }
+                    GeneratedSlotCompletion::Abandoned => {
+                        GeneratedEventKind::Reclaimed(GeneratedReclaim::Abandoned)
+                    }
+                };
+                events.borrow_mut().push_back(GeneratedEvent {
+                    frame,
+                    egress,
+                    bytes,
+                    kind,
+                });
+                match completion {
+                    GeneratedSlotCompletion::Transmit => inner.commit(),
+                    GeneratedSlotCompletion::Cancelled => inner.cancel(),
+                    GeneratedSlotCompletion::Abandoned => drop(inner),
+                }
+            }
+        }
+
+        struct XdpPairGeneratedHarness {
+            io: RecordingIo,
+            observer: ObserverHandle,
+        }
+
+        impl GeneratedHarness for XdpPairGeneratedHarness {
+            type Io = RecordingIo;
+            type Observer = ObserverHandle;
+
+            fn new() -> Self {
+                let pair = aggregate_pair(false, false);
+                let observer = Rc::new(RefCell::new(Observer::default()));
+                let events = Rc::new(RefCell::new(VecDeque::new()));
+                Self {
+                    io: RecordingIo {
+                        pair,
+                        observer: Rc::clone(&observer),
+                        events,
+                    },
+                    observer: ObserverHandle(observer),
+                }
+            }
+
+            fn io_and_observer(&mut self) -> (&mut Self::Io, &mut Self::Observer) {
+                (&mut self.io, &mut self.observer)
+            }
+
+            fn set_generated_allocation_budget(&mut self, budget: usize) {
+                assert_eq!(
+                    budget, 1,
+                    "this harness only proves the unknown-egress scenario, \
+                     which allocates exactly once"
+                );
+            }
+
+            fn set_generated_max_frame(&mut self, _max_frame: usize) {
+                // Not exercised by `unknown_egress_is_rejected_without_submission`.
+            }
+
+            fn set_generated_accept_budget(&mut self, _budget: usize) {
+                // Not exercised by `unknown_egress_is_rejected_without_submission`.
+            }
+
+            fn drain_generated_events(&mut self) -> Vec<GeneratedEvent> {
+                self.io.events.borrow_mut().drain(..).collect()
+            }
+        }
+
+        impl GeneratedUnknownEgressHarness for XdpPairGeneratedHarness {}
+
+        #[test]
+        fn wired_unknown_egress_is_rejected_without_submission() {
+            // This runs the *unmodified* shared conformance suite function
+            // against the real pair — it is the proof, required alongside
+            // the adversarial tests above, that `GeneratedUnknownEgressHarness`
+            // now holds for `ruster-io-xdp-native` without any relaxation
+            // of the shared contract.
+            generated::unknown_egress_is_rejected_without_submission::<XdpPairGeneratedHarness>();
+        }
     }
 }

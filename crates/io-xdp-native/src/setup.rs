@@ -628,6 +628,20 @@ impl XdpResource<'_> {
         self.inner.ownership.has_nonquiescent_owner()
     }
 
+    /// Test-only: the current free-chunk count of this resource's ownership
+    /// ledger, used to prove a generated frame returned to the pool exactly
+    /// once (no leak, no double free) without depending on any particular
+    /// allocator strategy.
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    #[cfg(test)]
+    pub(crate) fn free_generated_count(&self) -> usize {
+        self.inner.ownership.count(crate::XdpChunkState::Free)
+    }
+
     #[cfg(all(
         target_os = "linux",
         target_arch = "x86_64",
