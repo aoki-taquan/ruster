@@ -4,10 +4,14 @@ use std::{
     env,
     ffi::CString,
     fs,
+    io::Read,
     os::raw::c_int,
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -15,7 +19,12 @@ use std::{
 use ruster_config::MAX_CONFIG_BYTES;
 
 const SIGTERM: c_int = 15;
-const E2E_STARTUP_WAIT: Duration = Duration::from_secs(2);
+/// Pure hang detector, not a race-critical readiness budget: the loop below
+/// reacts to the child's actual observed state (exit, or a "bound interface"
+/// line proving startup is complete) rather than guessing how long startup
+/// or the non-privileged fail-fast path takes. This only fires if the child
+/// is genuinely stuck, so it can afford to be generous under load.
+const E2E_HANG_SAFETY_NET: Duration = Duration::from_secs(30);
 
 static NEXT_SIM_CONFIG_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -59,30 +68,78 @@ fn run_reports_missing_raw_capability_or_shuts_down_in_order() {
         .spawn()
         .expect("ruster run must spawn");
 
-    let deadline = Instant::now() + E2E_STARTUP_WAIT;
-    let (status, output) = loop {
+    // Drain stdout/stderr continuously on background threads for the whole
+    // lifetime of the child, instead of reading only after the fact via a
+    // single `wait_with_output` once we decide the child is done. That old
+    // shape raced the *decision of when to signal the child* against how
+    // long its own startup happens to take under load: under CPU
+    // contention the fixed startup budget could elapse, and SIGTERM could
+    // be delivered, before the child had printed anything at all (its
+    // signal handler only sets a stop flag, so a mid-setup shutdown can
+    // exit with empty stdout and empty stderr). Draining continuously means
+    // every byte the child ever writes is captured regardless of
+    // scheduling, and readiness is judged by what the child actually said
+    // rather than a guessed wall-clock budget.
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .expect("ruster run stdout must be piped");
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .expect("ruster run stderr must be piped");
+    let stdout_buffer = Arc::new(Mutex::new(Vec::new()));
+    let stderr_buffer = Arc::new(Mutex::new(Vec::new()));
+    let stdout_reader = spawn_drain(stdout_pipe, Arc::clone(&stdout_buffer));
+    let stderr_reader = spawn_drain(stderr_pipe, Arc::clone(&stderr_buffer));
+
+    let deadline = Instant::now() + E2E_HANG_SAFETY_NET;
+    let mut signalled = false;
+    let status = loop {
         if let Some(status) = child.try_wait().expect("child status must be readable") {
-            let output = child
-                .wait_with_output()
-                .expect("completed child output must be readable");
-            break (status, output);
+            break status;
         }
-        if Instant::now() >= deadline {
-            // SAFETY: `child.id()` identifies the live child we just spawned,
-            // and SIGTERM is a valid signal whose handler only sets its stop flag.
+        if !signalled && contains_bytes(&stdout_buffer.lock().unwrap(), b"bound interface") {
+            // The daemon has finished startup and bound its interfaces, so
+            // this is the long-running privileged case: signal it now for
+            // the orderly-shutdown assertions below instead of waiting out
+            // the hang safety net for no reason.
+            // SAFETY: `child.id()` identifies the live child we just
+            // spawned, and SIGTERM is a valid signal whose handler only
+            // sets its stop flag.
             let result = unsafe { kill(child.id() as c_int, SIGTERM) };
             assert_eq!(result, 0, "SIGTERM must be delivered to ruster run");
-            let output = child
-                .wait_with_output()
-                .expect("signalled child output must be readable");
-            break (output.status, output);
+            signalled = true;
+        }
+        if Instant::now() >= deadline {
+            // Only a genuine hang reaches this: the old flake's empty
+            // output happened at the two-second mark, three orders of
+            // magnitude sooner than this safety net.
+            // SAFETY: as above.
+            let _ = unsafe { kill(child.id() as c_int, SIGTERM) };
+            break child.wait().expect("hung child status must be readable");
         }
         thread::sleep(Duration::from_millis(10));
     };
 
+    stdout_reader
+        .join()
+        .expect("stdout reader thread must not panic");
+    stderr_reader
+        .join()
+        .expect("stderr reader thread must not panic");
     fs::remove_file(&config_path).expect("temporary run config must be removable");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let stdout_bytes = Arc::try_unwrap(stdout_buffer)
+        .expect("stdout reader thread has already exited")
+        .into_inner()
+        .expect("stdout buffer mutex must not be poisoned");
+    let stderr_bytes = Arc::try_unwrap(stderr_buffer)
+        .expect("stderr reader thread has already exited")
+        .into_inner()
+        .expect("stderr buffer mutex must not be poisoned");
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
     if status.success() {
         assert!(
             stdout.contains("shutdown complete"),
@@ -107,6 +164,37 @@ fn run_reports_missing_raw_capability_or_shuts_down_in_order() {
             "non-privileged run must explain the raw-socket requirement; stdout={stdout:?} stderr={stderr:?}"
         );
     }
+}
+
+/// Reads `pipe` to EOF on a dedicated thread, appending every chunk to
+/// `buffer`. Draining happens independently of whether or when the caller
+/// decides to poll for exit or send a signal, so no output the child ever
+/// writes can be missed by a race between "the process ended" and "we got
+/// around to reading it".
+fn spawn_drain<R: Read + Send + 'static>(
+    mut pipe: R,
+    buffer: Arc<Mutex<Vec<u8>>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut chunk = [0_u8; 4096];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => buffer
+                    .lock()
+                    .expect("drain buffer mutex must not be poisoned")
+                    .extend_from_slice(&chunk[..read]),
+                Err(_) => break,
+            }
+        }
+    })
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
 }
 
 fn resolvable_devices() -> Vec<String> {

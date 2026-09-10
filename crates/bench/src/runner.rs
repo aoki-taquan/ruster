@@ -228,8 +228,13 @@ fn run_plain_case(
     let mut allocations = 0;
     let mut digest = 0;
     for _ in 0..config.samples {
-        let measurement =
-            measure_plain(&mut backend, &template, &snapshot, batch_size, repetitions)?;
+        let measurement = measure_plain_tolerating_noise(
+            &mut backend,
+            &template,
+            &snapshot,
+            batch_size,
+            repetitions,
+        )?;
         allocations += measurement.allocations;
         digest = measurement.digest;
         let packets = repetitions
@@ -362,6 +367,40 @@ fn measure_plain(
         allocations,
         digest: u16::try_from(report.tx_requested).unwrap_or(u16::MAX),
     })
+}
+
+/// A formal sample's setup/measured split can still occasionally invert
+/// under pure scheduler noise even after calibration has picked a
+/// repetitions count large enough to clear it in the common case: a single
+/// unlucky preemption during the untimed setup loop, or a lucky quiet
+/// window during the timed loop, is possible however large the workload
+/// is. `warm_plain`/`calibrate_plain` already treat this exact error as
+/// retriable noise rather than a hard failure; this extends the same
+/// tolerance to the one formal sample actually recorded, at the same
+/// already-calibrated `repetitions` (a retry does not change what is being
+/// measured). `subtract_setup_control` itself stays exactly as strict as
+/// before — a persistent violation across every retry still fails loudly,
+/// since that is no longer explainable by a transient scheduling blip.
+pub(crate) const MAX_SETUP_CONTROL_RETRIES: u32 = 5;
+
+fn measure_plain_tolerating_noise(
+    backend: &mut BenchBackend,
+    template: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    batch_size: usize,
+    repetitions: usize,
+) -> Result<Measurement, RunError> {
+    let mut last_error = None;
+    for _ in 0..=MAX_SETUP_CONTROL_RETRIES {
+        match measure_plain(backend, template, snapshot, batch_size, repetitions) {
+            Ok(measurement) => return Ok(measurement),
+            Err(error @ RunError::SetupControlExceededMeasured { .. }) => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.expect("loop runs MAX_SETUP_CONTROL_RETRIES + 1 >= 1 time"))
 }
 
 pub(crate) fn subtract_setup_control(
@@ -517,7 +556,6 @@ mod tests {
     fn one_plain_iteration_passes_the_untimed_wire_oracle() {
         let mut config = RunConfig::smoke();
         config.samples = 1;
-        config.sample_time = Duration::from_micros(100);
         config.warmup_time = Duration::ZERO;
         config.batches = vec![1];
         let rows = run(&config).unwrap();

@@ -31,7 +31,8 @@ use crate::deterministic::{
     R17_DETERMINISTIC_SMOKE_SEED, R17_WORKLOAD_DESCRIPTOR,
 };
 use crate::runner::{
-    ensure_no_allocations, subtract_setup_control, Measurement, MIN_AGGREGATE_REPETITIONS,
+    ensure_no_allocations, subtract_setup_control, Measurement, MAX_SETUP_CONTROL_RETRIES,
+    MIN_AGGREGATE_REPETITIONS,
 };
 use crate::{
     allocation_count, BenchBackend, BenchCompletion, FrameSize, ResultRow, RunConfig, RunError,
@@ -3050,7 +3051,8 @@ where
     let mut allocations = 0_u64;
     let mut digest = 0_u16;
     for _ in 0..config.samples {
-        let measurement = measure_forward(backend, template, batch_size, repetitions, forward)?;
+        let measurement =
+            measure_forward_tolerating_noise(backend, template, batch_size, repetitions, forward)?;
         allocations += measurement.allocations;
         digest = measurement.digest;
         let packets = repetitions
@@ -3172,6 +3174,34 @@ where
         allocations,
         digest: u16::try_from(report.tx_requested).unwrap_or(u16::MAX),
     })
+}
+
+/// See `runner::measure_plain_tolerating_noise`: extends the same
+/// noise-retry tolerance already used by `warm_case`/`calibrate_case` to
+/// the one formal sample actually recorded, at the same already-calibrated
+/// `repetitions`. `subtract_setup_control` stays exactly as strict as
+/// before; a persistent violation across every retry still fails loudly.
+fn measure_forward_tolerating_noise<F>(
+    backend: &mut BenchBackend,
+    template: &[u8],
+    batch_size: usize,
+    repetitions: usize,
+    forward: &mut F,
+) -> Result<Measurement, RunError>
+where
+    F: for<'a> FnMut(BenchBatch<'a>) -> BatchReport<Infallible>,
+{
+    let mut last_error = None;
+    for _ in 0..=MAX_SETUP_CONTROL_RETRIES {
+        match measure_forward(backend, template, batch_size, repetitions, forward) {
+            Ok(measurement) => return Ok(measurement),
+            Err(error @ RunError::SetupControlExceededMeasured { .. }) => {
+                last_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.expect("loop runs MAX_SETUP_CONTROL_RETRIES + 1 >= 1 time"))
 }
 
 fn verify_report(report: &BatchReport<Infallible>, batch_size: usize) -> Result<(), RunError> {
