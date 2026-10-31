@@ -1,11 +1,17 @@
 pub mod artifact;
 pub mod corpus;
+pub mod documents;
 pub mod envelope;
+pub mod packets;
+pub mod publication;
+pub mod router;
+pub mod state;
 pub mod targets;
 
 use std::{
     env,
     panic::{self, AssertUnwindSafe},
+    time::Instant,
 };
 
 use artifact::{
@@ -73,6 +79,7 @@ pub fn run_bounded_smoke() {
         }
         None => {
             for target in Target::ALL {
+                let started = Instant::now();
                 for seed in V1_SEEDS {
                     for case_index in 0..smoke_budget(target) {
                         let encoded = generate_encoded(target, seed, case_index)
@@ -81,6 +88,13 @@ pub fn run_bounded_smoke() {
                         run_one(&encoded, writer.as_ref(), &repro);
                     }
                 }
+                eprintln!(
+                    "R16A_SMOKE target={} seeds={} cases_per_seed={} elapsed_ms={}",
+                    target.name(),
+                    V1_SEEDS.len(),
+                    smoke_budget(target),
+                    started.elapsed().as_millis()
+                );
             }
         }
     }

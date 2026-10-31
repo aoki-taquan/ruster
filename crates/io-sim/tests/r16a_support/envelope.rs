@@ -19,14 +19,22 @@ pub enum Target {
     Checksum = 2,
     Admission = 3,
     Resolution = 4,
+    State = 5,
+    Config = 6,
+    Scenario = 7,
+    Publication = 8,
 }
 
 impl Target {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 8] = [
         Self::Parser,
         Self::Checksum,
         Self::Admission,
         Self::Resolution,
+        Self::State,
+        Self::Config,
+        Self::Scenario,
+        Self::Publication,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -35,6 +43,10 @@ impl Target {
             Self::Checksum => "checksum",
             Self::Admission => "admission",
             Self::Resolution => "resolution",
+            Self::State => "state",
+            Self::Config => "config",
+            Self::Scenario => "scenario",
+            Self::Publication => "publication",
         }
     }
 
@@ -44,6 +56,10 @@ impl Target {
             "checksum" => Ok(Self::Checksum),
             "admission" => Ok(Self::Admission),
             "resolution" => Ok(Self::Resolution),
+            "state" => Ok(Self::State),
+            "config" => Ok(Self::Config),
+            "scenario" => Ok(Self::Scenario),
+            "publication" => Ok(Self::Publication),
             _ => Err(EnvelopeError::UnknownTargetName),
         }
     }
@@ -54,6 +70,10 @@ impl Target {
             2 => Ok(Self::Checksum),
             3 => Ok(Self::Admission),
             4 => Ok(Self::Resolution),
+            5 => Ok(Self::State),
+            6 => Ok(Self::Config),
+            7 => Ok(Self::Scenario),
+            8 => Ok(Self::Publication),
             _ => Err(EnvelopeError::UnknownTargetTag),
         }
     }
@@ -106,6 +126,34 @@ pub enum Expected {
     Checksum(u16),
     AdmissionTx,
     Resolution(ResolutionSummary),
+    /// The target checks its own properties; the flags only select how strict
+    /// the generator's claim about the input is.
+    Invariants(InvariantFlags),
+}
+
+/// Generator claims carried by [`Expected::Invariants`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InvariantFlags(u8);
+
+impl InvariantFlags {
+    /// The generated input is a well-formed document that must be accepted.
+    pub const MUST_ACCEPT: u8 = 1;
+
+    pub fn new(bits: u8) -> Result<Self, EnvelopeError> {
+        if bits & !Self::MUST_ACCEPT == 0 {
+            Ok(Self(bits))
+        } else {
+            Err(EnvelopeError::NonCanonicalExpected)
+        }
+    }
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    pub const fn must_accept(self) -> bool {
+        self.0 & Self::MUST_ACCEPT != 0
+    }
 }
 
 impl Expected {
@@ -116,6 +164,7 @@ impl Expected {
             Self::Checksum(_) => 3,
             Self::AdmissionTx => 4,
             Self::Resolution(_) => 5,
+            Self::Invariants(_) => 6,
         }
     }
 
@@ -126,6 +175,10 @@ impl Expected {
                 | (Target::Checksum, Self::Checksum(_))
                 | (Target::Admission, Self::Drop(_) | Self::AdmissionTx)
                 | (Target::Resolution, Self::Resolution(_))
+                | (
+                    Target::State | Target::Config | Target::Scenario | Target::Publication,
+                    Self::Invariants(_)
+                )
         )
     }
 }
@@ -253,6 +306,7 @@ fn encode_expected(expected: Expected, bytes: &mut [u8]) {
             bytes[18..22].copy_from_slice(&summary.action_full.to_le_bytes());
             bytes[22..26].copy_from_slice(&summary.clock_regressions.to_le_bytes());
         }
+        Expected::Invariants(flags) => bytes[0] = flags.bits(),
     }
 }
 
@@ -287,6 +341,7 @@ fn decode_expected(tag: u8, bytes: &[u8]) -> Result<Expected, EnvelopeError> {
             }),
             26,
         ),
+        6 => (Expected::Invariants(InvariantFlags::new(bytes[0])?), 1),
         _ => return Err(EnvelopeError::UnknownExpectedTag),
     };
     if bytes[used..].iter().any(|byte| *byte != 0) {

@@ -23,6 +23,10 @@ pub const PARSER_SMOKE_CASES: u64 = 4_096;
 pub const CHECKSUM_SMOKE_CASES: u64 = 4_096;
 pub const ADMISSION_SMOKE_CASES: u64 = 2_048;
 pub const RESOLUTION_SMOKE_CASES: u64 = 2_048;
+pub const STATE_SMOKE_CASES: u64 = 512;
+pub const CONFIG_SMOKE_CASES: u64 = 1_024;
+pub const SCENARIO_SMOKE_CASES: u64 = 1_024;
+pub const PUBLICATION_SMOKE_CASES: u64 = 256;
 
 const LAN: IfId = IfId(1);
 const WAN: IfId = IfId(2);
@@ -44,7 +48,7 @@ pub struct CaseFailure {
 }
 
 impl CaseFailure {
-    fn new(detail: impl Into<String>) -> Self {
+    pub fn new(detail: impl Into<String>) -> Self {
         Self {
             detail: detail.into(),
         }
@@ -52,20 +56,24 @@ impl CaseFailure {
 }
 
 #[derive(Clone, Copy)]
-struct V1Rng(u64);
+pub struct V1Rng(u64);
 
 impl V1Rng {
-    fn for_case(target: Target, seed: u64, case_index: u64) -> Self {
+    pub fn for_case(target: Target, seed: u64, case_index: u64) -> Self {
         let domain = match target {
             Target::Parser => 0x7061_7273_6572_0001,
             Target::Checksum => 0x6368_6563_6b73_0001,
             Target::Admission => 0x6164_6d69_7373_0001,
             Target::Resolution => 0x7265_736f_6c76_0001,
+            Target::State => 0x7374_6174_6500_0001,
+            Target::Config => 0x636f_6e66_6967_0001,
+            Target::Scenario => 0x7363_656e_6172_0001,
+            Target::Publication => 0x7075_626c_6963_0001,
         };
         Self(seed ^ domain ^ case_index.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x7631_5f72_6e67_0001)
     }
 
-    fn next_u64(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut value = self.0;
         value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -73,16 +81,16 @@ impl V1Rng {
         value ^ (value >> 31)
     }
 
-    fn below(&mut self, exclusive_upper: usize) -> usize {
+    pub fn below(&mut self, exclusive_upper: usize) -> usize {
         assert!(exclusive_upper != 0);
         usize::try_from(self.next_u64() % u64::try_from(exclusive_upper).unwrap()).unwrap()
     }
 
-    fn byte(&mut self) -> u8 {
+    pub fn byte(&mut self) -> u8 {
         self.next_u64().to_le_bytes()[0]
     }
 
-    fn fill(&mut self, bytes: &mut [u8]) {
+    pub fn fill(&mut self, bytes: &mut [u8]) {
         for byte in bytes {
             *byte = self.byte();
         }
@@ -95,6 +103,10 @@ pub fn smoke_budget(target: Target) -> u64 {
         Target::Checksum => CHECKSUM_SMOKE_CASES,
         Target::Admission => ADMISSION_SMOKE_CASES,
         Target::Resolution => RESOLUTION_SMOKE_CASES,
+        Target::State => STATE_SMOKE_CASES,
+        Target::Config => CONFIG_SMOKE_CASES,
+        Target::Scenario => SCENARIO_SMOKE_CASES,
+        Target::Publication => PUBLICATION_SMOKE_CASES,
     }
 }
 
@@ -113,6 +125,10 @@ pub fn generate_encoded(
         Target::Checksum => generate_checksum(seed, case_index),
         Target::Admission => generate_admission(seed, case_index),
         Target::Resolution => generate_resolution(seed, case_index),
+        Target::State => super::state::generate(seed, case_index),
+        Target::Config => super::documents::generate_config(seed, case_index),
+        Target::Scenario => super::documents::generate_scenario(seed, case_index),
+        Target::Publication => super::publication::generate(seed, case_index),
     }
 }
 
@@ -124,6 +140,10 @@ pub fn run_encoded(encoded: &[u8]) -> Result<(), CaseFailure> {
         Target::Checksum => run_checksum(&case),
         Target::Admission => run_admission(&case),
         Target::Resolution => run_resolution(&case),
+        Target::State => super::state::run(&case),
+        Target::Config => super::documents::run_config(&case),
+        Target::Scenario => super::documents::run_scenario(&case),
+        Target::Publication => super::publication::run(&case),
     }
 }
 
@@ -730,7 +750,7 @@ fn model_ipv4(frame: &[u8]) -> Result<ParserAccept, DropReason> {
     })
 }
 
-fn oracle_checksum(bytes: &[u8]) -> u16 {
+pub fn oracle_checksum(bytes: &[u8]) -> u16 {
     let mut high = 0_u64;
     let mut low = 0_u64;
     for (index, byte) in bytes.iter().enumerate() {

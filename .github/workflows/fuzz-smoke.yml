@@ -18,6 +18,10 @@ on:
           - checksum
           - admission
           - resolution
+          - state
+          - config
+          - scenario
+          - publication
       seed:
         description: Exact-mode unsigned decimal or 0x-prefixed u64 seed
         required: true
@@ -45,11 +49,19 @@ env:
   CARGO_TERM_COLOR: always
   RUSTER_R16A_ARTIFACT_DIR: /tmp/ruster-r16a-artifacts
 
+# Fixed full matrix (crates/io-sim/tests/r16a_support/targets.rs, SplitMix64-v1):
+#   seeds 0x6a09e667f3bcc909 0x243f6a8885a308d3 0x9e3779b97f4a7c15 0xd1b54a32d192ed03
+#   cases per seed: parser 4096, checksum 4096, admission 2048, resolution 2048,
+#   state 512 (<= 96 ops, <= 8 frames per batch), config 1024 and scenario 1024
+#   (<= 64 KiB documents, 10 s per-case bound), publication 256 (<= 64 ops).
+# The run prints one R16A_SMOKE line per target with its elapsed milliseconds.
+# Bounds: 15 min for build + run (timeout below), 20 min for the job.
+
 jobs:
   r16a-bounded:
     name: R16A Bounded
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -62,7 +74,7 @@ jobs:
       - name: Run full fixed matrix
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.target == 'all' }}
         run: >-
-          timeout --signal=TERM --kill-after=30s 8m
+          timeout --signal=TERM --kill-after=30s 15m
           cargo test --locked -p ruster-io-sim
           --test security_property_smoke r16a_bounded_smoke --
           --ignored --exact --nocapture --test-threads=1
@@ -75,7 +87,7 @@ jobs:
           RUSTER_R16A_CASE_START: ${{ inputs.case_start }}
           RUSTER_R16A_CASES: ${{ inputs.cases }}
         run: >-
-          timeout --signal=TERM --kill-after=30s 8m
+          timeout --signal=TERM --kill-after=30s 15m
           cargo test --locked -p ruster-io-sim
           --test security_property_smoke r16a_bounded_smoke --
           --ignored --exact --nocapture --test-threads=1
@@ -155,7 +167,7 @@ jobs:
           case_path="${case_files[0]}"
           jsonl_path="${jsonl_files[0]}"
           case_name="${case_path##*/}"
-          if [[ ! "${case_name}" =~ ^r16a-(parser|checksum|admission|resolution)-[0-9a-f]{16}-[0-9a-f]{16}(-([1-9]|1[0-5]))?\.case$ ]]; then
+          if [[ ! "${case_name}" =~ ^r16a-(parser|checksum|admission|resolution|state|config|scenario|publication)-[0-9a-f]{16}-[0-9a-f]{16}(-([1-9]|1[0-5]))?\.case$ ]]; then
             echo "failure artifact case filename is not canonical" >&2
             exit 1
           fi

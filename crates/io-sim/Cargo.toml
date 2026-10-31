@@ -9,4 +9,8 @@ publish.workspace = true
 ruster-core = { path = "../core" }
 
 [dev-dependencies]
+ruster-config = { path = "../config" }
+ruster-control = { path = "../control" }
 ruster-io-conformance = { path = "../io-conformance" }
+ruster-runtime = { path = "../runtime" }
+ruster-sim-scenario = { path = "../sim-scenario" }
