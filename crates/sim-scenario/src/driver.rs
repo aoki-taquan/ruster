@@ -37,8 +37,8 @@ use ruster_config::{
 };
 use ruster_control::{
     ActivationError, ActivePublication, ApplyError, ConfigBridgeError, FullServiceStorage,
-    PublicationSequencer, RestartRequired, SequencerError, SimDeterministicKeySource,
-    StorageAllocationError, ValidatedCandidate,
+    PublicationSequencer, SequencerError, SimDeterministicKeySource, StorageAllocationError,
+    ValidatedCandidate,
 };
 use ruster_core::{BackendStats, ConsumeReason, DropReason, IfId, MonotonicMillis};
 use ruster_io_sim::{FrameOrigin, SimIo};
@@ -94,12 +94,15 @@ impl ConfigRejection {
         }
     }
 
-    fn code(&self) -> String {
+    /// Stable SCREAMING_SNAKE_CASE code from the owning crate's exhaustive
+    /// `code()` table, never a `Debug` rendering.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
         match self {
-            Self::Parse(diagnostic) => format!("{:?}", diagnostic.code()),
-            Self::Validate(error) => format!("{:?}", error.code()),
-            Self::UnsupportedVersion => "UnsupportedVersion".to_owned(),
-            Self::Bridge(error) => format!("{error:?}"),
+            Self::Parse(diagnostic) => diagnostic.code().code(),
+            Self::Validate(error) => error.code().code(),
+            Self::UnsupportedVersion => "UNSUPPORTED_VERSION",
+            Self::Bridge(error) => error.code(),
         }
     }
 }
@@ -229,6 +232,11 @@ impl fmt::Display for ExpectMismatch {
 pub enum DriverError {
     /// A file could not be opened or read. `step` is `None` for the
     /// scenario and the initial configuration.
+    ///
+    /// This is an I/O failure of the run, not a scenario outcome: the CLI
+    /// maps it to exit 1 (runtime/I/O failure). A referenced file that reads
+    /// but fails parsing or validation is instead an `invalid` apply
+    /// rejection inside the scenario.
     Read {
         file: FileRole,
         step: Option<usize>,
@@ -243,6 +251,20 @@ pub enum DriverError {
     },
     StorageAllocation(StorageAllocationError),
     Activation(ActivationError),
+    /// [`SimSession::start`] was called a second time.
+    AlreadyStarted,
+    /// [`SimRun::idle_tick`] was called before every step had run.
+    IdleBeforeEnd,
+    /// [`SimRun::idle_tick`] asked for a time before the current time.
+    TimeRegression {
+        now_ms: u64,
+        at_ms: u64,
+    },
+    /// A tick reported an applied publication but the publication holds no
+    /// apply report. This is an invariant violation.
+    MissingApplyReport {
+        step: Option<usize>,
+    },
     /// A step names an interface absent from the active configuration.
     UnknownInterface {
         step: usize,
@@ -291,6 +313,14 @@ impl fmt::Display for DriverError {
             Self::Sequencer { error, .. } => write!(formatter, "sequencer failed: {error:?}"),
             Self::StorageAllocation(error) => write!(formatter, "storage allocation: {error:?}"),
             Self::Activation(error) => write!(formatter, "activation failed: {error:?}"),
+            Self::AlreadyStarted => formatter.write_str("session already started"),
+            Self::IdleBeforeEnd => formatter.write_str("idle tick before the scenario ended"),
+            Self::TimeRegression { now_ms, at_ms } => {
+                write!(formatter, "idle tick at {at_ms} ms is before {now_ms} ms")
+            }
+            Self::MissingApplyReport { .. } => {
+                formatter.write_str("applied tick without an apply report")
+            }
             Self::UnknownInterface { step, name } => {
                 write!(formatter, "step[{step}]: unknown interface {name:?}")
             }
@@ -378,11 +408,9 @@ impl SimSession {
     /// Activates the initial generation and writes the `start` event.
     ///
     /// A session runs once; a second call fails with
-    /// [`ActivationError::GenerationNotAboveFloor`].
+    /// [`DriverError::AlreadyStarted`].
     pub fn start<W: Write>(&mut self, out: &mut W) -> Result<SimRun<'_>, DriverError> {
-        let (config, candidate) = self.initial.take().ok_or(DriverError::Activation(
-            ActivationError::GenerationNotAboveFloor,
-        ))?;
+        let (config, candidate) = self.initial.take().ok_or(DriverError::AlreadyStarted)?;
         let active = ActivePublication::new(&mut self.storage, candidate)
             .map_err(DriverError::Activation)?;
         let run = SimRun {
@@ -468,7 +496,7 @@ impl SimRun<'_> {
                     self.ticks_left = *ticks;
                 }
                 self.ticks_left = self.ticks_left.saturating_sub(1);
-                self.tick(index, None, out)?;
+                self.tick(Some(index), None, out)?;
                 if self.ticks_left != 0 {
                     return Ok(Progress::Running);
                 }
@@ -543,9 +571,26 @@ impl SimRun<'_> {
             .map(ruster_config::InterfaceBindingV1::name)
     }
 
+    /// Runs one idle worker tick at `at_ms` after the scenario ended, for CLI
+    /// hold mode. Time must not go backwards. The `tick` and `tx` events carry
+    /// `"step":null`; TX is completed but not kept for any expectation.
+    pub fn idle_tick<W: Write>(&mut self, at_ms: u64, out: &mut W) -> Result<(), DriverError> {
+        if self.cursor < self.scenario.steps.len() {
+            return Err(DriverError::IdleBeforeEnd);
+        }
+        if at_ms < self.now {
+            return Err(DriverError::TimeRegression {
+                now_ms: self.now,
+                at_ms,
+            });
+        }
+        self.now = at_ms;
+        self.tick(None, None, out).map(|_| ())
+    }
+
     fn tick<W: Write>(
         &mut self,
-        step: usize,
+        step: Option<usize>,
         candidate: Option<ValidatedCandidate>,
         out: &mut W,
     ) -> Result<TickPublication, DriverError> {
@@ -563,15 +608,18 @@ impl SimRun<'_> {
         let publication = match report.publication {
             PublicationOutcome::Unchanged => TickPublication::Unchanged,
             PublicationOutcome::Applied => {
-                let flush = self.active.last_apply().map_or_else(Default::default, |r| {
-                    ApplyFlushCounts::from_reports(
-                        r.resolution,
-                        r.icmpv4_errors,
-                        r.nat44_udp,
-                        r.nat44_tcp,
-                        r.firewall,
-                    )
-                });
+                let r = self
+                    .active
+                    .last_apply()
+                    .filter(|r| r.generation == generation)
+                    .ok_or(DriverError::MissingApplyReport { step })?;
+                let flush = ApplyFlushCounts::from_reports(
+                    r.resolution,
+                    r.icmpv4_errors,
+                    r.nat44_udp,
+                    r.nat44_tcp,
+                    r.firewall,
+                );
                 self.observer.record_apply_flush(generation, flush);
                 TickPublication::Applied(flush)
             }
@@ -598,8 +646,9 @@ impl SimRun<'_> {
             _ => None,
         });
 
+        let step_field = step.map(|step| u64::try_from(step).unwrap_or(u64::MAX));
         let mut line = Line::event("tick");
-        line.usize("step", step);
+        line.opt_u64("step", step_field);
         line.u64("at_ms", self.now);
         line.u64("generation", generation.get());
         line.str(
@@ -623,7 +672,7 @@ impl SimRun<'_> {
         // Completing every accepted TX keeps the backend quiescent.
         while let Some(frame) = self.io.pop_tx() {
             let mut line = Line::event("tx");
-            line.usize("step", step);
+            line.opt_u64("step", step_field);
             line.u64("at_ms", self.now);
             line.opt_str("interface", self.interface_name(frame.egress));
             line.str(
@@ -636,10 +685,13 @@ impl SimRun<'_> {
             line.usize("len", frame.bytes.len());
             line.hex("hex", &frame.bytes);
             emit(out, line)?;
-            self.tx.push(TxRecord {
-                interface: frame.egress,
-                bytes: frame.bytes,
-            });
+            // Idle ticks run after the last expect, so their TX is not kept.
+            if step.is_some() {
+                self.tx.push(TxRecord {
+                    interface: frame.egress,
+                    bytes: frame.bytes,
+                });
+            }
         }
         while self.io.pop_recycled().is_some() {}
         while self.io.pop_generated_recycled().is_some() {}
@@ -656,12 +708,20 @@ impl SimRun<'_> {
         let mut candidate_generation = None;
         let mut flush = None;
         let (class, stage, code) = match load_config(path, Some(step))? {
-            Err(rejection) => (ApplyClass::Invalid, rejection.stage(), rejection.code()),
+            Err(rejection) => (
+                ApplyClass::Invalid,
+                rejection.stage(),
+                Some(rejection.code()),
+            ),
             Ok(config) => match self.sequencer.candidate(&config) {
                 Err(SequencerError::Bridge(error)) => {
                     candidate_generation = self.sequencer.last_issued();
                     let rejection = ConfigRejection::Bridge(error);
-                    (ApplyClass::Invalid, rejection.stage(), rejection.code())
+                    (
+                        ApplyClass::Invalid,
+                        rejection.stage(),
+                        Some(rejection.code()),
+                    )
                 }
                 Err(error) => {
                     return Err(DriverError::Sequencer {
@@ -671,25 +731,14 @@ impl SimRun<'_> {
                 }
                 Ok(candidate) => {
                     candidate_generation = Some(candidate.generation());
-                    match self.tick(step, Some(candidate), out)? {
-                        TickPublication::Applied(counts) => {
-                            flush = Some(counts);
-                            self.budgets = budgets(&config);
-                            self.config = config;
-                            (ApplyClass::Applied, "successor", String::new())
-                        }
-                        TickPublication::Rejected(ApplyError::RestartRequired(reason)) => (
-                            ApplyClass::RestartRequired,
-                            "successor",
-                            restart_label(reason).to_owned(),
-                        ),
-                        TickPublication::Rejected(error) => {
-                            return Err(DriverError::UnexpectedApplyError { step, error })
-                        }
-                        TickPublication::Deferred | TickPublication::Unchanged => {
-                            return Err(DriverError::ApplyDeferred { step })
-                        }
+                    let publication = self.tick(Some(step), Some(candidate), out)?;
+                    let (class, code) = classify_publication(step, &publication)?;
+                    if let TickPublication::Applied(counts) = publication {
+                        flush = Some(counts);
+                        self.budgets = budgets(&config);
+                        self.config = config;
                     }
+                    (class, "successor", code)
                 }
             },
         };
@@ -715,7 +764,7 @@ impl SimRun<'_> {
             },
         );
         line.str("stage", stage);
-        line.opt_str("code", (!code.is_empty()).then_some(code.as_str()));
+        line.opt_str("code", code);
         line.opt_u64(
             "candidate_generation",
             candidate_generation.map(NonZeroU64::get),
@@ -952,13 +1001,27 @@ fn write_flush(line: &mut Line, flush: ApplyFlushCounts) {
     line.close();
 }
 
-const fn restart_label(reason: RestartRequired) -> &'static str {
-    match reason {
-        RestartRequired::StorageShape => "storage_shape",
-        RestartRequired::ResolutionPolicy => "resolution_policy",
-        RestartRequired::Icmpv4ErrorPolicy => "icmpv4_error_policy",
-        RestartRequired::Interfaces => "interfaces",
-        _ => "other",
+/// Classifies the publication outcome of an apply tick. Restart-required
+/// codes come from control's exhaustive
+/// [`ruster_control::RestartRequired::code`]; every
+/// other rejection of a sequencer-built candidate, and a deferred or missing
+/// publication, is a fatal typed error.
+fn classify_publication(
+    step: usize,
+    publication: &TickPublication,
+) -> Result<(ApplyClass, Option<&'static str>), DriverError> {
+    match publication {
+        TickPublication::Applied(_) => Ok((ApplyClass::Applied, None)),
+        TickPublication::Rejected(ApplyError::RestartRequired(reason)) => {
+            Ok((ApplyClass::RestartRequired, Some(reason.code())))
+        }
+        TickPublication::Rejected(error) => Err(DriverError::UnexpectedApplyError {
+            step,
+            error: *error,
+        }),
+        TickPublication::Deferred | TickPublication::Unchanged => {
+            Err(DriverError::ApplyDeferred { step })
+        }
     }
 }
 
@@ -1033,4 +1096,82 @@ pub fn run_scenario_file<W: Write>(
     let mut run = session.start(out)?;
     run.run(out)?;
     run.finish(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use ruster_control::SuccessorError;
+
+    use super::*;
+
+    fn fixtures() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/m1")
+    }
+
+    fn bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn apply_on_non_quiescent_backend_is_deferred_and_keeps_the_generation() {
+        let source = "schema = \"ruster-scenario/v1\"\nseed = 9\nconfig = \"router-v1.toml\"\n";
+        let scenario = parse_scenario(source.as_bytes(), &fixtures()).unwrap();
+        let mut session = SimSession::new(scenario).unwrap();
+        let mut out = Vec::new();
+        let mut run = session.start(&mut out).unwrap();
+        // LAN UDP to the unresolved gateway generates an ARP Request; run the
+        // tick directly so that the TX stays accepted but uncompleted.
+        run.io.inject(
+            IfId(1),
+            bytes(concat!(
+                "020000000001020000000010080045000023000140004011",
+                "4ecfc0a8010ac633641413880035000f7f0371756572792d31"
+            )),
+        );
+        let report = run_tick(
+            &mut run.active,
+            None,
+            &mut run.io,
+            MonotonicMillis(0),
+            run.budgets,
+            &mut run.observer,
+        );
+        assert!(report.active);
+        assert_eq!(run.io.pending_tx(), 1);
+        let path = ScenarioPath::new(PathBuf::from("router-v2.toml"), &fixtures());
+        assert_eq!(
+            run.apply(7, &path, ApplyOutcome::Applied, &mut out),
+            Err(DriverError::ApplyDeferred { step: 7 })
+        );
+        assert_eq!(run.generation().get(), 1);
+        // The sequencer consumed generation 2 for the deferred candidate.
+        assert_eq!(run.sequencer.last_issued().map(NonZeroU64::get), Some(2));
+    }
+
+    #[test]
+    fn non_restart_rejections_and_missing_publications_are_fatal() {
+        let error = ApplyError::Successor(SuccessorError::GenerationNotIncreasing);
+        assert_eq!(
+            classify_publication(3, &TickPublication::Rejected(error)),
+            Err(DriverError::UnexpectedApplyError { step: 3, error })
+        );
+        assert_eq!(
+            classify_publication(3, &TickPublication::Unchanged),
+            Err(DriverError::ApplyDeferred { step: 3 })
+        );
+        assert_eq!(
+            classify_publication(
+                3,
+                &TickPublication::Rejected(ApplyError::RestartRequired(
+                    ruster_control::RestartRequired::Interfaces
+                ))
+            ),
+            Ok((ApplyClass::RestartRequired, Some("INTERFACES")))
+        );
+    }
 }

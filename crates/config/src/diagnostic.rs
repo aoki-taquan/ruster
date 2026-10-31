@@ -18,6 +18,30 @@ pub enum DiagnosticCode {
     ListTooLong,
 }
 
+impl DiagnosticCode {
+    /// Stable SCREAMING_SNAKE_CASE code for machine-readable output.
+    ///
+    /// Exhaustive, so a new variant fails to compile until it has a code.
+    /// Nested detail is collapsed to the outer variant.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InputTooLarge => "INPUT_TOO_LARGE",
+            Self::InvalidUtf8 => "INVALID_UTF8",
+            Self::InvalidToml => "INVALID_TOML",
+            Self::DuplicateField => "DUPLICATE_FIELD",
+            Self::MissingSchemaVersion => "MISSING_SCHEMA_VERSION",
+            Self::InvalidSchemaVersion => "INVALID_SCHEMA_VERSION",
+            Self::UnsupportedSchemaVersion => "UNSUPPORTED_SCHEMA_VERSION",
+            Self::ForbiddenField => "FORBIDDEN_FIELD",
+            Self::UnknownField => "UNKNOWN_FIELD",
+            Self::MissingField => "MISSING_FIELD",
+            Self::InvalidType => "INVALID_TYPE",
+            Self::ListTooLong => "LIST_TOO_LONG",
+        }
+    }
+}
+
 /// One safe component of a configuration source path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]

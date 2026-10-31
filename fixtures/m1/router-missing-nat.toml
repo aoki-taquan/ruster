@@ -1,0 +1,126 @@
+# Test-only: v1 without NAT44. It validates, but the M1 service bridge
+# rejects it (NAT44 UDP/TCP and firewall are required).
+# LAN 192.168.1.0/24 behind UDP/TCP NAPT on WAN 203.0.113.2, one static
+# route to 198.51.100.0/24 via a dynamically (ARP-)resolved gateway, and a
+# stateful firewall that denies LAN->WAN TCP/23 and allows other LAN->WAN
+# UDP/TCP.
+schema-version = 1
+
+[[interfaces]]
+id = 1
+name = "lan"
+device = "sim0"
+mac = "02:00:00:00:00:01"
+
+[[interfaces]]
+id = 2
+name = "wan"
+device = "sim1"
+mac = "02:00:00:00:00:02"
+
+[[addresses]]
+interface = "lan"
+ipv4 = "192.168.1.1/24"
+
+[[addresses]]
+interface = "wan"
+ipv4 = "203.0.113.2/24"
+
+[[routes]]
+prefix = "198.51.100.0/24"
+egress = "wan"
+via = "203.0.113.1"
+
+[[neighbors]]
+interface = "lan"
+address = "192.168.1.10"
+mac = "02:00:00:00:00:10"
+
+[ipv4-origin]
+default-ttl = 64
+
+[resolution.policy]
+interval-ms = 1000
+state-ttl-ms = 3000
+dynamic-neighbor-ttl-ms = 60000
+max-attempts = 3
+
+[resolution.capacity]
+states = 8
+actions = 8
+dynamic-neighbors = 8
+failure-holds = 8
+
+[icmpv4-errors.policy]
+interval-ms = 100
+state-ttl-ms = 60000
+
+[icmpv4-errors.capacity]
+states = 8
+actions = 8
+
+[firewall.policy]
+udp-idle-ttl-ms = 300000
+tcp-opening-idle-ttl-ms = 240000
+tcp-active-idle-ttl-ms = 7440000
+
+[firewall.capacity]
+states = 16
+
+[[firewall.rules]]
+id = 10
+ingress = "lan"
+egress = "wan"
+source = "192.168.1.0/24"
+destination = "0.0.0.0/0"
+protocol = "tcp"
+action = "deny"
+
+[firewall.rules.source-ports]
+first = 0
+last = 65535
+
+[firewall.rules.destination-ports]
+first = 23
+last = 23
+
+[[firewall.rules]]
+id = 20
+ingress = "lan"
+egress = "wan"
+source = "192.168.1.0/24"
+destination = "0.0.0.0/0"
+protocol = "udp"
+action = "allow-stateful"
+
+[firewall.rules.source-ports]
+first = 1
+last = 65535
+
+[firewall.rules.destination-ports]
+first = 1
+last = 65535
+
+[[firewall.rules]]
+id = 30
+ingress = "lan"
+egress = "wan"
+source = "192.168.1.0/24"
+destination = "0.0.0.0/0"
+protocol = "tcp"
+action = "allow-stateful"
+
+[firewall.rules.source-ports]
+first = 1
+last = 65535
+
+[firewall.rules.destination-ports]
+first = 1
+last = 65535
+
+[tick]
+rx = 32
+resolution-timer-scans = 16
+failure-dispatch-scans = 16
+generated-arp = 8
+generated-icmpv4 = 8

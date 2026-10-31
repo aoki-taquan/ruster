@@ -107,8 +107,8 @@ fn run_sim_output_is_byte_identical_across_runs_and_canonical() {
             && applies[0].contains("\"flush\":{\"resolution_states\":2")
     );
     assert!(applies[1].contains("\"reason\":\"invalid\"") && applies[1].contains("\"flush\":null"));
-    assert!(applies[2].contains("\"code\":\"storage_shape\""));
-    assert!(applies[3].contains("\"code\":\"interfaces\""));
+    assert!(applies[2].contains("\"code\":\"STORAGE_SHAPE\""));
+    assert!(applies[3].contains("\"code\":\"INTERFACES\""));
     // R15: counters, health, and generation are in the final event.
     let last = lines.last().unwrap();
     for field in [
@@ -386,4 +386,138 @@ kind = "hold"
     let text = String::from_utf8(out).unwrap();
     assert_eq!(text.matches("\"event\":\"tick\"").count(), 3);
     assert_eq!(text.lines().count(), 6);
+}
+
+#[test]
+fn reload_adopts_renamed_interfaces_and_new_tick_budgets() {
+    let source = r#"
+schema = "ruster-scenario/v1"
+seed = 4
+config = "router-v1.toml"
+
+[[step]]
+kind = "apply"
+config = "router-relabel.toml"
+outcome = "applied"
+
+[[step]]
+kind = "inject"
+interface = "uplink"
+frame = { kind = "arp", eth = { src = "02:00:00:00:00:fe", dst = "ff:ff:ff:ff:ff:ff" }, op = "request", sender-mac = "02:00:00:00:00:fe", sender-ip = "203.0.113.1", target-ip = "203.0.113.2", pad-to-min = true }
+
+[[step]]
+kind = "inject"
+interface = "uplink"
+frame = { kind = "raw", hex = "020000000002 0200000000fe 88b5 0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000" }
+
+[[step]]
+kind = "tick"
+at-ms = 10
+ticks = 2
+
+[[step]]
+kind = "expect"
+generation = 2
+tx = [
+  { interface = "uplink", frame = { kind = "arp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, op = "reply", sender-mac = "02:00:00:00:00:02", sender-ip = "203.0.113.2", target-mac = "02:00:00:00:00:fe", target-ip = "203.0.113.1", pad-to-min = true } },
+]
+drops = [{ reason = "UNSUPPORTED_ETHERTYPE", count = 1 }]
+"#;
+    let (result, output) = run_text(source);
+    result.unwrap();
+    let ticks: Vec<&str> = output
+        .lines()
+        .filter(|line| line.starts_with("{\"event\":\"tick\""))
+        .collect();
+    // The apply tick, then two ticks that each receive one frame because the
+    // relabelled document lowered the RX budget to 1.
+    assert_eq!(ticks.len(), 3);
+    assert!(ticks[1].contains("\"received\":1") && ticks[2].contains("\"received\":1"));
+    assert!(output.contains("\"event\":\"tx\",\"step\":3,\"at_ms\":10,\"interface\":\"uplink\""));
+}
+
+#[test]
+fn bridge_rejection_is_invalid_without_a_tick_and_consumes_a_generation() {
+    let source = r#"
+schema = "ruster-scenario/v1"
+seed = 5
+config = "router-v1.toml"
+
+[[step]]
+kind = "apply"
+config = "router-missing-nat.toml"
+outcome = "rejected"
+reason = "invalid"
+
+[[step]]
+kind = "apply"
+config = "router-v2.toml"
+outcome = "applied"
+
+[[step]]
+kind = "expect"
+generation = 3
+"#;
+    let (result, output) = run_text(source);
+    result.unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(
+        lines[1],
+        "{\"event\":\"apply\",\"step\":0,\"at_ms\":0,\"config\":\"router-missing-nat.toml\",\
+         \"outcome\":\"rejected\",\"reason\":\"invalid\",\"stage\":\"bridge\",\
+         \"code\":\"MISSING_SERVICE_NAT44_UDP\",\"candidate_generation\":2,\"generation\":1,\
+         \"flush\":null}"
+    );
+    assert!(lines[2].starts_with("{\"event\":\"tick\",\"step\":1,"));
+    assert!(lines[3].contains("\"candidate_generation\":3,\"generation\":3"));
+}
+
+#[test]
+fn idle_ticks_follow_hold_monotonically_and_sessions_start_once() {
+    let source = r#"
+schema = "ruster-scenario/v1"
+seed = 6
+config = "router-v1.toml"
+
+[[step]]
+kind = "tick"
+at-ms = 100
+
+[[step]]
+kind = "hold"
+"#;
+    let scenario = parse_scenario(source.as_bytes(), &fixtures()).unwrap();
+    let mut session = SimSession::new(scenario).unwrap();
+    let mut out = Vec::new();
+    {
+        let mut run = session.start(&mut out).unwrap();
+        assert_eq!(
+            run.idle_tick(200, &mut out),
+            Err(DriverError::IdleBeforeEnd)
+        );
+        assert_eq!(run.run(&mut out).unwrap(), Progress::Hold);
+        assert_eq!(run.idle_tick(1_000, &mut out), Ok(()));
+        assert_eq!(run.idle_tick(1_000, &mut out), Ok(()));
+        assert_eq!(
+            run.idle_tick(999, &mut out),
+            Err(DriverError::TimeRegression {
+                now_ms: 1_000,
+                at_ms: 999,
+            })
+        );
+        let snapshot = run.snapshot();
+        assert_eq!(snapshot.totals.ticks, 3);
+        assert_eq!(snapshot.health.last_tick.map(|time| time.0), Some(1_000));
+        run.finish(&mut out).unwrap();
+    }
+    assert!(matches!(
+        session.start(&mut out),
+        Err(DriverError::AlreadyStarted)
+    ));
+    let text = String::from_utf8(out).unwrap();
+    assert_eq!(
+        text.matches("{\"event\":\"tick\",\"step\":null,\"at_ms\":1000,")
+            .count(),
+        2
+    );
 }

@@ -893,7 +893,9 @@ tickなしの`invalid`、成功時はsequencerがgenerationを消費してcandid
 publication phaseへ渡し、そのtickの結果を`applied`または`restart-required`として扱います。
 restart-requiredでもstorageは作り直さず旧generationで継続します（M1 run-simの範囲）。
 `expect`は前回expect以降のTX（egress、exact bytes）、累積drop/consume数、generationを照合し、
-最初の差分をtyped errorで返します。出力はfield順固定の手書きJSONLで、wall clock、map順、
+最初の差分をtyped errorで返します。参照fileのread失敗はrunのI/O failure（CLIはexit 1）で、
+読めたがparse/validate/bridgeに失敗したfileはscenario内の`invalid` rejectです。`hold`後は
+`SimRun::idle_tick`で単調な注入時刻のidle tickを続けられます。出力はfield順固定の手書きJSONLで、wall clock、map順、
 hash key、seedを含みません。step単位（tickは1回ずつ）の`SimRun::step`で呼出し側がtick間に
 停止flagを確認できます。full compositionはfirewall必須のため、route missはsilentな
 `FIREWALL_ROUTE_UNAVAILABLE`でDestination Unreachable Networkは生成されません。

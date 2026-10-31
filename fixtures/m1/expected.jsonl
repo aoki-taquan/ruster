@@ -49,11 +49,11 @@
 {"event":"tick","step":35,"at_ms":4010,"generation":2,"publication":"unchanged","active":true,"received":2,"forwarded":1,"dropped":0,"consumed":1,"generated_arp":0,"generated_icmpv4":0}
 {"event":"tx","step":35,"at_ms":4010,"interface":"wan","origin":"forwarded","len":49,"hex":"0200000000fe020000000002080045000023000d40003f113d88cb007102c00002329c4b0009000fb4fb6e6f7768657265"}
 {"event":"expect","step":36,"at_ms":4010,"tx_observed":2,"generation":2,"result":"pass","mismatch":null}
-{"event":"apply","step":37,"at_ms":4010,"config":"router-invalid.toml","outcome":"rejected","reason":"invalid","stage":"validate","code":"GatewayNotOnLink","candidate_generation":null,"generation":2,"flush":null}
+{"event":"apply","step":37,"at_ms":4010,"config":"router-invalid.toml","outcome":"rejected","reason":"invalid","stage":"validate","code":"GATEWAY_NOT_ON_LINK","candidate_generation":null,"generation":2,"flush":null}
 {"event":"tick","step":38,"at_ms":4010,"generation":2,"publication":"rejected","active":true,"received":0,"forwarded":0,"dropped":0,"consumed":0,"generated_arp":0,"generated_icmpv4":0}
-{"event":"apply","step":38,"at_ms":4010,"config":"router-capacity.toml","outcome":"rejected","reason":"restart-required","stage":"successor","code":"storage_shape","candidate_generation":3,"generation":2,"flush":null}
+{"event":"apply","step":38,"at_ms":4010,"config":"router-capacity.toml","outcome":"rejected","reason":"restart-required","stage":"successor","code":"STORAGE_SHAPE","candidate_generation":3,"generation":2,"flush":null}
 {"event":"tick","step":39,"at_ms":4010,"generation":2,"publication":"rejected","active":true,"received":0,"forwarded":0,"dropped":0,"consumed":0,"generated_arp":0,"generated_icmpv4":0}
-{"event":"apply","step":39,"at_ms":4010,"config":"router-interface.toml","outcome":"rejected","reason":"restart-required","stage":"successor","code":"interfaces","candidate_generation":4,"generation":2,"flush":null}
+{"event":"apply","step":39,"at_ms":4010,"config":"router-interface.toml","outcome":"rejected","reason":"restart-required","stage":"successor","code":"INTERFACES","candidate_generation":4,"generation":2,"flush":null}
 {"event":"inject","step":40,"interface":"lan","len":49,"hex":"020000000001020000000010080045000023000e40004011b6d7c0a8010ac0000232138c0009000fb80b6e6f7768657265"}
 {"event":"tick","step":41,"at_ms":4020,"generation":2,"publication":"unchanged","active":true,"received":1,"forwarded":1,"dropped":0,"consumed":0,"generated_arp":0,"generated_icmpv4":0}
 {"event":"tx","step":41,"at_ms":4020,"interface":"wan","origin":"forwarded","len":49,"hex":"0200000000fe020000000002080045000023000e40003f113d87cb007102c00002329c4b0009000fb4fb6e6f7768657265"}

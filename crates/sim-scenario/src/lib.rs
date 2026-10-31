@@ -49,8 +49,12 @@
 //!   `"section.key"` members.
 //!
 //! Field names are part of the schema; renaming or reordering requires a new
-//! schema version. Rendered typed codes (`code` of an `apply` line) use the
-//! stable variant names of the config/control error enums.
+//! schema version. Labels (`event`, `outcome`, `reason`, `stage`, `origin`)
+//! are lowercase; the `code` of an `apply` line is a SCREAMING_SNAKE_CASE
+//! string from the exhaustive `code()` tables of `DiagnosticCode`,
+//! `ValidationCode`, `ConfigBridgeError`, and `RestartRequired` (nested
+//! detail collapsed to the outer variant), never a `Debug` rendering.
+//! Idle ticks after `hold` ([`SimRun::idle_tick`]) emit `"step":null`.
 //!
 //! ```
 //! use std::path::Path;
