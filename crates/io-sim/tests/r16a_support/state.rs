@@ -14,9 +14,15 @@
 //!   that created the state (same-batch visibility of committed state);
 //! - filtering: replies without exact live state, denied and corrupted
 //!   packets, and non-SYN TCP without a session are never forwarded;
-//! - capacity: a fresh flow on an empty router always succeeds, live flows
-//!   are never evicted by later pressure, and while no state can have expired
-//!   a tick that forwarded nothing leaves every NAT/firewall slot unchanged;
+//! - capacity: the model counts NAT mappings, UDP peers, TCP sessions,
+//!   firewall states, and the port pool independently (non-live flows count
+//!   as still occupying), and a state-creating packet refused while every
+//!   one of them has room fails the case; live flows are never evicted;
+//! - slots: with every flow live, a tick that forwarded nothing leaves every
+//!   NAT/firewall slot unchanged; with only live and known-dead flows it may
+//!   only remove (expired) entries;
+//! - not yet: post-expiry firewall liveness (see
+//!   [`REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY`]);
 //! - no panic and exact RX accounting in every tick.
 
 use ruster_control::{
@@ -242,13 +248,32 @@ struct Pending {
 
 struct Model {
     params: RouterParams,
+    /// Every flow that ever committed state. A flow never leaves the model,
+    /// because expired state may keep occupying slots until reclaimed.
     flows: Vec<Flow>,
     now: u64,
-    /// Set once any recorded state may have expired; exact slot equality
-    /// and no-eviction checks are then no longer decidable by the model.
-    stale_possible: bool,
     firewall_usable: usize,
 }
+
+/// What the model can decide about the slot tables at one tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlotKnowledge {
+    /// Every recorded flow is live: slots are exactly the model's state.
+    Exact,
+    /// Some flows are known dead, none undecided: slots may only lose
+    /// expired entries without forwarding anything.
+    DeletionOnly,
+    /// Some flow may or may not have expired.
+    Undecided,
+}
+
+/// Disabled until the follow-up core firewall fix: expired firewall slots
+/// are reclaimed only when a later probe crosses them (at most one per
+/// probe), so after every flow expired a fresh flow can still be refused
+/// with `FirewallStateTableFull`. When enabled, refusals are checked with
+/// known-dead flows treated as reclaimed.
+// TODO(R16 follow-up core firewall expired-slot reclaim): enable.
+pub const REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY: bool = false;
 
 impl Model {
     fn live_endpoint_port(&self, proto: Proto, host: usize, port: u16) -> Option<u16> {
@@ -259,14 +284,72 @@ impl Model {
             .map(|flow| flow.public_port)
     }
 
-    fn refresh_staleness(&mut self) {
-        if self
-            .flows
-            .iter()
-            .any(|flow| flow.liveness(self.now) != Liveness::Live)
-        {
-            self.stale_possible = true;
+    fn knowledge(&self) -> SlotKnowledge {
+        let mut knowledge = SlotKnowledge::Exact;
+        for flow in &self.flows {
+            match flow.liveness(self.now) {
+                Liveness::Live => {}
+                Liveness::Dead => knowledge = SlotKnowledge::DeletionOnly,
+                Liveness::Unknown => return SlotKnowledge::Undecided,
+            }
         }
+        knowledge
+    }
+
+    /// Why a refused state-creating outbound packet was owed success, if
+    /// it was. Occupancy is counted independently from the model; every
+    /// recorded flow that is not live is counted as still occupying its
+    /// slots (`dead_reclaimed` = false), which keeps the check sound
+    /// whatever the reclaim policy is.
+    fn owed(&self, out: &Outbound, dead_reclaimed: bool) -> Option<&'static str> {
+        let now = self.now;
+        let counted = |flow: &&Flow| !(dead_reclaimed && flow.liveness(now) == Liveness::Dead);
+        let flows: Vec<&Flow> = self.flows.iter().filter(counted).collect();
+        let tuple_live = flows
+            .iter()
+            .any(|flow| flow.same_tuple(out) && flow.liveness(now) == Liveness::Live);
+        if tuple_live {
+            return Some("outbound on a live flow");
+        }
+        let distinct = |key: &dyn Fn(&Flow) -> (usize, u16, Ipv4Address, u16)| {
+            let mut keys: Vec<_> = flows
+                .iter()
+                .filter(|flow| flow.proto == out.proto)
+                .map(|flow| key(flow))
+                .collect();
+            keys.sort_unstable_by_key(|(host, port, address, remote_port)| {
+                (*host, *port, address.octets(), *remote_port)
+            });
+            keys.dedup();
+            keys.len()
+        };
+        let unspecified = Ipv4Address::from_octets([0; 4]);
+        let mappings = distinct(&|flow| (flow.host, flow.internal_port, unspecified, 0));
+        let endpoint_live = self
+            .live_endpoint_port(out.proto, out.host, out.internal_port)
+            .is_some();
+        let params = self.params;
+        let (mapping_capacity, per_flow, per_flow_capacity) = match out.proto {
+            // UDP peers are keyed by mapping and remote address.
+            Proto::Udp => (
+                params.udp_mappings,
+                distinct(&|flow| (flow.host, flow.internal_port, flow.remote, 0)),
+                params.udp_peers,
+            ),
+            // TCP sessions are keyed by mapping and remote endpoint.
+            Proto::Tcp => (
+                params.tcp_mappings,
+                distinct(&|flow| (flow.host, flow.internal_port, flow.remote, flow.remote_port)),
+                params.tcp_sessions,
+            ),
+        };
+        let as_count = |value: u32| usize::try_from(value).unwrap();
+        let mapping_room = endpoint_live
+            || (mappings < as_count(mapping_capacity) && mappings < usize::from(params.ports));
+        let flow_room = per_flow < as_count(per_flow_capacity);
+        let firewall_room = flows.len() < self.firewall_usable;
+        (mapping_room && flow_room && firewall_room)
+            .then_some("fresh flow with NAT mapping/port, peer/session, and firewall room")
     }
 }
 
@@ -279,7 +362,39 @@ struct Slots {
     firewall: Vec<ruster_core::FirewallStateSlot>,
 }
 
+/// Whether `after` is `before` with zero or more entries removed (values
+/// may move between indices, as in backward-shift deletion).
+fn sub_multiset<T: Copy + Eq>(before: &[T], after: &[T], occupied: impl Fn(T) -> bool) -> bool {
+    let mut remaining: Vec<T> = before
+        .iter()
+        .copied()
+        .filter(|slot| occupied(*slot))
+        .collect();
+    for slot in after.iter().copied().filter(|slot| occupied(*slot)) {
+        match remaining.iter().position(|candidate| *candidate == slot) {
+            Some(index) => {
+                remaining.swap_remove(index);
+            }
+            None => return false,
+        }
+    }
+    true
+}
+
 impl Slots {
+    fn only_deleted_into(&self, after: &Self) -> bool {
+        sub_multiset(&self.udp_mappings, &after.udp_mappings, |slot| {
+            slot.is_occupied()
+        }) && sub_multiset(&self.udp_peers, &after.udp_peers, |slot| slot.is_occupied())
+            && sub_multiset(&self.tcp_mappings, &after.tcp_mappings, |slot| {
+                slot.is_occupied()
+            })
+            && sub_multiset(&self.tcp_sessions, &after.tcp_sessions, |slot| {
+                slot.is_occupied()
+            })
+            && sub_multiset(&self.firewall, &after.firewall, |slot| slot.is_occupied())
+    }
+
     fn capture(active: &ActivePublication<'_, SimIo>) -> Self {
         Self {
             udp_mappings: active.nat44_udp().mappings().to_vec(),
@@ -346,6 +461,12 @@ pub struct StateCoverage {
     pub outbound_refused: u64,
     pub filtered: u64,
     pub unchanged_ticks: u64,
+    pub deletion_only_ticks: u64,
+    /// Forwarded state-creating packets the capacity model owed success.
+    pub owed_successes: u64,
+    /// Refusals while known-dead state existed (post-expiry liveness is
+    /// not asserted yet; see `REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY`).
+    pub refused_after_expiry: u64,
     pub big_jumps: u64,
 }
 
@@ -358,6 +479,9 @@ impl StateCoverage {
         self.outbound_refused += other.outbound_refused;
         self.filtered += other.filtered;
         self.unchanged_ticks += other.unchanged_ticks;
+        self.deletion_only_ticks += other.deletion_only_ticks;
+        self.owed_successes += other.owed_successes;
+        self.refused_after_expiry += other.refused_after_expiry;
         self.big_jumps += other.big_jumps;
     }
 }
@@ -401,7 +525,6 @@ pub fn run_with_coverage(case: &CaseEnvelope<'_>) -> Result<StateCoverage, CaseF
             params: program.params,
             flows: Vec::new(),
             now: case.now,
-            stale_possible: false,
             firewall_usable: 0,
         },
         io: SimIo::new(),
@@ -673,8 +796,7 @@ impl Harness {
         }
         let batch = std::mem::take(&mut self.batch);
         self.ticks += 1;
-        self.model.refresh_staleness();
-        let stale_before = self.model.stale_possible;
+        let knowledge = self.model.knowledge();
         let before = Slots::capture(active);
         let report = run_tick(
             active,
@@ -756,7 +878,16 @@ impl Harness {
         }
 
         let after = Slots::capture(active);
-        if !stale_before {
+        if knowledge == SlotKnowledge::DeletionOnly && forwarded.is_empty() {
+            if !before.only_deleted_into(&after) {
+                return Err(CaseFailure::new(format!(
+                    "tick={tick} forwarded nothing but NAT/firewall slots changed beyond \
+                     reclaiming expired entries"
+                )));
+            }
+            self.coverage.deletion_only_ticks += 1;
+        }
+        if knowledge == SlotKnowledge::Exact {
             if forwarded.is_empty() {
                 if before != after {
                     return Err(CaseFailure::new(format!(
@@ -821,27 +952,35 @@ impl Harness {
                     .flows
                     .iter()
                     .position(|flow| flow.same_tuple(&out));
-                let existing_live = existing
-                    .is_some_and(|index| self.model.flows[index].liveness(now) == Liveness::Live);
                 let existing_dead_or_none = existing
                     .is_none_or(|index| self.model.flows[index].liveness(now) == Liveness::Dead);
+                let owed = if out.creates {
+                    self.model.owed(&out, false)
+                } else {
+                    existing
+                        .filter(|index| self.model.flows[*index].liveness(now) == Liveness::Live)
+                        .map(|_| "non-SYN TCP on a live session")
+                };
                 let Some((egress, bytes)) = tx else {
-                    if existing_live {
+                    if let Some(reason) = owed {
                         return Err(CaseFailure::new(format!(
-                            "outbound on a live flow was dropped: {out:?}"
+                            "refused although owed ({reason}): {out:?}"
                         )));
                     }
-                    // Expired state is reclaimed only by bounded probe-path
-                    // cleanup, so it may still occupy capacity; a fresh flow
-                    // is owed only while nothing can have expired.
-                    if out.creates
-                        && !self.model.stale_possible
-                        && self.model.flows.len() < self.model.firewall_usable
-                        && !self.model.flows.iter().any(|flow| flow.proto == out.proto)
+                    if self
+                        .model
+                        .flows
+                        .iter()
+                        .any(|flow| flow.liveness(now) == Liveness::Dead)
                     {
-                        return Err(CaseFailure::new(format!(
-                            "fresh flow without same-protocol state and with firewall room was dropped: {out:?}"
-                        )));
+                        self.coverage.refused_after_expiry += 1;
+                        if REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY && out.creates {
+                            if let Some(reason) = self.model.owed(&out, true) {
+                                return Err(CaseFailure::new(format!(
+                                    "refused after expiry although owed ({reason}): {out:?}"
+                                )));
+                            }
+                        }
                     }
                     self.coverage.outbound_refused += 1;
                     return Ok(());
@@ -901,6 +1040,9 @@ impl Harness {
                     )));
                 }
                 self.coverage.translated_out += 1;
+                if owed.is_some() {
+                    self.coverage.owed_successes += 1;
+                }
                 match existing {
                     Some(index) => {
                         let flow = &mut self.model.flows[index];

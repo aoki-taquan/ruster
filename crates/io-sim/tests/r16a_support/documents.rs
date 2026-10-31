@@ -8,8 +8,10 @@
 //! - parsing/validation never panics, stays within the case time bound, and
 //!   is deterministic (two runs give equal results);
 //! - every rejection is value-free: neither the planted token nor a planted
-//!   numeric seed appears in the error's `Debug`, `Display`, or code, and an
-//!   accepted document's `Debug` never shows a planted seed;
+//!   numeric seed (whole, any 8-byte fragment, or hex-encoded) appears in a
+//!   config diagnostic/validation error's `Debug` or code (they implement no
+//!   `Display`) or a scenario error's `Debug`, `Display`, or code, and an
+//!   accepted unmutated document's `Debug` never shows a planted seed;
 //! - documents the generator marks `MUST_ACCEPT` parse, validate, and (for
 //!   configs) build a publication candidate.
 
@@ -26,6 +28,9 @@ use super::router::{RouterParams, LIMITS};
 use super::targets::{CaseFailure, V1Rng};
 
 /// Wall-clock bound for one document case (debug build, shared runner).
+///
+/// Checked only after the case returns: a case that never returns is cut
+/// by the workflow's job timeout instead, which writes no replay artifact.
 pub const MAX_DOCUMENT_CASE: Duration = Duration::from_secs(10);
 /// Generated documents stay below this size; the 1 MiB / 256 KiB parser
 /// input bounds are exercised by fixed tests.
@@ -156,8 +161,24 @@ fn mutate_bytes(document: &mut Vec<u8>, rng: &mut V1Rng) {
     }
 }
 
-fn contains(haystack: &str, needles: &[&str]) -> Option<usize> {
-    needles.iter().position(|needle| haystack.contains(needle))
+/// Shortest planted fragment that counts as a leak.
+pub const MIN_LEAK_FRAGMENT: usize = 8;
+
+/// Index of the first planted token that leaks into `haystack`, whole, as
+/// any [`MIN_LEAK_FRAGMENT`]-byte fragment, or hex-encoded (as raw frame
+/// bytes would render). Tokens are ASCII alphanumeric, so `Debug` string
+/// escaping leaves them unchanged.
+pub fn leaked(haystack: &str, needles: &[&str]) -> Option<usize> {
+    needles.iter().position(|needle| {
+        let hex: String = needle.bytes().map(|byte| format!("{byte:02x}")).collect();
+        haystack.contains(hex.as_str())
+            || needle
+                .as_bytes()
+                .windows(MIN_LEAK_FRAGMENT.min(needle.len()))
+                .any(|fragment| {
+                    haystack.contains(std::str::from_utf8(fragment).expect("ASCII token"))
+                })
+    })
 }
 
 fn timed<T>(label: &str, run: impl FnOnce() -> T) -> Result<T, CaseFailure> {
@@ -330,7 +351,7 @@ pub fn run_config_outcome(case: &CaseEnvelope<'_>) -> Result<DocumentOutcome, Ca
     let document = decode_payload(case.payload)?;
     let planted = [document.secret, document.numeric];
     let leak = |label: &str, rendered: &str| -> Result<(), CaseFailure> {
-        match contains(rendered, &planted) {
+        match leaked(rendered, &planted) {
             Some(which) => Err(CaseFailure::new(format!(
                 "{label} echoes planted {}",
                 ["secret token", "numeric seed"][which]
@@ -420,7 +441,7 @@ pub fn check_document_input_bounds() -> Result<(), CaseFailure> {
     if diagnostic.code() != ruster_config::DiagnosticCode::InputTooLarge
         || diagnostic.limit() != Some(MAX_CONFIG_BYTES)
         || diagnostic.actual() != Some(MAX_CONFIG_BYTES + 1)
-        || format!("{diagnostic:?}").contains(secret)
+        || leaked(&format!("{diagnostic:?}"), &[secret]).is_some()
     {
         return Err(CaseFailure::new(
             "oversized config diagnostic is not bounded/value-free",
@@ -433,7 +454,7 @@ pub fn check_document_input_bounds() -> Result<(), CaseFailure> {
         .ok_or_else(|| CaseFailure::new("oversized scenario accepted"))?;
     if error.code() != ruster_sim_scenario::ScenarioErrorCode::InputTooLarge
         || error.limit() != Some(MAX_SCENARIO_BYTES as u64)
-        || format!("{error:?}{error}").contains(secret)
+        || leaked(&format!("{error:?}{error}"), &[secret]).is_some()
     {
         return Err(CaseFailure::new(
             "oversized scenario error is not bounded/value-free",
@@ -589,7 +610,7 @@ pub fn run_scenario_outcome(case: &CaseEnvelope<'_>) -> Result<DocumentOutcome, 
                 Ok(_) => String::new(),
                 Err(error) => format!("{error:?} {error} {:?}", error.code()),
             };
-            if let Some(which) = contains(&rendered, &planted) {
+            if let Some(which) = leaked(&rendered, &planted) {
                 return Err(CaseFailure::new(format!(
                     "scenario {} echoes planted {}",
                     if first.is_ok() { "Debug" } else { "error" },

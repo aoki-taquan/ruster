@@ -405,8 +405,8 @@ fn r16a_v1_generation_is_exact_case_replayable() {
             Target::Publication,
             V1_SEEDS[1],
             31,
-            96,
-            0x6746_4c81_197a_feb8,
+            186,
+            0x4e4e_9a3e_b996_986c,
         ),
         (
             Target::Publication,
@@ -757,5 +757,27 @@ fn assert_exercised(rendered: &str) {
     assert!(
         !rendered.contains(": 0,") && !rendered.contains(": 0 }"),
         "a checked property was never exercised: {rendered}"
+    );
+}
+
+/// Known gap, not a guarantee: post-expiry firewall capacity liveness.
+///
+/// Today's core refuses a fresh flow after every flow of a full firewall
+/// table expired (see the `state-expired-firewall-capacity-after-idle-jump`
+/// corpus case). This test pins that refusal so the follow-up core fix must
+/// flip it deliberately: invert the assertion and enable
+/// `REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY` in the same change.
+#[test]
+fn r16_known_gap_expired_firewall_slots_still_refuse_fresh_flow() {
+    const { assert!(!r16a::state::REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY) };
+    let corpus = r16a::corpus::past_regressions();
+    let case = corpus
+        .iter()
+        .find(|case| case.name == "state-expired-firewall-capacity-after-idle-jump")
+        .unwrap();
+    let coverage = r16a::state::run_with_coverage(&parse(&case.encoded).unwrap()).unwrap();
+    assert!(
+        coverage.refused_after_expiry >= 1,
+        "the post-expiry refusal is gone; finish the follow-up: {coverage:?}"
     );
 }

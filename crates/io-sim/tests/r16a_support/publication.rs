@@ -122,9 +122,11 @@ fn variant(index: u8) -> Option<RouterParams> {
 pub fn generate(seed: u64, case_index: u64) -> Result<Vec<u8>, CaseFailure> {
     let mut rng = V1Rng::for_case(Target::Publication, seed, case_index);
     let mut payload = vec![0_u8; HEADER_LEN];
-    // Byte 0: key-source mode; bytes 4..12: repeat mask for mode 1.
+    // Byte 0: key-source mode; for mode 1, byte 2 is the repeat distance
+    // (1-3 generations back) and bytes 4..12 the repeat mask.
     payload[0] = u8::from(rng.below(4) == 0);
     if payload[0] == 1 {
+        payload[2] = 1 + u8::try_from(rng.below(3)).unwrap();
         payload[4..12].copy_from_slice(&rng.next_u64().to_le_bytes());
     }
     let ops = 4 + rng.below(MAX_OPS - 3);
@@ -154,18 +156,22 @@ pub fn generate(seed: u64, case_index: u64) -> Result<Vec<u8>, CaseFailure> {
     .map_err(|error| CaseFailure::new(format!("encode publication case: {error}")))
 }
 
-/// Simulation key source that, in repeat mode, hands out the previous
-/// generation's keys whenever the generation's mask bit is set.
+/// Simulation key source that, in repeat mode, hands out the keys of the
+/// generation `distance` (1-3) back whenever the generation's mask bit is
+/// set, so a guard that only compares against the previous key is caught.
+#[derive(Clone, Copy)]
 struct ScriptedKeys {
     seed: u64,
-    repeat_mask: Option<u64>,
+    repeat: Option<(u64, u64)>,
 }
 
 impl ScriptedKeys {
     fn source_generation(&self, generation: NonZeroU64) -> NonZeroU64 {
-        match self.repeat_mask {
-            Some(mask) if generation.get() > 1 && mask >> (generation.get() % 64) & 1 == 1 => {
-                NonZeroU64::new(generation.get() - 1).unwrap()
+        match self.repeat {
+            Some((mask, distance))
+                if generation.get() > distance && mask >> (generation.get() % 64) & 1 == 1 =>
+            {
+                NonZeroU64::new(generation.get() - distance).unwrap()
             }
             _ => generation,
         }
@@ -274,6 +280,8 @@ pub struct PublicationCoverage {
     pub restarts: u64,
     pub reactivation_refused: u64,
     pub key_reuse_refused: u64,
+    /// Key reuse from two or three generations back was refused.
+    pub far_key_reuse_refused: u64,
     pub bridge_refused: u64,
     pub invalid_refused: u64,
     pub replies_translated: u64,
@@ -293,6 +301,7 @@ impl PublicationCoverage {
             (&mut self.restarts, other.restarts),
             (&mut self.reactivation_refused, other.reactivation_refused),
             (&mut self.key_reuse_refused, other.key_reuse_refused),
+            (&mut self.far_key_reuse_refused, other.far_key_reuse_refused),
             (&mut self.bridge_refused, other.bridge_refused),
             (&mut self.invalid_refused, other.invalid_refused),
             (&mut self.replies_translated, other.replies_translated),
@@ -329,8 +338,9 @@ pub fn run_with_coverage(case: &CaseEnvelope<'_>) -> Result<PublicationCoverage,
     let payload = case.payload;
     if payload.len() < HEADER_LEN
         || payload[0] > 1
-        || payload[2..4] != [0, 0]
-        || (payload[0] == 0 && payload[4..12] != [0; 8])
+        || payload[3] != 0
+        || (payload[0] == 0 && (payload[2] != 0 || payload[4..12] != [0; 8]))
+        || (payload[0] == 1 && !(1..=3).contains(&payload[2]))
     {
         return Err(CaseFailure::new("publication payload header is malformed"));
     }
@@ -344,8 +354,12 @@ pub fn run_with_coverage(case: &CaseEnvelope<'_>) -> Result<PublicationCoverage,
     if ops.chunks_exact(OP_LEN).any(|chunk| chunk[0] >= op::COUNT) {
         return Err(CaseFailure::new("publication op kind is unknown"));
     }
-    let repeat_mask =
-        (payload[0] == 1).then(|| u64::from_le_bytes(payload[4..12].try_into().unwrap()));
+    let repeat = (payload[0] == 1).then(|| {
+        (
+            u64::from_le_bytes(payload[4..12].try_into().unwrap()),
+            u64::from(payload[2]),
+        )
+    });
     let base = RouterParams::BASE.validated()?;
     let tick = base.tick();
     let mut world = World {
@@ -353,11 +367,11 @@ pub fn run_with_coverage(case: &CaseEnvelope<'_>) -> Result<PublicationCoverage,
         cursor: 0,
         sequencer: PublicationSequencer::new(ScriptedKeys {
             seed: case.seed,
-            repeat_mask,
+            repeat,
         }),
         oracle_keys: ScriptedKeys {
             seed: case.seed,
-            repeat_mask,
+            repeat,
         },
         issued: Vec::new(),
         last_issued: None,
@@ -464,6 +478,13 @@ impl World<'_> {
             }
             Err(SequencerError::KeyReused(_)) if params.include_nat && reused => {
                 self.coverage.key_reuse_refused += 1;
+                if self
+                    .oracle_keys
+                    .repeat
+                    .is_some_and(|(_, distance)| distance > 1)
+                {
+                    self.coverage.far_key_reuse_refused += 1;
+                }
                 Ok(None)
             }
             Err(error) => Err(self.fail(format!("unexpected sequencer error {error:?}"))),
@@ -670,6 +691,22 @@ impl World<'_> {
                 active.resolution().pending_failure_holds(),
             ],
             icmpv4_actions: active.icmpv4_errors().pending_actions(),
+            counters: Counters {
+                resolution: active.resolution().counters(),
+                resolution_failures: active.resolution().failure_counters(),
+                icmpv4_errors: active.icmpv4_errors().counters(),
+                nat44_udp: active.nat44_udp().counters(),
+                nat44_tcp: active.nat44_tcp().counters(),
+                firewall: active.firewall().counters(),
+            },
+            bindings: Bindings {
+                storage_shape: active.storage_shape(),
+                nat44_udp: active.nat44_udp().config(),
+                nat44_tcp: active.nat44_tcp().config(),
+                resolution_policy: active.resolution().policy(),
+                icmpv4_error_policy: active.icmpv4_errors().policy(),
+                firewall_pristine: active.firewall().is_pristine(),
+            },
         }
     }
 
@@ -715,19 +752,18 @@ impl World<'_> {
                 {
                     return Err(self.fail("dry-run generations are wrong"));
                 }
-                let occupied = |count: usize| FlushCount::Exact(count);
-                let mappings = before
-                    .udp_mappings
-                    .iter()
-                    .filter(|slot| slot.is_occupied())
-                    .count();
-                let flows = before
-                    .firewall
-                    .iter()
-                    .filter(|slot| slot.is_occupied())
-                    .count();
-                if check.flush.nat44_udp_mappings != occupied(mappings)
-                    || check.flush.firewall_flows != occupied(flows)
+                fn exact<T: Copy>(slots: &[T], occupied: impl Fn(T) -> bool) -> FlushCount {
+                    FlushCount::Exact(slots.iter().filter(|slot| occupied(**slot)).count())
+                }
+                let flush = check.flush;
+                if flush.nat44_udp_mappings
+                    != exact(&before.udp_mappings, |slot| slot.is_occupied())
+                    || flush.nat44_udp_peers != exact(&before.udp_peers, |slot| slot.is_occupied())
+                    || flush.nat44_tcp_mappings
+                        != exact(&before.tcp_mappings, |slot| slot.is_occupied())
+                    || flush.nat44_tcp_sessions
+                        != exact(&before.tcp_sessions, |slot| slot.is_occupied())
+                    || flush.firewall_flows != exact(&before.firewall, |slot| slot.is_occupied())
                 {
                     return Err(self.fail("dry-run flush counts are not the live counts"));
                 }
@@ -964,7 +1000,32 @@ impl World<'_> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Cumulative runtime counters; a rejected apply or a dry-run must not
+/// change them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Counters {
+    resolution: ruster_core::ResolutionCounters,
+    resolution_failures: ruster_core::ResolutionFailureCounters,
+    icmpv4_errors: ruster_core::Icmpv4ErrorCounters,
+    nat44_udp: ruster_core::Nat44UdpCounters,
+    nat44_tcp: ruster_core::Nat44TcpCounters,
+    firewall: ruster_core::FirewallCounters,
+}
+
+/// Publication-bound runtime configuration readable through public
+/// accessors (the firewall binding itself is private; its pristine flag
+/// and the counters stand in for it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Bindings {
+    storage_shape: FullServiceStorageShape,
+    nat44_udp: ruster_core::Nat44UdpConfig,
+    nat44_tcp: ruster_core::Nat44TcpConfig,
+    resolution_policy: ruster_core::ResolutionPolicy,
+    icmpv4_error_policy: ruster_core::Icmpv4ErrorPolicy,
+    firewall_pristine: bool,
+}
+
+#[derive(Clone, PartialEq, Eq)]
 struct Observed {
     generation: NonZeroU64,
     last_apply: Option<ruster_control::ApplyReport>,
@@ -975,4 +1036,6 @@ struct Observed {
     firewall: Vec<ruster_core::FirewallStateSlot>,
     resolution: [usize; 4],
     icmpv4_actions: usize,
+    counters: Counters,
+    bindings: Bindings,
 }
