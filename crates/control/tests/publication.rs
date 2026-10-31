@@ -574,6 +574,19 @@ fn typed_errors_and_source_never_format_nested_authority_or_secrets() {
     }
     // The activation boundary (tick token, backend binding, !Debug/!Clone,
     // storage borrow) is enforced by compile_fail doctests in activation.rs.
+    // The AGENTS.md fast-path bans cannot be expressed that way, so guard the
+    // non-comment activation source against them.
+    let activation_code: String = include_str!("../src/activation.rs")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for forbidden in ["Mutex<", "dyn PacketIo", "Box::leak", "into_raw", "unsafe"] {
+        assert!(
+            !activation_code.contains(forbidden),
+            "forbidden activation source: {forbidden}"
+        );
+    }
     assert!(!exports.contains("FullServiceRuntimeSet,"));
 
     let candidate_start = source.find("pub struct ValidatedCandidate {").unwrap();
