@@ -10,7 +10,8 @@ active treeは、そのコードを継承しないv0.2のゼロベース実装�
 active treeは、外部依存を持たないpacket core、bounded worker runtime、sim I/O、
 benchmark harness、I/O conformance、AF_XDP ownership modelで構成します。
 data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control-planeの
-`ruster-config`だけは、保守されているSerde/TOML parserを最小featureで利用します。
+`ruster-config`とsim専用の`ruster-sim-scenario`だけは、保守されているSerde/TOML parserを
+最小featureで利用します。
 
 - `ruster-config`: 最大1 MiBのUTF-8 TOMLをschema versionでpredispatchし、V1の
   interface/address/route/neighbor/NAT44/firewall/capacity/tick budget DTOへexact decode
@@ -26,6 +27,12 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
   stateful forward firewallを扱う。
 - `ruster-io-sim`: rootやNICなしでRX/generated TXのFIFO、budget、TX/drop、
   traceを決定的に検証する。
+- `ruster-sim-scenario`: 最大256 KiBの`ruster-scenario/v1` TOMLを、seed、初期config path、
+  `inject`/`tick`/`apply`/`expect`/末尾`hold` stepのtyped modelへexact decodeする。
+  Ethernet II、ARP、IPv4、ICMPv4 Echo、UDP、TCPのcold側builderとraw hexでframeを
+  checksum込みのexact bytesへ組み立てる。config pathはscenario directory内の相対pathに限り、
+  時刻後退、unknown/duplicate field、上限超過をvalue-freeなtyped errorで拒否する。
+  fileを開かず、実行driverは持たない。
 - `ruster-io-afpacket`: Linux AF_PACKET/TPACKET_V3 backendのchecked configuration、
   fixed IfId mapping、ring ownership/UAPI scaffold。combined mmapのRX/TX extentを
   overlap/gap/overflow/実address alignmentまで検証し、後続state machine用metadataを

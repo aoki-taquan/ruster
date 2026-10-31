@@ -10,6 +10,7 @@ members = [
     "crates/io-xdp",
     "crates/io-xdp-native",
     "crates/runtime",
+    "crates/sim-scenario",
 ]
 resolver = "2"
 
