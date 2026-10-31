@@ -24,74 +24,114 @@
 
 ## 現在地
 
+2026-10-31時点の`main`（`477f2ef`、#281まで）をcodeから確認した状態である。以下で矛盾する
+場合はcode、[`requirements-v0.2.md`](requirements-v0.2.md)のledger、
+[`release-evidence/m1.md`](release-evidence/m1.md)を正とする。
+
 ### 実装済み
 
-active workspaceは外部依存を持たない二つのlibrary crateからなる。
+workspaceは12 crateからなる。data-planeとI/Oのlibrary crate（`ruster-core`、`ruster-io-*`、
+`ruster-runtime`、`ruster-bench`）は外部依存を持たない。外部依存は`ruster-config`と
+`ruster-sim-scenario`が直接使うserde/serde_path_to_error/tomlだけで、`ruster-control`と
+`ruster-cli`はpath depを通じてそれらを推移的に含む。
 
-- `ruster-core`
-  - backend-owned RX/generated bufferのGAT/RAII lease
-  - Ethernet II、IPv4 header/length/checksum、LPM、TTL/checksum/MAC rewrite
-  - static/dynamic ARP、retry、failure hold、generated ARP
+- packet core（`ruster-core`）
+  - backend-owned RX/generated bufferのGAT/RAII lease、stableな`DropReason`/`ConsumeReason`
+  - Ethernet II、exact ingress MAC admission、IPv4 header/length/checksum、common martian
+    admission（P0-INGRESS、ETH-002、IP4 rows）
+  - LPM、TTL/checksum/MAC rewrite、static/dynamic ARP、retry、failure hold、generated ARP
   - local ICMPv4 Echo、Time Exceeded、Network/Host Unreachable
-  - worker-local fixed-capacity UDP/TCP NAT44
-  - external ICMPv4 Type 3/Code 4 NAT translation
-  - opt-in stateful IPv4 UDP/TCP firewallとNAT RELATED照合
-- `ruster-io-sim`
-  - deterministic RX/TX/recycle FIFO
-  - received/generated partial TX、allocation failure、finish error
-  - lifecycle accountingとtyped trace
-- CI
-  - format、clippy、workspace tests、doctests、rustdoc、check
-  - requirements ledgerが参照するtest IDの機械検証
+  - worker-local fixed-capacity UDP/TCP NAT44（caller-backed directoryとdirect public-port
+    ownerによるbounded lookup/allocator、P0-NAT-INDEX）とexternal ICMPv4 Type 3/Code 4
+    translation
+  - opt-in stateful IPv4 UDP/TCP firewall、NAT RELATED照合、期限切れslotのbounded sweep回収
+    （#281、FW-021A）
+  - UDP/TCP NAT44+FW+generated ICMPのunaudited/audited public full composition（P0-COMPOSE）
+  - backend stats extension（`BackendStats`、`ObservableFields`）
+- worker runtime（`ruster-runtime`）: generic publication seam、`PublicationTick` token、
+  backend quiescence gate、明示budget付きbounded single-worker `run_tick`（RT-001〜003）、
+  allocation-freeな`TickObserver`とhealth/counter snapshot（OBS-004〜021）
+- config（`ruster-config`）: 最大1 MiBのversioned TOML parserとbounded semantic validation
+  （CONFIG-001〜003）
+- control（`ruster-control`）: owned `ValidatedCandidate`、config→candidate bridge、
+  sim専用決定的key source、`FullServiceStorage`/`ActivePublication`による5 runtimeの
+  preflight後一点commit、`ApplyPlan`、guard不要dry-run、`PublicationSequencer`による
+  generation/key採番とrollback（PUB-001〜009）
+- sim（`ruster-io-sim`、`ruster-io-conformance`、`ruster-sim-scenario`）: deterministic
+  RX/TX/recycle FIFO、backend conformance suite、`ruster-scenario/v1` model/frame builder、
+  run-sim driverとcanonical JSONL `ruster-run-sim/v1`、M1 golden fixture（SIM-001〜019）
+- CLI（`ruster-cli`、binary `ruster`）: `validate`、`plan`、`run-sim [--hold]`、
+  SIGINT/SIGTERMのordered shutdown（CLI-001〜007）
+- benchmark（`ruster-bench`）: NIC-free sim smoke/datapath suite、hardware plan/protocol/
+  artifact v1 schema（BENCH-001〜006）。v0.2 benchmark spec（R17）はdraft #282でowner承認待ち
+- real-I/O scaffold（productionではない）
+  - `ruster-io-afpacket`: checked TPACKET_V3 mapping、fixed-frame TX engine、persistent
+    RX block engine、core `PacketIo`のcopy backend（AFPKT-001〜007、IO-012）。証跡は
+    scripted syscall上のconformanceだけで、public live constructor、TX completion
+    scheduling、poll、netns/実NIC E2Eは無い
+  - `ruster-io-xdp`/`ruster-io-xdp-native`: AF_XDP ownership model、native ABI/ring
+    scaffold、private syscall RAII seam（XDP rows）。socket/UMEM登録、attach、`PacketIo`接続は
+    無い
+- CI: `CI` workflow（Check、Musl、Test、Clippy、Format、Doc。Testはdoctestとrequirements
+  gateを含む）と`Security Smoke` workflow（`R16A Bounded`、8 target×4 fixed seed）。
+  repository rulesetのrequired checkは`Check`、`Test`、`Clippy`、`Format`、`Doc`だけで、
+  `Musl`と`R16A Bounded`はrequiredではない
 
-NAT/FWはrewrite成功後、TX request前にstateをcommitし、backend rejectでも同一batch内の
-後続packetから見える。resolution、ICMP error、firewall、NATのmutable stateはcaller-backedで
-worker-localであり、live capacity pressureで別flowをevictしない。これらはreal backendへ
-持ち込む価値のある基盤である。
+milestone状態: M0のP0 rowはすべてledger上implementedだが、M0の独立release evidence fileは
+作っていない。M1は[`release-evidence/m1.md`](release-evidence/m1.md)のとおり、route-miss
+ICMPのowner判断、R16 checkのrequired化、R17 spec承認が残り未closeである。
 
 ### Partialまたは欠落
 
-- forwarded IPv4に対する統一されたingress L2 admissionとmartian source/destination policyが
-  ない。local ICMP、ARP、NATには個別防御があるが、plain forwardingを含む入口全体の境界ではない。
-- UDP/TCP NATはcaller-backed mapping/filter directoryとdirect public-port ownerへ移行済みで、
-  lookupはcapacity-bounded、allocatorは候補port数`P`だけをscanする。TCP mapping再生成も
-  generation+epochで旧sessionをlazyに無効化し、commitでsession全体をscanしない。
-- NAT+generated ICMP、FW+generated ICMP、NAT+FWのpublic wrapperはあるが、
-  UDP/TCP NAT+FW+generated ICMPを同時に選ぶfull composition wrapperがない。
-  private `forward_batch_inner`は全serviceを同時に受け取れるため、内部能力ではなくpublic
-  compositionの欠落である。
-- architecture順のbounded single-worker tickとgeneric publication seamは`ruster-runtime`に
-  ある。具体的なowned publication、設定parser、daemon、thread/signal lifecycleは後続taskである。
-- `ForwardingSnapshot`とNAT/FW configはborrowed sliceのpointer identityへbindされる。
-  owned configをmove/reallocateした後のsnapshot、runtimeより短命なrule slice、partial reloadは
-  fail closedまたはdangling設計を招く。Rustのborrowでmemory safetyは守れても、daemonの
-  publication lifetimeとatomic replacementを先に設計する必要がある。
-- declarative config、schema version、validate/plan/apply、rollback、daemon、CLI、signal処理、
-  privilege separation、persistent diagnosticsがない。
-- production backend、AF_PACKET、AF_XDP、libxdp FFI、XDP program lifecycle、multi-queue
-  worker ownershipがない。
-- countersを運用系へexportするsnapshot、structured log、health/readiness、queue saturation、
-  config generation表示がない。
-- parser/state machine/checksumのfuzz、property test、loom相当のownership model test、
-  sanitizer、long soak、failure injection matrixがCIへ組み込まれていない。
-- benchmark harness、packet-size/flow-count matrix、latency、cycles/packet、cache miss、
-  copy/zero-copy判定、10GbE acceptance threshold、hardware runnerがない。
+- production backendが無い。AF_PACKETはscripted syscall上のcopy backendまで、AF_XDPは
+  ownership model/native scaffoldまでで、`ruster run`、XDP program lifecycle、multi-queue
+  worker ownership、netns/実NIC E2Eは無い（M2）。
+- firewall有効時のroute missはsilent dropで、Destination Unreachable Networkを生成しない
+  （SIM-010 deviation、owner確認待ち）。
+- `run-sim`はrestart-required applyをrejectとして報告し、同一process内でstorageを
+  作り直さない（SIM-016 deferred）。process restartをまたぐgeneration/key履歴は無い。
+- OS乱数によるproduction key sourceと、sim専用key sourceを`run`で拒否する仕組みが無い（M2）。
+- NAT/FW占有、resolution/action/audit high-watermark、native ringのsaturationが無い
+  （OBS-015/017/018 deferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
+- optional serviceを表すcomposition seamが無く、M1はUDP/TCP NAT44+FWを必須とする。
+- R17 benchmark spec（数値threshold、`benchmark-smoke.yml`）がmainに無い（#282 draft）。
+- privilege separation、persistent diagnostics、structured log、metrics endpoint、
+  config history、sanitizer、long soak、netns/hardware CIが無い。
+
+### 計画との差分（2026-10-31確認）
+
+実装を進めた結果、この文書の次の記述は実態とずれている。設計変更はせず事実だけを記録する。
+
+- 依存とlock: 「外部依存なし」は旧状態。serde/tomlは#251がcodeと同じPRで追加し、新crate追加
+  PR（#259、#267、#277、#279等）も`Cargo.lock`を変更した。root `Cargo.toml`/`Cargo.lock`を
+  RI-DEPだけが編集する規則は守られていない。規則を改めるかはowner判断である。
+- R10/live activation: plan/applyとlive activationは`ruster-control`
+  （`plan.rs`の`ApplyPlan`/`PublicationSequencer`、`activation.rs`）に置いた（S2/S3）。work packet表のR10 rowは
+  これに合わせて更新した。
+- R16: 実装は`fuzz/`ではなく`crates/io-sim/tests/r16a_support`と`fuzz-smoke.yml`
+  （#249、#252、#280）。work packet表のR16 rowを更新した。`R16A Bounded`と`Musl`
+  （#244 titleは「required」）は現状required checkではない。
+- R15: core accessorが必要なhigh-watermarkは見送り（OBS-015/017/018）、R15 rowへ注記した。
+  #276は`BackendStats`/`DropReason::ALL`等をcoreへ追加しており、`crates/core/src/lib.rs`を
+  RI0だけが編集する規則とはずれている。
+- dependency graph: R11（S5b driver）は実際にはR10（S3）、live activation（S2）、R15（S4）の
+  merge後に実装した。graphへ注記した。
+- R17とhardware v1文書の関係、M1/M2でのspec SHAの扱いは#282で提案中で未決である。
+- config/control/runtimeのservice必須性とrollbackの意味は「M1 owner決定」で解決済みである。
 
 ### Open issue hygiene
 
-open issueのうち、#200、#202、#207はactive v0.2 treeより前のcrate、API、reportを前提にする。
-issue本文にあるprototype Rustを実装資産として再利用せず、次のmappingをissue tracker側へ
-commentした後にsupersedeまたはdeferする。roadmap文書のmergeだけでissueをcloseしたことには
-しない。
+#200、#202、#207はactive v0.2 treeより前のcrate、API、reportを前提にしていたため、次のmappingを
+issue tracker側へcommentしたうえで2026-07-30に`not planned`としてcloseした（H00完了）。
+prototype Rustを実装資産として再利用しない。
 
-| Issue | 現在の前提 | v0.2での扱い | Tracker action |
+| Issue | 当時の前提 | v0.2での扱い | Tracker action |
 |---|---|---|---|
-| #200 DPDK実I/O | 消滅した`ruster-dataplane`、`DpdkPacketIo`、旧`router.toml`を前提 | M2はAF_XDPをproduction backendの第一候補とする。DPDKはP2かM3後に、新backend contractから設計し直すまでdefer | #200へR07/X00–X05を参照するsuperseded/deferred noteを追加し、旧実装taskとしてcloseするか`deferred` labelへ移す |
-| #202 OSPF/BGP run loop | active treeに存在しない旧engine、RIB/FIB、main loopを「実装済み」とする | dynamic routingはM3のstatic-router運用後に再scopeする。RFCとblack-box protocol期待値だけを再利用し、旧engine codeは移植しない | #202へP2-ROUTING後の新design issueが必要と記録し、現issueをsuperseded/deferredにする |
-| #207 v0.1性能report | 旧benchmark binaryとplaceholder reportを前提 | R17でv0.2 benchmark specを先にfreezeし、X05がそのSHAに対する実測artifactを作る。v0.1 reportへv0.2数値を追記しない | #207へR17/X05 mappingをcommentし、v0.1計測taskとしてsuperseded closeする |
+| #200 DPDK実I/O | 消滅した`ruster-dataplane`、`DpdkPacketIo`、旧`router.toml`を前提 | M2はAF_XDPをproduction backendの第一候補とする。DPDKはP2かM3後に、新backend contractから設計し直すまでdefer | superseded noteを追加しclose済み |
+| #202 OSPF/BGP run loop | active treeに存在しない旧engine、RIB/FIB、main loopを「実装済み」とする | dynamic routingはM3のstatic-router運用後に再scopeする。RFCとblack-box protocol期待値だけを再利用し、旧engine codeは移植しない | P2-ROUTING後の新design issueが必要と記録しclose済み |
+| #207 v0.1性能report | 旧benchmark binaryとplaceholder reportを前提 | R17でv0.2 benchmark specを先にfreezeし、X05がそのSHAに対する実測artifactを作る。v0.1 reportへv0.2数値を追記しない | R17/X05 mappingをcommentしclose済み |
 
-issue整理PR/operationはdocs/code PRと分け、close理由、replacement PR/issue、prototype非再利用を
-相互linkする。将来DPDKやdynamic routingを再開する場合も、v0.2 backend/publication/runtime
+将来DPDKやdynamic routingを再開する場合も、v0.2 backend/publication/runtime
 contractから新しいacceptance criteriaを作る。
 
 ## P0/P1/P2 backlog
@@ -239,6 +279,11 @@ M1への経路はgap分析のslice S1〜S9とする。
 - S8a/S8b: R16 NAT/FW state・config fuzz、publication/apply property。
 - S9: RD0 docsとM1 release evidence。
 
+実績（2026-10-31）: S1 #273、S2 #274、S3 #275、S4 #276、S5a #277、S5b #278、S6a/S6b #279
+（一PR）、S8a/S8b #280（一PR）はmerge済み。#280が見つけたfirewall期限切れslotのliveness
+bugは#281で修正した。S7は#282（draft、threshold owner承認待ち）、S9はRD0とM1 release
+evidence（[`release-evidence/m1.md`](release-evidence/m1.md)）。M1 exit判定はevidence fileで行う。
+
 ### M2: Operable AF_XDP static router
 
 一workerまたはqueue-shardedな静的LAN/WAN構成をAF_XDPで継続運用できる。
@@ -330,6 +375,10 @@ R08 merge後に別crate/fileで並列化でき、R15はconfig generation schema�
 並列化できる。R12はR10とR11の両方に依存し、X04はX01–X03に加えて
 runtime/config/observabilityへ依存する。
 
+実績注記（M1）: reloadを含むM1 golden scenarioのため、R11のdriver（S5b #278）は実際には
+R10（S3 #275）、live activation（S2 #274）、R15（S4 #276）のmerge後に実装した。
+scenario model（S5a #277）だけがR08後に独立して進められた。
+
 ## Work packets、file ownership、acceptance
 
 全packetがconflict-freeではない。共有fileは明示したintegration ownerだけが編集し、
@@ -356,10 +405,10 @@ matching requirements rowを同じPRで完成させる。
 | R07 | new backend conformance crate/filesとsim adapter test | RX/generated exactly-once、partial reject、finish error、abandon | backend ownership |
 | R08 | RI0/R06/R07後。new runtime crateのtick module/test | phase順、全budget bounded、RX borrow後generated、error時pending保存 | lifecycle/performance |
 | R09 | R08後。config crateの`model`/`parse`/`validate` module | schema version、duplicate/unknown/canonicality/realm/capacityをmutation前にtyped reject | product/security |
-| R10 | R09後。config/runtimeの`plan`/`apply` module | dry-run diff、all-or-nothing apply、restart-required、new-generation rollback | failure atomicity |
+| R10 | R09後。publication ownerである`ruster-control`の`plan`/`activation` module（実績: S2 #274、S3 #275） | dry-run diff、all-or-nothing apply、restart-required、new-generation rollback | failure atomicity |
 | R11 | R08後。sim scenario crate/moduleとgolden fixtures | deterministic timestamp/ingress/frame inputとtyped output。packet path Stringなし | test/product |
-| R15 | R09後（R09はR08依存）。runtime `observability` moduleと専用snapshot test | allocation-free typed snapshot、generation、health、core state/action/audit high-watermark、backend stats extension pointとsim実装、saturating counters。formatはcold consumerだけ | operations/performance |
-| R16 | R01/R03/R04/R05/R06/R08/R09後。`fuzz/`、new property tests、`.github/workflows/fuzz-smoke.yml`だけ | fixed seed/corpusと時間上限を記録し、parser/checksum/state/publication invariants、過去failure corpusをrequired unprivileged smokeで実行 | security/test |
+| R15 | R09後（R09はR08依存）。runtime `observability` moduleと専用snapshot test | allocation-free typed snapshot、generation、health、core state/action/audit high-watermark、backend stats extension pointとsim実装、saturating counters。formatはcold consumerだけ（実績 #276: core accessorが要るhigh-watermarkはOBS-015/017/018でdeferred） | operations/performance |
+| R16 | R01/R03/R04/R05/R06/R08/R09後。`fuzz/`、new property tests、`.github/workflows/fuzz-smoke.yml`だけ（実績: dependency-free runnerを`crates/io-sim/tests/r16a_support`に置いた。#249、#252、#280） | fixed seed/corpusと時間上限を記録し、parser/checksum/state/publication invariants、過去failure corpusをrequired unprivileged smokeで実行 | security/test |
 | R17 | R08/R15後。benchmark crate、`docs/benchmark-spec-v0.2.md`、`.github/workflows/benchmark-smoke.yml`だけ | queue/flow/packet/service matrix、pps/loss/p50/p99/regression/soak/operator thresholdを結果取得前に数値freezeしspec SHAを出力。通常CIはsim smokeのみ | performance/reproducibility |
 | R12 | R08/R10/R11/R15/R16/R17後。binary crateとnew M1 E2E | validate/plan/run-sim、exit status、signals、ordered shutdown、observability、frozen spec SHA表示 | operations/security |
 | R13 | R07/R08後。AF_PACKET crateのbackend files | backend-owned preallocated slots、IfId mapping、partial TX、no packet clone | backend/performance |
