@@ -56,6 +56,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruster-cli"
+version = "0.2.0"
+dependencies = [
+ "ruster-config",
+ "ruster-control",
+ "ruster-core",
+ "ruster-io-sim",
+ "ruster-sim-scenario",
+]
+
+[[package]]
 name = "ruster-config"
 version = "0.2.0"
 dependencies = [

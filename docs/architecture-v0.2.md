@@ -900,6 +900,20 @@ hash key、seedを含みません。step単位（tickは1回ずつ）の`SimRun:
 停止flagを確認できます。full compositionはfirewall必須のため、route missはsilentな
 `FIREWALL_ROUTE_UNAVAILABLE`でDestination Unreachable Networkは生成されません。
 
+### `ruster` CLI（M1）
+
+`ruster-cli`はcold sideだけのbinaryで、data-plane/I/O crateへcodeを追加しません。
+`validate`/`plan`はconfigを`run-sim`と同じlimitでparse/validateし、`validate`は捨てる
+candidateを作ってM1 service bridgeまで確認します（key値は出力しない）。`plan`は
+`ApplyPlan::between`をfield順固定のtextへ描画します。`run-sim`は`SimRun::step`の各呼出し前に
+停止flagを読み、signalはtick境界でだけ効きます。shutdownは「stepを止める→
+`SimRun::check_quiescence`（backendの`try_publication_quiescence`）→`final` event」の順で、
+quiescenceが崩れていればexit 1です。注入済みで未受信のframeはleaseではなく`pending_rx`として
+`final`に出ます。signal handlerは`signal(2)`で登録し、static `AtomicBool`へのrelaxed store
+だけを行います（lock-free atomic storeはasync-signal-safe）。handlerは戻さず、親が
+SIGINTをignoreしていても上書きします。Linux以外ではhandlerを登録しません。`unsafe`は
+private `signal` moduleだけで、crateは`#![deny(unsafe_code)]`です。
+
 ### AF_PACKET checked combined-mapping substrate
 
 `ruster-io-afpacket`のAP0は、64-bit Linuxのstrict TPACKET_V3 profileについて

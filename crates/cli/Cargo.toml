@@ -1,0 +1,17 @@
+[package]
+name = "ruster-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ruster"
+path = "src/main.rs"
+
+[dependencies]
+ruster-config = { path = "../config" }
+ruster-control = { path = "../control" }
+ruster-core = { path = "../core" }
+ruster-io-sim = { path = "../io-sim" }
+ruster-sim-scenario = { path = "../sim-scenario" }
