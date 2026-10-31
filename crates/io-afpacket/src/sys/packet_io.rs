@@ -59,9 +59,28 @@
 //!   RX packets that fail validation are never leased and are not counted;
 //!   they appear only in the per-port `BackendStats`. A `mem::forget`-ten
 //!   lease is finalized by a later cursor step and is not counted either.
-//! - `error`: the first backend fault of the batch: a halting RX fault of any
-//!   port, a TX fault-class rejection, or the first failed kick. Routine
-//!   rejections are not errors. Accounting is complete in every case.
+//! - `error`: the first backend fault of the batch: a newly observed halting
+//!   RX fault of any port, a TX fault-class rejection, or the first failed
+//!   kick. Routine rejections are not errors. Accounting is complete in every
+//!   case.
+//!
+//! RX halts are edge-triggered. A halt becomes `error` only in the batch that
+//! first observes that halt event, using the same sticky event identity that
+//! counts it once in `BackendStats`. While the same condition persists, later
+//! batches skip the halted port without an error; a different halt, or the
+//! same condition recurring after the port made progress, is a new event and
+//! is reported again. The runtime treats any finish error as a backend I/O
+//! failure and skips generated ARP/ICMP for every port in that tick, so a
+//! level-triggered report would let one halted port starve healthy ports
+//! indefinitely. The halted state stays visible through `BackendStats`;
+//! health reporting and escalation are deferred (R15/AP3).
+//!
+//! PacketIo alone never reaps TX completions. Accepted frames are returned
+//! only by the engine's bounded `scan_completions`, which today only tests
+//! call. Without it each egress TX ring is exhausted after `frame_count`
+//! accepted commits, and later commits are routinely rejected as ring full
+//! with `error == None`. A public constructor must not be exposed before AP3
+//! adds completion scheduling.
 //!
 //! `finish` and `Drop` both try `send(MSG_DONTWAIT)` at most once per egress
 //! port that accepted a frame in this batch and never retry.
@@ -186,6 +205,7 @@ impl<O: PacketOps> AfPacketBatch<'_, O> {
     fn next_rx(&mut self) -> Option<LeasedRx> {
         while self.ports_left != 0 {
             let port = self.port;
+            let already_reported = self.engine.ports[port].rx_sticky_halt();
             match self.engine.ports[port].rx_step(&mut self.rx, &mut self.rx_report) {
                 // A packet-local or whole-block fault is already terminal and
                 // counted in the port's BackendStats; delivery continues.
@@ -204,8 +224,14 @@ impl<O: PacketOps> AfPacketBatch<'_, O> {
                 }
                 Step::Stop(_) => self.next_port(),
                 Step::Halt(fault) => {
-                    let interface = self.engine.ports[port].interface;
-                    self.record(AfPacketIoError::Rx { interface, fault });
+                    // Edge-triggered: a halt is an error only in the batch
+                    // that first observes it (the same event identity that
+                    // `BackendStats` counts once), so one persistently
+                    // halted port does not fail every later batch.
+                    if already_reported != Some(fault) {
+                        let interface = self.engine.ports[port].interface;
+                        self.record(AfPacketIoError::Rx { interface, fault });
+                    }
                     self.next_port();
                 }
             }
@@ -244,11 +270,14 @@ impl<O: PacketOps> AfPacketBatch<'_, O> {
 
     fn complete_rx(&mut self, port: usize, token: RxPacketToken, end: Completion) {
         let resources = &mut self.engine.ports[port];
+        let already_reported = resources.rx_sticky_halt();
         if let Err(error) = resources.rx_complete(token, end, &mut self.rx_report) {
             let fault = RxFault::Release(error);
             resources.rx_note_halt(fault);
             let interface = resources.interface;
-            self.record(AfPacketIoError::Rx { interface, fault });
+            if already_reported != Some(fault) {
+                self.record(AfPacketIoError::Rx { interface, fault });
+            }
         }
     }
 

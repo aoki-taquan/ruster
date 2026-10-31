@@ -132,28 +132,47 @@ fn af_packet_finish_error_preserves_partial_reject_accounting_and_single_kick() 
 fn af_packet_rx_halt_and_tx_fault_report_errors_with_exact_accounting() {
     let mut harness = DefaultHarness::new();
     // RX: a head status that is neither KERNEL nor USER halts that port.
+    // The halt is edge-triggered: only the batch that first observes a halt
+    // event reports it, so a persistently halted port does not turn every
+    // later batch into a backend failure for the healthy ports.
+    let halt = |status| AfPacketIoError::Rx {
+        interface: CONFORMANCE_LAN,
+        fault: RxFault::Status {
+            block_index: 0,
+            status,
+        },
+    };
+    let run = |harness: &mut DefaultHarness| {
+        let (io, _) = harness.io_and_observer();
+        let mut batch = io.receive(4).expect("receive");
+        let mut delivered = Vec::new();
+        while let Some(packet) = batch.next_packet() {
+            delivered.push(packet.ingress());
+            packet.recycle(DropReason::RouteMiss);
+        }
+        (delivered, batch.finish())
+    };
     harness.view(LAN_PORT).set_rx_status(2);
-    for _ in 0..2 {
-        let completion = {
-            let (io, _) = harness.io_and_observer();
-            let mut batch = io.receive(4).expect("receive");
-            assert!(batch.next_packet().is_none());
-            batch.finish()
-        };
-        assert_eq!(counts(&completion), (0, 0, 0, 0));
-        assert_eq!(
-            completion.error,
-            Some(AfPacketIoError::Rx {
-                interface: CONFORMANCE_LAN,
-                fault: RxFault::Status {
-                    block_index: 0,
-                    status: 2,
-                },
-            })
-        );
-    }
-    // The persistent halt is counted once, not once per batch.
+    let (delivered, first) = run(&mut harness);
+    assert!(delivered.is_empty());
+    assert_eq!(counts(&first), (0, 0, 0, 0));
+    assert_eq!(first.error, Some(halt(2)));
     harness.trace().expected_stats[LAN_PORT].status_rejected = 1;
+    // Same halt persists: no error, and the healthy WAN port is served.
+    harness.inject_rx_block(CONFORMANCE_WAN, vec![vec![0x31]]);
+    let (delivered, second) = run(&mut harness);
+    assert_eq!(delivered, [CONFORMANCE_WAN]);
+    assert_eq!(counts(&second), (0, 0, 0, 1));
+    assert_eq!(second.error, None);
+    assert_eq!(harness.drain_copy_rx_block_returns().len(), 1);
+    // A distinct halt is a new event and is reported again, once.
+    harness.view(LAN_PORT).set_rx_status(4);
+    let (_, third) = run(&mut harness);
+    assert_eq!(third.error, Some(halt(4)));
+    let (_, fourth) = run(&mut harness);
+    assert_eq!(fourth.error, None);
+    // Each distinct halt event is counted once in BackendStats.
+    harness.trace().expected_stats[LAN_PORT].status_rejected = 2;
     harness.view(LAN_PORT).set_rx_status(TP_STATUS_KERNEL);
 
     // TX: an unknown producer-head status is a fault-class rejection; the
@@ -204,6 +223,58 @@ fn af_packet_receive_round_robins_ports_under_packet_budget() {
         ]
     );
     assert_eq!(harness.drain_copy_rx_block_returns().len(), 2);
+}
+
+#[test]
+fn af_packet_round_robin_resumes_after_the_port_that_exhausted_the_budget() {
+    // Batch one starts at LAN, drains its single packet, and exhausts the
+    // packet budget on WAN. The next batch must start at the port after
+    // WAN (LAN), not at the port after this batch's start (WAN).
+    let mut harness = DefaultHarness::new();
+    harness.inject_rx_block(CONFORMANCE_LAN, vec![vec![1]]);
+    harness.inject_rx_block(CONFORMANCE_WAN, vec![vec![10], vec![11], vec![12]]);
+    let drain = |harness: &mut DefaultHarness, budget| {
+        let (io, _) = harness.io_and_observer();
+        let mut batch = io.receive(budget).expect("receive");
+        let mut order = Vec::new();
+        while let Some(mut packet) = batch.next_packet() {
+            order.push((packet.ingress(), packet.bytes_mut()[0]));
+            packet.recycle(DropReason::RouteMiss);
+        }
+        assert!(batch.finish().error.is_none());
+        order
+    };
+    assert_eq!(
+        drain(&mut harness, 2),
+        [(CONFORMANCE_LAN, 1), (CONFORMANCE_WAN, 10)]
+    );
+    harness.inject_rx_block(CONFORMANCE_LAN, vec![vec![2]]);
+    assert_eq!(drain(&mut harness, 1), [(CONFORMANCE_LAN, 2)]);
+    assert_eq!(drain(&mut harness, 1), [(CONFORMANCE_WAN, 11)]);
+}
+
+#[test]
+#[should_panic(expected = "changed without being published")]
+fn af_packet_harness_detects_a_write_into_an_unpublished_tx_frame() {
+    // Regression for a reviewed mutation that copied a rejected payload into
+    // the in-flight head TX frame: the copy counter is the engine's own, so
+    // the harness must catch such a write from ring bytes alone. A one-frame
+    // WAN ring keeps its only frame in flight; overwriting its payload
+    // between the snapshot and the check must be detected.
+    let mut harness = OneFrameHarness::new();
+    harness.inject_rx_block(CONFORMANCE_LAN, vec![vec![0x55; 8]]);
+    {
+        let (io, _) = harness.io_and_observer();
+        let mut batch = io.receive(1).expect("receive");
+        batch.next_packet().expect("packet").commit(CONFORMANCE_WAN);
+        assert_eq!(batch.finish().tx_accepted, 1);
+    }
+    let wan = harness.view(WAN_PORT);
+    assert_eq!(wan.tx_status(0), TP_STATUS_SEND_REQUEST);
+    let trace = harness.trace();
+    let snapshot = trace.tx_snapshot();
+    wan.overwrite_tx_payload_for_test(0, &[0xee; 8]);
+    trace.assert_tx_unchanged_except(&snapshot, &[]);
 }
 
 #[test]

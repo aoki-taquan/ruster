@@ -486,6 +486,9 @@ impl<O: PacketOps> PacketRingResources<O> {
                 .ring_address(self.extents, RingKind::Tx, data_offset, payload.len, 1)?;
         let length =
             u32::try_from(payload.len).map_err(|_| MappingAccessError::ArithmeticOverflow)?;
+        // Every checked address, including the status word, is resolved
+        // before ownership changes or any byte moves.
+        let status_offset = self.tx_frame_status_offset(frame_index)?;
         let frame = &mut self.metadata.tx_frames_mut()[frame_index];
         frame
             .ownership
@@ -531,14 +534,16 @@ impl<O: PacketOps> PacketRingResources<O> {
             counts.tx_copies += 1;
             counts.tx_copied_bytes += payload.len;
         });
-        frame
-            .ownership
-            .publish()
-            .map_err(MappingAccessError::Ownership)?;
-        self.mapping.store_status_release(
-            frame_offset + offset_of!(Tpacket3Hdr, tp_status) + self.extents.tx().start(),
-            TP_STATUS_SEND_REQUEST,
-        )
+        if let Err(error) = frame.ownership.publish() {
+            // The ring status is still AVAILABLE, so the kernel never sees
+            // the copied bytes. Roll the frame back to Available instead of
+            // leaving it Prepared, which would make it a silent permanent
+            // Unavailable; the caller reports the error as a fault.
+            let _ = frame.ownership.cancel_prepared();
+            return Err(MappingAccessError::Ownership(error));
+        }
+        self.mapping
+            .store_status_release(status_offset, TP_STATUS_SEND_REQUEST)
     }
 
     fn tx_metadata(&self, frame_index: usize) -> &crate::boundary::TxFrameMetadata {
@@ -620,9 +625,16 @@ impl<'p> TxPayload<'p> {
 
     /// # Safety
     ///
-    /// `source..source + len` must stay readable for `'p`, no `&mut`
-    /// reference may alias it while the payload exists, and it must not
-    /// overlap any TX extent of any port mapping.
+    /// For all of `'p`:
+    ///
+    /// - `source..source + len` stays readable and is not written by anyone,
+    ///   neither userspace nor the kernel (an RX source must lie in a block
+    ///   that stays USER-owned, which the kernel does not write);
+    /// - no `&mut` reference aliases it;
+    /// - it does not overlap any TX extent of any port mapping.
+    ///
+    /// The payload must not be retained beyond the submission call that
+    /// consumes it.
     pub(super) const unsafe fn from_raw(source: NonNull<u8>, len: usize) -> Self {
         Self {
             source,

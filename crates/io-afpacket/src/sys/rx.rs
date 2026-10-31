@@ -803,6 +803,12 @@ impl<O: PacketOps> PacketRingResources<O> {
         Step::Halt(fault)
     }
 
+    /// The halting fault already counted for the current condition, if any.
+    /// A halt equal to this value is a repeat of an event already reported.
+    pub(super) const fn rx_sticky_halt(&self) -> Option<RxFault> {
+        self.rx_cursor.sticky
+    }
+
     pub(super) fn rx_note_halt(&mut self, fault: RxFault) {
         if self.rx_cursor.sticky != Some(fault) {
             self.rx_stats.record(fault.halt_stat());

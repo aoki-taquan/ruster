@@ -943,19 +943,39 @@ TX budget枯渇、ring full、fault-class reject(未知status、generation枯渇
 違反)、`recycled`をRecycle/Consume/LeaseAbandonedとして`invariants_hold`を常に満たします。
 検証faultのRX packetはleaseされないため`recycled`に入らずport `BackendStats`だけに計上し、
 `mem::forget`されたleaseは後続cursor stepが一度だけabandonとして確定します。`error`は
-batch中最初のbackend fault(port単位のRX halt、fault-class TX reject、最初のkick失敗)で、
-通常のrejectはerrorにしません。`finish`とDropは受理portごとに`send(MSG_DONTWAIT)`を最大
+batch中最初のbackend fault(新たに観測したport単位のRX halt、fault-class TX reject、最初の
+kick失敗)で、通常のrejectはerrorにしません。
+
+RX haltはedge-triggeredです。haltは、`BackendStats`へ一回だけ数える既存のsticky halt event
+identityを使い、そのeventを最初に観測したbatchでだけ`error`になります。同じ条件が続く間の
+後続batchはhalt中portをerrorなしでskipし、別のhalt、またはportが進捗した後の再発は新しい
+eventとして再度報告します。runtimeはfinish errorを`BackendIoFailure`として扱い、そのtickの
+generated ARP/ICMPを全portでskipするため、level-triggeredでは一つのhalt portが健全なportを
+無期限にstarveさせます。halt状態は`BackendStats`で引き続き観測でき、health報告とescalationは
+R15/AP3へdeferredです。
+
+`PacketIo`単体はTX completionを回収しません。受理frameを戻すのはengineのbounded
+`scan_completions`だけで、現在これを呼ぶのはtestだけです。従って各egress TX ringは
+`frame_count`回の受理で尽き、以降のcommitはring fullの通常rejectとして`error == None`の
+まま拒否されます。AP3がcompletion schedulingを追加するまでpublic constructorを公開しては
+なりません。`finish`とDropは受理portごとに`send(MSG_DONTWAIT)`を最大
 一回だけ試しretryしません。hot pathはheap allocation、lock、trait objectを使いません。
 
 IO-012の証跡として、reusable `ruster-io-conformance` RX-to-distinct-TX copy suiteを
 private static-dispatchの`ConformanceOps`(scripted mmap/kick)上の実engineで実行します。
-pass-through decoratorはlease address、実TX ringのSEND_REQUEST遷移、frame header/payload、
-engineのRX status store、syscall logだけを観測し、報告したgenerationをengine metadataと
-照合します。AF_PACKETはportごとにTX ringが一つなのでsuiteのqueue番号はring labelであり、
+pass-through decoratorはscripted ring/syscall状態から、lease address、実TX ringの
+SEND_REQUEST遷移、frame header/payload、新規publish以外の全TX frameが全byte不変であること
+(reject時copyなしの独立証拠)、RX block statusのKERNEL化(各engine呼び出し後に全pending block
+を確認)、syscall logを観測し、報告したgenerationをengine metadataと照合します。per-block scan
+counter、RX/TX status read・descriptor counter、copy回数/byte数はtest専用`PortProbe`由来で、
+copy回数は新規publish frame数と、block return数はstatus wordと照合します。AF_PACKETはportごとにTX ringが一つなのでsuiteのqueue番号はring labelであり、
 FIFO producer/one-block RX ringのためpreferred frame/block指定は選択ではなくassertです
 (TX reuse caseはone-frame TX ringで実行)。RX work counterは全caseのingressであるLAN portの
 値です。TX storageを予約しtokenを付けてからrejectする前提の3 case(partial reject、finish
-error、rejected TX ABA)はAF_PACKETにreserve-then-reject経路が無いため非適用とし、ring full
+error、rejected TX ABA)はAF_PACKETにreserve-then-reject経路が無いため非適用とします。
+rejected TX ABAが守る性質は、rejectがframeをreserveせずgenerationを進めないことから自明に
+成り立ち、AP1-TXの`tx_status_validation_precedes_reserve_and_rejected_packets_copy_nothing`、
+`settle()`のgeneration/metadata照合、上記byte不変checkで検証します。代わりにring full
 によるpartial reject、kick失敗のfinish errorとsingle kick、RX halt/TX faultのerror mapping、
 hairpin byte、round-robin、forget、steady allocation zeroをAF_PACKET固有testで検証します。
 poll統合、TX completionのscheduling、live stats/cleanup、public constructorはAP3、実NIC/netns

@@ -8,14 +8,35 @@
 //! out and moves TX frames from SEND_REQUEST to SENDING/AVAILABLE.
 //!
 //! The PacketIo seen by the suite is [`TracedIo`], a pass-through decorator
-//! around the engine. It forwards every call unchanged and only observes:
-//! source identity comes from lease addresses, TX acceptance from a TX frame
-//! status that became SEND_REQUEST in the ring of the port that received it,
-//! descriptor length and payload from that frame's header and bytes, block
-//! return from the engine's real RX status store, and kicks from the scripted
-//! syscall log. Generations reported at injection or acceptance are verified
-//! against engine metadata before the next harness operation. Allocation is
-//! counted only while engine code runs.
+//! around the engine. It forwards every call unchanged and observes.
+//!
+//! Observed from scripted ring/syscall state (independent of the engine):
+//!
+//! - source identity from lease addresses;
+//! - TX acceptance from a TX frame status that became SEND_REQUEST in the
+//!   ring of the port that received it, its descriptor length and payload
+//!   from that frame's header and bytes;
+//! - "no copy on reject": every byte of every TX frame of every port that was
+//!   not newly published by an operation must be unchanged across it, and a
+//!   published frame must be unchanged past its payload;
+//! - RX block return from the block status word turning TP_STATUS_KERNEL,
+//!   checked for every pending block after every engine call;
+//! - kicks and their errno from the scripted syscall log.
+//!
+//! Taken from the test-only `PortProbe` (engine-side counters):
+//!
+//! - per-block scan observations (status reads, acquisitions, descriptor
+//!   visits), frozen at the block's return, and the RX/TX status-read and
+//!   descriptor counters of `CopyOperationCounters`;
+//! - `copy_invocations`/`copied_bytes`, each cross-checked against the
+//!   ring: the number of copies must equal the number of newly published
+//!   frames, and the byte-unchanged check above catches a copy the probe
+//!   does not count;
+//! - the RX block-return count, asserted to agree with the status word.
+//!
+//! Generations reported at injection or acceptance are verified against
+//! engine metadata before the next harness operation. Allocation is counted
+//! only while engine code runs.
 //!
 //! AF_PACKET-specific adaptations (documented, not silent):
 //!
@@ -46,7 +67,13 @@
 //!
 //! Their AF_PACKET contract (partial ring-full rejection with no copy, a
 //! finish error preserving accounting and the single kick) is covered by the
-//! native tests in `tests.rs`.
+//! native tests in `tests.rs`. The ABA protection that
+//! `rejected_tx_reuse_advances_generation` targets holds trivially because a
+//! rejection never reserves a frame or advances its generation: the AP1-TX
+//! test `tx_status_validation_precedes_reserve_and_rejected_packets_copy_nothing`
+//! asserts generation zero and untouched bytes after every rejection kind,
+//! `settle()` checks each reported TX generation against engine metadata, and
+//! the byte-unchanged check here proves no rejected commit wrote any frame.
 
 use std::{
     alloc::{alloc_zeroed, dealloc, Layout},
@@ -249,8 +276,18 @@ impl PortView {
         raw_write_u32(self.tx_frame(frame) + 20, status);
     }
 
-    fn tx_len(self, frame: usize) -> usize {
+    pub(super) fn tx_len(self, frame: usize) -> usize {
         raw_u32(self.tx_frame(frame) + 16) as usize
+    }
+
+    /// Simulates a stray write into a TX frame's payload (test of the
+    /// harness's own detector).
+    pub(super) fn overwrite_tx_payload_for_test(self, frame: usize, bytes: &[u8]) {
+        raw_write_bytes(self.tx_data_address(frame), bytes);
+    }
+
+    fn tx_frame_bytes(self, frame: usize) -> Vec<u8> {
+        raw_read_bytes(self.tx_frame(frame), TX_FRAME)
     }
 
     pub(super) fn tx_data_address(self, frame: usize) -> usize {
@@ -366,8 +403,9 @@ struct InFlight {
     sequence: u64,
 }
 
-struct TxSnapshot {
+pub(super) struct TxSnapshot {
     statuses: [Vec<u32>; 2],
+    frames: [Vec<Vec<u8>>; 2],
     probes: [ProbeCounts; 2],
 }
 
@@ -393,14 +431,48 @@ pub(super) struct Trace {
 }
 
 impl Trace {
-    fn tx_snapshot(&self) -> TxSnapshot {
+    pub(super) fn tx_snapshot(&self) -> TxSnapshot {
         TxSnapshot {
             statuses: [0, 1].map(|port| {
                 (0..self.views[port].tx_frames)
                     .map(|frame| self.views[port].tx_status(frame))
                     .collect()
             }),
+            frames: [0, 1].map(|port| {
+                (0..self.views[port].tx_frames)
+                    .map(|frame| self.views[port].tx_frame_bytes(frame))
+                    .collect()
+            }),
             probes: [0, 1].map(|port| self.probes[port].counts()),
+        }
+    }
+
+    /// Asserts that no TX frame changed across an engine call except the
+    /// `published` ones, and that a published frame changed only in its
+    /// header and payload. Independent of the engine's own copy counter.
+    pub(super) fn assert_tx_unchanged_except(
+        &self,
+        before: &TxSnapshot,
+        published: &[(usize, usize)],
+    ) {
+        for port in 0..2 {
+            for frame in 0..self.views[port].tx_frames {
+                let now = self.views[port].tx_frame_bytes(frame);
+                let old = &before.frames[port][frame];
+                if published.contains(&(port, frame)) {
+                    let end = TX_DATA + self.views[port].tx_len(frame);
+                    assert_eq!(
+                        now[end..],
+                        old[end..],
+                        "published TX frame {frame} of port {port} changed past its payload"
+                    );
+                } else {
+                    assert!(
+                        now == *old,
+                        "TX frame {frame} of port {port} changed without being published"
+                    );
+                }
+            }
         }
     }
 
@@ -433,6 +505,7 @@ impl Trace {
                 }
             }
         }
+        self.assert_tx_unchanged_except(before, &published);
         let copies: usize = (0..2)
             .map(|port| self.probes[port].counts().tx_copies - before.probes[port].tx_copies)
             .sum();
@@ -526,14 +599,18 @@ impl Trace {
         let mut index = 0;
         while index < self.pending.len() {
             let port = self.pending[index].port;
-            let returned = self.probes[port].counts().rx_blocks_returned
+            let returned = self.views[port].rx_status() == TP_STATUS_KERNEL;
+            let counted = self.probes[port].counts().rx_blocks_returned
                 > self.pending[index].at_inject.rx_blocks_returned;
+            assert_eq!(
+                returned, counted,
+                "RX block status and the engine's return count disagree"
+            );
             if !returned {
                 index += 1;
                 continue;
             }
             let block = self.pending.remove(index);
-            assert_eq!(self.views[port].rx_status(), TP_STATUS_KERNEL);
             let frozen = self.probes[port].at_last_return();
             self.scans.insert(
                 block.token,
@@ -621,12 +698,14 @@ impl<'a> PacketBatch for TracedBatch<'a> {
         Self: 'b;
 
     fn next_packet(&mut self) -> Option<PacketLease<Self::Slot<'_>>> {
+        let snapshot = self.trace.borrow().tx_snapshot();
         let before = allocation_count();
         let lease = self.inner.as_mut().expect("live batch").next_packet();
         let after = allocation_count();
         {
             let mut trace = self.trace.borrow_mut();
             trace.steady_allocations += (after - before) as usize;
+            trace.assert_tx_unchanged_except(&snapshot, &[]);
             trace.check_returns();
         }
         let mut lease = lease?;
@@ -643,11 +722,13 @@ impl<'a> PacketBatch for TracedBatch<'a> {
 
     fn finish(mut self) -> BatchCompletion<Self::Error> {
         let inner = self.inner.take().expect("live batch");
+        let snapshot = self.trace.borrow().tx_snapshot();
         let before = allocation_count();
         let completion = inner.finish();
         let after = allocation_count();
         let mut trace = self.trace.borrow_mut();
         trace.steady_allocations += (after - before) as usize;
+        trace.assert_tx_unchanged_except(&snapshot, &[]);
         trace.check_returns();
         assert!(completion.invariants_hold());
         completion
@@ -657,11 +738,13 @@ impl<'a> PacketBatch for TracedBatch<'a> {
 impl Drop for TracedBatch<'_> {
     fn drop(&mut self) {
         if let Some(inner) = self.inner.take() {
+            let snapshot = self.trace.borrow().tx_snapshot();
             let before = allocation_count();
             drop(inner);
             let after = allocation_count();
             let mut trace = self.trace.borrow_mut();
             trace.steady_allocations += (after - before) as usize;
+            trace.assert_tx_unchanged_except(&snapshot, &[]);
             trace.check_returns();
         }
     }
@@ -1077,6 +1160,7 @@ impl<const TX_FRAMES: u32> RxCopyCompletionHarness for AfPacketCopyHarness<TX_FR
                 continue;
             }
             let interface = self.view(port).interface;
+            let snapshot = self.trace().tx_snapshot();
             let reads_before = self.trace().probes[port]
                 .counts()
                 .tx_completion_status_reads;
@@ -1089,6 +1173,10 @@ impl<const TX_FRAMES: u32> RxCopyCompletionHarness for AfPacketCopyHarness<TX_FR
             let after = allocation_count();
             let mut trace = self.trace();
             trace.steady_allocations += (after - before) as usize;
+            // Completion reclaims frames without touching their bytes; the
+            // suite never produces WRONG_FORMAT, whose recycle writes status.
+            assert_eq!(report.wrong_format, 0);
+            trace.assert_tx_unchanged_except(&snapshot, &[]);
             let reads = trace.probes[port].counts().tx_completion_status_reads - reads_before;
             assert_eq!(reads, report.inspected);
             remaining -= report.inspected;
