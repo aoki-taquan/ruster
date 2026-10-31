@@ -5,28 +5,48 @@
 `main`の旧実装は [`prototype-v0.1`](docs/prototype-v0.1.md) として固定しました。現在の
 active treeは、そのコードを継承しないv0.2のゼロベース実装です。
 
-## v0.2 bootstrap
+## v0.2の構成と現在地
 
-active treeは、外部依存を持たないpacket core、bounded worker runtime、sim I/O、
-benchmark harness、I/O conformance、AF_XDP ownership modelで構成します。
-data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control-planeの
-`ruster-config`とsim専用の`ruster-sim-scenario`だけは、保守されているSerde/TOML parserを
-最小featureで利用します。
+M1（Runnable deterministic router）では、rootやNICなしで宣言的configから
+`config → validate → publication candidate → live activation → run_tick → observability →
+run-sim JSONL`をend-to-endで実行できます（下の「使い方」）。backendは決定的な`SimIo`だけで、
+AF_PACKET/AF_XDPはproduction backendではなく、実NICでの動作やthroughputは主張しません。
+M1はroute-miss ICMPのowner判断、R16 checkのrequired化、R17 benchmark specの承認が残っており
+未closeです。exit criterionごとの証跡は
+[`docs/release-evidence/m1.md`](docs/release-evidence/m1.md)にあります。
 
-- `ruster-config`: 最大1 MiBのUTF-8 TOMLをschema versionでpredispatchし、V1の
-  interface/address/route/neighbor/NAT44/firewall/capacity/tick budget DTOへexact decode
-  する。unknown/duplicate field、runtime生成値、過大listをvalue-freeなtyped diagnosticで
-  fail-closeする。cold semantic validationはcanonicalなowned core値、connected route、
-  cross-reference/on-link検証、policy/NAT/firewall検証、全runtime storage shapeを作る。
-  publication identity、fresh secret、plan/applyはまだ持たない。
+workspaceは12 crateです。data-planeとI/Oのlibrary crateは外部依存を持ちません。cold
+control-planeの`ruster-config`とsim専用の`ruster-sim-scenario`だけが、保守されている
+Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`ruster-cli`はpath depを
+通じて推移的に含みます）。
+
 - `ruster-core`: backend所有packetを借用し、Ethernet II / IPv4検証、LPM、
   TTL/checksum/MAC rewrite、local IPv4向けARP reply、static neighbor miss時の
   ARP Request生成action、fixed-capacity dynamic ARP cache、local ICMPv4 Echo
   responder、ICMPv4 Time Exceeded / Destination Unreachable生成、opt-inの
   single-domain UDP NAT44/NAPT、outbound-initiated TCP NAT44/NAPT、最小IPv4
-  stateful forward firewallを扱う。
+  stateful forward firewallと、それらを一workerへbindするfull composition wrapperを扱う。
+- `ruster-runtime`: genericなpublication seamから一つのactive generationを借用し、
+  `RX → resolution timer → failure dispatch → generated ARP → generated ICMPv4`を
+  明示budget付きのsingle-worker tickとして実行する。`TickObserver`はtraceとして渡す
+  allocation-freeなsaturating counter sinkで、drop/consume reason別数、tick集計、注入時刻
+  だけによるhealth、generation/apply結果をtick境界で固定順snapshotにする。
+- `ruster-config`: 最大1 MiBのUTF-8 TOMLをschema versionでpredispatchし、V1の
+  interface/address/route/neighbor/NAT44/firewall/capacity/tick budget DTOへexact decode
+  する。unknown/duplicate field、runtime生成値、過大listをvalue-freeなtyped diagnosticで
+  fail-closeする。cold semantic validationはcanonicalなowned core値、connected route、
+  cross-reference/on-link検証、policy/NAT/firewall検証、全runtime storage shapeを作る。
+  publication identityとsecretは持たない。
+- `ruster-control`: validated configからpublication candidateを作るbridge（M1は
+  Resolution/ICMPv4 error/NAT44 UDP/TCP/firewallを全て必須とし、欠落はtyped reject）、
+  scenario seed由来のsim専用key source、shapeどおりのslot配列を一度だけ確保する
+  `FullServiceStorage`、5 runtimeをpreflightしてから一点でcommitする`ActivePublication`、
+  mutationなしの`ApplyPlan`/dry-run、単調なgenerationとkey非再利用を保証する
+  `PublicationSequencer`（rollbackは旧configを新generationとして再apply）を持つ。
 - `ruster-io-sim`: rootやNICなしでRX/generated TXのFIFO、budget、TX/drop、
   traceを決定的に検証する。
+- `ruster-io-conformance`: backend共通のlease exactly-once、partial TX、finish error、
+  abandonを検証する再利用可能なconformance suite。
 - `ruster-sim-scenario`: 最大256 KiBの`ruster-scenario/v1` TOMLを、seed、初期config path、
   `inject`/`tick`/`apply`/`expect`/末尾`hold` stepのtyped modelへexact decodeする。
   Ethernet II、ARP、IPv4、ICMPv4 Echo、UDP、TCPのcold側builderとraw hexでframeを
@@ -39,7 +59,9 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
   `RUSTER_UPDATE_GOLDEN=1 cargo test -p ruster-sim-scenario --test driver`（CIでは拒否）。
 - `ruster-cli`: binary `ruster`。手書きarg parsingで`validate`/`plan`/`run-sim`を提供し、
   SIGINT/SIGTERMはprivate FFIのhandlerがstatic `AtomicBool`へstoreするだけです
-  （下の「使い方」）。外部依存はありません。
+  （下の「使い方」）。外部crateを直接には追加しません。
+- `ruster-bench`: NIC-freeなsim smoke/datapath benchmarkとhardware benchmark plan/
+  measurement protocol/artifact v1のschema検証。sim結果からproduction性能を主張しない。
 - `ruster-io-afpacket`: Linux AF_PACKET/TPACKET_V3 backendのchecked configuration、
   fixed IfId mapping、ring ownership/UAPI scaffold。combined mmapのRX/TX extentを
   overlap/gap/overflow/実address alignmentまで検証し、後続state machine用metadataを
@@ -71,11 +93,6 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
   constructor、UMEM登録、
   ring設定・bind transaction、live session、libxdp link、core `PacketIo`接続はまだ持たず、
   FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
-- `ruster-runtime`: genericなpublication seamから一つのactive generationを借用し、
-  `RX → resolution timer → failure dispatch → generated ARP → generated ICMPv4`を
-  明示budget付きのsingle-worker tickとして実行する。`TickObserver`はtraceとして渡す
-  allocation-freeなsaturating counter sinkで、drop/consume reason別数、tick集計、注入時刻
-  だけによるhealth、generation/apply結果をtick境界で固定順snapshotにする。
 
 ```text
 inject Vec<u8>
