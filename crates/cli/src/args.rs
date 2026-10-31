@@ -11,11 +11,12 @@ pub const USAGE: &str = "\
 usage:
   ruster validate <config.toml>
   ruster plan <current.toml> <next.toml>
-  ruster run-sim --scenario <scenario.toml> [--hold]
+  ruster run-sim [--hold] --scenario <scenario.toml>
+  ruster run-sim [--hold] -- <scenario.toml>
   ruster --help | --version
 
-exit status: 0 success or signal shutdown, 1 runtime/I/O/expectation failure,
-2 usage error or invalid config/scenario
+exit status: 0 success or signal shutdown, 1 runtime/I/O/expectation failure
+(including unreadable files), 2 usage error or invalid config/scenario
 ";
 
 #[derive(Debug, Eq, PartialEq)]
@@ -91,21 +92,34 @@ fn parse_run_sim(rest: &[OsString]) -> Result<Command, UsageError> {
     let mut hold = false;
     let mut words = rest.iter();
     while let Some(word) = words.next() {
-        let text = word.to_str();
-        match text {
+        if let Some(value) = equals_value(word, "--scenario=") {
+            if value.is_empty() {
+                return Err(UsageError::MissingValue("--scenario"));
+            }
+            set_once(&mut scenario, value.into())?;
+            continue;
+        }
+        match word.to_str() {
+            Some("--") => {
+                // `run-sim [--hold] -- <scenario.toml>`: the one operand
+                // after `--` is the scenario, even if it starts with `-`.
+                let value = words.next().ok_or(UsageError::MissingValue("--scenario"))?;
+                set_once(&mut scenario, value.into())?;
+                if let Some(extra) = words.next() {
+                    return Err(UsageError::UnexpectedOperand(lossy(extra)));
+                }
+            }
             Some("-h" | "--help") => return Ok(Command::Help),
             Some("--hold") if hold => return Err(UsageError::DuplicateOption("--hold")),
             Some("--hold") => hold = true,
             Some("--scenario") => {
-                let value = words.next().ok_or(UsageError::MissingValue("--scenario"))?;
-                set_once(&mut scenario, PathBuf::from(value))?;
-            }
-            Some(text) if text.starts_with("--scenario=") => {
-                let value = &text["--scenario=".len()..];
-                if value.is_empty() {
-                    return Err(UsageError::MissingValue("--scenario"));
-                }
-                set_once(&mut scenario, PathBuf::from(value))?;
+                // A flag-like word is not taken as the value; use
+                // `--scenario=<path>` or `--` for such paths.
+                let value = words
+                    .next()
+                    .filter(|value| !is_option(value))
+                    .ok_or(UsageError::MissingValue("--scenario"))?;
+                set_once(&mut scenario, value.into())?;
             }
             _ if is_option(word) => return Err(UsageError::UnknownOption(lossy(word))),
             _ => return Err(UsageError::UnexpectedOperand(lossy(word))),
@@ -113,6 +127,21 @@ fn parse_run_sim(rest: &[OsString]) -> Result<Command, UsageError> {
     }
     let scenario = scenario.ok_or(UsageError::MissingValue("--scenario"))?;
     Ok(Command::RunSim { scenario, hold })
+}
+
+/// The value of `<prefix><value>`, split on the raw bytes on Unix so a
+/// non-UTF-8 value is preserved.
+fn equals_value(word: &OsStr, prefix: &str) -> Option<OsString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let value = word.as_bytes().strip_prefix(prefix.as_bytes())?;
+        Some(OsStr::from_bytes(value).to_owned())
+    }
+    #[cfg(not(unix))]
+    {
+        word.to_str()?.strip_prefix(prefix).map(OsString::from)
+    }
 }
 
 fn set_once(slot: &mut Option<PathBuf>, value: PathBuf) -> Result<(), UsageError> {
@@ -276,6 +305,59 @@ mod tests {
         assert_eq!(
             run(&["run-sim", "--scenario", "a", "--fast"]),
             Err(UsageError::UnknownOption("--fast".into()))
+        );
+    }
+
+    #[test]
+    fn run_sim_accepts_double_dash_and_rejects_flag_like_values() {
+        assert_eq!(
+            run(&["run-sim", "--hold", "--", "-s.toml"]),
+            Ok(Command::RunSim {
+                scenario: "-s.toml".into(),
+                hold: true
+            })
+        );
+        assert_eq!(
+            run(&["run-sim", "--scenario=-s.toml"]),
+            Ok(Command::RunSim {
+                scenario: "-s.toml".into(),
+                hold: false
+            })
+        );
+        assert_eq!(
+            run(&["run-sim", "--"]),
+            Err(UsageError::MissingValue("--scenario"))
+        );
+        assert_eq!(
+            run(&["run-sim", "--", "a", "b"]),
+            Err(UsageError::UnexpectedOperand("b".into()))
+        );
+        assert_eq!(
+            run(&["run-sim", "--scenario", "a", "--", "b"]),
+            Err(UsageError::DuplicateOption("--scenario"))
+        );
+        for value in ["--hold", "--help", "-x"] {
+            assert_eq!(
+                run(&["run-sim", "--scenario", value]),
+                Err(UsageError::MissingValue("--scenario")),
+                "{value}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_scenario_values_are_kept_as_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut word = b"--scenario=".to_vec();
+        word.extend_from_slice(&[b's', 0xfe, b'.', b't']);
+        let parsed = parse([OsString::from("run-sim"), OsString::from_vec(word)]);
+        assert_eq!(
+            parsed,
+            Ok(Command::RunSim {
+                scenario: PathBuf::from(OsString::from_vec(vec![b's', 0xfe, b'.', b't'])),
+                hold: false
+            })
         );
     }
 

@@ -28,5 +28,5 @@ pub use validate::{
     Nat44UdpStorageShapeV1, ResolutionStorageShapeV1, RuntimeStorageShapeV1, TickBudgetsV1,
     ValidatedConfig, ValidatedConfigV1, ValidatedFirewallV1, ValidatedIcmpv4ErrorV1,
     ValidatedNat44TcpV1, ValidatedNat44UdpV1, ValidatedNat44V1, ValidatedResolutionV1,
-    ValidationCode, ValidationError, ValidationLimits,
+    ValidationCode, ValidationError, ValidationLimits, MAX_INTERFACE_LABEL_BYTES,
 };

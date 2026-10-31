@@ -59,7 +59,7 @@ fn status(output: &Output) -> i32 {
 fn help_version_and_usage_errors_have_documented_statuses() {
     let help = run(&["--help"]);
     assert_eq!(status(&help), 0);
-    assert!(text(&help.stdout).contains("ruster run-sim --scenario"));
+    assert!(text(&help.stdout).contains("ruster run-sim [--hold] --scenario"));
     let version = run(&["--version"]);
     assert_eq!(status(&version), 0);
     assert_eq!(
@@ -74,6 +74,7 @@ fn help_version_and_usage_errors_have_documented_statuses() {
         &["plan", "a.toml"][..],
         &["run-sim"][..],
         &["run-sim", "--scenario", "s.toml", "--fast"][..],
+        &["run-sim", "--scenario", "--hold"][..],
     ] {
         let output = run(args);
         assert_eq!(status(&output), 2, "{args:?}");
@@ -118,7 +119,7 @@ fn validate_reports_summary_or_typed_diagnostics_with_exit_status() {
     assert_eq!(status(&missing), 1);
     assert_eq!(
         text(&missing.stderr),
-        "ruster: cannot read config: NotFound\n"
+        "ruster: cannot read config: NOT_FOUND\n"
     );
 }
 
@@ -318,10 +319,10 @@ fn run_sim_failures_map_to_exit_statuses() {
             "expectation failed: step[0]: generation expected 9, observed 1",
         ),
         (&bad_config, 2, "invalid initial config"),
-        (&missing_config, 1, "read failed"),
+        (&missing_config, 1, "read failed: config file: NOT_FOUND"),
         (&unknown_field, 2, "invalid scenario"),
         (&unknown_interface, 2, "invalid scenario"),
-        (&absent, 1, "read failed"),
+        (&absent, 1, "read failed: scenario file: NOT_FOUND"),
     ] {
         let output = run(&["run-sim", "--scenario", path]);
         let stderr = text(&output.stderr);
@@ -334,36 +335,47 @@ fn run_sim_failures_map_to_exit_statuses() {
     }
 }
 
-fn wait_with_timeout(child: &mut Child) -> std::process::ExitStatus {
-    let deadline = Instant::now() + TIMEOUT;
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            return status;
+/// A `run-sim --hold` child that is always killed and reaped, even when an
+/// assertion panics, so no orphan outlives the test.
+struct Held {
+    child: Child,
+    stdout: Option<thread::JoinHandle<String>>,
+    stderr: Option<thread::JoinHandle<Vec<String>>>,
+    idle: mpsc::Receiver<()>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
         }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("ruster did not exit after the signal");
-        }
-        thread::sleep(Duration::from_millis(10));
+        let _ = self.child.wait();
     }
 }
 
-fn hold_then_signal(signal: &str) {
-    let mut child = Command::new(BIN)
-        .args(["run-sim", "--hold", "--scenario", &fixture("scenario.toml")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn ruster");
-    // Hold mode flushes stdout after every idle tick; wait for the first one
-    // so the signal provably interrupts the idle loop.
-    let (idle_tx, idle_rx) = mpsc::channel();
-    let stdout = {
-        let pipe = child.stdout.take().unwrap();
-        thread::spawn(move || {
+impl Held {
+    /// Spawns `command` and returns once the readiness line is on stderr and
+    /// the first idle tick is on stdout (hold mode flushes after every idle
+    /// tick), so a signal provably interrupts the idle loop.
+    fn spawn(mut command: Command) -> Self {
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn ruster");
+        let (idle_tx, idle) = mpsc::channel();
+        let stdout_pipe = child.stdout.take().unwrap();
+        let stderr_pipe = child.stderr.take().unwrap();
+        let mut held = Self {
+            child,
+            stdout: None,
+            stderr: None,
+            idle,
+        };
+        held.stdout = Some(thread::spawn(move || {
             let mut text = String::new();
-            for line in BufReader::new(pipe).lines() {
+            for line in BufReader::new(stdout_pipe).lines() {
                 let line = line.unwrap();
                 if line.starts_with("{\"event\":\"tick\",\"step\":null,") {
                     let _ = idle_tx.send(());
@@ -372,14 +384,11 @@ fn hold_then_signal(signal: &str) {
                 text.push('\n');
             }
             text
-        })
-    };
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let stderr = {
-        let pipe = child.stderr.take().unwrap();
-        thread::spawn(move || {
+        }));
+        let (ready_tx, ready) = mpsc::channel();
+        held.stderr = Some(thread::spawn(move || {
             let mut lines = Vec::new();
-            for line in BufReader::new(pipe).lines() {
+            for line in BufReader::new(stderr_pipe).lines() {
                 let line = line.unwrap();
                 if line.starts_with("ruster run-sim: holding") {
                     let _ = ready_tx.send(());
@@ -387,24 +396,52 @@ fn hold_then_signal(signal: &str) {
                 lines.push(line);
             }
             lines
-        })
-    };
-    if ready_rx.recv_timeout(TIMEOUT).is_err() {
-        let _ = child.kill();
-        panic!("no readiness line: {:?}", stderr.join());
+        }));
+        ready.recv_timeout(TIMEOUT).expect("readiness line");
+        held.next_idle_tick();
+        held
     }
-    if idle_rx.recv_timeout(TIMEOUT).is_err() {
-        let _ = child.kill();
-        panic!("no idle tick");
+
+    fn next_idle_tick(&self) {
+        self.idle.recv_timeout(TIMEOUT).expect("idle tick");
     }
-    let kill = Command::new("kill")
-        .args(["-s", signal, &child.id().to_string()])
-        .status()
-        .expect("run kill");
-    assert!(kill.success());
-    let exit = wait_with_timeout(&mut child);
-    let stdout = stdout.join().unwrap();
-    let stderr = stderr.join().unwrap();
+
+    fn signal(&self, signal: &str) {
+        let kill = Command::new("kill")
+            .args(["-s", signal, &self.child.id().to_string()])
+            .status()
+            .expect("run kill");
+        assert!(kill.success());
+    }
+
+    /// Waits (bounded) for exit and returns status, stdout, stderr lines.
+    fn finish(mut self) -> (std::process::ExitStatus, String, Vec<String>) {
+        let deadline = Instant::now() + TIMEOUT;
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                panic!("ruster did not exit after the signal");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = self.stdout.take().unwrap().join().unwrap();
+        let stderr = self.stderr.take().unwrap().join().unwrap();
+        (status, stdout, stderr)
+    }
+}
+
+fn hold_command() -> Command {
+    let mut command = Command::new(BIN);
+    command.args(["run-sim", "--hold", "--scenario", &fixture("scenario.toml")]);
+    command
+}
+
+fn assert_stopped(signal: &str, held: Held) -> String {
+    let (exit, stdout, stderr) = held.finish();
     assert_eq!(exit.code(), Some(0), "{signal}: {stderr:?}");
     assert!(
         stderr
@@ -412,6 +449,13 @@ fn hold_then_signal(signal: &str) {
             .is_some_and(|line| line.starts_with("ruster run-sim: stopped by signal")),
         "{signal}: {stderr:?}"
     );
+    stdout
+}
+
+fn hold_then_signal(signal: &str) {
+    let held = Held::spawn(hold_command());
+    held.signal(signal);
+    let stdout = assert_stopped(signal, held);
 
     // The scenario part is the golden output without its final event, then
     // idle ticks, then exactly one final event.
@@ -458,4 +502,30 @@ fn hold_mode_shuts_down_in_order_on_sigterm() {
 #[test]
 fn hold_mode_shuts_down_in_order_on_sigint() {
     hold_then_signal("INT");
+}
+
+#[test]
+fn inherited_ignored_sigint_stays_ignored_and_sigterm_still_stops() {
+    // `trap '' INT` sets SIG_IGN, which `exec` preserves (as for a
+    // background job without job control).
+    let mut command = Command::new("sh");
+    command.args([
+        "-c",
+        "trap '' INT; exec \"$0\" run-sim --hold --scenario \"$1\"",
+        BIN,
+        &fixture("scenario.toml"),
+    ]);
+    let held = Held::spawn(command);
+    held.signal("INT");
+    // Still idling: had SIGINT been handled, at most one more idle tick
+    // could follow and stdout would close.
+    for _ in 0..3 {
+        held.next_idle_tick();
+    }
+    held.signal("TERM");
+    let stdout = assert_stopped("TERM", held);
+    assert!(stdout
+        .lines()
+        .last()
+        .is_some_and(|line| line.starts_with("{\"event\":\"final\"")));
 }

@@ -29,8 +29,9 @@ use std::thread;
 use std::time::Duration;
 
 use ruster_io_sim::SimPublicationQuiescenceError;
-use ruster_sim_scenario::{DriverError, Progress, SimRun, SimSession};
+use ruster_sim_scenario::{DriverError, FileRole, Progress, SimRun, SimSession};
 
+use crate::config_cmd::io_code;
 use crate::{signal, EXIT_INVALID, EXIT_RUNTIME};
 
 /// Injected time added per idle tick in hold mode.
@@ -62,6 +63,25 @@ fn label(error: &DriverError) -> &'static str {
         DriverError::Read { .. } => "read failed",
         DriverError::Output(_) => "output failed",
         _ => "runtime failure",
+    }
+}
+
+/// Value-free failure detail. I/O failures use stable role and error-kind
+/// codes instead of `Debug` names; other errors use the driver's `Display`.
+fn detail(error: &DriverError) -> String {
+    match error {
+        DriverError::Read { file, step, kind } => {
+            let role = match file {
+                FileRole::Scenario => "scenario",
+                FileRole::Config => "config",
+            };
+            match step {
+                Some(step) => format!("{role} file of step[{step}]: {}", io_code(*kind)),
+                None => format!("{role} file: {}", io_code(*kind)),
+            }
+        }
+        DriverError::Output(kind) => format!("stdout: {}", io_code(*kind)),
+        error => error.to_string(),
     }
 }
 
@@ -99,7 +119,7 @@ pub fn run(scenario: &Path, hold: bool, err: &mut impl Write) -> u8 {
     let status = match result {
         Ok(()) => 0,
         Err(Failure::Driver(error)) => {
-            let _ = writeln!(err, "ruster run-sim: {}: {error}", label(&error));
+            let _ = writeln!(err, "ruster run-sim: {}: {}", label(&error), detail(&error));
             exit_status(&error)
         }
         Err(Failure::NotQuiescent(error)) => {
@@ -116,7 +136,7 @@ pub fn run(scenario: &Path, hold: bool, err: &mut impl Write) -> u8 {
         }
     };
     if status == 0 && flushed.is_err() {
-        let _ = writeln!(err, "ruster run-sim: output failed");
+        let _ = writeln!(err, "ruster run-sim: output failed: stdout");
         return EXIT_RUNTIME;
     }
     status
@@ -207,8 +227,6 @@ fn shutdown<W: Write>(
 #[cfg(test)]
 mod tests {
     use std::io::ErrorKind;
-
-    use ruster_sim_scenario::FileRole;
 
     use super::*;
 

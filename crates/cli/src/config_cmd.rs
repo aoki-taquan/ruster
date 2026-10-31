@@ -73,7 +73,9 @@ fn render_path(path: &SourcePath) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Reads, parses, and validates one configuration document.
+/// Reads, parses, and validates one configuration document, including the
+/// M1 service bridge, so `validate` and both sides of `plan` accept exactly
+/// what `run-sim` accepts.
 pub fn load(path: &Path) -> Result<ValidatedConfigV1, LoadError> {
     let mut bytes = Vec::new();
     let take = wide(MAX_CONFIG_BYTES).saturating_add(1);
@@ -106,6 +108,35 @@ pub fn load(path: &Path) -> Result<ValidatedConfigV1, LoadError> {
             bounds: error.limit().zip(error.actual()),
         })),
     }
+    .and_then(|config| {
+        bridge_check(&config).map_err(LoadError::Rejected)?;
+        Ok(config)
+    })
+}
+
+/// The M1 service bridge that `run-sim` applies: every service present and
+/// candidate validation passing. It builds a throw-away generation-1
+/// candidate with the simulation key source; the keys stay in memory and
+/// are dropped unprinted.
+fn bridge_check(config: &ValidatedConfigV1) -> Result<(), Rejection> {
+    let mut keys = SimDeterministicKeySource::new(0);
+    candidate_from_config(config, NonZeroU64::MIN, &mut keys)
+        .map(drop)
+        .map_err(bridge_rejection)
+}
+
+/// Stable label of an I/O error kind (never an OS message or a path).
+pub fn io_code(kind: io::ErrorKind) -> &'static str {
+    match kind {
+        io::ErrorKind::NotFound => "NOT_FOUND",
+        io::ErrorKind::PermissionDenied => "PERMISSION_DENIED",
+        io::ErrorKind::IsADirectory => "IS_A_DIRECTORY",
+        io::ErrorKind::InvalidData => "INVALID_DATA",
+        io::ErrorKind::Interrupted => "INTERRUPTED",
+        io::ErrorKind::BrokenPipe => "BROKEN_PIPE",
+        io::ErrorKind::OutOfMemory => "OUT_OF_MEMORY",
+        _ => "IO_ERROR",
+    }
 }
 
 fn bridge_rejection(error: ConfigBridgeError) -> Rejection {
@@ -121,7 +152,7 @@ fn bridge_rejection(error: ConfigBridgeError) -> Rejection {
 fn report_load(err: &mut impl Write, label: &str, error: &LoadError) -> u8 {
     match error {
         LoadError::Read(kind) => {
-            let _ = writeln!(err, "ruster: cannot read {label}config: {kind:?}");
+            let _ = writeln!(err, "ruster: cannot read {label}config: {}", io_code(*kind));
             EXIT_RUNTIME
         }
         LoadError::Rejected(rejection) => {
@@ -132,26 +163,11 @@ fn report_load(err: &mut impl Write, label: &str, error: &LoadError) -> u8 {
 }
 
 /// `ruster validate <config>`: summary on stdout, diagnostics on stderr.
-///
-/// Beyond schema and semantic validation, the document must also pass the
-/// M1 service bridge that `run-sim` applies (all of resolution, ICMPv4
-/// errors, NAT44 UDP/TCP, and firewall present; candidate validation). The
-/// bridge check builds a throw-away candidate with the simulation key
-/// source; its keys stay in memory and are dropped unprinted.
 pub fn run_validate(path: &Path, out: &mut impl Write, err: &mut impl Write) -> u8 {
     let config = match load(path) {
         Ok(config) => config,
         Err(error) => return report_load(err, "", &error),
     };
-    let mut keys = SimDeterministicKeySource::new(0);
-    if let Err(error) = candidate_from_config(&config, NonZeroU64::MIN, &mut keys) {
-        let _ = writeln!(
-            err,
-            "ruster: invalid config: {}",
-            bridge_rejection(error).render()
-        );
-        return EXIT_INVALID;
-    }
     let rules = config
         .firewall()
         .map_or(0, |firewall| firewall.rules().len());

@@ -3,7 +3,8 @@ use std::mem::size_of;
 use ruster_config::{
     parse, validate, ConfigV1, PathSegment, RuntimeStorageShapeV1, ValidatedConfig,
     ValidatedConfigV1, ValidationCode, ValidationLimits, VersionedConfig, MAX_ADDRESSES,
-    MAX_CONFIG_BYTES, MAX_FIREWALL_RULES, MAX_INTERFACES, MAX_NEIGHBORS, MAX_ROUTES,
+    MAX_CONFIG_BYTES, MAX_FIREWALL_RULES, MAX_INTERFACES, MAX_INTERFACE_LABEL_BYTES, MAX_NEIGHBORS,
+    MAX_ROUTES,
 };
 use ruster_core::{
     DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallRuleId, FirewallStateSlot,
@@ -662,4 +663,47 @@ fn route_host_bits_and_error_path_are_exact() {
             PathSegment::Field("prefix".to_owned()),
         ]
     );
+}
+
+#[test]
+fn interface_labels_are_restricted_to_a_conservative_charset() {
+    let at = |code, field: &'static str| {
+        move |source: String| {
+            let rejected = error(&source);
+            assert_eq!(rejected.code(), code, "{source}");
+            let segments = rejected.path().segments();
+            assert_eq!(segments.last(), Some(&PathSegment::Field(field.to_owned())));
+        }
+    };
+    let name = at(ValidationCode::InvalidInterfaceName, "name");
+    let device = at(ValidationCode::InvalidDeviceName, "device");
+    // A label crafted to forge a plan line and emit a terminal escape.
+    let forged = r"wan device x -> name y\n  route - 0.0.0.0\u001b[31m";
+    name(VALID.replace("name = \"wan\"", &format!("name = \"{forged}\"")));
+    device(VALID.replace("device = \"eth1\"", &format!("device = \"{forged}\"")));
+    for bad in ["a b", r"a\tb", "a/b", "a:b", "\u{e9}", "a->b", r"a\u0000"] {
+        name(VALID.replace("name = \"wan\"", &format!("name = \"{bad}\"")));
+        device(VALID.replace("device = \"eth1\"", &format!("device = \"{bad}\"")));
+    }
+    let long = "a".repeat(MAX_INTERFACE_LABEL_BYTES + 1);
+    let rejected = error(&VALID.replace("device = \"eth1\"", &format!("device = \"{long}\"")));
+    assert_eq!(rejected.code(), ValidationCode::InvalidDeviceName);
+    assert_eq!(rejected.limit(), Some(15));
+    assert_eq!(rejected.actual(), Some(16));
+
+    let edge = "Aa0._-".to_owned() + &"z".repeat(MAX_INTERFACE_LABEL_BYTES - 6);
+    // The renamed interface is also referenced by name elsewhere.
+    let config = validated(
+        &VALID
+            .replace("\"wan\"", &format!("\"{edge}\""))
+            .replace("device = \"eth1\"", &format!("device = \"{edge}\"")),
+    );
+    assert!(config
+        .interfaces()
+        .iter()
+        .any(|binding| binding.name() == edge));
+    assert!(config
+        .interfaces()
+        .iter()
+        .any(|binding| binding.device() == edge));
 }

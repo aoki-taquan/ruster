@@ -291,9 +291,18 @@ $B run-sim --scenario fixtures/m1/scenario.toml --hold
 - `validate`/`plan`は`run-sim`と同じvalidation limitを使い、allocator seed、hash key、
   scenario seedを出力しません。`validate`はM1で必須のresolution、ICMPv4 error、NAT44
   UDP/TCP、firewallの欠落も`stage=bridge`で拒否します。
-- `plan`の`expected-flush`はdocument間のplanなので`all`（apply時に全live stateをflush）で、
-  実際のflush数は`run-sim`の`apply` eventに出ます。`--format jsonl`は未実装です。
-- `run-sim`はstepごと（tickは1回ずつ）に停止flagを確認します。`--hold`のidle tickは
+- `plan`は両documentに`validate`と同じbridge確認を行います。`expected-flush`はdocument間の
+  planなので`all`（apply時に全live stateをflush）で、実際のflush数は`run-sim`の`apply` eventに
+  出ます。capacityやresolution/ICMP/NAT/firewall policyの変更はrestart理由（`STORAGE_SHAPE`等）
+  または`changed` flagとしてだけ出し、fieldごとの値は出しません。interface labelは
+  `[A-Za-z0-9._-]`以外を`\xNN`でescapeします（configも同じcharsetと15 bytes上限を要求）。
+  `--format jsonl`は未実装です。
+- `run-sim`はstepごと（tickは1回ずつ）に停止flagを確認します。`--hold`なしのrun中にsignalを
+  受けても残りのstepを実行せずordered shutdownしてexit 0、stderrは`stopped by signal`です。
+  したがってexit 0だけで「全expectが成功した」と判断せず、stderrの`finished`を確認してください。
+  SIGTERMは常に処理し、SIGINTは起動時にignoreされていれば（job controlなしの`cmd &`など）
+  ignoreのままです。SIGHUPなど他のsignalは扱いません。scenario pathが`-`で始まる場合は
+  `--scenario=<path>`または`run-sim [--hold] -- <path>`を使います。`--hold`のidle tickは
   注入時刻を100 msずつ進め（wall clockは読まない）、空回りを避けるため実時間100 msの
   sleepを挟みます。stderrの`ruster run-sim: holding`行がhold開始の目印で、hold中はidle tickごとに
   stdoutをflushします。signal受信後はtick境界で止まり、backendのpublication quiescence
@@ -301,7 +310,8 @@ $B run-sim --scenario fixtures/m1/scenario.toml --hold
   generation）を書きます。
 - exit status: `0`成功（restart-requiredのplan、signalによるordered shutdownを含む）、
   `1` runtime/I/O/invariant失敗とscenarioの`expect`/`apply`不一致、`2` usage errorと
-  invalid config/scenario（未知interface名を含む）。file read失敗は`1`です。
+  invalid config/scenario（未知interface名を含む）。file read失敗（存在しない、読めない）は
+  内容のinvalidとは区別して`1`で、stderrは`cannot read config: NOT_FOUND`のような安定codeです。
 
 ## 開発
 

@@ -35,6 +35,12 @@ pub enum ValidationCode {
     TextTooLarge,
     EmptyInterfaceName,
     EmptyDeviceName,
+    /// An interface `name` is longer than [`MAX_INTERFACE_LABEL_BYTES`] or
+    /// uses a byte outside `[A-Za-z0-9._-]`.
+    InvalidInterfaceName,
+    /// A `device` is longer than [`MAX_INTERFACE_LABEL_BYTES`] or uses a
+    /// byte outside `[A-Za-z0-9._-]`.
+    InvalidDeviceName,
     DuplicateInterfaceId,
     DuplicateInterfaceName,
     DuplicateDeviceName,
@@ -90,6 +96,8 @@ impl ValidationCode {
             Self::TextTooLarge => "TEXT_TOO_LARGE",
             Self::EmptyInterfaceName => "EMPTY_INTERFACE_NAME",
             Self::EmptyDeviceName => "EMPTY_DEVICE_NAME",
+            Self::InvalidInterfaceName => "INVALID_INTERFACE_NAME",
+            Self::InvalidDeviceName => "INVALID_DEVICE_NAME",
             Self::DuplicateInterfaceId => "DUPLICATE_INTERFACE_ID",
             Self::DuplicateInterfaceName => "DUPLICATE_INTERFACE_NAME",
             Self::DuplicateDeviceName => "DUPLICATE_DEVICE_NAME",
@@ -579,6 +587,31 @@ struct RoutedValue {
     source_path: SourcePath,
 }
 
+/// Maximum byte length of an interface `name` or `device` (Linux
+/// `IFNAMSIZ - 1`).
+pub const MAX_INTERFACE_LABEL_BYTES: usize = 15;
+
+/// Interface labels are operator-facing text that later output prints
+/// verbatim, so they are restricted to a conservative charset with no
+/// whitespace, control, or separator characters.
+fn check_label(label: &str, code: ValidationCode, path: SourcePath) -> Result<(), ValidationError> {
+    if label.len() > MAX_INTERFACE_LABEL_BYTES {
+        return Err(ValidationError::bounded(
+            code,
+            path,
+            MAX_INTERFACE_LABEL_BYTES as u64,
+            u64::try_from(label.len()).unwrap_or(u64::MAX),
+        ));
+    }
+    if !label
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(ValidationError::new(code, path));
+    }
+    Ok(())
+}
+
 fn validate_v1(
     config: ConfigV1,
     limits: ValidationLimits,
@@ -605,6 +638,16 @@ fn validate_v1(
                 child_path(&base, "device"),
             ));
         }
+        check_label(
+            &source.name,
+            ValidationCode::InvalidInterfaceName,
+            child_path(&base, "name"),
+        )?;
+        check_label(
+            &source.device,
+            ValidationCode::InvalidDeviceName,
+            child_path(&base, "device"),
+        )?;
         if interface_records
             .iter()
             .any(|record: &InterfaceRecord| record.binding.id == IfId(source.id))

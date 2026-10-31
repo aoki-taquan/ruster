@@ -13,7 +13,11 @@
 //! ```
 //!
 //! Interfaces are written as `if<id>`. No allocator seed or hash key is part
-//! of any plan item, so none can be printed.
+//! of any plan item, so none can be printed. Interface name/device labels
+//! are the only operator text; validation already restricts them to
+//! `[A-Za-z0-9._-]`, and [`label`] escapes every other byte as `\xNN`
+//! anyway, so a plan line can never contain whitespace, a control
+//! character, or `->` from a label.
 
 use std::fmt::Write as _;
 
@@ -31,6 +35,23 @@ fn ip(address: Ipv4Address) -> String {
 fn mac(address: MacAddress) -> String {
     let [a, b, c, d, e, f] = address.0;
     format!("{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{f:02x}")
+}
+
+/// Defensive escape of an operator label: bytes outside `[A-Za-z0-9._-]`
+/// become `\xNN`, and an empty label is written as `""`.
+fn label(text: &str) -> String {
+    if text.is_empty() {
+        return "\"\"".to_owned();
+    }
+    let mut escaped = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-') {
+            escaped.push(char::from(byte));
+        } else {
+            let _ = write!(escaped, "\\x{byte:02x}");
+        }
+    }
+    escaped
 }
 
 fn iface(id: IfId) -> String {
@@ -167,10 +188,10 @@ pub fn render(plan: &ApplyPlan) -> String {
         lines.push(format!(
             "interface-label ~ {} name {} device {} -> name {} device {}",
             iface(old.id),
-            old.name,
-            old.device,
-            new.name,
-            new.device
+            label(&old.name),
+            label(&old.device),
+            label(&new.name),
+            label(&new.device)
         ));
     }
     changes(&mut lines, "local-ipv4", plan.local_ipv4(), local);
@@ -221,4 +242,29 @@ pub fn render(plan: &ApplyPlan) -> String {
         };
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::label;
+
+    #[test]
+    fn labels_are_escaped_to_one_safe_token() {
+        assert_eq!(label("wan"), "wan");
+        assert_eq!(label("Aa0._-"), "Aa0._-");
+        assert_eq!(label(""), "\"\"");
+        // The review reproduction: a label forging a `route -` line and
+        // emitting a terminal escape.
+        let forged = label("wan device x -> name y\n  route - 0.0.0.0\u{1b}[31m");
+        assert_eq!(
+            forged,
+            "wan\\x20device\\x20x\\x20-\\x3e\\x20name\\x20y\\x0a\\x20\\x20route\\x20-\\x20\
+             0.0.0.0\\x1b\\x5b31m"
+        );
+        assert!(forged
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-\\".contains(&b)));
+        assert!(!forged.contains("->"));
+        assert_eq!(label("\u{e9}\\"), "\\xc3\\xa9\\x5c");
+    }
 }
