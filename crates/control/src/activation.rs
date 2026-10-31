@@ -378,6 +378,22 @@ pub enum RestartRequired {
     Interfaces,
 }
 
+impl RestartRequired {
+    /// Stable SCREAMING_SNAKE_CASE code for machine-readable output.
+    ///
+    /// Exhaustive, so a new variant fails to compile until it has a code.
+    /// Nested detail is collapsed to the outer variant.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::StorageShape => "STORAGE_SHAPE",
+            Self::ResolutionPolicy => "RESOLUTION_POLICY",
+            Self::Icmpv4ErrorPolicy => "ICMPV4_ERROR_POLICY",
+            Self::Interfaces => "INTERFACES",
+        }
+    }
+}
+
 /// Typed, value-free reason a successor was rejected.
 ///
 /// Every variant guarantees that the old candidate, snapshot, generation, and

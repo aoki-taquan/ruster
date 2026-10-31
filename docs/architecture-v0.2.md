@@ -437,7 +437,8 @@ runtimeはcontrolへ依存しません。apply tickごとに呼ぶcontractで、
 coreだけに依存してstatic dispatchで固定statsを提供します。`SimIo`はqueue/lease占有と
 pending RX/TXのhigh-watermarkを返します。snapshotは`Copy`の固定サイズ値で、
 `ObservableFields`がmapなしの固定順`(section, key, value)`を訪問し、`FieldsDisplay`はcold side
-だけで`section.key=value`行へ描画します。canonical JSONLとCLI出力は後続です。NAT/FW占有
+だけで`section.key=value`行へ描画します。`ruster-sim-scenario`のdriverが同じ訪問順を
+canonical JSONL `ruster-run-sim/v1`の`final` eventへ描画します（CLI出力はS6）。NAT/FW占有
 high-watermarkはM2（owner決定）、resolution/action/audit high-watermarkとnative ring saturationは
 core accessorまたはnative backend実装が必要なため未実装でowner確認待ちです。
 
@@ -880,6 +881,24 @@ cancel/abandon、partial TX/reject、finish errorを決定的に実装します�
 `FrameOrigin`でRXとgeneratedを区別します。RX/生成の`Vec<u8>`そのものをTX/dropへmoveし、
 packet bytesをcloneしません。次の実I/O backendも同じlease contractを実装し、
 backend固有pointerをcoreへ漏らしません。
+
+### deterministic scenario driver（run-sim）
+
+`ruster-sim-scenario`のdriverはscenarioと初期configを読み、process唯一の
+`PublicationSequencer`（scenario seed由来のsim専用key source）でgeneration 1を作り、
+`FullServiceStorage`上の`ActivePublication<SimIo>`を`run_tick`で駆動します。時刻は
+scenarioの注入`MonotonicMillis`だけで、毎tick後に全TXを`pop_tx`で完了させるためtick境界は
+常にquiescentです。`apply`はfileをparse/validateし、失敗（parse、validate、M1 service bridge）は
+tickなしの`invalid`、成功時はsequencerがgenerationを消費してcandidateを現在時刻の1 tickの
+publication phaseへ渡し、そのtickの結果を`applied`または`restart-required`として扱います。
+restart-requiredでもstorageは作り直さず旧generationで継続します（M1 run-simの範囲）。
+`expect`は前回expect以降のTX（egress、exact bytes）、累積drop/consume数、generationを照合し、
+最初の差分をtyped errorで返します。参照fileのread失敗はrunのI/O failure（CLIはexit 1）で、
+読めたがparse/validate/bridgeに失敗したfileはscenario内の`invalid` rejectです。`hold`後は
+`SimRun::idle_tick`で単調な注入時刻のidle tickを続けられます。出力はfield順固定の手書きJSONLで、wall clock、map順、
+hash key、seedを含みません。step単位（tickは1回ずつ）の`SimRun::step`で呼出し側がtick間に
+停止flagを確認できます。full compositionはfirewall必須のため、route missはsilentな
+`FIREWALL_ROUTE_UNAVAILABLE`でDestination Unreachable Networkは生成されません。
 
 ### AF_PACKET checked combined-mapping substrate
 

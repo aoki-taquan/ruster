@@ -209,6 +209,12 @@ exit criteria:
   - 補足（2026-11-01、実装による明確化。owner確認待ち）: NAT port poolのsize変更はstorage shapeを
     変えるためrestart-required。同sizeのrange shiftとrealm変更はreload可能。
 - rollback: M1では旧config fileを新generationとして再applyすることを指す。
+- 補足（S5b review、owner確認待ち）: firewall有効時はroute missでICMPv4 Destination Unreachable
+  Networkを生成しない（architectureに記載のcore policy、RFC 1812 §5.2.7.1からのdeviation）。M1は
+  firewallを必須とするため、exit criterionの「route ICMP」はowner確認までこの挙動で受容する。
+  core修正はegress=noneでingress ruleとdefault policyを評価する案で、範囲は`forwarding.rs`の
+  `decide_ipv4`、io-simの`stateful_firewall.rs`（約1290行目/約3002行目のtest）、architecture記述、
+  M1 golden再生成（ledger SIM-010）。
 - R17の数値thresholdはimplementerがPRで提案し、ownerがそのPRで承認する。
 - NAT/FW占有のhigh-watermarkはM2へ延期する。
   - 補足（S4実装による明確化。owner確認待ち）: R15/Operability minimumのresolution state、action

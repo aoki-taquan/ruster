@@ -223,6 +223,25 @@ pub enum ConfigBridgeError {
     Candidate(PublicationCandidateError),
 }
 
+impl ConfigBridgeError {
+    /// Stable SCREAMING_SNAKE_CASE code for machine-readable output.
+    ///
+    /// Exhaustive, so a new variant fails to compile until it has a code.
+    /// Nested key-source and candidate detail is collapsed.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::MissingService(RuntimeService::Resolution) => "MISSING_SERVICE_RESOLUTION",
+            Self::MissingService(RuntimeService::Icmpv4Errors) => "MISSING_SERVICE_ICMPV4_ERRORS",
+            Self::MissingService(RuntimeService::Nat44Udp) => "MISSING_SERVICE_NAT44_UDP",
+            Self::MissingService(RuntimeService::Nat44Tcp) => "MISSING_SERVICE_NAT44_TCP",
+            Self::MissingService(RuntimeService::Firewall) => "MISSING_SERVICE_FIREWALL",
+            Self::KeySource(_) => "KEY_SOURCE",
+            Self::Candidate(_) => "CANDIDATE",
+        }
+    }
+}
+
 /// Builds a full-service candidate for `generation` from validated config.
 ///
 /// Missing services are rejected before the key source is consulted. The

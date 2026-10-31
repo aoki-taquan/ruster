@@ -77,6 +77,63 @@ pub enum ValidationCode {
     RuntimeStorageBytesExceeded,
 }
 
+impl ValidationCode {
+    /// Stable SCREAMING_SNAKE_CASE code for machine-readable output.
+    ///
+    /// Exhaustive, so a new variant fails to compile until it has a code.
+    /// Nested detail is collapsed to the outer variant.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidSchemaVersion => "INVALID_SCHEMA_VERSION",
+            Self::ListTooLong => "LIST_TOO_LONG",
+            Self::TextTooLarge => "TEXT_TOO_LARGE",
+            Self::EmptyInterfaceName => "EMPTY_INTERFACE_NAME",
+            Self::EmptyDeviceName => "EMPTY_DEVICE_NAME",
+            Self::DuplicateInterfaceId => "DUPLICATE_INTERFACE_ID",
+            Self::DuplicateInterfaceName => "DUPLICATE_INTERFACE_NAME",
+            Self::DuplicateDeviceName => "DUPLICATE_DEVICE_NAME",
+            Self::InvalidMac => "INVALID_MAC",
+            Self::NonCanonicalMac => "NON_CANONICAL_MAC",
+            Self::MacNotUnicast => "MAC_NOT_UNICAST",
+            Self::InvalidIpv4 => "INVALID_IPV4",
+            Self::NonCanonicalIpv4 => "NON_CANONICAL_IPV4",
+            Self::InvalidIpv4Prefix => "INVALID_IPV4_PREFIX",
+            Self::NonCanonicalIpv4Prefix => "NON_CANONICAL_IPV4_PREFIX",
+            Self::AddressNotHost => "ADDRESS_NOT_HOST",
+            Self::UnknownInterface => "UNKNOWN_INTERFACE",
+            Self::DuplicateLocalAddress => "DUPLICATE_LOCAL_ADDRESS",
+            Self::DuplicateInterfaceAddress => "DUPLICATE_INTERFACE_ADDRESS",
+            Self::Route(_) => "ROUTE",
+            Self::DuplicateRoute => "DUPLICATE_ROUTE",
+            Self::GatewayNotHost => "GATEWAY_NOT_HOST",
+            Self::GatewayNotOnLink => "GATEWAY_NOT_ON_LINK",
+            Self::DuplicateNeighbor => "DUPLICATE_NEIGHBOR",
+            Self::NeighborNotHost => "NEIGHBOR_NOT_HOST",
+            Self::NeighborNotOnLink => "NEIGHBOR_NOT_ON_LINK",
+            Self::Forwarding(_) => "FORWARDING",
+            Self::Ipv4Origin(_) => "IPV4_ORIGIN",
+            Self::ResolutionPolicy(_) => "RESOLUTION_POLICY",
+            Self::Icmpv4ErrorPolicy(_) => "ICMPV4_ERROR_POLICY",
+            Self::InvalidAllocatorSeed => "INVALID_ALLOCATOR_SEED",
+            Self::NonCanonicalAllocatorSeed => "NON_CANONICAL_ALLOCATOR_SEED",
+            Self::Nat44RealmWithoutProtocol => "NAT44_REALM_WITHOUT_PROTOCOL",
+            Self::Nat44UdpPolicy(_) => "NAT44_UDP_POLICY",
+            Self::Nat44UdpConfig(_) => "NAT44_UDP_CONFIG",
+            Self::Nat44TcpPolicy(_) => "NAT44_TCP_POLICY",
+            Self::Nat44TcpConfig(_) => "NAT44_TCP_CONFIG",
+            Self::FirewallPrefix(_) => "FIREWALL_PREFIX",
+            Self::FirewallPortRange(_) => "FIREWALL_PORT_RANGE",
+            Self::FirewallPolicy(_) => "FIREWALL_POLICY",
+            Self::FirewallRules(_) => "FIREWALL_RULES",
+            Self::CapacityLimitExceeded => "CAPACITY_LIMIT_EXCEEDED",
+            Self::CapacityNotRepresentable => "CAPACITY_NOT_REPRESENTABLE",
+            Self::CapacityArithmeticOverflow => "CAPACITY_ARITHMETIC_OVERFLOW",
+            Self::RuntimeStorageBytesExceeded => "RUNTIME_STORAGE_BYTES_EXCEEDED",
+        }
+    }
+}
+
 /// A semantic error that never retains source values.
 #[derive(Clone, Eq, PartialEq)]
 pub struct ValidationError {

@@ -32,7 +32,11 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
   Ethernet II、ARP、IPv4、ICMPv4 Echo、UDP、TCPのcold側builderとraw hexでframeを
   checksum込みのexact bytesへ組み立てる（`pad-to-min`で60 bytesまでzero padding）。config pathはscenario directory内の相対pathに限り、
   時刻後退、unknown/duplicate field、上限超過をvalue-freeなtyped errorで拒否する。
-  fileを開かず、実行driverは持たない。
+  driverはscenarioと参照configを読み、full-service publicationを`SimIo`上の`run_tick`で
+  注入時刻だけを使って実行し、`expect`（TX bytes/egress、累積drop/consume、generation）を
+  typed errorで評価してcanonical JSONL `ruster-run-sim/v1`を出力する。M1 golden fixtureは
+  [`fixtures/m1`](fixtures/m1)にあり、golden出力の再生成は
+  `RUSTER_UPDATE_GOLDEN=1 cargo test -p ruster-sim-scenario --test driver`（CIでは拒否）。
 - `ruster-io-afpacket`: Linux AF_PACKET/TPACKET_V3 backendのchecked configuration、
   fixed IfId mapping、ring ownership/UAPI scaffold。combined mmapのRX/TX extentを
   overlap/gap/overflow/実address alignmentまで検証し、後続state machine用metadataを
