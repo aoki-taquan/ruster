@@ -795,13 +795,50 @@ ordered ruleをscanします。
 
 exact expiryをprobe中に発見したattemptは最大1 slotだけ`occupied=false`へ戻し、最大capacity回の
 backward-shift deletionで後続live entryのprobe chainを修復し、最大1回だけ先頭から再scanします。
-再scanで見つけた別のexpired slotは追加deleteせずfirst reuse候補として扱います。このため単一
-packetはprobe最大2N、maintenanceも定数倍Nでstrict O(N)であり、expired数を掛けたO(N²)には
-なりません。full相当のusable loadが全expiryしても、繰返しattemptが1 slotずつamortized cleanup
-し、最終的にempty terminationを回復します。新規flowはcleanupが追いつかない間fail closedで
-構いません。cleanupによるdelete/moveはruntime epochを進め、移動前planをrelease buildでも
-staleとして拒否します。live evictionはありません。probe、maintenance shift/hash/scan、
+再scanで見つけた別のexpired slotは追加deleteせずfirst reuse候補として扱います。
+
+lazy cleanupはprobe chain上のexpired slotしか回収しないため、それだけでは全flow失効後の
+full tableで、empty homeに直接着地するtuple（同一tupleの再送を含む）が永久に
+`FirewallStateTableFull`になり得ます。そこでrule許可済みの新規flowが「placement先がempty
+かつ`occupied_count >= usable`」で拒否されそうなときだけ、refusal-path sweepを1回実行します。
+sweepはworker-localな`reclaim_cursor`（初期値とreconcile後は0）から循環して最大N slot
+（1周）を読み、最初のexpired slotを1件だけ同じbackward-shiftで削除してから同じtupleを再probe
+します。成功したsweepはcursorを削除位置に残します。sweep自身のshiftはentryをholeへ寄せる
+だけでcursorの後ろへは動かさないため、通常は次のsweepが回収済み・再充填済みのslotを読み直し
+ません。ただしcursorより手前でlazy probe cleanupが削除すると、そのshiftがentry（expiredを
+含む）をcursorの後ろへ移すことがあります。これはcostだけに影響し、次の1周で必ず見つかるため
+回復保証は変わりません。worker-localな`reclaim_not_before_ms`（全occupied slotの
+idle deadline `last_activity + TTL`の下界。初期値とreconcile後は0）が`now`より大きい間は
+sweepを読まずO(1)で拒否します。expired slotが無かったsweepは下界をlive slotの正確な最小
+deadline（`now`より後）へ上げ、commitは書いたslotのdeadlineで下界を下げる（ACKによる
+Opening→Active昇格でdeadlineが早まる場合を含む）ため、下界は常に正しく、full-liveな表への
+新規flowは失敗sweepを下界時刻ごとに高々1回しか起こしません。失敗sweep後の下界は`now`より
+後なので、時間軸でも失敗sweepは1 msあたり高々1回です。最早deadlineのflowをrefreshし続ける
+攻撃者でも、強制できるのはおよそ1 msに1回のfull sweep（N read）までです。下界が
+`u64::MAX`に飽和したslotは`now == u64::MAX`のときだけ毎packet sweepを走らせますが、
+上限内で無害です。
+
+単一packetの上限は、probe 2N+shift、sweep N+shift、再probe 2N+shiftの定数倍N
+（delete最大3件）でstrict O(N)のままで、expired数を掛けたO(N²)にはなりません。cursorにより
+全失効後の再充填は償却O(1)/createです。実測（N=65536、usable 49152を全失効させて49152件を
+再作成、probe+maintenance counter合計）は、slot 0から毎回scanする版の総計4.04e8・平均8224・
+最大65584に対し、総計854350（約13N）・平均17・最大329でした。償却O(1)はこの一斉失効後の
+再充填の場合です。1 msに1 flowずつ失効するtrickle/staggered expiryでは、cursorから次の
+expired slotまでの距離が長く、createは引き続き約O(N)です（N=65536で実測平均≈N/2）。
+この場合も下界gateにより概ね1 msあたり1周、かつ持続可能な失効率usable/TTLで抑えられます。回復保証:
+expired slotが1件でもあれば、そのdeadlineは下界以上かつ`now`以下なのでsweepが必ず走って
+1件削除し、`occupied_count < usable`となって同じattempt内の再probeがempty slotで終わり
+placementが成功します。したがって`FirewallStateTableFull`はoccupied slotが全てliveの
+ときだけ返り、同一tupleの再送も含め失効由来の拒否は0回で回復します（timer phaseや他packet
+の通過には依存しません）。cleanupによるdelete/moveはruntime epochを進め、移動前planを
+release buildでもstaleとして拒否します。live evictionはありません。probe、maintenance shift/hash/scan、
 rule evaluation数はcounterで観測できます。
+
+NAT44 UDP/TCPのexpired mapping/peer/sessionは、作成時の`find_reusable_*`がslice全体を
+linear scanし、`select_port`が非liveなport ownerを置換候補にするため、opportunisticな回収
+だけに頼る同種のliveness gapはありません。ただしこれらはindex 0からの走査で下界gateも
+cursorも持たず、ほぼ満杯時には新規作成attemptごとにO(N)の既存costがあります（NAT44-035、
+follow-up）。
 
 common Ethernet ingress admissionはprotocol parserより前にexact ingress MACを検証します。
 続くIPv4 structural/header-checksum検証後のIP admissionだけは、sourceとnonlocal destinationの

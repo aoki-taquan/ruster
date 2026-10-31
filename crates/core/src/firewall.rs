@@ -1264,6 +1264,18 @@ pub struct FirewallRuntime<'state> {
     runtime_epoch: u64,
     next_slot_generation: u64,
     occupied_count: usize,
+    /// Lower bound on the earliest idle deadline of every occupied slot.
+    ///
+    /// The full-table reclaim sweep runs only when `now_ms` reached this
+    /// bound, so a table full of live flows refuses in O(1) and at most one
+    /// unsuccessful sweep happens per distinct bound. `0` means unknown.
+    reclaim_not_before_ms: u64,
+    /// Slot where the next reclaim sweep starts (worker-local, wraps).
+    ///
+    /// A successful sweep leaves it at the reclaimed position, so a refill
+    /// after mass expiry walks the table about once in total instead of
+    /// rescanning reclaimed-and-refilled slots from slot 0 on every create.
+    reclaim_cursor: usize,
     counters: FirewallCounters,
     _worker_local: PhantomData<Rc<()>>,
 }
@@ -1283,6 +1295,8 @@ impl<'state> FirewallRuntime<'state> {
             runtime_epoch: 1,
             next_slot_generation: 1,
             occupied_count: 0,
+            reclaim_not_before_ms: 0,
+            reclaim_cursor: 0,
             counters: FirewallCounters::default(),
             _worker_local: PhantomData,
         }
@@ -1323,6 +1337,8 @@ impl<'state> FirewallRuntime<'state> {
             && self.runtime_epoch == 1
             && self.next_slot_generation == 1
             && self.occupied_count == 0
+            && self.reclaim_not_before_ms == 0
+            && self.reclaim_cursor == 0
             && self.counters == FirewallCounters::default()
     }
 
@@ -1426,7 +1442,7 @@ impl<'state> FirewallRuntime<'state> {
     ) -> Result<FirewallPlan, FirewallPlanError> {
         debug_assert!(self.config_matches(config));
         self.observe_attempt(now_ms)?;
-        let probe = self.probe(packet, now_ms);
+        let mut probe = self.probe(packet, now_ms);
         self.counters.state_probes = self
             .counters
             .state_probes
@@ -1484,6 +1500,19 @@ impl<'state> FirewallRuntime<'state> {
         let rule_id = matched.expect("allow branch requires a matching rule").id;
         if packet.protocol == FirewallProtocol::Tcp && packet.tcp_flags & 0x17 != 0x02 {
             return Err(FirewallPlanError::InvalidInitialTcp(rule_id));
+        }
+        if !self.has_room(probe.reusable) && self.reclaim_one_expired(now_ms) {
+            // The sweep deleted and shifted, so the original placement may
+            // no longer be the first reusable slot of this tuple's chain.
+            probe = self.probe(packet, now_ms);
+            self.counters.state_probes = self
+                .counters
+                .state_probes
+                .saturating_add(probe.probes as u64);
+            debug_assert!(
+                probe.live.is_none(),
+                "a reclaim sweep never creates live state"
+            );
         }
         let index = probe
             .reusable
@@ -1589,6 +1618,9 @@ impl<'state> FirewallRuntime<'state> {
             return Err(FirewallCommitError::UsableCapacityExceeded);
         }
         self.states[plan.index] = plan.replacement;
+        self.reclaim_not_before_ms = self
+            .reclaim_not_before_ms
+            .min(self.slot_deadline(plan.replacement));
         if plan.created {
             if !current.occupied {
                 self.occupied_count += 1;
@@ -1676,6 +1708,72 @@ impl<'state> FirewallRuntime<'state> {
         unreachable!("one cleanup permits at most one bounded restart")
     }
 
+    /// Returns whether a fresh flow could be placed at `reusable` now.
+    fn has_room(&self, reusable: Option<usize>) -> bool {
+        reusable.is_some_and(|index| {
+            self.states[index].occupied || self.occupied_count < self.usable_capacity()
+        })
+    }
+
+    /// Bounded refusal-path sweep: deletes the first expired slot, if any.
+    ///
+    /// Lazy probe cleanup reclaims only expired slots on the probed chain, so
+    /// a full table of expired flows could otherwise refuse the same tuple
+    /// forever. This sweep reads at most `capacity` slots (one full lap from
+    /// `reclaim_cursor`) and performs at most one backward-shift deletion,
+    /// keeping the per-packet bound O(N); a full lap means any expired slot
+    /// is found. It resumes at the reclaimed position because its own shift
+    /// only moves entries toward the hole, never behind the cursor; a lazy
+    /// probe-cleanup deletion before the cursor can shift entries behind it,
+    /// which only costs more reads, since the next full lap still finds
+    /// them. It is skipped
+    /// in O(1) while `now_ms` is below the earliest-deadline lower bound,
+    /// which an unsuccessful sweep raises to the exact minimum deadline of
+    /// the (then all live) occupied slots. Live slots are never evicted.
+    fn reclaim_one_expired(&mut self, now_ms: u64) -> bool {
+        // A deadline saturated at u64::MAX makes the bound u64::MAX; at
+        // `now_ms == u64::MAX` that only re-runs a bounded, harmless sweep.
+        if self.states.is_empty() || now_ms < self.reclaim_not_before_ms {
+            return false;
+        }
+        let capacity = self.states.len();
+        let start = self.reclaim_cursor % capacity;
+        let mut earliest = u64::MAX;
+        for step in 0..capacity {
+            let index = (start + step) % capacity;
+            self.counters.maintenance_steps = self.counters.maintenance_steps.saturating_add(1);
+            let slot = self.states[index];
+            if !slot.occupied {
+                continue;
+            }
+            if !self.slot_live(slot, now_ms) {
+                self.delete_expired_and_shift(index);
+                self.reclaim_cursor = index;
+                return true;
+            }
+            earliest = earliest.min(self.slot_deadline(slot));
+        }
+        self.reclaim_not_before_ms = earliest;
+        false
+    }
+
+    /// First timestamp at which `slot_live` may report this slot expired.
+    fn slot_deadline(&self, slot: FirewallStateSlot) -> u64 {
+        slot.last_activity_ms.saturating_add(self.slot_ttl(slot))
+    }
+
+    fn slot_ttl(&self, slot: FirewallStateSlot) -> u64 {
+        match (slot.protocol, slot.tcp_phase) {
+            (FirewallProtocol::Udp, _) => self.binding.policy.udp_idle_ttl_ms,
+            (FirewallProtocol::Tcp, FirewallTcpPhase::Opening) => {
+                self.binding.policy.tcp_opening_idle_ttl_ms
+            }
+            (FirewallProtocol::Tcp, FirewallTcpPhase::Active) => {
+                self.binding.policy.tcp_active_idle_ttl_ms
+            }
+        }
+    }
+
     fn delete_expired_and_shift(&mut self, index: usize) {
         let capacity = self.states.len();
         self.states[index] = FirewallStateSlot::default();
@@ -1715,16 +1813,7 @@ impl<'state> FirewallRuntime<'state> {
         {
             return false;
         }
-        let ttl = match (slot.protocol, slot.tcp_phase) {
-            (FirewallProtocol::Udp, _) => self.binding.policy.udp_idle_ttl_ms,
-            (FirewallProtocol::Tcp, FirewallTcpPhase::Opening) => {
-                self.binding.policy.tcp_opening_idle_ttl_ms
-            }
-            (FirewallProtocol::Tcp, FirewallTcpPhase::Active) => {
-                self.binding.policy.tcp_active_idle_ttl_ms
-            }
-        };
-        now_ms - slot.last_activity_ms < ttl
+        now_ms - slot.last_activity_ms < self.slot_ttl(slot)
     }
 }
 
@@ -1734,6 +1823,8 @@ impl FirewallReconcilePermit<'_, '_> {
         if self.advance {
             self.runtime.states.fill(FirewallStateSlot::default());
             self.runtime.occupied_count = 0;
+            self.runtime.reclaim_not_before_ms = 0;
+            self.runtime.reclaim_cursor = 0;
             self.runtime.binding = self.next;
             self.runtime.runtime_epoch = self.next_runtime_epoch;
             self.runtime.counters.reconciliations =
@@ -1898,6 +1989,8 @@ mod tests {
         runtime_epoch: u64,
         next_slot_generation: u64,
         occupied_count: usize,
+        reclaim_not_before_ms: u64,
+        reclaim_cursor: usize,
         counters: FirewallCounters,
     }
 
@@ -1909,6 +2002,8 @@ mod tests {
             runtime_epoch: runtime.runtime_epoch,
             next_slot_generation: runtime.next_slot_generation,
             occupied_count: runtime.occupied_count,
+            reclaim_not_before_ms: runtime.reclaim_not_before_ms,
+            reclaim_cursor: runtime.reclaim_cursor,
             counters: runtime.counters,
         }
     }
@@ -2910,6 +3005,351 @@ mod tests {
                 assert_eq!(after.state_probes - before.state_probes, 1);
                 assert_eq!(after.maintenance_steps - before.maintenance_steps, 0);
             }
+        });
+    }
+
+    /// Finds `count` UDP tuples (distinct source ports from `first_port`)
+    /// whose home slot in a `capacity`-slot table satisfies `home`.
+    fn udp_tuples_with_home(
+        capacity: usize,
+        count: usize,
+        first_port: u16,
+        home: impl Fn(usize) -> bool,
+    ) -> Vec<FirewallPacket> {
+        let mut found = Vec::with_capacity(count);
+        for port in first_port..=u16::MAX {
+            let mut candidate = packet(FirewallProtocol::Udp, 0);
+            candidate.source_port = port;
+            if home(flow_hash(candidate, 1, hash_key()) as usize % capacity) {
+                found.push(candidate);
+                if found.len() == count {
+                    break;
+                }
+            }
+        }
+        assert_eq!(found.len(), count);
+        found
+    }
+
+    #[test]
+    fn expired_full_table_recovers_same_tuple_retry_in_one_bounded_attempt() {
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            for capacity in [4, 8, 32, 64] {
+                let mut slots = vec![FirewallStateSlot::default(); capacity];
+                let mut runtime = FirewallRuntime::new(config, &mut slots);
+                let usable = runtime.usable_capacity();
+                // Every old flow homes at slot 0, so the cluster is
+                // [0, usable) and every slot from `usable` on stays empty.
+                let old = udp_tuples_with_home(capacity, usable, 1, |home| home == 0);
+                for flow in &old {
+                    let plan = runtime.plan_packet(&config, *flow, 0).unwrap();
+                    runtime.commit(plan).unwrap();
+                }
+                // A fresh tuple homed at the first empty slot: its probe ends
+                // at that empty home without crossing any expired slot, the
+                // path that used to refuse the same tuple forever.
+                let fresh = udp_tuples_with_home(capacity, 1, 20_000, |home| home == usable)[0];
+                assert_eq!(
+                    runtime.plan_packet(&config, fresh, 0),
+                    Err(FirewallPlanError::StateFull(FirewallRuleId(1)))
+                );
+
+                let expired_at = FIREWALL_UDP_DEFAULT_IDLE_TTL_MS;
+                for attempt in 0..3 {
+                    let before = runtime.counters();
+                    let plan = runtime
+                        .plan_packet(&config, fresh, expired_at)
+                        .unwrap_or_else(|error| {
+                            panic!("capacity {capacity} attempt {attempt}: {error:?}")
+                        });
+                    let after = runtime.counters();
+                    let operations = (after.state_probes - before.state_probes)
+                        + (after.maintenance_steps - before.maintenance_steps);
+                    // probe (2N) + shift (3N+1) + sweep (N) + shift (3N+1) +
+                    // retry probe (2N) + shift (3N+1).
+                    assert!(
+                        operations <= (capacity as u64) * 14 + 3,
+                        "capacity {capacity}: {operations} operations"
+                    );
+                    if attempt == 0 {
+                        assert_eq!(after.states_expired, before.states_expired + 1);
+                    } else {
+                        // The first attempt's deletion already freed room.
+                        assert_eq!(after.states_expired, before.states_expired);
+                    }
+                    if attempt == 2 {
+                        runtime.commit(plan).unwrap();
+                    }
+                }
+                assert!(runtime
+                    .states()
+                    .iter()
+                    .any(|slot| slot.is_occupied() && slot.initiator_port() == fresh.source_port));
+                // The remaining expired slots are recoverable one per create.
+                let more = udp_tuples_with_home(capacity, usable - 1, 30_000, |_| true);
+                for flow in more {
+                    let plan = runtime.plan_packet(&config, flow, expired_at).unwrap();
+                    runtime.commit(plan).unwrap();
+                }
+                let occupied = runtime
+                    .states()
+                    .iter()
+                    .filter(|slot| slot.is_occupied())
+                    .count();
+                assert_eq!(occupied, usable);
+                assert_eq!(runtime.occupied_count, usable);
+                assert_eq!(runtime.counters().states_expired, usable as u64);
+                assert!(runtime
+                    .states()
+                    .iter()
+                    .all(|slot| runtime.slot_live(*slot, expired_at) || !slot.is_occupied()));
+            }
+        });
+    }
+
+    #[test]
+    fn full_live_table_refuses_without_eviction_and_sweeps_once_per_deadline() {
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let capacity = 32;
+            let mut slots = vec![FirewallStateSlot::default(); capacity];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let usable = runtime.usable_capacity();
+            let ttl = FIREWALL_UDP_DEFAULT_IDLE_TTL_MS;
+            let flows = udp_tuples_with_home(capacity, usable, 1, |_| true);
+            // Flow `i` is created at time `i`, so flow 0 expires first.
+            for (created, flow) in flows.iter().enumerate() {
+                let plan = runtime.plan_packet(&config, *flow, created as u64).unwrap();
+                runtime.commit(plan).unwrap();
+            }
+            let now = usable as u64;
+            let fresh = udp_tuples_with_home(capacity, 1, 40_000, |_| true)[0];
+            let full_states = runtime.states().to_vec();
+
+            // The first refusal sweeps the table once and learns the exact
+            // earliest deadline; nothing is evicted.
+            let before = runtime.counters();
+            assert_eq!(
+                runtime.plan_packet(&config, fresh, now),
+                Err(FirewallPlanError::StateFull(FirewallRuleId(1)))
+            );
+            let after = runtime.counters();
+            assert_eq!(
+                after.maintenance_steps - before.maintenance_steps,
+                capacity as u64
+            );
+            assert_eq!(runtime.states(), &full_states[..]);
+            assert_eq!(runtime.reclaim_not_before_ms, ttl);
+
+            // Until that deadline, refusals do not sweep at all.
+            for now in [now, ttl - 1] {
+                let before = runtime.counters();
+                assert_eq!(
+                    runtime.plan_packet(&config, fresh, now),
+                    Err(FirewallPlanError::StateFull(FirewallRuleId(1)))
+                );
+                let after = runtime.counters();
+                assert_eq!(after.maintenance_steps, before.maintenance_steps);
+                assert_eq!(after.states_expired, 0);
+                assert_eq!(runtime.states(), &full_states[..]);
+            }
+
+            // At the deadline exactly the earliest flow has expired and is
+            // the only one reclaimed.
+            let plan = runtime.plan_packet(&config, fresh, ttl).unwrap();
+            runtime.commit(plan).unwrap();
+            assert_eq!(runtime.counters().states_expired, 1);
+            let holds = |runtime: &FirewallRuntime<'_>, flow: &FirewallPacket| {
+                runtime
+                    .states()
+                    .iter()
+                    .any(|slot| slot.is_occupied() && slot.initiator_port() == flow.source_port)
+            };
+            assert!(flows[1..].iter().all(|flow| holds(&runtime, flow)));
+            assert!(!holds(&runtime, &flows[0]));
+
+            // A refresh makes the bound stale: the next sweep finds nothing,
+            // re-learns the exact bound, and still evicts nothing.
+            let refresh = runtime.plan_packet(&config, flows[1], ttl).unwrap();
+            runtime.commit(refresh).unwrap();
+            let another = udp_tuples_with_home(capacity, 1, 50_000, |_| true)[0];
+            let states = runtime.states().to_vec();
+            let before = runtime.counters();
+            assert_eq!(
+                runtime.plan_packet(&config, another, ttl),
+                Err(FirewallPlanError::StateFull(FirewallRuleId(1)))
+            );
+            assert_eq!(runtime.states(), &states[..]);
+            assert_eq!(
+                runtime.counters().maintenance_steps - before.maintenance_steps,
+                capacity as u64
+            );
+            assert_eq!(runtime.reclaim_not_before_ms, ttl + 2);
+
+            // Reconcile flushes state and forgets the bound.
+            let rotated = FirewallConfig::new(
+                snapshot,
+                &rules,
+                FirewallPolicy::default(),
+                2,
+                rotated_hash_key(),
+            )
+            .unwrap();
+            runtime.reclaim_cursor = 5;
+            runtime.reconcile(rotated).unwrap();
+            assert_eq!(runtime.reclaim_not_before_ms, 0);
+            assert_eq!(runtime.reclaim_cursor, 0);
+        });
+    }
+
+    #[test]
+    fn refill_after_mass_expiry_is_amortized_linear_in_capacity() {
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let capacity = 1 << 16;
+            let mut slots = vec![FirewallStateSlot::default(); capacity];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let usable = runtime.usable_capacity();
+            let flow = |port: usize, destination_port: u16| FirewallPacket {
+                source_port: u16::try_from(port).unwrap(),
+                destination_port,
+                ..packet(FirewallProtocol::Udp, 0)
+            };
+            for port in 1..=usable {
+                let plan = runtime.plan_packet(&config, flow(port, 443), 0).unwrap();
+                runtime.commit(plan).unwrap();
+            }
+            let expired_at = FIREWALL_UDP_DEFAULT_IDLE_TTL_MS;
+            let before = runtime.counters();
+            let mut worst = 0;
+            for port in 1..=usable {
+                let step = runtime.counters();
+                let plan = runtime
+                    .plan_packet(&config, flow(port, 444), expired_at)
+                    .unwrap();
+                runtime.commit(plan).unwrap();
+                let after = runtime.counters();
+                worst = worst.max(
+                    (after.state_probes - step.state_probes)
+                        + (after.maintenance_steps - step.maintenance_steps),
+                );
+            }
+            let after = runtime.counters();
+            let total = (after.state_probes - before.state_probes)
+                + (after.maintenance_steps - before.maintenance_steps);
+            assert_eq!(after.states_expired, usable as u64);
+            assert_eq!(runtime.occupied_count, usable);
+            // Sweeps resume at the cursor, so the refill walks the table
+            // about once in total (plus probe/shift work per create)
+            // instead of O(N) per create from slot 0.
+            assert!(
+                total <= (capacity as u64) * 16,
+                "total {total} worst {worst} for capacity {capacity}"
+            );
+            assert!(worst <= (capacity as u64) * 14 + 3);
+        });
+    }
+
+    #[test]
+    fn phase_change_that_shortens_a_deadline_lowers_the_sweep_bound() {
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Tcp,
+            )];
+            // Opening may outlive Active, so ACK-driven promotion can move a
+            // slot's deadline earlier than the bound a sweep learned.
+            let policy = FirewallPolicy::new(
+                FIREWALL_UDP_DEFAULT_IDLE_TTL_MS,
+                FIREWALL_MAX_IDLE_TTL_MS,
+                FIREWALL_TCP_ACTIVE_MIN_IDLE_TTL_MS,
+            )
+            .unwrap();
+            let config = FirewallConfig::new(snapshot, &rules, policy, 1, hash_key()).unwrap();
+            let capacity = 4;
+            let mut slots = vec![FirewallStateSlot::default(); capacity];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let tcp_with_home = |count: usize, first_port: u16, home: usize| {
+                let mut found = Vec::new();
+                for port in first_port..=u16::MAX {
+                    let mut candidate = packet(FirewallProtocol::Tcp, 0x02);
+                    candidate.source_port = port;
+                    if flow_hash(candidate, 1, hash_key()) as usize % capacity == home {
+                        found.push(candidate);
+                        if found.len() == count {
+                            break;
+                        }
+                    }
+                }
+                found
+            };
+            let old = tcp_with_home(3, 1, 0);
+            for syn in &old {
+                let plan = runtime.plan_packet(&config, *syn, 0).unwrap();
+                runtime.commit(plan).unwrap();
+            }
+            let fresh = tcp_with_home(1, 20_000, 3)[0];
+            assert_eq!(
+                runtime.plan_packet(&config, fresh, 1),
+                Err(FirewallPlanError::StateFull(FirewallRuleId(1)))
+            );
+            assert_eq!(runtime.reclaim_not_before_ms, FIREWALL_MAX_IDLE_TTL_MS);
+
+            let forward_ack = FirewallPacket {
+                tcp_flags: 0x10,
+                ..old[0]
+            };
+            let reverse_syn_ack = FirewallPacket {
+                ingress: forward_ack.egress,
+                egress: forward_ack.ingress,
+                source: forward_ack.destination,
+                destination: forward_ack.source,
+                source_port: forward_ack.destination_port,
+                destination_port: forward_ack.source_port,
+                tcp_flags: 0x12,
+                ..forward_ack
+            };
+            let plan = runtime.plan_packet(&config, reverse_syn_ack, 2).unwrap();
+            runtime.commit(plan).unwrap();
+            let plan = runtime.plan_packet(&config, forward_ack, 3).unwrap();
+            runtime.commit(plan).unwrap();
+            let promoted_deadline = 3 + FIREWALL_TCP_ACTIVE_MIN_IDLE_TTL_MS;
+            assert_eq!(runtime.reclaim_not_before_ms, promoted_deadline);
+
+            // The fresh tuple's probe ends at its empty home, so only the
+            // sweep can reclaim the promoted, now expired flow.
+            let plan = runtime
+                .plan_packet(&config, fresh, promoted_deadline)
+                .unwrap();
+            runtime.commit(plan).unwrap();
+            assert_eq!(runtime.counters().states_expired, 1);
+            assert!(old[1..].iter().all(|syn| runtime
+                .states()
+                .iter()
+                .any(|slot| slot.is_occupied() && slot.initiator_port() == syn.source_port)));
         });
     }
 

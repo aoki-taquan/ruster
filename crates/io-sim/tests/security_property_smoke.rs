@@ -760,38 +760,35 @@ fn assert_exercised(rendered: &str) {
     );
 }
 
-/// Known gap, not a guarantee: post-expiry firewall capacity liveness.
+/// Post-expiry firewall capacity liveness (R16A-009).
 ///
-/// Today's core refuses a fresh flow after every flow of a full firewall
-/// table expired (see the `state-expired-firewall-capacity-after-idle-jump`
-/// corpus case). This test pins that refusal so the follow-up core fix must
-/// flip it deliberately: invert the assertion and enable
-/// `REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY` in the same change.
+/// The `state-expired-firewall-capacity-after-idle-jump` corpus program
+/// fills a 4-slot firewall table (3 usable), jumps past every idle lifetime,
+/// and then sends a fresh flow, a reply to an expired flow, and the expired
+/// flow's own tuple again. Expired slots must be reclaimed for both creates:
+/// the only refusal is the pre-jump fourth flow, refused while every
+/// firewall flow was still live.
 #[test]
-fn r16_known_gap_expired_firewall_slots_still_refuse_fresh_flow() {
-    const { assert!(!r16a::state::REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY) };
+fn r16_expired_firewall_slots_are_reclaimed_for_fresh_and_same_tuple_flows() {
     let corpus = r16a::corpus::past_regressions();
     let case = corpus
         .iter()
         .find(|case| case.name == "state-expired-firewall-capacity-after-idle-jump")
         .unwrap();
     let (coverage, refusals) = r16a::state::run_traced(&parse(&case.encoded).unwrap()).unwrap();
-    assert!(
-        coverage.refused_after_expiry >= 1,
-        "the post-expiry refusal is gone; finish the follow-up: {coverage:?}"
-    );
-    // The program's final packet retries the expired flow's own tuple.
+    assert_eq!(coverage.refused_after_expiry, 0, "{coverage:?}");
+    assert_eq!(coverage.big_jumps, 1, "{coverage:?}");
     assert_eq!(
-        refusals.last(),
-        Some(&r16a::state::Refusal {
-            host: 0,
+        refusals,
+        [r16a::state::Refusal {
+            host: 3,
             internal_port: 5_000,
-            remote: r16a::router::remote(0, false),
+            remote: r16a::router::remote(3, false),
             remote_port: 53,
             cause: Some(ruster_io_sim::RecycleCause::Forwarding(
                 ruster_core::DropReason::FirewallStateTableFull
             )),
-        }),
-        "the expired same-tuple retry is no longer refused as table-full; finish the follow-up"
+        }],
+        "only the pre-expiry fourth flow may be refused"
     );
 }
