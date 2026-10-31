@@ -9,6 +9,7 @@ mod generated;
 mod icmpv4_error;
 mod io;
 mod nat44;
+mod observability;
 mod packet;
 mod resolution;
 mod route;
@@ -82,6 +83,7 @@ pub use nat44::{
     NAT44_TCP_DEFAULT_IDLE_TTL_MS, NAT44_TCP_MAX_IDLE_TTL_MS, NAT44_TCP_MIN_IDLE_TTL_MS,
     NAT44_UDP_DEFAULT_IDLE_TTL_MS, NAT44_UDP_MAX_IDLE_TTL_MS, NAT44_UDP_MIN_IDLE_TTL_MS,
 };
+pub use observability::{BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields};
 pub use packet::{
     validate_arp, validate_arp_request, validate_ipv4_frame, ArpOpcode, MacAddress, ValidatedArp,
     ValidatedArpRequest, ValidatedIpv4, ARP_ETHERTYPE, ETHERNET_HEADER_LEN, IPV4_ETHERTYPE,

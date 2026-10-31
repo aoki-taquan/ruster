@@ -238,6 +238,39 @@ pub enum ConsumeReason {
     Ipv4LocalUnsupported,
 }
 
+impl ConsumeReason {
+    /// Every reason in declaration order; `ALL[reason.index()] == reason`.
+    pub const ALL: [Self; 2] = [Self::ArpControl, Self::Ipv4LocalUnsupported];
+
+    /// Dense index into [`Self::ALL`]. Exhaustive inside core, so a new
+    /// variant fails to compile until it is indexed and listed.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::ArpControl => 0,
+            Self::Ipv4LocalUnsupported => 1,
+        }
+    }
+
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ArpControl => "ARP_CONTROL",
+            Self::Ipv4LocalUnsupported => "IPV4_LOCAL_UNSUPPORTED",
+        }
+    }
+}
+
+// `ALL` agrees with the exhaustive `index`. Completeness against the
+// declaration is checked by `consume_reason_all_lists_every_declared_variant`.
+const _: () = {
+    let mut index = 0;
+    while index < ConsumeReason::ALL.len() {
+        assert!(ConsumeReason::ALL[index].index() == index);
+        index += 1;
+    }
+};
+
 /// A core-owned, worker-local RAII lease.
 ///
 /// The `Rc` marker makes this type `!Send + !Sync`; moving a live backend slot
@@ -355,9 +388,33 @@ impl<E> BatchCompletion<E> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchCompletion, PublicationQuiescence, PublicationQuiescenceDisposition,
+        BatchCompletion, ConsumeReason, PublicationQuiescence, PublicationQuiescenceDisposition,
         PublicationQuiescenceGuard,
     };
+
+    /// A new variant fails this test until it is appended to `ALL`.
+    #[test]
+    fn consume_reason_all_lists_every_declared_variant() {
+        let body = include_str!("io.rs")
+            .split_once("pub enum ConsumeReason {")
+            .unwrap()
+            .1
+            .split_once("\n}")
+            .unwrap()
+            .0;
+        let declared: Vec<&str> = body
+            .lines()
+            .map(|line| line.trim().trim_end_matches(','))
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .collect();
+        let listed: Vec<String> = ConsumeReason::ALL
+            .iter()
+            .map(|r| format!("{r:?}"))
+            .collect();
+        assert_eq!(declared, listed);
+        let codes: Vec<&str> = ConsumeReason::ALL.iter().map(|r| r.code()).collect();
+        assert_eq!(codes, ["ARP_CONTROL", "IPV4_LOCAL_UNSUPPORTED"]);
+    }
 
     struct UnclassifiedBackend;
 
