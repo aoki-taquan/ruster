@@ -230,6 +230,20 @@ fn benchmark_spec_v0_2_matrix_matches_hardware_plan_v1() {
     assert_eq!(documented, computed);
     assert_eq!(documented.values().sum::<usize>(), 237);
 
+    // Queue-count split cited in the hardware prerequisite and owner questions.
+    let q1 = plan
+        .cases
+        .iter()
+        .filter(|c| c.case.queue_count == 1)
+        .count();
+    let q4 = plan
+        .cases
+        .iter()
+        .filter(|c| c.case.queue_count == 4)
+        .count();
+    assert_eq!((q1, q4), (36, 201));
+    assert!(spec.contains("q1は36 case") && spec.contains("237中201 caseが`q4`"));
+
     // Offered table: floor(line rate * percent / 100) at 10 Gbit/s, and every
     // gated or report-only (tier, frame) pair in plan v1 has a load to use.
     let mut offered: BTreeMap<(String, String), u128> = BTreeMap::new();

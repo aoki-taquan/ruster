@@ -56,11 +56,13 @@ jobs:
             echo "smoke suite produced no rows" >&2
             exit 1
           fi
-          if grep -v -F '"schema_version":1,' "${RUNNER_TEMP}/benchmark-smoke.jsonl" | grep -q .; then
+          # Single grep per check (no pipe): `grep -v | grep -q` fails open under
+          # pipefail when the producer gets SIGPIPE.
+          if grep -q -v -F '"schema_version":1,' "${RUNNER_TEMP}/benchmark-smoke.jsonl"; then
             echo "smoke row without schema_version 1" >&2
             exit 1
           fi
-          if grep -v -F '"timed_allocations":0,' "${RUNNER_TEMP}/benchmark-smoke.jsonl" | grep -q .; then
+          if grep -q -v -F '"timed_allocations":0,' "${RUNNER_TEMP}/benchmark-smoke.jsonl"; then
             echo "smoke row with timed allocations" >&2
             exit 1
           fi

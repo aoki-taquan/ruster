@@ -9,8 +9,25 @@
 このdocumentはdevelopment plan R17の「結果取得前に数値をfreezeするbenchmark
 specification」です。**本文中の数値thresholdはすべてimplementerによる提案（PROPOSED）で、
 ownerがPRで承認するまで効力を持ちません**（M1 owner決定「R17の数値thresholdはimplementerが
-PRで提案し、ownerがそのPRで承認する」）。承認時はstatus行を`APPROVED`へ変え、digest fileを
-更新したcommitをfrozen specとします。X05は`DRAFT`のspecに対して測定を開始してはいけません。
+PRで提案し、ownerがそのPRで承認する」）。このdraftはまだfrozen specではありません。
+X05は`DRAFT`のspecに対して測定を開始してはいけません。
+
+### 承認手順
+
+ownerが数値を承認（必要なら修正）するPRで、同じcommit内に次をすべて行います。
+
+1. status行を`- status: **APPROVED — owner承認済み（承認PR番号）**`へ変え、承認された値以外の
+   本文を変更しない。
+2. repository rootで`sha256sum docs/benchmark-spec-v0.2.md > docs/benchmark-spec-v0.2.sha256`を
+   実行してdigestを再生成する。
+3. `crates/bench/tests/benchmark_spec.rs`のdraft marker test
+   （`benchmark_spec_v0_2_is_marked_draft_until_owner_approval`）を`APPROVED`を要求するtestへ
+   置き換える。
+4. `docs/requirements-v0.2.md`のBENCH-009を`deferred`から実装済みの状態とtest IDへ更新する。
+
+frozen specは、このPRが`main`へsquash mergeされたcommitです。そのcommit SHAを`spec_git_sha`、
+そのcommitにおける`docs/benchmark-spec-v0.2.md`のbytesのSHA-256を`spec_sha256`とします。
+以後の数値変更は新しいspec versionとして同じ手順を繰り返し、X05の結果PRで緩和しません。
 
 ## 既存hardware v1文書との関係
 
@@ -29,9 +46,10 @@ PRで提案し、ownerがそのPRで承認する」）。承認時はstatus行�
 - 名前の`v0.2`はruster project versionで、`v1`はhardware plan/protocol/artifactの
   schema versionです。plan/protocol/artifactのversionが変わる場合は、このspecも新versionとして
   再freezeします。
-- protocol v1の`spec_git_sha`はこのspecが`APPROVED`としてmergeされた`main` commit、
-  `spec_sha256`は`docs/benchmark-spec-v0.2.md`のbytesのSHA-256です。値は
-  [`benchmark-spec-v0.2.sha256`](benchmark-spec-v0.2.sha256)（`sha256sum -c`形式）に固定します。
+- protocol v1の`spec_git_sha`と`spec_sha256`は上の「承認手順」の定義に従います
+  （`APPROVED` specが`main`へsquash mergeされたcommitと、そのspec bytesのSHA-256）。
+  `spec_sha256`は[`benchmark-spec-v0.2.sha256`](benchmark-spec-v0.2.sha256)
+  （`sha256sum -c`形式）に固定し、`.gitattributes`の`-text`でcheckout間のbytesを安定させます。
 - plan v1/protocol v1/artifact v1の文書が「threshold、pass/fail非対象」と書いている点は
   変わりません。合否はこのspecとX05のevaluatorだけが扱います。
 
@@ -54,8 +72,8 @@ hardware、AF_XDP、traffic generator、baselineはM1の対象外です。
 ### Hardware前提
 
 M2 minimum topologyは2 ports、各port 1 RX/TX queueです。これはtier `SC`のq1 caseが
-評価します。ただしplan v1のcomplete runはexact 237 caseを要求し、そのうち210 caseが
-`q4`なので、X05のlabは**port当たり4 queue以上をsupportするNIC**を必要とします
+評価します。ただしplan v1のcomplete runはexact 237 caseを要求し、そのうちq1は36 case
+（single-queue 27、udp-zeroのzero-copy/q1/flow4096 9）で、237中201 caseが`q4`なので、X05のlabは**port当たり4 queue以上をsupportするNIC**を必要とします
 （下の「ownerへの確認事項」1）。
 
 ### Gate tier
@@ -132,7 +150,7 @@ MQ/SCの各caseは、protocol v1が導出したsummaryに対して次をすべ�
 
 | metric | artifact field | threshold | rationale |
 |---|---|---|---|
-| maximum loss | `loss_ratio_worst` | ≤ 0.00001（0.001%） | near-zero-loss基準。1500-byte 30秒で約2,438万packet中243以下。TCPのloss感度から、測定可能な最小の非zero許容値を置く |
+| maximum loss | `loss_ratio_worst` | binary64で`loss_ratio_worst <= 1e-5`（0.001%） | near-zero-loss基準。1500-byte 30秒で約2,438万packet中243以下。TCPのloss感度から、測定可能な最小の非zero許容値を置く |
 | minimum accepted rate | `accepted_pps_median` | ≥ `D × O × 0.99999` | loss上限と同じ比率をrateへ写す。line-rate比はMQ/SC表のpercent × 0.99999 |
 | p50 latency | `p50_latency_ns_worst` | ≤ 100,000 ns（100 µs） | batch 64のpoll遅延と2回のwire serializationを含めても十分小さく、household interactive trafficの数msの予算に影響しない |
 | p99 latency | `p99_latency_ns_worst` | ≤ 1,000,000 ns（1 ms） | VoIP/game等の片道20 ms級予算の5%以下 |
@@ -170,12 +188,20 @@ zeroに加え、次の共通invariantを要求します。
 
 | metric | allowed regression | rationale |
 |---|---|---|
-| `accepted_pps_median` | ≥ baseline × 0.95（5%以内の低下） | offeredが固定のため、低下は実質loss増加。5%はgenerator/host jitterの余裕 |
+| `accepted_pps_median` | regression判定なし（下の注記） | 絶対下限が常に支配する |
 | `p50_latency_ns_worst` | ≤ max(baseline × 1.10, baseline + 5,000 ns) | 小さい値でのnoiseを絶対値5 µsで吸収 |
 | `p99_latency_ns_worst` | ≤ max(baseline × 1.20, baseline + 20,000 ns) | tailはnoiseが大きいので20%または20 µs |
 | `loss_ratio_worst` | 相対比較なし（絶対上限0.001%のみ） | zero近傍の比率比較は不安定 |
 
 hardware profileが異なるrunはbaselineと比較せず、新しいbaselineの確立として扱います。
+
+注記（owner判断事項、確認事項6）: protocol v1はofferedを固定するため、baselineの
+`accepted_pps_median`は`D × O`以下で、絶対下限`≥ D × O × 0.99999`を満たすrunは
+`baseline × 0.95`も必ず満たします。したがってpps regression ruleは決して発火しない
+no-opであり、このspecでは採用しません。throughput regressionを意味のある形で検出するには、
+最大no-drop rateを探索する測定（RFC 2544 throughput型）か、artifactにcycles/packetや
+CPU使用率を追加するprotocol/artifact v2が必要で、v1の範囲外です。v0.2のregression gateは
+latencyだけです。
 
 ### Soak（M2、PROPOSED）
 
@@ -183,7 +209,7 @@ hardware profileが異なるrunはbaselineと比較せず、新しいbaselineの
   の設定で、offeredは50%（1,763,046 pps/direction）。
 - duration: 2時間（600秒window × 12）。protocol v1の237-case runとは別の連続runとし、
   artifact形式はX05で定義する（確認事項4）。
-- 各window: `loss ≤ 0.00001`、`p99 ≤ 1 ms`。
+- 各window: binary64で`loss_ratio <= 1e-5`、`p99 ≤ 1 ms`。
 - 全体: frame health totalが不変、`invalid_descriptors = double_owned = 0`、worker healthの
   last successful tickが1秒を超えて止まらない、window 1終了時からwindow 12終了時までの
   process RSS増加 ≤ 4 MiB、NAT/FW live state数がwindow 1終了時を超えて単調増加しない。
@@ -212,9 +238,14 @@ ms級停止）を上限とする。
 
 ## ownerへの確認事項
 
-1. M2 minimum topology（各port 1 queue）とplan v1（237中210 caseがq4）の差。このspecは
-   X05 labに4 queue NICを要求する。1 queue NICだけでM2を閉じる場合はplan v2が必要。
+1. M2 minimum topology（各port 1 queue）とplan v1（237中201 caseがq4、q1は36 case）の差。
+   このspecはX05 labに4 queue NICを要求する。1 queue NICだけでM2を閉じる場合はplan v2が必要。
 2. MQ IMIX/eth512 100%（特にbidirectional NAT+FW）が過大なら、percentを下げる。
 3. loss 0.001%（zero-lossではない）、p50 100 µs/p99 1 msの水準。
 4. soakとoperator testのartifact形式はprotocol v1外であり、X05で定義してよいか。
 5. latencyのgenerator loopbackを差し引かない方針。
+6. pps regressionはfixed offered loadでは発火しないため不採用とし、v0.2のregression gateを
+   latencyだけにするか。throughput regressionが必要なら、no-drop rate探索または
+   cycles/packetを持つprotocol/artifact v2を別sliceで追加するか。
+7. 承認手順（status、digest、draft marker test、BENCH-009を同じ承認PRで更新し、squash merge
+   commitを`spec_git_sha`とする）でよいか。
