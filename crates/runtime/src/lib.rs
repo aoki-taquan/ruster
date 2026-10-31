@@ -17,12 +17,14 @@ use std::{marker::PhantomData, num::NonZeroU64};
 mod observability;
 
 pub use observability::{
-    ApplyFlushCounts, ApplyOutcomeKind, BackendMode, BackendStats, ConsumeReasonCounters,
-    DropReasonCounters, FieldValue, FieldVisitor, FieldsDisplay, GeneratedTotals, Health,
-    HealthPolicy, HealthState, LastApply, ObservabilitySnapshot, ObservableFields,
+    ApplyFlushCounts, ApplyOutcomeKind, ConsumeReasonCounters, DropReasonCounters, FieldsDisplay,
+    GeneratedTotals, Health, HealthPolicy, HealthState, LastApply, ObservabilitySnapshot,
     PhaseSkipCounters, RxTotals, ServiceCounters, TickObserver, TickTotals, DROP_REASON_CODE_LIMIT,
     TICK_PHASE_SKIPS,
 };
+/// Backend-facing observability vocabulary, defined in `ruster-core` so packet
+/// backends depend only on core.
+pub use ruster_core::{BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields};
 
 /// Tick-local UDP NAT44 authority and its optional worker-local runtime.
 ///

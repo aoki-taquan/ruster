@@ -211,6 +211,10 @@ exit criteria:
 - rollback: M1では旧config fileを新generationとして再applyすることを指す。
 - R17の数値thresholdはimplementerがPRで提案し、ownerがそのPRで承認する。
 - NAT/FW占有のhigh-watermarkはM2へ延期する。
+  - 補足（S4実装による明確化。owner確認待ち）: R15/Operability minimumのresolution state、action
+    queue、firewall auditのhigh-watermarkも同じくcore accessorが必要なため未実装（ledger OBS-017）。
+    RX/TX queue saturationはSimIoのpending RX/TX high-watermarkだけ実装し、native ringの
+    RX/TX/FILL/COMPLETIONは各backendの`BackendStats`実装まで延期（OBS-018）。
 - sim専用key sourceの拒否: 現在は型名と自己申告の`KeySourceKind`だけで区別している。M2の`run`は
   `DeterministicSimulation`を拒否する仕組み（`S::KIND`のconst assertionまたはsealed production
   marker trait）を実装する。

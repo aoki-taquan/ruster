@@ -74,6 +74,7 @@ fn sim_tick_observer_counts_match_backend_recycle_causes() {
         SimIoStats {
             injected: 8,
             pending_rx: 8,
+            rx_high_watermark: 8,
             ..SimIoStats::default()
         }
     );
@@ -88,6 +89,8 @@ fn sim_tick_observer_counts_match_backend_recycle_causes() {
             injected: 8,
             pending_tx: 1,
             pending_recycled: 7,
+            rx_high_watermark: 8,
+            tx_high_watermark: 1,
             ..SimIoStats::default()
         }
     );
@@ -167,6 +170,9 @@ fn sim_tick_observer_counts_match_backend_recycle_causes() {
 
     // Once TX completes, the candidate applies; a stale one is rejected.
     assert!(io.pop_tx().is_some());
+    let drained = io.backend_stats();
+    assert_eq!((drained.pending_tx, drained.tx_high_watermark), (0, 1));
+    assert_eq!((drained.pending_rx, drained.rx_high_watermark), (0, 8));
     let apply = MonotonicMillis(12);
     let report = run_tick(
         &mut publication,
@@ -235,6 +241,7 @@ fn sim_io_backend_stats_expose_fixed_occupancy() {
         SimIoStats {
             injected: 3,
             pending_rx: 3,
+            rx_high_watermark: 3,
             ..SimIoStats::default()
         }
     );
@@ -247,6 +254,8 @@ fn sim_io_backend_stats_expose_fixed_occupancy() {
          backend.sim.pending_generated_recycled=0\n\
          backend.sim.rx_leases_live=0\n\
          backend.sim.generated_leases_live=0\n\
+         backend.sim.rx_high_watermark=3\n\
+         backend.sim.tx_high_watermark=0\n\
          backend.sim.batch_open=false\n"
     );
 }

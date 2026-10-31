@@ -13,19 +13,22 @@
 //! [`ObservableFields`], which visits `(section, key, value)` triples in a fixed
 //! order without maps, so a caller can serialize deterministically;
 //! [`FieldsDisplay`] renders the same triples as stable `section.key=value`
-//! lines.
+//! lines. The visiting vocabulary and [`BackendStats`](ruster_core::BackendStats)
+//! live in `ruster-core` so packet backends need not depend on this crate.
 
 use core::{convert::Infallible, fmt};
 use std::num::NonZeroU64;
 
 use ruster_core::{
-    ConsumeReason, DropReason, FirewallCounters, FirewallReconcileReport, FirewallRuntime,
-    GeneratedAllocationError, GeneratedArpTrace, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink,
-    GeneratedTraceSink, Icmpv4ErrorCounters, Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime,
-    MonotonicMillis, Nat44TcpCounters, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44UdpCounters,
-    Nat44UdpReconcileReport, Nat44UdpRuntime, PublicationQuiescenceDisposition, ResolutionCounters,
-    ResolutionFailureTrace, ResolutionFailureTraceSink, ResolutionPublicationReport,
-    ResolutionRuntime, ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent, TraceSink,
+    ConsumeReason, DropReason, FieldValue, FieldVisitor, FirewallCounters, FirewallReconcileReport,
+    FirewallRuntime, GeneratedAllocationError, GeneratedArpTrace, GeneratedIcmpv4Trace,
+    GeneratedIcmpv4TraceSink, GeneratedTraceSink, Icmpv4ErrorCounters,
+    Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, MonotonicMillis, Nat44TcpCounters,
+    Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44UdpCounters, Nat44UdpReconcileReport,
+    Nat44UdpRuntime, ObservableFields, PublicationQuiescenceDisposition, ResolutionCounters,
+    ResolutionFailureDispatchError, ResolutionFailureTrace, ResolutionFailureTraceSink,
+    ResolutionPublicationReport, ResolutionRuntime, ResolutionTimerError, ResolutionTimerTrace,
+    ResolutionTimerTraceSink, TraceEvent, TraceSink,
 };
 
 use crate::{
@@ -36,33 +39,10 @@ use crate::{
 
 /// One past the largest stable [`DropReason`] discriminant (OBS-001).
 ///
-/// Code 0 is unused. A reason whose discriminant does not fit is counted as
-/// unclassified instead of being lost.
-pub const DROP_REASON_CODE_LIMIT: usize = 146;
-
-/// A field value visited by [`ObservableFields::visit_fields`].
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FieldValue {
-    Count(u64),
-    Flag(bool),
-    /// Injected monotonic time; `None` when the event has not happened.
-    Millis(Option<MonotonicMillis>),
-    Generation(Option<NonZeroU64>),
-    Label(&'static str),
-}
-
-/// Receives `(section, key, value)` triples in a fixed order.
-pub trait FieldVisitor {
-    fn field(&mut self, section: &'static str, key: &'static str, value: FieldValue);
-}
-
-/// A fixed-shape value that can be serialized deterministically.
-///
-/// Implementations must visit fields in a fixed order, must not allocate,
-/// and must not depend on map iteration order.
-pub trait ObservableFields {
-    fn visit_fields<V: FieldVisitor>(&self, visitor: &mut V);
-}
+/// Code 0 is unused. A reason whose discriminant does not fit (a variant
+/// added to core but not to `DropReason::ALL`) is counted as unclassified
+/// instead of being lost.
+pub const DROP_REASON_CODE_LIMIT: usize = DropReason::ALL.len() + 1;
 
 /// Stable cold-side `section.key=value` rendering, one field per line.
 pub struct FieldsDisplay<'a, T>(pub &'a T);
@@ -159,7 +139,6 @@ macro_rules! add_counts {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DropReasonCounters {
     counts: [u64; DROP_REASON_CODE_LIMIT],
-    reasons: [Option<DropReason>; DROP_REASON_CODE_LIMIT],
     unclassified: u64,
 }
 
@@ -167,22 +146,18 @@ impl Default for DropReasonCounters {
     fn default() -> Self {
         Self {
             counts: [0; DROP_REASON_CODE_LIMIT],
-            reasons: [None; DROP_REASON_CODE_LIMIT],
             unclassified: 0,
         }
     }
 }
 
 impl DropReasonCounters {
-    /// O(1): one bounds check and one array store.
+    /// O(1): one bounds check and one saturating add.
     #[inline]
     pub(crate) fn record(&mut self, reason: DropReason) {
         let code = usize::from(reason as u16);
         match self.counts.get_mut(code) {
-            Some(count) if code != 0 => {
-                incr(count);
-                self.reasons[code] = Some(reason);
-            }
+            Some(count) if code != 0 => incr(count),
             _ => incr(&mut self.unclassified),
         }
     }
@@ -212,67 +187,49 @@ impl DropReasonCounters {
 }
 
 impl ObservableFields for DropReasonCounters {
-    /// Nonzero reasons in ascending stable code order, then `UNCLASSIFIED`.
+    /// Every reason (zeros included) in ascending stable code order, then
+    /// `UNCLASSIFIED`, so the shape does not depend on traffic.
     fn visit_fields<V: FieldVisitor>(&self, visitor: &mut V) {
-        for (count, reason) in self.counts.iter().zip(self.reasons) {
-            if let Some(reason) = reason.filter(|_| *count != 0) {
-                visitor.field("drop", reason.code(), FieldValue::Count(*count));
-            }
+        for reason in DropReason::ALL {
+            let count = FieldValue::Count(self.count(reason));
+            visitor.field("drop", reason.code(), count);
         }
         visitor.field("drop", "UNCLASSIFIED", FieldValue::Count(self.unclassified));
     }
 }
 
-/// Saturating per-[`ConsumeReason`] counters.
+/// Saturating per-[`ConsumeReason`] counters indexed by the exhaustive
+/// core `ConsumeReason::index`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ConsumeReasonCounters {
-    pub arp_control: u64,
-    pub ipv4_local_unsupported: u64,
-    /// A reason added to core after this table; never silently dropped.
-    pub unclassified: u64,
+    counts: [u64; ConsumeReason::ALL.len()],
 }
 
 impl ConsumeReasonCounters {
     #[inline]
     pub(crate) fn record(&mut self, reason: ConsumeReason) {
-        match reason {
-            ConsumeReason::ArpControl => incr(&mut self.arp_control),
-            ConsumeReason::Ipv4LocalUnsupported => incr(&mut self.ipv4_local_unsupported),
-            _ => incr(&mut self.unclassified),
-        }
+        incr(&mut self.counts[reason.index()]);
     }
 
     #[must_use]
-    pub fn count(&self, reason: ConsumeReason) -> u64 {
-        match reason {
-            ConsumeReason::ArpControl => self.arp_control,
-            ConsumeReason::Ipv4LocalUnsupported => self.ipv4_local_unsupported,
-            _ => 0,
-        }
+    pub const fn count(&self, reason: ConsumeReason) -> u64 {
+        self.counts[reason.index()]
     }
 
     #[must_use]
-    pub const fn total(&self) -> u64 {
-        self.arp_control
-            .saturating_add(self.ipv4_local_unsupported)
-            .saturating_add(self.unclassified)
+    pub fn total(&self) -> u64 {
+        self.counts
+            .iter()
+            .fold(0, |total, count| total.saturating_add(*count))
     }
 }
 
 impl ObservableFields for ConsumeReasonCounters {
     fn visit_fields<V: FieldVisitor>(&self, visitor: &mut V) {
-        let Self {
-            arp_control,
-            ipv4_local_unsupported,
-            unclassified,
-        } = *self;
-        visitor.field("consume", "ARP_CONTROL", FieldValue::Count(arp_control));
-        visitor.field(
-            "consume",
-            "IPV4_LOCAL_UNSUPPORTED",
-            FieldValue::Count(ipv4_local_unsupported),
-        );
-        visitor.field("consume", "UNCLASSIFIED", FieldValue::Count(unclassified));
+        for reason in ConsumeReason::ALL {
+            let count = FieldValue::Count(self.count(reason));
+            visitor.field("consume", reason.code(), count);
+        }
     }
 }
 
@@ -383,6 +340,10 @@ pub struct TickTotals {
     pub publications_applied: u64,
     pub publications_rejected: u64,
     pub publications_deferred: u64,
+    /// Applies whose flush counts were attached by
+    /// [`TickObserver::record_apply_flush`]. `publications_applied` minus this
+    /// exposes applies whose flush was never recorded.
+    pub apply_flushes_recorded: u64,
     pub rx: RxTotals,
     pub resolution_timer_scanned: u64,
     pub resolution_retries_queued: u64,
@@ -410,6 +371,9 @@ pub struct Health {
     pub consecutive_backend_io_failures: u64,
     pub backend_contract_violations: u64,
     pub quiescence_deferrals: u64,
+    /// Publication attempts deferred in a row. Ticks without a candidate
+    /// (`Unchanged`) neither increment nor reset it; only an `Applied` or
+    /// `Rejected` attempt resets it.
     pub consecutive_quiescence_deferrals: u64,
     /// Sticky once the backend classified itself as terminally stopped.
     pub backend_stopped: bool,
@@ -420,7 +384,7 @@ pub struct Health {
 pub enum HealthState {
     NotStarted,
     Healthy,
-    /// The last tick succeeded but no tick succeeded within the policy.
+    /// No tick was observed within the policy window.
     Stale,
     /// The last observed tick did not complete every phase successfully.
     Degraded,
@@ -456,24 +420,28 @@ impl Default for HealthPolicy {
 }
 
 impl Health {
-    /// Classifies health at `now`. Precedence: stopped, not started,
-    /// degraded, stale, healthy. A `now` below the last success is age 0.
+    /// Classifies health at `now`. Precedence: stopped, not started, stale
+    /// (no tick at all within the policy, even if the last one failed),
+    /// degraded (the last tick failed), healthy. A `now` below the last tick
+    /// is age 0.
+    ///
+    /// `NotStarted` means no tick was observed. A tick that ran without an
+    /// active publication (before activation) reads `Degraded`: the worker
+    /// is alive but forwards nothing.
     #[must_use]
     pub fn state(&self, now: MonotonicMillis, policy: HealthPolicy) -> HealthState {
         if self.backend_stopped {
             return HealthState::Stopped;
         }
-        if self.last_tick.is_none() {
+        let Some(last) = self.last_tick else {
             return HealthState::NotStarted;
-        }
-        if !self.last_tick_successful {
-            return HealthState::Degraded;
-        }
-        match self.last_successful_tick {
-            Some(last) if now.0.saturating_sub(last.0) <= policy.stale_after_ms => {
-                HealthState::Healthy
-            }
-            _ => HealthState::Stale,
+        };
+        if now.0.saturating_sub(last.0) > policy.stale_after_ms {
+            HealthState::Stale
+        } else if self.last_tick_successful {
+            HealthState::Healthy
+        } else {
+            HealthState::Degraded
         }
     }
 
@@ -573,8 +541,9 @@ pub struct LastApply {
     pub outcome: ApplyOutcomeKind,
     /// Observed tick time (monotonic high-water mark) of the attempt.
     pub at: MonotonicMillis,
-    /// Active generation after the attempt.
-    pub generation: Option<NonZeroU64>,
+    /// Generation active after the attempt: the new one when `Applied`, the
+    /// still-active previous one when `Rejected` or `Deferred`.
+    pub active_generation: Option<NonZeroU64>,
     /// Flushed state, attached by [`TickObserver::record_apply_flush`].
     pub flush: Option<ApplyFlushCounts>,
 }
@@ -691,7 +660,7 @@ impl TickObserver {
             self.last_apply = Some(LastApply {
                 outcome,
                 at,
-                generation,
+                active_generation: generation,
                 flush: None,
             });
         }
@@ -736,8 +705,9 @@ impl TickObserver {
                 bump(&mut totals.resolution_retries_queued, timers.retries_queued);
                 bump(&mut totals.resolution_timed_out, timers.timed_out);
             }
-            // The only timer error is a clock regression.
-            PhaseReport::Failed(_) => flags.clock_regression = true,
+            PhaseReport::Failed(ResolutionTimerError::ClockRegression) => {
+                flags.clock_regression = true;
+            }
         }
         match &report.failure_dispatch {
             PhaseReport::Skipped(reason) => flags.skip(health, *reason),
@@ -745,8 +715,9 @@ impl TickObserver {
                 bump(&mut totals.failure_dispatch_scanned, dispatch.scanned);
                 bump(&mut totals.failure_dispatch_queued, dispatch.queued);
             }
-            // The only dispatch error is a clock regression.
-            PhaseReport::Failed(_) => flags.clock_regression = true,
+            PhaseReport::Failed(ResolutionFailureDispatchError::ClockRegression) => {
+                flags.clock_regression = true;
+            }
         }
 
         flags.generated(
@@ -814,15 +785,21 @@ impl TickObserver {
     /// tick. Returns `false` (and records nothing) unless the last attempt
     /// was `Applied` at `generation` and has no flush counts yet, so a
     /// duplicate call cannot double count.
+    ///
+    /// Contract: call this after every tick whose report was `Applied` and
+    /// before observing the next tick that carries a publication outcome;
+    /// otherwise that apply's flush is lost. A loss is never silent: it shows
+    /// as `publications_applied > apply_flushes_recorded`.
     pub fn record_apply_flush(&mut self, generation: NonZeroU64, flush: ApplyFlushCounts) -> bool {
         match &mut self.last_apply {
             Some(last)
                 if last.outcome == ApplyOutcomeKind::Applied
-                    && last.generation == Some(generation)
+                    && last.active_generation == Some(generation)
                     && last.flush.is_none() =>
             {
                 last.flush = Some(flush);
                 self.flushed.accumulate(&flush);
+                incr(&mut self.totals.apply_flushes_recorded);
                 true
             }
             _ => false,
@@ -1003,7 +980,7 @@ impl ObservableFields for ObservabilitySnapshot {
 
         visit_counts! {v, "tick", self.totals, TickTotals {
             ticks, active_ticks, successful_ticks, publications_applied, publications_rejected,
-            publications_deferred, resolution_timer_scanned, resolution_retries_queued,
+            publications_deferred, apply_flushes_recorded, resolution_timer_scanned, resolution_retries_queued,
             resolution_timed_out, failure_dispatch_scanned, failure_dispatch_queued;
             rx, generated_arp, generated_icmpv4
         }}
@@ -1017,22 +994,20 @@ impl ObservableFields for ObservabilitySnapshot {
         self.drops.visit_fields(v);
         self.consumes.visit_fields(v);
 
-        match self.last_apply {
-            None => v.field("apply", "outcome", FieldValue::Label("none")),
-            Some(last) => {
-                v.field("apply", "outcome", FieldValue::Label(last.outcome.label()));
-                v.field("apply", "at", FieldValue::Millis(Some(last.at)));
-                v.field(
-                    "apply",
-                    "generation",
-                    FieldValue::Generation(last.generation),
-                );
-                match last.flush {
-                    None => v.field("apply", "flush", FieldValue::Label("none")),
-                    Some(flush) => flush.visit("apply.flush", v),
-                }
-            }
-        }
+        // Fixed shape: every field is emitted whether or not an apply happened.
+        let last = self.last_apply;
+        let outcome = last.map_or("none", |last| last.outcome.label());
+        v.field("apply", "outcome", FieldValue::Label(outcome));
+        v.field("apply", "at", FieldValue::Millis(last.map(|last| last.at)));
+        let generation = last.and_then(|last| last.active_generation);
+        v.field(
+            "apply",
+            "active_generation",
+            FieldValue::Generation(generation),
+        );
+        let flush = last.and_then(|last| last.flush);
+        v.field("apply", "flush_recorded", FieldValue::Flag(flush.is_some()));
+        flush.unwrap_or_default().visit("apply.flush", v);
         self.flushed.visit("flushed", v);
     }
 }
@@ -1106,40 +1081,6 @@ impl ObservableFields for ServiceCounters {
             state_probes, maintenance_steps, rule_evaluations,
         }}
     }
-}
-
-/// How a backend moves packet bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BackendMode {
-    Simulated,
-    Copy,
-    ZeroCopy,
-}
-
-impl BackendMode {
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Simulated => "simulated",
-            Self::Copy => "copy",
-            Self::ZeroCopy => "zero_copy",
-        }
-    }
-}
-
-/// Static-dispatch extension point for backend-owned fixed stats.
-///
-/// `backend_stats` is called by the cold side between ticks. It must be O(1)
-/// or bounded by fixed backend geometry, must not allocate, and must not
-/// mutate backend state. The stats type renders through
-/// [`ObservableFields`] with a fixed field order.
-pub trait BackendStats {
-    type Stats: Copy + fmt::Debug + Eq + ObservableFields;
-
-    const NAME: &'static str;
-    const MODE: BackendMode;
-
-    fn backend_stats(&self) -> Self::Stats;
 }
 
 #[cfg(test)]

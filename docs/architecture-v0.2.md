@@ -421,18 +421,25 @@ TX accepted/submittedはdescriptor publicationであってwire deliveryやcomple
 R15 observabilityの`TickObserver`は`run_tick`の`trace`引数としてstatic dispatchで渡します。
 tick中はdrop/consume eventごとに固定配列の一要素とphase skipごとに一counterをsaturating加算
 するだけで、format、allocation、lockを行いません。`DropReason`はstableな`repr(u16)`
-discriminantで直接indexし、表外のreasonは`UNCLASSIFIED`に数えて失いません。cold sideは
+discriminantで直接indexし、表外のreasonは`UNCLASSIFIED`に数えて失いません。表の完全性は
+core側の`DropReason::ALL`/`ConsumeReason::ALL`（宣言scan testとconst assertion）が保証し、
+出力は全reasonをzero込みで固定順に並べます。cold sideは
 `run_tick`が返した`TickReport`を`observe_tick`でO(1)集計し、注入された`MonotonicMillis`だけから
 health（last tick/last successful tick、RX/TX progress、入力時刻regressionとruntime報告の
 clock regression、連続backend I/O failure、quiescence deferral、sticky `Stop`）を導きます。
-health時刻は単調high-waterで後退しません。apply結果は`PublicationOutcome`から、flush数は
+health時刻は単調high-waterで後退しません。staleness（last tickがpolicyより古い）はDegradedより
+優先し、activation前のtickはDegradedです。apply結果は`PublicationOutcome`から、flush数は
 core publication reportから作る`ApplyFlushCounts`を`record_apply_flush`で一度だけ添付するので、
-runtimeはcontrolへ依存しません。各runtimeの累積counterは`ServiceCounters::capture`でpublication
-ownerのread-only accessorからcopyします。backendは`BackendStats`をstatic dispatchで実装して
-固定statsを提供でき、`SimIo`がqueue/lease占有を返します。snapshotは`Copy`の固定サイズ値で、
+runtimeはcontrolへ依存しません。apply tickごとに呼ぶcontractで、欠落は
+`publications_applied - apply_flushes_recorded`として見えます。各runtimeの累積counterは
+`ServiceCounters::capture`でpublication ownerのread-only accessorからcopyします。
+`BackendStats`と`ObservableFields`語彙は`ruster-core`に置き（runtimeはre-export）、backendは
+coreだけに依存してstatic dispatchで固定statsを提供します。`SimIo`はqueue/lease占有と
+pending RX/TXのhigh-watermarkを返します。snapshotは`Copy`の固定サイズ値で、
 `ObservableFields`がmapなしの固定順`(section, key, value)`を訪問し、`FieldsDisplay`はcold side
-だけで`section.key=value`行へ描画します。canonical JSONLとCLI出力は後続、NAT/FW/resolution
-占有high-watermarkはcore accessorが必要なためM2へdeferしています。
+だけで`section.key=value`行へ描画します。canonical JSONLとCLI出力は後続です。NAT/FW占有
+high-watermarkはM2（owner決定）、resolution/action/audit high-watermarkとnative ring saturationは
+core accessorまたはnative backend実装が必要なため未実装でowner確認待ちです。
 
 逆経路は元IPv4 sourceへの通常LPMです。gateway routeではnext-hop、connected routeでは
 元sourceをneighbor targetにし、reverse egressのInterface MAC/local IPv4 bindingを使います。

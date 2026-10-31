@@ -170,6 +170,166 @@ pub enum DropReason {
 use DropReason::*;
 
 impl DropReason {
+    /// Every reason in ascending stable code order. Codes are contiguous
+    /// from 1, so `ALL[code - 1]` is the reason with that code.
+    pub const ALL: [Self; 145] = [
+        EthernetHeaderTruncated,
+        UnsupportedEtherType,
+        Ipv4HeaderTruncated,
+        Ipv4VersionUnsupported,
+        Ipv4IhlTooSmall,
+        Ipv4HeaderLengthExceedsPacket,
+        Ipv4TotalLengthTooSmall,
+        Ipv4TotalLengthExceedsPacket,
+        Ipv4HeaderChecksumInvalid,
+        Ipv4OptionsUnsupported,
+        Ipv4TtlExpired,
+        RouteMiss,
+        NeighborUnresolved,
+        InterfaceMiss,
+        ArpPacketTruncated,
+        ArpHardwareTypeUnsupported,
+        ArpProtocolTypeUnsupported,
+        ArpHardwareLengthUnsupported,
+        ArpProtocolLengthUnsupported,
+        ArpReplyUnsupported,
+        ArpOpcodeUnsupported,
+        ArpTargetNotLocal,
+        ArpSenderHardwareZero,
+        ArpSenderHardwareBroadcast,
+        ArpSenderHardwareMulticast,
+        Icmpv4HeaderTruncated,
+        Icmpv4EchoHeaderTruncated,
+        Icmpv4ChecksumInvalid,
+        Icmpv4EchoCodeInvalid,
+        Icmpv4FragmentUnsupported,
+        Icmpv4SourceNotUnicast,
+        Icmpv4EthernetSourceInvalid,
+        Icmpv4EthernetDestinationNotLocal,
+        Nat44UdpRuntimeUnavailable,
+        Nat44UdpConfigMismatch,
+        Nat44UdpUnsupportedTransport,
+        Nat44UdpHairpinUnsupported,
+        Nat44UdpNonAtomicIpv4Unsupported,
+        Nat44UdpHeaderTruncated,
+        Nat44UdpLengthTooSmall,
+        Nat44UdpLengthExceedsIpv4Payload,
+        Nat44UdpSourcePortZero,
+        Nat44UdpSourceForbidden,
+        Nat44UdpReverseAuthorityMismatch,
+        Nat44UdpMappingMiss,
+        Nat44UdpFilterDenied,
+        Nat44UdpMappingTableFull,
+        Nat44UdpPeerTableFull,
+        Nat44UdpPortExhausted,
+        Nat44UdpClockRegression,
+        Nat44UdpWrongIngress,
+        Nat44UdpWrongEgress,
+        Nat44ExternalToInternalBypass,
+        Nat44TcpRuntimeUnavailable,
+        Nat44TcpConfigMismatch,
+        Nat44TcpUnsupportedTransport,
+        Nat44TcpHairpinUnsupported,
+        Nat44TcpNonAtomicIpv4Unsupported,
+        Nat44TcpHeaderTruncated,
+        Nat44TcpDataOffsetTooSmall,
+        Nat44TcpDataOffsetExceedsIpv4Payload,
+        Nat44TcpChecksumInvalid,
+        Nat44TcpSourcePortZero,
+        Nat44TcpSourceForbidden,
+        Nat44TcpReverseAuthorityMismatch,
+        Nat44TcpMappingMiss,
+        Nat44TcpSessionMiss,
+        Nat44TcpInvalidInitialFlags,
+        Nat44TcpMappingTableFull,
+        Nat44TcpSessionTableFull,
+        Nat44TcpPortExhausted,
+        Nat44TcpClockRegression,
+        Nat44TcpWrongIngress,
+        Nat44TcpWrongEgress,
+        Nat44CombinedRealmMismatch,
+        Nat44Icmpv4WrongIngress,
+        Nat44Icmpv4OuterOptionsUnsupported,
+        Nat44Icmpv4OuterFragmentUnsupported,
+        Nat44Icmpv4OuterTtlExpired,
+        Nat44Icmpv4HeaderTruncated,
+        Nat44Icmpv4ChecksumInvalid,
+        Nat44Icmpv4QuoteTruncated,
+        Nat44Icmpv4QuotedVersionUnsupported,
+        Nat44Icmpv4QuotedIhlTooSmall,
+        Nat44Icmpv4QuotedHeaderTruncated,
+        Nat44Icmpv4QuotedTotalLengthTooSmall,
+        Nat44Icmpv4QuotedChecksumInvalid,
+        Nat44Icmpv4QuotedFragmentUnsupported,
+        Nat44Icmpv4QuotedProtocolUnsupported,
+        Nat44Icmpv4QuotedPublicSourceMismatch,
+        Nat44Icmpv4TcpChecksumPartial,
+        Nat44Icmpv4WrongEgress,
+        Nat44Icmpv4SourceForbidden,
+        FirewallRuntimeUnavailable,
+        FirewallConfigMismatch,
+        FirewallUnsupportedProtocol,
+        FirewallIpv4OptionsUnsupported,
+        FirewallFragmentUnsupported,
+        FirewallTcpHeaderTruncated,
+        FirewallTcpDataOffsetTooSmall,
+        FirewallTcpDataOffsetExceedsIpv4Payload,
+        FirewallTcpChecksumInvalid,
+        FirewallTcpPortZero,
+        FirewallUdpHeaderTruncated,
+        FirewallUdpLengthTooSmall,
+        FirewallUdpLengthExceedsIpv4Payload,
+        FirewallUdpChecksumInvalid,
+        FirewallUdpDestinationPortZero,
+        FirewallRuleDenied,
+        FirewallDefaultDenied,
+        FirewallTcpInvalidInitialFlags,
+        FirewallStateTableFull,
+        FirewallClockRegression,
+        FirewallRelatedIcmpv4Unsupported,
+        FirewallRouteUnavailable,
+        FirewallRelatedIcmpv4StateMiss,
+        Ipv4IngressInterfaceUnknown,
+        Ipv4EthernetSourceZero,
+        Ipv4EthernetSourceBroadcast,
+        Ipv4EthernetSourceMulticast,
+        Ipv4EthernetDestinationZero,
+        Ipv4EthernetDestinationBroadcast,
+        Ipv4EthernetDestinationMulticast,
+        Ipv4SourceUnspecifiedNetwork,
+        Ipv4SourceLoopback,
+        Ipv4SourceMulticast,
+        Ipv4SourceLimitedBroadcast,
+        Ipv4SourceClassE,
+        Ipv4SourceNetworkAddress,
+        Ipv4SourceDirectedBroadcast,
+        Ipv4DestinationUnspecifiedNetwork,
+        Ipv4DestinationLoopback,
+        Ipv4DestinationMulticast,
+        Ipv4DestinationLimitedBroadcast,
+        Ipv4DestinationClassE,
+        Ipv4DestinationNetworkAddress,
+        Ipv4DestinationDirectedBroadcast,
+        EthernetDestinationNotLocal,
+        ArpIngressInterfaceUnknown,
+        ArpEthernetSourceZero,
+        ArpEthernetSourceBroadcast,
+        ArpEthernetSourceMulticast,
+        ArpEthernetDestinationZero,
+        ArpEthernetDestinationMulticast,
+        Ipv4SourceLocalAddress,
+    ];
+
+    /// The reason with stable discriminant `code`, if any.
+    #[must_use]
+    pub const fn from_code(code: u16) -> Option<Self> {
+        let index = code as usize;
+        if index == 0 || index > Self::ALL.len() {
+            return None;
+        }
+        Some(Self::ALL[index - 1])
+    }
+
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
@@ -323,6 +483,15 @@ impl DropReason {
         }
     }
 }
+
+// `ALL` is contiguous from code 1; a gap or reordering fails to compile.
+const _: () = {
+    let mut index = 0;
+    while index < DropReason::ALL.len() {
+        assert!(DropReason::ALL[index] as usize == index + 1);
+        index += 1;
+    }
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SnapshotError {
@@ -5907,157 +6076,36 @@ mod tests {
             (144, "ARP_ETHERNET_DESTINATION_MULTICAST"),
             (145, "IPV4_SOURCE_LOCAL_ADDRESS"),
         ];
-        let actual = [
-            DropReason::EthernetHeaderTruncated,
-            DropReason::UnsupportedEtherType,
-            DropReason::Ipv4HeaderTruncated,
-            DropReason::Ipv4VersionUnsupported,
-            DropReason::Ipv4IhlTooSmall,
-            DropReason::Ipv4HeaderLengthExceedsPacket,
-            DropReason::Ipv4TotalLengthTooSmall,
-            DropReason::Ipv4TotalLengthExceedsPacket,
-            DropReason::Ipv4HeaderChecksumInvalid,
-            DropReason::Ipv4OptionsUnsupported,
-            DropReason::Ipv4TtlExpired,
-            DropReason::RouteMiss,
-            DropReason::NeighborUnresolved,
-            DropReason::InterfaceMiss,
-            DropReason::ArpPacketTruncated,
-            DropReason::ArpHardwareTypeUnsupported,
-            DropReason::ArpProtocolTypeUnsupported,
-            DropReason::ArpHardwareLengthUnsupported,
-            DropReason::ArpProtocolLengthUnsupported,
-            DropReason::ArpReplyUnsupported,
-            DropReason::ArpOpcodeUnsupported,
-            DropReason::ArpTargetNotLocal,
-            DropReason::ArpSenderHardwareZero,
-            DropReason::ArpSenderHardwareBroadcast,
-            DropReason::ArpSenderHardwareMulticast,
-            DropReason::Icmpv4HeaderTruncated,
-            DropReason::Icmpv4EchoHeaderTruncated,
-            DropReason::Icmpv4ChecksumInvalid,
-            DropReason::Icmpv4EchoCodeInvalid,
-            DropReason::Icmpv4FragmentUnsupported,
-            DropReason::Icmpv4SourceNotUnicast,
-            DropReason::Icmpv4EthernetSourceInvalid,
-            DropReason::Icmpv4EthernetDestinationNotLocal,
-            DropReason::Nat44UdpRuntimeUnavailable,
-            DropReason::Nat44UdpConfigMismatch,
-            DropReason::Nat44UdpUnsupportedTransport,
-            DropReason::Nat44UdpHairpinUnsupported,
-            DropReason::Nat44UdpNonAtomicIpv4Unsupported,
-            DropReason::Nat44UdpHeaderTruncated,
-            DropReason::Nat44UdpLengthTooSmall,
-            DropReason::Nat44UdpLengthExceedsIpv4Payload,
-            DropReason::Nat44UdpSourcePortZero,
-            DropReason::Nat44UdpSourceForbidden,
-            DropReason::Nat44UdpReverseAuthorityMismatch,
-            DropReason::Nat44UdpMappingMiss,
-            DropReason::Nat44UdpFilterDenied,
-            DropReason::Nat44UdpMappingTableFull,
-            DropReason::Nat44UdpPeerTableFull,
-            DropReason::Nat44UdpPortExhausted,
-            DropReason::Nat44UdpClockRegression,
-            DropReason::Nat44UdpWrongIngress,
-            DropReason::Nat44UdpWrongEgress,
-            DropReason::Nat44ExternalToInternalBypass,
-            DropReason::Nat44TcpRuntimeUnavailable,
-            DropReason::Nat44TcpConfigMismatch,
-            DropReason::Nat44TcpUnsupportedTransport,
-            DropReason::Nat44TcpHairpinUnsupported,
-            DropReason::Nat44TcpNonAtomicIpv4Unsupported,
-            DropReason::Nat44TcpHeaderTruncated,
-            DropReason::Nat44TcpDataOffsetTooSmall,
-            DropReason::Nat44TcpDataOffsetExceedsIpv4Payload,
-            DropReason::Nat44TcpChecksumInvalid,
-            DropReason::Nat44TcpSourcePortZero,
-            DropReason::Nat44TcpSourceForbidden,
-            DropReason::Nat44TcpReverseAuthorityMismatch,
-            DropReason::Nat44TcpMappingMiss,
-            DropReason::Nat44TcpSessionMiss,
-            DropReason::Nat44TcpInvalidInitialFlags,
-            DropReason::Nat44TcpMappingTableFull,
-            DropReason::Nat44TcpSessionTableFull,
-            DropReason::Nat44TcpPortExhausted,
-            DropReason::Nat44TcpClockRegression,
-            DropReason::Nat44TcpWrongIngress,
-            DropReason::Nat44TcpWrongEgress,
-            DropReason::Nat44CombinedRealmMismatch,
-            DropReason::Nat44Icmpv4WrongIngress,
-            DropReason::Nat44Icmpv4OuterOptionsUnsupported,
-            DropReason::Nat44Icmpv4OuterFragmentUnsupported,
-            DropReason::Nat44Icmpv4OuterTtlExpired,
-            DropReason::Nat44Icmpv4HeaderTruncated,
-            DropReason::Nat44Icmpv4ChecksumInvalid,
-            DropReason::Nat44Icmpv4QuoteTruncated,
-            DropReason::Nat44Icmpv4QuotedVersionUnsupported,
-            DropReason::Nat44Icmpv4QuotedIhlTooSmall,
-            DropReason::Nat44Icmpv4QuotedHeaderTruncated,
-            DropReason::Nat44Icmpv4QuotedTotalLengthTooSmall,
-            DropReason::Nat44Icmpv4QuotedChecksumInvalid,
-            DropReason::Nat44Icmpv4QuotedFragmentUnsupported,
-            DropReason::Nat44Icmpv4QuotedProtocolUnsupported,
-            DropReason::Nat44Icmpv4QuotedPublicSourceMismatch,
-            DropReason::Nat44Icmpv4TcpChecksumPartial,
-            DropReason::Nat44Icmpv4WrongEgress,
-            DropReason::Nat44Icmpv4SourceForbidden,
-            DropReason::FirewallRuntimeUnavailable,
-            DropReason::FirewallConfigMismatch,
-            DropReason::FirewallUnsupportedProtocol,
-            DropReason::FirewallIpv4OptionsUnsupported,
-            DropReason::FirewallFragmentUnsupported,
-            DropReason::FirewallTcpHeaderTruncated,
-            DropReason::FirewallTcpDataOffsetTooSmall,
-            DropReason::FirewallTcpDataOffsetExceedsIpv4Payload,
-            DropReason::FirewallTcpChecksumInvalid,
-            DropReason::FirewallTcpPortZero,
-            DropReason::FirewallUdpHeaderTruncated,
-            DropReason::FirewallUdpLengthTooSmall,
-            DropReason::FirewallUdpLengthExceedsIpv4Payload,
-            DropReason::FirewallUdpChecksumInvalid,
-            DropReason::FirewallUdpDestinationPortZero,
-            DropReason::FirewallRuleDenied,
-            DropReason::FirewallDefaultDenied,
-            DropReason::FirewallTcpInvalidInitialFlags,
-            DropReason::FirewallStateTableFull,
-            DropReason::FirewallClockRegression,
-            DropReason::FirewallRelatedIcmpv4Unsupported,
-            DropReason::FirewallRouteUnavailable,
-            DropReason::FirewallRelatedIcmpv4StateMiss,
-            DropReason::Ipv4IngressInterfaceUnknown,
-            DropReason::Ipv4EthernetSourceZero,
-            DropReason::Ipv4EthernetSourceBroadcast,
-            DropReason::Ipv4EthernetSourceMulticast,
-            DropReason::Ipv4EthernetDestinationZero,
-            DropReason::Ipv4EthernetDestinationBroadcast,
-            DropReason::Ipv4EthernetDestinationMulticast,
-            DropReason::Ipv4SourceUnspecifiedNetwork,
-            DropReason::Ipv4SourceLoopback,
-            DropReason::Ipv4SourceMulticast,
-            DropReason::Ipv4SourceLimitedBroadcast,
-            DropReason::Ipv4SourceClassE,
-            DropReason::Ipv4SourceNetworkAddress,
-            DropReason::Ipv4SourceDirectedBroadcast,
-            DropReason::Ipv4DestinationUnspecifiedNetwork,
-            DropReason::Ipv4DestinationLoopback,
-            DropReason::Ipv4DestinationMulticast,
-            DropReason::Ipv4DestinationLimitedBroadcast,
-            DropReason::Ipv4DestinationClassE,
-            DropReason::Ipv4DestinationNetworkAddress,
-            DropReason::Ipv4DestinationDirectedBroadcast,
-            DropReason::EthernetDestinationNotLocal,
-            DropReason::ArpIngressInterfaceUnknown,
-            DropReason::ArpEthernetSourceZero,
-            DropReason::ArpEthernetSourceBroadcast,
-            DropReason::ArpEthernetSourceMulticast,
-            DropReason::ArpEthernetDestinationZero,
-            DropReason::ArpEthernetDestinationMulticast,
-            DropReason::Ipv4SourceLocalAddress,
-        ];
+        let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
         for (reason, &(discriminant, code)) in actual.iter().zip(&expected) {
             assert_eq!(*reason as u16, discriminant);
             assert_eq!(reason.code(), code);
+            assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
+        assert_eq!(DropReason::from_code(0), None);
+        assert_eq!(DropReason::from_code(146), None);
+    }
+
+    /// `DropReason::ALL` lists every declared variant: a new variant fails
+    /// this test until it is appended to `ALL` (and to the code table above).
+    #[test]
+    fn drop_reason_all_lists_every_declared_variant_in_order() {
+        let source = include_str!("forwarding.rs");
+        let body = source
+            .split_once("pub enum DropReason {")
+            .unwrap()
+            .1
+            .split_once("\n}")
+            .unwrap()
+            .0;
+        let declared: Vec<String> = body
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .map(|line| line.split_once(" = ").unwrap().0.to_owned())
+            .collect();
+        let listed: Vec<String> = DropReason::ALL.iter().map(|r| format!("{r:?}")).collect();
+        assert_eq!(declared, listed);
     }
 }

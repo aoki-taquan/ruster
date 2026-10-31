@@ -5,182 +5,6 @@ use ruster_core::{
     ResolutionTimerReport,
 };
 
-const ALL_DROP_REASONS: [DropReason; 145] = [
-    DropReason::EthernetHeaderTruncated,
-    DropReason::UnsupportedEtherType,
-    DropReason::Ipv4HeaderTruncated,
-    DropReason::Ipv4VersionUnsupported,
-    DropReason::Ipv4IhlTooSmall,
-    DropReason::Ipv4HeaderLengthExceedsPacket,
-    DropReason::Ipv4TotalLengthTooSmall,
-    DropReason::Ipv4TotalLengthExceedsPacket,
-    DropReason::Ipv4HeaderChecksumInvalid,
-    DropReason::Ipv4OptionsUnsupported,
-    DropReason::Ipv4TtlExpired,
-    DropReason::RouteMiss,
-    DropReason::NeighborUnresolved,
-    DropReason::InterfaceMiss,
-    DropReason::ArpPacketTruncated,
-    DropReason::ArpHardwareTypeUnsupported,
-    DropReason::ArpProtocolTypeUnsupported,
-    DropReason::ArpHardwareLengthUnsupported,
-    DropReason::ArpProtocolLengthUnsupported,
-    DropReason::ArpReplyUnsupported,
-    DropReason::ArpOpcodeUnsupported,
-    DropReason::ArpTargetNotLocal,
-    DropReason::ArpSenderHardwareZero,
-    DropReason::ArpSenderHardwareBroadcast,
-    DropReason::ArpSenderHardwareMulticast,
-    DropReason::Icmpv4HeaderTruncated,
-    DropReason::Icmpv4EchoHeaderTruncated,
-    DropReason::Icmpv4ChecksumInvalid,
-    DropReason::Icmpv4EchoCodeInvalid,
-    DropReason::Icmpv4FragmentUnsupported,
-    DropReason::Icmpv4SourceNotUnicast,
-    DropReason::Icmpv4EthernetSourceInvalid,
-    DropReason::Icmpv4EthernetDestinationNotLocal,
-    DropReason::Nat44UdpRuntimeUnavailable,
-    DropReason::Nat44UdpConfigMismatch,
-    DropReason::Nat44UdpUnsupportedTransport,
-    DropReason::Nat44UdpHairpinUnsupported,
-    DropReason::Nat44UdpNonAtomicIpv4Unsupported,
-    DropReason::Nat44UdpHeaderTruncated,
-    DropReason::Nat44UdpLengthTooSmall,
-    DropReason::Nat44UdpLengthExceedsIpv4Payload,
-    DropReason::Nat44UdpSourcePortZero,
-    DropReason::Nat44UdpSourceForbidden,
-    DropReason::Nat44UdpReverseAuthorityMismatch,
-    DropReason::Nat44UdpMappingMiss,
-    DropReason::Nat44UdpFilterDenied,
-    DropReason::Nat44UdpMappingTableFull,
-    DropReason::Nat44UdpPeerTableFull,
-    DropReason::Nat44UdpPortExhausted,
-    DropReason::Nat44UdpClockRegression,
-    DropReason::Nat44UdpWrongIngress,
-    DropReason::Nat44UdpWrongEgress,
-    DropReason::Nat44ExternalToInternalBypass,
-    DropReason::Nat44TcpRuntimeUnavailable,
-    DropReason::Nat44TcpConfigMismatch,
-    DropReason::Nat44TcpUnsupportedTransport,
-    DropReason::Nat44TcpHairpinUnsupported,
-    DropReason::Nat44TcpNonAtomicIpv4Unsupported,
-    DropReason::Nat44TcpHeaderTruncated,
-    DropReason::Nat44TcpDataOffsetTooSmall,
-    DropReason::Nat44TcpDataOffsetExceedsIpv4Payload,
-    DropReason::Nat44TcpChecksumInvalid,
-    DropReason::Nat44TcpSourcePortZero,
-    DropReason::Nat44TcpSourceForbidden,
-    DropReason::Nat44TcpReverseAuthorityMismatch,
-    DropReason::Nat44TcpMappingMiss,
-    DropReason::Nat44TcpSessionMiss,
-    DropReason::Nat44TcpInvalidInitialFlags,
-    DropReason::Nat44TcpMappingTableFull,
-    DropReason::Nat44TcpSessionTableFull,
-    DropReason::Nat44TcpPortExhausted,
-    DropReason::Nat44TcpClockRegression,
-    DropReason::Nat44TcpWrongIngress,
-    DropReason::Nat44TcpWrongEgress,
-    DropReason::Nat44CombinedRealmMismatch,
-    DropReason::Nat44Icmpv4WrongIngress,
-    DropReason::Nat44Icmpv4OuterOptionsUnsupported,
-    DropReason::Nat44Icmpv4OuterFragmentUnsupported,
-    DropReason::Nat44Icmpv4OuterTtlExpired,
-    DropReason::Nat44Icmpv4HeaderTruncated,
-    DropReason::Nat44Icmpv4ChecksumInvalid,
-    DropReason::Nat44Icmpv4QuoteTruncated,
-    DropReason::Nat44Icmpv4QuotedVersionUnsupported,
-    DropReason::Nat44Icmpv4QuotedIhlTooSmall,
-    DropReason::Nat44Icmpv4QuotedHeaderTruncated,
-    DropReason::Nat44Icmpv4QuotedTotalLengthTooSmall,
-    DropReason::Nat44Icmpv4QuotedChecksumInvalid,
-    DropReason::Nat44Icmpv4QuotedFragmentUnsupported,
-    DropReason::Nat44Icmpv4QuotedProtocolUnsupported,
-    DropReason::Nat44Icmpv4QuotedPublicSourceMismatch,
-    DropReason::Nat44Icmpv4TcpChecksumPartial,
-    DropReason::Nat44Icmpv4WrongEgress,
-    DropReason::Nat44Icmpv4SourceForbidden,
-    DropReason::FirewallRuntimeUnavailable,
-    DropReason::FirewallConfigMismatch,
-    DropReason::FirewallUnsupportedProtocol,
-    DropReason::FirewallIpv4OptionsUnsupported,
-    DropReason::FirewallFragmentUnsupported,
-    DropReason::FirewallTcpHeaderTruncated,
-    DropReason::FirewallTcpDataOffsetTooSmall,
-    DropReason::FirewallTcpDataOffsetExceedsIpv4Payload,
-    DropReason::FirewallTcpChecksumInvalid,
-    DropReason::FirewallTcpPortZero,
-    DropReason::FirewallUdpHeaderTruncated,
-    DropReason::FirewallUdpLengthTooSmall,
-    DropReason::FirewallUdpLengthExceedsIpv4Payload,
-    DropReason::FirewallUdpChecksumInvalid,
-    DropReason::FirewallUdpDestinationPortZero,
-    DropReason::FirewallRuleDenied,
-    DropReason::FirewallDefaultDenied,
-    DropReason::FirewallTcpInvalidInitialFlags,
-    DropReason::FirewallStateTableFull,
-    DropReason::FirewallClockRegression,
-    DropReason::FirewallRelatedIcmpv4Unsupported,
-    DropReason::FirewallRouteUnavailable,
-    DropReason::FirewallRelatedIcmpv4StateMiss,
-    DropReason::Ipv4IngressInterfaceUnknown,
-    DropReason::Ipv4EthernetSourceZero,
-    DropReason::Ipv4EthernetSourceBroadcast,
-    DropReason::Ipv4EthernetSourceMulticast,
-    DropReason::Ipv4EthernetDestinationZero,
-    DropReason::Ipv4EthernetDestinationBroadcast,
-    DropReason::Ipv4EthernetDestinationMulticast,
-    DropReason::Ipv4SourceUnspecifiedNetwork,
-    DropReason::Ipv4SourceLoopback,
-    DropReason::Ipv4SourceMulticast,
-    DropReason::Ipv4SourceLimitedBroadcast,
-    DropReason::Ipv4SourceClassE,
-    DropReason::Ipv4SourceNetworkAddress,
-    DropReason::Ipv4SourceDirectedBroadcast,
-    DropReason::Ipv4DestinationUnspecifiedNetwork,
-    DropReason::Ipv4DestinationLoopback,
-    DropReason::Ipv4DestinationMulticast,
-    DropReason::Ipv4DestinationLimitedBroadcast,
-    DropReason::Ipv4DestinationClassE,
-    DropReason::Ipv4DestinationNetworkAddress,
-    DropReason::Ipv4DestinationDirectedBroadcast,
-    DropReason::EthernetDestinationNotLocal,
-    DropReason::ArpIngressInterfaceUnknown,
-    DropReason::ArpEthernetSourceZero,
-    DropReason::ArpEthernetSourceBroadcast,
-    DropReason::ArpEthernetSourceMulticast,
-    DropReason::ArpEthernetDestinationZero,
-    DropReason::ArpEthernetDestinationMulticast,
-    DropReason::Ipv4SourceLocalAddress,
-];
-
-const ALL_CONSUME_REASONS: [ConsumeReason; 2] = [
-    ConsumeReason::ArpControl,
-    ConsumeReason::Ipv4LocalUnsupported,
-];
-
-/// `(name, explicit discriminant)` of every variant of `enum_name` in a core
-/// source file, so a variant added to core fails these tests until the
-/// runtime tables and the lists above are updated.
-fn scan_enum(source: &str, enum_name: &str) -> Vec<(String, Option<u16>)> {
-    let header = format!("pub enum {enum_name} {{");
-    let body = source
-        .split_once(&header)
-        .expect("enum present in core source")
-        .1;
-    let body = &body[..body.find("\n}").expect("enum end")];
-    body.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with("//"))
-        .map(|line| {
-            let line = line.trim_end_matches(',');
-            match line.split_once(" = ") {
-                Some((name, code)) => (name.to_owned(), Some(code.parse().expect("u16 code"))),
-                None => (line.to_owned(), None),
-            }
-        })
-        .collect()
-}
-
 #[derive(Default)]
 struct Collect(Vec<(&'static str, &'static str, FieldValue)>);
 
@@ -190,30 +14,19 @@ impl FieldVisitor for Collect {
     }
 }
 
+/// Completeness of `DropReason::ALL` against the declaration is enforced in
+/// core (`drop_reason_all_lists_every_declared_variant_in_order` and a const
+/// contiguity check); this test proves the runtime table indexes all of it.
 #[test]
 fn drop_reason_counters_index_every_stable_core_reason() {
-    let scanned = scan_enum(
-        include_str!("../../../core/src/forwarding.rs"),
-        "DropReason",
-    );
-    let listed: Vec<(String, Option<u16>)> = ALL_DROP_REASONS
-        .iter()
-        .map(|reason| (format!("{reason:?}"), Some(*reason as u16)))
-        .collect();
-    assert_eq!(
-        scanned, listed,
-        "every core DropReason is listed in code order"
-    );
-    let max = ALL_DROP_REASONS.iter().map(|r| *r as u16).max().unwrap();
-    assert_eq!(usize::from(max) + 1, DROP_REASON_CODE_LIMIT);
-
+    assert_eq!(DROP_REASON_CODE_LIMIT, DropReason::ALL.len() + 1);
     let mut counters = DropReasonCounters::default();
-    for reason in ALL_DROP_REASONS {
+    for reason in DropReason::ALL {
         for _ in 0..(reason as u16) {
             counters.record(reason);
         }
     }
-    for reason in ALL_DROP_REASONS {
+    for reason in DropReason::ALL {
         assert_eq!(
             counters.count(reason),
             u64::from(reason as u16),
@@ -221,36 +34,43 @@ fn drop_reason_counters_index_every_stable_core_reason() {
         );
     }
     assert_eq!(counters.unclassified(), 0);
-    assert_eq!(counters.total(), (1..=u64::from(max)).sum::<u64>());
+    let max = DropReason::ALL.len() as u64;
+    assert_eq!(counters.total(), (1..=max).sum::<u64>());
 
     let mut visited = Collect::default();
     counters.visit_fields(&mut visited);
-    let expected: Vec<_> = ALL_DROP_REASONS
+    let expected: Vec<_> = DropReason::ALL
         .iter()
         .map(|r| ("drop", r.code(), FieldValue::Count(u64::from(*r as u16))))
         .chain([("drop", "UNCLASSIFIED", FieldValue::Count(0))])
         .collect();
     assert_eq!(visited.0, expected, "ascending stable code order");
+
+    // Zero counts are rendered too, so the shape is traffic independent.
+    let mut empty = Collect::default();
+    DropReasonCounters::default().visit_fields(&mut empty);
+    let keys = |c: &Collect| c.0.iter().map(|(_, key, _)| *key).collect::<Vec<_>>();
+    assert_eq!(keys(&empty), keys(&visited));
 }
 
 #[test]
 fn consume_reason_counters_cover_every_core_reason() {
-    let scanned = scan_enum(include_str!("../../../core/src/io.rs"), "ConsumeReason");
-    let listed: Vec<(String, Option<u16>)> = ALL_CONSUME_REASONS
-        .iter()
-        .map(|reason| (format!("{reason:?}"), None))
-        .collect();
-    assert_eq!(scanned, listed, "every core ConsumeReason is listed");
-
     let mut counters = ConsumeReasonCounters::default();
-    for (index, reason) in ALL_CONSUME_REASONS.into_iter().enumerate() {
-        for _ in 0..=index {
+    for reason in ConsumeReason::ALL {
+        for _ in 0..=reason.index() {
             counters.record(reason);
         }
     }
     assert_eq!(counters.count(ConsumeReason::ArpControl), 1);
     assert_eq!(counters.count(ConsumeReason::Ipv4LocalUnsupported), 2);
-    assert_eq!((counters.unclassified, counters.total()), (0, 3));
+    assert_eq!(counters.total(), 3);
+    let mut visited = Collect::default();
+    ConsumeReasonCounters::default().visit_fields(&mut visited);
+    let expected: Vec<_> = ConsumeReason::ALL
+        .iter()
+        .map(|r| ("consume", r.code(), FieldValue::Count(0)))
+        .collect();
+    assert_eq!(visited.0, expected);
 }
 
 #[test]
@@ -290,13 +110,11 @@ fn observability_counters_saturate_instead_of_wrapping() {
     assert_eq!(drops.total(), u64::MAX);
 
     let mut consumes = ConsumeReasonCounters {
-        arp_control: u64::MAX,
-        ipv4_local_unsupported: u64::MAX,
-        unclassified: 0,
+        counts: [u64::MAX; ConsumeReason::ALL.len()],
     };
     consumes.record(ConsumeReason::ArpControl);
     assert_eq!(
-        (consumes.arp_control, consumes.total()),
+        (consumes.count(ConsumeReason::ArpControl), consumes.total()),
         (u64::MAX, u64::MAX)
     );
 
@@ -480,7 +298,12 @@ fn health_transitions_follow_tick_outcomes_and_injected_time() {
         2
     );
 
-    // No active publication degrades.
+    // A worker that stops ticking after a failed tick reads Stale, not
+    // Degraded, once the policy window elapses.
+    assert_eq!(state(&observer, 134), HealthState::Degraded);
+    assert_eq!(state(&observer, 135), HealthState::Stale);
+
+    // No active publication (pre-activation) degrades: alive, not started.
     let mut inactive = healthy();
     inactive.active = false;
     observer.observe_tick(MonotonicMillis(35), None, &inactive);
@@ -513,6 +336,10 @@ fn health_transitions_follow_tick_outcomes_and_injected_time() {
         snapshot.last_apply.map(|last| last.outcome),
         Some(ApplyOutcomeKind::Deferred)
     );
+    // Candidate-free ticks between attempts neither count nor reset.
+    observer.observe_tick(MonotonicMillis(37), None, &healthy());
+    let snapshot = observer.snapshot(MonotonicMillis(37));
+    assert_eq!(snapshot.health.consecutive_quiescence_deferrals, 2);
     assert_eq!(snapshot.state, HealthState::Stopped);
     observer.observe_tick(MonotonicMillis(38), None, &healthy());
     assert_eq!(state(&observer, 38), HealthState::Stopped, "stop is sticky");
@@ -620,12 +447,13 @@ fn generation_and_apply_outcome_are_reflected_once() {
         Some(LastApply {
             outcome: ApplyOutcomeKind::Applied,
             at: MonotonicMillis(2),
-            generation: Some(two),
+            active_generation: Some(two),
             flush: Some(flush),
         })
     );
     assert_eq!(snapshot.flushed, flush);
     assert_eq!(snapshot.totals.publications_applied, 1);
+    assert_eq!(snapshot.totals.apply_flushes_recorded, 1);
 
     let rejected = Report {
         publication: PublicationOutcome::Rejected("stale"),
@@ -645,9 +473,44 @@ fn generation_and_apply_outcome_are_reflected_once() {
     assert_eq!((snapshot.generation_changes, snapshot.flushed), (1, flush));
     assert_eq!(snapshot.totals.publications_rejected, 1);
     assert_eq!(
+        snapshot.last_apply.and_then(|last| last.active_generation),
+        Some(two),
+        "a rejected attempt reports the still-active generation"
+    );
+    assert_eq!(
         snapshot.state,
         HealthState::Healthy,
         "old generation continues"
+    );
+}
+
+#[test]
+fn missed_apply_flush_is_exposed_by_recorded_counter() {
+    let three = NonZeroU64::new(3).unwrap();
+    let four = NonZeroU64::new(4).unwrap();
+    let applied = || Report {
+        publication: PublicationOutcome::Applied,
+        ..healthy()
+    };
+    let mut observer = TickObserver::default();
+    // Back-to-back applies without recording the first flush in between.
+    observer.observe_tick(MonotonicMillis(1), Some(three), &applied());
+    observer.observe_tick(MonotonicMillis(2), Some(four), &applied());
+    let flush = ApplyFlushCounts {
+        firewall_flows: 1,
+        ..ApplyFlushCounts::default()
+    };
+    assert!(!observer.record_apply_flush(three, flush), "too late");
+    assert!(observer.record_apply_flush(four, flush));
+    let totals = observer.snapshot(MonotonicMillis(2)).totals;
+    assert_eq!(
+        (totals.publications_applied, totals.apply_flushes_recorded),
+        (2, 1)
+    );
+    assert_eq!(
+        totals.publications_applied - totals.apply_flushes_recorded,
+        1,
+        "the lost flush is visible, not silent"
     );
 }
 
@@ -674,14 +537,48 @@ fn snapshot_rendering_is_stable_and_ordered() {
         .iter()
         .position(|line| *line == "drop.ETHERNET_HEADER_TRUNCATED=1")
         .unwrap();
-    assert_eq!(lines[truncated + 1], "drop.ROUTE_MISS=1");
-    assert_eq!(lines[truncated + 2], "drop.UNCLASSIFIED=0");
+    assert_eq!(lines[truncated + 1], "drop.UNSUPPORTED_ETHERTYPE=0");
+    let unclassified = truncated + DropReason::ALL.len();
+    assert_eq!(lines[unclassified], "drop.UNCLASSIFIED=0");
+    assert!(lines.contains(&"drop.ROUTE_MISS=1"));
     assert!(lines.contains(&"apply.outcome=none"));
+    assert!(lines.contains(&"apply.flush_recorded=false"));
+    assert!(lines.contains(&"apply.flush.firewall_flows=0"));
     assert!(lines.contains(&"health.last_rx_progress=none"));
     assert_eq!(lines.last(), Some(&"flushed.firewall_flows=0"));
-    let mut keys: Vec<&str> = lines.iter().map(|l| l.split_once('=').unwrap().0).collect();
-    let count = keys.len();
-    keys.sort_unstable();
-    keys.dedup();
-    assert_eq!(keys.len(), count, "keys are unique");
+    let keys = |text: &str| -> Vec<String> {
+        text.lines()
+            .map(|l| l.split_once('=').unwrap().0.to_owned())
+            .collect()
+    };
+    let mut unique = keys(&text);
+    let count = unique.len();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), count, "keys are unique");
+
+    // The key sequence is fixed: an idle observer and one after an applied,
+    // flush-recorded tick render exactly the same keys in the same order.
+    let idle = FieldsDisplay(&TickObserver::default().snapshot(MonotonicMillis(0))).to_string();
+    let two = NonZeroU64::new(2).unwrap();
+    let applied = Report {
+        publication: PublicationOutcome::Applied,
+        ..healthy()
+    };
+    observer.observe_tick(MonotonicMillis(6), Some(two), &applied);
+    assert!(observer.record_apply_flush(two, ApplyFlushCounts::default()));
+    let busy = FieldsDisplay(&observer.snapshot(MonotonicMillis(6))).to_string();
+    assert!(busy.contains("apply.flush_recorded=true\n"));
+    assert_eq!(keys(&idle), keys(&busy));
+    assert_eq!(keys(&idle), keys(&text));
+}
+
+/// io-sim implements the core-defined trait, so a runtime unit test sees the
+/// same `BackendStats` (no dev-dependency cycle duplicating this crate).
+#[test]
+fn sim_io_satisfies_backend_stats_in_runtime_unit_tests() {
+    fn stats<T: crate::BackendStats>(backend: &T) -> T::Stats {
+        backend.backend_stats()
+    }
+    assert_eq!(stats(&ruster_io_sim::SimIo::new()).injected, 0);
 }
