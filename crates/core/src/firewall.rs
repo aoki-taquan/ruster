@@ -1270,6 +1270,12 @@ pub struct FirewallRuntime<'state> {
     /// bound, so a table full of live flows refuses in O(1) and at most one
     /// unsuccessful sweep happens per distinct bound. `0` means unknown.
     reclaim_not_before_ms: u64,
+    /// Slot where the next reclaim sweep starts (worker-local, wraps).
+    ///
+    /// A successful sweep leaves it at the reclaimed position, so a refill
+    /// after mass expiry walks the table about once in total instead of
+    /// rescanning reclaimed-and-refilled slots from slot 0 on every create.
+    reclaim_cursor: usize,
     counters: FirewallCounters,
     _worker_local: PhantomData<Rc<()>>,
 }
@@ -1290,6 +1296,7 @@ impl<'state> FirewallRuntime<'state> {
             next_slot_generation: 1,
             occupied_count: 0,
             reclaim_not_before_ms: 0,
+            reclaim_cursor: 0,
             counters: FirewallCounters::default(),
             _worker_local: PhantomData,
         }
@@ -1331,6 +1338,7 @@ impl<'state> FirewallRuntime<'state> {
             && self.next_slot_generation == 1
             && self.occupied_count == 0
             && self.reclaim_not_before_ms == 0
+            && self.reclaim_cursor == 0
             && self.counters == FirewallCounters::default()
     }
 
@@ -1711,18 +1719,25 @@ impl<'state> FirewallRuntime<'state> {
     ///
     /// Lazy probe cleanup reclaims only expired slots on the probed chain, so
     /// a full table of expired flows could otherwise refuse the same tuple
-    /// forever. This sweep reads at most `capacity` slots and performs at
-    /// most one backward-shift deletion, keeping the per-packet bound O(N).
-    /// It is skipped in O(1) while `now_ms` is below the earliest-deadline
-    /// lower bound, which an unsuccessful sweep raises to the exact minimum
-    /// deadline of the (then all live) occupied slots. Live slots are never
-    /// evicted.
+    /// forever. This sweep reads at most `capacity` slots (one full lap from
+    /// `reclaim_cursor`) and performs at most one backward-shift deletion,
+    /// keeping the per-packet bound O(N); a full lap means any expired slot
+    /// is found. It resumes at the reclaimed position because the shift only
+    /// moves entries toward the hole, never behind the cursor. It is skipped
+    /// in O(1) while `now_ms` is below the earliest-deadline lower bound,
+    /// which an unsuccessful sweep raises to the exact minimum deadline of
+    /// the (then all live) occupied slots. Live slots are never evicted.
     fn reclaim_one_expired(&mut self, now_ms: u64) -> bool {
+        // A deadline saturated at u64::MAX makes the bound u64::MAX; at
+        // `now_ms == u64::MAX` that only re-runs a bounded, harmless sweep.
         if self.states.is_empty() || now_ms < self.reclaim_not_before_ms {
             return false;
         }
+        let capacity = self.states.len();
+        let start = self.reclaim_cursor % capacity;
         let mut earliest = u64::MAX;
-        for index in 0..self.states.len() {
+        for step in 0..capacity {
+            let index = (start + step) % capacity;
             self.counters.maintenance_steps = self.counters.maintenance_steps.saturating_add(1);
             let slot = self.states[index];
             if !slot.occupied {
@@ -1730,6 +1745,7 @@ impl<'state> FirewallRuntime<'state> {
             }
             if !self.slot_live(slot, now_ms) {
                 self.delete_expired_and_shift(index);
+                self.reclaim_cursor = index;
                 return true;
             }
             earliest = earliest.min(self.slot_deadline(slot));
@@ -1805,6 +1821,7 @@ impl FirewallReconcilePermit<'_, '_> {
             self.runtime.states.fill(FirewallStateSlot::default());
             self.runtime.occupied_count = 0;
             self.runtime.reclaim_not_before_ms = 0;
+            self.runtime.reclaim_cursor = 0;
             self.runtime.binding = self.next;
             self.runtime.runtime_epoch = self.next_runtime_epoch;
             self.runtime.counters.reconciliations =
@@ -1970,6 +1987,7 @@ mod tests {
         next_slot_generation: u64,
         occupied_count: usize,
         reclaim_not_before_ms: u64,
+        reclaim_cursor: usize,
         counters: FirewallCounters,
     }
 
@@ -1982,6 +2000,7 @@ mod tests {
             next_slot_generation: runtime.next_slot_generation,
             occupied_count: runtime.occupied_count,
             reclaim_not_before_ms: runtime.reclaim_not_before_ms,
+            reclaim_cursor: runtime.reclaim_cursor,
             counters: runtime.counters,
         }
     }
@@ -3188,8 +3207,65 @@ mod tests {
                 rotated_hash_key(),
             )
             .unwrap();
+            runtime.reclaim_cursor = 5;
             runtime.reconcile(rotated).unwrap();
             assert_eq!(runtime.reclaim_not_before_ms, 0);
+            assert_eq!(runtime.reclaim_cursor, 0);
+        });
+    }
+
+    #[test]
+    fn refill_after_mass_expiry_is_amortized_linear_in_capacity() {
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let capacity = 1 << 16;
+            let mut slots = vec![FirewallStateSlot::default(); capacity];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let usable = runtime.usable_capacity();
+            let flow = |port: usize, destination_port: u16| FirewallPacket {
+                source_port: u16::try_from(port).unwrap(),
+                destination_port,
+                ..packet(FirewallProtocol::Udp, 0)
+            };
+            for port in 1..=usable {
+                let plan = runtime.plan_packet(&config, flow(port, 443), 0).unwrap();
+                runtime.commit(plan).unwrap();
+            }
+            let expired_at = FIREWALL_UDP_DEFAULT_IDLE_TTL_MS;
+            let before = runtime.counters();
+            let mut worst = 0;
+            for port in 1..=usable {
+                let step = runtime.counters();
+                let plan = runtime
+                    .plan_packet(&config, flow(port, 444), expired_at)
+                    .unwrap();
+                runtime.commit(plan).unwrap();
+                let after = runtime.counters();
+                worst = worst.max(
+                    (after.state_probes - step.state_probes)
+                        + (after.maintenance_steps - step.maintenance_steps),
+                );
+            }
+            let after = runtime.counters();
+            let total = (after.state_probes - before.state_probes)
+                + (after.maintenance_steps - before.maintenance_steps);
+            assert_eq!(after.states_expired, usable as u64);
+            assert_eq!(runtime.occupied_count, usable);
+            // Sweeps resume at the cursor, so the refill walks the table
+            // about once in total (plus probe/shift work per create)
+            // instead of O(N) per create from slot 0.
+            assert!(
+                total <= (capacity as u64) * 16,
+                "total {total} worst {worst} for capacity {capacity}"
+            );
+            assert!(worst <= (capacity as u64) * 14 + 3);
         });
     }
 
