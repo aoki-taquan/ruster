@@ -1,5 +1,6 @@
 use super::envelope::{
-    CaseEnvelope, DropCode, Expected, ParserAccept, ResolutionSummary, Target, MAX_CORPUS_CASES,
+    CaseEnvelope, DropCode, Expected, InvariantFlags, ParserAccept, ResolutionSummary, Target,
+    MAX_CORPUS_CASES,
 };
 
 pub struct NamedCase {
@@ -18,6 +19,7 @@ pub fn past_regressions() -> Vec<NamedCase> {
         admission_arp_foreign_destination(),
         resolution_cancel_and_reuse(),
         resolution_zero_action_capacity(),
+        state_expired_firewall_capacity_after_idle_jump(),
     ];
     assert!(
         cases.len() <= MAX_CORPUS_CASES,
@@ -199,6 +201,53 @@ fn resolution_zero_action_capacity() -> NamedCase {
             action_full: 1,
             clock_regressions: 0,
         }),
+        payload,
+    )
+}
+
+/// Reproduction program for a known core liveness gap, retained so that the
+/// follow-up core firewall fix must change its observed behaviour
+/// deliberately. Found by the first R16 `state` generator revision (seed
+/// 0x6a09e667f3bcc909, case 4): after every flow of a full firewall table
+/// expired, fresh flows are refused with `FirewallStateTableFull`, because
+/// expired slots keep counting against the usable capacity until a later
+/// probe crosses them (at most one per probe).
+///
+/// The program fills a 4-slot table (3 usable), jumps past every idle
+/// lifetime, then sends a fresh flow, a reply to an expired flow (must be
+/// refused), and the expired flow's own tuple again. As a corpus case its
+/// expected value is `Invariants(0)`: the state properties must hold, but
+/// the refusal itself is not asserted here. The separate test
+/// `r16_known_gap_expired_firewall_slots_still_refuse_fresh_flow` asserts
+/// today's refusal; the follow-up fix inverts that test and enables
+/// `state::REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY`.
+fn state_expired_firewall_capacity_after_idle_jump() -> NamedCase {
+    const UDP_OUT: u8 = 0;
+    const UDP_IN: u8 = 1;
+    const BIG_JUMP: u8 = 8;
+    const FLUSH: u8 = 9;
+    let ops: [[u8; 4]; 10] = [
+        [UDP_OUT, 0, 0, 0],
+        [UDP_OUT, 1, 0, 1],
+        [UDP_OUT, 2, 0, 2],
+        [UDP_OUT, 3, 0, 3],
+        [FLUSH, 0, 0, 0],
+        [BIG_JUMP, 0, 0, 0],
+        [UDP_OUT, 3, 1, 3],
+        [UDP_IN, 0, 0, 0],
+        [UDP_OUT, 0, 0, 0],
+        [FLUSH, 0, 0, 0],
+    ];
+    let mut payload = vec![4, 6, 4, 6, 4, 4, u8::try_from(ops.len()).unwrap(), 0];
+    for op in ops {
+        payload.extend_from_slice(&op);
+    }
+    encoded(
+        "state-expired-firewall-capacity-after-idle-jump",
+        Target::State,
+        0x6a09_e667_f3bc_c909,
+        4,
+        Expected::Invariants(InvariantFlags::default()),
         payload,
     )
 }

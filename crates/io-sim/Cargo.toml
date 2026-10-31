@@ -8,5 +8,12 @@ publish.workspace = true
 [dependencies]
 ruster-core = { path = "../core" }
 
+# The R16 integration-test targets drive these public APIs. Never use them
+# from io-sim's own `src` unit tests: sim-scenario/control depend on io-sim,
+# so a `cfg(test)` build of this library would see duplicate io-sim types.
 [dev-dependencies]
+ruster-config = { path = "../config" }
+ruster-control = { path = "../control" }
 ruster-io-conformance = { path = "../io-conformance" }
+ruster-runtime = { path = "../runtime" }
+ruster-sim-scenario = { path = "../sim-scenario" }

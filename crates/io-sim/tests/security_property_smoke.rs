@@ -11,12 +11,13 @@ use std::{
 use r16a::{
     artifact::{load_replay, ArtifactWriter},
     envelope::{
-        parse, CaseEnvelope, EnvelopeError, Expected, Target, MAX_CASES_PER_RUN, MAX_CORPUS_CASES,
-        MAX_ENVELOPE_LEN, MAX_PAYLOAD_LEN, MAX_RESOLUTION_NOW,
+        parse, CaseEnvelope, EnvelopeError, Expected, InvariantFlags, Target, MAX_CASES_PER_RUN,
+        MAX_CORPUS_CASES, MAX_ENVELOPE_LEN, MAX_PAYLOAD_LEN, MAX_RESOLUTION_NOW,
     },
     targets::{
-        generate_encoded, ADMISSION_SMOKE_CASES, CHECKSUM_SMOKE_CASES, PARSER_SMOKE_CASES,
-        RESOLUTION_SMOKE_CASES, V1_SEEDS,
+        generate_encoded, ADMISSION_SMOKE_CASES, CHECKSUM_SMOKE_CASES, CONFIG_SMOKE_CASES,
+        PARSER_SMOKE_CASES, PUBLICATION_SMOKE_CASES, RESOLUTION_SMOKE_CASES, SCENARIO_SMOKE_CASES,
+        STATE_SMOKE_CASES, V1_SEEDS,
     },
 };
 
@@ -133,6 +134,28 @@ fn r16a_envelope_parser_is_typed_canonical_and_bounded() {
         resolution_time,
         EnvelopeError::ResolutionTimeOutOfRange,
     ));
+    let invariants = generate_encoded(Target::Publication, V1_SEEDS[0], 0).unwrap();
+    let mut unknown_flag = invariants.clone();
+    unknown_flag[40] = 0x02;
+    cases.push((
+        "unknown invariant flag",
+        unknown_flag,
+        EnvelopeError::NonCanonicalExpected,
+    ));
+    let mut invariant_tail = invariants.clone();
+    invariant_tail[41] = 1;
+    cases.push((
+        "noncanonical invariant tail",
+        invariant_tail,
+        EnvelopeError::NonCanonicalExpected,
+    ));
+    let mut invariant_target = invariants;
+    invariant_target[5] = Target::Checksum as u8;
+    cases.push((
+        "invariants on an oracle target",
+        invariant_target,
+        EnvelopeError::ExpectedTargetMismatch,
+    ));
 
     for (case, (label, bytes, expected)) in cases.into_iter().enumerate() {
         assert_eq!(
@@ -141,6 +164,24 @@ fn r16a_envelope_parser_is_typed_canonical_and_bounded() {
             "envelope_case={case} label={label}"
         );
     }
+
+    for target in [
+        Target::State,
+        Target::Config,
+        Target::Scenario,
+        Target::Publication,
+    ] {
+        let encoded = generate_encoded(target, V1_SEEDS[1], 3).unwrap();
+        let parsed = parse(&encoded).unwrap();
+        assert_eq!(parsed.target, target);
+        assert!(matches!(parsed.expected, Expected::Invariants(_)));
+        assert_eq!(Target::from_name(target.name()), Ok(target));
+        assert_eq!(parsed.encode().unwrap(), encoded);
+    }
+    assert_eq!(
+        InvariantFlags::new(InvariantFlags::MUST_ACCEPT).map(InvariantFlags::must_accept),
+        Ok(true)
+    );
 
     assert_eq!(MAX_PAYLOAD_LEN + 72, MAX_ENVELOPE_LEN);
     assert_eq!(MAX_CORPUS_CASES, 512);
@@ -190,8 +231,12 @@ fn r16a_v1_generation_is_exact_case_replayable() {
             CHECKSUM_SMOKE_CASES,
             ADMISSION_SMOKE_CASES,
             RESOLUTION_SMOKE_CASES,
+            STATE_SMOKE_CASES,
+            CONFIG_SMOKE_CASES,
+            SCENARIO_SMOKE_CASES,
+            PUBLICATION_SMOKE_CASES,
         ),
-        (4_096, 4_096, 2_048, 2_048)
+        (4_096, 4_096, 2_048, 2_048, 512, 1_024, 1_024, 256)
     );
     for target in Target::ALL {
         let first = generate_encoded(target, V1_SEEDS[2], 317).unwrap();
@@ -289,6 +334,94 @@ fn r16a_v1_generation_is_exact_case_replayable() {
             118,
             0x8afa_4b2c_93dd_039d,
         ),
+        (Target::State, V1_SEEDS[0], 0, 296, 0xa820_8df2_4a38_15c0),
+        (Target::State, V1_SEEDS[1], 31, 180, 0x1483_ad51_3f0e_084e),
+        (Target::State, V1_SEEDS[2], 317, 216, 0x82ba_0719_4d58_208b),
+        (
+            Target::State,
+            V1_SEEDS[3],
+            2_047,
+            448,
+            0x6a74_d25b_c962_912c,
+        ),
+        (Target::Config, V1_SEEDS[0], 0, 3_243, 0x45c6_7911_79d3_b0c3),
+        (
+            Target::Config,
+            V1_SEEDS[1],
+            31,
+            2_964,
+            0xdf44_d158_3dee_b286,
+        ),
+        (
+            Target::Config,
+            V1_SEEDS[2],
+            317,
+            3_235,
+            0x6db3_36d8_ea48_ef48,
+        ),
+        (
+            Target::Config,
+            V1_SEEDS[3],
+            2_047,
+            3_020,
+            0x6b72_93a6_154d_e916,
+        ),
+        (
+            Target::Scenario,
+            V1_SEEDS[0],
+            0,
+            5_252,
+            0x7787_9177_a75b_aa99,
+        ),
+        (
+            Target::Scenario,
+            V1_SEEDS[1],
+            31,
+            991,
+            0x6dc1_c1b0_feaa_b6b4,
+        ),
+        (
+            Target::Scenario,
+            V1_SEEDS[2],
+            317,
+            2_937,
+            0x3279_1622_c9c5_64f8,
+        ),
+        (
+            Target::Scenario,
+            V1_SEEDS[3],
+            2_047,
+            2_917,
+            0xc13e_2ba2_c3d6_72a5,
+        ),
+        (
+            Target::Publication,
+            V1_SEEDS[0],
+            0,
+            158,
+            0x4dc9_1df8_a162_9be4,
+        ),
+        (
+            Target::Publication,
+            V1_SEEDS[1],
+            31,
+            186,
+            0x4e4e_9a3e_b996_986c,
+        ),
+        (
+            Target::Publication,
+            V1_SEEDS[2],
+            317,
+            168,
+            0xf170_a684_47f4_aac0,
+        ),
+        (
+            Target::Publication,
+            V1_SEEDS[3],
+            2_047,
+            196,
+            0xa47d_af7a_62b1_87ce,
+        ),
     ];
     for (target, seed, case_index, length, digest) in goldens {
         let encoded = generate_encoded(target, seed, case_index).unwrap();
@@ -329,6 +462,11 @@ fn r16a_past_regression_corpus_is_exact() {
             "resolution-zero-action-and-cache-capacity",
             80,
             0x8257_75e7_732e_ef57,
+        ),
+        (
+            "state-expired-firewall-capacity-after-idle-jump",
+            120,
+            0x9520_4d86_0ee1_8253,
         ),
     ];
     let corpus = r16a::corpus::past_regressions();
@@ -536,4 +674,124 @@ fn private_temp_dir(label: &str) -> PathBuf {
         }
     }
     panic!("all bounded private temporary directories already exist");
+}
+
+#[test]
+fn r16_document_targets_are_bounded_value_free_and_reach_every_stage() {
+    use r16a::documents::{run_config_outcome, run_scenario_outcome, DocumentOutcome};
+
+    r16a::documents::check_document_input_bounds().unwrap();
+    let mut config = Vec::new();
+    let mut scenario = Vec::new();
+    let mut must_accept = 0;
+    for case_index in 0..r16a::targets::SHORT_CASES * 4 {
+        for (target, outcomes) in [
+            (Target::Config, &mut config),
+            (Target::Scenario, &mut scenario),
+        ] {
+            let encoded = generate_encoded(target, V1_SEEDS[0], case_index).unwrap();
+            let case = parse(&encoded).unwrap();
+            if matches!(case.expected, Expected::Invariants(flags) if flags.must_accept()) {
+                must_accept += 1;
+            }
+            let outcome = match target {
+                Target::Config => run_config_outcome(&case),
+                _ => run_scenario_outcome(&case),
+            };
+            outcomes.push(outcome.unwrap());
+        }
+    }
+    let count = |outcomes: &[DocumentOutcome], stage| {
+        outcomes.iter().filter(|outcome| **outcome == stage).count()
+    };
+    eprintln!(
+        "R16 document coverage: must_accept={must_accept} config accepted={} parse={} \
+         validation={} scenario accepted={} parse={}",
+        count(&config, DocumentOutcome::Accepted),
+        count(&config, DocumentOutcome::ParseRejected),
+        count(&config, DocumentOutcome::ValidationRejected),
+        count(&scenario, DocumentOutcome::Accepted),
+        count(&scenario, DocumentOutcome::ParseRejected),
+    );
+    assert!(must_accept > 0);
+    for stage in [
+        DocumentOutcome::Accepted,
+        DocumentOutcome::ParseRejected,
+        DocumentOutcome::ValidationRejected,
+    ] {
+        assert!(config.contains(&stage), "config never reached {stage:?}");
+    }
+    for stage in [DocumentOutcome::Accepted, DocumentOutcome::ParseRejected] {
+        assert!(
+            scenario.contains(&stage),
+            "scenario never reached {stage:?}"
+        );
+    }
+}
+
+#[test]
+fn r16_state_target_exercises_every_property() {
+    let mut state = r16a::state::StateCoverage::default();
+    for case_index in 0..r16a::targets::SHORT_CASES {
+        let encoded = generate_encoded(Target::State, V1_SEEDS[0], case_index).unwrap();
+        state.add(r16a::state::run_with_coverage(&parse(&encoded).unwrap()).unwrap());
+    }
+    assert_exercised(&format!("{state:?}"));
+}
+
+#[test]
+fn r16_publication_target_exercises_every_property() {
+    let mut publication = r16a::publication::PublicationCoverage::default();
+    for case_index in 0..r16a::targets::SHORT_CASES {
+        let encoded = generate_encoded(Target::Publication, V1_SEEDS[0], case_index).unwrap();
+        publication.add(r16a::publication::run_with_coverage(&parse(&encoded).unwrap()).unwrap());
+    }
+    assert_exercised(&format!("{publication:?}"));
+}
+
+fn assert_exercised(rendered: &str) {
+    eprintln!(
+        "R16 coverage over {} short cases: {rendered}",
+        r16a::targets::SHORT_CASES
+    );
+    assert!(
+        !rendered.contains(": 0,") && !rendered.contains(": 0 }"),
+        "a checked property was never exercised: {rendered}"
+    );
+}
+
+/// Known gap, not a guarantee: post-expiry firewall capacity liveness.
+///
+/// Today's core refuses a fresh flow after every flow of a full firewall
+/// table expired (see the `state-expired-firewall-capacity-after-idle-jump`
+/// corpus case). This test pins that refusal so the follow-up core fix must
+/// flip it deliberately: invert the assertion and enable
+/// `REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY` in the same change.
+#[test]
+fn r16_known_gap_expired_firewall_slots_still_refuse_fresh_flow() {
+    const { assert!(!r16a::state::REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY) };
+    let corpus = r16a::corpus::past_regressions();
+    let case = corpus
+        .iter()
+        .find(|case| case.name == "state-expired-firewall-capacity-after-idle-jump")
+        .unwrap();
+    let (coverage, refusals) = r16a::state::run_traced(&parse(&case.encoded).unwrap()).unwrap();
+    assert!(
+        coverage.refused_after_expiry >= 1,
+        "the post-expiry refusal is gone; finish the follow-up: {coverage:?}"
+    );
+    // The program's final packet retries the expired flow's own tuple.
+    assert_eq!(
+        refusals.last(),
+        Some(&r16a::state::Refusal {
+            host: 0,
+            internal_port: 5_000,
+            remote: r16a::router::remote(0, false),
+            remote_port: 53,
+            cause: Some(ruster_io_sim::RecycleCause::Forwarding(
+                ruster_core::DropReason::FirewallStateTableFull
+            )),
+        }),
+        "the expired same-tuple retry is no longer refused as table-full; finish the follow-up"
+    );
 }

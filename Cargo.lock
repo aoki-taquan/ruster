@@ -109,8 +109,12 @@ dependencies = [
 name = "ruster-io-sim"
 version = "0.2.0"
 dependencies = [
+ "ruster-config",
+ "ruster-control",
  "ruster-core",
  "ruster-io-conformance",
+ "ruster-runtime",
+ "ruster-sim-scenario",
 ]
 
 [[package]]
