@@ -795,12 +795,28 @@ ordered ruleをscanします。
 
 exact expiryをprobe中に発見したattemptは最大1 slotだけ`occupied=false`へ戻し、最大capacity回の
 backward-shift deletionで後続live entryのprobe chainを修復し、最大1回だけ先頭から再scanします。
-再scanで見つけた別のexpired slotは追加deleteせずfirst reuse候補として扱います。このため単一
-packetはprobe最大2N、maintenanceも定数倍Nでstrict O(N)であり、expired数を掛けたO(N²)には
-なりません。full相当のusable loadが全expiryしても、繰返しattemptが1 slotずつamortized cleanup
-し、最終的にempty terminationを回復します。新規flowはcleanupが追いつかない間fail closedで
-構いません。cleanupによるdelete/moveはruntime epochを進め、移動前planをrelease buildでも
-staleとして拒否します。live evictionはありません。probe、maintenance shift/hash/scan、
+再scanで見つけた別のexpired slotは追加deleteせずfirst reuse候補として扱います。
+
+lazy cleanupはprobe chain上のexpired slotしか回収しないため、それだけでは全flow失効後の
+full tableで、empty homeに直接着地するtuple（同一tupleの再送を含む）が永久に
+`FirewallStateTableFull`になり得ます。そこでrule許可済みの新規flowが「placement先がempty
+かつ`occupied_count >= usable`」で拒否されそうなときだけ、refusal-path sweepを1回実行します。
+sweepはslot 0から最大N slotを読み、最初のexpired slotを1件だけ同じbackward-shiftで削除して
+から同じtupleを再probeします。worker-localな`reclaim_not_before_ms`（全occupied slotの
+idle deadline `last_activity + TTL`の下界。初期値とreconcile後は0）が`now`より大きい間は
+sweepを読まずO(1)で拒否します。expired slotが無かったsweepは下界をlive slotの正確な最小
+deadline（`now`より後）へ上げ、commitは書いたslotのdeadlineで下界を下げる（ACKによる
+Opening→Active昇格でdeadlineが早まる場合を含む）ため、下界は常に正しく、full-liveな表への
+新規flowは失敗sweepを下界時刻ごとに高々1回しか起こしません。
+
+単一packetの上限は、probe 2N+shift、sweep N+shift、再probe 2N+shiftの定数倍N
+（delete最大3件）でstrict O(N)のままで、expired数を掛けたO(N²)にはなりません。回復保証:
+expired slotが1件でもあれば、そのdeadlineは下界以上かつ`now`以下なのでsweepが必ず走って
+1件削除し、`occupied_count < usable`となって同じattempt内の再probeがempty slotで終わり
+placementが成功します。したがって`FirewallStateTableFull`はoccupied slotが全てliveの
+ときだけ返り、同一tupleの再送も含め失効由来の拒否は0回で回復します（timer phaseや他packet
+の通過には依存しません）。cleanupによるdelete/moveはruntime epochを進め、移動前planを
+release buildでもstaleとして拒否します。live evictionはありません。probe、maintenance shift/hash/scan、
 rule evaluation数はcounterで観測できます。
 
 common Ethernet ingress admissionはprotocol parserより前にexact ingress MACを検証します。

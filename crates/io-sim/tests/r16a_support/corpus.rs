@@ -205,22 +205,20 @@ fn resolution_zero_action_capacity() -> NamedCase {
     )
 }
 
-/// Reproduction program for a known core liveness gap, retained so that the
-/// follow-up core firewall fix must change its observed behaviour
-/// deliberately. Found by the first R16 `state` generator revision (seed
-/// 0x6a09e667f3bcc909, case 4): after every flow of a full firewall table
-/// expired, fresh flows are refused with `FirewallStateTableFull`, because
-/// expired slots keep counting against the usable capacity until a later
-/// probe crosses them (at most one per probe).
+/// Regression program for a fixed core liveness gap (R16A-009). Found by
+/// the first R16 `state` generator revision (seed 0x6a09e667f3bcc909,
+/// case 4): after every flow of a full firewall table expired, fresh flows
+/// were refused with `FirewallStateTableFull` indefinitely, because expired
+/// slots were reclaimed only when a later probe happened to cross them.
 ///
 /// The program fills a 4-slot table (3 usable), jumps past every idle
 /// lifetime, then sends a fresh flow, a reply to an expired flow (must be
-/// refused), and the expired flow's own tuple again. As a corpus case its
-/// expected value is `Invariants(0)`: the state properties must hold, but
-/// the refusal itself is not asserted here. The separate test
-/// `r16_known_gap_expired_firewall_slots_still_refuse_fresh_flow` asserts
-/// today's refusal; the follow-up fix inverts that test and enables
-/// `state::REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY`.
+/// refused), and the expired flow's own tuple again. Its expected value is
+/// `Invariants(0)`: every state property holds, and the state model owes
+/// both post-expiry creates success because known-dead flows count as
+/// reclaimed firewall room. The separate test
+/// `r16_expired_firewall_slots_are_reclaimed_for_fresh_and_same_tuple_flows`
+/// pins the exact refusal list (only the pre-expiry fourth flow).
 fn state_expired_firewall_capacity_after_idle_jump() -> NamedCase {
     const UDP_OUT: u8 = 0;
     const UDP_IN: u8 = 1;

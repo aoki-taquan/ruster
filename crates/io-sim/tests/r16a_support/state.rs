@@ -16,16 +16,17 @@
 //!   packets, and non-SYN TCP without a session are never forwarded;
 //! - capacity: the model counts NAT mappings, UDP peers, TCP sessions,
 //!   firewall states, and the port pool independently (live and undecided
-//!   flows occupy; known-dead flows are reclaimable except for firewall
-//!   room), and a state-creating packet refused while every one of them has
-//!   room fails the case; live flows are never evicted;
+//!   flows occupy; known-dead flows are reclaimable, firewall room
+//!   included), and a state-creating packet refused while every one of them
+//!   has room fails the case; live flows are never evicted;
 //! - slots: with every flow live, a tick that forwarded nothing leaves every
 //!   NAT/firewall slot unchanged; with only live and known-dead flows it may
 //!   only remove (expired) entries;
 //! - boundaries: some advances land within 2 ms of an idle lifetime, so
 //!   exact-boundary and partially expired tables are exercised;
-//! - not yet: post-expiry firewall liveness (see
-//!   [`REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY`]);
+//! - post-expiry liveness: after flows expire, their NAT and firewall
+//!   capacity is owed to fresh flows (R16A-009), including a retry of the
+//!   expired flow's own tuple;
 //! - no panic and exact RX accounting in every tick.
 
 use ruster_control::{
@@ -275,15 +276,6 @@ enum SlotKnowledge {
     Undecided,
 }
 
-/// Disabled until the follow-up core firewall fix: expired firewall slots
-/// are reclaimed only when a later probe crosses them (at most one per
-/// probe), so after every flow expired a fresh flow can still be refused
-/// with `FirewallStateTableFull`. While disabled, known-dead flows still
-/// count against firewall room; when enabled they count as reclaimed, as
-/// they always do for NAT mappings, peers, sessions, and ports.
-// TODO(R16 follow-up core firewall expired-slot reclaim): enable.
-pub const REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY: bool = false;
-
 impl Model {
     fn live_endpoint_port(&self, proto: Proto, host: usize, port: u16) -> Option<u16> {
         self.flows
@@ -308,17 +300,13 @@ impl Model {
     /// Why a refused state-creating outbound packet was owed success, if
     /// it was. Occupancy is counted independently from the model. Flows
     /// that may still be live (live or undecided) always occupy. Known-dead
-    /// flows are reclaimable for NAT mappings, peers, sessions, and ports;
-    /// for firewall room only when `firewall_dead_reclaimed`.
-    fn owed(&self, out: &Outbound, firewall_dead_reclaimed: bool) -> Option<&'static str> {
+    /// flows are reclaimable for NAT mappings, peers, sessions, ports, and
+    /// firewall room.
+    fn owed(&self, out: &Outbound) -> Option<&'static str> {
         let now = self.now;
         let not_dead = |flow: &&Flow| flow.liveness(now) != Liveness::Dead;
         let flows: Vec<&Flow> = self.flows.iter().filter(not_dead).collect();
-        let firewall_occupied = if firewall_dead_reclaimed {
-            flows.len()
-        } else {
-            self.flows.len()
-        };
+        let firewall_occupied = flows.len();
         let tuple_live = flows
             .iter()
             .any(|flow| flow.same_tuple(out) && flow.liveness(now) == Liveness::Live);
@@ -484,8 +472,8 @@ pub struct StateCoverage {
     pub boundary_advances: u64,
     /// Forwarded state-creating packets the capacity model owed success.
     pub owed_successes: u64,
-    /// Refusals while known-dead state existed (post-expiry liveness is
-    /// not asserted yet; see `REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY`).
+    /// Refusals while known-dead state existed that were not owed (some
+    /// capacity was still held by live or undecided flows).
     pub refused_after_expiry: u64,
     pub big_jumps: u64,
 }
@@ -1011,7 +999,7 @@ impl Harness {
                 let existing_dead_or_none = existing
                     .is_none_or(|index| self.model.flows[index].liveness(now) == Liveness::Dead);
                 let owed = if out.creates {
-                    self.model.owed(&out, REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY)
+                    self.model.owed(&out)
                 } else {
                     existing
                         .filter(|index| self.model.flows[*index].liveness(now) == Liveness::Live)
