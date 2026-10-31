@@ -12,7 +12,7 @@ use ruster_core::{
     ResolutionFailureDispatchReport, ResolutionFailureTraceSink, ResolutionRuntime,
     ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTraceSink, TraceSink,
 };
-use std::num::NonZeroU64;
+use std::{marker::PhantomData, num::NonZeroU64};
 
 /// Tick-local UDP NAT44 authority and its optional worker-local runtime.
 ///
@@ -20,7 +20,19 @@ use std::num::NonZeroU64;
 /// from accidentally pairing a config with another service's runtime.
 pub struct Nat44UdpServiceView<'view, 'storage> {
     pub config: Nat44UdpConfig,
-    pub runtime: Option<&'view mut Nat44UdpRuntime<'storage>>,
+    runtime: Option<&'view mut Nat44UdpRuntime<'storage>>,
+}
+
+impl<'view, 'storage> Nat44UdpServiceView<'view, 'storage> {
+    /// Pairs a config with its optional runtime. The runtime borrow is
+    /// private: only [`run_tick`] can use it.
+    #[must_use]
+    pub fn new(
+        config: Nat44UdpConfig,
+        runtime: Option<&'view mut Nat44UdpRuntime<'storage>>,
+    ) -> Self {
+        Self { config, runtime }
+    }
 }
 
 /// Tick-local TCP NAT44 authority and its optional worker-local runtime.
@@ -29,7 +41,19 @@ pub struct Nat44UdpServiceView<'view, 'storage> {
 /// when a configured service cannot supply mutable state for a tick.
 pub struct Nat44TcpServiceView<'view, 'storage> {
     pub config: Nat44TcpConfig,
-    pub runtime: Option<&'view mut Nat44TcpRuntime<'storage>>,
+    runtime: Option<&'view mut Nat44TcpRuntime<'storage>>,
+}
+
+impl<'view, 'storage> Nat44TcpServiceView<'view, 'storage> {
+    /// Pairs a config with its optional runtime. The runtime borrow is
+    /// private: only [`run_tick`] can use it.
+    #[must_use]
+    pub fn new(
+        config: Nat44TcpConfig,
+        runtime: Option<&'view mut Nat44TcpRuntime<'storage>>,
+    ) -> Self {
+        Self { config, runtime }
+    }
 }
 
 /// Tick-local firewall authority and its optional worker-local runtime.
@@ -38,7 +62,19 @@ pub struct Nat44TcpServiceView<'view, 'storage> {
 /// the lifetime of the active publication view.
 pub struct FirewallServiceView<'view, 'storage> {
     pub config: FirewallConfig<'view>,
-    pub runtime: Option<&'view mut FirewallRuntime<'storage>>,
+    runtime: Option<&'view mut FirewallRuntime<'storage>>,
+}
+
+impl<'view, 'storage> FirewallServiceView<'view, 'storage> {
+    /// Pairs a config with its optional runtime. The runtime borrow is
+    /// private: only [`run_tick`] can use it.
+    #[must_use]
+    pub fn new(
+        config: FirewallConfig<'view>,
+        runtime: Option<&'view mut FirewallRuntime<'storage>>,
+    ) -> Self {
+        Self { config, runtime }
+    }
 }
 
 /// All immutable authority and mutable worker-local state required by the
@@ -76,25 +112,26 @@ pub struct FirewallServiceView<'view, 'storage> {
 ///
 /// ```compile_fail
 /// use ruster_core::PublicationQuiescence;
-/// use ruster_runtime::{FullServicePublication, FullServiceView};
+/// use ruster_runtime::{FullServicePublication, FullServiceView, PublicationTick};
 ///
 /// fn publish_while_authority_is_live<'storage, I, P>(
 ///     publication: &mut P,
 ///     io: &mut I,
 ///     candidate: P::Candidate,
+///     tick: &PublicationTick<'_>,
 /// )
 /// where
 ///     I: PublicationQuiescence,
 ///     P: FullServicePublication<'storage, I>,
 /// {
 ///     let view: FullServiceView<'_, 'storage> =
-///         publication.active().expect("active publication");
+///         publication.active(tick).expect("active publication");
 ///     let snapshot = view.snapshot;
 ///     let firewall_config = view.firewall.config;
 ///     let Ok(guard) = io.try_publication_quiescence() else {
 ///         return;
 ///     };
-///     let _result = publication.publish_candidate(candidate, guard);
+///     let _result = publication.publish_candidate(candidate, guard, tick);
 ///     drop((snapshot, firewall_config));
 /// }
 /// ```
@@ -104,22 +141,23 @@ pub struct FirewallServiceView<'view, 'storage> {
 ///
 /// ```compile_fail
 /// use ruster_core::PublicationQuiescence;
-/// use ruster_runtime::FullServicePublication;
+/// use ruster_runtime::{FullServicePublication, PublicationTick};
 ///
 /// fn publish_while_old_view_is_live<'storage, I, P>(
 ///     publication: &mut P,
 ///     io: &mut I,
 ///     candidate: P::Candidate,
+///     tick: &PublicationTick<'_>,
 /// )
 /// where
 ///     I: PublicationQuiescence,
 ///     P: FullServicePublication<'storage, I>,
 /// {
-///     let old_view = publication.active().expect("active publication");
+///     let old_view = publication.active(tick).expect("active publication");
 ///     let Ok(guard) = io.try_publication_quiescence() else {
 ///         return;
 ///     };
-///     let _result = publication.publish_candidate(candidate, guard);
+///     let _result = publication.publish_candidate(candidate, guard, tick);
 ///     drop(old_view);
 /// }
 /// ```
@@ -148,11 +186,108 @@ pub struct FirewallServiceView<'view, 'storage> {
 pub struct FullServiceView<'view, 'storage> {
     pub generation: NonZeroU64,
     pub snapshot: ForwardingSnapshot<'view>,
-    pub resolution: &'view mut ResolutionRuntime<'storage>,
-    pub icmpv4_errors: &'view mut Icmpv4ErrorRuntime<'storage>,
+    resolution: &'view mut ResolutionRuntime<'storage>,
+    icmpv4_errors: &'view mut Icmpv4ErrorRuntime<'storage>,
     pub nat44_udp: Nat44UdpServiceView<'view, 'storage>,
     pub nat44_tcp: Nat44TcpServiceView<'view, 'storage>,
     pub firewall: FirewallServiceView<'view, 'storage>,
+}
+
+impl<'view, 'storage> FullServiceView<'view, 'storage> {
+    /// Builds one coherent tick-local view.
+    ///
+    /// Every mutable runtime borrow is private to the view, so a holder of a
+    /// view (including an adapter that wraps another adapter) can read the
+    /// copied authority but cannot mutate or reconcile any runtime. Only
+    /// [`run_tick`] destructures the view:
+    ///
+    /// ```compile_fail,E0616
+    /// use ruster_runtime::FullServiceView;
+    ///
+    /// fn escape_runtime(view: FullServiceView<'_, '_>) {
+    ///     let _ = view.nat44_udp.runtime;
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail,E0616
+    /// use ruster_runtime::FullServiceView;
+    ///
+    /// fn escape_resolution(view: FullServiceView<'_, '_>) {
+    ///     let _ = view.resolution;
+    /// }
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        generation: NonZeroU64,
+        snapshot: ForwardingSnapshot<'view>,
+        resolution: &'view mut ResolutionRuntime<'storage>,
+        icmpv4_errors: &'view mut Icmpv4ErrorRuntime<'storage>,
+        nat44_udp: Nat44UdpServiceView<'view, 'storage>,
+        nat44_tcp: Nat44TcpServiceView<'view, 'storage>,
+        firewall: FirewallServiceView<'view, 'storage>,
+    ) -> Self {
+        Self {
+            generation,
+            snapshot,
+            resolution,
+            icmpv4_errors,
+            nat44_udp,
+            nat44_tcp,
+            firewall,
+        }
+    }
+}
+
+/// Capability that exists only inside [`run_tick`].
+///
+/// [`FullServicePublication::active`] and
+/// [`FullServicePublication::publish_candidate`] require a borrow of this
+/// token, so they are reachable only from code that `run_tick` calls. The
+/// token has a private field and no constructor, is not `Clone`, `Copy`,
+/// `Send`, or `Sync`, and is only lent for one call, so it cannot be forged,
+/// duplicated, or kept beyond its tick.
+///
+/// It does not make adapters untrusted: an adapter receives the token and may
+/// forward it, and a guard can be built with the public
+/// `PublicationQuiescenceGuard::new`. Only `run_tick` itself requests the
+/// guard from the backend's real quiescence check, and using the same
+/// backend instance on every tick is the caller's responsibility. The
+/// compile_fail error codes below were verified manually; stable rustdoc
+/// only enforces that each example fails to compile.
+///
+/// ```compile_fail,E0451
+/// use ruster_runtime::PublicationTick;
+///
+/// fn forge() -> PublicationTick<'static> {
+///     PublicationTick { _tick: std::marker::PhantomData }
+/// }
+/// ```
+///
+/// ```compile_fail,E0308
+/// use ruster_runtime::PublicationTick;
+///
+/// fn duplicate<'a>(tick: &PublicationTick<'a>) -> PublicationTick<'a> {
+///     tick.clone()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use ruster_runtime::PublicationTick;
+///
+/// fn keep<'a>(tick: &PublicationTick<'_>) -> &'a PublicationTick<'a> {
+///     tick
+/// }
+/// ```
+///
+/// ```compile_fail,E0277
+/// use ruster_runtime::PublicationTick;
+///
+/// fn require_send<T: Send>() {}
+/// require_send::<PublicationTick<'static>>();
+/// ```
+pub struct PublicationTick<'tick> {
+    _tick: PhantomData<*mut &'tick ()>,
 }
 
 /// Atomic publication seam used by [`run_tick`].
@@ -205,9 +340,10 @@ pub trait FullServicePublication<'storage, I: PublicationQuiescence> {
         &mut self,
         candidate: Self::Candidate,
         quiescence: I::Guard<'_>,
+        tick: &PublicationTick<'_>,
     ) -> Result<(), Self::Reject>;
 
-    fn active(&mut self) -> Option<FullServiceView<'_, 'storage>>;
+    fn active(&mut self, tick: &PublicationTick<'_>) -> Option<FullServiceView<'_, 'storage>>;
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -708,12 +844,13 @@ where
         + GeneratedTraceSink
         + GeneratedIcmpv4TraceSink,
 {
+    let tick = PublicationTick { _tick: PhantomData };
     trace.record_tick_phase(TickPhaseTrace::TickStarted);
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::Publication));
     let mut io_disposition = candidate.is_none().then(|| io.current_io_disposition());
     let publication_report = match candidate {
         Some(candidate) => match io.try_publication_quiescence() {
-            Ok(quiescence) => match publication.publish_candidate(candidate, quiescence) {
+            Ok(quiescence) => match publication.publish_candidate(candidate, quiescence, &tick) {
                 Ok(()) => PublicationOutcome::Applied,
                 Err(error) => PublicationOutcome::Rejected(error),
             },
@@ -727,7 +864,7 @@ where
     };
     trace.record_tick_phase(TickPhaseTrace::PhaseFinished(TickPhase::Publication));
 
-    let Some(view) = publication.active() else {
+    let Some(view) = publication.active(&tick) else {
         for phase in [
             TickPhase::Rx,
             TickPhase::ResolutionTimers,
@@ -976,6 +1113,7 @@ mod tests {
             &mut self,
             candidate: Self::Candidate,
             _quiescence: I::Guard<'_>,
+            _tick: &PublicationTick<'_>,
         ) -> Result<(), Self::Reject> {
             match candidate {
                 Candidate::Apply => {
@@ -986,7 +1124,7 @@ mod tests {
             }
         }
 
-        fn active(&mut self) -> Option<FullServiceView<'_, 'storage>> {
+        fn active(&mut self, _tick: &PublicationTick<'_>) -> Option<FullServiceView<'_, 'storage>> {
             self.active_calls += 1;
             self.enabled.then_some(FullServiceView {
                 generation: NonZeroU64::MIN,
@@ -2151,8 +2289,10 @@ mod tests {
             let udp = publication.udp_config;
             let tcp = publication.tcp_config;
             let firewall = publication.firewall_config;
+            let tick = PublicationTick { _tick: PhantomData };
             let view = <TestPublication<'_, '_> as FullServicePublication<'_, TestIo>>::active(
                 publication,
+                &tick,
             )
             .expect("active view");
             assert_eq!(view.generation, NonZeroU64::MIN);

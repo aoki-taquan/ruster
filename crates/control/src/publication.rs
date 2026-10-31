@@ -515,6 +515,9 @@ pub struct ValidatedCandidate {
     storage_shape: FullServiceStorageShape,
     resolution_policy: ResolutionPolicy,
     icmpv4_error_policy: Icmpv4ErrorPolicy,
+    /// Owned copy of the published interface identities (IfId and MAC),
+    /// compared by successor validation. It borrows nothing.
+    interfaces: Box<[Interface]>,
     nat44_udp: Nat44UdpConfig,
     nat44_udp_hash_key: Nat44UdpHashKey,
     nat44_tcp: Nat44TcpConfig,
@@ -551,6 +554,7 @@ impl ValidatedCandidate {
         validate_structural_shapes(storage_shape)
             .map_err(PublicationCandidateError::StorageShape)?;
 
+        let interface_identities = interfaces.clone();
         // The owner is created before every dependent config. Box allocation
         // addresses remain stable when the finished candidate is moved.
         let forwarding =
@@ -598,6 +602,7 @@ impl ValidatedCandidate {
             storage_shape,
             resolution_policy,
             icmpv4_error_policy,
+            interfaces: interface_identities,
             nat44_udp: udp_config,
             nat44_udp_hash_key: nat44_udp.hash_key,
             nat44_tcp: tcp_config,
@@ -667,6 +672,16 @@ impl ValidatedCandidate {
         }
         if candidate.icmpv4_error_policy != self.icmpv4_error_policy {
             return Err(SuccessorError::Icmpv4ErrorPolicyChanged);
+        }
+        // The validated owner rejects duplicate IfIds, so equal length plus
+        // inclusion is set equality of (IfId, MAC) pairs.
+        if candidate.interfaces.len() != self.interfaces.len()
+            || !candidate
+                .interfaces
+                .iter()
+                .all(|interface| self.interfaces.contains(interface))
+        {
+            return Err(SuccessorError::InterfacesChanged);
         }
         Ok(())
     }
@@ -796,6 +811,8 @@ pub enum SuccessorError {
     StorageShapeChanged,
     ResolutionPolicyChanged,
     Icmpv4ErrorPolicyChanged,
+    /// The set of interface IfIds or their MAC addresses changed.
+    InterfacesChanged,
 }
 
 fn validate_structural_shapes(shape: FullServiceStorageShape) -> Result<(), StorageShapeError> {

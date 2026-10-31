@@ -332,12 +332,28 @@ allocation、再validation、再hashなしのO(1)で返します。generation前
 rotation、固定shape/policyはstatic successor checkだけを提供し、ownerのinstallやruntime変更は
 行いません。
 
-この段階では`ActivePublication`、`FullServiceView`構築、既存runtimeのadopt、apply、
-rollback、backend quiescence APIを一切公開しません。Resolution/ICMP runtimeには旧snapshotの
-egress/MAC/IP authorityを持つqueueがあり、shape/policy一致だけで新candidateへ接続するとstale
-出力を許すためです。live activationは、全5 runtimeのR06G permitとbackend quiescenceを同じ
-exclusive transactionに保持する後続workerだけが行います。`ruster-control`はR06O時点では
-`ruster-core`だけに依存し、runtime依存の追加もそのworker PRまで延期します。
+live activationは`FullServiceStorage`と`ActivePublication<'storage>`だけで行います。
+`FullServiceStorage`はcandidateのstorage shapeどおりに全runtime slot配列を一度だけ確保し、
+`ActivePublication`はそれを`'storage`の間exclusive borrowして5 runtimeを新規構築します。
+既存runtimeのadoptはできません。`ActivePublication`は一つのbackend型に束縛され、
+`ruster-runtime`の`FullServicePublication`をそのbackendに対してだけ実装します。seamの
+`active`/`publish_candidate`は`run_tick`だけが作れる`PublicationTick` tokenを要求し、
+`FullServiceView`のruntime borrowはprivateなので、tick外やviewを受け取ったwrapperから
+runtimeを変更できません。ただしtokenが保証するのは「`run_tick`から到達するcodeだけが呼べる」
+ことまでです。`FullServicePublication`実装（adapter、wrapperを含む）はtokenを受け取り転送
+できるtrusted codeです。backendへの束縛は型だけで、毎tick同じbackend instanceを渡すのは
+callerの責任です。core `PublicationQuiescenceGuard::new`はsealされていないため、guardは型の
+規律でありquiescenceの証明ではありません。backendの実checkからguardを得るのは`run_tick`
+自身だけです。guard mintのseal（backend専用化またはunsafe化）は後続課題です。
+applyは`validate_successor`の後、Resolution/ICMPv4 errorの`preflight_publication`と
+NAT44 UDP/TCP・firewallの`preflight_reconcile`の5 permitを同時に保持し、全て成功した場合だけ
+一点でcommitします。各permit commitとcandidate swapには失敗分岐がありません。途中の失敗では
+permitのDropにより全runtimeが不変で、旧candidate/snapshot/generationが継続します。
+Resolution/ICMP runtimeは旧snapshotのauthorityを持つqueueを全flushし、NAT/firewallはkey
+rotationに伴いflow stateを全flushします。累積counterは保持します。storage shapeと
+Resolution/ICMP policy、interface IfId/MACの変更はtyped `RestartRequired`としてrejectし、
+resizeしません。reloadのたびにARP学習も消え、NAT/FW keyのrotationによりTCP sessionも切れます。
+rollbackとplan/diffは未実装です。
 
 `ruster-runtime`の`FullServicePublication`は、具体的なowned publicationやparserを持たず、
 candidateのall-or-nothing適用とactive full-service viewの借用だけを抽象化します。
@@ -371,7 +387,9 @@ snapshot内sliceとfirewall rulesのborrowはactive adapter borrowと同じview 
 mutable runtime storageもそのtick-local viewだけがexclusiveにreborrowします。
 `FullServiceView`自身は`Copy`/`Clone`にせず、viewをtick外へescapeさせません。このsnapshot
 by-value化、generation追加、flat config/runtime fieldのnested化はpre-1.0 APIの意図したsource
-breakであり、downstream adapterはstruct literalを更新します。現行core full wrapperは3 configを
+breakであり、runtime borrowはprivate fieldにしたためdownstream adapterは`FullServiceView::new`と
+各`*ServiceView::new`でviewを構築します。`active`/`publish_candidate`は`run_tick`だけが作る
+`PublicationTick`を要求します。現行core full wrapperは3 configを
 必須とするため、service pair全体の不在表現はoptional-config composition seamを追加する後続
 作業です。64-bit buildではsnapshot 144 bytes、Firewall config 160 bytes、UDP/TCP NAT configは
 各112 bytesで、full view全体を576 bytes以下に保ちます。1024 tickの回帰fixtureは各tickの

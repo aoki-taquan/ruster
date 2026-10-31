@@ -8,7 +8,7 @@ use ruster_core::{
 use ruster_io_sim::SimIo;
 use ruster_runtime::{
     FirewallServiceView, FullServicePublication, FullServiceView, Nat44TcpServiceView,
-    Nat44UdpServiceView,
+    Nat44UdpServiceView, PublicationTick,
 };
 
 /// A downstream crate's minimal adapter fixture. Keeping this as an
@@ -38,29 +38,21 @@ impl<'owner, 'storage> FullServicePublication<'storage, SimIo>
         &mut self,
         _candidate: Self::Candidate,
         _quiescence: PublicationQuiescenceGuard<'_, SimIo>,
+        _tick: &PublicationTick<'_>,
     ) -> Result<(), Self::Reject> {
         Ok(())
     }
 
-    fn active(&mut self) -> Option<FullServiceView<'_, 'storage>> {
-        Some(FullServiceView {
-            generation: self.generation,
-            snapshot: *self.snapshot,
-            resolution: self.resolution,
-            icmpv4_errors: self.icmpv4_errors,
-            nat44_udp: Nat44UdpServiceView {
-                config: self.udp_config,
-                runtime: self.nat44_udp.as_deref_mut(),
-            },
-            nat44_tcp: Nat44TcpServiceView {
-                config: self.tcp_config,
-                runtime: self.nat44_tcp.as_deref_mut(),
-            },
-            firewall: FirewallServiceView {
-                config: self.firewall_config,
-                runtime: self.firewall.as_deref_mut(),
-            },
-        })
+    fn active(&mut self, _tick: &PublicationTick<'_>) -> Option<FullServiceView<'_, 'storage>> {
+        Some(FullServiceView::new(
+            self.generation,
+            *self.snapshot,
+            self.resolution,
+            self.icmpv4_errors,
+            Nat44UdpServiceView::new(self.udp_config, self.nat44_udp.as_deref_mut()),
+            Nat44TcpServiceView::new(self.tcp_config, self.nat44_tcp.as_deref_mut()),
+            FirewallServiceView::new(self.firewall_config, self.firewall.as_deref_mut()),
+        ))
     }
 }
 

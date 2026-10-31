@@ -11,3 +11,7 @@ validation-test-hooks = ["ruster-core/validation-test-hooks"]
 [dependencies]
 ruster-config = { path = "../config" }
 ruster-core = { path = "../core" }
+ruster-runtime = { path = "../runtime" }
+
+[dev-dependencies]
+ruster-io-sim = { path = "../io-sim" }

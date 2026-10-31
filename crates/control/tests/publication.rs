@@ -112,6 +112,55 @@ fn base_plan(
     )
 }
 
+/// Successor candidate with fresh keys and the given interface identities.
+fn interface_candidate(generation: u64, interfaces: &[(u8, u8)]) -> ValidatedCandidate {
+    let routes = [
+        Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, LAN, None).unwrap(),
+        Route::new(
+            Ipv4Address::from_octets([0; 4]),
+            0,
+            WAN,
+            Some(Ipv4Address::from_octets([203, 0, 113, 1])),
+        )
+        .unwrap(),
+    ];
+    let interfaces: Box<[Interface]> = interfaces
+        .iter()
+        .map(|&(id, mac)| Interface {
+            id: IfId(id.into()),
+            mac: MacAddress([2, 0, 0, 0, 0, mac]),
+        })
+        .collect();
+    let bindings = [
+        LocalIpv4Binding {
+            interface: LAN,
+            address: Ipv4Address::from_octets([10, 0, 0, 1]),
+        },
+        LocalIpv4Binding {
+            interface: WAN,
+            address: PUBLIC,
+        },
+    ];
+    let seed = generation * 1_000;
+    ValidatedCandidate::new(
+        PublicationPlan::new(
+            NonZeroU64::new(generation).unwrap(),
+            exact_shape(),
+            routes.into(),
+            interfaces,
+            Vec::new().into_boxed_slice(),
+            bindings.into(),
+            Ipv4OriginPolicy::default(),
+            ResolutionPolicy::new(1_000, 2_000).unwrap(),
+            Icmpv4ErrorPolicy::default(),
+        )
+        .with_nat44_udp(udp_input((seed, seed + 1)))
+        .with_nat44_tcp(tcp_input((seed + 2, seed + 3)))
+        .with_firewall(firewall_input((seed + 4, seed + 5))),
+    )
+    .unwrap()
+}
+
 fn udp_input(hash_key: (u64, u64)) -> Nat44UdpPublicationInput {
     Nat44UdpPublicationInput::new(
         LAN,
@@ -537,6 +586,31 @@ fn successor_checks_generation_keys_shape_and_fixed_policies_without_apply() {
     );
     assert_eq!(active.validate_successor(&candidate(2, 100)), Ok(()));
 
+    // Interface identities (IfId set and MACs) are restart-required. The
+    // published order is not part of the identity.
+    let base = interface_candidate(1, &[(1, 1), (2, 2)]);
+    for (changed, label) in [
+        (&[(1, 1), (2, 2), (3, 3)][..], "IfId added"),
+        (&[(1, 1), (2, 9)][..], "MAC changed"),
+    ] {
+        assert_eq!(
+            base.validate_successor(&interface_candidate(2, changed)),
+            Err(SuccessorError::InterfacesChanged),
+            "{label}"
+        );
+    }
+    let three = interface_candidate(1, &[(1, 1), (2, 2), (3, 3)]);
+    assert_eq!(
+        three.validate_successor(&interface_candidate(2, &[(1, 1), (2, 2)])),
+        Err(SuccessorError::InterfacesChanged),
+        "IfId removed"
+    );
+    assert_eq!(
+        base.validate_successor(&interface_candidate(2, &[(2, 2), (1, 1)])),
+        Ok(()),
+        "same set in another order"
+    );
+
     let exhausted = candidate(u64::MAX, 200);
     assert_eq!(
         exhausted.validate_successor(&candidate(u64::MAX - 1, 300)),
@@ -567,16 +641,27 @@ fn typed_errors_and_source_never_format_nested_authority_or_secrets() {
         "unsafe {",
         "Mutex<",
         "dyn PacketIo",
-        "pub struct ActivePublication",
         "pub struct FullServiceRuntimeSet",
-        "ruster-runtime",
+        "ruster_runtime",
     ] {
         assert!(!source.contains(forbidden), "forbidden source: {forbidden}");
     }
-    assert!(!exports.contains("    ActivePublication,"));
-    assert!(!exports.contains("    FullServiceRuntimeSet,"));
-    let manifest = include_str!("../Cargo.toml");
-    assert!(!manifest.contains("ruster-runtime"));
+    // The activation boundary (tick token, backend binding, !Debug/!Clone,
+    // storage borrow) is enforced by compile_fail doctests in activation.rs.
+    // The AGENTS.md fast-path bans cannot be expressed that way, so guard the
+    // non-comment activation source against them.
+    let activation_code: String = include_str!("../src/activation.rs")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for forbidden in ["Mutex<", "dyn PacketIo", "Box::leak", "into_raw", "unsafe"] {
+        assert!(
+            !activation_code.contains(forbidden),
+            "forbidden activation source: {forbidden}"
+        );
+    }
+    assert!(!exports.contains("FullServiceRuntimeSet,"));
 
     let candidate_start = source.find("pub struct ValidatedCandidate {").unwrap();
     let candidate_end = source[candidate_start..]
