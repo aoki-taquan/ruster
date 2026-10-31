@@ -681,7 +681,9 @@ fn interface_labels_are_restricted_to_a_conservative_charset() {
     let forged = r"wan device x -> name y\n  route - 0.0.0.0\u001b[31m";
     name(VALID.replace("name = \"wan\"", &format!("name = \"{forged}\"")));
     device(VALID.replace("device = \"eth1\"", &format!("device = \"{forged}\"")));
-    for bad in ["a b", r"a\tb", "a/b", "a:b", "\u{e9}", "a->b", r"a\u0000"] {
+    for bad in [
+        "a b", r"a\tb", "a/b", "a:b", "\u{e9}", "a->b", r"a\u0000", ".", "..", "-a", "-",
+    ] {
         name(VALID.replace("name = \"wan\"", &format!("name = \"{bad}\"")));
         device(VALID.replace("device = \"eth1\"", &format!("device = \"{bad}\"")));
     }

@@ -35,11 +35,11 @@ pub enum ValidationCode {
     TextTooLarge,
     EmptyInterfaceName,
     EmptyDeviceName,
-    /// An interface `name` is longer than [`MAX_INTERFACE_LABEL_BYTES`] or
-    /// uses a byte outside `[A-Za-z0-9._-]`.
+    /// An interface `name` is longer than [`MAX_INTERFACE_LABEL_BYTES`], uses
+    /// a byte outside `[A-Za-z0-9._-]`, is `.`/`..`, or starts with `-`.
     InvalidInterfaceName,
-    /// A `device` is longer than [`MAX_INTERFACE_LABEL_BYTES`] or uses a
-    /// byte outside `[A-Za-z0-9._-]`.
+    /// A `device` is longer than [`MAX_INTERFACE_LABEL_BYTES`], uses a byte
+    /// outside `[A-Za-z0-9._-]`, is `.`/`..`, or starts with `-`.
     InvalidDeviceName,
     DuplicateInterfaceId,
     DuplicateInterfaceName,
@@ -593,7 +593,8 @@ pub const MAX_INTERFACE_LABEL_BYTES: usize = 15;
 
 /// Interface labels are operator-facing text that later output prints
 /// verbatim, so they are restricted to a conservative charset with no
-/// whitespace, control, or separator characters.
+/// whitespace, control, or separator characters, and may not be `.`, `..`,
+/// or start with `-`.
 fn check_label(label: &str, code: ValidationCode, path: SourcePath) -> Result<(), ValidationError> {
     if label.len() > MAX_INTERFACE_LABEL_BYTES {
         return Err(ValidationError::bounded(
@@ -603,9 +604,13 @@ fn check_label(label: &str, code: ValidationCode, path: SourcePath) -> Result<()
             u64::try_from(label.len()).unwrap_or(u64::MAX),
         ));
     }
-    if !label
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    // `.` and `..` are rejected like Linux `dev_valid_name`; a leading `-`
+    // would read as a command-line option.
+    if matches!(label, "." | "..")
+        || label.starts_with('-')
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
         return Err(ValidationError::new(code, path));
     }

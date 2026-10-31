@@ -517,6 +517,8 @@ fn inherited_ignored_sigint_stays_ignored_and_sigterm_still_stops() {
     ]);
     let held = Held::spawn(command);
     held.signal("INT");
+    // Count only ticks received after the send.
+    while held.idle.try_recv().is_ok() {}
     // Still idling: had SIGINT been handled, at most one more idle tick
     // could follow and stdout would close.
     for _ in 0..3 {
