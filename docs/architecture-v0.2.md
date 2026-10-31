@@ -857,7 +857,7 @@ storage addressも変わりません。
 AP1-TXのprivate engineはfixed `IfId` tableからportをO(1)選択し、各portのproducer headだけを
 確認します。TX statusをAcquireで読む前にframeをreserveせず、unknown interface、宣言最大長超過、
 AVAILABLE以外、未知status、generation枯渇はpayloadをcopyせず拒否します。受理時だけdistinctな
-backend-owned TX mmap frameへ一度`copy_from_slice`し、`tp_next_offset=0`、
+backend-owned TX mmap frameへ一度だけcopy(AP2以降は`copy_nonoverlapping`)し、`tp_next_offset=0`、
 `tp_snaplen=tp_len=payload length`のV3 headerを構築してSEND_REQUESTをRelease publishします。
 固定metadataのownershipとchecked generationはframe再利用cycleを区別します。
 
@@ -911,11 +911,76 @@ chain link(packet offset、header bounds、next offset)のerrorはMAC/network of
 data rangeのerrorより先に返ります。例えばmac=80かつnext=148のdescriptorは、以前の
 `EthernetMacOffsetInvalid`ではなく`NextPacketOffsetNotAligned`になります。
 
-このsliceは`PacketIo` lease、RXからTXへのadapter接続、同一portでRX lease中にTXへcopyする
-split borrowとRX/TX engine統合(AP2)、poll、live stats/cleanupを実装しません。persistent halt時の
-escalation/port再初期化policyと`sll_pkttype` policyもdeferredです。AP1-TXのstatus pathは
-volatileとfenceのままで、`AtomicU32`化はfollow-upです。従ってIO-012のproduction conformance、
-実packet送受信、throughputは引き続きdeferredです。
+AP1-RXは`PacketIo` lease、RXからTXへのadapter接続、poll、live stats/cleanupを実装しません。
+persistent halt時のescalation/port再初期化policyと`sll_pkttype` policyもdeferredです。
+
+AP2はportごとのRX cursor/metadata、TX producer/completion state、combined mappingを同じ
+`PacketRingResources`に置き、全portを一つのprivate `AfPacketEngine`が所有します。engineは
+core `PacketIo`をcopy backendとして実装します。`receive`のbatchはengine全体を排他borrowし、
+各portのpersistent RX cursorをround-robinで進めます。packet budgetはbatch共通、RX status
+read/descriptor visit budgetはport単位、TX submit status read budgetはbatch共通です。
+次batchの開始portはpacket budgetを使い切ったportの次へ回ります。leaseはingress portの
+RX extent内にある検証済みpacketのzero-copy viewです。mappingは`PROT_READ|PROT_WRITE`の
+`MAP_SHARED`で、USER blockはTP_STATUS_KERNELを書き戻すまでuserspace所有なので、coreは
+`bytes_mut`でin-place rewriteできます。
+
+`commit(egress)`はO(1) IfId lookup、宣言最大長、TX status read budget、egress producer headの
+Acquire status、frame ownershipを先に検査し、拒否時はframeをreserveもcopyもしません。受理時だけ
+RX packetからegress portのTX frameへ一度`copy_nonoverlapping`し、SEND_REQUESTをRelease
+publishします。egressはingress自身でもよく(hairpin)、その後にRX packetをterminalにします。
+leaseはbatch経由でengineをborrowするため、lease中に他のleaseやport stateへのaccessは型上
+存在しません。core向け`&mut [u8]`は`bytes_mut(&mut self)`経由だけで、`complete(self)`が
+slotをconsumeするためcopy開始前に終わっています。copy sourceは`&[u8]`ではなくraw
+`(NonNull<u8>, len)`の`TxPayload`として`&mut` engine呼び出しへ渡すので、同一portのsharedと
+exclusive borrowを同時に作りません。sourceはingress RX extent、destinationはegress TX extent
+内と`ring_address`で証明済みで、同一mapping内ではchecked `CombinedRingExtents`がRXを
+`[0, rx_len)`、TXを`[rx_len, combined_len)`に固定し、port間はmappingが別なので、両rangeは
+重なりません。`recycle`/`consume`/abandonはTXに触れずRX packetを完了します。
+
+`finish`の`BatchCompletion`は、`tx_requested`を全Transmit、`tx_accepted`をfinish前に
+publishしたSEND_REQUEST(kick失敗でも降格しない)、`tx_rejected`をunknown egress、oversize、
+TX budget枯渇、ring full、fault-class reject(未知status、generation枯渇、mapping/ownership
+違反)、`recycled`をRecycle/Consume/LeaseAbandonedとして`invariants_hold`を常に満たします。
+検証faultのRX packetはleaseされないため`recycled`に入らずport `BackendStats`だけに計上し、
+`mem::forget`されたleaseは後続cursor stepが一度だけabandonとして確定します。`error`は
+batch中最初のbackend fault(新たに観測したport単位のRX halt、fault-class TX reject、最初の
+kick失敗)で、通常のrejectはerrorにしません。
+
+RX haltはedge-triggeredです。haltは、`BackendStats`へ一回だけ数える既存のsticky halt event
+identityを使い、そのeventを最初に観測したbatchでだけ`error`になります。同じ条件が続く間の
+後続batchはhalt中portをerrorなしでskipし、別のhalt、またはportが進捗した後の再発は新しい
+eventとして再度報告します。runtimeはfinish errorを`BackendIoFailure`として扱い、そのtickの
+generated ARP/ICMPを全portでskipするため、level-triggeredでは一つのhalt portが健全なportを
+無期限にstarveさせます。halt状態は`BackendStats`で引き続き観測でき、health報告とescalationは
+R15/AP3へdeferredです。
+
+`PacketIo`単体はTX completionを回収しません。受理frameを戻すのはengineのbounded
+`scan_completions`だけで、現在これを呼ぶのはtestだけです。従って各egress TX ringは
+`frame_count`回の受理で尽き、以降のcommitはring fullの通常rejectとして`error == None`の
+まま拒否されます。AP3がcompletion schedulingを追加するまでpublic constructorを公開しては
+なりません。`finish`とDropは受理portごとに`send(MSG_DONTWAIT)`を最大
+一回だけ試しretryしません。hot pathはheap allocation、lock、trait objectを使いません。
+
+IO-012の証跡として、reusable `ruster-io-conformance` RX-to-distinct-TX copy suiteを
+private static-dispatchの`ConformanceOps`(scripted mmap/kick)上の実engineで実行します。
+pass-through decoratorはscripted ring/syscall状態から、lease address、実TX ringの
+SEND_REQUEST遷移、frame header/payload、新規publish以外の全TX frameが全byte不変であること
+(reject時copyなしの独立証拠)、RX block statusのKERNEL化(各engine呼び出し後に全pending block
+を確認)、syscall logを観測し、報告したgenerationをengine metadataと照合します。per-block scan
+counter、RX/TX status read・descriptor counter、copy回数/byte数はtest専用`PortProbe`由来で、
+copy回数は新規publish frame数と、block return数はstatus wordと照合します。AF_PACKETはportごとにTX ringが一つなのでsuiteのqueue番号はring labelであり、
+FIFO producer/one-block RX ringのためpreferred frame/block指定は選択ではなくassertです
+(TX reuse caseはone-frame TX ringで実行)。RX work counterは全caseのingressであるLAN portの
+値です。TX storageを予約しtokenを付けてからrejectする前提の3 case(partial reject、finish
+error、rejected TX ABA)はAF_PACKETにreserve-then-reject経路が無いため非適用とします。
+rejected TX ABAが守る性質は、rejectがframeをreserveせずgenerationを進めないことから自明に
+成り立ち、AP1-TXの`tx_status_validation_precedes_reserve_and_rejected_packets_copy_nothing`、
+`settle()`のgeneration/metadata照合、上記byte不変checkで検証します。代わりにring full
+によるpartial reject、kick失敗のfinish errorとsingle kick、RX halt/TX faultのerror mapping、
+hairpin byte、round-robin、forget、steady allocation zeroをAF_PACKET固有testで検証します。
+poll統合、TX completionのscheduling、live stats/cleanup、public constructorはAP3、実NIC/netns
+E2Eと性能はR14以降へdeferredです。AP1-TXのstatus pathはvolatileとfenceのままで、RXの
+`AtomicU32`化とは共有helperを持たないためfollow-upです。
 
 `ruster-io-xdp`の最初のsliceは、native AF_XDP backendではなく、全targetでcompileできる
 pure-Rust ownership/ring modelです。socket、native ring、libxdp FFI、XDP program、core

@@ -47,6 +47,11 @@
 //!   completed as abandoned by the next cursor step that has packet budget,
 //!   because its borrow has necessarily ended by then.
 //!
+//! [`RxBatch`] and [`RxPacket`] drive one port directly. The AP2 PacketIo
+//! adapter (`sys::packet_io`) drives the same cursor through `rx_step` and
+//! `rx_complete`, with leases that borrow the whole engine instead of one
+//! port, so a packet can be copied into a TX frame of its own port.
+//!
 //! Persistent halts are not escalated (no port reinitialization) and the
 //! `sll_pkttype` of captured frames is not filtered here; both are deferred.
 //!
@@ -266,7 +271,7 @@ fn take_injected(counter: &mut usize, offset: usize, length: usize) -> Option<Ma
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Completion {
+pub(super) enum Completion {
     Released,
     Dropped,
     Abandoned,
@@ -318,7 +323,7 @@ impl RxCursor {
     }
 }
 
-enum Step {
+pub(super) enum Step {
     Continue,
     Stop(RxStop),
     Fault(RxFault),
@@ -344,7 +349,7 @@ impl<O: PacketOps> PacketRingResources<O> {
         self.rx_stats.snapshot()
     }
 
-    fn rx_step(&mut self, remaining: &mut RxBudget, report: &mut RxBatchReport) -> Step {
+    pub(super) fn rx_step(&mut self, remaining: &mut RxBudget, report: &mut RxBatchReport) -> Step {
         if remaining.packets == 0 {
             return Step::Stop(RxStop::PacketBudget);
         }
@@ -373,6 +378,8 @@ impl<O: PacketOps> PacketRingResources<O> {
         }
         remaining.block_status_reads -= 1;
         report.status_reads += 1;
+        #[cfg(test)]
+        self.probe.record(|counts| counts.rx_status_reads += 1);
         let block_index = self.rx_cursor.head;
         let block_start = match self.rx.block_range(block_index) {
             Ok(range) => range.start,
@@ -414,6 +421,8 @@ impl<O: PacketOps> PacketRingResources<O> {
         entry.generation = generation;
         self.rx_cursor.sticky = None;
         report.blocks_acquired += 1;
+        #[cfg(test)]
+        self.probe.record(|counts| counts.rx_blocks_acquired += 1);
         let token = RxBlockToken {
             block_index,
             generation,
@@ -457,6 +466,8 @@ impl<O: PacketOps> PacketRingResources<O> {
         }
         remaining.descriptor_visits -= 1;
         report.descriptor_visits += 1;
+        #[cfg(test)]
+        self.probe.record(|counts| counts.rx_descriptor_visits += 1);
         let is_last = index + 1 == block.packet_count;
         let (descriptor, status) = match self.rx_read_descriptor(block.block_start, offset, is_last)
         {
@@ -649,7 +660,7 @@ impl<O: PacketOps> PacketRingResources<O> {
 
     /// Marks the cursor's current packet terminal exactly once. Returns the
     /// block to the kernel when it was the final outstanding packet.
-    fn rx_complete(
+    pub(super) fn rx_complete(
         &mut self,
         token: RxPacketToken,
         kind: Completion,
@@ -733,6 +744,8 @@ impl<O: PacketOps> PacketRingResources<O> {
         }
         self.rx_advance(index);
         report.blocks_returned += 1;
+        #[cfg(test)]
+        self.probe.mark_rx_return();
         Ok(RxBlockReturn {
             block: block.token,
             packet_count: block.packet_count,
@@ -767,6 +780,8 @@ impl<O: PacketOps> PacketRingResources<O> {
         }
         self.rx_advance(block.block_index);
         report.blocks_returned += 1;
+        #[cfg(test)]
+        self.probe.mark_rx_return();
         Step::Fault(fault)
     }
 
@@ -788,7 +803,13 @@ impl<O: PacketOps> PacketRingResources<O> {
         Step::Halt(fault)
     }
 
-    fn rx_note_halt(&mut self, fault: RxFault) {
+    /// The halting fault already counted for the current condition, if any.
+    /// A halt equal to this value is a repeat of an event already reported.
+    pub(super) const fn rx_sticky_halt(&self) -> Option<RxFault> {
+        self.rx_cursor.sticky
+    }
+
+    pub(super) fn rx_note_halt(&mut self, fault: RxFault) {
         if self.rx_cursor.sticky != Some(fault) {
             self.rx_stats.record(fault.halt_stat());
             self.rx_cursor.sticky = Some(fault);
