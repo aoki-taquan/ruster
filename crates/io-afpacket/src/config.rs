@@ -331,6 +331,7 @@ pub struct ValidatedPort {
     tx: RingLayout,
     tx_map_offset: usize,
     combined_map_len: usize,
+    max_frame_len: usize,
 }
 
 impl ValidatedPort {
@@ -362,6 +363,13 @@ impl ValidatedPort {
     #[must_use]
     pub const fn combined_map_len(self) -> usize {
         self.combined_map_len
+    }
+
+    /// The configuration-wide maximum Ethernet frame this port's geometry was
+    /// validated against.
+    #[must_use]
+    pub const fn max_frame_len(self) -> usize {
+        self.max_frame_len
     }
 }
 
@@ -438,6 +446,7 @@ impl ValidatedConfig {
                 tx,
                 tx_map_offset: rx.map_len(),
                 combined_map_len,
+                max_frame_len,
             });
         }
         Ok(Self {

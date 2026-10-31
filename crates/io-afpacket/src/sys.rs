@@ -3,7 +3,7 @@ use std::{
     mem::{align_of, offset_of, size_of},
     os::fd::RawFd,
     ptr::NonNull,
-    sync::atomic::{fence, Ordering},
+    sync::atomic::{fence, AtomicU32, Ordering},
 };
 
 use ruster_core::IfId;
@@ -344,22 +344,20 @@ pub(crate) struct PacketRingResources<O: PacketOps = LinuxOps> {
     metadata: ColdRingMetadata,
     rx_cursor: rx::RxCursor,
     rx_stats: BackendStats,
+    #[cfg(test)]
+    rx_injection: rx::RxFaultInjection,
 }
 
 #[allow(dead_code)]
 impl PacketRingResources<LinuxOps> {
-    pub(crate) fn open(port: ValidatedPort, max_frame_len: usize) -> Result<Self, PlatformError> {
-        Self::open_with_ops(port, max_frame_len, LinuxOps)
+    pub(crate) fn open(port: ValidatedPort) -> Result<Self, PlatformError> {
+        Self::open_with_ops(port, LinuxOps)
     }
 }
 
 #[allow(dead_code)]
 impl<O: PacketOps> PacketRingResources<O> {
-    fn open_with_ops(
-        port: ValidatedPort,
-        max_frame_len: usize,
-        ops: O,
-    ) -> Result<Self, PlatformError> {
+    fn open_with_ops(port: ValidatedPort, ops: O) -> Result<Self, PlatformError> {
         let extents =
             CombinedRingExtents::for_port(port).map_err(PlatformError::InvalidCombinedMapping)?;
         // All fallible cold allocation happens before external resources are
@@ -389,12 +387,14 @@ impl<O: PacketOps> PacketRingResources<O> {
             mapping,
             socket,
             interface: port.interface(),
-            max_frame_len,
+            max_frame_len: port.max_frame_len(),
             rx: port.rx(),
             extents,
             metadata,
             rx_cursor: rx::RxCursor::new(),
             rx_stats: BackendStats::new(),
+            #[cfg(test)]
+            rx_injection: rx::RxFaultInjection::default(),
         })
     }
 
@@ -606,11 +606,7 @@ impl<O: PacketOps> TxEngine<O> {
                 entries,
             })?;
         for port in validated_ports.iter().copied() {
-            ports.push(PacketRingResources::open_with_ops(
-                port,
-                max_frame_len,
-                ops.clone(),
-            )?);
+            ports.push(PacketRingResources::open_with_ops(port, ops.clone())?);
         }
         Ok(Self {
             table,
@@ -1041,15 +1037,24 @@ impl<O: PacketOps> MmapRegion<O> {
         Ok(unsafe { std::ptr::read_volatile(address.cast::<u16>()) })
     }
 
+    // Ring status words are the kernel/userspace ownership handoff points, so
+    // they are accessed as `AtomicU32` with Acquire/Release ordering rather
+    // than as volatile accesses plus separate fences. Only the RX engine uses
+    // these helpers; the AP1-TX status path is unchanged (follow-up).
     fn ring_load_status_acquire(
         &self,
         extents: CombinedRingExtents,
         kind: RingKind,
         offset: usize,
     ) -> Result<u32, MappingAccessError> {
-        let status = self.ring_read_u32(extents, kind, offset)?;
-        fence(Ordering::Acquire);
-        Ok(status)
+        let address =
+            self.ring_address(extents, kind, offset, size_of::<u32>(), align_of::<u32>())?;
+        // SAFETY: ring_address proved a live 4-byte range inside the ring
+        // extent, aligned to `align_of::<u32>() == align_of::<AtomicU32>()`.
+        // The mapping outlives this call, and userspace never accesses a
+        // status word non-atomically while the engine runs.
+        let status = unsafe { AtomicU32::from_ptr(address.cast::<u32>()) };
+        Ok(status.load(Ordering::Acquire))
     }
 
     fn ring_store_status_release(
@@ -1061,11 +1066,10 @@ impl<O: PacketOps> MmapRegion<O> {
     ) -> Result<(), MappingAccessError> {
         let address =
             self.ring_address(extents, kind, offset, size_of::<u32>(), align_of::<u32>())?;
-        fence(Ordering::Release);
-        // SAFETY: ring_address proved a live, aligned 4-byte range inside the
-        // requested ring extent, and `&mut self` excludes any simultaneous
-        // userspace access through this mapping owner.
-        unsafe { std::ptr::write_volatile(address.cast::<u32>(), status) };
+        // SAFETY: as in ring_load_status_acquire; `&mut self` additionally
+        // excludes any simultaneous userspace access through this owner.
+        let word = unsafe { AtomicU32::from_ptr(address.cast::<u32>()) };
+        word.store(status, Ordering::Release);
         Ok(())
     }
 
@@ -1522,7 +1526,7 @@ mod tests {
         ] {
             let ops = ScriptedOps::new(Some(stage));
             assert!(matches!(
-                PacketRingResources::open_with_ops(port, 1_514, ops.clone()),
+                PacketRingResources::open_with_ops(port, ops.clone()),
                 Err(PlatformError::Syscall {
                     stage: failed,
                     errno: _
@@ -1554,7 +1558,7 @@ mod tests {
 
         let ops = ScriptedOps::new(None);
         let resources =
-            PacketRingResources::open_with_ops(port, 1_514, ops.clone()).expect("scripted open");
+            PacketRingResources::open_with_ops(port, ops.clone()).expect("scripted open");
         assert!(matches!(
             ops.calls().as_slice(),
             [

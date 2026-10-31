@@ -870,31 +870,51 @@ publishしたsubmissionをrejectへ巻き戻さずin-flightに残します。hot
 heap allocationしません。
 
 AP1-RXのprivate engineは、portごとにbatchから独立したpersistent cursorをresource側に持ちます。
-batchはpacket、block status read、descriptor visitの独立budgetで進み、packet budgetがzeroなら
-statusもdescriptorも読みません。head blockのstatusをAcquireで一度だけ読み、KERNELなら後続blockを
-skipせずring emptyとして止まります。USERなら固定per-block metadataのchecked nonzero generationを
-進めてblock headerを検証し、descriptorを一つずつchain linkに沿って検証します。検証進捗と
-per-packet data rangeは固定metadataへ保存するため、budgetで中断したbatchを捨てても次のbatchは
-正確に同じdescriptorから再開し、既検証descriptorを再走査しません。blockのpacketはchain全体の
-検証が終わるまで一つも公開しません。全readはRX extent内のchecked range、volatile accessです。
+batchはpacket、block status read、descriptor visitの独立budgetで進みます。packet budgetがzeroなら
+何もしません。新しいhead blockの観測にはstatus readとdescriptor visitの両方の残りが必要で、
+どちらかがzeroならstatus read、header検証、generation更新を一切行いません。head blockのstatusは
+`AtomicU32`のAcquire loadで一度だけ読み、KERNELなら後続blockをskipせずring emptyとして止まります。
+USERなら固定per-block metadataのchecked nonzero generationを進めてblock headerを検証し、
+descriptorを一つずつchain linkに沿って検証します。検証進捗とper-packet data rangeは固定metadataへ
+保存するため、budgetで中断したbatchを捨てても次のbatchは正確に同じdescriptorから再開し、既検証
+descriptorを再走査しません。blockのpacketはchain全体の検証が終わるまで一つも公開しません。
+status以外のdescriptor readはAcquire観測後のRX extent内checked range、volatile accessです。
 
 公開するpacketはmmap上のexact data rangeを指すzero-copy leaseで、portを排他的にborrowします。
-従ってleaseが生きている間はsibling leaseもblock returnも型上起こりません。release、drop、
-`mem::forget`後の次cursor stepのいずれでもpacketは一度だけterminalになり、最後のpacketが
-terminalになった時点でだけTP_STATUS_KERNELをRelease storeし、ring順に次blockへ進みます。
-古いgenerationやpacket indexのcompletionはstale tokenとして拒否します。
+従ってleaseが生きている間はsibling leaseもblock returnも型上起こりません。packetは明示release、
+drop(panic unwind中を含む)、`mem::forget`後にpacket budgetを持つ次のcursor stepのいずれかで
+一度だけterminalになり、最後のpacketがterminalになった時点でだけTP_STATUS_KERNELを`AtomicU32`の
+Release storeで返し、ring順に次blockへ進みます。古いgenerationやpacket indexのcompletionは、
+同じblockが新generationでDelivering中でもstale tokenとして拒否します。batch reportはeventが
+起きたbatchへ計上します。`released`は明示release、`dropped`はdrop、`abandoned_leaks`はforget
+されたleaseを後続batchが確定した数で、同じcompletionを二重に数えません。forgetされた最後の
+packetによるblock returnも確定したbatchへ計上します。
 
 malformed inputのrecovery policyはfail closedです。KERNELでもUSER bit付きでもないstatusと
 generation枯渇はkernel所有の可能性があるblockへ書かずcursorを保持してbatchをhaltします。
+同じ条件が続く間のhaltはpollごとではなくevent一回として`BackendStats`へ数えます。
 block header不正、またはdescriptor自身の配置/next linkが不安全なchainはUSER観測済みなので、
 どのpacketも公開せず、後続descriptorも読まずにblock全体を即kernelへ返します。linkが安全で
 MAC/network offset、snapshot、data range、truncation、宣言最大frame超過、kernelがcaptured bytes
 から外したVLAN offload tagのいずれかが不正なpacketだけを個別terminal faultにし、siblingは配送
-します。counterは既存の固定saturating `BackendStats`だけを使い、steady receive/releaseは
-heap allocationしません。
+します。検証済みblockをownership modelへ反映できない場合は内部不変条件違反として、blockを返さず
+cursorも動かさずにhaltします。block return storeの失敗ではpacketはterminalのまま残り、次stepが
+returnを再試行します。これらmapping失敗経路はchecked geometry上productionでは到達しないため、
+test専用のfault injection seamで検証します。counterは既存の固定saturating `BackendStats`だけを
+使い、正常、packet fault、block rejectのsteady経路はheap allocationしません。
+
+strict profileはGRO/LROの無効化を前提にします。GSO superframeはTruncatedまたはOversize faultとして
+dropされます。kernelがVLAN tagを外して渡したtagged frameも同様に拒否します。
+
+AP1-RXは`PacketDescriptor::validate`と`validate_v3_block_chain`のerror優先順位を変更しました。
+chain link(packet offset、header bounds、next offset)のerrorはMAC/network offset、snapshot、
+data rangeのerrorより先に返ります。例えばmac=80かつnext=148のdescriptorは、以前の
+`EthernetMacOffsetInvalid`ではなく`NextPacketOffsetNotAligned`になります。
 
 このsliceは`PacketIo` lease、RXからTXへのadapter接続、同一portでRX lease中にTXへcopyする
-split borrow、poll、live stats/cleanupを実装しません。従ってIO-012のproduction conformance、
+split borrowとRX/TX engine統合(AP2)、poll、live stats/cleanupを実装しません。persistent halt時の
+escalation/port再初期化policyと`sll_pkttype` policyもdeferredです。AP1-TXのstatus pathは
+volatileとfenceのままで、`AtomicU32`化はfollow-upです。従ってIO-012のproduction conformance、
 実packet送受信、throughputは引き続きdeferredです。
 
 `ruster-io-xdp`の最初のsliceは、native AF_XDP backendではなく、全targetでcompileできる

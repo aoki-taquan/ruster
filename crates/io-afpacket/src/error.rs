@@ -274,11 +274,6 @@ pub enum MappingAccessError {
         expected: usize,
         actual: usize,
     },
-    BlockNotUser {
-        status: u32,
-    },
-    PacketAlreadyBorrowed,
-    PacketNotBorrowed,
     Geometry(GeometryError),
     Ownership(OwnershipError),
 }

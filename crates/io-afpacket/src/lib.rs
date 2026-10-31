@@ -33,7 +33,9 @@
 //! per-packet storage for an internal budgeted RX cursor: malformed block
 //! headers and unsafe chains return the whole block unexposed, locally invalid
 //! or truncated packets become individual terminal faults, and unrecognized
-//! head status halts without writing the block. Neither engine exposes
+//! head status halts without writing the block. The strict profile requires
+//! GRO/LRO disabled (GSO superframes are dropped as truncated or oversize) and
+//! rejects frames whose VLAN tag the kernel removed. Neither engine exposes
 //! `PacketIo`, poll integration, or cleanup telemetry.
 
 #[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]

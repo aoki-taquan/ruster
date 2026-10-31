@@ -3,14 +3,15 @@ use std::{ffi::c_int, mem::ManuallyDrop, os::fd::RawFd, ptr::NonNull};
 use ruster_core::IfId;
 
 use super::{
-    RxBatchReport, RxBlockReturn, RxBlockToken, RxBudget, RxFault, RxNext, RxPacket, RxPacketToken,
-    RxReleaseError, RxStop,
+    Completion, RxBatchReport, RxBlockReturn, RxBlockToken, RxBudget, RxFault, RxNext, RxPacket,
+    RxPacketToken, RxReleaseError, RxStop,
 };
 use crate::{
     boundary::RxPacketFault,
     sys::{tests::allocation_count, PacketOps, PacketRingResources, SockaddrLl},
-    GeometryError, MappingAccessError, PlatformError, PortConfig, RingGeometry, SyscallStage,
-    ValidatedConfig, TP_STATUS_KERNEL, TP_STATUS_USER,
+    GeometryError, MappingAccessError, OwnershipError, PlatformError, PortConfig, RingGeometry,
+    RingKind, RxBlockModel, RxOwnership, SyscallStage, ValidatedConfig, TP_STATUS_KERNEL,
+    TP_STATUS_USER,
 };
 
 const BLOCK_SIZE: usize = 4_096;
@@ -110,7 +111,7 @@ impl Fixture {
         let base = NonNull::new(Box::into_raw(Box::new(Backing([0; COMBINED_LEN]))))
             .expect("boxed backing")
             .cast::<u8>();
-        let port = PacketRingResources::open_with_ops(port, MAX_FRAME, FixtureOps { base })
+        let port = PacketRingResources::open_with_ops(port, FixtureOps { base })
             .expect("fixture resources");
         Self {
             port: ManuallyDrop::new(port),
@@ -353,6 +354,7 @@ fn rx_validation_budget_persists_progress_and_zero_budgets_do_not_scan() {
     for (zero, stop) in [
         (budget(0, usize::MAX, usize::MAX), RxStop::PacketBudget),
         (budget(usize::MAX, 0, usize::MAX), RxStop::StatusBudget),
+        (budget(usize::MAX, usize::MAX, 0), RxStop::DescriptorBudget),
     ] {
         let mut batch = fixture.port.begin_rx(zero);
         assert!(batch.next().is_none());
@@ -397,11 +399,17 @@ fn rx_validation_budget_persists_progress_and_zero_budgets_do_not_scan() {
     }
     assert_eq!(markers, [1, 2, 3]);
     let report = batch.finish();
-    assert_eq!(report.status_reads, 1, "returned head observes next block");
+    assert_eq!(
+        report.status_reads, 0,
+        "exhausted descriptor budget observed a block"
+    );
     assert_eq!(report.descriptor_visits, 1);
     assert_eq!(report.leased, 3);
+    assert_eq!(report.dropped, 3);
+    assert_eq!(report.released, 0);
     assert_eq!(report.blocks_returned, 1);
-    assert_eq!(report.stop, Some(RxStop::RingEmpty));
+    assert_eq!(report.stop, Some(RxStop::DescriptorBudget));
+    assert_eq!(fixture.port.metadata.rx_blocks()[1].generation, 0);
 }
 
 #[test]
@@ -484,7 +492,9 @@ fn rx_live_lease_blocks_return_until_release_and_returns_exactly_once() {
         assert!(batch.next().is_none());
         let report = batch.finish();
         assert_eq!(report.leased, 2);
-        assert_eq!(report.released, 2);
+        assert_eq!(report.released, 1);
+        assert_eq!(report.dropped, 1);
+        assert_eq!(report.abandoned_leaks, 0);
         assert_eq!(report.blocks_returned, 1);
     }
     assert_eq!(raw_u8(base, FIRST_PACKET + 82), 0xee, "zero-copy mutation");
@@ -492,7 +502,9 @@ fn rx_live_lease_blocks_return_until_release_and_returns_exactly_once() {
     // The returned packet's token is stale: no second completion or return.
     let mut report = RxBatchReport::default();
     assert_eq!(
-        fixture.port.rx_complete(token(0, 1, 1), true, &mut report),
+        fixture
+            .port
+            .rx_complete(token(0, 1, 1), Completion::Released, &mut report),
         Err(RxReleaseError::Stale(token(0, 1, 1)))
     );
     assert_eq!(report, RxBatchReport::default());
@@ -506,7 +518,10 @@ fn rx_live_lease_blocks_return_until_release_and_returns_exactly_once() {
     assert_eq!(second.token(), token(1, 1, 1));
     assert!(second.release().expect("release").is_some());
     let report = batch.finish();
+    assert_eq!(report.leased, 2);
     assert_eq!(report.abandoned_leaks, 1);
+    assert_eq!(report.released, 1, "abandoned completion double-counted");
+    assert_eq!(report.dropped, 0);
     assert_eq!(report.blocks_returned, 1);
     assert_eq!(fixture.status(1), TP_STATUS_KERNEL);
 }
@@ -798,7 +813,7 @@ fn rx_invalid_status_and_generation_exhaustion_fail_closed_without_touching_bloc
     let mut fixture = Fixture::new();
     fixture.write_block(0, &[packet(&[1; 60])]);
     fixture.set_status(0, 0x2);
-    for _ in 0..2 {
+    for _ in 0..3 {
         let mut batch = fixture.port.begin_rx(UNLIMITED);
         assert_eq!(
             expect_fault(batch.next()),
@@ -813,6 +828,19 @@ fn rx_invalid_status_and_generation_exhaustion_fail_closed_without_touching_bloc
         assert_eq!(report.stop, Some(RxStop::Halted));
         assert_eq!(fixture.status(0), 0x2, "unowned block was written");
     }
+    // A persistent halt is one event, not one per poll; a different unknown
+    // status is a new event.
+    assert_eq!(fixture.port.rx_stats().status_rejected, 1);
+    fixture.set_status(0, 0x4);
+    let mut batch = fixture.port.begin_rx(UNLIMITED);
+    assert_eq!(
+        expect_fault(batch.next()),
+        RxFault::Status {
+            block_index: 0,
+            status: 0x4,
+        }
+    );
+    drop(batch);
     assert_eq!(fixture.port.rx_stats().status_rejected, 2);
     assert_eq!(fixture.port.metadata.rx_blocks()[0].generation, 0);
 
@@ -830,6 +858,7 @@ fn rx_invalid_status_and_generation_exhaustion_fail_closed_without_touching_bloc
         TP_STATUS_USER,
         "exhausted block was returned"
     );
+    assert_eq!(fixture.port.rx_stats().ownership_rejected, 1);
 
     fixture.port.metadata.rx_blocks_mut()[0].generation = u64::MAX - 1;
     let mut batch = fixture.port.begin_rx(UNLIMITED);
@@ -844,20 +873,381 @@ fn rx_steady_receive_release_has_zero_allocations() {
     let mut fixture = Fixture::new();
     let payload = [0x42; 128];
     let packets = [packet(&payload), packet(&payload)];
+    let mut truncated = packet(&payload);
+    truncated.wire_len = Some(1_500);
+    let faulted = [truncated, packet(&payload)];
     let before = allocation_count();
     let mut digest = 0_usize;
     for iteration in 0..10_000 {
-        fixture.write_block(iteration % BLOCKS, &packets);
-        let mut batch = fixture.port.begin_rx(UNLIMITED);
-        let first = expect_packet(batch.next());
-        digest ^= usize::from(first.bytes()[0]);
-        assert_eq!(first.release().expect("first"), None);
-        let second = expect_packet(batch.next());
-        digest ^= second.len();
-        assert!(second.release().expect("second").is_some());
-        assert!(batch.next().is_none());
-        assert_eq!(batch.finish().blocks_returned, 1);
+        let block = iteration % BLOCKS;
+        match iteration % 3 {
+            0 => {
+                fixture.write_block(block, &packets);
+                let mut batch = fixture.port.begin_rx(UNLIMITED);
+                let first = expect_packet(batch.next());
+                digest ^= usize::from(first.bytes()[0]);
+                assert_eq!(first.release().expect("first"), None);
+                let second = expect_packet(batch.next());
+                digest ^= second.len();
+                assert!(second.release().expect("second").is_some());
+                assert!(batch.next().is_none());
+                assert_eq!(batch.finish().blocks_returned, 1);
+            }
+            1 => {
+                fixture.write_block(block, &faulted);
+                let mut batch = fixture.port.begin_rx(UNLIMITED);
+                assert!(matches!(
+                    expect_fault(batch.next()),
+                    RxFault::Packet { returned: None, .. }
+                ));
+                drop(expect_packet(batch.next()));
+                assert!(batch.next().is_none());
+                assert_eq!(batch.finish().blocks_returned, 1);
+            }
+            _ => {
+                fixture.write_block(block, &packets);
+                fixture.write_u32(block * BLOCK_SIZE, 1);
+                let mut batch = fixture.port.begin_rx(UNLIMITED);
+                assert!(matches!(
+                    expect_fault(batch.next()),
+                    RxFault::Block {
+                        return_error: None,
+                        ..
+                    }
+                ));
+                assert!(batch.next().is_none());
+                assert_eq!(batch.finish().blocks_returned, 1);
+            }
+        }
     }
     std::hint::black_box(digest);
     assert_eq!(allocation_count(), before);
+}
+
+#[test]
+fn rx_old_generation_token_is_stale_while_reused_block_is_delivering() {
+    let mut fixture = Fixture::new();
+    for block in 0..BLOCKS {
+        fixture.write_block(block, &[packet(&[1; 60]), packet(&[2; 60])]);
+    }
+    {
+        let mut batch = fixture.port.begin_rx(UNLIMITED);
+        while let Some(next) = batch.next() {
+            drop(expect_packet(Some(next)));
+        }
+        assert_eq!(batch.finish().blocks_returned, BLOCKS);
+    }
+    fixture.write_block(0, &[packet(&[3; 60]), packet(&[4; 60])]);
+    {
+        let mut batch = fixture.port.begin_rx(budget(1, usize::MAX, usize::MAX));
+        let first = expect_packet(batch.next());
+        assert_eq!(first.token(), token(0, 2, 0));
+        assert_eq!(first.release().expect("first"), None);
+    }
+    let mut report = RxBatchReport::default();
+    for (stale, kind) in [
+        (token(0, 1, 1), Completion::Fault),
+        (token(0, 1, 1), Completion::Released),
+        (token(0, 1, 0), Completion::Fault),
+        (token(0, 2, 0), Completion::Fault),
+    ] {
+        assert_eq!(
+            fixture.port.rx_complete(stale, kind, &mut report),
+            Err(RxReleaseError::Stale(stale))
+        );
+    }
+    {
+        // Lent packet of the new generation: an old-generation release of
+        // the same index is still stale.
+        let mut batch = fixture.port.begin_rx(budget(1, usize::MAX, usize::MAX));
+        std::mem::forget(expect_packet(batch.next()));
+    }
+    for kind in [
+        Completion::Released,
+        Completion::Dropped,
+        Completion::Abandoned,
+    ] {
+        assert_eq!(
+            fixture.port.rx_complete(token(0, 1, 1), kind, &mut report),
+            Err(RxReleaseError::Stale(token(0, 1, 1)))
+        );
+    }
+    assert_eq!(report, RxBatchReport::default());
+    assert_eq!(fixture.status(0), TP_STATUS_USER);
+    assert_eq!(
+        fixture.port.metadata.rx_blocks()[0].ownership.remaining(),
+        1
+    );
+    assert_eq!(
+        fixture
+            .port
+            .rx_complete(token(0, 2, 1), Completion::Abandoned, &mut report),
+        Ok(Some(RxBlockReturn {
+            block: RxBlockToken {
+                block_index: 0,
+                generation: 2,
+            },
+            packet_count: 2,
+        }))
+    );
+    assert_eq!(fixture.status(0), TP_STATUS_KERNEL);
+}
+
+#[test]
+fn rx_forgotten_leases_finalize_in_a_later_batch_with_packet_budget() {
+    let mut fixture = Fixture::new();
+    fixture.write_block(0, &[packet(&[1; 60]), packet(&[2; 60])]);
+    let one = budget(1, usize::MAX, usize::MAX);
+    let mut batch = fixture.port.begin_rx(one);
+    std::mem::forget(expect_packet(batch.next()));
+    assert!(batch.next().is_none());
+    let first = batch.finish();
+    assert_eq!((first.leased, first.abandoned_leaks), (1, 0));
+    assert_eq!(first.stop, Some(RxStop::PacketBudget));
+
+    // A zero packet budget neither scans nor finalizes the leaked lease.
+    let mut batch = fixture.port.begin_rx(budget(0, usize::MAX, usize::MAX));
+    assert!(batch.next().is_none());
+    assert_eq!(batch.finish().abandoned_leaks, 0);
+    assert_eq!(fixture.status(0), TP_STATUS_USER);
+
+    let mut batch = fixture.port.begin_rx(one);
+    let last = expect_packet(batch.next());
+    assert_eq!(last.token(), token(0, 1, 1));
+    std::mem::forget(last);
+    assert!(batch.next().is_none());
+    let second = batch.finish();
+    assert_eq!(
+        (
+            second.leased,
+            second.abandoned_leaks,
+            second.blocks_returned
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(
+        fixture.status(0),
+        TP_STATUS_USER,
+        "forgotten last packet returned"
+    );
+
+    let mut batch = fixture.port.begin_rx(budget(0, usize::MAX, usize::MAX));
+    assert!(batch.next().is_none());
+    drop(batch);
+    assert_eq!(fixture.status(0), TP_STATUS_USER);
+
+    let mut batch = fixture.port.begin_rx(one);
+    assert!(batch.next().is_none());
+    let third = batch.finish();
+    assert_eq!(
+        third,
+        RxBatchReport {
+            status_reads: 1,
+            abandoned_leaks: 1,
+            blocks_returned: 1,
+            stop: Some(RxStop::RingEmpty),
+            ..RxBatchReport::default()
+        }
+    );
+    assert_eq!(fixture.status(0), TP_STATUS_KERNEL);
+}
+
+#[test]
+fn rx_lease_dropped_during_unwind_completes_once() {
+    let mut fixture = Fixture::new();
+    fixture.write_block(0, &[packet(&[1; 60])]);
+    let base = fixture.base;
+    let port = &mut *fixture.port;
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut batch = port.begin_rx(UNLIMITED);
+        let packet = expect_packet(batch.next());
+        assert_eq!(raw_u32(base, 8), TP_STATUS_USER);
+        std::hint::black_box(&packet);
+        std::panic::resume_unwind(Box::new("unwind with a live lease"));
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(fixture.status(0), TP_STATUS_KERNEL);
+    let mut batch = fixture.port.begin_rx(UNLIMITED);
+    assert!(batch.next().is_none());
+    assert_eq!(
+        batch.finish(),
+        RxBatchReport {
+            status_reads: 1,
+            stop: Some(RxStop::RingEmpty),
+            ..RxBatchReport::default()
+        }
+    );
+    assert_eq!(
+        fixture.port.metadata.rx_blocks()[0].ownership.owner(),
+        RxOwnership::Kernel
+    );
+    assert_eq!(fixture.port.rx_stats().ownership_rejected, 0);
+}
+
+#[test]
+fn rx_acquire_invariant_failure_halts_without_returning_block() {
+    let mut fixture = Fixture::new();
+    fixture.write_block(0, &[packet(&[1; 60]), packet(&[2; 60])]);
+    fixture.port.metadata.rx_blocks_mut()[0]
+        .ownership
+        .acquire(1)
+        .expect("desynchronize model");
+    let expected = RxFault::Acquire {
+        block: RxBlockToken {
+            block_index: 0,
+            generation: 1,
+        },
+        error: OwnershipError::RxAcquireWhileOwned {
+            owner: RxOwnership::User,
+        },
+    };
+    let mut reports = Vec::new();
+    for _ in 0..2 {
+        let mut batch = fixture.port.begin_rx(UNLIMITED);
+        assert_eq!(expect_fault(batch.next()), expected);
+        assert!(batch.next().is_none());
+        reports.push(batch.finish());
+        assert_eq!(
+            fixture.status(0),
+            TP_STATUS_USER,
+            "block returned on invariant failure"
+        );
+    }
+    assert_eq!(reports[0].descriptor_visits, 2);
+    assert_eq!(
+        reports[1].descriptor_visits, 1,
+        "only the final descriptor is retried"
+    );
+    assert_eq!(reports[1].status_reads, 0);
+    let stats = fixture.port.rx_stats();
+    assert_eq!(stats.ownership_rejected, 1);
+    assert_eq!(stats.geometry_rejected, 0);
+
+    fixture.port.metadata.rx_blocks_mut()[0].ownership = RxBlockModel::new();
+    let mut batch = fixture.port.begin_rx(UNLIMITED);
+    assert_eq!(expect_packet(batch.next()).token(), token(0, 1, 0));
+    assert_eq!(expect_packet(batch.next()).token(), token(0, 1, 1));
+    assert!(batch.next().is_none());
+    drop(batch);
+    assert_eq!(fixture.status(0), TP_STATUS_KERNEL);
+}
+
+fn injected(offset: usize, length: usize) -> MappingAccessError {
+    MappingAccessError::RingOffsetOutOfBounds {
+        kind: RingKind::Rx,
+        offset,
+        length,
+    }
+}
+
+#[test]
+fn rx_injected_mapping_failures_halt_retry_and_count_once() {
+    // Head status load failure: halts untouched, counted once per event.
+    let mut fixture = Fixture::new();
+    fixture.write_block(0, &[packet(&[1; 60])]);
+    fixture.port.rx_injection.status_loads = 2;
+    for _ in 0..2 {
+        let mut batch = fixture.port.begin_rx(UNLIMITED);
+        assert_eq!(
+            expect_fault(batch.next()),
+            RxFault::Mapping {
+                block_index: 0,
+                error: injected(8, 4),
+            }
+        );
+        assert!(batch.next().is_none());
+    }
+    assert_eq!(fixture.port.rx_stats().mmap_errors, 1);
+    assert_eq!(fixture.port.metadata.rx_blocks()[0].generation, 0);
+
+    // Data address failure: only that packet faults.
+    fixture.write_block(0, &[packet(&[1; 60]), packet(&[2; 60])]);
+    fixture.port.rx_injection.data_addresses = 1;
+    let mut batch = fixture.port.begin_rx(UNLIMITED);
+    assert_eq!(
+        expect_fault(batch.next()),
+        RxFault::Packet {
+            token: token(0, 1, 0),
+            fault: RxPacketFault::Mapping(injected(FIRST_PACKET + 82, 60)),
+            returned: None,
+        }
+    );
+    assert_eq!(expect_packet(batch.next()).bytes()[0], 2);
+    assert!(batch.next().is_none());
+    drop(batch);
+    assert_eq!(fixture.status(0), TP_STATUS_KERNEL);
+    assert_eq!(fixture.port.rx_stats().descriptor_rejected, 1);
+
+    // Return-store failure: the release reports it, every packet stays
+    // terminal, the next step retries and halts while it keeps failing, and
+    // the block returns exactly once when the store succeeds.
+    fixture.write_block(1, &[packet(&[3; 60])]);
+    fixture.port.rx_injection.status_stores = 2;
+    let store_error = injected(BLOCK_SIZE + 8, 4);
+    let mut batch = fixture.port.begin_rx(UNLIMITED);
+    let packet_lease = expect_packet(batch.next());
+    assert_eq!(
+        packet_lease.release(),
+        Err(RxReleaseError::Mapping(store_error))
+    );
+    assert_eq!(
+        expect_fault(batch.next()),
+        RxFault::Release(RxReleaseError::Mapping(store_error))
+    );
+    assert!(batch.next().is_none());
+    let report = batch.finish();
+    assert_eq!((report.released, report.blocks_returned), (1, 0));
+    assert_eq!(fixture.status(1), TP_STATUS_USER);
+    assert_eq!(fixture.port.rx_stats().mmap_errors, 2);
+    let mut batch = fixture.port.begin_rx(UNLIMITED);
+    assert!(batch.next().is_none());
+    let report = batch.finish();
+    assert_eq!(
+        (report.blocks_returned, report.released, report.stop),
+        (1, 0, Some(RxStop::RingEmpty))
+    );
+    assert_eq!(fixture.status(1), TP_STATUS_KERNEL);
+    assert_eq!(fixture.port.rx_stats().mmap_errors, 2);
+
+    // Reject-store failure: the malformed block is not advanced past; the
+    // next observation (new generation) returns it.
+    fixture.write_block(2, &[packet(&[4; 60])]);
+    fixture.write_u32(2 * BLOCK_SIZE, 1);
+    fixture.port.rx_injection.status_stores = 1;
+    let mut batch = fixture.port.begin_rx(UNLIMITED);
+    assert_eq!(
+        expect_fault(batch.next()),
+        RxFault::Block {
+            block: RxBlockToken {
+                block_index: 2,
+                generation: 1,
+            },
+            packet_index: None,
+            error: MappingAccessError::Geometry(GeometryError::UnsupportedBlockVersion {
+                version: 1
+            }),
+            return_error: Some(injected(2 * BLOCK_SIZE + 8, 4)),
+        }
+    );
+    assert!(batch.next().is_none());
+    drop(batch);
+    assert_eq!(fixture.status(2), TP_STATUS_USER);
+    let mut batch = fixture.port.begin_rx(UNLIMITED);
+    assert!(matches!(
+        expect_fault(batch.next()),
+        RxFault::Block {
+            block: RxBlockToken {
+                block_index: 2,
+                generation: 2,
+            },
+            return_error: None,
+            ..
+        }
+    ));
+    drop(batch);
+    assert_eq!(fixture.status(2), TP_STATUS_KERNEL);
+    let stats = fixture.port.rx_stats();
+    assert_eq!(stats.mmap_errors, 3);
+    assert_eq!(stats.geometry_rejected, 2);
+    assert_eq!(stats.ownership_rejected, 0);
 }
