@@ -8,8 +8,11 @@
 //! nonblocking endpoint kicks. Its private AP1 RX engine keeps a persistent
 //! block cursor, validates each USER block chain before exposing any packet,
 //! lends zero-copy packet views, and returns each block exactly once after its
-//! last packet is terminal. It does not yet implement
-//! [`ruster_core::PacketIo`] or expose a live adapter.
+//! last packet is terminal. AP2 unifies both directions of every port in one
+//! private engine that implements [`ruster_core::PacketIo`] as a copy
+//! backend: leases borrow RX bytes in place, and `commit` copies them exactly
+//! once into a TX frame of any port, including the ingress port. No public
+//! constructor or live adapter is exposed yet.
 //!
 //! The safe model is available on every target. Raw Linux UAPI access is
 //! confined to `sys`; [`AfPacketPlatform::ensure_supported`] returns
@@ -35,8 +38,10 @@
 //! or truncated packets become individual terminal faults, and unrecognized
 //! head status halts without writing the block. The strict profile requires
 //! GRO/LRO disabled (GSO superframes are dropped as truncated or oversize) and
-//! rejects frames whose VLAN tag the kernel removed. Neither engine exposes
-//! `PacketIo`, poll integration, or cleanup telemetry.
+//! rejects frames whose VLAN tag the kernel removed. The AP2 engine is
+//! exercised by the reusable `ruster-io-conformance` copy suite over scripted
+//! syscalls; poll integration, cleanup telemetry, and real-NIC evidence are
+//! still deferred.
 
 #[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
 compile_error!("ruster-io-afpacket currently supports only 64-bit Linux targets");
