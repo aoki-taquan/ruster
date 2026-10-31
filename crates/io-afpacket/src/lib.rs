@@ -5,7 +5,10 @@
 //! lookup, ring geometry, descriptor bounds, ownership state, and the Linux
 //! syscall/mmap boundary needed by the future AF_PACKET backend. Its private
 //! AP1 TX engine publishes fixed frames, scans FIFO completions, and batches
-//! nonblocking endpoint kicks. It does not yet implement
+//! nonblocking endpoint kicks. Its private AP1 RX engine keeps a persistent
+//! block cursor, validates each USER block chain before exposing any packet,
+//! lends zero-copy packet views, and returns each block exactly once after its
+//! last packet is terminal. It does not yet implement
 //! [`ruster_core::PacketIo`] or expose a live adapter.
 //!
 //! The safe model is available on every target. Raw Linux UAPI access is
@@ -26,8 +29,14 @@
 //! its validated `sockaddr_ll` is bound. Backend counters are fixed accumulators
 //! only. AP1-0 additionally fixes disjoint RX/TX extents within the combined
 //! mapping and cold-preallocates fixed metadata. AP1-TX uses that storage for
-//! an internal producer/completion/kick engine without exposing `PacketIo`,
-//! an RX path, poll integration, or cleanup telemetry.
+//! an internal producer/completion/kick engine. AP1-RX uses the per-block and
+//! per-packet storage for an internal budgeted RX cursor: malformed block
+//! headers and unsafe chains return the whole block unexposed, locally invalid
+//! or truncated packets become individual terminal faults, and unrecognized
+//! head status halts without writing the block. The strict profile requires
+//! GRO/LRO disabled (GSO superframes are dropped as truncated or oversize) and
+//! rejects frames whose VLAN tag the kernel removed. Neither engine exposes
+//! `PacketIo`, poll integration, or cleanup telemetry.
 
 #[cfg(all(target_os = "linux", not(target_pointer_width = "64")))]
 compile_error!("ruster-io-afpacket currently supports only 64-bit Linux targets");

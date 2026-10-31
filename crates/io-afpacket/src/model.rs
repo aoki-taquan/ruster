@@ -85,25 +85,8 @@ pub struct PacketDescriptor {
 
 impl PacketDescriptor {
     pub fn validate(self, block_len: usize) -> Result<ValidatedPacket, GeometryError> {
-        if !self.packet_offset.is_multiple_of(TPACKET_V3_ALIGNMENT) {
-            return Err(GeometryError::PacketOffsetNotAligned {
-                offset: self.packet_offset,
-            });
-        }
-        if self.packet_offset < TPACKET_BLOCK_HEADER_LEN {
-            return Err(GeometryError::PacketHeaderOutOfBounds {
-                offset: self.packet_offset,
-            });
-        }
-        let header_end = self
-            .packet_offset
-            .checked_add(TPACKET_V3_HEADER_LEN)
-            .ok_or(GeometryError::ArithmeticOverflow)?;
-        if header_end > block_len {
-            return Err(GeometryError::PacketHeaderOutOfBounds {
-                offset: self.packet_offset,
-            });
-        }
+        let next_packet_offset = self.validate_link(block_len)?;
+        let header_end = self.packet_offset + TPACKET_V3_HEADER_LEN;
         if self.mac_offset < TPACKET_V3_HDRLEN {
             return Err(GeometryError::MacOffsetBeforeHeader {
                 mac_offset: self.mac_offset,
@@ -138,44 +121,9 @@ impl PacketDescriptor {
                 length: self.snap_len,
             });
         }
-
-        let next_packet_offset = if self.next_offset == 0 {
-            if self.is_last {
-                None
-            } else {
-                return Err(GeometryError::MissingNextPacketOffset);
-            }
-        } else {
-            if self.is_last {
-                return Err(GeometryError::TerminalPacketHasNextOffset {
-                    offset: self.next_offset,
-                });
-            }
-            if !self.next_offset.is_multiple_of(TPACKET_V3_ALIGNMENT) {
-                return Err(GeometryError::NextPacketOffsetNotAligned {
-                    offset: self.next_offset,
-                });
-            }
-            if self.next_offset < TPACKET_V3_HEADER_LEN {
-                return Err(GeometryError::NextPacketOffsetTooSmall {
-                    offset: self.next_offset,
-                });
-            }
-            let next = self
-                .packet_offset
-                .checked_add(self.next_offset)
-                .ok_or(GeometryError::ArithmeticOverflow)?;
-            let next_header_end = next
-                .checked_add(TPACKET_V3_HEADER_LEN)
-                .ok_or(GeometryError::ArithmeticOverflow)?;
-            if next_header_end > block_len {
-                return Err(GeometryError::PacketHeaderOutOfBounds { offset: next });
-            }
-            if data_end > next {
-                return Err(GeometryError::PacketCrossesNextOffset);
-            }
-            Some(next)
-        };
+        if next_packet_offset.is_some_and(|next| data_end > next) {
+            return Err(GeometryError::PacketCrossesNextOffset);
+        }
 
         Ok(ValidatedPacket {
             header: self.packet_offset..header_end,
@@ -183,6 +131,68 @@ impl PacketDescriptor {
             next_packet_offset,
             truncated: self.snap_len < self.wire_len,
         })
+    }
+
+    /// Validates only the fields that decide whether the block chain can be
+    /// walked safely: this header's placement and the checked next link.
+    ///
+    /// Success means the next header (if any) lies wholly inside `block_len`
+    /// even when this packet's own MAC/network offsets or lengths are invalid.
+    /// [`Self::validate`] performs this check first, so any error it returns
+    /// after `validate_link` succeeded is local to this packet.
+    pub(crate) fn validate_link(self, block_len: usize) -> Result<Option<usize>, GeometryError> {
+        if !self.packet_offset.is_multiple_of(TPACKET_V3_ALIGNMENT) {
+            return Err(GeometryError::PacketOffsetNotAligned {
+                offset: self.packet_offset,
+            });
+        }
+        if self.packet_offset < TPACKET_BLOCK_HEADER_LEN {
+            return Err(GeometryError::PacketHeaderOutOfBounds {
+                offset: self.packet_offset,
+            });
+        }
+        let header_end = self
+            .packet_offset
+            .checked_add(TPACKET_V3_HEADER_LEN)
+            .ok_or(GeometryError::ArithmeticOverflow)?;
+        if header_end > block_len {
+            return Err(GeometryError::PacketHeaderOutOfBounds {
+                offset: self.packet_offset,
+            });
+        }
+        if self.next_offset == 0 {
+            return if self.is_last {
+                Ok(None)
+            } else {
+                Err(GeometryError::MissingNextPacketOffset)
+            };
+        }
+        if self.is_last {
+            return Err(GeometryError::TerminalPacketHasNextOffset {
+                offset: self.next_offset,
+            });
+        }
+        if !self.next_offset.is_multiple_of(TPACKET_V3_ALIGNMENT) {
+            return Err(GeometryError::NextPacketOffsetNotAligned {
+                offset: self.next_offset,
+            });
+        }
+        if self.next_offset < TPACKET_V3_HEADER_LEN {
+            return Err(GeometryError::NextPacketOffsetTooSmall {
+                offset: self.next_offset,
+            });
+        }
+        let next = self
+            .packet_offset
+            .checked_add(self.next_offset)
+            .ok_or(GeometryError::ArithmeticOverflow)?;
+        let next_header_end = next
+            .checked_add(TPACKET_V3_HEADER_LEN)
+            .ok_or(GeometryError::ArithmeticOverflow)?;
+        if next_header_end > block_len {
+            return Err(GeometryError::PacketHeaderOutOfBounds { offset: next });
+        }
+        Ok(Some(next))
     }
 }
 
@@ -462,5 +472,71 @@ impl TxFrameModel {
         }
         self.owner = to;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PacketDescriptor;
+    use crate::GeometryError;
+
+    fn descriptor() -> PacketDescriptor {
+        PacketDescriptor {
+            packet_offset: 64,
+            next_offset: 144,
+            mac_offset: 82,
+            net_offset: 96,
+            snap_len: 60,
+            wire_len: 60,
+            is_last: false,
+        }
+    }
+
+    #[test]
+    fn link_validation_separates_unsafe_chains_from_local_packet_faults() {
+        assert_eq!(descriptor().validate_link(4_096), Ok(Some(208)));
+
+        // A locally invalid packet with a safe link: only `validate` fails.
+        let mut local = descriptor();
+        local.mac_offset = 80;
+        assert_eq!(local.validate_link(4_096), Ok(Some(208)));
+        assert_eq!(
+            local.validate(4_096),
+            Err(GeometryError::EthernetMacOffsetInvalid { mac_offset: 80 })
+        );
+        let mut crossing = descriptor();
+        crossing.snap_len = 63;
+        crossing.wire_len = 63;
+        assert_eq!(crossing.validate_link(4_096), Ok(Some(208)));
+        assert_eq!(
+            crossing.validate(4_096),
+            Err(GeometryError::PacketCrossesNextOffset)
+        );
+
+        // An unsafe link is reported before any local fault.
+        let mut both = local;
+        both.next_offset = 148;
+        assert_eq!(
+            both.validate_link(4_096),
+            Err(GeometryError::NextPacketOffsetNotAligned { offset: 148 })
+        );
+        assert_eq!(
+            both.validate(4_096),
+            Err(GeometryError::NextPacketOffsetNotAligned { offset: 148 })
+        );
+        let mut beyond = descriptor();
+        beyond.next_offset = 4_000;
+        assert_eq!(
+            beyond.validate_link(4_096),
+            Err(GeometryError::PacketHeaderOutOfBounds { offset: 4_064 })
+        );
+        let mut terminal = descriptor();
+        terminal.is_last = true;
+        assert_eq!(
+            terminal.validate_link(4_096),
+            Err(GeometryError::TerminalPacketHasNextOffset { offset: 144 })
+        );
+        terminal.next_offset = 0;
+        assert_eq!(terminal.validate_link(4_096), Ok(None));
     }
 }
