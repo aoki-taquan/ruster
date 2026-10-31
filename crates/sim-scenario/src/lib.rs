@@ -7,6 +7,16 @@
 //! described with typed cold-side builders or raw hex and are built to exact
 //! bytes while parsing, so the same input always yields the same model.
 //!
+//! Notes on the format:
+//!
+//! - `seed` is a TOML integer, so its range is `0..=i64::MAX`.
+//! - IPv4 `df` defaults to `true`; `ttl` to 64; other header fields to 0.
+//! - Hex strings may contain ASCII whitespace only between whole octets.
+//! - Config paths are relative to the scenario directory; `.` segments are
+//!   stripped and root, `..`, `\`, and `:` are rejected.
+//! - Typed frames accept `pad-to-min = true` for zero padding to 60 bytes.
+//! - `expect.tx` matches bytes exactly; see [`Expectation::tx`].
+//!
 //! This crate only parses and validates. It opens no file, reads no clock,
 //! and executes nothing; the driver evaluates the model.
 //!
@@ -41,11 +51,11 @@ mod parse;
 pub use error::{PathSegment, ScenarioError, ScenarioErrorCode};
 pub use frame::{
     ArpOperation, ArpSpec, EthernetSpec, Frame, FrameBuildError, FrameKind, FrameSpec,
-    IcmpEchoKind, Ipv4Spec, TcpFlags, MAX_FRAGMENT_OFFSET, MAX_FRAME_LEN,
+    IcmpEchoKind, Ipv4Spec, TcpFlags, ETHERNET_MIN_FRAME_LEN, MAX_FRAGMENT_OFFSET, MAX_FRAME_LEN,
 };
 pub use model::{
-    ApplyOutcome, Expectation, ExpectedTx, InterfaceName, Scenario, ScenarioPath, ScenarioSeed,
-    Step,
+    ApplyOutcome, Expectation, ExpectedTx, InterfaceName, RejectReason, Scenario, ScenarioPath,
+    ScenarioSeed, Step,
 };
 pub use parse::{
     parse_scenario, MAX_EXPECTED_TX, MAX_INTERFACE_NAME_BYTES, MAX_PATH_BYTES, MAX_SCENARIO_BYTES,

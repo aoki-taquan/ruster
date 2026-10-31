@@ -123,6 +123,7 @@ name = "ruster-sim-scenario"
 version = "0.2.0"
 dependencies = [
  "ruster-core",
+ "ruster-io-sim",
  "serde",
  "serde_path_to_error",
  "toml",

@@ -38,6 +38,7 @@ pub enum ScenarioErrorCode {
     EmptyExpectation,
     ZeroGeneration,
     HoldNotLast,
+    ReasonWithoutRejection,
 }
 
 /// One value-free component of a scenario source path.

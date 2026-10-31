@@ -1,6 +1,6 @@
 //! Cold-side typed frame builders producing exact wire bytes.
 //!
-//! Builders never pad to the Ethernet minimum, never add IPv4 or TCP options,
+//! Builders pad to the Ethernet minimum only on request, never add IPv4 or TCP options,
 //! and always compute IPv4 header, ICMPv4, UDP, and TCP checksums unless a
 //! spec explicitly asks for UDP checksum zero (RFC 768 "no checksum").
 
@@ -10,6 +10,8 @@ use ruster_core::{internet_checksum, MacAddress, ARP_ETHERTYPE, IPV4_ETHERTYPE};
 
 /// Largest frame a scenario may build or inject, in bytes.
 pub const MAX_FRAME_LEN: usize = 9216;
+/// Ethernet minimum frame length without FCS; the `pad-to-min` target.
+pub const ETHERNET_MIN_FRAME_LEN: usize = 60;
 /// Largest IPv4 fragment offset expressible in 13 bits (8-octet units).
 pub const MAX_FRAGMENT_OFFSET: u16 = 0x1fff;
 
@@ -175,6 +177,16 @@ impl Frame {
     #[must_use]
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes
+    }
+
+    /// Appends zero octets up to [`ETHERNET_MIN_FRAME_LEN`], as core does for
+    /// generated ARP and ICMPv4 frames. Longer frames are unchanged.
+    #[must_use]
+    pub fn padded_to_ethernet_min(mut self) -> Self {
+        if self.bytes.len() < ETHERNET_MIN_FRAME_LEN {
+            self.bytes.resize(ETHERNET_MIN_FRAME_LEN, 0);
+        }
+        self
     }
 }
 

@@ -3,6 +3,7 @@ use std::num::NonZeroU64;
 use std::path::{Component, Path, PathBuf};
 
 use ruster_core::{ConsumeReason, DropReason, MacAddress};
+use serde::de::DeserializeOwned;
 use serde::de::IntoDeserializer;
 use serde::Deserialize;
 use serde_path_to_error::Segment;
@@ -14,8 +15,8 @@ use crate::frame::{
     TcpFlags,
 };
 use crate::model::{
-    ApplyOutcome, Expectation, ExpectedTx, InterfaceName, Scenario, ScenarioPath, ScenarioSeed,
-    Step,
+    ApplyOutcome, Expectation, ExpectedTx, InterfaceName, RejectReason, Scenario, ScenarioPath,
+    ScenarioSeed, Step,
 };
 use crate::Frame;
 
@@ -34,7 +35,8 @@ pub const MAX_INTERFACE_NAME_BYTES: usize = 64;
 const FIELDS: &[&str] = &[
     "ack", "advance-ms", "at-ms", "config", "consumes", "count", "df", "drops", "dst",
     "dst-port", "eth", "ether-type", "flags", "fragment-offset", "frame", "generation", "hex",
-    "id", "interface", "ip", "kind", "mf", "op", "outcome", "payload-ascii", "payload-hex",
+    "id", "interface", "ip", "kind", "mf", "op", "outcome", "pad-to-min", "payload-ascii",
+    "payload-hex",
     "protocol", "reason", "reserved", "schema", "seed", "sender-ip", "sender-mac", "seq", "src",
     "src-port", "start-ms", "step", "target-ip", "target-mac", "ticks", "tos", "ttl", "tx",
     "window", "zero-checksum",
@@ -50,24 +52,14 @@ struct ScenarioDto {
     start_ms: u64,
     config: String,
     #[serde(default)]
-    step: Vec<StepDto>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
-enum StepDto {
-    Inject(InjectDto),
-    Tick(TickDto),
-    Apply(ApplyDto),
-    Expect(ExpectDto),
-    Hold(HoldDto),
+    step: Vec<Value>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct InjectDto {
     interface: String,
-    frame: FrameDto,
+    frame: Value,
 }
 
 #[derive(Deserialize)]
@@ -83,6 +75,14 @@ struct TickDto {
 struct ApplyDto {
     config: String,
     outcome: OutcomeDto,
+    reason: Option<RejectReasonDto>,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum RejectReasonDto {
+    RestartRequired,
+    Invalid,
 }
 
 #[derive(Clone, Copy, Deserialize)]
@@ -111,7 +111,7 @@ struct HoldDto {}
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct TxDto {
     interface: String,
-    frame: FrameDto,
+    frame: Value,
 }
 
 #[derive(Deserialize)]
@@ -119,18 +119,6 @@ struct TxDto {
 struct CountDto {
     reason: String,
     count: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case")]
-enum FrameDto {
-    Raw(RawDto),
-    Ethernet(EthernetFrameDto),
-    Arp(ArpDto),
-    Ipv4(Ipv4FrameDto),
-    IcmpEcho(IcmpEchoDto),
-    Udp(UdpDto),
-    Tcp(TcpDto),
 }
 
 #[derive(Deserialize)]
@@ -164,6 +152,8 @@ struct IpDto {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct EthernetFrameDto {
     eth: EthDto,
+    #[serde(default)]
+    pad_to_min: bool,
     ether_type: u16,
     payload_hex: Option<String>,
     payload_ascii: Option<String>,
@@ -180,6 +170,8 @@ enum OpDto {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct ArpDto {
     eth: EthDto,
+    #[serde(default)]
+    pad_to_min: bool,
     op: OpDto,
     sender_mac: String,
     sender_ip: String,
@@ -191,6 +183,8 @@ struct ArpDto {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct Ipv4FrameDto {
     eth: EthDto,
+    #[serde(default)]
+    pad_to_min: bool,
     ip: IpDto,
     protocol: u8,
     payload_hex: Option<String>,
@@ -201,6 +195,8 @@ struct Ipv4FrameDto {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct IcmpEchoDto {
     eth: EthDto,
+    #[serde(default)]
+    pad_to_min: bool,
     ip: IpDto,
     op: OpDto,
     #[serde(default)]
@@ -215,6 +211,8 @@ struct IcmpEchoDto {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct UdpDto {
     eth: EthDto,
+    #[serde(default)]
+    pad_to_min: bool,
     ip: IpDto,
     src_port: u16,
     dst_port: u16,
@@ -238,6 +236,8 @@ enum TcpFlagDto {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct TcpDto {
     eth: EthDto,
+    #[serde(default)]
+    pad_to_min: bool,
     ip: IpDto,
     src_port: u16,
     dst_port: u16,
@@ -295,36 +295,54 @@ pub fn parse_scenario(input: &[u8], base_dir: &Path) -> Result<Scenario, Scenari
     if let Some(Value::Array(steps)) = table.get("step") {
         check_list(&[PathSegment::Field("step")], steps.len(), MAX_STEPS)?;
     }
-    let dto: ScenarioDto =
-        serde_path_to_error::deserialize(value.into_deserializer()).map_err(|error| {
-            let message = error.inner().message();
-            let code = if message.contains("unknown field") {
-                Code::UnknownField
-            } else if message.contains("duplicate field") {
-                Code::DuplicateField
-            } else if message.contains("missing field") {
-                Code::MissingField
-            } else if message.contains("unknown variant") {
-                Code::UnknownKind
-            } else {
-                Code::InvalidType
-            };
-            ScenarioError::new(code, &convert_path(error.path()))
-        })?;
+    let dto: ScenarioDto = decode(value, &[])?;
     convert(dto, base_dir)
 }
 
-fn convert_path(path: &serde_path_to_error::Path) -> Vec<PathSegment> {
-    path.iter()
-        .filter_map(|segment| match segment {
-            Segment::Seq { index } => Some(PathSegment::Index(*index)),
-            Segment::Map { key } => FIELDS
-                .iter()
-                .find(|field| **field == key.as_str())
-                .map(|field| PathSegment::Field(field)),
-            Segment::Enum { .. } | Segment::Unknown => None,
-        })
-        .collect()
+/// Decodes one exact DTO and prefixes the value-free serde path.
+///
+/// Unknown/duplicate/missing classification relies on serde and toml error
+/// message text; re-check `every_rejection_class_is_typed` on upgrades.
+fn decode<T: DeserializeOwned>(value: Value, prefix: &[PathSegment]) -> Result<T, ScenarioError> {
+    serde_path_to_error::deserialize(value.into_deserializer()).map_err(|error| {
+        let message = error.inner().message();
+        let code = if message.contains("unknown field") {
+            Code::UnknownField
+        } else if message.contains("duplicate field") {
+            Code::DuplicateField
+        } else if message.contains("missing field") {
+            Code::MissingField
+        } else if message.contains("unknown variant") {
+            Code::UnknownKind
+        } else {
+            Code::InvalidType
+        };
+        let mut path = prefix.to_vec();
+        path.extend(error.path().iter().filter_map(|segment| {
+            match segment {
+                Segment::Seq { index } => Some(PathSegment::Index(*index)),
+                Segment::Map { key } => FIELDS
+                    .iter()
+                    .find(|field| **field == key.as_str())
+                    .map(|field| PathSegment::Field(field)),
+                Segment::Enum { .. } | Segment::Unknown => None,
+            }
+        }));
+        ScenarioError::new(code, &path)
+    })
+}
+
+/// Splits the `kind` discriminator from a table so the variant DTO can be
+/// decoded with full error paths.
+fn split_kind(value: Value, at: &Cursor) -> Result<(String, Value), ScenarioError> {
+    let Value::Table(mut table) = value else {
+        return Err(ScenarioError::new(Code::InvalidType, &at.0));
+    };
+    match table.remove("kind") {
+        Some(Value::String(kind)) => Ok((kind, Value::Table(table))),
+        Some(_) => Err(at.error("kind", Code::InvalidType)),
+        None => Err(at.error("kind", Code::MissingField)),
+    }
 }
 
 fn check_list(path: &[PathSegment], actual: usize, limit: usize) -> Result<(), ScenarioError> {
@@ -374,12 +392,17 @@ fn convert(dto: ScenarioDto, base_dir: &Path) -> Result<Scenario, ScenarioError>
     let mut steps = Vec::with_capacity(count);
     for (index, step) in dto.step.into_iter().enumerate() {
         let at = root.index("step", index);
-        steps.push(match step {
-            StepDto::Inject(inject) => Step::Inject {
-                interface: interface_name(&inject.interface, &at.at("interface"))?,
-                frame: frame(inject.frame, &at.child("frame"))?,
-            },
-            StepDto::Tick(tick) => {
+        let (kind, body) = split_kind(step, &at)?;
+        steps.push(match kind.as_str() {
+            "inject" => {
+                let inject: InjectDto = decode(body, &at.0)?;
+                Step::Inject {
+                    interface: interface_name(&inject.interface, &at.at("interface"))?,
+                    frame: frame(inject.frame, &at.child("frame"))?,
+                }
+            }
+            "tick" => {
+                let tick: TickDto = decode(body, &at.0)?;
                 now = match (tick.advance_ms, tick.at_ms) {
                     (Some(_), Some(_)) => return Err(at.error("at-ms", Code::ConflictingTime)),
                     (Some(advance), None) => now
@@ -411,18 +434,32 @@ fn convert(dto: ScenarioDto, base_dir: &Path) -> Result<Scenario, ScenarioError>
                 }
                 Step::Tick { at_ms: now, ticks }
             }
-            StepDto::Apply(apply) => Step::Apply {
-                config: confined_path(&apply.config, base_dir, &at.at("config"))?,
-                outcome: match apply.outcome {
-                    OutcomeDto::Applied => ApplyOutcome::Applied,
-                    OutcomeDto::Rejected => ApplyOutcome::Rejected,
-                },
-            },
-            StepDto::Expect(expect) => Step::Expect(expectation(expect, &at)?),
-            StepDto::Hold(HoldDto {}) if index + 1 != count => {
-                return Err(at.error("kind", Code::HoldNotLast))
+            "apply" => {
+                let apply: ApplyDto = decode(body, &at.0)?;
+                let reason = apply.reason.map(|reason| match reason {
+                    RejectReasonDto::RestartRequired => RejectReason::RestartRequired,
+                    RejectReasonDto::Invalid => RejectReason::Invalid,
+                });
+                Step::Apply {
+                    config: confined_path(&apply.config, base_dir, &at.at("config"))?,
+                    outcome: match (apply.outcome, reason) {
+                        (OutcomeDto::Applied, None) => ApplyOutcome::Applied,
+                        (OutcomeDto::Applied, Some(_)) => {
+                            return Err(at.error("reason", Code::ReasonWithoutRejection))
+                        }
+                        (OutcomeDto::Rejected, reason) => ApplyOutcome::Rejected { reason },
+                    },
+                }
             }
-            StepDto::Hold(HoldDto {}) => Step::Hold,
+            "expect" => Step::Expect(expectation(decode(body, &at.0)?, &at)?),
+            "hold" => {
+                let HoldDto {} = decode(body, &at.0)?;
+                if index + 1 != count {
+                    return Err(at.error("kind", Code::HoldNotLast));
+                }
+                Step::Hold
+            }
+            _ => return Err(at.error("kind", Code::UnknownKind)),
         });
     }
     Ok(Scenario {
@@ -518,7 +555,9 @@ fn confined_path(
             value.len() as u64,
         ));
     }
-    if value.contains('\0') {
+    // `\` and `:` are rejected for portability and to keep operator intent
+    // unambiguous (no Windows separators, drive prefixes, or URL-like forms).
+    if value.contains(['\0', '\\', ':']) {
         return Err(ScenarioError::new(Code::InvalidPath, path));
     }
     let mut relative = PathBuf::new();
@@ -572,10 +611,15 @@ fn ipv4(value: &str, path: &[PathSegment]) -> Result<Ipv4Addr, ScenarioError> {
 }
 
 fn hex(value: &str, path: &[PathSegment]) -> Result<Vec<u8>, ScenarioError> {
-    let digits: Vec<u8> = value
-        .bytes()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .collect();
+    // ASCII whitespace is allowed only between complete octets.
+    let mut digits = Vec::with_capacity(value.len());
+    for byte in value.bytes() {
+        if !byte.is_ascii_whitespace() {
+            digits.push(byte);
+        } else if !digits.len().is_multiple_of(2) {
+            return Err(ScenarioError::new(Code::InvalidHex, path));
+        }
+    }
     if !digits.len().is_multiple_of(2) {
         return Err(ScenarioError::new(Code::InvalidHex, path));
     }
@@ -679,71 +723,106 @@ fn tcp_flags(flags: &[TcpFlagDto], at: &Cursor) -> Result<TcpFlags, ScenarioErro
     Ok(out)
 }
 
-fn frame(dto: FrameDto, at: &Cursor) -> Result<Frame, ScenarioError> {
-    let spec = match dto {
-        FrameDto::Raw(raw) => FrameSpec::Raw(hex(&raw.hex, &at.at("hex"))?),
-        FrameDto::Ethernet(eth) => FrameSpec::Ethernet {
-            ethernet: ethernet(&eth.eth, at)?,
-            ether_type: eth.ether_type,
-            payload: payload(eth.payload_hex.as_deref(), eth.payload_ascii.as_deref(), at)?,
-        },
-        FrameDto::Arp(arp) => FrameSpec::Arp(ArpSpec {
-            ethernet: ethernet(&arp.eth, at)?,
-            operation: match arp.op {
-                OpDto::Request => ArpOperation::Request,
-                OpDto::Reply => ArpOperation::Reply,
-            },
-            sender_mac: mac(&arp.sender_mac, &at.at("sender-mac"))?,
-            sender_ip: ipv4(&arp.sender_ip, &at.at("sender-ip"))?,
-            target_mac: match &arp.target_mac {
-                Some(value) => mac(value, &at.at("target-mac"))?,
-                None => MacAddress([0; 6]),
-            },
-            target_ip: ipv4(&arp.target_ip, &at.at("target-ip"))?,
-        }),
-        FrameDto::Ipv4(v4) => FrameSpec::Ipv4 {
-            ethernet: ethernet(&v4.eth, at)?,
-            ipv4: ip(&v4.ip, at)?,
-            protocol: v4.protocol,
-            payload: payload(v4.payload_hex.as_deref(), v4.payload_ascii.as_deref(), at)?,
-        },
-        FrameDto::IcmpEcho(echo) => FrameSpec::IcmpEcho {
-            ethernet: ethernet(&echo.eth, at)?,
-            ipv4: ip(&echo.ip, at)?,
-            kind: echo_kind(echo.op),
-            identifier: echo.id,
-            sequence: echo.seq,
-            payload: payload(
-                echo.payload_hex.as_deref(),
-                echo.payload_ascii.as_deref(),
-                at,
-            )?,
-        },
-        FrameDto::Udp(udp) => FrameSpec::Udp {
-            ethernet: ethernet(&udp.eth, at)?,
-            ipv4: ip(&udp.ip, at)?,
-            source_port: udp.src_port,
-            destination_port: udp.dst_port,
-            zero_checksum: udp.zero_checksum,
-            payload: payload(udp.payload_hex.as_deref(), udp.payload_ascii.as_deref(), at)?,
-        },
-        FrameDto::Tcp(tcp) => FrameSpec::Tcp {
-            ethernet: ethernet(&tcp.eth, at)?,
-            ipv4: ip(&tcp.ip, at)?,
-            source_port: tcp.src_port,
-            destination_port: tcp.dst_port,
-            sequence: tcp.seq,
-            acknowledgment: tcp.ack,
-            flags: tcp_flags(&tcp.flags, at)?,
-            window: tcp.window.unwrap_or(65_535),
-            payload: payload(tcp.payload_hex.as_deref(), tcp.payload_ascii.as_deref(), at)?,
-        },
+fn frame(value: Value, at: &Cursor) -> Result<Frame, ScenarioError> {
+    let (kind, body) = split_kind(value, at)?;
+    let mut pad_to_min = false;
+    let spec = match kind.as_str() {
+        "raw" => {
+            let raw: RawDto = decode(body, &at.0)?;
+            FrameSpec::Raw(hex(&raw.hex, &at.at("hex"))?)
+        }
+        "ethernet" => {
+            let eth: EthernetFrameDto = decode(body, &at.0)?;
+            pad_to_min = eth.pad_to_min;
+            FrameSpec::Ethernet {
+                ethernet: ethernet(&eth.eth, at)?,
+                ether_type: eth.ether_type,
+                payload: payload(eth.payload_hex.as_deref(), eth.payload_ascii.as_deref(), at)?,
+            }
+        }
+        "arp" => {
+            let arp: ArpDto = decode(body, &at.0)?;
+            pad_to_min = arp.pad_to_min;
+            FrameSpec::Arp(ArpSpec {
+                ethernet: ethernet(&arp.eth, at)?,
+                operation: match arp.op {
+                    OpDto::Request => ArpOperation::Request,
+                    OpDto::Reply => ArpOperation::Reply,
+                },
+                sender_mac: mac(&arp.sender_mac, &at.at("sender-mac"))?,
+                sender_ip: ipv4(&arp.sender_ip, &at.at("sender-ip"))?,
+                target_mac: match &arp.target_mac {
+                    Some(value) => mac(value, &at.at("target-mac"))?,
+                    None => MacAddress([0; 6]),
+                },
+                target_ip: ipv4(&arp.target_ip, &at.at("target-ip"))?,
+            })
+        }
+        "ipv4" => {
+            let v4: Ipv4FrameDto = decode(body, &at.0)?;
+            pad_to_min = v4.pad_to_min;
+            FrameSpec::Ipv4 {
+                ethernet: ethernet(&v4.eth, at)?,
+                ipv4: ip(&v4.ip, at)?,
+                protocol: v4.protocol,
+                payload: payload(v4.payload_hex.as_deref(), v4.payload_ascii.as_deref(), at)?,
+            }
+        }
+        "icmp-echo" => {
+            let echo: IcmpEchoDto = decode(body, &at.0)?;
+            pad_to_min = echo.pad_to_min;
+            FrameSpec::IcmpEcho {
+                ethernet: ethernet(&echo.eth, at)?,
+                ipv4: ip(&echo.ip, at)?,
+                kind: echo_kind(echo.op),
+                identifier: echo.id,
+                sequence: echo.seq,
+                payload: payload(
+                    echo.payload_hex.as_deref(),
+                    echo.payload_ascii.as_deref(),
+                    at,
+                )?,
+            }
+        }
+        "udp" => {
+            let udp: UdpDto = decode(body, &at.0)?;
+            pad_to_min = udp.pad_to_min;
+            FrameSpec::Udp {
+                ethernet: ethernet(&udp.eth, at)?,
+                ipv4: ip(&udp.ip, at)?,
+                source_port: udp.src_port,
+                destination_port: udp.dst_port,
+                zero_checksum: udp.zero_checksum,
+                payload: payload(udp.payload_hex.as_deref(), udp.payload_ascii.as_deref(), at)?,
+            }
+        }
+        "tcp" => {
+            let tcp: TcpDto = decode(body, &at.0)?;
+            pad_to_min = tcp.pad_to_min;
+            FrameSpec::Tcp {
+                ethernet: ethernet(&tcp.eth, at)?,
+                ipv4: ip(&tcp.ip, at)?,
+                source_port: tcp.src_port,
+                destination_port: tcp.dst_port,
+                sequence: tcp.seq,
+                acknowledgment: tcp.ack,
+                flags: tcp_flags(&tcp.flags, at)?,
+                window: tcp.window.unwrap_or(65_535),
+                payload: payload(tcp.payload_hex.as_deref(), tcp.payload_ascii.as_deref(), at)?,
+            }
+        }
+        _ => return Err(at.error("kind", Code::UnknownKind)),
     };
-    spec.build().map_err(|error| match error {
+    let built = spec.build().map_err(|error| match error {
         FrameBuildError::TooLong { actual, .. } => too_long(&at.0, actual),
         FrameBuildError::FragmentOffsetOutOfRange => ScenarioError::new(
             Code::FragmentOffsetOutOfRange,
             &at.child("ip").at("fragment-offset"),
         ),
+    })?;
+    Ok(if pad_to_min {
+        built.padded_to_ethernet_min()
+    } else {
+        built
     })
 }

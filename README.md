@@ -30,7 +30,7 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
 - `ruster-sim-scenario`: 最大256 KiBの`ruster-scenario/v1` TOMLを、seed、初期config path、
   `inject`/`tick`/`apply`/`expect`/末尾`hold` stepのtyped modelへexact decodeする。
   Ethernet II、ARP、IPv4、ICMPv4 Echo、UDP、TCPのcold側builderとraw hexでframeを
-  checksum込みのexact bytesへ組み立てる。config pathはscenario directory内の相対pathに限り、
+  checksum込みのexact bytesへ組み立てる（`pad-to-min`で60 bytesまでzero padding）。config pathはscenario directory内の相対pathに限り、
   時刻後退、unknown/duplicate field、上限超過をvalue-freeなtyped errorで拒否する。
   fileを開かず、実行driverは持たない。
 - `ruster-io-afpacket`: Linux AF_PACKET/TPACKET_V3 backendのchecked configuration、

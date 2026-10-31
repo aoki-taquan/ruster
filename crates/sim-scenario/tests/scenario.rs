@@ -5,8 +5,8 @@ use ruster_core::{
     internet_checksum, validate_arp, validate_ipv4_frame, ArpOpcode, ConsumeReason, DropReason,
 };
 use ruster_sim_scenario::{
-    parse_scenario, ApplyOutcome, FrameKind, PathSegment, ScenarioErrorCode as Code, Step,
-    MAX_EXPECTED_TX, MAX_FRAME_LEN, MAX_SCENARIO_BYTES, MAX_STEPS, MAX_TICKS_PER_STEP,
+    parse_scenario, ApplyOutcome, FrameKind, PathSegment, RejectReason, ScenarioErrorCode as Code,
+    Step, MAX_EXPECTED_TX, MAX_FRAME_LEN, MAX_SCENARIO_BYTES, MAX_STEPS, MAX_TICKS_PER_STEP,
     MAX_TOTAL_TICKS,
 };
 
@@ -89,6 +89,18 @@ outcome = "applied"
 [[step]]
 kind = "apply"
 config = "invalid.toml"
+outcome = "rejected"
+reason = "invalid"
+
+[[step]]
+kind = "apply"
+config = "v3-shape.toml"
+outcome = "rejected"
+reason = "restart-required"
+
+[[step]]
+kind = "apply"
+config = "configs/v1.toml"
 outcome = "rejected"
 
 [[step]]
@@ -231,7 +243,10 @@ fn scenario_happy_path_covers_every_step_and_frame_kind() {
             },
             Step::Apply {
                 config: invalid,
-                outcome: ApplyOutcome::Rejected,
+                outcome:
+                    ApplyOutcome::Rejected {
+                        reason: Some(RejectReason::Invalid),
+                    },
             },
         ) => {
             assert_eq!(v2.resolved(), Path::new("/scenarios/m1/configs/v2.toml"));
@@ -239,7 +254,23 @@ fn scenario_happy_path_covers_every_step_and_frame_kind() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    match &scenario.steps[14] {
+    assert!(matches!(
+        scenario.steps[14],
+        Step::Apply {
+            outcome: ApplyOutcome::Rejected {
+                reason: Some(RejectReason::RestartRequired)
+            },
+            ..
+        }
+    ));
+    assert!(matches!(
+        scenario.steps[15],
+        Step::Apply {
+            outcome: ApplyOutcome::Rejected { reason: None },
+            ..
+        }
+    ));
+    match &scenario.steps[16] {
         Step::Expect(expect) => {
             assert_eq!(expect.generation, NonZeroU64::new(2));
             let tx = expect.tx.as_ref().expect("tx");
@@ -257,11 +288,11 @@ fn scenario_happy_path_covers_every_step_and_frame_kind() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    match &scenario.steps[15] {
+    match &scenario.steps[17] {
         Step::Expect(expect) => assert_eq!(expect.tx, Some(Vec::new())),
         other => panic!("unexpected {other:?}"),
     }
-    assert_eq!(scenario.steps[16], Step::Hold);
+    assert_eq!(scenario.steps[18], Step::Hold);
     assert!(
         !format!("{scenario:?}").contains("12345"),
         "seed is redacted"
@@ -638,5 +669,189 @@ fn rejection_paths_name_schema_fields_and_indices() {
     assert_eq!(
         unknown.path()[..2],
         [PathSegment::Field("step"), PathSegment::Index(0)]
+    );
+}
+
+#[test]
+fn padded_typed_arp_request_equals_core_generated_request() {
+    use ruster_core::{
+        execute_one_arp_request, forward_batch_with_resolution, ForwardingSnapshot, IfId,
+        Interface, Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, NoGeneratedTrace,
+        NoTrace, PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime,
+        ResolutionStateSlot, Route,
+    };
+    use ruster_io_sim::SimIo;
+
+    const LAN: IfId = IfId(1);
+    const WAN: IfId = IfId(2);
+    let target = Ipv4Address::from_octets([203, 0, 113, 1]);
+    let routes = [Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, Some(target)).unwrap()];
+    let interfaces = [
+        Interface {
+            id: LAN,
+            mac: MacAddress([2, 0, 0, 0, 0, 1]),
+        },
+        Interface {
+            id: WAN,
+            mac: MacAddress([2, 0, 0, 0, 0, 2]),
+        },
+    ];
+    let bindings = [LocalIpv4Binding {
+        interface: WAN,
+        address: Ipv4Address::from_octets([203, 0, 113, 2]),
+    }];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+    let mut states = [ResolutionStateSlot::EMPTY; 2];
+    let mut actions = [ResolutionActionSlot::EMPTY; 2];
+    let policy = ResolutionPolicy::new(1_000, 2_000).unwrap();
+    let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+    let mut io = SimIo::new();
+
+    let trigger = frame_bytes(&inject(&format!(
+        r#"kind = "ipv4", {ETH}, {IP}, protocol = 17"#
+    )));
+    io.inject(LAN, trigger);
+    let batch = io.receive(1).unwrap();
+    let report = forward_batch_with_resolution(
+        batch,
+        &snapshot,
+        &mut runtime,
+        MonotonicMillis(10),
+        &mut NoTrace,
+    );
+    assert_eq!(report.dropped, 1);
+    execute_one_arp_request(
+        &mut io,
+        &mut runtime,
+        MonotonicMillis(10),
+        &mut NoGeneratedTrace,
+    )
+    .unwrap()
+    .unwrap();
+    let generated = io.pop_tx().expect("core ARP request").bytes;
+
+    let typed = r#"kind = "arp", eth = { src = "02:00:00:00:00:02", dst = "ff:ff:ff:ff:ff:ff" }, op = "request", sender-mac = "02:00:00:00:00:02", sender-ip = "203.0.113.2", target-ip = "203.0.113.1""#;
+    let padded = frame_bytes(&inject(&format!("{typed}, pad-to-min = true")));
+    assert_eq!(padded.len(), 60);
+    assert_eq!(padded, generated);
+    let unpadded = frame_bytes(&inject(typed));
+    assert_eq!(unpadded.len(), 42);
+    assert_eq!(unpadded, generated[..42]);
+
+    // Padding never shortens or alters frames already at or above 60 bytes.
+    let long = format!(
+        r#"kind = "udp", {ETH}, {IP}, src-port = 1, dst-port = 2, payload-hex = "{}""#,
+        "11".repeat(30)
+    );
+    assert_eq!(
+        frame_bytes(&inject(&format!("{long}, pad-to-min = true"))),
+        frame_bytes(&inject(&long))
+    );
+    assert_eq!(
+        reject(&inject("kind = \"raw\", hex = \"00\", pad-to-min = true")),
+        Code::UnknownField
+    );
+}
+
+#[test]
+fn nested_rejections_are_typed_with_full_paths() {
+    let frame_path = |tail: &[PathSegment]| {
+        let mut path = vec![
+            PathSegment::Field("step"),
+            PathSegment::Index(0),
+            PathSegment::Field("frame"),
+        ];
+        path.extend_from_slice(tail);
+        path
+    };
+    let step0 = |field: &'static str| {
+        vec![
+            PathSegment::Field("step"),
+            PathSegment::Index(0),
+            PathSegment::Field(field),
+        ]
+    };
+    let cases: Vec<(String, Code, Vec<PathSegment>)> = vec![
+        (
+            inject(&format!(
+                "kind = \"udp\", {ETH}, ip = {{ src = \"192.0.2.1\", dst = \"192.0.2.2\", bogus = 1 }}, src-port = 1, dst-port = 2"
+            )),
+            Code::UnknownField,
+            frame_path(&[PathSegment::Field("ip")]),
+        ),
+        (
+            inject(&format!(
+                "kind = \"tcp\", {ETH}, {IP}, src-port = 1, dst-port = 2, flags = [\"ack\", \"urg\"]"
+            )),
+            Code::UnknownKind,
+            frame_path(&[PathSegment::Field("flags"), PathSegment::Index(1)]),
+        ),
+        (
+            inject(&format!(
+                "kind = \"udp\", {ETH}, {IP}, src-port = 70000, dst-port = 2"
+            )),
+            Code::InvalidType,
+            frame_path(&[PathSegment::Field("src-port")]),
+        ),
+        (
+            inject("kind = \"jumbo\""),
+            Code::UnknownKind,
+            frame_path(&[PathSegment::Field("kind")]),
+        ),
+        (
+            inject("hex = \"00\""),
+            Code::MissingField,
+            frame_path(&[PathSegment::Field("kind")]),
+        ),
+        (
+            step("kind = \"expect\"\ntx = [{ interface = \"wan\", frame = { kind = \"raw\", hex = \"0 0\" } }]"),
+            Code::InvalidHex,
+            vec![
+                PathSegment::Field("step"),
+                PathSegment::Index(0),
+                PathSegment::Field("tx"),
+                PathSegment::Index(0),
+                PathSegment::Field("frame"),
+                PathSegment::Field("hex"),
+            ],
+        ),
+        (
+            step("kind = \"apply\"\nconfig = \"x.toml\"\noutcome = \"applied\"\nreason = \"invalid\""),
+            Code::ReasonWithoutRejection,
+            step0("reason"),
+        ),
+        (
+            step("kind = \"apply\"\nconfig = \"x.toml\"\noutcome = \"rejected\"\nreason = \"flaky\""),
+            Code::UnknownKind,
+            step0("reason"),
+        ),
+        (
+            step("kind = \"teleport\""),
+            Code::UnknownKind,
+            step0("kind"),
+        ),
+        (
+            HEAD.replace("configs/./v1.toml", "configs\\\\v1.toml"),
+            Code::InvalidPath,
+            vec![PathSegment::Field("config")],
+        ),
+        (
+            HEAD.replace("configs/./v1.toml", "c:v1.toml"),
+            Code::InvalidPath,
+            vec![PathSegment::Field("config")],
+        ),
+    ];
+    for (source, code, path) in cases {
+        let error = parse(&source).expect_err("must reject");
+        assert_eq!(
+            (error.code(), error.path()),
+            (code, path.as_slice()),
+            "{source}"
+        );
+    }
+    // Whitespace between whole octets stays accepted.
+    assert_eq!(
+        frame_bytes(&inject("kind = \"raw\", hex = \" 00 11\\n22 \"")),
+        [0, 0x11, 0x22]
     );
 }

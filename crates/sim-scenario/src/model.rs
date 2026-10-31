@@ -50,8 +50,8 @@ impl fmt::Debug for ScenarioSeed {
 
 /// A configuration file reference confined to the scenario directory.
 ///
-/// `relative` has no root, no `..`, and no `.` components. `resolved` is
-/// `base_dir.join(relative)`. The file is not opened or canonicalized here,
+/// `relative` is the scenario text with `.` segments stripped; it never has a
+/// root, a `..` segment, `\\`, or `:`. `resolved` is `base_dir.join(relative)`. The file is not opened or canonicalized here,
 /// so symlinks are not inspected.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScenarioPath {
@@ -113,16 +113,34 @@ pub enum Step {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum ApplyOutcome {
     Applied,
-    Rejected,
+    /// The apply must fail and leave the active generation unchanged.
+    /// `None` accepts any rejection class.
+    Rejected {
+        reason: Option<RejectReason>,
+    },
+}
+
+/// Expected rejection class; the driver maps it to control's typed errors.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum RejectReason {
+    /// Valid config whose change requires a process restart.
+    RestartRequired,
+    /// Config that fails parsing or validation.
+    Invalid,
 }
 
 /// Assertions the driver evaluates at this point.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Expectation {
     /// When present, the exact ordered TX frames since the previous expect
-    /// step (or scenario start). An empty list asserts no TX.
+    /// step (or scenario start). An empty list asserts no TX. Matching is
+    /// byte-exact only: allocator-chosen NAT ports or ICMP identifiers are
+    /// deterministic per seed, but fixtures must be regenerated whenever the
+    /// allocator changes.
     pub tx: Option<Vec<ExpectedTx>>,
     /// Cumulative drop counts, in file order; each reason at most once.
     pub drops: Vec<(DropReason, u64)>,
