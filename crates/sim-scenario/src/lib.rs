@@ -17,8 +17,40 @@
 //! - Typed frames accept `pad-to-min = true` for zero padding to 60 bytes.
 //! - `expect.tx` matches bytes exactly; see [`Expectation::tx`].
 //!
-//! This crate only parses and validates. It opens no file, reads no clock,
-//! and executes nothing; the driver evaluates the model.
+//! [`parse_scenario`] only parses and validates: it opens no file, reads no
+//! clock, and executes nothing. The driver ([`SimSession`], [`SimRun`],
+//! [`run_scenario_file`]) reads the scenario and configuration files, runs
+//! the scenario through the public full-service composition on `SimIo` with
+//! injected time only, evaluates `expect` steps, and writes canonical
+//! `ruster-run-sim/v1` JSON lines.
+//!
+//! # `ruster-run-sim/v1` output
+//!
+//! One JSON object per line, fields in a fixed order, the first field always
+//! `event`. No wall clock, map iteration, hash key, or seed is ever written.
+//! Steps are zero-based indices into the scenario `step` list.
+//!
+//! - `start`: `schema`, backend name and mode, initial config path,
+//!   generation, start time, step count, interfaces, storage capacities,
+//!   tick budgets.
+//! - `inject`: step, interface, length, frame hex.
+//! - `tick`: one line per worker tick with its publication outcome and RX,
+//!   forwarded, drop, consume, and generated counts.
+//! - `tx`: every completed TX frame with egress interface, origin
+//!   (`forwarded`/`generated`), and hex, in backend FIFO order.
+//! - `apply`: outcome (`applied`/`rejected`), reason (`restart-required`/
+//!   `invalid`), stage and code, the generation the sequencer consumed (if
+//!   any), the active generation, and the committed flush counts.
+//! - `expect`: `pass` or `fail` with the mismatch kind; the typed
+//!   [`DriverError::Expect`] carries the precise difference.
+//! - `final`: the R15 [`ruster_runtime::ObservabilitySnapshot`] (counters,
+//!   health, generation, last apply), per-service counters, and backend
+//!   stats, each rendered through `ObservableFields` as flat
+//!   `"section.key"` members.
+//!
+//! Field names are part of the schema; renaming or reordering requires a new
+//! schema version. Rendered typed codes (`code` of an `apply` line) use the
+//! stable variant names of the config/control error enums.
 //!
 //! ```
 //! use std::path::Path;
@@ -43,10 +75,17 @@
 //! assert!(matches!(scenario.steps[1], Step::Tick { at_ms: 10, ticks: 1 }));
 //! ```
 
+mod driver;
 mod error;
 mod frame;
 mod model;
+mod output;
 mod parse;
+
+pub use driver::{
+    run_scenario_file, ApplyClass, ConfigRejection, DriverError, ExpectMismatch, FileRole,
+    Progress, RunSummary, SimRun, SimSession, TxRecord, RUN_SIM_SCHEMA_V1, SIM_VALIDATION_LIMITS,
+};
 
 pub use error::{PathSegment, ScenarioError, ScenarioErrorCode};
 pub use frame::{

@@ -6,10 +6,11 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+ruster-config = { path = "../config" }
+ruster-control = { path = "../control" }
 ruster-core = { path = "../core" }
+ruster-io-sim = { path = "../io-sim" }
+ruster-runtime = { path = "../runtime" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_path_to_error = "0.1.20"
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde", "std"] }
-
-[dev-dependencies]
-ruster-io-sim = { path = "../io-sim" }
