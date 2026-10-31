@@ -14,6 +14,16 @@ use ruster_core::{
 };
 use std::{marker::PhantomData, num::NonZeroU64};
 
+mod observability;
+
+pub use observability::{
+    ApplyFlushCounts, ApplyOutcomeKind, BackendMode, BackendStats, ConsumeReasonCounters,
+    DropReasonCounters, FieldValue, FieldVisitor, FieldsDisplay, GeneratedTotals, Health,
+    HealthPolicy, HealthState, LastApply, ObservabilitySnapshot, ObservableFields,
+    PhaseSkipCounters, RxTotals, ServiceCounters, TickObserver, TickTotals, DROP_REASON_CODE_LIMIT,
+    TICK_PHASE_SKIPS,
+};
+
 /// Tick-local UDP NAT44 authority and its optional worker-local runtime.
 ///
 /// Keeping these values in one view prevents downstream publication adapters

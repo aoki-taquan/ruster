@@ -418,6 +418,22 @@ errorは許しません。accounting違反reportはbackendが返した生counter
 TX accepted/submittedはdescriptor publicationであってwire deliveryやcompletion queue返却では
 ありません。runtime packet pathはheap allocationと共有同期を行いません。
 
+R15 observabilityの`TickObserver`は`run_tick`の`trace`引数としてstatic dispatchで渡します。
+tick中はdrop/consume eventごとに固定配列の一要素とphase skipごとに一counterをsaturating加算
+するだけで、format、allocation、lockを行いません。`DropReason`はstableな`repr(u16)`
+discriminantで直接indexし、表外のreasonは`UNCLASSIFIED`に数えて失いません。cold sideは
+`run_tick`が返した`TickReport`を`observe_tick`でO(1)集計し、注入された`MonotonicMillis`だけから
+health（last tick/last successful tick、RX/TX progress、入力時刻regressionとruntime報告の
+clock regression、連続backend I/O failure、quiescence deferral、sticky `Stop`）を導きます。
+health時刻は単調high-waterで後退しません。apply結果は`PublicationOutcome`から、flush数は
+core publication reportから作る`ApplyFlushCounts`を`record_apply_flush`で一度だけ添付するので、
+runtimeはcontrolへ依存しません。各runtimeの累積counterは`ServiceCounters::capture`でpublication
+ownerのread-only accessorからcopyします。backendは`BackendStats`をstatic dispatchで実装して
+固定statsを提供でき、`SimIo`がqueue/lease占有を返します。snapshotは`Copy`の固定サイズ値で、
+`ObservableFields`がmapなしの固定順`(section, key, value)`を訪問し、`FieldsDisplay`はcold side
+だけで`section.key=value`行へ描画します。canonical JSONLとCLI出力は後続、NAT/FW/resolution
+占有high-watermarkはcore accessorが必要なためM2へdeferしています。
+
 逆経路は元IPv4 sourceへの通常LPMです。gateway routeではnext-hop、connected routeでは
 元sourceをneighbor targetにし、reverse egressのInterface MAC/local IPv4 bindingを使います。
 static neighborを優先し、次にfresh dynamic ARP entryを使います。未解決時は既存ARP actionを

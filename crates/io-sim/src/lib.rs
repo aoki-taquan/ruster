@@ -19,6 +19,7 @@ use ruster_core::{
     PacketIo, PacketLease, PacketSlot, PublicationQuiescence, PublicationQuiescenceDisposition,
     PublicationQuiescenceGuard, ResolutionRuntime, SlotCompletion, TraceEvent, TraceSink,
 };
+use ruster_runtime::{BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields};
 
 #[derive(Debug, Eq, PartialEq)]
 struct Slot {
@@ -507,6 +508,69 @@ impl SimIo {
                 trace,
             ),
         )
+    }
+}
+
+/// Fixed simulated-backend occupancy, read between ticks.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SimIoStats {
+    /// Frames ever injected (the next RX sequence number).
+    pub injected: u64,
+    pub pending_rx: u64,
+    pub pending_tx: u64,
+    pub pending_recycled: u64,
+    pub pending_generated_recycled: u64,
+    pub rx_leases_live: u64,
+    pub generated_leases_live: u64,
+    pub batch_open: bool,
+}
+
+impl ObservableFields for SimIoStats {
+    fn visit_fields<V: FieldVisitor>(&self, visitor: &mut V) {
+        let Self {
+            injected,
+            pending_rx,
+            pending_tx,
+            pending_recycled,
+            pending_generated_recycled,
+            rx_leases_live,
+            generated_leases_live,
+            batch_open,
+        } = *self;
+        for (key, value) in [
+            ("injected", injected),
+            ("pending_rx", pending_rx),
+            ("pending_tx", pending_tx),
+            ("pending_recycled", pending_recycled),
+            ("pending_generated_recycled", pending_generated_recycled),
+            ("rx_leases_live", rx_leases_live),
+            ("generated_leases_live", generated_leases_live),
+        ] {
+            visitor.field("backend.sim", key, FieldValue::Count(value));
+        }
+        visitor.field("backend.sim", "batch_open", FieldValue::Flag(batch_open));
+    }
+}
+
+impl BackendStats for SimIo {
+    type Stats = SimIoStats;
+
+    const NAME: &'static str = "sim";
+    const MODE: BackendMode = BackendMode::Simulated;
+
+    /// O(1) queue-length and lease-count reads.
+    fn backend_stats(&self) -> SimIoStats {
+        let count = |value: usize| u64::try_from(value).unwrap_or(u64::MAX);
+        SimIoStats {
+            injected: self.next_sequence,
+            pending_rx: count(self.rx.len()),
+            pending_tx: count(self.tx.len()),
+            pending_recycled: count(self.recycled.len()),
+            pending_generated_recycled: count(self.generated_recycled.len()),
+            rx_leases_live: count(self.rx_leases_live),
+            generated_leases_live: count(self.generated_leases_live),
+            batch_open: self.batch_state != SimBatchState::Idle,
+        }
     }
 }
 

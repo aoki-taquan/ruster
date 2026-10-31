@@ -59,7 +59,9 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
   FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
 - `ruster-runtime`: genericなpublication seamから一つのactive generationを借用し、
   `RX → resolution timer → failure dispatch → generated ARP → generated ICMPv4`を
-  明示budget付きのsingle-worker tickとして実行する。
+  明示budget付きのsingle-worker tickとして実行する。`TickObserver`はtraceとして渡す
+  allocation-freeなsaturating counter sinkで、drop/consume reason別数、tick集計、注入時刻
+  だけによるhealth、generation/apply結果をtick境界で固定順snapshotにする。
 
 ```text
 inject Vec<u8>
