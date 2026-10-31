@@ -1,18 +1,18 @@
 mod support;
 
 use ruster_core::{
-    execute_one_icmpv4_error, internet_checksum, ipv4_header_checksum, DropReason,
-    DynamicNeighborSlot, FirewallAction, FirewallAuditBuffer, FirewallAuditRecord, FirewallConfig,
-    FirewallConnectionClass, FirewallDisposition, FirewallFailure, FirewallHashKey,
-    FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPolicySource, FirewallPortRange,
-    FirewallProtocol, FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot,
-    FirewallTcpPhase, FirewallVerdict, ForwardingSnapshot, Icmpv4ErrorActionSlot,
-    Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
-    LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
-    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor,
-    NoGeneratedIcmpv4Trace, NoTrace, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime,
-    ResolutionStateSlot, Route,
+    execute_one_icmpv4_error, forward_batch_with_resolution_and_icmpv4_errors, internet_checksum,
+    ipv4_header_checksum, DropReason, DynamicNeighborSlot, FirewallAction, FirewallAuditBuffer,
+    FirewallAuditRecord, FirewallConfig, FirewallConnectionClass, FirewallDisposition,
+    FirewallFailure, FirewallHashKey, FirewallInterface, FirewallIpv4Prefix, FirewallPolicy,
+    FirewallPolicySource, FirewallPortRange, FirewallProtocol, FirewallRule, FirewallRuleId,
+    FirewallRuntime, FirewallStateSlot, FirewallTcpPhase, FirewallVerdict, ForwardingSnapshot,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId,
+    Interface, Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy,
+    Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot,
+    Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime,
+    Neighbor, NoGeneratedIcmpv4Trace, NoTrace, PacketIo, ResolutionActionSlot, ResolutionPolicy,
+    ResolutionRuntime, ResolutionStateSlot, Route,
 };
 use ruster_io_sim::{FrameOrigin, RecycleCause, SimIo};
 use support::UdpTestIndexes;
@@ -1287,6 +1287,8 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
         &mut NoTrace,
     )
     .unwrap();
+    // The egress-bound allow rules cannot match a route miss, so it stays
+    // silent.
     assert_drop(&mut io, DropReason::FirewallRouteUnavailable, &no_route);
     assert_eq!(errors.pending_actions(), 0);
     assert_eq!(route_resolution.pending_actions(), 0);
@@ -1294,6 +1296,53 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
     assert_eq!(
         combined_state_snapshot(&route_udp, &route_tcp, &route_firewall),
         route_state_before
+    );
+
+    // With an egress-any allow, the same miss yields Network Unreachable
+    // before any NAT translation: the quote is the received datagram and no
+    // NAT or firewall state is created.
+    let open_rules = [any_egress_allow(5, FirewallProtocol::Udp)];
+    let open_firewall_config = firewall_config(&route_snapshot, &open_rules, 2);
+    let mut open_firewall_slots = [FirewallStateSlot::default(); 1];
+    let mut open_firewall = FirewallRuntime::new(open_firewall_config, &mut open_firewall_slots);
+    let open_state_before = combined_state_snapshot(&route_udp, &route_tcp, &open_firewall);
+    io.inject(LAN, no_route.clone());
+    io.run_nat44_udp_and_tcp_with_firewall_and_icmpv4_errors_once(
+        1,
+        &route_snapshot,
+        &mut route_resolution,
+        &mut errors,
+        &route_udp_config,
+        Some(&mut route_udp),
+        &route_tcp_config,
+        Some(&mut route_tcp),
+        &open_firewall_config,
+        Some(&mut open_firewall),
+        MonotonicMillis(300),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::RouteMiss, &no_route);
+    assert_eq!(errors.pending_actions(), 1);
+    assert_eq!(route_resolution.pending_actions(), 0);
+    assert_eq!(
+        combined_state_snapshot(&route_udp, &route_tcp, &open_firewall),
+        open_state_before
+    );
+    execute_one_icmpv4_error(
+        &mut io,
+        &mut errors,
+        MonotonicMillis(300),
+        &mut NoGeneratedIcmpv4Trace,
+    )
+    .unwrap()
+    .unwrap();
+    let tx = io.pop_tx().unwrap();
+    assert_eq!(tx.egress, LAN);
+    assert_eq!((tx.bytes[34], tx.bytes[35]), (3, 0));
+    assert_eq!(
+        tx.bytes,
+        plain_route_miss_icmpv4(&no_route, &no_remote_routes)
     );
 }
 
@@ -3543,4 +3592,257 @@ fn ipv4_ingress_admission_precedes_nat_firewall_time_state_audit_and_actions() {
         assert!(io.pop_tx().is_some());
         assert_eq!(audit.records().len(), 2);
     }
+}
+
+fn any_egress_allow(id: u32, protocol: FirewallProtocol) -> FirewallRule {
+    rule(
+        id,
+        FirewallInterface::Interface(LAN),
+        FirewallInterface::Any,
+        prefix(Ipv4Address::from_octets([10, 0, 0, 0]), 24),
+        any_prefix(),
+        protocol,
+        ports(0, u16::MAX),
+        ports(1, u16::MAX),
+        FirewallAction::AllowStateful,
+    )
+}
+
+fn plain_route_miss_icmpv4(frame: &[u8], routes: &[Route]) -> Vec<u8> {
+    let (_, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(routes, &interfaces, &neighbors, &bindings).unwrap();
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(
+        Icmpv4ErrorPolicy::default(),
+        &mut error_states,
+        &mut error_actions,
+    );
+    let mut io = SimIo::new();
+    io.inject(LAN, frame.to_vec());
+    let batch = io.receive(1).unwrap();
+    forward_batch_with_resolution_and_icmpv4_errors(
+        batch,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        MonotonicMillis(1),
+        &mut NoTrace,
+    );
+    assert_drop(&mut io, DropReason::RouteMiss, frame);
+    execute_one_icmpv4_error(
+        &mut io,
+        &mut errors,
+        MonotonicMillis(1),
+        &mut NoGeneratedIcmpv4Trace,
+    )
+    .unwrap()
+    .unwrap();
+    let tx = io.pop_tx().unwrap();
+    assert_eq!(tx.origin, FrameOrigin::Generated);
+    tx.bytes
+}
+
+#[test]
+fn route_miss_permitted_toward_every_egress_generates_the_plain_type3_code0() {
+    let (all_routes, interfaces, neighbors, bindings) = topology();
+    // 192.0.2.0/24 is routed via the WAN gateway; REMOTE has no route.
+    let routes = [
+        all_routes[0],
+        Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, WAN, Some(GW)).unwrap(),
+    ];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let rules = [any_egress_allow(5, FirewallProtocol::Udp)];
+    let config = firewall_config(&snapshot, &rules, 1);
+    let mut firewall_slots = [FirewallStateSlot::default(); 2];
+    let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(
+        Icmpv4ErrorPolicy::default(),
+        &mut error_states,
+        &mut error_actions,
+    );
+    let mut io = SimIo::new();
+
+    // TTL 1 still yields Network Unreachable: route miss precedes TTL.
+    let mut no_route = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, true);
+    set_ttl(&mut no_route, 1);
+    let expected = plain_route_miss_icmpv4(&no_route, &routes);
+    io.inject(LAN, no_route.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        &config,
+        Some(&mut firewall),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::RouteMiss, &no_route);
+    assert_eq!(errors.pending_actions(), 1);
+    assert_eq!(errors.counters().queued_destination_unreachable, 1);
+    assert_eq!(resolution.pending_actions(), 0);
+    assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
+    assert_eq!(firewall.counters().allowed_new, 0);
+    assert_eq!(firewall.counters().rule_evaluations, 1);
+    execute_one_icmpv4_error(
+        &mut io,
+        &mut errors,
+        MonotonicMillis(1),
+        &mut NoGeneratedIcmpv4Trace,
+    )
+    .unwrap()
+    .unwrap();
+    let tx = io.pop_tx().unwrap();
+    assert_eq!(tx.origin, FrameOrigin::Generated);
+    assert_eq!(tx.egress, LAN);
+    assert_eq!(tx.bytes, expected);
+    assert_eq!((tx.bytes[34], tx.bytes[35]), (3, 0));
+    assert_eq!(&tx.bytes[42..], &no_route[14..14 + 20 + 11]);
+
+    // The plain per-egress limiter is shared: a second route miss and a
+    // routed TTL expiry inside the interval are both rate limited.
+    let again = udp_frame(HOST, REMOTE, 12_346, 53, 0x4000, true);
+    let mut expiring = udp_frame(HOST, OTHER_REMOTE, 12_347, 53, 0x4000, true);
+    set_ttl(&mut expiring, 1);
+    io.inject(LAN, again.clone());
+    io.inject(LAN, expiring.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        2,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        &config,
+        Some(&mut firewall),
+        MonotonicMillis(50),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::RouteMiss, &again);
+    assert_drop(&mut io, DropReason::Ipv4TtlExpired, &expiring);
+    assert_eq!(errors.pending_actions(), 0);
+    assert_eq!(errors.counters().rate_limited, 2);
+    assert!(io.pop_tx().is_none());
+
+    // TCP is admitted only as a valid initial SYN.
+    let tcp_rules = [any_egress_allow(6, FirewallProtocol::Tcp)];
+    let tcp_config = firewall_config(&snapshot, &tcp_rules, 2);
+    let mut tcp_slots = [FirewallStateSlot::default(); 2];
+    let mut tcp_firewall = FirewallRuntime::new(tcp_config, &mut tcp_slots);
+    let ack = tcp_frame(HOST, REMOTE, 40_000, 443, 0x10, 0x4000);
+    io.inject(LAN, ack.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        &tcp_config,
+        Some(&mut tcp_firewall),
+        MonotonicMillis(200),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallRouteUnavailable, &ack);
+    assert_eq!(errors.pending_actions(), 0);
+    let syn = tcp_frame(HOST, REMOTE, 40_000, 443, 0x02, 0x4000);
+    io.inject(LAN, syn.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        &tcp_config,
+        Some(&mut tcp_firewall),
+        MonotonicMillis(200),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::RouteMiss, &syn);
+    assert_eq!(errors.pending_actions(), 1);
+    assert!(tcp_firewall.states().iter().all(|slot| !slot.is_occupied()));
+}
+
+#[test]
+fn route_miss_denied_toward_some_egress_stays_silent() {
+    let (all_routes, interfaces, neighbors, bindings) = topology();
+    let routes = [all_routes[0]];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(
+        Icmpv4ErrorPolicy::default(),
+        &mut error_states,
+        &mut error_actions,
+    );
+    let mut io = SimIo::new();
+    let egress_deny = rule(
+        4,
+        FirewallInterface::Any,
+        FirewallInterface::Interface(WAN),
+        any_prefix(),
+        any_prefix(),
+        FirewallProtocol::Udp,
+        ports(0, u16::MAX),
+        ports(53, 53),
+        FirewallAction::Deny,
+    );
+    let any_deny = rule(
+        4,
+        FirewallInterface::Any,
+        FirewallInterface::Any,
+        any_prefix(),
+        any_prefix(),
+        FirewallProtocol::Udp,
+        ports(0, u16::MAX),
+        ports(53, 53),
+        FirewallAction::Deny,
+    );
+    let rule_sets: [&[FirewallRule]; 4] = [
+        // An egress-bound deny that would apply on some route fails closed.
+        &[egress_deny, any_egress_allow(5, FirewallProtocol::Udp)],
+        &[any_deny, any_egress_allow(5, FirewallProtocol::Udp)],
+        // Egress-bound allow rules cannot match a route miss.
+        &[allow(FirewallProtocol::Udp)],
+        // Default deny.
+        &[],
+    ];
+    for (generation, rules) in (1..).zip(rule_sets) {
+        let config = firewall_config(&snapshot, rules, generation);
+        let mut slots = [FirewallStateSlot::default(); 1];
+        let mut firewall = FirewallRuntime::new(config, &mut slots);
+        let frame = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, true);
+        io.inject(LAN, frame.clone());
+        io.run_firewall_with_icmpv4_errors_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &mut errors,
+            &config,
+            Some(&mut firewall),
+            MonotonicMillis(1),
+            &mut NoTrace,
+        )
+        .unwrap();
+        assert_drop(&mut io, DropReason::FirewallRouteUnavailable, &frame);
+        assert_eq!(errors.pending_actions(), 0);
+        assert_eq!(errors.counters().queued, 0);
+        assert_eq!(resolution.pending_actions(), 0);
+        assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
+        // A route-miss denial is reported only as the route-miss drop.
+        assert_eq!(firewall.counters().denied_by_rule, 0);
+        assert_eq!(firewall.counters().denied_default, 0);
+    }
+    assert!(io.pop_tx().is_none());
 }

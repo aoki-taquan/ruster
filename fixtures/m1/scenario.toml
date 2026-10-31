@@ -102,8 +102,10 @@ tx = [
 # --- 5. Firewall rule 10 denies LAN->WAN TCP/23 (silent); unsolicited
 # inbound UDP has no NAT mapping (silent); TTL 1 yields ICMPv4 Time Exceeded
 # quoting the pre-SNAT packet; a destination without a route is dropped
-# silently because the firewall is bound (FIREWALL_ROUTE_UNAVAILABLE, no
-# Destination Unreachable in the full composition).
+# silently (FIREWALL_ROUTE_UNAVAILABLE): every v1 rule is bound to egress
+# "wan", so with no egress none can admit it and the default policy denies.
+# Network Unreachable is generated only for a route miss the policy admits
+# toward every egress (step 7b).
 [[step]]
 kind = "inject"
 interface = "lan"
@@ -233,6 +235,27 @@ drops = [
 ]
 consumes = [{ reason = "ARP_CONTROL", count = 2 }]
 
+# --- 7b. Route miss admitted by v2's egress-free rule 40: RFC 1812
+# §5.2.7.1 ICMPv4 Destination Unreachable (Network, code 0) to H, quoting
+# the received datagram (no route, so no NAT rewrite). The quoted IPv4
+# header and UDP checksum, and the ICMP checksum, were computed separately.
+[[step]]
+kind = "inject"
+interface = "lan"
+frame = { kind = "udp", eth = { src = "02:00:00:00:00:10", dst = "02:00:00:00:00:01" }, ip = { src = "192.168.1.10", dst = "198.18.0.9", id = 16 }, src-port = 5006, dst-port = 9, payload-ascii = "unrouted" }
+
+[[step]]
+kind = "tick"
+at-ms = 4015
+
+[[step]]
+kind = "expect"
+generation = 2
+tx = [
+  { interface = "lan", frame = { kind = "ipv4", eth = { src = "02:00:00:00:00:01", dst = "02:00:00:00:00:10" }, ip = { src = "192.168.1.1", dst = "192.168.1.10", tos = 192, ttl = 64 }, protocol = 1, payload-hex = "030084ef 00000000 45000024001040004011b2ebc0a8010ac6120009 138e00090010a1b2 756e726f75746564" } },
+]
+drops = [{ reason = "ROUTE_MISS", count = 1 }]
+
 # --- 8. Rejected applies leave generation 2 and its state working: an
 # invalid document (validation), a capacity change, and an interface change
 # (both restart-required). The sequencer still consumes generations 3 and 4
@@ -297,5 +320,6 @@ drops = [
   { reason = "IPV4_TTL_EXPIRED", count = 1 },
   { reason = "NAT44_UDP_MAPPING_MISS", count = 2 },
   { reason = "NEIGHBOR_UNRESOLVED", count = 3 },
+  { reason = "ROUTE_MISS", count = 1 },
 ]
 consumes = [{ reason = "ARP_CONTROL", count = 2 }]

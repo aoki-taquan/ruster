@@ -1,4 +1,4 @@
-use crate::firewall::{FirewallPacket, FirewallPlan, FirewallPlanError};
+use crate::firewall::{FirewallPacket, FirewallPlan, FirewallPlanError, FirewallRouteMissPacket};
 use crate::nat44::{
     Nat44TcpInboundPlan, Nat44TcpOutboundPlan, Nat44TcpPlanError, Nat44UdpInboundPlan,
     Nat44UdpOutboundPlan, Nat44UdpPlanError,
@@ -2391,8 +2391,26 @@ fn decide_ipv4<T: TraceSink>(
         return Err(Ipv4OptionsUnsupported);
     }
     let Some(route) = selected_route else {
-        if firewall_config.is_some() {
-            return Err(FirewallRouteUnavailable);
+        if let Some(config) = firewall_config {
+            // RFC 1812 §5.2.7.1 requires Destination Unreachable (Network),
+            // but only for packets the policy would admit toward every
+            // possible egress; anything else stays a silent drop so the error
+            // never becomes a route oracle.
+            let runtime = require_firewall_runtime(snapshot, config, firewall)?;
+            let validated =
+                firewall_validated.expect("forward firewall packet was preflight validated");
+            let packet = FirewallRouteMissPacket {
+                ingress,
+                source: ipv4.source,
+                destination: ipv4.destination,
+                protocol: validated.protocol,
+                source_port: validated.source_port,
+                destination_port: validated.destination_port,
+                tcp_flags: validated.tcp_flags,
+            };
+            if runtime.permits_route_miss(config, packet).is_none() {
+                return Err(FirewallRouteUnavailable);
+            }
         }
         if let Some((runtime, now)) = icmpv4_errors.as_mut() {
             let disposition = decide_icmpv4_error(

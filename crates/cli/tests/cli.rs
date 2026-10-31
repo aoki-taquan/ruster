@@ -192,8 +192,10 @@ fn plan_output_is_deterministic_and_reports_restart_reasons() {
     let cases = [
         (
             "router-v2.toml",
-            "plan: reloadable\nrestart-required: none\nchanges: 1\n  \
-             route + 192.0.2.0/24 dev if2 via 203.0.113.1\n",
+            "plan: reloadable\nrestart-required: none\nchanges: 2\n  \
+             route + 192.0.2.0/24 dev if2 via 203.0.113.1\n  \
+             firewall-rule + id 40 udp if1 -> any 192.168.1.0/24 -> 0.0.0.0/0 \
+             sport 1-65535 dport 1-65535 allow-stateful\n",
         ),
         (
             "router-capacity.toml",
