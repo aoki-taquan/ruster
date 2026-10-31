@@ -69,8 +69,10 @@ fn consume_reason_counters_cover_every_core_reason() {
     let expected: Vec<_> = ConsumeReason::ALL
         .iter()
         .map(|r| ("consume", r.code(), FieldValue::Count(0)))
+        .chain([("consume", "UNCLASSIFIED", FieldValue::Count(0))])
         .collect();
     assert_eq!(visited.0, expected);
+    assert_eq!(counters.unclassified(), 0);
 }
 
 #[test]
@@ -111,6 +113,7 @@ fn observability_counters_saturate_instead_of_wrapping() {
 
     let mut consumes = ConsumeReasonCounters {
         counts: [u64::MAX; ConsumeReason::ALL.len()],
+        unclassified: 0,
     };
     consumes.record(ConsumeReason::ArpControl);
     assert_eq!(

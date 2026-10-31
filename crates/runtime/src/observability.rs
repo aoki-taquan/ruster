@@ -203,24 +203,36 @@ impl ObservableFields for DropReasonCounters {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ConsumeReasonCounters {
     counts: [u64; ConsumeReason::ALL.len()],
+    /// A reason whose core index falls outside `ALL`; never panics or drops.
+    unclassified: u64,
 }
 
 impl ConsumeReasonCounters {
     #[inline]
     pub(crate) fn record(&mut self, reason: ConsumeReason) {
-        incr(&mut self.counts[reason.index()]);
+        match self.counts.get_mut(reason.index()) {
+            Some(count) => incr(count),
+            None => incr(&mut self.unclassified),
+        }
+    }
+
+    /// Count for `reason`; 0 for a reason outside the table, which is
+    /// counted in [`Self::unclassified`] instead.
+    #[must_use]
+    pub fn count(&self, reason: ConsumeReason) -> u64 {
+        self.counts.get(reason.index()).copied().unwrap_or(0)
     }
 
     #[must_use]
-    pub const fn count(&self, reason: ConsumeReason) -> u64 {
-        self.counts[reason.index()]
+    pub const fn unclassified(&self) -> u64 {
+        self.unclassified
     }
 
     #[must_use]
     pub fn total(&self) -> u64 {
-        self.counts
-            .iter()
-            .fold(0, |total, count| total.saturating_add(*count))
+        self.counts.iter().fold(self.unclassified, |total, count| {
+            total.saturating_add(*count)
+        })
     }
 }
 
@@ -230,6 +242,8 @@ impl ObservableFields for ConsumeReasonCounters {
             let count = FieldValue::Count(self.count(reason));
             visitor.field("consume", reason.code(), count);
         }
+        let unclassified = FieldValue::Count(self.unclassified);
+        visitor.field("consume", "UNCLASSIFIED", unclassified);
     }
 }
 
@@ -980,7 +994,8 @@ impl ObservableFields for ObservabilitySnapshot {
 
         visit_counts! {v, "tick", self.totals, TickTotals {
             ticks, active_ticks, successful_ticks, publications_applied, publications_rejected,
-            publications_deferred, apply_flushes_recorded, resolution_timer_scanned, resolution_retries_queued,
+            publications_deferred, apply_flushes_recorded, resolution_timer_scanned,
+            resolution_retries_queued,
             resolution_timed_out, failure_dispatch_scanned, failure_dispatch_queued;
             rx, generated_arp, generated_icmpv4
         }}
