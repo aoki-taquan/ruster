@@ -336,13 +336,13 @@ fn r16a_v1_generation_is_exact_case_replayable() {
         ),
         (Target::State, V1_SEEDS[0], 0, 296, 0xa820_8df2_4a38_15c0),
         (Target::State, V1_SEEDS[1], 31, 180, 0x1483_ad51_3f0e_084e),
-        (Target::State, V1_SEEDS[2], 317, 216, 0x7a60_b7ba_9616_7fd0),
+        (Target::State, V1_SEEDS[2], 317, 216, 0x82ba_0719_4d58_208b),
         (
             Target::State,
             V1_SEEDS[3],
             2_047,
             448,
-            0x1377_8d30_218a_abcf,
+            0x6a74_d25b_c962_912c,
         ),
         (Target::Config, V1_SEEDS[0], 0, 3_243, 0x45c6_7911_79d3_b0c3),
         (
@@ -775,9 +775,23 @@ fn r16_known_gap_expired_firewall_slots_still_refuse_fresh_flow() {
         .iter()
         .find(|case| case.name == "state-expired-firewall-capacity-after-idle-jump")
         .unwrap();
-    let coverage = r16a::state::run_with_coverage(&parse(&case.encoded).unwrap()).unwrap();
+    let (coverage, refusals) = r16a::state::run_traced(&parse(&case.encoded).unwrap()).unwrap();
     assert!(
         coverage.refused_after_expiry >= 1,
         "the post-expiry refusal is gone; finish the follow-up: {coverage:?}"
+    );
+    // The program's final packet retries the expired flow's own tuple.
+    assert_eq!(
+        refusals.last(),
+        Some(&r16a::state::Refusal {
+            host: 0,
+            internal_port: 5_000,
+            remote: r16a::router::remote(0, false),
+            remote_port: 53,
+            cause: Some(ruster_io_sim::RecycleCause::Forwarding(
+                ruster_core::DropReason::FirewallStateTableFull
+            )),
+        }),
+        "the expired same-tuple retry is no longer refused as table-full; finish the follow-up"
     );
 }

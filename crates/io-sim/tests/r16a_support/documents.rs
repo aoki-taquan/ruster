@@ -163,6 +163,9 @@ fn mutate_bytes(document: &mut Vec<u8>, rng: &mut V1Rng) {
 
 /// Shortest planted fragment that counts as a leak.
 pub const MIN_LEAK_FRAGMENT: usize = 8;
+/// Shortest fragment of an all-digit token that counts as a leak; longer,
+/// because short digit runs occur in legitimate numeric bounds.
+pub const MIN_NUMERIC_LEAK_FRAGMENT: usize = 12;
 
 /// Index of the first planted token that leaks into `haystack`, whole, as
 /// any [`MIN_LEAK_FRAGMENT`]-byte fragment, or hex-encoded (as raw frame
@@ -174,7 +177,14 @@ pub fn leaked(haystack: &str, needles: &[&str]) -> Option<usize> {
         haystack.contains(hex.as_str())
             || needle
                 .as_bytes()
-                .windows(MIN_LEAK_FRAGMENT.min(needle.len()))
+                .windows(
+                    if needle.bytes().all(|byte| byte.is_ascii_digit()) {
+                        MIN_NUMERIC_LEAK_FRAGMENT
+                    } else {
+                        MIN_LEAK_FRAGMENT
+                    }
+                    .min(needle.len()),
+                )
                 .any(|fragment| {
                     haystack.contains(std::str::from_utf8(fragment).expect("ASCII token"))
                 })

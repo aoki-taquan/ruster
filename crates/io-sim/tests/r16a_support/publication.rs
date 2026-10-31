@@ -743,7 +743,10 @@ impl World<'_> {
         let result = active.check_successor(&built.candidate);
         let after = Self::snapshot(active);
         if before != after {
-            return Err(self.fail("check_successor changed the live publication"));
+            return Err(self.fail(format!(
+                "check_successor changed the live publication: {:?}",
+                before.differing(&after)
+            )));
         }
         match (&result, expected) {
             (Ok(check), Ok(())) => {
@@ -834,7 +837,8 @@ impl World<'_> {
             (PublicationOutcome::Rejected(error), Err(expected)) if error == expected => {
                 if before != after {
                     return Err(self.fail(format!(
-                        "rejected apply ({error:?}) changed the live publication"
+                        "rejected apply ({error:?}) changed the live publication: {:?}",
+                        before.differing(&after)
                     )));
                 }
                 if matches!(error, ApplyError::RestartRequired(_)) {
@@ -1038,4 +1042,31 @@ struct Observed {
     icmpv4_actions: usize,
     counters: Counters,
     bindings: Bindings,
+}
+
+impl Observed {
+    /// Names of the fields that differ, for failure messages.
+    fn differing(&self, other: &Self) -> Vec<&'static str> {
+        let fields = [
+            ("generation", self.generation == other.generation),
+            ("last_apply", self.last_apply == other.last_apply),
+            ("udp_mappings", self.udp_mappings == other.udp_mappings),
+            ("udp_peers", self.udp_peers == other.udp_peers),
+            ("tcp_mappings", self.tcp_mappings == other.tcp_mappings),
+            ("tcp_sessions", self.tcp_sessions == other.tcp_sessions),
+            ("firewall", self.firewall == other.firewall),
+            ("resolution", self.resolution == other.resolution),
+            (
+                "icmpv4_actions",
+                self.icmpv4_actions == other.icmpv4_actions,
+            ),
+            ("counters", self.counters == other.counters),
+            ("bindings", self.bindings == other.bindings),
+        ];
+        fields
+            .into_iter()
+            .filter(|(_, equal)| !equal)
+            .map(|(name, _)| name)
+            .collect()
+    }
 }

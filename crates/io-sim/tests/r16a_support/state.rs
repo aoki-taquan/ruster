@@ -15,12 +15,15 @@
 //! - filtering: replies without exact live state, denied and corrupted
 //!   packets, and non-SYN TCP without a session are never forwarded;
 //! - capacity: the model counts NAT mappings, UDP peers, TCP sessions,
-//!   firewall states, and the port pool independently (non-live flows count
-//!   as still occupying), and a state-creating packet refused while every
-//!   one of them has room fails the case; live flows are never evicted;
+//!   firewall states, and the port pool independently (live and undecided
+//!   flows occupy; known-dead flows are reclaimable except for firewall
+//!   room), and a state-creating packet refused while every one of them has
+//!   room fails the case; live flows are never evicted;
 //! - slots: with every flow live, a tick that forwarded nothing leaves every
 //!   NAT/firewall slot unchanged; with only live and known-dead flows it may
 //!   only remove (expired) entries;
+//! - boundaries: some advances land within 2 ms of an idle lifetime, so
+//!   exact-boundary and partially expired tables are exercised;
 //! - not yet: post-expiry firewall liveness (see
 //!   [`REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY`]);
 //! - no panic and exact RX accounting in every tick.
@@ -29,7 +32,7 @@ use ruster_control::{
     ActivePublication, FullServiceStorage, PublicationSequencer, SimDeterministicKeySource,
 };
 use ruster_core::{IfId, Ipv4Address, MonotonicMillis};
-use ruster_io_sim::{FrameOrigin, SimIo};
+use ruster_io_sim::{FrameOrigin, RecycleCause, SimIo};
 use ruster_runtime::{run_tick, RxPhaseReport, TickBudgets, TickObserver};
 
 use super::envelope::{CaseEnvelope, Expected, InvariantFlags, Target};
@@ -56,6 +59,9 @@ pub const LIVE_WINDOW_MS: u64 = 230_000;
 pub const DEAD_AFTER_MS: u64 = 7_500_000;
 pub const BIG_JUMP_MS: u64 = 10_000_000;
 pub const MAX_ADVANCE_MS: u64 = 4_000;
+/// Configured idle lifetimes (firewall TCP Opening, UDP NAT/firewall); the
+/// `BOUNDARY` op advances to within 2 ms of one of them.
+pub const IDLE_LIFETIMES_MS: [u64; 2] = [240_000, 300_000];
 
 /// Start times above this could overflow the bounded time advances.
 pub const MAX_START_MS: u64 = 1 << 40;
@@ -78,7 +84,8 @@ mod op {
     pub const FLUSH: u8 = 9;
     pub const PAIR_UDP: u8 = 10;
     pub const PAIR_TCP: u8 = 11;
-    pub const COUNT: u8 = 12;
+    pub const BOUNDARY: u8 = 12;
+    pub const COUNT: u8 = 13;
 }
 
 pub fn generate(seed: u64, case_index: u64) -> Result<Vec<u8>, CaseFailure> {
@@ -105,7 +112,8 @@ pub fn generate(seed: u64, case_index: u64) -> Result<Vec<u8>, CaseFailure> {
             32..=39 => op::TCP_IN,
             40..=42 => op::DENY,
             43..=45 => op::CORRUPT,
-            46..=50 => op::ADVANCE,
+            46..=49 => op::ADVANCE,
+            50 => op::BOUNDARY,
             51 if rng.below(4) == 0 => op::BIG_JUMP,
             51 => op::ADVANCE,
             52..=55 => op::FLUSH,
@@ -270,8 +278,9 @@ enum SlotKnowledge {
 /// Disabled until the follow-up core firewall fix: expired firewall slots
 /// are reclaimed only when a later probe crosses them (at most one per
 /// probe), so after every flow expired a fresh flow can still be refused
-/// with `FirewallStateTableFull`. When enabled, refusals are checked with
-/// known-dead flows treated as reclaimed.
+/// with `FirewallStateTableFull`. While disabled, known-dead flows still
+/// count against firewall room; when enabled they count as reclaimed, as
+/// they always do for NAT mappings, peers, sessions, and ports.
 // TODO(R16 follow-up core firewall expired-slot reclaim): enable.
 pub const REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY: bool = false;
 
@@ -297,14 +306,19 @@ impl Model {
     }
 
     /// Why a refused state-creating outbound packet was owed success, if
-    /// it was. Occupancy is counted independently from the model; every
-    /// recorded flow that is not live is counted as still occupying its
-    /// slots (`dead_reclaimed` = false), which keeps the check sound
-    /// whatever the reclaim policy is.
-    fn owed(&self, out: &Outbound, dead_reclaimed: bool) -> Option<&'static str> {
+    /// it was. Occupancy is counted independently from the model. Flows
+    /// that may still be live (live or undecided) always occupy. Known-dead
+    /// flows are reclaimable for NAT mappings, peers, sessions, and ports;
+    /// for firewall room only when `firewall_dead_reclaimed`.
+    fn owed(&self, out: &Outbound, firewall_dead_reclaimed: bool) -> Option<&'static str> {
         let now = self.now;
-        let counted = |flow: &&Flow| !(dead_reclaimed && flow.liveness(now) == Liveness::Dead);
-        let flows: Vec<&Flow> = self.flows.iter().filter(counted).collect();
+        let not_dead = |flow: &&Flow| flow.liveness(now) != Liveness::Dead;
+        let flows: Vec<&Flow> = self.flows.iter().filter(not_dead).collect();
+        let firewall_occupied = if firewall_dead_reclaimed {
+            flows.len()
+        } else {
+            self.flows.len()
+        };
         let tuple_live = flows
             .iter()
             .any(|flow| flow.same_tuple(out) && flow.liveness(now) == Liveness::Live);
@@ -347,7 +361,7 @@ impl Model {
         let mapping_room = endpoint_live
             || (mappings < as_count(mapping_capacity) && mappings < usize::from(params.ports));
         let flow_room = per_flow < as_count(per_flow_capacity);
-        let firewall_room = flows.len() < self.firewall_usable;
+        let firewall_room = firewall_occupied < self.firewall_usable;
         (mapping_room && flow_room && firewall_room)
             .then_some("fresh flow with NAT mapping/port, peer/session, and firewall room")
     }
@@ -461,7 +475,13 @@ pub struct StateCoverage {
     pub outbound_refused: u64,
     pub filtered: u64,
     pub unchanged_ticks: u64,
+    pub exact_ticks: u64,
     pub deletion_only_ticks: u64,
+    pub undecided_ticks: u64,
+    /// Ticks with only live and known-dead flows (all-drop ones among them
+    /// are counted in `deletion_only_ticks`).
+    pub dead_known_ticks: u64,
+    pub boundary_advances: u64,
     /// Forwarded state-creating packets the capacity model owed success.
     pub owed_successes: u64,
     /// Refusals while known-dead state existed (post-expiry liveness is
@@ -479,7 +499,11 @@ impl StateCoverage {
         self.outbound_refused += other.outbound_refused;
         self.filtered += other.filtered;
         self.unchanged_ticks += other.unchanged_ticks;
+        self.exact_ticks += other.exact_ticks;
         self.deletion_only_ticks += other.deletion_only_ticks;
+        self.undecided_ticks += other.undecided_ticks;
+        self.dead_known_ticks += other.dead_known_ticks;
+        self.boundary_advances += other.boundary_advances;
         self.owed_successes += other.owed_successes;
         self.refused_after_expiry += other.refused_after_expiry;
         self.big_jumps += other.big_jumps;
@@ -490,7 +514,21 @@ pub fn run(case: &CaseEnvelope<'_>) -> Result<(), CaseFailure> {
     run_with_coverage(case).map(|_| ())
 }
 
+/// One refused state-creating outbound packet, in program order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Refusal {
+    pub host: usize,
+    pub internal_port: u16,
+    pub remote: Ipv4Address,
+    pub remote_port: u16,
+    pub cause: Option<RecycleCause>,
+}
+
 pub fn run_with_coverage(case: &CaseEnvelope<'_>) -> Result<StateCoverage, CaseFailure> {
+    run_traced(case).map(|(coverage, _)| coverage)
+}
+
+pub fn run_traced(case: &CaseEnvelope<'_>) -> Result<(StateCoverage, Vec<Refusal>), CaseFailure> {
     if case.now > MAX_START_MS {
         return Err(CaseFailure::new("state start time is out of range"));
     }
@@ -534,6 +572,7 @@ pub fn run_with_coverage(case: &CaseEnvelope<'_>) -> Result<StateCoverage, CaseF
         next_id: 1,
         ticks: 0,
         coverage: StateCoverage::default(),
+        refusals: Vec::new(),
     };
     harness.model.firewall_usable = active.firewall().usable_capacity();
     for (index, chunk) in program.ops.chunks_exact(OP_LEN).enumerate() {
@@ -544,7 +583,7 @@ pub fn run_with_coverage(case: &CaseEnvelope<'_>) -> Result<StateCoverage, CaseF
             })?;
     }
     harness.flush(&mut active)?;
-    Ok(harness.coverage)
+    Ok((harness.coverage, harness.refusals))
 }
 
 struct Harness {
@@ -556,6 +595,7 @@ struct Harness {
     next_id: u16,
     ticks: u32,
     coverage: StateCoverage,
+    refusals: Vec<Refusal>,
 }
 
 impl Harness {
@@ -677,6 +717,16 @@ impl Harness {
                 self.flush(active)?;
                 self.model.now += 1 + u64::from(u16::from_le_bytes([a, b])) % MAX_ADVANCE_MS;
             }
+            op::BOUNDARY => {
+                // Advance to just before, at, or just after an idle
+                // lifetime of the most recently refreshed flows, so tables
+                // hold exact-boundary and partially expired state.
+                self.flush(active)?;
+                let lifetime = IDLE_LIFETIMES_MS[usize::from(a) % IDLE_LIFETIMES_MS.len()];
+                let skew = u64::from(b % 5);
+                self.model.now += lifetime - 2 + skew;
+                self.coverage.boundary_advances += 1;
+            }
             op::BIG_JUMP => {
                 self.flush(active)?;
                 self.coverage.big_jumps += 1;
@@ -797,6 +847,11 @@ impl Harness {
         let batch = std::mem::take(&mut self.batch);
         self.ticks += 1;
         let knowledge = self.model.knowledge();
+        match knowledge {
+            SlotKnowledge::Exact => self.coverage.exact_ticks += 1,
+            SlotKnowledge::DeletionOnly => self.coverage.dead_known_ticks += 1,
+            SlotKnowledge::Undecided => self.coverage.undecided_ticks += 1,
+        }
         let before = Slots::capture(active);
         let report = run_tick(
             active,
@@ -865,11 +920,11 @@ impl Harness {
                 .iter()
                 .find(|(id, _, _)| *id == pending.id)
                 .map(|(_, egress, bytes)| (*egress, bytes.as_slice()));
-            self.evaluate(pending, tx).map_err(|failure| {
-                let cause = recycled
-                    .iter()
-                    .find(|(id, _)| *id == pending.id)
-                    .map(|(_, cause)| *cause);
+            let cause = recycled
+                .iter()
+                .find(|(id, _)| *id == pending.id)
+                .map(|(_, cause)| *cause);
+            self.evaluate(pending, tx, cause).map_err(|failure| {
                 CaseFailure::new(format!(
                     "tick={tick} now={} id={} {} recycle={cause:?}",
                     self.model.now, pending.id, failure.detail
@@ -937,6 +992,7 @@ impl Harness {
         &mut self,
         pending: &Pending,
         tx: Option<(IfId, &[u8])>,
+        cause: Option<RecycleCause>,
     ) -> Result<(), CaseFailure> {
         let now = self.model.now;
         match pending.expect {
@@ -955,7 +1011,7 @@ impl Harness {
                 let existing_dead_or_none = existing
                     .is_none_or(|index| self.model.flows[index].liveness(now) == Liveness::Dead);
                 let owed = if out.creates {
-                    self.model.owed(&out, false)
+                    self.model.owed(&out, REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY)
                 } else {
                     existing
                         .filter(|index| self.model.flows[*index].liveness(now) == Liveness::Live)
@@ -974,13 +1030,15 @@ impl Harness {
                         .any(|flow| flow.liveness(now) == Liveness::Dead)
                     {
                         self.coverage.refused_after_expiry += 1;
-                        if REQUIRE_POST_EXPIRY_FIREWALL_RECOVERY && out.creates {
-                            if let Some(reason) = self.model.owed(&out, true) {
-                                return Err(CaseFailure::new(format!(
-                                    "refused after expiry although owed ({reason}): {out:?}"
-                                )));
-                            }
-                        }
+                    }
+                    if out.creates {
+                        self.refusals.push(Refusal {
+                            host: out.host,
+                            internal_port: out.internal_port,
+                            remote: out.remote,
+                            remote_port: out.remote_port,
+                            cause,
+                        });
                     }
                     self.coverage.outbound_refused += 1;
                     return Ok(());
