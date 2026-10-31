@@ -1722,8 +1722,11 @@ impl<'state> FirewallRuntime<'state> {
     /// forever. This sweep reads at most `capacity` slots (one full lap from
     /// `reclaim_cursor`) and performs at most one backward-shift deletion,
     /// keeping the per-packet bound O(N); a full lap means any expired slot
-    /// is found. It resumes at the reclaimed position because the shift only
-    /// moves entries toward the hole, never behind the cursor. It is skipped
+    /// is found. It resumes at the reclaimed position because its own shift
+    /// only moves entries toward the hole, never behind the cursor; a lazy
+    /// probe-cleanup deletion before the cursor can shift entries behind it,
+    /// which only costs more reads, since the next full lap still finds
+    /// them. It is skipped
     /// in O(1) while `now_ms` is below the earliest-deadline lower bound,
     /// which an unsuccessful sweep raises to the exact minimum deadline of
     /// the (then all live) occupied slots. Live slots are never evicted.

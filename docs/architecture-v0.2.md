@@ -803,8 +803,11 @@ full tableで、empty homeに直接着地するtuple（同一tupleの再送を�
 かつ`occupied_count >= usable`」で拒否されそうなときだけ、refusal-path sweepを1回実行します。
 sweepはworker-localな`reclaim_cursor`（初期値とreconcile後は0）から循環して最大N slot
 （1周）を読み、最初のexpired slotを1件だけ同じbackward-shiftで削除してから同じtupleを再probe
-します。成功したsweepはcursorを削除位置に残します。shiftはentryをholeへ寄せるだけでcursorの
-後ろへは動かさないため、次のsweepは回収済み・再充填済みのslotを読み直しません。worker-localな`reclaim_not_before_ms`（全occupied slotの
+します。成功したsweepはcursorを削除位置に残します。sweep自身のshiftはentryをholeへ寄せる
+だけでcursorの後ろへは動かさないため、通常は次のsweepが回収済み・再充填済みのslotを読み直し
+ません。ただしcursorより手前でlazy probe cleanupが削除すると、そのshiftがentry（expiredを
+含む）をcursorの後ろへ移すことがあります。これはcostだけに影響し、次の1周で必ず見つかるため
+回復保証は変わりません。worker-localな`reclaim_not_before_ms`（全occupied slotの
 idle deadline `last_activity + TTL`の下界。初期値とreconcile後は0）が`now`より大きい間は
 sweepを読まずO(1)で拒否します。expired slotが無かったsweepは下界をlive slotの正確な最小
 deadline（`now`より後）へ上げ、commitは書いたslotのdeadlineで下界を下げる（ACKによる
@@ -819,7 +822,10 @@ Opening→Active昇格でdeadlineが早まる場合を含む）ため、下界�
 （delete最大3件）でstrict O(N)のままで、expired数を掛けたO(N²)にはなりません。cursorにより
 全失効後の再充填は償却O(1)/createです。実測（N=65536、usable 49152を全失効させて49152件を
 再作成、probe+maintenance counter合計）は、slot 0から毎回scanする版の総計4.04e8・平均8224・
-最大65584に対し、総計854350（約13N）・平均17・最大329でした。回復保証:
+最大65584に対し、総計854350（約13N）・平均17・最大329でした。償却O(1)はこの一斉失効後の
+再充填の場合です。1 msに1 flowずつ失効するtrickle/staggered expiryでは、cursorから次の
+expired slotまでの距離が長く、createは引き続き約O(N)です（N=65536で実測平均≈N/2）。
+この場合も下界gateにより概ね1 msあたり1周、かつ持続可能な失効率usable/TTLで抑えられます。回復保証:
 expired slotが1件でもあれば、そのdeadlineは下界以上かつ`now`以下なのでsweepが必ず走って
 1件削除し、`occupied_count < usable`となって同じattempt内の再probeがempty slotで終わり
 placementが成功します。したがって`FirewallStateTableFull`はoccupied slotが全てliveの
