@@ -13,7 +13,10 @@
 
 use std::{fmt, num::NonZeroU64};
 
-use ruster_config::ValidatedConfigV1;
+use ruster_config::{
+    ValidatedConfigV1, ValidatedFirewallV1, ValidatedIcmpv4ErrorV1, ValidatedNat44TcpV1,
+    ValidatedNat44UdpV1, ValidatedResolutionV1,
+};
 use ruster_core::{FirewallHashKey, Nat44TcpHashKey, Nat44UdpHashKey};
 
 use crate::publication::{
@@ -230,62 +233,14 @@ pub fn candidate_from_config<S: PublicationKeySource>(
     generation: NonZeroU64,
     keys: &mut S,
 ) -> Result<ValidatedCandidate, ConfigBridgeError> {
-    let missing = ConfigBridgeError::MissingService;
-    let storage = config.storage_shape();
-    let resolution = config
-        .resolution()
-        .zip(storage.resolution)
-        .ok_or(missing(RuntimeService::Resolution))?;
-    let icmpv4_errors = config
-        .icmpv4_errors()
-        .zip(storage.icmpv4_errors)
-        .ok_or(missing(RuntimeService::Icmpv4Errors))?;
-    let nat44 = config.nat44();
-    let udp = nat44
-        .and_then(|nat44| nat44.udp())
-        .zip(storage.nat44_udp)
-        .ok_or(missing(RuntimeService::Nat44Udp))?;
-    let tcp = nat44
-        .and_then(|nat44| nat44.tcp())
-        .zip(storage.nat44_tcp)
-        .ok_or(missing(RuntimeService::Nat44Tcp))?;
-    let (firewall, firewall_states) = config
-        .firewall()
-        .zip(storage.firewall_states)
-        .ok_or(missing(RuntimeService::Firewall))?;
-
-    let (resolution, resolution_shape) = resolution;
-    let (icmpv4_errors, icmpv4_shape) = icmpv4_errors;
-    let (udp, udp_shape) = udp;
-    let (tcp, tcp_shape) = tcp;
-    let shape = FullServiceStorageShape::new(
-        ResolutionStorageShape::new(
-            resolution_shape.states,
-            resolution_shape.actions,
-            resolution_shape.dynamic_neighbors,
-            resolution_shape.failure_holds,
-        ),
-        Icmpv4ErrorStorageShape::new(icmpv4_shape.states, icmpv4_shape.actions),
-        Nat44UdpStoragePlan::new(
-            udp_shape.mappings,
-            udp_shape.peers,
-            udp_shape.mapping_buckets,
-            udp_shape.mapping_nodes,
-            udp_shape.peer_buckets,
-            udp_shape.peer_nodes,
-            udp_shape.port_owners,
-        ),
-        Nat44TcpStoragePlan::new(
-            tcp_shape.mappings,
-            tcp_shape.sessions,
-            tcp_shape.mapping_buckets,
-            tcp_shape.mapping_nodes,
-            tcp_shape.session_buckets,
-            tcp_shape.session_nodes,
-            tcp_shape.port_owners,
-        ),
-        firewall_states,
-    );
+    let RequiredServices {
+        resolution,
+        icmpv4_errors,
+        udp,
+        tcp,
+        firewall,
+        shape,
+    } = required_services(config).map_err(ConfigBridgeError::MissingService)?;
 
     let key_set = keys
         .publication_keys(generation)
@@ -326,4 +281,81 @@ pub fn candidate_from_config<S: PublicationKeySource>(
         key_set.firewall,
     ));
     ValidatedCandidate::new(plan).map_err(ConfigBridgeError::Candidate)
+}
+
+/// Every service M1 requires, borrowed from one validated configuration,
+/// plus the storage shape that successor validation compares.
+pub(crate) struct RequiredServices<'config> {
+    pub(crate) resolution: &'config ValidatedResolutionV1,
+    pub(crate) icmpv4_errors: &'config ValidatedIcmpv4ErrorV1,
+    pub(crate) udp: &'config ValidatedNat44UdpV1,
+    pub(crate) tcp: &'config ValidatedNat44TcpV1,
+    pub(crate) firewall: &'config ValidatedFirewallV1,
+    pub(crate) shape: FullServiceStorageShape,
+}
+
+/// Selects the M1 services and maps their storage shape, or names the first
+/// missing service. Shared by [`candidate_from_config`] and the apply plan so
+/// that both classify one configuration identically.
+pub(crate) fn required_services(
+    config: &ValidatedConfigV1,
+) -> Result<RequiredServices<'_>, RuntimeService> {
+    let storage = config.storage_shape();
+    let (resolution, resolution_shape) = config
+        .resolution()
+        .zip(storage.resolution)
+        .ok_or(RuntimeService::Resolution)?;
+    let (icmpv4_errors, icmpv4_shape) = config
+        .icmpv4_errors()
+        .zip(storage.icmpv4_errors)
+        .ok_or(RuntimeService::Icmpv4Errors)?;
+    let nat44 = config.nat44();
+    let (udp, udp_shape) = nat44
+        .and_then(|nat44| nat44.udp())
+        .zip(storage.nat44_udp)
+        .ok_or(RuntimeService::Nat44Udp)?;
+    let (tcp, tcp_shape) = nat44
+        .and_then(|nat44| nat44.tcp())
+        .zip(storage.nat44_tcp)
+        .ok_or(RuntimeService::Nat44Tcp)?;
+    let (firewall, firewall_states) = config
+        .firewall()
+        .zip(storage.firewall_states)
+        .ok_or(RuntimeService::Firewall)?;
+    let shape = FullServiceStorageShape::new(
+        ResolutionStorageShape::new(
+            resolution_shape.states,
+            resolution_shape.actions,
+            resolution_shape.dynamic_neighbors,
+            resolution_shape.failure_holds,
+        ),
+        Icmpv4ErrorStorageShape::new(icmpv4_shape.states, icmpv4_shape.actions),
+        Nat44UdpStoragePlan::new(
+            udp_shape.mappings,
+            udp_shape.peers,
+            udp_shape.mapping_buckets,
+            udp_shape.mapping_nodes,
+            udp_shape.peer_buckets,
+            udp_shape.peer_nodes,
+            udp_shape.port_owners,
+        ),
+        Nat44TcpStoragePlan::new(
+            tcp_shape.mappings,
+            tcp_shape.sessions,
+            tcp_shape.mapping_buckets,
+            tcp_shape.mapping_nodes,
+            tcp_shape.session_buckets,
+            tcp_shape.session_nodes,
+            tcp_shape.port_owners,
+        ),
+        firewall_states,
+    );
+    Ok(RequiredServices {
+        resolution,
+        icmpv4_errors,
+        udp,
+        tcp,
+        firewall,
+        shape,
+    })
 }

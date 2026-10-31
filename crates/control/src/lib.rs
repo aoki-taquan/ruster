@@ -13,6 +13,7 @@
 
 mod activation;
 mod config_bridge;
+mod plan;
 mod publication;
 
 pub use activation::{
@@ -23,6 +24,11 @@ pub use activation::{
 pub use config_bridge::{
     candidate_from_config, ConfigBridgeError, KeySourceError, KeySourceKind, PublicationKeySource,
     PublicationKeys, SimDeterministicKeySource,
+};
+
+pub use plan::{
+    ApplyPlan, Change, Delta, FlushCount, NatChange, NatPortRange, NatRealm, PlanError, PlanSide,
+    PublicationSequencer, SequencerError, StateFlush, SuccessorCheck,
 };
 
 pub use publication::{
