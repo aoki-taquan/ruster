@@ -217,9 +217,11 @@ M1への経路はgap分析のslice S1〜S9とする。
 
 - S1: config→publication candidate bridge（`ruster-control`、sim専用key source）。
 - S2: live activation（storage所有、5 runtime preflight後の一点commit）。
-- S3: R10 plan/apply（typed diff、restart理由、generation採番、rollback）。
+- S3: R10 plan/apply（typed diff、restart理由、generation採番、rollback）。reloadごとのARP/NAT/FW
+  flush数をplan出力に表示する。restartをまたぐ単調なgeneration/key採番（A→B→Aのkey再利用防止）と
+  guard不要のdry-run successor checkもS3が持つ。
 - S4: R15 observability（counter snapshot、drop reason集計、health）。
-- S5a/S5b: scenario modelとsim driver、golden fixture。
+- S5a/S5b: scenario modelとsim driver、golden fixture。golden scenarioはreloadのflush数を出力する。
 - S6a/S6b: CLI `validate`/`plan`、`run-sim`/signal/E2E。
 - S7: R17 benchmark specとsmoke workflow。
 - S8a/S8b: R16 NAT/FW state・config fuzz、publication/apply property。

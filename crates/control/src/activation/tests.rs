@@ -7,14 +7,13 @@ use ruster_core::{
     GeneratedTraceSink, Icmpv4ErrorCounters, Icmpv4ErrorPublicationError, IfId, Ipv4Address,
     MonotonicMillis, Nat44TcpCounters, Nat44TcpMappingSlot, Nat44TcpReconcileError,
     Nat44TcpSessionSlot, Nat44UdpCounters, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
-    Nat44UdpReconcileError, PublicationQuiescence, ResolutionCounters, ResolutionFailureCounters,
-    ResolutionFailureTrace, ResolutionFailureTraceSink, ResolutionPublicationError,
-    ResolutionTimerTrace, ResolutionTimerTraceSink, TraceEvent, TraceSink,
+    Nat44UdpReconcileError, ResolutionCounters, ResolutionFailureCounters, ResolutionFailureTrace,
+    ResolutionFailureTraceSink, ResolutionPublicationError, ResolutionTimerTrace,
+    ResolutionTimerTraceSink, TraceEvent, TraceSink,
 };
 use ruster_io_sim::{SimIo, SimPublicationQuiescenceError};
 use ruster_runtime::{
-    run_tick, FullServicePublication, PublicationOutcome, TickBudgets, TickPhaseTrace,
-    TickPhaseTraceSink,
+    run_tick, PublicationOutcome, TickBudgets, TickPhaseTrace, TickPhaseTraceSink,
 };
 
 use super::{
@@ -48,6 +47,7 @@ const LIMITS: ValidationLimits = ValidationLimits {
 
 struct Variant {
     gateway: &'static str,
+    wan_mac: &'static str,
     resolution_interval_ms: u32,
     icmp_interval_ms: u32,
     firewall_states: u32,
@@ -55,6 +55,7 @@ struct Variant {
 
 const V1: Variant = Variant {
     gateway: "198.51.100.1",
+    wan_mac: "02:00:00:00:00:02",
     resolution_interval_ms: 1000,
     icmp_interval_ms: 100,
     firewall_states: 16,
@@ -80,7 +81,7 @@ mac = "02:00:00:00:00:01"
 id = 2
 name = "wan"
 device = "eth1"
-mac = "02:00:00:00:00:02"
+mac = "{wan_mac}"
 
 [[addresses]]
 interface = "lan"
@@ -198,8 +199,26 @@ last = 65535
 [firewall.rules.destination-ports]
 first = 0
 last = 65535
+
+[[firewall.rules]]
+id = 3
+ingress = "lan"
+egress = "lan"
+source = "192.0.2.0/24"
+destination = "192.0.2.0/24"
+protocol = "udp"
+action = "allow-stateful"
+
+[firewall.rules.source-ports]
+first = 0
+last = 65535
+
+[firewall.rules.destination-ports]
+first = 0
+last = 65535
 "#,
         gateway = variant.gateway,
+        wan_mac = variant.wan_mac,
         resolution_interval = variant.resolution_interval_ms,
         icmp_interval = variant.icmp_interval_ms,
         firewall_states = variant.firewall_states,
@@ -276,7 +295,7 @@ type Report = ruster_runtime::TickReport<
 >;
 
 fn tick(
-    active: &mut ActivePublication<'_>,
+    active: &mut ActivePublication<'_, SimIo>,
     io: &mut SimIo,
     now: u64,
     successor: Option<ValidatedCandidate>,
@@ -344,23 +363,49 @@ fn wan_udp_reply(public_port: u16) -> Vec<u8> {
     )
 }
 
-fn lan_tcp_syn(source_port: u16) -> Vec<u8> {
-    let mut frame = ethernet(14 + 40, LAN_MAC, HOST_MAC);
-    frame[34..36].copy_from_slice(&source_port.to_be_bytes());
-    frame[36..38].copy_from_slice(&443_u16.to_be_bytes());
+fn tcp(
+    l2: ([u8; 6], [u8; 6]),
+    source: ([u8; 4], u16),
+    destination: ([u8; 4], u16),
+    flags: u8,
+) -> Vec<u8> {
+    let mut frame = ethernet(14 + 40, l2.0, l2.1);
+    frame[34..36].copy_from_slice(&source.1.to_be_bytes());
+    frame[36..38].copy_from_slice(&destination.1.to_be_bytes());
     frame[38..42].copy_from_slice(&1_u32.to_be_bytes());
+    if flags & 0x10 != 0 {
+        frame[42..46].copy_from_slice(&2_u32.to_be_bytes());
+    }
     frame[46] = 5 << 4;
-    frame[47] = 0x02;
+    frame[47] = flags;
     frame[48..50].copy_from_slice(&65_535_u16.to_be_bytes());
     let mut pseudo = Vec::new();
-    pseudo.extend_from_slice(&HOST);
-    pseudo.extend_from_slice(&REMOTE);
+    pseudo.extend_from_slice(&source.0);
+    pseudo.extend_from_slice(&destination.0);
     pseudo.extend_from_slice(&[0, 6, 0, 20]);
     pseudo.extend_from_slice(&frame[34..54]);
     let checksum = internet_checksum(&pseudo);
     frame[50..52].copy_from_slice(&checksum.to_be_bytes());
-    ipv4(&mut frame, 6, 64, HOST, REMOTE);
+    ipv4(&mut frame, 6, 64, source.0, destination.0);
     frame
+}
+
+fn lan_tcp_syn(source_port: u16) -> Vec<u8> {
+    tcp(
+        (LAN_MAC, HOST_MAC),
+        (HOST, source_port),
+        (REMOTE, 443),
+        0x02,
+    )
+}
+
+fn wan_tcp_syn_ack(public_port: u16) -> Vec<u8> {
+    tcp(
+        (WAN_MAC, GATEWAY_A_MAC),
+        (REMOTE, 443),
+        (PUBLIC, public_port),
+        0x12,
+    )
 }
 
 fn arp_request(sender_mac: [u8; 6], sender: [u8; 4], target: [u8; 4]) -> Vec<u8> {
@@ -385,7 +430,7 @@ fn drain(io: &mut SimIo) -> Vec<ruster_io_sim::TxFrame> {
 /// Forwards one outbound UDP packet and returns (egress, destination MAC,
 /// translated source port).
 fn forward_once(
-    active: &mut ActivePublication<'_>,
+    active: &mut ActivePublication<'_, SimIo>,
     io: &mut SimIo,
     now: u64,
     source_port: u16,
@@ -410,7 +455,7 @@ fn forward_once(
 
 /// Returns whether an inbound reply to `public_port` is translated back.
 fn reply_reaches_host(
-    active: &mut ActivePublication<'_>,
+    active: &mut ActivePublication<'_, SimIo>,
     io: &mut SimIo,
     now: u64,
     public_port: u16,
@@ -422,10 +467,23 @@ fn reply_reaches_host(
         .any(|frame| frame.egress == LAN && frame.bytes[30..34] == HOST)
 }
 
-/// Every observable runtime field reachable without mutation.
+/// Every runtime field observable without mutation, plus the exact
+/// publication binding (config and hash key) of NAT and firewall runtimes.
+/// Internal directories, port owners, epochs, and watermarks have no
+/// read accessor; they are covered behaviourally after the failure loop.
 #[derive(PartialEq)]
 struct Observed {
     generation: NonZeroU64,
+    bindings: [bool; 3],
+    policies: (
+        ruster_core::ResolutionPolicy,
+        ruster_core::Icmpv4ErrorPolicy,
+    ),
+    shapes: (
+        ruster_core::Nat44UdpStorageShape,
+        ruster_core::Nat44TcpStorageShape,
+        usize,
+    ),
     last_apply: Option<super::ApplyReport>,
     resolution: (ResolutionCounters, ResolutionFailureCounters),
     resolution_occupancy: [usize; 5],
@@ -444,10 +502,30 @@ struct Observed {
     firewall: (FirewallCounters, Vec<FirewallStateSlot>),
 }
 
-fn observe(active: &ActivePublication<'_>) -> Observed {
+fn observe(active: &ActivePublication<'_, SimIo>) -> Observed {
     let resolution = active.resolution();
+    let authority = active.candidate.authority();
     Observed {
         generation: active.generation(),
+        bindings: [
+            active.nat44_udp().publication_binding_matches(
+                authority.nat44_udp_config(),
+                authority.nat44_udp_hash_key(),
+            ),
+            active.nat44_tcp().publication_binding_matches(
+                authority.nat44_tcp_config(),
+                authority.nat44_tcp_hash_key(),
+            ),
+            active
+                .firewall()
+                .config_matches(&authority.firewall_config()),
+        ],
+        policies: (resolution.policy(), active.icmpv4_errors().policy()),
+        shapes: (
+            active.nat44_udp().storage_shape(),
+            active.nat44_tcp().storage_shape(),
+            active.firewall().usable_capacity(),
+        ),
         last_apply: active.last_apply(),
         resolution: (resolution.counters(), resolution.failure_counters()),
         resolution_occupancy: [
@@ -485,10 +563,11 @@ fn occupied<T: PartialEq + Default>(slots: &[T]) -> usize {
 
 struct Live {
     public_udp_port: u16,
+    public_tcp_port: u16,
 }
 
 /// Installs live ARP, resolution, ICMPv4, NAT UDP/TCP, and firewall state.
-fn populate(active: &mut ActivePublication<'_>, io: &mut SimIo) -> Live {
+fn populate(active: &mut ActivePublication<'_, SimIo>, io: &mut SimIo) -> Live {
     let (egress, mac, public_udp_port) = forward_once(active, io, 1_000, 5_000);
     assert_eq!((egress, mac), (WAN, GATEWAY_A_MAC));
     io.inject(LAN, arp_request(LEARNED_MAC, LEARNED_HOST, ROUTER_LAN));
@@ -497,7 +576,12 @@ fn populate(active: &mut ActivePublication<'_>, io: &mut SimIo) -> Live {
     io.inject(LAN, lan_udp(5_002, REMOTE, 1));
     let report = tick(active, io, 1_001, None);
     assert!(report.active);
-    drain(io);
+    let sent = drain(io);
+    let syn = sent
+        .iter()
+        .find(|frame| frame.egress == WAN && frame.bytes[23] == 6)
+        .expect("translated TCP SYN");
+    let public_tcp_port = u16::from_be_bytes([syn.bytes[34], syn.bytes[35]]);
 
     let resolution = active.resolution();
     assert_eq!(resolution.dynamic_neighbor_count(), 1, "learned ARP entry");
@@ -509,7 +593,11 @@ fn populate(active: &mut ActivePublication<'_>, io: &mut SimIo) -> Live {
     assert!(occupied(active.nat44_udp().mappings()) >= 1, "UDP mapping");
     assert_eq!(occupied(active.nat44_tcp().mappings()), 1, "TCP mapping");
     assert!(occupied(active.firewall().states()) >= 2, "firewall flows");
-    Live { public_udp_port }
+    assert!(observe(active).bindings.iter().all(|matches| *matches));
+    Live {
+        public_udp_port,
+        public_tcp_port,
+    }
 }
 
 fn injected(stage: ApplyStage) -> ApplyError {
@@ -531,7 +619,7 @@ fn injected(stage: ApplyStage) -> ApplyError {
 fn failure_at_every_apply_stage_leaves_live_runtimes_unchanged() {
     let first = candidate(&V1, 1);
     let mut storage = FullServiceStorage::new(first.storage_shape()).unwrap();
-    let mut active = ActivePublication::new(&mut storage, first).unwrap();
+    let mut active = ActivePublication::<SimIo>::new(&mut storage, first).unwrap();
     let mut io = SimIo::new();
     let live = populate(&mut active, &mut io);
 
@@ -562,7 +650,9 @@ fn failure_at_every_apply_stage_leaves_live_runtimes_unchanged() {
     }
 
     // The old generation, snapshot route, and live NAT/firewall state still
-    // serve traffic: an inbound reply uses the pre-existing mapping.
+    // serve traffic. Inbound UDP and TCP replies use the pre-existing
+    // mappings, which exercises the NAT directories, port owners, hash
+    // keys, and firewall reverse lookups.
     assert_eq!(active.generation().get(), 1);
     assert!(reply_reaches_host(
         &mut active,
@@ -570,6 +660,33 @@ fn failure_at_every_apply_stage_leaves_live_runtimes_unchanged() {
         1_002,
         live.public_udp_port
     ));
+    io.inject(WAN, wan_tcp_syn_ack(live.public_tcp_port));
+    tick(&mut active, &mut io, 1_002, None);
+    let sent = drain(&mut io);
+    assert!(
+        sent.iter().any(|frame| frame.egress == LAN
+            && frame.bytes[23] == 6
+            && frame.bytes[30..34] == HOST
+            && frame.bytes[36..38] == 6_000_u16.to_be_bytes()),
+        "old TCP mapping still translates its reply"
+    );
+
+    // The learned dynamic neighbor is still used, without a new ARP request.
+    let queued = active.resolution().counters().queued;
+    let pending = active.resolution().pending_actions();
+    io.inject(
+        LAN,
+        udp((LAN_MAC, HOST_MAC), (HOST, 7_000), (LEARNED_HOST, 9), 64),
+    );
+    tick(&mut active, &mut io, 1_002, None);
+    let sent = drain(&mut io);
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        (sent[0].egress, &sent[0].bytes[0..6]),
+        (LAN, &LEARNED_MAC[..])
+    );
+    assert_eq!(active.resolution().counters().queued, queued);
+    assert_eq!(active.resolution().pending_actions(), pending);
     assert_eq!(
         forward_once(&mut active, &mut io, 1_003, 5_000),
         (WAN, GATEWAY_A_MAC, live.public_udp_port)
@@ -580,7 +697,7 @@ fn failure_at_every_apply_stage_leaves_live_runtimes_unchanged() {
 fn natural_successor_rejections_are_typed_and_leave_state_unchanged() {
     let first = candidate(&V1, 1);
     let mut storage = FullServiceStorage::new(first.storage_shape()).unwrap();
-    let mut active = ActivePublication::new(&mut storage, first).unwrap();
+    let mut active = ActivePublication::<SimIo>::new(&mut storage, first).unwrap();
     let mut io = SimIo::new();
     populate(&mut active, &mut io);
 
@@ -629,12 +746,21 @@ fn natural_successor_rejections_are_typed_and_leave_state_unchanged() {
             ),
             ApplyError::RestartRequired(RestartRequired::Icmpv4ErrorPolicy),
         ),
+        (
+            candidate(
+                &Variant {
+                    wan_mac: "02:00:00:00:00:22",
+                    ..V2
+                },
+                2,
+            ),
+            ApplyError::RestartRequired(RestartRequired::Interfaces),
+        ),
     ];
     for (successor, expected) in cases {
         let before = observe(&active);
-        let guard = io.try_publication_quiescence().unwrap();
-        let result =
-            FullServicePublication::<SimIo>::publish_candidate(&mut active, successor, guard);
+        // Same transaction that `publish_candidate` runs inside `run_tick`.
+        let result = active.apply_with(successor, |_| None).map(|_| ());
         assert_eq!(result, Err(expected));
         assert!(observe(&active) == before, "{expected:?} changed state");
     }
@@ -644,7 +770,7 @@ fn natural_successor_rejections_are_typed_and_leave_state_unchanged() {
 fn run_tick_applies_successor_at_tick_boundary_with_reconcile_semantics() {
     let first = candidate(&V1, 1);
     let mut storage = FullServiceStorage::new(first.storage_shape()).unwrap();
-    let mut active = ActivePublication::new(&mut storage, first).unwrap();
+    let mut active = ActivePublication::<SimIo>::new(&mut storage, first).unwrap();
     let mut io = SimIo::new();
     let live = populate(&mut active, &mut io);
     let before = observe(&active);
@@ -746,7 +872,7 @@ fn activation_rejects_mismatched_storage_and_storage_is_reusable() {
     let mut storage = FullServiceStorage::new(other_shape).unwrap();
     assert_eq!(storage.shape(), other_shape);
     assert_eq!(
-        ActivePublication::new(&mut storage, first).err(),
+        ActivePublication::<SimIo>::new(&mut storage, first).err(),
         Some(ActivationError::StorageShapeMismatch)
     );
 
@@ -755,10 +881,10 @@ fn activation_rejects_mismatched_storage_and_storage_is_reusable() {
     let mut storage = FullServiceStorage::new(candidate(&V1, 1).storage_shape()).unwrap();
     let mut io = SimIo::new();
     {
-        let mut active = ActivePublication::new(&mut storage, candidate(&V1, 1)).unwrap();
+        let mut active = ActivePublication::<SimIo>::new(&mut storage, candidate(&V1, 1)).unwrap();
         populate(&mut active, &mut io);
     }
-    let active = ActivePublication::new(&mut storage, candidate(&V1, 5)).unwrap();
+    let active = ActivePublication::<SimIo>::new(&mut storage, candidate(&V1, 5)).unwrap();
     assert_eq!(active.generation().get(), 5);
     assert!(active.resolution().is_pristine());
     assert!(active.icmpv4_errors().is_pristine());

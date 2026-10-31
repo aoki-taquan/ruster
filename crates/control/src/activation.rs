@@ -7,14 +7,17 @@
 //! self-reference, leaking, or pointer-identity tricks.
 //!
 //! [`ActivePublication`] owns the current [`ValidatedCandidate`] and the five
-//! worker-local runtimes bound to that storage. It implements
-//! [`FullServicePublication`], so [`ruster_runtime::run_tick`] drives it
-//! directly. A successor is installed only through
-//! [`FullServicePublication::publish_candidate`], which requires the packet
-//! backend's quiescence guard. The transaction is:
+//! worker-local runtimes bound to that storage. It is bound to exactly one
+//! packet backend type `I` and implements [`FullServicePublication`] only for
+//! that backend, so [`ruster_runtime::run_tick`] drives it directly. Both
+//! seam methods require a [`PublicationTick`] that only `run_tick` can mint,
+//! so the active view and successor publication are reachable only inside a
+//! tick, and a successor only after that backend granted quiescence. The
+//! transaction is:
 //!
 //! 1. [`ValidatedCandidate::validate_successor`] (generation, key rotation,
-//!    and the restart-required storage shape and fixed policies);
+//!    and the restart-required storage shape, fixed policies, and interface
+//!    identities);
 //! 2. preflight of all five runtimes, holding all five exclusive permits at
 //!    once (resolution, ICMPv4 errors, NAT44 UDP, NAT44 TCP, firewall);
 //! 3. one commit point: the five permit commits and the candidate swap. Each
@@ -25,48 +28,127 @@
 //! permits, which leaves every runtime byte unchanged, and keeps the old
 //! candidate, snapshot, and generation active.
 //!
-//! A successor cannot be applied without a backend quiescence guard:
+//! Outside `run_tick`, neither seam method can be called, because the tick
+//! token is a required argument:
 //!
-//! ```compile_fail
-//! use ruster_control::{ActivePublication, ValidatedCandidate};
+//! ```compile_fail,E0061
+//! use ruster_control::ActivePublication;
+//! use ruster_io_sim::SimIo;
+//! use ruster_runtime::FullServicePublication;
 //!
-//! fn apply_without_guard(active: &mut ActivePublication<'_>, next: ValidatedCandidate) {
-//!     let _ = active.apply(next);
+//! fn view_outside_tick(active: &mut ActivePublication<'_, SimIo>) {
+//!     let _ = FullServicePublication::<SimIo>::active(active);
 //! }
+//! ```
+//!
+//! ```compile_fail,E0061
+//! use ruster_control::{ActivePublication, ValidatedCandidate};
+//! use ruster_core::PublicationQuiescence;
+//! use ruster_io_sim::SimIo;
+//! use ruster_runtime::FullServicePublication;
+//!
+//! fn publish_outside_tick(
+//!     active: &mut ActivePublication<'_, SimIo>,
+//!     io: &mut SimIo,
+//!     next: ValidatedCandidate,
+//! ) {
+//!     let guard = io.try_publication_quiescence().unwrap();
+//!     let _ = FullServicePublication::<SimIo>::publish_candidate(active, next, guard);
+//! }
+//! ```
+//!
+//! and the token cannot be forged:
+//!
+//! ```compile_fail,E0451
+//! use ruster_control::ActivePublication;
+//! use ruster_io_sim::SimIo;
+//! use ruster_runtime::{FullServicePublication, PublicationTick};
+//!
+//! fn forge(active: &mut ActivePublication<'_, SimIo>) {
+//!     let tick = PublicationTick { _tick: std::marker::PhantomData };
+//!     let _ = FullServicePublication::<SimIo>::active(active, &tick);
+//! }
+//! ```
+//!
+//! A publication bound to one backend cannot be driven with another
+//! backend's (for example a self-minted) quiescence guard:
+//!
+//! ```compile_fail,E0277
+//! use ruster_control::ActivePublication;
+//! use ruster_core::{
+//!     PublicationQuiescence, PublicationQuiescenceDisposition, PublicationQuiescenceGuard,
+//! };
+//! use ruster_io_sim::SimIo;
+//! use ruster_runtime::FullServicePublication;
+//!
+//! struct AlwaysQuiet;
+//!
+//! impl PublicationQuiescence for AlwaysQuiet {
+//!     type Error = ();
+//!     type Guard<'backend> = PublicationQuiescenceGuard<'backend, Self>;
+//!
+//!     fn try_publication_quiescence(&mut self) -> Result<Self::Guard<'_>, ()> {
+//!         Ok(PublicationQuiescenceGuard::new(self))
+//!     }
+//!
+//!     fn current_io_disposition(&self) -> PublicationQuiescenceDisposition {
+//!         PublicationQuiescenceDisposition::ContinueOldIo
+//!     }
+//! }
+//!
+//! fn require_seam<P: FullServicePublication<'static, AlwaysQuiet>>() {}
+//! require_seam::<ActivePublication<'static, SimIo>>();
 //! ```
 //!
 //! The storage cannot be touched, moved, or dropped while a publication
 //! borrows it:
 //!
-//! ```compile_fail
+//! ```compile_fail,E0505
 //! use ruster_control::{ActivePublication, FullServiceStorage, ValidatedCandidate};
+//! use ruster_io_sim::SimIo;
 //!
 //! fn reuse_live_storage(candidate: ValidatedCandidate) {
 //!     let mut storage = FullServiceStorage::new(candidate.storage_shape()).unwrap();
-//!     let active = ActivePublication::new(&mut storage, candidate).unwrap();
+//!     let active = ActivePublication::<SimIo>::new(&mut storage, candidate).unwrap();
 //!     drop(storage);
 //!     drop(active);
 //! }
 //! ```
 //!
-//! Neither type can be cloned or formatted, so the owned hash keys cannot
-//! leak through them:
+//! Neither type can be formatted or cloned, so owned hash keys and runtime
+//! state cannot leak or be duplicated through them:
 //!
-//! ```compile_fail
+//! ```compile_fail,E0277
 //! use ruster_control::ActivePublication;
+//! use ruster_io_sim::SimIo;
 //!
 //! fn require_debug<T: std::fmt::Debug>() {}
-//! require_debug::<ActivePublication<'static>>();
+//! require_debug::<ActivePublication<'static, SimIo>>();
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0277
+//! use ruster_control::ActivePublication;
+//! use ruster_io_sim::SimIo;
+//!
+//! fn require_clone<T: Clone>() {}
+//! require_clone::<ActivePublication<'static, SimIo>>();
+//! ```
+//!
+//! ```compile_fail,E0277
+//! use ruster_control::FullServiceStorage;
+//!
+//! fn require_debug<T: std::fmt::Debug>() {}
+//! require_debug::<FullServiceStorage>();
+//! ```
+//!
+//! ```compile_fail,E0277
 //! use ruster_control::FullServiceStorage;
 //!
 //! fn require_clone<T: Clone>() {}
 //! require_clone::<FullServiceStorage>();
 //! ```
 
-use std::num::NonZeroU64;
+use std::{marker::PhantomData, num::NonZeroU64};
 
 use ruster_core::{
     DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallReconcileError,
@@ -82,13 +164,14 @@ use ruster_core::{
 };
 use ruster_runtime::{
     FirewallServiceView, FullServicePublication, FullServiceView, Nat44TcpServiceView,
-    Nat44UdpServiceView,
+    Nat44UdpServiceView, PublicationTick,
 };
 
 use crate::{FullServiceStorageShape, RuntimeService, SuccessorError, ValidatedCandidate};
 
 /// Typed, value-free failure to allocate one runtime table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct StorageAllocationError {
     pub service: RuntimeService,
 }
@@ -254,6 +337,8 @@ pub enum RestartRequired {
     StorageShape,
     ResolutionPolicy,
     Icmpv4ErrorPolicy,
+    /// An interface IfId was added/removed or its MAC address changed.
+    Interfaces,
 }
 
 /// Typed, value-free reason a successor was rejected.
@@ -284,6 +369,7 @@ impl From<SuccessorError> for ApplyError {
             SuccessorError::Icmpv4ErrorPolicyChanged => {
                 Self::RestartRequired(RestartRequired::Icmpv4ErrorPolicy)
             }
+            SuccessorError::InterfacesChanged => Self::RestartRequired(RestartRequired::Interfaces),
             SuccessorError::GenerationExhausted
             | SuccessorError::GenerationNotIncreasing
             | SuccessorError::Nat44UdpHashKeyReused
@@ -329,9 +415,11 @@ enum ApplyStage {
 /// candidate's precomputed snapshot and configs and reborrows the runtimes,
 /// without validation, hashing, scans, or allocation.
 ///
-/// Runtimes are reachable mutably only through that tick-local view. The
-/// read-only accessors serve observability and tests.
-pub struct ActivePublication<'storage> {
+/// Runtimes are reachable mutably only through that tick-local view, whose
+/// runtime borrows are private to `run_tick`. The read-only accessors serve
+/// observability and tests. `I` is the one packet backend whose quiescence
+/// guards may publish a successor.
+pub struct ActivePublication<'storage, I> {
     candidate: ValidatedCandidate,
     resolution: ResolutionRuntime<'storage>,
     icmpv4_errors: Icmpv4ErrorRuntime<'storage>,
@@ -339,9 +427,10 @@ pub struct ActivePublication<'storage> {
     nat44_tcp: Nat44TcpRuntime<'storage>,
     firewall: FirewallRuntime<'storage>,
     last_apply: Option<ApplyReport>,
+    backend: PhantomData<fn(I) -> I>,
 }
 
-impl<'storage> ActivePublication<'storage> {
+impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
     /// Builds pristine runtimes in `storage` and activates `candidate`.
     ///
     /// The storage must have been allocated for exactly the candidate's
@@ -415,6 +504,7 @@ impl<'storage> ActivePublication<'storage> {
             nat44_tcp,
             firewall,
             last_apply: None,
+            backend: PhantomData,
         })
     }
 
@@ -536,7 +626,7 @@ impl<'storage> ActivePublication<'storage> {
 }
 
 impl<'storage, I: PublicationQuiescence> FullServicePublication<'storage, I>
-    for ActivePublication<'storage>
+    for ActivePublication<'storage, I>
 {
     type Candidate = ValidatedCandidate;
     type Reject = ApplyError;
@@ -545,30 +635,22 @@ impl<'storage, I: PublicationQuiescence> FullServicePublication<'storage, I>
         &mut self,
         candidate: Self::Candidate,
         _quiescence: I::Guard<'_>,
+        _tick: &PublicationTick<'_>,
     ) -> Result<(), Self::Reject> {
         self.apply_with(candidate, |_| None).map(|_| ())
     }
 
-    fn active(&mut self) -> Option<FullServiceView<'_, 'storage>> {
+    fn active(&mut self, _tick: &PublicationTick<'_>) -> Option<FullServiceView<'_, 'storage>> {
         let authority = self.candidate.authority();
-        Some(FullServiceView {
-            generation: authority.generation(),
-            snapshot: authority.snapshot(),
-            resolution: &mut self.resolution,
-            icmpv4_errors: &mut self.icmpv4_errors,
-            nat44_udp: Nat44UdpServiceView {
-                config: authority.nat44_udp_config(),
-                runtime: Some(&mut self.nat44_udp),
-            },
-            nat44_tcp: Nat44TcpServiceView {
-                config: authority.nat44_tcp_config(),
-                runtime: Some(&mut self.nat44_tcp),
-            },
-            firewall: FirewallServiceView {
-                config: authority.firewall_config(),
-                runtime: Some(&mut self.firewall),
-            },
-        })
+        Some(FullServiceView::new(
+            authority.generation(),
+            authority.snapshot(),
+            &mut self.resolution,
+            &mut self.icmpv4_errors,
+            Nat44UdpServiceView::new(authority.nat44_udp_config(), Some(&mut self.nat44_udp)),
+            Nat44TcpServiceView::new(authority.nat44_tcp_config(), Some(&mut self.nat44_tcp)),
+            FirewallServiceView::new(authority.firewall_config(), Some(&mut self.firewall)),
+        ))
     }
 }
 

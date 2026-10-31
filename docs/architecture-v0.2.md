@@ -335,15 +335,19 @@ rotation、固定shape/policyはstatic successor checkだけを提供し、owner
 live activationは`FullServiceStorage`と`ActivePublication<'storage>`だけで行います。
 `FullServiceStorage`はcandidateのstorage shapeどおりに全runtime slot配列を一度だけ確保し、
 `ActivePublication`はそれを`'storage`の間exclusive borrowして5 runtimeを新規構築します。
-既存runtimeのadoptはできません。`ActivePublication`は`ruster-runtime`の`FullServicePublication`
-を実装し、successorはbackend quiescence guardを受け取る`publish_candidate`からだけ適用します。
+既存runtimeのadoptはできません。`ActivePublication`は一つのbackend型に束縛され、
+`ruster-runtime`の`FullServicePublication`をそのbackendに対してだけ実装します。seamの
+`active`/`publish_candidate`は`run_tick`だけが作れる`PublicationTick` tokenを要求し、
+`FullServiceView`のruntime borrowはprivateなので、tick外やwrapper adapterからruntimeを
+変更できません。successorはbackend quiescence成功後の`publish_candidate`からだけ適用します。
 applyは`validate_successor`の後、Resolution/ICMPv4 errorの`preflight_publication`と
 NAT44 UDP/TCP・firewallの`preflight_reconcile`の5 permitを同時に保持し、全て成功した場合だけ
 一点でcommitします。各permit commitとcandidate swapには失敗分岐がありません。途中の失敗では
 permitのDropにより全runtimeが不変で、旧candidate/snapshot/generationが継続します。
 Resolution/ICMP runtimeは旧snapshotのauthorityを持つqueueを全flushし、NAT/firewallはkey
 rotationに伴いflow stateを全flushします。累積counterは保持します。storage shapeと
-Resolution/ICMP policyの変更はtyped `RestartRequired`としてrejectし、resizeしません。
+Resolution/ICMP policy、interface IfId/MACの変更はtyped `RestartRequired`としてrejectし、
+resizeしません。reloadのたびにARP学習も消え、NAT/FW keyのrotationによりTCP sessionも切れます。
 rollbackとplan/diffは未実装です。
 
 `ruster-runtime`の`FullServicePublication`は、具体的なowned publicationやparserを持たず、
@@ -378,7 +382,9 @@ snapshot内sliceとfirewall rulesのborrowはactive adapter borrowと同じview 
 mutable runtime storageもそのtick-local viewだけがexclusiveにreborrowします。
 `FullServiceView`自身は`Copy`/`Clone`にせず、viewをtick外へescapeさせません。このsnapshot
 by-value化、generation追加、flat config/runtime fieldのnested化はpre-1.0 APIの意図したsource
-breakであり、downstream adapterはstruct literalを更新します。現行core full wrapperは3 configを
+breakであり、runtime borrowはprivate fieldにしたためdownstream adapterは`FullServiceView::new`と
+各`*ServiceView::new`でviewを構築します。`active`/`publish_candidate`は`run_tick`だけが作る
+`PublicationTick`を要求します。現行core full wrapperは3 configを
 必須とするため、service pair全体の不在表現はoptional-config composition seamを追加する後続
 作業です。64-bit buildではsnapshot 144 bytes、Firewall config 160 bytes、UDP/TCP NAT configは
 各112 bytesで、full view全体を576 bytes以下に保ちます。1024 tickの回帰fixtureは各tickの

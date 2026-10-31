@@ -19,7 +19,7 @@ use ruster_core::{
 use ruster_io_sim::SimIo;
 use ruster_runtime::{
     run_tick, FirewallServiceView, FullServicePublication, FullServiceView, Nat44TcpServiceView,
-    Nat44UdpServiceView, TickBudgets, TickPhaseTrace, TickPhaseTraceSink,
+    Nat44UdpServiceView, PublicationTick, TickBudgets, TickPhaseTrace, TickPhaseTraceSink,
 };
 
 struct CountingAllocator;
@@ -77,6 +77,7 @@ impl<'view, 'storage> FullServicePublication<'storage, SimIo> for Publication<'v
         &mut self,
         _candidate: Self::Candidate,
         _quiescence: PublicationQuiescenceGuard<'_, SimIo>,
+        _tick: &PublicationTick<'_>,
     ) -> Result<(), Self::Reject> {
         self.semantic_validation_calls += 1;
         self.fingerprint_calls += 1;
@@ -85,26 +86,17 @@ impl<'view, 'storage> FullServicePublication<'storage, SimIo> for Publication<'v
         Ok(())
     }
 
-    fn active(&mut self) -> Option<FullServiceView<'_, 'storage>> {
+    fn active(&mut self, _tick: &PublicationTick<'_>) -> Option<FullServiceView<'_, 'storage>> {
         self.active_calls += 1;
-        Some(FullServiceView {
-            generation: self.generation,
-            snapshot: *self.snapshot,
-            resolution: self.resolution,
-            icmpv4_errors: self.icmpv4_errors,
-            nat44_udp: Nat44UdpServiceView {
-                config: self.udp_config,
-                runtime: None,
-            },
-            nat44_tcp: Nat44TcpServiceView {
-                config: self.tcp_config,
-                runtime: None,
-            },
-            firewall: FirewallServiceView {
-                config: self.firewall_config,
-                runtime: None,
-            },
-        })
+        Some(FullServiceView::new(
+            self.generation,
+            *self.snapshot,
+            self.resolution,
+            self.icmpv4_errors,
+            Nat44UdpServiceView::new(self.udp_config, None),
+            Nat44TcpServiceView::new(self.tcp_config, None),
+            FirewallServiceView::new(self.firewall_config, None),
+        ))
     }
 }
 
