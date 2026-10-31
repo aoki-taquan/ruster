@@ -9,4 +9,5 @@ publish.workspace = true
 validation-test-hooks = ["ruster-core/validation-test-hooks"]
 
 [dependencies]
+ruster-config = { path = "../config" }
 ruster-core = { path = "../core" }

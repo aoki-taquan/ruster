@@ -191,6 +191,37 @@ exit criteria:
 - R16のparser/state/publication property suiteとbounded fuzz smokeが必須CIで成功する。
 - R17がbenchmark specificationをcommitし、そのspec SHAをM1 release evidenceへ固定する。
 
+#### M1 owner決定（2026-11-01決定）
+
+- binary: `crates/cli`（package `ruster-cli`、bin `ruster`）。arg parsingは手書きでclapは使わない。
+- signal: binary内の小さなprivate FFIでhandlerはstatic `AtomicBool`へstoreするだけ。新しい依存は追加しない。
+- scenario: `--scenario`で渡す別TOML file。frameは型付きbuilderとraw hex。reload stepは
+  scenario fileからの相対pathでconfig fileを参照する。
+- `run-sim`出力: stdoutはversion付きcanonical JSONL `ruster-run-sim/v1`、stderrは人向けsummary。
+  wall clockは含めない。signal試験用に`--hold` modeを持つ。
+- exit code: 0 = 正常終了またはsignalによる正常shutdown、1 = runtime/invariant failure、
+  2 = usage/config invalid。
+- hash key: `run-sim`はscenario seedからsim専用型で決定的に導出する。OS乱数による
+  key sourceはM2の`run`へ延期する。
+- service: M1ではNAT44 UDP、NAT44 TCP、FWを全て必須とし、欠落はtyped rejectとする。
+- restart-required: storage shape、resolution/ICMP policy、interface IfId/MAC変更。
+  route、neighbor、FW rule、NAT port/realmはreload可能。
+- rollback: M1では旧config fileを新generationとして再applyすることを指す。
+- R17の数値thresholdはimplementerがPRで提案し、ownerがそのPRで承認する。
+- NAT/FW占有のhigh-watermarkはM2へ延期する。
+
+M1への経路はgap分析のslice S1〜S9とする。
+
+- S1: config→publication candidate bridge（`ruster-control`、sim専用key source）。
+- S2: live activation（storage所有、5 runtime preflight後の一点commit）。
+- S3: R10 plan/apply（typed diff、restart理由、generation採番、rollback）。
+- S4: R15 observability（counter snapshot、drop reason集計、health）。
+- S5a/S5b: scenario modelとsim driver、golden fixture。
+- S6a/S6b: CLI `validate`/`plan`、`run-sim`/signal/E2E。
+- S7: R17 benchmark specとsmoke workflow。
+- S8a/S8b: R16 NAT/FW state・config fuzz、publication/apply property。
+- S9: RD0 docsとM1 release evidence。
+
 ### M2: Operable AF_XDP static router
 
 一workerまたはqueue-shardedな静的LAN/WAN構成をAF_XDPで継続運用できる。

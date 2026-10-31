@@ -8,7 +8,13 @@
 //! use ruster_control::{ActivePublication, FullServiceRuntimeSet};
 //! ```
 
+mod config_bridge;
 mod publication;
+
+pub use config_bridge::{
+    candidate_from_config, ConfigBridgeError, KeySourceError, KeySourceKind, PublicationKeySource,
+    PublicationKeys, SimDeterministicKeySource,
+};
 
 pub use publication::{
     FirewallPublicationInput, FullServiceStorageShape, Icmpv4ErrorStorageShape,
