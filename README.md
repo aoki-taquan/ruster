@@ -11,8 +11,8 @@ M1（Runnable deterministic router）では、rootやNICなしで宣言的config
 `config → validate → publication candidate → live activation → run_tick → observability →
 run-sim JSONL`をend-to-endで実行できます（下の「使い方」）。backendは決定的な`SimIo`だけで、
 AF_PACKET/AF_XDPはproduction backendではなく、実NICでの動作やthroughputは主張しません。
-M1はR16 checkのrequired化、R17 benchmark specの承認が残っており未closeです（firewall有効時の
-route-miss ICMPはcore修正で解消）。exit criterionごとの証跡は
+M1はroute-miss ICMPのowner判断（deviation受容か#284のmergeか）、R16 checkのrequired化、
+R17 benchmark specの承認が残っており未closeです。exit criterionごとの証跡は
 [`docs/release-evidence/m1.md`](docs/release-evidence/m1.md)にあります。
 
 workspaceは12 crateです。data-planeとI/Oのlibrary crateは外部依存を持ちません。cold
@@ -244,7 +244,8 @@ UDP/TCP NAT44、firewall、router-originated ICMPv4 errorを同じworkerへbind�
 選び、`Icmpv4ErrorRuntime`を必須で渡します。firewall deny、authority failureはsilentのままで、
 認可後のeligible TTL expiryはSNAT前の受信IPv4をquoteしてactionをqueueします。route missは
 egress不明のため、egress以外のselectorで「どのegressへも新規flowとして許可される」と判定
-できたpacketだけにDestination Unreachable Network（Type 3/Code 0）をqueueし、それ以外は
+でき、egress依存のNAT gate（outside→insideのbypass等）にも当たらないpacketだけに
+Destination Unreachable Network（Type 3/Code 0）をqueueし、それ以外は
 silentな`FIREWALL_ROUTE_UNAVAILABLE`です（route oracleを作らない、architecture参照）。
 RX batchとgenerated TXは融合せず、既定のworker tick順どおりRX完了後に生成します。生成packet
 そのものはfirewallの対象外です。既存のICMP runtimeを取らないcombined APIは変更しません。

@@ -760,6 +760,22 @@ allow」というrulesetで、LANへroute hitするprobeはsilent、route miss�
 同じegressへの先行allowにshadowされたegress限定denyでもroute missは保守的にsilentです。
 egress限定ruleだけのruleset（M1 fixtureのv1など）では、route missは従来どおりsilentです。
 
+「どのegressでも許可」はfirewall ruleだけでは決まりません。route hitではfirewall planより前に、
+egressに依存するNAT gateがsilent dropします（external→internalの
+`Nat44ExternalToInternalBypass`、combined realm mismatchのcrossing reject、inside→outsideの
+NAT runtime/authority要求）。これを無視すると、例えばNAT inside=LAN/outside=WANで
+`ingress Any / egress Any`のUDP allowがある場合、WANからLAN host宛はsilent、未routeの宛先は
+ICMPとなり、外部からinside側のroute有無を走査できます。そのためroute missでは、firewall評価の
+前にread-onlyな`route_miss_may_hit_nat_reject`で、いずれかのNAT configのoutsideがingress、
+realm mismatch時のTCP/UDPでingressがinside、またはinside発のUDP/TCPで対応するNAT runtimeが
+不在/不一致なら、counter/trace/stateを変えずsilentな`FirewallRouteUnavailable`にします
+（いずれも保守側で、該当egressへのrouteが無い場合も含む）。
+
+残るdeviation: egress-free評価はestablished stateを参照せず新規flowとして判定するため、
+routeが撤去された後の既存flowのpacket（例: established TCPのACK、許可ruleがegress限定の
+flowのUDP）はsilentな`FirewallRouteUnavailable`で、firewallなしの経路やRFC 1812 §5.2.7.1の
+MUSTと異なりNetwork Unreachableを返しません（FW-025）。
+
 full compositionでもfirewall authorizationはTTL判定とgenerated error captureより先です。
 rule/default deny、runtime/config/snapshot authority failure、上記egress-free評価でdenyされた
 LPM missはICMP/ARPをqueueしないsilent dropを維持します。認可済みpacketのTTL 0/1は既存のerror suppressionとreverse
@@ -1034,6 +1050,9 @@ private `signal` moduleだけで、crateは`#![deny(unsafe_code)]`です。
 - backendは`SimIo`だけです。`ruster run`、AF_PACKET/AF_XDPのlive constructor、実NIC/netns
   E2Eはありません（M2）。run-simの結果を性能値として扱いません（simは注入frameごとに
   cold側`Vec<u8>`を確保します）。
+- firewall有効時のroute missは、egress-free評価で許可されegress依存のNAT gateにも当たらない
+  packetだけにDestination Unreachable Networkを返します。route撤去後の既存flowのpacketは
+  silentです（RFC 1812 §5.2.7.1からのdeviation、FW-025）。この修正（#284）の採否はowner確認待ちです。
 - restart-requiredのapplyはrun-sim内でrejectとして報告し、storageを作り直しません（SIM-016）。
   generation/key履歴はprocess内だけです。
 - NAT/FW占有、resolution/action/audit high-watermark、native ring saturationは未実装です

@@ -3846,3 +3846,101 @@ fn route_miss_denied_toward_some_egress_stays_silent() {
     }
     assert!(io.pop_tx().is_none());
 }
+
+/// Review PoC: with NAT, a route hit from the outside toward the inside is a
+/// silent `Nat44ExternalToInternalBypass` drop before the firewall runs, so an
+/// egress-any allow must not turn the matching route miss into an ICMP error
+/// (that would let an outsider scan which inside prefixes are routed).
+#[test]
+fn nat_outside_route_miss_stays_silent_like_the_external_to_internal_bypass() {
+    let (_, interfaces, neighbors, bindings) = topology();
+    let routes = [
+        Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, LAN, None).unwrap(),
+        Route::new(Ipv4Address::from_octets([203, 0, 113, 0]), 24, WAN, None).unwrap(),
+    ];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let udp_config = Nat44UdpConfig::new(
+        &snapshot,
+        LAN,
+        WAN,
+        WAN_LOCAL,
+        40_000,
+        40_001,
+        Nat44UdpPolicy::default(),
+    )
+    .unwrap();
+    let tcp_config = Nat44TcpConfig::new(
+        &snapshot,
+        LAN,
+        WAN,
+        WAN_LOCAL,
+        40_000,
+        40_001,
+        Nat44TcpPolicy::default(),
+    )
+    .unwrap();
+    let rules = [rule(
+        9,
+        FirewallInterface::Any,
+        FirewallInterface::Any,
+        any_prefix(),
+        any_prefix(),
+        FirewallProtocol::Udp,
+        ports(0, u16::MAX),
+        ports(53, 53),
+        FirewallAction::AllowStateful,
+    )];
+    let config = firewall_config(&snapshot, &rules, 1);
+    let mut firewall_slots = [FirewallStateSlot::default(); 2];
+    let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
+    let mut udp_mappings = [Nat44UdpMappingSlot::default(); 1];
+    let mut udp_peers = [Nat44UdpPeerSlot::default(); 1];
+    let mut udp_indexes = UdpTestIndexes::new(udp_config, udp_mappings.len(), udp_peers.len());
+    let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
+    let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
+    let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
+    let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(
+        Icmpv4ErrorPolicy::default(),
+        &mut error_states,
+        &mut error_actions,
+    );
+    let mut io = SimIo::new();
+
+    // GW is a resolved WAN neighbor, so an ICMP error toward it would queue.
+    let routed_inside = udp_frame(GW, HOST, 12_345, 53, 0x4000, true);
+    let unrouted = udp_frame(GW, REMOTE, 12_345, 53, 0x4000, true);
+    let state_before = combined_state_snapshot(&udp, &tcp, &firewall);
+    for (frame, reason) in [
+        (&routed_inside, DropReason::Nat44ExternalToInternalBypass),
+        (&unrouted, DropReason::FirewallRouteUnavailable),
+    ] {
+        io.inject(WAN, frame.clone());
+        io.run_nat44_udp_and_tcp_with_firewall_and_icmpv4_errors_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &mut errors,
+            &udp_config,
+            Some(&mut udp),
+            &tcp_config,
+            Some(&mut tcp),
+            &config,
+            Some(&mut firewall),
+            MonotonicMillis(1),
+            &mut NoTrace,
+        )
+        .unwrap();
+        assert_drop(&mut io, reason, frame);
+        assert_eq!(errors.pending_actions(), 0);
+        assert_eq!(errors.counters().queued, 0);
+        assert_eq!(resolution.pending_actions(), 0);
+    }
+    assert_eq!(combined_state_snapshot(&udp, &tcp, &firewall), state_before);
+    assert!(io.pop_tx().is_none());
+}

@@ -78,8 +78,9 @@ workspaceは12 crateからなる。data-planeとI/Oのlibrary crate（`ruster-co
   `Musl`と`R16A Bounded`はrequiredではない
 
 milestone状態: M0のP0 rowはすべてledger上implementedだが、M0の独立release evidence fileは
-作っていない。M1は[`release-evidence/m1.md`](release-evidence/m1.md)のとおり、R16 checkの
-required化、R17 spec承認が残り未closeである（route-miss ICMPはcore修正で解消）。
+作っていない。M1は[`release-evidence/m1.md`](release-evidence/m1.md)のとおり、route-miss
+ICMPのowner判断（deviation受容か#284のmergeか）、R16 checkのrequired化、R17 spec承認が残り
+未closeである。
 
 ### Partialまたは欠落
 
@@ -247,12 +248,14 @@ exit criteria:
   - 補足（2026-11-01、実装による明確化。owner確認待ち）: NAT port poolのsize変更はstorage shapeを
     変えるためrestart-required。同sizeのrange shiftとrealm変更はreload可能。
 - rollback: M1では旧config fileを新generationとして再applyすることを指す。
-- 補足（S5b review。branch `fix/route-miss-icmp-with-firewall`のmergeをもってownerがcore修正を
-  選択）: firewall有効時のroute missは、egress=noneでingress/src/dst/protocol/port ruleとdefault policyを評価し、どのegressへも新規flowとして許可される
-  packetだけにICMPv4 Destination Unreachable Networkを生成する（egress限定allowはmatchせず、
-  egress限定denyはfail closed。route oracleの考察はarchitecture）。denyはsilentな
-  `FIREWALL_ROUTE_UNAVAILABLE`のまま。M1 goldenはv2のegress `Any` rule 40でType 3/Code 0を検証し、
-  exit criterionの「route ICMP」を満たす（ledger SIM-010 implemented、FW-025）。
+- 補足（S5b review、owner確認待ち）: firewall有効時のroute missの扱いは、deviationの受容か
+  core修正#284のmergeかをownerが決める。#284はegress=noneでingress/src/dst/protocol/port ruleと
+  default policyを評価し、どのegressへも新規flowとして許可され、egress依存のNAT gateにも
+  当たらないpacketだけにICMPv4 Destination Unreachable Networkを生成する（egress限定allowは
+  matchせず、egress限定denyはfail closed。route oracleの考察はarchitecture）。それ以外は
+  silentな`FIREWALL_ROUTE_UNAVAILABLE`のまま。M1 goldenはv2のegress `Any` rule 40で
+  Type 3/Code 0を検証する（SIM-010、FW-025）。route撤去後の既存flowのpacketはsilentのまま
+  （FW-025 deviation）。
 - R17の数値thresholdはimplementerがPRで提案し、ownerがそのPRで承認する。
 - NAT/FW占有のhigh-watermarkはM2へ延期する。
   - 補足（S4実装による明確化。owner確認待ち）: R15/Operability minimumのresolution state、action

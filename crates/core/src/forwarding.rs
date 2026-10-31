@@ -2397,6 +2397,18 @@ fn decide_ipv4<T: TraceSink>(
             // possible egress; anything else stays a silent drop so the error
             // never becomes a route oracle.
             let runtime = require_firewall_runtime(snapshot, config, firewall)?;
+            if route_miss_may_hit_nat_reject(
+                snapshot,
+                ingress,
+                ipv4.protocol,
+                combined_realm_mismatch,
+                nat44_udp_config,
+                nat44_udp,
+                nat44_tcp_config,
+                nat44_tcp,
+            ) {
+                return Err(FirewallRouteUnavailable);
+            }
             let validated =
                 firewall_validated.expect("forward firewall packet was preflight validated");
             let packet = FirewallRouteMissPacket {
@@ -3375,6 +3387,58 @@ fn plan_firewall(
             })
         }
     }
+}
+
+/// Read-only check whether a route-missing packet would be silently dropped by
+/// an egress-dependent NAT gate for *some* egress if it had a route.
+///
+/// A route hit runs these gates before the firewall plan: the
+/// external-to-internal bypass reject (any NAT config whose outside is the
+/// ingress), the combined realm-mismatch crossing reject, and the inside to
+/// outside NAT runtime/authority requirement. Answering such a route miss
+/// with ICMP while the route hit stays silent would let the sender learn which
+/// destinations are routed toward the guarded realm, so the route miss stays
+/// silent instead. Nothing (counters, traces, state) is mutated.
+#[allow(clippy::too_many_arguments)]
+fn route_miss_may_hit_nat_reject(
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    protocol: u8,
+    combined_realm_mismatch: bool,
+    nat44_udp_config: Option<&Nat44UdpConfig>,
+    nat44_udp: &Option<&mut Nat44UdpRuntime<'_>>,
+    nat44_tcp_config: Option<&Nat44TcpConfig>,
+    nat44_tcp: &Option<&mut Nat44TcpRuntime<'_>>,
+) -> bool {
+    let udp_outside = nat44_udp_config.is_some_and(|config| ingress == config.outside());
+    let tcp_outside = nat44_tcp_config.is_some_and(|config| ingress == config.outside());
+    if udp_outside || tcp_outside {
+        return true;
+    }
+    let udp_inside = nat44_udp_config.is_some_and(|config| ingress == config.inside());
+    let tcp_inside = nat44_tcp_config.is_some_and(|config| ingress == config.inside());
+    if combined_realm_mismatch && matches!(protocol, 6 | 17) && (udp_inside || tcp_inside) {
+        return true;
+    }
+    if let Some(config) = nat44_udp_config.filter(|_| udp_inside && protocol == 17) {
+        let usable = config.authority_matches(snapshot)
+            && nat44_udp
+                .as_deref()
+                .is_some_and(|runtime| runtime.config() == *config);
+        if !usable {
+            return true;
+        }
+    }
+    if let Some(config) = nat44_tcp_config.filter(|_| tcp_inside && protocol == 6) {
+        let usable = config.authority_matches(snapshot)
+            && nat44_tcp
+                .as_deref()
+                .is_some_and(|runtime| runtime.config() == *config);
+        if !usable {
+            return true;
+        }
+    }
+    false
 }
 
 fn require_firewall_runtime<'runtime, 'state>(
