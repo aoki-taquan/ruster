@@ -617,6 +617,14 @@ impl ValidatedCandidate {
         self.storage_shape
     }
 
+    /// Test-only read access to the owned forwarding tables.
+    #[cfg(feature = "validation-test-hooks")]
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn forwarding_owner(&self) -> &ValidatedForwardingOwner {
+        &self.forwarding
+    }
+
     /// Builds one O(1), lifetime-bound authority borrow.
     #[must_use]
     pub fn authority(&self) -> ValidatedAuthority<'_> {

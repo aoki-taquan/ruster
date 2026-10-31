@@ -2,8 +2,10 @@ use std::num::NonZeroU64;
 
 use ruster_config::{parse, validate, ValidatedConfig, ValidatedConfigV1, ValidationLimits};
 use ruster_control::{
-    candidate_from_config, ConfigBridgeError, KeySourceError, KeySourceKind, PublicationKeySource,
-    PublicationKeys, RuntimeService, SimDeterministicKeySource, SuccessorError, ValidatedCandidate,
+    candidate_from_config, ConfigBridgeError, FullServiceStorageShape, Icmpv4ErrorStorageShape,
+    KeySourceError, KeySourceKind, Nat44TcpStoragePlan, Nat44UdpStoragePlan, PublicationKeySource,
+    PublicationKeys, ResolutionStorageShape, RuntimeService, SimDeterministicKeySource,
+    SuccessorError, ValidatedCandidate,
 };
 use ruster_core::{FirewallHashKey, IfId, Ipv4Address, Nat44TcpHashKey, Nat44UdpHashKey};
 
@@ -46,7 +48,7 @@ address = "198.51.100.1"
 mac = "02:00:00:00:00:03"
 
 [ipv4-origin]
-default-ttl = 64
+default-ttl = 200
 
 [resolution.policy]
 interval-ms = 1000
@@ -55,18 +57,18 @@ dynamic-neighbor-ttl-ms = 60000
 max-attempts = 3
 
 [resolution.capacity]
-states = 8
-actions = 8
-dynamic-neighbors = 16
-failure-holds = 8
+states = 5
+actions = 6
+dynamic-neighbors = 7
+failure-holds = 9
 
 [icmpv4-errors.policy]
 interval-ms = 100
 state-ttl-ms = 60000
 
 [icmpv4-errors.capacity]
-states = 8
-actions = 8
+states = 10
+actions = 11
 
 [nat44.realm]
 inside = "lan"
@@ -75,7 +77,7 @@ public-address = "198.51.100.10"
 
 [nat44.realm.ports]
 first = 40000
-last = 40015
+last = 40020
 
 [nat44.udp]
 idle-ttl-ms = 300000
@@ -83,8 +85,8 @@ allocator-seed = "9876543210123"
 icmpv4-errors = "external-only"
 
 [nat44.udp.capacity]
-mappings = 16
-peers = 32
+mappings = 12
+peers = 40
 
 [nat44.tcp]
 idle-ttl-ms = 7440000
@@ -92,8 +94,8 @@ allocator-seed = "11"
 icmpv4-errors = "disabled"
 
 [nat44.tcp.capacity]
-mappings = 16
-sessions = 32
+mappings = 24
+sessions = 100
 
 [firewall.policy]
 udp-idle-ttl-ms = 300000
@@ -101,7 +103,7 @@ tcp-opening-idle-ttl-ms = 240000
 tcp-active-idle-ttl-ms = 7440000
 
 [firewall.capacity]
-states = 64
+states = 30
 
 [[firewall.rules]]
 id = 1
@@ -229,34 +231,47 @@ fn config_bridge_builds_candidates_and_rejects_missing_services() {
     let candidate = sim_candidate(&config, 7);
     assert_eq!(candidate.generation(), generation(7));
 
+    // Every shape field has a distinct value so a swapped mapping fails.
+    // Node counts equal slot counts by construction in both validators.
     let storage = config.storage_shape();
-    let shape = candidate.storage_shape();
-    let resolution = storage.resolution.unwrap();
-    assert_eq!(shape.resolution().state_slots(), resolution.states);
-    assert_eq!(shape.resolution().action_slots(), resolution.actions);
     assert_eq!(
-        shape.resolution().dynamic_neighbor_slots(),
-        resolution.dynamic_neighbors
+        candidate.storage_shape(),
+        FullServiceStorageShape::new(
+            ResolutionStorageShape::new(5, 6, 7, 9),
+            Icmpv4ErrorStorageShape::new(10, 11),
+            Nat44UdpStoragePlan::new(12, 40, 16, 12, 64, 40, 21),
+            Nat44TcpStoragePlan::new(24, 100, 32, 24, 128, 100, 21),
+            30,
+        )
     );
-    assert_eq!(
-        shape.resolution().failure_hold_slots(),
-        resolution.failure_holds
-    );
-    let icmp = storage.icmpv4_errors.unwrap();
-    assert_eq!(shape.icmpv4_errors().state_slots(), icmp.states);
-    assert_eq!(shape.icmpv4_errors().action_slots(), icmp.actions);
     let udp = storage.nat44_udp.unwrap();
-    assert_eq!(shape.nat44_udp().mapping_slots(), udp.mappings);
-    assert_eq!(shape.nat44_udp().peer_slots(), udp.peers);
-    assert_eq!(shape.nat44_udp().mapping_buckets(), udp.mapping_buckets);
-    assert_eq!(shape.nat44_udp().peer_buckets(), udp.peer_buckets);
-    assert_eq!(shape.nat44_udp().port_owner_slots(), 16);
+    assert_eq!(
+        (
+            udp.mappings,
+            udp.peers,
+            udp.mapping_buckets,
+            udp.mapping_nodes
+        ),
+        (12, 40, 16, 12)
+    );
+    assert_eq!(
+        (udp.peer_buckets, udp.peer_nodes, udp.port_owners),
+        (64, 40, 21)
+    );
     let tcp = storage.nat44_tcp.unwrap();
-    assert_eq!(shape.nat44_tcp().mapping_slots(), tcp.mappings);
-    assert_eq!(shape.nat44_tcp().session_slots(), tcp.sessions);
-    assert_eq!(shape.nat44_tcp().session_buckets(), tcp.session_buckets);
-    assert_eq!(shape.nat44_tcp().port_owner_slots(), 16);
-    assert_eq!(shape.firewall_state_slots(), 64);
+    assert_eq!(
+        (
+            tcp.mappings,
+            tcp.sessions,
+            tcp.mapping_buckets,
+            tcp.mapping_nodes
+        ),
+        (24, 100, 32, 24)
+    );
+    assert_eq!(
+        (tcp.session_buckets, tcp.session_nodes, tcp.port_owners),
+        (128, 100, 21)
+    );
 
     let expected_keys = SimDeterministicKeySource::new(SIM_SEED)
         .publication_keys(generation(7))
@@ -287,7 +302,7 @@ fn config_bridge_builds_candidates_and_rejects_missing_services() {
     );
     assert_eq!(
         (udp_config.first_port(), udp_config.last_port()),
-        (40000, 40015)
+        (40000, 40020)
     );
     assert_eq!(udp_config.policy(), nat.udp().unwrap().policy());
     assert_eq!(udp_config.policy().allocator_seed(), 9_876_543_210_123);
@@ -394,7 +409,7 @@ fn bridge_candidates_pass_successor_validation_and_reject_key_reuse() {
         Err(SuccessorError::Nat44UdpHashKeyReused)
     );
 
-    let resized = validated(&CONFIG.replace("states = 64", "states = 128"));
+    let resized = validated(&CONFIG.replace("states = 30\n", "states = 31\n"));
     let resized = sim_candidate(&resized, 4);
     assert_eq!(
         rollback.validate_successor(&resized),
@@ -468,4 +483,32 @@ fn bridge_errors_and_key_material_are_redacted() {
             "forbidden source: {forbidden}"
         );
     }
+}
+
+#[cfg(feature = "validation-test-hooks")]
+#[test]
+fn config_bridge_moves_complete_topology_and_origin_policy_into_candidate() {
+    let config = validated(CONFIG);
+    assert_eq!(config.ipv4_origin().default_ttl(), 200);
+    assert!(!config.routes().is_empty());
+    assert!(!config.neighbors().is_empty());
+    assert!(!config.local_ipv4().is_empty());
+    let candidate = sim_candidate(&config, 1);
+    let owner = candidate.forwarding_owner();
+    assert_eq!(owner.routes(), config.routes());
+    assert_eq!(owner.interfaces(), config.core_interfaces());
+    assert_eq!(owner.neighbors(), config.neighbors());
+    assert_eq!(owner.local_ipv4(), config.local_ipv4());
+
+    let expected = ruster_core::ForwardingSnapshot::with_ipv4_origin_policy(
+        config.routes(),
+        config.core_interfaces(),
+        config.neighbors(),
+        config.local_ipv4(),
+        config.ipv4_origin(),
+    )
+    .unwrap();
+    let rendered = format!("{:?}", candidate.authority().snapshot());
+    assert_eq!(rendered, format!("{expected:?}"));
+    assert!(rendered.contains("default_ttl: 200"), "{rendered}");
 }

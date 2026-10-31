@@ -25,8 +25,10 @@ use crate::publication::{
 
 /// How a [`PublicationKeySource`] obtains its keys.
 ///
-/// A future production entry point must statically require a non-simulation
-/// kind and therefore refuse [`SimDeterministicKeySource`].
+/// The kind is self-declared by the implementation. A future production entry
+/// point must reject [`KeySourceKind::DeterministicSimulation`], for example
+/// with a const assertion on `S::KIND` or a sealed production marker trait.
+/// This is not enforced yet; no production entry point exists in M1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum KeySourceKind {
@@ -39,7 +41,11 @@ pub enum KeySourceKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum KeySourceError {
-    /// The derivation produced an all-zero key, which core rejects.
+    /// The source produced an all-zero key, which core rejects.
+    ///
+    /// Defensive only for [`SimDeterministicKeySource`]: the two words of one
+    /// key come from distinct tags through an injective map, so they never
+    /// coincide and in particular are never both zero.
     AllZeroKey(RuntimeService),
 }
 
@@ -95,6 +101,11 @@ impl fmt::Debug for PublicationKeys {
 /// This is a cold-path, statically dispatched abstraction. Implementations
 /// must return keys distinct from every earlier generation they served so
 /// that successor validation accepts the resulting candidate.
+///
+/// [`candidate_from_config`] draws the key set after the missing-service
+/// checks but before [`ValidatedCandidate::new`]. A build that is then
+/// rejected still consumes one key set, which a source enforcing unique,
+/// never-reissued keys must account for.
 pub trait PublicationKeySource {
     /// Provenance of the keys, checked by entry points that require a
     /// particular kind.
@@ -111,9 +122,9 @@ pub trait PublicationKeySource {
 ///
 /// Keys are a pure function of `(seed, generation)` so `run-sim` output is
 /// byte-reproducible. They are *not* unpredictable and must never protect live
-/// traffic; [`PublicationKeySource::KIND`] is
-/// [`KeySourceKind::DeterministicSimulation`] so production entry points can
-/// reject this type at compile time.
+/// traffic. Its [`PublicationKeySource::KIND`] is
+/// [`KeySourceKind::DeterministicSimulation`]; a future production entry point
+/// must reject that kind, which is not enforced yet (M2).
 ///
 /// # Derivation
 ///
@@ -129,8 +140,10 @@ pub trait PublicationKeySource {
 /// For a fixed seed and tag every step is a bijection of `generation`, so two
 /// different generations always produce different first words and therefore
 /// different keys for every service. Identical `(seed, generation)` yields
-/// identical keys. An all-zero pair is never accepted: it is rejected through
-/// the core key constructors as [`KeySourceError::AllZeroKey`].
+/// identical keys. For one key the two words are `mix(seed ^ mix(g ^ t1))`
+/// and `mix(seed ^ mix(g ^ t2))` with `t1 != t2`; by injectivity they differ,
+/// so an all-zero pair is unreachable. The [`KeySourceError::AllZeroKey`]
+/// mapping through the core constructors is purely defensive.
 ///
 /// The seed is never formatted.
 pub struct SimDeterministicKeySource {

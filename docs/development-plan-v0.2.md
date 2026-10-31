@@ -209,6 +209,9 @@ exit criteria:
 - rollback: M1では旧config fileを新generationとして再applyすることを指す。
 - R17の数値thresholdはimplementerがPRで提案し、ownerがそのPRで承認する。
 - NAT/FW占有のhigh-watermarkはM2へ延期する。
+- sim専用key sourceの拒否: 現在は型名と自己申告の`KeySourceKind`だけで区別している。M2の`run`は
+  `DeterministicSimulation`を拒否する仕組み（`S::KIND`のconst assertionまたはsealed production
+  marker trait）を実装する。
 
 M1への経路はgap分析のslice S1〜S9とする。
 
