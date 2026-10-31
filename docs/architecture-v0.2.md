@@ -353,7 +353,14 @@ Resolution/ICMP runtimeは旧snapshotのauthorityを持つqueueを全flushし、
 rotationに伴いflow stateを全flushします。累積counterは保持します。storage shapeと
 Resolution/ICMP policy、interface IfId/MACの変更はtyped `RestartRequired`としてrejectし、
 resizeしません。reloadのたびにARP学習も消え、NAT/FW keyのrotationによりTCP sessionも切れます。
-rollbackとplan/diffは未実装です。
+`ApplyPlan`は二つのvalidated config文書からmutationなしでkey順のroute/neighbor/local IPv4/
+interface/FW rule差分、FW順序・policy、NAT realm/port/policy変更、restart理由、flush見込みを
+作ります。`ActivePublication::check_successor`はguardなしで同じ検証と5 preflightを行い、
+permitをcommitせず破棄するdry-runで、live flush数を返します。generationは
+`PublicationSequencer`が単調に採番し、発行済みkeyの再利用をrejectします。M1のrollbackは
+旧config文書を再validateし、新generation・新keyとしてapplyすることです。storageは
+activateした最大generationを保持し、再activationはそれより大きいgenerationだけを受理します。
+process restartをまたぐgeneration/key履歴は持たず、M1はprocess起動ごとに新規開始します。
 
 `ruster-runtime`の`FullServicePublication`は、具体的なowned publicationやparserを持たず、
 candidateのall-or-nothing適用とactive full-service viewの借用だけを抽象化します。

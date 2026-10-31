@@ -39,6 +39,12 @@
 //! permits, which leaves every runtime byte unchanged, and keeps the old
 //! candidate, snapshot, and generation active.
 //!
+//! [`ActivePublication::check_successor`] runs stages 1 and 2 without a
+//! guard or tick and drops the permits instead of committing them, so a plan
+//! can dry-run a successor without changing anything. [`FullServiceStorage`]
+//! remembers the highest generation it served, and a re-activation on it must
+//! use a strictly higher generation.
+//!
 //! Outside `run_tick`, neither seam method can be called, because the tick
 //! token is a required argument:
 //!
@@ -173,12 +179,19 @@ use ruster_core::{
     ResolutionPublicationError, ResolutionPublicationReport, ResolutionRuntime,
     ResolutionStateSlot,
 };
+use ruster_core::{
+    FirewallReconcilePermit, Icmpv4ErrorPublicationPermit, Nat44TcpReconcilePermit,
+    Nat44UdpReconcilePermit, ResolutionPublicationPermit,
+};
 use ruster_runtime::{
     FirewallServiceView, FullServicePublication, FullServiceView, Nat44TcpServiceView,
     Nat44UdpServiceView, PublicationTick,
 };
 
-use crate::{FullServiceStorageShape, RuntimeService, SuccessorError, ValidatedCandidate};
+use crate::{
+    plan::{FlushCount, StateFlush, SuccessorCheck},
+    FullServiceStorageShape, RuntimeService, SuccessorError, ValidatedCandidate,
+};
 
 /// Typed, value-free failure to allocate one runtime table.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -195,6 +208,8 @@ pub struct StorageAllocationError {
 /// resized.
 pub struct FullServiceStorage {
     shape: FullServiceStorageShape,
+    /// Highest generation ever activated or applied on this storage.
+    generation_floor: Option<NonZeroU64>,
     resolution_states: Box<[ResolutionStateSlot]>,
     resolution_actions: Box<[ResolutionActionSlot]>,
     dynamic_neighbors: Box<[DynamicNeighborSlot]>,
@@ -230,6 +245,7 @@ impl FullServiceStorage {
         let tcp = shape.nat44_tcp();
         Ok(Self {
             shape,
+            generation_floor: None,
             resolution_states: slots(
                 resolution.state_slots(),
                 ResolutionStateSlot::EMPTY,
@@ -296,6 +312,13 @@ impl FullServiceStorage {
     pub const fn shape(&self) -> FullServiceStorageShape {
         self.shape
     }
+
+    /// Highest generation ever activated or applied on this storage. A new
+    /// [`ActivePublication`] on this storage must use a strictly higher one.
+    #[must_use]
+    pub const fn generation_floor(&self) -> Option<NonZeroU64> {
+        self.generation_floor
+    }
 }
 
 impl<M: Copy + Default, S: Copy + Default> NatTables<M, S> {
@@ -333,6 +356,9 @@ fn slots<T: Copy>(
 pub enum ActivationError {
     /// The storage was allocated for a different shape than the candidate.
     StorageShapeMismatch,
+    /// The candidate generation is not above every generation this storage
+    /// has already served, so a drop and re-activation cannot go back.
+    GenerationNotAboveFloor,
     Nat44Udp(Nat44UdpRuntimeConfigError),
     Nat44Tcp(Nat44TcpRuntimeConfigError),
 }
@@ -432,13 +458,124 @@ enum ApplyStage {
 /// guards may publish a successor.
 pub struct ActivePublication<'storage, I> {
     candidate: ValidatedCandidate,
+    runtimes: LiveRuntimes<'storage>,
+    generation_floor: &'storage mut Option<NonZeroU64>,
+    last_apply: Option<ApplyReport>,
+    backend: PhantomData<fn(I) -> I>,
+}
+
+/// The five runtimes bound to one storage.
+struct LiveRuntimes<'storage> {
     resolution: ResolutionRuntime<'storage>,
     icmpv4_errors: Icmpv4ErrorRuntime<'storage>,
     nat44_udp: Nat44UdpRuntime<'storage>,
     nat44_tcp: Nat44TcpRuntime<'storage>,
     firewall: FirewallRuntime<'storage>,
-    last_apply: Option<ApplyReport>,
-    backend: PhantomData<fn(I) -> I>,
+}
+
+/// All five exclusive permits of one successor, held at once.
+struct Permits<'runtime, 'storage> {
+    resolution: ResolutionPublicationPermit<'runtime, 'storage>,
+    icmpv4_errors: Icmpv4ErrorPublicationPermit<'runtime, 'storage>,
+    nat44_udp: Nat44UdpReconcilePermit<'runtime, 'storage>,
+    nat44_tcp: Nat44TcpReconcilePermit<'runtime, 'storage>,
+    firewall: FirewallReconcilePermit<'runtime, 'storage>,
+}
+
+impl<'storage> LiveRuntimes<'storage> {
+    /// Validates `successor` against `current` and preflights all five
+    /// runtimes. Preflight never mutates; dropping the permits leaves every
+    /// runtime unchanged.
+    ///
+    /// `fault` is a test seam evaluated after each stage succeeded and while
+    /// that stage's permit (and every earlier one) is still held.
+    fn preflight<'runtime, F>(
+        &'runtime mut self,
+        current: &ValidatedCandidate,
+        successor: &ValidatedCandidate,
+        fault: &mut F,
+    ) -> Result<Permits<'runtime, 'storage>, ApplyError>
+    where
+        F: FnMut(ApplyStage) -> Option<ApplyError>,
+    {
+        current.validate_successor(successor)?;
+        if let Some(error) = fault(ApplyStage::Successor) {
+            return Err(error);
+        }
+        let authority = successor.authority();
+        let resolution = self
+            .resolution
+            .preflight_publication()
+            .map_err(ApplyError::Resolution)?;
+        if let Some(error) = fault(ApplyStage::Resolution) {
+            return Err(error);
+        }
+        let icmpv4_errors = self
+            .icmpv4_errors
+            .preflight_publication()
+            .map_err(ApplyError::Icmpv4Errors)?;
+        if let Some(error) = fault(ApplyStage::Icmpv4Errors) {
+            return Err(error);
+        }
+        let nat44_udp = self
+            .nat44_udp
+            .preflight_reconcile(authority.nat44_udp_config(), authority.nat44_udp_hash_key())
+            .map_err(ApplyError::Nat44Udp)?;
+        if let Some(error) = fault(ApplyStage::Nat44Udp) {
+            return Err(error);
+        }
+        let nat44_tcp = self
+            .nat44_tcp
+            .preflight_reconcile(authority.nat44_tcp_config(), authority.nat44_tcp_hash_key())
+            .map_err(ApplyError::Nat44Tcp)?;
+        if let Some(error) = fault(ApplyStage::Nat44Tcp) {
+            return Err(error);
+        }
+        let firewall = self
+            .firewall
+            .preflight_reconcile(authority.firewall_config())
+            .map_err(ApplyError::Firewall)?;
+        if let Some(error) = fault(ApplyStage::Firewall) {
+            return Err(error);
+        }
+        Ok(Permits {
+            resolution,
+            icmpv4_errors,
+            nat44_udp,
+            nat44_tcp,
+            firewall,
+        })
+    }
+
+    /// Live counts of the state a commit would flush, read without mutation.
+    /// The ICMPv4 limiter state count has no read accessor in core.
+    fn flush_counts(&self) -> StateFlush {
+        let count = |occupied: usize| FlushCount::Exact(occupied);
+        let resolution = &self.resolution;
+        StateFlush {
+            resolution_states: count(resolution.pending_states()),
+            resolution_actions: count(resolution.pending_actions()),
+            dynamic_neighbors: count(resolution.dynamic_neighbor_count()),
+            failure_holds: count(resolution.pending_failure_holds()),
+            icmpv4_error_states: FlushCount::All,
+            icmpv4_error_actions: count(self.icmpv4_errors.pending_actions()),
+            nat44_udp_mappings: count(occupied(self.nat44_udp.mappings(), |slot| {
+                slot.is_occupied()
+            })),
+            nat44_udp_peers: count(occupied(self.nat44_udp.peers(), |slot| slot.is_occupied())),
+            nat44_tcp_mappings: count(occupied(self.nat44_tcp.mappings(), |slot| {
+                slot.is_occupied()
+            })),
+            nat44_tcp_sessions: count(occupied(self.nat44_tcp.sessions(), |slot| {
+                slot.is_occupied()
+            })),
+            firewall_flows: count(occupied(self.firewall.states(), |slot| slot.is_occupied())),
+        }
+    }
+}
+
+fn occupied<T: Copy>(slots: &[T], is_occupied: impl Fn(T) -> bool) -> usize {
+    slots.iter().filter(|slot| is_occupied(**slot)).count()
 }
 
 impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
@@ -453,8 +590,15 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
         if storage.shape != candidate.storage_shape() {
             return Err(ActivationError::StorageShapeMismatch);
         }
+        if storage
+            .generation_floor
+            .is_some_and(|floor| candidate.generation() <= floor)
+        {
+            return Err(ActivationError::GenerationNotAboveFloor);
+        }
         let FullServiceStorage {
             shape: _,
+            generation_floor,
             resolution_states,
             resolution_actions,
             dynamic_neighbors,
@@ -507,13 +651,17 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             icmpv4_actions,
         );
         let firewall = FirewallRuntime::new(authority.firewall_config(), firewall_states);
+        *generation_floor = Some(candidate.generation());
         Ok(Self {
             candidate,
-            resolution,
-            icmpv4_errors,
-            nat44_udp,
-            nat44_tcp,
-            firewall,
+            runtimes: LiveRuntimes {
+                resolution,
+                icmpv4_errors,
+                nat44_udp,
+                nat44_tcp,
+                firewall,
+            },
+            generation_floor,
             last_apply: None,
             backend: PhantomData,
         })
@@ -537,33 +685,65 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
 
     #[must_use]
     pub const fn resolution(&self) -> &ResolutionRuntime<'storage> {
-        &self.resolution
+        &self.runtimes.resolution
     }
 
     #[must_use]
     pub const fn icmpv4_errors(&self) -> &Icmpv4ErrorRuntime<'storage> {
-        &self.icmpv4_errors
+        &self.runtimes.icmpv4_errors
     }
 
     #[must_use]
     pub const fn nat44_udp(&self) -> &Nat44UdpRuntime<'storage> {
-        &self.nat44_udp
+        &self.runtimes.nat44_udp
     }
 
     #[must_use]
     pub const fn nat44_tcp(&self) -> &Nat44TcpRuntime<'storage> {
-        &self.nat44_tcp
+        &self.runtimes.nat44_tcp
     }
 
     #[must_use]
     pub const fn firewall(&self) -> &FirewallRuntime<'storage> {
-        &self.firewall
+        &self.runtimes.firewall
+    }
+
+    /// Guard-free dry-run of `successor` against this publication.
+    ///
+    /// Runs exactly the checks of an apply (successor validation, including
+    /// the restart-required classification, and all five runtime preflights)
+    /// and then drops the permits, so nothing is committed: generation,
+    /// candidate, slots, counters, and bindings are unchanged. It takes no
+    /// quiescence guard or tick because it publishes nothing; the exclusive
+    /// borrow only reflects that core preflight hands out exclusive permits.
+    pub fn check_successor(
+        &mut self,
+        successor: &ValidatedCandidate,
+    ) -> Result<SuccessorCheck, ApplyError> {
+        let flush = self.runtimes.flush_counts();
+        // The permits are discarded at the end of this statement without a
+        // commit, which leaves every runtime unchanged.
+        let preview = self
+            .runtimes
+            .preflight(&self.candidate, successor, &mut |_| None)?
+            .resolution
+            .preview();
+        Ok(SuccessorCheck {
+            previous_generation: self.candidate.generation(),
+            generation: successor.generation(),
+            flush: StateFlush {
+                resolution_states: FlushCount::Exact(preview.states_flushed),
+                resolution_actions: FlushCount::Exact(preview.actions_flushed),
+                dynamic_neighbors: FlushCount::Exact(preview.dynamic_neighbors_flushed),
+                failure_holds: FlushCount::Exact(preview.failure_holds_flushed),
+                ..flush
+            },
+        })
     }
 
     /// Validates, preflights all five runtimes, then commits at one point.
     ///
-    /// `fault` is a test seam evaluated after each stage succeeded and while
-    /// that stage's permit (and every earlier one) is still held. Production
+    /// `fault` is a test seam (see [`LiveRuntimes::preflight`]). Production
     /// passes a closure that never fails, which is inlined away.
     fn apply_with<F>(
         &mut self,
@@ -573,46 +753,15 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
     where
         F: FnMut(ApplyStage) -> Option<ApplyError>,
     {
-        self.candidate.validate_successor(&successor)?;
-        if let Some(error) = fault(ApplyStage::Successor) {
-            return Err(error);
-        }
-        let authority = successor.authority();
-        let resolution = self
-            .resolution
-            .preflight_publication()
-            .map_err(ApplyError::Resolution)?;
-        if let Some(error) = fault(ApplyStage::Resolution) {
-            return Err(error);
-        }
-        let icmpv4_errors = self
-            .icmpv4_errors
-            .preflight_publication()
-            .map_err(ApplyError::Icmpv4Errors)?;
-        if let Some(error) = fault(ApplyStage::Icmpv4Errors) {
-            return Err(error);
-        }
-        let nat44_udp = self
-            .nat44_udp
-            .preflight_reconcile(authority.nat44_udp_config(), authority.nat44_udp_hash_key())
-            .map_err(ApplyError::Nat44Udp)?;
-        if let Some(error) = fault(ApplyStage::Nat44Udp) {
-            return Err(error);
-        }
-        let nat44_tcp = self
-            .nat44_tcp
-            .preflight_reconcile(authority.nat44_tcp_config(), authority.nat44_tcp_hash_key())
-            .map_err(ApplyError::Nat44Tcp)?;
-        if let Some(error) = fault(ApplyStage::Nat44Tcp) {
-            return Err(error);
-        }
-        let firewall = self
-            .firewall
-            .preflight_reconcile(authority.firewall_config())
-            .map_err(ApplyError::Firewall)?;
-        if let Some(error) = fault(ApplyStage::Firewall) {
-            return Err(error);
-        }
+        let Permits {
+            resolution,
+            icmpv4_errors,
+            nat44_udp,
+            nat44_tcp,
+            firewall,
+        } = self
+            .runtimes
+            .preflight(&self.candidate, &successor, &mut fault)?;
 
         // Commit point. Nothing below can fail: every permit commit is a
         // total core operation, the permits retain no borrow of `successor`,
@@ -628,8 +777,9 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             nat44_tcp: nat44_tcp.commit(),
             firewall: firewall.commit(),
         };
-        // `authority` is dead here; moving `successor` ends its borrow.
+        // No permit borrows `successor`, so it can move into place.
         let previous = std::mem::replace(&mut self.candidate, successor);
+        *self.generation_floor = Some(report.generation);
         self.last_apply = Some(report);
         drop(previous);
         Ok(report)
@@ -656,14 +806,23 @@ impl<'storage, I: PublicationQuiescence> FullServicePublication<'storage, I>
         Some(FullServiceView::new(
             authority.generation(),
             authority.snapshot(),
-            &mut self.resolution,
-            &mut self.icmpv4_errors,
-            Nat44UdpServiceView::new(authority.nat44_udp_config(), Some(&mut self.nat44_udp)),
-            Nat44TcpServiceView::new(authority.nat44_tcp_config(), Some(&mut self.nat44_tcp)),
-            FirewallServiceView::new(authority.firewall_config(), Some(&mut self.firewall)),
+            &mut self.runtimes.resolution,
+            &mut self.runtimes.icmpv4_errors,
+            Nat44UdpServiceView::new(
+                authority.nat44_udp_config(),
+                Some(&mut self.runtimes.nat44_udp),
+            ),
+            Nat44TcpServiceView::new(
+                authority.nat44_tcp_config(),
+                Some(&mut self.runtimes.nat44_tcp),
+            ),
+            FirewallServiceView::new(
+                authority.firewall_config(),
+                Some(&mut self.runtimes.firewall),
+            ),
         ))
     }
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

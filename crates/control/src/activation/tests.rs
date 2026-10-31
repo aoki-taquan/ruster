@@ -24,7 +24,7 @@ use crate::{
     SimDeterministicKeySource, SuccessorError, ValidatedCandidate,
 };
 
-const SEED: u64 = 0x5eed_0bad_cafe_f00d;
+pub(crate) const SEED: u64 = 0x5eed_0bad_cafe_f00d;
 const LAN: IfId = IfId(1);
 const WAN: IfId = IfId(2);
 const LAN_MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
@@ -40,12 +40,12 @@ const PUBLIC: [u8; 4] = [198, 51, 100, 10];
 const UNRESOLVED_WAN: [u8; 4] = [198, 51, 100, 77];
 const REMOTE: [u8; 4] = [203, 0, 113, 20];
 
-const LIMITS: ValidationLimits = ValidationLimits {
+pub(crate) const LIMITS: ValidationLimits = ValidationLimits {
     max_slots_per_table: 1 << 16,
     max_runtime_bytes: 1 << 26,
 };
 
-struct Variant {
+pub(crate) struct Variant {
     gateway: &'static str,
     wan_mac: &'static str,
     resolution_interval_ms: u32,
@@ -53,7 +53,7 @@ struct Variant {
     firewall_states: u32,
 }
 
-const V1: Variant = Variant {
+pub(crate) const V1: Variant = Variant {
     gateway: "198.51.100.1",
     wan_mac: "02:00:00:00:00:02",
     resolution_interval_ms: 1000,
@@ -66,7 +66,7 @@ const V2: Variant = Variant {
     ..V1
 };
 
-fn config_text(variant: &Variant) -> String {
+pub(crate) fn config_text(variant: &Variant) -> String {
     format!(
         r#"
 schema-version = 1
@@ -891,4 +891,258 @@ fn activation_rejects_mismatched_storage_and_storage_is_reusable() {
     assert!(active.firewall().is_pristine());
     assert_eq!(occupied(active.nat44_udp().mappings()), 0);
     assert_eq!(occupied(active.nat44_tcp().sessions()), 0);
+}
+
+fn exact(count: usize) -> crate::FlushCount {
+    crate::FlushCount::Exact(count)
+}
+
+#[test]
+fn check_successor_is_a_side_effect_free_dry_run_that_predicts_apply() {
+    // The dry-run does not raise the storage generation floor either.
+    {
+        let mut storage = FullServiceStorage::new(candidate(&V1, 1).storage_shape()).unwrap();
+        let mut active = ActivePublication::<SimIo>::new(&mut storage, candidate(&V1, 1)).unwrap();
+        for generation in [2, 3, 9] {
+            assert!(active.check_successor(&candidate(&V2, generation)).is_ok());
+        }
+        drop(active);
+        assert_eq!(storage.generation_floor().map(NonZeroU64::get), Some(1));
+        assert!(ActivePublication::<SimIo>::new(&mut storage, candidate(&V1, 2)).is_ok());
+    }
+
+    let first = candidate(&V1, 1);
+    let mut storage = FullServiceStorage::new(first.storage_shape()).unwrap();
+    let mut active = ActivePublication::<SimIo>::new(&mut storage, first).unwrap();
+    let mut io = SimIo::new();
+    let live = populate(&mut active, &mut io);
+    let before = observe(&active);
+
+    // Rejections are the exact errors apply returns, and change nothing.
+    for (successor, expected) in [
+        (
+            candidate(&V2, 1),
+            ApplyError::Successor(SuccessorError::GenerationNotIncreasing),
+        ),
+        (
+            candidate(
+                &Variant {
+                    firewall_states: 32,
+                    ..V2
+                },
+                2,
+            ),
+            ApplyError::RestartRequired(RestartRequired::StorageShape),
+        ),
+    ] {
+        assert_eq!(active.check_successor(&successor), Err(expected));
+        assert!(observe(&active) == before);
+    }
+
+    // Repeated successful dry-runs hold and drop all five permits without
+    // committing anything.
+    let successor = candidate(&V2, 2);
+    let check = active.check_successor(&successor).expect("dry-run");
+    for _ in 0..64 {
+        assert_eq!(active.check_successor(&successor), Ok(check));
+    }
+    assert!(observe(&active) == before, "dry-run changed runtime state");
+    assert_eq!(
+        (check.previous_generation.get(), check.generation.get()),
+        (1, 2)
+    );
+    let flush = check.flush;
+    assert_eq!(flush.dynamic_neighbors, exact(1));
+    assert_eq!(
+        flush.resolution_actions,
+        exact(before.resolution_occupancy[0])
+    );
+    assert_eq!(flush.icmpv4_error_actions, exact(before.icmpv4.1));
+    assert_eq!(flush.icmpv4_error_states, crate::FlushCount::All);
+    assert_eq!(flush.nat44_udp_mappings, exact(occupied(&before.udp.1)));
+    assert_eq!(flush.nat44_tcp_mappings, exact(1));
+    assert_eq!(flush.firewall_flows, exact(occupied(&before.firewall.1)));
+
+    // Old state still serves traffic (directories, port owners, keys).
+    assert!(reply_reaches_host(
+        &mut active,
+        &mut io,
+        1_002,
+        live.public_udp_port
+    ));
+    let check = active.check_successor(&successor).unwrap();
+
+    // The real apply flushes exactly what the dry-run predicted.
+    let report = tick(&mut active, &mut io, 1_003, Some(successor));
+    assert_eq!(report.publication, PublicationOutcome::Applied);
+    let applied = active.last_apply().unwrap();
+    let predicted = check.flush;
+    assert_eq!(
+        [
+            predicted.resolution_states,
+            predicted.resolution_actions,
+            predicted.dynamic_neighbors,
+            predicted.failure_holds,
+            predicted.icmpv4_error_actions,
+            predicted.nat44_udp_mappings,
+            predicted.nat44_udp_peers,
+            predicted.nat44_tcp_mappings,
+            predicted.nat44_tcp_sessions,
+            predicted.firewall_flows,
+        ],
+        [
+            applied.resolution.states_flushed,
+            applied.resolution.actions_flushed,
+            applied.resolution.dynamic_neighbors_flushed,
+            applied.resolution.failure_holds_flushed,
+            applied.icmpv4_errors.actions_flushed,
+            applied.nat44_udp.mappings_flushed,
+            applied.nat44_udp.peers_flushed,
+            applied.nat44_tcp.mappings_flushed,
+            applied.nat44_tcp.sessions_flushed,
+            applied.firewall.states_flushed,
+        ]
+        .map(exact)
+    );
+}
+
+#[test]
+fn plan_restart_classification_matches_live_apply_rejection() {
+    use crate::plan::tests::{
+        config, ICMPV4_POLICY_CHANGE, INTERFACE_CHANGE, PORT_CHANGE, PORT_SHIFT,
+        RESOLUTION_POLICY_CHANGE, ROUTE_CHANGE, SHAPE_CHANGE,
+    };
+    use crate::{ApplyPlan, PublicationSequencer};
+
+    let current = config(&[]);
+    let mut sequencer = PublicationSequencer::new(SimDeterministicKeySource::new(SEED));
+    let first = sequencer.candidate(&current).unwrap();
+    let mut storage = FullServiceStorage::new(first.storage_shape()).unwrap();
+    let mut active = ActivePublication::<SimIo>::new(&mut storage, first).unwrap();
+    let mut io = SimIo::new();
+    populate(&mut active, &mut io);
+
+    let cases: &[&[(&str, &str)]] = &[
+        &[SHAPE_CHANGE],
+        &[PORT_CHANGE],
+        &[RESOLUTION_POLICY_CHANGE],
+        &[ICMPV4_POLICY_CHANGE],
+        &[INTERFACE_CHANGE],
+        &[INTERFACE_CHANGE, ICMPV4_POLICY_CHANGE],
+        &[INTERFACE_CHANGE, RESOLUTION_POLICY_CHANGE, SHAPE_CHANGE],
+    ];
+    let mut now = 2_000;
+    for edits in cases {
+        let next = config(edits);
+        let successor = sequencer.candidate(&next).unwrap();
+        let plan = ApplyPlan::for_active(&mut active, &current, &next, &successor).unwrap();
+        let expected = ApplyError::RestartRequired(plan.restart_required()[0]);
+        assert_eq!(plan.dry_run(), Some(Err(expected)));
+        assert_eq!(plan.flush(), crate::StateFlush::ALL);
+        let before = observe(&active);
+        now += 1;
+        let report = tick(&mut active, &mut io, now, Some(successor));
+        assert_eq!(report.publication, PublicationOutcome::Rejected(expected));
+        assert!(observe(&active) == before);
+    }
+
+    // No restart reason: the dry-run and the apply both succeed. A
+    // same-size NAT port pool shift keeps the storage shape and reloads.
+    let next = config(&[ROUTE_CHANGE, PORT_SHIFT]);
+    let successor = sequencer.candidate(&next).unwrap();
+    let plan = ApplyPlan::for_active(&mut active, &current, &next, &successor).unwrap();
+    assert!(!plan.requires_restart());
+    let Some(Ok(check)) = plan.dry_run() else {
+        panic!("dry-run accepted");
+    };
+    assert_eq!(plan.flush(), check.flush);
+    assert_eq!(check.generation, successor.generation());
+    let report = tick(&mut active, &mut io, now + 1, Some(successor));
+    assert_eq!(report.publication, PublicationOutcome::Applied);
+    let (_, mac, port) = forward_once(&mut active, &mut io, now + 2, 5_000);
+    assert_eq!(mac, GATEWAY_B_MAC);
+    assert!((40016..=40031).contains(&port), "shifted pool in use");
+    assert!(reply_reaches_host(&mut active, &mut io, now + 3, port));
+}
+
+#[test]
+fn rollback_reapplies_old_document_as_new_generation_with_new_keys() {
+    use crate::plan::tests::{config, ROUTE_CHANGE};
+    use crate::{ApplyPlan, PublicationSequencer};
+
+    let a = config(&[]);
+    let b = config(&[ROUTE_CHANGE]);
+    let mut sequencer = PublicationSequencer::new(SimDeterministicKeySource::new(SEED));
+    let first = sequencer.candidate(&a).unwrap();
+    let keys = |active: &ActivePublication<'_, SimIo>| {
+        let authority = active.candidate.authority();
+        (
+            authority.nat44_udp_hash_key(),
+            authority.nat44_tcp_hash_key(),
+            authority.firewall_config().hash_key(),
+        )
+    };
+    let mut storage = FullServiceStorage::new(first.storage_shape()).unwrap();
+    let mut active = ActivePublication::<SimIo>::new(&mut storage, first).unwrap();
+    let mut io = SimIo::new();
+    let key_a = keys(&active);
+    assert_eq!(
+        forward_once(&mut active, &mut io, 1_000, 5_000).1,
+        GATEWAY_A_MAC
+    );
+
+    let report = tick(
+        &mut active,
+        &mut io,
+        1_001,
+        Some(sequencer.candidate(&b).unwrap()),
+    );
+    assert_eq!(report.publication, PublicationOutcome::Applied);
+    let key_b = keys(&active);
+    let (_, mac, port_b) = forward_once(&mut active, &mut io, 1_002, 5_000);
+    assert_eq!(mac, GATEWAY_B_MAC);
+
+    // Rollback: plan B→A, then apply the re-validated A as generation 3.
+    let rollback = sequencer.candidate(&a).unwrap();
+    let plan = ApplyPlan::for_active(&mut active, &b, &a, &rollback).unwrap();
+    assert!(matches!(plan.routes(), [crate::Change::Changed(_)]));
+    assert_eq!(plan.flush().nat44_udp_mappings, exact(1));
+    let report = tick(&mut active, &mut io, 1_003, Some(rollback));
+    assert_eq!(report.publication, PublicationOutcome::Applied);
+    assert_eq!(active.generation().get(), 3);
+    let key_rollback = keys(&active);
+    for earlier in [key_a, key_b] {
+        assert!(earlier.0 != key_rollback.0);
+        assert!(earlier.1 != key_rollback.1);
+        assert!(earlier.2 != key_rollback.2);
+    }
+    // The flushed generation-2 mapping is gone; traffic uses route A again.
+    assert!(!reply_reaches_host(&mut active, &mut io, 1_004, port_b));
+    let (_, mac, port) = forward_once(&mut active, &mut io, 1_005, 5_000);
+    assert_eq!(mac, GATEWAY_A_MAC);
+    assert!(reply_reaches_host(&mut active, &mut io, 1_006, port));
+}
+
+#[test]
+fn storage_reactivation_requires_generation_above_every_served_one() {
+    let mut storage = FullServiceStorage::new(candidate(&V1, 1).storage_shape()).unwrap();
+    assert_eq!(storage.generation_floor(), None);
+    let mut io = SimIo::new();
+    {
+        let mut active = ActivePublication::<SimIo>::new(&mut storage, candidate(&V1, 5)).unwrap();
+        let report = tick(&mut active, &mut io, 1_000, Some(candidate(&V2, 7)));
+        assert_eq!(report.publication, PublicationOutcome::Applied);
+    }
+    assert_eq!(storage.generation_floor().map(NonZeroU64::get), Some(7));
+    for stale in [1, 5, 7] {
+        assert_eq!(
+            ActivePublication::<SimIo>::new(&mut storage, candidate(&V1, stale)).err(),
+            Some(ActivationError::GenerationNotAboveFloor),
+            "generation {stale}"
+        );
+    }
+    let active = ActivePublication::<SimIo>::new(&mut storage, candidate(&V1, 8)).unwrap();
+    assert_eq!(active.generation().get(), 8);
+    drop(active);
+    assert_eq!(storage.generation_floor().map(NonZeroU64::get), Some(8));
 }
