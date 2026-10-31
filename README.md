@@ -37,6 +37,9 @@ data-planeとI/Oのlibrary crateは外部依存を持ちません。cold control
   typed errorで評価してcanonical JSONL `ruster-run-sim/v1`を出力する。M1 golden fixtureは
   [`fixtures/m1`](fixtures/m1)にあり、golden出力の再生成は
   `RUSTER_UPDATE_GOLDEN=1 cargo test -p ruster-sim-scenario --test driver`（CIでは拒否）。
+- `ruster-cli`: binary `ruster`。手書きarg parsingで`validate`/`plan`/`run-sim`を提供し、
+  SIGINT/SIGTERMはprivate FFIのhandlerがstatic `AtomicBool`へstoreするだけです
+  （下の「使い方」）。外部依存はありません。
 - `ruster-io-afpacket`: Linux AF_PACKET/TPACKET_V3 backendのchecked configuration、
   fixed IfId mapping、ring ownership/UAPI scaffold。combined mmapのRX/TX extentを
   overlap/gap/overflow/実address alignmentまで検証し、後続state machine用metadataを
@@ -249,6 +252,66 @@ candidateなしのtickにもboundedなread-only current-I/O dispositionを返し
 forgotten batch/leaseを次tickで再進入しません。未知errorは保守的にI/Oをskipし、candidateなしの
 steady tickはquiescence guard checkを行いません。Sim backendの出力queue完了は保守的なmodelで
 あり、AF_XDP CQ drainを実装・証明したものではありません。
+
+## 使い方（M1 `ruster` CLI）
+
+`crates/cli`（package `ruster-cli`）がbinary `ruster`を提供します。rootやNICは不要で、
+[`fixtures/m1`](fixtures/m1)をdocumented exampleとして使えます。
+
+```bash
+cargo build -p ruster-cli
+B=target/debug/ruster
+
+# parse + semantic validation + M1 service bridge。成功時はstdoutへ値を含まない要約
+$B validate fixtures/m1/router-v1.toml
+# valid: schema-version=1 interfaces=2 routes=3 neighbors=1 local-ipv4=2 firewall-rules=3 ...
+
+# 失敗時はstderrへstage/code/schema path/数値上限だけを出しexit 2
+$B validate fixtures/m1/router-invalid.toml
+# ruster: invalid config: stage=validate code=GATEWAY_NOT_ON_LINK path=routes[0].via
+
+# current→nextのapply plan（決定的なtext）。restart-requiredでもplanを出せればexit 0
+$B plan fixtures/m1/router-v1.toml fixtures/m1/router-v2.toml
+# plan: reloadable
+# restart-required: none
+# changes: 1
+#   route + 192.0.2.0/24 dev if2 via 203.0.113.1
+# expected-flush:
+#   resolution_states all
+#   ...
+
+# scenarioを決定的に実行。stdoutはcanonical JSONL ruster-run-sim/v1、stderrは人向けsummary
+$B run-sim --scenario fixtures/m1/scenario.toml > out.jsonl
+cmp out.jsonl fixtures/m1/expected.jsonl
+
+# --hold: scenario終了後もidle tickを続け、SIGINT/SIGTERMでordered shutdownしてfinalを出す
+$B run-sim --scenario fixtures/m1/scenario.toml --hold
+```
+
+- `validate`/`plan`は`run-sim`と同じvalidation limitを使い、allocator seed、hash key、
+  scenario seedを出力しません。`validate`はM1で必須のresolution、ICMPv4 error、NAT44
+  UDP/TCP、firewallの欠落も`stage=bridge`で拒否します。
+- `plan`は両documentに`validate`と同じbridge確認を行います。`expected-flush`はdocument間の
+  planなので`all`（apply時に全live stateをflush）で、実際のflush数は`run-sim`の`apply` eventに
+  出ます。capacityやresolution/ICMP/NAT/firewall policyの変更はrestart理由（`STORAGE_SHAPE`等）
+  または`changed` flagとしてだけ出し、fieldごとの値は出しません。interface labelは
+  `[A-Za-z0-9._-]`以外を`\xNN`でescapeします（configも同じcharsetと15 bytes上限を要求）。
+  `--format jsonl`は未実装です。
+- `run-sim`はstepごと（tickは1回ずつ）に停止flagを確認します。`--hold`なしのrun中にsignalを
+  受けても残りのstepを実行せずordered shutdownしてexit 0、stderrは`stopped by signal`です。
+  したがってexit 0だけで「全expectが成功した」と判断せず、stderrの`finished`を確認してください。
+  SIGTERMは常に処理し、SIGINTは起動時にignoreされていれば（job controlなしの`cmd &`など）
+  ignoreのままです。SIGHUPなど他のsignalは扱いません。scenario pathが`-`で始まる場合は
+  `--scenario=<path>`または`run-sim [--hold] -- <path>`を使います。`--hold`のidle tickは
+  注入時刻を100 msずつ進め（wall clockは読まない）、空回りを避けるため実時間100 msの
+  sleepを挟みます。stderrの`ruster run-sim: holding`行がhold開始の目印で、hold中はidle tickごとに
+  stdoutをflushします。signal受信後はtick境界で止まり、backendのpublication quiescence
+  （未完了batch、live lease、未完了TXなし）を確認してから`final` event（counter、health、
+  generation）を書きます。
+- exit status: `0`成功（restart-requiredのplan、signalによるordered shutdownを含む）、
+  `1` runtime/I/O/invariant失敗とscenarioの`expect`/`apply`不一致、`2` usage errorと
+  invalid config/scenario（未知interface名を含む）。file read失敗（存在しない、読めない）は
+  内容のinvalidとは区別して`1`で、stderrは`cannot read config: NOT_FOUND`のような安定codeです。
 
 ## 開発
 

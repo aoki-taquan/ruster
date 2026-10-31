@@ -40,8 +40,10 @@ use ruster_control::{
     PublicationSequencer, SequencerError, SimDeterministicKeySource, StorageAllocationError,
     ValidatedCandidate,
 };
-use ruster_core::{BackendStats, ConsumeReason, DropReason, IfId, MonotonicMillis};
-use ruster_io_sim::{FrameOrigin, SimIo};
+use ruster_core::{
+    BackendStats, ConsumeReason, DropReason, IfId, MonotonicMillis, PublicationQuiescence,
+};
+use ruster_io_sim::{FrameOrigin, SimIo, SimPublicationQuiescenceError};
 use ruster_runtime::{
     run_tick, ApplyFlushCounts, HealthPolicy, ObservabilitySnapshot, PhaseReport,
     PublicationOutcome, RxPhaseReport, ServiceCounters, TickBudgets, TickObserver,
@@ -524,6 +526,18 @@ impl SimRun<'_> {
                 done => return Ok(done),
             }
         }
+    }
+
+    /// Asks the simulated backend for publication quiescence: no unfinished
+    /// RX/generated batch, no live RX/generated lease, and no accepted but
+    /// uncompleted TX. Frames injected but not yet received are queued
+    /// input, not leases, and do not fail the check.
+    ///
+    /// The driver completes every TX after every tick, so this holds at every
+    /// tick boundary; the CLI calls it once before the `final` event of an
+    /// ordered shutdown. It mutates nothing.
+    pub fn check_quiescence(&mut self) -> Result<(), SimPublicationQuiescenceError> {
+        self.io.try_publication_quiescence().map(|_guard| ())
     }
 
     /// Writes the `final` event with the observability snapshot, the
@@ -1143,6 +1157,10 @@ mod tests {
         );
         assert!(report.active);
         assert_eq!(run.io.pending_tx(), 1);
+        assert_eq!(
+            run.check_quiescence(),
+            Err(SimPublicationQuiescenceError::TxCompletionPending)
+        );
         let path = ScenarioPath::new(PathBuf::from("router-v2.toml"), &fixtures());
         assert_eq!(
             run.apply(7, &path, ApplyOutcome::Applied, &mut out),
@@ -1187,6 +1205,7 @@ kind = "hold"
         assert_eq!(text.matches("{\"event\":\"tx\",\"step\":null,").count(), 2);
         assert!(run.tx.is_empty());
         assert_eq!(run.io.pending_tx(), 0);
+        assert_eq!(run.check_quiescence(), Ok(()));
     }
 
     #[test]
