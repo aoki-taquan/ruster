@@ -1,15 +1,24 @@
 #![forbid(unsafe_code)]
 //! Owned, validated cold-path publications for ruster.
 //!
-//! Runtime activation is intentionally sealed until the follow-on worker can
-//! mint an all-five-runtime publication proof:
+//! Live activation is exposed only as [`FullServiceStorage`] plus
+//! [`ActivePublication`]: runtimes are always constructed from owned storage,
+//! never adopted, and a successor is installed only through the
+//! guard-taking [`ruster_runtime::FullServicePublication`] seam. No separate
+//! runtime set can be assembled or adopted:
 //!
 //! ```compile_fail
-//! use ruster_control::{ActivePublication, FullServiceRuntimeSet};
+//! use ruster_control::FullServiceRuntimeSet;
 //! ```
 
+mod activation;
 mod config_bridge;
 mod publication;
+
+pub use activation::{
+    ActivationError, ActivePublication, ApplyError, ApplyReport, FullServiceStorage,
+    RestartRequired, StorageAllocationError,
+};
 
 pub use config_bridge::{
     candidate_from_config, ConfigBridgeError, KeySourceError, KeySourceKind, PublicationKeySource,

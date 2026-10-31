@@ -332,12 +332,19 @@ allocation、再validation、再hashなしのO(1)で返します。generation前
 rotation、固定shape/policyはstatic successor checkだけを提供し、ownerのinstallやruntime変更は
 行いません。
 
-この段階では`ActivePublication`、`FullServiceView`構築、既存runtimeのadopt、apply、
-rollback、backend quiescence APIを一切公開しません。Resolution/ICMP runtimeには旧snapshotの
-egress/MAC/IP authorityを持つqueueがあり、shape/policy一致だけで新candidateへ接続するとstale
-出力を許すためです。live activationは、全5 runtimeのR06G permitとbackend quiescenceを同じ
-exclusive transactionに保持する後続workerだけが行います。`ruster-control`はR06O時点では
-`ruster-core`だけに依存し、runtime依存の追加もそのworker PRまで延期します。
+live activationは`FullServiceStorage`と`ActivePublication<'storage>`だけで行います。
+`FullServiceStorage`はcandidateのstorage shapeどおりに全runtime slot配列を一度だけ確保し、
+`ActivePublication`はそれを`'storage`の間exclusive borrowして5 runtimeを新規構築します。
+既存runtimeのadoptはできません。`ActivePublication`は`ruster-runtime`の`FullServicePublication`
+を実装し、successorはbackend quiescence guardを受け取る`publish_candidate`からだけ適用します。
+applyは`validate_successor`の後、Resolution/ICMPv4 errorの`preflight_publication`と
+NAT44 UDP/TCP・firewallの`preflight_reconcile`の5 permitを同時に保持し、全て成功した場合だけ
+一点でcommitします。各permit commitとcandidate swapには失敗分岐がありません。途中の失敗では
+permitのDropにより全runtimeが不変で、旧candidate/snapshot/generationが継続します。
+Resolution/ICMP runtimeは旧snapshotのauthorityを持つqueueを全flushし、NAT/firewallはkey
+rotationに伴いflow stateを全flushします。累積counterは保持します。storage shapeと
+Resolution/ICMP policyの変更はtyped `RestartRequired`としてrejectし、resizeしません。
+rollbackとplan/diffは未実装です。
 
 `ruster-runtime`の`FullServicePublication`は、具体的なowned publicationやparserを持たず、
 candidateのall-or-nothing適用とactive full-service viewの借用だけを抽象化します。

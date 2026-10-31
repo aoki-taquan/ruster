@@ -567,16 +567,35 @@ fn typed_errors_and_source_never_format_nested_authority_or_secrets() {
         "unsafe {",
         "Mutex<",
         "dyn PacketIo",
-        "pub struct ActivePublication",
         "pub struct FullServiceRuntimeSet",
-        "ruster-runtime",
+        "ruster_runtime",
     ] {
         assert!(!source.contains(forbidden), "forbidden source: {forbidden}");
     }
-    assert!(!exports.contains("    ActivePublication,"));
-    assert!(!exports.contains("    FullServiceRuntimeSet,"));
-    let manifest = include_str!("../Cargo.toml");
-    assert!(!manifest.contains("ruster-runtime"));
+    // Live activation is limited to storage-owned runtimes behind the
+    // guard-taking publication seam: no adoption, no unguarded apply, no
+    // mutable runtime escape, and no formatting of owned keys.
+    let activation = include_str!("../src/activation.rs");
+    for forbidden in [
+        "impl std::fmt::Debug for ActivePublication",
+        "impl std::fmt::Debug for FullServiceStorage",
+        "pub fn apply",
+        "pub fn adopt",
+        "-> &mut",
+        "pub struct FullServiceRuntimeSet",
+        "Box::leak",
+        "Box::into_raw",
+        "unsafe {",
+        "Mutex<",
+        "dyn PacketIo",
+    ] {
+        assert!(
+            !activation.contains(forbidden),
+            "forbidden activation source: {forbidden}"
+        );
+    }
+    assert!(exports.contains(" ActivePublication,"));
+    assert!(!exports.contains("FullServiceRuntimeSet,"));
 
     let candidate_start = source.find("pub struct ValidatedCandidate {").unwrap();
     let candidate_end = source[candidate_start..]

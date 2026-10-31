@@ -71,6 +71,8 @@ version = "0.2.0"
 dependencies = [
  "ruster-config",
  "ruster-core",
+ "ruster-io-sim",
+ "ruster-runtime",
 ]
 
 [[package]]
