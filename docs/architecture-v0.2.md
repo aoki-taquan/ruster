@@ -338,8 +338,13 @@ live activationは`FullServiceStorage`と`ActivePublication<'storage>`だけで�
 既存runtimeのadoptはできません。`ActivePublication`は一つのbackend型に束縛され、
 `ruster-runtime`の`FullServicePublication`をそのbackendに対してだけ実装します。seamの
 `active`/`publish_candidate`は`run_tick`だけが作れる`PublicationTick` tokenを要求し、
-`FullServiceView`のruntime borrowはprivateなので、tick外やwrapper adapterからruntimeを
-変更できません。successorはbackend quiescence成功後の`publish_candidate`からだけ適用します。
+`FullServiceView`のruntime borrowはprivateなので、tick外やviewを受け取ったwrapperから
+runtimeを変更できません。ただしtokenが保証するのは「`run_tick`から到達するcodeだけが呼べる」
+ことまでです。`FullServicePublication`実装（adapter、wrapperを含む）はtokenを受け取り転送
+できるtrusted codeです。backendへの束縛は型だけで、毎tick同じbackend instanceを渡すのは
+callerの責任です。core `PublicationQuiescenceGuard::new`はsealされていないため、guardは型の
+規律でありquiescenceの証明ではありません。backendの実checkからguardを得るのは`run_tick`
+自身だけです。guard mintのseal（backend専用化またはunsafe化）は後続課題です。
 applyは`validate_successor`の後、Resolution/ICMPv4 errorの`preflight_publication`と
 NAT44 UDP/TCP・firewallの`preflight_reconcile`の5 permitを同時に保持し、全て成功した場合だけ
 一点でcommitします。各permit commitとcandidate swapには失敗分岐がありません。途中の失敗では

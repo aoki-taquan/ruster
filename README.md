@@ -221,7 +221,9 @@ backendのTX acceptedはdescriptor publicationであり、wire送信やcompletio
 意味しません。tick-local `FullServiceView`は非ゼロgenerationを持ち、UDP/TCP NAT44と
 firewallの各configを対応するoptional runtimeとnested viewで対にします。resolutionと
 generated ICMP runtimeは直接borrowのままです。runtime borrowはviewのprivate fieldで、
-publication seamの`active`/`publish_candidate`は`run_tick`だけが作る`PublicationTick`を要求します。現行core full wrapperは3 configを必須とする
+publication seamの`active`/`publish_candidate`は`run_tick`だけが作る`PublicationTick`を要求します
+（呼出しを`run_tick`から到達するcodeに限定するもので、adapter実装はtrusted、backend instanceの
+同一性はcallerの責任、guard mintは未seal）。現行core full wrapperは3 configを必須とする
 ため、service pair全体の不在表現はoptional-config composition seamを追加する後続作業です。
 candidateがあるtickだけ、backendはboundedな所有状態からpublication quiescenceを検証し、
 exact `&mut backend`を保持するsealed GAT guardをpublicationへ渡します。unfinished RX/generated

@@ -11,9 +11,20 @@
 //! packet backend type `I` and implements [`FullServicePublication`] only for
 //! that backend, so [`ruster_runtime::run_tick`] drives it directly. Both
 //! seam methods require a [`PublicationTick`] that only `run_tick` can mint,
-//! so the active view and successor publication are reachable only inside a
-//! tick, and a successor only after that backend granted quiescence. The
-//! transaction is:
+//! so they are reachable only from code that `run_tick` calls.
+//!
+//! Precise guarantee: `FullServicePublication` implementations (adapters,
+//! including wrappers around this type) are trusted code, because they
+//! receive the token and may forward it. Backend binding is by type only:
+//! driving the publication with the same backend instance on every tick is
+//! the caller's responsibility, and core's `PublicationQuiescenceGuard::new`
+//! is not sealed, so a guard is type discipline, not proof of quiescence.
+//! Only `run_tick` itself obtains the guard from the backend's real check.
+//!
+//! The compile_fail error codes below were verified manually; stable rustdoc
+//! (and therefore CI) only enforces that each example fails to compile.
+//!
+//! The transaction is:
 //!
 //! 1. [`ValidatedCandidate::validate_successor`] (generation, key rotation,
 //!    and the restart-required storage shape, fixed policies, and interface
@@ -70,8 +81,8 @@
 //! }
 //! ```
 //!
-//! A publication bound to one backend cannot be driven with another
-//! backend's (for example a self-minted) quiescence guard:
+//! A publication bound to one backend type cannot be driven through the seam
+//! of another backend type:
 //!
 //! ```compile_fail,E0277
 //! use ruster_control::ActivePublication;

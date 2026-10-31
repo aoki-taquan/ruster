@@ -243,11 +243,18 @@ impl<'view, 'storage> FullServiceView<'view, 'storage> {
 ///
 /// [`FullServicePublication::active`] and
 /// [`FullServicePublication::publish_candidate`] require a borrow of this
-/// token, so a publication is read or changed only by the tick orchestrator;
-/// a candidate additionally only after the backend granted quiescence. The
+/// token, so they are reachable only from code that `run_tick` calls. The
 /// token has a private field and no constructor, is not `Clone`, `Copy`,
 /// `Send`, or `Sync`, and is only lent for one call, so it cannot be forged,
 /// duplicated, or kept beyond its tick.
+///
+/// It does not make adapters untrusted: an adapter receives the token and may
+/// forward it, and a guard can be built with the public
+/// `PublicationQuiescenceGuard::new`. Only `run_tick` itself requests the
+/// guard from the backend's real quiescence check, and using the same
+/// backend instance on every tick is the caller's responsibility. The
+/// compile_fail error codes below were verified manually; stable rustdoc
+/// only enforces that each example fails to compile.
 ///
 /// ```compile_fail,E0451
 /// use ruster_runtime::PublicationTick;
