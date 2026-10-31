@@ -769,7 +769,12 @@ ICMPとなり、外部からinside側のroute有無を走査できます。そ�
 前にread-onlyな`route_miss_may_hit_nat_reject`で、いずれかのNAT configのoutsideがingress、
 realm mismatch時のTCP/UDPでingressがinside、またはinside発のUDP/TCPで対応するNAT runtimeが
 不在/不一致なら、counter/trace/stateを変えずsilentな`FirewallRouteUnavailable`にします
-（いずれも保守側で、該当egressへのrouteが無い場合も含む）。
+（いずれも保守側で、該当egressへのrouteが無い場合も含む）。firewall評価より後で行う
+outbound NATのshape/plan reject（DF=0の`Nat44UdpNonAtomicIpv4Unsupported`、source port 0、
+SourceForbidden、ReverseAuthorityMismatch、port pool枯渇など）は再現しないため、例えばLANからの
+DF=0 UDP/53はroute有りならsilent、route無しならICMPになります。これは受容します: 送信者はinside
+にいて有効なDF=1 trafficで同じroute有無を知ることができ、firewallなしの経路にも同じ非対称が
+あり、生成errorはper-egress rate limiterで抑えられるためです。
 
 残るdeviation: egress-free評価はestablished stateを参照せず新規flowとして判定するため、
 routeが撤去された後の既存flowのpacket（例: established TCPのACK、許可ruleがegress限定の
