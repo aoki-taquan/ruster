@@ -869,9 +869,33 @@ deduplicateし、明示finishとDropのどちらも各endpointへ
 publishしたsubmissionをrejectへ巻き戻さずin-flightに残します。hot submit/completion/reuseは
 heap allocationしません。
 
-このsliceはpersistent RX validation cursor、`PacketIo` lease、RXからTXへのadapter接続、poll、
-live stats/cleanupを実装しません。従ってIO-012のproduction conformance、実packet送受信、
-throughputは引き続きdeferredです。
+AP1-RXのprivate engineは、portごとにbatchから独立したpersistent cursorをresource側に持ちます。
+batchはpacket、block status read、descriptor visitの独立budgetで進み、packet budgetがzeroなら
+statusもdescriptorも読みません。head blockのstatusをAcquireで一度だけ読み、KERNELなら後続blockを
+skipせずring emptyとして止まります。USERなら固定per-block metadataのchecked nonzero generationを
+進めてblock headerを検証し、descriptorを一つずつchain linkに沿って検証します。検証進捗と
+per-packet data rangeは固定metadataへ保存するため、budgetで中断したbatchを捨てても次のbatchは
+正確に同じdescriptorから再開し、既検証descriptorを再走査しません。blockのpacketはchain全体の
+検証が終わるまで一つも公開しません。全readはRX extent内のchecked range、volatile accessです。
+
+公開するpacketはmmap上のexact data rangeを指すzero-copy leaseで、portを排他的にborrowします。
+従ってleaseが生きている間はsibling leaseもblock returnも型上起こりません。release、drop、
+`mem::forget`後の次cursor stepのいずれでもpacketは一度だけterminalになり、最後のpacketが
+terminalになった時点でだけTP_STATUS_KERNELをRelease storeし、ring順に次blockへ進みます。
+古いgenerationやpacket indexのcompletionはstale tokenとして拒否します。
+
+malformed inputのrecovery policyはfail closedです。KERNELでもUSER bit付きでもないstatusと
+generation枯渇はkernel所有の可能性があるblockへ書かずcursorを保持してbatchをhaltします。
+block header不正、またはdescriptor自身の配置/next linkが不安全なchainはUSER観測済みなので、
+どのpacketも公開せず、後続descriptorも読まずにblock全体を即kernelへ返します。linkが安全で
+MAC/network offset、snapshot、data range、truncation、宣言最大frame超過、kernelがcaptured bytes
+から外したVLAN offload tagのいずれかが不正なpacketだけを個別terminal faultにし、siblingは配送
+します。counterは既存の固定saturating `BackendStats`だけを使い、steady receive/releaseは
+heap allocationしません。
+
+このsliceは`PacketIo` lease、RXからTXへのadapter接続、同一portでRX lease中にTXへcopyする
+split borrow、poll、live stats/cleanupを実装しません。従ってIO-012のproduction conformance、
+実packet送受信、throughputは引き続きdeferredです。
 
 `ruster-io-xdp`の最初のsliceは、native AF_XDP backendではなく、全targetでcompileできる
 pure-Rust ownership/ring modelです。socket、native ring、libxdp FFI、XDP program、core

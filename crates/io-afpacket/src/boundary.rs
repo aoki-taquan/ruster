@@ -1,12 +1,12 @@
 //! Cold ownership storage and checked combined-ring extent foundations.
 //!
-//! AP1-0 does not perform packet I/O. It fixes the disjoint RX/TX mapping
-//! boundary and allocates the metadata backing that later RX/TX state machines
-//! will reuse without allocating in steady operation.
+//! AP1-0 fixes the disjoint RX/TX mapping boundary and allocates the metadata
+//! that the private RX/TX engines reuse without allocating in steady
+//! operation.
 
 use crate::{
-    MappingAccessError, PlatformError, RingKind, TxFrameModel, ValidatedPort, TPACKET_ALIGNMENT,
-    TPACKET_V3_HEADER_LEN,
+    GeometryError, MappingAccessError, PlatformError, RingKind, RxBlockModel, TxFrameModel,
+    ValidatedPort, TPACKET_ALIGNMENT, TPACKET_V3_HEADER_LEN,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,12 +102,42 @@ impl CombinedRingExtents {
     }
 }
 
+/// Why one RX packet whose chain link was safe is not exposed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum RxPacketFault {
+    /// MAC/network offset, snapshot, or data-range validation failed.
+    Descriptor(GeometryError),
+    /// The kernel captured fewer bytes than the wire frame carried.
+    Truncated { snap_len: usize, wire_len: usize },
+    /// The captured frame exceeds the configured maximum Ethernet frame.
+    Oversize { length: usize, maximum: usize },
+    /// The kernel reported an offloaded VLAN tag that is absent from the
+    /// captured bytes.
+    VlanOffloaded { status: u32 },
+    /// The checked data range could not be mapped inside the RX extent.
+    Mapping(MappingAccessError),
+}
+
+/// One validated descriptor of the active RX block. `data_offset` is
+/// block-relative; `fault` marks a locally invalid packet that is terminal
+/// without being exposed.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct RxPacketMetadata {
     pub(crate) data_offset: usize,
     pub(crate) data_len: usize,
     pub(crate) next_offset: usize,
+    pub(crate) fault: Option<RxPacketFault>,
+}
+
+/// Per-block identity and userspace ownership mirror. `generation` is zero
+/// until the block is first observed USER and advances on every observation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct RxBlockMetadata {
+    pub(crate) generation: u64,
+    pub(crate) ownership: RxBlockModel,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -119,6 +149,7 @@ pub(crate) struct TxFrameMetadata {
 
 #[allow(dead_code)]
 pub(crate) struct ColdRingMetadata {
+    rx_blocks: Box<[RxBlockMetadata]>,
     rx_packets: Box<[RxPacketMetadata]>,
     tx_frames: Box<[TxFrameMetadata]>,
 }
@@ -131,9 +162,18 @@ impl ColdRingMetadata {
         let tx = port.tx();
         let tx_frames = tx.map_len() / tx.frame_size();
         Ok(Self {
+            rx_blocks: fixed_storage(RingKind::Rx, rx.block_count(), RxBlockMetadata::default())?,
             rx_packets: fixed_storage(RingKind::Rx, rx_packets, RxPacketMetadata::default())?,
             tx_frames: fixed_storage(RingKind::Tx, tx_frames, TxFrameMetadata::default())?,
         })
+    }
+
+    pub(crate) fn rx_blocks(&self) -> &[RxBlockMetadata] {
+        &self.rx_blocks
+    }
+
+    pub(crate) fn rx_blocks_mut(&mut self) -> &mut [RxBlockMetadata] {
+        &mut self.rx_blocks
     }
 
     pub(crate) fn rx_packets(&self) -> &[RxPacketMetadata] {
