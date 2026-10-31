@@ -1154,6 +1154,42 @@ mod tests {
     }
 
     #[test]
+    fn idle_tick_tx_is_completed_but_not_kept_for_expectations() {
+        let source = r#"
+schema = "ruster-scenario/v1"
+seed = 8
+config = "router-v1.toml"
+
+[[step]]
+kind = "inject"
+interface = "lan"
+frame = { kind = "raw", hex = "020000000001020000000010080045000023000140004011 4ecfc0a8010ac633641413880035000f7f0371756572792d31" }
+
+[[step]]
+kind = "tick"
+at-ms = 0
+
+[[step]]
+kind = "hold"
+"#;
+        let scenario = parse_scenario(source.as_bytes(), &fixtures()).unwrap();
+        let mut session = SimSession::new(scenario).unwrap();
+        let mut out = Vec::new();
+        let mut run = session.start(&mut out).unwrap();
+        assert_eq!(run.run(&mut out).unwrap(), Progress::Hold);
+        // The scenario tick emitted the first ARP Request into the buffer.
+        assert_eq!(run.tx.len(), 1);
+        run.tx.clear();
+        // The unresolved gateway is retried during hold.
+        run.idle_tick(1_000, &mut out).unwrap();
+        run.idle_tick(2_000, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert_eq!(text.matches("{\"event\":\"tx\",\"step\":null,").count(), 2);
+        assert!(run.tx.is_empty());
+        assert_eq!(run.io.pending_tx(), 0);
+    }
+
+    #[test]
     fn non_restart_rejections_and_missing_publications_are_fatal() {
         let error = ApplyError::Successor(SuccessorError::GenerationNotIncreasing);
         assert_eq!(
