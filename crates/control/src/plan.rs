@@ -26,7 +26,7 @@
 
 use std::{cmp::Ordering, fmt, num::NonZeroU64};
 
-use ruster_config::ValidatedConfigV1;
+use ruster_config::{InterfaceBindingV1, ValidatedConfigV1};
 use ruster_core::{
     FirewallHashKey, FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, LocalIpv4Binding,
     Nat44TcpHashKey, Nat44UdpHashKey, Neighbor, PublicationQuiescence, Route,
@@ -147,6 +147,26 @@ impl NatChange {
     }
 }
 
+/// Control-plane labels of one interface. Informational only: core
+/// identity is the IfId and MAC, so a label change is reloadable.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct InterfaceLabels {
+    pub id: IfId,
+    pub name: Box<str>,
+    pub device: Box<str>,
+}
+
+impl InterfaceLabels {
+    fn of(binding: &InterfaceBindingV1) -> Self {
+        Self {
+            id: binding.id(),
+            name: binding.name().into(),
+            device: binding.device().into(),
+        }
+    }
+}
+
 /// Which input of a plan was rejected.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlanSide {
@@ -178,6 +198,7 @@ pub struct ApplyPlan {
     neighbors: Box<[Change<Neighbor>]>,
     local_ipv4: Box<[Change<LocalIpv4Binding>]>,
     interfaces: Box<[Change<Interface>]>,
+    interface_labels: Box<[Delta<InterfaceLabels>]>,
     firewall_rules: Box<[Change<FirewallRule>]>,
     firewall_rule_order_changed: bool,
     firewall_policy_changed: bool,
@@ -232,6 +253,7 @@ impl ApplyPlan {
                 binding.interface
             }),
             interfaces,
+            interface_labels: label_changes(current.interfaces(), next.interfaces()),
             firewall_rules: diff(old_rules, new_rules, |rule| rule.id()),
             firewall_rule_order_changed: common_order_changed(old_rules, new_rules),
             firewall_policy_changed: old.firewall.policy() != new.firewall.policy(),
@@ -290,6 +312,14 @@ impl ApplyPlan {
         &self.interfaces
     }
 
+    /// Name/device changes of interfaces present in both documents, in IfId
+    /// order. Not restart-required; additions/removals are in
+    /// [`ApplyPlan::interfaces`].
+    #[must_use]
+    pub fn interface_labels(&self) -> &[Delta<InterfaceLabels>] {
+        &self.interface_labels
+    }
+
     #[must_use]
     pub fn firewall_rules(&self) -> &[Change<FirewallRule>] {
         &self.firewall_rules
@@ -323,8 +353,10 @@ impl ApplyPlan {
     }
 
     /// Reasons the change cannot be applied in place, in successor
-    /// validation order. A NAT port range change also changes the port-owner
-    /// storage shape and is therefore restart-required.
+    /// validation order. The NAT port-owner table holds exactly one slot per
+    /// pool port, so only a pool *size* change alters the storage shape and
+    /// is restart-required; a same-size shift of the range and a realm change
+    /// are reloadable.
     #[must_use]
     pub fn restart_required(&self) -> &[RestartRequired] {
         &self.restart_required
@@ -377,6 +409,24 @@ fn diff<T: Copy + Eq, K: Ord>(old: &[T], new: &[T], key: impl Fn(&T) -> K) -> Bo
             }
         }
     }
+    changes.into_boxed_slice()
+}
+
+fn label_changes(
+    old: &[InterfaceBindingV1],
+    new: &[InterfaceBindingV1],
+) -> Box<[Delta<InterfaceLabels>]> {
+    let mut changes: Vec<_> = old
+        .iter()
+        .filter_map(|old| {
+            let new = new.iter().find(|new| new.id() == old.id())?;
+            (old.name() != new.name() || old.device() != new.device()).then(|| Delta {
+                old: InterfaceLabels::of(old),
+                new: InterfaceLabels::of(new),
+            })
+        })
+        .collect();
+    changes.sort_by_key(|change| change.old.id);
     changes.into_boxed_slice()
 }
 
@@ -473,10 +523,12 @@ struct IssuedKeys {
 /// rejected. A→B→A therefore yields three generations with three distinct key
 /// sets even when the key source misbehaves.
 ///
-/// One sequencer must serve the whole process: activating new storage after
-/// a restart-required change keeps using the same sequencer, so the new
-/// storage starts above every generation already issued. Nothing persists
-/// across process restarts (M1).
+/// Exactly one sequencer must serve the whole process (S5b driver and S6
+/// CLI included), also across storage re-creation for a restart-required
+/// change: new storage starts with no generation floor, so only the shared
+/// sequencer keeps the new storage above every generation already issued.
+/// Building with caller-chosen generations through `candidate_from_config`
+/// bypasses this guarantee. Nothing persists across process restarts (M1).
 ///
 /// ```compile_fail
 /// use ruster_control::{PublicationSequencer, SimDeterministicKeySource};

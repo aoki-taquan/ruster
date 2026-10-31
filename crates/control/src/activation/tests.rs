@@ -899,6 +899,18 @@ fn exact(count: usize) -> crate::FlushCount {
 
 #[test]
 fn check_successor_is_a_side_effect_free_dry_run_that_predicts_apply() {
+    // The dry-run does not raise the storage generation floor either.
+    {
+        let mut storage = FullServiceStorage::new(candidate(&V1, 1).storage_shape()).unwrap();
+        let mut active = ActivePublication::<SimIo>::new(&mut storage, candidate(&V1, 1)).unwrap();
+        for generation in [2, 3, 9] {
+            assert!(active.check_successor(&candidate(&V2, generation)).is_ok());
+        }
+        drop(active);
+        assert_eq!(storage.generation_floor().map(NonZeroU64::get), Some(1));
+        assert!(ActivePublication::<SimIo>::new(&mut storage, candidate(&V1, 2)).is_ok());
+    }
+
     let first = candidate(&V1, 1);
     let mut storage = FullServiceStorage::new(first.storage_shape()).unwrap();
     let mut active = ActivePublication::<SimIo>::new(&mut storage, first).unwrap();
@@ -997,8 +1009,8 @@ fn check_successor_is_a_side_effect_free_dry_run_that_predicts_apply() {
 #[test]
 fn plan_restart_classification_matches_live_apply_rejection() {
     use crate::plan::tests::{
-        config, ICMPV4_POLICY_CHANGE, INTERFACE_CHANGE, PORT_CHANGE, RESOLUTION_POLICY_CHANGE,
-        ROUTE_CHANGE, SHAPE_CHANGE,
+        config, ICMPV4_POLICY_CHANGE, INTERFACE_CHANGE, PORT_CHANGE, PORT_SHIFT,
+        RESOLUTION_POLICY_CHANGE, ROUTE_CHANGE, SHAPE_CHANGE,
     };
     use crate::{ApplyPlan, PublicationSequencer};
 
@@ -1034,8 +1046,9 @@ fn plan_restart_classification_matches_live_apply_rejection() {
         assert!(observe(&active) == before);
     }
 
-    // No restart reason: the dry-run and the apply both succeed.
-    let next = config(&[ROUTE_CHANGE]);
+    // No restart reason: the dry-run and the apply both succeed. A
+    // same-size NAT port pool shift keeps the storage shape and reloads.
+    let next = config(&[ROUTE_CHANGE, PORT_SHIFT]);
     let successor = sequencer.candidate(&next).unwrap();
     let plan = ApplyPlan::for_active(&mut active, &current, &next, &successor).unwrap();
     assert!(!plan.requires_restart());
@@ -1046,6 +1059,10 @@ fn plan_restart_classification_matches_live_apply_rejection() {
     assert_eq!(check.generation, successor.generation());
     let report = tick(&mut active, &mut io, now + 1, Some(successor));
     assert_eq!(report.publication, PublicationOutcome::Applied);
+    let (_, mac, port) = forward_once(&mut active, &mut io, now + 2, 5_000);
+    assert_eq!(mac, GATEWAY_B_MAC);
+    assert!((40016..=40031).contains(&port), "shifted pool in use");
+    assert!(reply_reaches_host(&mut active, &mut io, now + 3, port));
 }
 
 #[test]

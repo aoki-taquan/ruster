@@ -206,6 +206,8 @@ exit criteria:
 - service: M1ではNAT44 UDP、NAT44 TCP、FWを全て必須とし、欠落はtyped rejectとする。
 - restart-required: storage shape、resolution/ICMP policy、interface IfId/MAC変更。
   route、neighbor、FW rule、NAT port/realmはreload可能。
+  - 補足（2026-11-01、実装による明確化。owner確認待ち）: NAT port poolのsize変更はstorage shapeを
+    変えるためrestart-required。同sizeのrange shiftとrealm変更はreload可能。
 - rollback: M1では旧config fileを新generationとして再applyすることを指す。
 - R17の数値thresholdはimplementerがPRで提案し、ownerがそのPRで承認する。
 - NAT/FW占有のhigh-watermarkはM2へ延期する。

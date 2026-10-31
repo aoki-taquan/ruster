@@ -27,8 +27,8 @@ pub use config_bridge::{
 };
 
 pub use plan::{
-    ApplyPlan, Change, Delta, FlushCount, NatChange, NatPortRange, NatRealm, PlanError, PlanSide,
-    PublicationSequencer, SequencerError, StateFlush, SuccessorCheck,
+    ApplyPlan, Change, Delta, FlushCount, InterfaceLabels, NatChange, NatPortRange, NatRealm,
+    PlanError, PlanSide, PublicationSequencer, SequencerError, StateFlush, SuccessorCheck,
 };
 
 pub use publication::{

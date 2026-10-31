@@ -48,6 +48,9 @@ pub(crate) const ICMPV4_POLICY_CHANGE: (&str, &str) = (
 pub(crate) const INTERFACE_CHANGE: (&str, &str) =
     ("mac = \"02:00:00:00:00:02\"", "mac = \"02:00:00:00:00:22\"");
 pub(crate) const PORT_CHANGE: (&str, &str) = ("last = 40015", "last = 40031");
+/// Same pool size, shifted range: reloadable.
+pub(crate) const PORT_SHIFT: (&str, &str) =
+    ("first = 40000\nlast = 40015", "first = 40016\nlast = 40031");
 
 fn plan(edits: &[(&str, &str)]) -> ApplyPlan {
     ApplyPlan::between(&config(&[]), &config(edits)).expect("plan")
@@ -64,6 +67,7 @@ fn only(plan: &ApplyPlan, aspects: &[&str]) {
         ("neighbors", !plan.neighbors().is_empty()),
         ("local_ipv4", !plan.local_ipv4().is_empty()),
         ("interfaces", !plan.interfaces().is_empty()),
+        ("interface_labels", !plan.interface_labels().is_empty()),
         ("firewall_rules", !plan.firewall_rules().is_empty()),
         ("firewall_order", plan.firewall_rule_order_changed()),
         ("firewall_policy", plan.firewall_policy_changed()),
@@ -182,8 +186,8 @@ fn plan_reports_nat_realm_ports_and_policy_changes() {
         assert_eq!((nat.ports, nat.policy_changed), (None, false));
     }
 
-    // The port-owner table is sized by the pool, so a pool change is also a
-    // storage shape change.
+    // The port-owner table has one slot per pool port, so a pool size change
+    // is also a storage shape change.
     let ports = plan(&[PORT_CHANGE]);
     only(&ports, &["nat44_udp", "nat44_tcp", "restart"]);
     assert_eq!(
@@ -201,6 +205,17 @@ fn plan_reports_nat_realm_ports_and_policy_changes() {
     );
     assert_eq!(ports.restart_required(), [RestartRequired::StorageShape]);
 
+    // A same-size shift keeps the shape and is reloadable.
+    let shift = plan(&[PORT_SHIFT]);
+    only(&shift, &["nat44_udp", "nat44_tcp"]);
+    assert_eq!(
+        shift.nat44_tcp().ports.map(|ports| ports.new),
+        Some(NatPortRange {
+            first: 40016,
+            last: 40031
+        })
+    );
+
     let policy = plan(&[("allocator-seed = \"7\"", "allocator-seed = \"8\"")]);
     only(&policy, &["nat44_udp"]);
     assert!(policy.nat44_udp().policy_changed);
@@ -215,6 +230,19 @@ fn plan_classifies_interface_shape_and_policy_changes_as_restart_required() {
         [Change::Changed(Delta { old, new })] if old.id == IfId(2) && new.mac == MacAddress([2, 0, 0, 0, 0, 0x22])
     ));
     assert_eq!(interface.restart_required(), [RestartRequired::Interfaces]);
+
+    // Name/device are control-plane labels: informational, reloadable.
+    // Every reference is by name, so rename all of them.
+    let renamed =
+        edited(&[("device = \"eth1\"", "device = \"eth9\"")]).replace("\"wan\"", "\"uplink\"");
+    let labels = ApplyPlan::between(&config(&[]), &document(&renamed)).unwrap();
+    only(&labels, &["interface_labels"]);
+    let [change] = labels.interface_labels() else {
+        panic!("one label change: {:?}", labels.interface_labels());
+    };
+    assert_eq!(change.old.id, IfId(2));
+    assert_eq!((&*change.old.name, &*change.old.device), ("wan", "eth1"));
+    assert_eq!((&*change.new.name, &*change.new.device), ("uplink", "eth9"));
 
     for (edit, reason) in [
         (SHAPE_CHANGE, RestartRequired::StorageShape),
