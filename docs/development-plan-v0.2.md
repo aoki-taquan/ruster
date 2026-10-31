@@ -405,7 +405,7 @@ matching requirements rowを同じPRで完成させる。
 | R07 | new backend conformance crate/filesとsim adapter test | RX/generated exactly-once、partial reject、finish error、abandon | backend ownership |
 | R08 | RI0/R06/R07後。new runtime crateのtick module/test | phase順、全budget bounded、RX borrow後generated、error時pending保存 | lifecycle/performance |
 | R09 | R08後。config crateの`model`/`parse`/`validate` module | schema version、duplicate/unknown/canonicality/realm/capacityをmutation前にtyped reject | product/security |
-| R10 | R09後。publication ownerである`ruster-control`の`plan`/`activation` module（実績: S2 #274、S3 #275） | dry-run diff、all-or-nothing apply、restart-required、new-generation rollback | failure atomicity |
+| R10 | R09後。config/runtimeの`plan`/`apply` module（実績: publication ownerである`ruster-control`の`plan`/`activation` moduleに置いた。S2 #274、S3 #275） | dry-run diff、all-or-nothing apply、restart-required、new-generation rollback | failure atomicity |
 | R11 | R08後。sim scenario crate/moduleとgolden fixtures | deterministic timestamp/ingress/frame inputとtyped output。packet path Stringなし | test/product |
 | R15 | R09後（R09はR08依存）。runtime `observability` moduleと専用snapshot test | allocation-free typed snapshot、generation、health、core state/action/audit high-watermark、backend stats extension pointとsim実装、saturating counters。formatはcold consumerだけ（実績 #276: core accessorが要るhigh-watermarkはOBS-015/017/018でdeferred） | operations/performance |
 | R16 | R01/R03/R04/R05/R06/R08/R09後。`fuzz/`、new property tests、`.github/workflows/fuzz-smoke.yml`だけ（実績: dependency-free runnerを`crates/io-sim/tests/r16a_support`に置いた。#249、#252、#280） | fixed seed/corpusと時間上限を記録し、parser/checksum/state/publication invariants、過去failure corpusをrequired unprivileged smokeで実行 | security/test |
