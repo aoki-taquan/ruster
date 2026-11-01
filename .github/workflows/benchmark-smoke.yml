@@ -1,0 +1,79 @@
+name: Benchmark Smoke
+
+# R17 scope (docs/benchmark-spec-v0.2.md, "M1で適用する範囲"):
+#   - verify the benchmark spec bytes against the pinned SHA-256 digest
+#   - check the spec tables against hardware plan v1
+#   - run the NIC-free sim smoke suite and keep its JSONL as an artifact
+# No throughput/latency pass/fail and no hardware comparison happen here.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark-smoke:
+    name: Benchmark Smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+
+      - name: Verify pinned spec digest
+        run: sha256sum --check --strict docs/benchmark-spec-v0.2.sha256
+
+      - name: Check spec against hardware plan v1
+        run: >-
+          timeout --signal=TERM --kill-after=30s 10m
+          cargo test --locked -p ruster-bench --test benchmark_spec
+
+      - name: Run sim smoke suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=30s 10m \
+            cargo run --release --locked -p ruster-bench -- \
+            --suite smoke --format jsonl > "${RUNNER_TEMP}/benchmark-smoke.jsonl"
+          rows="$(wc -l < "${RUNNER_TEMP}/benchmark-smoke.jsonl")"
+          if (( rows == 0 )); then
+            echo "smoke suite produced no rows" >&2
+            exit 1
+          fi
+          # Single grep per check (no pipe): `grep -v | grep -q` fails open under
+          # pipefail when the producer gets SIGPIPE.
+          if grep -q -v -F '"schema_version":1,' "${RUNNER_TEMP}/benchmark-smoke.jsonl"; then
+            echo "smoke row without schema_version 1" >&2
+            exit 1
+          fi
+          if grep -q -v -F '"timed_allocations":0,' "${RUNNER_TEMP}/benchmark-smoke.jsonl"; then
+            echo "smoke row with timed allocations" >&2
+            exit 1
+          fi
+          echo "benchmark smoke rows: ${rows} (no performance thresholds applied)"
+
+      - name: Upload smoke JSONL
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: benchmark-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/benchmark-smoke.jsonl
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
+          include-hidden-files: false
