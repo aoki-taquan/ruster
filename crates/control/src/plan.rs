@@ -19,6 +19,9 @@
 //! refuses any key set that it already issued within this process. An M1
 //! rollback is simply building the old configuration document again: the
 //! result is a new generation with new keys, applied like any successor.
+//! [`ProductionSequencer`] is the same sequencer restricted to a sealed
+//! [`ProductionKeySource`]; the live `run` path must use it, so a
+//! deterministic simulation key source cannot reach live traffic.
 //!
 //! Across process restarts nothing is remembered: M1 starts from scratch, so
 //! a new process restarts numbering at generation 1 with a fresh sequencer
@@ -35,8 +38,8 @@ use ruster_core::{
 use crate::{
     candidate_from_config,
     config_bridge::{required_services, RequiredServices},
-    ActivePublication, ApplyError, ConfigBridgeError, PublicationKeySource, RestartRequired,
-    RuntimeService, ValidatedCandidate,
+    ActivePublication, ApplyError, ConfigBridgeError, ProductionKeySource, PublicationKeySource,
+    RestartRequired, RuntimeService, ValidatedCandidate,
 };
 
 /// How many entries of one kind of publication-bound state an apply flushes.
@@ -659,6 +662,92 @@ impl<S: PublicationKeySource> PublicationSequencer<S> {
         }
         self.issued.push(keys);
         Ok(candidate)
+    }
+}
+
+/// The [`PublicationSequencer`] for live traffic.
+///
+/// Identical generation numbering, key-reuse guard, and rollback semantics,
+/// but it can only be built from a sealed [`ProductionKeySource`] (today only
+/// [`crate::OsRandomKeySource`]), and [`ProductionSequencer::new`] also
+/// asserts at compile time that `S::KIND` is a production kind (never
+/// [`crate::KeySourceKind::DeterministicSimulation`]). The production `run` entry
+/// point takes this type, never a bare [`PublicationSequencer`]; `run-sim`
+/// keeps using [`PublicationSequencer`] with
+/// [`crate::SimDeterministicKeySource`].
+///
+/// ```no_run
+/// use ruster_control::{KeySourceError, OsRandomKeySource, ProductionSequencer};
+///
+/// let sequencer = ProductionSequencer::new(OsRandomKeySource::open()?);
+/// assert_eq!(sequencer.last_issued(), None);
+/// # Ok::<(), KeySourceError>(())
+/// ```
+///
+/// A simulation source is rejected at compile time:
+///
+/// ```compile_fail,E0277
+/// use ruster_control::{ProductionSequencer, SimDeterministicKeySource};
+///
+/// let _ = ProductionSequencer::new(SimDeterministicKeySource::new(7));
+/// ```
+///
+/// Like [`PublicationSequencer`] it is not `Clone`:
+///
+/// ```compile_fail
+/// use ruster_control::{OsRandomKeySource, ProductionSequencer};
+///
+/// fn require_clone<T: Clone>() {}
+/// require_clone::<ProductionSequencer<OsRandomKeySource>>();
+/// ```
+pub struct ProductionSequencer<S: ProductionKeySource> {
+    inner: PublicationSequencer<S>,
+}
+
+impl<S: ProductionKeySource> ProductionSequencer<S> {
+    /// Starts a process-lifetime production sequence at generation 1.
+    #[must_use]
+    pub const fn new(keys: S) -> Self {
+        const {
+            assert!(
+                S::KIND.is_production(),
+                "a production sequencer requires a production key source"
+            );
+        }
+        Self {
+            inner: PublicationSequencer::new(keys),
+        }
+    }
+
+    /// The highest generation consumed so far.
+    #[must_use]
+    pub const fn last_issued(&self) -> Option<NonZeroU64> {
+        self.inner.last_issued()
+    }
+
+    /// The generation the next build will consume.
+    pub fn next_generation(&self) -> Result<NonZeroU64, SequencerError> {
+        self.inner.next_generation()
+    }
+
+    /// Builds `config` as the next generation with fresh keys; see
+    /// [`PublicationSequencer::candidate`]. A key-source failure consumes the
+    /// generation and yields no candidate.
+    pub fn candidate(
+        &mut self,
+        config: &ValidatedConfigV1,
+    ) -> Result<ValidatedCandidate, SequencerError> {
+        self.inner.candidate(config)
+    }
+}
+
+impl<S: ProductionKeySource> fmt::Debug for ProductionSequencer<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProductionSequencer")
+            .field("last_issued", &self.inner.last_issued)
+            .field("issued_key_sets", &self.inner.issued.len())
+            .finish_non_exhaustive()
     }
 }
 

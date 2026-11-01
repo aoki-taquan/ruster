@@ -13,6 +13,7 @@
 
 mod activation;
 mod config_bridge;
+mod key_source;
 mod plan;
 mod publication;
 
@@ -26,9 +27,12 @@ pub use config_bridge::{
     PublicationKeys, SimDeterministicKeySource,
 };
 
+pub use key_source::{OsRandomKeySource, ProductionKeySource};
+
 pub use plan::{
     ApplyPlan, Change, Delta, FlushCount, InterfaceLabels, NatChange, NatPortRange, NatRealm,
-    PlanError, PlanSide, PublicationSequencer, SequencerError, StateFlush, SuccessorCheck,
+    PlanError, PlanSide, ProductionSequencer, PublicationSequencer, SequencerError, StateFlush,
+    SuccessorCheck,
 };
 
 pub use publication::{
