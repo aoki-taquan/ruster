@@ -151,7 +151,7 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   quiescenceはleaked lease回収とsettle後にlease/handoff/in-flightなし、OBS-018のstatsはkernel
   `XDP_STATISTICS`とring gaugeを含め固定順で出す。Rx/Generated/CQ conformance
   suiteをscripted kernel上で、二veth portのcore forwardingをprivileged smokeで検証した
-  （XDP-133〜170、IO-013、OBS-018）。configからのport構築と`ruster run`、health化、MTU/link変更、
+  （XDP-133〜174、IO-013、OBS-018）。configからのport構築と`ruster run`、health化、MTU/link変更、
   TX枠公平性はX04b（XDP-157）。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native

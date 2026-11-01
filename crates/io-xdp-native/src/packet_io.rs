@@ -44,7 +44,9 @@
 //! `cross_port_copies` on the egress port.
 //!
 //! Copies never take the last [`generated_reserve`] frames of the egress
-//! generated pool (`max(2, pool / 8)`, capped at the pool): those stay for
+//! generated pool (`max(2, pool / 8)`, capped at the pool; a multi-port
+//! adapter refuses a pool of 1 or 2 frames, which could never take a copy,
+//! with [`XdpPacketIoSetupError::GeneratedPoolTooSmall`]): those stay for
 //! router-generated ARP and ICMP, so sustained cross-port traffic cannot
 //! starve neighbour resolution. A copy that would dip into the reserve, or
 //! finds the pool empty, is refused without blocking
@@ -94,7 +96,9 @@
 //!   handoff is a fault: it is reported once as the batch error and makes
 //!   the adapter stop ([`PublicationQuiescenceDisposition::Stop`]) for
 //!   good. A panic that unwinds through a batch stops the adapter too
-//!   (fail closed: a lease or handoff could be stranded mid-operation).
+//!   (fail closed: a lease or handoff could be stranded mid-operation);
+//!   nothing else runs during the unwind, and `drain` reclaims a lease
+//!   left recorded then.
 //!
 //! # Kicks
 //!
@@ -104,8 +108,12 @@
 //! settled (reap, then kick unless the TX need-wakeup flag says
 //! `NotRequired`, repeated while TX stays in flight) by `finish`, by a
 //! dropped batch, by `receive`, by `begin_generated`, by
-//! [`XdpPacketIo::service`], by the quiescence check, and right after a
-//! submission was blocked. One settle kicks at most
+//! [`XdpPacketIo::service`], by the quiescence check, and right after the
+//! first blocked submission of a port in a batch. A batch's drop does not
+//! settle again after `finish`. A settle kicks only while the kernel has
+//! not consumed every published descriptor: once only completions lag
+//! (TX interrupt coalescing, zero copy), a kick cannot help, so it stops
+//! and later settles just reap. One settle kicks at most
 //! `ceil(in_flight / 32) + 2` times: Linux v6.8 copy mode transmits at most
 //! `TX_BATCH_SIZE` (32) descriptors per `sendto` and answers `EAGAIN` while
 //! more remain, so a 60-frame batch needs two kicks. A kick that fails
@@ -287,6 +295,13 @@ pub enum XdpPacketIoSetupError {
     ZeroMtu(IfId),
     /// A port's config was taken from another session than its engine's.
     SessionMismatch(IfId),
+    /// With more than one port, a port's generated pool is no larger than
+    /// its router reserve ([`generated_reserve`]: pools of 1 or 2 frames),
+    /// so no cross-port copy could ever reach it.
+    GeneratedPoolTooSmall {
+        interface: IfId,
+        generated_frames: u32,
+    },
 }
 
 impl fmt::Display for XdpPacketIoSetupError {
@@ -405,13 +420,20 @@ struct PortState<'memory> {
     kick_owed: bool,
     /// The last TX kick found the link down.
     link_down: bool,
+    /// The current batch already settled this port after a blocked
+    /// submission (at most once per port per batch).
+    relieved: bool,
     counters: XdpAdapterCounters,
 }
 
 impl PortState<'_> {
-    /// Reaps, then kicks while TX stays in flight and the kernel does not
-    /// decline, within `ceil(in_flight / 32) + 2` kicks. A link that is
-    /// down leaves the kick owed without an error.
+    /// Reaps, then kicks while the kernel has not consumed every published
+    /// TX descriptor and does not decline, within `ceil(in_flight / 32) + 2`
+    /// kicks. A kick can only make the kernel consume descriptors: once
+    /// every descriptor is consumed and only completions lag (TX interrupt
+    /// coalescing on a NIC, zero-copy), it stops without kicking and keeps
+    /// the kick owed, so later settles just reap. A link that is down
+    /// leaves the kick owed without an error.
     fn settle(&mut self) -> Result<(), XdpIoError> {
         let interface = self.config.interface;
         let mut kicks = self.engine.tx_inflight().div_ceil(KICK_TX_BATCH) + KICK_SLACK;
@@ -427,6 +449,10 @@ impl PortState<'_> {
             }
             self.kick_owed = true;
             if self.engine.tx_needs_wakeup() == Ok(NeedWakeup::NotRequired) {
+                return Ok(());
+            }
+            if self.engine.tx_unconsumed() == 0 {
+                // Consumed, completion pending on the kernel side.
                 return Ok(());
             }
             if kicks == 0 {
@@ -508,12 +534,27 @@ impl<'memory> XdpPacketIo<'memory> {
                 engine: port.engine,
                 lendable: 0,
                 kick_owed: false,
+                relieved: false,
                 link_down: false,
                 counters: XdpAdapterCounters::default(),
             });
         }
         if states.is_empty() {
             return Err(XdpPacketIoSetupError::NoPorts);
+        }
+        if states.len() > 1 {
+            // A pool no larger than its router reserve could never carry a
+            // cross-port copy: refuse it rather than silently disabling
+            // forwarding into this port.
+            if let Some(port) = states
+                .iter()
+                .find(|port| port.engine.generated_frames() <= port.copy_reserve)
+            {
+                return Err(XdpPacketIoSetupError::GeneratedPoolTooSmall {
+                    interface: port.config.interface,
+                    generated_frames: port.engine.generated_frames(),
+                });
+            }
         }
         states.sort_by_key(|port| port.config.interface);
         if let Some(pair) = states
@@ -737,8 +778,14 @@ impl<'memory> XdpPacketIo<'memory> {
         }
     }
 
-    /// After a blocked submission: kick and reap the port at once.
+    /// After a blocked submission: kick and reap the port at once, at most
+    /// once per port per batch (later blocked submissions of the same batch
+    /// are left to the batch's own settle, so a burst of refusals cannot
+    /// multiply syscalls).
     fn relieve(&mut self, port: usize, error: &mut Option<XdpIoError>) {
+        if std::mem::replace(&mut self.ports[port].relieved, true) {
+            return;
+        }
         if let Err(failure) = self.settle_port(port) {
             error.get_or_insert(failure);
         }
@@ -930,7 +977,13 @@ impl<'memory> PacketIo for XdpPacketIo<'memory> {
 
     fn receive(&mut self, budget: usize) -> Result<Self::Batch<'_>, Self::Error> {
         self.running()?;
+        // Defensive and redundant (a mutation removing it is expected to
+        // survive): `next_packet` and the batch's settle reclaim too. Doing
+        // it first only returns a leaked frame before this receive's poll.
         self.reclaim_outstanding();
+        for port in self.ports.iter_mut() {
+            port.relieved = false;
+        }
         let mut error = None;
         if let Err(failure) = self.settle_owed() {
             if self.stop.is_some() {
@@ -984,6 +1037,7 @@ impl<'memory> PacketIo for XdpPacketIo<'memory> {
             tx_rejected: 0,
             recycled: 0,
             error,
+            finished: false,
         })
     }
 }
@@ -998,20 +1052,36 @@ pub struct XdpRxBatch<'a, 'memory> {
     tx_rejected: usize,
     recycled: usize,
     error: Option<XdpIoError>,
+    /// `finish` already settled; the drop does nothing more.
+    finished: bool,
+}
+
+/// Stops the adapter for good while a panic unwinds through a batch.
+///
+/// Nothing else runs then: no reclaim (a panic raised by a lease invariant
+/// could fire again and abort the process) and no kick. The frame of a
+/// leased-but-unreclaimed lease stays recorded in the adapter; `drain`
+/// reclaims it later.
+fn fail_closed_on_panic(io: &mut XdpPacketIo<'_>) -> bool {
+    if std::thread::panicking() {
+        io.stop.get_or_insert(Stop::Fault);
+        true
+    } else {
+        false
+    }
 }
 
 impl XdpRxBatch<'_, '_> {
     /// Ends the batch: reclaims a leaked lease, stops lending, and settles
     /// every port that owes a kick. A panic unwinding through the batch
-    /// stops the adapter (fail closed) instead of kicking.
+    /// only stops the adapter (fail closed).
     fn settle(&mut self) {
+        if fail_closed_on_panic(self.io) {
+            return;
+        }
         self.io.reclaim_outstanding();
         for port in self.io.ports.iter_mut() {
             port.lendable = 0;
-        }
-        if std::thread::panicking() {
-            self.io.stop.get_or_insert(Stop::Fault);
-            return;
         }
         if let Err(failure) = self.io.settle_owed() {
             self.error.get_or_insert(failure);
@@ -1074,6 +1144,7 @@ impl<'a, 'memory> PacketBatch for XdpRxBatch<'a, 'memory> {
 
     fn finish(mut self) -> BatchCompletion<Self::Error> {
         self.settle();
+        self.finished = true;
         BatchCompletion {
             tx_requested: self.tx_requested,
             tx_accepted: self.tx_accepted,
@@ -1086,9 +1157,11 @@ impl<'a, 'memory> PacketBatch for XdpRxBatch<'a, 'memory> {
 
 impl Drop for XdpRxBatch<'_, '_> {
     fn drop(&mut self) {
-        // Cheap after `finish`: nothing outstanding, no kick owed unless TX
-        // is still in flight (then the settle retries it).
-        self.settle();
+        // A batch dropped without `finish` settles here; after `finish`
+        // nothing is left to do (no second settle, no extra kicks).
+        if !self.finished {
+            self.settle();
+        }
     }
 }
 
@@ -1148,6 +1221,7 @@ impl<'memory> GeneratedPacketIo for XdpPacketIo<'memory> {
             }
             (Ok(()), None) => None,
             (Ok(()), Some(port)) => {
+                self.ports[port].relieved = false;
                 // Completed frames return to the pool before this phase.
                 if let Err(failure) = self.settle_port(port) {
                     error = Some(failure);
@@ -1172,6 +1246,7 @@ impl<'memory> GeneratedPacketIo for XdpPacketIo<'memory> {
                 rejected: 0,
                 error,
             },
+            finished: false,
             #[cfg(test)]
             allocation_budget,
         }
@@ -1186,6 +1261,8 @@ pub struct XdpGeneratedBatch<'a, 'memory> {
     /// The egress has no port.
     unknown: bool,
     completion: GeneratedBatchCompletion<XdpIoError>,
+    /// `finish` already settled; the drop does nothing more.
+    finished: bool,
     #[cfg(test)]
     allocation_budget: Option<usize>,
 }
@@ -1201,11 +1278,10 @@ impl XdpGeneratedBatch<'_, '_> {
     }
 
     fn settle(&mut self) {
-        self.reclaim();
-        if std::thread::panicking() {
-            self.io.stop.get_or_insert(Stop::Fault);
+        if fail_closed_on_panic(self.io) {
             return;
         }
+        self.reclaim();
         if let Some(port) = self.port {
             if self.io.ports[port].kick_owed {
                 if let Err(failure) = self.io.settle_port(port) {
@@ -1240,9 +1316,7 @@ impl XdpGeneratedBatch<'_, '_> {
                         assert!(cancelled.is_ok(), "the adapter's own handoff cancels");
                         if let TxRejection::Blocked(_) = reason {
                             bump(&mut state.counters.generated_tx_blocked);
-                            if let Err(failure) = self.io.settle_port(port) {
-                                self.completion.error.get_or_insert(failure);
-                            }
+                            self.io.relieve(port, &mut self.completion.error);
                         } else {
                             let failure = self.io.fault(XdpIoError::Submit {
                                 interface,
@@ -1342,6 +1416,7 @@ impl<'a, 'memory> GeneratedPacketBatch for XdpGeneratedBatch<'a, 'memory> {
 
     fn finish(mut self) -> GeneratedBatchCompletion<Self::Error> {
         self.settle();
+        self.finished = true;
         GeneratedBatchCompletion {
             attempts: self.completion.attempts,
             allocated: self.completion.allocated,
@@ -1358,7 +1433,9 @@ impl<'a, 'memory> GeneratedPacketBatch for XdpGeneratedBatch<'a, 'memory> {
 
 impl Drop for XdpGeneratedBatch<'_, '_> {
     fn drop(&mut self) {
-        self.settle();
+        if !self.finished {
+            self.settle();
+        }
     }
 }
 

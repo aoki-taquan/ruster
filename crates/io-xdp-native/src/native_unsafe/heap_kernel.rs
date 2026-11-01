@@ -167,6 +167,10 @@ pub(crate) struct ScriptedKernel {
     /// Link down: a TX kick fails `ENETDOWN` and transmits nothing.
     link_down: Cell<bool>,
     transmitted: Cell<u32>,
+    /// When set, copy-mode kicks consume TX but hold the completions (TX
+    /// interrupt coalescing) until `release_deferred_completions`.
+    defer_completions: Cell<bool>,
+    deferred: RefCell<Vec<u64>>,
     statistics: Cell<Option<crate::abi::XdpStatistics>>,
 }
 
@@ -203,6 +207,8 @@ impl ScriptedKernel {
             copy_transmit: Cell::new(None),
             link_down: Cell::new(false),
             transmitted: Cell::new(0),
+            defer_completions: Cell::new(false),
+            deferred: RefCell::new(Vec::new()),
             statistics: Cell::new(None),
         }
     }
@@ -566,6 +572,21 @@ impl ScriptedKernel {
         self.link_down.set(down);
     }
 
+    /// Makes copy-mode kicks consume TX descriptors without completing
+    /// them until [`Self::release_deferred_completions`].
+    pub(crate) fn set_defer_completions(&self, defer: bool) {
+        self.defer_completions.set(defer);
+    }
+
+    /// Produces every held completion; returns how many.
+    pub(crate) fn release_deferred_completions(&self) -> usize {
+        let held = std::mem::take(&mut *self.deferred.borrow_mut());
+        for address in &held {
+            assert!(self.produce_completion(*address));
+        }
+        held.len()
+    }
+
     /// Descriptors transmitted by copy-mode kicks.
     pub(crate) fn transmitted(&self) -> u32 {
         self.transmitted.get()
@@ -600,7 +621,11 @@ impl ScriptedKernel {
                 return Ok(());
             }
             let descriptor = self.consume_tx().expect("pending TX");
-            assert!(self.produce_completion(descriptor.address));
+            if self.defer_completions.get() {
+                self.deferred.borrow_mut().push(descriptor.address);
+            } else {
+                assert!(self.produce_completion(descriptor.address));
+            }
             self.transmitted.set(self.transmitted.get() + 1);
         }
         if self.tx_pending() > 0 {

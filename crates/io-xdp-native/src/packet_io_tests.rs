@@ -19,7 +19,7 @@ use crate::{
         heap_kernel::{allocation_count, ScriptedKernel},
         kick::KickRing,
     },
-    packet_io::{generated_reserve, KICK_TX_BATCH},
+    packet_io::{generated_reserve, KICK_SLACK, KICK_TX_BATCH},
     KickError, NegotiatedMode, RingEntries, RingName, RxFillConfig, RxFillEngine, TxRejection,
     UmemConfig, UmemDomainId, XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort,
     XdpPortConfig, XdpQuiescenceError, XDP_PACKET_HEADROOM,
@@ -701,6 +701,18 @@ fn kick_policy_settles_owed_tx_and_reports_only_genuine_failures() {
         assert_eq!(batch.finish().error, None);
     }
     assert!(wan.kicks(KickRing::Tx) >= 1);
+    // A finished batch is settled once: a kernel that consumes nothing
+    // gets exactly one settle's budget of kicks, not a second from the
+    // batch's drop.
+    transmit_all(&wan);
+    io.service().expect("service");
+    deliver(&wan, &ipv4_frame(60, 64));
+    let before = wan.kicks(KickRing::Tx);
+    assert_eq!(commit_all(&mut io, 8, WAN), (1, 1, 0));
+    assert_eq!(
+        wan.kicks(KickRing::Tx) - before,
+        1_u32.div_ceil(KICK_TX_BATCH) + KICK_SLACK
+    );
     // Fill wakeup requests are answered by receive.
     lan.set_fill_flags(XDP_RING_NEED_WAKEUP);
     drop(io.receive(8).expect("receive"));
@@ -869,13 +881,28 @@ fn generated_reserve_keeps_router_frames_from_cross_port_copies() {
         }
         let _ = batch.finish();
     }
-    // An empty pool (no reserve left to protect) counts as unavailable.
-    let (lan, wan) = (kernel(), kernel_with(RX_FRAMES, 2));
+    // A pool of 1 or 2 frames is all reserve: refused with several ports.
+    for frames in [1, 2] {
+        let (lan, wan) = (kernel(), kernel_with(RX_FRAMES, frames));
+        assert_eq!(
+            XdpPacketIo::new([port(&lan, LAN, 0, MTU), port(&wan, WAN, 0, MTU)]).map(|_| ()),
+            Err(XdpPacketIoSetupError::GeneratedPoolTooSmall {
+                interface: WAN,
+                generated_frames: frames,
+            })
+        );
+    }
+    // A single port never copies, so its small pool is accepted.
+    let alone = kernel_with(RX_FRAMES, 1);
+    assert!(XdpPacketIo::new([port(&alone, WAN, 0, MTU)]).is_ok());
+    // An empty pool counts as unavailable.
+    let (lan, wan) = (kernel(), kernel_with(RX_FRAMES, 3));
     let mut io = adapter(&lan, &wan);
     {
         let mut batch = io.begin_generated(WAN);
-        batch.allocate(42).expect("generated").commit();
-        batch.allocate(42).expect("generated").commit();
+        for _ in 0..3 {
+            batch.allocate(42).expect("generated").commit();
+        }
         let _ = batch.finish();
     }
     deliver(&lan, &ipv4_frame(60, 64));
@@ -1152,6 +1179,126 @@ fn a_raw_lease_of_another_engine_is_refused() {
     let lease = other.lease_pending().expect("lease");
     assert_ne!(lease.engine(), 0);
     let _ = mine.lease_bytes_mut(&lease);
+}
+
+#[test]
+fn completion_lag_after_consumption_does_not_burn_kicks() {
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    // Copy-mode transmit that consumes at once but completes late (TX
+    // interrupt coalescing on a NIC, or zero copy).
+    lan.set_copy_transmit(Some(KICK_TX_BATCH));
+    lan.set_defer_completions(true);
+    lan.set_tx_flags(XDP_RING_NEED_WAKEUP);
+    for _ in 0..RING {
+        deliver(&lan, &ipv4_frame(60, 64));
+    }
+    assert_eq!(commit_all(&mut io, 8, LAN), (8, 8, 0));
+    // One kick consumed all eight; nothing more is kicked while only the
+    // completions lag, across the finish, the drop, and later settles.
+    assert_eq!(lan.kicks(KickRing::Tx), 1);
+    for _ in 0..4 {
+        io.service().expect("service");
+        drop(io.receive(8).expect("receive"));
+    }
+    assert_eq!(lan.kicks(KickRing::Tx), 1);
+    let stats = io.port_stats(LAN).expect("LAN");
+    assert_eq!(stats.counters.kick_budget_exhausted, 0);
+    assert_eq!(stats.counters.tx_inflight, 8);
+    assert!(stats.kick_owed, "owed until the completions arrive");
+    // Blocked submissions while the in-flight bound is full relieve at most
+    // once per batch and do not kick either.
+    for _ in 0..4 {
+        deliver(&lan, &ipv4_frame(60, 64));
+    }
+    assert_eq!(commit_all(&mut io, 8, LAN), (4, 0, 4));
+    assert_eq!(lan.kicks(KickRing::Tx), 1);
+    assert_eq!(
+        io.port_stats(LAN)
+            .expect("LAN")
+            .counters
+            .kick_budget_exhausted,
+        0
+    );
+    // The completions arrive; the next settle reaps them all.
+    assert_eq!(lan.release_deferred_completions(), 8);
+    io.service().expect("service");
+    let stats = io.port_stats(LAN).expect("LAN");
+    assert_eq!(stats.counters.tx_inflight, 0);
+    assert!(!stats.kick_owed);
+    audit(&io);
+}
+
+#[test]
+fn a_blocked_port_is_relieved_once_per_batch() {
+    // TX ring of 4 and copy-mode transmit: the first refusal kicks and
+    // reaps, freeing the ring for the next four commits; the second
+    // refusal of the same batch is left to the finish.
+    let make = || {
+        ScriptedKernel::with_tx(
+            entries(RingName::Fill, 16),
+            entries(RingName::Rx, 16),
+            entries(RingName::Tx, 4),
+            entries(RingName::Completion, 4),
+            UmemConfig::new(40, FRAME_SIZE, 0, 24, 16, 0).expect("UMEM"),
+        )
+    };
+    let (lan, wan) = (make(), kernel());
+    let engine = RxFillEngine::new(
+        lan.take_datapath().expect("first take"),
+        UmemDomainId::new(NonZeroU128::new(0x5781).expect("nonzero")),
+        RxFillConfig::new(NonZeroU32::new(16).expect("nonzero")),
+    )
+    .expect("engine");
+    let mut io = XdpPacketIo::new([
+        XdpPort::new(
+            XdpPortConfig::for_test(LAN, 0, NegotiatedMode::Copy, MTU, lan.origin()),
+            engine,
+        ),
+        port(&wan, WAN, 0, MTU),
+    ])
+    .expect("adapter");
+    lan.set_copy_transmit(Some(KICK_TX_BATCH));
+    lan.set_tx_flags(XDP_RING_NEED_WAKEUP);
+    for _ in 0..12 {
+        deliver(&lan, &ipv4_frame(60, 64));
+    }
+    // 4 accepted, 1 refused (relieve: kick + reap), 4 accepted, 3 refused.
+    assert_eq!(commit_all(&mut io, 16, LAN), (12, 8, 4));
+    assert_eq!(lan.transmitted(), 8);
+    assert_eq!(lan.kicks(KickRing::Tx), 2, "one relieve, one finish");
+    let counters = io.port_stats(LAN).expect("LAN").counters;
+    assert_eq!(counters.tx_blocked, 4);
+    assert_eq!(counters.kick_budget_exhausted, 0);
+    assert_eq!(counters.tx_inflight, 0);
+    audit(&io);
+}
+
+#[test]
+fn a_panic_with_a_leaked_lease_only_stops_and_drain_reclaims() {
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    deliver(&lan, &ipv4_frame(60, 64));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut batch = io.receive(8).expect("receive");
+        std::mem::forget(batch.next_packet().expect("lease"));
+        panic!("core failed after leaking a lease");
+    }));
+    assert!(result.is_err());
+    assert_eq!(
+        io.current_io_disposition(),
+        PublicationQuiescenceDisposition::Stop
+    );
+    // Nothing was reclaimed during the unwind.
+    assert_eq!(io.engine(LAN).expect("LAN").frame_accounting().leased, 1);
+    let report = io.drain(1).expect("drain");
+    assert!(report.is_drained());
+    assert_eq!(io.engine(LAN).expect("LAN").frame_accounting().leased, 0);
+    assert_eq!(
+        io.port_stats(LAN).expect("LAN").counters.leases_reclaimed,
+        1
+    );
+    audit(&io);
 }
 
 #[test]

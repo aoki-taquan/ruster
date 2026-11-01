@@ -2517,7 +2517,9 @@ generated reserve: 持続的なcross-port trafficがegressのgenerated poolを�
 ARP/ICMPが毎tick `Unavailable`になりneighborがexpireするので、copyはpoolの最後の
 `generated_reserve(pool) = max(2, pool / 8)`（poolで上限）frameを取りません。reserveに食い込む
 copyは`cross_port_copy_reserved`、poolが空なら`cross_port_copy_unavailable`で拒否し、blockしません。
-router生成（`begin_generated`）はreserveを含むpool全体を使えます。`begin_generated`はallocation前に
+router生成（`begin_generated`）はreserveを含むpool全体を使えます。複数portのadapterでは、
+reserveがpool全体になる1〜2 frameのpool（cross-port copyが一度も届かない）を
+`GeneratedPoolTooSmall`でsetup時に拒否します（一portなら受理）。`begin_generated`はallocation前に
 egress portをsettle（completion reapと負っているkick）するので、完了したframeはその場でpoolへ戻ります。
 reserveはportのstats（`copy_reserve`）に出る定数式で、configは持ちません。
 
@@ -2535,10 +2537,15 @@ in-flightが残る限りpublicationを全体で延期し得ます（X04b、XDP-1
 
 kick policy: portはTXがin-flightの間kickを負います（`kick_owed`）。受理されたsubmitごと、deferred/
 失敗したkickの後に立ち、batchの開始ではresetせずbatchをまたいで保持し、in-flightが0になったときだけ
-消えます。負っているportは`finish`、batchのdrop、`receive`、`begin_generated`、`service`、quiescence
-check、そしてsubmitがback-pressureで拒否された直後にsettleされます。settleはcompletionをreapし、
-in-flightが残りTX need-wakeupが`NotRequired`でない限りkickしてまたreapすることを、一回あたり
-`ceil(in_flight / 32) + 2`回のkick以内で繰り返します。Linux v6.8 copy modeは一回の`sendto`で最大
+消えます。負っているportは`finish`（batchのdropは`finish`後には何もしない）、`finish`なしのbatch drop、
+`receive`、`begin_generated`、`service`、quiescence check、そしてbatch内でそのportのsubmitが最初に
+back-pressureで拒否された直後（portごとbatchごとに一回だけ。後の拒否はbatchのsettleに任せる）に
+settleされます。settleはcompletionをreapし、in-flightが残り、TX need-wakeupが`NotRequired`でなく、
+kernelがまだ消費していないTX descriptorがある（`tx_unconsumed() > 0`）限りkickしてまたreapすることを、
+一回あたり`ceil(in_flight / 32) + 2`回のkick以内で繰り返します。kickはkernelにdescriptorを消費させる
+ことしかできないので、全部消費済みでcompletionだけが遅れている場合（NICのTX interrupt coalescingや
+zero-copy）はkickせずdebtを残し、以後のsettleはreapだけをします（以前はこの状態で毎settle予算を使い切り、
+blockされたsubmitごとにも繰り返して2048 entry ringで一tick約4.3k syscallになり得た）。Linux v6.8 copy modeは一回の`sendto`で最大
 `TX_BATCH_SIZE`（32）descriptorを送りまだ残れば`EAGAIN`を返すので、60 frameのbatchは`finish`の中の
 二回のkickで全部completionまで進みます（以前は32で止まり残りは次のtrafficを待った）。`ENETDOWN`
 （link down）はerrorではなくportのlink state（stats `link_down`、`kicks_link_down`）で、kickは負った
@@ -2572,7 +2579,9 @@ phaseをgenerated failureとしてskip）ので、`BelowMinimum`を`ZeroLength`�
 mapしてもruntimeの結果は同じで、最も近い`FrameTooLarge`へmapしcoreは変更しません。`Draining`は
 drain後のadapterが`Stop`を返すためruntimeからは到達しません。finish errorはruntimeが全portの
 generated ARP/ICMPをskipする原因になるので、本物のfaultだけに限ります。link downは一portの状態で
-あってerrorではありません。unknown egressのsessionはbatch errorを出しませんが、runtimeは最初の
+あってerrorではありません。device削除後の`ENXIO`のような`ENETDOWN`以外の持続的なkick失敗は毎tickの
+batch errorになり、quiescenceは`ContinueOldIo`のままです（device削除の扱いはX04b、XDP-157）。
+unknown egressのsessionはbatch errorを出しませんが、runtimeは最初の
 `Unavailable`でそのtickのARP phaseを止めます（head of line）。これはcoreを変えずには避けられないため、
 X04bがsnapshotのinterfaceと同じvalidated configからportを作り、runtimeが要求する全egressにportがある
 ことを保証します。
@@ -2585,7 +2594,9 @@ batchのframeは次の`next_packet`/`allocate`/`finish`/batch drop/`receive`/`be
 条件を保ちます）。忘れたbatchのkick debtもportに残り次のsettleが払います。`RawLease`の全使用
 （byte access、resume）はengine identityをalways-onで確かめ、別engineのleaseはpanicします
 （同じ`UmemDomainId`で同じtokenでも）。batchを通ってpanicがunwindした場合はleaseやhandoffが操作途中で
-残り得るので、adapterを`Stop`にしてfail closedします（leaseは回収）。
+残り得るので、adapterを`Stop`にしてfail closedし、unwind中はそれ以外何もしません（lease invariantの
+assertが原因のpanicで回収が同じassertを再び踏みprocessがabortするのを避けるため）。記録された
+leaseは後の`drain`が回収します。
 
 quiescence: batchはadapterを可変借用するので`try_publication_quiescence`を呼べる時点でbatchは開いて
 いません。leaked leaseを回収し、全portをsettle（reapと負っているkick）してから、各portで両poolのlent
@@ -2607,7 +2618,9 @@ port数、link downのport数、kickを負っているport数、kernel statsを�
 `link_down`、`kick_owed`、`copy_reserve`、kernel `XDP_STATISTICS`、`XdpCounters`）を返します。どちらも
 allocationなしのO(ports)で固定順の`ObservableFields`です。kernel statsはportごとに一回の
 `getsockopt(SOL_XDP, XDP_STATISTICS)`（seam経由、fd/長さのalways-on check、Linux v6.8の48 byte
-`struct xdp_statistics`と完全一致する長さだけを受理）をstats呼び出し時（cold path）にだけ行い、
+`struct xdp_statistics`と完全一致する長さだけを受理。将来のkernelで構造体が大きくなれば48 byteの
+要求は拒否され、kernel statsはfail closedで`kernel_stats_available = false`）をstats呼び出し時
+（cold path）にだけ行い、
 packet pathでは読みません。`XdpCounters`はRX/Fill（polls、rx_packets/leased/recycled/abandoned、
 rx_ring_empty、rx_backlogged、runt、reason別invalid descriptor、fill_published/starved/ring_full/
 need_wakeup/flag_errors/suppressed_draining）、TX/Completion（tx_submitted、tx_ring_full、
@@ -2654,4 +2667,4 @@ snapshot、static neighbor）で転送し、Bのgenerated poolへのcopyがBのp
 読み、Bで60 frameのgenerated burstが`finish`だけで全部completionまで進むこと（二回のkick）、Bを
 `ip link set down`（netns内）した間のTXが`ENETDOWN`のlink stateになりerrorにならず、`up`後は新しい
 trafficなしにquiescence checkだけでreadyへ戻ることを確認してから両portをdrainします
-（XDP-133〜170、IO-013、OBS-018）。
+（XDP-133〜174、IO-013、OBS-018）。
