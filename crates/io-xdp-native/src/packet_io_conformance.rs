@@ -15,8 +15,9 @@
 //! - An accept budget is real back-pressure: the harness commits filler
 //!   generated frames that the kernel consumes and never completes, so
 //!   the TX in-flight bound (the TX capacity) leaves exactly the budget.
-//! - The finish-error capability fails the next TX kick (`ENETDOWN`) with
-//!   the TX need-wakeup flag set.
+//! - The finish-error capability fails the next TX kick with `EINVAL`
+//!   (`ENETDOWN` is a link state, not an error) with the TX need-wakeup
+//!   flag set.
 //! - The generated allocation budget is the adapter's test gate, which
 //!   returns `Unavailable` once the session's budget is spent.
 //!
@@ -56,8 +57,8 @@ use crate::{
 };
 
 const ENDPOINTS: [TxEndpoint; 2] = [CONFORMANCE_LAN_ENDPOINT, CONFORMANCE_WAN_ENDPOINT];
-/// ENETDOWN.
-const KICK_ERRNO: u16 = 100;
+/// EINVAL: a genuine kick failure (ENETDOWN is a link state, not an error).
+const KICK_ERRNO: u16 = 22;
 
 fn port_of(interface: IfId) -> usize {
     ENDPOINTS

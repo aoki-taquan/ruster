@@ -57,6 +57,18 @@ pub struct DatapathRings<'session> {
     umem: UmemMapping<'session>,
     umem_config: UmemConfig,
     kick: SocketKick<'session>,
+    origin: u64,
+}
+
+/// Source of process-unique datapath origins (cold: one per session open or
+/// test kernel).
+static NEXT_ORIGIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A fresh nonzero origin identity for one session's datapath.
+pub(crate) fn next_origin() -> u64 {
+    let id = NEXT_ORIGIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert_ne!(id, 0, "datapath origins exhausted");
+    id
 }
 
 /// The members of one bundle, moved into the engine together.
@@ -68,6 +80,8 @@ pub(crate) struct DatapathParts<'session> {
     pub(crate) umem: UmemMapping<'session>,
     pub(crate) umem_config: UmemConfig,
     pub(crate) kick: SocketKick<'session>,
+    /// The session (or test kernel) the bundle came from.
+    pub(crate) origin: u64,
 }
 
 impl<'session> DatapathRings<'session> {
@@ -91,6 +105,7 @@ impl<'session> DatapathRings<'session> {
             umem,
             umem_config,
             kick,
+            origin,
         } = parts;
         Self {
             fill,
@@ -100,6 +115,7 @@ impl<'session> DatapathRings<'session> {
             umem,
             umem_config,
             kick,
+            origin,
         }
     }
 
@@ -112,6 +128,7 @@ impl<'session> DatapathRings<'session> {
             umem,
             umem_config,
             kick,
+            origin,
         } = self;
         DatapathParts {
             fill,
@@ -121,6 +138,7 @@ impl<'session> DatapathRings<'session> {
             umem,
             umem_config,
             kick,
+            origin,
         }
     }
 

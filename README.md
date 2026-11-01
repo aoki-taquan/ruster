@@ -166,9 +166,16 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   `BelowMinimum`は`FrameTooLarge`、`Draining`は`Unavailable`へmapし、ring破損は一回のerrorの後
   adapterを`Stop`にする。`finish`はTXを公開したportごとに一回need-wakeupに従ってkickする。
   quiescenceはcompletionをreapしてからlease/handoff/in-flight TXが無いことを要求し、in-flightは
-  `ContinueOldIo`で延期する。`backend_stats()`は全port合計、`port_stats(IfId)`はportごとの
-  mode、need-wakeup、Fill/RX/TX/CQ saturation、completion lag、invalid descriptor、quarantine、
-  generated、cross-port copyのcounterを固定順・allocationなしで出す。configからのport構築と
+  `ContinueOldIo`で延期する。kickはportごとのdebtとしてbatchをまたいで保持し、TXがin-flightの間は
+  `finish`、`receive`、`begin_generated`、`service`、quiescence check、back-pressure直後にreapと
+  kickを繰り返す（一回`ceil(in_flight/32)+2` kick以内。copy modeの一`sendto` 32 descriptor上限を
+  越えるbatchも`finish`で完了）。`ENETDOWN`はerrorでなくportのlink stateで、linkが戻れば新しい
+  trafficなしに回復する。cross-port copyはrouter生成ARP/ICMP用のgenerated reserve
+  `max(2, pool/8)`を取らない。portの設定は`XdpPortConfig::from_session`でだけ作れ、別sessionの
+  engineとの組は拒否する。`backend_stats()`は全port合計、`port_stats(IfId)`はportごとの
+  mode、need-wakeup、link state、Fill/RX/TX/CQ saturationとring占有、completion lag、invalid
+  descriptor、kernel `XDP_STATISTICS`（stats呼び出し時だけgetsockopt）、quarantine、generated、
+  cross-port copyのcounterを固定順・allocationなしで出す。configからのport構築と
   `ruster run`はまだ無い（X04b）。FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
   privileged smokeは`scripts/priv-xdp-smoke.sh`（`sudo -n`で専用netnsとその中だけのveth pairを
   作り、`RUSTER_PRIV_XDP=1`で実行してnetnsを必ず削除。不足はskipせずfail）。
@@ -647,7 +654,7 @@ replyへ書き換えて送りpeerが学習、in-flight frameをdrain、X02）、
 ARP requestを生成してcommitし、peerが送信元を`ip neigh`に学習、completionとdrainでgenerated poolへ
 戻る、X03）、adapter（別の1-queue veth pair二つ`rx00c4`/`rx00c5`と`rx00c6`/`rx00c7`を一つの
 `XdpPacketIo`の二portにし、Aのpeerから送ったIPv4/UDP frameをcore `forward_batch`で転送してBの
-generated poolへcopyし、Bのpeerが書き換え済みMACとTTLで受信、両portをdrain、X04a）、foreign（`ip link set ... xdpgeneric obj`で
+generated poolへcopyし、Bのpeerが書き換え済みMACとTTLで受信、60 frame burstが一batchで完了、netns内の`ip link set down/up`によるBのlink flapから新しいtrafficなしにquiescenceがreadyへ戻る、両portをdrain、X04a）、foreign（`ip link set ... xdpgeneric obj`で
 付けた外部programを両modeで拒否しprogram id不変。objectは`scripts/priv-xdp-foreign-elf.py`が
 compilerなしで生成）、holder（attachした別processをSIGKILLしlinkが消える）の順です。
 

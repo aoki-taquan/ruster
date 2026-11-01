@@ -13,14 +13,16 @@ use ruster_core::{
 };
 
 use crate::{
+    abi::XdpStatistics,
     abi::{XdpDescriptor, XDP_RING_NEED_WAKEUP},
     native_unsafe::{
         heap_kernel::{allocation_count, ScriptedKernel},
         kick::KickRing,
     },
-    NegotiatedMode, RingEntries, RingName, RxFillConfig, RxFillEngine, UmemConfig, UmemDomainId,
-    XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort, XdpPortConfig, XdpQuiescenceError,
-    XDP_PACKET_HEADROOM,
+    packet_io::{generated_reserve, KICK_TX_BATCH},
+    KickError, NegotiatedMode, RingEntries, RingName, RxFillConfig, RxFillEngine, TxRejection,
+    UmemConfig, UmemDomainId, XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort,
+    XdpPortConfig, XdpQuiescenceError, XDP_PACKET_HEADROOM,
 };
 
 pub(crate) const FRAME_SIZE: u32 = 2_048;
@@ -76,7 +78,7 @@ pub(crate) fn engine(kernel: &ScriptedKernel, domain: u128) -> RxFillEngine<'_> 
 
 pub(crate) fn port(kernel: &ScriptedKernel, interface: IfId, queue: u32, mtu: u32) -> XdpPort<'_> {
     XdpPort::new(
-        XdpPortConfig::new(interface, queue, NegotiatedMode::Copy, mtu),
+        XdpPortConfig::for_test(interface, queue, NegotiatedMode::Copy, mtu, kernel.origin()),
         engine(kernel, 0x5600 + u128::from(interface.0)),
     )
 }
@@ -223,7 +225,7 @@ fn adapter_fixes_the_ifid_mapping_and_refuses_bad_port_sets() {
     let draining = kernel();
     let mut engine = engine(&draining, 0x5698);
     let _ = engine.drain(0).expect("drain");
-    let config = XdpPortConfig::new(LAN, 0, NegotiatedMode::Copy, MTU);
+    let config = XdpPortConfig::for_test(LAN, 0, NegotiatedMode::Copy, MTU, draining.origin());
     assert_eq!(
         XdpPacketIo::new([XdpPort::new(config, engine)]).map(|_| ()),
         Err(XdpPacketIoSetupError::EngineDraining(LAN))
@@ -509,7 +511,8 @@ fn generated_refusals_map_to_core_allocation_errors() {
         batch.finish()
     };
     assert!(completion.invariants_hold());
-    assert_eq!(completion.error, Some(XdpIoError::UnknownEgress(IfId(42))));
+    assert_eq!(completion.error, None, "not a backend fault");
+    assert_eq!(io.backend_stats().generated_unknown_egress, 1);
     transmit_all(&wan);
     io.service().expect("service");
     audit(&io);
@@ -635,34 +638,41 @@ fn forgotten_leases_are_reclaimed_by_their_batch() {
 }
 
 #[test]
-fn kicks_once_per_published_port_and_reports_a_failed_kick() {
+fn kick_policy_settles_owed_tx_and_reports_only_genuine_failures() {
     let (lan, wan) = (kernel(), kernel());
     let mut io = adapter(&lan, &wan);
-    lan.set_tx_flags(XDP_RING_NEED_WAKEUP);
-    wan.set_tx_flags(XDP_RING_NEED_WAKEUP);
+    // Need-wakeup clear (a zero-copy driver that consumes by itself): TX in
+    // flight is owed but never kicked.
     for _ in 0..3 {
         deliver(&lan, &ipv4_frame(60, 64));
     }
-    {
-        let mut batch = io.receive(8).expect("receive");
-        let mut index = 0;
-        while let Some(packet) = batch.next_packet() {
-            packet.commit(if index == 0 { WAN } else { LAN });
-            index += 1;
-        }
-        let completion = batch.finish();
-        assert_eq!((completion.tx_accepted, completion.error), (3, None));
-    }
-    assert_eq!(lan.kicks(KickRing::Tx), 1);
-    assert_eq!(wan.kicks(KickRing::Tx), 1);
-    // Nothing published: no kick.
-    drop(io.receive(8).expect("receive"));
-    assert_eq!(lan.kicks(KickRing::Tx), 1);
-    // A failed kick is the batch error; the frame stays in flight.
+    assert_eq!(commit_all(&mut io, 8, LAN), (3, 3, 0));
+    assert_eq!(lan.kicks(KickRing::Tx), 0, "NotRequired: no kick");
+    let stats = io.port_stats(LAN).expect("LAN");
+    assert!(stats.kick_owed);
+    assert_eq!(io.backend_stats().kick_owed_ports, 1);
+    // The kernel asks: the next settle kicks within its budget,
+    // ceil(3 / 32) + 2 = 3 kicks, while nothing is consumed.
+    lan.set_tx_flags(XDP_RING_NEED_WAKEUP);
+    io.service().expect("service");
+    assert_eq!(lan.kicks(KickRing::Tx), 3);
+    let counters = io.port_stats(LAN).expect("LAN").counters;
+    assert_eq!(counters.kick_budget_exhausted, 1);
+    assert_eq!(counters.tx_kicks, 3);
+    // Nothing published on WAN: never kicked.
+    assert_eq!(wan.kicks(KickRing::Tx), 0);
+    // Once the kernel completes, the next settle clears the debt.
     transmit_all(&lan);
     io.service().expect("service");
+    assert!(!io.port_stats(LAN).expect("LAN").kick_owed);
+    let kicks = lan.kicks(KickRing::Tx);
+    io.service().expect("service");
+    assert_eq!(lan.kicks(KickRing::Tx), kicks, "no debt, no kick");
+
+    // A genuine failure (EINVAL) is the batch error; the frame stays in
+    // flight and the kick stays owed.
     deliver(&lan, &ipv4_frame(60, 64));
-    lan.fail_next_kick(Some(100)); // ENETDOWN
+    lan.fail_next_kick(Some(22));
     {
         let mut batch = io.receive(8).expect("receive");
         batch.next_packet().expect("lease").commit(LAN);
@@ -671,22 +681,26 @@ fn kicks_once_per_published_port_and_reports_a_failed_kick() {
         assert_eq!(completion.tx_accepted, 1);
         assert!(matches!(
             completion.error,
-            Some(XdpIoError::Kick { interface: LAN, .. })
+            Some(XdpIoError::Kick {
+                interface: LAN,
+                error: KickError::Errno(22),
+            })
         ));
     }
     assert_eq!(io.engine(LAN).expect("LAN").tx_inflight(), 1);
-    // Not sticky: I/O continues.
     assert_eq!(
         io.current_io_disposition(),
-        PublicationQuiescenceDisposition::ContinueOldIo
+        PublicationQuiescenceDisposition::ContinueOldIo,
+        "not sticky"
     );
     // A generated session kicks its egress the same way.
+    wan.set_tx_flags(XDP_RING_NEED_WAKEUP);
     {
         let mut batch = io.begin_generated(WAN);
         batch.allocate(42).expect("generated").commit();
         assert_eq!(batch.finish().error, None);
     }
-    assert_eq!(wan.kicks(KickRing::Tx), 2);
+    assert!(wan.kicks(KickRing::Tx) >= 1);
     // Fill wakeup requests are answered by receive.
     lan.set_fill_flags(XDP_RING_NEED_WAKEUP);
     drop(io.receive(8).expect("receive"));
@@ -694,6 +708,469 @@ fn kicks_once_per_published_port_and_reports_a_failed_kick() {
     transmit_all(&lan);
     transmit_all(&wan);
     io.service().expect("service");
+    audit(&io);
+}
+
+/// A port whose rings hold 64 entries and whose RX pool can fill them.
+fn big_kernel() -> ScriptedKernel {
+    ScriptedKernel::with_tx(
+        entries(RingName::Fill, 64),
+        entries(RingName::Rx, 64),
+        entries(RingName::Tx, 64),
+        entries(RingName::Completion, 64),
+        UmemConfig::new(144, FRAME_SIZE, 0, 128, 16, 0).expect("UMEM"),
+    )
+}
+
+fn big_port(kernel: &ScriptedKernel, interface: IfId) -> XdpPort<'_> {
+    let engine = RxFillEngine::new(
+        kernel.take_datapath().expect("first take"),
+        UmemDomainId::new(NonZeroU128::new(0x5700 + u128::from(interface.0)).expect("nonzero")),
+        RxFillConfig::new(NonZeroU32::new(64).expect("nonzero")),
+    )
+    .expect("engine");
+    XdpPort::new(
+        XdpPortConfig::for_test(interface, 0, NegotiatedMode::Copy, MTU, kernel.origin()),
+        engine,
+    )
+}
+
+#[test]
+fn copy_mode_batch_above_tx_batch_size_completes_without_more_traffic() {
+    let (lan, wan) = (big_kernel(), kernel());
+    let mut io = XdpPacketIo::new([big_port(&lan, LAN), port(&wan, WAN, 0, MTU)]).expect("adapter");
+    // Linux v6.8 copy mode: at most 32 descriptors per sendto, EAGAIN while
+    // more remain; the flag stays set.
+    lan.set_copy_transmit(Some(KICK_TX_BATCH));
+    lan.set_tx_flags(XDP_RING_NEED_WAKEUP);
+    for _ in 0..60 {
+        deliver(&lan, &ipv4_frame(60, 64));
+    }
+    assert_eq!(commit_all(&mut io, 64, LAN), (60, 60, 0));
+    // The finish alone pushed all 60 out: two kicks, nothing in flight.
+    assert_eq!(lan.transmitted(), 60);
+    assert_eq!(lan.kicks(KickRing::Tx), 2);
+    let stats = io.port_stats(LAN).expect("LAN");
+    assert_eq!(stats.counters.tx_inflight, 0);
+    assert_eq!(stats.counters.tx_completed, 60);
+    assert_eq!(stats.counters.kicks_deferred, 1, "the EAGAIN round");
+    assert!(!stats.kick_owed);
+    assert!(io.try_publication_quiescence().is_ok());
+    audit(&io);
+}
+
+#[test]
+fn link_flap_recovers_without_new_traffic() {
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    for kernel in [&lan, &wan] {
+        kernel.set_copy_transmit(Some(KICK_TX_BATCH));
+        kernel.set_tx_flags(XDP_RING_NEED_WAKEUP);
+    }
+    wan.set_link_down(true);
+    // A forwarded copy and a generated ARP frame while WAN is down.
+    deliver(&lan, &ipv4_frame(60, 64));
+    {
+        let mut batch = io.receive(8).expect("receive");
+        batch.next_packet().expect("lease").commit(WAN);
+        let completion = batch.finish();
+        assert_eq!(completion.tx_accepted, 1);
+        assert_eq!(completion.error, None, "link down is not an error");
+    }
+    {
+        let mut batch = io.begin_generated(WAN);
+        batch.allocate(42).expect("generated").commit();
+        assert_eq!(batch.finish().error, None);
+    }
+    let stats = io.port_stats(WAN).expect("WAN");
+    assert!(stats.link_down && stats.kick_owed, "{stats:?}");
+    assert_eq!(stats.counters.tx_inflight, 2);
+    assert!(stats.counters.kicks_link_down >= 2);
+    assert_eq!(io.backend_stats().link_down_ports, 1);
+    assert!(matches!(
+        io.try_publication_quiescence(),
+        Err(XdpQuiescenceError::TxInFlight {
+            interface: WAN,
+            frames: 2
+        })
+    ));
+    // The link returns; no new traffic. The quiescence check itself
+    // settles the owed kick and becomes ready.
+    wan.set_link_down(false);
+    assert!(io.try_publication_quiescence().is_ok());
+    assert_eq!(wan.transmitted(), 2);
+    let stats = io.port_stats(WAN).expect("WAN");
+    assert!(!stats.link_down && !stats.kick_owed);
+    assert_eq!(
+        stats.counters.generated_completed, 2,
+        "both pool frames back"
+    );
+    // The same recovery through idle receives, with the debt kept across
+    // a batch that ran while the link was still down.
+    wan.set_link_down(true);
+    {
+        let mut batch = io.begin_generated(WAN);
+        batch.allocate(42).expect("generated").commit();
+        let _ = batch.finish();
+    }
+    drop(io.receive(0).expect("idle receive while down"));
+    assert!(io.port_stats(WAN).expect("WAN").kick_owed);
+    wan.set_link_down(false);
+    drop(io.receive(0).expect("idle receive"));
+    assert_eq!(wan.transmitted(), 3);
+    assert_eq!(io.engine(WAN).expect("WAN").tx_inflight(), 0);
+    audit(&io);
+}
+
+#[test]
+fn generated_reserve_keeps_router_frames_from_cross_port_copies() {
+    assert_eq!(generated_reserve(1), 1);
+    assert_eq!(generated_reserve(2), 2);
+    assert_eq!(generated_reserve(16), 2);
+    assert_eq!(generated_reserve(64), 8);
+    assert_eq!(generated_reserve(512), 64);
+    let (lan, wan) = (big_kernel(), big_kernel());
+    let mut io = XdpPacketIo::new([big_port(&lan, LAN), big_port(&wan, WAN)]).expect("adapter");
+    assert_eq!(io.port_stats(WAN).expect("WAN").copy_reserve, 2);
+    // Sixteen cross-port copies with WAN's kernel not transmitting: the
+    // first fourteen take generated frames, the last two are refused.
+    for _ in 0..16 {
+        deliver(&lan, &ipv4_frame(60, 64));
+    }
+    assert_eq!(commit_all(&mut io, 64, WAN), (16, 14, 2));
+    let wan_engine = io.engine(WAN).expect("WAN");
+    assert_eq!(wan_engine.generated_free_frames(), 2);
+    let counters = io.port_stats(WAN).expect("WAN").counters;
+    assert_eq!(counters.cross_port_copies, 14);
+    assert_eq!(counters.cross_port_copy_reserved, 2);
+    // Router generation still gets the reserve.
+    {
+        let mut batch = io.begin_generated(WAN);
+        batch.allocate(42).expect("reserved frame").commit();
+        batch.allocate(42).expect("reserved frame").commit();
+        assert!(matches!(
+            batch.allocate(42),
+            Err(GeneratedAllocationError::Unavailable)
+        ));
+        assert_eq!(batch.finish().accepted, 2);
+    }
+    // begin_generated reaps first: once WAN's kernel completes, the pool
+    // is back for the next generated session without any other call.
+    while let Some(descriptor) = wan.consume_tx() {
+        assert!(wan.produce_completion(descriptor.address));
+    }
+    {
+        let mut batch = io.begin_generated(WAN);
+        for _ in 0..3 {
+            batch
+                .allocate(42)
+                .expect("completions reaped by begin_generated")
+                .cancel();
+        }
+        let _ = batch.finish();
+    }
+    // An empty pool (no reserve left to protect) counts as unavailable.
+    let (lan, wan) = (kernel(), kernel_with(RX_FRAMES, 2));
+    let mut io = adapter(&lan, &wan);
+    {
+        let mut batch = io.begin_generated(WAN);
+        batch.allocate(42).expect("generated").commit();
+        batch.allocate(42).expect("generated").commit();
+        let _ = batch.finish();
+    }
+    deliver(&lan, &ipv4_frame(60, 64));
+    assert_eq!(commit_all(&mut io, 8, WAN), (1, 0, 1));
+    assert_eq!(
+        io.port_stats(WAN)
+            .expect("WAN")
+            .counters
+            .cross_port_copy_unavailable,
+        1
+    );
+    transmit_all(&wan);
+    io.service().expect("service");
+    audit(&io);
+}
+
+#[test]
+fn leaked_batches_are_reclaimed_and_keep_their_kick_debt() {
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    lan.set_copy_transmit(Some(KICK_TX_BATCH));
+    lan.set_tx_flags(XDP_RING_NEED_WAKEUP);
+    deliver(&lan, &ipv4_frame(60, 64));
+    deliver(&lan, &ipv4_frame(60, 64));
+    // A whole batch leaked with one frame committed and one still lent.
+    {
+        let mut batch = io.receive(8).expect("receive");
+        batch.next_packet().expect("first").commit(LAN);
+        let lent = batch.next_packet().expect("second");
+        std::mem::forget(lent);
+        std::mem::forget(batch);
+    }
+    // The leaked lease is reclaimable, so I/O is not skipped.
+    assert_eq!(
+        io.current_io_disposition(),
+        PublicationQuiescenceDisposition::ContinueOldIo
+    );
+    assert!(io.port_stats(LAN).expect("LAN").kick_owed);
+    assert_eq!(lan.transmitted(), 0, "no finish ran");
+    // The next receive reclaims the lease and pays the kick debt before
+    // it lends anything.
+    let batch = io.receive(8).expect("receive");
+    assert_eq!(lan.transmitted(), 1);
+    drop(batch);
+    let counters = io.port_stats(LAN).expect("LAN").counters;
+    assert_eq!(counters.leases_reclaimed, 1);
+    assert_eq!(counters.tx_inflight, 0);
+    // A leaked generated batch is reclaimed by the next begin_generated.
+    {
+        let mut batch = io.begin_generated(WAN);
+        std::mem::forget(batch.allocate(42).expect("generated"));
+        std::mem::forget(batch);
+    }
+    let _ = io.begin_generated(LAN).finish();
+    assert_eq!(
+        io.port_stats(WAN).expect("WAN").counters.leases_reclaimed,
+        1
+    );
+    assert!(io.try_publication_quiescence().is_ok());
+    audit(&io);
+}
+
+#[test]
+fn stranded_engine_leases_and_handoffs_skip_io() {
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    deliver(&lan, &ipv4_frame(60, 64));
+    deliver(&lan, &ipv4_frame(60, 64));
+    // Engine-level leaks no adapter path produces: a handoff and a frame.
+    {
+        let engine = io.engine_mut_for_test(LAN);
+        let mut batch = engine.poll(8).expect("poll");
+        let handoff = batch.next_frame().expect("first").stage_tx();
+        std::mem::forget(handoff);
+    }
+    assert_eq!(
+        io.current_io_disposition(),
+        PublicationQuiescenceDisposition::SkipIo
+    );
+    let error = io
+        .try_publication_quiescence()
+        .map(|_| ())
+        .expect_err("stranded");
+    assert_eq!(
+        error,
+        XdpQuiescenceError::HandoffOutstanding {
+            interface: LAN,
+            frames: 1
+        }
+    );
+    assert_eq!(
+        XdpPacketIo::quiescence_error_disposition(&error),
+        PublicationQuiescenceDisposition::SkipIo
+    );
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    deliver(&wan, &ipv4_frame(60, 64));
+    {
+        let engine = io.engine_mut_for_test(WAN);
+        let mut batch = engine.poll(8).expect("poll");
+        std::mem::forget(batch.next_frame().expect("frame"));
+    }
+    assert_eq!(
+        io.current_io_disposition(),
+        PublicationQuiescenceDisposition::SkipIo
+    );
+    let error = io
+        .try_publication_quiescence()
+        .map(|_| ())
+        .expect_err("stranded");
+    assert_eq!(
+        error,
+        XdpQuiescenceError::LeaseOutstanding {
+            interface: WAN,
+            frames: 1
+        }
+    );
+    assert_eq!(
+        XdpPacketIo::quiescence_error_disposition(&error),
+        PublicationQuiescenceDisposition::SkipIo
+    );
+}
+
+#[test]
+fn budget_zero_ports_still_reap_and_refill() {
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    // WAN: a frame in flight committed at engine level (no kick debt), then
+    // completed by the kernel, and three Fill frames taken by the kernel.
+    {
+        let engine = io.engine_mut_for_test(WAN);
+        let report = engine.allocate_generated(42).expect("generated").commit();
+        assert_eq!(report.map(|report| report.submitted()).ok(), Some(1));
+    }
+    transmit_all(&wan);
+    for _ in 0..3 {
+        let _ = wan.consume_fill();
+    }
+    let published = io.port_stats(WAN).expect("WAN").counters.fill_published;
+    // LAN (first this batch) uses the whole budget of one.
+    deliver(&lan, &ipv4_frame(60, 64));
+    deliver(&lan, &ipv4_frame(60, 64));
+    {
+        let mut batch = io.receive(1).expect("receive");
+        batch
+            .next_packet()
+            .expect("lease")
+            .recycle(ruster_core::DropReason::RouteMiss);
+        assert!(batch.next_packet().is_none(), "budget spent");
+        let _ = batch.finish();
+    }
+    let wan_stats = io.port_stats(WAN).expect("WAN").counters;
+    assert_eq!(wan_stats.tx_inflight, 0, "reaped by the budget-0 poll");
+    assert_eq!(wan_stats.tx_completed, 1);
+    assert_eq!(wan_stats.fill_published, published + 3, "refilled");
+    audit(&io);
+}
+
+#[test]
+fn cross_port_submit_fault_stops_the_adapter() {
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    wan.set_tx_consumer(wan.tx_producer().wrapping_add(RING + 1));
+    deliver(&lan, &ipv4_frame(60, 64));
+    let completion = {
+        let mut batch = io.receive(8).expect("receive");
+        batch.next_packet().expect("lease").commit(WAN);
+        batch.finish()
+    };
+    assert!(completion.invariants_hold());
+    assert_eq!((completion.tx_accepted, completion.tx_rejected), (0, 1));
+    assert!(matches!(
+        completion.error,
+        Some(XdpIoError::Submit {
+            interface: WAN,
+            rejection: TxRejection::Ring(_),
+        })
+    ));
+    assert_eq!(
+        io.current_io_disposition(),
+        PublicationQuiescenceDisposition::Stop
+    );
+    assert!(matches!(io.receive(8), Err(XdpIoError::Stopped)));
+    // Both frames went back to their pools before the stop.
+    assert_eq!(io.engine(LAN).expect("LAN").frame_accounting().leased, 0);
+    let wan_engine = io.engine(WAN).expect("WAN");
+    assert_eq!(wan_engine.generated_free_frames(), FRAMES - RX_FRAMES);
+    assert_eq!(wan_engine.tx_handoffs_outstanding(), 0);
+}
+
+#[test]
+fn unknown_egress_and_high_water_are_counted_exactly() {
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    deliver(&lan, &ipv4_frame(60, 64));
+    assert_eq!(commit_all(&mut io, 8, IfId(77)), (1, 0, 1));
+    assert_eq!(
+        io.port_stats(LAN).expect("LAN").counters.tx_unknown_egress,
+        1
+    );
+    // High-water is a maximum over ports, not a sum: LAN 3, WAN 1.
+    for _ in 0..3 {
+        deliver(&lan, &ipv4_frame(60, 64));
+    }
+    assert_eq!(commit_all(&mut io, 8, LAN), (3, 3, 0));
+    deliver(&wan, &ipv4_frame(60, 64));
+    assert_eq!(commit_all(&mut io, 8, WAN), (1, 1, 0));
+    let stats = io.backend_stats().counters;
+    assert_eq!(stats.tx_inflight_highwater, 3);
+    assert_eq!(stats.tx_inflight, 4, "the gauge is a sum");
+    transmit_all(&lan);
+    transmit_all(&wan);
+    io.service().expect("service");
+    audit(&io);
+}
+
+#[test]
+fn kernel_statistics_and_ring_gauges_reach_the_stats() {
+    let (lan, wan) = (kernel(), kernel());
+    let io = adapter(&lan, &wan);
+    lan.set_statistics(Some(XdpStatistics {
+        rx_dropped: 1,
+        rx_invalid_descriptors: 2,
+        tx_invalid_descriptors: 3,
+        rx_ring_full: 4,
+        rx_fill_ring_empty_descriptors: 5,
+        tx_ring_empty_descriptors: 6,
+    }));
+    deliver(&wan, &ipv4_frame(60, 64));
+    let lan_stats = io.port_stats(LAN).expect("LAN");
+    assert_eq!(lan_stats.kernel.map(|k| k.tx_invalid_descriptors), Some(3));
+    assert_eq!(io.port_stats(WAN).expect("WAN").kernel, None);
+    let stats = io.backend_stats();
+    assert_eq!(stats.kernel_stats_ports, 1);
+    let counters = stats.counters;
+    assert_eq!(
+        [
+            counters.kernel_rx_dropped,
+            counters.kernel_rx_invalid_descs,
+            counters.kernel_tx_invalid_descs,
+            counters.kernel_rx_ring_full,
+            counters.kernel_rx_fill_ring_empty_descs,
+            counters.kernel_tx_ring_empty_descs,
+        ],
+        [1, 2, 3, 4, 5, 6]
+    );
+    // Fill: 8 published per port, one taken by WAN's kernel; RX: one
+    // descriptor WAN's engine has not read.
+    assert_eq!(counters.fill_ring_occupancy, 15);
+    assert_eq!(counters.rx_ring_occupancy, 1);
+    assert_eq!(counters.tx_ring_unconsumed, 0);
+}
+
+#[test]
+fn a_port_config_of_another_session_is_refused() {
+    let (first, second) = (kernel(), kernel());
+    let engine = engine(&second, 0x5690);
+    let config = XdpPortConfig::for_test(LAN, 0, NegotiatedMode::Copy, MTU, first.origin());
+    assert_eq!(
+        XdpPacketIo::new([XdpPort::new(config, engine)]).map(|_| ()),
+        Err(XdpPacketIoSetupError::SessionMismatch(LAN))
+    );
+}
+
+#[test]
+#[should_panic(expected = "a raw lease is used only on the engine that issued it")]
+fn a_raw_lease_of_another_engine_is_refused() {
+    let (first, second) = (kernel(), kernel());
+    // The same domain on both: identical tokens, only the engine differs.
+    let mut mine = engine(&first, 0x5691);
+    let mut other = engine(&second, 0x5691);
+    deliver(&second, &ipv4_frame(60, 64));
+    drop(other.poll(8).expect("poll"));
+    let lease = other.lease_pending().expect("lease");
+    assert_ne!(lease.engine(), 0);
+    let _ = mine.lease_bytes_mut(&lease);
+}
+
+#[test]
+fn a_panic_inside_a_batch_stops_the_adapter() {
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    deliver(&lan, &ipv4_frame(60, 64));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut batch = io.receive(8).expect("receive");
+        let _lease = batch.next_packet().expect("lease");
+        panic!("core failed while a frame was lent");
+    }));
+    assert!(result.is_err());
+    assert_eq!(
+        io.current_io_disposition(),
+        PublicationQuiescenceDisposition::Stop
+    );
+    // Fail closed, but no frame leaked: the lease was reclaimed.
+    assert_eq!(io.engine(LAN).expect("LAN").frame_accounting().leased, 0);
     audit(&io);
 }
 
@@ -723,7 +1200,7 @@ fn backend_stats_sum_ports_with_a_fixed_shape_and_allocate_nothing() {
     let mut io = XdpPacketIo::new([
         port(&lan, LAN, 0, MTU),
         XdpPort::new(
-            XdpPortConfig::new(WAN, 0, NegotiatedMode::ZeroCopy, MTU),
+            XdpPortConfig::for_test(WAN, 0, NegotiatedMode::ZeroCopy, MTU, wan.origin()),
             engine(&wan, 0x5699),
         ),
     ])

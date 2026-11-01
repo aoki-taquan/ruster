@@ -11,9 +11,11 @@
 //!
 //! M2 binds one AF_XDP socket (one engine, one UMEM) per interface and
 //! queue. The ports are passed once to [`XdpPacketIo::new`], which refuses
-//! an empty set and a duplicate `IfId` and sorts them by `IfId` into a
-//! boxed slice that never changes afterwards. TX egress selection is a
-//! binary search of that fixed slice (`O(log ports)`, no map, no string).
+//! an empty set, a duplicate `IfId`, and a config that was not taken from
+//! the session whose engine it is paired with, and sorts the ports by
+//! `IfId` into a boxed slice that never changes afterwards. TX egress
+//! selection is a binary search of that fixed slice (`O(log ports)`, no
+//! map, no string).
 //!
 //! # RX merge
 //!
@@ -39,8 +41,14 @@
 //! recycles the RX frame on the ingress port. The cost is one
 //! `memcpy` of the frame per cross-port packet plus one generated frame of
 //! the egress pool while it is in flight; it is counted as
-//! `cross_port_copies` on the egress port. An empty egress generated pool
-//! refuses the commit (`cross_port_copy_unavailable`), never blocks.
+//! `cross_port_copies` on the egress port.
+//!
+//! Copies never take the last [`generated_reserve`] frames of the egress
+//! generated pool (`max(2, pool / 8)`, capped at the pool): those stay for
+//! router-generated ARP and ICMP, so sustained cross-port traffic cannot
+//! starve neighbour resolution. A copy that would dip into the reserve, or
+//! finds the pool empty, is refused without blocking
+//! (`cross_port_copy_reserved`, `cross_port_copy_unavailable`).
 //!
 //! Every TX (forwarded or generated) is bounded by the egress port's MTU
 //! plus the 14-byte Ethernet header ([`XdpPortConfig::max_frame_len`]): a
@@ -48,57 +56,83 @@
 //! (`tx_over_mtu`, `generated_over_mtu`). Linux copy-mode transmit may
 //! otherwise consume an over-MTU descriptor without completing it (#299
 //! review), leaving the frame `TxOwnedByKernel` forever. The MTU is read
-//! once at session open; a later MTU change is not seen (X04b).
+//! once at session open; a later MTU decrease is not seen and can recreate
+//! that stranded descriptor (X04b, XDP-157).
 //!
 //! # Error mapping
 //!
 //! - `TxBlocked` (`RingFull`, `InflightLimit`, `Draining`) is core
 //!   back-pressure: the slot counts as `tx_rejected` (generated:
-//!   `rejected`), the handoff is cancelled back to its pool, and `finish`
-//!   reports no error. It is counted per port (`tx_blocked`,
-//!   `generated_tx_blocked`).
-//! - An unknown egress, an over-MTU frame, and an empty egress pool for a
-//!   cross-port copy are rejections without an error, like back-pressure.
+//!   `rejected`), the handoff is cancelled back to its pool, the port is
+//!   kicked and reaped at once, and `finish` reports no error. It is
+//!   counted per port (`tx_blocked`, `generated_tx_blocked`).
+//! - An unknown egress, an over-MTU frame, and a refused cross-port copy
+//!   are rejections without an error, like back-pressure.
 //! - [`GeneratedAllocError`] maps to [`GeneratedAllocationError`]:
 //!   `Unavailable` → `Unavailable`; `Rejected(ZeroLength)` → `ZeroLength`;
 //!   `Rejected(TooLarge)` and a length above the egress MTU bound →
 //!   `FrameTooLarge`; `Rejected(BelowMinimum)` (1 to 13 bytes) →
-//!   `FrameTooLarge`, the nearest core variant: core has no "too short"
-//!   variant, its generators never ask for less than an Ethernet header,
-//!   and the runtime treats both as the same fatal build failure, so no
-//!   core change is needed to keep the outcome exact;
-//!   `Rejected(Draining)` → `Unavailable` plus [`XdpIoError::Stopped`] at
-//!   `finish` (a drained adapter also reports
-//!   [`PublicationQuiescenceDisposition::Stop`], so the runtime never
-//!   reaches it); `Ledger` → `Unavailable` plus
+//!   `FrameTooLarge`, the nearest core variant. Core has no "too short"
+//!   variant and its generators never ask for less than an Ethernet
+//!   header. The runtime handles every allocation error other than
+//!   `Unavailable` alike (the generated phase stops and the later
+//!   generated phase of the tick is skipped as a generated failure), so
+//!   the choice between `ZeroLength` and `FrameTooLarge` changes no
+//!   runtime outcome and core stays unchanged. `Rejected(Draining)` →
+//!   `Unavailable` plus [`XdpIoError::Stopped`] at `finish` (a drained
+//!   adapter also reports [`PublicationQuiescenceDisposition::Stop`], so
+//!   the runtime never reaches it); `Ledger` → `Unavailable` plus
 //!   [`XdpIoError::GeneratedLedger`] at `finish`.
+//! - A generated session for an interface without a port allocates
+//!   nothing: every attempt is `Unavailable` and counted
+//!   (`generated_unknown_egress`), with no batch error. The runtime stops
+//!   that tick's generated phase at the first `Unavailable` (head of line),
+//!   which an adapter cannot change without a core change; X04b builds the
+//!   ports from the same validated config as the snapshot's interfaces, so
+//!   every egress the runtime asks for has a port.
 //! - A corrupt ring cursor or a ledger refusal of the adapter's own
 //!   handoff is a fault: it is reported once as the batch error and makes
 //!   the adapter stop ([`PublicationQuiescenceDisposition::Stop`]) for
-//!   good. A failed wakeup kick is reported as the batch error and is not
-//!   sticky: the published descriptors stay in flight.
+//!   good. A panic that unwinds through a batch stops the adapter too
+//!   (fail closed: a lease or handoff could be stranded mid-operation).
 //!
 //! # Kicks
 //!
-//! `finish` (or dropping a batch) kicks TX once per port that accepted a
-//! frame in that batch, unless the kernel's need-wakeup flag says it is not
-//! needed (copy mode keeps it set: Linux transmits only from `sendto`).
-//! `receive` answers a Fill need-wakeup request with a non-sleeping `poll`
-//! kick on that port.
+//! Each port owes a kick while it has TX in flight: set by every accepted
+//! submission and by a deferred or failed kick, kept across batches, and
+//! cleared only when nothing is in flight. A port that owes a kick is
+//! settled (reap, then kick unless the TX need-wakeup flag says
+//! `NotRequired`, repeated while TX stays in flight) by `finish`, by a
+//! dropped batch, by `receive`, by `begin_generated`, by
+//! [`XdpPacketIo::service`], by the quiescence check, and right after a
+//! submission was blocked. One settle kicks at most
+//! `ceil(in_flight / 32) + 2` times: Linux v6.8 copy mode transmits at most
+//! `TX_BATCH_SIZE` (32) descriptors per `sendto` and answers `EAGAIN` while
+//! more remain, so a 60-frame batch needs two kicks. A kick that fails
+//! with `ENETDOWN` (link down) is not an error: it marks the port's link
+//! state down in its stats (`kicks_link_down`), leaves the kick owed, and
+//! the next settle retries, so the port recovers when the link returns
+//! without new traffic. Other kick failures are the batch error (not
+//! sticky). `receive` also answers a Fill need-wakeup request with a
+//! non-sleeping `poll` kick.
 //!
 //! # Quiescence
 //!
-//! Batches borrow the adapter mutably, so no batch is open whenever
-//! [`PublicationQuiescence::try_publication_quiescence`] can be called. It
-//! first reaps every port's completions (bounded by the TX capacity), then
-//! requires, for every port: no lent frame of either pool (a forgotten
-//! lease is reclaimed by the batch that lent it, so this is defensive), no
-//! staged handoff, and no TX in flight. In-flight TX still carries bytes
-//! rewritten under the active publication, so it defers the publication
-//! but lets old I/O continue ([`PublicationQuiescenceDisposition::ContinueOldIo`]);
-//! the next batch reaps it. RX frames validated but not yet lent carry no
-//! publication authority and do not block. A drained or faulted adapter
-//! is [`PublicationQuiescenceDisposition::Stop`].
+//! A lease lent by a batch is recorded in the adapter, not the batch, so a
+//! leaked (`mem::forget`) slot or batch is reclaimed by the next
+//! `next_packet`, `allocate`, `finish`, batch drop, `receive`,
+//! `begin_generated`, `service`, or quiescence check.
+//! [`PublicationQuiescence::try_publication_quiescence`] reclaims, settles
+//! every port (reap and owed kicks), then requires, for every port: no lent
+//! frame of either pool, no staged handoff, and no TX in flight. In-flight
+//! TX still carries bytes rewritten under the active publication, so it
+//! defers the publication but lets old I/O continue
+//! ([`PublicationQuiescenceDisposition::ContinueOldIo`]). A staged handoff
+//! that no batch owns (only an engine-level leak) is
+//! [`PublicationQuiescenceDisposition::SkipIo`] for good. RX frames
+//! validated but not yet lent carry no publication authority and do not
+//! block. A drained or faulted adapter is
+//! [`PublicationQuiescenceDisposition::Stop`].
 
 use std::fmt;
 
@@ -112,34 +146,80 @@ use ruster_core::{
 use ruster_io_xdp::LedgerError;
 
 use crate::{
+    abi::XdpStatistics,
     rx_fill::{RawLease, ZeroFill},
-    DrainOutcome, GeneratedAllocError, GeneratedRejectReason, KickError, NeedWakeup,
+    DrainOutcome, GeneratedAllocError, GeneratedRejectReason, KickError, KickOutcome, NeedWakeup,
     NegotiatedMode, RxFillEngine, RxFillError, RxInvalidReason, TxRejection, ETHERNET_HEADER_LEN,
 };
 
+/// Descriptors Linux v6.8 copy mode transmits per `sendto`
+/// (`TX_BATCH_SIZE`).
+pub const KICK_TX_BATCH: u32 = 32;
+/// Extra kicks one settle may spend beyond `ceil(in_flight / 32)`.
+pub const KICK_SLACK: u32 = 2;
+
+/// Generated-pool frames of a port that cross-port copies never take:
+/// `max(2, pool / 8)`, capped at the pool.
+#[must_use]
+pub const fn generated_reserve(generated_frames: u32) -> u32 {
+    let eighth = generated_frames / 8;
+    let reserve = if eighth > 2 { eighth } else { 2 };
+    if reserve < generated_frames {
+        reserve
+    } else {
+        generated_frames
+    }
+}
+
 /// Static facts of one port: its interface, its socket's queue and
-/// negotiated mode, and the device MTU.
+/// negotiated mode, the device MTU, and the session it came from.
 ///
-/// Build it from the session before taking its datapath:
-/// `XdpPortConfig::new(interface, session.queue(), session.mode(),
-/// session.mtu())`. The MTU is read once by `NativeSession::open` from
-/// sysfs and bounds every TX on this port to `mtu + 14` bytes.
+/// Built only from the session ([`Self::from_session`], before taking its
+/// datapath), so the MTU and mode cannot be overstated, and
+/// [`XdpPacketIo::new`] refuses a config paired with another session's
+/// engine. The MTU bounds every TX on this port to `mtu + 14` bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct XdpPortConfig {
     interface: IfId,
     queue: u32,
     mode: NegotiatedMode,
     mtu: u32,
+    origin: u64,
 }
 
 impl XdpPortConfig {
+    /// The facts of `session` for `interface`.
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
     #[must_use]
-    pub const fn new(interface: IfId, queue: u32, mode: NegotiatedMode, mtu: u32) -> Self {
+    pub const fn from_session(interface: IfId, session: &crate::NativeSession) -> Self {
+        Self {
+            interface,
+            queue: session.queue(),
+            mode: session.mode(),
+            mtu: session.mtu(),
+            origin: session.origin(),
+        }
+    }
+
+    /// A config for a scripted test kernel.
+    #[cfg(test)]
+    pub(crate) const fn for_test(
+        interface: IfId,
+        queue: u32,
+        mode: NegotiatedMode,
+        mtu: u32,
+        origin: u64,
+    ) -> Self {
         Self {
             interface,
             queue,
             mode,
             mtu,
+            origin,
         }
     }
 
@@ -205,6 +285,8 @@ pub enum XdpPacketIoSetupError {
     EngineDraining(IfId),
     /// A port's MTU leaves no room for an Ethernet payload (zero).
     ZeroMtu(IfId),
+    /// A port's config was taken from another session than its engine's.
+    SessionMismatch(IfId),
 }
 
 impl fmt::Display for XdpPacketIoSetupError {
@@ -215,7 +297,9 @@ impl fmt::Display for XdpPacketIoSetupError {
 
 impl std::error::Error for XdpPacketIoSetupError {}
 
-/// The first failure of one batch, or why `receive` refused.
+/// The first genuine failure of one batch, or why `receive` refused.
+///
+/// Back-pressure, refusals, and a link that is down are not errors.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum XdpIoError {
     /// The adapter was drained or stopped by an earlier fault: no I/O.
@@ -234,10 +318,9 @@ pub enum XdpIoError {
     /// its ledger (an engine invariant failure that `audit` also reports).
     /// The allocation failed as `Unavailable`.
     GeneratedLedger { interface: IfId, error: LedgerError },
-    /// A TX or Fill wakeup failed. Published descriptors stay in flight.
+    /// A TX or Fill wakeup failed for a reason other than a link that is
+    /// down. Published descriptors stay in flight and the kick stays owed.
     Kick { interface: IfId, error: KickError },
-    /// A generated session named an interface without a port.
-    UnknownEgress(IfId),
 }
 
 impl fmt::Display for XdpIoError {
@@ -285,6 +368,9 @@ pub struct XdpAdapterCounters {
     /// Cross-port commits refused because this port's generated pool was
     /// empty.
     pub cross_port_copy_unavailable: u64,
+    /// Cross-port commits refused to keep this port's generated reserve
+    /// for router-generated frames.
+    pub cross_port_copy_reserved: u64,
     /// Forwarded frames refused for this egress because they exceed
     /// `mtu + 14`.
     pub tx_over_mtu: u64,
@@ -297,38 +383,66 @@ pub struct XdpAdapterCounters {
     pub generated_over_mtu: u64,
     /// Generated commits refused by TX back-pressure.
     pub generated_tx_blocked: u64,
-    /// Lent frames whose lease was forgotten (`mem::forget`) and that the
-    /// batch reclaimed.
+    /// Lent frames whose lease was forgotten (`mem::forget` of the lease or
+    /// of its batch) and that the adapter reclaimed.
     pub leases_reclaimed: u64,
+    /// TX kicks that found the link down (`ENETDOWN`); the kick stays owed.
+    pub kicks_link_down: u64,
+    /// Settles that used their whole kick budget with TX still in flight.
+    pub kick_budget_exhausted: u64,
 }
 
 struct PortState<'memory> {
     config: XdpPortConfig,
     /// `min(config.max_frame_len(), engine frame capacity)`.
     max_frame: u32,
+    /// Generated frames cross-port copies leave free.
+    copy_reserve: u32,
     engine: RxFillEngine<'memory>,
     /// Frames the current RX batch may still lend from this port.
     lendable: u32,
-    /// Whether the current batch published TX on this port.
-    tx_touched: bool,
+    /// TX may be in flight that a kick must push: kept across batches.
+    kick_owed: bool,
+    /// The last TX kick found the link down.
+    link_down: bool,
     counters: XdpAdapterCounters,
 }
 
 impl PortState<'_> {
-    /// Kicks TX once if this batch published here and the kernel did not
-    /// say a kick is unnecessary.
-    fn kick_tx(&mut self, error: &mut Option<XdpIoError>) {
-        if !std::mem::take(&mut self.tx_touched) {
-            return;
-        }
-        if self.engine.tx_needs_wakeup() == Ok(NeedWakeup::NotRequired) {
-            return;
-        }
-        if let Err(kick) = self.engine.wake_tx() {
-            error.get_or_insert(XdpIoError::Kick {
-                interface: self.config.interface,
-                error: kick,
-            });
+    /// Reaps, then kicks while TX stays in flight and the kernel does not
+    /// decline, within `ceil(in_flight / 32) + 2` kicks. A link that is
+    /// down leaves the kick owed without an error.
+    fn settle(&mut self) -> Result<(), XdpIoError> {
+        let interface = self.config.interface;
+        let mut kicks = self.engine.tx_inflight().div_ceil(KICK_TX_BATCH) + KICK_SLACK;
+        loop {
+            let budget = self.engine.tx_inflight_limit();
+            let _reaped = self
+                .engine
+                .reap_completions(budget)
+                .map_err(|error| XdpIoError::Datapath { interface, error })?;
+            if self.engine.tx_inflight() == 0 {
+                self.kick_owed = false;
+                return Ok(());
+            }
+            self.kick_owed = true;
+            if self.engine.tx_needs_wakeup() == Ok(NeedWakeup::NotRequired) {
+                return Ok(());
+            }
+            if kicks == 0 {
+                bump(&mut self.counters.kick_budget_exhausted);
+                return Ok(());
+            }
+            kicks -= 1;
+            match self.engine.wake_tx() {
+                Ok(KickOutcome::Woken | KickOutcome::Deferred(_)) => self.link_down = false,
+                Err(KickError::NetworkDown) => {
+                    self.link_down = true;
+                    bump(&mut self.counters.kicks_link_down);
+                    return Ok(());
+                }
+                Err(error) => return Err(XdpIoError::Kick { interface, error }),
+            }
         }
     }
 }
@@ -352,6 +466,12 @@ pub struct XdpPacketIo<'memory> {
     ports: Box<[PortState<'memory>]>,
     rx_start: usize,
     stop: Option<Stop>,
+    /// The RX lease a slot holds (or a leaked slot or batch left behind).
+    rx_outstanding: Option<(usize, RawLease)>,
+    /// The generated lease a slot holds (or a leaked one left behind).
+    generated_outstanding: Option<(usize, RawLease)>,
+    /// Generated allocation attempts for an interface without a port.
+    generated_unknown_egress: u64,
     #[cfg(test)]
     test: test_hooks::TestHooks,
 }
@@ -368,6 +488,9 @@ impl<'memory> XdpPacketIo<'memory> {
         let mut states: Vec<PortState<'memory>> = Vec::new();
         for port in ports {
             let interface = port.config.interface;
+            if port.config.origin != port.engine.origin() {
+                return Err(XdpPacketIoSetupError::SessionMismatch(interface));
+            }
             if port.config.mtu == 0 {
                 return Err(XdpPacketIoSetupError::ZeroMtu(interface));
             }
@@ -381,9 +504,11 @@ impl<'memory> XdpPacketIo<'memory> {
             states.push(PortState {
                 config: port.config,
                 max_frame,
+                copy_reserve: generated_reserve(port.engine.generated_frames()),
                 engine: port.engine,
                 lendable: 0,
-                tx_touched: false,
+                kick_owed: false,
+                link_down: false,
                 counters: XdpAdapterCounters::default(),
             });
         }
@@ -403,6 +528,9 @@ impl<'memory> XdpPacketIo<'memory> {
             ports: states.into_boxed_slice(),
             rx_start: 0,
             stop: None,
+            rx_outstanding: None,
+            generated_outstanding: None,
+            generated_unknown_egress: 0,
             #[cfg(test)]
             test: test_hooks::TestHooks::default(),
         })
@@ -454,26 +582,78 @@ impl<'memory> XdpPacketIo<'memory> {
         error
     }
 
-    /// Reaps completions (up to the TX capacity) and refills Fill on every
-    /// port, outside a batch: for idle ticks, before a drain, and in tests.
-    /// Returns the frames reaped.
-    pub fn service(&mut self) -> Result<u32, XdpIoError> {
-        self.running()?;
-        let mut reaped = 0_u32;
+    /// Settles port `index` (reap, owed kicks). A datapath failure stops
+    /// the adapter; it and a genuine kick failure are returned.
+    fn settle_port(&mut self, index: usize) -> Result<(), XdpIoError> {
+        match self.ports[index].settle() {
+            Err(error @ XdpIoError::Datapath { .. }) => Err(self.fault(error)),
+            other => other,
+        }
+    }
+
+    /// Settles every port that owes a kick; returns the first error.
+    fn settle_owed(&mut self) -> Result<(), XdpIoError> {
+        let mut first = Ok(());
         for index in 0..self.ports.len() {
-            let port = &mut self.ports[index];
-            let interface = port.config.interface;
-            let budget = port.engine.tx_inflight_limit();
-            let result = port
-                .engine
-                .reap_completions(budget)
-                .and_then(|report| port.engine.refill().map(|_| report.reaped()));
-            match result {
-                Ok(count) => reaped = reaped.saturating_add(count),
-                Err(error) => return Err(self.fault(XdpIoError::Datapath { interface, error })),
+            if self.ports[index].kick_owed {
+                if let Err(error) = self.settle_port(index) {
+                    if first.is_ok() {
+                        first = Err(error);
+                    }
+                    if self.stop.is_some() {
+                        break;
+                    }
+                }
             }
         }
-        Ok(reaped)
+        first
+    }
+
+    /// Reclaims leases whose slot (or whole batch) was leaked.
+    fn reclaim_outstanding(&mut self) {
+        if let Some((port, lease)) = self.rx_outstanding.take() {
+            let state = &mut self.ports[port];
+            bump(&mut state.counters.leases_reclaimed);
+            drop(state.engine.resume_rx(lease));
+        }
+        if let Some((port, lease)) = self.generated_outstanding.take() {
+            let state = &mut self.ports[port];
+            bump(&mut state.counters.leases_reclaimed);
+            drop(state.engine.resume_generated(lease));
+        }
+    }
+
+    /// Reclaims leaked leases, settles every port (reap, owed kicks), and
+    /// refills Fill: for idle ticks and tests. Returns the completions
+    /// reaped.
+    pub fn service(&mut self) -> Result<u64, XdpIoError> {
+        self.running()?;
+        self.reclaim_outstanding();
+        let before: u64 = self.completed();
+        let mut first = Ok(());
+        for index in 0..self.ports.len() {
+            if let Err(error) = self.settle_port(index) {
+                if self.stop.is_some() {
+                    return Err(error);
+                }
+                if first.is_ok() {
+                    first = Err(error);
+                }
+            }
+            let port = &mut self.ports[index];
+            let interface = port.config.interface;
+            if let Err(error) = port.engine.refill() {
+                return Err(self.fault(XdpIoError::Datapath { interface, error }));
+            }
+        }
+        first.map(|()| self.completed() - before)
+    }
+
+    fn completed(&self) -> u64 {
+        self.ports
+            .iter()
+            .map(|port| port.engine.tx_counters().tx_completed)
+            .sum()
     }
 
     /// Shutdown drain of every port (see [`RxFillEngine::drain`]): no new
@@ -483,6 +663,7 @@ impl<'memory> XdpPacketIo<'memory> {
     /// [`XdpDrainReport::is_drained`] or the caller's own timeout.
     pub fn drain(&mut self, rounds: u32) -> Result<XdpDrainReport, XdpIoError> {
         self.stop = Some(self.stop.unwrap_or(Stop::Drained));
+        self.reclaim_outstanding();
         let mut report = XdpDrainReport::default();
         for port in self.ports.iter_mut() {
             let interface = port.config.interface;
@@ -508,19 +689,12 @@ impl<'memory> XdpPacketIo<'memory> {
         Ok(report)
     }
 
-    /// Per-port stats of `interface` (bounded, allocation-free).
+    /// Per-port stats of `interface` (bounded, allocation-free; one
+    /// `getsockopt(XDP_STATISTICS)`, cold path only).
     #[must_use]
     pub fn port_stats(&self, interface: IfId) -> Option<XdpPortStats> {
         self.port_index(interface)
             .map(|index| port_stats(&self.ports[index]))
-    }
-
-    /// Ends a forgotten RX lease (its `PacketLease` was leaked): the frame
-    /// returns to its pool and is counted, not reported as recycled.
-    fn reclaim_rx(&mut self, port: usize, lease: RawLease) {
-        let state = &mut self.ports[port];
-        bump(&mut state.counters.leases_reclaimed);
-        drop(state.engine.resume_rx(lease));
     }
 
     /// Ends one RX lease without TX.
@@ -563,6 +737,13 @@ impl<'memory> XdpPacketIo<'memory> {
         }
     }
 
+    /// After a blocked submission: kick and reap the port at once.
+    fn relieve(&mut self, port: usize, error: &mut Option<XdpIoError>) {
+        if let Err(failure) = self.settle_port(port) {
+            error.get_or_insert(failure);
+        }
+    }
+
     fn transmit_in_place(
         &mut self,
         port: usize,
@@ -576,7 +757,7 @@ impl<'memory> XdpPacketIo<'memory> {
         let handoff = state.engine.resume_rx(lease).stage_tx();
         match state.engine.submit_tx(handoff) {
             Ok(_) => {
-                state.tx_touched = true;
+                state.kick_owed = true;
                 bump(&mut state.counters.forwarded_in_place);
                 true
             }
@@ -586,6 +767,7 @@ impl<'memory> XdpPacketIo<'memory> {
                 assert!(cancelled.is_ok(), "the adapter's own handoff cancels");
                 if let TxRejection::Blocked(_) = reason {
                     bump(&mut state.counters.tx_blocked);
+                    self.relieve(port, error);
                 } else {
                     let failure = self.fault(XdpIoError::Submit {
                         interface,
@@ -616,56 +798,66 @@ impl<'memory> XdpPacketIo<'memory> {
         let interface = target.config.interface;
         let len = lease.len() as usize;
         let mut failure = None;
-        let accepted = match target
-            .engine
-            .allocate_generated_raw(len, ZeroFill::Overwritten)
-        {
-            Ok(copy) => {
-                // Every visible byte is overwritten here, before the lease
-                // can end or be observed (the engine skipped zeroing).
-                target
-                    .engine
-                    .lease_bytes_mut(&copy)
-                    .copy_from_slice(source.engine.lease_bytes(&lease));
-                match target.engine.resume_generated(copy).commit() {
-                    Ok(_) => {
-                        target.tx_touched = true;
-                        bump(&mut target.counters.cross_port_copies);
-                        true
-                    }
-                    Err(rejected) => {
-                        let reason = rejected.reason();
-                        let cancelled = target.engine.cancel_tx_handoff(rejected.into_handoff());
-                        assert!(cancelled.is_ok(), "the adapter's own handoff cancels");
-                        if let TxRejection::Blocked(_) = reason {
-                            bump(&mut target.counters.tx_blocked);
-                        } else {
-                            failure = Some(XdpIoError::Submit {
-                                interface,
-                                rejection: reason,
-                            });
+        let mut blocked = false;
+        let free = target.engine.generated_free_frames();
+        let accepted = if free != 0 && free <= target.copy_reserve {
+            bump(&mut target.counters.cross_port_copy_reserved);
+            false
+        } else {
+            match target
+                .engine
+                .allocate_generated_raw(len, ZeroFill::Overwritten)
+            {
+                Ok(copy) => {
+                    // Every visible byte is overwritten here, before the
+                    // lease can end or be observed (the engine skipped
+                    // zeroing).
+                    target
+                        .engine
+                        .lease_bytes_mut(&copy)
+                        .copy_from_slice(source.engine.lease_bytes(&lease));
+                    match target.engine.resume_generated(copy).commit() {
+                        Ok(_) => {
+                            target.kick_owed = true;
+                            bump(&mut target.counters.cross_port_copies);
+                            true
                         }
-                        false
+                        Err(rejected) => {
+                            let reason = rejected.reason();
+                            let cancelled =
+                                target.engine.cancel_tx_handoff(rejected.into_handoff());
+                            assert!(cancelled.is_ok(), "the adapter's own handoff cancels");
+                            if let TxRejection::Blocked(_) = reason {
+                                bump(&mut target.counters.tx_blocked);
+                                blocked = true;
+                            } else {
+                                failure = Some(XdpIoError::Submit {
+                                    interface,
+                                    rejection: reason,
+                                });
+                            }
+                            false
+                        }
                     }
                 }
-            }
-            Err(GeneratedAllocError::Unavailable) => {
-                bump(&mut target.counters.cross_port_copy_unavailable);
-                false
-            }
-            Err(GeneratedAllocError::Rejected(_)) => {
-                // Only `Draining` is reachable (the length is within the MTU
-                // bound, itself capped by the frame capacity), and a
-                // draining engine belongs to a stopped adapter.
-                bump(&mut target.counters.tx_blocked);
-                false
-            }
-            Err(GeneratedAllocError::Ledger(ledger)) => {
-                failure = Some(XdpIoError::GeneratedLedger {
-                    interface,
-                    error: ledger,
-                });
-                false
+                Err(GeneratedAllocError::Unavailable) => {
+                    bump(&mut target.counters.cross_port_copy_unavailable);
+                    false
+                }
+                Err(GeneratedAllocError::Rejected(_)) => {
+                    // Only `Draining` is reachable (the length is within the
+                    // MTU bound, itself capped by the frame capacity), and a
+                    // draining engine belongs to a stopped adapter.
+                    bump(&mut target.counters.tx_blocked);
+                    false
+                }
+                Err(GeneratedAllocError::Ledger(ledger)) => {
+                    failure = Some(XdpIoError::GeneratedLedger {
+                        interface,
+                        error: ledger,
+                    });
+                    false
+                }
             }
         };
         // The source frame's job ended with the copy (or the refusal).
@@ -677,6 +869,9 @@ impl<'memory> XdpPacketIo<'memory> {
                 failure
             };
             error.get_or_insert(failure);
+        }
+        if blocked {
+            self.relieve(out, error);
         }
         #[cfg(test)]
         if !accepted {
@@ -735,14 +930,20 @@ impl<'memory> PacketIo for XdpPacketIo<'memory> {
 
     fn receive(&mut self, budget: usize) -> Result<Self::Batch<'_>, Self::Error> {
         self.running()?;
+        self.reclaim_outstanding();
+        let mut error = None;
+        if let Err(failure) = self.settle_owed() {
+            if self.stop.is_some() {
+                return Err(failure);
+            }
+            error = Some(failure);
+        }
         let count = self.ports.len();
         let start = self.rx_start;
         self.rx_start = (start + 1) % count;
         let mut remaining = u32::try_from(budget).unwrap_or(u32::MAX);
-        let mut error = None;
         for step in 0..count {
             let port = &mut self.ports[(start + step) % count];
-            port.tx_touched = false;
             let interface = port.config.interface;
             let polled = port
                 .engine
@@ -763,11 +964,14 @@ impl<'memory> PacketIo for XdpPacketIo<'memory> {
             port.lendable = lendable;
             remaining -= lendable;
             if refill.need_wakeup() != Ok(NeedWakeup::NotRequired) {
-                if let Err(kick) = port.engine.wake_fill() {
-                    error.get_or_insert(XdpIoError::Kick {
-                        interface,
-                        error: kick,
-                    });
+                match port.engine.wake_fill() {
+                    Ok(_) | Err(KickError::NetworkDown) => {}
+                    Err(kick) => {
+                        error.get_or_insert(XdpIoError::Kick {
+                            interface,
+                            error: kick,
+                        });
+                    }
                 }
             }
         }
@@ -775,7 +979,6 @@ impl<'memory> PacketIo for XdpPacketIo<'memory> {
             io: self,
             start,
             step: 0,
-            outstanding: None,
             tx_requested: 0,
             tx_accepted: 0,
             tx_rejected: 0,
@@ -790,8 +993,6 @@ pub struct XdpRxBatch<'a, 'memory> {
     io: &'a mut XdpPacketIo<'memory>,
     start: usize,
     step: usize,
-    /// The lent frame and its port, while a slot is live (or forgotten).
-    outstanding: Option<(usize, RawLease)>,
     tx_requested: usize,
     tx_accepted: usize,
     tx_rejected: usize,
@@ -800,21 +1001,20 @@ pub struct XdpRxBatch<'a, 'memory> {
 }
 
 impl XdpRxBatch<'_, '_> {
-    /// Reclaims a lease whose `PacketLease` was forgotten.
-    fn reclaim(&mut self) {
-        if let Some((port, lease)) = self.outstanding.take() {
-            self.io.reclaim_rx(port, lease);
-        }
-    }
-
-    /// Reclaims, kicks each port that published TX, and returns the error.
+    /// Ends the batch: reclaims a leaked lease, stops lending, and settles
+    /// every port that owes a kick. A panic unwinding through the batch
+    /// stops the adapter (fail closed) instead of kicking.
     fn settle(&mut self) {
-        self.reclaim();
-        let count = self.io.ports.len();
-        for step in 0..count {
-            let port = (self.start + step) % count;
-            self.io.ports[port].lendable = 0;
-            self.io.ports[port].kick_tx(&mut self.error);
+        self.io.reclaim_outstanding();
+        for port in self.io.ports.iter_mut() {
+            port.lendable = 0;
+        }
+        if std::thread::panicking() {
+            self.io.stop.get_or_insert(Stop::Fault);
+            return;
+        }
+        if let Err(failure) = self.io.settle_owed() {
+            self.error.get_or_insert(failure);
         }
     }
 
@@ -854,7 +1054,7 @@ impl<'a, 'memory> PacketBatch for XdpRxBatch<'a, 'memory> {
         Self: 's;
 
     fn next_packet(&mut self) -> Option<PacketLease<Self::Slot<'_>>> {
-        self.reclaim();
+        self.io.reclaim_outstanding();
         let count = self.io.ports.len();
         while self.step < count {
             let port = (self.start + self.step) % count;
@@ -862,7 +1062,7 @@ impl<'a, 'memory> PacketBatch for XdpRxBatch<'a, 'memory> {
             if state.lendable > 0 {
                 state.lendable -= 1;
                 if let Some(lease) = state.engine.lease_pending() {
-                    self.outstanding = Some((port, lease));
+                    self.io.rx_outstanding = Some((port, lease));
                     return Some(PacketLease::new(XdpRxSlot { batch: self }));
                 }
                 state.lendable = 0;
@@ -886,7 +1086,8 @@ impl<'a, 'memory> PacketBatch for XdpRxBatch<'a, 'memory> {
 
 impl Drop for XdpRxBatch<'_, '_> {
     fn drop(&mut self) {
-        // Idempotent after `finish`: nothing outstanding, nothing touched.
+        // Cheap after `finish`: nothing outstanding, no kick owed unless TX
+        // is still in flight (then the settle retries it).
         self.settle();
     }
 }
@@ -911,18 +1112,18 @@ pub struct XdpRxSlot<'s, 'a, 'memory> {
 
 impl PacketSlot for XdpRxSlot<'_, '_, '_> {
     fn ingress(&self) -> IfId {
-        let (port, _) = self.batch.outstanding.as_ref().expect("live RX slot");
+        let (port, _) = self.batch.io.rx_outstanding.as_ref().expect("live RX slot");
         self.batch.io.ports[*port].config.interface
     }
 
     fn bytes_mut(&mut self) -> &mut [u8] {
-        let batch = &mut *self.batch;
-        let (port, lease) = batch.outstanding.as_ref().expect("live RX slot");
-        batch.io.ports[*port].engine.lease_bytes_mut(lease)
+        let io = &mut *self.batch.io;
+        let (port, lease) = io.rx_outstanding.as_ref().expect("live RX slot");
+        io.ports[*port].engine.lease_bytes_mut(lease)
     }
 
     fn complete(self, completion: SlotCompletion) {
-        let (port, lease) = self.batch.outstanding.take().expect("live RX slot");
+        let (port, lease) = self.batch.io.rx_outstanding.take().expect("live RX slot");
         self.batch.complete(port, lease, completion);
     }
 }
@@ -937,22 +1138,29 @@ impl<'memory> GeneratedPacketIo for XdpPacketIo<'memory> {
         Self: 'a;
 
     fn begin_generated(&mut self, egress: IfId) -> Self::Batch<'_> {
+        self.reclaim_outstanding();
         let port = self.port_index(egress);
-        let error = match (self.running(), port) {
-            (Err(stopped), _) => Some(stopped),
-            (Ok(()), None) => Some(XdpIoError::UnknownEgress(egress)),
-            (Ok(()), Some(port)) => {
-                self.ports[port].tx_touched = false;
+        let mut error = None;
+        let usable = match (self.running(), port) {
+            (Err(stopped), _) => {
+                error = Some(stopped);
                 None
             }
+            (Ok(()), None) => None,
+            (Ok(()), Some(port)) => {
+                // Completed frames return to the pool before this phase.
+                if let Err(failure) = self.settle_port(port) {
+                    error = Some(failure);
+                }
+                self.stop.is_none().then_some(port)
+            }
         };
-        let usable = if error.is_none() { port } else { None };
         #[cfg(test)]
         let allocation_budget = self.test.generated_allocation_budget;
         XdpGeneratedBatch {
             io: self,
             port: usable,
-            outstanding: None,
+            unknown: port.is_none(),
             completion: GeneratedBatchCompletion {
                 attempts: 0,
                 allocated: 0,
@@ -975,26 +1183,35 @@ pub struct XdpGeneratedBatch<'a, 'memory> {
     io: &'a mut XdpPacketIo<'memory>,
     /// The egress port; `None` for an unknown egress or a stopped adapter.
     port: Option<usize>,
-    outstanding: Option<RawLease>,
+    /// The egress has no port.
+    unknown: bool,
     completion: GeneratedBatchCompletion<XdpIoError>,
     #[cfg(test)]
     allocation_budget: Option<usize>,
 }
 
 impl XdpGeneratedBatch<'_, '_> {
+    /// Reclaims a lease whose slot was leaked, as an abandon of this batch
+    /// (it is the only batch that can have lent it).
     fn reclaim(&mut self) {
-        if let (Some(port), Some(lease)) = (self.port, self.outstanding.take()) {
-            let state = &mut self.io.ports[port];
-            bump(&mut state.counters.leases_reclaimed);
+        if self.io.generated_outstanding.is_some() {
             self.completion.abandoned += 1;
-            drop(state.engine.resume_generated(lease));
+            self.io.reclaim_outstanding();
         }
     }
 
     fn settle(&mut self) {
         self.reclaim();
+        if std::thread::panicking() {
+            self.io.stop.get_or_insert(Stop::Fault);
+            return;
+        }
         if let Some(port) = self.port {
-            self.io.ports[port].kick_tx(&mut self.completion.error);
+            if self.io.ports[port].kick_owed {
+                if let Err(failure) = self.io.settle_port(port) {
+                    self.completion.error.get_or_insert(failure);
+                }
+            }
         }
     }
 
@@ -1003,8 +1220,7 @@ impl XdpGeneratedBatch<'_, '_> {
         error
     }
 
-    fn complete(&mut self, lease: RawLease, completion: GeneratedSlotCompletion) {
-        let port = self.port.expect("a lease implies a port");
+    fn complete(&mut self, port: usize, lease: RawLease, completion: GeneratedSlotCompletion) {
         #[cfg(test)]
         let snapshot = self.io.test_generated_snapshot(port, &lease);
         let state = &mut self.io.ports[port];
@@ -1014,7 +1230,7 @@ impl XdpGeneratedBatch<'_, '_> {
                 let interface = state.config.interface;
                 match state.engine.resume_generated(lease).commit() {
                     Ok(_) => {
-                        state.tx_touched = true;
+                        state.kick_owed = true;
                         self.completion.accepted += 1;
                     }
                     Err(rejected) => {
@@ -1024,6 +1240,9 @@ impl XdpGeneratedBatch<'_, '_> {
                         assert!(cancelled.is_ok(), "the adapter's own handoff cancels");
                         if let TxRejection::Blocked(_) = reason {
                             bump(&mut state.counters.generated_tx_blocked);
+                            if let Err(failure) = self.io.settle_port(port) {
+                                self.completion.error.get_or_insert(failure);
+                            }
                         } else {
                             let failure = self.io.fault(XdpIoError::Submit {
                                 interface,
@@ -1066,6 +1285,9 @@ impl<'a, 'memory> GeneratedPacketBatch for XdpGeneratedBatch<'a, 'memory> {
         self.reclaim();
         self.completion.attempts += 1;
         let Some(port) = self.port else {
+            if self.unknown {
+                bump(&mut self.io.generated_unknown_egress);
+            }
             return Err(self.fail(GeneratedAllocationError::Unavailable));
         };
         #[cfg(test)]
@@ -1091,7 +1313,7 @@ impl<'a, 'memory> GeneratedPacketBatch for XdpGeneratedBatch<'a, 'memory> {
                 self.completion.allocated += 1;
                 #[cfg(test)]
                 self.io.test_generated_allocated(port, &lease);
-                self.outstanding = Some(lease);
+                self.io.generated_outstanding = Some((port, lease));
                 Ok(GeneratedPacketLease::new(XdpGeneratedSlot { batch: self }))
             }
             Err(GeneratedAllocError::Unavailable) => {
@@ -1156,15 +1378,22 @@ pub struct XdpGeneratedSlot<'s, 'a, 'memory> {
 
 impl GeneratedPacketSlot for XdpGeneratedSlot<'_, '_, '_> {
     fn bytes_mut(&mut self) -> &mut [u8] {
-        let batch = &mut *self.batch;
-        let port = batch.port.expect("a lease implies a port");
-        let lease = batch.outstanding.as_ref().expect("live generated slot");
-        batch.io.ports[port].engine.lease_bytes_mut(lease)
+        let io = &mut *self.batch.io;
+        let (port, lease) = io
+            .generated_outstanding
+            .as_ref()
+            .expect("live generated slot");
+        io.ports[*port].engine.lease_bytes_mut(lease)
     }
 
     fn complete(self, completion: GeneratedSlotCompletion) {
-        let lease = self.batch.outstanding.take().expect("live generated slot");
-        self.batch.complete(lease, completion);
+        let (port, lease) = self
+            .batch
+            .io
+            .generated_outstanding
+            .take()
+            .expect("live generated slot");
+        self.batch.complete(port, lease, completion);
     }
 }
 
@@ -1181,12 +1410,11 @@ impl PublicationQuiescence for XdpPacketIo<'_> {
         if self.stop.is_some() {
             return Err(XdpQuiescenceError::Stopped);
         }
+        self.reclaim_outstanding();
         for index in 0..self.ports.len() {
-            let port = &mut self.ports[index];
-            let interface = port.config.interface;
-            let budget = port.engine.tx_inflight_limit();
-            if let Err(error) = port.engine.reap_completions(budget) {
-                self.fault(XdpIoError::Datapath { interface, error });
+            // A genuine kick failure is counted by the engine and leaves the
+            // kick owed; only a datapath fault ends the check.
+            if let Err(XdpIoError::Datapath { interface, error }) = self.settle_port(index) {
                 return Err(XdpQuiescenceError::Datapath { interface, error });
             }
         }
@@ -1218,13 +1446,21 @@ impl PublicationQuiescence for XdpPacketIo<'_> {
         Ok(PublicationQuiescenceGuard::new(self))
     }
 
+    /// `SkipIo` while a lease is outstanding (the next `receive`,
+    /// `begin_generated`, `service`, or quiescence check reclaims it) or a
+    /// staged handoff is stranded (no adapter path leaves one; only an
+    /// engine-level leak can, and it never recovers).
     fn current_io_disposition(&self) -> PublicationQuiescenceDisposition {
         if self.stop.is_some() {
             return PublicationQuiescenceDisposition::Stop;
         }
-        let stranded = self.ports.iter().any(|port| {
-            port.engine.frame_accounting().leased != 0
-                || port.engine.generated_accounting().leased != 0
+        let reclaimable = |index: usize| {
+            u32::from(matches!(self.rx_outstanding, Some((port, _)) if port == index))
+                + u32::from(matches!(self.generated_outstanding, Some((port, _)) if port == index))
+        };
+        let stranded = self.ports.iter().enumerate().any(|(index, port)| {
+            port.engine.frame_accounting().leased + port.engine.generated_accounting().leased
+                != reclaimable(index)
                 || port.engine.tx_handoffs_outstanding() != 0
         });
         if stranded {
@@ -1327,10 +1563,28 @@ pub struct XdpCounters {
     pub generated_over_mtu: u64,
     pub generated_tx_blocked: u64,
     pub leases_reclaimed: u64,
+    pub cross_port_copy_reserved: u64,
+    pub kicks_link_down: u64,
+    pub kick_budget_exhausted: u64,
+    // Ring occupancy gauges (one atomic load each, at stats time).
+    /// Fill entries published and not yet taken by the kernel.
+    pub fill_ring_occupancy: u64,
+    /// RX descriptors the kernel produced and the engine has not read.
+    pub rx_ring_occupancy: u64,
+    /// TX descriptors published and not yet consumed by the kernel.
+    pub tx_ring_unconsumed: u64,
+    // Kernel `XDP_STATISTICS` (Linux v6.8), summed over the ports whose
+    // getsockopt succeeded.
+    pub kernel_rx_dropped: u64,
+    pub kernel_rx_invalid_descs: u64,
+    pub kernel_tx_invalid_descs: u64,
+    pub kernel_rx_ring_full: u64,
+    pub kernel_rx_fill_ring_empty_descs: u64,
+    pub kernel_tx_ring_empty_descs: u64,
 }
 
 impl XdpCounters {
-    fn of(port: &PortState<'_>) -> Self {
+    fn of(port: &PortState<'_>, kernel: Option<XdpStatistics>) -> Self {
         let engine = &port.engine;
         let rx = engine.counters();
         let tx = engine.tx_counters();
@@ -1396,6 +1650,18 @@ impl XdpCounters {
             generated_over_mtu: adapter.generated_over_mtu,
             generated_tx_blocked: adapter.generated_tx_blocked,
             leases_reclaimed: adapter.leases_reclaimed,
+            cross_port_copy_reserved: adapter.cross_port_copy_reserved,
+            kicks_link_down: adapter.kicks_link_down,
+            kick_budget_exhausted: adapter.kick_budget_exhausted,
+            fill_ring_occupancy: u64::from(engine.fill_occupancy()),
+            rx_ring_occupancy: u64::from(engine.rx_occupancy()),
+            tx_ring_unconsumed: u64::from(engine.tx_unconsumed()),
+            kernel_rx_dropped: kernel.map_or(0, |k| k.rx_dropped),
+            kernel_rx_invalid_descs: kernel.map_or(0, |k| k.rx_invalid_descriptors),
+            kernel_tx_invalid_descs: kernel.map_or(0, |k| k.tx_invalid_descriptors),
+            kernel_rx_ring_full: kernel.map_or(0, |k| k.rx_ring_full),
+            kernel_rx_fill_ring_empty_descs: kernel.map_or(0, |k| k.rx_fill_ring_empty_descriptors),
+            kernel_tx_ring_empty_descs: kernel.map_or(0, |k| k.tx_ring_empty_descriptors),
         }
     }
 
@@ -1458,6 +1724,18 @@ impl XdpCounters {
             generated_over_mtu,
             generated_tx_blocked,
             leases_reclaimed,
+            cross_port_copy_reserved,
+            kicks_link_down,
+            kick_budget_exhausted,
+            fill_ring_occupancy,
+            rx_ring_occupancy,
+            tx_ring_unconsumed,
+            kernel_rx_dropped,
+            kernel_rx_invalid_descs,
+            kernel_tx_invalid_descs,
+            kernel_rx_ring_full,
+            kernel_rx_fill_ring_empty_descs,
+            kernel_tx_ring_empty_descs,
         );
         for (total, value) in self
             .rx_invalid_by_reason
@@ -1541,6 +1819,24 @@ impl XdpCounters {
         count("generated_over_mtu", self.generated_over_mtu);
         count("generated_tx_blocked", self.generated_tx_blocked);
         count("leases_reclaimed", self.leases_reclaimed);
+        count("cross_port_copy_reserved", self.cross_port_copy_reserved);
+        count("kicks_link_down", self.kicks_link_down);
+        count("kick_budget_exhausted", self.kick_budget_exhausted);
+        count("fill_ring_occupancy", self.fill_ring_occupancy);
+        count("rx_ring_occupancy", self.rx_ring_occupancy);
+        count("tx_ring_unconsumed", self.tx_ring_unconsumed);
+        count("kernel_rx_dropped", self.kernel_rx_dropped);
+        count("kernel_rx_invalid_descs", self.kernel_rx_invalid_descs);
+        count("kernel_tx_invalid_descs", self.kernel_tx_invalid_descs);
+        count("kernel_rx_ring_full", self.kernel_rx_ring_full);
+        count(
+            "kernel_rx_fill_ring_empty_descs",
+            self.kernel_rx_fill_ring_empty_descs,
+        );
+        count(
+            "kernel_tx_ring_empty_descs",
+            self.kernel_tx_ring_empty_descs,
+        );
     }
 }
 
@@ -1577,10 +1873,22 @@ pub struct XdpPortStats {
     /// The TX need-wakeup flag right now (copy mode keeps it set).
     pub tx_need_wakeup: bool,
     pub draining: bool,
+    /// The last TX kick found the link down (`ENETDOWN`); cleared by the
+    /// next kick the kernel accepts.
+    pub link_down: bool,
+    /// TX is in flight that a later settle must still push.
+    pub kick_owed: bool,
+    /// Generated frames cross-port copies leave for router-generated
+    /// frames ([`generated_reserve`]).
+    pub copy_reserve: u32,
+    /// The kernel's `XDP_STATISTICS`, `None` if getsockopt was refused or
+    /// returned a size other than Linux v6.8's.
+    pub kernel: Option<XdpStatistics>,
     pub counters: XdpCounters,
 }
 
 fn port_stats(port: &PortState<'_>) -> XdpPortStats {
+    let kernel = port.engine.kernel_statistics();
     XdpPortStats {
         interface: port.config.interface,
         queue: port.config.queue,
@@ -1590,7 +1898,11 @@ fn port_stats(port: &PortState<'_>) -> XdpPortStats {
         fill_need_wakeup: port.engine.fill_needs_wakeup() != Ok(NeedWakeup::NotRequired),
         tx_need_wakeup: port.engine.tx_needs_wakeup() != Ok(NeedWakeup::NotRequired),
         draining: port.engine.is_draining(),
-        counters: XdpCounters::of(port),
+        link_down: port.link_down,
+        kick_owed: port.kick_owed,
+        copy_reserve: port.copy_reserve,
+        kernel,
+        counters: XdpCounters::of(port, kernel),
     }
 }
 
@@ -1621,6 +1933,18 @@ impl ObservableFields for XdpPortStats {
             FieldValue::Flag(self.tx_need_wakeup),
         );
         visitor.field(SECTION, "draining", FieldValue::Flag(self.draining));
+        visitor.field(SECTION, "link_down", FieldValue::Flag(self.link_down));
+        visitor.field(SECTION, "kick_owed", FieldValue::Flag(self.kick_owed));
+        visitor.field(
+            SECTION,
+            "copy_reserve",
+            FieldValue::Count(u64::from(self.copy_reserve)),
+        );
+        visitor.field(
+            SECTION,
+            "kernel_stats_available",
+            FieldValue::Flag(self.kernel.is_some()),
+        );
         self.counters.visit(SECTION, visitor);
     }
 }
@@ -1636,6 +1960,14 @@ pub struct XdpBackendStats {
     pub fill_need_wakeup_ports: u32,
     /// Ports whose TX need-wakeup flag is set right now.
     pub tx_need_wakeup_ports: u32,
+    /// Ports whose last TX kick found the link down.
+    pub link_down_ports: u32,
+    /// Ports that owe a kick (TX in flight a later settle must push).
+    pub kick_owed_ports: u32,
+    /// Ports whose kernel `XDP_STATISTICS` were read.
+    pub kernel_stats_ports: u32,
+    /// Generated allocation attempts for an interface without a port.
+    pub generated_unknown_egress: u64,
     /// Drained or stopped by a fault: no more I/O.
     pub stopped: bool,
     pub counters: XdpCounters,
@@ -1678,6 +2010,26 @@ impl ObservableFields for XdpBackendStats {
             "tx_need_wakeup_ports",
             FieldValue::Count(u64::from(self.tx_need_wakeup_ports)),
         );
+        visitor.field(
+            SECTION,
+            "link_down_ports",
+            FieldValue::Count(u64::from(self.link_down_ports)),
+        );
+        visitor.field(
+            SECTION,
+            "kick_owed_ports",
+            FieldValue::Count(u64::from(self.kick_owed_ports)),
+        );
+        visitor.field(
+            SECTION,
+            "kernel_stats_ports",
+            FieldValue::Count(u64::from(self.kernel_stats_ports)),
+        );
+        visitor.field(
+            SECTION,
+            "generated_unknown_egress",
+            FieldValue::Count(self.generated_unknown_egress),
+        );
         visitor.field(SECTION, "stopped", FieldValue::Flag(self.stopped));
         self.counters.visit(SECTION, visitor);
     }
@@ -1687,10 +2039,13 @@ impl BackendStats for XdpPacketIo<'_> {
     type Stats = XdpBackendStats;
 
     const NAME: &'static str = "af_xdp";
-    /// The mode every port guarantees: the bind mode is negotiated per
-    /// port at open (`auto` may fall back to copy), so the static claim is
-    /// copy. The negotiated mode of each port is in the stats
-    /// (`copy_ports`, `zero_copy_ports`, [`XdpPortStats::mode`]).
+    /// The mode every port guarantees, a static claim: the bind mode is
+    /// negotiated per port at open (`auto` may fall back to copy, and ports
+    /// may differ), so only copy can be promised for the type. The mode a
+    /// port actually negotiated is runtime data in the stats
+    /// (`copy_ports`, `zero_copy_ports`, the `mixed` label, and
+    /// [`XdpPortStats::mode`]); consumers must read those, not `MODE`, to
+    /// tell copy from zero-copy.
     const MODE: BackendMode = BackendMode::Copy;
 
     fn backend_stats(&self) -> Self::Stats {
@@ -1700,6 +2055,10 @@ impl BackendStats for XdpPacketIo<'_> {
             zero_copy_ports: 0,
             fill_need_wakeup_ports: 0,
             tx_need_wakeup_ports: 0,
+            link_down_ports: 0,
+            kick_owed_ports: 0,
+            kernel_stats_ports: 0,
+            generated_unknown_egress: self.generated_unknown_egress,
             stopped: self.stop.is_some(),
             counters: XdpCounters::default(),
         };
@@ -1712,6 +2071,9 @@ impl BackendStats for XdpPacketIo<'_> {
             }
             stats.fill_need_wakeup_ports += u32::from(port.fill_need_wakeup);
             stats.tx_need_wakeup_ports += u32::from(port.tx_need_wakeup);
+            stats.link_down_ports += u32::from(port.link_down);
+            stats.kick_owed_ports += u32::from(port.kick_owed);
+            stats.kernel_stats_ports += u32::from(port.kernel.is_some());
             stats.counters.accumulate(&port.counters);
         }
         stats

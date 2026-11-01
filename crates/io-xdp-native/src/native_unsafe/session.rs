@@ -394,6 +394,8 @@ pub(super) struct SessionCore<'s, S: MapsRealMemory> {
     ifindex: u32,
     queue: u32,
     mtu: u32,
+    /// Process-unique identity stamped into the datapath bundle.
+    origin: u64,
     mode: NegotiatedMode,
     zero_copy_fallback: bool,
     datapath: DatapathAccess,
@@ -625,6 +627,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
             ifindex,
             queue: config.queue(),
             mtu: 0,
+            origin: crate::datapath::next_origin(),
             mode,
             zero_copy_fallback: false,
             datapath: DatapathAccess::Untouched,
@@ -688,6 +691,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
             umem,
             umem_config: self.umem_config,
             kick,
+            origin: self.origin,
         }))
     }
 
@@ -863,6 +867,10 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
     pub(super) const fn mtu(&self) -> u32 {
         self.mtu
     }
+
+    pub(super) const fn origin(&self) -> u64 {
+        self.origin
+    }
 }
 
 type ViewFailure = (SessionStage, SessionFailure);
@@ -1014,6 +1022,13 @@ impl NativeSession {
     #[must_use]
     pub const fn mtu(&self) -> u32 {
         self.core.mtu()
+    }
+
+    /// Identity stamped into this session's datapath bundle, which
+    /// `XdpPortConfig::from_session` records so the adapter can refuse a
+    /// config paired with another session's engine.
+    pub(crate) const fn origin(&self) -> u64 {
+        self.core.origin()
     }
 
     /// Lends the four ring views and the UMEM geometry for the borrow of

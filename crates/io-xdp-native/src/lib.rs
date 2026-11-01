@@ -85,9 +85,10 @@ pub use native_unsafe::kick::{KickDeferral, KickError, KickOutcome};
 ))]
 pub use native_unsafe::session::NativeSession;
 pub use packet_io::{
-    XdpAdapterCounters, XdpBackendStats, XdpCounters, XdpDrainReport, XdpGeneratedBatch,
-    XdpGeneratedSlot, XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort, XdpPortConfig,
-    XdpPortStats, XdpQuiescenceError, XdpRxBatch, XdpRxSlot,
+    generated_reserve, XdpAdapterCounters, XdpBackendStats, XdpCounters, XdpDrainReport,
+    XdpGeneratedBatch, XdpGeneratedSlot, XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort,
+    XdpPortConfig, XdpPortStats, XdpQuiescenceError, XdpRxBatch, XdpRxSlot, KICK_SLACK,
+    KICK_TX_BATCH,
 };
 pub use platform::{ensure_native_syscall_supported, ensure_supported};
 pub use ring::{

@@ -144,10 +144,14 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   `PacketIo`/`GeneratedPacketIo`/`PublicationQuiescence`/`BackendStats`をstatic dispatchで実装する。
   `IfId`→portはconstruction時に固定（merge blocker 8）、RXは全portをrotating startでmerge、同じport
   へのcommitはsame-frame TX、別portはegressのgenerated poolへexact copy（shared UMEMはXDP-136で
-  deferred）、TXは`mtu + 14`以下（MTUはopenでsysfsから）、`TxBlocked`はcore back-pressure、quiescenceは
-  reap後にlease/handoff/in-flightなし、OBS-018のstatsを固定順で出す。Rx/Generated/CQ conformance
+  deferred。copyはrouter用のgenerated reserve `max(2, pool/8)`を取らない）、TXは`mtu + 14`以下（MTUは
+  openでsysfsから、configは`from_session`でだけ作れる）、`TxBlocked`はcore back-pressure、kickはport
+  ごとのdebtとしてbatchをまたいで保持し、copy modeの一`sendto` 32 descriptor上限を越えるbatchも
+  `finish`で完了させ、link down（`ENETDOWN`）はerrorでなくlink stateとして新しいtrafficなしに回復する。
+  quiescenceはleaked lease回収とsettle後にlease/handoff/in-flightなし、OBS-018のstatsはkernel
+  `XDP_STATISTICS`とring gaugeを含め固定順で出す。Rx/Generated/CQ conformance
   suiteをscripted kernel上で、二veth portのcore forwardingをprivileged smokeで検証した
-  （XDP-133〜156、IO-013、OBS-018）。configからのport構築と`ruster run`、health化、MTU/link変更、
+  （XDP-133〜170、IO-013、OBS-018）。configからのport構築と`ruster run`、health化、MTU/link変更、
   TX枠公平性はX04b（XDP-157）。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native

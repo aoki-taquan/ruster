@@ -34,8 +34,8 @@ use std::{
 };
 
 use ruster_core::{
-    forward_batch, BackendStats, ForwardingSnapshot, IfId, Interface, Ipv4Address, MacAddress,
-    Neighbor, NoTrace, PacketIo, Route,
+    forward_batch, BackendStats, ForwardingSnapshot, GeneratedPacketBatch, GeneratedPacketIo, IfId,
+    Interface, Ipv4Address, MacAddress, Neighbor, NoTrace, PacketIo, PublicationQuiescence, Route,
 };
 
 use ruster_io_xdp_native::{
@@ -976,8 +976,8 @@ fn priv_xdp_adapter_forwards_between_two_veth_ports_through_core_and_drains() {
             .attach_xdp(XdpAttachMode::Native)
             .expect("native attach on veth");
     }
-    let config_a = XdpPortConfig::new(lan, session_a.queue(), session_a.mode(), session_a.mtu());
-    let config_b = XdpPortConfig::new(wan, session_b.queue(), session_b.mode(), session_b.mtu());
+    let config_a = XdpPortConfig::from_session(lan, &session_a);
+    let config_b = XdpPortConfig::from_session(wan, &session_b);
     assert_eq!(config_a.max_frame_len(), 1_514);
     {
         let mut io = XdpPacketIo::new([
@@ -1078,6 +1078,78 @@ fn priv_xdp_adapter_forwards_between_two_veth_ports_through_core_and_drains() {
         assert_eq!(stats.counters.tx_over_mtu, 0);
         assert_eq!(stats.counters.tx_invalid_completions, 0);
 
+        // The kernel's XDP_STATISTICS reach the per-port stats.
+        let kernel = io.port_stats(wan).expect("WAN").kernel;
+        assert!(
+            kernel.is_some(),
+            "getsockopt(XDP_STATISTICS) on a live socket"
+        );
+
+        // A burst above copy mode's 32 descriptors per sendto completes in
+        // the batch's own finish, without any further traffic or call.
+        let completed = io.port_stats(wan).expect("WAN").counters.tx_completed;
+        let kicks = io.port_stats(wan).expect("WAN").counters.tx_kicks;
+        {
+            let mut batch = io.begin_generated(wan);
+            for _ in 0..60 {
+                let mut frame = batch.allocate(42).expect("generated frame");
+                build_arp_request(frame.bytes_mut());
+                frame.commit();
+            }
+            let completion = batch.finish();
+            assert_eq!(completion.accepted, 60, "{completion:?}");
+            assert_eq!(completion.error, None, "{completion:?}");
+        }
+        let burst = io.port_stats(wan).expect("WAN").counters;
+        assert_eq!(burst.tx_inflight, 0, "all 60 completed: {burst:?}");
+        assert_eq!(burst.tx_completed, completed + 60, "{burst:?}");
+        assert!(burst.tx_kicks >= kicks + 2, "two sendto rounds: {burst:?}");
+
+        // Link flap on B (inside the namespace): TX while down, then up,
+        // and no new traffic. The quiescence check alone settles the owed
+        // kick until the publication is ready.
+        let ip_link = |state: &str| {
+            let status = Command::new("ip")
+                .args(["link", "set", "dev", port_b.as_str(), state])
+                .status()
+                .expect("run ip link set");
+            assert!(status.success(), "ip link set {port_b} {state} failed");
+        };
+        ip_link("down");
+        {
+            let mut batch = io.begin_generated(wan);
+            for _ in 0..3 {
+                let mut frame = batch.allocate(42).expect("generated frame");
+                build_arp_request(frame.bytes_mut());
+                frame.commit();
+            }
+            let completion = batch.finish();
+            assert_eq!(completion.error, None, "link down is not an error");
+        }
+        let down = io.port_stats(wan).expect("WAN");
+        ip_link("up");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Err(error) = io.try_publication_quiescence().map(|_| ()) {
+            assert!(
+                Instant::now() < deadline,
+                "quiescence never became ready after the flap: {error:?} {:?}",
+                io.port_stats(wan)
+            );
+            sleep(Duration::from_millis(20));
+        }
+        let up = io.port_stats(wan).expect("WAN");
+        assert_eq!(up.counters.tx_inflight, 0, "{up:?}");
+        assert!(!up.link_down && !up.kick_owed, "{up:?}");
+        eprintln!(
+            "priv_xdp_adapter: burst of 60 used {} kicks; flap: link_down {} kicks_link_down {} \
+             deferred {} in flight {} while down",
+            burst.tx_kicks - kicks,
+            down.link_down,
+            down.counters.kicks_link_down,
+            down.counters.kicks_deferred,
+            down.counters.tx_inflight
+        );
+
         // Ordered shutdown of both ports.
         let deadline = Instant::now() + Duration::from_secs(2);
         let report = loop {
@@ -1109,7 +1181,8 @@ fn priv_xdp_adapter_forwards_between_two_veth_ports_through_core_and_drains() {
     eprintln!(
         "priv_xdp_adapter: a frame from veth A was forwarded by core through the adapter, \
          copied into port B's generated pool, transmitted on veth B with the rewritten MACs and \
-         TTL, received by B's peer, and both ports drained verified"
+         TTL, received by B's peer, a 60-frame burst completed without more traffic, a link \
+         flap on B recovered to a ready quiescence, and both ports drained verified"
     );
 }
 

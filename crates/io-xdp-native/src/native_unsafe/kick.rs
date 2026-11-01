@@ -137,6 +137,10 @@ pub(super) enum KickTarget<'session> {
     /// A test script that records kicks and injects errno values.
     #[cfg(test)]
     Scripted(&'session ScriptedKicks),
+    /// The scripted heap kernel, which can also run a copy-mode transmit
+    /// round on a TX kick and report scripted `XDP_STATISTICS`.
+    #[cfg(test)]
+    Kernel(&'session super::heap_kernel::ScriptedKernel),
     /// Unreachable marker that keeps `'session` used on every target.
     #[allow(dead_code)]
     Never(std::convert::Infallible, PhantomData<&'session ()>),
@@ -187,9 +191,80 @@ impl<'session> SocketKick<'session> {
             }
             #[cfg(test)]
             KickTarget::Scripted(script) => script.kick(ring),
+            #[cfg(test)]
+            KickTarget::Kernel(kernel) => kernel.scripted_kick(ring),
             KickTarget::Never(never, _) => match *never {},
         }
     }
+
+    /// `getsockopt(SOL_XDP, XDP_STATISTICS)` on the bundle's socket (cold
+    /// path). The seam checks the fd and the returned length against the
+    /// buffer (always on); this also requires exactly the Linux v6.8
+    /// `struct xdp_statistics` size (48 bytes, six `u64`), so an older
+    /// kernel's shorter structure is refused rather than misread.
+    pub(crate) fn statistics(&self) -> Option<crate::abi::XdpStatistics> {
+        match &self.target {
+            #[cfg(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                target_pointer_width = "64"
+            ))]
+            KickTarget::Live(fd) => {
+                if !fd.is_active() {
+                    return None;
+                }
+                let mut raw = [0_u8; XDP_STATISTICS_LEN];
+                let length = fd
+                    .get_socket_option(crate::abi::SOL_XDP, crate::abi::XDP_STATISTICS, &mut raw)
+                    .ok()?;
+                decode_statistics(&raw, length)
+            }
+            #[cfg(test)]
+            KickTarget::Scripted(_) => None,
+            #[cfg(test)]
+            KickTarget::Kernel(kernel) => kernel.scripted_statistics(),
+            KickTarget::Never(never, _) => match *never {},
+        }
+    }
+}
+
+/// Size of Linux v6.8 `struct xdp_statistics`.
+const XDP_STATISTICS_LEN: usize = std::mem::size_of::<crate::abi::XdpStatistics>();
+const _: () = assert!(XDP_STATISTICS_LEN == 48);
+
+/// Decodes a kernel-written `struct xdp_statistics`; `None` unless the
+/// kernel wrote exactly the v6.8 size.
+#[cfg_attr(
+    not(any(
+        test,
+        all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        )
+    )),
+    allow(dead_code)
+)]
+fn decode_statistics(
+    raw: &[u8; XDP_STATISTICS_LEN],
+    length: usize,
+) -> Option<crate::abi::XdpStatistics> {
+    if length != XDP_STATISTICS_LEN {
+        return None;
+    }
+    let field = |index: usize| {
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&raw[index * 8..index * 8 + 8]);
+        u64::from_ne_bytes(bytes)
+    };
+    Some(crate::abi::XdpStatistics {
+        rx_dropped: field(0),
+        rx_invalid_descriptors: field(1),
+        tx_invalid_descriptors: field(2),
+        rx_ring_full: field(3),
+        rx_fill_ring_empty_descriptors: field(4),
+        tx_ring_empty_descriptors: field(5),
+    })
 }
 
 impl fmt::Debug for SocketKick<'_> {
@@ -212,7 +287,7 @@ pub(crate) struct ScriptedKicks {
 
 #[cfg(test)]
 impl ScriptedKicks {
-    fn kick(&self, ring: KickRing) -> Result<(), Option<u16>> {
+    pub(crate) fn kick(&self, ring: KickRing) -> Result<(), Option<u16>> {
         let counter = match ring {
             KickRing::Tx => &self.tx,
             KickRing::Fill => &self.fill,
@@ -238,7 +313,30 @@ impl ScriptedKicks {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, KickDeferral, KickError, KickOutcome};
+    use super::{classify, decode_statistics, KickDeferral, KickError, KickOutcome};
+
+    #[test]
+    fn xdp_statistics_decode_requires_the_v6_8_size() {
+        let mut raw = [0_u8; 48];
+        for (index, chunk) in raw.chunks_exact_mut(8).enumerate() {
+            chunk.copy_from_slice(&(index as u64 + 1).to_ne_bytes());
+        }
+        let stats = decode_statistics(&raw, 48).expect("v6.8 size");
+        assert_eq!(
+            [
+                stats.rx_dropped,
+                stats.rx_invalid_descriptors,
+                stats.tx_invalid_descriptors,
+                stats.rx_ring_full,
+                stats.rx_fill_ring_empty_descriptors,
+                stats.tx_ring_empty_descriptors,
+            ],
+            [1, 2, 3, 4, 5, 6]
+        );
+        // The v1 structure (three fields, 24 bytes) is refused.
+        assert_eq!(decode_statistics(&raw, 24), None);
+        assert_eq!(decode_statistics(&raw, 0), None);
+    }
 
     #[test]
     fn kick_errno_mapping_is_exact() {

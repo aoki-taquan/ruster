@@ -349,12 +349,20 @@ impl<'memory> RxFillEngine<'memory> {
                 .expect("a just-leased generated frame")
                 .fill(0);
         }
-        Ok(RawLease { token, descriptor })
+        Ok(RawLease {
+            engine: state.engine_id,
+            token,
+            descriptor,
+        })
     }
 
     /// Turns a generated lease back into the borrowing view that ends it.
     pub(crate) fn resume_generated(&mut self, lease: RawLease) -> GeneratedFrame<'_, 'memory> {
-        debug_assert!(self.state.is_generated(lease.token.frame().index()));
+        self.check_lease(&lease);
+        assert!(
+            self.state.is_generated(lease.token.frame().index()),
+            "a generated lease names a generated-pool frame"
+        );
         GeneratedFrame {
             engine: self,
             token: lease.token,

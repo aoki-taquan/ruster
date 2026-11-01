@@ -716,6 +716,8 @@ pub struct RxFillEngine<'memory> {
     tx: TxProducer<'memory>,
     completion: CompletionConsumer<'memory>,
     kick: SocketKick<'memory>,
+    /// Identity of the session (or test kernel) the bundle came from.
+    origin: u64,
     state: EngineState<'memory>,
     initial_refill: RefillReport,
 }
@@ -744,6 +746,7 @@ impl<'memory> RxFillEngine<'memory> {
             umem,
             umem_config: geometry,
             kick,
+            origin,
         } = datapath.into_parts();
         let fill_batch = config.fill_batch().get();
         if fill_batch > fill.capacity() {
@@ -810,6 +813,7 @@ impl<'memory> RxFillEngine<'memory> {
             tx,
             completion,
             kick,
+            origin,
             state,
             initial_refill: RefillReport {
                 published: 0,
@@ -835,6 +839,41 @@ impl<'memory> RxFillEngine<'memory> {
     /// asks, also while the free list is empty or Fill is full.
     pub fn fill_needs_wakeup(&self) -> Result<NeedWakeup, NativeRingError> {
         self.fill.need_wakeup()
+    }
+
+    /// Identity of the session (or test kernel) whose datapath bundle this
+    /// engine consumed; the core adapter pairs it with the port config.
+    pub(crate) const fn origin(&self) -> u64 {
+        self.origin
+    }
+
+    /// TX descriptors published and not yet consumed by the kernel (one
+    /// atomic load). A corrupt cursor reads as the full capacity.
+    pub(crate) fn tx_unconsumed(&self) -> u32 {
+        self.tx
+            .free_slots()
+            .map_or(self.tx.capacity(), |free| self.tx.capacity() - free)
+    }
+
+    /// Fill entries published and not yet taken by the kernel (one atomic
+    /// load; a corrupt cursor reads as the full capacity).
+    pub(crate) fn fill_occupancy(&self) -> u32 {
+        self.fill
+            .free_slots()
+            .map_or(self.fill.capacity(), |free| self.fill.capacity() - free)
+    }
+
+    /// RX descriptors produced by the kernel and not yet consumed (one
+    /// atomic load; a corrupt cursor reads as the full capacity).
+    pub(crate) fn rx_occupancy(&self) -> u32 {
+        self.rx.available().unwrap_or(self.rx.capacity())
+    }
+
+    /// The kernel's `XDP_STATISTICS` for this socket (one `getsockopt`,
+    /// cold path only), or `None` if the kernel refused or returned another
+    /// structure size than Linux v6.8's 48 bytes.
+    pub(crate) fn kernel_statistics(&self) -> Option<crate::abi::XdpStatistics> {
+        self.kick.statistics()
     }
 
     /// Frames handed to TX and neither submitted nor cancelled: the
@@ -1301,6 +1340,8 @@ impl<'memory> RxBatch<'_, 'memory> {
 /// engine: the adapter stores it with its port index).
 #[derive(Debug)]
 pub(crate) struct RawLease {
+    /// The issuing engine (`EngineState::engine_id`), checked on every use.
+    engine: u64,
     token: FrameToken,
     descriptor: ValidatedDescriptor,
 }
@@ -1309,6 +1350,12 @@ impl RawLease {
     /// Visible length.
     pub(crate) const fn len(&self) -> u32 {
         self.descriptor.len()
+    }
+
+    /// The issuing engine identity (tests).
+    #[cfg(test)]
+    pub(crate) const fn engine(&self) -> u64 {
+        self.engine
     }
 
     /// Ledger ownership cycle.
@@ -1333,11 +1380,26 @@ impl<'memory> RxFillEngine<'memory> {
             .lease_rx(token)
             .expect("pending holds RxAvailable tokens");
         bump(&mut state.counters.rx_leased);
-        Some(RawLease { token, descriptor })
+        Some(RawLease {
+            engine: state.engine_id,
+            token,
+            descriptor,
+        })
+    }
+
+    /// Always-on check that `lease` was issued by this engine: a lease of
+    /// another engine never touches this ledger or UMEM, even when the two
+    /// ledgers share a `UmemDomainId` and issue identical tokens.
+    pub(crate) fn check_lease(&self, lease: &RawLease) {
+        assert_eq!(
+            lease.engine, self.state.engine_id,
+            "a raw lease is used only on the engine that issued it"
+        );
     }
 
     /// The visible bytes of a lease of this engine.
     pub(crate) fn lease_bytes(&self, lease: &RawLease) -> &[u8] {
+        self.check_lease(lease);
         self.state
             .frames
             .leased_bytes(lease.token, lease.descriptor)
@@ -1346,6 +1408,7 @@ impl<'memory> RxFillEngine<'memory> {
 
     /// The visible bytes of a lease of this engine, for writing.
     pub(crate) fn lease_bytes_mut(&mut self, lease: &RawLease) -> &mut [u8] {
+        self.check_lease(lease);
         self.state
             .frames
             .leased_bytes_mut(lease.token, lease.descriptor)
@@ -1354,7 +1417,11 @@ impl<'memory> RxFillEngine<'memory> {
 
     /// Turns an RX lease back into the borrowing view that ends it.
     pub(crate) fn resume_rx(&mut self, lease: RawLease) -> RxFrame<'_, 'memory> {
-        debug_assert!(!self.state.is_generated(lease.token.frame().index()));
+        self.check_lease(&lease);
+        assert!(
+            !self.state.is_generated(lease.token.frame().index()),
+            "an RX lease names an RX-pool frame"
+        );
         RxFrame {
             engine: self,
             token: lease.token,
