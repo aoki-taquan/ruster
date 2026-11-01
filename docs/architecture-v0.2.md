@@ -1310,19 +1310,31 @@ hash key、generationを持たず、validationはmutationを起こしません�
 schema-version 1のまま後方互換です。`af-xdp`はinterfaceごとに一つの`[[backend.ports]]`
 （queue、copy/zero-copy/auto、need-wakeup、native/generic attach、4 ring、frame size/count、
 generated frame、headroom）を持ち、`validate`はmutationもresource取得もせずboundedに検査して
-IfId順の`ValidatedBackendV1`を返します。bind flag、`RingConfig`、`UmemConfig`は
-`ruster-io-xdp-native`のvalidator自身が構築するため、configはnative profile（need-wakeup必須、
+IfId順の`ValidatedBackendV1`（portはbindするdevice名のcopyを持つ）を返します。bind flag、
+`RingConfig`、`UmemConfig`は`ruster-io-xdp::native_profile`のvalidatorが構築します。このmoduleは
+unsafeもFFIも含まないsafe profileで、`ruster-io-xdp-native`は同じ型・定数をre-exportして使うため、
+`ruster-config`（`#![forbid(unsafe_code)]`）、`ruster-control`、`ruster-cli`、`ruster-sim-scenario`は
+native crateへ依存せずに、configがnative profile（need-wakeup必須、
 2048/4096-byte aligned chunk、kernel固定256-byte headroomへの加算、exact RX/generated
 partition）より緩くなれません。configの追加policyは、1 queue/interface、queue ≤ 1023、ring
-64..=16384、`completion >= tx`、visible packet bytes ≥ 1514、`zero-copy`+`generic`の拒否、
-`frame-count - generated-frames >= fill + tx`（Fill ringを満杯に保ったままTX ring一杯の
-forward frameがcompletion待ちでも足りる量）、UMEM 256 MiB/socketと1 GiB/configです。
+64..=16384、`completion >= tx`、visible packet bytes ≥ 1514、generic attachでは`mode = "copy"`
+だけ（skb XDPは常にcopyなので`zero-copy`/`auto`を拒否）、UMEM 256 MiB/socketと1 GiB/config、
+そして`frame-count - generated-frames >= fill + tx`です。最後の式はlibxdp慣行と同じ最低限の
+floorで、Fill ring満杯とTX ring一杯のforward frameを同時に賄えるだけです。未回収のcompletion、
+driverがdequeue済みのTX frame、coreが借用中のRX frameは数えないため、それだけで枯渇しないことは
+保証しません。後続のX01/X02 backendは、in-flight TXを`tx` entry以下に制限し、free listが
+Fill ringを満たせないときもstallせずに進む（部分的なFill、completion回収を優先）ことを
+要求されます（ledger BACKEND-004、deferred）。
 `existing-xdp-program`は`refuse`だけで、既存programを置換・detachしない方針を明示するために
 fieldを残します。`queue`は`backend.ports[i]`直下でだけoperator入力として許し、他の位置の
 queue/shard/umem/worker fieldはruntime生成値として従来どおり拒否します。
 
 `ApplyPlan`は`[backend]`の差を`BackendChange`（kind、existing-program、IfId keyのport差分）
-として出し、差があれば`RestartRequired::Backend`を最後の理由に加えます。publication
+として出し、差があれば`RestartRequired::Backend`を最後の理由に加えます。portはdeviceを含むため、
+af-xdpでbind先interfaceの`device`を変える、または二つのdeviceを入れ替えるとrestart-requiredです
+（sim backendではdevice変更は従来どおりreloadableなlabel変更）。`ApplyPlan::for_active`は
+`Backend`を含むplanでlive dry-runを行わず、`dry_run()`を
+`Err(ApplyError::RestartRequired(Backend))`、flushを`All`にして、in-place reload可能に見せません。publication
 candidateはbackendを持たないので、live activationはこの理由を返しません。backend
 resource（socket、UMEM、XDP program）を所有するprocessがreload時に拒否します。`run-sim`は
 `SimIo`だけを動かすため、非`sim` backendのconfigを初期configでもapply stepでも

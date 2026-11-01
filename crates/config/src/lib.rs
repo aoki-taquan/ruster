@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! Versioned declarative configuration parsing and cold semantic validation.
 //!
 //! Parsing preserves the exact V1 source schema. Semantic validation resolves

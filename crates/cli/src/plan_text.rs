@@ -195,14 +195,15 @@ fn nat(lines: &mut Vec<String>, kind: &str, change: NatChange) {
     }
 }
 
-/// One AF_XDP socket: `if<id> queue <q> <mode> <attach> rings
+/// One AF_XDP socket: `if<id> dev <device> queue <q> <mode> <attach> rings
 /// <fill>/<rx>/<tx>/<completion> frames <count>x<size> generated <n>
 /// headroom <bytes>`. Need-wakeup is always on and not printed.
 fn port(port: &ValidatedAfXdpPortV1) -> String {
     let (rings, umem) = (port.rings(), port.umem());
     format!(
-        "{} queue {} {} {} rings {}/{}/{}/{} frames {}x{} generated {} headroom {}",
+        "{} dev {} queue {} {} {} rings {}/{}/{}/{} frames {}x{} generated {} headroom {}",
         iface(port.interface()),
+        label(port.device()),
         port.queue(),
         port.mode().config_name(),
         port.attach().config_name(),

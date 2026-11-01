@@ -810,9 +810,9 @@ fn af_xdp_backend_validates_plans_as_restart_required_and_is_refused_by_run_sim(
         stdout.starts_with(
             "plan: restart-required\nrestart-required: BACKEND\nchanges: 3\n\
              \x20 backend ~ sim -> af-xdp\n\
-             \x20 backend-port + if1 queue 0 copy generic rings 256/256/256/512 \
+             \x20 backend-port + if1 dev sim0 queue 0 copy generic rings 256/256/256/512 \
              frames 1024x2048 generated 64 headroom 32\n\
-             \x20 backend-port + if2 queue 1 zero-copy native rings 2048/2048/2048/2048 \
+             \x20 backend-port + if2 dev sim1 queue 1 zero-copy native rings 2048/2048/2048/2048 \
              frames 4608x4096 generated 512 headroom 0\n\
              expected-flush:\n"
         ),
@@ -835,8 +835,8 @@ fn af_xdp_backend_validates_plans_as_restart_required_and_is_refused_by_run_sim(
     assert!(
         stdout.starts_with(
             "plan: restart-required\nrestart-required: BACKEND\nchanges: 1\n\
-             \x20 backend-port ~ if2 queue 1 zero-copy native rings 2048/2048/2048/2048 \
-             frames 4608x4096 generated 512 headroom 0 -> if2 queue 2 zero-copy native \
+             \x20 backend-port ~ if2 dev sim1 queue 1 zero-copy native rings 2048/2048/2048/2048 \
+             frames 4608x4096 generated 512 headroom 0 -> if2 dev sim1 queue 2 zero-copy native \
              rings 2048/2048/2048/2048 frames 4608x4096 generated 512 headroom 0\n"
         ),
         "{stdout}"
@@ -860,7 +860,7 @@ fn af_xdp_backend_validates_plans_as_restart_required_and_is_refused_by_run_sim(
     assert_eq!(status(&output), 2);
     assert_eq!(
         text(&output.stderr),
-        "ruster: invalid config: stage=validate code=BACKEND_ZERO_COPY_REQUIRES_NATIVE_ATTACH \
+        "ruster: invalid config: stage=validate code=BACKEND_MODE_REQUIRES_NATIVE_ATTACH \
          path=backend.ports[0].mode\n"
     );
 

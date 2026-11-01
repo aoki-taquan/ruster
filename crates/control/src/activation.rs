@@ -384,8 +384,9 @@ pub enum ActivationError {
 /// dropping the active publication and activating new storage.
 ///
 /// [`RestartRequired::Backend`] is reported only by
-/// [`ApplyPlan`](crate::ApplyPlan): a publication candidate carries no
-/// backend, so live activation never returns it. The process that owns the
+/// [`ApplyPlan`](crate::ApplyPlan) (including as the recorded dry run of
+/// [`ApplyPlan::for_active`](crate::ApplyPlan::for_active)): a publication
+/// candidate carries no backend, so live activation never returns it. The process that owns the
 /// backend (sockets, UMEM, attached XDP programs) must refuse a backend
 /// change on reload and restart instead.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

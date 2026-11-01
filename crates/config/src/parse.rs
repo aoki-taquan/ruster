@@ -161,7 +161,7 @@ pub fn parse(input: &[u8]) -> Result<VersionedConfig, Diagnostic> {
         ));
     }
 
-    reject_forbidden_fields(&value, &mut SourcePath::default())?;
+    reject_forbidden_fields(&value, &mut SourcePath::default(), true)?;
     let config = deserialize_exact(value)?;
     enforce_list_bounds(&config)?;
     Ok(VersionedConfig::V1(config))
@@ -212,12 +212,20 @@ fn convert_path(path: &Path) -> SourcePath {
     converted
 }
 
-fn reject_forbidden_fields(value: &Value, path: &mut SourcePath) -> Result<(), Diagnostic> {
+/// `exact` is true while every key from the root to `value` is spelled
+/// exactly as a [`SAFE_PATH_FIELDS`] entry, so `path` is the complete source
+/// path. Only then can a [`BACKEND_PORT_FIELDS`] key be operator input:
+/// under an unknown, unsafe, or differently spelled key it stays forbidden.
+fn reject_forbidden_fields(
+    value: &Value,
+    path: &mut SourcePath,
+    exact: bool,
+) -> Result<(), Diagnostic> {
     match value {
         Value::Array(values) => {
             for (index, value) in values.iter().enumerate() {
                 path.push_index(index);
-                reject_forbidden_fields(value, path)?;
+                reject_forbidden_fields(value, path, exact)?;
                 path.pop();
             }
         }
@@ -225,7 +233,7 @@ fn reject_forbidden_fields(value: &Value, path: &mut SourcePath) -> Result<(), D
             for (field, value) in table {
                 let normalized = field.to_ascii_lowercase().replace('_', "-");
                 let operator_input =
-                    BACKEND_PORT_FIELDS.contains(&field.as_str()) && is_backend_port(path);
+                    exact && BACKEND_PORT_FIELDS.contains(&field.as_str()) && is_backend_port(path);
                 if FORBIDDEN_FIELDS.contains(&normalized.as_str()) && !operator_input {
                     path.push_field(normalized);
                     return Err(Diagnostic::new(
@@ -234,11 +242,12 @@ fn reject_forbidden_fields(value: &Value, path: &mut SourcePath) -> Result<(), D
                     ));
                 }
                 if SAFE_PATH_FIELDS.contains(&normalized.as_str()) {
+                    let exact = exact && *field == normalized;
                     path.push_field(normalized);
-                    reject_forbidden_fields(value, path)?;
+                    reject_forbidden_fields(value, path, exact)?;
                     path.pop();
                 } else {
-                    reject_forbidden_fields(value, path)?;
+                    reject_forbidden_fields(value, path, false)?;
                 }
             }
         }

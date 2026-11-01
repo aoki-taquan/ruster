@@ -15,10 +15,9 @@ use ruster_core::{
     ResolutionStateSlot, Route, RouteError, SnapshotError,
 };
 
-use ruster_io_xdp_native::{
-    abi::{XDP_COPY, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY},
-    BindMode, RingConfig, UmemConfig, ValidatedBindFlags, SUPPORTED_ALIGNED_CHUNK_SIZES,
-    XDP_PACKET_HEADROOM,
+use ruster_io_xdp::native_profile::{
+    BindMode, RingConfig, UmemConfig, ValidatedBindFlags, SUPPORTED_ALIGNED_CHUNK_SIZES, XDP_COPY,
+    XDP_PACKET_HEADROOM, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY,
 };
 
 use crate::{
@@ -104,9 +103,10 @@ pub enum ValidationCode {
     /// `need-wakeup = false`; the native profile requires
     /// `XDP_USE_NEED_WAKEUP`.
     BackendNeedWakeupRequired,
-    /// `mode = "zero-copy"` with `xdp-attach = "generic"`: generic (skb)
-    /// XDP always copies.
-    BackendZeroCopyRequiresNativeAttach,
+    /// `mode = "zero-copy"` or `"auto"` with `xdp-attach = "generic"`:
+    /// generic (skb) XDP always copies, so only `mode = "copy"` states what
+    /// the socket will do.
+    BackendModeRequiresNativeAttach,
     /// A ring entry count is not a power of two.
     BackendRingNotPowerOfTwo,
     /// A ring entry count is outside
@@ -194,7 +194,7 @@ impl ValidationCode {
             Self::BackendMultipleQueuesPerInterface => "BACKEND_MULTIPLE_QUEUES_PER_INTERFACE",
             Self::BackendQueueOutOfRange => "BACKEND_QUEUE_OUT_OF_RANGE",
             Self::BackendNeedWakeupRequired => "BACKEND_NEED_WAKEUP_REQUIRED",
-            Self::BackendZeroCopyRequiresNativeAttach => "BACKEND_ZERO_COPY_REQUIRES_NATIVE_ATTACH",
+            Self::BackendModeRequiresNativeAttach => "BACKEND_MODE_REQUIRES_NATIVE_ATTACH",
             Self::BackendRingNotPowerOfTwo => "BACKEND_RING_NOT_POWER_OF_TWO",
             Self::BackendRingOutOfRange => "BACKEND_RING_OUT_OF_RANGE",
             Self::BackendCompletionRingTooSmall => "BACKEND_COMPLETION_RING_TOO_SMALL",
@@ -546,12 +546,16 @@ pub const MAX_AF_XDP_UMEM_BYTES: u64 = 1 << 30;
 /// One validated AF_XDP socket: an interface queue with checked native
 /// bind flags, ring capacities, and UMEM geometry.
 ///
-/// The ring and UMEM values are the `ruster-io-xdp-native` profile types,
+/// The ring and UMEM values are the `ruster-io-xdp::native_profile` types (shared with `ruster-io-xdp-native`),
 /// built by that crate's own validators, so the configuration cannot accept
 /// a geometry the native backend would reject.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+///
+/// The port owns a copy of the bound device name, so two ports compare
+/// unequal when the interface keeps its IfId but moves to another device.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedAfXdpPortV1 {
     interface: IfId,
+    device: Box<str>,
     queue: u32,
     mode: AfXdpModeV1,
     bind_flags: ValidatedBindFlags,
@@ -561,11 +565,17 @@ pub struct ValidatedAfXdpPortV1 {
 }
 
 impl ValidatedAfXdpPortV1 {
-    /// The bound interface; its device is in
-    /// [`ValidatedConfigV1::interfaces`].
+    /// The bound interface.
     #[must_use]
     pub const fn interface(&self) -> IfId {
         self.interface
+    }
+
+    /// The bound device: the `device` of [`Self::interface`], already
+    /// restricted to the CONFIG-003 label charset.
+    #[must_use]
+    pub fn device(&self) -> &str {
+        &self.device
     }
 
     #[must_use]
@@ -1545,16 +1555,16 @@ fn validate_af_xdp_port(
     earlier: &[ValidatedAfXdpPortV1],
     base: &SourcePath,
 ) -> Result<ValidatedAfXdpPortV1, ValidationError> {
-    let interface = interfaces
+    let binding = interfaces
         .iter()
         .find(|binding| binding.name() == port.interface)
-        .map(InterfaceBindingV1::id)
         .ok_or_else(|| {
             ValidationError::new(
                 ValidationCode::UnknownInterface,
                 child_path(base, "interface"),
             )
         })?;
+    let interface = binding.id();
     let queue_path = child_path(base, "queue");
     if port.queue > MAX_AF_XDP_QUEUE_ID {
         return Err(ValidationError::bounded(
@@ -1573,9 +1583,9 @@ fn validate_af_xdp_port(
         };
         return Err(ValidationError::new(code, queue_path));
     }
-    if port.mode == AfXdpModeV1::ZeroCopy && port.xdp_attach == XdpAttachModeV1::Generic {
+    if port.mode != AfXdpModeV1::Copy && port.xdp_attach == XdpAttachModeV1::Generic {
         return Err(ValidationError::new(
-            ValidationCode::BackendZeroCopyRequiresNativeAttach,
+            ValidationCode::BackendModeRequiresNativeAttach,
             child_path(base, "mode"),
         ));
     }
@@ -1705,6 +1715,7 @@ fn validate_af_xdp_port(
     .map_err(native)?;
     Ok(ValidatedAfXdpPortV1 {
         interface,
+        device: binding.device().into(),
         queue: port.queue,
         mode: port.mode,
         bind_flags,

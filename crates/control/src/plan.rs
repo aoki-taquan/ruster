@@ -174,7 +174,9 @@ pub struct BackendChange {
     pub kind: Option<Delta<BackendKindV1>>,
     pub existing_xdp_program: Option<Delta<ExistingXdpProgramV1>>,
     /// AF_XDP ports keyed by interface IfId. The simulation backend has
-    /// none, so a `sim` to `af-xdp` change adds every port.
+    /// none, so a `sim` to `af-xdp` change adds every port. A port includes
+    /// its bound device, so moving an interface to another device (or
+    /// swapping two devices) is a port change, not just a label change.
     pub ports: Box<[Change<ValidatedAfXdpPortV1>]>,
 }
 
@@ -346,6 +348,13 @@ impl ApplyPlan {
     /// [`FlushCount::All`]. The caller is responsible for `current` being the
     /// document of the active generation and `successor` being built from
     /// `next`.
+    ///
+    /// A [`RestartRequired::Backend`] plan is never live-applicable even
+    /// though the publication would accept the successor (a candidate
+    /// carries no backend). Such a plan skips the live check: the dry run is
+    /// recorded as `Err(ApplyError::RestartRequired(Backend))` and the flush
+    /// stays [`FlushCount::All`], so no caller can mistake it for an
+    /// in-place reload.
     pub fn for_active<I: PublicationQuiescence>(
         active: &mut ActivePublication<'_, I>,
         current: &ValidatedConfigV1,
@@ -353,6 +362,10 @@ impl ApplyPlan {
         successor: &ValidatedCandidate,
     ) -> Result<Self, PlanError> {
         let mut plan = Self::between(current, next)?;
+        if plan.restart_required.contains(&RestartRequired::Backend) {
+            plan.dry_run = Some(Err(ApplyError::RestartRequired(RestartRequired::Backend)));
+            return Ok(plan);
+        }
         let check = active.check_successor(successor);
         if let Ok(check) = check {
             plan.flush = check.flush;
@@ -459,7 +472,7 @@ impl ApplyPlan {
 }
 
 /// Keyed diff, ordered by key. Validated configuration has unique keys.
-fn diff<T: Copy + Eq, K: Ord>(old: &[T], new: &[T], key: impl Fn(&T) -> K) -> Box<[Change<T>]> {
+fn diff<T: Clone + Eq, K: Ord>(old: &[T], new: &[T], key: impl Fn(&T) -> K) -> Box<[Change<T>]> {
     let sorted = |items: &[T]| {
         let mut items = items.to_vec();
         items.sort_by_key(|item| key(item));
@@ -476,12 +489,15 @@ fn diff<T: Copy + Eq, K: Ord>(old: &[T], new: &[T], key: impl Fn(&T) -> K) -> Bo
             (Some(a), Some(b)) => key(a).cmp(&key(b)),
         };
         match order {
-            Ordering::Less => changes.extend(old.next().map(|item| Change::Removed(*item))),
-            Ordering::Greater => changes.extend(new.next().map(|item| Change::Added(*item))),
+            Ordering::Less => changes.extend(old.next().cloned().map(Change::Removed)),
+            Ordering::Greater => changes.extend(new.next().cloned().map(Change::Added)),
             Ordering::Equal => {
-                if let (Some(&old), Some(&new)) = (old.next(), new.next()) {
+                if let (Some(old), Some(new)) = (old.next(), new.next()) {
                     if old != new {
-                        changes.push(Change::Changed(Delta { old, new }));
+                        changes.push(Change::Changed(Delta {
+                            old: old.clone(),
+                            new: new.clone(),
+                        }));
                     }
                 }
             }

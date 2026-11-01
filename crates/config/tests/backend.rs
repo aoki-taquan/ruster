@@ -9,9 +9,10 @@ use ruster_config::{
     MIN_AF_XDP_RING_ENTRIES, MIN_AF_XDP_VISIBLE_FRAME_BYTES,
 };
 use ruster_core::IfId;
-use ruster_io_xdp_native::{
-    abi::{XDP_COPY, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY},
-    BindMode, UmemConfig, SUPPORTED_ALIGNED_CHUNK_SIZES, XDP_PACKET_HEADROOM,
+// The same types `ruster-io-xdp-native` re-exports as its native profile.
+use ruster_io_xdp::native_profile::{
+    BindMode, UmemConfig, SUPPORTED_ALIGNED_CHUNK_SIZES, XDP_COPY, XDP_PACKET_HEADROOM,
+    XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY,
 };
 
 const LIMITS: ValidationLimits = ValidationLimits {
@@ -146,11 +147,10 @@ fn af_xdp_backend_validates_to_typed_native_profile() {
         assert_eq!(umem.visible_capacity(), 4096 - XDP_PACKET_HEADROOM);
     }
 
-    // Every mode/attach pair except zero-copy over generic, and the
+    // Every mode with native attach, copy with generic, and the
     // explicit spelling of every default.
     for (mode, attach, raw, bind) in [
         ("auto", "native", XDP_USE_NEED_WAKEUP, BindMode::Automatic),
-        ("auto", "generic", XDP_USE_NEED_WAKEUP, BindMode::Automatic),
         (
             "zero-copy",
             "native",
@@ -181,7 +181,7 @@ fn af_xdp_backend_validates_to_typed_native_profile() {
                 1,
             );
         let config = check(&text).unwrap();
-        let port = config.backend().af_xdp().unwrap().ports()[1];
+        let port = &config.backend().af_xdp().unwrap().ports()[1];
         assert_eq!(port.interface(), IfId(2));
         assert_eq!(port.bind_flags().raw(), raw, "{mode} {attach}");
         assert_eq!(port.bind_flags().mode(), bind);
@@ -266,6 +266,26 @@ fn backend_schema_is_exact_bounded_and_value_free() {
         base.replacen("completion = 2048 }", "completion = 2048, queue = 0 }", 1),
     ] {
         assert_eq!(syntax(&text).code(), DiagnosticCode::ForbiddenField);
+    }
+    // The exemption needs the complete source path: `queue` under an
+    // unknown key, at an alternate path, or spelled differently stays
+    // forbidden (not merely an unknown field).
+    for text in [
+        base.replacen(
+            "frame-size = 4096",
+            "frame-size = 4096\nnested = { queue = 1 }",
+            1,
+        ),
+        format!("{base}\n[[backend.x.ports]]\nqueue = 0\n"),
+        format!("{base}\n[[Backend.ports]]\nqueue = 0\n"),
+        format!("{base}\n[[backend.Ports]]\nqueue = 0\n"),
+        // A sub-table of the last port entry.
+        format!("{base}\n[backend.ports.extra]\nqueue = 0\n"),
+        base.replacen("queue = 0", "Queue = 0", 1),
+        base.replacen("queue = 0", "QUEUE = 0", 1),
+    ] {
+        let diagnostic = syntax(&text);
+        assert_eq!(diagnostic.code(), DiagnosticCode::ForbiddenField, "{text}");
     }
     for field in ["queues", "queue-id", "umem", "workers"] {
         let text = base.replacen("queue = 0", &format!("queue = 0\n{field} = 1"), 1);
@@ -353,7 +373,17 @@ fn backend_validation_rejects_every_rule_with_a_value_free_path() {
                 "xdp-attach = \"generic\"",
                 1,
             ),
-            ValidationCode::BackendZeroCopyRequiresNativeAttach,
+            ValidationCode::BackendModeRequiresNativeAttach,
+            "backend.ports[0].mode",
+            None,
+        ),
+        (
+            edited("mode = \"copy\"", "mode = \"auto\"").replacen(
+                "xdp-attach = \"native\"",
+                "xdp-attach = \"generic\"",
+                1,
+            ),
+            ValidationCode::BackendModeRequiresNativeAttach,
             "backend.ports[0].mode",
             None,
         ),
@@ -551,12 +581,14 @@ fn backend_limits_accept_exact_boundaries() {
             &format!("frame-size = 2048\nheadroom = {max_headroom}"),
         ),
         edited("queue = 0", &format!("queue = {MAX_AF_XDP_QUEUE_ID}")),
-        // A larger Completion ring than TX ring is fine.
+        // A larger Completion ring than TX ring is fine, and the Completion
+        // ring is not compared with the RX ring.
         edited("completion = 2048", "completion = 4096"),
+        edited("rx = 2048", "rx = 4096"),
         edited("frame-count = 4608", "frame-count = 65536"),
     ] {
         let config = check(&text).unwrap();
-        let port = config.backend().af_xdp().unwrap().ports()[1];
+        let port = &config.backend().af_xdp().unwrap().ports()[1];
         let umem = port.umem();
         assert!(umem.visible_capacity() >= MIN_AF_XDP_VISIBLE_FRAME_BYTES);
         let rings = port.rings();
@@ -583,7 +615,7 @@ fn backend_geometry_is_consistent_with_the_native_profile() {
             let native = UmemConfig::new(4608, frame_size, headroom, 4096, 512, 0);
             match check(&text) {
                 Ok(config) => {
-                    let port = config.backend().af_xdp().unwrap().ports()[1];
+                    let port = &config.backend().af_xdp().unwrap().ports()[1];
                     assert_eq!(Ok(port.umem()), native, "{frame_size} {headroom}");
                     assert!(port.umem().visible_capacity() >= MIN_AF_XDP_VISIBLE_FRAME_BYTES);
                 }
