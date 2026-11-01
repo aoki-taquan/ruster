@@ -133,8 +133,10 @@ staticまたはfresh dynamic neighborが無い場合はARPだけを開始し、�
 
 routerが自身で生成するICMPv4（Echo Reply、Time Exceeded、Destination Unreachable
 Network/Host）はすべてdefaultでRFC 1812どおり生成し、security上の理由でclassごとにoffに
-できます（RFC 1812 §1.1.3はdefaultが準拠するoptionを許す）。offのclassはbyte不変dropの
-reasonを変えず、ICMPを生成せず、rate limiterにも触れずに専用counterだけを加算します。
+できます（RFC 1812 §1.1.3はdefaultが準拠するoptionを許す）。offにしたerror class
+（Time Exceeded、Network/Host Unreachable）は元packetのbyte不変drop reasonを変えず、ICMPも
+reverse ARPも生成せず、rate limiterとclockにも触れずに専用counterだけを加算します。Echoをoffに
+すると、valid Echo Requestは新しいreason `ICMPV4_ECHO_DISABLED`でdropされます。
 
 ```toml
 [ipv4-origin]

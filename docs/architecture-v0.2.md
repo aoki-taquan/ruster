@@ -313,7 +313,9 @@ Network Unreachableがroute table probing、Host UnreachableがLAN host enumerat
 rate limit（RFC 1812 §4.3.2.8のSHOULD settable）は既存の`interval-ms`/`state-ttl-ms`で、switchは
 limiterを変更しません。disabled kindは`decide_icmpv4_error`先頭（および`schedule`と
 failure dispatch）で判定し、clock watermark、per-egress limiter state、reverse LPM、reverse ARPに
-触れずcounterだけを加算するため、他kindのrate limitを消費しません。switchは公開runtimeの
+触れずcounterだけを加算するため、他kindのrate limitを消費しません。Host Unreachableのfailure holdは
+switchに関係なくcaptureし（ARP miss時のfixed slotへのbounded copy）、ARPが実際に失敗した時点で
+retireして数えます。captureをskipするとARP成否が未定の時点で数えるか、数えられなくなるためです。switchは公開runtimeの
 `Copy` policyに入ったbit/boolの読み出しだけで、allocation、lock、packet cloneを伴いません。
 error switchの変更はinterval等と同じ`Icmpv4ErrorPolicy`の変更としてrestart-required
 （`RestartRequired::Icmpv4ErrorPolicy`）、Echo switchは`Ipv4OriginPolicy`の変更として通常reload

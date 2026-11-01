@@ -538,3 +538,126 @@ fn echo_reply_switch_drops_valid_requests_with_a_typed_reason() {
         "ICMPV4_ECHO_DISABLED"
     );
 }
+
+/// The early gate in the forwarding decision must precede the reverse
+/// neighbor lookup: with an unresolved reverse next-hop, a disabled kind must
+/// not start a reverse ARP or observe the clock.
+#[test]
+fn disabled_kind_never_starts_reverse_arp_or_moves_the_clock() {
+    for (disabled, frame, other) in [
+        (
+            Icmpv4ErrorKind::TimeExceededTtl,
+            udp_frame(ROUTED, 1),
+            udp_frame(MISSING, 64),
+        ),
+        (
+            Icmpv4ErrorKind::DestinationUnreachableNetwork,
+            udp_frame(MISSING, 64),
+            udp_frame(ROUTED, 1),
+        ),
+    ] {
+        let routes = routes();
+        let interfaces = interfaces();
+        let bindings = bindings();
+        // No neighbor for SOURCE: the reverse next-hop is unresolved.
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+        let mut rs = [ResolutionStateSlot::EMPTY; 2];
+        let mut ra = [ResolutionActionSlot::EMPTY; 2];
+        let mut resolution = ResolutionRuntime::new(
+            ResolutionPolicy::new(1_000, 60_000).unwrap(),
+            &mut rs,
+            &mut ra,
+        );
+        let mut es = [Icmpv4ErrorStateSlot::EMPTY; 2];
+        let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 2];
+        let mut errors = Icmpv4ErrorRuntime::new(policy_with(disabled, false), &mut es, &mut ea);
+        let mut io = SimIo::new();
+        io.inject(LAN, frame.clone());
+        let mut trace = VecTrace::default();
+        forward_batch_with_resolution_and_icmpv4_errors(
+            io.receive(1).unwrap(),
+            &snapshot,
+            &mut resolution,
+            &mut errors,
+            MonotonicMillis(10),
+            &mut trace,
+        );
+        assert_eq!(io.pop_recycled().unwrap().bytes, frame);
+        let dispositions: Vec<_> = trace
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                TraceEvent::Icmpv4TimeExceededDisposition { disposition, .. }
+                | TraceEvent::Icmpv4DestinationUnreachableDisposition { disposition, .. } => {
+                    Some(*disposition)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            dispositions,
+            [Icmpv4ErrorDisposition::GenerationDisabled { kind: disabled }],
+            "{disabled:?}"
+        );
+        assert!(!trace
+            .events()
+            .iter()
+            .any(|event| matches!(event, TraceEvent::NeighborResolution { .. })));
+        assert_eq!(resolution.pending_actions(), 0, "{disabled:?}");
+        assert!(execute_one_arp_request(
+            &mut io,
+            &mut resolution,
+            MonotonicMillis(10),
+            &mut NoGeneratedTrace,
+        )
+        .unwrap()
+        .is_none());
+        assert!(execute_one_icmpv4_error(
+            &mut io,
+            &mut errors,
+            MonotonicMillis(10),
+            &mut NoGeneratedIcmpv4Trace,
+        )
+        .unwrap()
+        .is_none());
+        assert!(io.pop_tx().is_none(), "{disabled:?}: nothing on the wire");
+        let counters = errors.counters();
+        assert_eq!(
+            (
+                counters.disabled_time_exceeded,
+                counters.disabled_destination_unreachable,
+                counters.reverse_neighbor_unresolved,
+                counters.clock_regressions,
+            ),
+            if disabled == Icmpv4ErrorKind::TimeExceededTtl {
+                (1, 0, 0, 0)
+            } else {
+                (0, 1, 0, 0)
+            }
+        );
+
+        // The disabled attempt observed no time: an enabled kind at an
+        // earlier instant is not a clock regression.
+        io.inject(LAN, other);
+        let mut trace = VecTrace::default();
+        forward_batch_with_resolution_and_icmpv4_errors(
+            io.receive(1).unwrap(),
+            &snapshot,
+            &mut resolution,
+            &mut errors,
+            MonotonicMillis(5),
+            &mut trace,
+        );
+        assert!(trace.events().iter().any(|event| matches!(
+            event,
+            TraceEvent::Icmpv4TimeExceededDisposition {
+                disposition: Icmpv4ErrorDisposition::ReverseNeighborUnresolved { .. },
+                ..
+            } | TraceEvent::Icmpv4DestinationUnreachableDisposition {
+                disposition: Icmpv4ErrorDisposition::ReverseNeighborUnresolved { .. },
+                ..
+            }
+        )));
+        assert_eq!(errors.counters().clock_regressions, 0);
+    }
+}
