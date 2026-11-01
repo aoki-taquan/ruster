@@ -16,8 +16,10 @@ use crate::{
     ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
 use hairpin::{decide_nat44_tcp_hairpin, decide_nat44_udp_hairpin, Nat44HairpinDestinationRewrite};
+use nat44_icmpv4_inside::{decide_nat44_icmpv4_inside_error, is_nat44_icmpv4_inside_candidate};
 
 mod hairpin;
+mod nat44_icmpv4_inside;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -173,6 +175,16 @@ pub enum DropReason {
     Nat44TcpHairpinFiltered = 148,
     Nat44Icmpv4QuotedRemoteLocal = 149,
     Nat44TcpInboundRemoteQuotaExceeded = 150,
+    /// An inside-originated ICMPv4 error is not addressed to the source of
+    /// the packet it quotes (RFC 5508 REQ-5).
+    Nat44Icmpv4OuterDestinationMismatch = 151,
+    /// An inside-originated ICMPv4 error comes from neither the quoted
+    /// internal destination nor the router's inside next hop toward it.
+    Nat44Icmpv4InsideSourceMismatch = 152,
+    /// An external Protocol or Port Unreachable (Type 3, Code 2 or 3) does
+    /// not come from the quoted destination host, the only node that
+    /// generates it.
+    Nat44Icmpv4EndHostSourceMismatch = 153,
 }
 
 use DropReason::*;
@@ -180,7 +192,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 150] = [
+    pub const ALL: [Self; 153] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -331,6 +343,9 @@ impl DropReason {
         Nat44TcpHairpinFiltered,
         Nat44Icmpv4QuotedRemoteLocal,
         Nat44TcpInboundRemoteQuotaExceeded,
+        Nat44Icmpv4OuterDestinationMismatch,
+        Nat44Icmpv4InsideSourceMismatch,
+        Nat44Icmpv4EndHostSourceMismatch,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -498,6 +513,9 @@ impl DropReason {
             Nat44TcpHairpinFiltered => "NAT44_TCP_HAIRPIN_FILTERED",
             Nat44Icmpv4QuotedRemoteLocal => "NAT44_ICMPV4_QUOTED_REMOTE_LOCAL",
             Nat44TcpInboundRemoteQuotaExceeded => "NAT44_TCP_INBOUND_REMOTE_QUOTA_EXCEEDED",
+            Nat44Icmpv4OuterDestinationMismatch => "NAT44_ICMPV4_OUTER_DESTINATION_MISMATCH",
+            Nat44Icmpv4InsideSourceMismatch => "NAT44_ICMPV4_INSIDE_SOURCE_MISMATCH",
+            Nat44Icmpv4EndHostSourceMismatch => "NAT44_ICMPV4_END_HOST_SOURCE_MISMATCH",
         }
     }
 }
@@ -996,7 +1014,25 @@ fn calculate_snapshot_authority(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Nat44Icmpv4Disposition {
+    /// An external-realm error translated toward the inside endpoint
+    /// `internal_address:internal_port` (RFC 5508 REQ-4).
     Translated {
+        quoted_protocol: u8,
+        internal_address: crate::Ipv4Address,
+        internal_port: u16,
+    },
+    /// A private-realm error about a packet the inside endpoint
+    /// `internal_address:internal_port` received, translated toward the
+    /// external realm with that endpoint's `public_port` (RFC 5508 REQ-5).
+    TranslatedFromInside {
+        quoted_protocol: u8,
+        internal_address: crate::Ipv4Address,
+        internal_port: u16,
+        public_port: u16,
+    },
+    /// A hairpinned error translated back to the hairpin sender
+    /// `internal_address:internal_port` (RFC 5508 REQ-7).
+    TranslatedHairpin {
         quoted_protocol: u8,
         internal_address: crate::Ipv4Address,
         internal_port: u16,
@@ -1240,6 +1276,11 @@ struct Nat44TcpRewriteDecision {
     hairpin_destination: Option<Nat44HairpinDestinationRewrite>,
 }
 
+/// In-place rewrite of a translated ICMPv4 error. The outer addresses are
+/// 8 bytes from `outer_source_offset`, the quoted addresses 8 bytes from
+/// `inner_source_offset`, and the quoted ports 4 bytes from
+/// `inner_port_offset`; unchanged fields are written back with their
+/// received value.
 #[derive(Clone, Copy)]
 struct Nat44Icmpv4RewriteDecision {
     egress: IfId,
@@ -1247,14 +1288,18 @@ struct Nat44Icmpv4RewriteDecision {
     destination_mac: [u8; 6],
     outer_ttl_offset: usize,
     outer_checksum_offset: usize,
-    outer_destination_offset: usize,
+    outer_source_offset: usize,
     inner_checksum_offset: usize,
     inner_source_offset: usize,
     inner_port_offset: usize,
     transport_checksum_offset: Option<usize>,
     icmp_checksum_offset: usize,
-    internal_address: [u8; 4],
-    internal_port: u16,
+    outer_source: [u8; 4],
+    outer_destination: [u8; 4],
+    inner_source: [u8; 4],
+    inner_destination: [u8; 4],
+    inner_source_port: u16,
+    inner_destination_port: u16,
     outer_checksum: u16,
     inner_checksum: u16,
     transport_checksum: Option<u16>,
@@ -2304,6 +2349,39 @@ fn decide_ipv4<T: TraceSink>(
         .as_ref()
         .map_or(MonotonicMillis(0), |(_, now)| *now);
     let combined_realm_mismatch = matches!((nat44_udp_config, nat44_tcp_config), (Some(udp), Some(tcp)) if !tcp.realm_matches_udp(*udp));
+    // Inside-realm errors (RFC 5508 REQ-5, REQ-7) before the external
+    // candidate, which would otherwise claim an inside error addressed to
+    // the public address as a wrong-ingress external error.
+    if is_nat44_icmpv4_inside_candidate(
+        frame,
+        ingress,
+        ipv4,
+        local,
+        selected_route,
+        nat44_udp_config,
+        nat44_tcp_config,
+    ) {
+        let related_firewall = firewall_config
+            .map(|config| require_firewall_runtime(snapshot, config, firewall))
+            .transpose()?;
+        return decide_nat44_icmpv4_inside_error(
+            frame,
+            snapshot,
+            ingress,
+            ipv4,
+            selected_route,
+            resolution,
+            nat44_udp_config,
+            nat44_udp,
+            nat44_tcp_config,
+            nat44_tcp,
+            nat_now,
+            combined_realm_mismatch,
+            related_firewall,
+            firewall_audit,
+            trace,
+        );
+    }
     if is_nat44_icmpv4_candidate(frame, ipv4, nat44_udp_config, nat44_tcp_config) {
         let related_firewall = firewall_config
             .map(|config| require_firewall_runtime(snapshot, config, firewall))
@@ -2792,42 +2870,91 @@ fn decide_ipv4<T: TraceSink>(
     Ok(PacketDecision::Ipv4(forwarding))
 }
 
+/// ICMPv4 error messages NAT44 translates (RFC 5508 REQ-10; RFC 792 and
+/// RFC 1812 §§4.3.2, 5.2.7 for the codes).
+///
+/// - Destination Unreachable (Type 3, REQ-10 a.1): codes 0–4, 6, 7, and
+///   9–15. Code 5 (Source Route Failed) is excluded because NAT44 translates
+///   only packets without IPv4 options, so no translated packet can carry a
+///   source route. Code 8 (Source Host Isolated) is obsolete (RFC 1812
+///   §5.2.7.1: routers SHOULD NOT generate it).
+/// - Time Exceeded (Type 11, REQ-10 a.2): code 0 only. Code 1 (Fragment
+///   Reassembly) needs a fragment, and NAT44 translates only atomic
+///   datagrams (the quote must be DF=1/MF=0/offset=0).
+/// - Parameter Problem (Type 12, REQ-10 b.5, MAY): codes 0–2. The pointer is
+///   an offset into the quoted packet, which translation never moves.
+///
+/// Source Quench (Type 4) is excluded (REQ-10 c.1 SHOULD NOT; deprecated by
+/// RFC 6633), and Redirect (Type 5, REQ-10 b.1 MAY) is excluded because a
+/// redirect is link-local advice that must never cross the NAT.
+pub(crate) const fn nat44_icmpv4_error_supported(icmp_type: u8, code: u8) -> bool {
+    match icmp_type {
+        3 => matches!(code, 0..=4 | 6 | 7 | 9..=15),
+        11 => code == 0,
+        12 => code <= 2,
+        _ => false,
+    }
+}
+
+/// Whether only the quoted destination host itself generates this error:
+/// Protocol Unreachable and Port Unreachable (RFC 1812 §5.2.7.1, RFC 792)
+/// report the absence of a transport or port at the destination host,
+/// never a condition on the path.
+///
+/// As a local policy ("unless explicitly overridden by local policy", RFC
+/// 5508 REQ-4 and REQ-5), NAT44 translates these only when the outer source
+/// is that host. Otherwise an off-path sender using its own, unspoofed
+/// address could sweep public ports and tear down inside UDP flows with a
+/// hard error.
+pub(crate) const fn nat44_icmpv4_error_end_host_only(icmp_type: u8, code: u8) -> bool {
+    icmp_type == 3 && matches!(code, 2 | 3)
+}
+
+/// Type, code, and quoted protocol of an ICMPv4 message, peeked within the
+/// outer IPv4 Total Length only (link padding is never a candidate byte).
+fn peek_nat44_icmpv4_error(
+    frame: &[u8],
+    ipv4: packet::ValidatedIpv4,
+) -> Option<(u8, u8, Option<u8>)> {
+    if ipv4.protocol != 1 {
+        return None;
+    }
+    let ipv4_end = ipv4.header_offset.checked_add(ipv4.total_len)?;
+    let icmp_offset = ipv4.header_offset.checked_add(ipv4.header_len)?;
+    let type_code_end = icmp_offset.checked_add(2)?;
+    if type_code_end > ipv4_end {
+        return None;
+    }
+    let type_code = frame.get(icmp_offset..type_code_end)?;
+    let quoted_protocol = icmp_offset
+        .checked_add(8 + 9)
+        .filter(|offset| *offset < ipv4_end)
+        .and_then(|offset| frame.get(offset))
+        .copied();
+    Some((type_code[0], type_code[1], quoted_protocol))
+}
+
 fn is_nat44_icmpv4_candidate(
     frame: &[u8],
     ipv4: packet::ValidatedIpv4,
     nat44_udp_config: Option<&Nat44UdpConfig>,
     nat44_tcp_config: Option<&Nat44TcpConfig>,
 ) -> bool {
-    if ipv4.protocol != 1 {
-        return false;
-    }
-    let Some(ipv4_end) = ipv4.header_offset.checked_add(ipv4.total_len) else {
+    let Some((icmp_type, code, quoted_protocol)) = peek_nat44_icmpv4_error(frame, ipv4) else {
         return false;
     };
-    let Some(icmp_offset) = ipv4.header_offset.checked_add(ipv4.header_len) else {
-        return false;
-    };
-    let Some(type_code_end) = icmp_offset.checked_add(2) else {
-        return false;
-    };
-    if type_code_end > ipv4_end || frame.get(icmp_offset..type_code_end) != Some([3, 4].as_slice())
-    {
+    if !nat44_icmpv4_error_supported(icmp_type, code) {
         return false;
     }
 
     let udp_enabled = nat44_udp_config.is_some_and(|config| {
-        config.policy().icmpv4_errors() == Nat44Icmpv4ErrorPolicy::ExternalOnly
+        config.policy().icmpv4_errors().translates_external()
             && ipv4.destination == config.public_address()
     });
     let tcp_enabled = nat44_tcp_config.is_some_and(|config| {
-        config.policy().icmpv4_errors() == Nat44Icmpv4ErrorPolicy::ExternalOnly
+        config.policy().icmpv4_errors().translates_external()
             && ipv4.destination == config.public_address()
     });
-    let quoted_protocol = icmp_offset
-        .checked_add(8 + 9)
-        .filter(|offset| *offset < ipv4_end)
-        .and_then(|offset| frame.get(offset))
-        .copied();
     match quoted_protocol {
         Some(17) => udp_enabled,
         Some(6) => tcp_enabled,
@@ -2837,11 +2964,13 @@ fn is_nat44_icmpv4_candidate(
 
 #[derive(Clone, Copy)]
 struct ParsedNat44Icmpv4Quote {
+    icmp_type: u8,
+    icmp_code: u8,
     protocol: u8,
-    public_address: crate::Ipv4Address,
-    public_port: u16,
-    remote_address: crate::Ipv4Address,
-    remote_port: u16,
+    source_address: crate::Ipv4Address,
+    source_port: u16,
+    destination_address: crate::Ipv4Address,
+    destination_port: u16,
     inner_checksum_offset: usize,
     inner_checksum: u16,
     inner_source_offset: usize,
@@ -2862,6 +2991,188 @@ fn quoted_remote_is_local(snapshot: &ForwardingSnapshot<'_>, remote: crate::Ipv4
         .any(|binding| binding.address == remote)
 }
 
+fn nat44_udp_icmpv4_lookup_reason(error: Nat44UdpPlanError) -> DropReason {
+    match error {
+        Nat44UdpPlanError::MappingMiss => Nat44UdpMappingMiss,
+        Nat44UdpPlanError::FilterDenied => Nat44UdpFilterDenied,
+        Nat44UdpPlanError::ClockRegression => Nat44UdpClockRegression,
+        Nat44UdpPlanError::MappingFull
+        | Nat44UdpPlanError::PeerFull
+        | Nat44UdpPlanError::PortExhausted
+        | Nat44UdpPlanError::GenerationExhausted
+        | Nat44UdpPlanError::StateRevisionExhausted => {
+            unreachable!("read-only ICMP lookup cannot exhaust state")
+        }
+        Nat44UdpPlanError::IndexCorrupt => Nat44UdpConfigMismatch,
+    }
+}
+
+fn nat44_tcp_icmpv4_lookup_reason(error: Nat44TcpPlanError) -> DropReason {
+    match error {
+        Nat44TcpPlanError::MappingMiss => Nat44TcpMappingMiss,
+        Nat44TcpPlanError::SessionMiss => Nat44TcpSessionMiss,
+        Nat44TcpPlanError::ClockRegression => Nat44TcpClockRegression,
+        Nat44TcpPlanError::InvalidInitialFlags
+        | Nat44TcpPlanError::MappingFull
+        | Nat44TcpPlanError::SessionFull
+        | Nat44TcpPlanError::PortExhausted
+        | Nat44TcpPlanError::InboundRemoteQuotaExceeded => {
+            unreachable!("read-only ICMP lookup cannot create state")
+        }
+        Nat44TcpPlanError::IndexCorrupt
+        | Nat44TcpPlanError::GenerationExhausted
+        | Nat44TcpPlanError::StateRevisionExhausted => Nat44TcpConfigMismatch,
+    }
+}
+
+/// Read-only firewall RELATED check of one quoted flow, with audit.
+///
+/// `either_direction` selects
+/// [`FirewallRuntime::inspect_related_icmpv4_either_direction`] (the quoted
+/// packet was received by the error's sender) instead of the direct-only
+/// [`FirewallRuntime::inspect_related_icmpv4`] (the quoted packet was sent
+/// by the inside host the error is delivered to).
+fn inspect_nat44_icmpv4_related<T: TraceSink>(
+    runtime: &FirewallRuntime<'_>,
+    firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
+    packet: FirewallPacket,
+    either_direction: bool,
+    ingress: IfId,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> Result<(), DropReason> {
+    let flow = FirewallRelatedIcmpv4Flow::new(
+        packet.ingress,
+        packet.egress,
+        packet.source,
+        packet.destination,
+        packet.protocol,
+        packet.source_port,
+        packet.destination_port,
+    );
+    let result = if either_direction {
+        runtime.inspect_related_icmpv4_either_direction(flow, now.0)
+    } else {
+        runtime.inspect_related_icmpv4(flow, now.0)
+    };
+    match result {
+        Ok(rule_id) => {
+            if let Some(audit) = firewall_audit.as_deref_mut() {
+                audit.record(
+                    packet,
+                    FirewallDisposition {
+                        verdict: FirewallVerdict::Allow,
+                        class: FirewallConnectionClass::Related,
+                        source: FirewallPolicySource::Rule(rule_id),
+                        matched_action: Some(FirewallAction::AllowStateful),
+                        failure: None,
+                    },
+                );
+            }
+            Ok(())
+        }
+        Err(FirewallRelatedIcmpv4Error::StateMiss) => {
+            if let Some(audit) = firewall_audit.as_deref_mut() {
+                audit.record(
+                    packet,
+                    FirewallDisposition {
+                        verdict: FirewallVerdict::Drop,
+                        class: FirewallConnectionClass::Related,
+                        source: FirewallPolicySource::Default,
+                        matched_action: None,
+                        failure: None,
+                    },
+                );
+            }
+            Err(trace_nat44_icmpv4_drop(
+                ingress,
+                FirewallRelatedIcmpv4StateMiss,
+                trace,
+            ))
+        }
+        Err(FirewallRelatedIcmpv4Error::ClockRegression) => Err(trace_nat44_icmpv4_drop(
+            ingress,
+            FirewallClockRegression,
+            trace,
+        )),
+    }
+}
+
+/// Static or fresh dynamic neighbor toward `target` on `egress`. A miss
+/// schedules ARP like an ordinary forwarded packet and reports
+/// `NeighborUnresolved`.
+fn resolve_nat44_icmpv4_next_hop<T: TraceSink>(
+    snapshot: &ForwardingSnapshot<'_>,
+    egress: IfId,
+    target: crate::Ipv4Address,
+    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    trace: &mut T,
+) -> Result<(Interface, crate::MacAddress), DropReason> {
+    let interface = *snapshot
+        .interfaces
+        .iter()
+        .find(|interface| interface.id == egress)
+        .ok_or(InterfaceMiss)?;
+    let destination_mac = if let Some(neighbor) = snapshot
+        .neighbors
+        .iter()
+        .find(|neighbor| neighbor.interface == egress && neighbor.target == target)
+    {
+        neighbor.mac
+    } else if let Some((runtime, resolution_now)) = resolution.as_mut() {
+        match runtime.lookup_dynamic(egress, target, *resolution_now) {
+            DynamicLookup::Hit(mac) => mac,
+            DynamicLookup::ClockRegression => {
+                trace.record(TraceEvent::NeighborResolution {
+                    egress,
+                    target,
+                    result: ResolutionResult::ClockRegression,
+                });
+                return Err(NeighborUnresolved);
+            }
+            DynamicLookup::Miss => {
+                if let Some(binding) = snapshot
+                    .local_ipv4
+                    .iter()
+                    .find(|binding| binding.interface == egress)
+                {
+                    let result = runtime.schedule(
+                        ArpRequestAction {
+                            egress,
+                            source_mac: interface.mac,
+                            source_ip: binding.address,
+                            target_ip: target,
+                        },
+                        *resolution_now,
+                        snapshot
+                            .local_ipv4
+                            .iter()
+                            .any(|binding| binding.address == target)
+                            || snapshot.routes.iter().any(|candidate| {
+                                candidate.egress() == egress
+                                    && (candidate.is_connected_directed_broadcast(target)
+                                        || candidate.is_connected_network_address(target))
+                            }),
+                    );
+                    trace.record(TraceEvent::NeighborResolution {
+                        egress,
+                        target,
+                        result,
+                    });
+                }
+                return Err(NeighborUnresolved);
+            }
+        }
+    } else {
+        return Err(NeighborUnresolved);
+    };
+    trace.record(TraceEvent::Routed {
+        egress,
+        neighbor_target: target,
+    });
+    Ok((interface, destination_mac))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
     frame: &[u8],
@@ -2879,7 +3190,7 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
     firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    let quote = parse_nat44_icmpv4_frag_needed(frame, outer)
+    let quote = parse_nat44_icmpv4_error(frame, outer)
         .map_err(|reason| trace_nat44_icmpv4_drop(ingress, reason, trace))?;
     if !icmp_error_source_is_host(snapshot, outer.source)
         || snapshot
@@ -2889,22 +3200,27 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
     {
         return nat44_icmpv4_drop(ingress, Nat44Icmpv4SourceForbidden, trace);
     }
+    if nat44_icmpv4_error_end_host_only(quote.icmp_type, quote.icmp_code)
+        && outer.source != quote.destination_address
+    {
+        return nat44_icmpv4_drop(ingress, Nat44Icmpv4EndHostSourceMismatch, trace);
+    }
 
-    let (inside, internal_address, internal_port) = match quote.protocol {
+    let (inside, outside, internal_address, internal_port) = match quote.protocol {
         17 => {
             let Some(config) = nat44_udp_config else {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedProtocolUnsupported, trace);
             };
-            if config.policy().icmpv4_errors() != Nat44Icmpv4ErrorPolicy::ExternalOnly
+            if !config.policy().icmpv4_errors().translates_external()
                 || outer.destination != config.public_address()
-                || quote.public_address != config.public_address()
+                || quote.source_address != config.public_address()
             {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedPublicSourceMismatch, trace);
             }
             // A quoted remote naming a router address can only match state
             // the hairpin outbound half created (remote = the public
             // address). An outside error must never reach it.
-            if quoted_remote_is_local(snapshot, quote.remote_address) {
+            if quoted_remote_is_local(snapshot, quote.destination_address) {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedRemoteLocal, trace);
             }
             if combined_realm_mismatch {
@@ -2929,29 +3245,17 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
             }
             let lookup = runtime
                 .inspect_icmpv4(
-                    quote.public_port,
-                    quote.remote_address,
-                    quote.remote_port,
+                    quote.source_port,
+                    quote.destination_address,
+                    quote.destination_port,
                     now.0,
                 )
                 .map_err(|error| {
-                    let reason = match error {
-                        Nat44UdpPlanError::MappingMiss => Nat44UdpMappingMiss,
-                        Nat44UdpPlanError::FilterDenied => Nat44UdpFilterDenied,
-                        Nat44UdpPlanError::ClockRegression => Nat44UdpClockRegression,
-                        Nat44UdpPlanError::MappingFull
-                        | Nat44UdpPlanError::PeerFull
-                        | Nat44UdpPlanError::PortExhausted
-                        | Nat44UdpPlanError::GenerationExhausted
-                        | Nat44UdpPlanError::StateRevisionExhausted => {
-                            unreachable!("read-only ICMP lookup cannot exhaust state")
-                        }
-                        Nat44UdpPlanError::IndexCorrupt => Nat44UdpConfigMismatch,
-                    };
-                    trace_nat44_icmpv4_drop(ingress, reason, trace)
+                    trace_nat44_icmpv4_drop(ingress, nat44_udp_icmpv4_lookup_reason(error), trace)
                 })?;
             (
                 config.inside(),
+                config.outside(),
                 lookup.internal_address(),
                 lookup.internal_port(),
             )
@@ -2960,16 +3264,16 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
             let Some(config) = nat44_tcp_config else {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedProtocolUnsupported, trace);
             };
-            if config.policy().icmpv4_errors() != Nat44Icmpv4ErrorPolicy::ExternalOnly
+            if !config.policy().icmpv4_errors().translates_external()
                 || outer.destination != config.public_address()
-                || quote.public_address != config.public_address()
+                || quote.source_address != config.public_address()
             {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedPublicSourceMismatch, trace);
             }
             // A quoted remote naming a router address can only match state
             // the hairpin outbound half created (remote = the public
             // address). An outside error must never reach it.
-            if quoted_remote_is_local(snapshot, quote.remote_address) {
+            if quoted_remote_is_local(snapshot, quote.destination_address) {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedRemoteLocal, trace);
             }
             if combined_realm_mismatch {
@@ -2994,31 +3298,17 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
             }
             let lookup = runtime
                 .inspect_icmpv4(
-                    quote.public_port,
-                    quote.remote_address,
-                    quote.remote_port,
+                    quote.source_port,
+                    quote.destination_address,
+                    quote.destination_port,
                     now.0,
                 )
                 .map_err(|error| {
-                    let reason = match error {
-                        Nat44TcpPlanError::MappingMiss => Nat44TcpMappingMiss,
-                        Nat44TcpPlanError::SessionMiss => Nat44TcpSessionMiss,
-                        Nat44TcpPlanError::ClockRegression => Nat44TcpClockRegression,
-                        Nat44TcpPlanError::InvalidInitialFlags
-                        | Nat44TcpPlanError::MappingFull
-                        | Nat44TcpPlanError::SessionFull
-                        | Nat44TcpPlanError::PortExhausted
-                        | Nat44TcpPlanError::InboundRemoteQuotaExceeded => {
-                            unreachable!("read-only ICMP lookup cannot create state")
-                        }
-                        Nat44TcpPlanError::IndexCorrupt
-                        | Nat44TcpPlanError::GenerationExhausted
-                        | Nat44TcpPlanError::StateRevisionExhausted => Nat44TcpConfigMismatch,
-                    };
-                    trace_nat44_icmpv4_drop(ingress, reason, trace)
+                    trace_nat44_icmpv4_drop(ingress, nat44_tcp_icmpv4_lookup_reason(error), trace)
                 })?;
             (
                 config.inside(),
+                config.outside(),
                 lookup.internal_address(),
                 lookup.internal_port(),
             )
@@ -3033,147 +3323,50 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
             .expect("the NAT ICMPv4 parser accepts only UDP and TCP quotes");
         let packet = FirewallPacket {
             ingress: inside,
-            egress: match quote.protocol {
-                17 => nat44_udp_config
-                    .expect("UDP quote was accepted only with UDP configuration")
-                    .outside(),
-                6 => nat44_tcp_config
-                    .expect("TCP quote was accepted only with TCP configuration")
-                    .outside(),
-                _ => unreachable!("the NAT ICMPv4 parser accepts only UDP and TCP quotes"),
-            },
+            egress: outside,
             source: internal_address,
-            destination: quote.remote_address,
+            destination: quote.destination_address,
             protocol,
             source_port: internal_port,
-            destination_port: quote.remote_port,
+            destination_port: quote.destination_port,
             tcp_flags: 0,
         };
-        let flow = FirewallRelatedIcmpv4Flow::new(
-            packet.ingress,
-            packet.egress,
-            packet.source,
-            packet.destination,
-            packet.protocol,
-            packet.source_port,
-            packet.destination_port,
-        );
-        match runtime.inspect_related_icmpv4(flow, now.0) {
-            Ok(rule_id) => {
-                if let Some(audit) = firewall_audit.as_deref_mut() {
-                    audit.record(
-                        packet,
-                        FirewallDisposition {
-                            verdict: FirewallVerdict::Allow,
-                            class: FirewallConnectionClass::Related,
-                            source: FirewallPolicySource::Rule(rule_id),
-                            matched_action: Some(FirewallAction::AllowStateful),
-                            failure: None,
-                        },
-                    );
-                }
-            }
-            Err(FirewallRelatedIcmpv4Error::StateMiss) => {
-                if let Some(audit) = firewall_audit.as_deref_mut() {
-                    audit.record(
-                        packet,
-                        FirewallDisposition {
-                            verdict: FirewallVerdict::Drop,
-                            class: FirewallConnectionClass::Related,
-                            source: FirewallPolicySource::Default,
-                            matched_action: None,
-                            failure: None,
-                        },
-                    );
-                }
-                return nat44_icmpv4_drop(ingress, FirewallRelatedIcmpv4StateMiss, trace);
-            }
-            Err(FirewallRelatedIcmpv4Error::ClockRegression) => {
-                return nat44_icmpv4_drop(ingress, FirewallClockRegression, trace);
-            }
-        }
+        inspect_nat44_icmpv4_related(runtime, firewall_audit, packet, false, ingress, now, trace)?;
     }
 
     let route = route::lookup(snapshot.routes, internal_address).ok_or(RouteMiss)?;
     if route.egress() != inside {
         return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongEgress, trace);
     }
-    let interface = snapshot
-        .interfaces
-        .iter()
-        .find(|interface| interface.id == inside)
-        .ok_or(InterfaceMiss)?;
     let target = route.next_hop().unwrap_or(internal_address);
-    let destination_mac = if let Some(neighbor) = snapshot
-        .neighbors
-        .iter()
-        .find(|neighbor| neighbor.interface == inside && neighbor.target == target)
-    {
-        neighbor.mac
-    } else if let Some((runtime, resolution_now)) = resolution.as_mut() {
-        match runtime.lookup_dynamic(inside, target, *resolution_now) {
-            DynamicLookup::Hit(mac) => mac,
-            DynamicLookup::ClockRegression => {
-                trace.record(TraceEvent::NeighborResolution {
-                    egress: inside,
-                    target,
-                    result: ResolutionResult::ClockRegression,
-                });
-                return Err(NeighborUnresolved);
-            }
-            DynamicLookup::Miss => {
-                if let Some(binding) = snapshot
-                    .local_ipv4
-                    .iter()
-                    .find(|binding| binding.interface == inside)
-                {
-                    let result = runtime.schedule(
-                        ArpRequestAction {
-                            egress: inside,
-                            source_mac: interface.mac,
-                            source_ip: binding.address,
-                            target_ip: target,
-                        },
-                        *resolution_now,
-                        snapshot
-                            .local_ipv4
-                            .iter()
-                            .any(|binding| binding.address == target)
-                            || snapshot.routes.iter().any(|candidate| {
-                                candidate.egress() == inside
-                                    && (candidate.is_connected_directed_broadcast(target)
-                                        || candidate.is_connected_network_address(target))
-                            }),
-                    );
-                    trace.record(TraceEvent::NeighborResolution {
-                        egress: inside,
-                        target,
-                        result,
-                    });
-                }
-                return Err(NeighborUnresolved);
-            }
-        }
-    } else {
-        return Err(NeighborUnresolved);
-    };
-
-    trace.record(TraceEvent::Routed {
-        egress: inside,
-        neighbor_target: target,
-    });
-    build_nat44_icmpv4_rewrite(
+    let (interface, destination_mac) =
+        resolve_nat44_icmpv4_next_hop(snapshot, inside, target, resolution, trace)?;
+    Ok(build_nat44_icmpv4_rewrite(
         outer,
         quote,
         inside,
         interface.mac.0,
         destination_mac.0,
-        internal_address,
-        internal_port,
-    )
+        Nat44Icmpv4Rewrite {
+            outer_source: None,
+            outer_destination: Some(internal_address),
+            quoted_source: Some((internal_address, internal_port)),
+            quoted_destination: None,
+        },
+        Nat44Icmpv4Disposition::Translated {
+            quoted_protocol: quote.protocol,
+            internal_address,
+            internal_port,
+        },
+    ))
 }
 
-fn parse_nat44_icmpv4_frag_needed(
+/// Parses and validates a candidate ICMPv4 error and its quote (RFC 5508
+/// REQ-3): outer IHL 5, nonfragment, TTL > 1, valid ICMP checksum; a quoted
+/// IPv4 header with a valid checksum (options skipped by IHL), reserved flag
+/// masked, DF=1/MF=0/offset=0, UDP or TCP, and the first 8 transport bytes.
+/// The embedded transport checksum is located but not validated.
+fn parse_nat44_icmpv4_error(
     frame: &[u8],
     outer: packet::ValidatedIpv4,
 ) -> Result<ParsedNat44Icmpv4Quote, DropReason> {
@@ -3235,12 +3428,12 @@ fn parse_nat44_icmpv4_frag_needed(
     if !matches!(protocol, 6 | 17) {
         return Err(Nat44Icmpv4QuotedProtocolUnsupported);
     }
-    let public_address = crate::Ipv4Address::from_octets(
+    let source_address = crate::Ipv4Address::from_octets(
         inner_header[12..16]
             .try_into()
             .expect("validated IPv4 header contains the source address"),
     );
-    let remote_address = crate::Ipv4Address::from_octets(
+    let destination_address = crate::Ipv4Address::from_octets(
         inner_header[16..20]
             .try_into()
             .expect("validated IPv4 header contains the destination address"),
@@ -3251,8 +3444,8 @@ fn parse_nat44_icmpv4_frag_needed(
     if transport_available < 8 {
         return Err(Nat44Icmpv4QuoteTruncated);
     }
-    let public_port = packet::read_u16(frame, transport_offset).ok_or(Nat44Icmpv4QuoteTruncated)?;
-    let remote_port =
+    let source_port = packet::read_u16(frame, transport_offset).ok_or(Nat44Icmpv4QuoteTruncated)?;
+    let destination_port =
         packet::read_u16(frame, transport_offset + 2).ok_or(Nat44Icmpv4QuoteTruncated)?;
     let (transport_checksum_offset, transport_checksum) = if protocol == 17 {
         (
@@ -3273,11 +3466,13 @@ fn parse_nat44_icmpv4_frag_needed(
         (None, None)
     };
     Ok(ParsedNat44Icmpv4Quote {
+        icmp_type: icmp[0],
+        icmp_code: icmp[1],
         protocol,
-        public_address,
-        public_port,
-        remote_address,
-        remote_port,
+        source_address,
+        source_port,
+        destination_address,
+        destination_port,
         inner_checksum_offset: quote_offset + 10,
         inner_checksum: packet::read_u16(frame, quote_offset + 10)
             .ok_or(Nat44Icmpv4QuotedHeaderTruncated)?,
@@ -3291,41 +3486,86 @@ fn parse_nat44_icmpv4_frag_needed(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Address/port replacements of one ICMPv4 error translation; `None` keeps
+/// the received value.
+#[derive(Clone, Copy)]
+struct Nat44Icmpv4Rewrite {
+    outer_source: Option<crate::Ipv4Address>,
+    outer_destination: Option<crate::Ipv4Address>,
+    quoted_source: Option<(crate::Ipv4Address, u16)>,
+    quoted_destination: Option<(crate::Ipv4Address, u16)>,
+}
+
+fn address_words(address: crate::Ipv4Address) -> [u16; 2] {
+    let octets = address.octets();
+    [
+        u16::from_be_bytes([octets[0], octets[1]]),
+        u16::from_be_bytes([octets[2], octets[3]]),
+    ]
+}
+
+/// RFC 1624 update of `checksum` for one replaced IPv4 address.
+fn rfc1624_update_address(checksum: u16, old: crate::Ipv4Address, new: crate::Ipv4Address) -> u16 {
+    let [old_high, old_low] = address_words(old);
+    let [new_high, new_low] = address_words(new);
+    rfc1624_update(
+        rfc1624_update(checksum, old_high, new_high),
+        old_low,
+        new_low,
+    )
+}
+
+/// Builds the in-place rewrite of a validated ICMPv4 error: Ethernet, outer
+/// TTL decrement and addresses, quoted addresses and ports, and the outer
+/// IPv4, quoted IPv4, quoted transport (within the quoted Total Length only,
+/// UDP zero preserved), and ICMP checksums, all by RFC 1624 incremental
+/// update. The work is a fixed number of word updates (NAT44-019C).
 fn build_nat44_icmpv4_rewrite(
     outer: packet::ValidatedIpv4,
     quote: ParsedNat44Icmpv4Quote,
     egress: IfId,
     source_mac: [u8; 6],
     destination_mac: [u8; 6],
-    internal_address: crate::Ipv4Address,
-    internal_port: u16,
-) -> Result<PacketDecision, DropReason> {
-    let old_octets = quote.public_address.octets();
-    let new_octets = internal_address.octets();
-    let old_high = u16::from_be_bytes([old_octets[0], old_octets[1]]);
-    let old_low = u16::from_be_bytes([old_octets[2], old_octets[3]]);
-    let new_high = u16::from_be_bytes([new_octets[0], new_octets[1]]);
-    let new_low = u16::from_be_bytes([new_octets[2], new_octets[3]]);
+    rewrite: Nat44Icmpv4Rewrite,
+    disposition: Nat44Icmpv4Disposition,
+) -> PacketDecision {
+    let outer_source = rewrite.outer_source.unwrap_or(outer.source);
+    let outer_destination = rewrite.outer_destination.unwrap_or(outer.destination);
+    let (quoted_source, quoted_source_port) = rewrite
+        .quoted_source
+        .unwrap_or((quote.source_address, quote.source_port));
+    let (quoted_destination, quoted_destination_port) = rewrite
+        .quoted_destination
+        .unwrap_or((quote.destination_address, quote.destination_port));
+    let source_changed = rewrite.quoted_source.is_some();
+    let destination_changed = rewrite.quoted_destination.is_some();
 
-    let inner_checksum = rfc1624_update(
-        rfc1624_update(quote.inner_checksum, old_high, new_high),
-        old_low,
-        new_low,
-    );
+    let mut inner_checksum = quote.inner_checksum;
+    if source_changed {
+        inner_checksum =
+            rfc1624_update_address(inner_checksum, quote.source_address, quoted_source);
+    }
+    if destination_changed {
+        inner_checksum = rfc1624_update_address(
+            inner_checksum,
+            quote.destination_address,
+            quoted_destination,
+        );
+    }
     let transport_checksum = quote.transport_checksum.map(|checksum| {
         if quote.protocol == 17 && checksum == 0 {
             return 0;
         }
-        let updated = rfc1624_update(
-            rfc1624_update(
-                rfc1624_update(checksum, old_high, new_high),
-                old_low,
-                new_low,
-            ),
-            quote.public_port,
-            internal_port,
-        );
+        let mut updated = checksum;
+        if source_changed {
+            updated = rfc1624_update_address(updated, quote.source_address, quoted_source);
+            updated = rfc1624_update(updated, quote.source_port, quoted_source_port);
+        }
+        if destination_changed {
+            updated =
+                rfc1624_update_address(updated, quote.destination_address, quoted_destination);
+            updated = rfc1624_update(updated, quote.destination_port, quoted_destination_port);
+        }
         if quote.protocol == 17 && updated == 0 {
             0xffff
         } else {
@@ -3334,55 +3574,59 @@ fn build_nat44_icmpv4_rewrite(
     });
     let mut icmp_checksum =
         rfc1624_update(quote.icmp_checksum, quote.inner_checksum, inner_checksum);
-    icmp_checksum = rfc1624_update(icmp_checksum, old_high, new_high);
-    icmp_checksum = rfc1624_update(icmp_checksum, old_low, new_low);
-    icmp_checksum = rfc1624_update(icmp_checksum, quote.public_port, internal_port);
+    if source_changed {
+        icmp_checksum = rfc1624_update_address(icmp_checksum, quote.source_address, quoted_source);
+        icmp_checksum = rfc1624_update(icmp_checksum, quote.source_port, quoted_source_port);
+    }
+    if destination_changed {
+        icmp_checksum =
+            rfc1624_update_address(icmp_checksum, quote.destination_address, quoted_destination);
+        icmp_checksum = rfc1624_update(
+            icmp_checksum,
+            quote.destination_port,
+            quoted_destination_port,
+        );
+    }
     if let (Some(old), Some(new)) = (quote.transport_checksum, transport_checksum) {
         icmp_checksum = rfc1624_update(icmp_checksum, old, new);
     }
 
-    let outer_destination_offset = outer.header_offset + 16;
-    let outer_destination = outer.destination.octets();
-    let outer_old_high = u16::from_be_bytes([outer_destination[0], outer_destination[1]]);
-    let outer_old_low = u16::from_be_bytes([outer_destination[2], outer_destination[3]]);
-    let outer_checksum = rfc1624_update(
-        rfc1624_update(
-            rfc1624_update(
-                outer.checksum,
-                u16::from_be_bytes([outer.ttl, outer.protocol]),
-                u16::from_be_bytes([outer.ttl - 1, outer.protocol]),
-            ),
-            outer_old_high,
-            new_high,
-        ),
-        outer_old_low,
-        new_low,
+    let mut outer_checksum = rfc1624_update(
+        outer.checksum,
+        u16::from_be_bytes([outer.ttl, outer.protocol]),
+        u16::from_be_bytes([outer.ttl - 1, outer.protocol]),
     );
-    let disposition = Nat44Icmpv4Disposition::Translated {
-        quoted_protocol: quote.protocol,
-        internal_address,
-        internal_port,
-    };
-    Ok(PacketDecision::Nat44Icmpv4(Nat44Icmpv4RewriteDecision {
+    if rewrite.outer_source.is_some() {
+        outer_checksum = rfc1624_update_address(outer_checksum, outer.source, outer_source);
+    }
+    if rewrite.outer_destination.is_some() {
+        outer_checksum =
+            rfc1624_update_address(outer_checksum, outer.destination, outer_destination);
+    }
+    PacketDecision::Nat44Icmpv4(Nat44Icmpv4RewriteDecision {
         egress,
         source_mac,
         destination_mac,
         outer_ttl_offset: outer.header_offset + 8,
         outer_checksum_offset: outer.header_offset + 10,
-        outer_destination_offset,
+        outer_source_offset: outer.header_offset + 12,
         inner_checksum_offset: quote.inner_checksum_offset,
         inner_source_offset: quote.inner_source_offset,
         inner_port_offset: quote.inner_port_offset,
         transport_checksum_offset: quote.transport_checksum_offset,
         icmp_checksum_offset: quote.icmp_checksum_offset,
-        internal_address: new_octets,
-        internal_port,
+        outer_source: outer_source.octets(),
+        outer_destination: outer_destination.octets(),
+        inner_source: quoted_source.octets(),
+        inner_destination: quoted_destination.octets(),
+        inner_source_port: quoted_source_port,
+        inner_destination_port: quoted_destination_port,
         outer_checksum,
         inner_checksum,
         transport_checksum,
         icmp_checksum,
         disposition,
-    }))
+    })
 }
 
 fn trace_nat44_icmpv4_drop<T: TraceSink>(
@@ -5355,10 +5599,10 @@ fn apply_nat44_icmpv4_rewrite(
 ) -> Result<(), DropReason> {
     let required = [
         (decision.outer_checksum_offset, 2),
-        (decision.outer_destination_offset, 4),
+        (decision.outer_source_offset, 8),
         (decision.inner_checksum_offset, 2),
-        (decision.inner_source_offset, 4),
-        (decision.inner_port_offset, 2),
+        (decision.inner_source_offset, 8),
+        (decision.inner_port_offset, 4),
         (decision.icmp_checksum_offset, 2),
     ];
     if frame.get(0..12).is_none()
@@ -5377,14 +5621,17 @@ fn apply_nat44_icmpv4_rewrite(
     frame[decision.outer_ttl_offset] -= 1;
     frame[decision.outer_checksum_offset..decision.outer_checksum_offset + 2]
         .copy_from_slice(&decision.outer_checksum.to_be_bytes());
-    frame[decision.outer_destination_offset..decision.outer_destination_offset + 4]
-        .copy_from_slice(&decision.internal_address);
+    let outer = decision.outer_source_offset;
+    frame[outer..outer + 4].copy_from_slice(&decision.outer_source);
+    frame[outer + 4..outer + 8].copy_from_slice(&decision.outer_destination);
     frame[decision.inner_checksum_offset..decision.inner_checksum_offset + 2]
         .copy_from_slice(&decision.inner_checksum.to_be_bytes());
-    frame[decision.inner_source_offset..decision.inner_source_offset + 4]
-        .copy_from_slice(&decision.internal_address);
-    frame[decision.inner_port_offset..decision.inner_port_offset + 2]
-        .copy_from_slice(&decision.internal_port.to_be_bytes());
+    let inner = decision.inner_source_offset;
+    frame[inner..inner + 4].copy_from_slice(&decision.inner_source);
+    frame[inner + 4..inner + 8].copy_from_slice(&decision.inner_destination);
+    let ports = decision.inner_port_offset;
+    frame[ports..ports + 2].copy_from_slice(&decision.inner_source_port.to_be_bytes());
+    frame[ports + 2..ports + 4].copy_from_slice(&decision.inner_destination_port.to_be_bytes());
     if let (Some(offset), Some(checksum)) = (
         decision.transport_checksum_offset,
         decision.transport_checksum,
@@ -6356,6 +6603,9 @@ mod tests {
             (148, "NAT44_TCP_HAIRPIN_FILTERED"),
             (149, "NAT44_ICMPV4_QUOTED_REMOTE_LOCAL"),
             (150, "NAT44_TCP_INBOUND_REMOTE_QUOTA_EXCEEDED"),
+            (151, "NAT44_ICMPV4_OUTER_DESTINATION_MISMATCH"),
+            (152, "NAT44_ICMPV4_INSIDE_SOURCE_MISMATCH"),
+            (153, "NAT44_ICMPV4_END_HOST_SOURCE_MISMATCH"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -6365,7 +6615,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(151), None);
+        assert_eq!(DropReason::from_code(154), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

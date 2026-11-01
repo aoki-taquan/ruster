@@ -956,13 +956,13 @@ fn hairpinned_icmp_error(code: u8, quoted_source_port: u16) -> Vec<u8> {
     frame
 }
 
-/// RFC 5508 REQ-7 (hairpinned ICMP error traversal) is deferred: an ICMP
-/// error an inside host sends to the public address about a hairpinned
-/// datagram is not translated. It fails closed like any other
-/// non-UDP/TCP inside-to-outside crossing, with no state change, whatever
-/// the quoted tuple.
+/// With ICMPv4 error translation set to `disabled` (an explicit security
+/// option; the default `bidirectional` translates them, RFC 5508 REQ-7, see
+/// `nat44_icmpv4_errors.rs`), an ICMP error an inside host sends to the
+/// public address about a hairpinned datagram fails closed like any other
+/// non-UDP/TCP inside-to-outside crossing, with no state change.
 #[test]
-fn hairpinned_icmp_errors_are_not_translated_and_fail_closed() {
+fn hairpinned_icmp_errors_fail_closed_when_translation_is_disabled() {
     for rules in [None, Some(outbound_only_rules())] {
         let firewall = rules.is_some();
         let mut world = World::new(Nat44Filtering::EndpointIndependent, true, rules);

@@ -606,6 +606,72 @@ fn nat44_filtering_defaults_to_address_dependent_and_is_exact() {
 }
 
 #[test]
+fn nat44_icmpv4_errors_defaults_to_bidirectional_and_is_exact() {
+    use ruster_config::Nat44Icmpv4ErrorsV1;
+
+    // Absent key: the RFC 5508 REQ-4/REQ-5/REQ-7 behavior, per protocol.
+    let source = VALID_V1
+        .replacen("icmpv4-errors = \"external-only\"\n", "", 1)
+        .replacen("icmpv4-errors = \"disabled\"\n", "", 1);
+    let VersionedConfig::V1(config) = parse(source.as_bytes()).unwrap() else {
+        panic!("schema version 1");
+    };
+    let nat = config.nat44.unwrap();
+    assert_eq!(
+        nat.udp.unwrap().icmpv4_errors,
+        Nat44Icmpv4ErrorsV1::Bidirectional
+    );
+    assert_eq!(
+        nat.tcp.unwrap().icmpv4_errors,
+        Nat44Icmpv4ErrorsV1::Bidirectional
+    );
+    assert_eq!(
+        Nat44Icmpv4ErrorsV1::default(),
+        Nat44Icmpv4ErrorsV1::Bidirectional
+    );
+
+    for (spelling, expected) in [
+        ("disabled", Nat44Icmpv4ErrorsV1::Disabled),
+        ("external-only", Nat44Icmpv4ErrorsV1::ExternalOnly),
+        ("bidirectional", Nat44Icmpv4ErrorsV1::Bidirectional),
+    ] {
+        let source = VALID_V1.replacen(
+            "icmpv4-errors = \"disabled\"\n",
+            &format!("icmpv4-errors = \"{spelling}\"\n"),
+            1,
+        );
+        let VersionedConfig::V1(config) = parse(source.as_bytes()).unwrap() else {
+            panic!("schema version 1");
+        };
+        assert_eq!(config.nat44.unwrap().tcp.unwrap().icmpv4_errors, expected);
+    }
+
+    // Unknown spellings and wrong types are rejected without echoing them.
+    for value in ["\"internal-only\"", "\"Bidirectional\"", "true", "1"] {
+        let diagnostic = parse(
+            VALID_V1
+                .replacen(
+                    "icmpv4-errors = \"disabled\"\n",
+                    &format!("icmpv4-errors = {value}\n"),
+                    1,
+                )
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            diagnostic.path().segments(),
+            &[
+                PathSegment::Field("nat44".to_owned()),
+                PathSegment::Field("tcp".to_owned()),
+                PathSegment::Field("icmpv4-errors".to_owned()),
+            ],
+            "{value}"
+        );
+        assert!(!format!("{diagnostic:?}").contains("internal-only"));
+    }
+}
+
+#[test]
 fn nat44_hairpinning_defaults_to_enabled_and_is_exact() {
     let VersionedConfig::V1(config) = parse(VALID_V1.as_bytes()).unwrap() else {
         panic!("schema version 1");

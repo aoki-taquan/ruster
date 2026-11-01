@@ -844,6 +844,66 @@ fn nat44_filtering_maps_onto_core_policies_per_protocol() {
 }
 
 #[test]
+fn nat44_icmpv4_errors_map_onto_core_policies_per_protocol() {
+    use ruster_core::{Nat44Icmpv4ErrorPolicy, Nat44TcpPolicy, Nat44UdpPolicy};
+
+    // VALID spells both protocols out: UDP external-only, TCP disabled.
+    let explicit = validated(VALID);
+    let nat = explicit.nat44().unwrap();
+    assert_eq!(
+        nat.udp().unwrap().policy().icmpv4_errors(),
+        Nat44Icmpv4ErrorPolicy::ExternalOnly
+    );
+    assert_eq!(
+        nat.tcp().unwrap().policy().icmpv4_errors(),
+        Nat44Icmpv4ErrorPolicy::Disabled
+    );
+
+    // Absent keys: bidirectional, equal to the core default.
+    let defaults = validated(
+        &VALID
+            .replacen("icmpv4-errors = \"external-only\"\n", "", 1)
+            .replacen("icmpv4-errors = \"disabled\"\n", "", 1),
+    );
+    let nat = defaults.nat44().unwrap();
+    let (udp, tcp) = (nat.udp().unwrap().policy(), nat.tcp().unwrap().policy());
+    assert_eq!(udp.icmpv4_errors(), Nat44Icmpv4ErrorPolicy::Bidirectional);
+    assert_eq!(tcp.icmpv4_errors(), Nat44Icmpv4ErrorPolicy::Bidirectional);
+    assert_eq!(
+        Nat44UdpPolicy::default().icmpv4_errors(),
+        Nat44Icmpv4ErrorPolicy::Bidirectional
+    );
+    assert_eq!(
+        Nat44TcpPolicy::default().icmpv4_errors(),
+        Nat44Icmpv4ErrorPolicy::Bidirectional
+    );
+    // Only the switch differs; storage shape does not depend on it.
+    assert_eq!(
+        udp.with_icmpv4_errors(Nat44Icmpv4ErrorPolicy::ExternalOnly),
+        explicit.nat44().unwrap().udp().unwrap().policy()
+    );
+    assert_eq!(explicit.storage_shape(), defaults.storage_shape());
+
+    for policy in Nat44Icmpv4ErrorPolicy::ALL {
+        let spelled = validated(&VALID.replacen(
+            "icmpv4-errors = \"disabled\"\n",
+            &format!("icmpv4-errors = \"{}\"\n", policy.config_name()),
+            1,
+        ));
+        assert_eq!(
+            spelled
+                .nat44()
+                .unwrap()
+                .tcp()
+                .unwrap()
+                .policy()
+                .icmpv4_errors(),
+            policy
+        );
+    }
+}
+
+#[test]
 fn nat44_hairpinning_maps_onto_core_policies_per_protocol() {
     use ruster_core::{Nat44TcpPolicy, Nat44UdpPolicy};
 
