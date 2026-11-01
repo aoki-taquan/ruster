@@ -11,9 +11,11 @@ M1（Runnable deterministic router）では、rootやNICなしで宣言的config
 `config → validate → publication candidate → live activation → run_tick → observability →
 run-sim JSONL`をend-to-endで実行できます（下の「使い方」）。backendは決定的な`SimIo`だけで、
 AF_PACKET/AF_XDPはproduction backendではなく、実NICでの動作やthroughputは主張しません。
-M1は`R16A Bounded` checkのrequired化（repository adminの操作）だけが残っており未closeです。
+M1は2026-11-01にcloseしました（9 exit criterionすべてmet。`R16A Bounded`はrequired checkです）。
 exit criterionごとの証跡は
-[`docs/release-evidence/m1.md`](docs/release-evidence/m1.md)にあります。
+[`docs/release-evidence/m1.md`](docs/release-evidence/m1.md)にあります。次のmilestoneは
+[development plan](docs/development-plan-v0.2.md#m2-operable-af_xdp-static-router)のM2
+（Operable AF_XDP static router）で、AF_XDP work packet X00〜X05を順に進めます。
 
 workspaceは12 crateです。data-planeとI/Oのlibrary crateは外部依存を持ちません。cold
 control-planeの`ruster-config`とsim専用の`ruster-sim-scenario`だけが、保守されている

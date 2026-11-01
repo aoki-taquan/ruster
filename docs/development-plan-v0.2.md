@@ -24,7 +24,8 @@
 
 ## 現在地
 
-2026-11-01時点の`main`（`c256e92`、#285まで）をcodeから確認した状態である。以下で矛盾する
+2026-11-01時点の`main`（codeは`c256e92`、#285まで。docsは`5fc4663`、#286まで）をcodeと
+repository rulesetから確認した状態である。以下で矛盾する
 場合はcode、[`requirements-v0.2.md`](requirements-v0.2.md)のledger、
 [`release-evidence/m1.md`](release-evidence/m1.md)を正とする。
 
@@ -76,14 +77,19 @@ workspaceは12 crateからなる。data-planeとI/Oのlibrary crate（`ruster-co
 - CI: `CI` workflow（Check、Musl、Test、Clippy、Format、Doc。Testはdoctestとrequirements
   gateを含む）、`Security Smoke` workflow（`R16A Bounded`、8 target×4 fixed seed）、
   `Benchmark Smoke` workflow（spec digest、plan v1照合、sim smoke）。
-  repository rulesetのrequired checkは`Check`、`Test`、`Clippy`、`Format`、`Doc`だけで、
-  `Musl`、`R16A Bounded`、`Benchmark Smoke`はrequiredではない
+  repository rulesetのrequired checkは`Check`、`Test`、`Clippy`、`Format`、`Doc`、
+  `R16A Bounded`で（2026-11-01追加）、`Musl`と`Benchmark Smoke`はrequiredではない
 
 milestone状態: M0のP0 rowはすべてledger上implementedだが、M0の独立release evidence fileは
-作っていない。M1は[`release-evidence/m1.md`](release-evidence/m1.md)のとおり、`R16A Bounded`
-checkのrequired化（repository admin操作）だけが残り未closeである。route-miss ICMP（#284）、
-ICMPv4生成switch（#285）、R17 spec固定（#282）はmerge済みで、route撤去後の既存flowがsilentな
-点はtracked deviation（FW-025）として残る。
+作っていない。M1は2026-11-01にcloseした。[`release-evidence/m1.md`](release-evidence/m1.md)の
+9 exit criterionはすべてmetで、closing SHAはそのevidenceをcloseへ更新したPRのsquash merge
+commitである。route撤去後の既存flowがsilentな点はtracked deviation（FW-025）として残り、
+NAT port pool size明確化とOBS-017/018延期のowner確認は任意でM1 closeを妨げない。
+
+次のmilestoneはM2（Operable AF_XDP static router）である。経路はdependency graphの
+X00 → X01/X02/X03 → X04 attach/config/ops integration → X05 hardware benchmarkで、X04は
+R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまたは欠落」のうち（M2）と
+記したproduction backend、`ruster run`、production key sourceがM2の対象である。
 
 ### Partialまたは欠落
 
@@ -112,8 +118,9 @@ ICMPv4生成switch（#285）、R17 spec固定（#282）はmerge済みで、route
   （`plan.rs`の`ApplyPlan`/`PublicationSequencer`、`activation.rs`）に置いた（S2/S3）。work packet表のR10 rowは
   これに合わせて更新した。
 - R16: 実装は`fuzz/`ではなく`crates/io-sim/tests/r16a_support`と`fuzz-smoke.yml`
-  （#249、#252、#280）。work packet表のR16 rowを更新した。`R16A Bounded`と`Musl`
-  （#244 titleは「required」）は現状required checkではない。
+  （#249、#252、#280）。work packet表のR16 rowを更新した。`R16A Bounded`は
+  2026-11-01にrequired checkへ追加された。`Musl`（#244 titleは「required」）は現状required
+  checkではない。
 - R15: core accessorが必要なhigh-watermarkは見送り（OBS-015/017/018）、R15 rowへ注記した。
   #276は`BackendStats`/`DropReason::ALL`等をcoreへ追加しており、`crates/core/src/lib.rs`を
   RI0だけが編集する規則とはずれている。
@@ -301,7 +308,8 @@ M1への経路はgap分析のslice S1〜S9とする。
 （一PR）、S8a/S8b #280（一PR）はmerge済み。#280が見つけたfirewall期限切れslotのliveness
 bugは#281で修正した。S7は#282（owner承認済み）、route-miss ICMPの修正は#284、ICMPv4生成switchは
 #285でmerge済み。S9はRD0とM1 release evidence
-（[`release-evidence/m1.md`](release-evidence/m1.md)）。M1 exit判定はevidence fileで行う。
+（[`release-evidence/m1.md`](release-evidence/m1.md)）。M1 exit判定はevidence fileで行い、
+2026-11-01に`R16A Bounded`のrequired化を記録して9 criterionすべてmetとし、M1をcloseした。
 
 ### M2: Operable AF_XDP static router
 
