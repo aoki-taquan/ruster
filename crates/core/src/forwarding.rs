@@ -181,6 +181,10 @@ pub enum DropReason {
     /// An inside-originated ICMPv4 error comes from neither the quoted
     /// internal destination nor the router's inside next hop toward it.
     Nat44Icmpv4InsideSourceMismatch = 152,
+    /// An external Protocol or Port Unreachable (Type 3, Code 2 or 3) does
+    /// not come from the quoted destination host, the only node that
+    /// generates it.
+    Nat44Icmpv4EndHostSourceMismatch = 153,
 }
 
 use DropReason::*;
@@ -188,7 +192,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 152] = [
+    pub const ALL: [Self; 153] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -341,6 +345,7 @@ impl DropReason {
         Nat44TcpInboundRemoteQuotaExceeded,
         Nat44Icmpv4OuterDestinationMismatch,
         Nat44Icmpv4InsideSourceMismatch,
+        Nat44Icmpv4EndHostSourceMismatch,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -510,6 +515,7 @@ impl DropReason {
             Nat44TcpInboundRemoteQuotaExceeded => "NAT44_TCP_INBOUND_REMOTE_QUOTA_EXCEEDED",
             Nat44Icmpv4OuterDestinationMismatch => "NAT44_ICMPV4_OUTER_DESTINATION_MISMATCH",
             Nat44Icmpv4InsideSourceMismatch => "NAT44_ICMPV4_INSIDE_SOURCE_MISMATCH",
+            Nat44Icmpv4EndHostSourceMismatch => "NAT44_ICMPV4_END_HOST_SOURCE_MISMATCH",
         }
     }
 }
@@ -2890,6 +2896,20 @@ pub(crate) const fn nat44_icmpv4_error_supported(icmp_type: u8, code: u8) -> boo
     }
 }
 
+/// Whether only the quoted destination host itself generates this error:
+/// Protocol Unreachable and Port Unreachable (RFC 1812 §5.2.7.1, RFC 792)
+/// report the absence of a transport or port at the destination host,
+/// never a condition on the path.
+///
+/// As a local policy ("unless explicitly overridden by local policy", RFC
+/// 5508 REQ-4 and REQ-5), NAT44 translates these only when the outer source
+/// is that host. Otherwise an off-path sender using its own, unspoofed
+/// address could sweep public ports and tear down inside UDP flows with a
+/// hard error.
+pub(crate) const fn nat44_icmpv4_error_end_host_only(icmp_type: u8, code: u8) -> bool {
+    icmp_type == 3 && matches!(code, 2 | 3)
+}
+
 /// Type, code, and quoted protocol of an ICMPv4 message, peeked within the
 /// outer IPv4 Total Length only (link padding is never a candidate byte).
 fn peek_nat44_icmpv4_error(
@@ -2944,6 +2964,8 @@ fn is_nat44_icmpv4_candidate(
 
 #[derive(Clone, Copy)]
 struct ParsedNat44Icmpv4Quote {
+    icmp_type: u8,
+    icmp_code: u8,
     protocol: u8,
     source_address: crate::Ipv4Address,
     source_port: u16,
@@ -3177,6 +3199,11 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
             .any(|binding| binding.address == outer.source)
     {
         return nat44_icmpv4_drop(ingress, Nat44Icmpv4SourceForbidden, trace);
+    }
+    if nat44_icmpv4_error_end_host_only(quote.icmp_type, quote.icmp_code)
+        && outer.source != quote.destination_address
+    {
+        return nat44_icmpv4_drop(ingress, Nat44Icmpv4EndHostSourceMismatch, trace);
     }
 
     let (inside, outside, internal_address, internal_port) = match quote.protocol {
@@ -3439,6 +3466,8 @@ fn parse_nat44_icmpv4_error(
         (None, None)
     };
     Ok(ParsedNat44Icmpv4Quote {
+        icmp_type: icmp[0],
+        icmp_code: icmp[1],
         protocol,
         source_address,
         source_port,
@@ -6576,6 +6605,7 @@ mod tests {
             (150, "NAT44_TCP_INBOUND_REMOTE_QUOTA_EXCEEDED"),
             (151, "NAT44_ICMPV4_OUTER_DESTINATION_MISMATCH"),
             (152, "NAT44_ICMPV4_INSIDE_SOURCE_MISMATCH"),
+            (153, "NAT44_ICMPV4_END_HOST_SOURCE_MISMATCH"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -6585,7 +6615,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(153), None);
+        assert_eq!(DropReason::from_code(154), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

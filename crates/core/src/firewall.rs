@@ -2741,6 +2741,57 @@ mod tests {
         });
     }
 
+    /// The reply branch of the either-direction view requires both swapped
+    /// interfaces. A one-slot table makes every probe reach the live slot, so
+    /// only the interface comparison can refuse these.
+    #[test]
+    fn related_icmpv4_either_direction_reply_requires_swapped_interfaces() {
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                7,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 1];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let origin = packet(FirewallProtocol::Udp, 0);
+            let plan = runtime.plan_packet(&config, origin, 10).unwrap();
+            runtime.commit(plan).unwrap();
+            let reply = |ingress, egress| {
+                FirewallRelatedIcmpv4Flow::new(
+                    ingress,
+                    egress,
+                    origin.destination,
+                    origin.source,
+                    origin.protocol,
+                    origin.destination_port,
+                    origin.source_port,
+                )
+            };
+            assert_eq!(
+                runtime.inspect_related_icmpv4_either_direction(
+                    reply(origin.egress, origin.ingress),
+                    10
+                ),
+                Ok(FirewallRuleId(7))
+            );
+            for (ingress, egress) in [
+                (origin.egress, IfId(99)),
+                (IfId(99), origin.ingress),
+                (origin.ingress, origin.egress),
+            ] {
+                assert_eq!(
+                    runtime.inspect_related_icmpv4_either_direction(reply(ingress, egress), 10),
+                    Err(FirewallRelatedIcmpv4Error::StateMiss),
+                    "{ingress:?} -> {egress:?}"
+                );
+            }
+        });
+    }
+
     #[test]
     fn related_icmpv4_probe_crosses_expired_same_home_wrap_without_mutation() {
         with_snapshot(|snapshot| {

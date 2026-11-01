@@ -307,7 +307,10 @@ NAT44 ICMPv4 error translation（RFC 5508）はUDP/TCPごとの`icmpv4-errors`�
 `bidirectional`は三方向すべてを変換します。対象はDestination Unreachable code 0–4, 6, 7, 9–15、
 Time Exceeded code 0、Parameter Problem code 0–2で、type/codeとrest-of-header（MTU、pointer）は
 保存します。Source Quench、Redirect、code 5/8、Time Exceeded code 1は変換しません
-（architectureの「NAT44 ICMPv4 Fragmentation Needed translation」）。
+（architectureの「NAT44 ICMPv4 Fragmentation Needed translation」）。Protocol/Port Unreachable
+（3/2、3/3）はend host自身からだけ受け付けます（outsideでは引用destination、insideでは引用
+internal host）。off-path hostのport sweepによる注入を防ぐlocal policyで、中継routerが送る
+他のtypeについての残余riskはrequirements NAT44-065を参照してください。
 
 | 方向 | 変換 | 必要なauthority |
 |---|---|---|
@@ -319,7 +322,9 @@ Time Exceeded code 0、Parameter Problem code 0–2で、type/codeとrest-of-hea
 （inside発は受信packetとしてflowのorigin/replyのどちらか、hairpinは両half）。inside hostが別hostの
 flowを詐称したり、mappingが通信していないexternal hostへerrorを送ったりはできません。
 例外としてUDPはEIFでもaddress粒度peerを要求し、inside pathの2 hop目以降のrouterのerrorは
-変換しません（requirements NAT44-063/064のdeviation）。
+変換しません（requirements NAT44-063/064のdeviation）。逆にfirewallなしのADF/EIFではUDP peerが
+address粒度なので、hairpin errorはX1が送っていない`P`のportを引用しても届き（NAT44-061）、
+REQ-5の引用remote portもauthorityになりません。firewallをbindするとどちらもexactです。
 
 ```toml
 [nat44.udp]
@@ -332,7 +337,9 @@ icmpv4-errors = "bidirectional"
 ```
 
 defaultは以前`disabled`で、outsideからのFrag Neededをconsumeしていました（PMTUD black hole）。
-keyを省略したconfigは新しいdefaultになり、M1 fixtureのように値を明示したconfigは不変です。
+以前はkeyが必須だったため、既存configは値を必ず明示しており、その`"disabled"`はそのままです。
+ただし明示した`"external-only"`も変換するtype/codeがType 3/Code 4から上の集合へ広がるため、
+挙動が変わります。keyの省略が許されるのは新しく書くconfigだけで、省略は`"bidirectional"`です。
 
 IPv4 forward firewallは`forward_batch_with_firewall`を選んだworkerだけで有効です。immutableな
 ordered rule sliceとmutableなfixed-capacity state sliceをcallerが所有し、first-matchの

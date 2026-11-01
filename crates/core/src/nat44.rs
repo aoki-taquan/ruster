@@ -4037,15 +4037,10 @@ impl<'a> Nat44UdpRuntime<'a> {
         else {
             return Err(Nat44UdpPlanError::MappingMiss);
         };
+        // `port_owned` is the slot's ownership of its public port; the
+        // port-owner index is kept consistent with it by every commit.
         if !self.mapping_is_live(mapping, now_ms) || !mapping.port_owned {
             return Err(Nat44UdpPlanError::MappingMiss);
-        }
-        // The inbound view of the same mapping: the public port must still
-        // resolve to this exact slot and generation.
-        match self.mapping_for_public_port(mapping.public_port, now_ms)? {
-            Some((owner_index, owner))
-                if owner_index == mapping_index && owner.generation == mapping.generation => {}
-            Some(_) | None => return Err(Nat44UdpPlanError::MappingMiss),
         }
         if !self.peer_exists(
             mapping_index,
@@ -6770,11 +6765,6 @@ impl<'a> Nat44TcpRuntime<'a> {
         };
         if !self.mapping_is_live(mapping, now_ms) || !mapping.port_owned {
             return Err(Nat44TcpPlanError::MappingMiss);
-        }
-        match self.mapping_for_public_port(mapping.public_port, now_ms)? {
-            Some((owner_index, owner))
-                if owner_index == mapping_index && owner.generation == mapping.generation => {}
-            Some(_) | None => return Err(Nat44TcpPlanError::MappingMiss),
         }
         if self
             .find_session(

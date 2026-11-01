@@ -200,12 +200,14 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
     };
 
     // Source authority: the quoted internal destination itself, or the
-    // router's inside next hop toward it.
+    // router's inside next hop toward it. Protocol and Port Unreachable come
+    // only from the host itself.
     let internal = quote.destination_address;
     let on_path = outer.source == internal
-        || route::lookup(snapshot.routes, internal).is_some_and(|route| {
-            route.egress() == owner.inside && route.next_hop() == Some(outer.source)
-        });
+        || (!nat44_icmpv4_error_end_host_only(quote.icmp_type, quote.icmp_code)
+            && route::lookup(snapshot.routes, internal).is_some_and(|route| {
+                route.egress() == owner.inside && route.next_hop() == Some(outer.source)
+            }));
     if !on_path {
         return nat44_icmpv4_drop(ingress, Nat44Icmpv4InsideSourceMismatch, trace);
     }

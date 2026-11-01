@@ -46,6 +46,10 @@ const H2: Ipv4Address = Ipv4Address::from_octets([10, 0, 0, 11]);
 const INNER_GW: Ipv4Address = Ipv4Address::from_octets([10, 0, 0, 254]);
 /// A host behind `INNER_GW`.
 const H4: Ipv4Address = Ipv4Address::from_octets([10, 1, 0, 5]);
+/// A host routed out of the DMZ through a next hop that is `INNER_GW`.
+const H5: Ipv4Address = Ipv4Address::from_octets([10, 2, 0, 5]);
+/// An off-path outside host that never spoofs its address.
+const ATTACKER: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 66]);
 const REMOTE: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 20]);
 const OTHER_REMOTE: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 21]);
 const ROUTER: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 1]);
@@ -99,6 +103,13 @@ fn snapshot() -> ForwardingSnapshot<'static> {
         )
         .unwrap(),
         Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, WAN, Some(GW)).unwrap(),
+        Route::new(
+            Ipv4Address::from_octets([10, 2, 0, 0]),
+            16,
+            DMZ,
+            Some(INNER_GW),
+        )
+        .unwrap(),
         Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, Some(GW)).unwrap(),
     ]);
     let interfaces = leak([
@@ -189,6 +200,8 @@ struct Shape {
     udp_errors: Nat44Icmpv4ErrorPolicy,
     tcp_errors: Nat44Icmpv4ErrorPolicy,
     hairpinning: bool,
+    /// Adds a rule admitting new outside-to-inside UDP flows.
+    inbound_udp_rule: bool,
 }
 
 impl Default for Shape {
@@ -198,6 +211,7 @@ impl Default for Shape {
             udp_errors: Nat44Icmpv4ErrorPolicy::default(),
             tcp_errors: Nat44Icmpv4ErrorPolicy::default(),
             hairpinning: true,
+            inbound_udp_rule: false,
         }
     }
 }
@@ -263,7 +277,23 @@ impl World {
         let (firewall_config, firewall) = if firewall {
             let config = FirewallConfig::new(
                 &snapshot,
-                Vec::leak(outbound_only_rules()),
+                Vec::leak({
+                    let mut rules = outbound_only_rules();
+                    if shape.inbound_udp_rule {
+                        rules.push(FirewallRule::new(
+                            FirewallRuleId(40),
+                            FirewallInterface::Interface(WAN),
+                            FirewallInterface::Interface(LAN),
+                            any(),
+                            inside_prefix(),
+                            FirewallProtocol::Udp,
+                            FirewallPortRange::new(1, u16::MAX).unwrap(),
+                            FirewallPortRange::new(1, u16::MAX).unwrap(),
+                            FirewallAction::AllowStateful,
+                        ));
+                    }
+                    rules
+                }),
                 FirewallPolicy::default(),
                 1,
                 FirewallHashKey::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210).unwrap(),
@@ -701,11 +731,29 @@ fn external_errors_of_every_supported_type_reach_the_inside_host() {
             let outbound = world.establish(H1, P1, tcp);
             let expected_quote = after_one_hop(&original);
             for (icmp_type, code, supported) in error_matrix() {
-                let error = icmp_error(ROUTER, PUBLIC, icmp_type, code, &outbound);
+                // Protocol/Port Unreachable come only from the end host.
+                let end_host_only = icmp_type == 3 && matches!(code, 2 | 3);
+                if end_host_only {
+                    world.assert_refused(
+                        WAN,
+                        icmp_error(ROUTER, PUBLIC, icmp_type, code, &outbound),
+                        DropReason::Nat44Icmpv4EndHostSourceMismatch,
+                    );
+                }
+                let reporter = if end_host_only { REMOTE } else { ROUTER };
+                let error = icmp_error(reporter, PUBLIC, icmp_type, code, &outbound);
                 let before = world.state();
                 world.run(WAN, error.clone());
                 if supported {
-                    assert_translated(&mut world, &error, LAN, H1_MAC, ROUTER, H1, &expected_quote);
+                    assert_translated(
+                        &mut world,
+                        &error,
+                        LAN,
+                        H1_MAC,
+                        reporter,
+                        H1,
+                        &expected_quote,
+                    );
                 } else {
                     let recycled = world.io.pop_recycled().unwrap();
                     assert_eq!(
@@ -742,7 +790,15 @@ fn inside_router_on_the_path_may_report_about_the_host_behind_it() {
                 &after_one_hop(&sent),
             );
         }
-        // The host itself may report too.
+        // Protocol/Port Unreachable come only from the host itself.
+        for code in [2, 3] {
+            world.assert_refused(
+                LAN,
+                icmp_error(INNER_GW, REMOTE, 3, code, &delivered),
+                DropReason::Nat44Icmpv4InsideSourceMismatch,
+            );
+        }
+        // The host itself may report them.
         let error = icmp_error(H4, REMOTE, 3, 3, &delivered);
         world.run(LAN, error.clone());
         assert_translated(
@@ -1053,8 +1109,32 @@ fn hairpinned_errors_return_to_the_sender_with_both_halves_reverted() {
 /// is address-granular (from a punch toward another host), and X2's own
 /// outbound half gives it the received-flow state. Only X1's missing
 /// outbound flow `X1:x1 -> P:x2'` refuses the forged error.
+///
+/// Without the firewall the same forged error is delivered (review L1,
+/// `poc_req7_adf_wildcard_fabricated_hairpin_flow`): UDP peers are
+/// address-granular under address-dependent filtering, as REQ-9 a and ADF
+/// require, so the NAT cannot tell which `P` port X1 sent to. The error
+/// stays inside the inside realm, where X1's socket tuple match is the
+/// final guard.
 #[test]
 fn firewall_requires_the_hairpin_senders_own_outbound_flow() {
+    let mut world = World::new(false);
+    let public1 = public_source_port(&world.establish(H1, P1, false));
+    let public2 = public_source_port(&world.establish(H2, P2, false));
+    let public4 = public_source_port(&world.establish(H4, P1, false));
+    world.run(LAN, udp_frame(H1, PUBLIC, P1, public4));
+    assert!(world.io.pop_recycled().is_some());
+    world.run(LAN, udp_frame(H2, PUBLIC, P2, public1));
+    assert_eq!(world.io.pop_tx().unwrap().egress, LAN);
+    let mut never_sent = after_one_hop(&udp_frame(PUBLIC, H2, public1, P2));
+    let mut frame = vec![0_u8; 14];
+    frame.append(&mut never_sent);
+    world.run(LAN, icmp_error(H2, PUBLIC, 3, 3, &frame));
+    let delivered = world.io.pop_tx().expect("no firewall: delivered");
+    assert_eq!(&delivered.bytes[30..34], &H1.octets());
+    // The quote names `P:x2'`, a port X1 never sent to.
+    assert_eq!(&delivered.bytes[64..66], &public2.to_be_bytes());
+
     let mut world = World::new(true);
     let public1 = public_source_port(&world.establish(H1, P1, false));
     let public2 = public_source_port(&world.establish(H2, P2, false));
@@ -1250,4 +1330,117 @@ fn inside_translation_has_per_protocol_off_switches() {
         icmp_error(H2, PUBLIC, 3, 3, &udp_frame(PUBLIC, H2, public1, P2)),
         DropReason::Nat44Icmpv4WrongIngress,
     );
+}
+
+/// Review M1 regression (`poc` sweep): an off-path outside host using its
+/// own, unspoofed address sweeps every public port with errors quoting
+/// `P:port -> REMOTE:53`. Protocol and Port Unreachable get no hit, because
+/// only the quoted destination host may send them. The types an
+/// intermediate router legitimately sends still hit the live mapping: that
+/// is the residual trade-off of REQ-4 (no rate limit, NAT44-065).
+#[test]
+fn off_path_sweep_cannot_inject_end_host_errors() {
+    for firewall in [false, true] {
+        let mut world = World::new(firewall);
+        let public = public_source_port(&world.establish(H1, P1, false));
+        let mut hits = Vec::new();
+        for (icmp_type, code) in [(3_u8, 2_u8), (3, 3), (3, 1), (11, 0), (12, 0), (3, 13)] {
+            let mut count = 0;
+            for port in FIRST_PORT..=LAST_PORT {
+                let quoted = udp_frame(PUBLIC, REMOTE, port, 53);
+                world.run(WAN, icmp_error(ATTACKER, PUBLIC, icmp_type, code, &quoted));
+                if let Some(tx) = world.io.pop_tx() {
+                    assert_eq!(port, public);
+                    assert_eq!(tx.egress, LAN);
+                    count += 1;
+                } else {
+                    world.io.pop_recycled().expect("refused");
+                }
+            }
+            hits.push(((icmp_type, code), count));
+        }
+        assert_eq!(
+            hits,
+            [
+                ((3, 2), 0),
+                ((3, 3), 0),
+                ((3, 1), 1),
+                ((11, 0), 1),
+                ((12, 0), 1),
+                ((3, 13), 1),
+            ],
+            "firewall {firewall}"
+        );
+    }
+}
+
+/// Review RFC M-1: a TCP inside error needs a live session even while the
+/// mapping stays live through another session.
+#[test]
+fn inside_tcp_error_about_an_expired_session_is_a_session_miss() {
+    let mut world = World::new(false);
+    let public = public_source_port(&world.establish(H1, P1, true));
+    let (_, delivered) = world.reply(public, true);
+    // A second session keeps the mapping live past the first's idle TTL.
+    world.now = 7_000_000;
+    world.run(LAN, tcp_frame(H1, REMOTE, P1, 444, SYN));
+    assert_eq!(world.io.pop_tx().unwrap().egress, WAN);
+    world.now = 7_440_010;
+    world.assert_refused(
+        LAN,
+        icmp_error(H1, REMOTE, 3, 1, &delivered),
+        DropReason::Nat44TcpSessionMiss,
+    );
+    // The live session still translates.
+    let (_, live) = {
+        let packet = tcp_frame(REMOTE, PUBLIC, 444, public, SYN_ACK);
+        world.run(WAN, packet.clone());
+        (packet, world.io.pop_tx().unwrap().bytes)
+    };
+    world.run(LAN, icmp_error(H1, REMOTE, 3, 1, &live));
+    assert_eq!(world.io.pop_tx().unwrap().egress, WAN);
+}
+
+/// Review RFC L-1: the inside next hop counts only for a route whose egress
+/// is the inside interface. A route out of another interface through the
+/// same next-hop address gives that router no authority.
+#[test]
+fn next_hop_authority_requires_an_inside_egress_route() {
+    let mut world = World::new(false);
+    let quoted = udp_frame(REMOTE, H5, 53, P1);
+    world.assert_refused(
+        LAN,
+        icmp_error(INNER_GW, REMOTE, 3, 1, &quoted),
+        DropReason::Nat44Icmpv4InsideSourceMismatch,
+    );
+}
+
+/// Review RFC L-3: REQ-4 matches the firewall flow by its origin only. An
+/// outside error about H1's reply in an outside-initiated flow has NAT
+/// authority but is refused, while REQ-5 accepts both directions.
+#[test]
+fn external_errors_match_the_firewall_origin_only() {
+    let mut world = World::shaped(
+        true,
+        Shape {
+            filtering: Nat44Filtering::EndpointIndependent,
+            inbound_udp_rule: true,
+            ..Shape::default()
+        },
+    );
+    let public = public_source_port(&world.establish(H1, P1, false));
+    // REMOTE:7000 opens a new inbound flow (origin outside).
+    world.run(WAN, udp_frame(REMOTE, PUBLIC, 7000, public));
+    let delivered = world.io.pop_tx().expect("inbound flow").bytes;
+    // H1 replies; the reply leaves as P:x' -> REMOTE:7000.
+    world.run(LAN, udp_frame(H1, REMOTE, P1, 7000));
+    let reply = world.io.pop_tx().expect("reply").bytes;
+    world.assert_refused(
+        WAN,
+        icmp_error(ROUTER, PUBLIC, 3, 1, &reply),
+        DropReason::FirewallRelatedIcmpv4StateMiss,
+    );
+    // The inside error about the inbound packet is RELATED (origin match).
+    world.run(LAN, icmp_error(H1, REMOTE, 3, 3, &delivered));
+    assert_eq!(world.io.pop_tx().unwrap().egress, WAN);
 }

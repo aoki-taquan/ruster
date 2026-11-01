@@ -869,7 +869,8 @@ firewall bind時は`FIREWALL_UNSUPPORTED_PROTOCOL`。`external-only`で`P`宛て
 対象でしたが、現在は全方向で同じtype/code集合を変換します（NAT44-019J）: Destination
 Unreachable code 0–4, 6, 7, 9–15、Time Exceeded code 0、Parameter Problem code 0–2。
 除外はType 3 code 5（NAT44はoptionsなしpacketだけを変換するのでsource routeを持つ変換済み
-packetは無い）、code 8（obsolete、RFC 1812 §5.2.7.1）、未割当code、Time Exceeded code 1
+packetは無い）、code 8（obsolete。RFC 1812 §5.2.7.1はSHOULD NOT generateで禁止ではなく、古い
+routerが送り得るがdeviation NAT44-067として除外）、未割当code、Time Exceeded code 1
 （変換はatomic datagramだけでreassemblyが起きない）、Source Quench（REQ-10 c.1 SHOULD NOT、
 RFC 6633）、Redirect（link-local advice）です。非対象はcandidateにならず従来の経路に残ります。
 
@@ -882,7 +883,16 @@ errorの変換をMUSTとし（「unless explicitly overridden by local policy」
 （2026-11-01、RFC準拠を基準、securityのためのcontrolは設定可能に）に合わせてdefaultを
 `Bidirectional`へ変更しました（behavior change、NAT44-062）。`ExternalOnly`/`Disabled`は
 RFC 1812 §1.1.3のsecurity optionです。combined serviceでは引用protocolに対応するpolicyだけが
-判定を所有するため、UDPだけを有効にしてもTCP引用をinterceptせず、その逆も同じです。Type/Codeと引用protocolの
+判定を所有するため、UDPだけを有効にしてもTCP引用をinterceptせず、その逆も同じです。
+
+Protocol Unreachable（3/2）とPort Unreachable（3/3）はdestination host自身だけが生成する
+ため、outer sourceが引用destination（remote host）でなければ
+`NAT44_ICMPV4_END_HOST_SOURCE_MISMATCH`でdropします（REQ-4のlocal policy override、
+NAT44-066）。これが無いとoff-pathのoutside hostが自分のaddressのまま（BCP38は効かない）public
+port全域をsweepし、inside UDP flowへhard errorを注入できます。中継routerが正当に送る他の
+type（Type 3 code 0/1/4/6/7/9–15、Time Exceeded、Parameter Problem）は同じsweepでlive mappingに
+当たり得ます。これはREQ-4に従う残余riskで、rate limitやvalidationはNAT44-065としてdeferred、
+securityを優先するなら`external-only`/`disabled`を選べます。Type/Codeと引用protocolの
 peekはouter IPv4 Total Length内だけで行い、link paddingをcandidate bytesとして扱いません。
 対象はouter IHL=5、nonfragment、TTL>1、valid ICMP checksumと、validなIPv4 headerを含む
 引用です。引用datagramはreserved flagをfragment判定からmaskした上で
@@ -955,7 +965,8 @@ hairpinning offでは`NAT44_*_HAIRPIN_DISABLED`、引用sourceが`P`でなけれ
 - outer sourceはhost-unicast、router-localでなく、reverse LPMがinside（local strict uRPF、
   `NAT44_ICMPV4_SOURCE_FORBIDDEN`）。さらに引用internal destination自身か、routerがそこへ使う
   inside routeのnext hopであること（`NAT44_ICMPV4_INSIDE_SOURCE_MISMATCH`）。これで別のinside
-  hostのflowについてerrorを詐称できません。REQ-5 cはinside realmのどのrouterのerrorも変換対象に
+  hostのflowについてerrorを詐称できません。next hopはegressがinsideのrouteのものに限り、
+  Protocol/Port Unreachable（3/2、3/3）はinternal host自身からだけ受け付けます（NAT44-066）。REQ-5 cはinside realmのどのrouterのerrorも変換対象に
   しますが、2 hop目以降のrouterのerrorはこのlocal policyで拒否します（deviation NAT44-064）。
   L2上でのIP source詐称そのものは、通常のoutbound UDP/TCPと同じく検出できません。
 - 引用internal endpointは、liveでpublic portを今も所有するmappingを持つ必要があります
@@ -982,7 +993,11 @@ Rが開始してruleが許可したflowはorigin側で一致します。REQ-7は
 address-dependentではX1のpeer `P`がinside全体のwildcardなので（NAT44-046）、X2はX1が送って
 いないpacketについてもNAT authorityを満たせますが、X1のexact outbound flowが無いため
 firewallが拒否します（NAT44-061）。missは`FIREWALL_RELATED_ICMPV4_STATE_MISS`、auditは
-`Related`です。outside→inside（REQ-4）は従来どおりdirect originだけを照合します。NAT44-021の
+`Related`です。firewallなしのADF/EIFでは、UDP REQ-7 errorがX1の送っていない`P`のport
+（`X1:x1 -> P:x2'`）を引用しても届きます（review L1）。REQ-9 aとADFが要求するaddress粒度peerの
+帰結で、errorはinside realm内にとどまりX1 socketのtuple照合が最終guardです。同様にREQ-5の
+UDP引用remote portもADF/EIFではauthorityになりません（review L2、利得は無視できる）。
+outside→inside（REQ-4）は従来どおりdirect originだけを照合します。NAT44-021の
 外部→内部bypass拒否とroute-miss NAT gateは別経路で不変です。
 
 **rewrite。** 共通builder（`Nat44Icmpv4Rewrite`）がouter source/destination、引用

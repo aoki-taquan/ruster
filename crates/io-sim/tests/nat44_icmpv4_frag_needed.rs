@@ -1168,7 +1168,7 @@ fn combined_realm_mismatch_is_candidate_only_and_precedes_lookup_without_counter
 
     // Every other supported error type/code is a candidate too
     // (NAT44-019J) ...
-    for (icmp_type, code) in [(3_u8, 3_u8), (11, 0), (12, 0)] {
+    for (icmp_type, code) in [(3_u8, 1_u8), (11, 0), (12, 0)] {
         let mut other = frag_needed(&quote, 64, 0, &[]);
         other[34] = icmp_type;
         other[35] = code;
