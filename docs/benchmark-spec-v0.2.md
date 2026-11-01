@@ -19,8 +19,9 @@ ownerが承認しました。X05はこのspecの`spec_git_sha`に対してだけ
 v0.2は#282で次の手順により承認されました。以後のversionも、ownerが数値を承認（必要なら修正）
 するPRで、同じcommit内に次をすべて行います。
 
-1. status行を`- status: **APPROVED — owner承認済み（承認PR番号）**`へ変え、承認された値以外の
-   本文を変更しない。
+1. status行を`- status: **APPROVED — owner承認済み（承認PR番号）**`へ変える。本文の変更は
+   status、承認記録（承認日とowner決定の引用）、提案段階を示す表示の除去、ownerへの確認事項を
+   owner決定へ置き換えることだけに限る。ownerが修正した値を除き、数値は変更しない。
 2. repository rootで`sha256sum docs/benchmark-spec-v0.2.md > docs/benchmark-spec-v0.2.sha256`を
    実行してdigestを再生成する。
 3. `crates/bench/tests/benchmark_spec.rs`のdraft marker testを`APPROVED`を要求するtestへ
