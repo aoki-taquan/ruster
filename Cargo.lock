@@ -71,6 +71,7 @@ name = "ruster-config"
 version = "0.2.0"
 dependencies = [
  "ruster-core",
+ "ruster-io-xdp-native",
  "serde",
  "serde_path_to_error",
  "toml",

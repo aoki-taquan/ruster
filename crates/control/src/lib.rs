@@ -30,9 +30,9 @@ pub use config_bridge::{
 pub use key_source::{OsRandomKeySource, ProductionKeySource};
 
 pub use plan::{
-    ApplyPlan, Change, Delta, FlushCount, InterfaceLabels, NatChange, NatPortRange, NatRealm,
-    PlanError, PlanSide, ProductionSequencer, PublicationSequencer, SequencerError, StateFlush,
-    SuccessorCheck,
+    ApplyPlan, BackendChange, Change, Delta, FlushCount, InterfaceLabels, NatChange, NatPortRange,
+    NatRealm, PlanError, PlanSide, ProductionSequencer, PublicationSequencer, SequencerError,
+    StateFlush, SuccessorCheck,
 };
 
 pub use publication::{

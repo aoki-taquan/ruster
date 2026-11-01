@@ -472,6 +472,108 @@ generation = 3
     assert!(lines[3].contains("\"candidate_generation\":3,\"generation\":3"));
 }
 
+/// An AF_XDP `[backend]` binding both M1 interfaces.
+const AF_XDP_BACKEND: &str = r#"
+[backend]
+kind = "af-xdp"
+
+[[backend.ports]]
+interface = "lan"
+queue = 0
+mode = "copy"
+xdp-attach = "generic"
+rings = { fill = 256, rx = 256, tx = 256, completion = 256 }
+frame-size = 2048
+frame-count = 1024
+generated-frames = 64
+
+[[backend.ports]]
+interface = "wan"
+queue = 0
+mode = "copy"
+xdp-attach = "generic"
+rings = { fill = 256, rx = 256, tx = 256, completion = 256 }
+frame-size = 2048
+frame-count = 1024
+generated-frames = 64
+"#;
+
+/// `run-sim` drives only the simulation backend: a valid AF_XDP document is
+/// a typed rejection, never silently run on `SimIo`.
+#[test]
+fn non_sim_backend_is_rejected_initially_and_as_an_invalid_apply() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("driver-backend-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let v1 = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    fs::write(dir.join("router-v1.toml"), &v1).unwrap();
+    fs::write(
+        dir.join("router-af-xdp.toml"),
+        format!("{v1}{AF_XDP_BACKEND}"),
+    )
+    .unwrap();
+    // An explicit `sim` backend is accepted.
+    fs::write(
+        dir.join("router-sim.toml"),
+        format!("{v1}\n[backend]\nkind = \"sim\"\n"),
+    )
+    .unwrap();
+
+    let initial = "schema = \"ruster-scenario/v1\"\nseed = 1\nconfig = \"router-af-xdp.toml\"\n";
+    let scenario = parse_scenario(initial.as_bytes(), &dir).unwrap();
+    let Err(error) = SimSession::new(scenario) else {
+        panic!("af-xdp initial config accepted");
+    };
+    assert_eq!(
+        error,
+        DriverError::InitialConfig(ConfigRejection::UnsupportedBackend(
+            ruster_config::BackendKindV1::AfXdp
+        ))
+    );
+    assert_eq!(
+        error.to_string(),
+        "initial config rejected at backend: UNSUPPORTED_BACKEND"
+    );
+
+    let apply = r#"
+schema = "ruster-scenario/v1"
+seed = 1
+config = "router-v1.toml"
+
+[[step]]
+kind = "apply"
+config = "router-af-xdp.toml"
+outcome = "rejected"
+reason = "invalid"
+
+[[step]]
+kind = "apply"
+config = "router-sim.toml"
+outcome = "applied"
+
+[[step]]
+kind = "expect"
+generation = 2
+"#;
+    let scenario = parse_scenario(apply.as_bytes(), &dir).unwrap();
+    let mut session = SimSession::new(scenario).unwrap();
+    let mut out = Vec::new();
+    let mut run = session.start(&mut out).unwrap();
+    run.run(&mut out).unwrap();
+    run.finish(&mut out).unwrap();
+    let output = String::from_utf8(out).unwrap();
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(
+        lines[1],
+        "{\"event\":\"apply\",\"step\":0,\"at_ms\":0,\"config\":\"router-af-xdp.toml\",\
+         \"outcome\":\"rejected\",\"reason\":\"invalid\",\"stage\":\"backend\",\
+         \"code\":\"UNSUPPORTED_BACKEND\",\"candidate_generation\":null,\"generation\":1,\
+         \"flush\":null}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn idle_ticks_follow_hold_monotonically_and_sessions_start_once() {
     let source = r#"

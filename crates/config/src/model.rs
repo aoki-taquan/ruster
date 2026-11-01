@@ -28,6 +28,8 @@ pub struct ConfigV1 {
     pub nat44: Option<Nat44V1>,
     pub firewall: Option<FirewallV1>,
     pub tick: Option<TickBudgetV1>,
+    /// Packet backend; absent means [`BackendKindV1::Sim`].
+    pub backend: Option<BackendV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -344,4 +346,149 @@ pub struct TickBudgetV1 {
     pub failure_dispatch_scans: u32,
     pub generated_arp: u32,
     pub generated_icmpv4: u32,
+}
+
+/// Packet backend selection (`[backend]`).
+///
+/// The section is optional and defaults to the deterministic simulation
+/// backend, so every schema-version 1 document written before the section
+/// existed keeps its meaning. `ports` is valid only with `kind = "af-xdp"`.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct BackendV1 {
+    /// Absent means `sim`.
+    #[serde(default)]
+    pub kind: BackendKindV1,
+    /// What to do when a device already has an XDP program attached.
+    /// Absent means `refuse`, the only supported policy.
+    #[serde(default)]
+    pub existing_xdp_program: ExistingXdpProgramV1,
+    /// One AF_XDP socket per entry (`[[backend.ports]]`).
+    #[serde(default)]
+    pub ports: Vec<AfXdpPortV1>,
+}
+
+/// Which packet backend a router process drives.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BackendKindV1 {
+    /// Deterministic in-process simulation (`ruster run-sim`).
+    #[default]
+    Sim,
+    /// Linux AF_XDP sockets on real devices.
+    AfXdp,
+}
+
+impl BackendKindV1 {
+    /// The kebab-case spelling used in configuration and plan text.
+    #[must_use]
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            Self::Sim => "sim",
+            Self::AfXdp => "af-xdp",
+        }
+    }
+}
+
+/// Policy for a device that already has an XDP program attached.
+///
+/// Only `refuse` exists: the backend never replaces or detaches a program it
+/// did not attach. The field is kept so that the policy is explicit and can
+/// grow without a schema change.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExistingXdpProgramV1 {
+    #[default]
+    Refuse,
+}
+
+impl ExistingXdpProgramV1 {
+    /// The kebab-case spelling used in configuration and plan text.
+    #[must_use]
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            Self::Refuse => "refuse",
+        }
+    }
+}
+
+/// Requested AF_XDP copy policy of one socket.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AfXdpModeV1 {
+    /// Require copy mode (`XDP_COPY`).
+    Copy,
+    /// Require zero-copy mode (`XDP_ZEROCOPY`).
+    ZeroCopy,
+    /// Let the kernel choose zero-copy when available, else copy.
+    Auto,
+}
+
+impl AfXdpModeV1 {
+    /// The kebab-case spelling used in configuration and plan text.
+    #[must_use]
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::ZeroCopy => "zero-copy",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+/// How the XDP program that redirects to the socket is attached.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum XdpAttachModeV1 {
+    /// Driver (native) XDP, `XDP_FLAGS_DRV_MODE`.
+    Native,
+    /// Generic (skb) XDP, `XDP_FLAGS_SKB_MODE`; copy mode only.
+    Generic,
+}
+
+impl XdpAttachModeV1 {
+    /// The kebab-case spelling used in configuration and plan text.
+    #[must_use]
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Generic => "generic",
+        }
+    }
+}
+
+/// One AF_XDP socket bound to one queue of one configured interface.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AfXdpPortV1 {
+    /// `name` of an `[[interfaces]]` entry; its `device` is bound.
+    pub interface: String,
+    /// Device RX/TX queue id.
+    pub queue: u32,
+    pub mode: AfXdpModeV1,
+    /// `XDP_USE_NEED_WAKEUP`; absent means `true`, the only supported value.
+    #[serde(default = "enabled")]
+    pub need_wakeup: bool,
+    pub xdp_attach: XdpAttachModeV1,
+    pub rings: AfXdpRingsV1,
+    /// UMEM chunk size in bytes.
+    pub frame_size: u32,
+    /// Total UMEM chunks of this socket.
+    pub frame_count: u32,
+    /// Chunks reserved for router-generated ARP/ICMPv4 frames.
+    pub generated_frames: u32,
+    /// UMEM headroom in addition to the kernel's fixed 256 bytes; absent
+    /// means 0.
+    #[serde(default)]
+    pub headroom: u32,
+}
+
+/// Entry counts of the four AF_XDP rings of one socket.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AfXdpRingsV1 {
+    pub fill: u32,
+    pub rx: u32,
+    pub tx: u32,
+    pub completion: u32,
 }

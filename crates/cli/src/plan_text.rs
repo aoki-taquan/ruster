@@ -8,6 +8,7 @@
 //! restart-required: none | CODE[,CODE...]
 //! changes: N
 //!   <kind> <+|-|~> <rendered item>[ -> <rendered item>]
+//!   (backend changes last: `backend ~ sim -> af-xdp`, `backend-port + ...`)
 //! expected-flush:
 //!   <counter> all|<n>
 //! ```
@@ -21,7 +22,8 @@
 
 use std::fmt::Write as _;
 
-use ruster_control::{ApplyPlan, Change, Delta, FlushCount, NatChange, StateFlush};
+use ruster_config::ValidatedAfXdpPortV1;
+use ruster_control::{ApplyPlan, BackendChange, Change, Delta, FlushCount, NatChange, StateFlush};
 use ruster_core::{
     FirewallAction, FirewallInterface, FirewallProtocol, FirewallRule, IfId, Interface,
     Ipv4Address, LocalIpv4Binding, MacAddress, Neighbor, Route,
@@ -193,6 +195,46 @@ fn nat(lines: &mut Vec<String>, kind: &str, change: NatChange) {
     }
 }
 
+/// One AF_XDP socket: `if<id> queue <q> <mode> <attach> rings
+/// <fill>/<rx>/<tx>/<completion> frames <count>x<size> generated <n>
+/// headroom <bytes>`. Need-wakeup is always on and not printed.
+fn port(port: &ValidatedAfXdpPortV1) -> String {
+    let (rings, umem) = (port.rings(), port.umem());
+    format!(
+        "{} queue {} {} {} rings {}/{}/{}/{} frames {}x{} generated {} headroom {}",
+        iface(port.interface()),
+        port.queue(),
+        port.mode().config_name(),
+        port.attach().config_name(),
+        rings.fill().get(),
+        rings.rx().get(),
+        rings.tx().get(),
+        rings.completion().get(),
+        umem.frame_count(),
+        umem.frame_size(),
+        umem.generated_frames(),
+        umem.headroom()
+    )
+}
+
+fn backend(lines: &mut Vec<String>, change: &BackendChange) {
+    if let Some(Delta { old, new }) = change.kind {
+        lines.push(format!(
+            "backend ~ {} -> {}",
+            old.config_name(),
+            new.config_name()
+        ));
+    }
+    if let Some(Delta { old, new }) = change.existing_xdp_program {
+        lines.push(format!(
+            "backend existing-xdp-program ~ {} -> {}",
+            old.config_name(),
+            new.config_name()
+        ));
+    }
+    changes(lines, "backend-port", &change.ports, port);
+}
+
 fn flush_lines(flush: StateFlush) -> [(&'static str, FlushCount); 11] {
     [
         ("resolution_states", flush.resolution_states),
@@ -238,6 +280,7 @@ pub fn render(plan: &ApplyPlan) -> String {
     }
     nat(&mut lines, "nat44-udp", plan.nat44_udp());
     nat(&mut lines, "nat44-tcp", plan.nat44_tcp());
+    backend(&mut lines, plan.backend());
 
     let mut text = String::new();
     let restart: Vec<&str> = plan.restart_required().iter().map(|r| r.code()).collect();

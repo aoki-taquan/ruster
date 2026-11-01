@@ -75,7 +75,9 @@ fn render_path(path: &SourcePath) -> Option<String> {
 
 /// Reads, parses, and validates one configuration document, including the
 /// M1 service bridge, so `validate` and both sides of `plan` accept exactly
-/// what `run-sim` accepts.
+/// what `run-sim` accepts, except that any validated `[backend]` is
+/// accepted here: `run-sim` additionally refuses a non-`sim` backend
+/// (`stage=backend code=UNSUPPORTED_BACKEND`).
 pub fn load(path: &Path) -> Result<ValidatedConfigV1, LoadError> {
     let mut bytes = Vec::new();
     let take = wide(MAX_CONFIG_BYTES).saturating_add(1);
@@ -171,10 +173,19 @@ pub fn run_validate(path: &Path, out: &mut impl Write, err: &mut impl Write) -> 
     let rules = config
         .firewall()
         .map_or(0, |firewall| firewall.rules().len());
+    let backend = match config.backend().af_xdp() {
+        None => format!("backend={}", config.backend().kind().config_name()),
+        Some(af_xdp) => format!(
+            "backend={} ports={} umem-bytes={}",
+            config.backend().kind().config_name(),
+            af_xdp.ports().len(),
+            af_xdp.umem_bytes()
+        ),
+    };
     let summary = format!(
         "valid: schema-version=1 interfaces={} routes={} neighbors={} local-ipv4={} \
          firewall-rules={} services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,firewall \
-         storage-bytes={}\n",
+         storage-bytes={} {backend}\n",
         config.interfaces().len(),
         config.routes().len(),
         config.neighbors().len(),

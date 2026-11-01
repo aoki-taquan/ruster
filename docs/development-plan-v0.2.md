@@ -100,6 +100,10 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   作り直さない（SIM-016 deferred）。process restartをまたぐgeneration/key履歴は無い。
 - OS乱数によるproduction key source（`OsRandomKeySource`）と、sim専用key sourceを型で拒否する
   `ProductionSequencer`はM2 S7で追加した（PUB-010〜013）。これを使う`ruster run`はまだ無い（M2）。
+- AF_XDP backendのversioned `[backend]` config（kind、portごとのqueue/mode/need-wakeup/attach/
+  ring/UMEM、existing-program policy）、bounded validation、restart-required classification、
+  `run-sim`の非sim backend拒否はM2 S9で追加した（CONFIG-004〜007、BACKEND-001〜003）。これを
+  使うsocket/UMEM/attach setupと`ruster run`はまだ無い（M2）。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
   ringのsaturationが無い（OBS-017/018 deferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
