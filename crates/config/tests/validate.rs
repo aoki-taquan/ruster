@@ -842,3 +842,40 @@ fn nat44_filtering_maps_onto_core_policies_per_protocol() {
             .replacen("idle-ttl-ms = 7440000\n", "idle-ttl-ms = 7439999\n", 1)
     }
 }
+
+#[test]
+fn nat44_hairpinning_maps_onto_core_policies_per_protocol() {
+    use ruster_core::{Nat44TcpPolicy, Nat44UdpPolicy};
+
+    let defaults = validated(VALID);
+    let nat = defaults.nat44().unwrap();
+    let (udp, tcp) = (nat.udp().unwrap().policy(), nat.tcp().unwrap().policy());
+    // Absent key: on, the RFC-conforming default, equal to the core default.
+    assert!(udp.hairpinning() && tcp.hairpinning());
+    assert!(Nat44UdpPolicy::default().hairpinning());
+    assert!(Nat44TcpPolicy::default().hairpinning());
+
+    let off = validated(
+        &VALID
+            .replacen(
+                "icmpv4-errors = \"external-only\"\n",
+                "icmpv4-errors = \"external-only\"\nhairpinning = false\n",
+                1,
+            )
+            .replacen(
+                "icmpv4-errors = \"disabled\"\n",
+                "icmpv4-errors = \"disabled\"\nhairpinning = false\n",
+                1,
+            ),
+    );
+    let off_nat = off.nat44().unwrap();
+    let (udp_off, tcp_off) = (
+        off_nat.udp().unwrap().policy(),
+        off_nat.tcp().unwrap().policy(),
+    );
+    assert!(!udp_off.hairpinning() && !tcp_off.hairpinning());
+    // Only the switch differs; storage shape does not depend on it.
+    assert_eq!(udp_off.with_hairpinning(true), udp);
+    assert_eq!(tcp_off.with_hairpinning(true), tcp);
+    assert_eq!(off.storage_shape(), defaults.storage_shape());
+}

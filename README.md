@@ -197,7 +197,7 @@ outside/public宛てICMPv4 Type 3/Code 4が
 引用するlive UDP mapping/ADF peerをread-only参照し、outer destinationと引用source tupleを
 insideへ戻します。outer sourceはexternal host-unicastかつoutsideへのreverse LPMを要求する
 local strict-uRPF policyで、asymmetric external pathを意図的に拒否します。中継routerの
-addressは引用remoteと異なっていても保存します。fragment、hairpin、private発の
+addressは引用remoteと異なっていても保存します。fragment、private発の
 ICMP error、他のtype/codeとquery NAT、local MTU起因のType 3/Code 4生成、PMTU cache、
 static forward、
 multi-public、port randomization/parity、full packet filterはdeferredで、RFC 4787/7857全体への
@@ -223,7 +223,7 @@ mapping再生成時は旧sessionを全走査せずgeneration+epochでlazyに無�
 TCP session idle TTLはdefault/minimumともに2時間4分です。sequence/window/ACK妥当性は追跡
 せず、FIN/RSTもsessionを削除・短縮せず通常のsuccessful TX requestとしてTTLだけをrefresh
 します。この保守的な単一timer profile、unsolicited SYNへのdelayed ICMP Port Unreachable
-（RFC 5382 REQ-4のSHOULD）を送らずsilent dropすること、fragment/hairpin未実装を明示し、
+（RFC 5382 REQ-4のSHOULD）を送らずsilent dropすること、fragment未実装を明示し、
 RFC 5382全体への準拠は主張しません。TCPもpolicyで
 opt-inしたType 3/Code 4だけ、引用public source portとexact live remote address/port sessionを
 read-only参照してinsideへ変換します。UDP-only/TCP-only wrapperは他方のprotocolがdomainを
@@ -263,6 +263,34 @@ remote-address directoryの一回のbounded lookupで、このdirectory分だけ
 mappingが既に話しているremote address（CDNやDNS serverなど）を詐称したSYNなら同じことができ
 ます（NAT44-041）。firewall判定より前に走るinbound SYNのNAT側workは、session capacityに
 よらず`NAT44_TCP_INBOUND_SLOT_PROBES`（16）slot/chain nodeまでに上限されます。
+
+NAT44 hairpinning（RFC 4787 §6 REQ-9、RFC 5382 §7.2 REQ-8）はUDP/TCPともdefaultで有効です。
+inside host X1がpublic address `P`のlive mapping `P:x2'`（X2のmapping。X1自身でもよい）へ
+送ったpacketを、X1自身のexternal mapping `P:x1'`をsourceにして（REQ-9 a / REQ-8 a）X2へ
+戻します。X1にmappingが無ければ通常のoutbound規則で作ります。一つのpacketを二つのNAT
+traversalとして扱い、それぞれatomicにcommitします。outbound half（X1のmappingとpeer/session）は
+同じhostの通常outbound packetと同じplanで、firewallはingress inside/egress outside、pre-SNAT
+`X1:x1 -> P:x2'`で評価します。inbound halfはdestination mappingのfilteringと、firewallの
+ingress outside/egress inside、post-DNAT `P:x1' -> X2:x2`で、通常inboundと同じに評価します。
+inbound halfが拒否されてもoutbound halfは残る（remote NATにdropされたoutbound packetと同じ）
+ため、defaultの`address-dependent`では最初のX1→X2'が`NAT44_UDP_HAIRPIN_FILTERED`/
+`NAT44_TCP_HAIRPIN_FILTERED`、続くX2→X1'が届き、以後双方向に通るhole punching（RFC 5128
+§3.3.2、TCPは§3.4 simultaneous open）になります。hairpinはfirewallのbypassにならず、outbound
+halfのfirewall deny、malformed、unknown mapping、offでは何もcommitしません。hairpin stateのremoteは
+router自身の`P`で、`P`をsourceとするoutside packetはcommon admissionで、`P`などrouter addressを
+引用remoteとするoutside ICMPv4 Type 3/Code 4は`NAT44_ICMPV4_QUOTED_REMOTE_LOCAL`でdropするため、
+外部からは使えません。`address-dependent`ではX1のpeer `P`がinside全host共通のwildcardになる
+（REQ-9 aから不可避。firewallはexact reverseを要求）点に注意してください。hairpinしたdatagram
+についてのICMP error（RFC 5508 REQ-7）は変換せずfail closedで、明示deviationです
+（architectureの「NAT44 hairpinning」）。
+
+```toml
+[nat44.udp]
+hairpinning = true   # 省略時true（RFC MUST）。false: NAT44_UDP_HAIRPIN_DISABLED でdrop（reloadable）
+
+[nat44.tcp]
+hairpinning = true   # false: NAT44_TCP_HAIRPIN_DISABLED。counter nat44_*.hairpin_disabled
+```
 
 IPv4 forward firewallは`forward_batch_with_firewall`を選んだworkerだけで有効です。immutableな
 ordered rule sliceとmutableなfixed-capacity state sliceをcallerが所有し、first-matchの
@@ -374,8 +402,9 @@ $B run-sim --scenario fixtures/m1/scenario.toml --hold
   planなので`all`（apply時に全live stateをflush）で、実際のflush数は`run-sim`の`apply` eventに
   出ます。capacityやresolution/ICMP/NAT/firewall policyの変更はrestart理由（`STORAGE_SHAPE`等）
   または`changed` flagとしてだけ出し、fieldごとの値は出しません。例外はsecretでないNAT
-  filteringで、`nat44-tcp filtering ~ address-dependent -> endpoint-independent`のように
-  値を出し、`policy ~ changed`はそれ以外のNAT policy変更だけを表します。interface labelは
+  filteringとhairpinningで、`nat44-tcp filtering ~ address-dependent -> endpoint-independent`、
+  `nat44-udp hairpinning ~ on -> off`のように値を出し、`policy ~ changed`はそれ以外のNAT
+  policy変更だけを表します。interface labelは
   `[A-Za-z0-9._-]`以外を`\xNN`でescapeします（configも同じcharsetと15 bytes上限を要求）。
   `--format jsonl`は未実装です。
 - `run-sim`はstepごと（tickは1回ずつ）に停止flagを確認します。`--hold`なしのrun中にsignalを

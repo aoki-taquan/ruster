@@ -757,7 +757,7 @@ fn structural_and_policy_failures_are_byte_and_state_atomic() {
                 &[],
                 UdpChecksum::Zero,
             ),
-            DropReason::Nat44UdpHairpinUnsupported,
+            DropReason::Nat44UdpMappingMiss,
         ),
     ];
     let mut io = SimIo::new();

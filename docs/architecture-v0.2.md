@@ -497,7 +497,7 @@ translated IPv4 address wordsとportを更新し、算術結果zeroをUDP wire�
 RFC 6864 atomic datagramとして保存します。RFC 1812 §4.2.2.3に従いreserved flagだけでは
 dropせず、IPv4 flags/fragment wordをNAT rewrite後のwireへそのまま保存します。
 
-fragment handling/reassembly、hairpinning、Type 3/Code 4以外のICMP errorとICMP query
+fragment handling/reassembly、Type 3/Code 4以外のICMP errorとICMP query
 NAT、static port forward、複数public address、port randomization/parity、minimal
 stateful sliceを越えるfull packet filterはdeferredです。RFC 3022/4787/7857の全機能準拠は
 主張しません。
@@ -572,10 +572,10 @@ dispatchします。opt-in ICMP error candidate以外のICMPとその他のproto
 の対象外で、どちらのruntime、watermark、counter、NAT traceも変更しません。ただし
 traditional NAT domain境界はprotocol非依存です。設定済みoutside→inside direct LPMと、
 変換不能なinside→outside protocolはneighbor lookup/ARP scheduleより前にgeneric fail-closeし、
-private sourceや外部から内部へのbypassを許可しません。runtime/config/snapshot mismatch、
-hairpinはneighbor処理やstate変更より前にtyped dropします。
+private sourceや外部から内部へのbypassを許可しません。runtime/config/snapshot mismatchはneighbor処理やstate変更より前にtyped dropします。
+inside発のpublic address宛てUDP/TCPは後述の「NAT44 hairpinning」で扱います。
 
-TCP fragment association/reassembly、hairpin translation、Type 3/Code 4以外のembedded ICMP
+TCP fragment association/reassembly、Type 3/Code 4以外のembedded ICMP
 translation、static forwards、sequence/window validation、full RFC 5382 lifecycle、
 safe FIN/RST cleanupはdeferredです。
 
@@ -621,7 +621,7 @@ filterを通ったinbound initial SYNは認証されておらず、firewallの�
 同じbucketに入るためchainはsession capacity近くまで伸び得ますが、lookupはどの場合も16 node
 までです。新sessionのslotは、exact tupleのexpired slotがあればそれを再利用し、無ければ
 16 slot以下のtableは全体を、それより大きいtableはruntimeのsecret hash key、tuple、時刻、
-probe番号から独立に決めた16個のslot位置だけを調べます。outboundのindex 0からの全scan
+probe番号から独立に決めた16個のslot位置だけを調べます。引いた位置が既に調べた位置と重なれば、まだ調べていない次の位置へ進める（最大15 step）ため、16 probeは常に互いに異なるslotを調べ、16 slotを少し超える小さくほぼ満杯のtableでも重複で空きを取り逃しません。outboundのindex 0からの全scan
 （NAT44-035）はinbound開始では使いません。外部senderは位置を選べず、再送SYNは別の位置を
 調べます。outbound作成がlive slotを低indexへ集めても各probeは独立なので、live率ρのとき
 missの確率は約ρ^16です（ρ = 1/2で約1.5×10^-5。連続16 slotの窓では窓がlive領域から始まると
@@ -674,6 +674,127 @@ filteringはpolicyの一部で、変更はreloadableです。storage shapeはmod
 ことはありません。`ApplyPlan`は`NatChange::filtering`をtyped deltaとして出し、seedを含む
 残りのpolicyの変更だけを`policy_changed`にします。
 
+## NAT44 hairpinning
+
+RFC 4787 §6 REQ-9（UDP）とRFC 5382 §7.2 REQ-8（TCP）はhairpinningをMUSTとし、REQ-9 a /
+REQ-8 aはhairpinしたpacketのsourceを「External source IP address and port」にすることを
+MUSTとします。inside host `X1:x1`がpublic address `P`のlive mapping `P:x2'`（inside host
+`X2:x2`のmapping。`X2 = X1`でもよい）へ送ったUDP/TCPを、`P:x1' -> X2:x2`としてinsideへ戻します。
+`P:x1'`はX1自身のexternal mappingで、無ければ通常のoutbound規則（EIM、port allocation）で
+作ります。対象はinside ingressでdestinationが`P`、protocolがそのruntimeのもの（UDPまたは
+TCP）であるpacketで、ordinary route lookupより前にinterceptします。UDP-only serviceへの
+TCP、TCP-only serviceへのUDPは従来どおり`*_UNSUPPORTED_TRANSPORT`です。
+
+### 二つのtraversal
+
+RFC 4787 §6はfilteringに触れませんが、hairpinしたpacketはNATを一度出て`P:x1'`から戻ってくる
+外部packetと同じ扱いにします。したがって一つのpacketを二つのNAT traversalとして扱い、
+それぞれをatomicにcommitします。
+
+1. **outbound half**: `X1:x1 -> P:x2'`を通常のoutbound packetとしてplanします。NAT planは
+   通常outboundと同じ関数（UDPはmapping + peer、TCPはmapping + session。新規作成は
+   TCP initial SYNだけ）で、firewallをbindしていれば通常outboundと同じcanonical tupleで
+   planします。source admission（host unicast、router/public addressでない、source
+   reverse-LPMがinside）、atomic IPv4/transport validation、TTL>1、destination portが
+   live mappingであることをread-onlyで確認してから、NATとfirewallのplanが両方成功した
+   場合だけ二つを続けてcommitします（TCPはprevalidate後）。packetはoutsideへ出ないため
+   outside route/neighborは要求しません。commitするstateは同じhostが通常のoutbound
+   packetで作るものと同一で、hairpinは新しいstate作成能力ではありません。remoteがrouter
+   自身の`P`なので、外部からこのstateを使うことはできません。`P`をsourceとするoutside
+   packetはcommon admissionの`IPV4_SOURCE_LOCAL_ADDRESS`でdropし、opt-in ICMPv4 Type 3/Code 4
+   変換は引用remoteがrouterのlocal address（`P`を含む）なら全lookup前に
+   `NAT44_ICMPV4_QUOTED_REMOTE_LOCAL`でdropします（outside由来の入力がremoteでNAT stateを
+   引くのはこの二経路だけで、firewallのRELATED lookupはNAT変換が復元したtupleに限られます）。
+   ただしslotの形が同じでも許可の意味は外部remote一つ分より広くなります。全inside hostの
+   external sourceは`P`なので（REQ-9 aから不可避）、`address-dependent`ではX1のpeer/session
+   `P`はどのinside hostからのhairpinも許すinside全体のwildcardです（`address-and-port-dependent`
+   は`P:x2'`一つ）。firewallは引き続き`P:x2' -> X1:x1`のexact reverseだけをestablishedと
+   します。
+2. **inbound half**: outbound half commit後のstateに対し、`P:x1' -> P:x2'`を通常の
+   inbound packetとしてplanします。destination mappingのfiltering（mode別、TCPはexact
+   sessionかfilterを通ったinitial SYN）、translated destinationのinside route、firewall、
+   inside neighborの順で、成功すればbytesをrewriteし、inbound NAT planとfirewall planを
+   TX request時にcommitします（通常inboundと同じ）。
+
+inbound halfが拒否された場合（NAT filter、firewall、session capacity、route/neighbor）、
+packetはbyte不変でdropしますが、outbound halfは残ります。remote NATにdropされたoutbound
+packetと同じで、同じNATの背後の二hostのhole punchingはこれに依存します（RFC 5128 §3.3.2の
+UDP、§3.4のTCP simultaneous open）。defaultの`address-dependent`では、最初のX1→`P:x2'`は
+X2のmappingが`P`へ送っていないため`NAT44_UDP_HAIRPIN_FILTERED`（TCPは
+`NAT44_TCP_HAIRPIN_FILTERED`）になりますが、X1のmappingに`P`のpeer/sessionを残します。
+続くX2→`P:x1'`はそのpeer/sessionで通り、以後X1→`P:x2'`も通ります。`endpoint-independent`
+では最初から通ります。inbound halfを評価する前にoutbound halfをcommitするため、self-hairpin
+（X1→`P:x1'`）は全modeで最初のpacketから届き、TCPでは同じsessionが両halfのexact sessionに
+なります。
+
+hairpinning off、malformed、unknown destination mapping、送信元authority違反、TTL≤1、
+outbound halfのNAT capacity不足やfirewall denyは何もcommitしません。translated destinationの
+route miss/`WrongEgress`はdefensive checkで、mappingをinside-routed sourceにしか作らず
+reconcileでflushする固定publicationでは到達しません。TTL≤1はICMP Time
+Exceededを生成しないsilent dropです（NAT inboundと同じ。deferred）。
+
+### firewall
+
+firewallは各halfを、それが表す通常traversalと同じ方向・tupleで評価します。
+
+| half | ingress | egress | source | destination | 通常traversalとの対応 |
+|---|---|---|---|---|---|
+| outbound | inside | outside | `X1:x1`（pre-SNAT） | `P:x2'`（pre-DNAT） | 通常outboundのpre-SNAT internal→remote |
+| inbound | outside | inside | `P:x1'`（post-SNAT） | `X2:x2`（post-DNAT） | 通常inboundのpost-DNAT remote→internal |
+
+auditはpacketごとにこの順で二recordを残します。inside→insideのrule（ingress = egress =
+inside）はhairpinに使いません。そのためoutbound-onlyのpolicy（M1）では、最初のpacketの
+inbound halfはunsolicited inboundとして`FIREWALL_DEFAULT_DENIED`になり、X2の返信のinbound
+halfはX1のoutbound half stateのexact reverseとして`ESTABLISHED`になります。実効admissionは
+NAT filteringとfirewallの積で、「X2が`P:x1'`という外部hostから受け取るもの」と一致します。
+inside hostはhairpinでfirewallが拒否するものに到達できず、通常outboundで拒否される宛先
+（たとえば`P:x2'`を拒否するrule）はoutbound halfで拒否されてstateを残しません。NAT44-021の
+outside→inside direct bypass拒否、route-miss時のNAT gate（#284）、realm mismatch、
+runtime/config authority検査はhairpin interceptと別経路で変わりません。
+
+### 変換とcounter
+
+source address/port（`X1:x1 -> P:x1'`）とdestination address/port（`P:x2' -> X2:x2`）、TTL、
+Ethernetを一つのplanでin-place rewriteし、IPv4 header checksumとUDP/TCP checksumはRFC
+1624で両address、両port、TTL/protocol wordをincremental更新します。UDP checksum zeroは保存、
+算術zeroは`0xffff`、TCPの算術zeroはwire zeroのままです。IPv4 ID/flagsとpayloadは保存します。
+per-packet allocation、shared lock、packet cloneはありません。workは通常のoutbound
+plan（NAT44-035のreusable-slot scanを含むcapacity有界のwork）、destination mappingの
+direct port-owner lookup一回、通常のinbound plan（TCP inbound session slotは16 probe上限）、
+firewall plan二回の和で有界です。
+
+counterはprotocolごとに`hairpin_translated`（両half commit）、`hairpin_inbound_refused`
+（outbound half commit後にinbound halfが拒否された数。通常の`filter_denied`/`session_misses`には
+数えない。`decide`後のTCP commit prevalidationとrewrite適用の失敗は逐次packet pathでは起きない
+前提なので数えない）、`hairpin_disabled`です。outbound halfは`mappings_*`/`peers_created`/`sessions_*`に
+数えますが、`outbound_translated`と`inbound_translated`にはどちらのhalfも数えません。
+
+### switch
+
+`Nat44UdpPolicy`/`Nat44TcpPolicy`の`hairpinning`はdefault true（RFC準拠）です。security上の
+理由でoperatorは`[nat44.udp]`/`[nat44.tcp]`の`hairpinning = false`でprotocolごとに切れます
+（RFC 1812 §1.1.3はdefaultが準拠するoptionを許す）。offではhairpin packetをNAT validation、
+NAT/firewall/resolution stateの変更、neighbor workより前に`NAT44_UDP_HAIRPIN_DISABLED` /
+`NAT44_TCP_HAIRPIN_DISABLED`でdropし`hairpin_disabled`に数えます。drop前にNAT runtimeの
+`observe_now`が通常のNAT packetと同じくclock watermarkとstate revisionを進め、firewallを
+bindしたworkerでは他のinside発packetと同じくfirewallのtransport preflightとclock watermarkも
+進みます。stable code 37/57は旧`*_HAIRPIN_UNSUPPORTED`の改名で、意味も狭まりました。旧codeは
+inside発のpublic address宛てのそのprotocol全部（UDP-only serviceへのTCPなどを含む）でしたが、
+新codeはそのprotocolのruntimeがhairpinning offの場合だけで、他protocolは
+`*_UNSUPPORTED_TRANSPORT`です。変更はfilteringと同じ
+reloadableで、storage shapeは変わらず、applyは全NAT stateをflushします。`ApplyPlan`は
+`NatChange::hairpinning`を`Delta<bool>`として出し、`policy_changed`には含めません。
+
+### RFC 5508 REQ-7
+
+RFC 5508 §5 REQ-7はhairpinしたICMP Error messageのtraversal（outer destinationをtranslation後の
+embedded sourceに合わせる等、outerとembeddedの二重変換）をMUSTとします。このsliceは前提の
+private→external ICMP error変換（REQ-5）を持たないため、hairpinしたdatagramについてinside
+hostが`P`宛てに返すICMP errorは他のnon-UDP/TCP inside→outside crossingと同じくfail closed
+です（`NAT44_UDP_UNSUPPORTED_TRANSPORT`、firewall bind時は`FIREWALL_UNSUPPORTED_PROTOCOL`）。
+hairpinningがdefault有効なので、これはREQ-7に対する明示deviationです（requirements
+NAT44-019I）。
+
 ## NAT44 ICMPv4 Fragmentation Needed translation
 
 `Nat44UdpPolicy`または`Nat44TcpPolicy`の`icmpv4_errors`を`ExternalOnly`へ明示設定した
@@ -724,7 +845,7 @@ RFC 1191およびRFC 5508 §7.1.2に関係する受信Type 3/Code 4として、u
 MTU 16 bitsは解釈・clampせず32 bitsすべてを保存します。MTU 0、68、1500、65535も同じです。
 local forwarding MTUとの比較、PMTU cache更新、MTU 0のplateau推定、local MTU超過時の
 Type 3/Code 4生成はまだありません。DF=0 packetの必要なfragmentation、private→externalの
-RFC 5508 REQ-5、hairpin ICMP errorのREQ-7、他のICMP error type/code、ICMP query NAT、
+RFC 5508 REQ-5、hairpin ICMP errorのREQ-7（hairpinning有効時のdeviation、後述）、他のICMP error type/code、ICMP query NAT、
 RFC 4884 full supportもdeferredです。
 
 ## Minimal IPv4 stateful forward firewall

@@ -121,6 +121,7 @@ pub struct Nat44UdpPolicy {
     allocator_seed: u64,
     icmpv4_errors: Nat44Icmpv4ErrorPolicy,
     filtering: Nat44Filtering,
+    hairpinning: bool,
 }
 
 impl std::fmt::Debug for Nat44UdpPolicy {
@@ -131,6 +132,7 @@ impl std::fmt::Debug for Nat44UdpPolicy {
             .field("allocator_seed", &Redacted)
             .field("icmpv4_errors", &self.icmpv4_errors)
             .field("filtering", &self.filtering)
+            .field("hairpinning", &self.hairpinning)
             .finish()
     }
 }
@@ -1021,6 +1023,144 @@ mod tcp_tests {
         });
     }
 
+    /// L-4: the keyed probes of a table just above the full-scan bound
+    /// visit 16 distinct slots, so with one free slot among 17 an inbound
+    /// SYN finds it on 16 of every 17 positions instead of missing whenever
+    /// two draws collide.
+    #[test]
+    fn tcp_inbound_slot_probes_never_repeat_a_position() {
+        const SESSIONS: usize = NAT44_TCP_INBOUND_SLOT_PROBES + 1;
+        let policy = Nat44TcpPolicy::default().with_filtering(Nat44Filtering::EndpointIndependent);
+        with_config(policy, 40_000, 40_000, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); SESSIONS];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            for port in 1..SESSIONS as u16 {
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, port, true, 0)
+                    .unwrap();
+                runtime.commit_outbound(plan, 0).unwrap();
+            }
+            // Exactly one free slot: the last one.
+            assert_eq!(
+                runtime
+                    .sessions()
+                    .iter()
+                    .filter(|slot| !slot.is_occupied())
+                    .count(),
+                1
+            );
+            let mut misses = 0;
+            for remote_port in 1..=170 {
+                runtime.reusable_session_checks.set(0);
+                match runtime.plan_inbound_read_only(40_000, REMOTE2, remote_port, true, 1) {
+                    Ok(_) => {}
+                    Err(Nat44TcpPlanError::SessionFull) => {
+                        misses += 1;
+                        // A miss inspected 16 distinct slots, all live.
+                        assert_eq!(
+                            runtime.reusable_session_checks.get(),
+                            NAT44_TCP_INBOUND_SLOT_PROBES
+                        );
+                    }
+                    Err(error) => panic!("unexpected {error:?}"),
+                }
+                assert!(runtime.reusable_session_checks.get() <= NAT44_TCP_INBOUND_SLOT_PROBES);
+            }
+            // Only the start position that excludes the free slot can miss:
+            // about 1/17 of SYNs (10 of 170). Independent draws with
+            // repeats missed about (16/17)^16 = 38% (65 of 170).
+            assert!(misses <= 25, "{misses} of 170 inbound SYNs missed");
+        });
+    }
+
+    /// A full table answers `SessionFull` on both slot-search branches
+    /// (full scan at 16 slots and below, distinct keyed probes above).
+    #[test]
+    fn full_small_tcp_session_tables_refuse_inbound_syn() {
+        for capacity in [
+            2,
+            NAT44_TCP_INBOUND_SLOT_PROBES,
+            NAT44_TCP_INBOUND_SLOT_PROBES + 1,
+        ] {
+            let policy =
+                Nat44TcpPolicy::default().with_filtering(Nat44Filtering::EndpointIndependent);
+            with_config(policy, 40_000, 40_000, |config| {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = vec![Nat44TcpSessionSlot::default(); capacity];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                for port in 1..=capacity as u16 {
+                    let plan = runtime
+                        .plan_outbound(INTERNAL, 40_000, REMOTE1, port, true, 0)
+                        .unwrap();
+                    runtime.commit_outbound(plan, 0).unwrap();
+                }
+                assert!(runtime.sessions().iter().all(|slot| slot.is_occupied()));
+                for remote_port in 1..=8 {
+                    runtime.reusable_session_checks.set(0);
+                    assert_eq!(
+                        runtime
+                            .plan_inbound_read_only(40_000, REMOTE2, remote_port, true, 1)
+                            .err(),
+                        Some(Nat44TcpPlanError::SessionFull),
+                        "capacity {capacity}"
+                    );
+                    assert!(
+                        runtime.reusable_session_checks.get()
+                            <= capacity.min(NAT44_TCP_INBOUND_SLOT_PROBES)
+                    );
+                }
+            });
+        }
+    }
+
+    /// L-5: a table of at most `NAT44_TCP_INBOUND_SLOT_PROBES` slots is
+    /// scanned whole, so its single free slot is always found, wherever it
+    /// is and whatever the tuple. (Capacity 1 cannot have a live mapping
+    /// with no live session, so it starts at 2.)
+    #[test]
+    fn small_tcp_session_table_with_one_free_slot_always_admits_inbound_syn() {
+        for capacity in [2, 5, NAT44_TCP_INBOUND_SLOT_PROBES] {
+            for free in 0..capacity {
+                let policy =
+                    Nat44TcpPolicy::default().with_filtering(Nat44Filtering::EndpointIndependent);
+                with_config(policy, 40_000, 40_000, |config| {
+                    let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                    let mut sessions = vec![Nat44TcpSessionSlot::default(); capacity];
+                    let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                    // Fill every slot at time 0, refresh all but `free` just
+                    // before the idle TTL, and look at the exact boundary,
+                    // where only `free` has expired.
+                    let ttl = config.policy.idle_ttl_ms();
+                    for at in [0, ttl - 1] {
+                        for port in 0..capacity as u16 {
+                            if at != 0 && usize::from(port) == free {
+                                continue;
+                            }
+                            let plan = runtime
+                                .plan_outbound(INTERNAL, 40_000, REMOTE1, port + 1, true, at)
+                                .unwrap();
+                            runtime.commit_outbound(plan, at).unwrap();
+                        }
+                    }
+                    let now = ttl;
+                    let reusable: Vec<usize> = (0..capacity)
+                        .filter(|&index| runtime.session_slot_reusable(index, now))
+                        .collect();
+                    assert_eq!(reusable, [free], "capacity {capacity}");
+                    for remote_port in 1..=8 {
+                        runtime.reusable_session_checks.set(0);
+                        let plan = runtime
+                            .plan_inbound_read_only(40_000, REMOTE2, remote_port, true, now)
+                            .unwrap_or_else(|error| panic!("capacity {capacity}: {error:?}"));
+                        assert_eq!(plan.session_index, free);
+                        assert!(runtime.reusable_session_checks.get() <= capacity);
+                    }
+                });
+            }
+        }
+    }
+
     #[test]
     fn tcp_inbound_syn_work_is_bounded_independent_of_session_capacity() {
         const SESSIONS: usize = 64;
@@ -1783,6 +1923,7 @@ impl Nat44UdpPolicy {
             allocator_seed,
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
             filtering: Nat44Filtering::AddressDependent,
+            hairpinning: true,
         })
     }
 
@@ -1819,6 +1960,24 @@ impl Nat44UdpPolicy {
     pub const fn filtering(self) -> Nat44Filtering {
         self.filtering
     }
+
+    /// Enables or disables hairpinning: an inside host addressing the
+    /// public address and port of a live mapping is translated back into
+    /// the inside realm with the external source address and port of its own
+    /// mapping (RFC 4787 REQ-9, REQ-9 a for UDP; RFC 5382 REQ-8 for TCP).
+    /// The default `true` conforms to those MUSTs; `false` is an RFC 1812
+    /// §1.1.3 security option that drops such packets before any NAT,
+    /// firewall, or resolution state changes.
+    #[must_use]
+    pub const fn with_hairpinning(mut self, enabled: bool) -> Self {
+        self.hairpinning = enabled;
+        self
+    }
+
+    #[must_use]
+    pub const fn hairpinning(self) -> bool {
+        self.hairpinning
+    }
 }
 
 impl Default for Nat44UdpPolicy {
@@ -1828,6 +1987,7 @@ impl Default for Nat44UdpPolicy {
             allocator_seed: 0,
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
             filtering: Nat44Filtering::AddressDependent,
+            hairpinning: true,
         }
     }
 }
@@ -2132,6 +2292,20 @@ pub struct Nat44UdpCounters {
     pub clock_regressions: u64,
     pub config_mismatches: u64,
     pub reconciliations: u64,
+    /// Hairpinned packets translated back into the inside realm (both
+    /// halves committed). Not counted in `outbound_translated` or
+    /// `inbound_translated`.
+    pub hairpin_translated: u64,
+    /// Hairpinned packets dropped after their outbound half committed: the
+    /// destination mapping's filtering, a bound firewall, capacity, or
+    /// inside route/neighbor work refused the inbound half. The sender's
+    /// mapping and filter state stay, as for an outbound packet a remote NAT
+    /// drops (hole punching, RFC 5128 §3.3.2 for UDP and §3.4 for TCP).
+    /// Filter refusals are not also counted in the ordinary inbound
+    /// miss/deny counters.
+    pub hairpin_inbound_refused: u64,
+    /// Hairpinned packets dropped because hairpinning is disabled.
+    pub hairpin_disabled: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2143,6 +2317,21 @@ pub enum Nat44UdpDisposition {
         peer_created: bool,
     },
     InboundTranslated {
+        internal_address: Ipv4Address,
+        internal_port: u16,
+    },
+    /// The outbound half of a hairpinned packet committed the sender's
+    /// mapping and filter state; `public_port` is its external source port.
+    HairpinOutboundCommitted {
+        public_port: u16,
+        mapping_created: bool,
+        peer_created: bool,
+    },
+    /// A hairpinned packet was translated back into the inside realm with
+    /// external source `public_port` and internal destination
+    /// `internal_address:internal_port`.
+    HairpinTranslated {
+        public_port: u16,
         internal_address: Ipv4Address,
         internal_port: u16,
     },
@@ -2200,6 +2389,14 @@ impl Nat44UdpOutboundPlan {
 
     pub(crate) const fn disposition(self) -> Nat44UdpDisposition {
         Nat44UdpDisposition::OutboundTranslated {
+            public_port: self.mapping.public_port,
+            mapping_created: self.mapping_created,
+            peer_created: self.peer_created,
+        }
+    }
+
+    pub(crate) const fn hairpin_disposition(self) -> Nat44UdpDisposition {
+        Nat44UdpDisposition::HairpinOutboundCommitted {
             public_port: self.mapping.public_port,
             mapping_created: self.mapping_created,
             peer_created: self.peer_created,
@@ -3045,6 +3242,26 @@ impl<'a> Nat44UdpRuntime<'a> {
         plan: Nat44UdpOutboundPlan,
         now_ms: u64,
     ) -> Result<(), Nat44UdpCommitError> {
+        self.commit_outbound_counted(plan, now_ms, false)
+    }
+
+    /// Commits the outbound half of a hairpinned packet: exactly the state
+    /// [`Self::commit_outbound`] commits for the same plan, without counting
+    /// an outbound translation (the packet does not leave the inside realm).
+    pub(crate) fn commit_hairpin_outbound(
+        &mut self,
+        plan: Nat44UdpOutboundPlan,
+        now_ms: u64,
+    ) -> Result<(), Nat44UdpCommitError> {
+        self.commit_outbound_counted(plan, now_ms, true)
+    }
+
+    fn commit_outbound_counted(
+        &mut self,
+        plan: Nat44UdpOutboundPlan,
+        now_ms: u64,
+        hairpin: bool,
+    ) -> Result<(), Nat44UdpCommitError> {
         self.revalidate_outbound_commit(plan, now_ms)?;
         let prepared = plan.prepared;
         if let Some(mutation) = prepared.mapping {
@@ -3093,7 +3310,9 @@ impl<'a> Nat44UdpRuntime<'a> {
         if plan.peer_created {
             self.counters.peers_created = self.counters.peers_created.saturating_add(1);
         }
-        self.counters.outbound_translated = self.counters.outbound_translated.saturating_add(1);
+        if !hairpin {
+            self.counters.outbound_translated = self.counters.outbound_translated.saturating_add(1);
+        }
         debug_assert!(self.validate_indexes().is_ok());
         Ok(())
     }
@@ -3163,6 +3382,26 @@ impl<'a> Nat44UdpRuntime<'a> {
         plan: Nat44UdpInboundPlan,
         now_ms: u64,
     ) -> Result<(), Nat44UdpCommitError> {
+        self.commit_inbound_counted(plan, now_ms, false)
+    }
+
+    /// Commits the inbound half of a hairpinned packet, planned after its
+    /// outbound half committed. Counts `hairpin_translated` instead of
+    /// `inbound_translated`.
+    pub(crate) fn commit_hairpin_inbound(
+        &mut self,
+        plan: Nat44UdpInboundPlan,
+        now_ms: u64,
+    ) -> Result<(), Nat44UdpCommitError> {
+        self.commit_inbound_counted(plan, now_ms, true)
+    }
+
+    fn commit_inbound_counted(
+        &mut self,
+        plan: Nat44UdpInboundPlan,
+        now_ms: u64,
+        hairpin: bool,
+    ) -> Result<(), Nat44UdpCommitError> {
         if plan.expected_runtime_epoch != self.runtime_epoch {
             return Err(Nat44UdpCommitError::RuntimeEpochChanged);
         }
@@ -3187,7 +3426,11 @@ impl<'a> Nat44UdpRuntime<'a> {
             .ok_or(Nat44UdpCommitError::StateRevisionExhausted)?;
         self.watermark_ms = Some(now_ms);
         self.state_revision = next_revision;
-        self.counters.inbound_translated = self.counters.inbound_translated.saturating_add(1);
+        if hairpin {
+            self.counters.hairpin_translated = self.counters.hairpin_translated.saturating_add(1);
+        } else {
+            self.counters.inbound_translated = self.counters.inbound_translated.saturating_add(1);
+        }
         debug_assert!(self.validate_indexes().is_ok());
         Ok(())
     }
@@ -3226,6 +3469,26 @@ impl<'a> Nat44UdpRuntime<'a> {
         if error == Nat44UdpPlanError::ClockRegression {
             self.counters.clock_regressions = self.counters.clock_regressions.saturating_add(1);
         }
+    }
+
+    pub(crate) fn record_hairpin_disabled(&mut self) {
+        self.counters.hairpin_disabled = self.counters.hairpin_disabled.saturating_add(1);
+    }
+
+    pub(crate) fn record_hairpin_inbound_refused(&mut self) {
+        self.counters.hairpin_inbound_refused =
+            self.counters.hairpin_inbound_refused.saturating_add(1);
+    }
+
+    /// Read-only: does `public_port` belong to a live mapping? A hairpinned
+    /// packet to an unknown public port commits nothing, not even its
+    /// outbound half.
+    pub(crate) fn hairpin_destination_is_live(
+        &self,
+        public_port: u16,
+        now_ms: u64,
+    ) -> Result<bool, Nat44UdpPlanError> {
+        Ok(self.mapping_for_public_port(public_port, now_ms)?.is_some())
     }
 
     /// Read-only authority for a quoted outbound UDP packet. The quoted
@@ -3864,6 +4127,7 @@ pub struct Nat44TcpPolicy {
     allocator_seed: u64,
     icmpv4_errors: Nat44Icmpv4ErrorPolicy,
     filtering: Nat44Filtering,
+    hairpinning: bool,
 }
 
 impl std::fmt::Debug for Nat44TcpPolicy {
@@ -3874,6 +4138,7 @@ impl std::fmt::Debug for Nat44TcpPolicy {
             .field("allocator_seed", &Redacted)
             .field("icmpv4_errors", &self.icmpv4_errors)
             .field("filtering", &self.filtering)
+            .field("hairpinning", &self.hairpinning)
             .finish()
     }
 }
@@ -3898,6 +4163,7 @@ impl Nat44TcpPolicy {
             allocator_seed,
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
             filtering: Nat44Filtering::AddressDependent,
+            hairpinning: true,
         })
     }
 
@@ -3934,6 +4200,24 @@ impl Nat44TcpPolicy {
     pub const fn filtering(self) -> Nat44Filtering {
         self.filtering
     }
+
+    /// Enables or disables hairpinning: an inside host addressing the
+    /// public address and port of a live mapping is translated back into
+    /// the inside realm with the external source address and port of its own
+    /// mapping (RFC 4787 REQ-9, REQ-9 a for UDP; RFC 5382 REQ-8 for TCP).
+    /// The default `true` conforms to those MUSTs; `false` is an RFC 1812
+    /// §1.1.3 security option that drops such packets before any NAT,
+    /// firewall, or resolution state changes.
+    #[must_use]
+    pub const fn with_hairpinning(mut self, enabled: bool) -> Self {
+        self.hairpinning = enabled;
+        self
+    }
+
+    #[must_use]
+    pub const fn hairpinning(self) -> bool {
+        self.hairpinning
+    }
 }
 
 impl Default for Nat44TcpPolicy {
@@ -3943,6 +4227,7 @@ impl Default for Nat44TcpPolicy {
             allocator_seed: 0,
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
             filtering: Nat44Filtering::AddressDependent,
+            hairpinning: true,
         }
     }
 }
@@ -4230,6 +4515,20 @@ pub struct Nat44TcpCounters {
     pub clock_regressions: u64,
     pub config_mismatches: u64,
     pub reconciliations: u64,
+    /// Hairpinned packets translated back into the inside realm (both
+    /// halves committed). Not counted in `outbound_translated` or
+    /// `inbound_translated`.
+    pub hairpin_translated: u64,
+    /// Hairpinned packets dropped after their outbound half committed: the
+    /// destination mapping's filtering, a bound firewall, capacity, or
+    /// inside route/neighbor work refused the inbound half. The sender's
+    /// mapping and filter state stay, as for an outbound packet a remote NAT
+    /// drops (hole punching, RFC 5128 §3.3.2 for UDP and §3.4 for TCP).
+    /// Filter refusals are not also counted in the ordinary inbound
+    /// miss/deny counters.
+    pub hairpin_inbound_refused: u64,
+    /// Hairpinned packets dropped because hairpinning is disabled.
+    pub hairpin_disabled: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4241,6 +4540,21 @@ pub enum Nat44TcpDisposition {
         session_created: bool,
     },
     InboundTranslated {
+        internal_address: Ipv4Address,
+        internal_port: u16,
+    },
+    /// The outbound half of a hairpinned segment committed the sender's
+    /// mapping and session; `public_port` is its external source port.
+    HairpinOutboundCommitted {
+        public_port: u16,
+        mapping_created: bool,
+        session_created: bool,
+    },
+    /// A hairpinned segment was translated back into the inside realm with
+    /// external source `public_port` and internal destination
+    /// `internal_address:internal_port`.
+    HairpinTranslated {
+        public_port: u16,
         internal_address: Ipv4Address,
         internal_port: u16,
     },
@@ -4298,6 +4612,14 @@ impl Nat44TcpOutboundPlan {
 
     pub(crate) const fn disposition(self) -> Nat44TcpDisposition {
         Nat44TcpDisposition::OutboundTranslated {
+            public_port: self.mapping.public_port,
+            mapping_created: self.mapping_created,
+            session_created: self.session_created,
+        }
+    }
+
+    pub(crate) const fn hairpin_disposition(self) -> Nat44TcpDisposition {
+        Nat44TcpDisposition::HairpinOutboundCommitted {
             public_port: self.mapping.public_port,
             mapping_created: self.mapping_created,
             session_created: self.session_created,
@@ -5271,9 +5593,12 @@ impl<'a> Nat44TcpRuntime<'a> {
     /// steer the positions, and a retransmitted SYN probes others. Probes
     /// are independent of where outbound creation clusters live slots (it
     /// fills from index 0), so with live fraction ρ a miss has probability
-    /// about ρ^16 (well under 10^-4 at ρ = 1/2). A miss is `SessionFull`
-    /// even if a reusable slot exists elsewhere; the outbound path keeps its
-    /// full scan.
+    /// about ρ^16 (well under 10^-4 at ρ = 1/2). The probed positions are
+    /// distinct: a drawn position that repeats an earlier probe moves to the
+    /// next position not yet probed (at most 15 steps), so every probe checks
+    /// a new slot and a small, nearly full table is not missed for repeated
+    /// draws. A miss is `SessionFull` even if a reusable slot exists
+    /// elsewhere; the outbound path keeps its full scan.
     fn find_reusable_session_for_inbound(
         &self,
         mapping_index: usize,
@@ -5297,16 +5622,31 @@ impl<'a> Nat44TcpRuntime<'a> {
             now_ms,
             0,
         ];
-        (0..NAT44_TCP_INBOUND_SLOT_PROBES as u64)
-            .map(|probe| {
-                words[5] = probe;
-                let position = self
-                    .hash_key
-                    .0
-                    .hash_words(DirectoryHashDomain::TcpInboundSlot, &words);
-                usize::try_from(position % capacity as u64).expect("index below capacity")
-            })
-            .find(|&index| self.session_slot_reusable(index, now_ms))
+        let mut probed = [0_usize; NAT44_TCP_INBOUND_SLOT_PROBES];
+        for probe in 0..NAT44_TCP_INBOUND_SLOT_PROBES {
+            words[5] = probe as u64;
+            let position = self
+                .hash_key
+                .0
+                .hash_words(DirectoryHashDomain::TcpInboundSlot, &words);
+            let mut index =
+                usize::try_from(position % capacity as u64).expect("index below capacity");
+            // `capacity` exceeds the probes made so far, so an unprobed
+            // position is at most `probe` steps away. The step count is
+            // also bounded on its own, independent of the full-scan branch
+            // above.
+            debug_assert!(capacity > NAT44_TCP_INBOUND_SLOT_PROBES);
+            let mut steps = 0;
+            while steps < NAT44_TCP_INBOUND_SLOT_PROBES && probed[..probe].contains(&index) {
+                index = if index + 1 == capacity { 0 } else { index + 1 };
+                steps += 1;
+            }
+            probed[probe] = index;
+            if self.session_slot_reusable(index, now_ms) {
+                return Some(index);
+            }
+        }
+        None
     }
 
     /// Filtering decision for an inbound initial SYN without an exact live
@@ -5407,6 +5747,26 @@ impl<'a> Nat44TcpRuntime<'a> {
     }
 
     pub(crate) fn commit_prevalidated_outbound(&mut self, plan: Nat44TcpOutboundPlan, now_ms: u64) {
+        self.commit_prevalidated_outbound_counted(plan, now_ms, false);
+    }
+
+    /// Commits the prevalidated outbound half of a hairpinned segment:
+    /// exactly the state [`Self::commit_prevalidated_outbound`] commits for
+    /// the same plan, without counting an outbound translation.
+    pub(crate) fn commit_prevalidated_hairpin_outbound(
+        &mut self,
+        plan: Nat44TcpOutboundPlan,
+        now_ms: u64,
+    ) {
+        self.commit_prevalidated_outbound_counted(plan, now_ms, true);
+    }
+
+    fn commit_prevalidated_outbound_counted(
+        &mut self,
+        plan: Nat44TcpOutboundPlan,
+        now_ms: u64,
+        hairpin: bool,
+    ) {
         if let Some(mutation) = plan.prepared.mapping {
             self.apply_mapping_mutation(mutation);
         }
@@ -5447,7 +5807,9 @@ impl<'a> Nat44TcpRuntime<'a> {
         } else {
             self.counters.sessions_reused = self.counters.sessions_reused.saturating_add(1);
         }
-        self.counters.outbound_translated = self.counters.outbound_translated.saturating_add(1);
+        if !hairpin {
+            self.counters.outbound_translated = self.counters.outbound_translated.saturating_add(1);
+        }
     }
 
     #[allow(dead_code)] // Typed stale-plan API retained for core callers and tests.
@@ -5479,6 +5841,26 @@ impl<'a> Nat44TcpRuntime<'a> {
     }
 
     pub(crate) fn commit_prevalidated_inbound(&mut self, plan: Nat44TcpInboundPlan, now_ms: u64) {
+        self.commit_prevalidated_inbound_counted(plan, now_ms, false);
+    }
+
+    /// Commits the prevalidated inbound half of a hairpinned segment,
+    /// planned after its outbound half committed. Counts
+    /// `hairpin_translated` instead of `inbound_translated`.
+    pub(crate) fn commit_prevalidated_hairpin_inbound(
+        &mut self,
+        plan: Nat44TcpInboundPlan,
+        now_ms: u64,
+    ) {
+        self.commit_prevalidated_inbound_counted(plan, now_ms, true);
+    }
+
+    fn commit_prevalidated_inbound_counted(
+        &mut self,
+        plan: Nat44TcpInboundPlan,
+        now_ms: u64,
+        hairpin: bool,
+    ) {
         self.apply_session_link(plan.prepared);
         self.mappings[plan.mapping_index] = plan.mapping;
         self.sessions[plan.session_index] = plan.session;
@@ -5494,7 +5876,11 @@ impl<'a> Nat44TcpRuntime<'a> {
         } else {
             self.counters.sessions_reused = self.counters.sessions_reused.saturating_add(1);
         }
-        self.counters.inbound_translated = self.counters.inbound_translated.saturating_add(1);
+        if hairpin {
+            self.counters.hairpin_translated = self.counters.hairpin_translated.saturating_add(1);
+        } else {
+            self.counters.inbound_translated = self.counters.inbound_translated.saturating_add(1);
+        }
     }
 
     fn plan_authority(
@@ -5565,6 +5951,26 @@ impl<'a> Nat44TcpRuntime<'a> {
         if error == Nat44TcpPlanError::ClockRegression {
             self.counters.clock_regressions = self.counters.clock_regressions.saturating_add(1);
         }
+    }
+
+    pub(crate) fn record_hairpin_disabled(&mut self) {
+        self.counters.hairpin_disabled = self.counters.hairpin_disabled.saturating_add(1);
+    }
+
+    pub(crate) fn record_hairpin_inbound_refused(&mut self) {
+        self.counters.hairpin_inbound_refused =
+            self.counters.hairpin_inbound_refused.saturating_add(1);
+    }
+
+    /// Read-only: does `public_port` belong to a live mapping? A hairpinned
+    /// segment to an unknown public port commits nothing, not even its
+    /// outbound half.
+    pub(crate) fn hairpin_destination_is_live(
+        &self,
+        public_port: u16,
+        now_ms: u64,
+    ) -> Result<bool, Nat44TcpPlanError> {
+        Ok(self.mapping_for_public_port(public_port, now_ms)?.is_some())
     }
 
     pub(crate) fn inspect_icmpv4(
@@ -6324,22 +6730,22 @@ mod tests {
         assert_eq!(
             format!("{udp_policy:?}"),
             "Nat44UdpPolicy { idle_ttl_ms: 120000, allocator_seed: [REDACTED], \
-             icmpv4_errors: ExternalOnly, filtering: AddressDependent }"
+             icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true }"
         );
         assert_eq!(
             format!("{udp_policy:#?}"),
             "Nat44UdpPolicy {\n    idle_ttl_ms: 120000,\n    allocator_seed: [REDACTED],\n    \
-             icmpv4_errors: ExternalOnly,\n    filtering: AddressDependent,\n}"
+             icmpv4_errors: ExternalOnly,\n    filtering: AddressDependent,\n    hairpinning: true,\n}"
         );
         assert_eq!(
             format!("{tcp_policy:?}"),
             "Nat44TcpPolicy { idle_ttl_ms: 7440000, allocator_seed: [REDACTED], \
-             icmpv4_errors: ExternalOnly, filtering: AddressDependent }"
+             icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true }"
         );
         assert_eq!(
             format!("{tcp_policy:#?}"),
             "Nat44TcpPolicy {\n    idle_ttl_ms: 7440000,\n    allocator_seed: [REDACTED],\n    \
-             icmpv4_errors: ExternalOnly,\n    filtering: AddressDependent,\n}"
+             icmpv4_errors: ExternalOnly,\n    filtering: AddressDependent,\n    hairpinning: true,\n}"
         );
 
         with_config(udp_policy, |udp_config| {
@@ -6371,7 +6777,7 @@ mod tests {
                 "Nat44UdpConfig { inside: IfId(1), outside: IfId(2), public_address: \
                  Ipv4Address(3405803786), first_port: 40000, last_port: 40001, policy: \
                  Nat44UdpPolicy { idle_ttl_ms: 120000, allocator_seed: [REDACTED], \
-                 icmpv4_errors: ExternalOnly, filtering: AddressDependent }, authority: \
+                 icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true }, authority: \
                  [REDACTED], snapshot_identity: \
                  [REDACTED] }"
             );
@@ -6380,7 +6786,7 @@ mod tests {
                 "Nat44TcpConfig { inside: IfId(1), outside: IfId(2), public_address: \
                  Ipv4Address(3405803786), first_port: 40000, last_port: 40001, policy: \
                  Nat44TcpPolicy { idle_ttl_ms: 7440000, allocator_seed: [REDACTED], \
-                 icmpv4_errors: ExternalOnly, filtering: AddressDependent }, authority: \
+                 icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true }, authority: \
                  [REDACTED], snapshot_identity: \
                  [REDACTED] }"
             );
@@ -6392,7 +6798,7 @@ mod tests {
                  2,\n    ),\n    public_address: Ipv4Address(\n        3405803786,\n    ),\n    \
                  first_port: 40000,\n    last_port: 40001,\n    policy: Nat44UdpPolicy {\n        \
                  idle_ttl_ms: 120000,\n        allocator_seed: [REDACTED],\n        icmpv4_errors: \
-                 ExternalOnly,\n        filtering: AddressDependent,\n    },\n    authority: \
+                 ExternalOnly,\n        filtering: AddressDependent,\n        hairpinning: true,\n    },\n    authority: \
                  [REDACTED],\n    snapshot_identity: \
                  [REDACTED],\n}"
             );
@@ -6402,7 +6808,7 @@ mod tests {
                  2,\n    ),\n    public_address: Ipv4Address(\n        3405803786,\n    ),\n    \
                  first_port: 40000,\n    last_port: 40001,\n    policy: Nat44TcpPolicy {\n        \
                  idle_ttl_ms: 7440000,\n        allocator_seed: [REDACTED],\n        icmpv4_errors: \
-                 ExternalOnly,\n        filtering: AddressDependent,\n    },\n    authority: \
+                 ExternalOnly,\n        filtering: AddressDependent,\n        hairpinning: true,\n    },\n    authority: \
                  [REDACTED],\n    snapshot_identity: \
                  [REDACTED],\n}"
             );
@@ -6847,6 +7253,9 @@ mod tests {
                 "clock_regressions",
                 "config_mismatches",
                 "reconciliations",
+                "hairpin_translated",
+                "hairpin_inbound_refused",
+                "hairpin_disabled",
             ]
         );
         assert_eq!(
@@ -6870,6 +7279,9 @@ mod tests {
                 "clock_regressions",
                 "config_mismatches",
                 "reconciliations",
+                "hairpin_translated",
+                "hairpin_inbound_refused",
+                "hairpin_disabled",
             ]
         );
         assert_eq!(

@@ -225,6 +225,10 @@ pub struct Nat44UdpV1 {
     /// Inbound filtering; absent means `address-dependent`.
     #[serde(default)]
     pub filtering: Nat44FilteringV1,
+    /// Hairpinning (RFC 4787 REQ-9 / RFC 5382 REQ-8); absent means `true`.
+    /// `false` is an RFC 1812 §1.1.3 security option.
+    #[serde(default = "enabled")]
+    pub hairpinning: bool,
     pub capacity: Nat44UdpCapacityV1,
 }
 
@@ -244,6 +248,10 @@ pub struct Nat44TcpV1 {
     /// Inbound filtering; absent means `address-dependent`.
     #[serde(default)]
     pub filtering: Nat44FilteringV1,
+    /// Hairpinning (RFC 4787 REQ-9 / RFC 5382 REQ-8); absent means `true`.
+    /// `false` is an RFC 1812 §1.1.3 security option.
+    #[serde(default = "enabled")]
+    pub hairpinning: bool,
     pub capacity: Nat44TcpCapacityV1,
 }
 

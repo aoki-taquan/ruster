@@ -308,6 +308,59 @@ fn nat_filtering_is_a_reloadable_typed_delta_separate_from_the_policy_flag() {
 }
 
 #[test]
+fn nat_hairpinning_is_a_reloadable_typed_delta_separate_from_the_policy_flag() {
+    const UDP: &str = "icmpv4-errors = \"external-only\"\n";
+    const TCP: &str = "allocator-seed = \"11\"\n";
+    // Spelling out the default (on) is no change.
+    only(
+        &plan(&[
+            (
+                UDP,
+                "icmpv4-errors = \"external-only\"\nhairpinning = true\n",
+            ),
+            (TCP, "allocator-seed = \"11\"\nhairpinning = true\n"),
+        ]),
+        &[],
+    );
+
+    let udp = plan(&[(
+        UDP,
+        "icmpv4-errors = \"external-only\"\nhairpinning = false\n",
+    )]);
+    only(&udp, &["nat44_udp"]);
+    assert_eq!(
+        udp.nat44_udp().hairpinning,
+        Some(Delta {
+            old: true,
+            new: false
+        })
+    );
+    assert_eq!(udp.nat44_udp().filtering, None);
+    // A switch-only change does not set the opaque policy flag and is not
+    // restart-required: storage does not depend on it.
+    assert!(!udp.nat44_udp().policy_changed);
+    assert!(udp.restart_required().is_empty());
+    assert_eq!(udp.nat44_tcp().hairpinning, None);
+
+    let tcp = plan(&[(TCP, "allocator-seed = \"12\"\nhairpinning = false\n")]);
+    only(&tcp, &["nat44_tcp"]);
+    assert_eq!(
+        tcp.nat44_tcp().hairpinning,
+        Some(Delta {
+            old: true,
+            new: false
+        })
+    );
+    // Another policy change alongside still raises the opaque flag.
+    assert!(tcp.nat44_tcp().policy_changed);
+    assert!(tcp.restart_required().is_empty());
+    assert_eq!(
+        config(&[]).storage_shape(),
+        config(&[(TCP, "allocator-seed = \"11\"\nhairpinning = false\n")]).storage_shape()
+    );
+}
+
+#[test]
 fn plan_classifies_interface_shape_and_policy_changes_as_restart_required() {
     let interface = plan(&[INTERFACE_CHANGE]);
     only(&interface, &["interfaces", "restart"]);

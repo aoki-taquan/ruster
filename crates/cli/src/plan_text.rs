@@ -166,6 +166,14 @@ fn nat(lines: &mut Vec<String>, kind: &str, change: NatChange) {
             new.config_name()
         ));
     }
+    if let Some(Delta { old, new }) = change.hairpinning {
+        let switch = |enabled: bool| if enabled { "on" } else { "off" };
+        lines.push(format!(
+            "{kind} hairpinning ~ {} -> {}",
+            switch(old),
+            switch(new)
+        ));
+    }
     if change.policy_changed {
         lines.push(format!("{kind} policy ~ changed"));
     }

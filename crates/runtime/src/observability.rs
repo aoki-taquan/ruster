@@ -1083,7 +1083,7 @@ impl ObservableFields for ServiceCounters {
             mappings_created, mappings_reused, mappings_expired, peers_created,
             outbound_translated, inbound_translated, mapping_misses, filter_denied,
             mapping_full, peer_full, port_exhausted, clock_regressions, config_mismatches,
-            reconciliations,
+            reconciliations, hairpin_translated, hairpin_inbound_refused, hairpin_disabled,
         }}
         visit_counts! {v, "nat44_tcp", self.nat44_tcp, Nat44TcpCounters {
             mappings_created, mappings_reused, mappings_expired, sessions_created,
@@ -1091,6 +1091,7 @@ impl ObservableFields for ServiceCounters {
             inbound_translated, mapping_misses, session_misses, invalid_initial_flags,
             mapping_full, session_full,
             port_exhausted, clock_regressions, config_mismatches, reconciliations,
+            hairpin_translated, hairpin_inbound_refused, hairpin_disabled,
         }}
         visit_counts! {v, "firewall", self.firewall, FirewallCounters {
             allowed_new, allowed_established, denied_by_rule, denied_default, invalid_packets,
