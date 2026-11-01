@@ -74,6 +74,9 @@ pub enum KeySourceError {
     EntropyOpen(std::io::ErrorKind),
     /// The entropy path is not a character device.
     EntropyNotCharacterDevice,
+    /// The entropy path is a character device, but not the kernel CSPRNG
+    /// (`/dev/urandom` 1:9 or `/dev/random` 1:8), for example `/dev/zero`.
+    EntropyUnexpectedDevice,
     /// Reading the entropy device failed (`EINTR` is retried, not reported).
     EntropyRead(std::io::ErrorKind),
     /// The entropy device reached end of file before a full key set was read.

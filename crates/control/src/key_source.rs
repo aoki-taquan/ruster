@@ -2,8 +2,11 @@
 //! and the sealed marker that production entry points require.
 //!
 //! [`OsRandomKeySource`] reads `/dev/urandom` through `std` (no new
-//! dependency, no `unsafe`). The device is opened once, by
-//! [`OsRandomKeySource::open`], and must be a character device. Each
+//! dependency, no `unsafe`). On kernels before 5.18 `/dev/urandom` may serve
+//! output from a not yet seeded CRNG early in boot; `getrandom(2)` is a
+//! follow-up. The device is opened once, by
+//! [`OsRandomKeySource::open`], and must be the Linux `/dev/urandom` (1:9)
+//! or `/dev/random` (1:8) character device. Each
 //! publication draws 48 fresh bytes (two 64-bit words for each of the UDP
 //! NAT44, TCP NAT44, and firewall keys). Short reads are continued,
 //! `EINTR` is retried, and every other outcome is a typed, value-free
@@ -30,7 +33,7 @@ use std::{
     fs::File,
     io::{ErrorKind, Read},
     num::NonZeroU64,
-    os::unix::fs::FileTypeExt,
+    os::unix::fs::{FileTypeExt, MetadataExt},
     path::Path,
 };
 
@@ -46,6 +49,18 @@ const DEVICE: &str = "/dev/urandom";
 
 /// Bytes drawn per publication: three keys of two `u64` words each.
 const KEY_SET_BYTES: usize = 48;
+
+/// Linux `(major, minor)` numbers of the kernel CSPRNG devices:
+/// `/dev/urandom` (1:9) and `/dev/random` (1:8).
+const CSPRNG_DEVICES: &[(u64, u64)] = &[(1, 9), (1, 8)];
+
+/// Splits a Linux `dev_t` into `(major, minor)` (glibc/kernel huge encoding,
+/// matching `major(3)`/`minor(3)`).
+const fn device_numbers(rdev: u64) -> (u64, u64) {
+    let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & 0xffff_f000);
+    let minor = (rdev & 0xff) | ((rdev >> 12) & 0xffff_ff00);
+    (major, minor)
+}
 
 mod sealed {
     pub trait Sealed {}
@@ -115,18 +130,22 @@ impl OsRandomKeySource {
     /// Open the source before dropping privileges or changing root, so the
     /// device stays readable for the whole process.
     pub fn open() -> Result<Self, KeySourceError> {
-        Self::open_at(Path::new(DEVICE))
+        Self::open_at(Path::new(DEVICE), CSPRNG_DEVICES)
     }
 
-    /// Opens `path` as the entropy device. Private seam for failure
-    /// injection: production always uses [`DEVICE`].
-    fn open_at(path: &Path) -> Result<Self, KeySourceError> {
+    /// Opens `path` as the entropy device and requires its device number to
+    /// be one of `accepted`. Private seam for failure injection: production
+    /// always uses [`DEVICE`] and [`CSPRNG_DEVICES`].
+    fn open_at(path: &Path, accepted: &[(u64, u64)]) -> Result<Self, KeySourceError> {
         let device = File::open(path).map_err(|error| KeySourceError::EntropyOpen(error.kind()))?;
         let metadata = device
             .metadata()
             .map_err(|error| KeySourceError::EntropyOpen(error.kind()))?;
         if !metadata.file_type().is_char_device() {
             return Err(KeySourceError::EntropyNotCharacterDevice);
+        }
+        if !accepted.contains(&device_numbers(metadata.rdev())) {
+            return Err(KeySourceError::EntropyUnexpectedDevice);
         }
         Ok(Self { device })
     }

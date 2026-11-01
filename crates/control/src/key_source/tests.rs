@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::{keys_from, OsRandomKeySource, KEY_SET_BYTES};
+use super::{device_numbers, keys_from, OsRandomKeySource, CSPRNG_DEVICES, KEY_SET_BYTES};
 use crate::{
     plan::tests::{config, ROUTE_CHANGE},
     ConfigBridgeError, KeySourceError, KeySourceKind, ProductionKeySource, ProductionSequencer,
@@ -141,6 +141,37 @@ fn production_guard_rejects_simulation_key_sources() {
 }
 
 #[test]
+fn only_the_kernel_csprng_devices_are_accepted() {
+    assert_eq!(device_numbers(0x109), (1, 9));
+    assert_eq!(device_numbers(0x108), (1, 8));
+    // Huge encoding: major 0x1234, minor 0x56789.
+    let rdev: u64 = ((0x1234_u64 & 0xfff) << 8)
+        | ((0x1234_u64 & !0xfff) << 32)
+        | (0x5_6789_u64 & 0xff)
+        | ((0x5_6789_u64 & !0xff) << 12);
+    assert_eq!(device_numbers(rdev), (0x1234, 0x5_6789));
+
+    for path in ["/dev/urandom", "/dev/random"] {
+        OsRandomKeySource::open_at(Path::new(path), CSPRNG_DEVICES).expect(path);
+    }
+    // /dev/zero (1:5) would only be caught later by AllZeroKey; /dev/null
+    // (1:3) and /dev/full (1:7) are other memory devices. All fail at open.
+    for path in ["/dev/zero", "/dev/null", "/dev/full"] {
+        assert_eq!(
+            OsRandomKeySource::open_at(Path::new(path), CSPRNG_DEVICES).err(),
+            Some(KeySourceError::EntropyUnexpectedDevice),
+            "{path}"
+        );
+    }
+    // AllZeroKey stays as defense in depth for a source that does yield zeros.
+    let mut zeros = OsRandomKeySource::open_at(Path::new("/dev/zero"), &[(1, 5)]).unwrap();
+    assert_eq!(
+        zeros.publication_keys(NonZeroU64::MIN).err(),
+        Some(KeySourceError::AllZeroKey(RuntimeService::Nat44Udp))
+    );
+}
+
+#[test]
 fn entropy_reads_retry_interrupts_and_continue_short_reads() {
     let mut steps = vec![Step::Fail(ErrorKind::Interrupted)];
     for chunk in PATTERN.chunks(5) {
@@ -191,21 +222,22 @@ fn entropy_failures_are_typed_and_yield_no_publication() {
 
     // Unopenable or wrong-kind devices fail at construction.
     assert_eq!(
-        OsRandomKeySource::open_at(&manifest_path("no-such-entropy-device")).err(),
+        OsRandomKeySource::open_at(&manifest_path("no-such-entropy-device"), CSPRNG_DEVICES).err(),
         Some(KeySourceError::EntropyOpen(ErrorKind::NotFound))
     );
     assert_eq!(
-        OsRandomKeySource::open_at(&manifest_path("src")).err(),
+        OsRandomKeySource::open_at(&manifest_path("src"), CSPRNG_DEVICES).err(),
         Some(KeySourceError::EntropyNotCharacterDevice)
     );
     assert_eq!(
-        OsRandomKeySource::open_at(&manifest_path("Cargo.toml")).err(),
+        OsRandomKeySource::open_at(&manifest_path("Cargo.toml"), CSPRNG_DEVICES).err(),
         Some(KeySourceError::EntropyNotCharacterDevice)
     );
 
-    // A character device that yields no bytes: the sequencer consumes the
-    // generation, issues no candidate, and never falls back.
-    let empty = OsRandomKeySource::open_at(Path::new("/dev/null")).expect("char device");
+    // A character device that yields no bytes (the seam admits /dev/null,
+    // 1:3, which production rejects): the sequencer consumes the generation,
+    // issues no candidate, and never falls back.
+    let empty = OsRandomKeySource::open_at(Path::new("/dev/null"), &[(1, 3)]).expect("char device");
     let mut sequencer = ProductionSequencer::new(empty);
     let a = config(&[]);
     for generation in 1..=2 {
@@ -271,6 +303,7 @@ fn os_random_source_and_errors_are_redacted() {
     for error in [
         KeySourceError::EntropyOpen(ErrorKind::NotFound),
         KeySourceError::EntropyNotCharacterDevice,
+        KeySourceError::EntropyUnexpectedDevice,
         KeySourceError::EntropyEndOfFile,
     ] {
         let rendered = format!("{error:?}");

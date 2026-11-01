@@ -1315,8 +1315,9 @@ hash key、generationを持たず、validationはmutationを起こしません�
 出ません。
 
 production key sourceは`OsRandomKeySource`（KIND=`OperatingSystemRandom`）です。`open`で
-`/dev/urandom`を`std`だけで一度開いてcharacter deviceであることを確かめ、publicationごとに
-48 bytesを新たに読みます。short readは続きを読み、`EINTR`は再試行し、それ以外のopen/read失敗、
+`/dev/urandom`を`std`だけで一度開いてcharacter deviceかつdevice番号1:9/1:8であることを確かめ、
+publicationごとに48 bytesを新たに読みます。kernel 5.18未満の`/dev/urandom`は起動初期にseed前の
+CRNG出力を返しうるため、`getrandom(2)`化はfollow-upです。short readは続きを読み、`EINTR`は再試行し、それ以外のopen/read失敗、
 EOF、all-zero keyはvalue-freeな`KeySourceError`（`ErrorKind`だけを持つ）になり、予測可能な
 keyへfallbackしません。generation採番、key再利用拒否、rollbackは`PublicationSequencer`の
 ままです。live trafficの入口は`ProductionSequencer`で、sealed marker `ProductionKeySource`
