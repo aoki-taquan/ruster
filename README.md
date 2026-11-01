@@ -32,7 +32,9 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   `RX → resolution timer → failure dispatch → generated ARP → generated ICMPv4`を
   明示budget付きのsingle-worker tickとして実行する。`TickObserver`はtraceとして渡す
   allocation-freeなsaturating counter sinkで、drop/consume reason別数、tick集計、注入時刻
-  だけによるhealth、generation/apply結果をtick境界で固定順snapshotにする。
+  だけによるhealth、generation/apply結果、NAT44/firewall/ICMPv4 limiter state tableの占有
+  （割当済みslot数、generation内high-water、capacity、flushを越えるpeak。coreがO(1)で保守し
+  table scanなし）をtick境界で固定順snapshotにする。
 - `ruster-config`: 最大1 MiBのUTF-8 TOMLをschema versionでpredispatchし、V1の
   interface/address/route/neighbor/NAT44/firewall/capacity/tick budget DTOへexact decode
   する。unknown/duplicate field、runtime生成値、過大listをvalue-freeなtyped diagnosticで
@@ -469,7 +471,7 @@ $B run-sim --scenario fixtures/m1/scenario.toml --hold
   sleepを挟みます。stderrの`ruster run-sim: holding`行がhold開始の目印で、hold中はidle tickごとに
   stdoutをflushします。signal受信後はtick境界で止まり、backendのpublication quiescence
   （未完了batch、live lease、未完了TXなし）を確認してから`final` event（counter、health、
-  generation）を書きます。
+  generation、state table占有）を書きます。
 - exit status: `0`成功（restart-requiredのplan、signalによるordered shutdownを含む）、
   `1` runtime/I/O/invariant失敗とscenarioの`expect`/`apply`不一致、`2` usage errorと
   invalid config/scenario（未知interface名を含む）。file read失敗（存在しない、読めない）は

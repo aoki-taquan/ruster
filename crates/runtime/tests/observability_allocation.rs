@@ -11,14 +11,16 @@ use std::{
 
 use observability_support::*;
 use ruster_core::{
-    ConsumeReason, DropReason, ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy,
-    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, MonotonicMillis, ResolutionActionSlot,
+    ConsumeReason, DirectoryBucket, DropReason, FirewallRuntime, FirewallStateSlot,
+    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
+    Icmpv4ErrorStateSlot, MonotonicMillis, Nat44TcpHashKey, Nat44TcpIndexStorage, Nat44TcpRuntime,
+    Nat44UdpHashKey, Nat44UdpIndexStorage, Nat44UdpRuntime, PortOwnerSlot, ResolutionActionSlot,
     ResolutionFailureHoldSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot,
 };
 use ruster_io_sim::SimIo;
 use ruster_runtime::{
-    run_tick, ApplyFlushCounts, BackendStats, HealthState, PublicationOutcome, TickBudgets,
-    TickObserver,
+    run_tick, ApplyFlushCounts, BackendStats, HealthState, PublicationOutcome, ServiceOccupancy,
+    TickBudgets, TickObserver,
 };
 
 struct CountingAllocator;
@@ -102,6 +104,37 @@ fn observability_sink_is_allocation_free_in_steady_state() {
         tcp_config: tcp_config(&snapshot),
         firewall_config: firewall_config(&snapshot),
     };
+    // Occupancy is sampled from these alongside the publication's ICMPv4
+    // error runtime; the accessors are O(1) whatever the storage holds.
+    let mut udp_owner = [PortOwnerSlot::default(); 1];
+    let mut tcp_owner = [PortOwnerSlot::default(); 1];
+    let no_buckets: &mut [DirectoryBucket] = &mut [];
+    let nat44_udp = Nat44UdpRuntime::new(
+        udp_config(&snapshot),
+        &mut [],
+        &mut [],
+        Nat44UdpIndexStorage::new(no_buckets, &mut [], &mut [], &mut [], &mut udp_owner),
+        Nat44UdpHashKey::new(3, 4).unwrap(),
+    )
+    .unwrap();
+    let nat44_tcp = Nat44TcpRuntime::new(
+        tcp_config(&snapshot),
+        &mut [],
+        &mut [],
+        Nat44TcpIndexStorage::new(
+            &mut [],
+            &mut [],
+            &mut [],
+            &mut [],
+            &mut [],
+            &mut [],
+            &mut tcp_owner,
+        ),
+        Nat44TcpHashKey::new(5, 6).unwrap(),
+    )
+    .unwrap();
+    let mut firewall_states = [FirewallStateSlot::default(); 4];
+    let firewall = FirewallRuntime::new(firewall_config(&snapshot), &mut firewall_states);
     let mut io = SimIo::new();
     let mut observer = TickObserver::default();
     let budgets = TickBudgets {
@@ -154,6 +187,12 @@ fn observability_sink_is_allocation_free_in_steady_state() {
         if report.publication == PublicationOutcome::Applied {
             assert!(observer.record_apply_flush(generation, ApplyFlushCounts::default()));
         }
+        observer.record_occupancy(ServiceOccupancy::capture(
+            publication.icmpv4_errors,
+            &nat44_udp,
+            &nat44_tcp,
+            &firewall,
+        ));
         last = Some((observer.snapshot(now), io.backend_stats()));
         while io.pop_recycled().is_some() {}
         while io.pop_tx().is_some() {}
@@ -197,6 +236,8 @@ fn observability_sink_is_allocation_free_in_steady_state() {
     assert_eq!(snapshot.totals.apply_flushes_recorded, applies);
     assert_eq!(snapshot.generation, NonZeroU64::new(1 + applies));
     assert_eq!(snapshot.generation_changes, applies);
+    assert_eq!(snapshot.occupancy.samples, TICKS);
+    assert_eq!(snapshot.occupancy.firewall_states.capacity, 3);
     assert_eq!(backend.injected, PER_TICK * ticks);
     assert_eq!(backend.tx_high_watermark, 1);
 }

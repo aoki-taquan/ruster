@@ -14,7 +14,8 @@ use crate::{
         PortOwnerToken, PreparedDirectoryLink, PreparedDirectoryRelink,
         PreparedPortOwnerMoveTopology,
     },
-    route, DirectoryBucket, DirectoryNode, ForwardingSnapshot, IfId, Ipv4Address, PortOwnerSlot,
+    route, DirectoryBucket, DirectoryNode, ForwardingSnapshot, IfId, Ipv4Address, OccupancyCounter,
+    PortOwnerSlot, TableOccupancy,
 };
 
 pub const NAT44_UDP_MIN_IDLE_TTL_MS: u64 = 120_000;
@@ -453,6 +454,119 @@ mod tcp_tests {
                     .mappings()
                     .iter()
                     .all(|slot| slot.last_activity_ms == 0));
+            },
+        );
+    }
+
+    /// `(occupied, high_water, capacity)` of one table.
+    fn tcp_table(table: TableOccupancy) -> (usize, usize, usize) {
+        (table.occupied(), table.high_water(), table.capacity())
+    }
+
+    /// The O(1) counters equal a full scan of the slots they count.
+    fn assert_tcp_occupancy_exact(runtime: &Nat44TcpRuntime<'_>) {
+        let occupancy = runtime.occupancy();
+        let mappings = runtime
+            .mappings()
+            .iter()
+            .filter(|slot| slot.occupied)
+            .count();
+        let sessions = runtime
+            .sessions()
+            .iter()
+            .filter(|slot| slot.occupied)
+            .count();
+        let external = runtime
+            .sessions()
+            .iter()
+            .filter(|slot| slot.occupied && slot.external_inbound)
+            .count();
+        assert_eq!(occupancy.mappings.occupied(), mappings);
+        assert_eq!(occupancy.sessions.occupied(), sessions);
+        assert_eq!(occupancy.external_inbound_sessions.occupied(), external);
+        for table in [
+            occupancy.mappings,
+            occupancy.sessions,
+            occupancy.external_inbound_sessions,
+        ] {
+            assert!(table.occupied() <= table.high_water());
+            assert!(table.high_water() <= table.capacity());
+        }
+    }
+
+    #[test]
+    fn tcp_occupancy_is_exact_across_insert_expiry_reuse_and_flush() {
+        let ttl = NAT44_TCP_DEFAULT_IDLE_TTL_MS;
+        with_config(
+            quota_policy(Nat44Filtering::AddressDependent, 0),
+            40_000,
+            40_000,
+            |config| {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 3];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                let occupancy = runtime.occupancy();
+                assert_eq!(tcp_table(occupancy.mappings), (0, 0, 1));
+                assert_eq!(tcp_table(occupancy.sessions), (0, 0, 3));
+                assert_eq!(tcp_table(occupancy.external_inbound_sessions), (0, 0, 3));
+
+                // Insert: outbound mapping/session, then two inbound-created
+                // sessions admitted by the outbound session's filter.
+                outbound_syn(&mut runtime, REMOTE1, 443, 0);
+                assert_tcp_occupancy_exact(&runtime);
+                assert_eq!(tcp_table(runtime.occupancy().mappings), (1, 1, 1));
+                assert_eq!(tcp_table(runtime.occupancy().sessions), (1, 1, 3));
+                let first = inbound_syn(&mut runtime, REMOTE1, 1001, 1).unwrap();
+                inbound_syn(&mut runtime, REMOTE1, 1002, 2).unwrap();
+                assert_tcp_occupancy_exact(&runtime);
+                let occupancy = runtime.occupancy();
+                assert_eq!(tcp_table(occupancy.sessions), (3, 3, 3));
+                assert_eq!(tcp_table(occupancy.external_inbound_sessions), (2, 2, 3));
+
+                // A refresh keeps the mapping and outbound session live.
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, false, ttl / 2)
+                    .unwrap();
+                runtime.commit_outbound(plan, ttl / 2).unwrap();
+                assert_eq!(runtime.occupancy(), occupancy);
+
+                // Expiry is lazy: the first inbound session expired at
+                // `ttl + 1` but stays counted until its slot is reused.
+                assert!(runtime
+                    .plan_inbound(40_000, REMOTE1, 1001, false, ttl + 1)
+                    .is_err());
+                assert_eq!(runtime.occupancy(), occupancy);
+
+                // Reuse: an outbound SYN reclaims that expired slot in place.
+                // The table count stays, the inbound-created count drops, and
+                // its high-water mark does not.
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 450, true, ttl + 1)
+                    .unwrap();
+                assert_eq!(plan.session_index(), first);
+                runtime.commit_outbound(plan, ttl + 1).unwrap();
+                assert_tcp_occupancy_exact(&runtime);
+                let occupancy = runtime.occupancy();
+                assert_eq!(tcp_table(occupancy.mappings), (1, 1, 1));
+                assert_eq!(tcp_table(occupancy.sessions), (3, 3, 3));
+                assert_eq!(tcp_table(occupancy.external_inbound_sessions), (1, 2, 3));
+                assert_eq!(runtime.counters().sessions_expired, 1);
+
+                // Flush resets every count and high-water mark.
+                runtime
+                    .reconcile(config, rotated_test_tcp_hash_key())
+                    .unwrap();
+                assert_tcp_occupancy_exact(&runtime);
+                let occupancy = runtime.occupancy();
+                assert_eq!(tcp_table(occupancy.mappings), (0, 0, 1));
+                assert_eq!(tcp_table(occupancy.sessions), (0, 0, 3));
+                assert_eq!(tcp_table(occupancy.external_inbound_sessions), (0, 0, 3));
+                outbound_syn(&mut runtime, REMOTE2, 443, 0);
+                assert_eq!(tcp_table(runtime.occupancy().sessions), (1, 1, 3));
+                assert_eq!(
+                    tcp_table(runtime.occupancy().external_inbound_sessions),
+                    (0, 0, 3)
+                );
             },
         );
     }
@@ -2141,6 +2255,7 @@ mod tcp_tests {
                     let mut model_sessions: [Option<ModelSession>; SESSION_CAPACITY] =
                         [None; SESSION_CAPACITY];
                     let mut next_model_identity = 1_u64;
+                    let mut previous_occupancy = runtime.occupancy();
                     let mut random = seed;
                     let mut now = 0_u64;
                     for step in 0..BUDGET {
@@ -2298,6 +2413,16 @@ mod tcp_tests {
                         }
 
                         assert_eq!(runtime.validate_indexes(), Ok(()));
+                        assert_tcp_occupancy_exact(&runtime);
+                        let occupancy = runtime.occupancy();
+                        assert!(
+                            occupancy.mappings.high_water()
+                                >= previous_occupancy.mappings.high_water()
+                                && occupancy.sessions.high_water()
+                                    >= previous_occupancy.sessions.high_water(),
+                            "seed={seed} step={step}"
+                        );
+                        previous_occupancy = occupancy;
                         let runtime_live_mappings = runtime
                             .mappings()
                             .iter()
@@ -2766,6 +2891,13 @@ impl Nat44UdpPeerSlot {
     pub const fn remote_port(self) -> u16 {
         self.remote_port
     }
+}
+
+/// Slot occupancy of a [`Nat44UdpRuntime`]; see [`Nat44UdpRuntime::occupancy`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Nat44UdpOccupancy {
+    pub mappings: TableOccupancy,
+    pub peers: TableOccupancy,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -3315,6 +3447,9 @@ pub struct Nat44UdpRuntime<'a> {
     #[allow(dead_code)] // Retained as defense-in-depth for the publication owner.
     reconcile_binding: Nat44UdpReconcileBinding,
     counters: Nat44UdpCounters,
+    /// Allocated mapping and peer slots; see [`Nat44UdpRuntime::occupancy`].
+    mapping_occupancy: OccupancyCounter,
+    peer_occupancy: OccupancyCounter,
     #[cfg(test)]
     mapping_lookup_probes: Cell<usize>,
     #[cfg(test)]
@@ -3381,6 +3516,8 @@ impl<'a> Nat44UdpRuntime<'a> {
             state_revision: 0,
             reconcile_binding,
             counters: Nat44UdpCounters::default(),
+            mapping_occupancy: OccupancyCounter::default(),
+            peer_occupancy: OccupancyCounter::default(),
             #[cfg(test)]
             mapping_lookup_probes: Cell::new(0),
             #[cfg(test)]
@@ -3419,6 +3556,23 @@ impl<'a> Nat44UdpRuntime<'a> {
     #[must_use]
     pub fn peers(&self) -> &[Nat44UdpPeerSlot] {
         self.peers
+    }
+
+    /// Exact allocated mapping and filter-peer slots and their high-water
+    /// marks since construction or the last reconcile flush, in O(1).
+    ///
+    /// A slot counts from the outbound commit that first fills it until a
+    /// reconcile flush. Expiry is lazy and an expired slot is reclaimed by
+    /// overwriting it in place, so expired mappings and peers of expired or
+    /// recreated mappings still count until a flush. Within one generation
+    /// the counts therefore never decrease and equal the number of distinct
+    /// slots used since the flush.
+    #[must_use]
+    pub fn occupancy(&self) -> Nat44UdpOccupancy {
+        Nat44UdpOccupancy {
+            mappings: self.mapping_occupancy.snapshot(self.mappings.len()),
+            peers: self.peer_occupancy.snapshot(self.peers.len()),
+        }
     }
 
     #[must_use]
@@ -3509,6 +3663,8 @@ impl<'a> Nat44UdpRuntime<'a> {
         let peers_flushed = self.peers.iter().filter(|peer| peer.occupied).count();
         self.mappings.fill(Nat44UdpMappingSlot::default());
         self.peers.fill(Nat44UdpPeerSlot::default());
+        self.mapping_occupancy.flush();
+        self.peer_occupancy.flush();
         self.mapping_directory.clear_with_key(hash_key.0);
         self.peer_directory.clear_with_key(hash_key.0);
         self.port_owners.reconfigure_prevalidated_and_clear(
@@ -3777,9 +3933,14 @@ impl<'a> Nat44UdpRuntime<'a> {
         {
             self.mappings[index].port_owned = false;
         }
+        let mapping_before = self.mappings[plan.mapping_index()].occupied;
         self.mappings[plan.mapping_index()] = plan.mapping;
+        self.mapping_occupancy
+            .transition(mapping_before, plan.mapping.occupied);
         if let (Some(index), Some(peer)) = (plan.peer_index(), plan.peer) {
+            let peer_before = self.peers[index].occupied;
             self.peers[index] = peer;
+            self.peer_occupancy.transition(peer_before, peer.occupied);
         }
         self.watermark_ms = Some(now_ms);
         self.state_revision = self
@@ -5090,6 +5251,14 @@ impl Nat44TcpSessionSlot {
     }
 }
 
+/// Slot occupancy of a [`Nat44TcpRuntime`]; see [`Nat44TcpRuntime::occupancy`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Nat44TcpOccupancy {
+    pub mappings: TableOccupancy,
+    pub sessions: TableOccupancy,
+    pub external_inbound_sessions: TableOccupancy,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Nat44TcpCounters {
     pub mappings_created: u64,
@@ -5631,6 +5800,11 @@ pub struct Nat44TcpRuntime<'a> {
     #[allow(dead_code)]
     runtime_binding: Nat44TcpRuntimeBinding,
     counters: Nat44TcpCounters,
+    /// Allocated mapping, session, and external-inbound session slots; see
+    /// [`Nat44TcpRuntime::occupancy`].
+    mapping_occupancy: OccupancyCounter,
+    session_occupancy: OccupancyCounter,
+    external_inbound_occupancy: OccupancyCounter,
     #[cfg(test)]
     mapping_liveness_checks: Cell<usize>,
     #[cfg(test)]
@@ -5722,6 +5896,9 @@ impl<'a> Nat44TcpRuntime<'a> {
             state_revision: 0,
             runtime_binding,
             counters: Nat44TcpCounters::default(),
+            mapping_occupancy: OccupancyCounter::default(),
+            session_occupancy: OccupancyCounter::default(),
+            external_inbound_occupancy: OccupancyCounter::default(),
             #[cfg(test)]
             mapping_liveness_checks: Cell::new(0),
             #[cfg(test)]
@@ -5760,6 +5937,29 @@ impl<'a> Nat44TcpRuntime<'a> {
     #[must_use]
     pub fn sessions(&self) -> &[Nat44TcpSessionSlot] {
         self.sessions
+    }
+
+    /// Exact allocated mapping and session slots and their high-water marks
+    /// since construction or the last reconcile flush, in O(1).
+    ///
+    /// A slot counts from the commit that first fills it until a reconcile
+    /// flush. Expiry is lazy and an expired slot is reclaimed by overwriting
+    /// it in place, so expired mappings and sessions still count until a
+    /// flush, and within one generation the counts never decrease.
+    /// `external_inbound_sessions` counts the allocated session slots whose
+    /// current session was created by an external inbound initial SYN
+    /// ([`Nat44TcpSessionSlot::is_external_inbound`]); it drops when such a
+    /// slot is reused by an outbound-created session. Its capacity is the
+    /// session capacity.
+    #[must_use]
+    pub fn occupancy(&self) -> Nat44TcpOccupancy {
+        Nat44TcpOccupancy {
+            mappings: self.mapping_occupancy.snapshot(self.mappings.len()),
+            sessions: self.session_occupancy.snapshot(self.sessions.len()),
+            external_inbound_sessions: self
+                .external_inbound_occupancy
+                .snapshot(self.sessions.len()),
+        }
     }
 
     pub fn storage_shape(&self) -> Nat44TcpStorageShape {
@@ -5840,6 +6040,9 @@ impl<'a> Nat44TcpRuntime<'a> {
         let sessions_flushed = self.sessions.iter().filter(|slot| slot.occupied).count();
         self.mappings.fill(Nat44TcpMappingSlot::default());
         self.sessions.fill(Nat44TcpSessionSlot::default());
+        self.mapping_occupancy.flush();
+        self.session_occupancy.flush();
+        self.external_inbound_occupancy.flush();
         self.mapping_directory.clear_with_key(hash_key.0);
         self.session_directory.clear_with_key(hash_key.0);
         self.session_address_directory.clear_with_key(hash_key.0);
@@ -6517,8 +6720,8 @@ impl<'a> Nat44TcpRuntime<'a> {
         {
             self.mappings[displaced].port_owned = false;
         }
-        self.mappings[plan.mapping_index()] = plan.mapping;
-        self.sessions[plan.session_index()] = plan.session;
+        self.write_mapping_slot(plan.mapping_index(), plan.mapping);
+        self.write_session_slot(plan.session_index(), plan.session);
         self.watermark_ms = Some(now_ms);
         self.state_revision = plan.authority.state_revision + 1;
         if plan.mapping_created {
@@ -6593,8 +6796,8 @@ impl<'a> Nat44TcpRuntime<'a> {
         hairpin: bool,
     ) {
         self.apply_session_link(plan.prepared);
-        self.mappings[plan.mapping_index] = plan.mapping;
-        self.sessions[plan.session_index] = plan.session;
+        self.write_mapping_slot(plan.mapping_index, plan.mapping);
+        self.write_session_slot(plan.session_index, plan.session);
         self.watermark_ms = Some(now_ms);
         self.state_revision = plan.authority.state_revision + 1;
         if plan.session_created {
@@ -6612,6 +6815,25 @@ impl<'a> Nat44TcpRuntime<'a> {
         } else {
             self.counters.inbound_translated = self.counters.inbound_translated.saturating_add(1);
         }
+    }
+
+    /// Overwrites one mapping slot and its O(1) occupancy counter.
+    fn write_mapping_slot(&mut self, index: usize, mapping: Nat44TcpMappingSlot) {
+        let before = self.mappings[index].occupied;
+        self.mappings[index] = mapping;
+        self.mapping_occupancy.transition(before, mapping.occupied);
+    }
+
+    /// Overwrites one session slot and its O(1) occupancy counters.
+    fn write_session_slot(&mut self, index: usize, session: Nat44TcpSessionSlot) {
+        let before = self.sessions[index];
+        self.sessions[index] = session;
+        self.session_occupancy
+            .transition(before.occupied, session.occupied);
+        self.external_inbound_occupancy.transition(
+            before.occupied && before.external_inbound,
+            session.occupied && session.external_inbound,
+        );
     }
 
     fn plan_authority(
@@ -8527,6 +8749,147 @@ mod tests {
             assert!(runtime
                 .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 200)
                 .is_ok());
+        });
+    }
+
+    /// `(occupied, high_water, capacity)` of one table.
+    fn udp_table(table: TableOccupancy) -> (usize, usize, usize) {
+        (table.occupied(), table.high_water(), table.capacity())
+    }
+
+    /// The O(1) counters equal a full scan of the slots they count.
+    fn assert_udp_occupancy_exact(runtime: &Nat44UdpRuntime<'_>) {
+        let occupancy = runtime.occupancy();
+        let mappings = runtime
+            .mappings()
+            .iter()
+            .filter(|slot| slot.occupied)
+            .count();
+        let peers = runtime.peers().iter().filter(|slot| slot.occupied).count();
+        assert_eq!(occupancy.mappings.occupied(), mappings);
+        assert_eq!(occupancy.peers.occupied(), peers);
+        for table in [occupancy.mappings, occupancy.peers] {
+            assert!(table.occupied() <= table.high_water());
+            assert!(table.high_water() <= table.capacity());
+        }
+    }
+
+    fn udp_outbound(
+        runtime: &mut Nat44UdpRuntime<'_>,
+        internal: Ipv4Address,
+        remote: Ipv4Address,
+        now: u64,
+    ) {
+        let plan = runtime
+            .plan_outbound(internal, 40_000, remote, TEST_REMOTE_PORT, now)
+            .unwrap();
+        runtime.commit_outbound(plan, now).unwrap();
+        assert_udp_occupancy_exact(runtime);
+    }
+
+    #[test]
+    fn udp_occupancy_is_exact_across_insert_expiry_reuse_and_flush() {
+        let ttl = NAT44_UDP_MIN_IDLE_TTL_MS;
+        let policy = Nat44UdpPolicy::new(ttl, 11).unwrap();
+        with_config(policy, |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 2];
+            let mut peers = [Nat44UdpPeerSlot::default(); 3];
+            let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
+            assert_eq!(udp_table(runtime.occupancy().mappings), (0, 0, 2));
+            assert_eq!(udp_table(runtime.occupancy().peers), (0, 0, 3));
+
+            // Insert: a mapping and its first filter peer, then a second peer.
+            udp_outbound(&mut runtime, INTERNAL, REMOTE1, 0);
+            assert_eq!(udp_table(runtime.occupancy().mappings), (1, 1, 2));
+            assert_eq!(udp_table(runtime.occupancy().peers), (1, 1, 3));
+            udp_outbound(&mut runtime, INTERNAL, REMOTE2, 1);
+            // A refresh of existing state changes nothing.
+            udp_outbound(&mut runtime, INTERNAL, REMOTE1, 1);
+            assert_eq!(udp_table(runtime.occupancy().mappings), (1, 1, 2));
+            assert_eq!(udp_table(runtime.occupancy().peers), (2, 2, 3));
+
+            // Expiry is lazy: an expired mapping and its peers stay allocated
+            // and counted, even after a refused lookup at the later time.
+            assert!(matches!(
+                runtime.plan_inbound(40_000, REMOTE1, TEST_REMOTE_PORT, ttl + 1),
+                Err(Nat44UdpPlanError::MappingMiss)
+            ));
+            assert_eq!(runtime.occupancy().mappings.occupied(), 1);
+            assert_eq!(runtime.occupancy().peers.occupied(), 2);
+
+            // Reclaim: a new mapping reuses the expired slot in place and its
+            // peer reuses a stale peer slot, so neither count moves.
+            udp_outbound(&mut runtime, INTERNAL2, REMOTE1, ttl + 1);
+            assert_eq!(runtime.counters().mappings_expired, 1);
+            assert_eq!(udp_table(runtime.occupancy().mappings), (1, 1, 2));
+            assert_eq!(udp_table(runtime.occupancy().peers), (2, 2, 3));
+            // A second live mapping fills the free mapping slot.
+            udp_outbound(&mut runtime, INTERNAL, REMOTE2, ttl + 1);
+            assert_eq!(udp_table(runtime.occupancy().mappings), (2, 2, 2));
+            assert!(runtime.occupancy().peers.occupied() >= 2);
+
+            // Flush resets both counts and high-water marks.
+            runtime.reconcile(config, rotated_udp_hash_key()).unwrap();
+            assert_udp_occupancy_exact(&runtime);
+            assert_eq!(udp_table(runtime.occupancy().mappings), (0, 0, 2));
+            assert_eq!(udp_table(runtime.occupancy().peers), (0, 0, 3));
+            // The next generation starts its own high-water mark.
+            udp_outbound(&mut runtime, INTERNAL, REMOTE1, 0);
+            assert_eq!(udp_table(runtime.occupancy().mappings), (1, 1, 2));
+            assert_eq!(udp_table(runtime.occupancy().peers), (1, 1, 3));
+        });
+    }
+
+    #[test]
+    fn udp_occupancy_matches_a_scan_under_seeded_churn() {
+        const MAPPINGS: usize = 5;
+        const PEERS: usize = 7;
+        let ttl = NAT44_UDP_MIN_IDLE_TTL_MS;
+        with_config(Nat44UdpPolicy::new(ttl, 3).unwrap(), |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); MAPPINGS];
+            let mut peers = [Nat44UdpPeerSlot::default(); PEERS];
+            let mut runtime_indexes = TestNat44UdpIndexes::new(config, MAPPINGS, PEERS);
+            let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
+            let mut random = 7_u64;
+            let mut now = 0;
+            let mut previous = runtime.occupancy();
+            let mut key = 1_u64;
+            let mut peak = 0;
+            for step in 0..2_000_u64 {
+                random = random
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                if step % 97 == 96 {
+                    now += ttl / 2;
+                }
+                let host = 10 + ((random >> 33) % 6) as u8;
+                let remote = 1 + ((random >> 41) % 4) as u8;
+                let internal = Ipv4Address::from_octets([10, 0, 0, host]);
+                let remote = Ipv4Address::from_octets([198, 51, 100, remote]);
+                if let Ok(plan) = runtime.plan_outbound(internal, 40_000, remote, 53, now) {
+                    runtime.commit_outbound(plan, now).unwrap();
+                }
+                if step % 500 == 499 {
+                    key += 1;
+                    let hash_key = Nat44UdpHashKey::new(key, key.rotate_left(17)).unwrap();
+                    runtime.reconcile(config, hash_key).unwrap();
+                    now = 0;
+                    previous = runtime.occupancy();
+                    assert_eq!(udp_table(previous.mappings), (0, 0, MAPPINGS));
+                    assert_eq!(udp_table(previous.peers), (0, 0, PEERS));
+                    continue;
+                }
+                assert_udp_occupancy_exact(&runtime);
+                let current = runtime.occupancy();
+                assert!(current.mappings.high_water() >= previous.mappings.high_water());
+                assert!(current.peers.high_water() >= previous.peers.high_water());
+                peak = peak.max(current.mappings.high_water());
+                previous = current;
+            }
+            // The two-port pool, not the mapping table, bounds live mappings.
+            let pool = usize::from(config.last_port - config.first_port) + 1;
+            assert_eq!(peak, pool.min(MAPPINGS), "the churn fills the port pool");
         });
     }
 

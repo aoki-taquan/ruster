@@ -1449,9 +1449,23 @@ coreだけに依存してstatic dispatchで固定statsを提供します。`SimI
 pending RX/TXのhigh-watermarkを返します。snapshotは`Copy`の固定サイズ値で、
 `ObservableFields`がmapなしの固定順`(section, key, value)`を訪問し、`FieldsDisplay`はcold side
 だけで`section.key=value`行へ描画します。`ruster-sim-scenario`のdriverが同じ訪問順を
-canonical JSONL `ruster-run-sim/v1`の`final` eventへ描画し、`ruster run-sim`がそのままstdoutへ出します。NAT/FW占有
-high-watermarkはM2（owner決定）、resolution/action/audit high-watermarkとnative ring saturationは
-core accessorまたはnative backend実装が必要なため未実装でowner確認待ちです。
+canonical JSONL `ruster-run-sim/v1`の`final` eventへ描画し、`ruster run-sim`がそのままstdoutへ出します。
+
+state table占有（OBS-015、M2 S8）はcoreの各runtimeがslot書込点でO(1)に保守する
+`TableOccupancy`（`occupied`/`high_water`/`capacity`）で、NAT44 UDP mapping/peer、TCP mapping/
+session/external-inbound session、firewall state、ICMPv4 error limiter stateが対象です。
+`occupied`はreclaim・削除・flushされていない割当済みslot数です。expiryはlazyなので期限切れでも
+未回収のslotは数え、live stateの上界です（NAT44とlimiterは期限切れslotをin-placeで再利用するため
+generation内では減らず、firewallはprobe cleanup/sweepの削除で減る）。`high_water`はgeneration内で
+単調で、flushするpublicationでcountと共にzeroへ戻り、同generationのreconcileでは保持します。
+per-tick scanをしない理由は、lazy expiryのtableでexact live数を得るにはexpiry順indexか全scanが
+必要で、前者はrefreshごとのhot path workを、後者はtable長に比例するtick workを足すためです
+（live数はOBS-027としてdeferred）。runtimeは毎tick後に`ServiceOccupancy::capture`（4 runtimeの
+accessor copy）を`TickObserver::record_occupancy`へ渡し、最後の値と、flushを越える`peak`
+（全sampleの`high_water`の最大）、`samples`を保持します。flushはtick先頭のpublication phaseだけで
+起きるため、毎tick後のsampleでpeakはexactです。snapshotは`flushed.*`の後に`occupancy.*`
+29 keyを常に出します。resolution/action/audit high-watermark（OBS-017）とnative ring
+saturation（OBS-018）はcore accessorまたはnative backend実装が必要なため未実装です。
 
 ### deterministic scenario driver（`ruster-sim-scenario`）
 
@@ -1504,8 +1518,9 @@ private `signal` moduleだけで、crateは`#![deny(unsafe_code)]`です。
   default onで、classごとにoffにできます（上記inventory）。
 - restart-requiredのapplyはrun-sim内でrejectとして報告し、storageを作り直しません（SIM-016）。
   generation/key履歴はprocess内だけです。
-- NAT/FW占有、resolution/action/audit high-watermark、native ring saturationは未実装です
-  （OBS-015/017/018）。
+- NAT/FW占有は割当済みslot数とgeneration内high-water（OBS-015）で、TTL未満のlive数は出しません
+  （OBS-027）。resolution/action/audit high-watermark、native ring saturationは未実装です
+  （OBS-017/018）。
 
 ## backend progression
 

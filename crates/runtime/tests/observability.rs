@@ -4,17 +4,17 @@ use std::{collections::BTreeMap, num::NonZeroU64};
 
 use observability_support::*;
 use ruster_core::{
-    ConsumeReason, DirectoryBucket, DropReason, FirewallRuntime, ForwardingSnapshot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot,
-    MonotonicMillis, Nat44TcpHashKey, Nat44TcpIndexStorage, Nat44TcpRuntime, Nat44UdpHashKey,
-    Nat44UdpIndexStorage, Nat44UdpRuntime, PortOwnerSlot, PublicationQuiescenceDisposition,
-    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy, ResolutionRuntime,
-    ResolutionStateSlot,
+    ConsumeReason, DirectoryBucket, DropReason, FirewallRuntime, FirewallStateSlot,
+    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
+    Icmpv4ErrorStateSlot, MonotonicMillis, Nat44TcpHashKey, Nat44TcpIndexStorage, Nat44TcpRuntime,
+    Nat44UdpHashKey, Nat44UdpIndexStorage, Nat44UdpRuntime, PortOwnerSlot,
+    PublicationQuiescenceDisposition, ResolutionActionSlot, ResolutionFailureHoldSlot,
+    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot,
 };
 use ruster_io_sim::{RecycleCause, SimIo, SimIoStats};
 use ruster_runtime::{
     run_tick, ApplyOutcomeKind, BackendMode, BackendStats, FieldsDisplay, HealthState,
-    PublicationOutcome, ServiceCounters, TickBudgets, TickObserver,
+    PublicationOutcome, ServiceCounters, ServiceOccupancy, TickBudgets, TickObserver,
 };
 
 const BUDGETS: TickBudgets = TickBudgets {
@@ -260,8 +260,17 @@ fn sim_io_backend_stats_expose_fixed_occupancy() {
     );
 }
 
-#[test]
-fn service_counters_capture_every_runtime_counter_in_fixed_order() {
+/// Runs `test` with one runtime of every service over empty or one-slot
+/// storage.
+fn with_service_runtimes(
+    test: impl FnOnce(
+        &ResolutionRuntime<'_>,
+        &Icmpv4ErrorRuntime<'_>,
+        &Nat44UdpRuntime<'_>,
+        &Nat44TcpRuntime<'_>,
+        &FirewallRuntime<'_>,
+    ),
+) {
     let routes = routes();
     let snapshot = ForwardingSnapshot::new(&routes, &INTERFACES, &[], &BINDINGS).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 1];
@@ -307,15 +316,66 @@ fn service_counters_capture_every_runtime_counter_in_fixed_order() {
         Nat44TcpHashKey::new(5, 6).unwrap(),
     )
     .unwrap();
-    let firewall = FirewallRuntime::new(firewall_config(&snapshot), &mut []);
-
-    let counters = ServiceCounters::capture(
+    let mut firewall_states = [FirewallStateSlot::default(); 4];
+    let firewall = FirewallRuntime::new(firewall_config(&snapshot), &mut firewall_states);
+    test(
         &resolution,
         &icmpv4_errors,
         &nat44_udp,
         &nat44_tcp,
         &firewall,
     );
+}
+
+#[test]
+fn service_occupancy_capture_copies_every_runtime_accessor() {
+    with_service_runtimes(|_, icmpv4_errors, nat44_udp, nat44_tcp, firewall| {
+        let occupancy = ServiceOccupancy::capture(icmpv4_errors, nat44_udp, nat44_tcp, firewall);
+        let udp = nat44_udp.occupancy();
+        let tcp = nat44_tcp.occupancy();
+        assert_eq!(
+            occupancy,
+            ServiceOccupancy {
+                nat44_udp_mappings: udp.mappings,
+                nat44_udp_peers: udp.peers,
+                nat44_tcp_mappings: tcp.mappings,
+                nat44_tcp_sessions: tcp.sessions,
+                nat44_tcp_external_inbound_sessions: tcp.external_inbound_sessions,
+                firewall_states: firewall.occupancy(),
+                icmpv4_error_states: icmpv4_errors.state_occupancy(),
+            }
+        );
+        // Capacities come from each runtime's own storage shape.
+        assert_eq!(occupancy.icmpv4_error_states.capacity(), 1);
+        assert_eq!(
+            occupancy.firewall_states.capacity(),
+            firewall.usable_capacity()
+        );
+        assert_eq!(occupancy.firewall_states.capacity(), 3);
+        assert_eq!(occupancy.nat44_udp_mappings.capacity(), 0);
+        let mut observer = TickObserver::default();
+        observer.record_occupancy(occupancy);
+        let observed = observer.snapshot(MonotonicMillis(0)).occupancy;
+        assert_eq!(observed.samples, 1);
+        assert_eq!(observed.firewall_states.capacity, 3);
+        assert_eq!(observed.icmpv4_error_states.capacity, 1);
+    });
+}
+
+#[test]
+fn service_counters_capture_every_runtime_counter_in_fixed_order() {
+    with_service_runtimes(service_counters_render_in_fixed_order);
+}
+
+fn service_counters_render_in_fixed_order(
+    resolution: &ResolutionRuntime<'_>,
+    icmpv4_errors: &Icmpv4ErrorRuntime<'_>,
+    nat44_udp: &Nat44UdpRuntime<'_>,
+    nat44_tcp: &Nat44TcpRuntime<'_>,
+    firewall: &FirewallRuntime<'_>,
+) {
+    let counters =
+        ServiceCounters::capture(resolution, icmpv4_errors, nat44_udp, nat44_tcp, firewall);
     assert_eq!(counters.resolution, resolution.counters());
     assert_eq!(counters.icmpv4_errors, icmpv4_errors.counters());
     assert_eq!(counters.nat44_udp, nat44_udp.counters());

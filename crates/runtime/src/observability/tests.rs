@@ -548,7 +548,13 @@ fn snapshot_rendering_is_stable_and_ordered() {
     assert!(lines.contains(&"apply.flush_recorded=false"));
     assert!(lines.contains(&"apply.flush.firewall_flows=0"));
     assert!(lines.contains(&"health.last_rx_progress=none"));
-    assert_eq!(lines.last(), Some(&"flushed.firewall_flows=0"));
+    let occupancy = lines
+        .iter()
+        .position(|line| *line == "occupancy.samples=0")
+        .unwrap();
+    assert_eq!(lines[occupancy - 1], "flushed.firewall_flows=0");
+    assert_eq!(lines.len() - occupancy, OCCUPANCY_FIELDS);
+    assert_eq!(lines.last(), Some(&"occupancy.icmpv4_error_states.peak=0"));
     let keys = |text: &str| -> Vec<String> {
         text.lines()
             .map(|l| l.split_once('=').unwrap().0.to_owned())
@@ -574,6 +580,103 @@ fn snapshot_rendering_is_stable_and_ordered() {
     assert!(busy.contains("apply.flush_recorded=true\n"));
     assert_eq!(keys(&idle), keys(&busy));
     assert_eq!(keys(&idle), keys(&text));
+}
+
+/// `samples` plus four fields for each of the seven tables.
+const OCCUPANCY_FIELDS: usize = 1 + 7 * 4;
+
+fn table(occupied: usize, high_water: usize, capacity: usize) -> TableOccupancy {
+    TableOccupancy::new(occupied, high_water, capacity).unwrap()
+}
+
+#[test]
+fn occupancy_samples_keep_the_last_value_and_a_lifetime_peak() {
+    let mut observer = TickObserver::default();
+    assert_eq!(
+        observer.snapshot(MonotonicMillis(0)).occupancy,
+        OccupancyTotals::default()
+    );
+    let sample = |udp: TableOccupancy| ServiceOccupancy {
+        nat44_udp_mappings: udp,
+        firewall_states: table(1, 2, 6),
+        ..ServiceOccupancy::default()
+    };
+    let observed = |observer: &TickObserver| observer.snapshot(MonotonicMillis(0)).occupancy;
+    observer.record_occupancy(sample(table(2, 3, 4)));
+    // The count falls (deleted or reclaimed state); the high-water mark of
+    // the generation and the peak stay.
+    observer.record_occupancy(sample(table(1, 3, 4)));
+    let after = observed(&observer);
+    assert_eq!(after.samples, 2);
+    assert_eq!(
+        after.nat44_udp_mappings,
+        ObservedTable {
+            occupied: 1,
+            high_water: 3,
+            capacity: 4,
+            peak: 3,
+        }
+    );
+    assert_eq!(
+        after.firewall_states,
+        ObservedTable {
+            occupied: 1,
+            high_water: 2,
+            capacity: 6,
+            peak: 2,
+        }
+    );
+    assert_eq!(after.nat44_tcp_sessions, ObservedTable::default());
+    // A flushing publication resets the core values; the peak survives.
+    observer.record_occupancy(sample(table(0, 0, 4)));
+    assert_eq!(
+        observed(&observer).nat44_udp_mappings,
+        ObservedTable {
+            occupied: 0,
+            high_water: 0,
+            capacity: 4,
+            peak: 3,
+        }
+    );
+    // A later generation that goes higher raises it.
+    observer.record_occupancy(sample(table(4, 4, 4)));
+    let last = observed(&observer);
+    assert_eq!((last.samples, last.nat44_udp_mappings.peak), (4, 4));
+
+    let text = FieldsDisplay(&observer.snapshot(MonotonicMillis(0))).to_string();
+    let rendered: Vec<&str> = text
+        .lines()
+        .filter(|line| line.starts_with("occupancy."))
+        .collect();
+    assert_eq!(rendered.len(), OCCUPANCY_FIELDS);
+    assert_eq!(
+        &rendered[..5],
+        [
+            "occupancy.samples=4",
+            "occupancy.nat44_udp_mappings.occupied=4",
+            "occupancy.nat44_udp_mappings.high_water=4",
+            "occupancy.nat44_udp_mappings.capacity=4",
+            "occupancy.nat44_udp_mappings.peak=4",
+        ]
+    );
+    let mut sections: Vec<&str> = rendered[1..]
+        .iter()
+        .map(|line| line.rsplit_once('.').unwrap().0)
+        .collect();
+    sections.dedup();
+    assert_eq!(
+        sections,
+        [
+            "occupancy.nat44_udp_mappings",
+            "occupancy.nat44_udp_peers",
+            "occupancy.nat44_tcp_mappings",
+            "occupancy.nat44_tcp_sessions",
+            "occupancy.nat44_tcp_external_inbound_sessions",
+            "occupancy.firewall_states",
+            "occupancy.icmpv4_error_states",
+        ]
+    );
+    assert!(rendered.contains(&"occupancy.firewall_states.capacity=6"));
 }
 
 /// io-sim implements the core-defined trait, so a runtime unit test sees the

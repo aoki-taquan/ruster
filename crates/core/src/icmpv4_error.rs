@@ -3,7 +3,7 @@ use std::{marker::PhantomData, rc::Rc};
 use crate::{
     internet_checksum, ipv4_header_checksum, GeneratedAllocationError, GeneratedBatchCompletion,
     GeneratedPacketBatch, GeneratedPacketIo, IfId, Ipv4Address, MacAddress, MonotonicMillis,
-    IPV4_ETHERTYPE,
+    OccupancyCounter, TableOccupancy, IPV4_ETHERTYPE,
 };
 
 pub const ICMPV4_ERROR_MAX_QUOTE_LEN: usize = 548;
@@ -396,6 +396,8 @@ pub struct Icmpv4ErrorRuntime<'a> {
     last_now: Option<MonotonicMillis>,
     runtime_epoch: u128,
     counters: Icmpv4ErrorCounters,
+    /// Allocated limiter state slots; see [`Icmpv4ErrorRuntime::state_occupancy`].
+    state_occupancy: OccupancyCounter,
     _worker_local: PhantomData<Rc<()>>,
 }
 
@@ -417,6 +419,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             last_now: None,
             runtime_epoch: 1,
             counters: Icmpv4ErrorCounters::default(),
+            state_occupancy: OccupancyCounter::default(),
             _worker_local: PhantomData,
         }
     }
@@ -446,6 +449,17 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         self.actions.len()
     }
 
+    /// Exact allocated per-egress limiter state slots and their high-water
+    /// mark since construction or the last publication flush, in O(1).
+    ///
+    /// A slot counts from the first queued error for its egress until a
+    /// publication flush. A state past its TTL is reclaimed in place by the
+    /// next new egress, so expired states still count until reused.
+    #[must_use]
+    pub const fn state_occupancy(&self) -> TableOccupancy {
+        self.state_occupancy.snapshot(self.states.len())
+    }
+
     /// Returns whether this runtime is still in its exact constructor state.
     #[must_use]
     pub fn is_pristine(&self) -> bool {
@@ -461,6 +475,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             && self.last_now.is_none()
             && self.runtime_epoch == 1
             && self.counters == Icmpv4ErrorCounters::default()
+            && self.state_occupancy == OccupancyCounter::default()
     }
 
     /// Validates the generated-action queue without changing runtime state.
@@ -667,6 +682,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         if self.len == self.actions.len() {
             return self.record_suppression(Icmpv4TimeExceededDisposition::ActionFull);
         }
+        let reclaimed = self.states[index].occupied;
         self.states[index] = Icmpv4ErrorStateSlot {
             egress: action.egress,
             generation: self.states[index].generation.wrapping_add(1),
@@ -675,6 +691,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             action_queued: false,
             has_requested: false,
         };
+        self.state_occupancy.transition(reclaimed, true);
         self.enqueue(index, action)
     }
 
@@ -773,6 +790,7 @@ impl Icmpv4ErrorPublicationPermit<'_, '_> {
         self.runtime.len = 0;
         self.runtime.last_now = None;
         self.runtime.runtime_epoch = self.next_runtime_epoch;
+        self.runtime.state_occupancy.flush();
         self.report
     }
 }
@@ -1030,6 +1048,7 @@ mod tests {
         last_now: Option<MonotonicMillis>,
         runtime_epoch: u128,
         counters: Icmpv4ErrorCounters,
+        state_occupancy: OccupancyCounter,
     }
 
     fn runtime_image(runtime: &Icmpv4ErrorRuntime<'_>) -> RuntimeImage {
@@ -1042,6 +1061,7 @@ mod tests {
             last_now: runtime.last_now,
             runtime_epoch: runtime.runtime_epoch,
             counters: runtime.counters,
+            state_occupancy: runtime.state_occupancy,
         }
     }
 
@@ -1498,5 +1518,64 @@ mod tests {
             runtime.schedule(action(3, 20), MonotonicMillis(3)),
             Icmpv4TimeExceededDisposition::Queued { .. }
         ));
+    }
+
+    /// `(occupied, high_water, capacity)`, checked against a full scan.
+    fn exact_state_occupancy(runtime: &Icmpv4ErrorRuntime<'_>) -> (usize, usize, usize) {
+        let occupancy = runtime.state_occupancy();
+        let scanned = runtime.states.iter().filter(|state| state.occupied).count();
+        assert_eq!(occupancy.occupied(), scanned);
+        (
+            occupancy.occupied(),
+            occupancy.high_water(),
+            occupancy.capacity(),
+        )
+    }
+
+    #[test]
+    fn limiter_state_occupancy_is_exact_across_insert_reuse_and_flush() {
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; 2];
+        let mut slots = [Icmpv4ErrorActionSlot::EMPTY; 4];
+        let mut runtime = Icmpv4ErrorRuntime::new(
+            Icmpv4ErrorPolicy::new(1, 2).unwrap(),
+            &mut states,
+            &mut slots,
+        );
+        assert_eq!(exact_state_occupancy(&runtime), (0, 0, 2));
+        // Insert one state per egress.
+        runtime.schedule(action(1, 20), MonotonicMillis(0));
+        assert_eq!(exact_state_occupancy(&runtime), (1, 1, 2));
+        runtime.schedule(action(2, 20), MonotonicMillis(0));
+        assert_eq!(exact_state_occupancy(&runtime), (2, 2, 2));
+        for _ in 0..2 {
+            let front = runtime.front().unwrap();
+            runtime.committed(front, MonotonicMillis(0));
+        }
+        // An existing egress state is reused; a third egress finds no
+        // reclaimable state and is refused without a count change.
+        runtime.schedule(action(1, 20), MonotonicMillis(1));
+        assert!(matches!(
+            runtime.schedule(action(3, 20), MonotonicMillis(1)),
+            Icmpv4TimeExceededDisposition::StateFull
+        ));
+        assert_eq!(exact_state_occupancy(&runtime), (2, 2, 2));
+        let front = runtime.front().unwrap();
+        runtime.committed(front, MonotonicMillis(1));
+        // Expiry is lazy: egress 2's idle state passed its TTL at 2 and stays
+        // counted until egress 3 reclaims it in place.
+        assert_eq!(exact_state_occupancy(&runtime), (2, 2, 2));
+        assert!(matches!(
+            runtime.schedule(action(3, 20), MonotonicMillis(3)),
+            Icmpv4TimeExceededDisposition::Queued { .. }
+        ));
+        assert_eq!(exact_state_occupancy(&runtime), (2, 2, 2));
+        // A dropped permit changes nothing; a committed flush resets the
+        // count and the high-water mark.
+        drop(runtime.preflight_publication().unwrap());
+        assert_eq!(exact_state_occupancy(&runtime), (2, 2, 2));
+        runtime.preflight_publication().unwrap().commit();
+        assert_eq!(exact_state_occupancy(&runtime), (0, 0, 2));
+        runtime.schedule(action(2, 20), MonotonicMillis(0));
+        assert_eq!(exact_state_occupancy(&runtime), (1, 1, 2));
     }
 }

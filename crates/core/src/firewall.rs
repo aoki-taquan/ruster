@@ -1,6 +1,6 @@
 use std::{marker::PhantomData, rc::Rc};
 
-use crate::{ForwardingSnapshot, IfId, Ipv4Address};
+use crate::{ForwardingSnapshot, IfId, Ipv4Address, OccupancyCounter, TableOccupancy};
 
 pub const FIREWALL_UDP_MIN_IDLE_TTL_MS: u64 = 120_000;
 pub const FIREWALL_UDP_DEFAULT_IDLE_TTL_MS: u64 = 300_000;
@@ -1294,7 +1294,9 @@ pub struct FirewallRuntime<'state> {
     watermark_ms: Option<u64>,
     runtime_epoch: u64,
     next_slot_generation: u64,
-    occupied_count: usize,
+    /// Allocated slots (live or expired but not yet deleted) and their
+    /// high-water mark since construction or the last flush.
+    occupancy: OccupancyCounter,
     /// Lower bound on the earliest idle deadline of every occupied slot.
     ///
     /// The full-table reclaim sweep runs only when `now_ms` reached this
@@ -1325,7 +1327,7 @@ impl<'state> FirewallRuntime<'state> {
             watermark_ms: None,
             runtime_epoch: 1,
             next_slot_generation: 1,
-            occupied_count: 0,
+            occupancy: OccupancyCounter::default(),
             reclaim_not_before_ms: 0,
             reclaim_cursor: 0,
             counters: FirewallCounters::default(),
@@ -1358,6 +1360,19 @@ impl<'state> FirewallRuntime<'state> {
         usable_state_capacity(self.states.len())
     }
 
+    /// Exact allocated flow-state slots and their high-water mark since
+    /// construction or the last flushing reconcile, in O(1).
+    ///
+    /// A slot counts from the commit that creates its flow until a probe
+    /// cleanup or refusal-path sweep deletes it after expiry, or a flush.
+    /// Expired flows that were not deleted yet still count. Reusing an
+    /// expired slot in place keeps the count. Capacity is
+    /// [`Self::usable_capacity`], the bound new flows are admitted against.
+    #[must_use]
+    pub const fn occupancy(&self) -> TableOccupancy {
+        self.occupancy.snapshot(self.usable_capacity())
+    }
+
     /// Returns whether this runtime is still in its exact constructor state.
     #[must_use]
     pub fn is_pristine(&self) -> bool {
@@ -1367,7 +1382,7 @@ impl<'state> FirewallRuntime<'state> {
             && self.watermark_ms.is_none()
             && self.runtime_epoch == 1
             && self.next_slot_generation == 1
-            && self.occupied_count == 0
+            && self.occupancy == OccupancyCounter::default()
             && self.reclaim_not_before_ms == 0
             && self.reclaim_cursor == 0
             && self.counters == FirewallCounters::default()
@@ -1549,7 +1564,7 @@ impl<'state> FirewallRuntime<'state> {
             .reusable
             .ok_or(FirewallPlanError::StateFull(rule_id))?;
         let current = self.states[index];
-        if !current.occupied && self.occupied_count >= self.usable_capacity() {
+        if !current.occupied && self.occupancy.occupied() >= self.usable_capacity() {
             return Err(FirewallPlanError::StateFull(rule_id));
         }
         let slot_generation = self.next_slot_generation.max(1);
@@ -1727,7 +1742,8 @@ impl<'state> FirewallRuntime<'state> {
         if current.slot_generation != plan.expected_generation {
             return Err(FirewallCommitError::SlotGenerationChanged);
         }
-        if plan.created && !current.occupied && self.occupied_count >= self.usable_capacity() {
+        if plan.created && !current.occupied && self.occupancy.occupied() >= self.usable_capacity()
+        {
             return Err(FirewallCommitError::UsableCapacityExceeded);
         }
         self.states[plan.index] = plan.replacement;
@@ -1736,7 +1752,7 @@ impl<'state> FirewallRuntime<'state> {
             .min(self.slot_deadline(plan.replacement));
         if plan.created {
             if !current.occupied {
-                self.occupied_count += 1;
+                self.occupancy.insert();
             }
             self.next_slot_generation = plan.replacement.slot_generation.wrapping_add(1).max(1);
             self.counters.allowed_new = self.counters.allowed_new.saturating_add(1);
@@ -1824,7 +1840,7 @@ impl<'state> FirewallRuntime<'state> {
     /// Returns whether a fresh flow could be placed at `reusable` now.
     fn has_room(&self, reusable: Option<usize>) -> bool {
         reusable.is_some_and(|index| {
-            self.states[index].occupied || self.occupied_count < self.usable_capacity()
+            self.states[index].occupied || self.occupancy.occupied() < self.usable_capacity()
         })
     }
 
@@ -1890,7 +1906,7 @@ impl<'state> FirewallRuntime<'state> {
     fn delete_expired_and_shift(&mut self, index: usize) {
         let capacity = self.states.len();
         self.states[index] = FirewallStateSlot::default();
-        self.occupied_count -= 1;
+        self.occupancy.remove();
         self.runtime_epoch = self.runtime_epoch.wrapping_add(1).max(1);
         self.counters.states_expired = self.counters.states_expired.saturating_add(1);
         self.counters.maintenance_steps = self.counters.maintenance_steps.saturating_add(1);
@@ -1935,7 +1951,7 @@ impl FirewallReconcilePermit<'_, '_> {
     pub fn commit(self) -> FirewallReconcileReport {
         if self.advance {
             self.runtime.states.fill(FirewallStateSlot::default());
-            self.runtime.occupied_count = 0;
+            self.runtime.occupancy.flush();
             self.runtime.reclaim_not_before_ms = 0;
             self.runtime.reclaim_cursor = 0;
             self.runtime.binding = self.next;
@@ -2101,7 +2117,7 @@ mod tests {
         watermark_ms: Option<u64>,
         runtime_epoch: u64,
         next_slot_generation: u64,
-        occupied_count: usize,
+        occupancy: OccupancyCounter,
         reclaim_not_before_ms: u64,
         reclaim_cursor: usize,
         counters: FirewallCounters,
@@ -2114,7 +2130,7 @@ mod tests {
             watermark_ms: runtime.watermark_ms,
             runtime_epoch: runtime.runtime_epoch,
             next_slot_generation: runtime.next_slot_generation,
-            occupied_count: runtime.occupied_count,
+            occupancy: runtime.occupancy,
             reclaim_not_before_ms: runtime.reclaim_not_before_ms,
             reclaim_cursor: runtime.reclaim_cursor,
             counters: runtime.counters,
@@ -2277,7 +2293,7 @@ mod tests {
         let mut states = [FirewallStateSlot::default(); 2];
         let mut runtime = FirewallRuntime::new(current, &mut states);
         runtime.states[0].occupied = true;
-        runtime.occupied_count = 1;
+        runtime.occupancy.insert();
         runtime.watermark_ms = Some(9);
         runtime.counters.reconciliations = u64::MAX;
 
@@ -2295,7 +2311,7 @@ mod tests {
             .states
             .iter()
             .all(|slot| *slot == FirewallStateSlot::default()));
-        assert_eq!(runtime.occupied_count, 0);
+        assert_eq!(runtime.occupancy, OccupancyCounter::default());
         assert_eq!(runtime.runtime_epoch, 2);
         assert_eq!(runtime.counters.reconciliations, u64::MAX);
         assert!(runtime.config_matches(&next));
@@ -3303,13 +3319,108 @@ mod tests {
                     .filter(|slot| slot.is_occupied())
                     .count();
                 assert_eq!(occupied, usable);
-                assert_eq!(runtime.occupied_count, usable);
+                assert_eq!(runtime.occupancy.occupied(), usable);
                 assert_eq!(runtime.counters().states_expired, usable as u64);
                 assert!(runtime
                     .states()
                     .iter()
                     .all(|slot| runtime.slot_live(*slot, expired_at) || !slot.is_occupied()));
             }
+        });
+    }
+
+    /// `(occupied, high_water, capacity)`, checked against a full scan.
+    fn exact_occupancy(runtime: &FirewallRuntime<'_>) -> (usize, usize, usize) {
+        let occupancy = runtime.occupancy();
+        let scanned = runtime
+            .states()
+            .iter()
+            .filter(|slot| slot.is_occupied())
+            .count();
+        assert_eq!(occupancy.occupied(), scanned);
+        assert!(occupancy.occupied() <= occupancy.high_water());
+        assert!(occupancy.high_water() <= occupancy.capacity());
+        (
+            occupancy.occupied(),
+            occupancy.high_water(),
+            occupancy.capacity(),
+        )
+    }
+
+    #[test]
+    fn state_occupancy_is_exact_across_insert_expiry_reclaim_and_flush() {
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = vec![FirewallStateSlot::default(); 8];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            assert_eq!(exact_occupancy(&runtime), (0, 0, 6));
+            let flow = |port| {
+                let mut flow = packet(FirewallProtocol::Udp, 0);
+                flow.source_port = port;
+                flow
+            };
+            // Insert three flows; an established refresh changes nothing.
+            for port in 1_000..1_003 {
+                let plan = runtime.plan_packet(&config, flow(port), 0).unwrap();
+                runtime.commit(plan).unwrap();
+            }
+            assert_eq!(exact_occupancy(&runtime), (3, 3, 6));
+            let plan = runtime.plan_packet(&config, flow(1_000), 1).unwrap();
+            runtime.commit(plan).unwrap();
+            assert_eq!(exact_occupancy(&runtime), (3, 3, 6));
+
+            // Expiry is lazy: nothing is deleted until an operation probes.
+            let expired_at = FIREWALL_UDP_DEFAULT_IDLE_TTL_MS + 1;
+            assert_eq!(exact_occupancy(&runtime), (3, 3, 6));
+            // Reclaim: creating flows after expiry deletes expired slots on
+            // the probed chains or by the bounded sweep, one count each,
+            // and the high-water mark never moves back.
+            let mut high_water = 3;
+            for port in 2_000..2_006 {
+                let plan = runtime
+                    .plan_packet(&config, flow(port), expired_at)
+                    .unwrap();
+                let (_, planned_high_water, _) = exact_occupancy(&runtime);
+                assert_eq!(planned_high_water, high_water);
+                runtime.commit(plan).unwrap();
+                let (occupied, current_high_water, _) = exact_occupancy(&runtime);
+                assert!(current_high_water >= high_water);
+                assert_eq!(current_high_water, high_water.max(occupied));
+                high_water = current_high_water;
+            }
+            assert_eq!(runtime.counters().states_expired, 3);
+            assert_eq!(exact_occupancy(&runtime), (6, 6, 6));
+
+            // A same-generation reconcile keeps state and counts.
+            assert_eq!(
+                runtime.reconcile(config).unwrap(),
+                FirewallReconcileReport { states_flushed: 0 }
+            );
+            assert_eq!(exact_occupancy(&runtime), (6, 6, 6));
+            // A flushing reconcile resets the count and the high-water mark.
+            let next = FirewallConfig::new(
+                snapshot,
+                &rules,
+                FirewallPolicy::default(),
+                2,
+                rotated_hash_key(),
+            )
+            .unwrap();
+            assert_eq!(
+                runtime.reconcile(next).unwrap(),
+                FirewallReconcileReport { states_flushed: 6 }
+            );
+            assert_eq!(exact_occupancy(&runtime), (0, 0, 6));
+            let plan = runtime.plan_packet(&next, flow(3_000), expired_at).unwrap();
+            runtime.commit(plan).unwrap();
+            assert_eq!(exact_occupancy(&runtime), (1, 1, 6));
         });
     }
 
@@ -3458,7 +3569,7 @@ mod tests {
             let total = (after.state_probes - before.state_probes)
                 + (after.maintenance_steps - before.maintenance_steps);
             assert_eq!(after.states_expired, usable as u64);
-            assert_eq!(runtime.occupied_count, usable);
+            assert_eq!(runtime.occupancy.occupied(), usable);
             // Sweeps resume at the cursor, so the refill walks the table
             // about once in total (plus probe/shift work per create)
             // instead of O(N) per create from slot 0.
