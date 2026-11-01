@@ -63,6 +63,8 @@ dependencies = [
  "ruster-control",
  "ruster-core",
  "ruster-io-sim",
+ "ruster-io-xdp-native",
+ "ruster-runtime",
  "ruster-sim-scenario",
 ]
 

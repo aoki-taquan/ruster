@@ -7,16 +7,23 @@
 //!   on stdout, including restart-required reasons and the expected flush.
 //! - `ruster run-sim --scenario <scenario.toml> [--hold]`: canonical
 //!   `ruster-run-sim/v1` JSONL on stdout, human summary on stderr.
+//! - `ruster run --config <config.toml>`: the AF_XDP static router (x86_64
+//!   Linux); stats blocks on stdout, progress and diagnostics on stderr.
 //!
 //! Exit status: 0 success (also a restart-required plan, and an ordered
 //! shutdown after SIGINT/SIGTERM), 1 runtime, I/O, invariant, or scenario
-//! expectation failure, 2 usage error or invalid configuration/scenario.
+//! expectation failure, 2 usage error or invalid configuration/scenario;
+//! `run` adds 3 (shutdown deadline with TX frames still in the kernel) and
+//! 4 (missing privilege or memlock).
 //!
-//! The only `unsafe` code is the signal FFI in the private `signal` module.
+//! The only `unsafe` code is FFI in two private modules: the signal
+//! handlers (`signal`) and the rtnetlink address dump of `ruster run`'s
+//! startup check (`run::netlink`).
 
 mod args;
 mod config_cmd;
 mod plan_text;
+mod run;
 mod run_sim;
 mod signal;
 
@@ -53,6 +60,7 @@ fn main() -> ExitCode {
             config_cmd::run_plan(&current, &next, &mut stdout.lock(), &mut stderr)
         }
         Ok(Command::RunSim { scenario, hold }) => run_sim::run(&scenario, hold, &mut stderr),
+        Ok(Command::Run(run)) => run::run(&run, &mut stderr),
     };
     let _ = stdout.flush();
     ExitCode::from(status)

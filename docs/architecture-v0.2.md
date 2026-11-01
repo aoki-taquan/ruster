@@ -1357,8 +1357,8 @@ keyへfallbackしません。generation採番、key再利用拒否、rollbackは
 ままです。live trafficの入口は`ProductionSequencer`で、sealed marker `ProductionKeySource`
 （`OsRandomKeySource`だけが実装）を要求し、`new`が`S::KIND.is_production()`をcompile時に
 assertします。sim sourceはcompileできず、`run-sim`は従来どおり`PublicationSequencer`と
-`SimDeterministicKeySource`を使います（M1 goldenは不変）。`ruster run`はM2の後続sliceで
-`ProductionSequencer`を受け取ります。sourceのDebugはredactし、keyは`Copy`のcore値として
+`SimDeterministicKeySource`を使います（M1 goldenは不変）。`ruster run`（M2 S10a）は起動処理
+全体が`ProductionSequencer<K: ProductionKeySource>`だけを受け取ります。sourceのDebugはredactし、keyは`Copy`のcore値として
 authorityと各runtimeへ複製されるため、`unsafe`もdependencyも使わないこのcrateではzeroizeを
 保証できず、行いません（PUB-010〜013）。
 
@@ -1536,8 +1536,10 @@ quiescenceが崩れていればexit 1です。注入済みで未受信のframe�
 だけを行います（lock-free atomic storeはasync-signal-safe）。handlerは戻しません。SIGTERMは常に登録し、SIGINTは慣習どおり
 起動時にSIG_IGNを継承していれば（job controlなしの`cmd &`など）ignoreのまま残します（SIG_IGNを
 先に設定して旧dispositionを調べるため、調査中のSIGINTはignoreされる）。SIGHUPなど他のsignalは
-扱いません。Linux以外ではhandlerを登録しません。`unsafe`は
-private `signal` moduleだけで、crateは`#![deny(unsafe_code)]`です。
+扱いません。Linux以外ではhandlerを登録しません。M2 S10aでhandlerは`STOP.swap(true)`が既に`true`
+なら`FORCE`もstoreするようになり（二回目のsignal、`ruster run`のforced teardown）、`run-sim`は
+`STOP`だけを読むので挙動は変わりません。`unsafe`はprivate `signal` moduleと`ruster run`の
+rtnetlink address dump（`run::netlink`）だけで、crateは`#![deny(unsafe_code)]`です。
 
 ### M1の範囲と既知の差分
 
@@ -2496,7 +2498,8 @@ engineが保持するので、別sessionのengineと組んだconfigは`SessionMi
 偽れません。空集合、重複`IfId`、MTU 0、drain済みengineもtyped errorで拒否し、`IfId`順にsortした
 boxed sliceへ固定します（cold pathの一回だけのallocation）。以後mappingは変わらず、egress選択は
 この固定sliceの二分探索（`O(log ports)`、map/string/trait objectなし）です。runtimeのconfigから
-portを作る配線（validated configの`ports()`はIfId順）と`ruster run`はX04bです。
+portを作る配線（validated configの`ports()`はIfId順）と`ruster run`はX04bで、前半（M2 S10a）を
+後述「`ruster run`」に記します。
 
 RX merge: `receive`は全portを一回ずつpollし、開始portはbatchごとに一つずつrotateします。各pollは
 そのportのcompletion reap、Fill refill、残りbudget以下のRX descriptor検証を行い、budgetを使い切った
@@ -2518,7 +2521,7 @@ ARP/ICMPが毎tick `Unavailable`になりneighborがexpireするので、copyは
 `generated_reserve(pool) = max(2, pool / 8)`（poolで上限）frameを取りません。reserveに食い込む
 copyは`cross_port_copy_reserved`、poolが空なら`cross_port_copy_unavailable`で拒否し、blockしません。
 router生成（`begin_generated`）はreserveを含むpool全体を使えます。複数portのadapterでは、
-reserveがpool全体になる1〜2 frameのpool（cross-port copyが一度も届かない）を
+reserveがpool全体になる0〜2 frameのpool（cross-port copyが一度も届かない。0は`UmemConfig`が先に拒否）を
 `GeneratedPoolTooSmall`でsetup時に拒否します（一portなら受理）。`begin_generated`はallocation前に
 egress portをsettle（completion reapと負っているkick）するので、完了したframeはその場でpoolへ戻ります。
 reserveはportのstats（`copy_reserve`）に出る定数式で、configは持ちません。
@@ -2668,3 +2671,84 @@ snapshot、static neighbor）で転送し、Bのgenerated poolへのcopyがBのp
 `ip link set down`（netns内）した間のTXが`ENETDOWN`のlink stateになりerrorにならず、`up`後は新しい
 trafficなしにquiescence checkだけでreadyへ戻ることを確認してから両portをdrainします
 （XDP-133〜174、IO-013、OBS-018）。
+
+#300 follow-up（M2 S10a）: once-per-batch relieveの`relieved`が`receive`と`begin_generated`で
+batchごとに再armされること（XDP-175）と、`finish`が`self`を消費した後の`Drop`が二度settleしない
+こと（XDP-176）をtestで固定し、`GeneratedPoolTooSmall`の説明を「0〜2 frame」に直しました。
+
+### `ruster run` (X04b前半, M2 S10a)
+
+`ruster run --config <path>`はx86_64 LinuxのAF_XDP static routerです（他のplatformはconfig検証後に
+`unsupported platform`でexit 1）。`ruster-cli`の`run` moduleは起動、run loop、停止をhost
+（`PortHost`: preflight、open、inspect、attach、build、close）とdatapath（`Datapath`: core I/O、
+drain、stats）、clock、停止flagについてgenericに書き、本番は`LinuxHost`（`NativeSession`、
+`RxFillEngine`、`XdpPacketIo`）、testはscripted host（`SimIo` datapath、scripted clock/停止）です。
+
+```text
+config validate ─► [backend] af-xdp? ─► signal handler ─► OsRandomKeySource ─► ProductionSequencer
+   ─► candidate (generation 1) ─► FullServiceStorage ─► privilege/memlock preflight
+   ─► port if1: open ─► XDP-063 checks ─► attach      (IfId順。失敗/停止なら開いた全portを逆順close)
+   ─► port if2: open ─► XDP-063 checks ─► attach
+   ─► take_datapath/engine (if1, if2) ─► XdpPacketIo ─► activate generation 1 ─► run loop
+SIGINT/SIGTERM ─► tick停止 ─► bounded drain ─► final stats取得 ─► adapter/engine drop
+   ─► close if2 ─► close if1（各closeはlink closeでdetachしてからsocket/UMEM/ringを解放）
+```
+
+起動（failure atomic）: configは`run-sim`と同じlimitでparse/validateし、service bridgeは本番
+candidateの構築で一回だけ行います（sim key sourceの捨てcandidateは作らない）。`[backend]`が
+`sim`なら`stage=backend code=SIM_BACKEND`で`ruster run-sim`を案内しexit 2です。key sourceは
+`OsRandomKeySource::open()`だけで、`run::execute`は`ProductionSequencer<K: ProductionKeySource>`を
+受け取るためsim sourceは型で入りません。preflightは`CapEff`に`CAP_NET_ADMIN`、`CAP_NET_RAW`、
+`CAP_BPF`+`CAP_PERFMON`（または`CAP_SYS_ADMIN`）を、`CAP_IPC_LOCK`が無ければsoft
+`RLIMIT_MEMLOCK` ≥ UMEM合計（page切り上げ、`auto`は2倍、XDP-045）を要求し、不足はresource取得前に
+exit 4です。portは`IfId`順にopen（session自身のTX queue/MTU check込み）、XDP-063 check、
+configのattach mode（既存programは`ExistingProgram`で拒否し置換しない）の順で、全portのattach後に
+各sessionのdatapathを取りengine（`fill_batch` = Fill ring容量、UMEM domainはportの`IfId`から
+一意）と`XdpPacketIo`を作り、generation 1をactivateします。engineはsessionを生涯可変借用し
+attachも`&mut`を要するので、datapathは全attachの後です（kernel資源を取らない段階で、Fillへ
+publishするまでのframeはXDPがsocketへ送りkernelが`rx_fill_ring_empty`で捨てる。kernel stackへは
+届かない）。開いたsessionは`OpenedPorts`が所有し、どのstageの失敗でも（stage間で停止flagが立って
+も）開いた全portを最後に開いたものから一回ずつcloseします。closeはlinkを先に閉じるので
+XDP programは残りません。errorは`startup failed: stage=<stage> [port=if<id>] code=<typed>`
+（session/attachは`<stage>/<failure>`、verifier logは長さとtruncationだけ）です。
+
+XDP-063 device check（session open後、attach前）: sysfsの`ifindex`がsessionと一致することを確かめて
+から、RX queue数（`/sys/class/net/<dev>/queues/rx-*`）が1でなければ拒否します。RSS/ntupleで全
+trafficをbind queueへ寄せたoperatorだけが`--allow-multi-queue`で受理できます（warning）。kernel IPv4
+address（rtnetlink `RTM_GETADDR` dump、labelに依らずifindexで数える）とportを出口にするmain tableの
+IPv4 route（`/proc/net/route`）は拒否、`net.ipv4.ip_forward`と`conf/<dev>/forwarding`はwarningだけです。
+拒否の理由: attach中はkernelがportのframeを見ないのでaddressは働かず、detach中（起動前、停止後、
+crash/SIGKILLでunpinned linkがauto-detachした後）にkernelがARPに答え、forwardingが有効なら
+firewall/NATを迂回してport間をroutingします（fail open、XDP-050）。forwarding sysctlはnamespace
+全体の設定で他のinterface（container、VPN）が必要とし得るうえ、port上にaddress/routeが無ければ
+kernelはportへのconnected routeを持たないので、拒否は過剰としてwarningにしました。読めないfactは
+fail closed（`UNVERIFIABLE probe=...`）です。
+
+run loop: 一threadが停止flagを読み、`Instant`起点のmonotonic wall clockで`run_tick`をconfigの
+budgetで呼び、reportを`TickObserver`へ畳み、O(1)のstate table占有を記録します。kickとneed-wakeupは
+adapterの`receive`（completion reap、Fill refill、Fill need-wakeupへの`poll`、負っているTX kickの
+settle）と`finish`が扱います。RXも生成TX要求も無いtickが64回続くと50 µsからtickごとに倍、上限1 msの
+sleepを挟み、busyなtickで即spinへ戻ります。idle時のwake-upは約1 kHzでcoreを使い切らず、idle後の
+最初のframeは最大1 ms（+timer slack）RX ringで待ちます。1 msなら2048 entryのRX ringは約2 Mppsまで
+取りこぼさず、負荷中はsleepしません。socket fdの`poll`待ちはnative crateに複数fdのsyscallが要るので
+S10bです。tickごとのallocationは0（counting allocatorのtest）。backendが自らStop（ring破損等）を
+報告するとloopを抜けexit 1です。`--stats-interval`（既定60 s、0で無効）ごとにstdoutへ
+`ruster-run-stats kind=periodic`のblock（worker observability、service counter、`af_xdp.*`、
+`if<id>.af_xdp_port.*`の`section.key=value`、`end`）をcold pathで出します。counter、gauge、flag、
+固定label、generation、`if<id>`だけで、address、MAC、device名、key、seedは出しません。
+
+停止: 一回目のSIGINT/SIGTERMでtickを止め（RX、forward/生成TXとも以後なし。tick間なのでbatchも
+caller保持のleaseも無い）、`XdpPacketIo::drain`を一回4 round、1 ms間隔、全体2 sまで繰り返します
+（RX/Fill/新規TXを永久に止め、leaked leaseとstaged handoffを回収し、未lendのRX frameを戻し、kickと
+reapをする）。二回目のsignal（`FORCE`）はdrainを打ち切り、kick round 0の一回だけで停止と計数をします。
+final statsを取り、active publication、adapter、engineをdropしてから全portを逆順にclose（link closeで
+detach、socket/UMEM/ringを解放）し、final statsをstdoutへ、summary（`drain calls`、`completed`、
+`rx-released`、kernelが持つ`tx-in-flight`/`fill-in-kernel`、`forced`、`timed-out`、閉じたport数）を
+stderrへ出します。exit statusは0（clean。起動中のsignalでrollbackしたときも）、1（起動失敗、backend
+fault、drain失敗、close error）、2（usage、invalid config、sim backend）、3（期限またはforceでTXが
+kernelに残った。detach/closeは済み）、4（capability/memlock不足、何も取得していない）です。
+
+privilegeのdropはしません（deferred）。SIGHUP reload、health/stall signal、retry policy、`poll`待機は
+S10bです（CLI-034）。operator手順は[`runbook-m2.md`](runbook-m2.md)、privileged E2Eは
+`scripts/priv-run-smoke.sh`（三つの専用netns、forward、SIGTERM、rollback、XDP-063、SIGKILL後の
+restart）です（CLI-008〜035、XDP-063）。

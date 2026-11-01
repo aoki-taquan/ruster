@@ -45,7 +45,8 @@
 //!
 //! Copies never take the last [`generated_reserve`] frames of the egress
 //! generated pool (`max(2, pool / 8)`, capped at the pool; a multi-port
-//! adapter refuses a pool of 1 or 2 frames, which could never take a copy,
+//! adapter refuses a pool of 0 to 2 frames, which could never take a copy
+//! (0 is already refused by `UmemConfig`),
 //! with [`XdpPacketIoSetupError::GeneratedPoolTooSmall`]): those stay for
 //! router-generated ARP and ICMP, so sustained cross-port traffic cannot
 //! starve neighbour resolution. A copy that would dip into the reserve, or
@@ -296,7 +297,8 @@ pub enum XdpPacketIoSetupError {
     /// A port's config was taken from another session than its engine's.
     SessionMismatch(IfId),
     /// With more than one port, a port's generated pool is no larger than
-    /// its router reserve ([`generated_reserve`]: pools of 1 or 2 frames),
+    /// its router reserve ([`generated_reserve`]: pools of 0 to 2 frames;
+    /// `UmemConfig` already refuses 0),
     /// so no cross-port copy could ever reach it.
     GeneratedPoolTooSmall {
         interface: IfId,

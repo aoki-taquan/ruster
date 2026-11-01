@@ -79,6 +79,17 @@ fn render_path(path: &SourcePath) -> Option<String> {
 /// accepted here: `run-sim` additionally refuses a non-`sim` backend
 /// (`stage=backend code=UNSUPPORTED_BACKEND`).
 pub fn load(path: &Path) -> Result<ValidatedConfigV1, LoadError> {
+    load_validated(path).and_then(|config| {
+        bridge_check(&config).map_err(LoadError::Rejected)?;
+        Ok(config)
+    })
+}
+
+/// Reads, parses, and validates one configuration document without the
+/// service bridge. `ruster run` uses this and then builds its one
+/// candidate with the production key source, so no simulation key source
+/// is ever constructed on the live path; the bridge errors are the same.
+pub fn load_validated(path: &Path) -> Result<ValidatedConfigV1, LoadError> {
     let mut bytes = Vec::new();
     let take = wide(MAX_CONFIG_BYTES).saturating_add(1);
     File::open(path)
@@ -110,10 +121,6 @@ pub fn load(path: &Path) -> Result<ValidatedConfigV1, LoadError> {
             bounds: error.limit().zip(error.actual()),
         })),
     }
-    .and_then(|config| {
-        bridge_check(&config).map_err(LoadError::Rejected)?;
-        Ok(config)
-    })
 }
 
 /// The M1 service bridge that `run-sim` applies: every service present and
@@ -151,7 +158,7 @@ fn bridge_rejection(error: ConfigBridgeError) -> Rejection {
 }
 
 /// Reports a load failure on stderr and returns the exit status.
-fn report_load(err: &mut impl Write, label: &str, error: &LoadError) -> u8 {
+pub fn report_load(err: &mut impl Write, label: &str, error: &LoadError) -> u8 {
     match error {
         LoadError::Read(kind) => {
             let _ = writeln!(err, "ruster: cannot read {label}config: {}", io_code(*kind));
