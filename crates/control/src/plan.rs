@@ -130,16 +130,18 @@ pub struct NatPortRange {
     pub last: u16,
 }
 
-/// Difference of one NAT44 protocol. The filtering behavior is not secret
-/// and is reported as a typed delta. The rest of the policy (which includes
-/// the allocator seed) is never exposed, only whether it changed:
-/// `policy_changed` ignores a filtering-only change.
+/// Difference of one NAT44 protocol. The filtering behavior and the
+/// hairpinning switch are not secret and are reported as typed deltas. The
+/// rest of the policy (which includes the allocator seed) is never exposed,
+/// only whether it changed: `policy_changed` ignores filtering-only and
+/// hairpinning-only changes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct NatChange {
     pub realm: Option<Delta<NatRealm>>,
     pub ports: Option<Delta<NatPortRange>>,
     pub filtering: Option<Delta<Nat44Filtering>>,
+    pub hairpinning: Option<Delta<bool>>,
     pub policy_changed: bool,
 }
 
@@ -149,6 +151,7 @@ impl NatChange {
         self.realm.is_none()
             && self.ports.is_none()
             && self.filtering.is_none()
+            && self.hairpinning.is_none()
             && !self.policy_changed
     }
 }
@@ -486,21 +489,27 @@ fn nat_change(
 ) -> NatChange {
     let (old_realm, old_ports) = nat_parts(old, protocol);
     let (new_realm, new_ports) = nat_parts(new, protocol);
-    // Filtering is reported separately, so compare the rest of the policy
-    // with the new filtering substituted into the old policy.
-    let (filtering, policy_changed) = match protocol {
+    // Filtering and hairpinning are reported separately, so compare the
+    // rest of the policy with both new values substituted into the old one.
+    let (filtering, hairpinning, policy_changed) = match protocol {
         Protocol::Udp => {
             let (old, new) = (old.udp.policy(), new.udp.policy());
             (
                 delta(old.filtering(), new.filtering()),
-                old.with_filtering(new.filtering()) != new,
+                delta(old.hairpinning(), new.hairpinning()),
+                old.with_filtering(new.filtering())
+                    .with_hairpinning(new.hairpinning())
+                    != new,
             )
         }
         Protocol::Tcp => {
             let (old, new) = (old.tcp.policy(), new.tcp.policy());
             (
                 delta(old.filtering(), new.filtering()),
-                old.with_filtering(new.filtering()) != new,
+                delta(old.hairpinning(), new.hairpinning()),
+                old.with_filtering(new.filtering())
+                    .with_hairpinning(new.hairpinning())
+                    != new,
             )
         }
     };
@@ -508,6 +517,7 @@ fn nat_change(
         realm: delta(old_realm, new_realm),
         ports: delta(old_ports, new_ports),
         filtering,
+        hairpinning,
         policy_changed,
     }
 }

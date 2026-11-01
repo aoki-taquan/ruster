@@ -57,6 +57,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "generate",
     "generated-arp",
     "generated-icmpv4",
+    "hairpinning",
     "host-unreachable",
     "icmpv4-errors",
     "id",

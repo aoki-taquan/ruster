@@ -194,7 +194,7 @@ attachした時に「kernel/NICが先に捨てるはず」と仮定しない。
 |---|---|---|
 | P2-SCALE | multi-queue/multi-worker sharding | NAT/FW/resolution ownershipをqueueへ固定し、cross-worker flow routingを共有lockなしで定義 |
 | P2-ROUTING | scalable route/neighbor lookup | linear LPM/table scanをbounded indexed structureへ移し、publication build時に検証 |
-| P2-NAT | NAT product features | static forward、hairpin、multiple public addresses、port policy、ICMP query/追加error、fragment/PMTU方針 |
+| P2-NAT | NAT product features | static forward、hairpin（UDP/TCP NAT44は実装済み: NAT44-017/042。hairpin ICMP error REQ-7はNAT44-019I）、multiple public addresses、port policy、ICMP query/追加error、fragment/PMTU方針 |
 | P2-FW | firewall product features | plain NAT-less RELATED、rule compiler/index、state export、運用可能なdeny/audit policy |
 | P2-NET | VLAN/IPv6/MTU | VLAN、IPv6、egress MTU、fragmentation/Packet Too Bigを個別milestoneで追加 |
 | P2-OPS | durable operations | config history、automatic rollback policy、upgrade/drain、metrics endpoint、support bundle |

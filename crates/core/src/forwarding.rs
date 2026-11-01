@@ -15,6 +15,9 @@ use crate::{
     Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, ResolutionResult,
     ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
+use hairpin::{decide_nat44_tcp_hairpin, decide_nat44_udp_hairpin, Nat44HairpinDestinationRewrite};
+
+mod hairpin;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -56,7 +59,7 @@ pub enum DropReason {
     Nat44UdpRuntimeUnavailable = 34,
     Nat44UdpConfigMismatch = 35,
     Nat44UdpUnsupportedTransport = 36,
-    Nat44UdpHairpinUnsupported = 37,
+    Nat44UdpHairpinDisabled = 37,
     Nat44UdpNonAtomicIpv4Unsupported = 38,
     Nat44UdpHeaderTruncated = 39,
     Nat44UdpLengthTooSmall = 40,
@@ -76,7 +79,7 @@ pub enum DropReason {
     Nat44TcpRuntimeUnavailable = 54,
     Nat44TcpConfigMismatch = 55,
     Nat44TcpUnsupportedTransport = 56,
-    Nat44TcpHairpinUnsupported = 57,
+    Nat44TcpHairpinDisabled = 57,
     Nat44TcpNonAtomicIpv4Unsupported = 58,
     Nat44TcpHeaderTruncated = 59,
     Nat44TcpDataOffsetTooSmall = 60,
@@ -166,6 +169,8 @@ pub enum DropReason {
     ArpEthernetDestinationMulticast = 144,
     Ipv4SourceLocalAddress = 145,
     Icmpv4EchoDisabled = 146,
+    Nat44UdpHairpinFiltered = 147,
+    Nat44TcpHairpinFiltered = 148,
 }
 
 use DropReason::*;
@@ -173,7 +178,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 146] = [
+    pub const ALL: [Self; 148] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -210,7 +215,7 @@ impl DropReason {
         Nat44UdpRuntimeUnavailable,
         Nat44UdpConfigMismatch,
         Nat44UdpUnsupportedTransport,
-        Nat44UdpHairpinUnsupported,
+        Nat44UdpHairpinDisabled,
         Nat44UdpNonAtomicIpv4Unsupported,
         Nat44UdpHeaderTruncated,
         Nat44UdpLengthTooSmall,
@@ -230,7 +235,7 @@ impl DropReason {
         Nat44TcpRuntimeUnavailable,
         Nat44TcpConfigMismatch,
         Nat44TcpUnsupportedTransport,
-        Nat44TcpHairpinUnsupported,
+        Nat44TcpHairpinDisabled,
         Nat44TcpNonAtomicIpv4Unsupported,
         Nat44TcpHeaderTruncated,
         Nat44TcpDataOffsetTooSmall,
@@ -320,6 +325,8 @@ impl DropReason {
         ArpEthernetDestinationMulticast,
         Ipv4SourceLocalAddress,
         Icmpv4EchoDisabled,
+        Nat44UdpHairpinFiltered,
+        Nat44TcpHairpinFiltered,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -371,7 +378,7 @@ impl DropReason {
             Nat44UdpRuntimeUnavailable => "NAT44_UDP_RUNTIME_UNAVAILABLE",
             Nat44UdpConfigMismatch => "NAT44_UDP_CONFIG_MISMATCH",
             Nat44UdpUnsupportedTransport => "NAT44_UDP_UNSUPPORTED_TRANSPORT",
-            Nat44UdpHairpinUnsupported => "NAT44_UDP_HAIRPIN_UNSUPPORTED",
+            Nat44UdpHairpinDisabled => "NAT44_UDP_HAIRPIN_DISABLED",
             Nat44UdpNonAtomicIpv4Unsupported => "NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED",
             Nat44UdpHeaderTruncated => "NAT44_UDP_HEADER_TRUNCATED",
             Nat44UdpLengthTooSmall => "NAT44_UDP_LENGTH_TOO_SMALL",
@@ -391,7 +398,7 @@ impl DropReason {
             Nat44TcpRuntimeUnavailable => "NAT44_TCP_RUNTIME_UNAVAILABLE",
             Nat44TcpConfigMismatch => "NAT44_TCP_CONFIG_MISMATCH",
             Nat44TcpUnsupportedTransport => "NAT44_TCP_UNSUPPORTED_TRANSPORT",
-            Nat44TcpHairpinUnsupported => "NAT44_TCP_HAIRPIN_UNSUPPORTED",
+            Nat44TcpHairpinDisabled => "NAT44_TCP_HAIRPIN_DISABLED",
             Nat44TcpNonAtomicIpv4Unsupported => "NAT44_TCP_NON_ATOMIC_IPV4_UNSUPPORTED",
             Nat44TcpHeaderTruncated => "NAT44_TCP_HEADER_TRUNCATED",
             Nat44TcpDataOffsetTooSmall => "NAT44_TCP_DATA_OFFSET_TOO_SMALL",
@@ -483,6 +490,8 @@ impl DropReason {
             ArpEthernetDestinationMulticast => "ARP_ETHERNET_DESTINATION_MULTICAST",
             Ipv4SourceLocalAddress => "IPV4_SOURCE_LOCAL_ADDRESS",
             Icmpv4EchoDisabled => "ICMPV4_ECHO_DISABLED",
+            Nat44UdpHairpinFiltered => "NAT44_UDP_HAIRPIN_FILTERED",
+            Nat44TcpHairpinFiltered => "NAT44_TCP_HAIRPIN_FILTERED",
         }
     }
 }
@@ -1177,12 +1186,16 @@ struct Icmpv4EchoReplyDecision {
 enum Nat44UdpTransition {
     Outbound(Nat44UdpOutboundPlan),
     Inbound(Nat44UdpInboundPlan),
+    /// Inbound half of a hairpinned packet; its outbound half has committed.
+    Hairpin(Nat44UdpInboundPlan),
 }
 
 #[derive(Clone, Copy)]
 enum Nat44TcpTransition {
     Outbound(Nat44TcpOutboundPlan),
     Inbound(Nat44TcpInboundPlan),
+    /// Inbound half of a hairpinned segment; its outbound half has committed.
+    Hairpin(Nat44TcpInboundPlan),
 }
 
 #[derive(Clone, Copy)]
@@ -1200,6 +1213,7 @@ struct Nat44UdpRewriteDecision {
     udp_checksum: u16,
     transition: Nat44UdpTransition,
     disposition: Nat44UdpDisposition,
+    hairpin_destination: Option<Nat44HairpinDestinationRewrite>,
 }
 
 #[derive(Clone, Copy)]
@@ -1217,6 +1231,7 @@ struct Nat44TcpRewriteDecision {
     tcp_checksum: u16,
     transition: Nat44TcpTransition,
     disposition: Nat44TcpDisposition,
+    hairpin_destination: Option<Nat44HairpinDestinationRewrite>,
 }
 
 #[derive(Clone, Copy)]
@@ -1927,9 +1942,11 @@ where
                         Nat44TcpTransition::Outbound(plan) => runtime
                             .prevalidate_outbound_commit(plan, nat_now_ms)
                             .map_err(|_| DropReason::Nat44TcpConfigMismatch)?,
-                        Nat44TcpTransition::Inbound(plan) => runtime
-                            .prevalidate_inbound_commit(plan, nat_now_ms)
-                            .map_err(|_| DropReason::Nat44TcpConfigMismatch)?,
+                        Nat44TcpTransition::Inbound(plan) | Nat44TcpTransition::Hairpin(plan) => {
+                            runtime
+                                .prevalidate_inbound_commit(plan, nat_now_ms)
+                                .map_err(|_| DropReason::Nat44TcpConfigMismatch)?;
+                        }
                     }
                 }
                 if matches!(
@@ -1988,6 +2005,11 @@ where
                                 .commit_inbound(plan, nat_now_ms)
                                 .expect("sequential packet path keeps UDP NAT plan current");
                         }
+                        Nat44UdpTransition::Hairpin(plan) => {
+                            runtime
+                                .commit_hairpin_inbound(plan, nat_now_ms)
+                                .expect("sequential packet path keeps UDP NAT plan current");
+                        }
                     }
                     trace.record(TraceEvent::Nat44Udp {
                         ingress,
@@ -2002,6 +2024,9 @@ where
                             }
                             Nat44TcpTransition::Inbound(plan) => {
                                 runtime.commit_prevalidated_inbound(plan, nat_now_ms);
+                            }
+                            Nat44TcpTransition::Hairpin(plan) => {
+                                runtime.commit_prevalidated_hairpin_inbound(plan, nat_now_ms);
                             }
                         }
                     }
@@ -2357,10 +2382,31 @@ fn decide_ipv4<T: TraceSink>(
     if let Some(config) = nat44_udp_config {
         if ingress == config.inside()
             && ipv4.destination == config.public_address()
-            && (ipv4.protocol == 17 || (ipv4.protocol == 6 && nat44_tcp_config.is_none()))
+            && ipv4.protocol == 17
+        {
+            return decide_nat44_udp_hairpin(
+                frame,
+                snapshot,
+                ingress,
+                ipv4,
+                resolution,
+                config,
+                nat44_udp,
+                firewall_config,
+                firewall,
+                firewall_audit,
+                firewall_validated,
+                firewall_plan,
+                trace,
+            );
+        }
+        if ingress == config.inside()
+            && ipv4.destination == config.public_address()
+            && ipv4.protocol == 6
+            && nat44_tcp_config.is_none()
         {
             observe_nat_candidate_if_present(snapshot, config, nat44_udp, nat_now, ingress, trace)?;
-            return nat44_udp_drop(ingress, Nat44UdpHairpinUnsupported, trace);
+            return nat44_udp_drop(ingress, Nat44UdpUnsupportedTransport, trace);
         }
         if ipv4.destination == config.public_address() && ipv4.protocol == 17 {
             if ingress != config.outside() {
@@ -2389,12 +2435,33 @@ fn decide_ipv4<T: TraceSink>(
     if let Some(config) = nat44_tcp_config {
         if ingress == config.inside()
             && ipv4.destination == config.public_address()
-            && (ipv4.protocol == 6 || (ipv4.protocol == 17 && nat44_udp_config.is_none()))
+            && ipv4.protocol == 6
+        {
+            return decide_nat44_tcp_hairpin(
+                frame,
+                snapshot,
+                ingress,
+                ipv4,
+                resolution,
+                config,
+                nat44_tcp,
+                firewall_config,
+                firewall,
+                firewall_audit,
+                firewall_validated,
+                firewall_plan,
+                trace,
+            );
+        }
+        if ingress == config.inside()
+            && ipv4.destination == config.public_address()
+            && ipv4.protocol == 17
+            && nat44_udp_config.is_none()
         {
             observe_nat44_tcp_candidate_if_present(
                 snapshot, config, nat44_tcp, nat_now, ingress, trace,
             )?;
-            return nat44_tcp_drop(ingress, Nat44TcpHairpinUnsupported, trace);
+            return nat44_tcp_drop(ingress, Nat44TcpUnsupportedTransport, trace);
         }
         if ipv4.destination == config.public_address() && ipv4.protocol == 6 {
             if ingress != config.outside() {
@@ -4376,6 +4443,7 @@ fn build_nat44_tcp_rewrite(
         tcp_checksum,
         transition,
         disposition,
+        hairpin_destination: None,
     }))
 }
 
@@ -4508,6 +4576,7 @@ fn build_nat44_udp_rewrite(
         udp_checksum,
         transition,
         disposition,
+        hairpin_destination: None,
     }))
 }
 
@@ -5310,6 +5379,9 @@ fn apply_nat44_tcp_rewrite(
         || frame
             .get(decision.tcp_checksum_offset..decision.tcp_checksum_end)
             .is_none()
+        || decision
+            .hairpin_destination
+            .is_some_and(|rewrite| !rewrite.fits(frame))
     {
         return Err(Nat44TcpHeaderTruncated);
     }
@@ -5321,6 +5393,9 @@ fn apply_nat44_tcp_rewrite(
     frame[decision.address_offset..decision.address_end].copy_from_slice(&decision.new_address);
     frame[decision.port_offset..decision.port_end]
         .copy_from_slice(&decision.new_port.to_be_bytes());
+    if let Some(rewrite) = decision.hairpin_destination {
+        rewrite.apply(frame);
+    }
     frame[decision.tcp_checksum_offset..decision.tcp_checksum_end]
         .copy_from_slice(&decision.tcp_checksum.to_be_bytes());
     Ok(())
@@ -5342,6 +5417,9 @@ fn apply_nat44_udp_rewrite(
         || frame
             .get(decision.udp_checksum_offset..decision.udp_checksum_end)
             .is_none()
+        || decision
+            .hairpin_destination
+            .is_some_and(|rewrite| !rewrite.fits(frame))
     {
         return Err(Nat44UdpHeaderTruncated);
     }
@@ -5353,6 +5431,9 @@ fn apply_nat44_udp_rewrite(
     frame[decision.address_offset..decision.address_end].copy_from_slice(&decision.new_address);
     frame[decision.port_offset..decision.port_end]
         .copy_from_slice(&decision.new_port.to_be_bytes());
+    if let Some(rewrite) = decision.hairpin_destination {
+        rewrite.apply(frame);
+    }
     frame[decision.udp_checksum_offset..decision.udp_checksum_end]
         .copy_from_slice(&decision.udp_checksum.to_be_bytes());
     Ok(())
@@ -6128,7 +6209,7 @@ mod tests {
             (34, "NAT44_UDP_RUNTIME_UNAVAILABLE"),
             (35, "NAT44_UDP_CONFIG_MISMATCH"),
             (36, "NAT44_UDP_UNSUPPORTED_TRANSPORT"),
-            (37, "NAT44_UDP_HAIRPIN_UNSUPPORTED"),
+            (37, "NAT44_UDP_HAIRPIN_DISABLED"),
             (38, "NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED"),
             (39, "NAT44_UDP_HEADER_TRUNCATED"),
             (40, "NAT44_UDP_LENGTH_TOO_SMALL"),
@@ -6148,7 +6229,7 @@ mod tests {
             (54, "NAT44_TCP_RUNTIME_UNAVAILABLE"),
             (55, "NAT44_TCP_CONFIG_MISMATCH"),
             (56, "NAT44_TCP_UNSUPPORTED_TRANSPORT"),
-            (57, "NAT44_TCP_HAIRPIN_UNSUPPORTED"),
+            (57, "NAT44_TCP_HAIRPIN_DISABLED"),
             (58, "NAT44_TCP_NON_ATOMIC_IPV4_UNSUPPORTED"),
             (59, "NAT44_TCP_HEADER_TRUNCATED"),
             (60, "NAT44_TCP_DATA_OFFSET_TOO_SMALL"),
@@ -6238,6 +6319,8 @@ mod tests {
             (144, "ARP_ETHERNET_DESTINATION_MULTICAST"),
             (145, "IPV4_SOURCE_LOCAL_ADDRESS"),
             (146, "ICMPV4_ECHO_DISABLED"),
+            (147, "NAT44_UDP_HAIRPIN_FILTERED"),
+            (148, "NAT44_TCP_HAIRPIN_FILTERED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -6247,7 +6330,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(147), None);
+        assert_eq!(DropReason::from_code(149), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

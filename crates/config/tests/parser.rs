@@ -604,3 +604,66 @@ fn nat44_filtering_defaults_to_address_dependent_and_is_exact() {
     .unwrap_err();
     assert_eq!(misplaced.code(), DiagnosticCode::UnknownField);
 }
+
+#[test]
+fn nat44_hairpinning_defaults_to_enabled_and_is_exact() {
+    let VersionedConfig::V1(config) = parse(VALID_V1.as_bytes()).unwrap() else {
+        panic!("schema version 1");
+    };
+    // Absent key: the RFC 4787 REQ-9 / RFC 5382 REQ-8 MUST, per protocol.
+    let nat = config.nat44.unwrap();
+    assert!(nat.udp.unwrap().hairpinning);
+    assert!(nat.tcp.unwrap().hairpinning);
+
+    // Each protocol takes its own switch.
+    let source = VALID_V1
+        .replacen(
+            "icmpv4-errors = \"external-only\"\n",
+            "icmpv4-errors = \"external-only\"\nhairpinning = false\n",
+            1,
+        )
+        .replacen(
+            "icmpv4-errors = \"disabled\"\n",
+            "icmpv4-errors = \"disabled\"\nhairpinning = true\n",
+            1,
+        );
+    let VersionedConfig::V1(config) = parse(source.as_bytes()).unwrap() else {
+        panic!("schema version 1");
+    };
+    let nat = config.nat44.unwrap();
+    assert!(!nat.udp.unwrap().hairpinning);
+    assert!(nat.tcp.unwrap().hairpinning);
+
+    // Wrong types are typed and value-free; the path is safe to print.
+    for value in ["\"false\"", "0", "\"off\""] {
+        let replacement = format!("icmpv4-errors = \"disabled\"\nhairpinning = {value}\n");
+        let diagnostic = parse(
+            VALID_V1
+                .replacen("icmpv4-errors = \"disabled\"\n", &replacement, 1)
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(diagnostic.code(), DiagnosticCode::InvalidType, "{value}");
+        assert_eq!(
+            diagnostic.path().segments(),
+            &[
+                PathSegment::Field("nat44".to_owned()),
+                PathSegment::Field("tcp".to_owned()),
+                PathSegment::Field("hairpinning".to_owned()),
+            ],
+            "{value}"
+        );
+    }
+    // The switch belongs to a protocol section, not to the realm.
+    let misplaced = parse(
+        VALID_V1
+            .replacen(
+                "[nat44.realm.ports]",
+                "hairpinning = false\n\n[nat44.realm.ports]",
+                1,
+            )
+            .as_bytes(),
+    )
+    .unwrap_err();
+    assert_eq!(misplaced.code(), DiagnosticCode::UnknownField);
+}

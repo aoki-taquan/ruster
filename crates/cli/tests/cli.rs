@@ -665,3 +665,35 @@ fn plan_text_covers_every_nat_filtering_variant() {
         }
     }
 }
+
+/// The hairpinning switch is a reloadable typed delta rendered as `on`/`off`
+/// per protocol, and only the changed protocol gets a line.
+#[test]
+fn plan_text_renders_the_hairpinning_switch_as_a_reloadable_typed_delta() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let off = dir.join("tcp-hairpin-off.toml");
+    fs::write(
+        &off,
+        source.replacen(
+            "allocator-seed = \"2\"\n",
+            "allocator-seed = \"2\"\nhairpinning = false\n",
+            1,
+        ),
+    )
+    .unwrap();
+    let current = fixtures().join("router-v1.toml");
+    assert_eq!(status(&ruster(&["validate".as_ref(), off.as_os_str()])), 0);
+    for (from, to, line) in [
+        (&current, &off, "  nat44-tcp hairpinning ~ on -> off\n"),
+        (&off, &current, "  nat44-tcp hairpinning ~ off -> on\n"),
+    ] {
+        let plan = ruster(&["plan".as_ref(), from.as_os_str(), to.as_os_str()]);
+        assert_eq!(status(&plan), 0);
+        let stdout = text(&plan.stdout);
+        assert!(stdout.starts_with("plan: reloadable\n"), "{stdout}");
+        assert!(stdout.contains(line), "{stdout}");
+        assert!(!stdout.contains("nat44-udp hairpinning"), "{stdout}");
+        assert!(!stdout.contains("policy ~ changed"), "{stdout}");
+    }
+}
