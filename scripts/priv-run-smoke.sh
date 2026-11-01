@@ -30,6 +30,9 @@
 #             restart (bounded retry of the transient BIND/BUSY or
 #             REGISTER_UMEM/MEMLOCK_LIMIT after teardown, XDP-045, in this
 #             test only) and forward again, then SIGTERM, exit 0
+#   stuck     stdout on a FIFO that is held open but never read: the stats
+#             blocks fill it, yet SIGTERM still drains, detaches, and the
+#             process exits within 10 seconds with status 0 (#301 LN1)
 set -eu
 
 for tool in cargo ip sudo python3 od ethtool ps; do
@@ -373,6 +376,38 @@ grep -q "startup failed: stage=checks port=if1 code=KERNEL_IPV4_ROUTES count=1" 
 assert_detached "the kernel route refusal"
 sudo -n ip -n "$router" route del 10.98.0.0/16 dev ra
 echo "priv_run_checks: multi-queue device, kernel IPv4 address, and kernel route refused before attach verified"
+
+# stuck: an undrained stdout must not keep the process alive.
+mkfifo "$work/stuck.fifo"
+# Open read-write so the FIFO has a reader that never reads.
+exec 3<>"$work/stuck.fifo"
+rm -f "$pidfile"
+sudo -n sh -c 'echo $$ >"$1"; shift; exec ip netns exec "$@"' sh "$pidfile" \
+    "$router" "$binary_path" run --stats-interval 1 --config "$work/router.toml" \
+    >"$work/stuck.fifo" 2>"$work/stuck.err" &
+launcher=$!
+tries=0
+while [ ! -s "$pidfile" ]; do
+    tries=$((tries + 1))
+    [ "$tries" -le 200 ] || fail "stuck: ruster did not start within 10 seconds"
+    sleep 0.05
+done
+ruster_pid=$(tr -cd '0-9' <"$pidfile")
+wait_ready stuck || fail "stuck: ruster exited during startup"
+# About one stats block (>10 KiB) per second fills the 64 KiB pipe.
+sleep 8
+signal_ruster TERM
+tries=0
+while launcher_alive; do
+    tries=$((tries + 1))
+    [ "$tries" -le 200 ] || fail "stuck: no exit within 10 seconds of SIGTERM"
+    sleep 0.05
+done
+wait_ruster
+exec 3<&-
+[ "$status" -eq 0 ] || fail "stuck: exit status $status after SIGTERM"
+assert_detached "SIGTERM with an undrained stdout"
+echo "priv_run_stuck: undrained stdout, SIGTERM drained, detached, and exited in bounded time verified"
 
 # restart: SIGKILL, auto-detach, bounded restart retry, forward again.
 start_ruster killed "$work/router.toml"

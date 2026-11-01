@@ -949,3 +949,60 @@ fn run_without_privileges_or_devices_fails_closed() {
     assert!(!stderr.contains("running generation"), "{stderr}");
     assert!(output.stdout.is_empty());
 }
+
+/// Waits at most `limit` for `child`, killing it on timeout.
+fn exits_within(mut child: Child, limit: Duration) -> Option<i32> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            return status.code();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `ruster run` exits in bounded time even when nobody ever reads its
+/// stdout (#301 LN1): `main` does not flush stdout after `run`. Both the
+/// sim refusal (before the output thread) and the privilege refusal
+/// (through the output thread) are exercised with stdout on a pipe that
+/// is never drained. Skipped with `CAP_NET_ADMIN`, like the test above.
+#[test]
+fn run_exits_in_bounded_time_with_an_undrained_stdout() {
+    let sim = Command::new(BIN)
+        .args(["run", "--config", &fixture("router-v1.toml")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    assert_eq!(exits_within(sim, Duration::from_secs(10)), Some(2));
+    if holds_net_admin() {
+        eprintln!("skipped the live part: CAP_NET_ADMIN held");
+        return;
+    }
+    let dir = scratch();
+    let v1 = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let config = dir.join("router-af-xdp.toml");
+    fs::write(
+        &config,
+        format!("{v1}{AF_XDP_BACKEND}")
+            .replace("device = \"sim0\"", "device = \"rusternodev0\"")
+            .replace("device = \"sim1\"", "device = \"rusternodev1\""),
+    )
+    .unwrap();
+    let live = Command::new(BIN)
+        .arg("run")
+        .arg("--config")
+        .arg(&config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    assert_eq!(exits_within(live, Duration::from_secs(10)), Some(4));
+}

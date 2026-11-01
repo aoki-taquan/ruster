@@ -100,12 +100,18 @@ A SIGINT/SIGTERM during startup rolls back the same way and exits 0
 
 stdout and stderr are written by a separate output thread. The router
 thread only queues complete lines and stats blocks with a bounded,
-non-blocking hand-off (64 messages); when the pipe behind stdout/stderr is
-full or nobody reads it (a stuck log collector, `ruster run | less` left
+non-blocking hand-off (64 messages per stream; stdout and stderr have
+separate threads and queues, so a stuck stdout never holds back stderr);
+when the pipe behind stdout/stderr is full or nobody reads it (a stuck log collector, `ruster run | less` left
 alone), further blocks and lines are dropped and counted in
 `output.dropped` of the next stats block that gets through. Ticks, the
-stop flag, the drain, and the detach never wait for output. At exit the
-process waits at most 1 s for queued output, then exits anyway.
+stop flag, the drain, and the detach never wait for output. The threads
+write to duplicated fds, not through Rust's stdout/stderr locks, and `main`
+does not flush stdout after `run`, so nothing waits on a blocked writer. At
+exit the process waits at most 1 s for queued output, then exits anyway:
+if a stream is still blocked then, its final stats block and summary line
+can be lost (they were teardown's last output; the teardown itself has
+completed).
 
 ## 3. Graceful shutdown
 
@@ -115,8 +121,11 @@ process waits at most 1 s for queued output, then exits anyway.
    stdout, detaches XDP by closing each link, closes every socket and UMEM,
    and prints on stderr:
    `ruster run: stopped by signal; drain calls=C completed=K rx-released=R
-   tx-in-flight=T fill-in-kernel=F forced=false timed-out=false; detached and
-   closed N port(s)`.
+   tx-in-flight=T fill-in-kernel=F forced=false timed-out=false
+   last-kick-error=none; detached and closed N port(s)`. If a close failed the
+   tail reads `detached and closed K of N port(s); see close failed` after a
+   `close failed: port=if<id> code=...` line, and `last-kick-error=` names the
+   last kick failure the drain saw (for example `if2:NETWORK_DOWN`).
 3. Exit status 0 means no TX frame was left with the kernel. Exit 3 means the
    deadline (or a second signal) left `tx-in-flight=T` frames with the kernel;
    they were released by the socket close, nothing stays attached.

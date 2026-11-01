@@ -201,7 +201,9 @@ fn live(args: &RunArgs, config: &ValidatedConfigV1, err: &mut impl Write) -> u8 
     let host = linux::LinuxHost;
     // From here on nothing on this thread writes to a file descriptor: a
     // stalled stdout/stderr pipe cannot block the datapath or the shutdown.
-    let output = match output::ColdOutput::spawn(std::io::stdout(), std::io::stderr()) {
+    // The threads get dups of fd 1/2 as plain files: blocked writes hold
+    // no std stdio lock that `main` or the exit path could wait on.
+    let output = match output::ColdOutput::process() {
         Ok(output) => output,
         Err(_) => {
             let _ = writeln!(err, "ruster run: cannot start the output thread");
@@ -223,7 +225,13 @@ fn live(args: &RunArgs, config: &ValidatedConfigV1, err: &mut impl Write) -> u8 
     );
     drop((out, cold_err));
     // Bounded: a reader that never drains cannot keep the process alive.
-    let _ = output.finish(OUTPUT_FLUSH_TIMEOUT);
+    // Teardown is complete here. If the output thread is still blocked (it
+    // may hold the global stdout lock), exit at once: `process::exit`
+    // runs no destructors, and std's exit-time stdout cleanup only
+    // try-locks, so nothing can wait on that thread (#301 LN1).
+    if !output.finish(OUTPUT_FLUSH_TIMEOUT) {
+        std::process::exit(i32::from(status));
+    }
     status
 }
 

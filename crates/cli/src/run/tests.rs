@@ -1284,11 +1284,20 @@ fn startup_codes_are_stable_tokens_without_struct_syntax() {
 fn an_undrained_output_pipe_never_blocks_the_loop_or_the_stop() {
     use std::io::Write as _;
 
-    use super::output::{dropped, ColdOutput, Stream};
+    use std::io::Read as _;
 
+    use super::output::{dropped, ColdOutput, Stream, Watchdog};
+
+    // A regression to a blocking write hangs `execute`; abort instead.
+    let _watchdog = Watchdog::arm(Duration::from_secs(120), "undrained stdout run");
     let (reader, writer) = std::io::pipe().expect("pipe");
-    let err_writer = writer.try_clone().expect("clone");
-    let output = ColdOutput::spawn(writer, err_writer).expect("output thread");
+    let (mut err_reader, err_writer) = std::io::pipe().expect("pipe");
+    let stderr_text = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = err_reader.read_to_string(&mut text);
+        text
+    });
+    let output = ColdOutput::spawn(writer, err_writer).expect("output threads");
     let mut out = output.writer(Stream::Out);
     let mut err = output.writer(Stream::Err);
     let host = FakeHost::default();
@@ -1323,8 +1332,89 @@ fn an_undrained_output_pipe_never_blocks_the_loop_or_the_stop() {
     assert!(dropped() > before, "a full pipe drops instead of blocking");
     let _ = out.flush();
     drop((out, err));
-    // The writer thread is still blocked on the full pipe; finishing is
+    // The stdout thread is still blocked on the full pipe; finishing is
     // bounded anyway.
-    assert!(!output.finish(Duration::from_millis(100)));
+    assert!(!output.finish(Duration::from_millis(500)));
+    // stderr has its own lane: the readiness line and the summary arrived
+    // although stdout never moved.
+    let stderr = stderr_text.join().expect("stderr reader");
+    assert!(stderr.contains(READY), "{stderr}");
+    assert!(stderr.contains("stopped by signal"), "{stderr}");
     drop(reader);
+}
+
+/// Pins `token()` over representative variants of every error enum it
+/// formats on the startup and shutdown paths, including nested and errno
+/// shapes, so a rename or a format change is a visible diff.
+#[test]
+fn token_table_is_pinned() {
+    use super::startup::token;
+    use ruster_control::{ActivationError, SequencerError, StorageAllocationError};
+    use ruster_io_xdp_native::{
+        AttachFailure, AttachStage, CleanupStage, DatapathError, KickError, RxFillSetupError,
+        SessionConfigError, SessionFailure, SessionStage, XdpPacketIoSetupError,
+    };
+
+    let table: Vec<(String, &str)> = vec![
+        (token(&SessionStage::TxQueueCheck), "TX_QUEUE_CHECK"),
+        (token(&SessionStage::RegisterUmem), "REGISTER_UMEM"),
+        (token(&SessionFailure::MemlockLimit), "MEMLOCK_LIMIT"),
+        (token(&SessionFailure::Errno(105)), "ERRNO_105"),
+        (token(&AttachStage::CreateLink), "CREATE_LINK"),
+        (token(&AttachFailure::ExistingProgram), "EXISTING_PROGRAM"),
+        (token(&AttachFailure::Errno(95)), "ERRNO_95"),
+        (token(&CleanupStage::CloseXdpLink), "CLOSE_XDP_LINK"),
+        (
+            token(&SessionConfigError::DeviceNameTooLong { len: 20 }),
+            "DEVICE_NAME_TOO_LONG",
+        ),
+        (
+            token(&SessionConfigError::QueueOutOfRange { queue: 9 }),
+            "QUEUE_OUT_OF_RANGE",
+        ),
+        (token(&DatapathError::AlreadyTaken), "ALREADY_TAKEN"),
+        (token(&RxFillSetupError::UmemTooShort), "UMEM_TOO_SHORT"),
+        (
+            token(&RxFillSetupError::TxRingNotEmpty),
+            "TX_RING_NOT_EMPTY",
+        ),
+        (token(&XdpPacketIoSetupError::NoPorts), "NO_PORTS"),
+        (token(&XdpPacketIoSetupError::ZeroMtu(IfId(1))), "ZERO_MTU"),
+        (
+            token(&ActivationError::StorageShapeMismatch),
+            "STORAGE_SHAPE_MISMATCH",
+        ),
+        (
+            token(&SequencerError::GenerationExhausted),
+            "GENERATION_EXHAUSTED",
+        ),
+        (
+            token(&SequencerError::HistoryAllocation),
+            "HISTORY_ALLOCATION",
+        ),
+        (
+            token(&SequencerError::KeyReused(
+                ruster_control::RuntimeService::Firewall,
+            )),
+            "KEY_REUSED.FIREWALL",
+        ),
+        (token(&KickError::NotBound), "NOT_BOUND"),
+        (
+            token(&XdpIoError::Kick {
+                interface: IfId(2),
+                error: KickError::Errno(22),
+            }),
+            "KICK",
+        ),
+    ];
+    for (got, want) in &table {
+        assert_eq!(got, want);
+    }
+    // `StorageAllocationError` is a non-exhaustive struct: its code is
+    // `ALLOCATION.<service>` from the service token.
+    assert_eq!(
+        token(&ruster_control::RuntimeService::Nat44Tcp),
+        "NAT44_TCP"
+    );
+    let _: fn(&StorageAllocationError) -> String = |error| token(&error.service);
 }

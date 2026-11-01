@@ -101,7 +101,7 @@ impl fmt::Display for Failure {
                 write!(formatter, "code={}", error.code())
             }
             Self::Sequencer(error) => write!(formatter, "code={}", token(error)),
-            Self::Storage(error) => write!(formatter, "code={}", token(error)),
+            Self::Storage(error) => write!(formatter, "code=ALLOCATION.{}", token(&error.service)),
             Self::Privileges(error) => write!(formatter, "code={error}"),
             Self::SessionConfig(error) => write!(formatter, "code={}", token(error)),
             Self::Session(error) => write!(
