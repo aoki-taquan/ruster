@@ -68,6 +68,12 @@ pub(crate) const NAT_FILTERING_CHANGE: [(&str, &str); 2] = [
         "allocator-seed = \"11\"\nfiltering = \"address-and-port-dependent\"\n",
     ),
 ];
+/// The TCP per-remote inbound session limit is reloadable (the storage
+/// shape does not depend on it); this edit opts into the recommended 8.
+pub(crate) const TCP_INBOUND_LIMIT_CHANGE: (&str, &str) = (
+    "allocator-seed = \"11\"\n",
+    "allocator-seed = \"11\"\ninbound-sessions-per-remote = 8\n",
+);
 pub(crate) const INTERFACE_CHANGE: (&str, &str) =
     ("mac = \"02:00:00:00:00:02\"", "mac = \"02:00:00:00:00:22\"");
 pub(crate) const PORT_CHANGE: (&str, &str) = ("last = 40015", "last = 40031");
@@ -358,6 +364,49 @@ fn nat_hairpinning_is_a_reloadable_typed_delta_separate_from_the_policy_flag() {
         config(&[]).storage_shape(),
         config(&[(TCP, "allocator-seed = \"11\"\nhairpinning = false\n")]).storage_shape()
     );
+}
+
+#[test]
+fn tcp_inbound_limit_is_a_reloadable_typed_delta_separate_from_the_policy_flag() {
+    const TCP: &str = "allocator-seed = \"11\"\n";
+    // Spelling out the default (0, no limit) is no change.
+    only(
+        &plan(&[(
+            TCP,
+            "allocator-seed = \"11\"\ninbound-sessions-per-remote = 0\n",
+        )]),
+        &[],
+    );
+
+    let tcp = plan(&[TCP_INBOUND_LIMIT_CHANGE]);
+    only(&tcp, &["nat44_tcp"]);
+    assert_eq!(
+        tcp.nat44_tcp().inbound_sessions_per_remote,
+        Some(Delta { old: 0, new: 8 })
+    );
+    assert_eq!(tcp.nat44_tcp().filtering, None);
+    assert_eq!(tcp.nat44_tcp().hairpinning, None);
+    // A limit-only change does not set the opaque policy flag and is not
+    // restart-required: storage does not depend on it.
+    assert!(!tcp.nat44_tcp().policy_changed);
+    assert!(tcp.restart_required().is_empty());
+    assert_eq!(tcp.nat44_udp().inbound_sessions_per_remote, None);
+    assert_eq!(
+        config(&[]).storage_shape(),
+        config(&[TCP_INBOUND_LIMIT_CHANGE]).storage_shape()
+    );
+
+    // Another policy change alongside still raises the opaque flag.
+    let both = plan(&[(
+        TCP,
+        "allocator-seed = \"12\"\ninbound-sessions-per-remote = 3\n",
+    )]);
+    assert_eq!(
+        both.nat44_tcp().inbound_sessions_per_remote,
+        Some(Delta { old: 0, new: 3 })
+    );
+    assert!(both.nat44_tcp().policy_changed);
+    assert!(both.restart_required().is_empty());
 }
 
 #[test]

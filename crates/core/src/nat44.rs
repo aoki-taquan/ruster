@@ -25,8 +25,23 @@ pub const NAT44_TCP_DEFAULT_IDLE_TTL_MS: u64 = 7_440_000;
 pub const NAT44_TCP_MAX_IDLE_TTL_MS: u64 = 604_800_000;
 /// Per-packet work bound for an inbound initial SYN that passed the NAT
 /// filter: at most this many session slots examined for reuse, and at most
-/// this many remote-address chain nodes for address-dependent admission.
+/// this many remote-address chain nodes for address-dependent admission and
+/// the per-remote inbound session count.
 pub const NAT44_TCP_INBOUND_SLOT_PROBES: usize = 16;
+/// Default limit on live TCP sessions that external inbound initial SYNs
+/// created on one mapping from one remote IPv4 address: `0`, no limit (the
+/// RFC baseline). The TCP NAT does not track FIN/RST, so a closed
+/// connection keeps its session, and its quota, until the idle TTL (at
+/// least 2h4m) expires. A default limit would therefore refuse legitimate
+/// reconnects for hours. Operators who admit new inbound flows can opt into
+/// a limit (8 is a reasonable choice). See
+/// [`Nat44TcpPolicy::with_inbound_sessions_per_remote`].
+pub const NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE: u8 = 0;
+/// Largest finite per-remote limit: the count is taken by one remote-address
+/// chain walk of at most [`NAT44_TCP_INBOUND_SLOT_PROBES`] nodes.
+pub const NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE: u8 = 16;
+const _: () =
+    assert!(NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE as usize == NAT44_TCP_INBOUND_SLOT_PROBES);
 const UDP_INDEX_NONE: u32 = u32::MAX;
 const TCP_INDEX_NONE: u32 = u32::MAX;
 static NEXT_UDP_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -1161,6 +1176,431 @@ mod tcp_tests {
         }
     }
 
+    /// Plans and commits an external inbound SYN, recording a refusal the
+    /// way the forwarding path does.
+    fn inbound_syn(
+        runtime: &mut Nat44TcpRuntime<'_>,
+        remote: Ipv4Address,
+        remote_port: u16,
+        now_ms: u64,
+    ) -> Result<usize, Nat44TcpPlanError> {
+        match runtime.plan_inbound(40_000, remote, remote_port, true, now_ms) {
+            Ok(plan) => {
+                runtime.commit_inbound(plan, now_ms).unwrap();
+                Ok(plan.session_index)
+            }
+            Err(error) => {
+                runtime.record_plan_error(error);
+                Err(error)
+            }
+        }
+    }
+
+    fn outbound_syn(runtime: &mut Nat44TcpRuntime<'_>, remote: Ipv4Address, port: u16, now: u64) {
+        let plan = runtime
+            .plan_outbound(INTERNAL, 40_000, remote, port, true, now)
+            .unwrap();
+        runtime.commit_outbound(plan, now).unwrap();
+    }
+
+    fn quota_policy(filtering: Nat44Filtering, limit: u8) -> Nat44TcpPolicy {
+        Nat44TcpPolicy::default()
+            .with_filtering(filtering)
+            .with_inbound_sessions_per_remote(limit)
+            .unwrap()
+    }
+
+    #[test]
+    fn tcp_inbound_sessions_per_remote_policy_bounds_and_default() {
+        assert_eq!(
+            Nat44TcpPolicy::default().inbound_sessions_per_remote(),
+            NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE
+        );
+        assert_eq!(
+            Nat44TcpPolicy::new(NAT44_TCP_MIN_IDLE_TTL_MS, 0)
+                .unwrap()
+                .inbound_sessions_per_remote(),
+            NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE
+        );
+        for limit in [0, 1, NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE] {
+            assert_eq!(
+                Nat44TcpPolicy::default()
+                    .with_inbound_sessions_per_remote(limit)
+                    .unwrap()
+                    .inbound_sessions_per_remote(),
+                limit
+            );
+        }
+        for limit in [NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE + 1, u8::MAX] {
+            assert_eq!(
+                Nat44TcpPolicy::default().with_inbound_sessions_per_remote(limit),
+                Err(Nat44TcpPolicyError::InboundSessionsPerRemoteTooLarge)
+            );
+        }
+    }
+
+    /// NAT44-041: at the limit an external SYN from the same remote IPv4 is
+    /// refused with a typed error and changes no slot or index; outbound
+    /// sessions to that remote are not counted, and other remotes keep
+    /// their own quota.
+    #[test]
+    fn tcp_inbound_remote_quota_refuses_without_state_change() {
+        for filtering in [
+            Nat44Filtering::EndpointIndependent,
+            Nat44Filtering::AddressDependent,
+        ] {
+            with_config(quota_policy(filtering, 2), 40_000, 40_000, |config| {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 16];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                // Three outbound sessions to REMOTE1 and one to REMOTE2 on
+                // the same mapping: more than the limit, none counted.
+                for port in [443, 444, 445] {
+                    outbound_syn(&mut runtime, REMOTE1, port, 0);
+                }
+                outbound_syn(&mut runtime, REMOTE2, 443, 0);
+                assert!(runtime.sessions().iter().all(|s| !s.is_external_inbound()));
+
+                for (offset, port) in [1001, 1002].into_iter().enumerate() {
+                    let index = inbound_syn(&mut runtime, REMOTE1, port, 1 + offset as u64)
+                        .expect("under the limit");
+                    assert!(runtime.sessions()[index].is_external_inbound());
+                }
+                assert_eq!(runtime.counters().inbound_sessions_created, 2);
+
+                let mappings_before = runtime.mappings().to_vec();
+                let sessions_before = runtime.sessions().to_vec();
+                let counters_before = runtime.counters();
+                let directory_before = runtime.session_address_directory.backing_snapshot();
+                let exact_before = runtime.session_directory.backing_snapshot();
+                runtime.session_address_lookup_probes.set(0);
+                assert_eq!(
+                    inbound_syn(&mut runtime, REMOTE1, 1003, 3),
+                    Err(Nat44TcpPlanError::InboundRemoteQuotaExceeded)
+                );
+                assert!(
+                    runtime.session_address_lookup_probes.get() <= NAT44_TCP_INBOUND_SLOT_PROBES
+                );
+                // Nothing created, refreshed, or evicted.
+                assert_eq!(runtime.mappings(), mappings_before.as_slice());
+                assert_eq!(runtime.sessions(), sessions_before.as_slice());
+                assert_eq!(
+                    runtime.session_address_directory.backing_snapshot(),
+                    directory_before
+                );
+                assert_eq!(runtime.session_directory.backing_snapshot(), exact_before);
+                assert_eq!(
+                    runtime.counters(),
+                    Nat44TcpCounters {
+                        inbound_remote_quota_exceeded: 1,
+                        ..counters_before
+                    }
+                );
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+                // A retransmission is refused again (no slot was taken).
+                assert_eq!(
+                    inbound_syn(&mut runtime, REMOTE1, 1003, 3),
+                    Err(Nat44TcpPlanError::InboundRemoteQuotaExceeded)
+                );
+
+                // Existing inbound-created sessions still translate both ways.
+                let plan = runtime
+                    .plan_inbound(40_000, REMOTE1, 1001, false, 4)
+                    .unwrap();
+                runtime.commit_inbound(plan, 4).unwrap();
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 1002, false, 4)
+                    .unwrap();
+                runtime.commit_outbound(plan, 4).unwrap();
+                // Outbound creation to the same remote is unaffected.
+                outbound_syn(&mut runtime, REMOTE1, 446, 4);
+
+                // Another remote has its own quota.
+                for port in [2001, 2002] {
+                    inbound_syn(&mut runtime, REMOTE2, port, 5).expect("own quota");
+                }
+                assert_eq!(
+                    inbound_syn(&mut runtime, REMOTE2, 2003, 5),
+                    Err(Nat44TcpPlanError::InboundRemoteQuotaExceeded)
+                );
+                assert_eq!(runtime.counters().inbound_remote_quota_exceeded, 3);
+                assert_eq!(runtime.counters().inbound_sessions_created, 4);
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+            });
+        }
+    }
+
+    /// The count is derived from live slots, so an expired inbound-created
+    /// session frees its quota without bookkeeping, and the next SYN reuses
+    /// an expired slot of the same mapping and remote.
+    #[test]
+    fn tcp_inbound_remote_quota_is_released_by_expiry_and_reuse() {
+        let ttl = NAT44_TCP_DEFAULT_IDLE_TTL_MS;
+        with_config(
+            quota_policy(Nat44Filtering::AddressDependent, 2),
+            40_000,
+            40_000,
+            |config| {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 4];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                outbound_syn(&mut runtime, REMOTE1, 443, 0);
+                let first = inbound_syn(&mut runtime, REMOTE1, 1001, 1).unwrap();
+                let second = inbound_syn(&mut runtime, REMOTE1, 1002, 2).unwrap();
+                assert_eq!(
+                    inbound_syn(&mut runtime, REMOTE1, 1003, 3),
+                    Err(Nat44TcpPlanError::InboundRemoteQuotaExceeded)
+                );
+                // Keep the mapping and the outbound (admitting) session live.
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, false, ttl / 2)
+                    .unwrap();
+                runtime.commit_outbound(plan, ttl / 2).unwrap();
+                // One tick before the first inbound session expires: full.
+                assert_eq!(
+                    inbound_syn(&mut runtime, REMOTE1, 1003, ttl),
+                    Err(Nat44TcpPlanError::InboundRemoteQuotaExceeded)
+                );
+                // The first expires: one SYN fits, into an expired slot of the
+                // same (mapping, remote).
+                let reused = inbound_syn(&mut runtime, REMOTE1, 1003, ttl + 1).unwrap();
+                assert_eq!(reused, first);
+                assert_eq!(
+                    inbound_syn(&mut runtime, REMOTE1, 1004, ttl + 1),
+                    Err(Nat44TcpPlanError::InboundRemoteQuotaExceeded)
+                );
+                // The second expires: its slot is reused next.
+                assert_eq!(
+                    inbound_syn(&mut runtime, REMOTE1, 1004, ttl + 2).unwrap(),
+                    second
+                );
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+                assert_eq!(runtime.counters().inbound_sessions_created, 4);
+                assert_eq!(runtime.counters().sessions_expired, 2);
+                assert_eq!(
+                    runtime
+                        .sessions()
+                        .iter()
+                        .filter(|session| session.is_occupied())
+                        .count(),
+                    3
+                );
+
+                // An outbound session that reuses an expired inbound-created
+                // slot is not counted: the flag follows the slot's new origin.
+                let refresh = ttl + ttl / 2 - 1;
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, false, refresh)
+                    .unwrap();
+                runtime.commit_outbound(plan, refresh).unwrap();
+                let later = ttl * 2 + 2;
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 450, true, later)
+                    .unwrap();
+                assert_eq!(plan.session_index(), first);
+                runtime.commit_outbound(plan, later).unwrap();
+                assert!(!runtime.sessions()[first].is_external_inbound());
+                assert_eq!(
+                    inbound_syn(&mut runtime, REMOTE1, 1005, later).unwrap(),
+                    second
+                );
+                inbound_syn(&mut runtime, REMOTE1, 1006, later).expect("outbound not counted");
+                assert_eq!(
+                    inbound_syn(&mut runtime, REMOTE1, 1007, later),
+                    Err(Nat44TcpPlanError::InboundRemoteQuotaExceeded)
+                );
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+            },
+        );
+    }
+
+    /// In a large table an expired slot of the same mapping and remote seen
+    /// by the admission walk is reused before any random probe, so expired
+    /// nodes do not pile up in that remote-address chain.
+    #[test]
+    fn tcp_inbound_syn_reuses_an_expired_slot_of_the_same_remote() {
+        let ttl = NAT44_TCP_DEFAULT_IDLE_TTL_MS;
+        with_config(
+            quota_policy(Nat44Filtering::AddressDependent, 2),
+            40_000,
+            40_000,
+            |config| {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 256];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                outbound_syn(&mut runtime, REMOTE1, 443, 0);
+                let mut previous = inbound_syn(&mut runtime, REMOTE1, 1000, 1).unwrap();
+                assert_ne!(previous, 0, "keyed probe, not the outbound slot");
+                for round in 1..8_u64 {
+                    // Keep the mapping and the admitting outbound session live.
+                    let now = round * ttl + 1;
+                    for at in [now - ttl / 2, now] {
+                        let plan = runtime
+                            .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, false, at)
+                            .unwrap();
+                        runtime.commit_outbound(plan, at).unwrap();
+                    }
+                    let port = 1000 + u16::try_from(round).unwrap();
+                    let index = inbound_syn(&mut runtime, REMOTE1, port, now).unwrap();
+                    assert_eq!(index, previous, "round {round}");
+                    previous = index;
+                }
+                assert_eq!(
+                    runtime
+                        .sessions()
+                        .iter()
+                        .filter(|session| session.is_occupied())
+                        .count(),
+                    2
+                );
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+            },
+        );
+    }
+
+    /// Reconcile flushes every slot, so the next publication starts with a
+    /// full quota; mapping recreation keys a fresh chain likewise.
+    #[test]
+    fn tcp_inbound_remote_quota_is_reset_by_flush() {
+        with_config(
+            quota_policy(Nat44Filtering::EndpointIndependent, 1),
+            40_000,
+            40_000,
+            |config| {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 8];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                outbound_syn(&mut runtime, REMOTE1, 443, 0);
+                inbound_syn(&mut runtime, REMOTE2, 1001, 1).unwrap();
+                assert_eq!(
+                    inbound_syn(&mut runtime, REMOTE2, 1002, 1),
+                    Err(Nat44TcpPlanError::InboundRemoteQuotaExceeded)
+                );
+                let report = runtime
+                    .reconcile(config, rotated_test_tcp_hash_key())
+                    .unwrap();
+                assert_eq!(report.sessions_flushed, 2);
+                assert!(runtime.sessions().iter().all(|s| !s.is_occupied()));
+                outbound_syn(&mut runtime, REMOTE1, 443, 2);
+                inbound_syn(&mut runtime, REMOTE2, 1002, 3).expect("flushed quota");
+                assert_eq!(
+                    inbound_syn(&mut runtime, REMOTE2, 1003, 3),
+                    Err(Nat44TcpPlanError::InboundRemoteQuotaExceeded)
+                );
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+            },
+        );
+    }
+
+    /// `0` disables the limit: the pre-NAT44-041 behavior, bounded only by
+    /// the session table.
+    #[test]
+    fn tcp_inbound_remote_quota_zero_means_unlimited() {
+        with_config(
+            quota_policy(Nat44Filtering::EndpointIndependent, 0),
+            40_000,
+            40_000,
+            |config| {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 8];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                outbound_syn(&mut runtime, REMOTE1, 443, 0);
+                runtime.session_address_lookup_probes.set(0);
+                for port in 1..8 {
+                    inbound_syn(&mut runtime, REMOTE2, port, 1).unwrap();
+                }
+                // Endpoint-independent filtering without a limit walks nothing.
+                assert_eq!(runtime.session_address_lookup_probes.get(), 0);
+                assert_eq!(
+                    inbound_syn(&mut runtime, REMOTE2, 8, 1),
+                    Err(Nat44TcpPlanError::SessionFull)
+                );
+                assert_eq!(runtime.counters().inbound_remote_quota_exceeded, 0);
+            },
+        );
+    }
+
+    /// A chain the bounded walk cannot finish fails closed: the count is not
+    /// proven below the limit, so the SYN is refused, after at most
+    /// `NAT44_TCP_INBOUND_SLOT_PROBES` nodes.
+    #[test]
+    fn tcp_inbound_remote_quota_fails_closed_beyond_the_walk_budget() {
+        let limit = NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE;
+        with_config(
+            quota_policy(Nat44Filtering::AddressDependent, limit),
+            40_000,
+            40_000,
+            |config| {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 64];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                // Two outbound sessions put the chain one node over budget
+                // once 15 inbound sessions exist.
+                outbound_syn(&mut runtime, REMOTE1, 443, 0);
+                outbound_syn(&mut runtime, REMOTE1, 444, 0);
+                for port in 1..16 {
+                    inbound_syn(&mut runtime, REMOTE1, port, 1).unwrap();
+                }
+                runtime.session_address_lookup_probes.set(0);
+                assert_eq!(
+                    inbound_syn(&mut runtime, REMOTE1, 16, 2),
+                    Err(Nat44TcpPlanError::InboundRemoteQuotaExceeded)
+                );
+                assert_eq!(
+                    runtime.session_address_lookup_probes.get(),
+                    NAT44_TCP_INBOUND_SLOT_PROBES
+                );
+                assert_eq!(runtime.counters().inbound_sessions_created, 15);
+            },
+        );
+    }
+
+    /// Hairpinned inbound halves are neither limited nor counted: their
+    /// remote is the public address shared by every inside host.
+    #[test]
+    fn tcp_hairpin_inbound_halves_are_exempt_from_the_remote_quota() {
+        with_config(
+            quota_policy(Nat44Filtering::EndpointIndependent, 1),
+            40_000,
+            40_010,
+            |config| {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 32];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                    .unwrap();
+                let public_port = plan.public_port();
+                runtime.commit_outbound(plan, 0).unwrap();
+                // More hairpin halves than the walk budget: no walk, no limit.
+                for sender_port in 41_000..41_020 {
+                    let plan = runtime
+                        .plan_hairpin_inbound(public_port, PUBLIC, sender_port, true, 1)
+                        .unwrap();
+                    assert!(!plan.session.is_external_inbound());
+                    runtime.commit_prevalidated_hairpin_inbound(plan, 1);
+                }
+                // Hairpin sessions do not use up an external remote's quota.
+                assert!(runtime
+                    .plan_inbound_read_only(public_port, REMOTE2, 1001, true, 1)
+                    .is_ok());
+                // External SYNs are still limited after the hairpin halves.
+                let plan = runtime
+                    .plan_inbound(public_port, REMOTE2, 1001, true, 1)
+                    .unwrap();
+                runtime.commit_inbound(plan, 1).unwrap();
+                assert_eq!(
+                    runtime
+                        .plan_inbound(public_port, REMOTE2, 1002, true, 1)
+                        .err(),
+                    Some(Nat44TcpPlanError::InboundRemoteQuotaExceeded)
+                );
+                assert_eq!(runtime.counters().hairpin_translated, 20);
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+            },
+        );
+    }
+
     #[test]
     fn tcp_inbound_syn_work_is_bounded_independent_of_session_capacity() {
         const SESSIONS: usize = 64;
@@ -1356,6 +1796,7 @@ mod tcp_tests {
                 remote_address: REMOTE1,
                 remote_port: 443,
                 last_activity_ms: 3,
+                external_inbound: false,
             };
             let mut mappings = [occupied_mapping];
             let mut sessions = [occupied_session];
@@ -4128,6 +4569,7 @@ pub struct Nat44TcpPolicy {
     icmpv4_errors: Nat44Icmpv4ErrorPolicy,
     filtering: Nat44Filtering,
     hairpinning: bool,
+    inbound_sessions_per_remote: u8,
 }
 
 impl std::fmt::Debug for Nat44TcpPolicy {
@@ -4139,6 +4581,10 @@ impl std::fmt::Debug for Nat44TcpPolicy {
             .field("icmpv4_errors", &self.icmpv4_errors)
             .field("filtering", &self.filtering)
             .field("hairpinning", &self.hairpinning)
+            .field(
+                "inbound_sessions_per_remote",
+                &self.inbound_sessions_per_remote,
+            )
             .finish()
     }
 }
@@ -4148,6 +4594,9 @@ impl std::fmt::Debug for Nat44TcpPolicy {
 pub enum Nat44TcpPolicyError {
     IdleTtlTooShort,
     IdleTtlTooLong,
+    /// A finite per-remote inbound session limit above
+    /// [`NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE`].
+    InboundSessionsPerRemoteTooLarge,
 }
 
 impl Nat44TcpPolicy {
@@ -4164,6 +4613,7 @@ impl Nat44TcpPolicy {
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
             filtering: Nat44Filtering::AddressDependent,
             hairpinning: true,
+            inbound_sessions_per_remote: NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE,
         })
     }
 
@@ -4218,6 +4668,55 @@ impl Nat44TcpPolicy {
     pub const fn hairpinning(self) -> bool {
         self.hairpinning
     }
+
+    /// Limits the live sessions that external inbound initial SYNs may
+    /// create on one mapping from one remote IPv4 address (any remote port).
+    /// `0` means no limit and is the default
+    /// ([`NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE`]).
+    ///
+    /// This is an opt-in local security policy against session-table
+    /// exhaustion by spoofed SYNs. RFC 5382 §9 notes that address-dependent
+    /// filtering does not fully protect against attackers sharing the
+    /// remote's IP address behind a remote NAT, and that a NAT may check
+    /// liveness or use more conservative timeouts against resource attacks;
+    /// it does not address spoofing, and no REQ of RFC 5382 or RFC 4787
+    /// requires admitting every filtered-in SYN. The limit is fixed by
+    /// configuration, not adaptive, so the device stays deterministic
+    /// (RFC 4787 §13).
+    ///
+    /// FIN and RST are not tracked: a cleanly closed connection keeps
+    /// counting until its idle TTL expires. The count is taken over at most
+    /// [`NAT44_TCP_INBOUND_SLOT_PROBES`] remote-address chain nodes, which
+    /// also hold the outbound-created sessions of the same mapping and
+    /// remote; those reduce the effective limit, and a longer chain refuses
+    /// (fails closed) even where address-dependent filtering alone would
+    /// admit. The maximum of 16 is therefore nominal.
+    /// Sessions created by outbound segments are never
+    /// limited or counted, and neither are hairpinned inbound halves: their
+    /// remote is the NAT's own public address, which every inside host
+    /// shares and an outside sender cannot use. A SYN over the limit is
+    /// dropped without creating state and without evicting a live session.
+    ///
+    /// # Errors
+    ///
+    /// [`Nat44TcpPolicyError::InboundSessionsPerRemoteTooLarge`] above
+    /// [`NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE`].
+    pub const fn with_inbound_sessions_per_remote(
+        mut self,
+        limit: u8,
+    ) -> Result<Self, Nat44TcpPolicyError> {
+        if limit > NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE {
+            return Err(Nat44TcpPolicyError::InboundSessionsPerRemoteTooLarge);
+        }
+        self.inbound_sessions_per_remote = limit;
+        Ok(self)
+    }
+
+    /// The per-remote inbound session limit; `0` means no limit.
+    #[must_use]
+    pub const fn inbound_sessions_per_remote(self) -> u8 {
+        self.inbound_sessions_per_remote
+    }
 }
 
 impl Default for Nat44TcpPolicy {
@@ -4228,6 +4727,7 @@ impl Default for Nat44TcpPolicy {
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
             filtering: Nat44Filtering::AddressDependent,
             hairpinning: true,
+            inbound_sessions_per_remote: NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE,
         }
     }
 }
@@ -4445,6 +4945,9 @@ pub struct Nat44TcpSessionSlot {
     remote_address: Ipv4Address,
     remote_port: u16,
     last_activity_ms: u64,
+    /// Created by an external (non-hairpin) inbound initial SYN; counted
+    /// against the per-remote inbound session limit while live.
+    external_inbound: bool,
 }
 
 impl std::fmt::Debug for Nat44TcpSessionSlot {
@@ -4467,6 +4970,7 @@ impl Default for Nat44TcpSessionSlot {
             remote_address: Ipv4Address::from_octets([0; 4]),
             remote_port: 0,
             last_activity_ms: 0,
+            external_inbound: false,
         }
     }
 }
@@ -4490,6 +4994,13 @@ impl Nat44TcpSessionSlot {
     #[must_use]
     pub const fn last_activity_ms(self) -> u64 {
         self.last_activity_ms
+    }
+
+    /// Whether an external inbound initial SYN created this session, so it
+    /// counts against the per-remote inbound session limit while live.
+    #[must_use]
+    pub const fn is_external_inbound(self) -> bool {
+        self.external_inbound
     }
 }
 
@@ -4529,6 +5040,11 @@ pub struct Nat44TcpCounters {
     pub hairpin_inbound_refused: u64,
     /// Hairpinned packets dropped because hairpinning is disabled.
     pub hairpin_disabled: u64,
+    /// External inbound initial SYNs dropped because their mapping already
+    /// has the configured number of live inbound-created sessions from the
+    /// same remote IPv4 address, or because the count could not be proven
+    /// below it within [`NAT44_TCP_INBOUND_SLOT_PROBES`] chain nodes.
+    pub inbound_remote_quota_exceeded: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4569,6 +5085,9 @@ pub enum Nat44TcpDisposition {
     Rejected {
         reason: crate::DropReason,
     },
+    /// An external inbound initial SYN over the per-remote inbound session
+    /// limit; nothing was created or evicted.
+    InboundRemoteQuotaExceeded,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4639,6 +5158,28 @@ pub(crate) struct Nat44TcpInboundPlan {
     prepared: PreparedNat44TcpSessionLink,
 }
 
+/// Who sent an inbound segment: an outside host, or the inbound half of a
+/// hairpinned segment (whose remote is the NAT's own public address).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Nat44TcpInboundOrigin {
+    External,
+    Hairpin,
+}
+
+/// What one bounded remote-address chain walk saw for a mapping and remote
+/// IPv4 address.
+#[derive(Clone, Copy)]
+struct Nat44TcpRemoteCensus {
+    /// A live session of this mapping with this remote address exists.
+    live: bool,
+    /// Live externally created sessions seen (stops at the limit).
+    counted: usize,
+    /// The first expired slot of this mapping and remote address seen.
+    expired_slot: Option<usize>,
+    /// The walk reached the end of the chain.
+    complete: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Nat44TcpPlanAuthority {
     runtime_epoch: u128,
@@ -4681,6 +5222,7 @@ pub(crate) enum Nat44TcpPlanError {
     IndexCorrupt,
     GenerationExhausted,
     StateRevisionExhausted,
+    InboundRemoteQuotaExceeded,
 }
 
 #[derive(Clone, Copy)]
@@ -5380,6 +5922,7 @@ impl<'a> Nat44TcpRuntime<'a> {
                         remote_address,
                         remote_port,
                         last_activity_ms: now_ms,
+                        external_inbound: false,
                     },
                     mapping_created: false,
                     mapping_expired: false,
@@ -5439,6 +5982,7 @@ impl<'a> Nat44TcpRuntime<'a> {
                     remote_address,
                     remote_port,
                     last_activity_ms: now_ms,
+                    external_inbound: false,
                 },
                 mapping_created: true,
                 mapping_expired,
@@ -5467,6 +6011,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             remote_address,
             remote_port,
             initial_syn,
+            Nat44TcpInboundOrigin::External,
             now_ms,
         )
     }
@@ -5485,6 +6030,49 @@ impl<'a> Nat44TcpRuntime<'a> {
             remote_address,
             remote_port,
             initial_syn,
+            Nat44TcpInboundOrigin::External,
+            now_ms,
+        )
+    }
+
+    /// Plans the inbound half of a hairpinned segment: exactly
+    /// [`Self::plan_inbound`] except that a session it creates is not
+    /// counted against, or limited by, the per-remote inbound session limit.
+    pub(crate) fn plan_hairpin_inbound(
+        &mut self,
+        public_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        initial_syn: bool,
+        now_ms: u64,
+    ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
+        self.observe_now(now_ms)?;
+        self.plan_inbound_after_clock(
+            public_port,
+            remote_address,
+            remote_port,
+            initial_syn,
+            Nat44TcpInboundOrigin::Hairpin,
+            now_ms,
+        )
+    }
+
+    /// Read-only variant of [`Self::plan_hairpin_inbound`].
+    pub(crate) fn plan_hairpin_inbound_read_only(
+        &self,
+        public_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        initial_syn: bool,
+        now_ms: u64,
+    ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
+        self.check_now_read_only(now_ms)?;
+        self.plan_inbound_after_clock(
+            public_port,
+            remote_address,
+            remote_port,
+            initial_syn,
+            Nat44TcpInboundOrigin::Hairpin,
             now_ms,
         )
     }
@@ -5495,14 +6083,19 @@ impl<'a> Nat44TcpRuntime<'a> {
     /// admits the remote endpoint (RFC 5382 §4.3, REQ-3): any endpoint under
     /// endpoint-independent filtering, a remote IPv4 with another live
     /// session of this mapping under address-dependent filtering, never under
-    /// address-and-port-dependent filtering. Every refusal is
-    /// `SessionMiss`, a silent drop (REQ-4 a).
+    /// address-and-port-dependent filtering. Every filter refusal is
+    /// `SessionMiss`, a silent drop (REQ-4 a). An external SYN the filter
+    /// admits is then refused as `InboundRemoteQuotaExceeded` when the
+    /// mapping already has the configured number of live externally created
+    /// sessions from the same remote IPv4 (see
+    /// [`Nat44TcpPolicy::with_inbound_sessions_per_remote`]).
     fn plan_inbound_after_clock(
         &self,
         public_port: u16,
         remote_address: Ipv4Address,
         remote_port: u16,
         initial_syn: bool,
+        origin: Nat44TcpInboundOrigin,
         now_ms: u64,
     ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
         if self.state_revision == u128::MAX {
@@ -5538,16 +6131,20 @@ impl<'a> Nat44TcpRuntime<'a> {
                 prepared: PreparedNat44TcpSessionLink::EMPTY,
             });
         }
-        if !initial_syn
-            || !self.inbound_filter_admits(mapping_index, mapping, remote_address, now_ms)?
-        {
+        if !initial_syn {
             return Err(Nat44TcpPlanError::SessionMiss);
         }
+        let same_remote_expired =
+            self.inbound_admission(mapping_index, mapping, remote_address, origin, now_ms)?;
         // Externally initiated sessions never run the outbound O(S) slot
         // scan: this packet is unauthenticated and a bound firewall has not
-        // judged it yet. Reuse the exact expired slot, or probe a bounded
-        // keyed window.
+        // judged it yet. Reuse the exact expired slot, else an expired slot
+        // of this mapping and remote address seen by the admission walk
+        // (so such slots do not pile up in the remote-address chain), else
+        // probe a bounded keyed window.
         let session_index = if let Some((session_index, _)) = exact_session {
+            session_index
+        } else if let Some(session_index) = same_remote_expired {
             session_index
         } else if let Some(session_index) = self.find_reusable_session_for_inbound(
             mapping_index,
@@ -5569,6 +6166,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             remote_address,
             remote_port,
             last_activity_ms: now_ms,
+            external_inbound: origin == Nat44TcpInboundOrigin::External,
         };
         let prepared = self.prepare_session_link(session_index, session)?;
         mapping.last_activity_ms = now_ms;
@@ -5649,68 +6247,115 @@ impl<'a> Nat44TcpRuntime<'a> {
         None
     }
 
-    /// Filtering decision for an inbound initial SYN without an exact live
-    /// session. Bounded: no lookup for endpoint-independent or
-    /// address-and-port-dependent filtering, and for address-dependent
-    /// filtering one remote-address directory lookup that visits at most
-    /// [`NAT44_TCP_INBOUND_SLOT_PROBES`] chain nodes and fails closed
-    /// (refuses) beyond that.
-    fn inbound_filter_admits(
+    /// Admission of an inbound initial SYN without an exact live session:
+    /// the filtering decision, then (for an external SYN with a finite
+    /// limit) the per-remote inbound session limit. Returns an expired slot
+    /// of this mapping and remote address that the walk saw, if any.
+    ///
+    /// Bounded: no lookup for address-and-port-dependent filtering, or for
+    /// endpoint-independent filtering without a limit. Otherwise one walk
+    /// of the remote-address chain that visits at most
+    /// [`NAT44_TCP_INBOUND_SLOT_PROBES`] nodes. Without a limit the walk
+    /// stops at the first live session (address-dependent admission). With
+    /// a limit it counts the live externally created sessions of this
+    /// mapping and remote address and stops when the count reaches the
+    /// limit; a chain the budget cannot finish fails closed, because the
+    /// count is then not proven below the limit. The count is derived from
+    /// live slots on every SYN, so expiry, slot reuse, mapping recreation,
+    /// and reconcile release quota without any separate bookkeeping.
+    fn inbound_admission(
         &self,
         mapping_index: usize,
         mapping: Nat44TcpMappingSlot,
         remote_address: Ipv4Address,
+        origin: Nat44TcpInboundOrigin,
         now_ms: u64,
-    ) -> Result<bool, Nat44TcpPlanError> {
-        match self.config.policy.filtering {
-            Nat44Filtering::EndpointIndependent => Ok(true),
-            Nat44Filtering::AddressAndPortDependent => Ok(false),
-            Nat44Filtering::AddressDependent => self.live_session_with_address_exists(
-                mapping_index,
-                mapping,
-                remote_address,
-                now_ms,
-            ),
+    ) -> Result<Option<usize>, Nat44TcpPlanError> {
+        let filtering = self.config.policy.filtering;
+        if filtering == Nat44Filtering::AddressAndPortDependent {
+            return Err(Nat44TcpPlanError::SessionMiss);
         }
+        let limit = match origin {
+            Nat44TcpInboundOrigin::External => {
+                usize::from(self.config.policy.inbound_sessions_per_remote)
+            }
+            Nat44TcpInboundOrigin::Hairpin => 0,
+        };
+        if filtering == Nat44Filtering::EndpointIndependent && limit == 0 {
+            return Ok(None);
+        }
+        let census = self.remote_census(mapping_index, mapping, remote_address, limit, now_ms)?;
+        if filtering == Nat44Filtering::AddressDependent && !census.live {
+            return Err(Nat44TcpPlanError::SessionMiss);
+        }
+        if limit != 0 && (census.counted >= limit || !census.complete) {
+            return Err(Nat44TcpPlanError::InboundRemoteQuotaExceeded);
+        }
+        Ok(census.expired_slot)
     }
 
-    fn live_session_with_address_exists(
+    /// One bounded walk of the remote-address chain of
+    /// `(mapping, remote_address)`; see [`Self::inbound_admission`].
+    fn remote_census(
         &self,
         mapping_index: usize,
         mapping: Nat44TcpMappingSlot,
         remote_address: Ipv4Address,
+        limit: usize,
         now_ms: u64,
-    ) -> Result<bool, Nat44TcpPlanError> {
+    ) -> Result<Nat44TcpRemoteCensus, Nat44TcpPlanError> {
         let words = Self::session_address_lookup_words(
             mapping_index,
             mapping.generation,
             mapping.lifecycle_epoch,
             remote_address,
         );
-        let probe = self
+        let mut census = Nat44TcpRemoteCensus {
+            live: false,
+            counted: 0,
+            expired_slot: None,
+            complete: false,
+        };
+        let walk = self
             .session_address_directory
-            .lookup_bounded(
+            .walk_bounded(
                 DirectoryHashDomain::TcpSessionAddress,
                 &words,
                 NAT44_TCP_INBOUND_SLOT_PROBES,
                 |index| {
                     let session = self.sessions[index];
-                    session.occupied
+                    if !(session.occupied
                         && session.mapping_index == mapping_index
                         && session.mapping_generation == mapping.generation
                         && session.mapping_lifecycle_epoch == mapping.lifecycle_epoch
-                        && session.remote_address == remote_address
-                        && self.session_is_live(session, now_ms)
+                        && session.remote_address == remote_address)
+                    {
+                        return false;
+                    }
+                    if !self.session_is_live(session, now_ms) {
+                        census.expired_slot.get_or_insert(index);
+                        return false;
+                    }
+                    census.live = true;
+                    if session.external_inbound {
+                        census.counted += 1;
+                    }
+                    if limit == 0 {
+                        true
+                    } else {
+                        census.counted >= limit
+                    }
                 },
             )
             .map_err(|_| Nat44TcpPlanError::IndexCorrupt)?;
+        census.complete = walk.complete;
         #[cfg(test)]
         self.session_address_lookup_probes.set(
             self.session_address_lookup_probes
                 .get()
-                .saturating_add(probe.probes),
+                .saturating_add(walk.probes),
         );
-        Ok(probe.state_index.is_some())
+        Ok(census)
     }
 
     #[allow(dead_code)] // Typed stale-plan API retained for core callers and tests.
@@ -5936,6 +6581,12 @@ impl<'a> Nat44TcpRuntime<'a> {
             }
             Nat44TcpPlanError::PortExhausted => {
                 self.counters.port_exhausted = self.counters.port_exhausted.saturating_add(1);
+            }
+            Nat44TcpPlanError::InboundRemoteQuotaExceeded => {
+                self.counters.inbound_remote_quota_exceeded = self
+                    .counters
+                    .inbound_remote_quota_exceeded
+                    .saturating_add(1);
             }
             Nat44TcpPlanError::ClockRegression => {}
             Nat44TcpPlanError::IndexCorrupt
@@ -6740,12 +7391,14 @@ mod tests {
         assert_eq!(
             format!("{tcp_policy:?}"),
             "Nat44TcpPolicy { idle_ttl_ms: 7440000, allocator_seed: [REDACTED], \
-             icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true }"
+             icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true, \
+             inbound_sessions_per_remote: 0 }"
         );
         assert_eq!(
             format!("{tcp_policy:#?}"),
             "Nat44TcpPolicy {\n    idle_ttl_ms: 7440000,\n    allocator_seed: [REDACTED],\n    \
-             icmpv4_errors: ExternalOnly,\n    filtering: AddressDependent,\n    hairpinning: true,\n}"
+             icmpv4_errors: ExternalOnly,\n    filtering: AddressDependent,\n    hairpinning: true,\n    \
+             inbound_sessions_per_remote: 0,\n}"
         );
 
         with_config(udp_policy, |udp_config| {
@@ -6786,7 +7439,8 @@ mod tests {
                 "Nat44TcpConfig { inside: IfId(1), outside: IfId(2), public_address: \
                  Ipv4Address(3405803786), first_port: 40000, last_port: 40001, policy: \
                  Nat44TcpPolicy { idle_ttl_ms: 7440000, allocator_seed: [REDACTED], \
-                 icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true }, authority: \
+                 icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true, \
+                 inbound_sessions_per_remote: 0 }, authority: \
                  [REDACTED], snapshot_identity: \
                  [REDACTED] }"
             );
@@ -6808,7 +7462,8 @@ mod tests {
                  2,\n    ),\n    public_address: Ipv4Address(\n        3405803786,\n    ),\n    \
                  first_port: 40000,\n    last_port: 40001,\n    policy: Nat44TcpPolicy {\n        \
                  idle_ttl_ms: 7440000,\n        allocator_seed: [REDACTED],\n        icmpv4_errors: \
-                 ExternalOnly,\n        filtering: AddressDependent,\n        hairpinning: true,\n    },\n    authority: \
+                 ExternalOnly,\n        filtering: AddressDependent,\n        hairpinning: true,\n        \
+                 inbound_sessions_per_remote: 0,\n    },\n    authority: \
                  [REDACTED],\n    snapshot_identity: \
                  [REDACTED],\n}"
             );
@@ -6978,6 +7633,7 @@ mod tests {
             remote_address: POISON_ADDRESS,
             remote_port: 65_529,
             last_activity_ms: 99,
+            external_inbound: true,
         };
         let mut tcp_session_hidden = tcp_session;
         tcp_session_hidden.mapping_index -= 1;
@@ -7282,6 +7938,7 @@ mod tests {
                 "hairpin_translated",
                 "hairpin_inbound_refused",
                 "hairpin_disabled",
+                "inbound_remote_quota_exceeded",
             ]
         );
         assert_eq!(

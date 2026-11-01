@@ -341,7 +341,7 @@ fn service_counters_capture_every_runtime_counter_in_fixed_order() {
         ("resolution", 13),
         ("icmpv4_errors", 31),
         ("nat44_udp", 17),
-        ("nat44_tcp", 21),
+        ("nat44_tcp", 22),
         ("firewall", 13),
     ] {
         assert_eq!(sections.iter().filter(|s| **s == section).count(), fields);

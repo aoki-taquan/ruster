@@ -1011,7 +1011,7 @@ fn plan_restart_classification_matches_live_apply_rejection() {
     use crate::plan::tests::{
         config, ECHO_REPLY_CHANGE, ICMPV4_GENERATION_CHANGE, ICMPV4_POLICY_CHANGE,
         INTERFACE_CHANGE, NAT_FILTERING_CHANGE, PORT_CHANGE, PORT_SHIFT, RESOLUTION_POLICY_CHANGE,
-        ROUTE_CHANGE, SHAPE_CHANGE,
+        ROUTE_CHANGE, SHAPE_CHANGE, TCP_INBOUND_LIMIT_CHANGE,
     };
     use crate::{ApplyPlan, PublicationSequencer};
 
@@ -1050,13 +1050,15 @@ fn plan_restart_classification_matches_live_apply_rejection() {
 
     // No restart reason: the dry-run and the apply both succeed. A
     // same-size NAT port pool shift keeps the storage shape and reloads, and
-    // so do the Echo responder switch and the NAT filtering modes.
+    // so do the Echo responder switch, the NAT filtering modes, and the TCP
+    // per-remote inbound session limit.
     let next = config(&[
         ROUTE_CHANGE,
         PORT_SHIFT,
         ECHO_REPLY_CHANGE,
         NAT_FILTERING_CHANGE[0],
         NAT_FILTERING_CHANGE[1],
+        TCP_INBOUND_LIMIT_CHANGE,
     ]);
     let successor = sequencer.candidate(&next).unwrap();
     let plan = ApplyPlan::for_active(&mut active, &current, &next, &successor).unwrap();

@@ -172,6 +172,7 @@ pub enum DropReason {
     Nat44UdpHairpinFiltered = 147,
     Nat44TcpHairpinFiltered = 148,
     Nat44Icmpv4QuotedRemoteLocal = 149,
+    Nat44TcpInboundRemoteQuotaExceeded = 150,
 }
 
 use DropReason::*;
@@ -179,7 +180,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 149] = [
+    pub const ALL: [Self; 150] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -329,6 +330,7 @@ impl DropReason {
         Nat44UdpHairpinFiltered,
         Nat44TcpHairpinFiltered,
         Nat44Icmpv4QuotedRemoteLocal,
+        Nat44TcpInboundRemoteQuotaExceeded,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -495,6 +497,7 @@ impl DropReason {
             Nat44UdpHairpinFiltered => "NAT44_UDP_HAIRPIN_FILTERED",
             Nat44TcpHairpinFiltered => "NAT44_TCP_HAIRPIN_FILTERED",
             Nat44Icmpv4QuotedRemoteLocal => "NAT44_ICMPV4_QUOTED_REMOTE_LOCAL",
+            Nat44TcpInboundRemoteQuotaExceeded => "NAT44_TCP_INBOUND_REMOTE_QUOTA_EXCEEDED",
         }
     }
 }
@@ -3004,7 +3007,8 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
                         Nat44TcpPlanError::InvalidInitialFlags
                         | Nat44TcpPlanError::MappingFull
                         | Nat44TcpPlanError::SessionFull
-                        | Nat44TcpPlanError::PortExhausted => {
+                        | Nat44TcpPlanError::PortExhausted
+                        | Nat44TcpPlanError::InboundRemoteQuotaExceeded => {
                             unreachable!("read-only ICMP lookup cannot create state")
                         }
                         Nat44TcpPlanError::IndexCorrupt
@@ -4746,6 +4750,10 @@ fn nat44_tcp_plan_error(error: Nat44TcpPlanError) -> (DropReason, Nat44TcpDispos
             Nat44TcpClockRegression,
             Nat44TcpDisposition::ClockRegression,
         ),
+        Nat44TcpPlanError::InboundRemoteQuotaExceeded => (
+            Nat44TcpInboundRemoteQuotaExceeded,
+            Nat44TcpDisposition::InboundRemoteQuotaExceeded,
+        ),
         Nat44TcpPlanError::IndexCorrupt
         | Nat44TcpPlanError::GenerationExhausted
         | Nat44TcpPlanError::StateRevisionExhausted => {
@@ -6347,6 +6355,7 @@ mod tests {
             (147, "NAT44_UDP_HAIRPIN_FILTERED"),
             (148, "NAT44_TCP_HAIRPIN_FILTERED"),
             (149, "NAT44_ICMPV4_QUOTED_REMOTE_LOCAL"),
+            (150, "NAT44_TCP_INBOUND_REMOTE_QUOTA_EXCEEDED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -6356,7 +6365,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(150), None);
+        assert_eq!(DropReason::from_code(151), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

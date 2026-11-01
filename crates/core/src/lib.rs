@@ -80,9 +80,10 @@ pub use nat44::{
     Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
     Nat44UdpPolicyError, Nat44UdpReconcileError, Nat44UdpReconcilePermit, Nat44UdpReconcileReport,
     Nat44UdpRuntime, Nat44UdpRuntimeConfigError, Nat44UdpStorageShape,
-    NAT44_TCP_DEFAULT_IDLE_TTL_MS, NAT44_TCP_INBOUND_SLOT_PROBES, NAT44_TCP_MAX_IDLE_TTL_MS,
-    NAT44_TCP_MIN_IDLE_TTL_MS, NAT44_UDP_DEFAULT_IDLE_TTL_MS, NAT44_UDP_MAX_IDLE_TTL_MS,
-    NAT44_UDP_MIN_IDLE_TTL_MS,
+    NAT44_TCP_DEFAULT_IDLE_TTL_MS, NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE,
+    NAT44_TCP_INBOUND_SLOT_PROBES, NAT44_TCP_MAX_IDLE_TTL_MS,
+    NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE, NAT44_TCP_MIN_IDLE_TTL_MS,
+    NAT44_UDP_DEFAULT_IDLE_TTL_MS, NAT44_UDP_MAX_IDLE_TTL_MS, NAT44_UDP_MIN_IDLE_TTL_MS,
 };
 pub use observability::{BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields};
 pub use packet::{

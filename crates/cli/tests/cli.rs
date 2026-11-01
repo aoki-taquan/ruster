@@ -697,3 +697,61 @@ fn plan_text_renders_the_hairpinning_switch_as_a_reloadable_typed_delta() {
         assert!(!stdout.contains("policy ~ changed"), "{stdout}");
     }
 }
+
+/// The TCP per-remote inbound session limit is a reloadable typed delta;
+/// `0` renders as `unlimited`, and out-of-range values are rejected with a
+/// value-free code and path.
+#[test]
+fn plan_text_renders_the_tcp_inbound_limit_as_a_reloadable_typed_delta() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let with = |name: &str, value: &str| {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            source.replacen(
+                "allocator-seed = \"2\"\n",
+                &format!("allocator-seed = \"2\"\ninbound-sessions-per-remote = {value}\n"),
+                1,
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let eight = with("tcp-eight.toml", "8");
+    let four = with("tcp-four.toml", "4");
+    let current = fixtures().join("router-v1.toml");
+    for (from, to, line) in [
+        (
+            &current,
+            &eight,
+            "  nat44-tcp inbound-sessions-per-remote ~ unlimited -> 8\n",
+        ),
+        (
+            &eight,
+            &four,
+            "  nat44-tcp inbound-sessions-per-remote ~ 8 -> 4\n",
+        ),
+        (
+            &four,
+            &current,
+            "  nat44-tcp inbound-sessions-per-remote ~ 4 -> unlimited\n",
+        ),
+    ] {
+        let plan = ruster(&["plan".as_ref(), from.as_os_str(), to.as_os_str()]);
+        assert_eq!(status(&plan), 0);
+        let stdout = text(&plan.stdout);
+        assert!(stdout.starts_with("plan: reloadable\n"), "{stdout}");
+        assert!(stdout.contains(line), "{stdout}");
+        assert!(!stdout.contains("policy ~ changed"), "{stdout}");
+    }
+    let invalid = with("tcp-too-large.toml", "17");
+    let output = ruster(&["validate".as_ref(), invalid.as_os_str()]);
+    assert_eq!(status(&output), 2);
+    let stderr = text(&output.stderr);
+    assert!(
+        stderr.contains("code=NAT44_TCP_POLICY path=nat44.tcp.inbound-sessions-per-remote"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("17"), "{stderr}");
+}

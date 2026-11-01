@@ -1047,7 +1047,14 @@ fn validate_v1(
                 })?
                 .with_icmpv4_errors(map_icmp_policy(source.icmpv4_errors))
                 .with_filtering(map_filtering(source.filtering))
-                .with_hairpinning(source.hairpinning);
+                .with_hairpinning(source.hairpinning)
+                .with_inbound_sessions_per_remote(source.inbound_sessions_per_remote)
+                .map_err(|error| {
+                    ValidationError::new(
+                        ValidationCode::Nat44TcpPolicy(error),
+                        path(&["nat44", "tcp", "inbound-sessions-per-remote"]),
+                    )
+                })?;
             Nat44TcpConfig::new(
                 &snapshot,
                 inside,

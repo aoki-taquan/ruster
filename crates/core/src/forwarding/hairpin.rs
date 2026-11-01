@@ -750,7 +750,7 @@ fn tcp_hairpin_inbound_half<T: TraceSink>(
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     let planned = if read_only {
-        runtime.plan_inbound_read_only(
+        runtime.plan_hairpin_inbound_read_only(
             tcp.destination_port,
             tuples.public_address,
             tuples.sender_public_port,
@@ -758,7 +758,7 @@ fn tcp_hairpin_inbound_half<T: TraceSink>(
             now.0,
         )
     } else {
-        runtime.plan_inbound(
+        runtime.plan_hairpin_inbound(
             tcp.destination_port,
             tuples.public_address,
             tuples.sender_public_port,

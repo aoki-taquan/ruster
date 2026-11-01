@@ -155,6 +155,16 @@ pub(crate) struct DirectoryProbe {
     pub probes: usize,
 }
 
+/// Outcome of [`FixedDirectory::walk_bounded`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DirectoryWalk {
+    pub probes: usize,
+    /// The visitor stopped the walk.
+    pub stopped: bool,
+    /// The walk reached the end of the chain without being stopped.
+    pub complete: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DirectoryConservation {
     pub linked_nodes: usize,
@@ -543,22 +553,26 @@ impl<'a> FixedDirectory<'a> {
         }
     }
 
-    /// Like [`FixedDirectory::lookup`], but visits at most `max_probes`
-    /// chain nodes. A chain longer than the budget is reported as a miss
-    /// (`state_index: None`), never as an error, so callers that use this
-    /// for an admission decision fail closed under collision or flooding.
-    pub(crate) fn lookup_bounded(
+    /// Visits the chain of `words` in order, at most `max_probes` nodes,
+    /// calling `visit` for each node whose hash matches. `visit` returns
+    /// `true` to stop early. The result says how many nodes were visited,
+    /// whether `visit` stopped the walk, and whether the walk reached the
+    /// end of the chain (`complete`). A chain longer than the budget is
+    /// reported as incomplete, never as an error, so callers that count
+    /// matches for an admission decision can fail closed.
+    pub(crate) fn walk_bounded(
         &self,
         domain: DirectoryHashDomain,
         words: &[u64],
         max_probes: usize,
-        mut key_matches: impl FnMut(usize) -> bool,
-    ) -> Result<DirectoryProbe, DirectoryLookupError> {
+        mut visit: impl FnMut(usize) -> bool,
+    ) -> Result<DirectoryWalk, DirectoryLookupError> {
         let hash = self.hash_words(domain, words);
         let Some(bucket_index) = self.bucket_for_hash(hash) else {
-            return Ok(DirectoryProbe {
-                state_index: None,
+            return Ok(DirectoryWalk {
                 probes: 0,
+                stopped: false,
+                complete: true,
             });
         };
         let bucket =
@@ -577,17 +591,19 @@ impl<'a> FixedDirectory<'a> {
                 return Err(DirectoryLookupError::BucketMismatch { probes });
             }
             probes += 1;
-            if node.hash == hash && key_matches(index) {
-                return Ok(DirectoryProbe {
-                    state_index: Some(index),
+            if node.hash == hash && visit(index) {
+                return Ok(DirectoryWalk {
                     probes,
+                    stopped: true,
+                    complete: false,
                 });
             }
             current = node.next;
         }
-        Ok(DirectoryProbe {
-            state_index: None,
+        Ok(DirectoryWalk {
             probes,
+            stopped: false,
+            complete: current == NONE,
         })
     }
 
@@ -1561,6 +1577,70 @@ mod tests {
                 nonempty_buckets: 1,
                 max_chain_len: 3,
             }
+        );
+    }
+
+    #[test]
+    fn bounded_walk_visits_hash_matches_in_order_and_reports_completion() {
+        let mut buckets = [DirectoryBucket::default(); 4];
+        let mut nodes = [DirectoryNode::default(); 4];
+        let mut directory = FixedDirectory::new(&mut buckets, &mut nodes, key(5)).unwrap();
+        let same = [7];
+        for state_index in 0..4 {
+            directory.link(state_index, DOMAIN, &same).unwrap();
+        }
+        // Links are pushed at the head: the walk sees 3, 2, 1, 0.
+        let mut seen = Vec::new();
+        let walk = directory
+            .walk_bounded(DOMAIN, &same, 16, |index| {
+                seen.push(index);
+                false
+            })
+            .unwrap();
+        assert_eq!(seen, [3, 2, 1, 0]);
+        assert_eq!(
+            walk,
+            DirectoryWalk {
+                probes: 4,
+                stopped: false,
+                complete: true,
+            }
+        );
+        // The visitor can stop; that is neither complete nor an error.
+        let walk = directory
+            .walk_bounded(DOMAIN, &same, 16, |index| index == 2)
+            .unwrap();
+        assert_eq!(
+            walk,
+            DirectoryWalk {
+                probes: 2,
+                stopped: true,
+                complete: false,
+            }
+        );
+        // The budget cuts the chain: incomplete, never an error.
+        let mut calls = 0;
+        let walk = directory
+            .walk_bounded(DOMAIN, &same, 3, |_| {
+                calls += 1;
+                false
+            })
+            .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(
+            walk,
+            DirectoryWalk {
+                probes: 3,
+                stopped: false,
+                complete: false,
+            }
+        );
+        // Exactly the chain length is complete.
+        assert!(
+            directory
+                .walk_bounded(DOMAIN, &same, 4, |_| false)
+                .unwrap()
+                .complete
         );
     }
 

@@ -62,6 +62,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "icmpv4-errors",
     "id",
     "idle-ttl-ms",
+    "inbound-sessions-per-remote",
     "ingress",
     "inside",
     "interface",

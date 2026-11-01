@@ -1092,6 +1092,7 @@ impl ObservableFields for ServiceCounters {
             mapping_full, session_full,
             port_exhausted, clock_regressions, config_mismatches, reconciliations,
             hairpin_translated, hairpin_inbound_refused, hairpin_disabled,
+            inbound_remote_quota_exceeded,
         }}
         visit_counts! {v, "firewall", self.firewall, FirewallCounters {
             allowed_new, allowed_established, denied_by_rule, denied_default, invalid_packets,
