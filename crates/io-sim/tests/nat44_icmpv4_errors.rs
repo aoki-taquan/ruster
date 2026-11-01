@@ -1204,8 +1204,22 @@ fn hairpinned_udp_errors_need_the_receivers_peer_even_under_eif() {
 /// The firewall view: the REQ-5 quote is the received packet `R:r -> X:x`
 /// (ingress outside, egress inside), RELATED to the live flow in either
 /// direction; the audit records it as RELATED from the flow's rule.
+///
+/// Without the firewall the other-remote-port quote is delivered (review
+/// L2): under address-dependent filtering the UDP peer is address-granular,
+/// so the quoted remote port is not NAT authority.
 #[test]
 fn firewall_records_inside_errors_as_related_to_the_reverse_flow() {
+    let mut world = World::new(false);
+    let outbound = world.establish(H1, P1, false);
+    let (_, delivered) = world.reply(public_source_port(&outbound), false);
+    let mut other_port = delivered.clone();
+    other_port[34..36].copy_from_slice(&54_u16.to_be_bytes());
+    world.run(LAN, icmp_error(H1, REMOTE, 3, 3, &other_port));
+    let tx = world.io.pop_tx().expect("no firewall: delivered");
+    assert_eq!(tx.egress, WAN);
+    assert_eq!(&tx.bytes[62..64], &54_u16.to_be_bytes());
+
     let mut world = World::new(true);
     let outbound = world.establish(H1, P1, false);
     let (_, delivered) = world.reply(public_source_port(&outbound), false);
@@ -1443,4 +1457,19 @@ fn external_errors_match_the_firewall_origin_only() {
     // The inside error about the inbound packet is RELATED (origin match).
     world.run(LAN, icmp_error(H1, REMOTE, 3, 3, &delivered));
     assert_eq!(world.io.pop_tx().unwrap().egress, WAN);
+}
+
+/// Review Low-A: the UDP REQ-5 authority needs a live mapping. Past the
+/// idle TTL the mapping slot still names H1:P1, but the error is refused.
+#[test]
+fn inside_udp_error_after_the_mapping_expired_is_a_mapping_miss() {
+    let mut world = World::new(false);
+    let outbound = world.establish(H1, P1, false);
+    let (_, delivered) = world.reply(public_source_port(&outbound), false);
+    world.now = 400_000;
+    world.assert_refused(
+        LAN,
+        icmp_error(H1, REMOTE, 3, 3, &delivered),
+        DropReason::Nat44UdpMappingMiss,
+    );
 }
