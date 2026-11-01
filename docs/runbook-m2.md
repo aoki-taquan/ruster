@@ -82,19 +82,30 @@ detached) and prints one line `ruster run: startup failed: stage=<stage>
 | 2 | `parse`/`validate`/`candidate code=MISSING_SERVICE_*` | fix the config (`ruster validate`) |
 | 4 | `privileges code=MISSING_CAPABILITIES missing=...` | run as root or grant the listed capabilities |
 | 4 | `privileges code=MEMLOCK_LIMIT limit-bytes=L required-bytes=R` | raise `ulimit -l`/`LimitMEMLOCK` to at least R, or grant `CAP_IPC_LOCK` |
-| 1 | `open code=InterfaceLookup/NoSuchDevice` | wrong `device` or wrong network namespace |
-| 1 | `open code=TxQueueCheck/NoTxQueue` or `Bind/InvalidArgument` | `queue` is not a queue of the device |
-| 1 | `open code=Bind/Busy` | another AF_XDP socket owns the queue, or a previous run is still being released (retry after a second) |
-| 1 | `open code=RegisterUmem/MemlockLimit` | memlock too small, or a previous run's UMEM accounting is still being released |
+| 1 | `open code=INTERFACE_LOOKUP/NO_SUCH_DEVICE` | wrong `device` or wrong network namespace |
+| 1 | `open code=TX_QUEUE_CHECK/NO_TX_QUEUE` or `BIND/INVALID_ARGUMENT` | `queue` is not a queue of the device |
+| 1 | `open code=BIND/BUSY` | another AF_XDP socket owns the queue, or a previous run is still being released (retry after a second) |
+| 1 | `open code=REGISTER_UMEM/MEMLOCK_LIMIT` | memlock too small, or a previous run's UMEM accounting is still being released |
 | 1 | `checks code=MULTI_QUEUE_DEVICE rx-queues=N` | reduce to one queue or steer and use `--allow-multi-queue` |
 | 1 | `checks code=KERNEL_IPV4_ADDRESSES` / `KERNEL_IPV4_ROUTES` | remove kernel L3 config from the port |
 | 1 | `checks code=UNVERIFIABLE probe=...` | sysfs/procfs/netlink not readable in this namespace (run under `ip netns exec` so `/sys` matches) |
-| 1 | `attach code=CreateLink/ExistingProgram` | another XDP program is attached; remove it deliberately or use another device |
-| 1 | `attach code=CreateLink/NativeXdpUnsupported` | driver lacks native XDP: use `xdp-attach = "generic"` with `mode = "copy"` |
+| 1 | `attach code=CREATE_LINK/EXISTING_PROGRAM` | another XDP program is attached; remove it deliberately or use another device |
+| 1 | `attach code=CREATE_LINK/NATIVE_XDP_UNSUPPORTED` | driver lacks native XDP: use `xdp-attach = "generic"` with `mode = "copy"` |
 | 1 | `key-source` / `candidate code=KEY_SOURCE` | `/dev/urandom` unreadable |
 
 A SIGINT/SIGTERM during startup rolls back the same way and exits 0
 (`startup cancelled by signal; rolled back N port(s)`).
+
+### Output never blocks the router
+
+stdout and stderr are written by a separate output thread. The router
+thread only queues complete lines and stats blocks with a bounded,
+non-blocking hand-off (64 messages); when the pipe behind stdout/stderr is
+full or nobody reads it (a stuck log collector, `ruster run | less` left
+alone), further blocks and lines are dropped and counted in
+`output.dropped` of the next stats block that gets through. Ticks, the
+stop flag, the drain, and the detach never wait for output. At exit the
+process waits at most 1 s for queued output, then exits anyway.
 
 ## 3. Graceful shutdown
 
@@ -113,9 +124,23 @@ A SIGINT/SIGTERM during startup rolls back the same way and exits 0
 4. A second SIGTERM/SIGINT during the drain cuts it short (`forced=true`).
 5. Confirm: `ip -details link show dev lan0` shows no `prog/xdp`.
 
-Exit 1 after a run means a backend fault (`stopped after a backend fault`), a
-drain failure (`drain failed: ...`), or a close error (`close failed: port=...`);
-the ports were still closed.
+Exit 1 after a run means a backend fault (`stopped after a backend fault`:
+the adapter stopped itself, or its I/O stayed non-reentrant for 1024 ticks in
+a row, about a second), a drain failure (`drain failed: code=...`), or a close
+error (`close failed: port=...`, and the summary then says `detached and
+closed K of N port(s)`). Every port was still closed. `last-kick-error=` names
+the last kick failure the drain saw (`none`, or `if<id>:NETWORK_DOWN`, ...).
+
+### Panics
+
+`ruster run` keeps Rust's default `panic = "unwind"`. A panic on the router
+thread unwinds through the run: the adapter and engines are dropped and the
+startup guard closes every opened session, last first, which detaches XDP;
+then the process exits with status 101 and the panic message on stderr, and
+no summary or final stats. A panic during that unwinding aborts the process
+(SIGABRT); the kernel then closes every fd and the unpinned links detach as
+after SIGKILL (section 4). There is no custom panic hook: the unwind already
+tears down in order, and 101 stays distinct from the documented statuses.
 
 ## 4. Forced termination and restart
 
@@ -127,14 +152,45 @@ the ports were still closed.
    and forwarding off (section 1).
 2. Restart with the same command. Right after a teardown the kernel releases
    the old sockets' queue registration and UMEM accounting from deferred
-   work, so the first restart can fail with `open code=Bind/Busy` or
-   `open code=RegisterUmem/MemlockLimit` (exit 1, fully rolled back). Retry
+   work, so the first restart can fail with `open code=BIND/BUSY` or
+   `open code=REGISTER_UMEM/MEMLOCK_LIMIT` (exit 1, fully rolled back). Retry
    after about a second; under systemd `Restart=on-failure` with
    `RestartSec=1` covers it. `ruster run` itself does not retry yet (S10b).
 3. A restarted process begins again at generation 1 with fresh keys; no
    state (NAT mappings, firewall flows, dynamic neighbors) survives.
 
-## 5. Verification
+## 5. Known limits (M2 S10a)
+
+- RX queue count comes from sysfs (`/sys/class/net/<dev>/queues`). The check
+  proves only that the sysfs `ifindex` equals the session's, not that this
+  sysfs view belongs to the same network namespace (an unrelated device in
+  another namespace can share the ifindex). Run `ruster run` in the router's
+  namespace with `ip netns exec <ns>`, which remounts `/sys` for it. Moving
+  the count to rtnetlink `RTM_GETLINK` `IFLA_NUM_RX_QUEUES` is deferred.
+- Only the main routing table is checked for kernel routes out of a port;
+  policy-routing tables (`ip rule`, other tables) are not (deferred:
+  `RTM_GETROUTE` over all tables).
+- IPv6 is not checked at all: link-local and other IPv6 addresses, IPv6
+  routes, and `net.ipv6.conf.*.forwarding` on the ports. While XDP is
+  detached the kernel can still forward IPv6 between the ports; disable it
+  on the ports yourself (`sysctl net.ipv6.conf.<dev>.disable_ipv6=1`) if
+  that matters.
+- The config is validated with the same limits as `run-sim`
+  (`SIM_VALIDATION_LIMITS`); production limits are not decided yet.
+- Capability diagnostics read `CapEff` in the caller's user namespace; in a
+  non-initial user namespace the bits can look sufficient while BPF still
+  needs init-namespace capabilities, so the failure appears later as
+  `attach code=.../PERMISSION_DENIED`.
+- Under `sudo` from an interactive terminal, Ctrl-C reaches `ruster run`
+  both from the terminal's process group and relayed by sudo, so one key
+  press can count as two signals and force the drain (`forced=true`). Use
+  `kill -TERM <pid>` (or systemd) for a full drain; check this manually on
+  your setup.
+- The memlock estimate adds 64 KiB per port for BPF objects (charged to
+  `RLIMIT_MEMLOCK` before Linux 5.11) and is a lower bound: other processes
+  of the same user, and a run that just exited, also hold locked memory.
+
+## 6. Verification
 
 `scripts/priv-run-smoke.sh` exercises sections 2–4 in three dedicated
 network namespaces (forwarding with ARP, NAT44, and the firewall; SIGTERM;

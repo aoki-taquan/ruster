@@ -27,8 +27,8 @@
 #   checks    a two-queue device and a kernel IPv4 address on the port are
 #             refused before attach (XDP-063)
 #   restart   SIGKILL a running router: the unpinned links auto-detach;
-#             restart (bounded retry of the transient Bind/Busy or
-#             RegisterUmem/MemlockLimit after teardown, XDP-045, in this
+#             restart (bounded retry of the transient BIND/BUSY or
+#             REGISTER_UMEM/MEMLOCK_LIMIT after teardown, XDP-045, in this
 #             test only) and forward again, then SIGTERM, exit 0
 set -eu
 
@@ -92,6 +92,8 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap 'exit 131' QUIT
 
 # A pre-existing namespace of these names is never adopted or deleted.
 for ns in "$router" "$host_a" "$host_b"; do
@@ -327,7 +329,7 @@ echo "priv_run_shutdown: SIGTERM exit 0, XDP detached, final counters (rx.receiv
 start_ruster bad-queue "$work/bad-queue.toml"
 wait_ruster
 [ "$status" -eq 1 ] || fail "bad-queue: exit status $status"
-grep -q "startup failed: stage=open port=if2 code=TxQueueCheck/NoTxQueue" \
+grep -q "startup failed: stage=open port=if2 code=TX_QUEUE_CHECK/NO_TX_QUEUE" \
     "$work/bad-queue.err" || fail "bad-queue: wrong failure"
 assert_detached "a failed open of the second port"
 echo "priv_run_rollback: second-port open failure detached the first port verified"
@@ -339,7 +341,7 @@ case $foreign in xdpgeneric\ [0-9]*) ;; *) fail "foreign program did not attach"
 start_ruster foreign "$work/router.toml"
 wait_ruster
 [ "$status" -eq 1 ] || fail "foreign: exit status $status"
-grep -q "startup failed: stage=attach port=if2 code=CreateLink/ExistingProgram" \
+grep -q "startup failed: stage=attach port=if2 code=CREATE_LINK/EXISTING_PROGRAM" \
     "$work/foreign.err" || fail "foreign: wrong failure"
 test -z "$(xdp_on ra)" || fail "foreign: XDP left attached on ra"
 test "$(xdp_on rb)" = "$foreign" || fail "foreign: the foreign program changed"
@@ -394,7 +396,7 @@ while :; do
     wait_ruster
     # Only the transient deferred-release failures are retried, boundedly.
     if [ "$attempt" -lt 20 ] && [ "$status" -eq 1 ] &&
-        grep -Eq "code=(Bind/Busy|RegisterUmem/MemlockLimit)" "$work/restart.err"; then
+        grep -Eq "code=(BIND/BUSY|REGISTER_UMEM/MEMLOCK_LIMIT)" "$work/restart.err"; then
         assert_detached "a transient restart failure"
         sleep 0.1
         continue

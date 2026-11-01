@@ -98,14 +98,23 @@ impl fmt::Display for PrivilegeFailure {
 /// The soft `RLIMIT_MEMLOCK`: `None` is unlimited.
 pub type MemlockLimit = Option<u64>;
 
-/// Bytes of UMEM that `ruster run` pins against `RLIMIT_MEMLOCK`: each
+/// Memlock reserved per port for its BPF objects (the redirect program and
+/// a `queue + 1` entry XSKMAP). Linux before 5.11 charges BPF maps and
+/// programs to `RLIMIT_MEMLOCK` (later kernels use memcg); the program is
+/// a few instructions and the map a few pages, so 64 KiB is a generous
+/// margin, not an exact kernel figure.
+pub const BPF_MEMLOCK_MARGIN_PER_PORT: u64 = 64 * 1_024;
+
+/// Bytes that `ruster run` expects to pin against `RLIMIT_MEMLOCK`: each
 /// port's UMEM rounded up to whole 4 KiB pages, twice for `mode = "auto"`
 /// (XDP-045: the copy fallback registers a second UMEM while the first
-/// one's accounting is still released from deferred work).
+/// one's accounting is still released from deferred work), plus
+/// [`BPF_MEMLOCK_MARGIN_PER_PORT`].
 ///
-/// The kernel charges the pages to the user (`user->locked_vm`), so other
-/// processes of the same user and a just-closed previous run count too;
-/// this is the lower bound for one process.
+/// This is a lower bound: the kernel charges the pages to the user
+/// (`user->locked_vm`), so other processes of the same user and a
+/// just-closed previous run count too, and the BPF figure is an estimate
+/// for pre-5.11 kernels.
 pub fn required_memlock(backend: &ValidatedAfXdpV1) -> u64 {
     const PAGE: u64 = 4_096;
     backend.ports().iter().fold(0_u64, |total, port| {
@@ -114,7 +123,9 @@ pub fn required_memlock(backend: &ValidatedAfXdpV1) -> u64 {
             AfXdpModeV1::Auto => 2,
             AfXdpModeV1::Copy | AfXdpModeV1::ZeroCopy => 1,
         };
-        total.saturating_add(pages.saturating_mul(factor))
+        total
+            .saturating_add(pages.saturating_mul(factor))
+            .saturating_add(BPF_MEMLOCK_MARGIN_PER_PORT)
     })
 }
 
@@ -225,7 +236,10 @@ pub enum CheckFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Probe {
     /// `/sys/class/net/<dev>/ifindex` is not the session's ifindex (or is
-    /// unreadable): the sysfs view is not the session's namespace.
+    /// unreadable): the sysfs view is certainly not the session's device.
+    /// A match does not prove the namespace (another namespace's device
+    /// can share the ifindex); run under `ip netns exec`, which remounts
+    /// `/sys`. Reading the count over rtnetlink is deferred (CLI-034).
     SysfsIdentity,
     /// `/sys/class/net/<dev>/queues` could not be listed or had no RX
     /// queue.
@@ -421,9 +435,10 @@ pub mod linux {
         evaluate_privileges(effective, memlock, required)
     }
 
-    /// Reads the device facts of `device`, after proving that the sysfs
-    /// view's `ifindex` is `ifindex` (the opened session's device), and
-    /// counts kernel IPv4 addresses with `addresses`.
+    /// Reads the device facts of `device`, after checking that the sysfs
+    /// view's `ifindex` is `ifindex` (the opened session's; see
+    /// [`Probe::SysfsIdentity`] for what this does not prove), and counts
+    /// kernel IPv4 addresses with `addresses`.
     ///
     /// `device` was accepted by `SessionConfig::new` (no `/`, not `.` or
     /// `..`), so it is one path component.

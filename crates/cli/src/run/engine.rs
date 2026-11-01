@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use ruster_control::ActivePublication;
 use ruster_core::{GeneratedPacketIo, IfId, MonotonicMillis, PacketIo, PublicationQuiescence};
-use ruster_io_xdp_native::XdpIoError;
+use ruster_io_xdp_native::{KickError, XdpIoError};
 use ruster_runtime::{
     run_tick, PhaseReport, RxPhaseReport, ServiceOccupancy, TickBudgets, TickObserver,
     TickPhaseSkip, TickReport,
@@ -85,6 +85,8 @@ pub struct DrainProgress {
     pub tx_in_flight: u32,
     /// Frames the kernel still holds from Fill (released by socket close).
     pub fill_in_kernel: u32,
+    /// The last failed kick of this call.
+    pub last_kick_error: Option<(IfId, KickError)>,
 }
 
 /// Monotonic time and pausing.
@@ -188,6 +190,39 @@ pub fn backend_stopped<P, Q, R, G>(report: &TickReport<P, Q, R, G>) -> bool {
     )
 }
 
+/// Consecutive ticks whose I/O was skipped as `BackendIoNotReentrant`
+/// (the adapter's `SkipIo` disposition: an engine-level stranded lease or
+/// handoff that never clears by itself) before the loop treats the backend
+/// as stopped. About one second at the 1 ms idle sleep.
+pub const WEDGED_TICKS: u32 = 1_024;
+
+/// Ends the loop on a terminal backend stop, or on [`WEDGED_TICKS`]
+/// consecutive non-reentrant skips; any other tick resets the count.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BackendWatch {
+    skipped: u32,
+}
+
+impl BackendWatch {
+    pub fn after_tick<P, Q, R, G>(&mut self, report: &TickReport<P, Q, R, G>) -> Option<LoopEnd> {
+        if backend_stopped(report) {
+            return Some(LoopEnd::BackendStopped);
+        }
+        if matches!(
+            report.rx,
+            RxPhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
+        ) {
+            self.skipped = self.skipped.saturating_add(1);
+            if self.skipped >= WEDGED_TICKS {
+                return Some(LoopEnd::BackendStopped);
+            }
+        } else {
+            self.skipped = 0;
+        }
+        None
+    }
+}
+
 /// Why the run loop returned.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoopEnd {
@@ -223,6 +258,7 @@ where
     F: FnMut(&ActivePublication<'s, D::Io>, &D, &TickObserver, MonotonicMillis),
 {
     let mut backoff = IdleBackoff::default();
+    let mut watch = BackendWatch::default();
     let mut last_stats = clock.now();
     loop {
         if stop.stop() {
@@ -237,8 +273,8 @@ where
             active.nat44_tcp(),
             active.firewall(),
         ));
-        if backend_stopped(&report) {
-            return LoopEnd::BackendStopped;
+        if let Some(end) = watch.after_tick(&report) {
+            return end;
         }
         let busy = tick_was_busy(&report);
         drop(report);
@@ -273,6 +309,28 @@ pub struct ShutdownReport {
     pub timed_out: bool,
     /// The first drain failure; the drain stopped there.
     pub fault: Option<XdpIoError>,
+    /// The last kick failure any drain call reported.
+    pub last_kick_error: Option<(IfId, KickError)>,
+}
+
+/// Stable value-free token of a kick failure.
+pub fn kick_error_token(error: KickError) -> String {
+    match error {
+        KickError::NetworkDown => "NETWORK_DOWN".to_owned(),
+        KickError::NotBound => "NOT_BOUND".to_owned(),
+        KickError::Errno(errno) => format!("ERRNO_{errno}"),
+        KickError::Rejected => "REJECTED".to_owned(),
+    }
+}
+
+/// `none` or `if<id>:<token>`.
+pub fn last_kick_label(last: Option<(IfId, KickError)>) -> String {
+    match last {
+        None => "none".to_owned(),
+        Some((interface, error)) => {
+            format!("{}:{}", port_label(interface), kick_error_token(error))
+        }
+    }
 }
 
 /// Shutdown drain: stop RX (the loop no longer ticks), then call
@@ -303,6 +361,9 @@ pub fn shutdown_drain<D: Datapath, C: Clock, S: StopSignal>(
                     .saturating_add(u64::from(progress.rx_pending_released));
                 report.tx_in_flight = progress.tx_in_flight;
                 report.fill_in_kernel = progress.fill_in_kernel;
+                if progress.last_kick_error.is_some() {
+                    report.last_kick_error = progress.last_kick_error;
+                }
             }
             Err(error) => {
                 report.fault = Some(error);

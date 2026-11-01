@@ -89,6 +89,7 @@ pub fn block(
     write_fields(&mut out, None, snapshot);
     write_fields(&mut out, None, services);
     backend(&mut out);
+    let _ = writeln!(out, "output.dropped={}", super::output::dropped());
     out.push_str("end\n");
     out
 }

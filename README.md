@@ -574,8 +574,8 @@ sudo target/release/ruster run --stats-interval 0 -- router.toml   # 周期stats
 
 - 権限: 実効capabilityに`CAP_NET_ADMIN`と`CAP_NET_RAW`、および`CAP_BPF`+`CAP_PERFMON`
   （または`CAP_SYS_ADMIN`）、つまりrootか`setcap`/systemdの`AmbientCapabilities`です。
-  `CAP_IPC_LOCK`が無ければsoft `RLIMIT_MEMLOCK`がport UMEMの合計（`mode = "auto"`は2倍）以上
-  必要です（`ulimit -l`、systemdの`LimitMEMLOCK=`）。不足は何も取得せずexit 4で、不足した
+  `CAP_IPC_LOCK`が無ければsoft `RLIMIT_MEMLOCK`がport UMEMの合計（`mode = "auto"`は2倍、
+  5.11前のkernelのBPF object分としてportごとに64 KiBを加算した下限）以上必要です（`ulimit -l`、systemdの`LimitMEMLOCK=`）。不足は何も取得せずexit 4で、不足した
   capabilityまたは`limit-bytes`/`required-bytes`を表示します。起動後もprivilegeは落としません。
 - portの前提（起動時に確認）: deviceのRX queueは1つ（`ethtool -L <dev> combined 1`など。RSS/ntupleで
   全trafficをbind queueへ寄せたなら`--allow-multi-queue`、他queueのframeはXDPが捨てる）。port上に
@@ -583,14 +583,19 @@ sudo target/release/ruster run --stats-interval 0 -- router.toml   # 周期stats
   attach中は無意味で、停止中やcrash後にkernelがfirewall/NATを迂回してforwardし得るためで、
   `stage=checks code=KERNEL_IPV4_ADDRESSES`/`KERNEL_IPV4_ROUTES`/`MULTI_QUEUE_DEVICE`で拒否します。
   `net.ipv4.ip_forward`や`conf/<dev>/forwarding`が1ならwarningだけです。既存のXDP programが
-  あるdeviceは`stage=attach code=CreateLink/ExistingProgram`で拒否し、置換しません。
+  あるdeviceは`stage=attach code=CREATE_LINK/EXISTING_PROGRAM`で拒否し、置換しません。
 - 起動はfailure atomicです: どのstageで失敗しても開いたportを逆順にclose（XDP detachを含む）
-  してから`ruster run: startup failed: stage=<stage> [port=if<id>] code=<typed>`でexit 1です。
+  してから`ruster run: startup failed: stage=<stage> [port=if<id>] code=<TOKEN>`を出します。
+  exit statusはstageによります: 権限/memlock不足は4、config（bridge rejectionを含む）は2、
+  open/check/attach等のbackend stageとkey sourceは1です（下のexit status）。`code=`は
+  `BIND/BUSY`、`CREATE_LINK/EXISTING_PROGRAM`のような安定したSCREAMING_SNAKE tokenです。
+- stdout/stderrは別threadが書き、run loopは上限付きqueueへ`try_send`するだけです。読まれない
+  pipeで詰まってもtickと停止は止まらず、溢れたblock/行は捨てて`output.dropped`に数えます。
 - 停止: SIGINT/SIGTERMでtickを止め、各portを最大2秒drainしてから逆順にdetach/closeし、
   stdoutへfinal statsを、stderrへ`stopped by signal; drain calls=... tx-in-flight=N
   fill-in-kernel=M ...; detached and closed 2 port(s)`を出します。二回目のsignalはdrainを
   打ち切ります。SIGKILLやcrashでもunpinned linkはkernelが自動でdetachします（直後の再起動は
-  一時的に`Bind/Busy`や`RegisterUmem/MemlockLimit`になり得る。retryはS10b）。
+  一時的に`BIND/BUSY`や`REGISTER_UMEM/MEMLOCK_LIMIT`になり得る。retryはS10b）。
 - stats: `ruster-run-stats kind=periodic|final uptime-ms=N`の後に`section.key=value`行
   （`observer.*`、`health.*`、`tick.*`、`rx.*`、`drop.*`、`af_xdp.*`、`if<id>.af_xdp_port.*`等）と
   `end`。counterとlabelだけでaddress、MAC、device名、key、seedは出しません。

@@ -908,12 +908,29 @@ fn run_refuses_sim_backend_and_unreadable_config() {
     assert!(text(&invalid.stderr).contains("stage=validate"));
 }
 
+/// Whether this test process holds `CAP_NET_ADMIN` (bit 12 of `CapEff`).
+fn holds_net_admin() -> bool {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            let value = status
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:"))?;
+            u64::from_str_radix(value.trim(), 16).ok()
+        })
+        .is_some_and(|effective| effective & (1 << 12) != 0)
+}
+
 /// Without the documented capabilities `run` refuses before any resource
-/// (exit 4). Run as root it gets past the preflight and fails to open a
-/// device that does not exist (exit 1). Either way nothing starts, and no
-/// existing interface is named: the devices are `rusternodev0/1`.
+/// (exit 4). With `CAP_NET_ADMIN` (for example `cargo test` as root) the
+/// test is skipped: a live startup must never run in the caller's network
+/// namespace, even against device names that should not exist.
 #[test]
 fn run_without_privileges_or_devices_fails_closed() {
+    if holds_net_admin() {
+        eprintln!("skipped: CAP_NET_ADMIN held; refusing a live startup in this namespace");
+        return;
+    }
     let dir = scratch();
     let v1 = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
     let config = dir.join("router-af-xdp.toml");
@@ -924,19 +941,11 @@ fn run_without_privileges_or_devices_fails_closed() {
     let output = ruster(&["run".as_ref(), "--config".as_ref(), config.as_os_str()]);
     let code = status(&output);
     let stderr = text(&output.stderr);
-    assert!(code == 4 || code == 1, "{code}: {stderr}");
-    if code == 4 {
-        assert!(
-            stderr.contains("startup failed: stage=privileges code=MISSING_CAPABILITIES"),
-            "{stderr}"
-        );
-    } else {
-        assert!(
-            stderr
-                .contains("startup failed: stage=open port=if1 code=InterfaceLookup/NoSuchDevice"),
-            "{stderr}"
-        );
-    }
+    assert_eq!(code, 4, "{stderr}");
+    assert!(
+        stderr.contains("startup failed: stage=privileges code=MISSING_CAPABILITIES"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("running generation"), "{stderr}");
     assert!(output.stdout.is_empty());
 }

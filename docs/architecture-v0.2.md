@@ -2713,7 +2713,8 @@ XDP programは残りません。errorは`startup failed: stage=<stage> [port=if<
 （session/attachは`<stage>/<failure>`、verifier logは長さとtruncationだけ）です。
 
 XDP-063 device check（session open後、attach前）: sysfsの`ifindex`がsessionと一致することを確かめて
-から、RX queue数（`/sys/class/net/<dev>/queues/rx-*`）が1でなければ拒否します。RSS/ntupleで全
+（同じnamespaceのsysfsであることまでは証明しないので`ip netns exec`で`/sys`を合わせる。`RTM_GETLINK`
+への移行はdeferred）から、RX queue数（`/sys/class/net/<dev>/queues/rx-*`）が1でなければ拒否します。RSS/ntupleで全
 trafficをbind queueへ寄せたoperatorだけが`--allow-multi-queue`で受理できます（warning）。kernel IPv4
 address（rtnetlink `RTM_GETADDR` dump、labelに依らずifindexで数える）とportを出口にするmain tableの
 IPv4 route（`/proc/net/route`）は拒否、`net.ipv4.ip_forward`と`conf/<dev>/forwarding`はwarningだけです。
@@ -2748,7 +2749,16 @@ stderrへ出します。exit statusは0（clean。起動中のsignalでrollback�
 fault、drain失敗、close error）、2（usage、invalid config、sim backend）、3（期限またはforceでTXが
 kernelに残った。detach/closeは済み）、4（capability/memlock不足、何も取得していない）です。
 
+出力: stdout/stderrは`run::output`の別threadが書き、run loop threadは完成した行とstats blockを
+容量64のqueueへ`try_send`するだけです。読まれないpipeで詰まっても溢れた分を捨てて`output.dropped`に
+数え、tick、停止flag、drain、detachは出力を待ちません。終了時の出力待ちは最大1 sです。adapterのI/Oが
+`BackendIoNotReentrant`で1024 tick連続skipされると（`SkipIo`のまま戻らない）backend停止とみなしexit 1、
+summaryにはdrainが最後に見たkick失敗を`last-kick-error=`の型付きtokenで出し、`code=`はすべて
+variant pathのSCREAMING_SNAKE tokenです。netlink dumpは送信元`nl_pid == 0`とこのsocketの
+`nlmsg_pid`を要求し、`NLMSG_DONE`の負のstatusを失敗とします。memlock見積りは5.11前のBPF object分として
+portごとに64 KiBを加え、それでも下限です。panicはunwindで`OpenedPorts`がportを閉じてからexit 101です。
+
 privilegeのdropはしません（deferred）。SIGHUP reload、health/stall signal、retry policy、`poll`待機は
 S10bです（CLI-034）。operator手順は[`runbook-m2.md`](runbook-m2.md)、privileged E2Eは
 `scripts/priv-run-smoke.sh`（三つの専用netns、forward、SIGTERM、rollback、XDP-063、SIGKILL後の
-restart）です（CLI-008〜035、XDP-063）。
+restart）です（CLI-008〜043、XDP-063）。

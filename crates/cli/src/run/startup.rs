@@ -100,16 +100,24 @@ impl fmt::Display for Failure {
             Self::Sequencer(SequencerError::Bridge(error)) => {
                 write!(formatter, "code={}", error.code())
             }
-            Self::Sequencer(error) => write!(formatter, "code={error:?}"),
-            Self::Storage(error) => write!(formatter, "code={error:?}"),
+            Self::Sequencer(error) => write!(formatter, "code={}", token(error)),
+            Self::Storage(error) => write!(formatter, "code={}", token(error)),
             Self::Privileges(error) => write!(formatter, "code={error}"),
-            Self::SessionConfig(error) => write!(formatter, "code={error:?}"),
-            Self::Session(error) => {
-                write!(formatter, "code={:?}/{:?}", error.stage(), error.failure())
-            }
+            Self::SessionConfig(error) => write!(formatter, "code={}", token(error)),
+            Self::Session(error) => write!(
+                formatter,
+                "code={}/{}",
+                token(&error.stage()),
+                token(&error.failure())
+            ),
             Self::Check(error) => write!(formatter, "code={error}"),
             Self::Attach(error) => {
-                write!(formatter, "code={:?}/{:?}", error.stage(), error.failure())?;
+                write!(
+                    formatter,
+                    "code={}/{}",
+                    token(&error.stage()),
+                    token(&error.failure())
+                )?;
                 if let Some(log) = error.verifier_log() {
                     write!(
                         formatter,
@@ -120,14 +128,82 @@ impl fmt::Display for Failure {
                 }
                 Ok(())
             }
-            Self::Datapath(error) => write!(formatter, "code={error:?}"),
-            Self::Engine(error) => write!(formatter, "code={error:?}"),
-            Self::Adapter(error) => write!(formatter, "code={error:?}"),
-            Self::Activation(error) => write!(formatter, "code={error:?}"),
+            Self::Datapath(error) => write!(formatter, "code={}", token(error)),
+            Self::Engine(error) => write!(formatter, "code={}", token(error)),
+            Self::Adapter(error) => write!(formatter, "code={}", token(error)),
+            Self::Activation(error) => write!(formatter, "code={}", token(error)),
             #[cfg(test)]
             Self::Injected => formatter.write_str("code=INJECTED"),
         }
     }
+}
+
+/// Stable, value-free `SCREAMING_SNAKE` token of a typed error, derived
+/// from its variant path: `Bind` / `Busy` -> `BIND` / `BUSY`,
+/// `Layout(ZeroFrames)` -> `LAYOUT.ZERO_FRAMES`, `Errno(105)` ->
+/// `ERRNO_105`. Struct fields (after `{`) and `IfId(..)` payloads are left
+/// out (the port is reported as `port=if<id>`), so no field value and no
+/// `Debug` struct syntax reaches the output.
+pub fn token(value: &impl fmt::Debug) -> String {
+    let text = format!("{value:?}");
+    let text = text.split('{').next().unwrap_or_default();
+    let mut parts: Vec<String> = Vec::new();
+    let mut skip_number = false;
+    let mut chars = text.chars().peekable();
+    while let Some(&first) = chars.peek() {
+        if first.is_ascii_alphabetic() {
+            let mut word = String::new();
+            while let Some(&c) = chars.peek().filter(|c| c.is_ascii_alphanumeric()) {
+                word.push(c);
+                chars.next();
+            }
+            if word == "IfId" {
+                skip_number = true;
+            } else {
+                parts.push(screaming(&word));
+            }
+        } else if first.is_ascii_digit() {
+            let mut number = String::new();
+            while let Some(&c) = chars.peek().filter(|c| c.is_ascii_digit()) {
+                number.push(c);
+                chars.next();
+            }
+            if !std::mem::take(&mut skip_number) {
+                match parts.last_mut() {
+                    Some(last) => {
+                        last.push('_');
+                        last.push_str(&number);
+                    }
+                    None => parts.push(number),
+                }
+            }
+        } else {
+            chars.next();
+        }
+    }
+    if parts.is_empty() {
+        return "UNKNOWN".to_owned();
+    }
+    parts.join(".")
+}
+
+fn screaming(word: &str) -> String {
+    let chars: Vec<char> = word.chars().collect();
+    let mut out = String::new();
+    for (index, c) in chars.iter().enumerate() {
+        if c.is_ascii_uppercase() && index > 0 {
+            let previous = chars[index - 1];
+            let next_lower = chars.get(index + 1).is_some_and(char::is_ascii_lowercase);
+            if previous.is_ascii_lowercase()
+                || previous.is_ascii_digit()
+                || (previous.is_ascii_uppercase() && next_lower)
+            {
+                out.push('_');
+            }
+        }
+        out.push(c.to_ascii_uppercase());
+    }
+    out
 }
 
 /// A stage that failed, the port it failed on, and why.
@@ -171,8 +247,10 @@ impl fmt::Display for CloseFailure {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Cleanup(error) => match error.errno() {
-                Some(errno) => write!(formatter, "code={:?} errno={errno}", error.stage()),
-                None => write!(formatter, "code={:?}", error.stage()),
+                Some(errno) => {
+                    write!(formatter, "code={} errno={errno}", token(&error.stage()))
+                }
+                None => write!(formatter, "code={}", token(&error.stage())),
             },
             #[cfg(test)]
             Self::Injected => formatter.write_str("code=INJECTED"),

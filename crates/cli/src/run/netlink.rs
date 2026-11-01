@@ -1,9 +1,12 @@
 //! Kernel IPv4 address count of one interface through one rtnetlink
 //! `RTM_GETADDR` dump (cold path, startup only).
 //!
-//! The FFI is four C library calls (`socket`, `send`, `recv`, through
-//! [`std::os::fd::OwnedFd`] for `close`) in `sys`; everything else parses a byte slice
-//! and is unit tested. Unlike `SIOCGIFADDR`, which matches only addresses
+//! The FFI is five C library calls (`socket`, `send`, `getsockname`,
+//! `recvfrom`, and `close` through [`std::os::fd::OwnedFd`]) in `sys`;
+//! everything else parses a byte slice and is unit tested. Every datagram
+//! must come from the kernel (`nl_pid == 0` from `recvfrom`), and every
+//! message of the dump must carry this socket's port id (`nlmsg_pid`), so
+//! no other process can answer for the kernel. Unlike `SIOCGIFADDR`, which matches only addresses
 //! whose label equals the device name, the dump sees every IPv4 address of
 //! the interface index, labelled or not.
 
@@ -51,6 +54,11 @@ pub enum NetlinkError {
     Interrupted,
     /// The socket ended before `NLMSG_DONE`.
     EndOfStream,
+    /// A datagram did not come from the kernel (sender `nl_pid != 0`, or
+    /// not a netlink address).
+    NotFromKernel,
+    /// A message of the dump named another port id than this socket's.
+    UnexpectedPort,
 }
 
 impl fmt::Display for NetlinkError {
@@ -93,10 +101,17 @@ fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]))
 }
 
-/// Parses one datagram of the dump answering `sequence`, counting
-/// `AF_INET` addresses of `ifindex`. Messages of another sequence are
-/// skipped.
-pub fn parse_chunk(datagram: &[u8], sequence: u32, ifindex: u32) -> Result<Chunk, NetlinkError> {
+/// Parses one datagram of the dump answering `sequence` on the socket with
+/// port id `port`, counting `AF_INET` addresses of `ifindex`. Messages of
+/// another sequence are skipped; a message of this sequence for another
+/// port id fails closed. `NLMSG_DONE` carrying a negative error (an
+/// aborted dump) fails closed too.
+pub fn parse_chunk(
+    datagram: &[u8],
+    sequence: u32,
+    port: u32,
+    ifindex: u32,
+) -> Result<Chunk, NetlinkError> {
     let mut chunk = Chunk::default();
     let mut at = 0;
     while at < datagram.len() {
@@ -108,13 +123,26 @@ pub fn parse_chunk(datagram: &[u8], sequence: u32, ifindex: u32) -> Result<Chunk
         let kind = u16_at(rest, 4).ok_or(NetlinkError::Malformed)?;
         let flags = u16_at(rest, 6).ok_or(NetlinkError::Malformed)?;
         let seq = u32_at(rest, 8).ok_or(NetlinkError::Malformed)?;
+        let pid = u32_at(rest, 12).ok_or(NetlinkError::Malformed)?;
         let message = &rest[..len];
         if seq == sequence {
+            if pid != port {
+                return Err(NetlinkError::UnexpectedPort);
+            }
             if flags & NLM_F_DUMP_INTR != 0 {
                 chunk.interrupted = true;
             }
             match kind {
                 NLMSG_DONE => {
+                    // Linux puts the dump's final status (an `int`) in the
+                    // payload; negative means the dump was aborted.
+                    if len >= HEADER_LEN + 4 {
+                        let status = u32_at(message, HEADER_LEN).ok_or(NetlinkError::Malformed)?;
+                        let status = i32::from_ne_bytes(status.to_ne_bytes());
+                        if status < 0 {
+                            return Err(NetlinkError::Kernel(status));
+                        }
+                    }
                     chunk.done = true;
                     return Ok(chunk);
                 }
@@ -155,6 +183,8 @@ pub fn ipv4_address_count(ifindex: u32) -> Result<u32, NetlinkError> {
         let socket = sys::RouteSocket::open()?;
         let sequence = attempt + 1;
         socket.send(&dump_request(sequence))?;
+        // The send auto-bound the socket; its port id names our replies.
+        let port = socket.port_id()?;
         let mut total = 0_u32;
         let mut interrupted = false;
         loop {
@@ -165,7 +195,7 @@ pub fn ipv4_address_count(ifindex: u32) -> Result<u32, NetlinkError> {
             if received > buffer.len() {
                 return Err(NetlinkError::Truncated);
             }
-            let chunk = parse_chunk(&buffer[..received], sequence, ifindex)?;
+            let chunk = parse_chunk(&buffer[..received], sequence, port, ifindex)?;
             total = total.saturating_add(chunk.addresses);
             interrupted |= chunk.interrupted;
             if chunk.done {
@@ -194,15 +224,39 @@ mod sys {
     /// `MSG_TRUNC` on receive: return the real datagram length.
     const MSG_TRUNC: c_int = 0x20;
     const EINTR: i32 = 4;
+    const AF_NETLINK_FAMILY: u16 = 16;
+
+    /// Linux `struct sockaddr_nl` (12 bytes).
+    #[repr(C)]
+    #[derive(Default)]
+    struct SockAddrNl {
+        family: u16,
+        pad: u16,
+        pid: u32,
+        groups: u32,
+    }
+
+    const SOCKADDR_NL_LEN: u32 = std::mem::size_of::<SockAddrNl>() as u32;
+    const _: () = assert!(SOCKADDR_NL_LEN == 12);
 
     extern "C" {
         // From the C library std already links (glibc or musl), with the
         // POSIX prototypes: `int socket(int, int, int)`,
-        // `ssize_t send(int, const void *, size_t, int)`, and
-        // `ssize_t recv(int, void *, size_t, int)`.
+        // `ssize_t send(int, const void *, size_t, int)`,
+        // `int getsockname(int, struct sockaddr *, socklen_t *)`, and
+        // `ssize_t recvfrom(int, void *, size_t, int, struct sockaddr *,
+        // socklen_t *)`; `socklen_t` is a 32-bit unsigned integer.
         fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
         fn send(fd: c_int, buffer: *const c_void, len: usize, flags: c_int) -> isize;
-        fn recv(fd: c_int, buffer: *mut c_void, len: usize, flags: c_int) -> isize;
+        fn getsockname(fd: c_int, address: *mut c_void, len: *mut u32) -> c_int;
+        fn recvfrom(
+            fd: c_int,
+            buffer: *mut c_void,
+            len: usize,
+            flags: c_int,
+            address: *mut c_void,
+            address_len: *mut u32,
+        ) -> isize;
     }
 
     fn last_errno() -> NetlinkError {
@@ -259,22 +313,55 @@ mod sys {
             }
         }
 
+        /// The socket's netlink port id (auto-bound by the first send).
+        pub fn port_id(&self) -> Result<u32, NetlinkError> {
+            let mut address = SockAddrNl::default();
+            let mut len = SOCKADDR_NL_LEN;
+            // SAFETY: `address` is a live, exclusively borrowed 12-byte
+            // `repr(C)` `sockaddr_nl` and `len` holds its size; the kernel
+            // writes at most `len` bytes there and the actual size to `len`.
+            // The fd is open.
+            let result = unsafe {
+                getsockname(self.fd.as_raw_fd(), (&raw mut address).cast(), &raw mut len)
+            };
+            if result != 0 {
+                return Err(last_errno());
+            }
+            if len != SOCKADDR_NL_LEN || address.family != AF_NETLINK_FAMILY {
+                return Err(NetlinkError::Malformed);
+            }
+            Ok(address.pid)
+        }
+
         /// Receives one datagram into `buffer` and returns its full length
-        /// (`MSG_TRUNC`), which exceeds `buffer.len()` if it was cut.
+        /// (`MSG_TRUNC`), which exceeds `buffer.len()` if it was cut. A
+        /// datagram from anyone but the kernel is refused.
         pub fn receive(&self, buffer: &mut [u8]) -> Result<usize, NetlinkError> {
             loop {
+                let mut address = SockAddrNl::default();
+                let mut len = SOCKADDR_NL_LEN;
                 // SAFETY: `buffer` is a live, exclusively borrowed slice of
-                // `buffer.len()` writable bytes for the duration of the call;
-                // the kernel writes at most that many. The fd is open.
+                // `buffer.len()` writable bytes, `address` a live 12-byte
+                // `repr(C)` `sockaddr_nl` whose size `len` holds, all for the
+                // duration of the call; the kernel writes at most those
+                // sizes. The fd is open.
                 let received = unsafe {
-                    recv(
+                    recvfrom(
                         self.fd.as_raw_fd(),
                         buffer.as_mut_ptr().cast(),
                         buffer.len(),
                         MSG_TRUNC,
+                        (&raw mut address).cast(),
+                        &raw mut len,
                     )
                 };
                 if received >= 0 {
+                    if len != SOCKADDR_NL_LEN
+                        || address.family != AF_NETLINK_FAMILY
+                        || address.pid != 0
+                    {
+                        return Err(NetlinkError::NotFromKernel);
+                    }
                     return Ok(received as usize);
                 }
                 let error = last_errno();
@@ -290,14 +377,20 @@ mod sys {
 mod tests {
     use super::*;
 
+    const PORT: u32 = 4242;
+
     fn message(kind: u16, flags: u16, sequence: u32, payload: &[u8]) -> Vec<u8> {
+        message_for(PORT, kind, flags, sequence, payload)
+    }
+
+    fn message_for(port: u32, kind: u16, flags: u16, sequence: u32, payload: &[u8]) -> Vec<u8> {
         let len = HEADER_LEN + payload.len();
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&u32::try_from(len).unwrap().to_ne_bytes());
         bytes.extend_from_slice(&kind.to_ne_bytes());
         bytes.extend_from_slice(&flags.to_ne_bytes());
         bytes.extend_from_slice(&sequence.to_ne_bytes());
-        bytes.extend_from_slice(&0_u32.to_ne_bytes());
+        bytes.extend_from_slice(&port.to_ne_bytes());
         bytes.extend_from_slice(payload);
         while bytes.len() % 4 != 0 {
             bytes.push(0);
@@ -334,7 +427,7 @@ mod tests {
         datagram.extend(address(10, 5)); // AF_INET6 is not counted
         datagram.extend(address(2, 5));
         assert_eq!(
-            parse_chunk(&datagram, 7, 5),
+            parse_chunk(&datagram, 7, PORT, 5),
             Ok(Chunk {
                 addresses: 2,
                 done: false,
@@ -345,7 +438,7 @@ mod tests {
         // Anything after DONE is ignored.
         datagram.extend(address(2, 5));
         assert_eq!(
-            parse_chunk(&datagram, 7, 5),
+            parse_chunk(&datagram, 7, PORT, 5),
             Ok(Chunk {
                 addresses: 2,
                 done: true,
@@ -353,31 +446,68 @@ mod tests {
             })
         );
         // Another sequence is skipped entirely.
-        assert_eq!(parse_chunk(&datagram, 8, 5), Ok(Chunk::default()));
+        assert_eq!(parse_chunk(&datagram, 8, PORT, 5), Ok(Chunk::default()));
     }
 
     #[test]
     fn errors_interruptions_and_malformed_input_are_typed() {
         let error = message(NLMSG_ERROR, 0, 7, &(-1_i32).to_ne_bytes());
-        assert_eq!(parse_chunk(&error, 7, 1), Err(NetlinkError::Kernel(-1)));
+        assert_eq!(
+            parse_chunk(&error, 7, PORT, 1),
+            Err(NetlinkError::Kernel(-1))
+        );
         let ack = message(NLMSG_ERROR, 0, 7, &0_i32.to_ne_bytes());
-        assert_eq!(parse_chunk(&ack, 7, 1), Ok(Chunk::default()));
-        let mut interrupted = message(RTM_NEWADDR, NLM_F_DUMP_INTR, 7, &[2, 0, 0, 0, 1, 0, 0, 0]);
-        interrupted[8..12].copy_from_slice(&7_u32.to_ne_bytes());
-        let chunk = parse_chunk(&interrupted, 7, 1).expect("parsed");
+        assert_eq!(parse_chunk(&ack, 7, PORT, 1), Ok(Chunk::default()));
+        let interrupted = message(RTM_NEWADDR, NLM_F_DUMP_INTR, 7, &[2, 0, 0, 0, 1, 0, 0, 0]);
+        let chunk = parse_chunk(&interrupted, 7, PORT, 1).expect("parsed");
         assert!(chunk.interrupted);
         assert_eq!(chunk.addresses, 1);
         // Length below the header, beyond the datagram, short payload.
         let mut short = address(2, 1);
         short[0..4].copy_from_slice(&8_u32.to_ne_bytes());
-        assert_eq!(parse_chunk(&short, 7, 1), Err(NetlinkError::Malformed));
+        assert_eq!(
+            parse_chunk(&short, 7, PORT, 1),
+            Err(NetlinkError::Malformed)
+        );
         let mut long = address(2, 1);
         long[0..4].copy_from_slice(&4096_u32.to_ne_bytes());
-        assert_eq!(parse_chunk(&long, 7, 1), Err(NetlinkError::Malformed));
+        assert_eq!(parse_chunk(&long, 7, PORT, 1), Err(NetlinkError::Malformed));
         let truncated = message(RTM_NEWADDR, 0, 7, &[2, 0]);
-        assert_eq!(parse_chunk(&truncated, 7, 1), Err(NetlinkError::Malformed));
-        assert_eq!(parse_chunk(&[1, 2, 3], 7, 1), Err(NetlinkError::Malformed));
-        assert_eq!(parse_chunk(&[], 7, 1), Ok(Chunk::default()));
+        assert_eq!(
+            parse_chunk(&truncated, 7, PORT, 1),
+            Err(NetlinkError::Malformed)
+        );
+        assert_eq!(
+            parse_chunk(&[1, 2, 3], 7, PORT, 1),
+            Err(NetlinkError::Malformed)
+        );
+        assert_eq!(parse_chunk(&[], 7, PORT, 1), Ok(Chunk::default()));
+    }
+
+    #[test]
+    fn an_aborted_dump_or_a_foreign_port_fails_closed() {
+        // NLMSG_DONE with a negative status (for example -EINTR): the dump
+        // was cut short, its count is not trustworthy.
+        let mut datagram = address(2, 5);
+        datagram.extend(message(NLMSG_DONE, 0x2, 7, &(-4_i32).to_ne_bytes()));
+        assert_eq!(
+            parse_chunk(&datagram, 7, PORT, 5),
+            Err(NetlinkError::Kernel(-4))
+        );
+        // A short DONE (no status) and a zero status complete the dump.
+        let bare = message(NLMSG_DONE, 0x2, 7, &[]);
+        assert!(parse_chunk(&bare, 7, PORT, 5).expect("done").done);
+        let zero = message(NLMSG_DONE, 0x2, 7, &0_i32.to_ne_bytes());
+        assert!(parse_chunk(&zero, 7, PORT, 5).expect("done").done);
+        // A message of this dump for another port id.
+        let foreign = message_for(PORT + 1, RTM_NEWADDR, 0x2, 7, &[2, 0, 0, 0, 5, 0, 0, 0]);
+        assert_eq!(
+            parse_chunk(&foreign, 7, PORT, 5),
+            Err(NetlinkError::UnexpectedPort)
+        );
+        // Another sequence is skipped whatever its port id.
+        let other = message_for(PORT + 1, RTM_NEWADDR, 0x2, 8, &[2, 0, 0, 0, 5, 0, 0, 0]);
+        assert_eq!(parse_chunk(&other, 7, PORT, 5), Ok(Chunk::default()));
     }
 
     /// The live dump works unprivileged in any network namespace; the

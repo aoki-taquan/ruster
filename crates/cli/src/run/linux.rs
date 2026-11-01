@@ -7,7 +7,7 @@ use ruster_config::{ValidatedAfXdpPortV1, ValidatedAfXdpV1, XdpAttachModeV1};
 use ruster_core::{BackendStats, IfId};
 use ruster_io_xdp_native::{
     NativeSession, RxFillConfig, RxFillEngine, SessionConfig, UmemDomainId, XdpAttachMode,
-    XdpIoError, XdpPacketIo, XdpPort, XdpPortConfig,
+    XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort, XdpPortConfig,
 };
 
 use super::checks::{self, CheckFailure, DeviceFacts, PrivilegeFailure};
@@ -86,13 +86,26 @@ impl PortHost for LinuxHost {
             .map_err(|error| fail(Stage::Engine, Failure::Engine(error)))?;
             built.push(XdpPort::new(config, engine));
         }
-        let io = XdpPacketIo::new(built)
-            .map_err(|error| StartupError::new(Stage::Adapter, None, Failure::Adapter(error)))?;
+        let io = XdpPacketIo::new(built).map_err(|error| {
+            StartupError::new(Stage::Adapter, adapter_port(error), Failure::Adapter(error))
+        })?;
         Ok(XdpDatapath { io })
     }
 
     fn close(&self, session: NativeSession) -> Result<(), CloseFailure> {
         session.close().map_err(CloseFailure::Cleanup)
+    }
+}
+
+/// The interface an adapter setup error names, if any.
+fn adapter_port(error: XdpPacketIoSetupError) -> Option<IfId> {
+    match error {
+        XdpPacketIoSetupError::NoPorts => None,
+        XdpPacketIoSetupError::DuplicateInterface(interface)
+        | XdpPacketIoSetupError::EngineDraining(interface)
+        | XdpPacketIoSetupError::ZeroMtu(interface)
+        | XdpPacketIoSetupError::SessionMismatch(interface)
+        | XdpPacketIoSetupError::GeneratedPoolTooSmall { interface, .. } => Some(interface),
     }
 }
 
@@ -120,6 +133,7 @@ impl<'s> Datapath for XdpDatapath<'s> {
             rx_pending_released: report.rx_pending_released,
             tx_in_flight: report.tx_in_flight,
             fill_in_kernel: report.fill_in_kernel,
+            last_kick_error: report.last_kick_error,
         })
     }
 

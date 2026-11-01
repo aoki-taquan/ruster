@@ -104,6 +104,7 @@ struct FakeHost {
     multi_queue: Option<u16>,
     privilege: Option<PrivilegeFailure>,
     close_fails: Option<u16>,
+    panic_in_build: bool,
 }
 
 impl FakeHost {
@@ -250,6 +251,10 @@ impl PortHost for FakeHost {
             }
         }
         self.state.push(Event::Adapter);
+        assert!(
+            !self.panic_in_build,
+            "injected panic while building the datapath"
+        );
         if self.fails(Stage::Adapter, None) {
             return Err(StartupError::new(Stage::Adapter, None, Failure::Injected));
         }
@@ -288,6 +293,9 @@ struct FakeStop {
     calls: Cell<u32>,
     stop_at: u32,
     force: bool,
+    /// Force from this `force()` call on (1-based).
+    force_at: Option<u32>,
+    force_calls: Cell<u32>,
 }
 
 impl FakeStop {
@@ -296,6 +304,8 @@ impl FakeStop {
             calls: Cell::new(0),
             stop_at,
             force: false,
+            force_at: None,
+            force_calls: Cell::new(0),
         }
     }
 
@@ -314,7 +324,9 @@ impl StopSignal for FakeStop {
     }
 
     fn force(&self) -> bool {
-        self.force
+        let call = self.force_calls.get() + 1;
+        self.force_calls.set(call);
+        self.force || self.force_at.is_some_and(|at| call >= at)
     }
 }
 
@@ -408,6 +420,7 @@ fn startup_runs_in_ifid_order_and_shutdown_closes_in_reverse() {
             rx_pending_released: 1,
             tx_in_flight: 3,
             fill_in_kernel: 64,
+            last_kick_error: None,
         }),
         Ok(DrainProgress {
             completed: 3,
@@ -717,7 +730,11 @@ fn a_drain_failure_exits_1_and_still_closes() {
     host.script_drains([Err(XdpIoError::Stopped)]);
     let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
     assert_eq!(outcome.status, EXIT_RUNTIME);
-    assert!(outcome.err.contains("drain failed: Stopped"));
+    assert!(
+        outcome.err.contains("drain failed: code=STOPPED"),
+        "{}",
+        outcome.err
+    );
     host.assert_released();
 }
 
@@ -877,8 +894,12 @@ fn stats_never_carry_secrets_or_addresses() {
 fn memlock_requirement_doubles_auto_ports() {
     let config = config();
     let backend = config.backend().af_xdp().expect("af-xdp");
-    // copy: 256 x 2048 bytes; auto: twice that (XDP-045).
-    assert_eq!(required_memlock(backend), 3 * 256 * 2_048);
+    // copy: 256 x 2048 bytes; auto: twice that (XDP-045); plus the BPF
+    // object margin per port for kernels before 5.11.
+    assert_eq!(
+        required_memlock(backend),
+        3 * 256 * 2_048 + 2 * super::checks::BPF_MEMLOCK_MARGIN_PER_PORT
+    );
 }
 
 #[test]
@@ -1061,4 +1082,249 @@ fn a_backend_stop_ends_the_run_with_exit_1() {
     );
     let err = String::from_utf8(err).expect("utf-8");
     assert!(err.contains("stopped after a backend fault"), "{err}");
+}
+
+thread_local! {
+    static FAIL_ACTIVATION: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Consumed by `run_ports` right after `ActivePublication::new`.
+pub(super) fn take_activation_failure() -> bool {
+    FAIL_ACTIVATION.with(|flag| flag.replace(false))
+}
+
+#[test]
+fn an_activation_failure_drops_the_datapath_and_rolls_back() {
+    let host = FakeHost::default();
+    FAIL_ACTIVATION.with(|flag| flag.set(true));
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
+    assert_eq!(outcome.status, EXIT_RUNTIME, "{}", outcome.err);
+    assert!(
+        outcome
+            .err
+            .contains("startup failed: stage=activate code=STORAGE_SHAPE_MISMATCH"),
+        "{}",
+        outcome.err
+    );
+    assert!(!outcome.err.contains(READY));
+    assert!(outcome.out.is_empty());
+    host.assert_released();
+    assert!(host.events().ends_with(&[
+        Event::Adapter,
+        Event::Close {
+            port: WAN,
+            attached: true
+        },
+        Event::Close {
+            port: LAN,
+            attached: true
+        }
+    ]));
+}
+
+#[test]
+fn force_after_a_non_forced_drain_call_stops_the_drain() {
+    let host = FakeHost::default();
+    host.script_drains([
+        Ok(DrainProgress {
+            tx_in_flight: 3,
+            ..DrainProgress::default()
+        }),
+        Ok(DrainProgress {
+            tx_in_flight: 2,
+            ..DrainProgress::default()
+        }),
+    ]);
+    let stop = FakeStop {
+        force_at: Some(2),
+        ..FakeStop::after(FIRST_LOOP_CHECK + 1)
+    };
+    let outcome = run(&host, &stop);
+    assert_eq!(outcome.status, EXIT_DRAIN_INCOMPLETE, "{}", outcome.err);
+    let drains: Vec<Event> = host
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event, Event::Drain(_)))
+        .collect();
+    assert_eq!(drains, [Event::Drain(DRAIN_ROUNDS), Event::Drain(0)]);
+    assert!(outcome.err.contains("tx-in-flight=2"), "{}", outcome.err);
+    assert!(outcome.err.contains("forced=true timed-out=false"));
+    host.assert_released();
+}
+
+#[test]
+fn a_panic_during_startup_closes_every_port_through_drop() {
+    let host = FakeHost {
+        panic_in_build: true,
+        ..FakeHost::default()
+    };
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1))
+    }));
+    assert!(result.is_err(), "the injected panic propagates");
+    host.assert_released();
+    assert!(host.events().ends_with(&[
+        Event::Close {
+            port: WAN,
+            attached: true
+        },
+        Event::Close {
+            port: LAN,
+            attached: true
+        }
+    ]));
+}
+
+#[test]
+fn the_last_kick_error_reaches_the_summary_as_a_token() {
+    let host = FakeHost::default();
+    host.script_drains([
+        Ok(DrainProgress {
+            tx_in_flight: 1,
+            last_kick_error: Some((IfId(WAN), ruster_io_xdp_native::KickError::NetworkDown)),
+            ..DrainProgress::default()
+        }),
+        Ok(DrainProgress::default()),
+    ]);
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(
+        outcome.err.contains("last-kick-error=if2:NETWORK_DOWN;"),
+        "{}",
+        outcome.err
+    );
+    assert_eq!(
+        super::engine::kick_error_token(ruster_io_xdp_native::KickError::Errno(22)),
+        "ERRNO_22"
+    );
+    let clean = FakeHost::default();
+    let outcome = run(&clean, &FakeStop::after(FIRST_LOOP_CHECK + 1));
+    assert!(
+        outcome.err.contains("last-kick-error=none;"),
+        "{}",
+        outcome.err
+    );
+}
+
+#[test]
+fn a_wedged_backend_ends_the_loop_after_bounded_skips() {
+    use super::engine::{BackendWatch, LoopEnd, WEDGED_TICKS};
+    use ruster_runtime::{
+        PhaseReport, PublicationOutcome, RxPhaseReport, TickPhaseSkip, TickReport,
+    };
+
+    let skipped = |reason| -> TickReport<(), (), (), ()> {
+        TickReport {
+            publication: PublicationOutcome::Unchanged,
+            active: true,
+            rx: RxPhaseReport::Skipped(reason),
+            resolution_timers: PhaseReport::Skipped(reason),
+            failure_dispatch: PhaseReport::Skipped(reason),
+            generated_arp: PhaseReport::Skipped(reason),
+            generated_icmpv4: PhaseReport::Skipped(reason),
+        }
+    };
+    let wedged = skipped(TickPhaseSkip::BackendIoNotReentrant);
+    let other = skipped(TickPhaseSkip::BackendIoFailure);
+    let mut watch = BackendWatch::default();
+    for _ in 0..WEDGED_TICKS - 1 {
+        assert_eq!(watch.after_tick(&wedged), None);
+    }
+    // Any other tick resets the count.
+    assert_eq!(watch.after_tick(&other), None);
+    for _ in 0..WEDGED_TICKS - 1 {
+        assert_eq!(watch.after_tick(&wedged), None);
+    }
+    assert_eq!(watch.after_tick(&wedged), Some(LoopEnd::BackendStopped));
+    assert_eq!(
+        BackendWatch::default().after_tick(&skipped(TickPhaseSkip::BackendStopped)),
+        Some(LoopEnd::BackendStopped)
+    );
+}
+
+#[test]
+fn startup_codes_are_stable_tokens_without_struct_syntax() {
+    use super::startup::token;
+    use ruster_io_xdp_native::{RxFillSetupError, XdpPacketIoSetupError};
+
+    assert_eq!(token(&Stage::Activate), "ACTIVATE");
+    assert_eq!(
+        token(&RxFillSetupError::FillBatchExceedsRing {
+            fill_batch: 64,
+            capacity: 32
+        }),
+        "FILL_BATCH_EXCEEDS_RING"
+    );
+    assert_eq!(
+        token(&XdpPacketIoSetupError::GeneratedPoolTooSmall {
+            interface: IfId(2),
+            generated_frames: 1
+        }),
+        "GENERATED_POOL_TOO_SMALL"
+    );
+    assert_eq!(
+        token(&XdpPacketIoSetupError::DuplicateInterface(IfId(2))),
+        "DUPLICATE_INTERFACE"
+    );
+    assert_eq!(token(&XdpIoError::Stopped), "STOPPED");
+    assert_eq!(
+        token(&ruster_io_xdp_native::KickError::Errno(105)),
+        "ERRNO_105"
+    );
+    assert_eq!(
+        token(&ruster_control::ActivationError::GenerationNotAboveFloor),
+        "GENERATION_NOT_ABOVE_FLOOR"
+    );
+}
+
+/// A pipe nobody reads: once it and the output queue are full, every
+/// further output message is dropped and counted, while the loop keeps
+/// ticking and the stop is honoured (M1 of the #301 review).
+#[test]
+fn an_undrained_output_pipe_never_blocks_the_loop_or_the_stop() {
+    use std::io::Write as _;
+
+    use super::output::{dropped, ColdOutput, Stream};
+
+    let (reader, writer) = std::io::pipe().expect("pipe");
+    let err_writer = writer.try_clone().expect("clone");
+    let output = ColdOutput::spawn(writer, err_writer).expect("output thread");
+    let mut out = output.writer(Stream::Out);
+    let mut err = output.writer(Stream::Err);
+    let host = FakeHost::default();
+    let config = config();
+    let backend = config.backend().af_xdp().expect("af-xdp");
+    let before = dropped();
+    let ticks = 20_000;
+    let stop = FakeStop::after(FIRST_LOOP_CHECK + ticks);
+    let status = execute(
+        &host,
+        &config,
+        backend,
+        ProductionSequencer::new(OsRandomKeySource::open().expect("urandom")),
+        Settings {
+            policy: CheckPolicy::default(),
+            // A ~10 KiB block every 1 ms of fake time, 10 ticks apart.
+            stats_interval_ms: 1,
+            drain_deadline_ms: DRAIN_DEADLINE_MS,
+        },
+        &mut FakeClock {
+            step_us: 100,
+            ..FakeClock::default()
+        },
+        &stop,
+        &mut out,
+        &mut err,
+    );
+    assert_eq!(status, 0);
+    // Every loop check ran: the stop came exactly when scheduled.
+    assert_eq!(stop.calls.get(), FIRST_LOOP_CHECK + ticks);
+    host.assert_released();
+    assert!(dropped() > before, "a full pipe drops instead of blocking");
+    let _ = out.flush();
+    drop((out, err));
+    // The writer thread is still blocked on the full pipe; finishing is
+    // bounded anyway.
+    assert!(!output.finish(Duration::from_millis(100)));
+    drop(reader);
 }

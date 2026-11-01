@@ -83,6 +83,7 @@ mod linux;
     allow(dead_code)
 )]
 mod netlink;
+mod output;
 mod startup;
 mod stats;
 #[cfg(test)]
@@ -198,8 +199,18 @@ fn live(args: &RunArgs, config: &ValidatedConfigV1, err: &mut impl Write) -> u8 
     };
     let settings = Settings::from_args(args);
     let host = linux::LinuxHost;
-    let mut out = std::io::stdout().lock();
-    execute(
+    // From here on nothing on this thread writes to a file descriptor: a
+    // stalled stdout/stderr pipe cannot block the datapath or the shutdown.
+    let output = match output::ColdOutput::spawn(std::io::stdout(), std::io::stderr()) {
+        Ok(output) => output,
+        Err(_) => {
+            let _ = writeln!(err, "ruster run: cannot start the output thread");
+            return EXIT_RUNTIME;
+        }
+    };
+    let mut out = output.writer(output::Stream::Out);
+    let mut cold_err = output.writer(output::Stream::Err);
+    let status = execute(
         &host,
         config,
         backend,
@@ -208,9 +219,21 @@ fn live(args: &RunArgs, config: &ValidatedConfigV1, err: &mut impl Write) -> u8 
         &mut engine::SystemClock::new(),
         &engine::ProcessSignals,
         &mut out,
-        err,
-    )
+        &mut cold_err,
+    );
+    drop((out, cold_err));
+    // Bounded: a reader that never drains cannot keep the process alive.
+    let _ = output.finish(OUTPUT_FLUSH_TIMEOUT);
+    status
 }
+
+/// How long the exit waits for queued output.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
+const OUTPUT_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Tick budgets of the configuration.
 fn budgets(config: &ValidatedConfigV1) -> TickBudgets {
@@ -299,7 +322,12 @@ where
             report_cleanup(err, &cleanup);
             let _ = writeln!(
                 err,
-                "ruster run: startup cancelled by signal; rolled back {ports} port(s)"
+                "ruster run: startup cancelled by signal; rolled back {ports} port(s){}",
+                if cleanup.is_empty() {
+                    ""
+                } else {
+                    " (see close failed)"
+                }
             );
             if cleanup.is_empty() {
                 0
@@ -342,7 +370,19 @@ where
     if stop.stop() {
         return Err(Interrupt::Signalled);
     }
-    let mut active = ActivePublication::new(storage, candidate).map_err(|error| {
+    let activated = ActivePublication::new(storage, candidate);
+    // Activation is unreachable to fail in production (the storage was
+    // built from this candidate's shape); tests inject it here.
+    #[cfg(test)]
+    let activated = activated.and_then(|active| {
+        if tests::take_activation_failure() {
+            drop(active);
+            Err(ruster_control::ActivationError::StorageShapeMismatch)
+        } else {
+            Ok(active)
+        }
+    });
+    let mut active = activated.map_err(|error| {
         Interrupt::Failed(StartupError::new(
             Stage::Activate,
             None,
@@ -461,12 +501,17 @@ fn finished(
     report_cleanup(err, cleanup);
     let shutdown = &ran.shutdown;
     if let Some(fault) = shutdown.fault {
-        let _ = writeln!(err, "ruster run: drain failed: {fault}");
+        let _ = writeln!(
+            err,
+            "ruster run: drain failed: code={}",
+            startup::token(&fault)
+        );
     }
+    let closed = ports.saturating_sub(cleanup.len());
     let _ = writeln!(
         err,
         "ruster run: {}; drain calls={} completed={} rx-released={} tx-in-flight={} \
-         fill-in-kernel={} forced={} timed-out={}; detached and closed {ports} port(s)",
+         fill-in-kernel={} forced={} timed-out={} last-kick-error={}; {}",
         match ran.end {
             LoopEnd::Signal => "stopped by signal",
             LoopEnd::BackendStopped => "stopped after a backend fault",
@@ -478,6 +523,12 @@ fn finished(
         shutdown.fill_in_kernel,
         shutdown.forced,
         shutdown.timed_out,
+        engine::last_kick_label(shutdown.last_kick_error),
+        if cleanup.is_empty() {
+            format!("detached and closed {ports} port(s)")
+        } else {
+            format!("detached and closed {closed} of {ports} port(s); see close failed")
+        },
     );
     if !cleanup.is_empty() || ran.end == LoopEnd::BackendStopped || shutdown.fault.is_some() {
         EXIT_RUNTIME
