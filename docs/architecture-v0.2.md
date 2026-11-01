@@ -621,7 +621,7 @@ filterを通ったinbound initial SYNは認証されておらず、firewallの�
 同じbucketに入るためchainはsession capacity近くまで伸び得ますが、lookupはどの場合も16 node
 までです。新sessionのslotは、exact tupleのexpired slotがあればそれを再利用し、無ければ
 16 slot以下のtableは全体を、それより大きいtableはruntimeのsecret hash key、tuple、時刻、
-probe番号から独立に決めた16個のslot位置だけを調べます。outboundのindex 0からの全scan
+probe番号から独立に決めた16個のslot位置だけを調べます。引いた位置が既に調べた位置と重なれば、まだ調べていない次の位置へ進める（最大15 step）ため、16 probeは常に互いに異なるslotを調べ、16 slotを少し超える小さくほぼ満杯のtableでも重複で空きを取り逃しません。outboundのindex 0からの全scan
 （NAT44-035）はinbound開始では使いません。外部senderは位置を選べず、再送SYNは別の位置を
 調べます。outbound作成がlive slotを低indexへ集めても各probeは独立なので、live率ρのとき
 missの確率は約ρ^16です（ρ = 1/2で約1.5×10^-5。連続16 slotの窓では窓がlive領域から始まると
