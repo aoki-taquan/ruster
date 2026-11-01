@@ -1643,6 +1643,35 @@ impl<'state> FirewallRuntime<'state> {
         flow: FirewallRelatedIcmpv4Flow,
         now_ms: u64,
     ) -> Result<FirewallRuleId, FirewallRelatedIcmpv4Error> {
+        self.inspect_related(flow, false, now_ms)
+    }
+
+    /// Looks up a live flow that `flow` belongs to in either direction,
+    /// without changing any runtime state.
+    ///
+    /// `flow` is a packet the quoting host received: it matches a live state
+    /// whose origin is exactly `flow` or whose exact reply is `flow`
+    /// (interfaces swapped too). This is the RELATED view of an ICMPv4 error
+    /// sent by the receiver of a forwarded packet (RFC 5508 REQ-5 and REQ-7):
+    /// the quoted packet must be one the firewall forwards as part of a live
+    /// flow, whichever side opened it. Like [`Self::inspect_related_icmpv4`]
+    /// it is one bounded probe and never scans rules, refreshes activity,
+    /// advances the clock watermark, cleans expired slots, or updates
+    /// counters.
+    pub fn inspect_related_icmpv4_either_direction(
+        &self,
+        flow: FirewallRelatedIcmpv4Flow,
+        now_ms: u64,
+    ) -> Result<FirewallRuleId, FirewallRelatedIcmpv4Error> {
+        self.inspect_related(flow, true, now_ms)
+    }
+
+    fn inspect_related(
+        &self,
+        flow: FirewallRelatedIcmpv4Flow,
+        allow_reply: bool,
+        now_ms: u64,
+    ) -> Result<FirewallRuleId, FirewallRelatedIcmpv4Error> {
         if self
             .watermark_ms
             .is_some_and(|watermark| now_ms < watermark)
@@ -1671,7 +1700,14 @@ impl<'state> FirewallRuntime<'state> {
                 && slot.responder_address == packet.destination
                 && slot.initiator_port == packet.source_port
                 && slot.responder_port == packet.destination_port;
-            if direct {
+            let reply = allow_reply
+                && slot.origin_ingress == packet.egress
+                && slot.origin_egress == packet.ingress
+                && slot.initiator_address == packet.destination
+                && slot.responder_address == packet.source
+                && slot.initiator_port == packet.destination_port
+                && slot.responder_port == packet.source_port;
+            if direct || reply {
                 return Ok(slot.origin_rule_id);
             }
         }
@@ -2642,6 +2678,40 @@ mod tests {
             );
             assert_eq!(
                 runtime.inspect_related_icmpv4(wrong_egress, 10),
+                Err(FirewallRelatedIcmpv4Error::StateMiss)
+            );
+            // The either-direction view accepts the origin and its exact
+            // reply, and nothing looser.
+            for accepted in [flow, reverse] {
+                assert_eq!(
+                    runtime.inspect_related_icmpv4_either_direction(accepted, 10),
+                    Ok(FirewallRuleId(7))
+                );
+            }
+            let half_reversed = FirewallRelatedIcmpv4Flow::new(
+                origin.ingress,
+                origin.egress,
+                origin.destination,
+                origin.source,
+                origin.protocol,
+                origin.destination_port,
+                origin.source_port,
+            );
+            for refused in [wrong_remote_port, wrong_egress, half_reversed] {
+                assert_eq!(
+                    runtime.inspect_related_icmpv4_either_direction(refused, 10),
+                    Err(FirewallRelatedIcmpv4Error::StateMiss)
+                );
+            }
+            assert_eq!(
+                runtime.inspect_related_icmpv4_either_direction(reverse, 9),
+                Err(FirewallRelatedIcmpv4Error::ClockRegression)
+            );
+            assert_eq!(
+                runtime.inspect_related_icmpv4_either_direction(
+                    reverse,
+                    10 + FIREWALL_UDP_DEFAULT_IDLE_TTL_MS
+                ),
                 Err(FirewallRelatedIcmpv4Error::StateMiss)
             );
             assert_eq!(

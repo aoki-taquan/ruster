@@ -177,11 +177,18 @@ pub struct Nat44PortRangeV1 {
     pub last: u16,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+/// Received ICMPv4 error translation of one NAT44 protocol (RFC 5508).
+///
+/// The default, `bidirectional`, is the RFC 5508 behavior: external errors
+/// (REQ-4), inside errors toward the external realm (REQ-5), and hairpinned
+/// errors (REQ-7). `external-only` and `disabled` are security options.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Nat44Icmpv4ErrorsV1 {
     Disabled,
     ExternalOnly,
+    #[default]
+    Bidirectional,
 }
 
 /// Inbound filtering behavior of one NAT44 protocol (RFC 4787 §5).
@@ -225,6 +232,8 @@ impl fmt::Debug for AllocatorSeedV1 {
 pub struct Nat44UdpV1 {
     pub idle_ttl_ms: u64,
     pub allocator_seed: AllocatorSeedV1,
+    /// ICMPv4 error translation; absent means `bidirectional`.
+    #[serde(default)]
     pub icmpv4_errors: Nat44Icmpv4ErrorsV1,
     /// Inbound filtering; absent means `address-dependent`.
     #[serde(default)]
@@ -248,6 +257,8 @@ pub struct Nat44UdpCapacityV1 {
 pub struct Nat44TcpV1 {
     pub idle_ttl_ms: u64,
     pub allocator_seed: AllocatorSeedV1,
+    /// ICMPv4 error translation; absent means `bidirectional`.
+    #[serde(default)]
     pub icmpv4_errors: Nat44Icmpv4ErrorsV1,
     /// Inbound filtering; absent means `address-dependent`.
     #[serde(default)]

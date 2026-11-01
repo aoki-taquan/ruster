@@ -1652,6 +1652,7 @@ fn map_icmp_policy(policy: Nat44Icmpv4ErrorsV1) -> Nat44Icmpv4ErrorPolicy {
     match policy {
         Nat44Icmpv4ErrorsV1::Disabled => Nat44Icmpv4ErrorPolicy::Disabled,
         Nat44Icmpv4ErrorsV1::ExternalOnly => Nat44Icmpv4ErrorPolicy::ExternalOnly,
+        Nat44Icmpv4ErrorsV1::Bidirectional => Nat44Icmpv4ErrorPolicy::Bidirectional,
     }
 }
 

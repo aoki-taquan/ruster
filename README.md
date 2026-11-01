@@ -192,14 +192,13 @@ NAT runtimeへ到達した非退行時刻はdrop結果でもwatermarkへ反映�
 neighbor解決前にfail closedです。
 publication変更はvalidated config、fresh hash key、reconcile permitの事前検証後に行う
 明示的な全state/index flushを要求します。`storage_shape`はmapping/peerと全index backing
-arrayのcapacityを一つのopaque valueとして返します。policyで明示的にopt-inした場合だけ、
-outside/public宛てICMPv4 Type 3/Code 4が
-引用するlive UDP mapping/ADF peerをread-only参照し、outer destinationと引用source tupleを
-insideへ戻します。outer sourceはexternal host-unicastかつoutsideへのreverse LPMを要求する
+arrayのcapacityを一つのopaque valueとして返します。受信ICMPv4 errorの変換（RFC 5508）は下の
+「NAT44 ICMPv4 error translation」を参照してください。outside/public宛てerrorは引用する
+live UDP mapping/ADF peerをread-only参照し、outer destinationと引用source tupleをinsideへ
+戻します。outer sourceはexternal host-unicastかつoutsideへのreverse LPMを要求する
 local strict-uRPF policyで、asymmetric external pathを意図的に拒否します。中継routerの
-addressは引用remoteと異なっていても保存します。fragment、private発の
-ICMP error、他のtype/codeとquery NAT、local MTU起因のType 3/Code 4生成、PMTU cache、
-static forward、
+addressは引用remoteと異なっていても保存します。fragment、query NAT、local MTU起因の
+Type 3/Code 4生成、PMTU cache、static forward、
 multi-public、port randomization/parity、full packet filterはdeferredで、RFC 4787/7857全体への
 準拠は主張しません。
 引用UDP/TCP IPv4 headerもreserved flagをfragment判定から除外し、reserved以外は
@@ -224,9 +223,8 @@ TCP session idle TTLはdefault/minimumともに2時間4分です。sequence/wind
 せず、FIN/RSTもsessionを削除・短縮せず通常のsuccessful TX requestとしてTTLだけをrefresh
 します。この保守的な単一timer profile、unsolicited SYNへのdelayed ICMP Port Unreachable
 （RFC 5382 REQ-4のSHOULD）を送らずsilent dropすること、fragment未実装を明示し、
-RFC 5382全体への準拠は主張しません。TCPもpolicyで
-opt-inしたType 3/Code 4だけ、引用public source portとexact live remote address/port sessionを
-read-only参照してinsideへ変換します。UDP-only/TCP-only wrapperは他方のprotocolがdomainを
+RFC 5382全体への準拠は主張しません。TCPのICMPv4 error変換は、引用public source portと
+exact live remote address/port sessionをread-only参照します。UDP-only/TCP-only wrapperは他方のprotocolがdomainを
 crossするとfail closedにし、combined wrapperはinside/outside/public realm一致を要求します。
 
 NAT44 inbound filteringは`[nat44.udp]`と`[nat44.tcp]`の`filtering`で個別に選びます。
@@ -256,7 +254,7 @@ inbound-sessions-per-remote = 0  # 省略時0（無制限）。新規inboundを�
 inboundはmappingを作りません。firewallを同じworkerへbindした場合はpost-DNAT packetを従来どおり
 評価するため、緩いNAT filterが許可したpacketもfirewall policyが許可しなければdropし、NAT state
 もcommitしません。外部→内部bypass拒否（NAT44-021）とroute-miss時のNAT gateはfilteringに
-依存しません。UDP ICMPv4 Type 3/Code 4の変換authorityは`endpoint-independent`でもaddress粒度の
+依存しません。UDP ICMPv4 errorの変換authorityは`endpoint-independent`でもaddress粒度の
 peerを要求します。TCPのaddress-dependent判定はsession slotを共有するcaller-backed
 remote-address directoryの一回のbounded lookupで、このdirectory分だけTCP storageが増えます
 （M1 fixtureで448 bytes）。`endpoint-independent`とinbound新規flowを許可するfirewall ruleを
@@ -292,11 +290,10 @@ inbound halfが拒否されてもoutbound halfは残る（remote NATにdropさ�
 §3.3.2、TCPは§3.4 simultaneous open）になります。hairpinはfirewallのbypassにならず、outbound
 halfのfirewall deny、malformed、unknown mapping、offでは何もcommitしません。hairpin stateのremoteは
 router自身の`P`で、`P`をsourceとするoutside packetはcommon admissionで、`P`などrouter addressを
-引用remoteとするoutside ICMPv4 Type 3/Code 4は`NAT44_ICMPV4_QUOTED_REMOTE_LOCAL`でdropするため、
+引用remoteとするoutside ICMPv4 errorは`NAT44_ICMPV4_QUOTED_REMOTE_LOCAL`でdropするため、
 外部からは使えません。`address-dependent`ではX1のpeer `P`がinside全host共通のwildcardになる
-（REQ-9 aから不可避。firewallはexact reverseを要求）点に注意してください。hairpinしたdatagram
-についてのICMP error（RFC 5508 REQ-7）は変換せずfail closedで、明示deviationです
-（architectureの「NAT44 hairpinning」）。
+（REQ-9 aから不可避。firewallはexact reverseを要求）点に注意してください。hairpinした
+datagramについてのICMP error（RFC 5508 REQ-7）は次の節のとおり変換します。
 
 ```toml
 [nat44.udp]
@@ -305,6 +302,37 @@ hairpinning = true   # 省略時true（RFC MUST）。false: NAT44_UDP_HAIRPIN_DI
 [nat44.tcp]
 hairpinning = true   # false: NAT44_TCP_HAIRPIN_DISABLED。counter nat44_*.hairpin_disabled
 ```
+
+NAT44 ICMPv4 error translation（RFC 5508）はUDP/TCPごとの`icmpv4-errors`で選び、defaultの
+`bidirectional`は三方向すべてを変換します。対象はDestination Unreachable code 0–4, 6, 7, 9–15、
+Time Exceeded code 0、Parameter Problem code 0–2で、type/codeとrest-of-header（MTU、pointer）は
+保存します。Source Quench、Redirect、code 5/8、Time Exceeded code 1は変換しません
+（architectureの「NAT44 ICMPv4 Fragmentation Needed translation」）。
+
+| 方向 | 変換 | 必要なauthority |
+|---|---|---|
+| outside → `P`（REQ-4） | outer destinationと引用sourceをinside hostへ | mapping + peer/session（引用remote）、outer sourceはoutsideへのreverse LPM |
+| inside → external（REQ-5） | outer sourceを`P`、引用destinationを`P:x'`へ | outer destinationが引用source、outer sourceが引用internal host自身かそこへのinside next hop、mapping + peer/session |
+| inside → `P`、hairpin（REQ-7） | outer `P -> X1`、引用`X1:x1 -> P:x2'` | 上記に加えhairpinning有効、X2側とX1側outbound halfの両方 |
+
+変換はread-onlyでstateを作らず、firewallをbindするとerrorは引用flowにRELATEDなときだけ通ります
+（inside発は受信packetとしてflowのorigin/replyのどちらか、hairpinは両half）。inside hostが別hostの
+flowを詐称したり、mappingが通信していないexternal hostへerrorを送ったりはできません。
+例外としてUDPはEIFでもaddress粒度peerを要求し、inside pathの2 hop目以降のrouterのerrorは
+変換しません（requirements NAT44-063/064のdeviation）。
+
+```toml
+[nat44.udp]
+# 省略時 "bidirectional"（RFC 5508 REQ-4/5/7）。security option: "external-only"
+# （outsideからのerrorだけ）、"disabled"（変換しない）。変更はreloadable（applyで全NAT stateをflush）
+icmpv4-errors = "bidirectional"
+
+[nat44.tcp]
+icmpv4-errors = "bidirectional"
+```
+
+defaultは以前`disabled`で、outsideからのFrag Neededをconsumeしていました（PMTUD black hole）。
+keyを省略したconfigは新しいdefaultになり、M1 fixtureのように値を明示したconfigは不変です。
 
 IPv4 forward firewallは`forward_batch_with_firewall`を選んだworkerだけで有効です。immutableな
 ordered rule sliceとmutableなfixed-capacity state sliceをcallerが所有し、first-matchの
@@ -330,9 +358,10 @@ matched action、New/Established、terminal failureとeffective `Allow|Drop` ver
 NATとのcombined APIではoutboundをpre-SNAT internal→remote、inboundをpost-DNAT
 remote→internalのcanonical tupleで照合します。NAT mappingだけではinboundを許可せず、exact
 reverse firewall stateが無ければinside neighbor処理前にdenyします。packet rewrite成功後、
-NAT/FW stateをTX request前にcommitするためbackend rejectでも両stateを保持します。ICMPv4
-Type 3/Code 4はopt-in NAT translationがmapping/sessionから復元したpre-SNAT
-internal→remote tupleを、firewall origin stateへdirect exactかつread-onlyで照合します。
+NAT/FW stateをTX request前にcommitするためbackend rejectでも両stateを保持します。outsideからの
+ICMPv4 errorはNAT translationがmapping/sessionから復元したpre-SNAT
+internal→remote tupleを、firewall origin stateへdirect exactかつread-onlyで照合します
+（inside発errorの照合は上の「NAT44 ICMPv4 error translation」）。
 hitだけを`RELATED`として許可し、missは`FIREWALL_RELATED_ICMPV4_STATE_MISS`でneighbor処理前に
 silent dropします。lookupはrule scan、reverse match、activity/phase/counter/watermark更新を
 行いません。NATを伴わないplain forwarded RELATEDはdeferredで、既存の

@@ -733,13 +733,15 @@ fn disabled_policy_preserves_local_consume_and_candidate_drops_are_atomic() {
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
     let enabled = udp_config(&snapshot, true);
     let disabled = udp_config(&snapshot, false);
+    // The default is the RFC 5508 behavior; `Disabled` is an explicit
+    // security option.
     assert_eq!(
         Nat44UdpPolicy::default().icmpv4_errors(),
-        Nat44Icmpv4ErrorPolicy::Disabled
+        Nat44Icmpv4ErrorPolicy::Bidirectional
     );
     assert_eq!(
         Nat44TcpPolicy::default().icmpv4_errors(),
-        Nat44Icmpv4ErrorPolicy::Disabled
+        Nat44Icmpv4ErrorPolicy::Bidirectional
     );
     let mut mappings = [Nat44UdpMappingSlot::default(); 1];
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
@@ -1164,9 +1166,33 @@ fn combined_realm_mismatch_is_candidate_only_and_precedes_lookup_without_counter
     assert_eq!(udp.counters(), udp_counters);
     assert_eq!(tcp.counters(), tcp_counters);
 
+    // Every other supported error type/code is a candidate too
+    // (NAT44-019J) ...
+    for (icmp_type, code) in [(3_u8, 3_u8), (11, 0), (12, 0)] {
+        let mut other = frag_needed(&quote, 64, 0, &[]);
+        other[34] = icmp_type;
+        other[35] = code;
+        refresh_icmp_and_outer_checksums(&mut other);
+        io.inject(WAN, other.clone());
+        io.run_nat44_udp_and_tcp_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &udp_config,
+            Some(&mut udp),
+            &tcp_config,
+            Some(&mut tcp),
+            MonotonicMillis(0),
+            &mut NoTrace,
+        )
+        .unwrap();
+        assert_drop(&mut io, DropReason::Nat44CombinedRealmMismatch, &other);
+    }
+
+    // ... and an unsupported one (Source Route Failed) stays local control.
     let ordinary = frag_needed(&quote, 64, 0, &[]);
     let mut non_candidate = ordinary.clone();
-    non_candidate[35] = 3;
+    non_candidate[35] = 5;
     refresh_icmp_and_outer_checksums(&mut non_candidate);
     io.inject(WAN, non_candidate);
     let report = io

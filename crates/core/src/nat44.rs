@@ -76,12 +76,63 @@ fn encode_optional_udp_index(index: Option<usize>) -> u32 {
     index.map_or(UDP_INDEX_NONE, encode_udp_index)
 }
 
+/// Which received ICMPv4 errors (RFC 5508 §4) one NAT44 protocol translates.
+///
+/// Translation is read-only: it never creates, refreshes, or deletes NAT or
+/// firewall state, and the quoted packet must match a live mapping and its
+/// peer (UDP) or exact session (TCP). The supported messages are
+/// Destination Unreachable codes 0–4, 6, 7, and 9–15, Time Exceeded code 0,
+/// and Parameter Problem codes 0–2 (RFC 5508 REQ-10 a, b.5).
+///
+/// The default [`Self::Bidirectional`] is the RFC 5508 behavior (REQ-4,
+/// REQ-5, and REQ-7 are MUSTs for errors that match an active mapping).
+/// [`Self::ExternalOnly`] and [`Self::Disabled`] are RFC 1812 §1.1.3
+/// security options ("unless explicitly overridden by local policy" in
+/// REQ-4 and REQ-5).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Nat44Icmpv4ErrorPolicy {
-    #[default]
+    /// No translation: errors to the public address stay unsupported local
+    /// control, and inside-originated errors fail closed like any other
+    /// non-UDP/TCP inside-to-outside crossing.
     Disabled,
+    /// Only errors from the external realm toward the public address
+    /// (REQ-4).
     ExternalOnly,
+    /// External-realm errors (REQ-4), errors an inside host or router sends
+    /// toward the external realm about a packet it received through the NAT
+    /// (REQ-5), and hairpinned errors (REQ-7, also gated by hairpinning).
+    #[default]
+    Bidirectional,
+}
+
+impl Nat44Icmpv4ErrorPolicy {
+    /// Every variant, from the most to the least restrictive.
+    pub const ALL: [Self; 3] = [Self::Disabled, Self::ExternalOnly, Self::Bidirectional];
+
+    /// Whether external-realm errors toward the public address are
+    /// translated (RFC 5508 REQ-4).
+    #[must_use]
+    pub const fn translates_external(self) -> bool {
+        matches!(self, Self::ExternalOnly | Self::Bidirectional)
+    }
+
+    /// Whether private-realm errors toward the external realm (REQ-5) and
+    /// hairpinned errors (REQ-7) are translated.
+    #[must_use]
+    pub const fn translates_internal(self) -> bool {
+        matches!(self, Self::Bidirectional)
+    }
+
+    /// The declarative-config spelling (`icmpv4-errors = "..."`).
+    #[must_use]
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::ExternalOnly => "external-only",
+            Self::Bidirectional => "bidirectional",
+        }
+    }
 }
 
 /// Inbound filtering behavior of one NAT44 protocol (RFC 4787 §5).
@@ -2362,7 +2413,7 @@ impl Nat44UdpPolicy {
         Ok(Self {
             idle_ttl_ms,
             allocator_seed,
-            icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
+            icmpv4_errors: Nat44Icmpv4ErrorPolicy::Bidirectional,
             filtering: Nat44Filtering::AddressDependent,
             hairpinning: true,
         })
@@ -2426,7 +2477,7 @@ impl Default for Nat44UdpPolicy {
         Self {
             idle_ttl_ms: NAT44_UDP_DEFAULT_IDLE_TTL_MS,
             allocator_seed: 0,
-            icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
+            icmpv4_errors: Nat44Icmpv4ErrorPolicy::Bidirectional,
             filtering: Nat44Filtering::AddressDependent,
             hairpinning: true,
         }
@@ -3967,6 +4018,46 @@ impl<'a> Nat44UdpRuntime<'a> {
         })
     }
 
+    /// Read-only authority for a quoted inbound UDP packet `remote ->
+    /// internal` that an inside host received (RFC 5508 REQ-5, REQ-7). The
+    /// internal endpoint must own a live mapping that still owns its public
+    /// port, and the remote must match a recorded peer at the runtime's peer
+    /// key granularity (address-granular under endpoint-independent
+    /// filtering, as for [`Self::inspect_icmpv4`]). Returns the public port.
+    pub(crate) fn inspect_icmpv4_inbound_quote(
+        &self,
+        internal_address: Ipv4Address,
+        internal_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        now_ms: u64,
+    ) -> Result<u16, Nat44UdpPlanError> {
+        self.check_now_read_only(now_ms)?;
+        let Some((mapping_index, mapping)) = self.find_mapping(internal_address, internal_port)?
+        else {
+            return Err(Nat44UdpPlanError::MappingMiss);
+        };
+        if !self.mapping_is_live(mapping, now_ms) || !mapping.port_owned {
+            return Err(Nat44UdpPlanError::MappingMiss);
+        }
+        // The inbound view of the same mapping: the public port must still
+        // resolve to this exact slot and generation.
+        match self.mapping_for_public_port(mapping.public_port, now_ms)? {
+            Some((owner_index, owner))
+                if owner_index == mapping_index && owner.generation == mapping.generation => {}
+            Some(_) | None => return Err(Nat44UdpPlanError::MappingMiss),
+        }
+        if !self.peer_exists(
+            mapping_index,
+            mapping.generation,
+            remote_address,
+            self.peer_key_port(remote_port),
+        )? {
+            return Err(Nat44UdpPlanError::FilterDenied);
+        }
+        Ok(mapping.public_port)
+    }
+
     fn prepare_outbound_plan(
         &self,
         mut plan: Nat44UdpOutboundPlan,
@@ -4610,7 +4701,7 @@ impl Nat44TcpPolicy {
         Ok(Self {
             idle_ttl_ms,
             allocator_seed,
-            icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
+            icmpv4_errors: Nat44Icmpv4ErrorPolicy::Bidirectional,
             filtering: Nat44Filtering::AddressDependent,
             hairpinning: true,
             inbound_sessions_per_remote: NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE,
@@ -4724,7 +4815,7 @@ impl Default for Nat44TcpPolicy {
         Self {
             idle_ttl_ms: NAT44_TCP_DEFAULT_IDLE_TTL_MS,
             allocator_seed: 0,
-            icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
+            icmpv4_errors: Nat44Icmpv4ErrorPolicy::Bidirectional,
             filtering: Nat44Filtering::AddressDependent,
             hairpinning: true,
             inbound_sessions_per_remote: NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE,
@@ -6657,6 +6748,47 @@ impl<'a> Nat44TcpRuntime<'a> {
             internal_address: mapping.internal_address,
             internal_port: mapping.internal_port,
         })
+    }
+
+    /// Read-only authority for a quoted inbound TCP segment `remote ->
+    /// internal` that an inside host received (RFC 5508 REQ-5, REQ-7). The
+    /// internal endpoint must own a live mapping that still owns its public
+    /// port, with a live session for the exact remote address and port.
+    /// Returns the public port.
+    pub(crate) fn inspect_icmpv4_inbound_quote(
+        &self,
+        internal_address: Ipv4Address,
+        internal_port: u16,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        now_ms: u64,
+    ) -> Result<u16, Nat44TcpPlanError> {
+        self.check_now_read_only(now_ms)?;
+        let Some((mapping_index, mapping)) = self.find_mapping(internal_address, internal_port)?
+        else {
+            return Err(Nat44TcpPlanError::MappingMiss);
+        };
+        if !self.mapping_is_live(mapping, now_ms) || !mapping.port_owned {
+            return Err(Nat44TcpPlanError::MappingMiss);
+        }
+        match self.mapping_for_public_port(mapping.public_port, now_ms)? {
+            Some((owner_index, owner))
+                if owner_index == mapping_index && owner.generation == mapping.generation => {}
+            Some(_) | None => return Err(Nat44TcpPlanError::MappingMiss),
+        }
+        if self
+            .find_session(
+                mapping_index,
+                mapping.generation,
+                mapping.lifecycle_epoch,
+                remote_address,
+                remote_port,
+            )?
+            .is_none_or(|(_, session)| !self.session_is_live(session, now_ms))
+        {
+            return Err(Nat44TcpPlanError::SessionMiss);
+        }
+        Ok(mapping.public_port)
     }
 
     fn session_is_live(&self, session: Nat44TcpSessionSlot, now_ms: u64) -> bool {
