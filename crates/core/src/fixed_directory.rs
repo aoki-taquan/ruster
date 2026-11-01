@@ -52,6 +52,7 @@ pub(crate) enum DirectoryHashDomain {
     TcpMapping = 0x4e41_5434_544d_4150,
     TcpSession = 0x4e41_5434_5453_4553,
     TcpSessionAddress = 0x4e41_5434_5453_4144,
+    TcpInboundSlot = 0x4e41_5434_5449_534c,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -540,6 +541,54 @@ impl<'a> FixedDirectory<'a> {
         } else {
             Err(DirectoryLookupError::Cycle { probes })
         }
+    }
+
+    /// Like [`FixedDirectory::lookup`], but visits at most `max_probes`
+    /// chain nodes. A chain longer than the budget is reported as a miss
+    /// (`state_index: None`), never as an error, so callers that use this
+    /// for an admission decision fail closed under collision or flooding.
+    pub(crate) fn lookup_bounded(
+        &self,
+        domain: DirectoryHashDomain,
+        words: &[u64],
+        max_probes: usize,
+        mut key_matches: impl FnMut(usize) -> bool,
+    ) -> Result<DirectoryProbe, DirectoryLookupError> {
+        let hash = self.hash_words(domain, words);
+        let Some(bucket_index) = self.bucket_for_hash(hash) else {
+            return Ok(DirectoryProbe {
+                state_index: None,
+                probes: 0,
+            });
+        };
+        let bucket =
+            u32::try_from(bucket_index).expect("validated directory bucket count fits u32");
+        let mut current = self.buckets[bucket_index].head;
+        let mut probes = 0;
+        for _ in 0..self.nodes.len().min(max_probes) {
+            if current == NONE {
+                break;
+            }
+            let Some(index) = link_to_index(current, self.nodes.len()) else {
+                return Err(DirectoryLookupError::InvalidNodeIndex { probes });
+            };
+            let node = self.nodes[index];
+            if node.bucket != bucket {
+                return Err(DirectoryLookupError::BucketMismatch { probes });
+            }
+            probes += 1;
+            if node.hash == hash && key_matches(index) {
+                return Ok(DirectoryProbe {
+                    state_index: Some(index),
+                    probes,
+                });
+            }
+            current = node.next;
+        }
+        Ok(DirectoryProbe {
+            state_index: None,
+            probes,
+        })
     }
 
     pub(crate) fn validate(&self) -> Result<DirectoryConservation, DirectoryInvariantError> {

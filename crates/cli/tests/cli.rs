@@ -624,3 +624,44 @@ fn plan_prints_nat_filtering_as_a_reloadable_typed_delta() {
     let plan = ruster(&["plan".as_ref(), current.as_os_str(), v2.as_os_str()]);
     assert!(!text(&plan.stdout).contains("filtering"));
 }
+
+/// Every `Nat44Filtering` variant renders its config spelling on both sides
+/// of a plan line, and that spelling is accepted by `validate`, so a new
+/// variant cannot appear in plan text without a real, parseable name.
+#[test]
+fn plan_text_covers_every_nat_filtering_variant() {
+    use ruster_core::Nat44Filtering;
+
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let with_udp = |filtering: Nat44Filtering| {
+        let path = dir.join(format!("udp-{}.toml", filtering.config_name()));
+        fs::write(
+            &path,
+            source.replacen(
+                "filtering = \"address-dependent\"",
+                &format!("filtering = \"{}\"", filtering.config_name()),
+                1,
+            ),
+        )
+        .unwrap();
+        path
+    };
+    for old in Nat44Filtering::ALL {
+        for new in Nat44Filtering::ALL {
+            let (current, next) = (with_udp(old), with_udp(new));
+            assert_eq!(status(&ruster(&["validate".as_ref(), next.as_os_str()])), 0);
+            let plan = ruster(&["plan".as_ref(), current.as_os_str(), next.as_os_str()]);
+            assert_eq!(status(&plan), 0);
+            let stdout = text(&plan.stdout);
+            assert!(!stdout.contains("unknown"), "{stdout}");
+            let line = format!(
+                "  nat44-udp filtering ~ {} -> {}\n",
+                old.config_name(),
+                new.config_name()
+            );
+            assert_eq!(stdout.contains(&line), old != new, "{stdout}");
+            assert!(stdout.starts_with("plan: reloadable\n"), "{stdout}");
+        }
+    }
+}

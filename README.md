@@ -259,7 +259,10 @@ inboundはmappingを作りません。firewallを同じworkerへbindした場合
 peerを要求します。TCPのaddress-dependent判定はsession slotを共有するcaller-backed
 remote-address directoryの一回のbounded lookupで、このdirectory分だけTCP storageが増えます
 （M1 fixtureで448 bytes）。`endpoint-independent`とinbound新規flowを許可するfirewall ruleを
-組み合わせると、外部からのSYNがsession slotを2時間4分占有し得ます。
+組み合わせると、外部からのSYNがsession slotを2時間4分占有し得ます。defaultの`address-dependent`でも
+mappingが既に話しているremote address（CDNやDNS serverなど）を詐称したSYNなら同じことができ
+ます（NAT44-041）。firewall判定より前に走るinbound SYNのNAT側workは、session capacityに
+よらず`NAT44_TCP_INBOUND_SLOT_PROBES`（16）slot/chain nodeまでに上限されます。
 
 IPv4 forward firewallは`forward_batch_with_firewall`を選んだworkerだけで有効です。immutableな
 ordered rule sliceとmutableなfixed-capacity state sliceをcallerが所有し、first-matchの

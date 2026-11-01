@@ -607,11 +607,24 @@ inboundはpeerを作らずrefreshもしません。TCPではexact live session�
 exact sessionが無ければSYN=1、ACK=0、RST=0、FIN=0のinitial SYNだけがfilter判定に進みます。
 admitされたSYNは既存live mappingの上にsessionを一つ作ります（RFC 5382 §4.3、REQ-2の外部
 開始connection）。mappingは作らず、mapping idle summaryとsessionを同じcommitで更新します。
-`address-dependent`の判定はremote-address directoryの一回のbounded keyed lookupで、live
+`address-dependent`の判定はremote-address directoryの一回のkeyed lookupで、live
 sessionだけを数えます。expired sessionや旧generationのsessionは許可根拠になりません。
-`endpoint-independent`と`address-and-port-dependent`はlookupを行いません。新sessionの
-slotはoutboundと同じreusable-slot探索（NAT44-035）を使い、空きが無ければ
-`NAT44_TCP_SESSION_TABLE_FULL`でdropし、live sessionをevictしません。session作成は
+outbound開始だけでなくinbound開始のsessionも許可根拠になり、inbound packetのTX requestは
+sessionとmappingのidle timeをrefreshします。したがって同じremote addressからSYNやACKを送り
+続ける限り、そのaddressのadmissionとmappingは生き続けます。
+`endpoint-independent`と`address-and-port-dependent`はlookupを行いません。
+
+filterを通ったinbound initial SYNは認証されておらず、firewallの判定（後段のpost-DNAT plan）より
+前にNAT planが走るため、そのper-packet workはsession capacityではなく
+`NAT44_TCP_INBOUND_SLOT_PROBES`（16）で上限します。remote-address chainは最大16 nodeだけ辿り、
+それを越えるchainは拒否（fail closed）とします。同じ`(mapping, remote IPv4)`のsessionは全て
+同じbucketに入るためchainはsession capacity近くまで伸び得ますが、lookupはどの場合も16 node
+までです。新sessionのslotは、exact tupleのexpired slotがあればそれを再利用し、無ければ
+runtimeのsecret hash key、tuple、時刻から決めた開始位置から連続する最大16 slotだけを調べます。
+outboundのindex 0からの全scan（NAT44-035）はinbound開始では使いません。外部senderは窓を
+選べず、再送SYNは別の窓を調べます。窓内に空きが無ければ他所に空きがあっても
+`NAT44_TCP_SESSION_TABLE_FULL`でdropし、live sessionをevictしません（inbound開始はbest-effort）。
+session作成は
 exact session directoryとremote-address directoryの両方へprepared link/relinkを
 rewrite前に検証し、commitはinfallibleです。そのためTCP outbound planは二つの
 prepared session linkを持ち、x86_64で288 bytes（上限320 bytesをtestで固定）になります。
@@ -632,8 +645,15 @@ REQ-5のtimerはmodeに依存しません。inbound開始のsessionもoutbound�
 4分も満たしますが、外部から開いたまま応答の無いSYNもsession slotを2時間4分占有します。
 `endpoint-independent`と、inbound新規flowを許可するfirewall ruleを組み合わせると、外部hostが
 mapping済みpublic portへのSYNでsession tableを埋め、内部からの新規sessionが
-`NAT44_TCP_SESSION_TABLE_FULL`になり得ます。defaultの`address-dependent`では、外部hostは
-mappingが既にsessionを持つremote addressからしか新sessionを作れません。RFC 5382 REQ-6が扱う
+`NAT44_TCP_SESSION_TABLE_FULL`になり得ます。defaultの`address-dependent`でも、admissionは
+packetのsource addressだけで判定するため、off-pathの攻撃者がmappingが既にsessionを持つ
+remote address（広く使われるCDNやDNS serverのaddressなど）を詐称し、source portを変えたSYNを
+送れば同じことができます（requirements NAT44-041）。必要なのはmapping済みpublic portと、その
+mappingが話しているremote addressの推測です。この詐称で作られたsessionは2時間4分残り、同じ
+`(mapping, remote IPv4)`のchainを伸ばしますが、上の16 node上限によりlookup costは増えず、16 node以内に
+live sessionが見つからないADF判定（同じkeyでも、bucketが衝突する別keyでも）が拒否側に倒れるだけです。M1のようにfirewallがoutside→insideの新規flowを
+許可しない構成では、NAT planはcommitされないためsessionは作られません。remoteごとのinbound開始
+session数の上限（quota）はdeferredです。RFC 5382 REQ-6が扱う
 TCP ALGはこのsliceに無く、defaultでdisabledという要求を自明に満たします。
 
 filteringはNAT domainの境界を緩めません。firewallを同じworkerへbindする場合、firewallは

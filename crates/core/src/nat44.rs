@@ -23,6 +23,10 @@ pub const NAT44_UDP_MAX_IDLE_TTL_MS: u64 = 86_400_000;
 pub const NAT44_TCP_MIN_IDLE_TTL_MS: u64 = 7_440_000;
 pub const NAT44_TCP_DEFAULT_IDLE_TTL_MS: u64 = 7_440_000;
 pub const NAT44_TCP_MAX_IDLE_TTL_MS: u64 = 604_800_000;
+/// Per-packet work bound for an inbound initial SYN that passed the NAT
+/// filter: at most this many session slots examined for reuse, and at most
+/// this many remote-address chain nodes for address-dependent admission.
+pub const NAT44_TCP_INBOUND_SLOT_PROBES: usize = 16;
 const UDP_INDEX_NONE: u32 = u32::MAX;
 const TCP_INDEX_NONE: u32 = u32::MAX;
 static NEXT_UDP_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -89,6 +93,26 @@ pub enum Nat44Filtering {
     AddressDependent,
     /// Only the exact external IPv4 address and port the mapping has sent to.
     AddressAndPortDependent,
+}
+
+impl Nat44Filtering {
+    /// Every variant, in RFC 4787 §5 order from loosest to strictest.
+    pub const ALL: [Self; 3] = [
+        Self::EndpointIndependent,
+        Self::AddressDependent,
+        Self::AddressAndPortDependent,
+    ];
+
+    /// The declarative-config spelling (`filtering = "..."`). Exhaustive in
+    /// this crate, so a new variant cannot be rendered without a name.
+    #[must_use]
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            Self::EndpointIndependent => "endpoint-independent",
+            Self::AddressDependent => "address-dependent",
+            Self::AddressAndPortDependent => "address-and-port-dependent",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -951,6 +975,96 @@ mod tcp_tests {
                 assert_eq!(runtime.validate_indexes(), Ok(()));
             });
         }
+    }
+
+    /// Unauthenticated inbound SYNs that pass the NAT filter run before any
+    /// firewall decision, so their work is bounded by
+    /// `NAT44_TCP_INBOUND_SLOT_PROBES`, not by the session capacity.
+    #[test]
+    fn tcp_inbound_syn_work_is_bounded_independent_of_session_capacity() {
+        const SESSIONS: usize = 64;
+        // A full table: every slot live. The old full scan examined all 64.
+        let policy = Nat44TcpPolicy::default().with_filtering(Nat44Filtering::EndpointIndependent);
+        with_config(policy, 40_000, 40_000, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); SESSIONS];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            for port in 1..=SESSIONS as u16 {
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, port, true, 0)
+                    .unwrap();
+                runtime.commit_outbound(plan, 0).unwrap();
+            }
+            for remote_port in 1..=8 {
+                runtime.reusable_session_checks.set(0);
+                assert_eq!(
+                    runtime
+                        .plan_inbound(40_000, REMOTE2, remote_port, true, 1)
+                        .err(),
+                    Some(Nat44TcpPlanError::SessionFull)
+                );
+                assert!(
+                    runtime.reusable_session_checks.get() <= NAT44_TCP_INBOUND_SLOT_PROBES,
+                    "examined {}",
+                    runtime.reusable_session_checks.get()
+                );
+            }
+            // The outbound path keeps its exhaustive search.
+            runtime.reusable_session_checks.set(0);
+            assert_eq!(
+                runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE2, 1, true, 1)
+                    .err(),
+                Some(Nat44TcpPlanError::SessionFull)
+            );
+            assert_eq!(runtime.reusable_session_checks.get(), SESSIONS);
+        });
+
+        // Address-dependent: a long chain of expired (mapping, REMOTE1)
+        // sessions is walked at most NAT44_TCP_INBOUND_SLOT_PROBES nodes
+        // deep and refuses (fails closed).
+        let policy = Nat44TcpPolicy::default();
+        with_config(policy, 40_000, 40_000, |config| {
+            let ttl = config.policy().idle_ttl_ms();
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); SESSIONS];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            for port in 1..=40 {
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, port, true, 0)
+                    .unwrap();
+                runtime.commit_outbound(plan, 0).unwrap();
+            }
+            let plan = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE2, 443, true, ttl - 1)
+                .unwrap();
+            runtime.commit_outbound(plan, ttl - 1).unwrap();
+            runtime.session_address_lookup_probes.set(0);
+            assert_eq!(
+                runtime.plan_inbound(40_000, REMOTE1, 9, true, ttl).err(),
+                Some(Nat44TcpPlanError::SessionMiss)
+            );
+            let probes = runtime.session_address_lookup_probes.get();
+            assert!(probes <= NAT44_TCP_INBOUND_SLOT_PROBES, "probes {probes}");
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+
+        // With free slots available the bounded window still admits.
+        let policy = Nat44TcpPolicy::default().with_filtering(Nat44Filtering::EndpointIndependent);
+        with_config(policy, 40_000, 40_000, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); SESSIONS];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            let plan = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                .unwrap();
+            runtime.commit_outbound(plan, 0).unwrap();
+            runtime.reusable_session_checks.set(0);
+            let plan = runtime.plan_inbound(40_000, REMOTE2, 443, true, 1).unwrap();
+            assert!(runtime.reusable_session_checks.get() <= NAT44_TCP_INBOUND_SLOT_PROBES);
+            runtime.commit_inbound(plan, 1).unwrap();
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
     }
 
     #[test]
@@ -5066,9 +5180,19 @@ impl<'a> Nat44TcpRuntime<'a> {
         {
             return Err(Nat44TcpPlanError::SessionMiss);
         }
+        // Externally initiated sessions never run the outbound O(S) slot
+        // scan: this packet is unauthenticated and a bound firewall has not
+        // judged it yet. Reuse the exact expired slot, or probe a bounded
+        // keyed window.
         let session_index = if let Some((session_index, _)) = exact_session {
             session_index
-        } else if let Some(session_index) = self.find_reusable_session(now_ms) {
+        } else if let Some(session_index) = self.find_reusable_session_for_inbound(
+            mapping_index,
+            mapping,
+            remote_address,
+            remote_port,
+            now_ms,
+        ) {
             session_index
         } else {
             return Err(Nat44TcpPlanError::SessionFull);
@@ -5097,10 +5221,49 @@ impl<'a> Nat44TcpRuntime<'a> {
         })
     }
 
+    /// Bounded slot search for an inbound-initiated session.
+    ///
+    /// Examines at most [`NAT44_TCP_INBOUND_SLOT_PROBES`] consecutive slots
+    /// (wrapping) from a start derived from the runtime's secret hash key,
+    /// the tuple, and the time, so an external sender cannot steer the
+    /// window and a retransmitted SYN probes a different window. A miss is
+    /// `SessionFull` even if a reusable slot exists outside the window; the
+    /// outbound path keeps its full scan.
+    fn find_reusable_session_for_inbound(
+        &self,
+        mapping_index: usize,
+        mapping: Nat44TcpMappingSlot,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        now_ms: u64,
+    ) -> Option<usize> {
+        let capacity = self.sessions.len();
+        if capacity == 0 {
+            return None;
+        }
+        let words = [
+            mapping_index as u64,
+            mapping.generation,
+            u64::from(u32::from_be_bytes(remote_address.octets())),
+            u64::from(remote_port),
+            now_ms,
+        ];
+        let start = self
+            .hash_key
+            .0
+            .hash_words(DirectoryHashDomain::TcpInboundSlot, &words);
+        let start = usize::try_from(start % capacity as u64).expect("index below capacity");
+        (0..capacity.min(NAT44_TCP_INBOUND_SLOT_PROBES))
+            .map(|step| (start + step) % capacity)
+            .find(|&index| self.session_slot_reusable(index, now_ms))
+    }
+
     /// Filtering decision for an inbound initial SYN without an exact live
     /// session. Bounded: no lookup for endpoint-independent or
-    /// address-and-port-dependent filtering, one bounded remote-address
-    /// directory lookup for address-dependent filtering.
+    /// address-and-port-dependent filtering, and for address-dependent
+    /// filtering one remote-address directory lookup that visits at most
+    /// [`NAT44_TCP_INBOUND_SLOT_PROBES`] chain nodes and fails closed
+    /// (refuses) beyond that.
     fn inbound_filter_admits(
         &self,
         mapping_index: usize,
@@ -5135,15 +5298,20 @@ impl<'a> Nat44TcpRuntime<'a> {
         );
         let probe = self
             .session_address_directory
-            .lookup(DirectoryHashDomain::TcpSessionAddress, &words, |index| {
-                let session = self.sessions[index];
-                session.occupied
-                    && session.mapping_index == mapping_index
-                    && session.mapping_generation == mapping.generation
-                    && session.mapping_lifecycle_epoch == mapping.lifecycle_epoch
-                    && session.remote_address == remote_address
-                    && self.session_is_live(session, now_ms)
-            })
+            .lookup_bounded(
+                DirectoryHashDomain::TcpSessionAddress,
+                &words,
+                NAT44_TCP_INBOUND_SLOT_PROBES,
+                |index| {
+                    let session = self.sessions[index];
+                    session.occupied
+                        && session.mapping_index == mapping_index
+                        && session.mapping_generation == mapping.generation
+                        && session.mapping_lifecycle_epoch == mapping.lifecycle_epoch
+                        && session.remote_address == remote_address
+                        && self.session_is_live(session, now_ms)
+                },
+            )
             .map_err(|_| Nat44TcpPlanError::IndexCorrupt)?;
         #[cfg(test)]
         self.session_address_lookup_probes.set(
@@ -5519,20 +5687,23 @@ impl<'a> Nat44TcpRuntime<'a> {
     }
 
     fn find_reusable_session(&self, now_ms: u64) -> Option<usize> {
-        self.sessions.iter().position(|session| {
-            #[cfg(test)]
-            self.reusable_session_checks
-                .set(self.reusable_session_checks.get().saturating_add(1));
-            !self.session_is_live(*session, now_ms)
-                || self
-                    .mappings
-                    .get(session.mapping_index)
-                    .is_none_or(|mapping| {
-                        !mapping.occupied
-                            || mapping.generation != session.mapping_generation
-                            || mapping.lifecycle_epoch != session.mapping_lifecycle_epoch
-                    })
-        })
+        (0..self.sessions.len()).find(|&index| self.session_slot_reusable(index, now_ms))
+    }
+
+    fn session_slot_reusable(&self, index: usize, now_ms: u64) -> bool {
+        #[cfg(test)]
+        self.reusable_session_checks
+            .set(self.reusable_session_checks.get().saturating_add(1));
+        let session = self.sessions[index];
+        !self.session_is_live(session, now_ms)
+            || self
+                .mappings
+                .get(session.mapping_index)
+                .is_none_or(|mapping| {
+                    !mapping.occupied
+                        || mapping.generation != session.mapping_generation
+                        || mapping.lifecycle_epoch != session.mapping_lifecycle_epoch
+                })
     }
 
     fn mapping_for_public_port(
