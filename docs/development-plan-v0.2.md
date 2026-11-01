@@ -300,7 +300,8 @@ M1への経路はgap分析のslice S1〜S9とする。
 実績（2026-11-01更新）: S1 #273、S2 #274、S3 #275、S4 #276、S5a #277、S5b #278、S6a/S6b #279
 （一PR）、S8a/S8b #280（一PR）はmerge済み。#280が見つけたfirewall期限切れslotのliveness
 bugは#281で修正した。S7は#282（owner承認済み）、route-miss ICMPの修正は#284、ICMPv4生成switchは
-#285でmerge済み。S9はRD0とM1 release evidence（[`release-evidence/m1.md`](release-evidence/m1.md)）。M1 exit判定はevidence fileで行う。
+#285でmerge済み。S9はRD0とM1 release evidence
+（[`release-evidence/m1.md`](release-evidence/m1.md)）。M1 exit判定はevidence fileで行う。
 
 ### M2: Operable AF_XDP static router
 
