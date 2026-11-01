@@ -11,7 +11,8 @@ M1（Runnable deterministic router）では、rootやNICなしで宣言的config
 `config → validate → publication candidate → live activation → run_tick → observability →
 run-sim JSONL`をend-to-endで実行できます（下の「使い方」）。backendは決定的な`SimIo`だけで、
 AF_PACKET/AF_XDPはproduction backendではなく、実NICでの動作やthroughputは主張しません。
-M1はR16 checkのrequired化、R17 benchmark specの承認が残っており未closeです。exit criterionごとの証跡は
+M1は`R16A Bounded` checkのrequired化（repository adminの操作）だけが残っており未closeです。
+exit criterionごとの証跡は
 [`docs/release-evidence/m1.md`](docs/release-evidence/m1.md)にあります。
 
 workspaceは12 crateです。data-planeとI/Oのlibrary crateは外部依存を持ちません。cold
