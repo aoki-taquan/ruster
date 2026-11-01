@@ -147,16 +147,25 @@ fn benchmark_spec_v0_2_digest_matches_pinned_file() {
 }
 
 #[test]
-fn benchmark_spec_v0_2_is_marked_draft_until_owner_approval() {
+fn benchmark_spec_v0_2_is_marked_approved_by_owner() {
     let spec = spec_text();
     let status_lines: Vec<&str> = spec
         .lines()
         .filter(|line| line.starts_with("- status: "))
         .collect();
     assert_eq!(status_lines.len(), 1, "exactly one status line");
+    assert_eq!(
+        status_lines[0], "- status: **APPROVED — owner承認済み（#282）**",
+        "v0.2 thresholds are frozen by the owner approval in #282"
+    );
     assert!(
-        status_lines[0].contains("DRAFT") && status_lines[0].contains("PROPOSED"),
-        "thresholds must stay marked PROPOSED/DRAFT until the owner approves them"
+        !spec.contains("DRAFT") && !spec.contains("PROPOSED"),
+        "an approved spec must not keep DRAFT/PROPOSED markers"
+    );
+    assert!(
+        spec.lines()
+            .any(|line| line.starts_with("- 承認: 2026-11-01、ownerが#282")),
+        "the approval line must cite the 2026-11-01 owner decision"
     );
 }
 

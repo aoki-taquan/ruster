@@ -83,7 +83,7 @@ baseline、pass/fail、性能主張を実装しません。
 
 R17の[benchmark specification v0.2](../../docs/benchmark-spec-v0.2.md)は、上のplan/protocol/
 artifact v1を再定義せず、case IDごとのgate tier、offered load、threshold、baseline regression、
-soak、operator criteriaを追加します。現在はDRAFTで、数値はすべてowner承認待ちのPROPOSEDです。
+soak、operator criteriaを追加します。2026-11-01にownerが#282で数値を変更なしで承認し、statusは`APPROVED`です。
 spec bytesは[`benchmark-spec-v0.2.sha256`](../../docs/benchmark-spec-v0.2.sha256)に固定し、
 `tests/benchmark_spec.rs`と`.github/workflows/benchmark-smoke.yml`が照合します。specを変更した
 場合はrepository rootで`sha256sum docs/benchmark-spec-v0.2.md > docs/benchmark-spec-v0.2.sha256`

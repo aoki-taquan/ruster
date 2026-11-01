@@ -1,28 +1,30 @@
 # Benchmark specification v0.2 (R17)
 
 - spec ID: `ruster.benchmark-spec/v0.2`
-- status: **DRAFT — 全数値はPROPOSED、owner承認待ち**
+- status: **APPROVED — owner承認済み（#282）**
 - 対象: M1（sim smokeのみ）とM2（AF_XDP hardware gate）
 - 対象外: M3 benchmark（1 queue baseline対全queue、state capacity直前flow、24時間soak）は
   M3着手前に別specとしてfreezeする
 
 このdocumentはdevelopment plan R17の「結果取得前に数値をfreezeするbenchmark
-specification」です。**本文中の数値thresholdはすべてimplementerによる提案（PROPOSED）で、
-ownerがPRで承認するまで効力を持ちません**（M1 owner決定「R17の数値thresholdはimplementerが
-PRで提案し、ownerがそのPRで承認する」）。このdraftはまだfrozen specではありません。
-X05は`DRAFT`のspecに対して測定を開始してはいけません。
+specification」です。本文中の数値thresholdはimplementerが#282で提案し、M1 owner決定
+「R17の数値thresholdはimplementerがPRで提案し、ownerがそのPRで承認する」に従って
+ownerが承認しました。X05はこのspecの`spec_git_sha`に対してだけ測定し、thresholdを変更しません。
+
+- 承認: 2026-11-01、ownerが#282の提案値を変更なしで承認（「ベンチマークは一旦ok」）。
+  下の「owner決定」の全項目を含みます。
 
 ### 承認手順
 
-ownerが数値を承認（必要なら修正）するPRで、同じcommit内に次をすべて行います。
+v0.2は#282で次の手順により承認されました。以後のversionも、ownerが数値を承認（必要なら修正）
+するPRで、同じcommit内に次をすべて行います。
 
 1. status行を`- status: **APPROVED — owner承認済み（承認PR番号）**`へ変え、承認された値以外の
    本文を変更しない。
 2. repository rootで`sha256sum docs/benchmark-spec-v0.2.md > docs/benchmark-spec-v0.2.sha256`を
    実行してdigestを再生成する。
-3. `crates/bench/tests/benchmark_spec.rs`のdraft marker test
-   （`benchmark_spec_v0_2_is_marked_draft_until_owner_approval`）を`APPROVED`を要求するtestへ
-   置き換える。
+3. `crates/bench/tests/benchmark_spec.rs`のdraft marker testを`APPROVED`を要求するtestへ
+   置き換える（v0.2では`benchmark_spec_v0_2_is_marked_approved_by_owner`）。
 4. `docs/requirements-v0.2.md`のBENCH-009を`deferred`から実装済みの状態とtest IDへ更新する。
 
 frozen specは、このPRが`main`へsquash mergeされたcommitです。そのcommit SHAを`spec_git_sha`、
@@ -74,7 +76,7 @@ hardware、AF_XDP、traffic generator、baselineはM1の対象外です。
 M2 minimum topologyは2 ports、各port 1 RX/TX queueです。これはtier `SC`のq1 caseが
 評価します。ただしplan v1のcomplete runはexact 237 caseを要求し、そのうちq1は36 case
 （single-queue 27、udp-zeroのzero-copy/q1/flow4096 9）で、237中201 caseが`q4`なので、X05のlabは**port当たり4 queue以上をsupportするNIC**を必要とします
-（下の「ownerへの確認事項」1）。
+（下の「owner決定」1）。
 
 ### Gate tier
 
@@ -108,10 +110,10 @@ IMIX、single-flowと複数flow、plain/NAT/NAT+FW、双方向は、MQのprimary
 flow4096）とSCのflow-one（flow1）で満たします。eth128とIMIXはplan v1上q4/flow≥64にしか
 存在しないため、SCには含まれません。
 
-rationale（PROPOSED）: copy modeはdriver依存のfallbackでM2では「観測できること」が要件のため
+rationale: copy modeはdriver依存のfallbackでM2では「観測できること」が要件のため
 report-only。batch-sweepはb64を基準としたtuning情報でありgateはprimaryのb64で行う。
 
-### Offered load（PROPOSED）
+### Offered load
 
 offeredは**active directionごと**のpackets/sで、10,000,000,000 bits/sに対するplan v1の
 exact line-rate rational（L1 = FCS + preamble/SFD + IFG）に百分率を掛けて切り捨てた値です。
@@ -130,7 +132,7 @@ bidirectionalでは両directionへ同じ値を同時に与えます。R tierは�
 | SC | ip-mtu1500 | 100 | 812743 |
 <!-- r17:offered-table:end -->
 
-rationale（PROPOSED）:
+rationale:
 
 - 「10GbE対応」はhousehold用途で支配的なMTU-size転送とmixed trafficで主張するため、
   ip-mtu1500とIMIXは4 queueで100% line rate、eth512も100%とする。
@@ -141,9 +143,9 @@ rationale（PROPOSED）:
   意味する。
 - 参考値（gateの根拠ではない）: 開発VM（Xeon E5-2650 v4）のsim smoke（hot-cache、1 thread）で
   plain約5.9 Mops/s、NAT44+firewall約1.1 Mops/s（batch 32、64-byte）。MQ IMIX bidirectional
-  NAT+FW（約7.05 Mpps合計）は4 workerでも余裕が小さく、ownerが下げる候補（確認事項2）。
+  NAT+FW（約7.05 Mpps合計）は4 workerでも余裕が小さいが、ownerは100%のまま承認した（owner決定2）。
 
-### 合否式（PROPOSED）
+### 合否式
 
 MQ/SCの各caseは、protocol v1が導出したsummaryに対して次をすべて満たします。
 `D`はactive direction数（outbound/inbound = 1、bidirectional = 2）、`O`は上表のoffered値です。
@@ -165,7 +167,7 @@ zeroに加え、次の共通invariantを要求します。
 - `invalid_descriptors = 0`、`double_owned = 0`（before/afterとも）
 - caseのdrain後lifecycle `frame_health`で`rx_owned = core_borrowed = tx_owned = 0`
 
-### Protocol parameters（PROPOSED）
+### Protocol parameters
 
 | parameter | value | rationale |
 |---|---|---|
@@ -177,7 +179,7 @@ zeroに加え、次の共通invariantを要求します。
 | run timeout | 71,100,000 ms（= case timeout × 237、約19.75 h） | protocol v1の下限そのもの |
 | latency profile | round-trip、`sample_every_packets = 1024` | 1500-byteで1 repeat約23,800 sample、p99に十分 |
 
-### Baseline regression（PROPOSED）
+### Baseline regression
 
 - baselineは、同じ`hardware_profile_id`、`generator_id`、`offload_profile_id`、
   `rss_profile_id`、`build_profile`で、このspecの全MQ/SC gateを満たした最初の完全run
@@ -195,7 +197,7 @@ zeroに加え、次の共通invariantを要求します。
 
 hardware profileが異なるrunはbaselineと比較せず、新しいbaselineの確立として扱います。
 
-注記（owner判断事項、確認事項6）: protocol v1はofferedを固定するため、baselineの
+注記（owner決定6）: protocol v1はofferedを固定するため、baselineの
 `accepted_pps_median`は`D × O`以下で、絶対下限`≥ D × O × 0.99999`を満たすrunは
 `baseline × 0.95`も必ず満たします。したがってpps regression ruleは決して発火しない
 no-opであり、このspecでは採用しません。throughput regressionを意味のある形で検出するには、
@@ -203,12 +205,12 @@ no-opであり、このspecでは採用しません。throughput regressionを�
 CPU使用率を追加するprotocol/artifact v2が必要で、v1の範囲外です。v0.2のregression gateは
 latencyだけです。
 
-### Soak（M2、PROPOSED）
+### Soak（M2）
 
 - case: `v1:zero-copy:q4:b64:ruster-imix-v1:f4096:bidirectional:nat44-firewall:udp-checksum`
   の設定で、offeredは50%（1,763,046 pps/direction）。
 - duration: 2時間（600秒window × 12）。protocol v1の237-case runとは別の連続runとし、
-  artifact形式はX05で定義する（確認事項4）。
+  artifact形式はX05で定義する（owner決定4）。
 - 各window: binary64で`loss_ratio <= 1e-5`、`p99 ≤ 1 ms`。
 - 全体: frame health totalが不変、`invalid_descriptors = double_owned = 0`、worker healthの
   last successful tickが1秒を超えて止まらない、window 1終了時からwindow 12終了時までの
@@ -216,7 +218,7 @@ latencyだけです。
 - rationale: M3の24時間soakより短い、M2の最初のleak検出。約2.5×10^10 packetを処理し、
   descriptor/frame/state leakを検出できる。
 
-### Operator criteria（M2、PROPOSED）
+### Operator criteria（M2）
 
 各手順を3回実行し、全回で満たします。背景loadは
 `v1:zero-copy:q4:b64:ip-mtu1500:f4096:outbound:plain:udp-checksum`の設定で10%
@@ -236,16 +238,18 @@ latencyだけです。
 rationale: 家庭用routerのreboot/再設定でユーザーが体感しない範囲（秒単位の起動、apply中の
 ms級停止）を上限とする。
 
-## ownerへの確認事項
+## owner決定（2026-11-01）
 
-1. M2 minimum topology（各port 1 queue）とplan v1（237中201 caseがq4、q1は36 case）の差。
-   このspecはX05 labに4 queue NICを要求する。1 queue NICだけでM2を閉じる場合はplan v2が必要。
-2. MQ IMIX/eth512 100%（特にbidirectional NAT+FW）が過大なら、percentを下げる。
-3. loss 0.001%（zero-lossではない）、p50 100 µs/p99 1 msの水準。
-4. soakとoperator testのartifact形式はprotocol v1外であり、X05で定義してよいか。
-5. latencyのgenerator loopbackを差し引かない方針。
-6. pps regressionはfixed offered loadでは発火しないため不採用とし、v0.2のregression gateを
-   latencyだけにするか。throughput regressionが必要なら、no-drop rate探索または
-   cycles/packetを持つprotocol/artifact v2を別sliceで追加するか。
-7. 承認手順（status、digest、draft marker test、BENCH-009を同じ承認PRで更新し、squash merge
-   commitを`spec_git_sha`とする）でよいか。
+ownerは#282の確認事項すべてについて提案どおりに承認しました。
+
+1. M2 minimum topology（各port 1 queue）とplan v1（237中201 caseがq4、q1は36 case）の差は、
+   X05 labに**port当たり4 queue以上をsupportするNIC**を要求することで解消する。plan v2は作らない。
+2. MQ IMIX/eth512 100%（bidirectional NAT+FWを含む）を含め、offered load表の値を変更しない。
+3. loss 0.001%（zero-lossではない）、p50 100 µs/p99 1 msの水準を採用する。
+4. soakとoperator testのartifact形式はprotocol v1外であり、X05で定義する。
+5. latencyはgenerator loopbackを差し引かない。
+6. pps regressionはfixed offered loadでは発火しないため不採用とし、v0.2のregression gateは
+   latencyだけとする。throughput regressionが必要になった場合は、no-drop rate探索または
+   cycles/packetを持つprotocol/artifact v2を別sliceで追加する。
+7. 承認手順は上の「承認手順」のとおりとし、#282が`main`へsquash mergeされたcommitを
+   `spec_git_sha`とする。
