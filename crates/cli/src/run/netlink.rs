@@ -869,7 +869,10 @@ mod tests {
             parse_link_reply(&done, 7, PORT, 5),
             Err(NetlinkError::Malformed)
         );
-        let address = message(RTM_NEWADDR, 0, 7, &[2, 0, 0, 0, 5, 0, 0, 0]);
+        // Another message type, even one shaped exactly like a valid link
+        // reply, is never read as link facts.
+        let mut address = link(5, UP, std::slice::from_ref(&mtu));
+        address[4..6].copy_from_slice(&RTM_NEWADDR.to_ne_bytes());
         assert_eq!(
             parse_link_reply(&address, 7, PORT, 5),
             Err(NetlinkError::Malformed)

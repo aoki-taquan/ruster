@@ -286,6 +286,34 @@ fn a_pending_reload_waits_for_quiescence_or_fails_after_the_bound() {
     );
     assert_eq!(line_value(&outcome.out, "rx.tx_accepted"), Some("1"));
     assert_eq!(line_value(&outcome.out, "observer.generation"), Some("1"));
+    // Bounded by RELOAD_QUIESCE_MS of fake time (about 1 ms per probe).
+    let probes = host.state.quiesce_probes.get();
+    assert!(
+        (150..=super::super::reload::RELOAD_QUIESCE_MS as u32 + 5).contains(&probes),
+        "{probes}"
+    );
+}
+
+/// The applied document becomes the current one: its tick budgets apply
+/// from the next tick (and the next reload plans against it).
+#[test]
+fn an_applied_reload_takes_the_new_tick_budgets() {
+    let received_in_last_tick = |reload: bool| {
+        let host = FakeHost::default();
+        // Three requests arrive together in the last tick (30).
+        host.state
+            .inject_at
+            .borrow_mut()
+            .extend((1..=3).map(|sequence| (30, IfId(LAN), echo_request(sequence))));
+        let one_rx = edited(|text| text.replace("[tick]\nrx = 32", "[tick]\nrx = 1"));
+        let source = FakeSource::with([Ok(one_rx)]);
+        let reloads: &[u32] = if reload { &[5] } else { &[] };
+        let outcome = ops(&host, source, &StopAfterTicks::new(&host, 30, reloads));
+        assert_eq!(outcome.status, 0, "{}", outcome.err);
+        line_value(&outcome.out, "rx.received").map(str::to_owned)
+    };
+    assert_eq!(received_in_last_tick(false).as_deref(), Some("3"));
+    assert_eq!(received_in_last_tick(true).as_deref(), Some("1"));
 }
 
 /// A SIGHUP that arrives while a reload is pending is not lost: it is
