@@ -1,5 +1,6 @@
 //! Privileged real-kernel smoke for the X00C native AF_XDP session, the
-//! X00D XDP program/`bpf_link` lifecycle, and the X01 RX/Fill engine.
+//! X00D XDP program/`bpf_link` lifecycle, the X01 RX/Fill engine, and the
+//! X02 TX/Completion half.
 //!
 //! Runs only with `RUSTER_PRIV_XDP=1`, normally through
 //! `scripts/priv-xdp-smoke.sh`, which creates a dedicated network namespace
@@ -32,9 +33,10 @@ use std::{
 
 use ruster_io_xdp_native::{
     abi::{XDP_COPY, XDP_USE_NEED_WAKEUP},
-    AttachFailure, AttachStage, DatapathError, NativeRingError, NativeSession, NegotiatedMode,
-    RingConfig, RingsError, RxFillConfig, RxFillEngine, SessionConfig, SessionFailure,
-    SessionStage, UmemConfig, UmemDomainId, ValidatedBindFlags, XdpAttachMode, XDP_PACKET_HEADROOM,
+    AttachFailure, AttachStage, DatapathError, DrainOutcome, KickOutcome, NativeRingError,
+    NativeSession, NeedWakeup, NegotiatedMode, RingConfig, RingsError, RxFillConfig, RxFillEngine,
+    SessionConfig, SessionFailure, SessionStage, UmemConfig, UmemDomainId, ValidatedBindFlags,
+    XdpAttachMode, XDP_PACKET_HEADROOM,
 };
 
 const FRAME_SIZE: u64 = 2_048;
@@ -436,6 +438,168 @@ fn priv_xdp_engine_validates_and_recycles_peer_frames() {
     eprintln!(
         "priv_xdp_engine: peer ARP frames validated, lent, recycled, and refilled through the \
          RX/Fill engine verified"
+    );
+}
+
+/// Locally administered unicast MAC the TX phase answers ARP with.
+const REFLECTOR_MAC: [u8; 6] = [0x02, 0x52, 0x55, 0x53, 0x54, 0x52];
+const REFLECTOR_MAC_TEXT: &str = "02:52:55:53:54:52";
+const UNANSWERED_IP: [u8; 4] = [192, 0, 2, 1];
+const PEER_IP: [u8; 4] = [192, 0, 2, 2];
+
+/// Rewrites the peer's ARP request for `UNANSWERED_IP` in place into the
+/// matching ARP reply from `REFLECTOR_MAC` (same length, so the RX
+/// descriptor geometry is the TX geometry). Returns `false` and leaves the
+/// bytes alone for any other frame.
+fn rewrite_arp_request_into_reply(bytes: &mut [u8]) -> bool {
+    let is_request = bytes.len() >= 42
+        && bytes[..6] == [0xff; 6]
+        && bytes[12..14] == [0x08, 0x06]
+        && bytes[14..22] == [0, 1, 8, 0, 6, 4, 0, 1]
+        && bytes[28..32] == PEER_IP
+        && bytes[38..42] == UNANSWERED_IP;
+    if !is_request {
+        return false;
+    }
+    let mut peer_mac = [0_u8; 6];
+    peer_mac.copy_from_slice(&bytes[6..12]);
+    // Ethernet: back to the peer, from the reflector.
+    bytes[..6].copy_from_slice(&peer_mac);
+    bytes[6..12].copy_from_slice(&REFLECTOR_MAC);
+    // ARP reply: sender is the reflector at the asked-for address.
+    bytes[21] = 2;
+    bytes[22..28].copy_from_slice(&REFLECTOR_MAC);
+    bytes[28..32].copy_from_slice(&UNANSWERED_IP);
+    bytes[32..38].copy_from_slice(&peer_mac);
+    bytes[38..42].copy_from_slice(&PEER_IP);
+    true
+}
+
+/// The peer's neighbor entry for `UNANSWERED_IP`, in this namespace only.
+fn peer_neighbor(peer: &str) -> String {
+    let output = Command::new("ip")
+        .args(["neigh", "show", "192.0.2.1", "dev", peer])
+        .output()
+        .expect("run ip neigh show");
+    assert!(output.status.success(), "ip neigh show failed");
+    String::from_utf8(output.stdout).expect("ip output is UTF-8")
+}
+
+#[test]
+fn priv_xdp_tx_reflects_peer_frame_completes_and_drains_on_netns_veth() {
+    let Some(device) = requested(Some("tx")) else {
+        return;
+    };
+    let peer_device = required("RUSTER_PRIV_XDP_PEER");
+    assert_eq!(attached_program(&device), None, "veth starts without XDP");
+    assert!(
+        !peer_neighbor(&peer_device).contains(REFLECTOR_MAC_TEXT),
+        "the peer must not know the reflector yet"
+    );
+    let mut session = open_after_release(&session_config(&device, 0, XDP_COPY));
+    // attach_xdp needs `&mut session`, so it must precede take_datapath:
+    // the bundle (and its kick handle) borrows the session from then on.
+    session
+        .attach_xdp(XdpAttachMode::Native)
+        .expect("native attach on veth");
+    let peer = UdpSocket::bind(PEER_SOURCE).expect("peer address configured by the script");
+    {
+        let datapath = session.take_datapath().expect("first datapath take");
+        let mut engine = RxFillEngine::new(
+            datapath,
+            UmemDomainId::new(NonZeroU128::new(0x5444).expect("nonzero")),
+            RxFillConfig::new(NonZeroU32::new(64).expect("nonzero")),
+        )
+        .expect("engine over the live mappings");
+        assert_eq!(engine.tx_inflight_limit(), 64);
+        engine.audit().expect("primed engine audit");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut reflected = 0_u32;
+        while engine.tx_counters().tx_completed == 0 {
+            if reflected == 0 {
+                peer.send_to(b"ruster", UNANSWERED_TARGET)
+                    .expect("peer send");
+            }
+            sleep(Duration::from_millis(20));
+            let mut handoff = None;
+            {
+                let mut batch = engine.poll(16).expect("poll");
+                while let Some(mut frame) = batch.next_frame() {
+                    if handoff.is_none() && rewrite_arp_request_into_reply(frame.bytes_mut()) {
+                        handoff = Some(frame.stage_tx());
+                    } else {
+                        frame.recycle();
+                    }
+                }
+            }
+            if let Some(handoff) = handoff {
+                let descriptor = handoff.descriptor();
+                assert_eq!(descriptor.data_offset(), XDP_PACKET_HEADROOM);
+                let report = engine
+                    .submit_tx(handoff)
+                    .map_err(|rejected| rejected.reason())
+                    .expect("TX ring has room");
+                assert_eq!(report.submitted(), 1);
+                reflected += 1;
+            }
+            // Copy mode transmits only from sendto, and keeps asking.
+            if reflected > 0 && engine.tx_needs_wakeup() == Ok(NeedWakeup::Required) {
+                match engine.wake_tx() {
+                    Ok(KickOutcome::Woken | KickOutcome::Deferred(_)) => {}
+                    Err(error) => panic!("TX kick failed: {error:?}"),
+                }
+            }
+            engine.audit().expect("engine audit after poll");
+            assert!(
+                Instant::now() < deadline,
+                "no reflected frame completed within five seconds: {:?} {:?}",
+                engine.counters(),
+                engine.tx_counters()
+            );
+        }
+        let counters = engine.tx_counters();
+        assert_eq!(counters.tx_submitted, u64::from(reflected));
+        assert_eq!(counters.tx_invalid_completion_total(), 0, "{counters:?}");
+        assert!(counters.tx_kicks >= 1, "{counters:?}");
+
+        // The peer kernel received the reply that left the same veth: it
+        // learned the reflector's MAC for the address it asked about.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let neighbor = peer_neighbor(&peer_device);
+            if neighbor.contains(REFLECTOR_MAC_TEXT) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the peer never learned the reflected ARP reply: {neighbor:?}"
+            );
+            sleep(Duration::from_millis(20));
+        }
+
+        // Ordered shutdown: drain until no TX frame is in kernel hands.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let report = loop {
+            let report = engine.drain(16).expect("drain");
+            if report.outcome() == DrainOutcome::Drained {
+                break report;
+            }
+            assert!(Instant::now() < deadline, "drain timed out: {report:?}");
+            sleep(Duration::from_millis(10));
+        };
+        let accounting = report.accounting();
+        assert_eq!(accounting.tx_in_flight, 0);
+        assert_eq!(accounting.tx_handoffs, 0);
+        assert_eq!(accounting.total(), 192);
+        assert_eq!(engine.tx_counters().tx_completed, u64::from(reflected));
+        engine.audit().expect("engine audit after drain");
+    }
+    session.close().expect("attached session teardown");
+    wait_detached(&device);
+    eprintln!(
+        "priv_xdp_tx: peer ARP request rewritten in place, transmitted from the same frame on \
+         the same veth, received by the peer, completed, and drained verified"
     );
 }
 

@@ -17,11 +17,12 @@ use std::{
 };
 
 use super::{
+    kick::{KickTarget, ScriptedKicks},
     session::{classify, classify_attach, summarize_log, SessionCore, VERIFIER_LOG_CAPACITY},
     syscall::{
-        errno, sealed, Errno, MapCreateRequest, MapRequest, MapsRealMemory, PollDescriptor,
-        ProgramLoadRequest, ResourceError, SyscallArgumentError, SyscallError, SyscallStage,
-        Syscalls, IFNAMSIZ, PAGE_SIZE,
+        errno, sealed, Errno, MapCreateRequest, MapRequest, MapsRealMemory, OwnedXdpFd,
+        PollDescriptor, ProgramLoadRequest, ResourceError, SyscallArgumentError, SyscallError,
+        SyscallStage, Syscalls, IFNAMSIZ, PAGE_SIZE,
     },
 };
 use crate::{
@@ -150,6 +151,7 @@ struct SessionFake {
     double_releases: Cell<u32>,
     /// Kernel log written by a load: byte count and whether a NUL follows.
     verifier_log: Cell<Option<(usize, bool)>>,
+    kicks: ScriptedKicks,
 }
 
 impl SessionFake {
@@ -175,6 +177,7 @@ impl SessionFake {
             open_fds: Cell::new(0),
             double_releases: Cell::new(0),
             verifier_log: Cell::new(None),
+            kicks: ScriptedKicks::default(),
         }
     }
 
@@ -505,6 +508,10 @@ impl Syscalls for SessionFake {
         .1?;
         self.open_fds.set(self.open_fds.get() + 1);
         Ok(FAKE_LINK_FD)
+    }
+
+    fn datapath_kick<'a>(fd: &'a OwnedXdpFd<'a, Self>) -> KickTarget<'a> {
+        KickTarget::Scripted(&fd.syscalls().kicks)
     }
 }
 
@@ -1777,7 +1784,7 @@ fn native_session_datapath_is_taken_once_and_excludes_raw_rings() {
         {
             let datapath = session.take_datapath().expect("first take");
             assert_eq!(datapath.capacities(), [64, 128, 64, 256]);
-            let engine = RxFillEngine::new(
+            let mut engine = RxFillEngine::new(
                 datapath,
                 UmemDomainId::new(NonZeroU128::new(0x5310).expect("nonzero")),
                 RxFillConfig::new(NonZeroU32::new(64).expect("nonzero")),
@@ -1785,6 +1792,13 @@ fn native_session_datapath_is_taken_once_and_excludes_raw_rings() {
             .expect("engine over the session's real arena mappings");
             assert_eq!(engine.initial_refill().published(), 64);
             engine.audit().expect("engine audit");
+            // The bundle's kick reaches this session's socket through the
+            // seam while the session stays borrowed by the engine.
+            assert_eq!(engine.wake_tx(), Ok(crate::KickOutcome::Woken));
+            assert_eq!(engine.wake_fill(), Ok(crate::KickOutcome::Woken));
+            assert_eq!(fake.kicks.count(super::kick::KickRing::Tx), 1);
+            assert_eq!(fake.kicks.count(super::kick::KickRing::Fill), 1);
+            assert_eq!(engine.tx_inflight_limit(), 64);
         }
         // The engine is gone, but the kernel may hold what it published:
         // neither a second bundle nor raw views are ever lent again.

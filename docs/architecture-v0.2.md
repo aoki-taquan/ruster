@@ -1322,9 +1322,9 @@ partition）より緩くなれません。configの追加policyは、1 queue/int
 そして`frame-count - generated-frames >= fill + tx`です。最後の式はlibxdp慣行と同じ最低限の
 floorで、Fill ring満杯とTX ring一杯のforward frameを同時に賄えるだけです。未回収のcompletion、
 driverがdequeue済みのTX frame、coreが借用中のRX frameは数えないため、それだけで枯渇しないことは
-保証しません。後続のX01/X02 backendは、in-flight TXを`tx` entry以下に制限し、free listが
-Fill ringを満たせないときもstallせずに進む（部分的なFill、completion回収を優先）ことを
-要求されます（ledger BACKEND-004、deferred）。
+保証しません。X01/X02 engine（M2 S3/S4）は、in-flight TXを`tx` entry以下に制限し、free listが
+Fill ringを満たせないときもstallせずに進みます（部分的なFill、refill前のcompletion回収。ledger
+BACKEND-004、「AF_XDP TX/Completion half」節）。
 `existing-xdp-program`は`refuse`だけで、既存programを置換・detachしない方針を明示するために
 fieldを残します。`queue`は`backend.ports[i]`直下でだけoperator入力として許し、他の位置の
 queue/shard/umem/worker fieldはruntime生成値として従来どおり拒否します。
@@ -2121,8 +2121,8 @@ down/up、netdev削除、reload時のre-attach policyはX04です（XDP-062）�
 `ruster-io-xdp-native`の`RxFillEngine<'memory>`はdatapath engineのRX/Fill半分です。一workerが
 Fill producer、RX consumer、TX producer、Completion consumer、UMEM、authoritative `FrameLedger`を
 まとめて所有し、lock、構築後のallocation、packet clone、packet単位`String`、`dyn`を使いません
-（ledgerが`!Send + !Sync`なのでengineも同じ）。TX/CompletionはS4まで使いませんが、engineが
-持つことで、lend中のframeを指すTX descriptorを他者がsubmitできなくなります。
+（ledgerが`!Send + !Sync`なのでengineも同じ）。TX/Completion半分（M2 S4、次節X02）も同じengineと
+同じledgerにあり、engineだけがTX descriptorをsubmitできます。
 
 ledgerの前提は「このUMEMのFillへpublishしたのはこのengineだけ」です。これを型で保証するため、
 engineは`DatapathRings<'session>`（Fill、Completion、RX、TX、UMEM bytesの一組）をby valueで
@@ -2156,7 +2156,7 @@ need-wakeupは各refillの最後（publicationがあればそのRelease後）に
 `RefillReport::need_wakeup`で返します。publishしなかったrefill（Fill満杯、starved）や構築時の
 初回refill（`initial_refill()`）でも同じで、別に`fill_needs_wakeup()`がpublishなしに一回のatomic
 loadで読みます。zero-copyではkernelがFill枯渇時にflagを立てるため、libxdpと同じく各pollで
-flagを見てkickできます（kick自体はX04）。`fill_need_wakeup`はRequiredを観測したrefill数、
+flagを見てkickできます（kickは次節X02の`wake_fill()`、いつkickするかのpolicyはX04）。`fill_need_wakeup`はRequiredを観測したrefill数、
 `fill_flag_errors`は未知bitを観測したrefill数で、publicationはrollbackしません。
 
 `poll(budget)`はrefillの後、RX ringから`min(budget - pending, pending capacity, available)`個だけ
@@ -2174,15 +2174,18 @@ reason別counter）。
 | 2 | `addr / chunk`のframeが`FillOwnedByKernel` | `NotKernelOwned`（重複、generated pool、lease中/TX中/pending/quarantine済み） | 不変 |
 | 3 | `options == 0`（`XDP_PKT_CONTD`等） | `UnsupportedOptions` | quarantine |
 | 4 | chunk内offset ≥ user headroom + 256 | `DataBeforeHeadroom` | quarantine |
-| 5 | `len ≥ 14`（Ethernet header） | `ShorterThanEthernetHeader` | recycle |
-| 6 | `offset + len ≤ chunk size` | `ExceedsFrame` | quarantine |
+| 5 | `offset + len ≤ chunk size` | `ExceedsFrame` | quarantine |
+| 6 | `len ≥ 14`（Ethernet header） | `ShorterThanEthernetHeader` | recycle |
+
+chunk越えはrunt判定より前です（M2 S4で順序を入れ替え）。14 byte未満でもchunk末尾を越える
+descriptorはprofile外のgeometryなので、runtとしてrecycleせずquarantineします（XDP-106）。
 
 最後に`UmemLayout::validate_descriptor`を独立な第二gateとして通します。kernelがframeを
 profile外のdescriptor（options、headroom、chunk越え）で返した場合、そのframeは
 `FrameLedger::quarantine_kernel_fill`で永久に`Quarantined`へ移し、lendもrecycleもしません
 （未reviewのkernel契約を再利用しないfail closed）。これによるpool縮小は`frames_quarantined`で
 観測します（free listが尽きればstarvationとしても現れますが、縮小そのものの指標ではありません）。
-address、所有、headroomが正しく長さだけが14未満のrunt（0を含む）は、kernelがframeを正しく返した上で
+address、所有、headroom、chunk境界が正しく長さだけが14未満のrunt（0を含む）は、kernelがframeを正しく返した上で
 packetが使えないだけなので、`FrameLedger::release_kernel_fill`でFreeへ戻してfree listへ入れ、
 `rx_runts_recycled`も数えます。kernelがframeを返していない場合（1、2）はledgerに一切触れないので、
 重複descriptorが別ownerのframeを奪うことはありません。最小長は60-byte padded minimumではなく
@@ -2200,10 +2203,10 @@ consumeするので、bytes借用中のrecycleはcompile error（`compile_fail,E
 recycleはledger `recycle_lease`（exact token/generationの`Leased`だけ）とfree listへのpushで、
 同じcycleの二度目の完了、pending/kernel所有frameのrecycleはledgerが`WrongState`/`StaleToken`で
 拒否します。`stage_tx`はframeを`PendingTx`へ移したmove-onlyの`TxHandoff`（public
-constructorなし、`must_use`）を返すS4用hookで、S4が無い間は`cancel_tx_handoff`がfree listへ
-戻します。engine methodを通らずにdropされた`TxHandoff`はframeを`PendingTx`に置き去りにするため、
-debug buildではassertし、`tx_handoffs_outstanding()`（ledgerの`PendingTx`数、O(1)）が数え続けます。
-S4は全handoffをengine method（publishまたはcancel）で消費しなければなりません。
+constructorなし、`must_use`）を返し、次節の`submit_tx`がTXへ出すか、`cancel_tx_handoff`がfree listへ
+戻します。どちらも拒否時はhandoffをそのまま返します。engine methodを通らずにdropされた`TxHandoff`は
+frameを`PendingTx`に置き去りにするため、debug buildではassert（`#[should_panic]` testで固定）し、
+`tx_handoffs_outstanding()`（ledgerの`PendingTx`数、O(1)）が数え続けます。
 
 UMEM byte accessは`native_unsafe/umem.rs`の`UmemFrames`だけです。mappingとledgerを一つの値に
 まとめ、ledgerが`Leased`（user space所有）と記録しているframeについてだけ、その時点のexact
@@ -2241,3 +2244,119 @@ native engineはRX ringを読むまで観測できないため、両者を「ker
 privileged smokeのengine phaseは専用netns veth上でattach後のpeer ARP frameがengineの検証を通り
 lend、recycle、refillされ、copy modeのdata offsetが256、bundleの二度目のtakeとraw viewが
 拒否されることを確認します（XDP-064〜090）。
+
+### AF_XDP TX/Completion half (X02, M2 S4)
+
+TX/Completion半分は別engineではなく、同じ`RxFillEngine`の子module（`tx_completion.rs`）です。
+TX producer、Completion consumer、socketのkick handleもengineが所有し、UMEMの全frameを記録する
+ledgerは一つだけです（ledgerを変更するのはこのengineだけ）。名前は互換のため`RxFillEngine`のままです。
+
+state machine（RX pool frameのTX cycle）:
+
+```text
+Leased (RxFrame, core rewrites in place)
+  │ stage_tx
+  ▼
+PendingTx (TxHandoff, caller-held) ──cancel_tx_handoff──► Leased ─► Free ─► free list ─► Fill
+  │ submit_tx / submit_tx_batch: check(PendingTx) + geometry → reserve_tx
+  ▼
+TxReserved ──ring write → Release publish──► TxOwnedByKernel (in flight)
+  │ reap: exact address                      │ reap: same frame, other address
+  ▼                                          ▼
+CompletionAvailable ─► Free ─► free list   Quarantined (permanent)
+```
+
+**same-frame TX**: `submit_tx(handoff)`と`submit_tx_batch(&mut [Option<TxHandoff>])`はcopyせず、
+ledgerが検証したRX geometry（`frame_base + data_offset`、受信長、options 0）をTX descriptorにします。
+core `PacketSlot`は長さを変えないので、in-placeで書き換えたbytesがそのまま出ます。submit前に
+各handoffを`FrameLedger::check(token, PendingTx)`（domain、generation、state、tokenの非破壊検証）と
+layoutによる再検証（hidden domainを含む`ValidatedDescriptor`の一致）で確かめ、一つでも拒否なら何も
+submitせず全slotを不変に残します（`TxSubmitError::Handoff{index}`、一件版は
+`TxRejection::Invalid`）。batchは一つのTX reservationと一回のRelease publicationで、ledger遷移は
+`reserve_tx`（ring write前）、`publish_tx`（publication後）です。publication失敗時は
+`cancel_tx_reservation`で全部戻します。
+
+**in-flight上限（BACKEND-004）**: in-flight（TXへpublish済み、未completion）は提出順の固定長list
+（容量はTX capacity）で持ち、一回のsubmitは`min(TX ring room, TX capacity - in flight)`個までです。
+ring上の未消費descriptorは必ずin-flightの一部なので、ring roomは常に`TX capacity - in flight`以上で、
+実際に効くのはin-flight上限です。engine setupは`completion capacity >= tx capacity`
+（`CompletionSmallerThanTx`）とTX/Completion ringが空であること（`TxRingNotEmpty`、
+`CompletionRingNotEmpty`）を要求するので、全in-flight frameにCompletion slotがあり、Linux copy modeの
+completion予約（`xsk_generic_xmit`）が満杯にならない構成です。
+
+**would-block**: 上限で残ったhandoffはslotに不変のまま残り、`TxSubmitReport::blocked()`が理由を
+返します。`RingFull`はkernelがまだTX descriptorを消費していない（`wake_tx`して再試行）、
+`InflightLimit`はkernelが消費したがcompletionが遅れている（`poll`/`reap_completions`して再試行）、
+`Draining`はdrain開始後です。部分submitはerrorではなく通常のback-pressureです。一件の`submit_tx`は
+`TxRejected{reason, handoff}`を返し（boxしないので拒否pathもallocationなし）、`into_handoff()`で
+再試行するか`cancel_tx_handoff`でfree list（次のrefillでFill）へ戻します。どの拒否でもframeは
+strandしません。
+
+**completion**: `reap_completions(budget)`はCompletion ringから`min(budget, available)`個を読み、
+全部を処理してからconsumer cursorをReleaseします（残りは`completion_backlogged`）。`poll`は
+refillの前にTX capacityをbudgetとしてreapするため、completed frameは同じpollのrefillでFillへ戻れます
+（free listが短くてもstallしない）。各addressは次の順で検証します。
+
+| 順 | 条件 | reason | frame |
+|---|---|---|---|
+| 1 | `addr < UMEM byte_len` | `AddressOutsideUmem` | 不変 |
+| 2 | frameが`TxOwnedByKernel` | `NotInFlight`（重複completion、Fill/RX/caller/quarantine所有、generated pool） | 不変 |
+| 3 | 提出したexact descriptor address | `AddressMismatch` | quarantine |
+
+1、2はledgerに触れないので、kernelのcompletionが他ownerのframeを解放することはありません。3は
+in-flight frameですがLinuxが返すはずの`desc.addr`と違い、kernelが使い終えたか分からないため
+`FrameLedger::quarantine_kernel_tx`で永久にquarantineします（fail closed、`frames_quarantined`）。
+validなcompletionだけが`complete_tx` → `recycle_completion` → free listです。Linuxは提出順に
+completionを出すので該当entryは通常list先頭（O(1)）です。順序が違うcompletionも受理し、list中央から
+除去（TX capacity以下のshift）して`tx_completions_reordered`で数えます。resubmit済みframeに対する
+古い重複completionはkernel sequenceが無いと区別できない残余で、Linuxは消費したTX descriptorと1:1で
+completionを出します。
+
+**completion lag**: `completion_lag()`はO(1)でin-flight数と最古in-flight frameのsubmit時からの
+poll数を返します。engineは時計を持たず、時間への換算とhealth化はX04のcallerです。
+
+**need-wakeupとkick handle**: 各submitの最後にTX flagをAcquire観測して`TxSubmitReport::need_wakeup`で
+返し、`tx_needs_wakeup()`は一回のatomic loadです。copy modeのLinuxは`sendto`からだけ送信し、flagを
+立て続けます。bundleを取るとsessionはengineの生存中borrowされるため、`DatapathRings`はsessionの
+所有socketへのshared borrow（private `SocketKick`）も運びます。できるのは`wake_tx()`
+（`sendto(fd, NULL, 0, MSG_DONTWAIT, NULL, 0)`）と`wake_fill()`（`poll(fd, POLLIN, 0)`、sleepしない。
+zero-copy driverの`ndo_xsk_wakeup`を起こす）だけで、close/bind/mmap/setsockoptは持ちません。`close`は
+sessionをby valueで要するので、fdはkickより長生きします。kick moduleにunsafeはなく、syscallはsealed
+seamだけを通り、Linux実装は負のfdをdebug assertionでなく常にlibc前で拒否します。errnoは
+`EAGAIN`/`EBUSY`/`ENOBUFS`/`EINTR`をbenignな`KickOutcome::Deferred`、`ENETDOWN`を
+`KickError::NetworkDown`、`ENXIO`を`NotBound`、他を`Errno(n)`、seam前の拒否を`Rejected`にします。
+kickの失敗はledgerを変えず、publish済みdescriptorはin-flightのままです。`attach_xdp(&mut self)`は
+`take_datapath`より前に呼びます（以後sessionはbundleにborrowされています）。
+
+**shutdown drain**: `drain(rounds)`は新規TXとFill publicationを永久に止め（`TxBlocked::Draining`、
+`fill_suppressed_draining`）、lendされていないvalid RX frameをfree listへ戻し、最大`rounds`回
+「kernelが求めればTX kick、TX capacity分のreap」を行います。frameは通常と同じvalidated completion
+pathを通って一回だけfree listへ戻り、重複completionは二度目を拒否します。kernelが保持するframeは
+返ったことにしません: TXは`DrainOutcome::TxInFlight{frames}`、全体は`FrameAccounting`（free、
+`fill_in_kernel`、pending RX、lease、handoff、`tx_in_flight`、quarantine、和はRX pool size）で返します。
+Fillへpublishしたframeはkernelが返すかsocketがcloseするまでkernelのもので、shutdownでは想定どおりです
+（drain後もpollはRXを処理してfree listへ戻します）。engineは時計を持たないため、callerが`rounds`と
+再呼出し（間にsleep）でtimeoutを決めます。
+
+**audit**: `audit()`はXDP-080に加え、in-flight listの各entryが`TxOwnedByKernel`のexact tokenで重複
+せず他のlistにも無いこと、listと`TxOwnedByKernel`数とgauge `tx_inflight`の一致、in-flight ≤ TX
+capacity、owner partitionの和がRX pool sizeであることを検査します。すなわち各frameがちょうど一回
+数えられていることを確かめます。
+
+**counter**（`TxCounters`、OBS-018のTX/Completion半分）: `tx_submitted`、`tx_ring_full`、
+`tx_inflight_limited`、`tx_refused_draining`、`tx_completed`、`tx_completions_reordered`、
+`completion_backlogged`、`tx_invalid_completion(reason)`、`tx_need_wakeup`、`tx_flag_errors`、
+`tx_kicks`、`fill_kicks`、`kicks_deferred`、`kick_errors`、`drains`、gauge `tx_inflight`と
+`tx_inflight_highwater`。hot pathは整数更新だけでledgerをscanしません。
+
+testはscripted heap kernelをTX consume（同じframeの二重submitやFill publish中のTX submitでfail）と
+completion produce、kick記録/errno注入へ拡張して行います。partial/full ring、in-flight上限とcompletion
+lag、短いfree listでの前進、順序違いcompletion、UMEM外/重複/Fill所有/generated pool/address違いの
+completion、need-wakeupとerrno mapping、kernelが保持したままのdrainと二度目のdrain、foreign handoff、
+setup拒否、corrupt cursor、in-flight listのaudit、各step後のdeep audit、steady-stateのallocation zero、
+io-xdp `FakeKernel`のTX lifecycleとのdifferential（modelの`CompletionAvailable`はengineがringを
+読むまで`TxOwnedByKernel`へ射影）を検証します。privileged smokeのtx phaseは専用netns veth上で
+peerのARP requestを同じUMEM frameのままin-placeでARP replyへ書き換え、同じvethからTXし、peer kernelが
+`ip neigh`にreplyのMACを学習することで受信を確かめ、completionをreapし、`Drained`のdrain後にcloseします
+（XDP-091〜111）。core `PacketIo` adapter、generated poolのTX（X03）、kick policy、health化、runtime
+statsはX03/X04です（XDP-112）。

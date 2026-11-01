@@ -25,7 +25,7 @@ use crate::{
     NativeSyscallPlatformError,
 };
 
-use super::mmap::BorrowedMmap;
+use super::{kick::KickTarget, mmap::BorrowedMmap};
 
 /// Pinned source profile for architecture-dependent syscall constants.
 const SYSCALL_ABI_PROFILE: &str =
@@ -368,6 +368,11 @@ pub(super) trait Syscalls: sealed::Sealed {
     /// `bpf(BPF_LINK_CREATE)` with `attach_type = BPF_XDP` on `ifindex`;
     /// returns an owned CLOEXEC link fd.
     fn bpf_link_create(&self, prog_fd: RawFd, ifindex: u32, flags: u32) -> Result<RawFd, Errno>;
+    /// The kick target a datapath bundle borrows for `fd`'s socket. Only
+    /// `SessionCore::take_datapath` calls this.
+    fn datapath_kick<'a>(fd: &'a OwnedXdpFd<'a, Self>) -> KickTarget<'a>
+    where
+        Self: Sized;
 }
 
 /// Seam whose successful `mmap` results are real process mappings.
@@ -502,6 +507,11 @@ impl Syscalls for LinuxSyscalls {
     }
 
     fn poll(&self, descriptor: &mut PollDescriptor, timeout_millis: c_int) -> Result<u32, Errno> {
+        // Always-on argument check: never hand libc a negative fd, which
+        // `poll` would silently ignore.
+        if descriptor.fd < 0 {
+            return Err(Errno::ArgumentRejected);
+        }
         let mut raw = ffi::PollFd {
             fd: descriptor.fd,
             events: descriptor.events,
@@ -516,6 +526,9 @@ impl Syscalls for LinuxSyscalls {
     }
 
     fn send_to_wakeup(&self, fd: RawFd) -> Result<(), Errno> {
+        if fd < 0 {
+            return Err(Errno::ArgumentRejected);
+        }
         // SAFETY: Linux AF_XDP wakeup uses a zero-length datagram with null
         // buffer and destination. No memory is read through either null.
         let result =
@@ -631,6 +644,10 @@ impl Syscalls for LinuxSyscalls {
         // the passed length; the kernel only reads it.
         let result = unsafe { attr.call(bpf::BPF_LINK_CREATE) };
         result_from_fd(result)
+    }
+
+    fn datapath_kick<'a>(fd: &'a OwnedXdpFd<'a, Self>) -> KickTarget<'a> {
+        KickTarget::Live(fd)
     }
 }
 
@@ -758,6 +775,11 @@ impl<'syscalls, S: Syscalls> OwnedXdpFd<'syscalls, S> {
 
     fn raw(&self) -> RawFd {
         self.fd.expect("owned fd is active")
+    }
+
+    /// Whether the fd is still owned (not yet closed).
+    pub(super) const fn is_active(&self) -> bool {
+        self.fd.is_some()
     }
 
     /// The seam this fd releases through, for creating related objects.
@@ -1532,6 +1554,10 @@ mod tests {
             });
             self.result(SyscallStage::CreateBpfLink).map(|()| 32)
         }
+
+        fn datapath_kick<'a>(_fd: &'a OwnedXdpFd<'a, Self>) -> KickTarget<'a> {
+            unreachable!("the resource seam fake never lends a datapath")
+        }
     }
 
     fn assert_static_syscalls<T: Syscalls>() {}
@@ -2166,6 +2192,16 @@ mod tests {
             Err(Errno::ArgumentRejected)
         );
         assert_eq!(linux.bpf_link_create(3, 0, 4), Err(Errno::ArgumentRejected));
+    }
+
+    #[test]
+    fn native_kick_linux_seam_rejects_negative_fd_before_ffi() {
+        // Always on: the kick path never hands libc a negative fd (`poll`
+        // would silently ignore it and report nothing ready).
+        let linux = LinuxSyscalls;
+        assert_eq!(linux.send_to_wakeup(-1), Err(Errno::ArgumentRejected));
+        let mut descriptor = PollDescriptor::new(-1, 1);
+        assert_eq!(linux.poll(&mut descriptor, 0), Err(Errno::ArgumentRejected));
     }
 
     #[test]

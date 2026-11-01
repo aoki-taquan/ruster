@@ -1,7 +1,10 @@
 //! RX/Fill half of the AF_XDP datapath engine (M2 S3, X01).
 //!
 //! One worker owns one [`RxFillEngine`]: the Fill producer, the RX
-//! consumer, the UMEM, and the authoritative frame ledger. Nothing here
+//! consumer, the TX producer, the Completion consumer, the socket's kick
+//! handle, the UMEM, and the authoritative frame ledger. The TX/Completion
+//! half (M2 S4, X02) lives in the `tx_completion` child module and shares
+//! this one ledger. Nothing here
 //! locks, allocates after construction, clones packets, or formats a
 //! string. The engine is generic over ring memory only through the
 //! [`DatapathRings`] bundle it consumes: a live [`crate::NativeSession`]
@@ -17,7 +20,16 @@
 //! refill republishes it) or by handing it to TX (`PendingTx`, see
 //! [`TxHandoff`]). An invalid descriptor never reaches the caller.
 
+#[path = "tx_completion.rs"]
+mod tx_completion;
+
 use std::{fmt, num::NonZeroU32};
+
+use tx_completion::InflightFifo;
+pub use tx_completion::{
+    CompletionInvalidReason, CompletionLag, CompletionReport, DrainOutcome, DrainReport,
+    FrameAccounting, TxBlocked, TxCounters, TxRejected, TxRejection, TxSubmitError, TxSubmitReport,
+};
 
 use ruster_io_xdp::{
     AuditError, FrameId, FrameLedger, FrameStateKind, FrameToken, LayoutError, LedgerError,
@@ -27,7 +39,10 @@ use ruster_io_xdp::{
 use crate::{
     abi::XdpDescriptor,
     datapath::{DatapathParts, DatapathRings},
-    native_unsafe::umem::{UmemFrames, UmemPairingError},
+    native_unsafe::{
+        kick::SocketKick,
+        umem::{UmemFrames, UmemPairingError},
+    },
     CompletionConsumer, FillProducer, NativeRingError, NeedWakeup, RxConsumer, TxProducer,
     XDP_PACKET_HEADROOM,
 };
@@ -55,11 +70,13 @@ pub enum RxInvalidReason {
     /// kernel-owned frame is quarantined.
     DataBeforeHeadroom,
     /// Shorter than [`ETHERNET_HEADER_LEN`], including zero. The kernel
-    /// returned the frame correctly (address and headroom in profile) with
-    /// an unusable packet, so the frame is recycled, not quarantined.
+    /// returned the frame correctly (address, headroom, and chunk bound in
+    /// profile) with an unusable packet, so the frame is recycled, not
+    /// quarantined.
     ShorterThanEthernetHeader,
-    /// The visible range ends beyond the frame (chunk). The kernel-owned
-    /// frame is quarantined.
+    /// The visible range ends beyond the frame (chunk), whatever its
+    /// length. Checked before the runt check, so out-of-profile geometry is
+    /// always quarantined. The kernel-owned frame is quarantined.
     ExceedsFrame,
 }
 
@@ -125,6 +142,8 @@ pub struct RxFillCounters {
     pub rx_tx_handoffs: u64,
     /// TX handoffs cancelled back to the free list.
     pub tx_handoffs_cancelled: u64,
+    /// Refills that published nothing because a drain started.
+    pub fill_suppressed_draining: u64,
     /// Polls that wanted RX descriptors, had none pending, and found the RX
     /// ring empty.
     pub rx_ring_empty: u64,
@@ -142,8 +161,8 @@ pub struct RxFillCounters {
     /// Refills whose Fill flags word had unknown bits.
     pub fill_flag_errors: u64,
     /// Frames permanently removed from reuse (out-of-profile kernel return
-    /// or generation exhaustion). This, not starvation, is where pool
-    /// shrinkage is observed.
+    /// on RX or Completion, or generation exhaustion). This, not
+    /// starvation, is where pool shrinkage is observed.
     pub frames_quarantined: u64,
     /// Runt frames (shorter than an Ethernet header) recycled to the pool.
     pub rx_runts_recycled: u64,
@@ -166,11 +185,11 @@ impl RxFillCounters {
     }
 }
 
-fn bump(counter: &mut u64) {
+pub(super) fn bump(counter: &mut u64) {
     *counter = counter.saturating_add(1);
 }
 
-fn add(counter: &mut u64, value: u32) {
+pub(super) fn add(counter: &mut u64, value: u32) {
     *counter = counter.saturating_add(u64::from(value));
 }
 
@@ -215,6 +234,18 @@ pub enum RxFillSetupError {
     FillRingNotEmpty,
     /// The RX ring already holds descriptors that no ledger tracks.
     RxRingNotEmpty,
+    /// The TX ring already holds descriptors that no ledger tracks.
+    TxRingNotEmpty,
+    /// The Completion ring already holds entries that no ledger tracks.
+    CompletionRingNotEmpty,
+    /// The Completion ring is smaller than the TX ring, so in-flight TX
+    /// (bounded by the TX capacity) could outgrow the completion slots.
+    CompletionSmallerThanTx {
+        /// TX ring capacity.
+        tx: u32,
+        /// Completion ring capacity.
+        completion: u32,
+    },
     /// A ring cursor was corrupt, or the initial refill failed.
     Ring(NativeRingError),
 }
@@ -281,6 +312,34 @@ pub enum RxFillAuditError {
         frame: u32,
         /// Observed state.
         state: FrameStateKind,
+    },
+    /// An in-flight entry is duplicated, listed in another engine list, or
+    /// not the exact `TxOwnedByKernel` owner of its frame.
+    InflightEntry {
+        /// Offending frame index.
+        frame: u32,
+    },
+    /// The in-flight list does not hold exactly the `TxOwnedByKernel`
+    /// frames, or the in-flight gauge disagrees with it.
+    InflightCount {
+        /// Entries in the in-flight list.
+        listed: u32,
+        /// `TxOwnedByKernel` frames in the ledger.
+        in_flight: u32,
+    },
+    /// In-flight TX exceeds the TX ring capacity (BACKEND-004).
+    InflightExceedsLimit {
+        /// Frames in flight.
+        in_flight: u32,
+        /// TX ring capacity.
+        limit: u32,
+    },
+    /// The owner partition of the RX pool does not sum to the pool size.
+    Accounting {
+        /// Sum over all owners.
+        accounted: u32,
+        /// RX pool size.
+        rx_frames: u32,
     },
 }
 
@@ -419,6 +478,11 @@ struct EngineState<'memory> {
     pending: TokenFifo,
     scratch: Box<[Option<FrameToken>]>,
     counters: RxFillCounters,
+    /// Published, not yet completed TX frames, in submission order.
+    inflight: InflightFifo,
+    tx_counters: TxCounters,
+    /// Set by `drain`: no new TX or Fill publication, ever again.
+    draining: bool,
     fill_batch: u32,
     rx_frames: u32,
     frame_size: u64,
@@ -466,14 +530,16 @@ impl EngineState<'_> {
         if offset < self.headroom {
             return quarantine(RxInvalidReason::DataBeforeHeadroom);
         }
+        // Chunk overflow before the runt check: an out-of-profile range is
+        // quarantined even when it is also short.
+        if offset + u64::from(raw.len) > self.frame_size {
+            return quarantine(RxInvalidReason::ExceedsFrame);
+        }
         if raw.len < ETHERNET_HEADER_LEN {
             return Err((
                 RxInvalidReason::ShorterThanEthernetHeader,
                 Refusal::Recycle(token),
             ));
-        }
-        if offset + u64::from(raw.len) > self.frame_size {
-            return quarantine(RxInvalidReason::ExceedsFrame);
         }
         match ledger.layout().validate_descriptor(RawDescriptor {
             addr: raw.address,
@@ -560,12 +626,11 @@ impl EngineState<'_> {
 pub struct RxFillEngine<'memory> {
     fill: FillProducer<'memory>,
     rx: RxConsumer<'memory>,
-    /// Owned, unused until the TX/Completion half (S4): holding them means
-    /// no one else can submit a TX descriptor naming a lent frame.
-    #[allow(dead_code)]
+    /// Owned by the engine alone: no one else can submit a TX descriptor
+    /// naming a frame of this ledger.
     tx: TxProducer<'memory>,
-    #[allow(dead_code)]
     completion: CompletionConsumer<'memory>,
+    kick: SocketKick<'memory>,
     state: EngineState<'memory>,
     initial_refill: RefillReport,
 }
@@ -577,8 +642,9 @@ impl<'memory> RxFillEngine<'memory> {
     ///
     /// Frames `0..rx_frames` form the RX pool. The generated pool
     /// `rx_frames..frame_count` is never published or lent by this engine.
-    /// The Fill and RX rings must be empty, a defensive check on top of the
-    /// once-per-session bundle.
+    /// All four rings must be empty, a defensive check on top of the
+    /// once-per-session bundle, and the Completion ring must be at least as
+    /// large as the TX ring, which bounds in-flight TX.
     pub fn new(
         datapath: DatapathRings<'memory>,
         domain: UmemDomainId,
@@ -591,6 +657,7 @@ impl<'memory> RxFillEngine<'memory> {
             tx,
             umem,
             umem_config: geometry,
+            kick,
         } = datapath.into_parts();
         let fill_batch = config.fill_batch().get();
         if fill_batch > fill.capacity() {
@@ -604,6 +671,18 @@ impl<'memory> RxFillEngine<'memory> {
         }
         if rx.available().map_err(RxFillSetupError::Ring)? != 0 {
             return Err(RxFillSetupError::RxRingNotEmpty);
+        }
+        if completion.capacity() < tx.capacity() {
+            return Err(RxFillSetupError::CompletionSmallerThanTx {
+                tx: tx.capacity(),
+                completion: completion.capacity(),
+            });
+        }
+        if tx.free_slots().map_err(RxFillSetupError::Ring)? != tx.capacity() {
+            return Err(RxFillSetupError::TxRingNotEmpty);
+        }
+        if completion.available().map_err(RxFillSetupError::Ring)? != 0 {
+            return Err(RxFillSetupError::CompletionRingNotEmpty);
         }
         let headroom = geometry.headroom() + XDP_PACKET_HEADROOM;
         let layout = UmemLayout::new(
@@ -626,6 +705,9 @@ impl<'memory> RxFillEngine<'memory> {
             pending: TokenFifo::new(rx.capacity()),
             scratch: vec![None; fill.capacity() as usize].into_boxed_slice(),
             counters: RxFillCounters::default(),
+            inflight: InflightFifo::new(tx.capacity()),
+            tx_counters: TxCounters::default(),
+            draining: false,
             fill_batch,
             rx_frames: geometry.rx_frames(),
             frame_size: u64::from(geometry.frame_size()),
@@ -637,6 +719,7 @@ impl<'memory> RxFillEngine<'memory> {
             rx,
             tx,
             completion,
+            kick,
             state,
             initial_refill: RefillReport {
                 published: 0,
@@ -664,8 +747,8 @@ impl<'memory> RxFillEngine<'memory> {
         self.fill.need_wakeup()
     }
 
-    /// Frames handed to TX and not yet cancelled (or, from S4, published):
-    /// the ledger's `PendingTx` count. A `TxHandoff` dropped without either
+    /// Frames handed to TX and neither submitted nor cancelled: the
+    /// ledger's `PendingTx` count. A `TxHandoff` dropped without either
     /// stays counted here forever.
     #[must_use]
     pub fn tx_handoffs_outstanding(&self) -> u32 {
@@ -683,7 +766,8 @@ impl<'memory> RxFillEngine<'memory> {
     /// the ring's room.
     ///
     /// An empty free list with room in Fill is counted as starvation and
-    /// returns immediately; it never blocks other work.
+    /// returns immediately; it never blocks other work. After
+    /// [`Self::drain`] nothing is published.
     pub fn refill(&mut self) -> Result<RefillReport, RxFillError> {
         let (published, starved) = self.publish_fill()?;
         let need_wakeup = self.fill.need_wakeup();
@@ -702,6 +786,10 @@ impl<'memory> RxFillEngine<'memory> {
 
     /// Returns `(published, starved)`.
     fn publish_fill(&mut self) -> Result<(u32, bool), RxFillError> {
+        if self.state.draining {
+            bump(&mut self.state.counters.fill_suppressed_draining);
+            return Ok((0, false));
+        }
         let room = self.fill.free_slots().map_err(RxFillError::Ring)?;
         let state = &mut self.state;
         if room == 0 {
@@ -770,15 +858,20 @@ impl<'memory> RxFillEngine<'memory> {
         Ok((count, false))
     }
 
-    /// Refills Fill, then consumes at most `budget` RX descriptors and
-    /// returns a batch that lends at most `budget` valid frames.
+    /// Reaps completions, refills Fill, then consumes at most `budget` RX
+    /// descriptors and returns a batch that lends at most `budget` valid
+    /// frames.
     ///
-    /// Valid frames left unlent when the batch drops stay pending and are
-    /// lent by the next poll before any new descriptor is consumed, so one
-    /// poll never does more than `budget` descriptor work. A zero budget
-    /// only refills and never observes the RX ring.
+    /// The reap comes first and is bounded by the TX capacity (the most
+    /// frames that can be in flight), so completed TX frames are back in
+    /// the free list before this refill (BACKEND-004). Valid frames left
+    /// unlent when the batch drops stay pending and are lent by the next
+    /// poll before any new descriptor is consumed, so one poll never does
+    /// more than `budget` RX descriptor work. A zero budget reaps and
+    /// refills only and never observes the RX ring.
     pub fn poll(&mut self, budget: u32) -> Result<RxBatch<'_, 'memory>, RxFillError> {
         bump(&mut self.state.counters.polls);
+        let completions = self.reap_completions(self.tx.capacity())?;
         let refill = self.refill()?;
         let pending = self.state.pending.len();
         let budget_len = budget as usize;
@@ -806,6 +899,7 @@ impl<'memory> RxFillEngine<'memory> {
             engine: self,
             remaining,
             refill,
+            completions,
         })
     }
 
@@ -821,13 +915,27 @@ impl<'memory> RxFillEngine<'memory> {
         acquisition.release_consume().map_err(RxFillError::Ring)
     }
 
-    /// Returns a TX handoff that will not be transmitted to the free list.
-    pub fn cancel_tx_handoff(&mut self, handoff: TxHandoff) -> Result<(), RxFillError> {
+    /// Returns a TX handoff that will not be transmitted to the free list
+    /// (the next refill republishes its frame to Fill).
+    ///
+    /// The handoff is verified against the ledger before it is consumed: a
+    /// handoff of another engine (or one whose geometry this ledger does
+    /// not validate) comes back unchanged with the error.
+    // Boxing the refusal would allocate; the handoff must come back intact.
+    #[allow(clippy::result_large_err)]
+    pub fn cancel_tx_handoff(
+        &mut self,
+        handoff: TxHandoff,
+    ) -> Result<(), (RxFillError, TxHandoff)> {
+        if let Err(error) = self.state.verify_handoff(&handoff) {
+            return Err((RxFillError::Ledger(error), handoff));
+        }
         let token = handoff.defuse();
-        let ledger = self.state.frames.ledger_mut();
-        ledger
+        self.state
+            .frames
+            .ledger_mut()
             .cancel_pending_tx(token)
-            .map_err(RxFillError::Ledger)?;
+            .expect("verified PendingTx with this token");
         self.state.recycle(token);
         bump(&mut self.state.counters.tx_handoffs_cancelled);
         Ok(())
@@ -863,10 +971,16 @@ impl<'memory> RxFillEngine<'memory> {
         self.state.rx_frames
     }
 
-    /// Cold full consistency check of ledger, free list, and pending list.
+    /// Cold full consistency check of the ledger and every engine list.
     ///
-    /// It runs only between batches (it borrows the engine shared, so no
-    /// frame can be lent) and allocates one bitmap.
+    /// Every RX-pool frame must be accounted for exactly once: each listed
+    /// frame appears in exactly one of the free, pending-RX, and in-flight
+    /// lists, in the matching ledger state with the exact token; each
+    /// ledger state that has a list is listed completely; and the owner
+    /// partition ([`Self::frame_accounting`]) sums to the pool size.
+    /// In-flight TX must not exceed the TX capacity. It runs only between
+    /// batches (it borrows the engine shared, so no frame can be lent) and
+    /// allocates one bitmap.
     pub fn audit(&self) -> Result<(), RxFillAuditError> {
         let ledger = self.state.frames.ledger();
         ledger.deep_audit().map_err(RxFillAuditError::Ledger)?;
@@ -892,8 +1006,21 @@ impl<'memory> RxFillEngine<'memory> {
                 _ => return Err(RxFillAuditError::PendingEntry { frame }),
             }
         }
+        for entry in self.state.inflight.iter() {
+            let frame = entry.token.frame().index();
+            let entry_slot = seen.get_mut(frame as usize);
+            let in_flight = ledger.state(frame).is_ok_and(|state| {
+                state.kind() == FrameStateKind::TxOwnedByKernel
+                    && state.token() == Some(entry.token)
+            });
+            match entry_slot {
+                Some(seen) if !*seen && in_flight && frame < self.state.rx_frames => *seen = true,
+                _ => return Err(RxFillAuditError::InflightEntry { frame }),
+            }
+        }
         let mut free = 0_u32;
         let mut available = 0_u32;
+        let mut in_flight = 0_u32;
         for frame in 0..ledger.layout().frame_count() {
             let kind = ledger
                 .state(frame)
@@ -905,6 +1032,7 @@ impl<'memory> RxFillEngine<'memory> {
                 FrameStateKind::FillOwnedByKernel
                 | FrameStateKind::RxAvailable
                 | FrameStateKind::PendingTx
+                | FrameStateKind::TxOwnedByKernel
                 | FrameStateKind::Quarantined => in_pool,
                 _ => false,
             };
@@ -917,6 +1045,9 @@ impl<'memory> RxFillEngine<'memory> {
             if kind == FrameStateKind::RxAvailable {
                 available += 1;
             }
+            if kind == FrameStateKind::TxOwnedByKernel {
+                in_flight += 1;
+            }
         }
         let listed = self.free_frames();
         if listed != free {
@@ -925,6 +1056,21 @@ impl<'memory> RxFillEngine<'memory> {
         let listed = self.pending_rx();
         if listed != available {
             return Err(RxFillAuditError::PendingCount { listed, available });
+        }
+        let listed = self.tx_inflight();
+        if listed != in_flight || self.state.tx_counters.tx_inflight != listed {
+            return Err(RxFillAuditError::InflightCount { listed, in_flight });
+        }
+        let limit = self.tx_inflight_limit();
+        if in_flight > limit {
+            return Err(RxFillAuditError::InflightExceedsLimit { in_flight, limit });
+        }
+        let accounting = self.state.accounting();
+        if accounting.total() != self.state.rx_frames {
+            return Err(RxFillAuditError::Accounting {
+                accounted: accounting.total(),
+                rx_frames: self.state.rx_frames,
+            });
         }
         Ok(())
     }
@@ -937,7 +1083,10 @@ impl fmt::Debug for RxFillEngine<'_> {
             .field("frames", &self.state.frames)
             .field("free", &self.state.free.len())
             .field("pending", &self.state.pending.len())
+            .field("inflight", &self.state.inflight.len())
+            .field("draining", &self.state.draining)
             .field("counters", &self.state.counters)
+            .field("tx_counters", &self.state.tx_counters)
             .finish_non_exhaustive()
     }
 }
@@ -947,6 +1096,7 @@ pub struct RxBatch<'engine, 'memory> {
     engine: &'engine mut RxFillEngine<'memory>,
     remaining: usize,
     refill: RefillReport,
+    completions: CompletionReport,
 }
 
 impl<'memory> RxBatch<'_, 'memory> {
@@ -981,6 +1131,11 @@ impl<'memory> RxBatch<'_, 'memory> {
     /// The refill that preceded this batch.
     pub const fn refill(&self) -> RefillReport {
         self.refill
+    }
+
+    /// The completion reap that preceded the refill.
+    pub const fn completions(&self) -> CompletionReport {
+        self.completions
     }
 }
 
@@ -1059,9 +1214,10 @@ impl RxFrame<'_, '_> {
         bump(&mut self.engine.state.counters.rx_recycled);
     }
 
-    /// Hands the frame to TX (`PendingTx`). The TX/Completion half (S4)
-    /// publishes it; until then [`RxFillEngine::cancel_tx_handoff`] returns
-    /// it to the free list.
+    /// Hands the frame to TX (`PendingTx`) with the bytes as rewritten in
+    /// place and the received length. [`RxFillEngine::submit_tx`] (or
+    /// [`RxFillEngine::submit_tx_batch`]) publishes it;
+    /// [`RxFillEngine::cancel_tx_handoff`] returns it to the free list.
     pub fn stage_tx(mut self) -> TxHandoff {
         self.resolved = true;
         self.engine
@@ -1097,15 +1253,15 @@ impl fmt::Debug for RxFrame<'_, '_> {
     }
 }
 
-/// A received frame staged for TX: the hook point of the TX half (S4).
+/// A received frame staged for TX.
 ///
 /// Move-only and without a public constructor. The frame stays
-/// `PendingTx` in the ledger until TX publishes it or
-/// [`RxFillEngine::cancel_tx_handoff`] returns it. Dropping the value
-/// strands the frame (it never becomes reusable): it is `must_use`, a debug
-/// build asserts on such a drop, and
-/// [`RxFillEngine::tx_handoffs_outstanding`] keeps counting it. S4 must
-/// consume every handoff through an engine method.
+/// `PendingTx` in the ledger until [`RxFillEngine::submit_tx`] publishes it
+/// or [`RxFillEngine::cancel_tx_handoff`] returns it; a refused submission
+/// or cancel hands the value back. Dropping the value strands the frame
+/// (it never becomes reusable): it is `must_use`, a debug build asserts on
+/// such a drop, and [`RxFillEngine::tx_handoffs_outstanding`] keeps
+/// counting it.
 #[must_use = "a dropped TX handoff strands its frame in PendingTx"]
 #[derive(Debug)]
 pub struct TxHandoff {
