@@ -491,14 +491,22 @@ fn rx_fill_frame_cannot_be_recycled_twice_or_while_not_lent() {
     engine.cancel_tx_handoff(handoff).expect("first cancel");
     let before = snapshot(engine.ledger());
     let free = engine.free_frames();
+    // The refusal is verified before the handoff is consumed, so the
+    // duplicate comes back intact.
+    let (error, returned) = engine
+        .cancel_tx_handoff(duplicate)
+        .expect_err("duplicate refused");
     assert!(matches!(
-        engine.cancel_tx_handoff(duplicate),
-        Err(RxFillError::Ledger(LedgerError::WrongState {
+        error,
+        RxFillError::Ledger(LedgerError::WrongState {
             expected: FrameStateKind::PendingTx,
             actual: FrameStateKind::Free,
             ..
-        }))
+        })
     ));
+    assert_eq!(returned.token(), token);
+    // A forged copy owns no frame, so forgetting it strands nothing.
+    std::mem::forget(returned);
     assert_eq!(engine.raw_recycle_for_test(token).map_err(|_| ()), Err(()));
     assert_eq!(snapshot(engine.ledger()), before);
     assert_eq!(engine.free_frames(), free);

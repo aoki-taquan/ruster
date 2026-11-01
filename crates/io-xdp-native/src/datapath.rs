@@ -36,15 +36,19 @@
 use std::{error::Error, fmt};
 
 use crate::{
-    native_unsafe::umem::UmemMapping, CompletionConsumer, FillProducer, RingMapError, RxConsumer,
-    TxProducer, UmemConfig,
+    native_unsafe::{kick::SocketKick, umem::UmemMapping},
+    CompletionConsumer, FillProducer, RingMapError, RxConsumer, TxProducer, UmemConfig,
 };
 
 /// All datapath resources of one session, taken once.
 ///
 /// Obtained only from `NativeSession::take_datapath` (or, in this crate's
 /// tests, from the scripted heap kernel as one bundle) and consumed whole by
-/// [`crate::RxFillEngine::new`].
+/// [`crate::RxFillEngine::new`]. Besides the four rings and the UMEM it
+/// carries the socket's kick handle: a shared borrow of the session's
+/// socket that can only `sendto` (TX wakeup) and `poll` (Fill wakeup), so
+/// the engine can answer `XDP_RING_NEED_WAKEUP` while the bundle keeps the
+/// session borrowed.
 pub struct DatapathRings<'session> {
     fill: FillProducer<'session>,
     completion: CompletionConsumer<'session>,
@@ -52,6 +56,7 @@ pub struct DatapathRings<'session> {
     tx: TxProducer<'session>,
     umem: UmemMapping<'session>,
     umem_config: UmemConfig,
+    kick: SocketKick<'session>,
 }
 
 /// The members of one bundle, moved into the engine together.
@@ -62,6 +67,7 @@ pub(crate) struct DatapathParts<'session> {
     pub(crate) tx: TxProducer<'session>,
     pub(crate) umem: UmemMapping<'session>,
     pub(crate) umem_config: UmemConfig,
+    pub(crate) kick: SocketKick<'session>,
 }
 
 impl<'session> DatapathRings<'session> {
@@ -84,6 +90,7 @@ impl<'session> DatapathRings<'session> {
             tx,
             umem,
             umem_config,
+            kick,
         } = parts;
         Self {
             fill,
@@ -92,6 +99,7 @@ impl<'session> DatapathRings<'session> {
             tx,
             umem,
             umem_config,
+            kick,
         }
     }
 
@@ -103,6 +111,7 @@ impl<'session> DatapathRings<'session> {
             tx,
             umem,
             umem_config,
+            kick,
         } = self;
         DatapathParts {
             fill,
@@ -111,6 +120,7 @@ impl<'session> DatapathRings<'session> {
             tx,
             umem,
             umem_config,
+            kick,
         }
     }
 

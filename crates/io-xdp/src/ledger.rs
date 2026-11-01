@@ -387,6 +387,22 @@ impl FrameLedger {
         )
     }
 
+    /// Permanently removes a kernel-owned TX frame from reuse.
+    ///
+    /// A native engine calls this when the kernel returned a completion
+    /// that names the frame but not the exact descriptor address that was
+    /// submitted (out of profile). Whether the kernel still reads the frame
+    /// is unknown, so it is neither recycled nor lent again. The token keeps
+    /// its generation; the frame stays [`FrameStateKind::Quarantined`] for
+    /// the ledger lifetime.
+    pub fn quarantine_kernel_tx(&mut self, token: FrameToken) -> Result<(), LedgerError> {
+        self.transition(
+            token,
+            FrameStateKind::TxOwnedByKernel,
+            FrameState::Quarantined(Some(token)),
+        )
+    }
+
     /// Recycles a completed TX frame.
     pub fn recycle_completion(&mut self, token: FrameToken) -> Result<(), LedgerError> {
         self.transition(token, FrameStateKind::CompletionAvailable, FrameState::Free)
@@ -570,6 +586,15 @@ impl FrameLedger {
         Ok(index)
     }
 
+    /// Checks, without mutation, that `token` is the exact current owner
+    /// of its frame (same domain and generation) in state `expected`.
+    ///
+    /// A native engine uses this to validate a capability before it
+    /// consumes it, so a refused capability can be handed back intact.
+    pub fn check(&self, token: FrameToken, expected: FrameStateKind) -> Result<(), LedgerError> {
+        self.verify(token, expected).map(|_| ())
+    }
+
     pub(crate) fn verify_state(
         &self,
         token: FrameToken,
@@ -606,14 +631,24 @@ impl FrameLedger {
         Ok(index)
     }
 
-    /// Test hook: sets the generation of a `Free` frame, so generation
-    /// exhaustion can be exercised without 2^64 cycles. Available only with
-    /// the `test-hooks` feature, which is not part of the supported API.
+    /// Test hook: moves the generation of a `Free` frame forward, so
+    /// generation exhaustion can be exercised without 2^64 cycles. Available
+    /// only with the `test-hooks` feature, which is not part of the
+    /// supported API.
+    ///
+    /// # Panics
+    ///
+    /// If the frame is not `Free` or `generation` is below the current
+    /// generation: moving it back could reissue a token of an earlier cycle.
     #[cfg(any(test, feature = "test-hooks"))]
     #[doc(hidden)]
     pub fn set_free_generation_for_test(&mut self, frame_index: u32, generation: u64) {
         let index = self.index(frame_index).expect("test frame");
         assert_eq!(self.entries[index].state, FrameState::Free);
+        assert!(
+            generation >= self.entries[index].generation,
+            "a test generation may only move forward"
+        );
         self.entries[index].generation = generation;
     }
 }

@@ -1,6 +1,7 @@
 #!/bin/sh
 # Privileged AF_XDP smoke: native session (M2 S1, X00C), XDP program /
-# bpf_link lifecycle (M2 S2, X00D), and the RX/Fill engine (M2 S3, X01).
+# bpf_link lifecycle (M2 S2, X00D), the RX/Fill engine (M2 S3, X01), and
+# same-frame TX/Completion with shutdown drain (M2 S4, X02).
 #
 # Builds the test binary as the invoking user, then with `sudo -n` creates a
 # dedicated network namespace holding its own two-queue veth pair, runs the
@@ -12,11 +13,16 @@
 # runs under `ip netns exec`. Any missing privilege or tool fails.
 #
 # Phases:
-#   session  copy/auto session, EBUSY/EINVAL/ENODEV (X00C)
+#   session  copy/auto session, EBUSY, ENODEV, and the TX queue check: a
+#            queue without a TX queue (on the 2/2 veth and on an RX 4 / TX 2
+#            veth) is refused before bind (X00C, X02)
 #   attach   native attach, peer frame reaches the RX ring, second attach
 #            refused with ExistingProgram, detach, generic attach, close
 #   engine   RX/Fill engine over the live mappings: peer frames pass
 #            descriptor validation and are lent, recycled, and refilled (X01)
+#   tx       the peer's ARP request is rewritten in place into a reply,
+#            transmitted from the same UMEM frame out the same veth, learned
+#            by the peer (ip neigh), completed, and drained on close (X02)
 #   foreign  a netlink-attached xdpgeneric program loaded with `ip` is
 #            refused in both modes and left untouched (same program id)
 #   holder   attach in a separate process, SIGKILL it, link auto-detaches
@@ -49,6 +55,8 @@ suffix=$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')
 netns="ruster-x00c-$$-$suffix"
 device=rx00c0
 peer=rx00c1
+asym=rx00c2
+asym_peer=rx00c3
 work=$(mktemp -d "${TMPDIR:-/tmp}/ruster-priv-xdp.XXXXXX")
 binary_path=$(readlink -f "$binary")
 holder_pid=
@@ -101,6 +109,11 @@ sudo -n ip -n "$netns" link add "$device" numtxqueues 2 numrxqueues 2 type veth 
     peer name "$peer" numtxqueues 2 numrxqueues 2
 sudo -n ip -n "$netns" link set "$device" up
 sudo -n ip -n "$netns" link set "$peer" up
+# RX 4 / TX 2: queues 2 and 3 have RX but no TX (also only inside netns).
+sudo -n ip -n "$netns" link add "$asym" numtxqueues 2 numrxqueues 4 type veth \
+    peer name "$asym_peer" numtxqueues 4 numrxqueues 2
+sudo -n ip -n "$netns" link set "$asym" up
+sudo -n ip -n "$netns" link set "$asym_peer" up
 # TEST-NET-1 source for frames sent from the peer end; the device itself
 # has no address, so ARP requests go unanswered and repeat.
 sudo -n ip -n "$netns" address add 192.0.2.2/24 dev "$peer"
@@ -116,6 +129,8 @@ run_phase() {
         RUSTER_PRIV_XDP_PHASE="$phase" \
         RUSTER_PRIV_XDP_NETNS="$netns" \
         RUSTER_PRIV_XDP_DEVICE="$device" \
+        RUSTER_PRIV_XDP_PEER="$peer" \
+        RUSTER_PRIV_XDP_ASYM_DEVICE="$asym" \
         "$binary" --exact "$@" --nocapture --test-threads=1 >"$log" 2>&1 || status=$?
     cat "$log"
     test "$status" -eq 0 || {
@@ -148,6 +163,12 @@ test -z "$(xdp_prog)" || {
 run_phase engine priv_xdp_engine priv_xdp_engine_validates_and_recycles_peer_frames
 test -z "$(xdp_prog)" || {
     echo "priv-xdp-smoke: program left attached after the engine phase" >&2
+    exit 1
+}
+run_phase tx priv_xdp_tx \
+    priv_xdp_tx_reflects_peer_frame_completes_and_drains_on_netns_veth
+test -z "$(xdp_prog)" || {
+    echo "priv-xdp-smoke: program left attached after the tx phase" >&2
     exit 1
 }
 

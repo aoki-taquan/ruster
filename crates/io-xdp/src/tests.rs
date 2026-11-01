@@ -439,3 +439,86 @@ fn kernel_fill_release_frees_the_frame_for_a_new_cycle() {
     assert_eq!(next.generation().get(), token.generation().get() + 1);
     assert_state_and_partition(&ledger, 0, FrameStateKind::FillReserved);
 }
+
+#[test]
+fn kernel_tx_quarantine_is_exact_and_permanent() {
+    let mut ledger = ledger(44, 2);
+    let token = ledger.lease_generated(0).expect("lease");
+    ledger.stage_tx(token).expect("stage");
+    ledger.reserve_tx(token).expect("reserve");
+    // Only a kernel-owned TX frame can be quarantined this way.
+    assert!(matches!(
+        ledger.quarantine_kernel_tx(token),
+        Err(crate::LedgerError::WrongState {
+            expected: FrameStateKind::TxOwnedByKernel,
+            actual: FrameStateKind::TxReserved,
+            ..
+        })
+    ));
+    ledger.publish_tx(token).expect("publish");
+    ledger.quarantine_kernel_tx(token).expect("quarantine");
+    assert_state_and_partition(&ledger, 0, FrameStateKind::Quarantined);
+    assert_eq!(ledger.state(0).expect("frame").token(), Some(token));
+    // The token is dead, and the frame never completes or re-enters a cycle.
+    assert!(ledger.quarantine_kernel_tx(token).is_err());
+    assert!(ledger.complete_tx(token).is_err());
+    assert!(ledger.lease_generated(0).is_err());
+    assert_state_and_partition(&ledger, 0, FrameStateKind::Quarantined);
+
+    // A foreign token never quarantines a frame of this ledger.
+    let mut other = self::ledger(45, 2);
+    let foreign = other.lease_generated(1).expect("foreign lease");
+    let mine = ledger.lease_generated(1).expect("lease");
+    for (owner, token) in [(&mut other, foreign), (&mut ledger, mine)] {
+        owner.stage_tx(token).expect("stage");
+        owner.reserve_tx(token).expect("reserve");
+        owner.publish_tx(token).expect("publish");
+    }
+    assert_eq!(
+        ledger.quarantine_kernel_tx(foreign),
+        Err(crate::LedgerError::ForeignTokenDomain)
+    );
+    assert_state_and_partition(&ledger, 1, FrameStateKind::TxOwnedByKernel);
+}
+
+#[test]
+fn ledger_check_validates_a_capability_without_mutation() {
+    let mut ledger = ledger(47, 2);
+    let token = ledger.lease_generated(0).expect("lease");
+    ledger.stage_tx(token).expect("stage");
+    let before = ledger.counts();
+    assert_eq!(ledger.check(token, FrameStateKind::PendingTx), Ok(()));
+    assert!(matches!(
+        ledger.check(token, FrameStateKind::Leased),
+        Err(crate::LedgerError::WrongState {
+            expected: FrameStateKind::Leased,
+            actual: FrameStateKind::PendingTx,
+            ..
+        })
+    ));
+    let mut other = self::ledger(48, 2);
+    let foreign = other.lease_generated(0).expect("foreign lease");
+    assert_eq!(
+        ledger.check(foreign, FrameStateKind::PendingTx),
+        Err(crate::LedgerError::ForeignTokenDomain)
+    );
+    ledger.cancel_pending_tx(token).expect("cancel");
+    ledger.recycle_lease(token).expect("recycle");
+    let next = ledger.lease_generated(0).expect("next cycle");
+    ledger.stage_tx(next).expect("stage");
+    assert!(matches!(
+        ledger.check(token, FrameStateKind::PendingTx),
+        Err(crate::LedgerError::StaleToken { .. })
+    ));
+    assert_eq!(ledger.counts(), before);
+    assert_partition(&ledger);
+}
+
+#[test]
+#[should_panic(expected = "a test generation may only move forward")]
+fn test_generation_hook_refuses_to_move_backward() {
+    let mut ledger = ledger(46, 1);
+    let token = ledger.reserve_fill(0).expect("fill reserve");
+    ledger.cancel_fill(token).expect("cancel");
+    ledger.set_free_generation_for_test(0, 0);
+}

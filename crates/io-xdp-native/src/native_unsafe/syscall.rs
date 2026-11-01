@@ -25,7 +25,7 @@ use crate::{
     NativeSyscallPlatformError,
 };
 
-use super::mmap::BorrowedMmap;
+use super::{kick::KickTarget, mmap::BorrowedMmap};
 
 /// Pinned source profile for architecture-dependent syscall constants.
 const SYSCALL_ABI_PROFILE: &str =
@@ -318,10 +318,21 @@ pub(super) mod sealed {
     pub trait Sealed {}
 }
 
+/// Whether a device has a TX queue with a given id.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TxQueueProbe {
+    Present,
+    Absent,
+    Unverifiable,
+}
+
 /// Sealed cold-path boundary; generic users are monomorphized, never dynamic.
 pub(super) trait Syscalls: sealed::Sealed {
     /// `if_nametoindex(3)`. `name` is NUL-padded with `name[IFNAMSIZ - 1] == 0`.
     fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno>;
+    /// Whether device `name` (resolved to `ifindex`) has TX queue `queue`.
+    /// Cold path; it may allocate.
+    fn tx_queue_probe(&self, name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQueueProbe;
     fn socket(&self, domain: c_int, kind: c_int, protocol: c_int) -> Result<RawFd, Errno>;
     fn set_socket_option(
         &self,
@@ -368,6 +379,11 @@ pub(super) trait Syscalls: sealed::Sealed {
     /// `bpf(BPF_LINK_CREATE)` with `attach_type = BPF_XDP` on `ifindex`;
     /// returns an owned CLOEXEC link fd.
     fn bpf_link_create(&self, prog_fd: RawFd, ifindex: u32, flags: u32) -> Result<RawFd, Errno>;
+    /// The kick target a datapath bundle borrows for `fd`'s socket. Only
+    /// `SessionCore::take_datapath` calls this.
+    fn datapath_kick<'a>(fd: &'a OwnedXdpFd<'a, Self>) -> KickTarget<'a>
+    where
+        Self: Sized;
 }
 
 /// Seam whose successful `mmap` results are real process mappings.
@@ -399,6 +415,10 @@ impl sealed::Sealed for LinuxSyscalls {}
 unsafe impl MapsRealMemory for LinuxSyscalls {}
 
 impl Syscalls for LinuxSyscalls {
+    fn tx_queue_probe(&self, name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQueueProbe {
+        linux_tx_queue_probe(name, ifindex, queue)
+    }
+
     fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno> {
         if name[IFNAMSIZ - 1] != 0 {
             return Err(Errno::ArgumentRejected);
@@ -502,6 +522,11 @@ impl Syscalls for LinuxSyscalls {
     }
 
     fn poll(&self, descriptor: &mut PollDescriptor, timeout_millis: c_int) -> Result<u32, Errno> {
+        // Always-on argument check: never hand libc a negative fd, which
+        // `poll` would silently ignore.
+        if descriptor.fd < 0 {
+            return Err(Errno::ArgumentRejected);
+        }
         let mut raw = ffi::PollFd {
             fd: descriptor.fd,
             events: descriptor.events,
@@ -516,6 +541,9 @@ impl Syscalls for LinuxSyscalls {
     }
 
     fn send_to_wakeup(&self, fd: RawFd) -> Result<(), Errno> {
+        if fd < 0 {
+            return Err(Errno::ArgumentRejected);
+        }
         // SAFETY: Linux AF_XDP wakeup uses a zero-length datagram with null
         // buffer and destination. No memory is read through either null.
         let result =
@@ -631,6 +659,43 @@ impl Syscalls for LinuxSyscalls {
         // the passed length; the kernel only reads it.
         let result = unsafe { attr.call(bpf::BPF_LINK_CREATE) };
         result_from_fd(result)
+    }
+
+    fn datapath_kick<'a>(fd: &'a OwnedXdpFd<'a, Self>) -> KickTarget<'a> {
+        KickTarget::Live(fd)
+    }
+}
+
+/// Reads sysfs with safe std only. The device name was validated by
+/// `SessionConfig` (ASCII graphic, no `/`, `:`, `.` or `..`), so it is one
+/// path component.
+fn linux_tx_queue_probe(name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQueueProbe {
+    let len = name.iter().position(|byte| *byte == 0).unwrap_or(IFNAMSIZ);
+    let Ok(device) = std::str::from_utf8(&name[..len]) else {
+        return TxQueueProbe::Unverifiable;
+    };
+    if device.is_empty() || device == "." || device == ".." || device.contains('/') {
+        return TxQueueProbe::Unverifiable;
+    }
+    let base = std::path::Path::new("/sys/class/net").join(device);
+    // The sysfs view must describe the device this namespace resolved.
+    let same_device = std::fs::read_to_string(base.join("ifindex"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        == Some(ifindex);
+    if !same_device {
+        return TxQueueProbe::Unverifiable;
+    }
+    let queues = base.join("queues");
+    // Every netdev has tx-0; its absence means an unexpected sysfs layout.
+    if !queues.join("tx-0").is_dir() {
+        return TxQueueProbe::Unverifiable;
+    }
+    match std::fs::metadata(queues.join(format!("tx-{queue}"))) {
+        Ok(metadata) if metadata.is_dir() => TxQueueProbe::Present,
+        Ok(_) => TxQueueProbe::Unverifiable,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => TxQueueProbe::Absent,
+        Err(_) => TxQueueProbe::Unverifiable,
     }
 }
 
@@ -758,6 +823,11 @@ impl<'syscalls, S: Syscalls> OwnedXdpFd<'syscalls, S> {
 
     fn raw(&self) -> RawFd {
         self.fd.expect("owned fd is active")
+    }
+
+    /// Whether the fd is still owned (not yet closed).
+    pub(super) const fn is_active(&self) -> bool {
+        self.fd.is_some()
     }
 
     /// The seam this fd releases through, for creating related objects.
@@ -1369,6 +1439,10 @@ mod tests {
             self.result(SyscallStage::InterfaceIndex).map(|()| 3)
         }
 
+        fn tx_queue_probe(&self, _: &[u8; IFNAMSIZ], _: u32, _: u32) -> TxQueueProbe {
+            TxQueueProbe::Present
+        }
+
         fn socket(&self, domain: c_int, kind: c_int, protocol: c_int) -> Result<RawFd, Errno> {
             self.record(Call::Socket {
                 domain,
@@ -1531,6 +1605,10 @@ mod tests {
                 flags,
             });
             self.result(SyscallStage::CreateBpfLink).map(|()| 32)
+        }
+
+        fn datapath_kick<'a>(_fd: &'a OwnedXdpFd<'a, Self>) -> KickTarget<'a> {
+            unreachable!("the resource seam fake never lends a datapath")
         }
     }
 
@@ -2166,6 +2244,40 @@ mod tests {
             Err(Errno::ArgumentRejected)
         );
         assert_eq!(linux.bpf_link_create(3, 0, 4), Err(Errno::ArgumentRejected));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "reads sysfs")]
+    fn native_tx_queue_probe_reads_sysfs_for_the_resolved_device() {
+        // `lo` is ifindex 1 in every network namespace and has one TX queue.
+        let mut lo = [0_u8; IFNAMSIZ];
+        lo[..2].copy_from_slice(b"lo");
+        assert_eq!(linux_tx_queue_probe(&lo, 1, 0), TxQueueProbe::Present);
+        assert_eq!(linux_tx_queue_probe(&lo, 1, 1_000), TxQueueProbe::Absent);
+        // A sysfs view of another device fails closed.
+        assert_eq!(linux_tx_queue_probe(&lo, 2, 0), TxQueueProbe::Unverifiable);
+        let mut missing = [0_u8; IFNAMSIZ];
+        missing[..12].copy_from_slice(b"rusterNoDev0");
+        assert_eq!(
+            linux_tx_queue_probe(&missing, 1, 0),
+            TxQueueProbe::Unverifiable
+        );
+        let mut dots = [0_u8; IFNAMSIZ];
+        dots[..2].copy_from_slice(b"..");
+        assert_eq!(
+            linux_tx_queue_probe(&dots, 1, 0),
+            TxQueueProbe::Unverifiable
+        );
+    }
+
+    #[test]
+    fn native_kick_linux_seam_rejects_negative_fd_before_ffi() {
+        // Always on: the kick path never hands libc a negative fd (`poll`
+        // would silently ignore it and report nothing ready).
+        let linux = LinuxSyscalls;
+        assert_eq!(linux.send_to_wakeup(-1), Err(Errno::ArgumentRejected));
+        let mut descriptor = PollDescriptor::new(-1, 1);
+        assert_eq!(linux.poll(&mut descriptor, 0), Err(Errno::ArgumentRejected));
     }
 
     #[test]

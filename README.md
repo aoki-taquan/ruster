@@ -127,10 +127,24 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   options、headroom、Ethernet header長（14 byte）、chunk境界でcoreに見せる前に検証する（違反は
   reason別に数え、kernelがprofile外で返したframeはquarantine、runtはrecycle）。need-wakeupは
   毎refillと`fill_needs_wakeup()`で観測できる。valid frameはengineをborrowする`RxFrame`として
-  一つずつ貸し、`recycle`/`stage_tx`（S4向け`TxHandoff`）/dropで終える。bytes借用中のrecycleは
-  compile errorで、UMEM byte accessはledgerが`Leased`と記録するframeだけに限る。TX/Completion
-  （S4）、need-wakeup kick、core `PacketIo`接続はまだ持たず（`ruster-core`へは依存しない）、
-  FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
+  一つずつ貸し、`recycle`/`stage_tx`（`TxHandoff`）/dropで終える。bytes借用中のrecycleは
+  compile errorで、UMEM byte accessはledgerが`Leased`と記録するframeだけに限る。M2 S4（X02）の
+  TX/Completion半分は同じengineと同じledgerにあり、`submit_tx`/`submit_tx_batch`がcoreのin-place
+  rewrite後のframeをcopyせずRX geometryのままTX ringへ出す。in-flight TXはTX ring capacity以下
+  （engine setupは`completion >= tx`を要求）で、ring満杯やcompletion遅れは`TxBlocked`
+  （`RingFull`/`InflightLimit`/`Draining`）のrecoverableなwould-blockとしてhandoffを不変で返し、
+  cancelすればfree list経由でFillへ戻る。pollはrefill前にCompletion ringをboundedにreapし、各address
+  をUMEM範囲、in-flight所有（重複を拒否）、提出したexact addressで検証する（違うaddressのframeは
+  quarantine）。`completion_lag()`はin-flight数と最古frameのpoll年齢。bundleはsocketのkick handle
+  も運び、`wake_tx()`（`sendto` `MSG_DONTWAIT`）と`wake_fill()`（`poll`、timeout 0）は
+  `EAGAIN`/`EBUSY`/`ENOBUFS`/`EINTR`を`KickOutcome::Deferred`、他をtyped `KickError`にする。
+  `attach_xdp`は`take_datapath`より前に呼ぶ。`NativeSession::open`はinterface lookup直後に、bind queueに
+  TX queueがあることをsysfs（`/sys/class/net/<dev>/queues/tx-<queue>`、sysfsの`ifindex`が解決済みdeviceと
+  一致することを先に確認）で確かめ、無ければresource取得前に`SessionFailure::NoTxQueue`で拒否する
+  （Linuxは`queue < max(RX, TX)`でbindを許すがcopy-mode TXは黙って何も送らない）。`drain(rounds)`は新規TXとFillを止めてcompletionを
+  回収し、全frameを一回だけledgerへ戻し、kernelがまだ持つframeを`DrainOutcome::TxInFlight`と
+  `FrameAccounting`で報告する（返ったことにはしない）。core `PacketIo`接続はまだ持たず
+  （`ruster-core`へは依存しない）、FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
   privileged smokeは`scripts/priv-xdp-smoke.sh`（`sudo -n`で専用netnsとその中だけのveth pairを
   作り、`RUSTER_PRIV_XDP=1`で実行してnetnsを必ず削除。不足はskipせずfail）。
 
@@ -583,7 +597,7 @@ cargo +1.97.1 check --workspace --all-targets --all-features --locked --target x
 これはmusl targetでworkspace全体が型検査を通ることだけを確認するcompile-only portability
 checkです。musl向けartifactのlink、test実行、実NICでのruntime compatibilityは保証しません。
 
-`ruster-io-xdp-native`のunsafe/fake test（RX/Fill engineのheap scripted kernel testを含む）は任意でMiriでも確認できます（nightlyとMiri sysrootが
+`ruster-io-xdp-native`のunsafe/fake test（RX/Fill engineとTX/Completion半分のheap scripted kernel testを含む）は任意でMiriでも確認できます（nightlyとMiri sysrootが
 必要。CI gateではありません）。
 
 ```bash

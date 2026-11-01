@@ -196,6 +196,13 @@ pub enum NegotiatedMode {
 pub enum SessionStage {
     /// `if_nametoindex` in the caller's network namespace.
     InterfaceLookup,
+    /// The bound queue must have a TX queue: Linux v6.8 `xsk_bind` only
+    /// requires `queue < max(real_num_rx_queues, real_num_tx_queues)`, but
+    /// copy-mode `__xsk_generic_xmit` silently transmits nothing on a queue
+    /// at or above `real_num_tx_queues`. Checked through sysfs
+    /// (`/sys/class/net/<dev>/queues/tx-<queue>`) after proving that the
+    /// sysfs view's `ifindex` is the resolved device.
+    TxQueueCheck,
     /// `socket(AF_XDP, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)`.
     OpenSocket,
     /// Anonymous page-aligned UMEM `mmap`.
@@ -290,6 +297,16 @@ pub enum SessionFailure {
     /// fail closed on purpose: a newer kernel option could change the
     /// socket's contract in ways this profile has not reviewed.
     UnsupportedOptions(u32),
+    /// The bound queue has no TX queue on the device (queue id at or above
+    /// its real TX queue count, for example RX 4 / TX 2 bound at queue 2,
+    /// or after `ethtool -L`). Binding would succeed and TX would stall
+    /// silently, so the session is refused.
+    NoTxQueue,
+    /// The TX queue count could not be verified: sysfs is not mounted for
+    /// this network namespace, the device's sysfs `ifindex` differs from
+    /// the resolved one (a stale sysfs view after `setns`, or a rename
+    /// race), or sysfs could not be read. Fails closed.
+    TxQueueUnverifiable,
     /// The negotiated mode differs from the explicitly bound copy policy.
     NegotiatedModeMismatch {
         /// Mode reported by the kernel.

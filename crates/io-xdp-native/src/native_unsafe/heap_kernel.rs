@@ -1,8 +1,8 @@
 #![allow(unsafe_code)]
 //! Test-only scripted kernel over heap memory.
 //!
-//! The memory stands in for the kernel-shared Fill ring, RX ring, and UMEM
-//! mappings. The engine borrows it through the same role views a live
+//! The memory stands in for the kernel-shared Fill, RX, TX, and Completion
+//! rings and the UMEM mapping. The engine borrows it through the same role views a live
 //! session lends; the script plays the kernel side through raw pointers
 //! only (atomic cursors, volatile descriptors, raw byte copies), exactly as
 //! the kernel accesses the real mappings concurrently. No Rust reference
@@ -22,12 +22,16 @@ use crate::{
     CompletionConsumer, FillProducer, RingEntries, RingName, RxConsumer, TxProducer, UmemConfig,
 };
 
-/// TX and Completion capacity of the heap bundle (unused until S4).
-fn tx_entries() -> RingEntries {
+/// Default TX and Completion capacity of the heap bundle.
+fn default_tx_entries() -> RingEntries {
     RingEntries::new(RingName::Tx, 8).expect("valid capacity")
 }
 
-use super::{mmap::BorrowedMmap, umem::UmemMapping};
+use super::{
+    kick::{KickRing, KickTarget, ScriptedKicks, SocketKick},
+    mmap::BorrowedMmap,
+    umem::UmemMapping,
+};
 
 /// Allocation counter for hot-path tests; delegates to the system allocator.
 struct CountingAllocator;
@@ -136,8 +140,10 @@ impl Drop for HeapRegion {
 /// Heap stand-in for all datapath mappings of one socket.
 ///
 /// The script tracks which frames it holds as "kernel": taken from Fill and
-/// not yet returned on RX. It writes and reads packet bytes only inside
-/// those frames, so it never touches a frame the engine may have lent.
+/// not yet returned on RX (`held`), or taken from TX and not yet returned
+/// on Completion (`tx_held`). It writes packet bytes only inside Fill-held
+/// frames and reads them only inside held frames, so it never touches a
+/// frame the engine may have lent.
 pub(crate) struct ScriptedKernel {
     fill: HeapRegion,
     rx: HeapRegion,
@@ -146,25 +152,44 @@ pub(crate) struct ScriptedKernel {
     umem: HeapRegion,
     fill_entries: RingEntries,
     rx_entries: RingEntries,
+    tx_entries: RingEntries,
+    completion_entries: RingEntries,
     umem_config: UmemConfig,
     taken: Cell<bool>,
     held: RefCell<Vec<bool>>,
+    tx_held: RefCell<Vec<bool>>,
+    kicks: ScriptedKicks,
 }
 
 impl ScriptedKernel {
     pub(crate) fn new(fill: RingEntries, rx: RingEntries, umem: UmemConfig) -> Self {
+        Self::with_tx(fill, rx, default_tx_entries(), default_tx_entries(), umem)
+    }
+
+    /// A kernel with explicit TX and Completion capacities.
+    pub(crate) fn with_tx(
+        fill: RingEntries,
+        rx: RingEntries,
+        tx: RingEntries,
+        completion: RingEntries,
+        umem: UmemConfig,
+    ) -> Self {
         let umem_len = usize::try_from(umem.byte_len()).expect("test UMEM fits usize");
         Self {
             fill: HeapRegion::new(DESCRIPTORS + fill.get() as usize * 8),
             rx: HeapRegion::new(DESCRIPTORS + rx.get() as usize * 16),
-            tx: HeapRegion::new(DESCRIPTORS + tx_entries().get() as usize * 16),
-            completion: HeapRegion::new(DESCRIPTORS + tx_entries().get() as usize * 8),
+            tx: HeapRegion::new(DESCRIPTORS + tx.get() as usize * 16),
+            completion: HeapRegion::new(DESCRIPTORS + completion.get() as usize * 8),
             umem: HeapRegion::new(umem_len),
             fill_entries: fill,
             rx_entries: rx,
+            tx_entries: tx,
+            completion_entries: completion,
             umem_config: umem,
             taken: Cell::new(false),
             held: RefCell::new(vec![false; umem.frame_count() as usize]),
+            tx_held: RefCell::new(vec![false; umem.frame_count() as usize]),
+            kicks: ScriptedKicks::default(),
         }
     }
 
@@ -194,15 +219,16 @@ impl ScriptedKernel {
             completion: CompletionConsumer::with_mapping(
                 completion,
                 HEAP_RING_OFFSETS,
-                tx_entries(),
+                self.completion_entries,
             )
             .expect("heap Completion view"),
             rx: RxConsumer::with_mapping(rx, HEAP_RING_OFFSETS, self.rx_entries)
                 .expect("heap RX view"),
-            tx: TxProducer::with_mapping(tx, HEAP_RING_OFFSETS, tx_entries())
+            tx: TxProducer::with_mapping(tx, HEAP_RING_OFFSETS, self.tx_entries)
                 .expect("heap TX view"),
             umem,
             umem_config: self.umem_config,
+            kick: SocketKick::new(KickTarget::Scripted(&self.kicks)),
         }))
     }
 
@@ -329,8 +355,10 @@ impl ScriptedKernel {
         self.fill.cursor(FLAGS).store(value, Ordering::Release);
     }
 
-    /// Checks that `offset..offset + len` lies inside one held frame.
-    fn held_range(&self, offset: u64, len: usize) -> usize {
+    /// Checks that `offset..offset + len` lies inside one held frame:
+    /// Fill-held, or also TX-held when `tx_ok` (the kernel reads a frame
+    /// it transmits but never writes it).
+    fn held_range(&self, offset: u64, len: usize, tx_ok: bool) -> usize {
         let frame = self.frame_of(offset).expect("offset inside UMEM");
         let frame_size = u64::from(self.umem_config.frame_size());
         let end = offset + len as u64;
@@ -339,7 +367,7 @@ impl ScriptedKernel {
             "range crosses its frame"
         );
         assert!(
-            self.held.borrow()[frame],
+            self.held.borrow()[frame] || (tx_ok && self.tx_held.borrow()[frame]),
             "the script may touch only frames it holds as kernel"
         );
         usize::try_from(offset).expect("test offset")
@@ -347,7 +375,7 @@ impl ScriptedKernel {
 
     /// Kernel-writes packet bytes into a frame it holds.
     pub(crate) fn write_umem(&self, offset: u64, bytes: &[u8]) {
-        let offset = self.held_range(offset, bytes.len());
+        let offset = self.held_range(offset, bytes.len(), false);
         // SAFETY: `held_range` proved the range lies inside the allocation
         // and inside one frame the script holds as kernel: taken from Fill
         // and not returned on RX, so the engine's ledger records it as
@@ -364,7 +392,7 @@ impl ScriptedKernel {
     /// Kernel-reads bytes back from a frame it holds (for example a frame
     /// recycled and republished after an in-place rewrite).
     pub(crate) fn read_umem(&self, offset: u64, out: &mut [u8]) {
-        let offset = self.held_range(offset, out.len());
+        let offset = self.held_range(offset, out.len(), true);
         // SAFETY: as in `write_umem`; the engine holds no reference into a
         // frame the script holds.
         unsafe {
@@ -374,5 +402,141 @@ impl ScriptedKernel {
                 out.len(),
             );
         }
+    }
+
+    pub(crate) fn tx_producer(&self) -> u32 {
+        self.tx.cursor(PRODUCER).load(Ordering::Acquire)
+    }
+
+    pub(crate) fn tx_consumer(&self) -> u32 {
+        self.tx.cursor(CONSUMER).load(Ordering::Relaxed)
+    }
+
+    /// TX descriptors the application published and the kernel has not
+    /// consumed.
+    pub(crate) fn tx_pending(&self) -> u32 {
+        self.tx_producer().wrapping_sub(self.tx_consumer())
+    }
+
+    /// Reads one published TX descriptor by logical cursor, without
+    /// consuming.
+    pub(crate) fn tx_entry(&self, logical: u32) -> XdpDescriptor {
+        let slot = (logical & (self.tx_entries.get() - 1)) as usize;
+        let pointer = self
+            .tx
+            .base
+            .as_ptr()
+            .wrapping_add(DESCRIPTORS + slot * 16)
+            .cast::<XdpDescriptor>();
+        // SAFETY: the slot lies inside the allocation, is 8-byte aligned,
+        // and is read volatile like the kernel reads the mapping.
+        unsafe { pointer.read_volatile() }
+    }
+
+    /// Kernel-consumes the oldest TX descriptor; its frame is now TX-held
+    /// until a completion names it.
+    ///
+    /// Panics if the frame is already held as kernel (Fill or TX): that
+    /// would be a double publication, which the engine must never produce.
+    pub(crate) fn consume_tx(&self) -> Option<XdpDescriptor> {
+        let consumer = self.tx_consumer();
+        if self.tx_producer() == consumer {
+            return None;
+        }
+        // The producer's Release store (Acquire-loaded above) published it.
+        let descriptor = self.tx_entry(consumer);
+        if let Some(frame) = self.frame_of(descriptor.address) {
+            let mut tx_held = self.tx_held.borrow_mut();
+            assert!(!tx_held[frame], "frame {frame} submitted to TX twice");
+            assert!(
+                !self.held.borrow()[frame],
+                "frame {frame} submitted to TX while published to Fill"
+            );
+            tx_held[frame] = true;
+        }
+        self.tx
+            .cursor(CONSUMER)
+            .store(consumer.wrapping_add(1), Ordering::Release);
+        Some(descriptor)
+    }
+
+    pub(crate) fn completion_producer(&self) -> u32 {
+        self.completion.cursor(PRODUCER).load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn completion_consumer(&self) -> u32 {
+        self.completion.cursor(CONSUMER).load(Ordering::Acquire)
+    }
+
+    /// Kernel-produces one completion address; `false` if the Completion
+    /// ring is full.
+    ///
+    /// An address inside a TX-held frame returns that frame; any other
+    /// address (invalid or duplicate) returns nothing.
+    pub(crate) fn produce_completion(&self, address: u64) -> bool {
+        let producer = self.completion_producer();
+        if producer.wrapping_sub(self.completion_consumer()) >= self.completion_entries.get() {
+            return false;
+        }
+        if let Some(frame) = self.frame_of(address) {
+            self.tx_held.borrow_mut()[frame] = false;
+        }
+        let slot = (producer & (self.completion_entries.get() - 1)) as usize;
+        let pointer = self
+            .completion
+            .base
+            .as_ptr()
+            .wrapping_add(DESCRIPTORS + slot * 8)
+            .cast::<u64>();
+        // SAFETY: the slot lies inside the allocation and is 8-byte aligned.
+        // The Release store below publishes it after the write.
+        unsafe { pointer.write_volatile(address) };
+        self.completion
+            .cursor(PRODUCER)
+            .store(producer.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Whether the script holds `frame` for TX (consumed, not completed).
+    pub(crate) fn tx_holds(&self, frame: u32) -> bool {
+        self.tx_held
+            .borrow()
+            .get(frame as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Sets the TX flags word the kernel exposes.
+    pub(crate) fn set_tx_flags(&self, value: u32) {
+        self.tx.cursor(FLAGS).store(value, Ordering::Release);
+    }
+
+    /// Overwrites the TX producer cursor, as a stale application would
+    /// have left it (setup tests).
+    pub(crate) fn set_tx_producer(&self, value: u32) {
+        self.tx.cursor(PRODUCER).store(value, Ordering::Release);
+    }
+
+    /// Overwrites the TX consumer cursor (corruption tests).
+    pub(crate) fn set_tx_consumer(&self, value: u32) {
+        self.tx.cursor(CONSUMER).store(value, Ordering::Release);
+    }
+
+    /// Overwrites the Completion producer cursor (corruption tests).
+    pub(crate) fn set_completion_producer(&self, value: u32) {
+        self.completion
+            .cursor(PRODUCER)
+            .store(value, Ordering::Release);
+    }
+
+    /// Kicks the engine performed on `ring`.
+    pub(crate) fn kicks(&self, ring: KickRing) -> u32 {
+        self.kicks.count(ring)
+    }
+
+    /// Makes the next kick fail with `errno` (`None`: refused before the
+    /// kernel).
+    pub(crate) fn fail_next_kick(&self, errno: Option<u16>) {
+        self.kicks.fail_next(errno);
     }
 }

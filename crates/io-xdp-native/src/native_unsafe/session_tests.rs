@@ -17,11 +17,12 @@ use std::{
 };
 
 use super::{
+    kick::{KickTarget, ScriptedKicks},
     session::{classify, classify_attach, summarize_log, SessionCore, VERIFIER_LOG_CAPACITY},
     syscall::{
-        errno, sealed, Errno, MapCreateRequest, MapRequest, MapsRealMemory, PollDescriptor,
-        ProgramLoadRequest, ResourceError, SyscallArgumentError, SyscallError, SyscallStage,
-        Syscalls, IFNAMSIZ, PAGE_SIZE,
+        errno, sealed, Errno, MapCreateRequest, MapRequest, MapsRealMemory, OwnedXdpFd,
+        PollDescriptor, ProgramLoadRequest, ResourceError, SyscallArgumentError, SyscallError,
+        SyscallStage, Syscalls, TxQueueProbe, IFNAMSIZ, PAGE_SIZE,
     },
 };
 use crate::{
@@ -150,6 +151,8 @@ struct SessionFake {
     double_releases: Cell<u32>,
     /// Kernel log written by a load: byte count and whether a NUL follows.
     verifier_log: Cell<Option<(usize, bool)>>,
+    kicks: ScriptedKicks,
+    tx_queue: Cell<TxQueueProbe>,
 }
 
 impl SessionFake {
@@ -175,6 +178,8 @@ impl SessionFake {
             open_fds: Cell::new(0),
             double_releases: Cell::new(0),
             verifier_log: Cell::new(None),
+            kicks: ScriptedKicks::default(),
+            tx_queue: Cell::new(TxQueueProbe::Present),
         }
     }
 
@@ -275,6 +280,11 @@ impl sealed::Sealed for SessionFake {}
 unsafe impl MapsRealMemory for SessionFake {}
 
 impl Syscalls for SessionFake {
+    fn tx_queue_probe(&self, _name: &[u8; IFNAMSIZ], ifindex: u32, _queue: u32) -> TxQueueProbe {
+        assert_eq!(ifindex, FAKE_IFINDEX, "probed with the resolved ifindex");
+        self.tx_queue.get()
+    }
+
     fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno> {
         self.record(Call::InterfaceIndex { name: *name })
             .1
@@ -505,6 +515,10 @@ impl Syscalls for SessionFake {
         .1?;
         self.open_fds.set(self.open_fds.get() + 1);
         Ok(FAKE_LINK_FD)
+    }
+
+    fn datapath_kick<'a>(fd: &'a OwnedXdpFd<'a, Self>) -> KickTarget<'a> {
+        KickTarget::Scripted(&fd.syscalls().kicks)
     }
 }
 
@@ -1777,7 +1791,7 @@ fn native_session_datapath_is_taken_once_and_excludes_raw_rings() {
         {
             let datapath = session.take_datapath().expect("first take");
             assert_eq!(datapath.capacities(), [64, 128, 64, 256]);
-            let engine = RxFillEngine::new(
+            let mut engine = RxFillEngine::new(
                 datapath,
                 UmemDomainId::new(NonZeroU128::new(0x5310).expect("nonzero")),
                 RxFillConfig::new(NonZeroU32::new(64).expect("nonzero")),
@@ -1785,6 +1799,13 @@ fn native_session_datapath_is_taken_once_and_excludes_raw_rings() {
             .expect("engine over the session's real arena mappings");
             assert_eq!(engine.initial_refill().published(), 64);
             engine.audit().expect("engine audit");
+            // The bundle's kick reaches this session's socket through the
+            // seam while the session stays borrowed by the engine.
+            assert_eq!(engine.wake_tx(), Ok(crate::KickOutcome::Woken));
+            assert_eq!(engine.wake_fill(), Ok(crate::KickOutcome::Woken));
+            assert_eq!(fake.kicks.count(super::kick::KickRing::Tx), 1);
+            assert_eq!(fake.kicks.count(super::kick::KickRing::Fill), 1);
+            assert_eq!(engine.tx_inflight_limit(), 64);
         }
         // The engine is gone, but the kernel may hold what it published:
         // neither a second bundle nor raw views are ever lent again.
@@ -1810,4 +1831,29 @@ fn native_session_datapath_is_taken_once_and_excludes_raw_rings() {
     }
     assert_eq!(fake.live_mappings(), 0);
     assert_eq!(fake.open_fds.get(), 0);
+}
+
+#[test]
+fn native_session_refuses_a_queue_without_tx_queue_before_any_resource() {
+    for (probe, failure) in [
+        (TxQueueProbe::Absent, SessionFailure::NoTxQueue),
+        (
+            TxQueueProbe::Unverifiable,
+            SessionFailure::TxQueueUnverifiable,
+        ),
+    ] {
+        let fake = SessionFake::new();
+        fake.tx_queue.set(probe);
+        let error = SessionCore::open(&fake, &config(XDP_COPY))
+            .map(|_| ())
+            .expect_err("refused");
+        assert_eq!(
+            (error.stage(), error.failure()),
+            (SessionStage::TxQueueCheck, failure)
+        );
+        // Only the interface lookup ran: no socket, mapping, or bind.
+        assert_eq!(fake.len.get(), 1);
+        assert_eq!(fake.open_fds.get(), 0);
+        assert_eq!(fake.live_mappings(), 0);
+    }
 }
