@@ -879,3 +879,59 @@ fn nat44_hairpinning_maps_onto_core_policies_per_protocol() {
     assert_eq!(tcp_off.with_hairpinning(true), tcp);
     assert_eq!(off.storage_shape(), defaults.storage_shape());
 }
+
+#[test]
+fn nat44_tcp_inbound_sessions_per_remote_maps_onto_the_core_policy() {
+    use ruster_core::{
+        Nat44TcpPolicy, Nat44TcpPolicyError, NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE,
+    };
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    let with = |value: &str| {
+        VALID.replacen(
+            TCP,
+            &format!("{TCP}inbound-sessions-per-remote = {value}\n"),
+            1,
+        )
+    };
+
+    let defaults = validated(VALID);
+    let tcp = defaults.nat44().unwrap().tcp().unwrap().policy();
+    // Absent key: the documented default, equal to the core default.
+    assert_eq!(
+        tcp.inbound_sessions_per_remote(),
+        NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE
+    );
+    assert_eq!(
+        Nat44TcpPolicy::default().inbound_sessions_per_remote(),
+        NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE
+    );
+    for limit in [0_u8, 1, 16] {
+        let config = validated(&with(&limit.to_string()));
+        let policy = config.nat44().unwrap().tcp().unwrap().policy();
+        assert_eq!(policy.inbound_sessions_per_remote(), limit);
+        // Only the limit differs, and storage does not depend on it.
+        assert_eq!(
+            policy
+                .with_inbound_sessions_per_remote(NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE)
+                .unwrap(),
+            tcp
+        );
+        assert_eq!(config.storage_shape(), defaults.storage_shape());
+    }
+    for limit in [17_u8, 255] {
+        let error = error(&with(&limit.to_string()));
+        assert_eq!(
+            error.code(),
+            ValidationCode::Nat44TcpPolicy(Nat44TcpPolicyError::InboundSessionsPerRemoteTooLarge)
+        );
+        assert_eq!(error.code().code(), "NAT44_TCP_POLICY");
+        assert_eq!(
+            error.path().segments(),
+            &[
+                PathSegment::Field("nat44".to_owned()),
+                PathSegment::Field("tcp".to_owned()),
+                PathSegment::Field("inbound-sessions-per-remote".to_owned()),
+            ]
+        );
+    }
+}

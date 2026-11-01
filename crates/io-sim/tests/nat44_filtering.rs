@@ -928,3 +928,97 @@ fn unsolicited_inbound_syn_is_silently_dropped_by_the_full_worker() {
     assert!(io.pop_tx().is_none());
     assert_eq!(tcp_nat.counters().inbound_sessions_created, 0);
 }
+
+/// NAT44-041: an off-path sender spoofing a remote address the mapping
+/// already talks to gets at most the default per-remote limit of sessions;
+/// every further SYN is a byte-unchanged typed drop that creates nothing, and
+/// the inside host keeps the remaining session capacity.
+#[test]
+fn spoofed_syns_are_capped_per_remote_and_inside_hosts_keep_capacity() {
+    use ruster_core::NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE as LIMIT;
+
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    for filtering in [
+        Nat44Filtering::EndpointIndependent,
+        Nat44Filtering::AddressDependent,
+    ] {
+        let config = tcp_config(&snapshot, filtering);
+        assert_eq!(config.policy().inbound_sessions_per_remote(), LIMIT);
+        let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 16];
+        let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut resolution = resolution(&mut states, &mut actions);
+        let mut io = SimIo::new();
+        let mut run = |io: &mut SimIo, nat: &mut _, packet: Vec<u8>, ingress: IfId, now: u64| {
+            io.inject(ingress, packet);
+            io.run_nat44_tcp_once(
+                1,
+                &snapshot,
+                &mut resolution,
+                &config,
+                Some(nat),
+                MonotonicMillis(now),
+                &mut NoTrace,
+            )
+            .unwrap();
+        };
+        run(
+            &mut io,
+            &mut nat,
+            tcp(HOST, REMOTE1, PORT, 443, SYN),
+            LAN,
+            0,
+        );
+        assert_tx(&mut io, WAN, (PUBLIC, PORT), (REMOTE1, 443));
+
+        // The spoofed flood: many source ports, one claimed remote address.
+        for spoofed_port in 1_000..1_040 {
+            let syn = tcp(REMOTE1, PUBLIC, spoofed_port, PORT, SYN);
+            let before = (nat.mappings().to_vec(), nat.sessions().to_vec());
+            run(&mut io, &mut nat, syn.clone(), WAN, 1);
+            if spoofed_port < 1_000 + u16::from(LIMIT) {
+                assert_tx(&mut io, LAN, (REMOTE1, spoofed_port), (HOST, PORT));
+            } else {
+                assert_drop(
+                    &mut io,
+                    DropReason::Nat44TcpInboundRemoteQuotaExceeded,
+                    &syn,
+                );
+                assert_eq!(nat.mappings(), before.0.as_slice());
+                assert_eq!(nat.sessions(), before.1.as_slice());
+            }
+        }
+        let counters = nat.counters();
+        assert_eq!(counters.inbound_sessions_created, u64::from(LIMIT));
+        assert_eq!(
+            counters.inbound_remote_quota_exceeded,
+            40 - u64::from(LIMIT)
+        );
+        assert_eq!(counters.session_full, 0);
+
+        // The inside host still opens new connections into the rest.
+        let free = 16 - 1 - usize::from(LIMIT);
+        for remote_port in 0..free {
+            let port = 2_000 + u16::try_from(remote_port).unwrap();
+            run(
+                &mut io,
+                &mut nat,
+                tcp(HOST, REMOTE1, PORT, port, SYN),
+                LAN,
+                2,
+            );
+            assert_tx(&mut io, WAN, (PUBLIC, PORT), (REMOTE1, port));
+        }
+        assert!(nat.sessions().iter().all(|session| session.is_occupied()));
+        assert_eq!(
+            nat.sessions()
+                .iter()
+                .filter(|session| session.is_external_inbound())
+                .count(),
+            usize::from(LIMIT)
+        );
+    }
+}

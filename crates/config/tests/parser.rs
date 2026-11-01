@@ -667,3 +667,74 @@ fn nat44_hairpinning_defaults_to_enabled_and_is_exact() {
     .unwrap_err();
     assert_eq!(misplaced.code(), DiagnosticCode::UnknownField);
 }
+
+#[test]
+fn nat44_tcp_inbound_sessions_per_remote_defaults_and_is_exact() {
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    let VersionedConfig::V1(config) = parse(VALID_V1.as_bytes()).unwrap() else {
+        panic!("schema version 1");
+    };
+    // Absent key: the core default (8).
+    assert_eq!(
+        config
+            .nat44
+            .unwrap()
+            .tcp
+            .unwrap()
+            .inbound_sessions_per_remote,
+        ruster_core::NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE
+    );
+    for value in [0_u8, 1, 16, 255] {
+        let source = VALID_V1.replacen(
+            TCP,
+            &format!("{TCP}inbound-sessions-per-remote = {value}\n"),
+            1,
+        );
+        let VersionedConfig::V1(config) = parse(source.as_bytes()).unwrap() else {
+            panic!("schema version 1");
+        };
+        // The decoder takes any u8; the range is a semantic check.
+        assert_eq!(
+            config
+                .nat44
+                .unwrap()
+                .tcp
+                .unwrap()
+                .inbound_sessions_per_remote,
+            value
+        );
+    }
+    // Out of u8 range or the wrong type: typed, value-free, safe path.
+    for value in ["-1", "256", "\"8\"", "8.0", "true"] {
+        let source = VALID_V1.replacen(
+            TCP,
+            &format!("{TCP}inbound-sessions-per-remote = {value}\n"),
+            1,
+        );
+        let diagnostic = parse(source.as_bytes()).unwrap_err();
+        assert_eq!(diagnostic.code(), DiagnosticCode::InvalidType, "{value}");
+        assert_eq!(
+            diagnostic.path().segments(),
+            &[
+                PathSegment::Field("nat44".to_owned()),
+                PathSegment::Field("tcp".to_owned()),
+                PathSegment::Field("inbound-sessions-per-remote".to_owned()),
+            ],
+            "{value}"
+        );
+    }
+    // TCP only: the UDP section and the realm reject it.
+    for anchor in ["icmpv4-errors = \"external-only\"\n", "[nat44.realm.ports]"] {
+        let misplaced = parse(
+            VALID_V1
+                .replacen(
+                    anchor,
+                    &format!("inbound-sessions-per-remote = 1\n{anchor}"),
+                    1,
+                )
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(misplaced.code(), DiagnosticCode::UnknownField, "{anchor}");
+    }
+}

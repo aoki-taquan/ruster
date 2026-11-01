@@ -76,6 +76,10 @@ const fn enabled() -> bool {
     true
 }
 
+const fn default_inbound_sessions_per_remote() -> u8 {
+    ruster_core::NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ResolutionPolicyV1 {
@@ -252,6 +256,12 @@ pub struct Nat44TcpV1 {
     /// `false` is an RFC 1812 §1.1.3 security option.
     #[serde(default = "enabled")]
     pub hairpinning: bool,
+    /// Limit on live sessions that external inbound initial SYNs created on
+    /// one mapping from one remote IPv4 address; `0` means no limit. Absent
+    /// means 8. A local security policy (RFC 5382 §9), validated to at most
+    /// 16 (the bounded inbound chain walk).
+    #[serde(default = "default_inbound_sessions_per_remote")]
+    pub inbound_sessions_per_remote: u8,
     pub capacity: Nat44TcpCapacityV1,
 }
 
