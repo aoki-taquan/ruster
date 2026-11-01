@@ -11,14 +11,16 @@
 //! the Fill ring, can happen while it is alive.
 //!
 //! Soundness of the lease check relies on one crate-private protocol, kept
-//! by the RX/Fill engine (`rx_fill.rs`), the only ledger mutator: a frame
-//! enters `Leased` either from `Free` without ever being published to the
-//! kernel, or from `FillOwnedByKernel` only after the kernel returned that
-//! exact frame on the RX ring (`receive` then `lease_rx`). That protocol in
-//! turn needs the engine to be the only writer of this UMEM's Fill and TX
-//! rings, which the once-per-session `DatapathRings` bundle guarantees: the
-//! engine receives every ring of the socket together with the UMEM, and no
-//! raw view of that socket was ever lent. A kernel that keeps writing a
+//! by the RX/Fill engine (`rx_fill.rs` and its `tx_completion.rs` and
+//! `generated.rs` child modules), the only ledger mutator: a frame enters
+//! `Leased` either from `Free` (a generated-pool frame, never published to
+//! Fill, and not in flight on TX: a TX frame becomes `Free` only after its
+//! validated completion), or from `FillOwnedByKernel` only after the kernel
+//! returned that exact frame on the RX ring (`receive` then `lease_rx`).
+//! That protocol in turn needs the engine to be the only writer of this
+//! UMEM's Fill and TX rings, which the once-per-session `DatapathRings`
+//! bundle guarantees: the engine receives every ring of the socket together
+//! with the UMEM, and no raw view of that socket was ever lent. A kernel that keeps writing a
 //! frame after returning it violates the AF_XDP contract.
 
 use std::{fmt, marker::PhantomData, ptr::NonNull};

@@ -1,6 +1,6 @@
 //! Privileged real-kernel smoke for the X00C native AF_XDP session, the
 //! X00D XDP program/`bpf_link` lifecycle, the X01 RX/Fill engine, and the
-//! X02 TX/Completion half.
+//! X02 TX/Completion half, and the X03 generated frames.
 //!
 //! Runs only with `RUSTER_PRIV_XDP=1`, normally through
 //! `scripts/priv-xdp-smoke.sh`, which creates a dedicated network namespace
@@ -33,10 +33,10 @@ use std::{
 
 use ruster_io_xdp_native::{
     abi::{XDP_COPY, XDP_USE_NEED_WAKEUP},
-    AttachFailure, AttachStage, DatapathError, DrainOutcome, KickOutcome, NativeRingError,
-    NativeSession, NeedWakeup, NegotiatedMode, RingConfig, RingsError, RxFillConfig, RxFillEngine,
-    SessionConfig, SessionFailure, SessionStage, UmemConfig, UmemDomainId, ValidatedBindFlags,
-    XdpAttachMode, XDP_PACKET_HEADROOM,
+    AttachFailure, AttachStage, DatapathError, DrainOutcome, GeneratedAllocError,
+    GeneratedRejectReason, KickOutcome, NativeRingError, NativeSession, NeedWakeup, NegotiatedMode,
+    RingConfig, RingsError, RxFillConfig, RxFillEngine, SessionConfig, SessionFailure,
+    SessionStage, UmemConfig, UmemDomainId, ValidatedBindFlags, XdpAttachMode, XDP_PACKET_HEADROOM,
 };
 
 const FRAME_SIZE: u64 = 2_048;
@@ -668,6 +668,175 @@ fn priv_xdp_tx_reflects_peer_frame_completes_and_drains_on_netns_veth() {
     eprintln!(
         "priv_xdp_tx: peer ARP request rewritten in place, transmitted from the same frame on \
          the same veth, received by the peer, completed, and an in-flight frame drained verified"
+    );
+}
+
+/// Source of the engine-generated ARP request (TEST-NET-1, unused by the
+/// tx phase, so the peer cannot know it from earlier phases).
+const GENERATOR_MAC: [u8; 6] = [0x02, 0x52, 0x55, 0x53, 0x54, 0x47];
+const GENERATOR_MAC_TEXT: &str = "02:52:55:53:54:47";
+const GENERATOR_IP: [u8; 4] = [192, 0, 2, 3];
+
+/// Writes a broadcast ARP request from the generator for `PEER_IP` into
+/// exactly 42 bytes.
+fn build_arp_request(bytes: &mut [u8]) {
+    assert_eq!(bytes.len(), 42);
+    bytes[..6].fill(0xff);
+    bytes[6..12].copy_from_slice(&GENERATOR_MAC);
+    bytes[12..14].copy_from_slice(&[0x08, 0x06]);
+    bytes[14..22].copy_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);
+    bytes[22..28].copy_from_slice(&GENERATOR_MAC);
+    bytes[28..32].copy_from_slice(&GENERATOR_IP);
+    bytes[32..38].fill(0);
+    bytes[38..42].copy_from_slice(&PEER_IP);
+}
+
+/// Whether `bytes` is the peer's ARP reply to the generator.
+fn is_reply_to_generator(bytes: &[u8]) -> bool {
+    bytes.len() >= 42
+        && bytes[..6] == GENERATOR_MAC
+        && bytes[12..14] == [0x08, 0x06]
+        && bytes[20..22] == [0, 2]
+        && bytes[28..32] == PEER_IP
+        && bytes[38..42] == GENERATOR_IP
+}
+
+/// The peer's neighbor entry for `GENERATOR_IP`, in this namespace only.
+fn peer_generator_neighbor(peer: &str) -> String {
+    let output = Command::new("ip")
+        .args(["neigh", "show", "192.0.2.3", "dev", peer])
+        .output()
+        .expect("run ip neigh show");
+    assert!(output.status.success(), "ip neigh show failed");
+    String::from_utf8(output.stdout).expect("ip output is UTF-8")
+}
+
+#[test]
+fn priv_xdp_generated_arp_request_is_learned_by_the_peer_and_drained() {
+    let Some(device) = requested(Some("generated")) else {
+        return;
+    };
+    let peer_device = required("RUSTER_PRIV_XDP_PEER");
+    assert_eq!(attached_program(&device), None, "veth starts without XDP");
+    assert!(
+        !peer_generator_neighbor(&peer_device).contains(GENERATOR_MAC_TEXT),
+        "the peer must not know the generator yet"
+    );
+    let mut session = open_after_release(&session_config(&device, 0, XDP_COPY));
+    session
+        .attach_xdp(XdpAttachMode::Native)
+        .expect("native attach on veth");
+    {
+        let datapath = session.take_datapath().expect("first datapath take");
+        let mut engine = RxFillEngine::new(
+            datapath,
+            UmemDomainId::new(NonZeroU128::new(0x5447).expect("nonzero")),
+            RxFillConfig::new(NonZeroU32::new(64).expect("nonzero")),
+        )
+        .expect("engine over the live mappings");
+        assert_eq!(engine.generated_frames(), 64);
+        engine.audit().expect("primed engine audit");
+
+        // Generate from the generated pool, commit through TX, kick (copy
+        // mode transmits only from sendto), and reap, until the peer
+        // kernel has learned the generator from the request.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut replies = 0_u32;
+        loop {
+            if engine.generated_counters().generated_committed
+                <= engine.generated_counters().generated_completed
+            {
+                let rx_frames = engine.rx_frames();
+                let mut frame = engine.allocate_generated(42).expect("generated frame");
+                assert!(frame.frame().index() >= rx_frames);
+                assert_eq!(frame.bytes().len(), 42);
+                assert_eq!(frame.descriptor().data_offset(), XDP_PACKET_HEADROOM);
+                build_arp_request(frame.bytes_mut());
+                let report = frame
+                    .commit()
+                    .map_err(|rejected| rejected.reason())
+                    .expect("TX ring has room");
+                assert_eq!(report.submitted(), 1);
+            }
+            if engine.tx_needs_wakeup() == Ok(NeedWakeup::Required) {
+                match engine.wake_tx() {
+                    Ok(KickOutcome::Woken | KickOutcome::Deferred(_)) => {}
+                    Err(error) => panic!("TX kick failed: {error:?}"),
+                }
+            }
+            sleep(Duration::from_millis(20));
+            {
+                let mut batch = engine.poll(16).expect("poll reaps completions");
+                while let Some(frame) = batch.next_frame() {
+                    if is_reply_to_generator(frame.bytes()) {
+                        replies += 1;
+                    }
+                    frame.recycle();
+                }
+            }
+            engine.audit().expect("engine audit after poll");
+            if engine.generated_counters().generated_completed > 0
+                && peer_generator_neighbor(&peer_device).contains(GENERATOR_MAC_TEXT)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the peer never learned the generated ARP request: {:?} {:?} {:?}",
+                engine.generated_counters(),
+                engine.tx_counters(),
+                peer_generator_neighbor(&peer_device)
+            );
+        }
+        let counters = engine.generated_counters();
+        assert!(counters.generated_committed >= 1, "{counters:?}");
+        assert_eq!(counters.generated_unavailable, 0, "{counters:?}");
+        assert_eq!(counters.generated_rejected_total(), 0, "{counters:?}");
+        assert_eq!(engine.tx_counters().tx_invalid_completion_total(), 0);
+
+        // Ordered shutdown: generate one more, submit without a kick, and
+        // let the drain kick and reap it back into the generated pool.
+        let mut frame = engine.allocate_generated(42).expect("generated frame");
+        build_arp_request(frame.bytes_mut());
+        let report = frame
+            .commit()
+            .map_err(|rejected| rejected.reason())
+            .expect("TX ring has room");
+        assert_eq!(report.submitted(), 1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let report = loop {
+            let report = engine.drain(16).expect("drain");
+            if report.outcome() == DrainOutcome::Drained {
+                break report;
+            }
+            assert!(Instant::now() < deadline, "drain timed out: {report:?}");
+            sleep(Duration::from_millis(10));
+        };
+        let generated = report.generated_accounting();
+        assert_eq!(generated.free, 64, "{generated:?}");
+        assert_eq!(generated.tx_in_flight, 0);
+        assert_eq!(generated.total(), 64);
+        assert_eq!(report.accounting().total(), 192);
+        let counters = engine.generated_counters();
+        assert_eq!(counters.generated_completed, counters.generated_committed);
+        assert_eq!(
+            engine.allocate_generated(42).map(|_| ()),
+            Err(GeneratedAllocError::Rejected(
+                GeneratedRejectReason::Draining
+            ))
+        );
+        engine.audit().expect("engine audit after drain");
+        eprintln!(
+            "priv_xdp_generated: {} generated ARP requests committed and completed, {replies} \
+             replies seen",
+            counters.generated_committed
+        );
+    }
+    session.close().expect("attached session teardown");
+    wait_detached(&device);
+    eprintln!(
+        "priv_xdp_generated: ARP request generated from the generated pool, transmitted, learned \
+         by the peer, completed back to the generated pool, and drained verified"
     );
 }
 

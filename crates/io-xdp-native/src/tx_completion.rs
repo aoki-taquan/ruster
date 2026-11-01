@@ -11,6 +11,13 @@
 //! handoff: the caller retries it or cancels it (`PendingTx` → `Leased` →
 //! `Free`).
 //!
+//! A generated frame (the `generated` sibling module) enters the same path
+//! as a [`TxHandoff`] and shares the same in-flight bound and back-pressure.
+//! Its completion returns it to the generated free list, and a cancelled
+//! generated handoff returns there too; the pool of every freed frame is
+//! decided by its frame index alone, so an RX completion never lands in the
+//! generated free list and a generated completion never reaches Fill.
+//!
 //! In-flight TX (published and not yet completed) never exceeds the TX ring
 //! capacity, which engine setup requires to be at most the Completion ring
 //! capacity, so every in-flight frame always has a Completion slot.
@@ -43,7 +50,7 @@ use std::fmt;
 
 use ruster_io_xdp::{FrameStateKind, FrameToken, LedgerError, RawDescriptor};
 
-use super::{add, bump, EngineState, RxFillEngine, RxFillError, TxHandoff};
+use super::{add, bump, EngineState, GeneratedAccounting, RxFillEngine, RxFillError, TxHandoff};
 use crate::{
     abi::XdpDescriptor,
     native_unsafe::kick::{KickError, KickOutcome, KickRing},
@@ -486,6 +493,7 @@ pub struct DrainReport {
     rx_pending_released: u32,
     last_kick_error: Option<KickError>,
     accounting: FrameAccounting,
+    generated_accounting: GeneratedAccounting,
 }
 
 impl DrainReport {
@@ -523,6 +531,12 @@ impl DrainReport {
     #[must_use]
     pub const fn accounting(self) -> FrameAccounting {
         self.accounting
+    }
+
+    /// Owner of every generated-pool frame after the drain.
+    #[must_use]
+    pub const fn generated_accounting(self) -> GeneratedAccounting {
+        self.generated_accounting
     }
 }
 
@@ -587,12 +601,20 @@ impl EngineState<'_> {
             .remove(token)
             .expect("every TxOwnedByKernel frame is listed in flight");
         self.tx_counters.tx_inflight = self.tx_counters.tx_inflight.saturating_sub(1);
+        let generated = self.is_generated(index);
+        if generated {
+            let gauge = &mut self.generated_counters.generated_inflight;
+            *gauge = gauge.saturating_sub(1);
+        }
         if entry.address != address {
             self.frames
                 .ledger_mut()
                 .quarantine_kernel_tx(token)
                 .expect("checked TxOwnedByKernel with this token");
             bump(&mut self.counters.frames_quarantined);
+            if generated {
+                self.generated.quarantined += 1;
+            }
             return Err(CompletionInvalidReason::AddressMismatch);
         }
         if offset != 0 {
@@ -605,9 +627,12 @@ impl EngineState<'_> {
         ledger
             .recycle_completion(token)
             .expect("completed under the same borrow");
-        let pushed = self.free.push(index);
-        debug_assert!(pushed, "each Free transition enters the free list once");
+        // The pool is the frame's, never the completion's claim.
+        self.push_free(index);
         bump(&mut self.tx_counters.tx_completed);
+        if generated {
+            bump(&mut self.generated_counters.generated_completed);
+        }
         Ok(())
     }
 
@@ -622,8 +647,7 @@ impl EngineState<'_> {
             ledger
                 .recycle_lease(token)
                 .expect("leased under the same borrow");
-            let pushed = self.free.push(token.frame().index());
-            debug_assert!(pushed, "each Free transition enters the free list once");
+            self.push_free(token.frame().index());
             released += 1;
         }
         released
@@ -642,24 +666,25 @@ impl EngineState<'_> {
         }
     }
 
+    /// RX-pool owners: the ledger's O(1) state counts minus the
+    /// generated pool's share of each state (also O(1)).
     pub(super) fn accounting(&self) -> FrameAccounting {
         let counts = self.frames.ledger().counts();
         let count = |kind| u32::try_from(counts.get(kind)).expect("bounded by u32 frames");
-        let generated = self.frames.ledger().layout().frame_count() - self.rx_frames;
+        let generated = self.generated_accounting();
         FrameAccounting {
             rx_frames: self.rx_frames,
-            // Generated-pool frames are never used by this engine, so they
-            // are the only Free frames outside the RX pool.
-            free: count(FrameStateKind::Free).saturating_sub(generated),
+            free: count(FrameStateKind::Free).saturating_sub(generated.free),
             fill_in_kernel: count(FrameStateKind::FillOwnedByKernel)
                 + count(FrameStateKind::FillReserved),
             rx_pending: count(FrameStateKind::RxAvailable),
-            leased: count(FrameStateKind::Leased),
-            tx_handoffs: count(FrameStateKind::PendingTx),
-            tx_in_flight: count(FrameStateKind::TxOwnedByKernel)
+            leased: count(FrameStateKind::Leased).saturating_sub(generated.leased),
+            tx_handoffs: count(FrameStateKind::PendingTx).saturating_sub(generated.tx_handoffs),
+            tx_in_flight: (count(FrameStateKind::TxOwnedByKernel)
                 + count(FrameStateKind::TxReserved)
-                + count(FrameStateKind::CompletionAvailable),
-            quarantined: count(FrameStateKind::Quarantined),
+                + count(FrameStateKind::CompletionAvailable))
+            .saturating_sub(generated.tx_in_flight),
+            quarantined: count(FrameStateKind::Quarantined).saturating_sub(generated.quarantined),
         }
     }
 }
@@ -825,6 +850,12 @@ impl RxFillEngine<'_> {
                 .ledger_mut()
                 .publish_tx(token)
                 .expect("reserved above");
+            if state.is_generated(token.frame().index()) {
+                state.generated.handoffs -= 1;
+                let counters = &mut state.generated_counters;
+                bump(&mut counters.generated_committed);
+                counters.generated_inflight += 1;
+            }
             let pushed = state.inflight.push(InflightEntry {
                 token,
                 address,
@@ -928,7 +959,8 @@ impl RxFillEngine<'_> {
         }
     }
 
-    /// Owner of every RX-pool frame, from O(1) ledger counts.
+    /// Owner of every RX-pool frame, from O(1) ledger counts (the generated
+    /// pool's share subtracted; see [`Self::generated_accounting`]).
     #[must_use]
     pub fn frame_accounting(&self) -> FrameAccounting {
         self.state.accounting()
@@ -975,6 +1007,7 @@ impl RxFillEngine<'_> {
             completed += self.reap_completions(budget)?.reaped();
         }
         let accounting = self.state.accounting();
+        let generated_accounting = self.state.generated_accounting();
         let outcome = match self.tx_inflight() {
             0 => DrainOutcome::Drained,
             frames => DrainOutcome::TxInFlight { frames },
@@ -986,6 +1019,7 @@ impl RxFillEngine<'_> {
             rx_pending_released,
             last_kick_error,
             accounting,
+            generated_accounting,
         })
     }
 }

@@ -1,7 +1,8 @@
 #!/bin/sh
 # Privileged AF_XDP smoke: native session (M2 S1, X00C), XDP program /
-# bpf_link lifecycle (M2 S2, X00D), the RX/Fill engine (M2 S3, X01), and
-# same-frame TX/Completion with shutdown drain (M2 S4, X02).
+# bpf_link lifecycle (M2 S2, X00D), the RX/Fill engine (M2 S3, X01),
+# same-frame TX/Completion with shutdown drain (M2 S4, X02), and generated
+# frames (M2 S5, X03).
 #
 # Builds the test binary as the invoking user, then with `sudo -n` creates a
 # dedicated network namespace holding its own two-queue veth pair, runs the
@@ -23,6 +24,9 @@
 #   tx       the peer's ARP request is rewritten in place into a reply,
 #            transmitted from the same UMEM frame out the same veth, learned
 #            by the peer (ip neigh), completed, and drained on close (X02)
+#   generated an ARP request built in a generated-pool frame is committed,
+#            learned by the peer (ip neigh), completed back to the generated
+#            pool, and a last one drained (X03)
 #   foreign  a netlink-attached xdpgeneric program loaded with `ip` is
 #            refused in both modes and left untouched (same program id)
 #   holder   attach in a separate process, SIGKILL it, link auto-detaches
@@ -169,6 +173,12 @@ run_phase tx priv_xdp_tx \
     priv_xdp_tx_reflects_peer_frame_completes_and_drains_on_netns_veth
 test -z "$(xdp_prog)" || {
     echo "priv-xdp-smoke: program left attached after the tx phase" >&2
+    exit 1
+}
+run_phase generated priv_xdp_generated \
+    priv_xdp_generated_arp_request_is_learned_by_the_peer_and_drained
+test -z "$(xdp_prog)" || {
+    echo "priv-xdp-smoke: program left attached after the generated phase" >&2
     exit 1
 }
 

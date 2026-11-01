@@ -25,11 +25,11 @@ use crate::{
     TxRejection, TxSubmitError, UmemConfig, XDP_PACKET_HEADROOM,
 };
 
-const FRAME_SIZE: u32 = 2_048;
-const FRAMES: u32 = 16;
-const RX_FRAMES: u32 = 12;
-const RING: u32 = 8;
-const HEADROOM: u64 = XDP_PACKET_HEADROOM as u64;
+pub(crate) const FRAME_SIZE: u32 = 2_048;
+pub(crate) const FRAMES: u32 = 16;
+pub(crate) const RX_FRAMES: u32 = 12;
+pub(crate) const RING: u32 = 8;
+pub(crate) const HEADROOM: u64 = XDP_PACKET_HEADROOM as u64;
 const UMEM_LEN: u64 = FRAMES as u64 * FRAME_SIZE as u64;
 
 fn umem_config() -> UmemConfig {
@@ -40,7 +40,7 @@ fn entries(ring: RingName, value: u32) -> RingEntries {
     RingEntries::new(ring, value).expect("ring entries")
 }
 
-fn kernel() -> ScriptedKernel {
+pub(crate) fn kernel() -> ScriptedKernel {
     ScriptedKernel::new(
         entries(RingName::Fill, RING),
         entries(RingName::Rx, RING),
@@ -48,11 +48,11 @@ fn kernel() -> ScriptedKernel {
     )
 }
 
-fn domain(value: u128) -> UmemDomainId {
+pub(crate) fn domain(value: u128) -> UmemDomainId {
     UmemDomainId::new(NonZeroU128::new(value).expect("nonzero domain"))
 }
 
-fn engine_with(kernel: &ScriptedKernel, domain_value: u128) -> RxFillEngine<'_> {
+pub(crate) fn engine_with(kernel: &ScriptedKernel, domain_value: u128) -> RxFillEngine<'_> {
     let datapath = kernel.take_datapath().expect("first take");
     RxFillEngine::new(
         datapath,
@@ -62,23 +62,23 @@ fn engine_with(kernel: &ScriptedKernel, domain_value: u128) -> RxFillEngine<'_> 
     .expect("engine")
 }
 
-fn engine(kernel: &ScriptedKernel) -> RxFillEngine<'_> {
+pub(crate) fn engine(kernel: &ScriptedKernel) -> RxFillEngine<'_> {
     engine_with(kernel, 0x5401)
 }
 
-fn frame_base(frame: u32) -> u64 {
+pub(crate) fn frame_base(frame: u32) -> u64 {
     u64::from(frame) * u64::from(FRAME_SIZE)
 }
 
-fn frame_of(address: u64) -> u32 {
+pub(crate) fn frame_of(address: u64) -> u32 {
     u32::try_from(address / u64::from(FRAME_SIZE)).expect("frame")
 }
 
-fn state(engine: &RxFillEngine<'_>, frame: u32) -> FrameStateKind {
+pub(crate) fn state(engine: &RxFillEngine<'_>, frame: u32) -> FrameStateKind {
     engine.ledger().state(frame).expect("frame").kind()
 }
 
-fn snapshot(ledger: &FrameLedger) -> Vec<(FrameStateKind, Option<u64>)> {
+pub(crate) fn snapshot(ledger: &FrameLedger) -> Vec<(FrameStateKind, Option<u64>)> {
     (0..u32::try_from(ledger.frame_count()).expect("u32 frames"))
         .map(|frame| {
             let view = ledger.state(frame).expect("frame");
@@ -102,7 +102,7 @@ fn audit(engine: &RxFillEngine<'_>) {
 }
 
 /// Kernel receive of one frame with `len` bytes; returns the frame.
-fn deliver(kernel: &ScriptedKernel, len: u32) -> u32 {
+pub(crate) fn deliver(kernel: &ScriptedKernel, len: u32) -> u32 {
     let base = kernel.consume_fill().expect("a published Fill frame");
     let mut bytes = [0_u8; 64];
     for (offset, byte) in bytes.iter_mut().enumerate() {
@@ -119,7 +119,11 @@ fn deliver(kernel: &ScriptedKernel, len: u32) -> u32 {
 
 /// Delivers `count` frames, lends them, swaps their MAC addresses in
 /// place, and stages them for TX.
-fn staged(kernel: &ScriptedKernel, engine: &mut RxFillEngine<'_>, count: usize) -> Vec<TxHandoff> {
+pub(crate) fn staged(
+    kernel: &ScriptedKernel,
+    engine: &mut RxFillEngine<'_>,
+    count: usize,
+) -> Vec<TxHandoff> {
     let mut handoffs = Vec::new();
     while handoffs.len() < count {
         let mut delivered = 0;
@@ -136,7 +140,7 @@ fn staged(kernel: &ScriptedKernel, engine: &mut RxFillEngine<'_>, count: usize) 
     handoffs
 }
 
-fn swap_macs(bytes: &mut [u8]) {
+pub(crate) fn swap_macs(bytes: &mut [u8]) {
     let (destination, rest) = bytes.split_at_mut(6);
     destination.swap_with_slice(&mut rest[..6]);
 }
@@ -155,7 +159,10 @@ fn transmit(kernel: &ScriptedKernel, count: usize) -> Vec<XdpDescriptor> {
     sent
 }
 
-fn cancel_all(engine: &mut RxFillEngine<'_>, handoffs: impl IntoIterator<Item = TxHandoff>) {
+pub(crate) fn cancel_all(
+    engine: &mut RxFillEngine<'_>,
+    handoffs: impl IntoIterator<Item = TxHandoff>,
+) {
     for handoff in handoffs {
         engine
             .cancel_tx_handoff(handoff)
@@ -1040,24 +1047,24 @@ fn tx_steady_state_does_not_allocate() {
 // Differential against the io-xdp FakeKernel TX lifecycle.
 
 /// Deterministic xorshift for the differential schedule.
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
         self.0
     }
 
-    fn below(&mut self, bound: u64) -> u64 {
+    pub(crate) fn below(&mut self, bound: u64) -> u64 {
         self.next() % bound
     }
 }
 
-type Model = FakeKernel<{ RING as usize }, { FRAMES as usize }>;
+pub(crate) type Model = FakeKernel<{ RING as usize }, { FRAMES as usize }>;
 
-fn model() -> Model {
+pub(crate) fn model() -> Model {
     let layout = UmemLayout::new(domain(0x5404), FRAMES, FRAME_SIZE, XDP_PACKET_HEADROOM)
         .expect("model layout");
     FakeKernel::new(
@@ -1068,7 +1075,7 @@ fn model() -> Model {
     .expect("model")
 }
 
-fn model_token(model: &Model, frame: u32) -> ruster_io_xdp::FrameToken {
+pub(crate) fn model_token(model: &Model, frame: u32) -> ruster_io_xdp::FrameToken {
     model
         .ledger()
         .state(frame)
@@ -1077,7 +1084,7 @@ fn model_token(model: &Model, frame: u32) -> ruster_io_xdp::FrameToken {
         .expect("token")
 }
 
-fn mirror_fill(kernel: &ScriptedKernel, model: &mut Model, mirrored: &mut u32) {
+pub(crate) fn mirror_fill(kernel: &ScriptedKernel, model: &mut Model, mirrored: &mut u32) {
     while *mirrored != kernel.fill_producer() {
         let frame = frame_of(kernel.fill_entry(*mirrored));
         model
@@ -1302,7 +1309,7 @@ fn tx_differential_matches_fake_kernel_tx_lifecycle() {
 
 /// Mirrors the last `submitted` TX ring entries into the model, in ring
 /// order.
-fn mirror_tx(kernel: &ScriptedKernel, model: &mut Model, submitted: u32, lens: &[u32]) {
+pub(crate) fn mirror_tx(kernel: &ScriptedKernel, model: &mut Model, submitted: u32, lens: &[u32]) {
     let producer = kernel.tx_producer();
     for logical in producer.wrapping_sub(submitted)..producer {
         let descriptor = kernel.tx_entry(logical);

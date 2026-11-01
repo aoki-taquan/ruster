@@ -143,7 +143,17 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   一致することを先に確認）で確かめ、無ければresource取得前に`SessionFailure::NoTxQueue`で拒否する
   （Linuxは`queue < max(RX, TX)`でbindを許すがcopy-mode TXは黙って何も送らない）。`drain(rounds)`は新規TXとFillを止めてcompletionを
   回収し、全frameを一回だけledgerへ戻し、kernelがまだ持つframeを`DrainOutcome::TxInFlight`と
-  `FrameAccounting`で報告する（返ったことにはしない）。core `PacketIo`接続はまだ持たず
+  `FrameAccounting`で報告する（返ったことにはしない）。M2 S5（X03）の`allocate_generated(len)`は
+  同じengineと同じledgerでgenerated pool（`rx_frames..frame_count`、Fillへは一度も出さない）から
+  frameを取り、headroomの後ろのexactに`len` byte（zero化済み、その先は到達不能）だけを
+  `GeneratedFrame`として貸す。`commit`（または`stage_tx`して`submit_tx_batch`）はforwarded frameと
+  同じTX ring、in-flight上限、`TxBlocked`を共有し、`cancel`、drop（abandon）、generated handoffの
+  cancel、completionはgenerated free listへ戻る。どのpoolへ戻すかはframe indexだけで決めるので
+  RX completionがgenerated poolへ、generated frameがFillへ入ることはない。拒否は`Rejected`
+  （`Draining`/`ZeroLength`/`BelowMinimum`/`TooLarge`）とpool枯渇の`Unavailable`でblockせず、
+  `GeneratedCounters`（allocated/unavailable/committed/cancelled/abandoned/completed/
+  rejected(reason)、gauge inflight）と`GeneratedAccounting`、両poolを見る`audit()`で観測する。
+  core `PacketIo`/`GeneratedPacketIo`接続はまだ持たず
   （`ruster-core`へは依存しない）、FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
   privileged smokeは`scripts/priv-xdp-smoke.sh`（`sudo -n`で専用netnsとその中だけのveth pairを
   作り、`RUSTER_PRIV_XDP=1`で実行してnetnsを必ず削除。不足はskipせずfail）。
@@ -597,7 +607,7 @@ cargo +1.97.1 check --workspace --all-targets --all-features --locked --target x
 これはmusl targetでworkspace全体が型検査を通ることだけを確認するcompile-only portability
 checkです。musl向けartifactのlink、test実行、実NICでのruntime compatibilityは保証しません。
 
-`ruster-io-xdp-native`のunsafe/fake test（RX/Fill engineとTX/Completion半分のheap scripted kernel testを含む）は任意でMiriでも確認できます（nightlyとMiri sysrootが
+`ruster-io-xdp-native`のunsafe/fake test（RX/Fill engine、TX/Completion半分、generated frameのheap scripted kernel testを含む）は任意でMiriでも確認できます（nightlyとMiri sysrootが
 必要。CI gateではありません）。
 
 ```bash
@@ -617,7 +627,10 @@ interfaceには触れません。testはinitial netnsでの実行を拒否し、
 netns/device/capabilityが欠ける場合はskipせずfailします。veth pairは2 queueで、phaseは
 session（X00C）、attach（native attach、peer端からのframeがRX ringへ届く、別queueからの二度目の
 attachが`ExistingProgram`、detach、generic attach）、engine（live mapping上の`RxFillEngine`で
-peerのARP frameが検証を通りlend、recycle、refillされる、X01）、foreign（`ip link set ... xdpgeneric obj`で
+peerのARP frameが検証を通りlend、recycle、refillされる、X01）、tx（peerのARP requestを同じframeで
+replyへ書き換えて送りpeerが学習、in-flight frameをdrain、X02）、generated（generated poolのframeに
+ARP requestを生成してcommitし、peerが送信元を`ip neigh`に学習、completionとdrainでgenerated poolへ
+戻る、X03）、foreign（`ip link set ... xdpgeneric obj`で
 付けた外部programを両modeで拒否しprogram id不変。objectは`scripts/priv-xdp-foreign-elf.py`が
 compilerなしで生成）、holder（attachした別processをSIGKILLしlinkが消える）の順です。
 
