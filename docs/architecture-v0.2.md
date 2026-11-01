@@ -2010,14 +2010,25 @@ owner決定は次のとおりです。
 - 既存のXDP program/linkは置換もdetachもしません。見つかれば`ExistingProgram`でrejectします
   （config `existing-xdp-program = "refuse"`の実装）。
 - detachはlink fdのcloseです。linkをbpffsへpinしないので、process crash（SIGKILLを含む）でも
-  kernelがfdを閉じて自動detachします。
+  kernelがfdを閉じて自動detachします。これは他processがlink fdを持たないこと（exec前の`fork`、
+  `SCM_RIGHTS`、`pidfd_getfd`がない）を前提とします。
+- socketの無いqueueのframeは`XDP_DROP`で捨てます（fail closed、XDP-050）。
 
 APIは`NativeSession`へ統合しました。`attach_xdp(XdpAttachMode::{Native, Generic})`、
 `detach_xdp()`、`xdp_attach_mode()`です（configの`XdpAttachModeV1`と一対一）。別型
 `XdpAttachment`にしなかったのは、attach中もdatapathが`rings(&mut self)`を借用する必要があり、
 sessionを借用するattachment型ではそれができず、所有型にするとsocketより先にlinkを閉じる順序を
 型で保証できないためです。統合した`SessionCore`はXDP object（link、program、map）を先頭field
-に置くので、Drop/`close`は必ずlinkを最初に閉じてから、ring、UMEM、socketを解放します。
+に置くので、Drop/`close`は必ずlinkを最初に閉じ、socketのXSKMAP entryを`BPF_MAP_DELETE_ELEM`で
+削除し、programとmapを閉じてから、ring、UMEM、socketを解放します。entry削除が要るのは、v6.8
+`xsk_map_node_alloc`がentryごとに`bpf_map_inc`し、socketのmap listがmapを参照し続けるためで、
+削除しないとattach/detachや失敗したlinkのたびにmapがsocket closeまで一つずつ残ります。
+`close`の分解代入は全ownerをlocal bindingへmoveするので、仮にpanicしても（現状は各releaseが
+`Result`を返すため到達しない）残りのbindingは宣言の逆順、つまり同じteardown順でdropされます。
+
+ifindexは`open`時にcallerのnetwork namespaceで解決し、linkは`attach_xdp`時のnamespaceで作られます。
+openとattachは同じnamespaceで行う必要があり、間の`setns`は同じifindexの無関係なdeviceへattach
+し得ます。
 
 順序は「session open（bind） → XSKMAP作成 → program load → socketをmapへ挿入 → link作成」です。
 
@@ -2030,13 +2041,17 @@ sessionを借用するattachment型ではそれができず、所有型にする
 | 4 | `CreateLink` | `BPF_LINK_CREATE`（prog fd、ifindex、`BPF_XDP`、`XDP_FLAGS_DRV_MODE`または`XDP_FLAGS_SKB_MODE`） |
 
 step 1〜3はprocess内のobjectだけを作り、interfaceを変えません。socketをlink作成前にmapへ入れる
-ので、最初にredirectされるpacketから届きます。step 4が唯一の外部可視stepでcommit pointです。
+ので、最初にredirectされるpacketから届きます。step 4が唯一の外部可視stepでcommit pointで、
+kernelはRTNL下でlinkをinstallするかrejectします。native modeでdriverの`ndo_bpf`が途中で失敗すると
+driverがlinkを一時的にreset（carrier断）し得ますが、programは残りません。
 Linux v6.8 `dev_xdp_attach`はRTNL下で、同modeのlink（`Can't replace active BPF XDP link`）と
 netlink attach program（`Can't replace active XDP program with BPF link`）にEBUSY、他modeの
-program（`Native and generic XDP can't be active at the same time`）とupper deviceのprogramに
-EEXISTを返します。linkは`XDP_FLAGS_REPLACE`を持てないため、既存programの検出はlink createで
-atomicに行われ（事前queryのTOCTOUなし）、既存programには触れません。各stepの失敗は作成済み
-objectだけをexact reverse orderで閉じ（program → map）、sessionはattachなしのまま使えます。
+program（`Native and generic XDP can't be active at the same time`）と、Linux 5.15以降ではupper
+deviceのprogramにEEXISTを返します（5.9〜5.14はupper deviceを検査しません）。hardware offload
+program（`XDP_FLAGS_HW_MODE`）はnative/genericと共存でき、検出もrejectもしません。linkは
+`XDP_FLAGS_REPLACE`を持てないため、既存programの検出はlink createで行われ（事前queryのTOCTOUなし）、
+既存programには触れません。各stepの失敗は作成済みobjectだけをexact reverse orderで解放し
+（link失敗時はXSKMAP entry削除 → program → map）、sessionはattachなしのまま使えます。
 
 programは手組みのoriginal eBPF（6 slot、48 byte）です。
 
@@ -2044,16 +2059,18 @@ programは手組みのoriginal eBPF（6 slot、48 byte）です。
 0: 61 12 10 00 00 00 00 00   r2 = *(u32 *)(r1 + 16)   ; xdp_md.rx_queue_index
 1: 18 11 00 00 <map fd>      r1 = map_fd ll           ; BPF_PSEUDO_MAP_FD
 2: 00 00 00 00 00 00 00 00                            ; ld_imm64 上位32 bit
-3: b7 03 00 00 02 00 00 00   r3 = XDP_PASS
+3: b7 03 00 00 01 00 00 00   r3 = XDP_DROP
 4: 85 00 00 00 33 00 00 00   call bpf_redirect_map (51)
 5: 95 00 00 00 00 00 00 00   exit
 ```
 
 `bpf_redirect_map`はslotが空（またはqueueが`max_entries`以上）のとき、flagsの下位2 bitを返します。
-fallbackは`XDP_PASS`で、socketの無いqueueはprogramなしと同じくkernel stackへ届きます。RSS設定
-誤りやsocketがmapに入る前後のtrafficを黙ってblack-holeしないためです。代わりにそのpacketは
-routerを通らずhost stackに届くので、M2ではsingle-queue deviceかethtool RSS/ntupleでbind queueへ
-寄せる運用を前提とします（XDP-050）。
+fallbackは`XDP_DROP`（fail closed）です。`XDP_PASS`ではmulti-queue RSSで非bind queueに来たframeが
+kernel stackへ届き、kernelがrouterのfirewall/NATを迂回してforwardしたり、portのARP/ICMPに応答
+したりし得ます。代わりに非bind queueのtrafficは失われるので、M2（1 port 1 queue）ではsingle-queue
+deviceを使うかethtool RSS/ntupleで全trafficをbind queueへ寄せることが前提で、portにkernelのL3設定
+（address、route）を残してはいけません（XDP-050）。startup時にqueue数/steeringを確認してtyped
+errorにするcheckはX04です（XDP-063）。
 
 licenseはrepoのSPDX式`MIT OR Apache-2.0`です。v6.8の`license_is_gpl_compatible`は
 `gpl_only = true`のhelper（とkfunc）だけを制限し、使う唯一のhelper
@@ -2067,10 +2084,10 @@ errorに入れます。errorはvalue-freeな`AttachError{stage, failure, verifie
 | errno | stage | `AttachFailure` |
 |---|---|---|
 | EBUSY、EEXIST | `CreateLink` | `ExistingProgram` |
-| EOPNOTSUPP | native `CreateLink` | `NativeXdpUnsupported`（driverにnative XDPなし） |
-| EACCES | `LoadProgram` | `VerifierRejected` |
-| EPERM、他のEACCES | any | `PermissionDenied`（`CAP_NET_ADMIN`/`CAP_BPF`。5.11前はmemlock超過も） |
-| EINVAL | any | `InvalidArgument` |
+| EOPNOTSUPP | native `CreateLink` | `NativeXdpUnsupported`（driverにnative XDPなし。slaveがprogramを持つbond masterも） |
+| EACCES（verifier logあり） | `LoadProgram` | `VerifierRejected`（verifierはEINVAL/E2BIGでも拒否し得る） |
+| EPERM、他のEACCES | any | `PermissionDenied`（`CAP_NET_ADMIN`/`CAP_BPF`、logが空のloadのEACCESはLSM。5.11前はmemlock超過も） |
+| EINVAL | any | `InvalidArgument`（link createで消えたdeviceはENODEVではなくEINVAL） |
 | E2BIG | any | `TooBig`（insertではqueue ≥ map size） |
 | ENOSPC | any | `NoSpace`（log truncation、vethでRX queue数 < peer TX queue数） |
 | ENOMEM | any | `OutOfMemory` |
@@ -2079,17 +2096,19 @@ errorに入れます。errorはvalue-freeな`AttachError{stage, failure, verifie
 
 production seamは常時、map size 0、NUL終端のないobject名、0または`BPF_MAXINSNS`超のinsn数、
 128 byte超のlicense、128..=`u32::MAX >> 2`外のlog長、負fd、ifindex 0をFFI前に拒否します。
-`union bpf_attr`はこのprofileが書くfieldまでのprefix（44/32/72/16 byte、すべて5.9に存在）だけを
+`union bpf_attr`はこのprofileが書くfieldまでのprefix（create 44/update 32/delete 16/load 72/
+link 16 byte、すべて5.9に存在）だけを
 8-byte alignで渡し、3つのuser pointer（insns、license、log）はcall中生存するborrowから作ります。
 BPF fdは`OwnedBpfFd`（種別付き、Debugでredact、close高々一回）が所有し、raw fdは`syscall.rs`から
 出ません。kernelはbpf fdを常に`O_CLOEXEC`で作ります。
 
 finite fakeはattach 4 stepの各callへの注入、全errno分類、log summary、precondition、detachと
-attach済みteardown 9 releaseの各失敗を検証します（XDP-047〜059）。privileged smoke
+attach済みteardown 10 releaseの各失敗、link失敗時のentry削除とその失敗を検証します（XDP-047〜059）。privileged smoke
 （`scripts/priv-xdp-smoke.sh`）は専用netns内だけの2-queue veth pairで、native attach後にpeer端
 から送ったframeがRX ringへ届くこと、別queueのsocketからの二度目のattachと、`ip link set ...
 xdpgeneric obj`で付けた外部programへのattachが両modeで`ExistingProgram`になりprogram idが
 不変なこと、detach/generic attach/closeによるdetach、attachしたprocessのSIGKILL後にlinkが
-消えることを確認します（XDP-060、XDP-061）。外部program用のELF objectはcompilerなしで
+消えることを確認します（XDP-060、XDP-061）。holderのpidはtmp+renameで公開させ、
+`/proc/<pid>/exe`がtest binaryであることを確認してから採用し、kill直前にも再確認します。外部program用のELF objectはcompilerなしで
 `scripts/priv-xdp-foreign-elf.py`が組み立てます。5.9〜6.xでの実機検証、CI workflow化、link
 down/up、netdev削除、reload時のre-attach policyはX04です（XDP-062）。

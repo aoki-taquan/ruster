@@ -107,7 +107,13 @@ pub(super) fn classify_attach(
             (AttachStage::CreateLink, Some(errno::EOPNOTSUPP)) if native => {
                 AttachFailure::NativeXdpUnsupported
             }
-            (AttachStage::LoadProgram, Some(errno::EACCES)) => AttachFailure::VerifierRejected,
+            // The verifier always logs its rejection; an empty log means an
+            // earlier denial (an LSM `security_bpf_prog_load` hook).
+            (AttachStage::LoadProgram, Some(errno::EACCES))
+                if verifier_log.is_some_and(|log| log.bytes() > 0) =>
+            {
+                AttachFailure::VerifierRejected
+            }
             (_, Some(errno::EPERM | errno::EACCES)) => AttachFailure::PermissionDenied,
             (_, Some(errno::EINVAL)) => AttachFailure::InvalidArgument,
             (_, Some(errno::E2BIG)) => AttachFailure::TooBig,
@@ -133,24 +139,55 @@ pub(super) fn summarize_log(log: &[u8], kernel_truncated: bool) -> VerifierLogSu
     )
 }
 
-/// Attached XDP objects. Field order is drop order: the link first (which
-/// detaches the program), then the program, then the XSKMAP.
+/// XDP objects of one attach, partial while the transaction runs.
+///
+/// [`Self::release`] (also run by Drop) closes the link first, which
+/// detaches the program, then deletes the socket's XSKMAP entry if one was
+/// inserted, then closes the program, then the map. The entry delete
+/// matters because each XSKMAP entry holds a map reference from the
+/// socket's map list: without it, every attach/detach (or failed link)
+/// would keep one map alive until the socket closes.
+///
+/// Each step `take`s its owner first, so if a release ever panicked
+/// (currently unreachable: every release returns a `Result`), unwinding
+/// would run Drop, which releases only the remaining owners, in the same
+/// order and still at most once each.
 pub(super) struct XdpObjects<'s, S: MapsRealMemory> {
-    link: OwnedBpfFd<'s, S>,
-    program: OwnedBpfFd<'s, S>,
-    map: OwnedBpfFd<'s, S>,
+    link: Option<OwnedBpfFd<'s, S>>,
+    program: Option<OwnedBpfFd<'s, S>>,
+    map: Option<OwnedBpfFd<'s, S>>,
+    queue: u32,
+    inserted: bool,
     mode: XdpAttachMode,
 }
 
 impl<S: MapsRealMemory> XdpObjects<'_, S> {
-    /// Closes link, program, and map once each, noting failures.
-    fn close(self, note: &mut impl FnMut(CleanupStage, Result<(), ResourceError>)) {
-        let Self {
-            link, program, map, ..
-        } = self;
-        note(CleanupStage::CloseXdpLink, link.close());
-        note(CleanupStage::CloseXdpProgram, program.close());
-        note(CleanupStage::CloseXskMap, map.close());
+    /// Releases every remaining object once, in teardown order, noting
+    /// each result. A second call does nothing.
+    fn release(&mut self, note: &mut impl FnMut(CleanupStage, Result<(), ResourceError>)) {
+        if let Some(link) = self.link.take() {
+            note(CleanupStage::CloseXdpLink, link.close());
+        }
+        if std::mem::take(&mut self.inserted) {
+            if let Some(map) = self.map.as_ref() {
+                note(
+                    CleanupStage::RemoveXskMapEntry,
+                    map.remove_socket(self.queue),
+                );
+            }
+        }
+        if let Some(program) = self.program.take() {
+            note(CleanupStage::CloseXdpProgram, program.close());
+        }
+        if let Some(map) = self.map.take() {
+            note(CleanupStage::CloseXskMap, map.close());
+        }
+    }
+}
+
+impl<S: MapsRealMemory> Drop for XdpObjects<'_, S> {
+    fn drop(&mut self) {
+        self.release(&mut |_, _| {});
     }
 }
 
@@ -570,6 +607,11 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
 
     /// Releases every resource once in teardown order and reports the first
     /// failure. Failed releases are not retried.
+    ///
+    /// The destructuring moves every owner into a local binding, so a panic
+    /// here (currently unreachable: each release returns a `Result`) would
+    /// still drop the remaining bindings in reverse declaration order, which
+    /// is the same teardown order.
     pub(super) fn close(self) -> Result<(), CleanupError> {
         let Self {
             xdp,
@@ -587,8 +629,8 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
                 first.get_or_insert(cleanup_error(stage, error));
             }
         };
-        if let Some(objects) = xdp {
-            objects.close(&mut note);
+        if let Some(mut objects) = xdp {
+            objects.release(&mut note);
         }
         note(CleanupStage::UnmapTxRing, tx.unmap());
         note(CleanupStage::UnmapRxRing, rx.unmap());
@@ -606,10 +648,11 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
     /// this process, so a failure there leaves the interface untouched. The
     /// socket is in the map before the link exists, so the first redirected
     /// packet already finds it. The link is the single commit point: Linux
-    /// `dev_xdp_attach` refuses with `EBUSY`/`EEXIST` while any other
-    /// program or link is attached (link create never sets
-    /// `XDP_FLAGS_REPLACE`), so an existing program is detected atomically
-    /// under RTNL and never replaced or detached.
+    /// `dev_xdp_attach` refuses with `EBUSY`/`EEXIST` while another program
+    /// or link is attached in the same or the other of native/generic mode
+    /// (link create never sets `XDP_FLAGS_REPLACE`), so such a program is
+    /// detected under RTNL and never replaced or detached. A failed link
+    /// deletes the socket's map entry before closing program and map.
     pub(super) fn attach_xdp(&mut self, mode: XdpAttachMode) -> Result<(), AttachError> {
         let precondition = |failure| AttachError::new(AttachStage::Precondition, failure, None);
         if self.xdp.is_some() {
@@ -654,28 +697,38 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
             }
         };
 
-        map.insert_socket(self.queue, &self.fd)
-            .map_err(at(AttachStage::InsertSocket))?;
-
-        let link = program
-            .create_xdp_link(self.ifindex, flags)
-            .map_err(at(AttachStage::CreateLink))?;
-
-        self.xdp = Some(XdpObjects {
-            link,
-            program,
-            map,
+        // From here on Drop of `objects` releases in teardown order.
+        let mut objects = XdpObjects {
+            link: None,
+            program: Some(program),
+            map: Some(map),
+            queue: self.queue,
+            inserted: false,
             mode,
-        });
+        };
+        if let Some(map) = objects.map.as_ref() {
+            map.insert_socket(self.queue, &self.fd)
+                .map_err(at(AttachStage::InsertSocket))?;
+        }
+        objects.inserted = true;
+
+        if let Some(program) = objects.program.as_ref() {
+            let link = program
+                .create_xdp_link(self.ifindex, flags)
+                .map_err(at(AttachStage::CreateLink))?;
+            objects.link = Some(link);
+        }
+        self.xdp = Some(objects);
         Ok(())
     }
 
-    /// Detaches by closing the link, then closes program and map, each
-    /// once. A session without an attachment is a no-op.
+    /// Detaches by closing the link, then deletes the socket's map entry and
+    /// closes program and map, each once. A session without an attachment
+    /// is a no-op.
     pub(super) fn detach_xdp(&mut self) -> Result<(), CleanupError> {
         let mut first = None;
-        if let Some(objects) = self.xdp.take() {
-            objects.close(&mut |stage, result: Result<(), ResourceError>| {
+        if let Some(mut objects) = self.xdp.take() {
+            objects.release(&mut |stage, result: Result<(), ResourceError>| {
                 if let Err(error) = result {
                     first.get_or_insert(cleanup_error(stage, error));
                 }
@@ -850,12 +903,20 @@ impl NativeSession {
     /// interface that already has any XDP program or link yields
     /// [`AttachFailure::ExistingProgram`](crate::AttachFailure::ExistingProgram);
     /// that program is never replaced or detached. Packets on queues
-    /// without a socket in the map are passed to the kernel stack
-    /// (`XDP_PASS`).
+    /// without a socket in the map are dropped (`XDP_DROP`, fail closed):
+    /// use a single-queue device or steer all traffic to the bound queue.
     ///
     /// The link fd is close-on-exec and never pinned, so it is detached by
     /// [`Self::detach_xdp`], [`Self::close`], drop, or process exit
-    /// (including `SIGKILL`).
+    /// (including `SIGKILL`). That assumes no other process holds the link
+    /// fd: a `fork` without `exec`, `SCM_RIGHTS`, or `pidfd_getfd` would
+    /// keep the link, and the program, alive.
+    ///
+    /// The ifindex was resolved by [`Self::open`] in the caller's network
+    /// namespace, and the link is created in the namespace current at this
+    /// call. Open and attach must therefore run in the same network
+    /// namespace; a `setns` between them can attach to an unrelated device
+    /// that happens to have the same ifindex.
     pub fn attach_xdp(&mut self, mode: XdpAttachMode) -> Result<(), AttachError> {
         self.core.attach_xdp(mode)
     }

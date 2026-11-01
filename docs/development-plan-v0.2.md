@@ -117,7 +117,9 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   crash時auto-detach、typed errno、exact reverse cleanup）はM2 S2（X00D）で追加した（XDP-047〜061）。
   owner決定: `bpf_link`だけを使いminimum kernelはLinux 5.9、既存XDP programは置換もdetachも
   しない、linkはpinしない、licenseは`MIT OR Apache-2.0`（使うhelperはGPL-onlyでない）。5.9〜6.xの
-  実機検証とCI workflowはX04（XDP-062）。datapath engine（S3）、`ruster run`はまだ無い。
+  実機検証とCI workflowはX04（XDP-062）。review決定: socketの無いqueueは`XDP_DROP`（fail closed。
+  firewall/NATの迂回を防ぐ代わりにsingle-queue deviceかbind queueへのsteeringが前提、portにkernel L3
+  設定を残さない。startup checkはX04、XDP-063）。datapath engine（S3）、`ruster run`はまだ無い。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
   ringのsaturationが無い（OBS-017/018 deferred）。core `PublicationQuiescenceGuard::new`はsealされていない。

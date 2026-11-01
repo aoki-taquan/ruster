@@ -77,6 +77,7 @@ const SYS_BPF: c_long = 321;
 pub(super) mod bpf {
     pub(in crate::native_unsafe) const BPF_MAP_CREATE: u32 = 0;
     pub(in crate::native_unsafe) const BPF_MAP_UPDATE_ELEM: u32 = 2;
+    pub(in crate::native_unsafe) const BPF_MAP_DELETE_ELEM: u32 = 3;
     pub(in crate::native_unsafe) const BPF_PROG_LOAD: u32 = 5;
     pub(in crate::native_unsafe) const BPF_LINK_CREATE: u32 = 28;
     /// `enum bpf_map_type` `BPF_MAP_TYPE_XSKMAP`.
@@ -98,6 +99,7 @@ pub(super) mod bpf {
     /// treats the omitted tail as zero.
     pub(in crate::native_unsafe) const MAP_CREATE_ATTR_LEN: usize = 44;
     pub(in crate::native_unsafe) const MAP_UPDATE_ATTR_LEN: usize = 32;
+    pub(in crate::native_unsafe) const MAP_DELETE_ATTR_LEN: usize = 16;
     pub(in crate::native_unsafe) const PROG_LOAD_ATTR_LEN: usize = 72;
     pub(in crate::native_unsafe) const LINK_CREATE_ATTR_LEN: usize = 16;
 }
@@ -197,6 +199,7 @@ pub(super) enum SyscallStage {
     CreateBpfMap,
     LoadBpfProgram,
     UpdateBpfMap,
+    DeleteBpfMapElement,
     CreateBpfLink,
     CloseBpfObject,
 }
@@ -349,8 +352,8 @@ pub(super) trait Syscalls: sealed::Sealed {
     /// # Safety
     ///
     /// `fd` must be an fd owned by the caller that is never used again,
-    /// because its number may be reused immediately. Only `OwnedXdpFd`
-    /// calls this, at most once per fd.
+    /// because its number may be reused immediately. Only `OwnedXdpFd` and
+    /// `OwnedBpfFd` call this, at most once per fd.
     unsafe fn close(&self, fd: RawFd) -> Result<(), Errno>;
     /// `bpf(BPF_MAP_CREATE)` for one XSKMAP; returns an owned CLOEXEC fd.
     fn bpf_map_create(&self, request: &MapCreateRequest) -> Result<RawFd, Errno>;
@@ -360,6 +363,8 @@ pub(super) trait Syscalls: sealed::Sealed {
     /// `bpf(BPF_MAP_UPDATE_ELEM, BPF_NOEXIST)` storing socket fd `value` at
     /// `key`.
     fn bpf_map_update(&self, map_fd: RawFd, key: u32, value: RawFd) -> Result<(), Errno>;
+    /// `bpf(BPF_MAP_DELETE_ELEM)` removing the socket stored at `key`.
+    fn bpf_map_delete(&self, map_fd: RawFd, key: u32) -> Result<(), Errno>;
     /// `bpf(BPF_LINK_CREATE)` with `attach_type = BPF_XDP` on `ifindex`;
     /// returns an owned CLOEXEC link fd.
     fn bpf_link_create(&self, prog_fd: RawFd, ifindex: u32, flags: u32) -> Result<RawFd, Errno>;
@@ -519,8 +524,9 @@ impl Syscalls for LinuxSyscalls {
     }
 
     unsafe fn close(&self, fd: RawFd) -> Result<(), Errno> {
-        // SAFETY: `OwnedXdpFd` transfers each nonnegative owned fd here at most
-        // once. Close is deliberately not retried after an error because the
+        // SAFETY: only `OwnedXdpFd` and `OwnedBpfFd` call this, each
+        // transferring its nonnegative owned fd here at most once. Close is
+        // deliberately not retried after an error because the
         // numeric fd may already have been released and reused.
         let result = unsafe { ffi::close(fd) };
         result_from_minus_one(result).map(|_| ())
@@ -594,6 +600,21 @@ impl Syscalls for LinuxSyscalls {
         // reads them during the call. The attr buffer has exactly the
         // passed length.
         let result = unsafe { attr.call(bpf::BPF_MAP_UPDATE_ELEM) };
+        result_from_fd(result).map(|_| ())
+    }
+
+    fn bpf_map_delete(&self, map_fd: RawFd, key: u32) -> Result<(), Errno> {
+        if map_fd < 0 {
+            return Err(Errno::ArgumentRejected);
+        }
+        let key_bytes = key.to_ne_bytes();
+        let mut attr = BpfAttr::<{ bpf::MAP_DELETE_ATTR_LEN }>::new();
+        attr.put_u32(0, map_fd.unsigned_abs());
+        attr.put_u64(8, key_bytes.as_ptr().expose_provenance() as u64);
+        // SAFETY: `key` points to a live four-byte local of this frame,
+        // matching the XSKMAP key size; the kernel only reads it during the
+        // call. The attr buffer has exactly the passed length.
+        let result = unsafe { attr.call(bpf::BPF_MAP_DELETE_ELEM) };
         result_from_fd(result).map(|_| ())
     }
 
@@ -953,6 +974,19 @@ impl<'syscalls, S: Syscalls> OwnedBpfFd<'syscalls, S> {
             .map_err(|errno| syscall_error(SyscallStage::UpdateBpfMap, errno))
     }
 
+    /// Removes the socket stored at `queue` from this XSKMAP.
+    ///
+    /// Each XSKMAP entry holds a reference on the map from the socket's
+    /// map list, so a map whose fd is closed stays alive until the entry is
+    /// deleted or the socket closes. Deleting first lets the map be freed
+    /// with its fd.
+    pub(super) fn remove_socket(&self, queue: u32) -> Result<(), ResourceError> {
+        let map_fd = self.raw_of(BpfObject::XskMap)?;
+        self.syscalls
+            .bpf_map_delete(map_fd, queue)
+            .map_err(|errno| syscall_error(SyscallStage::DeleteBpfMapElement, errno))
+    }
+
     /// Attaches this program to `ifindex` through a new, unpinned link.
     pub(super) fn create_xdp_link(
         &self,
@@ -1251,6 +1285,10 @@ mod tests {
             key: u32,
             value: RawFd,
         },
+        BpfMapDelete {
+            map_fd: RawFd,
+            key: u32,
+        },
         BpfLinkCreate {
             prog_fd: RawFd,
             ifindex: u32,
@@ -1474,6 +1512,11 @@ mod tests {
         fn bpf_map_update(&self, map_fd: RawFd, key: u32, value: RawFd) -> Result<(), Errno> {
             self.record(Call::BpfMapUpdate { map_fd, key, value });
             self.result(SyscallStage::UpdateBpfMap)
+        }
+
+        fn bpf_map_delete(&self, map_fd: RawFd, key: u32) -> Result<(), Errno> {
+            self.record(Call::BpfMapDelete { map_fd, key });
+            self.result(SyscallStage::DeleteBpfMapElement)
         }
 
         fn bpf_link_create(
@@ -1896,10 +1939,11 @@ mod tests {
             (
                 bpf::BPF_MAP_CREATE,
                 bpf::BPF_MAP_UPDATE_ELEM,
+                bpf::BPF_MAP_DELETE_ELEM,
                 bpf::BPF_PROG_LOAD,
                 bpf::BPF_LINK_CREATE
             ),
-            (0, 2, 5, 28)
+            (0, 2, 3, 5, 28)
         );
         assert_eq!(
             (
@@ -1914,15 +1958,17 @@ mod tests {
             (1, 1, 4_096)
         );
         // `union bpf_attr` prefix ends: map_name (28 + 16), flags (24 + 8),
-        // expected_attach_type (68 + 4), link_create.flags (12 + 4).
+        // key (8 + 8), expected_attach_type (68 + 4), link_create.flags
+        // (12 + 4).
         assert_eq!(
             (
                 bpf::MAP_CREATE_ATTR_LEN,
                 bpf::MAP_UPDATE_ATTR_LEN,
+                bpf::MAP_DELETE_ATTR_LEN,
                 bpf::PROG_LOAD_ATTR_LEN,
                 bpf::LINK_CREATE_ATTR_LEN
             ),
-            (44, 32, 72, 16)
+            (44, 32, 16, 72, 16)
         );
         assert_eq!(std::mem::align_of::<BpfAttr<16>>(), 8);
         assert_eq!(
@@ -1964,11 +2010,13 @@ mod tests {
         map.insert_socket(3, &socket).expect("fake update");
         let link = program.create_xdp_link(9, 4).expect("fake link");
         assert_eq!(link.object(), BpfObject::XdpLink);
+        map.remove_socket(3).expect("fake delete");
 
         // Handles of the wrong kind are refused before the seam.
         let baseline = syscalls.transcript.borrow().len;
         let wrong = ResourceError::Argument(SyscallArgumentError::WrongBpfObject);
         assert_eq!(program.insert_socket(3, &socket), Err(wrong));
+        assert_eq!(link.remove_socket(3), Err(wrong));
         assert_eq!(link.load_redirect_program(&mut log).map(|_| ()), Err(wrong));
         assert_eq!(map.create_xdp_link(9, 4).map(|_| ()), Err(wrong));
         assert_eq!(
@@ -2022,6 +2070,7 @@ mod tests {
                     ifindex: 9,
                     flags: 4,
                 }),
+                Some(Call::BpfMapDelete { map_fd: 30, key: 3 }),
                 Some(Call::Close { fd: 32 }),
                 Some(Call::Close { fd: 31 }),
                 Some(Call::Close { fd: 30 }),
@@ -2111,6 +2160,7 @@ mod tests {
         }
         assert_eq!(linux.bpf_map_update(-1, 0, 3), Err(Errno::ArgumentRejected));
         assert_eq!(linux.bpf_map_update(3, 0, -1), Err(Errno::ArgumentRejected));
+        assert_eq!(linux.bpf_map_delete(-1, 0), Err(Errno::ArgumentRejected));
         assert_eq!(
             linux.bpf_link_create(-1, 1, 4),
             Err(Errno::ArgumentRejected)

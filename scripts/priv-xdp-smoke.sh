@@ -48,12 +48,33 @@ netns="ruster-x00c-$$-$suffix"
 device=rx00c0
 peer=rx00c1
 work=$(mktemp -d "${TMPDIR:-/tmp}/ruster-priv-xdp.XXXXXX")
+binary_path=$(readlink -f "$binary")
 holder_pid=
+launcher=
+
+# True only if `$1` is a live process running the prebuilt test binary.
+is_holder() {
+    [ -n "$1" ] && [ "$(sudo -n readlink "/proc/$1/exe" 2>/dev/null)" = "$binary_path" ]
+}
+
+ready="$work/holder.pid"
 
 cleanup() {
-    if [ -n "$holder_pid" ]; then
-        # Only the holder process recorded by this script, if still alive.
+    if [ -n "$launcher" ] && [ -z "$holder_pid" ] && [ -s "$ready" ]; then
+        # A holder that published its pid after a failed check or timeout.
+        holder_pid=$(tr -cd '0-9' <"$ready")
+    fi
+    # Re-verify right before the kill: never signal a pid that is not the
+    # test binary (it may have exited and the number been reused).
+    if is_holder "$holder_pid"; then
         sudo -n kill -KILL "$holder_pid" 2>/dev/null || true
+    fi
+    holder_pid=
+    if [ -n "$launcher" ]; then
+        # Reap the launcher so no holder outlives the script. A holder that
+        # never published a pid exits by itself within 30 seconds.
+        wait "$launcher" 2>/dev/null || true
+        launcher=
     fi
     sudo -n ip netns del "$netns" 2>/dev/null || true
     rm -rf "$work"
@@ -150,7 +171,6 @@ test -z "$(xdp_prog)" || {
 }
 
 # Holder: attach in a separate process, then SIGKILL it.
-ready="$work/holder.pid"
 in_netns env \
     RUSTER_PRIV_XDP=1 \
     RUSTER_PRIV_XDP_PHASE=holder \
@@ -161,6 +181,7 @@ in_netns env \
     --nocapture --test-threads=1 >"$work/holder.log" 2>&1 &
 launcher=$!
 tries=0
+# The holder publishes the file by rename, so it is complete once present.
 while [ ! -s "$ready" ]; do
     tries=$((tries + 1))
     if [ "$tries" -gt 200 ]; then
@@ -170,13 +191,13 @@ while [ ! -s "$ready" ]; do
     fi
     sleep 0.05
 done
-holder_pid=$(tr -cd '0-9' <"$ready")
-test -n "$holder_pid"
-# The recorded pid must be the prebuilt test binary in the namespace.
-test "$(sudo -n readlink "/proc/$holder_pid/exe")" = "$(readlink -f "$binary")" || {
+candidate=$(tr -cd '0-9' <"$ready")
+# Adopt the pid only once it is proven to be the prebuilt test binary.
+is_holder "$candidate" || {
     echo "priv-xdp-smoke: holder pid does not belong to the test binary" >&2
     exit 1
 }
+holder_pid=$candidate
 case $(xdp_prog) in
 xdp\ [0-9]*) ;;
 *)
@@ -185,11 +206,17 @@ xdp\ [0-9]*) ;;
     ;;
 esac
 if command -v bpftool >/dev/null 2>&1; then
+    # Netlink query of this namespace's device only.
     in_netns bpftool net show dev "$device"
 fi
+is_holder "$holder_pid" || {
+    echo "priv-xdp-smoke: holder exited before SIGKILL" >&2
+    exit 1
+}
 sudo -n kill -KILL "$holder_pid"
 holder_pid=
 wait "$launcher" 2>/dev/null || true
+launcher=
 tries=0
 while [ -n "$(xdp_prog)" ]; do
     tries=$((tries + 1))

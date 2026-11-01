@@ -110,13 +110,15 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   `SessionError{stage, failure}`（PermissionDenied、MemlockLimit、NoSuchDevice、Busy等）。
   ring viewは`rings(&mut self)`が実mappingを排他borrowして貸すためmappingより長命になれない。
   M2 S2（X00D）の`NativeSession::attach_xdp(XdpAttachMode::{Native, Generic})`は、手組みの
-  original eBPF redirect program（`rx_queue_index`でXSKMAPを引き、空slotは`XDP_PASS`）を
+  original eBPF redirect program（`rx_queue_index`でXSKMAPを引き、空slotは`XDP_DROP`でfail closed）を
   `bpf(2)`で直接loadし、`queue + 1` slotのXSKMAPへsocketを入れてから`BPF_LINK_CREATE`で
   attachする（libbpf不要、minimum kernel 5.9、license `MIT OR Apache-2.0`）。既存のXDP program/
   linkがあれば置換もdetachもせず`ExistingProgram`で拒否し、失敗時は作成済みobjectだけを逆順に
   閉じる。detachはlink fdのclose（`detach_xdp`、`close`、drop）で、linkはpinしないため
   process crashでも自動detachされる。errorはvalue-freeな`AttachError{stage, failure}`で、
-  verifier logは長さとtruncationだけを返す。datapath engine（S3）、UMEM byte access、core
+  verifier logは長さとtruncationだけを返す。bind queue以外のframeは捨てる（firewall/NATの迂回を
+  防ぐ）ので、portはsingle-queue deviceにするかethtool RSS/ntupleでbind queueへ寄せ、kernelの
+  L3設定を残さない。datapath engine（S3）、UMEM byte access、core
   `PacketIo`接続はまだ持たず、FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
   privileged smokeは`scripts/priv-xdp-smoke.sh`（`sudo -n`で専用netnsとその中だけのveth pairを
   作り、`RUSTER_PRIV_XDP=1`で実行してnetnsを必ず削除。不足はskipせずfail）。

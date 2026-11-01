@@ -387,9 +387,12 @@ fn priv_xdp_attach_holder_waits_for_sigkill() {
     session
         .attach_xdp(XdpAttachMode::Native)
         .expect("native attach");
-    fs::write(&ready, format!("{}\n", std::process::id())).expect("write ready file");
+    // Write then rename, so the script never reads a partial pid.
+    let partial = format!("{ready}.partial");
+    fs::write(&partial, format!("{}\n", std::process::id())).expect("write ready file");
+    fs::rename(&partial, &ready).expect("publish ready file");
     eprintln!("priv_xdp_holder: attached; waiting for SIGKILL");
     // The script kills this process; returning normally means it did not.
-    sleep(Duration::from_secs(60));
-    panic!("holder was not killed within 60 seconds");
+    sleep(Duration::from_secs(30));
+    panic!("holder was not killed within 30 seconds");
 }

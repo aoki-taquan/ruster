@@ -113,6 +113,10 @@ enum Call {
         key: u32,
         value: RawFd,
     },
+    MapDelete {
+        map_fd: RawFd,
+        key: u32,
+    },
     LinkCreate {
         prog_fd: RawFd,
         ifindex: u32,
@@ -488,6 +492,10 @@ impl Syscalls for SessionFake {
         self.record(Call::MapUpdate { map_fd, key, value }).1
     }
 
+    fn bpf_map_delete(&self, map_fd: RawFd, key: u32) -> Result<(), Errno> {
+        self.record(Call::MapDelete { map_fd, key }).1
+    }
+
     fn bpf_link_create(&self, prog_fd: RawFd, ifindex: u32, flags: u32) -> Result<RawFd, Errno> {
         self.record(Call::LinkCreate {
             prog_fd,
@@ -624,6 +632,7 @@ fn reverse_cleanup(prefix: &[Call], failed: Option<usize>) -> Vec<Call> {
         match *call {
             Call::Socket { .. } => cleanup.push(Call::Close { fd: FAKE_FD }),
             Call::MapCreate { .. } => cleanup.push(Call::Close { fd: FAKE_MAP_FD }),
+            Call::MapUpdate { map_fd, key, .. } => cleanup.push(Call::MapDelete { map_fd, key }),
             Call::ProgLoad { .. } => cleanup.push(Call::Close { fd: FAKE_PROG_FD }),
             Call::LinkCreate { .. } => cleanup.push(Call::Close { fd: FAKE_LINK_FD }),
             Call::MapAnonymous { len } | Call::MapShared { len, .. } => cleanup.push(Call::Unmap {
@@ -1275,8 +1284,12 @@ fn attach_calls(flags: u32) -> Vec<Call> {
     ]
 }
 
-const DETACH_CALLS: [Call; 3] = [
+const DETACH_CALLS: [Call; 4] = [
     Call::Close { fd: FAKE_LINK_FD },
+    Call::MapDelete {
+        map_fd: FAKE_MAP_FD,
+        key: 3,
+    },
     Call::Close { fd: FAKE_PROG_FD },
     Call::Close { fd: FAKE_MAP_FD },
 ];
@@ -1484,7 +1497,8 @@ fn native_xdp_attach_errnos_map_to_typed_value_free_failures() {
         (A::CreateMap, errno::EBUSY, true, F::Errno(errno::EBUSY)),
         (A::CreateMap, errno::EINVAL, true, F::InvalidArgument),
         (A::CreateMap, errno::ENOMEM, true, F::OutOfMemory),
-        (A::LoadProgram, errno::EACCES, true, F::VerifierRejected),
+        // EACCES without a verifier log is an LSM denial, not the verifier.
+        (A::LoadProgram, errno::EACCES, true, F::PermissionDenied),
         (A::LoadProgram, errno::EPERM, true, F::PermissionDenied),
         (A::LoadProgram, errno::EINVAL, true, F::InvalidArgument),
         (A::LoadProgram, errno::E2BIG, true, F::TooBig),
@@ -1504,6 +1518,16 @@ fn native_xdp_attach_errnos_map_to_typed_value_free_failures() {
             classify_attach(stage, syscall(raw), native, None),
             AttachError::new(stage, failure, None),
             "{stage:?} errno {raw} native {native}"
+        );
+    }
+    for (log, failure) in [
+        (VerifierLogSummary::new(0, false), F::PermissionDenied),
+        (VerifierLogSummary::new(1, false), F::VerifierRejected),
+        (VerifierLogSummary::new(4_096, true), F::VerifierRejected),
+    ] {
+        assert_eq!(
+            classify_attach(A::LoadProgram, syscall(errno::EACCES), true, Some(log)),
+            AttachError::new(A::LoadProgram, failure, Some(log))
         );
     }
     for (error, failure) in [
@@ -1553,10 +1577,8 @@ fn native_xdp_attach_errnos_map_to_typed_value_free_failures() {
         );
         let mut expected = base;
         expected.extend(attach_calls(flags));
-        expected.extend([
-            Call::Close { fd: FAKE_PROG_FD },
-            Call::Close { fd: FAKE_MAP_FD },
-        ]);
+        // The failed link deletes the map entry before closing.
+        expected.extend(DETACH_CALLS[1..].iter().copied());
         assert_eq!(fake.transcript(), expected);
         assert_eq!(
             format!("{error}"),
@@ -1565,6 +1587,45 @@ fn native_xdp_attach_errnos_map_to_typed_value_free_failures() {
         drop(session);
         fake.assert_released();
     }
+
+    // A failing entry delete after a failed link is not retried; program
+    // and map are still closed and the link error is reported.
+    let fake = SessionFake::new();
+    let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("session");
+    let base = fake.transcript();
+    fake.fail_at
+        .set(Some((base.len() + 4, Errno::Linux(errno::EBUSY))));
+    fake.also_fail_at
+        .set(Some((base.len() + 5, Errno::Linux(errno::EINVAL))));
+    assert_eq!(
+        session.attach_xdp(XdpAttachMode::Native),
+        Err(AttachError::new(A::CreateLink, F::ExistingProgram, None))
+    );
+    let mut expected = base;
+    expected.extend(attach_calls(NATIVE_FLAGS));
+    expected.extend(DETACH_CALLS[1..].iter().copied());
+    assert_eq!(fake.transcript(), expected);
+    assert_eq!(fake.open_fds.get(), 1);
+    drop(session);
+    fake.assert_released();
+
+    // An LSM denial at load (EACCES with an empty log) end to end.
+    let fake = SessionFake::new();
+    let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("session");
+    fake.fail_at.set(Some((
+        fake.transcript().len() + 2,
+        Errno::Linux(errno::EACCES),
+    )));
+    assert_eq!(
+        session.attach_xdp(XdpAttachMode::Native),
+        Err(AttachError::new(
+            A::LoadProgram,
+            F::PermissionDenied,
+            Some(VerifierLogSummary::new(0, false))
+        ))
+    );
+    drop(session);
+    fake.assert_released();
 
     // Native XDP unsupported by the driver.
     let fake = SessionFake::new();
@@ -1648,6 +1709,7 @@ fn native_xdp_verifier_log_is_bounded_summarized_and_never_rendered() {
 fn native_xdp_detach_failures_never_retry_or_leak() {
     let stages = [
         CleanupStage::CloseXdpLink,
+        CleanupStage::RemoveXskMapEntry,
         CleanupStage::CloseXdpProgram,
         CleanupStage::CloseXskMap,
     ];
@@ -1670,10 +1732,11 @@ fn native_xdp_detach_failures_never_retry_or_leak() {
         fake.assert_released();
     }
 
-    // Explicit close of an attached session: each of the nine releases may
+    // Explicit close of an attached session: each of the ten releases may
     // fail; every later resource is still released exactly once.
     let teardown = [
         CleanupStage::CloseXdpLink,
+        CleanupStage::RemoveXskMapEntry,
         CleanupStage::CloseXdpProgram,
         CleanupStage::CloseXskMap,
         CleanupStage::UnmapTxRing,

@@ -347,10 +347,13 @@ pub enum XdpAttachMode {
 
 /// Ordered step of one XDP attach transaction.
 ///
-/// A failure at one step closes every object created by the earlier steps
-/// in exact reverse order. Only [`AttachStage::CreateLink`] changes the
-/// interface, and it is the commit point: the kernel either attaches the
-/// link atomically or leaves the interface untouched.
+/// A failure at one step releases every object created by the earlier steps
+/// in exact reverse order (after a failed link, the socket's map entry is
+/// deleted first). Only [`AttachStage::CreateLink`] changes the interface,
+/// and it is the commit point: the kernel either installs the link or
+/// rejects it under RTNL. In native mode a driver whose `ndo_bpf` fails
+/// part-way may briefly reset its link (carrier) before returning the
+/// error; no XDP program is left attached.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttachStage {
     /// Checks before any syscall: not already attached, mode compatible.
@@ -375,25 +378,34 @@ pub enum AttachFailure {
     /// Generic XDP was requested for a zero-copy session.
     GenericRequiresCopyMode,
     /// `EBUSY` or `EEXIST` from `BPF_LINK_CREATE`: another XDP program or
-    /// link is attached to the interface (in this or the other XDP mode, or
-    /// on an upper device). The existing program is never replaced or
-    /// detached; the interface is unchanged.
+    /// link is attached to the interface in the requested mode or in the
+    /// other of native/generic mode, or (Linux 5.15+) to an upper device.
+    /// The existing program is never replaced or detached. A
+    /// hardware-offloaded program (`XDP_FLAGS_HW_MODE`) can coexist with a
+    /// native or generic one and is not reported.
     ExistingProgram,
     /// `EOPNOTSUPP` from a native `BPF_LINK_CREATE`: the driver has no
-    /// native XDP support.
+    /// native XDP support. A bond master whose slave already runs its own
+    /// XDP program also reports this.
     NativeXdpUnsupported,
     /// `EPERM`, or `EACCES` outside program load: typically missing
     /// `CAP_NET_ADMIN` (XSKMAP, link) or `CAP_BPF`/`CAP_SYS_ADMIN` (load). On
     /// Linux before 5.11 a map or program over `RLIMIT_MEMLOCK` also
     /// reports `EPERM`.
     PermissionDenied,
-    /// `EACCES` from `BPF_PROG_LOAD`: the verifier rejected the program.
+    /// `EACCES` from `BPF_PROG_LOAD` with a nonempty verifier log: the
+    /// verifier rejected the program. `EACCES` with an empty log is an
+    /// earlier denial (an LSM hook) and reports [`Self::PermissionDenied`].
+    /// The verifier can also reject with `EINVAL` or `E2BIG`.
     VerifierRejected,
-    /// `EINVAL`.
+    /// `EINVAL`. At [`AttachStage::CreateLink`] this includes an ifindex
+    /// that no longer exists in the caller's network namespace (Linux
+    /// `bpf_xdp_link_attach` reports a vanished device as `EINVAL`, not
+    /// `ENODEV`).
     InvalidArgument,
     /// `E2BIG`: at [`AttachStage::InsertSocket`] the queue index is not
     /// below the map size; at load, a `bpf_attr` tail the kernel does not
-    /// know.
+    /// know or a verifier complexity limit.
     TooBig,
     /// `ENOSPC`: at load, the bounded verifier log was truncated; at link
     /// creation, a driver resource limit (veth: fewer RX queues than the
@@ -496,6 +508,9 @@ impl Error for AttachError {}
 pub enum CleanupStage {
     /// XDP link `close`: detaches the program (attached sessions only).
     CloseXdpLink,
+    /// `BPF_MAP_DELETE_ELEM` of the socket's XSKMAP entry, which otherwise
+    /// keeps the map alive until the socket closes.
+    RemoveXskMapEntry,
     /// XDP program fd `close`.
     CloseXdpProgram,
     /// XSKMAP fd `close`.

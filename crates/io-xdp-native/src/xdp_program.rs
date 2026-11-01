@@ -12,7 +12,7 @@
 //! ```text
 //! 0: r2 = *(u32 *)(r1 + 16)   ; r2 = ctx->rx_queue_index
 //! 1: r1 = map_fd ll           ; ld_imm64, src_reg BPF_PSEUDO_MAP_FD (two slots)
-//! 3: r3 = 2                   ; XDP_PASS: action if the XSKMAP slot is empty
+//! 3: r3 = 1                   ; XDP_DROP: action if the XSKMAP slot is empty
 //! 4: call 51                  ; r0 = bpf_redirect_map(r1, r2, r3)
 //! 5: exit                     ; return r0
 //! ```
@@ -87,23 +87,25 @@ pub(crate) const BPF_PSEUDO_MAP_FD: u8 = 1;
 pub(crate) const BPF_FUNC_REDIRECT_MAP: i32 = 51;
 /// `offsetof(struct xdp_md, rx_queue_index)`.
 pub(crate) const XDP_MD_RX_QUEUE_INDEX: i16 = 16;
-/// `enum xdp_action` `XDP_PASS`.
-pub(crate) const XDP_PASS: i32 = 2;
-/// `enum xdp_action` `XDP_DROP`, recorded for the fallback decision only.
-#[cfg(test)]
+/// `enum xdp_action` `XDP_DROP`.
 pub(crate) const XDP_DROP: i32 = 1;
+/// `enum xdp_action` `XDP_PASS`, recorded for the fallback decision only.
+#[cfg(test)]
+pub(crate) const XDP_PASS: i32 = 2;
 
 /// Action `bpf_redirect_map` returns when the XSKMAP slot of the receive
 /// queue is empty (the low two flag bits, Linux 5.3+).
 ///
-/// `XDP_PASS` is chosen deliberately: a queue without a bound socket keeps
-/// ordinary kernel-stack delivery, exactly as if no program were attached,
-/// so a misconfigured RSS spread or a socket that is not yet (or no longer)
-/// in the map cannot silently black-hole traffic. The trade-off is that
-/// such packets reach the host stack instead of the router: M2 binds one
-/// queue per port, and operators must steer traffic to that queue
-/// (single-queue device or ethtool RSS/ntuple). See XDP-050.
-pub(crate) const REDIRECT_FALLBACK_ACTION: i32 = XDP_PASS;
+/// `XDP_DROP` is chosen deliberately: the router fails closed. With
+/// `XDP_PASS`, a frame on a queue without a bound socket (a multi-queue RSS
+/// spread, or the window before the socket is in the map) would reach the
+/// kernel stack, which could forward it around the router's firewall and
+/// NAT or answer ARP/ICMP for the port. The cost is that such frames are
+/// lost: M2 binds one queue per port, so operators must use a single-queue
+/// device or steer all traffic to the bound queue (ethtool RSS/ntuple),
+/// and a port must not keep kernel L3 configuration. See XDP-050; a startup
+/// check of the queue/steering setup is X04 (XDP-063).
+pub(crate) const REDIRECT_FALLBACK_ACTION: i32 = XDP_DROP;
 
 const R1: u8 = 1;
 const R2: u8 = 2;
@@ -123,7 +125,7 @@ pub(crate) const REDIRECT_PROGRAM_TEMPLATE: [BpfInsn; REDIRECT_PROGRAM_LEN] = [
     BpfInsn::new(BPF_LD | BPF_IMM | BPF_DW, R1, BPF_PSEUDO_MAP_FD, 0, 0),
     // ld_imm64 high half: all-zero code/regs/off, imm = upper 32 bits (0).
     BpfInsn::new(0, 0, 0, 0, 0),
-    // 0xb7: ALU64 | MOV | K. dst r3, imm XDP_PASS.
+    // 0xb7: ALU64 | MOV | K. dst r3, imm XDP_DROP.
     BpfInsn::new(
         BPF_ALU64 | BPF_MOV | BPF_K,
         R3,
@@ -189,7 +191,7 @@ mod tests {
         [0x61, 0x12, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00],
         [0x18, 0x11, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00],
         [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        [0xb7, 0x03, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00],
+        [0xb7, 0x03, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00],
         [0x85, 0x00, 0x00, 0x00, 0x33, 0x00, 0x00, 0x00],
         [0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
     ];
@@ -236,7 +238,7 @@ mod tests {
             ),
             (1, 51, 16)
         );
-        assert_eq!((XDP_DROP, XDP_PASS, REDIRECT_FALLBACK_ACTION), (1, 2, 2));
+        assert_eq!((XDP_DROP, XDP_PASS, REDIRECT_FALLBACK_ACTION), (1, 2, 1));
         assert_eq!((XDP_FLAGS_SKB_MODE, XDP_FLAGS_DRV_MODE), (2, 4));
         assert_eq!(PROGRAM_LICENSE.to_bytes(), b"MIT OR Apache-2.0");
         assert!(PROGRAM_LICENSE.to_bytes_with_nul().len() <= 128);
