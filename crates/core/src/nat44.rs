@@ -980,6 +980,47 @@ mod tcp_tests {
     /// Unauthenticated inbound SYNs that pass the NAT filter run before any
     /// firewall decision, so their work is bounded by
     /// `NAT44_TCP_INBOUND_SLOT_PROBES`, not by the session capacity.
+    /// Outbound creation fills slots from index 0, so live slots cluster.
+    /// Inbound probes are independent keyed positions: at half occupancy a
+    /// miss has probability about 2^-16, not about 1/2 as a window starting
+    /// inside the live cluster would give.
+    #[test]
+    fn tcp_inbound_slot_probes_are_independent_of_outbound_clustering() {
+        const SESSIONS: usize = 256;
+        let policy = Nat44TcpPolicy::default().with_filtering(Nat44Filtering::EndpointIndependent);
+        with_config(policy, 40_000, 40_000, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); SESSIONS];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            for port in 1..=(SESSIONS / 2) as u16 {
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, port, true, 0)
+                    .unwrap();
+                runtime.commit_outbound(plan, 0).unwrap();
+            }
+            // Live slots are exactly the low half.
+            assert!(runtime.sessions()[..SESSIONS / 2]
+                .iter()
+                .all(|slot| slot.is_occupied()));
+            assert!(runtime.sessions()[SESSIONS / 2..]
+                .iter()
+                .all(|slot| !slot.is_occupied()));
+            let mut misses = 0;
+            for remote_port in 1..=1000 {
+                runtime.reusable_session_checks.set(0);
+                match runtime.plan_inbound_read_only(40_000, REMOTE2, remote_port, true, 1) {
+                    Ok(_) => {}
+                    Err(Nat44TcpPlanError::SessionFull) => misses += 1,
+                    Err(error) => panic!("unexpected {error:?}"),
+                }
+                assert!(runtime.reusable_session_checks.get() <= NAT44_TCP_INBOUND_SLOT_PROBES);
+            }
+            // Expected about 1000 * 2^-16 = 0.015; consecutive windows gave
+            // about 440 here.
+            assert!(misses <= 2, "{misses} of 1000 inbound SYNs missed");
+        });
+    }
+
     #[test]
     fn tcp_inbound_syn_work_is_bounded_independent_of_session_capacity() {
         const SESSIONS: usize = 64;
@@ -5223,12 +5264,16 @@ impl<'a> Nat44TcpRuntime<'a> {
 
     /// Bounded slot search for an inbound-initiated session.
     ///
-    /// Examines at most [`NAT44_TCP_INBOUND_SLOT_PROBES`] consecutive slots
-    /// (wrapping) from a start derived from the runtime's secret hash key,
-    /// the tuple, and the time, so an external sender cannot steer the
-    /// window and a retransmitted SYN probes a different window. A miss is
-    /// `SessionFull` even if a reusable slot exists outside the window; the
-    /// outbound path keeps its full scan.
+    /// A table of at most [`NAT44_TCP_INBOUND_SLOT_PROBES`] slots is
+    /// scanned whole. A larger one gets that many probes, each at an
+    /// independent position keyed by the runtime's secret hash key, the
+    /// tuple, the time, and the probe number. An external sender cannot
+    /// steer the positions, and a retransmitted SYN probes others. Probes
+    /// are independent of where outbound creation clusters live slots (it
+    /// fills from index 0), so with live fraction ρ a miss has probability
+    /// about ρ^16 (well under 10^-4 at ρ = 1/2). A miss is `SessionFull`
+    /// even if a reusable slot exists elsewhere; the outbound path keeps its
+    /// full scan.
     fn find_reusable_session_for_inbound(
         &self,
         mapping_index: usize,
@@ -5241,20 +5286,26 @@ impl<'a> Nat44TcpRuntime<'a> {
         if capacity == 0 {
             return None;
         }
-        let words = [
+        if capacity <= NAT44_TCP_INBOUND_SLOT_PROBES {
+            return (0..capacity).find(|&index| self.session_slot_reusable(index, now_ms));
+        }
+        let mut words = [
             mapping_index as u64,
             mapping.generation,
             u64::from(u32::from_be_bytes(remote_address.octets())),
             u64::from(remote_port),
             now_ms,
+            0,
         ];
-        let start = self
-            .hash_key
-            .0
-            .hash_words(DirectoryHashDomain::TcpInboundSlot, &words);
-        let start = usize::try_from(start % capacity as u64).expect("index below capacity");
-        (0..capacity.min(NAT44_TCP_INBOUND_SLOT_PROBES))
-            .map(|step| (start + step) % capacity)
+        (0..NAT44_TCP_INBOUND_SLOT_PROBES as u64)
+            .map(|probe| {
+                words[5] = probe;
+                let position = self
+                    .hash_key
+                    .0
+                    .hash_words(DirectoryHashDomain::TcpInboundSlot, &words);
+                usize::try_from(position % capacity as u64).expect("index below capacity")
+            })
             .find(|&index| self.session_slot_reusable(index, now_ms))
     }
 

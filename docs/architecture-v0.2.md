@@ -620,9 +620,12 @@ filterを通ったinbound initial SYNは認証されておらず、firewallの�
 それを越えるchainは拒否（fail closed）とします。同じ`(mapping, remote IPv4)`のsessionは全て
 同じbucketに入るためchainはsession capacity近くまで伸び得ますが、lookupはどの場合も16 node
 までです。新sessionのslotは、exact tupleのexpired slotがあればそれを再利用し、無ければ
-runtimeのsecret hash key、tuple、時刻から決めた開始位置から連続する最大16 slotだけを調べます。
-outboundのindex 0からの全scan（NAT44-035）はinbound開始では使いません。外部senderは窓を
-選べず、再送SYNは別の窓を調べます。窓内に空きが無ければ他所に空きがあっても
+16 slot以下のtableは全体を、それより大きいtableはruntimeのsecret hash key、tuple、時刻、
+probe番号から独立に決めた16個のslot位置だけを調べます。outboundのindex 0からの全scan
+（NAT44-035）はinbound開始では使いません。外部senderは位置を選べず、再送SYNは別の位置を
+調べます。outbound作成がlive slotを低indexへ集めても各probeは独立なので、live率ρのとき
+missの確率は約ρ^16です（ρ = 1/2で約1.5×10^-5。連続16 slotの窓では窓がlive領域から始まると
+ほぼ必ず満杯で、missが約ρになっていました）。probe位置に空きが無ければ他所に空きがあっても
 `NAT44_TCP_SESSION_TABLE_FULL`でdropし、live sessionをevictしません（inbound開始はbest-effort）。
 session作成は
 exact session directoryとremote-address directoryの両方へprepared link/relinkを
