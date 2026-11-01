@@ -73,19 +73,23 @@ pub use io::{
 pub use nat44::{
     Nat44Filtering, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpCounters,
     Nat44TcpDisposition, Nat44TcpHashKey, Nat44TcpHashKeyError, Nat44TcpIndexStorage,
-    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpReconcileError,
-    Nat44TcpReconcilePermit, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError,
-    Nat44TcpSessionSlot, Nat44TcpStorageShape, Nat44UdpConfig, Nat44UdpConfigError,
-    Nat44UdpCounters, Nat44UdpDisposition, Nat44UdpHashKey, Nat44UdpHashKeyError,
-    Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
-    Nat44UdpPolicyError, Nat44UdpReconcileError, Nat44UdpReconcilePermit, Nat44UdpReconcileReport,
-    Nat44UdpRuntime, Nat44UdpRuntimeConfigError, Nat44UdpStorageShape,
-    NAT44_TCP_DEFAULT_IDLE_TTL_MS, NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE,
-    NAT44_TCP_INBOUND_SLOT_PROBES, NAT44_TCP_MAX_IDLE_TTL_MS,
-    NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE, NAT44_TCP_MIN_IDLE_TTL_MS,
-    NAT44_UDP_DEFAULT_IDLE_TTL_MS, NAT44_UDP_MAX_IDLE_TTL_MS, NAT44_UDP_MIN_IDLE_TTL_MS,
+    Nat44TcpMappingSlot, Nat44TcpOccupancy, Nat44TcpPolicy, Nat44TcpPolicyError,
+    Nat44TcpReconcileError, Nat44TcpReconcilePermit, Nat44TcpReconcileReport, Nat44TcpRuntime,
+    Nat44TcpRuntimeConfigError, Nat44TcpSessionSlot, Nat44TcpStorageShape, Nat44UdpConfig,
+    Nat44UdpConfigError, Nat44UdpCounters, Nat44UdpDisposition, Nat44UdpHashKey,
+    Nat44UdpHashKeyError, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpOccupancy,
+    Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Nat44UdpReconcileError,
+    Nat44UdpReconcilePermit, Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError,
+    Nat44UdpStorageShape, NAT44_TCP_DEFAULT_IDLE_TTL_MS,
+    NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE, NAT44_TCP_INBOUND_SLOT_PROBES,
+    NAT44_TCP_MAX_IDLE_TTL_MS, NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE,
+    NAT44_TCP_MIN_IDLE_TTL_MS, NAT44_UDP_DEFAULT_IDLE_TTL_MS, NAT44_UDP_MAX_IDLE_TTL_MS,
+    NAT44_UDP_MIN_IDLE_TTL_MS,
 };
-pub use observability::{BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields};
+pub(crate) use observability::OccupancyCounter;
+pub use observability::{
+    BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields, TableOccupancy,
+};
 pub use packet::{
     validate_arp, validate_arp_request, validate_ipv4_frame, ArpOpcode, MacAddress, ValidatedArp,
     ValidatedArpRequest, ValidatedIpv4, ARP_ETHERTYPE, ETHERNET_HEADER_LEN, IPV4_ETHERTYPE,

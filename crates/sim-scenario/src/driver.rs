@@ -46,7 +46,8 @@ use ruster_core::{
 use ruster_io_sim::{FrameOrigin, SimIo, SimPublicationQuiescenceError};
 use ruster_runtime::{
     run_tick, ApplyFlushCounts, HealthPolicy, ObservabilitySnapshot, PhaseReport,
-    PublicationOutcome, RxPhaseReport, ServiceCounters, TickBudgets, TickObserver,
+    PublicationOutcome, RxPhaseReport, ServiceCounters, ServiceOccupancy, TickBudgets,
+    TickObserver,
 };
 
 use crate::output::{hex_string, Line};
@@ -619,6 +620,14 @@ impl SimRun<'_> {
         );
         let generation = self.active.generation();
         self.observer.observe_tick(now, Some(generation), &report);
+        // Sampled after every tick so the lifetime peak survives flushes.
+        let active = &self.active;
+        self.observer.record_occupancy(ServiceOccupancy::capture(
+            active.icmpv4_errors(),
+            active.nat44_udp(),
+            active.nat44_tcp(),
+            active.firewall(),
+        ));
         let publication = match report.publication {
             PublicationOutcome::Unchanged => TickPublication::Unchanged,
             PublicationOutcome::Applied => {

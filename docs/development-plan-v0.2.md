@@ -100,8 +100,9 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   作り直さない（SIM-016 deferred）。process restartをまたぐgeneration/key履歴は無い。
 - OS乱数によるproduction key source（`OsRandomKeySource`）と、sim専用key sourceを型で拒否する
   `ProductionSequencer`はM2 S7で追加した（PUB-010〜013）。これを使う`ruster run`はまだ無い（M2）。
-- NAT/FW占有、resolution/action/audit high-watermark、native ringのsaturationが無い
-  （OBS-015/017/018 deferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
+- NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
+  OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
+  ringのsaturationが無い（OBS-017/018 deferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
 - optional serviceを表すcomposition seamが無く、M1はUDP/TCP NAT44+FWを必須とする。
 - `ruster run-sim`によるfrozen benchmark spec SHAの表示（R12 acceptance）が無い。spec SHA自体は
   M1 release evidenceへ固定済み。

@@ -19,12 +19,14 @@ mod observability;
 pub use observability::{
     ApplyFlushCounts, ApplyOutcomeKind, ConsumeReasonCounters, DropReasonCounters, FieldsDisplay,
     GeneratedTotals, Health, HealthPolicy, HealthState, LastApply, ObservabilitySnapshot,
-    PhaseSkipCounters, RxTotals, ServiceCounters, TickObserver, TickTotals, DROP_REASON_CODE_LIMIT,
-    TICK_PHASE_SKIPS,
+    ObservedTable, OccupancyTotals, PhaseSkipCounters, RxTotals, ServiceCounters, ServiceOccupancy,
+    TickObserver, TickTotals, DROP_REASON_CODE_LIMIT, TICK_PHASE_SKIPS,
 };
 /// Backend-facing observability vocabulary, defined in `ruster-core` so packet
 /// backends depend only on core.
-pub use ruster_core::{BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields};
+pub use ruster_core::{
+    BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields, TableOccupancy,
+};
 
 /// Tick-local UDP NAT44 authority and its optional worker-local runtime.
 ///

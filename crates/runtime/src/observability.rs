@@ -15,6 +15,11 @@
 //! [`FieldsDisplay`] renders the same triples as stable `section.key=value`
 //! lines. The visiting vocabulary and [`BackendStats`](ruster_core::BackendStats)
 //! live in `ruster-core` so packet backends need not depend on this crate.
+//!
+//! State-table occupancy (OBS-015) is read between ticks through the O(1)
+//! core accessors by [`ServiceOccupancy::capture`] and folded in with
+//! [`TickObserver::record_occupancy`]; see [`OccupancyTotals`] for the
+//! definitions.
 
 use core::{convert::Infallible, fmt};
 use std::num::NonZeroU64;
@@ -28,7 +33,7 @@ use ruster_core::{
     Nat44UdpRuntime, ObservableFields, PublicationQuiescenceDisposition, ResolutionCounters,
     ResolutionFailureDispatchError, ResolutionFailureTrace, ResolutionFailureTraceSink,
     ResolutionPublicationReport, ResolutionRuntime, ResolutionTimerError, ResolutionTimerTrace,
-    ResolutionTimerTraceSink, TraceEvent, TraceSink,
+    ResolutionTimerTraceSink, TableOccupancy, TraceEvent, TraceSink,
 };
 
 use crate::{
@@ -562,6 +567,141 @@ pub struct LastApply {
     pub flush: Option<ApplyFlushCounts>,
 }
 
+/// One state table's occupancy as sampled at tick boundaries (OBS-015).
+///
+/// `occupied`, `high_water`, and `capacity` are the core
+/// [`TableOccupancy`] values at the last sample: `occupied` counts allocated
+/// slots (state not yet reclaimed, deleted, or flushed, so lazily expired
+/// state still counts) and `high_water` is the core's exact maximum of that
+/// count within the current runtime generation, including peaks inside a
+/// tick. `peak` is the largest `high_water` of every sample, so it survives
+/// the reset of a flushing publication; it is exact when a sample is taken
+/// after every tick, because a flush happens only in a tick's publication
+/// phase, before that tick touches any table.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ObservedTable {
+    pub occupied: u64,
+    pub high_water: u64,
+    pub capacity: u64,
+    pub peak: u64,
+}
+
+impl ObservedTable {
+    fn record(&mut self, table: TableOccupancy) {
+        self.occupied = saturating_u64(table.occupied());
+        self.high_water = saturating_u64(table.high_water());
+        self.capacity = saturating_u64(table.capacity());
+        self.peak = self.peak.max(self.high_water);
+    }
+
+    fn visit<V: FieldVisitor>(&self, section: &'static str, v: &mut V) {
+        visit_counts! {v, section, *self, ObservedTable {
+            occupied, high_water, capacity, peak,
+        }}
+    }
+}
+
+/// Core occupancy of every NAT44, firewall, and ICMPv4 error limiter table,
+/// read through each runtime's O(1) accessor.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServiceOccupancy {
+    pub nat44_udp_mappings: TableOccupancy,
+    pub nat44_udp_peers: TableOccupancy,
+    pub nat44_tcp_mappings: TableOccupancy,
+    pub nat44_tcp_sessions: TableOccupancy,
+    pub nat44_tcp_external_inbound_sessions: TableOccupancy,
+    pub firewall_states: TableOccupancy,
+    pub icmpv4_error_states: TableOccupancy,
+}
+
+impl ServiceOccupancy {
+    /// Reads each runtime's occupancy accessor: O(1) copies, no table scan.
+    /// Cold side, between ticks, through the publication owner's read-only
+    /// runtime accessors.
+    #[must_use]
+    pub fn capture(
+        icmpv4_errors: &Icmpv4ErrorRuntime<'_>,
+        nat44_udp: &Nat44UdpRuntime<'_>,
+        nat44_tcp: &Nat44TcpRuntime<'_>,
+        firewall: &FirewallRuntime<'_>,
+    ) -> Self {
+        let udp = nat44_udp.occupancy();
+        let tcp = nat44_tcp.occupancy();
+        Self {
+            nat44_udp_mappings: udp.mappings,
+            nat44_udp_peers: udp.peers,
+            nat44_tcp_mappings: tcp.mappings,
+            nat44_tcp_sessions: tcp.sessions,
+            nat44_tcp_external_inbound_sessions: tcp.external_inbound_sessions,
+            firewall_states: firewall.occupancy(),
+            icmpv4_error_states: icmpv4_errors.state_occupancy(),
+        }
+    }
+}
+
+/// Occupancy of every state table as of the last
+/// [`TickObserver::record_occupancy`] sample.
+///
+/// `samples` counts recorded samples; `ticks - samples` exposes ticks
+/// after which no sample was taken, whose flushed generation peaks `peak`
+/// may then miss.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OccupancyTotals {
+    pub samples: u64,
+    pub nat44_udp_mappings: ObservedTable,
+    pub nat44_udp_peers: ObservedTable,
+    pub nat44_tcp_mappings: ObservedTable,
+    pub nat44_tcp_sessions: ObservedTable,
+    pub nat44_tcp_external_inbound_sessions: ObservedTable,
+    pub firewall_states: ObservedTable,
+    pub icmpv4_error_states: ObservedTable,
+}
+
+impl OccupancyTotals {
+    fn record(&mut self, occupancy: &ServiceOccupancy) {
+        let ServiceOccupancy {
+            nat44_udp_mappings,
+            nat44_udp_peers,
+            nat44_tcp_mappings,
+            nat44_tcp_sessions,
+            nat44_tcp_external_inbound_sessions,
+            firewall_states,
+            icmpv4_error_states,
+        } = *occupancy;
+        incr(&mut self.samples);
+        self.nat44_udp_mappings.record(nat44_udp_mappings);
+        self.nat44_udp_peers.record(nat44_udp_peers);
+        self.nat44_tcp_mappings.record(nat44_tcp_mappings);
+        self.nat44_tcp_sessions.record(nat44_tcp_sessions);
+        self.nat44_tcp_external_inbound_sessions
+            .record(nat44_tcp_external_inbound_sessions);
+        self.firewall_states.record(firewall_states);
+        self.icmpv4_error_states.record(icmpv4_error_states);
+    }
+
+    fn visit<V: FieldVisitor>(&self, v: &mut V) {
+        let Self {
+            samples,
+            nat44_udp_mappings,
+            nat44_udp_peers,
+            nat44_tcp_mappings,
+            nat44_tcp_sessions,
+            nat44_tcp_external_inbound_sessions,
+            firewall_states,
+            icmpv4_error_states,
+        } = self;
+        v.field("occupancy", "samples", FieldValue::Count(*samples));
+        nat44_udp_mappings.visit("occupancy.nat44_udp_mappings", v);
+        nat44_udp_peers.visit("occupancy.nat44_udp_peers", v);
+        nat44_tcp_mappings.visit("occupancy.nat44_tcp_mappings", v);
+        nat44_tcp_sessions.visit("occupancy.nat44_tcp_sessions", v);
+        nat44_tcp_external_inbound_sessions
+            .visit("occupancy.nat44_tcp_external_inbound_sessions", v);
+        firewall_states.visit("occupancy.firewall_states", v);
+        icmpv4_error_states.visit("occupancy.icmpv4_error_states", v);
+    }
+}
+
 /// By-value, fixed-size observability state taken at a tick boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ObservabilitySnapshot {
@@ -577,6 +717,8 @@ pub struct ObservabilitySnapshot {
     pub last_apply: Option<LastApply>,
     /// Cumulative state flushed by every recorded apply.
     pub flushed: ApplyFlushCounts,
+    /// State-table occupancy as of the last recorded sample.
+    pub occupancy: OccupancyTotals,
 }
 
 /// Worker-local observability sink and cold-side tick aggregator.
@@ -596,6 +738,7 @@ pub struct TickObserver {
     phase_skips: PhaseSkipCounters,
     last_apply: Option<LastApply>,
     flushed: ApplyFlushCounts,
+    occupancy: OccupancyTotals,
 }
 
 #[derive(Default)]
@@ -820,6 +963,19 @@ impl TickObserver {
         }
     }
 
+    /// Records one state-table occupancy sample, normally
+    /// [`ServiceOccupancy::capture`] of the active publication. O(1) and
+    /// allocation-free.
+    ///
+    /// Contract: call this between ticks, after every observed tick. A
+    /// flushing publication resets the core high-water marks at the start of
+    /// the next tick, so a skipped sample can lose that generation's last
+    /// peak from [`ObservedTable::peak`]; skipped samples show as
+    /// `ticks > occupancy.samples`.
+    pub fn record_occupancy(&mut self, occupancy: ServiceOccupancy) {
+        self.occupancy.record(&occupancy);
+    }
+
     /// Copies the current state. Call only between ticks.
     #[must_use]
     pub fn snapshot(&self, now: MonotonicMillis) -> ObservabilitySnapshot {
@@ -835,6 +991,7 @@ impl TickObserver {
             phase_skips: self.phase_skips,
             last_apply: self.last_apply,
             flushed: self.flushed,
+            occupancy: self.occupancy,
         }
     }
 }
@@ -1024,6 +1181,7 @@ impl ObservableFields for ObservabilitySnapshot {
         v.field("apply", "flush_recorded", FieldValue::Flag(flush.is_some()));
         flush.unwrap_or_default().visit("apply.flush", v);
         self.flushed.visit("flushed", v);
+        self.occupancy.visit(v);
     }
 }
 
