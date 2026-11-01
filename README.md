@@ -118,12 +118,15 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   process crashでも自動detachされる。errorはvalue-freeな`AttachError{stage, failure}`で、
   verifier logは長さとtruncationだけを返す。bind queue以外のframeは捨てる（firewall/NATの迂回を
   防ぐ）ので、portはsingle-queue deviceにするかethtool RSS/ntupleでbind queueへ寄せ、kernelの
-  L3設定を残さない。M2 S3（X01）の`RxFillEngine`はdatapath engineのRX/Fill半分で、session
-  （または`UmemRegion::from_slice`等のheap memory）のFill/RX viewとUMEMを一workerで所有し、
+  L3設定を残さない。M2 S3（X01）の`RxFillEngine`はdatapath engineのRX/Fill半分で、
+  `NativeSession::take_datapath()`がsessionごとに一回だけ貸す`DatapathRings`（Fill、Completion、
+  RX、TX、UMEMの一組。二回目や`rings()`との併用は拒否し、engineの作り直しにはsessionのcloseが
+  要る）を一workerで所有し、
   free RX-pool frameを`fill_batch`以下ずつFillへpublishし（free listが空でFillにroomがあれば
   `fill_starved`を数えてstallしない）、RX descriptorをUMEM範囲、kernel所有（重複を拒否）、
   options、headroom、Ethernet header長（14 byte）、chunk境界でcoreに見せる前に検証する（違反は
-  reason別に数え、kernelが返したframeはquarantine）。valid frameはengineをborrowする`RxFrame`として
+  reason別に数え、kernelがprofile外で返したframeはquarantine、runtはrecycle）。need-wakeupは
+  毎refillと`fill_needs_wakeup()`で観測できる。valid frameはengineをborrowする`RxFrame`として
   一つずつ貸し、`recycle`/`stage_tx`（S4向け`TxHandoff`）/dropで終える。bytes借用中のrecycleは
   compile errorで、UMEM byte accessはledgerが`Leased`と記録するframeだけに限る。TX/Completion
   （S4）、need-wakeup kick、core `PacketIo`接続はまだ持たず（`ruster-core`へは依存しない）、

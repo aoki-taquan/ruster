@@ -120,10 +120,12 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   実機検証とCI workflowはX04（XDP-062）。review決定: socketの無いqueueは`XDP_DROP`（fail closed。
   firewall/NATの迂回を防ぐ代わりにsingle-queue deviceかbind queueへのsteeringが前提、portにkernel L3
   設定を残さない。startup checkはX04、XDP-063）。`ruster run`はまだ無い。
-- AF_XDP RX/Fill engine（`RxFillEngine`: bounded Fill refill、free list空のstarvation accounting、
-  RX descriptorのaddress/ownership/options/headroom/length検証とquarantine、borrow-scopedな
+- AF_XDP RX/Fill engine（`RxFillEngine`: sessionごとに一回だけ取る`DatapathRings` bundle
+  （`NativeSession::take_datapath`、Fill/Completion/RX/TX/UMEMを一組で所有）、bounded Fill refill、
+  free list空のstarvation accounting、毎refillのneed-wakeup観測、RX descriptorの
+  address/ownership/options/headroom/length検証とquarantine（runtはrecycle）、borrow-scopedな
   frame lending、ledger-gated UMEM byte access、TX handoff hook、OBS-018のRX/Fill counter）は
-  M2 S3（X01）で追加した（XDP-064〜081）。dependency決定: `ruster-io-xdp-native`は`ruster-io-xdp`
+  M2 S3（X01）で追加した（XDP-064〜090）。dependency決定: `ruster-io-xdp-native`は`ruster-io-xdp`
   だけに依存し`ruster-core`へは依存しない（`PacketIo` adapterはX04）。TX/Completion（S4、X02）、
   need-wakeup kick、`PacketIo` adapter、runtime stats接続はまだ無い（XDP-082）。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、

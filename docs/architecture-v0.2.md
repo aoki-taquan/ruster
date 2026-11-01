@@ -2119,27 +2119,45 @@ down/up、netdev削除、reload時のre-attach policyはX04です（XDP-062）�
 ### AF_XDP RX/Fill engine (X01, M2 S3)
 
 `ruster-io-xdp-native`の`RxFillEngine<'memory>`はdatapath engineのRX/Fill半分です。一workerが
-Fill producer、RX consumer、UMEM、authoritative `FrameLedger`をまとめて所有し、lock、構築後の
-allocation、packet clone、packet単位`String`、`dyn`を使いません（ledgerが`!Send + !Sync`なので
-engineも同じ）。ring memoryへのgeneric性は消費するborrowed role viewだけで表します。live
-`NativeSession::rings()`はkernel mappingを、testと`FillProducer::new`/`RxConsumer::new`/
-`UmemRegion::from_slice`はheap memoryを貸し、engineはどちらも同じ型で受けます。
+Fill producer、RX consumer、TX producer、Completion consumer、UMEM、authoritative `FrameLedger`を
+まとめて所有し、lock、構築後のallocation、packet clone、packet単位`String`、`dyn`を使いません
+（ledgerが`!Send + !Sync`なのでengineも同じ）。TX/CompletionはS4まで使いませんが、engineが
+持つことで、lend中のframeを指すTX descriptorを他者がsubmitできなくなります。
+
+ledgerの前提は「このUMEMのFillへpublishしたのはこのengineだけ」です。これを型で保証するため、
+engineは`DatapathRings<'session>`（Fill、Completion、RX、TX、UMEM bytesの一組）をby valueで
+一つだけ受け取ります。bundleにはpublic constructorもmember accessもなく
+（`compile_fail,E0451`/`E0616` doctest）、別sessionのviewやheap view、すでにpublishに使った
+viewを混ぜられません。liveでは`NativeSession::take_datapath(&mut self)`がsessionごとに高々一回
+だけ貸し、二回目は`DatapathError::AlreadyTaken`、`rings()`でraw viewを一度でも貸したsessionでは
+`RawRingsLent`、bundleを取った後の`rings()`は`RingsError::DatapathTaken`です。engineをdropしても
+kernel/driver（zero-copyのhardware RX descriptor、copy modeのdrop path）は以前publishしたframeを
+保持し得るため、engineの作り直しにはsessionのclose（新socketと新UMEM）が必要です。testのheap
+bundleはtest専用scripted kernelだけが一組として一回だけ作ります。ring memoryへのgeneric性は
+このbundleを貸す側（session mappingまたはheap）で表します。
 
 dependencyの決定: `ruster-io-xdp-native`は既存の`ruster-io-xdp`（ledger、token、layout、
 FakeKernel）だけに依存し、`ruster-core`には依存しません。core `PacketIo`/`PacketSlot` adapterは
 `SlotCompletion::Transmit`にTX publication（S4、X02）が要るため、X04のapp adapterで`RxFrame`の
-上に実装します。
+上に実装します。`ruster-io-xdp`のtest用`test-hooks` feature（generation exhaustionを起こす
+ledger hook、supported APIではない）はdev-dependencyからだけ有効にします。
 
 `RxFillEngine::new`は`UmemDomainId`からfreshなledgerを作り（geometryは`UmemConfig`、headroomは
-user headroom + `XDP_PACKET_HEADROOM`）、Fill ring empty、RX ring emptyでなければ拒否します
-（どのledgerも追跡しないentryを受けないため）。frame `0..rx_frames`がRX poolで、generated pool
-（`rx_frames..frame_count`、X03）は一度もpublishもlendもしません。free RX-pool frameは固定長
-FIFOで持ち、`refill`は`min(Fill room, free list, fill_batch)`個を`reserve_fill` → Fillへchunk
-base address write → Release publish → `publish_fill`の順に一回で出します。ring操作が失敗すれば
-reserve済みframeを`cancel_fill`でfree listへ戻します。free listが空でFillにroomがあれば
-`fill_starved`を数えてすぐ戻り（stallしない、BACKEND-004のRX側）、free frameがあるのにFillが満杯
-なら`fill_ring_full`です。publication後のneed-wakeup（`fill_need_wakeup`）と未知flag bit
-（`fill_flag_errors`、publicationは成立）は観測だけで、kick（poll/recvfrom）はX04です。
+user headroom + `XDP_PACKET_HEADROOM`）、防御的にFill/RX ringが空であることも確かめます。frame
+`0..rx_frames`がRX poolで、generated pool（`rx_frames..frame_count`、X03）は一度もpublishも
+lendもしません。free RX-pool frameは固定長FIFOで持ち、`refill`は`min(Fill room, free list,
+fill_batch)`個を`reserve_fill` → Fillへchunk base address write → Release publish →
+`publish_fill`の順に一回で出します。ring操作が失敗すればreserve済みframeを`cancel_fill`で
+free listへ戻し、generation exhaustionのframeはquarantineして次へ進みます。free listが空で
+Fillにroomがあれば`fill_starved`を数えてすぐ戻り（stallしない、BACKEND-004のRX側）、free
+frameがあるのにFillが満杯なら`fill_ring_full`です。
+
+need-wakeupは各refillの最後（publicationがあればそのRelease後）に必ずAcquire観測し、
+`RefillReport::need_wakeup`で返します。publishしなかったrefill（Fill満杯、starved）や構築時の
+初回refill（`initial_refill()`）でも同じで、別に`fill_needs_wakeup()`がpublishなしに一回のatomic
+loadで読みます。zero-copyではkernelがFill枯渇時にflagを立てるため、libxdpと同じく各pollで
+flagを見てkickできます（kick自体はX04）。`fill_need_wakeup`はRequiredを観測したrefill数、
+`fill_flag_errors`は未知bitを観測したrefill数で、publicationはrollbackしません。
 
 `poll(budget)`はrefillの後、RX ringから`min(budget - pending, pending capacity, available)`個だけ
 descriptorを読み、全部を検証してからconsumer cursorをReleaseします。valid frameは`RxAvailable`
@@ -2150,23 +2168,30 @@ lendされずにbatchが終わったframeはpendingに残り、次のpollが新�
 RX descriptorは次の順で検証し、どれかに失敗したdescriptorはcoreへ届きません（`rx_invalid`の
 reason別counter）。
 
-| 順 | 条件 | reason | ledger |
+| 順 | 条件 | reason | frame |
 |---|---|---|---|
 | 1 | `addr < UMEM byte_len` | `AddressOutsideUmem` | 不変 |
 | 2 | `addr / chunk`のframeが`FillOwnedByKernel` | `NotKernelOwned`（重複、generated pool、lease中/TX中/pending/quarantine済み） | 不変 |
 | 3 | `options == 0`（`XDP_PKT_CONTD`等） | `UnsupportedOptions` | quarantine |
 | 4 | chunk内offset ≥ user headroom + 256 | `DataBeforeHeadroom` | quarantine |
-| 5 | `len ≥ 14`（Ethernet header） | `ShorterThanEthernetHeader` | quarantine |
+| 5 | `len ≥ 14`（Ethernet header） | `ShorterThanEthernetHeader` | recycle |
 | 6 | `offset + len ≤ chunk size` | `ExceedsFrame` | quarantine |
 
-最後に`UmemLayout::validate_descriptor`を独立な第二gateとして通します。kernelが返したframeを
-profile外のdescriptorで返した場合、そのframeは`FrameLedger::quarantine_kernel_fill`で永久に
-`Quarantined`へ移し、lendもrecycleもしません（未reviewのkernel契約を再利用しないfail closed。
-pool縮小はstarvationとして観測できる）。kernelがframeを返していない場合（1、2）はledgerに一切
-触れないので、重複descriptorが別ownerのframeを奪うことはありません。最小長は60-byte padded
-minimumではなく14 byteです。vethなどsoftware deviceはpaddingせずARP requestを42 byteで渡すため
-で、L2/L3の検証はcoreが行います。data offsetはheadroom以上を要求しexact一致は要求しません
-（driverがdataを後ろに置く余地を残す）。
+最後に`UmemLayout::validate_descriptor`を独立な第二gateとして通します。kernelがframeを
+profile外のdescriptor（options、headroom、chunk越え）で返した場合、そのframeは
+`FrameLedger::quarantine_kernel_fill`で永久に`Quarantined`へ移し、lendもrecycleもしません
+（未reviewのkernel契約を再利用しないfail closed）。これによるpool縮小は`frames_quarantined`で
+観測します（free listが尽きればstarvationとしても現れますが、縮小そのものの指標ではありません）。
+address、所有、headroomが正しく長さだけが14未満のrunt（0を含む）は、kernelがframeを正しく返した上で
+packetが使えないだけなので、`FrameLedger::release_kernel_fill`でFreeへ戻してfree listへ入れ、
+`rx_runts_recycled`も数えます。kernelがframeを返していない場合（1、2）はledgerに一切触れないので、
+重複descriptorが別ownerのframeを奪うことはありません。最小長は60-byte padded minimumではなく
+14 byteです。vethなどsoftware deviceはpaddingせずARP requestを42 byteで渡すためで、L2/L3の検証は
+coreが行います。data offsetはheadroom以上を要求しexact一致は要求しません（driverがdataを後ろに
+置く余地を残す）。前提として、attachするXDP program（X00Dのredirect program）は
+`bpf_xdp_adjust_head`の負方向などでdataをheadroomより前へ動かしません。動かすprogramを使うと
+全frameが`DataBeforeHeadroom`でquarantineされます。copy modeではdataはexactにchunk +
+user headroom + 256にあり、privileged smokeがこれを確認します（XDP-067）。
 
 `RxFrame<'engine, 'memory>`はengineを排他borrowし、`bytes`/`bytes_mut`、`recycle`、
 `stage_tx`を持ちます。`bytes_mut`のsliceは`RxFrame`をborrowし、`recycle`/`stage_tx`は`self`を
@@ -2176,33 +2201,43 @@ recycleはledger `recycle_lease`（exact token/generationの`Leased`だけ）と
 同じcycleの二度目の完了、pending/kernel所有frameのrecycleはledgerが`WrongState`/`StaleToken`で
 拒否します。`stage_tx`はframeを`PendingTx`へ移したmove-onlyの`TxHandoff`（public
 constructorなし、`must_use`）を返すS4用hookで、S4が無い間は`cancel_tx_handoff`がfree listへ
-戻します。
+戻します。engine methodを通らずにdropされた`TxHandoff`はframeを`PendingTx`に置き去りにするため、
+debug buildではassertし、`tx_handoffs_outstanding()`（ledgerの`PendingTx`数、O(1)）が数え続けます。
+S4は全handoffをengine method（publishまたはcancel）で消費しなければなりません。
 
 UMEM byte accessは`native_unsafe/umem.rs`の`UmemFrames`だけです。mappingとledgerを一つの値に
 まとめ、ledgerが`Leased`（user space所有）と記録しているframeについてだけ、その時点のexact
 tokenとdescriptorのvisible rangeを自前のgeometryで再計算してからsliceを作ります。sliceは
 `UmemFrames`をborrowするので、生存中はledger遷移（Fillへのrecycleを含む）が起きません。kernelは
 Fill/TXにpublishされた他のframeを同時に書き得ますが、Rust referenceはlease中の一frameにだけ
-作られます。この健全性は、frameが`Leased`へ入るのはpublishされていない`Free`からか、kernelが
-RX ringでそのframeを返した後の`FillOwnedByKernel → RxAvailable → Leased`だけ、という
-crate-privateなprotocol（ledgerを変更するのはengineだけ）に依存します。`UmemRegion`はmapping
-borrowをredactしたDebugで保持し、自身はbyte accessorを持ちません。
+作られます。この健全性は二つに依存します。(1) frameが`Leased`へ入るのはpublishされていない
+`Free`からか、kernelがRX ringでそのframeを返した後の`FillOwnedByKernel → RxAvailable → Leased`
+だけで、ledgerを変更するのはengineだけ。(2) このUMEMのFill/TXへ書けるのはengineだけ。(2)は
+once-per-sessionの`DatapathRings`がengineへ全ringを渡すことで型として成り立ちます。
+`UmemRegion`（`NativeRings`の一部）はgeometryだけでbyte accessを持ちません。
 
 counter（`RxFillCounters`、OBS-018のRX/Fill半分）はsaturating `u64`で、`polls`、`rx_packets`、
 `rx_leased`、`rx_recycled`、`rx_abandoned`、`rx_tx_handoffs`、`tx_handoffs_cancelled`、
-`rx_ring_empty`、`rx_backlogged`、`rx_invalid(reason)`、`fill_published`、`fill_starved`、
-`fill_ring_full`、`fill_need_wakeup`、`fill_flag_errors`、`frames_quarantined`です。hot pathは
-数個の整数更新だけでledgerをscanしません。`audit()`はcold pathでledger deep audit、free listが
-Free RX-pool frameとexactに一致すること、pending listが`RxAvailable`とexactに一致すること、
-engineがrestで残さないstateが無いことを検査します。runtime `BackendStats`への接続はX04です。
+`rx_ring_empty`、`rx_backlogged`、`rx_invalid(reason)`、`rx_runts_recycled`、`fill_published`、
+`fill_starved`、`fill_ring_full`、`fill_need_wakeup`、`fill_flag_errors`、`frames_quarantined`です。
+hot pathは数個の整数更新とflag一回のatomic loadだけでledgerをscanしません。`audit()`はcold pathで
+ledger deep audit、free listがFree RX-pool frameとexactに一致すること、pending listが
+`RxAvailable`とexactに一致すること、engineがrestで残さないstateが無いことを検査します。runtime
+`BackendStats`への接続はX04です。
 
-testは`native_unsafe/heap_kernel.rs`（test専用）のscripted kernelで行います。heap上のFill/RX/UMEMを
-同じrole viewでengineへ貸し、scriptはkernelと同じくraw pointer（atomic cursor、volatile
-descriptor、raw byte copy）だけでkernel側を演じます。invalid descriptor全種、exact境界、重複、
-二重完了、starvationと回復、partial Fill、poll budget、need-wakeup/flag、corrupt cursor、setup拒否、
-steady-stateのallocation zero、io-xdp `FakeKernel`とのdifferential（seed付きscheduleで各step後に
-frameごとのstate/generationとdeep auditを比較。modelはkernelがRXをproduceした時点で
-`RxAvailable`とするがnative engineはRX ringを読むまで観測できないため、両者を「kernel側保持」へ
-射影して比較）を検証します（XDP-064〜080）。privileged smokeのengine phaseは専用netns veth上で
-attach後のpeer ARP frameがengineの検証を通りlend、recycle、refillされることを確認します
-（XDP-079）。
+testは`native_unsafe/heap_kernel.rs`（test専用）のscripted kernelで行います。heap上の五regionを
+一回だけbundleとしてengineへ貸し、scriptはkernelと同じくraw pointer（atomic cursor、volatile
+descriptor、raw byte copy）だけでkernel側を演じます。scriptはFillから取ってRXで返していない
+frameを「保持中」として追跡し、packet bytesの読み書きは保持中のframeに限り（lend中のframeには
+触れない）、同じframeをFillから二度取ればfailします。invalid descriptor全種、exact境界、重複、
+二重完了、starvationと回復、partial Fill、poll budgetとbacklog/empty境界、generation exhaustion、
+need-wakeup、corrupt cursor、setup拒否、bundleの一回性と二重publishの不可能性（review PoCの回帰）、
+steady-stateとrefusal/starvation pathのallocation zero、io-xdp `FakeKernel`とのdifferential
+（seed付きscheduleで各step後にframeごとのstate/generationとdeep auditを比較）を検証します。
+differentialは状態を変えないinvalid descriptor（UMEM外、generated pool）を含みますが、quarantineと
+runtは含みません。model kernelはprofile外のRXをproduceせず、それを写すmutable ledgerも公開しない
+ためで、両pathは直接のtestで固定します。modelはkernelがRXをproduceした時点で`RxAvailable`とするが
+native engineはRX ringを読むまで観測できないため、両者を「kernel側保持」へ射影して比較します。
+privileged smokeのengine phaseは専用netns veth上でattach後のpeer ARP frameがengineの検証を通り
+lend、recycle、refillされ、copy modeのdata offsetが256、bundleの二度目のtakeとraw viewが
+拒否されることを確認します（XDP-064〜090）。

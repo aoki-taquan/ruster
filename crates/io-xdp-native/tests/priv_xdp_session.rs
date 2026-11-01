@@ -32,9 +32,9 @@ use std::{
 
 use ruster_io_xdp_native::{
     abi::{XDP_COPY, XDP_USE_NEED_WAKEUP},
-    AttachFailure, AttachStage, NativeRingError, NativeSession, NegotiatedMode, RingConfig,
-    RxFillConfig, RxFillEngine, SessionConfig, SessionFailure, SessionStage, UmemConfig,
-    UmemDomainId, ValidatedBindFlags, XdpAttachMode, XDP_PACKET_HEADROOM,
+    AttachFailure, AttachStage, DatapathError, NativeRingError, NativeSession, NegotiatedMode,
+    RingConfig, RingsError, RxFillConfig, RxFillEngine, SessionConfig, SessionFailure,
+    SessionStage, UmemConfig, UmemDomainId, ValidatedBindFlags, XdpAttachMode, XDP_PACKET_HEADROOM,
 };
 
 const FRAME_SIZE: u64 = 2_048;
@@ -371,11 +371,9 @@ fn priv_xdp_engine_validates_and_recycles_peer_frames() {
         .expect("native attach on veth");
     let peer = UdpSocket::bind(PEER_SOURCE).expect("peer address configured by the script");
     {
-        let rings = session.rings().expect("ring views");
+        let datapath = session.take_datapath().expect("first datapath take");
         let mut engine = RxFillEngine::new(
-            rings.fill,
-            rings.rx,
-            rings.umem,
+            datapath,
             UmemDomainId::new(NonZeroU128::new(0x5333).expect("nonzero")),
             RxFillConfig::new(NonZeroU32::new(64).expect("nonzero")),
         )
@@ -394,9 +392,14 @@ fn priv_xdp_engine_validates_and_recycles_peer_frames() {
                 let bytes = frame.bytes();
                 assert_eq!(bytes.len(), frame.len() as usize);
                 assert!(frame.frame().index() < 192, "RX pool frame");
-                assert!(
-                    frame.descriptor().data_offset() >= XDP_PACKET_HEADROOM,
-                    "kernel headroom"
+                // Copy mode places data exactly after the kernel headroom
+                // (user headroom is 0): `xsk_buff_alloc` data at
+                // `XDP_PACKET_HEADROOM`, and the redirect program never
+                // moves it (XDP-067).
+                assert_eq!(
+                    frame.descriptor().data_offset(),
+                    XDP_PACKET_HEADROOM,
+                    "copy-mode RX data offset"
                 );
                 // The peer's unanswered ARP request: broadcast, EtherType ARP.
                 if bytes.len() >= 42 && bytes[..6] == [0xff; 6] && bytes[12..14] == [0x08, 0x06] {
@@ -422,6 +425,12 @@ fn priv_xdp_engine_validates_and_recycles_peer_frames() {
             "{counters:?}"
         );
     }
+    // The bundle is never lent twice, and raw views never alias it.
+    assert_eq!(
+        session.take_datapath().map(|_| ()),
+        Err(DatapathError::AlreadyTaken)
+    );
+    assert_eq!(session.rings().map(|_| ()), Err(RingsError::DatapathTaken));
     session.close().expect("attached session teardown");
     wait_detached(&device);
     eprintln!(

@@ -11,14 +11,21 @@
 
 use std::{
     alloc::{alloc_zeroed, dealloc, Layout},
+    cell::{Cell, RefCell},
     ptr::NonNull,
     sync::atomic::{AtomicU32, Ordering},
 };
 
 use crate::{
     abi::{XdpDescriptor, XdpRingOffset},
-    FillProducer, RingEntries, RxConsumer, UmemConfig, UmemRegion,
+    datapath::{DatapathError, DatapathParts, DatapathRings},
+    CompletionConsumer, FillProducer, RingEntries, RingName, RxConsumer, TxProducer, UmemConfig,
 };
+
+/// TX and Completion capacity of the heap bundle (unused until S4).
+fn tx_entries() -> RingEntries {
+    RingEntries::new(RingName::Tx, 8).expect("valid capacity")
+}
 
 use super::{mmap::BorrowedMmap, umem::UmemMapping};
 
@@ -126,14 +133,22 @@ impl Drop for HeapRegion {
     }
 }
 
-/// Heap stand-in for one socket's Fill ring, RX ring, and UMEM.
+/// Heap stand-in for all datapath mappings of one socket.
+///
+/// The script tracks which frames it holds as "kernel": taken from Fill and
+/// not yet returned on RX. It writes and reads packet bytes only inside
+/// those frames, so it never touches a frame the engine may have lent.
 pub(crate) struct ScriptedKernel {
     fill: HeapRegion,
     rx: HeapRegion,
+    tx: HeapRegion,
+    completion: HeapRegion,
     umem: HeapRegion,
     fill_entries: RingEntries,
     rx_entries: RingEntries,
     umem_config: UmemConfig,
+    taken: Cell<bool>,
+    held: RefCell<Vec<bool>>,
 }
 
 impl ScriptedKernel {
@@ -142,32 +157,60 @@ impl ScriptedKernel {
         Self {
             fill: HeapRegion::new(DESCRIPTORS + fill.get() as usize * 8),
             rx: HeapRegion::new(DESCRIPTORS + rx.get() as usize * 16),
+            tx: HeapRegion::new(DESCRIPTORS + tx_entries().get() as usize * 16),
+            completion: HeapRegion::new(DESCRIPTORS + tx_entries().get() as usize * 8),
             umem: HeapRegion::new(umem_len),
             fill_entries: fill,
             rx_entries: rx,
             umem_config: umem,
+            taken: Cell::new(false),
+            held: RefCell::new(vec![false; umem.frame_count() as usize]),
         }
     }
 
-    /// Lends the application-side views, as `NativeSession::rings` does.
-    ///
-    /// The test must not hold two sets of views at once.
-    pub(crate) fn views(&self) -> (FillProducer<'_>, RxConsumer<'_>, UmemRegion<'_>) {
-        // SAFETY (all three): each region is one live zeroed heap
-        // allocation that outlives the `&self` borrow and is freed only by
-        // Drop. The script touches it only through raw pointers: atomic
-        // cursor words and volatile descriptor or raw byte copies, never
-        // inside a frame the engine has leased. That is the contract
-        // `from_raw_parts` states for kernel-shared mappings.
+    /// Lends the application side as one bundle, at most once, exactly as
+    /// `NativeSession::take_datapath` does.
+    pub(crate) fn take_datapath(&self) -> Result<DatapathRings<'_>, DatapathError> {
+        if self.taken.replace(true) {
+            return Err(DatapathError::AlreadyTaken);
+        }
+        // SAFETY (all five): each region is one live zeroed heap allocation
+        // that outlives the `&self` borrow and is freed only by Drop. The
+        // once-only flag means at most one set of views ever exists. The
+        // script touches the memory only through raw pointers: atomic
+        // cursor words, volatile descriptors, and raw byte copies inside
+        // frames it holds as kernel (never a frame the engine can lend).
+        // That is the contract `from_raw_parts` states for kernel-shared
+        // mappings.
         let fill = unsafe { BorrowedMmap::from_raw_parts(self.fill.base, self.fill.len()) };
         let rx = unsafe { BorrowedMmap::from_raw_parts(self.rx.base, self.rx.len()) };
+        let tx = unsafe { BorrowedMmap::from_raw_parts(self.tx.base, self.tx.len()) };
+        let completion =
+            unsafe { BorrowedMmap::from_raw_parts(self.completion.base, self.completion.len()) };
         let umem = unsafe { UmemMapping::from_raw_parts(self.umem.base, self.umem.len()) };
-        (
-            FillProducer::with_mapping(fill, HEAP_RING_OFFSETS, self.fill_entries)
+        Ok(DatapathRings::new(DatapathParts {
+            fill: FillProducer::with_mapping(fill, HEAP_RING_OFFSETS, self.fill_entries)
                 .expect("heap Fill view"),
-            RxConsumer::with_mapping(rx, HEAP_RING_OFFSETS, self.rx_entries).expect("heap RX view"),
-            UmemRegion::new(self.umem_config, umem),
-        )
+            completion: CompletionConsumer::with_mapping(
+                completion,
+                HEAP_RING_OFFSETS,
+                tx_entries(),
+            )
+            .expect("heap Completion view"),
+            rx: RxConsumer::with_mapping(rx, HEAP_RING_OFFSETS, self.rx_entries)
+                .expect("heap RX view"),
+            tx: TxProducer::with_mapping(tx, HEAP_RING_OFFSETS, tx_entries())
+                .expect("heap TX view"),
+            umem,
+            umem_config: self.umem_config,
+        }))
+    }
+
+    fn frame_of(&self, address: u64) -> Option<usize> {
+        let frame = address / u64::from(self.umem_config.frame_size());
+        usize::try_from(frame)
+            .ok()
+            .filter(|frame| *frame < self.umem_config.frame_count() as usize)
     }
 
     pub(crate) fn fill_producer(&self) -> u32 {
@@ -197,17 +240,34 @@ impl ScriptedKernel {
         unsafe { pointer.read_volatile() }
     }
 
-    /// Kernel-consumes the oldest Fill entry.
+    /// Kernel-consumes the oldest Fill entry; the frame is now held.
+    ///
+    /// Panics if the frame is already held: that would be a double
+    /// publication of one frame, which the engine must never produce.
     pub(crate) fn consume_fill(&self) -> Option<u64> {
         let consumer = self.fill_consumer();
         if self.fill_producer() == consumer {
             return None;
         }
         let address = self.fill_entry(consumer);
+        if let Some(frame) = self.frame_of(address) {
+            let mut held = self.held.borrow_mut();
+            assert!(!held[frame], "frame {frame} published to Fill twice");
+            held[frame] = true;
+        }
         self.fill
             .cursor(CONSUMER)
             .store(consumer.wrapping_add(1), Ordering::Release);
         Some(address)
+    }
+
+    /// Whether the script holds `frame` (taken from Fill, not returned).
+    pub(crate) fn holds(&self, frame: u32) -> bool {
+        self.held
+            .borrow()
+            .get(frame as usize)
+            .copied()
+            .unwrap_or(false)
     }
 
     pub(crate) fn rx_consumer(&self) -> u32 {
@@ -219,10 +279,17 @@ impl ScriptedKernel {
     }
 
     /// Kernel-produces one RX descriptor; `false` if the RX ring is full.
+    ///
+    /// A descriptor naming a held frame returns that frame to the
+    /// application; any other descriptor (invalid or duplicate) returns
+    /// nothing.
     pub(crate) fn produce_rx(&self, descriptor: XdpDescriptor) -> bool {
         let producer = self.rx_producer();
         if producer.wrapping_sub(self.rx_consumer()) >= self.rx_entries.get() {
             return false;
+        }
+        if let Some(frame) = self.frame_of(descriptor.address) {
+            self.held.borrow_mut()[frame] = false;
         }
         let slot = (producer & (self.rx_entries.get() - 1)) as usize;
         let pointer = self
@@ -246,22 +313,45 @@ impl ScriptedKernel {
         self.rx.cursor(PRODUCER).store(value, Ordering::Release);
     }
 
+    /// Overwrites the Fill producer cursor, as a stale application would
+    /// have left it (setup tests).
+    pub(crate) fn set_fill_producer(&self, value: u32) {
+        self.fill.cursor(PRODUCER).store(value, Ordering::Release);
+    }
+
     /// Overwrites the Fill consumer cursor (corruption tests).
     pub(crate) fn set_fill_consumer(&self, value: u32) {
         self.fill.cursor(CONSUMER).store(value, Ordering::Release);
     }
 
-    /// Sets the Fill flags word the kernel exposes after publication.
+    /// Sets the Fill flags word the kernel exposes.
     pub(crate) fn set_fill_flags(&self, value: u32) {
         self.fill.cursor(FLAGS).store(value, Ordering::Release);
     }
 
-    /// Kernel-writes packet bytes into a frame it owns.
+    /// Checks that `offset..offset + len` lies inside one held frame.
+    fn held_range(&self, offset: u64, len: usize) -> usize {
+        let frame = self.frame_of(offset).expect("offset inside UMEM");
+        let frame_size = u64::from(self.umem_config.frame_size());
+        let end = offset + len as u64;
+        assert!(
+            end <= (frame as u64 + 1) * frame_size,
+            "range crosses its frame"
+        );
+        assert!(
+            self.held.borrow()[frame],
+            "the script may touch only frames it holds as kernel"
+        );
+        usize::try_from(offset).expect("test offset")
+    }
+
+    /// Kernel-writes packet bytes into a frame it holds.
     pub(crate) fn write_umem(&self, offset: u64, bytes: &[u8]) {
-        let offset = usize::try_from(offset).expect("test offset");
-        assert!(offset + bytes.len() <= self.umem.len());
-        // SAFETY: the range lies inside the allocation, and tests write only
-        // frames the ledger records as kernel-owned (never a leased one).
+        let offset = self.held_range(offset, bytes.len());
+        // SAFETY: `held_range` proved the range lies inside the allocation
+        // and inside one frame the script holds as kernel: taken from Fill
+        // and not returned on RX, so the engine's ledger records it as
+        // `FillOwnedByKernel` and never lends it.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
@@ -271,12 +361,12 @@ impl ScriptedKernel {
         }
     }
 
-    /// Kernel-reads bytes back (for example after an in-place rewrite).
+    /// Kernel-reads bytes back from a frame it holds (for example a frame
+    /// recycled and republished after an in-place rewrite).
     pub(crate) fn read_umem(&self, offset: u64, out: &mut [u8]) {
-        let offset = usize::try_from(offset).expect("test offset");
-        assert!(offset + out.len() <= self.umem.len());
-        // SAFETY: the range lies inside the allocation, and tests read only
-        // frames that no live lease borrows mutably.
+        let offset = self.held_range(offset, out.len());
+        // SAFETY: as in `write_umem`; the engine holds no reference into a
+        // frame the script holds.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.umem.base.as_ptr().add(offset),

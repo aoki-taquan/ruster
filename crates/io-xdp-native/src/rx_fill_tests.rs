@@ -12,10 +12,10 @@ use ruster_io_xdp::{
 
 use crate::{
     abi::{XdpDescriptor, XDP_PKT_CONTD, XDP_RING_NEED_WAKEUP},
-    native_unsafe::heap_kernel::{allocation_count, ScriptedKernel, HEAP_RING_OFFSETS},
-    FillProducer, NativeRingError, NeedWakeup, RingEntries, RingName, RxConsumer, RxFillAuditError,
+    native_unsafe::heap_kernel::{allocation_count, ScriptedKernel},
+    DatapathError, NativeRingError, NeedWakeup, RingEntries, RingName, RxFillAuditError,
     RxFillConfig, RxFillEngine, RxFillError, RxFillSetupError, RxInvalidReason, TxHandoff,
-    UmemConfig, UmemRegion, UmemRegionError, ETHERNET_HEADER_LEN, XDP_PACKET_HEADROOM,
+    UmemConfig, ETHERNET_HEADER_LEN, XDP_PACKET_HEADROOM,
 };
 
 const FRAME_SIZE: u32 = 2_048;
@@ -50,8 +50,8 @@ fn config(fill_batch: u32) -> RxFillConfig {
 }
 
 fn engine(kernel: &ScriptedKernel, fill_batch: u32) -> RxFillEngine<'_> {
-    let (fill, rx, umem) = kernel.views();
-    RxFillEngine::new(fill, rx, umem, domain(0x5301), config(fill_batch)).expect("engine")
+    let datapath = kernel.take_datapath().expect("first take");
+    RxFillEngine::new(datapath, domain(0x5301), config(fill_batch)).expect("engine")
 }
 
 fn frame_base(frame: u32) -> u64 {
@@ -127,8 +127,8 @@ fn rx_fill_engine_primes_validates_lends_and_recycles() {
 
     let first = packet(1, 60);
     let second = packet(2, 1_514);
-    let base_first = deliver(&kernel, &first);
-    let base_second = deliver(&kernel, &second);
+    deliver(&kernel, &first);
+    deliver(&kernel, &second);
     {
         let mut batch = engine.poll(RING).expect("poll");
         assert_eq!(batch.remaining(), 2);
@@ -147,10 +147,6 @@ fn rx_fill_engine_primes_validates_lends_and_recycles() {
         frame.recycle();
         assert!(batch.next_frame().is_none());
     }
-    // The in-place rewrite reached UMEM.
-    let mut byte = [0_u8; 1];
-    kernel.read_umem(base_first + HEADROOM, &mut byte);
-    assert_eq!(byte, [0xee]);
     assert_eq!(state(&engine, 0), FrameStateKind::Free);
     assert_eq!(state(&engine, 1), FrameStateKind::Free);
     let counters = engine.counters();
@@ -171,7 +167,6 @@ fn rx_fill_engine_primes_validates_lends_and_recycles() {
     assert_eq!(engine.counters().fill_ring_full, 1);
     let next = deliver(&kernel, &packet(3, 64));
     assert_eq!(next, frame_base(2));
-    let _ = base_second;
     let mut batch = engine.poll(RING).expect("poll");
     let frame = batch.next_frame().expect("frame");
     assert_eq!(frame.frame().index(), 2);
@@ -180,6 +175,41 @@ fn rx_fill_engine_primes_validates_lends_and_recycles() {
     assert_eq!(engine.counters().rx_abandoned, 1);
     assert_eq!(state(&engine, 2), FrameStateKind::Free);
     audit(&engine);
+}
+
+#[test]
+fn rx_fill_in_place_rewrite_reaches_umem() {
+    let kernel = kernel();
+    let mut engine = engine(&kernel, RING);
+    deliver(&kernel, &packet(1, 64));
+    {
+        let mut batch = engine.poll(RING).expect("poll");
+        let mut frame = batch.next_frame().expect("frame");
+        assert_eq!(frame.frame().index(), 0);
+        frame.bytes_mut()[..2].copy_from_slice(&[0xee, 0xef]);
+        frame.recycle();
+    }
+    // Cycle Fill until the kernel holds frame 0 again, then read it back.
+    for _ in 0..64 {
+        if kernel.holds(0) {
+            break;
+        }
+        if kernel.consume_fill().is_none() {
+            // The script returns nothing; the engine republishes free frames.
+            let _ = engine.refill().expect("refill");
+        }
+    }
+    assert!(kernel.holds(0), "frame 0 was republished");
+    let mut bytes = [0_u8; 2];
+    kernel.read_umem(frame_base(0) + HEADROOM, &mut bytes);
+    assert_eq!(bytes, [0xee, 0xef]);
+}
+
+#[derive(Clone, Copy)]
+enum Effect {
+    Untouched,
+    Quarantined(u32),
+    Recycled(u32),
 }
 
 #[test]
@@ -202,7 +232,7 @@ fn rx_fill_rejects_every_invalid_descriptor_kind() {
         len: 64,
         options: 0,
     };
-    // (descriptor, reason, quarantined frame)
+    // (descriptor, reason, effect on the named frame)
     let cases = [
         (
             XdpDescriptor {
@@ -210,7 +240,7 @@ fn rx_fill_rejects_every_invalid_descriptor_kind() {
                 ..valid(0)
             },
             RxInvalidReason::AddressOutsideUmem,
-            None,
+            Effect::Untouched,
         ),
         (
             XdpDescriptor {
@@ -218,7 +248,7 @@ fn rx_fill_rejects_every_invalid_descriptor_kind() {
                 ..valid(0)
             },
             RxInvalidReason::AddressOutsideUmem,
-            None,
+            Effect::Untouched,
         ),
         (
             XdpDescriptor {
@@ -226,23 +256,27 @@ fn rx_fill_rejects_every_invalid_descriptor_kind() {
                 ..valid(bases[0])
             },
             RxInvalidReason::UnsupportedOptions,
-            Some(0),
+            Effect::Quarantined(0),
         ),
         // A generated-pool frame (never published) and the frame that the
         // previous case quarantined: nothing is mutated.
         (
             valid(frame_base(RX_FRAMES)),
             RxInvalidReason::NotKernelOwned,
-            None,
+            Effect::Untouched,
         ),
-        (valid(bases[0]), RxInvalidReason::NotKernelOwned, None),
+        (
+            valid(bases[0]),
+            RxInvalidReason::NotKernelOwned,
+            Effect::Untouched,
+        ),
         (
             XdpDescriptor {
                 options: 1 << 31,
                 ..valid(bases[1])
             },
             RxInvalidReason::UnsupportedOptions,
-            Some(1),
+            Effect::Quarantined(1),
         ),
         (
             XdpDescriptor {
@@ -250,7 +284,7 @@ fn rx_fill_rejects_every_invalid_descriptor_kind() {
                 ..valid(bases[2])
             },
             RxInvalidReason::DataBeforeHeadroom,
-            Some(2),
+            Effect::Quarantined(2),
         ),
         (
             XdpDescriptor {
@@ -258,7 +292,7 @@ fn rx_fill_rejects_every_invalid_descriptor_kind() {
                 ..valid(bases[3])
             },
             RxInvalidReason::DataBeforeHeadroom,
-            Some(3),
+            Effect::Quarantined(3),
         ),
         (
             XdpDescriptor {
@@ -266,7 +300,7 @@ fn rx_fill_rejects_every_invalid_descriptor_kind() {
                 ..valid(bases[4])
             },
             RxInvalidReason::ShorterThanEthernetHeader,
-            Some(4),
+            Effect::Recycled(4),
         ),
         (
             XdpDescriptor {
@@ -274,7 +308,7 @@ fn rx_fill_rejects_every_invalid_descriptor_kind() {
                 ..valid(bases[5])
             },
             RxInvalidReason::ShorterThanEthernetHeader,
-            Some(5),
+            Effect::Recycled(5),
         ),
         (
             XdpDescriptor {
@@ -282,7 +316,7 @@ fn rx_fill_rejects_every_invalid_descriptor_kind() {
                 ..valid(bases[6])
             },
             RxInvalidReason::ExceedsFrame,
-            Some(6),
+            Effect::Quarantined(6),
         ),
         (
             XdpDescriptor {
@@ -290,10 +324,13 @@ fn rx_fill_rejects_every_invalid_descriptor_kind() {
                 ..valid(bases[7])
             },
             RxInvalidReason::ExceedsFrame,
-            Some(7),
+            Effect::Quarantined(7),
         ),
     ];
-    for (descriptor, reason, quarantined) in cases {
+    for (descriptor, reason, effect) in cases {
+        // Republish any recycled runt frame first, so the poll's own refill
+        // changes nothing but the case's frame.
+        let _ = engine.refill().expect("refill");
         let before = snapshot(engine.ledger());
         assert!(kernel.produce_rx(descriptor));
         let counted = engine.counters().rx_invalid(reason);
@@ -309,12 +346,18 @@ fn rx_fill_rejects_every_invalid_descriptor_kind() {
         );
         let after = snapshot(engine.ledger());
         for (frame, (old, new)) in before.iter().zip(&after).enumerate() {
-            if Some(frame as u32) == quarantined {
-                assert_eq!(old.0, FrameStateKind::FillOwnedByKernel);
-                assert_eq!(new.0, FrameStateKind::Quarantined, "{reason:?}");
-                assert_eq!(old.1, new.1, "quarantine keeps the generation");
-            } else {
-                assert_eq!(old, new, "{reason:?} mutated frame {frame}");
+            let frame = frame as u32;
+            match effect {
+                Effect::Quarantined(target) if target == frame => {
+                    assert_eq!(old.0, FrameStateKind::FillOwnedByKernel);
+                    assert_eq!(new.0, FrameStateKind::Quarantined, "{reason:?}");
+                    assert_eq!(old.1, new.1, "quarantine keeps the generation");
+                }
+                Effect::Recycled(target) if target == frame => {
+                    assert_eq!(old.0, FrameStateKind::FillOwnedByKernel);
+                    assert_eq!(*new, (FrameStateKind::Free, None), "{reason:?}");
+                }
+                _ => assert_eq!(old, new, "{reason:?} mutated frame {frame}"),
             }
         }
         audit(&engine);
@@ -323,18 +366,20 @@ fn rx_fill_rejects_every_invalid_descriptor_kind() {
     assert_eq!(counters.rx_packets, 0);
     assert_eq!(counters.rx_leased, 0);
     assert_eq!(counters.rx_invalid_total(), 12);
-    assert_eq!(counters.frames_quarantined, 8);
+    assert_eq!(counters.frames_quarantined, 6);
+    assert_eq!(counters.rx_runts_recycled, 2);
     for reason in RxInvalidReason::ALL {
         assert_eq!(RxInvalidReason::ALL[reason.index()], reason);
         assert!(counters.rx_invalid(reason) >= 2, "{}", reason.code());
     }
-    // Quarantined frames never return: only the four never-published
-    // RX-pool frames remain usable and are now in Fill.
-    assert_eq!(
-        engine.ledger().counts().get(FrameStateKind::Quarantined),
-        RING as usize
-    );
-    assert_eq!(kernel.fill_pending(), RX_FRAMES - RING);
+    // Quarantined frames never return; the two runt frames re-entered the
+    // pool and were republished behind the four never-published frames.
+    assert_eq!(engine.ledger().counts().get(FrameStateKind::Quarantined), 6);
+    let _ = engine.refill().expect("refill");
+    assert_eq!(kernel.fill_pending(), RX_FRAMES - RING + 2);
+    assert_eq!(state(&engine, 4), FrameStateKind::FillOwnedByKernel);
+    assert_eq!(state(&engine, 5), FrameStateKind::FillOwnedByKernel);
+    audit(&engine);
 }
 
 #[test]
@@ -660,27 +705,62 @@ fn rx_fill_poll_budget_bounds_descriptor_work() {
 }
 
 #[test]
-fn rx_fill_need_wakeup_and_unknown_flags_are_counted_after_publication() {
+fn rx_fill_need_wakeup_is_observed_on_every_refill() {
     let kernel = kernel();
-    let mut engine = engine(&kernel, RING);
-    assert_eq!(engine.counters().fill_need_wakeup, 0);
+    // The flag is already set when the engine primes Fill: the initial
+    // report carries it, so the first kick is not lost.
     kernel.set_fill_flags(XDP_RING_NEED_WAKEUP);
+    let mut engine = engine(&kernel, RING);
+    let initial = engine.initial_refill();
+    assert_eq!(initial.published(), RING);
+    assert_eq!(initial.need_wakeup(), Ok(NeedWakeup::Required));
+    assert_eq!(engine.counters().fill_need_wakeup, 1);
+
+    // Fill full: nothing is published, the flag is still reported.
+    let report = engine.refill().expect("refill");
+    assert_eq!(report.published(), 0);
+    assert_eq!(report.need_wakeup(), Ok(NeedWakeup::Required));
+    assert_eq!(engine.fill_needs_wakeup(), Ok(NeedWakeup::Required));
+    assert_eq!(engine.counters().fill_need_wakeup, 2);
+
+    // After a publication.
     deliver(&kernel, &packet(1, 64));
     let report = engine.refill().expect("refill");
     assert_eq!(report.published(), 1);
-    assert_eq!(report.need_wakeup(), Some(Ok(NeedWakeup::Required)));
-    assert_eq!(engine.counters().fill_need_wakeup, 1);
+    assert_eq!(report.need_wakeup(), Ok(NeedWakeup::Required));
 
+    // Starved: the free list is empty, Fill has room, the flag is reported.
+    while engine.free_frames() > 0 {
+        deliver(&kernel, &packet(2, 64));
+        let _ = engine.refill().expect("refill");
+    }
+    deliver(&kernel, &packet(3, 64));
+    let report = engine.refill().expect("refill");
+    assert!(report.starved());
+    assert_eq!(report.need_wakeup(), Ok(NeedWakeup::Required));
+
+    // The kernel clears the flag; the accessor follows without publishing.
+    kernel.set_fill_flags(0);
+    assert_eq!(engine.fill_needs_wakeup(), Ok(NeedWakeup::NotRequired));
+    let wakeups = engine.counters().fill_need_wakeup;
+    assert_eq!(
+        engine.refill().expect("refill").need_wakeup(),
+        Ok(NeedWakeup::NotRequired)
+    );
+    assert_eq!(engine.counters().fill_need_wakeup, wakeups);
+
+    // Unknown bits are reported and counted; nothing is rolled back.
     kernel.set_fill_flags(XDP_RING_NEED_WAKEUP | 4);
-    deliver(&kernel, &packet(2, 64));
-    let report = engine.refill().expect("publication still succeeds");
-    assert_eq!(report.published(), 1);
+    assert_eq!(
+        engine.fill_needs_wakeup(),
+        Err(NativeRingError::UnsupportedRingFlags(4))
+    );
+    let report = engine.refill().expect("refill still succeeds");
     assert_eq!(
         report.need_wakeup(),
-        Some(Err(NativeRingError::UnsupportedRingFlags(4)))
+        Err(NativeRingError::UnsupportedRingFlags(4))
     );
     assert_eq!(engine.counters().fill_flag_errors, 1);
-    assert_eq!(kernel.fill_pending(), RING);
     audit(&engine);
 }
 
@@ -711,82 +791,83 @@ fn rx_fill_corrupt_kernel_cursors_fail_closed_without_mutation() {
 }
 
 #[test]
-fn rx_fill_setup_rejects_untracked_ring_entries_and_bad_geometry() {
-    let entries_error = |kernel: &ScriptedKernel, batch: u32| {
-        let (fill, rx, umem) = kernel.views();
-        RxFillEngine::new(fill, rx, umem, domain(7), config(batch)).map(|_| ())
+fn rx_fill_setup_rejects_untracked_ring_entries_and_bad_batch() {
+    let build = |kernel: &ScriptedKernel, batch: u32| {
+        let datapath = kernel.take_datapath().expect("first take");
+        RxFillEngine::new(datapath, domain(7), config(batch)).map(|_| ())
     };
-    let kernel = kernel();
     assert_eq!(
-        entries_error(&kernel, RING + 1),
+        build(&kernel(), RING + 1),
         Err(RxFillSetupError::FillBatchExceedsRing {
             fill_batch: RING + 1,
             capacity: RING,
         })
     );
-    // An engine already published to this Fill ring; a second, untracked
-    // ledger must refuse it.
-    {
-        let _first = engine(&kernel, 2);
-    }
-    assert_eq!(
-        entries_error(&kernel, RING),
-        Err(RxFillSetupError::FillRingNotEmpty)
-    );
-    let kernel = self::kernel();
-    assert!(kernel.produce_rx(XdpDescriptor {
+    // Stale Fill entries that no ledger tracks.
+    let stale = kernel();
+    stale.set_fill_producer(2);
+    assert_eq!(build(&stale, RING), Err(RxFillSetupError::FillRingNotEmpty));
+    // A stale RX descriptor.
+    let stale = kernel();
+    assert!(stale.produce_rx(XdpDescriptor {
         address: HEADROOM,
         len: 64,
         options: 0,
     }));
-    assert_eq!(
-        entries_error(&kernel, RING),
-        Err(RxFillSetupError::RxRingNotEmpty)
-    );
-
-    let mut short = vec![0_u8; UMEM_LEN as usize - 1];
-    assert_eq!(
-        UmemRegion::from_slice(&mut short, umem_config()).map(|_| ()),
-        Err(UmemRegionError::TooShort {
-            required: UMEM_LEN,
-            actual: UMEM_LEN as usize - 1,
-        })
-    );
+    assert_eq!(build(&stale, RING), Err(RxFillSetupError::RxRingNotEmpty));
 }
 
-#[repr(align(64))]
-struct AlignedRing([u8; 512]);
-
+/// Regression for review PoC (c): dropping an engine and building a second
+/// one over the same socket gave a fresh ledger that believed every frame
+/// was Free while the kernel still held the frames the first engine
+/// published, and the second engine published them again. The bundle is
+/// now taken once per socket lifetime, so the second engine cannot exist.
+/// The scripted kernel asserts that it never takes one frame from Fill
+/// twice. This runs under Miri with the rest of the lib tests.
 #[test]
-fn rx_fill_engine_runs_over_caller_owned_heap_memory() {
-    let mut fill_memory = Box::new(AlignedRing([0; 512]));
-    let mut rx_memory = Box::new(AlignedRing([0; 512]));
-    let mut umem_memory = vec![0_u8; UMEM_LEN as usize];
-    let fill = FillProducer::new(
-        &mut fill_memory.0,
-        HEAP_RING_OFFSETS,
-        entries(RingName::Fill),
-    )
-    .expect("Fill view");
-    let rx = RxConsumer::new(&mut rx_memory.0, HEAP_RING_OFFSETS, entries(RingName::Rx))
-        .expect("RX view");
-    let umem = UmemRegion::from_slice(&mut umem_memory, umem_config()).expect("UMEM");
-    assert_eq!(umem.byte_len(), UMEM_LEN);
-    let mut engine =
-        RxFillEngine::new(fill, rx, umem, domain(11), config(RING)).expect("heap engine");
-    assert_eq!(engine.counters().fill_published, u64::from(RING));
-    let batch = engine.poll(RING).expect("poll");
-    assert_eq!(batch.remaining(), 0);
-    drop(batch);
-    assert_eq!(engine.counters().rx_ring_empty, 1);
+fn rx_fill_bundle_is_taken_once_so_no_frame_is_published_twice() {
+    let kernel = kernel();
+    {
+        let mut engine = engine(&kernel, RING);
+        // The kernel takes every published frame and keeps them (a
+        // zero-copy driver holding hardware RX descriptors).
+        while kernel.consume_fill().is_some() {}
+        let _ = engine.refill().expect("refill");
+        while kernel.consume_fill().is_some() {}
+        assert_eq!(engine.free_frames(), 0);
+        for frame in 0..RX_FRAMES {
+            assert!(kernel.holds(frame));
+        }
+    }
+    // The first engine is gone; the kernel still holds all 12 frames.
+    assert!(matches!(
+        kernel.take_datapath(),
+        Err(DatapathError::AlreadyTaken)
+    ));
+    assert_eq!(kernel.fill_pending(), 0, "nothing was published again");
+    for frame in 0..RX_FRAMES {
+        assert!(kernel.holds(frame));
+    }
+}
+
+/// Regression for review PoCs (a) and (b): an engine accepts only one
+/// whole bundle, and a bundle has no public constructor or member access,
+/// so a heap Fill view, or one session's rings with another session's UMEM,
+/// cannot be combined. The compile-time half is the `compile_fail`
+/// doctests on `DatapathRings`; this is the runtime half.
+#[test]
+fn rx_fill_engine_consumes_one_bundle_with_every_ring() {
+    let kernel = kernel();
+    let datapath = kernel.take_datapath().expect("bundle");
+    assert_eq!(datapath.capacities(), [RING, RING, 8, 8]);
+    assert_eq!(datapath.umem_config(), umem_config());
+    assert!(format!("{datapath:?}").contains("<redacted>"));
+    let engine = RxFillEngine::new(datapath, domain(9), config(RING)).expect("engine");
     assert!(format!("{engine:?}").contains("<redacted>"));
+    // The engine owns TX and Completion too: no other party holds a TX
+    // producer that could name a lent frame.
+    assert!(kernel.take_datapath().is_err());
     audit(&engine);
-    drop(engine);
-    // Producer cursor 8 is visible in the caller's memory after the borrow.
-    assert_eq!(
-        u32::from_ne_bytes(fill_memory.0[0..4].try_into().expect("u32")),
-        RING
-    );
 }
 
 #[test]
@@ -805,12 +886,13 @@ fn rx_fill_audit_detects_free_list_divergence() {
     );
     assert!(engine.push_free_entry_for_test(lost));
     audit(&engine);
-    // A duplicated entry, and an entry naming a kernel-owned frame.
+    // A duplicated entry.
     assert!(engine.push_free_entry_for_test(lost));
     assert_eq!(
         engine.audit(),
         Err(RxFillAuditError::FreeListEntry { frame: lost })
     );
+    // A kernel-owned frame in the free list.
     let fresh = self::kernel();
     let mut engine = self::engine(&fresh, RING);
     assert_eq!(state(&engine, 0), FrameStateKind::FillOwnedByKernel);
@@ -819,6 +901,81 @@ fn rx_fill_audit_detects_free_list_divergence() {
         engine.audit(),
         Err(RxFillAuditError::FreeListEntry { frame: 0 })
     );
+    // A generated-pool frame (Free in the ledger, but outside the RX pool).
+    let fresh = self::kernel();
+    let mut engine = self::engine(&fresh, RING);
+    assert_eq!(state(&engine, RX_FRAMES), FrameStateKind::Free);
+    assert!(engine.push_free_entry_for_test(RX_FRAMES));
+    assert_eq!(
+        engine.audit(),
+        Err(RxFillAuditError::FreeListEntry { frame: RX_FRAMES })
+    );
+}
+
+#[test]
+fn rx_fill_generation_exhaustion_quarantines_and_refill_continues() {
+    let kernel = kernel();
+    let mut engine = engine(&kernel, RING);
+    // Free list is [8, 9, 10, 11]; exhaust frame 8.
+    engine.exhaust_generation_for_test(8);
+    for _ in 0..2 {
+        kernel.consume_fill().expect("Fill");
+    }
+    let report = engine.refill().expect("refill");
+    // Frame 8 was skipped and quarantined; 9 and 10 were published.
+    assert_eq!(report.published(), 2);
+    assert_eq!(state(&engine, 8), FrameStateKind::Quarantined);
+    assert_eq!(state(&engine, 9), FrameStateKind::FillOwnedByKernel);
+    assert_eq!(state(&engine, 10), FrameStateKind::FillOwnedByKernel);
+    assert_eq!(engine.counters().frames_quarantined, 1);
+    assert_eq!(engine.free_frames(), 1);
+    audit(&engine);
+}
+
+#[test]
+fn rx_fill_backlog_and_empty_ring_boundaries_are_exact() {
+    let kernel = kernel();
+    let mut engine = engine(&kernel, RING);
+    for seed in 0..3 {
+        deliver(&kernel, &packet(seed, 64));
+    }
+    // available == budget: no backlog.
+    drop(engine.poll(3).expect("poll"));
+    assert_eq!(engine.counters().rx_backlogged, 0);
+    assert_eq!(engine.pending_rx(), 3);
+    // Pending frames and an empty RX ring: not an empty-ring poll.
+    {
+        let mut batch = engine.poll(4).expect("poll");
+        assert_eq!(engine_remaining(&batch), 3);
+        while let Some(frame) = batch.next_frame() {
+            frame.recycle();
+        }
+    }
+    assert_eq!(engine.counters().rx_ring_empty, 0);
+    // available == budget + 1: backlog.
+    for seed in 0..3 {
+        deliver(&kernel, &packet(seed, 64));
+    }
+    {
+        let mut batch = engine.poll(2).expect("poll");
+        while let Some(frame) = batch.next_frame() {
+            frame.recycle();
+        }
+    }
+    assert_eq!(engine.counters().rx_backlogged, 1);
+    {
+        let mut batch = engine.poll(1).expect("poll");
+        batch.next_frame().expect("frame").recycle();
+    }
+    assert_eq!(engine.counters().rx_backlogged, 1, "exactly drained");
+    // Nothing pending and nothing in RX: an empty-ring poll.
+    drop(engine.poll(1).expect("poll"));
+    assert_eq!(engine.counters().rx_ring_empty, 1);
+    audit(&engine);
+}
+
+fn engine_remaining(batch: &crate::RxBatch<'_, '_>) -> u32 {
+    batch.remaining()
 }
 
 #[test]
@@ -867,6 +1024,92 @@ fn rx_fill_steady_state_does_not_allocate() {
     }
     assert_eq!(allocation_count(), before, "hot path allocated");
     audit(&engine);
+}
+
+fn rx_room(kernel: &ScriptedKernel) -> u32 {
+    RING - kernel.rx_producer().wrapping_sub(kernel.rx_consumer())
+}
+
+fn drain(engine: &mut RxFillEngine<'_>, budget: u32) {
+    let mut batch = engine.poll(budget).expect("poll");
+    while let Some(frame) = batch.next_frame() {
+        frame.recycle();
+    }
+}
+
+#[test]
+fn rx_fill_refusal_and_starvation_paths_do_not_allocate() {
+    let kernel = kernel();
+    let mut engine = engine(&kernel, RING);
+    drain(&mut engine, RING);
+    let before = allocation_count();
+    for round in 0..64_u32 {
+        // Refused without mutation: outside UMEM, generated-pool frame.
+        for address in [UMEM_LEN, frame_base(RX_FRAMES) + HEADROOM] {
+            if rx_room(&kernel) > 0 {
+                assert!(kernel.produce_rx(XdpDescriptor {
+                    address,
+                    len: 64,
+                    options: 0,
+                }));
+            }
+        }
+        // A runt (recycled) every round, a quarantine in the first rounds.
+        let quarantine = round < 3;
+        for options in [0, u32::from(quarantine)] {
+            if kernel.fill_pending() > 0 && rx_room(&kernel) > 0 {
+                let base = kernel.consume_fill().expect("Fill");
+                assert!(kernel.produce_rx(XdpDescriptor {
+                    address: base + HEADROOM,
+                    len: if options == 0 { 1 } else { 64 },
+                    options,
+                }));
+            }
+        }
+        drain(&mut engine, RING);
+    }
+    assert!(engine.counters().rx_runts_recycled >= 60);
+    assert_eq!(engine.counters().frames_quarantined, 3);
+    // Starvation: every pool frame handed to TX, then polls with an empty
+    // free list, then recovery.
+    let mut handoffs: [Option<TxHandoff>; RX_FRAMES as usize] = Default::default();
+    let mut held = 0;
+    for _ in 0..4 {
+        while kernel.fill_pending() > 0 && rx_room(&kernel) > 0 {
+            deliver_without_payload(&kernel);
+        }
+        let mut batch = engine.poll(RING).expect("poll");
+        while let Some(frame) = batch.next_frame() {
+            handoffs[held] = Some(frame.stage_tx());
+            held += 1;
+        }
+    }
+    let starved = engine.counters().fill_starved;
+    for _ in 0..8 {
+        drain(&mut engine, RING);
+    }
+    assert!(engine.counters().fill_starved >= starved + 8);
+    for handoff in handoffs.iter_mut().filter_map(Option::take) {
+        engine.cancel_tx_handoff(handoff).expect("cancel");
+    }
+    drain(&mut engine, RING);
+    assert_eq!(
+        allocation_count(),
+        before,
+        "refusal or starvation path allocated"
+    );
+    assert_eq!(engine.tx_handoffs_outstanding(), 0);
+    audit(&engine);
+}
+
+/// `deliver` without a packet buffer, for allocation-free schedules.
+fn deliver_without_payload(kernel: &ScriptedKernel) {
+    let base = kernel.consume_fill().expect("Fill");
+    assert!(kernel.produce_rx(XdpDescriptor {
+        address: base + HEADROOM,
+        len: 64,
+        options: 0,
+    }));
 }
 
 /// Deterministic xorshift for the differential schedule.
@@ -946,6 +1189,12 @@ fn assert_same(engine: &RxFillEngine<'_>, model: &Model, step: usize) {
         .unwrap_or_else(|error| panic!("step {step}: {error:?}"));
 }
 
+/// Invalid descriptors that mutate nothing (outside UMEM, generated pool)
+/// are part of the schedule. Quarantine and runt recycling are not: the
+/// model kernel validates and refuses to produce out-of-profile RX
+/// descriptors, and it exposes no mutable ledger through which the
+/// differential could mirror a quarantine or a runt release. Those paths
+/// are covered by the direct tests above.
 #[test]
 fn rx_fill_differential_matches_fake_kernel_ownership_model() {
     for seed in [
@@ -968,9 +1217,8 @@ fn rx_fill_differential_matches_fake_kernel_ownership_model() {
                 // Kernel: receive into some Fill frames, if RX has room.
                 0 | 1 => {
                     for _ in 0..rng.below(u64::from(RING)) + 1 {
-                        let rx_room =
-                            RING - kernel.rx_producer().wrapping_sub(kernel.rx_consumer());
-                        if kernel.fill_pending() == 0 || rx_room == 0 {
+                        let room = RING - kernel.rx_producer().wrapping_sub(kernel.rx_consumer());
+                        if kernel.fill_pending() == 0 || room == 0 {
                             break;
                         }
                         let base = kernel.consume_fill().expect("Fill");
@@ -985,6 +1233,18 @@ fn rx_fill_differential_matches_fake_kernel_ownership_model() {
                         written[frame] = step as u8;
                         kernel.write_umem(base + HEADROOM, &[step as u8; 4]);
                         assert!(kernel.produce_rx(raw));
+                        if rng.below(4) == 0 && rx_room(&kernel) > 0 {
+                            let address = if rng.below(2) == 0 {
+                                UMEM_LEN + rng.below(1 << 20)
+                            } else {
+                                frame_base(RX_FRAMES + rng.below(4) as u32) + HEADROOM
+                            };
+                            assert!(kernel.produce_rx(XdpDescriptor {
+                                address,
+                                len: 64,
+                                options: 0,
+                            }));
+                        }
                         model
                             .kernel_consume_fill()
                             .expect("model Fill")
@@ -999,9 +1259,10 @@ fn rx_fill_differential_matches_fake_kernel_ownership_model() {
                 // Engine: poll and drain the batch with a random completion.
                 2 => {
                     let budget = u32::try_from(rng.below(u64::from(RING) + 2)).expect("small");
-                    let consumed_before = kernel.rx_consumer();
                     let mut batch = engine.poll(budget).expect("poll");
-                    let consumed = kernel.rx_consumer().wrapping_sub(consumed_before);
+                    // Pending is empty at every step start, so the batch
+                    // lends exactly the valid descriptors it consumed.
+                    let consumed = batch.remaining();
                     if consumed > 0 {
                         model
                             .acquire_rx(consumed as usize)
@@ -1055,7 +1316,15 @@ fn rx_fill_differential_matches_fake_kernel_ownership_model() {
         }
         assert_same(&engine, &model, usize::MAX);
         let counters = engine.counters();
-        assert_eq!(counters.rx_invalid_total(), 0);
+        assert_eq!(
+            counters.rx_invalid_total(),
+            counters.rx_invalid(RxInvalidReason::AddressOutsideUmem)
+                + counters.rx_invalid(RxInvalidReason::NotKernelOwned)
+        );
+        assert!(
+            counters.rx_invalid_total() > 0,
+            "invalid descriptors scheduled"
+        );
         // The schedule exercised every completion path and starvation.
         assert!(counters.rx_leased >= steps as u64 / 10, "{counters:?}");
         assert!(counters.rx_recycled > 0 && counters.rx_abandoned > 0);

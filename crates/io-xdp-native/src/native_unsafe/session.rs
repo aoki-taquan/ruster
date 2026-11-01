@@ -32,6 +32,7 @@ use crate::{
 };
 
 use super::umem::UmemMapping;
+use crate::datapath::{DatapathError, DatapathParts, DatapathRings, RingsError};
 
 use super::syscall::{
     errno, interface_index, Errno, LinuxSyscalls, MappedRegion, MapsRealMemory, OwnedBpfFd,
@@ -394,6 +395,19 @@ pub(super) struct SessionCore<'s, S: MapsRealMemory> {
     queue: u32,
     mode: NegotiatedMode,
     zero_copy_fallback: bool,
+    datapath: DatapathAccess,
+}
+
+/// Which kind of ring access this session has handed out. The two kinds
+/// never overlap, and the datapath bundle is handed out at most once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum DatapathAccess {
+    /// Nothing was lent yet.
+    Untouched,
+    /// `rings` lent raw views at least once.
+    RawLent,
+    /// `take_datapath` lent the bundle; it can never be lent again.
+    Taken,
 }
 
 impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
@@ -454,7 +468,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
                 SessionStage::MapUmem,
                 SessionFailure::ArgumentOutOfRange,
             ))?;
-        let mut umem =
+        let umem =
             MappedRegion::map_anonymous(syscalls, umem_len).map_err(at(SessionStage::MapUmem))?;
         check_page_aligned(SessionStage::MapUmem, &umem)?;
 
@@ -522,7 +536,6 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
             &mut completion,
             &mut rx,
             &mut tx,
-            &mut umem,
             plans,
             umem_config,
         )
@@ -586,27 +599,80 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
             queue: config.queue(),
             mode,
             zero_copy_fallback: false,
+            datapath: DatapathAccess::Untouched,
         })
     }
 
     /// Lends the four role-typed ring views and the UMEM geometry.
-    pub(super) fn rings(&mut self) -> Result<NativeRings<'_>, RingMapError> {
+    ///
+    /// Refused once the datapath bundle was taken.
+    pub(super) fn rings(&mut self) -> Result<NativeRings<'_>, RingsError> {
+        if self.datapath == DatapathAccess::Taken {
+            return Err(RingsError::DatapathTaken);
+        }
+        self.datapath = DatapathAccess::RawLent;
+        self.raw_views().map_err(RingsError::Map)
+    }
+
+    /// Lends all datapath resources as one bundle, at most once per session
+    /// and never after raw views were lent.
+    pub(super) fn take_datapath(&mut self) -> Result<DatapathRings<'_>, DatapathError> {
+        match self.datapath {
+            DatapathAccess::Taken => return Err(DatapathError::AlreadyTaken),
+            DatapathAccess::RawLent => return Err(DatapathError::RawRingsLent),
+            DatapathAccess::Untouched => {}
+        }
+        // `open` rejected a zero or unaligned UMEM address, so only an
+        // inactive region could yield no borrow.
+        let Some(umem) = self.umem.borrow_mapping() else {
+            return Err(DatapathError::Map(RingMapError::MappingTooShort {
+                required: 1,
+                actual: 0,
+            }));
+        };
+        let umem = UmemMapping::from_mapping(umem);
+        let views = build_views(
+            &mut self.fill,
+            &mut self.completion,
+            &mut self.rx,
+            &mut self.tx,
+            self.plans,
+            self.umem_config,
+        )
+        .map_err(|(_, failure)| DatapathError::Map(view_error(failure)))?;
+        self.datapath = DatapathAccess::Taken;
+        let NativeRings {
+            fill,
+            completion,
+            rx,
+            tx,
+            umem: _,
+        } = views;
+        Ok(DatapathRings::new(DatapathParts {
+            fill,
+            completion,
+            rx,
+            tx,
+            umem,
+            umem_config: self.umem_config,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(super) const fn datapath_access(&self) -> DatapathAccess {
+        self.datapath
+    }
+
+    fn raw_views(&mut self) -> Result<NativeRings<'_>, RingMapError> {
         build_views(
             &mut self.fill,
             &mut self.completion,
             &mut self.rx,
             &mut self.tx,
-            &mut self.umem,
             self.plans,
             self.umem_config,
         )
-        .map_err(|(_, failure)| match failure {
-            SessionFailure::RingLayout { error, .. } => error,
-            _ => RingMapError::MappingTooShort {
-                required: 1,
-                actual: 0,
-            },
-        })
+        .map_err(|(_, failure)| view_error(failure))
     }
 
     /// Releases every resource once in teardown order and reports the first
@@ -764,6 +830,16 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
 
 type ViewFailure = (SessionStage, SessionFailure);
 
+fn view_error(failure: SessionFailure) -> RingMapError {
+    match failure {
+        SessionFailure::RingLayout { error, .. } => error,
+        _ => RingMapError::MappingTooShort {
+            required: 1,
+            actual: 0,
+        },
+    }
+}
+
 fn borrow_failure(stage: SessionStage, ring: RingName, error: RingMapError) -> ViewFailure {
     (stage, SessionFailure::RingLayout { ring, error })
 }
@@ -773,7 +849,6 @@ fn build_views<'a, S: MapsRealMemory>(
     completion: &'a mut MappedRegion<'_, S>,
     rx: &'a mut MappedRegion<'_, S>,
     tx: &'a mut MappedRegion<'_, S>,
-    umem_region: &'a mut MappedRegion<'_, S>,
     plans: RingPlans,
     umem: UmemConfig,
 ) -> Result<NativeRings<'a>, ViewFailure> {
@@ -809,17 +884,12 @@ fn build_views<'a, S: MapsRealMemory>(
         .ok_or(inactive(plans.tx))
         .and_then(|mapping| TxProducer::with_mapping(mapping, plans.tx.raw, plans.tx.entries))
         .map_err(|error| borrow_failure(SessionStage::MapTxRing, RingName::Tx, error))?;
-    // `open` rejected a zero or unaligned UMEM address before this point,
-    // so only an inactive region yields no borrow.
-    let umem_mapping = umem_region
-        .borrow_mapping()
-        .ok_or((SessionStage::MapUmem, SessionFailure::MisalignedMapping))?;
     Ok(NativeRings {
         fill,
         completion,
         rx,
         tx,
-        umem: UmemRegion::new(umem, UmemMapping::from_mapping(umem_mapping)),
+        umem: UmemRegion::new(umem),
     })
 }
 
@@ -898,9 +968,34 @@ impl NativeSession {
     }
 
     /// Lends the four ring views and the UMEM geometry for the borrow of
-    /// `self`.
-    pub fn rings(&mut self) -> Result<NativeRings<'_>, RingMapError> {
+    /// `self`, for direct ring access without the engine.
+    ///
+    /// Once called, [`Self::take_datapath`] is refused for this session,
+    /// because frames published through raw views are unknown to any
+    /// engine ledger. After the datapath was taken this returns
+    /// [`RingsError::DatapathTaken`].
+    pub fn rings(&mut self) -> Result<NativeRings<'_>, RingsError> {
         self.core.rings()
+    }
+
+    /// Takes all datapath resources (Fill, Completion, RX, TX, and UMEM
+    /// bytes) as one bundle for [`crate::RxFillEngine::new`].
+    ///
+    /// Succeeds at most once per session, and only if [`Self::rings`] was
+    /// never called: the engine's ledger must have seen every Fill
+    /// publication of this socket. Rebuilding an engine therefore requires
+    /// closing the session, because the kernel or driver may still hold
+    /// frames the first engine published.
+    ///
+    /// ```compile_fail,E0499
+    /// fn two(session: &mut ruster_io_xdp_native::NativeSession) {
+    ///     let first = session.take_datapath();
+    ///     let raw = session.rings();
+    ///     drop((first, raw));
+    /// }
+    /// ```
+    pub fn take_datapath(&mut self) -> Result<DatapathRings<'_>, DatapathError> {
+        self.core.take_datapath()
     }
 
     /// Attaches the XSK redirect program to the bound interface through an

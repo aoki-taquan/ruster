@@ -314,6 +314,16 @@ impl FrameLedger {
         )
     }
 
+    /// Frees a kernel-owned Fill frame that the kernel returned correctly
+    /// but whose packet is unusable (for example a runt).
+    ///
+    /// Unlike [`Self::quarantine_kernel_fill`], the descriptor's address and
+    /// headroom were in profile, so the frame re-enters the pool; the next
+    /// cycle gets a new generation.
+    pub fn release_kernel_fill(&mut self, token: FrameToken) -> Result<(), LedgerError> {
+        self.transition(token, FrameStateKind::FillOwnedByKernel, FrameState::Free)
+    }
+
     /// Borrows a received frame for packet processing.
     pub fn lease_rx(&mut self, token: FrameToken) -> Result<ValidatedDescriptor, LedgerError> {
         let index = self.verify(token, FrameStateKind::RxAvailable)?;
@@ -596,8 +606,12 @@ impl FrameLedger {
         Ok(index)
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_free_generation_for_test(&mut self, frame_index: u32, generation: u64) {
+    /// Test hook: sets the generation of a `Free` frame, so generation
+    /// exhaustion can be exercised without 2^64 cycles. Available only with
+    /// the `test-hooks` feature, which is not part of the supported API.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_free_generation_for_test(&mut self, frame_index: u32, generation: u64) {
         let index = self.index(frame_index).expect("test frame");
         assert_eq!(self.entries[index].state, FrameState::Free);
         self.entries[index].generation = generation;

@@ -4,8 +4,10 @@
 //! consumer, the UMEM, and the authoritative frame ledger. Nothing here
 //! locks, allocates after construction, clones packets, or formats a
 //! string. The engine is generic over ring memory only through the
-//! borrowed role views it consumes: a live [`crate::NativeSession`] lends
-//! them over the kernel mappings, and tests lend them over heap memory.
+//! [`DatapathRings`] bundle it consumes: a live [`crate::NativeSession`]
+//! lends it once over the kernel mappings, and tests lend it once over heap
+//! memory. Taking the whole bundle once is what makes the ledger the only
+//! record of Fill publications for this UMEM.
 //!
 //! Frame ownership follows the [`FrameLedger`]: a free RX-pool frame is
 //! reserved and published to Fill (`FillOwnedByKernel`); the kernel returns
@@ -24,8 +26,10 @@ use ruster_io_xdp::{
 
 use crate::{
     abi::XdpDescriptor,
+    datapath::{DatapathParts, DatapathRings},
     native_unsafe::umem::{UmemFrames, UmemPairingError},
-    FillProducer, NativeRingError, NeedWakeup, RxConsumer, UmemRegion, XDP_PACKET_HEADROOM,
+    CompletionConsumer, FillProducer, NativeRingError, NeedWakeup, RxConsumer, TxProducer,
+    XDP_PACKET_HEADROOM,
 };
 
 /// Smallest accepted RX length: one Ethernet II header.
@@ -50,8 +54,9 @@ pub enum RxInvalidReason {
     /// The packet starts inside the configured plus kernel headroom. The
     /// kernel-owned frame is quarantined.
     DataBeforeHeadroom,
-    /// Shorter than [`ETHERNET_HEADER_LEN`], including zero. The
-    /// kernel-owned frame is quarantined.
+    /// Shorter than [`ETHERNET_HEADER_LEN`], including zero. The kernel
+    /// returned the frame correctly (address and headroom in profile) with
+    /// an unusable packet, so the frame is recycled, not quarantined.
     ShorterThanEthernetHeader,
     /// The visible range ends beyond the frame (chunk). The kernel-owned
     /// frame is quarantined.
@@ -132,13 +137,16 @@ pub struct RxFillCounters {
     pub fill_starved: u64,
     /// Refills that found free frames and a full Fill ring.
     pub fill_ring_full: u64,
-    /// Fill publications after which the kernel requested a wakeup.
+    /// Refills that observed the kernel requesting a Fill wakeup.
     pub fill_need_wakeup: u64,
-    /// Fill publications whose flags word had unknown bits.
+    /// Refills whose Fill flags word had unknown bits.
     pub fill_flag_errors: u64,
-    /// Frames permanently removed from reuse (invalid kernel return or
-    /// generation exhaustion).
+    /// Frames permanently removed from reuse (out-of-profile kernel return
+    /// or generation exhaustion). This, not starvation, is where pool
+    /// shrinkage is observed.
     pub frames_quarantined: u64,
+    /// Runt frames (shorter than an Ethernet header) recycled to the pool.
+    pub rx_runts_recycled: u64,
     rx_invalid: [u64; RxInvalidReason::COUNT],
 }
 
@@ -282,18 +290,10 @@ pub enum RxFillAuditError {
 pub struct RefillReport {
     published: u32,
     starved: bool,
-    need_wakeup: Option<Result<NeedWakeup, NativeRingError>>,
+    need_wakeup: Result<NeedWakeup, NativeRingError>,
 }
 
 impl RefillReport {
-    const fn idle(starved: bool) -> Self {
-        Self {
-            published: 0,
-            starved,
-            need_wakeup: None,
-        }
-    }
-
     /// Frames published to Fill.
     #[must_use]
     pub const fn published(self) -> u32 {
@@ -306,10 +306,11 @@ impl RefillReport {
         self.starved
     }
 
-    /// The need-wakeup observation after a publication, if one happened.
-    /// The kick itself (poll/recvfrom on the socket) belongs to the caller.
-    #[must_use]
-    pub const fn need_wakeup(self) -> Option<Result<NeedWakeup, NativeRingError>> {
+    /// The Fill need-wakeup flag observed at the end of this refill (after
+    /// the Release publication, if one happened), also when nothing was
+    /// published. The kick itself (poll/recvfrom on the socket) belongs to
+    /// the caller.
+    pub const fn need_wakeup(self) -> Result<NeedWakeup, NativeRingError> {
         self.need_wakeup
     }
 }
@@ -425,29 +426,39 @@ struct EngineState<'memory> {
     umem_len: u64,
 }
 
-type Classified = Result<(FrameToken, ValidatedDescriptor), (RxInvalidReason, Option<FrameToken>)>;
+/// What happens to the frame of a refused descriptor.
+#[derive(Clone, Copy)]
+enum Refusal {
+    /// The kernel did not return a frame this engine owns: touch nothing.
+    Untouched,
+    /// Out-of-profile kernel return: remove the frame from reuse.
+    Quarantine(FrameToken),
+    /// Correct kernel return with an unusable packet: recycle the frame.
+    Recycle(FrameToken),
+}
+
+type Classified = Result<(FrameToken, ValidatedDescriptor), (RxInvalidReason, Refusal)>;
 
 impl EngineState<'_> {
     /// Validates one kernel RX descriptor against the profile and ledger.
     ///
-    /// The returned token, on failure, names a kernel-owned frame that must
-    /// be quarantined; `None` means nothing may be touched.
+    /// On failure the [`Refusal`] says what happens to the frame.
     fn classify(&self, raw: XdpDescriptor) -> Classified {
         if raw.address >= self.umem_len {
-            return Err((RxInvalidReason::AddressOutsideUmem, None));
+            return Err((RxInvalidReason::AddressOutsideUmem, Refusal::Untouched));
         }
         let frame_base = raw.address & !(self.frame_size - 1);
         let Ok(index) = u32::try_from(raw.address / self.frame_size) else {
-            return Err((RxInvalidReason::AddressOutsideUmem, None));
+            return Err((RxInvalidReason::AddressOutsideUmem, Refusal::Untouched));
         };
         let ledger = self.frames.ledger();
         let Ok(state) = ledger.state(index) else {
-            return Err((RxInvalidReason::AddressOutsideUmem, None));
+            return Err((RxInvalidReason::AddressOutsideUmem, Refusal::Untouched));
         };
         let (FrameStateKind::FillOwnedByKernel, Some(token)) = (state.kind(), state.token()) else {
-            return Err((RxInvalidReason::NotKernelOwned, None));
+            return Err((RxInvalidReason::NotKernelOwned, Refusal::Untouched));
         };
-        let quarantine = |reason| Err((reason, Some(token)));
+        let quarantine = |reason| Err((reason, Refusal::Quarantine(token)));
         if raw.options != 0 {
             return quarantine(RxInvalidReason::UnsupportedOptions);
         }
@@ -456,7 +467,10 @@ impl EngineState<'_> {
             return quarantine(RxInvalidReason::DataBeforeHeadroom);
         }
         if raw.len < ETHERNET_HEADER_LEN {
-            return quarantine(RxInvalidReason::ShorterThanEthernetHeader);
+            return Err((
+                RxInvalidReason::ShorterThanEthernetHeader,
+                Refusal::Recycle(token),
+            ));
         }
         if offset + u64::from(raw.len) > self.frame_size {
             return quarantine(RxInvalidReason::ExceedsFrame);
@@ -484,14 +498,26 @@ impl EngineState<'_> {
                 debug_assert!(pushed, "acquisition is bounded by pending capacity");
                 bump(&mut self.counters.rx_packets);
             }
-            Err((reason, quarantine)) => {
+            Err((reason, refusal)) => {
                 bump(&mut self.counters.rx_invalid[reason.index()]);
-                if let Some(token) = quarantine {
-                    self.frames
-                        .ledger_mut()
-                        .quarantine_kernel_fill(token)
-                        .expect("classification proved FillOwnedByKernel");
-                    bump(&mut self.counters.frames_quarantined);
+                match refusal {
+                    Refusal::Untouched => {}
+                    Refusal::Quarantine(token) => {
+                        self.frames
+                            .ledger_mut()
+                            .quarantine_kernel_fill(token)
+                            .expect("classification proved FillOwnedByKernel");
+                        bump(&mut self.counters.frames_quarantined);
+                    }
+                    Refusal::Recycle(token) => {
+                        self.frames
+                            .ledger_mut()
+                            .release_kernel_fill(token)
+                            .expect("classification proved FillOwnedByKernel");
+                        let pushed = self.free.push(token.frame().index());
+                        debug_assert!(pushed, "each Free transition enters the free list once");
+                        bump(&mut self.counters.rx_runts_recycled);
+                    }
                 }
             }
         }
@@ -534,24 +560,38 @@ impl EngineState<'_> {
 pub struct RxFillEngine<'memory> {
     fill: FillProducer<'memory>,
     rx: RxConsumer<'memory>,
+    /// Owned, unused until the TX/Completion half (S4): holding them means
+    /// no one else can submit a TX descriptor naming a lent frame.
+    #[allow(dead_code)]
+    tx: TxProducer<'memory>,
+    #[allow(dead_code)]
+    completion: CompletionConsumer<'memory>,
     state: EngineState<'memory>,
+    initial_refill: RefillReport,
 }
 
 impl<'memory> RxFillEngine<'memory> {
-    /// Binds the engine to the Fill and RX views and the UMEM, creates the
-    /// ledger for `domain`, and performs the first bounded refill.
+    /// Consumes the session's datapath bundle, creates the ledger for
+    /// `domain`, and performs the first bounded refill (see
+    /// [`Self::initial_refill`]).
     ///
     /// Frames `0..rx_frames` form the RX pool. The generated pool
     /// `rx_frames..frame_count` is never published or lent by this engine.
-    /// Both rings must be empty: entries that no ledger tracks are refused.
+    /// The Fill and RX rings must be empty, a defensive check on top of the
+    /// once-per-session bundle.
     pub fn new(
-        fill: FillProducer<'memory>,
-        rx: RxConsumer<'memory>,
-        umem: UmemRegion<'memory>,
+        datapath: DatapathRings<'memory>,
         domain: UmemDomainId,
         config: RxFillConfig,
     ) -> Result<Self, RxFillSetupError> {
-        let geometry = umem.config();
+        let DatapathParts {
+            fill,
+            completion,
+            rx,
+            tx,
+            umem,
+            umem_config: geometry,
+        } = datapath.into_parts();
         let fill_batch = config.fill_batch().get();
         if fill_batch > fill.capacity() {
             return Err(RxFillSetupError::FillBatchExceedsRing {
@@ -574,7 +614,7 @@ impl<'memory> RxFillEngine<'memory> {
         )
         .map_err(RxFillSetupError::Layout)?;
         let ledger = FrameLedger::new(layout).map_err(RxFillSetupError::Ledger)?;
-        let frames = UmemFrames::new(umem.into_mapping(), ledger).map_err(|error| match error {
+        let frames = UmemFrames::new(umem, ledger).map_err(|error| match error {
             UmemPairingError::MappingTooShort => RxFillSetupError::UmemTooShort,
             UmemPairingError::LedgerNotFresh => {
                 unreachable!("a newly created ledger is fresh")
@@ -592,12 +632,51 @@ impl<'memory> RxFillEngine<'memory> {
             headroom: u64::from(headroom),
             umem_len: geometry.byte_len(),
         };
-        let mut engine = Self { fill, rx, state };
-        let _initial = engine.refill().map_err(|error| match error {
+        let mut engine = Self {
+            fill,
+            rx,
+            tx,
+            completion,
+            state,
+            initial_refill: RefillReport {
+                published: 0,
+                starved: false,
+                need_wakeup: Ok(NeedWakeup::NotRequired),
+            },
+        };
+        engine.initial_refill = engine.refill().map_err(|error| match error {
             RxFillError::Ring(error) => RxFillSetupError::Ring(error),
             RxFillError::Ledger(error) => RxFillSetupError::Ledger(error),
         })?;
         Ok(engine)
+    }
+
+    /// The refill performed by [`Self::new`], including its need-wakeup
+    /// observation: in zero-copy mode the first kick may be due at once.
+    pub const fn initial_refill(&self) -> RefillReport {
+        self.initial_refill
+    }
+
+    /// Acquire-loads the Fill need-wakeup flag without publishing (one
+    /// atomic load), for the libxdp pattern of kicking whenever the kernel
+    /// asks, also while the free list is empty or Fill is full.
+    pub fn fill_needs_wakeup(&self) -> Result<NeedWakeup, NativeRingError> {
+        self.fill.need_wakeup()
+    }
+
+    /// Frames handed to TX and not yet cancelled (or, from S4, published):
+    /// the ledger's `PendingTx` count. A `TxHandoff` dropped without either
+    /// stays counted here forever.
+    #[must_use]
+    pub fn tx_handoffs_outstanding(&self) -> u32 {
+        u32::try_from(
+            self.state
+                .frames
+                .ledger()
+                .counts()
+                .get(FrameStateKind::PendingTx),
+        )
+        .expect("bounded by the u32 frame count")
     }
 
     /// Publishes up to `fill_batch` free RX-pool frames to Fill, bounded by
@@ -606,13 +685,30 @@ impl<'memory> RxFillEngine<'memory> {
     /// An empty free list with room in Fill is counted as starvation and
     /// returns immediately; it never blocks other work.
     pub fn refill(&mut self) -> Result<RefillReport, RxFillError> {
+        let (published, starved) = self.publish_fill()?;
+        let need_wakeup = self.fill.need_wakeup();
+        let counters = &mut self.state.counters;
+        match need_wakeup {
+            Ok(NeedWakeup::Required) => bump(&mut counters.fill_need_wakeup),
+            Ok(NeedWakeup::NotRequired) => {}
+            Err(_) => bump(&mut counters.fill_flag_errors),
+        }
+        Ok(RefillReport {
+            published,
+            starved,
+            need_wakeup,
+        })
+    }
+
+    /// Returns `(published, starved)`.
+    fn publish_fill(&mut self) -> Result<(u32, bool), RxFillError> {
         let room = self.fill.free_slots().map_err(RxFillError::Ring)?;
         let state = &mut self.state;
         if room == 0 {
             if state.free.len() > 0 {
                 bump(&mut state.counters.fill_ring_full);
             }
-            return Ok(RefillReport::idle(false));
+            return Ok((0, false));
         }
         let target = (room as usize).min(state.fill_batch as usize);
         let mut reserved = 0;
@@ -637,7 +733,7 @@ impl<'memory> RxFillEngine<'memory> {
         }
         if reserved == 0 {
             bump(&mut state.counters.fill_starved);
-            return Ok(RefillReport::idle(true));
+            return Ok((0, true));
         }
         let count = u32::try_from(reserved).expect("bounded by the u32 ring room");
         let mut reservation = match self.fill.reserve(count) {
@@ -656,13 +752,12 @@ impl<'memory> RxFillEngine<'memory> {
                 return Err(RxFillError::Ring(error));
             }
         }
-        let publication = match reservation.release_submit() {
-            Ok(publication) => publication,
-            Err(error) => {
-                state.rollback_reserved(reserved);
-                return Err(RxFillError::Ring(error));
-            }
-        };
+        // The publication's own flag observation is superseded by the one
+        // `refill` takes after this returns.
+        if let Err(error) = reservation.release_submit() {
+            state.rollback_reserved(reserved);
+            return Err(RxFillError::Ring(error));
+        }
         for slot in &mut state.scratch[..reserved] {
             let token = slot.take().expect("reserved prefix");
             state
@@ -672,17 +767,7 @@ impl<'memory> RxFillEngine<'memory> {
                 .expect("scratch holds FillReserved tokens");
         }
         add(&mut state.counters.fill_published, count);
-        let need_wakeup = publication.need_wakeup();
-        match need_wakeup {
-            Ok(NeedWakeup::Required) => bump(&mut state.counters.fill_need_wakeup),
-            Ok(NeedWakeup::NotRequired) => {}
-            Err(_) => bump(&mut state.counters.fill_flag_errors),
-        }
-        Ok(RefillReport {
-            published: count,
-            starved: false,
-            need_wakeup: Some(need_wakeup),
-        })
+        Ok((count, false))
     }
 
     /// Refills Fill, then consumes at most `budget` RX descriptors and
@@ -738,11 +823,12 @@ impl<'memory> RxFillEngine<'memory> {
 
     /// Returns a TX handoff that will not be transmitted to the free list.
     pub fn cancel_tx_handoff(&mut self, handoff: TxHandoff) -> Result<(), RxFillError> {
+        let token = handoff.defuse();
         let ledger = self.state.frames.ledger_mut();
         ledger
-            .cancel_pending_tx(handoff.token)
+            .cancel_pending_tx(token)
             .map_err(RxFillError::Ledger)?;
-        self.state.recycle(handoff.token);
+        self.state.recycle(token);
         bump(&mut self.state.counters.tx_handoffs_cancelled);
         Ok(())
     }
@@ -1015,8 +1101,11 @@ impl fmt::Debug for RxFrame<'_, '_> {
 ///
 /// Move-only and without a public constructor. The frame stays
 /// `PendingTx` in the ledger until TX publishes it or
-/// [`RxFillEngine::cancel_tx_handoff`] returns it; dropping the value
-/// strands the frame (it never becomes reusable), so it is `must_use`.
+/// [`RxFillEngine::cancel_tx_handoff`] returns it. Dropping the value
+/// strands the frame (it never becomes reusable): it is `must_use`, a debug
+/// build asserts on such a drop, and
+/// [`RxFillEngine::tx_handoffs_outstanding`] keeps counting it. S4 must
+/// consume every handoff through an engine method.
 #[must_use = "a dropped TX handoff strands its frame in PendingTx"]
 #[derive(Debug)]
 pub struct TxHandoff {
@@ -1024,7 +1113,23 @@ pub struct TxHandoff {
     descriptor: ValidatedDescriptor,
 }
 
+impl Drop for TxHandoff {
+    fn drop(&mut self) {
+        debug_assert!(
+            std::thread::panicking(),
+            "TxHandoff dropped without TX or cancel: frame stranded in PendingTx"
+        );
+    }
+}
+
 impl TxHandoff {
+    /// Consumes the handoff inside an engine method, without the drop check.
+    fn defuse(self) -> FrameToken {
+        let token = self.token;
+        std::mem::forget(self);
+        token
+    }
+
     /// The canonical UMEM frame.
     #[must_use]
     pub const fn frame(&self) -> FrameId {
@@ -1075,5 +1180,17 @@ impl RxFillEngine<'_> {
     /// Lists a frame in the free list a second time.
     pub(crate) fn push_free_entry_for_test(&mut self, frame: u32) -> bool {
         self.state.free.push(frame)
+    }
+}
+
+#[cfg(test)]
+impl RxFillEngine<'_> {
+    /// Moves a free frame's generation to `u64::MAX`, so its next refill
+    /// exhausts the generation.
+    pub(crate) fn exhaust_generation_for_test(&mut self, frame: u32) {
+        self.state
+            .frames
+            .ledger_mut()
+            .set_free_generation_for_test(frame, u64::MAX);
     }
 }

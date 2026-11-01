@@ -82,6 +82,16 @@ impl<'memory, T: RingValue> ProducerRing<'memory, T> {
         Ok(self.capacity() - occupied(producer, consumer, self.capacity())?)
     }
 
+    fn need_wakeup(&self) -> Result<NeedWakeup, NativeRingError> {
+        self.memory.need_wakeup().map(|required| {
+            if required {
+                NeedWakeup::Required
+            } else {
+                NeedWakeup::NotRequired
+            }
+        })
+    }
+
     fn reserve(
         &mut self,
         len: u32,
@@ -315,6 +325,14 @@ impl<'memory> FillProducer<'memory> {
         self.inner.free_slots()
     }
 
+    /// Acquire-loads the kernel's need-wakeup flag without publishing.
+    ///
+    /// Unknown flag bits are reported as
+    /// [`NativeRingError::UnsupportedRingFlags`].
+    pub fn need_wakeup(&self) -> Result<NeedWakeup, NativeRingError> {
+        self.inner.need_wakeup()
+    }
+
     /// Reserves an unpublished range of UMEM addresses.
     pub fn reserve(&mut self, len: u32) -> Result<FillReservation<'_, 'memory>, NativeRingError> {
         Ok(FillReservation {
@@ -400,6 +418,14 @@ impl<'memory> TxProducer<'memory> {
     /// before this producer's next reservation.
     pub fn free_slots(&self) -> Result<u32, NativeRingError> {
         self.inner.free_slots()
+    }
+
+    /// Acquire-loads the kernel's need-wakeup flag without publishing.
+    ///
+    /// Unknown flag bits are reported as
+    /// [`NativeRingError::UnsupportedRingFlags`].
+    pub fn need_wakeup(&self) -> Result<NeedWakeup, NativeRingError> {
+        self.inner.need_wakeup()
     }
 
     /// Reserves an unpublished descriptor range.

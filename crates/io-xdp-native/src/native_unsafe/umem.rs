@@ -14,8 +14,12 @@
 //! by the RX/Fill engine (`rx_fill.rs`), the only ledger mutator: a frame
 //! enters `Leased` either from `Free` without ever being published to the
 //! kernel, or from `FillOwnedByKernel` only after the kernel returned that
-//! exact frame on the RX ring (`receive` then `lease_rx`). A kernel that
-//! keeps writing a frame after returning it violates the AF_XDP contract.
+//! exact frame on the RX ring (`receive` then `lease_rx`). That protocol in
+//! turn needs the engine to be the only writer of this UMEM's Fill and TX
+//! rings, which the once-per-session `DatapathRings` bundle guarantees: the
+//! engine receives every ring of the socket together with the UMEM, and no
+//! raw view of that socket was ever lent. A kernel that keeps writing a
+//! frame after returning it violates the AF_XDP contract.
 
 use std::{fmt, marker::PhantomData, ptr::NonNull};
 
@@ -31,15 +35,6 @@ pub(crate) struct UmemMapping<'memory> {
 }
 
 impl<'memory> UmemMapping<'memory> {
-    /// Borrows caller-owned process memory (tests and heap-backed callers).
-    pub(crate) fn from_slice(memory: &'memory mut [u8]) -> Self {
-        Self {
-            base: NonNull::new(memory.as_mut_ptr()).expect("slice pointers are non-null"),
-            len: memory.len(),
-            _borrow: PhantomData,
-        }
-    }
-
     /// Takes over an exclusive borrow of a live session UMEM mapping.
     #[cfg_attr(
         not(all(

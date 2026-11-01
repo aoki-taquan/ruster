@@ -13,6 +13,7 @@
 #![doc = "frame lending. TX/Completion and core `PacketIo` integration remain unimplemented."]
 
 mod config;
+mod datapath;
 mod error;
 mod platform;
 mod ring;
@@ -61,6 +62,7 @@ pub use config::{
     ValidatedBindFlags, MIN_VISIBLE_FRAME_CAPACITY, SUPPORTED_ALIGNED_CHUNK_SIZES,
     XDP_PACKET_HEADROOM,
 };
+pub use datapath::{DatapathError, DatapathRings, RingsError};
 pub use ruster_io_xdp::native_profile::ConfigError;
 
 pub use error::{
@@ -86,8 +88,8 @@ pub use rx_fill::{
 pub use session::{
     AttachError, AttachFailure, AttachStage, CleanupError, CleanupStage, NativeRings,
     NegotiatedMode, SessionConfig, SessionConfigError, SessionError, SessionFailure, SessionStage,
-    UmemRegion, UmemRegionError, VerifierLogSummary, XdpAttachMode, INTERFACE_NAME_CAPACITY,
-    MAX_QUEUE_ID, MAX_RING_HEADER_OFFSET,
+    UmemRegion, VerifierLogSummary, XdpAttachMode, INTERFACE_NAME_CAPACITY, MAX_QUEUE_ID,
+    MAX_RING_HEADER_OFFSET,
 };
 
 #[cfg(test)]

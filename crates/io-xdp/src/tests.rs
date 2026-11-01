@@ -421,3 +421,21 @@ fn kernel_fill_quarantine_is_exact_and_permanent() {
     );
     assert_state_and_partition(&ledger, 1, FrameStateKind::FillOwnedByKernel);
 }
+
+#[test]
+fn kernel_fill_release_frees_the_frame_for_a_new_cycle() {
+    let mut ledger = ledger(43, 1);
+    let token = ledger.reserve_fill(0).expect("fill reserve");
+    assert!(
+        ledger.release_kernel_fill(token).is_err(),
+        "not yet published"
+    );
+    ledger.publish_fill(token).expect("fill publish");
+    ledger.release_kernel_fill(token).expect("release");
+    assert_state_and_partition(&ledger, 0, FrameStateKind::Free);
+    // The released token is dead; the next cycle has a new generation.
+    assert!(ledger.release_kernel_fill(token).is_err());
+    let next = ledger.reserve_fill(0).expect("new cycle");
+    assert_eq!(next.generation().get(), token.generation().get() + 1);
+    assert_state_and_partition(&ledger, 0, FrameStateKind::FillReserved);
+}
