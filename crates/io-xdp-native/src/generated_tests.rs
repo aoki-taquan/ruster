@@ -5,19 +5,19 @@
 
 use std::collections::VecDeque;
 
-use ruster_io_xdp::{FrameStateKind, RawDescriptor};
+use ruster_io_xdp::{FrameStateKind, LedgerError, RawDescriptor};
 
 use crate::{
     abi::XdpDescriptor,
     native_unsafe::heap_kernel::{allocation_count, ScriptedKernel},
     tx_completion_tests::{
-        cancel_all, deliver, engine, frame_base, frame_of, kernel, mirror_fill, mirror_tx, model,
-        model_token, snapshot, staged, state, Model, Rng, FRAMES, FRAME_SIZE, HEADROOM, RING,
-        RX_FRAMES,
+        cancel_all, deliver, engine, engine_with, frame_base, frame_of, kernel, mirror_fill,
+        mirror_tx, model, model_token, snapshot, staged, state, Model, Rng, FRAMES, FRAME_SIZE,
+        HEADROOM, RING, RX_FRAMES,
     },
     CompletionInvalidReason, DrainOutcome, GeneratedAccounting, GeneratedAllocError,
-    GeneratedRejectReason, RxFillAuditError, RxFillEngine, RxInvalidReason, TxBlocked, TxHandoff,
-    TxRejection,
+    GeneratedRejectReason, RxFillAuditError, RxFillEngine, RxFillError, RxInvalidReason, TxBlocked,
+    TxHandoff, TxRejection, TxSubmitError,
 };
 
 const GENERATED: u32 = FRAMES - RX_FRAMES;
@@ -500,10 +500,112 @@ fn kernel_returns_naming_the_other_pool_are_refused() {
     assert_eq!(engine.frame_accounting().quarantined, 0);
     assert_eq!(engine.counters().frames_quarantined, 1);
     assert_eq!(engine.generated_counters().generated_inflight, 0);
+    let counters = engine.generated_counters();
+    assert_eq!(counters.generated_quarantined_after_tx, 1);
+    // committed == completed + inflight + quarantined after TX.
     assert_eq!(
-        engine.generated_counters().generated_committed,
-        engine.generated_counters().generated_completed + 1
+        counters.generated_committed,
+        counters.generated_completed
+            + u64::from(counters.generated_inflight)
+            + counters.generated_quarantined_after_tx
     );
+    audit(&engine);
+}
+
+#[test]
+fn generated_foreign_handoffs_are_refused_and_returned_intact() {
+    // Distinct domains, and one `UmemDomainId` reused for both ledgers:
+    // only the engine identity in the handoff tells them apart.
+    for (mine_domain, other_domain) in [(0x5502, 0x5503), (0x5502, 0x5502)] {
+        let first = kernel();
+        let second = kernel();
+        let mut mine = engine_with(&first, mine_domain);
+        let mut other = engine_with(&second, other_domain);
+        let foreign = generated_handoff(&mut other, ARP_LEN, 1);
+        let own = generated_handoff(&mut mine, ARP_LEN, 2);
+        if mine_domain == other_domain {
+            assert_eq!(foreign.token(), own.token(), "same domain, same token");
+        }
+        let before = snapshot(mine.ledger());
+        let counters = (mine.tx_counters(), mine.generated_counters());
+        let token = foreign.token();
+
+        let rejected = mine.submit_tx(foreign).expect_err("foreign");
+        assert_eq!(
+            rejected.reason(),
+            TxRejection::Invalid(LedgerError::ForeignTokenDomain)
+        );
+        let foreign = rejected.into_handoff();
+        assert_eq!(foreign.token(), token, "returned intact");
+        // In a batch, the foreign slot refuses the whole call.
+        let mut slots = [Some(own), Some(foreign)];
+        assert_eq!(
+            mine.submit_tx_batch(&mut slots),
+            Err(TxSubmitError::Handoff {
+                index: 1,
+                error: LedgerError::ForeignTokenDomain,
+            })
+        );
+        assert!(slots.iter().all(Option::is_some));
+        assert_eq!(first.tx_pending(), 0, "nothing published");
+        assert_eq!(snapshot(mine.ledger()), before);
+        assert_eq!(
+            (mine.tx_counters(), mine.generated_counters()),
+            counters,
+            "a refused submission counts nothing"
+        );
+        let [own, foreign] = slots;
+        let (error, foreign) = mine
+            .cancel_tx_handoff(foreign.expect("kept"))
+            .expect_err("foreign cancel");
+        assert_eq!(error, RxFillError::Ledger(LedgerError::ForeignTokenDomain));
+        assert_eq!(snapshot(mine.ledger()), before);
+        audit(&mine);
+        cancel_all(&mut other, [foreign]);
+        cancel_all(&mut mine, [own.expect("kept")]);
+        audit(&mine);
+        audit(&other);
+        assert_eq!(mine.generated_free_frames(), GENERATED);
+        assert_eq!(other.generated_free_frames(), GENERATED);
+    }
+}
+
+#[test]
+fn generated_duplicate_handoff_in_one_batch_is_refused_and_rolled_back() {
+    let kernel = kernel();
+    let mut engine = engine(&kernel);
+    let first = generated_handoff(&mut engine, ARP_LEN, 1);
+    let second = generated_handoff(&mut engine, ARP_LEN, 2);
+    let duplicate = first.forged_copy_for_test();
+    let frame = first.frame().index();
+    let before = snapshot(engine.ledger());
+    let counters = engine.generated_counters();
+    let mut slots = [Some(first), Some(second), Some(duplicate)];
+    assert!(matches!(
+        engine.submit_tx_batch(&mut slots),
+        Err(TxSubmitError::Handoff {
+            index: 2,
+            error: LedgerError::WrongState {
+                expected: FrameStateKind::PendingTx,
+                actual: FrameStateKind::TxReserved,
+                ..
+            },
+        })
+    ));
+    // Both reservations before the duplicate were rolled back.
+    assert_eq!(snapshot(engine.ledger()), before);
+    assert_eq!(state(&engine, frame), FrameStateKind::PendingTx);
+    assert_eq!(engine.generated_counters(), counters);
+    assert_eq!(engine.generated_accounting().tx_handoffs, 2);
+    assert_eq!(kernel.tx_pending(), 0);
+    let [first, second, duplicate] = slots;
+    // The forged copy owns no frame of its own.
+    std::mem::forget(duplicate);
+    let report = engine
+        .submit_tx_batch(&mut [first, second])
+        .expect("the real handoffs still submit");
+    assert_eq!(report.submitted(), 2);
+    assert_eq!(engine.generated_counters().generated_committed, 2);
     audit(&engine);
 }
 

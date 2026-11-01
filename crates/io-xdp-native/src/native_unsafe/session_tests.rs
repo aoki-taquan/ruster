@@ -153,6 +153,7 @@ struct SessionFake {
     verifier_log: Cell<Option<(usize, bool)>>,
     kicks: ScriptedKicks,
     tx_queue: Cell<TxQueueProbe>,
+    mtu: Cell<Option<u32>>,
 }
 
 impl SessionFake {
@@ -180,6 +181,7 @@ impl SessionFake {
             verifier_log: Cell::new(None),
             kicks: ScriptedKicks::default(),
             tx_queue: Cell::new(TxQueueProbe::Present),
+            mtu: Cell::new(Some(1_500)),
         }
     }
 
@@ -283,6 +285,11 @@ impl Syscalls for SessionFake {
     fn tx_queue_probe(&self, _name: &[u8; IFNAMSIZ], ifindex: u32, _queue: u32) -> TxQueueProbe {
         assert_eq!(ifindex, FAKE_IFINDEX, "probed with the resolved ifindex");
         self.tx_queue.get()
+    }
+
+    fn mtu_probe(&self, _name: &[u8; IFNAMSIZ], ifindex: u32) -> Option<u32> {
+        assert_eq!(ifindex, FAKE_IFINDEX, "probed with the resolved ifindex");
+        self.mtu.get()
     }
 
     fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno> {
@@ -1856,4 +1863,27 @@ fn native_session_refuses_a_queue_without_tx_queue_before_any_resource() {
         assert_eq!(fake.open_fds.get(), 0);
         assert_eq!(fake.live_mappings(), 0);
     }
+}
+
+#[test]
+fn native_session_reads_the_mtu_before_any_resource_and_fails_closed() {
+    let fake = SessionFake::new();
+    fake.mtu.set(Some(9_000));
+    let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("open");
+    assert_eq!(session.mtu(), 9_000);
+    let _ = session.rings().expect("rings");
+    session.close().expect("teardown");
+
+    let fake = SessionFake::new();
+    fake.mtu.set(None);
+    let error = SessionCore::open(&fake, &config(XDP_COPY))
+        .map(|_| ())
+        .expect_err("refused");
+    assert_eq!(
+        (error.stage(), error.failure()),
+        (SessionStage::MtuProbe, SessionFailure::MtuUnverifiable)
+    );
+    assert_eq!(fake.len.get(), 1, "only the interface lookup ran");
+    assert_eq!(fake.open_fds.get(), 0);
+    assert_eq!(fake.live_mappings(), 0);
 }

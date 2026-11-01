@@ -126,6 +126,8 @@ version = "0.2.0"
 name = "ruster-io-xdp-native"
 version = "0.2.0"
 dependencies = [
+ "ruster-core",
+ "ruster-io-conformance",
  "ruster-io-xdp",
 ]
 

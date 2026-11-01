@@ -13,12 +13,14 @@
 #![doc = "validated RX descriptors, ledger-gated frame lending, same-frame TX bounded by"]
 #![doc = "the TX ring capacity, validated completion reaping, need-wakeup kicks, an"]
 #![doc = "exactly-once shutdown drain, and exact-length generated frames from the separate"]
-#![doc = "generated pool on the same TX path. Core `PacketIo` integration remains"]
-#![doc = "unimplemented."]
+#![doc = "generated pool on the same TX path. [`XdpPacketIo`] adapts one engine per"]
+#![doc = "interface to `ruster-core`'s `PacketIo`, `GeneratedPacketIo`,"]
+#![doc = "`PublicationQuiescence`, and `BackendStats` with static dispatch."]
 
 mod config;
 mod datapath;
 mod error;
+mod packet_io;
 mod platform;
 mod ring;
 mod rx_fill;
@@ -82,6 +84,12 @@ pub use native_unsafe::kick::{KickDeferral, KickError, KickOutcome};
     target_pointer_width = "64"
 ))]
 pub use native_unsafe::session::NativeSession;
+pub use packet_io::{
+    generated_reserve, XdpAdapterCounters, XdpBackendStats, XdpCounters, XdpDrainReport,
+    XdpGeneratedBatch, XdpGeneratedSlot, XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort,
+    XdpPortConfig, XdpPortStats, XdpQuiescenceError, XdpRxBatch, XdpRxSlot, KICK_SLACK,
+    KICK_TX_BATCH,
+};
 pub use platform::{ensure_native_syscall_supported, ensure_supported};
 pub use ring::{
     CompletionAcquisition, CompletionConsumer, FillProducer, FillReservation, NeedWakeup,
@@ -104,6 +112,10 @@ pub use session::{
 
 #[cfg(test)]
 mod generated_tests;
+#[cfg(test)]
+mod packet_io_conformance;
+#[cfg(test)]
+mod packet_io_tests;
 #[cfg(test)]
 mod rx_fill_tests;
 #[cfg(test)]

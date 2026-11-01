@@ -6,7 +6,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+ruster-core = { path = "../core" }
 ruster-io-xdp = { path = "../io-xdp" }
 
 [dev-dependencies]
+ruster-io-conformance = { path = "../io-conformance" }
 ruster-io-xdp = { path = "../io-xdp", features = ["test-hooks"] }

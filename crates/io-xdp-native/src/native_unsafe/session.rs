@@ -393,6 +393,9 @@ pub(super) struct SessionCore<'s, S: MapsRealMemory> {
     umem_config: UmemConfig,
     ifindex: u32,
     queue: u32,
+    mtu: u32,
+    /// Process-unique identity stamped into the datapath bundle.
+    origin: u64,
     mode: NegotiatedMode,
     zero_copy_fallback: bool,
     datapath: DatapathAccess,
@@ -446,6 +449,14 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
                 ));
             }
         }
+        // The TX length bound of the core adapter (mtu + Ethernet header):
+        // read once here, before any resource.
+        let Some(mtu) = syscalls.mtu_probe(config.interface_name_bytes(), ifindex) else {
+            return Err(fail(
+                SessionStage::MtuProbe,
+                SessionFailure::MtuUnverifiable,
+            ));
+        };
         let raw = config.bind_flags().raw();
         match config.mode() {
             BindMode::CopyRequired | BindMode::ZeroCopyRequired => {
@@ -462,6 +473,10 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
                 }
             }
         }
+        .map(|mut session| {
+            session.mtu = mtu;
+            session
+        })
     }
 
     fn attempt(
@@ -611,6 +626,8 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
             umem_config,
             ifindex,
             queue: config.queue(),
+            mtu: 0,
+            origin: crate::datapath::next_origin(),
             mode,
             zero_copy_fallback: false,
             datapath: DatapathAccess::Untouched,
@@ -674,6 +691,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
             umem,
             umem_config: self.umem_config,
             kick,
+            origin: self.origin,
         }))
     }
 
@@ -845,6 +863,14 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
     pub(super) const fn queue(&self) -> u32 {
         self.queue
     }
+
+    pub(super) const fn mtu(&self) -> u32 {
+        self.mtu
+    }
+
+    pub(super) const fn origin(&self) -> u64 {
+        self.origin
+    }
 }
 
 type ViewFailure = (SessionStage, SessionFailure);
@@ -984,6 +1010,25 @@ impl NativeSession {
     #[must_use]
     pub const fn queue(&self) -> u32 {
         self.core.queue()
+    }
+
+    /// Returns the device MTU read from sysfs (`/sys/class/net/<dev>/mtu`,
+    /// after proving its `ifindex`) by [`Self::open`], before any resource.
+    ///
+    /// This is the L3 MTU: the longest Ethernet frame the device sends is
+    /// `mtu + 14` bytes, the TX bound the core adapter enforces
+    /// ([`crate::XdpPortConfig`]). It is not refreshed: an MTU changed
+    /// after open is not seen until the session is reopened.
+    #[must_use]
+    pub const fn mtu(&self) -> u32 {
+        self.core.mtu()
+    }
+
+    /// Identity stamped into this session's datapath bundle, which
+    /// `XdpPortConfig::from_session` records so the adapter can refuse a
+    /// config paired with another session's engine.
+    pub(crate) const fn origin(&self) -> u64 {
+        self.core.origin()
     }
 
     /// Lends the four ring views and the UMEM geometry for the borrow of

@@ -159,6 +159,19 @@ pub(crate) struct ScriptedKernel {
     held: RefCell<Vec<bool>>,
     tx_held: RefCell<Vec<bool>>,
     kicks: ScriptedKicks,
+    origin: u64,
+    /// When set, a TX kick runs a Linux copy-mode transmit round of at most
+    /// this many descriptors (`TX_BATCH_SIZE` is 32 in v6.8), completing
+    /// each, and fails `EAGAIN` while more remain.
+    copy_transmit: Cell<Option<u32>>,
+    /// Link down: a TX kick fails `ENETDOWN` and transmits nothing.
+    link_down: Cell<bool>,
+    transmitted: Cell<u32>,
+    /// When set, copy-mode kicks consume TX but hold the completions (TX
+    /// interrupt coalescing) until `release_deferred_completions`.
+    defer_completions: Cell<bool>,
+    deferred: RefCell<Vec<u64>>,
+    statistics: Cell<Option<crate::abi::XdpStatistics>>,
 }
 
 impl ScriptedKernel {
@@ -190,6 +203,13 @@ impl ScriptedKernel {
             held: RefCell::new(vec![false; umem.frame_count() as usize]),
             tx_held: RefCell::new(vec![false; umem.frame_count() as usize]),
             kicks: ScriptedKicks::default(),
+            origin: crate::datapath::next_origin(),
+            copy_transmit: Cell::new(None),
+            link_down: Cell::new(false),
+            transmitted: Cell::new(0),
+            defer_completions: Cell::new(false),
+            deferred: RefCell::new(Vec::new()),
+            statistics: Cell::new(None),
         }
     }
 
@@ -228,7 +248,8 @@ impl ScriptedKernel {
                 .expect("heap TX view"),
             umem,
             umem_config: self.umem_config,
-            kick: SocketKick::new(KickTarget::Scripted(&self.kicks)),
+            kick: SocketKick::new(KickTarget::Kernel(self)),
+            origin: self.origin,
         }))
     }
 
@@ -404,6 +425,12 @@ impl ScriptedKernel {
         }
     }
 
+    /// The process address of UMEM byte `offset`, as a lent slice's
+    /// `as_ptr().addr()` reports it (identity only, never dereferenced).
+    pub(crate) fn umem_address(&self, offset: u64) -> usize {
+        self.umem.base.as_ptr().addr() + usize::try_from(offset).expect("test offset")
+    }
+
     pub(crate) fn tx_producer(&self) -> u32 {
         self.tx.cursor(PRODUCER).load(Ordering::Acquire)
     }
@@ -527,6 +554,85 @@ impl ScriptedKernel {
         self.completion
             .cursor(PRODUCER)
             .store(value, Ordering::Release);
+    }
+
+    /// Identity stamped into the bundle.
+    pub(crate) const fn origin(&self) -> u64 {
+        self.origin
+    }
+
+    /// Makes TX kicks transmit like Linux copy mode, at most `batch`
+    /// descriptors per kick (`None`: kicks only record).
+    pub(crate) fn set_copy_transmit(&self, batch: Option<u32>) {
+        self.copy_transmit.set(batch);
+    }
+
+    /// Takes the link down (TX kicks fail `ENETDOWN`) or up.
+    pub(crate) fn set_link_down(&self, down: bool) {
+        self.link_down.set(down);
+    }
+
+    /// Makes copy-mode kicks consume TX descriptors without completing
+    /// them until [`Self::release_deferred_completions`].
+    pub(crate) fn set_defer_completions(&self, defer: bool) {
+        self.defer_completions.set(defer);
+    }
+
+    /// Produces every held completion; returns how many.
+    pub(crate) fn release_deferred_completions(&self) -> usize {
+        let held = std::mem::take(&mut *self.deferred.borrow_mut());
+        for address in &held {
+            assert!(self.produce_completion(*address));
+        }
+        held.len()
+    }
+
+    /// Descriptors transmitted by copy-mode kicks.
+    pub(crate) fn transmitted(&self) -> u32 {
+        self.transmitted.get()
+    }
+
+    /// Scripts the socket's `XDP_STATISTICS` (`None`: getsockopt refused).
+    pub(crate) fn set_statistics(&self, statistics: Option<crate::abi::XdpStatistics>) {
+        self.statistics.set(statistics);
+    }
+
+    pub(super) fn scripted_statistics(&self) -> Option<crate::abi::XdpStatistics> {
+        self.statistics.get()
+    }
+
+    /// One kick as the scripted kernel answers it: recorded, then an
+    /// injected errno, then (TX, copy mode) link down or a transmit round.
+    pub(super) fn scripted_kick(&self, ring: KickRing) -> Result<(), Option<u16>> {
+        self.kicks.kick(ring)?;
+        let (KickRing::Tx, Some(batch)) = (ring, self.copy_transmit.get()) else {
+            return Ok(());
+        };
+        if self.link_down.get() {
+            return Err(Some(100)); // ENETDOWN
+        }
+        for _ in 0..batch {
+            if self.tx_pending() == 0 {
+                return Ok(());
+            }
+            // A full Completion ring ends the round with success.
+            let producer = self.completion_producer();
+            if producer.wrapping_sub(self.completion_consumer()) >= self.completion_entries.get() {
+                return Ok(());
+            }
+            let descriptor = self.consume_tx().expect("pending TX");
+            if self.defer_completions.get() {
+                self.deferred.borrow_mut().push(descriptor.address);
+            } else {
+                assert!(self.produce_completion(descriptor.address));
+            }
+            self.transmitted.set(self.transmitted.get() + 1);
+        }
+        if self.tx_pending() > 0 {
+            Err(Some(11)) // EAGAIN: TX_BATCH_SIZE reached with more pending
+        } else {
+            Ok(())
+        }
     }
 
     /// Kicks the engine performed on `ring`.

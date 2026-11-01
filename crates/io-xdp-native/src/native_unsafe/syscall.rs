@@ -333,6 +333,9 @@ pub(super) trait Syscalls: sealed::Sealed {
     /// Whether device `name` (resolved to `ifindex`) has TX queue `queue`.
     /// Cold path; it may allocate.
     fn tx_queue_probe(&self, name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQueueProbe;
+    /// The MTU of device `name` (resolved to `ifindex`), `None` when it
+    /// cannot be verified. Cold path; it may allocate.
+    fn mtu_probe(&self, name: &[u8; IFNAMSIZ], ifindex: u32) -> Option<u32>;
     fn socket(&self, domain: c_int, kind: c_int, protocol: c_int) -> Result<RawFd, Errno>;
     fn set_socket_option(
         &self,
@@ -417,6 +420,10 @@ unsafe impl MapsRealMemory for LinuxSyscalls {}
 impl Syscalls for LinuxSyscalls {
     fn tx_queue_probe(&self, name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQueueProbe {
         linux_tx_queue_probe(name, ifindex, queue)
+    }
+
+    fn mtu_probe(&self, name: &[u8; IFNAMSIZ], ifindex: u32) -> Option<u32> {
+        linux_mtu_probe(name, ifindex)
     }
 
     fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno> {
@@ -670,22 +677,9 @@ impl Syscalls for LinuxSyscalls {
 /// `SessionConfig` (ASCII graphic, no `/`, `:`, `.` or `..`), so it is one
 /// path component.
 fn linux_tx_queue_probe(name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQueueProbe {
-    let len = name.iter().position(|byte| *byte == 0).unwrap_or(IFNAMSIZ);
-    let Ok(device) = std::str::from_utf8(&name[..len]) else {
+    let Some(base) = linux_sysfs_device(name, ifindex) else {
         return TxQueueProbe::Unverifiable;
     };
-    if device.is_empty() || device == "." || device == ".." || device.contains('/') {
-        return TxQueueProbe::Unverifiable;
-    }
-    let base = std::path::Path::new("/sys/class/net").join(device);
-    // The sysfs view must describe the device this namespace resolved.
-    let same_device = std::fs::read_to_string(base.join("ifindex"))
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok())
-        == Some(ifindex);
-    if !same_device {
-        return TxQueueProbe::Unverifiable;
-    }
     let queues = base.join("queues");
     // Every netdev has tx-0; its absence means an unexpected sysfs layout.
     if !queues.join("tx-0").is_dir() {
@@ -697,6 +691,33 @@ fn linux_tx_queue_probe(name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQu
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => TxQueueProbe::Absent,
         Err(_) => TxQueueProbe::Unverifiable,
     }
+}
+
+/// The sysfs directory of device `name`, only after proving that its
+/// `ifindex` is the one this namespace resolved (safe std only).
+fn linux_sysfs_device(name: &[u8; IFNAMSIZ], ifindex: u32) -> Option<std::path::PathBuf> {
+    let len = name.iter().position(|byte| *byte == 0).unwrap_or(IFNAMSIZ);
+    let device = std::str::from_utf8(&name[..len]).ok()?;
+    if device.is_empty() || device == "." || device == ".." || device.contains('/') {
+        return None;
+    }
+    let base = std::path::Path::new("/sys/class/net").join(device);
+    // The sysfs view must describe the device this namespace resolved.
+    let same_device = std::fs::read_to_string(base.join("ifindex"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        == Some(ifindex);
+    same_device.then_some(base)
+}
+
+/// Reads `/sys/class/net/<dev>/mtu` (the L3 MTU, excluding the Ethernet
+/// header) of the resolved device with safe std only. Zero is refused.
+fn linux_mtu_probe(name: &[u8; IFNAMSIZ], ifindex: u32) -> Option<u32> {
+    let base = linux_sysfs_device(name, ifindex)?;
+    std::fs::read_to_string(base.join("mtu"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .filter(|mtu| *mtu > 0)
 }
 
 /// Leading bytes of one `union bpf_attr`, 8-byte aligned like the kernel's
@@ -1441,6 +1462,10 @@ mod tests {
 
         fn tx_queue_probe(&self, _: &[u8; IFNAMSIZ], _: u32, _: u32) -> TxQueueProbe {
             TxQueueProbe::Present
+        }
+
+        fn mtu_probe(&self, _: &[u8; IFNAMSIZ], _: u32) -> Option<u32> {
+            Some(1_500)
         }
 
         fn socket(&self, domain: c_int, kind: c_int, protocol: c_int) -> Result<RawFd, Errno> {
@@ -2268,6 +2293,27 @@ mod tests {
             linux_tx_queue_probe(&dots, 1, 0),
             TxQueueProbe::Unverifiable
         );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "reads sysfs")]
+    fn native_mtu_probe_reads_sysfs_for_the_resolved_device() {
+        let mut lo = [0_u8; IFNAMSIZ];
+        lo[..2].copy_from_slice(b"lo");
+        let expected = std::fs::read_to_string("/sys/class/net/lo/mtu")
+            .expect("lo mtu")
+            .trim()
+            .parse::<u32>()
+            .expect("numeric mtu");
+        assert_eq!(linux_mtu_probe(&lo, 1), Some(expected));
+        // A sysfs view of another device, or no device, fails closed.
+        assert_eq!(linux_mtu_probe(&lo, 2), None);
+        let mut missing = [0_u8; IFNAMSIZ];
+        missing[..12].copy_from_slice(b"rusterNoDev0");
+        assert_eq!(linux_mtu_probe(&missing, 1), None);
+        let mut dots = [0_u8; IFNAMSIZ];
+        dots[..2].copy_from_slice(b"..");
+        assert_eq!(linux_mtu_probe(&dots, 1), None);
     }
 
     #[test]

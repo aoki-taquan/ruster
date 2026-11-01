@@ -1,11 +1,12 @@
 #!/bin/sh
 # Privileged AF_XDP smoke: native session (M2 S1, X00C), XDP program /
 # bpf_link lifecycle (M2 S2, X00D), the RX/Fill engine (M2 S3, X01),
-# same-frame TX/Completion with shutdown drain (M2 S4, X02), and generated
-# frames (M2 S5, X03).
+# same-frame TX/Completion with shutdown drain (M2 S4, X02), generated
+# frames (M2 S5, X03), and the core adapter forwarding between two ports
+# (M2 S6, X04a).
 #
 # Builds the test binary as the invoking user, then with `sudo -n` creates a
-# dedicated network namespace holding its own two-queue veth pair, runs the
+# dedicated network namespace holding its own veth pairs, runs the
 # prebuilt test inside that namespace phase by phase with RUSTER_PRIV_XDP=1,
 # and always deletes the namespace (which destroys both veth ends and
 # detaches every XDP program on them). No command touches an interface
@@ -27,6 +28,10 @@
 #   generated an ARP request built in a generated-pool frame is committed,
 #            learned by the peer (ip neigh), completed back to the generated
 #            pool, and a last one drained (X03)
+#   adapter  two one-queue veth pairs as two ports of one XdpPacketIo: a raw
+#            frame sent by A's peer is forwarded by core forward_batch,
+#            copied into port B's generated pool, received by B's peer
+#            with the rewritten MACs and TTL, then both ports drain (X04a)
 #   foreign  a netlink-attached xdpgeneric program loaded with `ip` is
 #            refused in both modes and left untouched (same program id)
 #   holder   attach in a separate process, SIGKILL it, link auto-detaches
@@ -61,6 +66,10 @@ device=rx00c0
 peer=rx00c1
 asym=rx00c2
 asym_peer=rx00c3
+fwd_a=rx00c4
+fwd_a_peer=rx00c5
+fwd_b=rx00c6
+fwd_b_peer=rx00c7
 work=$(mktemp -d "${TMPDIR:-/tmp}/ruster-priv-xdp.XXXXXX")
 binary_path=$(readlink -f "$binary")
 holder_pid=
@@ -118,6 +127,15 @@ sudo -n ip -n "$netns" link add "$asym" numtxqueues 2 numrxqueues 4 type veth \
     peer name "$asym_peer" numtxqueues 4 numrxqueues 2
 sudo -n ip -n "$netns" link set "$asym" up
 sudo -n ip -n "$netns" link set "$asym_peer" up
+# Two one-queue pairs for the adapter phase: every frame the peer sends
+# lands on the bound queue 0 (also only inside the netns).
+for pair in "$fwd_a $fwd_a_peer" "$fwd_b $fwd_b_peer"; do
+    set -- $pair
+    sudo -n ip -n "$netns" link add "$1" numtxqueues 1 numrxqueues 1 type veth \
+        peer name "$2" numtxqueues 1 numrxqueues 1
+    sudo -n ip -n "$netns" link set "$1" up
+    sudo -n ip -n "$netns" link set "$2" up
+done
 # TEST-NET-1 source for frames sent from the peer end; the device itself
 # has no address, so ARP requests go unanswered and repeat.
 sudo -n ip -n "$netns" address add 192.0.2.2/24 dev "$peer"
@@ -135,6 +153,10 @@ run_phase() {
         RUSTER_PRIV_XDP_DEVICE="$device" \
         RUSTER_PRIV_XDP_PEER="$peer" \
         RUSTER_PRIV_XDP_ASYM_DEVICE="$asym" \
+        RUSTER_PRIV_XDP_FWD_A="$fwd_a" \
+        RUSTER_PRIV_XDP_FWD_A_PEER="$fwd_a_peer" \
+        RUSTER_PRIV_XDP_FWD_B="$fwd_b" \
+        RUSTER_PRIV_XDP_FWD_B_PEER="$fwd_b_peer" \
         "$binary" --exact "$@" --nocapture --test-threads=1 >"$log" 2>&1 || status=$?
     cat "$log"
     test "$status" -eq 0 || {
@@ -181,6 +203,14 @@ test -z "$(xdp_prog)" || {
     echo "priv-xdp-smoke: program left attached after the generated phase" >&2
     exit 1
 }
+run_phase adapter priv_xdp_adapter \
+    priv_xdp_adapter_forwards_between_two_veth_ports_through_core_and_drains
+for dev in "$fwd_a" "$fwd_b"; do
+    if sudo -n ip -n "$netns" -details link show dev "$dev" | grep -q 'prog/xdp'; then
+        echo "priv-xdp-smoke: program left attached on $dev after the adapter phase" >&2
+        exit 1
+    fi
+done
 
 # Foreign program: a compiler-free XDP_PASS object attached through netlink.
 python3 -I "$here/priv-xdp-foreign-elf.py" "$work/foreign.o"

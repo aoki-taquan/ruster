@@ -614,6 +614,7 @@ impl EngineState<'_> {
             bump(&mut self.counters.frames_quarantined);
             if generated {
                 self.generated.quarantined += 1;
+                bump(&mut self.generated_counters.generated_quarantined_after_tx);
             }
             return Err(CompletionInvalidReason::AddressMismatch);
         }
