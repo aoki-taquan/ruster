@@ -2,14 +2,15 @@
 //!
 //! The failure-atomic builder itself lives in the private `native_unsafe`
 //! module and is exposed as [`crate::NativeSession`] on x86_64 Linux only.
-//! Every type here is plain data: no file descriptor, address, or packet byte
-//! is stored or rendered.
+//! Every type here is plain data except [`UmemRegion`], which carries an
+//! exclusive UMEM borrow; no file descriptor, address, or packet byte is
+//! stored in an error or rendered.
 
 use std::{error::Error, fmt};
 
 use crate::{
-    BindMode, NativeSyscallPlatformError, RingConfig, RingField, RingMapError, RingName,
-    UmemConfig, ValidatedBindFlags,
+    native_unsafe::umem::UmemMapping, BindMode, NativeSyscallPlatformError, RingConfig, RingField,
+    RingMapError, RingName, UmemConfig, ValidatedBindFlags,
 };
 
 /// Linux `IFNAMSIZ`: interface name bytes plus the terminating NUL.
@@ -567,23 +568,48 @@ impl fmt::Display for CleanupError {
 
 impl Error for CleanupError {}
 
-/// Geometry of the session-owned UMEM, borrowed with the ring views.
+/// Exclusive borrow of one UMEM: its geometry and its bytes.
 ///
-/// Byte access to frames is deliberately absent: it arrives with the frame
-/// ownership ledger integration (X01–X03), which decides who may touch which
-/// frame while the kernel owns others.
-#[derive(Debug)]
-pub struct UmemRegion<'session> {
+/// The region has no byte accessor of its own. Frame bytes become reachable
+/// only through [`crate::RxFillEngine`], which pairs the region with the
+/// frame ownership ledger and lends one frame at a time while the ledger
+/// records it as owned by user space; the kernel may write every other
+/// frame concurrently.
+pub struct UmemRegion<'memory> {
     config: UmemConfig,
-    _session: std::marker::PhantomData<&'session mut ()>,
+    mapping: UmemMapping<'memory>,
 }
 
-impl UmemRegion<'_> {
-    pub(crate) const fn new(config: UmemConfig) -> Self {
-        Self {
-            config,
-            _session: std::marker::PhantomData,
+impl<'memory> UmemRegion<'memory> {
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) const fn new(config: UmemConfig, mapping: UmemMapping<'memory>) -> Self {
+        Self { config, mapping }
+    }
+
+    /// Borrows caller-owned process memory as a UMEM of `config` geometry.
+    ///
+    /// This is the heap-backed source for tests and for callers that drive
+    /// the engine without a kernel. The slice must cover at least
+    /// [`UmemConfig::byte_len`] bytes.
+    pub fn from_slice(
+        memory: &'memory mut [u8],
+        config: UmemConfig,
+    ) -> Result<Self, UmemRegionError> {
+        let required = config.byte_len();
+        if u64::try_from(memory.len()).map_or(true, |actual| actual < required) {
+            return Err(UmemRegionError::TooShort {
+                required,
+                actual: memory.len(),
+            });
         }
+        Ok(Self::new(config, UmemMapping::from_slice(memory)))
     }
 
     /// Returns the registered UMEM geometry.
@@ -597,7 +623,41 @@ impl UmemRegion<'_> {
     pub const fn byte_len(&self) -> u64 {
         self.config.byte_len()
     }
+
+    pub(crate) fn into_mapping(self) -> UmemMapping<'memory> {
+        self.mapping
+    }
 }
+
+impl fmt::Debug for UmemRegion<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UmemRegion")
+            .field("config", &self.config)
+            .field("mapping", &self.mapping)
+            .finish()
+    }
+}
+
+/// Failure building a [`UmemRegion`] over caller-owned memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UmemRegionError {
+    /// The memory is shorter than the configured UMEM.
+    TooShort {
+        /// Configured UMEM byte length.
+        required: u64,
+        /// Supplied byte length.
+        actual: usize,
+    },
+}
+
+impl fmt::Display for UmemRegionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for UmemRegionError {}
 
 /// The four role-typed ring views and UMEM geometry of one live session.
 ///

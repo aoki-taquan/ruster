@@ -118,8 +118,16 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   process crashでも自動detachされる。errorはvalue-freeな`AttachError{stage, failure}`で、
   verifier logは長さとtruncationだけを返す。bind queue以外のframeは捨てる（firewall/NATの迂回を
   防ぐ）ので、portはsingle-queue deviceにするかethtool RSS/ntupleでbind queueへ寄せ、kernelの
-  L3設定を残さない。datapath engine（S3）、UMEM byte access、core
-  `PacketIo`接続はまだ持たず、FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
+  L3設定を残さない。M2 S3（X01）の`RxFillEngine`はdatapath engineのRX/Fill半分で、session
+  （または`UmemRegion::from_slice`等のheap memory）のFill/RX viewとUMEMを一workerで所有し、
+  free RX-pool frameを`fill_batch`以下ずつFillへpublishし（free listが空でFillにroomがあれば
+  `fill_starved`を数えてstallしない）、RX descriptorをUMEM範囲、kernel所有（重複を拒否）、
+  options、headroom、Ethernet header長（14 byte）、chunk境界でcoreに見せる前に検証する（違反は
+  reason別に数え、kernelが返したframeはquarantine）。valid frameはengineをborrowする`RxFrame`として
+  一つずつ貸し、`recycle`/`stage_tx`（S4向け`TxHandoff`）/dropで終える。bytes借用中のrecycleは
+  compile errorで、UMEM byte accessはledgerが`Leased`と記録するframeだけに限る。TX/Completion
+  （S4）、need-wakeup kick、core `PacketIo`接続はまだ持たず（`ruster-core`へは依存しない）、
+  FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
   privileged smokeは`scripts/priv-xdp-smoke.sh`（`sudo -n`で専用netnsとその中だけのveth pairを
   作り、`RUSTER_PRIV_XDP=1`で実行してnetnsを必ず削除。不足はskipせずfail）。
 
@@ -572,7 +580,7 @@ cargo +1.97.1 check --workspace --all-targets --all-features --locked --target x
 これはmusl targetでworkspace全体が型検査を通ることだけを確認するcompile-only portability
 checkです。musl向けartifactのlink、test実行、実NICでのruntime compatibilityは保証しません。
 
-`ruster-io-xdp-native`のunsafe/fake testは任意でMiriでも確認できます（nightlyとMiri sysrootが
+`ruster-io-xdp-native`のunsafe/fake test（RX/Fill engineのheap scripted kernel testを含む）は任意でMiriでも確認できます（nightlyとMiri sysrootが
 必要。CI gateではありません）。
 
 ```bash
@@ -591,7 +599,8 @@ scriptはtest binaryを通常userでbuildし、`ruster-x00c-<pid>-<random>`と�
 interfaceには触れません。testはinitial netnsでの実行を拒否し、`RUSTER_PRIV_XDP=1`なのに
 netns/device/capabilityが欠ける場合はskipせずfailします。veth pairは2 queueで、phaseは
 session（X00C）、attach（native attach、peer端からのframeがRX ringへ届く、別queueからの二度目の
-attachが`ExistingProgram`、detach、generic attach）、foreign（`ip link set ... xdpgeneric obj`で
+attachが`ExistingProgram`、detach、generic attach）、engine（live mapping上の`RxFillEngine`で
+peerのARP frameが検証を通りlend、recycle、refillされる、X01）、foreign（`ip link set ... xdpgeneric obj`で
 付けた外部programを両modeで拒否しprogram id不変。objectは`scripts/priv-xdp-foreign-elf.py`が
 compilerなしで生成）、holder（attachした別processをSIGKILLしlinkが消える）の順です。
 

@@ -56,6 +56,20 @@ impl<'memory> BorrowedMmap<'memory> {
         }
     }
 
+    /// Releases the base and length to a sibling owner that keeps the same
+    /// exclusive-borrow and no-reference contract for `'memory`.
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        )),
+        allow(dead_code)
+    )]
+    pub(super) fn into_parts(self) -> (NonNull<u8>, usize) {
+        (self.base, self.len)
+    }
+
     /// Checks the minimum extent and the actual cursor-field address alignment.
     pub(super) fn validate(&self, layout: RingMmapLayout) -> Result<(), RingMapError> {
         if self.len < layout.byte_len() {

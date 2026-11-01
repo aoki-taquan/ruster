@@ -98,7 +98,7 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
 ### Partialまたは欠落
 
 - production backendが無い。AF_PACKETはscripted syscall上のcopy backendまで、AF_XDPは
-  一socketのsessionとXDP program attachまでで、`ruster run`、datapath engine、multi-queue
+  一socketのsession、XDP program attach、RX/Fill engineまでで、`ruster run`、TX/Completion engine、multi-queue
   worker ownership、netns/実NIC forwarding E2Eは無い（M2）。
 - `run-sim`はrestart-required applyをrejectとして報告し、同一process内でstorageを
   作り直さない（SIM-016 deferred）。process restartをまたぐgeneration/key履歴は無い。
@@ -119,10 +119,16 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   しない、linkはpinしない、licenseは`MIT OR Apache-2.0`（使うhelperはGPL-onlyでない）。5.9〜6.xの
   実機検証とCI workflowはX04（XDP-062）。review決定: socketの無いqueueは`XDP_DROP`（fail closed。
   firewall/NATの迂回を防ぐ代わりにsingle-queue deviceかbind queueへのsteeringが前提、portにkernel L3
-  設定を残さない。startup checkはX04、XDP-063）。datapath engine（S3）、`ruster run`はまだ無い。
+  設定を残さない。startup checkはX04、XDP-063）。`ruster run`はまだ無い。
+- AF_XDP RX/Fill engine（`RxFillEngine`: bounded Fill refill、free list空のstarvation accounting、
+  RX descriptorのaddress/ownership/options/headroom/length検証とquarantine、borrow-scopedな
+  frame lending、ledger-gated UMEM byte access、TX handoff hook、OBS-018のRX/Fill counter）は
+  M2 S3（X01）で追加した（XDP-064〜081）。dependency決定: `ruster-io-xdp-native`は`ruster-io-xdp`
+  だけに依存し`ruster-core`へは依存しない（`PacketIo` adapterはX04）。TX/Completion（S4、X02）、
+  need-wakeup kick、`PacketIo` adapter、runtime stats接続はまだ無い（XDP-082）。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
-  ringのsaturationが無い（OBS-017/018 deferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
+  ringのsaturationのruntime接続が無い（OBS-017/018 deferred。AF_XDP RX/Fill engine自身のcounterはM2 S3）。core `PublicationQuiescenceGuard::new`はsealされていない。
 - optional serviceを表すcomposition seamが無く、M1はUDP/TCP NAT44+FWを必須とする。
 - `ruster run-sim`によるfrozen benchmark spec SHAの表示（R12 acceptance）が無い。spec SHA自体は
   M1 release evidenceへ固定済み。

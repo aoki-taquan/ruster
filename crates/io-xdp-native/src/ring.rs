@@ -76,6 +76,12 @@ impl<'memory, T: RingValue> ProducerRing<'memory, T> {
         self.memory.capacity()
     }
 
+    fn free_slots(&self) -> Result<u32, NativeRingError> {
+        let producer = self.memory.producer_relaxed();
+        let consumer = self.memory.consumer_acquire();
+        Ok(self.capacity() - occupied(producer, consumer, self.capacity())?)
+    }
+
     fn reserve(
         &mut self,
         len: u32,
@@ -173,6 +179,12 @@ impl<'memory, T: RingValue> ConsumerRing<'memory, T> {
 
     const fn capacity(&self) -> u32 {
         self.memory.capacity()
+    }
+
+    fn available(&self) -> Result<u32, NativeRingError> {
+        let producer = self.memory.producer_acquire();
+        let consumer = self.memory.consumer_relaxed();
+        occupied(producer, consumer, self.capacity())
     }
 
     fn acquire(
@@ -294,6 +306,15 @@ impl<'memory> FillProducer<'memory> {
         self.inner.capacity()
     }
 
+    /// Acquire-loads the kernel consumer cursor and returns the number of
+    /// entries that a [`Self::reserve`] can currently cover.
+    ///
+    /// The kernel only consumes, so the value can grow but never shrink
+    /// before this producer's next reservation.
+    pub fn free_slots(&self) -> Result<u32, NativeRingError> {
+        self.inner.free_slots()
+    }
+
     /// Reserves an unpublished range of UMEM addresses.
     pub fn reserve(&mut self, len: u32) -> Result<FillReservation<'_, 'memory>, NativeRingError> {
         Ok(FillReservation {
@@ -372,6 +393,15 @@ impl<'memory> TxProducer<'memory> {
         self.inner.capacity()
     }
 
+    /// Acquire-loads the kernel consumer cursor and returns the number of
+    /// entries that a [`Self::reserve`] can currently cover.
+    ///
+    /// The kernel only consumes, so the value can grow but never shrink
+    /// before this producer's next reservation.
+    pub fn free_slots(&self) -> Result<u32, NativeRingError> {
+        self.inner.free_slots()
+    }
+
     /// Reserves an unpublished descriptor range.
     pub fn reserve(&mut self, len: u32) -> Result<TxReservation<'_, 'memory>, NativeRingError> {
         Ok(TxReservation {
@@ -443,6 +473,15 @@ impl<'memory> RxConsumer<'memory> {
         self.inner.capacity()
     }
 
+    /// Acquire-loads the kernel producer cursor and returns the number of
+    /// published entries that an [`Self::acquire`] can currently cover.
+    ///
+    /// The kernel only produces, so the value can grow but never shrink
+    /// before this consumer's next release.
+    pub fn available(&self) -> Result<u32, NativeRingError> {
+        self.inner.available()
+    }
+
     /// Acquire-loads the producer cursor and acquires a published range.
     pub fn acquire(&mut self, len: u32) -> Result<RxAcquisition<'_, 'memory>, NativeRingError> {
         Ok(RxAcquisition {
@@ -512,6 +551,15 @@ impl<'memory> CompletionConsumer<'memory> {
     /// Returns the checked fixed capacity.
     pub const fn capacity(&self) -> u32 {
         self.inner.capacity()
+    }
+
+    /// Acquire-loads the kernel producer cursor and returns the number of
+    /// published entries that an [`Self::acquire`] can currently cover.
+    ///
+    /// The kernel only produces, so the value can grow but never shrink
+    /// before this consumer's next release.
+    pub fn available(&self) -> Result<u32, NativeRingError> {
+        self.inner.available()
     }
 
     /// Acquire-loads the producer cursor and acquires a published range.

@@ -1,6 +1,6 @@
 #!/bin/sh
-# Privileged AF_XDP smoke: native session (M2 S1, X00C) and XDP program /
-# bpf_link lifecycle (M2 S2, X00D).
+# Privileged AF_XDP smoke: native session (M2 S1, X00C), XDP program /
+# bpf_link lifecycle (M2 S2, X00D), and the RX/Fill engine (M2 S3, X01).
 #
 # Builds the test binary as the invoking user, then with `sudo -n` creates a
 # dedicated network namespace holding its own two-queue veth pair, runs the
@@ -15,6 +15,8 @@
 #   session  copy/auto session, EBUSY/EINVAL/ENODEV (X00C)
 #   attach   native attach, peer frame reaches the RX ring, second attach
 #            refused with ExistingProgram, detach, generic attach, close
+#   engine   RX/Fill engine over the live mappings: peer frames pass
+#            descriptor validation and are lent, recycled, and refilled (X01)
 #   foreign  a netlink-attached xdpgeneric program loaded with `ip` is
 #            refused in both modes and left untouched (same program id)
 #   holder   attach in a separate process, SIGKILL it, link auto-detaches
@@ -141,6 +143,11 @@ run_phase attach priv_xdp_attach \
     priv_xdp_attach_redirects_refuses_second_and_detaches_on_netns_veth
 test -z "$(xdp_prog)" || {
     echo "priv-xdp-smoke: program left attached after the attach phase" >&2
+    exit 1
+}
+run_phase engine priv_xdp_engine priv_xdp_engine_validates_and_recycles_peer_frames
+test -z "$(xdp_prog)" || {
+    echo "priv-xdp-smoke: program left attached after the engine phase" >&2
     exit 1
 }
 

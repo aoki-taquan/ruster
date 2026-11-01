@@ -299,6 +299,21 @@ impl FrameLedger {
         )
     }
 
+    /// Permanently removes a kernel-owned Fill frame from reuse.
+    ///
+    /// A native engine calls this when the kernel returned the frame on an
+    /// RX descriptor that failed validation (options, headroom, or length).
+    /// The return is out of profile, so the frame is neither lent nor
+    /// recycled. The token keeps its generation; the frame stays
+    /// [`FrameStateKind::Quarantined`] for the ledger lifetime.
+    pub fn quarantine_kernel_fill(&mut self, token: FrameToken) -> Result<(), LedgerError> {
+        self.transition(
+            token,
+            FrameStateKind::FillOwnedByKernel,
+            FrameState::Quarantined(Some(token)),
+        )
+    }
+
     /// Borrows a received frame for packet processing.
     pub fn lease_rx(&mut self, token: FrameToken) -> Result<ValidatedDescriptor, LedgerError> {
         let index = self.verify(token, FrameStateKind::RxAvailable)?;

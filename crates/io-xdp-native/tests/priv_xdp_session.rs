@@ -1,5 +1,5 @@
-//! Privileged real-kernel smoke for the X00C native AF_XDP session and the
-//! X00D XDP program/`bpf_link` lifecycle.
+//! Privileged real-kernel smoke for the X00C native AF_XDP session, the
+//! X00D XDP program/`bpf_link` lifecycle, and the X01 RX/Fill engine.
 //!
 //! Runs only with `RUSTER_PRIV_XDP=1`, normally through
 //! `scripts/priv-xdp-smoke.sh`, which creates a dedicated network namespace
@@ -23,6 +23,7 @@
 use std::{
     env, fs,
     net::UdpSocket,
+    num::{NonZeroU128, NonZeroU32},
     os::unix::fs::MetadataExt,
     process::Command,
     thread::sleep,
@@ -32,7 +33,8 @@ use std::{
 use ruster_io_xdp_native::{
     abi::{XDP_COPY, XDP_USE_NEED_WAKEUP},
     AttachFailure, AttachStage, NativeRingError, NativeSession, NegotiatedMode, RingConfig,
-    SessionConfig, SessionFailure, SessionStage, UmemConfig, ValidatedBindFlags, XdpAttachMode,
+    RxFillConfig, RxFillEngine, SessionConfig, SessionFailure, SessionStage, UmemConfig,
+    UmemDomainId, ValidatedBindFlags, XdpAttachMode, XDP_PACKET_HEADROOM,
 };
 
 const FRAME_SIZE: u64 = 2_048;
@@ -351,6 +353,80 @@ fn priv_xdp_attach_redirects_refuses_second_and_detaches_on_netns_veth() {
     eprintln!(
         "priv_xdp_attach: native redirect to RX ring, ExistingProgram for a second attach, \
          detach, generic attach, close-detach verified"
+    );
+}
+
+#[test]
+fn priv_xdp_engine_validates_and_recycles_peer_frames() {
+    let Some(device) = requested(Some("engine")) else {
+        return;
+    };
+    assert_eq!(attached_program(&device), None, "veth starts without XDP");
+    let mut session = open_after_release(&session_config(&device, 0, XDP_COPY));
+    // Attach first: the engine then borrows the session's mappings for its
+    // whole life. Frames arriving before the first refill are dropped by
+    // the kernel (empty Fill ring), not mis-owned.
+    session
+        .attach_xdp(XdpAttachMode::Native)
+        .expect("native attach on veth");
+    let peer = UdpSocket::bind(PEER_SOURCE).expect("peer address configured by the script");
+    {
+        let rings = session.rings().expect("ring views");
+        let mut engine = RxFillEngine::new(
+            rings.fill,
+            rings.rx,
+            rings.umem,
+            UmemDomainId::new(NonZeroU128::new(0x5333).expect("nonzero")),
+            RxFillConfig::new(NonZeroU32::new(64).expect("nonzero")),
+        )
+        .expect("engine over the live mappings");
+        assert_eq!(engine.counters().fill_published, 64);
+        engine.audit().expect("primed engine audit");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut verified = 0_u32;
+        while verified < 2 {
+            peer.send_to(b"ruster", UNANSWERED_TARGET)
+                .expect("peer send");
+            sleep(Duration::from_millis(20));
+            let mut batch = engine.poll(16).expect("poll");
+            while let Some(frame) = batch.next_frame() {
+                let bytes = frame.bytes();
+                assert_eq!(bytes.len(), frame.len() as usize);
+                assert!(frame.frame().index() < 192, "RX pool frame");
+                assert!(
+                    frame.descriptor().data_offset() >= XDP_PACKET_HEADROOM,
+                    "kernel headroom"
+                );
+                // The peer's unanswered ARP request: broadcast, EtherType ARP.
+                if bytes.len() >= 42 && bytes[..6] == [0xff; 6] && bytes[12..14] == [0x08, 0x06] {
+                    verified += 1;
+                }
+                frame.recycle();
+            }
+            engine.audit().expect("engine audit after poll");
+            assert!(
+                Instant::now() < deadline,
+                "no ARP frame passed the engine within five seconds: {:?}",
+                engine.counters()
+            );
+        }
+        // Recycled frames go back to Fill on the next refill.
+        let _ = engine.refill().expect("refill recycled frames");
+        engine.audit().expect("engine audit after refill");
+        let counters = engine.counters();
+        assert_eq!(counters.rx_invalid_total(), 0, "{counters:?}");
+        assert!(counters.rx_recycled >= 2);
+        assert!(
+            counters.fill_published >= 64 + counters.rx_recycled,
+            "{counters:?}"
+        );
+    }
+    session.close().expect("attached session teardown");
+    wait_detached(&device);
+    eprintln!(
+        "priv_xdp_engine: peer ARP frames validated, lent, recycled, and refilled through the \
+         RX/Fill engine verified"
     );
 }
 

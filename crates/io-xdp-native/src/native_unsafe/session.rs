@@ -31,6 +31,8 @@ use crate::{
     RingName, RxConsumer, TxProducer, UmemConfig,
 };
 
+use super::umem::UmemMapping;
+
 use super::syscall::{
     errno, interface_index, Errno, LinuxSyscalls, MappedRegion, MapsRealMemory, OwnedBpfFd,
     OwnedXdpFd, ResourceError, SyscallError, IFNAMSIZ, PAGE_SIZE,
@@ -452,7 +454,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
                 SessionStage::MapUmem,
                 SessionFailure::ArgumentOutOfRange,
             ))?;
-        let umem =
+        let mut umem =
             MappedRegion::map_anonymous(syscalls, umem_len).map_err(at(SessionStage::MapUmem))?;
         check_page_aligned(SessionStage::MapUmem, &umem)?;
 
@@ -520,6 +522,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
             &mut completion,
             &mut rx,
             &mut tx,
+            &mut umem,
             plans,
             umem_config,
         )
@@ -593,6 +596,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
             &mut self.completion,
             &mut self.rx,
             &mut self.tx,
+            &mut self.umem,
             self.plans,
             self.umem_config,
         )
@@ -769,6 +773,7 @@ fn build_views<'a, S: MapsRealMemory>(
     completion: &'a mut MappedRegion<'_, S>,
     rx: &'a mut MappedRegion<'_, S>,
     tx: &'a mut MappedRegion<'_, S>,
+    umem_region: &'a mut MappedRegion<'_, S>,
     plans: RingPlans,
     umem: UmemConfig,
 ) -> Result<NativeRings<'a>, ViewFailure> {
@@ -804,12 +809,17 @@ fn build_views<'a, S: MapsRealMemory>(
         .ok_or(inactive(plans.tx))
         .and_then(|mapping| TxProducer::with_mapping(mapping, plans.tx.raw, plans.tx.entries))
         .map_err(|error| borrow_failure(SessionStage::MapTxRing, RingName::Tx, error))?;
+    // `open` rejected a zero or unaligned UMEM address before this point,
+    // so only an inactive region yields no borrow.
+    let umem_mapping = umem_region
+        .borrow_mapping()
+        .ok_or((SessionStage::MapUmem, SessionFailure::MisalignedMapping))?;
     Ok(NativeRings {
         fill,
         completion,
         rx,
         tx,
-        umem: UmemRegion::new(umem),
+        umem: UmemRegion::new(umem, UmemMapping::from_mapping(umem_mapping)),
     })
 }
 
