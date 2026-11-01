@@ -331,7 +331,7 @@ fn service_counters_capture_every_runtime_counter_in_fixed_order() {
     );
     for (section, fields) in [
         ("resolution", 13),
-        ("icmpv4_errors", 28),
+        ("icmpv4_errors", 31),
         ("nat44_udp", 14),
         ("nat44_tcp", 17),
         ("firewall", 13),

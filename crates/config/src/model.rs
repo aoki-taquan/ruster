@@ -66,6 +66,14 @@ pub struct NeighborV1 {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Ipv4OriginV1 {
     pub default_ttl: u8,
+    /// Answer Echo Requests to router addresses (RFC 1812 §4.3.3.6 option;
+    /// default `true`).
+    #[serde(default = "enabled")]
+    pub echo_reply: bool,
+}
+
+const fn enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -112,6 +120,33 @@ pub struct Icmpv4ErrorCapacityV1 {
 pub struct Icmpv4ErrorV1 {
     pub policy: Icmpv4ErrorPolicyV1,
     pub capacity: Icmpv4ErrorCapacityV1,
+    #[serde(default)]
+    pub generate: Icmpv4ErrorGenerateV1,
+}
+
+/// Per-kind generation switches. Every kind defaults to `true` (RFC 1812).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Icmpv4ErrorGenerateV1 {
+    /// Time Exceeded, TTL exceeded in transit (Type 11/Code 0).
+    #[serde(default = "enabled")]
+    pub time_exceeded: bool,
+    /// Destination Unreachable, Network (Type 3/Code 0) on a route miss.
+    #[serde(default = "enabled")]
+    pub net_unreachable: bool,
+    /// Destination Unreachable, Host (Type 3/Code 1) after fruitless ARP.
+    #[serde(default = "enabled")]
+    pub host_unreachable: bool,
+}
+
+impl Default for Icmpv4ErrorGenerateV1 {
+    fn default() -> Self {
+        Self {
+            time_exceeded: true,
+            net_unreachable: true,
+            host_unreachable: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

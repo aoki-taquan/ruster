@@ -533,3 +533,47 @@ fn inherited_ignored_sigint_stays_ignored_and_sigterm_still_stops() {
         .last()
         .is_some_and(|line| line.starts_with("{\"event\":\"final\"")));
 }
+
+#[test]
+fn plan_classifies_icmpv4_switches_like_their_policy_tables() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let echo_off = dir.join("echo-off.toml");
+    fs::write(
+        &echo_off,
+        source.replacen("echo-reply = true", "echo-reply = false", 1),
+    )
+    .unwrap();
+    let ttl_off = dir.join("ttl-off.toml");
+    fs::write(
+        &ttl_off,
+        source.replacen("time-exceeded = true", "time-exceeded = false", 1),
+    )
+    .unwrap();
+    let current = fixtures().join("router-v1.toml");
+
+    let validate = ruster(&["validate".as_ref(), ttl_off.as_os_str()]);
+    assert_eq!(status(&validate), 0);
+
+    // The Echo responder switch is a reloadable ipv4-origin change.
+    let echo = ruster(&["plan".as_ref(), current.as_os_str(), echo_off.as_os_str()]);
+    assert_eq!(status(&echo), 0);
+    assert_eq!(
+        text(&echo.stdout),
+        format!(
+            "plan: reloadable\nrestart-required: none\nchanges: 1\n  ipv4-origin ~ changed\n\
+             {FLUSH_ALL}"
+        )
+    );
+    // An ICMPv4 error generation switch belongs to the restart-required
+    // ICMPv4 error policy, like interval-ms and state-ttl-ms.
+    let ttl = ruster(&["plan".as_ref(), current.as_os_str(), ttl_off.as_os_str()]);
+    assert_eq!(status(&ttl), 0);
+    assert_eq!(
+        text(&ttl.stdout),
+        format!(
+            "plan: restart-required\nrestart-required: ICMPV4_ERROR_POLICY\nchanges: 0\n\
+             {FLUSH_ALL}"
+        )
+    );
+}

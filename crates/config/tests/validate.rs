@@ -709,3 +709,61 @@ fn interface_labels_are_restricted_to_a_conservative_charset() {
         .iter()
         .any(|binding| binding.device() == edge));
 }
+
+#[test]
+fn icmpv4_generation_switches_map_onto_core_policies() {
+    use ruster_core::{Icmpv4ErrorKind, Icmpv4ErrorPolicy, Ipv4OriginPolicy};
+
+    let defaults = validated(VALID);
+    assert_eq!(defaults.ipv4_origin(), Ipv4OriginPolicy::default());
+    assert!(defaults.ipv4_origin().echo_reply());
+    let policy = defaults.icmpv4_errors().unwrap().policy();
+    assert_eq!(policy, Icmpv4ErrorPolicy::new(100, 60_000).unwrap());
+
+    let all_on_explicitly = VALID
+        .replacen(
+            "default-ttl = 64\n",
+            "default-ttl = 64\necho-reply = true\n",
+            1,
+        )
+        .replacen(
+            "[icmpv4-errors.capacity]",
+            "[icmpv4-errors.generate]\ntime-exceeded = true\nnet-unreachable = true\n\
+             host-unreachable = true\n\n[icmpv4-errors.capacity]",
+            1,
+        );
+    let explicit = validated(&all_on_explicitly);
+    assert_eq!(explicit.ipv4_origin(), defaults.ipv4_origin());
+    assert_eq!(
+        explicit.icmpv4_errors().unwrap().policy(),
+        defaults.icmpv4_errors().unwrap().policy()
+    );
+
+    let disabled = VALID
+        .replacen(
+            "default-ttl = 64\n",
+            "default-ttl = 64\necho-reply = false\n",
+            1,
+        )
+        .replacen(
+            "[icmpv4-errors.capacity]",
+            "[icmpv4-errors.generate]\nnet-unreachable = false\n\n[icmpv4-errors.capacity]",
+            1,
+        );
+    let config = validated(&disabled);
+    assert!(!config.ipv4_origin().echo_reply());
+    assert_eq!(config.ipv4_origin().default_ttl(), 64);
+    let policy = config.icmpv4_errors().unwrap().policy();
+    assert!(policy.generates(Icmpv4ErrorKind::TimeExceededTtl));
+    assert!(!policy.generates(Icmpv4ErrorKind::DestinationUnreachableNetwork));
+    assert!(policy.generates(Icmpv4ErrorKind::DestinationUnreachableHost));
+    assert_eq!((policy.interval_ms(), policy.state_ttl_ms()), (100, 60_000));
+    // Storage shape is unaffected by a switch.
+    assert_eq!(config.storage_shape(), defaults.storage_shape());
+
+    // Policy validation still applies with switches present.
+    assert_eq!(
+        error(&disabled.replacen("interval-ms = 100\n", "interval-ms = 0\n", 1)).code(),
+        ValidationCode::Icmpv4ErrorPolicy(ruster_core::Icmpv4ErrorPolicyError::IntervalZero)
+    );
+}

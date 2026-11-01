@@ -7,12 +7,12 @@ use ruster_core::{
     FirewallFailure, FirewallHashKey, FirewallInterface, FirewallIpv4Prefix, FirewallPolicy,
     FirewallPolicySource, FirewallPortRange, FirewallProtocol, FirewallRule, FirewallRuleId,
     FirewallRuntime, FirewallStateSlot, FirewallTcpPhase, FirewallVerdict, ForwardingSnapshot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId,
-    Interface, Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy,
-    Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot,
-    Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime,
-    Neighbor, NoGeneratedIcmpv4Trace, NoTrace, PacketIo, ResolutionActionSlot, ResolutionPolicy,
-    ResolutionRuntime, ResolutionStateSlot, Route,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
+    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy,
+    Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
+    Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoGeneratedIcmpv4Trace, NoTrace, PacketIo,
+    ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
 };
 use ruster_io_sim::{FrameOrigin, RecycleCause, SimIo};
 use support::UdpTestIndexes;
@@ -3942,5 +3942,139 @@ fn nat_outside_route_miss_stays_silent_like_the_external_to_internal_bypass() {
         assert_eq!(resolution.pending_actions(), 0);
     }
     assert_eq!(combined_state_snapshot(&udp, &tcp, &firewall), state_before);
+    assert!(io.pop_tx().is_none());
+}
+
+#[test]
+fn route_miss_net_unreachable_switch_keeps_the_firewall_verdict_and_drop_reason() {
+    let (all_routes, interfaces, neighbors, bindings) = topology();
+    let routes = [all_routes[0]];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let rules = [any_egress_allow(5, FirewallProtocol::Udp)];
+    let config = firewall_config(&snapshot, &rules, 1);
+    let mut firewall_slots = [FirewallStateSlot::default(); 2];
+    let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(
+        Icmpv4ErrorPolicy::default()
+            .with_generation(Icmpv4ErrorKind::DestinationUnreachableNetwork, false),
+        &mut error_states,
+        &mut error_actions,
+    );
+    let mut io = SimIo::new();
+    let no_route = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, true);
+    io.inject(LAN, no_route.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        &config,
+        Some(&mut firewall),
+        MonotonicMillis(1),
+        &mut NoTrace,
+    )
+    .unwrap();
+    // Same verdict and reason as with generation on; only the error is gone.
+    assert_drop(&mut io, DropReason::RouteMiss, &no_route);
+    assert_eq!(errors.pending_actions(), 0);
+    assert_eq!(errors.counters().disabled_destination_unreachable, 1);
+    assert_eq!(errors.counters().queued, 0);
+    assert_eq!(firewall.counters().rule_evaluations, 1);
+    assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
+    assert_eq!(resolution.pending_actions(), 0);
+    assert!(io.pop_tx().is_none());
+}
+
+/// FW-025: every route change is a new publication generation that flushes
+/// all firewall flows, so a flow's later packets are new-flow attempts. With
+/// the route back they are silently denied too, so answering only the route
+/// miss would turn the error into a route oracle.
+#[test]
+fn withdrawn_route_flow_is_flushed_so_route_hit_and_miss_stay_equally_silent() {
+    let (with_default, interfaces, neighbors, bindings) = topology();
+    let without_default = [with_default[0]];
+    let rules = [allow(FirewallProtocol::Tcp)];
+    let first = ForwardingSnapshot::new(&with_default, &interfaces, &neighbors, &bindings).unwrap();
+    let first_config = firewall_config(&first, &rules, 1);
+    let mut firewall_slots = [FirewallStateSlot::default(); 4];
+    let mut firewall = FirewallRuntime::new(first_config, &mut firewall_slots);
+    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 2];
+    let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 2];
+    let mut errors = Icmpv4ErrorRuntime::new(
+        Icmpv4ErrorPolicy::default(),
+        &mut error_states,
+        &mut error_actions,
+    );
+    let mut io = SimIo::new();
+    let syn = tcp_frame(HOST, REMOTE, 40_000, 443, 0x02, 0x4000);
+    let ack = tcp_frame(HOST, REMOTE, 40_000, 443, 0x10, 0x4000);
+    io.inject(LAN, syn);
+    io.inject(LAN, ack.clone());
+    let report = io
+        .run_firewall_with_icmpv4_errors_once(
+            2,
+            &first,
+            &mut resolution,
+            &mut errors,
+            &first_config,
+            Some(&mut firewall),
+            MonotonicMillis(1),
+            &mut NoTrace,
+        )
+        .unwrap();
+    assert_eq!(report.tx_requested, 2);
+    while io.pop_tx().is_some() {}
+
+    // Route withdrawn: a new generation (fresh key) flushes the flow.
+    let second =
+        ForwardingSnapshot::new(&without_default, &interfaces, &neighbors, &bindings).unwrap();
+    let second_key = FirewallHashKey::new(0x1111, 0x2222).unwrap();
+    let second_config =
+        FirewallConfig::new(&second, &rules, FirewallPolicy::default(), 2, second_key).unwrap();
+    assert_eq!(firewall.reconcile(second_config).unwrap().states_flushed, 1);
+    io.inject(LAN, ack.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        1,
+        &second,
+        &mut resolution,
+        &mut errors,
+        &second_config,
+        Some(&mut firewall),
+        MonotonicMillis(2),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallRouteUnavailable, &ack);
+
+    // Route restored: the same packet is still dropped silently, by the
+    // firewall, because the flow state did not survive the publication.
+    let third = ForwardingSnapshot::new(&with_default, &interfaces, &neighbors, &bindings).unwrap();
+    let third_key = FirewallHashKey::new(0x3333, 0x4444).unwrap();
+    let third_config =
+        FirewallConfig::new(&third, &rules, FirewallPolicy::default(), 3, third_key).unwrap();
+    firewall.reconcile(third_config).unwrap();
+    io.inject(LAN, ack.clone());
+    io.run_firewall_with_icmpv4_errors_once(
+        1,
+        &third,
+        &mut resolution,
+        &mut errors,
+        &third_config,
+        Some(&mut firewall),
+        MonotonicMillis(3),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert_drop(&mut io, DropReason::FirewallTcpInvalidInitialFlags, &ack);
+    assert_eq!(errors.pending_actions(), 0);
+    assert_eq!(errors.counters().queued, 0);
     assert!(io.pop_tx().is_none());
 }

@@ -1069,7 +1069,8 @@ impl ObservableFields for ServiceCounters {
         }}
         visit_counts! {v, "icmpv4_errors", self.icmpv4_errors, Icmpv4ErrorCounters {
             queued, queued_time_exceeded, queued_destination_unreachable,
-            queued_host_unreachable, pending, rate_limited, state_full, action_full,
+            queued_host_unreachable, pending, rate_limited, disabled_time_exceeded,
+            disabled_destination_unreachable, disabled_host_unreachable, state_full, action_full,
             clock_regressions, source_not_unicast, source_is_local, destination_multicast,
             destination_limited_broadcast, destination_network_address,
             destination_directed_broadcast, ethernet_destination_group, noninitial_fragment,
