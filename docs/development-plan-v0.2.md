@@ -98,8 +98,9 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
 ### Partialまたは欠落
 
 - production backendが無い。AF_PACKETはscripted syscall上のcopy backendまで、AF_XDPは
-  一socketのsession、XDP program attach、RX/Fill engine、same-frame TX/Completion、generated frameまでで、`ruster run`、`PacketIo` adapter、multi-queue
-  worker ownership、netns/実NIC forwarding E2Eは無い（M2）。
+  一socketのsession、XDP program attach、RX/Fill engine、same-frame TX/Completion、generated frame、
+  複数portのcore `PacketIo` adapter（X04a）までで、`ruster run`、configからのport構築、multi-queue
+  worker ownership、実NIC forwarding E2Eは無い（M2）。
 - `run-sim`はrestart-required applyをrejectとして報告し、同一process内でstorageを
   作り直さない（SIM-016 deferred）。process restartをまたぐgeneration/key履歴は無い。
 - OS乱数によるproduction key source（`OsRandomKeySource`）と、sim専用key sourceを型で拒否する
@@ -126,21 +127,31 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   address/ownership/options/headroom/length検証とquarantine（runtはrecycle）、borrow-scopedな
   frame lending、ledger-gated UMEM byte access、TX handoff hook、OBS-018のRX/Fill counter）は
   M2 S3（X01）で追加した（XDP-064〜090）。dependency決定: `ruster-io-xdp-native`は`ruster-io-xdp`
-  だけに依存し`ruster-core`へは依存しない（`PacketIo` adapterはX04）。
+  だけに依存し`ruster-core`へは依存しない（M2 S6でcore adapterのため`ruster-core`へ依存した。coreは
+  外部依存なし）。
 - AF_XDP TX/Completion半分（同じengineと同じledger: same-frame TX、TX capacity以下のin-flight上限と
   `TxBlocked`のrecoverableなwould-block、refill前のbounded completion reapとaddress検証/quarantine、
   completion lag、TX need-wakeup、bundle内のkick handle（`sendto`/`poll`、typed errno）、
   exactly-onceのshutdown drainとframe accounting audit、OBS-018のTX counter）はM2 S4（X02）で追加した
-  （XDP-091〜111、BACKEND-004）。`PacketIo` adapter、kick policy、runtime stats接続はまだ無い
+  （XDP-091〜111、BACKEND-004）。`PacketIo` adapter、kick policy、runtime stats接続はM2 S6（X04a）
   （XDP-112）。
 - AF_XDP generated frame（同じengineと同じledger: generated pool `rx_frames..frame_count`からの
   exact visible length allocation、typedな`Unavailable`/`Rejected`、commitはforwarded frameと同じTX
   上限とback-pressure、cancel/abandon/completionはgenerated free listへ、pool分離と両poolのaudit、
   `GeneratedCounters`）はM2 S5（X03）で追加した（XDP-120〜131、IO-009）。core
-  `GeneratedPacketIo` adapterとconformance suiteの適用はX04（XDP-132）。
+  `GeneratedPacketIo` adapterとconformance suiteの適用はM2 S6（X04a、XDP-132）。
+- AF_XDP core adapter（M2 S6、X04aの前半）: `XdpPacketIo`がinterfaceごとのengine上でcore
+  `PacketIo`/`GeneratedPacketIo`/`PublicationQuiescence`/`BackendStats`をstatic dispatchで実装する。
+  `IfId`→portはconstruction時に固定（merge blocker 8）、RXは全portをrotating startでmerge、同じport
+  へのcommitはsame-frame TX、別portはegressのgenerated poolへexact copy（shared UMEMはXDP-136で
+  deferred）、TXは`mtu + 14`以下（MTUはopenでsysfsから）、`TxBlocked`はcore back-pressure、quiescenceは
+  reap後にlease/handoff/in-flightなし、OBS-018のstatsを固定順で出す。Rx/Generated/CQ conformance
+  suiteをscripted kernel上で、二veth portのcore forwardingをprivileged smokeで検証した
+  （XDP-133〜156、IO-013、OBS-018）。configからのport構築と`ruster run`、health化、MTU/link変更、
+  TX枠公平性はX04b（XDP-157）。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
-  ringのsaturationのruntime接続が無い（OBS-017/018 deferred。AF_XDP RX/Fill engine自身のcounterはM2 S3）。core `PublicationQuiescenceGuard::new`はsealされていない。
+  ringのsaturationはM2 S6でAF_XDPの`BackendStats`へ接続した（OBS-018。AF_PACKETはOBS-028、OBS-017はdeferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
 - optional serviceを表すcomposition seamが無く、M1はUDP/TCP NAT44+FWを必須とする。
 - `ruster run-sim`によるfrozen benchmark spec SHAの表示（R12 acceptance）が無い。spec SHA自体は
   M1 release evidenceへ固定済み。

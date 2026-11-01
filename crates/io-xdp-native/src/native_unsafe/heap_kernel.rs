@@ -404,6 +404,12 @@ impl ScriptedKernel {
         }
     }
 
+    /// The process address of UMEM byte `offset`, as a lent slice's
+    /// `as_ptr().addr()` reports it (identity only, never dereferenced).
+    pub(crate) fn umem_address(&self, offset: u64) -> usize {
+        self.umem.base.as_ptr().addr() + usize::try_from(offset).expect("test offset")
+    }
+
     pub(crate) fn tx_producer(&self) -> u32 {
         self.tx.cursor(PRODUCER).load(Ordering::Acquire)
     }

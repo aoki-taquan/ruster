@@ -2226,7 +2226,7 @@ counter（`RxFillCounters`、OBS-018のRX/Fill半分）はsaturating `u64`で、
 hot pathは数個の整数更新とflag一回のatomic loadだけでledgerをscanしません。`audit()`はcold pathで
 ledger deep audit、free listがFree RX-pool frameとexactに一致すること、pending listが
 `RxAvailable`とexactに一致すること、engineがrestで残さないstateが無いことを検査します。runtime
-`BackendStats`への接続はX04です。
+`BackendStats`への接続はX04a（後述「AF_XDP core adapter」）です。
 
 testは`native_unsafe/heap_kernel.rs`（test専用）のscripted kernelで行います。heap上の五regionを
 一回だけbundleとしてengineへ貸し、scriptはkernelと同じくraw pointer（atomic cursor、volatile
@@ -2391,8 +2391,8 @@ io-xdp `FakeKernel`のTX lifecycleとのdifferential（modelの`CompletionAvaila
 peerのARP requestを同じUMEM frameのままin-placeでARP replyへ書き換え、同じvethからTXし、peer kernelが
 `ip neigh`にreplyのMACを学習することで受信を確かめ、completionをreapし、さらにkickもreapもせずに
 submitしたままのframe（in-flight 1）をdrainのkickとreapだけで回収して`Drained`を確認してからcloseします
-（XDP-091〜111）。generated poolのTXは次節X03、core `PacketIo` adapter、kick policy、health化、
-runtime statsはX04です（XDP-112）。
+（XDP-091〜111）。generated poolのTXは次節X03、core `PacketIo` adapter、kick policy、runtime
+statsはX04a（後述「AF_XDP core adapter」）、health化はX04bです（XDP-112）。
 
 ### AF_XDP generated frames (X03, M2 S5)
 
@@ -2469,5 +2469,140 @@ io-conformance generated suiteのsemantics（三つの`GeneratedBatchCompletion`
 suite自体はcore `GeneratedPacketIo`実装を要求するため、core adapterと一緒にX04で適用します。
 privileged smokeのgenerated phaseは専用netns veth上でgenerated poolのframeに42 byteのARP requestを
 書いてcommitし、peer kernelが送信元を`ip neigh`に学習することとcompletionを確認し、kickなしで提出した
-最後の一つをdrainで回収します（XDP-120〜131）。core adapter、refusalのcore errorへのmapping、TX枠の
-公平性、multi-port egress、runtime statsはX04です（XDP-132）。
+最後の一つをdrainで回収します（XDP-120〜131）。core adapter、refusalのcore errorへのmapping、
+multi-port egress、runtime statsはX04a（次節）、TX枠の公平性はdeferredです（XDP-132）。
+
+### AF_XDP core adapter (X04a, M2 S6)
+
+`ruster-io-xdp-native`は`ruster-core`へ依存するようになり（core自身は外部依存なし）、
+`XdpPacketIo<'memory>`がinterfaceごとに一つの`RxFillEngine`（一socket、一queue、一UMEM）の上で
+core `PacketIo`、`GeneratedPacketIo`、`PublicationQuiescence`、`BackendStats`を実装します。adapter、
+batch（`XdpRxBatch`、`XdpGeneratedBatch`）、slot（`XdpRxSlot`、`XdpGeneratedSlot`）はすべて具体型で
+static dispatchだけを使い、packet pathには共有`Mutex`、packet clone、packet単位`String`、
+`dyn PacketIo`、allocationがありません（scripted kernel上のsteady-state testでallocation 0）。
+
+```text
+            receive(budget)                       commit(egress)
+port[rx_start] ─poll─┐                       ┌─ egress == ingress ─► 同じframeをstage/submit（copyなし）
+port[+1]       ─poll─┼─► 各portのpending frame ┤
+...  (残りbudget0でも ┘   をport順にlend       └─ egress != ingress ─► egressのgenerated frameへexact copy
+     reap/refillのみ)                                                  → commit、ingressのRX frameはrecycle
+```
+
+multi-port mapping: `XdpPacketIo::new(ports)`は`XdpPort { XdpPortConfig { interface, queue, mode, mtu },
+engine }`の集合を一度だけ受け、空集合、重複`IfId`、MTU 0、drain済みengineをtyped errorで拒否し、
+`IfId`順にsortしたboxed sliceへ固定します（cold pathの一回だけのallocation）。以後mappingは変わらず、
+egress選択はこの固定sliceの二分探索（`O(log ports)`、map/string/trait objectなし）です。runtimeの
+configからportを作る配線（validated configの`ports()`はIfId順）と`ruster run`はX04bです。
+
+RX merge: `receive`は全portを一回ずつpollし、開始portはbatchごとに一つずつrotateします。各pollは
+そのportのcompletion reap、Fill refill、残りbudget以下のRX descriptor検証を行い、budgetを使い切った
+後のportもbudget 0でpollされreap/refillだけを行います。batchは同じ順にportごとのpending frameを
+lendします。batch終了時にlendしなかったframeはengineのpendingに残り、次のbatchが新しいdescriptorより
+先にlendします。Fill need-wakeupが立っていればそのportへ`poll(timeout 0)`のkickを一回送ります。
+
+cross-port TX: port Aで受けたframeはAのUMEMにあり、portごとにUMEMが別なのでBのTX descriptorは
+それを指せません（shared UMEMのcross-port zero-copyはXDP-136でdeferred。merge blocker 4のsingle
+owner証明が要ります）。そこでegressがingressと異なるcommitは、egress engineのgenerated poolから
+同じ長さのframeを取り（ここだけは直後に全visible byteを上書きするのでzero化を省く
+`ZeroFill::Overwritten`）、visible bytesを一回だけcopyしてBのTX ringへcommitし、AのRX frameを
+recycleします。costはcross-port packetごとに一回のframe長`memcpy`と、in-flight中のBのgenerated
+frame一つです。BのTX in-flight上限（TX capacity）とgenerated poolはforwarded copyとrouter生成
+（ARP/ICMP）で共有され、先着です。copyはegress portの`cross_port_copies`、generated poolが空で
+拒否したcommitは`cross_port_copy_unavailable`に数え、blockしません。egressがingressと同じなら
+X02のsame-frame TX（`forwarded_in_place`）です。
+
+TX length bound: forwarded/generatedともTXはegress portの`mtu + 14`（`XdpPortConfig::max_frame_len`、
+VLANはM2 profile外）以下に限ります。MTUは`NativeSession::open`がTX queue checkと同じifindex確認済み
+sysfs view（`/sys/class/net/<dev>/mtu`、safe std）からresource取得前に一回読み
+（`SessionStage::MtuProbe`、読めなければ`SessionFailure::MtuUnverifiable`でfail closed）、
+`NativeSession::mtu()`で渡します。configにMTUは無く、kernelのMTUが実際にcopy-mode TXを決めるため
+sysfsを選びました。open後のMTU変更は再openまで見えません（X04b）。超過したforwarded frameは
+descriptorを書く前に拒否して（`tx_over_mtu`、`tx_rejected`、errorなし）ingressのframeをrecycleし、
+generatedは`FrameTooLarge`（`generated_over_mtu`）です。実効上限はframe容量（frame size −
+headroom）でも切ります。Linux copy-mode transmitはover-MTU descriptorをcompletionなしで消費し得るため、
+frameが`TxOwnedByKernel`のまま残るのを防ぎます。
+
+error mapping:
+
+| engine | core | finish error |
+|---|---|---|
+| `TxBlocked::{RingFull, InflightLimit, Draining}`（forwarded/copy/generated） | `tx_rejected` / `rejected`（handoffはcancelでpoolへ） | なし（back-pressure、`tx_blocked`/`generated_tx_blocked`） |
+| unknown egress、over-MTU、copy先generated pool空 | `tx_rejected` | なし |
+| `GeneratedAllocError::Unavailable` | `Unavailable` | なし |
+| `Rejected(ZeroLength)` | `ZeroLength` | なし |
+| `Rejected(TooLarge)`、MTU超過 | `FrameTooLarge` | なし |
+| `Rejected(BelowMinimum)`（1〜13 byte） | `FrameTooLarge` | なし |
+| `Rejected(Draining)` | `Unavailable` | `XdpIoError::Stopped` |
+| `GeneratedAllocError::Ledger` | `Unavailable` | `GeneratedLedger` |
+| `TxRejection::{Invalid, Ring}`（adapter自身のhandoff） | `tx_rejected` / `rejected` | `Submit`、adapter停止 |
+| RX/Fill/Completion ring破損 | `receive`のErr | `Datapath`、adapter停止 |
+| kick失敗 | 影響なし（frameはin-flight） | `Kick`（stickyでない） |
+| unknown egressの`begin_generated` | 各allocateが`Unavailable` | `UnknownEgress` |
+
+coreに"too short"のvariantは無く、core generatorはEthernet header未満を要求せず、runtimeは
+`ZeroLength`/`FrameTooLarge`をどちらも同じfatal build failureとして扱うので、`BelowMinimum`は最も
+近い`FrameTooLarge`へmapし、coreは変更しません。`Draining`はdrain後のadapterが`Stop`を返すため
+runtimeからは到達しません。
+
+kick: `finish`（またはbatchのdrop）はそのbatchでTXを公開したportごとに一回、kernelの
+need-wakeup flagが`NotRequired`でない限り`sendto`でkickします（copy modeはflagを立て続け、`sendto`
+からだけ送信します）。generated sessionはegress portだけです。失敗は最初のbatch errorで、公開済み
+descriptorはin-flightのままです。
+
+forgotten lease: `PacketLease`/`GeneratedPacketLease`は`RawLease`（token + descriptor、move-only、
+crate private）をbatchへ預けて借用するので、`mem::forget`されたleaseは次の`next_packet`/`allocate`、
+`finish`、batch dropが回収します（engineの`rx_abandoned`/`generated_abandoned`とadapterの
+`leases_reclaimed`。RXは`recycled`に入れず、generatedは`abandoned`に入れて三つの不変条件を保ちます）。
+
+quiescence: batchはadapterを可変借用するので`try_publication_quiescence`を呼べる時点でbatchは開いて
+いません。まず全portのcompletionをTX capacity以下でreapし、各portで両poolのlent frameなし（上記の回収が
+あるため防御的）、stageされたhandoffなし、TX in-flightなしを要求します。in-flight TXはactive
+publicationで書き換えたbytesを運ぶのでpublicationを延期しますが旧publicationのI/Oは続けられる
+（`TxInFlight` → `ContinueOldIo`、次のbatchがreap）、lease/handoff残存は`SkipIo`、drainか
+fault後は`Stop`（sticky）です。lendしていないRX pending frameはpublication authorityを持たないので
+妨げません。`current_io_disposition`はO(ports)のO(1) accountingだけを読みます。
+
+`BackendStats`（OBS-018）: `NAME = "af_xdp"`、`MODE = BackendMode::Copy`（bind modeはportごとに
+openで交渉され`auto`はcopyへfallbackし得るので、静的に保証できるのはcopyです。実際のmodeは
+statsの`copy_ports`/`zero_copy_ports`/`mode`（`copy`、`zero_copy`、`mixed`）と`XdpPortStats::mode`）。
+`backend_stats`は全portを合計した`XdpBackendStats`（port数、mode別port数、need-wakeupが今立って
+いるport数、`stopped`、`XdpCounters`）を、`port_stats(IfId)`は一portの`XdpPortStats`（interface、
+queue、mode、MTU、実効`max_frame`、Fill/TX need-wakeupの現在値、draining、`XdpCounters`）を返し、
+どちらもallocationなしのO(ports)で固定順の`ObservableFields`です。`XdpCounters`はRX/Fill
+（polls、rx_packets/leased/recycled/abandoned、rx_ring_empty、rx_backlogged、runt、reason別invalid
+descriptor、fill_published/starved/ring_full/need_wakeup/flag_errors/suppressed_draining）、
+TX/Completion（tx_submitted、tx_ring_full、tx_inflight_limited、tx_refused_draining、tx_completed、
+reordered、completion_backlogged、invalid completion、tx_need_wakeup、flag errors、kicks、drains、
+gauge `tx_inflight`、high-water、最古in-flight frameのpoll年齢のcompletion lag）、quarantine（両pool
+合計の`frames_quarantined`、generated poolの現在数、`generated_quarantined_after_tx`）、generated
+（allocated/unavailable/committed/cancelled/abandoned/completed/rejected、gauge inflight。cross-port
+copyを含む）、adapter（forwarded_in_place、cross_port_copies、cross_port_copy_unavailable、
+tx_over_mtu、tx_blocked、tx_unknown_egress、generated_over_mtu、generated_tx_blocked、
+leases_reclaimed）です。合計はsaturating、high-waterとlagは最大値です。
+
+#299 follow-up: `GeneratedCounters::generated_quarantined_after_tx`を追加し、
+`generated_committed = generated_completed + generated_inflight + generated_quarantined_after_tx`を
+counterだけで閉じました。`RxFillCounters::frames_quarantined`は両poolのquarantineを数え、
+`GeneratedAccounting::quarantined`がそのgenerated分です。他engineのgenerated handoff
+（`ForeignTokenDomain`、同じ`UmemDomainId`でも）と一batch内の重複generated handoff（`WrongState`）の
+拒否をregression testにしました。
+
+conformance: `ruster-io-conformance`のRx（`RxHarness`にdefault付きの`COMMIT_EGRESS`と
+`MIN_FRAME_LEN`を追加。既存harnessはWAN/1 byteのまま不変）、Generated、CQ/finite-pool suiteを二つの
+scripted kernel上のadapterで実行します。Rx caseはsame-frame in-place pathを記述するのでingress自身
+（`CONFORMANCE_LAN`）へcommitし、marker frameをEthernet header長までzero paddingします。harnessはTX
+submissionをscripted kernelのTX ringから、ringに現れないreclaimと事前拒否をadapterの`cfg(test)`
+journalから観測し、free poolはengine ledgerから読みます。accept budgetは本物のback-pressureで、
+kernelが消費してcompletionを返さないfiller generated frameでTX in-flight上限をbudget分だけ残します。
+finish errorは次のTX kickを`ENETDOWN`で失敗させます。generated allocation budgetはadapterの
+`cfg(test)` gateです。`RxReceiveErrorHarness`（receive errorはring faultでadapterが停止するので
+retry caseに合わない）と`GeneratedUnknownEgressHarness`（unknown egressは何もallocateしない）は
+実装しません。harnessはadapterへ`'static`借用を与えるためkernelをleakするので、Miriはこのharness testを
+skipし、同じpathを借用kernelで通す`packet_io_tests`をMiriで実行します。
+
+privileged smokeのadapter phaseは専用netns内の二つの1-queue veth pair（`rx00c4`/`rx00c5`、
+`rx00c6`/`rx00c7`）をcopy mode・native attachの二portとして一つの`XdpPacketIo`に渡し、Aのpeerから
+AF_PACKETで送ったIPv4/UDP frameをcore `forward_batch`（実MACのsnapshot、static neighbor）で転送し、
+Bのgenerated poolへのcopyがBのpeerにMAC書き換えとTTL−1、正しいIPv4 checksum、不変payloadで
+届くことを確認してから両portをdrainします（XDP-133〜157、IO-013、OBS-018）。

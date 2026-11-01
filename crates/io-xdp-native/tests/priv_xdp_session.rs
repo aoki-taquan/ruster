@@ -1,6 +1,7 @@
 //! Privileged real-kernel smoke for the X00C native AF_XDP session, the
 //! X00D XDP program/`bpf_link` lifecycle, the X01 RX/Fill engine, and the
-//! X02 TX/Completion half, and the X03 generated frames.
+//! X02 TX/Completion half, the X03 generated frames, and the X04a core
+//! adapter forwarding between two ports.
 //!
 //! Runs only with `RUSTER_PRIV_XDP=1`, normally through
 //! `scripts/priv-xdp-smoke.sh`, which creates a dedicated network namespace
@@ -23,12 +24,18 @@
 
 use std::{
     env, fs,
+    io::{BufRead, BufReader},
     net::UdpSocket,
     num::{NonZeroU128, NonZeroU32},
     os::unix::fs::MetadataExt,
-    process::Command,
+    process::{Command, Stdio},
     thread::sleep,
     time::{Duration, Instant},
+};
+
+use ruster_core::{
+    forward_batch, BackendStats, ForwardingSnapshot, IfId, Interface, Ipv4Address, MacAddress,
+    Neighbor, NoTrace, PacketIo, Route,
 };
 
 use ruster_io_xdp_native::{
@@ -36,7 +43,8 @@ use ruster_io_xdp_native::{
     AttachFailure, AttachStage, DatapathError, DrainOutcome, GeneratedAllocError,
     GeneratedRejectReason, KickOutcome, NativeRingError, NativeSession, NeedWakeup, NegotiatedMode,
     RingConfig, RingsError, RxFillConfig, RxFillEngine, SessionConfig, SessionFailure,
-    SessionStage, UmemConfig, UmemDomainId, ValidatedBindFlags, XdpAttachMode, XDP_PACKET_HEADROOM,
+    SessionStage, UmemConfig, UmemDomainId, ValidatedBindFlags, XdpAttachMode, XdpIoError,
+    XdpPacketIo, XdpPort, XdpPortConfig, XDP_PACKET_HEADROOM,
 };
 
 const FRAME_SIZE: u64 = 2_048;
@@ -837,6 +845,271 @@ fn priv_xdp_generated_arp_request_is_learned_by_the_peer_and_drained() {
     eprintln!(
         "priv_xdp_generated: ARP request generated from the generated pool, transmitted, learned \
          by the peer, completed back to the generated pool, and drained verified"
+    );
+}
+
+/// Router MAC of `device` from sysfs (inside the namespace).
+fn device_mac(device: &str) -> [u8; 6] {
+    let text = fs::read_to_string(format!("/sys/class/net/{device}/address"))
+        .unwrap_or_else(|error| panic!("cannot read the MAC of {device}: {error}"));
+    let mut mac = [0_u8; 6];
+    let mut parts = text.trim().split(':');
+    for byte in &mut mac {
+        *byte = u8::from_str_radix(parts.next().expect("six octets"), 16).expect("hex octet");
+    }
+    assert!(parts.next().is_none(), "six octets");
+    mac
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&text[index..index + 2], 16).expect("hex"))
+        .collect()
+}
+
+/// Sends one raw Ethernet frame out of `device` (an AF_PACKET socket in
+/// python, run inside the namespace by the already-privileged test).
+const RAW_SEND: &str = r"
+import socket, sys
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+s.bind((sys.argv[1], 0))
+s.send(bytes.fromhex(sys.argv[2]))
+";
+
+/// Prints `ready`, then the hex of the first IPv4 frame received (not
+/// sent) on `device` that contains the marker, or fails after a timeout.
+const RAW_RECEIVE: &str = r"
+import select, socket, sys, time
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
+s.bind((sys.argv[1], 0))
+marker = bytes.fromhex(sys.argv[2])
+print('ready', flush=True)
+deadline = time.time() + float(sys.argv[3])
+while time.time() < deadline:
+    ready, _, _ = select.select([s], [], [], 0.05)
+    if not ready:
+        continue
+    data, address = s.recvfrom(65535)
+    if address[2] == socket.PACKET_OUTGOING:
+        continue
+    if marker in data:
+        print(data.hex(), flush=True)
+        sys.exit(0)
+sys.exit(1)
+";
+
+const FORWARD_MARKER: &[u8] = b"ruster-x04a-forward";
+const FORWARD_HOST_MAC: [u8; 6] = [0x02, 0x52, 0x55, 0x53, 0x54, 0x41];
+const FORWARD_SOURCE: [u8; 4] = [192, 0, 2, 2];
+const FORWARD_TARGET: [u8; 4] = [198, 51, 100, 2];
+
+/// An IPv4/UDP frame from the A-side host to the B-side host, addressed
+/// to router port A's MAC.
+fn forward_frame(router_a: [u8; 6]) -> Vec<u8> {
+    let payload_len = FORWARD_MARKER.len();
+    let total = 20 + 8 + payload_len;
+    let mut bytes = vec![0_u8; 14 + total];
+    bytes[0..6].copy_from_slice(&router_a);
+    bytes[6..12].copy_from_slice(&FORWARD_HOST_MAC);
+    bytes[12..14].copy_from_slice(&[0x08, 0x00]);
+    bytes[14] = 0x45;
+    bytes[16..18].copy_from_slice(&u16::try_from(total).expect("short").to_be_bytes());
+    bytes[20..22].copy_from_slice(&0x4000_u16.to_be_bytes());
+    bytes[22] = 64;
+    bytes[23] = 17;
+    bytes[26..30].copy_from_slice(&FORWARD_SOURCE);
+    bytes[30..34].copy_from_slice(&FORWARD_TARGET);
+    let checksum = ruster_core::ipv4_header_checksum(&bytes[14..34]);
+    bytes[24..26].copy_from_slice(&checksum.to_be_bytes());
+    bytes[34..36].copy_from_slice(&40_000_u16.to_be_bytes());
+    bytes[36..38].copy_from_slice(&9_u16.to_be_bytes());
+    bytes[38..40].copy_from_slice(&u16::try_from(8 + payload_len).expect("short").to_be_bytes());
+    bytes[42..].copy_from_slice(FORWARD_MARKER);
+    bytes
+}
+
+fn engine(session: &mut NativeSession, domain: u128) -> RxFillEngine<'_> {
+    RxFillEngine::new(
+        session.take_datapath().expect("first datapath take"),
+        UmemDomainId::new(NonZeroU128::new(domain).expect("nonzero")),
+        RxFillConfig::new(NonZeroU32::new(64).expect("nonzero")),
+    )
+    .expect("engine over the live mappings")
+}
+
+fn adapter_session_config(device: &str) -> SessionConfig {
+    // One queue per veth end in this phase: the peer's TX always lands on
+    // the bound queue 0.
+    session_config(device, 0, XDP_COPY)
+}
+
+#[test]
+fn priv_xdp_adapter_forwards_between_two_veth_ports_through_core_and_drains() {
+    let Some(_device) = requested(Some("adapter")) else {
+        return;
+    };
+    let port_a = required("RUSTER_PRIV_XDP_FWD_A");
+    let peer_a = required("RUSTER_PRIV_XDP_FWD_A_PEER");
+    let port_b = required("RUSTER_PRIV_XDP_FWD_B");
+    let peer_b = required("RUSTER_PRIV_XDP_FWD_B_PEER");
+    for device in [&port_a, &port_b] {
+        assert_eq!(attached_program(device), None, "veth starts without XDP");
+    }
+    let (mac_a, mac_b, mac_peer_b) = (
+        device_mac(&port_a),
+        device_mac(&port_b),
+        device_mac(&peer_b),
+    );
+    let lan = IfId(1);
+    let wan = IfId(2);
+    let mut session_a = open_after_release(&adapter_session_config(&port_a));
+    let mut session_b = open_after_release(&adapter_session_config(&port_b));
+    for session in [&mut session_a, &mut session_b] {
+        assert_eq!(session.mode(), NegotiatedMode::Copy);
+        assert_eq!(session.mtu(), 1_500, "veth default MTU from sysfs");
+        session
+            .attach_xdp(XdpAttachMode::Native)
+            .expect("native attach on veth");
+    }
+    let config_a = XdpPortConfig::new(lan, session_a.queue(), session_a.mode(), session_a.mtu());
+    let config_b = XdpPortConfig::new(wan, session_b.queue(), session_b.mode(), session_b.mtu());
+    assert_eq!(config_a.max_frame_len(), 1_514);
+    {
+        let mut io = XdpPacketIo::new([
+            XdpPort::new(config_b, engine(&mut session_b, 0x5462)),
+            XdpPort::new(config_a, engine(&mut session_a, 0x5461)),
+        ])
+        .expect("adapter");
+        let ip = Ipv4Address::from_octets;
+        let routes = [
+            Route::new(ip([192, 0, 2, 0]), 24, lan, None).expect("route"),
+            Route::new(ip([198, 51, 100, 0]), 24, wan, None).expect("route"),
+        ];
+        let interfaces = [
+            Interface {
+                id: lan,
+                mac: MacAddress(mac_a),
+            },
+            Interface {
+                id: wan,
+                mac: MacAddress(mac_b),
+            },
+        ];
+        let neighbors = [Neighbor {
+            interface: wan,
+            target: ip(FORWARD_TARGET),
+            mac: MacAddress(mac_peer_b),
+        }];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).expect("snapshot");
+
+        let mut receiver = Command::new("python3")
+            .args(["-I", "-c", RAW_RECEIVE, &peer_b, &hex(FORWARD_MARKER), "8"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn the peer B receiver");
+        let mut stdout = BufReader::new(receiver.stdout.take().expect("piped stdout"));
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("receiver ready line");
+        assert_eq!(line.trim(), "ready", "receiver did not start");
+
+        let original = forward_frame(mac_a);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut sent = 0_u32;
+        while io.port_stats(wan).expect("WAN").counters.cross_port_copies == 0 {
+            if sent < 50 {
+                let status = Command::new("python3")
+                    .args(["-I", "-c", RAW_SEND, &peer_a, &hex(&original)])
+                    .status()
+                    .expect("run the peer A sender");
+                assert!(status.success(), "raw send from {peer_a} failed");
+                sent += 1;
+            }
+            sleep(Duration::from_millis(20));
+            let report = forward_batch(io.receive(64).expect("receive"), &snapshot, &mut NoTrace);
+            assert!(report.invariants_hold(), "{report:?}");
+            assert_eq!(report.completion.error, None, "{report:?}");
+            for interface in [lan, wan] {
+                io.engine(interface).expect("port").audit().expect("audit");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no frame forwarded A -> B within five seconds: {:?}",
+                io.backend_stats()
+            );
+        }
+        let mut forwarded = String::new();
+        stdout.read_line(&mut forwarded).expect("forwarded frame");
+        assert!(
+            receiver.wait().expect("receiver exit").success(),
+            "peer B never received the forwarded frame"
+        );
+        let bytes = unhex(forwarded.trim());
+        assert_eq!(bytes.len(), original.len(), "exact length on the wire");
+        assert_eq!(&bytes[0..6], &mac_peer_b, "next-hop MAC");
+        assert_eq!(&bytes[6..12], &mac_b, "egress port MAC");
+        assert_eq!(bytes[22], 63, "TTL decremented once");
+        assert_eq!(
+            ruster_core::internet_checksum(&bytes[14..34]),
+            0,
+            "IPv4 checksum updated"
+        );
+        assert_eq!(
+            &bytes[34..],
+            &original[34..],
+            "UDP header and payload intact"
+        );
+
+        let stats = io.backend_stats();
+        assert_eq!(stats.ports, 2);
+        assert_eq!(stats.copy_ports, 2);
+        let wan_stats = io.port_stats(wan).expect("WAN");
+        assert!(wan_stats.counters.cross_port_copies >= 1, "{wan_stats:?}");
+        assert!(wan_stats.counters.tx_kicks >= 1, "{wan_stats:?}");
+        assert!(
+            wan_stats.tx_need_wakeup,
+            "copy mode keeps asking for sendto"
+        );
+        assert_eq!(stats.counters.tx_over_mtu, 0);
+        assert_eq!(stats.counters.tx_invalid_completions, 0);
+
+        // Ordered shutdown of both ports.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let report = loop {
+            let report = io.drain(16).expect("drain");
+            if report.is_drained() {
+                break report;
+            }
+            assert!(Instant::now() < deadline, "drain timed out: {report:?}");
+            sleep(Duration::from_millis(10));
+        };
+        assert_eq!(report.tx_in_flight, 0);
+        for interface in [lan, wan] {
+            let engine = io.engine(interface).expect("port");
+            engine.audit().expect("audit after drain");
+            assert_eq!(engine.tx_inflight(), 0);
+            assert_eq!(engine.generated_accounting().free, 64);
+            assert_eq!(engine.frame_accounting().total(), 192);
+        }
+        assert!(matches!(io.receive(1), Err(XdpIoError::Stopped)));
+        eprintln!(
+            "priv_xdp_adapter: {} raw frames sent, {} cross-port copies, {} completed before the drain",
+            sent, wan_stats.counters.cross_port_copies, wan_stats.counters.tx_completed
+        );
+    }
+    session_a.close().expect("port A teardown");
+    session_b.close().expect("port B teardown");
+    wait_detached(&port_a);
+    wait_detached(&port_b);
+    eprintln!(
+        "priv_xdp_adapter: a frame from veth A was forwarded by core through the adapter, \
+         copied into port B's generated pool, transmitted on veth B with the rewritten MACs and \
+         TTL, received by B's peer, and both ports drained verified"
     );
 }
 

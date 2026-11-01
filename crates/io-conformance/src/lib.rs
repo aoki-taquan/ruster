@@ -146,6 +146,17 @@ pub trait RxHarness: Sized {
     type Io: PacketIo;
     type Observer: LeaseObserver;
 
+    /// Egress of every commit case. The default, [`CONFORMANCE_WAN`],
+    /// commits across interfaces. A backend whose in-place, same-frame TX
+    /// exists only on the ingress interface (AF_XDP with one UMEM per
+    /// interface copies across interfaces) selects [`CONFORMANCE_LAN`] so
+    /// the cases check its in-place path; its cross-interface path then
+    /// needs its own tests.
+    const COMMIT_EGRESS: IfId = CONFORMANCE_WAN;
+    /// Shortest frame the backend lends (for example an Ethernet header).
+    /// Cases zero-pad their marker frames to this length.
+    const MIN_FRAME_LEN: usize = 1;
+
     fn new() -> Self;
     fn io_and_observer(&mut self) -> (&mut Self::Io, &mut Self::Observer);
     fn inject_rx(&mut self, ingress: IfId, bytes: Vec<u8>) -> LiveFrame;
@@ -245,12 +256,20 @@ pub mod rx {
     };
 
     const LAN: IfId = CONFORMANCE_LAN;
-    const WAN: IfId = CONFORMANCE_WAN;
+
+    /// A marker frame padded with zeros to the harness's shortest frame.
+    fn frame<H: RxHarness>(marker: &[u8]) -> Vec<u8> {
+        let mut bytes = marker.to_vec();
+        if bytes.len() < H::MIN_FRAME_LEN {
+            bytes.resize(H::MIN_FRAME_LEN, 0);
+        }
+        bytes
+    }
 
     fn expected_endpoint(egress: IfId) -> TxEndpoint {
         match egress {
             LAN => CONFORMANCE_LAN_ENDPOINT,
-            WAN => CONFORMANCE_WAN_ENDPOINT,
+            CONFORMANCE_WAN => CONFORMANCE_WAN_ENDPOINT,
             _ => panic!("unknown conformance endpoint"),
         }
     }
@@ -294,9 +313,9 @@ pub mod rx {
     pub fn budget_and_unleased_slots_are_exact<H: RxHarness>() {
         let mut harness = H::new();
         let injected = [
-            harness.inject_rx(LAN, vec![1, 0xa1]),
-            harness.inject_rx(LAN, vec![2, 0xa2]),
-            harness.inject_rx(LAN, vec![3, 0xa3]),
+            harness.inject_rx(LAN, frame::<H>(&[1, 0xa1])),
+            harness.inject_rx(LAN, frame::<H>(&[2, 0xa2])),
+            harness.inject_rx(LAN, frame::<H>(&[3, 0xa3])),
         ];
         assert_distinct_live(&injected);
 
@@ -361,8 +380,8 @@ pub mod rx {
 
     pub fn commit_is_submitted_in_place_with_exact_descriptor<H: RxHarness>() {
         let mut harness = H::new();
-        let endpoint = expected_endpoint(WAN);
-        let injected = harness.inject_rx(LAN, vec![0x10, 0x20, 0x30]);
+        let endpoint = expected_endpoint(H::COMMIT_EGRESS);
+        let injected = harness.inject_rx(LAN, frame::<H>(&[0x10, 0x20, 0x30]));
         let completion = {
             let (io, observer) = harness.io_and_observer();
             let mut batch = match io.receive(1) {
@@ -374,7 +393,7 @@ pub mod rx {
             let observed = observer.observe(packet.bytes_mut());
             assert_eq!(observed, injected);
             packet.bytes_mut()[1] = 0x99;
-            packet.commit(WAN);
+            packet.commit(H::COMMIT_EGRESS);
             batch.finish()
         };
         assert_eq!(
@@ -388,7 +407,7 @@ pub mod rx {
         );
         let events = harness.drain_rx_events();
         assert_event_bindings(&[injected], &events);
-        assert_eq!(events[0].bytes, [0x10, 0x99, 0x30]);
+        assert_eq!(events[0].bytes, frame::<H>(&[0x10, 0x99, 0x30]));
         assert_eq!(
             events[0].kind,
             RxEventKind::TxSubmitted {
@@ -401,9 +420,9 @@ pub mod rx {
     pub fn recycle_consume_and_abandon_are_distinct<H: RxHarness>() {
         let mut harness = H::new();
         let injected = [
-            harness.inject_rx(LAN, vec![1, 0x11]),
-            harness.inject_rx(LAN, vec![2, 0x22]),
-            harness.inject_rx(LAN, vec![3, 0x33]),
+            harness.inject_rx(LAN, frame::<H>(&[1, 0x11])),
+            harness.inject_rx(LAN, frame::<H>(&[2, 0x22])),
+            harness.inject_rx(LAN, frame::<H>(&[3, 0x33])),
         ];
         assert_distinct_live(&injected);
         let completion = {
@@ -441,11 +460,11 @@ pub mod rx {
     pub fn partial_reject_reclaims_exact_tokens<H: RxHarness>() {
         let mut harness = H::new();
         harness.set_rx_accept_budget(1);
-        let endpoint = expected_endpoint(WAN);
+        let endpoint = expected_endpoint(H::COMMIT_EGRESS);
         let injected = [
-            harness.inject_rx(LAN, vec![1, 0x41]),
-            harness.inject_rx(LAN, vec![2, 0x42]),
-            harness.inject_rx(LAN, vec![3, 0x43]),
+            harness.inject_rx(LAN, frame::<H>(&[1, 0x41])),
+            harness.inject_rx(LAN, frame::<H>(&[2, 0x42])),
+            harness.inject_rx(LAN, frame::<H>(&[3, 0x43])),
         ];
         assert_distinct_live(&injected);
         let completion = {
@@ -457,7 +476,7 @@ pub mod rx {
             while let Some(mut packet) = batch.next_packet() {
                 let observed = observer.observe(packet.bytes_mut());
                 assert!(injected.contains(&observed));
-                packet.commit(WAN);
+                packet.commit(H::COMMIT_EGRESS);
             }
             batch.finish()
         };
@@ -491,7 +510,7 @@ pub mod rx {
                 .filter(|event| {
                     event.kind
                         == RxEventKind::TxRejected {
-                            attempted_egress: WAN,
+                            attempted_egress: H::COMMIT_EGRESS,
                             endpoint: Some(endpoint),
                         }
                 })
@@ -502,7 +521,7 @@ pub mod rx {
 
     pub fn receive_error_preserves_queued_ownership<H: RxReceiveErrorHarness>() {
         let mut harness = H::new();
-        let injected = harness.inject_rx(LAN, vec![0x51, 0x52]);
+        let injected = harness.inject_rx(LAN, frame::<H>(&[0x51, 0x52]));
         harness.fail_next_receive();
         let receive_failed = {
             let (io, _) = harness.io_and_observer();
@@ -530,9 +549,9 @@ pub mod rx {
         harness.set_rx_accept_budget(1);
         harness.fail_next_rx_finish();
         let injected = [
-            harness.inject_rx(LAN, vec![0x61]),
-            harness.inject_rx(LAN, vec![0x62]),
-            harness.inject_rx(LAN, vec![0x63]),
+            harness.inject_rx(LAN, frame::<H>(&[0x61])),
+            harness.inject_rx(LAN, frame::<H>(&[0x62])),
+            harness.inject_rx(LAN, frame::<H>(&[0x63])),
         ];
         let completion = {
             let (io, observer) = harness.io_and_observer();
@@ -542,7 +561,7 @@ pub mod rx {
             };
             while let Some(mut packet) = batch.next_packet() {
                 assert!(injected.contains(&observer.observe(packet.bytes_mut())));
-                packet.commit(WAN);
+                packet.commit(H::COMMIT_EGRESS);
             }
             batch.finish()
         };
@@ -554,8 +573,8 @@ pub mod rx {
 
     pub fn completion_advances_the_exact_submitted_token<H: RxCompletionHarness>() {
         let mut harness = H::new();
-        let endpoint = expected_endpoint(WAN);
-        let injected = harness.inject_rx(LAN, vec![0x71, 0x72]);
+        let endpoint = expected_endpoint(H::COMMIT_EGRESS);
+        let injected = harness.inject_rx(LAN, frame::<H>(&[0x71, 0x72]));
         {
             let (io, observer) = harness.io_and_observer();
             let mut batch = match io.receive(1) {
@@ -564,7 +583,7 @@ pub mod rx {
             };
             let mut packet = batch.next_packet().expect("RX lease");
             assert_eq!(observer.observe(packet.bytes_mut()), injected);
-            packet.commit(WAN);
+            packet.commit(H::COMMIT_EGRESS);
             assert_eq!(batch.finish().tx_accepted, 1);
         }
         let events = harness.drain_rx_events();
@@ -586,8 +605,8 @@ pub mod rx {
         let mut last_generation = BTreeMap::<u64, u64>::new();
         for cycle in 0_u8..4 {
             let injected = [
-                harness.inject_rx(LAN, vec![cycle, 1]),
-                harness.inject_rx(LAN, vec![cycle, 2]),
+                harness.inject_rx(LAN, frame::<H>(&[cycle, 1])),
+                harness.inject_rx(LAN, frame::<H>(&[cycle, 2])),
             ];
             for frame in injected {
                 if let Some(previous) =
@@ -608,7 +627,7 @@ pub mod rx {
                 };
                 while let Some(mut packet) = batch.next_packet() {
                     assert!(injected.contains(&observer.observe(packet.bytes_mut())));
-                    packet.commit(WAN);
+                    packet.commit(H::COMMIT_EGRESS);
                 }
                 assert_eq!(batch.finish().tx_rejected, 2);
             }
@@ -625,7 +644,7 @@ pub mod rx {
     pub fn unknown_egress_is_rejected_without_submission<H: RxUnknownEgressHarness>() {
         let mut harness = H::new();
         let unknown = CONFORMANCE_UNKNOWN;
-        let injected = harness.inject_rx(LAN, vec![0x81]);
+        let injected = harness.inject_rx(LAN, frame::<H>(&[0x81]));
         let completion = {
             let (io, observer) = harness.io_and_observer();
             let mut batch = match io.receive(1) {
@@ -654,7 +673,7 @@ pub mod rx {
         harness.set_rx_accept_budget(1);
         let baseline = harness.free_rx_frames();
         assert!(baseline >= 1);
-        let first = harness.inject_rx(LAN, vec![0x91, 0x92]);
+        let first = harness.inject_rx(LAN, frame::<H>(&[0x91, 0x92]));
         assert_eq!(harness.free_rx_frames() + 1, baseline);
         {
             let (io, observer) = harness.io_and_observer();
@@ -664,7 +683,7 @@ pub mod rx {
             };
             let mut packet = batch.next_packet().expect("RX lease");
             assert_eq!(observer.observe(packet.bytes_mut()), first);
-            packet.commit(WAN);
+            packet.commit(H::COMMIT_EGRESS);
             assert_eq!(batch.finish().tx_accepted, 1);
         }
         let events = harness.drain_rx_events();
@@ -672,7 +691,7 @@ pub mod rx {
         assert_eq!(
             events[0].kind,
             RxEventKind::TxSubmitted {
-                endpoint: expected_endpoint(WAN),
+                endpoint: expected_endpoint(H::COMMIT_EGRESS),
                 descriptor_len: first.requested_len,
             }
         );
@@ -685,7 +704,7 @@ pub mod rx {
             harness.complete_rx_submissions(),
             [super::TxCompletion {
                 frame: first,
-                endpoint: expected_endpoint(WAN),
+                endpoint: expected_endpoint(H::COMMIT_EGRESS),
             }]
         );
         assert_eq!(
@@ -694,7 +713,8 @@ pub mod rx {
             "CQ-observed RX frame was not returned to the free pool"
         );
 
-        let second = harness.inject_rx_from_free_frame(first.token.frame_id, LAN, vec![0x93, 0x94]);
+        let second =
+            harness.inject_rx_from_free_frame(first.token.frame_id, LAN, frame::<H>(&[0x93, 0x94]));
         assert_eq!(second.token.frame_id, first.token.frame_id);
         assert!(
             second.token.generation > first.token.generation,
@@ -727,9 +747,9 @@ pub mod rx {
         let baseline = harness.free_rx_frames();
         assert!(baseline >= 3);
         let injected = [
-            harness.inject_rx(LAN, vec![0xc1]),
-            harness.inject_rx(LAN, vec![0xc2]),
-            harness.inject_rx(LAN, vec![0xc3]),
+            harness.inject_rx(LAN, frame::<H>(&[0xc1])),
+            harness.inject_rx(LAN, frame::<H>(&[0xc2])),
+            harness.inject_rx(LAN, frame::<H>(&[0xc3])),
         ];
         assert_distinct_live(&injected);
         assert_eq!(harness.free_rx_frames() + injected.len(), baseline);
@@ -742,7 +762,7 @@ pub mod rx {
             };
             let mut packet = batch.next_packet().expect("committed RX lease");
             assert_eq!(observer.observe(packet.bytes_mut()), injected[0]);
-            packet.commit(WAN);
+            packet.commit(H::COMMIT_EGRESS);
             drop(batch);
         }
 
@@ -753,7 +773,7 @@ pub mod rx {
                 endpoint,
                 descriptor_len,
             } => {
-                assert_eq!(endpoint, expected_endpoint(WAN));
+                assert_eq!(endpoint, expected_endpoint(H::COMMIT_EGRESS));
                 assert_eq!(descriptor_len, injected[0].requested_len);
                 assert_eq!(
                     harness.free_rx_frames() + injected.len(),
@@ -766,8 +786,8 @@ pub mod rx {
                 attempted_egress,
                 endpoint,
             } => {
-                assert_eq!(attempted_egress, WAN);
-                assert_eq!(endpoint, Some(expected_endpoint(WAN)));
+                assert_eq!(attempted_egress, H::COMMIT_EGRESS);
+                assert_eq!(endpoint, Some(expected_endpoint(H::COMMIT_EGRESS)));
                 assert_eq!(harness.free_rx_frames() + 2, baseline);
                 false
             }
@@ -815,7 +835,7 @@ pub mod rx {
                 completions,
                 [super::TxCompletion {
                     frame: injected[0],
-                    endpoint: expected_endpoint(WAN),
+                    endpoint: expected_endpoint(H::COMMIT_EGRESS),
                 }]
             );
         } else {

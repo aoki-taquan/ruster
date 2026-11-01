@@ -203,6 +203,9 @@ pub enum SessionStage {
     /// (`/sys/class/net/<dev>/queues/tx-<queue>`) after proving that the
     /// sysfs view's `ifindex` is the resolved device.
     TxQueueCheck,
+    /// The device MTU (`/sys/class/net/<dev>/mtu`, through the same proven
+    /// sysfs view as [`Self::TxQueueCheck`]), which bounds TX length.
+    MtuProbe,
     /// `socket(AF_XDP, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)`.
     OpenSocket,
     /// Anonymous page-aligned UMEM `mmap`.
@@ -307,6 +310,9 @@ pub enum SessionFailure {
     /// the resolved one (a stale sysfs view after `setns`, or a rename
     /// race), or sysfs could not be read. Fails closed.
     TxQueueUnverifiable,
+    /// The device MTU could not be read from the proven sysfs view (or was
+    /// zero). Fails closed: without it TX length cannot be bounded.
+    MtuUnverifiable,
     /// The negotiated mode differs from the explicitly bound copy policy.
     NegotiatedModeMismatch {
         /// Mode reported by the kernel.

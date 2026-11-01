@@ -38,6 +38,7 @@ mod tx_completion;
 use std::{fmt, num::NonZeroU32};
 
 use generated::GeneratedPool;
+pub(crate) use generated::ZeroFill;
 pub use generated::{
     GeneratedAccounting, GeneratedAllocError, GeneratedCounters, GeneratedFrame,
     GeneratedRejectReason,
@@ -178,8 +179,10 @@ pub struct RxFillCounters {
     /// Refills whose Fill flags word had unknown bits.
     pub fill_flag_errors: u64,
     /// Frames permanently removed from reuse (out-of-profile kernel return
-    /// on RX or Completion, or generation exhaustion). This, not
-    /// starvation, is where pool shrinkage is observed.
+    /// on RX or Completion, or generation exhaustion) in either pool: the
+    /// RX pool and the generated pool both count here, and
+    /// [`GeneratedAccounting::quarantined`] is the generated share. This,
+    /// not starvation, is where pool shrinkage is observed.
     pub frames_quarantined: u64,
     /// Runt frames (shorter than an Ethernet header) recycled to the pool.
     pub rx_runts_recycled: u64,
@@ -1262,21 +1265,9 @@ impl<'memory> RxBatch<'_, 'memory> {
         if self.remaining == 0 {
             return None;
         }
-        let state = &mut self.engine.state;
-        let token = state.pending.pop()?;
-        let descriptor = state
-            .frames
-            .ledger_mut()
-            .lease_rx(token)
-            .expect("pending holds RxAvailable tokens");
+        let lease = self.engine.lease_pending()?;
         self.remaining -= 1;
-        bump(&mut state.counters.rx_leased);
-        Some(RxFrame {
-            engine: &mut *self.engine,
-            token,
-            descriptor,
-            resolved: false,
-        })
+        Some(self.engine.resume_rx(lease))
     }
 
     /// Valid frames this batch can still lend.
@@ -1293,6 +1284,83 @@ impl<'memory> RxBatch<'_, 'memory> {
     /// The completion reap that preceded the refill.
     pub const fn completions(&self) -> CompletionReport {
         self.completions
+    }
+}
+
+/// One lent frame (received or generated) recorded by value.
+///
+/// The core adapter (`packet_io`) keeps a lease across borrows of other
+/// ports' engines, which a borrowing [`RxFrame`] or [`GeneratedFrame`]
+/// cannot do. The value is move-only and has no public constructor: only
+/// [`RxFillEngine::lease_pending`] and `allocate_generated_raw` create it,
+/// [`RxFillEngine::resume_rx`] and `resume_generated` consume it into the
+/// borrowing view whose end (recycle, stage, cancel, or drop) frees it
+/// through the same accounting as a directly lent frame. Byte access goes
+/// through the same ledger-gated view and panics if the lease does not
+/// name a `Leased` frame of that engine (a lease is never used on another
+/// engine: the adapter stores it with its port index).
+#[derive(Debug)]
+pub(crate) struct RawLease {
+    token: FrameToken,
+    descriptor: ValidatedDescriptor,
+}
+
+impl RawLease {
+    /// Visible length.
+    pub(crate) const fn len(&self) -> u32 {
+        self.descriptor.len()
+    }
+
+    /// Ledger ownership cycle.
+    #[cfg(test)]
+    pub(crate) const fn token(&self) -> FrameToken {
+        self.token
+    }
+}
+
+impl<'memory> RxFillEngine<'memory> {
+    /// Leases the next pending (validated, unlent) RX frame by value.
+    ///
+    /// Not bounded by a batch budget: the caller ([`RxBatch::next_frame`]
+    /// or the core adapter) bounds the number of calls by what one
+    /// [`Self::poll`] made lendable.
+    pub(crate) fn lease_pending(&mut self) -> Option<RawLease> {
+        let state = &mut self.state;
+        let token = state.pending.pop()?;
+        let descriptor = state
+            .frames
+            .ledger_mut()
+            .lease_rx(token)
+            .expect("pending holds RxAvailable tokens");
+        bump(&mut state.counters.rx_leased);
+        Some(RawLease { token, descriptor })
+    }
+
+    /// The visible bytes of a lease of this engine.
+    pub(crate) fn lease_bytes(&self, lease: &RawLease) -> &[u8] {
+        self.state
+            .frames
+            .leased_bytes(lease.token, lease.descriptor)
+            .expect("a live lease of this engine owns its Leased frame")
+    }
+
+    /// The visible bytes of a lease of this engine, for writing.
+    pub(crate) fn lease_bytes_mut(&mut self, lease: &RawLease) -> &mut [u8] {
+        self.state
+            .frames
+            .leased_bytes_mut(lease.token, lease.descriptor)
+            .expect("a live lease of this engine owns its Leased frame")
+    }
+
+    /// Turns an RX lease back into the borrowing view that ends it.
+    pub(crate) fn resume_rx(&mut self, lease: RawLease) -> RxFrame<'_, 'memory> {
+        debug_assert!(!self.state.is_generated(lease.token.frame().index()));
+        RxFrame {
+            engine: self,
+            token: lease.token,
+            descriptor: lease.descriptor,
+            resolved: false,
+        }
     }
 }
 

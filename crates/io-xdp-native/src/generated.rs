@@ -39,7 +39,7 @@ use std::fmt;
 
 use ruster_io_xdp::{FrameId, FrameToken, LedgerError, RawDescriptor, ValidatedDescriptor};
 
-use super::{bump, EngineState, RxFillEngine, TxHandoff, ETHERNET_HEADER_LEN};
+use super::{bump, EngineState, RawLease, RxFillEngine, TxHandoff, ETHERNET_HEADER_LEN};
 use crate::{TxRejected, TxSubmitReport};
 
 /// Why a generated allocation was refused for its arguments or the engine
@@ -129,8 +129,15 @@ impl std::error::Error for GeneratedAllocError {}
 ///
 /// - `generated_allocated == generated_committed + generated_cancelled +
 ///   generated_abandoned + H + L`
-/// - `generated_committed == generated_completed + generated_inflight +`
-///   generated frames quarantined after TX
+/// - `generated_committed == generated_completed + generated_inflight +
+///   generated_quarantined_after_tx`
+///
+/// `RxFillCounters::frames_quarantined` counts quarantined frames of both
+/// pools (an out-of-profile RX or completion return, or an exhausted
+/// generation, in either pool); [`GeneratedAccounting::quarantined`] is
+/// the generated pool's current share, and `generated_quarantined_after_tx`
+/// the part that a completion with a mismatched address removed after a
+/// commit.
 ///
 /// Refusals (`generated_unavailable`, `generated_rejected`) never allocate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -155,6 +162,10 @@ pub struct GeneratedCounters {
     /// Generated frames currently published to TX and not completed. Part
     /// of, never in addition to, `TxCounters::tx_inflight`.
     pub generated_inflight: u32,
+    /// Committed generated frames whose completion named an address other
+    /// than the submitted one, so the frame was quarantined instead of
+    /// freed. Also counted in `RxFillCounters::frames_quarantined`.
+    pub generated_quarantined_after_tx: u64,
     generated_rejected: [u64; GeneratedRejectReason::COUNT],
 }
 
@@ -203,6 +214,15 @@ impl GeneratedAccounting {
     pub const fn total(self) -> u32 {
         self.free + self.leased + self.tx_handoffs + self.tx_in_flight + self.quarantined
     }
+}
+
+/// Whether a generated allocation zeroes its visible bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ZeroFill {
+    /// Zero them (every public allocation).
+    Zero,
+    /// The caller overwrites every visible byte at once.
+    Overwritten,
 }
 
 /// Generated-pool owners the free list and the in-flight gauge do not
@@ -261,6 +281,22 @@ impl<'memory> RxFillEngine<'memory> {
         &mut self,
         len: usize,
     ) -> Result<GeneratedFrame<'_, 'memory>, GeneratedAllocError> {
+        let lease = self.allocate_generated_raw(len, ZeroFill::Zero)?;
+        Ok(self.resume_generated(lease))
+    }
+
+    /// [`Self::allocate_generated`] by value, for the core adapter.
+    ///
+    /// [`ZeroFill::Overwritten`] skips zeroing the visible bytes. It is
+    /// only for a caller that overwrites every visible byte before the
+    /// lease can end or be observed (the adapter's cross-port copy, which
+    /// copies exactly `len` bytes right after allocation): otherwise bytes
+    /// of an earlier packet could reach the wire.
+    pub(crate) fn allocate_generated_raw(
+        &mut self,
+        len: usize,
+        zero: ZeroFill,
+    ) -> Result<RawLease, GeneratedAllocError> {
         let state = &mut self.state;
         if state.draining {
             return Err(state.reject(GeneratedRejectReason::Draining));
@@ -306,17 +342,25 @@ impl<'memory> RxFillEngine<'memory> {
         };
         state.generated.leased += 1;
         bump(&mut state.generated_counters.generated_allocated);
-        state
-            .frames
-            .leased_bytes_mut(token, descriptor)
-            .expect("a just-leased generated frame")
-            .fill(0);
-        Ok(GeneratedFrame {
+        if zero == ZeroFill::Zero {
+            state
+                .frames
+                .leased_bytes_mut(token, descriptor)
+                .expect("a just-leased generated frame")
+                .fill(0);
+        }
+        Ok(RawLease { token, descriptor })
+    }
+
+    /// Turns a generated lease back into the borrowing view that ends it.
+    pub(crate) fn resume_generated(&mut self, lease: RawLease) -> GeneratedFrame<'_, 'memory> {
+        debug_assert!(self.state.is_generated(lease.token.frame().index()));
+        GeneratedFrame {
             engine: self,
-            token,
-            descriptor,
+            token: lease.token,
+            descriptor: lease.descriptor,
             resolved: false,
-        })
+        }
     }
 
     /// Generated-pool counter snapshot.
@@ -510,6 +554,34 @@ impl RxFillEngine<'_> {
     /// Lists a frame in the generated free list behind the ledger's back.
     pub(crate) fn push_generated_free_entry_for_test(&mut self, frame: u32) -> bool {
         self.state.generated_free.push(frame)
+    }
+
+    /// Moves `frame` to the head of the generated free list (a rotation of
+    /// the FIFO; the ledger is untouched), so the next allocation selects
+    /// it. Returns whether the frame was free.
+    pub(crate) fn prefer_generated_free_for_test(&mut self, frame: u32) -> bool {
+        let free = &mut self.state.generated_free;
+        let len = free.len();
+        if !free.iter().any(|entry| entry == frame) {
+            return false;
+        }
+        for _ in 0..len {
+            let head = free.pop().expect("nonempty");
+            if head == frame {
+                // Put it back at the head by rotating the rest behind it.
+                let pushed = free.push(head);
+                debug_assert!(pushed);
+                for _ in 1..len {
+                    let next = free.pop().expect("nonempty");
+                    let pushed = free.push(next);
+                    debug_assert!(pushed);
+                }
+                return true;
+            }
+            let pushed = free.push(head);
+            debug_assert!(pushed);
+        }
+        false
     }
 
     /// Skews the generated handoff record behind the ledger's back.
