@@ -595,7 +595,7 @@ fn native_corrupt_cursor_is_typed_and_atomic() {
 
 #[test]
 fn native_session_config_rejects_invalid_names_and_shared_umem() {
-    use crate::{SessionConfig, SessionConfigError, INTERFACE_NAME_CAPACITY};
+    use crate::{SessionConfig, SessionConfigError, INTERFACE_NAME_CAPACITY, MAX_QUEUE_ID};
 
     let flags = ValidatedBindFlags::new(XDP_USE_NEED_WAKEUP | XDP_COPY).expect("copy flags");
     let rings = RingConfig::new(64, 64, 64, 64).expect("rings");
@@ -649,4 +649,18 @@ fn native_session_config_rejects_invalid_names_and_shared_umem() {
         SessionConfig::new("veth0", 0, shared, rings, umem),
         Err(SessionConfigError::SharedUmemUnsupported)
     );
+
+    // Linux v6.8 truncates the bound queue id to u16; reject before it can
+    // silently bind queue `id & 0xffff`.
+    assert_eq!(MAX_QUEUE_ID, 65_535);
+    assert_eq!(
+        SessionConfig::new("veth0", MAX_QUEUE_ID, flags, rings, umem).map(|config| config.queue()),
+        Ok(MAX_QUEUE_ID)
+    );
+    for queue in [MAX_QUEUE_ID + 1, u32::MAX] {
+        assert_eq!(
+            SessionConfig::new("veth0", queue, flags, rings, umem),
+            Err(SessionConfigError::QueueOutOfRange { queue })
+        );
+    }
 }

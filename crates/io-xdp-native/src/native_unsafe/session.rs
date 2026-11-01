@@ -11,7 +11,7 @@
 //! acquisition order, so dropping a live session releases the four ring
 //! mappings (TX, RX, Completion, Fill), then the UMEM, then the socket.
 
-use std::mem::size_of;
+use std::{marker::PhantomData, mem::size_of};
 
 use crate::{
     abi::{
@@ -30,8 +30,8 @@ use crate::{
 };
 
 use super::syscall::{
-    errno, interface_index, LinuxSyscalls, MappedRegion, MapsRealMemory, OwnedXdpFd, ResourceError,
-    IFNAMSIZ, PAGE_SIZE,
+    errno, interface_index, Errno, LinuxSyscalls, MappedRegion, MapsRealMemory, OwnedXdpFd,
+    ResourceError, SyscallError, IFNAMSIZ, PAGE_SIZE,
 };
 
 const _: [(); IFNAMSIZ] = [(); crate::session::INTERFACE_NAME_CAPACITY];
@@ -54,6 +54,10 @@ pub(super) fn classify(
     let failure = match error {
         ResourceError::Platform(platform) => SessionFailure::Platform(platform),
         ResourceError::Argument(_) => SessionFailure::ArgumentOutOfRange,
+        ResourceError::Syscall(SyscallError {
+            errno: Errno::ArgumentRejected,
+            ..
+        }) => SessionFailure::ArgumentOutOfRange,
         ResourceError::Syscall(syscall) => match syscall.errno.raw() {
             None => SessionFailure::UnreadableErrno,
             Some(errno::EPERM | errno::EACCES) => SessionFailure::PermissionDenied,
@@ -270,12 +274,22 @@ pub(super) struct SessionCore<'s, S: MapsRealMemory> {
 impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
     /// Runs the complete transaction, including the `auto` fallback.
     ///
-    /// `auto` binds with `XDP_ZEROCOPY` first. Only `EOPNOTSUPP` from that
-    /// bind — the driver lacks `ndo_bpf`/`ndo_xsk_wakeup` or rejects
-    /// `XDP_SETUP_XSK_POOL` as unsupported — releases the whole first
-    /// attempt in reverse order and runs a fresh transaction with
-    /// `XDP_COPY`. Every other failure, including `EINVAL`, `EBUSY`, and
+    /// `auto` binds with `XDP_ZEROCOPY` first. Linux v6.8 `xp_assign_dev`
+    /// decides zero-copy support in order: the device must advertise the
+    /// complete `NETDEV_XDP_ACT_ZC` `xdp_features` set (else `EOPNOTSUPP`),
+    /// an `XDP_USE_SG` bind needs `xdp_zc_max_segs > 1` (never requested by
+    /// this profile), and finally the driver's
+    /// `ndo_bpf(XDP_SETUP_XSK_POOL)` return value is passed through. Only
+    /// `EOPNOTSUPP` from that bind releases the whole first attempt in
+    /// reverse order and runs a fresh transaction with `XDP_COPY`. Any
+    /// other driver or kernel failure, including `EINVAL`, `EBUSY`, and
     /// `ENOMEM`, fails closed without fallback.
+    ///
+    /// The fresh attempt registers a second UMEM while the kernel may still
+    /// account the first one: Linux releases UMEM pinning and memlock
+    /// accounting from deferred work after the socket is freed. Without
+    /// `CAP_IPC_LOCK`, `auto` therefore needs `RLIMIT_MEMLOCK` of at least
+    /// twice the UMEM size, or the fallback fails with `MemlockLimit`.
     pub(super) fn open(syscalls: &'s S, config: &SessionConfig) -> Result<Self, SessionError> {
         let ifindex = interface_index(syscalls, config.interface_name_bytes())
             .map_err(at(SessionStage::InterfaceLookup))?;
@@ -582,11 +596,17 @@ static LINUX_SYSCALLS: LinuxSyscalls = LinuxSyscalls;
 /// attached, so the socket receives nothing until a later slice redirects a
 /// queue to it.
 ///
-/// The session is `!Send` and `!Sync`: one worker owns its rings.
+/// The session is `!Send` and `!Sync` through an explicit marker: one
+/// worker owns its rings.
 ///
 /// ```compile_fail
 /// fn send<T: Send>() {}
 /// send::<ruster_io_xdp_native::NativeSession>();
+/// ```
+///
+/// ```compile_fail
+/// fn sync<T: Sync>() {}
+/// sync::<ruster_io_xdp_native::NativeSession>();
 /// ```
 ///
 /// Ring views borrow the session and cannot outlive it:
@@ -600,13 +620,17 @@ static LINUX_SYSCALLS: LinuxSyscalls = LinuxSyscalls;
 /// ```
 pub struct NativeSession {
     core: SessionCore<'static, LinuxSyscalls>,
+    _worker_local: PhantomData<*mut ()>,
 }
 
 impl NativeSession {
     /// Opens, registers, maps, and binds one session in the caller's network
     /// namespace.
     pub fn open(config: &SessionConfig) -> Result<Self, SessionError> {
-        SessionCore::open(&LINUX_SYSCALLS, config).map(|core| Self { core })
+        SessionCore::open(&LINUX_SYSCALLS, config).map(|core| Self {
+            core,
+            _worker_local: PhantomData,
+        })
     }
 
     /// Returns the mode reported by `XDP_OPTIONS` after bind.

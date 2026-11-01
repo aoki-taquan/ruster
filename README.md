@@ -563,6 +563,13 @@ cargo +1.97.1 check --workspace --all-targets --all-features --locked --target x
 これはmusl targetでworkspace全体が型検査を通ることだけを確認するcompile-only portability
 checkです。musl向けartifactのlink、test実行、実NICでのruntime compatibilityは保証しません。
 
+`ruster-io-xdp-native`のunsafe/fake testは任意でMiriでも確認できます（nightlyとMiri sysrootが
+必要。CI gateではありません）。
+
+```bash
+MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test -p ruster-io-xdp-native --lib
+```
+
 AF_XDP native sessionのprivileged smokeはCIでは実行せず（workflowはX04）、`sudo -n`が使える
 Linux hostで明示的に実行します。
 
@@ -570,8 +577,8 @@ Linux hostで明示的に実行します。
 scripts/priv-xdp-smoke.sh
 ```
 
-scriptはtest binaryを通常userでbuildし、`ruster-x00c-<pid>`というnetnsとその中だけのveth pair
-（`rx00c0`/`rx00c1`）を作ってnetns内でtestを実行し、成否によらずnetnsを削除します。host側の
+scriptはtest binaryを通常userでbuildし、`ruster-x00c-<pid>-<random>`というnetnsとその中だけのveth pair
+（`rx00c0`/`rx00c1`）を作ってnetns内でtestを実行し、成否によらずnetnsを削除します（同名netnsが既にあれば触らずfail）。host側の
 interfaceには触れません。testはinitial netnsでの実行を拒否し、`RUSTER_PRIV_XDP=1`なのに
 netns/device/capabilityが欠ける場合はskipせずfailします。
 

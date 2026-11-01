@@ -15,6 +15,14 @@ use crate::{
 /// Linux `IFNAMSIZ`: interface name bytes plus the terminating NUL.
 pub const INTERFACE_NAME_CAPACITY: usize = 16;
 
+/// Largest accepted queue id.
+///
+/// `sockaddr_xdp.sxdp_queue_id` is a `u32`, but Linux v6.8 `xsk_bind`
+/// passes it to `xp_assign_dev` as a `u16`, so a larger id would silently
+/// bind queue `id & 0xffff`. The configuration layer applies a stricter cap
+/// (1023); this bound is the kernel truncation boundary.
+pub const MAX_QUEUE_ID: u32 = u16::MAX as u32;
+
 /// Largest kernel-reported ring header offset accepted from
 /// `XDP_MMAP_OFFSETS` (one x86_64 page).
 ///
@@ -43,8 +51,9 @@ impl SessionConfig {
     /// initial session profile.
     ///
     /// The name must be 1..=15 bytes of printable ASCII other than `/` and
-    /// `:`, and must not be `.` or `..`. Shared UMEM is rejected: each
-    /// session registers and owns exactly one UMEM.
+    /// `:`, and must not be `.` or `..`. The queue id must not exceed
+    /// [`MAX_QUEUE_ID`]. Shared UMEM is rejected: each session registers and
+    /// owns exactly one UMEM.
     pub fn new(
         device: &str,
         queue: u32,
@@ -66,6 +75,9 @@ impl SessionConfig {
                 .any(|byte| !byte.is_ascii_graphic() || *byte == b'/' || *byte == b':')
         {
             return Err(SessionConfigError::DeviceNameInvalid);
+        }
+        if queue > MAX_QUEUE_ID {
+            return Err(SessionConfigError::QueueOutOfRange { queue });
         }
         if bind_flags.shared_umem() {
             return Err(SessionConfigError::SharedUmemUnsupported);
@@ -152,6 +164,11 @@ pub enum SessionConfigError {
     DeviceNameInvalid,
     /// `XDP_SHARED_UMEM` is outside the initial session profile.
     SharedUmemUnsupported,
+    /// The queue id exceeds [`MAX_QUEUE_ID`].
+    QueueOutOfRange {
+        /// Rejected queue id.
+        queue: u32,
+    },
 }
 
 impl fmt::Display for SessionConfigError {
@@ -220,7 +237,8 @@ pub enum SessionFailure {
     /// `ENOMEM`.
     OutOfMemory,
     /// `ENOBUFS` from `XDP_UMEM_REG`: the UMEM exceeds `RLIMIT_MEMLOCK`
-    /// without `CAP_IPC_LOCK`.
+    /// without `CAP_IPC_LOCK`. It can be transient: Linux releases a closed
+    /// session's UMEM accounting from deferred work.
     MemlockLimit,
     /// `ENODEV`: no such interface in this network namespace.
     NoSuchDevice,
@@ -233,9 +251,10 @@ pub enum SessionFailure {
     /// `EOPNOTSUPP` outside a zero-copy bind, or `EAFNOSUPPORT` from
     /// `socket` (kernel without `CONFIG_XDP_SOCKETS`).
     Unsupported,
-    /// `EOPNOTSUPP` from a bind that requested `XDP_ZEROCOPY`: the driver
-    /// lacks AF_XDP zero-copy support. `auto` mode falls back to copy mode
-    /// on exactly this failure.
+    /// `EOPNOTSUPP` from a bind that requested `XDP_ZEROCOPY`: the device
+    /// does not advertise the complete `NETDEV_XDP_ACT_ZC` feature set, or
+    /// its driver's `XDP_SETUP_XSK_POOL` returned `EOPNOTSUPP`. `auto` mode
+    /// falls back to copy mode on exactly this failure.
     ZeroCopyUnsupported,
     /// Any other errno, kept numerically.
     Errno(u16),
@@ -267,7 +286,9 @@ pub enum SessionFailure {
     },
     /// A mapping address was zero or not page aligned.
     MisalignedMapping,
-    /// `XDP_OPTIONS` reported bits outside the v6.8 profile.
+    /// `XDP_OPTIONS` reported bits outside the v6.8 profile. Unknown bits
+    /// fail closed on purpose: a newer kernel option could change the
+    /// socket's contract in ways this profile has not reviewed.
     UnsupportedOptions(u32),
     /// The negotiated mode differs from the explicitly bound copy policy.
     NegotiatedModeMismatch {
@@ -331,6 +352,10 @@ pub enum CleanupStage {
 
 /// First failure of an explicit teardown. Every later resource was still
 /// released exactly once; failed releases are never retried.
+///
+/// A failed ring `munmap` can leave the mapping in place; its vma keeps a
+/// reference to the socket, so the kernel socket (and its queue binding)
+/// then lives until the process exits even though the fd is closed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CleanupError {
     stage: CleanupStage,

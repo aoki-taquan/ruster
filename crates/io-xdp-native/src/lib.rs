@@ -68,7 +68,7 @@ pub use ring::{
 };
 pub use session::{
     CleanupError, CleanupStage, NativeRings, NegotiatedMode, SessionConfig, SessionConfigError,
-    SessionError, SessionFailure, SessionStage, UmemRegion, INTERFACE_NAME_CAPACITY,
+    SessionError, SessionFailure, SessionStage, UmemRegion, INTERFACE_NAME_CAPACITY, MAX_QUEUE_ID,
     MAX_RING_HEADER_OFFSET,
 };
 

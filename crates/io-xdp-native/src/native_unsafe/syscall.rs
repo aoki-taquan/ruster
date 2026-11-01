@@ -36,7 +36,7 @@ const MAP_SHARED: c_int = 1;
 const MAP_PRIVATE: c_int = 2;
 const MAP_ANONYMOUS: c_int = 0x20;
 const MSG_DONTWAIT: c_int = 0x40;
-const MAP_FAILED: *mut c_void = usize::MAX as *mut c_void;
+const MAP_FAILED: *mut c_void = std::ptr::without_provenance_mut(usize::MAX);
 
 type SockLen = u32;
 type Offset = i64;
@@ -76,6 +76,9 @@ pub(super) mod errno {
 pub(super) enum Errno {
     Linux(u16),
     InvalidCapture,
+    /// The production seam refused an argument before entering libc. The
+    /// checked wrappers make this unreachable; it is a defense in depth.
+    ArgumentRejected,
 }
 
 impl Errno {
@@ -94,7 +97,7 @@ impl Errno {
     pub(super) const fn raw(self) -> Option<u16> {
         match self {
             Self::Linux(raw) => Some(raw),
-            Self::InvalidCapture => None,
+            Self::InvalidCapture | Self::ArgumentRejected => None,
         }
     }
 }
@@ -104,6 +107,7 @@ impl fmt::Debug for Errno {
         match self {
             Self::Linux(raw) => formatter.debug_tuple("Errno").field(raw).finish(),
             Self::InvalidCapture => formatter.write_str("Errno(<invalid-capture>)"),
+            Self::ArgumentRejected => formatter.write_str("Errno(<argument-rejected>)"),
         }
     }
 }
@@ -240,11 +244,21 @@ pub(super) trait Syscalls: sealed::Sealed {
         length: &mut SockLen,
     ) -> Result<(), Errno>;
     fn mmap(&self, request: MapRequest) -> Result<*mut c_void, Errno>;
-    fn munmap(&self, address: *mut c_void, byte_len: usize) -> Result<(), Errno>;
+    /// # Safety
+    ///
+    /// `address` and `byte_len` must be exactly one live mapping returned by
+    /// this seam, and no ring view or other access may use it afterwards.
+    /// Only `MappedRegion` calls this, at most once per mapping.
+    unsafe fn munmap(&self, address: *mut c_void, byte_len: usize) -> Result<(), Errno>;
     fn bind(&self, fd: RawFd, address: &[u8], length: SockLen) -> Result<(), Errno>;
     fn poll(&self, descriptor: &mut PollDescriptor, timeout_millis: c_int) -> Result<u32, Errno>;
     fn send_to_wakeup(&self, fd: RawFd) -> Result<(), Errno>;
-    fn close(&self, fd: RawFd) -> Result<(), Errno>;
+    /// # Safety
+    ///
+    /// `fd` must be an fd owned by the caller that is never used again,
+    /// because its number may be reused immediately. Only `OwnedXdpFd`
+    /// calls this, at most once per fd.
+    unsafe fn close(&self, fd: RawFd) -> Result<(), Errno>;
 }
 
 /// Seam whose successful `mmap` results are real process mappings.
@@ -255,7 +269,11 @@ pub(super) trait Syscalls: sealed::Sealed {
 /// `byte_len` bytes must be a live `PROT_READ | PROT_WRITE` mapping of at
 /// least `byte_len` bytes that no Rust reference aliases and that remains
 /// valid until [`Syscalls::munmap`] is called with the same address and
-/// length. [`MappedRegion::borrow_mapping`] relies on this to lend ring views.
+/// length by its owning `MappedRegion`. Nothing else may unmap, remap, or
+/// change the protection of any range overlapping that mapping (including
+/// `MAP_FIXED` mappings or `munmap`/`mprotect` calls elsewhere in the
+/// process); doing so breaks this contract.
+/// [`MappedRegion::borrow_mapping`] relies on this to lend ring views.
 /// Transcript-only fakes that return synthetic addresses must not implement
 /// this trait.
 pub(super) unsafe trait MapsRealMemory: Syscalls {}
@@ -273,7 +291,9 @@ unsafe impl MapsRealMemory for LinuxSyscalls {}
 
 impl Syscalls for LinuxSyscalls {
     fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno> {
-        debug_assert_eq!(name[IFNAMSIZ - 1], 0);
+        if name[IFNAMSIZ - 1] != 0 {
+            return Err(Errno::ArgumentRejected);
+        }
         // SAFETY: `name` is a borrowed 16-byte array whose last byte is NUL
         // (checked by `interface_index`), so libc reads a terminated C
         // string entirely inside the borrow. The call retains no pointer.
@@ -300,9 +320,11 @@ impl Syscalls for LinuxSyscalls {
         value: &[u8],
         length: SockLen,
     ) -> Result<(), Errno> {
-        debug_assert_eq!(usize::try_from(length), Ok(value.len()));
+        if usize::try_from(length) != Ok(value.len()) {
+            return Err(Errno::ArgumentRejected);
+        }
         // SAFETY: `value` remains readable for exactly `length` bytes during
-        // the call. The checked wrapper produced the matching SockLen.
+        // the call; the check above enforces the matching SockLen.
         let result =
             unsafe { ffi::setsockopt(fd, level, name, value.as_ptr().cast::<c_void>(), length) };
         result_from_minus_one(result).map(|_| ())
@@ -316,7 +338,9 @@ impl Syscalls for LinuxSyscalls {
         value: &mut [u8],
         length: &mut SockLen,
     ) -> Result<(), Errno> {
-        debug_assert_eq!(usize::try_from(*length), Ok(value.len()));
+        if usize::try_from(*length) != Ok(value.len()) {
+            return Err(Errno::ArgumentRejected);
+        }
         // SAFETY: `value` is writable for its checked initial length and
         // `length` is a valid in/out SockLen for the complete call.
         let result = unsafe {
@@ -350,15 +374,18 @@ impl Syscalls for LinuxSyscalls {
         decode_mmap_result(address)
     }
 
-    fn munmap(&self, address: *mut c_void, byte_len: usize) -> Result<(), Errno> {
-        // SAFETY: `MappedRegion` calls this at most once with the exact address
-        // and length returned by one successful mmap call.
+    unsafe fn munmap(&self, address: *mut c_void, byte_len: usize) -> Result<(), Errno> {
+        // SAFETY: the caller upholds the trait contract: this is the exact
+        // address and length of one live mapping, unmapped at most once, and
+        // nothing accesses it afterwards.
         let result = unsafe { ffi::munmap(address, byte_len) };
         result_from_minus_one(result).map(|_| ())
     }
 
     fn bind(&self, fd: RawFd, address: &[u8], length: SockLen) -> Result<(), Errno> {
-        debug_assert_eq!(usize::try_from(length), Ok(address.len()));
+        if usize::try_from(length) != Ok(address.len()) {
+            return Err(Errno::ArgumentRejected);
+        }
         // SAFETY: `address` remains readable for exactly the checked SockLen
         // during the call. C2A does not select or interpret an address type.
         let result = unsafe { ffi::bind(fd, address.as_ptr().cast::<c_void>(), length) };
@@ -387,7 +414,7 @@ impl Syscalls for LinuxSyscalls {
         result_from_ssize_minus_one(result).map(|_| ())
     }
 
-    fn close(&self, fd: RawFd) -> Result<(), Errno> {
+    unsafe fn close(&self, fd: RawFd) -> Result<(), Errno> {
         // SAFETY: `OwnedXdpFd` transfers each nonnegative owned fd here at most
         // once. Close is deliberately not retried after an error because the
         // numeric fd may already have been released and reused.
@@ -554,8 +581,10 @@ impl<'syscalls, S: Syscalls> OwnedXdpFd<'syscalls, S> {
         let Some(fd) = self.fd.take() else {
             return Ok(());
         };
-        self.syscalls
-            .close(fd)
+        // SAFETY: `fd` came from one successful `socket` call, was owned only
+        // by `self`, and `take` above makes this the single release; the
+        // number is never used again.
+        unsafe { self.syscalls.close(fd) }
             .map_err(|errno| syscall_error(SyscallStage::CloseSocket, errno))
     }
 }
@@ -651,8 +680,11 @@ impl<'syscalls, S: Syscalls> MappedRegion<'syscalls, S> {
             return Ok(());
         }
         self.active = false;
-        self.syscalls
-            .munmap(self.address, self.byte_len)
+        // SAFETY: `active` was true, so this is the exact live extent of one
+        // successful mmap, released once. Any `BorrowedMmap` borrowed `&mut
+        // self`, so no ring view can exist while this runs (it needs `&mut
+        // self` or Drop), and `active = false` prevents later borrows.
+        unsafe { self.syscalls.munmap(self.address, self.byte_len) }
             .map_err(|errno| syscall_error(SyscallStage::UnmapMemory, errno))
     }
 }
@@ -939,10 +971,11 @@ mod tests {
             self.result(SyscallStage::MapMemory)?;
             let address = self.next_address.get();
             self.next_address.set(address.wrapping_add(0x1_0000));
-            Ok(address as *mut c_void)
+            // Synthetic, never dereferenced: this fake is not `MapsRealMemory`.
+            Ok(std::ptr::without_provenance_mut(address))
         }
 
-        fn munmap(&self, address: *mut c_void, byte_len: usize) -> Result<(), Errno> {
+        unsafe fn munmap(&self, address: *mut c_void, byte_len: usize) -> Result<(), Errno> {
             self.record(Call::Munmap {
                 address: address as usize,
                 byte_len,
@@ -982,7 +1015,7 @@ mod tests {
             self.result(SyscallStage::SendToSocket)
         }
 
-        fn close(&self, fd: RawFd) -> Result<(), Errno> {
+        unsafe fn close(&self, fd: RawFd) -> Result<(), Errno> {
             self.record(Call::Close { fd });
             self.result(SyscallStage::CloseSocket)
         }
@@ -1331,6 +1364,53 @@ mod tests {
                 }
             ))
         );
+    }
+
+    #[test]
+    fn native_linux_seam_rejects_inconsistent_arguments_before_ffi() {
+        // Each production entry point re-checks its pointer/length contract
+        // and returns a typed rejection without entering libc (fd -1 is
+        // never passed to the kernel).
+        let linux = LinuxSyscalls;
+        assert_eq!(
+            linux.interface_index(&[b'a'; IFNAMSIZ]),
+            Err(Errno::ArgumentRejected)
+        );
+        assert_eq!(
+            linux.set_socket_option(-1, 283, 4, &[1, 2], 3),
+            Err(Errno::ArgumentRejected)
+        );
+        let mut length = 5;
+        assert_eq!(
+            linux.get_socket_option(-1, 283, 1, &mut [0_u8; 4], &mut length),
+            Err(Errno::ArgumentRejected)
+        );
+        assert_eq!(length, 5);
+        assert_eq!(
+            linux.bind(-1, &[0_u8; 16], 15),
+            Err(Errno::ArgumentRejected)
+        );
+        assert_eq!(Errno::ArgumentRejected.raw(), None);
+        assert_eq!(
+            format!("{:?}", Errno::ArgumentRejected),
+            "Errno(<argument-rejected>)"
+        );
+
+        // The checked wrapper rejects a non-terminated name before the seam.
+        let fake = FakeSyscalls::new();
+        assert_eq!(
+            interface_index(&fake, &[b'a'; IFNAMSIZ]),
+            Err(ResourceError::Argument(
+                SyscallArgumentError::InvalidInterfaceName
+            ))
+        );
+        assert_eq!(
+            interface_index(&fake, &[0; IFNAMSIZ]),
+            Err(ResourceError::Argument(
+                SyscallArgumentError::InvalidInterfaceName
+            ))
+        );
+        assert_eq!(fake.transcript.borrow().len, 0);
     }
 
     #[test]

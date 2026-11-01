@@ -28,18 +28,26 @@ test -x "$binary" || {
     exit 1
 }
 
-netns="ruster-x00c-$$"
+# A pid plus 32 random bits names the namespace uniquely. A pre-existing
+# namespace of that name is never adopted or deleted: `ip netns add` fails
+# first, before the cleanup trap that owns the namespace is installed.
+suffix=$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')
+netns="ruster-x00c-$$-$suffix"
 device=rx00c0
 peer=rx00c1
 
 cleanup() {
     sudo -n ip netns del "$netns" 2>/dev/null || true
 }
+
+if ! sudo -n ip netns add "$netns"; then
+    echo "priv-xdp-smoke: cannot create $netns (already exists?); not touching it" >&2
+    exit 1
+fi
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-sudo -n ip netns add "$netns"
 sudo -n ip -n "$netns" link add "$device" type veth peer name "$peer"
 sudo -n ip -n "$netns" link set "$device" up
 sudo -n ip -n "$netns" link set "$peer" up

@@ -4,7 +4,10 @@
 //! The fake implements the sealed syscall seam with a bounded transcript, a
 //! fixed table of real page-aligned arena mappings (so ring views built on
 //! them are exercised for real), and exact fd/mapping accounting that
-//! detects leaks and double releases.
+//! detects leaks and double releases. `munmap` frees the arena block, so a
+//! use after unmap is a use after free that Miri reports.
+//!
+//! Run under Miri with `cargo +nightly miri test -p ruster-io-xdp-native --lib`.
 
 use std::{
     alloc::{alloc_zeroed, dealloc, Layout},
@@ -180,9 +183,11 @@ impl SessionFake {
         assert_eq!(self.double_releases.get(), 0, "double release");
     }
 
+    /// Returns the address handed out by map call `map_call`, keeping the
+    /// arena block's provenance.
     fn mapping_base(&self, map_call: usize) -> *mut u8 {
         let mapping = self.mappings.borrow()[map_call - 1].expect("mapping exists");
-        mapping.returned as *mut u8
+        mapping.base.with_addr(mapping.returned)
     }
 
     fn map(&self, call: Call, len: usize) -> Result<*mut c_void, Errno> {
@@ -191,7 +196,8 @@ impl SessionFake {
         let rounded = len.next_multiple_of(PAGE_SIZE) + PAGE_SIZE;
         let layout = Layout::from_size_align(rounded, PAGE_SIZE).expect("bounded test layout");
         // SAFETY: `layout` has nonzero size and a valid power-of-two
-        // alignment. The block is released only in `Drop`.
+        // alignment. The block is released by `munmap` or, if still live,
+        // by `Drop`, exactly once.
         let base = unsafe { alloc_zeroed(layout) };
         assert!(!base.is_null(), "test arena allocation");
         let returned = if self.misalign_call.get() == Some(ordinal) {
@@ -206,19 +212,19 @@ impl SessionFake {
             len,
             live: true,
         });
-        Ok(base
-            .wrapping_byte_add(returned - base.addr())
-            .cast::<c_void>())
+        Ok(base.with_addr(returned).cast::<c_void>())
     }
 }
 
 impl Drop for SessionFake {
     fn drop(&mut self) {
         for mapping in self.mappings.get_mut().iter().flatten() {
-            // SAFETY: each block was returned by `alloc_zeroed` with exactly
-            // this layout and is deallocated once here, after every session
-            // borrowing the fake has ended.
-            unsafe { dealloc(mapping.base, mapping.layout) };
+            if mapping.live {
+                // SAFETY: a live block was returned by `alloc_zeroed` with
+                // exactly this layout and was never freed by `munmap`; every
+                // session borrowing the fake has ended.
+                unsafe { dealloc(mapping.base, mapping.layout) };
+            }
         }
     }
 }
@@ -340,16 +346,20 @@ impl Syscalls for SessionFake {
         }
     }
 
-    fn munmap(&self, address: *mut c_void, byte_len: usize) -> Result<(), Errno> {
-        let map_call = self
-            .mappings
-            .borrow()
-            .iter()
-            .position(|mapping| {
+    unsafe fn munmap(&self, address: *mut c_void, byte_len: usize) -> Result<(), Errno> {
+        // A freed block's address can be reused by a later map, so prefer the
+        // live mapping; a match only among released ones is a double unmap.
+        let matching = |live_only: bool| {
+            self.mappings.borrow().iter().position(|mapping| {
                 mapping.is_some_and(|mapping| {
-                    mapping.returned == address.addr() && mapping.len == byte_len
+                    mapping.returned == address.addr()
+                        && mapping.len == byte_len
+                        && (mapping.live || !live_only)
                 })
             })
+        };
+        let map_call = matching(true)
+            .or_else(|| matching(false))
             .map(|index| index + 1)
             .expect("munmap of an exact mapping");
         let (_, result) = self.record(Call::Unmap {
@@ -358,12 +368,17 @@ impl Syscalls for SessionFake {
         });
         let mut mappings = self.mappings.borrow_mut();
         let mapping = mappings[map_call - 1].as_mut().expect("mapping exists");
-        if !mapping.live {
+        if mapping.live {
+            // Linux removes the mapping even when reporting some errors; the
+            // seam never retries, so treat every attempt as the release and
+            // free the block so any later access is a detectable error.
+            mapping.live = false;
+            // SAFETY: the block came from `alloc_zeroed` with this layout and
+            // is live; `live = false` makes this its only deallocation.
+            unsafe { dealloc(mapping.base, mapping.layout) };
+        } else {
             self.double_releases.set(self.double_releases.get() + 1);
         }
-        // Linux removes the mapping even when reporting some errors; the
-        // seam never retries, so treat every attempt as the release.
-        mapping.live = false;
         result
     }
 
@@ -393,7 +408,7 @@ impl Syscalls for SessionFake {
         panic!("session setup never kicks")
     }
 
-    fn close(&self, fd: RawFd) -> Result<(), Errno> {
+    unsafe fn close(&self, fd: RawFd) -> Result<(), Errno> {
         let (_, result) = self.record(Call::Close { fd });
         if self.open_fds.get() == 0 {
             self.double_releases.set(self.double_releases.get() + 1);
@@ -561,9 +576,10 @@ fn copy_flags() -> u16 {
 }
 
 fn read_cursor(base: *mut u8, offset: usize) -> u32 {
-    // SAFETY: `base` is the start of a live arena block owned by the fake
-    // with at least `offset + 4` bytes; the session's views have ended, so
-    // this volatile read does not race with any Rust access.
+    // SAFETY: `base` carries the provenance of a live (not yet unmapped)
+    // arena block owned by the fake with at least `offset + 4` bytes; the
+    // session's views have ended, so this volatile read does not race with
+    // any Rust access.
     unsafe { base.add(offset).cast::<u32>().read_volatile() }
 }
 
@@ -988,6 +1004,18 @@ fn native_session_errnos_map_to_typed_value_free_failures() {
         )
         .failure(),
         SessionFailure::UnreadableErrno
+    );
+    assert_eq!(
+        classify(
+            SessionStage::Bind,
+            ResourceError::Syscall(SyscallError {
+                stage: SyscallStage::BindSocket,
+                errno: Errno::ArgumentRejected,
+            }),
+            true,
+        )
+        .failure(),
+        SessionFailure::ArgumentOutOfRange
     );
     assert_eq!(
         classify(
