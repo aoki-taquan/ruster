@@ -24,7 +24,7 @@
 
 ## 現在地
 
-2026-10-31時点の`main`（`477f2ef`、#281まで）をcodeから確認した状態である。以下で矛盾する
+2026-11-01時点の`main`（`c256e92`、#285まで）をcodeから確認した状態である。以下で矛盾する
 場合はcode、[`requirements-v0.2.md`](requirements-v0.2.md)のledger、
 [`release-evidence/m1.md`](release-evidence/m1.md)を正とする。
 
@@ -63,7 +63,8 @@ workspaceは12 crateからなる。data-planeとI/Oのlibrary crate（`ruster-co
 - CLI（`ruster-cli`、binary `ruster`）: `validate`、`plan`、`run-sim [--hold]`、
   SIGINT/SIGTERMのordered shutdown（CLI-001〜007）
 - benchmark（`ruster-bench`）: NIC-free sim smoke/datapath suite、hardware plan/protocol/
-  artifact v1 schema（BENCH-001〜006）。v0.2 benchmark spec（R17）はdraft #282でowner承認待ち
+  artifact v1 schema（BENCH-001〜006）、owner承認済みv0.2 benchmark spec（R17、#282、
+  `spec_git_sha` `5c57f41`）とpin済みdigest/matrix/承認marker test（BENCH-007〜009）
 - real-I/O scaffold（productionではない）
   - `ruster-io-afpacket`: checked TPACKET_V3 mapping、fixed-frame TX engine、persistent
     RX block engine、core `PacketIo`のcopy backend（AFPKT-001〜007、IO-012）。証跡は
@@ -73,13 +74,16 @@ workspaceは12 crateからなる。data-planeとI/Oのlibrary crate（`ruster-co
     scaffold、private syscall RAII seam（XDP rows）。socket/UMEM登録、attach、`PacketIo`接続は
     無い
 - CI: `CI` workflow（Check、Musl、Test、Clippy、Format、Doc。Testはdoctestとrequirements
-  gateを含む）と`Security Smoke` workflow（`R16A Bounded`、8 target×4 fixed seed）。
+  gateを含む）、`Security Smoke` workflow（`R16A Bounded`、8 target×4 fixed seed）、
+  `Benchmark Smoke` workflow（spec digest、plan v1照合、sim smoke）。
   repository rulesetのrequired checkは`Check`、`Test`、`Clippy`、`Format`、`Doc`だけで、
-  `Musl`と`R16A Bounded`はrequiredではない
+  `Musl`、`R16A Bounded`、`Benchmark Smoke`はrequiredではない
 
 milestone状態: M0のP0 rowはすべてledger上implementedだが、M0の独立release evidence fileは
-作っていない。M1は[`release-evidence/m1.md`](release-evidence/m1.md)のとおり、R16 checkの
-required化、R17 spec承認が残り未closeである。route-miss ICMPは#284で修正した（ownerがmergeを決定）。
+作っていない。M1は[`release-evidence/m1.md`](release-evidence/m1.md)のとおり、`R16A Bounded`
+checkのrequired化（repository admin操作）だけが残り未closeである。route-miss ICMP（#284）、
+ICMPv4生成switch（#285）、R17 spec固定（#282）はmerge済みで、route撤去後の既存flowがsilentな
+点はtracked deviation（FW-025）として残る。
 
 ### Partialまたは欠落
 
@@ -92,7 +96,8 @@ required化、R17 spec承認が残り未closeである。route-miss ICMPは#284�
 - NAT/FW占有、resolution/action/audit high-watermark、native ringのsaturationが無い
   （OBS-015/017/018 deferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
 - optional serviceを表すcomposition seamが無く、M1はUDP/TCP NAT44+FWを必須とする。
-- R17 benchmark spec（数値threshold、`benchmark-smoke.yml`）がmainに無い（#282 draft）。
+- `ruster run-sim`によるfrozen benchmark spec SHAの表示（R12 acceptance）が無い。spec SHA自体は
+  M1 release evidenceへ固定済み。
 - privilege separation、persistent diagnostics、structured log、metrics endpoint、
   config history、sanitizer、long soak、netns/hardware CIが無い。
 
@@ -114,7 +119,8 @@ required化、R17 spec承認が残り未closeである。route-miss ICMPは#284�
   RI0だけが編集する規則とはずれている。
 - dependency graph: R11（S5b driver）は実際にはR10（S3）、live activation（S2）、R15（S4）の
   merge後に実装した。graphへ注記した。
-- R17とhardware v1文書の関係、M1/M2でのspec SHAの扱いは#282で提案中で未決である。
+- R17とhardware v1文書の関係、M1/M2でのspec SHAの扱いは#282で決定した（spec v0.2の
+  「M1で適用する範囲」、`spec_git_sha`はM1 release evidenceへ固定）。
 - config/control/runtimeのservice必須性とrollbackの意味は「M1 owner決定」で解決済みである。
 
 ### Open issue hygiene
@@ -291,10 +297,10 @@ M1への経路はgap分析のslice S1〜S9とする。
 - S8a/S8b: R16 NAT/FW state・config fuzz、publication/apply property。
 - S9: RD0 docsとM1 release evidence。
 
-実績（2026-10-31）: S1 #273、S2 #274、S3 #275、S4 #276、S5a #277、S5b #278、S6a/S6b #279
+実績（2026-11-01更新）: S1 #273、S2 #274、S3 #275、S4 #276、S5a #277、S5b #278、S6a/S6b #279
 （一PR）、S8a/S8b #280（一PR）はmerge済み。#280が見つけたfirewall期限切れslotのliveness
-bugは#281で修正した。S7は#282（draft、threshold owner承認待ち）、S9はRD0とM1 release
-evidence（[`release-evidence/m1.md`](release-evidence/m1.md)）。M1 exit判定はevidence fileで行う。
+bugは#281で修正した。S7は#282（owner承認済み）、route-miss ICMPの修正は#284、ICMPv4生成switchは
+#285でmerge済み。S9はRD0とM1 release evidence（[`release-evidence/m1.md`](release-evidence/m1.md)）。M1 exit判定はevidence fileで行う。
 
 ### M2: Operable AF_XDP static router
 
