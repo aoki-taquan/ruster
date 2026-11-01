@@ -171,6 +171,7 @@ pub enum DropReason {
     Icmpv4EchoDisabled = 146,
     Nat44UdpHairpinFiltered = 147,
     Nat44TcpHairpinFiltered = 148,
+    Nat44Icmpv4QuotedRemoteLocal = 149,
 }
 
 use DropReason::*;
@@ -178,7 +179,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 148] = [
+    pub const ALL: [Self; 149] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -327,6 +328,7 @@ impl DropReason {
         Icmpv4EchoDisabled,
         Nat44UdpHairpinFiltered,
         Nat44TcpHairpinFiltered,
+        Nat44Icmpv4QuotedRemoteLocal,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -492,6 +494,7 @@ impl DropReason {
             Icmpv4EchoDisabled => "ICMPV4_ECHO_DISABLED",
             Nat44UdpHairpinFiltered => "NAT44_UDP_HAIRPIN_FILTERED",
             Nat44TcpHairpinFiltered => "NAT44_TCP_HAIRPIN_FILTERED",
+            Nat44Icmpv4QuotedRemoteLocal => "NAT44_ICMPV4_QUOTED_REMOTE_LOCAL",
         }
     }
 }
@@ -2846,6 +2849,16 @@ struct ParsedNat44Icmpv4Quote {
     icmp_checksum: u16,
 }
 
+/// Whether a quoted remote names one of the router's own IPv4 addresses,
+/// including the NAT public address. Only hairpinned packets create NAT
+/// state with such a remote.
+fn quoted_remote_is_local(snapshot: &ForwardingSnapshot<'_>, remote: crate::Ipv4Address) -> bool {
+    snapshot
+        .local_ipv4
+        .iter()
+        .any(|binding| binding.address == remote)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
     frame: &[u8],
@@ -2884,6 +2897,12 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
                 || quote.public_address != config.public_address()
             {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedPublicSourceMismatch, trace);
+            }
+            // A quoted remote naming a router address can only match state
+            // the hairpin outbound half created (remote = the public
+            // address). An outside error must never reach it.
+            if quoted_remote_is_local(snapshot, quote.remote_address) {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedRemoteLocal, trace);
             }
             if combined_realm_mismatch {
                 return nat44_icmpv4_drop(ingress, Nat44CombinedRealmMismatch, trace);
@@ -2943,6 +2962,12 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
                 || quote.public_address != config.public_address()
             {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedPublicSourceMismatch, trace);
+            }
+            // A quoted remote naming a router address can only match state
+            // the hairpin outbound half created (remote = the public
+            // address). An outside error must never reach it.
+            if quoted_remote_is_local(snapshot, quote.remote_address) {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedRemoteLocal, trace);
             }
             if combined_realm_mismatch {
                 return nat44_icmpv4_drop(ingress, Nat44CombinedRealmMismatch, trace);
@@ -6321,6 +6346,7 @@ mod tests {
             (146, "ICMPV4_ECHO_DISABLED"),
             (147, "NAT44_UDP_HAIRPIN_FILTERED"),
             (148, "NAT44_TCP_HAIRPIN_FILTERED"),
+            (149, "NAT44_ICMPV4_QUOTED_REMOTE_LOCAL"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -6330,7 +6356,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(149), None);
+        assert_eq!(DropReason::from_code(150), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

@@ -276,7 +276,11 @@ inbound halfが拒否されてもoutbound halfは残る（remote NATにdropさ�
 ため、defaultの`address-dependent`では最初のX1→X2'が`NAT44_UDP_HAIRPIN_FILTERED`/
 `NAT44_TCP_HAIRPIN_FILTERED`、続くX2→X1'が届き、以後双方向に通るhole punching（RFC 5128
 §3.3.2、TCPは§3.4 simultaneous open）になります。hairpinはfirewallのbypassにならず、outbound
-halfのfirewall deny、malformed、unknown mapping、offでは何もcommitしません。hairpinしたdatagram
+halfのfirewall deny、malformed、unknown mapping、offでは何もcommitしません。hairpin stateのremoteは
+router自身の`P`で、`P`をsourceとするoutside packetはcommon admissionで、`P`などrouter addressを
+引用remoteとするoutside ICMPv4 Type 3/Code 4は`NAT44_ICMPV4_QUOTED_REMOTE_LOCAL`でdropするため、
+外部からは使えません。`address-dependent`ではX1のpeer `P`がinside全host共通のwildcardになる
+（REQ-9 aから不可避。firewallはexact reverseを要求）点に注意してください。hairpinしたdatagram
 についてのICMP error（RFC 5508 REQ-7）は変換せずfail closedで、明示deviationです
 （architectureの「NAT44 hairpinning」）。
 

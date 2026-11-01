@@ -18,10 +18,10 @@ use ruster_core::{
     FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange, FirewallProtocol,
     FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot, FirewallVerdict,
     ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
-    MonotonicMillis, Nat44Filtering, Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy,
-    Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
-    Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace, ResolutionActionSlot, ResolutionPolicy,
-    ResolutionRuntime, ResolutionStateSlot, Route,
+    MonotonicMillis, Nat44Filtering, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpMappingSlot,
+    Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot,
+    Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace, ResolutionActionSlot,
+    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
 };
 use ruster_io_sim::{RecycleCause, SimIo};
 use support::UdpTestIndexes;
@@ -36,6 +36,8 @@ const GW_MAC: MacAddress = MacAddress([2, 0, 0, 0, 0, 20]);
 const PUBLIC: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 10]);
 const H1: Ipv4Address = Ipv4Address::from_octets([10, 0, 0, 10]);
 const H2: Ipv4Address = Ipv4Address::from_octets([10, 0, 0, 11]);
+/// Inside host without a static neighbor (dynamic resolution only).
+const H3: Ipv4Address = Ipv4Address::from_octets([10, 0, 0, 12]);
 const REMOTE: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 20]);
 const GW: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 1]);
 const FIRST_PORT: u16 = 40_000;
@@ -165,8 +167,35 @@ struct World {
     now: u64,
 }
 
+/// Knobs of one test world beyond filtering, the switch, and the rules.
+#[derive(Clone, Copy)]
+struct Shape {
+    udp_peers: usize,
+    tcp_sessions: usize,
+    icmpv4_errors: Nat44Icmpv4ErrorPolicy,
+}
+
+impl Default for Shape {
+    fn default() -> Self {
+        Self {
+            udp_peers: 8,
+            tcp_sessions: 8,
+            icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
+        }
+    }
+}
+
 impl World {
     fn new(filtering: Nat44Filtering, hairpinning: bool, rules: Option<Vec<FirewallRule>>) -> Self {
+        Self::shaped(filtering, hairpinning, rules, Shape::default())
+    }
+
+    fn shaped(
+        filtering: Nat44Filtering,
+        hairpinning: bool,
+        rules: Option<Vec<FirewallRule>>,
+        shape: Shape,
+    ) -> Self {
         let snapshot = snapshot();
         let udp_config = Nat44UdpConfig::new(
             &snapshot,
@@ -177,7 +206,8 @@ impl World {
             LAST_PORT,
             Nat44UdpPolicy::default()
                 .with_filtering(filtering)
-                .with_hairpinning(hairpinning),
+                .with_hairpinning(hairpinning)
+                .with_icmpv4_errors(shape.icmpv4_errors),
         )
         .unwrap();
         let tcp_config = Nat44TcpConfig::new(
@@ -189,19 +219,20 @@ impl World {
             LAST_PORT,
             Nat44TcpPolicy::default()
                 .with_filtering(filtering)
-                .with_hairpinning(hairpinning),
+                .with_hairpinning(hairpinning)
+                .with_icmpv4_errors(shape.icmpv4_errors),
         )
         .unwrap();
-        let indexes = leak(UdpTestIndexes::new(udp_config, 4, 8));
+        let indexes = leak(UdpTestIndexes::new(udp_config, 4, shape.udp_peers));
         let udp = indexes.runtime(
             udp_config,
             leak([Nat44UdpMappingSlot::default(); 4]),
-            leak([Nat44UdpPeerSlot::default(); 8]),
+            Vec::leak(vec![Nat44UdpPeerSlot::default(); shape.udp_peers]),
         );
         let tcp = support::tcp_runtime(
             tcp_config,
             leak([Nat44TcpMappingSlot::default(); 4]),
-            leak([Nat44TcpSessionSlot::default(); 8]),
+            Vec::leak(vec![Nat44TcpSessionSlot::default(); shape.tcp_sessions]),
         );
         let (firewall_config, firewall) = match rules {
             Some(rules) => {
@@ -957,4 +988,333 @@ fn hairpinned_icmp_errors_are_not_translated_and_fail_closed() {
             assert_eq!(world.state(), state);
         }
     }
+}
+
+/// Type 3/Code 4 from an outside router to P quoting `P:quoted_public ->
+/// remote:remote_port` (UDP or TCP), as an outside host would forge to
+/// reach hairpin state.
+fn outside_frag_needed(
+    quoted_public: u16,
+    remote: Ipv4Address,
+    remote_port: u16,
+    tcp: bool,
+) -> Vec<u8> {
+    let quoted = if tcp {
+        tcp_frame(PUBLIC, remote, quoted_public, remote_port, SYN)
+    } else {
+        udp_frame(PUBLIC, remote, quoted_public, remote_port)
+    };
+    let quote = &quoted[14..14 + 28];
+    let total_len = 20 + 8 + quote.len();
+    let mut frame = vec![0_u8; 14 + total_len];
+    frame[0..6].copy_from_slice(&WAN_MAC.0);
+    frame[6..12].copy_from_slice(&GW_MAC.0);
+    frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+    frame[14] = 0x45;
+    frame[16..18].copy_from_slice(&u16::try_from(total_len).unwrap().to_be_bytes());
+    frame[22] = 64;
+    frame[23] = 1;
+    frame[26..30].copy_from_slice(&REMOTE.octets());
+    frame[30..34].copy_from_slice(&PUBLIC.octets());
+    frame[34] = 3;
+    frame[35] = 4;
+    frame[40..42].copy_from_slice(&1280_u16.to_be_bytes());
+    frame[42..].copy_from_slice(quote);
+    let checksum = internet_checksum(&frame[34..]);
+    frame[36..38].copy_from_slice(&checksum.to_be_bytes());
+    let checksum = ipv4_header_checksum(&frame[14..34]);
+    frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+    frame
+}
+
+/// Review M-1 regression: hairpin state names P as its remote, so an
+/// outside Fragmentation Needed quoting `P:x1' -> P:x2'` would otherwise
+/// find it. Opt-in ICMP translation refuses any quoted remote that is a
+/// router address, before any NAT lookup, with or without the firewall. A
+/// quote of a real external peer is still translated.
+#[test]
+fn outside_icmp_errors_cannot_reach_hairpin_state() {
+    for rules in [None, Some(outbound_only_rules())] {
+        let firewall = rules.is_some();
+        let mut world = World::shaped(
+            Nat44Filtering::AddressAndPortDependent,
+            true,
+            rules,
+            Shape {
+                icmpv4_errors: Nat44Icmpv4ErrorPolicy::ExternalOnly,
+                ..Shape::default()
+            },
+        );
+        for tcp in [false, true] {
+            let public1 = world.establish(H1, P1, tcp);
+            let public2 = world.establish(H2, P2, tcp);
+            // The hole punch is refused but commits H1's state toward P.
+            let punch = if tcp {
+                tcp_frame(H1, PUBLIC, P1, public2, SYN)
+            } else {
+                udp_frame(H1, PUBLIC, P1, public2)
+            };
+            world.run(LAN, punch.clone());
+            let refused = if tcp {
+                DropReason::Nat44TcpHairpinFiltered
+            } else {
+                DropReason::Nat44UdpHairpinFiltered
+            };
+            assert_drop(&mut world, refused, &punch);
+
+            for local in [PUBLIC, Ipv4Address::from_octets([10, 0, 0, 1])] {
+                let forged = outside_frag_needed(public1, local, public2, tcp);
+                let state = world.state();
+                world.run(WAN, forged.clone());
+                assert_drop(
+                    &mut world,
+                    DropReason::Nat44Icmpv4QuotedRemoteLocal,
+                    &forged,
+                );
+                assert_eq!(world.state(), state, "tcp {tcp} firewall {firewall}");
+            }
+
+            // Control: the real external peer of `establish` is still
+            // translated toward H1.
+            let remote_port = if tcp { 443 } else { 53 };
+            let genuine = outside_frag_needed(public1, REMOTE, remote_port, tcp);
+            world.run(WAN, genuine);
+            let tx = world.io.pop_tx().expect("translated ICMP error");
+            assert_eq!(tx.egress, LAN);
+            assert_eq!(&tx.bytes[30..34], &H1.octets());
+        }
+    }
+}
+
+/// Review L-1: the outbound half admits only an inside host. A router
+/// address as source is refused by common admission before NAT, and a
+/// source whose reverse LPM selects the outside is refused by the
+/// hairpin's own reverse-authority check; neither commits state.
+#[test]
+fn hairpin_sender_must_be_an_inside_host() {
+    for rules in [None, Some(outbound_only_rules())] {
+        let mut world = World::new(Nat44Filtering::EndpointIndependent, true, rules);
+        let public2 = world.establish(H2, P2, false);
+        let tcp_public2 = world.establish(H2, P2, true);
+        for tcp in [false, true] {
+            let port = if tcp { tcp_public2 } else { public2 };
+            // Every case arrives on the LAN interface.
+            let make = |source| {
+                let mut frame = if tcp {
+                    tcp_frame(source, PUBLIC, P1, port, SYN)
+                } else {
+                    udp_frame(source, PUBLIC, P1, port)
+                };
+                frame[0..6].copy_from_slice(&LAN_MAC.0);
+                frame
+            };
+            let mut cases = vec![
+                (make(PUBLIC), DropReason::Ipv4SourceLocalAddress),
+                (
+                    make(Ipv4Address::from_octets([10, 0, 0, 1])),
+                    DropReason::Ipv4SourceLocalAddress,
+                ),
+            ];
+            // An external source arriving on the LAN interface.
+            cases.push((
+                make(REMOTE),
+                if tcp {
+                    DropReason::Nat44TcpReverseAuthorityMismatch
+                } else {
+                    DropReason::Nat44UdpReverseAuthorityMismatch
+                },
+            ));
+            for (packet, reason) in cases {
+                let state = world.state();
+                world.run(LAN, packet.clone());
+                assert_drop(&mut world, reason, &packet);
+                assert_eq!(world.state(), state, "{reason:?}");
+            }
+        }
+    }
+}
+
+/// Review L-2: UDP checksum zero (no checksum) stays zero, and an
+/// incremental result of arithmetic zero is sent as 0xffff (RFC 768).
+#[test]
+fn udp_hairpin_checksum_zero_and_arithmetic_zero_follow_rfc768() {
+    let mut world = World::new(Nat44Filtering::EndpointIndependent, true, None);
+    let public1 = world.establish(H1, P1, false);
+    let public2 = world.establish(H2, P2, false);
+
+    let mut zero = udp_frame(H1, PUBLIC, P1, public2);
+    zero[40..42].fill(0);
+    world.run(LAN, zero.clone());
+    let tx = world.io.pop_tx().expect("hairpinned packet");
+    assert_eq!(&tx.bytes[40..42], &[0, 0], "zero checksum preserved");
+    assert_eq!(&tx.bytes[26..30], &PUBLIC.octets());
+    assert_eq!(&tx.bytes[30..34], &H2.octets());
+
+    // Choose the last payload word so that the translated datagram sums to
+    // 0xffff, that is a computed checksum of zero.
+    let word = (0..=u16::MAX)
+        .find(|word| {
+            let mut segment = udp_frame(PUBLIC, H2, public1, P2)[34..46].to_vec();
+            segment[10..12].copy_from_slice(&word.to_be_bytes());
+            segment[6..8].fill(0);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&PUBLIC.octets());
+            bytes.extend_from_slice(&H2.octets());
+            bytes.extend_from_slice(&[0, 17, 0, 12]);
+            bytes.extend_from_slice(&segment);
+            internet_checksum(&bytes) == 0
+        })
+        .expect("some payload word yields an arithmetic zero");
+    let mut packet = udp_frame(H1, PUBLIC, P1, public2);
+    packet[44..46].copy_from_slice(&word.to_be_bytes());
+    packet[40..42].fill(0);
+    let checksum = transport_checksum(H1, PUBLIC, 17, &packet[34..46]);
+    packet[40..42].copy_from_slice(&checksum.to_be_bytes());
+    world.run(LAN, packet.clone());
+    let tx = world.io.pop_tx().expect("hairpinned packet");
+    assert_eq!(&tx.bytes[34..36], &public1.to_be_bytes());
+    assert_eq!(&tx.bytes[36..38], &P2.to_be_bytes());
+    assert_eq!(
+        &tx.bytes[40..42],
+        &[0xff, 0xff],
+        "arithmetic zero is 0xffff"
+    );
+    assert_eq!(&tx.bytes[44..46], &word.to_be_bytes());
+}
+
+fn permissive_rules() -> Vec<FirewallRule> {
+    let mut rules = outbound_only_rules();
+    for (id, protocol) in [(40, FirewallProtocol::Udp), (50, FirewallProtocol::Tcp)] {
+        rules.push(FirewallRule::new(
+            FirewallRuleId(id),
+            FirewallInterface::Interface(WAN),
+            FirewallInterface::Interface(LAN),
+            any(),
+            lan_prefix(),
+            protocol,
+            ports(0, u16::MAX),
+            ports(1, u16::MAX),
+            FirewallAction::AllowStateful,
+        ));
+    }
+    rules
+}
+
+fn occupied_firewall_states(world: &World) -> usize {
+    world
+        .firewall
+        .as_ref()
+        .unwrap()
+        .states()
+        .iter()
+        .filter(|slot| slot.is_occupied())
+        .count()
+}
+
+fn sessions_toward(world: &World, remote: Ipv4Address) -> usize {
+    world
+        .tcp
+        .sessions()
+        .iter()
+        .filter(|slot| slot.is_occupied() && slot.remote_address() == remote)
+        .count()
+}
+
+/// Review L-3: with the firewall bound, an inbound half refused after its
+/// NAT and firewall plans (neighbor miss), by inbound session capacity, or
+/// by the firewall itself keeps only the outbound half: one new firewall
+/// state and one sender-side NAT entry, nothing on the destination side.
+/// A capacity failure of the outbound half (UDP peer table) commits
+/// nothing. (`WrongEgress` after DNAT needs a mapping whose internal
+/// address no longer routes inside, which a fixed publication cannot
+/// produce: mappings are created only for inside-routed sources and
+/// reconcile flushes them.)
+#[test]
+fn refused_inbound_halves_keep_only_the_outbound_half() {
+    // Neighbor miss after both plans: H3 has no static neighbor.
+    for tcp in [false, true] {
+        let mut world = World::new(
+            Nat44Filtering::EndpointIndependent,
+            true,
+            Some(permissive_rules()),
+        );
+        let public3 = world.establish(H3, P2, tcp);
+        let states = occupied_firewall_states(&world);
+        let allowed = world.firewall.as_ref().unwrap().counters().allowed_new;
+        let toward_public = sessions_toward(&world, PUBLIC);
+        let packet = if tcp {
+            tcp_frame(H1, PUBLIC, P1, public3, SYN)
+        } else {
+            udp_frame(H1, PUBLIC, P1, public3)
+        };
+        world.run(LAN, packet.clone());
+        assert_drop(&mut world, DropReason::NeighborUnresolved, &packet);
+        assert_eq!(occupied_firewall_states(&world), states + 1, "tcp {tcp}");
+        assert_eq!(
+            world.firewall.as_ref().unwrap().counters().allowed_new,
+            allowed + 1
+        );
+        if tcp {
+            // H1's outbound-half session only; none on H3's mapping.
+            assert_eq!(sessions_toward(&world, PUBLIC), toward_public + 1);
+            assert_eq!(world.tcp.counters().hairpin_inbound_refused, 1);
+            assert_eq!(world.tcp.counters().inbound_sessions_created, 0);
+        } else {
+            assert_eq!(world.udp.counters().hairpin_inbound_refused, 1);
+        }
+    }
+
+    // TCP inbound session table full (2 sessions: H2's and H1's outbound
+    // half).
+    let mut world = World::shaped(
+        Nat44Filtering::EndpointIndependent,
+        true,
+        Some(permissive_rules()),
+        Shape {
+            tcp_sessions: 2,
+            ..Shape::default()
+        },
+    );
+    let public2 = world.establish(H2, P2, true);
+    let states = occupied_firewall_states(&world);
+    let syn = tcp_frame(H1, PUBLIC, P1, public2, SYN);
+    world.run(LAN, syn.clone());
+    assert_drop(&mut world, DropReason::Nat44TcpSessionTableFull, &syn);
+    assert_eq!(occupied_firewall_states(&world), states + 1);
+    assert_eq!(sessions_toward(&world, PUBLIC), 1);
+    assert_eq!(world.tcp.counters().hairpin_inbound_refused, 1);
+
+    // TCP inbound half denied by the firewall (M1 policy, EIF admits).
+    let mut world = World::new(
+        Nat44Filtering::EndpointIndependent,
+        true,
+        Some(outbound_only_rules()),
+    );
+    let public2 = world.establish(H2, P2, true);
+    let states = occupied_firewall_states(&world);
+    let syn = tcp_frame(H1, PUBLIC, P1, public2, SYN);
+    world.run(LAN, syn.clone());
+    assert_drop(&mut world, DropReason::FirewallDefaultDenied, &syn);
+    assert_eq!(occupied_firewall_states(&world), states + 1);
+    assert_eq!(sessions_toward(&world, PUBLIC), 1, "H1's session only");
+    assert_eq!(world.tcp.counters().inbound_sessions_created, 0);
+    assert_eq!(world.tcp.counters().hairpin_inbound_refused, 1);
+
+    // UDP peer table full in the outbound half: nothing commits.
+    let mut world = World::shaped(
+        Nat44Filtering::EndpointIndependent,
+        true,
+        Some(permissive_rules()),
+        Shape {
+            udp_peers: 1,
+            ..Shape::default()
+        },
+    );
+    let public2 = world.establish(H2, P2, false);
+    let state = world.state();
+    let packet = udp_frame(H1, PUBLIC, P1, public2);
+    world.run(LAN, packet.clone());
+    assert_drop(&mut world, DropReason::Nat44UdpPeerTableFull, &packet);
+    assert_eq!(world.state(), state);
+    assert_eq!(world.udp.counters().hairpin_inbound_refused, 0);
 }

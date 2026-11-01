@@ -700,8 +700,16 @@ RFC 4787 §6はfilteringに触れませんが、hairpinしたpacketはNATを一�
    場合だけ二つを続けてcommitします（TCPはprevalidate後）。packetはoutsideへ出ないため
    outside route/neighborは要求しません。commitするstateは同じhostが通常のoutbound
    packetで作るものと同一で、hairpinは新しいstate作成能力ではありません。remoteがrouter
-   自身の`P`なので、外部からこのstateを使うことはできません（`P`をsourceとするoutside
-   packetはcommon admissionの`IPV4_SOURCE_LOCAL_ADDRESS`でdrop）。
+   自身の`P`なので、外部からこのstateを使うことはできません。`P`をsourceとするoutside
+   packetはcommon admissionの`IPV4_SOURCE_LOCAL_ADDRESS`でdropし、opt-in ICMPv4 Type 3/Code 4
+   変換は引用remoteがrouterのlocal address（`P`を含む）なら全lookup前に
+   `NAT44_ICMPV4_QUOTED_REMOTE_LOCAL`でdropします（outside由来の入力がremoteでNAT stateを
+   引くのはこの二経路だけで、firewallのRELATED lookupはNAT変換が復元したtupleに限られます）。
+   ただしslotの形が同じでも許可の意味は外部remote一つ分より広くなります。全inside hostの
+   external sourceは`P`なので（REQ-9 aから不可避）、`address-dependent`ではX1のpeer/session
+   `P`はどのinside hostからのhairpinも許すinside全体のwildcardです（`address-and-port-dependent`
+   は`P:x2'`一つ）。firewallは引き続き`P:x2' -> X1:x1`のexact reverseだけをestablishedと
+   します。
 2. **inbound half**: outbound half commit後のstateに対し、`P:x1' -> P:x2'`を通常の
    inbound packetとしてplanします。destination mappingのfiltering（mode別、TCPはexact
    sessionかfilterを通ったinitial SYN）、translated destinationのinside route、firewall、
@@ -720,7 +728,9 @@ X2のmappingが`P`へ送っていないため`NAT44_UDP_HAIRPIN_FILTERED`（TCP�
 なります。
 
 hairpinning off、malformed、unknown destination mapping、送信元authority違反、TTL≤1、
-outbound halfのNAT capacity不足やfirewall denyは何もcommitしません。TTL≤1はICMP Time
+outbound halfのNAT capacity不足やfirewall denyは何もcommitしません。translated destinationの
+route miss/`WrongEgress`はdefensive checkで、mappingをinside-routed sourceにしか作らず
+reconcileでflushする固定publicationでは到達しません。TTL≤1はICMP Time
 Exceededを生成しないsilent dropです（NAT inboundと同じ。deferred）。
 
 ### firewall
@@ -755,7 +765,8 @@ firewall plan二回の和で有界です。
 
 counterはprotocolごとに`hairpin_translated`（両half commit）、`hairpin_inbound_refused`
 （outbound half commit後にinbound halfが拒否された数。通常の`filter_denied`/`session_misses`には
-数えない）、`hairpin_disabled`です。outbound halfは`mappings_*`/`peers_created`/`sessions_*`に
+数えない。`decide`後のTCP commit prevalidationとrewrite適用の失敗は逐次packet pathでは起きない
+前提なので数えない）、`hairpin_disabled`です。outbound halfは`mappings_*`/`peers_created`/`sessions_*`に
 数えますが、`outbound_translated`と`inbound_translated`にはどちらのhalfも数えません。
 
 ### switch
@@ -764,9 +775,13 @@ counterはprotocolごとに`hairpin_translated`（両half commit）、`hairpin_i
 理由でoperatorは`[nat44.udp]`/`[nat44.tcp]`の`hairpinning = false`でprotocolごとに切れます
 （RFC 1812 §1.1.3はdefaultが準拠するoptionを許す）。offではhairpin packetをNAT validation、
 NAT/firewall/resolution stateの変更、neighbor workより前に`NAT44_UDP_HAIRPIN_DISABLED` /
-`NAT44_TCP_HAIRPIN_DISABLED`（stable code 37/57。旧`*_HAIRPIN_UNSUPPORTED`を改名）でdropし
-`hairpin_disabled`に数えます。firewallをbindしたworkerでは、他のinside発packetと同じく
-firewallのtransport preflightとclock watermarkだけはこれより前に進みます。変更はfilteringと同じ
+`NAT44_TCP_HAIRPIN_DISABLED`でdropし`hairpin_disabled`に数えます。drop前にNAT runtimeの
+`observe_now`が通常のNAT packetと同じくclock watermarkとstate revisionを進め、firewallを
+bindしたworkerでは他のinside発packetと同じくfirewallのtransport preflightとclock watermarkも
+進みます。stable code 37/57は旧`*_HAIRPIN_UNSUPPORTED`の改名で、意味も狭まりました。旧codeは
+inside発のpublic address宛てのそのprotocol全部（UDP-only serviceへのTCPなどを含む）でしたが、
+新codeはそのprotocolのruntimeがhairpinning offの場合だけで、他protocolは
+`*_UNSUPPORTED_TRANSPORT`です。変更はfilteringと同じ
 reloadableで、storage shapeは変わらず、applyは全NAT stateをflushします。`ApplyPlan`は
 `NatChange::hairpinning`を`Delta<bool>`として出し、`policy_changed`には含めません。
 

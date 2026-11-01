@@ -890,3 +890,73 @@ fn build_tcp_rewrite(
         }),
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Ipv4Address, MacAddress};
+
+    /// Sender admission of the outbound half. On the wire, common IPv4
+    /// admission already refuses router-local and network/broadcast
+    /// sources, so the call site is defense in depth that mirrors the
+    /// ordinary outbound check; this pins the helpers themselves.
+    #[test]
+    fn hairpin_sender_admission_requires_an_inside_host_that_is_not_the_router() {
+        let lan = IfId(1);
+        let wan = IfId(2);
+        let public = Ipv4Address::from_octets([203, 0, 113, 10]);
+        let routes = [
+            Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, lan, None).unwrap(),
+            Route::new(
+                Ipv4Address::from_octets([0; 4]),
+                0,
+                wan,
+                Some(Ipv4Address::from_octets([203, 0, 113, 1])),
+            )
+            .unwrap(),
+        ];
+        let interfaces = [
+            Interface {
+                id: lan,
+                mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            },
+            Interface {
+                id: wan,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: lan,
+                address: Ipv4Address::from_octets([10, 0, 0, 1]),
+            },
+            LocalIpv4Binding {
+                interface: wan,
+                address: public,
+            },
+        ];
+        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+        let host = Ipv4Address::from_octets([10, 0, 0, 10]);
+        assert!(sender_is_authorized(&snapshot, host, public));
+        for forbidden in [
+            public,
+            Ipv4Address::from_octets([10, 0, 0, 1]),
+            Ipv4Address::from_octets([10, 0, 0, 0]),
+            Ipv4Address::from_octets([10, 0, 0, 255]),
+            Ipv4Address::from_octets([127, 0, 0, 1]),
+            Ipv4Address::from_octets([0, 0, 0, 1]),
+            Ipv4Address::from_octets([224, 0, 0, 1]),
+        ] {
+            assert!(
+                !sender_is_authorized(&snapshot, forbidden, public),
+                "{forbidden:?}"
+            );
+        }
+        assert!(reverse_is_inside(&snapshot, host, lan));
+        assert!(!reverse_is_inside(
+            &snapshot,
+            Ipv4Address::from_octets([198, 51, 100, 7]),
+            lan
+        ));
+    }
+}

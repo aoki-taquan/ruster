@@ -1074,6 +1074,46 @@ mod tcp_tests {
         });
     }
 
+    /// A full table answers `SessionFull` on both slot-search branches
+    /// (full scan at 16 slots and below, distinct keyed probes above).
+    #[test]
+    fn full_small_tcp_session_tables_refuse_inbound_syn() {
+        for capacity in [
+            2,
+            NAT44_TCP_INBOUND_SLOT_PROBES,
+            NAT44_TCP_INBOUND_SLOT_PROBES + 1,
+        ] {
+            let policy =
+                Nat44TcpPolicy::default().with_filtering(Nat44Filtering::EndpointIndependent);
+            with_config(policy, 40_000, 40_000, |config| {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = vec![Nat44TcpSessionSlot::default(); capacity];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                for port in 1..=capacity as u16 {
+                    let plan = runtime
+                        .plan_outbound(INTERNAL, 40_000, REMOTE1, port, true, 0)
+                        .unwrap();
+                    runtime.commit_outbound(plan, 0).unwrap();
+                }
+                assert!(runtime.sessions().iter().all(|slot| slot.is_occupied()));
+                for remote_port in 1..=8 {
+                    runtime.reusable_session_checks.set(0);
+                    assert_eq!(
+                        runtime
+                            .plan_inbound_read_only(40_000, REMOTE2, remote_port, true, 1)
+                            .err(),
+                        Some(Nat44TcpPlanError::SessionFull),
+                        "capacity {capacity}"
+                    );
+                    assert!(
+                        runtime.reusable_session_checks.get()
+                            <= capacity.min(NAT44_TCP_INBOUND_SLOT_PROBES)
+                    );
+                }
+            });
+        }
+    }
+
     /// L-5: a table of at most `NAT44_TCP_INBOUND_SLOT_PROBES` slots is
     /// scanned whole, so its single free slot is always found, wherever it
     /// is and whatever the tuple. (Capacity 1 cannot have a live mapping
@@ -5592,9 +5632,14 @@ impl<'a> Nat44TcpRuntime<'a> {
             let mut index =
                 usize::try_from(position % capacity as u64).expect("index below capacity");
             // `capacity` exceeds the probes made so far, so an unprobed
-            // position is at most `probe` steps away.
-            while probed[..probe].contains(&index) {
+            // position is at most `probe` steps away. The step count is
+            // also bounded on its own, independent of the full-scan branch
+            // above.
+            debug_assert!(capacity > NAT44_TCP_INBOUND_SLOT_PROBES);
+            let mut steps = 0;
+            while steps < NAT44_TCP_INBOUND_SLOT_PROBES && probed[..probe].contains(&index) {
                 index = if index + 1 == capacity { 0 } else { index + 1 };
+                steps += 1;
             }
             probed[probe] = index;
             if self.session_slot_reusable(index, now_ms) {
