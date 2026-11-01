@@ -2144,8 +2144,8 @@ ledger hook、supported APIではない）はdev-dependencyからだけ有効に
 
 `RxFillEngine::new`は`UmemDomainId`からfreshなledgerを作り（geometryは`UmemConfig`、headroomは
 user headroom + `XDP_PACKET_HEADROOM`）、防御的にFill/RX ringが空であることも確かめます。frame
-`0..rx_frames`がRX poolで、generated pool（`rx_frames..frame_count`、X03）は一度もpublishも
-lendもしません。free RX-pool frameは固定長FIFOで持ち、`refill`は`min(Fill room, free list,
+`0..rx_frames`がRX poolで、generated pool（`rx_frames..frame_count`）はFillへ一度もpublishせず、
+次々節X03の`allocate_generated`だけが貸します。free RX-pool frameは固定長FIFOで持ち、`refill`は`min(Fill room, free list,
 fill_batch)`個を`reserve_fill` → Fillへchunk base address write → Release publish →
 `publish_fill`の順に一回で出します。ring操作が失敗すればreserve済みframeを`cancel_fill`で
 free listへ戻し、generation exhaustionのframeはquarantineして次へ進みます。free listが空で
@@ -2391,5 +2391,83 @@ io-xdp `FakeKernel`のTX lifecycleとのdifferential（modelの`CompletionAvaila
 peerのARP requestを同じUMEM frameのままin-placeでARP replyへ書き換え、同じvethからTXし、peer kernelが
 `ip neigh`にreplyのMACを学習することで受信を確かめ、completionをreapし、さらにkickもreapもせずに
 submitしたままのframe（in-flight 1）をdrainのkickとreapだけで回収して`Drained`を確認してからcloseします
-（XDP-091〜111）。core `PacketIo` adapter、generated poolのTX（X03）、kick policy、health化、runtime
-statsはX03/X04です（XDP-112）。
+（XDP-091〜111）。generated poolのTXは次節X03、core `PacketIo` adapter、kick policy、health化、
+runtime statsはX04です（XDP-112）。
+
+### AF_XDP generated frames (X03, M2 S5)
+
+generated半分も同じ`RxFillEngine`の子module（`generated.rs`）で、同じledgerを使います。UMEM frame
+`rx_frames..frame_count`（configの`generated-frames`）がgenerated poolで、RX poolとは別の固定長free
+list（cold pathで一回だけ確保）を持ちます。RX/Fill/TX/Completionのring所有とkick handleは変わりません。
+
+state machine（generated pool frame）:
+
+```text
+Free (generated free list) ──allocate_generated(len)──► Leased(Generated) = GeneratedFrame
+  ▲  ▲  ▲                                                 │   │   │
+  │  │  └─────────── cancel (generated_cancelled) ───────┘   │   │
+  │  └────────────── drop (generated_abandoned) ─────────────┘   │
+  │                                                              │ stage_tx / commit
+  │                                                              ▼
+  ├── cancel_tx_handoff (generated_cancelled) ─────────── PendingTx = TxHandoff
+  │                                                              │ submit_tx(_batch)（X02と同じ上限）
+  │                                                              ▼
+  └── validated completion (generated_completed) ─────── TxOwnedByKernel ──address違い──► Quarantined
+```
+
+`allocate_generated(len: usize)`は次の順に検査し、拒否はblockせずledgerとfree listを変えません。
+
+| 順 | 条件 | 結果 |
+|---|---|---|
+| 1 | `drain`開始後 | `Rejected(Draining)` |
+| 2 | `len == 0` | `Rejected(ZeroLength)` |
+| 3 | `len < 14`（RXと同じEthernet header floor） | `Rejected(BelowMinimum)` |
+| 4 | `len > frame_size - (headroom + XDP_PACKET_HEADROOM)`（u32を越える値も） | `Rejected(TooLarge)` |
+| 5 | generated free listが空 | `Unavailable`（`poll`/`reap_completions`後にretry） |
+
+成功するとledgerの`lease_generated`（`Free`→`Leased(Generated)`、Fillを経由しない）で新しいgenerationの
+tokenを取り、descriptor `frame base + headroom`・長さ`len`を`ValidatedDescriptor`として作り（layoutの
+検証を二重のgateとして使う）、visible rangeだけをzero化して`GeneratedFrame`を貸します。byte accessは
+RXと同じ`UmemFrames::leased_bytes(_mut)`で、ledgerが`Leased`と記録するframeのexactなdescriptor範囲
+だけに限られるので、`len`の先やheadroomは到達できません。`GeneratedFrame`はengineを可変借用するので、
+RX/generatedを問わず貸せるframeは常に一つで（double lendなし）、bytes借用中のcancel/commitはcompile
+errorです。ledgerの`GenerationExhausted`ならframeはquarantineされ、次のfree frameへ進みます。
+
+commitは`stage_tx` + `submit_tx`で、forwarded frameと同じTX ring、同じin-flight上限（TX capacity、
+BACKEND-004）、同じ`TxBlocked::RingFull`/`InflightLimit`/`Draining`を使います。拒否されたhandoffは
+`TxRejected`でそのまま返り、retryか`cancel_tx_handoff`です。`stage_tx`したhandoffは`submit_tx_batch`で
+forwarded frameと混ぜられます。generated用のTX枠予約や公平性は持たず、上限は先着で共有します（X04）。
+
+pool分離: frameが`Free`になる全経路（RX recycle、runt、Fill rollback、handoff cancel、completion、
+drainのpending解放、generated cancel/abandon）は`push_free(frame)`一箇所を通り、所属poolはframe index
+（`frame >= rx_frames`）だけで決まります。completion addressやhandoffの主張は使いません。refillは
+RX free listだけを読むので、Fill ringにgenerated frameが入ることはなく、generated allocationは
+generated free listだけを読むのでRX frameを取りません。RX descriptorがgenerated frameを指しても
+そのframeは`FillOwnedByKernel`ではないので`NotKernelOwned`で不変、free/staged generated frameへの
+completionは`NotInFlight`で不変、in-flight generated frameのaddress違いcompletionはgenerated poolで
+quarantineします。
+
+accounting: generated poolの所有者はfree list長、`leased`（0か1）、`tx_handoffs`、gauge
+`generated_inflight`、`quarantined`の五つで、`GeneratedAccounting`（O(1)）は常にpool sizeの和です。
+RX poolの`FrameAccounting`はledgerのO(1) state countからgenerated分を引いて出します。`audit()`は
+両free listのentryが自pool・`Free`・全listで一回だけであること、generated poolにFill/RX stateが
+無いこと、generated poolをscanした各state数がengineの記録と一致すること（`GeneratedCount`）、両
+partitionの和を検査します。counterの関係は
+`generated_allocated = generated_committed + generated_cancelled + generated_abandoned + handoffs + leased`、
+`generated_committed = generated_completed + generated_inflight + TX後のgenerated quarantine`です。
+`tx_inflight`と`tx_handoffs_outstanding()`は両poolの合計です。drainはgenerated allocationを止め
+（`Draining`）、in-flight generated frameを同じ検証付きreapで回収し、`DrainReport::generated_accounting`を
+返します。caller保持のgenerated handoffはRXと同様にcallerがcancelします。
+
+testはscripted heap kernel上で、exact visible length（full lengthを0xaaで送った同じframeに42 byteを
+割り当て、wire上の43 byte目以降が不変）、zero化、全拒否理由とUnavailableからの回復、cancel/abandon/
+handoff cancelのpoolとgeneration、forwarded frameとの共有上限とback-pressure、混在batchの逆順
+completionとFillのRX限定、他poolを指すkernel return、generation exhaustion、両poolのaudit検出、
+steady-stateのallocation zero、io-xdp `FakeKernel`の`lease_generated`経由lifecycleとのdifferential、
+io-conformance generated suiteのsemantics（三つの`GeneratedBatchCompletion`不変条件、成功allocation
+だけのownership、拒否後のpool復帰とgeneration、completionのexact frame）をengine層で検証します。
+suite自体はcore `GeneratedPacketIo`実装を要求するため、core adapterと一緒にX04で適用します。
+privileged smokeのgenerated phaseは専用netns veth上でgenerated poolのframeに42 byteのARP requestを
+書いてcommitし、peer kernelが送信元を`ip neigh`に学習することとcompletionを確認し、kickなしで提出した
+最後の一つをdrainで回収します（XDP-120〜131）。core adapter、refusalのcore errorへのmapping、TX枠の
+公平性、multi-port egress、runtime statsはX04です（XDP-132）。

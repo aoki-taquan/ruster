@@ -11,8 +11,10 @@
 #![doc = "the datapath over the session's once-taken [`DatapathRings`] bundle with one"]
 #![doc = "authoritative frame ledger: bounded Fill refill with starvation accounting,"]
 #![doc = "validated RX descriptors, ledger-gated frame lending, same-frame TX bounded by"]
-#![doc = "the TX ring capacity, validated completion reaping, need-wakeup kicks, and an"]
-#![doc = "exactly-once shutdown drain. Core `PacketIo` integration remains unimplemented."]
+#![doc = "the TX ring capacity, validated completion reaping, need-wakeup kicks, an"]
+#![doc = "exactly-once shutdown drain, and exact-length generated frames from the separate"]
+#![doc = "generated pool on the same TX path. Core `PacketIo` integration remains"]
+#![doc = "unimplemented."]
 
 mod config;
 mod datapath;
@@ -88,7 +90,8 @@ pub use ring::{
 pub use ruster_io_xdp::{AuditError, FrameId, FrameStateKind, LedgerError, UmemDomainId};
 pub use rx_fill::{
     CompletionInvalidReason, CompletionLag, CompletionReport, DrainOutcome, DrainReport,
-    FrameAccounting, RefillReport, RxBatch, RxFillAuditError, RxFillConfig, RxFillCounters,
+    FrameAccounting, GeneratedAccounting, GeneratedAllocError, GeneratedCounters, GeneratedFrame,
+    GeneratedRejectReason, RefillReport, RxBatch, RxFillAuditError, RxFillConfig, RxFillCounters,
     RxFillEngine, RxFillError, RxFillSetupError, RxFrame, RxInvalidReason, TxBlocked, TxCounters,
     TxHandoff, TxRejected, TxRejection, TxSubmitError, TxSubmitReport, ETHERNET_HEADER_LEN,
 };
@@ -99,6 +102,8 @@ pub use session::{
     MAX_RING_HEADER_OFFSET,
 };
 
+#[cfg(test)]
+mod generated_tests;
 #[cfg(test)]
 mod rx_fill_tests;
 #[cfg(test)]

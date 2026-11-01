@@ -19,12 +19,29 @@
 //! (`Leased`), which ends by recycling it to the free list (`Free`, next
 //! refill republishes it) or by handing it to TX (`PendingTx`, see
 //! [`TxHandoff`]). An invalid descriptor never reaches the caller.
+//!
+//! The generated pool (`rx_frames..frame_count`, M2 S5, X03) lives in the
+//! `generated` child module on the same ledger: a free generated frame is
+//! leased directly (`Free` → `Leased`, never published to Fill), lent as a
+//! [`GeneratedFrame`] of exactly the requested visible length, and either
+//! cancelled or abandoned back to the generated free list or staged into
+//! the same TX path as forwarded frames. Every frame that becomes `Free`
+//! returns to the free list of its own pool, decided by its frame index
+//! alone, so Fill never sees a generated frame and generation never takes
+//! an RX frame.
 
+#[path = "generated.rs"]
+mod generated;
 #[path = "tx_completion.rs"]
 mod tx_completion;
 
 use std::{fmt, num::NonZeroU32};
 
+use generated::GeneratedPool;
+pub use generated::{
+    GeneratedAccounting, GeneratedAllocError, GeneratedCounters, GeneratedFrame,
+    GeneratedRejectReason,
+};
 use tx_completion::InflightFifo;
 pub use tx_completion::{
     CompletionInvalidReason, CompletionLag, CompletionReport, DrainOutcome, DrainReport,
@@ -351,6 +368,32 @@ pub enum RxFillAuditError {
         /// RX pool size.
         rx_frames: u32,
     },
+    /// A generated free-list entry is outside the generated pool,
+    /// duplicated, or not `Free`.
+    GeneratedFreeListEntry {
+        /// Offending frame index.
+        frame: u32,
+    },
+    /// The engine's record of one generated-pool state disagrees with a
+    /// full scan of the generated pool (free list length for `Free`,
+    /// outstanding generated handoffs for `PendingTx`, the
+    /// `generated_inflight` gauge for `TxOwnedByKernel`, generated
+    /// quarantine for `Quarantined`, zero for every other state).
+    GeneratedCount {
+        /// Generated-pool state whose count disagrees.
+        state: FrameStateKind,
+        /// What the engine records.
+        recorded: u32,
+        /// What the scan found.
+        actual: u32,
+    },
+    /// The owner partition of the generated pool does not sum to its size.
+    GeneratedAccounting {
+        /// Sum over all owners.
+        accounted: u32,
+        /// Generated pool size.
+        generated_frames: u32,
+    },
 }
 
 /// Fill outcome of one refill.
@@ -384,7 +427,7 @@ impl RefillReport {
     }
 }
 
-/// Fixed-capacity FIFO of free RX-pool frame indices.
+/// Fixed-capacity FIFO of free frame indices of one pool.
 struct IndexFifo {
     slots: Box<[u32]>,
     head: usize,
@@ -393,10 +436,15 @@ struct IndexFifo {
 
 impl IndexFifo {
     fn full(count: u32) -> Self {
+        Self::range(0, count)
+    }
+
+    /// Holds every index of `start..end` (cold: one allocation).
+    fn range(start: u32, end: u32) -> Self {
         Self {
-            slots: (0..count).collect(),
+            slots: (start..end).collect(),
             head: 0,
-            len: count as usize,
+            len: end.saturating_sub(start) as usize,
         }
     }
 
@@ -486,7 +534,15 @@ struct EngineState<'memory> {
     /// Process-unique identity stamped into every `TxHandoff`.
     engine_id: u64,
     frames: UmemFrames<'memory>,
+    /// Free RX-pool frames (`0..rx_frames`), the only source of Fill.
     free: IndexFifo,
+    /// Free generated-pool frames (`rx_frames..frame_count`), the only
+    /// source of generated allocation.
+    generated_free: IndexFifo,
+    /// Generated-pool owners other than the free list and the in-flight
+    /// gauge (which is `generated_counters.generated_inflight`).
+    generated: GeneratedPool,
+    generated_counters: GeneratedCounters,
     pending: TokenFifo,
     scratch: Box<[Option<FrameToken>]>,
     counters: RxFillCounters,
@@ -592,8 +648,7 @@ impl EngineState<'_> {
                             .ledger_mut()
                             .release_kernel_fill(token)
                             .expect("classification proved FillOwnedByKernel");
-                        let pushed = self.free.push(token.frame().index());
-                        debug_assert!(pushed, "each Free transition enters the free list once");
+                        self.push_free(token.frame().index());
                         bump(&mut self.counters.rx_runts_recycled);
                     }
                 }
@@ -601,13 +656,29 @@ impl EngineState<'_> {
         }
     }
 
+    /// Whether `frame` belongs to the generated pool (`rx_frames..`).
+    const fn is_generated(&self, frame: u32) -> bool {
+        frame >= self.rx_frames
+    }
+
+    /// Lists a frame that just became `Free` in the free list of its own
+    /// pool, chosen by frame index alone.
+    fn push_free(&mut self, frame: u32) {
+        let pushed = if self.is_generated(frame) {
+            self.generated_free.push(frame)
+        } else {
+            self.free.push(frame)
+        };
+        debug_assert!(pushed, "each Free transition enters the free list once");
+    }
+
+    /// Ends a `Leased` cycle (either pool) and frees the frame to its pool.
     fn recycle(&mut self, token: FrameToken) {
         self.frames
             .ledger_mut()
             .recycle_lease(token)
-            .expect("only a live RxFrame recycles, and it is Leased");
-        let pushed = self.free.push(token.frame().index());
-        debug_assert!(pushed, "each Free transition enters the free list once");
+            .expect("only a live lease recycles, and it is Leased");
+        self.push_free(token.frame().index());
     }
 
     fn rollback_reserved(&mut self, reserved: usize) {
@@ -617,8 +688,7 @@ impl EngineState<'_> {
                     .ledger_mut()
                     .cancel_fill(token)
                     .expect("scratch holds FillReserved tokens");
-                let pushed = self.free.push(token.frame().index());
-                debug_assert!(pushed);
+                self.push_free(token.frame().index());
             }
         }
     }
@@ -652,8 +722,9 @@ impl<'memory> RxFillEngine<'memory> {
     /// `domain`, and performs the first bounded refill (see
     /// [`Self::initial_refill`]).
     ///
-    /// Frames `0..rx_frames` form the RX pool. The generated pool
-    /// `rx_frames..frame_count` is never published or lent by this engine.
+    /// Frames `0..rx_frames` form the RX pool, the only frames published to
+    /// Fill. The generated pool `rx_frames..frame_count` is never published
+    /// to Fill; it is lent only by [`Self::allocate_generated`].
     /// All four rings must be empty, a defensive check on top of the
     /// once-per-session bundle, and the Completion ring must be at least as
     /// large as the TX ring, which bounds in-flight TX.
@@ -715,6 +786,9 @@ impl<'memory> RxFillEngine<'memory> {
             engine_id: next_engine_id(),
             frames,
             free: IndexFifo::full(geometry.rx_frames()),
+            generated_free: IndexFifo::range(geometry.rx_frames(), geometry.frame_count()),
+            generated: GeneratedPool::default(),
+            generated_counters: GeneratedCounters::default(),
             pending: TokenFifo::new(rx.capacity()),
             scratch: vec![None; fill.capacity() as usize].into_boxed_slice(),
             counters: RxFillCounters::default(),
@@ -761,8 +835,8 @@ impl<'memory> RxFillEngine<'memory> {
     }
 
     /// Frames handed to TX and neither submitted nor cancelled: the
-    /// ledger's `PendingTx` count. A `TxHandoff` dropped without either
-    /// stays counted here forever.
+    /// ledger's `PendingTx` count, both pools (received and generated). A
+    /// `TxHandoff` dropped without either stays counted here forever.
     #[must_use]
     pub fn tx_handoffs_outstanding(&self) -> u32 {
         u32::try_from(
@@ -929,7 +1003,10 @@ impl<'memory> RxFillEngine<'memory> {
     }
 
     /// Returns a TX handoff that will not be transmitted to the free list
-    /// (the next refill republishes its frame to Fill).
+    /// of its pool: a received frame to the RX free list (the next refill
+    /// republishes it to Fill, counted as `tx_handoffs_cancelled`), a
+    /// generated frame to the generated free list (counted as
+    /// `generated_cancelled`).
     ///
     /// The handoff is verified against the ledger before it is consumed: a
     /// handoff of another engine (or one whose geometry this ledger does
@@ -944,13 +1021,19 @@ impl<'memory> RxFillEngine<'memory> {
             return Err((RxFillError::Ledger(error), handoff));
         }
         let token = handoff.defuse();
-        self.state
+        let state = &mut self.state;
+        state
             .frames
             .ledger_mut()
             .cancel_pending_tx(token)
             .expect("verified PendingTx with this token");
-        self.state.recycle(token);
-        bump(&mut self.state.counters.tx_handoffs_cancelled);
+        state.recycle(token);
+        if state.is_generated(token.frame().index()) {
+            state.generated.handoffs -= 1;
+            bump(&mut state.generated_counters.generated_cancelled);
+        } else {
+            bump(&mut state.counters.tx_handoffs_cancelled);
+        }
         Ok(())
     }
 
@@ -986,26 +1069,41 @@ impl<'memory> RxFillEngine<'memory> {
 
     /// Cold full consistency check of the ledger and every engine list.
     ///
-    /// Every RX-pool frame must be accounted for exactly once: each listed
-    /// frame appears in exactly one of the free, pending-RX, and in-flight
-    /// lists, in the matching ledger state with the exact token; each
-    /// ledger state that has a list is listed completely; and the owner
-    /// partition ([`Self::frame_accounting`]) sums to the pool size.
-    /// In-flight TX must not exceed the TX capacity. It runs only between
+    /// Every frame must be accounted for exactly once: each listed frame
+    /// appears in exactly one of the RX free, generated free, pending-RX,
+    /// and in-flight lists, in the matching ledger state with the exact
+    /// token; RX free-list entries lie in the RX pool and generated
+    /// free-list entries in the generated pool; RX-only states (Fill, RX)
+    /// never appear in the generated pool; each ledger state that has a
+    /// list or gauge matches it exactly, per pool; and both owner
+    /// partitions ([`Self::frame_accounting`],
+    /// [`Self::generated_accounting`]) sum to their pool size. In-flight TX
+    /// (both pools) must not exceed the TX capacity. It runs only between
     /// batches (it borrows the engine shared, so no frame can be lent) and
     /// allocates one bitmap.
     pub fn audit(&self) -> Result<(), RxFillAuditError> {
         let ledger = self.state.frames.ledger();
         ledger.deep_audit().map_err(RxFillAuditError::Ledger)?;
         let mut seen = vec![false; ledger.frame_count()];
-        for frame in self.state.free.iter() {
-            let entry = seen.get_mut(frame as usize);
-            let is_free = ledger
+        let is_free = |frame| {
+            ledger
                 .state(frame)
-                .is_ok_and(|state| state.kind() == FrameStateKind::Free);
-            match entry {
-                Some(seen) if !*seen && frame < self.state.rx_frames && is_free => *seen = true,
+                .is_ok_and(|state| state.kind() == FrameStateKind::Free)
+        };
+        for frame in self.state.free.iter() {
+            match seen.get_mut(frame as usize) {
+                Some(seen) if !*seen && frame < self.state.rx_frames && is_free(frame) => {
+                    *seen = true;
+                }
                 _ => return Err(RxFillAuditError::FreeListEntry { frame }),
+            }
+        }
+        for frame in self.state.generated_free.iter() {
+            match seen.get_mut(frame as usize) {
+                Some(seen) if !*seen && self.state.is_generated(frame) && is_free(frame) => {
+                    *seen = true;
+                }
+                _ => return Err(RxFillAuditError::GeneratedFreeListEntry { frame }),
             }
         }
         for token in self.state.pending.iter() {
@@ -1027,26 +1125,26 @@ impl<'memory> RxFillEngine<'memory> {
                     && state.token() == Some(entry.token)
             });
             match entry_slot {
-                Some(seen) if !*seen && in_flight && frame < self.state.rx_frames => *seen = true,
+                Some(seen) if !*seen && in_flight => *seen = true,
                 _ => return Err(RxFillAuditError::InflightEntry { frame }),
             }
         }
         let mut free = 0_u32;
         let mut available = 0_u32;
         let mut in_flight = 0_u32;
+        let mut generated = [0_u32; STATE_KINDS.len()];
         for frame in 0..ledger.layout().frame_count() {
             let kind = ledger
                 .state(frame)
                 .map_err(|_| RxFillAuditError::FreeListEntry { frame })?
                 .kind();
-            let in_pool = frame < self.state.rx_frames;
+            let in_pool = !self.state.is_generated(frame);
             let allowed = match kind {
-                FrameStateKind::Free => true,
-                FrameStateKind::FillOwnedByKernel
-                | FrameStateKind::RxAvailable
+                FrameStateKind::Free
                 | FrameStateKind::PendingTx
                 | FrameStateKind::TxOwnedByKernel
-                | FrameStateKind::Quarantined => in_pool,
+                | FrameStateKind::Quarantined => true,
+                FrameStateKind::FillOwnedByKernel | FrameStateKind::RxAvailable => in_pool,
                 _ => false,
             };
             if !allowed {
@@ -1054,6 +1152,9 @@ impl<'memory> RxFillEngine<'memory> {
             }
             if in_pool && kind == FrameStateKind::Free {
                 free += 1;
+            }
+            if !in_pool {
+                generated[kind as usize] += 1;
             }
             if kind == FrameStateKind::RxAvailable {
                 available += 1;
@@ -1078,6 +1179,32 @@ impl<'memory> RxFillEngine<'memory> {
         if in_flight > limit {
             return Err(RxFillAuditError::InflightExceedsLimit { in_flight, limit });
         }
+        let recorded = self.generated_accounting();
+        for kind in STATE_KINDS {
+            let expected = match kind {
+                FrameStateKind::Free => recorded.free,
+                FrameStateKind::PendingTx => recorded.tx_handoffs,
+                FrameStateKind::TxOwnedByKernel => recorded.tx_in_flight,
+                FrameStateKind::Quarantined => recorded.quarantined,
+                // A generated lease borrows the engine mutably, so none is
+                // live while this shared borrow is.
+                _ => 0,
+            };
+            let actual = generated[kind as usize];
+            if expected != actual {
+                return Err(RxFillAuditError::GeneratedCount {
+                    state: kind,
+                    recorded: expected,
+                    actual,
+                });
+            }
+        }
+        if recorded.total() != recorded.generated_frames {
+            return Err(RxFillAuditError::GeneratedAccounting {
+                accounted: recorded.total(),
+                generated_frames: recorded.generated_frames,
+            });
+        }
         let accounting = self.state.accounting();
         if accounting.total() != self.state.rx_frames {
             return Err(RxFillAuditError::Accounting {
@@ -1089,17 +1216,34 @@ impl<'memory> RxFillEngine<'memory> {
     }
 }
 
+/// Every ledger state, in declaration order (the ledger's own list is
+/// private to `ruster-io-xdp`).
+const STATE_KINDS: [FrameStateKind; 10] = [
+    FrameStateKind::Free,
+    FrameStateKind::FillReserved,
+    FrameStateKind::FillOwnedByKernel,
+    FrameStateKind::RxAvailable,
+    FrameStateKind::Leased,
+    FrameStateKind::PendingTx,
+    FrameStateKind::TxReserved,
+    FrameStateKind::TxOwnedByKernel,
+    FrameStateKind::CompletionAvailable,
+    FrameStateKind::Quarantined,
+];
+
 impl fmt::Debug for RxFillEngine<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("RxFillEngine")
             .field("frames", &self.state.frames)
             .field("free", &self.state.free.len())
+            .field("generated_free", &self.state.generated_free.len())
             .field("pending", &self.state.pending.len())
             .field("inflight", &self.state.inflight.len())
             .field("draining", &self.state.draining)
             .field("counters", &self.state.counters)
             .field("tx_counters", &self.state.tx_counters)
+            .field("generated_counters", &self.state.generated_counters)
             .finish_non_exhaustive()
     }
 }

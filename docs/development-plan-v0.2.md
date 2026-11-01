@@ -98,7 +98,7 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
 ### Partialまたは欠落
 
 - production backendが無い。AF_PACKETはscripted syscall上のcopy backendまで、AF_XDPは
-  一socketのsession、XDP program attach、RX/Fill engineとsame-frame TX/Completionまでで、`ruster run`、`PacketIo` adapter、multi-queue
+  一socketのsession、XDP program attach、RX/Fill engine、same-frame TX/Completion、generated frameまでで、`ruster run`、`PacketIo` adapter、multi-queue
   worker ownership、netns/実NIC forwarding E2Eは無い（M2）。
 - `run-sim`はrestart-required applyをrejectとして報告し、同一process内でstorageを
   作り直さない（SIM-016 deferred）。process restartをまたぐgeneration/key履歴は無い。
@@ -131,8 +131,13 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   `TxBlocked`のrecoverableなwould-block、refill前のbounded completion reapとaddress検証/quarantine、
   completion lag、TX need-wakeup、bundle内のkick handle（`sendto`/`poll`、typed errno）、
   exactly-onceのshutdown drainとframe accounting audit、OBS-018のTX counter）はM2 S4（X02）で追加した
-  （XDP-091〜111、BACKEND-004）。`PacketIo` adapter、generated poolのTX（X03）、kick policy、
-  runtime stats接続はまだ無い（XDP-112）。
+  （XDP-091〜111、BACKEND-004）。`PacketIo` adapter、kick policy、runtime stats接続はまだ無い
+  （XDP-112）。
+- AF_XDP generated frame（同じengineと同じledger: generated pool `rx_frames..frame_count`からの
+  exact visible length allocation、typedな`Unavailable`/`Rejected`、commitはforwarded frameと同じTX
+  上限とback-pressure、cancel/abandon/completionはgenerated free listへ、pool分離と両poolのaudit、
+  `GeneratedCounters`）はM2 S5（X03）で追加した（XDP-120〜131、IO-009）。core
+  `GeneratedPacketIo` adapterとconformance suiteの適用はX04（XDP-132）。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
   ringのsaturationのruntime接続が無い（OBS-017/018 deferred。AF_XDP RX/Fill engine自身のcounterはM2 S3）。core `PublicationQuiescenceGuard::new`はsealされていない。
