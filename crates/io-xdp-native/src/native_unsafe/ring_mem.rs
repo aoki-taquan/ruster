@@ -50,6 +50,34 @@ impl<'memory, T: RingValue> RingMemory<'memory, T> {
     ) -> Result<Self, RingMapError> {
         let layout = RingMmapLayout::new(raw, entries, T::ELEMENT)?;
         let mapping = BorrowedMmap::new(memory, layout)?;
+        Self::from_checked(mapping, layout, entries)
+    }
+
+    /// Binds a ring to an already borrowed mapping, re-deriving the layout
+    /// for this element type so a layout of the wrong element cannot be used.
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn with_mapping(
+        mapping: BorrowedMmap<'memory>,
+        raw: XdpRingOffset,
+        entries: RingEntries,
+    ) -> Result<Self, RingMapError> {
+        let layout = RingMmapLayout::new(raw, entries, T::ELEMENT)?;
+        mapping.validate(layout)?;
+        Self::from_checked(mapping, layout, entries)
+    }
+
+    fn from_checked(
+        mapping: BorrowedMmap<'memory>,
+        layout: RingMmapLayout,
+        entries: RingEntries,
+    ) -> Result<Self, RingMapError> {
         let producer = mapping.field(RingField::Producer, layout.producer())?;
         let consumer = mapping.field(RingField::Consumer, layout.consumer())?;
         let flags = mapping.field(RingField::Flags, layout.flags())?;

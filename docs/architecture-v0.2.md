@@ -1907,3 +1907,74 @@ C2AはUMEM allocation/registration、Fill/Completion/RX/TX ring configuration、
 `XDP_MMAP_OFFSETS` query、ring mappingの組立、`sockaddr_xdp` bind transaction、negotiated
 mode、wakeup policy、live session、XDP program/XSKMAP、libxdp、core `PacketIo`を実装済みとは
 主張しません。これらのresource lifetimeとpacket ownershipは後続sliceで別途検証します。
+
+### native AF_XDP session builder (X00C, M2 S1)
+
+X00Cはvalidated configから一つのsocket（一interface queue）のready ringまでを、上記sealed
+seamだけを通る一つのfailure-atomic transactionとして組み立てます。libbpf/libxdpにlinkせず、
+Linux v6.8 raw UAPI profile（`if_xdp.h`の`repr(C)` layoutとx86_64 syscall定数）だけを使います。
+XDP program/XSKMAP attach（S2）とdatapath engine（S3）は含みません。public APIはx86_64 Linuxだけの
+`NativeSession`で、他targetではtypeそのものが存在しません（pure ABI/ring/configはC0/C1どおり）。
+
+入力の`SessionConfig::new(device, queue, bind_flags, rings, umem)`は`ValidatedAfXdpPortV1`の同名
+accessorから作ります（native crateはconfig crateへ依存しない）。syscall前にdevice名をLinux
+`dev_valid_name`相当（1..=15 byteのprintable ASCII、`/`・`:`・`.`/`..`なし）へ制限して
+NUL-padded `IFNAMSIZ` bufferにし、`XDP_SHARED_UMEM`を拒否します（sessionごとに独立UMEM）。
+
+`NativeSession::open`のstep順は固定です。
+
+| # | step | 内容と検証 |
+|---|---|---|
+| 1 | `InterfaceLookup` | `if_nametoindex(3)`。callerのnetwork namespaceで解決し、sysfsに依存しない |
+| 2 | `OpenSocket` | `socket(AF_XDP, SOCK_RAW \| SOCK_CLOEXEC \| SOCK_NONBLOCK, 0)` |
+| 3 | `MapUmem` | anonymous private RW `mmap`。`UmemConfig::byte_len`をchecked `usize`化し4 KiBの倍数へ切上げ、addressが0またはpage非alignなら拒否 |
+| 4 | `RegisterUmem` | `XDP_UMEM_REG`（addr、len=`byte_len`、chunk=`frame_size`、headroom=user headroom、flags/tx_metadata_len 0）。kernelが`XDP_PACKET_HEADROOM`を加える |
+| 5–8 | `Size*Ring` | Fill、Completion、RX、TXの順に`u32` entryをsetsockopt |
+| 9 | `QueryMmapOffsets` | exact 128 byte（v1 layoutは拒否）。各ringで全field offset ≤ `MAX_RING_HEADER_OFFSET`（4096）、alignment、overlap、overflow、`usize`表現をring mmap前に検証 |
+| 10–13 | `Map*Ring` | Fill、Completion、RX、TXを各pgoffで`MAP_SHARED`。長さはchecked layoutの`descriptors + entries * element`。page非alignを拒否し、role-typed viewを一度実mapping上に組んで検証 |
+| 14 | `Bind` | `sockaddr_xdp{AF_XDP, flags, ifindex, queue, shared_umem_fd 0}`。flagsは`ValidatedBindFlags`（need-wakeup必須）で、必ず`XDP_COPY`か`XDP_ZEROCOPY`の一方を含む |
+| 15 | `QueryOptions` | `XDP_OPTIONS`はexact 4 byte。`XDP_OPTIONS_ZEROCOPY`以外のbit、bindしたpolicyと異なるnegotiated modeを拒否 |
+
+各resourceは取得成功後だけRAII ownerへ入り、取得順に宣言したlocalなので、途中のerrorは取得済み
+resourceだけをexact reverse orderで一回ずつ解放します。live sessionはowner fieldを逆順（TX、RX、
+Completion、Fill ring、UMEM、socket）に宣言し、Dropと明示`close`はこの順にunmap/closeします。
+`close`は全releaseを一回ずつ試み、最初の失敗だけを`CleanupError{stage, errno}`で返します。
+UMEM pageはkernelがpinしているため、socket close前のUMEM unmapでもkernel側pageは解放されません。
+
+ring viewは`NativeSession::rings(&mut self)`が返す`NativeRings<'_>`（`FillProducer`、
+`CompletionConsumer`、`RxConsumer`、`TxProducer`、`UmemRegion`）だけで、各viewは対応する
+`MappedRegion`を排他borrowします。従ってviewはmappingより長命になれず、二組を同時に持てず、
+borrow中はunmapもできません。この借用を作る`MappedRegion::borrow_mapping`は、`mmap`成功値が
+実mappingであることを約束する`unsafe trait MapsRealMemory`を実装したseamだけで使え、
+synthetic addressを返すtranscript-only fakeでは使えません。UMEM byte accessはまだ公開せず、
+frame ownership ledgerと結合するX01〜X03で追加します。sessionは`!Send + !Sync`です。
+
+failureは値を持たない`SessionError{stage, failure}`です。errnoの分類は次のとおりです。
+
+| errno | `SessionFailure` |
+|---|---|
+| EPERM、EACCES | `PermissionDenied`（典型はsocketの`CAP_NET_RAW`不足） |
+| ENOMEM | `OutOfMemory` |
+| ENOBUFS（`RegisterUmem`だけ） | `MemlockLimit`（`CAP_IPC_LOCK`なしで`RLIMIT_MEMLOCK`超過。他stageは`Errno(105)`） |
+| ENODEV | `NoSuchDevice` |
+| EINVAL | `InvalidArgument`（bindではqueue idがreal RX/TX queue数以上が典型） |
+| EBUSY | `Busy`（queueに既にAF_XDP poolがある） |
+| EOPNOTSUPP（`XDP_ZEROCOPY`付きbind） | `ZeroCopyUnsupported` |
+| 他のEOPNOTSUPP、socketのEAFNOSUPPORT | `Unsupported` |
+| その他 / 範囲外 | `Errno(n)` / `UnreadableErrno` |
+
+`auto`はkernelの暗黙copy fallback（mode bitなしbind）を使わず、まず`XDP_ZEROCOPY`でbindします。
+Linux v6.8 `xp_assign_dev`はdriverに`ndo_bpf`/`ndo_xsk_wakeup`が無いとEOPNOTSUPPを返し、
+driverがXSK poolを未対応と返す場合も同じerrnoです。この`ZeroCopyUnsupported`だけで一回目の
+attemptを全てreverse releaseし、新しいsocket/UMEMで`XDP_COPY` transactionを行います
+（`zero_copy_fallback() == true`）。EINVALはqueue範囲外やdriver geometry拒否と区別できないため、
+EBUSY、ENOMEMと同じくfallbackせずfail closedです。`zero-copy`指定もfallbackしません。
+
+finite fakeは固定長transcript、page-aligned実arena mapping、fd/mapping台帳で、15 stepの各call
+へのerrno注入、kernel報告の各不正値、teardown各releaseの失敗、`auto`のfallback成功/失敗を
+注入し、exact reverse release、leakなし、二重releaseなしを検証します（XDP-037〜043）。
+privileged smoke（`RUSTER_PRIV_XDP=1`、`scripts/priv-xdp-smoke.sh`）は専用netns内だけに作った
+veth上でcopy session、ring readiness、EBUSY/EINVAL/ENODEV、vethの`auto`→copy fallbackを実kernel
+で検証し、netnsを必ず削除します。initial netnsでは実行を拒否し、env/netns/capability不足は
+skipせずfailです（XDP-044）。実kernelではclose直後の同queue再bindが、pool登録解除のdeferred
+workのため短時間EBUSYになります。session builderは再試行せず、retry policyはX04です（XDP-045）。

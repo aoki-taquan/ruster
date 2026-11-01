@@ -108,6 +108,11 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   ring/UMEM、existing-program policy）、bounded validation、restart-required classification、
   `run-sim`の非sim backend拒否はM2 S9で追加した（CONFIG-004〜007、BACKEND-001〜003）。これを
   使うsocket/UMEM/attach setupと`ruster run`はまだ無い（M2）。
+- 一socketのfailure-atomic native session（`if_nametoindex`、AF_XDP socket、UMEM mmap/登録、
+  四ring size/`XDP_MMAP_OFFSETS`検証/mmap、`sockaddr_xdp` bind、`XDP_OPTIONS`によるmode確認、
+  `auto`のEOPNOTSUPP限定copy fallback、typed errno、exact reverse teardown）はM2 S1（X00C）で
+  追加した（XDP-037〜045）。XDP program attach（S2）、datapath engine（S3）、`ruster run`は
+  まだ無い。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
   ringのsaturationが無い（OBS-017/018 deferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
@@ -534,7 +539,9 @@ workflowごとのscopeを固定し、同じtestを複数jobへ無差別に重複
   - throughput合否やhardware比較は扱わない
 
 AF_PACKET/AF_XDP crate追加後の通常compile/clippyはworkspaceの`ci.yml`が担当する。
-libxdp enabled buildにhost libraryが必要なら別の明示container jobをX00で追加し、library不在を
+AF_XDP backendはlibbpf/libxdpにlinkしないraw UAPI v6.8 profileなので、host library用の
+container jobは不要である。privileged netns/veth smoke（`scripts/priv-xdp-smoke.sh`、
+`RUSTER_PRIV_XDP=1`）はX00Cで追加したが、workflow化はX04が所有し、capability不足を
 silent skipしない。packet/property matrixはtruncation、length/checksum、fragment、odd payload、
 incremental/full checksum一致、generation/clock/capacityを含む。
 
@@ -568,8 +575,11 @@ thresholdを満たした場合だけ主張する。
 次を満たさないAF_XDP PRはexperimental branchでは検証できてもproduction backendとして
 mainへmergeしない。
 
-1. libxdp/libbpf/kernel UAPIのABI、build/link、minimum kernel/driver条件を固定し、通常CIで
-   enabled/disabled buildを検証する。
+1. libbpf-free、raw UAPI v6.8 profile: libbpf/libxdpにlinkせず、Linux v6.8
+   `include/uapi/linux/if_xdp.h`の`repr(C)` layoutとx86_64 syscall定数をcompile-time/unit testで
+   固定し（XDP-020、XDP-036）、minimum kernel/driver条件を記録する。外部libraryが無いため
+   enabled/disabled buildの区別は無く、通常CIのworkspace build（x86_64 gnu/musl）がそのまま
+   検証する。
 2. XDP program attachが既存programを無断で置換せず、partial attach失敗とshutdownで元状態を
    回復する。
 3. `RLIMIT_MEMLOCK`、UMEM registration、queue bind、zero-copy request/fallbackをtyped errorと

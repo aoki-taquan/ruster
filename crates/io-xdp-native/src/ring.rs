@@ -6,7 +6,10 @@
 
 use crate::{
     abi::{XdpDescriptor, XdpRingOffset},
-    native_unsafe::ring_mem::{RingMemory, RingValue},
+    native_unsafe::{
+        mmap::BorrowedMmap,
+        ring_mem::{RingMemory, RingValue},
+    },
     NativeRingError, RingEntries, RingMapError,
 };
 
@@ -48,6 +51,24 @@ impl<'memory, T: RingValue> ProducerRing<'memory, T> {
     ) -> Result<Self, RingMapError> {
         Ok(Self {
             memory: RingMemory::new(memory, offsets, entries)?,
+        })
+    }
+
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        )),
+        allow(dead_code)
+    )]
+    fn with_mapping(
+        mapping: BorrowedMmap<'memory>,
+        offsets: XdpRingOffset,
+        entries: RingEntries,
+    ) -> Result<Self, RingMapError> {
+        Ok(Self {
+            memory: RingMemory::with_mapping(mapping, offsets, entries)?,
         })
     }
 
@@ -129,6 +150,24 @@ impl<'memory, T: RingValue> ConsumerRing<'memory, T> {
     ) -> Result<Self, RingMapError> {
         Ok(Self {
             memory: RingMemory::new(memory, offsets, entries)?,
+        })
+    }
+
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        )),
+        allow(dead_code)
+    )]
+    fn with_mapping(
+        mapping: BorrowedMmap<'memory>,
+        offsets: XdpRingOffset,
+        entries: RingEntries,
+    ) -> Result<Self, RingMapError> {
+        Ok(Self {
+            memory: RingMemory::with_mapping(mapping, offsets, entries)?,
         })
     }
 
@@ -231,6 +270,25 @@ impl<'memory> FillProducer<'memory> {
         })
     }
 
+    /// Binds this role to an exclusively borrowed live session mapping.
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn with_mapping(
+        mapping: BorrowedMmap<'memory>,
+        offsets: XdpRingOffset,
+        entries: RingEntries,
+    ) -> Result<Self, RingMapError> {
+        Ok(Self {
+            inner: ProducerRing::with_mapping(mapping, offsets, entries)?,
+        })
+    }
+
     /// Returns the checked fixed capacity.
     pub const fn capacity(&self) -> u32 {
         self.inner.capacity()
@@ -290,6 +348,25 @@ impl<'memory> TxProducer<'memory> {
         })
     }
 
+    /// Binds this role to an exclusively borrowed live session mapping.
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn with_mapping(
+        mapping: BorrowedMmap<'memory>,
+        offsets: XdpRingOffset,
+        entries: RingEntries,
+    ) -> Result<Self, RingMapError> {
+        Ok(Self {
+            inner: ProducerRing::with_mapping(mapping, offsets, entries)?,
+        })
+    }
+
     /// Returns the checked fixed capacity.
     pub const fn capacity(&self) -> u32 {
         self.inner.capacity()
@@ -342,6 +419,25 @@ impl<'memory> RxConsumer<'memory> {
         })
     }
 
+    /// Binds this role to an exclusively borrowed live session mapping.
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn with_mapping(
+        mapping: BorrowedMmap<'memory>,
+        offsets: XdpRingOffset,
+        entries: RingEntries,
+    ) -> Result<Self, RingMapError> {
+        Ok(Self {
+            inner: ConsumerRing::with_mapping(mapping, offsets, entries)?,
+        })
+    }
+
     /// Returns the checked fixed capacity.
     pub const fn capacity(&self) -> u32 {
         self.inner.capacity()
@@ -391,6 +487,25 @@ impl<'memory> CompletionConsumer<'memory> {
     ) -> Result<Self, RingMapError> {
         Ok(Self {
             inner: ConsumerRing::new(memory, offsets, entries)?,
+        })
+    }
+
+    /// Binds this role to an exclusively borrowed live session mapping.
+    #[cfg_attr(
+        not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn with_mapping(
+        mapping: BorrowedMmap<'memory>,
+        offsets: XdpRingOffset,
+        entries: RingEntries,
+    ) -> Result<Self, RingMapError> {
+        Ok(Self {
+            inner: ConsumerRing::with_mapping(mapping, offsets, entries)?,
         })
     }
 

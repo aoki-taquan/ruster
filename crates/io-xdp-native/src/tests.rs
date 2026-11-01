@@ -592,3 +592,61 @@ fn native_corrupt_cursor_is_typed_and_atomic() {
     assert_eq!(read_u32(&memory.0, 0), 5);
     assert_eq!(read_u32(&memory.0, 64), 0);
 }
+
+#[test]
+fn native_session_config_rejects_invalid_names_and_shared_umem() {
+    use crate::{SessionConfig, SessionConfigError, INTERFACE_NAME_CAPACITY};
+
+    let flags = ValidatedBindFlags::new(XDP_USE_NEED_WAKEUP | XDP_COPY).expect("copy flags");
+    let rings = RingConfig::new(64, 64, 64, 64).expect("rings");
+    let umem = UmemConfig::new(192, 2_048, 0, 128, 64, 0).expect("umem");
+    let build = |name: &str| SessionConfig::new(name, 1, flags, rings, umem);
+
+    assert_eq!(INTERFACE_NAME_CAPACITY, 16);
+    let valid = build("veth-a.b_1").expect("valid name");
+    assert_eq!(&valid.interface_name_bytes()[..11], b"veth-a.b_1\0");
+    assert!(valid.interface_name_bytes()[10..]
+        .iter()
+        .all(|byte| *byte == 0));
+    assert_eq!(
+        (
+            valid.queue(),
+            valid.bind_flags(),
+            valid.rings(),
+            valid.umem()
+        ),
+        (1, flags, rings, umem)
+    );
+    assert_eq!(valid.mode(), BindMode::CopyRequired);
+    assert_eq!(
+        format!("{valid:?}"),
+        format!(
+            "SessionConfig {{ device: \"veth-a.b_1\", queue: 1, bind_flags: {flags:?}, \
+             rings: {rings:?}, umem: {umem:?} }}"
+        )
+    );
+    let longest = "a".repeat(15);
+    assert_eq!(
+        build(&longest).map(|config| config.interface_name_bytes()[15]),
+        Ok(0)
+    );
+
+    assert_eq!(build(""), Err(SessionConfigError::DeviceNameEmpty));
+    assert_eq!(
+        build(&"a".repeat(16)),
+        Err(SessionConfigError::DeviceNameTooLong { len: 16 })
+    );
+    for invalid in [".", "..", "a/b", "a:b", "a b", "a\tb", "a\0b", "\u{e9}th0"] {
+        assert_eq!(
+            build(invalid),
+            Err(SessionConfigError::DeviceNameInvalid),
+            "{invalid:?}"
+        );
+    }
+    let shared = ValidatedBindFlags::new(XDP_USE_NEED_WAKEUP | XDP_COPY | XDP_SHARED_UMEM)
+        .expect("profile accepts shared UMEM flags");
+    assert_eq!(
+        SessionConfig::new("veth0", 0, shared, rings, umem),
+        Err(SessionConfigError::SharedUmemUnsupported)
+    );
+}

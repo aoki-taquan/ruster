@@ -8,13 +8,16 @@
 //! future data path.
 
 use std::{
-    ffi::{c_int, c_short, c_void},
+    ffi::{c_char, c_int, c_short, c_uint, c_void},
     fmt,
     mem::size_of,
     os::fd::RawFd,
+    ptr::NonNull,
 };
 
 use crate::{abi::AF_XDP, ensure_native_syscall_supported, NativeSyscallPlatformError};
+
+use super::mmap::BorrowedMmap;
 
 /// Pinned source profile for architecture-dependent syscall constants.
 const SYSCALL_ABI_PROFILE: &str =
@@ -47,6 +50,26 @@ const _: [(); 4] = [(); size_of::<RawFd>()];
 
 /// Largest positive errno encoded by the reviewed Linux syscall ABI.
 const MAX_LINUX_ERRNO: i32 = 4_095;
+
+/// Linux `IFNAMSIZ` (`include/uapi/linux/if.h`): name bytes plus the NUL.
+pub(super) const IFNAMSIZ: usize = 16;
+
+/// x86_64 Linux base page size (`arch/x86/include/asm/page_types.h`).
+pub(super) const PAGE_SIZE: usize = 4_096;
+
+/// Linux v6.8 `include/uapi/asm-generic/errno-base.h` and `errno.h` values
+/// that the session builder classifies. Every other errno stays numeric.
+pub(super) mod errno {
+    pub(in crate::native_unsafe) const EPERM: u16 = 1;
+    pub(in crate::native_unsafe) const ENOMEM: u16 = 12;
+    pub(in crate::native_unsafe) const EACCES: u16 = 13;
+    pub(in crate::native_unsafe) const EBUSY: u16 = 16;
+    pub(in crate::native_unsafe) const ENODEV: u16 = 19;
+    pub(in crate::native_unsafe) const EINVAL: u16 = 22;
+    pub(in crate::native_unsafe) const EOPNOTSUPP: u16 = 95;
+    pub(in crate::native_unsafe) const EAFNOSUPPORT: u16 = 97;
+    pub(in crate::native_unsafe) const ENOBUFS: u16 = 105;
+}
 
 /// Bounded positive Linux errno value.
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -88,6 +111,7 @@ impl fmt::Debug for Errno {
 /// Exact cold syscall stage associated with an errno.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SyscallStage {
+    InterfaceIndex,
     OpenSocket,
     SetSocketOption,
     GetSocketOption,
@@ -110,6 +134,7 @@ pub(super) struct SyscallError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SyscallArgumentError {
     InvalidFileDescriptor,
+    InvalidInterfaceName,
     ZeroLength { stage: SyscallStage },
     LengthDoesNotFitSockLen { stage: SyscallStage, length: usize },
     OffsetDoesNotFitOffT { offset: u64 },
@@ -189,12 +214,14 @@ impl MapRequest {
     }
 }
 
-mod sealed {
+pub(super) mod sealed {
     pub trait Sealed {}
 }
 
 /// Sealed cold-path boundary; generic users are monomorphized, never dynamic.
 pub(super) trait Syscalls: sealed::Sealed {
+    /// `if_nametoindex(3)`. `name` is NUL-padded with `name[IFNAMSIZ - 1] == 0`.
+    fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno>;
     fn socket(&self, domain: c_int, kind: c_int, protocol: c_int) -> Result<RawFd, Errno>;
     fn set_socket_option(
         &self,
@@ -220,13 +247,44 @@ pub(super) trait Syscalls: sealed::Sealed {
     fn close(&self, fd: RawFd) -> Result<(), Errno>;
 }
 
+/// Seam whose successful `mmap` results are real process mappings.
+///
+/// # Safety
+///
+/// Every `Ok(address)` returned by [`Syscalls::mmap`] for a request of
+/// `byte_len` bytes must be a live `PROT_READ | PROT_WRITE` mapping of at
+/// least `byte_len` bytes that no Rust reference aliases and that remains
+/// valid until [`Syscalls::munmap`] is called with the same address and
+/// length. [`MappedRegion::borrow_mapping`] relies on this to lend ring views.
+/// Transcript-only fakes that return synthetic addresses must not implement
+/// this trait.
+pub(super) unsafe trait MapsRealMemory: Syscalls {}
+
 /// Production Linux implementation. No C2A public API invokes it.
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct LinuxSyscalls;
 
 impl sealed::Sealed for LinuxSyscalls {}
 
+// SAFETY: a successful Linux `mmap` returns exactly such a mapping; the seam
+// requests PROT_READ|PROT_WRITE, and `MappedRegion` is the sole owner that
+// calls `munmap` with the exact returned address and length.
+unsafe impl MapsRealMemory for LinuxSyscalls {}
+
 impl Syscalls for LinuxSyscalls {
+    fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno> {
+        debug_assert_eq!(name[IFNAMSIZ - 1], 0);
+        // SAFETY: `name` is a borrowed 16-byte array whose last byte is NUL
+        // (checked by `interface_index`), so libc reads a terminated C
+        // string entirely inside the borrow. The call retains no pointer.
+        let index = unsafe { ffi::if_nametoindex(name.as_ptr().cast::<c_char>()) };
+        if index == 0 {
+            Err(last_errno())
+        } else {
+            Ok(index)
+        }
+    }
+
     fn socket(&self, domain: c_int, kind: c_int, protocol: c_int) -> Result<RawFd, Errno> {
         // SAFETY: `socket` has no pointer arguments. All integers are reviewed
         // Linux v6.8 constants, and a nonnegative result is an owned fd.
@@ -370,6 +428,21 @@ fn last_errno() -> Errno {
     Errno::new(raw).unwrap_or_else(Errno::invalid_capture)
 }
 
+/// Resolves one NUL-padded interface name to its nonzero Linux ifindex in
+/// the caller's network namespace. No resource is acquired.
+pub(super) fn interface_index<S: Syscalls>(
+    syscalls: &S,
+    name: &[u8; IFNAMSIZ],
+) -> Result<u32, ResourceError> {
+    ensure_native_syscall_supported().map_err(ResourceError::Platform)?;
+    if name[0] == 0 || name[IFNAMSIZ - 1] != 0 {
+        return Err(SyscallArgumentError::InvalidInterfaceName.into());
+    }
+    syscalls
+        .interface_index(name)
+        .map_err(|errno| syscall_error(SyscallStage::InterfaceIndex, errno))
+}
+
 /// Owned nonnegative AF_XDP fd with exactly-once close semantics.
 pub(super) struct OwnedXdpFd<'syscalls, S: Syscalls> {
     syscalls: &'syscalls S,
@@ -511,6 +584,27 @@ pub(super) struct MappedRegion<'syscalls, S: Syscalls> {
     active: bool,
 }
 
+impl<S: MapsRealMemory> MappedRegion<'_, S> {
+    /// Exclusively borrows the complete live mapping for ring access.
+    ///
+    /// Returns `None` for an inactive region or a mapping placed at address
+    /// zero, which ring views cannot represent.
+    pub(super) fn borrow_mapping(&mut self) -> Option<BorrowedMmap<'_>> {
+        if !self.active {
+            return None;
+        }
+        let base = NonNull::new(self.address.cast::<u8>())?;
+        // SAFETY: `S: MapsRealMemory` and `active` mean
+        // `address..address + byte_len` is the exact live read/write extent
+        // returned by one successful mmap, and only `unmap_once` (requiring
+        // `&mut self` or Drop) removes it. The returned borrow holds
+        // `&mut self` for its whole lifetime, so the region can be neither
+        // unmapped nor borrowed twice while ring views exist. Rust never
+        // forms references into the mapping; ring access is atomic/volatile.
+        Some(unsafe { BorrowedMmap::from_raw_parts(base, self.byte_len) })
+    }
+}
+
 impl<'syscalls, S: Syscalls> MappedRegion<'syscalls, S> {
     pub(super) fn map_anonymous(
         syscalls: &'syscalls S,
@@ -542,6 +636,16 @@ impl<'syscalls, S: Syscalls> MappedRegion<'syscalls, S> {
         self.unmap_once()
     }
 
+    /// Exact byte length passed to the successful mmap call.
+    pub(super) const fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    /// Numeric start address, for alignment checks only; never dereferenced.
+    pub(super) fn address_bits(&self) -> usize {
+        self.address.addr()
+    }
+
     fn unmap_once(&mut self) -> Result<(), ResourceError> {
         if !self.active {
             return Ok(());
@@ -571,7 +675,7 @@ impl<S: Syscalls> Drop for MappedRegion<'_, S> {
 }
 
 mod ffi {
-    use super::{c_int, c_short, c_void, Offset, PollCount, SockLen};
+    use super::{c_char, c_int, c_short, c_uint, c_void, Offset, PollCount, SockLen};
 
     #[repr(C)]
     pub(super) struct PollFd {
@@ -623,6 +727,7 @@ mod ffi {
             destination_len: SockLen,
         ) -> isize;
         pub(super) fn close(fd: c_int) -> c_int;
+        pub(super) fn if_nametoindex(name: *const c_char) -> c_uint;
         pub(super) fn __errno_location() -> *mut c_int;
     }
 }
@@ -641,6 +746,9 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum Call {
+        InterfaceIndex {
+            first: u8,
+        },
         Socket {
             domain: c_int,
             kind: c_int,
@@ -756,6 +864,11 @@ mod tests {
     impl sealed::Sealed for FakeSyscalls {}
 
     impl Syscalls for FakeSyscalls {
+        fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno> {
+            self.record(Call::InterfaceIndex { first: name[0] });
+            self.result(SyscallStage::InterfaceIndex).map(|()| 3)
+        }
+
         fn socket(&self, domain: c_int, kind: c_int, protocol: c_int) -> Result<RawFd, Errno> {
             self.record(Call::Socket {
                 domain,

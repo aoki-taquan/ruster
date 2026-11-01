@@ -1,0 +1,413 @@
+//! Safe parameters, outcomes, and typed failures of one native AF_XDP session.
+//!
+//! The failure-atomic builder itself lives in the private `native_unsafe`
+//! module and is exposed as [`crate::NativeSession`] on x86_64 Linux only.
+//! Every type here is plain data: no file descriptor, address, or packet byte
+//! is stored or rendered.
+
+use std::{error::Error, fmt};
+
+use crate::{
+    BindMode, NativeSyscallPlatformError, RingConfig, RingField, RingMapError, RingName,
+    UmemConfig, ValidatedBindFlags,
+};
+
+/// Linux `IFNAMSIZ`: interface name bytes plus the terminating NUL.
+pub const INTERFACE_NAME_CAPACITY: usize = 16;
+
+/// Largest kernel-reported ring header offset accepted from
+/// `XDP_MMAP_OFFSETS` (one x86_64 page).
+///
+/// Linux v6.8 places the producer, consumer, and flags words on separate
+/// cache lines of `struct xdp_ring` and the descriptor array immediately
+/// after it, all well inside the first page. Larger offsets are rejected
+/// before any ring is mapped.
+pub const MAX_RING_HEADER_OFFSET: u64 = 4_096;
+
+/// Checked parameters of one AF_XDP socket bound to one interface queue.
+///
+/// Callers derive the values from a validated configuration port (for
+/// example `ruster_config::ValidatedAfXdpPortV1::{device, queue, bind_flags,
+/// rings, umem}`); this crate does not depend on the configuration crate.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct SessionConfig {
+    name: [u8; INTERFACE_NAME_CAPACITY],
+    queue: u32,
+    bind_flags: ValidatedBindFlags,
+    rings: RingConfig,
+    umem: UmemConfig,
+}
+
+impl SessionConfig {
+    /// Validates the device name against Linux `dev_valid_name` and the
+    /// initial session profile.
+    ///
+    /// The name must be 1..=15 bytes of printable ASCII other than `/` and
+    /// `:`, and must not be `.` or `..`. Shared UMEM is rejected: each
+    /// session registers and owns exactly one UMEM.
+    pub fn new(
+        device: &str,
+        queue: u32,
+        bind_flags: ValidatedBindFlags,
+        rings: RingConfig,
+        umem: UmemConfig,
+    ) -> Result<Self, SessionConfigError> {
+        let bytes = device.as_bytes();
+        if bytes.is_empty() {
+            return Err(SessionConfigError::DeviceNameEmpty);
+        }
+        if bytes.len() >= INTERFACE_NAME_CAPACITY {
+            return Err(SessionConfigError::DeviceNameTooLong { len: bytes.len() });
+        }
+        if device == "."
+            || device == ".."
+            || bytes
+                .iter()
+                .any(|byte| !byte.is_ascii_graphic() || *byte == b'/' || *byte == b':')
+        {
+            return Err(SessionConfigError::DeviceNameInvalid);
+        }
+        if bind_flags.shared_umem() {
+            return Err(SessionConfigError::SharedUmemUnsupported);
+        }
+        let mut name = [0_u8; INTERFACE_NAME_CAPACITY];
+        name[..bytes.len()].copy_from_slice(bytes);
+        Ok(Self {
+            name,
+            queue,
+            bind_flags,
+            rings,
+            umem,
+        })
+    }
+
+    /// Returns the NUL-padded interface name.
+    #[must_use]
+    pub const fn interface_name_bytes(&self) -> &[u8; INTERFACE_NAME_CAPACITY] {
+        &self.name
+    }
+
+    /// Returns the device queue id.
+    #[must_use]
+    pub const fn queue(&self) -> u32 {
+        self.queue
+    }
+
+    /// Returns the checked bind flags.
+    #[must_use]
+    pub const fn bind_flags(&self) -> ValidatedBindFlags {
+        self.bind_flags
+    }
+
+    /// Returns the four ring capacities.
+    #[must_use]
+    pub const fn rings(&self) -> RingConfig {
+        self.rings
+    }
+
+    /// Returns the UMEM geometry.
+    #[must_use]
+    pub const fn umem(&self) -> UmemConfig {
+        self.umem
+    }
+
+    /// Returns the requested copy policy.
+    #[must_use]
+    pub const fn mode(&self) -> BindMode {
+        self.bind_flags.mode()
+    }
+}
+
+impl fmt::Debug for SessionConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let len = self
+            .name
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(self.name.len());
+        // The name is printable ASCII by construction.
+        let device = std::str::from_utf8(&self.name[..len]).unwrap_or("<invalid>");
+        formatter
+            .debug_struct("SessionConfig")
+            .field("device", &device)
+            .field("queue", &self.queue)
+            .field("bind_flags", &self.bind_flags)
+            .field("rings", &self.rings)
+            .field("umem", &self.umem)
+            .finish()
+    }
+}
+
+/// Session parameter failure detected before any syscall.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionConfigError {
+    /// The device name is empty.
+    DeviceNameEmpty,
+    /// The device name does not fit `IFNAMSIZ` with its NUL.
+    DeviceNameTooLong {
+        /// Byte length of the rejected name.
+        len: usize,
+    },
+    /// The device name is `.`/`..` or contains a non-printable, `/`, or `:` byte.
+    DeviceNameInvalid,
+    /// `XDP_SHARED_UMEM` is outside the initial session profile.
+    SharedUmemUnsupported,
+}
+
+impl fmt::Display for SessionConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for SessionConfigError {}
+
+/// Copy policy that the kernel reported through `XDP_OPTIONS` after bind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NegotiatedMode {
+    /// The socket copies frames between the driver and UMEM.
+    Copy,
+    /// The driver DMAs directly into UMEM.
+    ZeroCopy,
+}
+
+/// Ordered setup step of one session transaction.
+///
+/// Steps run in declaration order; a failure at one step releases every
+/// resource acquired by the earlier steps in exact reverse order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionStage {
+    /// `if_nametoindex` in the caller's network namespace.
+    InterfaceLookup,
+    /// `socket(AF_XDP, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)`.
+    OpenSocket,
+    /// Anonymous page-aligned UMEM `mmap`.
+    MapUmem,
+    /// `XDP_UMEM_REG`.
+    RegisterUmem,
+    /// `XDP_UMEM_FILL_RING` size.
+    SizeFillRing,
+    /// `XDP_UMEM_COMPLETION_RING` size.
+    SizeCompletionRing,
+    /// `XDP_RX_RING` size.
+    SizeRxRing,
+    /// `XDP_TX_RING` size.
+    SizeTxRing,
+    /// `XDP_MMAP_OFFSETS` query and validation.
+    QueryMmapOffsets,
+    /// Fill ring `mmap`.
+    MapFillRing,
+    /// Completion ring `mmap`.
+    MapCompletionRing,
+    /// RX ring `mmap`.
+    MapRxRing,
+    /// TX ring `mmap`.
+    MapTxRing,
+    /// `bind` with `sockaddr_xdp`.
+    Bind,
+    /// `XDP_OPTIONS` query and negotiated-mode check.
+    QueryOptions,
+}
+
+/// Value-free cause of one failed session step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionFailure {
+    /// The target cannot run the reviewed x86_64 Linux syscall profile.
+    Platform(NativeSyscallPlatformError),
+    /// `EPERM` or `EACCES`: typically missing `CAP_NET_RAW` (socket) or
+    /// `CAP_NET_ADMIN`/`CAP_IPC_LOCK`-related policy.
+    PermissionDenied,
+    /// `ENOMEM`.
+    OutOfMemory,
+    /// `ENOBUFS` from `XDP_UMEM_REG`: the UMEM exceeds `RLIMIT_MEMLOCK`
+    /// without `CAP_IPC_LOCK`.
+    MemlockLimit,
+    /// `ENODEV`: no such interface in this network namespace.
+    NoSuchDevice,
+    /// `EINVAL`. At [`SessionStage::Bind`] this most commonly means the
+    /// queue id is not below the device's real RX and TX queue counts.
+    InvalidArgument,
+    /// `EBUSY`: the queue already has an AF_XDP pool or the socket state
+    /// changed.
+    Busy,
+    /// `EOPNOTSUPP` outside a zero-copy bind, or `EAFNOSUPPORT` from
+    /// `socket` (kernel without `CONFIG_XDP_SOCKETS`).
+    Unsupported,
+    /// `EOPNOTSUPP` from a bind that requested `XDP_ZEROCOPY`: the driver
+    /// lacks AF_XDP zero-copy support. `auto` mode falls back to copy mode
+    /// on exactly this failure.
+    ZeroCopyUnsupported,
+    /// Any other errno, kept numerically.
+    Errno(u16),
+    /// The thread errno was outside the Linux errno range.
+    UnreadableErrno,
+    /// A checked size or argument could not be represented for the syscall.
+    ArgumentOutOfRange,
+    /// The kernel returned a socket-option length other than the pinned
+    /// v6.8 structure size.
+    OptionLength {
+        /// Pinned structure size.
+        expected: usize,
+        /// Kernel-reported length.
+        actual: usize,
+    },
+    /// A kernel-reported ring layout failed alignment, extent, or overlap checks.
+    RingLayout {
+        /// Ring whose layout was rejected.
+        ring: RingName,
+        /// Layout or mapping failure.
+        error: RingMapError,
+    },
+    /// A kernel-reported ring field offset exceeded [`MAX_RING_HEADER_OFFSET`].
+    RingHeaderOutOfBounds {
+        /// Ring whose layout was rejected.
+        ring: RingName,
+        /// Offending field.
+        field: RingField,
+    },
+    /// A mapping address was zero or not page aligned.
+    MisalignedMapping,
+    /// `XDP_OPTIONS` reported bits outside the v6.8 profile.
+    UnsupportedOptions(u32),
+    /// The negotiated mode differs from the explicitly bound copy policy.
+    NegotiatedModeMismatch {
+        /// Mode reported by the kernel.
+        negotiated: NegotiatedMode,
+    },
+}
+
+/// Typed, value-free failure of [`crate::NativeSession`] setup.
+///
+/// Every resource acquired before the failing stage was already released in
+/// exact reverse order when this value is returned.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SessionError {
+    stage: SessionStage,
+    failure: SessionFailure,
+}
+
+impl SessionError {
+    pub(crate) const fn new(stage: SessionStage, failure: SessionFailure) -> Self {
+        Self { stage, failure }
+    }
+
+    /// Returns the failing setup stage.
+    #[must_use]
+    pub const fn stage(self) -> SessionStage {
+        self.stage
+    }
+
+    /// Returns the classified cause.
+    #[must_use]
+    pub const fn failure(self) -> SessionFailure {
+        self.failure
+    }
+}
+
+impl fmt::Display for SessionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for SessionError {}
+
+/// Resource released by explicit session teardown, in teardown order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupStage {
+    /// TX ring `munmap`.
+    UnmapTxRing,
+    /// RX ring `munmap`.
+    UnmapRxRing,
+    /// Completion ring `munmap`.
+    UnmapCompletionRing,
+    /// Fill ring `munmap`.
+    UnmapFillRing,
+    /// UMEM `munmap`.
+    UnmapUmem,
+    /// Socket `close`.
+    CloseSocket,
+}
+
+/// First failure of an explicit teardown. Every later resource was still
+/// released exactly once; failed releases are never retried.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CleanupError {
+    stage: CleanupStage,
+    errno: Option<u16>,
+}
+
+impl CleanupError {
+    pub(crate) const fn new(stage: CleanupStage, errno: Option<u16>) -> Self {
+        Self { stage, errno }
+    }
+
+    /// Returns the first failing release.
+    #[must_use]
+    pub const fn stage(self) -> CleanupStage {
+        self.stage
+    }
+
+    /// Returns its errno, or `None` if the thread errno was unreadable.
+    #[must_use]
+    pub const fn errno(self) -> Option<u16> {
+        self.errno
+    }
+}
+
+impl fmt::Display for CleanupError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for CleanupError {}
+
+/// Geometry of the session-owned UMEM, borrowed with the ring views.
+///
+/// Byte access to frames is deliberately absent: it arrives with the frame
+/// ownership ledger integration (X01–X03), which decides who may touch which
+/// frame while the kernel owns others.
+#[derive(Debug)]
+pub struct UmemRegion<'session> {
+    config: UmemConfig,
+    _session: std::marker::PhantomData<&'session mut ()>,
+}
+
+impl UmemRegion<'_> {
+    pub(crate) const fn new(config: UmemConfig) -> Self {
+        Self {
+            config,
+            _session: std::marker::PhantomData,
+        }
+    }
+
+    /// Returns the registered UMEM geometry.
+    #[must_use]
+    pub const fn config(&self) -> UmemConfig {
+        self.config
+    }
+
+    /// Returns the registered UMEM byte length.
+    #[must_use]
+    pub const fn byte_len(&self) -> u64 {
+        self.config.byte_len()
+    }
+}
+
+/// The four role-typed ring views and UMEM geometry of one live session.
+///
+/// Every view exclusively borrows its kernel mapping through the session, so
+/// none can outlive the mapping or coexist with a second set of views.
+pub struct NativeRings<'session> {
+    /// Application producer of the UMEM Fill ring.
+    pub fill: crate::FillProducer<'session>,
+    /// Application consumer of the UMEM Completion ring.
+    pub completion: crate::CompletionConsumer<'session>,
+    /// Application consumer of the RX ring.
+    pub rx: crate::RxConsumer<'session>,
+    /// Application producer of the TX ring.
+    pub tx: crate::TxProducer<'session>,
+    /// UMEM geometry.
+    pub umem: UmemRegion<'session>,
+}
