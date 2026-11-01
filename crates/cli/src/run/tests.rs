@@ -493,7 +493,7 @@ fn a_failure_at_every_stage_rolls_back_every_opened_port() {
     ];
     for (stage, port, opened) in cases {
         let host = FakeHost::failing(stage, port);
-        let outcome = run(&host, &FakeStop::after(u32::MAX));
+        let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
         let label = format!("{stage:?} {port:?}");
         assert_eq!(outcome.status, EXIT_RUNTIME, "{label}: {}", outcome.err);
         let expected = match port {
@@ -561,7 +561,7 @@ fn a_close_error_during_rollback_is_reported_and_the_rest_still_closes() {
         close_fails: Some(WAN),
         ..FakeHost::failing(Stage::Adapter, None)
     };
-    let outcome = run(&host, &FakeStop::after(u32::MAX));
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
     assert_eq!(outcome.status, EXIT_RUNTIME);
     assert!(outcome.err.contains("close failed: port=if2 code=INJECTED"));
     host.assert_released();
@@ -583,7 +583,7 @@ fn privilege_refusal_exits_4_before_any_port() {
         privilege: Some(PrivilegeFailure::MissingCapabilities(1 << 39)),
         ..FakeHost::default()
     };
-    let outcome = run(&host, &FakeStop::after(u32::MAX));
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
     assert_eq!(outcome.status, EXIT_PRIVILEGE);
     assert!(
         outcome
@@ -601,7 +601,7 @@ fn multi_queue_device_is_refused_unless_allowed_with_a_warning() {
         multi_queue: Some(WAN),
         ..FakeHost::default()
     };
-    let outcome = run(&host, &FakeStop::after(u32::MAX));
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
     assert_eq!(outcome.status, EXIT_RUNTIME);
     assert!(outcome
         .err
