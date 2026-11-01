@@ -15,9 +15,15 @@ use ruster_core::{
     ResolutionStateSlot, Route, RouteError, SnapshotError,
 };
 
+use ruster_io_xdp::native_profile::{
+    BindMode, RingConfig, UmemConfig, ValidatedBindFlags, SUPPORTED_ALIGNED_CHUNK_SIZES, XDP_COPY,
+    XDP_PACKET_HEADROOM, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY,
+};
+
 use crate::{
-    ConfigV1, FirewallActionV1, FirewallProtocolV1, Nat44FilteringV1, Nat44Icmpv4ErrorsV1,
-    SourcePath, VersionedConfig,
+    AfXdpModeV1, AfXdpPortV1, BackendKindV1, BackendV1, ConfigV1, ExistingXdpProgramV1,
+    FirewallActionV1, FirewallProtocolV1, Nat44FilteringV1, Nat44Icmpv4ErrorsV1, SourcePath,
+    VersionedConfig, XdpAttachModeV1,
 };
 
 /// Caller-selected cold-path bounds for runtime storage requested by V1.
@@ -82,6 +88,48 @@ pub enum ValidationCode {
     CapacityNotRepresentable,
     CapacityArithmeticOverflow,
     RuntimeStorageBytesExceeded,
+    /// `[[backend.ports]]` is non-empty but `backend.kind` is not `af-xdp`.
+    BackendPortsWithoutAfXdp,
+    /// `backend.kind = "af-xdp"` with no `[[backend.ports]]`.
+    BackendNoPorts,
+    /// A configured interface has no `[[backend.ports]]` entry.
+    BackendInterfaceUnbound,
+    /// Two ports bind the same (device, queue).
+    BackendDuplicateQueue,
+    /// A second queue of one interface; M2 binds one queue per interface.
+    BackendMultipleQueuesPerInterface,
+    /// `queue` is above [`MAX_AF_XDP_QUEUE_ID`].
+    BackendQueueOutOfRange,
+    /// `need-wakeup = false`; the native profile requires
+    /// `XDP_USE_NEED_WAKEUP`.
+    BackendNeedWakeupRequired,
+    /// `mode = "zero-copy"` or `"auto"` with `xdp-attach = "generic"`:
+    /// generic (skb) XDP always copies, so only `mode = "copy"` states what
+    /// the socket will do.
+    BackendModeRequiresNativeAttach,
+    /// A ring entry count is not a power of two.
+    BackendRingNotPowerOfTwo,
+    /// A ring entry count is outside
+    /// [`MIN_AF_XDP_RING_ENTRIES`]..=[`MAX_AF_XDP_RING_ENTRIES`].
+    BackendRingOutOfRange,
+    /// The Completion ring is smaller than the TX ring.
+    BackendCompletionRingTooSmall,
+    /// `frame-size` is not one of the reviewed aligned chunk sizes.
+    BackendFrameSizeUnsupported,
+    /// `headroom` leaves less than [`MIN_AF_XDP_VISIBLE_FRAME_BYTES`] of
+    /// packet space after the kernel's fixed headroom.
+    BackendHeadroomTooLarge,
+    /// `generated-frames` is zero.
+    BackendGeneratedFramesZero,
+    /// `frame-count` is below `fill + tx + generated-frames`.
+    BackendFrameCountTooSmall,
+    /// One socket's UMEM exceeds [`MAX_AF_XDP_UMEM_BYTES_PER_PORT`].
+    BackendUmemTooLarge,
+    /// The UMEM of all sockets exceeds [`MAX_AF_XDP_UMEM_BYTES`].
+    BackendTotalUmemTooLarge,
+    /// The native AF_XDP profile rejected a geometry the configuration
+    /// checks accepted. Unreachable unless the two drift apart.
+    BackendNativeProfile,
 }
 
 impl ValidationCode {
@@ -139,6 +187,24 @@ impl ValidationCode {
             Self::CapacityNotRepresentable => "CAPACITY_NOT_REPRESENTABLE",
             Self::CapacityArithmeticOverflow => "CAPACITY_ARITHMETIC_OVERFLOW",
             Self::RuntimeStorageBytesExceeded => "RUNTIME_STORAGE_BYTES_EXCEEDED",
+            Self::BackendPortsWithoutAfXdp => "BACKEND_PORTS_WITHOUT_AF_XDP",
+            Self::BackendNoPorts => "BACKEND_NO_PORTS",
+            Self::BackendInterfaceUnbound => "BACKEND_INTERFACE_UNBOUND",
+            Self::BackendDuplicateQueue => "BACKEND_DUPLICATE_QUEUE",
+            Self::BackendMultipleQueuesPerInterface => "BACKEND_MULTIPLE_QUEUES_PER_INTERFACE",
+            Self::BackendQueueOutOfRange => "BACKEND_QUEUE_OUT_OF_RANGE",
+            Self::BackendNeedWakeupRequired => "BACKEND_NEED_WAKEUP_REQUIRED",
+            Self::BackendModeRequiresNativeAttach => "BACKEND_MODE_REQUIRES_NATIVE_ATTACH",
+            Self::BackendRingNotPowerOfTwo => "BACKEND_RING_NOT_POWER_OF_TWO",
+            Self::BackendRingOutOfRange => "BACKEND_RING_OUT_OF_RANGE",
+            Self::BackendCompletionRingTooSmall => "BACKEND_COMPLETION_RING_TOO_SMALL",
+            Self::BackendFrameSizeUnsupported => "BACKEND_FRAME_SIZE_UNSUPPORTED",
+            Self::BackendHeadroomTooLarge => "BACKEND_HEADROOM_TOO_LARGE",
+            Self::BackendGeneratedFramesZero => "BACKEND_GENERATED_FRAMES_ZERO",
+            Self::BackendFrameCountTooSmall => "BACKEND_FRAME_COUNT_TOO_SMALL",
+            Self::BackendUmemTooLarge => "BACKEND_UMEM_TOO_LARGE",
+            Self::BackendTotalUmemTooLarge => "BACKEND_TOTAL_UMEM_TOO_LARGE",
+            Self::BackendNativeProfile => "BACKEND_NATIVE_PROFILE",
         }
     }
 }
@@ -462,6 +528,144 @@ impl ValidatedFirewallV1 {
     }
 }
 
+/// Largest accepted AF_XDP device queue id.
+pub const MAX_AF_XDP_QUEUE_ID: u32 = 1_023;
+/// Smallest accepted AF_XDP ring entry count.
+pub const MIN_AF_XDP_RING_ENTRIES: u32 = 64;
+/// Largest accepted AF_XDP ring entry count.
+pub const MAX_AF_XDP_RING_ENTRIES: u32 = 16_384;
+/// Packet bytes every UMEM chunk must keep after the configured and the
+/// kernel's fixed headroom: one untagged 1500-byte-MTU Ethernet II frame
+/// without FCS, so the single-buffer profile never needs scatter/gather.
+pub const MIN_AF_XDP_VISIBLE_FRAME_BYTES: u32 = 1_514;
+/// Largest UMEM of one AF_XDP socket (256 MiB).
+pub const MAX_AF_XDP_UMEM_BYTES_PER_PORT: u64 = 256 << 20;
+/// Largest UMEM of all AF_XDP sockets of one configuration (1 GiB).
+pub const MAX_AF_XDP_UMEM_BYTES: u64 = 1 << 30;
+
+/// One validated AF_XDP socket: an interface queue with checked native
+/// bind flags, ring capacities, and UMEM geometry.
+///
+/// The ring and UMEM values are the `ruster-io-xdp::native_profile` types (shared with `ruster-io-xdp-native`),
+/// built by that crate's own validators, so the configuration cannot accept
+/// a geometry the native backend would reject.
+///
+/// The port owns a copy of the bound device name, so two ports compare
+/// unequal when the interface keeps its IfId but moves to another device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedAfXdpPortV1 {
+    interface: IfId,
+    device: Box<str>,
+    queue: u32,
+    mode: AfXdpModeV1,
+    bind_flags: ValidatedBindFlags,
+    attach: XdpAttachModeV1,
+    rings: RingConfig,
+    umem: UmemConfig,
+}
+
+impl ValidatedAfXdpPortV1 {
+    /// The bound interface.
+    #[must_use]
+    pub const fn interface(&self) -> IfId {
+        self.interface
+    }
+
+    /// The bound device: the `device` of [`Self::interface`], already
+    /// restricted to the CONFIG-003 label charset.
+    #[must_use]
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+
+    #[must_use]
+    pub const fn queue(&self) -> u32 {
+        self.queue
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> AfXdpModeV1 {
+        self.mode
+    }
+
+    /// Checked `sockaddr_xdp.sxdp_flags`: need-wakeup plus the copy policy
+    /// of [`Self::mode`], never shared UMEM.
+    #[must_use]
+    pub const fn bind_flags(&self) -> ValidatedBindFlags {
+        self.bind_flags
+    }
+
+    #[must_use]
+    pub const fn attach(&self) -> XdpAttachModeV1 {
+        self.attach
+    }
+
+    #[must_use]
+    pub const fn rings(&self) -> RingConfig {
+        self.rings
+    }
+
+    /// UMEM geometry. `rx_frames()` is `frame-count - generated-frames`.
+    #[must_use]
+    pub const fn umem(&self) -> UmemConfig {
+        self.umem
+    }
+}
+
+/// Validated AF_XDP backend: sockets in interface IfId order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedAfXdpV1 {
+    existing_program: ExistingXdpProgramV1,
+    ports: Box<[ValidatedAfXdpPortV1]>,
+    umem_bytes: u64,
+}
+
+impl ValidatedAfXdpV1 {
+    #[must_use]
+    pub const fn existing_program(&self) -> ExistingXdpProgramV1 {
+        self.existing_program
+    }
+
+    /// One socket per interface, sorted by IfId.
+    #[must_use]
+    pub fn ports(&self) -> &[ValidatedAfXdpPortV1] {
+        &self.ports
+    }
+
+    /// Sum of every socket's UMEM byte length.
+    #[must_use]
+    pub const fn umem_bytes(&self) -> u64 {
+        self.umem_bytes
+    }
+}
+
+/// Validated packet backend.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ValidatedBackendV1 {
+    Sim,
+    AfXdp(ValidatedAfXdpV1),
+}
+
+impl ValidatedBackendV1 {
+    #[must_use]
+    pub const fn kind(&self) -> BackendKindV1 {
+        match self {
+            Self::Sim => BackendKindV1::Sim,
+            Self::AfXdp(_) => BackendKindV1::AfXdp,
+        }
+    }
+
+    /// The AF_XDP sockets, or `None` for the simulation backend.
+    #[must_use]
+    pub const fn af_xdp(&self) -> Option<&ValidatedAfXdpV1> {
+        match self {
+            Self::Sim => None,
+            Self::AfXdp(af_xdp) => Some(af_xdp),
+        }
+    }
+}
+
 /// Owned, canonical, semantically validated schema V1.
 ///
 /// This type deliberately has no `Debug` implementation because it owns
@@ -487,6 +691,7 @@ pub struct ValidatedConfigV1 {
     firewall: Option<ValidatedFirewallV1>,
     tick: TickBudgetsV1,
     storage: RuntimeStorageShapeV1,
+    backend: ValidatedBackendV1,
 }
 
 impl ValidatedConfigV1 {
@@ -548,6 +753,13 @@ impl ValidatedConfigV1 {
     #[must_use]
     pub const fn storage_shape(&self) -> RuntimeStorageShapeV1 {
         self.storage
+    }
+
+    /// Packet backend; [`ValidatedBackendV1::Sim`] when `[backend]` is
+    /// absent.
+    #[must_use]
+    pub const fn backend(&self) -> &ValidatedBackendV1 {
+        &self.backend
     }
 }
 
@@ -1253,6 +1465,8 @@ fn validate_v1(
             generated_icmpv4: tick.generated_icmpv4,
         });
 
+    let backend = validate_backend(config.backend.unwrap_or_default(), &interfaces)?;
+
     Ok(ValidatedConfigV1 {
         interfaces,
         core_interfaces,
@@ -1266,6 +1480,248 @@ fn validate_v1(
         firewall,
         tick,
         storage,
+        backend,
+    })
+}
+
+/// Validates `[backend]` against the validated interfaces.
+///
+/// Every check is bounded (at most [`crate::MAX_BACKEND_PORTS`] ports, each
+/// compared with the earlier ones) and uses checked or widened arithmetic.
+/// Ports are checked in source order, fields in schema order; the result is
+/// sorted by IfId.
+fn validate_backend(
+    source: BackendV1,
+    interfaces: &[InterfaceBindingV1],
+) -> Result<ValidatedBackendV1, ValidationError> {
+    let ports_path = path(&["backend", "ports"]);
+    match source.kind {
+        BackendKindV1::Sim => {
+            if !source.ports.is_empty() {
+                return Err(ValidationError::new(
+                    ValidationCode::BackendPortsWithoutAfXdp,
+                    ports_path,
+                ));
+            }
+            return Ok(ValidatedBackendV1::Sim);
+        }
+        BackendKindV1::AfXdp => {}
+    }
+    if source.ports.is_empty() {
+        return Err(ValidationError::new(
+            ValidationCode::BackendNoPorts,
+            ports_path,
+        ));
+    }
+
+    let mut ports: Vec<ValidatedAfXdpPortV1> = Vec::with_capacity(source.ports.len());
+    let mut umem_bytes = 0_u64;
+    for (index, port) in source.ports.iter().enumerate() {
+        let mut base = ports_path.clone();
+        base.push_index(index);
+        let validated = validate_af_xdp_port(port, interfaces, &ports, &base)?;
+        umem_bytes = umem_bytes
+            .checked_add(validated.umem.byte_len())
+            .filter(|total| *total <= MAX_AF_XDP_UMEM_BYTES)
+            .ok_or_else(|| {
+                ValidationError::bounded(
+                    ValidationCode::BackendTotalUmemTooLarge,
+                    child_path(&base, "frame-count"),
+                    MAX_AF_XDP_UMEM_BYTES,
+                    umem_bytes.saturating_add(validated.umem.byte_len()),
+                )
+            })?;
+        ports.push(validated);
+    }
+    for (index, interface) in interfaces.iter().enumerate() {
+        if !ports.iter().any(|port| port.interface == interface.id) {
+            return Err(ValidationError::new(
+                ValidationCode::BackendInterfaceUnbound,
+                child_path(&indexed_path("interfaces", index), "name"),
+            ));
+        }
+    }
+    ports.sort_unstable_by_key(|port| port.interface);
+    Ok(ValidatedBackendV1::AfXdp(ValidatedAfXdpV1 {
+        existing_program: source.existing_xdp_program,
+        ports: ports.into_boxed_slice(),
+        umem_bytes,
+    }))
+}
+
+fn validate_af_xdp_port(
+    port: &AfXdpPortV1,
+    interfaces: &[InterfaceBindingV1],
+    earlier: &[ValidatedAfXdpPortV1],
+    base: &SourcePath,
+) -> Result<ValidatedAfXdpPortV1, ValidationError> {
+    let binding = interfaces
+        .iter()
+        .find(|binding| binding.name() == port.interface)
+        .ok_or_else(|| {
+            ValidationError::new(
+                ValidationCode::UnknownInterface,
+                child_path(base, "interface"),
+            )
+        })?;
+    let interface = binding.id();
+    let queue_path = child_path(base, "queue");
+    if port.queue > MAX_AF_XDP_QUEUE_ID {
+        return Err(ValidationError::bounded(
+            ValidationCode::BackendQueueOutOfRange,
+            queue_path,
+            u64::from(MAX_AF_XDP_QUEUE_ID),
+            u64::from(port.queue),
+        ));
+    }
+    // Interface devices are unique, so the same IfId is the same device.
+    if let Some(other) = earlier.iter().find(|other| other.interface == interface) {
+        let code = if other.queue == port.queue {
+            ValidationCode::BackendDuplicateQueue
+        } else {
+            ValidationCode::BackendMultipleQueuesPerInterface
+        };
+        return Err(ValidationError::new(code, queue_path));
+    }
+    if port.mode != AfXdpModeV1::Copy && port.xdp_attach == XdpAttachModeV1::Generic {
+        return Err(ValidationError::new(
+            ValidationCode::BackendModeRequiresNativeAttach,
+            child_path(base, "mode"),
+        ));
+    }
+    if !port.need_wakeup {
+        return Err(ValidationError::new(
+            ValidationCode::BackendNeedWakeupRequired,
+            child_path(base, "need-wakeup"),
+        ));
+    }
+
+    let rings_path = child_path(base, "rings");
+    let crate::AfXdpRingsV1 {
+        fill,
+        rx,
+        tx,
+        completion,
+    } = port.rings;
+    for (name, entries) in [
+        ("fill", fill),
+        ("rx", rx),
+        ("tx", tx),
+        ("completion", completion),
+    ] {
+        let ring_path = child_path(&rings_path, name);
+        if !entries.is_power_of_two() {
+            return Err(ValidationError::new(
+                ValidationCode::BackendRingNotPowerOfTwo,
+                ring_path,
+            ));
+        }
+        let limit = if entries < MIN_AF_XDP_RING_ENTRIES {
+            Some(MIN_AF_XDP_RING_ENTRIES)
+        } else if entries > MAX_AF_XDP_RING_ENTRIES {
+            Some(MAX_AF_XDP_RING_ENTRIES)
+        } else {
+            None
+        };
+        if let Some(limit) = limit {
+            return Err(ValidationError::bounded(
+                ValidationCode::BackendRingOutOfRange,
+                ring_path,
+                u64::from(limit),
+                u64::from(entries),
+            ));
+        }
+    }
+    if completion < tx {
+        return Err(ValidationError::bounded(
+            ValidationCode::BackendCompletionRingTooSmall,
+            child_path(&rings_path, "completion"),
+            u64::from(tx),
+            u64::from(completion),
+        ));
+    }
+
+    let frame_size_path = child_path(base, "frame-size");
+    if !SUPPORTED_ALIGNED_CHUNK_SIZES.contains(&port.frame_size) {
+        return Err(ValidationError::new(
+            ValidationCode::BackendFrameSizeUnsupported,
+            frame_size_path,
+        ));
+    }
+    // frame-size >= 2048 > 256 + 1514, so the subtraction cannot wrap.
+    let max_headroom = port.frame_size - XDP_PACKET_HEADROOM - MIN_AF_XDP_VISIBLE_FRAME_BYTES;
+    if port.headroom > max_headroom {
+        return Err(ValidationError::bounded(
+            ValidationCode::BackendHeadroomTooLarge,
+            child_path(base, "headroom"),
+            u64::from(max_headroom),
+            u64::from(port.headroom),
+        ));
+    }
+    if port.generated_frames == 0 {
+        return Err(ValidationError::new(
+            ValidationCode::BackendGeneratedFramesZero,
+            child_path(base, "generated-frames"),
+        ));
+    }
+    let frame_count_path = child_path(base, "frame-count");
+    // u32 + u32 + u32 cannot overflow u64.
+    let required = u64::from(fill) + u64::from(tx) + u64::from(port.generated_frames);
+    if u64::from(port.frame_count) < required {
+        return Err(ValidationError::bounded(
+            ValidationCode::BackendFrameCountTooSmall,
+            frame_count_path,
+            required,
+            u64::from(port.frame_count),
+        ));
+    }
+    // u32 * u32 cannot overflow u64.
+    let byte_len = u64::from(port.frame_count) * u64::from(port.frame_size);
+    if byte_len > MAX_AF_XDP_UMEM_BYTES_PER_PORT {
+        return Err(ValidationError::bounded(
+            ValidationCode::BackendUmemTooLarge,
+            frame_count_path,
+            MAX_AF_XDP_UMEM_BYTES_PER_PORT,
+            byte_len,
+        ));
+    }
+
+    let native = |_| ValidationError::new(ValidationCode::BackendNativeProfile, base.clone());
+    let mode_flag = match port.mode {
+        AfXdpModeV1::Copy => XDP_COPY,
+        AfXdpModeV1::ZeroCopy => XDP_ZEROCOPY,
+        AfXdpModeV1::Auto => 0,
+    };
+    let bind_flags = ValidatedBindFlags::new(XDP_USE_NEED_WAKEUP | mode_flag).map_err(native)?;
+    debug_assert_eq!(
+        bind_flags.mode(),
+        match port.mode {
+            AfXdpModeV1::Copy => BindMode::CopyRequired,
+            AfXdpModeV1::ZeroCopy => BindMode::ZeroCopyRequired,
+            AfXdpModeV1::Auto => BindMode::Automatic,
+        }
+    );
+    let rings = RingConfig::new(fill, rx, tx, completion).map_err(native)?;
+    // frame-count >= required > generated-frames, so this cannot wrap.
+    let rx_frames = port.frame_count - port.generated_frames;
+    let umem = UmemConfig::new(
+        port.frame_count,
+        port.frame_size,
+        port.headroom,
+        rx_frames,
+        port.generated_frames,
+        0,
+    )
+    .map_err(native)?;
+    Ok(ValidatedAfXdpPortV1 {
+        interface,
+        device: binding.device().into(),
+        queue: port.queue,
+        mode: port.mode,
+        bind_flags,
+        attach: port.xdp_attach,
+        rings,
+        umem,
     })
 }
 
@@ -1283,6 +1739,13 @@ fn preflight_public_dto(config: &ConfigV1) -> Result<(), ValidationError> {
             path(&["firewall", "rules"]),
             firewall.rules.len(),
             crate::MAX_FIREWALL_RULES,
+        )?;
+    }
+    if let Some(backend) = &config.backend {
+        check_list_bound(
+            path(&["backend", "ports"]),
+            backend.ports.len(),
+            crate::MAX_BACKEND_PORTS,
         )?;
     }
 
@@ -1343,6 +1806,12 @@ fn preflight_public_dto(config: &ConfigV1) -> Result<(), ValidationError> {
             }
             text.add(&rule.source, child_path(&base, "source"))?;
             text.add(&rule.destination, child_path(&base, "destination"))?;
+        }
+    }
+    if let Some(backend) = &config.backend {
+        for (index, port) in backend.ports.iter().enumerate() {
+            let base = indexed_nested_path("backend", "ports", index);
+            text.add(&port.interface, child_path(&base, "interface"))?;
         }
     }
     Ok(())

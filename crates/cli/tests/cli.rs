@@ -91,7 +91,7 @@ fn validate_reports_summary_or_typed_diagnostics_with_exit_status() {
         text(&ok.stdout),
         "valid: schema-version=1 interfaces=2 routes=3 neighbors=1 local-ipv4=2 \
          firewall-rules=3 services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,firewall \
-         storage-bytes=16640\n"
+         storage-bytes=16640 backend=sim\n"
     );
     assert!(ok.stderr.is_empty());
 
@@ -754,4 +754,132 @@ fn plan_text_renders_the_tcp_inbound_limit_as_a_reloadable_typed_delta() {
         "{stderr}"
     );
     assert!(!stderr.contains("17"), "{stderr}");
+}
+
+/// An AF_XDP `[backend]` binding both M1 interfaces (lan listed second).
+const AF_XDP_BACKEND: &str = r#"
+[backend]
+kind = "af-xdp"
+existing-xdp-program = "refuse"
+
+[[backend.ports]]
+interface = "wan"
+queue = 1
+mode = "zero-copy"
+xdp-attach = "native"
+rings = { fill = 2048, rx = 2048, tx = 2048, completion = 2048 }
+frame-size = 4096
+frame-count = 4608
+generated-frames = 512
+
+[[backend.ports]]
+interface = "lan"
+queue = 0
+mode = "copy"
+xdp-attach = "generic"
+rings = { fill = 256, rx = 256, tx = 256, completion = 512 }
+frame-size = 2048
+frame-count = 1024
+generated-frames = 64
+headroom = 32
+"#;
+
+/// `validate` and `plan` accept a valid AF_XDP backend; any backend change
+/// is restart-required with typed per-port lines; `run-sim` refuses it.
+#[test]
+fn af_xdp_backend_validates_plans_as_restart_required_and_is_refused_by_run_sim() {
+    let dir = scratch();
+    let v1 = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let xdp = dir.join("router-af-xdp.toml");
+    fs::write(&xdp, format!("{v1}{AF_XDP_BACKEND}")).unwrap();
+
+    let ok = ruster(&["validate".as_ref(), xdp.as_os_str()]);
+    assert_eq!(status(&ok), 0, "{}", text(&ok.stderr));
+    assert_eq!(
+        text(&ok.stdout),
+        "valid: schema-version=1 interfaces=2 routes=3 neighbors=1 local-ipv4=2 \
+         firewall-rules=3 services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,firewall \
+         storage-bytes=16640 backend=af-xdp ports=2 umem-bytes=20971520\n"
+    );
+
+    let current = fixtures().join("router-v1.toml");
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), xdp.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    let stdout = text(&plan.stdout);
+    assert!(
+        stdout.starts_with(
+            "plan: restart-required\nrestart-required: BACKEND\nchanges: 3\n\
+             \x20 backend ~ sim -> af-xdp\n\
+             \x20 backend-port + if1 dev sim0 queue 0 copy generic rings 256/256/256/512 \
+             frames 1024x2048 generated 64 headroom 32\n\
+             \x20 backend-port + if2 dev sim1 queue 1 zero-copy native rings 2048/2048/2048/2048 \
+             frames 4608x4096 generated 512 headroom 0\n\
+             expected-flush:\n"
+        ),
+        "{stdout}"
+    );
+
+    // One port setting: a typed `~` line for that port only.
+    let moved = dir.join("router-af-xdp-moved.toml");
+    fs::write(
+        &moved,
+        format!(
+            "{v1}{}",
+            AF_XDP_BACKEND.replacen("queue = 1", "queue = 2", 1)
+        ),
+    )
+    .unwrap();
+    let plan = ruster(&["plan".as_ref(), xdp.as_os_str(), moved.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    let stdout = text(&plan.stdout);
+    assert!(
+        stdout.starts_with(
+            "plan: restart-required\nrestart-required: BACKEND\nchanges: 1\n\
+             \x20 backend-port ~ if2 dev sim1 queue 1 zero-copy native rings 2048/2048/2048/2048 \
+             frames 4608x4096 generated 512 headroom 0 -> if2 dev sim1 queue 2 zero-copy native \
+             rings 2048/2048/2048/2048 frames 4608x4096 generated 512 headroom 0\n"
+        ),
+        "{stdout}"
+    );
+    let same = ruster(&["plan".as_ref(), xdp.as_os_str(), xdp.as_os_str()]);
+    assert!(
+        text(&same.stdout).starts_with("plan: reloadable\nrestart-required: none\nchanges: 0\n")
+    );
+
+    // A rule violation is a value-free path.
+    let bad = dir.join("router-af-xdp-bad.toml");
+    fs::write(
+        &bad,
+        format!(
+            "{v1}{}",
+            AF_XDP_BACKEND.replacen("xdp-attach = \"native\"", "xdp-attach = \"generic\"", 1)
+        ),
+    )
+    .unwrap();
+    let output = ruster(&["validate".as_ref(), bad.as_os_str()]);
+    assert_eq!(status(&output), 2);
+    assert_eq!(
+        text(&output.stderr),
+        "ruster: invalid config: stage=validate code=BACKEND_MODE_REQUIRES_NATIVE_ATTACH \
+         path=backend.ports[0].mode\n"
+    );
+
+    fs::write(
+        dir.join("scenario.toml"),
+        "schema = \"ruster-scenario/v1\"\nseed = 1\nconfig = \"router-af-xdp.toml\"\n",
+    )
+    .unwrap();
+    let scenario = dir.join("scenario.toml");
+    let output = ruster(&[
+        "run-sim".as_ref(),
+        "--scenario".as_ref(),
+        scenario.as_os_str(),
+    ]);
+    assert_eq!(status(&output), 2);
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        text(&output.stderr),
+        "ruster run-sim: invalid initial config: initial config rejected at backend: \
+         UNSUPPORTED_BACKEND\n"
+    );
 }

@@ -34,7 +34,10 @@ repository rulesetから確認した状態である。以下で矛盾する
 workspaceは12 crateからなる。data-planeとI/Oのlibrary crate（`ruster-core`、`ruster-io-*`、
 `ruster-runtime`、`ruster-bench`）は外部依存を持たない。外部依存は`ruster-config`と
 `ruster-sim-scenario`が直接使うserde/serde_path_to_error/tomlだけで、`ruster-control`と
-`ruster-cli`はpath depを通じてそれらを推移的に含む。
+`ruster-cli`はpath depを通じてそれらを推移的に含む。`ruster-config`はAF_XDP backend configの
+検証に`forbid(unsafe_code)`の`ruster-io-xdp`（safeな`native_profile`）だけを使い、unsafeを含む
+`ruster-io-xdp-native`はcontrol plane/run-simのdependency graphに入らない（native crateが
+`ruster-io-xdp`の同じprofile型をre-exportする）。
 
 - packet core（`ruster-core`）
   - backend-owned RX/generated bufferのGAT/RAII lease、stableな`DropReason`/`ConsumeReason`
@@ -71,8 +74,9 @@ workspaceは12 crateからなる。data-planeとI/Oのlibrary crate（`ruster-co
     RX block engine、core `PacketIo`のcopy backend（AFPKT-001〜007、IO-012）。証跡は
     scripted syscall上のconformanceだけで、public live constructor、TX completion
     scheduling、poll、netns/実NIC E2Eは無い
-  - `ruster-io-xdp`/`ruster-io-xdp-native`: AF_XDP ownership model、native ABI/ring
-    scaffold、private syscall RAII seam（XDP rows）。socket/UMEM登録、attach、`PacketIo`接続は
+  - `ruster-io-xdp`/`ruster-io-xdp-native`: AF_XDP ownership model、safe native profile
+    （`ruster-io-xdp::native_profile`、configと共有）、native ABI/ring scaffold、private syscall
+    RAII seam（XDP rows）。socket/UMEM登録、attach、`PacketIo`接続は
     無い
 - CI: `CI` workflow（Check、Musl、Test、Clippy、Format、Doc。Testはdoctestとrequirements
   gateを含む）、`Security Smoke` workflow（`R16A Bounded`、8 target×4 fixed seed）、
@@ -100,6 +104,10 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   作り直さない（SIM-016 deferred）。process restartをまたぐgeneration/key履歴は無い。
 - OS乱数によるproduction key source（`OsRandomKeySource`）と、sim専用key sourceを型で拒否する
   `ProductionSequencer`はM2 S7で追加した（PUB-010〜013）。これを使う`ruster run`はまだ無い（M2）。
+- AF_XDP backendのversioned `[backend]` config（kind、portごとのqueue/mode/need-wakeup/attach/
+  ring/UMEM、existing-program policy）、bounded validation、restart-required classification、
+  `run-sim`の非sim backend拒否はM2 S9で追加した（CONFIG-004〜007、BACKEND-001〜003）。これを
+  使うsocket/UMEM/attach setupと`ruster run`はまだ無い（M2）。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
   ringのsaturationが無い（OBS-017/018 deferred）。core `PublicationQuiescenceGuard::new`はsealされていない。

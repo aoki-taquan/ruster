@@ -1,6 +1,8 @@
 use std::num::NonZeroU64;
 
-use ruster_config::{parse, validate, ValidatedConfig, ValidatedConfigV1};
+use ruster_config::{
+    parse, validate, AfXdpModeV1, BackendKindV1, ValidatedConfig, ValidatedConfigV1,
+};
 use ruster_core::{FirewallAction, IfId, Ipv4Address, MacAddress};
 
 use super::{
@@ -103,6 +105,7 @@ fn only(plan: &ApplyPlan, aspects: &[&str]) {
         ("ipv4_origin", plan.ipv4_origin_changed()),
         ("nat44_udp", !plan.nat44_udp().is_empty()),
         ("nat44_tcp", !plan.nat44_tcp().is_empty()),
+        ("backend", !plan.backend().is_empty()),
         ("restart", plan.requires_restart()),
     ];
     for (name, is_present) in present {
@@ -477,6 +480,143 @@ fn plan_classifies_interface_shape_and_policy_changes_as_restart_required() {
             RestartRequired::Interfaces,
         ]
     );
+}
+
+/// The fixture document with an AF_XDP `[backend]` binding lan and wan,
+/// wan on `wan_queue` with `wan_mode`.
+pub(crate) fn af_xdp(edits: &[(&str, &str)], wan_queue: u32, wan_mode: &str) -> ValidatedConfigV1 {
+    document(&af_xdp_text(edits, wan_queue, wan_mode))
+}
+
+fn af_xdp_text(edits: &[(&str, &str)], wan_queue: u32, wan_mode: &str) -> String {
+    let port = |interface: &str, queue: u32, mode: &str| {
+        format!(
+            "\n[[backend.ports]]\ninterface = \"{interface}\"\nqueue = {queue}\n\
+             mode = \"{mode}\"\nxdp-attach = \"native\"\n\
+             rings = {{ fill = 256, rx = 256, tx = 256, completion = 256 }}\n\
+             frame-size = 2048\nframe-count = 1024\ngenerated-frames = 64\n"
+        )
+    };
+    format!(
+        "{}\n[backend]\nkind = \"af-xdp\"\n{}{}",
+        edited(edits),
+        port("wan", wan_queue, wan_mode),
+        port("lan", 0, "copy"),
+    )
+}
+
+#[test]
+fn backend_changes_are_restart_required_typed_and_listed_last() {
+    let sim = config(&[]);
+    // An explicit `sim` backend is the same as an absent section.
+    let explicit = document(&format!("{}\n[backend]\nkind = \"sim\"\n", edited(&[])));
+    only(&ApplyPlan::between(&sim, &explicit).unwrap(), &[]);
+
+    let xdp = af_xdp(&[], 0, "copy");
+    let up = ApplyPlan::between(&sim, &xdp).unwrap();
+    only(&up, &["backend", "restart"]);
+    assert_eq!(up.restart_required(), [RestartRequired::Backend]);
+    assert_eq!(
+        up.backend().kind,
+        Some(Delta {
+            old: BackendKindV1::Sim,
+            new: BackendKindV1::AfXdp,
+        })
+    );
+    assert_eq!(up.backend().existing_xdp_program, None);
+    // Ports appear in IfId order although the document lists wan first.
+    assert!(matches!(
+        &*up.backend().ports,
+        [Change::Added(lan), Change::Added(wan)]
+            if lan.interface() == IfId(1) && wan.interface() == IfId(2)
+    ));
+
+    let down = ApplyPlan::between(&xdp, &sim).unwrap();
+    only(&down, &["backend", "restart"]);
+    assert!(matches!(
+        &*down.backend().ports,
+        [Change::Removed(_), Change::Removed(_)]
+    ));
+
+    // Same backend: nothing to restart, even with other reloadable changes.
+    only(
+        &ApplyPlan::between(&xdp, &af_xdp(&[], 0, "copy")).unwrap(),
+        &[],
+    );
+    only(
+        &ApplyPlan::between(&xdp, &af_xdp(&[ROUTE_CHANGE], 0, "copy")).unwrap(),
+        &["routes"],
+    );
+
+    // Any one port setting is a typed per-port change.
+    for next in [af_xdp(&[], 1, "copy"), af_xdp(&[], 0, "auto")] {
+        let plan = ApplyPlan::between(&xdp, &next).unwrap();
+        only(&plan, &["backend", "restart"]);
+        assert_eq!(plan.restart_required(), [RestartRequired::Backend]);
+        assert_eq!(plan.backend().kind, None);
+        let [Change::Changed(Delta { old, new })] = &*plan.backend().ports else {
+            panic!("one wan port change: {:?}", plan.backend().ports);
+        };
+        assert_eq!((old.interface(), new.interface()), (IfId(2), IfId(2)));
+        assert!(old.queue() != new.queue() || old.mode() != new.mode());
+        assert_eq!(old.mode(), AfXdpModeV1::Copy);
+    }
+
+    // Under af-xdp a port owns its device: moving an interface to another
+    // device is restart-required (a label change alone is reloadable only
+    // under sim), and so is swapping the devices of two interfaces.
+    let moved = ApplyPlan::between(
+        &xdp,
+        &af_xdp(&[("device = \"eth1\"", "device = \"eth2\"")], 0, "copy"),
+    )
+    .unwrap();
+    only(&moved, &["interface_labels", "backend", "restart"]);
+    assert_eq!(moved.restart_required(), [RestartRequired::Backend]);
+    let [Change::Changed(Delta { old, new })] = &*moved.backend().ports else {
+        panic!("one wan port change: {:?}", moved.backend().ports);
+    };
+    assert_eq!((old.interface(), old.device()), (IfId(2), "eth1"));
+    assert_eq!((new.interface(), new.device()), (IfId(2), "eth2"));
+    let swapped = ApplyPlan::between(
+        &xdp,
+        &af_xdp(
+            &[
+                ("device = \"eth0\"", "device = \"swap\""),
+                ("device = \"eth1\"", "device = \"eth0\""),
+                ("device = \"swap\"", "device = \"eth1\""),
+            ],
+            0,
+            "copy",
+        ),
+    )
+    .unwrap();
+    only(&swapped, &["interface_labels", "backend", "restart"]);
+    assert_eq!(swapped.restart_required(), [RestartRequired::Backend]);
+    assert!(matches!(
+        &*swapped.backend().ports,
+        [Change::Changed(lan), Change::Changed(wan)]
+            if (lan.old.device(), lan.new.device()) == ("eth0", "eth1")
+                && (wan.old.device(), wan.new.device()) == ("eth1", "eth0")
+    ));
+    // The same device under a new interface name is still the same port.
+    let renamed = document(&af_xdp_text(&[], 0, "copy").replace("\"wan\"", "\"uplink\""));
+    only(
+        &ApplyPlan::between(&xdp, &renamed).unwrap(),
+        &["interface_labels"],
+    );
+
+    // Backend is always the last reason.
+    let both =
+        ApplyPlan::between(&sim, &af_xdp(&[SHAPE_CHANGE, INTERFACE_CHANGE], 0, "copy")).unwrap();
+    assert_eq!(
+        both.restart_required(),
+        [
+            RestartRequired::StorageShape,
+            RestartRequired::Interfaces,
+            RestartRequired::Backend,
+        ]
+    );
+    assert_eq!(RestartRequired::Backend.code(), "BACKEND");
 }
 
 #[test]

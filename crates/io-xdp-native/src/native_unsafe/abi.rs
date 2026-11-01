@@ -17,19 +17,14 @@ pub const AF_XDP: i32 = 44;
 /// AF_XDP socket option level.
 pub const SOL_XDP: i32 = 283;
 
-/// Share an existing UMEM.
-pub const XDP_SHARED_UMEM: u16 = 1 << 0;
-/// Require copy mode.
-pub const XDP_COPY: u16 = 1 << 1;
-/// Require zero-copy mode.
-pub const XDP_ZEROCOPY: u16 = 1 << 2;
-/// Enable conditional producer wakeups.
-pub const XDP_USE_NEED_WAKEUP: u16 = 1 << 3;
+/// Bind flags of the safe profile (`XDP_SHARED_UMEM`, `XDP_COPY`,
+/// `XDP_ZEROCOPY`, `XDP_USE_NEED_WAKEUP`, and the accepted set), defined in
+/// `ruster-io-xdp` and re-exported here.
+pub use ruster_io_xdp::native_profile::{
+    XDP_COPY, XDP_SHARED_UMEM, XDP_SUPPORTED_BIND_FLAGS, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY,
+};
 /// Enable scatter/gather packets; deferred by the initial profile.
 pub const XDP_USE_SG: u16 = 1 << 4;
-/// Bind flags accepted by the initial profile.
-pub const XDP_SUPPORTED_BIND_FLAGS: u16 =
-    XDP_SHARED_UMEM | XDP_COPY | XDP_ZEROCOPY | XDP_USE_NEED_WAKEUP;
 
 /// Use unaligned UMEM chunks.
 pub const XDP_UMEM_UNALIGNED_CHUNK_FLAG: u32 = 1 << 0;

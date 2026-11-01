@@ -36,11 +36,13 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   （割当済みslot数、generation内high-water、capacity、flushを越えるpeak。coreがO(1)で保守し
   table scanなし）をtick境界で固定順snapshotにする。
 - `ruster-config`: 最大1 MiBのUTF-8 TOMLをschema versionでpredispatchし、V1の
-  interface/address/route/neighbor/NAT44/firewall/capacity/tick budget DTOへexact decode
-  する。unknown/duplicate field、runtime生成値、過大listをvalue-freeなtyped diagnosticで
+  interface/address/route/neighbor/NAT44/firewall/capacity/tick budget/packet backend DTOへ
+  exact decodeする。unknown/duplicate field、runtime生成値、過大listをvalue-freeなtyped diagnosticで
   fail-closeする。cold semantic validationはcanonicalなowned core値、connected route、
   cross-reference/on-link検証、policy/NAT/firewall検証、全runtime storage shapeを作る。
-  publication identityとsecretは持たない。
+  AF_XDP backendのring/UMEM/bind flagは`ruster-io-xdp`の`native_profile`（unsafeなしの
+  native profile。`ruster-io-xdp-native`も同じ型をre-export）のvalidatorで構築し、
+  native crateには依存しない（下の「packet backend」）。`#![forbid(unsafe_code)]`。publication identityとsecretは持たない。
 - `ruster-control`: validated configからpublication candidateを作るbridge（M1は
   Resolution/ICMPv4 error/NAT44 UDP/TCP/firewallを全て必須とし、欠落はtyped reject）、
   scenario seed由来のsim専用key source、`/dev/urandom`由来のproduction key source
@@ -85,8 +87,10 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   TX mode、poll、cleanup/stats、実NIC/netns E2E、throughputを主張する段階ではない。
 - `ruster-io-xdp`: AF_XDP native接続より前に固定するpure-Rust ownership model。
   UMEM layout、descriptor境界、nonzero generation token、frame state ledger、
-  fixed-storage ring、authoritative ledgerと結合したfinite fake kernelを持つ。socket、
-  native ring、FFI、core `PacketIo`接続はまだ持たない。
+  fixed-storage ring、authoritative ledgerと結合したfinite fake kernelを持つ。
+  `native_profile`はbind flag、ring capacity、UMEM geometryのsafeなLinux v6.8 profileで、
+  `ruster-config`と`ruster-io-xdp-native`が共有する。socket、native ring、FFI、core
+  `PacketIo`接続はまだ持たない。
 - `ruster-io-xdp-native`: Linux v6.8 AF_XDP UAPIのC layout、raw flag profile、
   2048/4096-byte aligned UMEMと固定256-byte kernel headroomを含むring geometry、
   kernel報告mmap offsetをcold pathで検証するnative scaffold。caller-owned mappingを
@@ -476,6 +480,53 @@ $B run-sim --scenario fixtures/m1/scenario.toml --hold
   `1` runtime/I/O/invariant失敗とscenarioの`expect`/`apply`不一致、`2` usage errorと
   invalid config/scenario（未知interface名を含む）。file read失敗（存在しない、読めない）は
   内容のinvalidとは区別して`1`で、stderrは`cannot read config: NOT_FOUND`のような安定codeです。
+
+### packet backend（`[backend]`）
+
+`[backend]`は省略可能で、省略時は`kind = "sim"`です（M1 fixtureとgoldenは不変）。
+`kind = "af-xdp"`はM2のAF_XDP backend用のvalidated configを作るだけで、socket作成やXDP
+attachはまだ行いません（`ruster run`は後続slice）。`validate`/`plan`は受理し、`run-sim`は
+`SimIo`だけを動かすため無視せず`stage=backend code=UNSUPPORTED_BACKEND`で拒否します
+（初期configはexit 2、apply stepは`invalid`）。
+
+```toml
+[backend]
+kind = "af-xdp"                  # 省略時 "sim"
+existing-xdp-program = "refuse"  # 省略時 "refuse"（唯一の値。既存programを置換しない）
+
+[[backend.ports]]                # interfaceごとに1つ（M2は1 queue/interface）
+interface = "wan"                # [[interfaces]] の name。その device をbindする
+queue = 0                        # 0..=1023
+mode = "copy"                    # "copy" | "zero-copy" | "auto"
+need-wakeup = true               # 省略時 true。native profileが必須とするため false は拒否
+xdp-attach = "native"            # "native" | "generic"（skb）。generic は mode = "copy" だけ
+rings = { fill = 2048, rx = 2048, tx = 2048, completion = 2048 }  # power of two、64..=16384
+frame-size = 4096                # 2048 | 4096（aligned chunk）
+frame-count = 4608               # >= fill + tx + generated-frames（最低限のfloor）
+generated-frames = 512           # >= 1。生成ARP/ICMPv4用、残りがRX用
+headroom = 0                     # 省略時 0。kernel固定256 bytesに加算
+```
+
+制約（違反は`stage=validate code=BACKEND_* path=backend.ports[i].<field>`、数値はlimit/actualだけ）:
+
+- 全`[[interfaces]]`にちょうど1つのport。同じ(device, queue)の重複、同じinterfaceの2つ目のqueue、
+  未知interfaceは拒否します。`kind = "sim"`でportを書くと`BACKEND_PORTS_WITHOUT_AF_XDP`です。
+- `xdp-attach = "generic"`（skb XDPは常にcopy）では`mode = "copy"`だけを受理し、`zero-copy`/`auto`は
+  `BACKEND_MODE_REQUIRES_NATIVE_ATTACH`です。
+- `completion >= tx`。`frame-size - 256 - headroom >= 1514`（1500-byte MTUのEthernet IIを
+  single bufferに収める）。
+- `frame-count - generated-frames >= fill + tx`はlibxdpと同じ**最低限のfloor**です。Fill ringを
+  満杯にでき、かつTX ring一杯のforward frameを出せるだけの量で、未回収のcompletion、driverが
+  dequeue済みのTX frame、coreが借用中のRX frameまでは数えません。不足時に詰まらないことは
+  backend側の責務です（in-flight TXを`tx`以下に抑え、free listが足りなければFillを減らして
+  進む。後続X01/X02、ledger BACKEND-004）。生成frameは別poolです。
+- UMEMは1 socket 256 MiB、全socket合計1 GiBまで。
+- `[backend]`のどんな変更も`plan`で`restart-required: BACKEND`になり、`backend ~ sim -> af-xdp`や
+  `backend-port ~ if2 dev eth1 queue 0 copy native rings 2048/2048/2048/2048 frames 4608x4096
+  generated 512 headroom 0 -> ...`のように値を出します（secretを含まないため）。portはbindする
+  deviceを含むので、af-xdpでinterfaceの`device`を変える（2つのdeviceを入れ替えるのも）と
+  label変更に加えてrestart-requiredです（sim backendではlabel変更だけでreloadable）。`validate`の要約は末尾に
+  `backend=sim`または`backend=af-xdp ports=2 umem-bytes=...`を出します。
 
 ## 開発
 

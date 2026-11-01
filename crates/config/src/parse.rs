@@ -2,7 +2,7 @@ use serde::de::IntoDeserializer;
 use serde_path_to_error::{Path, Segment};
 use toml::Value;
 
-use crate::{ConfigV1, Diagnostic, DiagnosticCode, SourcePath, VersionedConfig};
+use crate::{ConfigV1, Diagnostic, DiagnosticCode, PathSegment, SourcePath, VersionedConfig};
 
 pub const SCHEMA_VERSION_V1: u32 = 1;
 pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
@@ -11,6 +11,8 @@ pub const MAX_ADDRESSES: usize = 1024;
 pub const MAX_ROUTES: usize = 4096;
 pub const MAX_NEIGHBORS: usize = 4096;
 pub const MAX_FIREWALL_RULES: usize = 4096;
+/// Bound of `[[backend.ports]]`. M2 binds at most one queue per interface.
+pub const MAX_BACKEND_PORTS: usize = MAX_INTERFACES;
 
 const FORBIDDEN_FIELDS: &[&str] = &[
     "config-generation",
@@ -34,13 +36,21 @@ const FORBIDDEN_FIELDS: &[&str] = &[
     "workers",
 ];
 
+/// Fields of [`FORBIDDEN_FIELDS`] that are operator input at exactly one
+/// place: the device queue id of one `[[backend.ports]]` entry. Everywhere
+/// else they stay forbidden (queue *ownership* and sharding remain
+/// runtime-generated).
+const BACKEND_PORT_FIELDS: &[&str] = &["queue"];
+
 const SAFE_PATH_FIELDS: &[&str] = &[
     "action",
     "actions",
     "address",
     "addresses",
     "allocator-seed",
+    "backend",
     "capacity",
+    "completion",
     "default-ttl",
     "destination",
     "destination-ports",
@@ -49,15 +59,21 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "dynamic-neighbors",
     "echo-reply",
     "egress",
+    "existing-xdp-program",
     "failure-holds",
+    "fill",
     "firewall",
     "first",
     "failure-dispatch-scans",
     "filtering",
+    "frame-count",
+    "frame-size",
     "generate",
     "generated-arp",
+    "generated-frames",
     "generated-icmpv4",
     "hairpinning",
+    "headroom",
     "host-unreachable",
     "icmpv4-errors",
     "id",
@@ -70,12 +86,15 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "interval-ms",
     "ipv4",
     "ipv4-origin",
+    "kind",
     "last",
     "mac",
     "mappings",
     "max-attempts",
+    "mode",
     "name",
     "nat44",
+    "need-wakeup",
     "neighbors",
     "net-unreachable",
     "outside",
@@ -85,9 +104,11 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "prefix",
     "protocol",
     "public-address",
+    "queue",
     "realm",
     "resolution",
     "resolution-timer-scans",
+    "rings",
     "routes",
     "rules",
     "rx",
@@ -102,9 +123,11 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "tcp-opening-idle-ttl-ms",
     "tick",
     "time-exceeded",
+    "tx",
     "udp",
     "udp-idle-ttl-ms",
     "via",
+    "xdp-attach",
 ];
 
 /// Parses bounded UTF-8 TOML using schema-version predispatch and exact V1 DTOs.
@@ -138,7 +161,7 @@ pub fn parse(input: &[u8]) -> Result<VersionedConfig, Diagnostic> {
         ));
     }
 
-    reject_forbidden_fields(&value, &mut SourcePath::default())?;
+    reject_forbidden_fields(&value, &mut SourcePath::default(), true)?;
     let config = deserialize_exact(value)?;
     enforce_list_bounds(&config)?;
     Ok(VersionedConfig::V1(config))
@@ -189,19 +212,29 @@ fn convert_path(path: &Path) -> SourcePath {
     converted
 }
 
-fn reject_forbidden_fields(value: &Value, path: &mut SourcePath) -> Result<(), Diagnostic> {
+/// `exact` is true while every key from the root to `value` is spelled
+/// exactly as a [`SAFE_PATH_FIELDS`] entry, so `path` is the complete source
+/// path. Only then can a [`BACKEND_PORT_FIELDS`] key be operator input:
+/// under an unknown, unsafe, or differently spelled key it stays forbidden.
+fn reject_forbidden_fields(
+    value: &Value,
+    path: &mut SourcePath,
+    exact: bool,
+) -> Result<(), Diagnostic> {
     match value {
         Value::Array(values) => {
             for (index, value) in values.iter().enumerate() {
                 path.push_index(index);
-                reject_forbidden_fields(value, path)?;
+                reject_forbidden_fields(value, path, exact)?;
                 path.pop();
             }
         }
         Value::Table(table) => {
             for (field, value) in table {
                 let normalized = field.to_ascii_lowercase().replace('_', "-");
-                if FORBIDDEN_FIELDS.contains(&normalized.as_str()) {
+                let operator_input =
+                    exact && BACKEND_PORT_FIELDS.contains(&field.as_str()) && is_backend_port(path);
+                if FORBIDDEN_FIELDS.contains(&normalized.as_str()) && !operator_input {
                     path.push_field(normalized);
                     return Err(Diagnostic::new(
                         DiagnosticCode::ForbiddenField,
@@ -209,17 +242,27 @@ fn reject_forbidden_fields(value: &Value, path: &mut SourcePath) -> Result<(), D
                     ));
                 }
                 if SAFE_PATH_FIELDS.contains(&normalized.as_str()) {
+                    let exact = exact && *field == normalized;
                     path.push_field(normalized);
-                    reject_forbidden_fields(value, path)?;
+                    reject_forbidden_fields(value, path, exact)?;
                     path.pop();
                 } else {
-                    reject_forbidden_fields(value, path)?;
+                    reject_forbidden_fields(value, path, false)?;
                 }
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Whether `path` is exactly one `[[backend.ports]]` entry.
+fn is_backend_port(path: &SourcePath) -> bool {
+    matches!(
+        path.segments(),
+        [PathSegment::Field(backend), PathSegment::Field(ports), PathSegment::Index(_)]
+            if backend == "backend" && ports == "ports"
+    )
 }
 
 fn enforce_list_bounds(config: &ConfigV1) -> Result<(), Diagnostic> {
@@ -231,6 +274,11 @@ fn enforce_list_bounds(config: &ConfigV1) -> Result<(), Diagnostic> {
         let mut path = SourcePath::root_field("firewall");
         path.push_field("rules");
         check_list_path(path, firewall.rules.len(), MAX_FIREWALL_RULES)?;
+    }
+    if let Some(backend) = &config.backend {
+        let mut path = SourcePath::root_field("backend");
+        path.push_field("ports");
+        check_list_path(path, backend.ports.len(), MAX_BACKEND_PORTS)?;
     }
     Ok(())
 }

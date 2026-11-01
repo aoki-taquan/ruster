@@ -11,6 +11,7 @@ mod endpoint;
 mod fake;
 mod layout;
 mod ledger;
+pub mod native_profile;
 mod ring;
 mod token;
 

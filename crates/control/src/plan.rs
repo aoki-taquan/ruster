@@ -29,7 +29,10 @@
 
 use std::{cmp::Ordering, fmt, num::NonZeroU64};
 
-use ruster_config::{InterfaceBindingV1, ValidatedConfigV1};
+use ruster_config::{
+    BackendKindV1, ExistingXdpProgramV1, InterfaceBindingV1, ValidatedAfXdpPortV1,
+    ValidatedBackendV1, ValidatedConfigV1,
+};
 use ruster_core::{
     FirewallHashKey, FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, LocalIpv4Binding,
     Nat44Filtering, Nat44TcpHashKey, Nat44UdpHashKey, Neighbor, PublicationQuiescence, Route,
@@ -162,6 +165,51 @@ impl NatChange {
     }
 }
 
+/// Difference of the `[backend]` section. Backend settings are not secret,
+/// so every difference is a typed value. Any non-empty change is
+/// [`RestartRequired::Backend`].
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct BackendChange {
+    pub kind: Option<Delta<BackendKindV1>>,
+    pub existing_xdp_program: Option<Delta<ExistingXdpProgramV1>>,
+    /// AF_XDP ports keyed by interface IfId. The simulation backend has
+    /// none, so a `sim` to `af-xdp` change adds every port. A port includes
+    /// its bound device, so moving an interface to another device (or
+    /// swapping two devices) is a port change, not just a label change.
+    pub ports: Box<[Change<ValidatedAfXdpPortV1>]>,
+}
+
+impl BackendChange {
+    fn between(old: &ValidatedBackendV1, new: &ValidatedBackendV1) -> Self {
+        let ports = |backend: &ValidatedBackendV1| {
+            backend
+                .af_xdp()
+                .map_or(&[][..], ruster_config::ValidatedAfXdpV1::ports)
+                .to_vec()
+        };
+        let program = |backend: &ValidatedBackendV1| {
+            backend
+                .af_xdp()
+                .map(ruster_config::ValidatedAfXdpV1::existing_program)
+        };
+        let existing_xdp_program = match (program(old), program(new)) {
+            (Some(old), Some(new)) => delta(old, new),
+            _ => None,
+        };
+        Self {
+            kind: delta(old.kind(), new.kind()),
+            existing_xdp_program,
+            ports: diff(&ports(old), &ports(new), ValidatedAfXdpPortV1::interface),
+        }
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.kind.is_none() && self.existing_xdp_program.is_none() && self.ports.is_empty()
+    }
+}
+
 /// Control-plane labels of one interface. Informational only: core
 /// identity is the IfId and MAC, so a label change is reloadable.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -204,9 +252,12 @@ pub enum PlanError {
 ///
 /// Building a plan never mutates configuration, candidates, storage, or
 /// runtimes. Restart-required reasons are listed in the order successor
-/// validation checks them, so a non-empty list predicts the rejection
+/// validation checks them, so a list whose first reason is not
+/// [`RestartRequired::Backend`] predicts the rejection
 /// `RestartRequired(restart_required()[0])` for any successor built from
-/// `next` with a fresh generation and keys.
+/// `next` with a fresh generation and keys. `Backend` is always last: the
+/// publication candidate carries no backend, so only the backend-owning
+/// process can enforce it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplyPlan {
     routes: Box<[Change<Route>]>,
@@ -220,6 +271,7 @@ pub struct ApplyPlan {
     ipv4_origin_changed: bool,
     nat44_udp: NatChange,
     nat44_tcp: NatChange,
+    backend: BackendChange,
     restart_required: Box<[RestartRequired]>,
     flush: StateFlush,
     dry_run: Option<Result<SuccessorCheck, ApplyError>>,
@@ -254,6 +306,11 @@ impl ApplyPlan {
         if !interfaces.is_empty() {
             restart_required.push(RestartRequired::Interfaces);
         }
+        let backend = BackendChange::between(current.backend(), next.backend());
+        debug_assert_eq!(backend.is_empty(), current.backend() == next.backend());
+        if current.backend() != next.backend() {
+            restart_required.push(RestartRequired::Backend);
+        }
 
         let old_rules = old.firewall.rules();
         let new_rules = new.firewall.rules();
@@ -275,6 +332,7 @@ impl ApplyPlan {
             ipv4_origin_changed: current.ipv4_origin() != next.ipv4_origin(),
             nat44_udp: nat_change(&old, &new, Protocol::Udp),
             nat44_tcp: nat_change(&old, &new, Protocol::Tcp),
+            backend,
             restart_required: restart_required.into_boxed_slice(),
             flush: StateFlush::ALL,
             dry_run: None,
@@ -290,6 +348,13 @@ impl ApplyPlan {
     /// [`FlushCount::All`]. The caller is responsible for `current` being the
     /// document of the active generation and `successor` being built from
     /// `next`.
+    ///
+    /// A [`RestartRequired::Backend`] plan is never live-applicable even
+    /// though the publication would accept the successor (a candidate
+    /// carries no backend). Such a plan skips the live check: the dry run is
+    /// recorded as `Err(ApplyError::RestartRequired(Backend))` and the flush
+    /// stays [`FlushCount::All`], so no caller can mistake it for an
+    /// in-place reload.
     pub fn for_active<I: PublicationQuiescence>(
         active: &mut ActivePublication<'_, I>,
         current: &ValidatedConfigV1,
@@ -297,6 +362,10 @@ impl ApplyPlan {
         successor: &ValidatedCandidate,
     ) -> Result<Self, PlanError> {
         let mut plan = Self::between(current, next)?;
+        if plan.restart_required.contains(&RestartRequired::Backend) {
+            plan.dry_run = Some(Err(ApplyError::RestartRequired(RestartRequired::Backend)));
+            return Ok(plan);
+        }
         let check = active.check_successor(successor);
         if let Ok(check) = check {
             plan.flush = check.flush;
@@ -367,8 +436,15 @@ impl ApplyPlan {
         self.nat44_tcp
     }
 
+    /// Difference of the `[backend]` section; non-empty exactly when
+    /// [`RestartRequired::Backend`] is listed.
+    #[must_use]
+    pub const fn backend(&self) -> &BackendChange {
+        &self.backend
+    }
+
     /// Reasons the change cannot be applied in place, in successor
-    /// validation order. The NAT port-owner table holds exactly one slot per
+    /// validation order (with [`RestartRequired::Backend`] last). The NAT port-owner table holds exactly one slot per
     /// pool port, so only a pool *size* change alters the storage shape and
     /// is restart-required; a same-size shift of the range and a realm change
     /// are reloadable.
@@ -396,7 +472,7 @@ impl ApplyPlan {
 }
 
 /// Keyed diff, ordered by key. Validated configuration has unique keys.
-fn diff<T: Copy + Eq, K: Ord>(old: &[T], new: &[T], key: impl Fn(&T) -> K) -> Box<[Change<T>]> {
+fn diff<T: Clone + Eq, K: Ord>(old: &[T], new: &[T], key: impl Fn(&T) -> K) -> Box<[Change<T>]> {
     let sorted = |items: &[T]| {
         let mut items = items.to_vec();
         items.sort_by_key(|item| key(item));
@@ -413,12 +489,15 @@ fn diff<T: Copy + Eq, K: Ord>(old: &[T], new: &[T], key: impl Fn(&T) -> K) -> Bo
             (Some(a), Some(b)) => key(a).cmp(&key(b)),
         };
         match order {
-            Ordering::Less => changes.extend(old.next().map(|item| Change::Removed(*item))),
-            Ordering::Greater => changes.extend(new.next().map(|item| Change::Added(*item))),
+            Ordering::Less => changes.extend(old.next().cloned().map(Change::Removed)),
+            Ordering::Greater => changes.extend(new.next().cloned().map(Change::Added)),
             Ordering::Equal => {
-                if let (Some(&old), Some(&new)) = (old.next(), new.next()) {
+                if let (Some(old), Some(new)) = (old.next(), new.next()) {
                     if old != new {
-                        changes.push(Change::Changed(Delta { old, new }));
+                        changes.push(Change::Changed(Delta {
+                            old: old.clone(),
+                            new: new.clone(),
+                        }));
                     }
                 }
             }

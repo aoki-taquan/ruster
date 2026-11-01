@@ -382,6 +382,13 @@ pub enum ActivationError {
 /// The fixed runtime storage and the fixed resolution/ICMPv4 policies are
 /// bound when storage and runtimes are created. Changing them requires
 /// dropping the active publication and activating new storage.
+///
+/// [`RestartRequired::Backend`] is reported only by
+/// [`ApplyPlan`](crate::ApplyPlan) (including as the recorded dry run of
+/// [`ApplyPlan::for_active`](crate::ApplyPlan::for_active)): a publication
+/// candidate carries no backend, so live activation never returns it. The process that owns the
+/// backend (sockets, UMEM, attached XDP programs) must refuse a backend
+/// change on reload and restart instead.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RestartRequired {
@@ -390,6 +397,9 @@ pub enum RestartRequired {
     Icmpv4ErrorPolicy,
     /// An interface IfId was added/removed or its MAC address changed.
     Interfaces,
+    /// The `[backend]` section changed: backend kind, existing-program
+    /// policy, or any AF_XDP port (queue, mode, attach, ring, or UMEM).
+    Backend,
 }
 
 impl RestartRequired {
@@ -404,6 +414,7 @@ impl RestartRequired {
             Self::ResolutionPolicy => "RESOLUTION_POLICY",
             Self::Icmpv4ErrorPolicy => "ICMPV4_ERROR_POLICY",
             Self::Interfaces => "INTERFACES",
+            Self::Backend => "BACKEND",
         }
     }
 }

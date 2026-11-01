@@ -32,9 +32,11 @@ pub use config::{
     ValidatedBindFlags, MIN_VISIBLE_FRAME_CAPACITY, SUPPORTED_ALIGNED_CHUNK_SIZES,
     XDP_PACKET_HEADROOM,
 };
+pub use ruster_io_xdp::native_profile::ConfigError;
+
 pub use error::{
-    AbiLayoutError, ConfigError, NativeRingError, NativeSyscallPlatformError, PlatformError,
-    RingField, RingMapError,
+    AbiLayoutError, NativeRingError, NativeSyscallPlatformError, PlatformError, RingField,
+    RingMapError,
 };
 pub use platform::{ensure_native_syscall_supported, ensure_supported};
 pub use ring::{

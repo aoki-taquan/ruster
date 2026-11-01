@@ -1076,6 +1076,38 @@ fn plan_restart_classification_matches_live_apply_rejection() {
     assert!(reply_reaches_host(&mut active, &mut io, now + 3, port));
 }
 
+/// The publication accepts a successor whose document only changes the
+/// backend (candidates carry none), but the plan must never look
+/// live-applicable: no live dry run, flush `All`, and a restart dry-run
+/// result.
+#[test]
+fn backend_only_plan_for_active_is_never_live_applicable() {
+    use crate::plan::tests::{af_xdp, config};
+    use crate::{ApplyPlan, PublicationSequencer, StateFlush};
+
+    let current = config(&[]);
+    let mut sequencer = PublicationSequencer::new(SimDeterministicKeySource::new(SEED));
+    let first = sequencer.candidate(&current).unwrap();
+    let mut storage = FullServiceStorage::new(first.storage_shape()).unwrap();
+    let mut active = ActivePublication::<SimIo>::new(&mut storage, first).unwrap();
+    let mut io = SimIo::new();
+    populate(&mut active, &mut io);
+
+    let next = af_xdp(&[], 0, "copy");
+    let successor = sequencer.candidate(&next).unwrap();
+    assert!(active.check_successor(&successor).is_ok());
+    let before = observe(&active);
+    let plan = ApplyPlan::for_active(&mut active, &current, &next, &successor).unwrap();
+    assert!(plan.requires_restart());
+    assert_eq!(plan.restart_required(), [RestartRequired::Backend]);
+    assert_eq!(
+        plan.dry_run(),
+        Some(Err(ApplyError::RestartRequired(RestartRequired::Backend)))
+    );
+    assert_eq!(plan.flush(), StateFlush::ALL);
+    assert!(observe(&active) == before);
+}
+
 #[test]
 fn rollback_reapplies_old_document_as_new_generation_with_new_keys() {
     use crate::plan::tests::{config, ROUTE_CHANGE};

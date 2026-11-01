@@ -12,13 +12,15 @@
 //! wall clock, iterates a hash map, or formats a hash key or seed.
 //!
 //! An `apply` step reads, parses, and validates the referenced file. A file
-//! that fails parsing, validation, or the M1 service bridge is rejected as
-//! `invalid` without a tick. Otherwise the sequencer builds the next
-//! generation (consuming it even if the apply is later rejected) and the
-//! driver runs one tick at the current injected time whose publication phase
-//! carries the candidate; that tick's outcome is the apply outcome. Tick
-//! budgets of the active configuration are used, so the apply tick still runs
-//! with the old budgets. A restart-required change is reported as a rejection
+//! that fails parsing, validation, or the M1 service bridge, or that selects
+//! a backend other than `sim` (stage `backend`, code `UNSUPPORTED_BACKEND`),
+//! is rejected as `invalid` without a tick (the same backend rejection of
+//! the initial configuration is [`DriverError::InitialConfig`]). Otherwise
+//! the sequencer builds the next generation (consuming it even if the apply
+//! is later rejected) and the driver runs one tick at the current injected
+//! time whose publication phase carries the candidate; that tick's outcome
+//! is the apply outcome. Tick budgets of the active configuration are used,
+//! so the apply tick still runs with the old budgets. A restart-required change is reported as a rejection
 //! and leaves the old generation active: M1 `run-sim` never re-creates
 //! storage within one run.
 //!
@@ -32,8 +34,8 @@ use std::num::NonZeroU64;
 use std::path::Path;
 
 use ruster_config::{
-    parse, validate, Diagnostic, ValidatedConfig, ValidatedConfigV1, ValidationError,
-    ValidationLimits, MAX_CONFIG_BYTES,
+    parse, validate, BackendKindV1, Diagnostic, ValidatedConfig, ValidatedConfigV1,
+    ValidationError, ValidationLimits, MAX_CONFIG_BYTES,
 };
 use ruster_control::{
     ActivationError, ActivePublication, ApplyError, ConfigBridgeError, FullServiceStorage,
@@ -85,6 +87,10 @@ pub enum ConfigRejection {
     /// The M1 service bridge rejected the document (for example a missing
     /// NAT44 or firewall service).
     Bridge(ConfigBridgeError),
+    /// The document selects a backend other than `sim`. `run-sim` drives
+    /// only the deterministic simulation backend and never silently ignores
+    /// a configured real-device backend.
+    UnsupportedBackend(BackendKindV1),
 }
 
 impl ConfigRejection {
@@ -94,6 +100,7 @@ impl ConfigRejection {
             Self::Validate(_) => "validate",
             Self::UnsupportedVersion => "version",
             Self::Bridge(_) => "bridge",
+            Self::UnsupportedBackend(_) => "backend",
         }
     }
 
@@ -106,6 +113,7 @@ impl ConfigRejection {
             Self::Validate(error) => error.code().code(),
             Self::UnsupportedVersion => "UNSUPPORTED_VERSION",
             Self::Bridge(error) => error.code(),
+            Self::UnsupportedBackend(_) => "UNSUPPORTED_BACKEND",
         }
     }
 }
@@ -1089,7 +1097,8 @@ fn read_bounded(
 }
 
 /// Reads, parses, and validates one configuration file. I/O failures are
-/// driver errors; content failures are [`ConfigRejection`]s.
+/// driver errors; content failures are [`ConfigRejection`]s, including a
+/// valid document whose backend is not `sim`.
 fn load_config(
     path: &ScenarioPath,
     step: Option<usize>,
@@ -1100,7 +1109,10 @@ fn load_config(
         Err(diagnostic) => return Ok(Err(ConfigRejection::Parse(diagnostic))),
     };
     Ok(match validate(parsed, SIM_VALIDATION_LIMITS) {
-        Ok(ValidatedConfig::V1(config)) => Ok(config),
+        Ok(ValidatedConfig::V1(config)) => match config.backend().kind() {
+            BackendKindV1::Sim => Ok(config),
+            kind => Err(ConfigRejection::UnsupportedBackend(kind)),
+        },
         Ok(_) => Err(ConfigRejection::UnsupportedVersion),
         Err(error) => Err(ConfigRejection::Validate(error)),
     })
