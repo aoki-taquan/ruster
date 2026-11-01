@@ -99,10 +99,20 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   private x86_64 Linux syscall/RAII seamは、CLOEXEC/nonblocking AF_XDP socket、socket option、
   mmap/munmap、bind、poll、sendto、closeをdependencyなしで包み、fd/addressをDebugから
   redactしてcleanupを高々一回にする。他の64-bit Linux architectureはC0/C1のpure ABI/ring
-  validationを狭めず、別のtyped syscall capability checkで拒否する。publicなsocket/mapping
-  constructor、UMEM登録、
-  ring設定・bind transaction、live session、libxdp link、core `PacketIo`接続はまだ持たず、
-  FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
+  validationを狭めず、別のtyped syscall capability checkで拒否する。M2 S1（X00C）の
+  `NativeSession::open(&SessionConfig)`（x86_64 Linuxだけ）は、libbpf/libxdpなしのraw UAPI
+  v6.8 profileで一socket（一interface queue）を`if_nametoindex` → AF_XDP socket → UMEM
+  mmap/`XDP_UMEM_REG` → 四ring size → `XDP_MMAP_OFFSETS`検証 → 四ring mmap → `sockaddr_xdp`
+  bind → `XDP_OPTIONS`のmode確認まで一つのfailure-atomic transactionで組み立て、失敗時は取得済み
+  resourceだけをexact reverse orderで一回ずつ解放する。`SessionConfig`は
+  `ValidatedAfXdpPortV1`の`device`/`queue`/`bind_flags`/`rings`/`umem`から作る。`auto`は
+  zero-copy bindがEOPNOTSUPPのときだけcopyへfallbackし、errorはvalue-freeな
+  `SessionError{stage, failure}`（PermissionDenied、MemlockLimit、NoSuchDevice、Busy等）。
+  ring viewは`rings(&mut self)`が実mappingを排他borrowして貸すためmappingより長命になれない。
+  XDP program attach（S2）、datapath engine（S3）、UMEM byte access、core `PacketIo`接続は
+  まだ持たず、FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
+  privileged smokeは`scripts/priv-xdp-smoke.sh`（`sudo -n`で専用netnsとその中だけのveth pairを
+  作り、`RUSTER_PRIV_XDP=1`で実行してnetnsを必ず削除。不足はskipせずfail）。
 
 ```text
 inject Vec<u8>
@@ -552,6 +562,25 @@ cargo +1.97.1 check --workspace --all-targets --all-features --locked --target x
 
 これはmusl targetでworkspace全体が型検査を通ることだけを確認するcompile-only portability
 checkです。musl向けartifactのlink、test実行、実NICでのruntime compatibilityは保証しません。
+
+`ruster-io-xdp-native`のunsafe/fake testは任意でMiriでも確認できます（nightlyとMiri sysrootが
+必要。CI gateではありません）。
+
+```bash
+MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test -p ruster-io-xdp-native --lib
+```
+
+AF_XDP native sessionのprivileged smokeはCIでは実行せず（workflowはX04）、`sudo -n`が使える
+Linux hostで明示的に実行します。
+
+```bash
+scripts/priv-xdp-smoke.sh
+```
+
+scriptはtest binaryを通常userでbuildし、`ruster-x00c-<pid>-<random>`というnetnsとその中だけのveth pair
+（`rx00c0`/`rx00c1`）を作ってnetns内でtestを実行し、成否によらずnetnsを削除します（同名netnsが既にあれば触らずfail）。host側の
+interfaceには触れません。testはinitial netnsでの実行を拒否し、`RUSTER_PRIV_XDP=1`なのに
+netns/device/capabilityが欠ける場合はskipせずfailします。
 
 設計契約と非対象は[architecture v0.2](docs/architecture-v0.2.md)、要件とRFC根拠は
 [requirements](docs/requirements-v0.2.md)、production backendから自宅ラボ運用までの
