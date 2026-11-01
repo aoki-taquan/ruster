@@ -20,6 +20,16 @@
 #             crosses the router (ARP reply from the router to A, ARP
 #             request from the router to B, NAT44 to 203.0.113.2, stateful
 #             firewall); SIGTERM; exit 0, no XDP left on ra/rb, final stats
+#   ops       (M2 S10b) on one running router: SIGHUP reload that turns the
+#             LAN->WAN UDP rule into deny (the datagram stops arriving) and
+#             back (it arrives again), generations 2 and 3, no restart; a
+#             restart-required reload (UMEM shape) refused while traffic
+#             keeps flowing; `ip link set ra down/up` inside the router
+#             namespace warns and recovers with forwarding; then rb's MTU
+#             raised beyond the 2048-byte frame bound: exit 1 after drain,
+#             nothing left attached
+#   removal   (last) `ip link del ra` inside the router namespace while
+#             running: exit 1 (DEVICE_REMOVED), nothing left attached
 #   rollback  a second port that fails to open (queue 1 of a one-queue
 #             veth) or to attach (a foreign xdpgeneric program on rb):
 #             exit 1 with the stage and port, nothing left attached on ra,
@@ -256,6 +266,31 @@ signal_ruster() {
     sudo -n kill "-$1" "$ruster_pid"
 }
 
+# Waits until $work/$1.err contains the fixed text $2 while ruster runs.
+wait_line() {
+    name=$1
+    text=$2
+    tries=0
+    while ! grep -qF -- "$text" "$work/$name.err"; do
+        launcher_alive || fail "$name: exited while waiting for: $text"
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "$name: no \"$text\" within 10 seconds"
+        sleep 0.05
+    done
+}
+
+# Waits for ruster to exit by itself within 10 seconds and sets `status`.
+wait_exit() {
+    name=$1
+    tries=0
+    while launcher_alive; do
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "$name: still running 10 seconds after the event"
+        sleep 0.05
+    done
+    wait_ruster
+}
+
 RECEIVE='
 import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -309,6 +344,36 @@ forward_once() {
     echo "priv_run_$tag: host A -> host B forwarded and translated ($source) verified"
 }
 
+# Host A -> host B must NOT arrive within 3 seconds (firewall deny).
+forward_blocked() {
+    tag=$1
+    marker="ruster-s10b-$tag-$suffix"
+    rm -f "$stopfile" "$work/recv-$tag.out"
+    in_ns "$host_b" python3 -I -c "$RECEIVE" 9000 "$marker" 3 >"$work/recv-$tag.out" 2>&1 &
+    receiver=$!
+    tries=0
+    while ! grep -q ready "$work/recv-$tag.out" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "$tag: receiver not ready"
+        sleep 0.05
+    done
+    in_ns "$host_a" python3 -I -c "$SEND" 203.0.113.1 9000 "$marker" "$stopfile" &
+    sender=$!
+    status=0
+    wait "$receiver" || status=$?
+    : >"$stopfile"
+    wait "$sender" || true
+    [ "$status" -ne 0 ] || fail "$tag: host B received a datagram the firewall denies"
+    echo "priv_run_$tag: host A -> host B denied by the reloaded firewall verified"
+}
+
+# Replaces the running router's config atomically and sends SIGHUP.
+reload_with() {
+    cp "$1" "$work/ops.next"
+    mv "$work/ops.next" "$work/ops.toml"
+    signal_ruster HUP
+}
+
 # forward: cold start, forward, SIGTERM.
 start_ruster forward "$work/router.toml"
 wait_ready forward || fail "forward: ruster exited during startup"
@@ -327,6 +392,52 @@ grep -q "stopped by signal; .* tx-in-flight=0 .*detached and closed 2 port(s)" \
     "$work/forward.err" || fail "forward: no shutdown summary"
 cat "$work/forward.err"
 echo "priv_run_shutdown: SIGTERM exit 0, XDP detached, final counters (rx.received=$received) verified"
+
+# ops: SIGHUP reload, a refused restart-required reload, and link down/up,
+# all on one running router (M2 S10b).
+cp "$work/router.toml" "$work/ops.toml"
+# Rule 20 (LAN -> WAN UDP) denies instead of allowing.
+sed '/protocol = "udp"/{n;s/action = "allow-stateful"/action = "deny"/;}' \
+    "$work/router.toml" >"$work/deny.toml"
+grep -q 'action = "deny"' "$work/deny.toml" || fail "ops: deny config not written"
+# A different UMEM shape for lan: restart-required (BACKEND).
+sed '0,/frame-count = 512/s//frame-count = 1024/' "$work/router.toml" >"$work/reshape.toml"
+start_ruster ops "$work/ops.toml"
+wait_ready ops || fail "ops: ruster exited during startup"
+forward_once ops-before
+reload_with "$work/deny.toml"
+wait_line ops "reload applied: generation=2 previous=1"
+forward_blocked ops-denied
+reload_with "$work/router.toml"
+wait_line ops "reload applied: generation=3 previous=2"
+forward_once ops-allowed
+echo "priv_run_reload: SIGHUP changed the firewall outcome twice without a restart verified"
+reload_with "$work/reshape.toml"
+wait_line ops "reload refused: code=RESTART_REQUIRED reasons=BACKEND; generation 3 keeps running"
+forward_once ops-refused
+reload_with "$work/router.toml"
+echo "priv_run_reload_refused: restart-required reload refused while traffic kept flowing verified"
+sudo -n ip -n "$router" link set ra down
+wait_line ops "warning: port=if1 health=LINK_DOWN"
+sudo -n ip -n "$router" link set ra up
+wait_line ops "recovered: port=if1 health=LINK_DOWN"
+forward_once ops-link-up
+echo "priv_run_link: link down/up on ra kept the router running and forwarding recovered verified"
+# An MTU above what a 2048-byte frame holds (1778): fail closed, exit 1.
+sudo -n ip -n "$router" link set rb mtu 3000
+wait_exit ops
+[ "$status" -eq 1 ] || fail "ops: exit status $status after the MTU change"
+grep -q "fatal: port=if2 health=MTU_ABOVE_FRAME" "$work/ops.err" ||
+    fail "ops: no MTU_ABOVE_FRAME"
+grep -q "stopped after a fatal health event port=if2 code=MTU_ABOVE_FRAME; .*detached and closed 2 port(s)" \
+    "$work/ops.err" || fail "ops: no fatal summary"
+grep -q "^reload.applied=2$" "$work/ops.out" || fail "ops: reload counters"
+grep -q "^reload.refused=1$" "$work/ops.out" || fail "ops: refused counter"
+grep -q "^if1.watch.link_down_events=1$" "$work/ops.out" || fail "ops: link counters"
+assert_detached "the MTU fail-closed exit"
+sudo -n ip -n "$router" link set rb mtu 1500
+cat "$work/ops.err"
+echo "priv_run_mtu: MTU above the frame bound failed closed with exit 1 and detached verified"
 
 # rollback: the second port fails after the first one attached.
 start_ruster bad-queue "$work/bad-queue.toml"
@@ -445,6 +556,34 @@ wait_ruster
 assert_detached "the restarted router's SIGTERM"
 grep -q "^ruster-run-stats kind=final" "$work/restart.out" || fail "restart: no final stats"
 echo "priv_run_restart: restart after SIGKILL (attempts $attempt) forwarded and shut down verified"
+
+# removal (last: it destroys ra/pa): deleting a port's veth inside the
+# router namespace fails closed with exit 1 and leaves nothing attached.
+attempt=0
+while :; do
+    attempt=$((attempt + 1))
+    start_ruster removal "$work/router.toml"
+    if wait_ready removal; then
+        break
+    fi
+    wait_ruster
+    [ "$attempt" -lt 20 ] || fail "removal: did not start"
+    sleep 0.1
+done
+forward_once removal-before
+sudo -n ip -n "$router" link del ra
+wait_exit removal
+[ "$status" -eq 1 ] || fail "removal: exit status $status after deleting ra"
+grep -q "fatal: port=if1 health=DEVICE_REMOVED" "$work/removal.err" ||
+    fail "removal: no DEVICE_REMOVED"
+grep -q "stopped after a fatal health event port=if1 code=DEVICE_REMOVED; .*detached and closed 2 port(s)" \
+    "$work/removal.err" || fail "removal: no fatal summary"
+test -z "$(xdp_on rb)" || fail "removal: XDP left attached on rb"
+if sudo -n ip -n "$router" link show dev ra >/dev/null 2>&1; then
+    fail "removal: ra still exists"
+fi
+cat "$work/removal.err"
+echo "priv_run_removal: deleted port device failed closed with exit 1, nothing left attached verified"
 
 cleanup
 trap - EXIT

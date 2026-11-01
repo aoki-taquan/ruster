@@ -11,10 +11,11 @@ use ruster_io_xdp_native::{
 };
 
 use super::checks::{self, CheckFailure, DeviceFacts, PrivilegeFailure};
-use super::engine::{Datapath, DrainProgress};
-use super::netlink;
+use super::engine::{Datapath, DrainProgress, LinkMonitor};
+use super::netlink::{self, LinkFacts, LinkProbe, NetlinkError};
 use super::startup::{CloseFailure, Failure, OpenPort, PortHost, Stage, StartupError};
 use super::stats::write_fields;
+use super::watch::{LinkTarget, PortSample};
 
 /// High bits of every engine's UMEM domain id (`"rstr"`); the low bits are
 /// the port's `IfId`, so domains are distinct per port.
@@ -26,6 +27,11 @@ pub struct LinuxHost;
 impl PortHost for LinuxHost {
     type Session = NativeSession;
     type Datapath<'s> = XdpDatapath<'s>;
+    type Links = NetlinkLinks;
+
+    fn links(&self) -> Result<NetlinkLinks, Failure> {
+        LinkProbe::open().map(NetlinkLinks).map_err(Failure::Links)
+    }
 
     fn preflight(&self, backend: &ValidatedAfXdpV1) -> Result<(), PrivilegeFailure> {
         checks::linux::check_privileges(checks::required_memlock(backend))
@@ -48,9 +54,17 @@ impl PortHost for LinuxHost {
         port: &ValidatedAfXdpPortV1,
         session: &NativeSession,
     ) -> Result<DeviceFacts, CheckFailure> {
-        checks::linux::device_facts(port.device(), session.ifindex(), |ifindex| {
-            netlink::ipv4_address_count(ifindex).ok()
-        })
+        let facts = checks::linux::SessionFacts {
+            ifindex: session.ifindex(),
+            mtu: session.mtu(),
+            frame_capacity: port.umem().visible_capacity(),
+        };
+        checks::linux::device_facts(
+            port.device(),
+            facts,
+            |ifindex| LinkProbe::open().ok()?.query(ifindex).ok(),
+            |ifindex| netlink::ipv4_address_count(ifindex).ok(),
+        )
     }
 
     fn attach(&self, session: &mut NativeSession, mode: XdpAttachModeV1) -> Result<(), Failure> {
@@ -115,6 +129,15 @@ fn domain(interface: IfId) -> UmemDomainId {
     UmemDomainId::new(NonZeroU128::new(id).unwrap_or(NonZeroU128::MIN))
 }
 
+/// The run-time link watch: one reused rtnetlink socket and buffer.
+pub struct NetlinkLinks(LinkProbe);
+
+impl LinkMonitor for NetlinkLinks {
+    fn query(&mut self, target: &LinkTarget) -> Result<LinkFacts, NetlinkError> {
+        self.0.query(target.ifindex)
+    }
+}
+
 /// The adapter over every port's engine.
 pub struct XdpDatapath<'s> {
     io: XdpPacketIo<'s>,
@@ -133,8 +156,29 @@ impl<'s> Datapath for XdpDatapath<'s> {
             rx_pending_released: report.rx_pending_released,
             tx_in_flight: report.tx_in_flight,
             fill_in_kernel: report.fill_in_kernel,
+            tx_handoffs: report.tx_handoffs_outstanding,
             last_kick_error: report.last_kick_error,
         })
+    }
+
+    fn sample_ports(&self, visit: &mut impl FnMut(PortSample)) {
+        for interface in self.io.interfaces() {
+            // One getsockopt(XDP_STATISTICS) per port; no allocation.
+            if let Some(stats) = self.io.port_stats(interface) {
+                let counters = stats.counters;
+                visit(PortSample {
+                    interface,
+                    polls: counters.polls,
+                    tx_inflight: counters.tx_inflight,
+                    oldest_age_polls: counters.completion_lag_oldest_polls,
+                    kick_errors: counters.kick_errors,
+                    kick_link_down: stats.link_down,
+                    fill_starved: counters.fill_starved,
+                    fill_ring_occupancy: counters.fill_ring_occupancy,
+                    rx_packets: counters.rx_packets,
+                });
+            }
+        }
     }
 
     fn write_stats(&self, out: &mut String) {

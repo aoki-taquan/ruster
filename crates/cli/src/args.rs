@@ -13,12 +13,16 @@ usage:
   ruster plan <current.toml> <next.toml>
   ruster run-sim [--hold] --scenario <scenario.toml>
   ruster run-sim [--hold] -- <scenario.toml>
-  ruster run [--allow-multi-queue] [--stats-interval <seconds>] --config <config.toml>
-  ruster run [--allow-multi-queue] [--stats-interval <seconds>] -- <config.toml>
+  ruster run [--allow-multi-queue] [--stats-interval <seconds>]
+             [--startup-attempts <n>] --config <config.toml>
+  ruster run [options] -- <config.toml>
   ruster --help | --version
 
+`run`: SIGINT/SIGTERM stop (a second one forces), SIGHUP reloads the config.
+
 exit status: 0 success or signal shutdown, 1 runtime/I/O/expectation failure
-(including unreadable files), 2 usage error or invalid config/scenario;
+(including unreadable files, and `run` stopped by a fatal health or device
+event), 2 usage error or invalid config/scenario;
 `run` also: 3 shutdown deadline passed with TX frames still in the kernel,
 4 missing privilege or too small RLIMIT_MEMLOCK (nothing was acquired)
 ";
@@ -27,6 +31,10 @@ exit status: 0 success or signal shutdown, 1 runtime/I/O/expectation failure
 pub const DEFAULT_STATS_INTERVAL_SECS: u64 = 60;
 /// Largest accepted `--stats-interval` (one day).
 pub const MAX_STATS_INTERVAL_SECS: u64 = 86_400;
+/// Default `ruster run --startup-attempts` (XDP-045).
+pub const DEFAULT_STARTUP_ATTEMPTS: u32 = 3;
+/// Largest accepted `--startup-attempts`.
+pub const MAX_STARTUP_ATTEMPTS: u32 = 10;
 
 /// `ruster run` options.
 #[derive(Debug, Eq, PartialEq)]
@@ -39,6 +47,10 @@ pub struct RunArgs {
     /// Seconds between periodic stats blocks on stdout; 0 disables them
     /// (the final block is always printed).
     pub stats_interval_secs: u64,
+    /// Whole startups tried when a port open fails transiently (XDP-045:
+    /// `BIND/BUSY`, `REGISTER_UMEM/MEMLOCK_LIMIT`, ...), each after a full
+    /// rollback; `1..=MAX_STARTUP_ATTEMPTS`, 1 disables the retry.
+    pub startup_attempts: u32,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -75,6 +87,10 @@ impl fmt::Display for UsageError {
             Self::MissingOperand(name) => write!(formatter, "missing operand <{name}>"),
             Self::MissingValue(option) => write!(formatter, "option {option} requires a value"),
             Self::DuplicateOption(option) => write!(formatter, "option {option} given twice"),
+            Self::InvalidValue(option @ "--startup-attempts") => write!(
+                formatter,
+                "option {option} needs a whole number from 1 to {MAX_STARTUP_ATTEMPTS}"
+            ),
             Self::InvalidValue(option) => write!(
                 formatter,
                 "option {option} needs a whole number of seconds from 0 to {MAX_STATS_INTERVAL_SECS}"
@@ -177,6 +193,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
     let mut config = None;
     let mut allow_multi_queue = false;
     let mut interval = None;
+    let mut attempts = None;
     let mut words = rest.iter();
     while let Some(word) = words.next() {
         if let Some(value) = equals_value(word, "--config=") {
@@ -188,6 +205,10 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
         }
         if let Some(value) = equals_value(word, "--stats-interval=") {
             set_interval(&mut interval, &value)?;
+            continue;
+        }
+        if let Some(value) = equals_value(word, "--startup-attempts=") {
+            set_attempts(&mut attempts, &value)?;
             continue;
         }
         match word.to_str() {
@@ -219,6 +240,13 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
                     .ok_or(UsageError::MissingValue("--stats-interval"))?;
                 set_interval(&mut interval, value)?;
             }
+            Some("--startup-attempts") => {
+                let value = words
+                    .next()
+                    .filter(|value| !is_option(value))
+                    .ok_or(UsageError::MissingValue("--startup-attempts"))?;
+                set_attempts(&mut attempts, value)?;
+            }
             _ if is_option(word) => return Err(UsageError::UnknownOption(lossy(word))),
             _ => return Err(UsageError::UnexpectedOperand(lossy(word))),
         }
@@ -228,7 +256,25 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
         config,
         allow_multi_queue,
         stats_interval_secs: interval.unwrap_or(DEFAULT_STATS_INTERVAL_SECS),
+        startup_attempts: attempts.unwrap_or(DEFAULT_STARTUP_ATTEMPTS),
     }))
+}
+
+/// A decimal attempt count, `1..=MAX_STARTUP_ATTEMPTS`, ASCII digits only.
+fn set_attempts(slot: &mut Option<u32>, value: &OsStr) -> Result<(), UsageError> {
+    const OPTION: &str = "--startup-attempts";
+    let attempts = value
+        .to_str()
+        .filter(|text| {
+            !text.is_empty() && text.len() <= 2 && text.bytes().all(|b| b.is_ascii_digit())
+        })
+        .and_then(|text| text.parse::<u32>().ok())
+        .filter(|attempts| (1..=MAX_STARTUP_ATTEMPTS).contains(attempts))
+        .ok_or(UsageError::InvalidValue(OPTION))?;
+    if slot.replace(attempts).is_some() {
+        return Err(UsageError::DuplicateOption(OPTION));
+    }
+    Ok(())
 }
 
 /// A decimal number of seconds, `0..=MAX_STATS_INTERVAL_SECS`, ASCII digits
@@ -459,7 +505,55 @@ mod tests {
             config: config.into(),
             allow_multi_queue,
             stats_interval_secs,
+            startup_attempts: DEFAULT_STARTUP_ATTEMPTS,
         })
+    }
+
+    #[test]
+    fn run_parses_startup_attempts() {
+        let with = |attempts| {
+            Ok(Command::Run(RunArgs {
+                config: "r.toml".into(),
+                allow_multi_queue: false,
+                stats_interval_secs: DEFAULT_STATS_INTERVAL_SECS,
+                startup_attempts: attempts,
+            }))
+        };
+        assert_eq!(
+            run(&["run", "--startup-attempts", "1", "--config", "r.toml"]),
+            with(1)
+        );
+        assert_eq!(
+            run(&["run", "--startup-attempts=10", "--config", "r.toml"]),
+            with(MAX_STARTUP_ATTEMPTS)
+        );
+        for bad in ["", "0", "11", "-1", "+3", " 3", "3.0", "x", "100"] {
+            let word = format!("--startup-attempts={bad}");
+            assert_eq!(
+                run(&["run", "--config", "a", &word]),
+                Err(UsageError::InvalidValue("--startup-attempts")),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            run(&["run", "--config", "a", "--startup-attempts"]),
+            Err(UsageError::MissingValue("--startup-attempts"))
+        );
+        assert_eq!(
+            run(&[
+                "run",
+                "--config",
+                "a",
+                "--startup-attempts=2",
+                "--startup-attempts",
+                "3"
+            ]),
+            Err(UsageError::DuplicateOption("--startup-attempts"))
+        );
+        assert_eq!(
+            UsageError::InvalidValue("--startup-attempts").to_string(),
+            "option --startup-attempts needs a whole number from 1 to 10"
+        );
     }
 
     #[test]

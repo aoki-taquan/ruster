@@ -1001,6 +1001,13 @@ fn stranded_engine_leases_and_handoffs_skip_io() {
         XdpPacketIo::quiescence_error_disposition(&error),
         PublicationQuiescenceDisposition::SkipIo
     );
+    // The drain cannot cancel a lost handoff (nobody holds it): it is
+    // counted instead of reported as a clean drain, on every call.
+    for _ in 0..2 {
+        let report = io.drain(1).expect("drain");
+        assert_eq!(report.tx_handoffs_outstanding, 1, "{report:?}");
+        assert!(report.is_drained(), "nothing is in the kernel");
+    }
     let (lan, wan) = (kernel(), kernel());
     let mut io = adapter(&lan, &wan);
     deliver(&wan, &ipv4_frame(60, 64));
@@ -1406,6 +1413,7 @@ fn a_panic_with_a_leaked_lease_only_stops_and_drain_reclaims() {
     assert_eq!(io.engine(LAN).expect("LAN").frame_accounting().leased, 1);
     let report = io.drain(1).expect("drain");
     assert!(report.is_drained());
+    assert_eq!(report.tx_handoffs_outstanding, 0);
     assert_eq!(io.engine(LAN).expect("LAN").frame_accounting().leased, 0);
     assert_eq!(
         io.port_stats(LAN).expect("LAN").counters.leases_reclaimed,

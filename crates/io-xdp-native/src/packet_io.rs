@@ -704,6 +704,12 @@ impl<'memory> XdpPacketIo<'memory> {
     /// `rounds` rounds of kick-and-reap per port. The adapter stops
     /// ([`PublicationQuiescenceDisposition::Stop`]). Call again until
     /// [`XdpDrainReport::is_drained`] or the caller's own timeout.
+    ///
+    /// Leases a leaked slot or batch left recorded are reclaimed first.
+    /// The adapter never holds a staged TX handoff between calls, so there
+    /// is no live handoff to cancel; one lost to an unwind or a leak is
+    /// counted in [`XdpDrainReport::tx_handoffs_outstanding`] rather than
+    /// reported as drained.
     pub fn drain(&mut self, rounds: u32) -> Result<XdpDrainReport, XdpIoError> {
         self.stop = Some(self.stop.unwrap_or(Stop::Drained));
         self.reclaim_outstanding();
@@ -725,6 +731,9 @@ impl<'memory> XdpPacketIo<'memory> {
             report.fill_in_kernel = report
                 .fill_in_kernel
                 .saturating_add(accounting.fill_in_kernel);
+            report.tx_handoffs_outstanding = report
+                .tx_handoffs_outstanding
+                .saturating_add(port.engine.tx_handoffs_outstanding());
             if let Some(error) = drained.last_kick_error() {
                 report.last_kick_error = Some((interface, error));
             }
@@ -956,12 +965,24 @@ pub struct XdpDrainReport {
     /// Frames the kernel still holds from Fill (released when the socket
     /// closes).
     pub fill_in_kernel: u32,
+    /// TX handoffs (either pool) staged but neither submitted nor
+    /// cancelled, summed over the ports. Every adapter path consumes the
+    /// handoffs it stages within the same call, so a nonzero count means
+    /// one was lost (dropped during an unwind, or leaked by the engine's
+    /// caller) and can never be cancelled: the frame is not in the kernel
+    /// and returns only when the UMEM is released. The engine's drain
+    /// leaves caller-held handoffs to the caller (XDP-099); the adapter is
+    /// that caller, so it reports them here instead of claiming a clean
+    /// drain.
+    pub tx_handoffs_outstanding: u32,
     /// The last failed kick of this call.
     pub last_kick_error: Option<(IfId, KickError)>,
 }
 
 impl XdpDrainReport {
-    /// Whether no TX is in flight on any port.
+    /// Whether no TX is in flight on any port. Stranded handoffs
+    /// ([`Self::tx_handoffs_outstanding`]) are not in the kernel and no
+    /// further drain call changes them; check them separately.
     #[must_use]
     pub const fn is_drained(&self) -> bool {
         self.tx_in_flight == 0

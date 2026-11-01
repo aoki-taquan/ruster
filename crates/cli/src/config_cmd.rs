@@ -28,6 +28,20 @@ pub enum LoadError {
     Read(io::ErrorKind),
     /// The content was rejected (exit 2). Value-free.
     Rejected(Rejection),
+    /// The reload path is not a regular file
+    /// ([`load_validated_regular`]).
+    NotAFile,
+}
+
+impl LoadError {
+    /// Value-free `stage=... code=...` text of the failure.
+    pub fn render(&self) -> String {
+        match self {
+            Self::Read(kind) => format!("stage=read code={}", io_code(*kind)),
+            Self::Rejected(rejection) => rejection.render(),
+            Self::NotAFile => "stage=read code=NOT_A_FILE".to_owned(),
+        }
+    }
 }
 
 pub struct Rejection {
@@ -90,10 +104,44 @@ pub fn load(path: &Path) -> Result<ValidatedConfigV1, LoadError> {
 /// candidate with the production key source, so no simulation key source
 /// is ever constructed on the live path; the bridge errors are the same.
 pub fn load_validated(path: &Path) -> Result<ValidatedConfigV1, LoadError> {
+    let file = File::open(path).map_err(|error| LoadError::Read(error.kind()))?;
+    validate_file(file)
+}
+
+/// [`load_validated`] for the `ruster run` reload, which runs on the
+/// router thread: the path is opened with `O_NONBLOCK` and must be a
+/// regular file (`NOT_A_FILE` otherwise), so a FIFO or device node in its
+/// place cannot block the datapath. A regular file's reads never block on
+/// the writer.
+pub fn load_validated_regular(path: &Path) -> Result<ValidatedConfigV1, LoadError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        /// Linux `O_NONBLOCK` (the same value on every Linux architecture
+        /// this binary supports for `run`).
+        const O_NONBLOCK: i32 = 0o4000;
+        options.custom_flags(O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| LoadError::Read(error.kind()))?;
+    let regular = file
+        .metadata()
+        .map_err(|error| LoadError::Read(error.kind()))?
+        .is_file();
+    if !regular {
+        return Err(LoadError::NotAFile);
+    }
+    validate_file(file)
+}
+
+fn validate_file(file: File) -> Result<ValidatedConfigV1, LoadError> {
     let mut bytes = Vec::new();
     let take = wide(MAX_CONFIG_BYTES).saturating_add(1);
-    File::open(path)
-        .and_then(|file| file.take(take).read_to_end(&mut bytes))
+    file.take(take)
+        .read_to_end(&mut bytes)
         .map_err(|error| LoadError::Read(error.kind()))?;
     let parsed = parse(&bytes).map_err(|diagnostic| {
         LoadError::Rejected(Rejection {
@@ -162,6 +210,10 @@ pub fn report_load(err: &mut impl Write, label: &str, error: &LoadError) -> u8 {
     match error {
         LoadError::Read(kind) => {
             let _ = writeln!(err, "ruster: cannot read {label}config: {}", io_code(*kind));
+            EXIT_RUNTIME
+        }
+        LoadError::NotAFile => {
+            let _ = writeln!(err, "ruster: cannot read {label}config: NOT_A_FILE");
             EXIT_RUNTIME
         }
         LoadError::Rejected(rejection) => {

@@ -2,8 +2,10 @@
 //! resource), and the XDP-063 per-port device checks (after the session is
 //! open, before XDP attach).
 //!
-//! The decisions are pure functions over facts read from procfs/sysfs (and
-//! netlink for kernel IPv4 addresses), so they are tested without a kernel.
+//! The decisions are pure functions over facts read from procfs and
+//! rtnetlink (link facts and kernel IPv4 addresses of the session's
+//! interface index, in the caller's network namespace), so they are tested
+//! without a kernel.
 //! Every reader fails closed: a fact that cannot be read refuses startup,
 //! except the forwarding sysctls, which only ever warn.
 
@@ -196,8 +198,21 @@ pub fn parse_memlock(limits: &str) -> Option<MemlockLimit> {
 /// Facts of one port's device read after the session opened.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DeviceFacts {
-    /// `rx-<n>` entries of `/sys/class/net/<dev>/queues`.
+    /// The session's interface index (the link watch queries it later).
+    pub ifindex: u32,
+    /// `IFLA_NUM_RX_QUEUES` of the session's interface index (rtnetlink
+    /// `RTM_GETLINK`, so in the caller's network namespace): the
+    /// allocated RX queue count, which is never below the active one; 0
+    /// if the kernel did not report it.
     pub rx_queues: u32,
+    /// `IFLA_MTU` of the session's interface index (rtnetlink).
+    pub link_mtu: u32,
+    /// The MTU the session read at open, which bounds every TX of the
+    /// adapter (`mtu + 14`).
+    pub session_mtu: u32,
+    /// The longest frame a UMEM frame of this port holds
+    /// (`frame-size` minus the 256-byte kernel headroom).
+    pub frame_capacity: u32,
     /// Kernel IPv4 addresses on the device (netlink `RTM_GETADDR`).
     pub ipv4_addresses: u32,
     /// Main-table kernel IPv4 routes out of the device
@@ -219,15 +234,20 @@ pub struct CheckPolicy {
 /// Why a port's device check refused startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CheckFailure {
-    /// The device has more than one RX queue and `--allow-multi-queue`
-    /// was not given: frames on the other queues would be dropped by the
-    /// XDP program (XDP-050).
+    /// The device has (allocates) more than one RX queue and
+    /// `--allow-multi-queue` was not given: frames on the other queues
+    /// would be dropped by the XDP program (XDP-050).
     MultiQueue { rx_queues: u32 },
     /// The kernel holds IPv4 addresses on the port (refused, see
     /// [`evaluate_device`]).
     KernelIpv4Addresses { count: u32 },
     /// The kernel's main table routes IPv4 out of the port.
     KernelIpv4Routes { count: u32 },
+    /// The device MTU plus the 14-byte Ethernet header does not fit a
+    /// UMEM frame: the kernel would drop (copy mode) or split (driver
+    /// multi-buffer) every longer frame before the router sees it.
+    /// `limit` is the largest MTU the frames hold.
+    MtuAboveFrame { mtu: u32, limit: u32 },
     /// A fact could not be read or did not belong to the opened device.
     Unverifiable(Probe),
 }
@@ -235,15 +255,16 @@ pub enum CheckFailure {
 /// Which device fact could not be established.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Probe {
-    /// `/sys/class/net/<dev>/ifindex` is not the session's ifindex (or is
-    /// unreadable): the sysfs view is certainly not the session's device.
-    /// A match does not prove the namespace (another namespace's device
-    /// can share the ifindex); run under `ip netns exec`, which remounts
-    /// `/sys`. Reading the count over rtnetlink is deferred (CLI-034).
-    SysfsIdentity,
-    /// `/sys/class/net/<dev>/queues` could not be listed or had no RX
-    /// queue.
+    /// The rtnetlink `RTM_GETLINK` query of the session's interface index
+    /// failed.
+    Link,
+    /// The link reply carried no (or a zero) `IFLA_NUM_RX_QUEUES`
+    /// (a kernel without `CONFIG_RPS`).
     RxQueues,
+    /// The link's MTU differs from the one the session read at open (the
+    /// MTU changed in between, or the session's sysfs view is not this
+    /// namespace's device).
+    Mtu,
     /// The netlink address dump failed.
     Ipv4Addresses,
     /// `/proc/net/route` could not be read or parsed.
@@ -262,12 +283,14 @@ impl fmt::Display for CheckFailure {
             Self::KernelIpv4Routes { count } => {
                 write!(formatter, "KERNEL_IPV4_ROUTES count={count}")
             }
-            Self::Unverifiable(Probe::SysfsIdentity) => {
-                formatter.write_str("UNVERIFIABLE probe=sysfs-ifindex")
+            Self::MtuAboveFrame { mtu, limit } => {
+                write!(formatter, "MTU_ABOVE_FRAME mtu={mtu} limit={limit}")
             }
+            Self::Unverifiable(Probe::Link) => formatter.write_str("UNVERIFIABLE probe=link"),
             Self::Unverifiable(Probe::RxQueues) => {
                 formatter.write_str("UNVERIFIABLE probe=rx-queues")
             }
+            Self::Unverifiable(Probe::Mtu) => formatter.write_str("UNVERIFIABLE probe=mtu"),
             Self::Unverifiable(Probe::Ipv4Addresses) => {
                 formatter.write_str("UNVERIFIABLE probe=ipv4-addresses")
             }
@@ -338,9 +361,31 @@ impl Warnings {
 ///   without kernel addresses or routes on the ports the kernel has no
 ///   connected route through them, so refusing would block legitimate
 ///   hosts for a second-order risk. Unreadable sysctls are warned too.
+/// - MTU: the rtnetlink MTU must equal the one the session read at open
+///   (which bounds TX), and it must fit a UMEM frame with its Ethernet
+///   header ([`mtu_limit`]); both refusals keep the run-time MTU rule of
+///   the link watch (a change beyond that bound is fatal) true from the
+///   first tick.
+///
+/// The RX queue count is `IFLA_NUM_RX_QUEUES`, the *allocated* count: a
+/// driver that allocates more queues than it activates (`ethtool -l`
+/// shows `Combined: 1` of a larger maximum) is counted as multi-queue and
+/// needs `--allow-multi-queue` (fail closed: the netlink count is
+/// namespace-correct, the active count is only in sysfs, whose mount may
+/// belong to another namespace).
 pub fn evaluate_device(facts: &DeviceFacts, policy: CheckPolicy) -> Result<Warnings, CheckFailure> {
     if facts.rx_queues == 0 {
         return Err(CheckFailure::Unverifiable(Probe::RxQueues));
+    }
+    if facts.link_mtu != facts.session_mtu {
+        return Err(CheckFailure::Unverifiable(Probe::Mtu));
+    }
+    let limit = mtu_limit(facts.frame_capacity);
+    if facts.link_mtu > limit {
+        return Err(CheckFailure::MtuAboveFrame {
+            mtu: facts.link_mtu,
+            limit,
+        });
     }
     let mut warnings = Warnings::default();
     if facts.rx_queues > 1 {
@@ -366,6 +411,12 @@ pub fn evaluate_device(facts: &DeviceFacts, policy: CheckPolicy) -> Result<Warni
     warnings.forwarding_unreadable =
         facts.forwarding_global.is_none() || facts.forwarding_device.is_none();
     Ok(warnings)
+}
+
+/// The largest MTU whose frames (MTU plus the 14-byte Ethernet header)
+/// fit a UMEM frame of `frame_capacity` bytes.
+pub const fn mtu_limit(frame_capacity: u32) -> u32 {
+    frame_capacity.saturating_sub(14)
 }
 
 /// A `0`/`1` sysctl file.
@@ -397,26 +448,15 @@ pub fn count_routes(text: &str, device: &str) -> Option<u32> {
     Some(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
-/// Counts `rx-<n>` names.
-pub fn count_rx_queues<'a>(names: impl IntoIterator<Item = &'a str>) -> u32 {
-    let count = names
-        .into_iter()
-        .filter(|name| {
-            name.strip_prefix("rx-")
-                .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
-        })
-        .count();
-    u32::try_from(count).unwrap_or(u32::MAX)
-}
-
 /// Linux readers of the facts above (cold path, std only, no `unsafe`).
 #[cfg(target_os = "linux")]
 pub mod linux {
     use std::fs;
 
+    use super::super::netlink::LinkFacts;
     use super::{
-        count_routes, count_rx_queues, evaluate_privileges, parse_cap_eff, parse_flag,
-        parse_memlock, CheckFailure, DeviceFacts, PrivilegeFailure, Probe, ProcSource,
+        count_routes, evaluate_privileges, parse_cap_eff, parse_flag, parse_memlock, CheckFailure,
+        DeviceFacts, PrivilegeFailure, Probe, ProcSource,
     };
 
     /// Reads the effective capabilities and memlock limit of this process
@@ -435,36 +475,30 @@ pub mod linux {
         evaluate_privileges(effective, memlock, required)
     }
 
-    /// Reads the device facts of `device`, after checking that the sysfs
-    /// view's `ifindex` is `ifindex` (the opened session's; see
-    /// [`Probe::SysfsIdentity`] for what this does not prove), and counts
-    /// kernel IPv4 addresses with `addresses`.
+    /// What [`device_facts`] needs from the opened session and the config.
+    #[derive(Clone, Copy, Debug)]
+    pub struct SessionFacts {
+        pub ifindex: u32,
+        pub mtu: u32,
+        pub frame_capacity: u32,
+    }
+
+    /// Reads the device facts of the session's interface index: RX queues
+    /// and MTU from `link` (rtnetlink `RTM_GETLINK`), kernel IPv4
+    /// addresses from `addresses` (rtnetlink `RTM_GETADDR`), routes and
+    /// forwarding sysctls from procfs (the reading process's namespace).
     ///
     /// `device` was accepted by `SessionConfig::new` (no `/`, not `.` or
     /// `..`), so it is one path component.
     pub fn device_facts(
         device: &str,
-        ifindex: u32,
+        session: SessionFacts,
+        link: impl FnOnce(u32) -> Option<LinkFacts>,
         addresses: impl FnOnce(u32) -> Option<u32>,
     ) -> Result<DeviceFacts, CheckFailure> {
-        let base = format!("/sys/class/net/{device}");
-        let proven = fs::read_to_string(format!("{base}/ifindex"))
-            .ok()
-            .and_then(|text| text.trim().parse::<u32>().ok())
-            == Some(ifindex);
-        if !proven {
-            return Err(CheckFailure::Unverifiable(Probe::SysfsIdentity));
-        }
-        let entries = fs::read_dir(format!("{base}/queues"))
-            .map_err(|_| CheckFailure::Unverifiable(Probe::RxQueues))?;
-        let mut names = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|_| CheckFailure::Unverifiable(Probe::RxQueues))?;
-            if let Some(name) = entry.file_name().to_str() {
-                names.push(name.to_owned());
-            }
-        }
-        let rx_queues = count_rx_queues(names.iter().map(String::as_str));
+        let ifindex = session.ifindex;
+        let link = link(ifindex).ok_or(CheckFailure::Unverifiable(Probe::Link))?;
+        let rx_queues = link.rx_queues.unwrap_or(0);
         let ipv4_addresses =
             addresses(ifindex).ok_or(CheckFailure::Unverifiable(Probe::Ipv4Addresses))?;
         // `/proc/net` is the reading process's network namespace, the
@@ -480,7 +514,11 @@ pub mod linux {
                 .and_then(parse_flag)
         };
         Ok(DeviceFacts {
+            ifindex,
             rx_queues,
+            link_mtu: link.mtu,
+            session_mtu: session.mtu,
+            frame_capacity: session.frame_capacity,
             ipv4_addresses,
             ipv4_routes,
             forwarding_global: flag("/proc/sys/net/ipv4/ip_forward".to_owned()),
@@ -568,7 +606,11 @@ mod tests {
     #[test]
     fn device_checks_refuse_or_warn_as_documented() {
         let clean = DeviceFacts {
+            ifindex: 7,
             rx_queues: 1,
+            link_mtu: 1500,
+            session_mtu: 1500,
+            frame_capacity: 1792,
             ipv4_addresses: 0,
             ipv4_routes: 0,
             forwarding_global: Some(false),
@@ -648,11 +690,59 @@ mod tests {
     }
 
     #[test]
-    fn rx_queue_names_and_flags_parse_strictly() {
+    fn mtu_must_match_the_session_and_fit_a_frame() {
+        let clean = DeviceFacts {
+            ifindex: 7,
+            rx_queues: 1,
+            link_mtu: 1778,
+            session_mtu: 1778,
+            frame_capacity: 1792,
+            ..DeviceFacts::default()
+        };
+        let policy = CheckPolicy::default();
+        assert_eq!(mtu_limit(1792), 1778);
+        assert_eq!(mtu_limit(10), 0);
+        assert!(evaluate_device(&clean, policy).is_ok(), "exactly the limit");
         assert_eq!(
-            count_rx_queues(["rx-0", "tx-0", "rx-1", "rx-", "rx-x", "rxq-2"]),
-            2
+            evaluate_device(
+                &DeviceFacts {
+                    link_mtu: 1779,
+                    session_mtu: 1779,
+                    ..clean
+                },
+                policy
+            ),
+            Err(CheckFailure::MtuAboveFrame {
+                mtu: 1779,
+                limit: 1778
+            })
         );
+        assert_eq!(
+            evaluate_device(
+                &DeviceFacts {
+                    session_mtu: 1500,
+                    ..clean
+                },
+                policy
+            ),
+            Err(CheckFailure::Unverifiable(Probe::Mtu))
+        );
+        assert_eq!(
+            CheckFailure::MtuAboveFrame {
+                mtu: 9000,
+                limit: 1778
+            }
+            .to_string(),
+            "MTU_ABOVE_FRAME mtu=9000 limit=1778"
+        );
+        assert_eq!(
+            CheckFailure::Unverifiable(Probe::Link).to_string(),
+            "UNVERIFIABLE probe=link"
+        );
+    }
+
+    #[test]
+    fn routes_and_flags_parse_strictly() {
         let routes = "Iface\tDestination\tGateway \tFlags\n\
                       ra\t0000620A\t00000000\t0001\n\
                       rb\t00000000\t017100CB\t0003\n\

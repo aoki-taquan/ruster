@@ -8,8 +8,16 @@
 //! stop flag is set or the backend stops itself. Each iteration reads the
 //! clock, runs one tick, folds the report into the [`TickObserver`], samples
 //! the O(1) state-table occupancy, and asks [`IdleBackoff`] whether to
-//! pause. Nothing on this path allocates, formats, or locks; the periodic
-//! stats block is the only cold work and runs at most once per interval.
+//! pause. Nothing on this path allocates, formats, or locks; the cold work
+//! between ticks is the periodic stats block (at most once per interval),
+//! a SIGHUP reload (only on request; see [`super::reload`]), and the health
+//! sample and rtnetlink link query round of [`super::watch`] (at most every
+//! 500 ms and 1 s; allocation-free unless an event line is printed).
+//!
+//! A pending reload holds RX back (no tick runs) until the backend is
+//! quiescent or [`super::reload::RELOAD_QUIESCE_MS`] passed; its candidate
+//! then rides the publication phase of the next tick, before RX, so no
+//! batch or lease is open across the switch.
 //!
 //! Kicks and need-wakeup are the adapter's: every `receive` reaps
 //! completions, refills Fill, answers a Fill need-wakeup with a
@@ -28,18 +36,26 @@
 //! load the loop never sleeps. At 1 ms the default 2048-entry RX ring
 //! absorbs a burst of up to about 2 Mpps without loss while the loop
 //! wakes. A blocking `poll` on the socket fds would wake sooner but needs a
-//! new multi-fd syscall in the native crate; that is deferred (S10b).
+//! new multi-fd syscall in the native crate; that is deferred (CLI-034).
 
+use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ruster_control::ActivePublication;
-use ruster_core::{GeneratedPacketIo, IfId, MonotonicMillis, PacketIo, PublicationQuiescence};
+use ruster_control::{ActivePublication, ProductionKeySource};
+use ruster_core::{
+    GeneratedPacketIo, IfId, MonotonicMillis, PacketIo, PublicationQuiescence,
+    PublicationQuiescenceDisposition,
+};
 use ruster_io_xdp_native::{KickError, XdpIoError};
 use ruster_runtime::{
-    run_tick, PhaseReport, RxPhaseReport, ServiceOccupancy, TickBudgets, TickObserver,
-    TickPhaseSkip, TickReport,
+    run_tick, ApplyFlushCounts, PhaseReport, PublicationOutcome, RxPhaseReport, ServiceOccupancy,
+    TickObserver, TickPhaseSkip, TickReport,
 };
+
+use super::netlink::{LinkFacts, NetlinkError};
+use super::reload::{ConfigSource, ReloadCounters, Reloader};
+use super::watch::{Fatal, LinkTarget, PortSample, Watch, WatchEvent};
 
 /// Idle ticks before the loop starts to sleep.
 pub const SPIN_TICKS: u32 = 64;
@@ -72,6 +88,33 @@ pub trait Datapath {
 
     /// Interfaces of the ports, in `IfId` order.
     fn port_count(&self) -> usize;
+
+    /// Hands each port's health counters to `visit` (cold path, no
+    /// allocation).
+    fn sample_ports(&self, visit: &mut impl FnMut(PortSample));
+
+    /// Whether a publication could be applied right now: the backend's
+    /// own quiescence check (which reaps completions and kicks owed TX
+    /// first), with the guard dropped at once. `Err` carries what the
+    /// backend says about I/O meanwhile.
+    fn probe_quiescence(&mut self) -> Result<(), PublicationQuiescenceDisposition> {
+        match self.io().try_publication_quiescence() {
+            Ok(guard) => {
+                drop(guard);
+                Ok(())
+            }
+            Err(error) => {
+                Err(<Self::Io as PublicationQuiescence>::quiescence_error_disposition(&error))
+            }
+        }
+    }
+}
+
+/// rtnetlink link queries of the ports (cold path).
+pub trait LinkMonitor {
+    /// Link facts of `target`'s interface index in the router's network
+    /// namespace.
+    fn query(&mut self, target: &LinkTarget) -> Result<LinkFacts, NetlinkError>;
 }
 
 /// Summed result of one drain call.
@@ -85,6 +128,10 @@ pub struct DrainProgress {
     pub tx_in_flight: u32,
     /// Frames the kernel still holds from Fill (released by socket close).
     pub fill_in_kernel: u32,
+    /// TX handoffs staged but neither submitted nor cancelled (none on
+    /// any adapter path; only a leak can leave one). Not in the kernel:
+    /// the socket close releases them, but the run was not clean.
+    pub tx_handoffs: u32,
     /// The last failed kick of this call.
     pub last_kick_error: Option<(IfId, KickError)>,
 }
@@ -118,10 +165,15 @@ impl Clock for SystemClock {
     }
 }
 
-/// The stop request: a first signal stops, a second forces.
+/// The stop request: a first signal stops, a second forces; and the
+/// reload request (SIGHUP).
 pub trait StopSignal {
     fn stop(&self) -> bool;
     fn force(&self) -> bool;
+    /// Takes a pending reload request (once per request).
+    fn take_reload(&self) -> bool {
+        false
+    }
 }
 
 /// The process signal flags of [`crate::signal`].
@@ -134,6 +186,10 @@ impl StopSignal for ProcessSignals {
 
     fn force(&self) -> bool {
         crate::signal::force_requested()
+    }
+
+    fn take_reload(&self) -> bool {
+        crate::signal::take_reload_request()
     }
 }
 
@@ -230,64 +286,207 @@ pub enum LoopEnd {
     Signal,
     /// The backend reported a terminal stop (a datapath fault).
     BackendStopped,
+    /// The health or link watch found a fatal condition on a port.
+    Fatal { port: IfId, cause: Fatal },
 }
 
 /// Run-loop settings.
 #[derive(Clone, Copy, Debug)]
 pub struct LoopSettings {
-    pub budgets: TickBudgets,
     /// Milliseconds between periodic stats; 0 disables them.
     pub stats_interval_ms: u64,
+    /// Milliseconds between backend health samples.
+    pub health_interval_ms: u64,
+    /// Milliseconds between rtnetlink link query rounds.
+    pub link_interval_ms: u64,
+    /// Longest wait of a pending reload for quiescence.
+    pub reload_quiesce_ms: u64,
 }
 
-/// Runs ticks until a stop request or a backend stop. `periodic` is called
-/// between ticks once per `stats_interval_ms` (cold path).
-pub fn run_loop<'s, D, C, S, F>(
+/// The cold-path control of the loop: reload, health, and link watch.
+pub struct Control<K: ProductionKeySource, R, L> {
+    pub reloader: Reloader<K, R>,
+    pub watch: Watch,
+    pub links: L,
+}
+
+/// What a periodic stats block reads besides the publication and backend.
+pub struct RunStatus<'a> {
+    pub reload: ReloadCounters,
+    pub watch: &'a Watch,
+}
+
+/// Runs ticks until a stop request, a backend stop, or a fatal watch
+/// event. Between ticks (cold path): a reload request is prepared and,
+/// once the backend is quiescent, its candidate rides the next tick's
+/// publication phase; the health and link watch sample at their
+/// intervals; `periodic` is called once per `stats_interval_ms`. Lines go
+/// to `err`.
+#[allow(clippy::too_many_arguments)]
+pub fn run_loop<'s, D, C, S, K, R, L, E, F>(
     active: &mut ActivePublication<'s, D::Io>,
     datapath: &mut D,
     observer: &mut TickObserver,
     clock: &mut C,
     stop: &S,
     settings: LoopSettings,
+    control: &mut Control<K, R, L>,
+    err: &mut E,
     mut periodic: F,
 ) -> LoopEnd
 where
     D: Datapath,
     C: Clock,
     S: StopSignal,
-    F: FnMut(&ActivePublication<'s, D::Io>, &D, &TickObserver, MonotonicMillis),
+    K: ProductionKeySource,
+    R: ConfigSource,
+    L: LinkMonitor,
+    E: Write,
+    F: FnMut(&ActivePublication<'s, D::Io>, &D, &TickObserver, &RunStatus<'_>, MonotonicMillis),
 {
     let mut backoff = IdleBackoff::default();
-    let mut watch = BackendWatch::default();
+    let mut wedge = BackendWatch::default();
     let mut last_stats = clock.now();
+    let mut budgets = control.reloader.budgets();
     loop {
         if stop.stop() {
             return LoopEnd::Signal;
         }
         let now = clock.now();
-        let report = run_tick(active, None, datapath.io(), now, settings.budgets, observer);
-        observer.observe_tick(now, Some(active.generation()), &report);
+        let generation = active.generation();
+        if control.reloader.pending_since().is_none() && stop.take_reload() {
+            let _ = writeln!(
+                err,
+                "ruster run: reload requested (generation {generation})"
+            );
+            if let Some(outcome) = control.reloader.prepare(active, now) {
+                let _ = writeln!(err, "ruster run: {outcome}");
+            }
+        }
+        let mut candidate = None;
+        if let Some(since) = control.reloader.pending_since() {
+            match datapath.probe_quiescence() {
+                Ok(()) => candidate = control.reloader.take_candidate(),
+                Err(PublicationQuiescenceDisposition::Stop) => {
+                    if let Some(outcome) = control.reloader.abandon("BACKEND_STOPPED", generation) {
+                        let _ = writeln!(err, "ruster run: {outcome}");
+                    }
+                }
+                Err(_) if now.0.saturating_sub(since.0) >= settings.reload_quiesce_ms => {
+                    if let Some(outcome) = control.reloader.abandon("TIMEOUT", generation) {
+                        let _ = writeln!(err, "ruster run: {outcome}");
+                    }
+                }
+                Err(_) => {
+                    // Hold RX back so in-flight TX can complete; the probe
+                    // reaped and kicked.
+                    clock.pause(MIN_PAUSE);
+                    continue;
+                }
+            }
+        }
+        let reloading = candidate.is_some();
+        let report = run_tick(active, candidate, datapath.io(), now, budgets, observer);
+        let generation = active.generation();
+        observer.observe_tick(now, Some(generation), &report);
+        if reloading {
+            let (applied, rejected) = match &report.publication {
+                PublicationOutcome::Applied => (
+                    active
+                        .last_apply()
+                        .filter(|apply| apply.generation == generation)
+                        .map(|apply| {
+                            let flush = ApplyFlushCounts::from_reports(
+                                apply.resolution,
+                                apply.icmpv4_errors,
+                                apply.nat44_udp,
+                                apply.nat44_tcp,
+                                apply.firewall,
+                            );
+                            (apply.previous_generation, flush)
+                        }),
+                    None,
+                ),
+                PublicationOutcome::Rejected(error) => (None, Some(*error)),
+                PublicationOutcome::Unchanged | PublicationOutcome::Deferred { .. } => (None, None),
+            };
+            if let Some((_, flush)) = applied {
+                observer.record_apply_flush(generation, flush);
+            }
+            if let Some(outcome) = control.reloader.finish(generation, applied, rejected) {
+                let _ = writeln!(err, "ruster run: {outcome}");
+            }
+            budgets = control.reloader.budgets();
+        }
         observer.record_occupancy(ServiceOccupancy::capture(
             active.icmpv4_errors(),
             active.nat44_udp(),
             active.nat44_tcp(),
             active.firewall(),
         ));
-        if let Some(end) = watch.after_tick(&report) {
+        if let Some(end) = wedge.after_tick(&report) {
             return end;
         }
         let busy = tick_was_busy(&report);
         drop(report);
+        if let Some(end) = watch_step(datapath, control, now, settings, err) {
+            return end;
+        }
         if settings.stats_interval_ms != 0
             && now.0.saturating_sub(last_stats.0) >= settings.stats_interval_ms
         {
             last_stats = now;
-            periodic(active, datapath, observer, now);
+            let status = RunStatus {
+                reload: control.reloader.counters(),
+                watch: &control.watch,
+            };
+            periodic(active, datapath, observer, &status, now);
         }
         if let Some(pause) = backoff.after_tick(busy) {
             clock.pause(pause);
         }
     }
+}
+
+/// The health sample and link query round, when due. Returns the first
+/// fatal event as the loop end.
+fn watch_step<D, K, R, L, E>(
+    datapath: &D,
+    control: &mut Control<K, R, L>,
+    now: MonotonicMillis,
+    settings: LoopSettings,
+    err: &mut E,
+) -> Option<LoopEnd>
+where
+    D: Datapath,
+    K: ProductionKeySource,
+    L: LinkMonitor,
+    E: Write,
+{
+    let mut end = None;
+    let mut on_event = |event: WatchEvent| {
+        if let WatchEvent::Fatal { port, cause } = event {
+            if end.is_some() {
+                return;
+            }
+            end = Some(LoopEnd::Fatal { port, cause });
+        }
+        let _ = writeln!(err, "ruster run: {event}");
+    };
+    let watch = &mut control.watch;
+    if watch.health_due(now, settings.health_interval_ms) {
+        datapath.sample_ports(&mut |sample| watch.on_sample(now, sample, &mut on_event));
+    }
+    if watch.link_due(now, settings.link_interval_ms) {
+        for index in 0..watch.port_count() {
+            let Some(target) = watch.target(index) else {
+                break;
+            };
+            let result = control.links.query(&target);
+            watch.on_link(index, result, &mut on_event);
+        }
+    }
+    end
 }
 
 /// Outcome of [`shutdown_drain`].
@@ -303,6 +502,8 @@ pub struct ShutdownReport {
     pub tx_in_flight: u32,
     /// Frames the kernel still held from Fill after the last call.
     pub fill_in_kernel: u32,
+    /// Stranded TX handoffs after the last call (exit 1 if nonzero).
+    pub tx_handoffs: u32,
     /// A second signal cut the drain short.
     pub forced: bool,
     /// The deadline passed with TX still in flight.
@@ -361,6 +562,7 @@ pub fn shutdown_drain<D: Datapath, C: Clock, S: StopSignal>(
                     .saturating_add(u64::from(progress.rx_pending_released));
                 report.tx_in_flight = progress.tx_in_flight;
                 report.fill_in_kernel = progress.fill_in_kernel;
+                report.tx_handoffs = progress.tx_handoffs;
                 if progress.last_kick_error.is_some() {
                     report.last_kick_error = progress.last_kick_error;
                 }

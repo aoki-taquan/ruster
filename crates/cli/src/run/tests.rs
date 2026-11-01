@@ -16,15 +16,21 @@ use ruster_io_sim::SimIo;
 use ruster_io_xdp_native::XdpIoError;
 use ruster_sim_scenario::SIM_VALIDATION_LIMITS;
 
+use ruster_core::PublicationQuiescenceDisposition;
+
 use super::checks::{
     required_memlock, CheckFailure, CheckPolicy, DeviceFacts, PrivilegeFailure, Probe,
 };
 use super::engine::{
-    Clock, Datapath, DrainProgress, IdleBackoff, StopSignal, DRAIN_DEADLINE_MS, DRAIN_ROUNDS,
-    MAX_PAUSE, MIN_PAUSE, SPIN_TICKS,
+    Clock, Datapath, DrainProgress, IdleBackoff, LinkMonitor, StopSignal, DRAIN_DEADLINE_MS,
+    DRAIN_ROUNDS, MAX_PAUSE, MIN_PAUSE, SPIN_TICKS,
 };
+use super::netlink::{LinkFacts, NetlinkError};
+use super::reload::ConfigSource;
 use super::startup::{CloseFailure, Failure, OpenPort, PortHost, Stage, StartupError};
+use super::watch::{LinkTarget, PortSample};
 use super::{execute, Settings, EXIT_DRAIN_INCOMPLETE, EXIT_PRIVILEGE, READY};
+use crate::config_cmd::LoadError;
 use crate::{EXIT_INVALID, EXIT_RUNTIME};
 
 const LAN: u16 = 1;
@@ -89,6 +95,20 @@ struct State {
     attached: Cell<u32>,
     drains: RefCell<VecDeque<Result<DrainProgress, XdpIoError>>>,
     inject: RefCell<Vec<(IfId, Vec<u8>)>>,
+    /// Frames injected when the datapath's `io()` call number (1-based,
+    /// one per tick) reaches the first field.
+    inject_at: RefCell<VecDeque<(u32, IfId, Vec<u8>)>>,
+    io_calls: Cell<u32>,
+    /// Health sample rounds handed out by `sample_ports`, one per call.
+    samples: RefCell<VecDeque<Vec<PortSample>>>,
+    /// Link query results, consumed in order by the matching port.
+    links: RefCell<VecDeque<(IfId, Result<LinkFacts, NetlinkError>)>>,
+    link_queries: Cell<u32>,
+    /// Quiescence probes refused before one succeeds.
+    quiesce_blocks: Cell<u32>,
+    quiesce_probes: Cell<u32>,
+    /// Transient open failures still to inject for this port.
+    transient_open: Cell<Option<(u16, u32)>>,
 }
 
 impl State {
@@ -149,7 +169,43 @@ impl Datapath for FakeDatapath<'_> {
     type Io = SimIo;
 
     fn io(&mut self) -> &mut SimIo {
+        let call = self.state.io_calls.get() + 1;
+        self.state.io_calls.set(call);
+        let mut scheduled = self.state.inject_at.borrow_mut();
+        while scheduled.front().is_some_and(|(at, _, _)| *at <= call) {
+            if let Some((_, ingress, bytes)) = scheduled.pop_front() {
+                self.io.inject(ingress, bytes);
+            }
+        }
         &mut self.io
+    }
+
+    fn sample_ports(&self, visit: &mut impl FnMut(PortSample)) {
+        let round = self.state.samples.borrow_mut().pop_front();
+        for sample in round.into_iter().flatten() {
+            visit(sample);
+        }
+    }
+
+    /// Completes every queued TX frame (the fake kernel transmits at
+    /// once), unless a refusal is scripted.
+    fn probe_quiescence(&mut self) -> Result<(), PublicationQuiescenceDisposition> {
+        use ruster_core::PublicationQuiescence as _;
+        self.state
+            .quiesce_probes
+            .set(self.state.quiesce_probes.get() + 1);
+        let blocks = self.state.quiesce_blocks.get();
+        if blocks != 0 {
+            self.state.quiesce_blocks.set(blocks - 1);
+            return Err(PublicationQuiescenceDisposition::ContinueOldIo);
+        }
+        while self.io.pop_tx().is_some() {}
+        while self.io.pop_recycled().is_some() {}
+        while self.io.pop_generated_recycled().is_some() {}
+        match self.io.try_publication_quiescence() {
+            Ok(_) => Ok(()),
+            Err(error) => Err(SimIo::quiescence_error_disposition(&error)),
+        }
     }
 
     fn drain(&mut self, rounds: u32) -> Result<DrainProgress, XdpIoError> {
@@ -173,9 +229,51 @@ impl Datapath for FakeDatapath<'_> {
     }
 }
 
+struct FakeLinks {
+    state: Rc<State>,
+}
+
+impl LinkMonitor for FakeLinks {
+    fn query(&mut self, target: &LinkTarget) -> Result<LinkFacts, NetlinkError> {
+        self.state
+            .link_queries
+            .set(self.state.link_queries.get() + 1);
+        let mut links = self.state.links.borrow_mut();
+        if links
+            .front()
+            .is_some_and(|(port, _)| *port == target.interface)
+        {
+            if let Some((_, result)) = links.pop_front() {
+                return result;
+            }
+        }
+        Ok(LinkFacts {
+            mtu: target.mtu,
+            rx_queues: Some(1),
+            admin_up: true,
+            lower_up: true,
+        })
+    }
+}
+
+/// Fake interface index of a port.
+const fn fake_ifindex(id: u16) -> u32 {
+    100 + id as u32
+}
+
 impl PortHost for FakeHost {
     type Session = FakeSession;
     type Datapath<'s> = FakeDatapath<'s>;
+    type Links = FakeLinks;
+
+    fn links(&self) -> Result<FakeLinks, Failure> {
+        if self.fails(Stage::Watch, None) {
+            return Err(Failure::Links(NetlinkError::Errno(24)));
+        }
+        Ok(FakeLinks {
+            state: Rc::clone(&self.state),
+        })
+    }
 
     fn preflight(&self, _: &ValidatedAfXdpV1) -> Result<(), PrivilegeFailure> {
         self.state.push(Event::Preflight);
@@ -187,6 +285,12 @@ impl PortHost for FakeHost {
         self.state.push(Event::Open(id));
         if self.fails(Stage::Open, Some(id)) {
             return Err(Failure::Injected);
+        }
+        if let Some((port, left)) = self.state.transient_open.get() {
+            if port == id && left != 0 {
+                self.state.transient_open.set(Some((port, left - 1)));
+                return Err(Failure::InjectedTransient);
+            }
         }
         self.state.live.set(self.state.live.get() + 1);
         Ok(FakeSession {
@@ -204,10 +308,14 @@ impl PortHost for FakeHost {
         assert_eq!(session.interface, port.interface());
         self.state.push(Event::Inspect(id));
         if self.fails(Stage::Checks, Some(id)) {
-            return Err(CheckFailure::Unverifiable(Probe::SysfsIdentity));
+            return Err(CheckFailure::Unverifiable(Probe::Link));
         }
         Ok(DeviceFacts {
+            ifindex: fake_ifindex(id),
             rx_queues: if self.multi_queue == Some(id) { 4 } else { 1 },
+            link_mtu: 1500,
+            session_mtu: 1500,
+            frame_capacity: port.umem().visible_capacity(),
             ipv4_addresses: 0,
             ipv4_routes: 0,
             forwarding_global: Some(false),
@@ -330,6 +438,62 @@ impl StopSignal for FakeStop {
     }
 }
 
+/// Scripted reload documents, shared with the test.
+#[derive(Clone, Default)]
+struct FakeSource {
+    documents: Rc<RefCell<VecDeque<Result<ValidatedConfigV1, LoadError>>>>,
+    loads: Rc<Cell<u32>>,
+}
+
+impl FakeSource {
+    fn with(documents: impl IntoIterator<Item = Result<ValidatedConfigV1, LoadError>>) -> Self {
+        let source = Self::default();
+        source.documents.borrow_mut().extend(documents);
+        source
+    }
+}
+
+impl ConfigSource for FakeSource {
+    fn load(&mut self) -> Result<ValidatedConfigV1, LoadError> {
+        self.loads.set(self.loads.get() + 1);
+        self.documents
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(Err(LoadError::Read(std::io::ErrorKind::NotFound)))
+    }
+}
+
+/// Test settings: no periodic stats, health and link watch every tick.
+fn settings(policy: CheckPolicy, stats_interval_ms: u64) -> Settings {
+    Settings {
+        policy,
+        stats_interval_ms,
+        drain_deadline_ms: DRAIN_DEADLINE_MS,
+        startup_attempts: 3,
+        health_interval_ms: 0,
+        link_interval_ms: 0,
+        reload_quiesce_ms: super::reload::RELOAD_QUIESCE_MS,
+    }
+}
+
+/// `execute` over the default config with a production sequencer.
+#[allow(clippy::too_many_arguments)]
+fn execute_with<S: StopSignal, O: std::io::Write, E: std::io::Write>(
+    host: &FakeHost,
+    config: ValidatedConfigV1,
+    source: FakeSource,
+    settings: Settings,
+    clock: &mut FakeClock,
+    stop: &S,
+    out: &mut O,
+    err: &mut E,
+) -> u8 {
+    let sequencer = ProductionSequencer::new(OsRandomKeySource::open().expect("urandom"));
+    execute(
+        host, config, sequencer, source, settings, clock, stop, out, err,
+    )
+}
+
 /// Microsecond clock advanced by `step_us` per reading and by every pause.
 #[derive(Default)]
 struct FakeClock {
@@ -369,21 +533,29 @@ fn run_with<S: StopSignal>(
     stop: &S,
     clock: &mut FakeClock,
 ) -> Outcome {
-    let config = config();
-    let backend = config.backend().af_xdp().expect("af-xdp");
+    run_full(
+        host,
+        settings(policy, 0),
+        FakeSource::default(),
+        stop,
+        clock,
+    )
+}
+
+fn run_full<S: StopSignal>(
+    host: &FakeHost,
+    settings: Settings,
+    source: FakeSource,
+    stop: &S,
+    clock: &mut FakeClock,
+) -> Outcome {
     let mut out = Vec::new();
     let mut err = Vec::new();
-    let sequencer = ProductionSequencer::new(OsRandomKeySource::open().expect("urandom"));
-    let status = execute(
+    let status = execute_with(
         host,
-        &config,
-        backend,
-        sequencer,
-        Settings {
-            policy,
-            stats_interval_ms: 0,
-            drain_deadline_ms: DRAIN_DEADLINE_MS,
-        },
+        config(),
+        source,
+        settings,
         clock,
         stop,
         &mut out,
@@ -420,6 +592,7 @@ fn startup_runs_in_ifid_order_and_shutdown_closes_in_reverse() {
             rx_pending_released: 1,
             tx_in_flight: 3,
             fill_in_kernel: 64,
+            tx_handoffs: 0,
             last_kick_error: None,
         }),
         Ok(DrainProgress {
@@ -469,7 +642,7 @@ fn startup_runs_in_ifid_order_and_shutdown_closes_in_reverse() {
     assert!(
         outcome
             .err
-            .contains("completed=5 rx-released=1 tx-in-flight=0 fill-in-kernel=64"),
+            .contains("completed=5 rx-released=1 tx-in-flight=0 tx-handoffs=0 fill-in-kernel=64"),
         "{}",
         outcome.err
     );
@@ -502,6 +675,7 @@ fn a_failure_at_every_stage_rolls_back_every_opened_port() {
         (Stage::Engine, Some(LAN), 2),
         (Stage::Datapath, Some(WAN), 2),
         (Stage::Engine, Some(WAN), 2),
+        (Stage::Watch, None, 2),
         (Stage::Adapter, None, 2),
     ];
     for (stage, port, opened) in cases {
@@ -821,20 +995,13 @@ fn idle_backoff_spins_then_doubles_to_the_cap() {
 #[test]
 fn periodic_stats_follow_the_interval() {
     let host = FakeHost::default();
-    let config = config();
-    let backend = config.backend().af_xdp().expect("af-xdp");
     let (mut out, mut err) = (Vec::new(), Vec::new());
     // 1 ms per clock reading, 25 loop iterations, a block every 10 ms.
-    let status = execute(
+    let status = execute_with(
         &host,
-        &config,
-        backend,
-        ProductionSequencer::new(OsRandomKeySource::open().expect("urandom")),
-        Settings {
-            policy: CheckPolicy::default(),
-            stats_interval_ms: 10,
-            drain_deadline_ms: DRAIN_DEADLINE_MS,
-        },
+        config(),
+        FakeSource::default(),
+        settings(CheckPolicy::default(), 10),
         &mut FakeClock {
             step_us: 1_000,
             ..FakeClock::default()
@@ -1021,6 +1188,22 @@ impl StopSignal for MeasuringStop {
 #[test]
 fn ticks_do_not_allocate() {
     let host = FakeHost::default();
+    // The health and link watch run every tick here (test settings), with
+    // healthy samples that change nothing, so their path is measured too.
+    let rounds = (0..1_000_u64).map(|step| {
+        vec![PortSample {
+            interface: IfId(WAN),
+            polls: step * 10,
+            tx_inflight: 1,
+            oldest_age_polls: 1,
+            kick_errors: 0,
+            kick_link_down: false,
+            fill_starved: 0,
+            fill_ring_occupancy: 8,
+            rx_packets: step,
+        }]
+    });
+    host.state.samples.borrow_mut().extend(rounds);
     // Warm up past the busy first ticks; then measure idle ticks that both
     // spin and sleep, plus the stop checks themselves.
     let arm_at = FIRST_LOOP_CHECK + 8;
@@ -1301,22 +1484,15 @@ fn an_undrained_output_pipe_never_blocks_the_loop_or_the_stop() {
     let mut out = output.writer(Stream::Out);
     let mut err = output.writer(Stream::Err);
     let host = FakeHost::default();
-    let config = config();
-    let backend = config.backend().af_xdp().expect("af-xdp");
     let before = dropped();
     let ticks = 20_000;
     let stop = FakeStop::after(FIRST_LOOP_CHECK + ticks);
-    let status = execute(
+    let status = execute_with(
         &host,
-        &config,
-        backend,
-        ProductionSequencer::new(OsRandomKeySource::open().expect("urandom")),
-        Settings {
-            policy: CheckPolicy::default(),
-            // A ~10 KiB block every 1 ms of fake time, 10 ticks apart.
-            stats_interval_ms: 1,
-            drain_deadline_ms: DRAIN_DEADLINE_MS,
-        },
+        config(),
+        FakeSource::default(),
+        // A ~10 KiB block every 1 ms of fake time, 10 ticks apart.
+        settings(CheckPolicy::default(), 1),
         &mut FakeClock {
             step_us: 100,
             ..FakeClock::default()
@@ -1418,3 +1594,6 @@ fn token_table_is_pinned() {
     );
     let _: fn(&StorageAllocationError) -> String = |error| token(&error.service);
 }
+
+#[path = "ops_tests.rs"]
+mod ops;

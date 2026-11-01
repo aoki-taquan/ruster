@@ -65,10 +65,11 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   typed errorで評価してcanonical JSONL `ruster-run-sim/v1`を出力する。M1 golden fixtureは
   [`fixtures/m1`](fixtures/m1)にあり、golden出力の再生成は
   `RUSTER_UPDATE_GOLDEN=1 cargo test -p ruster-sim-scenario --test driver`（CIでは拒否）。
-- `ruster-cli`: binary `ruster`。手書きarg parsingで`validate`/`plan`/`run-sim`と、M2 S10aの
+- `ruster-cli`: binary `ruster`。手書きarg parsingで`validate`/`plan`/`run-sim`と、M2 S10a/S10bの
   `run`（x86_64 LinuxのAF_XDP static router、下の「`ruster run`」）を提供し、SIGINT/SIGTERMは
   private FFIのhandlerがstatic `AtomicBool`へswap/storeするだけです（二回目のsignalはforce
-  flag）。`unsafe`はそのhandlerと`run`のrtnetlink address dumpだけです（下の「使い方」）。
+  flag。`run`のSIGHUPはreload flagへstoreするだけ）。`unsafe`はそのhandlerと`run`のrtnetlink
+  query（address dumpとlink）だけです（下の「使い方」）。
   外部crateを直接には追加しません。
 - `ruster-bench`: NIC-freeなsim smoke/datapath benchmarkとhardware benchmark plan/
   measurement protocol/artifact v1のschema検証。sim結果からproduction性能を主張しない。
@@ -559,7 +560,7 @@ $B run-sim --scenario fixtures/m1/scenario.toml --hold
   invalid config/scenario（未知interface名を含む）。file read失敗（存在しない、読めない）は
   内容のinvalidとは区別して`1`で、stderrは`cannot read config: NOT_FOUND`のような安定codeです。
 
-### `ruster run`（M2 S10a、AF_XDP static router）
+### `ruster run`（M2 S10a/S10b、AF_XDP static router）
 
 `ruster run --config <config.toml>`は`kind = "af-xdp"`のconfigでx86_64 Linuxの各portにAF_XDP
 socketを開き、XDP programをattachしてrouterを動かします（`kind = "sim"`は`stage=backend
@@ -569,7 +570,9 @@ code=SIM_BACKEND`でexit 2、`run-sim`を使う）。操作手順は[`docs/runbo
 cargo build --release -p ruster-cli
 sudo target/release/ruster run --config router.toml                # 既定: 60秒ごとにstats
 sudo target/release/ruster run --stats-interval 0 -- router.toml   # 周期statsなし
-# stderr: ruster run: running generation 1 on 2 port(s); send SIGINT or SIGTERM to stop
+sudo target/release/ruster run --startup-attempts 1 -- router.toml # 起動retryなし
+# stderr: ruster run: running generation 1 on 2 port(s); send SIGINT or SIGTERM to stop, SIGHUP to reload
+sudo kill -HUP <pid>                                               # configをreload
 ```
 
 - 権限: 実効capabilityに`CAP_NET_ADMIN`と`CAP_NET_RAW`、および`CAP_BPF`+`CAP_PERFMON`
@@ -577,8 +580,11 @@ sudo target/release/ruster run --stats-interval 0 -- router.toml   # 周期stats
   `CAP_IPC_LOCK`が無ければsoft `RLIMIT_MEMLOCK`がport UMEMの合計（`mode = "auto"`は2倍、
   5.11前のkernelのBPF object分としてportごとに64 KiBを加算した下限）以上必要です（`ulimit -l`、systemdの`LimitMEMLOCK=`）。不足は何も取得せずexit 4で、不足した
   capabilityまたは`limit-bytes`/`required-bytes`を表示します。起動後もprivilegeは落としません。
-- portの前提（起動時に確認）: deviceのRX queueは1つ（`ethtool -L <dev> combined 1`など。RSS/ntupleで
-  全trafficをbind queueへ寄せたなら`--allow-multi-queue`、他queueのframeはXDPが捨てる）。port上に
+- portの前提（起動時に確認）: deviceのRX queueは1つ（rtnetlinkの`IFLA_NUM_RX_QUEUES`で数えるので
+  namespaceに正しいが、driverが確保したqueue数。`ethtool -L <dev> combined 1`しても確保数が多い
+  NICやRSS/ntupleで全trafficをbind queueへ寄せたなら`--allow-multi-queue`、他queueのframeは
+  XDPが捨てる）。MTU + 14がUMEM frame（`frame-size - 256 - headroom`）に収まること
+  （`MTU_ABOVE_FRAME`）。port上に
   kernelのIPv4 addressとIPv4 route（main table）を置かない（`ip -4 addr flush dev <dev>`）。
   attach中は無意味で、停止中やcrash後にkernelがfirewall/NATを迂回してforwardし得るためで、
   `stage=checks code=KERNEL_IPV4_ADDRESSES`/`KERNEL_IPV4_ROUTES`/`MULTI_QUEUE_DEVICE`で拒否します。
@@ -594,17 +600,42 @@ sudo target/release/ruster run --stats-interval 0 -- router.toml   # 周期stats
 - 停止: SIGINT/SIGTERMでtickを止め、各portを最大2秒drainしてから逆順にdetach/closeし、
   stdoutへfinal statsを、stderrへ`stopped by signal; drain calls=... tx-in-flight=N
   fill-in-kernel=M ...; detached and closed 2 port(s)`を出します。二回目のsignalはdrainを
-  打ち切ります。SIGKILLやcrashでもunpinned linkはkernelが自動でdetachします（直後の再起動は
-  一時的に`BIND/BUSY`や`REGISTER_UMEM/MEMLOCK_LIMIT`になり得る。retryはS10b）。
+  打ち切ります。SIGKILLやcrashでもunpinned linkはkernelが自動でdetachします。
+- 起動retry（XDP-045）: 直前のrunのsocket/UMEMはkernelが遅延解放するため、port openの一時的な
+  `BIND/BUSY`、`REGISTER_UMEM/MEMLOCK_LIMIT`（`OUT_OF_MEMORY`）、`ERRNO_11`だけは開いた全portを
+  rollbackしてから250 ms（倍々、最大2 s）後に起動全体をやり直します。`--startup-attempts`
+  （1〜10、既定3、1でretryなし）が上限で、他の失敗はretryしません。
+- SIGHUP reload: handlerはflagを立てるだけで、tick境界で`--config`を起動時と同じ経路で読み直して
+  validateし（regular file以外は拒否）、新generationのcandidateを作り`ApplyPlan::for_active`で
+  稼働中generationと比べます。restart-required（`[backend]`、interface id/MAC、storage shape、
+  resolution/ICMPv4 policy）は`reload refused: code=RESTART_REQUIRED reasons=...`、読めない・不正・
+  dry run失敗は`reload failed: stage=... code=...`で、どちらも旧generationがそのまま動き続けます。
+  通ればbackendがquiescent（旧generationのTXがkernelに無い）になったtick境界でpublication phaseへ
+  渡し（待つ間はRXを最大200 ms止める。過ぎれば`stage=quiesce code=TIMEOUT`）、
+  `reload applied: generation=N previous=P; flushed ...`です。適用時はcontrol-planeの契約どおり
+  ARP学習・NAT44 mapping・firewall flowをflushし（hash keyがrotateする）、counterは保持します。
+  `reload.requested|applied|refused|failed`をstatsに出します。
+- health/link watch（cold path）: 500 msごとにportのcounterを、1 sごとにrtnetlink `RTM_GETLINK`で
+  linkを見ます。最古のin-flight TX frameが完了しない`TX_STALL`は1 sでwarning、10 sでfatal、
+  `FILL_STARVED`はwarningだけ、`ENETDOWN`以外のkick errorが続く`KICK_ERRORS`は5 sでfatal。
+  link downはwarningと計数だけで動き続け、upで`recovered`になりowed kickが再開します。device削除
+  （`DEVICE_REMOVED`）、startup MTU未満へのMTU低下（`MTU_DECREASED`）、frameに収まらないMTU
+  （`MTU_ABOVE_FRAME`）、3回連続のlink query失敗はfatalです。fatalはdrain・detach・closeの後
+  exit 1（`stopped after a fatal health event port=if<id> code=...`）。statsは`watch.state`、
+  `if<id>.watch.*`。行はすべて`warning:|recovered:|fatal: port=if<id> health=<CODE>`のvalue-free形式。
 - stats: `ruster-run-stats kind=periodic|final uptime-ms=N`の後に`section.key=value`行
-  （`observer.*`、`health.*`、`tick.*`、`rx.*`、`drop.*`、`af_xdp.*`、`if<id>.af_xdp_port.*`等）と
+  （`observer.*`、`health.*`、`tick.*`、`rx.*`、`drop.*`、`af_xdp.*`、`if<id>.af_xdp_port.*`、
+  `reload.*`、`watch.*`、`if<id>.watch.*`等）と
   `end`。counterとlabelだけでaddress、MAC、device名、key、seedは出しません。
 - idle時は64 tick spinした後50 µsから1 msまで倍々でsleepします（idle後最初のframeは最大約1 ms
   遅れる。負荷中はsleepしない）。
 - exit status: `0` clean shutdown（起動中のsignalでrollbackした場合も）、`1`起動失敗、backend
-  fault、drain失敗、close error、`2` usage/invalid config、`3`停止期限（または二回目のsignal）で
-  TX frameがkernelに残った（detach/closeは済み）、`4`権限/memlock不足。
-- SIGHUP reload、health/stall signal、retry policy、privilege dropはM2 S10b以降です。
+  fault、fatal health/device event、drain失敗、drain後に残ったTX handoff、close error、
+  `2` usage/invalid config、`3`停止期限（または二回目のsignal）で
+  TX frameがkernelに残った（detach/closeは済み）、`4`権限/memlock不足。reloadの拒否・失敗では
+  終了しません。
+- privilege drop、socket fdの`poll`待機、multi-queue、systemd notify、SIGUSR1 statsはdeferred
+  （requirements CLI-034、runbookの「Known limits」）。
 
 ### packet backend（`[backend]`）
 
@@ -698,8 +729,12 @@ binaryを通常userでbuildし、router用とhost A/B用の三つの専用netns�
 processとして起動します。host Aからhost BへのUDPがrouterのARP、NAT44、firewallを通って届くこと、
 SIGTERMでexit 0・XDP detach・final stats、二つ目のportのopen/attach失敗でexit 1と一つ目のportの
 detach（外部programは不変）、2-queue device・kernel IPv4 address・kernel routeの拒否、SIGKILL後の
-auto-detachと再起動（transientなBusy/MemlockLimitだけtest内でbounded retry）を確認し、成否に
-よらず三つのnetnsを削除します。
+auto-detachと再起動（transientなBusy/MemlockLimitはrouter自身もretryし、test側もbounded retry）、
+M2 S10bのops phase（一つの稼働中routerでSIGHUP reloadによりUDP ruleをdenyにして届かなくなり、
+戻して再び届く。generation 2/3でrestartなし。UMEM shapeを変えたreloadは`RESTART_REQUIRED`で
+拒否され転送は継続。router netns内の`ip link set ra down/up`でwarningとrecovered、転送回復。rbの
+MTUをframe上限超へ上げるとexit 1でdetach）、最後にrouter netns内でraのvethを削除するとexit 1
+（`DEVICE_REMOVED`）で何もattachが残らないことを確認し、成否によらず三つのnetnsを削除します。
 
 ```bash
 scripts/priv-run-smoke.sh

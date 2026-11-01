@@ -1,12 +1,12 @@
-//! `ruster run --config <path>`: the AF_XDP static router (M2 S10a, the
-//! first half of X04b). x86_64 Linux only.
+//! `ruster run --config <path>`: the AF_XDP static router (M2 S10a/S10b,
+//! X04b). x86_64 Linux only.
 //!
 //! # Startup (failure atomic)
 //!
 //! 1. Load and validate the config without the service bridge. `[backend]`
 //!    must be `kind = "af-xdp"`; `sim` is refused (`stage=backend
 //!    code=SIM_BACKEND`, exit 2) and points to `ruster run-sim`.
-//! 2. Install the SIGINT/SIGTERM handlers, open `/dev/urandom` as the
+//! 2. Install the SIGINT/SIGTERM and SIGHUP handlers, open `/dev/urandom` as the
 //!    [`ruster_control::OsRandomKeySource`] and wrap it in a [`ProductionSequencer`]. The
 //!    whole live path is generic over `K: ProductionKeySource`, a sealed
 //!    trait that the simulation key source cannot implement, so a
@@ -31,11 +31,24 @@
 //! exits non-zero. A signal between stages rolls back the same way and
 //! exits 0.
 //!
+//! A transient port open failure (XDP-045, [`Failure::is_transient`]:
+//! `BIND/BUSY`, `REGISTER_UMEM/MEMLOCK_LIMIT` or `OUT_OF_MEMORY`, any
+//! `ERRNO_11`) rolls back every opened port the same way and retries the
+//! whole port startup after 250 ms, doubling up to 2 s, at most
+//! `--startup-attempts` attempts in all (default 3, `1..=10`; 1 disables
+//! the retry). Each retry prints `startup attempt N of M failed: ...;
+//! rolled back K port(s), retrying in P ms`. Every other failure is
+//! final at once. The candidate, storage, and privilege preflight are not
+//! repeated.
+//!
 //! # Run loop
 //!
 //! See [`engine`]: `run_tick` with the configured budgets and an `Instant`
 //! clock, spin-then-sleep idle backoff (at most 1 ms), no allocation per
 //! tick, and a stats block on stdout every `--stats-interval` seconds.
+//! Between ticks, on the cold path: the SIGHUP reload ([`reload`]), and
+//! the health and link watch ([`watch`]), whose fatal events end the run
+//! like a stop request, with drain and close, but exit 1.
 //!
 //! # Shutdown
 //!
@@ -54,9 +67,13 @@
 //!
 //! - 0: ordered shutdown with no TX frame left in the kernel (also a
 //!   signal during startup, after a clean rollback).
-//! - 1: startup failure (open, checks, attach, datapath, engine, adapter,
-//!   activation, key source), a backend fault during the run, a drain
-//!   failure, or a close error.
+//! - 1: startup failure (open, checks, attach, watch, datapath, engine,
+//!   adapter, activation, key source; a transient open failure after the
+//!   last attempt), a backend fault during the run, a fatal health or
+//!   device event ([`watch`]: TX stall, persistent kick errors, device
+//!   removed, MTU decreased or above the frame bound, link unverifiable),
+//!   a drain failure, a stranded TX handoff after the drain, or a close
+//!   error. A refused or failed reload never ends the run.
 //! - 2: usage error or invalid configuration (including the `sim`
 //!   backend).
 //! - 3: shutdown deadline (or a second signal) with TX frames still owned
@@ -84,14 +101,17 @@ mod linux;
 )]
 mod netlink;
 mod output;
+mod reload;
 mod startup;
 mod stats;
 #[cfg(test)]
 mod tests;
+mod watch;
 
 use std::io::Write;
+use std::time::Duration;
 
-use ruster_config::{ValidatedAfXdpV1, ValidatedConfigV1};
+use ruster_config::ValidatedConfigV1;
 use ruster_control::{
     ActivePublication, ConfigBridgeError, FullServiceStorage, ProductionKeySource,
     ProductionSequencer, SequencerError, ValidatedCandidate,
@@ -105,13 +125,15 @@ use crate::{EXIT_INVALID, EXIT_RUNTIME};
 
 use checks::{CheckPolicy, PrivilegeFailure};
 use engine::{
-    port_label, run_loop, shutdown_drain, Clock, Datapath, LoopEnd, LoopSettings, ShutdownReport,
-    StopSignal, DRAIN_DEADLINE_MS,
+    port_label, run_loop, shutdown_drain, Clock, Control, Datapath, LoopEnd, LoopSettings,
+    RunStatus, ShutdownReport, StopSignal, DRAIN_DEADLINE_MS,
 };
+use reload::{ConfigSource, Reloader};
 use startup::{
     open_ports, CloseFailure, Failure, Interrupt, OpenedPorts, PortHost, Stage, StartupError,
 };
 use stats::BlockKind;
+use watch::{Watch, HEALTH_INTERVAL_MS, LINK_INTERVAL_MS};
 
 /// Shutdown deadline passed with TX frames still owned by the kernel.
 pub const EXIT_DRAIN_INCOMPLETE: u8 = 3;
@@ -121,12 +143,24 @@ pub const EXIT_PRIVILEGE: u8 = 4;
 /// Readiness line prefix on stderr.
 pub const READY: &str = "ruster run: running generation";
 
+/// First pause between startup attempts; it doubles per attempt.
+pub const STARTUP_RETRY_PAUSE_MS: u64 = 250;
+/// Longest pause between startup attempts.
+pub const STARTUP_RETRY_PAUSE_MAX_MS: u64 = 2_000;
+/// Slice of the retry pause between stop-flag checks.
+const RETRY_SLICE: Duration = Duration::from_millis(10);
+
 /// Settings of one run.
 #[derive(Clone, Copy, Debug)]
 pub struct Settings {
     pub policy: CheckPolicy,
     pub stats_interval_ms: u64,
     pub drain_deadline_ms: u64,
+    /// Whole startups tried on a transient port open failure.
+    pub startup_attempts: u32,
+    pub health_interval_ms: u64,
+    pub link_interval_ms: u64,
+    pub reload_quiesce_ms: u64,
 }
 
 impl Settings {
@@ -137,8 +171,19 @@ impl Settings {
             },
             stats_interval_ms: args.stats_interval_secs.saturating_mul(1_000),
             drain_deadline_ms: DRAIN_DEADLINE_MS,
+            startup_attempts: args.startup_attempts,
+            health_interval_ms: HEALTH_INTERVAL_MS,
+            link_interval_ms: LINK_INTERVAL_MS,
+            reload_quiesce_ms: reload::RELOAD_QUIESCE_MS,
         }
     }
+}
+
+/// Pause before startup attempt `next` (2, 3, ...): 250 ms doubling, at
+/// most 2 s.
+pub fn retry_pause_ms(next: u32) -> u64 {
+    let doublings = next.saturating_sub(2).min(8);
+    (STARTUP_RETRY_PAUSE_MS << doublings).min(STARTUP_RETRY_PAUSE_MAX_MS)
 }
 
 /// Runs the command and returns the exit status.
@@ -155,7 +200,7 @@ pub fn run(args: &RunArgs, err: &mut impl Write) -> u8 {
         );
         return EXIT_INVALID;
     }
-    live(args, &config, err)
+    live(args, config, err)
 }
 
 #[cfg(not(all(
@@ -163,7 +208,7 @@ pub fn run(args: &RunArgs, err: &mut impl Write) -> u8 {
     target_arch = "x86_64",
     target_pointer_width = "64"
 )))]
-fn live(_: &RunArgs, _: &ValidatedConfigV1, err: &mut impl Write) -> u8 {
+fn live(_: &RunArgs, _: ValidatedConfigV1, err: &mut impl Write) -> u8 {
     let _ = writeln!(
         err,
         "ruster run: unsupported platform: the AF_XDP backend needs x86_64 Linux"
@@ -176,13 +221,10 @@ fn live(_: &RunArgs, _: &ValidatedConfigV1, err: &mut impl Write) -> u8 {
     target_arch = "x86_64",
     target_pointer_width = "64"
 ))]
-fn live(args: &RunArgs, config: &ValidatedConfigV1, err: &mut impl Write) -> u8 {
+fn live(args: &RunArgs, config: ValidatedConfigV1, err: &mut impl Write) -> u8 {
     use ruster_control::OsRandomKeySource;
 
-    let Some(backend) = config.backend().af_xdp() else {
-        return EXIT_INVALID;
-    };
-    if let Err(name) = crate::signal::install() {
+    if let Err(name) = crate::signal::install().and_then(|()| crate::signal::install_reload()) {
         let _ = writeln!(err, "ruster run: cannot install {name} handler");
         return EXIT_RUNTIME;
     }
@@ -215,8 +257,8 @@ fn live(args: &RunArgs, config: &ValidatedConfigV1, err: &mut impl Write) -> u8 
     let status = execute(
         &host,
         config,
-        backend,
         ProductionSequencer::new(keys),
+        reload::ConfigFile(args.config.clone()),
         settings,
         &mut engine::SystemClock::new(),
         &engine::ProcessSignals,
@@ -256,13 +298,26 @@ fn budgets(config: &ValidatedConfigV1) -> TickBudgets {
     }
 }
 
+/// How one startup attempt ended.
+enum Attempt {
+    /// Every port is open, checked, and attached.
+    Started,
+    /// Stopped early; `opened` still holds what was opened.
+    Interrupted(Interrupt),
+}
+
 /// Startup, run, shutdown, and teardown over `host`.
+///
+/// A transient port open failure ([`Failure::is_transient`]) rolls back
+/// every opened port (last first) and retries the whole startup after
+/// [`retry_pause_ms`], at most `settings.startup_attempts` attempts in
+/// all; a signal during the pause cancels like any startup signal.
 #[allow(clippy::too_many_arguments)]
-pub fn execute<H, K, C, S, O, E>(
+pub fn execute<H, K, R, C, S, O, E>(
     host: &H,
-    config: &ValidatedConfigV1,
-    backend: &ValidatedAfXdpV1,
+    config: ValidatedConfigV1,
     mut sequencer: ProductionSequencer<K>,
+    source: R,
     settings: Settings,
     clock: &mut C,
     stop: &S,
@@ -272,12 +327,20 @@ pub fn execute<H, K, C, S, O, E>(
 where
     H: PortHost,
     K: ProductionKeySource,
+    R: ConfigSource,
     C: Clock,
     S: StopSignal,
     O: Write,
     E: Write,
 {
-    let candidate = match sequencer.candidate(config) {
+    let Some(ports) = config
+        .backend()
+        .af_xdp()
+        .map(|backend| backend.ports().len())
+    else {
+        return EXIT_INVALID;
+    };
+    let candidate = match sequencer.candidate(&config) {
         Ok(candidate) => candidate,
         Err(error) => {
             let error = StartupError::new(Stage::Candidate, None, Failure::Sequencer(error));
@@ -291,36 +354,71 @@ where
             return startup_failed(err, error, &[]);
         }
     };
-    if let Err(error) = host.preflight(backend) {
-        let error = StartupError::new(Stage::Privileges, None, Failure::Privileges(error));
-        return startup_failed(err, error, &[]);
+    if let Some(backend) = config.backend().af_xdp() {
+        if let Err(error) = host.preflight(backend) {
+            let error = StartupError::new(Stage::Privileges, None, Failure::Privileges(error));
+            return startup_failed(err, error, &[]);
+        }
     }
-    let mut opened = OpenedPorts::new(host, backend.ports().len());
-    let started = open_ports(
-        &mut opened,
-        backend,
-        settings.policy,
-        stop,
-        |port, warnings| {
-            for code in warnings.codes() {
-                let _ = writeln!(err, "ruster run: warning: port={} {code}", port_label(port));
+    let attempts = settings.startup_attempts.max(1);
+    let mut attempt = 1;
+    let (mut opened, attempt_end) = loop {
+        let mut opened = OpenedPorts::new(host, ports);
+        let started = match config.backend().af_xdp() {
+            Some(backend) => open_ports(
+                &mut opened,
+                backend,
+                settings.policy,
+                stop,
+                |port, warnings| {
+                    for code in warnings.codes() {
+                        let _ =
+                            writeln!(err, "ruster run: warning: port={} {code}", port_label(port));
+                    }
+                },
+            ),
+            None => Ok(()),
+        };
+        match started {
+            Ok(()) => break (opened, Attempt::Started),
+            Err(Interrupt::Failed(error)) if attempt < attempts && error.failure.is_transient() => {
+                let rolled_back = opened.len();
+                let cleanup = opened.close_all();
+                if !cleanup.is_empty() {
+                    return startup_failed(err, error, &cleanup);
+                }
+                let pause = retry_pause_ms(attempt + 1);
+                let _ = writeln!(
+                    err,
+                    "ruster run: startup attempt {attempt} of {attempts} failed: {error}; \
+                     rolled back {rolled_back} port(s), retrying in {pause} ms"
+                );
+                if !retry_pause(clock, stop, pause) {
+                    let _ = writeln!(
+                        err,
+                        "ruster run: startup cancelled by signal; rolled back {rolled_back} port(s)"
+                    );
+                    return 0;
+                }
+                attempt += 1;
             }
-        },
-    );
-    let outcome = match started {
-        Ok(()) => run_ports(
+            Err(interrupt) => break (opened, Attempt::Interrupted(interrupt)),
+        }
+    };
+    let outcome = match attempt_end {
+        Attempt::Started => run_ports(
             host,
             &mut opened,
             candidate,
             &mut storage,
-            budgets(config),
+            Reloader::new(sequencer, config, source),
             settings,
             clock,
             stop,
             out,
             err,
         ),
-        Err(interrupt) => Err(interrupt),
+        Attempt::Interrupted(interrupt) => Err(interrupt),
     };
     let ports = opened.len();
     let cleanup = opened.close_all();
@@ -347,6 +445,20 @@ where
     }
 }
 
+/// Sleeps `pause_ms` in slices; `false` if a stop request arrived.
+fn retry_pause<C: Clock, S: StopSignal>(clock: &mut C, stop: &S, pause_ms: u64) -> bool {
+    let start = clock.now();
+    loop {
+        if stop.stop() {
+            return false;
+        }
+        if clock.now().0.saturating_sub(start.0) >= pause_ms {
+            return true;
+        }
+        clock.pause(RETRY_SLICE);
+    }
+}
+
 /// What a completed run hands to teardown.
 struct Ran {
     end: LoopEnd,
@@ -355,12 +467,12 @@ struct Ran {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_ports<'h, H, C, S, O, E>(
+fn run_ports<'h, H, K, R, C, S, O, E>(
     host: &H,
     opened: &mut OpenedPorts<'h, H>,
     candidate: ValidatedCandidate,
     storage: &mut FullServiceStorage,
-    budgets: TickBudgets,
+    reloader: Reloader<K, R>,
     settings: Settings,
     clock: &mut C,
     stop: &S,
@@ -369,11 +481,17 @@ fn run_ports<'h, H, C, S, O, E>(
 ) -> Result<Ran, Interrupt>
 where
     H: PortHost,
+    K: ProductionKeySource,
+    R: ConfigSource,
     C: Clock,
     S: StopSignal,
     O: Write,
     E: Write,
 {
+    let links = host
+        .links()
+        .map_err(|failure| Interrupt::Failed(StartupError::new(Stage::Watch, None, failure)))?;
+    let targets: Vec<_> = opened.ports_mut().iter().map(|port| port.link).collect();
     let mut datapath = host.build(opened.ports_mut()).map_err(Interrupt::Failed)?;
     if stop.stop() {
         return Err(Interrupt::Signalled);
@@ -400,14 +518,21 @@ where
     let mut observer = TickObserver::new(HealthPolicy::default());
     let _ = writeln!(
         err,
-        "{READY} {} on {} port(s); send SIGINT or SIGTERM to stop",
+        "{READY} {} on {} port(s); send SIGINT or SIGTERM to stop, SIGHUP to reload",
         active.generation(),
         datapath.port_count()
     );
     let _ = err.flush();
     let loop_settings = LoopSettings {
-        budgets,
         stats_interval_ms: settings.stats_interval_ms,
+        health_interval_ms: settings.health_interval_ms,
+        link_interval_ms: settings.link_interval_ms,
+        reload_quiesce_ms: settings.reload_quiesce_ms,
+    };
+    let mut control = Control {
+        reloader,
+        watch: Watch::new(&targets),
+        links,
     };
     let end = run_loop(
         &mut active,
@@ -416,8 +541,10 @@ where
         clock,
         stop,
         loop_settings,
-        |active, datapath, observer, now| {
-            let text = render(BlockKind::Periodic, now, active, datapath, observer);
+        &mut control,
+        err,
+        |active, datapath, observer, status, now| {
+            let text = render(BlockKind::Periodic, now, active, datapath, observer, status);
             let _ = out.write_all(text.as_bytes());
             let _ = out.flush();
         },
@@ -426,13 +553,29 @@ where
         err,
         "ruster run: {}; draining",
         match end {
-            LoopEnd::Signal => "stop requested",
-            LoopEnd::BackendStopped => "backend stopped after a fault",
+            LoopEnd::Signal => "stop requested".to_owned(),
+            LoopEnd::BackendStopped => "backend stopped after a fault".to_owned(),
+            LoopEnd::Fatal { port, cause } => format!(
+                "fatal health event port={} code={}",
+                port_label(port),
+                cause.code()
+            ),
         }
     );
     let shutdown = shutdown_drain(&mut datapath, clock, stop, settings.drain_deadline_ms);
     let now = clock.now();
-    let final_block = render(BlockKind::Final, now, &active, &datapath, &observer);
+    let status = RunStatus {
+        reload: control.reloader.counters(),
+        watch: &control.watch,
+    };
+    let final_block = render(
+        BlockKind::Final,
+        now,
+        &active,
+        &datapath,
+        &observer,
+        &status,
+    );
     drop(active);
     drop(datapath);
     Ok(Ran {
@@ -448,6 +591,7 @@ fn render<D: Datapath>(
     active: &ActivePublication<'_, D::Io>,
     datapath: &D,
     observer: &TickObserver,
+    status: &RunStatus<'_>,
 ) -> String {
     let services = ServiceCounters::capture(
         active.resolution(),
@@ -458,6 +602,11 @@ fn render<D: Datapath>(
     );
     stats::block(kind, now, &observer.snapshot(now), &services, |out| {
         datapath.write_stats(out);
+        stats::write_fields(out, None, &status.reload);
+        stats::write_fields(out, None, status.watch);
+        for (interface, health) in status.watch.health() {
+            stats::write_fields(out, Some(interface), &health);
+        }
     })
 }
 
@@ -519,15 +668,21 @@ fn finished(
     let _ = writeln!(
         err,
         "ruster run: {}; drain calls={} completed={} rx-released={} tx-in-flight={} \
-         fill-in-kernel={} forced={} timed-out={} last-kick-error={}; {}",
+         tx-handoffs={} fill-in-kernel={} forced={} timed-out={} last-kick-error={}; {}",
         match ran.end {
-            LoopEnd::Signal => "stopped by signal",
-            LoopEnd::BackendStopped => "stopped after a backend fault",
+            LoopEnd::Signal => "stopped by signal".to_owned(),
+            LoopEnd::BackendStopped => "stopped after a backend fault".to_owned(),
+            LoopEnd::Fatal { port, cause } => format!(
+                "stopped after a fatal health event port={} code={}",
+                port_label(port),
+                cause.code()
+            ),
         },
         shutdown.calls,
         shutdown.completed,
         shutdown.rx_pending_released,
         shutdown.tx_in_flight,
+        shutdown.tx_handoffs,
         shutdown.fill_in_kernel,
         shutdown.forced,
         shutdown.timed_out,
@@ -538,7 +693,11 @@ fn finished(
             format!("detached and closed {closed} of {ports} port(s); see close failed")
         },
     );
-    if !cleanup.is_empty() || ran.end == LoopEnd::BackendStopped || shutdown.fault.is_some() {
+    if !cleanup.is_empty()
+        || ran.end != LoopEnd::Signal
+        || shutdown.fault.is_some()
+        || shutdown.tx_handoffs != 0
+    {
         EXIT_RUNTIME
     } else if shutdown.tx_in_flight != 0 {
         EXIT_DRAIN_INCOMPLETE

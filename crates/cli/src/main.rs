@@ -8,17 +8,19 @@
 //! - `ruster run-sim --scenario <scenario.toml> [--hold]`: canonical
 //!   `ruster-run-sim/v1` JSONL on stdout, human summary on stderr.
 //! - `ruster run --config <config.toml>`: the AF_XDP static router (x86_64
-//!   Linux); stats blocks on stdout, progress and diagnostics on stderr.
+//!   Linux); stats blocks on stdout, progress and diagnostics on stderr;
+//!   SIGHUP reloads the config.
 //!
 //! Exit status: 0 success (also a restart-required plan, and an ordered
 //! shutdown after SIGINT/SIGTERM), 1 runtime, I/O, invariant, or scenario
-//! expectation failure, 2 usage error or invalid configuration/scenario;
+//! expectation failure (for `run` also a fatal health or device event), 2
+//! usage error or invalid configuration/scenario;
 //! `run` adds 3 (shutdown deadline with TX frames still in the kernel) and
 //! 4 (missing privilege or memlock).
 //!
 //! The only `unsafe` code is FFI in two private modules: the signal
-//! handlers (`signal`) and the rtnetlink address dump of `ruster run`'s
-//! startup check (`run::netlink`).
+//! handlers (`signal`) and the rtnetlink queries of `ruster run`'s
+//! startup check and link watch (`run::netlink`).
 
 mod args;
 mod config_cmd;
