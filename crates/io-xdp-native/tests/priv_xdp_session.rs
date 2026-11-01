@@ -293,7 +293,11 @@ fn priv_xdp_attach_redirects_refuses_second_and_detaches_on_netns_veth() {
     assert_eq!((mode.as_str(), name.as_str()), ("xdp", "ruster_xsk"));
 
     // A frame sent from the peer end (an ARP request for an address nobody
-    // owns) is redirected into the RX ring of queue 0.
+    // owns) is redirected into the RX ring of queue 0. This relies on the
+    // peer's frames landing on RX queue 0 of the two-queue veth: frames on
+    // queue 1 have no socket and are dropped by the XDP_DROP fallback
+    // (XDP-050), so if this check becomes flaky, look at the veth queue
+    // selection first.
     let peer = UdpSocket::bind(PEER_SOURCE).expect("peer address configured by the script");
     let deadline = Instant::now() + Duration::from_secs(3);
     let descriptor = loop {

@@ -2070,7 +2070,9 @@ kernel stackへ届き、kernelがrouterのfirewall/NATを迂回してforwardし�
 したりし得ます。代わりに非bind queueのtrafficは失われるので、M2（1 port 1 queue）ではsingle-queue
 deviceを使うかethtool RSS/ntupleで全trafficをbind queueへ寄せることが前提で、portにkernelのL3設定
 （address、route）を残してはいけません（XDP-050）。startup時にqueue数/steeringを確認してtyped
-errorにするcheckはX04です（XDP-063）。
+errorにするcheckはX04です（XDP-063）。DROP fallbackはprogramがattachされている間だけ効き、attach前と
+detach・close・crash（SIGKILL）後はprogramが無いため全queueのframeがkernel stackへ届きます（fail open）。
+その間はportにkernel L3設定を残さずforwardingを無効にする運用要件が保護します。
 
 licenseはrepoのSPDX式`MIT OR Apache-2.0`です。v6.8の`license_is_gpl_compatible`は
 `gpl_only = true`のhelper（とkfunc）だけを制限し、使う唯一のhelper
