@@ -76,8 +76,8 @@ workspaceは12 crateからなる。data-planeとI/Oのlibrary crate（`ruster-co
     scheduling、poll、netns/実NIC E2Eは無い
   - `ruster-io-xdp`/`ruster-io-xdp-native`: AF_XDP ownership model、safe native profile
     （`ruster-io-xdp::native_profile`、configと共有）、native ABI/ring scaffold、private syscall
-    RAII seam（XDP rows）。socket/UMEM登録、attach、`PacketIo`接続は
-    無い
+    RAII seam（XDP rows）、一socketのnative session（X00C）、XDP program/`bpf_link`
+    attach（X00D）。datapath engineと`PacketIo`接続は無い
 - CI: `CI` workflow（Check、Musl、Test、Clippy、Format、Doc。Testはdoctestとrequirements
   gateを含む）、`Security Smoke` workflow（`R16A Bounded`、8 target×4 fixed seed）、
   `Benchmark Smoke` workflow（spec digest、plan v1照合、sim smoke）。
@@ -98,8 +98,8 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
 ### Partialまたは欠落
 
 - production backendが無い。AF_PACKETはscripted syscall上のcopy backendまで、AF_XDPは
-  ownership model/native scaffoldまでで、`ruster run`、XDP program lifecycle、multi-queue
-  worker ownership、netns/実NIC E2Eは無い（M2）。
+  一socketのsessionとXDP program attachまでで、`ruster run`、datapath engine、multi-queue
+  worker ownership、netns/実NIC forwarding E2Eは無い（M2）。
 - `run-sim`はrestart-required applyをrejectとして報告し、同一process内でstorageを
   作り直さない（SIM-016 deferred）。process restartをまたぐgeneration/key履歴は無い。
 - OS乱数によるproduction key source（`OsRandomKeySource`）と、sim専用key sourceを型で拒否する
@@ -111,8 +111,15 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
 - 一socketのfailure-atomic native session（`if_nametoindex`、AF_XDP socket、UMEM mmap/登録、
   四ring size/`XDP_MMAP_OFFSETS`検証/mmap、`sockaddr_xdp` bind、`XDP_OPTIONS`によるmode確認、
   `auto`のEOPNOTSUPP限定copy fallback、typed errno、exact reverse teardown）はM2 S1（X00C）で
-  追加した（XDP-037〜045）。XDP program attach（S2）、datapath engine（S3）、`ruster run`は
-  まだ無い。
+  追加した（XDP-037〜045）。
+- XDP program/`bpf_link` lifecycle（手組みredirect program、`queue + 1` slotのXSKMAP、socket挿入、
+  `BPF_LINK_CREATE`、既存programの`ExistingProgram` reject、link closeによるdetach、unpinnedで
+  crash時auto-detach、typed errno、exact reverse cleanup）はM2 S2（X00D）で追加した（XDP-047〜061）。
+  owner決定: `bpf_link`だけを使いminimum kernelはLinux 5.9、既存XDP programは置換もdetachも
+  しない、linkはpinしない、licenseは`MIT OR Apache-2.0`（使うhelperはGPL-onlyでない）。5.9〜6.xの
+  実機検証とCI workflowはX04（XDP-062）。review決定: socketの無いqueueは`XDP_DROP`（fail closed。
+  firewall/NATの迂回を防ぐ代わりにsingle-queue deviceかbind queueへのsteeringが前提、portにkernel L3
+  設定を残さない。startup checkはX04、XDP-063）。datapath engine（S3）、`ruster run`はまだ無い。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
   ringのsaturationが無い（OBS-017/018 deferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
@@ -541,7 +548,8 @@ workflowごとのscopeを固定し、同じtestを複数jobへ無差別に重複
 AF_PACKET/AF_XDP crate追加後の通常compile/clippyはworkspaceの`ci.yml`が担当する。
 AF_XDP backendはlibbpf/libxdpにlinkしないraw UAPI v6.8 profileなので、host library用の
 container jobは不要である。privileged netns/veth smoke（`scripts/priv-xdp-smoke.sh`、
-`RUSTER_PRIV_XDP=1`）はX00Cで追加したが、workflow化はX04が所有し、capability不足を
+`RUSTER_PRIV_XDP=1`）はX00Cで追加しX00Dでattach/existing program/SIGKILL phaseを加えたが、
+workflow化はX04が所有し、capability不足を
 silent skipしない。packet/property matrixはtruncation、length/checksum、fragment、odd payload、
 incremental/full checksum一致、generation/clock/capacityを含む。
 
@@ -579,9 +587,13 @@ mainへmergeしない。
    `include/uapi/linux/if_xdp.h`の`repr(C)` layoutとx86_64 syscall定数をcompile-time/unit testで
    固定し（XDP-020、XDP-036）、minimum kernel/driver条件を記録する。外部libraryが無いため
    enabled/disabled buildの区別は無く、通常CIのworkspace build（x86_64 gnu/musl）がそのまま
-   検証する。
+   検証する。X00Dで`bpf(2)`の定数とattr prefixも固定し（XDP-048）、minimum kernelは
+   XDP `bpf_link`の入ったLinux 5.9とした。
 2. XDP program attachが既存programを無断で置換せず、partial attach失敗とshutdownで元状態を
-   回復する。
+   回復する。X00Dは`bpf_link`だけでattachし、既存program/linkを`ExistingProgram`でreject
+   （置換もdetachもしない）、失敗時は作成済みobjectだけをreverse close、shutdownとcrashは
+   unpinned linkのcloseでdetachする（XDP-051〜053、XDP-057、XDP-061）。reload/link down時の
+   re-attachはX04。
 3. `RLIMIT_MEMLOCK`、UMEM registration、queue bind、zero-copy request/fallbackをtyped errorと
    capability reportにする。
 4. shared UMEMを使う場合、fill/completion ringのowner、frame partition、queue間handoffを

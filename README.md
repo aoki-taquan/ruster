@@ -109,8 +109,17 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   zero-copy bindがEOPNOTSUPPのときだけcopyへfallbackし、errorはvalue-freeな
   `SessionError{stage, failure}`（PermissionDenied、MemlockLimit、NoSuchDevice、Busy等）。
   ring viewは`rings(&mut self)`が実mappingを排他borrowして貸すためmappingより長命になれない。
-  XDP program attach（S2）、datapath engine（S3）、UMEM byte access、core `PacketIo`接続は
-  まだ持たず、FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
+  M2 S2（X00D）の`NativeSession::attach_xdp(XdpAttachMode::{Native, Generic})`は、手組みの
+  original eBPF redirect program（`rx_queue_index`でXSKMAPを引き、空slotは`XDP_DROP`でfail closed）を
+  `bpf(2)`で直接loadし、`queue + 1` slotのXSKMAPへsocketを入れてから`BPF_LINK_CREATE`で
+  attachする（libbpf不要、minimum kernel 5.9、license `MIT OR Apache-2.0`）。既存のXDP program/
+  linkがあれば置換もdetachもせず`ExistingProgram`で拒否し、失敗時は作成済みobjectだけを逆順に
+  閉じる。detachはlink fdのclose（`detach_xdp`、`close`、drop）で、linkはpinしないため
+  process crashでも自動detachされる。errorはvalue-freeな`AttachError{stage, failure}`で、
+  verifier logは長さとtruncationだけを返す。bind queue以外のframeは捨てる（firewall/NATの迂回を
+  防ぐ）ので、portはsingle-queue deviceにするかethtool RSS/ntupleでbind queueへ寄せ、kernelの
+  L3設定を残さない。datapath engine（S3）、UMEM byte access、core
+  `PacketIo`接続はまだ持たず、FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
   privileged smokeは`scripts/priv-xdp-smoke.sh`（`sudo -n`で専用netnsとその中だけのveth pairを
   作り、`RUSTER_PRIV_XDP=1`で実行してnetnsを必ず削除。不足はskipせずfail）。
 
@@ -570,8 +579,8 @@ checkです。musl向けartifactのlink、test実行、実NICでのruntime compa
 MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test -p ruster-io-xdp-native --lib
 ```
 
-AF_XDP native sessionのprivileged smokeはCIでは実行せず（workflowはX04）、`sudo -n`が使える
-Linux hostで明示的に実行します。
+AF_XDP native session/XDP attachのprivileged smokeはCIでは実行せず（workflowはX04）、`sudo -n`が
+使えるLinux 5.9以上のhost（`ip`はlibbpf付きiproute2、`python3`が必要）で明示的に実行します。
 
 ```bash
 scripts/priv-xdp-smoke.sh
@@ -580,7 +589,11 @@ scripts/priv-xdp-smoke.sh
 scriptはtest binaryを通常userでbuildし、`ruster-x00c-<pid>-<random>`というnetnsとその中だけのveth pair
 （`rx00c0`/`rx00c1`）を作ってnetns内でtestを実行し、成否によらずnetnsを削除します（同名netnsが既にあれば触らずfail）。host側の
 interfaceには触れません。testはinitial netnsでの実行を拒否し、`RUSTER_PRIV_XDP=1`なのに
-netns/device/capabilityが欠ける場合はskipせずfailします。
+netns/device/capabilityが欠ける場合はskipせずfailします。veth pairは2 queueで、phaseは
+session（X00C）、attach（native attach、peer端からのframeがRX ringへ届く、別queueからの二度目の
+attachが`ExistingProgram`、detach、generic attach）、foreign（`ip link set ... xdpgeneric obj`で
+付けた外部programを両modeで拒否しprogram id不変。objectは`scripts/priv-xdp-foreign-elf.py`が
+compilerなしで生成）、holder（attachした別processをSIGKILLしlinkが消える）の順です。
 
 設計契約と非対象は[architecture v0.2](docs/architecture-v0.2.md)、要件とRFC根拠は
 [requirements](docs/requirements-v0.2.md)、production backendから自宅ラボ運用までの
