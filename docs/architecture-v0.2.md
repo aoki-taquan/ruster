@@ -1312,7 +1312,20 @@ hash key、generationを持たず、validationはmutationを起こしません�
 `ValidatedCandidate`を作ります。key sourceは`KIND`で由来を自己申告し、M1の
 `SimDeterministicKeySource`はscenario seedとgenerationから決定的にUDP/TCP NAT44/firewall keyを
 導出する`DeterministicSimulation`です。key、seed、allocator seedはどのDebug/plan/run-sim出力にも
-出ません。production key sourceと、それ以外を拒否する入口はM2の`run`で作ります。
+出ません。
+
+production key sourceは`OsRandomKeySource`（KIND=`OperatingSystemRandom`）です。`open`で
+`/dev/urandom`を`std`だけで一度開いてcharacter deviceであることを確かめ、publicationごとに
+48 bytesを新たに読みます。short readは続きを読み、`EINTR`は再試行し、それ以外のopen/read失敗、
+EOF、all-zero keyはvalue-freeな`KeySourceError`（`ErrorKind`だけを持つ）になり、予測可能な
+keyへfallbackしません。generation採番、key再利用拒否、rollbackは`PublicationSequencer`の
+ままです。live trafficの入口は`ProductionSequencer`で、sealed marker `ProductionKeySource`
+（`OsRandomKeySource`だけが実装）を要求し、`new`が`S::KIND.is_production()`をcompile時に
+assertします。sim sourceはcompileできず、`run-sim`は従来どおり`PublicationSequencer`と
+`SimDeterministicKeySource`を使います（M1 goldenは不変）。`ruster run`はM2の後続sliceで
+`ProductionSequencer`を受け取ります。sourceのDebugはredactし、keyは`Copy`のcore値として
+authorityと各runtimeへ複製されるため、`unsafe`もdependencyも使わないこのcrateではzeroizeを
+保証できず、行いません（PUB-010〜013）。
 
 `ruster-control`のstatic-only owned publication境界は、nonzero generation、固定runtime
 storage shape、owned forwarding table、必須UDP/TCP NAT44 input、owned firewall rulesを

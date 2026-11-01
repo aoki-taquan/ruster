@@ -41,7 +41,9 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   publication identityとsecretは持たない。
 - `ruster-control`: validated configからpublication candidateを作るbridge（M1は
   Resolution/ICMPv4 error/NAT44 UDP/TCP/firewallを全て必須とし、欠落はtyped reject）、
-  scenario seed由来のsim専用key source、shapeどおりのslot配列を一度だけ確保する
+  scenario seed由来のsim専用key source、`/dev/urandom`由来のproduction key source
+  `OsRandomKeySource`とsim sourceをcompile時に拒否する`ProductionSequencer`（`ruster run`用、
+  失敗はtyped errorでfallbackなし）、shapeどおりのslot配列を一度だけ確保する
   `FullServiceStorage`、5 runtimeをpreflightしてから一点でcommitする`ActivePublication`、
   mutationなしの`ApplyPlan`/dry-run、単調なgenerationとkey非再利用を保証する
   `PublicationSequencer`（rollbackは旧configを新generationとして再apply）を持つ。

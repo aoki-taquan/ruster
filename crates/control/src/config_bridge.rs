@@ -28,19 +28,38 @@ use crate::publication::{
 
 /// How a [`PublicationKeySource`] obtains its keys.
 ///
-/// The kind is self-declared by the implementation. A future production entry
-/// point must reject [`KeySourceKind::DeterministicSimulation`], for example
-/// with a const assertion on `S::KIND` or a sealed production marker trait.
-/// This is not enforced yet; no production entry point exists in M1.
+/// The kind is self-declared by the implementation, so it is not the guard
+/// by itself. The production entry point [`crate::ProductionSequencer`]
+/// requires the sealed [`crate::ProductionKeySource`] marker (implemented only
+/// by [`crate::OsRandomKeySource`]) and also rejects
+/// [`KeySourceKind::DeterministicSimulation`] with a compile-time assertion on
+/// `S::KIND`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum KeySourceKind {
     /// Keys are a reproducible, publicly derivable function of a seed. Only
     /// valid for simulation and tests; never for live traffic.
     DeterministicSimulation,
+    /// Keys are drawn from the operating system CSPRNG and are unpredictable.
+    OperatingSystemRandom,
+}
+
+impl KeySourceKind {
+    /// Whether keys of this kind may protect live traffic.
+    #[must_use]
+    pub const fn is_production(self) -> bool {
+        match self {
+            Self::DeterministicSimulation => false,
+            Self::OperatingSystemRandom => true,
+        }
+    }
 }
 
 /// Value-free key-source failure.
+///
+/// No variant carries key material; the entropy variants carry only the
+/// [`std::io::ErrorKind`] of the failed operation. A failure never falls
+/// back to a predictable key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum KeySourceError {
@@ -48,8 +67,17 @@ pub enum KeySourceError {
     ///
     /// Defensive only for [`SimDeterministicKeySource`]: the two words of one
     /// key come from distinct tags through an injective map, so they never
-    /// coincide and in particular are never both zero.
+    /// coincide and in particular are never both zero. For
+    /// [`crate::OsRandomKeySource`] it means 128 random bits were all zero.
     AllZeroKey(RuntimeService),
+    /// The entropy device could not be opened or inspected.
+    EntropyOpen(std::io::ErrorKind),
+    /// The entropy path is not a character device.
+    EntropyNotCharacterDevice,
+    /// Reading the entropy device failed (`EINTR` is retried, not reported).
+    EntropyRead(std::io::ErrorKind),
+    /// The entropy device reached end of file before a full key set was read.
+    EntropyEndOfFile,
 }
 
 /// The three hash keys bound to one publication generation.
@@ -126,8 +154,15 @@ pub trait PublicationKeySource {
 /// Keys are a pure function of `(seed, generation)` so `run-sim` output is
 /// byte-reproducible. They are *not* unpredictable and must never protect live
 /// traffic. Its [`PublicationKeySource::KIND`] is
-/// [`KeySourceKind::DeterministicSimulation`]; a future production entry point
-/// must reject that kind, which is not enforced yet (M2).
+/// [`KeySourceKind::DeterministicSimulation`], and it does not implement
+/// [`crate::ProductionKeySource`], so [`crate::ProductionSequencer`] rejects
+/// it at compile time:
+///
+/// ```compile_fail,E0277
+/// use ruster_control::{ProductionSequencer, SimDeterministicKeySource};
+///
+/// let _ = ProductionSequencer::new(SimDeterministicKeySource::new(1));
+/// ```
 ///
 /// # Derivation
 ///

@@ -98,7 +98,8 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   worker ownership、netns/実NIC E2Eは無い（M2）。
 - `run-sim`はrestart-required applyをrejectとして報告し、同一process内でstorageを
   作り直さない（SIM-016 deferred）。process restartをまたぐgeneration/key履歴は無い。
-- OS乱数によるproduction key sourceと、sim専用key sourceを`run`で拒否する仕組みが無い（M2）。
+- OS乱数によるproduction key source（`OsRandomKeySource`）と、sim専用key sourceを型で拒否する
+  `ProductionSequencer`はM2 S7で追加した（PUB-010〜013）。これを使う`ruster run`はまだ無い（M2）。
 - NAT/FW占有、resolution/action/audit high-watermark、native ringのsaturationが無い
   （OBS-015/017/018 deferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
 - optional serviceを表すcomposition seamが無く、M1はUDP/TCP NAT44+FWを必須とする。
@@ -286,9 +287,8 @@ exit criteria:
     queue、firewall auditのhigh-watermarkも同じくcore accessorが必要なため未実装（ledger OBS-017）。
     RX/TX queue saturationはSimIoのpending RX/TX high-watermarkだけ実装し、native ringの
     RX/TX/FILL/COMPLETIONは各backendの`BackendStats`実装まで延期（OBS-018）。
-- sim専用key sourceの拒否: 現在は型名と自己申告の`KeySourceKind`だけで区別している。M2の`run`は
-  `DeterministicSimulation`を拒否する仕組み（`S::KIND`のconst assertionまたはsealed production
-  marker trait）を実装する。
+- sim専用key sourceの拒否: M2 S7でsealed `ProductionKeySource`と、それだけを受ける
+  `ProductionSequencer`（`S::KIND`のcompile時assertion付き）を実装した。M2の`run`はこの型を使う。
 
 M1への経路はgap分析のslice S1〜S9とする。
 
