@@ -779,7 +779,9 @@ DF=0 UDP/53はroute有りならsilent、route無しならICMPになります。�
 残るdeviation: egress-free評価はestablished stateを参照せず新規flowとして判定するため、
 routeが撤去された後の既存flowのpacket（例: established TCPのACK、許可ruleがegress限定の
 flowのUDP）はsilentな`FirewallRouteUnavailable`で、firewallなしの経路やRFC 1812 §5.2.7.1の
-MUSTと異なりNetwork Unreachableを返しません（FW-025）。
+MUSTと異なりNetwork Unreachableを返しません（FW-025）。これはtracked deviationで、ownerの
+RFC準拠を基準とする方針（2026-11-01）のもと、security上の挙動を設定可能にする要求とあわせて
+別PRで再検討します。
 
 full compositionでもfirewall authorizationはTTL判定とgenerated error captureより先です。
 rule/default deny、runtime/config/snapshot authority failure、上記egress-free評価でdenyされた
@@ -1057,7 +1059,7 @@ private `signal` moduleだけで、crateは`#![deny(unsafe_code)]`です。
   cold側`Vec<u8>`を確保します）。
 - firewall有効時のroute missは、egress-free評価で許可されegress依存のNAT gateにも当たらない
   packetだけにDestination Unreachable Networkを返します。route撤去後の既存flowのpacketは
-  silentです（RFC 1812 §5.2.7.1からのdeviation、FW-025）。この修正（#284）の採否はowner確認待ちです。
+  silentです（RFC 1812 §5.2.7.1からのtracked deviation、FW-025。RFC準拠を基準に別PRで再検討）。
 - restart-requiredのapplyはrun-sim内でrejectとして報告し、storageを作り直しません（SIM-016）。
   generation/key履歴はprocess内だけです。
 - NAT/FW占有、resolution/action/audit high-watermark、native ring saturationは未実装です

@@ -78,9 +78,8 @@ workspaceは12 crateからなる。data-planeとI/Oのlibrary crate（`ruster-co
   `Musl`と`R16A Bounded`はrequiredではない
 
 milestone状態: M0のP0 rowはすべてledger上implementedだが、M0の独立release evidence fileは
-作っていない。M1は[`release-evidence/m1.md`](release-evidence/m1.md)のとおり、route-miss
-ICMPのowner判断（deviation受容か#284のmergeか）、R16 checkのrequired化、R17 spec承認が残り
-未closeである。
+作っていない。M1は[`release-evidence/m1.md`](release-evidence/m1.md)のとおり、R16 checkの
+required化、R17 spec承認が残り未closeである。route-miss ICMPは#284で修正した（ownerがmergeを決定）。
 
 ### Partialまたは欠落
 
@@ -248,14 +247,20 @@ exit criteria:
   - 補足（2026-11-01、実装による明確化。owner確認待ち）: NAT port poolのsize変更はstorage shapeを
     変えるためrestart-required。同sizeのrange shiftとrealm変更はreload可能。
 - rollback: M1では旧config fileを新generationとして再applyすることを指す。
-- 補足（S5b review、owner確認待ち）: firewall有効時のroute missの扱いは、deviationの受容か
-  core修正#284のmergeかをownerが決める。#284はegress=noneでingress/src/dst/protocol/port ruleと
+- 補足（S5b review、2026-11-01 owner決定）: ownerは「基本的な判断基準としてRFC準拠」とし、
+  firewall有効時のroute missはdeviationを受容せずcore修正#284をmergeする。#284はegress=noneでingress/src/dst/protocol/port ruleと
   default policyを評価し、どのegressへも新規flowとして許可され、egress依存のNAT gateにも
   当たらないpacketだけにICMPv4 Destination Unreachable Networkを生成する（egress限定allowは
   matchせず、egress限定denyはfail closed。route oracleの考察はarchitecture）。それ以外は
   silentな`FIREWALL_ROUTE_UNAVAILABLE`のまま。M1 goldenはv2のegress `Any` rule 40で
-  Type 3/Code 0を検証する（SIM-010、FW-025）。route撤去後の既存flowのpacketはsilentのまま
-  （FW-025 deviation）。
+  Type 3/Code 0を検証する（SIM-010、FW-025）。同じ決定で次を確定した。
+  - egress限定denyはroute missでもdenyとして扱う。firewall filteringはRFC 1812が認める
+    operator policyであり、route oracleを防ぐ。
+  - route missのegress-free評価はfirewall auditへ記録せず、`denied_by_rule`/`denied_default`も
+    数えない（drop reasonで区別できる）。
+  - route撤去後の既存flowのpacketがsilentな点（FW-025）はtracked deviationとして残し、
+    RFC準拠を基準に別PRで再検討する。security上offにしたい挙動を設定可能にする要求
+    （ownerの同日決定）も同じ別PRで扱う。
 - R17の数値thresholdはimplementerがPRで提案し、ownerがそのPRで承認する。
 - NAT/FW占有のhigh-watermarkはM2へ延期する。
   - 補足（S4実装による明確化。owner確認待ち）: R15/Operability minimumのresolution state、action
