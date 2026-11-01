@@ -7,3 +7,6 @@ publish.workspace = true
 
 [dependencies]
 ruster-io-xdp = { path = "../io-xdp" }
+
+[dev-dependencies]
+ruster-io-xdp = { path = "../io-xdp", features = ["test-hooks"] }

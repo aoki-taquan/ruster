@@ -383,3 +383,59 @@ fn assert_partition(ledger: &FrameLedger) {
     assert_eq!(ledger.counts().total(), ledger.frame_count());
     ledger.deep_audit().expect("deep audit");
 }
+
+#[test]
+fn kernel_fill_quarantine_is_exact_and_permanent() {
+    let mut ledger = ledger(41, 2);
+    let token = ledger.reserve_fill(0).expect("fill reserve");
+    // Only a kernel-owned Fill frame can be quarantined.
+    assert!(matches!(
+        ledger.quarantine_kernel_fill(token),
+        Err(crate::LedgerError::WrongState {
+            expected: FrameStateKind::FillOwnedByKernel,
+            actual: FrameStateKind::FillReserved,
+            ..
+        })
+    ));
+    assert_state_and_partition(&ledger, 0, FrameStateKind::FillReserved);
+    ledger.publish_fill(token).expect("fill publish");
+    ledger.quarantine_kernel_fill(token).expect("quarantine");
+    assert_state_and_partition(&ledger, 0, FrameStateKind::Quarantined);
+    assert_eq!(ledger.state(0).expect("frame").token(), Some(token));
+    assert_eq!(ledger.counts().get(FrameStateKind::Quarantined), 1);
+    // The same token cannot act again, and the frame never re-enters a cycle.
+    assert!(ledger.quarantine_kernel_fill(token).is_err());
+    assert!(ledger.recycle_lease(token).is_err());
+    assert!(ledger.reserve_fill(0).is_err());
+    assert_state_and_partition(&ledger, 0, FrameStateKind::Quarantined);
+
+    // A foreign token never quarantines a frame of this ledger.
+    let mut other = self::ledger(42, 2);
+    let foreign = other.reserve_fill(1).expect("foreign reserve");
+    other.publish_fill(foreign).expect("foreign publish");
+    let mine = ledger.reserve_fill(1).expect("fill reserve");
+    ledger.publish_fill(mine).expect("fill publish");
+    assert_eq!(
+        ledger.quarantine_kernel_fill(foreign),
+        Err(crate::LedgerError::ForeignTokenDomain)
+    );
+    assert_state_and_partition(&ledger, 1, FrameStateKind::FillOwnedByKernel);
+}
+
+#[test]
+fn kernel_fill_release_frees_the_frame_for_a_new_cycle() {
+    let mut ledger = ledger(43, 1);
+    let token = ledger.reserve_fill(0).expect("fill reserve");
+    assert!(
+        ledger.release_kernel_fill(token).is_err(),
+        "not yet published"
+    );
+    ledger.publish_fill(token).expect("fill publish");
+    ledger.release_kernel_fill(token).expect("release");
+    assert_state_and_partition(&ledger, 0, FrameStateKind::Free);
+    // The released token is dead; the next cycle has a new generation.
+    assert!(ledger.release_kernel_fill(token).is_err());
+    let next = ledger.reserve_fill(0).expect("new cycle");
+    assert_eq!(next.generation().get(), token.generation().get() + 1);
+    assert_state_and_partition(&ledger, 0, FrameStateKind::FillReserved);
+}

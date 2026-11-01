@@ -7,19 +7,26 @@
 #![doc = "mappings, `sockaddr_xdp` bind, and `XDP_OPTIONS` mode check."]
 #![doc = "[`NativeSession::attach_xdp`] then redirects the bound queue to the socket with a"]
 #![doc = "hand-assembled XDP program, an XSKMAP, and an unpinned `bpf_link` (Linux 5.9+),"]
-#![doc = "refusing any interface that already has an XDP program. Packet I/O and core"]
-#![doc = "`PacketIo` integration remain unimplemented."]
+#![doc = "refusing any interface that already has an XDP program. [`RxFillEngine`] runs"]
+#![doc = "the RX/Fill half of the datapath over the session (or heap) memory: bounded Fill"]
+#![doc = "refill with starvation accounting, validated RX descriptors, and ledger-gated"]
+#![doc = "frame lending. TX/Completion and core `PacketIo` integration remain unimplemented."]
 
 mod config;
+mod datapath;
 mod error;
 mod platform;
 mod ring;
+mod rx_fill;
 mod session;
 mod xdp_program;
 
 #[path = "native_unsafe/abi.rs"]
 pub mod abi;
 mod native_unsafe {
+    #[cfg(test)]
+    #[path = "heap_kernel.rs"]
+    pub(super) mod heap_kernel;
     #[path = "mmap.rs"]
     pub(super) mod mmap;
     #[path = "ring_mem.rs"]
@@ -46,6 +53,8 @@ mod native_unsafe {
     ))]
     #[path = "syscall.rs"]
     pub(super) mod syscall;
+    #[path = "umem.rs"]
+    pub(super) mod umem;
 }
 
 pub use config::{
@@ -53,6 +62,7 @@ pub use config::{
     ValidatedBindFlags, MIN_VISIBLE_FRAME_CAPACITY, SUPPORTED_ALIGNED_CHUNK_SIZES,
     XDP_PACKET_HEADROOM,
 };
+pub use datapath::{DatapathError, DatapathRings, RingsError};
 pub use ruster_io_xdp::native_profile::ConfigError;
 
 pub use error::{
@@ -70,6 +80,11 @@ pub use ring::{
     CompletionAcquisition, CompletionConsumer, FillProducer, FillReservation, NeedWakeup,
     ProducerPublication, RxAcquisition, RxConsumer, TxProducer, TxReservation,
 };
+pub use ruster_io_xdp::{AuditError, FrameId, FrameStateKind, LedgerError, UmemDomainId};
+pub use rx_fill::{
+    RefillReport, RxBatch, RxFillAuditError, RxFillConfig, RxFillCounters, RxFillEngine,
+    RxFillError, RxFillSetupError, RxFrame, RxInvalidReason, TxHandoff, ETHERNET_HEADER_LEN,
+};
 pub use session::{
     AttachError, AttachFailure, AttachStage, CleanupError, CleanupStage, NativeRings,
     NegotiatedMode, SessionConfig, SessionConfigError, SessionError, SessionFailure, SessionStage,
@@ -77,5 +92,7 @@ pub use session::{
     MAX_RING_HEADER_OFFSET,
 };
 
+#[cfg(test)]
+mod rx_fill_tests;
 #[cfg(test)]
 mod tests;

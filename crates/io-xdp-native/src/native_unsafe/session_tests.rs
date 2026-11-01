@@ -1762,3 +1762,52 @@ fn native_xdp_detach_failures_never_retry_or_leak() {
         fake.assert_released();
     }
 }
+
+#[test]
+fn native_session_datapath_is_taken_once_and_excludes_raw_rings() {
+    use std::num::{NonZeroU128, NonZeroU32};
+
+    use super::session::DatapathAccess;
+    use crate::{DatapathError, RingsError, RxFillConfig, RxFillEngine, UmemDomainId};
+
+    let fake = SessionFake::new();
+    {
+        let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("session opens");
+        assert_eq!(session.datapath_access(), DatapathAccess::Untouched);
+        {
+            let datapath = session.take_datapath().expect("first take");
+            assert_eq!(datapath.capacities(), [64, 128, 64, 256]);
+            let engine = RxFillEngine::new(
+                datapath,
+                UmemDomainId::new(NonZeroU128::new(0x5310).expect("nonzero")),
+                RxFillConfig::new(NonZeroU32::new(64).expect("nonzero")),
+            )
+            .expect("engine over the session's real arena mappings");
+            assert_eq!(engine.initial_refill().published(), 64);
+            engine.audit().expect("engine audit");
+        }
+        // The engine is gone, but the kernel may hold what it published:
+        // neither a second bundle nor raw views are ever lent again.
+        assert_eq!(session.datapath_access(), DatapathAccess::Taken);
+        assert!(matches!(
+            session.take_datapath(),
+            Err(DatapathError::AlreadyTaken)
+        ));
+        assert!(matches!(session.rings(), Err(RingsError::DatapathTaken)));
+        session.close().expect("teardown");
+    }
+    {
+        let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("session opens");
+        // Raw views could publish frames no ledger tracks.
+        let _ = session.rings().expect("raw views");
+        assert_eq!(session.datapath_access(), DatapathAccess::RawLent);
+        assert!(matches!(
+            session.take_datapath(),
+            Err(DatapathError::RawRingsLent)
+        ));
+        let _ = session.rings().expect("raw views stay available");
+        session.close().expect("teardown");
+    }
+    assert_eq!(fake.live_mappings(), 0);
+    assert_eq!(fake.open_fds.get(), 0);
+}
