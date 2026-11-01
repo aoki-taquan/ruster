@@ -165,6 +165,7 @@ pub enum DropReason {
     ArpEthernetDestinationZero = 143,
     ArpEthernetDestinationMulticast = 144,
     Ipv4SourceLocalAddress = 145,
+    Icmpv4EchoDisabled = 146,
 }
 
 use DropReason::*;
@@ -172,7 +173,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 145] = [
+    pub const ALL: [Self; 146] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -318,6 +319,7 @@ impl DropReason {
         ArpEthernetDestinationZero,
         ArpEthernetDestinationMulticast,
         Ipv4SourceLocalAddress,
+        Icmpv4EchoDisabled,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -480,6 +482,7 @@ impl DropReason {
             ArpEthernetDestinationZero => "ARP_ETHERNET_DESTINATION_ZERO",
             ArpEthernetDestinationMulticast => "ARP_ETHERNET_DESTINATION_MULTICAST",
             Ipv4SourceLocalAddress => "IPV4_SOURCE_LOCAL_ADDRESS",
+            Icmpv4EchoDisabled => "ICMPV4_ECHO_DISABLED",
         }
     }
 }
@@ -508,6 +511,7 @@ pub enum SnapshotError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ipv4OriginPolicy {
     default_ttl: u8,
+    echo_reply: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -521,18 +525,44 @@ impl Ipv4OriginPolicy {
         if default_ttl == 0 {
             return Err(Ipv4OriginPolicyError::DefaultTtlZero);
         }
-        Ok(Self { default_ttl })
+        Ok(Self {
+            default_ttl,
+            echo_reply: true,
+        })
     }
 
     #[must_use]
     pub const fn default_ttl(self) -> u8 {
         self.default_ttl
     }
+
+    /// Returns this policy with the local Echo responder enabled or disabled.
+    ///
+    /// RFC 1812 §4.3.3.6 asks for an option to silently ignore all Echo
+    /// Requests that defaults to answering them. When disabled, a valid Echo
+    /// Request to a router address is dropped as
+    /// [`DropReason::Icmpv4EchoDisabled`] without any reply.
+    #[must_use]
+    pub const fn with_echo_reply(self, enabled: bool) -> Self {
+        Self {
+            echo_reply: enabled,
+            ..self
+        }
+    }
+
+    /// Whether valid Echo Requests to a router address are answered.
+    #[must_use]
+    pub const fn echo_reply(self) -> bool {
+        self.echo_reply
+    }
 }
 
 impl Default for Ipv4OriginPolicy {
     fn default() -> Self {
-        Self { default_ttl: 64 }
+        Self {
+            default_ttl: 64,
+            echo_reply: true,
+        }
     }
 }
 
@@ -939,7 +969,13 @@ fn calculate_snapshot_authority(
             hash = mix(hash, u64::from(octet));
         }
     }
-    mix(hash, u64::from(ipv4_origin.default_ttl())) & !VALIDATED_OWNER_AUTHORITY_BIT
+    hash = mix(hash, u64::from(ipv4_origin.default_ttl()));
+    // Mixed only when non-default so existing publications keep their
+    // authority values.
+    if !ipv4_origin.echo_reply() {
+        hash = mix(hash, 0xec);
+    }
+    hash & !VALIDATED_OWNER_AUTHORITY_BIT
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4675,6 +4711,9 @@ fn decide_icmpv4_error<T: TraceSink>(
     now: MonotonicMillis,
     trace: &mut T,
 ) -> Icmpv4ErrorDisposition {
+    if !runtime.policy().generates(kind) {
+        return runtime.record_suppression(Icmpv4ErrorDisposition::GenerationDisabled { kind });
+    }
     if !runtime.observe_decision(now) {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::ClockRegression);
     }
@@ -4996,6 +5035,10 @@ fn decide_local_ipv4<T: TraceSink>(
     }
     if frame.get(0..6) != Some(interface.mac.0.as_slice()) {
         return Err(Icmpv4EthernetDestinationNotLocal);
+    }
+    if !snapshot.ipv4_origin.echo_reply() {
+        // RFC 1812 §4.3.3.6 operator option: silently ignore Echo Requests.
+        return Err(Icmpv4EchoDisabled);
     }
     let old_icmp_checksum =
         packet::read_u16(frame, icmp_offset + 2).ok_or(Icmpv4HeaderTruncated)?;
@@ -5452,12 +5495,12 @@ mod tests {
         assert_eq!(
             format!("{first_snapshot:?}"),
             "ForwardingSnapshot { routes_len: 0, interfaces_len: 0, neighbors_len: 0, \
-             local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64 }, .. }"
+             local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64, echo_reply: true }, .. }"
         );
         assert_eq!(
             format!("{first:?}"),
             "ValidatedForwardingOwner { routes_len: 0, interfaces_len: 0, neighbors_len: 0, \
-             local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64 }, .. }"
+             local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64, echo_reply: true }, .. }"
         );
     }
 
@@ -6157,6 +6200,7 @@ mod tests {
             (143, "ARP_ETHERNET_DESTINATION_ZERO"),
             (144, "ARP_ETHERNET_DESTINATION_MULTICAST"),
             (145, "IPV4_SOURCE_LOCAL_ADDRESS"),
+            (146, "ICMPV4_ECHO_DISABLED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -6166,7 +6210,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(146), None);
+        assert_eq!(DropReason::from_code(147), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

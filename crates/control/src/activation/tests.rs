@@ -1009,8 +1009,9 @@ fn check_successor_is_a_side_effect_free_dry_run_that_predicts_apply() {
 #[test]
 fn plan_restart_classification_matches_live_apply_rejection() {
     use crate::plan::tests::{
-        config, ICMPV4_POLICY_CHANGE, INTERFACE_CHANGE, PORT_CHANGE, PORT_SHIFT,
-        RESOLUTION_POLICY_CHANGE, ROUTE_CHANGE, SHAPE_CHANGE,
+        config, ECHO_REPLY_CHANGE, ICMPV4_GENERATION_CHANGE, ICMPV4_POLICY_CHANGE,
+        INTERFACE_CHANGE, PORT_CHANGE, PORT_SHIFT, RESOLUTION_POLICY_CHANGE, ROUTE_CHANGE,
+        SHAPE_CHANGE,
     };
     use crate::{ApplyPlan, PublicationSequencer};
 
@@ -1027,6 +1028,7 @@ fn plan_restart_classification_matches_live_apply_rejection() {
         &[PORT_CHANGE],
         &[RESOLUTION_POLICY_CHANGE],
         &[ICMPV4_POLICY_CHANGE],
+        &[ICMPV4_GENERATION_CHANGE],
         &[INTERFACE_CHANGE],
         &[INTERFACE_CHANGE, ICMPV4_POLICY_CHANGE],
         &[INTERFACE_CHANGE, RESOLUTION_POLICY_CHANGE, SHAPE_CHANGE],
@@ -1047,8 +1049,9 @@ fn plan_restart_classification_matches_live_apply_rejection() {
     }
 
     // No restart reason: the dry-run and the apply both succeed. A
-    // same-size NAT port pool shift keeps the storage shape and reloads.
-    let next = config(&[ROUTE_CHANGE, PORT_SHIFT]);
+    // same-size NAT port pool shift keeps the storage shape and reloads, and
+    // so does the Echo responder switch.
+    let next = config(&[ROUTE_CHANGE, PORT_SHIFT, ECHO_REPLY_CHANGE]);
     let successor = sequencer.candidate(&next).unwrap();
     let plan = ApplyPlan::for_active(&mut active, &current, &next, &successor).unwrap();
     assert!(!plan.requires_restart());

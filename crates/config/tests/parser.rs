@@ -431,3 +431,80 @@ fn assert_list_at_limit(field: &str, item: &str, limit: usize, prefix: &str) {
         "{field} must accept exactly {limit} entries"
     );
 }
+
+#[test]
+fn icmpv4_generation_switches_default_on_and_are_exact() {
+    let VersionedConfig::V1(config) = parse(VALID_V1.as_bytes()).unwrap() else {
+        panic!("schema version 1");
+    };
+    // Omitted switches are the RFC behavior.
+    assert!(config.ipv4_origin.unwrap().echo_reply);
+    let generate = config.icmpv4_errors.unwrap().generate;
+    assert!(generate.time_exceeded && generate.net_unreachable && generate.host_unreachable);
+    assert_eq!(generate, ruster_config::Icmpv4ErrorGenerateV1::default());
+
+    let explicit = VALID_V1
+        .replacen(
+            "default-ttl = 64\n",
+            "default-ttl = 64\necho-reply = false\n",
+            1,
+        )
+        .replacen(
+            "[icmpv4-errors.capacity]",
+            "[icmpv4-errors.generate]\ntime-exceeded = false\nhost-unreachable = false\n\n\
+             [icmpv4-errors.capacity]",
+            1,
+        );
+    let VersionedConfig::V1(config) = parse(explicit.as_bytes()).unwrap() else {
+        panic!("schema version 1");
+    };
+    assert!(!config.ipv4_origin.unwrap().echo_reply);
+    let generate = config.icmpv4_errors.unwrap().generate;
+    assert_eq!(
+        (
+            generate.time_exceeded,
+            generate.net_unreachable,
+            generate.host_unreachable
+        ),
+        (false, true, false)
+    );
+
+    for (needle, replacement, code) in [
+        (
+            "[icmpv4-errors.capacity]",
+            "[icmpv4-errors.generate]\nredirect = false\n\n[icmpv4-errors.capacity]",
+            DiagnosticCode::UnknownField,
+        ),
+        (
+            "[icmpv4-errors.capacity]",
+            "[icmpv4-errors.generate]\ntime-exceeded = \"no\"\n\n[icmpv4-errors.capacity]",
+            DiagnosticCode::InvalidType,
+        ),
+        (
+            "default-ttl = 64\n",
+            "default-ttl = 64\necho-reply = 0\n",
+            DiagnosticCode::InvalidType,
+        ),
+    ] {
+        let diagnostic = parse(VALID_V1.replacen(needle, replacement, 1).as_bytes()).unwrap_err();
+        assert_eq!(diagnostic.code(), code, "{replacement}");
+    }
+    let wrong_type = parse(
+        VALID_V1
+            .replacen(
+                "[icmpv4-errors.capacity]",
+                "[icmpv4-errors.generate]\nnet-unreachable = 1\n\n[icmpv4-errors.capacity]",
+                1,
+            )
+            .as_bytes(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        wrong_type.path().segments(),
+        &[
+            PathSegment::Field("icmpv4-errors".to_owned()),
+            PathSegment::Field("generate".to_owned()),
+            PathSegment::Field("net-unreachable".to_owned()),
+        ]
+    );
+}

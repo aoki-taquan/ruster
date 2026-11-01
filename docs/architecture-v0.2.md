@@ -293,6 +293,35 @@ queueし、RX batch終了後のgenerated sessionで送信します。kindはFIFO
 traceまでtypedに保持し、action FIFOとper-egress rate stateは両kindで共有します。
 worker-localであり、共有lock、packet clone、backend buffer pointerを持ちません。
 
+### router-originated ICMPv4 inventoryとoperator switch
+
+routerが自身の名前で生成または応答するICMPv4は次の4 classだけです（NAT44のType 3/Code 4は
+受信errorのtranslationで生成ではなく、`nat44.*.icmpv4-errors`で別途opt-inします）。owner方針
+（2026-11-01）により既定値はすべてRFC動作で、security上offにしたい運用者向けにclassごとの
+switchを持ちます。RFC 1812 §1.1.3は、default設定がRFC準拠である限り、SHOULDに反するoption
+およびMUSTに反するoption（明示的に禁止された場合を除く）を許します。
+
+| class | 生成条件 | RFC要件 | switch（default） | off時 | 変更の分類 |
+|---|---|---|---|---|---|
+| Echo Reply（Type 0） | router addressへの有効なEcho Request | RFC 1812 §4.3.3.6 MUST implement、無視optionはSHOULD提供かつMUST default応答。RFC 1122 §3.2.2.6 MUST | `[ipv4-origin] echo-reply`（`true`） | 全validation後に`ICMPV4_ECHO_DISABLED`でbyte不変drop | reloadable（`Ipv4OriginPolicy`、`default-ttl`と同じ） |
+| Time Exceeded（Type 11/Code 0） | route hitでTTL 0/1 | RFC 1812 §5.3.1 MUST | `[icmpv4-errors.generate] time-exceeded`（`true`） | `IPV4_TTL_EXPIRED`のまま、`icmpv4_errors.disabled_time_exceeded` | restart-required（`Icmpv4ErrorPolicy`） |
+| Destination Unreachable Network（Type 3/Code 0） | LPM miss（firewall有効時はegress-free permitのみ） | RFC 1812 §§4.3.3.1, 5.2.7.1 MUST | `net-unreachable`（`true`） | `ROUTE_MISS`/`FIREWALL_ROUTE_UNAVAILABLE`のまま、`icmpv4_errors.disabled_destination_unreachable` | restart-required |
+| Destination Unreachable Host（Type 3/Code 1） | direct targetのfruitless ARP | RFC 1812 §5.2.7.1（MUST be able to generate、最も近いcodeをSHOULD） | `host-unreachable`（`true`） | holdをreverse route/reverse ARP前にretire、`icmpv4_errors.disabled_host_unreachable`と`ResolutionFailureCounters::generation_disabled` | restart-required |
+
+security上の理由は、Echoがhost discovery、Time Exceededがtraceroute topology disclosure、
+Network Unreachableがroute table probing、Host UnreachableがLAN host enumerationに使えることです。
+rate limit（RFC 1812 §4.3.2.8のSHOULD settable）は既存の`interval-ms`/`state-ttl-ms`で、switchは
+limiterを変更しません。disabled kindは`decide_icmpv4_error`先頭（および`schedule`と
+failure dispatch）で判定し、clock watermark、per-egress limiter state、reverse LPM、reverse ARPに
+触れずcounterだけを加算するため、他kindのrate limitを消費しません。Host Unreachableのfailure holdは
+switchに関係なくcaptureし（ARP miss時のfixed slotへのbounded copy）、ARPが実際に失敗した時点で
+retireして数えます。captureをskipするとARP成否が未定の時点で数えるか、数えられなくなるためです。switchは公開runtimeの
+`Copy` policyに入ったbit/boolの読み出しだけで、allocation、lock、packet cloneを伴いません。
+error switchの変更はinterval等と同じ`Icmpv4ErrorPolicy`の変更としてrestart-required
+（`RestartRequired::Icmpv4ErrorPolicy`）、Echo switchは`Ipv4OriginPolicy`の変更として通常reload
+（全reloadと同じflushを伴う）です。snapshot authorityへはEcho switchがdefaultでない場合だけmixし、
+既存publicationのauthority値を変えません。
+
 Code 1はconnected routeのdirect targetだけが対象です。failure holdはresolution state/action
 とは別のfixed sliceで、`{egress,target,generation}` token、元source/destination/TOS、
 forward authority、最大548-byte quoteだけを持ちます。packet lease、Ethernet header、
@@ -776,12 +805,24 @@ DF=0 UDP/53はroute有りならsilent、route無しならICMPになります。�
 にいて有効なDF=1 trafficで同じroute有無を知ることができ、firewallなしの経路にも同じ非対称が
 あり、生成errorはper-egress rate limiterで抑えられるためです。
 
-残るdeviation: egress-free評価はestablished stateを参照せず新規flowとして判定するため、
-routeが撤去された後の既存flowのpacket（例: established TCPのACK、許可ruleがegress限定の
-flowのUDP）はsilentな`FirewallRouteUnavailable`で、firewallなしの経路やRFC 1812 §5.2.7.1の
-MUSTと異なりNetwork Unreachableを返しません（FW-025）。これはtracked deviationで、ownerの
-RFC準拠を基準とする方針（2026-11-01）のもと、security上の挙動を設定可能にする要求とあわせて
-別PRで再検討します。
+残るdeviation: routeが撤去された後の既存flowのpacket（例: established TCPのACK、許可ruleが
+egress限定のflowのUDP）はsilentな`FirewallRouteUnavailable`で、firewallなしの経路やRFC 1812
+§5.2.7.1のMUSTと異なりNetwork Unreachableを返しません（FW-025）。2026-11-01にRFC準拠を基準として
+再評価し、次の理由でdeviationを維持しました。
+
+- routeはconfig publicationでしか変わらず、すべてのpublicationは新generationとfirewall hash key
+  rotationで全flowをflushします。route missの時点で「撤去前のflow」のstateは存在しないため、
+  established lookup（egress非依存にinterfaceごとprobeする等）を加えてもhitせず、効果がありません。
+- 同じreloadの後にrouteが残っていても、そのpacketはstateなしの新規attemptとしてfirewallにsilent
+  dropされます（TCP ACKなら`FirewallTcpInvalidInitialFlags`）。route missの場合だけerrorを返すと
+  route有無が外から観測でき、上記のroute oracleを再び開きます。
+- egress限定allowで許可されていたUDPをadmitするには撤去前routeのegressを知る必要がありますが、
+  routerはそれを保持せず、推測でadmitすると拒否宛先空間のroute有無が漏れます。
+
+解消には、flowを保ったままrouteを変えるpublication（動的routing等）と、それに合わせたstate
+参照が前提になるため、そのsliceで再検討します。RFC動作が必要なtrafficはegress `Any`のallow
+ruleでegress-free評価をpermitにでき、逆にroute-miss errorを全体に止めたい場合は
+`net-unreachable = false`を使えます。
 
 full compositionでもfirewall authorizationはTTL判定とgenerated error captureより先です。
 rule/default deny、runtime/config/snapshot authority failure、上記egress-free評価でdenyされた
@@ -1059,7 +1100,10 @@ private `signal` moduleだけで、crateは`#![deny(unsafe_code)]`です。
   cold側`Vec<u8>`を確保します）。
 - firewall有効時のroute missは、egress-free評価で許可されegress依存のNAT gateにも当たらない
   packetだけにDestination Unreachable Networkを返します。route撤去後の既存flowのpacketは
-  silentです（RFC 1812 §5.2.7.1からのtracked deviation、FW-025。RFC準拠を基準に別PRで再検討）。
+  silentです（RFC 1812 §5.2.7.1からのtracked deviation、FW-025。全reloadがflowをflushするため
+  参照できるstateがなく、answerするとroute oracleになるため2026-11-01の再評価でも維持）。
+- router-originated ICMPv4の4 class（Echo Reply、Time Exceeded、Network/Host Unreachable）は
+  default onで、classごとにoffにできます（上記inventory）。
 - restart-requiredのapplyはrun-sim内でrejectとして報告し、storageを作り直しません（SIM-016）。
   generation/key履歴はprocess内だけです。
 - NAT/FW占有、resolution/action/audit high-watermark、native ring saturationは未実装です

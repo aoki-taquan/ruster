@@ -37,6 +37,9 @@ mac = "02:00:00:00:00:10"
 
 [ipv4-origin]
 default-ttl = 64
+# RFC 1812 §4.3.3.6 option; `false` silently drops Echo Requests to router
+# addresses (ICMPV4_ECHO_DISABLED). Reloadable. Default true.
+echo-reply = true
 
 [resolution.policy]
 interval-ms = 1000
@@ -57,6 +60,15 @@ state-ttl-ms = 60000
 [icmpv4-errors.capacity]
 states = 8
 actions = 8
+
+# Per-kind generation switches (RFC 1812 §1.1.3 options whose default is the
+# RFC behavior). `false` drops the class silently and counts it as
+# icmpv4_errors.disabled_*. Part of the restart-required ICMPv4 error policy.
+# Every key and the table itself are optional and default to true.
+[icmpv4-errors.generate]
+time-exceeded = true
+net-unreachable = true
+host-unreachable = true
 
 [nat44.realm]
 inside = "lan"

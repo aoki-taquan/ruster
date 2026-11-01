@@ -131,6 +131,24 @@ staticまたはfresh dynamic neighborが無い場合はARPだけを開始し、�
 しません。generated outer IPv4は576 bytes以下、quoteは受信時IPv4 bytesを最大548 bytes
 所有し、link paddingを含みません。
 
+routerが自身で生成するICMPv4（Echo Reply、Time Exceeded、Destination Unreachable
+Network/Host）はすべてdefaultでRFC 1812どおり生成し、security上の理由でclassごとにoffに
+できます（RFC 1812 §1.1.3はdefaultが準拠するoptionを許す）。offにしたerror class
+（Time Exceeded、Network/Host Unreachable）は元packetのbyte不変drop reasonを変えず、ICMPも
+reverse ARPも生成せず、rate limiterとclockにも触れずに専用counterだけを加算します。Echoをoffに
+すると、valid Echo Requestは新しいreason `ICMPV4_ECHO_DISABLED`でdropされます。
+
+```toml
+[ipv4-origin]
+default-ttl = 64
+echo-reply = true          # false: Echo Requestを ICMPV4_ECHO_DISABLED でdrop（reload可能）
+
+[icmpv4-errors.generate]   # table/keyとも省略可能、default true。変更はrestart-required
+time-exceeded = true       # Type 11/Code 0  -> icmpv4_errors.disabled_time_exceeded
+net-unreachable = true     # Type 3/Code 0   -> icmpv4_errors.disabled_destination_unreachable
+host-unreachable = true    # Type 3/Code 1   -> icmpv4_errors.disabled_host_unreachable
+```
+
 EtherTypeを読んだ直後、IPv4/ARPはsnapshot上の正確なingress interfaceを解決し、
 Ethernet sourceのzero/broadcast/multicastをstableなtyped reasonでbyte不変dropします。
 IPv4 destinationはそのingress interface MACとの完全一致を要求し、ARP destinationだけは

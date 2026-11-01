@@ -5,13 +5,13 @@ use ruster_core::{
     FirewallConfigError, FirewallInterface, FirewallIpv4Prefix, FirewallIpv4PrefixError,
     FirewallPolicy, FirewallPolicyError, FirewallPortRange, FirewallPortRangeError,
     FirewallProtocol, FirewallRule, FirewallRuleId, FirewallStateSlot, ForwardingSnapshot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, Icmpv4ErrorStateSlot, IfId,
-    Interface, Ipv4Address, Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding, MacAddress,
-    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpMappingSlot,
-    Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpConfigError,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor,
-    PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy,
-    ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError,
+    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4OriginPolicy, Ipv4OriginPolicyError,
+    LocalIpv4Binding, MacAddress, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError,
+    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44UdpConfig,
+    Nat44UdpConfigError, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
+    Nat44UdpPolicyError, Neighbor, PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot,
+    ResolutionPolicy, ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
 };
 
 use crate::{
@@ -869,12 +869,14 @@ fn validate_v1(
     }
 
     let ipv4_origin = match config.ipv4_origin {
-        Some(source) => Ipv4OriginPolicy::new(source.default_ttl).map_err(|error| {
-            ValidationError::new(
-                ValidationCode::Ipv4Origin(error),
-                path(&["ipv4-origin", "default-ttl"]),
-            )
-        })?,
+        Some(source) => Ipv4OriginPolicy::new(source.default_ttl)
+            .map_err(|error| {
+                ValidationError::new(
+                    ValidationCode::Ipv4Origin(error),
+                    path(&["ipv4-origin", "default-ttl"]),
+                )
+            })?
+            .with_echo_reply(source.echo_reply),
         None => Ipv4OriginPolicy::default(),
     };
 
@@ -943,14 +945,26 @@ fn validate_v1(
     let icmp_source = config.icmpv4_errors;
     let icmp_policy = icmp_source
         .map(|source| {
-            Icmpv4ErrorPolicy::new(source.policy.interval_ms, source.policy.state_ttl_ms).map_err(
-                |error| {
+            let generate = source.generate;
+            Icmpv4ErrorPolicy::new(source.policy.interval_ms, source.policy.state_ttl_ms)
+                .map(|policy| {
+                    policy
+                        .with_generation(Icmpv4ErrorKind::TimeExceededTtl, generate.time_exceeded)
+                        .with_generation(
+                            Icmpv4ErrorKind::DestinationUnreachableNetwork,
+                            generate.net_unreachable,
+                        )
+                        .with_generation(
+                            Icmpv4ErrorKind::DestinationUnreachableHost,
+                            generate.host_unreachable,
+                        )
+                })
+                .map_err(|error| {
                     ValidationError::new(
                         ValidationCode::Icmpv4ErrorPolicy(error),
                         path(&["icmpv4-errors", "policy"]),
                     )
-                },
-            )
+                })
         })
         .transpose()?;
 

@@ -45,6 +45,17 @@ pub(crate) const ICMPV4_POLICY_CHANGE: (&str, &str) = (
     "interval-ms = 100\nstate-ttl-ms = 60000",
     "interval-ms = 200\nstate-ttl-ms = 60000",
 );
+/// An ICMPv4 error generation switch is part of the restart-required policy.
+pub(crate) const ICMPV4_GENERATION_CHANGE: (&str, &str) = (
+    "[icmpv4-errors.capacity]",
+    "[icmpv4-errors.generate]\ntime-exceeded = false\n\n[icmpv4-errors.capacity]",
+);
+/// The Echo responder switch lives in the reloadable `ipv4-origin` policy
+/// (the default TTL is unchanged).
+pub(crate) const ECHO_REPLY_CHANGE: (&str, &str) = (
+    "[resolution.policy]",
+    "[ipv4-origin]\ndefault-ttl = 64\necho-reply = false\n\n[resolution.policy]",
+);
 pub(crate) const INTERFACE_CHANGE: (&str, &str) =
     ("mac = \"02:00:00:00:00:02\"", "mac = \"02:00:00:00:00:22\"");
 pub(crate) const PORT_CHANGE: (&str, &str) = ("last = 40015", "last = 40031");
@@ -248,11 +259,30 @@ fn plan_classifies_interface_shape_and_policy_changes_as_restart_required() {
         (SHAPE_CHANGE, RestartRequired::StorageShape),
         (RESOLUTION_POLICY_CHANGE, RestartRequired::ResolutionPolicy),
         (ICMPV4_POLICY_CHANGE, RestartRequired::Icmpv4ErrorPolicy),
+        (ICMPV4_GENERATION_CHANGE, RestartRequired::Icmpv4ErrorPolicy),
     ] {
         let plan = plan(&[edit]);
         only(&plan, &["restart"]);
         assert_eq!(plan.restart_required(), [reason]);
     }
+
+    // The Echo responder switch is a reloadable ipv4-origin change, and
+    // spelling out every default switch is no change at all.
+    only(&plan(&[ECHO_REPLY_CHANGE]), &["ipv4_origin"]);
+    only(
+        &plan(&[
+            (
+                "[icmpv4-errors.capacity]",
+                "[icmpv4-errors.generate]\ntime-exceeded = true\nnet-unreachable = true\n\
+                 host-unreachable = true\n\n[icmpv4-errors.capacity]",
+            ),
+            (
+                "[resolution.policy]",
+                "[ipv4-origin]\ndefault-ttl = 64\necho-reply = true\n\n[resolution.policy]",
+            ),
+        ]),
+        &[],
+    );
 
     // Every reason is listed, in successor validation order.
     let all = plan(&[

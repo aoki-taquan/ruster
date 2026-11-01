@@ -261,6 +261,12 @@ exit criteria:
   - route撤去後の既存flowのpacketがsilentな点（FW-025）はtracked deviationとして残し、
     RFC準拠を基準に別PRで再検討する。security上offにしたい挙動を設定可能にする要求
     （ownerの同日決定）も同じ別PRで扱う。
+  - 補足（2026-11-01、上記の別PRで実装）: router-originated ICMPv4の4 classに
+    default onのswitchを追加した（`[ipv4-origin] echo-reply`はreloadable、
+    `[icmpv4-errors.generate]`の`time-exceeded`/`net-unreachable`/`host-unreachable`は
+    ICMPv4 error policyとしてrestart-required）。FW-025は再評価の結果deviationを維持した:
+    全reloadがfirewall flowをflushするため撤去前flowのstateは存在せず、route missだけ
+    answerするとroute oracleになる（理由はarchitecture、ledger FW-025）。
 - R17の数値thresholdはimplementerがPRで提案し、ownerがそのPRで承認する。
 - NAT/FW占有のhigh-watermarkはM2へ延期する。
   - 補足（S4実装による明確化。owner確認待ち）: R15/Operability minimumのresolution state、action

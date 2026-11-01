@@ -403,6 +403,9 @@ pub struct ResolutionFailureCounters {
     pub queued: usize,
     pub retained_transient: usize,
     pub retired_permanent: usize,
+    /// Holds retired because the ICMPv4 error policy disables Host
+    /// Unreachable generation; no reverse ARP or action was attempted.
+    pub generation_disabled: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -455,6 +458,9 @@ pub enum ResolutionFailureTrace {
         forward: ResolutionGenerationToken,
     },
     ForwardAuthorityLost {
+        forward: ResolutionGenerationToken,
+    },
+    GenerationDisabled {
         forward: ResolutionGenerationToken,
     },
     ClockRegression,
@@ -1781,6 +1787,14 @@ pub fn dispatch_host_unreachable_failures<T: ResolutionFailureTraceSink>(
                     forward: hold.forward,
                 });
             }
+            FailureDispatch::GenerationDisabled => {
+                resolution.clear_failure_hold(index);
+                resolution.failure_counters.generation_disabled += 1;
+                report.retired += 1;
+                trace.record_resolution_failure(ResolutionFailureTrace::GenerationDisabled {
+                    forward: hold.forward,
+                });
+            }
             FailureDispatch::AuthorityLost => {
                 resolution.clear_failure_hold(index);
                 resolution.failure_counters.retired_permanent += 1;
@@ -1804,6 +1818,7 @@ enum FailureDispatch {
     Retain(Icmpv4ErrorDisposition),
     ReverseFailed(ResolutionGenerationToken),
     SameFailedKey,
+    GenerationDisabled,
     AuthorityLost,
 }
 
@@ -1851,6 +1866,17 @@ fn dispatch_one_failure(
     }
     if !current_icmp_error_eligible(snapshot, hold) {
         return FailureDispatch::AuthorityLost;
+    }
+    if !icmpv4_errors
+        .policy()
+        .generates(Icmpv4ErrorKind::DestinationUnreachableHost)
+    {
+        // Retire before the reverse route or reverse ARP: a disabled kind
+        // emits nothing on the wire.
+        icmpv4_errors.record_suppression(Icmpv4ErrorDisposition::GenerationDisabled {
+            kind: Icmpv4ErrorKind::DestinationUnreachableHost,
+        });
+        return FailureDispatch::GenerationDisabled;
     }
 
     let Some(reverse_route) = crate::route::lookup(snapshot.routes, hold.original_source) else {
