@@ -718,19 +718,24 @@ fn plan_text_renders_the_tcp_inbound_limit_as_a_reloadable_typed_delta() {
         .unwrap();
         path
     };
-    let unlimited = with("tcp-unlimited.toml", "0");
+    let eight = with("tcp-eight.toml", "8");
     let four = with("tcp-four.toml", "4");
     let current = fixtures().join("router-v1.toml");
     for (from, to, line) in [
         (
             &current,
-            &unlimited,
-            "  nat44-tcp inbound-sessions-per-remote ~ 8 -> unlimited\n",
+            &eight,
+            "  nat44-tcp inbound-sessions-per-remote ~ unlimited -> 8\n",
         ),
         (
-            &unlimited,
+            &eight,
             &four,
-            "  nat44-tcp inbound-sessions-per-remote ~ unlimited -> 4\n",
+            "  nat44-tcp inbound-sessions-per-remote ~ 8 -> 4\n",
+        ),
+        (
+            &four,
+            &current,
+            "  nat44-tcp inbound-sessions-per-remote ~ 4 -> unlimited\n",
         ),
     ] {
         let plan = ruster(&["plan".as_ref(), from.as_os_str(), to.as_os_str()]);

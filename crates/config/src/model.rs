@@ -258,8 +258,9 @@ pub struct Nat44TcpV1 {
     pub hairpinning: bool,
     /// Limit on live sessions that external inbound initial SYNs created on
     /// one mapping from one remote IPv4 address; `0` means no limit. Absent
-    /// means 8. A local security policy (RFC 5382 §9), validated to at most
-    /// 16 (the bounded inbound chain walk).
+    /// means 0: closed connections count until the idle TTL, so a limit is
+    /// an opt-in local security policy. Validated to at most 16 (the
+    /// bounded inbound chain walk).
     #[serde(default = "default_inbound_sessions_per_remote")]
     pub inbound_sessions_per_remote: u8,
     pub capacity: Nat44TcpCapacityV1,

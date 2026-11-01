@@ -243,7 +243,7 @@ filtering = "address-dependent"  # | "endpoint-independent" | "address-and-port-
 
 [nat44.tcp]
 filtering = "address-dependent"
-inbound-sessions-per-remote = 8  # 省略時8、0は無制限、最大16（reloadable）
+inbound-sessions-per-remote = 0  # 省略時0（無制限）。新規inboundを許可するなら8推奨、最大16（reloadable）
 ```
 
 | `filtering` | UDP inbound（live mapping必須） | TCP inbound（exact live sessionが無い場合） |
@@ -262,15 +262,19 @@ remote-address directoryの一回のbounded lookupで、このdirectory分だけ
 （M1 fixtureで448 bytes）。`endpoint-independent`とinbound新規flowを許可するfirewall ruleを
 組み合わせると、外部からのSYNがsession slotを2時間4分占有し得ます。defaultの`address-dependent`でも
 mappingが既に話しているremote address（CDNやDNS serverなど）を詐称したSYNなら同じことができ
-ます（NAT44-041）。これを`[nat44.tcp] inbound-sessions-per-remote`（default 8、`0`は無制限、
-最大16）が抑えます。外部initial SYNが一つのmappingに一つのremote IPv4から作ったlive sessionが
+ます（NAT44-041）。これをopt-inの`[nat44.tcp] inbound-sessions-per-remote`（default `0`は無制限、
+推奨8、最大16）が抑えます。外部initial SYNが一つのmappingに一つのremote IPv4から作ったlive sessionが
 上限数あれば、次のSYNはbyte不変の`NAT44_TCP_INBOUND_REMOTE_QUOTA_EXCEEDED`（counter
 `nat44_tcp.inbound_remote_quota_exceeded`）でdropし、stateを作らずevictもしません。outbound開始
 sessionとhairpinのinbound half（remoteがrouter自身の`P`）は数えません。数はstored counterでは
-なくlive slotから導くため、idle expiry、slot再利用、reconcileで自然に戻ります。RFC 5382 §9が
-ADFは同じaddressを名乗るsenderから完全には守らないと述べ、どのREQもfilterを通ったSYNの全受理を
-求めないため、MUSTに反しないlocal security policyです。`endpoint-independent`では詐称addressを
-変えれば`上限 × address数`まで残ります（per-mapping上限はdeferred、NAT44-058）。
+なくlive slotから導くため、idle expiry、slot再利用、reconcileで自然に戻ります。ただしFIN/RSTを
+追跡しないため、closeしたconnectionもidle TTL（2時間4分）まで数え、上限をdefaultにすると同じremoteから
+の短い再接続を数時間拒否し得ます。このためdefaultは無制限です（transitory/FIN-aware timerはNAT44-058）。
+chainの最初の16 nodeにある同じmapping/remoteのoutbound開始session分だけ実効上限は下がり（最大16は
+名目値）、上限が1以上だと16 nodeを超えるchainではADF単独なら許可したSYNも拒否します。どのREQも
+filterを通ったSYNの全受理を求めないため、MUSTに反しないlocal security policyです。
+`endpoint-independent`では詐称addressを変えれば`上限 × address数`まで残ります（per-mapping上限は
+deferred、NAT44-058）。
 firewall判定より前に走るinbound SYNのNAT側workは、session capacityに
 よらず`NAT44_TCP_INBOUND_SLOT_PROBES`（16）slot/chain nodeまでに上限されます。
 
@@ -413,7 +417,7 @@ $B run-sim --scenario fixtures/m1/scenario.toml --hold
   出ます。capacityやresolution/ICMP/NAT/firewall policyの変更はrestart理由（`STORAGE_SHAPE`等）
   または`changed` flagとしてだけ出し、fieldごとの値は出しません。例外はsecretでないNAT
   filtering、hairpinning、TCP inbound limitで、`nat44-tcp filtering ~ address-dependent -> endpoint-independent`、
-  `nat44-udp hairpinning ~ on -> off`、`nat44-tcp inbound-sessions-per-remote ~ 8 -> unlimited`の
+  `nat44-udp hairpinning ~ on -> off`、`nat44-tcp inbound-sessions-per-remote ~ unlimited -> 8`の
   ように値を出し、`policy ~ changed`はそれ以外のNAT policy変更だけを表します。interface labelは
   `[A-Za-z0-9._-]`以外を`\xNN`でescapeします（configも同じcharsetと15 bytes上限を要求）。
   `--format jsonl`は未実装です。

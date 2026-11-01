@@ -929,13 +929,14 @@ fn unsolicited_inbound_syn_is_silently_dropped_by_the_full_worker() {
     assert_eq!(tcp_nat.counters().inbound_sessions_created, 0);
 }
 
-/// NAT44-041: an off-path sender spoofing a remote address the mapping
-/// already talks to gets at most the default per-remote limit of sessions;
+/// NAT44-041: with the recommended opt-in limit of 8, an off-path sender
+/// spoofing a remote address the mapping already talks to gets at most 8
+/// sessions;
 /// every further SYN is a byte-unchanged typed drop that creates nothing, and
 /// the inside host keeps the remaining session capacity.
 #[test]
 fn spoofed_syns_are_capped_per_remote_and_inside_hosts_keep_capacity() {
-    use ruster_core::NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE as LIMIT;
+    const LIMIT: u8 = 8;
 
     let (routes, interfaces, neighbors, bindings) = topology();
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
@@ -943,8 +944,19 @@ fn spoofed_syns_are_capped_per_remote_and_inside_hosts_keep_capacity() {
         Nat44Filtering::EndpointIndependent,
         Nat44Filtering::AddressDependent,
     ] {
-        let config = tcp_config(&snapshot, filtering);
-        assert_eq!(config.policy().inbound_sessions_per_remote(), LIMIT);
+        let config = Nat44TcpConfig::new(
+            &snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            PORT,
+            PORT,
+            Nat44TcpPolicy::default()
+                .with_filtering(filtering)
+                .with_inbound_sessions_per_remote(LIMIT)
+                .unwrap(),
+        )
+        .unwrap();
         let mut mappings = [Nat44TcpMappingSlot::default(); 1];
         let mut sessions = [Nat44TcpSessionSlot::default(); 16];
         let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);

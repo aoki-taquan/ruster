@@ -69,10 +69,10 @@ pub(crate) const NAT_FILTERING_CHANGE: [(&str, &str); 2] = [
     ),
 ];
 /// The TCP per-remote inbound session limit is reloadable (the storage
-/// shape does not depend on it); this edit removes the limit.
+/// shape does not depend on it); this edit opts into the recommended 8.
 pub(crate) const TCP_INBOUND_LIMIT_CHANGE: (&str, &str) = (
     "allocator-seed = \"11\"\n",
-    "allocator-seed = \"11\"\ninbound-sessions-per-remote = 0\n",
+    "allocator-seed = \"11\"\ninbound-sessions-per-remote = 8\n",
 );
 pub(crate) const INTERFACE_CHANGE: (&str, &str) =
     ("mac = \"02:00:00:00:00:02\"", "mac = \"02:00:00:00:00:22\"");
@@ -369,11 +369,11 @@ fn nat_hairpinning_is_a_reloadable_typed_delta_separate_from_the_policy_flag() {
 #[test]
 fn tcp_inbound_limit_is_a_reloadable_typed_delta_separate_from_the_policy_flag() {
     const TCP: &str = "allocator-seed = \"11\"\n";
-    // Spelling out the default (8) is no change.
+    // Spelling out the default (0, no limit) is no change.
     only(
         &plan(&[(
             TCP,
-            "allocator-seed = \"11\"\ninbound-sessions-per-remote = 8\n",
+            "allocator-seed = \"11\"\ninbound-sessions-per-remote = 0\n",
         )]),
         &[],
     );
@@ -382,7 +382,7 @@ fn tcp_inbound_limit_is_a_reloadable_typed_delta_separate_from_the_policy_flag()
     only(&tcp, &["nat44_tcp"]);
     assert_eq!(
         tcp.nat44_tcp().inbound_sessions_per_remote,
-        Some(Delta { old: 8, new: 0 })
+        Some(Delta { old: 0, new: 8 })
     );
     assert_eq!(tcp.nat44_tcp().filtering, None);
     assert_eq!(tcp.nat44_tcp().hairpinning, None);
@@ -403,7 +403,7 @@ fn tcp_inbound_limit_is_a_reloadable_typed_delta_separate_from_the_policy_flag()
     )]);
     assert_eq!(
         both.nat44_tcp().inbound_sessions_per_remote,
-        Some(Delta { old: 8, new: 3 })
+        Some(Delta { old: 0, new: 3 })
     );
     assert!(both.nat44_tcp().policy_changed);
     assert!(both.restart_required().is_empty());

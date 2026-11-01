@@ -28,18 +28,20 @@ pub const NAT44_TCP_MAX_IDLE_TTL_MS: u64 = 604_800_000;
 /// this many remote-address chain nodes for address-dependent admission and
 /// the per-remote inbound session count.
 pub const NAT44_TCP_INBOUND_SLOT_PROBES: usize = 16;
-/// Default local security limit on live TCP sessions that external inbound
-/// initial SYNs created on one mapping from one remote IPv4 address. See
+/// Default limit on live TCP sessions that external inbound initial SYNs
+/// created on one mapping from one remote IPv4 address: `0`, no limit (the
+/// RFC baseline). The TCP NAT does not track FIN/RST, so a closed
+/// connection keeps its session, and its quota, until the idle TTL (at
+/// least 2h4m) expires. A default limit would therefore refuse legitimate
+/// reconnects for hours. Operators who admit new inbound flows can opt into
+/// a limit (8 is a reasonable choice). See
 /// [`Nat44TcpPolicy::with_inbound_sessions_per_remote`].
-pub const NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE: u8 = 8;
+pub const NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE: u8 = 0;
 /// Largest finite per-remote limit: the count is taken by one remote-address
 /// chain walk of at most [`NAT44_TCP_INBOUND_SLOT_PROBES`] nodes.
 pub const NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE: u8 = 16;
-const _: () = assert!(
-    NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE as usize == NAT44_TCP_INBOUND_SLOT_PROBES
-        && NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE
-            <= NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE
-);
+const _: () =
+    assert!(NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE as usize == NAT44_TCP_INBOUND_SLOT_PROBES);
 const UDP_INDEX_NONE: u32 = u32::MAX;
 const TCP_INDEX_NONE: u32 = u32::MAX;
 static NEXT_UDP_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -937,10 +939,8 @@ mod tcp_tests {
                 runtime.session_address_lookup_probes.set(0);
                 let planned = runtime.plan_inbound(40_000, REMOTE1, 8443, true, 1);
                 let address_probes = runtime.session_address_lookup_probes.get();
-                if filtering != Nat44Filtering::AddressAndPortDependent {
-                    // One bounded keyed lookup, never a session scan: the
-                    // address-dependent filter and, in every admitting
-                    // mode, the default per-remote inbound session limit.
+                if filtering == Nat44Filtering::AddressDependent {
+                    // One bounded keyed lookup, never a session scan.
                     assert!((1..=4).contains(&address_probes));
                 } else {
                     assert_eq!(address_probes, 0);
@@ -4671,16 +4671,26 @@ impl Nat44TcpPolicy {
 
     /// Limits the live sessions that external inbound initial SYNs may
     /// create on one mapping from one remote IPv4 address (any remote port).
-    /// `0` means no limit. The default is
-    /// [`NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE`].
+    /// `0` means no limit and is the default
+    /// ([`NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE`]).
     ///
-    /// This is a local security policy against session-table exhaustion by
-    /// spoofed SYNs. RFC 5382 §9 notes that address-dependent filtering does
-    /// not fully protect against senders sharing (or claiming) an admitted
-    /// remote address and lets a NAT under attack choose more conservative
-    /// session handling; no REQ of RFC 5382 or RFC 4787 requires admitting
-    /// every filtered-in SYN. The limit is fixed by configuration, not
-    /// adaptive, so the device stays deterministic (RFC 4787 §13).
+    /// This is an opt-in local security policy against session-table
+    /// exhaustion by spoofed SYNs. RFC 5382 §9 notes that address-dependent
+    /// filtering does not fully protect against attackers sharing the
+    /// remote's IP address behind a remote NAT, and that a NAT may check
+    /// liveness or use more conservative timeouts against resource attacks;
+    /// it does not address spoofing, and no REQ of RFC 5382 or RFC 4787
+    /// requires admitting every filtered-in SYN. The limit is fixed by
+    /// configuration, not adaptive, so the device stays deterministic
+    /// (RFC 4787 §13).
+    ///
+    /// FIN and RST are not tracked: a cleanly closed connection keeps
+    /// counting until its idle TTL expires. The count is taken over at most
+    /// [`NAT44_TCP_INBOUND_SLOT_PROBES`] remote-address chain nodes, which
+    /// also hold the outbound-created sessions of the same mapping and
+    /// remote; those reduce the effective limit, and a longer chain refuses
+    /// (fails closed) even where address-dependent filtering alone would
+    /// admit. The maximum of 16 is therefore nominal.
     /// Sessions created by outbound segments are never
     /// limited or counted, and neither are hairpinned inbound halves: their
     /// remote is the NAT's own public address, which every inside host
@@ -7382,13 +7392,13 @@ mod tests {
             format!("{tcp_policy:?}"),
             "Nat44TcpPolicy { idle_ttl_ms: 7440000, allocator_seed: [REDACTED], \
              icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true, \
-             inbound_sessions_per_remote: 8 }"
+             inbound_sessions_per_remote: 0 }"
         );
         assert_eq!(
             format!("{tcp_policy:#?}"),
             "Nat44TcpPolicy {\n    idle_ttl_ms: 7440000,\n    allocator_seed: [REDACTED],\n    \
              icmpv4_errors: ExternalOnly,\n    filtering: AddressDependent,\n    hairpinning: true,\n    \
-             inbound_sessions_per_remote: 8,\n}"
+             inbound_sessions_per_remote: 0,\n}"
         );
 
         with_config(udp_policy, |udp_config| {
@@ -7430,7 +7440,7 @@ mod tests {
                  Ipv4Address(3405803786), first_port: 40000, last_port: 40001, policy: \
                  Nat44TcpPolicy { idle_ttl_ms: 7440000, allocator_seed: [REDACTED], \
                  icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true, \
-                 inbound_sessions_per_remote: 8 }, authority: \
+                 inbound_sessions_per_remote: 0 }, authority: \
                  [REDACTED], snapshot_identity: \
                  [REDACTED] }"
             );
@@ -7453,7 +7463,7 @@ mod tests {
                  first_port: 40000,\n    last_port: 40001,\n    policy: Nat44TcpPolicy {\n        \
                  idle_ttl_ms: 7440000,\n        allocator_seed: [REDACTED],\n        icmpv4_errors: \
                  ExternalOnly,\n        filtering: AddressDependent,\n        hairpinning: true,\n        \
-                 inbound_sessions_per_remote: 8,\n    },\n    authority: \
+                 inbound_sessions_per_remote: 0,\n    },\n    authority: \
                  [REDACTED],\n    snapshot_identity: \
                  [REDACTED],\n}"
             );

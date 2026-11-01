@@ -674,7 +674,7 @@ fn nat44_tcp_inbound_sessions_per_remote_defaults_and_is_exact() {
     let VersionedConfig::V1(config) = parse(VALID_V1.as_bytes()).unwrap() else {
         panic!("schema version 1");
     };
-    // Absent key: the core default (8).
+    // Absent key: the core default (0, no limit).
     assert_eq!(
         config
             .nat44

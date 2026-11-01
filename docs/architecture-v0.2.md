@@ -678,17 +678,26 @@ filteringはpolicyの一部で、変更はreloadableです。storage shapeはmod
 
 `[nat44.tcp] inbound-sessions-per-remote`（core `Nat44TcpPolicy::with_inbound_sessions_per_remote`）は、
 外部からのinitial SYN（hairpinでないもの）が一つのmappingに一つのremote IPv4（portは問わない）から
-作ったlive sessionの数を制限するlocal security policyです（requirements NAT44-041）。default 8、
-`0`は無制限、有効範囲0〜16（`NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE`）。filterが許可した外部SYNは、
+作ったlive sessionの数を制限するopt-inのlocal security policyです（requirements NAT44-041）。
+default `0`（無制限）、有効範囲0〜16（`NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE`）で、外部からの
+新規inbound flowをfirewallで許可するoperatorには8を推奨します。filterが許可した外部SYNは、
 そのmappingとremote addressのlive外部開始sessionが既に上限数あれば、byte不変の
 `NAT44_TCP_INBOUND_REMOTE_QUOTA_EXCEEDED`（drop code 150、counter
 `nat44_tcp.inbound_remote_quota_exceeded`）でdropされます。sessionもmappingも作らず、refreshも
-evictもせず、live sessionは不変です。RFC 5382 §9はREQ-3の議論でAddress-Dependent Filteringが
-同じaddressを名乗るsenderから完全には守らないこと、REQ-5の議論で攻撃下のNATがより保守的な
-session処理を選べることを述べ、RFC 5382/4787のどのREQも「filterを通ったSYNを全て受け入れる」
-ことを要求しません。limitはconfigで固定し負荷に応じて変えないため、RFC 4787 §13が警告する
-条件依存の非決定的挙動にもなりません。RFC MUSTに反しない上限としてsecurity側をdefaultにし、
-transparencyを優先するoperatorは`0`で外せます（owner policy 2026-11-01）。
+evictもせず、live sessionは不変です。RFC 5382 §9はREQ-3の議論で、Address-Dependent Filteringが
+remote NAT配下で同じIP addressを共有する攻撃者からは完全には守らないことを、REQ-5の議論で、
+NATがliveを能動的に確認したりより保守的なtimeoutを選んだりしてよいことを述べます。詐称そのものは
+扱っていませんが、RFC 5382/4787のどのREQも「filterを通ったSYNを全て受け入れる」ことを要求しない
+ため、上限はMUSTに反しないlocal policyです。limitはconfigで固定し負荷に応じて変えないため、
+RFC 4787 §13が警告する条件依存の非決定的挙動にもなりません。
+
+defaultを`0`にする理由: TCP NATはFIN/RSTを追跡しないため、正常にcloseしたconnectionのsessionも
+idle TTL（default/minimum 2時間4分）が切れるまでliveのまま数えられます。上限をdefaultにすると、
+inside P2P listenerが一つのremote IPv4（BitTorrent peerの再接続、CGNAT配下の複数client）から短い
+connectionを上限数受けただけで、以後約2時間そのremoteからのSYNを拒否します。owner policy
+（2026-11-01: RFC baselineをdefault、security強化はopt-in）に従い、transitoryまたはFIN/RST-awareな
+timer（NAT44-058）ができるまではdefaultを無制限とし、新規inbound flowを許可する構成のoperatorが
+明示的に有効にします。
 
 dataは新たに増やしません。session slotに「外部SYNが作った」flag（`is_external_inbound`）を一つ
 持ち、数はSYNごとに既存のremote-address directory（key = mapping index/generation/epoch +
@@ -697,7 +706,11 @@ remote IPv4）のchainを一回、最大`NAT44_TCP_INBOUND_SLOT_PROBES`（16）n
 flagはfalseになる）、mapping再生成（generationが変わりkeyが変わる）、reconcileの全flushで、
 何もしなくても数は正しく減ります。walkはlimitに達した時点で止まり拒否、chainの末尾に達すれば
 countはlimit未満と証明されて許可、16 nodeで末尾に届かなければcountを証明できないためfail closed
-で同じreasonで拒否します。limitの上限16はこのwalk予算に一致させています。`address-dependent`では
+で同じreasonで拒否します。limitの上限16はこのwalk予算に一致させています。chainには同じ
+mapping/remoteのoutbound開始sessionやbucketが衝突する別keyのnodeも入るため、最初の16 nodeに
+あるそれらの数だけ実効上限は下がり、上限16は名目値です。また上限が1以上なら、同じ
+`(mapping, remote)`のchainが16 nodeを超えると、#288の`address-dependent`判定だけなら許可した
+SYN（最初のlive sessionが16 node以内にある）も拒否します。`address-dependent`では
 同じwalkがADF判定（live sessionの有無）も兼ね、limit `0`の`address-dependent`は従来と同じく最初の
 live sessionで止まり、limit `0`の`endpoint-independent`はwalkしません。outbound開始sessionは
 許可根拠にはなりますが数えません。
@@ -710,7 +723,7 @@ tupleのexpired slotの次、keyed random probeより先に）再利用します
 plan/commitのまま）、firewall bind時もfirewall判定より前のNAT planで拒否します。
 
 hairpinのinbound half（remoteはrouter自身の`P`）は数えも制限もしません。`P`はinside全hostに共通の
-remoteなので、数えると一つのinside serverへ`P`経由で入るinside client全体が8 sessionに制限され、
+remoteなので、数えると一つのinside serverへ`P`経由で入るinside client全体が上限数のsessionに制限され、
 正当なhairpin利用（同じNAT配下のclientからのpublic address経由接続）を壊します。一方`P`をsourceと
 するoutside packetはcommon admissionで落ちる（NAT44-047）ため、off-pathの詐称者は`P`を使えず、
 inside hostはもともとoutboundでsession tableを使えるので、hairpinを数えても防げる脅威はありません。
@@ -718,12 +731,12 @@ inside hostはもともとoutboundでsession tableを使えるので、hairpin�
 `endpoint-independent`では攻撃者がremote addressを自由に選べるため、per-remote limitだけでは
 `limit × 詐称address数`まで埋められます。mappingごとの外部開始session上限はdeferredです
 （数えるにはmapping単位のchainか別directoryが要り、P2P listenerなど正当な多数inboundとの
-trade-offも大きい）。`address-dependent`（default）では詐称できるaddressがmappingの話している
+trade-offも大きい）。`address-dependent`（filteringのdefault）では詐称できるaddressがmappingの話している
 remoteに限られるため、攻撃者が占有できるのは高々`limit × そのremote数`です。
 
 limitはpolicyの一部で、変更はreloadable（storage shapeに依存しないため`STORAGE_SHAPE`にならず、
 applyは全NAT stateをflush）です。`NatChange::inbound_sessions_per_remote`（TCPのみ）はtyped
-deltaで`policy_changed`に含めず、plan textは`nat44-tcp inbound-sessions-per-remote ~ 8 -> unlimited`
+deltaで`policy_changed`に含めず、plan textは`nat44-tcp inbound-sessions-per-remote ~ unlimited -> 8`
 と値を出します。範囲外（17〜255）はvalidateが`NAT44_TCP_POLICY`
 （path `nat44.tcp.inbound-sessions-per-remote`）、u8外や型違いはparserが`INVALID_TYPE`で拒否します。
 
