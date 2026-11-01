@@ -22,7 +22,7 @@ use super::{
     syscall::{
         errno, sealed, Errno, MapCreateRequest, MapRequest, MapsRealMemory, OwnedXdpFd,
         PollDescriptor, ProgramLoadRequest, ResourceError, SyscallArgumentError, SyscallError,
-        SyscallStage, Syscalls, IFNAMSIZ, PAGE_SIZE,
+        SyscallStage, Syscalls, TxQueueProbe, IFNAMSIZ, PAGE_SIZE,
     },
 };
 use crate::{
@@ -152,6 +152,7 @@ struct SessionFake {
     /// Kernel log written by a load: byte count and whether a NUL follows.
     verifier_log: Cell<Option<(usize, bool)>>,
     kicks: ScriptedKicks,
+    tx_queue: Cell<TxQueueProbe>,
 }
 
 impl SessionFake {
@@ -178,6 +179,7 @@ impl SessionFake {
             double_releases: Cell::new(0),
             verifier_log: Cell::new(None),
             kicks: ScriptedKicks::default(),
+            tx_queue: Cell::new(TxQueueProbe::Present),
         }
     }
 
@@ -278,6 +280,11 @@ impl sealed::Sealed for SessionFake {}
 unsafe impl MapsRealMemory for SessionFake {}
 
 impl Syscalls for SessionFake {
+    fn tx_queue_probe(&self, _name: &[u8; IFNAMSIZ], ifindex: u32, _queue: u32) -> TxQueueProbe {
+        assert_eq!(ifindex, FAKE_IFINDEX, "probed with the resolved ifindex");
+        self.tx_queue.get()
+    }
+
     fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno> {
         self.record(Call::InterfaceIndex { name: *name })
             .1
@@ -1824,4 +1831,29 @@ fn native_session_datapath_is_taken_once_and_excludes_raw_rings() {
     }
     assert_eq!(fake.live_mappings(), 0);
     assert_eq!(fake.open_fds.get(), 0);
+}
+
+#[test]
+fn native_session_refuses_a_queue_without_tx_queue_before_any_resource() {
+    for (probe, failure) in [
+        (TxQueueProbe::Absent, SessionFailure::NoTxQueue),
+        (
+            TxQueueProbe::Unverifiable,
+            SessionFailure::TxQueueUnverifiable,
+        ),
+    ] {
+        let fake = SessionFake::new();
+        fake.tx_queue.set(probe);
+        let error = SessionCore::open(&fake, &config(XDP_COPY))
+            .map(|_| ())
+            .expect_err("refused");
+        assert_eq!(
+            (error.stage(), error.failure()),
+            (SessionStage::TxQueueCheck, failure)
+        );
+        // Only the interface lookup ran: no socket, mapping, or bind.
+        assert_eq!(fake.len.get(), 1);
+        assert_eq!(fake.open_fds.get(), 0);
+        assert_eq!(fake.live_mappings(), 0);
+    }
 }

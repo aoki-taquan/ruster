@@ -16,6 +16,28 @@
 //! capacity, so every in-flight frame always has a Completion slot.
 //! Completions are reaped in bounded batches and validated against the
 //! ledger and the exact submitted address before a frame is freed.
+//!
+//! Kernel-trust limits (Linux v6.8):
+//!
+//! - A stale duplicate completion that arrives after its frame was freed
+//!   and submitted again names an in-flight frame at the exact submitted
+//!   address, so it is indistinguishable from the real one without a kernel
+//!   sequence number. Linux produces exactly one completion per consumed TX
+//!   descriptor; relying on that is part of the kernel-trust assumption.
+//! - The kernel consumes a TX descriptor it considers invalid without ever
+//!   completing it (`xskq_cons_read_desc` skips it and counts
+//!   `invalid_descs`). Descriptors here are built from validated RX
+//!   geometry, so this should not happen; if it did, the frame would stay
+//!   in flight forever: its in-flight slot is lost, `completion_lag()`'s
+//!   oldest age grows without bound, and `drain` keeps reporting
+//!   `TxInFlight`. The kernel's `XDP_STATISTICS` `tx_invalid_descs` would
+//!   confirm it (health in X04).
+//! - The bound queue must have a TX queue: copy-mode transmit on a queue at
+//!   or above the device's real TX queue count silently does nothing, which
+//!   would look like kicks returning `Woken` while the TX consumer never
+//!   advances. `NativeSession::open` refuses such a queue
+//!   (`SessionFailure::NoTxQueue`); detecting the stall at run time (for
+//!   example after `ethtool -L`) is an X04 health item.
 
 use std::fmt;
 
@@ -80,9 +102,11 @@ impl TxSubmitReport {
 /// is still in its slot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TxSubmitError {
-    /// The handoff at `index` is not the current `PendingTx` owner of a
-    /// frame in this engine's ledger (another engine's handoff), or its
-    /// geometry does not match this ledger's layout.
+    /// The handoff at `index` was issued by another engine
+    /// (`ForeignTokenDomain`, also when both engines were given the same
+    /// `UmemDomainId`), is not the current `PendingTx` owner of its frame
+    /// (for example a second slot naming the same cycle: `WrongState`), or
+    /// its geometry does not match this ledger's layout.
     Handoff {
         /// Slot index of the refused handoff.
         index: usize,
@@ -145,7 +169,8 @@ pub enum CompletionInvalidReason {
     /// The addressed frame is not in flight on TX: a duplicate completion,
     /// or a frame owned by Fill, RX, the caller, or quarantine. Nothing is
     /// mutated, so a kernel completion can never free a frame that someone
-    /// else owns.
+    /// else owns. (A stale duplicate for a frame that was resubmitted since
+    /// cannot be detected; see the module documentation.)
     NotInFlight,
     /// The frame is in flight, but the address is not the exact descriptor
     /// address that was submitted (Linux returns `desc.addr` verbatim).
@@ -437,6 +462,10 @@ pub enum DrainOutcome {
     /// ([`FrameAccounting::fill_in_kernel`]) stay with the kernel until it
     /// returns them on RX or the socket closes; that is expected at
     /// shutdown and not reported as a failure.
+    ///
+    /// Handoffs the caller still holds ([`FrameAccounting::tx_handoffs`])
+    /// are not part of this outcome: an ordered shutdown cancels them
+    /// first and checks `tx_handoffs == 0` itself (X04).
     Drained,
     /// Frames are still in flight on TX: the kernel has not completed them
     /// within the caller's bound. They are not counted as returned; drain
@@ -502,6 +531,12 @@ impl EngineState<'_> {
     /// owner of its frame in this ledger and that its geometry is exactly
     /// what this ledger's layout validates.
     pub(super) fn verify_handoff(&self, handoff: &TxHandoff) -> Result<(), LedgerError> {
+        // The engine identity is unforgeable (no public constructor) and
+        // unique per process, so a handoff of another engine is refused even
+        // when the caller reused a `UmemDomainId` for both ledgers.
+        if handoff.engine != self.engine_id {
+            return Err(LedgerError::ForeignTokenDomain);
+        }
         let ledger = self.frames.ledger();
         ledger.check(handoff.token, FrameStateKind::PendingTx)?;
         let descriptor = handoff.descriptor;
@@ -692,18 +727,19 @@ impl RxFillEngine<'_> {
             let room = self.tx.free_slots().map_err(TxSubmitError::Ring)? as usize;
             let allowance = room.min(state.inflight.free());
             let take = allowance.min(candidates);
+            if take > 0 {
+                // A refused batch changes nothing, counters included.
+                Self::publish_tx(&mut self.tx, state, handoffs, take)?;
+                report.submitted = u32::try_from(take).expect("bounded by the u32 ring");
+            }
             if take < candidates {
-                if room <= state.inflight.free() {
+                if room <= state.inflight.free() + take {
                     bump(&mut state.tx_counters.tx_ring_full);
                     report.blocked = Some(TxBlocked::RingFull);
                 } else {
                     bump(&mut state.tx_counters.tx_inflight_limited);
                     report.blocked = Some(TxBlocked::InflightLimit);
                 }
-            }
-            if take > 0 {
-                Self::publish_tx(&mut self.tx, state, handoffs, take)?;
-                report.submitted = u32::try_from(take).expect("bounded by the u32 ring");
             }
         }
         report.need_wakeup = self.tx.need_wakeup();
@@ -718,6 +754,11 @@ impl RxFillEngine<'_> {
 
     /// Verifies, reserves, writes, publishes, and records the first `take`
     /// handoffs. Nothing is changed unless all of it succeeds.
+    ///
+    /// Each handoff is verified and moved to `TxReserved` in slot order, so
+    /// a second slot naming the same frame cycle (which only a forged
+    /// handoff could) fails its verification as `WrongState` instead of
+    /// panicking; every reservation made so far is then rolled back.
     fn publish_tx(
         tx: &mut crate::TxProducer<'_>,
         state: &mut EngineState<'_>,
@@ -731,31 +772,41 @@ impl RxFillEngine<'_> {
                 .filter_map(|(index, slot)| slot.as_ref().map(|handoff| (index, handoff)))
                 .take(take)
         };
-        for (index, handoff) in chosen() {
-            state
-                .verify_handoff(handoff)
-                .map_err(|error| TxSubmitError::Handoff { index, error })?;
-        }
-        let count = u32::try_from(take).expect("bounded by the u32 ring");
-        let mut reservation = tx.reserve(count).map_err(TxSubmitError::Ring)?;
-        for (_, handoff) in chosen() {
-            state
-                .frames
-                .ledger_mut()
-                .reserve_tx(handoff.token)
-                .expect("verified PendingTx");
-            reservation
-                .write(EngineState::tx_descriptor(handoff))
-                .expect("writes stay within the reservation");
-        }
-        if let Err(error) = reservation.release_submit() {
-            for (_, handoff) in chosen() {
+        let rollback = |state: &mut EngineState<'_>, reserved: usize| {
+            for (_, handoff) in chosen().take(reserved) {
                 state
                     .frames
                     .ledger_mut()
                     .cancel_tx_reservation(handoff.token)
                     .expect("reserved above");
             }
+        };
+        for (reserved, (index, handoff)) in chosen().enumerate() {
+            let checked = state
+                .verify_handoff(handoff)
+                .and_then(|()| state.frames.ledger_mut().reserve_tx(handoff.token));
+            if let Err(error) = checked {
+                rollback(state, reserved);
+                return Err(TxSubmitError::Handoff { index, error });
+            }
+        }
+        let count = u32::try_from(take).expect("bounded by the u32 ring");
+        let mut reservation = match tx.reserve(count) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                rollback(state, take);
+                return Err(TxSubmitError::Ring(error));
+            }
+        };
+        for (_, handoff) in chosen() {
+            if let Err(error) = reservation.write(EngineState::tx_descriptor(handoff)) {
+                reservation.release_cancel();
+                rollback(state, take);
+                return Err(TxSubmitError::Ring(error));
+            }
+        }
+        if let Err(error) = reservation.release_submit() {
+            rollback(state, take);
             return Err(TxSubmitError::Ring(error));
         }
         let stamp = state.counters.polls;
@@ -913,7 +964,9 @@ impl RxFillEngine<'_> {
         let mut last_kick_error = None;
         while used < rounds && self.state.inflight.len() != 0 {
             used += 1;
-            if self.tx_needs_wakeup() == Ok(NeedWakeup::Required) {
+            // Kick unless the kernel clearly said no: an unreadable flags
+            // word errs toward progress (a spurious kick is harmless).
+            if self.tx_needs_wakeup() != Ok(NeedWakeup::NotRequired) {
                 if let Err(error) = self.wake_tx() {
                     last_kick_error = Some(error);
                 }
@@ -951,5 +1004,76 @@ impl RxFillEngine<'_> {
     /// Lists an in-flight entry (again).
     pub(crate) fn push_inflight_entry_for_test(&mut self, entry: InflightEntry) {
         assert!(self.state.inflight.push(entry), "test list has room");
+    }
+}
+
+#[cfg(test)]
+mod fifo_tests {
+    use std::{collections::VecDeque, num::NonZeroU128};
+
+    use ruster_io_xdp::{FrameLedger, FrameToken, UmemDomainId, UmemLayout};
+
+    use super::{InflightEntry, InflightFifo};
+
+    fn tokens(count: u32) -> Vec<FrameToken> {
+        let domain = UmemDomainId::new(NonZeroU128::new(0x5450).expect("nonzero"));
+        let layout = UmemLayout::new(domain, count, 2_048, 256).expect("layout");
+        let mut ledger = FrameLedger::new(layout).expect("ledger");
+        (0..count)
+            .map(|frame| ledger.lease_generated(frame).expect("lease"))
+            .collect()
+    }
+
+    /// Push, oldest, and head or middle removal across every wrap-around
+    /// position, against `VecDeque` as the oracle.
+    #[test]
+    fn inflight_fifo_matches_a_vecdeque_with_wraparound_and_middle_removal() {
+        let pool = tokens(16);
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = |bound: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            usize::try_from(seed % bound as u64).expect("small")
+        };
+        for capacity in 1..=8_u32 {
+            let mut fifo = InflightFifo::new(capacity);
+            let mut model: VecDeque<FrameToken> = VecDeque::new();
+            let mut stamp = 0;
+            for _ in 0..2_000 {
+                if next(2) == 0 && model.len() < capacity as usize {
+                    let candidates: Vec<FrameToken> = pool
+                        .iter()
+                        .copied()
+                        .filter(|token| !model.contains(token))
+                        .collect();
+                    let token = candidates[next(candidates.len())];
+                    stamp += 1;
+                    assert!(fifo.push(InflightEntry {
+                        token,
+                        address: u64::from(token.frame().index()),
+                        stamp,
+                    }));
+                    model.push_back(token);
+                } else if !model.is_empty() {
+                    let offset = next(model.len());
+                    let token = model.remove(offset).expect("present");
+                    let (entry, found) = fifo.remove(token).expect("listed");
+                    assert_eq!((entry.token, found), (token, offset));
+                }
+                assert_eq!(fifo.len(), model.len());
+                assert_eq!(fifo.free(), capacity as usize - model.len());
+                let listed: Vec<FrameToken> = fifo.iter().map(|entry| entry.token).collect();
+                assert_eq!(listed, Vec::from(model.clone()));
+                assert_eq!(
+                    fifo.oldest().map(|entry| entry.token),
+                    model.front().copied()
+                );
+            }
+            // A token that is not listed is not found.
+            if let Some(absent) = pool.iter().find(|token| !model.contains(token)) {
+                assert!(fifo.remove(*absent).is_none());
+            }
+        }
     }
 }

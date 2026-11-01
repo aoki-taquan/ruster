@@ -265,19 +265,34 @@ fn priv_xdp_session_opens_copy_mode_on_netns_veth() {
     auto.close().expect("clean teardown");
 
     // Real-kernel errno classification. The smoke veth has two queues.
+    // Queue 2 on a 2/2-queue veth: the TX queue check refuses it before
+    // any resource (the bind would have failed with EINVAL).
     let bad_queue = NativeSession::open(&session_config(&device, 2, XDP_COPY))
         .expect_err("veth has two queues");
     assert_eq!(
         (bad_queue.stage(), bad_queue.failure()),
-        (SessionStage::Bind, SessionFailure::InvalidArgument)
+        (SessionStage::TxQueueCheck, SessionFailure::NoTxQueue)
     );
+    // RX 4 / TX 2: Linux would bind queue 2 (below max(RX, TX)) and then
+    // never transmit from it; the session refuses it. Queue 1 has both.
+    let asymmetric = required("RUSTER_PRIV_XDP_ASYM_DEVICE");
+    let no_tx =
+        NativeSession::open(&session_config(&asymmetric, 2, XDP_COPY)).expect_err("RX-only queue");
+    assert_eq!(
+        (no_tx.stage(), no_tx.failure()),
+        (SessionStage::TxQueueCheck, SessionFailure::NoTxQueue)
+    );
+    NativeSession::open(&session_config(&asymmetric, 1, XDP_COPY))
+        .expect("queue with RX and TX opens")
+        .close()
+        .expect("asymmetric session teardown");
     let missing = NativeSession::open(&session_config("ruster-absent", 0, XDP_COPY))
         .expect_err("absent device");
     assert_eq!(
         (missing.stage(), missing.failure()),
         (SessionStage::InterfaceLookup, SessionFailure::NoSuchDevice)
     );
-    eprintln!("priv_xdp_session: copy, auto fallback, EBUSY, EINVAL, ENODEV verified");
+    eprintln!("priv_xdp_session: copy, auto fallback, EBUSY, no-TX-queue refusal, ENODEV verified");
 }
 
 #[test]
@@ -578,16 +593,69 @@ fn priv_xdp_tx_reflects_peer_frame_completes_and_drains_on_netns_veth() {
             sleep(Duration::from_millis(20));
         }
 
-        // Ordered shutdown: drain until no TX frame is in kernel hands.
+        // Ordered shutdown with a frame still in flight: the peer's next
+        // UDP datagram (now sent to the reflector MAC) is reflected with
+        // swapped MACs and submitted without any kick or reap, so only the
+        // drain (which kicks while the kernel asks, then reaps) can
+        // complete it. The veth peer picks its TX queue (our RX queue) by
+        // flow hash, and only queue 0 has a socket, so each attempt uses a
+        // fresh source port until one flow lands on queue 0.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.tx_inflight() == 0 {
+            UdpSocket::bind(PEER_SOURCE)
+                .expect("peer address configured by the script")
+                .send_to(b"ruster", UNANSWERED_TARGET)
+                .expect("peer send");
+            sleep(Duration::from_millis(20));
+            let mut handoff = None;
+            {
+                let mut batch = engine.poll(16).expect("poll");
+                while let Some(mut frame) = batch.next_frame() {
+                    let bytes = frame.bytes_mut();
+                    if handoff.is_none() && bytes.len() >= 34 && bytes[12..14] == [0x08, 0x00] {
+                        let (destination, rest) = bytes.split_at_mut(6);
+                        destination.swap_with_slice(&mut rest[..6]);
+                        handoff = Some(frame.stage_tx());
+                    } else {
+                        frame.recycle();
+                    }
+                }
+            }
+            if let Some(handoff) = handoff {
+                let report = engine
+                    .submit_tx(handoff)
+                    .map_err(|rejected| rejected.reason())
+                    .expect("TX ring has room");
+                assert_eq!(report.submitted(), 1);
+                reflected += 1;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no peer IPv4 frame to reflect within five seconds"
+            );
+        }
+        assert_eq!(engine.completion_lag().in_flight(), 1);
+        let kicks = engine.tx_counters().tx_kicks;
         let deadline = Instant::now() + Duration::from_secs(2);
+        let mut drained_completions = 0;
         let report = loop {
             let report = engine.drain(16).expect("drain");
+            drained_completions += report.completed();
             if report.outcome() == DrainOutcome::Drained {
                 break report;
             }
+            assert!(report.rounds() > 0, "{report:?}");
             assert!(Instant::now() < deadline, "drain timed out: {report:?}");
             sleep(Duration::from_millis(10));
         };
+        assert_eq!(
+            drained_completions, 1,
+            "the drain reaped the in-flight frame"
+        );
+        assert!(
+            engine.tx_counters().tx_kicks > kicks,
+            "copy mode needs the drain's kick"
+        );
         let accounting = report.accounting();
         assert_eq!(accounting.tx_in_flight, 0);
         assert_eq!(accounting.tx_handoffs, 0);
@@ -599,7 +667,7 @@ fn priv_xdp_tx_reflects_peer_frame_completes_and_drains_on_netns_veth() {
     wait_detached(&device);
     eprintln!(
         "priv_xdp_tx: peer ARP request rewritten in place, transmitted from the same frame on \
-         the same veth, received by the peer, completed, and drained verified"
+         the same veth, received by the peer, completed, and an in-flight frame drained verified"
     );
 }
 

@@ -646,6 +646,30 @@ fn tx_drain_returns_every_frame_once_and_reports_kernel_held_frames() {
     audit(&engine);
 }
 
+#[test]
+fn tx_drain_kicks_unless_the_kernel_clearly_declines() {
+    let kernel = kernel();
+    let mut engine = engine(&kernel);
+    let handoff = staged(&kernel, &mut engine, 1).pop().expect("one");
+    let _ = engine.submit_tx(handoff).expect("submit");
+    // Not required: no kick.
+    let report = engine.drain(2).expect("drain");
+    assert_eq!(report.outcome(), DrainOutcome::TxInFlight { frames: 1 });
+    assert_eq!(kernel.kicks(KickRing::Tx), 0);
+    // An unreadable flags word errs toward progress: every round kicks.
+    kernel.set_tx_flags(XDP_RING_NEED_WAKEUP | 4);
+    let report = engine.drain(3).expect("drain");
+    assert_eq!(report.rounds(), 3);
+    assert_eq!(kernel.kicks(KickRing::Tx), 3);
+    kernel.set_tx_flags(0);
+    transmit(&kernel, 1);
+    assert_eq!(
+        engine.drain(1).expect("drain").outcome(),
+        DrainOutcome::Drained
+    );
+    audit(&engine);
+}
+
 fn drain_rx(engine: &mut RxFillEngine<'_>) {
     let mut batch = engine.poll(RING).expect("poll");
     while let Some(frame) = batch.next_frame() {
@@ -655,44 +679,151 @@ fn drain_rx(engine: &mut RxFillEngine<'_>) {
 
 #[test]
 fn tx_foreign_handoffs_are_refused_and_returned_intact() {
-    let first = kernel();
-    let second = kernel();
-    let mut mine = engine_with(&first, 0x5402);
-    let mut other = engine_with(&second, 0x5403);
-    let foreign = staged(&second, &mut other, 1).pop().expect("one");
-    let own = staged(&first, &mut mine, 1).pop().expect("one");
-    let before = snapshot(mine.ledger());
-    let token = foreign.token();
+    // Distinct domains, and the same `UmemDomainId` reused for both
+    // ledgers: deterministic kernels then issue identical tokens, and only
+    // the engine identity in the handoff tells them apart.
+    for (mine_domain, other_domain) in [(0x5402, 0x5403), (0x5402, 0x5402)] {
+        let first = kernel();
+        let second = kernel();
+        let mut mine = engine_with(&first, mine_domain);
+        let mut other = engine_with(&second, other_domain);
+        let foreign = staged(&second, &mut other, 1).pop().expect("one");
+        let own = staged(&first, &mut mine, 1).pop().expect("one");
+        if mine_domain == other_domain {
+            assert_eq!(foreign.token(), own.token(), "same domain, same token");
+        }
+        let before = snapshot(mine.ledger());
+        let token = foreign.token();
 
-    let rejected = mine.submit_tx(foreign).expect_err("foreign");
-    assert_eq!(
-        rejected.reason(),
-        TxRejection::Invalid(LedgerError::ForeignTokenDomain)
-    );
-    let foreign = rejected.into_handoff();
-    assert_eq!(foreign.token(), token);
-    // In a batch, the foreign slot refuses the whole call, nothing moves.
-    let mut slots = [Some(own), Some(foreign)];
-    assert_eq!(
-        mine.submit_tx_batch(&mut slots),
+        let rejected = mine.submit_tx(foreign).expect_err("foreign");
+        assert_eq!(
+            rejected.reason(),
+            TxRejection::Invalid(LedgerError::ForeignTokenDomain)
+        );
+        let foreign = rejected.into_handoff();
+        assert_eq!(foreign.token(), token);
+        assert_eq!(first.tx_pending(), 0, "nothing published");
+        // In a batch, the foreign slot refuses the whole call, nothing
+        // moves (the own handoff before it is rolled back).
+        let mut slots = [Some(own), Some(foreign)];
+        let counters = mine.tx_counters();
+        assert_eq!(
+            mine.submit_tx_batch(&mut slots),
+            Err(TxSubmitError::Handoff {
+                index: 1,
+                error: LedgerError::ForeignTokenDomain,
+            })
+        );
+        assert!(slots.iter().all(Option::is_some));
+        assert_eq!(first.tx_pending(), 0);
+        assert_eq!(snapshot(mine.ledger()), before);
+        assert_eq!(
+            mine.tx_counters(),
+            counters,
+            "a refused batch counts nothing"
+        );
+        let [own, foreign] = slots;
+        let (error, foreign) = mine
+            .cancel_tx_handoff(foreign.expect("kept"))
+            .expect_err("foreign cancel");
+        assert_eq!(error, RxFillError::Ledger(LedgerError::ForeignTokenDomain));
+        assert_eq!(snapshot(mine.ledger()), before);
+        audit(&mine);
+        cancel_all(&mut other, [foreign]);
+        cancel_all(&mut mine, [own.expect("kept")]);
+        audit(&mine);
+        audit(&other);
+    }
+}
+
+#[test]
+fn tx_duplicate_handoff_in_one_batch_is_refused_and_rolled_back() {
+    let kernel = kernel();
+    let mut engine = engine(&kernel);
+    let mut handoffs = staged(&kernel, &mut engine, 2);
+    let second = handoffs.pop().expect("two");
+    let first = handoffs.pop().expect("two");
+    let duplicate = first.forged_copy_for_test();
+    let frame = first.frame().index();
+    let before = snapshot(engine.ledger());
+    let mut slots = [Some(first), Some(second), Some(duplicate)];
+    assert!(matches!(
+        engine.submit_tx_batch(&mut slots),
         Err(TxSubmitError::Handoff {
-            index: 1,
-            error: LedgerError::ForeignTokenDomain,
+            index: 2,
+            error: LedgerError::WrongState {
+                expected: FrameStateKind::PendingTx,
+                actual: FrameStateKind::TxReserved,
+                ..
+            },
         })
-    );
+    ));
+    // Both reservations made before the duplicate were rolled back.
+    assert_eq!(snapshot(engine.ledger()), before);
+    assert_eq!(state(&engine, frame), FrameStateKind::PendingTx);
+    assert_eq!(kernel.tx_pending(), 0);
     assert!(slots.iter().all(Option::is_some));
-    assert_eq!(first.tx_pending(), 0);
-    let [own, foreign] = slots;
-    let (error, foreign) = mine
-        .cancel_tx_handoff(foreign.expect("kept"))
-        .expect_err("foreign cancel");
-    assert_eq!(error, RxFillError::Ledger(LedgerError::ForeignTokenDomain));
-    assert_eq!(snapshot(mine.ledger()), before);
-    audit(&mine);
-    cancel_all(&mut other, [foreign]);
-    cancel_all(&mut mine, [own.expect("kept")]);
-    audit(&mine);
-    audit(&other);
+    let [first, second, duplicate] = slots;
+    // The forged copy owns no frame of its own.
+    std::mem::forget(duplicate);
+    let report = engine
+        .submit_tx_batch(&mut [first, second])
+        .expect("the real handoffs still submit");
+    assert_eq!(report.submitted(), 2);
+    audit(&engine);
+}
+
+#[test]
+fn tx_handoff_geometry_is_revalidated_against_the_ledger_layout() {
+    let kernel = kernel();
+    let mut engine = engine(&kernel);
+    let mut handoffs = staged(&kernel, &mut engine, 2);
+    let neighbour = handoffs.pop().expect("two");
+    let handoff = handoffs.pop().expect("two");
+    let frame = handoff.frame().index();
+    let raw = |frame: u32, offset: u64| RawDescriptor {
+        addr: frame_base(frame) + offset,
+        len: 60,
+        options: 0,
+    };
+    // Same geometry validated for another UMEM domain.
+    let foreign_layout =
+        UmemLayout::new(domain(0x5499), FRAMES, FRAME_SIZE, XDP_PACKET_HEADROOM).expect("layout");
+    let foreign = foreign_layout
+        .validate_descriptor(raw(frame, HEADROOM))
+        .expect("descriptor");
+    // The engine's own domain, but a layout without the kernel headroom.
+    let loose_layout = UmemLayout::new(domain(0x5401), FRAMES, FRAME_SIZE, 0).expect("layout");
+    let before_headroom = loose_layout
+        .validate_descriptor(raw(frame, 0))
+        .expect("descriptor");
+    // Another frame than the token's.
+    let aliased = neighbour.descriptor();
+    let before = snapshot(engine.ledger());
+    for (descriptor, expected) in [
+        (foreign, LedgerError::ForeignDescriptorDomain),
+        (before_headroom, LedgerError::ForeignDescriptorDomain),
+        (
+            aliased,
+            LedgerError::DescriptorFrameAlias {
+                token_frame: handoff.frame(),
+                descriptor_frame: aliased.frame(),
+            },
+        ),
+    ] {
+        let forged = handoff.with_descriptor_for_test(descriptor);
+        let rejected = engine.submit_tx(forged).expect_err("refused");
+        assert_eq!(rejected.reason(), TxRejection::Invalid(expected));
+        std::mem::forget(rejected.into_handoff());
+        let forged = handoff.with_descriptor_for_test(descriptor);
+        let (error, forged) = engine.cancel_tx_handoff(forged).expect_err("refused");
+        assert_eq!(error, RxFillError::Ledger(expected));
+        std::mem::forget(forged);
+        assert_eq!(snapshot(engine.ledger()), before);
+        assert_eq!(kernel.tx_pending(), 0);
+    }
+    cancel_all(&mut engine, [handoff, neighbour]);
+    audit(&engine);
 }
 
 #[test]

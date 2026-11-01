@@ -193,6 +193,16 @@ pub(super) fn add(counter: &mut u64, value: u32) {
     *counter = counter.saturating_add(u64::from(value));
 }
 
+/// Source of process-unique engine identities (cold path: one increment
+/// per engine construction, never on the datapath).
+static NEXT_ENGINE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_engine_id() -> u64 {
+    let id = NEXT_ENGINE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    assert_ne!(id, 0, "engine identities exhausted");
+    id
+}
+
 /// Checked engine parameters.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RxFillConfig {
@@ -473,6 +483,8 @@ impl TokenFifo {
 /// Everything except the two ring views, so ring borrows and state updates
 /// can coexist inside one operation.
 struct EngineState<'memory> {
+    /// Process-unique identity stamped into every `TxHandoff`.
+    engine_id: u64,
     frames: UmemFrames<'memory>,
     free: IndexFifo,
     pending: TokenFifo,
@@ -700,6 +712,7 @@ impl<'memory> RxFillEngine<'memory> {
             }
         })?;
         let state = EngineState {
+            engine_id: next_engine_id(),
             frames,
             free: IndexFifo::full(geometry.rx_frames()),
             pending: TokenFifo::new(rx.capacity()),
@@ -1228,6 +1241,7 @@ impl RxFrame<'_, '_> {
             .expect("a live RxFrame owns its Leased frame");
         bump(&mut self.engine.state.counters.rx_tx_handoffs);
         TxHandoff {
+            engine: self.engine.state.engine_id,
             token: self.token,
             descriptor: self.descriptor,
         }
@@ -1265,6 +1279,8 @@ impl fmt::Debug for RxFrame<'_, '_> {
 #[must_use = "a dropped TX handoff strands its frame in PendingTx"]
 #[derive(Debug)]
 pub struct TxHandoff {
+    /// The issuing engine; see `EngineState::verify_handoff`.
+    engine: u64,
     token: FrameToken,
     descriptor: ValidatedDescriptor,
 }
@@ -1311,8 +1327,18 @@ impl TxHandoff {
     /// produce: used to prove the ledger refuses a duplicate completion.
     pub(crate) const fn forged_copy_for_test(&self) -> Self {
         Self {
+            engine: self.engine,
             token: self.token,
             descriptor: self.descriptor,
+        }
+    }
+
+    /// A forged copy that claims other descriptor geometry.
+    pub(crate) const fn with_descriptor_for_test(&self, descriptor: ValidatedDescriptor) -> Self {
+        Self {
+            engine: self.engine,
+            token: self.token,
+            descriptor,
         }
     }
 }

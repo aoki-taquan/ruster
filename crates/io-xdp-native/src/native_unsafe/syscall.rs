@@ -318,10 +318,21 @@ pub(super) mod sealed {
     pub trait Sealed {}
 }
 
+/// Whether a device has a TX queue with a given id.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum TxQueueProbe {
+    Present,
+    Absent,
+    Unverifiable,
+}
+
 /// Sealed cold-path boundary; generic users are monomorphized, never dynamic.
 pub(super) trait Syscalls: sealed::Sealed {
     /// `if_nametoindex(3)`. `name` is NUL-padded with `name[IFNAMSIZ - 1] == 0`.
     fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno>;
+    /// Whether device `name` (resolved to `ifindex`) has TX queue `queue`.
+    /// Cold path; it may allocate.
+    fn tx_queue_probe(&self, name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQueueProbe;
     fn socket(&self, domain: c_int, kind: c_int, protocol: c_int) -> Result<RawFd, Errno>;
     fn set_socket_option(
         &self,
@@ -404,6 +415,10 @@ impl sealed::Sealed for LinuxSyscalls {}
 unsafe impl MapsRealMemory for LinuxSyscalls {}
 
 impl Syscalls for LinuxSyscalls {
+    fn tx_queue_probe(&self, name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQueueProbe {
+        linux_tx_queue_probe(name, ifindex, queue)
+    }
+
     fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno> {
         if name[IFNAMSIZ - 1] != 0 {
             return Err(Errno::ArgumentRejected);
@@ -648,6 +663,39 @@ impl Syscalls for LinuxSyscalls {
 
     fn datapath_kick<'a>(fd: &'a OwnedXdpFd<'a, Self>) -> KickTarget<'a> {
         KickTarget::Live(fd)
+    }
+}
+
+/// Reads sysfs with safe std only. The device name was validated by
+/// `SessionConfig` (ASCII graphic, no `/`, `:`, `.` or `..`), so it is one
+/// path component.
+fn linux_tx_queue_probe(name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQueueProbe {
+    let len = name.iter().position(|byte| *byte == 0).unwrap_or(IFNAMSIZ);
+    let Ok(device) = std::str::from_utf8(&name[..len]) else {
+        return TxQueueProbe::Unverifiable;
+    };
+    if device.is_empty() || device == "." || device == ".." || device.contains('/') {
+        return TxQueueProbe::Unverifiable;
+    }
+    let base = std::path::Path::new("/sys/class/net").join(device);
+    // The sysfs view must describe the device this namespace resolved.
+    let same_device = std::fs::read_to_string(base.join("ifindex"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        == Some(ifindex);
+    if !same_device {
+        return TxQueueProbe::Unverifiable;
+    }
+    let queues = base.join("queues");
+    // Every netdev has tx-0; its absence means an unexpected sysfs layout.
+    if !queues.join("tx-0").is_dir() {
+        return TxQueueProbe::Unverifiable;
+    }
+    match std::fs::metadata(queues.join(format!("tx-{queue}"))) {
+        Ok(metadata) if metadata.is_dir() => TxQueueProbe::Present,
+        Ok(_) => TxQueueProbe::Unverifiable,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => TxQueueProbe::Absent,
+        Err(_) => TxQueueProbe::Unverifiable,
     }
 }
 
@@ -1389,6 +1437,10 @@ mod tests {
         fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno> {
             self.record(Call::InterfaceIndex { first: name[0] });
             self.result(SyscallStage::InterfaceIndex).map(|()| 3)
+        }
+
+        fn tx_queue_probe(&self, _: &[u8; IFNAMSIZ], _: u32, _: u32) -> TxQueueProbe {
+            TxQueueProbe::Present
         }
 
         fn socket(&self, domain: c_int, kind: c_int, protocol: c_int) -> Result<RawFd, Errno> {
@@ -2192,6 +2244,30 @@ mod tests {
             Err(Errno::ArgumentRejected)
         );
         assert_eq!(linux.bpf_link_create(3, 0, 4), Err(Errno::ArgumentRejected));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "reads sysfs")]
+    fn native_tx_queue_probe_reads_sysfs_for_the_resolved_device() {
+        // `lo` is ifindex 1 in every network namespace and has one TX queue.
+        let mut lo = [0_u8; IFNAMSIZ];
+        lo[..2].copy_from_slice(b"lo");
+        assert_eq!(linux_tx_queue_probe(&lo, 1, 0), TxQueueProbe::Present);
+        assert_eq!(linux_tx_queue_probe(&lo, 1, 1_000), TxQueueProbe::Absent);
+        // A sysfs view of another device fails closed.
+        assert_eq!(linux_tx_queue_probe(&lo, 2, 0), TxQueueProbe::Unverifiable);
+        let mut missing = [0_u8; IFNAMSIZ];
+        missing[..12].copy_from_slice(b"rusterNoDev0");
+        assert_eq!(
+            linux_tx_queue_probe(&missing, 1, 0),
+            TxQueueProbe::Unverifiable
+        );
+        let mut dots = [0_u8; IFNAMSIZ];
+        dots[..2].copy_from_slice(b"..");
+        assert_eq!(
+            linux_tx_queue_probe(&dots, 1, 0),
+            TxQueueProbe::Unverifiable
+        );
     }
 
     #[test]

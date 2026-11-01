@@ -2330,13 +2330,15 @@ kickの失敗はledgerを変えず、publish済みdescriptorはin-flightのま�
 
 **shutdown drain**: `drain(rounds)`は新規TXとFill publicationを永久に止め（`TxBlocked::Draining`、
 `fill_suppressed_draining`）、lendされていないvalid RX frameをfree listへ戻し、最大`rounds`回
-「kernelが求めればTX kick、TX capacity分のreap」を行います。frameは通常と同じvalidated completion
+「kernelが`NotRequired`と明示しない限り（flag wordが読めないErrでも）TX kick、TX capacity分のreap」を
+行います。frameは通常と同じvalidated completion
 pathを通って一回だけfree listへ戻り、重複completionは二度目を拒否します。kernelが保持するframeは
 返ったことにしません: TXは`DrainOutcome::TxInFlight{frames}`、全体は`FrameAccounting`（free、
 `fill_in_kernel`、pending RX、lease、handoff、`tx_in_flight`、quarantine、和はRX pool size）で返します。
 Fillへpublishしたframeはkernelが返すかsocketがcloseするまでkernelのもので、shutdownでは想定どおりです
 （drain後もpollはRXを処理してfree listへ戻します）。engineは時計を持たないため、callerが`rounds`と
-再呼出し（間にsleep）でtimeoutを決めます。
+再呼出し（間にsleep）でtimeoutを決めます。`Drained`はcallerが持つhandoff（`tx_handoffs`）を
+含まないため、X04のordered shutdownは先にcancelして`tx_handoffs == 0`を自分で確認します。
 
 **audit**: `audit()`はXDP-080に加え、in-flight listの各entryが`TxOwnedByKernel`のexact tokenで重複
 せず他のlistにも無いこと、listと`TxOwnedByKernel`数とgauge `tx_inflight`の一致、in-flight ≤ TX
@@ -2349,14 +2351,45 @@ capacity、owner partitionの和がRX pool sizeであることを検査します
 `tx_kicks`、`fill_kicks`、`kicks_deferred`、`kick_errors`、`drains`、gauge `tx_inflight`と
 `tx_inflight_highwater`。hot pathは整数更新だけでledgerをscanしません。
 
+**handoffの出自と重複**: `TxHandoff`は発行engineのprocess内一意identity（engine構築時に一回だけ
+static `AtomicU64`から採番。datapathでは触らない）を持ちます。`UmemDomainId::new`はpublicなので
+callerが二つのengineに同じdomain値を与えるとdeterministicなkernelでは同じtokenができますが、
+identityが違うので別engineのhandoffは`ForeignTokenDomain`で拒否されます。batchは各slotを検証して
+`TxReserved`へ移す処理を順に行うので、同じcycleを指す二つ目のslot（偽造でしか作れない）は
+`WrongState`となり、それまでのreservationを全てrollbackしてtyped errorを返します（panicしない）。
+ring reserve/write/publishの失敗も同じくrollbackし、拒否したbatchはcounterも変えません。
+
+**bind queueのTX queue**: Linux v6.8の`xsk_bind`は`queue < max(real_num_rx_queues,
+real_num_tx_queues)`だけを要求し、copy-modeの`__xsk_generic_xmit`は`queue >= real_num_tx_queues`
+では黙って何も送りません（kickは`Woken`のまま、TXは`RingFull`、drainは永久に`TxInFlight`）。
+そこで`NativeSession::open`はinterface lookup直後、resource取得前に`SessionStage::TxQueueCheck`で
+sysfs（`/sys/class/net/<dev>/ifindex`が解決済みifindexと一致することを確認してから
+`queues/tx-<queue>`）を調べ、無ければ`SessionFailure::NoTxQueue`、確かめられなければ
+`TxQueueUnverifiable`で拒否します。runtimeの`ethtool -L`などで後からTX queueを失ったstallの検出は
+X04のhealthです。
+
+**kernel-trustの限界**: copy modeでは`xsk_poll`もtransmit loopを回すので`wake_fill()`もTXを進めます。
+`EAGAIN`は主に一回のtransmitが`TX_BATCH_SIZE`（32）に達したことを意味し、すぐ再kickします
+（completion slotの予約失敗はsuccessで返ります）。kernelが不正とみなしたTX descriptorはcompletion
+なしに消費される（`invalid_descs`）ため、もし起きればそのframeのin-flight slotは失われ、
+`completion_lag()`の最古ageが増え続けdrainが`TxInFlight`を返すことで観測されます（descriptorは検証済み
+RX geometryから作るので想定外。`XDP_STATISTICS`の監視はX04）。resubmit後に届く古い重複completionは
+検出できず、Linuxが消費したTX descriptorごとにcompletionを一つだけ出すという前提はkernel-trust
+assumptionの一部です。
+
 testはscripted heap kernelをTX consume（同じframeの二重submitやFill publish中のTX submitでfail）と
 completion produce、kick記録/errno注入へ拡張して行います。partial/full ring、in-flight上限とcompletion
 lag、短いfree listでの前進、順序違いcompletion、UMEM外/重複/Fill所有/generated pool/address違いの
 completion、need-wakeupとerrno mapping、kernelが保持したままのdrainと二度目のdrain、foreign handoff、
 setup拒否、corrupt cursor、in-flight listのaudit、各step後のdeep audit、steady-stateのallocation zero、
 io-xdp `FakeKernel`のTX lifecycleとのdifferential（modelの`CompletionAvailable`はengineがringを
-読むまで`TxOwnedByKernel`へ射影）を検証します。privileged smokeのtx phaseは専用netns veth上で
+読むまで`TxOwnedByKernel`へ射影）、in-flight FIFOの`VecDeque` oracleとのproperty test
+（capacity 1..=8、全wrap-around位置）を検証します。differentialのmodelは提出順completionしか
+出さないため、invalid/重複/順序違いcompletion、quarantine、drainのkernel保持、kick errnoは直接testが
+担います。single-threadのtestとMiriは`publish_producer`のRelease→Relaxedのようなordering mutantを
+検出できないので、orderingはreviewとprivileged smokeに依存します。privileged smokeのtx phaseは専用netns veth上で
 peerのARP requestを同じUMEM frameのままin-placeでARP replyへ書き換え、同じvethからTXし、peer kernelが
-`ip neigh`にreplyのMACを学習することで受信を確かめ、completionをreapし、`Drained`のdrain後にcloseします
+`ip neigh`にreplyのMACを学習することで受信を確かめ、completionをreapし、さらにkickもreapもせずに
+submitしたままのframe（in-flight 1）をdrainのkickとreapだけで回収して`Drained`を確認してからcloseします
 （XDP-091〜111）。core `PacketIo` adapter、generated poolのTX（X03）、kick policy、health化、runtime
 statsはX03/X04です（XDP-112）。

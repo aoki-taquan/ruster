@@ -50,7 +50,9 @@ pub enum KickRing {
     /// runs the copy-mode transmit loop or the driver's `ndo_xsk_wakeup`.
     Tx,
     /// `poll(fd, POLLIN, 0)`: Linux `xsk_poll` wakes the zero-copy driver
-    /// for the flags it requested (Fill refill) and never sleeps here.
+    /// for the flags it requested (Fill refill) and never sleeps here. In
+    /// copy mode `xsk_poll` runs the copy-mode transmit loop instead, so
+    /// this kick also advances pending TX there.
     Fill,
 }
 
@@ -67,8 +69,10 @@ pub enum KickOutcome {
 /// Transient kick refusals that libxdp also treats as benign.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KickDeferral {
-    /// `EAGAIN`: copy-mode transmit could not reserve a completion slot or
-    /// an skb, or the socket would block.
+    /// `EAGAIN`: in Linux v6.8 copy mode this mostly means one transmit
+    /// round hit `TX_BATCH_SIZE` (32 descriptors) with more pending, so
+    /// kick again soon. (A failed completion-slot reservation ends the
+    /// round with success, `Woken`.)
     WouldBlock,
     /// `EBUSY`: the driver or the copy-mode transmit path is busy.
     Busy,

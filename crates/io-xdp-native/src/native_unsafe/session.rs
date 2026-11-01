@@ -36,7 +36,7 @@ use crate::datapath::{DatapathError, DatapathParts, DatapathRings, RingsError};
 
 use super::syscall::{
     errno, interface_index, Errno, LinuxSyscalls, MappedRegion, MapsRealMemory, OwnedBpfFd,
-    OwnedXdpFd, ResourceError, SyscallError, IFNAMSIZ, PAGE_SIZE,
+    OwnedXdpFd, ResourceError, SyscallError, TxQueueProbe, IFNAMSIZ, PAGE_SIZE,
 };
 
 /// Verifier log capacity: the program's success log is about 100 bytes, so
@@ -432,6 +432,20 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
     pub(super) fn open(syscalls: &'s S, config: &SessionConfig) -> Result<Self, SessionError> {
         let ifindex = interface_index(syscalls, config.interface_name_bytes())
             .map_err(at(SessionStage::InterfaceLookup))?;
+        // Before any resource: a queue without a TX queue binds fine and
+        // then never transmits.
+        match syscalls.tx_queue_probe(config.interface_name_bytes(), ifindex, config.queue()) {
+            TxQueueProbe::Present => {}
+            TxQueueProbe::Absent => {
+                return Err(fail(SessionStage::TxQueueCheck, SessionFailure::NoTxQueue));
+            }
+            TxQueueProbe::Unverifiable => {
+                return Err(fail(
+                    SessionStage::TxQueueCheck,
+                    SessionFailure::TxQueueUnverifiable,
+                ));
+            }
+        }
         let raw = config.bind_flags().raw();
         match config.mode() {
             BindMode::CopyRequired | BindMode::ZeroCopyRequired => {
