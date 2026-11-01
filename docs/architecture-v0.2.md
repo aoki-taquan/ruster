@@ -452,10 +452,14 @@ mapping/peer/indexを全flushします。permitは別runtimeへ移せず、drop�
 mapping keyは`(inside IfId, internal IPv4, internal UDP port)`でremote endpointを含めない
 Endpoint-Independent Mappingです。別のremoteへ送っても同じpublic tupleを使います。
 filter peerのcanonical index wordsは
-`(mapping slot, mapping generation, lifecycle epoch high, lifecycle epoch low, remote IPv4)`
-で、mappingは`(inside IfId, internal IPv4, internal UDP port)`です。既知IPの任意remote UDP
-portを許し、未接触IPをbyte不変dropします。outboundでpeer slotを確保できなければmappingを
-refreshせずdropし、filterを緩めません。live mappingをevictせず、port overloadもしません。
+`(mapping slot, mapping generation, lifecycle epoch high, lifecycle epoch low, remote IPv4 | key port << 32)`
+で、mappingは`(inside IfId, internal IPv4, internal UDP port)`です。key portは
+`address-and-port-dependent`のときだけremote UDP port、それ以外はzeroなので、defaultの
+address-granular peerのhashは従来と同一です。inbound filterは後述の
+「NAT44 inbound filtering modes」に従い、default（`address-dependent`）は既知IPの任意remote
+UDP portを許し、未接触IPをbyte不変dropします。outboundでpeer slotを確保できなければ
+mappingをrefreshせずdropし、filterを緩めません。live mappingをevictせず、port overloadも
+しません。
 内部portがpool内かつfreeなら保存し、それ以外はcaller seedを混ぜたstartからinclusive poolを
 一周だけscanします。各candidateはdirect owner tableを一回参照し、mapping tableを再scan
 しません。randomness、parity、low-class preservationは保証しません。
@@ -511,13 +515,16 @@ protocol-local direct public-port ownerを専有し、outbound worst-caseはaddi
 `(inside IfId, internal IPv4, internal TCP port)`、session keyは
 `(mapping slot, mapping generation, lifecycle epoch, remote IPv4, remote TCP port)`です。
 mapping再生成は旧sessionを全走査せずgeneration+epochでlazyに無効化します。複数remote sessionは
-同じpublic tupleを再利用しますが、inbound filterはremote address/portのexact matchであり、
-RFC 5382が推奨するEndpoint-Independent FilteringやAddress-Dependent Filteringより厳しい
-connection-dependent local policyです。protocol-dependent tableなのでUDPとTCPは同じ数値
-public portを同時に所有できます。
+同じpublic tupleを再利用します。同じsession slotをkey
+`(mapping slot, mapping generation, lifecycle epoch, remote IPv4)`で引く二つ目のcaller-backed
+remote-address directory（session directoryと同じbucket/node数）を持ち、address-dependent
+filteringの判定に使います。exact sessionが無いinboundの扱いは後述の
+「NAT44 inbound filtering modes」に従います。protocol-dependent tableなのでUDPとTCPは同じ
+数値public portを同時に所有できます。
 
-新mapping/sessionを作れるpacketはinsideからoutsideへ向かうSYN=1、ACK=0、RST=0、FIN=0
-だけです。ECE/CWR、TCP options、SYN dataは許可します。既存exact sessionではflagによる
+新mappingを作れるpacketはinsideからoutsideへ向かうSYN=1、ACK=0、RST=0、FIN=0だけです。
+新sessionはこのoutbound initial SYNに加え、filterが許可した同じflagのinbound initial SYNが
+既存live mapping上にだけ作れます。ECE/CWR、TCP options、SYN dataは許可します。既存exact sessionではflagによる
 phase遷移を行わず、SYN retransmit、inbound exact SYN（basic simultaneous open）、
 SYN-ACK、ACK/data、FIN、RSTを同じ規則で変換します。sequence number、receive window、
 ACK妥当性を追跡しないため、flagだけを信頼したFIN/RST cleanupは安全ではありません。
@@ -572,6 +579,101 @@ TCP fragment association/reassembly、hairpin translation、Type 3/Code 4以外�
 translation、static forwards、sequence/window validation、full RFC 5382 lifecycle、
 safe FIN/RST cleanupはdeferredです。
 
+## NAT44 inbound filtering modes
+
+UDPとTCPのinbound filtering behaviorはprotocolごとに`Nat44Filtering`で選び、RFC 4787 §5の
+三分類を使います。RFC 4787 REQ-8（UDP）とRFC 5382 REQ-3（TCP）は、application
+transparencyを最重視するならEndpoint-Independent Filtering、より厳しいfilteringを重視する
+ならAddress-Dependent FilteringをRECOMMENDEDとし、administrator optionにしてよい
+（REQ-8 a、REQ-3 a）、TCPとUDPで独立でよい（RFC 5382 REQ-3 b）としています。
+
+| config `filtering` | `Nat44Filtering` | UDP inbound（live mapping必須） | TCP inbound（exact live sessionなし） |
+|---|---|---|---|
+| `endpoint-independent` | `EndpointIndependent` | 任意remote endpoint | initial SYNならどのremoteからも新session |
+| `address-dependent`（default） | `AddressDependent` | 送信済みremote IPv4、任意port | 同mappingにそのremote IPv4のlive sessionがあるinitial SYNだけ新session |
+| `address-and-port-dependent` | `AddressAndPortDependent` | 送信済みremote IPv4+port | 新sessionを作らない |
+
+defaultはUDP/TCPとも`address-dependent`です。両RFCがRECOMMENDEDとする二つのうち、
+security上より厳しい側をRFC準拠のbaselineとし（owner policy 2026-11-01）、transparencyを
+選ぶoperatorは`endpoint-independent`へ緩め、さらに厳しくしたいoperatorは
+`address-and-port-dependent`をopt-inします。UDPのdefaultは従来の挙動と同一です。TCPの従来の
+exact remote address/port filterは`address-and-port-dependent`として残り、defaultだけを
+RECOMMENDEDの`address-dependent`へ移しました。FIN/RSTでsessionを削除しないため、従来の挙動は
+RFC 5382 §4.3のConnection-Dependent Filteringではなく、exact sessionのidle timer中は同じ
+remote endpointからのSYNを通すAddress and Port-Dependent Filteringに当たります。
+
+UDPでは全modeでlive mappingを要求し、`endpoint-independent`はpeer lookupを行いません。
+inboundはpeerを作らずrefreshもしません。TCPではexact live sessionのpacketを全modeで変換し、
+exact sessionが無ければSYN=1、ACK=0、RST=0、FIN=0のinitial SYNだけがfilter判定に進みます。
+admitされたSYNは既存live mappingの上にsessionを一つ作ります（RFC 5382 §4.3、REQ-2の外部
+開始connection）。mappingは作らず、mapping idle summaryとsessionを同じcommitで更新します。
+`address-dependent`の判定はremote-address directoryの一回のkeyed lookupで、live
+sessionだけを数えます。expired sessionや旧generationのsessionは許可根拠になりません。
+outbound開始だけでなくinbound開始のsessionも許可根拠になり、inbound packetのTX requestは
+sessionとmappingのidle timeをrefreshします。したがって同じremote addressからSYNやACKを送り
+続ける限り、そのaddressのadmissionとmappingは生き続けます。
+`endpoint-independent`と`address-and-port-dependent`はlookupを行いません。
+
+filterを通ったinbound initial SYNは認証されておらず、firewallの判定（後段のpost-DNAT plan）より
+前にNAT planが走るため、そのper-packet workはsession capacityではなく
+`NAT44_TCP_INBOUND_SLOT_PROBES`（16）で上限します。remote-address chainは最大16 nodeだけ辿り、
+それを越えるchainは拒否（fail closed）とします。同じ`(mapping, remote IPv4)`のsessionは全て
+同じbucketに入るためchainはsession capacity近くまで伸び得ますが、lookupはどの場合も16 node
+までです。新sessionのslotは、exact tupleのexpired slotがあればそれを再利用し、無ければ
+16 slot以下のtableは全体を、それより大きいtableはruntimeのsecret hash key、tuple、時刻、
+probe番号から独立に決めた16個のslot位置だけを調べます。outboundのindex 0からの全scan
+（NAT44-035）はinbound開始では使いません。外部senderは位置を選べず、再送SYNは別の位置を
+調べます。outbound作成がlive slotを低indexへ集めても各probeは独立なので、live率ρのとき
+missの確率は約ρ^16です（ρ = 1/2で約1.5×10^-5。連続16 slotの窓では窓がlive領域から始まると
+ほぼ必ず満杯で、missが約ρになっていました）。probe位置に空きが無ければ他所に空きがあっても
+`NAT44_TCP_SESSION_TABLE_FULL`でdropし、live sessionをevictしません（inbound開始はbest-effort）。
+session作成は
+exact session directoryとremote-address directoryの両方へprepared link/relinkを
+rewrite前に検証し、commitはinfallibleです。そのためTCP outbound planは二つの
+prepared session linkを持ち、x86_64で288 bytes（上限320 bytesをtestで固定）になります。
+新しいcounter `nat44_tcp.inbound_sessions_created`は`sessions_created`にも含めて数えます。
+
+filterが拒否したpacketはbyte不変のsilent dropで、UDPは`NAT44_UDP_FILTER_DENIED`、TCPは
+`NAT44_TCP_SESSION_MISS`です。RFC 5382 REQ-4はunsolicited inbound SYNへ受信後少なくとも
+6秒は応答しないこと（MUST）と、その間にoutbound SYNを変換したら元のSYNをsilent dropすること
+（MUST）を求め、それ以外はICMP Port Unreachable（Type 3/Code 3）をSHOULDとし、応答がNATの
+security policyに反するならREQ-4 aでsilent dropをMUSTとします。このsliceはunsolicited SYNに
+TCP RSTもICMPも返さないため二つのMUSTを満たし、SHOULDのdelayed Port Unreachableは送りません。
+packet hold/replayをしない設計なので、REQ-4 aのsilent dropを現在の唯一のlocal policyとし、
+6秒以上のbounded quote hold、outbound SYNによるcancel、rate limit、operator switchを持つ
+delayed ICMPはdeferredです（requirements NAT44-038）。
+
+REQ-5のtimerはmodeに依存しません。inbound開始のsessionもoutbound開始と同じ単一idle timer
+（default/minimum 2時間4分）を使うため、partially open phaseのtransitory idle-timeout下限
+4分も満たしますが、外部から開いたまま応答の無いSYNもsession slotを2時間4分占有します。
+`endpoint-independent`と、inbound新規flowを許可するfirewall ruleを組み合わせると、外部hostが
+mapping済みpublic portへのSYNでsession tableを埋め、内部からの新規sessionが
+`NAT44_TCP_SESSION_TABLE_FULL`になり得ます。defaultの`address-dependent`でも、admissionは
+packetのsource addressだけで判定するため、off-pathの攻撃者がmappingが既にsessionを持つ
+remote address（広く使われるCDNやDNS serverのaddressなど）を詐称し、source portを変えたSYNを
+送れば同じことができます（requirements NAT44-041）。必要なのはmapping済みpublic portと、その
+mappingが話しているremote addressの推測です。この詐称で作られたsessionは2時間4分残り、同じ
+`(mapping, remote IPv4)`のchainを伸ばしますが、上の16 node上限によりlookup costは増えず、16 node以内に
+live sessionが見つからないADF判定（同じkeyでも、bucketが衝突する別keyでも）が拒否側に倒れるだけです。M1のようにfirewallがoutside→insideの新規flowを
+許可しない構成では、NAT planはcommitされないためsessionは作られません。remoteごとのinbound開始
+session数の上限（quota）はdeferredです。RFC 5382 REQ-6が扱う
+TCP ALGはこのsliceに無く、defaultでdisabledという要求を自明に満たします。
+
+filteringはNAT domainの境界を緩めません。firewallを同じworkerへbindする場合、firewallは
+従来どおりpost-DNATのremote→internal tupleでinbound packetを評価し、NAT filterが許可した
+packetもexact reverse stateか、outside→insideの新規flowを許可するruleが無ければ
+`FIREWALL_DEFAULT_DENIED`等でdropします。NAT planはfirewall planが成功するまでread-onlyなので、
+firewallが拒否したinbound SYNはNAT sessionも作りません。逆にfirewall ruleがflowを許可しても
+NAT filterが拒否すればdropします（実効admissionは両者の積）。NAT44-021の外部→内部direct LPM
+bypass拒否、route-miss時のNAT gate（#284）、realm mismatch、runtime/config authority検査は
+public宛てNAT interceptより前またはそれとは別の経路で、filtering modeを参照しません。
+
+filteringはpolicyの一部で、変更はreloadableです。storage shapeはmodeに依存しない
+（remote-address directoryは常に確保する）ため`STORAGE_SHAPE`にはならず、applyは他のNAT policy
+変更と同じく全mapping/peer/session/indexをflushします。そのため異なるkey粒度のpeerが混在する
+ことはありません。`ApplyPlan`は`NatChange::filtering`をtyped deltaとして出し、seedを含む
+残りのpolicyの変更だけを`policy_changed`にします。
+
 ## NAT44 ICMPv4 Fragmentation Needed translation
 
 `Nat44UdpPolicy`または`Nat44TcpPolicy`の`icmpv4_errors`を`ExternalOnly`へ明示設定した
@@ -596,8 +698,11 @@ limited/selected-prefix network/broadcast、inside/local sourceはstateやresolu
 dropします。RFC 5508 REQ-4のexternal-realm profileとして、validな中継router sourceは
 引用remote addressと一致する必要がなく、translation後も不変です。
 
-UDPはpublic source portのlive mappingと同generationのremote destination IPv4 ADF peerを
-authorityとし、引用remote portはfilter keyにしません。TCPはpublic source portのlive mapping
+UDPはpublic source portのlive mappingと同generationのfilter peerを、runtimeのkey粒度
+（`address-and-port-dependent`だけ引用remote destination IPv4/port、それ以外は引用remote
+destination IPv4）でauthorityとします。`endpoint-independent`でもpeerはaddress粒度で記録し、
+このauthorityに使うため、inbound filterを緩めても未接触addressを引用するICMPは変換しません。
+TCPはfiltering modeにかかわらずpublic source portのlive mapping
 と引用remote destination IPv4/portに完全一致するlive sessionを要求します。lookupは
 mapping/session/peer、last activity、counter、monotonic watermarkを変更しません。退行時刻は
 typed drop、同時刻以上はread-onlyです。RFC 5508 REQ-6が直接扱うのはICMP Queryまたは

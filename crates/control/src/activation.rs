@@ -218,6 +218,10 @@ pub struct FullServiceStorage {
     icmpv4_actions: Box<[Icmpv4ErrorActionSlot]>,
     udp: NatTables<Nat44UdpMappingSlot, Nat44UdpPeerSlot>,
     tcp: NatTables<Nat44TcpMappingSlot, Nat44TcpSessionSlot>,
+    /// TCP session remote-address directory, sized like the session
+    /// directory (address-dependent filtering).
+    tcp_session_address_buckets: Box<[DirectoryBucket]>,
+    tcp_session_address_nodes: Box<[DirectoryNode]>,
     firewall_states: Box<[FirewallStateSlot]>,
 }
 
@@ -298,6 +302,16 @@ impl FullServiceStorage {
                     tcp.session_nodes(),
                     tcp.port_owner_slots(),
                 ],
+                Nat44Tcp,
+            )?,
+            tcp_session_address_buckets: slots(
+                tcp.session_buckets(),
+                DirectoryBucket::default(),
+                Nat44Tcp,
+            )?,
+            tcp_session_address_nodes: slots(
+                tcp.session_nodes(),
+                DirectoryNode::default(),
                 Nat44Tcp,
             )?,
             firewall_states: slots(
@@ -623,6 +637,8 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             icmpv4_actions,
             udp,
             tcp,
+            tcp_session_address_buckets,
+            tcp_session_address_nodes,
             firewall_states,
         } = storage;
         let authority = candidate.authority();
@@ -649,6 +665,8 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
                 &mut tcp.mapping_nodes,
                 &mut tcp.secondary_buckets,
                 &mut tcp.secondary_nodes,
+                tcp_session_address_buckets,
+                tcp_session_address_nodes,
                 &mut tcp.port_owners,
             ),
             authority.nat44_tcp_hash_key(),

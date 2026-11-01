@@ -508,3 +508,99 @@ fn icmpv4_generation_switches_default_on_and_are_exact() {
         ]
     );
 }
+
+#[test]
+fn nat44_filtering_defaults_to_address_dependent_and_is_exact() {
+    use ruster_config::Nat44FilteringV1;
+
+    let VersionedConfig::V1(config) = parse(VALID_V1.as_bytes()).unwrap() else {
+        panic!("schema version 1");
+    };
+    // Absent key: the RFC 4787 REQ-8 / RFC 5382 REQ-3 "more stringent"
+    // RECOMMENDED behavior, for each protocol.
+    let nat = config.nat44.unwrap();
+    assert_eq!(
+        Nat44FilteringV1::default(),
+        Nat44FilteringV1::AddressDependent
+    );
+    assert_eq!(
+        nat.udp.unwrap().filtering,
+        Nat44FilteringV1::AddressDependent
+    );
+    assert_eq!(
+        nat.tcp.unwrap().filtering,
+        Nat44FilteringV1::AddressDependent
+    );
+
+    // Each protocol takes its own mode (RFC 5382 REQ-3 b).
+    for (udp, tcp, expected_udp, expected_tcp) in [
+        (
+            "endpoint-independent",
+            "address-and-port-dependent",
+            Nat44FilteringV1::EndpointIndependent,
+            Nat44FilteringV1::AddressAndPortDependent,
+        ),
+        (
+            "address-dependent",
+            "endpoint-independent",
+            Nat44FilteringV1::AddressDependent,
+            Nat44FilteringV1::EndpointIndependent,
+        ),
+    ] {
+        let source = VALID_V1
+            .replacen(
+                "icmpv4-errors = \"external-only\"\n",
+                &format!("icmpv4-errors = \"external-only\"\nfiltering = \"{udp}\"\n"),
+                1,
+            )
+            .replacen(
+                "icmpv4-errors = \"disabled\"\n",
+                &format!("icmpv4-errors = \"disabled\"\nfiltering = \"{tcp}\"\n"),
+                1,
+            );
+        let VersionedConfig::V1(config) = parse(source.as_bytes()).unwrap() else {
+            panic!("schema version 1");
+        };
+        let nat = config.nat44.unwrap();
+        assert_eq!(nat.udp.unwrap().filtering, expected_udp);
+        assert_eq!(nat.tcp.unwrap().filtering, expected_tcp);
+    }
+
+    // Unknown spellings (including RFC 5382's connection-dependent, which
+    // is not offered) and wrong types are typed and value-free.
+    for value in [
+        "\"connection-dependent\"",
+        "\"EndpointIndependent\"",
+        "\"endpoint_independent\"",
+        "1",
+    ] {
+        let replacement = format!("icmpv4-errors = \"disabled\"\nfiltering = {value}\n");
+        let diagnostic = parse(
+            VALID_V1
+                .replacen("icmpv4-errors = \"disabled\"\n", &replacement, 1)
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(diagnostic.code(), DiagnosticCode::InvalidType, "{value}");
+        assert_eq!(
+            diagnostic.path().segments(),
+            &[
+                PathSegment::Field("nat44".to_owned()),
+                PathSegment::Field("tcp".to_owned()),
+                PathSegment::Field("filtering".to_owned()),
+            ],
+            "{value}"
+        );
+    }
+    let misplaced = parse(
+        VALID_V1
+            .replacen(
+                "[nat44.realm.ports]",
+                "filtering = \"endpoint-independent\"\n\n[nat44.realm.ports]",
+                1,
+            )
+            .as_bytes(),
+    )
+    .unwrap_err();
+    assert_eq!(misplaced.code(), DiagnosticCode::UnknownField);
+}

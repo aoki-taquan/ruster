@@ -2839,7 +2839,12 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
                 return nat44_icmpv4_drop(ingress, Nat44UdpConfigMismatch, trace);
             }
             let lookup = runtime
-                .inspect_icmpv4(quote.public_port, quote.remote_address, now.0)
+                .inspect_icmpv4(
+                    quote.public_port,
+                    quote.remote_address,
+                    quote.remote_port,
+                    now.0,
+                )
                 .map_err(|error| {
                     let reason = match error {
                         Nat44UdpPlanError::MappingMiss => Nat44UdpMappingMiss,
@@ -3687,9 +3692,21 @@ fn decide_nat44_udp_outbound<T: TraceSink>(
         return nat44_udp_drop(ingress, Nat44UdpReverseAuthorityMismatch, trace);
     }
     let planned = if read_only_plan {
-        runtime.plan_outbound_read_only(ipv4.source, udp.source_port, ipv4.destination, now.0)
+        runtime.plan_outbound_read_only(
+            ipv4.source,
+            udp.source_port,
+            ipv4.destination,
+            udp.destination_port,
+            now.0,
+        )
     } else {
-        runtime.plan_outbound(ipv4.source, udp.source_port, ipv4.destination, now.0)
+        runtime.plan_outbound(
+            ipv4.source,
+            udp.source_port,
+            ipv4.destination,
+            udp.destination_port,
+            now.0,
+        )
     };
     let plan = match planned {
         Ok(plan) => plan,
@@ -3769,9 +3786,9 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
         return nat44_udp_drop(ingress, Nat44UdpSourceForbidden, trace);
     }
     let planned = if firewall_config.is_some() {
-        runtime.plan_inbound_read_only(udp.destination_port, ipv4.source, now.0)
+        runtime.plan_inbound_read_only(udp.destination_port, ipv4.source, udp.source_port, now.0)
     } else {
-        runtime.plan_inbound(udp.destination_port, ipv4.source, now.0)
+        runtime.plan_inbound(udp.destination_port, ipv4.source, udp.source_port, now.0)
     };
     let plan = match planned {
         Ok(plan) => plan,
@@ -4053,10 +4070,26 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
     {
         return nat44_tcp_drop(ingress, Nat44TcpSourceForbidden, trace);
     }
+    // Same initial-SYN predicate as outbound: SYN=1 with ACK/RST/FIN=0.
+    // Only such a packet may initiate a session through the NAT filter; a
+    // bound firewall still plans the translated packet below.
+    let initial_syn = tcp.flags & 0x17 == 0x02;
     let planned = if firewall_config.is_some() {
-        runtime.plan_inbound_read_only(tcp.destination_port, ipv4.source, tcp.source_port, now.0)
+        runtime.plan_inbound_read_only(
+            tcp.destination_port,
+            ipv4.source,
+            tcp.source_port,
+            initial_syn,
+            now.0,
+        )
     } else {
-        runtime.plan_inbound(tcp.destination_port, ipv4.source, tcp.source_port, now.0)
+        runtime.plan_inbound(
+            tcp.destination_port,
+            ipv4.source,
+            tcp.source_port,
+            initial_syn,
+            now.0,
+        )
     };
     let plan = match planned {
         Ok(plan) => plan,
@@ -5840,6 +5873,8 @@ mod tests {
         let mut mapping_nodes = [DirectoryNode::default(); 1];
         let mut session_buckets = [DirectoryBucket::default(); 1];
         let mut session_nodes = [DirectoryNode::default(); 1];
+        let mut session_address_buckets = session_buckets;
+        let mut session_address_nodes = session_nodes;
         let mut owners = [PortOwnerSlot::default(); 1];
         let mut firewall_states = [FirewallStateSlot::default(); 1];
         let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
@@ -5868,6 +5903,8 @@ mod tests {
                     &mut mapping_nodes,
                     &mut session_buckets,
                     &mut session_nodes,
+                    &mut session_address_buckets,
+                    &mut session_address_nodes,
                     &mut owners,
                 ),
                 Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0).unwrap(),
@@ -6003,7 +6040,7 @@ mod tests {
         let mut nat_indexes =
             crate::nat44::TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
         let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-        let plan = nat.plan_outbound(INTERNAL, 12_345, REMOTE, 0).unwrap();
+        let plan = nat.plan_outbound(INTERNAL, 12_345, REMOTE, 53, 0).unwrap();
         nat.commit_outbound(plan, 0).unwrap();
         let before_mapping = nat.mappings()[0];
         let before_peer = nat.peers()[0];

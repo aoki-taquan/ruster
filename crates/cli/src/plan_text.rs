@@ -159,6 +159,13 @@ fn nat(lines: &mut Vec<String>, kind: &str, change: NatChange) {
             old.first, old.last, new.first, new.last
         ));
     }
+    if let Some(Delta { old, new }) = change.filtering {
+        lines.push(format!(
+            "{kind} filtering ~ {} -> {}",
+            old.config_name(),
+            new.config_name()
+        ));
+    }
     if change.policy_changed {
         lines.push(format!("{kind} policy ~ changed"));
     }

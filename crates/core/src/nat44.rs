@@ -23,6 +23,10 @@ pub const NAT44_UDP_MAX_IDLE_TTL_MS: u64 = 86_400_000;
 pub const NAT44_TCP_MIN_IDLE_TTL_MS: u64 = 7_440_000;
 pub const NAT44_TCP_DEFAULT_IDLE_TTL_MS: u64 = 7_440_000;
 pub const NAT44_TCP_MAX_IDLE_TTL_MS: u64 = 604_800_000;
+/// Per-packet work bound for an inbound initial SYN that passed the NAT
+/// filter: at most this many session slots examined for reuse, and at most
+/// this many remote-address chain nodes for address-dependent admission.
+pub const NAT44_TCP_INBOUND_SLOT_PROBES: usize = 16;
 const UDP_INDEX_NONE: u32 = u32::MAX;
 const TCP_INDEX_NONE: u32 = u32::MAX;
 static NEXT_UDP_RUNTIME_IDENTITY: AtomicU64 = AtomicU64::new(1);
@@ -65,11 +69,58 @@ pub enum Nat44Icmpv4ErrorPolicy {
     ExternalOnly,
 }
 
+/// Inbound filtering behavior of one NAT44 protocol (RFC 4787 §5).
+///
+/// RFC 4787 REQ-8 (UDP) and RFC 5382 REQ-3 (TCP) RECOMMEND
+/// [`Nat44Filtering::EndpointIndependent`] when application transparency is
+/// most important and [`Nat44Filtering::AddressDependent`] when a more
+/// stringent behavior is most important, and allow the behavior to be an
+/// administrator option (REQ-8 a, REQ-3 a) that may differ per protocol
+/// (RFC 5382 REQ-3 b). The default is the more stringent RECOMMENDED
+/// choice, `AddressDependent`. `AddressAndPortDependent` is a stricter
+/// opt-in that neither RFC recommends.
+///
+/// Filtering only decides whether an inbound packet may use an existing live
+/// mapping. It never creates a mapping, and any bound firewall still
+/// evaluates the translated packet afterwards.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Nat44Filtering {
+    /// Any external endpoint may reach a live mapping.
+    EndpointIndependent,
+    /// Only external IPv4 addresses the mapping has sent to (any port).
+    #[default]
+    AddressDependent,
+    /// Only the exact external IPv4 address and port the mapping has sent to.
+    AddressAndPortDependent,
+}
+
+impl Nat44Filtering {
+    /// Every variant, in RFC 4787 §5 order from loosest to strictest.
+    pub const ALL: [Self; 3] = [
+        Self::EndpointIndependent,
+        Self::AddressDependent,
+        Self::AddressAndPortDependent,
+    ];
+
+    /// The declarative-config spelling (`filtering = "..."`). Exhaustive in
+    /// this crate, so a new variant cannot be rendered without a name.
+    #[must_use]
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            Self::EndpointIndependent => "endpoint-independent",
+            Self::AddressDependent => "address-dependent",
+            Self::AddressAndPortDependent => "address-and-port-dependent",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Nat44UdpPolicy {
     idle_ttl_ms: u64,
     allocator_seed: u64,
     icmpv4_errors: Nat44Icmpv4ErrorPolicy,
+    filtering: Nat44Filtering,
 }
 
 impl std::fmt::Debug for Nat44UdpPolicy {
@@ -79,6 +130,7 @@ impl std::fmt::Debug for Nat44UdpPolicy {
             .field("idle_ttl_ms", &self.idle_ttl_ms)
             .field("allocator_seed", &Redacted)
             .field("icmpv4_errors", &self.icmpv4_errors)
+            .field("filtering", &self.filtering)
             .finish()
     }
 }
@@ -127,6 +179,10 @@ mod tcp_tests {
             Box::leak(vec![DirectoryBucket::default(); session_bucket_count].into_boxed_slice());
         let session_nodes =
             Box::leak(vec![DirectoryNode::default(); sessions.len()].into_boxed_slice());
+        let session_address_buckets =
+            Box::leak(vec![DirectoryBucket::default(); session_bucket_count].into_boxed_slice());
+        let session_address_nodes =
+            Box::leak(vec![DirectoryNode::default(); sessions.len()].into_boxed_slice());
         let port_count = usize::from(config.last_port - config.first_port) + 1;
         let port_owners = Box::leak(vec![PortOwnerSlot::default(); port_count].into_boxed_slice());
         Nat44TcpRuntime::new(
@@ -138,6 +194,8 @@ mod tcp_tests {
                 mapping_nodes,
                 session_buckets,
                 session_nodes,
+                session_address_buckets,
+                session_address_nodes,
                 port_owners,
             ),
             test_tcp_hash_key(),
@@ -279,10 +337,10 @@ mod tcp_tests {
                     .unwrap();
                 runtime.commit_outbound(first, 0).unwrap();
                 assert!(runtime
-                    .plan_inbound(40_000, REMOTE1, 443, NAT44_TCP_MIN_IDLE_TTL_MS - 1)
+                    .plan_inbound(40_000, REMOTE1, 443, false, NAT44_TCP_MIN_IDLE_TTL_MS - 1)
                     .is_ok());
                 assert!(matches!(
-                    runtime.plan_inbound(40_000, REMOTE1, 443, NAT44_TCP_MIN_IDLE_TTL_MS),
+                    runtime.plan_inbound(40_000, REMOTE1, 443, false, NAT44_TCP_MIN_IDLE_TTL_MS),
                     Err(Nat44TcpPlanError::MappingMiss)
                 ));
                 assert!(matches!(
@@ -356,7 +414,7 @@ mod tcp_tests {
                 assert_eq!(runtime.mappings()[0].last_activity_ms, ttl - 1);
 
                 assert!(matches!(
-                    runtime.plan_inbound(40_000, REMOTE1, 443, ttl),
+                    runtime.plan_inbound(40_000, REMOTE1, 443, false, ttl),
                     Err(Nat44TcpPlanError::SessionMiss)
                 ));
                 let third = runtime
@@ -377,11 +435,11 @@ mod tcp_tests {
                         && session.remote_port == 8443
                 }));
                 assert!(matches!(
-                    runtime.plan_inbound(40_000, REMOTE2, 8443, ttl * 2 - 1),
+                    runtime.plan_inbound(40_000, REMOTE2, 8443, false, ttl * 2 - 1),
                     Err(Nat44TcpPlanError::SessionMiss)
                 ));
                 assert!(matches!(
-                    runtime.plan_inbound(40_000, REMOTE1, 9443, ttl * 2),
+                    runtime.plan_inbound(40_000, REMOTE1, 9443, false, ttl * 2),
                     Err(Nat44TcpPlanError::MappingMiss)
                 ));
             },
@@ -412,7 +470,7 @@ mod tcp_tests {
                     .plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 443, false, 200)
                     .unwrap();
                 let inbound = runtime
-                    .plan_inbound_read_only(40_000, REMOTE1, 443, 300)
+                    .plan_inbound_read_only(40_000, REMOTE1, 443, false, 300)
                     .unwrap();
                 let _ = (outbound, inbound);
 
@@ -475,7 +533,7 @@ mod tcp_tests {
                 .unwrap();
             runtime.commit_outbound(first, 0).unwrap();
             let stale = runtime
-                .plan_inbound_read_only(40_000, REMOTE1, 443, 0)
+                .plan_inbound_read_only(40_000, REMOTE1, 443, false, 0)
                 .unwrap();
             let stale_mapping = runtime.mappings()[0];
             let stale_session = runtime.sessions()[0];
@@ -537,7 +595,7 @@ mod tcp_tests {
                     .plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 443, false, 0)
                     .unwrap();
                 let stale_inbound = runtime
-                    .plan_inbound_read_only(40_000, REMOTE1, 443, 0)
+                    .plan_inbound_read_only(40_000, REMOTE1, 443, false, 0)
                     .unwrap();
 
                 let replacement = runtime
@@ -771,8 +829,11 @@ mod tcp_tests {
             );
             assert_eq!(std::mem::size_of::<Nat44TcpMappingSlot>(), 48);
             assert_eq!(std::mem::size_of::<Nat44TcpSessionSlot>(), 48);
+            // A new session is keyed into both the exact and the
+            // remote-address session directory, so the plan carries two
+            // prepared session links (288 bytes on x86_64).
             assert!(
-                std::mem::size_of::<Nat44TcpOutboundPlan>() <= 256,
+                std::mem::size_of::<Nat44TcpOutboundPlan>() <= 320,
                 "plan size {}",
                 std::mem::size_of::<Nat44TcpOutboundPlan>()
             );
@@ -828,6 +889,226 @@ mod tcp_tests {
     }
 
     #[test]
+    fn tcp_inbound_initiation_is_filtered_bounded_and_stale_plans_are_rejected() {
+        for filtering in [
+            Nat44Filtering::EndpointIndependent,
+            Nat44Filtering::AddressDependent,
+            Nat44Filtering::AddressAndPortDependent,
+        ] {
+            let policy = Nat44TcpPolicy::default().with_filtering(filtering);
+            with_config(policy, 40_000, 40_000, |config| {
+                let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 4];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                let shape = runtime.storage_shape();
+                assert_eq!(
+                    (
+                        shape.session_address_buckets(),
+                        shape.session_address_nodes()
+                    ),
+                    (shape.session_buckets(), shape.session_nodes())
+                );
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                    .unwrap();
+                runtime.commit_outbound(plan, 0).unwrap();
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+
+                // A non-SYN packet without an exact session never initiates.
+                assert_eq!(
+                    runtime.plan_inbound(40_000, REMOTE1, 8443, false, 1).err(),
+                    Some(Nat44TcpPlanError::SessionMiss)
+                );
+                runtime.session_address_lookup_probes.set(0);
+                let planned = runtime.plan_inbound(40_000, REMOTE1, 8443, true, 1);
+                let address_probes = runtime.session_address_lookup_probes.get();
+                if filtering == Nat44Filtering::AddressDependent {
+                    // One bounded keyed lookup, never a session scan.
+                    assert!((1..=4).contains(&address_probes));
+                } else {
+                    assert_eq!(address_probes, 0);
+                }
+                if filtering == Nat44Filtering::AddressAndPortDependent {
+                    assert_eq!(planned.err(), Some(Nat44TcpPlanError::SessionMiss));
+                    assert_eq!(runtime.counters().inbound_sessions_created, 0);
+                    return;
+                }
+                let stale = planned.unwrap();
+                // Any intervening state revision makes the plan stale.
+                runtime.observe_now(2).unwrap();
+                assert_eq!(
+                    runtime.prevalidate_inbound_commit(stale, 1),
+                    Err(Nat44TcpCommitError::StalePlan)
+                );
+                assert_eq!(runtime.counters().inbound_sessions_created, 0);
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+
+                let plan = runtime
+                    .plan_inbound(40_000, REMOTE1, 8443, true, 2)
+                    .unwrap();
+                runtime.commit_inbound(plan, 2).unwrap();
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+                assert_eq!(runtime.counters().inbound_sessions_created, 1);
+                assert_eq!(runtime.counters().sessions_created, 2);
+                // The new session is now exact: its packets and the internal
+                // answer translate without creating more state.
+                let plan = runtime
+                    .plan_inbound(40_000, REMOTE1, 8443, false, 3)
+                    .unwrap();
+                runtime.commit_inbound(plan, 3).unwrap();
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, 8443, false, 4)
+                    .unwrap();
+                runtime.commit_outbound(plan, 4).unwrap();
+                assert_eq!(runtime.counters().sessions_created, 2);
+                assert_eq!(runtime.counters().mappings_created, 1);
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+
+                // An unmapped public port is a mapping miss in every mode.
+                runtime
+                    .reconcile(config, rotated_test_tcp_hash_key())
+                    .unwrap();
+                assert_eq!(
+                    runtime.plan_inbound(40_000, REMOTE1, 8443, true, 5).err(),
+                    Some(Nat44TcpPlanError::MappingMiss)
+                );
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+            });
+        }
+    }
+
+    /// Unauthenticated inbound SYNs that pass the NAT filter run before any
+    /// firewall decision, so their work is bounded by
+    /// `NAT44_TCP_INBOUND_SLOT_PROBES`, not by the session capacity.
+    /// Outbound creation fills slots from index 0, so live slots cluster.
+    /// Inbound probes are independent keyed positions: at half occupancy a
+    /// miss has probability about 2^-16, not about 1/2 as a window starting
+    /// inside the live cluster would give.
+    #[test]
+    fn tcp_inbound_slot_probes_are_independent_of_outbound_clustering() {
+        const SESSIONS: usize = 256;
+        let policy = Nat44TcpPolicy::default().with_filtering(Nat44Filtering::EndpointIndependent);
+        with_config(policy, 40_000, 40_000, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); SESSIONS];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            for port in 1..=(SESSIONS / 2) as u16 {
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, port, true, 0)
+                    .unwrap();
+                runtime.commit_outbound(plan, 0).unwrap();
+            }
+            // Live slots are exactly the low half.
+            assert!(runtime.sessions()[..SESSIONS / 2]
+                .iter()
+                .all(|slot| slot.is_occupied()));
+            assert!(runtime.sessions()[SESSIONS / 2..]
+                .iter()
+                .all(|slot| !slot.is_occupied()));
+            let mut misses = 0;
+            for remote_port in 1..=1000 {
+                runtime.reusable_session_checks.set(0);
+                match runtime.plan_inbound_read_only(40_000, REMOTE2, remote_port, true, 1) {
+                    Ok(_) => {}
+                    Err(Nat44TcpPlanError::SessionFull) => misses += 1,
+                    Err(error) => panic!("unexpected {error:?}"),
+                }
+                assert!(runtime.reusable_session_checks.get() <= NAT44_TCP_INBOUND_SLOT_PROBES);
+            }
+            // Expected about 1000 * 2^-16 = 0.015; consecutive windows gave
+            // about 440 here.
+            assert!(misses <= 2, "{misses} of 1000 inbound SYNs missed");
+        });
+    }
+
+    #[test]
+    fn tcp_inbound_syn_work_is_bounded_independent_of_session_capacity() {
+        const SESSIONS: usize = 64;
+        // A full table: every slot live. The old full scan examined all 64.
+        let policy = Nat44TcpPolicy::default().with_filtering(Nat44Filtering::EndpointIndependent);
+        with_config(policy, 40_000, 40_000, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); SESSIONS];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            for port in 1..=SESSIONS as u16 {
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, port, true, 0)
+                    .unwrap();
+                runtime.commit_outbound(plan, 0).unwrap();
+            }
+            for remote_port in 1..=8 {
+                runtime.reusable_session_checks.set(0);
+                assert_eq!(
+                    runtime
+                        .plan_inbound(40_000, REMOTE2, remote_port, true, 1)
+                        .err(),
+                    Some(Nat44TcpPlanError::SessionFull)
+                );
+                assert!(
+                    runtime.reusable_session_checks.get() <= NAT44_TCP_INBOUND_SLOT_PROBES,
+                    "examined {}",
+                    runtime.reusable_session_checks.get()
+                );
+            }
+            // The outbound path keeps its exhaustive search.
+            runtime.reusable_session_checks.set(0);
+            assert_eq!(
+                runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE2, 1, true, 1)
+                    .err(),
+                Some(Nat44TcpPlanError::SessionFull)
+            );
+            assert_eq!(runtime.reusable_session_checks.get(), SESSIONS);
+        });
+
+        // Address-dependent: a long chain of expired (mapping, REMOTE1)
+        // sessions is walked at most NAT44_TCP_INBOUND_SLOT_PROBES nodes
+        // deep and refuses (fails closed).
+        let policy = Nat44TcpPolicy::default();
+        with_config(policy, 40_000, 40_000, |config| {
+            let ttl = config.policy().idle_ttl_ms();
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); SESSIONS];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            for port in 1..=40 {
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, REMOTE1, port, true, 0)
+                    .unwrap();
+                runtime.commit_outbound(plan, 0).unwrap();
+            }
+            let plan = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE2, 443, true, ttl - 1)
+                .unwrap();
+            runtime.commit_outbound(plan, ttl - 1).unwrap();
+            runtime.session_address_lookup_probes.set(0);
+            assert_eq!(
+                runtime.plan_inbound(40_000, REMOTE1, 9, true, ttl).err(),
+                Some(Nat44TcpPlanError::SessionMiss)
+            );
+            let probes = runtime.session_address_lookup_probes.get();
+            assert!(probes <= NAT44_TCP_INBOUND_SLOT_PROBES, "probes {probes}");
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+
+        // With free slots available the bounded window still admits.
+        let policy = Nat44TcpPolicy::default().with_filtering(Nat44Filtering::EndpointIndependent);
+        with_config(policy, 40_000, 40_000, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); SESSIONS];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            let plan = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                .unwrap();
+            runtime.commit_outbound(plan, 0).unwrap();
+            runtime.reusable_session_checks.set(0);
+            let plan = runtime.plan_inbound(40_000, REMOTE2, 443, true, 1).unwrap();
+            assert!(runtime.reusable_session_checks.get() <= NAT44_TCP_INBOUND_SLOT_PROBES);
+            runtime.commit_inbound(plan, 1).unwrap();
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+    }
+
+    #[test]
     fn tcp_zero_capacity_same_backing_uses_a_fresh_runtime_identity() {
         with_config(Nat44TcpPolicy::default(), 40_000, 40_000, |config| {
             let mut mappings = [];
@@ -836,6 +1117,8 @@ mod tcp_tests {
             let mut mapping_nodes = [];
             let mut session_buckets = [];
             let mut session_nodes = [];
+            let mut session_address_buckets = session_buckets;
+            let mut session_address_nodes = session_nodes;
             let mut owners = [PortOwnerSlot::default(); 1];
             let first_binding = {
                 let first = Nat44TcpRuntime::new(
@@ -847,6 +1130,8 @@ mod tcp_tests {
                         &mut mapping_nodes,
                         &mut session_buckets,
                         &mut session_nodes,
+                        &mut session_address_buckets,
+                        &mut session_address_nodes,
                         &mut owners,
                     ),
                     test_tcp_hash_key(),
@@ -863,6 +1148,8 @@ mod tcp_tests {
                     &mut mapping_nodes,
                     &mut session_buckets,
                     &mut session_nodes,
+                    &mut session_address_buckets,
+                    &mut session_address_nodes,
                     &mut owners,
                 ),
                 test_tcp_hash_key(),
@@ -936,6 +1223,8 @@ mod tcp_tests {
             let mut no_mapping_nodes = [];
             let mut session_buckets = [DirectoryBucket::default(); 1];
             let mut session_nodes = [DirectoryNode::default(); 1];
+            let mut session_address_buckets = session_buckets;
+            let mut session_address_nodes = session_nodes;
             let mut owners = [PortOwnerSlot::default(); 1];
             let before_mapping_buckets = mapping_buckets;
             let before_session_buckets = session_buckets;
@@ -946,6 +1235,8 @@ mod tcp_tests {
                 &mut no_mapping_nodes,
                 &mut session_buckets,
                 &mut session_nodes,
+                &mut session_address_buckets,
+                &mut session_address_nodes,
                 &mut owners,
             );
             assert!(matches!(
@@ -1194,6 +1485,8 @@ mod tcp_tests {
                     let mut mapping_nodes = [DirectoryNode::default(); MAPPING_CAPACITY];
                     let mut session_buckets = [DirectoryBucket::default(); 16];
                     let mut session_nodes = [DirectoryNode::default(); SESSION_CAPACITY];
+                    let mut session_address_buckets = session_buckets;
+                    let mut session_address_nodes = session_nodes;
                     let mut owners = [PortOwnerSlot::default(); PORT_CAPACITY];
                     let mut runtime = Nat44TcpRuntime::new(
                         config,
@@ -1204,6 +1497,8 @@ mod tcp_tests {
                             &mut mapping_nodes,
                             &mut session_buckets,
                             &mut session_nodes,
+                            &mut session_address_buckets,
+                            &mut session_address_nodes,
                             &mut owners,
                         ),
                         test_tcp_hash_key(),
@@ -1487,6 +1782,7 @@ impl Nat44UdpPolicy {
             idle_ttl_ms,
             allocator_seed,
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
+            filtering: Nat44Filtering::AddressDependent,
         })
     }
 
@@ -1510,6 +1806,19 @@ impl Nat44UdpPolicy {
     pub const fn icmpv4_errors(self) -> Nat44Icmpv4ErrorPolicy {
         self.icmpv4_errors
     }
+
+    /// Selects the inbound filtering behavior. The default is
+    /// [`Nat44Filtering::AddressDependent`].
+    #[must_use]
+    pub const fn with_filtering(mut self, filtering: Nat44Filtering) -> Self {
+        self.filtering = filtering;
+        self
+    }
+
+    #[must_use]
+    pub const fn filtering(self) -> Nat44Filtering {
+        self.filtering
+    }
 }
 
 impl Default for Nat44UdpPolicy {
@@ -1518,6 +1827,7 @@ impl Default for Nat44UdpPolicy {
             idle_ttl_ms: NAT44_UDP_DEFAULT_IDLE_TTL_MS,
             allocator_seed: 0,
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
+            filtering: Nat44Filtering::AddressDependent,
         }
     }
 }
@@ -1760,6 +2070,9 @@ pub struct Nat44UdpPeerSlot {
     mapping_generation: u64,
     mapping_lifecycle_epoch: u128,
     remote_address: Ipv4Address,
+    /// Filter key port: the remote UDP port under
+    /// [`Nat44Filtering::AddressAndPortDependent`], otherwise zero.
+    remote_port: u16,
 }
 
 impl std::fmt::Debug for Nat44UdpPeerSlot {
@@ -1779,6 +2092,7 @@ impl Default for Nat44UdpPeerSlot {
             mapping_generation: 0,
             mapping_lifecycle_epoch: 0,
             remote_address: Ipv4Address::from_octets([0; 4]),
+            remote_port: 0,
         }
     }
 }
@@ -1792,6 +2106,13 @@ impl Nat44UdpPeerSlot {
     #[must_use]
     pub const fn remote_address(self) -> Ipv4Address {
         self.remote_address
+    }
+
+    /// Remote UDP port of the filter key. Zero unless the runtime uses
+    /// [`Nat44Filtering::AddressAndPortDependent`].
+    #[must_use]
+    pub const fn remote_port(self) -> u16 {
+        self.remote_port
     }
 }
 
@@ -2551,10 +2872,17 @@ impl<'a> Nat44UdpRuntime<'a> {
         internal_address: Ipv4Address,
         internal_port: u16,
         remote_address: Ipv4Address,
+        remote_port: u16,
         now_ms: u64,
     ) -> Result<Nat44UdpOutboundPlan, Nat44UdpPlanError> {
         self.observe_now(now_ms)?;
-        self.plan_outbound_after_clock(internal_address, internal_port, remote_address, now_ms)
+        self.plan_outbound_after_clock(
+            internal_address,
+            internal_port,
+            remote_address,
+            remote_port,
+            now_ms,
+        )
     }
 
     pub(crate) fn plan_outbound_read_only(
@@ -2562,10 +2890,28 @@ impl<'a> Nat44UdpRuntime<'a> {
         internal_address: Ipv4Address,
         internal_port: u16,
         remote_address: Ipv4Address,
+        remote_port: u16,
         now_ms: u64,
     ) -> Result<Nat44UdpOutboundPlan, Nat44UdpPlanError> {
         self.check_now_read_only(now_ms)?;
-        self.plan_outbound_after_clock(internal_address, internal_port, remote_address, now_ms)
+        self.plan_outbound_after_clock(
+            internal_address,
+            internal_port,
+            remote_address,
+            remote_port,
+            now_ms,
+        )
+    }
+
+    /// Port component of a peer filter key: the remote port only under
+    /// address-and-port-dependent filtering. Endpoint-independent runtimes
+    /// still record address-granular peers, which authorize only the
+    /// read-only quoted ICMPv4 translation.
+    const fn peer_key_port(&self, remote_port: u16) -> u16 {
+        match self.config.policy.filtering {
+            Nat44Filtering::AddressAndPortDependent => remote_port,
+            Nat44Filtering::EndpointIndependent | Nat44Filtering::AddressDependent => 0,
+        }
     }
 
     fn plan_outbound_after_clock(
@@ -2573,16 +2919,23 @@ impl<'a> Nat44UdpRuntime<'a> {
         internal_address: Ipv4Address,
         internal_port: u16,
         remote_address: Ipv4Address,
+        remote_port: u16,
         now_ms: u64,
     ) -> Result<Nat44UdpOutboundPlan, Nat44UdpPlanError> {
         if self.state_revision == u128::MAX {
             return Err(Nat44UdpPlanError::StateRevisionExhausted);
         }
+        let remote_port = self.peer_key_port(remote_port);
         let exact_mapping = self.find_mapping(internal_address, internal_port)?;
         if let Some((mapping_index, mapping)) =
             exact_mapping.filter(|(_, mapping)| self.mapping_is_live(*mapping, now_ms))
         {
-            if self.peer_exists(mapping_index, mapping.generation, remote_address)? {
+            if self.peer_exists(
+                mapping_index,
+                mapping.generation,
+                remote_address,
+                remote_port,
+            )? {
                 let mut refreshed = mapping;
                 refreshed.last_outbound_ms = now_ms;
                 return self.prepare_outbound_plan(
@@ -2619,6 +2972,7 @@ impl<'a> Nat44UdpRuntime<'a> {
                         mapping_generation: mapping.generation,
                         mapping_lifecycle_epoch: mapping.lifecycle_epoch,
                         remote_address,
+                        remote_port,
                     }),
                     mapping_created: false,
                     mapping_expired: false,
@@ -2669,6 +3023,7 @@ impl<'a> Nat44UdpRuntime<'a> {
                     mapping_generation: generation,
                     mapping_lifecycle_epoch: self.runtime_epoch,
                     remote_address,
+                    remote_port,
                 }),
                 mapping_created: true,
                 mapping_expired,
@@ -2747,26 +3102,32 @@ impl<'a> Nat44UdpRuntime<'a> {
         &mut self,
         public_port: u16,
         remote_address: Ipv4Address,
+        remote_port: u16,
         now_ms: u64,
     ) -> Result<Nat44UdpInboundPlan, Nat44UdpPlanError> {
         self.observe_now(now_ms)?;
-        self.plan_inbound_after_clock(public_port, remote_address, now_ms)
+        self.plan_inbound_after_clock(public_port, remote_address, remote_port, now_ms)
     }
 
     pub(crate) fn plan_inbound_read_only(
         &self,
         public_port: u16,
         remote_address: Ipv4Address,
+        remote_port: u16,
         now_ms: u64,
     ) -> Result<Nat44UdpInboundPlan, Nat44UdpPlanError> {
         self.check_now_read_only(now_ms)?;
-        self.plan_inbound_after_clock(public_port, remote_address, now_ms)
+        self.plan_inbound_after_clock(public_port, remote_address, remote_port, now_ms)
     }
 
+    /// Inbound filter (RFC 4787 §5): a live mapping is required in every
+    /// mode; address-dependent and address-and-port-dependent modes also
+    /// require a recorded peer at their key granularity.
     fn plan_inbound_after_clock(
         &self,
         public_port: u16,
         remote_address: Ipv4Address,
+        remote_port: u16,
         now_ms: u64,
     ) -> Result<Nat44UdpInboundPlan, Nat44UdpPlanError> {
         if self.state_revision == u128::MAX {
@@ -2776,7 +3137,14 @@ impl<'a> Nat44UdpRuntime<'a> {
         else {
             return Err(Nat44UdpPlanError::MappingMiss);
         };
-        if !self.peer_exists(mapping_index, mapping.generation, remote_address)? {
+        if self.config.policy.filtering != Nat44Filtering::EndpointIndependent
+            && !self.peer_exists(
+                mapping_index,
+                mapping.generation,
+                remote_address,
+                self.peer_key_port(remote_port),
+            )?
+        {
             return Err(Nat44UdpPlanError::FilterDenied);
         }
         Ok(Nat44UdpInboundPlan {
@@ -2860,10 +3228,15 @@ impl<'a> Nat44UdpRuntime<'a> {
         }
     }
 
+    /// Read-only authority for a quoted outbound UDP packet. The quoted
+    /// remote endpoint must match a recorded peer at the runtime's peer key
+    /// granularity; endpoint-independent runtimes use address-granular peers
+    /// here, so a looser inbound filter does not loosen ICMP authority.
     pub(crate) fn inspect_icmpv4(
         &self,
         public_port: u16,
         remote_address: Ipv4Address,
+        remote_port: u16,
         now_ms: u64,
     ) -> Result<Nat44UdpIcmpv4Lookup, Nat44UdpPlanError> {
         if self
@@ -2876,7 +3249,12 @@ impl<'a> Nat44UdpRuntime<'a> {
         else {
             return Err(Nat44UdpPlanError::MappingMiss);
         };
-        if !self.peer_exists(mapping_index, mapping.generation, remote_address)? {
+        if !self.peer_exists(
+            mapping_index,
+            mapping.generation,
+            remote_address,
+            self.peer_key_port(remote_port),
+        )? {
             return Err(Nat44UdpPlanError::FilterDenied);
         }
         Ok(Nat44UdpIcmpv4Lookup {
@@ -3149,18 +3527,21 @@ impl<'a> Nat44UdpRuntime<'a> {
         )
     }
 
+    /// The key port shares the address word, so address-granular keys (port
+    /// zero) hash exactly as before the port component existed.
     const fn peer_lookup_words(
         mapping_index: usize,
         mapping_generation: u64,
         lifecycle_epoch: u128,
         remote_address: Ipv4Address,
+        remote_port: u16,
     ) -> [u64; 5] {
         [
             mapping_index as u64,
             mapping_generation,
             (lifecycle_epoch >> 64) as u64,
             lifecycle_epoch as u64,
-            u32::from_be_bytes(remote_address.octets()) as u64,
+            (u32::from_be_bytes(remote_address.octets()) as u64) | ((remote_port as u64) << 32),
         ]
     }
 
@@ -3170,6 +3551,7 @@ impl<'a> Nat44UdpRuntime<'a> {
             peer.mapping_generation,
             peer.mapping_lifecycle_epoch,
             peer.remote_address,
+            peer.remote_port,
         )
     }
 
@@ -3227,6 +3609,7 @@ impl<'a> Nat44UdpRuntime<'a> {
                     && other.mapping_generation == peer.mapping_generation
                     && other.mapping_lifecycle_epoch == peer.mapping_lifecycle_epoch
                     && other.remote_address == peer.remote_address
+                    && other.remote_port == peer.remote_port
             }) {
                 return Err(Nat44UdpIndexInvariantError::DuplicatePeerKey);
             }
@@ -3276,6 +3659,7 @@ impl<'a> Nat44UdpRuntime<'a> {
         mapping_index: usize,
         mapping_generation: u64,
         remote_address: Ipv4Address,
+        remote_port: u16,
     ) -> Result<bool, Nat44UdpPlanError> {
         let mapping = self
             .mappings
@@ -3290,6 +3674,7 @@ impl<'a> Nat44UdpRuntime<'a> {
             mapping_generation,
             mapping.lifecycle_epoch,
             remote_address,
+            remote_port,
         );
         let probe = self
             .peer_directory
@@ -3300,6 +3685,7 @@ impl<'a> Nat44UdpRuntime<'a> {
                     && peer.mapping_generation == mapping_generation
                     && peer.mapping_lifecycle_epoch == mapping.lifecycle_epoch
                     && peer.remote_address == remote_address
+                    && peer.remote_port == remote_port
             })
             .map_err(|_| Nat44UdpPlanError::IndexCorrupt)?;
         #[cfg(test)]
@@ -3477,6 +3863,7 @@ pub struct Nat44TcpPolicy {
     idle_ttl_ms: u64,
     allocator_seed: u64,
     icmpv4_errors: Nat44Icmpv4ErrorPolicy,
+    filtering: Nat44Filtering,
 }
 
 impl std::fmt::Debug for Nat44TcpPolicy {
@@ -3486,6 +3873,7 @@ impl std::fmt::Debug for Nat44TcpPolicy {
             .field("idle_ttl_ms", &self.idle_ttl_ms)
             .field("allocator_seed", &Redacted)
             .field("icmpv4_errors", &self.icmpv4_errors)
+            .field("filtering", &self.filtering)
             .finish()
     }
 }
@@ -3509,6 +3897,7 @@ impl Nat44TcpPolicy {
             idle_ttl_ms,
             allocator_seed,
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
+            filtering: Nat44Filtering::AddressDependent,
         })
     }
 
@@ -3532,6 +3921,19 @@ impl Nat44TcpPolicy {
     pub const fn icmpv4_errors(self) -> Nat44Icmpv4ErrorPolicy {
         self.icmpv4_errors
     }
+
+    /// Selects the inbound filtering behavior. The default is
+    /// [`Nat44Filtering::AddressDependent`].
+    #[must_use]
+    pub const fn with_filtering(mut self, filtering: Nat44Filtering) -> Self {
+        self.filtering = filtering;
+        self
+    }
+
+    #[must_use]
+    pub const fn filtering(self) -> Nat44Filtering {
+        self.filtering
+    }
 }
 
 impl Default for Nat44TcpPolicy {
@@ -3540,6 +3942,7 @@ impl Default for Nat44TcpPolicy {
             idle_ttl_ms: NAT44_TCP_DEFAULT_IDLE_TTL_MS,
             allocator_seed: 0,
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
+            filtering: Nat44Filtering::AddressDependent,
         }
     }
 }
@@ -3811,6 +4214,9 @@ pub struct Nat44TcpCounters {
     pub mappings_reused: u64,
     pub mappings_expired: u64,
     pub sessions_created: u64,
+    /// Sessions created by an inbound initial SYN that the configured
+    /// filtering admitted. Also counted in `sessions_created`.
+    pub inbound_sessions_created: u64,
     pub sessions_reused: u64,
     pub sessions_expired: u64,
     pub outbound_translated: u64,
@@ -3906,6 +4312,9 @@ pub(crate) struct Nat44TcpInboundPlan {
     mapping: Nat44TcpMappingSlot,
     session_index: usize,
     session: Nat44TcpSessionSlot,
+    session_created: bool,
+    session_expired: bool,
+    prepared: PreparedNat44TcpSessionLink,
 }
 
 #[derive(Clone, Copy)]
@@ -3958,17 +4367,32 @@ enum PreparedTcpDirectoryMutation {
     Relink(PreparedDirectoryRelink),
 }
 
+/// Prepared links of one newly keyed session slot in the exact session
+/// directory and the remote-address directory over the same slots.
+#[derive(Clone, Copy)]
+struct PreparedNat44TcpSessionLink {
+    session: Option<PreparedTcpDirectoryMutation>,
+    address: Option<PreparedTcpDirectoryMutation>,
+}
+
+impl PreparedNat44TcpSessionLink {
+    const EMPTY: Self = Self {
+        session: None,
+        address: None,
+    };
+}
+
 #[derive(Clone, Copy)]
 struct PreparedNat44TcpOutboundCommit {
     mapping: Option<PreparedTcpDirectoryMutation>,
-    session: Option<PreparedTcpDirectoryMutation>,
+    session: PreparedNat44TcpSessionLink,
     owner: Option<PreparedPortOwnerMoveTopology>,
 }
 
 impl PreparedNat44TcpOutboundCommit {
     const EMPTY: Self = Self {
         mapping: None,
-        session: None,
+        session: PreparedNat44TcpSessionLink::EMPTY,
         owner: None,
     };
 }
@@ -3985,6 +4409,7 @@ struct Nat44TcpPortSelection {
 enum Nat44TcpIndexInvariantError {
     Mapping(DirectorySemanticError),
     Session(DirectorySemanticError),
+    SessionAddress(DirectorySemanticError),
     Port(PortOwnerSemanticError),
     DuplicateMappingKey,
     DuplicateSessionKey,
@@ -4008,12 +4433,21 @@ impl Nat44TcpIcmpv4Lookup {
     }
 }
 
-/// Caller-owned storage for TCP NAT mapping, session, and port-owner indexes.
+/// Caller-owned storage for TCP NAT mapping, session, session remote-address,
+/// and port-owner indexes.
+///
+/// The session remote-address directory indexes the same session slots as
+/// the exact session directory, keyed by mapping and remote IPv4 only. It
+/// answers the address-dependent filtering question "does this mapping have
+/// a live session with this remote address" without scanning sessions, so
+/// its node count must equal the session count.
 pub struct Nat44TcpIndexStorage<'a> {
     mapping_buckets: &'a mut [DirectoryBucket],
     mapping_nodes: &'a mut [DirectoryNode],
     session_buckets: &'a mut [DirectoryBucket],
     session_nodes: &'a mut [DirectoryNode],
+    session_address_buckets: &'a mut [DirectoryBucket],
+    session_address_nodes: &'a mut [DirectoryNode],
     port_owners: &'a mut [PortOwnerSlot],
 }
 
@@ -4023,6 +4457,8 @@ impl<'a> Nat44TcpIndexStorage<'a> {
         mapping_nodes: &'a mut [DirectoryNode],
         session_buckets: &'a mut [DirectoryBucket],
         session_nodes: &'a mut [DirectoryNode],
+        session_address_buckets: &'a mut [DirectoryBucket],
+        session_address_nodes: &'a mut [DirectoryNode],
         port_owners: &'a mut [PortOwnerSlot],
     ) -> Self {
         Self {
@@ -4030,6 +4466,8 @@ impl<'a> Nat44TcpIndexStorage<'a> {
             mapping_nodes,
             session_buckets,
             session_nodes,
+            session_address_buckets,
+            session_address_nodes,
             port_owners,
         }
     }
@@ -4040,8 +4478,10 @@ impl<'a> Nat44TcpIndexStorage<'a> {
 pub enum Nat44TcpRuntimeConfigError {
     MappingNodeCountMismatch,
     SessionNodeCountMismatch,
+    SessionAddressNodeCountMismatch,
     MappingDirectoryInvalid,
     SessionDirectoryInvalid,
+    SessionAddressDirectoryInvalid,
     PortOwnerTableInvalid,
     RuntimeIdentityExhausted,
 }
@@ -4062,6 +4502,8 @@ pub struct Nat44TcpStorageShape {
     mapping_nodes: u32,
     session_buckets: u32,
     session_nodes: u32,
+    session_address_buckets: u32,
+    session_address_nodes: u32,
     port_owner_slots: u32,
 }
 
@@ -4084,6 +4526,12 @@ impl Nat44TcpStorageShape {
     pub const fn session_nodes(self) -> u32 {
         self.session_nodes
     }
+    pub const fn session_address_buckets(self) -> u32 {
+        self.session_address_buckets
+    }
+    pub const fn session_address_nodes(self) -> u32 {
+        self.session_address_nodes
+    }
     pub const fn port_owner_slots(self) -> u32 {
         self.port_owner_slots
     }
@@ -4098,6 +4546,8 @@ struct Nat44TcpRuntimeBinding {
     mapping_nodes: Nat44UdpBackingIdentity,
     session_buckets: Nat44UdpBackingIdentity,
     session_nodes: Nat44UdpBackingIdentity,
+    session_address_buckets: Nat44UdpBackingIdentity,
+    session_address_nodes: Nat44UdpBackingIdentity,
     port_owners: Nat44UdpBackingIdentity,
 }
 
@@ -4116,6 +4566,8 @@ impl Nat44TcpRuntimeBinding {
             mapping_nodes: Nat44UdpBackingIdentity::of(indexes.mapping_nodes),
             session_buckets: Nat44UdpBackingIdentity::of(indexes.session_buckets),
             session_nodes: Nat44UdpBackingIdentity::of(indexes.session_nodes),
+            session_address_buckets: Nat44UdpBackingIdentity::of(indexes.session_address_buckets),
+            session_address_nodes: Nat44UdpBackingIdentity::of(indexes.session_address_nodes),
             port_owners: Nat44UdpBackingIdentity::of(indexes.port_owners),
         }
     }
@@ -4219,6 +4671,7 @@ pub struct Nat44TcpRuntime<'a> {
     sessions: &'a mut [Nat44TcpSessionSlot],
     mapping_directory: FixedDirectory<'a>,
     session_directory: FixedDirectory<'a>,
+    session_address_directory: FixedDirectory<'a>,
     port_owners: PortOwnerTable<'a>,
     hash_key: Nat44TcpHashKey,
     watermark_ms: Option<u64>,
@@ -4236,6 +4689,8 @@ pub struct Nat44TcpRuntime<'a> {
     mapping_lookup_probes: Cell<usize>,
     #[cfg(test)]
     session_lookup_probes: Cell<usize>,
+    #[cfg(test)]
+    session_address_lookup_probes: Cell<usize>,
     #[cfg(test)]
     reusable_mapping_checks: Cell<usize>,
     #[cfg(test)]
@@ -4259,10 +4714,18 @@ impl<'a> Nat44TcpRuntime<'a> {
         if indexes.session_nodes.len() != sessions.len() {
             return Err(Nat44TcpRuntimeConfigError::SessionNodeCountMismatch);
         }
+        if indexes.session_address_nodes.len() != sessions.len() {
+            return Err(Nat44TcpRuntimeConfigError::SessionAddressNodeCountMismatch);
+        }
         FixedDirectory::validate_config(indexes.mapping_buckets.len(), indexes.mapping_nodes.len())
             .map_err(|_| Nat44TcpRuntimeConfigError::MappingDirectoryInvalid)?;
         FixedDirectory::validate_config(indexes.session_buckets.len(), indexes.session_nodes.len())
             .map_err(|_| Nat44TcpRuntimeConfigError::SessionDirectoryInvalid)?;
+        FixedDirectory::validate_config(
+            indexes.session_address_buckets.len(),
+            indexes.session_address_nodes.len(),
+        )
+        .map_err(|_| Nat44TcpRuntimeConfigError::SessionAddressDirectoryInvalid)?;
         PortOwnerTable::validate_config(
             indexes.port_owners.len(),
             config.first_port,
@@ -4279,6 +4742,12 @@ impl<'a> Nat44TcpRuntime<'a> {
         let session_directory =
             FixedDirectory::new(indexes.session_buckets, indexes.session_nodes, hash_key.0)
                 .expect("session directory dimensions were preflighted");
+        let session_address_directory = FixedDirectory::new(
+            indexes.session_address_buckets,
+            indexes.session_address_nodes,
+            hash_key.0,
+        )
+        .expect("session address directory dimensions were preflighted");
         let port_owners = PortOwnerTable::new(
             indexes.port_owners,
             config.first_port,
@@ -4294,6 +4763,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             sessions,
             mapping_directory,
             session_directory,
+            session_address_directory,
             port_owners,
             hash_key,
             watermark_ms: None,
@@ -4310,6 +4780,8 @@ impl<'a> Nat44TcpRuntime<'a> {
             mapping_lookup_probes: Cell::new(0),
             #[cfg(test)]
             session_lookup_probes: Cell::new(0),
+            #[cfg(test)]
+            session_address_lookup_probes: Cell::new(0),
             #[cfg(test)]
             reusable_mapping_checks: Cell::new(0),
             #[cfg(test)]
@@ -4351,6 +4823,10 @@ impl<'a> Nat44TcpRuntime<'a> {
             session_buckets: u32::try_from(self.session_directory.bucket_count())
                 .expect("validated capacity"),
             session_nodes: u32::try_from(self.session_directory.node_capacity())
+                .expect("validated capacity"),
+            session_address_buckets: u32::try_from(self.session_address_directory.bucket_count())
+                .expect("validated capacity"),
+            session_address_nodes: u32::try_from(self.session_address_directory.node_capacity())
                 .expect("validated capacity"),
             port_owner_slots: u32::try_from(self.port_owners.slot_count())
                 .expect("validated capacity"),
@@ -4416,6 +4892,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         self.sessions.fill(Nat44TcpSessionSlot::default());
         self.mapping_directory.clear_with_key(hash_key.0);
         self.session_directory.clear_with_key(hash_key.0);
+        self.session_address_directory.clear_with_key(hash_key.0);
         self.port_owners.reconfigure_prevalidated_and_clear(
             config.first_port,
             config.last_port,
@@ -4659,10 +5136,17 @@ impl<'a> Nat44TcpRuntime<'a> {
         public_port: u16,
         remote_address: Ipv4Address,
         remote_port: u16,
+        initial_syn: bool,
         now_ms: u64,
     ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
         self.observe_now(now_ms)?;
-        self.plan_inbound_after_clock(public_port, remote_address, remote_port, now_ms)
+        self.plan_inbound_after_clock(
+            public_port,
+            remote_address,
+            remote_port,
+            initial_syn,
+            now_ms,
+        )
     }
 
     pub(crate) fn plan_inbound_read_only(
@@ -4670,17 +5154,33 @@ impl<'a> Nat44TcpRuntime<'a> {
         public_port: u16,
         remote_address: Ipv4Address,
         remote_port: u16,
+        initial_syn: bool,
         now_ms: u64,
     ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
         self.check_now_read_only(now_ms)?;
-        self.plan_inbound_after_clock(public_port, remote_address, remote_port, now_ms)
+        self.plan_inbound_after_clock(
+            public_port,
+            remote_address,
+            remote_port,
+            initial_syn,
+            now_ms,
+        )
     }
 
+    /// Plans an inbound packet. An exact live session is always translated.
+    /// Without one, only an initial SYN (SYN=1, ACK/RST/FIN=0) may initiate
+    /// a session on the live mapping, and only when the configured filtering
+    /// admits the remote endpoint (RFC 5382 §4.3, REQ-3): any endpoint under
+    /// endpoint-independent filtering, a remote IPv4 with another live
+    /// session of this mapping under address-dependent filtering, never under
+    /// address-and-port-dependent filtering. Every refusal is
+    /// `SessionMiss`, a silent drop (REQ-4 a).
     fn plan_inbound_after_clock(
         &self,
         public_port: u16,
         remote_address: Ipv4Address,
         remote_port: u16,
+        initial_syn: bool,
         now_ms: u64,
     ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
         if self.state_revision == u128::MAX {
@@ -4692,29 +5192,185 @@ impl<'a> Nat44TcpRuntime<'a> {
             return Err(Nat44TcpPlanError::MappingMiss);
         };
         let mapping_before = mapping;
-        let Some((session_index, mut session)) = self.find_session(
+        let exact_session = self.find_session(
             mapping_index,
             mapping.generation,
             mapping.lifecycle_epoch,
             remote_address,
             remote_port,
-        )?
-        else {
-            return Err(Nat44TcpPlanError::SessionMiss);
-        };
-        if !self.session_is_live(session, now_ms) {
+        )?;
+        if let Some((session_index, mut session)) =
+            exact_session.filter(|(_, session)| self.session_is_live(*session, now_ms))
+        {
+            let session_before = session;
+            mapping.last_activity_ms = now_ms;
+            session.last_activity_ms = now_ms;
+            return Ok(Nat44TcpInboundPlan {
+                authority: self.plan_authority(now_ms, mapping_before, session_before),
+                mapping_index,
+                mapping,
+                session_index,
+                session,
+                session_created: false,
+                session_expired: false,
+                prepared: PreparedNat44TcpSessionLink::EMPTY,
+            });
+        }
+        if !initial_syn
+            || !self.inbound_filter_admits(mapping_index, mapping, remote_address, now_ms)?
+        {
             return Err(Nat44TcpPlanError::SessionMiss);
         }
-        let session_before = session;
+        // Externally initiated sessions never run the outbound O(S) slot
+        // scan: this packet is unauthenticated and a bound firewall has not
+        // judged it yet. Reuse the exact expired slot, or probe a bounded
+        // keyed window.
+        let session_index = if let Some((session_index, _)) = exact_session {
+            session_index
+        } else if let Some(session_index) = self.find_reusable_session_for_inbound(
+            mapping_index,
+            mapping,
+            remote_address,
+            remote_port,
+            now_ms,
+        ) {
+            session_index
+        } else {
+            return Err(Nat44TcpPlanError::SessionFull);
+        };
+        let session_before = self.sessions[session_index];
+        let session = Nat44TcpSessionSlot {
+            occupied: true,
+            mapping_index,
+            mapping_generation: mapping.generation,
+            mapping_lifecycle_epoch: mapping.lifecycle_epoch,
+            remote_address,
+            remote_port,
+            last_activity_ms: now_ms,
+        };
+        let prepared = self.prepare_session_link(session_index, session)?;
         mapping.last_activity_ms = now_ms;
-        session.last_activity_ms = now_ms;
         Ok(Nat44TcpInboundPlan {
             authority: self.plan_authority(now_ms, mapping_before, session_before),
             mapping_index,
             mapping,
             session_index,
             session,
+            session_created: true,
+            session_expired: session_before.occupied,
+            prepared,
         })
+    }
+
+    /// Bounded slot search for an inbound-initiated session.
+    ///
+    /// A table of at most [`NAT44_TCP_INBOUND_SLOT_PROBES`] slots is
+    /// scanned whole. A larger one gets that many probes, each at an
+    /// independent position keyed by the runtime's secret hash key, the
+    /// tuple, the time, and the probe number. An external sender cannot
+    /// steer the positions, and a retransmitted SYN probes others. Probes
+    /// are independent of where outbound creation clusters live slots (it
+    /// fills from index 0), so with live fraction ρ a miss has probability
+    /// about ρ^16 (well under 10^-4 at ρ = 1/2). A miss is `SessionFull`
+    /// even if a reusable slot exists elsewhere; the outbound path keeps its
+    /// full scan.
+    fn find_reusable_session_for_inbound(
+        &self,
+        mapping_index: usize,
+        mapping: Nat44TcpMappingSlot,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        now_ms: u64,
+    ) -> Option<usize> {
+        let capacity = self.sessions.len();
+        if capacity == 0 {
+            return None;
+        }
+        if capacity <= NAT44_TCP_INBOUND_SLOT_PROBES {
+            return (0..capacity).find(|&index| self.session_slot_reusable(index, now_ms));
+        }
+        let mut words = [
+            mapping_index as u64,
+            mapping.generation,
+            u64::from(u32::from_be_bytes(remote_address.octets())),
+            u64::from(remote_port),
+            now_ms,
+            0,
+        ];
+        (0..NAT44_TCP_INBOUND_SLOT_PROBES as u64)
+            .map(|probe| {
+                words[5] = probe;
+                let position = self
+                    .hash_key
+                    .0
+                    .hash_words(DirectoryHashDomain::TcpInboundSlot, &words);
+                usize::try_from(position % capacity as u64).expect("index below capacity")
+            })
+            .find(|&index| self.session_slot_reusable(index, now_ms))
+    }
+
+    /// Filtering decision for an inbound initial SYN without an exact live
+    /// session. Bounded: no lookup for endpoint-independent or
+    /// address-and-port-dependent filtering, and for address-dependent
+    /// filtering one remote-address directory lookup that visits at most
+    /// [`NAT44_TCP_INBOUND_SLOT_PROBES`] chain nodes and fails closed
+    /// (refuses) beyond that.
+    fn inbound_filter_admits(
+        &self,
+        mapping_index: usize,
+        mapping: Nat44TcpMappingSlot,
+        remote_address: Ipv4Address,
+        now_ms: u64,
+    ) -> Result<bool, Nat44TcpPlanError> {
+        match self.config.policy.filtering {
+            Nat44Filtering::EndpointIndependent => Ok(true),
+            Nat44Filtering::AddressAndPortDependent => Ok(false),
+            Nat44Filtering::AddressDependent => self.live_session_with_address_exists(
+                mapping_index,
+                mapping,
+                remote_address,
+                now_ms,
+            ),
+        }
+    }
+
+    fn live_session_with_address_exists(
+        &self,
+        mapping_index: usize,
+        mapping: Nat44TcpMappingSlot,
+        remote_address: Ipv4Address,
+        now_ms: u64,
+    ) -> Result<bool, Nat44TcpPlanError> {
+        let words = Self::session_address_lookup_words(
+            mapping_index,
+            mapping.generation,
+            mapping.lifecycle_epoch,
+            remote_address,
+        );
+        let probe = self
+            .session_address_directory
+            .lookup_bounded(
+                DirectoryHashDomain::TcpSessionAddress,
+                &words,
+                NAT44_TCP_INBOUND_SLOT_PROBES,
+                |index| {
+                    let session = self.sessions[index];
+                    session.occupied
+                        && session.mapping_index == mapping_index
+                        && session.mapping_generation == mapping.generation
+                        && session.mapping_lifecycle_epoch == mapping.lifecycle_epoch
+                        && session.remote_address == remote_address
+                        && self.session_is_live(session, now_ms)
+                },
+            )
+            .map_err(|_| Nat44TcpPlanError::IndexCorrupt)?;
+        #[cfg(test)]
+        self.session_address_lookup_probes.set(
+            self.session_address_lookup_probes
+                .get()
+                .saturating_add(probe.probes),
+        );
+        Ok(probe.state_index.is_some())
     }
 
     #[allow(dead_code)] // Typed stale-plan API retained for core callers and tests.
@@ -4743,10 +5399,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             .prepared
             .mapping
             .is_none_or(|mutation| self.mapping_mutation_matches(mutation))
-            || !plan
-                .prepared
-                .session
-                .is_none_or(|mutation| self.session_mutation_matches(mutation))
+            || !self.session_link_matches(plan.prepared.session)
         {
             return Err(Nat44TcpCommitError::StalePlan);
         }
@@ -4757,9 +5410,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         if let Some(mutation) = plan.prepared.mapping {
             self.apply_mapping_mutation(mutation);
         }
-        if let Some(mutation) = plan.prepared.session {
-            self.apply_session_mutation(mutation);
-        }
+        self.apply_session_link(plan.prepared.session);
         if let Some(owner) = plan.prepared.owner {
             let replacement = PortOwnerToken::from_prevalidated_index(
                 plan.mapping_index,
@@ -4820,15 +5471,29 @@ impl<'a> Nat44TcpRuntime<'a> {
             plan.mapping_index,
             plan.session_index,
             now_ms,
-        )
+        )?;
+        if !self.session_link_matches(plan.prepared) {
+            return Err(Nat44TcpCommitError::StalePlan);
+        }
+        Ok(())
     }
 
     pub(crate) fn commit_prevalidated_inbound(&mut self, plan: Nat44TcpInboundPlan, now_ms: u64) {
+        self.apply_session_link(plan.prepared);
         self.mappings[plan.mapping_index] = plan.mapping;
         self.sessions[plan.session_index] = plan.session;
         self.watermark_ms = Some(now_ms);
         self.state_revision = plan.authority.state_revision + 1;
-        self.counters.sessions_reused = self.counters.sessions_reused.saturating_add(1);
+        if plan.session_created {
+            self.counters.sessions_created = self.counters.sessions_created.saturating_add(1);
+            self.counters.inbound_sessions_created =
+                self.counters.inbound_sessions_created.saturating_add(1);
+            if plan.session_expired {
+                self.counters.sessions_expired = self.counters.sessions_expired.saturating_add(1);
+            }
+        } else {
+            self.counters.sessions_reused = self.counters.sessions_reused.saturating_add(1);
+        }
         self.counters.inbound_translated = self.counters.inbound_translated.saturating_add(1);
     }
 
@@ -5073,20 +5738,23 @@ impl<'a> Nat44TcpRuntime<'a> {
     }
 
     fn find_reusable_session(&self, now_ms: u64) -> Option<usize> {
-        self.sessions.iter().position(|session| {
-            #[cfg(test)]
-            self.reusable_session_checks
-                .set(self.reusable_session_checks.get().saturating_add(1));
-            !self.session_is_live(*session, now_ms)
-                || self
-                    .mappings
-                    .get(session.mapping_index)
-                    .is_none_or(|mapping| {
-                        !mapping.occupied
-                            || mapping.generation != session.mapping_generation
-                            || mapping.lifecycle_epoch != session.mapping_lifecycle_epoch
-                    })
-        })
+        (0..self.sessions.len()).find(|&index| self.session_slot_reusable(index, now_ms))
+    }
+
+    fn session_slot_reusable(&self, index: usize, now_ms: u64) -> bool {
+        #[cfg(test)]
+        self.reusable_session_checks
+            .set(self.reusable_session_checks.get().saturating_add(1));
+        let session = self.sessions[index];
+        !self.session_is_live(session, now_ms)
+            || self
+                .mappings
+                .get(session.mapping_index)
+                .is_none_or(|mapping| {
+                    !mapping.occupied
+                        || mapping.generation != session.mapping_generation
+                        || mapping.lifecycle_epoch != session.mapping_lifecycle_epoch
+                })
     }
 
     fn mapping_for_public_port(
@@ -5210,6 +5878,105 @@ impl<'a> Nat44TcpRuntime<'a> {
         )
     }
 
+    const fn session_address_lookup_words(
+        mapping_index: usize,
+        mapping_generation: u64,
+        lifecycle_epoch: u128,
+        remote_address: Ipv4Address,
+    ) -> [u64; 5] {
+        [
+            mapping_index as u64,
+            mapping_generation,
+            (lifecycle_epoch >> 64) as u64,
+            lifecycle_epoch as u64,
+            u32::from_be_bytes(remote_address.octets()) as u64,
+        ]
+    }
+
+    const fn session_address_words(session: Nat44TcpSessionSlot) -> [u64; 5] {
+        Self::session_address_lookup_words(
+            session.mapping_index,
+            session.mapping_generation,
+            session.mapping_lifecycle_epoch,
+            session.remote_address,
+        )
+    }
+
+    /// Prepares keying `session` into slot `session_index` of both session
+    /// directories. A slot is linked in both or in neither, so the previous
+    /// occupancy selects link or relink for each.
+    fn prepare_session_link(
+        &self,
+        session_index: usize,
+        session: Nat44TcpSessionSlot,
+    ) -> Result<PreparedNat44TcpSessionLink, Nat44TcpPlanError> {
+        let occupied = self.sessions[session_index].occupied;
+        let prepare = |directory: &FixedDirectory<'_>, domain, words: &[u64]| {
+            if occupied {
+                directory
+                    .prepare_relink(session_index, domain, words)
+                    .map(PreparedTcpDirectoryMutation::Relink)
+            } else {
+                directory
+                    .prepare_link(session_index, domain, words)
+                    .map(PreparedTcpDirectoryMutation::Link)
+            }
+            .map_err(|_| Nat44TcpPlanError::IndexCorrupt)
+        };
+        Ok(PreparedNat44TcpSessionLink {
+            session: Some(prepare(
+                &self.session_directory,
+                DirectoryHashDomain::TcpSession,
+                &Self::session_words(session),
+            )?),
+            address: Some(prepare(
+                &self.session_address_directory,
+                DirectoryHashDomain::TcpSessionAddress,
+                &Self::session_address_words(session),
+            )?),
+        })
+    }
+
+    fn session_link_matches(&self, link: PreparedNat44TcpSessionLink) -> bool {
+        link.session
+            .is_none_or(|mutation| self.session_mutation_matches(mutation))
+            && link
+                .address
+                .is_none_or(|mutation| self.session_address_mutation_matches(mutation))
+    }
+
+    fn apply_session_link(&mut self, link: PreparedNat44TcpSessionLink) {
+        if let Some(mutation) = link.session {
+            self.apply_session_mutation(mutation);
+        }
+        if let Some(mutation) = link.address {
+            self.apply_session_address_mutation(mutation);
+        }
+    }
+
+    fn session_address_mutation_matches(&self, mutation: PreparedTcpDirectoryMutation) -> bool {
+        match mutation {
+            PreparedTcpDirectoryMutation::Link(prepared) => self
+                .session_address_directory
+                .prepared_link_matches(prepared),
+            PreparedTcpDirectoryMutation::Relink(prepared) => self
+                .session_address_directory
+                .prepared_relink_matches(prepared),
+        }
+    }
+
+    fn apply_session_address_mutation(&mut self, mutation: PreparedTcpDirectoryMutation) {
+        match mutation {
+            PreparedTcpDirectoryMutation::Link(prepared) => {
+                self.session_address_directory.apply_prepared_link(prepared);
+            }
+            PreparedTcpDirectoryMutation::Relink(prepared) => {
+                self.session_address_directory
+                    .apply_prepared_relink(prepared);
+            }
+        }
+    }
+
     fn mapping_owner_token(
         mapping_index: usize,
         mapping: Nat44TcpMappingSlot,
@@ -5243,24 +6010,9 @@ impl<'a> Nat44TcpRuntime<'a> {
             None
         };
         let session = if plan.session_created {
-            let words = Self::session_words(plan.session);
-            let session_index = plan.session_index();
-            let before = self.sessions[session_index];
-            Some(if before.occupied {
-                PreparedTcpDirectoryMutation::Relink(
-                    self.session_directory
-                        .prepare_relink(session_index, DirectoryHashDomain::TcpSession, &words)
-                        .map_err(|_| Nat44TcpPlanError::IndexCorrupt)?,
-                )
-            } else {
-                PreparedTcpDirectoryMutation::Link(
-                    self.session_directory
-                        .prepare_link(session_index, DirectoryHashDomain::TcpSession, &words)
-                        .map_err(|_| Nat44TcpPlanError::IndexCorrupt)?,
-                )
-            })
+            self.prepare_session_link(plan.session_index(), plan.session)?
         } else {
-            None
+            PreparedNat44TcpSessionLink::EMPTY
         };
         let owner = if plan.mapping_created {
             let mapping_index = plan.mapping_index();
@@ -5368,6 +6120,17 @@ impl<'a> Nat44TcpRuntime<'a> {
                 })
             })
             .map_err(Nat44TcpIndexInvariantError::Session)?;
+        self.session_address_directory
+            .validate_semantics(|index| {
+                let session = self.sessions[index];
+                session.occupied.then(|| {
+                    key.hash_words(
+                        DirectoryHashDomain::TcpSessionAddress,
+                        &Self::session_address_words(session),
+                    )
+                })
+            })
+            .map_err(Nat44TcpIndexInvariantError::SessionAddress)?;
         self.port_owners
             .validate_semantics(|index| {
                 let mapping = self.mappings[index];
@@ -5476,6 +6239,7 @@ mod tests {
     const PUBLIC: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 10]);
     const REMOTE1: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 1]);
     const REMOTE2: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 2]);
+    const TEST_REMOTE_PORT: u16 = 53;
 
     fn rotated_udp_hash_key() -> Nat44UdpHashKey {
         Nat44UdpHashKey::new(0xa5a5_5a5a_0123_4567, 0x1357_9bdf_2468_ace0).unwrap()
@@ -5560,22 +6324,22 @@ mod tests {
         assert_eq!(
             format!("{udp_policy:?}"),
             "Nat44UdpPolicy { idle_ttl_ms: 120000, allocator_seed: [REDACTED], \
-             icmpv4_errors: ExternalOnly }"
+             icmpv4_errors: ExternalOnly, filtering: AddressDependent }"
         );
         assert_eq!(
             format!("{udp_policy:#?}"),
             "Nat44UdpPolicy {\n    idle_ttl_ms: 120000,\n    allocator_seed: [REDACTED],\n    \
-             icmpv4_errors: ExternalOnly,\n}"
+             icmpv4_errors: ExternalOnly,\n    filtering: AddressDependent,\n}"
         );
         assert_eq!(
             format!("{tcp_policy:?}"),
             "Nat44TcpPolicy { idle_ttl_ms: 7440000, allocator_seed: [REDACTED], \
-             icmpv4_errors: ExternalOnly }"
+             icmpv4_errors: ExternalOnly, filtering: AddressDependent }"
         );
         assert_eq!(
             format!("{tcp_policy:#?}"),
             "Nat44TcpPolicy {\n    idle_ttl_ms: 7440000,\n    allocator_seed: [REDACTED],\n    \
-             icmpv4_errors: ExternalOnly,\n}"
+             icmpv4_errors: ExternalOnly,\n    filtering: AddressDependent,\n}"
         );
 
         with_config(udp_policy, |udp_config| {
@@ -5607,7 +6371,8 @@ mod tests {
                 "Nat44UdpConfig { inside: IfId(1), outside: IfId(2), public_address: \
                  Ipv4Address(3405803786), first_port: 40000, last_port: 40001, policy: \
                  Nat44UdpPolicy { idle_ttl_ms: 120000, allocator_seed: [REDACTED], \
-                 icmpv4_errors: ExternalOnly }, authority: [REDACTED], snapshot_identity: \
+                 icmpv4_errors: ExternalOnly, filtering: AddressDependent }, authority: \
+                 [REDACTED], snapshot_identity: \
                  [REDACTED] }"
             );
             assert_eq!(
@@ -5615,7 +6380,8 @@ mod tests {
                 "Nat44TcpConfig { inside: IfId(1), outside: IfId(2), public_address: \
                  Ipv4Address(3405803786), first_port: 40000, last_port: 40001, policy: \
                  Nat44TcpPolicy { idle_ttl_ms: 7440000, allocator_seed: [REDACTED], \
-                 icmpv4_errors: ExternalOnly }, authority: [REDACTED], snapshot_identity: \
+                 icmpv4_errors: ExternalOnly, filtering: AddressDependent }, authority: \
+                 [REDACTED], snapshot_identity: \
                  [REDACTED] }"
             );
             let udp_pretty = format!("{udp_config:#?}");
@@ -5626,7 +6392,8 @@ mod tests {
                  2,\n    ),\n    public_address: Ipv4Address(\n        3405803786,\n    ),\n    \
                  first_port: 40000,\n    last_port: 40001,\n    policy: Nat44UdpPolicy {\n        \
                  idle_ttl_ms: 120000,\n        allocator_seed: [REDACTED],\n        icmpv4_errors: \
-                 ExternalOnly,\n    },\n    authority: [REDACTED],\n    snapshot_identity: \
+                 ExternalOnly,\n        filtering: AddressDependent,\n    },\n    authority: \
+                 [REDACTED],\n    snapshot_identity: \
                  [REDACTED],\n}"
             );
             assert_eq!(
@@ -5635,7 +6402,8 @@ mod tests {
                  2,\n    ),\n    public_address: Ipv4Address(\n        3405803786,\n    ),\n    \
                  first_port: 40000,\n    last_port: 40001,\n    policy: Nat44TcpPolicy {\n        \
                  idle_ttl_ms: 7440000,\n        allocator_seed: [REDACTED],\n        icmpv4_errors: \
-                 ExternalOnly,\n    },\n    authority: [REDACTED],\n    snapshot_identity: \
+                 ExternalOnly,\n        filtering: AddressDependent,\n    },\n    authority: \
+                 [REDACTED],\n    snapshot_identity: \
                  [REDACTED],\n}"
             );
             assert_eq!(udp_pretty.matches("[REDACTED]").count(), 3);
@@ -5746,8 +6514,10 @@ mod tests {
             mapping_generation: POISON_U64,
             mapping_lifecycle_epoch: POISON_U128,
             remote_address: POISON_ADDRESS,
+            remote_port: 0xbeef,
         };
         let mut udp_peer_hidden = udp_peer;
+        udp_peer_hidden.remote_port -= 1;
         udp_peer_hidden.mapping_index -= 1;
         udp_peer_hidden.mapping_generation -= 1;
         udp_peer_hidden.mapping_lifecycle_epoch -= 1;
@@ -6086,6 +6856,7 @@ mod tests {
                 "mappings_reused",
                 "mappings_expired",
                 "sessions_created",
+                "inbound_sessions_created",
                 "sessions_reused",
                 "sessions_expired",
                 "outbound_translated",
@@ -6146,6 +6917,8 @@ mod tests {
                 "mapping_nodes",
                 "session_buckets",
                 "session_nodes",
+                "session_address_buckets",
+                "session_address_nodes",
                 "port_owner_slots",
             ]
         );
@@ -6191,33 +6964,121 @@ mod tests {
             let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
             assert!(runtime.publication_binding_matches(config, test_udp_hash_key()));
             assert!(!runtime.publication_binding_matches(config, rotated_udp_hash_key()));
-            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            let first = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0)
+                .unwrap();
             assert_eq!(first.public_port(), 40_000);
             runtime.commit_outbound(first, 0).unwrap();
-            let second = runtime.plan_outbound(INTERNAL, 40_000, REMOTE2, 1).unwrap();
+            let second = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE2, TEST_REMOTE_PORT, 1)
+                .unwrap();
             assert_eq!(second.public_port(), 40_000);
             runtime.commit_outbound(second, 1).unwrap();
-            assert!(runtime.plan_inbound(40_000, REMOTE1, 2).is_ok());
-            assert!(runtime.plan_inbound(40_000, REMOTE2, 2).is_ok());
+            assert!(runtime
+                .plan_inbound(40_000, REMOTE1, TEST_REMOTE_PORT, 2)
+                .is_ok());
+            assert!(runtime
+                .plan_inbound(40_000, REMOTE2, TEST_REMOTE_PORT, 2)
+                .is_ok());
 
             assert!(matches!(
-                runtime.plan_inbound(40_000, REMOTE1, NAT44_UDP_MIN_IDLE_TTL_MS + 1),
+                runtime.plan_inbound(
+                    40_000,
+                    REMOTE1,
+                    TEST_REMOTE_PORT,
+                    NAT44_UDP_MIN_IDLE_TTL_MS + 1
+                ),
                 Err(Nat44UdpPlanError::MappingMiss)
             ));
             let reused = runtime
-                .plan_outbound(INTERNAL2, 40_000, REMOTE2, NAT44_UDP_MIN_IDLE_TTL_MS + 1)
+                .plan_outbound(
+                    INTERNAL2,
+                    40_000,
+                    REMOTE2,
+                    TEST_REMOTE_PORT,
+                    NAT44_UDP_MIN_IDLE_TTL_MS + 1,
+                )
                 .unwrap();
             runtime
                 .commit_outbound(reused, NAT44_UDP_MIN_IDLE_TTL_MS + 1)
                 .unwrap();
             assert!(matches!(
-                runtime.plan_inbound(reused.public_port(), REMOTE1, NAT44_UDP_MIN_IDLE_TTL_MS + 1),
+                runtime.plan_inbound(
+                    reused.public_port(),
+                    REMOTE1,
+                    TEST_REMOTE_PORT,
+                    NAT44_UDP_MIN_IDLE_TTL_MS + 1
+                ),
                 Err(Nat44UdpPlanError::FilterDenied)
             ));
             assert!(runtime
-                .plan_inbound(reused.public_port(), REMOTE2, NAT44_UDP_MIN_IDLE_TTL_MS + 1)
+                .plan_inbound(
+                    reused.public_port(),
+                    REMOTE2,
+                    TEST_REMOTE_PORT,
+                    NAT44_UDP_MIN_IDLE_TTL_MS + 1
+                )
                 .is_ok());
         });
+    }
+
+    #[test]
+    fn udp_peer_granularity_follows_filtering_and_bounds_icmp_authority() {
+        for filtering in [
+            Nat44Filtering::EndpointIndependent,
+            Nat44Filtering::AddressDependent,
+            Nat44Filtering::AddressAndPortDependent,
+        ] {
+            let policy = Nat44UdpPolicy::default().with_filtering(filtering);
+            with_config(policy, |config| {
+                let mut mappings = [Nat44UdpMappingSlot::default(); 1];
+                let mut peers = [Nat44UdpPeerSlot::default(); 2];
+                let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+                let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+                for (now, remote_port) in [(0, 53), (1, 5353)] {
+                    let plan = runtime
+                        .plan_outbound(INTERNAL, 40_000, REMOTE1, remote_port, now)
+                        .unwrap();
+                    runtime.commit_outbound(plan, now).unwrap();
+                }
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+                let port_dependent = filtering == Nat44Filtering::AddressAndPortDependent;
+                let keys: Vec<_> = runtime
+                    .peers()
+                    .iter()
+                    .filter(|peer| peer.is_occupied())
+                    .map(|peer| (peer.remote_address(), peer.remote_port()))
+                    .collect();
+                if port_dependent {
+                    assert_eq!(keys, [(REMOTE1, 53), (REMOTE1, 5353)]);
+                } else {
+                    // Address-granular key: port zero, one peer.
+                    assert_eq!(keys, [(REMOTE1, 0)]);
+                }
+
+                // ICMP authority uses the recorded peers at their key
+                // granularity, so endpoint-independent inbound filtering
+                // does not admit quotes toward an uncontacted address.
+                assert!(runtime.inspect_icmpv4(40_000, REMOTE1, 53, 2).is_ok());
+                assert_eq!(
+                    runtime.inspect_icmpv4(40_000, REMOTE1, 9999, 2).err(),
+                    port_dependent.then_some(Nat44UdpPlanError::FilterDenied)
+                );
+                assert_eq!(
+                    runtime.inspect_icmpv4(40_000, REMOTE2, 53, 2).err(),
+                    Some(Nat44UdpPlanError::FilterDenied)
+                );
+                let peer_probes = runtime.peer_lookup_probes.get();
+                let inbound = runtime.plan_inbound(40_000, REMOTE2, 53, 2);
+                if filtering == Nat44Filtering::EndpointIndependent {
+                    assert!(inbound.is_ok());
+                    // Endpoint-independent admission does no peer lookup.
+                    assert_eq!(runtime.peer_lookup_probes.get(), peer_probes);
+                } else {
+                    assert_eq!(inbound.err(), Some(Nat44UdpPlanError::FilterDenied));
+                }
+            });
+        }
     }
 
     #[test]
@@ -6232,7 +7093,7 @@ mod tests {
                 TestNat44UdpIndexes::new(config, no_mappings.len(), no_peers.len());
             let empty = empty_indexes.runtime(config, &mut no_mappings, &mut no_peers);
             assert!(matches!(
-                empty.inspect_icmpv4(40_000, REMOTE1, 0),
+                empty.inspect_icmpv4(40_000, REMOTE1, TEST_REMOTE_PORT, 0),
                 Err(Nat44UdpPlanError::MappingMiss)
             ));
 
@@ -6241,32 +7102,47 @@ mod tests {
             let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
             let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
             let first = runtime
-                .plan_outbound(INTERNAL, 40_000, REMOTE1, 100)
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 100)
                 .unwrap();
             runtime.commit_outbound(first, 100).unwrap();
             let before_mapping = runtime.mappings()[0];
             let before_peer = runtime.peers()[0];
             let before_counters = runtime.counters();
             assert!(matches!(
-                runtime.inspect_icmpv4(40_000, REMOTE1, 99),
+                runtime.inspect_icmpv4(40_000, REMOTE1, TEST_REMOTE_PORT, 99),
                 Err(Nat44UdpPlanError::ClockRegression)
             ));
             for now in [100, 100 + NAT44_UDP_MIN_IDLE_TTL_MS - 1] {
-                let lookup = runtime.inspect_icmpv4(40_000, REMOTE1, now).unwrap();
+                let lookup = runtime
+                    .inspect_icmpv4(40_000, REMOTE1, TEST_REMOTE_PORT, now)
+                    .unwrap();
                 assert_eq!(lookup.internal_address(), INTERNAL);
                 assert_eq!(lookup.internal_port(), 40_000);
             }
             assert!(matches!(
-                runtime.inspect_icmpv4(40_000, REMOTE1, 100 + NAT44_UDP_MIN_IDLE_TTL_MS),
+                runtime.inspect_icmpv4(
+                    40_000,
+                    REMOTE1,
+                    TEST_REMOTE_PORT,
+                    100 + NAT44_UDP_MIN_IDLE_TTL_MS
+                ),
                 Err(Nat44UdpPlanError::MappingMiss)
             ));
-            assert!(runtime.inspect_icmpv4(40_000, REMOTE1, 100).is_ok());
+            assert!(runtime
+                .inspect_icmpv4(40_000, REMOTE1, TEST_REMOTE_PORT, 100)
+                .is_ok());
             assert_eq!(runtime.mappings()[0], before_mapping);
             assert_eq!(runtime.peers()[0], before_peer);
             assert_eq!(runtime.counters(), before_counters);
 
             let reused = runtime
-                .plan_outbound(INTERNAL2, 40_000, REMOTE2, 100 + NAT44_UDP_MIN_IDLE_TTL_MS)
+                .plan_outbound(
+                    INTERNAL2,
+                    40_000,
+                    REMOTE2,
+                    TEST_REMOTE_PORT,
+                    100 + NAT44_UDP_MIN_IDLE_TTL_MS,
+                )
                 .unwrap();
             runtime
                 .commit_outbound(reused, 100 + NAT44_UDP_MIN_IDLE_TTL_MS)
@@ -6275,6 +7151,7 @@ mod tests {
                 runtime.inspect_icmpv4(
                     reused.public_port(),
                     REMOTE1,
+                    TEST_REMOTE_PORT,
                     100 + NAT44_UDP_MIN_IDLE_TTL_MS
                 ),
                 Err(Nat44UdpPlanError::FilterDenied)
@@ -6283,6 +7160,7 @@ mod tests {
                 .inspect_icmpv4(
                     reused.public_port(),
                     REMOTE2,
+                    TEST_REMOTE_PORT,
                     100 + NAT44_UDP_MIN_IDLE_TTL_MS
                 )
                 .is_ok());
@@ -6297,16 +7175,16 @@ mod tests {
             let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
             let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
             let first = runtime
-                .plan_outbound(INTERNAL, 40_000, REMOTE1, 10)
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 10)
                 .unwrap();
             runtime.commit_outbound(first, 10).unwrap();
             assert!(matches!(
-                runtime.plan_outbound(INTERNAL, 40_000, REMOTE2, 20),
+                runtime.plan_outbound(INTERNAL, 40_000, REMOTE2, TEST_REMOTE_PORT, 20),
                 Err(Nat44UdpPlanError::PeerFull)
             ));
             assert_eq!(runtime.mappings()[0].last_outbound_ms(), 10);
             assert!(matches!(
-                runtime.plan_outbound(INTERNAL2, 40_001, REMOTE1, 20),
+                runtime.plan_outbound(INTERNAL2, 40_001, REMOTE1, TEST_REMOTE_PORT, 20),
                 Err(Nat44UdpPlanError::MappingFull)
             ));
             assert_eq!(runtime.mappings()[0].internal_address(), INTERNAL);
@@ -6317,7 +7195,7 @@ mod tests {
                 TestNat44UdpIndexes::new(config, no_mappings.len(), one_peer.len());
             let mut empty = empty_indexes.runtime(config, &mut no_mappings, &mut one_peer);
             assert!(matches!(
-                empty.plan_outbound(INTERNAL, 40_000, REMOTE1, 0),
+                empty.plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0),
                 Err(Nat44UdpPlanError::MappingFull)
             ));
             let mut one_mapping = [Nat44UdpMappingSlot::default(); 1];
@@ -6326,7 +7204,7 @@ mod tests {
                 TestNat44UdpIndexes::new(config, one_mapping.len(), no_peers.len());
             let mut empty = empty_indexes.runtime(config, &mut one_mapping, &mut no_peers);
             assert!(matches!(
-                empty.plan_outbound(INTERNAL, 40_000, REMOTE1, 0),
+                empty.plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0),
                 Err(Nat44UdpPlanError::PeerFull)
             ));
         });
@@ -6339,14 +7217,16 @@ mod tests {
             let mut peers = [Nat44UdpPeerSlot::default(); 2];
             let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
             let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
-            let last = runtime.plan_outbound(INTERNAL, 40_001, REMOTE1, 0).unwrap();
+            let last = runtime
+                .plan_outbound(INTERNAL, 40_001, REMOTE1, TEST_REMOTE_PORT, 0)
+                .unwrap();
             assert_eq!(last.public_port(), 40_001);
             runtime.commit_outbound(last, 0).unwrap();
 
             // For INTERNAL2/50000 and seed zero the deterministic start is
             // offset one. It collides with 40001, wraps, and selects 40000.
             let wrapped = runtime
-                .plan_outbound(INTERNAL2, 50_000, REMOTE1, 0)
+                .plan_outbound(INTERNAL2, 50_000, REMOTE1, TEST_REMOTE_PORT, 0)
                 .unwrap();
             assert_eq!(wrapped.public_port(), 40_000);
             runtime.commit_outbound(wrapped, 0).unwrap();
@@ -6365,18 +7245,18 @@ mod tests {
             let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
             let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
             let first = runtime
-                .plan_outbound(INTERNAL, 40_000, REMOTE1, 100)
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 100)
                 .unwrap();
             runtime.commit_outbound(first, 100).unwrap();
             let before = runtime.mappings()[0];
             assert!(matches!(
-                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 99),
+                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 99),
                 Err(Nat44UdpPlanError::ClockRegression)
             ));
             assert_eq!(runtime.mappings()[0], before);
             assert_eq!(runtime.counters().clock_regressions, 1);
             let equal = runtime
-                .plan_outbound(INTERNAL, 40_000, REMOTE1, 100)
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 100)
                 .unwrap();
             runtime.commit_outbound(equal, 100).unwrap();
             assert_eq!(runtime.mappings()[0].last_outbound_ms(), 100);
@@ -6391,18 +7271,25 @@ mod tests {
             let mut peers = [Nat44UdpPeerSlot::default(); 1];
             let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
             let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
-            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            let first = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0)
+                .unwrap();
             runtime.commit_outbound(first, 0).unwrap();
             assert!(matches!(
-                runtime.plan_inbound(40_000, REMOTE1, NAT44_UDP_MIN_IDLE_TTL_MS),
+                runtime.plan_inbound(40_000, REMOTE1, TEST_REMOTE_PORT, NAT44_UDP_MIN_IDLE_TTL_MS),
                 Err(Nat44UdpPlanError::MappingMiss)
             ));
             assert!(matches!(
-                runtime.plan_inbound(40_000, REMOTE1, NAT44_UDP_MIN_IDLE_TTL_MS - 1),
+                runtime.plan_inbound(
+                    40_000,
+                    REMOTE1,
+                    TEST_REMOTE_PORT,
+                    NAT44_UDP_MIN_IDLE_TTL_MS - 1
+                ),
                 Err(Nat44UdpPlanError::ClockRegression)
             ));
             assert!(matches!(
-                runtime.plan_inbound(40_000, REMOTE1, NAT44_UDP_MIN_IDLE_TTL_MS),
+                runtime.plan_inbound(40_000, REMOTE1, TEST_REMOTE_PORT, NAT44_UDP_MIN_IDLE_TTL_MS),
                 Err(Nat44UdpPlanError::MappingMiss)
             ));
         });
@@ -6412,18 +7299,20 @@ mod tests {
             let mut peers = [Nat44UdpPeerSlot::default(); 1];
             let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
             let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
-            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            let first = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0)
+                .unwrap();
             runtime.commit_outbound(first, 0).unwrap();
             assert!(matches!(
-                runtime.plan_inbound(40_000, REMOTE2, 100),
+                runtime.plan_inbound(40_000, REMOTE2, TEST_REMOTE_PORT, 100),
                 Err(Nat44UdpPlanError::FilterDenied)
             ));
             assert!(matches!(
-                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 99),
+                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 99),
                 Err(Nat44UdpPlanError::ClockRegression)
             ));
             assert!(runtime
-                .plan_outbound(INTERNAL, 40_000, REMOTE1, 100)
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 100)
                 .is_ok());
         });
 
@@ -6432,18 +7321,20 @@ mod tests {
             let mut peers = [Nat44UdpPeerSlot::default(); 2];
             let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
             let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
-            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            let first = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0)
+                .unwrap();
             runtime.commit_outbound(first, 0).unwrap();
             assert!(matches!(
-                runtime.plan_outbound(INTERNAL2, 40_001, REMOTE1, 200),
+                runtime.plan_outbound(INTERNAL2, 40_001, REMOTE1, TEST_REMOTE_PORT, 200),
                 Err(Nat44UdpPlanError::MappingFull)
             ));
             assert!(matches!(
-                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 199),
+                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 199),
                 Err(Nat44UdpPlanError::ClockRegression)
             ));
             assert!(runtime
-                .plan_outbound(INTERNAL, 40_000, REMOTE1, 200)
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 200)
                 .is_ok());
         });
     }
@@ -6455,9 +7346,13 @@ mod tests {
             let mut peers = [Nat44UdpPeerSlot::default(); 1];
             let mut runtime_indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
             let mut runtime = runtime_indexes.runtime(config, &mut mappings, &mut peers);
-            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            let first = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0)
+                .unwrap();
             runtime.commit_outbound(first, 0).unwrap();
-            let stale = runtime.plan_inbound_read_only(40_000, REMOTE1, 0).unwrap();
+            let stale = runtime
+                .plan_inbound_read_only(40_000, REMOTE1, TEST_REMOTE_PORT, 0)
+                .unwrap();
             let before_counters = runtime.counters();
             let permit = runtime
                 .preflight_reconcile(config, rotated_udp_hash_key())
@@ -6473,10 +7368,12 @@ mod tests {
             assert!(runtime.mappings().iter().all(|slot| !slot.occupied));
             assert!(runtime.peers().iter().all(|slot| !slot.occupied));
             assert!(matches!(
-                runtime.plan_inbound(40_000, REMOTE1, 0),
+                runtime.plan_inbound(40_000, REMOTE1, TEST_REMOTE_PORT, 0),
                 Err(Nat44UdpPlanError::MappingMiss)
             ));
-            let recreated = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            let recreated = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0)
+                .unwrap();
             runtime.commit_outbound(recreated, 0).unwrap();
             let before_mapping = runtime.mappings()[0];
             let before_peer = runtime.peers()[0];
@@ -6544,7 +7441,9 @@ mod tests {
             let mut peers = [Nat44UdpPeerSlot::default(); 1];
             let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
             let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
-            let plan = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            let plan = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0)
+                .unwrap();
             runtime.commit_outbound(plan, 0).unwrap();
 
             let before_mappings = runtime.mappings().to_vec();
@@ -6709,6 +7608,7 @@ mod tests {
                 11,
                 0x0011_2233_4455_6677_8899_aabb_ccdd_eeff,
                 REMOTE1,
+                0,
             ),
             [
                 7,
@@ -6740,6 +7640,7 @@ mod tests {
                 mapping_generation: 9,
                 mapping_lifecycle_epoch: 7,
                 remote_address: REMOTE1,
+                remote_port: 0,
             };
             let mut mappings = [occupied_mapping];
             let mut peers = [occupied_peer];
@@ -6780,7 +7681,9 @@ mod tests {
             let mut peers = [Nat44UdpPeerSlot::default(); 1];
             let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
             let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
-            let plan = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            let plan = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0)
+                .unwrap();
             runtime.commit_outbound(plan, 0).unwrap();
             let before_mapping = runtime.mappings()[0];
             let before_peer = runtime.peers()[0];
@@ -6839,10 +7742,10 @@ mod tests {
             let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
             let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
             let stale = runtime
-                .plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, 0)
+                .plan_outbound_read_only(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0)
                 .unwrap();
             let current = runtime
-                .plan_outbound_read_only(INTERNAL2, 40_001, REMOTE2, 0)
+                .plan_outbound_read_only(INTERNAL2, 40_001, REMOTE2, TEST_REMOTE_PORT, 0)
                 .unwrap();
             runtime.commit_outbound(current, 0).unwrap();
             let before_mappings = [runtime.mappings()[0], runtime.mappings()[1]];
@@ -6860,7 +7763,7 @@ mod tests {
             runtime.next_generation = u64::MAX;
             let before_mappings = [runtime.mappings()[0], runtime.mappings()[1]];
             assert!(matches!(
-                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 1),
+                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 1),
                 Err(Nat44UdpPlanError::GenerationExhausted)
             ));
             assert_eq!(runtime.mappings(), &before_mappings);
@@ -6868,7 +7771,7 @@ mod tests {
             runtime.next_generation = 2;
             runtime.state_revision = u128::MAX;
             assert!(matches!(
-                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 1),
+                runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 1),
                 Err(Nat44UdpPlanError::StateRevisionExhausted)
             ));
             assert_eq!(runtime.mappings(), &before_mappings);
@@ -6883,10 +7786,12 @@ mod tests {
             let mut peers = [Nat44UdpPeerSlot::default(); 3];
             let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
             let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
-            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            let first = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0)
+                .unwrap();
             runtime.commit_outbound(first, 0).unwrap();
             let second = runtime
-                .plan_outbound(INTERNAL2, 40_001, REMOTE1, 0)
+                .plan_outbound(INTERNAL2, 40_001, REMOTE1, TEST_REMOTE_PORT, 0)
                 .unwrap();
             runtime.commit_outbound(second, 0).unwrap();
             assert_eq!(runtime.validate_indexes(), Ok(()));
@@ -6896,6 +7801,7 @@ mod tests {
                     Ipv4Address::from_octets([10, 0, 0, 12]),
                     40_001,
                     REMOTE2,
+                    TEST_REMOTE_PORT,
                     NAT44_UDP_MIN_IDLE_TTL_MS,
                 )
                 .unwrap();
@@ -6921,6 +7827,7 @@ mod tests {
                     Ipv4Address::from_octets([10, 0, 0, 12]),
                     40_001,
                     REMOTE1,
+                    TEST_REMOTE_PORT,
                     NAT44_UDP_MIN_IDLE_TTL_MS,
                 )
                 .unwrap();
@@ -6940,16 +7847,24 @@ mod tests {
             let mut peers = [Nat44UdpPeerSlot::default(); 2];
             let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
             let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
-            let first = runtime.plan_outbound(INTERNAL, 40_000, REMOTE1, 0).unwrap();
+            let first = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0)
+                .unwrap();
             runtime.commit_outbound(first, 0).unwrap();
             let exact = runtime
-                .plan_outbound(INTERNAL2, 40_001, REMOTE1, 0)
+                .plan_outbound(INTERNAL2, 40_001, REMOTE1, TEST_REMOTE_PORT, 0)
                 .unwrap();
             assert_eq!(exact.mapping_index, 1);
             runtime.commit_outbound(exact, 0).unwrap();
 
             let recreated = runtime
-                .plan_outbound(INTERNAL2, 40_001, REMOTE2, NAT44_UDP_MIN_IDLE_TTL_MS)
+                .plan_outbound(
+                    INTERNAL2,
+                    40_001,
+                    REMOTE2,
+                    TEST_REMOTE_PORT,
+                    NAT44_UDP_MIN_IDLE_TTL_MS,
+                )
                 .unwrap();
             assert_eq!(recreated.mapping_index, 1);
             runtime
@@ -6998,7 +7913,9 @@ mod tests {
             assert_eq!(colliding_ports.len(), 4);
             for (offset, port) in colliding_ports.iter().copied().enumerate() {
                 let remote = Ipv4Address::from_octets([198, 51, 100, offset as u8 + 1]);
-                let plan = runtime.plan_outbound(INTERNAL, port, remote, 0).unwrap();
+                let plan = runtime
+                    .plan_outbound(INTERNAL, port, remote, TEST_REMOTE_PORT, 0)
+                    .unwrap();
                 runtime.commit_outbound(plan, 0).unwrap();
                 assert_eq!(runtime.validate_indexes(), Ok(()));
             }
@@ -7013,8 +7930,13 @@ mod tests {
 
             runtime.reset_index_probe_counts();
             assert!(matches!(
-                runtime
-                    .plan_outbound(Ipv4Address::from_octets([10, 0, 0, 99]), 40_000, REMOTE1, 0,),
+                runtime.plan_outbound(
+                    Ipv4Address::from_octets([10, 0, 0, 99]),
+                    40_000,
+                    REMOTE1,
+                    TEST_REMOTE_PORT,
+                    0,
+                ),
                 Err(Nat44UdpPlanError::PortExhausted)
             ));
             let (_, _, owner_probes) = runtime.index_probe_counts();
@@ -7031,7 +7953,7 @@ mod tests {
                 .peer_directory
                 .bucket_for_words(
                     DirectoryHashDomain::UdpPeer,
-                    &Nat44UdpRuntime::peer_lookup_words(0, 1, 1, REMOTE1),
+                    &Nat44UdpRuntime::peer_lookup_words(0, 1, 1, REMOTE1, 0),
                 )
                 .unwrap();
             let colliding_remotes = (1..=254)
@@ -7039,18 +7961,20 @@ mod tests {
                 .filter(|remote| {
                     runtime.peer_directory.bucket_for_words(
                         DirectoryHashDomain::UdpPeer,
-                        &Nat44UdpRuntime::peer_lookup_words(0, 1, 1, *remote),
+                        &Nat44UdpRuntime::peer_lookup_words(0, 1, 1, *remote, 0),
                     ) == Some(target_bucket)
                 })
                 .take(4)
                 .collect::<Vec<_>>();
             assert_eq!(colliding_remotes.len(), 4);
             for remote in colliding_remotes.iter().copied() {
-                let plan = runtime.plan_outbound(INTERNAL, 40_000, remote, 0).unwrap();
+                let plan = runtime
+                    .plan_outbound(INTERNAL, 40_000, remote, TEST_REMOTE_PORT, 0)
+                    .unwrap();
                 runtime.commit_outbound(plan, 0).unwrap();
             }
             runtime.reset_index_probe_counts();
-            assert!(runtime.peer_exists(0, 1, colliding_remotes[0]).unwrap());
+            assert!(runtime.peer_exists(0, 1, colliding_remotes[0], 0).unwrap());
             let (_, peer_probes, _) = runtime.index_probe_counts();
             assert_eq!(peer_probes, 4);
             assert!(peer_probes <= runtime.peers.len());

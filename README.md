@@ -178,8 +178,9 @@ inside/outside/public IPv4とnonzero port poolを設定し、mappingとremote-ad
 peerに加えてmapping/peer directoryとpublic-port ownerをcaller-backed固定配列で所有します。
 control planeはruntime生成とreconcileごとにfreshな`Nat44UdpHashKey`を供給します。
 mapping/peer/public-port lookupは固定capacityでbounded、port allocationはpoolを最大一周し、
-候補ごとのmapping全走査は行いません。outboundはEndpoint-Independent Mapping、
-inboundは過去に送信したremote IPv4だけを許すAddress-Dependent Filteringです。
+候補ごとのmapping全走査は行いません。outboundはEndpoint-Independent Mappingです。
+inbound filteringはUDP/TCPごとにRFC 4787 §5の三分類から選べ、defaultは過去に送信した
+remote IPv4だけを許すAddress-Dependent Filteringです（下の「NAT44 inbound filtering」）。
 IPv4 optionsなし、DF=1/MF=0/offset=0のatomic UDPだけを変換します。受信reserved flagは
 fragment判定から除外し、NAT rewrite後もwire上に保存します。UDP checksum zeroを保存、
 nonzero checksumとIPv4 checksumをRFC 1624でincremental更新します。
@@ -207,10 +208,10 @@ DF=1/MF=0/offset=0を要求します。引用reserved flagはtuple rewrite後も
 TCP NAT44は別のcaller-backed mapping/session storage、両keyed directory、direct
 public-port ownerを持ち、UDPと同じ数値public portを独立して使用できます。freshなTCP専用
 redacted keyとgeneration+lifecycle epochでstale authorityを遮断します。mappingはinternal
-TCP tupleのEndpoint-Independent Mapping、filterは
-remote IPv4とremote TCP portのexact matchです。新規sessionはoutbound SYN=1かつ
-ACK/RST/FIN=0だけが作成し、既存sessionではSYN-ACK、data、FIN、RSTを含むvalid packetを
-双方向に変換します。TCP header/options/dataを含むIPv4 payload全体のchecksumをstate更新前に
+TCP tupleのEndpoint-Independent Mappingです。新規mappingはoutbound SYN=1かつ
+ACK/RST/FIN=0だけが作成し、新規sessionはそれに加えてinbound filteringが許可した同じflagの
+inbound initial SYNだけが既存live mapping上に作成します。既存sessionではSYN-ACK、data、FIN、
+RSTを含むvalid packetを双方向に変換します。TCP header/options/dataを含むIPv4 payload全体のchecksumをstate更新前に
 検証し、address/port rewrite後もRFC 1624で更新します。TCPでは算術結果zeroもwire zeroの
 ままです。TCPもreserved flagをfragment判定から除外してwireへ保存し、reserved以外は
 DF=1/MF=0/offset=0を要求します。
@@ -221,11 +222,47 @@ mapping再生成時は旧sessionを全走査せずgeneration+epochでlazyに無�
 
 TCP session idle TTLはdefault/minimumともに2時間4分です。sequence/window/ACK妥当性は追跡
 せず、FIN/RSTもsessionを削除・短縮せず通常のsuccessful TX requestとしてTTLだけをrefresh
-します。この保守的な単一timer profile、recommended EIF/ADFより厳しいconnection-dependent
-filter、fragment/hairpin未実装を明示し、RFC 5382全体への準拠は主張しません。TCPもpolicyで
+します。この保守的な単一timer profile、unsolicited SYNへのdelayed ICMP Port Unreachable
+（RFC 5382 REQ-4のSHOULD）を送らずsilent dropすること、fragment/hairpin未実装を明示し、
+RFC 5382全体への準拠は主張しません。TCPもpolicyで
 opt-inしたType 3/Code 4だけ、引用public source portとexact live remote address/port sessionを
 read-only参照してinsideへ変換します。UDP-only/TCP-only wrapperは他方のprotocolがdomainを
 crossするとfail closedにし、combined wrapperはinside/outside/public realm一致を要求します。
+
+NAT44 inbound filteringは`[nat44.udp]`と`[nat44.tcp]`の`filtering`で個別に選びます。
+RFC 4787 REQ-8とRFC 5382 REQ-3は、transparency重視ならEndpoint-Independent、より厳しい
+filtering重視ならAddress-DependentをRECOMMENDEDとし、administrator option化と
+protocolごとの独立を許します。defaultはUDP/TCPとも後者で、UDPの挙動は従来どおりです。
+TCPの従来のexact remote address/port filterは`address-and-port-dependent`としてopt-inで
+残ります。
+
+```toml
+[nat44.udp]
+# 省略時 "address-dependent"。変更はreloadable（applyで全NAT stateをflush）
+filtering = "address-dependent"  # | "endpoint-independent" | "address-and-port-dependent"
+
+[nat44.tcp]
+filtering = "address-dependent"
+```
+
+| `filtering` | UDP inbound（live mapping必須） | TCP inbound（exact live sessionが無い場合） |
+|---|---|---|
+| `endpoint-independent` | 任意remote | initial SYNなら新session |
+| `address-dependent`（default） | 送信済みremote IPv4（任意port） | 同mappingにそのremote IPv4のlive sessionがあるinitial SYNだけ新session |
+| `address-and-port-dependent` | 送信済みremote IPv4+port | 新sessionを作らない |
+
+拒否はbyte不変のsilent drop（`NAT44_UDP_FILTER_DENIED`、`NAT44_TCP_SESSION_MISS`）で、
+inboundはmappingを作りません。firewallを同じworkerへbindした場合はpost-DNAT packetを従来どおり
+評価するため、緩いNAT filterが許可したpacketもfirewall policyが許可しなければdropし、NAT state
+もcommitしません。外部→内部bypass拒否（NAT44-021）とroute-miss時のNAT gateはfilteringに
+依存しません。UDP ICMPv4 Type 3/Code 4の変換authorityは`endpoint-independent`でもaddress粒度の
+peerを要求します。TCPのaddress-dependent判定はsession slotを共有するcaller-backed
+remote-address directoryの一回のbounded lookupで、このdirectory分だけTCP storageが増えます
+（M1 fixtureで448 bytes）。`endpoint-independent`とinbound新規flowを許可するfirewall ruleを
+組み合わせると、外部からのSYNがsession slotを2時間4分占有し得ます。defaultの`address-dependent`でも
+mappingが既に話しているremote address（CDNやDNS serverなど）を詐称したSYNなら同じことができ
+ます（NAT44-041）。firewall判定より前に走るinbound SYNのNAT側workは、session capacityに
+よらず`NAT44_TCP_INBOUND_SLOT_PROBES`（16）slot/chain nodeまでに上限されます。
 
 IPv4 forward firewallは`forward_batch_with_firewall`を選んだworkerだけで有効です。immutableな
 ordered rule sliceとmutableなfixed-capacity state sliceをcallerが所有し、first-matchの
@@ -336,7 +373,9 @@ $B run-sim --scenario fixtures/m1/scenario.toml --hold
 - `plan`は両documentに`validate`と同じbridge確認を行います。`expected-flush`はdocument間の
   planなので`all`（apply時に全live stateをflush）で、実際のflush数は`run-sim`の`apply` eventに
   出ます。capacityやresolution/ICMP/NAT/firewall policyの変更はrestart理由（`STORAGE_SHAPE`等）
-  または`changed` flagとしてだけ出し、fieldごとの値は出しません。interface labelは
+  または`changed` flagとしてだけ出し、fieldごとの値は出しません。例外はsecretでないNAT
+  filteringで、`nat44-tcp filtering ~ address-dependent -> endpoint-independent`のように
+  値を出し、`policy ~ changed`はそれ以外のNAT policy変更だけを表します。interface labelは
   `[A-Za-z0-9._-]`以外を`\xNN`でescapeします（configも同じcharsetと15 bytes上限を要求）。
   `--format jsonl`は未実装です。
 - `run-sim`はstepごと（tickは1回ずつ）に停止flagを確認します。`--hold`なしのrun中にsignalを

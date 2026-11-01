@@ -56,6 +56,18 @@ pub(crate) const ECHO_REPLY_CHANGE: (&str, &str) = (
     "[resolution.policy]",
     "[ipv4-origin]\ndefault-ttl = 64\necho-reply = false\n\n[resolution.policy]",
 );
+/// NAT filtering modes are reloadable (the storage shape does not depend on
+/// them); this edit loosens UDP and tightens TCP.
+pub(crate) const NAT_FILTERING_CHANGE: [(&str, &str); 2] = [
+    (
+        "icmpv4-errors = \"external-only\"\n",
+        "icmpv4-errors = \"external-only\"\nfiltering = \"endpoint-independent\"\n",
+    ),
+    (
+        "allocator-seed = \"11\"\n",
+        "allocator-seed = \"11\"\nfiltering = \"address-and-port-dependent\"\n",
+    ),
+];
 pub(crate) const INTERFACE_CHANGE: (&str, &str) =
     ("mac = \"02:00:00:00:00:02\"", "mac = \"02:00:00:00:00:22\"");
 pub(crate) const PORT_CHANGE: (&str, &str) = ("last = 40015", "last = 40031");
@@ -230,6 +242,69 @@ fn plan_reports_nat_realm_ports_and_policy_changes() {
     let policy = plan(&[("allocator-seed = \"7\"", "allocator-seed = \"8\"")]);
     only(&policy, &["nat44_udp"]);
     assert!(policy.nat44_udp().policy_changed);
+    assert_eq!(policy.nat44_udp().filtering, None);
+}
+
+#[test]
+fn nat_filtering_is_a_reloadable_typed_delta_separate_from_the_policy_flag() {
+    use ruster_core::Nat44Filtering;
+
+    const UDP: &str = "icmpv4-errors = \"external-only\"\n";
+    const TCP: &str = "allocator-seed = \"11\"\n";
+    // Spelling out the default is no change.
+    only(
+        &plan(&[
+            (
+                UDP,
+                "icmpv4-errors = \"external-only\"\nfiltering = \"address-dependent\"\n",
+            ),
+            (
+                TCP,
+                "allocator-seed = \"11\"\nfiltering = \"address-dependent\"\n",
+            ),
+        ]),
+        &[],
+    );
+
+    let udp = plan(&[(
+        UDP,
+        "icmpv4-errors = \"external-only\"\nfiltering = \"endpoint-independent\"\n",
+    )]);
+    only(&udp, &["nat44_udp"]);
+    assert_eq!(
+        udp.nat44_udp().filtering,
+        Some(Delta {
+            old: Nat44Filtering::AddressDependent,
+            new: Nat44Filtering::EndpointIndependent,
+        })
+    );
+    // A filtering-only change does not set the opaque policy flag, and it is
+    // not restart-required: storage does not depend on the mode.
+    assert!(!udp.nat44_udp().policy_changed);
+    assert!(udp.restart_required().is_empty());
+
+    let tcp = plan(&[(
+        TCP,
+        "allocator-seed = \"12\"\nfiltering = \"address-and-port-dependent\"\n",
+    )]);
+    only(&tcp, &["nat44_tcp"]);
+    assert_eq!(
+        tcp.nat44_tcp().filtering,
+        Some(Delta {
+            old: Nat44Filtering::AddressDependent,
+            new: Nat44Filtering::AddressAndPortDependent,
+        })
+    );
+    // Another policy change alongside still raises the opaque flag.
+    assert!(tcp.nat44_tcp().policy_changed);
+    assert!(tcp.restart_required().is_empty());
+    assert_eq!(config(&[]).storage_shape(), {
+        let edited = config(&[(
+            TCP,
+            "allocator-seed = \"11\"\nfiltering = \"endpoint-independent\"\n",
+        )]);
+        edited.storage_shape()
+    });
 }
 
 #[test]

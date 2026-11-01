@@ -28,6 +28,10 @@ pub fn tcp_runtime<'a>(
         Box::leak(vec![DirectoryBucket::default(); session_bucket_count].into_boxed_slice());
     let session_nodes =
         Box::leak(vec![DirectoryNode::default(); sessions.len()].into_boxed_slice());
+    let session_address_buckets =
+        Box::leak(vec![DirectoryBucket::default(); session_bucket_count].into_boxed_slice());
+    let session_address_nodes =
+        Box::leak(vec![DirectoryNode::default(); sessions.len()].into_boxed_slice());
     let port_count = usize::from(config.last_port() - config.first_port()) + 1;
     let port_owners = Box::leak(vec![PortOwnerSlot::default(); port_count].into_boxed_slice());
     Nat44TcpRuntime::new(
@@ -39,6 +43,8 @@ pub fn tcp_runtime<'a>(
             mapping_nodes,
             session_buckets,
             session_nodes,
+            session_address_buckets,
+            session_address_nodes,
             port_owners,
         ),
         Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0).unwrap(),
