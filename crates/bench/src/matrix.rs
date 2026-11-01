@@ -83,6 +83,8 @@ struct TcpBenchIndexes {
     mapping_nodes: [DirectoryNode; 4],
     session_buckets: [DirectoryBucket; 4],
     session_nodes: [DirectoryNode; 4],
+    session_address_buckets: [DirectoryBucket; 4],
+    session_address_nodes: [DirectoryNode; 4],
     port_owners: [PortOwnerSlot; 1],
 }
 
@@ -98,6 +100,8 @@ impl TcpBenchIndexes {
             &mut self.mapping_nodes,
             &mut self.session_buckets,
             &mut self.session_nodes,
+            &mut self.session_address_buckets,
+            &mut self.session_address_nodes,
             &mut self.port_owners,
         );
         Nat44TcpRuntime::new(

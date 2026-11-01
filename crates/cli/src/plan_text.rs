@@ -24,8 +24,19 @@ use std::fmt::Write as _;
 use ruster_control::{ApplyPlan, Change, Delta, FlushCount, NatChange, StateFlush};
 use ruster_core::{
     FirewallAction, FirewallInterface, FirewallProtocol, FirewallRule, IfId, Interface,
-    Ipv4Address, LocalIpv4Binding, MacAddress, Neighbor, Route,
+    Ipv4Address, LocalIpv4Binding, MacAddress, Nat44Filtering, Neighbor, Route,
 };
+
+/// Config spelling of a filtering behavior.
+const fn filtering(filtering: Nat44Filtering) -> &'static str {
+    match filtering {
+        Nat44Filtering::EndpointIndependent => "endpoint-independent",
+        Nat44Filtering::AddressDependent => "address-dependent",
+        Nat44Filtering::AddressAndPortDependent => "address-and-port-dependent",
+        // `Nat44Filtering` is non-exhaustive across crates.
+        _ => "unknown",
+    }
+}
 
 fn ip(address: Ipv4Address) -> String {
     let [a, b, c, d] = address.octets();
@@ -157,6 +168,13 @@ fn nat(lines: &mut Vec<String>, kind: &str, change: NatChange) {
         lines.push(format!(
             "{kind} ports ~ {}-{} -> {}-{}",
             old.first, old.last, new.first, new.last
+        ));
+    }
+    if let Some(Delta { old, new }) = change.filtering {
+        lines.push(format!(
+            "{kind} filtering ~ {} -> {}",
+            filtering(old),
+            filtering(new)
         ));
     }
     if change.policy_changed {

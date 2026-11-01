@@ -83,6 +83,9 @@ last = 40015
 idle-ttl-ms = 300000
 allocator-seed = "1"
 icmpv4-errors = "disabled"
+# RFC 4787 REQ-8 "more stringent" RECOMMENDED default; spelled out here.
+# router-v2.toml omits the key, so the v1 -> v2 plan also pins absent == default.
+filtering = "address-dependent"
 
 [nat44.udp.capacity]
 mappings = 8
@@ -92,6 +95,8 @@ peers = 16
 idle-ttl-ms = 7440000
 allocator-seed = "2"
 icmpv4-errors = "disabled"
+# RFC 5382 REQ-3 "more stringent" RECOMMENDED default.
+filtering = "address-dependent"
 
 [nat44.tcp.capacity]
 mappings = 8

@@ -91,7 +91,7 @@ fn validate_reports_summary_or_typed_diagnostics_with_exit_status() {
         text(&ok.stdout),
         "valid: schema-version=1 interfaces=2 routes=3 neighbors=1 local-ipv4=2 \
          firewall-rules=3 services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,firewall \
-         storage-bytes=16192\n"
+         storage-bytes=16640\n"
     );
     assert!(ok.stderr.is_empty());
 
@@ -576,4 +576,51 @@ fn plan_classifies_icmpv4_switches_like_their_policy_tables() {
              {FLUSH_ALL}"
         )
     );
+}
+
+#[test]
+fn plan_prints_nat_filtering_as_a_reloadable_typed_delta() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    // router-v1.toml spells the default out for UDP first, then TCP.
+    assert_eq!(
+        source.matches("filtering = \"address-dependent\"").count(),
+        2
+    );
+    let edited = dir.join("filtering.toml");
+    fs::write(
+        &edited,
+        source
+            .replacen(
+                "filtering = \"address-dependent\"",
+                "filtering = \"endpoint-independent\"",
+                1,
+            )
+            .replacen(
+                "allocator-seed = \"2\"\nicmpv4-errors = \"disabled\"\n# RFC 5382 REQ-3 \"more \
+                 stringent\" RECOMMENDED default.\nfiltering = \"address-dependent\"",
+                "allocator-seed = \"2\"\nicmpv4-errors = \"disabled\"\n\
+                 filtering = \"address-and-port-dependent\"",
+                1,
+            ),
+    )
+    .unwrap();
+    let current = fixtures().join("router-v1.toml");
+    let validate = ruster(&["validate".as_ref(), edited.as_os_str()]);
+    assert_eq!(status(&validate), 0);
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), edited.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert_eq!(
+        text(&plan.stdout),
+        format!(
+            "plan: reloadable\nrestart-required: none\nchanges: 2\n  \
+             nat44-udp filtering ~ address-dependent -> endpoint-independent\n  \
+             nat44-tcp filtering ~ address-dependent -> address-and-port-dependent\n\
+             {FLUSH_ALL}"
+        )
+    );
+    // router-v2.toml omits the key: the absent default plans as no change.
+    let v2 = fixtures().join("router-v2.toml");
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), v2.as_os_str()]);
+    assert!(!text(&plan.stdout).contains("filtering"));
 }

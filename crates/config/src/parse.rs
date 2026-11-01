@@ -53,6 +53,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "firewall",
     "first",
     "failure-dispatch-scans",
+    "filtering",
     "generate",
     "generated-arp",
     "generated-icmpv4",

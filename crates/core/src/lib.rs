@@ -71,7 +71,7 @@ pub use io::{
     PublicationQuiescenceWitness, SlotCompletion,
 };
 pub use nat44::{
-    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpCounters,
+    Nat44Filtering, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpCounters,
     Nat44TcpDisposition, Nat44TcpHashKey, Nat44TcpHashKeyError, Nat44TcpIndexStorage,
     Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpReconcileError,
     Nat44TcpReconcilePermit, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError,

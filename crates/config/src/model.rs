@@ -180,6 +180,21 @@ pub enum Nat44Icmpv4ErrorsV1 {
     ExternalOnly,
 }
 
+/// Inbound filtering behavior of one NAT44 protocol (RFC 4787 §5).
+///
+/// The default, `address-dependent`, is the RECOMMENDED "more stringent"
+/// behavior of RFC 4787 REQ-8 (UDP) and RFC 5382 REQ-3 (TCP).
+/// `endpoint-independent` is the RECOMMENDED "application transparency"
+/// behavior; `address-and-port-dependent` is a stricter opt-in.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Nat44FilteringV1 {
+    EndpointIndependent,
+    #[default]
+    AddressDependent,
+    AddressAndPortDependent,
+}
+
 /// Raw textual NAT allocator seed with redacted formatting.
 ///
 /// TOML integers are signed 64-bit values, so V1 uses text to preserve the
@@ -207,6 +222,9 @@ pub struct Nat44UdpV1 {
     pub idle_ttl_ms: u64,
     pub allocator_seed: AllocatorSeedV1,
     pub icmpv4_errors: Nat44Icmpv4ErrorsV1,
+    /// Inbound filtering; absent means `address-dependent`.
+    #[serde(default)]
+    pub filtering: Nat44FilteringV1,
     pub capacity: Nat44UdpCapacityV1,
 }
 
@@ -223,6 +241,9 @@ pub struct Nat44TcpV1 {
     pub idle_ttl_ms: u64,
     pub allocator_seed: AllocatorSeedV1,
     pub icmpv4_errors: Nat44Icmpv4ErrorsV1,
+    /// Inbound filtering; absent means `address-dependent`.
+    #[serde(default)]
+    pub filtering: Nat44FilteringV1,
     pub capacity: Nat44TcpCapacityV1,
 }
 

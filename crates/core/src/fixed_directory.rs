@@ -51,6 +51,7 @@ pub(crate) enum DirectoryHashDomain {
     UdpPeer = 0x4e41_5434_5550_4545,
     TcpMapping = 0x4e41_5434_544d_4150,
     TcpSession = 0x4e41_5434_5453_4553,
+    TcpSessionAddress = 0x4e41_5434_5453_4144,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

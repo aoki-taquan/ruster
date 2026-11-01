@@ -7,16 +7,17 @@ use ruster_core::{
     FirewallProtocol, FirewallRule, FirewallRuleId, FirewallStateSlot, ForwardingSnapshot,
     Icmpv4ErrorActionSlot, Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError,
     Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4OriginPolicy, Ipv4OriginPolicyError,
-    LocalIpv4Binding, MacAddress, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError,
-    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44UdpConfig,
-    Nat44UdpConfigError, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
-    Nat44UdpPolicyError, Neighbor, PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot,
-    ResolutionPolicy, ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
+    LocalIpv4Binding, MacAddress, Nat44Filtering, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
+    Nat44TcpConfigError, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError,
+    Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpMappingSlot,
+    Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor, PortOwnerSlot,
+    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy, ResolutionPolicyError,
+    ResolutionStateSlot, Route, RouteError, SnapshotError,
 };
 
 use crate::{
-    ConfigV1, FirewallActionV1, FirewallProtocolV1, Nat44Icmpv4ErrorsV1, SourcePath,
-    VersionedConfig,
+    ConfigV1, FirewallActionV1, FirewallProtocolV1, Nat44FilteringV1, Nat44Icmpv4ErrorsV1,
+    SourcePath, VersionedConfig,
 };
 
 /// Caller-selected cold-path bounds for runtime storage requested by V1.
@@ -265,6 +266,9 @@ pub struct Nat44TcpStorageShapeV1 {
     pub sessions: u32,
     pub mapping_buckets: u32,
     pub mapping_nodes: u32,
+    /// Dimensions of both the exact session directory and the
+    /// remote-address directory over the same session slots, which TCP
+    /// address-dependent filtering uses. `required_bytes` counts both.
     pub session_buckets: u32,
     pub session_nodes: u32,
     pub port_owners: u32,
@@ -1008,7 +1012,8 @@ fn validate_v1(
                         path(&["nat44", "udp", "idle-ttl-ms"]),
                     )
                 })?
-                .with_icmpv4_errors(map_icmp_policy(source.icmpv4_errors));
+                .with_icmpv4_errors(map_icmp_policy(source.icmpv4_errors))
+                .with_filtering(map_filtering(source.filtering));
             Nat44UdpConfig::new(
                 &snapshot,
                 inside,
@@ -1039,7 +1044,8 @@ fn validate_v1(
                         path(&["nat44", "tcp", "idle-ttl-ms"]),
                     )
                 })?
-                .with_icmpv4_errors(map_icmp_policy(source.icmpv4_errors));
+                .with_icmpv4_errors(map_icmp_policy(source.icmpv4_errors))
+                .with_filtering(map_filtering(source.filtering));
             Nat44TcpConfig::new(
                 &snapshot,
                 inside,
@@ -1485,6 +1491,8 @@ fn build_storage_shape(
             )?;
             add_directory_bytes(&mut bytes, shape.mapping_buckets, shape.mapping_nodes)?;
             add_directory_bytes(&mut bytes, shape.session_buckets, shape.session_nodes)?;
+            // Session remote-address directory: same dimensions.
+            add_directory_bytes(&mut bytes, shape.session_buckets, shape.session_nodes)?;
             add_bytes::<PortOwnerSlot>(
                 &mut bytes,
                 shape.port_owners,
@@ -1621,6 +1629,14 @@ fn add_bytes<T>(bytes: &mut usize, count: u32, path: SourcePath) -> Result<(), V
 
 fn port_count((first, last): (u16, u16)) -> u32 {
     u32::from(last) - u32::from(first) + 1
+}
+
+const fn map_filtering(filtering: Nat44FilteringV1) -> Nat44Filtering {
+    match filtering {
+        Nat44FilteringV1::EndpointIndependent => Nat44Filtering::EndpointIndependent,
+        Nat44FilteringV1::AddressDependent => Nat44Filtering::AddressDependent,
+        Nat44FilteringV1::AddressAndPortDependent => Nat44Filtering::AddressAndPortDependent,
+    }
 }
 
 fn map_icmp_policy(policy: Nat44Icmpv4ErrorsV1) -> Nat44Icmpv4ErrorPolicy {

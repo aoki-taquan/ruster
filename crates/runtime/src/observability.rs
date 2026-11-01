@@ -1087,8 +1087,9 @@ impl ObservableFields for ServiceCounters {
         }}
         visit_counts! {v, "nat44_tcp", self.nat44_tcp, Nat44TcpCounters {
             mappings_created, mappings_reused, mappings_expired, sessions_created,
-            sessions_reused, sessions_expired, outbound_translated, inbound_translated,
-            mapping_misses, session_misses, invalid_initial_flags, mapping_full, session_full,
+            inbound_sessions_created, sessions_reused, sessions_expired, outbound_translated,
+            inbound_translated, mapping_misses, session_misses, invalid_initial_flags,
+            mapping_full, session_full,
             port_exhausted, clock_regressions, config_mismatches, reconciliations,
         }}
         visit_counts! {v, "firewall", self.firewall, FirewallCounters {

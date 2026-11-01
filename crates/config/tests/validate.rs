@@ -280,8 +280,9 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         + 8 * size_of::<PortOwnerSlot>()
         + 3 * size_of::<Nat44TcpMappingSlot>()
         + 5 * size_of::<Nat44TcpSessionSlot>()
-        + (4 + 8) * size_of::<DirectoryBucket>()
-        + (3 + 5) * size_of::<DirectoryNode>()
+        // mapping, session, and session remote-address directories
+        + (4 + 8 + 8) * size_of::<DirectoryBucket>()
+        + (3 + 5 + 5) * size_of::<DirectoryNode>()
         + 8 * size_of::<PortOwnerSlot>()
         + 6 * size_of::<FirewallStateSlot>();
     assert_eq!(shape.required_bytes, expected);
@@ -766,4 +767,78 @@ fn icmpv4_generation_switches_map_onto_core_policies() {
         error(&disabled.replacen("interval-ms = 100\n", "interval-ms = 0\n", 1)).code(),
         ValidationCode::Icmpv4ErrorPolicy(ruster_core::Icmpv4ErrorPolicyError::IntervalZero)
     );
+}
+
+#[test]
+fn nat44_filtering_maps_onto_core_policies_per_protocol() {
+    use ruster_core::{Nat44Filtering, Nat44TcpPolicy, Nat44UdpPolicy};
+
+    let defaults = validated(VALID);
+    let nat = defaults.nat44().unwrap();
+    let (udp, tcp) = (nat.udp().unwrap().policy(), nat.tcp().unwrap().policy());
+    assert_eq!(udp.filtering(), Nat44Filtering::AddressDependent);
+    assert_eq!(tcp.filtering(), Nat44Filtering::AddressDependent);
+    // The absent key equals the core default policy apart from the
+    // explicitly configured fields.
+    assert_eq!(
+        udp.filtering(),
+        Nat44UdpPolicy::default().filtering(),
+        "UDP default"
+    );
+    assert_eq!(
+        tcp.filtering(),
+        Nat44TcpPolicy::default().filtering(),
+        "TCP default"
+    );
+
+    let edit = |udp: &str, tcp: &str| {
+        VALID
+            .replacen(
+                "icmpv4-errors = \"external-only\"\n",
+                &format!("icmpv4-errors = \"external-only\"\nfiltering = \"{udp}\"\n"),
+                1,
+            )
+            .replacen(
+                "icmpv4-errors = \"disabled\"\n",
+                &format!("icmpv4-errors = \"disabled\"\nfiltering = \"{tcp}\"\n"),
+                1,
+            )
+    };
+    let explicit = validated(&edit("address-dependent", "address-dependent"));
+    let explicit = explicit.nat44().unwrap();
+    assert!(explicit.udp().unwrap().policy() == defaults.nat44().unwrap().udp().unwrap().policy());
+    assert!(explicit.tcp().unwrap().policy() == defaults.nat44().unwrap().tcp().unwrap().policy());
+
+    let mixed = validated(&edit("endpoint-independent", "address-and-port-dependent"));
+    let nat = mixed.nat44().unwrap();
+    let (udp, tcp) = (nat.udp().unwrap().policy(), nat.tcp().unwrap().policy());
+    assert_eq!(udp.filtering(), Nat44Filtering::EndpointIndependent);
+    assert_eq!(tcp.filtering(), Nat44Filtering::AddressAndPortDependent);
+    // Only the filtering differs from the default policies.
+    assert_eq!(
+        udp.with_filtering(Nat44Filtering::AddressDependent),
+        defaults.nat44().unwrap().udp().unwrap().policy()
+    );
+    assert_eq!(
+        tcp.with_filtering(Nat44Filtering::AddressDependent),
+        defaults.nat44().unwrap().tcp().unwrap().policy()
+    );
+    // Storage shape does not depend on the mode.
+    assert_eq!(mixed.storage_shape(), defaults.storage_shape());
+
+    // Policy validation still applies with the key present.
+    assert_eq!(
+        error(&mixed_text_with_short_ttl()).code(),
+        ValidationCode::Nat44TcpPolicy(ruster_core::Nat44TcpPolicyError::IdleTtlTooShort)
+    );
+
+    fn mixed_text_with_short_ttl() -> String {
+        VALID
+            .replacen(
+                "icmpv4-errors = \"disabled\"\n",
+                "icmpv4-errors = \"disabled\"\nfiltering = \"endpoint-independent\"\n",
+                1,
+            )
+            .replacen("idle-ttl-ms = 7440000\n", "idle-ttl-ms = 7439999\n", 1)
+    }
 }

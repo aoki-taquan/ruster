@@ -446,12 +446,16 @@ fn runtimes_reject_every_cross_candidate_authority_binding() {
     let mut tcp_mapping_nodes = [DirectoryNode::default(); 1];
     let mut tcp_session_buckets = [DirectoryBucket::default(); 1];
     let mut tcp_session_nodes = [DirectoryNode::default(); 1];
+    let mut tcp_session_address_buckets = [DirectoryBucket::default(); 1];
+    let mut tcp_session_address_nodes = [DirectoryNode::default(); 1];
     let mut tcp_port_owners = [PortOwnerSlot::default(); 1];
     let tcp_indexes = Nat44TcpIndexStorage::new(
         &mut tcp_mapping_buckets,
         &mut tcp_mapping_nodes,
         &mut tcp_session_buckets,
         &mut tcp_session_nodes,
+        &mut tcp_session_address_buckets,
+        &mut tcp_session_address_nodes,
         &mut tcp_port_owners,
     );
     let mut firewall_states = [FirewallStateSlot::default(); 1];

@@ -29,7 +29,7 @@ use std::{cmp::Ordering, fmt, num::NonZeroU64};
 use ruster_config::{InterfaceBindingV1, ValidatedConfigV1};
 use ruster_core::{
     FirewallHashKey, FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, LocalIpv4Binding,
-    Nat44TcpHashKey, Nat44UdpHashKey, Neighbor, PublicationQuiescence, Route,
+    Nat44Filtering, Nat44TcpHashKey, Nat44UdpHashKey, Neighbor, PublicationQuiescence, Route,
 };
 
 use crate::{
@@ -130,20 +130,26 @@ pub struct NatPortRange {
     pub last: u16,
 }
 
-/// Difference of one NAT44 protocol. The policy itself (which includes the
-/// allocator seed) is never exposed, only whether it changed.
+/// Difference of one NAT44 protocol. The filtering behavior is not secret
+/// and is reported as a typed delta. The rest of the policy (which includes
+/// the allocator seed) is never exposed, only whether it changed:
+/// `policy_changed` ignores a filtering-only change.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct NatChange {
     pub realm: Option<Delta<NatRealm>>,
     pub ports: Option<Delta<NatPortRange>>,
+    pub filtering: Option<Delta<Nat44Filtering>>,
     pub policy_changed: bool,
 }
 
 impl NatChange {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.realm.is_none() && self.ports.is_none() && !self.policy_changed
+        self.realm.is_none()
+            && self.ports.is_none()
+            && self.filtering.is_none()
+            && !self.policy_changed
     }
 }
 
@@ -480,13 +486,28 @@ fn nat_change(
 ) -> NatChange {
     let (old_realm, old_ports) = nat_parts(old, protocol);
     let (new_realm, new_ports) = nat_parts(new, protocol);
-    let policy_changed = match protocol {
-        Protocol::Udp => old.udp.policy() != new.udp.policy(),
-        Protocol::Tcp => old.tcp.policy() != new.tcp.policy(),
+    // Filtering is reported separately, so compare the rest of the policy
+    // with the new filtering substituted into the old policy.
+    let (filtering, policy_changed) = match protocol {
+        Protocol::Udp => {
+            let (old, new) = (old.udp.policy(), new.udp.policy());
+            (
+                delta(old.filtering(), new.filtering()),
+                old.with_filtering(new.filtering()) != new,
+            )
+        }
+        Protocol::Tcp => {
+            let (old, new) = (old.tcp.policy(), new.tcp.policy());
+            (
+                delta(old.filtering(), new.filtering()),
+                old.with_filtering(new.filtering()) != new,
+            )
+        }
     };
     NatChange {
         realm: delta(old_realm, new_realm),
         ports: delta(old_ports, new_ports),
+        filtering,
         policy_changed,
     }
 }

@@ -295,7 +295,15 @@ fn service_counters_capture_every_runtime_counter_in_fixed_order() {
         tcp_config(&snapshot),
         &mut [],
         &mut [],
-        Nat44TcpIndexStorage::new(&mut [], &mut [], &mut [], &mut [], &mut tcp_owner),
+        Nat44TcpIndexStorage::new(
+            &mut [],
+            &mut [],
+            &mut [],
+            &mut [],
+            &mut [],
+            &mut [],
+            &mut tcp_owner,
+        ),
         Nat44TcpHashKey::new(5, 6).unwrap(),
     )
     .unwrap();
@@ -333,7 +341,7 @@ fn service_counters_capture_every_runtime_counter_in_fixed_order() {
         ("resolution", 13),
         ("icmpv4_errors", 31),
         ("nat44_udp", 14),
-        ("nat44_tcp", 17),
+        ("nat44_tcp", 18),
         ("firewall", 13),
     ] {
         assert_eq!(sections.iter().filter(|s| **s == section).count(), fields);
