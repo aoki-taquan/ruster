@@ -222,8 +222,12 @@ impl FirewallRule {
     }
 
     fn matches(self, packet: FirewallPacket) -> bool {
+        self.egress.matches(packet.egress) && self.matches_except_egress(packet.without_egress())
+    }
+
+    /// Matches every selector except egress, which a route miss cannot know.
+    fn matches_except_egress(self, packet: FirewallRouteMissPacket) -> bool {
         self.ingress.matches(packet.ingress)
-            && self.egress.matches(packet.egress)
             && self.source.matches(packet.source)
             && self.destination.matches(packet.destination)
             && self.protocol == packet.protocol
@@ -1019,6 +1023,33 @@ pub(crate) struct FirewallPacket {
     pub tcp_flags: u8,
 }
 
+impl FirewallPacket {
+    const fn without_egress(self) -> FirewallRouteMissPacket {
+        FirewallRouteMissPacket {
+            ingress: self.ingress,
+            source: self.source,
+            destination: self.destination,
+            protocol: self.protocol,
+            source_port: self.source_port,
+            destination_port: self.destination_port,
+            tcp_flags: self.tcp_flags,
+        }
+    }
+}
+
+/// Forwarded TCP/UDP tuple whose destination has no route, so it has no
+/// egress interface. See `FirewallRuntime::permits_route_miss`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FirewallRouteMissPacket {
+    pub ingress: IfId,
+    pub source: Ipv4Address,
+    pub destination: Ipv4Address,
+    pub protocol: FirewallProtocol,
+    pub source_port: u16,
+    pub destination_port: u16,
+    pub tcp_flags: u8,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FirewallPlan {
     index: usize,
@@ -1554,6 +1585,52 @@ impl<'state> FirewallRuntime<'state> {
                 failure: None,
             },
         })
+    }
+
+    /// Decides whether a forwarded packet without a route may be answered
+    /// with ICMPv4 Destination Unreachable (Network).
+    ///
+    /// The packet is permitted only if it would be admitted as a new
+    /// connection toward *every* possible egress, so the generated error never
+    /// reveals more about the route table than forwarding the same packet
+    /// would. Rules are walked in first-match order using every selector
+    /// except egress:
+    ///
+    /// - a matching rule with egress `Any` decides: `AllowStateful` permits,
+    ///   `Deny` denies;
+    /// - a matching `AllowStateful` rule constrained to one egress cannot
+    ///   match and is skipped;
+    /// - a matching `Deny` rule constrained to one egress denies (fail closed:
+    ///   the packet would be denied if its route pointed there);
+    /// - no deciding rule is the default deny.
+    ///
+    /// A permitted TCP packet must also be a valid initial SYN, as a new
+    /// flow would. Established state is never consulted (its key includes the
+    /// egress), no state is created or refreshed, the clock watermark is not
+    /// touched, and only `rule_evaluations` is counted; the caller reports a
+    /// denial as `FirewallRouteUnavailable`, not as a rule/default deny.
+    pub(crate) fn permits_route_miss(
+        &mut self,
+        config: &FirewallConfig<'_>,
+        packet: FirewallRouteMissPacket,
+    ) -> Option<FirewallRuleId> {
+        debug_assert!(self.config_matches(config));
+        for rule in config.rules.iter().copied() {
+            self.counters.rule_evaluations = self.counters.rule_evaluations.saturating_add(1);
+            if !rule.matches_except_egress(packet) {
+                continue;
+            }
+            match (rule.egress, rule.action) {
+                (FirewallInterface::Interface(_), FirewallAction::AllowStateful) => {}
+                (FirewallInterface::Any, FirewallAction::AllowStateful) => {
+                    let valid_initial =
+                        packet.protocol != FirewallProtocol::Tcp || packet.tcp_flags & 0x17 == 0x02;
+                    return valid_initial.then_some(rule.id);
+                }
+                (_, FirewallAction::Deny) => return None,
+            }
+        }
+        None
     }
 
     /// Looks up a live originating flow without changing any runtime state.
@@ -3489,5 +3566,177 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    fn egress_rule(
+        id: u32,
+        egress: FirewallInterface,
+        action: FirewallAction,
+        protocol: FirewallProtocol,
+    ) -> FirewallRule {
+        FirewallRule::new(
+            FirewallRuleId(id),
+            FirewallInterface::Interface(LAN),
+            egress,
+            any(),
+            any(),
+            protocol,
+            FirewallPortRange::new(0, u16::MAX).unwrap(),
+            FirewallPortRange::new(1, u16::MAX).unwrap(),
+            action,
+        )
+    }
+
+    fn route_miss(protocol: FirewallProtocol, flags: u8) -> FirewallRouteMissPacket {
+        packet(protocol, flags).without_egress()
+    }
+
+    fn permits_route_miss_with(
+        rules: &[FirewallRule],
+        candidate: FirewallRouteMissPacket,
+    ) -> (Option<FirewallRuleId>, u64) {
+        with_snapshot(|snapshot| {
+            let config =
+                FirewallConfig::new(snapshot, rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 2];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let mut before = runtime_image(&runtime);
+            let verdict = runtime.permits_route_miss(&config, candidate);
+            let evaluations = runtime.counters().rule_evaluations;
+            before.counters.rule_evaluations = evaluations;
+            assert_eq!(
+                runtime_image(&runtime),
+                before,
+                "only rule_evaluations moves"
+            );
+            (verdict, evaluations)
+        })
+    }
+
+    #[test]
+    fn route_miss_policy_requires_admission_toward_every_egress() {
+        use FirewallAction::{AllowStateful, Deny};
+        use FirewallInterface::{Any, Interface};
+        use FirewallProtocol::{Tcp, Udp};
+
+        // Egress-any allow permits; the evaluation is pure except the counter.
+        assert_eq!(
+            permits_route_miss_with(
+                &[egress_rule(5, Any, AllowStateful, Udp)],
+                route_miss(Udp, 0)
+            ),
+            (Some(FirewallRuleId(5)), 1)
+        );
+        // An allow rule bound to one egress cannot match, so the default
+        // policy denies.
+        assert_eq!(
+            permits_route_miss_with(
+                &[egress_rule(5, Interface(WAN), AllowStateful, Udp)],
+                route_miss(Udp, 0)
+            ),
+            (None, 1)
+        );
+        // It is skipped, so a later egress-any allow still decides.
+        assert_eq!(
+            permits_route_miss_with(
+                &[
+                    egress_rule(5, Interface(WAN), AllowStateful, Udp),
+                    egress_rule(6, Any, AllowStateful, Udp),
+                ],
+                route_miss(Udp, 0)
+            ),
+            (Some(FirewallRuleId(6)), 2)
+        );
+        // An egress-bound deny that otherwise matches fails closed and stops
+        // the walk before a later egress-any allow.
+        assert_eq!(
+            permits_route_miss_with(
+                &[
+                    egress_rule(5, Interface(WAN), Deny, Udp),
+                    egress_rule(6, Any, AllowStateful, Udp),
+                ],
+                route_miss(Udp, 0)
+            ),
+            (None, 1)
+        );
+        // Egress-any deny and the default policy deny.
+        assert_eq!(
+            permits_route_miss_with(
+                &[
+                    egress_rule(5, Any, Deny, Udp),
+                    egress_rule(6, Any, AllowStateful, Udp),
+                ],
+                route_miss(Udp, 0)
+            ),
+            (None, 1)
+        );
+        assert_eq!(permits_route_miss_with(&[], route_miss(Udp, 0)), (None, 0));
+        // Non-egress selectors still apply: protocol, ports, and ingress.
+        assert_eq!(
+            permits_route_miss_with(
+                &[
+                    egress_rule(5, Interface(WAN), Deny, Tcp),
+                    egress_rule(6, Any, AllowStateful, Udp),
+                ],
+                route_miss(Udp, 0)
+            ),
+            (Some(FirewallRuleId(6)), 2)
+        );
+        let mut port_zero = route_miss(Udp, 0);
+        port_zero.destination_port = 0;
+        assert_eq!(
+            permits_route_miss_with(&[egress_rule(5, Any, AllowStateful, Udp)], port_zero),
+            (None, 1)
+        );
+        let mut from_wan = route_miss(Udp, 0);
+        from_wan.ingress = WAN;
+        assert_eq!(
+            permits_route_miss_with(&[egress_rule(5, Any, AllowStateful, Udp)], from_wan),
+            (None, 1)
+        );
+        // TCP must be a valid initial SYN, exactly like a new flow.
+        let tcp_allow = [egress_rule(5, Any, AllowStateful, Tcp)];
+        assert_eq!(
+            permits_route_miss_with(&tcp_allow, route_miss(Tcp, 0x02)),
+            (Some(FirewallRuleId(5)), 1)
+        );
+        for flags in [0x10, 0x12, 0x04, 0x01, 0x03, 0x00] {
+            assert_eq!(
+                permits_route_miss_with(&tcp_allow, route_miss(Tcp, flags)),
+                (None, 1),
+                "flags {flags:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn route_miss_policy_ignores_established_state() {
+        with_snapshot(|snapshot| {
+            let rules = [rule(
+                1,
+                FirewallAction::AllowStateful,
+                FirewallProtocol::Udp,
+            )];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 2];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let plan = runtime
+                .plan_packet(&config, packet(FirewallProtocol::Udp, 0), 10)
+                .unwrap();
+            runtime.commit(plan).unwrap();
+            let before = runtime_image(&runtime);
+            // The live LAN->WAN flow is not consulted: its key includes the
+            // egress, and the only rule is bound to WAN.
+            assert_eq!(
+                runtime.permits_route_miss(&config, route_miss(FirewallProtocol::Udp, 0)),
+                None
+            );
+            let mut expected = before;
+            expected.counters.rule_evaluations += 1;
+            assert_eq!(runtime_image(&runtime), expected);
+        });
     }
 }

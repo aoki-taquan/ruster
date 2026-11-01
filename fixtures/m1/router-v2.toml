@@ -1,5 +1,11 @@
 # M1 golden router, document "v2": v1 plus a reloadable route to
-# 192.0.2.0/24 via the same gateway.
+# 192.0.2.0/24 via the same gateway, and a final LAN UDP allow rule without
+# an egress constraint. Rules 10-30 are bound to egress "wan", so in v1 a
+# route miss (no egress) is silent. Rule 40 admits new LAN UDP flows from
+# 192.168.1.0/24 (ports 1-65535) toward every egress: besides making a UDP
+# route miss yield Destination Unreachable (Network), it also permits such UDP
+# forwarding to any routed non-WAN egress (here LAN->LAN hairpin), which
+# rule 20 alone (egress "wan") did not.
 # LAN 192.168.1.0/24 behind UDP/TCP NAPT on WAN 203.0.113.2, one static
 # route to 198.51.100.0/24 via a dynamically (ARP-)resolved gateway, and a
 # stateful firewall that denies LAN->WAN TCP/23 and allows other LAN->WAN
@@ -140,6 +146,22 @@ egress = "wan"
 source = "192.168.1.0/24"
 destination = "0.0.0.0/0"
 protocol = "tcp"
+action = "allow-stateful"
+
+[firewall.rules.source-ports]
+first = 1
+last = 65535
+
+[firewall.rules.destination-ports]
+first = 1
+last = 65535
+
+[[firewall.rules]]
+id = 40
+ingress = "lan"
+source = "192.168.1.0/24"
+destination = "0.0.0.0/0"
+protocol = "udp"
 action = "allow-stateful"
 
 [firewall.rules.source-ports]

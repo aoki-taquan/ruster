@@ -232,7 +232,7 @@ fn wrong_expectations_fail_with_typed_mismatches() {
     assert_eq!(
         result,
         Err(DriverError::ApplyMismatch {
-            step: 38,
+            step: 41,
             expected: ApplyOutcome::Rejected {
                 reason: Some(RejectReason::Invalid)
             },

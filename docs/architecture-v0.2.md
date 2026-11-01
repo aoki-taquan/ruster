@@ -729,13 +729,63 @@ structural/checksum validationを通常forwarding destination LPMより前に行
 state/NAT lookupより前にworker-local security watermarkを単調更新し、
 rule/default deny、state full、route/neighbor/NAT missでも戻しません。そのためfuture時刻のdeny
 やmiss後に古い時刻でflowが復活することはなく、古いpacketはbyte/state/activity不変の
-`FirewallClockRegression`またはNAT clock regressionになります。FW opt-in時のLPM missは
-egress不明のためrule評価せず`FirewallRouteUnavailable`でsilent dropし、Type 3/Code 0やARPを
-queueしません。NAT inboundもFW state/rule判定をTTL判定より先に行います。
+`FirewallClockRegression`またはNAT clock regressionになります。NAT inboundもFW state/rule判定を
+TTL判定より先に行います。
+
+FW opt-in時のLPM missにはegressが無いため、stateful planではなくegress-freeなpolicy評価を
+行います（RFC 1812 §5.2.7.1のDestination Unreachable Networkを、policyが許すpacketにだけ返す）。
+ruleはfirst-match順に、egress以外のselector（ingress、source/destination prefix、protocol、
+port range）で照合します。
+
+- egress `Any`のruleが判定する。`AllowStateful`ならpermit、`Deny`ならdeny。
+- egressを一つに限定した`AllowStateful` ruleはmatchできず、skipする。
+- egressを一つに限定した`Deny` ruleがmatchすれば、routeがそのegressを指していれば拒否される
+  ため、fail closedでdenyする。
+- 判定するruleが無ければdefault deny。TCPは新規flowと同じくvalid initial SYNだけをpermitする。
+
+established stateはkeyにegressを含むため参照しません。評価はstate作成/refresh、security
+watermark、audit record、deny counterを変更せず、`rule_evaluations`だけを数えます（clockは
+共通preflightで観測済み）。permitならfirewallなしのroute missと同じ`decide_icmpv4_error`
+（同じper-egress rate limiter、quote規則、reverse authority/source選択、TTLよりroute miss優先）で
+Type 3/Code 0をqueueして`RouteMiss`、denyなら従来どおりICMP/ARPをqueueしないsilentな
+`FirewallRouteUnavailable`です。route missはNAT outbound translationより前に判定するので、
+quoteは受信datagramのままで、NAT mapping/sessionもfirewall flowも作りません。
+
+route oracle: errorを返すのは「どのegressに対しても新規flowとして許可されるpacket」だけです。
+そのpacketはroute hitなら転送（またはTTL/host error）されるため、Network Unreachableが示すのは
+同じpacketの転送可否から既に観測できるroute有無（RFC 1812がrouterに通知を求める情報）だけ
+です。egress限定ruleを単に「不一致」とすると、例えば「WAN→LAN deny、その後egress `Any`の
+allow」というrulesetで、LANへroute hitするprobeはsilent、route missはICMPになり、denyされた
+宛先空間のroute有無が漏れます。egress限定denyのfail closedがこのoracleを塞ぎます。代償として、
+同じegressへの先行allowにshadowされたegress限定denyでもroute missは保守的にsilentです。
+egress限定ruleだけのruleset（M1 fixtureのv1など）では、route missは従来どおりsilentです。
+
+「どのegressでも許可」はfirewall ruleだけでは決まりません。route hitではfirewall planより前に、
+egressに依存するNAT gateがsilent dropします（external→internalの
+`Nat44ExternalToInternalBypass`、combined realm mismatchのcrossing reject、inside→outsideの
+NAT runtime/authority要求）。これを無視すると、例えばNAT inside=LAN/outside=WANで
+`ingress Any / egress Any`のUDP allowがある場合、WANからLAN host宛はsilent、未routeの宛先は
+ICMPとなり、外部からinside側のroute有無を走査できます。そのためroute missでは、firewall評価の
+前にread-onlyな`route_miss_may_hit_nat_reject`で、いずれかのNAT configのoutsideがingress、
+realm mismatch時のTCP/UDPでingressがinside、またはinside発のUDP/TCPで対応するNAT runtimeが
+不在/不一致なら、counter/trace/stateを変えずsilentな`FirewallRouteUnavailable`にします
+（いずれも保守側で、該当egressへのrouteが無い場合も含む）。firewall評価より後で行う
+outbound NATのshape/plan reject（DF=0の`Nat44UdpNonAtomicIpv4Unsupported`、source port 0、
+SourceForbidden、ReverseAuthorityMismatch、port pool枯渇など）は再現しないため、例えばLANからの
+DF=0 UDP/53はroute有りならsilent、route無しならICMPになります。これは受容します: 送信者はinside
+にいて有効なDF=1 trafficで同じroute有無を知ることができ、firewallなしの経路にも同じ非対称が
+あり、生成errorはper-egress rate limiterで抑えられるためです。
+
+残るdeviation: egress-free評価はestablished stateを参照せず新規flowとして判定するため、
+routeが撤去された後の既存flowのpacket（例: established TCPのACK、許可ruleがegress限定の
+flowのUDP）はsilentな`FirewallRouteUnavailable`で、firewallなしの経路やRFC 1812 §5.2.7.1の
+MUSTと異なりNetwork Unreachableを返しません（FW-025）。これはtracked deviationで、ownerの
+RFC準拠を基準とする方針（2026-11-01）のもと、security上の挙動を設定可能にする要求とあわせて
+別PRで再検討します。
 
 full compositionでもfirewall authorizationはTTL判定とgenerated error captureより先です。
-rule/default deny、runtime/config/snapshot authority failure、LPM missはICMP/ARPをqueueしない
-silent dropを維持します。認可済みpacketのTTL 0/1は既存のerror suppressionとreverse
+rule/default deny、runtime/config/snapshot authority failure、上記egress-free評価でdenyされた
+LPM missはICMP/ARPをqueueしないsilent dropを維持します。認可済みpacketのTTL 0/1は既存のerror suppressionとreverse
 authorityを通過した場合にactionをqueueし、quoteはNAT rewrite前の受信IPv4 datagramです。
 TTL failureではNAT mapping/sessionとfirewall flowをcommitしません。captureはRX phaseだけで、
 generated実行をforwarding wrapper内へ融合しません。worker tick順は引き続き
@@ -979,8 +1029,10 @@ restart-requiredでもstorageは作り直さず旧generationで継続します�
 読めたがparse/validate/bridgeに失敗したfileはscenario内の`invalid` rejectです。`hold`後は
 `SimRun::idle_tick`で単調な注入時刻のidle tickを続けられます。出力はfield順固定の手書きJSONLで、wall clock、map順、
 hash key、seedを含みません。step単位（tickは1回ずつ）の`SimRun::step`で呼出し側がtick間に
-停止flagを確認できます。full compositionはfirewall必須のため、route missはsilentな
-`FIREWALL_ROUTE_UNAVAILABLE`でDestination Unreachable Networkは生成されません。
+停止flagを確認できます。full compositionはfirewall必須のため、route missは上記のegress-free
+policy評価でpermitされた場合だけDestination Unreachable Networkを生成し、それ以外はsilentな
+`FIREWALL_ROUTE_UNAVAILABLE`です（M1 goldenはv1でsilent、egress `Any`のrule 40を持つv2でType 3/
+Code 0を検証）。
 
 ### `ruster` CLI（`ruster-cli`）
 
@@ -1005,8 +1057,9 @@ private `signal` moduleだけで、crateは`#![deny(unsafe_code)]`です。
 - backendは`SimIo`だけです。`ruster run`、AF_PACKET/AF_XDPのlive constructor、実NIC/netns
   E2Eはありません（M2）。run-simの結果を性能値として扱いません（simは注入frameごとに
   cold側`Vec<u8>`を確保します）。
-- firewall有効時のroute missはsilentな`FIREWALL_ROUTE_UNAVAILABLE`で、Destination
-  Unreachable Networkを生成しません（RFC 1812 §5.2.7.1からのdeviation、SIM-010、owner確認待ち）。
+- firewall有効時のroute missは、egress-free評価で許可されegress依存のNAT gateにも当たらない
+  packetだけにDestination Unreachable Networkを返します。route撤去後の既存flowのpacketは
+  silentです（RFC 1812 §5.2.7.1からのtracked deviation、FW-025。RFC準拠を基準に別PRで再検討）。
 - restart-requiredのapplyはrun-sim内でrejectとして報告し、storageを作り直しません（SIM-016）。
   generation/key履歴はprocess内だけです。
 - NAT/FW占有、resolution/action/audit high-watermark、native ring saturationは未実装です
