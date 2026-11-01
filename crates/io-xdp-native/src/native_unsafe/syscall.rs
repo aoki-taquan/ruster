@@ -8,14 +8,22 @@
 //! future data path.
 
 use std::{
-    ffi::{c_char, c_int, c_short, c_uint, c_void},
+    ffi::{c_char, c_int, c_long, c_short, c_uint, c_void, CStr},
     fmt,
     mem::size_of,
     os::fd::RawFd,
     ptr::NonNull,
 };
 
-use crate::{abi::AF_XDP, ensure_native_syscall_supported, NativeSyscallPlatformError};
+use crate::{
+    abi::AF_XDP,
+    ensure_native_syscall_supported,
+    xdp_program::{
+        redirect_program, BpfInsn, BPF_OBJ_NAME_LEN, MAP_NAME, PROGRAM_LICENSE, PROGRAM_NAME,
+        REDIRECT_PROGRAM_LEN,
+    },
+    NativeSyscallPlatformError,
+};
 
 use super::mmap::BorrowedMmap;
 
@@ -57,15 +65,76 @@ pub(super) const IFNAMSIZ: usize = 16;
 /// x86_64 Linux base page size (`arch/x86/include/asm/page_types.h`).
 pub(super) const PAGE_SIZE: usize = 4_096;
 
+/// Pinned source profile of the `bpf(2)` subset used for XDP attach.
+const BPF_ABI_PROFILE: &str = "Linux v6.8 x86_64: arch/x86/entry/syscalls/syscall_64.tbl, \
+     include/uapi/linux/bpf.h, include/uapi/linux/bpf_common.h, \
+     include/uapi/linux/if_link.h; minimum kernel 5.9 (BPF_LINK_CREATE for XDP)";
+
+/// `__NR_bpf` on x86_64.
+const SYS_BPF: c_long = 321;
+
+/// `enum bpf_cmd`, object types, and `union bpf_attr` prefix lengths.
+pub(super) mod bpf {
+    pub(in crate::native_unsafe) const BPF_MAP_CREATE: u32 = 0;
+    pub(in crate::native_unsafe) const BPF_MAP_UPDATE_ELEM: u32 = 2;
+    pub(in crate::native_unsafe) const BPF_PROG_LOAD: u32 = 5;
+    pub(in crate::native_unsafe) const BPF_LINK_CREATE: u32 = 28;
+    /// `enum bpf_map_type` `BPF_MAP_TYPE_XSKMAP`.
+    pub(in crate::native_unsafe) const BPF_MAP_TYPE_XSKMAP: u32 = 17;
+    /// `enum bpf_prog_type` `BPF_PROG_TYPE_XDP`.
+    pub(in crate::native_unsafe) const BPF_PROG_TYPE_XDP: u32 = 6;
+    /// `enum bpf_attach_type` `BPF_XDP` (Linux 5.9+).
+    pub(in crate::native_unsafe) const BPF_XDP: u32 = 37;
+    /// `BPF_NOEXIST`: the update must not replace an occupied slot.
+    pub(in crate::native_unsafe) const BPF_NOEXIST: u64 = 1;
+    /// `BPF_LOG_LEVEL1`.
+    pub(in crate::native_unsafe) const BPF_LOG_LEVEL1: u32 = 1;
+    /// `BPF_MAXINSNS` (`bpf_common.h`), applied unconditionally.
+    pub(in crate::native_unsafe) const BPF_MAXINSNS: usize = 4_096;
+    /// Largest license copied by Linux `bpf_prog_load` (128-byte buffer).
+    pub(in crate::native_unsafe) const LICENSE_CAPACITY: usize = 128;
+    /// Bytes of `union bpf_attr` passed per command: exactly the leading
+    /// fields this profile writes, all present since Linux 5.9. The kernel
+    /// treats the omitted tail as zero.
+    pub(in crate::native_unsafe) const MAP_CREATE_ATTR_LEN: usize = 44;
+    pub(in crate::native_unsafe) const MAP_UPDATE_ATTR_LEN: usize = 32;
+    pub(in crate::native_unsafe) const PROG_LOAD_ATTR_LEN: usize = 72;
+    pub(in crate::native_unsafe) const LINK_CREATE_ATTR_LEN: usize = 16;
+}
+
+/// Accepted verifier log buffer lengths: Linux 5.x requires at least 128
+/// bytes with a nonzero log level, and every version caps at `u32::MAX >> 2`.
+pub(super) const BPF_LOG_CAPACITY_RANGE: std::ops::RangeInclusive<usize> =
+    128..=(u32::MAX >> 2) as usize;
+
+/// One XSKMAP creation request (`key_size = value_size = 4`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct MapCreateRequest {
+    pub(super) max_entries: u32,
+    pub(super) name: [u8; BPF_OBJ_NAME_LEN],
+}
+
+/// One `BPF_PROG_LOAD` request for an XDP program.
+pub(super) struct ProgramLoadRequest<'a> {
+    pub(super) insns: &'a [BpfInsn],
+    pub(super) license: &'a CStr,
+    pub(super) name: [u8; BPF_OBJ_NAME_LEN],
+    /// Kernel-written `BPF_LOG_LEVEL1` verifier log. Untrusted bytes.
+    pub(super) log: &'a mut [u8],
+}
+
 /// Linux v6.8 `include/uapi/asm-generic/errno-base.h` and `errno.h` values
 /// that the session builder classifies. Every other errno stays numeric.
 pub(super) mod errno {
     pub(in crate::native_unsafe) const EPERM: u16 = 1;
+    pub(in crate::native_unsafe) const E2BIG: u16 = 7;
     pub(in crate::native_unsafe) const ENOMEM: u16 = 12;
     pub(in crate::native_unsafe) const EACCES: u16 = 13;
     pub(in crate::native_unsafe) const EBUSY: u16 = 16;
+    pub(in crate::native_unsafe) const EEXIST: u16 = 17;
     pub(in crate::native_unsafe) const ENODEV: u16 = 19;
     pub(in crate::native_unsafe) const EINVAL: u16 = 22;
+    pub(in crate::native_unsafe) const ENOSPC: u16 = 28;
     pub(in crate::native_unsafe) const EOPNOTSUPP: u16 = 95;
     pub(in crate::native_unsafe) const EAFNOSUPPORT: u16 = 97;
     pub(in crate::native_unsafe) const ENOBUFS: u16 = 105;
@@ -125,6 +194,11 @@ pub(super) enum SyscallStage {
     PollSocket,
     SendToSocket,
     CloseSocket,
+    CreateBpfMap,
+    LoadBpfProgram,
+    UpdateBpfMap,
+    CreateBpfLink,
+    CloseBpfObject,
 }
 
 /// One syscall failure with no descriptor, address, or packet data.
@@ -139,10 +213,29 @@ pub(super) struct SyscallError {
 pub(super) enum SyscallArgumentError {
     InvalidFileDescriptor,
     InvalidInterfaceName,
-    ZeroLength { stage: SyscallStage },
-    LengthDoesNotFitSockLen { stage: SyscallStage, length: usize },
-    OffsetDoesNotFitOffT { offset: u64 },
-    KernelLengthOutOfBounds { capacity: usize, actual: usize },
+    ZeroLength {
+        stage: SyscallStage,
+    },
+    LengthDoesNotFitSockLen {
+        stage: SyscallStage,
+        length: usize,
+    },
+    OffsetDoesNotFitOffT {
+        offset: u64,
+    },
+    KernelLengthOutOfBounds {
+        capacity: usize,
+        actual: usize,
+    },
+    /// A BPF handle of the wrong kind was passed (a map where a program is
+    /// required, for example).
+    WrongBpfObject,
+    /// A zero ifindex or XSKMAP size, or an XSKMAP key outside the map.
+    BpfArgumentOutOfRange,
+    /// The verifier log buffer is outside [`BPF_LOG_CAPACITY_RANGE`].
+    VerifierLogLength {
+        length: usize,
+    },
 }
 
 /// Fixed-size error from the private syscall/RAII seam.
@@ -259,6 +352,17 @@ pub(super) trait Syscalls: sealed::Sealed {
     /// because its number may be reused immediately. Only `OwnedXdpFd`
     /// calls this, at most once per fd.
     unsafe fn close(&self, fd: RawFd) -> Result<(), Errno>;
+    /// `bpf(BPF_MAP_CREATE)` for one XSKMAP; returns an owned CLOEXEC fd.
+    fn bpf_map_create(&self, request: &MapCreateRequest) -> Result<RawFd, Errno>;
+    /// `bpf(BPF_PROG_LOAD)` for one `BPF_PROG_TYPE_XDP` program; returns an
+    /// owned CLOEXEC fd. The kernel writes at most `request.log.len()` bytes.
+    fn bpf_prog_load(&self, request: &mut ProgramLoadRequest<'_>) -> Result<RawFd, Errno>;
+    /// `bpf(BPF_MAP_UPDATE_ELEM, BPF_NOEXIST)` storing socket fd `value` at
+    /// `key`.
+    fn bpf_map_update(&self, map_fd: RawFd, key: u32, value: RawFd) -> Result<(), Errno>;
+    /// `bpf(BPF_LINK_CREATE)` with `attach_type = BPF_XDP` on `ifindex`;
+    /// returns an owned CLOEXEC link fd.
+    fn bpf_link_create(&self, prog_fd: RawFd, ifindex: u32, flags: u32) -> Result<RawFd, Errno>;
 }
 
 /// Seam whose successful `mmap` results are real process mappings.
@@ -421,6 +525,146 @@ impl Syscalls for LinuxSyscalls {
         let result = unsafe { ffi::close(fd) };
         result_from_minus_one(result).map(|_| ())
     }
+
+    fn bpf_map_create(&self, request: &MapCreateRequest) -> Result<RawFd, Errno> {
+        if request.max_entries == 0 || request.name[BPF_OBJ_NAME_LEN - 1] != 0 {
+            return Err(Errno::ArgumentRejected);
+        }
+        let mut attr = BpfAttr::<{ bpf::MAP_CREATE_ATTR_LEN }>::new();
+        attr.put_u32(0, bpf::BPF_MAP_TYPE_XSKMAP);
+        attr.put_u32(4, 4); // key_size: u32 queue index
+        attr.put_u32(8, 4); // value_size: u32 socket fd
+        attr.put_u32(12, request.max_entries);
+        // map_flags, inner_map_fd, and numa_node stay zero.
+        attr.put_bytes(28, &request.name);
+        // SAFETY: `attr` is an owned, 8-byte aligned, pointer-free buffer of
+        // exactly the passed length; the kernel only reads it.
+        let result = unsafe { attr.call(bpf::BPF_MAP_CREATE) };
+        result_from_fd(result)
+    }
+
+    fn bpf_prog_load(&self, request: &mut ProgramLoadRequest<'_>) -> Result<RawFd, Errno> {
+        let insn_cnt = request.insns.len();
+        let license = request.license.to_bytes_with_nul();
+        if insn_cnt == 0
+            || insn_cnt > bpf::BPF_MAXINSNS
+            || license.len() > bpf::LICENSE_CAPACITY
+            || !BPF_LOG_CAPACITY_RANGE.contains(&request.log.len())
+            || request.name[BPF_OBJ_NAME_LEN - 1] != 0
+        {
+            return Err(Errno::ArgumentRejected);
+        }
+        let mut attr = BpfAttr::<{ bpf::PROG_LOAD_ATTR_LEN }>::new();
+        attr.put_u32(0, bpf::BPF_PROG_TYPE_XDP);
+        attr.put_u32(4, insn_cnt as u32);
+        attr.put_u64(8, request.insns.as_ptr().expose_provenance() as u64);
+        attr.put_u64(16, license.as_ptr().expose_provenance() as u64);
+        attr.put_u32(24, bpf::BPF_LOG_LEVEL1);
+        attr.put_u32(28, request.log.len() as u32);
+        attr.put_u64(32, request.log.as_mut_ptr().expose_provenance() as u64);
+        // kern_version and prog_flags stay zero.
+        attr.put_bytes(48, &request.name);
+        // prog_ifindex stays zero: the program is not device-bound.
+        attr.put_u32(68, bpf::BPF_XDP);
+        // SAFETY: the attr holds three user pointers, each derived from a
+        // borrow that `request` holds for the whole call. `insns` is
+        // readable for exactly `insn_cnt` 8-byte `repr(C)` instructions
+        // (bounded above). `license` is NUL-terminated within 128 bytes,
+        // and the kernel copies at most 127 bytes of it. `log` is
+        // exclusively borrowed and writable for exactly `log_size` bytes,
+        // which the kernel never exceeds. The kernel keeps none of the
+        // pointers after returning.
+        let result = unsafe { attr.call(bpf::BPF_PROG_LOAD) };
+        result_from_fd(result)
+    }
+
+    fn bpf_map_update(&self, map_fd: RawFd, key: u32, value: RawFd) -> Result<(), Errno> {
+        if map_fd < 0 || value < 0 {
+            return Err(Errno::ArgumentRejected);
+        }
+        let key_bytes = key.to_ne_bytes();
+        let value_bytes = value.to_ne_bytes();
+        let mut attr = BpfAttr::<{ bpf::MAP_UPDATE_ATTR_LEN }>::new();
+        attr.put_u32(0, map_fd.unsigned_abs());
+        attr.put_u64(8, key_bytes.as_ptr().expose_provenance() as u64);
+        attr.put_u64(16, value_bytes.as_ptr().expose_provenance() as u64);
+        attr.put_u64(24, bpf::BPF_NOEXIST);
+        // SAFETY: `key` and `value` point to live four-byte locals of this
+        // frame, matching the XSKMAP key and value size. The kernel only
+        // reads them during the call. The attr buffer has exactly the
+        // passed length.
+        let result = unsafe { attr.call(bpf::BPF_MAP_UPDATE_ELEM) };
+        result_from_fd(result).map(|_| ())
+    }
+
+    fn bpf_link_create(&self, prog_fd: RawFd, ifindex: u32, flags: u32) -> Result<RawFd, Errno> {
+        if prog_fd < 0 || ifindex == 0 {
+            return Err(Errno::ArgumentRejected);
+        }
+        let mut attr = BpfAttr::<{ bpf::LINK_CREATE_ATTR_LEN }>::new();
+        attr.put_u32(0, prog_fd.unsigned_abs());
+        attr.put_u32(4, ifindex);
+        attr.put_u32(8, bpf::BPF_XDP);
+        attr.put_u32(12, flags);
+        // SAFETY: `attr` is an owned, aligned, pointer-free buffer of exactly
+        // the passed length; the kernel only reads it.
+        let result = unsafe { attr.call(bpf::BPF_LINK_CREATE) };
+        result_from_fd(result)
+    }
+}
+
+/// Leading bytes of one `union bpf_attr`, 8-byte aligned like the kernel's
+/// `__aligned_u64` fields.
+#[repr(C, align(8))]
+struct BpfAttr<const LEN: usize>([u8; LEN]);
+
+impl<const LEN: usize> BpfAttr<LEN> {
+    const fn new() -> Self {
+        Self([0; LEN])
+    }
+
+    fn put_u32(&mut self, offset: usize, value: u32) {
+        self.0[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn put_u64(&mut self, offset: usize, value: u64) {
+        self.0[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    fn put_bytes(&mut self, offset: usize, value: &[u8]) {
+        self.0[offset..offset + value.len()].copy_from_slice(value);
+    }
+
+    /// # Safety
+    ///
+    /// Every user pointer stored in the attr must be valid, for the whole
+    /// call, for the access the kernel performs for `command`.
+    unsafe fn call(&mut self, command: u32) -> c_long {
+        // SAFETY: the caller upholds the pointer contract above. The attr
+        // itself is valid for reads and writes of exactly `LEN` bytes. Every
+        // variadic argument is passed as a full `long`, as `syscall(2)`
+        // reads them.
+        unsafe {
+            ffi::syscall(
+                SYS_BPF,
+                c_long::from(command),
+                self.0.as_mut_ptr().cast::<c_void>(),
+                LEN as c_long,
+            )
+        }
+    }
+}
+
+/// Decodes a `bpf(2)` result: an fd, or zero for a map update.
+fn result_from_fd(result: c_long) -> Result<RawFd, Errno> {
+    if result == -1 {
+        Err(last_errno())
+    } else {
+        RawFd::try_from(result)
+            .ok()
+            .filter(|fd| *fd >= 0)
+            .ok_or(Errno::InvalidCapture)
+    }
 }
 
 fn result_from_minus_one(result: c_int) -> Result<c_int, Errno> {
@@ -493,6 +737,11 @@ impl<'syscalls, S: Syscalls> OwnedXdpFd<'syscalls, S> {
 
     fn raw(&self) -> RawFd {
         self.fd.expect("owned fd is active")
+    }
+
+    /// The seam this fd releases through, for creating related objects.
+    pub(super) const fn syscalls(&self) -> &'syscalls S {
+        self.syscalls
     }
 
     pub(super) fn set_socket_option(
@@ -605,6 +854,168 @@ impl<S: Syscalls> Drop for OwnedXdpFd<'_, S> {
     }
 }
 
+/// Kind of kernel BPF object behind one [`OwnedBpfFd`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BpfObject {
+    XskMap,
+    XdpProgram,
+    XdpLink,
+}
+
+/// Owned nonnegative BPF object fd with exactly-once close semantics.
+///
+/// Linux creates every map, program, and link fd with `O_CLOEXEC`, so none
+/// leaks into an exec'd child. Closing the last reference of an XDP link
+/// detaches its program; the link is never pinned, so process exit (even
+/// SIGKILL) also detaches.
+pub(super) struct OwnedBpfFd<'syscalls, S: Syscalls> {
+    syscalls: &'syscalls S,
+    fd: Option<RawFd>,
+    object: BpfObject,
+}
+
+impl<'syscalls, S: Syscalls> OwnedBpfFd<'syscalls, S> {
+    fn adopt(
+        syscalls: &'syscalls S,
+        object: BpfObject,
+        result: Result<RawFd, Errno>,
+        stage: SyscallStage,
+    ) -> Result<Self, ResourceError> {
+        let fd = result.map_err(|errno| syscall_error(stage, errno))?;
+        if fd < 0 {
+            return Err(SyscallArgumentError::InvalidFileDescriptor.into());
+        }
+        Ok(Self {
+            syscalls,
+            fd: Some(fd),
+            object,
+        })
+    }
+
+    /// Creates one XSKMAP with `max_entries` slots.
+    pub(super) fn create_xskmap(
+        syscalls: &'syscalls S,
+        max_entries: u32,
+    ) -> Result<Self, ResourceError> {
+        ensure_native_syscall_supported().map_err(ResourceError::Platform)?;
+        if max_entries == 0 {
+            return Err(SyscallArgumentError::BpfArgumentOutOfRange.into());
+        }
+        let request = MapCreateRequest {
+            max_entries,
+            name: MAP_NAME,
+        };
+        let result = syscalls.bpf_map_create(&request);
+        Self::adopt(
+            syscalls,
+            BpfObject::XskMap,
+            result,
+            SyscallStage::CreateBpfMap,
+        )
+    }
+
+    /// Loads the redirect program bound to this XSKMAP. The kernel writes
+    /// its verifier log into `log`, whose bytes the caller must treat as
+    /// untrusted.
+    pub(super) fn load_redirect_program(
+        &self,
+        log: &mut [u8],
+    ) -> Result<OwnedBpfFd<'syscalls, S>, ResourceError> {
+        let map_fd = self.raw_of(BpfObject::XskMap)?;
+        if !BPF_LOG_CAPACITY_RANGE.contains(&log.len()) {
+            return Err(SyscallArgumentError::VerifierLogLength { length: log.len() }.into());
+        }
+        let program: [BpfInsn; REDIRECT_PROGRAM_LEN] = redirect_program(map_fd);
+        let mut request = ProgramLoadRequest {
+            insns: &program,
+            license: PROGRAM_LICENSE,
+            name: PROGRAM_NAME,
+            log,
+        };
+        let result = self.syscalls.bpf_prog_load(&mut request);
+        Self::adopt(
+            self.syscalls,
+            BpfObject::XdpProgram,
+            result,
+            SyscallStage::LoadBpfProgram,
+        )
+    }
+
+    /// Stores `socket` in this XSKMAP at `queue` (`BPF_NOEXIST`).
+    pub(super) fn insert_socket(
+        &self,
+        queue: u32,
+        socket: &OwnedXdpFd<'_, S>,
+    ) -> Result<(), ResourceError> {
+        let map_fd = self.raw_of(BpfObject::XskMap)?;
+        self.syscalls
+            .bpf_map_update(map_fd, queue, socket.raw())
+            .map_err(|errno| syscall_error(SyscallStage::UpdateBpfMap, errno))
+    }
+
+    /// Attaches this program to `ifindex` through a new, unpinned link.
+    pub(super) fn create_xdp_link(
+        &self,
+        ifindex: u32,
+        flags: u32,
+    ) -> Result<OwnedBpfFd<'syscalls, S>, ResourceError> {
+        let prog_fd = self.raw_of(BpfObject::XdpProgram)?;
+        if ifindex == 0 {
+            return Err(SyscallArgumentError::BpfArgumentOutOfRange.into());
+        }
+        let result = self.syscalls.bpf_link_create(prog_fd, ifindex, flags);
+        Self::adopt(
+            self.syscalls,
+            BpfObject::XdpLink,
+            result,
+            SyscallStage::CreateBpfLink,
+        )
+    }
+
+    pub(super) const fn object(&self) -> BpfObject {
+        self.object
+    }
+
+    fn raw_of(&self, object: BpfObject) -> Result<RawFd, ResourceError> {
+        match self.fd {
+            Some(fd) if self.object == object => Ok(fd),
+            _ => Err(SyscallArgumentError::WrongBpfObject.into()),
+        }
+    }
+
+    pub(super) fn close(mut self) -> Result<(), ResourceError> {
+        self.close_once()
+    }
+
+    fn close_once(&mut self) -> Result<(), ResourceError> {
+        let Some(fd) = self.fd.take() else {
+            return Ok(());
+        };
+        // SAFETY: `fd` came from one successful `bpf(2)` call, was owned only
+        // by `self`, and `take` above makes this the single release; the
+        // number is never used again.
+        unsafe { self.syscalls.close(fd) }
+            .map_err(|errno| syscall_error(SyscallStage::CloseBpfObject, errno))
+    }
+}
+
+impl<S: Syscalls> fmt::Debug for OwnedBpfFd<'_, S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("OwnedBpfFd")
+            .field("object", &self.object)
+            .field("fd", &"<redacted>")
+            .field("active", &self.fd.is_some())
+            .finish()
+    }
+}
+
+impl<S: Syscalls> Drop for OwnedBpfFd<'_, S> {
+    fn drop(&mut self) {
+        let _ = self.close_once();
+    }
+}
+
 /// One owned mmap result. Address zero is a valid stored success.
 pub(super) struct MappedRegion<'syscalls, S: Syscalls> {
     syscalls: &'syscalls S,
@@ -707,7 +1118,7 @@ impl<S: Syscalls> Drop for MappedRegion<'_, S> {
 }
 
 mod ffi {
-    use super::{c_char, c_int, c_short, c_uint, c_void, Offset, PollCount, SockLen};
+    use super::{c_char, c_int, c_long, c_short, c_uint, c_void, Offset, PollCount, SockLen};
 
     #[repr(C)]
     pub(super) struct PollFd {
@@ -759,6 +1170,7 @@ mod ffi {
             destination_len: SockLen,
         ) -> isize;
         pub(super) fn close(fd: c_int) -> c_int;
+        pub(super) fn syscall(number: c_long, ...) -> c_long;
         pub(super) fn if_nametoindex(name: *const c_char) -> c_uint;
         pub(super) fn __errno_location() -> *mut c_int;
     }
@@ -825,6 +1237,24 @@ mod tests {
         },
         Close {
             fd: RawFd,
+        },
+        BpfMapCreate {
+            max_entries: u32,
+        },
+        BpfProgLoad {
+            insn_cnt: usize,
+            map_fd: i32,
+            log_len: usize,
+        },
+        BpfMapUpdate {
+            map_fd: RawFd,
+            key: u32,
+            value: RawFd,
+        },
+        BpfLinkCreate {
+            prog_fd: RawFd,
+            ifindex: u32,
+            flags: u32,
         },
     }
 
@@ -1017,7 +1447,47 @@ mod tests {
 
         unsafe fn close(&self, fd: RawFd) -> Result<(), Errno> {
             self.record(Call::Close { fd });
-            self.result(SyscallStage::CloseSocket)
+            let stage = if fd == 17 {
+                SyscallStage::CloseSocket
+            } else {
+                SyscallStage::CloseBpfObject
+            };
+            self.result(stage)
+        }
+
+        fn bpf_map_create(&self, request: &MapCreateRequest) -> Result<RawFd, Errno> {
+            self.record(Call::BpfMapCreate {
+                max_entries: request.max_entries,
+            });
+            self.result(SyscallStage::CreateBpfMap).map(|()| 30)
+        }
+
+        fn bpf_prog_load(&self, request: &mut ProgramLoadRequest<'_>) -> Result<RawFd, Errno> {
+            self.record(Call::BpfProgLoad {
+                insn_cnt: request.insns.len(),
+                map_fd: request.insns[1].imm,
+                log_len: request.log.len(),
+            });
+            self.result(SyscallStage::LoadBpfProgram).map(|()| 31)
+        }
+
+        fn bpf_map_update(&self, map_fd: RawFd, key: u32, value: RawFd) -> Result<(), Errno> {
+            self.record(Call::BpfMapUpdate { map_fd, key, value });
+            self.result(SyscallStage::UpdateBpfMap)
+        }
+
+        fn bpf_link_create(
+            &self,
+            prog_fd: RawFd,
+            ifindex: u32,
+            flags: u32,
+        ) -> Result<RawFd, Errno> {
+            self.record(Call::BpfLinkCreate {
+                prog_fd,
+                ifindex,
+                flags,
+            });
+            self.result(SyscallStage::CreateBpfLink).map(|()| 32)
         }
     }
 
@@ -1411,6 +1881,241 @@ mod tests {
             ))
         );
         assert_eq!(fake.transcript.borrow().len, 0);
+    }
+
+    #[test]
+    fn native_bpf_seam_constants_and_attr_prefixes_are_pinned() {
+        assert_eq!(
+            BPF_ABI_PROFILE,
+            "Linux v6.8 x86_64: arch/x86/entry/syscalls/syscall_64.tbl, \
+             include/uapi/linux/bpf.h, include/uapi/linux/bpf_common.h, \
+             include/uapi/linux/if_link.h; minimum kernel 5.9 (BPF_LINK_CREATE for XDP)"
+        );
+        assert_eq!(SYS_BPF, 321);
+        assert_eq!(
+            (
+                bpf::BPF_MAP_CREATE,
+                bpf::BPF_MAP_UPDATE_ELEM,
+                bpf::BPF_PROG_LOAD,
+                bpf::BPF_LINK_CREATE
+            ),
+            (0, 2, 5, 28)
+        );
+        assert_eq!(
+            (
+                bpf::BPF_MAP_TYPE_XSKMAP,
+                bpf::BPF_PROG_TYPE_XDP,
+                bpf::BPF_XDP
+            ),
+            (17, 6, 37)
+        );
+        assert_eq!(
+            (bpf::BPF_NOEXIST, bpf::BPF_LOG_LEVEL1, bpf::BPF_MAXINSNS),
+            (1, 1, 4_096)
+        );
+        // `union bpf_attr` prefix ends: map_name (28 + 16), flags (24 + 8),
+        // expected_attach_type (68 + 4), link_create.flags (12 + 4).
+        assert_eq!(
+            (
+                bpf::MAP_CREATE_ATTR_LEN,
+                bpf::MAP_UPDATE_ATTR_LEN,
+                bpf::PROG_LOAD_ATTR_LEN,
+                bpf::LINK_CREATE_ATTR_LEN
+            ),
+            (44, 32, 72, 16)
+        );
+        assert_eq!(std::mem::align_of::<BpfAttr<16>>(), 8);
+        assert_eq!(
+            (
+                *BPF_LOG_CAPACITY_RANGE.start(),
+                *BPF_LOG_CAPACITY_RANGE.end()
+            ),
+            (128, (u32::MAX >> 2) as usize)
+        );
+        assert_eq!((errno::E2BIG, errno::EEXIST, errno::ENOSPC), (7, 17, 28));
+        let mut attr = BpfAttr::<16>::new();
+        attr.put_u32(4, 0x0102_0304);
+        attr.put_u64(8, 0x0506_0708_090a_0b0c);
+        assert_eq!(
+            attr.0,
+            [0, 0, 0, 0, 4, 3, 2, 1, 0x0c, 0x0b, 0x0a, 9, 8, 7, 6, 5]
+        );
+        assert_eq!(result_from_fd(7), Ok(7));
+        assert_eq!(result_from_fd(0), Ok(0));
+        assert_eq!(result_from_fd(-2), Err(Errno::InvalidCapture));
+        assert_eq!(
+            result_from_fd(c_long::from(i32::MAX) + 1),
+            Err(Errno::InvalidCapture)
+        );
+    }
+
+    #[test]
+    fn native_bpf_objects_are_typed_redacted_and_closed_once() {
+        let syscalls = FakeSyscalls::new();
+        let socket = OwnedXdpFd::open(&syscalls).expect("fake socket");
+        let map = OwnedBpfFd::create_xskmap(&syscalls, 4).expect("fake map");
+        assert_eq!(map.object(), BpfObject::XskMap);
+        assert_eq!(
+            format!("{map:?}"),
+            "OwnedBpfFd { object: XskMap, fd: \"<redacted>\", active: true }"
+        );
+        let mut log = [0_u8; 128];
+        let program = map.load_redirect_program(&mut log).expect("fake load");
+        map.insert_socket(3, &socket).expect("fake update");
+        let link = program.create_xdp_link(9, 4).expect("fake link");
+        assert_eq!(link.object(), BpfObject::XdpLink);
+
+        // Handles of the wrong kind are refused before the seam.
+        let baseline = syscalls.transcript.borrow().len;
+        let wrong = ResourceError::Argument(SyscallArgumentError::WrongBpfObject);
+        assert_eq!(program.insert_socket(3, &socket), Err(wrong));
+        assert_eq!(link.load_redirect_program(&mut log).map(|_| ()), Err(wrong));
+        assert_eq!(map.create_xdp_link(9, 4).map(|_| ()), Err(wrong));
+        assert_eq!(
+            program.create_xdp_link(0, 4).map(|_| ()),
+            Err(ResourceError::Argument(
+                SyscallArgumentError::BpfArgumentOutOfRange
+            ))
+        );
+        assert_eq!(
+            map.load_redirect_program(&mut [0_u8; 127]).map(|_| ()),
+            Err(ResourceError::Argument(
+                SyscallArgumentError::VerifierLogLength { length: 127 }
+            ))
+        );
+        assert_eq!(
+            OwnedBpfFd::create_xskmap(&syscalls, 0).map(|_| ()),
+            Err(ResourceError::Argument(
+                SyscallArgumentError::BpfArgumentOutOfRange
+            ))
+        );
+        assert_eq!(syscalls.transcript.borrow().len, baseline);
+
+        drop(link);
+        drop(program);
+        let mut map = map;
+        map.close_once().expect("first close");
+        map.close_once().expect("idempotent close");
+        drop(map);
+        drop(socket);
+        assert_eq!(
+            syscalls.transcript.borrow().as_slice(),
+            &[
+                Some(Call::Socket {
+                    domain: 44,
+                    kind: XDP_SOCKET_KIND,
+                    protocol: 0,
+                }),
+                Some(Call::BpfMapCreate { max_entries: 4 }),
+                Some(Call::BpfProgLoad {
+                    insn_cnt: REDIRECT_PROGRAM_LEN,
+                    map_fd: 30,
+                    log_len: 128,
+                }),
+                Some(Call::BpfMapUpdate {
+                    map_fd: 30,
+                    key: 3,
+                    value: 17,
+                }),
+                Some(Call::BpfLinkCreate {
+                    prog_fd: 31,
+                    ifindex: 9,
+                    flags: 4,
+                }),
+                Some(Call::Close { fd: 32 }),
+                Some(Call::Close { fd: 31 }),
+                Some(Call::Close { fd: 30 }),
+                Some(Call::Close { fd: 17 }),
+            ]
+        );
+
+        // Failed creation adopts nothing; a failed close is never retried.
+        for (stage, closes) in [
+            (SyscallStage::CreateBpfMap, 0),
+            (SyscallStage::LoadBpfProgram, 1),
+            (SyscallStage::CreateBpfLink, 2),
+        ] {
+            let syscalls = FakeSyscalls::new();
+            syscalls.fail.set(Some(stage));
+            let error = OwnedBpfFd::create_xskmap(&syscalls, 1).and_then(|map| {
+                map.load_redirect_program(&mut [0_u8; 128])
+                    .and_then(|program| program.create_xdp_link(1, 2))
+                    .map(|_| ())
+            });
+            assert_eq!(
+                error,
+                Err(ResourceError::Syscall(SyscallError {
+                    stage,
+                    errno: TEST_ERRNO,
+                })),
+                "{stage:?}"
+            );
+            assert_eq!(
+                syscalls.count(|call| matches!(call, Call::Close { .. })),
+                closes,
+                "{stage:?}"
+            );
+        }
+        let syscalls = FakeSyscalls::new();
+        let mut map = OwnedBpfFd::create_xskmap(&syscalls, 1).expect("fake map");
+        syscalls.fail.set(Some(SyscallStage::CloseBpfObject));
+        assert!(map.close_once().is_err());
+        assert_eq!(map.close_once(), Ok(()));
+        drop(map);
+        assert_eq!(syscalls.count(|call| matches!(call, Call::Close { .. })), 1);
+    }
+
+    #[test]
+    fn native_bpf_linux_seam_rejects_inconsistent_arguments_before_ffi() {
+        // Every rejection returns before `syscall(SYS_bpf)`; fd -1 and the
+        // empty or oversized buffers below never reach the kernel.
+        let linux = LinuxSyscalls;
+        let name = [0_u8; BPF_OBJ_NAME_LEN];
+        assert_eq!(
+            linux.bpf_map_create(&MapCreateRequest {
+                max_entries: 0,
+                name,
+            }),
+            Err(Errno::ArgumentRejected)
+        );
+        assert_eq!(
+            linux.bpf_map_create(&MapCreateRequest {
+                max_entries: 1,
+                name: [b'a'; BPF_OBJ_NAME_LEN],
+            }),
+            Err(Errno::ArgumentRejected)
+        );
+        let program = redirect_program(3);
+        let oversized = vec![program[0]; bpf::BPF_MAXINSNS + 1];
+        let mut license_bytes = [b'L'; 130];
+        license_bytes[129] = 0;
+        let long_license = CStr::from_bytes_with_nul(&license_bytes).expect("129 bytes plus NUL");
+        for (insns, license, name, log_len) in [
+            (&program[..0], PROGRAM_LICENSE, PROGRAM_NAME, 128),
+            (&oversized[..], PROGRAM_LICENSE, PROGRAM_NAME, 128),
+            (&program[..], long_license, PROGRAM_NAME, 128),
+            (&program[..], PROGRAM_LICENSE, [b'a'; 16], 128),
+            (&program[..], PROGRAM_LICENSE, PROGRAM_NAME, 127),
+        ] {
+            let mut log = [0_u8; 128];
+            let mut request = ProgramLoadRequest {
+                insns,
+                license,
+                name,
+                log: &mut log[..log_len],
+            };
+            assert_eq!(
+                linux.bpf_prog_load(&mut request),
+                Err(Errno::ArgumentRejected)
+            );
+        }
+        assert_eq!(linux.bpf_map_update(-1, 0, 3), Err(Errno::ArgumentRejected));
+        assert_eq!(linux.bpf_map_update(3, 0, -1), Err(Errno::ArgumentRejected));
+        assert_eq!(
+            linux.bpf_link_create(-1, 1, 4),
+            Err(Errno::ArgumentRejected)
+        );
+        assert_eq!(linux.bpf_link_create(3, 0, 4), Err(Errno::ArgumentRejected));
     }
 
     #[test]

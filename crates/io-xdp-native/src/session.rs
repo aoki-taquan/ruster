@@ -333,9 +333,173 @@ impl fmt::Display for SessionError {
 
 impl Error for SessionError {}
 
+/// How the XSK redirect program is attached to the session's interface.
+///
+/// Configuration maps `ruster_config::XdpAttachModeV1::{Native, Generic}`
+/// onto these variants one to one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum XdpAttachMode {
+    /// Driver XDP, `XDP_FLAGS_DRV_MODE`.
+    Native,
+    /// Generic (skb) XDP, `XDP_FLAGS_SKB_MODE`. Requires a copy-mode session.
+    Generic,
+}
+
+/// Ordered step of one XDP attach transaction.
+///
+/// A failure at one step closes every object created by the earlier steps
+/// in exact reverse order. Only [`AttachStage::CreateLink`] changes the
+/// interface, and it is the commit point: the kernel either attaches the
+/// link atomically or leaves the interface untouched.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachStage {
+    /// Checks before any syscall: not already attached, mode compatible.
+    Precondition,
+    /// `BPF_MAP_CREATE` of a `BPF_MAP_TYPE_XSKMAP` with `queue + 1` slots.
+    CreateMap,
+    /// `BPF_PROG_LOAD` of the `BPF_PROG_TYPE_XDP` redirect program.
+    LoadProgram,
+    /// `BPF_MAP_UPDATE_ELEM` storing the session socket at the queue index.
+    InsertSocket,
+    /// `BPF_LINK_CREATE` with `BPF_XDP` on the session's ifindex.
+    CreateLink,
+}
+
+/// Value-free cause of one failed attach step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachFailure {
+    /// The target cannot run the reviewed x86_64 Linux syscall profile.
+    Platform(NativeSyscallPlatformError),
+    /// The session already owns an attached program.
+    AlreadyAttached,
+    /// Generic XDP was requested for a zero-copy session.
+    GenericRequiresCopyMode,
+    /// `EBUSY` or `EEXIST` from `BPF_LINK_CREATE`: another XDP program or
+    /// link is attached to the interface (in this or the other XDP mode, or
+    /// on an upper device). The existing program is never replaced or
+    /// detached; the interface is unchanged.
+    ExistingProgram,
+    /// `EOPNOTSUPP` from a native `BPF_LINK_CREATE`: the driver has no
+    /// native XDP support.
+    NativeXdpUnsupported,
+    /// `EPERM`, or `EACCES` outside program load: typically missing
+    /// `CAP_NET_ADMIN` (XSKMAP, link) or `CAP_BPF`/`CAP_SYS_ADMIN` (load). On
+    /// Linux before 5.11 a map or program over `RLIMIT_MEMLOCK` also
+    /// reports `EPERM`.
+    PermissionDenied,
+    /// `EACCES` from `BPF_PROG_LOAD`: the verifier rejected the program.
+    VerifierRejected,
+    /// `EINVAL`.
+    InvalidArgument,
+    /// `E2BIG`: at [`AttachStage::InsertSocket`] the queue index is not
+    /// below the map size; at load, a `bpf_attr` tail the kernel does not
+    /// know.
+    TooBig,
+    /// `ENOSPC`: at load, the bounded verifier log was truncated; at link
+    /// creation, a driver resource limit (veth: fewer RX queues than the
+    /// peer's TX queues).
+    NoSpace,
+    /// `ENOMEM`.
+    OutOfMemory,
+    /// `EOPNOTSUPP` elsewhere.
+    Unsupported,
+    /// Any other errno, kept numerically.
+    Errno(u16),
+    /// The thread errno, or a returned fd, was outside the Linux range.
+    UnreadableErrno,
+    /// A checked argument could not be represented for the syscall.
+    ArgumentOutOfRange,
+}
+
+/// Bounded summary of the kernel-written verifier log of one load.
+///
+/// The log bytes themselves are untrusted kernel output and are never
+/// stored in or rendered by an error; only these counts are.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct VerifierLogSummary {
+    bytes: u32,
+    truncated: bool,
+}
+
+impl VerifierLogSummary {
+    pub(crate) const fn new(bytes: u32, truncated: bool) -> Self {
+        Self { bytes, truncated }
+    }
+
+    /// Log bytes before the first NUL, at most the buffer capacity.
+    #[must_use]
+    pub const fn bytes(self) -> u32 {
+        self.bytes
+    }
+
+    /// Whether the kernel reported truncation (`ENOSPC`) or wrote no NUL.
+    #[must_use]
+    pub const fn truncated(self) -> bool {
+        self.truncated
+    }
+}
+
+/// Typed, value-free failure of [`crate::NativeSession::attach_xdp`].
+///
+/// Every BPF object created before the failing step was already closed in
+/// exact reverse order, and the session itself is unchanged and usable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AttachError {
+    stage: AttachStage,
+    failure: AttachFailure,
+    verifier_log: Option<VerifierLogSummary>,
+}
+
+impl AttachError {
+    pub(crate) const fn new(
+        stage: AttachStage,
+        failure: AttachFailure,
+        verifier_log: Option<VerifierLogSummary>,
+    ) -> Self {
+        Self {
+            stage,
+            failure,
+            verifier_log,
+        }
+    }
+
+    /// Returns the failing attach step.
+    #[must_use]
+    pub const fn stage(self) -> AttachStage {
+        self.stage
+    }
+
+    /// Returns the classified cause.
+    #[must_use]
+    pub const fn failure(self) -> AttachFailure {
+        self.failure
+    }
+
+    /// Returns the verifier log summary of a failed program load
+    /// ([`AttachStage::LoadProgram`] only).
+    #[must_use]
+    pub const fn verifier_log(self) -> Option<VerifierLogSummary> {
+        self.verifier_log
+    }
+}
+
+impl fmt::Display for AttachError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl Error for AttachError {}
+
 /// Resource released by explicit session teardown, in teardown order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleanupStage {
+    /// XDP link `close`: detaches the program (attached sessions only).
+    CloseXdpLink,
+    /// XDP program fd `close`.
+    CloseXdpProgram,
+    /// XSKMAP fd `close`.
+    CloseXskMap,
     /// TX ring `munmap`.
     UnmapTxRing,
     /// RX ring `munmap`.

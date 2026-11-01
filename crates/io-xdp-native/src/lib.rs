@@ -4,14 +4,18 @@
 #![doc = "On x86_64 Linux, [`NativeSession::open`] runs one failure-atomic, libbpf-free"]
 #![doc = "transaction through a private, dependency-free syscall/RAII seam: AF_XDP socket,"]
 #![doc = "anonymous UMEM registration, four ring sizes, checked `XDP_MMAP_OFFSETS`, ring"]
-#![doc = "mappings, `sockaddr_xdp` bind, and `XDP_OPTIONS` mode check. XDP program attach,"]
-#![doc = "packet I/O, and core `PacketIo` integration remain unimplemented."]
+#![doc = "mappings, `sockaddr_xdp` bind, and `XDP_OPTIONS` mode check."]
+#![doc = "[`NativeSession::attach_xdp`] then redirects the bound queue to the socket with a"]
+#![doc = "hand-assembled XDP program, an XSKMAP, and an unpinned `bpf_link` (Linux 5.9+),"]
+#![doc = "refusing any interface that already has an XDP program. Packet I/O and core"]
+#![doc = "`PacketIo` integration remain unimplemented."]
 
 mod config;
 mod error;
 mod platform;
 mod ring;
 mod session;
+mod xdp_program;
 
 #[path = "native_unsafe/abi.rs"]
 pub mod abi;
@@ -67,8 +71,9 @@ pub use ring::{
     ProducerPublication, RxAcquisition, RxConsumer, TxProducer, TxReservation,
 };
 pub use session::{
-    CleanupError, CleanupStage, NativeRings, NegotiatedMode, SessionConfig, SessionConfigError,
-    SessionError, SessionFailure, SessionStage, UmemRegion, INTERFACE_NAME_CAPACITY, MAX_QUEUE_ID,
+    AttachError, AttachFailure, AttachStage, CleanupError, CleanupStage, NativeRings,
+    NegotiatedMode, SessionConfig, SessionConfigError, SessionError, SessionFailure, SessionStage,
+    UmemRegion, VerifierLogSummary, XdpAttachMode, INTERFACE_NAME_CAPACITY, MAX_QUEUE_ID,
     MAX_RING_HEADER_OFFSET,
 };
 

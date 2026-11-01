@@ -22,17 +22,23 @@ use crate::{
         XDP_ZEROCOPY,
     },
     session::{
-        CleanupError, CleanupStage, NativeRings, NegotiatedMode, SessionConfig, SessionError,
-        SessionFailure, SessionStage, UmemRegion, MAX_RING_HEADER_OFFSET,
+        AttachError, AttachFailure, AttachStage, CleanupError, CleanupStage, NativeRings,
+        NegotiatedMode, SessionConfig, SessionError, SessionFailure, SessionStage, UmemRegion,
+        VerifierLogSummary, XdpAttachMode, MAX_RING_HEADER_OFFSET,
     },
+    xdp_program::{XDP_FLAGS_DRV_MODE, XDP_FLAGS_SKB_MODE},
     BindMode, CompletionConsumer, FillProducer, RingConfig, RingEntries, RingField, RingMapError,
     RingName, RxConsumer, TxProducer, UmemConfig,
 };
 
 use super::syscall::{
-    errno, interface_index, Errno, LinuxSyscalls, MappedRegion, MapsRealMemory, OwnedXdpFd,
-    ResourceError, SyscallError, IFNAMSIZ, PAGE_SIZE,
+    errno, interface_index, Errno, LinuxSyscalls, MappedRegion, MapsRealMemory, OwnedBpfFd,
+    OwnedXdpFd, ResourceError, SyscallError, IFNAMSIZ, PAGE_SIZE,
 };
+
+/// Verifier log capacity: the program's success log is about 100 bytes, so
+/// 4 KiB holds any `BPF_LOG_LEVEL1` rejection of it without truncation.
+pub(super) const VERIFIER_LOG_CAPACITY: usize = 4_096;
 
 const _: [(); IFNAMSIZ] = [(); crate::session::INTERFACE_NAME_CAPACITY];
 const UMEM_REG_LEN: usize = size_of::<XdpUmemReg>();
@@ -76,6 +82,84 @@ pub(super) fn classify(
         },
     };
     SessionError::new(stage, failure)
+}
+
+/// Classifies one seam failure at one attach step. `native` is true only
+/// for a link requested with `XDP_FLAGS_DRV_MODE`.
+pub(super) fn classify_attach(
+    stage: AttachStage,
+    error: ResourceError,
+    native: bool,
+    verifier_log: Option<VerifierLogSummary>,
+) -> AttachError {
+    let failure = match error {
+        ResourceError::Platform(platform) => AttachFailure::Platform(platform),
+        ResourceError::Argument(_)
+        | ResourceError::Syscall(SyscallError {
+            errno: Errno::ArgumentRejected,
+            ..
+        }) => AttachFailure::ArgumentOutOfRange,
+        ResourceError::Syscall(syscall) => match (stage, syscall.errno.raw()) {
+            (_, None) => AttachFailure::UnreadableErrno,
+            (AttachStage::CreateLink, Some(errno::EBUSY | errno::EEXIST)) => {
+                AttachFailure::ExistingProgram
+            }
+            (AttachStage::CreateLink, Some(errno::EOPNOTSUPP)) if native => {
+                AttachFailure::NativeXdpUnsupported
+            }
+            (AttachStage::LoadProgram, Some(errno::EACCES)) => AttachFailure::VerifierRejected,
+            (_, Some(errno::EPERM | errno::EACCES)) => AttachFailure::PermissionDenied,
+            (_, Some(errno::EINVAL)) => AttachFailure::InvalidArgument,
+            (_, Some(errno::E2BIG)) => AttachFailure::TooBig,
+            (_, Some(errno::ENOSPC)) => AttachFailure::NoSpace,
+            (_, Some(errno::ENOMEM)) => AttachFailure::OutOfMemory,
+            (_, Some(errno::EOPNOTSUPP)) => AttachFailure::Unsupported,
+            (_, Some(other)) => AttachFailure::Errno(other),
+        },
+    };
+    AttachError::new(stage, failure, verifier_log)
+}
+
+/// Summarizes a kernel-written verifier log without interpreting or
+/// copying its bytes. A buffer with no NUL counts as truncated.
+pub(super) fn summarize_log(log: &[u8], kernel_truncated: bool) -> VerifierLogSummary {
+    let (bytes, terminated) = match log.iter().position(|byte| *byte == 0) {
+        Some(len) => (len, true),
+        None => (log.len(), false),
+    };
+    VerifierLogSummary::new(
+        u32::try_from(bytes).unwrap_or(u32::MAX),
+        kernel_truncated || !terminated,
+    )
+}
+
+/// Attached XDP objects. Field order is drop order: the link first (which
+/// detaches the program), then the program, then the XSKMAP.
+pub(super) struct XdpObjects<'s, S: MapsRealMemory> {
+    link: OwnedBpfFd<'s, S>,
+    program: OwnedBpfFd<'s, S>,
+    map: OwnedBpfFd<'s, S>,
+    mode: XdpAttachMode,
+}
+
+impl<S: MapsRealMemory> XdpObjects<'_, S> {
+    /// Closes link, program, and map once each, noting failures.
+    fn close(self, note: &mut impl FnMut(CleanupStage, Result<(), ResourceError>)) {
+        let Self {
+            link, program, map, ..
+        } = self;
+        note(CleanupStage::CloseXdpLink, link.close());
+        note(CleanupStage::CloseXdpProgram, program.close());
+        note(CleanupStage::CloseXskMap, map.close());
+    }
+}
+
+fn cleanup_error(stage: CleanupStage, error: ResourceError) -> CleanupError {
+    let errno = match error {
+        ResourceError::Syscall(syscall) => syscall.errno.raw(),
+        _ => None,
+    };
+    CleanupError::new(stage, errno)
 }
 
 fn at(stage: SessionStage) -> impl FnOnce(ResourceError) -> SessionError {
@@ -253,10 +337,12 @@ fn set_ring_size<S: MapsRealMemory>(
 
 /// Owned resources of one bound session.
 ///
-/// Field order is drop order: ring mappings in reverse mapping order, then
-/// the UMEM, then the socket. Ring views are produced only by borrowing this
-/// value mutably, so no view can outlive a mapping.
+/// Field order is drop order: the attached XDP objects (link first, so the
+/// program is detached before anything else), then ring mappings in reverse
+/// mapping order, then the UMEM, then the socket. Ring views are produced
+/// only by borrowing this value mutably, so no view can outlive a mapping.
 pub(super) struct SessionCore<'s, S: MapsRealMemory> {
+    xdp: Option<XdpObjects<'s, S>>,
     tx: MappedRegion<'s, S>,
     rx: MappedRegion<'s, S>,
     completion: MappedRegion<'s, S>,
@@ -447,6 +533,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         }
 
         Ok(Self {
+            xdp: None,
             tx,
             rx,
             completion,
@@ -485,6 +572,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
     /// failure. Failed releases are not retried.
     pub(super) fn close(self) -> Result<(), CleanupError> {
         let Self {
+            xdp,
             tx,
             rx,
             completion,
@@ -496,13 +584,12 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         let mut first = None;
         let mut note = |stage, result: Result<(), ResourceError>| {
             if let Err(error) = result {
-                let errno = match error {
-                    ResourceError::Syscall(syscall) => syscall.errno.raw(),
-                    _ => None,
-                };
-                first.get_or_insert(CleanupError::new(stage, errno));
+                first.get_or_insert(cleanup_error(stage, error));
             }
         };
+        if let Some(objects) = xdp {
+            objects.close(&mut note);
+        }
         note(CleanupStage::UnmapTxRing, tx.unmap());
         note(CleanupStage::UnmapRxRing, rx.unmap());
         note(CleanupStage::UnmapCompletionRing, completion.unmap());
@@ -510,6 +597,95 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         note(CleanupStage::UnmapUmem, umem.unmap());
         note(CleanupStage::CloseSocket, fd.close());
         first.map_or(Ok(()), Err)
+    }
+
+    /// Attaches the XSK redirect program to the bound interface.
+    ///
+    /// Order: XSKMAP (`queue + 1` slots) → program load → socket insert at
+    /// `queue` → `BPF_LINK_CREATE`. Every step before the link is private to
+    /// this process, so a failure there leaves the interface untouched. The
+    /// socket is in the map before the link exists, so the first redirected
+    /// packet already finds it. The link is the single commit point: Linux
+    /// `dev_xdp_attach` refuses with `EBUSY`/`EEXIST` while any other
+    /// program or link is attached (link create never sets
+    /// `XDP_FLAGS_REPLACE`), so an existing program is detected atomically
+    /// under RTNL and never replaced or detached.
+    pub(super) fn attach_xdp(&mut self, mode: XdpAttachMode) -> Result<(), AttachError> {
+        let precondition = |failure| AttachError::new(AttachStage::Precondition, failure, None);
+        if self.xdp.is_some() {
+            return Err(precondition(AttachFailure::AlreadyAttached));
+        }
+        if mode == XdpAttachMode::Generic && self.mode == NegotiatedMode::ZeroCopy {
+            return Err(precondition(AttachFailure::GenericRequiresCopyMode));
+        }
+        let native = mode == XdpAttachMode::Native;
+        let flags = if native {
+            XDP_FLAGS_DRV_MODE
+        } else {
+            XDP_FLAGS_SKB_MODE
+        };
+        let at = |stage| move |error| classify_attach(stage, error, native, None);
+        // The queue id is at most MAX_QUEUE_ID, so this cannot overflow.
+        let max_entries = self.queue.checked_add(1).ok_or(AttachError::new(
+            AttachStage::CreateMap,
+            AttachFailure::ArgumentOutOfRange,
+            None,
+        ))?;
+
+        let map = OwnedBpfFd::create_xskmap(self.fd.syscalls(), max_entries)
+            .map_err(at(AttachStage::CreateMap))?;
+
+        let mut log = [0_u8; VERIFIER_LOG_CAPACITY];
+        let program = match map.load_redirect_program(&mut log) {
+            Ok(program) => program,
+            Err(error) => {
+                let truncated = matches!(
+                    error,
+                    ResourceError::Syscall(SyscallError { errno, .. })
+                        if errno.raw() == Some(errno::ENOSPC)
+                );
+                let summary = summarize_log(&log, truncated);
+                return Err(classify_attach(
+                    AttachStage::LoadProgram,
+                    error,
+                    native,
+                    Some(summary),
+                ));
+            }
+        };
+
+        map.insert_socket(self.queue, &self.fd)
+            .map_err(at(AttachStage::InsertSocket))?;
+
+        let link = program
+            .create_xdp_link(self.ifindex, flags)
+            .map_err(at(AttachStage::CreateLink))?;
+
+        self.xdp = Some(XdpObjects {
+            link,
+            program,
+            map,
+            mode,
+        });
+        Ok(())
+    }
+
+    /// Detaches by closing the link, then closes program and map, each
+    /// once. A session without an attachment is a no-op.
+    pub(super) fn detach_xdp(&mut self) -> Result<(), CleanupError> {
+        let mut first = None;
+        if let Some(objects) = self.xdp.take() {
+            objects.close(&mut |stage, result: Result<(), ResourceError>| {
+                if let Err(error) = result {
+                    first.get_or_insert(cleanup_error(stage, error));
+                }
+            });
+        }
+        first.map_or(Ok(()), Err)
+    }
+
+    pub(super) fn xdp_attach_mode(&self) -> Option<XdpAttachMode> {
+        self.xdp.as_ref().map(|objects| objects.mode)
     }
 
     pub(super) const fn mode(&self) -> NegotiatedMode {
@@ -590,11 +766,11 @@ static LINUX_SYSCALLS: LinuxSyscalls = LinuxSyscalls;
 /// mapped rings, bound with the negotiated copy policy.
 ///
 /// [`Self::open`] is failure atomic: on error every acquired resource has
-/// been released in exact reverse order. Dropping the session (or
-/// [`Self::close`]) unmaps the TX, RX, Completion, and Fill rings, then the
-/// UMEM, then closes the socket, each exactly once. No XDP program is
-/// attached, so the socket receives nothing until a later slice redirects a
-/// queue to it.
+/// been released in exact reverse order. The socket receives nothing until
+/// [`Self::attach_xdp`] redirects its queue to it. Dropping the session (or
+/// [`Self::close`]) first detaches an attached program (link, program, and
+/// XSKMAP fds), then unmaps the TX, RX, Completion, and Fill rings, then
+/// the UMEM, then closes the socket, each exactly once.
 ///
 /// The session is `!Send` and `!Sync` through an explicit marker: one
 /// worker owns its rings.
@@ -664,8 +840,42 @@ impl NativeSession {
         self.core.rings()
     }
 
+    /// Attaches the XSK redirect program to the bound interface through an
+    /// unpinned `bpf_link` (Linux 5.9+).
+    ///
+    /// Creates an XSKMAP with `queue + 1` slots, loads the redirect program,
+    /// stores this socket at the bound queue, and creates the link. On
+    /// error every object created so far has been closed in exact reverse
+    /// order, the interface is unchanged, and the session stays usable. An
+    /// interface that already has any XDP program or link yields
+    /// [`AttachFailure::ExistingProgram`](crate::AttachFailure::ExistingProgram);
+    /// that program is never replaced or detached. Packets on queues
+    /// without a socket in the map are passed to the kernel stack
+    /// (`XDP_PASS`).
+    ///
+    /// The link fd is close-on-exec and never pinned, so it is detached by
+    /// [`Self::detach_xdp`], [`Self::close`], drop, or process exit
+    /// (including `SIGKILL`).
+    pub fn attach_xdp(&mut self, mode: XdpAttachMode) -> Result<(), AttachError> {
+        self.core.attach_xdp(mode)
+    }
+
+    /// Detaches the program by closing its link, then closes the program
+    /// and the XSKMAP, each once, and reports the first failure. Without an
+    /// attachment this does nothing.
+    pub fn detach_xdp(&mut self) -> Result<(), CleanupError> {
+        self.core.detach_xdp()
+    }
+
+    /// Returns the attach mode of the live attachment, if any.
+    #[must_use]
+    pub fn xdp_attach_mode(&self) -> Option<XdpAttachMode> {
+        self.core.xdp_attach_mode()
+    }
+
     /// Releases every resource once, in teardown order, and reports the
-    /// first release failure. Later resources are still released.
+    /// first release failure. Later resources are still released. An
+    /// attached program is detached first.
     pub fn close(self) -> Result<(), CleanupError> {
         self.core.close()
     }
@@ -678,6 +888,7 @@ impl std::fmt::Debug for NativeSession {
             .field("mode", &self.core.mode())
             .field("zero_copy_fallback", &self.core.zero_copy_fallback())
             .field("queue", &self.core.queue())
+            .field("xdp_attach_mode", &self.core.xdp_attach_mode())
             .finish_non_exhaustive()
     }
 }

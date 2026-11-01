@@ -1913,7 +1913,7 @@ mode、wakeup policy、live session、XDP program/XSKMAP、libxdp、core `Packet
 X00Cはvalidated configから一つのsocket（一interface queue）のready ringまでを、上記sealed
 seamだけを通る一つのfailure-atomic transactionとして組み立てます。libbpf/libxdpにlinkせず、
 Linux v6.8 raw UAPI profile（`if_xdp.h`の`repr(C)` layoutとx86_64 syscall定数）だけを使います。
-XDP program/XSKMAP attach（S2）とdatapath engine（S3）は含みません。public APIはx86_64 Linuxだけの
+XDP program/XSKMAP attach（次節X00D、S2）とdatapath engine（S3）は含みません。public APIはx86_64 Linuxだけの
 `NativeSession`で、他targetではtypeそのものが存在しません（pure ABI/ring/configはC0/C1どおり）。
 
 入力の`SessionConfig::new(device, queue, bind_flags, rings, umem)`は`ValidatedAfXdpPortV1`の同名
@@ -1998,3 +1998,98 @@ setsockopt/getsockopt/bindのslice長・socklen一致を常時検査し、FFI前
 重なる範囲のunmap/remap/mprotectを契約違反とします。`NativeSession`は明示marker
 `PhantomData<*mut ()>`で`!Send + !Sync`です。session fakeは`munmap`でarenaを解放するため
 unmap後のaccessはMiriが検出し、lib testはstrict provenanceのMiriでUBなしです。
+
+### XDP program and bpf_link lifecycle (X00D, M2 S2)
+
+X00DはX00Cのbind済みsessionのqueueを、そのsocketへredirectします。libbpf/libxdpにlinkせず、
+`bpf(2)`を同じsealed seam（`native_unsafe/syscall.rs`）から`syscall(SYS_bpf, ...)`で呼びます。
+owner決定は次のとおりです。
+
+- attachは`bpf_link`（`BPF_LINK_CREATE`、attach type `BPF_XDP`）だけで行い、minimum kernelは
+  XDPの`bpf_link`が入った**Linux 5.9**です。netlink（`IFLA_XDP`）attachは使いません。
+- 既存のXDP program/linkは置換もdetachもしません。見つかれば`ExistingProgram`でrejectします
+  （config `existing-xdp-program = "refuse"`の実装）。
+- detachはlink fdのcloseです。linkをbpffsへpinしないので、process crash（SIGKILLを含む）でも
+  kernelがfdを閉じて自動detachします。
+
+APIは`NativeSession`へ統合しました。`attach_xdp(XdpAttachMode::{Native, Generic})`、
+`detach_xdp()`、`xdp_attach_mode()`です（configの`XdpAttachModeV1`と一対一）。別型
+`XdpAttachment`にしなかったのは、attach中もdatapathが`rings(&mut self)`を借用する必要があり、
+sessionを借用するattachment型ではそれができず、所有型にするとsocketより先にlinkを閉じる順序を
+型で保証できないためです。統合した`SessionCore`はXDP object（link、program、map）を先頭field
+に置くので、Drop/`close`は必ずlinkを最初に閉じてから、ring、UMEM、socketを解放します。
+
+順序は「session open（bind） → XSKMAP作成 → program load → socketをmapへ挿入 → link作成」です。
+
+| # | `AttachStage` | 内容 |
+|---|---|---|
+| 0 | `Precondition` | 二度目は`AlreadyAttached`、zero-copy sessionへのgenericは`GenericRequiresCopyMode`（syscallなし） |
+| 1 | `CreateMap` | `BPF_MAP_TYPE_XSKMAP`、key/value 4 byte、`max_entries = queue + 1`（M2は1 port 1 queueなのでbind queueを覆う最小。`MAX_QUEUE_ID`により最大65536） |
+| 2 | `LoadProgram` | `BPF_PROG_TYPE_XDP`、`expected_attach_type = BPF_XDP`、license `MIT OR Apache-2.0`、`BPF_LOG_LEVEL1`で固定4 KiB log |
+| 3 | `InsertSocket` | `BPF_MAP_UPDATE_ELEM`（key = queue、value = socket fd、`BPF_NOEXIST`） |
+| 4 | `CreateLink` | `BPF_LINK_CREATE`（prog fd、ifindex、`BPF_XDP`、`XDP_FLAGS_DRV_MODE`または`XDP_FLAGS_SKB_MODE`） |
+
+step 1〜3はprocess内のobjectだけを作り、interfaceを変えません。socketをlink作成前にmapへ入れる
+ので、最初にredirectされるpacketから届きます。step 4が唯一の外部可視stepでcommit pointです。
+Linux v6.8 `dev_xdp_attach`はRTNL下で、同modeのlink（`Can't replace active BPF XDP link`）と
+netlink attach program（`Can't replace active XDP program with BPF link`）にEBUSY、他modeの
+program（`Native and generic XDP can't be active at the same time`）とupper deviceのprogramに
+EEXISTを返します。linkは`XDP_FLAGS_REPLACE`を持てないため、既存programの検出はlink createで
+atomicに行われ（事前queryのTOCTOUなし）、既存programには触れません。各stepの失敗は作成済み
+objectだけをexact reverse orderで閉じ（program → map）、sessionはattachなしのまま使えます。
+
+programは手組みのoriginal eBPF（6 slot、48 byte）です。
+
+```text
+0: 61 12 10 00 00 00 00 00   r2 = *(u32 *)(r1 + 16)   ; xdp_md.rx_queue_index
+1: 18 11 00 00 <map fd>      r1 = map_fd ll           ; BPF_PSEUDO_MAP_FD
+2: 00 00 00 00 00 00 00 00                            ; ld_imm64 上位32 bit
+3: b7 03 00 00 02 00 00 00   r3 = XDP_PASS
+4: 85 00 00 00 33 00 00 00   call bpf_redirect_map (51)
+5: 95 00 00 00 00 00 00 00   exit
+```
+
+`bpf_redirect_map`はslotが空（またはqueueが`max_entries`以上）のとき、flagsの下位2 bitを返します。
+fallbackは`XDP_PASS`で、socketの無いqueueはprogramなしと同じくkernel stackへ届きます。RSS設定
+誤りやsocketがmapに入る前後のtrafficを黙ってblack-holeしないためです。代わりにそのpacketは
+routerを通らずhost stackに届くので、M2ではsingle-queue deviceかethtool RSS/ntupleでbind queueへ
+寄せる運用を前提とします（XDP-050）。
+
+licenseはrepoのSPDX式`MIT OR Apache-2.0`です。v6.8の`license_is_gpl_compatible`は
+`gpl_only = true`のhelper（とkfunc）だけを制限し、使う唯一のhelper
+`bpf_xdp_redirect_map_proto`は`.gpl_only = false`です（`net/core/filter.c`で確認）。GPL-only
+helperが必要になるまで`GPL`は使いません（XDP-049）。
+
+verifier logはstack上の固定4 KiB bufferへ書かせ、kernel出力はuntrustedとして解釈もcopyもせず、
+最初のNULまでの長さとtruncation（ENOSPCまたはNULなし）だけを`VerifierLogSummary`としてload失敗の
+errorに入れます。errorはvalue-freeな`AttachError{stage, failure, verifier_log}`です。
+
+| errno | stage | `AttachFailure` |
+|---|---|---|
+| EBUSY、EEXIST | `CreateLink` | `ExistingProgram` |
+| EOPNOTSUPP | native `CreateLink` | `NativeXdpUnsupported`（driverにnative XDPなし） |
+| EACCES | `LoadProgram` | `VerifierRejected` |
+| EPERM、他のEACCES | any | `PermissionDenied`（`CAP_NET_ADMIN`/`CAP_BPF`。5.11前はmemlock超過も） |
+| EINVAL | any | `InvalidArgument` |
+| E2BIG | any | `TooBig`（insertではqueue ≥ map size） |
+| ENOSPC | any | `NoSpace`（log truncation、vethでRX queue数 < peer TX queue数） |
+| ENOMEM | any | `OutOfMemory` |
+| 他のEOPNOTSUPP | any | `Unsupported` |
+| その他 / 範囲外 | any | `Errno(n)` / `UnreadableErrno` |
+
+production seamは常時、map size 0、NUL終端のないobject名、0または`BPF_MAXINSNS`超のinsn数、
+128 byte超のlicense、128..=`u32::MAX >> 2`外のlog長、負fd、ifindex 0をFFI前に拒否します。
+`union bpf_attr`はこのprofileが書くfieldまでのprefix（44/32/72/16 byte、すべて5.9に存在）だけを
+8-byte alignで渡し、3つのuser pointer（insns、license、log）はcall中生存するborrowから作ります。
+BPF fdは`OwnedBpfFd`（種別付き、Debugでredact、close高々一回）が所有し、raw fdは`syscall.rs`から
+出ません。kernelはbpf fdを常に`O_CLOEXEC`で作ります。
+
+finite fakeはattach 4 stepの各callへの注入、全errno分類、log summary、precondition、detachと
+attach済みteardown 9 releaseの各失敗を検証します（XDP-047〜059）。privileged smoke
+（`scripts/priv-xdp-smoke.sh`）は専用netns内だけの2-queue veth pairで、native attach後にpeer端
+から送ったframeがRX ringへ届くこと、別queueのsocketからの二度目のattachと、`ip link set ...
+xdpgeneric obj`で付けた外部programへのattachが両modeで`ExistingProgram`になりprogram idが
+不変なこと、detach/generic attach/closeによるdetach、attachしたprocessのSIGKILL後にlinkが
+消えることを確認します（XDP-060、XDP-061）。外部program用のELF objectはcompilerなしで
+`scripts/priv-xdp-foreign-elf.py`が組み立てます。5.9〜6.xでの実機検証、CI workflow化、link
+down/up、netdev削除、reload時のre-attach policyはX04です（XDP-062）。

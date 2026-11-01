@@ -17,10 +17,11 @@ use std::{
 };
 
 use super::{
-    session::{classify, SessionCore},
+    session::{classify, classify_attach, summarize_log, SessionCore, VERIFIER_LOG_CAPACITY},
     syscall::{
-        errno, sealed, Errno, MapRequest, MapsRealMemory, PollDescriptor, ResourceError,
-        SyscallArgumentError, SyscallError, SyscallStage, Syscalls, IFNAMSIZ, PAGE_SIZE,
+        errno, sealed, Errno, MapCreateRequest, MapRequest, MapsRealMemory, PollDescriptor,
+        ProgramLoadRequest, ResourceError, SyscallArgumentError, SyscallError, SyscallStage,
+        Syscalls, IFNAMSIZ, PAGE_SIZE,
     },
 };
 use crate::{
@@ -30,12 +31,20 @@ use crate::{
         XDP_UMEM_FILL_RING, XDP_UMEM_PGOFF_COMPLETION_RING, XDP_UMEM_PGOFF_FILL_RING, XDP_UMEM_REG,
         XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY,
     },
-    AbiLayoutError, CleanupStage, NativeSyscallPlatformError, NeedWakeup, NegotiatedMode,
-    RingConfig, RingField, RingMapError, RingName, SessionConfig, SessionError, SessionFailure,
-    SessionStage, UmemConfig, ValidatedBindFlags,
+    xdp_program::{
+        redirect_program, BpfInsn, BPF_OBJ_NAME_LEN, MAP_NAME, PROGRAM_NAME, REDIRECT_PROGRAM_LEN,
+    },
+    AbiLayoutError, AttachError, AttachFailure, AttachStage, CleanupStage,
+    NativeSyscallPlatformError, NeedWakeup, NegotiatedMode, RingConfig, RingField, RingMapError,
+    RingName, SessionConfig, SessionError, SessionFailure, SessionStage, UmemConfig,
+    ValidatedBindFlags, VerifierLogSummary, XdpAttachMode,
 };
 
 const FAKE_FD: RawFd = 17;
+const FAKE_MAP_FD: RawFd = 20;
+const FAKE_PROG_FD: RawFd = 21;
+const FAKE_LINK_FD: RawFd = 22;
+const LICENSE_BYTES: usize = 32;
 const FAKE_IFINDEX: u32 = 7;
 const MAX_CALLS: usize = 64;
 const SOCKET_KIND: c_int = 3 | 0x800 | 0x8_0000;
@@ -89,6 +98,26 @@ enum Call {
     Close {
         fd: RawFd,
     },
+    MapCreate {
+        max_entries: u32,
+        name: [u8; BPF_OBJ_NAME_LEN],
+    },
+    ProgLoad {
+        insns: [BpfInsn; REDIRECT_PROGRAM_LEN],
+        license: [u8; LICENSE_BYTES],
+        name: [u8; BPF_OBJ_NAME_LEN],
+        log_len: usize,
+    },
+    MapUpdate {
+        map_fd: RawFd,
+        key: u32,
+        value: RawFd,
+    },
+    LinkCreate {
+        prog_fd: RawFd,
+        ifindex: u32,
+        flags: u32,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -115,6 +144,8 @@ struct SessionFake {
     bound_flags: Cell<u16>,
     open_fds: Cell<u32>,
     double_releases: Cell<u32>,
+    /// Kernel log written by a load: byte count and whether a NUL follows.
+    verifier_log: Cell<Option<(usize, bool)>>,
 }
 
 impl SessionFake {
@@ -139,6 +170,7 @@ impl SessionFake {
             bound_flags: Cell::new(0),
             open_fds: Cell::new(0),
             double_releases: Cell::new(0),
+            verifier_log: Cell::new(None),
         }
     }
 
@@ -417,6 +449,55 @@ impl Syscalls for SessionFake {
         }
         result
     }
+
+    fn bpf_map_create(&self, request: &MapCreateRequest) -> Result<RawFd, Errno> {
+        self.record(Call::MapCreate {
+            max_entries: request.max_entries,
+            name: request.name,
+        })
+        .1?;
+        self.open_fds.set(self.open_fds.get() + 1);
+        Ok(FAKE_MAP_FD)
+    }
+
+    fn bpf_prog_load(&self, request: &mut ProgramLoadRequest<'_>) -> Result<RawFd, Errno> {
+        let insns: [BpfInsn; REDIRECT_PROGRAM_LEN] =
+            request.insns.try_into().expect("redirect program length");
+        let with_nul = request.license.to_bytes_with_nul();
+        let mut license = [0_u8; LICENSE_BYTES];
+        license[..with_nul.len()].copy_from_slice(with_nul);
+        // The kernel writes its log whether or not the load succeeds.
+        if let Some((len, terminated)) = self.verifier_log.get() {
+            request.log[..len].fill(b'v');
+            if terminated {
+                request.log[len] = 0;
+            }
+        }
+        self.record(Call::ProgLoad {
+            insns,
+            license,
+            name: request.name,
+            log_len: request.log.len(),
+        })
+        .1?;
+        self.open_fds.set(self.open_fds.get() + 1);
+        Ok(FAKE_PROG_FD)
+    }
+
+    fn bpf_map_update(&self, map_fd: RawFd, key: u32, value: RawFd) -> Result<(), Errno> {
+        self.record(Call::MapUpdate { map_fd, key, value }).1
+    }
+
+    fn bpf_link_create(&self, prog_fd: RawFd, ifindex: u32, flags: u32) -> Result<RawFd, Errno> {
+        self.record(Call::LinkCreate {
+            prog_fd,
+            ifindex,
+            flags,
+        })
+        .1?;
+        self.open_fds.set(self.open_fds.get() + 1);
+        Ok(FAKE_LINK_FD)
+    }
 }
 
 fn umem() -> UmemConfig {
@@ -542,6 +623,9 @@ fn reverse_cleanup(prefix: &[Call], failed: Option<usize>) -> Vec<Call> {
         }
         match *call {
             Call::Socket { .. } => cleanup.push(Call::Close { fd: FAKE_FD }),
+            Call::MapCreate { .. } => cleanup.push(Call::Close { fd: FAKE_MAP_FD }),
+            Call::ProgLoad { .. } => cleanup.push(Call::Close { fd: FAKE_PROG_FD }),
+            Call::LinkCreate { .. } => cleanup.push(Call::Close { fd: FAKE_LINK_FD }),
             Call::MapAnonymous { len } | Call::MapShared { len, .. } => cleanup.push(Call::Unmap {
                 map_call: index + 1,
                 len,
@@ -1152,4 +1236,466 @@ fn native_session_auto_falls_back_to_copy_only_on_zero_copy_eopnotsupp() {
         SessionError::new(SessionStage::RegisterUmem, SessionFailure::MemlockLimit)
     );
     fake.assert_released();
+}
+
+const NATIVE_FLAGS: u32 = 1 << 2;
+const GENERIC_FLAGS: u32 = 1 << 1;
+const ATTACH_STAGES: [AttachStage; 4] = [
+    AttachStage::CreateMap,
+    AttachStage::LoadProgram,
+    AttachStage::InsertSocket,
+    AttachStage::CreateLink,
+];
+
+/// The exact attach transcript for the queue-3 session of `config`.
+fn attach_calls(flags: u32) -> Vec<Call> {
+    let mut license = [0_u8; LICENSE_BYTES];
+    license[..18].copy_from_slice(b"MIT OR Apache-2.0\0");
+    vec![
+        Call::MapCreate {
+            max_entries: 4,
+            name: MAP_NAME,
+        },
+        Call::ProgLoad {
+            insns: redirect_program(FAKE_MAP_FD),
+            license,
+            name: PROGRAM_NAME,
+            log_len: VERIFIER_LOG_CAPACITY,
+        },
+        Call::MapUpdate {
+            map_fd: FAKE_MAP_FD,
+            key: 3,
+            value: FAKE_FD,
+        },
+        Call::LinkCreate {
+            prog_fd: FAKE_PROG_FD,
+            ifindex: FAKE_IFINDEX,
+            flags,
+        },
+    ]
+}
+
+const DETACH_CALLS: [Call; 3] = [
+    Call::Close { fd: FAKE_LINK_FD },
+    Call::Close { fd: FAKE_PROG_FD },
+    Call::Close { fd: FAKE_MAP_FD },
+];
+
+/// Teardown of an open copy session, by map call ordinal.
+fn session_teardown() -> [Call; 6] {
+    [
+        Call::Unmap {
+            map_call: 13,
+            len: 320 + 64 * 16,
+        },
+        Call::Unmap {
+            map_call: 12,
+            len: 320 + 128 * 16,
+        },
+        Call::Unmap {
+            map_call: 11,
+            len: 320 + 256 * 8,
+        },
+        Call::Unmap {
+            map_call: 10,
+            len: 320 + 64 * 8,
+        },
+        Call::Unmap {
+            map_call: 3,
+            len: UMEM_MAP_LEN,
+        },
+        Call::Close { fd: FAKE_FD },
+    ]
+}
+
+#[test]
+fn native_xdp_attach_is_exact_and_detach_is_reverse() {
+    let fake = SessionFake::new();
+    let mut expected;
+    {
+        let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("session");
+        expected = fake.transcript();
+        assert_eq!(session.xdp_attach_mode(), None);
+
+        session
+            .attach_xdp(XdpAttachMode::Native)
+            .expect("native attach");
+        assert_eq!(session.xdp_attach_mode(), Some(XdpAttachMode::Native));
+        expected.extend(attach_calls(NATIVE_FLAGS));
+        assert_eq!(fake.transcript(), expected);
+        assert_eq!(fake.open_fds.get(), 4);
+        // Ring views stay available while the program is attached.
+        assert_eq!(
+            session
+                .rings()
+                .expect("ring views")
+                .rx
+                .acquire(1)
+                .map(|_| ()),
+            Err(crate::NativeRingError::RingEmpty)
+        );
+
+        // Detach closes link, program, then map; a second detach is a no-op.
+        assert_eq!(session.detach_xdp(), Ok(()));
+        assert_eq!(session.xdp_attach_mode(), None);
+        expected.extend(DETACH_CALLS);
+        assert_eq!(fake.transcript(), expected);
+        assert_eq!(session.detach_xdp(), Ok(()));
+        assert_eq!(fake.transcript(), expected);
+        assert_eq!(fake.open_fds.get(), 1);
+
+        // Re-attach in generic mode; Drop detaches before any unmap.
+        session
+            .attach_xdp(XdpAttachMode::Generic)
+            .expect("generic attach");
+        expected.extend(attach_calls(GENERIC_FLAGS));
+        assert_eq!(fake.transcript(), expected);
+    }
+    expected.extend(DETACH_CALLS);
+    expected.extend(session_teardown());
+    assert_eq!(fake.transcript(), expected);
+    fake.assert_released();
+
+    // Explicit close of an attached session has the same order.
+    let fake = SessionFake::new();
+    let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("session");
+    session
+        .attach_xdp(XdpAttachMode::Native)
+        .expect("native attach");
+    assert_eq!(session.close(), Ok(()));
+    let mut expected = full_success_calls(&fake, copy_flags());
+    expected.extend(attach_calls(NATIVE_FLAGS));
+    expected.extend(DETACH_CALLS);
+    expected.extend(session_teardown());
+    assert_eq!(fake.transcript(), expected);
+    fake.assert_released();
+}
+
+#[test]
+fn native_xdp_attach_failure_at_every_step_is_atomic_and_session_survives() {
+    for (index, stage) in ATTACH_STAGES.iter().copied().enumerate() {
+        let fake = SessionFake::new();
+        let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("session");
+        let base = fake.transcript();
+        let ordinal = base.len() + 1 + index;
+        fake.fail_at.set(Some((ordinal, Errno::Linux(1_000))));
+        let error = session
+            .attach_xdp(XdpAttachMode::Native)
+            .expect_err("injected attach failure");
+        let log = (stage == AttachStage::LoadProgram).then_some(VerifierLogSummary::new(0, false));
+        assert_eq!(
+            error,
+            AttachError::new(stage, AttachFailure::Errno(1_000), log),
+            "{stage:?}"
+        );
+        // Exactly the objects created before the failing step were closed,
+        // in reverse order; the session is untouched.
+        let prefix = attach_calls(NATIVE_FLAGS)[..=index].to_vec();
+        let mut expected = base.clone();
+        expected.extend(prefix.iter().copied());
+        expected.extend(reverse_cleanup(&prefix, Some(index + 1)));
+        assert_eq!(fake.transcript(), expected, "{stage:?}");
+        assert_eq!(fake.open_fds.get(), 1, "{stage:?}");
+        assert_eq!(fake.double_releases.get(), 0, "{stage:?}");
+        assert_eq!(session.xdp_attach_mode(), None);
+
+        // The session stays usable and can attach afterwards.
+        fake.fail_at.set(None);
+        session.rings().expect("ring views after failed attach");
+        session
+            .attach_xdp(XdpAttachMode::Native)
+            .expect("attach after failure");
+        drop(session);
+        fake.assert_released();
+    }
+}
+
+#[test]
+fn native_xdp_attach_preconditions_fail_before_syscalls() {
+    let fake = SessionFake::new();
+    let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("session");
+    session
+        .attach_xdp(XdpAttachMode::Generic)
+        .expect("first attach");
+    let before = fake.transcript();
+    assert_eq!(
+        session.attach_xdp(XdpAttachMode::Native),
+        Err(AttachError::new(
+            AttachStage::Precondition,
+            AttachFailure::AlreadyAttached,
+            None
+        ))
+    );
+    assert_eq!(fake.transcript(), before);
+    assert_eq!(session.xdp_attach_mode(), Some(XdpAttachMode::Generic));
+    drop(session);
+    fake.assert_released();
+
+    // Generic (skb) XDP is copy only; a zero-copy session refuses it.
+    let fake = SessionFake::new();
+    let mut session = SessionCore::open(&fake, &config(XDP_ZEROCOPY)).expect("zero-copy");
+    assert_eq!(session.mode(), NegotiatedMode::ZeroCopy);
+    let before = fake.transcript();
+    assert_eq!(
+        session.attach_xdp(XdpAttachMode::Generic),
+        Err(AttachError::new(
+            AttachStage::Precondition,
+            AttachFailure::GenericRequiresCopyMode,
+            None
+        ))
+    );
+    assert_eq!(fake.transcript(), before);
+    session
+        .attach_xdp(XdpAttachMode::Native)
+        .expect("native attach on zero-copy");
+    drop(session);
+    fake.assert_released();
+}
+
+#[test]
+fn native_xdp_attach_errnos_map_to_typed_value_free_failures() {
+    use AttachFailure as F;
+    use AttachStage as A;
+    let syscall = |raw: u16| {
+        ResourceError::Syscall(SyscallError {
+            stage: SyscallStage::CreateBpfLink,
+            errno: Errno::Linux(raw),
+        })
+    };
+    let cases = [
+        (A::CreateLink, errno::EBUSY, true, F::ExistingProgram),
+        (A::CreateLink, errno::EBUSY, false, F::ExistingProgram),
+        (A::CreateLink, errno::EEXIST, true, F::ExistingProgram),
+        (A::CreateLink, errno::EEXIST, false, F::ExistingProgram),
+        (
+            A::CreateLink,
+            errno::EOPNOTSUPP,
+            true,
+            F::NativeXdpUnsupported,
+        ),
+        (A::CreateLink, errno::EOPNOTSUPP, false, F::Unsupported),
+        (A::CreateLink, errno::EINVAL, true, F::InvalidArgument),
+        (A::CreateLink, errno::EPERM, true, F::PermissionDenied),
+        (A::CreateLink, errno::ENOSPC, true, F::NoSpace),
+        (A::CreateLink, errno::ENOMEM, true, F::OutOfMemory),
+        (A::CreateLink, 98, true, F::Errno(98)),
+        (A::CreateMap, errno::EPERM, true, F::PermissionDenied),
+        (A::CreateMap, errno::EACCES, true, F::PermissionDenied),
+        (A::CreateMap, errno::EBUSY, true, F::Errno(errno::EBUSY)),
+        (A::CreateMap, errno::EINVAL, true, F::InvalidArgument),
+        (A::CreateMap, errno::ENOMEM, true, F::OutOfMemory),
+        (A::LoadProgram, errno::EACCES, true, F::VerifierRejected),
+        (A::LoadProgram, errno::EPERM, true, F::PermissionDenied),
+        (A::LoadProgram, errno::EINVAL, true, F::InvalidArgument),
+        (A::LoadProgram, errno::E2BIG, true, F::TooBig),
+        (A::LoadProgram, errno::ENOSPC, true, F::NoSpace),
+        (A::InsertSocket, errno::E2BIG, true, F::TooBig),
+        (
+            A::InsertSocket,
+            errno::EEXIST,
+            true,
+            F::Errno(errno::EEXIST),
+        ),
+        (A::InsertSocket, errno::EBUSY, true, F::Errno(errno::EBUSY)),
+        (A::InsertSocket, errno::EOPNOTSUPP, true, F::Unsupported),
+    ];
+    for (stage, raw, native, failure) in cases {
+        assert_eq!(
+            classify_attach(stage, syscall(raw), native, None),
+            AttachError::new(stage, failure, None),
+            "{stage:?} errno {raw} native {native}"
+        );
+    }
+    for (error, failure) in [
+        (
+            ResourceError::Syscall(SyscallError {
+                stage: SyscallStage::LoadBpfProgram,
+                errno: Errno::InvalidCapture,
+            }),
+            F::UnreadableErrno,
+        ),
+        (
+            ResourceError::Syscall(SyscallError {
+                stage: SyscallStage::LoadBpfProgram,
+                errno: Errno::ArgumentRejected,
+            }),
+            F::ArgumentOutOfRange,
+        ),
+        (
+            ResourceError::Argument(SyscallArgumentError::WrongBpfObject),
+            F::ArgumentOutOfRange,
+        ),
+        (
+            ResourceError::Platform(NativeSyscallPlatformError::UnsupportedArchitecture),
+            F::Platform(NativeSyscallPlatformError::UnsupportedArchitecture),
+        ),
+    ] {
+        assert_eq!(
+            classify_attach(A::LoadProgram, error, true, None).failure(),
+            failure
+        );
+    }
+
+    // End to end: an existing program at link creation closes program and
+    // map only, leaves the session usable, and renders no value.
+    for (raw, mode, flags) in [
+        (errno::EBUSY, XdpAttachMode::Native, NATIVE_FLAGS),
+        (errno::EEXIST, XdpAttachMode::Generic, GENERIC_FLAGS),
+    ] {
+        let fake = SessionFake::new();
+        let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("session");
+        let base = fake.transcript();
+        fake.fail_at.set(Some((base.len() + 4, Errno::Linux(raw))));
+        let error = session.attach_xdp(mode).expect_err("existing program");
+        assert_eq!(
+            error,
+            AttachError::new(A::CreateLink, F::ExistingProgram, None)
+        );
+        let mut expected = base;
+        expected.extend(attach_calls(flags));
+        expected.extend([
+            Call::Close { fd: FAKE_PROG_FD },
+            Call::Close { fd: FAKE_MAP_FD },
+        ]);
+        assert_eq!(fake.transcript(), expected);
+        assert_eq!(
+            format!("{error}"),
+            "AttachError { stage: CreateLink, failure: ExistingProgram, verifier_log: None }"
+        );
+        drop(session);
+        fake.assert_released();
+    }
+
+    // Native XDP unsupported by the driver.
+    let fake = SessionFake::new();
+    let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("session");
+    fake.fail_at.set(Some((
+        fake.transcript().len() + 4,
+        Errno::Linux(errno::EOPNOTSUPP),
+    )));
+    assert_eq!(
+        session
+            .attach_xdp(XdpAttachMode::Native)
+            .map_err(AttachError::failure),
+        Err(F::NativeXdpUnsupported)
+    );
+    drop(session);
+    fake.assert_released();
+}
+
+#[test]
+fn native_xdp_verifier_log_is_bounded_summarized_and_never_rendered() {
+    assert_eq!(
+        summarize_log(&[0; 8], false),
+        VerifierLogSummary::new(0, false)
+    );
+    assert_eq!(
+        summarize_log(b"ab\0cd", false),
+        VerifierLogSummary::new(2, false)
+    );
+    assert_eq!(
+        summarize_log(b"abcd", false),
+        VerifierLogSummary::new(4, true)
+    );
+    assert_eq!(
+        summarize_log(b"ab\0", true),
+        VerifierLogSummary::new(2, true)
+    );
+
+    for (written, raw, summary) in [
+        // A verifier rejection with a terminated 100-byte log.
+        (
+            (100, true),
+            errno::EACCES,
+            VerifierLogSummary::new(100, false),
+        ),
+        // A full, unterminated log reported as truncated by ENOSPC.
+        (
+            (VERIFIER_LOG_CAPACITY, false),
+            errno::ENOSPC,
+            VerifierLogSummary::new(VERIFIER_LOG_CAPACITY as u32, true),
+        ),
+    ] {
+        let fake = SessionFake::new();
+        let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("session");
+        fake.verifier_log.set(Some(written));
+        fake.fail_at
+            .set(Some((fake.transcript().len() + 2, Errno::Linux(raw))));
+        let error = session
+            .attach_xdp(XdpAttachMode::Native)
+            .expect_err("load fails");
+        assert_eq!(error.stage(), AttachStage::LoadProgram);
+        assert_eq!(error.verifier_log(), Some(summary));
+        assert_eq!(summary.bytes(), u32::try_from(written.0).expect("small"));
+        // The untrusted log bytes never reach Debug or Display.
+        assert!(!format!("{error:?}{error}").contains("vv"));
+        drop(session);
+        fake.assert_released();
+    }
+
+    // A successful load with a log attaches normally.
+    let fake = SessionFake::new();
+    let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("session");
+    fake.verifier_log.set(Some((96, true)));
+    session
+        .attach_xdp(XdpAttachMode::Native)
+        .expect("attach with log");
+    drop(session);
+    fake.assert_released();
+}
+
+#[test]
+fn native_xdp_detach_failures_never_retry_or_leak() {
+    let stages = [
+        CleanupStage::CloseXdpLink,
+        CleanupStage::CloseXdpProgram,
+        CleanupStage::CloseXskMap,
+    ];
+    for (index, stage) in stages.iter().copied().enumerate() {
+        let fake = SessionFake::new();
+        let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("session");
+        session.attach_xdp(XdpAttachMode::Native).expect("attach");
+        let base = fake.transcript();
+        fake.fail_at
+            .set(Some((base.len() + 1 + index, Errno::Linux(errno::EINVAL))));
+        let error = session.detach_xdp().expect_err("injected close failure");
+        assert_eq!((error.stage(), error.errno()), (stage, Some(errno::EINVAL)));
+        let mut expected = base;
+        expected.extend(DETACH_CALLS);
+        assert_eq!(fake.transcript(), expected);
+        assert_eq!(session.xdp_attach_mode(), None);
+        assert_eq!(session.detach_xdp(), Ok(()));
+        assert_eq!(fake.transcript(), expected);
+        drop(session);
+        fake.assert_released();
+    }
+
+    // Explicit close of an attached session: each of the nine releases may
+    // fail; every later resource is still released exactly once.
+    let teardown = [
+        CleanupStage::CloseXdpLink,
+        CleanupStage::CloseXdpProgram,
+        CleanupStage::CloseXskMap,
+        CleanupStage::UnmapTxRing,
+        CleanupStage::UnmapRxRing,
+        CleanupStage::UnmapCompletionRing,
+        CleanupStage::UnmapFillRing,
+        CleanupStage::UnmapUmem,
+        CleanupStage::CloseSocket,
+    ];
+    for (index, stage) in teardown.iter().copied().enumerate() {
+        let fake = SessionFake::new();
+        let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("session");
+        session.attach_xdp(XdpAttachMode::Generic).expect("attach");
+        let base = fake.transcript();
+        fake.fail_at
+            .set(Some((base.len() + 1 + index, Errno::Linux(errno::EINVAL))));
+        let error = session.close().expect_err("injected teardown failure");
+        assert_eq!((error.stage(), error.errno()), (stage, Some(errno::EINVAL)));
+        let mut expected = base;
+        expected.extend(DETACH_CALLS);
+        expected.extend(session_teardown());
+        assert_eq!(fake.transcript(), expected);
+        fake.assert_released();
+    }
 }
