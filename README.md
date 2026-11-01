@@ -65,9 +65,11 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   typed errorで評価してcanonical JSONL `ruster-run-sim/v1`を出力する。M1 golden fixtureは
   [`fixtures/m1`](fixtures/m1)にあり、golden出力の再生成は
   `RUSTER_UPDATE_GOLDEN=1 cargo test -p ruster-sim-scenario --test driver`（CIでは拒否）。
-- `ruster-cli`: binary `ruster`。手書きarg parsingで`validate`/`plan`/`run-sim`を提供し、
-  SIGINT/SIGTERMはprivate FFIのhandlerがstatic `AtomicBool`へstoreするだけです
-  （下の「使い方」）。外部crateを直接には追加しません。
+- `ruster-cli`: binary `ruster`。手書きarg parsingで`validate`/`plan`/`run-sim`と、M2 S10aの
+  `run`（x86_64 LinuxのAF_XDP static router、下の「`ruster run`」）を提供し、SIGINT/SIGTERMは
+  private FFIのhandlerがstatic `AtomicBool`へswap/storeするだけです（二回目のsignalはforce
+  flag）。`unsafe`はそのhandlerと`run`のrtnetlink address dumpだけです（下の「使い方」）。
+  外部crateを直接には追加しません。
 - `ruster-bench`: NIC-freeなsim smoke/datapath benchmarkとhardware benchmark plan/
   measurement protocol/artifact v1のschema検証。sim結果からproduction性能を主張しない。
 - `ruster-io-afpacket`: Linux AF_PACKET/TPACKET_V3 backendのchecked configuration、
@@ -176,7 +178,7 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   mode、need-wakeup、link state、Fill/RX/TX/CQ saturationとring占有、completion lag、invalid
   descriptor、kernel `XDP_STATISTICS`（stats呼び出し時だけgetsockopt）、quarantine、generated、
   cross-port copyのcounterを固定順・allocationなしで出す。configからのport構築と
-  `ruster run`はまだ無い（X04b）。FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
+  `ruster run`はM2 S10a（X04b前半、`ruster-cli`）。FFI/pointer accessはprivateな`native_unsafe` moduleだけに閉じる。
   privileged smokeは`scripts/priv-xdp-smoke.sh`（`sudo -n`で専用netnsとその中だけのveth pairを
   作り、`RUSTER_PRIV_XDP=1`で実行してnetnsを必ず削除。不足はskipせずfail）。
 
@@ -557,11 +559,58 @@ $B run-sim --scenario fixtures/m1/scenario.toml --hold
   invalid config/scenario（未知interface名を含む）。file read失敗（存在しない、読めない）は
   内容のinvalidとは区別して`1`で、stderrは`cannot read config: NOT_FOUND`のような安定codeです。
 
+### `ruster run`（M2 S10a、AF_XDP static router）
+
+`ruster run --config <config.toml>`は`kind = "af-xdp"`のconfigでx86_64 Linuxの各portにAF_XDP
+socketを開き、XDP programをattachしてrouterを動かします（`kind = "sim"`は`stage=backend
+code=SIM_BACKEND`でexit 2、`run-sim`を使う）。操作手順は[`docs/runbook-m2.md`](docs/runbook-m2.md)。
+
+```bash
+cargo build --release -p ruster-cli
+sudo target/release/ruster run --config router.toml                # 既定: 60秒ごとにstats
+sudo target/release/ruster run --stats-interval 0 -- router.toml   # 周期statsなし
+# stderr: ruster run: running generation 1 on 2 port(s); send SIGINT or SIGTERM to stop
+```
+
+- 権限: 実効capabilityに`CAP_NET_ADMIN`と`CAP_NET_RAW`、および`CAP_BPF`+`CAP_PERFMON`
+  （または`CAP_SYS_ADMIN`）、つまりrootか`setcap`/systemdの`AmbientCapabilities`です。
+  `CAP_IPC_LOCK`が無ければsoft `RLIMIT_MEMLOCK`がport UMEMの合計（`mode = "auto"`は2倍、
+  5.11前のkernelのBPF object分としてportごとに64 KiBを加算した下限）以上必要です（`ulimit -l`、systemdの`LimitMEMLOCK=`）。不足は何も取得せずexit 4で、不足した
+  capabilityまたは`limit-bytes`/`required-bytes`を表示します。起動後もprivilegeは落としません。
+- portの前提（起動時に確認）: deviceのRX queueは1つ（`ethtool -L <dev> combined 1`など。RSS/ntupleで
+  全trafficをbind queueへ寄せたなら`--allow-multi-queue`、他queueのframeはXDPが捨てる）。port上に
+  kernelのIPv4 addressとIPv4 route（main table）を置かない（`ip -4 addr flush dev <dev>`）。
+  attach中は無意味で、停止中やcrash後にkernelがfirewall/NATを迂回してforwardし得るためで、
+  `stage=checks code=KERNEL_IPV4_ADDRESSES`/`KERNEL_IPV4_ROUTES`/`MULTI_QUEUE_DEVICE`で拒否します。
+  `net.ipv4.ip_forward`や`conf/<dev>/forwarding`が1ならwarningだけです。既存のXDP programが
+  あるdeviceは`stage=attach code=CREATE_LINK/EXISTING_PROGRAM`で拒否し、置換しません。
+- 起動はfailure atomicです: どのstageで失敗しても開いたportを逆順にclose（XDP detachを含む）
+  してから`ruster run: startup failed: stage=<stage> [port=if<id>] code=<TOKEN>`を出します。
+  exit statusはstageによります: 権限/memlock不足は4、config（bridge rejectionを含む）は2、
+  open/check/attach等のbackend stageとkey sourceは1です（下のexit status）。`code=`は
+  `BIND/BUSY`、`CREATE_LINK/EXISTING_PROGRAM`のような安定したSCREAMING_SNAKE tokenです。
+- stdout/stderrは別threadが書き、run loopは上限付きqueueへ`try_send`するだけです。読まれない
+  pipeで詰まってもtickと停止は止まらず、溢れたblock/行は捨てて`output.dropped`に数えます。
+- 停止: SIGINT/SIGTERMでtickを止め、各portを最大2秒drainしてから逆順にdetach/closeし、
+  stdoutへfinal statsを、stderrへ`stopped by signal; drain calls=... tx-in-flight=N
+  fill-in-kernel=M ...; detached and closed 2 port(s)`を出します。二回目のsignalはdrainを
+  打ち切ります。SIGKILLやcrashでもunpinned linkはkernelが自動でdetachします（直後の再起動は
+  一時的に`BIND/BUSY`や`REGISTER_UMEM/MEMLOCK_LIMIT`になり得る。retryはS10b）。
+- stats: `ruster-run-stats kind=periodic|final uptime-ms=N`の後に`section.key=value`行
+  （`observer.*`、`health.*`、`tick.*`、`rx.*`、`drop.*`、`af_xdp.*`、`if<id>.af_xdp_port.*`等）と
+  `end`。counterとlabelだけでaddress、MAC、device名、key、seedは出しません。
+- idle時は64 tick spinした後50 µsから1 msまで倍々でsleepします（idle後最初のframeは最大約1 ms
+  遅れる。負荷中はsleepしない）。
+- exit status: `0` clean shutdown（起動中のsignalでrollbackした場合も）、`1`起動失敗、backend
+  fault、drain失敗、close error、`2` usage/invalid config、`3`停止期限（または二回目のsignal）で
+  TX frameがkernelに残った（detach/closeは済み）、`4`権限/memlock不足。
+- SIGHUP reload、health/stall signal、retry policy、privilege dropはM2 S10b以降です。
+
 ### packet backend（`[backend]`）
 
 `[backend]`は省略可能で、省略時は`kind = "sim"`です（M1 fixtureとgoldenは不変）。
-`kind = "af-xdp"`はM2のAF_XDP backend用のvalidated configを作るだけで、socket作成やXDP
-attachはまだ行いません（`ruster run`は後続slice）。`validate`/`plan`は受理し、`run-sim`は
+`kind = "af-xdp"`はM2のAF_XDP backend用のvalidated configで、`ruster run`（下）がこの
+portごとにsocket作成とXDP attachを行います。`validate`/`plan`は受理し、`run-sim`は
 `SimIo`だけを動かすため無視せず`stage=backend code=UNSUPPORTED_BACKEND`で拒否します
 （初期configはexit 2、apply stepは`invalid`）。
 
@@ -643,7 +692,20 @@ AF_XDP native session/XDP attachのprivileged smokeはCIでは実行せず（wor
 scripts/priv-xdp-smoke.sh
 ```
 
-scriptはtest binaryを通常userでbuildし、`ruster-x00c-<pid>-<random>`というnetnsとその中だけのveth pair
+`ruster run`のprivileged E2Eは`scripts/priv-run-smoke.sh`です（同じ前提に加え`ethtool`）。
+binaryを通常userでbuildし、router用とhost A/B用の三つの専用netns（`ruster-run-<pid>-<random>`と
+`-a`/`-b`）にveth pairを作り（initial namespaceには作らない）、netns内で`ruster run`をchild
+processとして起動します。host Aからhost BへのUDPがrouterのARP、NAT44、firewallを通って届くこと、
+SIGTERMでexit 0・XDP detach・final stats、二つ目のportのopen/attach失敗でexit 1と一つ目のportの
+detach（外部programは不変）、2-queue device・kernel IPv4 address・kernel routeの拒否、SIGKILL後の
+auto-detachと再起動（transientなBusy/MemlockLimitだけtest内でbounded retry）を確認し、成否に
+よらず三つのnetnsを削除します。
+
+```bash
+scripts/priv-run-smoke.sh
+```
+
+`priv-xdp-smoke.sh`はtest binaryを通常userでbuildし、`ruster-x00c-<pid>-<random>`というnetnsとその中だけのveth pair
 （`rx00c0`/`rx00c1`）を作ってnetns内でtestを実行し、成否によらずnetnsを削除します（同名netnsが既にあれば触らずfail）。host側の
 interfaceには触れません。testはinitial netnsでの実行を拒否し、`RUSTER_PRIV_XDP=1`なのに
 netns/device/capabilityが欠ける場合はskipせずfailします。veth pairは2 queueで、phaseは

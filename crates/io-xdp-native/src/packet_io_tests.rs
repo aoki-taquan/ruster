@@ -881,7 +881,11 @@ fn generated_reserve_keeps_router_frames_from_cross_port_copies() {
         }
         let _ = batch.finish();
     }
-    // A pool of 1 or 2 frames is all reserve: refused with several ports.
+    // A pool of 0 to 2 frames is all reserve: refused with several ports.
+    // An empty pool would be refused too (its reserve is 0), but
+    // `UmemConfig` already refuses zero generated frames.
+    assert_eq!(generated_reserve(0), 0);
+    assert!(UmemConfig::new(RX_FRAMES, FRAME_SIZE, 0, RX_FRAMES, 0, 0).is_err());
     for frames in [1, 2] {
         let (lan, wan) = (kernel(), kernel_with(RX_FRAMES, frames));
         assert_eq!(
@@ -1271,6 +1275,115 @@ fn a_blocked_port_is_relieved_once_per_batch() {
     assert_eq!(counters.tx_blocked, 4);
     assert_eq!(counters.kick_budget_exhausted, 0);
     assert_eq!(counters.tx_inflight, 0);
+    audit(&io);
+}
+
+/// #300 follow-up: the once-per-batch relieve is re-armed by every
+/// `receive` and every `begin_generated`, so a later batch that hits the
+/// same full ring relieves it again instead of refusing everything after
+/// the first four commits.
+#[test]
+fn relieve_is_rearmed_for_every_rx_and_generated_batch() {
+    let lan = ScriptedKernel::with_tx(
+        entries(RingName::Fill, 16),
+        entries(RingName::Rx, 16),
+        entries(RingName::Tx, 4),
+        entries(RingName::Completion, 4),
+        UmemConfig::new(40, FRAME_SIZE, 0, 24, 16, 0).expect("UMEM"),
+    );
+    let wan = kernel();
+    let engine = RxFillEngine::new(
+        lan.take_datapath().expect("first take"),
+        UmemDomainId::new(NonZeroU128::new(0x5782).expect("nonzero")),
+        RxFillConfig::new(NonZeroU32::new(16).expect("nonzero")),
+    )
+    .expect("engine");
+    let mut io = XdpPacketIo::new([
+        XdpPort::new(
+            XdpPortConfig::for_test(LAN, 0, NegotiatedMode::Copy, MTU, lan.origin()),
+            engine,
+        ),
+        port(&wan, WAN, 0, MTU),
+    ])
+    .expect("adapter");
+    lan.set_copy_transmit(Some(KICK_TX_BATCH));
+    lan.set_tx_flags(XDP_RING_NEED_WAKEUP);
+    for round in 1..=2_u32 {
+        for _ in 0..12 {
+            deliver(&lan, &ipv4_frame(60, 64));
+        }
+        // 4 accepted, 1 refused (relieve), 4 accepted, 3 refused: one
+        // relieve kick and one finish kick per batch.
+        assert_eq!(commit_all(&mut io, 16, LAN), (12, 8, 4), "batch {round}");
+        assert_eq!(lan.kicks(KickRing::Tx), 2 * round, "batch {round}");
+    }
+    // A generated session on the same port, right after an RX batch that
+    // relieved: its first blocked commit relieves again.
+    {
+        let mut batch = io.begin_generated(LAN);
+        for _ in 0..12 {
+            batch.allocate(42).expect("generated").commit();
+        }
+        let completion = batch.finish();
+        assert_eq!(
+            (completion.accepted, completion.rejected),
+            (8, 4),
+            "{completion:?}"
+        );
+        assert_eq!(completion.error, None);
+    }
+    assert_eq!(lan.kicks(KickRing::Tx), 6, "one relieve, one finish");
+    let counters = io.port_stats(LAN).expect("LAN").counters;
+    assert_eq!(counters.tx_blocked, 8);
+    assert_eq!(counters.generated_tx_blocked, 4);
+    assert_eq!(counters.tx_inflight, 0);
+    audit(&io);
+}
+
+/// #300 follow-up: `finish` consumes the generated batch, whose `Drop`
+/// then runs; it must not settle a second time. A batch dropped without
+/// `finish` settles exactly once from `Drop`.
+#[test]
+fn a_generated_batch_is_settled_once_by_finish_or_by_drop() {
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    // The kernel asks for kicks and consumes nothing, so every settle
+    // spends its whole budget: ceil(in_flight / 32) + 2 kicks.
+    wan.set_tx_flags(XDP_RING_NEED_WAKEUP);
+    let budget = |in_flight: u32| in_flight.div_ceil(KICK_TX_BATCH) + KICK_SLACK;
+    {
+        let mut batch = io.begin_generated(WAN);
+        for _ in 0..2 {
+            batch.allocate(42).expect("generated").commit();
+        }
+        assert_eq!(batch.finish().accepted, 2);
+    }
+    assert_eq!(wan.kicks(KickRing::Tx), budget(2), "finish only");
+    assert_eq!(
+        io.port_stats(WAN)
+            .expect("WAN")
+            .counters
+            .kick_budget_exhausted,
+        1
+    );
+    let before = wan.kicks(KickRing::Tx);
+    {
+        let mut batch = io.begin_generated(WAN);
+        batch.allocate(42).expect("generated").commit();
+        // Dropped without finish. `begin_generated` already settled the
+        // two earlier frames once (their debt is owed across batches).
+    }
+    let after_begin_and_drop = wan.kicks(KickRing::Tx) - before;
+    assert_eq!(after_begin_and_drop, budget(2) + budget(3));
+    assert_eq!(
+        io.port_stats(WAN)
+            .expect("WAN")
+            .counters
+            .kick_budget_exhausted,
+        3
+    );
+    transmit_all(&wan);
+    io.service().expect("service");
     audit(&io);
 }
 

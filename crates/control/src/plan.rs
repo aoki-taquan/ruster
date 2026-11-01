@@ -352,9 +352,11 @@ impl ApplyPlan {
     /// A [`RestartRequired::Backend`] plan is never live-applicable even
     /// though the publication would accept the successor (a candidate
     /// carries no backend). Such a plan skips the live check: the dry run is
-    /// recorded as `Err(ApplyError::RestartRequired(Backend))` and the flush
-    /// stays [`FlushCount::All`], so no caller can mistake it for an
-    /// in-place reload.
+    /// recorded as `Err(ApplyError::RestartRequired(restart_required()[0]))`
+    /// (`Backend` itself only when it is the sole reason, because `Backend`
+    /// is always listed last), and the flush stays [`FlushCount::All`], so
+    /// no caller can mistake it for an in-place reload and the recorded
+    /// reason is the first one, as for every other restart-required plan.
     pub fn for_active<I: PublicationQuiescence>(
         active: &mut ActivePublication<'_, I>,
         current: &ValidatedConfigV1,
@@ -363,7 +365,8 @@ impl ApplyPlan {
     ) -> Result<Self, PlanError> {
         let mut plan = Self::between(current, next)?;
         if plan.restart_required.contains(&RestartRequired::Backend) {
-            plan.dry_run = Some(Err(ApplyError::RestartRequired(RestartRequired::Backend)));
+            let first = plan.restart_required[0];
+            plan.dry_run = Some(Err(ApplyError::RestartRequired(first)));
             return Ok(plan);
         }
         let check = active.check_successor(successor);

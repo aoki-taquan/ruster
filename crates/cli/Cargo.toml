@@ -14,4 +14,6 @@ ruster-config = { path = "../config" }
 ruster-control = { path = "../control" }
 ruster-core = { path = "../core" }
 ruster-io-sim = { path = "../io-sim" }
+ruster-io-xdp-native = { path = "../io-xdp-native" }
+ruster-runtime = { path = "../runtime" }
 ruster-sim-scenario = { path = "../sim-scenario" }

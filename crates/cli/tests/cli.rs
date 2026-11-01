@@ -75,6 +75,9 @@ fn help_version_and_usage_errors_have_documented_statuses() {
         &["run-sim"][..],
         &["run-sim", "--scenario", "s.toml", "--fast"][..],
         &["run-sim", "--scenario", "--hold"][..],
+        &["run"][..],
+        &["run", "--config", "a.toml", "--hold"][..],
+        &["run", "--config", "a.toml", "--stats-interval=x"][..],
     ] {
         let output = run(args);
         assert_eq!(status(&output), 2, "{args:?}");
@@ -882,4 +885,124 @@ fn af_xdp_backend_validates_plans_as_restart_required_and_is_refused_by_run_sim(
         "ruster run-sim: invalid initial config: initial config rejected at backend: \
          UNSUPPORTED_BACKEND\n"
     );
+}
+
+/// `ruster run` refuses the simulation backend (pointing to `run-sim`) and
+/// an unreadable config with the documented statuses, before any signal
+/// handler, key source, or socket.
+#[test]
+fn run_refuses_sim_backend_and_unreadable_config() {
+    let sim = run(&["run", "--config", &fixture("router-v1.toml")]);
+    assert_eq!(status(&sim), 2);
+    assert!(sim.stdout.is_empty());
+    let stderr = text(&sim.stderr);
+    assert!(
+        stderr.contains("stage=backend code=SIM_BACKEND") && stderr.contains("ruster run-sim"),
+        "{stderr}"
+    );
+    let missing = run(&["run", "--config", "/nonexistent/ruster-run.toml"]);
+    assert_eq!(status(&missing), 1);
+    assert!(text(&missing.stderr).contains("cannot read config: NOT_FOUND"));
+    let invalid = run(&["run", "--config", &fixture("router-invalid.toml")]);
+    assert_eq!(status(&invalid), 2);
+    assert!(text(&invalid.stderr).contains("stage=validate"));
+}
+
+/// Whether this test process holds `CAP_NET_ADMIN` (bit 12 of `CapEff`).
+fn holds_net_admin() -> bool {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            let value = status
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:"))?;
+            u64::from_str_radix(value.trim(), 16).ok()
+        })
+        .is_some_and(|effective| effective & (1 << 12) != 0)
+}
+
+/// Without the documented capabilities `run` refuses before any resource
+/// (exit 4). With `CAP_NET_ADMIN` (for example `cargo test` as root) the
+/// test is skipped: a live startup must never run in the caller's network
+/// namespace, even against device names that should not exist.
+#[test]
+fn run_without_privileges_or_devices_fails_closed() {
+    if holds_net_admin() {
+        eprintln!("skipped: CAP_NET_ADMIN held; refusing a live startup in this namespace");
+        return;
+    }
+    let dir = scratch();
+    let v1 = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let config = dir.join("router-af-xdp.toml");
+    let text_config = format!("{v1}{AF_XDP_BACKEND}")
+        .replace("device = \"sim0\"", "device = \"rusternodev0\"")
+        .replace("device = \"sim1\"", "device = \"rusternodev1\"");
+    fs::write(&config, text_config).unwrap();
+    let output = ruster(&["run".as_ref(), "--config".as_ref(), config.as_os_str()]);
+    let code = status(&output);
+    let stderr = text(&output.stderr);
+    assert_eq!(code, 4, "{stderr}");
+    assert!(
+        stderr.contains("startup failed: stage=privileges code=MISSING_CAPABILITIES"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("running generation"), "{stderr}");
+    assert!(output.stdout.is_empty());
+}
+
+/// Waits at most `limit` for `child`, killing it on timeout.
+fn exits_within(mut child: Child, limit: Duration) -> Option<i32> {
+    let deadline = Instant::now() + limit;
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            return status.code();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `ruster run` exits in bounded time even when nobody ever reads its
+/// stdout (#301 LN1): `main` does not flush stdout after `run`. Both the
+/// sim refusal (before the output thread) and the privilege refusal
+/// (through the output thread) are exercised with stdout on a pipe that
+/// is never drained. Skipped with `CAP_NET_ADMIN`, like the test above.
+#[test]
+fn run_exits_in_bounded_time_with_an_undrained_stdout() {
+    let sim = Command::new(BIN)
+        .args(["run", "--config", &fixture("router-v1.toml")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    assert_eq!(exits_within(sim, Duration::from_secs(10)), Some(2));
+    if holds_net_admin() {
+        eprintln!("skipped the live part: CAP_NET_ADMIN held");
+        return;
+    }
+    let dir = scratch();
+    let v1 = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let config = dir.join("router-af-xdp.toml");
+    fs::write(
+        &config,
+        format!("{v1}{AF_XDP_BACKEND}")
+            .replace("device = \"sim0\"", "device = \"rusternodev0\"")
+            .replace("device = \"sim1\"", "device = \"rusternodev1\""),
+    )
+    .unwrap();
+    let live = Command::new(BIN)
+        .arg("run")
+        .arg("--config")
+        .arg(&config)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    assert_eq!(exits_within(live, Duration::from_secs(10)), Some(4));
 }

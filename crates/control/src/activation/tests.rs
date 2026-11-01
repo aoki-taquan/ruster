@@ -1082,7 +1082,7 @@ fn plan_restart_classification_matches_live_apply_rejection() {
 /// result.
 #[test]
 fn backend_only_plan_for_active_is_never_live_applicable() {
-    use crate::plan::tests::{af_xdp, config};
+    use crate::plan::tests::{af_xdp, config, INTERFACE_CHANGE, SHAPE_CHANGE};
     use crate::{ApplyPlan, PublicationSequencer, StateFlush};
 
     let current = config(&[]);
@@ -1103,6 +1103,28 @@ fn backend_only_plan_for_active_is_never_live_applicable() {
     assert_eq!(
         plan.dry_run(),
         Some(Err(ApplyError::RestartRequired(RestartRequired::Backend)))
+    );
+    assert_eq!(plan.flush(), StateFlush::ALL);
+    assert!(observe(&active) == before);
+
+    // With earlier reasons the recorded dry run is the first one, as for
+    // any other restart-required plan (#294), still without a live check.
+    let next = af_xdp(&[SHAPE_CHANGE, INTERFACE_CHANGE], 0, "copy");
+    let successor = sequencer.candidate(&next).unwrap();
+    let plan = ApplyPlan::for_active(&mut active, &current, &next, &successor).unwrap();
+    assert_eq!(
+        plan.restart_required(),
+        [
+            RestartRequired::StorageShape,
+            RestartRequired::Interfaces,
+            RestartRequired::Backend
+        ]
+    );
+    assert_eq!(
+        plan.dry_run(),
+        Some(Err(ApplyError::RestartRequired(
+            RestartRequired::StorageShape
+        )))
     );
     assert_eq!(plan.flush(), StateFlush::ALL);
     assert!(observe(&active) == before);

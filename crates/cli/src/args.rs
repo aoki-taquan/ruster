@@ -13,11 +13,33 @@ usage:
   ruster plan <current.toml> <next.toml>
   ruster run-sim [--hold] --scenario <scenario.toml>
   ruster run-sim [--hold] -- <scenario.toml>
+  ruster run [--allow-multi-queue] [--stats-interval <seconds>] --config <config.toml>
+  ruster run [--allow-multi-queue] [--stats-interval <seconds>] -- <config.toml>
   ruster --help | --version
 
 exit status: 0 success or signal shutdown, 1 runtime/I/O/expectation failure
-(including unreadable files), 2 usage error or invalid config/scenario
+(including unreadable files), 2 usage error or invalid config/scenario;
+`run` also: 3 shutdown deadline passed with TX frames still in the kernel,
+4 missing privilege or too small RLIMIT_MEMLOCK (nothing was acquired)
 ";
+
+/// Default `ruster run --stats-interval` in seconds.
+pub const DEFAULT_STATS_INTERVAL_SECS: u64 = 60;
+/// Largest accepted `--stats-interval` (one day).
+pub const MAX_STATS_INTERVAL_SECS: u64 = 86_400;
+
+/// `ruster run` options.
+#[derive(Debug, Eq, PartialEq)]
+pub struct RunArgs {
+    pub config: PathBuf,
+    /// Accept a port device with more than one RX queue (XDP-063): the
+    /// operator asserts that RSS/ntuple steers every frame to the bound
+    /// queue; frames on other queues are dropped by the XDP program.
+    pub allow_multi_queue: bool,
+    /// Seconds between periodic stats blocks on stdout; 0 disables them
+    /// (the final block is always printed).
+    pub stats_interval_secs: u64,
+}
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum Command {
@@ -26,6 +48,7 @@ pub enum Command {
     Validate { config: PathBuf },
     Plan { current: PathBuf, next: PathBuf },
     RunSim { scenario: PathBuf, hold: bool },
+    Run(RunArgs),
 }
 
 /// A usage error. Holds only fixed labels and, for an unrecognised word,
@@ -39,6 +62,7 @@ pub enum UsageError {
     MissingOperand(&'static str),
     MissingValue(&'static str),
     DuplicateOption(&'static str),
+    InvalidValue(&'static str),
 }
 
 impl fmt::Display for UsageError {
@@ -51,6 +75,10 @@ impl fmt::Display for UsageError {
             Self::MissingOperand(name) => write!(formatter, "missing operand <{name}>"),
             Self::MissingValue(option) => write!(formatter, "option {option} requires a value"),
             Self::DuplicateOption(option) => write!(formatter, "option {option} given twice"),
+            Self::InvalidValue(option) => write!(
+                formatter,
+                "option {option} needs a whole number of seconds from 0 to {MAX_STATS_INTERVAL_SECS}"
+            ),
         }
     }
 }
@@ -82,6 +110,7 @@ pub fn parse<I: IntoIterator<Item = OsString>>(args: I) -> Result<Command, Usage
             Ok(Command::Plan { current, next })
         }
         Some("run-sim") => parse_run_sim(&rest),
+        Some("run") => parse_run(&rest),
         _ if is_option(&first) => Err(UsageError::UnknownOption(lossy(&first))),
         _ => Err(UsageError::UnknownCommand(lossy(&first))),
     }
@@ -96,7 +125,7 @@ fn parse_run_sim(rest: &[OsString]) -> Result<Command, UsageError> {
             if value.is_empty() {
                 return Err(UsageError::MissingValue("--scenario"));
             }
-            set_once(&mut scenario, value.into())?;
+            set_once(&mut scenario, value.into(), "--scenario")?;
             continue;
         }
         match word.to_str() {
@@ -104,7 +133,7 @@ fn parse_run_sim(rest: &[OsString]) -> Result<Command, UsageError> {
                 // `run-sim [--hold] -- <scenario.toml>`: the one operand
                 // after `--` is the scenario, even if it starts with `-`.
                 let value = words.next().ok_or(UsageError::MissingValue("--scenario"))?;
-                set_once(&mut scenario, value.into())?;
+                set_once(&mut scenario, value.into(), "--scenario")?;
                 if let Some(extra) = words.next() {
                     return Err(UsageError::UnexpectedOperand(lossy(extra)));
                 }
@@ -119,7 +148,7 @@ fn parse_run_sim(rest: &[OsString]) -> Result<Command, UsageError> {
                     .next()
                     .filter(|value| !is_option(value))
                     .ok_or(UsageError::MissingValue("--scenario"))?;
-                set_once(&mut scenario, value.into())?;
+                set_once(&mut scenario, value.into(), "--scenario")?;
             }
             _ if is_option(word) => return Err(UsageError::UnknownOption(lossy(word))),
             _ => return Err(UsageError::UnexpectedOperand(lossy(word))),
@@ -144,9 +173,89 @@ fn equals_value(word: &OsStr, prefix: &str) -> Option<OsString> {
     }
 }
 
-fn set_once(slot: &mut Option<PathBuf>, value: PathBuf) -> Result<(), UsageError> {
+fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
+    let mut config = None;
+    let mut allow_multi_queue = false;
+    let mut interval = None;
+    let mut words = rest.iter();
+    while let Some(word) = words.next() {
+        if let Some(value) = equals_value(word, "--config=") {
+            if value.is_empty() {
+                return Err(UsageError::MissingValue("--config"));
+            }
+            set_once(&mut config, value.into(), "--config")?;
+            continue;
+        }
+        if let Some(value) = equals_value(word, "--stats-interval=") {
+            set_interval(&mut interval, &value)?;
+            continue;
+        }
+        match word.to_str() {
+            Some("--") => {
+                // `run [options] -- <config.toml>`: the one operand after
+                // `--` is the config, even if it starts with `-`.
+                let value = words.next().ok_or(UsageError::MissingValue("--config"))?;
+                set_once(&mut config, value.into(), "--config")?;
+                if let Some(extra) = words.next() {
+                    return Err(UsageError::UnexpectedOperand(lossy(extra)));
+                }
+            }
+            Some("-h" | "--help") => return Ok(Command::Help),
+            Some("--allow-multi-queue") if allow_multi_queue => {
+                return Err(UsageError::DuplicateOption("--allow-multi-queue"))
+            }
+            Some("--allow-multi-queue") => allow_multi_queue = true,
+            Some("--config") => {
+                let value = words
+                    .next()
+                    .filter(|value| !is_option(value))
+                    .ok_or(UsageError::MissingValue("--config"))?;
+                set_once(&mut config, value.into(), "--config")?;
+            }
+            Some("--stats-interval") => {
+                let value = words
+                    .next()
+                    .filter(|value| !is_option(value))
+                    .ok_or(UsageError::MissingValue("--stats-interval"))?;
+                set_interval(&mut interval, value)?;
+            }
+            _ if is_option(word) => return Err(UsageError::UnknownOption(lossy(word))),
+            _ => return Err(UsageError::UnexpectedOperand(lossy(word))),
+        }
+    }
+    let config = config.ok_or(UsageError::MissingValue("--config"))?;
+    Ok(Command::Run(RunArgs {
+        config,
+        allow_multi_queue,
+        stats_interval_secs: interval.unwrap_or(DEFAULT_STATS_INTERVAL_SECS),
+    }))
+}
+
+/// A decimal number of seconds, `0..=MAX_STATS_INTERVAL_SECS`, ASCII digits
+/// only (no sign, no whitespace).
+fn set_interval(slot: &mut Option<u64>, value: &OsStr) -> Result<(), UsageError> {
+    const OPTION: &str = "--stats-interval";
+    let seconds = value
+        .to_str()
+        .filter(|text| {
+            !text.is_empty() && text.len() <= 6 && text.bytes().all(|b| b.is_ascii_digit())
+        })
+        .and_then(|text| text.parse::<u64>().ok())
+        .filter(|seconds| *seconds <= MAX_STATS_INTERVAL_SECS)
+        .ok_or(UsageError::InvalidValue(OPTION))?;
+    if slot.replace(seconds).is_some() {
+        return Err(UsageError::DuplicateOption(OPTION));
+    }
+    Ok(())
+}
+
+fn set_once(
+    slot: &mut Option<PathBuf>,
+    value: PathBuf,
+    option: &'static str,
+) -> Result<(), UsageError> {
     if slot.replace(value).is_some() {
-        return Err(UsageError::DuplicateOption("--scenario"));
+        return Err(UsageError::DuplicateOption(option));
     }
     Ok(())
 }
@@ -343,6 +452,105 @@ mod tests {
                 "{value}"
             );
         }
+    }
+
+    fn run_args(config: &str, allow_multi_queue: bool, stats_interval_secs: u64) -> Command {
+        Command::Run(RunArgs {
+            config: config.into(),
+            allow_multi_queue,
+            stats_interval_secs,
+        })
+    }
+
+    #[test]
+    fn run_parses_config_and_options() {
+        assert_eq!(
+            run(&["run", "--config", "r.toml"]),
+            Ok(run_args("r.toml", false, DEFAULT_STATS_INTERVAL_SECS))
+        );
+        assert_eq!(
+            run(&["run", "--config=r.toml", "--allow-multi-queue"]),
+            Ok(run_args("r.toml", true, DEFAULT_STATS_INTERVAL_SECS))
+        );
+        assert_eq!(
+            run(&["run", "--stats-interval", "0", "--config", "r.toml"]),
+            Ok(run_args("r.toml", false, 0))
+        );
+        assert_eq!(
+            run(&["run", "--stats-interval=86400", "--", "-r.toml"]),
+            Ok(run_args("-r.toml", false, 86_400))
+        );
+        assert_eq!(run(&["run", "--help"]), Ok(Command::Help));
+    }
+
+    #[test]
+    fn run_usage_errors_are_typed() {
+        assert_eq!(run(&["run"]), Err(UsageError::MissingValue("--config")));
+        assert_eq!(
+            run(&["run", "--config"]),
+            Err(UsageError::MissingValue("--config"))
+        );
+        assert_eq!(
+            run(&["run", "--config="]),
+            Err(UsageError::MissingValue("--config"))
+        );
+        assert_eq!(
+            run(&["run", "--config", "--allow-multi-queue"]),
+            Err(UsageError::MissingValue("--config"))
+        );
+        assert_eq!(
+            run(&["run", "--config", "a", "--config=b"]),
+            Err(UsageError::DuplicateOption("--config"))
+        );
+        assert_eq!(
+            run(&["run", "--config", "a", "--", "b"]),
+            Err(UsageError::DuplicateOption("--config"))
+        );
+        assert_eq!(
+            run(&["run", "--", "a", "b"]),
+            Err(UsageError::UnexpectedOperand("b".into()))
+        );
+        assert_eq!(
+            run(&[
+                "run",
+                "--config",
+                "a",
+                "--allow-multi-queue",
+                "--allow-multi-queue"
+            ]),
+            Err(UsageError::DuplicateOption("--allow-multi-queue"))
+        );
+        assert_eq!(
+            run(&["run", "--config", "a", "extra"]),
+            Err(UsageError::UnexpectedOperand("extra".into()))
+        );
+        assert_eq!(
+            run(&["run", "--config", "a", "--hold"]),
+            Err(UsageError::UnknownOption("--hold".into()))
+        );
+        assert_eq!(
+            run(&["run", "--config", "a", "--stats-interval"]),
+            Err(UsageError::MissingValue("--stats-interval"))
+        );
+        for bad in ["", "-1", "+5", " 5", "1.5", "86401", "9999999", "x"] {
+            let word = format!("--stats-interval={bad}");
+            assert_eq!(
+                run(&["run", "--config", "a", &word]),
+                Err(UsageError::InvalidValue("--stats-interval")),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            run(&[
+                "run",
+                "--config",
+                "a",
+                "--stats-interval=1",
+                "--stats-interval",
+                "2"
+            ]),
+            Err(UsageError::DuplicateOption("--stats-interval"))
+        );
     }
 
     #[cfg(unix)]

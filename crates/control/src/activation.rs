@@ -385,7 +385,8 @@ pub enum ActivationError {
 ///
 /// [`RestartRequired::Backend`] is reported only by
 /// [`ApplyPlan`](crate::ApplyPlan) (including as the recorded dry run of
-/// [`ApplyPlan::for_active`](crate::ApplyPlan::for_active)): a publication
+/// [`ApplyPlan::for_active`](crate::ApplyPlan::for_active) when it is the
+/// only reason; otherwise that dry run records the first reason): a publication
 /// candidate carries no backend, so live activation never returns it. The process that owns the
 /// backend (sockets, UMEM, attached XDP programs) must refuse a backend
 /// change on reload and restart instead.

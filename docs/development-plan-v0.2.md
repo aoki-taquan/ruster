@@ -99,16 +99,17 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
 
 - production backendが無い。AF_PACKETはscripted syscall上のcopy backendまで、AF_XDPは
   一socketのsession、XDP program attach、RX/Fill engine、same-frame TX/Completion、generated frame、
-  複数portのcore `PacketIo` adapter（X04a）までで、`ruster run`、configからのport構築、multi-queue
-  worker ownership、実NIC forwarding E2Eは無い（M2）。
+  複数portのcore `PacketIo` adapter（X04a）、configからのport構築と`ruster run`の起動/停止（X04b前半、
+  M2 S10a）までで、reload、health/stall、retry policy、multi-queue worker ownership、実NIC forwarding
+  E2Eは無い（M2）。netns/veth上の`ruster run` E2Eは`scripts/priv-run-smoke.sh`（手動）。
 - `run-sim`はrestart-required applyをrejectとして報告し、同一process内でstorageを
   作り直さない（SIM-016 deferred）。process restartをまたぐgeneration/key履歴は無い。
 - OS乱数によるproduction key source（`OsRandomKeySource`）と、sim専用key sourceを型で拒否する
-  `ProductionSequencer`はM2 S7で追加した（PUB-010〜013）。これを使う`ruster run`はまだ無い（M2）。
+  `ProductionSequencer`はM2 S7で追加した（PUB-010〜013）。M2 S10aの`ruster run`がこれを型で要求する（CLI-012）。
 - AF_XDP backendのversioned `[backend]` config（kind、portごとのqueue/mode/need-wakeup/attach/
   ring/UMEM、existing-program policy）、bounded validation、restart-required classification、
   `run-sim`の非sim backend拒否はM2 S9で追加した（CONFIG-004〜007、BACKEND-001〜003）。これを
-  使うsocket/UMEM/attach setupと`ruster run`はまだ無い（M2）。
+  使うsocket/UMEM/attach setupと`ruster run`はM2 S10aで追加した（CLI-008〜035）。
 - 一socketのfailure-atomic native session（`if_nametoindex`、AF_XDP socket、UMEM mmap/登録、
   四ring size/`XDP_MMAP_OFFSETS`検証/mmap、`sockaddr_xdp` bind、`XDP_OPTIONS`によるmode確認、
   `auto`のEOPNOTSUPP限定copy fallback、typed errno、exact reverse teardown）はM2 S1（X00C）で
@@ -120,7 +121,7 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   しない、linkはpinしない、licenseは`MIT OR Apache-2.0`（使うhelperはGPL-onlyでない）。5.9〜6.xの
   実機検証とCI workflowはX04（XDP-062）。review決定: socketの無いqueueは`XDP_DROP`（fail closed。
   firewall/NATの迂回を防ぐ代わりにsingle-queue deviceかbind queueへのsteeringが前提、portにkernel L3
-  設定を残さない。startup checkはX04、XDP-063）。`ruster run`はまだ無い。
+  設定を残さない。startup checkはM2 S10aの`ruster run`で実装、XDP-063）。
 - AF_XDP RX/Fill engine（`RxFillEngine`: sessionごとに一回だけ取る`DatapathRings` bundle
   （`NativeSession::take_datapath`、Fill/Completion/RX/TX/UMEMを一組で所有）、bounded Fill refill、
   free list空のstarvation accounting、毎refillのneed-wakeup観測、RX descriptorの
@@ -151,8 +152,19 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   quiescenceはleaked lease回収とsettle後にlease/handoff/in-flightなし、OBS-018のstatsはkernel
   `XDP_STATISTICS`とring gaugeを含め固定順で出す。Rx/Generated/CQ conformance
   suiteをscripted kernel上で、二veth portのcore forwardingをprivileged smokeで検証した
-  （XDP-133〜174、IO-013、OBS-018）。configからのport構築と`ruster run`、health化、MTU/link変更、
+  （XDP-133〜174、IO-013、OBS-018）。configからのport構築と`ruster run`はM2 S10a。health化、MTU/link変更、
   TX枠公平性はX04b（XDP-157）。
+- `ruster run`（M2 S10a、X04b前半）: `kind = "af-xdp"`だけを受け（simは`run-sim`へ案内しexit 2）、
+  `ProductionSequencer<OsRandomKeySource>`、privilege/memlock preflight（exit 4）、portごとに`IfId`順の
+  open → XDP-063 check（RX queue 1か`--allow-multi-queue`、kernel IPv4 address/routeは拒否、forwarding
+  sysctlはwarning）→ attach、全attach後にdatapath/engine/adapter、generation 1 activate。どのstageの
+  失敗も開いた全portを逆順にclose（detach込み）してexit 1。loopは`run_tick`、`Instant` clock、
+  64 tick spin後50 µs〜1 msの倍々sleep、tickごとのallocation 0、`--stats-interval`ごとのstats block。
+  SIGINT/SIGTERMでtick停止 → 最大2 sのbounded drain（二回目のsignalで打ち切り）→ final stats →
+  逆順detach/close、exit 0（TXがkernelに残れば3）。#294（`for_active`のBackend dry runは先頭の理由）と
+  #300（relieveのbatchごとのreset、generated batchの一回settle、「0〜2 frame」）のfollow-upを含む。
+  operator手順は[`runbook-m2.md`](runbook-m2.md)（cold start、shutdown、kill/restart）。reload
+  （SIGHUP）、health/stall signal、retry policy、`poll`待機、privilege dropはM2 S10b以降（CLI-034）。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
   ringのsaturationはM2 S6でAF_XDPの`BackendStats`へ接続した（OBS-018。AF_PACKETはOBS-028、OBS-017はdeferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
