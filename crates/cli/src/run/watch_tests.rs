@@ -307,8 +307,15 @@ fn link_query_failures_warn_then_are_fatal_in_a_row() {
         link(&mut watch, up(1500)),
         [recovered(Condition::LinkProbe)]
     );
+    // A success resets the count: the next failures start from one.
     for _ in 1..LINK_PROBE_FAILURES_FATAL {
-        let _ = link(&mut watch, failure);
+        let events = link(&mut watch, failure);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, WatchEvent::Fatal { .. })),
+            "{events:?}"
+        );
     }
     assert_eq!(link(&mut watch, failure), [fatal(Fatal::LinkUnverifiable)]);
     let (_, health) = watch.health().next().expect("port");
