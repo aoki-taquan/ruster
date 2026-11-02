@@ -28,8 +28,21 @@
 #             (--seccomp kill): wherever the threads are checked, every
 #             thread shows Seccomp 2 and one filter more than this shell
 #             (Seccomp_filters 1 on an unconfined host), and the startup
-#             line and stats say seccomp mode=kill
-#   limits    (H3) a config with every runtime table at its production
+#             line and stats say seccomp mode=kill. (H11) And under the
+#             default filesystem confinement (--fs-confine landlock): the
+#             startup line says filesystem confined ... threads=5 and the
+#             stats fs.confine=landlock fs.threads=5
+#   fs        (H11, after privileges) the reload is the probe of what the
+#             router can open (no test hook): with --user/--group, the
+#             config atomically replaced by a symlink to a readable file
+#             outside its directory fails with stage=read
+#             code=PERMISSION_DENIED while forwarding goes on, and the same
+#             file installed in the directory applies; as uid 0 (which owns
+#             /etc/shadow) symlinks to /etc/shadow, /etc/passwd,
+#             /proc/1/status, and /proc/<pid>/root/etc/shadow all fail with
+#             PERMISSION_DENIED; with --fs-confine off the same reload
+#             through /etc/passwd gets past the read (the control)
+#   limits   (H3) a config with every runtime table at its production
 #             limit (failure holds and ICMPv4 error actions 4096, every
 #             other table 65536, NAT44 pool 1-65535, 51.11 MiB of storage) is
 #             accepted by `validate`; one more failure hold (4097) is
@@ -1176,6 +1189,8 @@ grep -qxF "ruster run: privileges dropped: threads=5 capabilities=none bounding-
     "$work/forward.err" || fail "forward: no privilege drop line"
 grep -Eqx "ruster run: seccomp filter installed: mode=kill threads=5 syscalls=[0-9]+ arch=x86_64" \
     "$work/forward.err" || fail "forward: no seccomp line"
+grep -Eqx "ruster run: filesystem confined: mode=landlock abi=[0-9]+ rules=4 threads=5" \
+    "$work/forward.err" || fail "forward: no filesystem confinement line"
 forward_once forward
 echo "priv_run_seccomp_kill: all $threads threads Seccomp=2 Seccomp_filters=$((seccomp_base + 1)) under the default kill filter, forwarding verified"
 echo "priv_run_privileges_dropped: all $threads threads CapInh/CapPrm/CapEff/CapAmb/CapBnd=0 NoNewPrivs=1 uid 0, forwarding after the drop verified"
@@ -1189,7 +1204,7 @@ sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/forward.out" >"$work/for
 block_has "$work/forward.final" observer.state=healthy observer.generation=1 watch.state=ok \
     resolution_index.state_probe_exhausted=0 resolution_index.index_corrupt=0 \
     privileges.state=dropped privileges.bounding_set=cleared privileges.identity=unchanged \
-    privileges.threads=5 seccomp.mode=kill seccomp.threads=5
+    privileges.threads=5 seccomp.mode=kill seccomp.threads=5 fs.confine=landlock fs.threads=5
 received=$(sed -n 's/^rx.received=//p' "$work/forward.out" | tail -n 1)
 [ "${received:-0}" -ge 1 ] || fail "forward: final rx.received is ${received:-missing}"
 grep -q "stopped by signal; .* tx-in-flight=0 .*detached and closed 2 port(s)" \
@@ -1357,6 +1372,127 @@ assert_detached "the --keep-privileges run"
 sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/keep.out" >"$work/keep.final"
 block_has "$work/keep.final" privileges.state=kept privileges.threads=0
 echo "priv_run_privileges_kept: --keep-privileges kept CAP_NET_ADMIN in all $threads threads (NoNewPrivs=1, Seccomp=2: the filter still applies), the same reload applied, privileges.state=kept, exit 0, detached verified"
+
+# fs (H11): the Landlock view. Nothing in the binary reports what it can
+# open (no test hook), so the SIGHUP reload, which opens the config path
+# again on the reload worker thread, is the probe: the config is replaced
+# (atomically) by a symlink to a file outside its directory that the
+# router's user can read; a refused open is `stage=read
+# code=PERMISSION_DENIED`, an allowed one gets past the read.
+# Line number of the first line of $work/$1.err containing $2 (0: none).
+line_of() {
+    grep -nF -- "$2" "$work/$1.err" | head -n 1 | cut -d: -f1 | grep . || echo 0
+}
+# Waits (10 s) until $work/$1.err has more than $2 lines containing $3.
+wait_count_above() {
+    tries=0
+    while [ "$(grep -cF -- "$3" "$work/$1.err" || true)" -le "$2" ]; do
+        launcher_alive || fail "$1: exited while waiting for: $3"
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "$1: no new \"$3\" within 10 seconds"
+        sleep 0.05
+    done
+}
+phase_fs_confine() {
+    # As the invoking user (who can read the work files): a symlink to the
+    # readable $work/deny.toml next to the config directory is refused,
+    # forwarding goes on; the same file copied into the directory (a new
+    # inode, as an editor or installer writes it) applies.
+    mkdir -p "$work/fsconf"
+    cp "$work/router.toml" "$work/fsconf/router.toml"
+    start_ruster fs-user "$work/fsconf/router.toml" --user "$smoke_uid" --group "$smoke_gid"
+    wait_ready fs-user || fail "fs-user: ruster exited during startup"
+    grep -Eqx "ruster run: filesystem confined: mode=landlock abi=[0-9]+ rules=4 threads=5" \
+        "$work/fs-user.err" || fail "fs-user: no filesystem confinement line"
+    fs_abi=$(sed -n 's/^ruster run: filesystem confined: mode=landlock abi=\([0-9]*\) .*/\1/p' "$work/fs-user.err")
+    # The startup order: drop, filesystem, filter, readiness.
+    at_drop=$(line_of fs-user "privileges dropped")
+    at_fs=$(line_of fs-user "filesystem confined")
+    at_filter=$(line_of fs-user "seccomp filter installed")
+    at_ready=$(line_of fs-user "running generation")
+    [ "$at_drop" -gt 0 ] && [ "$at_drop" -lt "$at_fs" ] && [ "$at_fs" -lt "$at_filter" ] &&
+        [ "$at_filter" -lt "$at_ready" ] || fail "fs-user: startup lines out of order"
+    ln -s "$work/deny.toml" "$work/fsconf/router.toml.next"
+    mv -f "$work/fsconf/router.toml.next" "$work/fsconf/router.toml"
+    signal_ruster HUP
+    wait_line fs-user "reload failed: stage=read code=PERMISSION_DENIED; generation 1 keeps running"
+    forward_once fs-user-outside
+    reload_with "$work/deny.toml" "$work/fsconf/router.toml"
+    wait_line fs-user "reload applied: generation=2 previous=1"
+    forward_blocked fs-user-inside
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "fs-user: exit status $status after SIGTERM"
+    assert_detached "the fs-user run"
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/fs-user.out" >"$work/fs-user.final"
+    block_has "$work/fs-user.final" fs.confine=landlock "fs.abi=$fs_abi" fs.rules=4 fs.threads=5 \
+        reload.applied=1 reload.failed=1
+    echo "priv_run_fs_confine_user: Landlock ABI $fs_abi, all 5 threads confined (drop, filesystem, filter, readiness in that order); a SIGHUP through a symlink to a readable file outside the config directory failed with PERMISSION_DENIED while forwarding went on, the same file installed in the directory applied (generation 2); exit 0, detached verified"
+
+    # As root (no --user): uid 0 owns /etc/shadow, which the drop alone
+    # leaves readable. A root-owned config directory as in section 5.
+    etcdir=$(sudo -n mktemp -d /run/ruster-smoke.XXXXXX)
+    case $etcdir in
+    /run/ruster-smoke.*) ;;
+    *) fail "fs: unexpected directory $etcdir" ;;
+    esac
+    sudo -n chown "root:$smoke_gid" "$etcdir"
+    sudo -n chmod 0750 "$etcdir"
+    sudo -n test -r /etc/shadow || fail "fs: no /etc/shadow on this host"
+    install_etc "$work/router.toml"
+    start_ruster fs-root "$etcdir/router.toml"
+    wait_ready fs-root || fail "fs-root: ruster exited during startup"
+    assert_dropped fs-root
+    grep -Eqx "ruster run: filesystem confined: mode=landlock abi=[0-9]+ rules=4 threads=5" \
+        "$work/fs-root.err" || fail "fs-root: no filesystem confinement line"
+    denied_line="reload failed: stage=read code=PERMISSION_DENIED; generation 1 keeps running"
+    for secret in /etc/shadow /etc/passwd /proc/1/status "/proc/$ruster_pid/root/etc/shadow"; do
+        before=$(grep -cF -- "$denied_line" "$work/fs-root.err" || true)
+        # $etcdir/router.toml becomes a symlink to $secret (atomic swap).
+        sudo -n ln -sfn "$secret" "$etcdir/router.toml.next"
+        sudo -n mv -f "$etcdir/router.toml.next" "$etcdir/router.toml"
+        signal_ruster HUP
+        wait_count_above fs-root "$before" "$denied_line"
+    done
+    install_etc "$work/deny.toml"
+    signal_ruster HUP
+    wait_line fs-root "reload applied: generation=2 previous=1"
+    forward_blocked fs-root-inside
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "fs-root: exit status $status after SIGTERM"
+    assert_detached "the fs-root run"
+    [ "$(grep -c "reload failed: " "$work/fs-root.err")" = 4 ] ||
+        fail "fs-root: a reload through a refused file failed otherwise"
+    echo "priv_run_fs_confine_root: as uid 0 without capabilities, SIGHUP reloads through symlinks to /etc/shadow, /etc/passwd, /proc/1/status, and /proc/<pid>/root/etc/shadow all failed with PERMISSION_DENIED, then a config in the directory applied (generation 2); exit 0, detached verified"
+
+    # The control: --fs-confine off reads the same world-readable file
+    # (/etc/passwd gets past the read and fails as a config).
+    install_etc "$work/router.toml"
+    start_ruster fs-off "$etcdir/router.toml" --fs-confine off
+    wait_ready fs-off || fail "fs-off: ruster exited during startup"
+    grep -qxF "ruster run: warning: fs-confine=off (--fs-confine off): no filesystem confinement; every file the process's user may read stays readable" \
+        "$work/fs-off.err" || fail "fs-off: no warning"
+    grep -q "filesystem confined" "$work/fs-off.err" && fail "fs-off: confined anyway"
+    sudo -n ln -sfn /etc/passwd "$etcdir/router.toml.next"
+    sudo -n mv -f "$etcdir/router.toml.next" "$etcdir/router.toml"
+    signal_ruster HUP
+    wait_line fs-off "reload failed: stage="
+    grep -q "reload failed: stage=read" "$work/fs-off.err" &&
+        fail "fs-off: /etc/passwd was not read without the confinement"
+    forward_once fs-off
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "fs-off: exit status $status after SIGTERM"
+    assert_detached "the fs-off run"
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/fs-off.out" >"$work/fs-off.final"
+    block_has "$work/fs-off.final" fs.confine=off fs.abi=0 fs.rules=0 fs.threads=0
+    sudo -n rm -rf -- "$etcdir"
+    etcdir=
+    passwd_stage=$(sed -n 's/.*reload failed: \(stage=[a-z-]*\).*/\1/p' "$work/fs-off.err" | head -n 1)
+    echo "priv_run_fs_confine_off: --fs-confine off warned, confined nothing (fs.confine=off), and the same reload through a symlink to /etc/passwd got past the read ($passwd_stage); exit 0, detached verified"
+}
+phase_fs_confine
 
 # icmp: router-generated ICMPv4 on the wire over AF_XDP, seen by host A.
 cp "$work/router.toml" "$work/icmp.toml"

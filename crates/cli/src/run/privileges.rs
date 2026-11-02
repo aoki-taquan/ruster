@@ -123,6 +123,10 @@ pub enum DropFailure {
     Unreadable,
     /// A thread of the process still holds this after the drop.
     NotDropped(Residue),
+    /// The thread's filesystem confinement, the step after its drop in the
+    /// same prologue ([`super::fs_confine`]), failed; reported as
+    /// `stage=fs-confine`.
+    Filesystem(super::fs_confine::FsFailure),
     /// A failure injected by a test host.
     #[cfg(test)]
     Injected,
@@ -137,6 +141,7 @@ impl fmt::Display for DropFailure {
             }
             Self::Unreadable => formatter.write_str("code=STATUS_UNREADABLE"),
             Self::NotDropped(residue) => write!(formatter, "code=NOT_DROPPED/{}", token(residue)),
+            Self::Filesystem(failure) => write!(formatter, "{failure}"),
             #[cfg(test)]
             Self::Injected => formatter.write_str("code=INJECTED"),
         }
