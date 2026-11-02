@@ -2005,8 +2005,10 @@ What it proves, on the runner's kernel only:
   without traffic the router thread wakes at most 400 times per second,
   measured as its voluntary context switches, and ticks at most 400 times
   per second, `idle.errors=0`; single pings after 2 s idle have a median
-  round trip of at most 1 ms and none above 10 ms, each waking the wait;
-  the line reports the measured rates, CPU, and round trips), and in
+  round trip of at most 1 ms and none above 10 ms, all 5 reach the router
+  (`rx.received`) and at least 3 end the wait (`idle.woken`; a frame that
+  lands while the thread is between waits is taken by the next tick
+  without a wake); the line reports the measured rates, CPU, and round trips), and in
   `priv-xdp-smoke.sh` the line `priv_xdp_idle_wait` (on two live veth
   ports a 30 ms `poll` times out after at least 30 ms, and a frame sent
   0.3 s into a 10 s `poll` ends it).
