@@ -144,10 +144,14 @@ in_netns() {
     sudo -n ip netns exec "$netns" "$@"
 }
 
-# Two queues per end: native veth XDP needs RX queues >= the peer's TX
-# queues, and a second socket on queue 1 exercises a second attach.
+# Two queues on the device: a second socket on queue 1 exercises a second
+# attach. The peer has a single TX queue, so every frame it sends lands on
+# the device's RX queue 0 (veth maps the peer's TX queue to the RX queue)
+# instead of on queue 1, where the XDP program drops it; with two peer TX
+# queues the choice follows a per-boot flow hash and the RX phases flaked
+# on CI. Native veth XDP needs RX queues >= the peer's TX queues (2 >= 1).
 sudo -n ip -n "$netns" link add "$device" numtxqueues 2 numrxqueues 2 type veth \
-    peer name "$peer" numtxqueues 2 numrxqueues 2
+    peer name "$peer" numtxqueues 1 numrxqueues 2
 sudo -n ip -n "$netns" link set "$device" up
 sudo -n ip -n "$netns" link set "$peer" up
 # RX 4 / TX 2: queues 2 and 3 have RX but no TX (also only inside netns).

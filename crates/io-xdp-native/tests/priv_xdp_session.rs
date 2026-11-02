@@ -406,8 +406,8 @@ fn priv_xdp_attach_redirects_refuses_second_and_detaches_on_netns_veth() {
     // owns) is redirected into the RX ring of queue 0. This relies on the
     // peer's frames landing on RX queue 0 of the two-queue veth: frames on
     // queue 1 have no socket and are dropped by the XDP_DROP fallback
-    // (XDP-050), so if this check becomes flaky, look at the veth queue
-    // selection first.
+    // (XDP-050). The script gives the peer a single TX queue, which veth
+    // maps to RX queue 0, so the choice does not depend on a flow hash.
     let peer = UdpSocket::bind(PEER_SOURCE).expect("peer address configured by the script");
     let deadline = Instant::now() + Duration::from_secs(3);
     let descriptor = loop {
