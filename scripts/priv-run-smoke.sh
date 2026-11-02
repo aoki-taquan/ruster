@@ -1250,8 +1250,10 @@ tcp = tcp[:16] + struct.pack("!H", 0xFFFF - fold(pseudo + tcp)) + tcp[18:]
 icmp_raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
 icmp_raw.settimeout(0.1)
 syn = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-syn.sendto(tcp, ("203.0.113.2", 0))
+# Read the clock before the send: the router may receive (and start its
+# hold) before sendto returns, so a later reading shortens the delay.
 sent = time.monotonic()
+syn.sendto(tcp, ("203.0.113.2", 0))
 answers = []
 while time.monotonic() - sent < wait:
     try:
