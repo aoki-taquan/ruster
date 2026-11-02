@@ -63,12 +63,12 @@ pub struct ValidationLimits {
 ///   sessions, and 2^16 also equals the largest NAT44 port pool
 ///   (1..=65535).
 /// - `max_quote_slots_per_table` = 4096 (2^12) for the two tables whose
-///   slots each hold a quoted datagram: resolution failure holds (648
+///   slots each hold a quoted datagram: resolution failure holds (656
 ///   bytes per slot) and ICMPv4 error actions (584 bytes). The bound is
-///   memory, not cost: at 2^16 these two tables alone would need 80 MiB.
+///   memory, not cost: at 2^16 these two tables alone would need 77.5 MiB.
 ///   4096 equals [`crate::MAX_NEIGHBORS`].
 /// - `max_runtime_bytes` = 64 MiB, the simulator's value. Every table at its
-///   limit (with the widest port pool) needs 53559488 bytes (51.08 MiB)
+///   limit (with the widest port pool) needs 53592256 bytes (51.11 MiB)
 ///   with the current slot sizes, so the per-table limits bind and this
 ///   bound only fails closed if a slot type grows. The storage is ordinary
 ///   heap (not memlocked), allocated once at startup.

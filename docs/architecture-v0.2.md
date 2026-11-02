@@ -1246,7 +1246,7 @@ lookupが検出し、mutation前にfail closed（`StateFull`/`CacheFull`/`Capaci
 `index_corrupt`）。mutationは隣接nodeを確かめてから書く。`preflight_publication`は全index
 （chain、bitmap、order list、action所有）をO(capacity)で検証し、不一致は`IndexCorrupt`。
 
-slot sizeはstate 56→96、action 32→56、dynamic neighbor 24→64、failure hold 608→648 bytes
+slot sizeはstate 56→96、action 32→56、dynamic neighbor 24→64、failure hold 608→656 bytes（reverse group link込み）
 で、ほかのstorageはありません（`required_bytes`と最大configが計上）。挙動は変わりません:
 seeded churn testが同じ操作列を旧runtime（`resolution_reference.rs`、origin/main b1e31aaの
 test専用copy）にも適用し、全結果、trace、slot、queue順、counterの一致を確かめます。新しい

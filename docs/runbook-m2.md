@@ -55,7 +55,7 @@ All commands assume a dedicated router host or network namespace. Replace
   limit-bytes=L required-bytes=R`). Root has `CAP_IPC_LOCK`. The estimate is
   a lower bound (section 12).
 - **Memory (RAM)**: the runtime tables are ordinary heap, not memlocked;
-  51.08 MiB for the largest config `ruster run` accepts (64 MiB bound),
+  51.11 MiB for the largest config `ruster run` accepts (64 MiB bound),
   plus the UMEM (see "Validation limits and memory" below).
 - **Dedicated network namespace (recommended)**: run the router in its own
   namespace (`ip netns exec <ns> ruster run ...`) that holds only the port
@@ -194,9 +194,9 @@ whole-document storage, which has no path.
 
 | Limit | `run-sim` (and `validate` of `sim`) | `ruster run` (and `validate` of `af-xdp`) | Why |
 |---|---|---|---|
-| quote tables (`max_quote_slots_per_table`): `resolution.capacity.failure-holds`, `icmpv4-errors.capacity.actions` | 65536 | 4096 | each slot holds a quoted datagram (648 and 584 bytes), so the bound is memory: at 65536 these two alone would need 80 MiB. Until H4b this limit (then `max_scanned_slots_per_table`) covered every resolution and ICMPv4 error table because their packet paths scanned |
+| quote tables (`max_quote_slots_per_table`): `resolution.capacity.failure-holds`, `icmpv4-errors.capacity.actions` | 65536 | 4096 | each slot holds a quoted datagram (656 and 584 bytes), so the bound is memory: at 65536 these two alone would need 77.5 MiB. Until H4b this limit (then `max_scanned_slots_per_table`) covered every resolution and ICMPv4 error table because their packet paths scanned |
 | other tables (`max_slots_per_table`): `resolution.capacity.{states,actions,dynamic-neighbors}`, `icmpv4-errors.capacity.states`, `nat44.{udp,tcp}.capacity.*`, `firewall.capacity.states`, each NAT44 directory (next power of two), the NAT44 port owner table (pool size) | 65536 | 65536 | no packet path scans them (table below); home NAT needs many sessions; also the largest port pool (1-65535) |
-| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 51.08 MiB, so the per-table limits bind; the byte limit fails closed only if a slot type grows |
+| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 51.11 MiB, so the per-table limits bind; the byte limit fails closed only if a slot type grows |
 | config file | 1 MiB | 1 MiB | parse stage, every backend (CONFIG-001) |
 | `[[interfaces]]` / `[[backend.ports]]` | 256 / 256 | 256 / 256 | parse stage |
 | `[[addresses]]` | 1024 | 1024 | parse stage |
@@ -222,7 +222,7 @@ caps one queue at about 45 kpps. Keep `[[routes]]`, `[[addresses]]`, and
 |---|---|---|---|---|
 | `dynamic-neighbors` (64 B) | lookup on forwarding to a non-static next hop, ARP merge: a LAN host flooding ARP from many senders, or WAN packets to unused LAN addresses where routed inbound traffic is allowed | one keyed chain of at most 16 slots (`RESOLUTION_INDEX_CHAIN_LIMIT`; secret per-publication SipHash key, one bucket per slot), plus for a new entry the lowest free or expired slot from a bitmap (at most 17 words at 65536) and the head of the refresh-order list; expired entries are taken off that list lazily, amortized O(1) per learned entry | miss 0.28 µs (74 µs); ARP flood into a full cache 0.31 µs (148 µs) | on-link hosts of the largest LAN plus headroom |
 | resolution `states` (96 B) | `schedule` on a dynamic miss, failure capture, ARP learn (cancels the key's state) | one keyed chain of at most 16 slots, plus for a new key the lowest free or elapsed-cooldown slot (bitmap) and the head of the request-order list (amortized O(1) per committed request) | new target with the table full 0.34 µs (250 µs); ARP update of a pending target 0.78 µs (943 µs) | the number of next hops being resolved at once |
-| resolution `failure-holds` (648 B) | capture on a miss, promotion and expiry of a failed resolution, ARP learn | the forward chain of the key (at most 16 holds) and, for holds waiting on a reverse resolution, the reverse chain, which carries one leader per distinct waiting token (the other holds of a token hang off its leader, so thousands of holds behind one spoofed source cost other tokens nothing); clearing a token's holds visits each once, and each was captured once (amortized O(1)) | — | a few times `states` |
+| resolution `failure-holds` (656 B) | capture on a miss, promotion and expiry of a failed resolution, ARP learn | the forward chain of the key (at most 16 holds) and, for holds waiting on a reverse resolution, the reverse chain, which carries one leader per distinct waiting token (the other holds of a token hang off its leader, so thousands of holds behind one spoofed source cost other tokens nothing); clearing a token's holds visits each once, and each was captured once (amortized O(1)) | — | a few times `states` |
 | resolution `actions` (56 B) | FIFO list; a state removes its own queued action in O(1) | O(1) | — | like `states` |
 | ICMPv4 error `states` (24 B) | every generated error (TTL expiry, unreachable) | only the occupied states, which are a prefix of the table and at most one per egress interface in use (≤ 256) | — | at most one per egress interface is ever used; a few |
 | ICMPv4 error `actions` (584 B) | O(1) ring; one per state | O(1) | — | like `states` |
@@ -271,7 +271,7 @@ attacker must first fill the table, one packet per entry.
 | `resolution.capacity.states` | 96 | 6 MiB (65536) |
 | `resolution.capacity.actions` | 56 | 3.5 MiB (65536) |
 | `resolution.capacity.dynamic-neighbors` | 64 | 4 MiB (65536) |
-| `resolution.capacity.failure-holds` (holds a quoted datagram) | 648 | 2.53 MiB (4096) |
+| `resolution.capacity.failure-holds` (holds a quoted datagram) | 656 | 2.56 MiB (4096) |
 | `icmpv4-errors.capacity.states` | 24 | 1.5 MiB (65536) |
 | `icmpv4-errors.capacity.actions` (holds a quoted datagram) | 584 | 2.28 MiB (4096) |
 | `nat44.udp.capacity.mappings` | 64 + 28 directory | 5.75 MiB (65536) |
@@ -285,18 +285,18 @@ A directory has one 4-byte bucket per slot, rounded up to a power of two,
 and one 24-byte node per slot (exact for the powers of two above). `ruster
 validate` prints the total as `storage-bytes=`. The largest config that
 `run` accepts (`fixtures/limits/router-production-max.toml`) needs
-53559488 bytes (51.08 MiB). H4a added 16 bytes per NAT44 mapping and
+53592256 bytes (51.11 MiB). H4a added 16 bytes per NAT44 mapping and
 session slot (reuse-list links, 48 to 64 bytes with the 16-byte alignment)
 and the free-port bitmaps: 3 MiB more at the limits. H4b added the
 resolution indexes inside the slots (state 56 to 96 bytes, action 32 to
-56, dynamic neighbor 24 to 64, failure hold 608 to 648; the chain heads
+56, dynamic neighbor 24 to 64, failure hold 608 to 656 with the reverse-group links; the chain heads
 and bitmap words live in the slots, so there is no other storage) and
 raised states, actions, dynamic neighbors, and ICMPv4 error states to
-65536: 14.5 MiB more.
+65536: 14.7 MiB more.
 
 Worst-case resident memory of `ruster run`:
 
-- Runtime storage: at most 64 MiB (51.08 MiB with today's slot sizes).
+- Runtime storage: at most 64 MiB (51.11 MiB with today's slot sizes).
   It is allocated once at startup, before the privilege preflight, and
   filled, so it is resident from the start. If the allocation fails,
   startup reports `stage=storage code=ALLOCATION.<service>` and exits 1.
@@ -952,7 +952,7 @@ What it proves, on the runner's kernel only:
   frames delivered and the counters adding up; `observer.state` and
   `watch.state` in the stats blocks.
   Added by H3 (marker `priv_run_limits`): a config with every runtime
-  table at its production limit (51.08 MiB of storage since H4b)
+  table at its production limit (51.11 MiB of storage since H4b)
   accepted by `validate`; `ruster run` starts it, forwards and
   translates, and exits 0 on SIGTERM; one more failure hold (4097, a
   quote table) refused by `validate` and `run` (exit 2) although
