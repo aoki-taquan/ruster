@@ -889,13 +889,22 @@ fn target_address(index: u8) -> Ipv4Address {
 }
 
 fn admission_topology() -> (
-    [Route; 1],
+    [Route; 2],
     [Interface; 2],
     [Neighbor; 1],
     [LocalIpv4Binding; 1],
 ) {
     (
-        [Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, Some(GATEWAY)).unwrap()],
+        [
+            Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, Some(GATEWAY)).unwrap(),
+            // Purpose: ARP-031 drops ARP from senders that are not on the
+            // ingress link, and this topology has no LAN connected route
+            // (a real config always has one), so the ARP peer needs a direct
+            // route on LAN to keep being learned and answered. A `/32` host
+            // route is used instead of the `/24` so it adds no network or
+            // broadcast boundary and leaves admission expectations unchanged.
+            Route::new(LAN_PEER, 32, LAN, None).unwrap(),
+        ],
         [
             Interface {
                 id: LAN,

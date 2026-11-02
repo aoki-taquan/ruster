@@ -1,0 +1,609 @@
+//! Differential and cost tests for the publication-time forwarding indexes
+//! (PERF-002). The oracle is `lookup::linear`, the pre-H4c per-packet code.
+
+use super::lookup::{linear, ForwardingIndex};
+use super::*;
+use crate::{Ipv4Address, MacAddress};
+
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        // SplitMix64: deterministic, seedable, no dependency.
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.0;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
+
+    fn address(&mut self) -> u32 {
+        self.next() as u32
+    }
+}
+
+fn ip(bits: u32) -> Ipv4Address {
+    Ipv4Address::from_octets(bits.to_be_bytes())
+}
+
+fn bits(address: Ipv4Address) -> u32 {
+    u32::from_be_bytes(address.octets())
+}
+
+fn mask(len: u8) -> u32 {
+    if len == 0 {
+        0
+    } else {
+        u32::MAX << (32 - u32::from(len))
+    }
+}
+
+struct Tables {
+    routes: Vec<Route>,
+    interfaces: Vec<Interface>,
+    neighbors: Vec<Neighbor>,
+    local_ipv4: Vec<LocalIpv4Binding>,
+}
+
+/// Random tables that pass snapshot validation: overlapping prefixes drawn
+/// from a few bases (so nesting is common), `/0` and `/32` included, a few
+/// interfaces, unique neighbors and one address per interface.
+fn random_tables(rng: &mut Rng, max_routes: u64) -> Tables {
+    let interface_count = 1 + rng.below(6) as u16;
+    let interfaces: Vec<Interface> = (0..interface_count)
+        .map(|id| Interface {
+            id: IfId(id * 3 + 1),
+            mac: MacAddress([2, 0, 0, 0, 0, id as u8]),
+        })
+        .collect();
+    let bases: Vec<u32> = (0..4).map(|_| rng.address()).collect();
+    let mut routes: Vec<Route> = Vec::new();
+    let wanted = rng.below(max_routes + 1);
+    while (routes.len() as u64) < wanted {
+        let len = match rng.below(8) {
+            0 => 0,
+            1 => 32,
+            2 => 31,
+            _ => rng.below(33) as u8,
+        };
+        let base = if rng.below(4) == 0 {
+            rng.address()
+        } else {
+            bases[rng.below(bases.len() as u64) as usize] ^ (rng.address() & 0xff)
+        };
+        let prefix = ip(base & mask(len));
+        let egress = interfaces[rng.below(interfaces.len() as u64) as usize].id;
+        let next_hop = (rng.below(3) == 0).then(|| ip(rng.address()));
+        if routes
+            .iter()
+            .any(|route| route.prefix() == prefix && route.prefix_len() == len)
+        {
+            continue;
+        }
+        routes.push(Route::new(prefix, len, egress, next_hop).unwrap());
+    }
+    let mut neighbors: Vec<Neighbor> = Vec::new();
+    for _ in 0..rng.below(40) {
+        let interface = interfaces[rng.below(interfaces.len() as u64) as usize].id;
+        let target = if rng.below(2) == 0 && !routes.is_empty() {
+            let route = routes[rng.below(routes.len() as u64) as usize];
+            ip(bits(route.prefix()) | (rng.address() & !mask(route.prefix_len())))
+        } else {
+            ip(rng.address())
+        };
+        if !neighbors
+            .iter()
+            .any(|neighbor| neighbor.interface == interface && neighbor.target == target)
+        {
+            neighbors.push(Neighbor {
+                interface,
+                target,
+                mac: MacAddress([2, 1, 0, 0, 0, neighbors.len() as u8]),
+            });
+        }
+    }
+    let mut local_ipv4: Vec<LocalIpv4Binding> = Vec::new();
+    for interface in &interfaces {
+        if rng.below(4) == 0 {
+            continue;
+        }
+        let address = ip(rng.address() | 1);
+        if !local_ipv4.iter().any(|binding| binding.address == address) {
+            local_ipv4.push(LocalIpv4Binding {
+                interface: interface.id,
+                address,
+            });
+        }
+    }
+    Tables {
+        routes,
+        interfaces,
+        neighbors,
+        local_ipv4,
+    }
+}
+
+/// Addresses that hit every interval boundary of the table plus random ones.
+fn probe_addresses(rng: &mut Rng, tables: &Tables) -> Vec<Ipv4Address> {
+    let mut addresses = vec![ip(0), ip(1), ip(u32::MAX), ip(u32::MAX - 1)];
+    for route in &tables.routes {
+        let first = bits(route.prefix());
+        let last = first | !mask(route.prefix_len());
+        for candidate in [
+            first,
+            last,
+            first.wrapping_sub(1),
+            last.wrapping_add(1),
+            first.wrapping_add(1),
+        ] {
+            addresses.push(ip(candidate));
+        }
+        if let Some(next_hop) = route.next_hop() {
+            addresses.push(next_hop);
+        }
+    }
+    for neighbor in &tables.neighbors {
+        addresses.push(neighbor.target);
+    }
+    for binding in &tables.local_ipv4 {
+        addresses.push(binding.address);
+    }
+    for _ in 0..64 {
+        addresses.push(ip(rng.address()));
+    }
+    addresses
+}
+
+fn interface_ids(tables: &Tables) -> Vec<IfId> {
+    let mut ids: Vec<IfId> = tables
+        .interfaces
+        .iter()
+        .map(|interface| interface.id)
+        .collect();
+    ids.push(IfId(0));
+    ids.push(IfId(u16::MAX));
+    ids
+}
+
+fn owner(tables: &Tables) -> ValidatedForwardingOwner {
+    ValidatedForwardingOwner::new(
+        tables.routes.clone().into_boxed_slice(),
+        tables.interfaces.clone().into_boxed_slice(),
+        tables.neighbors.clone().into_boxed_slice(),
+        tables.local_ipv4.clone().into_boxed_slice(),
+        Ipv4OriginPolicy::default(),
+    )
+    .unwrap()
+}
+
+fn assert_snapshot_matches_linear(
+    snapshot: &ForwardingSnapshot<'_>,
+    tables: &Tables,
+    rng: &mut Rng,
+) {
+    assert!(snapshot.index.is_some(), "owner snapshots are indexed");
+    let addresses = probe_addresses(rng, tables);
+    let ids = interface_ids(tables);
+    for id in &ids {
+        assert_eq!(
+            snapshot.interface(*id),
+            linear::interface(&tables.interfaces, *id)
+        );
+        assert_eq!(
+            snapshot.local_binding_on(*id),
+            linear::local_by_interface(&tables.local_ipv4, *id)
+        );
+    }
+    for address in &addresses {
+        assert_eq!(
+            snapshot.route_lookup(*address),
+            linear::route(&tables.routes, *address),
+            "route for {address:?}"
+        );
+        assert_eq!(
+            snapshot.local_binding_for(*address),
+            linear::local_by_address(&tables.local_ipv4, *address)
+        );
+        for id in &ids {
+            assert_eq!(
+                snapshot.static_neighbor(*id, *address),
+                linear::static_neighbor(&tables.neighbors, *id, *address)
+            );
+            assert_eq!(
+                snapshot.is_connected_boundary(*id, *address),
+                linear::connected_boundary(&tables.routes, *id, *address),
+                "connected boundary {id:?} {address:?}"
+            );
+            assert_eq!(
+                snapshot.is_gateway(*id, *address),
+                linear::gateway(&tables.routes, *id, *address)
+            );
+            assert_eq!(
+                snapshot.sender_on_link(*id, *address),
+                linear::sender_on_link(&tables.routes, *id, *address),
+                "on-link {id:?} {address:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn indexed_lookups_match_the_linear_reference_on_random_tables() {
+    let mut rng = Rng(0x5eed_4c00);
+    for _ in 0..400 {
+        let tables = random_tables(&mut rng, 80);
+        let owner = owner(&tables);
+        assert_snapshot_matches_linear(&owner.snapshot(), &tables, &mut rng);
+    }
+}
+
+#[test]
+fn indexed_route_lookup_matches_the_linear_reference_on_large_tables() {
+    let mut rng = Rng(0x0004_0960);
+    for _ in 0..8 {
+        let tables = random_tables(&mut rng, 4096);
+        let owner = owner(&tables);
+        let snapshot = owner.snapshot();
+        for address in probe_addresses(&mut rng, &tables) {
+            assert_eq!(
+                snapshot.route_lookup(address),
+                linear::route(&tables.routes, address)
+            );
+        }
+    }
+}
+
+#[test]
+fn resolution_authority_is_identical_for_indexed_and_linear_snapshots() {
+    let mut rng = Rng(0xa070_0001);
+    for _ in 0..200 {
+        let tables = random_tables(&mut rng, 40);
+        let owner = owner(&tables);
+        let indexed = owner.snapshot();
+        let linear = ForwardingSnapshot::new(
+            &tables.routes,
+            &tables.interfaces,
+            &tables.neighbors,
+            &tables.local_ipv4,
+        )
+        .unwrap();
+        assert!(linear.index.is_none());
+        for target in probe_addresses(&mut rng, &tables) {
+            for interface in &tables.interfaces {
+                let source_ip = tables
+                    .local_ipv4
+                    .iter()
+                    .find(|binding| binding.interface == interface.id)
+                    .map_or(ip(rng.address()), |binding| binding.address);
+                let action = ArpRequestAction {
+                    egress: interface.id,
+                    source_mac: interface.mac,
+                    source_ip,
+                    target_ip: target,
+                };
+                assert_eq!(
+                    indexed.resolution_action_authority(action),
+                    linear.resolution_action_authority(action)
+                );
+            }
+        }
+    }
+}
+
+/// Duplicate `(prefix, length)` pairs never pass validation, but the
+/// builder must still reproduce `max_by_key`'s last-maximum rule.
+#[test]
+fn unvalidated_duplicate_prefixes_resolve_to_the_last_like_max_by_key() {
+    let mut rng = Rng(0xd0b1_e000);
+    for _ in 0..300 {
+        let mut routes = Vec::new();
+        for _ in 0..rng.below(24) {
+            let len = rng.below(33) as u8;
+            let prefix = ip((0x0a00_0000 | (rng.address() & 0x00ff_ffff)) & mask(len));
+            let egress = IfId(rng.below(4) as u16);
+            routes.push(Route::new(prefix, len, egress, None).unwrap());
+            if rng.below(2) == 0 {
+                // An exact duplicate prefix with a different egress.
+                routes.push(Route::new(prefix, len, IfId(9), None).unwrap());
+            }
+        }
+        let index = ForwardingIndex::build(&routes, &[], &[], &[]);
+        for route in &routes {
+            for address in [
+                route.prefix(),
+                ip(bits(route.prefix()) | !mask(route.prefix_len())),
+                ip(rng.address()),
+            ] {
+                assert_eq!(
+                    index.route(address).0.map(|slot| routes[slot]),
+                    linear::route(&routes, address)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn edge_tables_default_host_and_empty() {
+    let default = Route::new(ip(0), 0, IfId(1), Some(ip(0x0a00_0001))).unwrap();
+    let host_low = Route::new(ip(0), 32, IfId(2), None).unwrap();
+    let host_high = Route::new(ip(u32::MAX), 32, IfId(3), None).unwrap();
+    let empty = ForwardingIndex::build(&[], &[], &[], &[]);
+    assert_eq!(empty.route(ip(0)).0, None);
+    assert_eq!(empty.route(ip(u32::MAX)).0, None);
+    assert!(!empty.sender_on_link(IfId(1), ip(1)).0);
+
+    let routes = [default, host_low, host_high];
+    let index = ForwardingIndex::build(&routes, &[], &[], &[]);
+    assert_eq!(index.route(ip(0)).0, Some(1));
+    assert_eq!(index.route(ip(1)).0, Some(0));
+    assert_eq!(index.route(ip(u32::MAX - 1)).0, Some(0));
+    assert_eq!(index.route(ip(u32::MAX)).0, Some(2));
+    // `/0` and `/32` are never connected boundaries (length > 30 or a
+    // gateway), but a direct `/32` is on-link for its own address only.
+    assert!(index.sender_on_link(IfId(3), ip(u32::MAX)).0);
+    assert!(!index.sender_on_link(IfId(3), ip(u32::MAX - 1)).0);
+    assert!(index.sender_on_link(IfId(1), ip(0x0a00_0001)).0);
+    assert!(!index.sender_on_link(IfId(1), ip(0x0a00_0002)).0);
+
+    let connected = [Route::new(ip(0), 0, IfId(4), None).unwrap()];
+    let index = ForwardingIndex::build(&connected, &[], &[], &[]);
+    assert!(index.connected_boundary(IfId(4), ip(0)).0);
+    assert!(index.connected_boundary(IfId(4), ip(u32::MAX)).0);
+    assert!(!index.connected_boundary(IfId(5), ip(u32::MAX)).0);
+    assert!(index.sender_on_link(IfId(4), ip(0x1234_5678)).0);
+}
+
+fn limit_tables() -> Tables {
+    let mut rng = Rng(0x1_0000);
+    let interfaces: Vec<Interface> = (0..256u16)
+        .map(|id| Interface {
+            id: IfId(id),
+            mac: MacAddress([2, 0, 0, 0, (id >> 8) as u8, id as u8]),
+        })
+        .collect();
+    // 4096 /24 routes, the shape the review measured, half of them direct.
+    let routes: Vec<Route> = (0..4096u32)
+        .map(|index| {
+            let prefix = ip(0x0a00_0000 | (index << 8));
+            let egress = IfId((index % 256) as u16);
+            let next_hop = (index % 2 == 1).then(|| ip(0x0a00_0000 | ((index - 1) << 8) | 1));
+            Route::new(prefix, 24, egress, next_hop).unwrap()
+        })
+        .collect();
+    let neighbors: Vec<Neighbor> = (0..4096u32)
+        .map(|index| Neighbor {
+            interface: IfId((index % 256) as u16),
+            target: ip(0x0a00_0000 | (index << 8) | 2),
+            mac: MacAddress([2, 2, 0, 0, (index >> 8) as u8, index as u8]),
+        })
+        .collect();
+    // One address per interface is the snapshot (and config validation)
+    // rule, so at most 256 here although `[[addresses]]` parses up to
+    // 1024. The bound below is computed for 1024 regardless.
+    let local_ipv4: Vec<LocalIpv4Binding> = (0..256u32)
+        .map(|index| LocalIpv4Binding {
+            interface: IfId(index as u16),
+            address: ip(0x0a00_0000 | (index << 8) | 1),
+        })
+        .collect();
+    let _ = rng.next();
+    Tables {
+        routes,
+        interfaces,
+        neighbors,
+        local_ipv4,
+    }
+}
+
+fn log2_ceil(entries: usize) -> u32 {
+    usize::BITS - entries.leading_zeros()
+}
+
+#[test]
+fn lookup_probes_are_bounded_at_the_config_limits() {
+    let tables = limit_tables();
+    let index = ForwardingIndex::build(
+        &tables.routes,
+        &tables.interfaces,
+        &tables.neighbors,
+        &tables.local_ipv4,
+    );
+    // ceil(log2(n + 1)) probes for n sorted entries.
+    let route_bound = log2_ceil(2 * 4096 + 1); // 14
+    let neighbor_bound = log2_ceil(4096); // 13
+    let local_bound = log2_ceil(1024); // 11
+    let interface_bound = log2_ceil(256); // 9
+    assert_eq!(route_bound, 14);
+    let mut rng = Rng(0xc057);
+    let mut addresses = probe_addresses(&mut rng, &tables);
+    addresses.extend((0..4096).map(|_| ip(rng.address())));
+    let mut worst = [0u32; 7];
+    for address in &addresses {
+        worst[0] = worst[0].max(index.route(*address).1);
+        worst[1] = worst[1].max(index.local_by_address(*address).1);
+        for id in [IfId(0), IfId(17), IfId(255)] {
+            worst[2] = worst[2].max(index.static_neighbor(id, *address).1);
+            worst[3] = worst[3].max(index.connected_boundary(id, *address).1);
+            worst[4] = worst[4].max(index.gateway(id, *address).1);
+            worst[5] = worst[5].max(index.sender_on_link(id, *address).1);
+        }
+    }
+    for id in 0..=u16::MAX {
+        worst[6] = worst[6].max(index.interface(IfId(id)).1);
+        worst[6] = worst[6].max(index.local_by_interface(IfId(id)).1);
+    }
+    assert!(worst[0] <= route_bound, "route probes {}", worst[0]);
+    assert!(worst[1] <= local_bound, "local probes {}", worst[1]);
+    assert!(worst[2] <= neighbor_bound, "neighbor probes {}", worst[2]);
+    assert!(worst[3] <= route_bound, "connected probes {}", worst[3]);
+    assert!(worst[4] <= neighbor_bound, "gateway probes {}", worst[4]);
+    assert!(
+        worst[5] <= route_bound + neighbor_bound,
+        "on-link probes {}",
+        worst[5]
+    );
+    assert!(worst[6] <= interface_bound, "interface probes {}", worst[6]);
+    // Memory at the limits stays small and is reported.
+    assert!(index.heap_bytes() < 256 * 1024, "{}", index.heap_bytes());
+}
+
+#[test]
+fn owner_snapshot_is_indexed_and_borrowed_snapshot_is_linear() {
+    let tables = limit_tables();
+    let owner = owner(&tables);
+    let snapshot = owner.snapshot();
+    assert!(snapshot.index.is_some());
+    assert_eq!(owner.index_heap_bytes(), owner.index.heap_bytes());
+    let borrowed = ForwardingSnapshot::new(
+        &tables.routes,
+        &tables.interfaces,
+        &tables.neighbors,
+        &tables.local_ipv4,
+    )
+    .unwrap();
+    assert!(borrowed.index.is_none());
+}
+
+/// Release timing, run on demand:
+/// `cargo test --release -p ruster-core lookup_timing -- --ignored --nocapture`
+#[test]
+#[ignore = "timing report, not a pass/fail test"]
+fn lookup_timing_at_4096_routes() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    let tables = limit_tables();
+    let owner = owner(&tables);
+    let snapshot = owner.snapshot();
+    let mut rng = Rng(0x7177);
+    let addresses: Vec<Ipv4Address> = (0..4096)
+        .map(|_| ip(0x0a00_0000 | (rng.address() & 0x00ff_ffff)))
+        .collect();
+    let rounds = 200;
+    let started = Instant::now();
+    for _ in 0..rounds {
+        for address in &addresses {
+            black_box(linear::route(&tables.routes, black_box(*address)));
+        }
+    }
+    let linear_ns = started.elapsed().as_nanos() as f64 / f64::from(rounds * 4096);
+    let rounds = 20_000;
+    let started = Instant::now();
+    for _ in 0..rounds {
+        for address in &addresses {
+            black_box(snapshot.route_lookup(black_box(*address)));
+        }
+    }
+    let indexed_ns = started.elapsed().as_nanos() as f64 / f64::from(rounds * 4096);
+    let started = Instant::now();
+    for _ in 0..rounds {
+        for address in &addresses {
+            black_box(snapshot.static_neighbor(IfId(7), black_box(*address)));
+            black_box(snapshot.is_local_ipv4(black_box(*address)));
+        }
+    }
+    let exact_ns = started.elapsed().as_nanos() as f64 / f64::from(rounds * 4096);
+    println!(
+        "4096 /24 routes: linear LPM {linear_ns:.1} ns, indexed LPM {indexed_ns:.1} ns, \
+         static neighbor + local address {exact_ns:.1} ns, index {} bytes",
+        owner.index_heap_bytes()
+    );
+}
+
+/// Duplicate ids, addresses, and neighbor keys never pass validation, but
+/// the exact-key indexes still return the first in slice order, like the
+/// reference `find`.
+#[test]
+fn unvalidated_duplicate_keys_resolve_to_the_first_like_find() {
+    let interfaces = [
+        Interface {
+            id: IfId(4),
+            mac: MacAddress([2, 0, 0, 0, 0, 1]),
+        },
+        Interface {
+            id: IfId(4),
+            mac: MacAddress([2, 0, 0, 0, 0, 2]),
+        },
+    ];
+    let local_ipv4 = [
+        LocalIpv4Binding {
+            interface: IfId(4),
+            address: ip(0x0a00_0001),
+        },
+        LocalIpv4Binding {
+            interface: IfId(4),
+            address: ip(0x0a00_0001),
+        },
+    ];
+    let neighbors = [
+        Neighbor {
+            interface: IfId(4),
+            target: ip(0x0a00_0002),
+            mac: MacAddress([2, 0, 0, 0, 0, 3]),
+        },
+        Neighbor {
+            interface: IfId(4),
+            target: ip(0x0a00_0002),
+            mac: MacAddress([2, 0, 0, 0, 0, 4]),
+        },
+    ];
+    let index = ForwardingIndex::build(&[], &interfaces, &neighbors, &local_ipv4);
+    assert_eq!(index.interface(IfId(4)).0, Some(0));
+    assert_eq!(index.local_by_interface(IfId(4)).0, Some(0));
+    assert_eq!(index.local_by_address(ip(0x0a00_0001)).0, Some(0));
+    assert_eq!(index.static_neighbor(IfId(4), ip(0x0a00_0002)).0, Some(0));
+}
+
+/// The largest index the config limits allow: 4096 non-adjacent direct
+/// routes (every route adds two LPM intervals, two connected boundaries,
+/// and its own on-link range), 4096 static neighbors, and 256 interfaces
+/// with one address each. About 262 KiB (snapshot memory; two owners
+/// coexist during a reload, about 524 KiB).
+#[test]
+fn index_heap_at_the_worst_config_shape_is_about_262_kib() {
+    let interfaces: Vec<Interface> = (0..256u16)
+        .map(|id| Interface {
+            id: IfId(id),
+            mac: MacAddress([2, 0, 0, 0, (id >> 8) as u8, id as u8]),
+        })
+        .collect();
+    // /24s spaced one /24 apart: no two ranges touch, nothing merges.
+    let routes: Vec<Route> = (0..4096u32)
+        .map(|index| {
+            Route::new(
+                ip(0x0a00_0000 | (index << 9)),
+                24,
+                IfId((index % 256) as u16),
+                None,
+            )
+            .unwrap()
+        })
+        .collect();
+    let neighbors: Vec<Neighbor> = (0..4096u32)
+        .map(|index| Neighbor {
+            interface: IfId((index % 256) as u16),
+            target: ip(0x0a00_0000 | (index << 9) | 2),
+            mac: MacAddress([2, 2, 0, 0, (index >> 8) as u8, index as u8]),
+        })
+        .collect();
+    let local_ipv4: Vec<LocalIpv4Binding> = (0..256u32)
+        .map(|index| LocalIpv4Binding {
+            interface: IfId(index as u16),
+            address: ip(0x0a00_0000 | (index << 9) | 1),
+        })
+        .collect();
+    let index = ForwardingIndex::build(&routes, &interfaces, &neighbors, &local_ipv4);
+    let bytes = index.heap_bytes();
+    // 8193 LPM intervals x 8 + 8192 boundaries x 8 + 4096 on-link ranges
+    // x 16 + 4096 neighbors x 16 + 256 interfaces x 8 + 2 x 256 locals x 8.
+    assert_eq!(
+        bytes,
+        8193 * 8 + 8192 * 8 + 4096 * 16 + 4096 * 16 + 256 * 8 + 2 * 256 * 8
+    );
+    assert!(bytes <= 300 * 1024, "{bytes}");
+}

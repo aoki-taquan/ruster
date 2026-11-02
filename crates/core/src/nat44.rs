@@ -14,7 +14,6 @@ use crate::{
         PortOwnerTable, PortOwnerToken, PreparedDirectoryLink, PreparedDirectoryRelink,
         PreparedPortOwnerMoveTopology,
     },
-    route,
     slot_list::{Linked, SlotLinks, SlotList, LINK_NONE},
     DirectoryBucket, DirectoryNode, ForwardingSnapshot, IfId, Ipv4Address, OccupancyCounter,
     PortOwnerSlot, TableOccupancy,
@@ -3012,28 +3011,16 @@ impl Nat44UdpConfig {
         if inside == outside {
             return Err(Nat44UdpConfigError::InterfacesEqual);
         }
-        if !snapshot
-            .interfaces
-            .iter()
-            .any(|interface| interface.id == inside)
-        {
+        if snapshot.interface(inside).is_none() {
             return Err(Nat44UdpConfigError::InsideInterfaceMissing);
         }
-        if !snapshot
-            .interfaces
-            .iter()
-            .any(|interface| interface.id == outside)
-        {
+        if snapshot.interface(outside).is_none() {
             return Err(Nat44UdpConfigError::OutsideInterfaceMissing);
         }
         if !address_is_host_unicast(snapshot, public_address) {
             return Err(Nat44UdpConfigError::PublicAddressNotHostUnicast);
         }
-        let Some(binding) = snapshot
-            .local_ipv4
-            .iter()
-            .find(|binding| binding.address == public_address)
-        else {
+        let Some(binding) = snapshot.local_binding_for(public_address) else {
             return Err(Nat44UdpConfigError::PublicBindingMissing);
         };
         if binding.interface != outside {
@@ -5712,7 +5699,7 @@ fn address_is_host_unicast(snapshot: &ForwardingSnapshot<'_>, address: Ipv4Addre
     if octets[0] == 0 || octets[0] == 127 || octets[0] >= 224 || octets == [255; 4] {
         return false;
     }
-    !route::lookup(snapshot.routes, address).is_some_and(|selected| {
+    !snapshot.route_lookup(address).is_some_and(|selected| {
         selected.is_prefix_network_address(address)
             || selected.is_prefix_directed_broadcast(address)
     })
@@ -5986,28 +5973,16 @@ impl Nat44TcpConfig {
         if inside == outside {
             return Err(Nat44TcpConfigError::InterfacesEqual);
         }
-        if !snapshot
-            .interfaces
-            .iter()
-            .any(|interface| interface.id == inside)
-        {
+        if snapshot.interface(inside).is_none() {
             return Err(Nat44TcpConfigError::InsideInterfaceMissing);
         }
-        if !snapshot
-            .interfaces
-            .iter()
-            .any(|interface| interface.id == outside)
-        {
+        if snapshot.interface(outside).is_none() {
             return Err(Nat44TcpConfigError::OutsideInterfaceMissing);
         }
         if !address_is_host_unicast(snapshot, public_address) {
             return Err(Nat44TcpConfigError::PublicAddressNotHostUnicast);
         }
-        let Some(binding) = snapshot
-            .local_ipv4
-            .iter()
-            .find(|binding| binding.address == public_address)
-        else {
+        let Some(binding) = snapshot.local_binding_for(public_address) else {
             return Err(Nat44TcpConfigError::PublicBindingMissing);
         };
         if binding.interface != outside {
