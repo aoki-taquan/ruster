@@ -798,6 +798,15 @@ fn link_flap_recovers_without_new_traffic() {
     assert!(stats.link_down && stats.kick_owed, "{stats:?}");
     assert_eq!(stats.counters.tx_inflight, 2);
     assert!(stats.counters.kicks_link_down >= 2);
+    // Invariant: while the link is down every failed TX kick is an
+    // ENETDOWN one, counted both by the engine (`kick_errors`, every
+    // failed kick) and by the adapter (`kicks_link_down`). The `ruster run`
+    // health watch relies on this: it times `kick_errors - kicks_link_down`
+    // as KICK_ERRORS (cli `run::linux::watched_kick_errors`, CLI-052A).
+    assert_eq!(
+        stats.counters.kick_errors, stats.counters.kicks_link_down,
+        "{stats:?}"
+    );
     assert_eq!(io.backend_stats().link_down_ports, 1);
     assert!(matches!(
         io.try_publication_quiescence(),
