@@ -91,9 +91,13 @@ for pair in "$fwd_a $fwd_a_peer" "$fwd_b $fwd_b_peer"; do
     sudo -n ip -n "$netns" link set "$1" up
     sudo -n ip -n "$netns" link set "$2" up
 done
-# The kernel must not route between the router ports itself.
+# The kernel must not route between the router ports itself: AF_PACKET
+# only copies frames, the kernel stack still sees them. A new namespace may
+# inherit forwarding from the initial one (devconf_inherit_init_net, e.g. on
+# hosts running Docker), so switch it off here (namespace-scoped) and check.
+in_netns sysctl -q -w net.ipv4.ip_forward=0
 test "$(in_netns sysctl -n net.ipv4.ip_forward)" = 0 || {
-    echo "priv-afpacket-smoke: IPv4 forwarding is on in the fresh namespace" >&2
+    echo "priv-afpacket-smoke: cannot turn IPv4 forwarding off in the namespace" >&2
     exit 1
 }
 
