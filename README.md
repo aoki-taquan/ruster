@@ -647,7 +647,7 @@ sudo target/release/ruster run -- router.toml                      # 既定のdr
 # stderr: ruster run: privileges dropped: threads=3 capabilities=none bounding-set=cleared no-new-privs=1 identity=unchanged
 sudo target/release/ruster run --user 990 --group 990 -- router.toml # 起動後にuid/gid 990へ切替
 # stderr: ruster run: privileges dropped: threads=3 capabilities=none bounding-set=cleared no-new-privs=1 identity=switched
-# stderr: ruster run: seccomp filter installed: mode=kill threads=5 syscalls=40 arch=x86_64
+# stderr: ruster run: seccomp filter installed: mode=kill threads=5 syscalls=43 arch=x86_64
 sudo target/release/ruster run --seccomp log -- router.toml       # allowlist外のsyscallをkernelがlogして許可（診断用）
 # stderr: ruster run: running generation 1 on 2 port(s); send SIGINT or SIGTERM to stop, SIGHUP to reload
 sudo kill -HUP <pid>                                               # configをreload
@@ -685,7 +685,7 @@ sudo kill -HUP <pid>                                               # configをre
   そのとき`no_new_privs`もここで立てる）。手で組んだclassic BPFで、archが`AUDIT_ARCH_X86_64`でないか
   x32 bitがあれば常にkill、allowlist（AF_XDPの`sendto`/`poll`/`getsockopt`、sleep/futex、read/write、
   read-onlyの`openat`、netlinkの`socket`/`setsockopt`/`connect`/`recvfrom`、teardownの
-  `bpf(BPF_MAP_DELETE_ELEM)`、allocation、exit等の40個。codeの読解とprivileged smoke全体の
+  `bpf(BPF_MAP_DELETE_ELEM)`、allocation、exit等の43個。codeの読解とprivileged smoke全体の
   `strace -f`から導出）だけを通します。引数filter: `socket`は`AF_NETLINK`/`NETLINK_ROUTE`だけ、
   `bpf`はmap entry削除だけ、`mmap`/`mprotect`は`PROT_EXEC`なし、`openat`は書き込み・作成・切り詰め
   なし、`setsockopt`/`fcntl`/`tgkill`も限定。それ以外は`--seccomp kill`（既定:

@@ -3092,7 +3092,7 @@ threadはactivate後で最後に自分を落とし、
 dropの直後（`--keep-privileges`でも）、router threadは`run::seccomp`のclassic BPF allowlistを
 `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC)`一回で全threadへ付けます（H8、
 CLI-102〜109）。programは手で組み（外部依存なし、`run::seccomp::program`）、archが
-`AUDIT_ARCH_X86_64`でないかx32 bitの番号は常に`SECCOMP_RET_KILL_PROCESS`、allowlistの40 syscall
+`AUDIT_ARCH_X86_64`でないかx32 bitの番号は常に`SECCOMP_RET_KILL_PROCESS`、allowlistの43 syscall
 （一部はint引数の下位32 bitに条件: `socket`は`AF_NETLINK`/`NETLINK_ROUTE`、`bpf`は
 `BPF_MAP_DELETE_ELEM`、`mmap`/`mprotect`は`PROT_EXEC`なし、`openat`は書き込み・作成・切り詰め
 なし、`setsockopt`、`fcntl`、`tgkill`）は許可、それ以外は`--seccomp kill`（既定）なら

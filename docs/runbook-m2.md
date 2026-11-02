@@ -682,15 +682,15 @@ attached to the running router; the Rust test
 | `sendto` (44) | — | router: AF_XDP TX kick; link watcher: netlink requests (`send`) |
 | `poll` (7) | — | router: Fill-ring wakeup of the need-wakeup profile |
 | `getsockopt` (55) | — | router: `XDP_STATISTICS` per stats sample |
-| `clock_nanosleep` (230), `restart_syscall` (219) | — | idle backoff and every `thread::sleep`; resuming one a signal interrupted |
+| `clock_nanosleep` (230), `nanosleep` (35), `restart_syscall` (219) | — | idle backoff and every `thread::sleep` (`nanosleep` where the C library's sleep uses it: older glibc, musl); resuming one a signal interrupted |
 | `clock_gettime` (228) | — | the monotonic clock (normally a vDSO call; this syscall without a vDSO) |
-| `futex` (202) | — | channels between the threads |
+| `futex` (202), `sched_yield` (24) | — | channels between the threads; std's channels back off with `yield_now` in disconnect and preemption races (dropping the worker and output channels) |
 | `write` (1) | — | output threads (stdout, stderr), a panic message |
 | `read` (0) | — | config, sysctls, `/proc`, `/dev/urandom` keys of a reload |
 | `recvfrom` (45), `getsockname` (51) | — | link watcher: netlink answers and the socket's port id |
 | `openat` (257) | flags without `O_WRONLY`, `O_RDWR`, `O_CREAT`, `O_TRUNC` | read-only opens: config, sysctls, `/proc` (no file is ever created, truncated, or opened for writing) |
 | `close` (3) | — | every fd closed: files, replaced netlink sockets, teardown |
-| `statx` (332), `fstat` (5) | — | std file metadata (reload, `--strict-config-perms`); glibc `opendir` |
+| `statx` (332), `fstat` (5), `newfstatat` (262) | — | std file metadata (reload, `--strict-config-perms`); glibc `opendir` checks its fd with `fstat`, which is the `fstat` syscall before glibc 2.33 and from 2.39 on, and `newfstatat(fd, "", AT_EMPTY_PATH)` in glibc 2.33 to 2.38 (Ubuntu 22.04, Debian 12, RHEL 9); std falls back to `fstat64`/`stat64`/`lstat64` (`newfstatat`) when a supervisor refuses `statx`. Read-only metadata either way |
 | `readlink` (89) | — | `--strict-config-perms`: the path of the opened config (`/proc/self/fd/N`) |
 | `getdents64` (217) | — | listing `/proc/self/task` (the verification after the install) |
 | `fcntl` (72) | `F_GETFD` only | debug builds of std check an fd before closing it |
@@ -706,6 +706,17 @@ attached to the running router; the Rust test
 | `getpid` (39), `gettid` (186), `tgkill` (234) | `tgkill`: this process only | `abort` (a panic while panicking) raises SIGABRT at itself; a panic message names the thread id |
 | `getcwd` (79), `lseek` (8) | — | a panic backtrace under `RUST_BACKTRACE=1` shortens paths against the working directory and reads the binary's debug info |
 | `rt_sigaction` (13) | — | std's SIGSEGV/SIGBUS handler restores the default action before re-raising, so a crash keeps its own signal |
+
+What the filter does not take away: everything the allowed calls can do
+on what the process may reach. Without `--user`/`--group` the process is
+still uid 0 and its read-only `openat` reaches every root-readable file
+(keys, `/etc/shadow`); an open alone can also have a side effect on some
+devices (a `/dev/watchdog`-style device arms on open). Use `--user`/
+`--group` with a dedicated account for the full benefit. Under
+`--keep-privileges` the filter does not narrow what the kept capabilities
+allow through the calls it permits: an rtnetlink request on the link
+watcher's socket can change links, addresses and routes (`CAP_NET_ADMIN`),
+and `bpf(BPF_MAP_DELETE_ELEM)` works on every map fd the process holds.
 
 Not on it (a selection): `open`, `ioctl`, `execve`, `clone`/`clone3`/
 `fork`, `kill`, `ptrace`, `prctl`, `setuid` and the other credential calls,
@@ -1291,12 +1302,21 @@ which removes this remaining oracle.
   64 ms (plus up to one 1 ms idle pause) after the link returns; the run loop's link watch (1 s) does not
   shortcut the retry.
 - Syscall filter limits (CLI-102 to CLI-109): x86_64 only (the platform of
-  `ruster run`); the allowlist is derived for the glibc build. A musl build
-  (compile-only in CI) is not verified at run time: musl's `open` and
-  `fstatat` use other syscalls (`open`, `newfstatat`), so run a musl build
-  with `--seccomp log` first. A future change that makes a new syscall
-  after startup (a new thread, a new file or socket) must extend the
-  allowlist, or the default kills the router. Argument filters cover the
+  `ruster run`). The allowlist is for glibc builds only. It covers glibc
+  2.31 and newer as far as the calls were checked: verified at run time on
+  the development host and the CI runner (glibc 2.39), and by reading the
+  glibc wrappers that changed in that range (`fstat` through `newfstatat`
+  in 2.33 to 2.38, `nanosleep` before `clock_nanosleep`). A musl build
+  (compile-only in CI) is not verified at run time and needs more (musl's
+  `open` uses the `open` syscall, for one; `nanosleep` and `newfstatat` are
+  already covered), so run a musl build with `--seccomp log` first. A
+  future change that makes a new syscall after startup (a new thread, a
+  new file or socket) must extend the allowlist, or the default kills the
+  router. Known calls that are denied and not reachable after startup
+  today: `fs::canonicalize` (`realpath`), glibc malloc's
+  `sched_getaffinity` (glibc sizes its arena limit once, when the first
+  extra arena is made; every thread has allocated before the install), `writev` (no vectored write is
+  used), `clone`/`clone3` (no thread after startup). Argument filters cover the
   calls listed in section 5; `write`, `read`, `sendto`, `connect` and the
   others work on any fd the process holds.
 - Verified kernels: the development host and the CI runner only

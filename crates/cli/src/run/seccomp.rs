@@ -25,8 +25,10 @@
 //! One `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC)` call
 //! on the router thread, after the privilege drop: TSYNC attaches the same
 //! filter to every thread of the process atomically (the four other
-//! threads exist by then: the two output threads and the two workers, and
-//! no thread is started later), or to none when any thread has a filter
+//! threads exist by then: the two output threads and the two workers,
+//! each fully started, since its spawn waited for its prologue's outcome,
+//! so the C library's thread start (`rseq`, `set_robust_list`) is behind
+//! it; no thread is started later), or to none when any thread has a filter
 //! that is not an ancestor of the caller's (the kernel then returns that
 //! thread's id: `TSYNC_CONFLICT`). One call instead of a filter per
 //! thread prologue because the threads that drop their privileges early
@@ -206,14 +208,19 @@ pub const ALLOWLIST: &[Rule] = &[
     // Router: `XDP_STATISTICS` of every stats sample.
     allow("getsockopt", 55),
     // Router idle backoff and every `thread::sleep` (std), and the restart
-    // of an interrupted one after a signal.
+    // of an interrupted one after a signal; `nanosleep` where the C
+    // library's sleep uses it (older glibc, musl).
     allow("clock_nanosleep", 230),
     allow("restart_syscall", 219),
+    allow("nanosleep", 35),
     // The monotonic clock is a vDSO call; without a vDSO (`vdso=0`) it is
     // this syscall.
     allow("clock_gettime", 228),
-    // Channels and locks between the threads (std).
+    // Channels and locks between the threads (std); std's channels back
+    // off with `thread::yield_now` in disconnect and preemption races
+    // (dropping the worker and output channels).
     allow("futex", 202),
+    allow("sched_yield", 24),
     // Output threads: stdout/stderr; config and sysctl reads; the
     // `/dev/urandom` key reads of a reload; `/proc` reads.
     allow("write", 1),
@@ -238,9 +245,15 @@ pub const ALLOWLIST: &[Rule] = &[
     // `read_link("/proc/self/fd/N")` of `--strict-config-perms`.
     allow("readlink", 89),
     // `read_dir` of `/proc/self/task` (the verification right after the
-    // install): glibc's `opendir` checks the fd with `fstat`.
+    // install): glibc's `opendir` checks the fd with `fstat`, which is
+    // the `fstat` syscall on glibc 2.39 and newer (and before 2.33) but
+    // `newfstatat(fd, "", AT_EMPTY_PATH)` on glibc 2.33 to 2.38 (Ubuntu
+    // 22.04, Debian 12, RHEL 9). std's `stat64`/`lstat64`/`fstat64`
+    // fallbacks (when a supervisor refuses `statx`) end there too. Both
+    // are read-only metadata, the same capability as `statx`.
     allow("getdents64", 217),
     allow("fstat", 5),
+    allow("newfstatat", 262),
     // Debug builds of std check an fd before closing it.
     only("fcntl", 72, &[equal(1, F_GETFD)]),
     // Allocation (glibc malloc and its arenas): never executable memory.
@@ -338,7 +351,10 @@ pub const fn violation(mode: SeccompMode) -> Option<u32> {
 }
 
 /// Assembles the filter of `rules` with `action` for a syscall outside
-/// them, for process `pid`:
+/// them, for process `pid`. Specific to little-endian x86_64: the
+/// argument loads read the low 32 bits at the lower address of each
+/// 64-bit `args[i]`, and the numbers and `AUDIT_ARCH_X86_64` are x86_64's.
+///
 ///
 /// ```text
 ///      ld  [arch]
@@ -722,7 +738,11 @@ pub mod linux {
             }
         }
 
-        /// `SECCOMP_GET_ACTION_AVAIL`: whether the kernel knows `action`.
+        /// `SECCOMP_GET_ACTION_AVAIL`: whether the kernel knows `action`
+        /// (the mode's violation action only: `SECCOMP_RET_ALLOW` is
+        /// always known, and `SECCOMP_RET_KILL_PROCESS` of the arch and
+        /// x32 checks dates from the same kernel, 4.14, as
+        /// `SECCOMP_RET_LOG`).
         pub fn action_available(action: u32) -> Result<(), i32> {
             // SAFETY: `action` is a live, initialized `u32` that the kernel
             // only reads (four bytes) during the call; flags are 0.

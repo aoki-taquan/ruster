@@ -245,7 +245,6 @@ fn only_the_allowlist_runs_and_everything_else_gets_the_violation_action() {
         ("setns", 308),
         ("pwrite64", 18),
         ("writev", 20),
-        ("newfstatat", 262),
     ] {
         assert!(!filter.allows(nr, [0; 6]), "{name} allowed");
         assert!(!ALLOWLIST.iter().any(|rule| rule.name == name), "{name}");
@@ -592,12 +591,36 @@ mod live {
         } else {
             SeccompMode::Kill
         };
+        // A thread that exists before the install and exits and is joined
+        // under the filter (no thread can be started under it).
+        // It must have started running first: glibc registers `rseq` at
+        // the start of a new thread, which the filter denies (`ruster
+        // run`'s threads have all reported their prologue by then).
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let (started, running) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::spawn(move || {
+            let _ = started.send(());
+            let _ = wait.recv();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::yield_now();
+            7_u32
+        });
+        running.recv().expect("worker started");
         let report = confine(mode).expect("confine");
         assert!(report.threads >= 1);
         assert_eq!(report.syscalls, allowed_syscalls());
         exercise_allowed();
+        let _ = go.send(());
+        assert_eq!(worker.join().expect("worker"), 7);
         mark(ALLOWED);
         match scenario.as_str() {
+            // A normal end: the test returns, the harness reports and the
+            // process exits through `main`.
+            "kill-exit" => {}
+            "kill-process-exit" => {
+                mark(SURVIVED);
+                std::process::exit(0);
+            }
             "kill-socket" | "log-socket" => {
                 drop(std::net::UdpSocket::bind("127.0.0.1:0"));
             }
@@ -643,6 +666,24 @@ mod live {
             );
             assert!(stdout.contains(ALLOWED), "{scenario}: {stdout}\n{stderr}");
             assert!(!stdout.contains(SURVIVED), "{scenario}: {stdout}");
+        }
+    }
+
+    #[test]
+    fn a_thread_exit_and_both_process_exits_pass_the_kill_filter() {
+        for scenario in ["kill-exit", "kill-process-exit"] {
+            let output = run_child(scenario);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{scenario}: {:?}\n{stdout}\n{stderr}",
+                output.status
+            );
+            assert!(
+                stdout.contains(ALLOWED) && stdout.contains(SURVIVED),
+                "{scenario}: {stdout}"
+            );
         }
     }
 
