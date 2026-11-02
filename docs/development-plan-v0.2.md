@@ -465,7 +465,18 @@ M2に関するownerの発言は次だけである（2026-10-31〜11-01、session
   再検討する。coordinatorの将来設計の希望（queueごとのexternal port range + NIC ntuple steering +
   symmetric RSS）は決定ではない。
 
-owner決定待ち（open）: なし（2a、2e、X05 lab、B3は上の2026-11-02の決定）。
+- CLI-079とARP-031（#307 review（H2）とH4c（#311）で残った二つのopen question）: 「1.は拒否、 2, rfc準きょで」（原文のまま）。
+  - 1（IPv4 weak host、CLI-079）: address無しportの実効`rp_filter` 0を`ruster run`の起動拒否にする
+    （decided）。H5で実装: `KERNEL_IPV4_WEAK_HOST`（読めなければ`UNVERIFIABLE probe=rp-filter`）、
+    overrideの`--allow-ipv4-weak-host`で従来のwarning `IPV4_WEAK_HOST_EXPOSURE`、run中は他の
+    kernel exposureと同じくcounted warningのまま（fatal exitはdetachしてbypassを作るため。CLI-088）。
+  - 2（ARP-031 on-link sender rule）: 「rfc準きょで」。coordinatorはこれを、ownerの方針「RFC挙動を
+    既定にし、security hardeningは設定可能（opt-in）にする」に沿って「既定はRFC 826（senderに
+    on-link条件なし、#311前の挙動）、ARP-031は`[arp] require-on-link-sender = true`のopt-in」と
+    解釈した（この読み方はcoordinatorの解釈でowner決定の文言ではない）。H5で実装（ARP-031、ARP-032）。
+    optionはforwarding snapshotのpolicyでreloadable。
+
+owner決定待ち（open）: なし（2a、2e、X05 lab、B3、CLI-079、ARP-031は上の2026-11-02の決定）。
 
 coordinating agentの既定値（owner決定ではない）:
 
@@ -499,7 +510,7 @@ M2a（coordinatorのscoping提案）: `ruster run`の下で動くcopy-mode AF_XD
 hardware）がpartially met、8（X05 artifact）がnot met。5と9はM2a close時にpartially metで、#305の
 veth gap fill（router生成ICMPv4、TX ring full、`validate`/`plan`、`observer.state`のE2E。CI-005〜007）で
 metにした。同PRでlink down中のTX保持が`KICK_ERRORS`でfatalになるbugを直した（CLI-052A）。M2b（multi-queue S12、zero-copy、X05 lab evidence）はowner決定（2026-11-02）でdeferredである: 2a「C」（当面portごとに1 queue、X05のNIC選定と合わせて再検討）、X05 labは当面不要で運用はveth（実NIC forwarding、実driverのnative mode、zero-copyが未検証のriskはownerが受け入れた）。B3/NAT44-038は「A」で、CLI-034 hardeningの後（順序はcoordinator既定）に実装する。いまはownerの「運用の残りを固める」に従いCLI-034の残りをhardening sliceで
-進める（H1: link down中のTX kick retryを1 msから64 msまで倍増するbackoffでrate limit）。M2全体のcloseはM2bの後である。
+進める（H1: link down中のTX kick retryを1 msから64 msまで倍増するbackoffでrate limit）。H5は同日のowner決定「1.は拒否、 2, rfc準きょで」を実装する（IPv4 weak hostの起動拒否と`--allow-ipv4-weak-host`、ARP-031のopt-in化）。M2全体のcloseはM2bの後である。
 
 ### M3: Household/scaled router
 

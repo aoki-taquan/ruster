@@ -424,16 +424,23 @@ MAC/refresh時刻やpending resolutionを変更しません。
 - local SPA claimの保護はlink scopedで、`(ingress IfId, SPA)`がlocal bindingと一致する場合
   だけ学習しない。同じIPv4値が別interfaceのlocal bindingでも、ingress上では通常peerとして
   学習できる。
-- SPAはingressのon-linkでなければならない（ARP-031、H4c）: ingressから出るdirect route
-  （next hopなし）のどれかに含まれるか、ingressから出るrouteのgateway next hopであること。
-  この集合はrouterがそのinterface上で自分でARP解決し得るtargetをすべて含み、それ以外の
-  SPAを学習してもforwardingが使うことはありません。条件を満たさないRequest、Reply、
-  Announcementはstatic neighbor、local SPA、上記のnon-host SPA（probeの`0.0.0.0`を含む）の
-  後で判定し、cache、pending、clock watermarkを変えず、replyも返さず
-  `ARP_SENDER_NOT_ON_LINK`（code 154）でbyte不変dropする。RFC 826はmergeとreplyに
-  sender addressの条件を課しませんが、off-linkのsenderへはこのlinkで返す経路が無く、
-  学習はcacheを埋めるだけなので、fail closedのlocal policyとして拒否します（Linuxの
-  strict `rp_filter`下のARP処理と同じ結果）。
+- SPAのon-link条件（ARP-031）はopt-inです（`[arp] require-on-link-sender`、既定`false`）。
+  既定はRFC 826どおりで、mergeとreplyはsender addressに条件を課さず、off-linkのsenderも
+  routerがtargetなら学習してreplyし、既知なら更新する（ARP-032）。H4c（#311）では無条件の
+  dropでしたが、owner決定2026-11-02「rfc準きょで」（RFC挙動が既定、security hardeningは
+  opt-in、という読み方はcoordinatorの解釈）でH5からopt-inにしました。有効時は、ingressから
+  出るdirect route（next hopなし）のどれかに含まれるか、ingressから出るrouteのgateway next hop
+  であることを要求します。この集合はrouterがそのinterface上で自分でARP解決し得るtargetを
+  すべて含み、それ以外のSPAを学習してもforwardingが使うことはありません。条件を満たさない
+  Request、Reply、Announcementはstatic neighbor、local SPA、上記のnon-host SPA（probeの
+  `0.0.0.0`を含む）の後で判定し、cache、pending、clock watermarkを変えず、replyも返さず
+  `ARP_SENDER_NOT_ON_LINK`（code 154）でbyte不変dropする（Linuxのstrict `rp_filter`下の
+  ARP処理と同じ結果）。trade-offは、off-linkのsenderへはこのlinkで返す経路が無く学習は
+  cacheを埋めるだけという利点に対し、linkを共有する別prefixのhost（secondary subnet）が
+  direct routeを足すまで解決されないことです。policyは`ArpPolicy`としてforwarding
+  snapshotが値で持ち（`ValidatedForwardingOwner::with_arp_policy`、snapshotは88 bytesのまま）、
+  packet pathではbool一つの分岐です。reloadable（`ApplyPlan::arp_policy_changed`）で、
+  reloadはARP学習を全flushします。
 - 学習成功時だけmatching active resolution/actionをcancelし、unrelated FIFOを維持する。
   commit済みRequestのflood cooldown tombstoneは残す。
 
@@ -1293,8 +1300,9 @@ indexへの参照を含むO(1) borrowのままで、packet pathのlookupはす�
   検証済みconfig由来なので、hash tableにしても攻撃者に対する利得はなく、上限を保つには
   secret keyが要ります。sorted arrayはdeterministicでworst caseが無く、publicationごとの
   keyも不要です。
-- ARP on-link判定（ARP-031）はinterfaceごとのdirect route（next hopなし）を
-  `(interface << 32 | address)`の互いに素な区間へmergeしたものとgateway集合です。
+- ARP on-link判定（ARP-031、opt-inの`[arp] require-on-link-sender`が有効なときだけ使う）は
+  interfaceごとのdirect route（next hopなし）を`(interface << 32 | address)`の互いに素な
+  区間へmergeしたものとgateway集合です。
 
 結果は線形版と同一です。線形版`max_by_key`は同じ長さの最大値のうち最後の要素を返しますが、
 snapshot検証は同じ`(prefix, length)`のrouteを拒否し、同じ長さで同じaddressにmatchする二つの
