@@ -491,8 +491,9 @@ are set at start and are not reloadable. The config file is always opened
 
 Signals: SIGINT/SIGTERM stop (a second one forces the drain to end),
 SIGHUP reloads the config, SIGUSR1 prints one stats block at once
-(`kind=on-demand`, section 11; several before it is printed make one
-block, and the periodic blocks keep their schedule). SIGHUP never ends `ruster run`, also not when
+(`kind=on-demand`, section 11; at most one per 100 ms: further SIGUSR1s
+within that make one more block when it has passed, and the periodic
+blocks keep their schedule). SIGHUP never ends `ruster run`, also not when
 its terminal hangs up or under `nohup`.
 
 ## 4. Exit status
@@ -548,10 +549,17 @@ allowlist is unchanged). A notification never blocks the router: when the
 manager's queue is full or nobody listens it is dropped and counted
 (`notify.failed`).
 
+Use a path socket (systemd's `/run/systemd/notify` is one). An abstract
+`@name` socket is scoped to a network namespace: with
+`NetworkNamespacePath=` (or under `ip netns exec`) the router would look
+it up in the router's namespace, not the manager's, and every
+notification would fail (`notify.failed`), so `Type=notify` would time
+out.
+
 | when | message |
 |---|---|
 | ready (the stderr line `running generation 1 on N port(s)`, after the privilege drop and the syscall filter) | `READY=1`, `STATUS=running generation 1` |
-| SIGHUP reload starts | `RELOADING=1`, `MONOTONIC_USEC=<CLOCK_MONOTONIC in µs>`, `STATUS=reloading (generation N)` |
+| SIGHUP reload starts | `RELOADING=1`, `MONOTONIC_USEC=<CLOCK_MONOTONIC in µs>` (omitted if the clock cannot be read), `STATUS=reloading (generation N)` |
 | the reload ended (applied, refused, failed, or abandoned) | `READY=1`, `STATUS=running generation N` (the new one if applied) |
 | the run loop ends (signal, fatal event, backend fault), before the drain | `STOPPING=1`, `STATUS=stopping: stop requested` or `stopping: fatal health event port=if<id> code=<CODE>` |
 | `WATCHDOG_USEC` set, and `WATCHDOG_PID` unset or this process | `WATCHDOG=1` every half of `WATCHDOG_USEC` (at least 1 ms), from the router thread between ticks |
@@ -1026,7 +1034,7 @@ outstanding:
 |---|---|
 | link down (`ip link set lan0 down`, cable out: `IFF_UP` or `IFF_LOWER_UP` clear) | warning `LINK_DOWN`, `if<id>.watch.link_down_events` +1; keeps running; owed TX is kicked again when the link returns (recovered `LINK_DOWN`, `link_up_events` +1) |
 | device removed (`ip link del`, driver unbind, moved to another namespace) | fatal `DEVICE_REMOVED` |
-| device renamed (`ip link set lan0 name x`, which the kernel allows only while it is down; H10) | fatal `DEVICE_RENAMED`: the per-port sysctls are read by name, so they would describe whatever device takes the old name. The rest of that port's round is ignored (also for `DEVICE_REMOVED`). Rename it back (or fix the config) and restart. Startup refuses a port whose interface index does not carry the configured name (`checks code=UNVERIFIABLE probe=name`) |
+| device renamed (`ip link set lan0 name x`; Linux 6.2 and newer also rename a device that is up; H10) | fatal `DEVICE_RENAMED` within one link round (about 1 s; until then the port keeps forwarding, since XDP follows the interface index, and its sysctls are read by the old name): the per-port sysctls are read by name, so they would describe whatever device takes the old name. The rest of that port's round is ignored (also for `DEVICE_REMOVED`). Rename it back (or fix the config) and restart. Startup refuses a port whose interface index does not carry the configured name (`checks code=UNVERIFIABLE probe=name`) |
 | MTU below the startup MTU | fatal `MTU_DECREASED` (TX is bounded by the startup MTU; longer frames could be stranded in the kernel) |
 | MTU above what a frame holds (`frame-size - 256 - headroom - 14`) | fatal `MTU_ABOVE_FRAME` |
 | MTU raised within that bound | warning `MTU_RAISED`, recovered when it returns; TX stays bounded by the startup MTU until a restart |
@@ -1165,7 +1173,9 @@ after SIGKILL.
 
 Every `--stats-interval` seconds stdout carries one block, SIGUSR1 adds one
 (`kind=on-demand`, at the next point between ticks: at once if the signal
-reaches the router thread, else within `--idle-wait-ms`), and the final
+reaches the router thread, else within `--idle-wait-ms`; at most one per
+100 ms, the requests in between coalesced into one block once it has
+passed, so a SIGUSR1 flood cannot keep the router formatting stats), and the final
 block is printed at shutdown. Only counters, gauges, flags, fixed labels,
 generations and interface ids appear: no key, address, MAC, device name,
 packet byte, fd or pointer.
@@ -1390,7 +1400,8 @@ SYNs nobody completes, such as a scan or a spoofed SYN flood.
   in whatever table it is, used by a rule or not.
 - The sysctl paths name the port device. A port renamed while the router
   runs ends the run within one link round (`DEVICE_RENAMED`, section 8,
-  H10); a rename that lands between a round's link query and its sysctl
+  H10; Linux 6.2 and newer rename an up device too, so up to about 1 s of
+  forwarding and of sysctl reads through the old name can happen first); a rename that lands between a round's link query and its sysctl
   reads is caught one round (1 s) later, and the reads in between can only
   warn or recover. Do not rename ports while the router runs.
 - IPv4 weak host: refused at startup (`KERNEL_IPV4_WEAK_HOST`) unless

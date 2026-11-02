@@ -1321,8 +1321,8 @@ fn the_preparer_plans_against_the_applied_document() {
 }
 
 /// H10: with `NOTIFY_SOCKET`, readiness, each reload (applied or refused),
-/// the watchdog, and the stop are notified in order; SIGUSR1 prints one
-/// `kind=on-demand` block per request without moving the periodic ones.
+/// the watchdog, and the stop are notified in order; SIGUSR1 prints an
+/// on-demand block without moving the periodic ones (none here).
 #[test]
 fn systemd_is_notified_of_readiness_reloads_watchdog_and_stop() {
     let listener = crate::run::notify::tests::Listener::bind();
@@ -1330,7 +1330,7 @@ fn systemd_is_notified_of_readiness_reloads_watchdog_and_stop() {
     let host = FakeHost::default();
     let frames = edited(|text| text.replacen("frame-count = 256", "frame-count = 512", 1));
     let source = FakeSource::with([Ok(echo_off()), Ok(frames)]);
-    let stop = StopAfterTicks::new(&host, 60, &[10, 30]).with_stats(&[20, 40]);
+    let stop = StopAfterTicks::new(&host, 60, &[10, 30]).with_stats(&[20]);
     let outcome = ops(&host, source, &stop);
     assert_eq!(outcome.status, 0, "{}", outcome.err);
     let messages = listener.messages();
@@ -1381,7 +1381,7 @@ fn systemd_is_notified_of_readiness_reloads_watchdog_and_stop() {
     let out = &outcome.out;
     assert_eq!(
         out.matches("ruster-run-stats kind=on-demand").count(),
-        2,
+        1,
         "{out}"
     );
     assert_eq!(
@@ -1425,4 +1425,43 @@ fn a_fatal_event_is_notified_as_stopping() {
             "STOPPING=1\nSTATUS=stopping: fatal health event port=if2 code=DEVICE_RENAMED\n",
         ]
     );
+}
+
+/// H10 (#322 review L3): SIGUSR1 prints at most one block per 100 ms;
+/// requests in between coalesce into one block once it passed.
+#[test]
+fn on_demand_stats_are_rate_limited_and_coalesced() {
+    use crate::run::engine::{OnDemandStats, ON_DEMAND_STATS_MIN_MS};
+
+    let at = MonotonicMillis;
+    let mut stats = OnDemandStats::default();
+    assert!(!stats.due(at(0), false));
+    assert_eq!(stats.next_due(), None);
+    assert!(stats.due(at(5), true), "the first at once");
+    assert!(!stats.due(at(6), true));
+    assert!(!stats.due(at(50), true));
+    assert_eq!(stats.next_due(), Some(at(5 + ON_DEMAND_STATS_MIN_MS)));
+    assert!(!stats.due(at(104), false));
+    assert!(stats.due(at(105), false), "the pending ones as one block");
+    assert!(!stats.due(at(300), false), "nothing left pending");
+    assert_eq!(stats.next_due(), None);
+    assert!(stats.due(at(300), true), "100 ms after the last: at once");
+}
+
+/// The same through the run loop: three SIGUSR1s on consecutive ticks
+/// make two blocks at least 100 ms apart.
+#[test]
+fn a_sigusr1_burst_prints_two_blocks_100_ms_apart() {
+    let host = FakeHost::default();
+    let stop = StopAfterTicks::new(&host, 400, &[]).with_stats(&[5, 6, 7]);
+    let outcome = ops(&host, FakeSource::default(), &stop);
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    let uptimes: Vec<u64> = outcome
+        .out
+        .lines()
+        .filter_map(|line| line.strip_prefix("ruster-run-stats kind=on-demand uptime-ms="))
+        .map(|ms| ms.parse().expect("uptime"))
+        .collect();
+    assert_eq!(uptimes.len(), 2, "{}", outcome.out);
+    assert!(uptimes[1] - uptimes[0] >= 100, "{uptimes:?}");
 }

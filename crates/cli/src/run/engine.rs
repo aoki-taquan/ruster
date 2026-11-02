@@ -93,6 +93,10 @@ use super::stats::BlockKind;
 use super::watch::{Fatal, Forwarding, Ipv6Sample, LinkTarget, PortSample, Watch, WatchEvent};
 use super::workers::LinkWatcher;
 
+/// Shortest time between two on-demand stats blocks (SIGUSR1, H10):
+/// requests within it coalesce into one block printed once it passed, so
+/// a SIGUSR1 flood cannot keep the router thread formatting stats.
+pub const ON_DEMAND_STATS_MIN_MS: u64 = 100;
 /// Idle ticks before the loop starts to wait.
 pub const SPIN_TICKS: u32 = 64;
 /// Pause of a tick held back by a pending reload's quiescence.
@@ -517,6 +521,42 @@ impl BackendWatch {
     }
 }
 
+/// The SIGUSR1 rate limit: at most one on-demand block per
+/// [`ON_DEMAND_STATS_MIN_MS`]; a request within it stays pending (any
+/// number of them make one block) until the interval passed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OnDemandStats {
+    pending: bool,
+    last: Option<MonotonicMillis>,
+}
+
+impl OnDemandStats {
+    /// Records whether a request was `taken` at `now`; returns whether a
+    /// block is printed now.
+    pub fn due(&mut self, now: MonotonicMillis, taken: bool) -> bool {
+        self.pending |= taken;
+        let ready = self
+            .last
+            .is_none_or(|last| now.0.saturating_sub(last.0) >= ON_DEMAND_STATS_MIN_MS);
+        if self.pending && ready {
+            self.pending = false;
+            self.last = Some(now);
+            return true;
+        }
+        false
+    }
+
+    /// When a pending request may print (the idle wait ends by then).
+    pub fn next_due(&self) -> Option<MonotonicMillis> {
+        self.pending.then(|| {
+            MonotonicMillis(
+                self.last
+                    .map_or(0, |last| last.0.saturating_add(ON_DEMAND_STATS_MIN_MS)),
+            )
+        })
+    }
+}
+
 /// Why the run loop returned.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoopEnd {
@@ -605,6 +645,7 @@ where
     let mut backoff = IdleBackoff::default();
     let mut wedge = BackendWatch::default();
     let mut last_stats = clock.now();
+    let mut on_demand_stats = OnDemandStats::default();
     let mut budgets = control.reloader.budgets();
     loop {
         if stop.stop() {
@@ -763,7 +804,7 @@ where
         control.notify.watchdog(now);
         let periodic = settings.stats_interval_ms != 0
             && now.0.saturating_sub(last_stats.0) >= settings.stats_interval_ms;
-        let on_demand = stop.take_stats();
+        let on_demand = on_demand_stats.due(now, stop.take_stats());
         if periodic || on_demand {
             let status = RunStatus {
                 reload: control.reloader.counters(),
@@ -812,10 +853,15 @@ where
                 let watch_due = control
                     .watch
                     .next_due(settings.health_interval_ms, settings.link_interval_ms);
-                let deadline = [stats_due, watch_due, control.notify.watchdog_due()]
-                    .into_iter()
-                    .flatten()
-                    .min();
+                let deadline = [
+                    stats_due,
+                    watch_due,
+                    control.notify.watchdog_due(),
+                    on_demand_stats.next_due(),
+                ]
+                .into_iter()
+                .flatten()
+                .min();
                 let timeout = idle_timeout_ms(now, settings.idle_wait_ms, pending, deadline);
                 // Shortened only if the pending cap, not a deadline or the
                 // configured wait, set this timeout.

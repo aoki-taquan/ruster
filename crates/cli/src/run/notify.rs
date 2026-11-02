@@ -16,7 +16,7 @@
 //! | when | message |
 //! |---|---|
 //! | generation 1 active, privileges dropped, seccomp installed (the stderr readiness line) | `READY=1`, `STATUS=running generation N` |
-//! | a SIGHUP reload starts | `RELOADING=1`, `MONOTONIC_USEC=<CLOCK_MONOTONIC>`, `STATUS=reloading (generation N)` |
+//! | a SIGHUP reload starts | `RELOADING=1`, `MONOTONIC_USEC=<CLOCK_MONOTONIC>` (omitted if the clock cannot be read), `STATUS=reloading (generation N)` |
 //! | it ends (applied, refused, failed, abandoned) | `READY=1`, `STATUS=running generation N` |
 //! | the run loop ends (signal, fatal event, backend stop) | `STOPPING=1`, `STATUS=stopping: <reason>` |
 //! | `WATCHDOG_USEC` set (and `WATCHDOG_PID` unset or this process) | `WATCHDOG=1` every half of it, from the router loop |
@@ -300,10 +300,12 @@ impl Notifier {
         self.reloading = true;
         let usec = sys::monotonic_usec();
         self.send(false, |out| {
-            write!(
-                out,
-                "RELOADING=1\nMONOTONIC_USEC={usec}\nSTATUS=reloading (generation {generation})\n"
-            )
+            out.write_all(b"RELOADING=1\n")?;
+            // Omitted rather than wrong when the clock cannot be read.
+            if let Some(usec) = usec {
+                writeln!(out, "MONOTONIC_USEC={usec}")?;
+            }
+            writeln!(out, "STATUS=reloading (generation {generation})")
         });
     }
 
@@ -377,19 +379,28 @@ fn abstract_address(_: &[u8]) -> io::Result<SocketAddr> {
 
 /// `clock_gettime(CLOCK_MONOTONIC)` for `MONOTONIC_USEC`: the clock
 /// systemd compares it with (std's `Instant` does not expose its value).
-#[cfg(target_os = "linux")]
+/// Only where `struct timespec` is two 64-bit fields: x86_64 Linux, the
+/// platform `ruster run` serves (the same gate as `live`).
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+))]
 #[allow(unsafe_code)]
 mod sys {
-    use std::os::raw::{c_int, c_long};
+    use std::os::raw::c_int;
 
     const CLOCK_MONOTONIC: c_int = 1;
 
-    /// `struct timespec` of 64-bit Linux.
+    /// `struct timespec` of x86_64 Linux (`time_t` and `long`, both
+    /// 64-bit; glibc and musl alike).
     #[repr(C)]
     struct Timespec {
         seconds: i64,
-        nanos: c_long,
+        nanos: i64,
     }
+
+    const _: () = assert!(std::mem::size_of::<Timespec>() == 16);
 
     extern "C" {
         // `int clock_gettime(clockid_t, struct timespec *)` from the C
@@ -398,30 +409,35 @@ mod sys {
         fn clock_gettime(clock: c_int, time: *mut Timespec) -> c_int;
     }
 
-    /// Microseconds of `CLOCK_MONOTONIC`; 0 if it cannot be read.
-    pub fn monotonic_usec() -> u64 {
+    /// Microseconds of `CLOCK_MONOTONIC`; `None` if it cannot be read.
+    pub fn monotonic_usec() -> Option<u64> {
         let mut time = Timespec {
             seconds: 0,
             nanos: 0,
         };
         // SAFETY: `clock_gettime` has the declared C ABI; `time` is a
-        // valid, writable, properly aligned `struct timespec` that lives
-        // across the call and is only written by it. CLOCK_MONOTONIC is
-        // always supported on Linux.
+        // valid, writable, properly aligned `struct timespec` of this
+        // target's layout (checked by the gate and the size assertion)
+        // that lives across the call and is only written by it.
         let status = unsafe { clock_gettime(CLOCK_MONOTONIC, &raw mut time) };
         if status != 0 {
-            return 0;
+            return None;
         }
-        let seconds = u64::try_from(time.seconds).unwrap_or(0);
-        let micros = u64::try_from(time.nanos / 1_000).unwrap_or(0);
-        seconds.saturating_mul(1_000_000).saturating_add(micros)
+        let seconds = u64::try_from(time.seconds).ok()?;
+        let micros = u64::try_from(time.nanos / 1_000).ok()?;
+        Some(seconds.saturating_mul(1_000_000).saturating_add(micros))
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Elsewhere no clock is read and `MONOTONIC_USEC` is omitted.
+#[cfg(not(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_pointer_width = "64"
+)))]
 mod sys {
-    pub fn monotonic_usec() -> u64 {
-        0
+    pub fn monotonic_usec() -> Option<u64> {
+        None
     }
 }
 

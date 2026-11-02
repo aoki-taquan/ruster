@@ -27,7 +27,9 @@
 //! `ruster run` alone also installs a SIGUSR1 handler ([`install_stats`],
 //! H10) that stores `true` into a fourth flag; the run loop takes it
 //! ([`take_stats_request`]) at its next cold point and prints one stats
-//! block (`kind=on-demand`). SIGUSR1s before the take coalesce into one
+//! block (`kind=on-demand`, at most one per 100 ms: the loop coalesces
+//! requests within that into one later block). SIGUSR1s before the take
+//! coalesce into one
 //! block. Installed unconditionally (also when inherited as ignored), like
 //! SIGHUP: without the handler the default action of SIGUSR1 would end the
 //! router. `run-sim` keeps the inherited SIGUSR1 disposition.

@@ -2294,8 +2294,9 @@ phase_systemd() {
     echo "priv_run_systemd: READY=1 after readiness, $((pings_b - pings_a)) watchdog pings in 2 s, RELOADING=1 with MONOTONIC_USEC and READY=1 generation 2 around a reload, a SIGUSR1 on-demand stats block, STOPPING=1 last ($lines datagrams, all counted), under --seccomp kill as the invoking user; exit 0, detached verified"
 }
 
-# rename (H10): renaming a port while the router runs (the kernel renames
-# only a down device) is fatal DEVICE_RENAMED: its sysctl paths would name
+# rename (H10): renaming a port while the router runs (taken down first,
+# which every kernel accepts; 6.2 and newer also rename an up device) is
+# fatal DEVICE_RENAMED: its sysctl paths would name
 # whatever device takes the old name. Exit 1, nothing left attached; the
 # device gets its name back for the later phases.
 phase_rename() {

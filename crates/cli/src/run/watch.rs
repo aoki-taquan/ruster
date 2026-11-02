@@ -101,12 +101,16 @@
 //! re-resolved to the new name: the config names the device, so a run that
 //! followed the new name would no longer be what the config says, and a
 //! supervised restart under the same config would bind whatever device
-//! holds the old name then; the kernel only renames a device that is down
-//! (`EBUSY` otherwise), so the port carries no traffic at that moment
-//! anyway; and stopping detaches, which the startup checks then guard
-//! (fail closed, consistent with `DEVICE_REMOVED`). A rename after the
-//! link query and before the sysctl reads of the same round is caught one
-//! round (1 s) later; the reads in between can only warn or recover.
+//! holds the old name then; and stopping detaches, which the startup
+//! checks then guard (fail closed, consistent with `DEVICE_REMOVED`).
+//! Since Linux 6.2 (commit bd039b5ea2a9) a device may be renamed while it
+//! is up, so the port can still forward when it happens: detection is
+//! bounded by one link round, so up to about 1 s of forwarding (the XDP
+//! attachment follows the index, not the name) and of sysctl reads through
+//! the old name (which may then name another device) can pass before the
+//! fatal. A rename after the link query and before the sysctl reads of the
+//! same round is caught by the next round; the reads in between can only
+//! warn or recover.
 //!
 //! A fatal event ends the run loop; the shutdown then drains, detaches,
 //! closes, and exits 1 (no silent continuation).

@@ -855,7 +855,7 @@ sudo kill -HUP <pid>                                               # configをre
   （`MTU_ABOVE_FRAME`）、3回連続のlink query失敗はfatalです。fatalはdrain・detach・closeの後
   exit 1（`stopped after a fatal health event port=if<id> code=...`）。statsは`watch.state`、
   `if<id>.watch.*`。行はすべて`warning:|recovered:|fatal: port=if<id> health=<CODE>`のvalue-free形式。
-- stats: `ruster-run-stats kind=periodic|on-demand|final uptime-ms=N`（`on-demand`はSIGUSR1、H10。
+- stats: `ruster-run-stats kind=periodic|on-demand|final uptime-ms=N`（`on-demand`はSIGUSR1、H10。100 msに一つまで、その間のSIGUSR1はまとめて後で一つ。
   受け取ったものは次のtick間で一つにまとめて出し、periodicの間隔は変えない）の後に`section.key=value`行
   （`observer.*`、`health.*`、`tick.*`、`rx.*`、`drop.*`、`af_xdp.*`、`if<id>.af_xdp_port.*`、
   `reload.*`、`idle.*`、`notify.*`、`watch.*`（`watch.link_rounds`/`link_rounds_late`/`link_rounds_stale`を含む）、
