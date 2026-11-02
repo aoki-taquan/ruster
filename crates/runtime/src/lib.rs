@@ -836,6 +836,10 @@ fn skip_phase<T: TickPhaseTraceSink>(trace: &mut T, phase: TickPhase, reason: Ti
 ///     drop((rx, generated));
 /// }
 /// ```
+///
+/// Every phase uses `now`. A caller with a live clock should use
+/// [`run_tick_reclocked`] instead, so a tick whose publication phase does
+/// real work does not stamp its RX with a reading taken before that work.
 #[allow(clippy::too_many_arguments)]
 pub fn run_tick<'storage, P, I, T>(
     publication: &mut P,
@@ -860,6 +864,49 @@ where
         + GeneratedTraceSink
         + GeneratedIcmpv4TraceSink,
 {
+    run_tick_reclocked(publication, candidate, io, now, || now, budgets, trace)
+}
+
+/// [`run_tick`] with a clock for ticks that carry a candidate.
+///
+/// A steady tick (no candidate) uses `now` for every phase and never calls
+/// `reclock`. A tick with a candidate calls `reclock` exactly once, after
+/// the publication phase (applied, rejected, or deferred) and before RX,
+/// and runs RX and every later phase at the later of `now` and that
+/// reading, so the tick clock never goes backwards. Applying a successor
+/// can take longer than the clock's granularity; without the fresh
+/// reading a frame that lands in the RX ring meanwhile would be stamped
+/// with the reading from before the publication, earlier than its arrival,
+/// and a timer started from it (such as the RFC 5382 REQ-4 unsolicited-SYN
+/// hold) could end early. `reclock` must not allocate or block; the tick
+/// loop passes its monotonic clock.
+#[allow(clippy::too_many_arguments)]
+pub fn run_tick_reclocked<'storage, P, I, T, R>(
+    publication: &mut P,
+    candidate: Option<P::Candidate>,
+    io: &mut I,
+    now: MonotonicMillis,
+    reclock: R,
+    budgets: TickBudgets,
+    trace: &mut T,
+) -> TickReport<
+    P::Reject,
+    <I as PublicationQuiescence>::Error,
+    <I as PacketIo>::Error,
+    <I as GeneratedPacketIo>::Error,
+>
+where
+    P: FullServicePublication<'storage, I>,
+    I: PacketIo + GeneratedPacketIo + PublicationQuiescence,
+    T: TickPhaseTraceSink
+        + TraceSink
+        + ResolutionTimerTraceSink
+        + ResolutionFailureTraceSink
+        + GeneratedTraceSink
+        + GeneratedIcmpv4TraceSink,
+    R: FnOnce() -> MonotonicMillis,
+{
+    let reclocks = candidate.is_some();
     let tick = PublicationTick { _tick: PhantomData };
     trace.record_tick_phase(TickPhaseTrace::TickStarted);
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::Publication));
@@ -879,6 +926,13 @@ where
         None => PublicationOutcome::Unchanged,
     };
     trace.record_tick_phase(TickPhaseTrace::PhaseFinished(TickPhase::Publication));
+    // The publication phase did work: RX and the later phases must not use
+    // a reading from before it (see `run_tick_reclocked`).
+    let now = if reclocks {
+        MonotonicMillis(now.0.max(reclock().0))
+    } else {
+        now
+    };
 
     let Some(view) = publication.active(&tick) else {
         for phase in [

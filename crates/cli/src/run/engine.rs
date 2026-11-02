@@ -3,21 +3,23 @@
 //!
 //! # Run loop
 //!
-//! One thread drives [`run_tick`] with the configured budgets and a
-//! monotonic wall clock ([`SystemClock`], `Instant` since start) until the
-//! stop flag is set or the backend stops itself. Each iteration reads the
-//! clock, runs one tick, folds the report into the [`TickObserver`], samples
-//! the O(1) state-table occupancy, and asks [`IdleBackoff`] whether to
-//! pause. Nothing on this path allocates, formats, or locks; the cold work
-//! between ticks is the periodic stats block (at most once per interval),
-//! a SIGHUP reload (only on request; see [`super::reload`]), the health
-//! sample of [`super::watch`] (at most every 500 ms), and the link round:
-//! requested from the link watcher thread at most every 1 s and folded in
-//! when it came back ([`super::workers`], H7). Allocation-free unless an
-//! event line is printed. Neither the link round's rtnetlink and sysctl
-//! I/O nor the reload's read, parse, validation, candidate, and plan run
-//! on this thread: it only hands requests to the worker threads and takes
-//! their answers with non-blocking `try_send`/`try_recv`.
+//! One thread drives [`run_tick_reclocked`] with the configured budgets and
+//! a monotonic wall clock ([`SystemClock`], `Instant` since start) until
+//! the stop flag is set or the backend stops itself. Each iteration reads
+//! the clock (again after the publication phase of a tick that publishes a
+//! reload candidate, before its RX), runs one tick, folds the report into
+//! the [`TickObserver`], samples the O(1) state-table occupancy, and asks
+//! [`IdleBackoff`] whether to pause. Nothing on this path allocates,
+//! formats, or locks; the cold work between ticks is the periodic stats
+//! block (at most once per interval), a SIGHUP reload (only on request; see
+//! [`super::reload`]), the health sample of [`super::watch`] (at most every
+//! 500 ms), and the link round: requested from the link watcher thread at
+//! most every 1 s and folded in when it came back ([`super::workers`], H7).
+//! Allocation-free unless an event line is printed. Neither the link
+//! round's rtnetlink and sysctl I/O nor the reload's read, parse,
+//! validation, candidate, and plan run on this thread: it only hands
+//! requests to the worker threads and takes their answers with non-blocking
+//! `try_send`/`try_recv`.
 //!
 //! A pending reload holds RX back (no tick runs) until the backend is
 //! quiescent or [`super::reload::RELOAD_QUIESCE_MS`] passed; its candidate
@@ -57,8 +59,8 @@ use ruster_core::{
 };
 use ruster_io_xdp_native::{KickError, XdpIoError};
 use ruster_runtime::{
-    run_tick, ApplyFlushCounts, PhaseReport, PublicationOutcome, RxPhaseReport, ServiceOccupancy,
-    TickObserver, TickPhaseSkip, TickReport,
+    run_tick_reclocked, ApplyFlushCounts, PhaseReport, PublicationOutcome, RxPhaseReport,
+    ServiceOccupancy, TickObserver, TickPhaseSkip, TickReport,
 };
 
 use super::netlink::{LinkFacts, NetlinkError};
@@ -446,7 +448,25 @@ where
             }
         }
         let reloading = candidate.is_some();
-        let report = run_tick(active, candidate, datapath.io(), now, budgets, observer);
+        // A tick that publishes a candidate reads the clock again after
+        // the publication phase, before RX (`run_tick_reclocked`): applying
+        // a successor can take longer than a millisecond, and a frame that
+        // arrives meanwhile must not be stamped with the earlier reading.
+        // Steady ticks read the clock once.
+        let mut reclocked = now;
+        let report = run_tick_reclocked(
+            active,
+            candidate,
+            datapath.io(),
+            now,
+            || {
+                reclocked = clock.now();
+                reclocked
+            },
+            budgets,
+            observer,
+        );
+        let now = MonotonicMillis(now.0.max(reclocked.0));
         let generation = active.generation();
         observer.observe_tick(now, Some(generation), &report);
         if reloading {

@@ -691,7 +691,9 @@ NAT planがfirewallより先に走るため、NATが許可しfirewallが拒否�
 - **Timer.** 期限は受信時刻 + `NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`（6000）+
   `NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS`（2）。受信時刻はtickのclock読み値（ms切り捨て、
   RX phaseの前に読む）なので真の受信より最大で切り捨て<1 ms + 読み値からRX ringを読むまで
-  （publication phaseだけ、≤1 ms）早い。2 msのmarginで、満了tick（読み値≥期限、送信はその後）
+  （non-blockingな処理だけ、≤1 ms）早い。reload candidateをpublishするtickはapplyに時間上限が
+  無いため、`run_tick_reclocked`がpublication phaseの後・RXの前にclockを読み直し（nowとのmaxで
+  単調、steady tickは読み直さない）、apply中に着いたSYNをapply前の読み値で記録しない。2 msのmarginで、満了tick（読み値≥期限、送信はその後）
   のICMPが真の受信から6秒より前に出ることはない。idle sleepはtick後なので遅く記録されるだけ。
   受信時刻はNAT clock watermarkで単調なのでFIFO先頭が最早期限で、満了判定は先頭checkだけ。同じconnectionの再SYNは
   holdを増やさず、期限をその受信+6秒に延ばして末尾へ移す（どの受信SYNにも6秒以内に応答しない）。
