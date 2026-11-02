@@ -1328,7 +1328,7 @@ done
 refused_with weakhost-refused "port=if1 code=KERNEL_IPV4_WEAK_HOST"
 # The other overrides do not accept it.
 refused_with weakhost-other-overrides "port=if1 code=KERNEL_IPV4_WEAK_HOST" \
-    --allow-kernel-forwarding --allow-kernel-ipv6
+    --allow-kernel-forwarding --allow-kernel-ipv6 --allow-multi-queue
 # The effective value is per port: rp_filter=1 on ra alone leaves rb at 0.
 in_ns "$router" sysctl -qw net.ipv4.conf.ra.rp_filter=1
 refused_with weakhost-device "port=if2 code=KERNEL_IPV4_WEAK_HOST"

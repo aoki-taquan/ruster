@@ -470,10 +470,12 @@ M2に関するownerの発言は次だけである（2026-10-31〜11-01、session
     （decided）。H5で実装: `KERNEL_IPV4_WEAK_HOST`（読めなければ`UNVERIFIABLE probe=rp-filter`）、
     overrideの`--allow-ipv4-weak-host`で従来のwarning `IPV4_WEAK_HOST_EXPOSURE`、run中は他の
     kernel exposureと同じくcounted warningのまま（fatal exitはdetachしてbypassを作るため。CLI-088）。
-  - 2（ARP-031 on-link sender rule）: 「rfc準きょで」。coordinatorはこれを、ownerの方針「RFC挙動を
-    既定にし、security hardeningは設定可能（opt-in）にする」に沿って「既定はRFC 826（senderに
+  - 2（ARP-031 on-link sender rule）: 「rfc準きょで」。ownerの2026-11-01の方針（原文のまま）
+    「基本的な判断基準としてrfc準拠にしてください」と「セキュリティ観点でoffするべきと考えるものに
+    関しても設定可能なようにしてください」に沿って、coordinatorはこれを「既定はRFC 826（senderに
     on-link条件なし、#311前の挙動）、ARP-031は`[arp] require-on-link-sender = true`のopt-in」と
-    解釈した（この読み方はcoordinatorの解釈でowner決定の文言ではない）。H5で実装（ARP-031、ARP-032）。
+    解釈した（「RFCが既定、hardeningはopt-in」はこの二つの発言のcoordinatorの読み方で、owner決定の
+    文言ではない）。H5で実装（ARP-031、ARP-032）。
     optionはforwarding snapshotのpolicyでreloadable。
 
 owner決定待ち（open）: なし（2a、2e、X05 lab、B3、CLI-079、ARP-031は上の2026-11-02の決定）。

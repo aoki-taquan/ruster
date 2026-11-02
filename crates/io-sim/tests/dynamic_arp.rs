@@ -1065,6 +1065,26 @@ fn assert_off_link_senders_are_learned_by_default(s: &ForwardingSnapshot<'_>) {
         }
     )));
 
+    // RFC 826 negative case: an unknown off-link sender whose target is
+    // not the router is neither inserted nor answered (only a known sender
+    // is merged).
+    const UNKNOWN_OFF_LINK: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 8]);
+    io.inject(
+        IFACE,
+        arp(1, UNKNOWN_OFF_LINK, OFF_LINK, PEER_MAC, PEER_MAC),
+    );
+    let mut trace = VecTrace::default();
+    let report = run(&mut io, &mut rt, s, 1, 1, &mut trace);
+    assert_eq!((report.tx_requested, report.dropped), (0, 0));
+    assert_eq!(rt.dynamic_neighbor_count(), 1);
+    assert!(trace.events().iter().any(|event| matches!(
+        event,
+        TraceEvent::ArpControl {
+            disposition: ControlDisposition::Ignored,
+            ..
+        }
+    )));
+
     // A Reply to us from a sender on-link only on another interface is
     // learned on this one.
     io.inject(IFACE, arp(2, OTHER_LINK, LOCAL, PEER_MAC, PEER_MAC));

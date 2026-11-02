@@ -853,6 +853,12 @@ impl<'a> ForwardingSnapshot<'a> {
     /// [`ValidatedForwardingOwner`] recomputes its authority, so two
     /// snapshots of the same tables with different ARP policies are never
     /// the same authority.
+    ///
+    /// For tests and benches that borrow tables directly. Production code
+    /// sets the policy on the owner
+    /// ([`ValidatedForwardingOwner::with_arp_policy`], from the validated
+    /// `[arp]` config through the publication plan), whose snapshots carry
+    /// it.
     #[must_use]
     pub fn with_arp_policy(self, arp: ArpPolicy) -> Self {
         let authority = if self.authority & VALIDATED_OWNER_AUTHORITY_BIT == 0 {
