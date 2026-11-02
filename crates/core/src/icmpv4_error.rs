@@ -1,5 +1,9 @@
 use std::{marker::PhantomData, rc::Rc};
 
+use crate::icmpv4_translated_limit::{
+    TranslatedIcmpv4Limiter, ICMPV4_DEFAULT_TRANSLATED_BURST,
+    ICMPV4_DEFAULT_TRANSLATED_RATE_PER_SECOND, ICMPV4_MAX_TRANSLATED_LIMIT,
+};
 use crate::{
     internet_checksum, ipv4_header_checksum, GeneratedAllocationError, GeneratedBatchCompletion,
     GeneratedPacketBatch, GeneratedPacketIo, IfId, Ipv4Address, MacAddress, MonotonicMillis,
@@ -71,6 +75,9 @@ impl Icmpv4ErrorKind {
 pub enum Icmpv4ErrorPolicyError {
     IntervalZero,
     StateTtlTooShort,
+    /// A translated error rate or burst is 0 or above
+    /// [`crate::ICMPV4_MAX_TRANSLATED_LIMIT`].
+    TranslatedLimitOutOfRange,
 }
 
 /// Rate-limit policy and per-kind generation switches for router-originated
@@ -88,6 +95,8 @@ pub struct Icmpv4ErrorPolicy {
     port_unreachable_interval_ms: u64,
     state_ttl_ms: u64,
     disabled: u8,
+    translated_rate_per_second: u32,
+    translated_burst: u32,
 }
 
 /// Default minimum interval between two ICMP Port Unreachable errors on one
@@ -107,7 +116,59 @@ impl Icmpv4ErrorPolicy {
             port_unreachable_interval_ms: ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS,
             state_ttl_ms,
             disabled: 0,
+            translated_rate_per_second: ICMPV4_DEFAULT_TRANSLATED_RATE_PER_SECOND,
+            translated_burst: ICMPV4_DEFAULT_TRANSLATED_BURST,
         })
+    }
+
+    /// Returns this policy with the rate limit of external ICMPv4 errors
+    /// that NAT44 translates toward an inside host (RFC 5508 REQ-10 f, RFC
+    /// 1812 §4.3.2.8; NAT44-065): at most `burst` errors at one instant
+    /// and `rate_per_second` sustained, per path (inside host and quoted
+    /// remote address).
+    ///
+    /// Errors offered at one clock reading pass at most `burst` at a time,
+    /// so the sustained rate is also capped at `burst` per millisecond.
+    /// Both at the maximum is the effectively-off setting. The
+    /// defaults are [`crate::ICMPV4_DEFAULT_TRANSLATED_RATE_PER_SECOND`]
+    /// and [`crate::ICMPV4_DEFAULT_TRANSLATED_BURST`].
+    ///
+    /// # Errors
+    ///
+    /// [`Icmpv4ErrorPolicyError::TranslatedLimitOutOfRange`] when either is
+    /// 0 or above [`crate::ICMPV4_MAX_TRANSLATED_LIMIT`]. There is no
+    /// unlimited setting: the limit fails closed.
+    pub const fn with_translated_limit(
+        self,
+        rate_per_second: u32,
+        burst: u32,
+    ) -> Result<Self, Icmpv4ErrorPolicyError> {
+        if rate_per_second == 0
+            || burst == 0
+            || rate_per_second > ICMPV4_MAX_TRANSLATED_LIMIT
+            || burst > ICMPV4_MAX_TRANSLATED_LIMIT
+        {
+            return Err(Icmpv4ErrorPolicyError::TranslatedLimitOutOfRange);
+        }
+        Ok(Self {
+            translated_rate_per_second: rate_per_second,
+            translated_burst: burst,
+            ..self
+        })
+    }
+
+    /// Sustained translated ICMPv4 errors per second per (inside host,
+    /// quoted remote address).
+    #[must_use]
+    pub const fn translated_rate_per_second(self) -> u32 {
+        self.translated_rate_per_second
+    }
+
+    /// Translated ICMPv4 errors one (inside host, quoted remote address)
+    /// can receive at one instant.
+    #[must_use]
+    pub const fn translated_burst(self) -> u32 {
+        self.translated_burst
     }
 
     /// Returns this policy with `interval_ms` as the minimum interval
@@ -197,6 +258,8 @@ impl Default for Icmpv4ErrorPolicy {
             port_unreachable_interval_ms: ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS,
             state_ttl_ms: 60_000,
             disabled: 0,
+            translated_rate_per_second: ICMPV4_DEFAULT_TRANSLATED_RATE_PER_SECOND,
+            translated_burst: ICMPV4_DEFAULT_TRANSLATED_BURST,
         }
     }
 }
@@ -499,6 +562,10 @@ pub struct Icmpv4ErrorRuntime<'a> {
     counters: Icmpv4ErrorCounters,
     /// Allocated limiter state slots; see [`Icmpv4ErrorRuntime::state_occupancy`].
     state_occupancy: OccupancyCounter,
+    /// Limiter of translated NAT44 errors per (inside host, quoted remote)
+    /// (NAT44-065). A publication that installs the same key keeps it (the
+    /// policy cannot change without a restart); a new key empties it.
+    translated: TranslatedIcmpv4Limiter,
     _worker_local: PhantomData<Rc<()>>,
 }
 
@@ -522,8 +589,46 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             runtime_epoch: 1,
             counters: Icmpv4ErrorCounters::default(),
             state_occupancy: OccupancyCounter::default(),
+            translated: TranslatedIcmpv4Limiter::EMPTY,
             _worker_local: PhantomData,
         }
+    }
+
+    /// Returns this runtime with `key` (a publication's secret resolution
+    /// key, used in its own hash domain) choosing the buckets of the
+    /// translated error limiter (NAT44-065). Without it the runtime uses a
+    /// public fixed key, whose bucket collisions anyone can compute; every
+    /// production activation and publication supplies the secret.
+    #[must_use]
+    pub fn with_translated_limit_key(mut self, key: crate::ResolutionHashKey) -> Self {
+        self.translated.rekey(key.directory_key());
+        self
+    }
+
+    /// Whether the translated error limiter hashes with `key` (a
+    /// publication's binding check; reveals nothing without the key).
+    #[must_use]
+    pub fn translated_limit_key_matches(&self, key: crate::ResolutionHashKey) -> bool {
+        self.translated.key_matches(key.directory_key())
+    }
+
+    /// Admits one external ICMPv4 error that NAT44 translates toward the
+    /// inside host `host` about its flow with `remote`, or refuses it under
+    /// the policy's translated limit (NAT44-065). O(1): one keyed hash and
+    /// one fixed bucket, no allocation or scan; a refusal changes nothing.
+    pub(crate) fn admit_translated(
+        &mut self,
+        host: Ipv4Address,
+        remote: Ipv4Address,
+        now: MonotonicMillis,
+    ) -> bool {
+        self.translated.admit(
+            host,
+            remote,
+            now,
+            self.policy.translated_rate_per_second,
+            self.policy.translated_burst,
+        )
     }
 
     #[must_use]
@@ -579,6 +684,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             && self.runtime_epoch == 1
             && self.counters == Icmpv4ErrorCounters::default()
             && self.state_occupancy == OccupancyCounter::default()
+            && self.translated.is_pristine()
     }
 
     /// Validates the generated-action queue without changing runtime state.
@@ -928,6 +1034,17 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
 }
 
 impl Icmpv4ErrorPublicationPermit<'_, '_> {
+    /// [`Self::commit`] that also installs the successor's secret key for
+    /// the translated error limiter (NAT44-065). A different key empties
+    /// the limiter, whose buckets the old key chose.
+    pub fn commit_with_translated_limit_key(
+        self,
+        key: crate::ResolutionHashKey,
+    ) -> Icmpv4ErrorPublicationReport {
+        self.runtime.translated.rekey(key.directory_key());
+        self.commit()
+    }
+
     /// Flushes old publication authority without failure.
     pub fn commit(self) -> Icmpv4ErrorPublicationReport {
         self.runtime.states.fill(Icmpv4ErrorStateSlot::EMPTY);
@@ -1477,6 +1594,75 @@ mod tests {
             Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut states, &mut actions);
         runtime.states[0].egress = IfId(9);
         assert!(!runtime.is_pristine());
+    }
+
+    /// NAT44-065: the translated limiter is part of the exact constructor
+    /// state (a keyed runtime is pristine too). A publication that installs
+    /// the same key keeps the buckets; a new key empties them.
+    #[test]
+    fn translated_limiter_is_pristine_state_and_follows_the_publication_key() {
+        let policy = Icmpv4ErrorPolicy::default()
+            .with_translated_limit(1, 1)
+            .unwrap();
+        let host = Ipv4Address::from_octets([10, 0, 0, 10]);
+        let remote = Ipv4Address::from_octets([198, 51, 100, 20]);
+        let first = crate::ResolutionHashKey::new(1, 2).unwrap();
+        let second = crate::ResolutionHashKey::new(3, 4).unwrap();
+        let mut states = [];
+        let mut actions = [];
+        let mut runtime = Icmpv4ErrorRuntime::new(policy, &mut states, &mut actions)
+            .with_translated_limit_key(first);
+        assert!(runtime.is_pristine());
+        assert!(runtime.admit_translated(host, remote, MonotonicMillis(1_000)));
+        assert!(!runtime.is_pristine());
+        assert_eq!(runtime.counters(), Icmpv4ErrorCounters::default());
+        runtime.preflight_publication().unwrap().commit();
+        assert!(!runtime.admit_translated(host, remote, MonotonicMillis(1_999)));
+        runtime
+            .preflight_publication()
+            .unwrap()
+            .commit_with_translated_limit_key(first);
+        assert!(!runtime.admit_translated(host, remote, MonotonicMillis(1_999)));
+        runtime
+            .preflight_publication()
+            .unwrap()
+            .commit_with_translated_limit_key(second);
+        assert!(runtime.admit_translated(host, remote, MonotonicMillis(1_999)));
+        assert!(!runtime.admit_translated(host, remote, MonotonicMillis(1_999)));
+        assert!(runtime.admit_translated(host, remote, MonotonicMillis(2_999)));
+    }
+
+    #[test]
+    fn translated_limit_policy_bounds_are_exact() {
+        use crate::{
+            ICMPV4_DEFAULT_TRANSLATED_BURST, ICMPV4_DEFAULT_TRANSLATED_RATE_PER_SECOND,
+            ICMPV4_MAX_TRANSLATED_LIMIT,
+        };
+        let policy = Icmpv4ErrorPolicy::default();
+        assert_eq!(
+            (
+                policy.translated_rate_per_second(),
+                policy.translated_burst()
+            ),
+            (
+                ICMPV4_DEFAULT_TRANSLATED_RATE_PER_SECOND,
+                ICMPV4_DEFAULT_TRANSLATED_BURST
+            )
+        );
+        assert_eq!(policy, Icmpv4ErrorPolicy::new(100, 60_000).unwrap());
+        let max = ICMPV4_MAX_TRANSLATED_LIMIT;
+        for (rate, burst) in [(0, 1), (1, 0), (max + 1, 1), (1, max + 1)] {
+            assert_eq!(
+                policy.with_translated_limit(rate, burst),
+                Err(Icmpv4ErrorPolicyError::TranslatedLimitOutOfRange)
+            );
+        }
+        let edge = policy.with_translated_limit(max, 1).unwrap();
+        assert_eq!(
+            (edge.translated_rate_per_second(), edge.translated_burst()),
+            (max, 1)
+        );
+        assert_eq!(edge.interval_ms(), policy.interval_ms());
     }
 
     #[test]

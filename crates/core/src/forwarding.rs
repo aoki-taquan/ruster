@@ -209,6 +209,14 @@ pub enum DropReason {
     /// limit of live mappings (N3, NAT44-092). Nothing was created or
     /// evicted.
     Nat44TcpHostQuotaExceeded = 156,
+    /// An external ICMPv4 error that NAT44 would translate toward an inside
+    /// host exceeds that host's translated-error rate limit (RFC 5508
+    /// REQ-10 f, RFC 1812 §4.3.2.8; NAT44-065).
+    Nat44Icmpv4TranslatedRateLimited = 157,
+    /// A Fragmentation Needed (Type 3, Code 4) error advertises a Next-Hop
+    /// MTU of 1 to 67, below the IPv4 minimum of 68 (RFC 791, RFC 1191 §3).
+    /// Zero (a router predating RFC 1191) stays valid.
+    Nat44Icmpv4FragNeededMtuInvalid = 158,
 }
 
 use DropReason::*;
@@ -216,7 +224,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 156] = [
+    pub const ALL: [Self; 158] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -373,6 +381,8 @@ impl DropReason {
         ArpSenderNotOnLink,
         Nat44UdpHostQuotaExceeded,
         Nat44TcpHostQuotaExceeded,
+        Nat44Icmpv4TranslatedRateLimited,
+        Nat44Icmpv4FragNeededMtuInvalid,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -546,6 +556,8 @@ impl DropReason {
             ArpSenderNotOnLink => "ARP_SENDER_NOT_ON_LINK",
             Nat44UdpHostQuotaExceeded => "NAT44_UDP_HOST_QUOTA_EXCEEDED",
             Nat44TcpHostQuotaExceeded => "NAT44_TCP_HOST_QUOTA_EXCEEDED",
+            Nat44Icmpv4TranslatedRateLimited => "NAT44_ICMPV4_TRANSLATED_RATE_LIMITED",
+            Nat44Icmpv4FragNeededMtuInvalid => "NAT44_ICMPV4_FRAG_NEEDED_MTU_INVALID",
         }
     }
 }
@@ -2653,6 +2665,7 @@ fn decide_ipv4<T: TraceSink>(
             ingress,
             ipv4,
             resolution,
+            icmpv4_errors,
             nat44_udp_config,
             nat44_udp,
             nat44_tcp_config,
@@ -3403,6 +3416,7 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
     ingress: IfId,
     outer: packet::ValidatedIpv4,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     nat44_udp_config: Option<&Nat44UdpConfig>,
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
     nat44_tcp_config: Option<&Nat44TcpConfig>,
@@ -3558,6 +3572,15 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
     if route.egress() != inside {
         return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongEgress, trace);
     }
+    // NAT44-065: the per-inside-host limit is the last gate, after every
+    // read-only authority check and before the only side effect (neighbor
+    // resolution may schedule ARP), so an error that would be refused
+    // anyway never spends the budget and a limited one never starts ARP.
+    if let Some((runtime, errors_now)) = icmpv4_errors.as_mut() {
+        if !runtime.admit_translated(internal_address, quote.destination_address, *errors_now) {
+            return nat44_icmpv4_drop(ingress, Nat44Icmpv4TranslatedRateLimited, trace);
+        }
+    }
     let target = route.next_hop().unwrap_or(internal_address);
     let (interface, destination_mac) =
         resolve_nat44_icmpv4_next_hop(snapshot, inside, target, resolution, trace)?;
@@ -3582,7 +3605,8 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
 }
 
 /// Parses and validates a candidate ICMPv4 error and its quote (RFC 5508
-/// REQ-3): outer IHL 5, nonfragment, TTL > 1, valid ICMP checksum; a quoted
+/// REQ-3): outer IHL 5, nonfragment, TTL > 1, valid ICMP checksum, a
+/// Fragmentation Needed Next-Hop MTU of 0 or at least 68; a quoted
 /// IPv4 header with a valid checksum (options skipped by IHL), reserved flag
 /// masked, DF=1/MF=0/offset=0, UDP or TCP, and the first 8 transport bytes.
 /// The embedded transport checksum is located but not validated.
@@ -3611,6 +3635,16 @@ fn parse_nat44_icmpv4_error(
     }
     if crate::internet_checksum(icmp) != 0 {
         return Err(Nat44Icmpv4ChecksumInvalid);
+    }
+    // A Next-Hop MTU of 1..=67 is below the IPv4 minimum every link carries
+    // (RFC 791: 68 octets), so no router can report it (RFC 1191 §4: the
+    // MTU of the next-hop network). Zero is a router predating RFC 1191
+    // (§5, the host estimates a plateau) and stays valid.
+    if icmp[0] == 3 && icmp[1] == 4 {
+        let mtu = u16::from_be_bytes([icmp[6], icmp[7]]);
+        if (1..68).contains(&mtu) {
+            return Err(Nat44Icmpv4FragNeededMtuInvalid);
+        }
     }
     let quote_offset = icmp_offset + 8;
     let quote = frame
@@ -6990,6 +7024,8 @@ mod tests {
             (154, "ARP_SENDER_NOT_ON_LINK"),
             (155, "NAT44_UDP_HOST_QUOTA_EXCEEDED"),
             (156, "NAT44_TCP_HOST_QUOTA_EXCEEDED"),
+            (157, "NAT44_ICMPV4_TRANSLATED_RATE_LIMITED"),
+            (158, "NAT44_ICMPV4_FRAG_NEEDED_MTU_INVALID"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -6999,7 +7035,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(157), None);
+        assert_eq!(DropReason::from_code(159), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

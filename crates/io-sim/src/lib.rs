@@ -10,7 +10,8 @@ use ruster_core::{
     forward_batch_with_nat44_udp_and_tcp_and_firewall,
     forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors,
     forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_audited,
-    forward_batch_with_nat44_udp_and_tcp_and_firewall_audited, BatchCompletion, BatchReport,
+    forward_batch_with_nat44_udp_and_tcp_and_firewall_audited,
+    forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors, BatchCompletion, BatchReport,
     ConsumeReason, DropReason, FirewallAuditBuffer, FirewallConfig, FirewallRuntime,
     ForwardingSnapshot, GeneratedAllocationError, GeneratedArpTrace, GeneratedBatchCompletion,
     GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedPacketBatch, GeneratedPacketIo,
@@ -319,6 +320,37 @@ impl SimIo {
         let batch = self.receive(budget)?;
         Ok(forward_batch_with_nat44_udp_and_tcp(
             batch, snapshot, resolution, udp_config, nat44_udp, tcp_config, nat44_tcp, now, trace,
+        ))
+    }
+
+    /// [`Self::run_nat44_udp_and_tcp_once`] with the generated-error runtime
+    /// bound, which also limits translated external errors (NAT44-065).
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_nat44_udp_and_tcp_with_icmpv4_errors_once<T: TraceSink>(
+        &mut self,
+        budget: usize,
+        snapshot: &ForwardingSnapshot<'_>,
+        resolution: &mut ResolutionRuntime<'_>,
+        icmpv4_errors: &mut ruster_core::Icmpv4ErrorRuntime<'_>,
+        udp_config: &Nat44UdpConfig,
+        nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+        tcp_config: &Nat44TcpConfig,
+        nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+        now: MonotonicMillis,
+        trace: &mut T,
+    ) -> Result<BatchReport<Infallible>, Infallible> {
+        let batch = self.receive(budget)?;
+        Ok(forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors(
+            batch,
+            snapshot,
+            resolution,
+            icmpv4_errors,
+            udp_config,
+            nat44_udp,
+            tcp_config,
+            nat44_tcp,
+            now,
+            trace,
         ))
     }
 

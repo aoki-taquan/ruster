@@ -173,6 +173,46 @@ pub struct Icmpv4ErrorV1 {
     pub capacity: Icmpv4ErrorCapacityV1,
     #[serde(default)]
     pub generate: Icmpv4ErrorGenerateV1,
+    /// Rate limit of external errors NAT44 translates toward an inside
+    /// host; absent means the defaults.
+    #[serde(default)]
+    pub translated: Icmpv4ErrorTranslatedV1,
+}
+
+/// `[icmpv4-errors.translated]`: per (inside host, quoted remote) rate limit of external
+/// ICMPv4 errors that NAT44 translates (RFC 5508 REQ-10 f, RFC 1812
+/// §4.3.2.8; NAT44-065). Part of the ICMPv4 error policy, so a change is
+/// restart-required.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Icmpv4ErrorTranslatedV1 {
+    /// Sustained errors per second per (inside host, quoted remote); absent means
+    /// [`ruster_core::ICMPV4_DEFAULT_TRANSLATED_RATE_PER_SECOND`]. 1 to
+    /// [`ruster_core::ICMPV4_MAX_TRANSLATED_LIMIT`]; there is no unlimited
+    /// setting (both keys at the maximum is effectively off).
+    #[serde(default = "default_translated_rate_per_second")]
+    pub rate_per_second: u32,
+    /// Errors one (inside host, quoted remote) can receive at one instant; absent means
+    /// [`ruster_core::ICMPV4_DEFAULT_TRANSLATED_BURST`]. Same bounds.
+    #[serde(default = "default_translated_burst")]
+    pub burst: u32,
+}
+
+const fn default_translated_rate_per_second() -> u32 {
+    ruster_core::ICMPV4_DEFAULT_TRANSLATED_RATE_PER_SECOND
+}
+
+const fn default_translated_burst() -> u32 {
+    ruster_core::ICMPV4_DEFAULT_TRANSLATED_BURST
+}
+
+impl Default for Icmpv4ErrorTranslatedV1 {
+    fn default() -> Self {
+        Self {
+            rate_per_second: default_translated_rate_per_second(),
+            burst: default_translated_burst(),
+        }
+    }
 }
 
 /// Per-kind generation switches. Every kind defaults to `true` (RFC 1812).

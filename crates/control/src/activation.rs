@@ -755,11 +755,14 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             failure_holds,
             authority.resolution_hash_key(),
         );
+        // The translated error limiter (NAT44-065) hashes with the
+        // publication's secret resolution key in its own domain.
         let icmpv4_errors = Icmpv4ErrorRuntime::new(
             authority.icmpv4_error_policy(),
             icmpv4_states,
             icmpv4_actions,
-        );
+        )
+        .with_translated_limit_key(authority.resolution_hash_key());
         let firewall = FirewallRuntime::new(authority.firewall_config(), firewall_states);
         *generation_floor = Some(candidate.generation());
         Ok(Self {
@@ -883,7 +886,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             previous_generation: self.candidate.generation(),
             generation: successor.generation(),
             resolution: resolution.commit_with_hash_key(resolution_hash_key),
-            icmpv4_errors: icmpv4_errors.commit(),
+            icmpv4_errors: icmpv4_errors.commit_with_translated_limit_key(resolution_hash_key),
             nat44_udp: nat44_udp.commit(),
             nat44_tcp: nat44_tcp.commit(),
             firewall: firewall.commit(),
