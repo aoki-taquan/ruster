@@ -147,6 +147,11 @@ pub trait LinkMonitor {
     /// The kernel IPv4 forwarding sysctls (global and `target`'s device);
     /// `Err` if either is unreadable. Cold path, no allocation.
     fn forwarding(&mut self, target: &LinkTarget) -> Result<Forwarding, ()>;
+
+    /// The IPv4 weak-host exposure of `target`'s port: `Some(true)` if the
+    /// effective `rp_filter` and `arp_ignore` are both 0, `None` if
+    /// unreadable. Cold path, no allocation.
+    fn ipv4_weak_host(&mut self, target: &LinkTarget) -> Option<bool>;
 }
 
 /// Summed result of one drain call.
@@ -539,6 +544,8 @@ where
             }
             let forwarding = control.links.forwarding(&target);
             watch.on_forwarding(index, forwarding, &mut on_event);
+            let weak_host = control.links.ipv4_weak_host(&target);
+            watch.on_weak_host(index, weak_host, &mut on_event);
             if linked {
                 let ipv6 = control.links.ipv6(&target);
                 watch.on_ipv6(index, ipv6, &mut on_event);

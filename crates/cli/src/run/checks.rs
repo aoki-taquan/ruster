@@ -223,6 +223,14 @@ pub struct DeviceFacts {
     pub forwarding_global: Option<bool>,
     /// `/proc/sys/net/ipv4/conf/<dev>/forwarding`; `None` if unreadable.
     pub forwarding_device: Option<bool>,
+    /// `conf/all/mc_forwarding` or `conf/<dev>/mc_forwarding` (a multicast
+    /// routing daemon is running; an absent file is off); `None` if
+    /// unreadable.
+    pub forwarding_multicast: Option<bool>,
+    /// Weak-host exposure of the address-less port: the effective
+    /// `rp_filter` (the larger of `conf/all` and `conf/<dev>`) and the
+    /// effective `arp_ignore` (likewise) are both 0; `None` if unreadable.
+    pub weak_host: Option<bool>,
     /// The kernel IPv6 stack on the device.
     pub ipv6: Ipv6Facts,
 }
@@ -247,8 +255,17 @@ pub struct Ipv6Facts {
     pub routes: Option<u32>,
     /// `/proc/sys/net/ipv6/conf/all/forwarding`.
     pub forwarding_global: Option<bool>,
-    /// `/proc/sys/net/ipv6/conf/<dev>/forwarding`.
+    /// `/proc/sys/net/ipv6/conf/<dev>/forwarding` (on its own it does
+    /// not make the kernel forward IPv6, `ip6_forward` reads
+    /// `conf/all/forwarding`; checked anyway).
     pub forwarding_device: Option<bool>,
+    /// `conf/<dev>/force_forwarding` or `conf/all/force_forwarding`
+    /// (Linux 6.17+: forwarding on that ingress device even with
+    /// `conf/all/forwarding` 0; an absent file is off).
+    pub forwarding_force: Option<bool>,
+    /// `conf/<dev>/mc_forwarding` or `conf/all/mc_forwarding` (an IPv6
+    /// multicast routing daemon; an absent file is off).
+    pub forwarding_multicast: Option<bool>,
 }
 
 impl Ipv6Facts {
@@ -259,6 +276,8 @@ impl Ipv6Facts {
         routes: None,
         forwarding_global: None,
         forwarding_device: None,
+        forwarding_force: None,
+        forwarding_multicast: None,
     };
     /// IPv6 on, with only link-local addresses and routes, forwarding off.
     #[cfg(test)]
@@ -268,6 +287,8 @@ impl Ipv6Facts {
         routes: Some(0),
         forwarding_global: Some(false),
         forwarding_device: Some(false),
+        forwarding_force: Some(false),
+        forwarding_multicast: Some(false),
     };
 }
 
@@ -279,9 +300,9 @@ pub struct CheckPolicy {
     /// `--allow-kernel-forwarding`: kernel IPv4 forwarding (or an
     /// unreadable forwarding sysctl) is warned instead of refused.
     pub allow_kernel_forwarding: bool,
-    /// `--allow-kernel-ipv6`: kernel IPv6 on a port (addresses, routes,
-    /// forwarding, or an unreadable IPv6 fact) is warned instead of
-    /// refused.
+    /// `--allow-kernel-ipv6`: kernel IPv6 enabled on a port (and with it
+    /// addresses, routes, forwarding, or an unreadable IPv6 fact) is warned
+    /// instead of refused.
     pub allow_kernel_ipv6: bool,
 }
 
@@ -293,6 +314,12 @@ pub enum ForwardingScope {
     /// `net.ipv4.conf.<dev>.forwarding` (IPv6:
     /// `net.ipv6.conf.<dev>.forwarding`).
     Device,
+    /// IPv6 only: `net.ipv6.conf.<dev>.force_forwarding` or
+    /// `conf.all.force_forwarding` (Linux 6.17+).
+    Force,
+    /// `conf/<dev>/mc_forwarding` or `conf/all/mc_forwarding`: a multicast
+    /// routing daemon forwards multicast between interfaces.
+    Multicast,
 }
 
 impl ForwardingScope {
@@ -300,6 +327,8 @@ impl ForwardingScope {
         match self {
             Self::Global => "global",
             Self::Device => "device",
+            Self::Force => "force",
+            Self::Multicast => "multicast",
         }
     }
 }
@@ -327,6 +356,11 @@ pub enum CheckFailure {
     /// Kernel IPv6 forwarding is on (and IPv6 is not disabled on the
     /// port) and `--allow-kernel-ipv6` was not given.
     KernelIpv6ForwardingEnabled(ForwardingScope),
+    /// IPv6 is enabled on the port (`disable_ipv6 = 0`) and
+    /// `--allow-kernel-ipv6` was not given: while detached the kernel's
+    /// IPv6 stack receives on the port (weak host model: every local IPv6
+    /// address of the host is reachable through it).
+    KernelIpv6Enabled,
     /// The device MTU plus the 14-byte Ethernet header does not fit a
     /// UMEM frame: the kernel would drop (copy mode) or split (driver
     /// multi-buffer) every longer frame before the router sees it.
@@ -423,6 +457,7 @@ impl fmt::Display for CheckFailure {
                 "KERNEL_IPV6_FORWARDING_ENABLED scope={}",
                 scope.name()
             ),
+            Self::KernelIpv6Enabled => formatter.write_str("KERNEL_IPV6_ENABLED"),
         }
     }
 }
@@ -436,10 +471,16 @@ pub struct Warnings {
     pub forwarding_global: bool,
     /// `net.ipv4.conf.<dev>.forwarding` is on.
     pub forwarding_device: bool,
+    /// IPv4 `mc_forwarding` is on.
+    pub forwarding_multicast: bool,
     /// A forwarding sysctl could not be read.
     pub forwarding_unreadable: bool,
-    /// Accepted through `--allow-kernel-ipv6`: the first IPv6 fact that
-    /// could not be read.
+    /// `rp_filter` and `arp_ignore` both 0 (or unreadable): weak-host
+    /// exposure while detached (never refused).
+    pub weak_host: bool,
+    /// Accepted through `--allow-kernel-ipv6`: IPv6 is enabled on the port.
+    pub ipv6_enabled: bool,
+    /// ... the first IPv6 fact that could not be read.
     pub ipv6_unverifiable: Option<Probe>,
     /// ... IPv6 addresses outside `fe80::/10` on the port.
     pub ipv6_addresses: Option<u32>,
@@ -449,6 +490,10 @@ pub struct Warnings {
     pub ipv6_forwarding_global: bool,
     /// ... `net.ipv6.conf.<dev>.forwarding` on.
     pub ipv6_forwarding_device: bool,
+    /// ... IPv6 `force_forwarding` on.
+    pub ipv6_forwarding_force: bool,
+    /// ... IPv6 `mc_forwarding` on.
+    pub ipv6_forwarding_multicast: bool,
 }
 
 impl Warnings {
@@ -457,15 +502,27 @@ impl Warnings {
         let multi = self
             .multi_queue
             .map(|queues| format!("MULTI_QUEUE_ALLOWED rx-queues={queues}"));
-        let global = self
-            .forwarding_global
-            .then(|| "IPV4_FORWARDING_ENABLED scope=global".to_owned());
-        let device = self
-            .forwarding_device
-            .then(|| "IPV4_FORWARDING_ENABLED scope=device".to_owned());
-        let unreadable = self
-            .forwarding_unreadable
-            .then(|| "IPV4_FORWARDING_UNVERIFIABLE".to_owned());
+        let flags = [
+            (
+                self.forwarding_global,
+                "IPV4_FORWARDING_ENABLED scope=global",
+            ),
+            (
+                self.forwarding_device,
+                "IPV4_FORWARDING_ENABLED scope=device",
+            ),
+            (
+                self.forwarding_multicast,
+                "IPV4_FORWARDING_ENABLED scope=multicast",
+            ),
+            (self.forwarding_unreadable, "IPV4_FORWARDING_UNVERIFIABLE"),
+            (self.weak_host, "IPV4_WEAK_HOST_EXPOSURE"),
+            (self.ipv6_enabled, "IPV6_ENABLED_ALLOWED"),
+        ];
+        let ipv4 = flags
+            .into_iter()
+            .filter(|(on, _)| *on)
+            .map(|(_, code)| code.to_owned());
         let ipv6_unverifiable = self
             .ipv6_unverifiable
             .map(|probe| format!("IPV6_UNVERIFIABLE probe={}", probe.name()));
@@ -475,22 +532,22 @@ impl Warnings {
         let ipv6_routes = self
             .ipv6_routes
             .map(|count| format!("IPV6_ROUTES_ALLOWED count={count}"));
-        let ipv6_global = self
-            .ipv6_forwarding_global
-            .then(|| "IPV6_FORWARDING_ENABLED scope=global".to_owned());
-        let ipv6_device = self
-            .ipv6_forwarding_device
-            .then(|| "IPV6_FORWARDING_ENABLED scope=device".to_owned());
+        let ipv6_forwarding = [
+            (self.ipv6_forwarding_global, ForwardingScope::Global),
+            (self.ipv6_forwarding_device, ForwardingScope::Device),
+            (self.ipv6_forwarding_force, ForwardingScope::Force),
+            (self.ipv6_forwarding_multicast, ForwardingScope::Multicast),
+        ]
+        .into_iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, scope)| format!("IPV6_FORWARDING_ENABLED scope={}", scope.name()));
         multi
             .into_iter()
-            .chain(global)
-            .chain(device)
-            .chain(unreadable)
+            .chain(ipv4)
             .chain(ipv6_unverifiable)
             .chain(ipv6_addresses)
             .chain(ipv6_routes)
-            .chain(ipv6_global)
-            .chain(ipv6_device)
+            .chain(ipv6_forwarding)
     }
 }
 
@@ -514,9 +571,12 @@ impl Warnings {
 ///   example `ip route add 10.0.0.0/8 dev <port> table 100` without an
 ///   address): refused for the same reason; addresses are checked first,
 ///   so a connected route reports its address.
-/// - Forwarding sysctls (`net.ipv4.ip_forward`, `conf/<dev>/forwarding`):
-///   refused by default (`KERNEL_FORWARDING_ENABLED scope=global|device`,
-///   unreadable: `UNVERIFIABLE probe=forwarding`). Whenever the router is
+/// - Forwarding sysctls (`net.ipv4.ip_forward`, `conf/<dev>/forwarding`,
+///   and `mc_forwarding` of `conf/all` or the device, set while a
+///   multicast routing daemon runs; an absent `mc_forwarding` is off):
+///   refused by default (`KERNEL_FORWARDING_ENABLED
+///   scope=global|device|multicast`, unreadable: `UNVERIFIABLE
+///   probe=forwarding`). Whenever the router is
 ///   not attached (before startup, after any exit including a fatal health
 ///   event, after a crash), kernel forwarding is what could carry traffic
 ///   between the ports around the firewall and NAT, so the fail-closed
@@ -525,16 +585,14 @@ impl Warnings {
 ///   `--allow-kernel-forwarding` accepts it with the old warnings; the
 ///   address and route refusals still keep the kernel without a connected
 ///   route through the ports.
-/// - Kernel IPv6 ([`evaluate_ipv6`]): the router is IPv4 only, so while
-///   detached the kernel IPv6 stack is the only one on the ports. Nothing
-///   is checked when IPv6 is disabled on the port (`disable_ipv6 = 1`, or
-///   no IPv6 in the namespace). Otherwise addresses outside `fe80::/10`
-///   (`KERNEL_IPV6_ADDRESSES`), routes out of the port beyond the
-///   automatic link-local and multicast ones (`KERNEL_IPV6_ROUTES`), and
-///   `net.ipv6.conf.all.forwarding` or `conf/<dev>/forwarding`
-///   (`KERNEL_IPV6_FORWARDING_ENABLED scope=global|device`) are refused,
-///   and so is an unreadable fact (`UNVERIFIABLE probe=ipv6-*`), unless
-///   `--allow-kernel-ipv6` turns all of them into warnings.
+/// - IPv4 weak host: an address-less port still receives, while detached,
+///   frames addressed to any local IPv4 address of the host (Linux's weak
+///   host model) and answers ARP for them unless `arp_ignore` is set.
+///   With the effective `rp_filter` and `arp_ignore` both 0 (or
+///   unreadable) a warning `IPV4_WEAK_HOST_EXPOSURE`, never a refusal
+///   (whether to refuse is an open owner question, CLI-034).
+/// - Kernel IPv6 ([`evaluate_ipv6`]): refused whenever IPv6 is enabled on
+///   the port, unless `--allow-kernel-ipv6`.
 /// - MTU: the rtnetlink MTU must equal the one the session read at open
 ///   (which bounds TX), and it must fit a UMEM frame with its Ethernet
 ///   header ([`mtu_limit`]); both refusals keep the run-time MTU rule of
@@ -582,46 +640,65 @@ pub fn evaluate_device(facts: &DeviceFacts, policy: CheckPolicy) -> Result<Warni
     }
     warnings.forwarding_global = facts.forwarding_global == Some(true);
     warnings.forwarding_device = facts.forwarding_device == Some(true);
-    warnings.forwarding_unreadable =
-        facts.forwarding_global.is_none() || facts.forwarding_device.is_none();
+    warnings.forwarding_multicast = facts.forwarding_multicast == Some(true);
+    warnings.forwarding_unreadable = facts.forwarding_global.is_none()
+        || facts.forwarding_device.is_none()
+        || facts.forwarding_multicast.is_none();
     if !policy.allow_kernel_forwarding {
-        if warnings.forwarding_global {
-            return Err(CheckFailure::KernelForwardingEnabled(
-                ForwardingScope::Global,
-            ));
-        }
-        if warnings.forwarding_device {
-            return Err(CheckFailure::KernelForwardingEnabled(
-                ForwardingScope::Device,
-            ));
+        for (on, scope) in [
+            (warnings.forwarding_global, ForwardingScope::Global),
+            (warnings.forwarding_device, ForwardingScope::Device),
+            (warnings.forwarding_multicast, ForwardingScope::Multicast),
+        ] {
+            if on {
+                return Err(CheckFailure::KernelForwardingEnabled(scope));
+            }
         }
         if warnings.forwarding_unreadable {
             return Err(CheckFailure::Unverifiable(Probe::Forwarding));
         }
     }
+    warnings.weak_host = facts.weak_host != Some(false);
     evaluate_ipv6(&facts.ipv6, policy.allow_kernel_ipv6, &mut warnings)?;
     Ok(warnings)
 }
 
-/// The IPv6 part of [`evaluate_device`]. With IPv6 disabled on the port
-/// nothing else matters: the kernel drops every IPv6 frame received on or
-/// sent through it and keeps no IPv6 address or route there. Otherwise,
-/// in order: the disable flag unreadable (`probe=ipv6-disabled`), the
+/// The IPv6 part of [`evaluate_device`].
+///
+/// The router is IPv4 only, so while it is detached (before startup, after
+/// any exit, after a crash) the kernel's IPv6 stack is the only one on the
+/// ports. With IPv6 disabled on the port (`disable_ipv6 = 1`, or no IPv6
+/// in the namespace) nothing else matters: the kernel drops every IPv6
+/// frame received on or sent through it and keeps no IPv6 address or
+/// route there.
+///
+/// With IPv6 enabled even only the kernel's own link-local address is
+/// exposure: Linux implements the weak host model and IPv6 has no
+/// `rp_filter`, so a frame arriving on the port for any local IPv6 address
+/// of the host (another interface's global address, `::1` is excluded by
+/// the stack) is delivered to local sockets, and services bound to `[::]`
+/// (sshd, tunnels, ...) answer through the port; Neighbor Discovery and
+/// ICMPv6 answer on the segment. Only forwarding between interfaces needs
+/// more than link-local (a link-local source or destination is never
+/// forwarded, RFC 4291 2.5.6). So an enabled port is refused
+/// (`KERNEL_IPV6_ENABLED`) unless `allow` (`--allow-kernel-ipv6`).
+///
+/// The more specific findings are reported first, so each stays visible
+/// and testable: the disable flag unreadable (`probe=ipv6-disabled`), the
 /// address dump (`probe=ipv6-addresses`, then `KERNEL_IPV6_ADDRESSES`),
-/// the route dump (`probe=ipv6-routes`, then `KERNEL_IPV6_ROUTES`), and
-/// the forwarding sysctls (`probe=ipv6-forwarding`, then
-/// `KERNEL_IPV6_FORWARDING_ENABLED scope=global|device`), each refused
-/// unless `allow` (`--allow-kernel-ipv6`), which records them as
-/// warnings instead.
+/// the route dump (`probe=ipv6-routes`, then `KERNEL_IPV6_ROUTES`), the
+/// forwarding sysctls (`probe=ipv6-forwarding`, then
+/// `KERNEL_IPV6_FORWARDING_ENABLED scope=global|device|force|multicast`),
+/// and only then `KERNEL_IPV6_ENABLED`. With `allow` every one of them is a
+/// warning instead (`IPV6_ENABLED_ALLOWED`, `IPV6_UNVERIFIABLE`,
+/// `IPV6_ADDRESSES_ALLOWED`, `IPV6_ROUTES_ALLOWED`,
+/// `IPV6_FORWARDING_ENABLED scope=...`).
 ///
 /// One override for the whole IPv6 stack, not one per fact: the router
-/// does not implement IPv6, so the only safe setting is IPv6 off on the
-/// ports (`disable_ipv6 = 1`, then every check passes), and an operator
-/// who cannot do that yet accepts the kernel's IPv6 on the ports as a
-/// whole (an address alone lets the kernel answer on the segment,
-/// forwarding alone lets it forward to its other interfaces). It is
-/// separate from `--allow-kernel-forwarding`, which keeps meaning IPv4
-/// only.
+/// does not implement IPv6, so the only safe setting is `disable_ipv6 = 1`,
+/// and an operator who cannot do that yet accepts the kernel's IPv6 on the
+/// ports as a whole. It is separate from `--allow-kernel-forwarding`,
+/// which keeps meaning IPv4 only.
 pub fn evaluate_ipv6(
     facts: &Ipv6Facts,
     allow: bool,
@@ -655,17 +732,27 @@ pub fn evaluate_ipv6(
     for (flag, scope) in [
         (facts.forwarding_global, ForwardingScope::Global),
         (facts.forwarding_device, ForwardingScope::Device),
+        (facts.forwarding_force, ForwardingScope::Force),
+        (facts.forwarding_multicast, ForwardingScope::Multicast),
     ] {
         match flag {
             None => unverifiable(Probe::Ipv6Forwarding, warnings)?,
             Some(false) => {}
-            Some(true) if allow => match scope {
-                ForwardingScope::Global => warnings.ipv6_forwarding_global = true,
-                ForwardingScope::Device => warnings.ipv6_forwarding_device = true,
-            },
+            Some(true) if allow => {
+                *match scope {
+                    ForwardingScope::Global => &mut warnings.ipv6_forwarding_global,
+                    ForwardingScope::Device => &mut warnings.ipv6_forwarding_device,
+                    ForwardingScope::Force => &mut warnings.ipv6_forwarding_force,
+                    ForwardingScope::Multicast => &mut warnings.ipv6_forwarding_multicast,
+                } = true
+            }
             Some(true) => return Err(CheckFailure::KernelIpv6ForwardingEnabled(scope)),
         }
     }
+    if !allow {
+        return Err(CheckFailure::KernelIpv6Enabled);
+    }
+    warnings.ipv6_enabled = true;
     Ok(())
 }
 
@@ -690,7 +777,7 @@ pub fn parse_flag(text: &str) -> Option<bool> {
 pub mod linux {
     use std::fs;
 
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::super::netlink::{Dump, Family, LinkProbe};
     use super::{
@@ -735,23 +822,212 @@ pub mod linux {
         parse_flag(std::str::from_utf8(&buffer[..len]).ok()?)
     }
 
+    /// Why a sysctl read failed.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ReadError {
+        /// The file does not exist.
+        Absent,
+        /// Anything else: unreadable, too long, or not a number.
+        Unreadable,
+    }
+
+    /// Reads a short decimal sysctl into a stack buffer: no allocation (a
+    /// short path is converted on the stack by std).
+    fn read_number(path: &Path) -> Result<u32, ReadError> {
+        use std::io::Read;
+        let mut file = fs::File::open(path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ReadError::Absent
+            } else {
+                ReadError::Unreadable
+            }
+        })?;
+        let mut buffer = [0_u8; 8];
+        let mut len = 0;
+        loop {
+            let read = file
+                .read(&mut buffer[len..])
+                .map_err(|_| ReadError::Unreadable)?;
+            if read == 0 {
+                break;
+            }
+            len += read;
+            if len == buffer.len() {
+                return Err(ReadError::Unreadable);
+            }
+        }
+        let text = std::str::from_utf8(&buffer[..len]).map_err(|_| ReadError::Unreadable)?;
+        let text = text.trim();
+        if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(ReadError::Unreadable);
+        }
+        text.parse().map_err(|_| ReadError::Unreadable)
+    }
+
+    /// A `0`/`1` flag whose absence means off (sysctls newer than the
+    /// minimum kernel, such as `force_forwarding`, and `mc_forwarding`).
+    fn read_flag_or_absent(path: &Path) -> Option<bool> {
+        match read_number(path) {
+            Ok(0) | Err(ReadError::Absent) => Some(false),
+            Ok(1) => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Either of two flags: on if either is known on, otherwise unknown if
+    /// either is unknown (fail closed), otherwise off.
+    fn either(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+        if a == Some(true) || b == Some(true) {
+            return Some(true);
+        }
+        Some(a? || b?)
+    }
+
     /// `/proc/sys/net/ipv6`: present whenever the namespace has IPv6.
     pub const IPV6_SYSCTLS: &str = "/proc/sys/net/ipv6";
-    /// `net.ipv6.conf.all.forwarding`.
-    pub const IPV6_FORWARDING_ALL: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
+    /// `/proc/sys/net/ipv4`: always present with a mounted procfs.
+    pub const IPV4_SYSCTLS: &str = "/proc/sys/net/ipv4";
+    const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
+    const IPV4_MC_FORWARDING_ALL: &str = "/proc/sys/net/ipv4/conf/all/mc_forwarding";
+    const IPV4_RP_FILTER_ALL: &str = "/proc/sys/net/ipv4/conf/all/rp_filter";
+    const IPV4_ARP_IGNORE_ALL: &str = "/proc/sys/net/ipv4/conf/all/arp_ignore";
+    const IPV6_FORWARDING_ALL: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
+    const IPV6_FORCE_FORWARDING_ALL: &str = "/proc/sys/net/ipv6/conf/all/force_forwarding";
+    const IPV6_MC_FORWARDING_ALL: &str = "/proc/sys/net/ipv6/conf/all/mc_forwarding";
 
     /// `conf/<dev>/disable_ipv6`: `Some(true)` also when the namespace has
-    /// no IPv6 at all ([`IPV6_SYSCTLS`] does not exist: nothing else can
-    /// be read and nothing IPv6 can happen); `None` if the flag cannot be
-    /// read otherwise (fail closed: then every other IPv6 fact is read).
-    /// No allocation (std converts a short path on the stack).
+    /// no IPv6 at all ([`IPV6_SYSCTLS`] does not exist while
+    /// [`IPV4_SYSCTLS`] does: nothing IPv6 can happen); `None` if the flag
+    /// cannot be read otherwise (fail closed: then every other IPv6 fact
+    /// is read). No allocation.
     pub fn ipv6_disabled(disable_ipv6: &Path) -> Option<bool> {
         if let Some(flag) = read_flag(disable_ipv6) {
             return Some(flag);
         }
-        match fs::metadata(IPV6_SYSCTLS) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(true),
-            _ => None,
+        let ipv6_missing = matches!(
+            fs::metadata(IPV6_SYSCTLS),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+        );
+        without_flag(ipv6_missing, fs::metadata(IPV4_SYSCTLS).is_ok())
+    }
+
+    /// The disable flag could not be read: IPv6 counts as absent (off)
+    /// only if `/proc/sys/net/ipv6` does not exist while
+    /// `/proc/sys/net/ipv4` does (so procfs is there and the namespace
+    /// simply has no IPv6); anything else is unverifiable.
+    fn without_flag(ipv6_missing: bool, ipv4_present: bool) -> Option<bool> {
+        (ipv6_missing && ipv4_present).then_some(true)
+    }
+
+    /// Weak-host exposure from `(all, device)` pairs of `rp_filter` and
+    /// `arp_ignore`: the kernel applies the larger value of each pair
+    /// (`IN_DEV_MAXCONF`), and only both effective values 0 are exposed.
+    fn weak_host(rp_filter: (u32, u32), arp_ignore: (u32, u32)) -> bool {
+        rp_filter.0.max(rp_filter.1) == 0 && arp_ignore.0.max(arp_ignore.1) == 0
+    }
+
+    /// The IPv4 procfs facts of one port.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Ipv4Sysctls {
+        pub forwarding_global: Option<bool>,
+        pub forwarding_device: Option<bool>,
+        pub forwarding_multicast: Option<bool>,
+        pub weak_host: Option<bool>,
+    }
+
+    /// The IPv6 forwarding facts of one port.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Ipv6Forwarding {
+        pub global: Option<bool>,
+        pub device: Option<bool>,
+        pub force: Option<bool>,
+        pub multicast: Option<bool>,
+    }
+
+    /// The procfs paths of one port, built once (cold); reading them
+    /// never allocates, so the run-time link round uses the same reader as
+    /// the startup check.
+    ///
+    /// The paths name the device, so they follow the name, not the
+    /// interface index: if the port is renamed its sysctls become
+    /// unreadable (a failed query, `LINK_UNVERIFIABLE` after three rounds),
+    /// and if another device then takes the old name its sysctls are read
+    /// instead until the next restart (whose startup reads the new
+    /// device's own). Do not rename ports while the router runs.
+    #[derive(Clone, Debug)]
+    pub struct PortSysctls {
+        ipv4_forwarding: PathBuf,
+        ipv4_mc_forwarding: PathBuf,
+        ipv4_rp_filter: PathBuf,
+        ipv4_arp_ignore: PathBuf,
+        ipv6_disable: PathBuf,
+        ipv6_forwarding: PathBuf,
+        ipv6_force_forwarding: PathBuf,
+        ipv6_mc_forwarding: PathBuf,
+    }
+
+    impl PortSysctls {
+        /// `device` was accepted by `SessionConfig::new` (no `/`, not `.`
+        /// or `..`), so it is one path component.
+        pub fn new(device: &str) -> Self {
+            let v4 = |name: &str| PathBuf::from(format!("/proc/sys/net/ipv4/conf/{device}/{name}"));
+            let v6 = |name: &str| PathBuf::from(format!("/proc/sys/net/ipv6/conf/{device}/{name}"));
+            Self {
+                ipv4_forwarding: v4("forwarding"),
+                ipv4_mc_forwarding: v4("mc_forwarding"),
+                ipv4_rp_filter: v4("rp_filter"),
+                ipv4_arp_ignore: v4("arp_ignore"),
+                ipv6_disable: v6("disable_ipv6"),
+                ipv6_forwarding: v6("forwarding"),
+                ipv6_force_forwarding: v6("force_forwarding"),
+                ipv6_mc_forwarding: v6("mc_forwarding"),
+            }
+        }
+
+        /// IPv4 forwarding (`ip_forward`, the device's `forwarding`, and
+        /// `mc_forwarding` of `all` or the device) and the weak-host
+        /// exposure (effective `rp_filter` and `arp_ignore`, the larger of
+        /// `all` and the device as the kernel takes them, both 0).
+        pub fn ipv4(&self) -> Ipv4Sysctls {
+            let pair = |all: &str, device: &Path| -> Option<(u32, u32)> {
+                Some((read_number(Path::new(all)).ok()?, read_number(device).ok()?))
+            };
+            let weak_host = pair(IPV4_RP_FILTER_ALL, &self.ipv4_rp_filter)
+                .zip(pair(IPV4_ARP_IGNORE_ALL, &self.ipv4_arp_ignore))
+                .map(|(rp_filter, arp_ignore)| weak_host(rp_filter, arp_ignore));
+            Ipv4Sysctls {
+                forwarding_global: read_flag(Path::new(IP_FORWARD)),
+                forwarding_device: read_flag(&self.ipv4_forwarding),
+                forwarding_multicast: either(
+                    read_flag_or_absent(Path::new(IPV4_MC_FORWARDING_ALL)),
+                    read_flag_or_absent(&self.ipv4_mc_forwarding),
+                ),
+                weak_host,
+            }
+        }
+
+        /// [`ipv6_disabled`] of this port.
+        pub fn ipv6_disabled(&self) -> Option<bool> {
+            ipv6_disabled(&self.ipv6_disable)
+        }
+
+        /// The IPv6 forwarding sysctls: `conf/all/forwarding`, the device's
+        /// `forwarding`, `force_forwarding` of the device or `all` (Linux
+        /// 6.17+, absent is off), `mc_forwarding` of the device or `all`
+        /// (absent is off).
+        pub fn ipv6_forwarding(&self) -> Ipv6Forwarding {
+            Ipv6Forwarding {
+                global: read_flag(Path::new(IPV6_FORWARDING_ALL)),
+                device: read_flag(&self.ipv6_forwarding),
+                force: either(
+                    read_flag_or_absent(Path::new(IPV6_FORCE_FORWARDING_ALL)),
+                    read_flag_or_absent(&self.ipv6_force_forwarding),
+                ),
+                multicast: either(
+                    read_flag_or_absent(Path::new(IPV6_MC_FORWARDING_ALL)),
+                    read_flag_or_absent(&self.ipv6_mc_forwarding),
+                ),
+            }
         }
     }
 
@@ -767,13 +1043,10 @@ pub mod linux {
     /// one connected rtnetlink socket (`probe`, `None` if it could not be
     /// opened): RX queues and MTU (`RTM_GETLINK`), kernel IPv4 and IPv6
     /// addresses (`RTM_GETADDR`) and routes of every table
-    /// (`RTM_GETROUTE`), then the forwarding and `disable_ipv6` sysctls from
-    /// procfs (the reading process's namespace).
-    ///
-    /// `device` was accepted by `SessionConfig::new` (no `/`, not `.` or
-    /// `..`), so it is one path component.
+    /// (`RTM_GETROUTE`), then the procfs sysctls of `sysctls` (the reading
+    /// process's namespace).
     pub fn device_facts(
-        device: &str,
+        sysctls: &PortSysctls,
         session: SessionFacts,
         probe: Option<&mut LinkProbe>,
     ) -> Result<DeviceFacts, CheckFailure> {
@@ -789,26 +1062,22 @@ pub mod linux {
         let ipv4_routes = probe
             .count(Dump::Routes(Family::Ipv4), ifindex)
             .map_err(|_| CheckFailure::Unverifiable(Probe::Ipv4Routes))?;
-        let flag = |path: String| {
-            fs::read_to_string(path)
-                .ok()
-                .as_deref()
-                .and_then(parse_flag)
-        };
-        let disabled = ipv6_disabled(Path::new(&format!(
-            "/proc/sys/net/ipv6/conf/{device}/disable_ipv6"
-        )));
+        let disabled = sysctls.ipv6_disabled();
         let ipv6 = if disabled == Some(true) {
             Ipv6Facts::DISABLED
         } else {
+            let forwarding = sysctls.ipv6_forwarding();
             Ipv6Facts {
                 disabled,
                 addresses: probe.count(Dump::Addresses(Family::Ipv6), ifindex).ok(),
                 routes: probe.count(Dump::Routes(Family::Ipv6), ifindex).ok(),
-                forwarding_global: flag(IPV6_FORWARDING_ALL.to_owned()),
-                forwarding_device: flag(format!("/proc/sys/net/ipv6/conf/{device}/forwarding")),
+                forwarding_global: forwarding.global,
+                forwarding_device: forwarding.device,
+                forwarding_force: forwarding.force,
+                forwarding_multicast: forwarding.multicast,
             }
         };
+        let ipv4 = sysctls.ipv4();
         Ok(DeviceFacts {
             ifindex,
             rx_queues,
@@ -817,10 +1086,91 @@ pub mod linux {
             frame_capacity: session.frame_capacity,
             ipv4_addresses,
             ipv4_routes,
-            forwarding_global: flag("/proc/sys/net/ipv4/ip_forward".to_owned()),
-            forwarding_device: flag(format!("/proc/sys/net/ipv4/conf/{device}/forwarding")),
+            forwarding_global: ipv4.forwarding_global,
+            forwarding_device: ipv4.forwarding_device,
+            forwarding_multicast: ipv4.forwarding_multicast,
+            weak_host: ipv4.weak_host,
             ipv6,
         })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Without a readable `disable_ipv6`, only a namespace that has
+        /// IPv4 sysctls but no IPv6 ones counts as IPv6 off.
+        #[test]
+        fn a_missing_ipv6_tree_is_off_only_with_ipv4_present() {
+            assert_eq!(without_flag(true, true), Some(true));
+            assert_eq!(without_flag(true, false), None, "no procfs at all");
+            assert_eq!(
+                without_flag(false, true),
+                None,
+                "IPv6 there, flag unreadable"
+            );
+            assert_eq!(without_flag(false, false), None);
+        }
+
+        /// The effective `rp_filter`/`arp_ignore` is the larger of `all`
+        /// and the device.
+        #[test]
+        fn weak_host_takes_the_larger_of_all_and_the_device() {
+            assert!(weak_host((0, 0), (0, 0)));
+            for (rp_filter, arp_ignore) in [
+                ((0, 1), (0, 0)),
+                ((2, 0), (0, 0)),
+                ((0, 0), (1, 0)),
+                ((0, 0), (0, 8)),
+            ] {
+                assert!(
+                    !weak_host(rp_filter, arp_ignore),
+                    "{rp_filter:?} {arp_ignore:?}"
+                );
+            }
+        }
+
+        /// Absent optional flags are off, unreadable ones unknown, and
+        /// `either` is on if either is on, else unknown if either is.
+        #[test]
+        fn optional_flags_and_their_combination_fail_closed() {
+            assert_eq!(
+                read_flag_or_absent(Path::new("/proc/sys/net/ipv4/conf/nonexistent0/x")),
+                Some(false)
+            );
+            assert_eq!(read_flag_or_absent(Path::new("/proc/sys/net/ipv4")), None);
+            let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+            assert_eq!(read_flag_or_absent(Path::new(manifest)), None);
+            assert_eq!(
+                read_number(Path::new("/dev/null")),
+                Err(ReadError::Unreadable)
+            );
+            assert!(read_number(Path::new("/proc/sys/net/ipv4/conf/all/arp_ignore")).is_ok());
+            for (a, b, both) in [
+                (Some(true), None, Some(true)),
+                (None, Some(true), Some(true)),
+                (Some(false), None, None),
+                (None, Some(false), None),
+                (Some(false), Some(false), Some(false)),
+                (Some(false), Some(true), Some(true)),
+            ] {
+                assert_eq!(either(a, b), both, "{a:?} {b:?}");
+            }
+            // A real port name's sysctls read (loopback exists everywhere).
+            let lo = PortSysctls::new("lo").ipv4();
+            assert!(lo.forwarding_device.is_some() && lo.forwarding_multicast.is_some());
+            assert!(lo.weak_host.is_some());
+            let gone = PortSysctls::new("nonexistent0").ipv4();
+            assert_eq!(
+                (
+                    gone.forwarding_device,
+                    gone.weak_host,
+                    gone.forwarding_multicast
+                ),
+                (None, None, Some(false)),
+                "a missing device: unreadable, mc_forwarding absent is off"
+            );
+        }
     }
 }
 
@@ -912,7 +1262,9 @@ mod tests {
             ipv4_routes: 0,
             forwarding_global: Some(false),
             forwarding_device: Some(false),
-            ipv6: Ipv6Facts::CLEAN,
+            forwarding_multicast: Some(false),
+            weak_host: Some(false),
+            ipv6: Ipv6Facts::DISABLED,
         };
         let strict = CheckPolicy::default();
         let lenient = CheckPolicy {
@@ -1017,6 +1369,8 @@ mod tests {
             frame_capacity: 1792,
             forwarding_global: Some(false),
             forwarding_device: Some(false),
+            forwarding_multicast: Some(false),
+            weak_host: Some(false),
             ipv6: Ipv6Facts::DISABLED,
             ..DeviceFacts::default()
         };
@@ -1082,15 +1436,19 @@ mod tests {
             frame_capacity: 1792,
             forwarding_global: Some(false),
             forwarding_device: Some(false),
+            forwarding_multicast: Some(false),
+            weak_host: Some(false),
             ipv6: Ipv6Facts::CLEAN,
             ..DeviceFacts::default()
         }
     }
 
-    /// Kernel IPv6 on a port is refused (addresses outside link-local,
-    /// routes, forwarding, any unreadable fact) unless
-    /// `--allow-kernel-ipv6`, which warns; `disable_ipv6 = 1` makes every
-    /// other fact irrelevant, also unreadable ones.
+    /// IPv6 enabled on a port is refused (`KERNEL_IPV6_ENABLED`) unless
+    /// `--allow-kernel-ipv6`, after the more specific findings (addresses
+    /// outside link-local, routes, forwarding of every scope, unreadable
+    /// facts), each refused with its own code first; the override turns all
+    /// of them into warnings. `disable_ipv6 = 1` makes every other fact
+    /// irrelevant, also unreadable ones.
     #[test]
     fn kernel_ipv6_is_refused_unless_allowed_or_disabled() {
         let strict = CheckPolicy::default();
@@ -1099,7 +1457,23 @@ mod tests {
             ..strict
         };
         let clean = ipv6_clean();
-        assert_eq!(evaluate_device(&clean, strict), Ok(Warnings::default()));
+        // Link-local only: still refused, warned under the override.
+        assert_eq!(
+            evaluate_device(&clean, strict),
+            Err(CheckFailure::KernelIpv6Enabled)
+        );
+        assert_eq!(
+            evaluate_device(&clean, allowed).map(|w| w.codes().collect::<Vec<_>>()),
+            Ok(vec!["IPV6_ENABLED_ALLOWED".to_owned()])
+        );
+        let disabled_port = DeviceFacts {
+            ipv6: Ipv6Facts::DISABLED,
+            ..clean
+        };
+        assert_eq!(
+            evaluate_device(&disabled_port, strict),
+            Ok(Warnings::default())
+        );
         let with = |ipv6: Ipv6Facts| DeviceFacts { ipv6, ..clean };
         let cases = [
             (
@@ -1136,6 +1510,22 @@ mod tests {
             ),
             (
                 Ipv6Facts {
+                    forwarding_force: Some(true),
+                    ..Ipv6Facts::CLEAN
+                },
+                CheckFailure::KernelIpv6ForwardingEnabled(ForwardingScope::Force),
+                "IPV6_FORWARDING_ENABLED scope=force",
+            ),
+            (
+                Ipv6Facts {
+                    forwarding_multicast: Some(true),
+                    ..Ipv6Facts::CLEAN
+                },
+                CheckFailure::KernelIpv6ForwardingEnabled(ForwardingScope::Multicast),
+                "IPV6_FORWARDING_ENABLED scope=multicast",
+            ),
+            (
+                Ipv6Facts {
                     disabled: None,
                     ..Ipv6Facts::CLEAN
                 },
@@ -1166,6 +1556,14 @@ mod tests {
                 CheckFailure::Unverifiable(Probe::Ipv6Forwarding),
                 "IPV6_UNVERIFIABLE probe=ipv6-forwarding",
             ),
+            (
+                Ipv6Facts {
+                    forwarding_force: None,
+                    ..Ipv6Facts::CLEAN
+                },
+                CheckFailure::Unverifiable(Probe::Ipv6Forwarding),
+                "IPV6_UNVERIFIABLE probe=ipv6-forwarding",
+            ),
         ];
         for (ipv6, refusal, warning) in cases {
             let facts = with(ipv6);
@@ -1177,19 +1575,21 @@ mod tests {
             };
             assert_eq!(evaluate_device(&facts, ipv4_only), Err(refusal), "{ipv6:?}");
             let warnings = evaluate_device(&facts, allowed).expect("warned when allowed");
-            assert_eq!(warnings.codes().collect::<Vec<_>>(), [warning], "{ipv6:?}");
+            assert_eq!(
+                warnings.codes().collect::<Vec<_>>(),
+                ["IPV6_ENABLED_ALLOWED", warning],
+                "{ipv6:?}"
+            );
             // Disabled on the port: nothing else matters.
             let disabled = Ipv6Facts {
                 disabled: Some(true),
                 ..ipv6
             };
-            if ipv6.disabled.is_some() {
-                assert_eq!(
-                    evaluate_device(&with(disabled), strict),
-                    Ok(Warnings::default()),
-                    "{ipv6:?}"
-                );
-            }
+            assert_eq!(
+                evaluate_device(&with(disabled), strict),
+                Ok(Warnings::default()),
+                "{ipv6:?}"
+            );
         }
         // Everything at once: the order of refusals, and every warning.
         let exposed = Ipv6Facts {
@@ -1198,6 +1598,8 @@ mod tests {
             routes: Some(1),
             forwarding_global: Some(true),
             forwarding_device: Some(true),
+            forwarding_force: Some(true),
+            forwarding_multicast: Some(true),
         };
         assert_eq!(
             evaluate_device(&with(exposed), strict),
@@ -1228,11 +1630,14 @@ mod tests {
         assert_eq!(
             all.codes().collect::<Vec<_>>(),
             [
+                "IPV6_ENABLED_ALLOWED",
                 "IPV6_UNVERIFIABLE probe=ipv6-disabled",
                 "IPV6_ADDRESSES_ALLOWED count=1",
                 "IPV6_ROUTES_ALLOWED count=1",
                 "IPV6_FORWARDING_ENABLED scope=global",
                 "IPV6_FORWARDING_ENABLED scope=device",
+                "IPV6_FORWARDING_ENABLED scope=force",
+                "IPV6_FORWARDING_ENABLED scope=multicast",
             ]
         );
         // The default facts are unreadable: fail closed.
@@ -1272,8 +1677,13 @@ mod tests {
                 "KERNEL_IPV6_FORWARDING_ENABLED scope=global",
             ),
             (
-                CheckFailure::KernelIpv6ForwardingEnabled(ForwardingScope::Device),
-                "KERNEL_IPV6_FORWARDING_ENABLED scope=device",
+                CheckFailure::KernelIpv6ForwardingEnabled(ForwardingScope::Force),
+                "KERNEL_IPV6_FORWARDING_ENABLED scope=force",
+            ),
+            (CheckFailure::KernelIpv6Enabled, "KERNEL_IPV6_ENABLED"),
+            (
+                CheckFailure::KernelForwardingEnabled(ForwardingScope::Multicast),
+                "KERNEL_FORWARDING_ENABLED scope=multicast",
             ),
             (
                 CheckFailure::KernelIpv4Routes { count: 4 },
@@ -1290,6 +1700,56 @@ mod tests {
         ] {
             assert_eq!(failure.to_string(), text);
         }
+    }
+
+    /// IPv4 `mc_forwarding` is refused like the other forwarding sysctls
+    /// (warned under `--allow-kernel-forwarding`); the weak-host exposure
+    /// (or an unreadable `rp_filter`/`arp_ignore`) only ever warns.
+    #[test]
+    fn multicast_forwarding_refuses_and_weak_host_only_warns() {
+        let clean = DeviceFacts {
+            ipv6: Ipv6Facts::DISABLED,
+            ..ipv6_clean()
+        };
+        let strict = CheckPolicy::default();
+        let allowed = CheckPolicy {
+            allow_kernel_forwarding: true,
+            ..strict
+        };
+        let multicast = DeviceFacts {
+            forwarding_multicast: Some(true),
+            ..clean
+        };
+        assert_eq!(
+            evaluate_device(&multicast, strict),
+            Err(CheckFailure::KernelForwardingEnabled(
+                ForwardingScope::Multicast
+            ))
+        );
+        assert_eq!(
+            evaluate_device(&multicast, allowed).map(|w| w.codes().collect::<Vec<_>>()),
+            Ok(vec!["IPV4_FORWARDING_ENABLED scope=multicast".to_owned()])
+        );
+        assert_eq!(
+            evaluate_device(
+                &DeviceFacts {
+                    forwarding_multicast: None,
+                    ..clean
+                },
+                strict
+            ),
+            Err(CheckFailure::Unverifiable(Probe::Forwarding))
+        );
+        for weak_host in [Some(true), None] {
+            let facts = DeviceFacts { weak_host, ..clean };
+            let warnings = evaluate_device(&facts, strict).expect("never refused");
+            assert_eq!(
+                warnings.codes().collect::<Vec<_>>(),
+                ["IPV4_WEAK_HOST_EXPOSURE"],
+                "{weak_host:?}"
+            );
+        }
+        assert_eq!(evaluate_device(&clean, strict), Ok(Warnings::default()));
     }
 
     /// The `disable_ipv6` reader: a present flag reads; a missing flag
@@ -1319,6 +1779,8 @@ mod tests {
             frame_capacity: 1792,
             forwarding_global: Some(false),
             forwarding_device: Some(false),
+            forwarding_multicast: Some(false),
+            weak_host: Some(false),
             ipv6: Ipv6Facts::DISABLED,
             ..DeviceFacts::default()
         };

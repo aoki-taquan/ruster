@@ -10,6 +10,16 @@
 //!   dump of every table ([`Dump::Routes`]): a route counts if its
 //!   `RTA_OIF` or any `RTA_MULTIPATH` nexthop is the interface (see
 //!   [`route_matches`] for the IPv6 exclusions).
+//!
+//! The socket sets `NETLINK_GET_STRICT_CHK` (Linux 4.20+; `ruster run`
+//! needs 5.9), so the kernel validates every request strictly and filters
+//! the dumps itself: address dumps by `ifa_index`, route dumps by an
+//! `RTA_OIF` attribute (which the kernel matches against every nexthop,
+//! multipath and nexthop objects included, `fib_info_nh_uses_dev` and
+//! `fib6_info_uses_dev`). The userspace match below still runs on every
+//! message (defense in depth). After any failed query the socket is
+//! replaced, so an aborted dump never leaves a running dump behind that
+//! would make the next request fail with `EBUSY`.
 //! - Link facts of one interface index through one `RTM_GETLINK` request
 //!   ([`LinkProbe`]): MTU, `IFLA_NUM_RX_QUEUES`, and the `IFF_UP` /
 //!   `IFF_LOWER_UP` flags, in the caller's network namespace (a netlink
@@ -122,10 +132,6 @@ pub enum NetlinkError {
     UnexpectedPort,
     /// A link reply described another interface index than requested.
     UnexpectedLink,
-    /// A route names a nexthop object (`RTA_NH_ID`) without its device
-    /// (`net.ipv4.nexthop_compat_mode = 0`), so whether it leaves through
-    /// the port cannot be told.
-    Unattributable,
 }
 
 impl NetlinkError {
@@ -176,18 +182,20 @@ pub enum Dump {
     Routes(Family),
 }
 
-/// Longest dump request: header and `rtmsg`.
-pub const REQUEST_LEN: usize = HEADER_LEN + RTMSG_LEN;
+/// Longest dump request: header, `rtmsg`, and one `RTA_OIF`.
+pub const REQUEST_LEN: usize = HEADER_LEN + RTMSG_LEN + 8;
 
-/// The dump request of `dump`, at the front of the returned array, and its
-/// length: 24 bytes (`ifaddrmsg`) for addresses, 28 (`rtmsg`) for routes.
-/// The family header is zero but for its family, so the kernel dumps every
-/// table, no cached route (`RTM_F_CLONED` clear), and (without
-/// `NETLINK_GET_STRICT_CHK`) no filter.
-pub fn dump_request(dump: Dump, sequence: u32) -> ([u8; REQUEST_LEN], usize) {
+/// The dump request of `dump` for `ifindex`, at the front of the returned
+/// array, and its length: 24 bytes for addresses (`ifaddrmsg` with
+/// `ifa_index`, the strict-check filter), 36 for routes (`rtmsg` and an
+/// `RTA_OIF` attribute, the strict-check device filter). Every other header
+/// field is zero, as strict checking requires: every table (no `RTA_TABLE`),
+/// no cached route (`RTM_F_CLONED` clear). The kernel answers an index that
+/// does not exist with `ENODEV`.
+pub fn dump_request(dump: Dump, sequence: u32, ifindex: u32) -> ([u8; REQUEST_LEN], usize) {
     let (kind, family, body) = match dump {
         Dump::Addresses(family) => (RTM_GETADDR, family, IFADDRMSG_LEN),
-        Dump::Routes(family) => (RTM_GETROUTE, family, RTMSG_LEN),
+        Dump::Routes(family) => (RTM_GETROUTE, family, RTMSG_LEN + 8),
     };
     let mut request = [0_u8; REQUEST_LEN];
     let len = HEADER_LEN + body;
@@ -199,6 +207,17 @@ pub fn dump_request(dump: Dump, sequence: u32) -> ([u8; REQUEST_LEN], usize) {
     // nlmsg_pid 0: addressed to the kernel. The family is the first byte
     // of both `ifaddrmsg` and `rtmsg`.
     request[HEADER_LEN] = family.af();
+    match dump {
+        Dump::Addresses(_) => {
+            request[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&ifindex.to_ne_bytes());
+        }
+        Dump::Routes(_) => {
+            let at = HEADER_LEN + RTMSG_LEN;
+            request[at..at + 2].copy_from_slice(&8_u16.to_ne_bytes());
+            request[at + 2..at + 4].copy_from_slice(&RTA_OIF.to_ne_bytes());
+            request[at + 4..at + 8].copy_from_slice(&ifindex.to_ne_bytes());
+        }
+    }
     (request, len)
 }
 
@@ -417,9 +436,14 @@ fn is_ipv6_multicast(bytes: &[u8], len: u8) -> bool {
 /// the family; a duplicated `RTA_DST`, `RTA_OIF`, `RTA_MULTIPATH`,
 /// `RTA_TABLE`, or `RTA_NH_ID`; a wrongly sized one; an `rtnexthop`
 /// shorter than 8 bytes or running past `RTA_MULTIPATH`; an empty
-/// `RTA_MULTIPATH`; an IPv6 prefix without `RTA_DST`; and a route that
-/// names a nexthop object without a device
-/// ([`NetlinkError::Unattributable`]). Another family does not count.
+/// `RTA_MULTIPATH`; and an IPv6 prefix without `RTA_DST`. `RTA_TABLE` and
+/// `RTA_NH_ID` are only size-checked. Another family does not count.
+///
+/// A route that names only a nexthop object (`RTA_NH_ID`, no `RTA_OIF` or
+/// `RTA_MULTIPATH`: `net.ipv4.nexthop_compat_mode = 0`) counts: the request
+/// filtered on `ifindex`, so the kernel returned it because one of its
+/// nexthops uses the device, and userspace cannot tell otherwise (fail
+/// closed; resolving the id through `RTM_GETNEXTHOP` is a follow-up).
 pub fn route_matches(message: &[u8], family: Family, ifindex: u32) -> Result<bool, NetlinkError> {
     if message.len() < HEADER_LEN + RTMSG_LEN {
         return Err(NetlinkError::Malformed);
@@ -460,7 +484,7 @@ pub fn route_matches(message: &[u8], family: Family, ifindex: u32) -> Result<boo
         through |= multipath_through(nexthops, ifindex)?;
     }
     if oif.is_none() && multipath.is_none() && nexthop_object.is_some() {
-        return Err(NetlinkError::Unattributable);
+        through = true;
     }
     if family == Family::Ipv6 && dst_len != 0 {
         let dst = dst.ok_or(NetlinkError::Malformed)?;
@@ -640,20 +664,45 @@ pub struct LinkProbe {
     buffer: Vec<u8>,
     port: Option<u32>,
     sequence: u32,
+    /// Sockets replaced after a failed query.
+    reopened: u32,
 }
 
 #[cfg(target_os = "linux")]
 impl LinkProbe {
-    /// Opens the socket and connects it to the kernel (`nl_pid` 0).
+    /// Opens the socket, turns on strict checking, and connects it to the
+    /// kernel (`nl_pid` 0).
     pub fn open() -> Result<Self, NetlinkError> {
-        let socket = sys::RouteSocket::open()?;
-        socket.connect_kernel()?;
         Ok(Self {
-            socket,
+            socket: Self::socket()?,
             buffer: vec![0_u8; RECEIVE_BUFFER],
             port: None,
             sequence: 0,
+            reopened: 0,
         })
+    }
+
+    fn socket() -> Result<sys::RouteSocket, NetlinkError> {
+        let socket = sys::RouteSocket::open()?;
+        socket.strict_check()?;
+        socket.connect_kernel()?;
+        Ok(socket)
+    }
+
+    /// After a failed query: replaces the socket (closing the old one ends
+    /// any dump the kernel still runs on it and drops queued answers), so
+    /// the next query never meets `EBUSY` or a stale chunk. If a new socket
+    /// cannot be opened the old one stays and the next failure tries
+    /// again. No allocation (one `socket`, `setsockopt`, `connect`).
+    fn recover<T>(&mut self, result: Result<T, NetlinkError>) -> Result<T, NetlinkError> {
+        if result.is_err() {
+            if let Ok(socket) = Self::socket() {
+                self.socket = socket;
+                self.port = None;
+                self.reopened = self.reopened.saturating_add(1);
+            }
+        }
+        result
     }
 
     fn next_sequence(&mut self) -> u32 {
@@ -667,6 +716,11 @@ impl LinkProbe {
     /// chunk while handing out the previous one). A dump that raced a
     /// change is retried at most [`DUMP_ATTEMPTS`] times.
     pub fn count(&mut self, dump: Dump, ifindex: u32) -> Result<u32, NetlinkError> {
+        let result = self.count_once(dump, ifindex);
+        self.recover(result)
+    }
+
+    fn count_once(&mut self, dump: Dump, ifindex: u32) -> Result<u32, NetlinkError> {
         for _ in 0..DUMP_ATTEMPTS {
             let sequence = self.next_sequence();
             if let Some(total) = dump_once(&self.socket, &mut self.buffer, sequence, dump, ifindex)?
@@ -688,6 +742,11 @@ impl LinkProbe {
     /// while handling the `send`, so an empty queue (`EAGAIN`) is an error
     /// of this query.
     pub fn query(&mut self, ifindex: u32) -> Result<LinkFacts, NetlinkError> {
+        let result = self.query_once(ifindex);
+        self.recover(result)
+    }
+
+    fn query_once(&mut self, ifindex: u32) -> Result<LinkFacts, NetlinkError> {
         let sequence = self.next_sequence();
         self.socket.send(&link_request(sequence, ifindex))?;
         let port = match self.port {
@@ -726,7 +785,7 @@ fn dump_once(
     dump: Dump,
     ifindex: u32,
 ) -> Result<Option<u32>, NetlinkError> {
-    let (request, len) = dump_request(dump, sequence);
+    let (request, len) = dump_request(dump, sequence, ifindex);
     socket.send(&request[..len])?;
     // The connect bound the socket; its port id names our replies.
     let port = socket.port_id()?;
@@ -766,6 +825,10 @@ mod sys {
     /// `MSG_DONTWAIT`: fail with `EAGAIN` instead of blocking.
     const MSG_DONTWAIT: c_int = 0x40;
     const EINTR: i32 = 4;
+    /// `SOL_NETLINK`.
+    const SOL_NETLINK: c_int = 270;
+    /// `NETLINK_GET_STRICT_CHK` (Linux 4.20+).
+    const NETLINK_GET_STRICT_CHK: c_int = 12;
     const AF_NETLINK_FAMILY: u16 = 16;
 
     /// Linux `struct sockaddr_nl` (12 bytes).
@@ -793,6 +856,14 @@ mod sys {
         fn getsockname(fd: c_int, address: *mut c_void, len: *mut u32) -> c_int;
         // `int connect(int, const struct sockaddr *, socklen_t)`.
         fn connect(fd: c_int, address: *const c_void, len: u32) -> c_int;
+        // `int setsockopt(int, int, int, const void *, socklen_t)`.
+        fn setsockopt(
+            fd: c_int,
+            level: c_int,
+            name: c_int,
+            value: *const c_void,
+            len: u32,
+        ) -> c_int;
         fn recvfrom(
             fd: c_int,
             buffer: *mut c_void,
@@ -826,6 +897,28 @@ mod sys {
             Ok(Self {
                 fd: unsafe { OwnedFd::from_raw_fd(fd) },
             })
+        }
+
+        /// Turns on `NETLINK_GET_STRICT_CHK`: the kernel validates every
+        /// request header and attribute and applies the dump filters.
+        pub fn strict_check(&self) -> Result<(), NetlinkError> {
+            let on: c_int = 1;
+            // SAFETY: `on` is a live, initialized `int` that the call only
+            // reads, and the length is its size (4); the fd is open (owned
+            // by `self`).
+            let result = unsafe {
+                setsockopt(
+                    self.fd.as_raw_fd(),
+                    SOL_NETLINK,
+                    NETLINK_GET_STRICT_CHK,
+                    (&raw const on).cast(),
+                    std::mem::size_of::<c_int>() as u32,
+                )
+            };
+            if result != 0 {
+                return Err(last_errno());
+            }
+            Ok(())
         }
 
         /// Connects the socket to the kernel (`nl_pid` 0, no groups), so
@@ -989,27 +1082,31 @@ mod tests {
 
     #[test]
     fn request_is_an_af_inet_dump() {
-        let (request, len) = dump_request(V4A, 9);
+        let (request, len) = dump_request(V4A, 9, 0x0102_0304);
         assert_eq!(len, 24);
         assert_eq!(&request[0..4], &24_u32.to_ne_bytes());
         assert_eq!(&request[4..6], &22_u16.to_ne_bytes());
         assert_eq!(&request[6..8], &0x301_u16.to_ne_bytes());
         assert_eq!(&request[8..12], &9_u32.to_ne_bytes());
         assert_eq!(request[16], 2);
-        assert!(request[17..].iter().all(|byte| *byte == 0));
+        // prefixlen, flags, scope zero (strict checking); ifa_index is the
+        // kernel's filter.
+        assert_eq!(&request[17..20], &[0; 3]);
+        assert_eq!(&request[20..24], &0x0102_0304_u32.to_ne_bytes());
+        assert!(request[24..].iter().all(|byte| *byte == 0));
     }
 
-    /// Route dumps carry a zero `rtmsg` but for the family: every table
-    /// (`rtm_table` 0, no `RTA_TABLE`), no cached routes (`RTM_F_CLONED`
-    /// clear).
+    /// Route dumps carry a zero `rtmsg` but for the family (every table:
+    /// `rtm_table` 0, no `RTA_TABLE`; no cached routes: `RTM_F_CLONED`
+    /// clear) and one `RTA_OIF`, the kernel's device filter.
     #[test]
     fn route_and_ipv6_requests_dump_every_table() {
         for (dump, kind, len, family) in [
-            (V4R, 26_u16, 28_usize, 2_u8),
-            (V6R, 26, 28, 10),
+            (V4R, 26_u16, 36_usize, 2_u8),
+            (V6R, 26, 36, 10),
             (V6A, 22, 24, 10),
         ] {
-            let (request, got) = dump_request(dump, 3);
+            let (request, got) = dump_request(dump, 3, 5);
             assert_eq!(got, len);
             assert_eq!(&request[0..4], &u32::try_from(len).unwrap().to_ne_bytes());
             assert_eq!(&request[4..6], &kind.to_ne_bytes());
@@ -1017,7 +1114,12 @@ mod tests {
             assert_eq!(&request[8..12], &3_u32.to_ne_bytes());
             assert_eq!(&request[12..16], &[0; 4], "to the kernel");
             assert_eq!(request[16], family);
-            assert!(request[17..].iter().all(|byte| *byte == 0), "{dump:?}");
+            if kind == 26 {
+                assert!(request[17..28].iter().all(|byte| *byte == 0), "{dump:?}");
+                assert_eq!(&request[28..36], &oif(5)[..], "{dump:?}");
+            } else {
+                assert_eq!(&request[20..24], &5_u32.to_ne_bytes());
+            }
         }
     }
 
@@ -1097,9 +1199,10 @@ mod tests {
         let nh_id = attribute(RTA_NH_ID, &9_u32.to_ne_bytes());
         let with_object = route(2, 8, 254, &[dst4, nh_id.clone(), oif(5)]);
         assert_eq!(count(&with_object, V4R), Ok(1));
-        // A nexthop object without its device cannot be attributed.
+        // A nexthop object without its device (nexthop_compat_mode 0)
+        // came through the kernel's device filter: counted (fail closed).
         let bare_object = route(2, 0, 254, &[nh_id]);
-        assert_eq!(count(&bare_object, V4R), Err(NetlinkError::Unattributable));
+        assert_eq!(count(&bare_object, V4R), Ok(1));
     }
 
     /// IPv6: the kernel's automatic link-local and multicast routes are
@@ -1574,18 +1677,64 @@ mod tests {
         // success is asserted, and a missing index has no address.
         assert_eq!(probe.query(1).map(|facts| facts.mtu), Ok(facts.mtu));
         assert!(probe.ipv4_addresses(1).is_ok());
-        assert_eq!(probe.ipv4_addresses(i32::MAX as u32), Ok(0));
+        // Strict checking: the kernel filters by index and refuses one
+        // that does not exist.
+        assert!(probe
+            .ipv4_addresses(i32::MAX as u32)
+            .expect_err("filtered on a missing index")
+            .is_no_device());
         assert_eq!(probe.query(1).map(|facts| facts.mtu), Ok(facts.mtu));
-        // Route and IPv6 dumps of every table on the same socket; a
-        // missing index has none (IPv6 may be off in this kernel, which
-        // still answers).
+        // Route and IPv6 dumps of every table on the same socket (IPv6
+        // only if this kernel has it).
+        let has_ipv6 = std::path::Path::new("/proc/sys/net/ipv6").exists();
         for family in [Family::Ipv4, Family::Ipv6] {
+            if family == Family::Ipv6 && !has_ipv6 {
+                continue;
+            }
             for dump in [Dump::Addresses(family), Dump::Routes(family)] {
                 assert!(probe.count(dump, 1).is_ok(), "{dump:?}");
-                assert_eq!(probe.count(dump, i32::MAX as u32), Ok(0), "{dump:?}");
+                assert!(
+                    probe
+                        .count(dump, i32::MAX as u32)
+                        .expect_err("missing index")
+                        .is_no_device(),
+                    "{dump:?}"
+                );
             }
         }
         assert_eq!(probe.query(1).map(|facts| facts.mtu), Ok(facts.mtu));
+    }
+
+    /// A query that fails mid-dump (here: every datagram is cut by a
+    /// 16-byte buffer) replaces the socket, so whatever the kernel still
+    /// had running or queued on the old one cannot wedge the next query
+    /// (`EBUSY`) or answer it; with the buffer back, the next dump and link
+    /// query succeed on the new socket.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_dump_replaces_the_socket() {
+        let mut probe = LinkProbe::open().expect("socket");
+        assert!(probe.ipv4_addresses(1).is_ok());
+        let before = probe.socket.port_id().expect("port id");
+        probe.buffer = vec![0_u8; 16];
+        assert_eq!(
+            probe.count(Dump::Routes(Family::Ipv4), 1),
+            Err(NetlinkError::Truncated)
+        );
+        assert_eq!(probe.reopened, 1);
+        probe.buffer = vec![0_u8; RECEIVE_BUFFER];
+        assert!(probe.count(Dump::Routes(Family::Ipv4), 1).is_ok());
+        assert_ne!(
+            probe.socket.port_id().expect("port id"),
+            before,
+            "new socket"
+        );
+        assert!(probe.query(1).is_ok());
+        // A link query failure replaces it too.
+        assert!(probe.query(i32::MAX as u32).is_err());
+        assert_eq!(probe.reopened, 2);
+        assert!(probe.query(1).is_ok());
+        assert_eq!(probe.reopened, 2, "success keeps the socket");
     }
 
     /// The live dump works unprivileged in any network namespace; the
@@ -1597,7 +1746,10 @@ mod tests {
     fn live_dump_answers() {
         let mut probe = LinkProbe::open().expect("socket");
         assert!(probe.ipv4_addresses(1).is_ok());
-        assert_eq!(probe.ipv4_addresses(u32::MAX), Ok(0));
-        assert_eq!(probe.count(Dump::Routes(Family::Ipv4), u32::MAX), Ok(0));
+        assert!(probe.count(Dump::Routes(Family::Ipv4), 1).is_ok());
+        assert!(probe
+            .count(Dump::Routes(Family::Ipv4), u32::MAX)
+            .expect_err("missing index")
+            .is_no_device());
     }
 }

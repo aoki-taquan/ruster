@@ -596,15 +596,25 @@ sudo kill -HUP <pid>                                               # configをre
   policy routing tableとmultipath nexthopを含む）を置かない（`ip -4 addr flush dev <dev>`）。
   attach中は無意味で、停止中やcrash後にkernelがfirewall/NATを迂回してforwardし得るためで、
   `stage=checks code=KERNEL_IPV4_ADDRESSES`/`KERNEL_IPV4_ROUTES`/`MULTI_QUEUE_DEVICE`で拒否します。
-  routerはIPv4だけなので、portのIPv6はoffを推奨します（`sysctl -w net.ipv6.conf.<dev>.disable_ipv6=1`、
-  そのportのIPv6 checkは全て通る）。IPv6がonのportでは、link-local（`fe80::/10`）以外のIPv6 address
-  （`KERNEL_IPV6_ADDRESSES`）、自動のlink-local/multicast route以外のIPv6 route（`KERNEL_IPV6_ROUTES`）、
-  `net.ipv6.conf.all.forwarding`か`conf/<dev>/forwarding`（`KERNEL_IPV6_FORWARDING_ENABLED
-  scope=global|device`）、読めないIPv6 fact（`UNVERIFIABLE probe=ipv6-*`）を既定で拒否します。
-  link-local addressだけならkernelはport間をforwardできない（RFC 4291 2.5.6）ので受理します。
-  `--allow-kernel-ipv6`はこれらをまとめてwarningにします（kernelのIPv6 stackがdetach中にportで
-  応答・forwardし得るriskを受け入れる宣言。IPv4の拒否と`--allow-kernel-forwarding`には影響しません）。
-  既存環境でportにSLAAC/DHCPv6のglobal addressやRA由来のdefault routeがあると、今回から起動を拒否します。
+  routerはIPv4だけなので、portのIPv6は無効にする必要があります（`sysctl -w
+  net.ipv6.conf.<dev>.disable_ipv6=1`、そのportのIPv6 checkは全て通る）。IPv6がonのportは
+  link-localだけでも既定で拒否します（`KERNEL_IPV6_ENABLED`）: Linuxはweak host modelでIPv6には
+  `rp_filter`が無いため、detach中はportに届いたhostの任意のIPv6 address宛てframeがlocalに配送され、
+  `[::]`でlistenするservice（sshd等）がportから応答し得るからです（link-localだけではport間の
+  forwardはできない、RFC 4291 2.5.6）。より具体的なもの、つまり読めないIPv6 fact（`UNVERIFIABLE
+  probe=ipv6-*`）、link-local（`fe80::/10`）以外のIPv6 address（`KERNEL_IPV6_ADDRESSES`）、自動の
+  link-local/multicast route以外のIPv6 route（`KERNEL_IPV6_ROUTES`）、IPv6 forwarding
+  （`KERNEL_IPV6_FORWARDING_ENABLED scope=global|device|force|multicast`: `conf/all/forwarding`、
+  `conf/<dev>/forwarding`（単独ではforwardを有効にしないが確認する）、Linux 6.17+の
+  `force_forwarding`、`mc_forwarding`）を先に報告します。`--allow-kernel-ipv6`はこれらをまとめて
+  warningにします（detach中にkernelのIPv6 stackがportで受信・応答・forwardし得るriskを受け入れる
+  宣言。IPv4の拒否と`--allow-kernel-forwarding`には影響しません）。既存環境への影響: 新しいnetnsや
+  deviceは`disable_ipv6=0`が既定なので、portに`disable_ipv6=1`を設定する（または
+  `--allow-kernel-ipv6`）まで起動を拒否します。IPv4の`mc_forwarding`（multicast routing daemon）は
+  `KERNEL_FORWARDING_ENABLED scope=multicast`で拒否（`--allow-kernel-forwarding`でwarning）。
+  addressの無いportで実効`rp_filter`と`arp_ignore`が共に0なら`IPV4_WEAK_HOST_EXPOSURE`の
+  warningだけを出します（拒否するかはowner判断待ち。`net.ipv4.conf.all.arp_ignore=1`と
+  `rp_filter=1`を推奨）。
   `net.ipv4.ip_forward`や`conf/<dev>/forwarding`が1（または読めない）なら既定で
   `KERNEL_FORWARDING_ENABLED`（`UNVERIFIABLE probe=forwarding`）で拒否します。router停止中・exit後・
   crash後にport間をfirewall/NAT抜きで運び得るのはkernel forwardingだからで、namespaceの他の
@@ -648,9 +658,10 @@ sudo kill -HUP <pid>                                               # configをre
   warningだけです（802.3x PAUSE floodのようにwireからTX stallを起こせる環境向け。既定がfatalなのは
   exit後もforwarding拒否とkernel L3拒否でfail closedだから）。同じroundでportにkernel IPv4
   addressや全tableのIPv4 routeが現れたり（`RTM_GETADDR`/`RTM_GETROUTE`）、kernel forwardingがonに
-  なったら（procfs）、またIPv6がonのportでIPv6のaddress/route/forwardingが現れたら
-  `KERNEL_IPV4_ADDRESSES`/`KERNEL_IPV4_ROUTES`/`KERNEL_FORWARDING_ENABLED`/`KERNEL_IPV6_ADDRESSES`/
-  `KERNEL_IPV6_ROUTES`/`KERNEL_IPV6_FORWARDING_ENABLED`のwarningで動き続けます（attach中はkernelが
+  なったら（procfs）、portの`disable_ipv6`が0になったり、IPv6がonのportでIPv6の
+  address/route/forwardingが現れたら`KERNEL_IPV4_ADDRESSES`/`KERNEL_IPV4_ROUTES`/
+  `KERNEL_FORWARDING_ENABLED`/`KERNEL_IPV6_ENABLED`/`KERNEL_IPV6_ADDRESSES`/
+  `KERNEL_IPV6_ROUTES`/`KERNEL_IPV6_FORWARDING_ENABLED`（`IPV4_WEAK_HOST_EXPOSURE`も）のwarningで動き続けます（attach中はkernelが
   frameを見ないので無害で、fatalにするとdetachがbypassを作るため。次の起動は拒否、exit時に種類ごとの
   警告行）。各queryの失敗は種類ごとに数え3回連続でfatal（IPv6は`--allow-kernel-ipv6`なら
   `IPV6_UNVERIFIABLE` warning）。

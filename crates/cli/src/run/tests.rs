@@ -116,6 +116,8 @@ struct State {
     forwarding: RefCell<VecDeque<(IfId, Result<Forwarding, ()>)>>,
     /// IPv4 route dump results, consumed in order by the matching port.
     routes: RefCell<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
+    /// Weak-host readings, consumed in order by the matching port.
+    weak_host: RefCell<VecDeque<(IfId, Option<bool>)>>,
     /// IPv6 samples, consumed in order by the matching port.
     ipv6: RefCell<VecDeque<(IfId, Ipv6Sample)>>,
     /// Quiescence probes refused before one succeeds.
@@ -141,7 +143,9 @@ struct FakeHost {
     panic_in_build: bool,
     /// `net.ipv4.ip_forward` reads 1.
     forwarding_on: bool,
-    /// IPv6 facts of every port at startup (`None`: IPv6 on, clean).
+    /// The weak-host exposure of every port at startup.
+    weak_host: bool,
+    /// IPv6 facts of every port at startup (`None`: IPv6 disabled).
     ipv6: Option<Ipv6Facts>,
     /// IPv4 routes out of every port at startup.
     ipv4_routes: u32,
@@ -369,17 +373,16 @@ impl LinkMonitor for FakeLinks {
         Ok(Forwarding::default())
     }
 
+    fn ipv4_weak_host(&mut self, target: &LinkTarget) -> Option<bool> {
+        scripted(&self.state.weak_host, target.interface).unwrap_or(Some(false))
+    }
+
     fn ipv4_routes(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError> {
         scripted(&self.state.routes, target.interface).unwrap_or(Ok(0))
     }
 
     fn ipv6(&mut self, target: &LinkTarget) -> Ipv6Sample {
-        scripted(&self.state.ipv6, target.interface).unwrap_or(Ipv6Sample {
-            disabled: Ok(false),
-            addresses: Ok(0),
-            routes: Ok(0),
-            forwarding: Ok(Forwarding::default()),
-        })
+        scripted(&self.state.ipv6, target.interface).unwrap_or(Ipv6Sample::DISABLED)
     }
 }
 
@@ -452,7 +455,9 @@ impl PortHost for FakeHost {
             ipv4_routes: self.ipv4_routes,
             forwarding_global: Some(self.forwarding_on),
             forwarding_device: Some(false),
-            ipv6: self.ipv6.unwrap_or(Ipv6Facts::CLEAN),
+            forwarding_multicast: Some(false),
+            weak_host: Some(self.weak_host),
+            ipv6: self.ipv6.unwrap_or(Ipv6Facts::DISABLED),
         })
     }
 

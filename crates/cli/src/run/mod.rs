@@ -619,6 +619,10 @@ where
             "kernel IPv6 addresses are on a port; detached ports may be answered and routed by the kernel",
         ),
         (
+            exposure.ipv6_enabled,
+            "kernel IPv6 is enabled on a port; detached ports may be answered by the kernel's IPv6 stack",
+        ),
+        (
             exposure.ipv6_routes,
             "kernel IPv6 routes lead out of a port; detached ports may be routed by the kernel",
         ),

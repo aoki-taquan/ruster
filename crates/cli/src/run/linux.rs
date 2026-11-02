@@ -2,7 +2,6 @@
 //! engines, and the core adapter of `ruster-io-xdp-native`.
 
 use std::num::{NonZeroU128, NonZeroU32};
-use std::path::{Path, PathBuf};
 
 use ruster_config::{ValidatedAfXdpPortV1, ValidatedAfXdpV1, XdpAttachModeV1};
 use ruster_core::{BackendStats, IfId, MonotonicMillis};
@@ -11,6 +10,7 @@ use ruster_io_xdp_native::{
     XdpCounters, XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort, XdpPortConfig,
 };
 
+use super::checks::linux::PortSysctls;
 use super::checks::{self, CheckFailure, DeviceFacts, PrivilegeFailure};
 use super::engine::{ClockedIo, Datapath, DrainProgress, LinkMonitor};
 use super::netlink::{Dump, Family, LinkFacts, LinkProbe, NetlinkError};
@@ -34,20 +34,11 @@ impl PortHost for LinuxHost {
         let probe = LinkProbe::open().map_err(Failure::Links)?;
         // Device names were accepted by `SessionConfig::new` (one path
         // component).
-        let paths = devices
+        let sysctls = devices
             .iter()
-            .map(|(interface, device)| PortPaths {
-                interface: *interface,
-                forwarding: PathBuf::from(format!("/proc/sys/net/ipv4/conf/{device}/forwarding")),
-                ipv6_disable: PathBuf::from(format!(
-                    "/proc/sys/net/ipv6/conf/{device}/disable_ipv6"
-                )),
-                ipv6_forwarding: PathBuf::from(format!(
-                    "/proc/sys/net/ipv6/conf/{device}/forwarding"
-                )),
-            })
+            .map(|(interface, device)| (*interface, PortSysctls::new(device)))
             .collect();
-        Ok(NetlinkLinks { probe, paths })
+        Ok(NetlinkLinks { probe, sysctls })
     }
 
     fn preflight(&self, backend: &ValidatedAfXdpV1) -> Result<(), PrivilegeFailure> {
@@ -77,7 +68,8 @@ impl PortHost for LinuxHost {
             frame_capacity: port.umem().visible_capacity(),
         };
         let mut probe = LinkProbe::open().ok();
-        checks::linux::device_facts(port.device(), facts, probe.as_mut())
+        let sysctls = PortSysctls::new(port.device());
+        checks::linux::device_facts(&sysctls, facts, probe.as_mut())
     }
 
     fn attach(&self, session: &mut NativeSession, mode: XdpAttachModeV1) -> Result<(), Failure> {
@@ -146,30 +138,17 @@ fn domain(interface: IfId) -> UmemDomainId {
 /// the sysctl paths built once at startup.
 pub struct NetlinkLinks {
     probe: LinkProbe,
-    paths: Vec<PortPaths>,
-}
-
-/// The per-port sysctl paths of the watch.
-struct PortPaths {
-    interface: IfId,
-    /// `net/ipv4/conf/<dev>/forwarding`.
-    forwarding: PathBuf,
-    /// `net/ipv6/conf/<dev>/disable_ipv6`.
-    ipv6_disable: PathBuf,
-    /// `net/ipv6/conf/<dev>/forwarding`.
-    ipv6_forwarding: PathBuf,
+    sysctls: Vec<(IfId, PortSysctls)>,
 }
 
 impl NetlinkLinks {
-    fn paths(&self, target: &LinkTarget) -> Option<&PortPaths> {
-        self.paths
+    fn sysctls(&self, target: &LinkTarget) -> Option<&PortSysctls> {
+        self.sysctls
             .iter()
-            .find(|paths| paths.interface == target.interface)
+            .find(|(interface, _)| *interface == target.interface)
+            .map(|(_, sysctls)| sysctls)
     }
 }
-
-/// `net.ipv4.ip_forward` of this namespace.
-const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 
 impl LinkMonitor for NetlinkLinks {
     fn query(&mut self, target: &LinkTarget) -> Result<LinkFacts, NetlinkError> {
@@ -185,19 +164,25 @@ impl LinkMonitor for NetlinkLinks {
     }
 
     fn forwarding(&mut self, target: &LinkTarget) -> Result<Forwarding, ()> {
-        let device = &self.paths(target).ok_or(())?.forwarding;
+        let ipv4 = self.sysctls(target).ok_or(())?.ipv4();
         Ok(Forwarding {
-            global: checks::linux::read_flag(Path::new(IP_FORWARD)).ok_or(())?,
-            device: checks::linux::read_flag(device).ok_or(())?,
+            global: ipv4.forwarding_global.ok_or(())?,
+            device: ipv4.forwarding_device.ok_or(())?,
+            force: false,
+            multicast: ipv4.forwarding_multicast.ok_or(())?,
         })
     }
 
+    fn ipv4_weak_host(&mut self, target: &LinkTarget) -> Option<bool> {
+        self.sysctls(target)?.ipv4().weak_host
+    }
+
     /// `disable_ipv6` first: when set (or without IPv6 in the namespace)
-    /// nothing else is read; otherwise both IPv6 dumps and both IPv6
-    /// forwarding sysctls (also when the flag was unreadable: fail
+    /// nothing else is read; otherwise both IPv6 dumps and every IPv6
+    /// forwarding sysctl (also when the flag was unreadable: fail
     /// closed). No allocation.
     fn ipv6(&mut self, target: &LinkTarget) -> Ipv6Sample {
-        let Some(paths) = self.paths(target) else {
+        let Some(sysctls) = self.sysctls(target) else {
             return Ipv6Sample {
                 disabled: Err(()),
                 addresses: Err(NetlinkError::UnexpectedLink),
@@ -205,17 +190,20 @@ impl LinkMonitor for NetlinkLinks {
                 forwarding: Err(()),
             };
         };
-        let disabled = checks::linux::ipv6_disabled(&paths.ipv6_disable).ok_or(());
+        let disabled = sysctls.ipv6_disabled().ok_or(());
         if disabled == Ok(true) {
             return Ipv6Sample::DISABLED;
         }
-        let read = |path: &Path| checks::linux::read_flag(path).ok_or(());
-        let forwarding = read(Path::new(checks::linux::IPV6_FORWARDING_ALL)).and_then(|global| {
-            Ok(Forwarding {
+        let ipv6 = sysctls.ipv6_forwarding();
+        let forwarding = match (ipv6.global, ipv6.device, ipv6.force, ipv6.multicast) {
+            (Some(global), Some(device), Some(force), Some(multicast)) => Ok(Forwarding {
                 global,
-                device: read(&paths.ipv6_forwarding)?,
-            })
-        });
+                device,
+                force,
+                multicast,
+            }),
+            _ => Err(()),
+        };
         Ipv6Sample {
             disabled,
             addresses: self

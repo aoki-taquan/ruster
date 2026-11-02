@@ -403,6 +403,8 @@ fn round(
 const OFF: Result<Forwarding, ()> = Ok(Forwarding {
     global: false,
     device: false,
+    force: false,
+    multicast: false,
 });
 
 /// While attached, a kernel address on a port changes nothing (XDP takes
@@ -485,7 +487,12 @@ fn an_address_dump_failing_every_round_is_fatal_despite_link_success() {
 #[test]
 fn kernel_forwarding_at_run_time_warns_while_attached() {
     for (global, device) in [(true, false), (false, true), (true, true)] {
-        let on = Ok(Forwarding { global, device });
+        let on = Ok(Forwarding {
+            global,
+            device,
+            force: false,
+            multicast: false,
+        });
         for mut watch in [fresh(), watch_allowing()] {
             assert_eq!(
                 round(&mut watch, up(1500), Ok(0), on),
@@ -583,6 +590,8 @@ const IPV6_CLEAN: Ipv6Sample = Ipv6Sample {
     forwarding: Ok(Forwarding {
         global: false,
         device: false,
+        force: false,
+        multicast: false,
     }),
 };
 
@@ -592,13 +601,13 @@ const IPV6_CLEAN: Ipv6Sample = Ipv6Sample {
 #[test]
 fn kernel_routes_on_a_port_warn_while_attached() {
     let mut watch = fresh();
-    assert!(exposure_round(&mut watch, Ok(0), IPV6_CLEAN).is_empty());
+    assert!(exposure_round(&mut watch, Ok(0), Ipv6Sample::DISABLED).is_empty());
     assert_eq!(
-        exposure_round(&mut watch, Ok(2), IPV6_CLEAN),
+        exposure_round(&mut watch, Ok(2), Ipv6Sample::DISABLED),
         [warning(Condition::KernelIpv4Routes)]
     );
     assert!(
-        exposure_round(&mut watch, Ok(3), IPV6_CLEAN).is_empty(),
+        exposure_round(&mut watch, Ok(3), Ipv6Sample::DISABLED).is_empty(),
         "once"
     );
     assert!(watch.warning());
@@ -612,7 +621,7 @@ fn kernel_routes_on_a_port_warn_while_attached() {
     let (_, health) = watch.health().next().expect("port");
     assert_eq!((health.kernel_ipv4_routes, health.warnings), (3, 1));
     assert_eq!(
-        exposure_round(&mut watch, Ok(0), IPV6_CLEAN),
+        exposure_round(&mut watch, Ok(0), Ipv6Sample::DISABLED),
         [recovered(Condition::KernelIpv4Routes)]
     );
     assert!(!watch.warning());
@@ -624,8 +633,8 @@ fn kernel_routes_on_a_port_warn_while_attached() {
     for _ in 0..LINK_PROBE_FAILURES_FATAL {
         events.extend(exposure_round(
             &mut watch,
-            Err(NetlinkError::Unattributable),
-            IPV6_CLEAN,
+            Err(NetlinkError::Truncated),
+            Ipv6Sample::DISABLED,
         ));
     }
     assert_eq!(
@@ -637,7 +646,8 @@ fn kernel_routes_on_a_port_warn_while_attached() {
     );
 }
 
-/// Kernel IPv6 on a port with IPv6 enabled warns per kind and recovers;
+/// Kernel IPv6 on a port warns: IPv6 enabled at all (`disable_ipv6`
+/// flipped to 0 while running), and each exposure kind; each recovers, and
 /// `disable_ipv6` turning on clears every kind at once.
 #[test]
 fn kernel_ipv6_at_run_time_warns_unless_disabled() {
@@ -648,12 +658,15 @@ fn kernel_ipv6_at_run_time_warns_unless_disabled() {
         forwarding: Ok(Forwarding {
             global: false,
             device: true,
+            force: false,
+            multicast: false,
         }),
     };
     for mut watch in [fresh(), fresh().allowing_kernel_ipv6(true)] {
         assert_eq!(
             exposure_round(&mut watch, Ok(0), exposed),
             [
+                warning(Condition::KernelIpv6Enabled),
                 warning(Condition::KernelIpv6Addresses),
                 warning(Condition::KernelIpv6Routes),
                 warning(Condition::KernelIpv6ForwardingEnabled),
@@ -670,18 +683,20 @@ fn kernel_ipv6_at_run_time_warns_unless_disabled() {
                 ipv6_forwarding: true,
                 ipv6_addresses: true,
                 ipv6_routes: true,
+                ipv6_enabled: true,
                 ..KernelExposure::default()
             }
         );
         let (_, health) = watch.health().next().expect("port");
         assert_eq!(
             (
+                health.kernel_ipv6_enabled,
                 health.kernel_ipv6_addresses,
                 health.kernel_ipv6_routes,
                 health.kernel_ipv6_forwarding,
                 health.warnings
             ),
-            (1, 2, true, 3)
+            (true, 1, 2, true, 4)
         );
         // disable_ipv6 = 1: whatever else the sample says, nothing is
         // exposed.
@@ -693,6 +708,7 @@ fn kernel_ipv6_at_run_time_warns_unless_disabled() {
         assert_eq!(
             exposure_round(&mut watch, Ok(0), disabled),
             [
+                recovered(Condition::KernelIpv6Enabled),
                 recovered(Condition::KernelIpv6Addresses),
                 recovered(Condition::KernelIpv6Routes),
                 recovered(Condition::KernelIpv6ForwardingEnabled),
@@ -707,12 +723,22 @@ fn kernel_ipv6_at_run_time_warns_unless_disabled() {
         };
         assert_eq!(
             exposure_round(&mut watch, Ok(0), routes_only),
-            [warning(Condition::KernelIpv6Routes)]
+            [
+                warning(Condition::KernelIpv6Enabled),
+                warning(Condition::KernelIpv6Routes)
+            ]
         );
         assert_eq!(
             exposure_round(&mut watch, Ok(0), IPV6_CLEAN),
             [recovered(Condition::KernelIpv6Routes)]
         );
+        // Link-local only, enabled: still a warning until disabled.
+        assert!(watch.warning());
+        assert_eq!(
+            exposure_round(&mut watch, Ok(0), Ipv6Sample::DISABLED),
+            [recovered(Condition::KernelIpv6Enabled)]
+        );
+        assert!(!watch.warning());
     }
 }
 
@@ -740,6 +766,14 @@ fn unreadable_ipv6_facts_are_failed_queries_unless_allowed() {
             ..IPV6_CLEAN
         },
     ];
+    // `KERNEL_IPV6_ENABLED` (the samples with a readable flag say 0) is
+    // covered above; here only the query outcome matters.
+    let enabled = warning(Condition::KernelIpv6Enabled);
+    let without_enabled = |mut events: Vec<WatchEvent>| {
+        events
+            .retain(|event| *event != enabled && *event != recovered(Condition::KernelIpv6Enabled));
+        events
+    };
     for sample in failing {
         let mut watch = fresh();
         let mut events = Vec::new();
@@ -747,7 +781,7 @@ fn unreadable_ipv6_facts_are_failed_queries_unless_allowed() {
             events.extend(exposure_round(&mut watch, Ok(0), sample));
         }
         assert_eq!(
-            events,
+            without_enabled(events),
             [
                 warning(Condition::LinkProbe),
                 fatal(Fatal::LinkUnverifiable)
@@ -769,11 +803,18 @@ fn unreadable_ipv6_facts_are_failed_queries_unless_allowed() {
         for _ in 0..10 {
             events.extend(exposure_round(&mut allowed, Ok(0), sample));
         }
-        assert_eq!(events, [warning(Condition::Ipv6Unverifiable)], "{sample:?}");
+        assert_eq!(
+            without_enabled(events),
+            [warning(Condition::Ipv6Unverifiable)],
+            "{sample:?}"
+        );
         assert!(allowed.warning());
         assert_eq!(
-            exposure_round(&mut allowed, Ok(0), IPV6_CLEAN),
+            without_enabled(exposure_round(&mut allowed, Ok(0), IPV6_CLEAN)),
             [recovered(Condition::Ipv6Unverifiable)]
+        );
+        assert!(
+            without_enabled(exposure_round(&mut allowed, Ok(0), Ipv6Sample::DISABLED)).is_empty()
         );
         assert!(!allowed.warning());
     }
@@ -788,7 +829,49 @@ fn unreadable_ipv6_facts_are_failed_queries_unless_allowed() {
         (Condition::KernelIpv6Routes, "KERNEL_IPV6_ROUTES"),
         (Condition::Ipv6Unverifiable, "IPV6_UNVERIFIABLE"),
         (Condition::KernelIpv4Routes, "KERNEL_IPV4_ROUTES"),
+        (Condition::KernelIpv6Enabled, "KERNEL_IPV6_ENABLED"),
+        (Condition::Ipv4WeakHost, "IPV4_WEAK_HOST_EXPOSURE"),
     ] {
         assert_eq!(condition.code(), code);
     }
+}
+
+/// The IPv4 weak-host advice warns (also when unreadable), recovers, and
+/// is never fatal; IPv4 multicast forwarding is forwarding.
+#[test]
+fn weak_host_warns_and_multicast_forwarding_is_forwarding() {
+    let mut watch = fresh();
+    let mut events = Vec::new();
+    for exposed in [Some(true), Some(true), None, Some(false), None] {
+        watch.on_weak_host(0, exposed, &mut |event| events.push(event));
+    }
+    assert_eq!(
+        events,
+        [
+            warning(Condition::Ipv4WeakHost),
+            recovered(Condition::Ipv4WeakHost),
+            warning(Condition::Ipv4WeakHost),
+        ]
+    );
+    let (_, health) = watch.health().next().expect("port");
+    assert!(health.ipv4_weak_host);
+    assert!(watch.warning());
+    let multicast = Ok(Forwarding {
+        multicast: true,
+        ..Forwarding::default()
+    });
+    assert_eq!(
+        round(&mut fresh(), up(1500), Ok(0), multicast),
+        [warning(Condition::KernelForwardingEnabled)]
+    );
+    let force = Ipv6Sample {
+        forwarding: Ok(Forwarding {
+            force: true,
+            ..Forwarding::default()
+        }),
+        ..IPV6_CLEAN
+    };
+    let mut watch = fresh();
+    assert!(exposure_round(&mut watch, Ok(0), force)
+        .contains(&warning(Condition::KernelIpv6ForwardingEnabled)));
 }
