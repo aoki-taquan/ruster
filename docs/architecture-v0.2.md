@@ -516,8 +516,7 @@ translated IPv4 address wordsとportを更新し、算術結果zeroをUDP wire�
 RFC 6864 atomic datagramとして保存します。RFC 1812 §4.2.2.3に従いreserved flagだけでは
 dropせず、IPv4 flags/fragment wordをNAT rewrite後のwireへそのまま保存します。
 
-fragment handling/reassembly、ICMP query
-NAT、static port forward、複数public address、port randomization/parity、minimal
+fragment handling/reassembly、static port forward、複数public address、port randomization/parity、minimal
 stateful sliceを越えるfull packet filterはdeferredです。RFC 3022/4787/7857の全機能準拠は
 主張しません。
 
@@ -592,8 +591,7 @@ traditional NAT domain境界はprotocol非依存です。設定済みoutside→i
 private sourceや外部から内部へのbypassを許可しません。runtime/config/snapshot mismatchはneighbor処理やstate変更より前にtyped dropします。
 inside発のpublic address宛てUDP/TCPは後述の「NAT44 hairpinning」で扱います。
 
-TCP fragment association/reassembly、ICMP query
-translation、static forwards、sequence/window validation（RSTのin-window検査を含む）、
+TCP fragment association/reassembly、static forwards、sequence/window validation（RSTのin-window検査を含む）、
 NATからのkeep-alive probe（RFC 6146 ESTABLISHED満了時のSHOULD）はdeferredです。
 
 ### TCP session phases and timers（N1、RFC 5382 REQ-5、RFC 7857 §2）
@@ -1158,7 +1156,7 @@ Next-Hop MTU 1〜67で、IPv4の最小MTU 68（RFC 791）未満はどのrouter�
 （RFC 1191 §4）ので、ICMP checksum検証の直後に両方向で`NAT44_ICMPV4_FRAG_NEEDED_MTU_INVALID`
 としてdropします（NAT44-098）。0はRFC 1191以前のrouter（§5）として有効です。
 local forwarding MTUとの比較、PMTU cache更新、MTU 0のplateau推定、local MTU超過時の
-Type 3/Code 4生成はまだありません。DF=0 packetの必要なfragmentation、ICMP query NAT、
+Type 3/Code 4生成はまだありません。DF=0 packetの必要なfragmentation、
 RFC 4884 full supportもdeferredです。
 
 ### translated error rate limit（NAT44-065）
@@ -1275,6 +1273,63 @@ outside→inside（REQ-4）は従来どおりdirect originだけを照合しま�
 source/destination address/portを任意に置換し、outer IPv4（TTL−1を含む）、引用IPv4、引用
 transport（引用Total Length内だけ、UDP zero保存、算術zeroは`0xffff`、TCP 8..16/17/18境界は
 NAT44-019C）、ICMP checksumをRFC 1624で更新します。外部errorの変換も同じbuilderを使います。
+
+## NAT44 ICMP query translation（N5、RFC 5508 §3）
+
+`[nat44.icmp]`（core `Nat44IcmpConfig`/`Nat44IcmpRuntime`）はICMP query（Echo 8/0、
+Timestamp 13/14）を変換します。RFC 5508 §3.1はQuery Identifierでsessionを識別し、NAPTに
+Identifierの変換（REQ-1）とexternal-host independentなmapping（REQ-1 a）を求めます。これは
+portをIdentifierに置き換えたEndpoint-Independent UDP mappingと同じ状態なので、
+`Nat44IcmpRuntime`はUDP NAT44のmapping engine（`Nat44UdpRuntime`）を自分のcaller-backed
+storageで駆動するwrapperです:
+
+- mapping key: inside interface、internal IPv4、internal Identifier（remoteを含まない）。
+- public identifier: pool（`[nat44.icmp.identifiers]`、省略時realm portsの数値。UDP/TCPの
+  portとは独立）内でlive mapping間unique。N2のpreservationとkeyed start/takeoverをそのまま使う。
+- filter peer: mappingがqueryしたremote address（portは常に0）。address-dependent filteringと
+  引用errorのauthorityに使う。`address-and-port-dependent`はpolicy構築時に拒否。
+- idle timer: mappingごとに一つ、outbound queryだけがrefresh（REQ-2: 60秒以上）。
+- per-host quota（N3）、O(1) slot list、keyed directory、free bitmap、occupancy、reconcile
+  permitはengineのものをそのまま使う。hash keyはICMP専用（publication keyの5本目、
+  reconcileごとにrotate、sequencerが再発行を拒否）で、UDP runtimeとstateもkeyも共有しない。
+  engineのhairpinningは常にoff（inbound query sessionが無いのでhairpin planは作られない）。
+
+packet path（`forwarding/nat44_icmp_query.rs`）:
+
+- inside→outside（routeのegressがoutside、protocol 1）: `[nat44.icmp]`があればUDP/TCPの
+  「unsupported transport」gateを通らず、route/TTL/neighborの後で`decide_nat44_icmp_outbound`。
+  Echo/Timestamp Request以外（Reply、Information、Address Mask、他のnon-error）は
+  `NAT44_ICMP_TYPE_UNSUPPORTED`。checksum、code 0、header長、unfragmented（MF=0/offset=0。UDP/TCPと違いDF=0も変換、NAT44-116）、source admission、
+  inside reverse routeをstate変更前に検証し、plan→prevalidate→rewrite→commitの順はUDPと同じ。
+- outside→public address: Reply（0/14）だけをNAT inboundとして扱い、Requestはrouter自身の
+  Echo responder（local）。Replyがoutside以外から来たら`NAT44_ICMP_WRONG_INGRESS`。
+- inside→public address: Requestはrouterが答える（`decide_local_ipv4`、ingressへ、source P）。
+  NAPTはinbound query sessionを作らないのでhairpinの相手が無い（REQ-7はBasic NATの要件、
+  RFC 7857 §12）。
+- rewrite: IPv4 address 1つ、TTL、Identifier。ICMP checksumはpseudo-headerを含まないので
+  Identifierの差分だけ、IPv4 header checksumはTTLとaddressの差分をRFC 1624で更新。
+- firewall付きの構成では`FirewallProtocol::Icmp`として評価する。queryにportは無いので
+  forwardingが擬似port tuple（Request: `(id, type)`、Reply: `(request type, id)`）を作り、Reply
+  がRequestのexactな逆tupleになるようにする。ruleは`protocol = "icmp"`（port rangeは全域）。
+  outboundはpre-SNAT、inboundはpost-DNATのtupleで評価（UDP/TCPと同じ）。ICMP flowのidle TTLは
+  `udp-idle-ttl-ms`。
+- ICMP error（`parse_nat44_icmpv4_error`）は引用protocol 1も受け付け、Identifierを
+  source/destination「port」の両方に入れて既存のexternal（REQ-4）/inside（REQ-5）pathへ流す。
+  externalは引用がP→RのRequest、insideは引用がR→XのReplyであることを要求し、engineの
+  read-only lookup（`inspect_icmpv4`/`inspect_icmpv4_inbound_quote`、remote port 0）で
+  authorityを確かめる。rewriteはIdentifier 2 byteだけを書き、引用ICMP checksumは
+  Identifierの差分だけを更新、外側ICMP checksumには引用address、Identifier、引用checksumの
+  差分を加える。N4のlimiter（NAT44-065）とFrag Needed MTU check（NAT44-098）は共有path上に
+  あるのでquery引用にも効く。hairpin（P宛て）の引用queryは`NAT44_ICMPV4_QUOTED_PROTOCOL_UNSUPPORTED`。
+
+control/runtime: ICMP query NATはpublicationで唯一optionalなserviceです。
+`FullServiceStorageShape::nat44_icmp`（`Option`）がstorage shapeに含まれるので有無の変更は
+`STORAGE_SHAPE`（restart-required）、`FullServiceView::with_nat44_icmp`がtick viewへ載せ、
+`run_tick`は`forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors`を
+呼びます（configが無ければUDP/TCPのcompositionと同じ挙動）。observabilityは常に
+`nat44_icmp.*`、`occupancy.nat44_icmp_{mappings,peers}`、flushの`nat44_icmp_*`を出します
+（無いときは0）。static/inbound query mapping、Information/Address
+Mask、ICMP-only NAT、fragmentはdeferred（NAT44-117）です。
 
 ## Minimal IPv4 stateful forward firewall
 

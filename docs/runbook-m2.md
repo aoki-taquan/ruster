@@ -248,6 +248,7 @@ reload path.
 | ICMPv4 error `states` (24 B) | every generated error (TTL expiry, unreachable) | only the occupied states, which are a prefix of the table and at most two per egress interface in use (one per limiter class: Port Unreachable has its own) | — | at least the number of interfaces plus one (the WAN's Port Unreachable class; `validate` requires it while delayed Port Unreachable is on) |
 | ICMPv4 error `actions` (584 B) | O(1) ring; one per state | O(1) | — | like `states` (one queued error per state; fewer only means `action_full` refusals while the queue is full) |
 | NAT44 `mappings`/`peers`/`sessions` (UDP 64/48 B, TCP 80/64 B + directories; with `mappings-per-host` also 64/76 B per mapping slot of per-host storage) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (one list per TTL, so its head is the first to expire; TCP since N1 has one session list per phase and two mapping lists) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
+| `nat44.icmp.capacity` `mappings`/`peers` (64/48 B + directories), `nat44.icmp.identifiers` (32 B per identifier plus the free bitmap) | the same O(1) mapping engine as UDP (N5) on its own tables and key | O(1) per query; a full table refuses without eviction (`NAT44_ICMP_MAPPING_TABLE_FULL`) | same (65536) | one mapping per running ping per host and one peer per pinged remote; the pool defaults to the realm port numbers |
 | `nat44.tcp.capacity.unsolicited-syn-holds` (592 B) | an unsolicited inbound TCP SYN (no mapping for its public port, or refused by the filtering) is held for the RFC 5382 REQ-4 delayed ICMP Port Unreachable; a translated outbound SYN cancels the hold of its connection | one keyed chain of at most 16 holds (`NAT44_TCP_SYN_HOLD_CHAIN_LIMIT`, secret NAT key) plus O(1) list heads; a full table or chain drops silently. Matured holds are taken in deadline order by the failure-dispatch phase, at most `tick.failure-dispatch-scans` per tick (the same budget value as the resolution failure dispatch, applied separately, so the phase does up to twice that), never scanning unmatured ones; each matured hold walks the firewall rules once. An inconsistent table is flushed (`unsolicited_syn_index_corrupt`) | — | default 64. The Port Unreachable limiter sends at most 1 per second per egress by default, so a bigger table does not send more ICMP; it only holds more SYNs that the limiter will refuse. 0 frees the 37 KiB when the switch is off |
 | `firewall.capacity.states` (56 B) | keyed SipHash probe with occupancy capped near 75% (`usable_state_capacity`), so a full table cannot occur; only the amortized expiry sweep (`reclaim_one_expired`) is linear | — (amortized) | — | the expected concurrent flows |
 
@@ -1193,7 +1194,7 @@ Sections, in this order:
 | prefix | content |
 |---|---|
 | `observer.*`, `tick.*`, `rx.*`, `generated_arp.*`, `generated_icmpv4.*`, `phase_skip.*`, `drop.<REASON>`, `consume.<REASON>`, `apply.*`, `flushed.*`, `occupancy.*` | worker observability: health state (`observer.state`: `healthy`, `degraded`, `stale`, `stopped`, `not_started`), active generation, tick totals, RX totals (`rx.received`, `rx.tx_accepted`, `rx.tx_rejected`, `rx.dropped`, `rx.consumed`, ...), drop/consume reason counts, last apply outcome and flush counts, NAT/FW/ICMP limiter occupancy and high-water |
-| `resolution.*`, `icmpv4_errors.*`, `nat44_udp.*`, `nat44_tcp.*`, `firewall.*` | the five service runtimes' cumulative counters |
+| `resolution.*`, `icmpv4_errors.*`, `nat44_udp.*`, `nat44_tcp.*`, `nat44_icmp.*`, `firewall.*` | the service runtimes' cumulative counters (`nat44_icmp.*` is all zero without `[nat44.icmp]`) |
 | `af_xdp.*` | all ports: `mode` (`copy`, `zero_copy`, `mixed`), `ports`, `copy_ports`, `zero_copy_ports`, `fill_need_wakeup_ports`, `tx_need_wakeup_ports`, `link_down_ports`, `kick_owed_ports`, `kernel_stats_ports`, `generated_unknown_egress`, `stopped`, and the summed port counters |
 | `if<id>.af_xdp_port.*` | per port: `interface`, `queue`, `mode`, `mtu`, `max_frame`, need-wakeup now, `draining`, `link_down`, `kick_owed`, `copy_reserve`, ring gauges (`fill_ring_occupancy`, `rx_ring_occupancy`, `tx_ring_unconsumed`), `fill_starved`, invalid RX descriptors and quarantines, TX (`tx_completed`, `tx_inflight`, `tx_inflight_highwater`, `tx_blocked`, `tx_over_mtu`, `tx_invalid_completions`), kicks (`tx_kicks`, `fill_kicks`, `kicks_deferred`, `kick_errors`, `kicks_link_down`, `kick_retries_suppressed`; `kick_errors` counts every failed kick and so includes `kicks_link_down`, while the `KICK_ERRORS` health code times `kick_errors - kicks_link_down` only; `kick_retries_suppressed` counts settles on a down port that skipped a retry not yet due, which made no syscall), generated frames, `cross_port_copies`, and the kernel `XDP_STATISTICS` (`kernel_rx_dropped`, `kernel_rx_invalid_descs`, `kernel_tx_invalid_descs`, `kernel_rx_ring_full`, `kernel_rx_fill_ring_empty_descs`, `kernel_tx_ring_empty_descs`) |
 | `reload.*` | `requested`, `applied`, `refused`, `failed`, `preparing_ms` (how long the reload being prepared on the worker has run; 0 when none) |
@@ -1559,6 +1560,42 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   budget. If inside hosts do not need PMTUD or
   traceroute through the NAT, `icmpv4-errors = "external-only"` or
   `"disabled"` (per protocol) remain the stricter options.
+- ICMP query NAT (`[nat44.icmp]`, N5, NAT44-100..117). Without the
+  section, `ping` from the LAN to the Internet does not work through the
+  router: ICMP queries crossing the NAT are dropped as
+  `NAT44_UDP_UNSUPPORTED_TRANSPORT`. Add the section (and, with the
+  firewall, an `icmp` rule such as `ingress = "lan"`, `egress = "wan"`,
+  `protocol = "icmp"`, `action = "allow-stateful"`, without port ranges)
+  to translate Echo and Timestamp requests from inside hosts and their
+  replies. Adding or removing the section changes the storage shape, so it
+  needs a restart (`ruster plan` shows `nat44-icmp ~ off -> on` and
+  `STORAGE_SHAPE`); its other keys are reloadable. Sizing: one mapping per
+  (inside host, ping identifier), usually one per running `ping`, and one
+  peer per remote it pings; `capacity.mappings = 256`, `peers = 1024` serve
+  a home LAN. The identifier pool (`[nat44.icmp.identifiers]`, default the
+  realm port numbers) costs 32 bytes per identifier, so the full
+  1..65535 range is about 2 MiB. Limits:
+  - Queries are translated whether DF is set or not (Linux sends Echo
+    Replies, and Windows Echo Requests, with DF clear), but never as
+    fragments (`NAT44_ICMP_FRAGMENT_UNSUPPORTED`, NAT44-116): a ping larger
+    than the path MTU fails. The IPv4 ID is not rewritten.
+  - The idle timeout is 60 s by default (RFC 5508 REQ-2 floor); a ping
+    with an interval above it gets a new mapping (and possibly a new public
+    identifier) per request.
+  - Pinging the router's public address from the LAN is answered by the
+    router itself; there is no inbound or static query mapping, so an
+    outside host cannot ping an inside host.
+  - Information and Address Mask messages (RFC 6918) are never
+    translated (`NAT44_ICMP_TYPE_UNSUPPORTED`).
+  - Errors quoting a query (for example Time Exceeded for `traceroute -I`)
+    are translated under `[nat44.icmp] icmpv4-errors` and share the
+    translated-error limit of NAT44-065.
+  - The firewall's ICMP flows use `udp-idle-ttl-ms`.
+  - Counters: `nat44_icmp.*` (for example `outbound_translated`,
+    `inbound_translated`, `mapping_misses`, `filter_denied`,
+    `identifier_exhausted`, `host_quota_exceeded`) and
+    `occupancy.nat44_icmp_{mappings,peers}`; drop reasons
+    `NAT44_ICMP_*` and `FIREWALL_ICMP_QUERY_INVALID`.
 - Per-host mapping quota (`[nat44.udp]`/`[nat44.tcp]` `mappings-per-host`,
   N3, NAT44-092; default `0`, no limit). Without it an inside host can
   fill the pool (it opens mappings from many source ports) and so steer
@@ -1728,6 +1765,13 @@ What it proves, on the runner's kernel only:
   `unsolicited-syn-icmp = false`, nothing arrives within 9 s. After a SIGHUP
   back to router-v1's default-deny firewall (switch on), nothing arrives
   within 9 s either (`unsolicited_syn_firewall_denied`).
+  Added by N5: without `[nat44.icmp]` (router-v1), `ping` from host
+  A to host B is dropped (`NAT44_UDP_UNSUPPORTED_TRANSPORT`); with the
+  section and an `icmp` firewall rule (a restart, `nat44-icmp ~ off -> on`
+  in the plan), 3 of 3 pings get their replies (host B has no route to the
+  LAN, so a reply proves both translations), a ping of 203.0.113.2 is
+  answered by the router, and the stats show 3 outbound and 3 inbound
+  translations on one mapping.
   Added by H2 (the router namespace is set up as recommended:
   `disable_ipv6=1` on every port, `all.arp_ignore=1`, `all.rp_filter=1`):
   IPv4 routes in a policy-routing table and a multipath route with one
