@@ -13,9 +13,18 @@
 //!
 //! | condition | detected when | warning after | fatal after |
 //! |---|---|---|---|
-//! | `TX_STALL` | TX is in flight and the oldest in-flight frame stays the same (no completion of it), while the link is up | [`TX_STALL_WARN_MS`] | [`TX_STALL_FATAL_MS`] |
+//! | `TX_STALL` | TX is in flight and the oldest in-flight frame stays the same (no completion of it), while the link is up | [`Thresholds::tx_stall_warn_ms`] (default 1 s) | [`Thresholds::tx_stall_fatal_ms`] (default 10 s, `None`: never) |
 //! | `FILL_STARVED` | Fill holds no frame in the kernel, no RX arrived, and the engine found its free list empty (`fill_starved` grew) since the last sample | [`FILL_STARVED_WARN_MS`] | never (a symptom; the frames are held by TX, which `TX_STALL` covers) |
-//! | `KICK_ERRORS` | `kick_errors` (kick failures other than `ENETDOWN`) grew in every sample | first growth | [`KICK_ERRORS_FATAL_MS`] of growth in every sample |
+//! | `KICK_ERRORS` | `kick_errors` (kick failures other than `ENETDOWN`) grew in every sample | first growth | [`Thresholds::kick_errors_fatal_ms`] (default 5 s, `None`: never) of growth in every sample |
+//!
+//! The thresholds come from `--tx-stall-warn-secs`, `--tx-stall-fatal-secs`,
+//! and `--kick-errors-fatal-secs` (0 disables a fatal exit). A TX stall can
+//! be caused from the wire (802.3x PAUSE frames from an on-segment host
+//! stop a NIC's TX), so its fatal exit is a denial-of-service lever; it
+//! stays on by default because the router fails closed (startup refuses
+//! kernel forwarding and kernel L3 on the ports, so nothing is forwarded
+//! while it is down, and a supervisor restarts it), and an operator who
+//! prefers availability over a restart can turn it into a warning.
 //!
 //! A busy healthy link never trips them: completions retire the oldest
 //! frame (a new oldest, or none, every sample), RX keeps arriving, and
@@ -33,6 +42,7 @@
 //! | MTU raised within the frame bound | warning `MTU_RAISED` (TX stays bounded by the startup MTU until a restart); recovered when it returns |
 //! | link down (`IFF_UP` or `IFF_LOWER_UP` clear) | warning `LINK_DOWN`, counted; the router keeps running and owed TX kicks resume when the link returns (recovered `LINK_DOWN`) |
 //! | the link query fails | warning `LINK_PROBE`; fatal `LINK_UNVERIFIABLE` after [`LINK_PROBE_FAILURES_FATAL`] failures in a row |
+//! | a kernel IPv4 address appears on the port (rtnetlink `RTM_GETADDR`, same round) | fatal `KERNEL_IPV4_ADDRESSES`, as the startup check refuses it; a failed address dump counts as a failed link query |
 //!
 //! A fatal event ends the run loop; the shutdown then drains, detaches,
 //! closes, and exits 1 (no silent continuation).
@@ -48,14 +58,42 @@ use super::netlink::{LinkFacts, NetlinkError};
 pub const HEALTH_INTERVAL_MS: u64 = 500;
 /// Minimum interval between rtnetlink link queries.
 pub const LINK_INTERVAL_MS: u64 = 1_000;
-/// The oldest in-flight frame unchanged this long: warning.
-pub const TX_STALL_WARN_MS: u64 = 1_000;
-/// The oldest in-flight frame unchanged this long: fatal.
-pub const TX_STALL_FATAL_MS: u64 = 10_000;
 /// Fill starved this long: warning.
 pub const FILL_STARVED_WARN_MS: u64 = 1_000;
-/// Kick errors in every sample this long: fatal.
-pub const KICK_ERRORS_FATAL_MS: u64 = 5_000;
+
+/// Operator-set health thresholds (milliseconds).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Thresholds {
+    /// The oldest in-flight frame unchanged this long: warning.
+    pub tx_stall_warn_ms: u64,
+    /// ... this long: fatal; `None` never (warn only).
+    pub tx_stall_fatal_ms: Option<u64>,
+    /// Kick errors in every sample this long: fatal; `None` never.
+    pub kick_errors_fatal_ms: Option<u64>,
+}
+
+impl Default for Thresholds {
+    /// 1 s warning, 10 s fatal TX stall; 5 s fatal kick errors.
+    fn default() -> Self {
+        Self {
+            tx_stall_warn_ms: 1_000,
+            tx_stall_fatal_ms: Some(10_000),
+            kick_errors_fatal_ms: Some(5_000),
+        }
+    }
+}
+
+impl Thresholds {
+    /// From whole seconds, 0 fatal meaning never.
+    pub fn from_secs(warn: u64, fatal: u64, kicks: u64) -> Self {
+        let ms = |secs: u64| secs.saturating_mul(1_000);
+        Self {
+            tx_stall_warn_ms: ms(warn),
+            tx_stall_fatal_ms: (fatal != 0).then(|| ms(fatal)),
+            kick_errors_fatal_ms: (kicks != 0).then(|| ms(kicks)),
+        }
+    }
+}
 /// Link queries failing in a row before the link counts as unverifiable.
 pub const LINK_PROBE_FAILURES_FATAL: u32 = 3;
 
@@ -126,6 +164,7 @@ pub enum Fatal {
     MtuDecreased,
     MtuAboveFrame,
     LinkUnverifiable,
+    KernelIpv4Addresses,
 }
 
 impl Fatal {
@@ -137,6 +176,7 @@ impl Fatal {
             Self::MtuDecreased => "MTU_DECREASED",
             Self::MtuAboveFrame => "MTU_ABOVE_FRAME",
             Self::LinkUnverifiable => "LINK_UNVERIFIABLE",
+            Self::KernelIpv4Addresses => "KERNEL_IPV4_ADDRESSES",
         }
     }
 }
@@ -226,6 +266,8 @@ pub struct PortHealth {
     pub link_up_events: u64,
     pub mtu: u32,
     pub link_probe_errors: u64,
+    /// Kernel IPv4 addresses seen on the port by the last nonzero dump.
+    pub kernel_ipv4_addresses: u32,
     pub warnings: u64,
 }
 
@@ -257,6 +299,11 @@ impl ObservableFields for PortHealth {
             "link_probe_errors",
             FieldValue::Count(self.link_probe_errors),
         );
+        visitor.field(
+            SECTION,
+            "kernel_ipv4_addresses",
+            FieldValue::Count(u64::from(self.kernel_ipv4_addresses)),
+        );
         visitor.field(SECTION, "warnings", FieldValue::Count(self.warnings));
     }
 }
@@ -264,13 +311,14 @@ impl ObservableFields for PortHealth {
 /// Health and link watch of every port, in `IfId` order.
 pub struct Watch {
     ports: Box<[PortWatch]>,
+    thresholds: Thresholds,
     last_health: Option<MonotonicMillis>,
     last_link: Option<MonotonicMillis>,
 }
 
 impl Watch {
     /// One allocation of the port state (cold).
-    pub fn new(targets: &[LinkTarget]) -> Self {
+    pub fn new(targets: &[LinkTarget], thresholds: Thresholds) -> Self {
         Self {
             ports: targets
                 .iter()
@@ -293,6 +341,7 @@ impl Watch {
                     },
                 })
                 .collect(),
+            thresholds,
             last_health: None,
             last_link: None,
         }
@@ -351,7 +400,7 @@ impl Watch {
         else {
             return;
         };
-        port.sample(now, sample, emit);
+        port.sample(now, sample, self.thresholds, emit);
     }
 
     /// Folds one link query result of port `index` (in [`Self::target`]
@@ -364,6 +413,20 @@ impl Watch {
     ) {
         if let Some(port) = self.ports.get_mut(index) {
             port.link(result, emit);
+        }
+    }
+
+    /// Folds the kernel IPv4 address count of port `index` (rtnetlink
+    /// `RTM_GETADDR`, queried after a successful link query of the same
+    /// round): any address is fatal, a failed dump is a failed query.
+    pub fn on_addresses(
+        &mut self,
+        index: usize,
+        result: Result<u32, NetlinkError>,
+        emit: &mut impl FnMut(WatchEvent),
+    ) {
+        if let Some(port) = self.ports.get_mut(index) {
+            port.addresses(result, emit);
         }
     }
 }
@@ -419,6 +482,7 @@ impl PortWatch {
         &mut self,
         now: MonotonicMillis,
         sample: PortSample,
+        thresholds: Thresholds,
         emit: &mut impl FnMut(WatchEvent),
     ) {
         let last = self.last.replace(sample);
@@ -431,9 +495,12 @@ impl PortWatch {
         if same_oldest && !link_down {
             let held = self.stall.hold(now);
             self.counters.tx_stall_ms = held;
-            if held >= TX_STALL_FATAL_MS {
+            if thresholds
+                .tx_stall_fatal_ms
+                .is_some_and(|fatal| held >= fatal)
+            {
                 self.fatal(Fatal::TxStall, emit);
-            } else if held >= TX_STALL_WARN_MS && !self.stall.warned {
+            } else if held >= thresholds.tx_stall_warn_ms && !self.stall.warned {
                 self.stall.warned = true;
                 self.counters.tx_stall = true;
                 self.warn(Condition::TxStall, emit);
@@ -478,7 +545,10 @@ impl PortWatch {
                 self.counters.kick_errors_persistent = true;
                 self.warn(Condition::KickErrors, emit);
             }
-            if held >= KICK_ERRORS_FATAL_MS {
+            if thresholds
+                .kick_errors_fatal_ms
+                .is_some_and(|fatal| held >= fatal)
+            {
                 self.fatal(Fatal::KickErrors, emit);
             }
         } else {
@@ -486,6 +556,29 @@ impl PortWatch {
             if self.kicks.clear() {
                 self.recover(Condition::KickErrors, emit);
             }
+        }
+    }
+
+    /// One failed query of this round (link or address dump).
+    fn probe_failed(&mut self, emit: &mut impl FnMut(WatchEvent)) {
+        self.counters.link_probe_errors = self.counters.link_probe_errors.saturating_add(1);
+        self.probe_failures = self.probe_failures.saturating_add(1);
+        if self.probe_failures >= LINK_PROBE_FAILURES_FATAL {
+            self.fatal(Fatal::LinkUnverifiable, emit);
+        } else if !self.probe_warned {
+            self.probe_warned = true;
+            self.warn(Condition::LinkProbe, emit);
+        }
+    }
+
+    fn addresses(&mut self, result: Result<u32, NetlinkError>, emit: &mut impl FnMut(WatchEvent)) {
+        match result {
+            Ok(0) => {}
+            Ok(count) => {
+                self.counters.kernel_ipv4_addresses = count;
+                self.fatal(Fatal::KernelIpv4Addresses, emit);
+            }
+            Err(_) => self.probe_failed(emit),
         }
     }
 
@@ -497,14 +590,7 @@ impl PortWatch {
                 return;
             }
             Err(_) => {
-                self.counters.link_probe_errors = self.counters.link_probe_errors.saturating_add(1);
-                self.probe_failures = self.probe_failures.saturating_add(1);
-                if self.probe_failures >= LINK_PROBE_FAILURES_FATAL {
-                    self.fatal(Fatal::LinkUnverifiable, emit);
-                } else if !self.probe_warned {
-                    self.probe_warned = true;
-                    self.warn(Condition::LinkProbe, emit);
-                }
+                self.probe_failed(emit);
                 return;
             }
         };

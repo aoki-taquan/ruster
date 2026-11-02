@@ -133,7 +133,7 @@ use startup::{
     open_ports, CloseFailure, Failure, Interrupt, OpenedPorts, PortHost, Stage, StartupError,
 };
 use stats::BlockKind;
-use watch::{Watch, HEALTH_INTERVAL_MS, LINK_INTERVAL_MS};
+use watch::{Thresholds, Watch, HEALTH_INTERVAL_MS, LINK_INTERVAL_MS};
 
 /// Shutdown deadline passed with TX frames still owned by the kernel.
 pub const EXIT_DRAIN_INCOMPLETE: u8 = 3;
@@ -161,6 +161,8 @@ pub struct Settings {
     pub health_interval_ms: u64,
     pub link_interval_ms: u64,
     pub reload_quiesce_ms: u64,
+    /// Health thresholds of the watch.
+    pub thresholds: Thresholds,
 }
 
 impl Settings {
@@ -168,6 +170,7 @@ impl Settings {
         Self {
             policy: CheckPolicy {
                 allow_multi_queue: args.allow_multi_queue,
+                allow_kernel_forwarding: args.allow_kernel_forwarding,
             },
             stats_interval_ms: args.stats_interval_secs.saturating_mul(1_000),
             drain_deadline_ms: DRAIN_DEADLINE_MS,
@@ -175,6 +178,11 @@ impl Settings {
             health_interval_ms: HEALTH_INTERVAL_MS,
             link_interval_ms: LINK_INTERVAL_MS,
             reload_quiesce_ms: reload::RELOAD_QUIESCE_MS,
+            thresholds: Thresholds::from_secs(
+                args.tx_stall_warn_secs,
+                args.tx_stall_fatal_secs,
+                args.kick_errors_fatal_secs,
+            ),
         }
     }
 }
@@ -188,7 +196,7 @@ pub fn retry_pause_ms(next: u32) -> u64 {
 
 /// Runs the command and returns the exit status.
 pub fn run(args: &RunArgs, err: &mut impl Write) -> u8 {
-    let config = match config_cmd::load_validated(&args.config) {
+    let config = match config_cmd::load_validated_regular(&args.config, args.strict_config_perms) {
         Ok(config) => config,
         Err(error) => return config_cmd::report_load(err, "", &error),
     };
@@ -258,7 +266,10 @@ fn live(args: &RunArgs, config: ValidatedConfigV1, err: &mut impl Write) -> u8 {
         &host,
         config,
         ProductionSequencer::new(keys),
-        reload::ConfigFile(args.config.clone()),
+        reload::ConfigFile {
+            path: args.config.clone(),
+            strict: args.strict_config_perms,
+        },
         settings,
         &mut engine::SystemClock::new(),
         &engine::ProcessSignals,
@@ -531,7 +542,7 @@ where
     };
     let mut control = Control {
         reloader,
-        watch: Watch::new(&targets),
+        watch: Watch::new(&targets, settings.thresholds),
         links,
     };
     let end = run_loop(
@@ -549,12 +560,17 @@ where
             let _ = out.flush();
         },
     );
+    // A reload still waiting for quiescence ends with the run.
+    if let Some(outcome) = control.reloader.abandon("STOPPED", active.generation()) {
+        let _ = writeln!(err, "ruster run: {outcome}");
+    }
     let _ = writeln!(
         err,
         "ruster run: {}; draining",
         match end {
             LoopEnd::Signal => "stop requested".to_owned(),
             LoopEnd::BackendStopped => "backend stopped after a fault".to_owned(),
+            LoopEnd::Invariant => "invariant violation code=APPLY_REPORT_MISSING".to_owned(),
             LoopEnd::Fatal { port, cause } => format!(
                 "fatal health event port={} code={}",
                 port_label(port),
@@ -672,6 +688,9 @@ fn finished(
         match ran.end {
             LoopEnd::Signal => "stopped by signal".to_owned(),
             LoopEnd::BackendStopped => "stopped after a backend fault".to_owned(),
+            LoopEnd::Invariant => {
+                "stopped after an invariant violation code=APPLY_REPORT_MISSING".to_owned()
+            }
             LoopEnd::Fatal { port, cause } => format!(
                 "stopped after a fatal health event port={} code={}",
                 port_label(port),

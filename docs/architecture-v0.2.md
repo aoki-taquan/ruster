@@ -2776,9 +2776,17 @@ M2 S10b（run-time operations、cold pathだけ）:
 - health watch（500 ms）: `XdpPortStats`から最古in-flight frameの提出poll（`polls - oldest_age`）が
   変わらない時間を計り、link up中に1 sでTX stall warning、10 sでfatal。Fill starvation（kernelの
   Fill 0、RXなし、free list枯渇）はwarningだけ、ENETDOWN以外のkick errorが5 s続けばfatal。
-- link watch（1 s）: 起動時に開いた一つのrtnetlink socketと事前確保bufferでportのifindexを
-  `RTM_GETLINK`し、ENODEV（device削除）、startup未満のMTU、frame超のMTU、3回連続のquery失敗は
+  閾値は`--tx-stall-warn-secs`/`--tx-stall-fatal-secs`/`--kick-errors-fatal-secs`（fatal 0でwarnだけ）。
+  TX stallはPAUSE floodでwireから起こせるので設定可能にし、既定のfatalはforwarding既定拒否と
+  kernel L3拒否によりexit後もfail closedであることを前提にしています（#302 sec M1）。
+- link watch（1 s）: 起動時に開きkernel（pid 0）へ`connect()`した一つのrtnetlink socketと事前確保
+  bufferでportのifindexを`RTM_GETLINK`し、続けて`RTM_GETADDR` dumpでkernel IPv4 addressを数えます。
+  ENODEV（device削除）、startup未満のMTU、frame超のMTU、portのIPv4 address、3回連続のquery失敗は
   fatal、link down/upとframe内のMTU上昇はwarning/recoveredだけです。
+- startup checkはkernel IPv4 forwarding（global/port）を既定で拒否し、`--allow-kernel-forwarding`で
+  warningにします。`--strict-config-perms`は起動時とreload時にconfigの所有者とmodeを`fstat`で確認し、
+  configは常に`O_NONBLOCK|O_NOCTTY`のregular fileとして読みます。reloadの`Applied`は権威的で、
+  commit reportが無ければinvariant違反としてexit 1、停止時の待機中reloadは`STOPPED`として数えます。
 - fatal eventはloopを`LoopEnd::Fatal{port, cause}`で抜け、SIGTERMと同じdrain/detach/closeの後exit 1。
   drainは誰もcancelできない失われたTX handoffを`tx_handoffs_outstanding`として報告し、0でなければexit 1
   （XDP-177）。

@@ -7,7 +7,7 @@
 //! interface index, in the caller's network namespace), so they are tested
 //! without a kernel.
 //! Every reader fails closed: a fact that cannot be read refuses startup,
-//! except the forwarding sysctls, which only ever warn.
+//! including the forwarding sysctls unless `--allow-kernel-forwarding`.
 
 use std::fmt;
 
@@ -229,6 +229,18 @@ pub struct DeviceFacts {
 pub struct CheckPolicy {
     /// `--allow-multi-queue`.
     pub allow_multi_queue: bool,
+    /// `--allow-kernel-forwarding`: kernel IPv4 forwarding (or an
+    /// unreadable forwarding sysctl) is warned instead of refused.
+    pub allow_kernel_forwarding: bool,
+}
+
+/// Which forwarding sysctl was on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ForwardingScope {
+    /// `net.ipv4.ip_forward`.
+    Global,
+    /// `net.ipv4.conf.<dev>.forwarding`.
+    Device,
 }
 
 /// Why a port's device check refused startup.
@@ -248,6 +260,9 @@ pub enum CheckFailure {
     /// multi-buffer) every longer frame before the router sees it.
     /// `limit` is the largest MTU the frames hold.
     MtuAboveFrame { mtu: u32, limit: u32 },
+    /// Kernel IPv4 forwarding is on and `--allow-kernel-forwarding` was not
+    /// given.
+    KernelForwardingEnabled(ForwardingScope),
     /// A fact could not be read or did not belong to the opened device.
     Unverifiable(Probe),
 }
@@ -269,6 +284,9 @@ pub enum Probe {
     Ipv4Addresses,
     /// `/proc/net/route` could not be read or parsed.
     Ipv4Routes,
+    /// A forwarding sysctl could not be read (refused without
+    /// `--allow-kernel-forwarding`).
+    Forwarding,
 }
 
 impl fmt::Display for CheckFailure {
@@ -296,6 +314,15 @@ impl fmt::Display for CheckFailure {
             }
             Self::Unverifiable(Probe::Ipv4Routes) => {
                 formatter.write_str("UNVERIFIABLE probe=ipv4-routes")
+            }
+            Self::Unverifiable(Probe::Forwarding) => {
+                formatter.write_str("UNVERIFIABLE probe=forwarding")
+            }
+            Self::KernelForwardingEnabled(ForwardingScope::Global) => {
+                formatter.write_str("KERNEL_FORWARDING_ENABLED scope=global")
+            }
+            Self::KernelForwardingEnabled(ForwardingScope::Device) => {
+                formatter.write_str("KERNEL_FORWARDING_ENABLED scope=device")
             }
         }
     }
@@ -356,11 +383,17 @@ impl Warnings {
 ///   `ip route add 10.0.0.0/8 dev <port>` without an address): refused for
 ///   the same reason; addresses are checked first, so a connected route
 ///   reports its address.
-/// - Forwarding sysctls: warned only. `ip_forward` is namespace-wide and
-///   may be needed by other interfaces of the host (containers, VPN);
-///   without kernel addresses or routes on the ports the kernel has no
-///   connected route through them, so refusing would block legitimate
-///   hosts for a second-order risk. Unreadable sysctls are warned too.
+/// - Forwarding sysctls (`net.ipv4.ip_forward`, `conf/<dev>/forwarding`):
+///   refused by default (`KERNEL_FORWARDING_ENABLED scope=global|device`,
+///   unreadable: `UNVERIFIABLE probe=forwarding`). Whenever the router is
+///   not attached (before startup, after any exit including a fatal health
+///   event, after a crash), kernel forwarding is what could carry traffic
+///   between the ports around the firewall and NAT, so the fail-closed
+///   default keeps it off. `ip_forward` is namespace-wide and other
+///   interfaces of the host (containers, VPN) may need it, so
+///   `--allow-kernel-forwarding` accepts it with the old warnings; the
+///   address and route refusals still keep the kernel without a connected
+///   route through the ports.
 /// - MTU: the rtnetlink MTU must equal the one the session read at open
 ///   (which bounds TX), and it must fit a UMEM frame with its Ethernet
 ///   header ([`mtu_limit`]); both refusals keep the run-time MTU rule of
@@ -410,6 +443,21 @@ pub fn evaluate_device(facts: &DeviceFacts, policy: CheckPolicy) -> Result<Warni
     warnings.forwarding_device = facts.forwarding_device == Some(true);
     warnings.forwarding_unreadable =
         facts.forwarding_global.is_none() || facts.forwarding_device.is_none();
+    if !policy.allow_kernel_forwarding {
+        if warnings.forwarding_global {
+            return Err(CheckFailure::KernelForwardingEnabled(
+                ForwardingScope::Global,
+            ));
+        }
+        if warnings.forwarding_device {
+            return Err(CheckFailure::KernelForwardingEnabled(
+                ForwardingScope::Device,
+            ));
+        }
+        if warnings.forwarding_unreadable {
+            return Err(CheckFailure::Unverifiable(Probe::Forwarding));
+        }
+    }
     Ok(warnings)
 }
 
@@ -619,6 +667,7 @@ mod tests {
         let strict = CheckPolicy::default();
         let lenient = CheckPolicy {
             allow_multi_queue: true,
+            ..CheckPolicy::default()
         };
         assert_eq!(evaluate_device(&clean, strict), Ok(Warnings::default()));
         let multi = DeviceFacts {
@@ -677,7 +726,11 @@ mod tests {
             forwarding_device: None,
             ..clean
         };
-        let warnings = evaluate_device(&forwarding, strict).expect("only warnings");
+        let allowed = CheckPolicy {
+            allow_kernel_forwarding: true,
+            ..strict
+        };
+        let warnings = evaluate_device(&forwarding, allowed).expect("only warnings");
         assert!(warnings.forwarding_global && !warnings.forwarding_device);
         assert!(warnings.forwarding_unreadable);
         assert_eq!(
@@ -690,6 +743,71 @@ mod tests {
     }
 
     #[test]
+    fn kernel_forwarding_is_refused_unless_allowed() {
+        let clean = DeviceFacts {
+            ifindex: 7,
+            rx_queues: 1,
+            link_mtu: 1500,
+            session_mtu: 1500,
+            frame_capacity: 1792,
+            forwarding_global: Some(false),
+            forwarding_device: Some(false),
+            ..DeviceFacts::default()
+        };
+        let strict = CheckPolicy::default();
+        let allowed = CheckPolicy {
+            allow_kernel_forwarding: true,
+            ..strict
+        };
+        for (global, device, refusal) in [
+            (
+                Some(true),
+                Some(false),
+                CheckFailure::KernelForwardingEnabled(ForwardingScope::Global),
+            ),
+            (
+                Some(false),
+                Some(true),
+                CheckFailure::KernelForwardingEnabled(ForwardingScope::Device),
+            ),
+            (
+                Some(true),
+                Some(true),
+                CheckFailure::KernelForwardingEnabled(ForwardingScope::Global),
+            ),
+            (
+                None,
+                Some(false),
+                CheckFailure::Unverifiable(Probe::Forwarding),
+            ),
+            (
+                Some(false),
+                None,
+                CheckFailure::Unverifiable(Probe::Forwarding),
+            ),
+        ] {
+            let facts = DeviceFacts {
+                forwarding_global: global,
+                forwarding_device: device,
+                ..clean
+            };
+            assert_eq!(evaluate_device(&facts, strict), Err(refusal), "{facts:?}");
+            let warnings = evaluate_device(&facts, allowed).expect("warned when allowed");
+            assert!(warnings.codes().next().is_some(), "{facts:?}");
+        }
+        assert_eq!(evaluate_device(&clean, strict), Ok(Warnings::default()));
+        assert_eq!(evaluate_device(&clean, allowed), Ok(Warnings::default()));
+        assert_eq!(
+            CheckFailure::KernelForwardingEnabled(ForwardingScope::Device).to_string(),
+            "KERNEL_FORWARDING_ENABLED scope=device"
+        );
+        assert_eq!(
+            CheckFailure::Unverifiable(Probe::Forwarding).to_string(),
+            "UNVERIFIABLE probe=forwarding"
+        );
+    }
+
+    #[test]
     fn mtu_must_match_the_session_and_fit_a_frame() {
         let clean = DeviceFacts {
             ifindex: 7,
@@ -697,6 +815,8 @@ mod tests {
             link_mtu: 1778,
             session_mtu: 1778,
             frame_capacity: 1792,
+            forwarding_global: Some(false),
+            forwarding_device: Some(false),
             ..DeviceFacts::default()
         };
         let policy = CheckPolicy::default();

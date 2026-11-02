@@ -588,7 +588,12 @@ sudo kill -HUP <pid>                                               # configをre
   kernelのIPv4 addressとIPv4 route（main table）を置かない（`ip -4 addr flush dev <dev>`）。
   attach中は無意味で、停止中やcrash後にkernelがfirewall/NATを迂回してforwardし得るためで、
   `stage=checks code=KERNEL_IPV4_ADDRESSES`/`KERNEL_IPV4_ROUTES`/`MULTI_QUEUE_DEVICE`で拒否します。
-  `net.ipv4.ip_forward`や`conf/<dev>/forwarding`が1ならwarningだけです。既存のXDP programが
+  `net.ipv4.ip_forward`や`conf/<dev>/forwarding`が1（または読めない）なら既定で
+  `KERNEL_FORWARDING_ENABLED`（`UNVERIFIABLE probe=forwarding`）で拒否します。router停止中・exit後・
+  crash後にport間をfirewall/NAT抜きで運び得るのはkernel forwardingだからで、namespaceの他の
+  interfaceに必要なら`--allow-kernel-forwarding`でwarningにできます。`--strict-config-perms`
+  （既定off）はgroup/otherが書けるか、root/実効user以外が所有するconfigを起動時とreload時に
+  `stage=permissions`で拒否します（configは`O_NONBLOCK|O_NOCTTY`でregular fileだけ）。既存のXDP programが
   あるdeviceは`stage=attach code=CREATE_LINK/EXISTING_PROGRAM`で拒否し、置換しません。
 - 起動はfailure atomicです: どのstageで失敗しても開いたportを逆順にclose（XDP detachを含む）
   してから`ruster run: startup failed: stage=<stage> [port=if<id>] code=<TOKEN>`を出します。
@@ -612,12 +617,20 @@ sudo kill -HUP <pid>                                               # configをre
   dry run失敗は`reload failed: stage=... code=...`で、どちらも旧generationがそのまま動き続けます。
   通ればbackendがquiescent（旧generationのTXがkernelに無い）になったtick境界でpublication phaseへ
   渡し（待つ間はRXを最大200 ms止める。過ぎれば`stage=quiesce code=TIMEOUT`）、
-  `reload applied: generation=N previous=P; flushed ...`です。適用時はcontrol-planeの契約どおり
+  `reload applied: generation=N previous=P; interfaces=.. routes=.. firewall-rules=.. ...; flushed ...`
+  です（件数で切り詰められたconfigに気づける）。適用時はcontrol-planeの契約どおり
   ARP学習・NAT44 mapping・firewall flowをflushし（hash keyがrotateする）、counterは保持します。
-  `reload.requested|applied|refused|failed`をstatsに出します。
+  `reload.requested|applied|refused|failed`をstatsに出し、停止時に待機中のreloadは
+  `stage=quiesce code=STOPPED`で数えるのでfinalでは常にrequested = applied + refused + failedです。
+  parse/planとquiescence待ちはrouter threadで同期的に走るため、負荷中はRX ringが溢れ得ます
+  （`kernel_rx_ring_full`）。SIGHUPで`ruster run`は終了しません。
 - health/link watch（cold path）: 500 msごとにportのcounterを、1 sごとにrtnetlink `RTM_GETLINK`で
-  linkを見ます。最古のin-flight TX frameが完了しない`TX_STALL`は1 sでwarning、10 sでfatal、
-  `FILL_STARVED`はwarningだけ、`ENETDOWN`以外のkick errorが続く`KICK_ERRORS`は5 sでfatal。
+  linkを見ます。最古のin-flight TX frameが完了しない`TX_STALL`は既定1 sでwarning、10 sでfatal、
+  `FILL_STARVED`はwarningだけ、`ENETDOWN`以外のkick errorが続く`KICK_ERRORS`は既定5 sでfatal。
+  `--tx-stall-warn-secs`/`--tx-stall-fatal-secs`/`--kick-errors-fatal-secs`で変えられ、fatalを0にすると
+  warningだけです（802.3x PAUSE floodのようにwireからTX stallを起こせる環境向け。既定がfatalなのは
+  exit後もforwarding拒否とkernel L3拒否でfail closedだから）。同じroundでportにkernel IPv4
+  addressが現れたら`KERNEL_IPV4_ADDRESSES`でfatalです。
   link downはwarningと計数だけで動き続け、upで`recovered`になりowed kickが再開します。device削除
   （`DEVICE_REMOVED`）、startup MTU未満へのMTU低下（`MTU_DECREASED`）、frameに収まらないMTU
   （`MTU_ABOVE_FRAME`）、3回連続のlink query失敗はfatalです。fatalはdrain・detach・closeの後

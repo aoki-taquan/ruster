@@ -955,6 +955,7 @@ fn bump(counter: &mut u64) {
 
 /// Outcome of [`XdpPacketIo::drain`], summed over ports.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub struct XdpDrainReport {
     /// Completions reaped by this call.
     pub completed: u32,

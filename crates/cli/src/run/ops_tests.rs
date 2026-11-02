@@ -6,7 +6,8 @@ use super::*;
 use crate::config_cmd::Rejection;
 
 use super::super::startup::transient_open;
-use super::super::watch::{TX_STALL_FATAL_MS, TX_STALL_WARN_MS};
+const TX_STALL_WARN_MS: u64 = 1_000;
+const TX_STALL_FATAL_MS: u64 = 10_000;
 use super::super::{retry_pause_ms, STARTUP_RETRY_PAUSE_MAX_MS};
 use ruster_io_xdp_native::{SessionFailure, SessionStage};
 
@@ -140,9 +141,10 @@ fn a_reload_applies_at_a_tick_boundary_and_changes_the_traffic_outcome() {
         outcome.err
     );
     assert!(
-        outcome
-            .err
-            .contains("ruster run: reload applied: generation=2 previous=1; flushed "),
+        outcome.err.contains(
+            "ruster run: reload applied: generation=2 previous=1; interfaces=2 addresses=2 \
+                 routes=3 neighbors=1 firewall-rules=3 nat44-ports=16; flushed "
+        ),
         "{}",
         outcome.err
     );
@@ -314,6 +316,149 @@ fn an_applied_reload_takes_the_new_tick_budgets() {
     };
     assert_eq!(received_in_last_tick(false).as_deref(), Some("3"));
     assert_eq!(received_in_last_tick(true).as_deref(), Some("1"));
+}
+
+/// A run that stops while a reload waits ends that reload as failed, so
+/// the counters always add up.
+#[test]
+fn a_reload_pending_at_the_stop_is_reported_failed() {
+    let host = FakeHost::default();
+    host.state.quiesce_blocks.set(u32::MAX);
+    let source = FakeSource::with([Ok(echo_off())]);
+    // The stop check comes while the reload waits (well within 200 ms).
+    let stop = FakeStop::after(FIRST_LOOP_CHECK + 20);
+    let stop = ReloadAt {
+        inner: stop,
+        at: FIRST_LOOP_CHECK + 3,
+    };
+    let outcome = ops(&host, source, &stop);
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(
+        outcome
+            .err
+            .contains("reload failed: stage=quiesce code=STOPPED; generation 1 keeps running"),
+        "{}",
+        outcome.err
+    );
+    let out = &outcome.out;
+    assert_eq!(line_value(out, "reload.requested"), Some("1"));
+    assert_eq!(line_value(out, "reload.failed"), Some("1"));
+    assert_eq!(line_value(out, "reload.applied"), Some("0"));
+}
+
+/// Wraps a [`FakeStop`] with one reload request at its `at`-th stop check.
+struct ReloadAt {
+    inner: FakeStop,
+    at: u32,
+}
+
+impl StopSignal for ReloadAt {
+    fn stop(&self) -> bool {
+        self.inner.stop()
+    }
+
+    fn force(&self) -> bool {
+        self.inner.force()
+    }
+
+    fn take_reload(&self) -> bool {
+        self.inner.calls.get() == self.at
+    }
+}
+
+/// `PublicationOutcome::Applied` is authoritative: without a matching
+/// commit report the document still becomes current and the outcome says
+/// so (the loop then ends as an invariant violation, exit 1).
+#[test]
+fn an_applied_reload_without_its_report_is_not_kept_running() {
+    use super::super::reload::{Reloader, TickApply};
+    let sequencer = ProductionSequencer::new(OsRandomKeySource::open().expect("urandom"));
+    let mut reloader = Reloader::new(sequencer, config(), FakeSource::default());
+    let one_rx = edited(|text| text.replace("[tick]\nrx = 32", "[tick]\nrx = 1"));
+    reloader.set_pending_for_test(one_rx);
+    let generation = std::num::NonZeroU64::new(2).expect("nonzero");
+    let outcome = reloader
+        .finish(generation, TickApply::Applied(None))
+        .expect("pending");
+    let text = outcome.to_string();
+    assert!(
+        text.starts_with("reload applied: generation=2 previous=unknown;"),
+        "{text}"
+    );
+    assert!(text.ends_with("code=APPLY_REPORT_MISSING"), "{text}");
+    assert!(!text.contains("keeps running"));
+    assert_eq!(reloader.budgets().rx, 1, "the applied document is current");
+    assert_eq!(reloader.counters().applied, 1);
+    assert!(reloader.finish(generation, TickApply::NotApplied).is_none());
+    let ran = super::super::Ran {
+        end: super::super::LoopEnd::Invariant,
+        shutdown: super::super::ShutdownReport::default(),
+        final_block: String::new(),
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert_eq!(
+        super::super::finished(&ran, 2, &[], &mut out, &mut err),
+        EXIT_RUNTIME
+    );
+    assert!(String::from_utf8(err)
+        .expect("utf-8")
+        .contains("stopped after an invariant violation code=APPLY_REPORT_MISSING"));
+}
+
+#[test]
+fn a_kernel_ipv4_address_on_a_port_while_running_fails_closed() {
+    let host = FakeHost::default();
+    host.state
+        .addresses
+        .borrow_mut()
+        .push_back((IfId(WAN), Ok(1)));
+    let outcome = fatal_run(&host, 1_000);
+    assert_fatal(&outcome, &host, "KERNEL_IPV4_ADDRESSES");
+    assert_eq!(
+        line_value(&outcome.out, "if2.watch.kernel_ipv4_addresses"),
+        Some("1")
+    );
+}
+
+#[test]
+fn kernel_forwarding_is_refused_at_startup_unless_allowed() {
+    let host = FakeHost {
+        forwarding_on: true,
+        ..FakeHost::default()
+    };
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
+    assert_eq!(outcome.status, EXIT_RUNTIME, "{}", outcome.err);
+    assert!(
+        outcome.err.contains(
+            "startup failed: stage=checks port=if1 code=KERNEL_FORWARDING_ENABLED scope=global"
+        ),
+        "{}",
+        outcome.err
+    );
+    assert!(!host
+        .events()
+        .iter()
+        .any(|event| matches!(event, Event::Attach(..))));
+    host.assert_released();
+
+    let host = FakeHost {
+        forwarding_on: true,
+        ..FakeHost::default()
+    };
+    let outcome = run_with(
+        &host,
+        CheckPolicy {
+            allow_kernel_forwarding: true,
+            ..CheckPolicy::default()
+        },
+        &FakeStop::after(FIRST_LOOP_CHECK + 1),
+        &mut FakeClock::default(),
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(outcome
+        .err
+        .contains("warning: port=if1 IPV4_FORWARDING_ENABLED scope=global"));
+    host.assert_released();
 }
 
 /// A SIGHUP that arrives while a reload is pending is not lost: it is

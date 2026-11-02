@@ -3,6 +3,10 @@
 use super::*;
 
 const PORT: IfId = IfId(1);
+// The default thresholds.
+const TX_STALL_WARN_MS: u64 = 1_000;
+const TX_STALL_FATAL_MS: u64 = 10_000;
+const KICK_ERRORS_FATAL_MS: u64 = 5_000;
 const TARGET: LinkTarget = LinkTarget {
     interface: PORT,
     ifindex: 7,
@@ -11,7 +15,7 @@ const TARGET: LinkTarget = LinkTarget {
 };
 
 fn watch() -> Watch {
-    Watch::new(&[TARGET])
+    Watch::new(&[TARGET], Thresholds::default())
 }
 
 fn run(watch: &mut Watch, at: u64, sample: PortSample) -> Vec<WatchEvent> {
@@ -322,6 +326,88 @@ fn link_query_failures_warn_then_are_fatal_in_a_row() {
     assert_eq!(
         health.link_probe_errors,
         2 + u64::from(LINK_PROBE_FAILURES_FATAL)
+    );
+}
+
+/// Holds the oldest frame for `duration` ms, sampling every 500 ms, and
+/// returns every event.
+fn stall_for(watch: &mut Watch, duration: u64) -> Vec<WatchEvent> {
+    let mut events = Vec::new();
+    let mut at = 0;
+    while at <= duration {
+        let stalled = PortSample {
+            tx_inflight: 1,
+            polls: 100 + at,
+            oldest_age_polls: at,
+            ..sample()
+        };
+        events.extend(run(watch, at, stalled));
+        at += HEALTH_INTERVAL_MS;
+    }
+    events
+}
+
+#[test]
+fn health_thresholds_are_configurable_and_fatal_can_be_off() {
+    // Warn only: a stall of an hour never ends the run.
+    let warn_only = Thresholds::from_secs(1, 0, 0);
+    assert_eq!(
+        warn_only,
+        Thresholds {
+            tx_stall_warn_ms: 1_000,
+            tx_stall_fatal_ms: None,
+            kick_errors_fatal_ms: None,
+        }
+    );
+    let mut watch = Watch::new(&[TARGET], warn_only);
+    assert_eq!(
+        stall_for(&mut watch, 3_600_000),
+        [warning(Condition::TxStall)]
+    );
+    // Custom bounds: 3 s warning, 4 s fatal.
+    let mut watch = Watch::new(&[TARGET], Thresholds::from_secs(3, 4, 5));
+    let events = stall_for(&mut watch, 4_000);
+    assert_eq!(events, [warning(Condition::TxStall), fatal(Fatal::TxStall)]);
+    let mut watch = Watch::new(&[TARGET], Thresholds::from_secs(3, 4, 5));
+    assert_eq!(stall_for(&mut watch, 2_500), []);
+    assert_eq!(Thresholds::default(), Thresholds::from_secs(1, 10, 5));
+    // Kick errors: warn only never ends the run either.
+    let mut watch = Watch::new(&[TARGET], warn_only);
+    let mut failing = sample();
+    let mut events = run(&mut watch, 0, failing);
+    for step in 1..100 {
+        failing.kick_errors += 1;
+        events.extend(run(&mut watch, step * 1_000, failing));
+    }
+    assert_eq!(events, [warning(Condition::KickErrors)]);
+}
+
+#[test]
+fn a_kernel_ipv4_address_after_startup_is_fatal() {
+    let mut watch = watch();
+    let addresses = |watch: &mut Watch, result| {
+        let mut events = Vec::new();
+        watch.on_addresses(0, result, &mut |event| events.push(event));
+        events
+    };
+    assert!(addresses(&mut watch, Ok(0)).is_empty());
+    assert_eq!(
+        addresses(&mut watch, Ok(2)),
+        [fatal(Fatal::KernelIpv4Addresses)]
+    );
+    let (_, health) = watch.health().next().expect("port");
+    assert_eq!(health.kernel_ipv4_addresses, 2);
+    // A failed dump is a failed query of the round.
+    let mut watch = Watch::new(&[TARGET], Thresholds::default());
+    let failure = Err(NetlinkError::Errno(11));
+    assert_eq!(
+        addresses(&mut watch, failure),
+        [warning(Condition::LinkProbe)]
+    );
+    let _ = addresses(&mut watch, failure);
+    assert_eq!(
+        addresses(&mut watch, failure),
+        [fatal(Fatal::LinkUnverifiable)]
     );
 }
 

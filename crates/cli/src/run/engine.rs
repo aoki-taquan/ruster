@@ -54,7 +54,7 @@ use ruster_runtime::{
 };
 
 use super::netlink::{LinkFacts, NetlinkError};
-use super::reload::{ConfigSource, ReloadCounters, Reloader};
+use super::reload::{ConfigSource, ReloadCounters, Reloader, TickApply};
 use super::watch::{Fatal, LinkTarget, PortSample, Watch, WatchEvent};
 
 /// Idle ticks before the loop starts to sleep.
@@ -115,6 +115,9 @@ pub trait LinkMonitor {
     /// Link facts of `target`'s interface index in the router's network
     /// namespace.
     fn query(&mut self, target: &LinkTarget) -> Result<LinkFacts, NetlinkError>;
+
+    /// Kernel IPv4 addresses on `target`'s interface index.
+    fn ipv4_addresses(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError>;
 }
 
 /// Summed result of one drain call.
@@ -288,6 +291,9 @@ pub enum LoopEnd {
     BackendStopped,
     /// The health or link watch found a fatal condition on a port.
     Fatal { port: IfId, cause: Fatal },
+    /// A reload was applied but the commit report did not match its
+    /// generation (publication contract violated).
+    Invariant,
 }
 
 /// Run-loop settings.
@@ -390,9 +396,9 @@ where
         let generation = active.generation();
         observer.observe_tick(now, Some(generation), &report);
         if reloading {
-            let (applied, rejected) = match &report.publication {
-                PublicationOutcome::Applied => (
-                    active
+            let result = match &report.publication {
+                PublicationOutcome::Applied => {
+                    let applied = active
                         .last_apply()
                         .filter(|apply| apply.generation == generation)
                         .map(|apply| {
@@ -404,19 +410,26 @@ where
                                 apply.firewall,
                             );
                             (apply.previous_generation, flush)
-                        }),
-                    None,
-                ),
-                PublicationOutcome::Rejected(error) => (None, Some(*error)),
-                PublicationOutcome::Unchanged | PublicationOutcome::Deferred { .. } => (None, None),
+                        });
+                    TickApply::Applied(applied)
+                }
+                PublicationOutcome::Rejected(error) => TickApply::Rejected(*error),
+                PublicationOutcome::Unchanged | PublicationOutcome::Deferred { .. } => {
+                    TickApply::NotApplied
+                }
             };
-            if let Some((_, flush)) = applied {
+            if let TickApply::Applied(Some((_, flush))) = result {
                 observer.record_apply_flush(generation, flush);
             }
-            if let Some(outcome) = control.reloader.finish(generation, applied, rejected) {
+            if let Some(outcome) = control.reloader.finish(generation, result) {
                 let _ = writeln!(err, "ruster run: {outcome}");
             }
             budgets = control.reloader.budgets();
+            if matches!(result, TickApply::Applied(None)) {
+                // Applied without a matching report: the publication
+                // contract is broken; stop rather than guess.
+                return LoopEnd::Invariant;
+            }
         }
         observer.record_occupancy(ServiceOccupancy::capture(
             active.icmpv4_errors(),
@@ -483,7 +496,12 @@ where
                 break;
             };
             let result = control.links.query(&target);
+            let linked = result.is_ok();
             watch.on_link(index, result, &mut on_event);
+            if linked {
+                let addresses = control.links.ipv4_addresses(&target);
+                watch.on_addresses(index, addresses, &mut on_event);
+            }
         }
     }
     end

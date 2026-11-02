@@ -54,9 +54,28 @@ All commands assume a dedicated router host or network namespace. Replace
   - no other XDP program: `ip -details link show dev lan0` must not show
     `prog/xdp`. `ruster run` never replaces or detaches a program it did not
     attach.
-- Recommended: `net.ipv4.ip_forward = 0` in the router's namespace. `ruster
-  run` only warns when it is on, but with forwarding on and kernel addresses on
-  the ports the kernel would route around the router while it is not running.
+- Kernel IPv4 forwarding off: `sysctl -w net.ipv4.ip_forward=0` (and
+  `net.ipv4.conf.<port>.forwarding=0`) in the router's namespace. `ruster
+  run` refuses to start otherwise (`checks code=KERNEL_FORWARDING_ENABLED
+  scope=global|device`; an unreadable sysctl is `UNVERIFIABLE
+  probe=forwarding`). Why: whenever the router is not attached — before it
+  starts, after any exit (including a fatal health event, section 3), and
+  after a crash or SIGKILL, when the unpinned XDP links detach by themselves
+  — frames on the ports reach the kernel stack, and kernel forwarding is
+  what would carry them between the ports around the firewall and NAT. With
+  forwarding off and no kernel L3 on the ports (below) the fallback is "no
+  traffic", not "traffic without the firewall". If other interfaces of the
+  namespace need forwarding (containers, VPN), start with
+  `--allow-kernel-forwarding`: the check then only warns
+  (`IPV4_FORWARDING_ENABLED ...`) and the address/route refusals are what
+  keep the kernel without a route through the ports; prefer a dedicated
+  router namespace instead.
+- Optional: `--strict-config-perms` refuses a config file (at startup and on
+  every reload) that group or other may write (`stage=permissions
+  code=WRITABLE_BY_OTHERS`) or that is owned by neither root nor the user
+  `ruster run` runs as (`code=UNTRUSTED_OWNER`). Off by default; it is a
+  flag, not a config key, because it guards the file itself. The config is
+  always opened `O_NONBLOCK | O_NOCTTY` and must be a regular file.
 
 ## 2. Cold start
 
@@ -73,8 +92,9 @@ All commands assume a dedicated router host or network namespace. Replace
    `ip -details link show dev lan0` lists `prog/xdp id <n>` (`xdp` or
    `xdpgeneric`).
 4. Warnings (`ruster run: warning: port=if<id> ...`) do not stop startup:
-   `MULTI_QUEUE_ALLOWED` (with `--allow-multi-queue`),
-   `IPV4_FORWARDING_ENABLED scope=global|device`, `IPV4_FORWARDING_UNVERIFIABLE`.
+   `MULTI_QUEUE_ALLOWED` (with `--allow-multi-queue`), and only with
+   `--allow-kernel-forwarding`: `IPV4_FORWARDING_ENABLED scope=global|device`,
+   `IPV4_FORWARDING_UNVERIFIABLE`.
 5. Health and counters: every `--stats-interval` seconds (default 60, 0 to
    disable) stdout carries a `ruster-run-stats kind=periodic` block ending in
    `end`. Look at `observer.state` (`healthy`), `rx.received`, `rx.dropped`,
@@ -102,6 +122,8 @@ detached) and prints one line `ruster run: startup failed: stage=<stage>
 | 1 | `open code=REGISTER_UMEM/MEMLOCK_LIMIT` | retried automatically (below); after the last attempt: memlock too small |
 | 1 | `checks code=MULTI_QUEUE_DEVICE rx-queues=N` | reduce to one queue or steer and use `--allow-multi-queue` |
 | 1 | `checks code=KERNEL_IPV4_ADDRESSES` / `KERNEL_IPV4_ROUTES` | remove kernel L3 config from the port |
+| 1 | `checks code=KERNEL_FORWARDING_ENABLED scope=global\|device` / `UNVERIFIABLE probe=forwarding` | turn kernel IPv4 forwarding off in the namespace, or knowingly use `--allow-kernel-forwarding` (section 1) |
+| 1 | `stage=permissions code=WRITABLE_BY_OTHERS\|UNTRUSTED_OWNER\|OWNER_UNVERIFIABLE` (`refused config:`) | with `--strict-config-perms`: `chmod go-w`, `chown root` (or the service user) |
 | 1 | `checks code=MTU_ABOVE_FRAME mtu=M limit=L` | lower the MTU to at most L or use `frame-size = 4096` |
 | 1 | `checks code=UNVERIFIABLE probe=link\|rx-queues\|mtu\|ipv4-addresses\|ipv4-routes` | rtnetlink or procfs not answering in this namespace; `mtu`: the MTU changed during startup, or sysfs (read by the session) is not this namespace's (run under `ip netns exec`) |
 | 1 | `watch code=...` | the rtnetlink socket of the link watch could not be opened |
@@ -157,7 +179,9 @@ completed).
    `ruster validate` and `ruster plan old.toml new.toml`.
 2. `kill -HUP <pid>` (`systemctl reload`, with `ExecReload=/bin/kill -HUP
    $MAINPID`). The handler only sets a flag; the router takes it between
-   two ticks and prints `reload requested (generation G)`.
+   two ticks and prints `reload requested (generation G)`. SIGHUP never
+   ends `ruster run`, also not a foreground run whose terminal hangs up
+   (and also under `nohup`): stop it with SIGINT/SIGTERM.
 3. The file is read and validated exactly like at startup (same limits; a
    path that is not a regular file is refused, so a FIFO cannot block the
    router), a successor generation is built with fresh keys, and the
@@ -166,12 +190,16 @@ completed).
 
    | line | meaning |
    |---|---|
-   | `reload applied: generation=N previous=P; flushed dynamic-neighbors=.. resolution-states=.. nat44-udp-mappings=.. nat44-tcp-sessions=.. firewall-flows=..` | the new generation is active from this tick on |
+   | `reload applied: generation=N previous=P; interfaces=.. addresses=.. routes=.. neighbors=.. firewall-rules=.. nat44-ports=..; flushed dynamic-neighbors=.. resolution-states=.. nat44-udp-mappings=.. nat44-tcp-sessions=.. firewall-flows=..` | the new generation is active from this tick on; compare the document counts with what you meant to load (a truncated file that still validates shows fewer rules or routes; `routes` includes the connected routes) |
    | `reload refused: code=RESTART_REQUIRED reasons=BACKEND,...; generation P keeps running` | the change needs a restart (below); nothing changed |
-   | `reload failed: stage=<stage> code=<code>[ path=...]; generation P keeps running` | read/parse/validate/candidate/plan/dry-run/apply/quiesce failure; nothing changed |
+   | `reload failed: stage=<stage> code=<code>[ path=...]; generation P keeps running` | read/permissions/parse/validate/candidate/plan/dry-run/apply/quiesce failure; nothing changed. `stage=quiesce code=STOPPED`: the run stopped while the reload waited |
 
    Counters: `reload.requested`, `reload.applied`, `reload.refused`,
-   `reload.failed` in every stats block.
+   `reload.failed` in every stats block; in the final block `requested`
+   always equals `applied + refused + failed`. If the backend reports a
+   commit without its report (`previous=unknown; ... code=APPLY_REPORT_MISSING`)
+   the publication contract is broken: the new document is current, the run
+   ends (`stopped after an invariant violation`) and exits 1.
 4. Restart-required (refused) changes: anything in `[backend]` (device,
    queue, mode, attach, rings, UMEM: `BACKEND`), interface ids or MACs
    (`INTERFACES`), a storage capacity (`STORAGE_SHAPE`), the resolution or
@@ -190,8 +218,14 @@ completed).
    200 ms; if the backend does not settle in time (for example a port whose
    link is down still holds TX), the reload fails with
    `stage=quiesce code=TIMEOUT`; send SIGHUP again later. Parsing and
-   planning run on the router thread too (typically a few milliseconds).
-   SIGHUPs while one reload is pending are coalesced into one more reload.
+   planning run synchronously on the router thread too (typically a few
+   milliseconds, more for a large config). SIGHUPs while one reload is
+   pending are coalesced into one more reload.
+7. Under load, reload when traffic is low: during the parse/plan and the
+   quiescence hold the router reads no RX, so a busy port's RX ring (2048
+   entries by default) can overflow and the kernel drops frames. That shows
+   as `if<id>.af_xdp_port.kernel_rx_ring_full` and `kernel_rx_dropped`
+   rising in the next stats block.
 
 ### Health and stall signals (OBS-018)
 
@@ -203,9 +237,26 @@ stats is `warning` while any condition holds.
 
 | code | condition | warning | fatal (exit 1) |
 |---|---|---|---|
-| `TX_STALL` | the oldest TX frame in flight has not completed while the link is up (kicks issued or not) | after 1 s | after 10 s |
+| `TX_STALL` | the oldest TX frame in flight has not completed while the link is up (kicks issued or not) | after `--tx-stall-warn-secs` (default 1) | after `--tx-stall-fatal-secs` (default 10; `0`: never) |
 | `FILL_STARVED` | no Fill frame with the kernel, no RX, and no free frame to refill | after 1 s | never (its frames are held by TX, which `TX_STALL` covers) |
-| `KICK_ERRORS` | kick failures other than `ENETDOWN` in every sample | at once | after 5 s without a clean sample |
+| `KICK_ERRORS` | kick failures other than `ENETDOWN` in every sample | at once | after `--kick-errors-fatal-secs` (default 5; `0`: never) without a clean sample |
+
+The thresholds are seconds from 1 (warning) or 0 (fatal) to 3600, and a
+nonzero `--tx-stall-fatal-secs` must be at least `--tx-stall-warn-secs`.
+They are command-line options (set at start, not reloadable).
+
+A TX stall can be caused from the wire: a host on a port's segment that
+floods 802.3x PAUSE frames stops a NIC with flow control from
+transmitting. With the default fatal exit such a host can therefore make
+the router exit (and, under `Restart=on-failure`, restart in a loop). The
+default stays fatal because the router then fails closed: kernel
+forwarding is refused and the ports carry no kernel L3 (section 1), so
+nothing is forwarded around the firewall while it is down, and a stuck TX
+queue usually needs the restart to recover. If availability under a
+hostile segment matters more, disable flow control on the port
+(`ethtool -A <dev> rx off tx off`) and/or run with
+`--tx-stall-fatal-secs 0` (warn only; the stall stays visible in
+`watch.state` and `if<id>.watch.tx_stall_ms`).
 
 A busy link never trips these: completions keep retiring the oldest frame,
 RX keeps arriving, and kicks succeed. Per port: `if<id>.watch.tx_stall`,
@@ -225,6 +276,9 @@ Every second the router asks rtnetlink for each port's interface index
 | MTU above what a frame holds (`frame-size - 256 - headroom - 14`) | fatal `MTU_ABOVE_FRAME` |
 | MTU raised within that bound | warning `MTU_RAISED`; TX stays bounded by the startup MTU until a restart |
 | the rtnetlink query fails | warning `LINK_PROBE`; fatal `LINK_UNVERIFIABLE` after 3 failures in a row |
+| a kernel IPv4 address appears on a port (`ip addr add ... dev lan0`; one `RTM_GETADDR` dump in the same round) | fatal `KERNEL_IPV4_ADDRESSES` (`if<id>.watch.kernel_ipv4_addresses`), like the startup refusal; a failed dump counts as a failed query |
+
+Kernel routes and forwarding sysctls are checked at startup only.
 
 A fatal event prints `fatal: port=if<id> health=<CODE>`, then the shutdown
 of section 4 runs and the summary starts with `stopped after a fatal health
@@ -303,18 +357,21 @@ tears down in order, and 101 stays distinct from the documented statuses.
   differs from rtnetlink's, which catches a foreign sysfs view with another
   MTU but not one with the same MTU. Keep running `ruster run` under
   `ip netns exec <ns>`, which remounts `/sys`.
-- The link watch and the reload's parse and plan run on the router thread:
-  an rtnetlink query once per second per port (blocked only while another
-  process holds the kernel's RTNL lock), and a reload for a few
-  milliseconds; RX queues in the ring meanwhile. The quiescence wait of a
-  reload holds RX back for at most 200 ms.
-- A link that is down holds its TX in the kernel's ring, so a reload while
-  a port is down usually fails with `stage=quiesce code=TIMEOUT`.
+- The link watch and the reload's parse and plan run synchronously on the
+  router thread: a link query and an address dump once per second per port
+  (the `send` blocks while another process holds the kernel's RTNL lock),
+  and a reload for a few milliseconds; RX queues in the ring meanwhile and
+  can overflow under load (section 3). The quiescence wait of a reload
+  holds RX back for at most 200 ms.
+- A port that is administratively down with TX queued holds those frames
+  in the kernel's ring, so a reload while it is down fails with
+  `stage=quiesce code=TIMEOUT`; bring the link up first.
 - Every reload rotates the NAT44 and firewall hash keys and so flushes
   their state (PUB-006): reload during busy NAT traffic drops established
   TCP sessions through NAT.
-- Health thresholds (1 s warning, 10 s fatal TX stall, 5 s kick errors,
-  3 failed link queries) and intervals are fixed, not configurable.
+- The `FILL_STARVED` warning delay (1 s), the 3 failed link queries, and
+  the watch intervals are fixed; the TX stall and kick error thresholds
+  are options (section 3) but not reloadable.
 - Only the main routing table is checked for kernel routes out of a port;
   policy-routing tables (`ip rule`, other tables) are not (deferred:
   `RTM_GETROUTE` over all tables).
@@ -346,5 +403,7 @@ a SIGHUP reload that denies and then allows the forwarded UDP again without
 a restart; a refused restart-required reload while traffic keeps flowing;
 link down/up on the router's port with recovered forwarding; an MTU above
 the frame bound and a deleted port device, both exit 1 with nothing
-attached; rollback after a second-port failure; the device checks; SIGKILL
+attached; rollback after a second-port failure; the device checks; kernel
+forwarding refused by default and accepted with `--allow-kernel-forwarding`;
+SIGKILL
 and restart). It never touches interfaces outside its namespaces.

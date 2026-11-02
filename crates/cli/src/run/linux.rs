@@ -136,6 +136,10 @@ impl LinkMonitor for NetlinkLinks {
     fn query(&mut self, target: &LinkTarget) -> Result<LinkFacts, NetlinkError> {
         self.0.query(target.ifindex)
     }
+
+    fn ipv4_addresses(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError> {
+        self.0.ipv4_addresses(target.ifindex)
+    }
 }
 
 /// The adapter over every port's engine.

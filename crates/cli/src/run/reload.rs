@@ -63,11 +63,15 @@ pub trait ConfigSource {
 }
 
 /// The `--config` file.
-pub struct ConfigFile(pub PathBuf);
+pub struct ConfigFile {
+    pub path: PathBuf,
+    /// `--strict-config-perms`.
+    pub strict: bool,
+}
 
 impl ConfigSource for ConfigFile {
     fn load(&mut self) -> Result<ValidatedConfigV1, LoadError> {
-        config_cmd::load_validated_regular(&self.0)
+        config_cmd::load_validated_regular(&self.path, self.strict)
     }
 }
 
@@ -94,9 +98,12 @@ impl ObservableFields for ReloadCounters {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReloadOutcome {
     Applied {
-        previous: NonZeroU64,
+        /// `None` if the commit's report was missing (an invariant
+        /// violation: the run then ends with exit 1).
+        previous: Option<NonZeroU64>,
         generation: NonZeroU64,
-        flush: ApplyFlushCounts,
+        flush: Option<ApplyFlushCounts>,
+        counts: DocumentCounts,
     },
     /// Restart-required reasons, in plan order.
     Refused {
@@ -117,17 +124,41 @@ impl fmt::Display for ReloadOutcome {
                 previous,
                 generation,
                 flush,
-            } => write!(
-                formatter,
-                "reload applied: generation={generation} previous={previous}; flushed \
-                 dynamic-neighbors={} resolution-states={} nat44-udp-mappings={} \
-                 nat44-tcp-sessions={} firewall-flows={}",
-                flush.dynamic_neighbors,
-                flush.resolution_states,
-                flush.nat44_udp_mappings,
-                flush.nat44_tcp_sessions,
-                flush.firewall_flows,
-            ),
+                counts,
+            } => {
+                write!(
+                    formatter,
+                    "reload applied: generation={generation} previous="
+                )?;
+                match previous {
+                    Some(previous) => write!(formatter, "{previous}")?,
+                    None => formatter.write_str("unknown")?,
+                }
+                write!(
+                    formatter,
+                    "; interfaces={} addresses={} routes={} neighbors={} firewall-rules={} \
+                     nat44-ports={}; ",
+                    counts.interfaces,
+                    counts.addresses,
+                    counts.routes,
+                    counts.neighbors,
+                    counts.firewall_rules,
+                    counts.nat44_ports,
+                )?;
+                match flush {
+                    Some(flush) => write!(
+                        formatter,
+                        "flushed dynamic-neighbors={} resolution-states={} \
+                         nat44-udp-mappings={} nat44-tcp-sessions={} firewall-flows={}",
+                        flush.dynamic_neighbors,
+                        flush.resolution_states,
+                        flush.nat44_udp_mappings,
+                        flush.nat44_tcp_sessions,
+                        flush.firewall_flows,
+                    ),
+                    None => formatter.write_str("code=APPLY_REPORT_MISSING"),
+                }
+            }
             Self::Refused {
                 reasons,
                 generation,
@@ -147,6 +178,55 @@ impl fmt::Display for ReloadOutcome {
             ),
         }
     }
+}
+
+/// The publication result of the tick that carried a reload candidate.
+#[derive(Clone, Copy, Debug)]
+pub enum TickApply {
+    /// Committed; the commit's report (previous generation, flush), if it
+    /// matched the new generation.
+    Applied(Option<(NonZeroU64, ApplyFlushCounts)>),
+    Rejected(ApplyError),
+    /// Neither (the backend deferred it).
+    NotApplied,
+}
+
+/// Value-free size of an applied document, so a truncated or wrong file
+/// shows in the `reload applied` line.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DocumentCounts {
+    pub interfaces: usize,
+    pub addresses: usize,
+    pub routes: usize,
+    pub neighbors: usize,
+    pub firewall_rules: usize,
+    /// NAT44 public port pool size (0 without NAT).
+    pub nat44_ports: u32,
+}
+
+impl DocumentCounts {
+    pub fn of(config: &ValidatedConfigV1) -> Self {
+        Self {
+            interfaces: config.interfaces().len(),
+            addresses: config.local_ipv4().len(),
+            routes: config.routes().len(),
+            neighbors: config.neighbors().len(),
+            firewall_rules: config
+                .firewall()
+                .map_or(0, |firewall| firewall.rules().len()),
+            nat44_ports: nat44_ports(config),
+        }
+    }
+}
+
+/// The NAT44 UDP public port pool size (the TCP pool shares the realm).
+fn nat44_ports(config: &ValidatedConfigV1) -> u32 {
+    config
+        .nat44()
+        .and_then(|nat44| nat44.udp())
+        .map_or(0, |udp| {
+            u32::from(udp.last_port()).saturating_sub(u32::from(udp.first_port())) + 1
+        })
 }
 
 struct Pending {
@@ -236,6 +316,17 @@ impl<K: ProductionKeySource, C: ConfigSource> Reloader<K, C> {
         None
     }
 
+    /// Makes `next` pending without a candidate (tests of `finish`).
+    #[cfg(test)]
+    pub fn set_pending_for_test(&mut self, next: ValidatedConfigV1) {
+        self.counters.requested = self.counters.requested.saturating_add(1);
+        self.pending = Some(Pending {
+            candidate: None,
+            next,
+            since: MonotonicMillis(0),
+        });
+    }
+
     /// Takes the pending candidate for the publication phase of this tick;
     /// its document stays until [`Self::finish`].
     pub fn take_candidate(&mut self) -> Option<ValidatedCandidate> {
@@ -243,33 +334,33 @@ impl<K: ProductionKeySource, C: ConfigSource> Reloader<K, C> {
     }
 
     /// Ends the pending reload with the publication result of the tick
-    /// that carried its candidate. `applied` is the report of the commit
-    /// (`ActivePublication::last_apply` of the new generation), `rejected`
-    /// the typed refusal; neither means the backend deferred it.
-    pub fn finish(
-        &mut self,
-        generation: NonZeroU64,
-        applied: Option<(NonZeroU64, ApplyFlushCounts)>,
-        rejected: Option<ApplyError>,
-    ) -> Option<ReloadOutcome> {
+    /// that carried its candidate. `PublicationOutcome::Applied` is
+    /// authoritative: the new document becomes current even if the
+    /// commit's report is missing (`TickApply::Applied(None)`, an invariant
+    /// violation the caller ends the run on), so it is never reported as
+    /// "keeps running".
+    pub fn finish(&mut self, generation: NonZeroU64, result: TickApply) -> Option<ReloadOutcome> {
         let pending = self.pending.take()?;
-        Some(match (applied, rejected) {
-            (Some((previous, flush)), _) => {
+        Some(match result {
+            TickApply::Applied(report) => {
+                let counts = DocumentCounts::of(&pending.next);
                 self.current = pending.next;
                 self.counters.applied = self.counters.applied.saturating_add(1);
                 ReloadOutcome::Applied {
-                    previous,
+                    previous: report.map(|(previous, _)| previous),
                     generation,
-                    flush,
+                    flush: report.map(|(_, flush)| flush),
+                    counts,
                 }
             }
-            (None, Some(error)) => self.failed("apply", apply_code(error), generation),
-            (None, None) => self.failed("apply", "NOT_QUIESCENT".to_owned(), generation),
+            TickApply::Rejected(error) => self.failed("apply", apply_code(error), generation),
+            TickApply::NotApplied => self.failed("apply", "NOT_QUIESCENT".to_owned(), generation),
         })
     }
 
-    /// Abandons the pending reload (quiescence timeout or a stopping
-    /// backend).
+    /// Abandons the pending reload (quiescence timeout, a stopping
+    /// backend, or the end of the run: `STOPPED`), so `requested` always
+    /// equals `applied + refused + failed` at the end.
     pub fn abandon(&mut self, code: &'static str, generation: NonZeroU64) -> Option<ReloadOutcome> {
         self.pending.take()?;
         Some(self.failed("quiesce", code.to_owned(), generation))

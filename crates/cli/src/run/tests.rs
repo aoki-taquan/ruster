@@ -104,6 +104,8 @@ struct State {
     /// Link query results, consumed in order by the matching port.
     links: RefCell<VecDeque<(IfId, Result<LinkFacts, NetlinkError>)>>,
     link_queries: Cell<u32>,
+    /// Address dump results, consumed in order by the matching port.
+    addresses: RefCell<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
     /// Quiescence probes refused before one succeeds.
     quiesce_blocks: Cell<u32>,
     quiesce_probes: Cell<u32>,
@@ -125,6 +127,8 @@ struct FakeHost {
     privilege: Option<PrivilegeFailure>,
     close_fails: Option<u16>,
     panic_in_build: bool,
+    /// `net.ipv4.ip_forward` reads 1.
+    forwarding_on: bool,
 }
 
 impl FakeHost {
@@ -254,6 +258,19 @@ impl LinkMonitor for FakeLinks {
             lower_up: true,
         })
     }
+
+    fn ipv4_addresses(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError> {
+        let mut addresses = self.state.addresses.borrow_mut();
+        if addresses
+            .front()
+            .is_some_and(|(port, _)| *port == target.interface)
+        {
+            if let Some((_, result)) = addresses.pop_front() {
+                return result;
+            }
+        }
+        Ok(0)
+    }
 }
 
 /// Fake interface index of a port.
@@ -318,7 +335,7 @@ impl PortHost for FakeHost {
             frame_capacity: port.umem().visible_capacity(),
             ipv4_addresses: 0,
             ipv4_routes: 0,
-            forwarding_global: Some(false),
+            forwarding_global: Some(self.forwarding_on),
             forwarding_device: Some(false),
         })
     }
@@ -473,6 +490,7 @@ fn settings(policy: CheckPolicy, stats_interval_ms: u64) -> Settings {
         health_interval_ms: 0,
         link_interval_ms: 0,
         reload_quiesce_ms: super::reload::RELOAD_QUIESCE_MS,
+        thresholds: super::watch::Thresholds::default(),
     }
 }
 
@@ -807,6 +825,7 @@ fn multi_queue_device_is_refused_unless_allowed_with_a_warning() {
         &host,
         CheckPolicy {
             allow_multi_queue: true,
+            ..CheckPolicy::default()
         },
         &FakeStop::after(FIRST_LOOP_CHECK + 1),
         &mut FakeClock::default(),

@@ -376,13 +376,37 @@ pub struct LinkProbe {
 
 #[cfg(target_os = "linux")]
 impl LinkProbe {
+    /// Opens the socket and connects it to the kernel (`nl_pid` 0).
     pub fn open() -> Result<Self, NetlinkError> {
+        let socket = sys::RouteSocket::open()?;
+        socket.connect_kernel()?;
         Ok(Self {
-            socket: sys::RouteSocket::open()?,
+            socket,
             buffer: vec![0_u8; RECEIVE_BUFFER],
             port: None,
             sequence: 0,
         })
+    }
+
+    fn next_sequence(&mut self) -> u32 {
+        self.sequence = self.sequence.wrapping_add(1).max(1);
+        self.sequence
+    }
+
+    /// Kernel IPv4 addresses of `ifindex`, through one `RTM_GETADDR` dump
+    /// on the reused socket and buffer (no allocation; non-blocking
+    /// receives: the kernel queues each next dump chunk while handing out
+    /// the previous one). A dump that raced a change is retried at most
+    /// [`DUMP_ATTEMPTS`] times.
+    pub fn ipv4_addresses(&mut self, ifindex: u32) -> Result<u32, NetlinkError> {
+        for _ in 0..DUMP_ATTEMPTS {
+            let sequence = self.next_sequence();
+            if let Some(total) = dump_once(&self.socket, &mut self.buffer, sequence, true, ifindex)?
+            {
+                return Ok(total);
+            }
+        }
+        Err(NetlinkError::Interrupted)
     }
 
     /// Link facts of `ifindex` in this socket's (the caller's) network
@@ -391,8 +415,7 @@ impl LinkProbe {
     /// while handling the `send`, so an empty queue (`EAGAIN`) is an error
     /// of this query.
     pub fn query(&mut self, ifindex: u32) -> Result<LinkFacts, NetlinkError> {
-        self.sequence = self.sequence.wrapping_add(1).max(1);
-        let sequence = self.sequence;
+        let sequence = self.next_sequence();
         self.socket.send(&link_request(sequence, ifindex))?;
         let port = match self.port {
             Some(port) => port,
@@ -426,34 +449,47 @@ impl LinkProbe {
 #[cfg(target_os = "linux")]
 pub fn ipv4_address_count(ifindex: u32) -> Result<u32, NetlinkError> {
     let mut buffer = vec![0_u8; RECEIVE_BUFFER];
-    for attempt in 0..DUMP_ATTEMPTS {
+    let mut sequence = 0;
+    for _ in 0..DUMP_ATTEMPTS {
         let socket = sys::RouteSocket::open()?;
-        let sequence = attempt + 1;
-        socket.send(&dump_request(sequence))?;
-        // The send auto-bound the socket; its port id names our replies.
-        let port = socket.port_id()?;
-        let mut total = 0_u32;
-        let mut interrupted = false;
-        loop {
-            let received = socket.receive(&mut buffer, false)?;
-            if received == 0 {
-                return Err(NetlinkError::EndOfStream);
-            }
-            if received > buffer.len() {
-                return Err(NetlinkError::Truncated);
-            }
-            let chunk = parse_chunk(&buffer[..received], sequence, port, ifindex)?;
-            total = total.saturating_add(chunk.addresses);
-            interrupted |= chunk.interrupted;
-            if chunk.done {
-                break;
-            }
-        }
-        if !interrupted {
+        sequence += 1;
+        if let Some(total) = dump_once(&socket, &mut buffer, sequence, false, ifindex)? {
             return Ok(total);
         }
     }
     Err(NetlinkError::Interrupted)
+}
+
+/// One `RTM_GETADDR` dump on `socket`: `Ok(None)` if it raced a change
+/// (`NLM_F_DUMP_INTR`). Messages of other sequences are skipped.
+#[cfg(target_os = "linux")]
+fn dump_once(
+    socket: &sys::RouteSocket,
+    buffer: &mut [u8],
+    sequence: u32,
+    nonblocking: bool,
+    ifindex: u32,
+) -> Result<Option<u32>, NetlinkError> {
+    socket.send(&dump_request(sequence))?;
+    // The send (or connect) bound the socket; its port id names our replies.
+    let port = socket.port_id()?;
+    let mut total = 0_u32;
+    let mut interrupted = false;
+    loop {
+        let received = socket.receive(buffer, nonblocking)?;
+        if received == 0 {
+            return Err(NetlinkError::EndOfStream);
+        }
+        if received > buffer.len() {
+            return Err(NetlinkError::Truncated);
+        }
+        let chunk = parse_chunk(&buffer[..received], sequence, port, ifindex)?;
+        total = total.saturating_add(chunk.addresses);
+        interrupted |= chunk.interrupted;
+        if chunk.done {
+            return Ok((!interrupted).then_some(total));
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -498,6 +534,8 @@ mod sys {
         fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
         fn send(fd: c_int, buffer: *const c_void, len: usize, flags: c_int) -> isize;
         fn getsockname(fd: c_int, address: *mut c_void, len: *mut u32) -> c_int;
+        // `int connect(int, const struct sockaddr *, socklen_t)`.
+        fn connect(fd: c_int, address: *const c_void, len: u32) -> c_int;
         fn recvfrom(
             fd: c_int,
             buffer: *mut c_void,
@@ -533,8 +571,33 @@ mod sys {
             })
         }
 
+        /// Connects the socket to the kernel (`nl_pid` 0, no groups), so
+        /// its default destination is fixed to the kernel for its whole
+        /// life (the long-lived link watch socket).
+        pub fn connect_kernel(&self) -> Result<(), NetlinkError> {
+            let address = SockAddrNl {
+                family: AF_NETLINK_FAMILY,
+                ..SockAddrNl::default()
+            };
+            // SAFETY: `address` is a live, initialized 12-byte `repr(C)`
+            // `sockaddr_nl` that the call only reads, and `SOCKADDR_NL_LEN`
+            // is its size; the fd is open (owned by `self`).
+            let result = unsafe {
+                connect(
+                    self.fd.as_raw_fd(),
+                    (&raw const address).cast(),
+                    SOCKADDR_NL_LEN,
+                )
+            };
+            if result != 0 {
+                return Err(last_errno());
+            }
+            Ok(())
+        }
+
         /// Sends one request datagram (to the kernel: the socket is
-        /// unconnected and unbound, which netlink addresses to pid 0).
+        /// unconnected and unbound, which netlink addresses to pid 0, or
+        /// connected to pid 0).
         pub fn send(&self, request: &[u8]) -> Result<(), NetlinkError> {
             loop {
                 // SAFETY: `request` is a live, initialized slice of
@@ -951,7 +1014,12 @@ mod tests {
             .query(i32::MAX as u32)
             .expect_err("no such index")
             .is_no_device());
-        // The socket is reused.
+        // The socket is reused, also for address dumps (connected to the
+        // kernel); loopback's 127.0.0.1 may have been removed, so only
+        // success is asserted, and a missing index has no address.
+        assert_eq!(probe.query(1).map(|facts| facts.mtu), Ok(facts.mtu));
+        assert!(probe.ipv4_addresses(1).is_ok());
+        assert_eq!(probe.ipv4_addresses(i32::MAX as u32), Ok(0));
         assert_eq!(probe.query(1).map(|facts| facts.mtu), Ok(facts.mtu));
     }
 

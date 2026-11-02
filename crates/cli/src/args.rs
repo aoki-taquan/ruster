@@ -13,12 +13,16 @@ usage:
   ruster plan <current.toml> <next.toml>
   ruster run-sim [--hold] --scenario <scenario.toml>
   ruster run-sim [--hold] -- <scenario.toml>
-  ruster run [--allow-multi-queue] [--stats-interval <seconds>]
-             [--startup-attempts <n>] --config <config.toml>
+  ruster run [--allow-multi-queue] [--allow-kernel-forwarding]
+             [--strict-config-perms] [--stats-interval <seconds>]
+             [--startup-attempts <n>] [--tx-stall-warn-secs <s>]
+             [--tx-stall-fatal-secs <s>] [--kick-errors-fatal-secs <s>]
+             --config <config.toml>
   ruster run [options] -- <config.toml>
   ruster --help | --version
 
 `run`: SIGINT/SIGTERM stop (a second one forces), SIGHUP reloads the config.
+A fatal threshold of 0 disables that fatal exit (warn only).
 
 exit status: 0 success or signal shutdown, 1 runtime/I/O/expectation failure
 (including unreadable files, and `run` stopped by a fatal health or device
@@ -35,6 +39,49 @@ pub const MAX_STATS_INTERVAL_SECS: u64 = 86_400;
 pub const DEFAULT_STARTUP_ATTEMPTS: u32 = 3;
 /// Largest accepted `--startup-attempts`.
 pub const MAX_STARTUP_ATTEMPTS: u32 = 10;
+/// Default `--tx-stall-warn-secs`.
+pub const DEFAULT_TX_STALL_WARN_SECS: u64 = 1;
+/// Default `--tx-stall-fatal-secs` (0 disables the fatal exit).
+pub const DEFAULT_TX_STALL_FATAL_SECS: u64 = 10;
+/// Default `--kick-errors-fatal-secs` (0 disables the fatal exit).
+pub const DEFAULT_KICK_ERRORS_FATAL_SECS: u64 = 5;
+/// Largest accepted health threshold (one hour).
+pub const MAX_HEALTH_SECS: u64 = 3_600;
+
+/// A numeric `run` option: name and accepted range.
+struct Numeric {
+    name: &'static str,
+    min: u64,
+    max: u64,
+}
+
+const NUMERIC: [Numeric; 5] = [
+    Numeric {
+        name: "--stats-interval",
+        min: 0,
+        max: MAX_STATS_INTERVAL_SECS,
+    },
+    Numeric {
+        name: "--startup-attempts",
+        min: 1,
+        max: MAX_STARTUP_ATTEMPTS as u64,
+    },
+    Numeric {
+        name: "--tx-stall-warn-secs",
+        min: 1,
+        max: MAX_HEALTH_SECS,
+    },
+    Numeric {
+        name: "--tx-stall-fatal-secs",
+        min: 0,
+        max: MAX_HEALTH_SECS,
+    },
+    Numeric {
+        name: "--kick-errors-fatal-secs",
+        min: 0,
+        max: MAX_HEALTH_SECS,
+    },
+];
 
 /// `ruster run` options.
 #[derive(Debug, Eq, PartialEq)]
@@ -51,6 +98,16 @@ pub struct RunArgs {
     /// `BIND/BUSY`, `REGISTER_UMEM/MEMLOCK_LIMIT`, ...), each after a full
     /// rollback; `1..=MAX_STARTUP_ATTEMPTS`, 1 disables the retry.
     pub startup_attempts: u32,
+    /// Start although kernel IPv4 forwarding is on (or unreadable) in the
+    /// namespace or on a port: warned instead of refused (XDP-063).
+    pub allow_kernel_forwarding: bool,
+    /// Refuse a config file that group or other may write or that is
+    /// owned by neither root nor the effective user (startup and reload).
+    pub strict_config_perms: bool,
+    /// Health thresholds of the watch, in seconds (0 fatal: warn only).
+    pub tx_stall_warn_secs: u64,
+    pub tx_stall_fatal_secs: u64,
+    pub kick_errors_fatal_secs: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -75,6 +132,9 @@ pub enum UsageError {
     MissingValue(&'static str),
     DuplicateOption(&'static str),
     InvalidValue(&'static str),
+    /// `--tx-stall-fatal-secs` is neither 0 nor at least
+    /// `--tx-stall-warn-secs`.
+    FatalBelowWarning,
 }
 
 impl fmt::Display for UsageError {
@@ -87,13 +147,21 @@ impl fmt::Display for UsageError {
             Self::MissingOperand(name) => write!(formatter, "missing operand <{name}>"),
             Self::MissingValue(option) => write!(formatter, "option {option} requires a value"),
             Self::DuplicateOption(option) => write!(formatter, "option {option} given twice"),
-            Self::InvalidValue(option @ "--startup-attempts") => write!(
-                formatter,
-                "option {option} needs a whole number from 1 to {MAX_STARTUP_ATTEMPTS}"
-            ),
-            Self::InvalidValue(option) => write!(
-                formatter,
-                "option {option} needs a whole number of seconds from 0 to {MAX_STATS_INTERVAL_SECS}"
+            Self::InvalidValue(option) => match NUMERIC.iter().find(|n| n.name == *option) {
+                Some(n) if n.name == "--startup-attempts" => write!(
+                    formatter,
+                    "option {option} needs a whole number from {} to {}",
+                    n.min, n.max
+                ),
+                Some(n) => write!(
+                    formatter,
+                    "option {option} needs a whole number of seconds from {} to {}",
+                    n.min, n.max
+                ),
+                None => write!(formatter, "option {option} has an invalid value"),
+            },
+            Self::FatalBelowWarning => formatter.write_str(
+                "option --tx-stall-fatal-secs must be 0 or at least --tx-stall-warn-secs",
             ),
         }
     }
@@ -192,10 +260,11 @@ fn equals_value(word: &OsStr, prefix: &str) -> Option<OsString> {
 fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
     let mut config = None;
     let mut allow_multi_queue = false;
-    let mut interval = None;
-    let mut attempts = None;
+    let mut allow_kernel_forwarding = false;
+    let mut strict_config_perms = false;
+    let mut numbers: [Option<u64>; NUMERIC.len()] = [None; NUMERIC.len()];
     let mut words = rest.iter();
-    while let Some(word) = words.next() {
+    'words: while let Some(word) = words.next() {
         if let Some(value) = equals_value(word, "--config=") {
             if value.is_empty() {
                 return Err(UsageError::MissingValue("--config"));
@@ -203,14 +272,28 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
             set_once(&mut config, value.into(), "--config")?;
             continue;
         }
-        if let Some(value) = equals_value(word, "--stats-interval=") {
-            set_interval(&mut interval, &value)?;
-            continue;
+        for (index, numeric) in NUMERIC.iter().enumerate() {
+            let prefix = format!("{}=", numeric.name);
+            if let Some(value) = equals_value(word, &prefix) {
+                set_number(&mut numbers[index], numeric, &value)?;
+                continue 'words;
+            }
+            if word.to_str() == Some(numeric.name) {
+                let value = words
+                    .next()
+                    .filter(|value| !is_option(value))
+                    .ok_or(UsageError::MissingValue(numeric.name))?;
+                set_number(&mut numbers[index], numeric, value)?;
+                continue 'words;
+            }
         }
-        if let Some(value) = equals_value(word, "--startup-attempts=") {
-            set_attempts(&mut attempts, &value)?;
-            continue;
-        }
+        let flag = |slot: &mut bool, name: &'static str| {
+            if std::mem::replace(slot, true) {
+                Err(UsageError::DuplicateOption(name))
+            } else {
+                Ok(())
+            }
+        };
         match word.to_str() {
             Some("--") => {
                 // `run [options] -- <config.toml>`: the one operand after
@@ -222,10 +305,13 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
                 }
             }
             Some("-h" | "--help") => return Ok(Command::Help),
-            Some("--allow-multi-queue") if allow_multi_queue => {
-                return Err(UsageError::DuplicateOption("--allow-multi-queue"))
+            Some("--allow-multi-queue") => flag(&mut allow_multi_queue, "--allow-multi-queue")?,
+            Some("--allow-kernel-forwarding") => {
+                flag(&mut allow_kernel_forwarding, "--allow-kernel-forwarding")?;
             }
-            Some("--allow-multi-queue") => allow_multi_queue = true,
+            Some("--strict-config-perms") => {
+                flag(&mut strict_config_perms, "--strict-config-perms")?
+            }
             Some("--config") => {
                 let value = words
                     .next()
@@ -233,64 +319,45 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
                     .ok_or(UsageError::MissingValue("--config"))?;
                 set_once(&mut config, value.into(), "--config")?;
             }
-            Some("--stats-interval") => {
-                let value = words
-                    .next()
-                    .filter(|value| !is_option(value))
-                    .ok_or(UsageError::MissingValue("--stats-interval"))?;
-                set_interval(&mut interval, value)?;
-            }
-            Some("--startup-attempts") => {
-                let value = words
-                    .next()
-                    .filter(|value| !is_option(value))
-                    .ok_or(UsageError::MissingValue("--startup-attempts"))?;
-                set_attempts(&mut attempts, value)?;
-            }
             _ if is_option(word) => return Err(UsageError::UnknownOption(lossy(word))),
             _ => return Err(UsageError::UnexpectedOperand(lossy(word))),
         }
     }
     let config = config.ok_or(UsageError::MissingValue("--config"))?;
+    let [interval, attempts, warn, fatal, kicks] = numbers;
+    let tx_stall_warn_secs = warn.unwrap_or(DEFAULT_TX_STALL_WARN_SECS);
+    let tx_stall_fatal_secs = fatal.unwrap_or(DEFAULT_TX_STALL_FATAL_SECS);
+    if tx_stall_fatal_secs != 0 && tx_stall_fatal_secs < tx_stall_warn_secs {
+        return Err(UsageError::FatalBelowWarning);
+    }
     Ok(Command::Run(RunArgs {
         config,
         allow_multi_queue,
         stats_interval_secs: interval.unwrap_or(DEFAULT_STATS_INTERVAL_SECS),
-        startup_attempts: attempts.unwrap_or(DEFAULT_STARTUP_ATTEMPTS),
+        startup_attempts: attempts
+            .and_then(|attempts| u32::try_from(attempts).ok())
+            .unwrap_or(DEFAULT_STARTUP_ATTEMPTS),
+        allow_kernel_forwarding,
+        strict_config_perms,
+        tx_stall_warn_secs,
+        tx_stall_fatal_secs,
+        kick_errors_fatal_secs: kicks.unwrap_or(DEFAULT_KICK_ERRORS_FATAL_SECS),
     }))
 }
 
-/// A decimal attempt count, `1..=MAX_STARTUP_ATTEMPTS`, ASCII digits only.
-fn set_attempts(slot: &mut Option<u32>, value: &OsStr) -> Result<(), UsageError> {
-    const OPTION: &str = "--startup-attempts";
-    let attempts = value
-        .to_str()
-        .filter(|text| {
-            !text.is_empty() && text.len() <= 2 && text.bytes().all(|b| b.is_ascii_digit())
-        })
-        .and_then(|text| text.parse::<u32>().ok())
-        .filter(|attempts| (1..=MAX_STARTUP_ATTEMPTS).contains(attempts))
-        .ok_or(UsageError::InvalidValue(OPTION))?;
-    if slot.replace(attempts).is_some() {
-        return Err(UsageError::DuplicateOption(OPTION));
-    }
-    Ok(())
-}
-
-/// A decimal number of seconds, `0..=MAX_STATS_INTERVAL_SECS`, ASCII digits
-/// only (no sign, no whitespace).
-fn set_interval(slot: &mut Option<u64>, value: &OsStr) -> Result<(), UsageError> {
-    const OPTION: &str = "--stats-interval";
-    let seconds = value
+/// A decimal number in the option's range, ASCII digits only (no sign,
+/// no whitespace, at most 6 digits).
+fn set_number(slot: &mut Option<u64>, numeric: &Numeric, value: &OsStr) -> Result<(), UsageError> {
+    let number = value
         .to_str()
         .filter(|text| {
             !text.is_empty() && text.len() <= 6 && text.bytes().all(|b| b.is_ascii_digit())
         })
         .and_then(|text| text.parse::<u64>().ok())
-        .filter(|seconds| *seconds <= MAX_STATS_INTERVAL_SECS)
-        .ok_or(UsageError::InvalidValue(OPTION))?;
-    if slot.replace(seconds).is_some() {
-        return Err(UsageError::DuplicateOption(OPTION));
+        .filter(|number| (numeric.min..=numeric.max).contains(number))
+        .ok_or(UsageError::InvalidValue(numeric.name))?;
+    if slot.replace(number).is_some() {
+        return Err(UsageError::DuplicateOption(numeric.name));
     }
     Ok(())
 }
@@ -506,7 +573,90 @@ mod tests {
             allow_multi_queue,
             stats_interval_secs,
             startup_attempts: DEFAULT_STARTUP_ATTEMPTS,
+            allow_kernel_forwarding: false,
+            strict_config_perms: false,
+            tx_stall_warn_secs: DEFAULT_TX_STALL_WARN_SECS,
+            tx_stall_fatal_secs: DEFAULT_TX_STALL_FATAL_SECS,
+            kick_errors_fatal_secs: DEFAULT_KICK_ERRORS_FATAL_SECS,
         })
+    }
+
+    #[test]
+    fn run_parses_security_and_health_options() {
+        let Ok(Command::Run(args)) = run(&[
+            "run",
+            "--allow-kernel-forwarding",
+            "--strict-config-perms",
+            "--tx-stall-warn-secs=2",
+            "--tx-stall-fatal-secs",
+            "0",
+            "--kick-errors-fatal-secs=0",
+            "--config",
+            "r.toml",
+        ]) else {
+            panic!("parsed");
+        };
+        assert!(args.allow_kernel_forwarding && args.strict_config_perms);
+        assert_eq!(
+            (
+                args.tx_stall_warn_secs,
+                args.tx_stall_fatal_secs,
+                args.kick_errors_fatal_secs
+            ),
+            (2, 0, 0)
+        );
+        let Ok(Command::Run(defaults)) = run(&["run", "--config", "r.toml"]) else {
+            panic!("parsed");
+        };
+        assert!(!defaults.allow_kernel_forwarding && !defaults.strict_config_perms);
+        assert_eq!(
+            (
+                defaults.tx_stall_warn_secs,
+                defaults.tx_stall_fatal_secs,
+                defaults.kick_errors_fatal_secs
+            ),
+            (1, 10, 5)
+        );
+        for flag in ["--allow-kernel-forwarding", "--strict-config-perms"] {
+            assert_eq!(
+                run(&["run", "--config", "a", flag, flag]),
+                Err(UsageError::DuplicateOption(flag))
+            );
+        }
+        for (word, option) in [
+            ("--tx-stall-warn-secs=0", "--tx-stall-warn-secs"),
+            ("--tx-stall-warn-secs=3601", "--tx-stall-warn-secs"),
+            ("--tx-stall-fatal-secs=3601", "--tx-stall-fatal-secs"),
+            ("--kick-errors-fatal-secs=-1", "--kick-errors-fatal-secs"),
+        ] {
+            assert_eq!(
+                run(&["run", "--config", "a", word]),
+                Err(UsageError::InvalidValue(option)),
+                "{word}"
+            );
+        }
+        assert_eq!(
+            run(&[
+                "run",
+                "--config",
+                "a",
+                "--tx-stall-warn-secs=20",
+                "--tx-stall-fatal-secs=10"
+            ]),
+            Err(UsageError::FatalBelowWarning)
+        );
+        assert!(run(&[
+            "run",
+            "--config",
+            "a",
+            "--tx-stall-warn-secs=20",
+            "--tx-stall-fatal-secs=20"
+        ])
+        .is_ok());
+        assert_eq!(
+            UsageError::InvalidValue("--tx-stall-fatal-secs").to_string(),
+            "option --tx-stall-fatal-secs needs a whole number of seconds from 0 to 3600"
+        );
     }
 
     #[test]
@@ -517,6 +667,11 @@ mod tests {
                 allow_multi_queue: false,
                 stats_interval_secs: DEFAULT_STATS_INTERVAL_SECS,
                 startup_attempts: attempts,
+                allow_kernel_forwarding: false,
+                strict_config_perms: false,
+                tx_stall_warn_secs: DEFAULT_TX_STALL_WARN_SECS,
+                tx_stall_fatal_secs: DEFAULT_TX_STALL_FATAL_SECS,
+                kick_errors_fatal_secs: DEFAULT_KICK_ERRORS_FATAL_SECS,
             }))
         };
         assert_eq!(

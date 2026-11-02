@@ -28,6 +28,9 @@
 #             namespace warns and recovers with forwarding; then rb's MTU
 #             raised beyond the 2048-byte frame bound: exit 1 after drain,
 #             nothing left attached
+#   forwarding  ip_forward=1 in the router namespace is refused
+#             (KERNEL_FORWARDING_ENABLED), accepted with a warning under
+#             --allow-kernel-forwarding
 #   removal   (last) `ip link del ra` inside the router namespace while
 #             running: exit 1 (DEVICE_REMOVED), nothing left attached
 #   rollback  a second port that fails to open (queue 1 of a one-queue
@@ -146,6 +149,9 @@ sudo -n ip -n "$router" link set rb address 02:00:00:00:00:02
 for dev in ra rb rq rqp; do
     sudo -n ip -n "$router" link set "$dev" up
 done
+# Kernel IPv4 forwarding stays off in the router namespace (refused by
+# `ruster run` unless --allow-kernel-forwarding; checks phase).
+in_ns "$router" sysctl -qw net.ipv4.ip_forward=0
 # Host A is the fixture's static LAN neighbor 192.168.1.10.
 sudo -n ip -n "$host_a" link set pa address 02:00:00:00:00:10
 sudo -n ip -n "$host_a" address add 192.168.1.10/24 dev pa
@@ -210,13 +216,14 @@ assert_detached() {
 
 # Starts `ruster run` in the router namespace; its stdout/stderr go to
 # $work/$1.out and $work/$1.err. The pid is the ruster process itself
-# (`sh` execs `ip netns exec`, which execs ruster).
+# (`sh` execs `ip netns exec`, which execs ruster). $3, if given, is one
+# extra option without spaces.
 start_ruster() {
     name=$1
     config=$2
     rm -f "$pidfile"
     sudo -n sh -c 'echo $$ >"$1"; shift; exec ip netns exec "$@"' sh "$pidfile" \
-        "$router" "$binary_path" run --stats-interval 1 --config "$config" \
+        "$router" "$binary_path" run --stats-interval 1 ${3:-} --config "$config" \
         >"$work/$name.out" 2>"$work/$name.err" &
     launcher=$!
     tries=0
@@ -416,6 +423,7 @@ reload_with "$work/reshape.toml"
 wait_line ops "reload refused: code=RESTART_REQUIRED reasons=BACKEND; generation 3 keeps running"
 forward_once ops-refused
 reload_with "$work/router.toml"
+wait_line ops "reload applied: generation=5 previous=3"
 echo "priv_run_reload_refused: restart-required reload refused while traffic kept flowing verified"
 sudo -n ip -n "$router" link set ra down
 wait_line ops "warning: port=if1 health=LINK_DOWN"
@@ -431,9 +439,11 @@ grep -q "fatal: port=if2 health=MTU_ABOVE_FRAME" "$work/ops.err" ||
     fail "ops: no MTU_ABOVE_FRAME"
 grep -q "stopped after a fatal health event port=if2 code=MTU_ABOVE_FRAME; .*detached and closed 2 port(s)" \
     "$work/ops.err" || fail "ops: no fatal summary"
-grep -q "^reload.applied=2$" "$work/ops.out" || fail "ops: reload counters"
-grep -q "^reload.refused=1$" "$work/ops.out" || fail "ops: refused counter"
-grep -q "^if1.watch.link_down_events=1$" "$work/ops.out" || fail "ops: link counters"
+sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/ops.out" >"$work/ops.final"
+grep -q "^reload.applied=3$" "$work/ops.final" || fail "ops: final reload.applied"
+grep -q "^reload.refused=1$" "$work/ops.final" || fail "ops: final reload.refused"
+grep -q "^reload.requested=4$" "$work/ops.final" || fail "ops: final reload.requested"
+grep -q "^if1.watch.link_down_events=1$" "$work/ops.final" || fail "ops: final link counters"
 assert_detached "the MTU fail-closed exit"
 sudo -n ip -n "$router" link set rb mtu 1500
 cat "$work/ops.err"
@@ -487,6 +497,25 @@ grep -q "startup failed: stage=checks port=if1 code=KERNEL_IPV4_ROUTES count=1" 
 assert_detached "the kernel route refusal"
 sudo -n ip -n "$router" route del 10.98.0.0/16 dev ra
 echo "priv_run_checks: multi-queue device, kernel IPv4 address, and kernel route refused before attach verified"
+# Kernel forwarding in the router namespace: refused by default, warned
+# and accepted with --allow-kernel-forwarding.
+in_ns "$router" sysctl -qw net.ipv4.ip_forward=1
+start_ruster forwarding "$work/router.toml"
+wait_ruster
+[ "$status" -eq 1 ] || fail "forwarding: exit status $status"
+grep -q "startup failed: stage=checks port=if1 code=KERNEL_FORWARDING_ENABLED scope=global" \
+    "$work/forwarding.err" || fail "forwarding: wrong failure"
+assert_detached "the kernel forwarding refusal"
+start_ruster forwarding-allowed "$work/router.toml" --allow-kernel-forwarding
+wait_ready forwarding-allowed || fail "forwarding-allowed: ruster exited during startup"
+grep -q "warning: port=if1 IPV4_FORWARDING_ENABLED scope=global" "$work/forwarding-allowed.err" ||
+    fail "forwarding-allowed: no warning"
+signal_ruster TERM
+wait_ruster
+[ "$status" -eq 0 ] || fail "forwarding-allowed: exit status $status"
+assert_detached "the forwarding override run"
+in_ns "$router" sysctl -qw net.ipv4.ip_forward=0
+echo "priv_run_forwarding: kernel forwarding refused by default and accepted with the override verified"
 
 # stuck: an undrained stdout must not keep the process alive.
 mkfifo "$work/stuck.fifo"
