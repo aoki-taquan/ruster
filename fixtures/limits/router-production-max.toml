@@ -167,7 +167,10 @@ last = 65535
 
 [tick]
 rx = 32
-resolution-timer-scans = 16
+# One sweep of the 65536 states takes 512 ticks and one of the 4096 failure
+# holds 256, both under the 1000-tick RESOLUTION_SWEEP_SLOW threshold
+# (about 1 s at the 1 ms idle backoff of `ruster run`).
+resolution-timer-scans = 128
 failure-dispatch-scans = 16
 generated-arp = 8
 generated-icmpv4 = 8

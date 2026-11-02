@@ -1,10 +1,12 @@
-use std::{cell::Cell, marker::PhantomData, rc::Rc};
+#[cfg(test)]
+use std::cell::Cell;
+use std::{marker::PhantomData, rc::Rc};
 
 use crate::{
     fixed_directory::{DirectoryHashDomain, DirectoryHashKey},
     slot_index::{
-        bucket_of, chain_bucket, chain_head, chain_next, first_unused, key_bucket, link, set_used,
-        unlink, validate, validate_bits, walk, Chain, ChainNode, IndexCorrupt, UsedBits,
+        bucket_of, chain_bucket, chain_head, chain_next, first_unused, key_bucket, link, replace,
+        set_used, unlink, validate, validate_bits, walk, Chain, ChainNode, IndexCorrupt, UsedBits,
         INDEX_NONE,
     },
     slot_list::{Linked, SlotLinks, SlotList},
@@ -123,7 +125,8 @@ pub struct ArpRequestAction {
 /// indexes admit (H4b, PERF-001).
 ///
 /// Each of those tables has one bucket per slot and a secret keyed SipHash,
-/// so a chain this long is astronomically unlikely by chance. An insert into
+/// so a chain this long is astronomically unlikely by chance, and it cannot
+/// be aimed at as long as the key stays secret. An insert into
 /// a chain that already holds this many entries fails closed with the
 /// table's existing full result (`StateFull`, `CacheFull`, or
 /// `CapacityFull`) and a `*_probe_exhausted` count in
@@ -458,6 +461,31 @@ pub struct ResolutionIndexCounters {
     pub index_corrupt: usize,
 }
 
+impl crate::ObservableFields for ResolutionIndexCounters {
+    /// Section `resolution_index`. `ruster run` renders it in its stats
+    /// blocks; the run-sim schema does not include it.
+    fn visit_fields<V: crate::FieldVisitor>(&self, visitor: &mut V) {
+        let Self {
+            state_probe_exhausted,
+            dynamic_probe_exhausted,
+            failure_hold_probe_exhausted,
+            index_corrupt,
+        } = *self;
+        for (key, value) in [
+            ("state_probe_exhausted", state_probe_exhausted),
+            ("dynamic_probe_exhausted", dynamic_probe_exhausted),
+            ("failure_hold_probe_exhausted", failure_hold_probe_exhausted),
+            ("index_corrupt", index_corrupt),
+        ] {
+            visitor.field(
+                "resolution_index",
+                key,
+                crate::FieldValue::Count(value as u64),
+            );
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolutionGenerationToken {
     pub egress: IfId,
@@ -481,9 +509,10 @@ pub enum ResolutionFailureHoldPhase {
 ///
 /// Besides the hold, the slot is a node of the forward chain (key: forward
 /// egress and target) and, while waiting for reverse resolution, of the
-/// reverse chain (key: the reverse generation token), and stores table word
-/// `i`: the heads of both chains' bucket `i` and word `i` of the free-slot
-/// bitmap.
+/// group of holds waiting on the same reverse generation token; the first
+/// hold of each group stands for it on the reverse chain. The slot also
+/// stores table word `i`: the heads of both chains' bucket `i` and word `i`
+/// of the free-slot bitmap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolutionFailureHoldSlot {
     phase: ResolutionFailureHoldPhase,
@@ -500,6 +529,10 @@ pub struct ResolutionFailureHoldSlot {
     quote: [u8; ICMPV4_ERROR_MAX_QUOTE_LEN],
     forward_chain: ChainNode,
     reverse_chain: ChainNode,
+    /// Previous/next hold waiting on the same reverse token (the group
+    /// leader, the only one on the reverse chain, has no previous).
+    reverse_group_prev: u32,
+    reverse_group_next: u32,
     forward_head: u32,
     reverse_head: u32,
     used_word: u64,
@@ -529,6 +562,8 @@ impl ResolutionFailureHoldSlot {
         quote: [0; ICMPV4_ERROR_MAX_QUOTE_LEN],
         forward_chain: ChainNode::UNLINKED,
         reverse_chain: ChainNode::UNLINKED,
+        reverse_group_prev: INDEX_NONE,
+        reverse_group_next: INDEX_NONE,
         forward_head: INDEX_NONE,
         reverse_head: INDEX_NONE,
         used_word: 0,
@@ -940,12 +975,16 @@ pub struct ResolutionRuntime<'a> {
     failure_counters: ResolutionFailureCounters,
     index_counters: ResolutionIndexCounters,
     /// Index slots visited (chain nodes, list heads, bitmap words). Cost
-    /// tests read it; it never affects behavior.
+    /// tests read it; it never affects behavior. Test builds only.
+    #[cfg(test)]
     visits: Cell<u64>,
     _worker_local: PhantomData<Rc<()>>,
 }
 
 impl<'a> ResolutionRuntime<'a> {
+    /// Test and bench constructor with a public fixed index key; production
+    /// code uses [`Self::with_hash_key`].
+    #[doc(hidden)]
     #[must_use]
     pub fn new(
         policy: ResolutionPolicy,
@@ -955,6 +994,9 @@ impl<'a> ResolutionRuntime<'a> {
         Self::with_dynamic_neighbors(policy, states, action_storage, &mut [])
     }
 
+    /// Test and bench constructor with a public fixed index key; production
+    /// code uses [`Self::with_hash_key`].
+    #[doc(hidden)]
     #[must_use]
     pub fn with_dynamic_neighbors(
         policy: ResolutionPolicy,
@@ -971,8 +1013,9 @@ impl<'a> ResolutionRuntime<'a> {
         )
     }
 
-    /// Builds a runtime with a public fixed index key. Production code uses
-    /// [`Self::with_hash_key`].
+    /// Test and bench constructor with a public fixed index key; production
+    /// code uses [`Self::with_hash_key`].
+    #[doc(hidden)]
     #[must_use]
     pub fn with_dynamic_neighbors_and_failure_holds(
         policy: ResolutionPolicy,
@@ -1057,6 +1100,7 @@ impl<'a> ResolutionRuntime<'a> {
             counters: ResolutionCounters::default(),
             failure_counters: ResolutionFailureCounters::default(),
             index_counters: ResolutionIndexCounters::default(),
+            #[cfg(test)]
             visits: Cell::new(0),
             _worker_local: PhantomData,
         }
@@ -1359,18 +1403,29 @@ impl<'a> ResolutionRuntime<'a> {
         };
         let reverse_bucket = |index: usize| {
             let hold = holds[index];
-            (hold.phase == ResolutionFailureHoldPhase::WaitingReverse).then(|| {
+            (hold.phase == ResolutionFailureHoldPhase::WaitingReverse
+                && hold.reverse_group_prev == INDEX_NONE)
+                .then(|| {
+                    bucket_of(
+                        self.hash_key.hash_words(
+                            DirectoryHashDomain::ResolutionHoldReverse,
+                            &token_words(hold.reverse),
+                        ),
+                        holds.len(),
+                    )
+                })
+        };
+        let holds_valid = validate::<HoldForwardChain>(holds, forward_bucket)
+            && validate::<HoldReverseChain>(holds, reverse_bucket)
+            && reverse_groups_valid(holds, |token| {
                 bucket_of(
                     self.hash_key.hash_words(
                         DirectoryHashDomain::ResolutionHoldReverse,
-                        &token_words(hold.reverse),
+                        &token_words(token),
                     ),
                     holds.len(),
                 )
             })
-        };
-        let holds_valid = validate::<HoldForwardChain>(holds, forward_bucket)
-            && validate::<HoldReverseChain>(holds, reverse_bucket)
             && validate_bits::<HoldBits>(holds, |index| {
                 holds[index].phase != ResolutionFailureHoldPhase::Empty
             });
@@ -1482,9 +1537,15 @@ impl<'a> ResolutionRuntime<'a> {
         })
     }
 
+    /// Counts index slot visits for the cost tests; compiled out otherwise.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    #[inline(always)]
     fn count_visits(&self, visits: usize) {
+        #[cfg(test)]
         self.visits
             .set(self.visits.get().wrapping_add(visits as u64));
+        #[cfg(not(test))]
+        let _ = visits;
     }
 
     /// Records an index inconsistency met while mutating; the caller has
@@ -1619,18 +1680,79 @@ impl<'a> ResolutionRuntime<'a> {
         Ok((walked.found.is_some(), walked.visited))
     }
 
-    /// Whether a hold waits for reverse resolution with token `token`.
-    fn reverse_hold_exists(&self, token: ResolutionGenerationToken) -> Result<bool, IndexCorrupt> {
+    /// The group leader of the holds waiting for reverse resolution
+    /// `token`, if any. The reverse chain holds one leader per distinct
+    /// waiting token, so this walk does not grow with the number of holds
+    /// that wait on one token (H4b review L1).
+    fn reverse_leader(
+        &self,
+        token: ResolutionGenerationToken,
+    ) -> Result<Option<usize>, IndexCorrupt> {
         let Some(bucket) = self.reverse_bucket(token) else {
-            return Ok(false);
+            return Ok(None);
         };
         let holds = &*self.failure_holds;
         let walked = walk::<HoldReverseChain>(holds, bucket, holds.len(), |index| {
-            holds[index].phase == ResolutionFailureHoldPhase::WaitingReverse
-                && holds[index].reverse == token
+            holds[index].reverse == token
         })?;
         self.count_visits(walked.visited.max(1));
-        Ok(walked.found.is_some())
+        Ok(walked.found)
+    }
+
+    /// Whether a hold waits for reverse resolution with token `token`.
+    fn reverse_hold_exists(&self, token: ResolutionGenerationToken) -> Result<bool, IndexCorrupt> {
+        self.reverse_leader(token).map(|leader| leader.is_some())
+    }
+
+    /// Adds hold `index` (already `WaitingReverse` with its token set) to
+    /// the group of its reverse token: right behind the leader, or as a new
+    /// leader on the reverse chain.
+    fn reverse_join(&mut self, index: usize) {
+        let token = self.failure_holds[index].reverse;
+        match self.reverse_leader(token) {
+            Ok(Some(leader)) => {
+                let next = self.failure_holds[leader].reverse_group_next;
+                let link = u32::try_from(index).expect("validated capacity");
+                self.failure_holds[index].reverse_group_prev =
+                    u32::try_from(leader).expect("validated capacity");
+                self.failure_holds[index].reverse_group_next = next;
+                if next != INDEX_NONE {
+                    self.failure_holds[next as usize].reverse_group_prev = link;
+                }
+                self.failure_holds[leader].reverse_group_next = link;
+            }
+            Ok(None) => {
+                let bucket = self.reverse_bucket(token).expect("nonempty hold table");
+                let linked = link::<HoldReverseChain>(self.failure_holds, index, bucket);
+                self.index_result(linked);
+            }
+            Err(IndexCorrupt) => self.index_result(Err(IndexCorrupt)),
+        }
+    }
+
+    /// Takes hold `index` out of its reverse group. A leader hands its
+    /// chain position to the next hold of the group, in O(1).
+    fn reverse_leave(&mut self, index: usize) {
+        let hold = self.failure_holds[index];
+        let (prev, next) = (hold.reverse_group_prev, hold.reverse_group_next);
+        if hold.reverse_chain.is_linked() {
+            let result = if next == INDEX_NONE {
+                unlink::<HoldReverseChain>(self.failure_holds, index)
+            } else {
+                replace::<HoldReverseChain>(self.failure_holds, index, next as usize)
+            };
+            self.index_result(result);
+            if next != INDEX_NONE {
+                self.failure_holds[next as usize].reverse_group_prev = INDEX_NONE;
+            }
+        } else if prev != INDEX_NONE {
+            self.failure_holds[prev as usize].reverse_group_next = next;
+            if next != INDEX_NONE {
+                self.failure_holds[next as usize].reverse_group_prev = prev;
+            }
+        }
+        self.failure_holds[index].reverse_group_prev = INDEX_NONE;
+        self.failure_holds[index].reverse_group_next = INDEX_NONE;
     }
 
     /// Visits every hold of the forward chain of `(egress, target)` (all
@@ -2043,13 +2165,25 @@ impl<'a> ResolutionRuntime<'a> {
 
     /// Takes every expired entry off the head of the refresh order and marks
     /// its slot reusable. Each refresh enters the order once, so the work is
-    /// amortized O(1) per learned or refreshed entry.
+    /// amortized O(1) per learned or refreshed entry. Taking an entry off is
+    /// only bookkeeping (an expired entry stays expired), so it may run at
+    /// any time; the timer poll drains a bounded number each tick so an
+    /// insert rarely finds many waiting. It cannot be bounded per insert
+    /// without losing the lowest-reusable-slot choice: the next expired
+    /// entry may be the lowest slot.
     fn mature_dynamic(&mut self, now: MonotonicMillis) {
-        while let Some(head) = self.dynamic_order.head() {
+        self.mature_dynamic_at_most(now, usize::MAX);
+    }
+
+    fn mature_dynamic_at_most(&mut self, now: MonotonicMillis, budget: usize) {
+        for _ in 0..budget {
+            let Some(head) = self.dynamic_order.head() else {
+                return;
+            };
             self.count_visits(1);
             let refreshed_at = self.dynamic_neighbors[head].entry.refreshed_at;
             if now.0.saturating_sub(refreshed_at.0) < self.policy.dynamic_neighbor_ttl_ms {
-                break;
+                return;
             }
             self.dynamic_order.unlink(self.dynamic_neighbors, head);
             self.dynamic_neighbors[head].in_lru = false;
@@ -2073,13 +2207,22 @@ impl<'a> ResolutionRuntime<'a> {
     /// Takes every state whose last request is at least one interval old off
     /// the head of the request order. Such a state that is (or later
     /// becomes) a cooldown is reusable. Each commit enters the order once,
-    /// so the work is amortized O(1) per committed ARP request.
+    /// so the work is amortized O(1) per committed ARP request; the timer
+    /// poll also drains a bounded number each tick (see
+    /// [`Self::mature_dynamic`]).
     fn mature_states(&mut self, now: MonotonicMillis) {
-        while let Some(head) = self.request_order.head() {
+        self.mature_states_at_most(now, usize::MAX);
+    }
+
+    fn mature_states_at_most(&mut self, now: MonotonicMillis, budget: usize) {
+        for _ in 0..budget {
+            let Some(head) = self.request_order.head() else {
+                return;
+            };
             self.count_visits(1);
             let requested_at = self.states[head].entry.requested_at;
             if now.0.saturating_sub(requested_at.0) < self.policy.interval_ms {
-                break;
+                return;
             }
             self.request_order.unlink(self.states, head);
             self.states[head].in_order = false;
@@ -2203,8 +2346,9 @@ impl<'a> ResolutionRuntime<'a> {
         );
         let forward = unlink::<HoldForwardChain>(self.failure_holds, index);
         self.index_result(forward);
-        let reverse = unlink::<HoldReverseChain>(self.failure_holds, index);
-        self.index_result(reverse);
+        if self.failure_holds[index].phase == ResolutionFailureHoldPhase::WaitingReverse {
+            self.reverse_leave(index);
+        }
         self.failure_holds[index].clear_entry();
         set_used::<HoldBits>(self.failure_holds, index, false);
         debug_assert!(self.pending_failure_hold_count != 0);
@@ -2214,25 +2358,22 @@ impl<'a> ResolutionRuntime<'a> {
     /// Moves hold `index` to waiting for reverse resolution `reverse`.
     pub(crate) fn wait_reverse(&mut self, index: usize, reverse: ResolutionGenerationToken) {
         let hold = self.failure_holds[index];
-        if hold.phase == ResolutionFailureHoldPhase::WaitingReverse
-            && hold.reverse == reverse
-            && hold.reverse_chain.is_linked()
-        {
-            return;
+        if hold.phase == ResolutionFailureHoldPhase::WaitingReverse {
+            if hold.reverse == reverse {
+                return;
+            }
+            self.reverse_leave(index);
         }
-        let unlinked = unlink::<HoldReverseChain>(self.failure_holds, index);
-        self.index_result(unlinked);
         self.failure_holds[index].phase = ResolutionFailureHoldPhase::WaitingReverse;
         self.failure_holds[index].reverse = reverse;
-        let bucket = self.reverse_bucket(reverse).expect("nonempty hold table");
-        let linked = link::<HoldReverseChain>(self.failure_holds, index, bucket);
-        self.index_result(linked);
+        self.reverse_join(index);
     }
 
     /// Clears every live hold whose forward token, or whose reverse token
     /// while waiting for reverse resolution, is `token`. Cost: the forward
-    /// chain of the key plus the reverse chain of the token; every hold
-    /// cleared was captured once.
+    /// chain of the key, the reverse chain of the bucket (one leader per
+    /// distinct token), and the group of the token, every hold of which is
+    /// cleared (each was captured once).
     fn cancel_holds_of_token(&mut self, token: ResolutionGenerationToken) {
         if let Some(bucket) = self.forward_bucket(token.egress, token.target) {
             self.for_each_hold::<HoldForwardChain>(bucket, |runtime, index| {
@@ -2243,15 +2384,29 @@ impl<'a> ResolutionRuntime<'a> {
                 }
             });
         }
-        if let Some(bucket) = self.reverse_bucket(token) {
-            self.for_each_hold::<HoldReverseChain>(bucket, |runtime, index| {
-                let hold = runtime.failure_holds[index];
-                if hold.phase == ResolutionFailureHoldPhase::WaitingReverse && hold.reverse == token
-                {
-                    runtime.clear_failure_hold(index);
-                    runtime.failure_counters.cancelled += 1;
-                }
-            });
+        let mut current = match self.reverse_leader(token) {
+            Ok(leader) => leader,
+            Err(IndexCorrupt) => {
+                self.index_result(Err(IndexCorrupt));
+                None
+            }
+        };
+        let mut steps = 0;
+        while let Some(index) = current {
+            let hold = self.failure_holds[index];
+            if steps == self.failure_holds.len()
+                || hold.phase != ResolutionFailureHoldPhase::WaitingReverse
+                || hold.reverse != token
+            {
+                self.index_result(Err(IndexCorrupt));
+                return;
+            }
+            steps += 1;
+            self.count_visits(1);
+            let next = hold.reverse_group_next;
+            current = (next != INDEX_NONE).then_some(next as usize);
+            self.clear_failure_hold(index);
+            self.failure_counters.cancelled += 1;
         }
     }
 
@@ -2511,6 +2666,11 @@ impl<'a> ResolutionRuntime<'a> {
             return Err(ResolutionTimerError::ClockRegression);
         }
         let mut report = ResolutionTimerReport::default();
+        // Background bookkeeping, invisible in behaviour: take up to one
+        // scan budget of elapsed requests and expired dynamic neighbors off
+        // their time-ordered lists, so a later insert has less to do.
+        self.mature_states_at_most(now, scan_budget);
+        self.mature_dynamic_at_most(now, scan_budget);
         if self.states.is_empty() || scan_budget == 0 {
             report.pending = self.pending_states();
             return Ok(report);
@@ -2643,7 +2803,9 @@ impl ResolutionPublicationPermit<'_, '_> {
     }
 
     /// Flushes all old publication authority without failure, keeping the
-    /// index key.
+    /// index key. Tests only; production code rotates the key with
+    /// [`Self::commit_with_hash_key`].
+    #[doc(hidden)]
     pub fn commit(self) -> ResolutionPublicationReport {
         let key = self.runtime.hash_key;
         self.commit_keyed(key)
@@ -2697,6 +2859,75 @@ fn publication_hold_valid(
         hold.forward.target,
         hold.forward_source_ip,
     )
+}
+
+/// Every waiting-reverse hold is in exactly one group: a leader (on the
+/// reverse chain, in the bucket of its token, the only leader of that token
+/// in the bucket) followed by holds of the same token with consistent back
+/// links. O(capacity); validation only.
+fn reverse_groups_valid(
+    holds: &[ResolutionFailureHoldSlot],
+    bucket_of_token: impl Fn(ResolutionGenerationToken) -> usize,
+) -> bool {
+    let waiting = holds
+        .iter()
+        .filter(|hold| hold.phase == ResolutionFailureHoldPhase::WaitingReverse)
+        .count();
+    let mut reached = 0usize;
+    for (leader, hold) in holds.iter().enumerate() {
+        if !hold.reverse_chain.is_linked() {
+            if hold.phase != ResolutionFailureHoldPhase::WaitingReverse
+                && (hold.reverse_group_prev != INDEX_NONE || hold.reverse_group_next != INDEX_NONE)
+            {
+                return false;
+            }
+            continue;
+        }
+        if hold.phase != ResolutionFailureHoldPhase::WaitingReverse
+            || hold.reverse_group_prev != INDEX_NONE
+        {
+            return false;
+        }
+        let bucket = bucket_of_token(hold.reverse);
+        if chain_bucket(hold.reverse_chain) != Some(bucket) {
+            return false;
+        }
+        // No second leader of the same token in this bucket.
+        let mut current = chain_head::<HoldReverseChain>(holds, bucket);
+        let mut seen = 0;
+        while let Some(other) = current {
+            if other != leader && holds[other].reverse == hold.reverse {
+                return false;
+            }
+            seen += 1;
+            if seen > holds.len() {
+                return false;
+            }
+            current = chain_next::<HoldReverseChain>(holds, other);
+        }
+        let mut previous = leader;
+        let mut current = hold.reverse_group_next;
+        reached += 1;
+        while current != INDEX_NONE {
+            let Some(member) = holds.get(current as usize) else {
+                return false;
+            };
+            if member.phase != ResolutionFailureHoldPhase::WaitingReverse
+                || member.reverse != hold.reverse
+                || member.reverse_chain.is_linked()
+                || member.reverse_group_prev as usize != previous
+            {
+                return false;
+            }
+            reached += 1;
+            if reached > waiting {
+                return false;
+            }
+            previous = current as usize;
+            current = member.reverse_group_next;
+        }
+    }
+    reached == waiting
 }
 
 const fn state_is_pending(state: StateEntry) -> bool {

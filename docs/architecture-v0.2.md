@@ -1208,14 +1208,18 @@ H4b（PERF-001、ARP-030）以前は、resolution runtimeのpacket path操作が
   successorは再利用keyを`ResolutionHashKeyReused`で拒否）をmultiply-highでslot数へ縮める。
   stateとdynamic neighborのkeyは`(IfId, IPv4)`、failure holdはforward chainが
   `(forward egress, forward target)`（全generation）、reverse chainがWaitingReverseのholdの
-  reverse token `(egress, target, generation)`。
+  reverse token `(egress, target, generation)`。reverse chainには異なるtokenごとに一つの
+  leaderだけを載せ、同じtokenを待つ他のholdはleaderからのgroup list（slot内のprev/next）に
+  つなぐ。leaderが消えるとgroupの次のholdがchain上の位置をO(1)で引き継ぐ（`replace`）。
 - chain上限: state、dynamic neighbor、forward holdのchainは`RESOLUTION_INDEX_CHAIN_LIMIT`（16）を
   超えて伸ばさず、超えるinsertは既存の`StateFull`/`CacheFull`/`CapacityFull`でfail closedし
   `ResolutionIndexCounters`の`*_probe_exhausted`を数える。insertが伸ばさないのでlookupは
-  最大16 slotで完全。secret keyと一slotあたり一bucketなので偶然にも狙っても起きない
-  （Poisson(1)で16以上は65536 bucket全体で約1e-9）。reverse chainは同じreverse tokenを
-  待つholdを全部含む（一つのspoofed sourceから全holdまで）ので上限を付けず、走査はtable
-  size以下。期待O(1)で、走査が消すholdはそれぞれ一度captureされたもの（償却O(1)）。
+  最大16 slotで完全。secret keyと一slotあたり一bucketなので偶然には起きず、keyが秘密である限り狙えない
+  （Poisson(1)で16以上は65536 bucket全体で約1e-9）。reverse chainはtokenの種類数だけを
+  持つので、同じtokenを待つholdが何千あっても（一つのspoofed source）他のtokenの照合
+  （generation alias check、expiry）はそれを辿らない（review L1。修正前はknown keyで
+  一操作約50 µs）。上限は付けず走査はtable size以下で、secret keyなら期待O(1)。token自身の
+  holdを消すときはgroupを一度ずつ辿り、それぞれ一度captureされたもの（償却O(1)）。
 - 再利用可能slot: 2段の「used」bitmap（leaf word wはslot w、summary word sはslot
   `leaf_words + s`に置く。合計はslot数以下）で最小indexの未使用slotを、65536 slotなら最大
   summary 16 word + leaf 1 wordで見つける。all-zeroが「全部空き」なのでentryが全部消えた
@@ -1223,7 +1227,11 @@ H4b（PERF-001、ARP-030）以前は、resolution runtimeのpacket path操作が
 - 時刻順list: stateはrequestをcommitした順（`requested_at`順。時刻はwatermarkで単調）、
   dynamic neighborはrefresh順のintrusive list（`slot_list.rs`）に載る。新しいkeyを入れる前に
   先頭からinterval（TTL）経過済みのものを外し、cooldown（expired entry）ならbitmap上で
-  再利用可能にする。各commit（refresh）がlistに一度入り一度出るので償却O(1)。これで
+  再利用可能にする。各commit（refresh）がlistに一度入り一度出るので償却O(1)。timer poll
+  もtickごとにscan budgetまで先頭から外す（挙動に影響しないbookkeeping）ので、insertが
+  まとめて払うのは同時にexpireしたのにまだtickが外していない分だけ（65536同時expiryの
+  直後で約0.8 ms、一回）。insertごとに打ち切ると「最小index」の選択が変わるので上限は
+  付けない。これで
   「free、またはinterval経過済みcooldown（expired entry）の最小index」が従来のslot 0からの
   scanと同じslotになり、poll/dispatch cursorの巡回順、ARP/ICMPのwire順、occupancy、
   generation番号が変わらない。
@@ -1242,9 +1250,14 @@ slot sizeはstate 56→96、action 32→56、dynamic neighbor 24→64、failure 
 で、ほかのstorageはありません（`required_bytes`と最大configが計上）。挙動は変わりません:
 seeded churn testが同じ操作列を旧runtime（`resolution_reference.rs`、origin/main b1e31aaの
 test専用copy）にも適用し、全結果、trace、slot、queue順、counterの一致を確かめます。新しい
-結果はchain上限のinsert拒否だけです。残るO(N)はpublication preflight/commit（control path）、
-tick budget付きのtimer/dispatchの巡回（packet pathではない。capacityとscan budgetの比で
-retry/Host Unreachableの遅れが決まる）、debug/testの全体検証です。
+結果はchain上限のinsert拒否だけです。fail closedの件数（`ResolutionIndexCounters`）は
+`ruster run`のstats blockに`resolution_index.*`として出ます（run-simのschemaには入れない）。
+残るO(N)はpublication preflight/commit（control path）、tick budget付きのtimer/dispatchの
+巡回（packet pathではない。`ceil(capacity / scans)` tickでretry/Host Unreachableの遅れが
+決まり、1000 tick（idle backoffで約1 s）を超えると`validate`/`run`が
+`RESOLUTION_SWEEP_SLOW`を警告）、debug/testの全体検証です。forwarding snapshotの
+config由来list（route LPM、local address、static neighbor）は依然packetごとに線形です
+（PERF-002、H4c）。
 
 common Ethernet ingress admissionはprotocol parserより前にexact ingress MACを検証します。
 続くIPv4 structural/header-checksum検証後のIP admissionだけは、sourceとnonlocal destinationの

@@ -1246,6 +1246,175 @@ fn a_full_forward_hold_chain_refuses_capture_and_counts() {
     assert!(runtime.indexes_valid());
 }
 
+/// H4b review L1: other tokens that hash into the bucket of a token that
+/// thousands of holds wait on (one spoofed source) pay only for the
+/// distinct tokens on the reverse chain, not for those holds. Adapted from
+/// the reviewer's `rev310_reverse_chain_miss_walk`; the key is the fixed
+/// test key, so the collisions are found by search.
+#[test]
+fn reverse_chain_walks_skip_holds_of_a_colliding_token() {
+    let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+    let holds = PRODUCTION_QUOTE_SLOTS;
+    let mut tables = Tables::new(PRODUCTION_SLOTS, PRODUCTION_SLOTS, 16, holds);
+    let mut runtime = tables.runtime(policy);
+    let reverse = ResolutionGenerationToken {
+        egress: LAN,
+        target: Ipv4Address::from_octets([10, 0, 1, 77]),
+        generation: 1,
+    };
+    for index in 0..holds {
+        runtime.install_hold_for_test(
+            index,
+            ResolutionFailureHoldPhase::WaitingReverse,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: spread(index),
+                generation: 1,
+            },
+            reverse,
+        );
+    }
+    let bucket = runtime.reverse_bucket(reverse).unwrap();
+    let colliding: Vec<Ipv4Address> = (10_000..2_000_000)
+        .map(spread)
+        .filter(|target| {
+            runtime.reverse_bucket(ResolutionGenerationToken {
+                egress: WAN,
+                target: *target,
+                generation: 1,
+            }) == Some(bucket)
+        })
+        .take(200)
+        .collect();
+    assert_eq!(colliding.len(), 200);
+    runtime.take_visits();
+    for target in &colliding {
+        let token = ResolutionGenerationToken {
+            egress: WAN,
+            target: *target,
+            generation: 1,
+        };
+        // The alias check of a new generation, then a new state whose
+        // first generation (1) collides with the crowded bucket.
+        assert!(!runtime.token_in_use(token));
+        assert!(runtime.take_visits() <= PER_PACKET_VISITS);
+        assert_eq!(
+            runtime.schedule(arp_action(WAN, *target), MonotonicMillis(0), false),
+            ResolutionResult::Queued
+        );
+        assert!(runtime.take_visits() <= PER_PACKET_VISITS);
+        // Expiry of a colliding token clears nothing and stays cheap.
+        runtime.cancel_holds_of_token(token);
+        assert!(runtime.take_visits() <= PER_PACKET_VISITS);
+    }
+    assert_eq!(runtime.pending_failure_holds(), holds);
+    assert!(runtime.token_in_use(reverse));
+    // The crowded token itself is cleared at one visit per hold.
+    runtime.take_visits();
+    runtime.cancel_holds_of_token(reverse);
+    assert_eq!(runtime.pending_failure_holds(), 0);
+    assert!(runtime.take_visits() <= holds as u64 + 4);
+    assert!(runtime.indexes_valid());
+}
+
+/// Group bookkeeping: a leader hands its place to the next hold of its
+/// token, members leave from the middle, and a hold moving to another
+/// reverse token changes group.
+#[test]
+fn reverse_groups_survive_leaders_and_members_leaving() {
+    let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+    let mut tables = Tables::new(4, 4, 1, 8);
+    let mut runtime = tables.runtime(policy);
+    let token = |last: u8| ResolutionGenerationToken {
+        egress: LAN,
+        target: Ipv4Address::from_octets([10, 0, 1, last]),
+        generation: 1,
+    };
+    for index in 0..6 {
+        runtime.install_hold_for_test(
+            index,
+            ResolutionFailureHoldPhase::WaitingReverse,
+            ResolutionGenerationToken {
+                egress: WAN,
+                target: spread(index),
+                generation: 1,
+            },
+            token(if index < 4 { 7 } else { 8 }),
+        );
+        assert!(runtime.indexes_valid());
+    }
+    // A middle member, then the leader, then a move to the other token.
+    runtime.clear_failure_hold(2);
+    assert!(runtime.indexes_valid());
+    runtime.clear_failure_hold(0);
+    assert!(runtime.indexes_valid());
+    runtime.wait_reverse(1, token(8));
+    assert!(runtime.indexes_valid());
+    runtime.wait_reverse(4, token(9));
+    assert!(runtime.indexes_valid());
+    assert!(runtime.token_in_use(token(7)));
+    runtime.cancel_holds_of_token(token(7));
+    assert!(!runtime.token_in_use(token(7)));
+    runtime.cancel_holds_of_token(token(8));
+    runtime.cancel_holds_of_token(token(9));
+    assert_eq!(runtime.pending_failure_holds(), 0);
+    assert!(runtime.indexes_valid());
+    assert!(runtime
+        .failure_holds
+        .iter()
+        .all(|hold| *hold == ResolutionFailureHoldSlot::EMPTY));
+}
+
+/// H4b review core L2: the timer poll drains expired entries off the
+/// time-ordered lists a scan budget at a time, so the insert after a quiet
+/// period does not pay for every entry that expired meanwhile.
+#[test]
+fn timer_polls_drain_expired_entries_in_the_background() {
+    let policy = ResolutionPolicy::with_dynamic_neighbor_ttl(1_000, 1_000, 100).unwrap();
+    let slots = PRODUCTION_QUOTE_SLOTS;
+    let mut tables = Tables::new(slots, slots, slots, 1);
+    let mut runtime = tables.runtime(policy);
+    let mac = MacAddress([2, 7, 7, 7, 7, 7]);
+    for index in 0..slots {
+        runtime.merge_dynamic(WAN, spread(index), mac, true, false, MonotonicMillis(0));
+        runtime.schedule(arp_action(LAN, spread(index)), MonotonicMillis(0), false);
+        let front = runtime.front().unwrap();
+        runtime.committed(front, MonotonicMillis(0));
+        runtime.clear_resolution(LAN, spread(index));
+    }
+    assert_eq!(runtime.cooldown_count(), slots);
+    let budget = 64;
+    for _ in 0..slots / budget {
+        runtime.take_visits();
+        poll_resolution_timers(
+            &mut runtime,
+            MonotonicMillis(1_000),
+            budget,
+            &mut NoResolutionTimerTrace,
+        )
+        .unwrap();
+        // Each list at most one budget plus the head that stops it.
+        assert!(runtime.take_visits() <= 2 * (budget as u64 + 1));
+    }
+    assert_eq!(runtime.dynamic_order, SlotList::EMPTY);
+    assert_eq!(runtime.request_order, SlotList::EMPTY);
+    runtime.take_visits();
+    assert_eq!(
+        runtime.merge_dynamic(WAN, spread(slots), mac, true, false, MonotonicMillis(1_000)),
+        ControlDisposition::Inserted
+    );
+    assert_eq!(
+        runtime.schedule(
+            arp_action(LAN, spread(slots)),
+            MonotonicMillis(1_000),
+            false
+        ),
+        ResolutionResult::Queued
+    );
+    assert!(runtime.take_visits() <= 2 * PER_PACKET_VISITS);
+    assert!(runtime.indexes_valid());
+}
+
 #[test]
 fn a_new_generation_skips_a_live_reverse_token() {
     let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
@@ -1433,6 +1602,24 @@ fn timing_report_before_and_after_h4b() {
                 false,
                 MonotonicMillis(1)
             )
+        );
+        // The one-off maturation pass: the first insert after every learned
+        // entry expired takes all of them off the refresh order at once.
+        let start = Instant::now();
+        assert_eq!(
+            new.merge_dynamic(
+                WAN,
+                spread(3 * slots),
+                mac,
+                true,
+                false,
+                MonotonicMillis(600_001)
+            ),
+            ControlDisposition::Inserted
+        );
+        eprintln!(
+            "H4B_TIMING slots={slots} after  first insert after all entries expired {} ns",
+            start.elapsed().as_nanos()
         );
     }
 }

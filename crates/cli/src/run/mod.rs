@@ -352,6 +352,12 @@ where
     else {
         return EXIT_INVALID;
     };
+    for warning in crate::config_cmd::sweep_warnings(&config)
+        .into_iter()
+        .flatten()
+    {
+        let _ = writeln!(err, "ruster run: warning: {warning}");
+    }
     let candidate = match sequencer.candidate(&config) {
         Ok(candidate) => candidate,
         Err(error) => {
@@ -668,7 +674,10 @@ fn render<D: Datapath>(
         active.nat44_tcp(),
         active.firewall(),
     );
+    let resolution_index = active.resolution().index_counters();
     stats::block(kind, now, &observer.snapshot(now), &services, |out| {
+        // H4b fail-closed index outcomes (ruster run only; not in run-sim).
+        stats::write_fields(out, None, &resolution_index);
         datapath.write_stats(out);
         stats::write_fields(out, None, &status.reload);
         stats::write_fields(out, None, status.watch);

@@ -255,6 +255,57 @@ fn validate_refuses_each_table_one_slot_above_the_production_limit() {
     );
 }
 
+/// H4b review: `validate` of an af-xdp document warns (exit 0, value-free)
+/// when a resolution table takes more than about 1 s (1000 ticks) to sweep;
+/// the maximal config is tuned below that, a sim document never warns.
+#[test]
+fn validate_warns_about_a_slow_resolution_sweep() {
+    let (status, _, err) = validate_text(MAXIMAL);
+    assert_eq!((status, err.as_str()), (0, ""));
+    for (from, to, line) in [
+        (
+            "resolution-timer-scans = 128",
+            "resolution-timer-scans = 16",
+            "ruster: warning: RESOLUTION_SWEEP_SLOW table=states ticks=4096\n",
+        ),
+        (
+            "resolution-timer-scans = 128",
+            "resolution-timer-scans = 0",
+            "ruster: warning: RESOLUTION_SWEEP_SLOW table=states ticks=never\n",
+        ),
+        (
+            "failure-dispatch-scans = 16",
+            "failure-dispatch-scans = 4",
+            "ruster: warning: RESOLUTION_SWEEP_SLOW table=failure-holds ticks=1024\n",
+        ),
+    ] {
+        let text = MAXIMAL.replacen(from, to, 1);
+        assert_ne!(text, MAXIMAL, "{from}");
+        let (status, out, err) = validate_text(&text);
+        assert_eq!(status, 0, "{err}");
+        assert!(out.starts_with("valid: "), "{out}");
+        assert_eq!(err, line);
+        let (status, _, err) = validate_text(&as_sim(&text));
+        assert_eq!((status, err.as_str()), (0, ""), "as sim");
+    }
+    // Exactly at the threshold is not slow: 65536 / 66 = 993.0.. -> 994.
+    let at = MAXIMAL.replacen(
+        "resolution-timer-scans = 128",
+        "resolution-timer-scans = 66",
+        1,
+    );
+    assert_eq!(validate_text(&at).2, "");
+    let over = MAXIMAL.replacen(
+        "resolution-timer-scans = 128",
+        "resolution-timer-scans = 65",
+        1,
+    );
+    assert_eq!(
+        validate_text(&over).2,
+        "ruster: warning: RESOLUTION_SWEEP_SLOW table=states ticks=1009\n"
+    );
+}
+
 /// `plan` loads both sides with the limits of their own backend.
 #[test]
 fn plan_loads_each_side_with_its_backend_limits() {

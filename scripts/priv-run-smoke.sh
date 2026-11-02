@@ -770,7 +770,8 @@ assert_detached "SIGTERM"
 grep -q "^ruster-run-stats kind=final" "$work/forward.out" || fail "forward: no final stats"
 grep -q "^af_xdp.ports=2$" "$work/forward.out" || fail "forward: no backend stats"
 sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/forward.out" >"$work/forward.final"
-block_has "$work/forward.final" observer.state=healthy observer.generation=1 watch.state=ok
+block_has "$work/forward.final" observer.state=healthy observer.generation=1 watch.state=ok \
+    resolution_index.state_probe_exhausted=0 resolution_index.index_corrupt=0
 received=$(sed -n 's/^rx.received=//p' "$work/forward.out" | tail -n 1)
 [ "${received:-0}" -ge 1 ] || fail "forward: final rx.received is ${received:-missing}"
 grep -q "stopped by signal; .* tx-in-flight=0 .*detached and closed 2 port(s)" \

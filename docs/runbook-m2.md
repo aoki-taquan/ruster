@@ -210,30 +210,57 @@ packet path any more (PERF-001: NAT44 since H4a, resolution and ICMPv4
 errors since H4b). Before H4b a dynamic-neighbor miss, resolution
 scheduling, an ARP learn, and failure capture scanned their whole table:
 75 to 940 µs per packet at 65536 slots in a release build, 4.5 to 72 µs
-at the old 4096 cap.
+at the old 4096 cap. The configured lists still scale the per-packet
+cost (PERF-002, planned for H4c): route lookup (longest prefix match),
+the local-address check, and the static-neighbor lookup each walk their
+whole list for every packet. With 4096 routes a review measured about
+10.9 µs per route lookup and at least 22 µs per forwarded packet, which
+caps one queue at about 45 kpps. Keep `[[routes]]`, `[[addresses]]`, and
+`[[neighbors]]` short (a home router needs a handful) until H4c.
 
 | Table | Packet path, and what drives it | Work per packet | Release time per packet at 65536 (before H4b) | Recommended size |
 |---|---|---|---|---|
 | `dynamic-neighbors` (64 B) | lookup on forwarding to a non-static next hop, ARP merge: a LAN host flooding ARP from many senders, or WAN packets to unused LAN addresses where routed inbound traffic is allowed | one keyed chain of at most 16 slots (`RESOLUTION_INDEX_CHAIN_LIMIT`; secret per-publication SipHash key, one bucket per slot), plus for a new entry the lowest free or expired slot from a bitmap (at most 17 words at 65536) and the head of the refresh-order list; expired entries are taken off that list lazily, amortized O(1) per learned entry | miss 0.28 µs (74 µs); ARP flood into a full cache 0.31 µs (148 µs) | on-link hosts of the largest LAN plus headroom |
 | resolution `states` (96 B) | `schedule` on a dynamic miss, failure capture, ARP learn (cancels the key's state) | one keyed chain of at most 16 slots, plus for a new key the lowest free or elapsed-cooldown slot (bitmap) and the head of the request-order list (amortized O(1) per committed request) | new target with the table full 0.34 µs (250 µs); ARP update of a pending target 0.78 µs (943 µs) | the number of next hops being resolved at once |
-| resolution `failure-holds` (648 B) | capture on a miss, promotion and expiry of a failed resolution, ARP learn | the forward chain of the key (at most 16 holds) and, for holds waiting on a reverse resolution, the chain of that reverse token; every hold that chain walk clears was captured once (amortized O(1)) | — | a few times `states` |
+| resolution `failure-holds` (648 B) | capture on a miss, promotion and expiry of a failed resolution, ARP learn | the forward chain of the key (at most 16 holds) and, for holds waiting on a reverse resolution, the reverse chain, which carries one leader per distinct waiting token (the other holds of a token hang off its leader, so thousands of holds behind one spoofed source cost other tokens nothing); clearing a token's holds visits each once, and each was captured once (amortized O(1)) | — | a few times `states` |
 | resolution `actions` (56 B) | FIFO list; a state removes its own queued action in O(1) | O(1) | — | like `states` |
 | ICMPv4 error `states` (24 B) | every generated error (TTL expiry, unreachable) | only the occupied states, which are a prefix of the table and at most one per egress interface in use (≤ 256) | — | at most one per egress interface is ever used; a few |
 | ICMPv4 error `actions` (584 B) | O(1) ring; one per state | O(1) | — | like `states` |
 | NAT44 `mappings`/`peers`/`sessions` (64/48/64 B + directories) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (the least recently refreshed, so the first to expire) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
 | `firewall.capacity.states` (56 B) | keyed SipHash probe with occupancy capped near 75% (`usable_state_capacity`), so a full table cannot occur; only the amortized expiry sweep (`reclaim_one_expired`) is linear | — (amortized) | — | the expected concurrent flows |
 
-Per-packet work no longer depends on the capacity, but two tick-budgeted
+The per-packet work on the runtime tables no longer depends on their
+capacity (the configured lists above still do), but two tick-budgeted
 round-robin scans do: the resolution timer visits `tick.resolution-timer-scans`
 state slots per tick and the failure dispatch `tick.failure-dispatch-scans`
 hold slots, so an ARP retry, timeout, or Host Unreachable can wait up to
-`capacity / scans` ticks for its slot to come round (with 65536 states and
-16 scans, 4096 ticks, about 4 s when the loop sleeps 1 ms between idle
+`ceil(capacity / scans)` ticks for its slot to come round (with 65536 states
+and 16 scans, 4096 ticks, about 4 s when the loop sleeps 1 ms between idle
 ticks). Size `states` for the expected traffic and raise the scan budgets
-with it. An insert whose key chain already holds 16 entries fails closed
-like a full table (`StateFull`, `CacheFull`, `CapacityFull`) and is counted
-in `ResolutionIndexCounters` (`*_probe_exhausted`); with the secret key a
-chain that long does not happen by chance or by aiming.
+with it. `ruster validate` (of an af-xdp document) and `ruster run` (at
+startup and after each applied reload) print a value-free warning when a
+sweep takes more than 1000 ticks (about 1 s at the idle backoff):
+`ruster: warning: RESOLUTION_SWEEP_SLOW table=states ticks=4096` (or
+`table=failure-holds`, `ticks=never` for a zero budget). The maximal
+fixture uses 128 timer scans (512 ticks for 65536 states) and 16 dispatch
+scans (256 ticks for 4096 holds). An insert whose key chain already holds
+16 entries fails closed like a full table (`StateFull`, `CacheFull`,
+`CapacityFull`) and is counted as `resolution_index.*_probe_exhausted`; an
+index inconsistency met on the packet path fails closed and is counted as
+`resolution_index.index_corrupt`. Both appear in every `ruster run` stats
+block (not in `run-sim` output, whose schema is pinned) and should stay 0:
+with the secret key a chain that long does not happen by chance, and
+cannot be aimed at as long as the key stays secret (it is drawn from the
+OS CSPRNG per publication and never printed).
+
+Expired dynamic neighbors and elapsed cooldowns are taken off their
+time-ordered lists lazily. Each timer tick drains up to its scan budget
+of them, and the next insert takes off whatever is left, so that insert
+can pay once for many entries that expired together: in a release build
+about 0.8 ms when all 65536 dynamic neighbors expired at the same moment
+and no tick ran since (85 µs at 4096). It cannot be bounded per insert
+without changing which slot is reused (the lowest reusable one), and an
+attacker must first fill the table, one packet per entry.
 
 **Memory per slot.** These are the x86_64 slot types that
 `FullServiceStorage` allocates; the total is pinned by
@@ -789,20 +816,32 @@ CLI-034).
 - Per-packet linear scans of runtime tables are gone (PERF-001: NAT44 in
   H4a, resolution and ICMPv4 errors in H4b). What the resolution runtime
   still does in more than constant time: the reverse failure-hold chain
-  is not capped (every hold waiting on one reverse resolution shares its
-  token; with the secret key a walk is expected O(1) plus the holds it
-  clears); taking expired dynamic neighbors and elapsed cooldowns off
-  their time-ordered lists is amortized, so the first insert after a quiet
-  period can take every entry that expired meanwhile off at once (one
-  short list step each, under 1 ms at 65536); the publication preflight
-  validates every index (O(capacity), control path); and the timer and
-  failure-dispatch scans are tick-budgeted round robins (section 1).
-  An insert into a key chain that already holds 16 entries fails closed
-  (`*_probe_exhausted`). The static neighbor, route (LPM), interface, and
-  local-address lookups of the forwarding snapshot are still linear in
-  the configured lists (at most 4096 routes, 4096 neighbors, 1024
-  addresses, 256 interfaces); they are not runtime tables and an attacker
-  cannot grow them. NAT44 slot reuse and port selection
+  is not capped, but it holds one leader per distinct waiting token, so a
+  walk is expected O(1) under the secret key however many holds wait on
+  one token, and clearing a token visits each of its holds once; taking
+  expired dynamic neighbors and elapsed cooldowns off their time-ordered
+  lists is amortized (drained a scan budget per tick in the background;
+  the insert after a burst of simultaneous expiries can still take up to
+  0.8 ms once at 65536, section 1); the publication preflight validates
+  every index (O(capacity), control path); and the timer and
+  failure-dispatch scans are tick-budgeted round robins
+  (`RESOLUTION_SWEEP_SLOW`, section 1). An insert into a key chain that
+  already holds 16 entries fails closed (`resolution_index.*_probe_exhausted`).
+- Per-packet cost still scales with the configured lists (PERF-002,
+  pre-existing, planned for hardening slice H4c): route lookup (longest
+  prefix match), the local-address check, and the static-neighbor
+  lookup are linear in `[[routes]]` (up to 4096), `[[addresses]]` (1024),
+  and `[[neighbors]]` (4096). A review measured about 10.9 µs per route
+  lookup with 4096 routes and at least 22 µs per forwarded packet, about
+  45 kpps per queue. An attacker cannot grow these lists, but a large
+  config makes every packet slower; keep them short until H4c.
+- ARP learning does not check that the sender is on the link of the
+  ingress interface (PERF-002, Low, pre-existing): `sender_is_host` only
+  excludes reserved, network, and broadcast addresses, so a LAN host can
+  fill the dynamic-neighbor cache with off-link sender addresses (they
+  expire with the TTL and never displace live entries; size
+  `dynamic-neighbors` with headroom). Planned for H4c.
+- NAT44 slot reuse and port selection
   are O(1) per new flow since H4a (NAT44-035). What NAT44 still does in
   more than constant time: a keyed directory lookup walks its hash chain
   (secret per-publication SipHash key and at most one slot per bucket on

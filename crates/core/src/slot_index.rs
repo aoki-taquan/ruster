@@ -233,6 +233,61 @@ pub(crate) fn chain_next<C: Chain>(slots: &[C::Slot], index: usize) -> Option<us
     decode(C::node(&slots[index]).next, slots.len())
 }
 
+/// Puts the unlinked slot `new` in the chain position of the linked slot
+/// `old`, which becomes unlinked. Every neighbour is checked first; on
+/// `IndexCorrupt` nothing changes.
+pub(crate) fn replace<C: Chain>(
+    slots: &mut [C::Slot],
+    old: usize,
+    new: usize,
+) -> Result<(), IndexCorrupt> {
+    if old >= slots.len() || new >= slots.len() || old == new || C::node(&slots[new]).is_linked() {
+        return Err(IndexCorrupt);
+    }
+    let node = C::node(&slots[old]);
+    if !node.is_linked() {
+        return Err(IndexCorrupt);
+    }
+    let this = link_index(old);
+    let bucket = decode(node.bucket, slots.len()).ok_or(IndexCorrupt)?;
+    let prev = match node.prev {
+        INDEX_NONE => {
+            if C::head(&slots[bucket]) != this {
+                return Err(IndexCorrupt);
+            }
+            None
+        }
+        link => {
+            let prev = decode(link, slots.len()).ok_or(IndexCorrupt)?;
+            if prev == old || prev == new || C::node(&slots[prev]).next != this {
+                return Err(IndexCorrupt);
+            }
+            Some(prev)
+        }
+    };
+    let next = match node.next {
+        INDEX_NONE => None,
+        link => {
+            let next = decode(link, slots.len()).ok_or(IndexCorrupt)?;
+            if next == old || next == new || C::node(&slots[next]).prev != this {
+                return Err(IndexCorrupt);
+            }
+            Some(next)
+        }
+    };
+    let new_link = link_index(new);
+    match prev {
+        Some(prev) => C::node_mut(&mut slots[prev]).next = new_link,
+        None => *C::head_mut(&mut slots[bucket]) = new_link,
+    }
+    if let Some(next) = next {
+        C::node_mut(&mut slots[next]).prev = new_link;
+    }
+    *C::node_mut(&mut slots[new]) = node;
+    *C::node_mut(&mut slots[old]) = ChainNode::UNLINKED;
+    Ok(())
+}
+
 /// Checks every chain of the table: each bucket head walks a well-formed
 /// chain of its own bucket, every linked node is reached exactly once, and
 /// `expected_bucket(i)` (the bucket slot `i` must be linked in, or `None`)
@@ -481,6 +536,20 @@ mod tests {
         unlink::<C>(&mut slots, 0).unwrap();
         unlink::<C>(&mut slots, 3).unwrap();
         unlink::<C>(&mut slots, 3).unwrap();
+        assert_eq!(slots, [EMPTY; 4]);
+        // Replacing keeps the chain position.
+        for index in [0, 1, 2] {
+            link::<C>(&mut slots, index, 3).unwrap();
+        }
+        replace::<C>(&mut slots, 1, 3).unwrap();
+        assert_eq!(chain(&slots, 3), [2, 3, 0]);
+        replace::<C>(&mut slots, 2, 1).unwrap();
+        assert_eq!(chain(&slots, 3), [1, 3, 0]);
+        assert_eq!(replace::<C>(&mut slots, 0, 3), Err(IndexCorrupt));
+        assert_eq!(replace::<C>(&mut slots, 2, 0), Err(IndexCorrupt));
+        for index in [1, 3, 0] {
+            unlink::<C>(&mut slots, index).unwrap();
+        }
         assert_eq!(slots, [EMPTY; 4]);
         let found = walk::<C>(&slots, 2, 4, |_| true).unwrap();
         assert_eq!(
