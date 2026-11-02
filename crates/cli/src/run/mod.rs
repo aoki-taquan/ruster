@@ -31,6 +31,10 @@
 //!    `--keep-privileges` skips it; `--user`/`--group` also switch
 //!    to that uid and gid. A failed drop rolls back like any startup
 //!    failure (`stage=privilege-drop`, exit 1).
+//! 7. Confine every thread to the syscall allowlist with one TSYNC
+//!    seccomp filter ([`seccomp`], H8; `--seccomp kill`, the default, or
+//!    `log`; `off` skips it), also with `--keep-privileges`. A failed
+//!    install rolls back the same way (`stage=seccomp`, exit 1).
 //!
 //! A failure at any stage closes every session opened so far, last first
 //! (closing detaches XDP before releasing the socket, UMEM, and rings),
@@ -78,7 +82,7 @@
 //! - 0: ordered shutdown with no TX frame left in the kernel (also a
 //!   signal during startup, after a clean rollback).
 //! - 1: startup failure (open, checks, attach, watch, datapath, engine,
-//!   adapter, activation, privilege drop, key source; a transient open
+//!   adapter, activation, privilege drop, seccomp, key source; a transient open
 //!   failure after the last attempt), a backend fault during the run, a fatal health or
 //!   device event ([`watch`]: TX stall, persistent kick errors, device
 //!   removed, MTU decreased or above the frame bound, link unverifiable),
@@ -113,6 +117,7 @@ mod netlink;
 mod output;
 mod privileges;
 mod reload;
+mod seccomp;
 mod startup;
 mod stats;
 #[cfg(test)]
@@ -142,6 +147,7 @@ use engine::{
 };
 use privileges::{Identity, PrivilegePolicy, PrivilegeState};
 use reload::{ConfigSource, Preparer, ReloadWorker, Reloader};
+use seccomp::{SeccompMode, SeccompState};
 use startup::{
     open_ports, CloseFailure, Failure, Interrupt, OpenedPorts, PortHost, Stage, StartupError,
 };
@@ -184,12 +190,15 @@ pub struct Settings {
     pub thresholds: Thresholds,
     /// The privilege drop after startup.
     pub privileges: PrivilegePolicy,
+    /// The syscall filter after the drop.
+    pub seccomp: SeccompMode,
 }
 
 impl Settings {
     fn from_args(args: &RunArgs) -> Self {
         Self {
             privileges: privilege_policy(args),
+            seccomp: args.seccomp,
             policy: CheckPolicy {
                 allow_multi_queue: args.allow_multi_queue,
                 allow_kernel_forwarding: args.allow_kernel_forwarding,
@@ -611,7 +620,8 @@ where
         (links.lockstep(lockstep), reloads.lockstep(lockstep))
     };
     let reloader = Reloader::new(reloads, budgets);
-    // Nothing after this point needs a privilege (see [`privileges`]).
+    // Nothing after this point needs a privilege (see [`privileges`]) or a
+    // syscall outside the allowlist (see [`seccomp`]).
     let privileges = match settings.privileges {
         PrivilegePolicy::Keep => PrivilegeState::Kept,
         PrivilegePolicy::Drop { identity } => {
@@ -626,6 +636,25 @@ where
         }
     };
     let _ = writeln!(err, "ruster run: {}", privileges.line());
+    // Every thread exists and has dropped: confine them all at once.
+    let seccomp = match settings.seccomp {
+        SeccompMode::Off => SeccompState::Off,
+        mode => {
+            let report = host.confine(mode).map_err(|error| {
+                Interrupt::Failed(StartupError::new(
+                    Stage::Seccomp,
+                    None,
+                    Failure::Seccomp(error),
+                ))
+            })?;
+            SeccompState::Confined { mode, report }
+        }
+    };
+    let _ = writeln!(err, "ruster run: {}", seccomp.line());
+    let hardening = Hardening {
+        privileges,
+        seccomp,
+    };
     let mut observer = TickObserver::new(HealthPolicy::default());
     let _ = writeln!(
         err,
@@ -666,7 +695,7 @@ where
                 datapath,
                 observer,
                 status,
-                privileges,
+                hardening,
             );
             let _ = out.write_all(text.as_bytes());
             let _ = out.flush();
@@ -748,7 +777,7 @@ where
         &datapath,
         &observer,
         &status,
-        privileges,
+        hardening,
     );
     drop(active);
     drop(datapath);
@@ -803,6 +832,14 @@ fn finish_workers(
     }
 }
 
+/// The privilege and syscall-filter state of the run, for the stats
+/// blocks.
+#[derive(Clone, Copy)]
+struct Hardening {
+    privileges: PrivilegeState,
+    seccomp: SeccompState,
+}
+
 fn render<D: Datapath>(
     kind: BlockKind,
     now: MonotonicMillis,
@@ -810,7 +847,7 @@ fn render<D: Datapath>(
     datapath: &D,
     observer: &TickObserver,
     status: &RunStatus<'_>,
-    privileges: PrivilegeState,
+    hardening: Hardening,
 ) -> String {
     let services = ServiceCounters::capture(
         active.resolution(),
@@ -829,7 +866,8 @@ fn render<D: Datapath>(
         for (interface, health) in status.watch.health() {
             stats::write_fields(out, Some(interface), &health);
         }
-        stats::write_fields(out, None, &privileges);
+        stats::write_fields(out, None, &hardening.privileges);
+        stats::write_fields(out, None, &hardening.seccomp);
     })
 }
 

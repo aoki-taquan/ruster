@@ -438,6 +438,7 @@ ruster run [--allow-multi-queue] [--allow-kernel-forwarding]
            [--tx-stall-fatal-secs <s>] [--kick-errors-fatal-secs <s>]
            [--link-stale-secs <s>]
            [--keep-privileges | --user <uid> --group <gid>]
+           [--seccomp kill|log|off]
            --config <config.toml>
 ruster run [options] -- <config.toml>
 ```
@@ -457,6 +458,7 @@ ruster run [options] -- <config.toml>
 | `--kick-errors-fatal-secs <s>` | 5 | 0 to 3600 | `KICK_ERRORS` fatal exit; 0 never |
 | `--link-stale-secs <s>` | 5 | 1 to 3600 | age of a link watcher round still running (a `send` waiting for the kernel's RTNL lock) from which every further due round counts as a failed link query on every port (`LINK_WATCH_STALE`, `LINK_PROBE`; `LINK_UNVERIFIABLE` at the third, so about `s + 2` seconds after the stuck round started; section 8). No 0: losing observability of the ports always ends the run eventually. Raise it on hosts where driver resets hold RTNL longer |
 | `--keep-privileges` | off | flag | do not drop privileges after startup (section 5, "Privilege drop"): the process keeps every capability it started with for its whole life (`warning: privileges kept (--keep-privileges)`, `privileges.state=kept`). Risk: a memory-safety bug or a logic flaw reachable from packets or the config then runs with `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_BPF`/`CAP_SYS_ADMIN` (as root: every capability), so it can reconfigure every interface and route of the namespace, sniff and inject on any device, load BPF programs, and (as root) read and write any file. Use it only to diagnose a drop problem, or on a kernel before 6.5 with `kernel.unprivileged_bpf_disabled` set (where the drop is refused) |
+| `--seccomp kill\|log\|off` (or `--seccomp=<mode>`) | `kill` | one of the three | the syscall filter after startup (section 5, "Syscall filter"). `kill`: a syscall outside the allowlist kills the whole process at once (`SECCOMP_RET_KILL_PROCESS`; the XDP links detach as after SIGKILL). `log`: the kernel logs it and lets it run (`SECCOMP_RET_LOG`; `warning: seccomp=log`), for finding a missing entry without an outage. `off`: no filter (`warning: seccomp=off`, `seccomp.mode=off`). Risk of `log` and `off`: a compromised router can then make every syscall an unprivileged process (after the drop) or a privileged one (with `--keep-privileges`) can: open inet sockets and connect out, write any file its user may write, start programs, `ptrace` its own user's processes, load BPF programs where unprivileged BPF is allowed, and probe kernel interfaces that the filter keeps out of reach. Use `log` to diagnose a kill, `off` only on a platform where the filter cannot be installed. An i386 or x32 syscall kills in every mode but `off`. Independent of `--keep-privileges` and `--user`/`--group` |
 | `--user <uid>` `--group <gid>` | none | numeric ids 1 to 4294967294, both or neither, not with `--keep-privileges` | with the drop, also switch every thread's real, effective, saved and filesystem uid and gid to these ids and clear the supplementary groups. Names are not resolved. Needs `CAP_SETUID` and `CAP_SETGID` at startup (exit 4 otherwise, checked before anything is opened). The config must then be readable by that user for reloads |
 
 Numbers are decimal digits only (at most 6, no sign; ids at most 10).
@@ -474,11 +476,12 @@ its terminal hangs up or under `nohup`.
 | status | meaning |
 |---|---|
 | 0 | ordered shutdown after SIGINT/SIGTERM with no TX frame left in the kernel; also a signal during startup or during a retry pause, after a clean rollback |
-| 1 | runtime failure: unreadable or refused config file; a startup failure at any stage after the config (open, checks, attach, watch, datapath, engine, adapter, activate, privilege-drop, storage, key source; a transient open failure after the last attempt); a backend fault, a fatal health or device event, or an invariant violation during the run; a drain failure; a stranded TX handoff; a close error; signal handler or output thread setup failure; unsupported platform |
+| 1 | runtime failure: unreadable or refused config file; a startup failure at any stage after the config (open, checks, attach, watch, datapath, engine, adapter, activate, privilege-drop, seccomp, storage, key source; a transient open failure after the last attempt); a backend fault, a fatal health or device event, or an invariant violation during the run; a drain failure; a stranded TX handoff; a close error; signal handler or output thread setup failure; unsupported platform |
 | 2 | usage error, or invalid config (`parse`, `version`, `validate`, the `sim` backend, or `candidate code=MISSING_SERVICE_*`) |
 | 3 | the shutdown drain deadline (or a second signal) left TX frames with the kernel; everything was still detached and closed |
 | 4 | missing capability (also `CAP_SETUID`/`CAP_SETGID` for `--user`/`--group`), too small `RLIMIT_MEMLOCK`, a kernel whose teardown would need `CAP_BPF` after the drop (`TEARDOWN_NEEDS_CAPABILITIES`), or unreadable `/proc/self/status`/`/proc/self/limits`/`/proc/sys/kernel/osrelease`/`/proc/sys/kernel/unprivileged_bpf_disabled`; nothing was acquired |
 | 101 | a panic (section 9) |
+| killed by SIGSYS (a shell shows 159, systemd `status=31/SYS`) | the seccomp filter killed the process: it made a syscall outside the allowlist (section 5, "Syscall filter"); every fd was closed by the kernel and the links detached |
 
 A refused or failed reload never ends the run.
 
@@ -631,6 +634,123 @@ router thread's own drop; a worker that cannot be spawned at all is
 `stage=workers code=THREAD_SPAWN`. An output thread that cannot drop fails
 before anything is opened (`stage=privilege-drop code=... thread=output`,
 exit 1). The router never runs half-dropped.
+
+### Syscall filter (seccomp)
+
+Right after the privilege drop (also with `--keep-privileges`), before the
+first tick, the router thread confines every thread of the process to the
+syscalls the run needs, with one classic BPF program installed by
+`seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC)` (H8,
+CLI-102 to CLI-109). TSYNC attaches the same filter to all five threads at
+once (or to none when a thread has a filter of its own that is not an
+ancestor of the router thread's: `TSYNC_CONFLICT`); no thread is started
+after it, and a thread could not be: `clone` is not allowed. The kernel needs
+`no_new_privs` on the installing thread: the drop has set it; with
+`--keep-privileges` it is set here (no capability is lost; it only stops an
+`execve` from granting any, and ruster executes nothing), and TSYNC sets
+it on every thread. The router thread then requires every thread
+(`/proc/self/task/*/status`) to show `Seccomp: 2`, `NoNewPrivs: 1`, and
+one filter more than before (`Seccomp_filters`, Linux 5.9). A supervisor's
+own filter (systemd `SystemCallFilter=`, a container runtime) stays
+underneath; the stricter result applies, and that filter must allow
+`seccomp` and `prctl` at startup. The line
+`ruster run: seccomp filter installed: mode=kill threads=5 syscalls=N
+arch=x86_64` follows the drop line; the stats show `seccomp.*`
+(section 11).
+
+The program, in order:
+
+1. `seccomp_data.arch` must be `AUDIT_ARCH_X86_64` and the number must not
+   carry the x32 bit (`0x40000000`): otherwise the process is killed, in
+   `log` mode too (the allowlist is in x86_64 numbers; ruster never makes
+   an i386 or x32 call).
+2. An allowlisted syscall runs if its argument conditions hold. Conditions
+   compare the low 32 bits of a C `int` argument, which is all the kernel
+   reads of it.
+3. Anything else gets the `--seccomp` action: `kill`
+   (`SECCOMP_RET_KILL_PROCESS`, the default: every thread dies at once, the
+   kernel closes every fd and the unpinned XDP links detach within
+   milliseconds as after SIGKILL, section 10; no drain, no final stats; not
+   dumpable, so no core file) or `log` (`SECCOMP_RET_LOG`: logged, then
+   run).
+
+The allowlist (x86_64 numbers; derived by reading every thread's code after
+the drop and checked against `strace -f` of the whole privileged smoke
+attached to the running router; the Rust test
+`seccomp::tests::live` runs the same work in a filtered child):
+
+| syscall | condition | who needs it after startup |
+|---|---|---|
+| `sendto` (44) | — | router: AF_XDP TX kick; link watcher: netlink requests (`send`) |
+| `poll` (7) | — | router: Fill-ring wakeup of the need-wakeup profile |
+| `getsockopt` (55) | — | router: `XDP_STATISTICS` per stats sample |
+| `clock_nanosleep` (230), `nanosleep` (35), `restart_syscall` (219) | — | idle backoff and every `thread::sleep` (`nanosleep` where the C library's sleep uses it: older glibc, musl); resuming one a signal interrupted |
+| `clock_gettime` (228) | — | the monotonic clock (normally a vDSO call; this syscall without a vDSO) |
+| `futex` (202), `sched_yield` (24) | — | channels between the threads; std's channels back off with `yield_now` in disconnect and preemption races (dropping the worker and output channels) |
+| `write` (1) | — | output threads (stdout, stderr), a panic message |
+| `read` (0) | — | config, sysctls, `/proc`, `/dev/urandom` keys of a reload |
+| `recvfrom` (45), `getsockname` (51) | — | link watcher: netlink answers and the socket's port id |
+| `openat` (257) | flags without `O_WRONLY`, `O_RDWR`, `O_CREAT`, `O_TRUNC` | read-only opens: config, sysctls, `/proc` (no file is ever created, truncated, or opened for writing) |
+| `close` (3) | — | every fd closed: files, replaced netlink sockets, teardown |
+| `statx` (332), `fstat` (5), `newfstatat` (262) | — | std file metadata (reload, `--strict-config-perms`); glibc `opendir` checks its fd with `fstat`, which is the `fstat` syscall before glibc 2.33 and from 2.39 on, and `newfstatat(fd, "", AT_EMPTY_PATH)` in glibc 2.33 to 2.38 (Ubuntu 22.04, Debian 12, RHEL 9); std falls back to `fstat64`/`stat64`/`lstat64` (`newfstatat`) when a supervisor refuses `statx`. Read-only metadata either way |
+| `readlink` (89) | — | `--strict-config-perms`: the path of the opened config (`/proc/self/fd/N`) |
+| `getdents64` (217) | — | listing `/proc/self/task` (the verification after the install) |
+| `fcntl` (72) | `F_GETFD` only | debug builds of std check an fd before closing it |
+| `mmap` (9), `mprotect` (10) | protection without `PROT_EXEC` | allocation (glibc malloc and its per-thread arenas); never executable memory |
+| `munmap` (11), `mremap` (25), `brk` (12), `madvise` (28) | — | allocation, freeing, a thread's stack at exit |
+| `getrandom` (318) | — | std's per-thread hash keys, drawn on a thread's first `HashMap` |
+| `socket` (41) | `AF_NETLINK` and `NETLINK_ROUTE` | link watcher: a replacement rtnetlink socket after a failed query |
+| `setsockopt` (54) | `SOL_NETLINK` and `NETLINK_GET_STRICT_CHK` | strict checking on that socket |
+| `connect` (42) | — | connecting that socket to the kernel |
+| `bpf` (321) | `BPF_MAP_DELETE_ELEM` only | teardown: the XSKMAP entry delete on the map fd the process holds |
+| `rt_sigreturn` (15) | — | return from the SIGINT/SIGTERM/SIGHUP handlers |
+| `exit` (60), `exit_group` (231), `sigaltstack` (131), `rt_sigprocmask` (14) | — | thread and process exit (glibc blocks signals and frees the thread's stacks) |
+| `getpid` (39), `gettid` (186), `tgkill` (234) | `tgkill`: this process only | `abort` (a panic while panicking) raises SIGABRT at itself; a panic message names the thread id |
+| `getcwd` (79), `lseek` (8) | — | a panic backtrace under `RUST_BACKTRACE=1` shortens paths against the working directory and reads the binary's debug info |
+| `rt_sigaction` (13) | — | std's SIGSEGV/SIGBUS handler restores the default action before re-raising, so a crash keeps its own signal |
+
+What the filter does not take away: everything the allowed calls can do
+on what the process may reach. Without `--user`/`--group` the process is
+still uid 0 and its read-only `openat` reaches every root-readable file
+(keys, `/etc/shadow`); an open alone can also have a side effect on some
+devices (a `/dev/watchdog`-style device arms on open). Use `--user`/
+`--group` with a dedicated account for the full benefit. Under
+`--keep-privileges` the filter does not narrow what the kept capabilities
+allow through the calls it permits: an rtnetlink request on the link
+watcher's socket can change links, addresses and routes (`CAP_NET_ADMIN`),
+and `bpf(BPF_MAP_DELETE_ELEM)` works on every map fd the process holds.
+
+Not on it (a selection): `open`, `ioctl`, `execve`, `clone`/`clone3`/
+`fork`, `kill`, `ptrace`, `prctl`, `setuid` and the other credential calls,
+`mount`, `bind`/`listen`/`accept`, `sendmsg`/`recvmsg`, `unlink`/`rename`/
+`mkdir`, `memfd_create`, `io_uring_*`, `perf_event_open`, `seccomp`, every
+`bpf` command but the delete, and executable mappings. The kernel caches
+the result of an unconditional allow per syscall number (Linux 5.11), so the
+hot-path calls (`sendto`, `poll`, `getsockopt`, `clock_nanosleep`, `futex`)
+skip the program; the hot path is listed first for older kernels.
+
+Failure: anything that keeps the filter from being installed or verified
+aborts startup with the full rollback of this section
+(`startup failed: stage=seccomp code=...`, exit 1, section 14), after the
+privilege drop line and before the readiness line.
+
+Diagnosing a kill (`killed by SIGSYS`, or systemd `status=31/SYS`): the
+kernel logs every seccomp kill (and every `log` hit) as an audit record:
+
+```bash
+journalctl -k | grep 'type=1326'        # or: dmesg | grep type=1326
+ausearch -m SECCOMP -ts recent          # where auditd runs (records go there)
+```
+
+`syscall=N` is the x86_64 number (`ausyscall N`, or
+`/usr/include/x86_64-linux-gnu/asm/unistd_64.h`), `comm=` the thread
+(`ruster`, `ruster-watch`, `ruster-reload`, `ruster-stdout`,
+`ruster-stderr`), `code=0x80000000` a kill and `0x7ffc0000` a logged run.
+Restart with `--seccomp log` to keep running while collecting every
+missing entry, and report the records (they hold no packet or config data).
+The kernel rate-limits these messages without auditd. Use `--seccomp off`
+only if the filter itself cannot be installed (for example a
+supervisor's filter that refuses `seccomp`).
 
 ### Output never blocks the router
 
@@ -912,7 +1032,7 @@ after SIGKILL.
 
 ## 10. Forced termination and restart
 
-1. `kill -KILL <pid>` (or a crash, OOM kill): no drain, no final stats. The
+1. `kill -KILL <pid>` (or a crash, OOM kill, a seccomp kill): no drain, no final stats. The
    kernel closes every fd; the XDP links are unpinned, so the programs
    detach by themselves within milliseconds. Confirm with
    `ip -details link show dev lan0` (no `prog/xdp`). While detached, frames
@@ -952,6 +1072,7 @@ Sections, in this order:
 | `watch.*` | `state` (`ok`/`warning`), `warnings` (all ports), `link_rounds` (link rounds that came back from the watcher), `link_rounds_late` (due rounds skipped because one still ran), `link_rounds_stale` (late rounds past `--link-stale-secs`, each a failed link query) |
 | `if<id>.watch.*` | `tx_stall`, `tx_stall_ms`, `fill_starved`, `kick_errors_persistent`, `link_up`, `link_down_events`, `link_up_events`, `mtu`, `link_probe_errors`, `kernel_ipv4_addresses`, `kernel_forwarding`, `kernel_ipv4_routes`, `kernel_ipv6_addresses`, `kernel_ipv6_routes`, `kernel_ipv6_forwarding`, `kernel_ipv6_enabled`, `ipv4_weak_host`, `warnings` |
 | `privileges.*` | `state` (`dropped`, or `kept` under `--keep-privileges`), `bounding_set` (`cleared`/`kept`), `identity` (`switched`/`unchanged`), `threads` (threads verified by the drop; 0 when kept) |
+| `seccomp.*` | `mode` (`kill`, `log`, `off`), `threads` (threads verified with the filter; 0 when off), `syscalls` (allowlist entries; 0 when off) |
 | `output.dropped` | output messages dropped because a stream could not keep up |
 
 What to watch in operation: `observer.state=healthy`, `watch.state=ok`,
@@ -1229,16 +1350,35 @@ SYNs nobody completes, such as a scan or a spoofed SYN flood.
   loop spins 64 ticks, then sleeps 50 µs doubling to 1 ms when idle),
   SIGUSR1 stats, structured logs, systemd notify, opt-in
   "link down / forwarding 0 at exit", state carried across a reload.
-- Privilege drop limits (CLI-089 to CLI-095): no seccomp filter (a
-  compromised process keeps every syscall an unprivileged process has, such
-  as opening netlink sockets and reading world-readable files), no chroot
-  or mount namespace, numeric `--user`/`--group` only, and the drop needs
+- Privilege drop limits (CLI-089 to CLI-095): no chroot or mount
+  namespace (the seccomp filter of section 5 still lets a compromised
+  process open and read every file its user may read, open rtnetlink
+  sockets and dump the namespace's links, addresses and routes, and
+  write to its own open fds), numeric `--user`/`--group` only, and the drop needs
   Linux 6.5 or newer unless `kernel.unprivileged_bpf_disabled=0`. Without
   `--user`/`--group` the process stays uid 0 (owner of every root file).
 - While a port is down with TX held, its owed kick is retried about 16
   times per second (1 ms doubling to 64 ms, §8), so held TX resumes within about
   64 ms (plus up to one 1 ms idle pause) after the link returns; the run loop's link watch (1 s) does not
   shortcut the retry.
+- Syscall filter limits (CLI-102 to CLI-109): x86_64 only (the platform of
+  `ruster run`). The allowlist is for glibc builds only. It covers glibc
+  2.31 and newer as far as the calls were checked: verified at run time on
+  the development host and the CI runner (glibc 2.39), and by reading the
+  glibc wrappers that changed in that range (`fstat` through `newfstatat`
+  in 2.33 to 2.38, `nanosleep` before `clock_nanosleep`). A musl build
+  (compile-only in CI) is not verified at run time and needs more (musl's
+  `open` uses the `open` syscall, for one; `nanosleep` and `newfstatat` are
+  already covered), so run a musl build with `--seccomp log` first. A
+  future change that makes a new syscall after startup (a new thread, a
+  new file or socket) must extend the allowlist, or the default kills the
+  router. Known calls that are denied and not reachable after startup
+  today: `fs::canonicalize` (`realpath`), glibc malloc's
+  `sched_getaffinity` (glibc sizes its arena limit once, when the first
+  extra arena is made; every thread has allocated before the install), `writev` (no vectored write is
+  used), `clone`/`clone3` (no thread after startup). Argument filters cover the
+  calls listed in section 5; `write`, `read`, `sendto`, `connect` and the
+  others work on any fd the process holds.
 - Verified kernels: the development host and the CI runner only
   (XDP-062). A TX stall with the link up (`TX_STALL`) cannot be produced
   on veth and is tested only against a scripted kernel (CLI-050).
@@ -1345,6 +1485,23 @@ What it proves, on the runner's kernel only:
   `priv_run_privileges_kept` (`--keep-privileges`:
   `CAP_NET_ADMIN` in every thread, the same reload applies,
   `privileges.state=kept`).
+  Added by H8: every phase runs under the default seccomp filter
+  (`--seccomp kill`), and wherever the smoke checks the threads it also
+  requires `Seccomp: 2`, `NoNewPrivs: 1`, and one filter more than its own
+  shell in every thread. Markers `priv_run_seccomp_kill` (every thread
+  filtered, the startup line, `seccomp.mode=kill`, forwarding),
+  `priv_run_seccomp_log` (`--seccomp log` with `--user`/`--group`: the
+  warning, forwarding, an applied reload, link down/up, exit 0, detached,
+  no seccomp record in `dmesg`), `priv_run_seccomp_off` (`--seccomp off`:
+  no thread filtered, `seccomp.mode=off`, exit 0), `priv_run_seccomp_sigsys`
+  (a SIGSYS sent to the router, the same group exit as the filter's kill:
+  it dies and both links detach; the smoke has no way to make the binary
+  itself call a denied syscall, which the Rust test `seccomp::tests::live`
+  does in a child process), and `priv_run_seccomp_no_violation` (no seccomp
+  record of the ruster binary in `dmesg` over the whole smoke; best effort:
+  with auditd running the records go to its log instead, and the kernel
+  rate-limits them). `--keep-privileges` now shows `NoNewPrivs: 1` (the
+  filter sets it).
 - Nothing is left behind: a final step fails if any `ruster-*` namespace
   survives. Smoke logs are uploaded as an artifact when the job fails.
 
@@ -1393,6 +1550,8 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `stage=privileges code=MISSING_CAPABILITIES missing=CAP_SETGID,CAP_SETUID` | 4 | `--user`/`--group` without the capabilities to switch | grant `CAP_SETUID` and `CAP_SETGID` (systemd: add them to `AmbientCapabilities`/`CapabilityBoundingSet`), or drop `--user`/`--group` |
 | `stage=privileges code=TEARDOWN_NEEDS_CAPABILITIES` | 4 | kernel before 6.5 with `kernel.unprivileged_bpf_disabled` set (Ubuntu 22.04, RHEL 9 defaults; vendor backports are not detected): the teardown after the drop would fail | use Linux 6.5 or newer, or knowingly `--keep-privileges` (section 2, upgrade note); with `Restart=on-failure` the unit otherwise restarts in a loop |
 | `stage=privilege-drop code=<STEP>/ERRNO_<n>` (`DUMPABLE`, `KEEPCAPS`, `BOUNDING`, `AMBIENT`, `GROUPS`, `GID`, `UID`, `CAPSET`, `NO_NEW_PRIVS`), `code=NOT_DROPPED/CAPABILITIES\|BOUNDING\|NO_NEW_PRIVS\|IDENTITY\|GROUPS\|DUMPABLE`, `code=STATUS_UNREADABLE` [`thread=output`] | 1 | the privilege drop failed (everything was rolled back) | check seccomp/LSM policy on `prctl`/`capset`/set-id calls and procfs; `NOT_DROPPED` names what a thread kept: report it |
+| `stage=seccomp code=NO_NEW_PRIVS\|ACTION_AVAIL\|INSTALL/ERRNO_<n>`, `code=ACTION_UNAVAILABLE`, `code=TSYNC_CONFLICT`, `code=PROGRAM_TOO_LONG`, `code=STATUS_UNREADABLE`, `code=NOT_CONFINED/MODE\|FILTERS\|NO_NEW_PRIVS` | 1 | the syscall filter could not be installed or verified (everything was rolled back): `INSTALL/ERRNO_13` no `no_new_privs`, `INSTALL/ERRNO_22` a kernel without seccomp filters, `INSTALL/ERRNO_1` a supervisor's filter refused `seccomp`, `TSYNC_CONFLICT` a thread with a filter of its own, `ACTION_UNAVAILABLE` a kernel before 4.14, `STATUS_UNREADABLE` no procfs or no `Seccomp_filters` row (before 5.9) | allow `seccomp` and `prctl` in the supervisor's filter, use Linux 5.9 or newer, or knowingly `--seccomp off` (section 3) |
+| the process died with SIGSYS (shell status 159, systemd `status=31/SYS`) | — | the seccomp filter killed it for a syscall outside the allowlist; the links detached | `journalctl -k \| grep type=1326` names the syscall and thread; run with `--seccomp log` meanwhile and report it (section 5, "Syscall filter") |
 | `reload failed: stage=read code=PERMISSION_DENIED` after a clean start | — | after the drop the config is read without `CAP_DAC_OVERRIDE` (section 5) | make the config and its directories readable by the process's user (root: a root-owned path such as `/etc/ruster`) |
 | `stage=open code=INTERFACE_LOOKUP/NO_SUCH_DEVICE` | 1 | the `device` does not exist in this namespace | fix `device`, or run in the right namespace |
 | `stage=open code=TX_QUEUE_CHECK/NO_TX_QUEUE`, `BIND/INVALID_ARGUMENT` | 1 | `queue` is not a queue of the device | use queue 0, or a queue that has RX and TX |

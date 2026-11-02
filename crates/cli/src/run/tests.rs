@@ -26,6 +26,7 @@ use super::engine::{
 use super::netlink::{LinkFacts, NetlinkError};
 use super::privileges::{Bounding, DropFailure, DropReport, Identity, PrivilegePolicy};
 use super::reload::ConfigSource;
+use super::seccomp::{ConfineFailure, ConfineReport, SeccompMode};
 use super::startup::{CloseFailure, Failure, OpenPort, PortHost, Stage, StartupError};
 use super::watch::{Forwarding, Ipv6Sample, LinkTarget, PortSample};
 use super::{execute, Settings, EXIT_DRAIN_INCOMPLETE, EXIT_PRIVILEGE, READY};
@@ -142,6 +143,15 @@ struct State {
     /// datapath `io()` calls (ticks) before it, and the ports attached
     /// then.
     lockdowns: RefCell<Vec<Lockdown>>,
+    /// Each `confine` call: the mode, the lockdowns and ticks before it.
+    confines: RefCell<Vec<Confine>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Confine {
+    mode: SeccompMode,
+    lockdowns_before: usize,
+    ticks_before: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -551,6 +561,21 @@ impl PortHost for FakeHost {
         })
     }
 
+    fn confine(&self, mode: SeccompMode) -> Result<ConfineReport, ConfineFailure> {
+        self.state.confines.borrow_mut().push(Confine {
+            mode,
+            lockdowns_before: self.state.lockdowns.borrow().len(),
+            ticks_before: self.state.io_calls.get(),
+        });
+        if self.fails(Stage::Seccomp, None) {
+            return Err(ConfineFailure::Injected);
+        }
+        Ok(ConfineReport {
+            threads: 3,
+            syscalls: 7,
+        })
+    }
+
     fn open(&self, port: &ValidatedAfXdpPortV1) -> Result<FakeSession, Failure> {
         let id = port.interface().0;
         self.state.push(Event::Open(id));
@@ -758,6 +783,7 @@ fn settings(policy: CheckPolicy, stats_interval_ms: u64) -> Settings {
         reload_prepare_warn_ms: super::reload::RELOAD_PREPARE_WARN_MS,
         thresholds: super::watch::Thresholds::default(),
         privileges: PrivilegePolicy::default(),
+        seccomp: SeccompMode::default(),
     }
 }
 
@@ -2221,6 +2247,149 @@ fn a_failed_drop_rolls_back_every_port_and_exits_1_without_a_tick() {
     );
     assert!(!outcome.err.contains(READY));
     assert!(!outcome.err.contains("privileges dropped"));
+    assert!(outcome.out.is_empty());
+    assert_eq!(host.state.io_calls.get(), 0, "no tick");
+    host.assert_released();
+    assert!(host.events().ends_with(&[
+        Event::Adapter,
+        Event::Close {
+            port: WAN,
+            attached: true
+        },
+        Event::Close {
+            port: LAN,
+            attached: true
+        }
+    ]));
+}
+
+/// The `seccomp.*` lines of the stats output.
+fn seccomp_lines(out: &str) -> Vec<&str> {
+    out.lines()
+        .filter(|line| line.starts_with("seccomp."))
+        .collect()
+}
+
+#[test]
+fn the_filter_is_installed_after_the_drop_and_before_the_first_tick() {
+    let host = FakeHost::default();
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 3));
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert_eq!(
+        *host.state.confines.borrow(),
+        [Confine {
+            mode: SeccompMode::Kill,
+            lockdowns_before: 1,
+            ticks_before: 0,
+        }],
+        "once, by default kill, after the drop, before any tick"
+    );
+    let dropped_at = outcome.err.find("privileges dropped").expect("drop line");
+    let line = "ruster run: seccomp filter installed: mode=kill threads=3 syscalls=7 \
+                arch=x86_64\n";
+    let confined_at = outcome.err.find(line).expect("seccomp line");
+    let ready_at = outcome.err.find(READY).expect("ready line");
+    assert!(
+        dropped_at < confined_at && confined_at < ready_at,
+        "{}",
+        outcome.err
+    );
+    assert_eq!(
+        seccomp_lines(&outcome.out),
+        [
+            "seccomp.mode=kill",
+            "seccomp.threads=3",
+            "seccomp.syscalls=7"
+        ]
+    );
+    host.assert_released();
+}
+
+#[test]
+fn the_log_mode_is_installed_and_warned_also_with_kept_privileges() {
+    let host = FakeHost::default();
+    let mut settings = settings(CheckPolicy::default(), 0);
+    settings.privileges = PrivilegePolicy::Keep;
+    settings.seccomp = SeccompMode::Log;
+    let outcome = run_full(
+        &host,
+        settings,
+        FakeSource::default(),
+        &FakeStop::after(FIRST_LOOP_CHECK + 3),
+        &mut FakeClock::default(),
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(host.state.lockdowns.borrow().is_empty());
+    assert_eq!(
+        *host.state.confines.borrow(),
+        [Confine {
+            mode: SeccompMode::Log,
+            lockdowns_before: 0,
+            ticks_before: 0,
+        }]
+    );
+    assert!(
+        outcome.err.contains(
+            "ruster run: seccomp filter installed: mode=log threads=3 syscalls=7 arch=x86_64\n\
+             ruster run: warning: seccomp=log (--seccomp log): a syscall outside the allowlist \
+             is logged by the kernel and allowed\n"
+        ),
+        "{}",
+        outcome.err
+    );
+    assert!(outcome.out.contains("\nseccomp.mode=log\n"));
+}
+
+#[test]
+fn seccomp_off_installs_nothing_and_says_so() {
+    let host = FakeHost::default();
+    let mut settings = settings(CheckPolicy::default(), 0);
+    settings.seccomp = SeccompMode::Off;
+    let outcome = run_full(
+        &host,
+        settings,
+        FakeSource::default(),
+        &FakeStop::after(FIRST_LOOP_CHECK + 3),
+        &mut FakeClock::default(),
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(host.state.confines.borrow().is_empty());
+    assert_eq!(
+        host.state.lockdowns.borrow().len(),
+        1,
+        "the drop still runs"
+    );
+    assert!(
+        outcome
+            .err
+            .contains("ruster run: warning: seccomp=off (--seccomp off): no syscall filter\n"),
+        "{}",
+        outcome.err
+    );
+    assert_eq!(
+        seccomp_lines(&outcome.out),
+        [
+            "seccomp.mode=off",
+            "seccomp.threads=0",
+            "seccomp.syscalls=0"
+        ]
+    );
+}
+
+#[test]
+fn a_failed_install_rolls_back_every_port_and_exits_1_without_a_tick() {
+    let host = FakeHost::failing(Stage::Seccomp, None);
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 3));
+    assert_eq!(outcome.status, EXIT_RUNTIME, "{}", outcome.err);
+    assert!(
+        outcome
+            .err
+            .contains("ruster run: startup failed: stage=seccomp code=INJECTED\n"),
+        "{}",
+        outcome.err
+    );
+    assert!(!outcome.err.contains(READY));
+    assert!(!outcome.err.contains("seccomp filter installed"));
     assert!(outcome.out.is_empty());
     assert_eq!(host.state.io_calls.get(), 0, "no tick");
     host.assert_released();

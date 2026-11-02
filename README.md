@@ -76,7 +76,8 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   private FFIのhandlerがstatic `AtomicBool`へswap/storeするだけです（二回目のsignalはforce
   flag。`run`のSIGHUPはreload flagへstoreするだけ）。`unsafe`はそのhandler、`run`のrtnetlink
   query（IPv4/IPv6のaddress dump、全tableのroute dump、link）、起動後のprivilege drop
-  （threadごとの`prctl`/`capset`/`setresuid`等のraw syscall）だけです（下の「使い方」）。
+  （threadごとの`prctl`/`capset`/`setresuid`等のraw syscall）とseccomp filterのinstall
+  （`prctl`/`seccomp`のraw syscall）だけです（下の「使い方」）。
   外部crateを直接には追加しません。
 - `ruster-bench`: NIC-freeなsim smoke/datapath benchmarkとhardware benchmark plan/
   measurement protocol/artifact v1のschema検証。sim結果からproduction性能を主張しない。
@@ -671,6 +672,8 @@ sudo target/release/ruster run -- router.toml                      # 既定のdr
 # stderr: ruster run: privileges dropped: threads=3 capabilities=none bounding-set=cleared no-new-privs=1 identity=unchanged
 sudo target/release/ruster run --user 990 --group 990 -- router.toml # 起動後にuid/gid 990へ切替
 # stderr: ruster run: privileges dropped: threads=3 capabilities=none bounding-set=cleared no-new-privs=1 identity=switched
+# stderr: ruster run: seccomp filter installed: mode=kill threads=5 syscalls=43 arch=x86_64
+sudo target/release/ruster run --seccomp log -- router.toml       # allowlist外のsyscallをkernelがlogして許可（診断用）
 # stderr: ruster run: running generation 1 on 2 port(s); send SIGINT or SIGTERM to stop, SIGHUP to reload
 sudo kill -HUP <pid>                                               # configをreload
 ```
@@ -701,6 +704,23 @@ sudo kill -HUP <pid>                                               # configをre
   `root:<group> 0750`、configを`root:<group> 0640`。rootはownerとして、切替後のuserはgroupで読め、
   `--strict-config-perms`も受理）。statsは`privileges.state=dropped|kept`
   等。詳細はrunbookの「Privilege drop」。
+- seccomp filter（H8、CLI-102〜CLI-109）: privilege dropの直後・最初のtickの前に、router threadが
+  `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC)`一回で全thread（router、output 2、
+  `ruster-watch`、`ruster-reload`）を同じsyscall allowlistへ閉じ込めます（`--keep-privileges`でも。
+  そのとき`no_new_privs`もここで立てる）。手で組んだclassic BPFで、archが`AUDIT_ARCH_X86_64`でないか
+  x32 bitがあれば常にkill、allowlist（AF_XDPの`sendto`/`poll`/`getsockopt`、sleep/futex、read/write、
+  read-onlyの`openat`、netlinkの`socket`/`setsockopt`/`connect`/`recvfrom`、teardownの
+  `bpf(BPF_MAP_DELETE_ELEM)`、allocation、exit等の43個。codeの読解とprivileged smoke全体の
+  `strace -f`から導出）だけを通します。引数filter: `socket`は`AF_NETLINK`/`NETLINK_ROUTE`だけ、
+  `bpf`はmap entry削除だけ、`mmap`/`mprotect`は`PROT_EXEC`なし、`openat`は書き込み・作成・切り詰め
+  なし、`setsockopt`/`fcntl`/`tgkill`も限定。それ以外は`--seccomp kill`（既定:
+  `SECCOMP_RET_KILL_PROCESS`で全threadが即死し、kernelが全fdを閉じてXDP linkはSIGKILL同様に
+  detach）、`--seccomp log`（`SECCOMP_RET_LOG`: kernelがlogして実行。診断用）、`--seccomp off`
+  （filterなし）。log/offはrisk付きのopt-out（warning行）。installの後に全threadの`Seccomp: 2`、
+  `NoNewPrivs: 1`、`Seccomp_filters`が一つ増えたことを`/proc/self/task/*/status`で確かめ、失敗は
+  全portをrollbackして`stage=seccomp`でexit 1。statsは`seccomp.mode=kill|log|off`、
+  `seccomp.threads`、`seccomp.syscalls`。killの診断は`journalctl -k | grep type=1326`（syscall番号と
+  thread名）と`--seccomp log`。詳細はrunbookの「Syscall filter (seccomp)」。
 - portの前提（起動時に確認）: deviceのRX queueは1つ（rtnetlinkの`IFLA_NUM_RX_QUEUES`で数えるので
   namespaceに正しいが、driverが確保したqueue数。`ethtool -L <dev> combined 1`しても確保数が多い
   NICやRSS/ntupleで全trafficをbind queueへ寄せたなら`--allow-multi-queue`、他queueのframeは
@@ -822,8 +842,9 @@ sudo kill -HUP <pid>                                               # configをre
   `2` usage/invalid config、`3`停止期限（または二回目のsignal）で
   TX frameがkernelに残った（detach/closeは済み）、`4`権限/memlock不足（`--user`/`--group`の
   `CAP_SETUID`/`CAP_SETGID`不足、drop後のteardownに権限が要るkernelを含む）。privilege dropの
-  失敗は`1`。reloadの拒否・失敗では終了しません。
-- socket fdの`poll`待機、multi-queue、systemd notify、SIGUSR1 stats、seccompはdeferred
+  失敗は`1`。seccomp filterのinstall失敗も`1`、filterによるkillはSIGSYS（shellでは159）。
+  reloadの拒否・失敗では終了しません。
+- socket fdの`poll`待機、multi-queue、systemd notify、SIGUSR1 stats、chroot/mount namespaceはdeferred
   （requirements CLI-034、runbookの「Known limits」）。
 
 ### packet backend（`[backend]`）
@@ -924,6 +945,10 @@ H6のprivilege drop（全phaseが既定のdropで動き、forward phaseで全thr
 全threadのuid/gidとsupplementary groupなしを確認した上でreload・link down/up・MTU fatalを行い、
 privileges phaseでdrop後のrootが他userの0700 directoryのconfigをreloadできない
 （`PERMISSION_DENIED`）こと、`--keep-privileges`ではcapabilityが残り同じreloadが通ることを確認）、
+H8のseccomp filter（全phaseが既定の`--seccomp kill`で動き、threadを確かめる所では全threadが
+`Seccomp: 2`、`NoNewPrivs: 1`、shellより一つ多い`Seccomp_filters`。seccomp phaseで`--seccomp log`の
+forward・reload・link down/upとdmesgに記録が無いこと、`--seccomp off`で全thread未filter、SIGSYSでの
+group exitで両linkがdetachすること、最後にsmoke全体でruster binaryのseccomp記録が増えないことを確認）、
 B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、
 M2 S10bのops phase（一つの稼働中routerでSIGHUP reloadによりUDP ruleをdenyにして届かなくなり、
 戻して再び届く。generation 2/3でrestartなし。UMEM shapeを変えたreloadは`RESTART_REQUIRED`で
