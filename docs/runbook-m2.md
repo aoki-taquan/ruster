@@ -54,6 +54,9 @@ All commands assume a dedicated router host or network namespace. Replace
   BPF objects. Otherwise exit 4 (`privileges code=MEMLOCK_LIMIT
   limit-bytes=L required-bytes=R`). Root has `CAP_IPC_LOCK`. The estimate is
   a lower bound (section 12).
+- **Memory (RAM)**: the runtime tables are ordinary heap, not memlocked;
+  up to 128 MiB for the largest config `ruster run` accepts, plus the UMEM
+  (see "Validation limits and memory" below).
 - **Dedicated network namespace (recommended)**: run the router in its own
   namespace (`ip netns exec <ns> ruster run ...`) that holds only the port
   devices. Then no other interface needs kernel forwarding, the per-second
@@ -172,6 +175,86 @@ All commands assume a dedicated router host or network namespace. Replace
     not attach.
   - IPv6 off (see above), unless `--allow-kernel-ipv6`.
 - **Config file permissions (optional)**: `--strict-config-perms` (section 3).
+
+### Validation limits and memory
+
+`ruster run` validates the config (at startup and on every SIGHUP reload)
+with the production limits (`PRODUCTION_VALIDATION_LIMITS`, H3).
+`ruster validate` and `ruster plan` pick the limits from the document's
+own `backend.kind`, so they predict exactly what the command that drives
+that backend accepts: `af-xdp` gets the production limits (what `run`
+accepts), `sim` or no `[backend]` gets the simulator's
+(`SIM_VALIDATION_LIMITS`, what `run-sim` accepts; `run-sim` is unchanged).
+In `plan` each side is checked with the limits of its own backend.
+A refusal is exit 2 with a value-free line such as `stage=validate
+code=CAPACITY_LIMIT_EXCEEDED path=firewall.capacity.states limit=65536
+actual=65537` or `stage=validate code=RUNTIME_STORAGE_BYTES_EXCEEDED
+limit=... actual=...` (whole-document storage; no path).
+
+| Limit | `run-sim` (and `validate` of `sim`) | `ruster run` (and `validate` of `af-xdp`) | Why |
+|---|---|---|---|
+| slots per runtime table (`max_slots_per_table`): each `*.capacity.*` key, each NAT44 directory (next power of two of mappings/peers/sessions), the NAT44 port owner table (pool size) | 65536 | 65536 | a per-packet CPU bound, not a memory one (below); also the largest port pool (1-65535) |
+| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 128 MiB | every table at 65536 needs 111.25 MiB, so in production the per-table limit binds; the byte limit fails closed only if a slot type grows |
+| config file | 1 MiB | 1 MiB | parse stage, every backend (CONFIG-001) |
+| `[[interfaces]]` / `[[backend.ports]]` | 256 / 256 | 256 / 256 | parse stage |
+| `[[addresses]]` | 1024 | 1024 | parse stage |
+| `[[routes]]` / `[[neighbors]]` / `[[firewall.rules]]` | 4096 each | 4096 each | parse stage |
+| UMEM per port / all ports | (not used) | 256 MiB / 1 GiB | CONFIG-005 |
+
+The slot limit stays at 2^16 in production on purpose (coordinator
+default, not an owner decision). Every runtime table has a per-packet path
+whose worst case is linear in its capacity: a dynamic-neighbor miss scans
+all `dynamic-neighbors` slots, resolution and ICMPv4 error state lookups
+scan their `states`, a new NAT44 mapping, peer or session scans for a
+reusable slot from slot 0 when the table is full of live entries, a new
+NAT44 port scans the pool, and the firewall's open-addressing probe walks
+the whole `states` table when it is full. So the slot limit caps that work
+at 65536 slot checks per table per packet; raising it needs indexed slot
+reuse first (deferred). Within the limit, size each table for the traffic
+(a busy table near its capacity costs CPU on every miss) rather than at the
+maximum.
+
+Memory per slot (x86_64, the slot types `FullServiceStorage` allocates,
+pinned by `the_maximal_production_config_allocates_within_the_documented_bound`):
+
+| Table (config key) | Bytes per slot | At 65536 slots |
+|---|---|---|
+| `resolution.capacity.states` | 56 | 3.5 MiB |
+| `resolution.capacity.actions` | 32 | 2 MiB |
+| `resolution.capacity.dynamic-neighbors` | 24 | 1.5 MiB |
+| `resolution.capacity.failure-holds` (holds a quoted datagram) | 608 | 38 MiB |
+| `icmpv4-errors.capacity.states` | 24 | 1.5 MiB |
+| `icmpv4-errors.capacity.actions` (holds a quoted datagram) | 584 | 36.5 MiB |
+| `nat44.udp.capacity.mappings` / `peers` | 48 + 28 directory each | 4.75 MiB each |
+| `nat44.tcp.capacity.mappings` | 48 + 28 directory | 4.75 MiB |
+| `nat44.tcp.capacity.sessions` | 48 + 2 x 28 directories | 6.5 MiB |
+| NAT44 port owners (`nat44.realm.ports`, per pool port, UDP and TCP each) | 32 | 2 MiB per protocol |
+| `firewall.capacity.states` | 56 | 3.5 MiB |
+
+A directory is one 4-byte bucket per slot, rounded up to a power of two,
+and one 24-byte node per slot (exact for the powers of two above). `ruster
+validate` prints the total as `storage-bytes=`. The largest config `run`
+accepts (every table at 65536, pool 1-65535;
+`fixtures/limits/router-production-max.toml`) needs 116654016 bytes
+(111.25 MiB).
+
+Worst-case resident memory of `ruster run`:
+
+- runtime storage: at most 128 MiB (111.25 MiB with today's slot sizes),
+  allocated once at startup before the privilege preflight and filled, so
+  it is resident from the start (`stage=storage code=ALLOCATION.<service>`
+  if the allocation fails, exit 1). Ordinary heap: it does not count
+  against `RLIMIT_MEMLOCK`, and a reload reuses it (a different size is
+  restart-required).
+- UMEM: the sum of `frame-count x frame-size` over the ports, at most
+  1 GiB, memlocked (Memlock above; twice during an `auto` copy fallback).
+- config documents: at most 1 MiB of text each and their parsed form; a
+  reload holds the running and the new document at once.
+- the rest (binary, stacks, rings, the forwarding snapshot of at most 4096
+  routes and neighbors) is a few MiB.
+
+So a maximal config with 1 GiB of UMEM needs about 1.2 GiB of RAM; the
+smoke configs (2 ports x 1 MiB UMEM, small tables) need a few MiB.
 
 ## 2. Install and run
 
@@ -670,8 +753,10 @@ CLI-034).
   so IPv6 cached exceptions (PMTU and redirect clones) are not listed;
   harmless, because each hangs off a FIB route through the same device,
   which is listed.
-- The config is validated with the same limits as `run-sim`
-  (`SIM_VALIDATION_LIMITS`); production limits are not decided yet.
+- The config is validated with the production limits (section 1,
+  "Validation limits and memory"). No runtime table can exceed 65536 slots:
+  several tables have per-packet paths linear in their capacity, and
+  indexed slot reuse (which would allow larger tables) is deferred.
 - Capability diagnostics read `CapEff` in the caller's user namespace; in a
   non-initial user namespace the bits can look sufficient while BPF still
   needs init-namespace capabilities, so the failure appears later as
@@ -763,6 +848,10 @@ What it proves, on the runner's kernel only:
   tight fatal thresholds without a fatal and recovered with the held
   frames delivered and the counters adding up; `observer.state` and
   `watch.state` in the stats blocks.
+  Added by H3 (marker `priv_run_limits`): a config with every runtime
+  table at the production limit (111.25 MiB of storage) refused by
+  `validate` as a sim document and accepted as af-xdp; `ruster run`
+  starts it, forwards and translates, and exits 0 on SIGTERM.
 - Nothing is left behind: a final step fails if any `ruster-*` namespace
   survives. Smoke logs are uploaded as an artifact when the job fails.
 

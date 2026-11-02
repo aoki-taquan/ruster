@@ -24,6 +24,8 @@
 
 mod args;
 mod config_cmd;
+#[cfg(test)]
+mod limits_tests;
 mod plan_text;
 mod run;
 mod run_sim;

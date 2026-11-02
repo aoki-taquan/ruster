@@ -29,9 +29,38 @@ use crate::{
 /// Caller-selected cold-path bounds for runtime storage requested by V1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ValidationLimits {
+    /// Largest slot count of any one runtime table, directory bucket array,
+    /// or NAT44 port owner table (`CAPACITY_LIMIT_EXCEEDED`).
     pub max_slots_per_table: u32,
+    /// Largest preallocated runtime storage in bytes, summed over every
+    /// table (`RUNTIME_STORAGE_BYTES_EXCEEDED`).
     pub max_runtime_bytes: usize,
 }
+
+/// Storage bounds of a production router (`ruster run`, and `ruster
+/// validate`/`plan` of a document whose `backend.kind` is `af-xdp`).
+///
+/// - `max_slots_per_table` = 2^16. Every runtime table has a per-packet
+///   path whose worst case is linear in its capacity (dynamic-neighbor
+///   and resolution lookups scan, NAT44 slot reuse scans from slot 0, the
+///   firewall's open-addressing probe walks a full table, NAT44 port
+///   selection walks the pool), so this bound is a per-packet CPU bound,
+///   not a memory one: at most 65536 slot checks per table per packet. It
+///   also equals the largest NAT44 port pool (1..=65535 is 65535 owners),
+///   so mappings above it could never get a public port of their own.
+///   Kept equal to the simulator's bound; raising it needs indexed slot
+///   reuse first (coordinator default, not an owner decision).
+/// - `max_runtime_bytes` = 128 MiB. Every table at the slot limit (with
+///   the widest port pool) needs 116654016 bytes (111.25 MiB) with the
+///   current slot sizes, so every document within the per-table bound is
+///   accepted and this bound only fails closed if a slot type grows. The
+///   storage is ordinary heap (not memlocked), allocated once at startup,
+///   and is at most one eighth of the largest UMEM
+///   ([`MAX_AF_XDP_UMEM_BYTES`], memlocked).
+pub const PRODUCTION_VALIDATION_LIMITS: ValidationLimits = ValidationLimits {
+    max_slots_per_table: 1 << 16,
+    max_runtime_bytes: 128 << 20,
+};
 
 /// Stable, value-free semantic rejection reason.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

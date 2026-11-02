@@ -1,8 +1,11 @@
 //! `ruster validate` and `ruster plan`.
 //!
-//! Both read at most [`MAX_CONFIG_BYTES`] + 1 bytes per file, parse and
-//! validate with the same [`SIM_VALIDATION_LIMITS`] that `run-sim` uses, and
-//! print only counts, stable codes, schema field paths, and plan structure.
+//! Both read at most [`MAX_CONFIG_BYTES`] + 1 bytes per file, parse, and
+//! validate with the limits of the backend the document selects
+//! ([`limits_for`]): [`PRODUCTION_VALIDATION_LIMITS`] for `af-xdp`, the
+//! limits `ruster run` uses, and [`SIM_VALIDATION_LIMITS`] for `sim`, the
+//! limits `run-sim` uses. They print only counts, stable codes, schema
+//! field paths, and plan structure.
 //! Secrets (allocator seeds, hash keys, scenario seeds) are never printed:
 //! they are not part of any rendered value.
 
@@ -12,7 +15,8 @@ use std::num::NonZeroU64;
 use std::path::Path;
 
 use ruster_config::{
-    parse, validate, PathSegment, SourcePath, ValidatedConfig, ValidatedConfigV1, MAX_CONFIG_BYTES,
+    parse, validate, BackendKindV1, PathSegment, SourcePath, ValidatedConfig, ValidatedConfigV1,
+    ValidationLimits, VersionedConfig, MAX_CONFIG_BYTES, PRODUCTION_VALIDATION_LIMITS,
 };
 use ruster_control::{
     candidate_from_config, ApplyPlan, ConfigBridgeError, PlanError, PlanSide,
@@ -92,14 +96,24 @@ fn render_path(path: &SourcePath) -> Option<String> {
 
 /// Reads, parses, and validates one configuration document, including the
 /// M1 service bridge, so `validate` and both sides of `plan` accept exactly
-/// what `run-sim` accepts, except that any validated `[backend]` is
-/// accepted here: `run-sim` additionally refuses a non-`sim` backend
-/// (`stage=backend code=UNSUPPORTED_BACKEND`).
+/// what the command for the document's backend accepts ([`limits_for`]):
+/// a `sim` document what `run-sim` accepts, an `af-xdp` one what `ruster
+/// run` accepts. Any validated `[backend]` is accepted here: `run-sim`
+/// additionally refuses a non-`sim` backend (`stage=backend
+/// code=UNSUPPORTED_BACKEND`) and `run` a `sim` one (`code=SIM_BACKEND`).
 pub fn load(path: &Path) -> Result<ValidatedConfigV1, LoadError> {
-    load_validated(path).and_then(|config| {
-        bridge_check(&config).map_err(LoadError::Rejected)?;
-        Ok(config)
-    })
+    load_validated(path).and_then(with_bridge)
+}
+
+/// [`load`] of a document already in memory.
+#[cfg(test)]
+pub fn load_bytes(bytes: &[u8]) -> Result<ValidatedConfigV1, LoadError> {
+    validate_bytes(bytes).and_then(with_bridge)
+}
+
+fn with_bridge(config: ValidatedConfigV1) -> Result<ValidatedConfigV1, LoadError> {
+    bridge_check(&config).map_err(LoadError::Rejected)?;
+    Ok(config)
 }
 
 /// Reads, parses, and validates one configuration document without the
@@ -246,13 +260,37 @@ pub fn parse_effective_uid(status: &str) -> Option<u32> {
     row.split_whitespace().nth(1)?.parse().ok()
 }
 
+/// Validation limits of a parsed document, chosen by the backend it
+/// selects, so `validate` and `plan` accept exactly what the command that
+/// runs that backend accepts: `af-xdp` (only `ruster run` drives it)
+/// gets [`PRODUCTION_VALIDATION_LIMITS`]; `sim`, or no `[backend]` (only
+/// `run-sim` drives it), gets [`SIM_VALIDATION_LIMITS`]. A document for
+/// another schema version gets the simulator's (smaller) limits; the
+/// validator refuses it anyway.
+pub fn limits_for(parsed: &VersionedConfig) -> ValidationLimits {
+    match parsed {
+        VersionedConfig::V1(config) => match config.backend.as_ref().map(|backend| backend.kind) {
+            Some(BackendKindV1::AfXdp) => PRODUCTION_VALIDATION_LIMITS,
+            Some(BackendKindV1::Sim) | None => SIM_VALIDATION_LIMITS,
+        },
+        _ => SIM_VALIDATION_LIMITS,
+    }
+}
+
 fn validate_file(file: File) -> Result<ValidatedConfigV1, LoadError> {
     let mut bytes = Vec::new();
     let take = wide(MAX_CONFIG_BYTES).saturating_add(1);
     file.take(take)
         .read_to_end(&mut bytes)
         .map_err(|error| LoadError::Read(error.kind()))?;
-    let parsed = parse(&bytes).map_err(|diagnostic| {
+    validate_bytes(&bytes)
+}
+
+/// Parses and validates one document (at most [`MAX_CONFIG_BYTES`] + 1
+/// bytes already read) with the limits of [`limits_for`]. Every loader
+/// of `validate`, `plan`, and `ruster run` (startup and reload) ends here.
+pub fn validate_bytes(bytes: &[u8]) -> Result<ValidatedConfigV1, LoadError> {
+    let parsed = parse(bytes).map_err(|diagnostic| {
         LoadError::Rejected(Rejection {
             stage: "parse",
             code: diagnostic.code().code(),
@@ -263,7 +301,8 @@ fn validate_file(file: File) -> Result<ValidatedConfigV1, LoadError> {
                 .map(|(l, a)| (wide(l), wide(a))),
         })
     })?;
-    match validate(parsed, SIM_VALIDATION_LIMITS) {
+    let limits = limits_for(&parsed);
+    match validate(parsed, limits) {
         Ok(ValidatedConfig::V1(config)) => Ok(config),
         Ok(_) => Err(LoadError::Rejected(Rejection {
             stage: "version",
@@ -341,7 +380,16 @@ pub fn report_load(err: &mut impl Write, label: &str, error: &LoadError) -> u8 {
 
 /// `ruster validate <config>`: summary on stdout, diagnostics on stderr.
 pub fn run_validate(path: &Path, out: &mut impl Write, err: &mut impl Write) -> u8 {
-    let config = match load(path) {
+    validate_loaded(load(path), out, err)
+}
+
+/// The `validate` report of one [`load`] result.
+pub fn validate_loaded(
+    loaded: Result<ValidatedConfigV1, LoadError>,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    let config = match loaded {
         Ok(config) => config,
         Err(error) => return report_load(err, "", &error),
     };
@@ -377,6 +425,17 @@ pub fn run_validate(path: &Path, out: &mut impl Write, err: &mut impl Write) -> 
 /// `ruster plan <current> <next>`: the plan on stdout, exit 0 whenever a
 /// plan is produced, including a restart-required one.
 pub fn run_plan(current: &Path, next: &Path, out: &mut impl Write, err: &mut impl Write) -> u8 {
+    plan_with(load, current, next, out, err)
+}
+
+/// `plan` over two documents read by `load` (next only after current).
+pub fn plan_with<T: ?Sized>(
+    load: impl Fn(&T) -> Result<ValidatedConfigV1, LoadError>,
+    current: &T,
+    next: &T,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
     let current = match load(current) {
         Ok(config) => config,
         Err(error) => return report_load(err, "current ", &error),

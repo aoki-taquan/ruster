@@ -88,10 +88,9 @@ fn echo_request(sequence: u16) -> Vec<u8> {
 fn edited(edit: impl Fn(String) -> String) -> ValidatedConfigV1 {
     let base = include_str!("../../../../fixtures/m1/router-v1.toml");
     let text = edit(format!("{base}\n{BACKEND}"));
-    let parsed = parse(text.as_bytes()).expect("parse");
-    match validate(parsed, SIM_VALIDATION_LIMITS) {
-        Ok(ValidatedConfig::V1(config)) => config,
-        _ => panic!("valid edited config"),
+    match crate::config_cmd::validate_bytes(text.as_bytes()) {
+        Ok(config) => config,
+        Err(error) => panic!("valid edited config: {}", error.render()),
     }
 }
 

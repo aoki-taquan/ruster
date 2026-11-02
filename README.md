@@ -539,7 +539,9 @@ cmp out.jsonl fixtures/m1/expected.jsonl
 $B run-sim --scenario fixtures/m1/scenario.toml --hold
 ```
 
-- `validate`/`plan`は`run-sim`と同じvalidation limitを使い、allocator seed、hash key、
+- `validate`/`plan`はdocumentの`backend.kind`でvalidation limitを選びます: `af-xdp`は
+  `ruster run`と同じ本番limit（`PRODUCTION_VALIDATION_LIMITS`）、`sim`（省略を含む）は`run-sim`と
+  同じ`SIM_VALIDATION_LIMITS`です（`plan`は両sideをそれぞれのbackendで）。allocator seed、hash key、
   scenario seedを出力しません。`validate`はM1で必須のresolution、ICMPv4 error、NAT44
   UDP/TCP、firewallの欠落も`stage=bridge`で拒否します。
 - `plan`は両documentに`validate`と同じbridge確認を行います。`expected-flush`はdocument間の
@@ -623,6 +625,16 @@ sudo kill -HUP <pid>                                               # configをre
   （既定off）はgroup/otherが書けるか、root/実効user以外が所有するconfigを起動時とreload時に
   `stage=permissions`で拒否します（configは`O_NONBLOCK|O_NOCTTY`でregular fileだけ）。既存のXDP programが
   あるdeviceは`stage=attach code=CREATE_LINK/EXISTING_PROGRAM`で拒否し、置換しません。
+- validation limit（H3）: configは起動時もreload時も本番limitで検証します。runtime table
+  （各`*.capacity.*`、NAT44 directory、port pool）は一つ65536 slotまで（`run-sim`と同じ。tableの
+  いくつかはpacketごとの処理がcapacityに線形なため、CPU上限としての値）、runtime storageの合計は
+  128 MiBまで（`run-sim`は64 MiB）。全tableを65536にしたconfig
+  （`fixtures/limits/router-production-max.toml`）でstorageは111.25 MiBで、`run`は受理し
+  `run-sim`は拒否します。storageは通常のheap（memlockではない）で起動時に一度だけ確保し、
+  `validate`の`storage-bytes=`がその量です。最悪のRAMはstorage 128 MiB + UMEM（最大1 GiB、memlock）
+  + config数MiB。超過は`stage=validate code=CAPACITY_LIMIT_EXCEEDED path=<field> limit=65536
+  actual=N`または`RUNTIME_STORAGE_BYTES_EXCEEDED`でexit 2です。limit表とslotごとのbyte数は
+  runbookの「Validation limits and memory」。
 - 起動はfailure atomicです: どのstageで失敗しても開いたportを逆順にclose（XDP detachを含む）
   してから`ruster run: startup failed: stage=<stage> [port=if<id>] code=<TOKEN>`を出します。
   exit statusはstageによります: 権限/memlock不足は4、config（bridge rejectionを含む）は2、

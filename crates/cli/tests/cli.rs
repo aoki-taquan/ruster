@@ -1006,3 +1006,70 @@ fn run_exits_in_bounded_time_with_an_undrained_stdout() {
         .expect("spawn");
     assert_eq!(exits_within(live, Duration::from_secs(10)), Some(4));
 }
+
+/// H3: `validate` and `run` apply the production limits to an af-xdp
+/// document (every table at the per-table limit, above the simulator's
+/// byte budget), `validate` of the same document with a sim backend the
+/// simulator's; one slot above the limit is exit 2 with a value-free code
+/// and path. `run` of the maximal document gets past validation and
+/// storage allocation to the privilege preflight (exit 4) when
+/// unprivileged; with `CAP_NET_ADMIN` that half is skipped (no live
+/// startup in the caller's namespace).
+#[test]
+fn validate_and_run_apply_the_production_limits_to_af_xdp() {
+    let dir = scratch();
+    let maximal = fs::read_to_string(fixtures().join("../limits/router-production-max.toml"))
+        .expect("fixture");
+    let max = dir.join("router-production-max.toml");
+    fs::write(&max, &maximal).unwrap();
+    let ok = ruster(&["validate".as_ref(), max.as_os_str()]);
+    assert_eq!(status(&ok), 0, "{}", text(&ok.stderr));
+    assert!(
+        text(&ok.stdout).contains(" storage-bytes=116654016 backend=af-xdp "),
+        "{}",
+        text(&ok.stdout)
+    );
+
+    let sim = dir.join("router-sim-max.toml");
+    let at = maximal.find("\n[backend]\n").expect("backend");
+    fs::write(&sim, &maximal[..=at]).unwrap();
+    let refused = ruster(&["validate".as_ref(), sim.as_os_str()]);
+    assert_eq!(status(&refused), 2);
+    assert_eq!(
+        text(&refused.stderr),
+        "ruster: invalid config: stage=validate code=RUNTIME_STORAGE_BYTES_EXCEEDED \
+         limit=67108864 actual=116654016\n"
+    );
+
+    let above = dir.join("router-production-above.toml");
+    fs::write(
+        &above,
+        maximal.replacen(
+            "[firewall.capacity]\nstates = 65536\n",
+            "[firewall.capacity]\nstates = 65537\n",
+            1,
+        ),
+    )
+    .unwrap();
+    let expected = "ruster: invalid config: stage=validate code=CAPACITY_LIMIT_EXCEEDED \
+                    path=firewall.capacity.states limit=65536 actual=65537\n";
+    let refused = ruster(&["validate".as_ref(), above.as_os_str()]);
+    assert_eq!(status(&refused), 2);
+    assert_eq!(text(&refused.stderr), expected);
+    let refused = ruster(&["run".as_ref(), "--config".as_ref(), above.as_os_str()]);
+    assert_eq!(status(&refused), 2);
+    assert_eq!(text(&refused.stderr), expected);
+    assert!(refused.stdout.is_empty());
+
+    if holds_net_admin() {
+        eprintln!("skipped run of the maximal config: CAP_NET_ADMIN held");
+        return;
+    }
+    let output = ruster(&["run".as_ref(), "--config".as_ref(), max.as_os_str()]);
+    let stderr = text(&output.stderr);
+    assert_eq!(status(&output), 4, "{stderr}");
+    assert!(
+        stderr.contains("startup failed: stage=privileges code=MISSING_CAPABILITIES"),
+        "{stderr}"
+    );
+}
