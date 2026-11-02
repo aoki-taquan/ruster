@@ -483,9 +483,10 @@ coordinating agentの既定値（owner決定ではない）:
 
 M2a（coordinatorのscoping提案）: `ruster run`の下で動くcopy-mode AF_XDP router、veth E2EをCIで
 実行する。multi-queue、zero-copy、X05を含まない。判定は
-[`release-evidence/m2.md`](release-evidence/m2.md)で、criterion 1、2、3、6、7がmet、4（zero-copy
-hardware）、5（TX ring fullのE2E）、9（TX full、`validate`/`plan`のE2E）がpartially met、8（X05
-artifact）がnot met。M2b（multi-queue S12、zero-copy、X05 lab evidence）はowner決定2aとX05 labの
+[`release-evidence/m2.md`](release-evidence/m2.md)で、criterion 1、2、3、5、6、7、9がmet、4（zero-copy
+hardware）がpartially met、8（X05 artifact）がnot met。5と9はM2a close時にpartially metで、#305の
+veth gap fill（router生成ICMPv4、TX ring full、`validate`/`plan`、`observer.state`のE2E。CI-005〜007）で
+metにした。同PRでlink down中のTX保持が`KICK_ERRORS`でfatalになるbugを直した（CLI-052A）。M2b（multi-queue S12、zero-copy、X05 lab evidence）はowner決定2aとX05 labの
 決定を待って次に進める。M2全体のcloseはM2bの後である。
 
 ### M3: Household/scaled router

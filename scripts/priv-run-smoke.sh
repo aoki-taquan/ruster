@@ -28,6 +28,36 @@
 #             namespace warns and recovers with forwarding; then rb's MTU
 #             raised beyond the 2048-byte frame bound: exit 1 after drain,
 #             nothing left attached
+#   validate  (gap fill) `ruster validate` on every config the smoke runs
+#             (exit 0, af-xdp backend with 2 ports) and on an invalid one
+#             (exit 2); `ruster plan` between the configs the smoke reloads
+#             (reloadable vs restart-required BACKEND). The ops and icmp
+#             phases then require the running router to do what plan said:
+#             a reloadable plan is applied, a restart-required plan is
+#             refused with the plan's reasons, and the invalid config is
+#             refused on SIGHUP with the validate diagnostic (and by `run`)
+#   icmp      (gap fill) router-generated ICMPv4 over AF_XDP, captured on
+#             host A with a raw socket: Echo Reply from 192.168.1.1; Time
+#             Exceeded (TTL 1), Destination Unreachable Host (an on-link WAN
+#             address that never answers ARP); a route miss is silent under
+#             router-v1 (FIREWALL_ROUTE_UNAVAILABLE) and, after a SIGHUP
+#             reload to router-v2 (rule 40, no egress), Destination
+#             Unreachable Network (RFC 1812 5.2.7.1). Every error is checked
+#             for type/code, outer source/TTL/TOS/checksums, and a quote that
+#             is the whole original datagram with a valid header checksum
+#   txfull    (gap fill) the WAN TX ring (128 entries; 256 generated frames
+#             so the ring, not the copy pool, is the bound) driven full:
+#             `ip link set rb down` in the router namespace makes every TX
+#             kick fail ENETDOWN, so the kernel consumes nothing; a burst
+#             from host A fills the ring (tx_inflight=128, tx_ring_full and
+#             tx_blocked counted, core tx_rejected). Held past
+#             --tx-stall-fatal-secs 2 and --kick-errors-fatal-secs 2 with no
+#             fatal (a down link holds TX by design and is LINK_DOWN, not
+#             TX_STALL or KICK_ERRORS); observer.state=healthy and
+#             watch.state=warning while held. `ip link set rb up`: the 128
+#             held datagrams reach host B, forwarding recovers, and the final
+#             counters add up (rx, TX submitted = completed, nothing in
+#             flight, observer.state=healthy, watch.state=ok)
 #   forwarding  ip_forward=1 in the router namespace is refused at startup
 #             (KERNEL_FORWARDING_ENABLED), accepted with a warning under
 #             --allow-kernel-forwarding, and only warned while running;
@@ -181,9 +211,10 @@ sudo -n ip -n "$host_b" link set pb up
 
 # The router-v1 fixture on ra/rb plus a copy-mode AF_XDP backend.
 write_config() {
-    # $1 output, $2 lan device, $3 wan queue
+    # $1 output, $2 lan device, $3 wan queue, $4 fixture (router-v1),
+    # $5 wan generated frames (64)
     sed -e 's/device = "sim0"/device = "'"$2"'"/' -e 's/device = "sim1"/device = "rb"/' \
-        "$root/fixtures/m1/router-v1.toml" >"$1"
+        "$root/fixtures/m1/${4:-router-v1}.toml" >"$1"
     cat >>"$1" <<EOF
 
 [backend]
@@ -207,12 +238,21 @@ xdp-attach = "native"
 rings = { fill = 128, rx = 128, tx = 128, completion = 128 }
 frame-size = 2048
 frame-count = 512
-generated-frames = 64
+generated-frames = ${5:-64}
 EOF
 }
 write_config "$work/router.toml" ra 0
 write_config "$work/bad-queue.toml" ra 1
 write_config "$work/multi-queue.toml" rq 0
+# router-v2: adds rule 40 (LAN UDP to any egress), so a UDP route miss
+# yields Destination Unreachable (Network); reloadable from router-v1.
+write_config "$work/router-v2.toml" ra 0 router-v2
+# 256 WAN generated frames (frame-count 512 = fill 128 + tx 128 + 256):
+# a cross-port forward is copied into an egress generated frame, so with
+# more of those than TX entries the 128-entry TX ring is what fills.
+write_config "$work/txfull.toml" ra 0 router-v1 256
+# Invalid: a frame size AF_XDP does not support (validate exit 2).
+sed 's/frame-size = 2048/frame-size = 1000/' "$work/router.toml" >"$work/invalid.toml"
 
 xdp_on() {
     # Prints "<mode> <id>" of the program attached to $1, or nothing.
@@ -230,14 +270,15 @@ assert_detached() {
 
 # Starts `ruster run` in the router namespace; its stdout/stderr go to
 # $work/$1.out and $work/$1.err. The pid is the ruster process itself
-# (`sh` execs `ip netns exec`, which execs ruster). $3, if given, is one
-# extra option without spaces.
+# (`sh` execs `ip netns exec`, which execs ruster). Arguments after $2 are
+# extra options.
 start_ruster() {
     name=$1
     config=$2
+    shift 2
     rm -f "$pidfile"
     sudo -n sh -c 'echo $$ >"$1"; shift; exec ip netns exec "$@"' sh "$pidfile" \
-        "$router" "$binary_path" run --stats-interval 1 ${3:-} --config "$config" \
+        "$router" "$binary_path" run --stats-interval 1 "$@" --config "$config" \
         >"$work/$name.out" 2>"$work/$name.err" &
     launcher=$!
     tries=0
@@ -398,12 +439,255 @@ forward_blocked() {
     echo "priv_run_$tag: host A -> host B denied by the reloaded firewall verified"
 }
 
-# Replaces the running router's config atomically and sends SIGHUP.
+# Replaces the running router's config ($2, default ops.toml) atomically
+# with $1 and sends SIGHUP.
 reload_with() {
-    cp "$1" "$work/ops.next"
-    mv "$work/ops.next" "$work/ops.toml"
+    target=${2:-$work/ops.toml}
+    cp "$1" "$target.next"
+    mv "$target.next" "$target"
     signal_ruster HUP
 }
+
+# Writes the last complete stats block of $work/$1.out to $work/$1.block.
+latest_block() {
+    awk '/^ruster-run-stats /{cur=""} {cur=cur $0 "\n"} /^end$/{last=cur} END{printf "%s", last}' \
+        "$work/$1.out" >"$work/$1.block"
+}
+
+# Prints the value of the stats key $2 in the block file $1.
+stat_in() {
+    sed -n "s/^$2=//p" "$1" | tail -n 1
+}
+
+# Waits (10 s) until the latest complete stats block of $1 has the line $2.
+wait_block() {
+    tries=0
+    while :; do
+        latest_block "$1"
+        grep -qxF -- "$2" "$work/$1.block" && return 0
+        launcher_alive || fail "$1: exited while waiting for a block with $2"
+        tries=$((tries + 1))
+        [ "$tries" -le 100 ] || fail "$1: no stats block with $2 within 10 seconds"
+        sleep 0.1
+    done
+}
+
+# Waits (10 s) until the stats key $2 of $1's latest block is at least $3.
+wait_stat_ge() {
+    tries=0
+    while :; do
+        latest_block "$1"
+        value=$(stat_in "$work/$1.block" "$2")
+        [ "${value:-0}" -ge "$3" ] && return 0
+        launcher_alive || fail "$1: exited while waiting for $2 >= $3"
+        tries=$((tries + 1))
+        [ "$tries" -le 100 ] || fail "$1: $2 is ${value:-missing}, not >= $3, after 10 seconds"
+        sleep 0.1
+    done
+}
+
+# Fails unless the block file $1 has every line given after it.
+block_has() {
+    file=$1
+    shift
+    for line in "$@"; do
+        grep -qxF -- "$line" "$file" || fail "$file: no line $line"
+    done
+}
+
+# Host A's view of router-generated ICMPv4 (argv: mode target ttl marker
+# deadline-seconds). Repeats the probe (an Echo Request on a raw socket, or
+# a UDP datagram to port 9 with the given TTL) every 0.3 s and reads every
+# ICMPv4 message host A receives on a raw socket, until one answers this
+# probe (or, for `absent`, until the deadline, failing if one does). An
+# error must come from the router's LAN address with
+# ipv4-origin.default-ttl 64, TOS 0xc0 (RFC 1812 4.3.2.5), valid IPv4 and
+# ICMP checksums, a zero unused field, and quote the whole datagram as sent
+# (it is shorter than the 576-byte bound of RFC 1812 4.3.2.3).
+ICMP_PROBE='
+import os, socket, struct, sys, time
+
+def fold(data):
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return total
+
+def check(ok, what):
+    if not ok:
+        sys.exit("icmp probe %s: %s" % (mode, what))
+
+mode, target, ttl, marker = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4].encode()
+deadline = time.monotonic() + float(sys.argv[5])
+router, host = socket.inet_aton("192.168.1.1"), socket.inet_aton("192.168.1.10")
+raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+raw.settimeout(0.1)
+ident = os.getpid() & 0xFFFF
+udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+udp.bind(("0.0.0.0", 0))
+sport = udp.getsockname()[1]
+
+def send():
+    if mode == "echo":
+        body = struct.pack("!BBHHH", 8, 0, 0, ident, 1) + marker
+        body = body[:2] + struct.pack("!H", 0xFFFF - fold(body)) + body[4:]
+        raw.sendto(body, (target, 0))
+    else:
+        udp.sendto(marker, (target, 9))
+
+def answer(pkt):
+    icmp = pkt[(pkt[0] & 15) * 4:]
+    if mode == "echo":
+        if len(icmp) >= 8 and icmp[0] == 0 and struct.unpack("!H", icmp[4:6])[0] == ident:
+            return icmp
+        return None
+    if len(icmp) < 36 or icmp[0] not in (3, 11):
+        return None
+    quote = icmp[8:]
+    qihl = (quote[0] & 15) * 4
+    if len(quote) < qihl + 4 or quote[16:20] != socket.inet_aton(target):
+        return None
+    if struct.unpack("!H", quote[qihl:qihl + 2])[0] != sport:
+        return None
+    return icmp
+
+found = None
+while found is None and time.monotonic() < deadline:
+    send()
+    end = time.monotonic() + 0.3
+    while found is None and time.monotonic() < end:
+        try:
+            pkt = raw.recv(4096)
+        except socket.timeout:
+            continue
+        icmp = answer(pkt)
+        if icmp is not None:
+            found = (pkt, icmp)
+if mode == "absent":
+    check(found is None, "an ICMPv4 error answered a datagram the router must drop silently")
+    print("no ICMPv4 error for %s within %s s" % (target, sys.argv[5]))
+    sys.exit(0)
+check(found is not None, "no answer within %s s" % sys.argv[5])
+pkt, icmp = found
+ihl = (pkt[0] & 15) * 4
+check(pkt[12:16] == router and pkt[16:20] == host, "outer addresses")
+check(pkt[9] == 1 and fold(pkt[:ihl]) == 0xFFFF, "outer protocol or header checksum")
+check(fold(icmp) == 0xFFFF, "ICMP checksum")
+if mode == "echo":
+    check(icmp[1] == 0 and icmp[6:8] == b"\0\x01" and icmp[8:] == marker, "echo code/sequence/payload")
+    print("echo-reply type=0 code=0 from 192.168.1.1, identifier, sequence, and payload echoed")
+    sys.exit(0)
+want = {"time-exceeded": (11, 0), "net-unreachable": (3, 0), "host-unreachable": (3, 1)}[mode]
+check((icmp[0], icmp[1]) == want, "type/code %d/%d" % (icmp[0], icmp[1]))
+check(pkt[8] == 64, "outer TTL %d" % pkt[8])
+check(pkt[1] == 0xC0, "outer TOS 0x%02x" % pkt[1])
+check(icmp[4:8] == b"\0\0\0\0", "unused field")
+quote = icmp[8:]
+check(quote[0] == 0x45 and quote[12:16] == host and quote[9] == 17, "quoted IPv4 header")
+check(quote[8] == ttl and fold(quote[:20]) == 0xFFFF, "quoted TTL or header checksum")
+check(struct.unpack("!HH", quote[20:24]) == (sport, 9), "quoted UDP ports")
+check(struct.unpack("!H", quote[2:4])[0] == 28 + len(marker) == len(quote), "quote length")
+check(quote[28:] == marker, "quoted payload")
+print("type=%d code=%d from 192.168.1.1 ttl=64 tos=0xc0, quoting the whole %d-byte datagram 192.168.1.10:%d -> %s:9 ttl=%d" % (icmp[0], icmp[1], len(quote), sport, target, ttl))
+'
+
+# Host A -> argv[1]:argv[2]: argv[3] datagrams "argv[4]-<n>", 2 ms apart.
+BURST='
+import socket, sys, time
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+for n in range(int(sys.argv[3])):
+    s.sendto(("%s-%d" % (sys.argv[4], n)).encode(), (sys.argv[1], int(sys.argv[2])))
+    time.sleep(0.002)
+'
+
+# Counts the distinct "argv[2]-<n>" datagrams on UDP port argv[1] until
+# none arrives for argv[3] seconds.
+COUNT='
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+s.bind(("0.0.0.0", int(sys.argv[1])))
+s.settimeout(float(sys.argv[3]))
+print("ready", flush=True)
+seen = set()
+try:
+    while True:
+        text = s.recv(2048).decode(errors="replace")
+        if text.startswith(sys.argv[2] + "-"):
+            seen.add(int(text.rsplit("-", 1)[1]))
+except socket.timeout:
+    pass
+print(len(seen), flush=True)
+'
+
+# Runs one ICMP_PROBE from host A (mode, target, TTL, deadline seconds).
+icmp_probe() {
+    in_ns "$host_a" python3 -I -c "$ICMP_PROBE" "$1" "$2" "$3" "ruster-icmp-$1-$suffix" "$4" \
+        >"$work/icmp-$1.txt" 2>&1 || fail "icmp: $(cat "$work/icmp-$1.txt")"
+}
+
+# Requires `ruster plan $work/$1.toml $work/$2.toml` to exit 0 with the
+# verdict $3 and the restart-required reasons $4.
+expect_plan() {
+    out="$work/plan-$1-$2.txt"
+    "$binary_path" plan "$work/$1.toml" "$work/$2.toml" >"$out" 2>&1 ||
+        fail "plan: $1 -> $2 exit status $?: $(cat "$out")"
+    grep -qx "plan: $3" "$out" || fail "plan: $1 -> $2 is not $3: $(cat "$out")"
+    grep -qx "restart-required: $4" "$out" ||
+        fail "plan: $1 -> $2 restart-required is not $4: $(cat "$out")"
+}
+
+# validate/plan: what the offline commands say about the smoke's configs.
+# The ops and icmp phases then require the running router to agree.
+# Rule 20 (LAN -> WAN UDP) denies instead of allowing.
+sed '/protocol = "udp"/{n;s/action = "allow-stateful"/action = "deny"/;}' \
+    "$work/router.toml" >"$work/deny.toml"
+grep -q 'action = "deny"' "$work/deny.toml" || fail "validate: deny config not written"
+# A different UMEM shape for lan: restart-required (BACKEND).
+sed '0,/frame-count = 512/s//frame-count = 1024/' "$work/router.toml" >"$work/reshape.toml"
+for config in router deny reshape router-v2 txfull bad-queue multi-queue; do
+    status=0
+    "$binary_path" validate "$work/$config.toml" >"$work/validate-$config.txt" 2>&1 || status=$?
+    [ "$status" -eq 0 ] || fail "validate: $config.toml exit status $status: $(cat "$work/validate-$config.txt")"
+    grep -q '^valid: schema-version=1 interfaces=2 .* backend=af-xdp ports=2 umem-bytes=[0-9]*$' \
+        "$work/validate-$config.txt" || fail "validate: $config.toml: $(cat "$work/validate-$config.txt")"
+done
+grep -q " routes=4 .* firewall-rules=4 " "$work/validate-router-v2.txt" ||
+    fail "validate: router-v2 counts: $(cat "$work/validate-router-v2.txt")"
+status=0
+"$binary_path" validate "$work/invalid.toml" >"$work/validate-invalid.txt" 2>&1 || status=$?
+[ "$status" -eq 2 ] || fail "validate: invalid.toml exit status $status"
+invalid_detail=$(sed -n 's/^ruster: invalid config: //p' "$work/validate-invalid.txt")
+[ "$invalid_detail" = "stage=validate code=BACKEND_FRAME_SIZE_UNSUPPORTED path=backend.ports[0].frame-size" ] ||
+    fail "validate: invalid.toml: $(cat "$work/validate-invalid.txt")"
+# `ruster run` refuses the same config with the same diagnostic, before
+# touching any port.
+start_ruster invalid "$work/invalid.toml"
+wait_ruster
+[ "$status" -eq 2 ] || fail "invalid: run exit status $status"
+grep -qxF "ruster: invalid config: $invalid_detail" "$work/invalid.err" ||
+    fail "invalid: run diagnostic differs from validate"
+assert_detached "the invalid config"
+echo "priv_run_validate: 7 smoke configs valid (af-xdp, 2 ports), invalid frame size exit 2 from validate and run with the same diagnostic verified"
+expect_plan router router reloadable none
+grep -qx "changes: 0" "$work/plan-router-router.txt" || fail "plan: router -> router has changes"
+expect_plan router deny reloadable none
+expect_plan deny router reloadable none
+expect_plan router reshape restart-required BACKEND
+expect_plan reshape router restart-required BACKEND
+expect_plan router router-v2 reloadable none
+expect_plan router txfull restart-required BACKEND
+status=0
+"$binary_path" plan "$work/router.toml" "$work/invalid.toml" >"$work/plan-router-invalid.txt" 2>&1 ||
+    status=$?
+[ "$status" -eq 2 ] || fail "plan: router -> invalid exit status $status"
+grep -qxF "ruster: invalid next config: $invalid_detail" "$work/plan-router-invalid.txt" ||
+    fail "plan: router -> invalid: $(cat "$work/plan-router-invalid.txt")"
+reshape_reasons=$(sed -n 's/^restart-required: //p' "$work/plan-router-reshape.txt")
+echo "priv_run_plan: deny and router-v2 reloadable, reshape and txfull restart-required BACKEND, invalid next exit 2 verified"
 
 # forward: cold start, forward, SIGTERM.
 start_ruster forward "$work/router.toml"
@@ -417,6 +701,8 @@ wait_ruster
 assert_detached "SIGTERM"
 grep -q "^ruster-run-stats kind=final" "$work/forward.out" || fail "forward: no final stats"
 grep -q "^af_xdp.ports=2$" "$work/forward.out" || fail "forward: no backend stats"
+sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/forward.out" >"$work/forward.final"
+block_has "$work/forward.final" observer.state=healthy observer.generation=1 watch.state=ok
 received=$(sed -n 's/^rx.received=//p' "$work/forward.out" | tail -n 1)
 [ "${received:-0}" -ge 1 ] || fail "forward: final rx.received is ${received:-missing}"
 grep -q "stopped by signal; .* tx-in-flight=0 .*detached and closed 2 port(s)" \
@@ -426,13 +712,10 @@ echo "priv_run_shutdown: SIGTERM exit 0, XDP detached, final counters (rx.receiv
 
 # ops: SIGHUP reload, a refused restart-required reload, and link down/up,
 # all on one running router (M2 S10b).
+# Each reload is the one `ruster plan` judged above: router -> deny and
+# deny -> router reloadable (applied), router -> reshape restart-required
+# with $reshape_reasons (refused with exactly those reasons).
 cp "$work/router.toml" "$work/ops.toml"
-# Rule 20 (LAN -> WAN UDP) denies instead of allowing.
-sed '/protocol = "udp"/{n;s/action = "allow-stateful"/action = "deny"/;}' \
-    "$work/router.toml" >"$work/deny.toml"
-grep -q 'action = "deny"' "$work/deny.toml" || fail "ops: deny config not written"
-# A different UMEM shape for lan: restart-required (BACKEND).
-sed '0,/frame-count = 512/s//frame-count = 1024/' "$work/router.toml" >"$work/reshape.toml"
 start_ruster ops "$work/ops.toml"
 wait_ready ops || fail "ops: ruster exited during startup"
 forward_once ops-before
@@ -444,7 +727,7 @@ wait_line ops "reload applied: generation=3 previous=2"
 forward_once ops-allowed
 echo "priv_run_reload: SIGHUP changed the firewall outcome twice without a restart verified"
 reload_with "$work/reshape.toml"
-wait_line ops "reload refused: code=RESTART_REQUIRED reasons=BACKEND; generation 3 keeps running"
+wait_line ops "reload refused: code=RESTART_REQUIRED reasons=$reshape_reasons; generation 3 keeps running"
 forward_once ops-refused
 reload_with "$work/router.toml"
 wait_line ops "reload applied: generation=5 previous=3"
@@ -472,6 +755,127 @@ assert_detached "the MTU fail-closed exit"
 sudo -n ip -n "$router" link set rb mtu 1500
 cat "$work/ops.err"
 echo "priv_run_mtu: MTU above the frame bound failed closed with exit 1 and detached verified"
+
+# icmp: router-generated ICMPv4 on the wire over AF_XDP, seen by host A.
+cp "$work/router.toml" "$work/icmp.toml"
+start_ruster icmp "$work/icmp.toml"
+wait_ready icmp || fail "icmp: ruster exited during startup"
+icmp_probe echo 192.168.1.1 64 10
+echo "priv_run_icmp_echo: $(cat "$work/icmp-echo.txt") verified"
+icmp_probe time-exceeded 203.0.113.1 1 10
+echo "priv_run_icmp_time_exceeded: $(cat "$work/icmp-time-exceeded.txt") verified"
+# 203.0.113.99 is on-link on the WAN and never answers the router's ARP
+# (3 attempts 1 s apart): the held datagram's Host Unreachable.
+icmp_probe host-unreachable 203.0.113.99 64 15
+echo "priv_run_icmp_host_unreachable: $(cat "$work/icmp-host-unreachable.txt") verified"
+# No route to 10.255.0.1: router-v1's rules all name the egress "wan", so a
+# route miss has no permitting rule and is dropped silently.
+icmp_probe absent 10.255.0.1 64 2
+wait_stat_ge icmp drop.FIREWALL_ROUTE_UNAVAILABLE 1
+# SIGHUP with the invalid config: refused with validate's diagnostic.
+reload_with "$work/invalid.toml" "$work/icmp.toml"
+wait_line icmp "reload failed: $invalid_detail; generation 1 keeps running"
+echo "priv_run_reload_invalid: SIGHUP with the config validate rejects failed with the same diagnostic, generation 1 kept verified"
+# router-v2 (plan: reloadable): rule 40 permits the route miss, which now
+# yields Destination Unreachable (Network).
+reload_with "$work/router-v2.toml" "$work/icmp.toml"
+wait_line icmp "reload applied: generation=2 previous=1; interfaces=2 addresses=2 routes=4 neighbors=1 firewall-rules=4 "
+icmp_probe net-unreachable 10.255.0.1 64 10
+echo "priv_run_icmp_net_unreachable: route miss silent under router-v1 (FIREWALL_ROUTE_UNAVAILABLE), then after the reloadable router-v2 reload $(cat "$work/icmp-net-unreachable.txt") verified"
+signal_ruster TERM
+wait_ruster
+[ "$status" -eq 0 ] || fail "icmp: exit status $status after SIGTERM"
+assert_detached "the icmp run"
+sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/icmp.out" >"$work/icmp.final"
+block_has "$work/icmp.final" observer.state=healthy observer.generation=2 \
+    generated_icmpv4.tx_rejected=0 if1.af_xdp_port.generated_inflight=0 \
+    if1.af_xdp_port.tx_inflight=0
+accepted=$(stat_in "$work/icmp.final" generated_icmpv4.tx_accepted)
+[ "${accepted:-0}" -ge 3 ] || fail "icmp: generated_icmpv4.tx_accepted is ${accepted:-missing}"
+committed=$(stat_in "$work/icmp.final" if1.af_xdp_port.generated_committed)
+completed=$(stat_in "$work/icmp.final" if1.af_xdp_port.generated_completed)
+[ "${committed:-x}" = "${completed:-y}" ] ||
+    fail "icmp: if1 generated committed $committed, completed $completed"
+cat "$work/icmp.err"
+echo "priv_run_icmp: generated_icmpv4.tx_accepted=$accepted, if1 generated committed=completed=$completed, exit 0 verified"
+
+# txfull: the WAN TX ring driven full and recovered.
+start_ruster txfull "$work/txfull.toml" --tx-stall-warn-secs 1 --tx-stall-fatal-secs 2 \
+    --kick-errors-fatal-secs 2
+wait_ready txfull || fail "txfull: ruster exited during startup"
+forward_once txfull-before
+# rb administratively down inside the router namespace: every TX kick
+# fails ENETDOWN and the kernel consumes no TX descriptor. (A peer that
+# is down only drops carrier; the kernel then consumes and drops the
+# frames, so the ring never fills.)
+sudo -n ip -n "$router" link set rb down
+wait_line txfull "warning: port=if2 health=LINK_DOWN"
+in_ns "$host_a" python3 -I -c "$BURST" 203.0.113.1 9001 300 "ruster-txfull-$suffix"
+wait_block txfull if2.af_xdp_port.tx_inflight=128
+# Held past both fatal thresholds (2 s): a down link holds its TX by
+# design, so neither TX_STALL nor KICK_ERRORS may fire.
+sleep 4
+launcher_alive || fail "txfull: exited while the TX ring was full"
+latest_block txfull
+cp "$work/txfull.block" "$work/txfull.held"
+block_has "$work/txfull.held" observer.state=healthy watch.state=warning \
+    if2.af_xdp_port.link_down=true if2.af_xdp_port.tx_inflight=128 \
+    if2.af_xdp_port.tx_ring_unconsumed=128 if2.af_xdp_port.tx_inflight_highwater=128 \
+    if2.watch.link_up=false if2.watch.tx_stall=false if2.watch.kick_errors_persistent=false \
+    if1.af_xdp_port.tx_blocked=0
+ring_full=$(stat_in "$work/txfull.held" if2.af_xdp_port.tx_ring_full)
+blocked=$(stat_in "$work/txfull.held" if2.af_xdp_port.tx_blocked)
+link_down_kicks=$(stat_in "$work/txfull.held" if2.af_xdp_port.kicks_link_down)
+[ "${ring_full:-0}" -ge 1 ] && [ "$ring_full" = "$blocked" ] ||
+    fail "txfull: tx_ring_full ${ring_full:-missing}, tx_blocked ${blocked:-missing}"
+[ "${link_down_kicks:-0}" -ge 1 ] || fail "txfull: no ENETDOWN kick while held"
+if grep -Eq "fatal:|health=(TX_STALL|KICK_ERRORS)" "$work/txfull.err"; then
+    fail "txfull: a TX_STALL/KICK_ERRORS event or a fatal while the link was down"
+fi
+echo "priv_run_txfull: rb down, TX ring full (tx_inflight=128 of 128, tx_ring_full=tx_blocked=$ring_full, $link_down_kicks ENETDOWN kicks), held 4 s past --tx-stall-fatal-secs 2 and --kick-errors-fatal-secs 2 without a fatal, observer.state=healthy watch.state=warning verified"
+rm -f "$work/recv-txfull-backlog.out"
+in_ns "$host_b" python3 -I -c "$COUNT" 9001 "ruster-txfull-$suffix" 3 \
+    >"$work/recv-txfull-backlog.out" 2>&1 &
+receiver=$!
+tries=0
+while ! grep -q ready "$work/recv-txfull-backlog.out" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -le 200 ] || fail "txfull: receiver not ready"
+    sleep 0.05
+done
+sudo -n ip -n "$router" link set rb up
+wait "$receiver" || fail "txfull: backlog receiver failed"
+backlog=$(sed -n 2p "$work/recv-txfull-backlog.out")
+[ "$backlog" = 128 ] || fail "txfull: host B got ${backlog:-no} held datagrams, not 128"
+wait_line txfull "recovered: port=if2 health=LINK_DOWN"
+forward_once txfull-after
+signal_ruster TERM
+wait_ruster
+[ "$status" -eq 0 ] || fail "txfull: exit status $status after SIGTERM"
+assert_detached "the txfull run"
+grep -q "stopped by signal; .* tx-in-flight=0 .*detached and closed 2 port(s)" \
+    "$work/txfull.err" || fail "txfull: no shutdown summary"
+if grep -Eq "fatal:|health=(TX_STALL|KICK_ERRORS)" "$work/txfull.err"; then
+    fail "txfull: a TX_STALL/KICK_ERRORS event or a fatal"
+fi
+sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/txfull.out" >"$work/txfull.final"
+block_has "$work/txfull.final" observer.state=healthy watch.state=ok \
+    if2.af_xdp_port.tx_inflight=0 if2.af_xdp_port.generated_inflight=0 \
+    if2.watch.link_down_events=1 if2.watch.link_up_events=1 rx.accounting_violations=0 \
+    "if2.af_xdp_port.tx_blocked=$blocked" "rx.tx_rejected=$blocked"
+final() {
+    stat_in "$work/txfull.final" "$1"
+}
+[ "$(final if2.af_xdp_port.tx_submitted)" = "$(final if2.af_xdp_port.tx_completed)" ] ||
+    fail "txfull: if2 TX submitted != completed"
+[ "$(final if2.af_xdp_port.generated_committed)" = "$(final if2.af_xdp_port.generated_completed)" ] ||
+    fail "txfull: if2 generated committed != completed"
+[ "$(final rx.tx_requested)" -eq $(($(final rx.tx_accepted) + $(final rx.tx_rejected))) ] ||
+    fail "txfull: rx.tx_requested != tx_accepted + tx_rejected"
+[ "$(final rx.received)" -eq $(($(final rx.tx_requested) + $(final rx.dropped) + $(final rx.consumed))) ] ||
+    fail "txfull: rx.received != tx_requested + dropped + consumed"
+cat "$work/txfull.err"
+echo "priv_run_txfull: rb up, the 128 held datagrams reached host B, forwarding recovered, exit 0; final rx.received=$(final rx.received) = tx_requested + dropped + consumed, tx_requested = tx_accepted + tx_rejected ($(final rx.tx_rejected) = if2 tx_blocked), if2 TX submitted = completed = $(final if2.af_xdp_port.tx_completed), nothing in flight, observer.state=healthy watch.state=ok verified"
 
 # rollback: the second port fails after the first one attached.
 start_ruster bad-queue "$work/bad-queue.toml"
