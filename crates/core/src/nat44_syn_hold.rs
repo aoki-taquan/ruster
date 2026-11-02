@@ -322,7 +322,6 @@ impl<'a> SynHoldTable<'a> {
         slot.original_tos = original_tos;
         slot.quote_len = u16::try_from(quote_len).expect("quote limit fits u16");
         slot.quote[..quote_len].copy_from_slice(&original_ipv4[..quote_len]);
-        slot.quote[quote_len..].fill(0);
         self.fifo.push_back(self.slots, index);
         self.occupancy.insert();
         SynHoldInsert::Held
