@@ -70,8 +70,34 @@
 #             veth) or to attach (a foreign xdpgeneric program on rb):
 #             exit 1 with the stage and port, nothing left attached on ra,
 #             and the foreign program untouched
-#   checks    a two-queue device and a kernel IPv4 address on the port are
-#             refused before attach (XDP-063)
+#   checks    a two-queue device, a kernel IPv4 address on the port, a
+#             main-table route, a route in a policy-routing table (100),
+#             and a multipath route with one nexthop on the port (table
+#             101) are refused before attach (XDP-063)
+#   ipv6      (H2) every phase runs with disable_ipv6=1 on ra/rb (the
+#             recommended setup) except these. IPv6 on ra with only
+#             link-local is refused (KERNEL_IPV6_ENABLED) and accepted with
+#             warnings under --allow-kernel-ipv6; a global IPv6 address is
+#             refused (KERNEL_IPV6_ADDRESSES, also under
+#             --allow-kernel-forwarding) and accepted with warnings under
+#             --allow-kernel-ipv6 (traffic forwarded, exit warning); an IPv6
+#             route out of rb in table 200 is refused (KERNEL_IPV6_ROUTES,
+#             port if2); net.ipv6.conf.all.forwarding=1 is refused
+#             (KERNEL_IPV6_FORWARDING_ENABLED scope=global) but accepted
+#             without a word with disable_ipv6=1 on both ports;
+#             conf/ra/force_forwarding=1 is refused (scope=force; the step
+#             says SKIPPED when the sysctl is absent, before Linux 6.17).
+#             While running: disable_ipv6 flipped to 0, a global IPv6
+#             address, force_forwarding, an IPv4 route in table 300, and
+#             IPv6 forwarding each warn and recover (disable_ipv6=1 on ra
+#             recovers if1 only), no fatal, exit warnings for rb
+#   weakhost  an effective rp_filter=0 (the setup sets all.rp_filter=1),
+#             also with arp_ignore=1, only warns IPV4_WEAK_HOST_EXPOSURE, at
+#             startup and while running, and recovers with rp_filter 2 or 1
+#   mc_forwarding  an IPv4 multicast routing socket (MRT_INIT) makes
+#             all/mc_forwarding=1: refused (scope=multicast), accepted with
+#             --allow-kernel-forwarding, warned and recovered (SKIPPED with
+#             the reason when MRT_INIT fails)
 #   restart   SIGKILL a running router: the unpinned links auto-detach;
 #             restart (bounded retry of the transient BIND/BUSY or
 #             REGISTER_UMEM/MEMLOCK_LIMIT after teardown, XDP-045, in this
@@ -123,6 +149,7 @@ stopfile="$work/sender.stop"
 created=
 launcher=
 ruster_pid=
+mroute=
 
 # True only if `$1` is a live process running the built ruster binary.
 is_ruster() {
@@ -130,6 +157,11 @@ is_ruster() {
 }
 
 cleanup() {
+    if [ -n "$mroute" ]; then
+        kill "$mroute" 2>/dev/null || true
+        wait "$mroute" 2>/dev/null || true
+        mroute=
+    fi
     if [ -z "$ruster_pid" ] && [ -s "$pidfile" ]; then
         ruster_pid=$(tr -cd '0-9' <"$pidfile")
     fi
@@ -193,9 +225,19 @@ sudo -n ip -n "$router" link set rb address 02:00:00:00:00:02
 for dev in ra rb rq rqp; do
     sudo -n ip -n "$router" link set "$dev" up
 done
-# Kernel IPv4 forwarding stays off in the router namespace (refused by
-# `ruster run` unless --allow-kernel-forwarding; checks phase).
+# The recommended router namespace (runbook section 2): kernel IPv4
+# forwarding off (refused by `ruster run` unless --allow-kernel-forwarding),
+# IPv6 off on every port device (refused unless --allow-kernel-ipv6; the
+# ipv6 phase turns it on where it tests that), IPv6 forwarding off, and
+# all.rp_filter=1 (otherwise IPV4_WEAK_HOST_EXPOSURE is warned; the
+# weakhost phase tests that) and all.arp_ignore=1 (advice: no ARP replies
+# for addresses the port does not hold).
 in_ns "$router" sysctl -qw net.ipv4.ip_forward=0
+in_ns "$router" sysctl -qw net.ipv6.conf.all.forwarding=0
+in_ns "$router" sysctl -qw net.ipv4.conf.all.rp_filter=1 net.ipv4.conf.all.arp_ignore=1
+for dev in ra rb rq rqp; do
+    in_ns "$router" sysctl -qw "net.ipv6.conf.$dev.disable_ipv6=1"
+done
 # Host A is the fixture's static LAN neighbor 192.168.1.10.
 sudo -n ip -n "$host_a" link set pa address 02:00:00:00:00:10
 sudo -n ip -n "$host_a" address add 192.168.1.10/24 dev pa
@@ -935,7 +977,26 @@ grep -q "startup failed: stage=checks port=if1 code=KERNEL_IPV4_ROUTES count=1" 
     "$work/kernel-route.err" || fail "kernel-route: wrong failure"
 assert_detached "the kernel route refusal"
 sudo -n ip -n "$router" route del 10.98.0.0/16 dev ra
-echo "priv_run_checks: multi-queue device, kernel IPv4 address, and kernel route refused before attach verified"
+# Policy routing: a route out of the port in a table other than main
+# (rtnetlink RTM_GETROUTE of every table), and a multipath route of which
+# one nexthop leaves through the port.
+sudo -n ip -n "$router" route add 10.97.0.0/16 dev ra table 100
+start_ruster kernel-route-table "$work/router.toml"
+wait_ruster
+[ "$status" -eq 1 ] || fail "kernel-route-table: exit status $status"
+grep -q "startup failed: stage=checks port=if1 code=KERNEL_IPV4_ROUTES count=1" \
+    "$work/kernel-route-table.err" || fail "kernel-route-table: wrong failure"
+assert_detached "the policy-table route refusal"
+sudo -n ip -n "$router" route del 10.97.0.0/16 dev ra table 100
+sudo -n ip -n "$router" route add 10.96.0.0/16 table 101 nexthop dev rq nexthop dev rb
+start_ruster kernel-route-multipath "$work/router.toml"
+wait_ruster
+[ "$status" -eq 1 ] || fail "kernel-route-multipath: exit status $status"
+grep -q "startup failed: stage=checks port=if2 code=KERNEL_IPV4_ROUTES count=1" \
+    "$work/kernel-route-multipath.err" || fail "kernel-route-multipath: wrong failure"
+assert_detached "the multipath route refusal"
+sudo -n ip -n "$router" route del 10.96.0.0/16 table 101
+echo "priv_run_checks: multi-queue device, kernel IPv4 address, and kernel routes (main, policy table 100, multipath nexthop in table 101) refused before attach verified"
 # Kernel forwarding in the router namespace: refused by default, warned
 # and accepted with --allow-kernel-forwarding.
 in_ns "$router" sysctl -qw net.ipv4.ip_forward=1
@@ -1017,6 +1078,261 @@ fi
 assert_detached "the run-time per-port forwarding run"
 echo "priv_run_forwarding_device: conf/ra/forwarding=1 with ip_forward=0 refused at startup" \
     "(scope=device), warned on if1 only and recovered while running verified"
+
+# ipv6: every phase so far ran with disable_ipv6=1 on the ports (the
+# recommended setup, set before the first phase). IPv6 enabled on a port
+# is refused unless --allow-kernel-ipv6; the more specific codes come
+# first, so each is asserted on its own.
+set_ipv6() {
+    # $1 ra|rb, $2 on|off
+    case $2 in on) value=0 ;; *) value=1 ;; esac
+    in_ns "$router" sysctl -qw "net.ipv6.conf.$1.disable_ipv6=$value"
+}
+# Waits (10 s) until $work/$1.err holds the fixed text $2 at least $3 times.
+wait_count() {
+    tries=0
+    while [ "$(grep -cF -- "$2" "$work/$1.err")" -lt "$3" ]; do
+        launcher_alive || fail "$1: exited while waiting for $3 x: $2"
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "$1: fewer than $3 \"$2\" within 10 seconds"
+        sleep 0.05
+    done
+}
+refused_with() {
+    # $1 name, $2 expected failure text, extra args: options
+    name=$1
+    text=$2
+    shift 2
+    start_ruster "$name" "$work/router.toml" "$@"
+    wait_ruster
+    [ "$status" -eq 1 ] || fail "$name: exit status $status"
+    grep -qF "startup failed: stage=checks $text" "$work/$name.err" ||
+        fail "$name: wrong failure (want $text)"
+    assert_detached "the $name refusal"
+}
+set_ipv6 ra on
+refused_with ipv6-enabled "port=if1 code=KERNEL_IPV6_ENABLED"
+start_ruster ipv6-enabled-allowed "$work/router.toml" --allow-kernel-ipv6
+wait_ready ipv6-enabled-allowed || fail "ipv6-enabled-allowed: ruster exited during startup"
+grep -q "warning: port=if1 IPV6_ENABLED_ALLOWED" "$work/ipv6-enabled-allowed.err" ||
+    fail "ipv6-enabled-allowed: no startup warning"
+if grep -q "port=if2 IPV6" "$work/ipv6-enabled-allowed.err"; then
+    fail "ipv6-enabled-allowed: rb (IPv6 off) warned"
+fi
+wait_line ipv6-enabled-allowed "warning: port=if1 health=KERNEL_IPV6_ENABLED"
+forward_once ipv6-enabled-allowed
+signal_ruster TERM
+wait_ruster
+[ "$status" -eq 0 ] || fail "ipv6-enabled-allowed: exit status $status"
+grep -q "warning: kernel IPv6 is enabled on a port; detached ports may be answered by the kernel's IPv6 stack" \
+    "$work/ipv6-enabled-allowed.err" || fail "ipv6-enabled-allowed: no exit warning"
+assert_detached "the IPv6-enabled override run"
+echo "priv_run_ipv6_enabled: IPv6 on ra with only link-local refused (KERNEL_IPV6_ENABLED), accepted with warnings under --allow-kernel-ipv6 (forwarded, exit warning) verified"
+sudo -n ip -n "$router" -6 address add 2001:db8:1::1/64 dev ra nodad
+refused_with ipv6-address "port=if1 code=KERNEL_IPV6_ADDRESSES count=1"
+# --allow-kernel-forwarding is IPv4 only; --allow-kernel-ipv6 accepts it.
+refused_with ipv6-address-ipv4-override "port=if1 code=KERNEL_IPV6_ADDRESSES count=1" \
+    --allow-kernel-forwarding
+start_ruster ipv6-allowed "$work/router.toml" --allow-kernel-ipv6
+wait_ready ipv6-allowed || fail "ipv6-allowed: ruster exited during startup"
+for line in "IPV6_ENABLED_ALLOWED" "IPV6_ADDRESSES_ALLOWED count=1" "IPV6_ROUTES_ALLOWED count="; do
+    grep -qF "warning: port=if1 $line" "$work/ipv6-allowed.err" ||
+        fail "ipv6-allowed: no $line warning"
+done
+forward_once ipv6-allowed
+wait_line ipv6-allowed "warning: port=if1 health=KERNEL_IPV6_ADDRESSES"
+signal_ruster TERM
+wait_ruster
+[ "$status" -eq 0 ] || fail "ipv6-allowed: exit status $status"
+grep -q "warning: kernel IPv6 addresses are on a port; detached ports may be answered and routed by the kernel" \
+    "$work/ipv6-allowed.err" || fail "ipv6-allowed: no exit warning"
+assert_detached "the IPv6 override run"
+sudo -n ip -n "$router" -6 address del 2001:db8:1::1/64 dev ra
+echo "priv_run_ipv6_address: a global IPv6 address on ra refused (also under --allow-kernel-forwarding), accepted with warnings under --allow-kernel-ipv6 (forwarded, exit warning) verified"
+set_ipv6 ra off
+set_ipv6 rb on
+sudo -n ip -n "$router" -6 route add 2001:db8:99::/48 dev rb table 200
+refused_with ipv6-route "port=if2 code=KERNEL_IPV6_ROUTES count=1"
+sudo -n ip -n "$router" -6 route del 2001:db8:99::/48 dev rb table 200
+set_ipv6 rb off
+echo "priv_run_ipv6_route: an IPv6 route out of rb in table 200 refused verified"
+set_ipv6 ra on
+in_ns "$router" sysctl -qw net.ipv6.conf.all.forwarding=1
+refused_with ipv6-forwarding "port=if1 code=KERNEL_IPV6_FORWARDING_ENABLED scope=global"
+# disable_ipv6 on both ports: the kernel drops every IPv6 frame there, so
+# IPv6 forwarding no longer matters and the run starts without a word.
+set_ipv6 ra off
+start_ruster ipv6-disabled "$work/router.toml"
+wait_ready ipv6-disabled || fail "ipv6-disabled: ruster exited during startup"
+forward_once ipv6-disabled
+signal_ruster TERM
+wait_ruster
+[ "$status" -eq 0 ] || fail "ipv6-disabled: exit status $status"
+if grep -q "IPV6" "$work/ipv6-disabled.err"; then
+    fail "ipv6-disabled: an IPv6 warning with IPv6 disabled on the ports"
+fi
+assert_detached "the disabled-IPv6 run"
+in_ns "$router" sysctl -qw net.ipv6.conf.all.forwarding=0
+for dev in ra rb; do
+    [ "$(in_ns "$router" sysctl -n "net.ipv6.conf.$dev.forwarding")" = 0 ] ||
+        fail "ipv6: $dev forwarding is still on"
+done
+echo "priv_run_ipv6_forwarding: net.ipv6.conf.all.forwarding=1 refused (scope=global), accepted silently with disable_ipv6=1 on both ports verified"
+# force_forwarding (Linux 6.17+): forwards on the ingress device even with
+# conf/all/forwarding 0. Only an absent sysctl skips, and says so.
+if in_ns "$router" test -e /proc/sys/net/ipv6/conf/ra/force_forwarding; then
+    force_forwarding=yes
+    set_ipv6 ra on
+    in_ns "$router" sysctl -qw net.ipv6.conf.ra.force_forwarding=1
+    [ "$(in_ns "$router" sysctl -n net.ipv6.conf.ra.forwarding)" = 0 ] ||
+        fail "ipv6-force: conf/ra/forwarding is on"
+    refused_with ipv6-force "port=if1 code=KERNEL_IPV6_FORWARDING_ENABLED scope=force"
+    in_ns "$router" sysctl -qw net.ipv6.conf.ra.force_forwarding=0
+    set_ipv6 ra off
+    echo "priv_run_ipv6_force_forwarding: net.ipv6.conf.ra.force_forwarding=1 with all.forwarding=0 refused (scope=force) verified"
+else
+    force_forwarding=
+    echo "priv_run_ipv6_force_forwarding: SKIPPED (no net.ipv6.conf.ra.force_forwarding on this kernel; Linux 6.17+)"
+fi
+# While running (no override; both ports start with IPv6 off): each kind
+# warns and recovers, the router keeps forwarding, and nothing is fatal
+# (a fatal exit would detach).
+start_ruster ipv6-runtime "$work/router.toml"
+wait_ready ipv6-runtime || fail "ipv6-runtime: ruster exited during startup"
+set_ipv6 ra on
+wait_line ipv6-runtime "warning: port=if1 health=KERNEL_IPV6_ENABLED"
+sudo -n ip -n "$router" -6 address add 2001:db8:2::1/64 dev ra nodad
+wait_line ipv6-runtime "warning: port=if1 health=KERNEL_IPV6_ADDRESSES"
+wait_line ipv6-runtime "warning: port=if1 health=KERNEL_IPV6_ROUTES"
+forward_once ipv6-runtime-address
+sudo -n ip -n "$router" -6 address del 2001:db8:2::1/64 dev ra
+wait_line ipv6-runtime "recovered: port=if1 health=KERNEL_IPV6_ADDRESSES"
+wait_line ipv6-runtime "recovered: port=if1 health=KERNEL_IPV6_ROUTES"
+forwarding_warnings=0
+if [ -n "$force_forwarding" ]; then
+    in_ns "$router" sysctl -qw net.ipv6.conf.ra.force_forwarding=1
+    wait_count ipv6-runtime "warning: port=if1 health=KERNEL_IPV6_FORWARDING_ENABLED" 1
+    in_ns "$router" sysctl -qw net.ipv6.conf.ra.force_forwarding=0
+    wait_count ipv6-runtime "recovered: port=if1 health=KERNEL_IPV6_FORWARDING_ENABLED" 1
+    forwarding_warnings=1
+fi
+sudo -n ip -n "$router" route add 10.95.0.0/16 dev rb table 300
+wait_line ipv6-runtime "warning: port=if2 health=KERNEL_IPV4_ROUTES"
+sudo -n ip -n "$router" route del 10.95.0.0/16 dev rb table 300
+wait_line ipv6-runtime "recovered: port=if2 health=KERNEL_IPV4_ROUTES"
+in_ns "$router" sysctl -qw net.ipv6.conf.all.forwarding=1
+wait_count ipv6-runtime "warning: port=if1 health=KERNEL_IPV6_FORWARDING_ENABLED" $((forwarding_warnings + 1))
+forward_once ipv6-runtime-forwarding
+set_ipv6 ra off
+wait_line ipv6-runtime "recovered: port=if1 health=KERNEL_IPV6_ENABLED"
+wait_count ipv6-runtime "recovered: port=if1 health=KERNEL_IPV6_FORWARDING_ENABLED" $((forwarding_warnings + 1))
+set_ipv6 rb on
+wait_line ipv6-runtime "warning: port=if2 health=KERNEL_IPV6_ENABLED"
+wait_line ipv6-runtime "warning: port=if2 health=KERNEL_IPV6_FORWARDING_ENABLED"
+signal_ruster TERM
+wait_ruster
+[ "$status" -eq 0 ] || fail "ipv6-runtime: exit status $status"
+if grep -q "fatal:" "$work/ipv6-runtime.err"; then
+    fail "ipv6-runtime: a fatal event"
+fi
+if grep -q "recovered: port=if2 health=KERNEL_IPV6" "$work/ipv6-runtime.err"; then
+    fail "ipv6-runtime: rb recovered although its IPv6 stayed on"
+fi
+for line in "kernel IPv6 forwarding is enabled for a port; detached ports may be forwarded by the kernel" \
+    "kernel IPv6 is enabled on a port; detached ports may be answered by the kernel's IPv6 stack"; do
+    grep -qF "warning: $line" "$work/ipv6-runtime.err" || fail "ipv6-runtime: no exit warning: $line"
+done
+if grep -q "warning: kernel IPv4 routes lead out of a port" "$work/ipv6-runtime.err"; then
+    fail "ipv6-runtime: an exit warning for a route that was removed"
+fi
+assert_detached "the run-time IPv6 run"
+in_ns "$router" sysctl -qw net.ipv6.conf.all.forwarding=0
+# Back to the recommended setup for the remaining phases.
+set_ipv6 rb off
+echo "priv_run_ipv6_runtime: disable_ipv6 flipped to 0, a global IPv6 address and its route, force_forwarding (${force_forwarding:-skipped}), an IPv4 route in table 300, and IPv6 forwarding warned and recovered while forwarding (disable_ipv6 on ra recovered if1 only), no fatal, exit warnings for rb verified"
+
+# weakhost: an effective rp_filter of 0 on an address-less port is only
+# warned (an owner decision whether to refuse), at startup and while
+# running, also with arp_ignore=1 (which stops ARP replies only: a frame
+# sent to the port's MAC for any host address is still delivered). The
+# setup's all.rp_filter=1 avoids it; strict (1) or loose (2) recovers.
+for dev in all ra rb; do
+    in_ns "$router" sysctl -qw "net.ipv4.conf.$dev.rp_filter=0"
+done
+[ "$(in_ns "$router" sysctl -n net.ipv4.conf.all.arp_ignore)" = 1 ] ||
+    fail "weakhost: all.arp_ignore is not 1"
+start_ruster weakhost "$work/router.toml"
+wait_ready weakhost || fail "weakhost: ruster exited during startup"
+grep -q "warning: port=if1 IPV4_WEAK_HOST_EXPOSURE" "$work/weakhost.err" ||
+    fail "weakhost: no startup warning with arp_ignore=1"
+wait_line weakhost "warning: port=if2 health=IPV4_WEAK_HOST_EXPOSURE"
+in_ns "$router" sysctl -qw net.ipv4.conf.all.rp_filter=2
+wait_line weakhost "recovered: port=if2 health=IPV4_WEAK_HOST_EXPOSURE"
+forward_once weakhost
+in_ns "$router" sysctl -qw net.ipv4.conf.all.rp_filter=0
+wait_count weakhost "warning: port=if2 health=IPV4_WEAK_HOST_EXPOSURE" 2
+in_ns "$router" sysctl -qw net.ipv4.conf.all.rp_filter=1
+wait_count weakhost "recovered: port=if2 health=IPV4_WEAK_HOST_EXPOSURE" 2
+signal_ruster TERM
+wait_ruster
+[ "$status" -eq 0 ] || fail "weakhost: exit status $status"
+if grep -q "fatal:" "$work/weakhost.err"; then
+    fail "weakhost: a fatal event"
+fi
+assert_detached "the weak-host run"
+echo "priv_run_weak_host: effective rp_filter=0 warned at startup and while running although arp_ignore=1, recovered with rp_filter=2 and with 1, never refused verified"
+
+# mc_forwarding: a multicast routing socket (MRT_INIT) sets IPv4
+# conf/all/mc_forwarding=1 while it is open: refused (scope=multicast)
+# unless --allow-kernel-forwarding. Without kernel multicast routing the
+# step says it is skipped.
+mroute_stop="$work/mroute.stop"
+rm -f "$work/mroute.ready" "$mroute_stop"
+in_ns "$router" python3 -I -c '
+import os, socket, sys, time
+try:
+    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IGMP)
+    s.setsockopt(socket.IPPROTO_IP, 200, (1).to_bytes(4, "little"))  # MRT_INIT
+except OSError as error:
+    open(sys.argv[1], "w").write("skip %d\n" % error.errno)
+    sys.exit(0)
+open(sys.argv[1], "w").write("ready\n")
+deadline = time.monotonic() + 120
+while not os.path.exists(sys.argv[2]) and time.monotonic() < deadline:
+    time.sleep(0.05)
+' "$work/mroute.ready" "$mroute_stop" &
+mroute=$!
+tries=0
+while [ ! -s "$work/mroute.ready" ]; do
+    tries=$((tries + 1))
+    [ "$tries" -le 200 ] || fail "mroute: holder not ready"
+    sleep 0.05
+done
+if grep -q ready "$work/mroute.ready"; then
+    [ "$(in_ns "$router" sysctl -n net.ipv4.conf.all.mc_forwarding)" = 1 ] ||
+        fail "mroute: mc_forwarding is not 1"
+    refused_with mc-forwarding "port=if1 code=KERNEL_FORWARDING_ENABLED scope=multicast"
+    start_ruster mc-forwarding-allowed "$work/router.toml" --allow-kernel-forwarding
+    wait_ready mc-forwarding-allowed || fail "mc-forwarding-allowed: ruster exited during startup"
+    grep -q "warning: port=if1 IPV4_FORWARDING_ENABLED scope=multicast" "$work/mc-forwarding-allowed.err" ||
+        fail "mc-forwarding-allowed: no warning"
+    wait_line mc-forwarding-allowed "warning: port=if1 health=KERNEL_FORWARDING_ENABLED"
+    : >"$mroute_stop"
+    wait "$mroute" || true
+    mroute=
+    wait_line mc-forwarding-allowed "recovered: port=if1 health=KERNEL_FORWARDING_ENABLED"
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "mc-forwarding-allowed: exit status $status"
+    assert_detached "the mc_forwarding override run"
+    echo "priv_run_mc_forwarding: an IPv4 multicast routing socket (all/mc_forwarding=1) refused (scope=multicast), accepted with --allow-kernel-forwarding, warned and recovered while running verified"
+else
+    : >"$mroute_stop"
+    wait "$mroute" || true
+    mroute=
+    echo "priv_run_mc_forwarding: SKIPPED (MRT_INIT failed: $(cat "$work/mroute.ready"))"
+fi
+rm -f "$mroute_stop"
 
 # stuck: an undrained stdout must not keep the process alive.
 mkfifo "$work/stuck.fifo"

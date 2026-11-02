@@ -43,20 +43,27 @@
 //! | link down (`IFF_UP` or `IFF_LOWER_UP` clear) | warning `LINK_DOWN`, counted; the router keeps running and owed TX kicks resume when the link returns (recovered `LINK_DOWN`) |
 //! | the link query fails | warning `LINK_PROBE`; fatal `LINK_UNVERIFIABLE` after [`LINK_PROBE_FAILURES_FATAL`] failures in a row |
 //! | a kernel IPv4 address appears on the port (rtnetlink `RTM_GETADDR`, same round) | warning `KERNEL_IPV4_ADDRESSES`, recovered when gone; not fatal (see below); a failed address dump counts as a failed query |
+//! | a kernel IPv4 route out of the port appears in any table (rtnetlink `RTM_GETROUTE`, same round) | warning `KERNEL_IPV4_ROUTES`, recovered when gone; not fatal; a failed route dump counts as a failed query |
 //! | `net.ipv4.ip_forward` or `conf/<dev>/forwarding` turns on (procfs, same round) | warning `KERNEL_FORWARDING_ENABLED`, recovered when off; not fatal (see below) |
 //! | a forwarding sysctl is unreadable | a failed query (fatal after [`LINK_PROBE_FAILURES_FATAL`] in a row); with `--allow-kernel-forwarding` a warning `FORWARDING_UNVERIFIABLE` |
+//! | IPv4 `mc_forwarding` (of `all` or the device) turns on | counted with the forwarding sysctls: warning `KERNEL_FORWARDING_ENABLED` |
+//! | the effective `rp_filter` (the larger of `all` and the device) is 0, or unreadable | warning `IPV4_WEAK_HOST_EXPOSURE`, recovered when it is 1 or 2; never fatal, never a failed query |
+//! | `disable_ipv6` is 0 on the port (also when it flips while running) | warning `KERNEL_IPV6_ENABLED`, recovered when it is 1 again; not fatal |
+//! | with IPv6 enabled on the port: an IPv6 address outside `fe80::/10`, an IPv6 route out of the port beyond the automatic link-local and multicast ones, `net.ipv6.conf.all.forwarding`, `conf/<dev>/forwarding`, a `force_forwarding`, or an IPv6 `mc_forwarding` on | warnings `KERNEL_IPV6_ADDRESSES`, `KERNEL_IPV6_ROUTES`, `KERNEL_IPV6_FORWARDING_ENABLED`, each recovered when gone (or when `disable_ipv6` turns on); not fatal |
+//! | an IPv6 fact is unreadable (`disable_ipv6`/forwarding sysctls, address or route dump) | a failed query of its kind; with `--allow-kernel-ipv6` a warning `IPV6_UNVERIFIABLE` instead |
 //!
-//! Kernel forwarding and port addresses found at run time only warn: while
-//! XDP is attached the kernel sees none of the ports' frames, so they change
-//! nothing, and a fatal exit would detach XDP, which is exactly what lets
-//! the kernel forward around the firewall (and the supervised restart
-//! would then refuse to start). The next startup still refuses both, and
-//! every exit prints a warning line if the last round saw either. The
-//! failed-query fatal (`LINK_UNVERIFIABLE`) remains: losing observability
-//! of the ports fails closed by stopping, which also detaches.
+//! Kernel forwarding, port addresses, and routes found at run time only
+//! warn: while XDP is attached the kernel sees none of the ports' frames,
+//! so they change nothing, and a fatal exit would detach XDP, which is
+//! exactly what lets the kernel forward around the firewall (and the
+//! supervised restart would then refuse to start). The next startup still
+//! refuses them, and every exit prints a warning line for each kind the
+//! last round saw. The failed-query fatal (`LINK_UNVERIFIABLE`) remains:
+//! losing observability of the ports fails closed by stopping, which also
+//! detaches.
 //!
-//! The link query, the address dump, and the forwarding read each count
-//! their own consecutive failures, so one query that succeeds every round
+//! The link query, each dump, and the forwarding reads each count their
+//! own consecutive failures, so one query that succeeds every round
 //! cannot keep another that fails every round from becoming fatal.
 //!
 //! A fatal event ends the run loop; the shutdown then drains, detaches,
@@ -68,6 +75,57 @@ use ruster_core::{FieldValue, FieldVisitor, IfId, MonotonicMillis, ObservableFie
 
 use super::checks::mtu_limit;
 use super::netlink::{LinkFacts, NetlinkError};
+
+/// The kernel IPv6 facts of one port in one link round.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ipv6Sample {
+    /// `conf/<dev>/disable_ipv6` (`Ok(true)` also without IPv6 in the
+    /// namespace); `Err` if unreadable. When `Ok(true)` the other fields
+    /// are not read and do not matter.
+    pub disabled: Result<bool, ()>,
+    /// IPv6 addresses outside `fe80::/10` on the port.
+    pub addresses: Result<u32, NetlinkError>,
+    /// IPv6 routes out of the port (without the automatic link-local and
+    /// multicast ones).
+    pub routes: Result<u32, NetlinkError>,
+    /// `net.ipv6.conf.all.forwarding` and `conf/<dev>/forwarding`.
+    pub forwarding: Result<Forwarding, ()>,
+}
+
+impl Ipv6Sample {
+    /// IPv6 off on the port: nothing else was read.
+    pub const DISABLED: Self = Self {
+        disabled: Ok(true),
+        addresses: Ok(0),
+        routes: Ok(0),
+        forwarding: Ok(Forwarding {
+            global: false,
+            device: false,
+            force: false,
+            multicast: false,
+        }),
+    };
+}
+
+/// What the last link round saw on any port, printed at every exit:
+/// once the ports are detached the kernel may act on them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KernelExposure {
+    /// Kernel IPv4 forwarding on.
+    pub forwarding: bool,
+    /// Kernel IPv4 addresses on a port.
+    pub addresses: bool,
+    /// Kernel IPv4 routes out of a port.
+    pub routes: bool,
+    /// Kernel IPv6 forwarding on for a port with IPv6 enabled.
+    pub ipv6_forwarding: bool,
+    /// Kernel IPv6 addresses (not link-local) on a port.
+    pub ipv6_addresses: bool,
+    /// Kernel IPv6 routes out of a port.
+    pub ipv6_routes: bool,
+    /// IPv6 enabled on a port (`disable_ipv6 = 0`).
+    pub ipv6_enabled: bool,
+}
 
 /// Minimum interval between backend health samples.
 pub const HEALTH_INTERVAL_MS: u64 = 500;
@@ -141,19 +199,35 @@ pub enum Query {
     Link = 0,
     Addresses = 1,
     Forwarding = 2,
+    Routes = 3,
+    /// `disable_ipv6` and the IPv6 forwarding sysctls (procfs).
+    Ipv6Sysctls = 4,
+    Ipv6Addresses = 5,
+    Ipv6Routes = 6,
 }
 
 impl Query {
-    const COUNT: usize = 3;
+    const COUNT: usize = 7;
 }
 
 /// The two kernel IPv4 forwarding sysctls of one port.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Forwarding {
-    /// `net.ipv4.ip_forward`.
+    /// `net.ipv4.ip_forward` (IPv6: `conf/all/forwarding`).
     pub global: bool,
-    /// `net.ipv4.conf.<dev>.forwarding`.
+    /// `conf/<dev>/forwarding`.
     pub device: bool,
+    /// IPv6 only: `force_forwarding` of the device or `all`.
+    pub force: bool,
+    /// `mc_forwarding` of the device or `all`.
+    pub multicast: bool,
+}
+
+impl Forwarding {
+    /// Any of them on.
+    pub const fn on(self) -> bool {
+        self.global || self.device || self.force || self.multicast
+    }
 }
 
 /// What the link watch checks one port against (fixed at startup).
@@ -183,6 +257,21 @@ pub enum Condition {
     KernelIpv4Addresses,
     /// A forwarding sysctl is unreadable under `--allow-kernel-forwarding`.
     ForwardingUnverifiable,
+    /// A kernel IPv4 route out of the port appeared while attached.
+    KernelIpv4Routes,
+    /// A kernel IPv6 address (not link-local) appeared while attached.
+    KernelIpv6Addresses,
+    /// A kernel IPv6 route out of the port appeared while attached.
+    KernelIpv6Routes,
+    /// Kernel IPv6 forwarding turned on for the port while attached.
+    KernelIpv6ForwardingEnabled,
+    /// An IPv6 fact is unreadable under `--allow-kernel-ipv6`.
+    Ipv6Unverifiable,
+    /// IPv6 is enabled on the port (`disable_ipv6 = 0`).
+    KernelIpv6Enabled,
+    /// The address-less port has the effective `rp_filter` 0 (or
+    /// unreadable): weak-host exposure once detached.
+    Ipv4WeakHost,
 }
 
 impl Condition {
@@ -197,6 +286,13 @@ impl Condition {
             Self::KernelForwardingEnabled => "KERNEL_FORWARDING_ENABLED",
             Self::KernelIpv4Addresses => "KERNEL_IPV4_ADDRESSES",
             Self::ForwardingUnverifiable => "FORWARDING_UNVERIFIABLE",
+            Self::KernelIpv4Routes => "KERNEL_IPV4_ROUTES",
+            Self::KernelIpv6Addresses => "KERNEL_IPV6_ADDRESSES",
+            Self::KernelIpv6Routes => "KERNEL_IPV6_ROUTES",
+            Self::KernelIpv6ForwardingEnabled => "KERNEL_IPV6_FORWARDING_ENABLED",
+            Self::Ipv6Unverifiable => "IPV6_UNVERIFIABLE",
+            Self::KernelIpv6Enabled => "KERNEL_IPV6_ENABLED",
+            Self::Ipv4WeakHost => "IPV4_WEAK_HOST_EXPOSURE",
         }
     }
 }
@@ -298,6 +394,13 @@ struct PortWatch {
     forwarding_warned: bool,
     forwarding_unreadable_warned: bool,
     addresses_warned: bool,
+    routes_warned: bool,
+    ipv6_addresses_warned: bool,
+    ipv6_routes_warned: bool,
+    ipv6_forwarding_warned: bool,
+    ipv6_unverifiable_warned: bool,
+    ipv6_enabled_warned: bool,
+    weak_host_warned: bool,
     counters: PortHealth,
 }
 
@@ -318,6 +421,21 @@ pub struct PortHealth {
     pub kernel_ipv4_addresses: u32,
     /// A kernel forwarding sysctl read 1 in the last round.
     pub kernel_forwarding: bool,
+    /// Kernel IPv4 routes out of the port seen by the last route dump.
+    pub kernel_ipv4_routes: u32,
+    /// Kernel IPv6 addresses (not link-local) seen by the last dump; 0
+    /// while IPv6 is disabled on the port.
+    pub kernel_ipv6_addresses: u32,
+    /// Kernel IPv6 routes out of the port seen by the last dump.
+    pub kernel_ipv6_routes: u32,
+    /// A kernel IPv6 forwarding sysctl read 1 for a port with IPv6
+    /// enabled in the last round.
+    pub kernel_ipv6_forwarding: bool,
+    /// IPv6 was enabled on the port (`disable_ipv6 = 0`) in the last round.
+    pub kernel_ipv6_enabled: bool,
+    /// The last round saw the effective `rp_filter` 0 (or
+    /// unreadable).
+    pub ipv4_weak_host: bool,
     pub warnings: u64,
 }
 
@@ -359,6 +477,36 @@ impl ObservableFields for PortHealth {
             "kernel_forwarding",
             FieldValue::Flag(self.kernel_forwarding),
         );
+        visitor.field(
+            SECTION,
+            "kernel_ipv4_routes",
+            FieldValue::Count(u64::from(self.kernel_ipv4_routes)),
+        );
+        visitor.field(
+            SECTION,
+            "kernel_ipv6_addresses",
+            FieldValue::Count(u64::from(self.kernel_ipv6_addresses)),
+        );
+        visitor.field(
+            SECTION,
+            "kernel_ipv6_routes",
+            FieldValue::Count(u64::from(self.kernel_ipv6_routes)),
+        );
+        visitor.field(
+            SECTION,
+            "kernel_ipv6_forwarding",
+            FieldValue::Flag(self.kernel_ipv6_forwarding),
+        );
+        visitor.field(
+            SECTION,
+            "kernel_ipv6_enabled",
+            FieldValue::Flag(self.kernel_ipv6_enabled),
+        );
+        visitor.field(
+            SECTION,
+            "ipv4_weak_host",
+            FieldValue::Flag(self.ipv4_weak_host),
+        );
         visitor.field(SECTION, "warnings", FieldValue::Count(self.warnings));
     }
 }
@@ -369,6 +517,8 @@ pub struct Watch {
     thresholds: Thresholds,
     /// `--allow-kernel-forwarding`: forwarding at run time only warns.
     allow_kernel_forwarding: bool,
+    /// `--allow-kernel-ipv6`: unreadable IPv6 facts only warn.
+    allow_kernel_ipv6: bool,
     last_health: Option<MonotonicMillis>,
     last_link: Option<MonotonicMillis>,
 }
@@ -394,6 +544,13 @@ impl Watch {
                     forwarding_warned: false,
                     forwarding_unreadable_warned: false,
                     addresses_warned: false,
+                    routes_warned: false,
+                    ipv6_addresses_warned: false,
+                    ipv6_routes_warned: false,
+                    ipv6_forwarding_warned: false,
+                    ipv6_unverifiable_warned: false,
+                    ipv6_enabled_warned: false,
+                    weak_host_warned: false,
                     counters: PortHealth {
                         link_up: true,
                         mtu: target.mtu,
@@ -403,6 +560,7 @@ impl Watch {
                 .collect(),
             thresholds,
             allow_kernel_forwarding: false,
+            allow_kernel_ipv6: false,
             last_health: None,
             last_link: None,
         }
@@ -413,6 +571,14 @@ impl Watch {
     #[must_use]
     pub const fn allowing_kernel_forwarding(mut self, allowed: bool) -> Self {
         self.allow_kernel_forwarding = allowed;
+        self
+    }
+
+    /// Unreadable IPv6 facts at run time warn instead of counting as
+    /// failed queries (`--allow-kernel-ipv6`).
+    #[must_use]
+    pub const fn allowing_kernel_ipv6(mut self, allowed: bool) -> Self {
+        self.allow_kernel_ipv6 = allowed;
         self
     }
 
@@ -447,22 +613,34 @@ impl Watch {
                 || port.forwarding_warned
                 || port.forwarding_unreadable_warned
                 || port.addresses_warned
+                || port.routes_warned
+                || port.ipv6_addresses_warned
+                || port.ipv6_routes_warned
+                || port.ipv6_forwarding_warned
+                || port.ipv6_unverifiable_warned
+                || port.ipv6_enabled_warned
+                || port.weak_host_warned
         })
     }
 
-    /// What the last link round saw on any port: kernel forwarding on, and
-    /// kernel IPv4 addresses on a port. Printed at every exit, because
-    /// once the ports are detached the kernel may act on them.
-    pub fn kernel_exposure(&self) -> (bool, bool) {
-        let forwarding = self
-            .ports
+    /// What the last link round saw on any port ([`KernelExposure`]).
+    /// Printed at every exit, because once the ports are detached the
+    /// kernel may act on them.
+    pub fn kernel_exposure(&self) -> KernelExposure {
+        self.ports
             .iter()
-            .any(|port| port.counters.kernel_forwarding);
-        let addresses = self
-            .ports
-            .iter()
-            .any(|port| port.counters.kernel_ipv4_addresses != 0);
-        (forwarding, addresses)
+            .fold(KernelExposure::default(), |seen, port| {
+                let health = &port.counters;
+                KernelExposure {
+                    forwarding: seen.forwarding || health.kernel_forwarding,
+                    addresses: seen.addresses || health.kernel_ipv4_addresses != 0,
+                    routes: seen.routes || health.kernel_ipv4_routes != 0,
+                    ipv6_forwarding: seen.ipv6_forwarding || health.kernel_ipv6_forwarding,
+                    ipv6_addresses: seen.ipv6_addresses || health.kernel_ipv6_addresses != 0,
+                    ipv6_routes: seen.ipv6_routes || health.kernel_ipv6_routes != 0,
+                    ipv6_enabled: seen.ipv6_enabled || health.kernel_ipv6_enabled,
+                }
+            })
     }
 
     /// Health fields of each port, in `IfId` order.
@@ -514,6 +692,55 @@ impl Watch {
     ) {
         if let Some(port) = self.ports.get_mut(index) {
             port.addresses(result, emit);
+        }
+    }
+
+    /// Folds the kernel IPv4 route count of port `index` (rtnetlink
+    /// `RTM_GETROUTE` of every table, after a successful link query of the
+    /// same round): a counted warning while nonzero, a failed dump is a
+    /// failed query.
+    pub fn on_ipv4_routes(
+        &mut self,
+        index: usize,
+        result: Result<u32, NetlinkError>,
+        emit: &mut impl FnMut(WatchEvent),
+    ) {
+        if let Some(port) = self.ports.get_mut(index) {
+            port.ipv4_routes(result, emit);
+        }
+    }
+
+    /// Folds the IPv4 weak-host reading of port `index` (`Some(true)`:
+    /// the effective `rp_filter` 0; `None`: unreadable): a warning
+    /// `IPV4_WEAK_HOST_EXPOSURE` unless `Some(false)`, recovered then.
+    /// Never fatal and never a failed query: it is advice, not a check.
+    pub fn on_weak_host(
+        &mut self,
+        index: usize,
+        exposed: Option<bool>,
+        emit: &mut impl FnMut(WatchEvent),
+    ) {
+        if let Some(port) = self.ports.get_mut(index) {
+            let on = exposed != Some(false);
+            port.counters.ipv4_weak_host = on;
+            port.exposure(
+                |port| &mut port.weak_host_warned,
+                Condition::Ipv4WeakHost,
+                on,
+                emit,
+            );
+        }
+    }
+
+    /// Folds the kernel IPv6 facts of port `index` in this round (after a
+    /// successful link query): with IPv6 disabled on the port nothing is
+    /// exposed; otherwise addresses, routes, and forwarding are counted
+    /// warnings, and an unreadable fact is a failed query of its kind
+    /// unless `--allow-kernel-ipv6` (then a warning `IPV6_UNVERIFIABLE`).
+    pub fn on_ipv6(&mut self, index: usize, sample: Ipv6Sample, emit: &mut impl FnMut(WatchEvent)) {
+        let allowed = self.allow_kernel_ipv6;
+        if let Some(port) = self.ports.get_mut(index) {
+            port.ipv6(sample, allowed, emit);
         }
     }
 
@@ -709,6 +936,116 @@ impl PortWatch {
         }
     }
 
+    /// A warning while `on` (once per episode) that recovers when it goes
+    /// off; `flag` selects the condition's warned bit.
+    fn exposure(
+        &mut self,
+        flag: fn(&mut Self) -> &mut bool,
+        condition: Condition,
+        on: bool,
+        emit: &mut impl FnMut(WatchEvent),
+    ) {
+        let warned = *flag(self);
+        if on && !warned {
+            *flag(self) = true;
+            self.warn(condition, emit);
+        } else if !on && warned {
+            *flag(self) = false;
+            self.recover(condition, emit);
+        }
+    }
+
+    /// Kernel IPv4 routes out of the port while attached: like
+    /// [`Self::addresses`].
+    fn ipv4_routes(
+        &mut self,
+        result: Result<u32, NetlinkError>,
+        emit: &mut impl FnMut(WatchEvent),
+    ) {
+        match result {
+            Ok(count) => {
+                self.probe_ok(Query::Routes, emit);
+                self.counters.kernel_ipv4_routes = count;
+                self.exposure(
+                    |port| &mut port.routes_warned,
+                    Condition::KernelIpv4Routes,
+                    count != 0,
+                    emit,
+                );
+            }
+            Err(_) => self.probe_failed(Query::Routes, emit),
+        }
+    }
+
+    /// The kernel IPv6 facts of this round (see [`Watch::on_ipv6`]).
+    fn ipv6(&mut self, sample: Ipv6Sample, allowed: bool, emit: &mut impl FnMut(WatchEvent)) {
+        let sample = if sample.disabled == Ok(true) {
+            Ipv6Sample::DISABLED
+        } else {
+            sample
+        };
+        let sysctls = sample.disabled.and(sample.forwarding);
+        if let Ok(disabled) = sample.disabled {
+            self.counters.kernel_ipv6_enabled = !disabled;
+            self.exposure(
+                |port| &mut port.ipv6_enabled_warned,
+                Condition::KernelIpv6Enabled,
+                !disabled,
+                emit,
+            );
+        }
+        let mut unreadable = false;
+        for (query, ok) in [
+            (Query::Ipv6Sysctls, sysctls.is_ok()),
+            (Query::Ipv6Addresses, sample.addresses.is_ok()),
+            (Query::Ipv6Routes, sample.routes.is_ok()),
+        ] {
+            if ok {
+                self.probe_ok(query, emit);
+            } else if allowed {
+                unreadable = true;
+            } else {
+                self.probe_failed(query, emit);
+            }
+        }
+        if let Ok(count) = sample.addresses {
+            self.counters.kernel_ipv6_addresses = count;
+            self.exposure(
+                |port| &mut port.ipv6_addresses_warned,
+                Condition::KernelIpv6Addresses,
+                count != 0,
+                emit,
+            );
+        }
+        if let Ok(count) = sample.routes {
+            self.counters.kernel_ipv6_routes = count;
+            self.exposure(
+                |port| &mut port.ipv6_routes_warned,
+                Condition::KernelIpv6Routes,
+                count != 0,
+                emit,
+            );
+        }
+        if let Ok(forwarding) = sysctls {
+            let on = forwarding.on();
+            self.counters.kernel_ipv6_forwarding = on;
+            self.exposure(
+                |port| &mut port.ipv6_forwarding_warned,
+                Condition::KernelIpv6ForwardingEnabled,
+                on,
+                emit,
+            );
+        }
+        if allowed {
+            self.exposure(
+                |port| &mut port.ipv6_unverifiable_warned,
+                Condition::Ipv6Unverifiable,
+                unreadable,
+                emit,
+            );
+        }
+    }
+
     /// Kernel forwarding turned on while attached: a counted warning, not
     /// fatal, for the same reason as [`Self::addresses`]. An unreadable
     /// sysctl is a failed query (lost observability) unless
@@ -725,7 +1062,7 @@ impl PortWatch {
                 if std::mem::take(&mut self.forwarding_unreadable_warned) {
                     self.recover(Condition::ForwardingUnverifiable, emit);
                 }
-                let on = forwarding.global || forwarding.device;
+                let on = forwarding.on();
                 self.counters.kernel_forwarding = on;
                 if on && !self.forwarding_warned {
                     self.forwarding_warned = true;
