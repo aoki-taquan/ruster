@@ -1039,21 +1039,41 @@ idle timeout of its phase:
 
 | phase | when | timeout (key, default) |
 |---|---|---|
-| opening | SYN and ACK not yet seen in both directions (also an external SYN the remote never completes) | `[nat44.tcp] opening-idle-ttl-ms`, 240000 (4 min) |
-| established | SYN and ACK seen both ways; a FIN in one direction keeps it here | `[nat44.tcp] idle-ttl-ms`, 7440000 (2 h 4 min) |
+| opening | a SYN, but ACK not yet seen in both directions (also an external SYN the remote never ACKs) | `[nat44.tcp] opening-idle-ttl-ms`, 240000 (4 min) |
+| established | ACK seen both ways after a SYN (RFC 5382 section 5); a FIN in one direction keeps it here | `[nat44.tcp] idle-ttl-ms`, 7440000 (2 h 4 min) |
 | closing | FIN seen both ways, or the last segment was a RST | `[nat44.tcp] closing-idle-ttl-ms`, 240000 (4 min) |
 
-Every translated segment restarts the timer of the session's phase. A RST
-never removes a session: it is translated and the session moves to the
-closing timeout; any later non-RST segment moves it back (RFC 7857 section
-2.2). An injected RST therefore cannot end a session sooner than the closing
-timeout, and live traffic undoes it. The router does not track TCP sequence
-numbers, so it accepts any RST that matches the exact connection (address
-and port pair). A mapping, with its public port, lives as long as its
-latest session: the established timeout while it has an established
-session, otherwise the longer transitory timeout after its last segment.
-After a clean close the port and the session slot are therefore free again
-after 4 minutes instead of 2 h 4 min.
+Every translated segment, a repeated RST included, restarts the timer of
+the session's phase. A RST never removes a session: it is translated and
+the session moves to the closing timeout; any later non-RST segment, a SYN
+included, moves it back (RFC 7857 section 2.2). An injected RST therefore
+cannot end a session sooner than the closing timeout, and live traffic
+undoes it. Only an inside host's new SYN on a connection closed by FIN in
+both directions starts it over as a new connection. The router does not
+track TCP sequence numbers, so it accepts any RST or FIN that matches the
+exact connection (address and port pair). A mapping, with its public port,
+lives as long as its latest session: the established timeout while it has
+an established session (also one that has expired but whose slot has not
+been reused yet; such a mapping can be live with no session left and then
+answers inbound segments with `drop.NAT44_TCP_SESSION_MISS`), otherwise
+the longer transitory timeout after its last segment. After a clean close
+the port and the session slot are therefore free again after 4 minutes
+instead of 2 h 4 min.
+
+Spoofed inbound segments (`[nat44.tcp] inbound-rst`). With the default
+`"closing"` (RFC 7857 section 2.2), an off-path attacker who guesses a
+connection's addresses and ports can move it to the closing timeout with a
+RST or a FIN, so it ends after 4 minutes idle, and can make a spoofed SYN
+look established by following it with blind ACKs, so that session holds a
+slot for 2 h 4 min. `inbound-rst = "corroborate"` (reloadable, `plan`
+shows `nat44-tcp inbound-rst ~ closing -> corroborate`) ignores inbound RSTs
+for the phase, closes on an inbound FIN that follows the inside FIN only
+after an outbound FIN or RST, and counts a connection as established only
+after the inside host sent an ACK without SYN. Its cost: a connection the
+inside host closes first keeps the established timeout, and an inbound
+connection on which the inside host sends nothing after its SYN-ACK keeps
+the opening timeout. No setting stops an attacker who keeps refreshing a
+session with spoofed segments.
 
 `validate` refuses an opening or closing timeout below 240000 (the RFC
 floor) or above `idle-ttl-ms` as `stage=validate code=NAT44_TCP_POLICY

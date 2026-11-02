@@ -606,27 +606,38 @@ SHOULDとし、§2.1はopeningとclosingのtimeoutを別々に設定可能にす
 変換しsessionを4分保ってから消すこと（MUST translate、SHOULD wait）を求めます。
 
 **State.** sessionは1 byteのstate（`nat44_tcp_state`）に方向別（outbound = inside→outside、
-inbound = outside→inside、hairpinは各halfの向き）のSYN/ACK/FINと「最後のcommitがRST」を持ち、
-phaseはその純関数です。
+inbound = outside→inside、hairpinは各halfの向き）のSYN/ACK/FIN、「RST pending」、
+`inbound-rst = "corroborate"`時の「未確認のinbound FIN」を持ち、phaseはその純関数です。
 
 | 条件（上から） | phase | idle TTL |
 |---|---|---|
-| RST pending、またはFINが両方向 | closing | `closing-idle-ttl-ms`（default 240000） |
-| SYNとACKが両方向 | established | `idle-ttl-ms`（default/minimum 7440000） |
+| RST pending、または（確認済みの）FINが両方向 | closing | `closing-idle-ttl-ms`（default 240000） |
+| ACKが両方向かつSYNが少なくとも一方向 | established | `idle-ttl-ms`（default/minimum 7440000） |
 | それ以外 | opening | `opening-idle-ttl-ms`（default 240000） |
 
 遷移はTX requestまで進んだcommitだけで行い（planはread-onlyでcopyを作るだけ）、RST segmentは
-RST bitだけを立てる（SYN/ACK/FINは記録しない）、非RST segmentはRST bitを消してSYN/ACK/FINを
-足す、closing phaseのsessionへのinitial SYNは記録を消してから足す（同じ5-tupleの新connection、
-RFC 1122 §4.2.2.13）、の三つです。establishedの判定はRFC 7857 Figure 1の「Server SYN」に加え
-RFC 5382 §5の「both endpoints have sent a packet with the ACK flag」も要求します。これにより
-outsideからの詐称SYNにinside hostがSYN-ACKを返してもremoteのACKが無い限りopeningのままで、
-quotaとsession slotを4分で手放します。blind attackerがACKまで詐称するとestablishedになり得ますが、
-inside hostは受理できないACKにRSTを返す（RFC 9293 SYN-RECEIVED）ためclosing TTLへ移ります。
+RST bitだけを立てる（SYN/ACK/FINは記録しない）、非RST segment（SYNも含む）はRST bitだけを消し
+flagを保ってSYN/ACK/FINを足す（RFC 6146 TRANS）、FIN両方向でclosingのsessionへの**outbound**
+initial SYNだけは記録を消してから足す（同じ5-tupleの新connection、RFC 1122 §4.2.2.13。inbound
+SYNは詐称できるのでrestartしない。restartしたsessionはoutbound開始として`external_inbound`を
+外す）、の三つです。
+
+establishedの判定はRFC 5382 §5の文言どおり「両endpointがACK flag付きpacketを送った」（SYNは
+どちらか一方向でよい）で、RFC 7857 Figure 1の「Server SYN」より弱い定義です。両方向のSYNを
+要求すると、注入RSTの後にremoteのSYNが来てinside hostがchallenge ACK（RFC 5961 §4）を返す列で、
+outbound SYNが二度と来ずestablishedのconnectionがopening TTLに落ちたままになりREQ-5のMUSTを
+破りました（review M1。RSTでのclosingはflagをresetしないことと合わせて修正）。outsideからの
+詐称SYNにinside hostがSYN-ACKを返すだけならremoteのACKが無いのでopeningのままです。ただし
+sequenceを見ないため、blind attackerが続けてACKを送り、insideが受理できないACKへ返すRST
+（RFC 9293 SYN-RECEIVED）の後にもう一度ACKを送ると、default policyではestablishedになり
+2時間4分残ります（review sec M2）。`inbound-rst = "corroborate"`はこれを閉じます（下の
+「Inbound corroboration」）。
 
 **Timers.** sessionの期限は最後のcommit時刻 + phaseのTTLで、どのphaseでもcommitごとにrefresh
-します（RFC 6146はFIN両方向の後にlifetimeを更新しないが、REQ-5の定義は「idle」時間なので、
-idleでないconnectionを4分で落とさない側を選ぶ）。期限の1 ms前はlive、期限ちょうどでexpired。
+します。RFC 6146からの意図的なdeviation（REQ-5の定義が「idle」時間なので、idleでない
+connectionを4分で落とさない側を選ぶ）: FIN両方向の後のsegmentも、TRANS（RST pending）中の
+繰り返しRSTもrefreshします（RFC 6146はどちらもlifetimeを更新しない）。期限の1 ms前はlive、
+期限ちょうどでexpired。
 validateはtransitoryの二つを4分未満（RFC 7857 §2.1はMAYで許すがREQ-5のMUSTとowner policy
 により拒否）とestablished超で`NAT44_TCP_POLICY`にします。
 
@@ -637,6 +648,21 @@ TTLへ移します。続くRSTはそのTTLをrefreshし、最初の非RST segmen
 closing TTLへの移行だけで、sessionをclosing TTLより早く消すことはできず、trafficが続けば元に
 戻ります。残るriskは5-tupleを当てた注入の後に4分以上idleなconnectionだけです。
 
+**Inbound corroboration（`inbound-rst`）.** owner policy（security関連はconfigurable）により
+`[nat44.tcp] inbound-rst`で選びます。default `closing`は上のRFC 7857 §2.2の挙動です。opt-inの
+`corroborate`では、詐称し得るinbound segmentだけではphaseをclosingへもestablishedへも進めません:
+inbound RSTは変換・forwardしますがphaseを変えません（outbound RSTはclosingへ）。outbound FINの
+後に来たinbound FINは「未確認」として記録し、outbound FINかRSTが続くまでclosingにしません
+（remoteが先にcloseした場合はinsideのFINがそのまま確認になる）。establishedに要るoutbound ACKは
+SYNを含まないsegmentに限ります（insideのSYN-ACKだけでは足りないので、上のblind spoofed
+handshakeはopeningのまま4分で切れる）。costは、insideが先にcloseしたconnection（FIN out、FIN in、
+ACK out）がestablished TTLで残ることと、inside hostがSYN-ACKの後に何も送らないinbound開始
+connectionがopening TTLで切れ得ること（REQ-5のestablished定義より厳しい）で、このため既定に
+しません。sequenceを見ない残余risk（NAT44-030の隣、requirements NAT44-088）: 5-tupleを当てた
+攻撃者はどのpolicyでもinbound segmentでsessionをrefreshし続けられ、`closing`ではRST/FIN注入で
+idleなconnectionを4分で落とせます。変更はreloadable（applyでNAT stateをflush）、planは
+`nat44-tcp inbound-rst ~ closing -> corroborate`のtyped deltaです。
+
 **Mapping lifetime.** mappingは`expires_ms`と同generationのestablished session数を持ちます。
 数はsessionがestablishedに入るcommitで増え、出るcommitと、expiredのestablished sessionのslotを
 別のsessionが再利用するcommitで減ります（再利用されるslotが同じmappingのものならplanのcopyで、
@@ -646,9 +672,15 @@ closing TTLへの移行だけで、sessionをclosing TTLより早く消すこと
 established期限がそれより後ならそのまま、でなければ後者です。どのsessionの期限も、そのsessionの
 最後のcommitで計算したmapping期限以下なので、mappingはどのsessionより先にexpireしません
 （下のsession再利用の正確性はこれに依存）。establishedが無くなればmappingとpublic portは最後の
-sessionと共に（transitory TTLの長い方の後に）空きます。establishedのsessionが別にある間に
-一つがcloseしても、mappingは最後のestablished commitから`idle-ttl-ms`まで残ります（保守側の
-近似。正確な最大値はmappingごとのsession listが要るため採らない）。
+sessionと共に（transitory TTLの長い方の後に）空きます。数はestablished phaseのoccupiedな
+session slotを数えるので、expiredでも未回収のestablished sessionは数に残ります。その間、また
+establishedのsessionが別にある間に一つがcloseしても、mappingは最後のestablished commitから
+`idle-ttl-ms`まで残ります（保守側の近似。正確な最大値はmappingごとのsession listが要るため
+採らない）。そのためmappingは全sessionが回収された後もliveであり得て（inboundは
+`NAT44_TCP_SESSION_MISS`）、「live mappingのactivityは最新sessionと一致する」はもう不変条件では
+ありません（index検査は「どのsessionもmappingより新しくない」に緩めた、review core L1）。数の
+driftはrelease buildでもfail closedです: 解放する数が足りないplanは`IndexCorrupt`、他mappingの
+expired established sessionを含まない数でのreclaimはcommit前の検査で`StalePlan`。
 
 **Lists.** sessionのactivity listはphaseごとに3本で、各listはTTLが一つなので最後のcommit順が
 期限順です。commitはsessionを旧phaseのlistから外して新phaseのlistの末尾へ置きます（時刻は単調）。
@@ -660,7 +692,7 @@ expireしたものを選ぶO(1)です（NAT44 bounded slot and port reuse）。
 
 **Config/plan.** `[nat44.tcp] opening-idle-ttl-ms`/`closing-idle-ttl-ms`（省略時240000）は
 `idle-ttl-ms`と同じくTCP policyで、変更はreloadable（applyで全NAT stateをflush）、planは
-`policy ~ changed`です。counterは`sessions_established`、`sessions_closed`（RSTでないFIN両方向）、
+`policy ~ changed`です（`inbound-rst`は上のtyped delta）。counterは`sessions_established`、`sessions_closed`（RSTでないFIN両方向）、
 `sessions_reset`（RST pendingでないsessionへのRST）、`sessions_expired_{opening,established,closing}`
 （再利用したexpired sessionの最後のphase、合計は`sessions_expired`）。
 
@@ -819,7 +851,7 @@ packetのsource addressだけで判定するため、off-pathの攻撃者がmapp
 remote address（広く使われるCDNやDNS serverのaddressなど）を詐称し、source portを変えたSYNを
 送れば同じことができます（requirements NAT44-041）。必要なのはmapping済みpublic portと、その
 mappingが話しているremote addressの推測です。この詐称で作られたsessionはopening TTL（default
-4分。N1以前は2時間4分）残り、同じ
+4分。N1以前は2時間4分。blindなACKまで送る適応的な攻撃者ならdefault policyでは2時間4分、下の「TCP per-remote inbound session limit」）残り、同じ
 `(mapping, remote IPv4)`のchainを伸ばしますが、上の16 node上限によりlookup costは増えず、16 node以内に
 live sessionが見つからないADF判定（同じkeyでも、bucketが衝突する別keyでも）が拒否側に倒れるだけです。M1のようにfirewallがoutside→insideの新規flowを
 許可しない構成では、NAT planはcommitされないためsessionは作られません。これに対する
@@ -865,14 +897,23 @@ sessionもidle TTL（default/minimum 2時間4分）が切れるまでliveのま�
 （2026-11-01: RFC baselineをdefault、security強化はopt-in）に従い、transitoryまたはFIN/RST-awareな
 timerができるまではdefaultを無制限としました。
 
-N1以降はcloseやRSTしたsessionはclosing TTL（default 4分）、remoteが完了しないSYN（詐称を含む）の
-sessionはopening TTL（default 4分）で数えなくなります。そこで上限8をdefaultにする案（requirements
-NAT44-086、提案でありowner決定ではない）: 8は「一つのremote IPv4から一つのmappingへの外部開始
-connectionで、まだ続いているか終わって4分以内のもの」が8本までという意味になり、正当な再接続は
-通常これを超えず、超えても4分で回復します。攻撃者は詐称SYN一本ごとに最大4分しかslotを持てず、
-ADFでは`8 × mappingが話しているremote数`が上限です。残るtrade-offは、同じremote IPv4から4分間に
-9本以上の短い外部開始connectionを受けるserverが拒否され得ることと、16 node walkの既存の制約です。
-決定まではdefaultは`0`のままです。
+N1以降はcloseやRSTしたsessionはclosing TTL（default 4分）、remoteがACKしないSYNだけの
+session（詐称SYNにinside hostがSYN-ACKを返すだけ）はopening TTL（default 4分）で数えなく
+なります。ただしsequenceを追跡しないため、これが効くのは非適応のSYN floodだけです（review sec
+M2）: 適応的なoff-path攻撃者が詐称SYNの後にblindなACKを送り、insideが受理できないACKに返すRSTの
+後にもう一度ACKを送れば、default（`inbound-rst = "closing"`）ではsessionはestablishedになり
+slotを2時間4分持ちます。`inbound-rst = "corroborate"`ではSYNを含まないoutbound ACKが要るので
+この列も4分で切れます。
+
+上限8をdefaultにする案（requirements NAT44-086、提案でありowner決定ではない）は両面を持ちます。
+利点: 正当な再接続は通常8本を超えず、超えても4分で回復し（以前は2時間4分）、ADFでは詐称で
+作れるsessionが`8 × mappingが話しているremote数`に抑えられる（1本の保持時間は上のとおり
+policyによって4分か2時間4分）。欠点: 上限はremote IPv4単位なので、off-pathの詐称者が正当な
+remote（CDN、利用者のpeer）のaddressで一つのmappingに8本作れば、そのremoteの本物のinbound
+connectionを拒否できる（targeted denial。defaultのpolicyでは最大2時間4分）。ほかに同じremote
+IPv4から4分間に9本以上の短い外部開始connectionを受けるserverが拒否され得ることと、16 node walkの
+既存の制約があります。上限0ではそのtargeted denialは無い代わりに詐称sessionがsession table
+全体を埋め得ます。決定まではdefaultは`0`のままです。
 
 dataは新たに増やしません。session slotに「外部SYNが作った」flag（`is_external_inbound`）を一つ
 持ち、数はSYNごとに既存のremote-address directory（key = mapping index/generation/epoch +
