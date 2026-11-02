@@ -172,6 +172,7 @@ impl Settings {
                 allow_multi_queue: args.allow_multi_queue,
                 allow_kernel_forwarding: args.allow_kernel_forwarding,
                 allow_kernel_ipv6: args.allow_kernel_ipv6,
+                allow_ipv4_weak_host: args.allow_ipv4_weak_host,
             },
             stats_interval_ms: args.stats_interval_secs.saturating_mul(1_000),
             drain_deadline_ms: DRAIN_DEADLINE_MS,

@@ -100,8 +100,11 @@
 #             IPv6 forwarding each warn and recover (disable_ipv6=1 on ra
 #             recovers if1 only), no fatal, exit warnings for rb
 #   weakhost  an effective rp_filter=0 (the setup sets all.rp_filter=1),
-#             also with arp_ignore=1, only warns IPV4_WEAK_HOST_EXPOSURE, at
-#             startup and while running, and recovers with rp_filter 2 or 1
+#             also with arp_ignore=1, is refused at startup
+#             (KERNEL_IPV4_WEAK_HOST, per port; CLI-079), accepted with the
+#             warning IPV4_WEAK_HOST_EXPOSURE under --allow-ipv4-weak-host;
+#             while running it only warns (with or without the override)
+#             and recovers with rp_filter 2 or 1
 #   mc_forwarding  an IPv4 multicast routing socket (MRT_INIT) makes
 #             all/mc_forwarding=1: refused (scope=multicast), accepted with
 #             --allow-kernel-forwarding, warned and recovered (SKIPPED with
@@ -237,8 +240,8 @@ done
 # forwarding off (refused by `ruster run` unless --allow-kernel-forwarding),
 # IPv6 off on every port device (refused unless --allow-kernel-ipv6; the
 # ipv6 phase turns it on where it tests that), IPv6 forwarding off, and
-# all.rp_filter=1 (otherwise IPV4_WEAK_HOST_EXPOSURE is warned; the
-# weakhost phase tests that) and all.arp_ignore=1 (advice: no ARP replies
+# all.rp_filter=1 (otherwise refused with KERNEL_IPV4_WEAK_HOST unless
+# --allow-ipv4-weak-host; the weakhost phase tests that) and all.arp_ignore=1 (advice: no ARP replies
 # for addresses the port does not hold).
 in_ns "$router" sysctl -qw net.ipv4.ip_forward=0
 in_ns "$router" sysctl -qw net.ipv6.conf.all.forwarding=0
@@ -1309,17 +1312,28 @@ in_ns "$router" sysctl -qw net.ipv6.conf.all.forwarding=0
 set_ipv6 rb off
 echo "priv_run_ipv6_runtime: disable_ipv6 flipped to 0, a global IPv6 address and its route, force_forwarding (${force_forwarding:-skipped}), an IPv4 route in table 300, and IPv6 forwarding warned and recovered while forwarding (disable_ipv6 on ra recovered if1 only), no fatal, exit warnings for rb verified"
 
-# weakhost: an effective rp_filter of 0 on an address-less port is only
-# warned (an owner decision whether to refuse), at startup and while
-# running, also with arp_ignore=1 (which stops ARP replies only: a frame
-# sent to the port's MAC for any host address is still delivered). The
-# setup's all.rp_filter=1 avoids it; strict (1) or loose (2) recovers.
+# weakhost: an effective rp_filter (the larger of all and the device) of 0
+# on an address-less port is refused at startup (KERNEL_IPV4_WEAK_HOST,
+# owner decision 2026-11-02, CLI-079), also with arp_ignore=1 (which stops
+# ARP replies only: a frame sent to the port's MAC for any host address is
+# still delivered). --allow-ipv4-weak-host accepts it with the warning.
+# While running it is only ever a warning (a fatal exit would detach XDP),
+# with or without the override; strict (1) or loose (2) recovers. The
+# setup's all.rp_filter=1 avoids it.
 for dev in all ra rb; do
     in_ns "$router" sysctl -qw "net.ipv4.conf.$dev.rp_filter=0"
 done
 [ "$(in_ns "$router" sysctl -n net.ipv4.conf.all.arp_ignore)" = 1 ] ||
     fail "weakhost: all.arp_ignore is not 1"
-start_ruster weakhost "$work/router.toml"
+refused_with weakhost-refused "port=if1 code=KERNEL_IPV4_WEAK_HOST"
+# The other overrides do not accept it.
+refused_with weakhost-other-overrides "port=if1 code=KERNEL_IPV4_WEAK_HOST" \
+    --allow-kernel-forwarding --allow-kernel-ipv6
+# The effective value is per port: rp_filter=1 on ra alone leaves rb at 0.
+in_ns "$router" sysctl -qw net.ipv4.conf.ra.rp_filter=1
+refused_with weakhost-device "port=if2 code=KERNEL_IPV4_WEAK_HOST"
+in_ns "$router" sysctl -qw net.ipv4.conf.ra.rp_filter=0
+start_ruster weakhost "$work/router.toml" --allow-ipv4-weak-host
 wait_ready weakhost || fail "weakhost: ruster exited during startup"
 grep -q "warning: port=if1 IPV4_WEAK_HOST_EXPOSURE" "$work/weakhost.err" ||
     fail "weakhost: no startup warning with arp_ignore=1"
@@ -1338,7 +1352,28 @@ if grep -q "fatal:" "$work/weakhost.err"; then
     fail "weakhost: a fatal event"
 fi
 assert_detached "the weak-host run"
-echo "priv_run_weak_host: effective rp_filter=0 warned at startup and while running although arp_ignore=1, recovered with rp_filter=2 and with 1, never refused verified"
+# Without the override: loose rp_filter (2) starts without a weak-host
+# warning; flipping it to 0 while running warns (no fatal) and 1 recovers.
+in_ns "$router" sysctl -qw net.ipv4.conf.all.rp_filter=2
+start_ruster weakhost-loose "$work/router.toml"
+wait_ready weakhost-loose || fail "weakhost-loose: ruster exited during startup"
+if grep -q "IPV4_WEAK_HOST" "$work/weakhost-loose.err"; then
+    fail "weakhost-loose: warned with rp_filter=2"
+fi
+forward_once weakhost-loose
+in_ns "$router" sysctl -qw net.ipv4.conf.all.rp_filter=0
+wait_line weakhost-loose "warning: port=if2 health=IPV4_WEAK_HOST_EXPOSURE"
+in_ns "$router" sysctl -qw net.ipv4.conf.all.rp_filter=1
+wait_line weakhost-loose "recovered: port=if2 health=IPV4_WEAK_HOST_EXPOSURE"
+forward_once weakhost-loose
+signal_ruster TERM
+wait_ruster
+[ "$status" -eq 0 ] || fail "weakhost-loose: exit status $status"
+if grep -q "fatal:" "$work/weakhost-loose.err"; then
+    fail "weakhost-loose: a fatal event"
+fi
+assert_detached "the loose rp_filter run"
+echo "priv_run_weak_host: effective rp_filter=0 refused at startup (KERNEL_IPV4_WEAK_HOST, per port, not by the other overrides) although arp_ignore=1, accepted and warned under --allow-ipv4-weak-host, recovered with rp_filter=2 and with 1; without the override rp_filter=2 started clean and a run-time flip to 0 only warned and recovered with 1 verified"
 
 # mc_forwarding: a multicast routing socket (MRT_INIT) sets IPv4
 # conf/all/mc_forwarding=1 while it is open: refused (scope=multicast)

@@ -47,7 +47,7 @@
 //! | `net.ipv4.ip_forward` or `conf/<dev>/forwarding` turns on (procfs, same round) | warning `KERNEL_FORWARDING_ENABLED`, recovered when off; not fatal (see below) |
 //! | a forwarding sysctl is unreadable | a failed query (fatal after [`LINK_PROBE_FAILURES_FATAL`] in a row); with `--allow-kernel-forwarding` a warning `FORWARDING_UNVERIFIABLE` |
 //! | IPv4 `mc_forwarding` (of `all` or the device) turns on | counted with the forwarding sysctls: warning `KERNEL_FORWARDING_ENABLED` |
-//! | the effective `rp_filter` (the larger of `all` and the device) is 0, or unreadable | warning `IPV4_WEAK_HOST_EXPOSURE`, recovered when it is 1 or 2; never fatal, never a failed query |
+//! | the effective `rp_filter` (the larger of `all` and the device) is 0, or unreadable | warning `IPV4_WEAK_HOST_EXPOSURE`, recovered when it is 1 or 2; never fatal, never a failed query (the startup refuses it as `KERNEL_IPV4_WEAK_HOST` unless `--allow-ipv4-weak-host`, CLI-079) |
 //! | `disable_ipv6` is 0 on the port (also when it flips while running) | warning `KERNEL_IPV6_ENABLED`, recovered when it is 1 again; not fatal |
 //! | with IPv6 enabled on the port: an IPv6 address outside `fe80::/10`, an IPv6 route out of the port beyond the automatic link-local and multicast ones, `net.ipv6.conf.all.forwarding`, `conf/<dev>/forwarding`, a `force_forwarding`, or an IPv6 `mc_forwarding` on | warnings `KERNEL_IPV6_ADDRESSES`, `KERNEL_IPV6_ROUTES`, `KERNEL_IPV6_FORWARDING_ENABLED`, each recovered when gone (or when `disable_ipv6` turns on); not fatal |
 //! | an IPv6 fact is unreadable (`disable_ipv6`/forwarding sysctls, address or route dump) | a failed query of its kind; with `--allow-kernel-ipv6` a warning `IPV6_UNVERIFIABLE` instead |
@@ -713,7 +713,11 @@ impl Watch {
     /// Folds the IPv4 weak-host reading of port `index` (`Some(true)`:
     /// the effective `rp_filter` 0; `None`: unreadable): a warning
     /// `IPV4_WEAK_HOST_EXPOSURE` unless `Some(false)`, recovered then.
-    /// Never fatal and never a failed query: it is advice, not a check.
+    /// Never fatal and never a failed query, with or without
+    /// `--allow-ipv4-weak-host`: the startup refuses it
+    /// (`KERNEL_IPV4_WEAK_HOST`, CLI-079), but at run time a fatal exit
+    /// would detach XDP and create the very exposure, as for the other
+    /// kernel exposure conditions.
     pub fn on_weak_host(
         &mut self,
         index: usize,

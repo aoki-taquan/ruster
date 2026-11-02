@@ -1865,5 +1865,42 @@ fn run_refuses_each_table_one_slot_above_the_production_limit() {
     }
 }
 
+/// Every override flag of `ruster run` reaches the check policy, each on
+/// its own.
+#[test]
+fn run_flags_reach_the_check_policy() {
+    use crate::args::{parse, Command};
+    let policy = |flags: &[&str]| {
+        let mut words: Vec<std::ffi::OsString> = vec!["run".into()];
+        words.extend(flags.iter().map(std::ffi::OsString::from));
+        words.extend(["--config".into(), "r.toml".into()]);
+        let Ok(Command::Run(args)) = parse(words) else {
+            panic!("parsed");
+        };
+        Settings::from_args(&args).policy
+    };
+    assert_eq!(policy(&[]), CheckPolicy::default());
+    assert_eq!(
+        policy(&["--allow-ipv4-weak-host"]),
+        CheckPolicy {
+            allow_ipv4_weak_host: true,
+            ..CheckPolicy::default()
+        }
+    );
+    assert_eq!(
+        policy(&[
+            "--allow-multi-queue",
+            "--allow-kernel-forwarding",
+            "--allow-kernel-ipv6",
+        ]),
+        CheckPolicy {
+            allow_multi_queue: true,
+            allow_kernel_forwarding: true,
+            allow_kernel_ipv6: true,
+            allow_ipv4_weak_host: false,
+        }
+    );
+}
+
 #[path = "ops_tests.rs"]
 mod ops;
