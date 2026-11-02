@@ -22,6 +22,7 @@ use super::engine::{
     DRAIN_DEADLINE_MS, DRAIN_ROUNDS, MAX_PAUSE, MIN_PAUSE, SPIN_TICKS,
 };
 use super::netlink::{LinkFacts, NetlinkError};
+use super::privileges::{Bounding, DropFailure, DropReport, Identity, PrivilegePolicy};
 use super::reload::ConfigSource;
 use super::startup::{CloseFailure, Failure, OpenPort, PortHost, Stage, StartupError};
 use super::watch::{Forwarding, Ipv6Sample, LinkTarget, PortSample};
@@ -121,6 +122,18 @@ struct State {
     quiesce_probes: Cell<u32>,
     /// Transient open failures still to inject for this port.
     transient_open: Cell<Option<(u16, u32)>>,
+    /// Each `lockdown` call: the identity, the number of events and
+    /// datapath `io()` calls (ticks) before it, and the ports attached
+    /// then.
+    lockdowns: RefCell<Vec<Lockdown>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Lockdown {
+    identity: Option<Identity>,
+    events_before: usize,
+    ticks_before: u32,
+    attached: u32,
 }
 
 impl State {
@@ -145,6 +158,8 @@ struct FakeHost {
     ipv6: Option<Ipv6Facts>,
     /// IPv4 routes out of every port at startup.
     ipv4_routes: u32,
+    /// The policy each `preflight` call was given.
+    preflight_policies: RefCell<Vec<PrivilegePolicy>>,
 }
 
 /// Pops the front result of `queue` if it belongs to `port`.
@@ -406,9 +421,31 @@ impl PortHost for FakeHost {
         })
     }
 
-    fn preflight(&self, _: &ValidatedAfXdpV1) -> Result<(), PrivilegeFailure> {
+    fn preflight(
+        &self,
+        _: &ValidatedAfXdpV1,
+        policy: PrivilegePolicy,
+    ) -> Result<(), PrivilegeFailure> {
         self.state.push(Event::Preflight);
+        self.preflight_policies.borrow_mut().push(policy);
         self.privilege.map_or(Ok(()), Err)
+    }
+
+    fn lockdown(&self, identity: Option<Identity>) -> Result<DropReport, DropFailure> {
+        self.state.lockdowns.borrow_mut().push(Lockdown {
+            identity,
+            events_before: self.state.events.borrow().len(),
+            ticks_before: self.state.io_calls.get(),
+            attached: self.state.attached.get(),
+        });
+        if self.fails(Stage::PrivilegeDrop, None) {
+            return Err(DropFailure::Injected);
+        }
+        Ok(DropReport {
+            threads: 3,
+            bounding: Bounding::Cleared,
+            identity_switched: identity.is_some(),
+        })
     }
 
     fn open(&self, port: &ValidatedAfXdpPortV1) -> Result<FakeSession, Failure> {
@@ -608,6 +645,7 @@ fn settings(policy: CheckPolicy, stats_interval_ms: u64) -> Settings {
         link_interval_ms: 0,
         reload_quiesce_ms: super::reload::RELOAD_QUIESCE_MS,
         thresholds: super::watch::Thresholds::default(),
+        privileges: PrivilegePolicy::default(),
     }
 }
 
@@ -1900,6 +1938,172 @@ fn run_flags_reach_the_check_policy() {
             allow_ipv4_weak_host: false,
         }
     );
+}
+
+#[test]
+fn run_flags_reach_the_privilege_policy() {
+    use crate::args::{parse, Command};
+    let policy = |flags: &[&str]| {
+        let mut words: Vec<std::ffi::OsString> = vec!["run".into()];
+        words.extend(flags.iter().map(std::ffi::OsString::from));
+        words.extend(["--config".into(), "r.toml".into()]);
+        let Ok(Command::Run(args)) = parse(words) else {
+            panic!("parsed");
+        };
+        Settings::from_args(&args).privileges
+    };
+    assert_eq!(policy(&[]), PrivilegePolicy::Drop { identity: None });
+    assert_eq!(policy(&["--keep-privileges"]), PrivilegePolicy::Keep);
+    assert_eq!(
+        policy(&["--user", "990", "--group", "991"]),
+        PrivilegePolicy::Drop {
+            identity: Some(Identity { uid: 990, gid: 991 })
+        }
+    );
+}
+
+/// The `privileges.*` lines of the stats output.
+fn privilege_lines(out: &str) -> Vec<&str> {
+    out.lines()
+        .filter(|line| line.starts_with("privileges."))
+        .collect()
+}
+
+#[test]
+fn privileges_are_dropped_after_activation_and_before_the_first_tick() {
+    let host = FakeHost::default();
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 3));
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    let lockdowns = host.state.lockdowns.borrow().clone();
+    assert_eq!(lockdowns.len(), 1, "exactly one drop");
+    let lockdown = lockdowns[0];
+    assert_eq!(lockdown.identity, None);
+    // After every port is attached and the adapter is built, before any
+    // tick (`io()` call) and before the drain.
+    assert_eq!(lockdown.attached, 2);
+    assert_eq!(lockdown.ticks_before, 0);
+    let events = host.events();
+    assert_eq!(events[lockdown.events_before - 1], Event::Adapter);
+    assert!(matches!(
+        events.get(lockdown.events_before),
+        Some(Event::Drain(_))
+    ));
+    assert!(host.state.io_calls.get() >= 3, "ticks ran after the drop");
+    // The value-free line comes before the readiness line.
+    let line = "ruster run: privileges dropped: threads=3 capabilities=none \
+                bounding-set=cleared no-new-privs=1 identity=unchanged\n";
+    let dropped_at = outcome.err.find(line).expect("drop line");
+    let ready_at = outcome.err.find(READY).expect("ready line");
+    assert!(dropped_at < ready_at, "{}", outcome.err);
+    assert_eq!(
+        privilege_lines(&outcome.out),
+        [
+            "privileges.state=dropped",
+            "privileges.bounding_set=cleared",
+            "privileges.identity=unchanged",
+            "privileges.threads=3",
+        ]
+    );
+    assert_eq!(
+        *host.preflight_policies.borrow(),
+        [PrivilegePolicy::Drop { identity: None }]
+    );
+    host.assert_released();
+}
+
+#[test]
+fn an_identity_reaches_the_preflight_and_the_drop() {
+    let host = FakeHost::default();
+    let identity = Identity { uid: 990, gid: 991 };
+    let mut settings = settings(CheckPolicy::default(), 0);
+    settings.privileges = PrivilegePolicy::Drop {
+        identity: Some(identity),
+    };
+    let outcome = run_full(
+        &host,
+        settings,
+        FakeSource::default(),
+        &FakeStop::after(FIRST_LOOP_CHECK + 3),
+        &mut FakeClock::default(),
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert_eq!(host.state.lockdowns.borrow()[0].identity, Some(identity));
+    assert_eq!(
+        *host.preflight_policies.borrow(),
+        [PrivilegePolicy::Drop {
+            identity: Some(identity)
+        }]
+    );
+    assert!(outcome.err.contains("identity=switched"), "{}", outcome.err);
+    // Value-free: neither id is printed.
+    assert!(!outcome.err.contains("990") && !outcome.err.contains("991"));
+    assert!(!outcome.out.contains("990") && !outcome.out.contains("991"));
+    assert!(outcome.out.contains("\nprivileges.identity=switched\n"));
+}
+
+#[test]
+fn keep_privileges_skips_the_drop_and_says_so() {
+    let host = FakeHost::default();
+    let mut settings = settings(CheckPolicy::default(), 0);
+    settings.privileges = PrivilegePolicy::Keep;
+    let outcome = run_full(
+        &host,
+        settings,
+        FakeSource::default(),
+        &FakeStop::after(FIRST_LOOP_CHECK + 3),
+        &mut FakeClock::default(),
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(host.state.lockdowns.borrow().is_empty());
+    assert!(
+        outcome.err.contains(
+            "ruster run: warning: privileges kept (--keep-privileges): every capability \
+             stays for the whole run\n"
+        ),
+        "{}",
+        outcome.err
+    );
+    assert!(!outcome.err.contains("privileges dropped"));
+    assert_eq!(
+        privilege_lines(&outcome.out),
+        [
+            "privileges.state=kept",
+            "privileges.bounding_set=kept",
+            "privileges.identity=unchanged",
+            "privileges.threads=0",
+        ]
+    );
+    assert_eq!(*host.preflight_policies.borrow(), [PrivilegePolicy::Keep]);
+}
+
+#[test]
+fn a_failed_drop_rolls_back_every_port_and_exits_1_without_a_tick() {
+    let host = FakeHost::failing(Stage::PrivilegeDrop, None);
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 3));
+    assert_eq!(outcome.status, EXIT_RUNTIME, "{}", outcome.err);
+    assert!(
+        outcome
+            .err
+            .contains("ruster run: startup failed: stage=privilege-drop code=INJECTED\n"),
+        "{}",
+        outcome.err
+    );
+    assert!(!outcome.err.contains(READY));
+    assert!(!outcome.err.contains("privileges dropped"));
+    assert!(outcome.out.is_empty());
+    assert_eq!(host.state.io_calls.get(), 0, "no tick");
+    host.assert_released();
+    assert!(host.events().ends_with(&[
+        Event::Adapter,
+        Event::Close {
+            port: WAN,
+            attached: true
+        },
+        Event::Close {
+            port: LAN,
+            attached: true
+        }
+    ]));
 }
 
 #[path = "ops_tests.rs"]

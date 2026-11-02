@@ -11,7 +11,10 @@
 //! dropped and [`dropped`] counts it; the caller never waits.
 //!
 //! [`ColdOutput::process`] gives the threads duplicates of fd 1 and fd 2
-//! wrapped in `File`, not `std::io::stdout()`/`stderr()`: a thread blocked
+//! wrapped in `File`, not `std::io::stdout()`/`stderr()`, and runs a
+//! prologue on each thread before it takes any message (`ruster run`'s
+//! per-thread privilege drop; the spawn waits for it and fails if it
+//! fails). A thread blocked
 //! in a write then holds no std lock, so neither `main` nor std's exit-time
 //! cleanup can wait on it.
 //!
@@ -53,19 +56,51 @@ struct Lane {
 }
 
 impl Lane {
-    fn spawn<W: Write + Send + 'static>(mut sink: W, name: &str) -> io::Result<Self> {
+    /// Spawns the writer thread, which runs `prologue` first (the privilege
+    /// drop of `ruster run`: credentials are per thread) and only then
+    /// takes messages. Waits for the prologue's outcome; on an error the
+    /// thread has already ended without writing anything.
+    fn spawn<W, P, X>(mut sink: W, name: &str, prologue: P) -> Result<Self, SpawnError<X>>
+    where
+        W: Write + Send + 'static,
+        P: FnOnce() -> Result<(), X> + Send + 'static,
+        X: Send + 'static,
+    {
         let (sender, receiver) = mpsc::sync_channel::<Vec<u8>>(QUEUE);
         let (finished, done) = mpsc::channel();
-        thread::Builder::new().name(name.into()).spawn(move || {
-            for bytes in receiver {
-                // Errors (a closed pipe) are ignored: output is best
-                // effort and never blocks the router.
-                let _ = sink.write_all(&bytes).and_then(|()| sink.flush());
-            }
-            let _ = finished.send(());
-        })?;
-        Ok(Self { sender, done })
+        let (started, outcome) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let ready = prologue();
+                let ok = ready.is_ok();
+                let _ = started.send(ready);
+                if !ok {
+                    return;
+                }
+                for bytes in receiver {
+                    // Errors (a closed pipe) are ignored: output is best
+                    // effort and never blocks the router.
+                    let _ = sink.write_all(&bytes).and_then(|()| sink.flush());
+                }
+                let _ = finished.send(());
+            })
+            .map_err(|_| SpawnError::Io)?;
+        match outcome.recv() {
+            Ok(Ok(())) => Ok(Self { sender, done }),
+            Ok(Err(error)) => Err(SpawnError::Prologue(error)),
+            Err(_) => Err(SpawnError::Io),
+        }
     }
+}
+
+/// Why the writer threads could not be started.
+#[derive(Debug)]
+pub enum SpawnError<X> {
+    /// A thread could not be spawned (or fd 1/2 duplicated).
+    Io,
+    /// A thread's prologue failed.
+    Prologue(X),
 }
 
 /// One writer thread and queue per stream.
@@ -75,26 +110,51 @@ pub struct ColdOutput {
 }
 
 impl ColdOutput {
-    /// Starts the writer threads over `out` and `err`.
+    /// Starts the writer threads over `out` and `err` (no prologue).
+    #[cfg(test)]
     pub fn spawn<O, E>(out: O, err: E) -> io::Result<Self>
     where
         O: Write + Send + 'static,
         E: Write + Send + 'static,
     {
+        Self::spawn_with(out, err, || Ok::<(), ()>(()))
+            .map_err(|_| io::Error::other("writer threads not started"))
+    }
+
+    /// Starts the writer threads over `out` and `err`; each runs
+    /// `prologue` on its own thread before anything else, and the call
+    /// fails if either prologue fails.
+    pub fn spawn_with<O, E, P, X>(out: O, err: E, prologue: P) -> Result<Self, SpawnError<X>>
+    where
+        O: Write + Send + 'static,
+        E: Write + Send + 'static,
+        P: Fn() -> Result<(), X> + Clone + Send + 'static,
+        X: Send + 'static,
+    {
         Ok(Self {
-            out: Lane::spawn(out, "ruster-stdout")?,
-            err: Lane::spawn(err, "ruster-stderr")?,
+            out: Lane::spawn(out, "ruster-stdout", prologue.clone())?,
+            err: Lane::spawn(err, "ruster-stderr", prologue)?,
         })
     }
 
     /// Writer threads over duplicates of this process's fd 1 and fd 2, as
-    /// plain `File`s that take no std stdout/stderr lock.
-    pub fn process() -> io::Result<Self> {
-        use std::os::fd::AsFd;
+    /// plain `File`s that take no std stdout/stderr lock, each running
+    /// `prologue` first.
+    pub fn process<P, X>(prologue: P) -> Result<Self, SpawnError<X>>
+    where
+        P: Fn() -> Result<(), X> + Clone + Send + 'static,
+        X: Send + 'static,
+    {
+        use std::os::fd::{AsFd, BorrowedFd};
 
-        let out = File::from(io::stdout().as_fd().try_clone_to_owned()?);
-        let err = File::from(io::stderr().as_fd().try_clone_to_owned()?);
-        Self::spawn(out, err)
+        let duplicate = |fd: BorrowedFd<'_>| {
+            fd.try_clone_to_owned()
+                .map(File::from)
+                .map_err(|_| SpawnError::Io)
+        };
+        let out = duplicate(io::stdout().as_fd())?;
+        let err = duplicate(io::stderr().as_fd())?;
+        Self::spawn_with(out, err, prologue)
     }
 
     /// A writer for `stream`.
@@ -239,7 +299,7 @@ mod tests {
         let stdout = io::stdout();
         let stderr = io::stderr();
         let held = (stdout.lock(), stderr.lock());
-        let output = ColdOutput::process().expect("dup fds");
+        let output = ColdOutput::process(|| Ok::<(), ()>(())).expect("dup fds");
         let mut out = output.writer(Stream::Out);
         let mut err = output.writer(Stream::Err);
         writeln!(out, "ruster-output-wiring-probe").unwrap();
@@ -248,6 +308,42 @@ mod tests {
         let finished = output.finish(Duration::from_secs(5));
         drop(held);
         assert!(finished, "a writer thread waited on a std stdio lock");
+    }
+
+    /// A failed prologue fails the spawn and its thread writes nothing;
+    /// each lane runs the prologue on its own thread.
+    #[test]
+    fn a_failed_prologue_fails_the_spawn_and_writes_nothing() {
+        let (mut out_reader, out_writer) = io::pipe().expect("pipe");
+        let (_err_reader, err_writer) = io::pipe().expect("pipe");
+        let calls = std::sync::Arc::new(AtomicU64::new(0));
+        let counted = std::sync::Arc::clone(&calls);
+        let result = ColdOutput::spawn_with(out_writer, err_writer, move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+            Err::<(), _>("dropped")
+        });
+        assert!(matches!(result, Err(SpawnError::Prologue("dropped"))));
+        // The stdout lane failed first; the stderr lane never started.
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let mut text = String::new();
+        out_reader.read_to_string(&mut text).expect("closed");
+        assert_eq!(text, "");
+        let main = thread::current().id();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = std::sync::Arc::clone(&seen);
+        let output = ColdOutput::spawn_with(
+            io::pipe().expect("pipe").1,
+            io::pipe().expect("pipe").1,
+            move || {
+                record.lock().unwrap().push(thread::current().id());
+                Ok::<(), ()>(())
+            },
+        )
+        .expect("spawn");
+        let ids = seen.lock().unwrap().clone();
+        assert_eq!(ids.len(), 2);
+        assert!(ids[0] != ids[1] && !ids.contains(&main));
+        drop(output);
     }
 
     /// A stuck stdout does not starve stderr.

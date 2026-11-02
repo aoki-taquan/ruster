@@ -24,6 +24,11 @@
 //!    datapath, build every engine, build the `XdpPacketIo` adapter, and
 //!    activate generation 1 ([`startup`] explains why the datapath comes
 //!    after all attaches).
+//! 6. Drop every privilege of every thread, irreversibly, before the
+//!    first tick ([`privileges`]; the output threads dropped their own at
+//!    spawn). `--keep-privileges` skips it; `--user`/`--group` also switch
+//!    to that uid and gid. A failed drop rolls back like any startup
+//!    failure (`stage=privilege-drop`, exit 1).
 //!
 //! A failure at any stage closes every session opened so far, last first
 //! (closing detaches XDP before releasing the socket, UMEM, and rings),
@@ -68,8 +73,8 @@
 //! - 0: ordered shutdown with no TX frame left in the kernel (also a
 //!   signal during startup, after a clean rollback).
 //! - 1: startup failure (open, checks, attach, watch, datapath, engine,
-//!   adapter, activation, key source; a transient open failure after the
-//!   last attempt), a backend fault during the run, a fatal health or
+//!   adapter, activation, privilege drop, key source; a transient open
+//!   failure after the last attempt), a backend fault during the run, a fatal health or
 //!   device event ([`watch`]: TX stall, persistent kick errors, device
 //!   removed, MTU decreased or above the frame bound, link unverifiable),
 //!   a drain failure, a stranded TX handoff after the drain, or a close
@@ -78,10 +83,10 @@
 //!   backend).
 //! - 3: shutdown deadline (or a second signal) with TX frames still owned
 //!   by the kernel; everything was still detached and closed.
-//! - 4: missing capability or too small `RLIMIT_MEMLOCK` (nothing was
-//!   acquired).
-//!
-//! Privileges are not dropped after startup (deferred).
+//! - 4: missing capability or too small `RLIMIT_MEMLOCK`, or a privilege
+//!   drop that cannot work (`CAP_SETUID`/`CAP_SETGID` missing for
+//!   `--user`/`--group`, or a kernel whose teardown needs `CAP_BPF`);
+//!   nothing was acquired.
 
 mod checks;
 mod engine;
@@ -101,6 +106,7 @@ mod linux;
 )]
 mod netlink;
 mod output;
+mod privileges;
 mod reload;
 mod startup;
 mod stats;
@@ -128,6 +134,7 @@ use engine::{
     port_label, run_loop, shutdown_drain, Clock, Control, Datapath, LoopEnd, LoopSettings,
     RunStatus, ShutdownReport, StopSignal, DRAIN_DEADLINE_MS,
 };
+use privileges::{Identity, PrivilegePolicy, PrivilegeState};
 use reload::{ConfigSource, Reloader};
 use startup::{
     open_ports, CloseFailure, Failure, Interrupt, OpenedPorts, PortHost, Stage, StartupError,
@@ -163,11 +170,14 @@ pub struct Settings {
     pub reload_quiesce_ms: u64,
     /// Health thresholds of the watch.
     pub thresholds: Thresholds,
+    /// The privilege drop after startup.
+    pub privileges: PrivilegePolicy,
 }
 
 impl Settings {
     fn from_args(args: &RunArgs) -> Self {
         Self {
+            privileges: privilege_policy(args),
             policy: CheckPolicy {
                 allow_multi_queue: args.allow_multi_queue,
                 allow_kernel_forwarding: args.allow_kernel_forwarding,
@@ -186,6 +196,21 @@ impl Settings {
                 args.kick_errors_fatal_secs,
             ),
         }
+    }
+}
+
+/// The privilege policy of the arguments: drop unless
+/// `--keep-privileges`; `--user` and `--group` (accepted only together and
+/// never with `--keep-privileges`) add the identity switch.
+fn privilege_policy(args: &RunArgs) -> PrivilegePolicy {
+    if args.keep_privileges {
+        return PrivilegePolicy::Keep;
+    }
+    PrivilegePolicy::Drop {
+        identity: match (args.user, args.group) {
+            (Some(uid), Some(gid)) => Some(Identity { uid, gid }),
+            _ => None,
+        },
     }
 }
 
@@ -251,17 +276,32 @@ fn live(args: &RunArgs, config: ValidatedConfigV1, err: &mut impl Write) -> u8 {
     };
     let settings = Settings::from_args(args);
     let host = linux::LinuxHost;
+    // The output threads drop their privileges (and switch identity) at
+    // spawn, so what that needs is checked before they start.
+    let policy = settings.privileges;
+    if let Err(error) = checks::linux::check_identity_switch(policy) {
+        let error = StartupError::new(Stage::Privileges, None, Failure::Privileges(error));
+        return startup_failed(err, error, &[]);
+    }
     // From here on nothing on this thread writes to a file descriptor: a
     // stalled stdout/stderr pipe cannot block the datapath or the shutdown.
     // The threads get dups of fd 1/2 as plain files: blocked writes hold
     // no std stdio lock that `main` or the exit path could wait on.
-    let output = match output::ColdOutput::process() {
-        Ok(output) => output,
-        Err(_) => {
-            let _ = writeln!(err, "ruster run: cannot start the output thread");
-            return EXIT_RUNTIME;
-        }
-    };
+    let output =
+        match output::ColdOutput::process(move || privileges::linux::drop_thread(policy).map(drop))
+        {
+            Ok(output) => output,
+            Err(output::SpawnError::Prologue(error)) => {
+                let error =
+                    StartupError::new(Stage::PrivilegeDrop, None, Failure::PrivilegeDrop(error));
+                let _ = writeln!(err, "ruster run: startup failed: {error} thread=output");
+                return EXIT_RUNTIME;
+            }
+            Err(output::SpawnError::Io) => {
+                let _ = writeln!(err, "ruster run: cannot start the output thread");
+                return EXIT_RUNTIME;
+            }
+        };
     let mut out = output.writer(output::Stream::Out);
     let mut cold_err = output.writer(output::Stream::Err);
     let status = execute(
@@ -374,7 +414,7 @@ where
         }
     };
     if let Some(backend) = config.backend().af_xdp() {
-        if let Err(error) = host.preflight(backend) {
+        if let Err(error) = host.preflight(backend, settings.privileges) {
             let error = StartupError::new(Stage::Privileges, None, Failure::Privileges(error));
             return startup_failed(err, error, &[]);
         }
@@ -546,6 +586,21 @@ where
             Failure::Activation(error),
         ))
     })?;
+    // Nothing after this point needs a privilege (see [`privileges`]).
+    let privileges = match settings.privileges {
+        PrivilegePolicy::Keep => PrivilegeState::Kept,
+        PrivilegePolicy::Drop { identity } => {
+            let report = host.lockdown(identity).map_err(|error| {
+                Interrupt::Failed(StartupError::new(
+                    Stage::PrivilegeDrop,
+                    None,
+                    Failure::PrivilegeDrop(error),
+                ))
+            })?;
+            PrivilegeState::Dropped(report)
+        }
+    };
+    let _ = writeln!(err, "ruster run: {}", privileges.line());
     let mut observer = TickObserver::new(HealthPolicy::default());
     let _ = writeln!(
         err,
@@ -577,7 +632,15 @@ where
         &mut control,
         err,
         |active, datapath, observer, status, now| {
-            let text = render(BlockKind::Periodic, now, active, datapath, observer, status);
+            let text = render(
+                BlockKind::Periodic,
+                now,
+                active,
+                datapath,
+                observer,
+                status,
+                privileges,
+            );
             let _ = out.write_all(text.as_bytes());
             let _ = out.flush();
         },
@@ -650,6 +713,7 @@ where
         &datapath,
         &observer,
         &status,
+        privileges,
     );
     drop(active);
     drop(datapath);
@@ -667,6 +731,7 @@ fn render<D: Datapath>(
     datapath: &D,
     observer: &TickObserver,
     status: &RunStatus<'_>,
+    privileges: PrivilegeState,
 ) -> String {
     let services = ServiceCounters::capture(
         active.resolution(),
@@ -685,6 +750,7 @@ fn render<D: Datapath>(
         for (interface, health) in status.watch.health() {
             stats::write_fields(out, Some(interface), &health);
         }
+        stats::write_fields(out, None, &privileges);
     })
 }
 
@@ -714,11 +780,29 @@ fn startup_failed(
     cleanup: &[(IfId, CloseFailure)],
 ) -> u8 {
     let _ = writeln!(err, "ruster run: startup failed: {error}");
-    if let Failure::Privileges(PrivilegeFailure::MissingCapabilities(_)) = error.failure {
-        let _ = writeln!(
-            err,
-            "ruster run: run as root or grant CAP_NET_ADMIN, CAP_NET_RAW, CAP_BPF, and CAP_PERFMON"
-        );
+    match error.failure {
+        Failure::Privileges(PrivilegeFailure::MissingCapabilities(missing)) => {
+            if missing & !checks::SWITCH_CAPABILITIES != 0 {
+                let _ = writeln!(
+                    err,
+                    "ruster run: run as root or grant CAP_NET_ADMIN, CAP_NET_RAW, CAP_BPF, and CAP_PERFMON"
+                );
+            }
+            if missing & checks::SWITCH_CAPABILITIES != 0 {
+                let _ = writeln!(
+                    err,
+                    "ruster run: --user/--group also need CAP_SETUID and CAP_SETGID at startup"
+                );
+            }
+        }
+        Failure::Privileges(PrivilegeFailure::TeardownNeedsCapabilities) => {
+            let _ = writeln!(
+                err,
+                "ruster run: before Linux 6.5 with kernel.unprivileged_bpf_disabled set, \
+                 detaching needs CAP_BPF; use Linux 6.5 or newer, or --keep-privileges"
+            );
+        }
+        _ => {}
     }
     report_cleanup(err, cleanup);
     startup_status(&error)

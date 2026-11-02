@@ -15,8 +15,12 @@ use std::fmt;
 
 use ruster_config::{AfXdpModeV1, ValidatedAfXdpV1};
 
+use super::privileges::PrivilegePolicy;
+
 /// Linux capability bits (`include/uapi/linux/capability.h`).
 pub mod cap {
+    pub const SETGID: u32 = 6;
+    pub const SETUID: u32 = 7;
     pub const NET_ADMIN: u32 = 12;
     pub const NET_RAW: u32 = 13;
     pub const IPC_LOCK: u32 = 14;
@@ -41,12 +45,21 @@ pub enum PrivilegeFailure {
     /// Without `CAP_IPC_LOCK`, the soft `RLIMIT_MEMLOCK` is below what the
     /// UMEMs pin.
     MemlockLimit { limit: u64, required: u64 },
+    /// The privilege drop is on, but this kernel refuses the teardown's
+    /// `bpf(2)` call (the XSKMAP entry delete) without a capability: Linux
+    /// before 6.5 with `kernel.unprivileged_bpf_disabled` nonzero
+    /// ([`super::privileges::teardown_without_capabilities`]).
+    TeardownNeedsCapabilities,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProcSource {
     Status,
     Limits,
+    /// `/proc/sys/kernel/osrelease` (privilege drop only).
+    OsRelease,
+    /// `/proc/sys/kernel/unprivileged_bpf_disabled` (privilege drop only).
+    UnprivilegedBpf,
 }
 
 impl ProcSource {
@@ -54,13 +67,17 @@ impl ProcSource {
         match self {
             Self::Status => "/proc/self/status",
             Self::Limits => "/proc/self/limits",
+            Self::OsRelease => "/proc/sys/kernel/osrelease",
+            Self::UnprivilegedBpf => "/proc/sys/kernel/unprivileged_bpf_disabled",
         }
     }
 }
 
 /// `CAP_*` names of a missing-capability set, comma separated.
 pub fn capability_names(set: u64) -> String {
-    const NAMES: [(u32, &str); 6] = [
+    const NAMES: [(u32, &str); 8] = [
+        (cap::SETGID, "CAP_SETGID"),
+        (cap::SETUID, "CAP_SETUID"),
         (cap::NET_ADMIN, "CAP_NET_ADMIN"),
         (cap::NET_RAW, "CAP_NET_RAW"),
         (cap::IPC_LOCK, "CAP_IPC_LOCK"),
@@ -95,6 +112,7 @@ impl fmt::Display for PrivilegeFailure {
                 formatter,
                 "MEMLOCK_LIMIT limit-bytes={limit} required-bytes={required}"
             ),
+            Self::TeardownNeedsCapabilities => formatter.write_str("TEARDOWN_NEEDS_CAPABILITIES"),
         }
     }
 }
@@ -168,6 +186,33 @@ pub fn evaluate_privileges(
                 return Err(PrivilegeFailure::MemlockLimit { limit, required });
             }
         }
+    }
+    Ok(())
+}
+
+/// `CAP_SETUID` and `CAP_SETGID`: the identity switch of the drop.
+pub const SWITCH_CAPABILITIES: u64 = bit(cap::SETUID) | bit(cap::SETGID);
+
+/// The privilege drop's own preconditions, after [`evaluate_privileges`]:
+/// an identity switch needs `CAP_SETUID` and `CAP_SETGID`, and the drop
+/// needs a kernel whose teardown works without a capability
+/// (`teardown`, from [`super::privileges::teardown_without_capabilities`]).
+/// Nothing is required with `--keep-privileges`.
+pub fn evaluate_drop(
+    effective: u64,
+    policy: PrivilegePolicy,
+    teardown: impl FnOnce() -> Result<bool, PrivilegeFailure>,
+) -> Result<(), PrivilegeFailure> {
+    let PrivilegePolicy::Drop { identity } = policy else {
+        return Ok(());
+    };
+    if identity.is_some() && effective & SWITCH_CAPABILITIES != SWITCH_CAPABILITIES {
+        return Err(PrivilegeFailure::MissingCapabilities(
+            SWITCH_CAPABILITIES & !effective,
+        ));
+    }
+    if !teardown()? {
+        return Err(PrivilegeFailure::TeardownNeedsCapabilities);
     }
     Ok(())
 }
@@ -808,25 +853,63 @@ pub mod linux {
     use std::path::{Path, PathBuf};
 
     use super::super::netlink::{Dump, Family, LinkProbe};
+    use super::super::privileges::{teardown_without_capabilities, PrivilegePolicy};
     use super::{
-        evaluate_privileges, parse_cap_eff, parse_flag, parse_memlock, CheckFailure, DeviceFacts,
-        Ipv6Facts, PrivilegeFailure, Probe, ProcSource,
+        evaluate_drop, evaluate_privileges, missing_capabilities, parse_cap_eff, parse_flag,
+        parse_memlock, CheckFailure, DeviceFacts, Ipv6Facts, PrivilegeFailure, Probe, ProcSource,
+        SWITCH_CAPABILITIES,
     };
 
-    /// Reads the effective capabilities and memlock limit of this process
-    /// and evaluates them against `required` memlock bytes.
-    pub fn check_privileges(required: u64) -> Result<(), PrivilegeFailure> {
-        let effective = fs::read_to_string("/proc/self/status")
+    fn effective_capabilities() -> Result<u64, PrivilegeFailure> {
+        fs::read_to_string("/proc/self/status")
             .ok()
             .as_deref()
             .and_then(parse_cap_eff)
-            .ok_or(PrivilegeFailure::Unreadable(ProcSource::Status))?;
+            .ok_or(PrivilegeFailure::Unreadable(ProcSource::Status))
+    }
+
+    /// Reads the effective capabilities and memlock limit of this process
+    /// and evaluates them against `required` memlock bytes, then the
+    /// preconditions of the privilege drop of `policy`.
+    pub fn check_privileges(
+        required: u64,
+        policy: PrivilegePolicy,
+    ) -> Result<(), PrivilegeFailure> {
+        let effective = effective_capabilities()?;
         let memlock = fs::read_to_string("/proc/self/limits")
             .ok()
             .as_deref()
             .and_then(parse_memlock)
             .ok_or(PrivilegeFailure::Unreadable(ProcSource::Limits))?;
-        evaluate_privileges(effective, memlock, required)
+        evaluate_privileges(effective, memlock, required)?;
+        check_drop(effective, policy)
+    }
+
+    /// Before the output threads start (they switch identity at spawn):
+    /// with `--user`/`--group`, every startup capability and `CAP_SETUID`
+    /// + `CAP_SETGID` must be effective. Nothing is read otherwise.
+    pub fn check_identity_switch(policy: PrivilegePolicy) -> Result<(), PrivilegeFailure> {
+        if !matches!(policy, PrivilegePolicy::Drop { identity: Some(_) }) {
+            return Ok(());
+        }
+        let effective = effective_capabilities()?;
+        let missing = missing_capabilities(effective) | (SWITCH_CAPABILITIES & !effective);
+        if missing != 0 {
+            return Err(PrivilegeFailure::MissingCapabilities(missing));
+        }
+        Ok(())
+    }
+
+    fn check_drop(effective: u64, policy: PrivilegePolicy) -> Result<(), PrivilegeFailure> {
+        evaluate_drop(effective, policy, || {
+            let release = fs::read_to_string("/proc/sys/kernel/osrelease")
+                .map_err(|_| PrivilegeFailure::Unreadable(ProcSource::OsRelease))?;
+            let disabled = fs::read_to_string("/proc/sys/kernel/unprivileged_bpf_disabled")
+                .ok()
+                .and_then(|text| text.trim().parse::<u32>().ok())
+                .ok_or(PrivilegeFailure::Unreadable(ProcSource::UnprivilegedBpf))?;
+            Ok(teardown_without_capabilities(&release, disabled))
+        })
     }
 
     /// Reads a `0`/`1` sysctl file into a stack buffer: no allocation (a
@@ -1245,6 +1328,54 @@ mod tests {
             Err(PrivilegeFailure::MissingCapabilities(missing_capabilities(
                 0
             )))
+        );
+    }
+
+    #[test]
+    fn the_drop_needs_setuid_setgid_for_an_identity_and_a_capable_teardown() {
+        use super::super::privileges::Identity;
+        let drop = PrivilegePolicy::Drop { identity: None };
+        let switch = PrivilegePolicy::Drop {
+            identity: Some(Identity { uid: 990, gid: 990 }),
+        };
+        let ok = || Ok(true);
+        assert_eq!(evaluate_drop(0, drop, ok), Ok(()));
+        assert_eq!(evaluate_drop(ALL, switch, ok), Ok(()));
+        assert_eq!(
+            evaluate_drop(ALL & !bit(cap::SETUID), switch, ok),
+            Err(PrivilegeFailure::MissingCapabilities(bit(cap::SETUID)))
+        );
+        assert_eq!(
+            evaluate_drop(0, switch, ok),
+            Err(PrivilegeFailure::MissingCapabilities(
+                bit(cap::SETUID) | bit(cap::SETGID)
+            ))
+        );
+        assert_eq!(
+            capability_names(bit(cap::SETUID) | bit(cap::SETGID)),
+            "CAP_SETGID,CAP_SETUID"
+        );
+        assert_eq!(
+            evaluate_drop(ALL, drop, || Ok(false)),
+            Err(PrivilegeFailure::TeardownNeedsCapabilities)
+        );
+        let unreadable = PrivilegeFailure::Unreadable(ProcSource::OsRelease);
+        assert_eq!(
+            evaluate_drop(ALL, drop, || Err(unreadable)),
+            Err(unreadable)
+        );
+        // --keep-privileges needs nothing and reads nothing.
+        assert_eq!(
+            evaluate_drop(0, PrivilegePolicy::Keep, || panic!("not read")),
+            Ok(())
+        );
+        assert_eq!(
+            PrivilegeFailure::TeardownNeedsCapabilities.to_string(),
+            "TEARDOWN_NEEDS_CAPABILITIES"
+        );
+        assert_eq!(
+            PrivilegeFailure::Unreadable(ProcSource::UnprivilegedBpf).to_string(),
+            "UNREADABLE source=/proc/sys/kernel/unprivileged_bpf_disabled"
         );
     }
 

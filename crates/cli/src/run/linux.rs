@@ -14,6 +14,7 @@ use super::checks::linux::PortSysctls;
 use super::checks::{self, CheckFailure, DeviceFacts, PrivilegeFailure};
 use super::engine::{ClockedIo, Datapath, DrainProgress, LinkMonitor};
 use super::netlink::{Dump, Family, LinkFacts, LinkProbe, NetlinkError};
+use super::privileges::{self, DropFailure, DropReport, Identity, PrivilegePolicy};
 use super::startup::{CloseFailure, Failure, OpenPort, PortHost, Stage, StartupError};
 use super::stats::write_fields;
 use super::watch::{Forwarding, Ipv6Sample, LinkTarget, PortSample};
@@ -41,8 +42,16 @@ impl PortHost for LinuxHost {
         Ok(NetlinkLinks { probe, sysctls })
     }
 
-    fn preflight(&self, backend: &ValidatedAfXdpV1) -> Result<(), PrivilegeFailure> {
-        checks::linux::check_privileges(checks::required_memlock(backend))
+    fn preflight(
+        &self,
+        backend: &ValidatedAfXdpV1,
+        policy: PrivilegePolicy,
+    ) -> Result<(), PrivilegeFailure> {
+        checks::linux::check_privileges(checks::required_memlock(backend), policy)
+    }
+
+    fn lockdown(&self, identity: Option<Identity>) -> Result<DropReport, DropFailure> {
+        privileges::linux::drop_process(identity)
     }
 
     fn open(&self, port: &ValidatedAfXdpPortV1) -> Result<NativeSession, Failure> {
