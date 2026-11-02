@@ -1,9 +1,15 @@
 //! rtnetlink queries of `ruster run` (cold path only).
 //!
-//! - Kernel IPv4 address count of one interface through one `RTM_GETADDR`
-//!   dump (startup check). Unlike `SIOCGIFADDR`, which matches only
-//!   addresses whose label equals the device name, the dump sees every IPv4
-//!   address of the interface index, labelled or not.
+//! - Kernel address counts of one interface through one `RTM_GETADDR`
+//!   dump ([`Dump::Addresses`]). Unlike `SIOCGIFADDR`, which matches only
+//!   addresses whose label equals the device name, the dump sees every
+//!   address of the interface index, labelled or not. IPv4 counts every
+//!   address; IPv6 counts every address outside `fe80::/10`
+//!   ([`address_matches`]).
+//! - Kernel route counts out of one interface through one `RTM_GETROUTE`
+//!   dump of every table ([`Dump::Routes`]): a route counts if its
+//!   `RTA_OIF` or any `RTA_MULTIPATH` nexthop is the interface (see
+//!   [`route_matches`] for the IPv6 exclusions).
 //! - Link facts of one interface index through one `RTM_GETLINK` request
 //!   ([`LinkProbe`]): MTU, `IFLA_NUM_RX_QUEUES`, and the `IFF_UP` /
 //!   `IFF_LOWER_UP` flags, in the caller's network namespace (a netlink
@@ -24,6 +30,31 @@ use std::fmt;
 
 /// `AF_INET`.
 const AF_INET: u8 = 2;
+/// `AF_INET6`.
+const AF_INET6: u8 = 10;
+/// `RTM_NEWROUTE`.
+const RTM_NEWROUTE: u16 = 24;
+/// `RTM_GETROUTE`.
+const RTM_GETROUTE: u16 = 26;
+/// `sizeof(struct rtmsg)`.
+const RTMSG_LEN: usize = 12;
+/// `RTA_DST`: the destination prefix (4 or 16 bytes).
+const RTA_DST: u16 = 1;
+/// `RTA_OIF`: the output interface index (`u32`).
+const RTA_OIF: u16 = 4;
+/// `RTA_MULTIPATH`: a sequence of `struct rtnexthop`.
+const RTA_MULTIPATH: u16 = 9;
+/// `RTA_TABLE`: the table id (`u32`, also for ids above 255).
+const RTA_TABLE: u16 = 15;
+/// `RTA_NH_ID`: a nexthop object id (`u32`).
+const RTA_NH_ID: u16 = 30;
+/// `sizeof(struct rtnexthop)`: `rtnh_len` (`u16`), `rtnh_flags`,
+/// `rtnh_hops`, `rtnh_ifindex` (`int`).
+const RTNEXTHOP_LEN: usize = 8;
+/// `IFA_ADDRESS`: the address, or the peer of a point-to-point address.
+const IFA_ADDRESS: u16 = 1;
+/// `IFA_LOCAL`: the local address when a peer is set.
+const IFA_LOCAL: u16 = 2;
 /// `NLMSG_ERROR`.
 const NLMSG_ERROR: u16 = 2;
 /// `NLMSG_DONE`.
@@ -91,6 +122,10 @@ pub enum NetlinkError {
     UnexpectedPort,
     /// A link reply described another interface index than requested.
     UnexpectedLink,
+    /// A route names a nexthop object (`RTA_NH_ID`) without its device
+    /// (`net.ipv4.nexthop_compat_mode = 0`), so whether it leaves through
+    /// the port cannot be told.
+    Unattributable,
 }
 
 impl NetlinkError {
@@ -107,24 +142,72 @@ impl fmt::Display for NetlinkError {
     }
 }
 
-/// The 24-byte `RTM_GETADDR` dump request for `AF_INET`.
-pub fn dump_request(sequence: u32) -> [u8; HEADER_LEN + IFADDRMSG_LEN] {
-    let mut request = [0_u8; HEADER_LEN + IFADDRMSG_LEN];
-    let len = u32::try_from(request.len()).unwrap_or(u32::MAX);
-    request[0..4].copy_from_slice(&len.to_ne_bytes());
-    request[4..6].copy_from_slice(&RTM_GETADDR.to_ne_bytes());
+/// An address family of the dumps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Family {
+    Ipv4,
+    Ipv6,
+}
+
+impl Family {
+    const fn af(self) -> u8 {
+        match self {
+            Self::Ipv4 => AF_INET,
+            Self::Ipv6 => AF_INET6,
+        }
+    }
+
+    /// Bytes of an address.
+    const fn address_len(self) -> usize {
+        match self {
+            Self::Ipv4 => 4,
+            Self::Ipv6 => 16,
+        }
+    }
+}
+
+/// What one dump counts for one interface index.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Dump {
+    /// `RTM_GETADDR`: addresses on the interface ([`address_matches`]).
+    Addresses(Family),
+    /// `RTM_GETROUTE` of every table: routes out of the interface
+    /// ([`route_matches`]).
+    Routes(Family),
+}
+
+/// Longest dump request: header and `rtmsg`.
+pub const REQUEST_LEN: usize = HEADER_LEN + RTMSG_LEN;
+
+/// The dump request of `dump`, at the front of the returned array, and its
+/// length: 24 bytes (`ifaddrmsg`) for addresses, 28 (`rtmsg`) for routes.
+/// The family header is zero but for its family, so the kernel dumps every
+/// table, no cached route (`RTM_F_CLONED` clear), and (without
+/// `NETLINK_GET_STRICT_CHK`) no filter.
+pub fn dump_request(dump: Dump, sequence: u32) -> ([u8; REQUEST_LEN], usize) {
+    let (kind, family, body) = match dump {
+        Dump::Addresses(family) => (RTM_GETADDR, family, IFADDRMSG_LEN),
+        Dump::Routes(family) => (RTM_GETROUTE, family, RTMSG_LEN),
+    };
+    let mut request = [0_u8; REQUEST_LEN];
+    let len = HEADER_LEN + body;
+    let len32 = u32::try_from(len).unwrap_or(u32::MAX);
+    request[0..4].copy_from_slice(&len32.to_ne_bytes());
+    request[4..6].copy_from_slice(&kind.to_ne_bytes());
     request[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
     request[8..12].copy_from_slice(&sequence.to_ne_bytes());
-    // nlmsg_pid 0: addressed to the kernel.
-    request[HEADER_LEN] = AF_INET;
-    request
+    // nlmsg_pid 0: addressed to the kernel. The family is the first byte
+    // of both `ifaddrmsg` and `rtmsg`.
+    request[HEADER_LEN] = family.af();
+    (request, len)
 }
 
 /// Result of parsing one received datagram.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Chunk {
-    /// IPv4 addresses of the interface in this datagram.
-    pub addresses: u32,
+    /// Messages of this datagram that matched (addresses on, or routes out
+    /// of, the interface).
+    pub count: u32,
     /// `NLMSG_DONE` was seen.
     pub done: bool,
     /// A message carried `NLM_F_DUMP_INTR`.
@@ -141,15 +224,19 @@ fn u32_at(bytes: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]))
 }
 
-/// Parses one datagram of the dump answering `sequence` on the socket with
-/// port id `port`, counting `AF_INET` addresses of `ifindex`. Messages of
-/// another sequence are skipped; a message of this sequence for another
-/// port id fails closed. `NLMSG_DONE` carrying a negative error (an
-/// aborted dump) fails closed too.
+/// Parses one datagram of the dump `dump` answering `sequence` on the
+/// socket with port id `port`, counting the messages that match `ifindex`
+/// ([`address_matches`], [`route_matches`]). Messages of another sequence
+/// are skipped, and so are other message types and families (a kernel
+/// without the family answers through `rtnl_dump_all` with every family);
+/// a message of this sequence for another port id fails closed.
+/// `NLMSG_DONE` carrying a negative error (an aborted dump) fails closed
+/// too.
 pub fn parse_chunk(
     datagram: &[u8],
     sequence: u32,
     port: u32,
+    dump: Dump,
     ifindex: u32,
 ) -> Result<Chunk, NetlinkError> {
     let mut chunk = Chunk::default();
@@ -194,10 +281,17 @@ pub fn parse_chunk(
                     }
                 }
                 RTM_NEWADDR => {
-                    let family = *message.get(HEADER_LEN).ok_or(NetlinkError::Malformed)?;
-                    let index = u32_at(message, HEADER_LEN + 4).ok_or(NetlinkError::Malformed)?;
-                    if family == AF_INET && index == ifindex {
-                        chunk.addresses = chunk.addresses.saturating_add(1);
+                    if let Dump::Addresses(family) = dump {
+                        if address_matches(message, family, ifindex)? {
+                            chunk.count = chunk.count.saturating_add(1);
+                        }
+                    }
+                }
+                RTM_NEWROUTE => {
+                    if let Dump::Routes(family) = dump {
+                        if route_matches(message, family, ifindex)? {
+                            chunk.count = chunk.count.saturating_add(1);
+                        }
                     }
                 }
                 _ => {}
@@ -211,6 +305,191 @@ pub fn parse_chunk(
         at += advance;
     }
     Ok(chunk)
+}
+
+/// The attributes of `message` from byte `at` on, as `(type, payload)`
+/// with the type bits only (`NLA_TYPE_MASK`). An attribute shorter than
+/// its header or running past the message fails closed.
+fn attributes<'m>(
+    message: &'m [u8],
+    mut at: usize,
+    mut visit: impl FnMut(u16, &'m [u8]) -> Result<(), NetlinkError>,
+) -> Result<(), NetlinkError> {
+    while at < message.len() {
+        let attr_len = usize::from(u16_at(message, at).ok_or(NetlinkError::Malformed)?);
+        let attr_kind = u16_at(message, at + 2).ok_or(NetlinkError::Malformed)? & NLA_TYPE_MASK;
+        if attr_len < 4 || at + attr_len > message.len() {
+            return Err(NetlinkError::Malformed);
+        }
+        visit(attr_kind, &message[at + 4..at + attr_len])?;
+        // NLA_ALIGN.
+        at += attr_len.div_ceil(4) * 4;
+    }
+    Ok(())
+}
+
+/// Stores `payload` in an empty `slot`: a second copy of the attribute
+/// fails closed.
+fn once<'m>(slot: &mut Option<&'m [u8]>, payload: &'m [u8]) -> Result<(), NetlinkError> {
+    if slot.replace(payload).is_some() {
+        return Err(NetlinkError::Malformed);
+    }
+    Ok(())
+}
+
+/// A `u32` attribute payload of exactly four bytes.
+fn u32_payload(payload: &[u8]) -> Result<u32, NetlinkError> {
+    let value: [u8; 4] = payload.try_into().map_err(|_| NetlinkError::Malformed)?;
+    Ok(u32::from_ne_bytes(value))
+}
+
+/// Whether the `RTM_NEWADDR` `message` is an address of `family` on
+/// `ifindex` that counts: every IPv4 address, and every IPv6 address
+/// outside the link-local `fe80::/10`. The kernel creates a link-local
+/// address on every IPv6 device, and a router never forwards a packet
+/// with a link-local source or destination (RFC 4291 2.5.6), so one alone
+/// cannot carry traffic between the ports. The IPv6 address is
+/// `IFA_LOCAL` if present (a point-to-point address, whose `IFA_ADDRESS`
+/// is the peer), otherwise `IFA_ADDRESS`; neither, a duplicate, or a
+/// wrong size fails closed. A message shorter than `ifaddrmsg` fails
+/// closed; another family or index does not count.
+pub fn address_matches(message: &[u8], family: Family, ifindex: u32) -> Result<bool, NetlinkError> {
+    if message.len() < HEADER_LEN + IFADDRMSG_LEN {
+        return Err(NetlinkError::Malformed);
+    }
+    let index = u32_at(message, HEADER_LEN + 4).ok_or(NetlinkError::Malformed)?;
+    if message[HEADER_LEN] != family.af() || index != ifindex {
+        return Ok(false);
+    }
+    if family == Family::Ipv4 {
+        return Ok(true);
+    }
+    let mut address = None;
+    let mut local = None;
+    attributes(
+        message,
+        HEADER_LEN + IFADDRMSG_LEN,
+        |kind, payload| match kind {
+            IFA_ADDRESS => once(&mut address, payload),
+            IFA_LOCAL => once(&mut local, payload),
+            _ => Ok(()),
+        },
+    )?;
+    for payload in [address, local].into_iter().flatten() {
+        if payload.len() != family.address_len() {
+            return Err(NetlinkError::Malformed);
+        }
+    }
+    let own = local.or(address).ok_or(NetlinkError::Malformed)?;
+    Ok(!is_ipv6_link_local(own, 128))
+}
+
+/// Whether the IPv6 prefix `bytes`/`len` lies inside `fe80::/10`.
+fn is_ipv6_link_local(bytes: &[u8], len: u8) -> bool {
+    len >= 10 && bytes.first() == Some(&0xfe) && bytes.get(1).is_some_and(|b| b & 0xc0 == 0x80)
+}
+
+/// Whether the IPv6 prefix `bytes`/`len` lies inside `ff00::/8`.
+fn is_ipv6_multicast(bytes: &[u8], len: u8) -> bool {
+    len >= 8 && bytes.first() == Some(&0xff)
+}
+
+/// Whether the `RTM_NEWROUTE` `message` is a route of `family` out of
+/// `ifindex`, in any table (main, local, and every policy-routing table:
+/// the dump has no table filter): its `RTA_OIF` is `ifindex`, or one
+/// `rtnexthop` of its `RTA_MULTIPATH` is.
+///
+/// IPv4 counts every route type: a `local` or `broadcast` route on the
+/// port exists only with an address there (refused first), and a
+/// hand-made one still makes the kernel answer ARP for it.
+///
+/// IPv6 excludes destinations inside `fe80::/10` (the `fe80::/64` route,
+/// the `local` routes of link-local addresses, and the `fe80::` anycast
+/// route the kernel adds with forwarding on: link-local traffic is never
+/// forwarded, RFC 4291 2.5.6) and inside `ff00::/8` (the
+/// `multicast ff00::/8` route the kernel adds on every IPv6 device: it
+/// selects the device for sending multicast; forwarding multicast needs a
+/// multicast routing daemon, and unicast forwarding never uses it). Every
+/// other IPv6 route out of the port counts, the default route learnt from
+/// a Router Advertisement included.
+///
+/// Fails closed: a message shorter than `rtmsg`; a prefix length beyond
+/// the family; a duplicated `RTA_DST`, `RTA_OIF`, `RTA_MULTIPATH`,
+/// `RTA_TABLE`, or `RTA_NH_ID`; a wrongly sized one; an `rtnexthop`
+/// shorter than 8 bytes or running past `RTA_MULTIPATH`; an empty
+/// `RTA_MULTIPATH`; an IPv6 prefix without `RTA_DST`; and a route that
+/// names a nexthop object without a device
+/// ([`NetlinkError::Unattributable`]). Another family does not count.
+pub fn route_matches(message: &[u8], family: Family, ifindex: u32) -> Result<bool, NetlinkError> {
+    if message.len() < HEADER_LEN + RTMSG_LEN {
+        return Err(NetlinkError::Malformed);
+    }
+    if message[HEADER_LEN] != family.af() {
+        return Ok(false);
+    }
+    let dst_len = message[HEADER_LEN + 1];
+    if usize::from(dst_len) > family.address_len() * 8 {
+        return Err(NetlinkError::Malformed);
+    }
+    let mut dst = None;
+    let mut oif = None;
+    let mut multipath = None;
+    let mut table = None;
+    let mut nexthop_object = None;
+    attributes(
+        message,
+        HEADER_LEN + RTMSG_LEN,
+        |kind, payload| match kind {
+            RTA_DST => once(&mut dst, payload),
+            RTA_OIF => once(&mut oif, payload),
+            RTA_MULTIPATH => once(&mut multipath, payload),
+            RTA_TABLE => once(&mut table, payload),
+            RTA_NH_ID => once(&mut nexthop_object, payload),
+            _ => Ok(()),
+        },
+    )?;
+    if dst.is_some_and(|dst| dst.len() != family.address_len()) {
+        return Err(NetlinkError::Malformed);
+    }
+    for payload in [table, nexthop_object].into_iter().flatten() {
+        u32_payload(payload)?;
+    }
+    let oif = oif.map(u32_payload).transpose()?;
+    let mut through = oif == Some(ifindex);
+    if let Some(nexthops) = multipath {
+        through |= multipath_through(nexthops, ifindex)?;
+    }
+    if oif.is_none() && multipath.is_none() && nexthop_object.is_some() {
+        return Err(NetlinkError::Unattributable);
+    }
+    if family == Family::Ipv6 && dst_len != 0 {
+        let dst = dst.ok_or(NetlinkError::Malformed)?;
+        if is_ipv6_link_local(dst, dst_len) || is_ipv6_multicast(dst, dst_len) {
+            return Ok(false);
+        }
+    }
+    Ok(through)
+}
+
+/// Whether one `rtnexthop` of an `RTA_MULTIPATH` payload names
+/// `ifindex`. Each is at least 8 bytes, inside the payload, and
+/// `RTNH_ALIGN`ed (4 bytes) to the next; its nested attributes are
+/// skipped.
+fn multipath_through(nexthops: &[u8], ifindex: u32) -> Result<bool, NetlinkError> {
+    if nexthops.is_empty() {
+        return Err(NetlinkError::Malformed);
+    }
+    let mut through = false;
+    let mut at = 0;
+    while at < nexthops.len() {
+        let len = usize::from(u16_at(nexthops, at).ok_or(NetlinkError::Malformed)?);
+        if len < RTNEXTHOP_LEN || at + len > nexthops.len() {
+            return Err(NetlinkError::Malformed);
+        }
+        through |= u32_at(nexthops, at + 4).ok_or(NetlinkError::Malformed)? == ifindex;
+        at += len.div_ceil(4) * 4;
+    }
+    Ok(through)
 }
 
 /// Link facts of one interface from an `RTM_NEWLINK` reply.
@@ -327,28 +606,17 @@ fn parse_link(message: &[u8], ifindex: u32) -> Result<LinkFacts, NetlinkError> {
     let flags = u32_at(message, HEADER_LEN + 8).ok_or(NetlinkError::Malformed)?;
     let mut mtu = None;
     let mut rx_queues = None;
-    let mut at = HEADER_LEN + IFINFOMSG_LEN;
-    while at < message.len() {
-        let attr_len = usize::from(u16_at(message, at).ok_or(NetlinkError::Malformed)?);
-        let attr_kind = u16_at(message, at + 2).ok_or(NetlinkError::Malformed)? & NLA_TYPE_MASK;
-        if attr_len < 4 || at + attr_len > message.len() {
+    attributes(message, HEADER_LEN + IFINFOMSG_LEN, |kind, payload| {
+        let slot = match kind {
+            IFLA_MTU => &mut mtu,
+            IFLA_NUM_RX_QUEUES => &mut rx_queues,
+            _ => return Ok(()),
+        };
+        if slot.replace(u32_payload(payload)?).is_some() {
             return Err(NetlinkError::Malformed);
         }
-        let payload = &message[at + 4..at + attr_len];
-        let slot = match attr_kind {
-            IFLA_MTU => Some(&mut mtu),
-            IFLA_NUM_RX_QUEUES => Some(&mut rx_queues),
-            _ => None,
-        };
-        if let Some(slot) = slot {
-            let value: [u8; 4] = payload.try_into().map_err(|_| NetlinkError::Malformed)?;
-            if slot.replace(u32::from_ne_bytes(value)).is_some() {
-                return Err(NetlinkError::Malformed);
-            }
-        }
-        // NLA_ALIGN.
-        at += attr_len.div_ceil(4) * 4;
-    }
+        Ok(())
+    })?;
     Ok(LinkFacts {
         mtu: mtu.ok_or(NetlinkError::Malformed)?,
         rx_queues,
@@ -393,20 +661,25 @@ impl LinkProbe {
         self.sequence
     }
 
-    /// Kernel IPv4 addresses of `ifindex`, through one `RTM_GETADDR` dump
-    /// on the reused socket and buffer (no allocation; non-blocking
-    /// receives: the kernel queues each next dump chunk while handing out
-    /// the previous one). A dump that raced a change is retried at most
-    /// [`DUMP_ATTEMPTS`] times.
-    pub fn ipv4_addresses(&mut self, ifindex: u32) -> Result<u32, NetlinkError> {
+    /// What `dump` counts for `ifindex` (addresses on it, routes out of
+    /// it), through one dump on the reused socket and buffer (no
+    /// allocation; non-blocking receives: the kernel queues each next dump
+    /// chunk while handing out the previous one). A dump that raced a
+    /// change is retried at most [`DUMP_ATTEMPTS`] times.
+    pub fn count(&mut self, dump: Dump, ifindex: u32) -> Result<u32, NetlinkError> {
         for _ in 0..DUMP_ATTEMPTS {
             let sequence = self.next_sequence();
-            if let Some(total) = dump_once(&self.socket, &mut self.buffer, sequence, true, ifindex)?
+            if let Some(total) = dump_once(&self.socket, &mut self.buffer, sequence, dump, ifindex)?
             {
                 return Ok(total);
             }
         }
         Err(NetlinkError::Interrupted)
+    }
+
+    /// Kernel IPv4 addresses of `ifindex` ([`Self::count`]).
+    pub fn ipv4_addresses(&mut self, ifindex: u32) -> Result<u32, NetlinkError> {
+        self.count(Dump::Addresses(Family::Ipv4), ifindex)
     }
 
     /// Link facts of `ifindex` in this socket's (the caller's) network
@@ -443,48 +716,32 @@ impl LinkProbe {
     }
 }
 
-/// Counts the kernel IPv4 addresses of `ifindex` in the caller's network
-/// namespace, retrying a dump that raced a change at most
-/// [`DUMP_ATTEMPTS`] times.
-#[cfg(target_os = "linux")]
-pub fn ipv4_address_count(ifindex: u32) -> Result<u32, NetlinkError> {
-    let mut buffer = vec![0_u8; RECEIVE_BUFFER];
-    let mut sequence = 0;
-    for _ in 0..DUMP_ATTEMPTS {
-        let socket = sys::RouteSocket::open()?;
-        sequence += 1;
-        if let Some(total) = dump_once(&socket, &mut buffer, sequence, false, ifindex)? {
-            return Ok(total);
-        }
-    }
-    Err(NetlinkError::Interrupted)
-}
-
-/// One `RTM_GETADDR` dump on `socket`: `Ok(None)` if it raced a change
+/// One dump on `socket`: `Ok(None)` if it raced a change
 /// (`NLM_F_DUMP_INTR`). Messages of other sequences are skipped.
 #[cfg(target_os = "linux")]
 fn dump_once(
     socket: &sys::RouteSocket,
     buffer: &mut [u8],
     sequence: u32,
-    nonblocking: bool,
+    dump: Dump,
     ifindex: u32,
 ) -> Result<Option<u32>, NetlinkError> {
-    socket.send(&dump_request(sequence))?;
-    // The send (or connect) bound the socket; its port id names our replies.
+    let (request, len) = dump_request(dump, sequence);
+    socket.send(&request[..len])?;
+    // The connect bound the socket; its port id names our replies.
     let port = socket.port_id()?;
     let mut total = 0_u32;
     let mut interrupted = false;
     loop {
-        let received = socket.receive(buffer, nonblocking)?;
+        let received = socket.receive(buffer, true)?;
         if received == 0 {
             return Err(NetlinkError::EndOfStream);
         }
         if received > buffer.len() {
             return Err(NetlinkError::Truncated);
         }
-        let chunk = parse_chunk(&buffer[..received], sequence, port, ifindex)?;
-        total = total.saturating_add(chunk.addresses);
+        let chunk = parse_chunk(&buffer[..received], sequence, port, dump, ifindex)?;
+        total = total.saturating_add(chunk.count);
         interrupted |= chunk.interrupted;
         if chunk.done {
             return Ok((!interrupted).then_some(total));
@@ -696,6 +953,10 @@ mod tests {
     use super::*;
 
     const PORT: u32 = 4242;
+    const V4A: Dump = Dump::Addresses(Family::Ipv4);
+    const V6A: Dump = Dump::Addresses(Family::Ipv6);
+    const V4R: Dump = Dump::Routes(Family::Ipv4);
+    const V6R: Dump = Dump::Routes(Family::Ipv6);
 
     fn message(kind: u16, flags: u16, sequence: u32, payload: &[u8]) -> Vec<u8> {
         message_for(PORT, kind, flags, sequence, payload)
@@ -728,13 +989,301 @@ mod tests {
 
     #[test]
     fn request_is_an_af_inet_dump() {
-        let request = dump_request(9);
+        let (request, len) = dump_request(V4A, 9);
+        assert_eq!(len, 24);
         assert_eq!(&request[0..4], &24_u32.to_ne_bytes());
         assert_eq!(&request[4..6], &22_u16.to_ne_bytes());
         assert_eq!(&request[6..8], &0x301_u16.to_ne_bytes());
         assert_eq!(&request[8..12], &9_u32.to_ne_bytes());
         assert_eq!(request[16], 2);
         assert!(request[17..].iter().all(|byte| *byte == 0));
+    }
+
+    /// Route dumps carry a zero `rtmsg` but for the family: every table
+    /// (`rtm_table` 0, no `RTA_TABLE`), no cached routes (`RTM_F_CLONED`
+    /// clear).
+    #[test]
+    fn route_and_ipv6_requests_dump_every_table() {
+        for (dump, kind, len, family) in [
+            (V4R, 26_u16, 28_usize, 2_u8),
+            (V6R, 26, 28, 10),
+            (V6A, 22, 24, 10),
+        ] {
+            let (request, got) = dump_request(dump, 3);
+            assert_eq!(got, len);
+            assert_eq!(&request[0..4], &u32::try_from(len).unwrap().to_ne_bytes());
+            assert_eq!(&request[4..6], &kind.to_ne_bytes());
+            assert_eq!(&request[6..8], &0x301_u16.to_ne_bytes());
+            assert_eq!(&request[8..12], &3_u32.to_ne_bytes());
+            assert_eq!(&request[12..16], &[0; 4], "to the kernel");
+            assert_eq!(request[16], family);
+            assert!(request[17..].iter().all(|byte| *byte == 0), "{dump:?}");
+        }
+    }
+
+    fn ipv6(text: &str) -> [u8; 16] {
+        text.parse::<std::net::Ipv6Addr>()
+            .expect("address")
+            .octets()
+    }
+
+    /// An `RTM_NEWADDR` of `family`/`index` with the given attributes.
+    fn address_with(family: u8, index: u32, attributes: &[Vec<u8>]) -> Vec<u8> {
+        let mut payload = vec![family, 64, 0, 0];
+        payload.extend_from_slice(&index.to_ne_bytes());
+        for attribute in attributes {
+            payload.extend_from_slice(attribute);
+        }
+        message(RTM_NEWADDR, 0x2, 7, &payload)
+    }
+
+    /// An `RTM_NEWROUTE` of `family` with `dst_len` and attributes.
+    fn route(family: u8, dst_len: u8, table: u8, attributes: &[Vec<u8>]) -> Vec<u8> {
+        // rtmsg: family, dst_len, src_len, tos, table, protocol, scope,
+        // type, flags.
+        let mut payload = vec![family, dst_len, 0, 0, table, 4, 0, 1];
+        payload.extend_from_slice(&0_u32.to_ne_bytes());
+        for attribute in attributes {
+            payload.extend_from_slice(attribute);
+        }
+        message(RTM_NEWROUTE, 0x2, 7, &payload)
+    }
+
+    fn oif(index: u32) -> Vec<u8> {
+        attribute(RTA_OIF, &index.to_ne_bytes())
+    }
+
+    /// One `rtnexthop` for `index` with a nested `RTA_GATEWAY`.
+    fn nexthop(index: u32) -> Vec<u8> {
+        let gateway = attribute(5, &[192, 0, 2, 1]);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&u16::try_from(8 + gateway.len()).unwrap().to_ne_bytes());
+        bytes.extend_from_slice(&[0, 0]);
+        bytes.extend_from_slice(&index.to_ne_bytes());
+        bytes.extend(gateway);
+        bytes
+    }
+
+    fn multipath(nexthops: &[Vec<u8>]) -> Vec<u8> {
+        attribute(RTA_MULTIPATH, &nexthops.concat())
+    }
+
+    fn count(datagram: &[u8], dump: Dump) -> Result<u32, NetlinkError> {
+        parse_chunk(datagram, 7, PORT, dump, 5).map(|chunk| chunk.count)
+    }
+
+    /// Routes in every table count (main 254, local 255, a policy-routing
+    /// table above 255 through `RTA_TABLE`), by `RTA_OIF` or by one
+    /// multipath nexthop; routes elsewhere, without a device (blackhole),
+    /// and of the other family do not.
+    #[test]
+    fn routes_out_of_the_port_count_in_every_table() {
+        let table = |id: u32| attribute(RTA_TABLE, &id.to_ne_bytes());
+        let dst4 = attribute(RTA_DST, &[10, 0, 0, 0]);
+        let mut datagram = Vec::new();
+        datagram.extend(route(2, 8, 254, &[table(254), dst4.clone(), oif(5)]));
+        datagram.extend(route(2, 32, 255, &[table(255), dst4.clone(), oif(5)]));
+        datagram.extend(route(2, 0, 252, &[table(1000), oif(5)]));
+        datagram.extend(route(2, 0, 100, &[multipath(&[nexthop(6), nexthop(5)])]));
+        datagram.extend(route(2, 8, 254, &[dst4.clone(), oif(6)]));
+        datagram.extend(route(2, 8, 254, &[multipath(&[nexthop(6), nexthop(7)])]));
+        datagram.extend(route(2, 8, 254, std::slice::from_ref(&dst4)));
+        datagram.extend(route(10, 0, 254, &[oif(5)]));
+        assert_eq!(count(&datagram, V4R), Ok(4));
+        // The same datagram answers nothing to an address dump.
+        assert_eq!(count(&datagram, V4A), Ok(0));
+        // IPv4 counts local and broadcast routes and a nexthop object
+        // whose device the kernel reports (nexthop_compat_mode 1).
+        let nh_id = attribute(RTA_NH_ID, &9_u32.to_ne_bytes());
+        let with_object = route(2, 8, 254, &[dst4, nh_id.clone(), oif(5)]);
+        assert_eq!(count(&with_object, V4R), Ok(1));
+        // A nexthop object without its device cannot be attributed.
+        let bare_object = route(2, 0, 254, &[nh_id]);
+        assert_eq!(count(&bare_object, V4R), Err(NetlinkError::Unattributable));
+    }
+
+    /// IPv6: the kernel's automatic link-local and multicast routes are
+    /// excluded; the default route (from a Router Advertisement), a global
+    /// prefix, and a site-local or ULA prefix count.
+    #[test]
+    fn ipv6_routes_exclude_link_local_and_multicast() {
+        let dst = |text: &str| attribute(RTA_DST, &ipv6(text));
+        let excluded = [
+            route(10, 64, 254, &[dst("fe80::"), oif(5)]),
+            route(10, 128, 255, &[dst("fe80::1"), oif(5)]),
+            route(10, 128, 255, &[dst("fe80::"), oif(5)]),
+            route(10, 10, 254, &[dst("fe80::"), oif(5)]),
+            route(10, 8, 255, &[dst("ff00::"), oif(5)]),
+            route(10, 16, 252, &[dst("ff02::"), oif(5)]),
+        ];
+        for message in &excluded {
+            assert_eq!(count(message, V6R), Ok(0), "{message:?}");
+        }
+        let counted = [
+            route(10, 0, 254, &[oif(5)]),
+            route(10, 64, 254, &[dst("2001:db8::"), oif(5)]),
+            route(10, 9, 254, &[dst("fe80::"), oif(5)]),
+            route(10, 64, 254, &[dst("fec0::"), oif(5)]),
+            route(10, 48, 254, &[dst("fd00::"), multipath(&[nexthop(5)])]),
+            route(10, 128, 255, &[dst("2001:db8::1"), oif(5)]),
+        ];
+        for message in &counted {
+            assert_eq!(count(message, V6R), Ok(1), "{message:?}");
+        }
+        // Another device, and IPv4 messages in an IPv6 dump.
+        assert_eq!(count(&route(10, 0, 254, &[oif(6)]), V6R), Ok(0));
+        assert_eq!(count(&route(2, 0, 254, &[oif(5)]), V6R), Ok(0));
+    }
+
+    /// Hostile route messages fail closed.
+    #[test]
+    fn hostile_route_messages_fail_closed() {
+        let dst4 = attribute(RTA_DST, &[10, 0, 0, 0]);
+        let table = attribute(RTA_TABLE, &254_u32.to_ne_bytes());
+        let nh_id = attribute(RTA_NH_ID, &1_u32.to_ne_bytes());
+        let malformed = [
+            // Shorter than rtmsg.
+            message(RTM_NEWROUTE, 0x2, 7, &[2, 0, 0, 0, 254, 0, 0, 1]),
+            // A prefix length beyond the family.
+            route(2, 33, 254, &[oif(5)]),
+            route(10, 129, 254, &[oif(5)]),
+            // Duplicates.
+            route(2, 8, 254, &[oif(5), oif(5)]),
+            route(2, 8, 254, &[oif(6), oif(5)]),
+            route(2, 8, 254, &[dst4.clone(), dst4.clone(), oif(5)]),
+            route(2, 8, 254, &[table.clone(), table.clone(), oif(5)]),
+            route(2, 8, 254, &[nh_id.clone(), nh_id.clone(), oif(5)]),
+            route(
+                2,
+                8,
+                254,
+                &[multipath(&[nexthop(5)]), multipath(&[nexthop(6)])],
+            ),
+            // Wrong sizes.
+            route(2, 8, 254, &[attribute(RTA_OIF, &5_u16.to_ne_bytes())]),
+            route(2, 8, 254, &[attribute(RTA_OIF, &[5, 0, 0, 0, 0, 0, 0, 0])]),
+            route(2, 8, 254, &[attribute(RTA_TABLE, &[254]), oif(5)]),
+            route(2, 8, 254, &[attribute(RTA_TABLE, &[0; 8]), oif(5)]),
+            route(2, 8, 254, &[attribute(RTA_NH_ID, &[1, 0]), oif(5)]),
+            route(
+                2,
+                8,
+                254,
+                &[attribute(RTA_DST, &ipv6("2001:db8::")), oif(5)],
+            ),
+            route(10, 64, 254, &[attribute(RTA_DST, &[10, 0, 0, 0]), oif(5)]),
+            // An IPv6 prefix without RTA_DST.
+            route(10, 64, 254, &[oif(5)]),
+            // Empty multipath, a short nexthop, one past the attribute.
+            route(2, 8, 254, &[attribute(RTA_MULTIPATH, &[])]),
+            route(2, 8, 254, &[attribute(RTA_MULTIPATH, &[4, 0, 0, 0])]),
+            route(
+                2,
+                8,
+                254,
+                &[attribute(RTA_MULTIPATH, &{
+                    let mut short = nexthop(5);
+                    short[0..2].copy_from_slice(&7_u16.to_ne_bytes());
+                    short
+                })],
+            ),
+            route(
+                2,
+                8,
+                254,
+                &[attribute(RTA_MULTIPATH, &{
+                    let mut long = nexthop(5);
+                    long[0..2].copy_from_slice(&64_u16.to_ne_bytes());
+                    long
+                })],
+            ),
+            route(
+                2,
+                8,
+                254,
+                &[attribute(RTA_MULTIPATH, &{
+                    let mut cut = nexthop(5);
+                    cut.extend_from_slice(&[16, 0]);
+                    cut
+                })],
+            ),
+        ];
+        for message in &malformed {
+            assert_eq!(
+                count(message, V4R).and(count(message, V6R)),
+                Err(NetlinkError::Malformed),
+                "{message:?}"
+            );
+        }
+        // An attribute shorter than its header or past its message.
+        let mut short = route(2, 8, 254, &[oif(5)]);
+        let at = short.len() - 8;
+        short[at..at + 2].copy_from_slice(&2_u16.to_ne_bytes());
+        assert_eq!(count(&short, V4R), Err(NetlinkError::Malformed));
+        let mut long = route(2, 8, 254, &[oif(5)]);
+        let at = long.len() - 8;
+        long[at..at + 2].copy_from_slice(&64_u16.to_ne_bytes());
+        assert_eq!(count(&long, V4R), Err(NetlinkError::Malformed));
+        // Flag bits of the attribute type are masked.
+        let flagged = route(
+            2,
+            8,
+            254,
+            &[attribute(0x8000 | RTA_OIF, &5_u32.to_ne_bytes())],
+        );
+        assert_eq!(count(&flagged, V4R), Ok(1));
+        // Another sequence is skipped unparsed; a foreign port id fails.
+        let mut other = malformed[1].clone();
+        other[8..12].copy_from_slice(&8_u32.to_ne_bytes());
+        assert_eq!(count(&other, V4R), Ok(0));
+        let mut foreign = route(2, 8, 254, &[oif(5)]);
+        foreign[12..16].copy_from_slice(&(PORT + 1).to_ne_bytes());
+        assert_eq!(count(&foreign, V4R), Err(NetlinkError::UnexpectedPort));
+    }
+
+    /// IPv6 addresses: link-local does not count, everything else does;
+    /// a point-to-point address is its `IFA_LOCAL`.
+    #[test]
+    fn ipv6_addresses_count_all_but_link_local() {
+        let addr = |text: &str| attribute(IFA_ADDRESS, &ipv6(text));
+        let local = |text: &str| attribute(IFA_LOCAL, &ipv6(text));
+        let mut datagram = Vec::new();
+        datagram.extend(address_with(10, 5, &[addr("fe80::1")]));
+        datagram.extend(address_with(10, 5, &[addr("febf::1")]));
+        datagram.extend(address_with(10, 5, &[addr("2001:db8::1")]));
+        datagram.extend(address_with(10, 5, &[addr("fd00::1")]));
+        datagram.extend(address_with(10, 5, &[addr("fec0::1")]));
+        datagram.extend(address_with(10, 6, &[addr("2001:db8::2")]));
+        // Peer fe80::2, own address global: counts. Peer global, own
+        // link-local: does not.
+        let global_with_peer = address_with(10, 5, &[addr("fe80::2"), local("2001:db8::3")]);
+        let link_local_with_peer = address_with(10, 5, &[addr("2001:db8::4"), local("fe80::4")]);
+        assert_eq!(count(&global_with_peer, V6A), Ok(1));
+        assert_eq!(count(&link_local_with_peer, V6A), Ok(0));
+        datagram.extend(global_with_peer);
+        datagram.extend(link_local_with_peer);
+        // IPv4 messages in an IPv6 dump.
+        datagram.extend(address(2, 5));
+        assert_eq!(count(&datagram, V6A), Ok(4));
+        assert_eq!(count(&datagram, V4A), Ok(1));
+        let malformed = [
+            address_with(10, 5, &[]),
+            address_with(10, 5, &[addr("2001:db8::1"), addr("2001:db8::1")]),
+            address_with(10, 5, &[local("2001:db8::1"), local("2001:db8::1")]),
+            address_with(10, 5, &[attribute(IFA_ADDRESS, &[192, 0, 2, 1])]),
+            address_with(10, 5, &[addr("fe80::1"), attribute(IFA_LOCAL, &[0; 4])]),
+            address_with(10, 5, &[attribute(IFA_ADDRESS, &[0; 17])]),
+            message(RTM_NEWADDR, 0x2, 7, &[10, 64, 0, 0]),
+        ];
+        for message in &malformed {
+            assert_eq!(
+                count(message, V6A),
+                Err(NetlinkError::Malformed),
+                "{message:?}"
+            );
+        }
+        // Another interface is not parsed beyond its header.
+        assert_eq!(count(&address_with(10, 6, &[]), V6A), Ok(0));
     }
 
     #[test]
@@ -745,9 +1294,9 @@ mod tests {
         datagram.extend(address(10, 5)); // AF_INET6 is not counted
         datagram.extend(address(2, 5));
         assert_eq!(
-            parse_chunk(&datagram, 7, PORT, 5),
+            parse_chunk(&datagram, 7, PORT, V4A, 5),
             Ok(Chunk {
-                addresses: 2,
+                count: 2,
                 done: false,
                 interrupted: false
             })
@@ -756,50 +1305,56 @@ mod tests {
         // Anything after DONE is ignored.
         datagram.extend(address(2, 5));
         assert_eq!(
-            parse_chunk(&datagram, 7, PORT, 5),
+            parse_chunk(&datagram, 7, PORT, V4A, 5),
             Ok(Chunk {
-                addresses: 2,
+                count: 2,
                 done: true,
                 interrupted: false
             })
         );
         // Another sequence is skipped entirely.
-        assert_eq!(parse_chunk(&datagram, 8, PORT, 5), Ok(Chunk::default()));
+        assert_eq!(
+            parse_chunk(&datagram, 8, PORT, V4A, 5),
+            Ok(Chunk::default())
+        );
     }
 
     #[test]
     fn errors_interruptions_and_malformed_input_are_typed() {
         let error = message(NLMSG_ERROR, 0, 7, &(-1_i32).to_ne_bytes());
         assert_eq!(
-            parse_chunk(&error, 7, PORT, 1),
+            parse_chunk(&error, 7, PORT, V4A, 1),
             Err(NetlinkError::Kernel(-1))
         );
         let ack = message(NLMSG_ERROR, 0, 7, &0_i32.to_ne_bytes());
-        assert_eq!(parse_chunk(&ack, 7, PORT, 1), Ok(Chunk::default()));
+        assert_eq!(parse_chunk(&ack, 7, PORT, V4A, 1), Ok(Chunk::default()));
         let interrupted = message(RTM_NEWADDR, NLM_F_DUMP_INTR, 7, &[2, 0, 0, 0, 1, 0, 0, 0]);
-        let chunk = parse_chunk(&interrupted, 7, PORT, 1).expect("parsed");
+        let chunk = parse_chunk(&interrupted, 7, PORT, V4A, 1).expect("parsed");
         assert!(chunk.interrupted);
-        assert_eq!(chunk.addresses, 1);
+        assert_eq!(chunk.count, 1);
         // Length below the header, beyond the datagram, short payload.
         let mut short = address(2, 1);
         short[0..4].copy_from_slice(&8_u32.to_ne_bytes());
         assert_eq!(
-            parse_chunk(&short, 7, PORT, 1),
+            parse_chunk(&short, 7, PORT, V4A, 1),
             Err(NetlinkError::Malformed)
         );
         let mut long = address(2, 1);
         long[0..4].copy_from_slice(&4096_u32.to_ne_bytes());
-        assert_eq!(parse_chunk(&long, 7, PORT, 1), Err(NetlinkError::Malformed));
+        assert_eq!(
+            parse_chunk(&long, 7, PORT, V4A, 1),
+            Err(NetlinkError::Malformed)
+        );
         let truncated = message(RTM_NEWADDR, 0, 7, &[2, 0]);
         assert_eq!(
-            parse_chunk(&truncated, 7, PORT, 1),
+            parse_chunk(&truncated, 7, PORT, V4A, 1),
             Err(NetlinkError::Malformed)
         );
         assert_eq!(
-            parse_chunk(&[1, 2, 3], 7, PORT, 1),
+            parse_chunk(&[1, 2, 3], 7, PORT, V4A, 1),
             Err(NetlinkError::Malformed)
         );
-        assert_eq!(parse_chunk(&[], 7, PORT, 1), Ok(Chunk::default()));
+        assert_eq!(parse_chunk(&[], 7, PORT, V4A, 1), Ok(Chunk::default()));
     }
 
     #[test]
@@ -809,23 +1364,23 @@ mod tests {
         let mut datagram = address(2, 5);
         datagram.extend(message(NLMSG_DONE, 0x2, 7, &(-4_i32).to_ne_bytes()));
         assert_eq!(
-            parse_chunk(&datagram, 7, PORT, 5),
+            parse_chunk(&datagram, 7, PORT, V4A, 5),
             Err(NetlinkError::Kernel(-4))
         );
         // A short DONE (no status) and a zero status complete the dump.
         let bare = message(NLMSG_DONE, 0x2, 7, &[]);
-        assert!(parse_chunk(&bare, 7, PORT, 5).expect("done").done);
+        assert!(parse_chunk(&bare, 7, PORT, V4A, 5).expect("done").done);
         let zero = message(NLMSG_DONE, 0x2, 7, &0_i32.to_ne_bytes());
-        assert!(parse_chunk(&zero, 7, PORT, 5).expect("done").done);
+        assert!(parse_chunk(&zero, 7, PORT, V4A, 5).expect("done").done);
         // A message of this dump for another port id.
         let foreign = message_for(PORT + 1, RTM_NEWADDR, 0x2, 7, &[2, 0, 0, 0, 5, 0, 0, 0]);
         assert_eq!(
-            parse_chunk(&foreign, 7, PORT, 5),
+            parse_chunk(&foreign, 7, PORT, V4A, 5),
             Err(NetlinkError::UnexpectedPort)
         );
         // Another sequence is skipped whatever its port id.
         let other = message_for(PORT + 1, RTM_NEWADDR, 0x2, 8, &[2, 0, 0, 0, 5, 0, 0, 0]);
-        assert_eq!(parse_chunk(&other, 7, PORT, 5), Ok(Chunk::default()));
+        assert_eq!(parse_chunk(&other, 7, PORT, V4A, 5), Ok(Chunk::default()));
     }
 
     fn attribute(kind: u16, payload: &[u8]) -> Vec<u8> {
@@ -1021,15 +1576,28 @@ mod tests {
         assert!(probe.ipv4_addresses(1).is_ok());
         assert_eq!(probe.ipv4_addresses(i32::MAX as u32), Ok(0));
         assert_eq!(probe.query(1).map(|facts| facts.mtu), Ok(facts.mtu));
+        // Route and IPv6 dumps of every table on the same socket; a
+        // missing index has none (IPv6 may be off in this kernel, which
+        // still answers).
+        for family in [Family::Ipv4, Family::Ipv6] {
+            for dump in [Dump::Addresses(family), Dump::Routes(family)] {
+                assert!(probe.count(dump, 1).is_ok(), "{dump:?}");
+                assert_eq!(probe.count(dump, i32::MAX as u32), Ok(0), "{dump:?}");
+            }
+        }
+        assert_eq!(probe.query(1).map(|facts| facts.mtu), Ok(facts.mtu));
     }
 
     /// The live dump works unprivileged in any network namespace; the
     /// loopback device (ifindex 1) of the test host's namespace has
-    /// 127.0.0.1 unless it was removed, so only success is asserted.
+    /// 127.0.0.1 and local routes unless they were removed, so only
+    /// success is asserted.
     #[cfg(target_os = "linux")]
     #[test]
     fn live_dump_answers() {
-        assert!(ipv4_address_count(1).is_ok());
-        assert_eq!(ipv4_address_count(u32::MAX), Ok(0));
+        let mut probe = LinkProbe::open().expect("socket");
+        assert!(probe.ipv4_addresses(1).is_ok());
+        assert_eq!(probe.ipv4_addresses(u32::MAX), Ok(0));
+        assert_eq!(probe.count(Dump::Routes(Family::Ipv4), u32::MAX), Ok(0));
     }
 }

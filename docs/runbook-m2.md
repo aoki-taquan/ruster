@@ -72,6 +72,36 @@ All commands assume a dedicated router host or network namespace. Replace
   firewall". If other interfaces of the namespace need forwarding, start
   with `--allow-kernel-forwarding` (the check only warns); prefer a
   dedicated namespace instead.
+- **IPv6 off on the ports (recommended)**: the router is IPv4 only, so
+  while it is detached the kernel's IPv6 stack is the only one on the
+  ports. Set `sysctl -w net.ipv6.conf.<port>.disable_ipv6=1` for every
+  port (persist it in `/etc/sysctl.d/` or in the namespace setup; it must
+  be set again after the device is re-created). Then the kernel drops
+  every IPv6 frame received on or sent through the port, removes its IPv6
+  addresses and routes, and refuses new ones, and the IPv6 checks pass
+  without reading anything else. A kernel without IPv6 (no
+  `/proc/sys/net/ipv6`, for example `ipv6.disable=1`) counts as disabled.
+  With IPv6 on, startup accepts only the kernel's own link-local state and
+  refuses:
+  - an IPv6 address outside `fe80::/10` on the port
+    (`checks code=KERNEL_IPV6_ADDRESSES count=N`), for example from SLAAC
+    (`accept_ra`) or DHCPv6;
+  - an IPv6 route out of the port in any table other than the kernel's
+    automatic `fe80::/64`, link-local `local`/`anycast` and
+    `multicast ff00::/8` routes (`KERNEL_IPV6_ROUTES count=N`), for
+    example a default route learnt from a Router Advertisement;
+  - `net.ipv6.conf.all.forwarding=1` or `conf/<port>/forwarding=1`
+    (`KERNEL_IPV6_FORWARDING_ENABLED scope=global|device`);
+  - an IPv6 fact that cannot be read (`UNVERIFIABLE
+    probe=ipv6-disabled|ipv6-addresses|ipv6-routes|ipv6-forwarding`).
+
+  Why link-local alone is accepted: the kernel creates it on every IPv6
+  device, and no router forwards a packet with a link-local source or
+  destination (RFC 4291 2.5.6), so it cannot carry traffic between the
+  ports; with forwarding off the kernel can at most answer Neighbor
+  Discovery and ICMPv6 on the segment while detached. `--allow-kernel-ipv6`
+  accepts all of the above with warnings (section 3); `disable_ipv6=1` is
+  the fix.
 - **Port devices** (each checked at startup, refused otherwise):
   - exactly one RX queue: `ethtool -l lan0`, then `ethtool -L lan0 combined 1`
     (or `rx 1`). The count is rtnetlink's `IFLA_NUM_RX_QUEUES`, the number
@@ -87,14 +117,20 @@ All commands assume a dedicated router host or network namespace. Replace
   - an MTU whose frames fit a UMEM frame: `mtu + 14 <= frame-size - 256 -
     headroom` (1778 for 2048-byte frames, 3826 for 4096 with `headroom =
     0`). Otherwise `checks code=MTU_ABOVE_FRAME mtu=M limit=L`.
-  - no kernel IPv4 address and no kernel IPv4 route (main table) out of
-    the port: `ip -4 addr flush dev lan0`; `ip -4 route show dev lan0`
-    must be empty. Leave the device up (`ip link set lan0 up`).
+  - no kernel IPv4 address and no kernel IPv4 route out of the port in any
+    table (main, local, and every policy-routing table; a multipath route
+    with one nexthop on the port counts): `ip -4 addr flush dev lan0`;
+    `ip -4 route show table all dev lan0` must be empty, and so must
+    `ip -4 route show table all | grep -w lan0` for multipath routes.
+    Leave the device up (`ip link set lan0 up`). The route check reads
+    rtnetlink `RTM_GETROUTE` of every table; a route through a nexthop
+    object (`ip nexthop`) is attributed only with
+    `net.ipv4.nexthop_compat_mode=1` (the default; with 0 the dump fails
+    closed as `UNVERIFIABLE probe=ipv4-routes`).
   - no other XDP program: `ip -details link show dev lan0` must not show
     `prog/xdp`. `ruster run` never replaces or detaches a program it did
     not attach.
-  - IPv6 on the ports is not checked (section 12); disable it yourself if
-    it matters (`sysctl -w net.ipv6.conf.lan0.disable_ipv6=1`).
+  - IPv6 off, or only link-local (see above).
 - **Config file permissions (optional)**: `--strict-config-perms` (section 3).
 
 ## 2. Install and run
@@ -105,6 +141,23 @@ Build and install the binary (no external libraries; libbpf is not used):
 cargo build --release --locked -p ruster-cli
 sudo install -m 0755 target/release/ruster /usr/local/bin/ruster
 ruster --version
+```
+
+Recommended namespace setup (the ports moved into a dedicated namespace,
+kernel L3 off on them; `lan0`/`wan0` stand for the port devices):
+
+```bash
+sudo ip netns add router
+for dev in lan0 wan0; do
+    sudo ip link set "$dev" netns router
+    sudo ip netns exec router sysctl -qw "net.ipv6.conf.$dev.disable_ipv6=1"
+    sudo ip netns exec router sysctl -qw "net.ipv4.conf.$dev.forwarding=0"
+    sudo ip -n router -4 addr flush dev "$dev"
+    sudo ip -n router link set "$dev" up
+done
+sudo ip netns exec router sysctl -qw net.ipv4.ip_forward=0
+sudo ip netns exec router sysctl -qw net.ipv6.conf.all.forwarding=0
+sudo ip -n router route show table all   # nothing may name lan0 or wan0
 ```
 
 Check the config, then start in the foreground:
@@ -140,6 +193,7 @@ output wait (section 9).
 
 ```text
 ruster run [--allow-multi-queue] [--allow-kernel-forwarding]
+           [--allow-kernel-ipv6]
            [--strict-config-perms] [--stats-interval <seconds>]
            [--startup-attempts <n>] [--tx-stall-warn-secs <s>]
            [--tx-stall-fatal-secs <s>] [--kick-errors-fatal-secs <s>]
@@ -152,6 +206,7 @@ ruster run [options] -- <config.toml>
 | `--config <path>` (or `--config=<path>`, or `-- <path>`) | required | a regular file | the config read at startup and on every reload |
 | `--allow-multi-queue` | off | flag | accept a port with more than one RX queue (warned, section 1) |
 | `--allow-kernel-forwarding` | off | flag | warn instead of refusing kernel IPv4 forwarding at startup (`IPV4_FORWARDING_ENABLED scope=global\|device`, `IPV4_FORWARDING_UNVERIFIABLE`); at run time an unreadable forwarding sysctl then warns `FORWARDING_UNVERIFIABLE` instead of counting as a failed query |
+| `--allow-kernel-ipv6` | off | flag | warn instead of refusing kernel IPv6 on a port with IPv6 enabled (section 1): `IPV6_ADDRESSES_ALLOWED count=N`, `IPV6_ROUTES_ALLOWED count=N`, `IPV6_FORWARDING_ENABLED scope=global\|device`, `IPV6_UNVERIFIABLE probe=ipv6-*` at startup; at run time an unreadable IPv6 fact then warns `IPV6_UNVERIFIABLE` instead of counting as a failed query. Risk: while the router is detached (before start, after any exit, after a crash) the kernel's IPv6 stack answers on the ports and, with IPv6 forwarding on, forwards IPv6 between them or to its other interfaces without the router's firewall. One flag for the whole IPv6 stack, because the router does not handle IPv6 and the safe setting is `disable_ipv6=1`; it does not touch any IPv4 refusal, and `--allow-kernel-forwarding` does not cover IPv6 |
 | `--strict-config-perms` | off | flag | refuse a config (startup and reload) that group/other may write (`WRITABLE_BY_OTHERS`), owned by neither root nor the effective user (`UNTRUSTED_OWNER`), with a symbolic link in its path (`SYMLINK_IN_PATH`), or in a directory up to `/` that is not owned by root/the user (`UNTRUSTED_DIRECTORY`) or is group/other writable (`WRITABLE_DIRECTORY`; a root-owned sticky directory such as `/tmp` is allowed); any error checking it is `OWNER_UNVERIFIABLE` |
 | `--stats-interval <s>` | 60 | 0 to 86400 | seconds between periodic stats blocks on stdout; 0 disables them (the final block is always printed) |
 | `--startup-attempts <n>` | 3 | 1 to 10 | whole startups tried on a transient open failure (section 5); 1 disables the retry |
@@ -198,9 +253,12 @@ A refused or failed reload never ends the run.
    `ip -details link show dev lan0` then lists `prog/xdp id <n>` (`xdp`, or
    `xdpgeneric` with `xdp-attach = "generic"`).
 4. Warnings (`ruster run: warning: port=if<id> <CODE>`) do not stop startup:
-   `MULTI_QUEUE_ALLOWED rx-queues=N` (with `--allow-multi-queue`), and with
+   `MULTI_QUEUE_ALLOWED rx-queues=N` (with `--allow-multi-queue`), with
    `--allow-kernel-forwarding` `IPV4_FORWARDING_ENABLED scope=global|device`
-   and `IPV4_FORWARDING_UNVERIFIABLE`.
+   and `IPV4_FORWARDING_UNVERIFIABLE`, and with `--allow-kernel-ipv6`
+   `IPV6_UNVERIFIABLE probe=...`, `IPV6_ADDRESSES_ALLOWED count=N`,
+   `IPV6_ROUTES_ALLOWED count=N`, and `IPV6_FORWARDING_ENABLED
+   scope=global|device`.
 
 ### Startup refusals
 
@@ -332,8 +390,11 @@ exit 1.
 
 Every second the router queries each port's interface index over
 rtnetlink (`RTM_GETLINK`, namespace correct), dumps the namespace's IPv4
-addresses (`RTM_GETADDR`), and reads the forwarding sysctls (procfs), all
-on the router thread:
+addresses (`RTM_GETADDR`) and IPv4 routes of every table
+(`RTM_GETROUTE`), reads the IPv4 forwarding sysctls (procfs), and then the
+port's `disable_ipv6`; unless it is 1 it also reads the IPv6 forwarding
+sysctls and dumps the IPv6 addresses and routes. All of it runs on the
+router thread, on one reused socket and buffer, without allocation:
 
 | event | outcome |
 |---|---|
@@ -342,22 +403,34 @@ on the router thread:
 | MTU below the startup MTU | fatal `MTU_DECREASED` (TX is bounded by the startup MTU; longer frames could be stranded in the kernel) |
 | MTU above what a frame holds (`frame-size - 256 - headroom - 14`) | fatal `MTU_ABOVE_FRAME` |
 | MTU raised within that bound | warning `MTU_RAISED`, recovered when it returns; TX stays bounded by the startup MTU until a restart |
-| a query fails | warning `LINK_PROBE`; fatal `LINK_UNVERIFIABLE` after 3 failures in a row. The link query, the address dump and the forwarding read each count their own failures |
+| a query fails | warning `LINK_PROBE`; fatal `LINK_UNVERIFIABLE` after 3 failures in a row. The link query, each dump (IPv4 addresses, IPv4 routes, IPv6 addresses, IPv6 routes) and the procfs reads (IPv4 forwarding; `disable_ipv6` with the IPv6 forwarding sysctls) each count their own failures |
 | a kernel IPv4 address appears on a port | warning `KERNEL_IPV4_ADDRESSES` (`if<id>.watch.kernel_ipv4_addresses`), recovered when gone; keeps running |
+| a kernel IPv4 route out of a port appears in any table (policy routing and multipath nexthops included) | warning `KERNEL_IPV4_ROUTES` (`if<id>.watch.kernel_ipv4_routes`), recovered when gone; keeps running |
 | `net.ipv4.ip_forward` or `conf/<port>/forwarding` turns on | warning `KERNEL_FORWARDING_ENABLED` (`if<id>.watch.kernel_forwarding`), recovered when off; keeps running |
 | a forwarding sysctl becomes unreadable (for example the device renamed) | a failed query; with `--allow-kernel-forwarding` a warning `FORWARDING_UNVERIFIABLE` instead |
+| with IPv6 on for the port: an IPv6 address outside `fe80::/10` appears | warning `KERNEL_IPV6_ADDRESSES` (`if<id>.watch.kernel_ipv6_addresses`), recovered when gone; keeps running |
+| ... an IPv6 route out of the port beyond the automatic link-local and multicast ones | warning `KERNEL_IPV6_ROUTES` (`if<id>.watch.kernel_ipv6_routes`), recovered when gone; keeps running |
+| ... `net.ipv6.conf.all.forwarding` or `conf/<port>/forwarding` turns on | warning `KERNEL_IPV6_FORWARDING_ENABLED` (`if<id>.watch.kernel_ipv6_forwarding`), recovered when off; keeps running |
+| `disable_ipv6=1` set on the port | every IPv6 warning of the port recovers (nothing IPv6 is exposed) |
+| an IPv6 fact becomes unreadable | a failed query of its kind; with `--allow-kernel-ipv6` a warning `IPV6_UNVERIFIABLE` instead, recovered when every IPv6 fact reads again |
 
-Why forwarding and addresses only warn while running: while XDP is
-attached the kernel never sees a frame from a port, so they change nothing.
-A fatal exit would detach XDP, which is exactly what would let the kernel
-forward around the firewall and NAT, and a supervised restart would then be
-refused at startup. Fix the namespace while it runs (`sysctl -w
-net.ipv4.ip_forward=0`, `ip addr flush dev <port>`). If the last round still
-saw either when `ruster run` exits, the exit prints `warning: kernel
-forwarding is enabled; detached ports may be forwarded by the kernel` or
-`warning: kernel IPv4 addresses are on a port; detached ports may be
-answered and routed by the kernel`. Kernel routes are checked at startup
-only.
+Why forwarding, addresses and routes only warn while running: while XDP
+is attached the kernel never sees a frame from a port, so they change
+nothing. A fatal exit would detach XDP, which is exactly what would let the
+kernel forward around the firewall and NAT, and a supervised restart would
+then be refused at startup. Fix the namespace while it runs (`sysctl -w
+net.ipv4.ip_forward=0`, `ip addr flush dev <port>`, `ip route del ...
+table <id>`, `sysctl -w net.ipv6.conf.<port>.disable_ipv6=1`). For each kind
+the last round still saw when `ruster run` exits, the exit prints one
+line: `warning: kernel forwarding is enabled; detached ports may be
+forwarded by the kernel`, `warning: kernel IPv4 addresses are on a port;
+detached ports may be answered and routed by the kernel`, `warning: kernel
+IPv4 routes lead out of a port; detached ports may be routed by the
+kernel`, `warning: kernel IPv6 forwarding is enabled for a port; detached
+ports may be forwarded by the kernel`, `warning: kernel IPv6 addresses are
+on a port; detached ports may be answered and routed by the kernel`, and
+`warning: kernel IPv6 routes lead out of a port; detached ports may be
+routed by the kernel`.
 
 TX while a port is down: with the port administratively down (`IFF_UP`
 clear), every TX kick fails `ENETDOWN`, the kernel consumes no TX
@@ -480,7 +553,7 @@ Sections, in this order:
 | `if<id>.af_xdp_port.*` | per port: `interface`, `queue`, `mode`, `mtu`, `max_frame`, need-wakeup now, `draining`, `link_down`, `kick_owed`, `copy_reserve`, ring gauges (`fill_ring_occupancy`, `rx_ring_occupancy`, `tx_ring_unconsumed`), `fill_starved`, invalid RX descriptors and quarantines, TX (`tx_completed`, `tx_inflight`, `tx_inflight_highwater`, `tx_blocked`, `tx_over_mtu`, `tx_invalid_completions`), kicks (`tx_kicks`, `fill_kicks`, `kicks_deferred`, `kick_errors`, `kicks_link_down`, `kick_retries_suppressed`; `kick_errors` counts every failed kick and so includes `kicks_link_down`, while the `KICK_ERRORS` health code times `kick_errors - kicks_link_down` only; `kick_retries_suppressed` counts settles on a down port that skipped a retry not yet due, which made no syscall), generated frames, `cross_port_copies`, and the kernel `XDP_STATISTICS` (`kernel_rx_dropped`, `kernel_rx_invalid_descs`, `kernel_tx_invalid_descs`, `kernel_rx_ring_full`, `kernel_rx_fill_ring_empty_descs`, `kernel_tx_ring_empty_descs`) |
 | `reload.*` | `requested`, `applied`, `refused`, `failed` |
 | `watch.*` | `state` (`ok`/`warning`), `warnings` (all ports) |
-| `if<id>.watch.*` | `tx_stall`, `tx_stall_ms`, `fill_starved`, `kick_errors_persistent`, `link_up`, `link_down_events`, `link_up_events`, `mtu`, `link_probe_errors`, `kernel_ipv4_addresses`, `kernel_forwarding`, `warnings` |
+| `if<id>.watch.*` | `tx_stall`, `tx_stall_ms`, `fill_starved`, `kick_errors_persistent`, `link_up`, `link_down_events`, `link_up_events`, `mtu`, `link_probe_errors`, `kernel_ipv4_addresses`, `kernel_forwarding`, `kernel_ipv4_routes`, `kernel_ipv6_addresses`, `kernel_ipv6_routes`, `kernel_ipv6_forwarding`, `warnings` |
 | `output.dropped` | output messages dropped because a stream could not keep up |
 
 What to watch in operation: `observer.state=healthy`, `watch.state=ok`,
@@ -506,12 +579,16 @@ CLI-034).
   not one with the same MTU. Run `ruster run` under `ip netns exec <ns>`,
   which remounts `/sys`.
 - The link watch and the reload's parse and plan run synchronously on the
-  router thread: one link query and one address dump per second per port
-  (the `send` blocks while another process holds the kernel's RTNL lock),
-  and a reload for a few milliseconds; RX queues in the ring meanwhile and
-  can overflow under load. The reload's quiescence wait holds RX back for
-  at most 200 ms. The address dump lists the whole namespace, so its cost
-  grows with every address the namespace holds.
+  router thread: one link query and up to four dumps (IPv4 addresses and
+  routes, and with IPv6 on the port IPv6 addresses and routes) per second
+  per port (the `send` blocks while another process holds the kernel's
+  RTNL lock), and a reload for a few milliseconds; RX queues in the ring
+  meanwhile and can overflow under load. The reload's quiescence wait holds
+  RX back for at most 200 ms. Each dump lists the whole namespace (the
+  route dumps every table), so its cost grows with every address and route
+  the namespace holds: keep the router in a dedicated namespace with a
+  small routing table, and set `disable_ipv6=1` on the ports, which skips
+  both IPv6 dumps.
 - A port that is administratively down with TX queued holds those frames
   in the kernel's ring, so a reload while it is down fails with
   `stage=quiesce code=TIMEOUT`; bring the link up first.
@@ -521,12 +598,19 @@ CLI-034).
 - The `FILL_STARVED` delay (1 s), the 3 failed queries, and the watch
   intervals (500 ms health, 1 s link) are fixed; the TX stall and kick
   error thresholds are flags (section 3), not reloadable.
-- Only the main routing table is checked for kernel routes out of a port,
-  and only at startup; policy-routing tables are not (deferred).
-- IPv6 is not checked at all: link-local and other IPv6 addresses, IPv6
-  routes, `net.ipv6.conf.*.forwarding`. While XDP is detached the kernel
-  can still forward IPv6 between the ports; disable it on the ports
-  (`sysctl -w net.ipv6.conf.<dev>.disable_ipv6=1`) if that matters.
+- Kernel routes are attributed to a port by `RTA_OIF` and `RTA_MULTIPATH`
+  nexthops. A route through a nexthop object needs
+  `net.ipv4.nexthop_compat_mode=1` (the default, also for IPv6) to show its
+  device; with 0 such a route cannot be attributed and the dump fails
+  closed (`UNVERIFIABLE probe=ipv4-routes|ipv6-routes` at startup, a failed
+  query at run time). `ip rule` policy itself is not inspected: a route out
+  of a port counts in whatever table it is, used by a rule or not.
+- IPv6 link-local is accepted on a port with IPv6 on (section 1): the
+  kernel can still answer Neighbor Discovery and ICMPv6 on the segment
+  while the router is detached, but cannot forward with it. Only
+  `disable_ipv6=1` closes IPv6 on a port completely. IPv6 multicast
+  routing (`ip6mr`, a multicast routing daemon) is not checked; the
+  `multicast ff00::/8` route is excluded from the route count.
 - The config is validated with the same limits as `run-sim`
   (`SIM_VALIDATION_LIMITS`); production limits are not decided yet.
 - Capability diagnostics read `CapEff` in the caller's user namespace; in a
@@ -589,6 +673,19 @@ What it proves, on the runner's kernel only:
   accepted with `--allow-kernel-forwarding`, and only warned while running;
   per-port `conf/<dev>/forwarding` refused (`scope=device`) and warned; an
   undrained stdout FIFO proven full before SIGTERM; SIGKILL and restart.
+  Added by H2: IPv4 routes in a policy-routing table and a multipath route
+  with one nexthop on a port refused; the earlier phases run with IPv6 on
+  and only link-local, accepted; a global IPv6 address refused (also with
+  only `--allow-kernel-forwarding`) and accepted with warnings under
+  `--allow-kernel-ipv6`; an IPv6 route in table 200 and
+  `net.ipv6.conf.all.forwarding=1` refused, the latter accepted silently
+  with `disable_ipv6=1` on both ports; at run time a global IPv6 address
+  and its route, an IPv4 route in table 300, and IPv6 forwarding warned
+  and recovered with traffic forwarded and no fatal (`disable_ipv6=1` on
+  one port recovers only that port), exit warning for what was still on;
+  the later phases run with `disable_ipv6=1` (markers
+  `priv_run_ipv6_address`, `priv_run_ipv6_route`, `priv_run_ipv6_forwarding`,
+  `priv_run_ipv6_runtime`, and the extended `priv_run_checks`).
   Added by #305 (CI-005 to CI-007): `ruster validate` on every smoke config
   and an invalid one (exit 2, refused by `run` and by a SIGHUP reload with
   the same diagnostic), `ruster plan` verdicts that the running router then
@@ -654,10 +751,12 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `stage=open code=.../PERMISSION_DENIED` | 1 | capability or LSM policy denied a syscall | check capabilities, user namespace, SELinux/AppArmor |
 | `stage=open code=.../ERRNO_<n>` | 1 | another errno at that step (`ERRNO_11` is retried) | look the errno up; report it if unexpected |
 | `stage=checks code=MULTI_QUEUE_DEVICE rx-queues=N` | 1 | more than one allocated RX queue | `ethtool -L <dev> combined 1`, or steer and use `--allow-multi-queue` |
-| `stage=checks code=KERNEL_IPV4_ADDRESSES count=N` / `KERNEL_IPV4_ROUTES count=N` | 1 | kernel L3 config on the port | `ip -4 addr flush dev <dev>`, delete the routes |
+| `stage=checks code=KERNEL_IPV4_ADDRESSES count=N` / `KERNEL_IPV4_ROUTES count=N` | 1 | kernel L3 config on the port; routes count in every table (`ip -4 route show table all`), multipath nexthops included | `ip -4 addr flush dev <dev>`, delete the routes (`ip route del ... table <id>`) |
+| `stage=checks code=KERNEL_IPV6_ADDRESSES count=N` / `KERNEL_IPV6_ROUTES count=N` | 1 | IPv6 on the port with a global/ULA address (SLAAC, DHCPv6, manual) or a route beyond link-local/multicast (for example an RA default route) | `sysctl -w net.ipv6.conf.<dev>.disable_ipv6=1` (recommended), or knowingly `--allow-kernel-ipv6` |
+| `stage=checks code=KERNEL_IPV6_FORWARDING_ENABLED scope=global\|device` | 1 | `net.ipv6.conf.all.forwarding` or `conf/<dev>/forwarding` on with IPv6 on the port | `disable_ipv6=1` on the port, or `sysctl -w net.ipv6.conf.all.forwarding=0`, or knowingly `--allow-kernel-ipv6` |
 | `stage=checks code=KERNEL_FORWARDING_ENABLED scope=global\|device` | 1 | kernel IPv4 forwarding on | `sysctl -w net.ipv4.ip_forward=0` and `net.ipv4.conf.<dev>.forwarding=0`, or knowingly `--allow-kernel-forwarding` |
 | `stage=checks code=MTU_ABOVE_FRAME mtu=M limit=L` | 1 | frames would not fit a UMEM frame | lower the MTU to at most L, or `frame-size = 4096` |
-| `stage=checks code=UNVERIFIABLE probe=link\|rx-queues\|mtu\|ipv4-addresses\|ipv4-routes\|forwarding` | 1 | a device fact could not be read (`mtu`: sysfs and rtnetlink disagree or the MTU changed during startup) | run under `ip netns exec <ns>`; check rtnetlink and procfs |
+| `stage=checks code=UNVERIFIABLE probe=link\|rx-queues\|mtu\|ipv4-addresses\|ipv4-routes\|forwarding\|ipv6-disabled\|ipv6-addresses\|ipv6-routes\|ipv6-forwarding` | 1 | a device fact could not be read (`mtu`: sysfs and rtnetlink disagree or the MTU changed during startup) | run under `ip netns exec <ns>`; check rtnetlink and procfs |
 | `stage=attach code=CREATE_LINK/EXISTING_PROGRAM` | 1 | another XDP program is attached | remove it deliberately (`ip link set dev <dev> xdp off`) or use another device |
 | `stage=attach code=CREATE_LINK/NATIVE_XDP_UNSUPPORTED` | 1 | driver lacks native XDP | `xdp-attach = "generic"` with `mode = "copy"` |
 | `stage=attach code=LOAD_PROGRAM/VERIFIER_REJECTED verifier-log-bytes=B truncated=T` | 1 | the kernel verifier refused the redirect program | report it with the kernel version |
@@ -673,7 +772,8 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `health=MTU_DECREASED` / `MTU_ABOVE_FRAME` | 1 | MTU changed below the startup MTU / above the frame bound | restore the MTU, then restart |
 | `health=MTU_RAISED` | — | MTU raised within the frame bound; TX still bounded by the old MTU | restart to use the new MTU |
 | `health=LINK_PROBE` / `LINK_UNVERIFIABLE` | 1 if `LINK_UNVERIFIABLE` | rtnetlink/procfs queries failing (3 in a row is fatal) | check the namespace; a renamed device makes its forwarding sysctl unreadable |
-| `health=KERNEL_IPV4_ADDRESSES` / `KERNEL_FORWARDING_ENABLED` / `FORWARDING_UNVERIFIABLE` | — | kernel L3 or forwarding appeared while attached | remove it while the router runs (section 8) |
+| `health=KERNEL_IPV4_ADDRESSES` / `KERNEL_IPV4_ROUTES` / `KERNEL_FORWARDING_ENABLED` / `FORWARDING_UNVERIFIABLE` | — | kernel L3 or forwarding appeared while attached | remove it while the router runs (section 8) |
+| `health=KERNEL_IPV6_ADDRESSES` / `KERNEL_IPV6_ROUTES` / `KERNEL_IPV6_FORWARDING_ENABLED` / `IPV6_UNVERIFIABLE` | — | kernel IPv6 on a port with IPv6 on, while attached | `sysctl -w net.ipv6.conf.<dev>.disable_ipv6=1` while the router runs (section 8) |
 | `reload refused: code=RESTART_REQUIRED reasons=...` | — | the change needs a restart | restart in a quiet period |
 | `reload failed: stage=quiesce code=TIMEOUT` | — | TX did not settle within 200 ms (often a port down with TX queued) | bring the link up, send SIGHUP again |
 | `reload failed: stage=apply code=RESTART_REQUIRED.<R>\|NOT_QUIESCENT\|...` | — | the live apply refused | nothing changed; check the plan |

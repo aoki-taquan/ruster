@@ -19,7 +19,7 @@ use ruster_sim_scenario::SIM_VALIDATION_LIMITS;
 use ruster_core::PublicationQuiescenceDisposition;
 
 use super::checks::{
-    required_memlock, CheckFailure, CheckPolicy, DeviceFacts, PrivilegeFailure, Probe,
+    required_memlock, CheckFailure, CheckPolicy, DeviceFacts, Ipv6Facts, PrivilegeFailure, Probe,
 };
 use super::engine::{
     Clock, ClockedIo, Datapath, DrainProgress, IdleBackoff, LinkMonitor, StopSignal,
@@ -28,7 +28,7 @@ use super::engine::{
 use super::netlink::{LinkFacts, NetlinkError};
 use super::reload::ConfigSource;
 use super::startup::{CloseFailure, Failure, OpenPort, PortHost, Stage, StartupError};
-use super::watch::{Forwarding, LinkTarget, PortSample};
+use super::watch::{Forwarding, Ipv6Sample, LinkTarget, PortSample};
 use super::{execute, Settings, EXIT_DRAIN_INCOMPLETE, EXIT_PRIVILEGE, READY};
 use crate::config_cmd::LoadError;
 use crate::{EXIT_INVALID, EXIT_RUNTIME};
@@ -114,6 +114,10 @@ struct State {
     addresses: RefCell<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
     /// Forwarding sysctl results, consumed in order by the matching port.
     forwarding: RefCell<VecDeque<(IfId, Result<Forwarding, ()>)>>,
+    /// IPv4 route dump results, consumed in order by the matching port.
+    routes: RefCell<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
+    /// IPv6 samples, consumed in order by the matching port.
+    ipv6: RefCell<VecDeque<(IfId, Ipv6Sample)>>,
     /// Quiescence probes refused before one succeeds.
     quiesce_blocks: Cell<u32>,
     quiesce_probes: Cell<u32>,
@@ -137,6 +141,19 @@ struct FakeHost {
     panic_in_build: bool,
     /// `net.ipv4.ip_forward` reads 1.
     forwarding_on: bool,
+    /// IPv6 facts of every port at startup (`None`: IPv6 on, clean).
+    ipv6: Option<Ipv6Facts>,
+    /// IPv4 routes out of every port at startup.
+    ipv4_routes: u32,
+}
+
+/// Pops the front result of `queue` if it belongs to `port`.
+fn scripted<T>(queue: &RefCell<VecDeque<(IfId, T)>>, port: IfId) -> Option<T> {
+    let mut queue = queue.borrow_mut();
+    if queue.front().is_some_and(|(id, _)| *id == port) {
+        return queue.pop_front().map(|(_, result)| result);
+    }
+    None
 }
 
 impl FakeHost {
@@ -351,6 +368,19 @@ impl LinkMonitor for FakeLinks {
         }
         Ok(Forwarding::default())
     }
+
+    fn ipv4_routes(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError> {
+        scripted(&self.state.routes, target.interface).unwrap_or(Ok(0))
+    }
+
+    fn ipv6(&mut self, target: &LinkTarget) -> Ipv6Sample {
+        scripted(&self.state.ipv6, target.interface).unwrap_or(Ipv6Sample {
+            disabled: Ok(false),
+            addresses: Ok(0),
+            routes: Ok(0),
+            forwarding: Ok(Forwarding::default()),
+        })
+    }
 }
 
 /// Fake interface index of a port.
@@ -419,9 +449,10 @@ impl PortHost for FakeHost {
             session_mtu: 1500,
             frame_capacity: port.umem().visible_capacity(),
             ipv4_addresses: 0,
-            ipv4_routes: 0,
+            ipv4_routes: self.ipv4_routes,
             forwarding_global: Some(self.forwarding_on),
             forwarding_device: Some(false),
+            ipv6: self.ipv6.unwrap_or(Ipv6Facts::CLEAN),
         })
     }
 

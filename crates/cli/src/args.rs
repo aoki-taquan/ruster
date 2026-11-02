@@ -14,6 +14,7 @@ usage:
   ruster run-sim [--hold] --scenario <scenario.toml>
   ruster run-sim [--hold] -- <scenario.toml>
   ruster run [--allow-multi-queue] [--allow-kernel-forwarding]
+             [--allow-kernel-ipv6]
              [--strict-config-perms] [--stats-interval <seconds>]
              [--startup-attempts <n>] [--tx-stall-warn-secs <s>]
              [--tx-stall-fatal-secs <s>] [--kick-errors-fatal-secs <s>]
@@ -101,6 +102,11 @@ pub struct RunArgs {
     /// Start although kernel IPv4 forwarding is on (or unreadable) in the
     /// namespace or on a port: warned instead of refused (XDP-063).
     pub allow_kernel_forwarding: bool,
+    /// Start although the kernel IPv6 stack is exposed on a port with IPv6
+    /// enabled (addresses outside `fe80::/10`, routes out of the port,
+    /// IPv6 forwarding, or an unreadable IPv6 fact): warned instead of
+    /// refused (XDP-063).
+    pub allow_kernel_ipv6: bool,
     /// Refuse a config file that group or other may write or that is
     /// owned by neither root nor the effective user (startup and reload).
     pub strict_config_perms: bool,
@@ -261,6 +267,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
     let mut config = None;
     let mut allow_multi_queue = false;
     let mut allow_kernel_forwarding = false;
+    let mut allow_kernel_ipv6 = false;
     let mut strict_config_perms = false;
     let mut numbers: [Option<u64>; NUMERIC.len()] = [None; NUMERIC.len()];
     let mut words = rest.iter();
@@ -309,6 +316,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
             Some("--allow-kernel-forwarding") => {
                 flag(&mut allow_kernel_forwarding, "--allow-kernel-forwarding")?;
             }
+            Some("--allow-kernel-ipv6") => flag(&mut allow_kernel_ipv6, "--allow-kernel-ipv6")?,
             Some("--strict-config-perms") => {
                 flag(&mut strict_config_perms, "--strict-config-perms")?
             }
@@ -338,6 +346,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
             .and_then(|attempts| u32::try_from(attempts).ok())
             .unwrap_or(DEFAULT_STARTUP_ATTEMPTS),
         allow_kernel_forwarding,
+        allow_kernel_ipv6,
         strict_config_perms,
         tx_stall_warn_secs,
         tx_stall_fatal_secs,
@@ -574,6 +583,7 @@ mod tests {
             stats_interval_secs,
             startup_attempts: DEFAULT_STARTUP_ATTEMPTS,
             allow_kernel_forwarding: false,
+            allow_kernel_ipv6: false,
             strict_config_perms: false,
             tx_stall_warn_secs: DEFAULT_TX_STALL_WARN_SECS,
             tx_stall_fatal_secs: DEFAULT_TX_STALL_FATAL_SECS,
@@ -586,6 +596,7 @@ mod tests {
         let Ok(Command::Run(args)) = run(&[
             "run",
             "--allow-kernel-forwarding",
+            "--allow-kernel-ipv6",
             "--strict-config-perms",
             "--tx-stall-warn-secs=2",
             "--tx-stall-fatal-secs",
@@ -597,6 +608,7 @@ mod tests {
             panic!("parsed");
         };
         assert!(args.allow_kernel_forwarding && args.strict_config_perms);
+        assert!(args.allow_kernel_ipv6);
         assert_eq!(
             (
                 args.tx_stall_warn_secs,
@@ -609,6 +621,7 @@ mod tests {
             panic!("parsed");
         };
         assert!(!defaults.allow_kernel_forwarding && !defaults.strict_config_perms);
+        assert!(!defaults.allow_kernel_ipv6);
         assert_eq!(
             (
                 defaults.tx_stall_warn_secs,
@@ -617,7 +630,11 @@ mod tests {
             ),
             (1, 10, 5)
         );
-        for flag in ["--allow-kernel-forwarding", "--strict-config-perms"] {
+        for flag in [
+            "--allow-kernel-forwarding",
+            "--allow-kernel-ipv6",
+            "--strict-config-perms",
+        ] {
             assert_eq!(
                 run(&["run", "--config", "a", flag, flag]),
                 Err(UsageError::DuplicateOption(flag))
@@ -668,6 +685,7 @@ mod tests {
                 stats_interval_secs: DEFAULT_STATS_INTERVAL_SECS,
                 startup_attempts: attempts,
                 allow_kernel_forwarding: false,
+                allow_kernel_ipv6: false,
                 strict_config_perms: false,
                 tx_stall_warn_secs: DEFAULT_TX_STALL_WARN_SECS,
                 tx_stall_fatal_secs: DEFAULT_TX_STALL_FATAL_SECS,
