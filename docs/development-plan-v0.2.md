@@ -100,8 +100,7 @@ M2（Operable AF_XDP static router）は**open**である。coordinatorのscopin
 ない）でM2をM2aとM2bに分け、M2a（`ruster run`の下のcopy-mode AF_XDP router、veth E2EをCIで実行。
 multi-queue、zero-copy、X05を含まない）はM2 S1〜S11（#292〜#303）とS13で完了した。exit criterion
 ごとの判定は[`release-evidence/m2.md`](release-evidence/m2.md)にあり、9 criterionのうちmet 5、
-partially met 3、not met 1（X05）である。M2b（multi-queue S12、zero-copy、X05 lab evidence）は
-owner決定2aとX05 labの決定を待って次に進める（下の「M2の判断の記録」）。
+partially met 3、not met 1（X05）である。M2b（multi-queue S12、zero-copy、X05 lab evidence）はowner決定（2026-11-02）でdeferredである: 2a「C」（当面portごとに1 queue、X05のNIC選定と合わせて再検討）、X05 labは当面不要で運用はveth（実NIC forwarding、実driverのnative mode、zero-copyが未検証のriskはownerが受け入れた）。B3/NAT44-038は「A」で、CLI-034 hardeningの後に実装する（下の「M2の判断の記録」）。
 
 ### Partialまたは欠落
 
@@ -499,8 +498,7 @@ M2a（coordinatorのscoping提案）: `ruster run`の下で動くcopy-mode AF_XD
 [`release-evidence/m2.md`](release-evidence/m2.md)で、criterion 1、2、3、5、6、7、9がmet、4（zero-copy
 hardware）がpartially met、8（X05 artifact）がnot met。5と9はM2a close時にpartially metで、#305の
 veth gap fill（router生成ICMPv4、TX ring full、`validate`/`plan`、`observer.state`のE2E。CI-005〜007）で
-metにした。同PRでlink down中のTX保持が`KICK_ERRORS`でfatalになるbugを直した（CLI-052A）。M2b（multi-queue S12、zero-copy、X05 lab evidence）はowner決定2aとX05 labの
-決定を待って次に進める。その間はownerの「運用の残りを固める」に従いCLI-034の残りをhardening sliceで
+metにした。同PRでlink down中のTX保持が`KICK_ERRORS`でfatalになるbugを直した（CLI-052A）。M2b（multi-queue S12、zero-copy、X05 lab evidence）はowner決定（2026-11-02）でdeferredである: 2a「C」（当面portごとに1 queue、X05のNIC選定と合わせて再検討）、X05 labは当面不要で運用はveth（実NIC forwarding、実driverのnative mode、zero-copyが未検証のriskはownerが受け入れた）。B3/NAT44-038は「A」で、CLI-034 hardeningの後に実装する。いまはownerの「運用の残りを固める」に従いCLI-034の残りをhardening sliceで
 進める（H1: link down中のTX kick retryを1 msから64 msまで倍増するbackoffでrate limit）。M2全体のcloseはM2bの後である。
 
 ### M3: Household/scaled router
