@@ -441,9 +441,26 @@ impl Held {
     }
 }
 
+/// `run-sim --hold` with SIGINT reset to its default disposition.
+///
+/// `ruster` deliberately keeps an inherited-ignored SIGINT ignored (see
+/// `inherited_ignored_sigint_stays_ignored_and_sigterm_still_stops`), and
+/// SIG_IGN survives fork and exec. A test runner started as an asynchronous
+/// list of a non-interactive shell (`cargo test &` in a script or a
+/// background job without job control) inherits SIGINT ignored, so without
+/// the reset every SIGINT test would wait out [`TIMEOUT`]. coreutils
+/// `env --default-signal` (8.31+) restores SIG_DFL and execs in place, so
+/// the child's pid is `ruster`'s.
 fn hold_command() -> Command {
-    let mut command = Command::new(BIN);
-    command.args(["run-sim", "--hold", "--scenario", &fixture("scenario.toml")]);
+    let mut command = Command::new("env");
+    command.args([
+        "--default-signal=INT",
+        BIN,
+        "run-sim",
+        "--hold",
+        "--scenario",
+        &fixture("scenario.toml"),
+    ]);
     command
 }
 
