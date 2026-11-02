@@ -18,17 +18,17 @@
 //! `Unavailable` (counted, no error); a fault-class reservation or
 //! publication failure is the session error. `finish` kicks the egress at
 //! most once when it published a frame, with the same errno classification
-//! as the RX batch. Nothing allocates.
+//! as the RX batch. A lease forgotten with `mem::forget` leaves its frame
+//! Prepared and unpublished; the session's `finish` (or, if the session was
+//! forgotten too, the port's next reservation) returns it to Available and
+//! counts it abandoned / `tx_orphans_reclaimed`. Nothing allocates.
 
 use ruster_core::{
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketLease,
     GeneratedPacketSlot, GeneratedSlotCompletion, IfId,
 };
 
-use super::{
-    bump, packet_io::AfPacketIoError, schedule::KickClass, AfPacketEngine, LinuxOps, PacketOps,
-    TxReservation,
-};
+use super::{bump, packet_io::AfPacketIoError, AfPacketEngine, LinuxOps, PacketOps, TxReservation};
 
 /// Shortest frame the kernel's `SOCK_RAW` Ethernet TX accepts.
 const ETHERNET_HEADER_LEN: usize = 14;
@@ -162,12 +162,29 @@ impl<'a, O: PacketOps> AfPacketGenBatch<'a, O> {
 
     fn finish_inner(&mut self) -> GeneratedBatchCompletion<AfPacketIoError> {
         self.finished = true;
+        // A lease forgotten with `mem::forget` never ran its completion. Its
+        // borrow of this session is over now, so its frame (still Prepared,
+        // never visible to the kernel) is returned and the lease is counted
+        // as abandoned, which keeps the completion invariants exact.
+        let ended = self.requested + self.cancelled + self.abandoned;
+        let forgotten = self.allocated.saturating_sub(ended);
+        if forgotten != 0 {
+            if let Some(port) = self.port {
+                let resources = &mut self.engine.ports[port];
+                let head = resources.tx_state.producer_head;
+                resources.tx_reclaim_orphan(head);
+                for _ in 0..forgotten {
+                    bump(&mut resources.counters.generated_abandoned);
+                }
+            }
+            self.abandoned += forgotten;
+        }
         if self.accepted != 0 {
             if let Some(port) = self.port {
                 let now = self.engine.now_ms;
                 let resources = &mut self.engine.ports[port];
                 if let Err(failure) = resources.kick_classified(now, false) {
-                    if failure.class == KickClass::Fault {
+                    if failure.class.is_error() {
                         let interface = resources.interface;
                         self.record(AfPacketIoError::Kick {
                             interface,

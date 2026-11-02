@@ -97,8 +97,8 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   bypassなし）。`receive`/`begin_generated`/quiescence checkはbatchを開く前にTX completionを
   boundedに回収し、kickを借りたport（kick失敗、またはkernelがSEND_REQUESTのまま残したframe）を
   `set_clock`のloop clockで1 msから64 msへ倍増するbackoffでretryする。kick errnoは
-  `EAGAIN`/`ENOBUFS`/`EINTR`/`EBUSY`がdeferred、`ENETDOWN`/`ENXIO`がlink downでどちらもerrorに
-  しない。core `GeneratedPacketIo`のframeはegress TX ringのframeそのもの（zero化して貸し、copy
+  `EAGAIN`/`ENOBUFS`/`EINTR`/`EBUSY`がdeferred、`ENETDOWN`がlink downでどちらもerrorに
+  しない。`ENXIO`（bind先deviceの削除）は恒久なのでbatch errorでportを`unbound`にしretryしない。core `GeneratedPacketIo`のframeはegress TX ringのframeそのもの（zero化して貸し、copy
   なし）。`PublicationQuiescence`はin-flight TXが無いときだけguardを返し、`wait_rx`は全socketの
   `poll(2)`によるidle wait、`BackendStats`（OBS-028）は固定順のport合計counter（kernel
   `PACKET_STATISTICS`はcoldな`refresh_kernel_stats`だけが累積）、`drain`はI/Oを恒久停止して

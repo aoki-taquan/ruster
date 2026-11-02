@@ -20,6 +20,7 @@ use ruster_core::{
 };
 
 use super::{AfPacketQuiescenceError, KICK_BACKOFF_MAX_MS};
+use crate::sys::rx::RxFault;
 use crate::{
     sys::{
         packet_io::AfPacketIoError, tests::allocation_count, AfPacketEngine, PacketOps, PollFd,
@@ -49,7 +50,7 @@ const ENOBUFS: i32 = 105;
 #[derive(Default)]
 struct LiveState {
     next_fd: RawFd,
-    mappings: Vec<(usize, usize)>,
+    mappings: Vec<(Addr, usize)>,
     kicks: Vec<(RawFd, Result<(), i32>)>,
     kick_errnos: VecDeque<i32>,
     persistent_kick_errno: Option<i32>,
@@ -93,7 +94,7 @@ impl PacketOps for LiveOps {
         self.0
             .borrow_mut()
             .mappings
-            .push((base.as_ptr() as usize, len));
+            .push((Addr(base.as_ptr()), len));
         Ok(base)
     }
 
@@ -148,35 +149,48 @@ impl PacketOps for LiveOps {
     fn close(&mut self, _fd: RawFd) {}
 }
 
-fn raw_u32(address: usize) -> u32 {
+/// A mapping address that keeps the pointer's provenance, so the harness
+/// runs under Miri's strict provenance (`-Zmiri-strict-provenance`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Addr(*mut u8);
+
+impl std::ops::Add<usize> for Addr {
+    type Output = Self;
+
+    fn add(self, offset: usize) -> Self {
+        Self(self.0.wrapping_add(offset))
+    }
+}
+
+fn raw_u32(address: Addr) -> u32 {
     // SAFETY: callers pass aligned addresses inside a live `LiveOps`
     // mapping; the engine reaches that memory only through raw pointers and
     // no Rust reference to it is held, so this volatile read conflicts with
     // no borrow.
-    unsafe { std::ptr::read_volatile(address as *const u32) }
+    unsafe { std::ptr::read_volatile(address.0.cast::<u32>()) }
 }
 
-fn raw_write_u32(address: usize, value: u32) {
+fn raw_write_u32(address: Addr, value: u32) {
     // SAFETY: as in `raw_u32`; the harness writes only words the kernel
     // would own, never while engine code runs.
-    unsafe { std::ptr::write_volatile(address as *mut u32, value) };
+    unsafe { std::ptr::write_volatile(address.0.cast::<u32>(), value) };
 }
 
-fn raw_write_u16(address: usize, value: u16) {
+fn raw_write_u16(address: Addr, value: u16) {
     // SAFETY: as in `raw_write_u32`.
-    unsafe { std::ptr::write_volatile(address as *mut u16, value) };
+    unsafe { std::ptr::write_volatile(address.0.cast::<u16>(), value) };
 }
 
-fn raw_bytes(address: usize, len: usize) -> Vec<u8> {
+fn raw_bytes(address: Addr, len: usize) -> Vec<u8> {
     let mut bytes = vec![0; len];
     // SAFETY: as in `raw_u32`; the range lies inside one TX frame.
-    unsafe { std::ptr::copy_nonoverlapping(address as *const u8, bytes.as_mut_ptr(), len) };
+    unsafe { std::ptr::copy_nonoverlapping(address.0, bytes.as_mut_ptr(), len) };
     bytes
 }
 
-fn raw_write_bytes(address: usize, bytes: &[u8]) {
-    // SAFETY: as in `raw_write_u32`; the range lies inside the RX block.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
+fn raw_write_bytes(address: Addr, bytes: &[u8]) {
+    // SAFETY: as in `raw_write_u32`; the range lies inside the mapping.
+    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address.0, bytes.len()) };
 }
 
 /// Two ports (LAN, WAN), one 4 KiB RX block and four 2 KiB TX frames each.
@@ -222,11 +236,11 @@ impl Live {
         Self { engine, ops }
     }
 
-    fn base(&self, port: usize) -> usize {
+    fn base(&self, port: usize) -> Addr {
         self.ops.0.borrow().mappings[port].0
     }
 
-    fn tx_frame(&self, port: usize, frame: usize) -> usize {
+    fn tx_frame(&self, port: usize, frame: usize) -> Addr {
         assert!(frame < TX_FRAMES);
         self.base(port) + RX_LEN + frame * TX_FRAME
     }
@@ -252,7 +266,7 @@ impl Live {
     }
 
     fn tx_payload(&self, port: usize, frame: usize) -> Vec<u8> {
-        let len = raw_u32(self.tx_frame(port, frame) + 16) as usize;
+        let len = usize::try_from(raw_u32(self.tx_frame(port, frame) + 16)).expect("len");
         raw_bytes(self.tx_frame(port, frame) + 48, len)
     }
 
@@ -368,12 +382,7 @@ fn af_packet_live_receive_reaps_tx_completions_so_the_ring_is_reused_without_mor
 #[test]
 fn af_packet_deferred_and_link_down_kicks_are_owed_not_errors_and_retry_with_backoff() {
     let mut live = Live::new();
-    for (errno, link_down) in [
-        (EAGAIN, false),
-        (ENOBUFS, false),
-        (ENETDOWN, true),
-        (ENXIO, true),
-    ] {
+    for (errno, link_down) in [(EAGAIN, false), (ENOBUFS, false), (ENETDOWN, true)] {
         let mut live_case = Live::new();
         live_case.fail_kicks(&[errno]);
         assert_eq!(
@@ -513,8 +522,8 @@ fn af_packet_generated_frames_are_lent_tx_frames_zeroed_and_published_without_a_
         let mut frame = batch.allocate(60).expect("frame");
         assert_eq!(frame.bytes_mut().len(), 60);
         assert!(frame.bytes_mut().iter().all(|byte| *byte == 0), "zeroed");
-        let address = frame.bytes_mut().as_ptr() as usize;
-        assert_eq!(address, frame0, "the TX frame itself");
+        let address = frame.bytes_mut().as_mut_ptr();
+        assert!(std::ptr::eq(address, frame0.0), "the TX frame itself");
         frame.bytes_mut().copy_from_slice(&[0x5a; 60]);
         frame.commit();
         // Cancel and abandon leave the next frame AVAILABLE and unpublished.
@@ -894,4 +903,189 @@ fn af_packet_steady_live_receive_generate_settle_and_wait_allocate_nothing() {
     }
     assert_eq!(allocations, 0);
     assert_eq!(live.port(WAN).counters.tx_published, 64 * 3);
+}
+
+#[test]
+fn af_packet_enxio_is_a_permanent_unbound_error_that_is_never_retried() {
+    let mut live = Live::new();
+    live.clock(0);
+    live.fail_kicks_persistently(Some(ENXIO));
+    let mut batch = live.engine.live_begin_generated(WAN);
+    batch.allocate(60).expect("frame").commit();
+    let completion = batch.finish();
+    assert_eq!(completion.accepted, 1);
+    assert_eq!(
+        completion.error,
+        Some(AfPacketIoError::Kick {
+            interface: WAN,
+            error: PlatformError::Syscall {
+                stage: SyscallStage::Kick,
+                errno: Errno::new(ENXIO),
+            },
+        })
+    );
+    assert_eq!(live.kicks().len(), 1);
+    // No settle retries the gone device, however much time passes, and the
+    // forced drain does not either.
+    for now in 0..500 {
+        live.clock(now);
+        let _ = live.engine.live_receive(1).expect("receive").finish();
+    }
+    assert_eq!(live.engine.drain(8).tx_in_flight, 1);
+    assert!(live.kicks().is_empty());
+    let wan = live.port(WAN);
+    assert!(wan.unbound && wan.kick_owed && !wan.link_down, "{wan:?}");
+    assert_eq!(
+        (
+            wan.counters.kicks_unbound,
+            wan.counters.kick_errors,
+            wan.counters.kick_retries
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(live.engine.backend_stats().unbound_ports, 1);
+}
+
+#[test]
+fn af_packet_without_a_clock_every_settle_retries_an_owed_kick() {
+    let mut live = Live::new();
+    live.fail_kicks(&[EAGAIN]);
+    assert_eq!(live.generate(WAN, 1, 60), 1);
+    assert_eq!(live.kicks().len(), 1);
+    // Clock never set: the frame stays SEND_REQUEST, and every settle kicks.
+    for _ in 0..3 {
+        let _ = live.engine.live_receive(1).expect("receive").finish();
+    }
+    assert_eq!(live.kicks().len(), 3);
+    // Once the loop hands in a clock, retries are paced again.
+    live.clock(1_000);
+    for _ in 0..3 {
+        let _ = live.engine.live_receive(1).expect("receive").finish();
+    }
+    assert_eq!(live.kicks().len(), 1);
+}
+
+#[test]
+fn af_packet_reclaim_progress_makes_the_next_retry_due_at_once() {
+    let mut live = Live::new();
+    live.clock(0);
+    live.fail_kicks_persistently(Some(EAGAIN));
+    assert_eq!(live.generate(WAN, 2, 60), 2);
+    for now in 1..40 {
+        live.clock(now);
+        let _ = live.engine.live_receive(1).expect("receive").finish();
+    }
+    assert!(live.engine.ports[1].kick.backoff_ms > 1);
+    let _ = live.kicks();
+    // The kernel completes one frame: backoff and retry time reset, so the
+    // still-owed second frame is kicked at the same settle.
+    live.set_tx_status(1, 0, TP_STATUS_AVAILABLE);
+    let _ = live.engine.live_receive(1).expect("receive").finish();
+    assert_eq!(live.kicks().len(), 1);
+    assert_eq!(live.port(WAN).tx_inflight, 1);
+}
+
+#[test]
+fn af_packet_idle_wait_does_not_spin_on_a_port_halted_mid_block() {
+    let mut live = Live::new();
+    live.inject_rx(0, &[&[1; 60]]);
+    // The block return (status store) fails once: the cursor halts in the
+    // delivery phase with every packet terminal.
+    live.engine.ports[0].rx_injection.status_stores = 1;
+    {
+        let mut batch = live.engine.live_receive(8).expect("receive");
+        batch
+            .next_packet()
+            .expect("packet")
+            .recycle(DropReason::UnsupportedEtherType);
+        let completion = batch.finish();
+        assert!(matches!(
+            completion.error,
+            Some(AfPacketIoError::Rx {
+                interface: LAN,
+                fault: RxFault::Release(_),
+            })
+        ));
+    }
+    assert!(live.port(LAN).rx_halted);
+    assert_eq!(live.rx_status(0), TP_STATUS_USER, "block not returned");
+    // Halted in a non-Idle phase: not RX work, so the wait polls.
+    assert_eq!(live.engine.wait_rx(5), Ok(RxWait::TimedOut));
+    assert_eq!(live.ops.0.borrow().polls.len(), 1);
+    // The next batch retries the return, which now succeeds.
+    let mut batch = live.engine.live_receive(8).expect("receive");
+    assert!(batch.next_packet().is_none());
+    assert_eq!(batch.finish().error, None);
+    assert_eq!(live.rx_status(0), TP_STATUS_KERNEL);
+    assert!(!live.port(LAN).rx_halted);
+}
+
+#[test]
+fn af_packet_forgotten_generated_lease_and_session_do_not_wedge_tx() {
+    let mut live = Live::new();
+    // A forgotten lease: its session's finish returns the frame and counts
+    // the lease abandoned, so the invariants stay exact.
+    {
+        let mut batch = live.engine.live_begin_generated(WAN);
+        std::mem::forget(batch.allocate(60).expect("frame"));
+        let mut frame = batch.allocate(60).expect("the orphan is reused");
+        frame.bytes_mut()[0] = 0x42;
+        frame.commit();
+        std::mem::forget(batch.allocate(42).expect("frame"));
+        let completion = batch.finish();
+        assert!(completion.invariants_hold(), "{completion:?}");
+        assert_eq!(
+            (
+                completion.allocated,
+                completion.accepted,
+                completion.abandoned
+            ),
+            (3, 1, 2)
+        );
+        assert_eq!(completion.error, None);
+    }
+    assert_eq!(live.tx_status(1, 0), TP_STATUS_SEND_REQUEST);
+    assert_eq!(live.tx_payload(1, 0)[0], 0x42);
+    assert_eq!(live.tx_status(1, 1), TP_STATUS_AVAILABLE);
+    // A forgotten session with a live lease: the next reservation of the
+    // port returns the orphaned frame.
+    {
+        let mut batch = live.engine.live_begin_generated(WAN);
+        std::mem::forget(batch.allocate(60).expect("frame"));
+        std::mem::forget(batch);
+    }
+    live.set_tx_status(1, 0, TP_STATUS_SENDING);
+    assert_eq!(live.generate(WAN, 3, 60), 3, "frames 1..=3, no wedge");
+    let wan = live.port(WAN);
+    assert_eq!(wan.counters.tx_orphans_reclaimed, 3);
+    assert_eq!(wan.counters.generated_abandoned, 2);
+    assert_eq!(wan.tx_inflight, 4);
+    // An RX copy commit also reclaims an orphan at the producer head.
+    live.kernel_completes(1);
+    {
+        let mut batch = live.engine.live_begin_generated(WAN);
+        std::mem::forget(batch.allocate(60).expect("frame"));
+        std::mem::forget(batch);
+    }
+    live.inject_rx(0, &[&[7; 60]]);
+    let mut batch = live.engine.live_receive(1).expect("receive");
+    batch.next_packet().expect("packet").commit(WAN);
+    assert_eq!(batch.finish().tx_accepted, 1);
+    assert_eq!(live.port(WAN).counters.tx_orphans_reclaimed, 4);
+}
+
+#[test]
+fn af_packet_tx_timestamp_status_bits_do_not_stop_the_engine() {
+    let mut live = Live::new();
+    assert_eq!(live.generate(WAN, 2, 60), 2);
+    // The kernel completes with TP_STATUS_AVAILABLE | TP_STATUS_TS_* when
+    // timestamping is enabled.
+    live.set_tx_status(1, 0, TP_STATUS_AVAILABLE | (1 << 29));
+    live.set_tx_status(1, 1, TP_STATUS_AVAILABLE | (1 << 31));
+    assert_eq!(live.engine.quiescence_check(), Ok(()));
+    assert!(!live.engine.is_stopped());
+    // Producer-head frames carrying timestamp bits are AVAILABLE too.
+    live.set_tx_status(1, 2, TP_STATUS_AVAILABLE | (1 << 30));
+    assert_eq!(live.generate(WAN, 4, 60), 4);
+    assert_eq!(live.port(WAN).counters.tx_completed, 2);
 }

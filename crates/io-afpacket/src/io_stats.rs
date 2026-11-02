@@ -41,8 +41,11 @@ pub struct AfPacketCounters {
     pub kicks: u64,
     /// Kicks the kernel deferred (`EAGAIN`, `ENOBUFS`, `EINTR`, `EBUSY`).
     pub kicks_deferred: u64,
-    /// Kicks refused because the link is down (`ENETDOWN`, `ENXIO`).
+    /// Kicks refused because the link is down (`ENETDOWN`).
     pub kicks_link_down: u64,
+    /// Kicks refused because the bound device is gone (`ENXIO`); also
+    /// counted in `kick_errors`.
+    pub kicks_unbound: u64,
     /// Kicks that failed with any other errno.
     pub kick_errors: u64,
     /// Retry kicks of an owed port (after a failed kick or a frame the
@@ -60,8 +63,12 @@ pub struct AfPacketCounters {
     pub generated_committed: u64,
     /// Generated frames cancelled before publication.
     pub generated_cancelled: u64,
-    /// Generated leases dropped without a terminal action.
+    /// Generated leases dropped (or forgotten) without a terminal action.
     pub generated_abandoned: u64,
+    /// Prepared TX frames whose generated lease was forgotten
+    /// (`mem::forget`), returned to Available by a later reservation or
+    /// session end.
+    pub tx_orphans_reclaimed: u64,
     /// Kernel `tp_packets`: frames the socket received (accumulated).
     pub kernel_packets: u64,
     /// Kernel `tp_drops`: frames dropped because the RX ring was full.
@@ -95,6 +102,7 @@ impl AfPacketCounters {
             kicks,
             kicks_deferred,
             kicks_link_down,
+            kicks_unbound,
             kick_errors,
             kick_retries,
             kick_retries_suppressed,
@@ -104,6 +112,7 @@ impl AfPacketCounters {
             generated_committed,
             generated_cancelled,
             generated_abandoned,
+            tx_orphans_reclaimed,
             kernel_packets,
             kernel_drops,
             kernel_freeze_q,
@@ -136,6 +145,7 @@ impl AfPacketCounters {
             kicks,
             kicks_deferred,
             kicks_link_down,
+            kicks_unbound,
             kick_errors,
             kick_retries,
             kick_retries_suppressed,
@@ -145,6 +155,7 @@ impl AfPacketCounters {
             generated_committed,
             generated_cancelled,
             generated_abandoned,
+            tx_orphans_reclaimed,
             kernel_packets,
             kernel_drops,
             kernel_freeze_q,
@@ -223,6 +234,9 @@ pub struct AfPacketPortStats {
     pub kick_owed: bool,
     /// The last kick found the link down.
     pub link_down: bool,
+    /// A kick found the bound device gone (`ENXIO`): permanent, the port
+    /// is no longer kicked or retried; the process must restart.
+    pub unbound: bool,
     /// RX fault-class counters (each halt event counted once).
     pub faults: BackendStatsSnapshot,
     pub counters: AfPacketCounters,
@@ -264,6 +278,7 @@ impl ObservableFields for AfPacketPortStats {
         visitor.field(SECTION, "rx_halted", FieldValue::Flag(self.rx_halted));
         visitor.field(SECTION, "kick_owed", FieldValue::Flag(self.kick_owed));
         visitor.field(SECTION, "link_down", FieldValue::Flag(self.link_down));
+        visitor.field(SECTION, "unbound", FieldValue::Flag(self.unbound));
         visit_faults(SECTION, &self.faults, visitor);
         self.counters.visit(SECTION, visitor);
     }
@@ -279,6 +294,8 @@ pub struct AfPacketBackendStats {
     pub rx_halted_ports: u32,
     pub kick_owed_ports: u32,
     pub link_down_ports: u32,
+    /// Ports whose bound device is gone (`ENXIO`).
+    pub unbound_ports: u32,
     /// Generated sessions started for an interface without a port.
     pub generated_unknown_egress: u64,
     /// Drained or stopped by a TX completion fault: no more I/O.
@@ -307,6 +324,11 @@ impl ObservableFields for AfPacketBackendStats {
             SECTION,
             "link_down_ports",
             FieldValue::Count(u64::from(self.link_down_ports)),
+        );
+        visitor.field(
+            SECTION,
+            "unbound_ports",
+            FieldValue::Count(u64::from(self.unbound_ports)),
         );
         visitor.field(
             SECTION,

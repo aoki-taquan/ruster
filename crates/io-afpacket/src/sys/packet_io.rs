@@ -84,10 +84,11 @@
 //!
 //! `finish` and `Drop` both try `send(MSG_DONTWAIT)` at most once per egress
 //! port that accepted a frame in this batch and never retry within the
-//! batch. Only a fault-class errno becomes the batch `error`; `EAGAIN`,
-//! `ENOBUFS`, `EINTR`, `EBUSY` (deferred) and `ENETDOWN`, `ENXIO` (link down)
-//! are not errors. In every failure case the kick is owed and a later settle
-//! retries it.
+//! batch. `EAGAIN`, `ENOBUFS`, `EINTR`, `EBUSY` (deferred) and `ENETDOWN`
+//! (link down) are not errors: the kick is owed and a later settle retries
+//! it. `ENXIO` (the bound device was unregistered, permanent) is the batch
+//! `error` and marks the port unbound, which is never retried. Any other
+//! errno is the batch `error` and is owed and retried.
 //!
 //! Steady operation allocates nothing, takes no lock, uses no trait object,
 //! and does O(1) work per packet plus bounded per-port status/descriptor work.

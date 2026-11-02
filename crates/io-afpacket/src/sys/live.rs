@@ -73,6 +73,19 @@ impl AfPacketIo {
     /// bypass is requested: the socket receives what the device accepts for
     /// its own MAC plus broadcast and multicast, and TX goes through the
     /// device's qdisc. Requires `CAP_NET_RAW`.
+    ///
+    /// # Exposure / not yet enforced
+    ///
+    /// AF_PACKET receives *copies*: unlike AF_XDP it does not take frames
+    /// away from the kernel, so the kernel stack still sees and processes
+    /// every frame of every port. This constructor checks none of that. The
+    /// caller must ensure that no port has a kernel IPv4 or IPv6 address, a
+    /// kernel route, or a forwarding role, that `rp_filter` and IPv6
+    /// (`disable_ipv6=1`) leave the kernel nothing to answer, and that the
+    /// configured maximum frame does not exceed the device MTU plus 14.
+    /// `ruster run` does not select this backend yet; until its startup
+    /// checks enforce this exposure model (AFPKT-015) the backend is not
+    /// production-ready.
     pub fn open(config: ValidatedConfig) -> Result<Self, PlatformError> {
         super::validated_uapi_layout()?;
         Ok(Self {
@@ -81,9 +94,10 @@ impl AfPacketIo {
     }
 
     /// Hands the adapter the loop's clock reading (cold boundary, once per
-    /// loop iteration). The adapter never reads a clock itself: owed-kick
-    /// retries are paced only by this value, so a caller that never calls it
-    /// gets at most one retry per owed kick, apart from `drain`.
+    /// loop iteration). The adapter never reads a clock itself: once a clock
+    /// was handed in, owed-kick retries are paced by it (1 ms doubling to
+    /// 64 ms). Before the first call there is nothing to pace by, so every
+    /// settle retries an owed kick, as the AF_XDP adapter does.
     pub fn set_clock(&mut self, now: MonotonicMillis) {
         self.engine.set_clock(now);
     }

@@ -1839,9 +1839,19 @@ operator should know before choosing it once it is wired:
   kernel's `tp_packets`/`tp_drops`/`tp_freeze_q_cnt` (folded in only by a
   cold refresh, because reading them resets them). A growing `kernel_drops`
   means the RX ring is too small or the router thread too slow.
-- **Kicks on a down link** are a link state, not an error: frames stay in
-  the TX ring and the owed kick is retried at most about 16 times a second
-  (1 ms doubling to 64 ms) until the link is back.
+- **Kicks on a down link** (`ENETDOWN`) are a link state, not an error:
+  frames stay in the TX ring and the owed kick is retried at most about 16
+  times a second (1 ms doubling to 64 ms) until the link is back. `ENXIO`
+  means the port's device was unregistered: that is permanent, reported as
+  an error, the port is marked `unbound` and never kicked again; restart
+  the router with the device back.
+- **Notes for the integration (AFPKT-015).** A down egress with queued TX
+  keeps those frames in flight, and a reload waits for in-flight TX to
+  drain (publication quiescence), so a SIGHUP reload during such an outage
+  is held back until the reload quiesce timeout. The kernel's
+  `PACKET_STATISTICS` counters are 32-bit and reset on every read; the
+  integration must refresh them periodically (for example with the stats
+  interval), not only at exit, so they neither wrap nor lose drops.
 
 ## 13. CI and E2E
 

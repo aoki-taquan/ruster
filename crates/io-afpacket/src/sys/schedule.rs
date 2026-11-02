@@ -20,14 +20,21 @@
 //! in with `set_clock`, never read here) has reached the port's retry time;
 //! each retry pushes that time out by a backoff that starts at 1 ms and
 //! doubles up to [`KICK_BACKOFF_MAX_MS`], and any reclaimed frame resets the
-//! backoff. A down link is therefore kicked at most about 16 times per
-//! second instead of at every tick. The drain ignores the backoff.
+//! backoff and makes the next retry due at once. A down link is therefore
+//! kicked at most about 16 times per second instead of at every tick. Until
+//! the first `set_clock` there is no clock to pace by, so every settle
+//! retries an owed kick (the AF_XDP adapter behaves the same way). The
+//! drain ignores the backoff.
 //!
 //! Kick errnos are classified once: `EAGAIN`, `ENOBUFS`, `EINTR`, `EBUSY`
-//! defer, `ENETDOWN` and `ENXIO` mean the link is down; neither is a batch
-//! error, both leave the kick owed. Any other errno is a fault: the first one
-//! of a batch is its `error`, and it is owed too. Published frames stay in
-//! flight in every case.
+//! defer and `ENETDOWN` means the link is down; neither is a batch error,
+//! both leave the kick owed. `ENXIO` means the bound device was unregistered
+//! (`tpacket_snd` finds no device for the bound ifindex): that is permanent,
+//! so it is a batch error, the port is marked `unbound`, and its owed kick
+//! is never retried (a restart must reopen the port). Any other errno is a
+//! fault: the first one of a batch is its `error`, and it is owed and
+//! retried with the backoff. Published frames stay in flight in every
+//! case.
 //!
 //! A completion scan that finds an impossible status or ownership is an
 //! invariant violation: the engine stops for good (fail closed), the call
@@ -71,6 +78,8 @@ pub(crate) enum KickClass {
     Deferred,
     /// The device is down; retry later, link state is not an error.
     LinkDown,
+    /// The bound device is gone (`ENXIO`): a batch error, never retried.
+    Unbound,
     /// Anything else: reported as the batch error, and retried.
     Fault,
 }
@@ -80,11 +89,17 @@ impl KickClass {
         match error {
             PlatformError::Syscall { errno, .. } => match errno.get() {
                 EAGAIN | ENOBUFS | EINTR | EBUSY => Self::Deferred,
-                ENETDOWN | ENXIO => Self::LinkDown,
+                ENETDOWN => Self::LinkDown,
+                ENXIO => Self::Unbound,
                 _ => Self::Fault,
             },
             _ => Self::Fault,
         }
+    }
+
+    /// Whether the failure is reported as a batch error.
+    pub(crate) const fn is_error(self) -> bool {
+        matches!(self, Self::Unbound | Self::Fault)
     }
 }
 
@@ -99,6 +114,8 @@ pub(crate) struct KickFailure {
 pub(crate) struct KickState {
     pub(crate) owed: bool,
     pub(crate) link_down: bool,
+    /// The bound device is gone; no retry is attempted any more.
+    pub(crate) unbound: bool,
     pub(crate) retry_at_ms: u64,
     pub(crate) backoff_ms: u64,
 }
@@ -108,6 +125,7 @@ impl KickState {
         Self {
             owed: false,
             link_down: false,
+            unbound: false,
             retry_at_ms: 0,
             backoff_ms: 1,
         }
@@ -183,6 +201,11 @@ impl<O: PacketOps> PacketRingResources<O> {
                         bump(&mut self.counters.kicks_link_down);
                         self.kick.link_down = true;
                     }
+                    KickClass::Unbound => {
+                        bump(&mut self.counters.kicks_unbound);
+                        bump(&mut self.counters.kick_errors);
+                        self.kick.unbound = true;
+                    }
                     KickClass::Fault => bump(&mut self.counters.kick_errors),
                 }
                 self.kick.owed = true;
@@ -193,7 +216,8 @@ impl<O: PacketOps> PacketRingResources<O> {
     }
 
     /// Reaps completions, detects frames the kernel has not taken, and
-    /// retries an owed kick when due (or `force`).
+    /// retries an owed kick when due (or `force`). An unbound port is never
+    /// retried.
     fn settle(&mut self, now: u64, force: bool) -> Result<(), TxCompletionError> {
         if self.tx_state.in_flight == 0 {
             self.kick.owed = false;
@@ -203,7 +227,9 @@ impl<O: PacketOps> PacketRingResources<O> {
         let frames = self.tx_frame_count();
         let report = self.tx_scan_completions(frames)?;
         if report.reclaimed != 0 {
+            // Progress: the kernel is taking frames again.
             self.kick.backoff_ms = 1;
+            self.kick.retry_at_ms = now;
         }
         if self.tx_state.in_flight == 0 {
             self.kick.owed = false;
@@ -215,7 +241,7 @@ impl<O: PacketOps> PacketRingResources<O> {
         if head == TP_STATUS_SEND_REQUEST {
             self.kick.owed = true;
         }
-        if self.kick.owed {
+        if self.kick.owed && !self.kick.unbound {
             if force || now >= self.kick.retry_at_ms {
                 let _ = self.kick_classified(now, true);
                 self.kick.retry_at_ms = now.saturating_add(self.kick.backoff_ms);
@@ -238,6 +264,7 @@ impl<O: PacketOps> PacketRingResources<O> {
             rx_halted: self.rx_sticky_halt().is_some(),
             kick_owed: self.kick.owed,
             link_down: self.kick.link_down,
+            unbound: self.kick.unbound,
             faults: self.rx_stats(),
             counters: self.counters,
         }
@@ -248,6 +275,7 @@ impl<O: PacketOps> AfPacketEngine<O> {
     /// Hands the engine the loop's clock reading (cold boundary).
     pub(crate) fn set_clock(&mut self, now: MonotonicMillis) {
         self.now_ms = now.0;
+        self.clock_set = true;
     }
 
     /// Whether the engine stopped for good (drained or faulted).
@@ -274,6 +302,9 @@ impl<O: PacketOps> AfPacketEngine<O> {
         force: bool,
     ) -> Result<(), super::packet_io::AfPacketIoError> {
         let now = self.now_ms;
+        // Without a clock there is nothing to pace retries by: every settle
+        // retries an owed kick.
+        let force = force || !self.clock_set;
         match self.ports[port].settle(now, force) {
             Ok(()) => Ok(()),
             Err(error) => Err(self.stop_on(port, error)),
@@ -448,6 +479,7 @@ impl<O: PacketOps> AfPacketEngine<O> {
             rx_halted_ports: 0,
             kick_owed_ports: 0,
             link_down_ports: 0,
+            unbound_ports: 0,
             generated_unknown_egress: self.generated_unknown_egress,
             stopped: self.is_stopped(),
             faults: BackendStatsSnapshot {
@@ -466,6 +498,7 @@ impl<O: PacketOps> AfPacketEngine<O> {
             stats.rx_halted_ports += u32::from(port.rx_halted);
             stats.kick_owed_ports += u32::from(port.kick_owed);
             stats.link_down_ports += u32::from(port.link_down);
+            stats.unbound_ports += u32::from(port.unbound);
             stats.faults = add_faults(stats.faults, port.faults);
             stats.counters.accumulate(&port.counters);
         }

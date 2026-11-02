@@ -808,18 +808,18 @@ impl<O: PacketOps> PacketRingResources<O> {
         Step::Halt(fault)
     }
 
-    /// The halting fault already counted for the current condition, if any.
-    /// A halt equal to this value is a repeat of an event already reported.
     /// Whether the cursor has RX work to take now: a block in validation or
     /// delivery, or a USER head block (one Acquire load, no budget). A
-    /// halted head is not work: it cannot progress until the kernel changes
-    /// it, and reporting it would turn the idle wait into a spin.
+    /// halted cursor is not work in any phase: a halt (for example a failed
+    /// block return in the delivery phase) cannot progress by itself, and
+    /// reporting it would turn the idle wait into a busy spin. The batch
+    /// still retries the halted step at every tick.
     pub(super) fn rx_ready(&mut self) -> bool {
-        if self.rx_cursor.phase != RxPhase::Idle {
-            return true;
-        }
         if self.rx_cursor.sticky.is_some() {
             return false;
+        }
+        if self.rx_cursor.phase != RxPhase::Idle {
+            return true;
         }
         let Ok(range) = self.rx.block_range(self.rx_cursor.head) else {
             return false;
@@ -831,6 +831,8 @@ impl<O: PacketOps> PacketRingResources<O> {
         )
     }
 
+    /// The halting fault already counted for the current condition, if any.
+    /// A halt equal to this value is a repeat of an event already reported.
     pub(super) const fn rx_sticky_halt(&self) -> Option<RxFault> {
         self.rx_cursor.sticky
     }

@@ -4,7 +4,7 @@ use std::{
     mem::{align_of, offset_of, size_of},
     os::fd::RawFd,
     ptr::NonNull,
-    sync::atomic::{fence, AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use ruster_core::IfId;
@@ -27,7 +27,6 @@ pub use live::{
     AfPacketDrain, AfPacketError, AfPacketGeneratedBatch, AfPacketGeneratedSlot, AfPacketIo,
     AfPacketQuiescenceError, AfPacketRxBatch, AfPacketRxFault, AfPacketRxSlot, AfPacketTxFault,
 };
-use schedule::KickClass;
 
 #[allow(unused_imports)]
 pub(crate) use rx::{
@@ -47,6 +46,9 @@ const PACKET_STATISTICS: c_int = 6;
 const POLLIN: i16 = 0x001;
 const POLLNVAL: i16 = 0x020;
 const SC_PAGESIZE: c_int = 30;
+/// Linux `TP_STATUS_TS_SOFTWARE | TP_STATUS_TS_SYS_HARDWARE |
+/// TP_STATUS_TS_RAW_HARDWARE`.
+const TP_STATUS_TS_MASK: u32 = (1 << 29) | (1 << 30) | (1 << 31);
 const TPACKET_V3: c_int = 2;
 const ETH_P_ALL: u16 = 0x0003;
 const PROT_READ: c_int = 1;
@@ -552,9 +554,13 @@ impl<O: PacketOps> PacketRingResources<O> {
         self.metadata.tx_frames().len()
     }
 
+    /// Acquire load of a TX frame status with the `TP_STATUS_TS_*` bits
+    /// (29..=31) removed: the kernel ORs a timestamp source into the
+    /// AVAILABLE it stores at TX completion when timestamping is enabled on
+    /// the socket or device, and that must not read as an unknown status.
     fn load_tx_status(&self, frame_index: usize) -> Result<u32, MappingAccessError> {
         let status_offset = self.tx_frame_status_offset(frame_index)?;
-        self.mapping.load_status_acquire(status_offset)
+        Ok(self.mapping.load_status_acquire(status_offset)? & !TP_STATUS_TS_MASK)
     }
 
     /// Resolves every checked address of the producer-head frame for a
@@ -584,8 +590,14 @@ impl<O: PacketOps> PacketRingResources<O> {
         let data = NonNull::new(data).ok_or(MappingAccessError::ArithmeticOverflow)?;
         u32::try_from(len).map_err(|_| MappingAccessError::ArithmeticOverflow)?;
         // Every checked address, including the status word, is resolved
-        // before ownership changes or any byte moves.
+        // before ownership changes or any byte moves, so publication cannot
+        // fail on an address once the frame is Prepared.
         let status_offset = self.tx_frame_status_offset(frame_index)?;
+        let status =
+            self.mapping
+                .checked_address(status_offset, size_of::<u32>(), align_of::<u32>())?;
+        let status =
+            NonNull::new(status.cast::<u32>()).ok_or(MappingAccessError::ArithmeticOverflow)?;
         let frame = &mut self.metadata.tx_frames_mut()[frame_index];
         frame
             .ownership
@@ -597,7 +609,7 @@ impl<O: PacketOps> PacketRingResources<O> {
             generation,
             header: header.cast::<Tpacket3Hdr>(),
             data,
-            status_offset,
+            status,
             len,
         })
     }
@@ -639,8 +651,14 @@ impl<O: PacketOps> PacketRingResources<O> {
             let _ = frame.ownership.cancel_prepared();
             return Err(MappingAccessError::Ownership(error));
         }
-        self.mapping
-            .store_status_release(reservation.status_offset, TP_STATUS_SEND_REQUEST)?;
+        // SAFETY: `tx_prepare` proved (through checked_address) a live,
+        // 4-byte-aligned status word inside this port's mapping, which
+        // outlives `self`; `align_of::<u32>() == align_of::<AtomicU32>()`.
+        // Userspace touches status words only atomically, and the kernel
+        // accesses them atomically too. This Release store hands the
+        // completely written header and payload to the kernel.
+        unsafe { AtomicU32::from_ptr(reservation.status.as_ptr()) }
+            .store(TP_STATUS_SEND_REQUEST, Ordering::Release);
         let frame_count = self.tx_frame_count();
         let state = &mut self.tx_state;
         state.producer_head = (state.producer_head + 1) % frame_count;
@@ -651,6 +669,21 @@ impl<O: PacketOps> PacketRingResources<O> {
             self.counters.tx_inflight_high_water = in_flight;
         }
         Ok(())
+    }
+
+    /// Returns an orphaned Prepared frame (its lease was forgotten) to
+    /// Available. Only callable while no slot can be live (`&mut self` of
+    /// the port, reached through an exclusively borrowed engine).
+    fn tx_reclaim_orphan(&mut self, frame_index: usize) -> bool {
+        let frame = &mut self.metadata.tx_frames_mut()[frame_index];
+        if frame.ownership.owner() == TxOwnership::Prepared
+            && frame.ownership.cancel_prepared().is_ok()
+        {
+            bump(&mut self.counters.tx_orphans_reclaimed);
+            true
+        } else {
+            false
+        }
     }
 
     /// Returns a prepared, unpublished frame to Available. Its status word
@@ -766,7 +799,8 @@ pub(crate) struct TxReservation {
     generation: u64,
     header: *mut Tpacket3Hdr,
     data: NonNull<u8>,
-    status_offset: usize,
+    /// Checked, aligned status word of the frame.
+    status: NonNull<u32>,
     len: usize,
 }
 
@@ -903,6 +937,14 @@ impl<O: PacketOps> PacketRingResources<O> {
                 bump(&mut self.counters.tx_faults);
                 return Err(TxSubmitError::InvalidStatus { status });
             }
+        }
+        if self.tx_metadata(frame_index).ownership.owner() == TxOwnership::Prepared {
+            // A Prepared frame is lent only to a generated slot, which
+            // exclusively borrows the engine; reaching this call means that
+            // borrow is over, so the slot was forgotten (`mem::forget`)
+            // without a terminal action. Its status word was never written,
+            // so the kernel never saw it: return it to Available.
+            self.tx_reclaim_orphan(frame_index);
         }
         let metadata = self.tx_metadata(frame_index);
         if metadata.ownership.owner() != TxOwnership::Available {
@@ -1121,6 +1163,8 @@ pub(crate) struct AfPacketEngine<O: PacketOps = LinuxOps> {
     /// drain and fault stop, and unknown generated egress.
     poll_fds: Box<[PollFd]>,
     now_ms: u64,
+    /// Whether `set_clock` was ever called (retry pacing needs a clock).
+    clock_set: bool,
     draining: bool,
     stopped: Option<schedule::StopCause>,
     generated_unknown_egress: u64,
@@ -1171,6 +1215,7 @@ impl<O: PacketOps> AfPacketEngine<O> {
             limits: WorkLimits::GEOMETRY_BOUNDED,
             poll_fds,
             now_ms: 0,
+            clock_set: false,
             draining: false,
             stopped: None,
             generated_unknown_egress: 0,
@@ -1257,7 +1302,7 @@ impl<O: PacketOps> AfPacketEngine<O> {
                 report.kick_failed += 1;
                 // Only a fault-class errno is an error: deferral and link
                 // down leave the kick owed for a later settle.
-                if error.class == KickClass::Fault && report.first_kick_error.is_none() {
+                if error.class.is_error() && report.first_kick_error.is_none() {
                     report.first_kick_error = Some(error.error);
                     report.first_kick_interface = Some(self.ports[port_index].interface);
                 }
@@ -1503,8 +1548,8 @@ impl<O: PacketOps> MmapRegion<O> {
 
     // Ring status words are the kernel/userspace ownership handoff points, so
     // they are accessed as `AtomicU32` with Acquire/Release ordering rather
-    // than as volatile accesses plus separate fences. Only the RX engine uses
-    // these helpers; the AP1-TX status path is unchanged (follow-up).
+    // than as volatile accesses plus separate fences. The RX engine uses
+    // these helpers; TX status words use the same atomics (AP3).
     fn ring_load_status_acquire(
         &self,
         extents: CombinedRingExtents,
@@ -1556,6 +1601,8 @@ impl<O: PacketOps> MmapRegion<O> {
         Ok(address)
     }
 
+    /// Test-only plain read of a non-status ring word.
+    #[cfg(test)]
     fn read_u32_volatile(&self, offset: usize) -> Result<u32, MappingAccessError> {
         let address = self.checked_address(offset, size_of::<u32>(), align_of::<u32>())?;
         // SAFETY: checked_address proves a live, aligned 4-byte range. A
@@ -1563,10 +1610,16 @@ impl<O: PacketOps> MmapRegion<O> {
         Ok(unsafe { std::ptr::read_volatile(address.cast::<u32>()) })
     }
 
+    // TX status words use the same `AtomicU32` Acquire/Release handoff as
+    // the RX ring helpers above.
     fn load_status_acquire(&self, offset: usize) -> Result<u32, MappingAccessError> {
-        let status = self.read_u32_volatile(offset)?;
-        fence(Ordering::Acquire);
-        Ok(status)
+        let address = self.checked_address(offset, size_of::<u32>(), align_of::<u32>())?;
+        // SAFETY: checked_address proved a live 4-byte range aligned to
+        // `align_of::<u32>() == align_of::<AtomicU32>()`. The mapping
+        // outlives this call, and userspace never accesses a status word
+        // non-atomically.
+        let status = unsafe { AtomicU32::from_ptr(address.cast::<u32>()) };
+        Ok(status.load(Ordering::Acquire))
     }
 
     fn store_status_release(
@@ -1575,10 +1628,10 @@ impl<O: PacketOps> MmapRegion<O> {
         status: u32,
     ) -> Result<(), MappingAccessError> {
         let address = self.checked_address(offset, size_of::<u32>(), align_of::<u32>())?;
-        fence(Ordering::Release);
-        // SAFETY: checked_address proves a live, aligned 4-byte range and
-        // `&mut self` excludes any simultaneous userspace mutable access.
-        unsafe { std::ptr::write_volatile(address.cast::<u32>(), status) };
+        // SAFETY: as in load_status_acquire; `&mut self` additionally
+        // excludes any simultaneous userspace access through this owner.
+        let word = unsafe { AtomicU32::from_ptr(address.cast::<u32>()) };
+        word.store(status, Ordering::Release);
         Ok(())
     }
 

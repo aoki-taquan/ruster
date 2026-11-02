@@ -2267,8 +2267,8 @@ rejected TX ABAが守る性質は、rejectがframeをreserveせずgenerationを�
 によるpartial reject、kick失敗のfinish errorとsingle kick、RX halt/TX faultのerror mapping、
 hairpin byte、round-robin、forget、steady allocation zeroをAF_PACKET固有testで検証します。
 poll統合、TX completionのscheduling、live stats/cleanup、public constructorはAP3、実NIC/netns
-E2Eと性能はR14以降へdeferredです。AP1-TXのstatus pathはvolatileとfenceのままで、RXの
-`AtomicU32`化とは共有helperを持たないためfollow-upです。
+E2Eと性能はR14以降へdeferredです。AP3でTX status accessもRXと同じ`AtomicU32` Acquire/Release
+になりました（publishのstoreはprepare時に検査済みの語へ行い失敗しません）。
 
 ### AF_PACKET live adapter (AP3)
 
@@ -2290,10 +2290,15 @@ schedulingとadapterが実行するものは同一です。errorはring offset�
   drainが、in-flight frameだけのbounded FIFO completion scanと借りkickのretryを行います。kickを
   借りるのは、直前のkickが失敗したportと、最古in-flight frameがSEND_REQUESTのまま（kernel未取得）
   のportです。retryは`set_clock`で渡されたloop clockが再試行時刻に達したときだけで、間隔は
-  1 msから64 msへ倍増し、回収があればresetします。errnoは`EAGAIN`/`ENOBUFS`/`EINTR`/`EBUSY`が
-  deferred、`ENETDOWN`/`ENXIO`がlink downで、どちらもbatch errorではありません（runtimeは
-  finish errorでそのtickのgenerated ARP/ICMPを全portでskipするため）。その他はfaultでbatch error
-  です。completion scanの不正status/ownershipはinvariant違反で、engineを恒久停止します。
+  1 msから64 msへ倍増し、回収があればresetして次のretryを即座に許します（clockが一度も渡されて
+  いなければ毎settleでretry、AF_XDPと同じ）。errnoは`EAGAIN`/`ENOBUFS`/`EINTR`/`EBUSY`が
+  deferred、`ENETDOWN`がlink downで、どちらもbatch errorではありません（runtimeは
+  finish errorでそのtickのgenerated ARP/ICMPを全portでskipするため）。`ENXIO`は`tpacket_snd`が
+  bind先deviceを見つけられない（unregister済み）恒久状態なので、batch errorにしてportを
+  `unbound`にし、以後retryしません（AF_XDPの`NotBound`と同じくerror）。その他はfaultでbatch error
+  で、backoff付きでretryします。TX statusは`TP_STATUS_TS_*`（bit 29〜31）を除いて解釈し、
+  completion scanの不正status/ownershipはinvariant違反で、engineを恒久停止します。forgetされた
+  generated lease（Preparedのまま）はsessionの`finish`か次のreserveがAvailableへ戻します。
 - **Generated**（AFPKT-010）: generated frameはegress TX ringのproducer-head frameそのもので、
   copy commitと同じreserveの後にdata `len` byteをzero化して貸します。statusはAVAILABLEのままなので
   kernelは読みません。commitでheaderを書きRelease SEND_REQUEST、cancel/abandonはring無変更で
