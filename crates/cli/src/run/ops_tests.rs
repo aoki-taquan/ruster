@@ -317,6 +317,28 @@ fn an_applied_reload_takes_the_new_tick_budgets() {
     assert_eq!(received_in_last_tick(true).as_deref(), Some("1"));
 }
 
+/// H4b review: an applied reload whose tick budget sweeps a resolution
+/// table slower than about 1 s warns (value-free) after the applied line.
+#[test]
+fn an_applied_reload_with_a_slow_sweep_warns() {
+    let host = FakeHost::default();
+    let slow =
+        edited(|text| text.replace("resolution-timer-scans = 16", "resolution-timer-scans = 0"));
+    let source = FakeSource::with([Ok(slow)]);
+    let outcome = ops(&host, source, &StopAfterTicks::new(&host, 10, &[5]));
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    let applied = outcome
+        .err
+        .find("reload applied: generation=2")
+        .expect("applied");
+    let warning = outcome
+        .err
+        .find("ruster run: warning: RESOLUTION_SWEEP_SLOW table=states ticks=never\n")
+        .expect("warning");
+    assert!(applied < warning, "{}", outcome.err);
+    assert_eq!(outcome.err.matches("RESOLUTION_SWEEP_SLOW").count(), 1);
+}
+
 /// A run that stops while a reload waits ends that reload as failed, so
 /// the counters always add up.
 #[test]
