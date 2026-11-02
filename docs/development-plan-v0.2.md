@@ -101,7 +101,8 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   一socketのsession、XDP program attach、RX/Fill engine、same-frame TX/Completion、generated frame、
   複数portのcore `PacketIo` adapter（X04a）、configからのport構築と`ruster run`の起動/停止（X04b前半、
   M2 S10a）までで、reload、health/stall、retry policy、multi-queue worker ownership、実NIC forwarding
-  E2Eは無い（M2）。netns/veth上の`ruster run` E2Eは`scripts/priv-run-smoke.sh`（手動）。
+  E2Eは無い（M2）。netns/veth上の`ruster run` E2Eは`scripts/priv-run-smoke.sh`で、M2 S11から
+  hosted runnerの`XDP veth` CI job（`.github/workflows/xdp-veth.yml`）が毎PRで実行する。
 - `run-sim`はrestart-required applyをrejectとして報告し、同一process内でstorageを
   作り直さない（SIM-016 deferred）。process restartをまたぐgeneration/key履歴は無い。
 - OS乱数によるproduction key source（`OsRandomKeySource`）と、sim専用key sourceを型で拒否する
@@ -170,7 +171,16 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   （rtnetlink `RTM_GETLINK`で1 sごと。device削除・MTU違反はexit 1、link down/upは継続）、起動retry
   （`--startup-attempts`、XDP-045）、RX queue数とMTUのrtnetlink化、drainのhandoff報告（XDP-177）。
   privileged smokeにreload、restart-required拒否、link down/up、MTU超過、veth削除を追加。`poll`待機、
-  privilege drop、multi-queue、systemd notify、SIGUSR1 stats、privileged E2EのCI（S11）は残り（CLI-034）。
+  privilege drop、multi-queue、systemd notify、SIGUSR1 statsは残り（CLI-034）。
+- M2 S11（X04のCI）: `.github/workflows/xdp-veth.yml`の`XDP veth` job（`ubuntu-24.04` hosted
+  runner、30分上限）。最初の`scripts/priv-xdp-probe.sh`がkernel 5.9以上、sudo下のcapability、
+  libbpf付きiproute2、throwaway netns内のveth、sysctl書き込み、AF_XDP socket作成、generic/native XDP
+  attachを確かめ、できなければtypedな`code=PROBE_*`でjobをfailする（skipしない）。binaryは
+  runner userでbuildし、`RUSTER_REQUIRE_PRIV=1`で`priv-xdp-smoke.sh`（`priv_xdp_session`）と
+  `priv-run-smoke.sh`を`sudo -n`で実行する。この変数の下ではtestのskip経路もfailになる
+  （CI-001、CI-002）。#302/#301 reviewのsmoke強化: global `ip_forward=0`で`conf/ra/forwarding=1`は
+  起動時`scope=device`で拒否、稼働中はif1だけwarningでrecovered（CI-003）、stuck phaseはFIFOが
+  capacityまで埋まり動かないことを確かめる（CI-004）。required check化はowner決定（未決）。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
   ringのsaturationはM2 S6でAF_XDPの`BackendStats`へ接続した（OBS-018。AF_PACKETはOBS-028、OBS-017はdeferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
@@ -599,8 +609,8 @@ workflowごとのscopeを固定し、同じtestを複数jobへ無差別に重複
 AF_PACKET/AF_XDP crate追加後の通常compile/clippyはworkspaceの`ci.yml`が担当する。
 AF_XDP backendはlibbpf/libxdpにlinkしないraw UAPI v6.8 profileなので、host library用の
 container jobは不要である。privileged netns/veth smoke（`scripts/priv-xdp-smoke.sh`、
-`RUSTER_PRIV_XDP=1`）はX00Cで追加しX00Dでattach/existing program/SIGKILL phaseを加えたが、
-workflow化はX04が所有し、capability不足を
+`RUSTER_PRIV_XDP=1`）はX00Cで追加しX00Dでattach/existing program/SIGKILL phaseを加え、
+workflow化はX04（M2 S11の`xdp-veth.yml`、下の「Privileged ephemeral CI」）。capability不足を
 silent skipしない。packet/property matrixはtruncation、length/checksum、fragment、odd payload、
 incremental/full checksum一致、generation/clock/capacityを含む。
 
@@ -610,8 +620,10 @@ incremental/full checksum一致、generation/clock/capacityを含む。
 - attach/detach rollback、existing XDP program、link down、process termination
 - capability不足は成功扱いのsilent skipにせず、明示されたjob policyに従う
 
-XDP attachをvethで検証するjobを追加する場合はX04が別workflowを所有し、AF_PACKETの
-`netns.yml`を並列編集しない。
+XDP attachをvethで検証するjobはX04が別workflow（`xdp-veth.yml`、M2 S11）として所有し、
+AF_PACKETの`netns.yml`を並列編集しない。`XDP veth` jobは最初のprobe（`scripts/priv-xdp-probe.sh`）が
+AF_XDP/veth/netnsの不足をtypedなfailureにし、smokeは`RUSTER_REQUIRE_PRIV=1`でskip経路を持たない。
+hosted runnerのkernel一つだけを検証し（5.9〜6.xの網羅はXDP-062）、required check化はowner決定。
 
 ### Hardware CI (`hardware-bench.yml`, X05)
 

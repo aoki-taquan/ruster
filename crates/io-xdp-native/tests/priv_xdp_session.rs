@@ -8,7 +8,9 @@
 //! with its own two-queue veth pair, runs this prebuilt test inside it phase
 //! by phase, and always deletes the namespace. When the variable is set,
 //! every missing precondition (namespace identity, device, capability) fails
-//! the test; it never skips. The tests refuse to run in the initial network
+//! the test; it never skips. With `RUSTER_REQUIRE_PRIV=1` (the `XDP veth`
+//! CI job) an unset `RUSTER_PRIV_XDP` or an unselected phase fails too, so
+//! a misconfigured run cannot pass vacuously. The tests refuse to run in the initial network
 //! namespace, so they cannot touch a host interface. Each phase prints a
 //! `priv_xdp_*: ... verified` marker that the script requires.
 //!
@@ -63,23 +65,104 @@ fn netns_inode(path: &str) -> u64 {
         .ino()
 }
 
+/// Whether a privileged test runs, is skipped, or fails before touching
+/// anything.
+#[derive(Debug, PartialEq, Eq)]
+enum Gate {
+    Run,
+    Skip(&'static str),
+}
+
+/// Decides a privileged test from `RUSTER_PRIV_XDP`, `RUSTER_REQUIRE_PRIV`,
+/// the phase the test needs, and `RUSTER_PRIV_XDP_PHASE`. Under
+/// `RUSTER_REQUIRE_PRIV=1` (the CI job) every would-be skip is an error,
+/// so a CI run can never pass without running the privileged phase.
+fn gate(
+    privileged: Option<&str>,
+    require: Option<&str>,
+    phase: Option<&str>,
+    selected: Option<&str>,
+) -> Result<Gate, &'static str> {
+    let required = match require {
+        None => false,
+        Some("1") => true,
+        Some(_) => return Err("RUSTER_REQUIRE_PRIV must be exactly 1 or unset"),
+    };
+    match privileged {
+        None if required => {
+            return Err("PRIV_REQUIRED: RUSTER_REQUIRE_PRIV=1 but RUSTER_PRIV_XDP is unset")
+        }
+        None => {
+            return Ok(Gate::Skip(
+                "RUSTER_PRIV_XDP unset; privileged smoke not requested",
+            ))
+        }
+        Some("1") => {}
+        Some(_) => return Err("RUSTER_PRIV_XDP must be exactly 1"),
+    }
+    match phase {
+        Some(phase) if selected != Some(phase) => {
+            if required {
+                Err("PRIV_REQUIRED: RUSTER_REQUIRE_PRIV=1 but this test's phase is not selected")
+            } else {
+                Ok(Gate::Skip("phase not selected"))
+            }
+        }
+        _ => Ok(Gate::Run),
+    }
+}
+
+/// A run that requires the privileged tests turns every skip into a
+/// failure, and nothing but exactly `1` enables either variable.
+#[test]
+fn priv_gate_fails_instead_of_skipping_when_required() {
+    assert_eq!(
+        gate(None, None, None, None),
+        Ok(Gate::Skip(
+            "RUSTER_PRIV_XDP unset; privileged smoke not requested"
+        ))
+    );
+    assert!(gate(None, Some("1"), None, None).is_err());
+    assert!(gate(None, Some("0"), None, None).is_err());
+    assert!(gate(None, Some(""), None, None).is_err());
+    assert!(gate(Some("yes"), None, None, None).is_err());
+    assert!(gate(Some("yes"), Some("1"), None, None).is_err());
+    assert_eq!(gate(Some("1"), None, None, None), Ok(Gate::Run));
+    assert_eq!(gate(Some("1"), Some("1"), None, None), Ok(Gate::Run));
+    assert_eq!(
+        gate(Some("1"), None, Some("tx"), Some("engine")),
+        Ok(Gate::Skip("phase not selected"))
+    );
+    assert_eq!(
+        gate(Some("1"), None, Some("tx"), None),
+        Ok(Gate::Skip("phase not selected"))
+    );
+    assert!(gate(Some("1"), Some("1"), Some("tx"), Some("engine")).is_err());
+    assert!(gate(Some("1"), Some("1"), Some("tx"), None).is_err());
+    assert_eq!(
+        gate(Some("1"), Some("1"), Some("tx"), Some("tx")),
+        Ok(Gate::Run)
+    );
+}
+
 /// Returns the device if this privileged phase was requested, after
 /// proving the process runs inside the dedicated namespace.
 fn requested(phase: Option<&str>) -> Option<String> {
-    if env::var_os("RUSTER_PRIV_XDP").is_none() {
-        eprintln!("priv_xdp: RUSTER_PRIV_XDP unset; privileged smoke not requested");
-        return None;
-    }
-    assert_eq!(
-        env::var("RUSTER_PRIV_XDP").as_deref(),
-        Ok("1"),
-        "RUSTER_PRIV_XDP must be exactly 1"
-    );
-    if let Some(phase) = phase {
-        if env::var("RUSTER_PRIV_XDP_PHASE").as_deref() != Ok(phase) {
-            eprintln!("priv_xdp: phase {phase} not selected");
+    let privileged = env::var("RUSTER_PRIV_XDP").ok();
+    let require = env::var("RUSTER_REQUIRE_PRIV").ok();
+    let selected = env::var("RUSTER_PRIV_XDP_PHASE").ok();
+    match gate(
+        privileged.as_deref(),
+        require.as_deref(),
+        phase,
+        selected.as_deref(),
+    ) {
+        Ok(Gate::Run) => {}
+        Ok(Gate::Skip(reason)) => {
+            eprintln!("priv_xdp: {reason}");
             return None;
         }
+        Err(reason) => panic!("priv_xdp: {reason}"),
     }
     let netns = required("RUSTER_PRIV_XDP_NETNS");
     let device = required("RUSTER_PRIV_XDP_DEVICE");

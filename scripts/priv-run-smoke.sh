@@ -30,7 +30,10 @@
 #             nothing left attached
 #   forwarding  ip_forward=1 in the router namespace is refused at startup
 #             (KERNEL_FORWARDING_ENABLED), accepted with a warning under
-#             --allow-kernel-forwarding
+#             --allow-kernel-forwarding, and only warned while running;
+#             then conf/ra/forwarding=1 with ip_forward=0: refused at
+#             startup with scope=device, warned on if1 (only) while
+#             running and recovered when cleared (M2 S11)
 #   removal   (last) `ip link del ra` inside the router namespace while
 #             running: exit 1 (DEVICE_REMOVED), nothing left attached
 #   rollback  a second port that fails to open (queue 1 of a one-queue
@@ -44,9 +47,20 @@
 #             REGISTER_UMEM/MEMLOCK_LIMIT after teardown, XDP-045, in this
 #             test only) and forward again, then SIGTERM, exit 0
 #   stuck     stdout on a FIFO that is held open but never read: the stats
-#             blocks fill it, yet SIGTERM still drains, detaches, and the
-#             process exits within 10 seconds with status 0 (#301 LN1)
+#             blocks fill it (checked: queued bytes at capacity and not
+#             moving), yet SIGTERM still drains, detaches, and the process
+#             exits within 10 seconds with status 0 (#301 LN1)
 set -eu
+
+# RUSTER_REQUIRE_PRIV=1 (the `XDP veth` CI job) is passed to the privileged
+# tests, which then fail instead of skipping. Nothing here ever skips.
+case ${RUSTER_REQUIRE_PRIV-} in
+"" | 1) ;;
+*)
+    echo "priv-run-smoke: RUSTER_REQUIRE_PRIV must be 1 or unset" >&2
+    exit 1
+    ;;
+esac
 
 for tool in cargo ip sudo python3 od ethtool ps; do
     command -v "$tool" >/dev/null 2>&1 || {
@@ -323,6 +337,16 @@ for _ in range(100):
     time.sleep(0.1)
 '
 
+# Prints "<queued bytes> <capacity>" of the FIFO at argv[1] without reading
+# from it (a second, non-blocking read end; FIONREAD and F_GETPIPE_SZ).
+PIPE_FILL='
+import array, fcntl, os, sys, termios
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NONBLOCK)
+queued = array.array("i", [0])
+fcntl.ioctl(fd, termios.FIONREAD, queued, True)
+print(queued[0], fcntl.fcntl(fd, getattr(fcntl, "F_GETPIPE_SZ", 1032)))
+'
+
 # Host A -> host B through the router; checks NAT44 on arrival.
 forward_once() {
     tag=$1
@@ -544,6 +568,39 @@ if grep -q "fatal:" "$work/forwarding-runtime.err"; then
 fi
 assert_detached "the run-time forwarding run"
 echo "priv_run_forwarding: kernel forwarding refused at startup, accepted with the override, and only warned (forwarding kept, recovered, exit warning) when turned on while running verified"
+# Per-port forwarding (conf/ra/forwarding) with the global switch off: the
+# startup check and the run-time watch read the port's own sysctl, not
+# only ip_forward (refused with scope=device; warned and recovered).
+in_ns "$router" sysctl -qw net.ipv4.conf.ra.forwarding=1
+[ "$(in_ns "$router" sysctl -n net.ipv4.ip_forward)" = 0 ] ||
+    fail "forwarding-device: ip_forward is not 0"
+start_ruster forwarding-device "$work/router.toml"
+wait_ruster
+[ "$status" -eq 1 ] || fail "forwarding-device: exit status $status"
+grep -q "startup failed: stage=checks port=if1 code=KERNEL_FORWARDING_ENABLED scope=device" \
+    "$work/forwarding-device.err" || fail "forwarding-device: wrong failure"
+assert_detached "the per-port forwarding refusal"
+in_ns "$router" sysctl -qw net.ipv4.conf.ra.forwarding=0
+start_ruster forwarding-device-runtime "$work/router.toml"
+wait_ready forwarding-device-runtime || fail "forwarding-device-runtime: ruster exited during startup"
+in_ns "$router" sysctl -qw net.ipv4.conf.ra.forwarding=1
+[ "$(in_ns "$router" sysctl -n net.ipv4.ip_forward)" = 0 ] ||
+    fail "forwarding-device-runtime: ip_forward is not 0"
+wait_line forwarding-device-runtime "warning: port=if1 health=KERNEL_FORWARDING_ENABLED"
+forward_once forwarding-device-on
+in_ns "$router" sysctl -qw net.ipv4.conf.ra.forwarding=0
+wait_line forwarding-device-runtime "recovered: port=if1 health=KERNEL_FORWARDING_ENABLED"
+signal_ruster TERM
+wait_ruster
+[ "$status" -eq 0 ] || fail "forwarding-device-runtime: exit status $status"
+if grep -q "port=if2 health=KERNEL_FORWARDING_ENABLED" "$work/forwarding-device-runtime.err"; then
+    fail "forwarding-device-runtime: rb warned for ra's sysctl"
+fi
+if grep -q "fatal:" "$work/forwarding-device-runtime.err"; then
+    fail "forwarding-device-runtime: a fatal event"
+fi
+assert_detached "the run-time per-port forwarding run"
+echo "priv_run_forwarding_device: conf/ra/forwarding=1 with ip_forward=0 refused at startup (scope=device), warned on if1 only and recovered while running verified"
 
 # stuck: an undrained stdout must not keep the process alive.
 mkfifo "$work/stuck.fifo"
@@ -564,6 +621,19 @@ ruster_pid=$(tr -cd '0-9' <"$pidfile")
 wait_ready stuck || fail "stuck: ruster exited during startup"
 # About one stats block (>10 KiB) per second fills the 64 KiB pipe.
 sleep 8
+# Prove the pipe is really full (the writer thread is blocked, so the
+# phase is not vacuous): queued bytes within one page of the capacity, and
+# unchanged 1.5 s later while ruster keeps producing stats.
+first=$(python3 -I -c "$PIPE_FILL" "$work/stuck.fifo") || fail "stuck: cannot read the FIFO fill"
+sleep 1.5
+second=$(python3 -I -c "$PIPE_FILL" "$work/stuck.fifo") || fail "stuck: cannot read the FIFO fill"
+queued=${first% *}
+capacity=${first#* }
+[ "$queued" -gt 0 ] && [ $((queued + 4096)) -gt "$capacity" ] ||
+    fail "stuck: stdout pipe not full ($queued of $capacity bytes queued)"
+[ "$first" = "$second" ] || fail "stuck: stdout pipe still moving ($first, then $second)"
+launcher_alive || fail "stuck: exited before SIGTERM"
+echo "priv_run_stuck: stdout pipe full ($queued of $capacity bytes) and not draining"
 signal_ruster TERM
 tries=0
 while launcher_alive; do

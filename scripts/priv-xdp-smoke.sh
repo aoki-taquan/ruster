@@ -37,6 +37,16 @@
 #   holder   attach in a separate process, SIGKILL it, link auto-detaches
 set -eu
 
+# RUSTER_REQUIRE_PRIV=1 (the `XDP veth` CI job) is passed to the privileged
+# tests, which then fail instead of skipping. Nothing here ever skips.
+case ${RUSTER_REQUIRE_PRIV-} in
+"" | 1) ;;
+*)
+    echo "priv-xdp-smoke: RUSTER_REQUIRE_PRIV must be 1 or unset" >&2
+    exit 1
+    ;;
+esac
+
 for tool in cargo ip sudo python3 od; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "priv-xdp-smoke: missing $tool" >&2
@@ -147,6 +157,7 @@ run_phase() {
     log="$work/$phase.log"
     status=0
     in_netns env \
+        ${RUSTER_REQUIRE_PRIV:+"RUSTER_REQUIRE_PRIV=$RUSTER_REQUIRE_PRIV"} \
         RUSTER_PRIV_XDP=1 \
         RUSTER_PRIV_XDP_PHASE="$phase" \
         RUSTER_PRIV_XDP_NETNS="$netns" \
@@ -240,6 +251,7 @@ test -z "$(xdp_prog)" || {
 
 # Holder: attach in a separate process, then SIGKILL it.
 in_netns env \
+    ${RUSTER_REQUIRE_PRIV:+"RUSTER_REQUIRE_PRIV=$RUSTER_REQUIRE_PRIV"} \
     RUSTER_PRIV_XDP=1 \
     RUSTER_PRIV_XDP_PHASE=holder \
     RUSTER_PRIV_XDP_NETNS="$netns" \

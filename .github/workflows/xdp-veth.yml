@@ -1,0 +1,108 @@
+name: XDP veth
+
+# M2 S11: the privileged AF_XDP smokes on a hosted runner.
+#   - probe first: the job FAILS (typed `code=`) if this runner cannot do
+#     AF_XDP and XDP attach on a veth inside a throwaway netns; it never
+#     skips or passes vacuously
+#   - build as the runner user, run only the privileged parts with `sudo -n`
+#   - scripts/priv-xdp-smoke.sh (native session tests, priv_xdp_session) and
+#     scripts/priv-run-smoke.sh (`ruster run` E2E) with RUSTER_REQUIRE_PRIV=1,
+#     so every would-be skip is a failure
+# Every veth lives in a dedicated `ruster-*` network namespace that the
+# scripts always delete; nothing is created in the initial namespace and no
+# host interface is touched. Not a required check (owner decision).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  xdp-veth:
+    name: XDP veth
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Install smoke tools
+        run: |
+          sudo -n apt-get update -q
+          sudo -n apt-get install -y -q --no-install-recommends ethtool iproute2 python3 procps
+
+      - name: Probe AF_XDP on veth in a netns
+        env:
+          RUSTER_REQUIRE_PRIV: "1"
+        run: >-
+          timeout --signal=TERM --kill-after=30s 2m
+          scripts/priv-xdp-probe.sh
+
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
+
+      - name: Build smoke binaries (unprivileged)
+        run: |
+          cargo build --locked -p ruster-cli --bin ruster
+          cargo test --locked -p ruster-io-xdp-native --test priv_xdp_session --no-run
+          # The pure gate test (skip vs fail) runs without privileges.
+          cargo test --locked -p ruster-io-xdp-native --test priv_xdp_session -- \
+            --exact priv_gate_fails_instead_of_skipping_when_required
+
+      - name: Native AF_XDP smoke (priv_xdp_session)
+        shell: bash
+        env:
+          RUSTER_REQUIRE_PRIV: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/smoke-logs" "${RUNNER_TEMP}/smoke-tmp"
+          TMPDIR="${RUNNER_TEMP}/smoke-tmp" \
+            timeout --signal=TERM --kill-after=30s 10m \
+            scripts/priv-xdp-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/smoke-logs/priv-xdp-smoke.log"
+
+      - name: ruster run E2E smoke
+        shell: bash
+        env:
+          RUSTER_REQUIRE_PRIV: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/smoke-logs" "${RUNNER_TEMP}/smoke-tmp"
+          TMPDIR="${RUNNER_TEMP}/smoke-tmp" \
+            timeout --signal=TERM --kill-after=30s 12m \
+            scripts/priv-run-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/smoke-logs/priv-run-smoke.log"
+
+      - name: No smoke namespace left behind
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          left="$(sudo -n ip netns list | grep -E '^ruster-' || true)"
+          if [[ -n "${left}" ]]; then
+            echo "::error title=XDP veth::namespaces left behind: ${left}"
+            exit 1
+          fi
+
+      - name: Upload smoke logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: xdp-veth-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/smoke-logs
+          if-no-files-found: warn
+          retention-days: 7
+          overwrite: false
+          include-hidden-files: false
