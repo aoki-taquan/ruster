@@ -8,9 +8,10 @@ use ruster_config::{parse, validate, ValidatedConfig, PRODUCTION_VALIDATION_LIMI
 use ruster_control::{candidate_from_config, FullServiceStorage, SimDeterministicKeySource};
 use ruster_core::{
     port_free_bitmap_words, DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallStateSlot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Nat44TcpMappingSlot, Nat44TcpSessionSlot,
-    Nat44TcpSynHoldSlot, Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot,
-    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionStateSlot,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Nat44HostLink, Nat44TcpHostSlot,
+    Nat44TcpMappingSlot, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpHostSlot,
+    Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot,
+    ResolutionFailureHoldSlot, ResolutionStateSlot,
 };
 
 /// Net bytes the measuring thread allocated while armed.
@@ -167,6 +168,59 @@ fn the_maximal_production_config_allocates_within_the_documented_bound() {
     // The arrays exactly; `Box<[T]>` has no spare capacity.
     assert_eq!(allocated, WORST_CASE);
     assert!(allocated <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes);
+    drop(storage);
+    assert_eq!(live::net(), 0);
+    live::stop();
+}
+
+/// N3: per-host mapping accounting on both protocols adds, per mapping
+/// slot, one host link, one host slot, and one host directory node and
+/// bucket. The maximal config with `mappings-per-host` set on both still
+/// fits the production byte bound, and the storage allocates exactly what
+/// `required_bytes` counts.
+#[test]
+fn the_maximal_config_with_per_host_limits_still_fits_the_bound() {
+    let slots = PRODUCTION_VALIDATION_LIMITS.max_slots_per_table as usize;
+    let directory = size_of::<DirectoryBucket>() + size_of::<DirectoryNode>();
+    let host_bytes = slots
+        * (2 * (size_of::<Nat44HostLink>() + directory)
+            + size_of::<Nat44UdpHostSlot>()
+            + size_of::<Nat44TcpHostSlot>());
+    // 12-byte links, 24- and 36-byte host slots (one and two host lists).
+    assert_eq!(host_bytes, 9_175_040);
+    let worst_case = worst_case_bytes() + host_bytes;
+    assert_eq!(worst_case, 66_240_704);
+    assert!(worst_case <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes);
+
+    let text = MAXIMAL
+        .replacen(
+            "[nat44.udp.capacity]",
+            "mappings-per-host = 256\n\n[nat44.udp.capacity]",
+            1,
+        )
+        .replacen(
+            "[nat44.tcp.capacity]",
+            "mappings-per-host = 256\n\n[nat44.tcp.capacity]",
+            1,
+        );
+    let parsed = parse(text.as_bytes()).expect("parse");
+    let Ok(ValidatedConfig::V1(config)) = validate(parsed, PRODUCTION_VALIDATION_LIMITS) else {
+        panic!("per-host limits keep the maximal config within the production limits");
+    };
+    assert_eq!(config.storage_shape().required_bytes, worst_case);
+    let mut keys = SimDeterministicKeySource::new(0);
+    let candidate =
+        candidate_from_config(&config, NonZeroU64::MIN, &mut keys).expect("bridge accepts");
+    assert_eq!(candidate.storage_shape().nat44_udp().host_slots(), 65_536);
+    assert_eq!(candidate.storage_shape().nat44_tcp().host_slots(), 65_536);
+
+    live::self_check();
+    live::start();
+    let storage = FullServiceStorage::new(candidate.storage_shape()).expect("allocates");
+    assert_eq!(
+        usize::try_from(live::net()).expect("storage allocates"),
+        worst_case
+    );
     drop(storage);
     assert_eq!(live::net(), 0);
     live::stop();

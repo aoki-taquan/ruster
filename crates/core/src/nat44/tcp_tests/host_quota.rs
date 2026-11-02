@@ -1,0 +1,360 @@
+//! N3: the per-internal-host mapping quota of the TCP NAT (NAT44-092, RFC
+//! 6888 REQ-4). A child of `nat44::tcp_tests`, sharing its helpers.
+
+use super::*;
+
+const SYN: u8 = 0x02;
+const SYN_ACK: u8 = 0x12;
+const ACK: u8 = 0x10;
+const FIN_ACK: u8 = 0x11;
+const RST: u8 = 0x04;
+const TRANSITORY: u64 = NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS;
+
+fn quota_policy(limit: u16) -> Nat44TcpPolicy {
+    Nat44TcpPolicy::default()
+        .with_filtering(Nat44Filtering::EndpointIndependent)
+        .with_mappings_per_host(limit)
+}
+
+fn seg(flags: u8) -> Nat44TcpSegment {
+    Nat44TcpSegment::from_flags(flags)
+}
+
+fn out(
+    runtime: &mut Nat44TcpRuntime<'_>,
+    internal: (Ipv4Address, u16),
+    remote: (Ipv4Address, u16),
+    flags: u8,
+    now: u64,
+) -> Result<Nat44TcpOutboundPlan, Nat44TcpPlanError> {
+    let plan = runtime
+        .plan_outbound(internal.0, internal.1, remote.0, remote.1, seg(flags), now)
+        .inspect_err(|error| runtime.record_plan_error(*error))?;
+    runtime.commit_outbound(plan, now).unwrap();
+    Ok(plan)
+}
+
+fn inbound(
+    runtime: &mut Nat44TcpRuntime<'_>,
+    public_port: u16,
+    remote: (Ipv4Address, u16),
+    flags: u8,
+    now: u64,
+) -> Result<(), Nat44TcpPlanError> {
+    let plan = runtime.plan_inbound(public_port, remote.0, remote.1, seg(flags), now)?;
+    runtime.commit_inbound(plan, now).unwrap();
+    Ok(())
+}
+
+fn host_count(runtime: &Nat44TcpRuntime<'_>, address: Ipv4Address) -> usize {
+    runtime
+        .hosts
+        .find(address)
+        .unwrap()
+        .map_or(0, |host| runtime.hosts.count(host))
+}
+
+/// Mappings of `address` that own a port and those live at `now`, by a
+/// full scan of the slots.
+fn scan(runtime: &Nat44TcpRuntime<'_>, address: Ipv4Address, now: u64) -> (usize, usize) {
+    let mut counted = 0;
+    let mut live = 0;
+    for mapping in runtime.mappings.iter().copied() {
+        if mapping.occupied && mapping.internal_address == address {
+            counted += usize::from(mapping.port_owned);
+            live += usize::from(runtime.mapping_is_live(mapping, now));
+        }
+    }
+    (counted, live)
+}
+
+/// At the limit a new mapping is refused without any state change, while
+/// new sessions on the host's existing mappings (outbound to another remote
+/// and filtered inbound) still work, and another host keeps its own quota.
+#[test]
+fn tcp_host_quota_refuses_new_mappings_but_not_new_sessions() {
+    with_config(quota_policy(2), 40_000, 40_063, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 8];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 16];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let first = out(&mut runtime, (INTERNAL, 1_000), (REMOTE1, 443), SYN, 0).unwrap();
+        out(&mut runtime, (INTERNAL, 1_001), (REMOTE1, 443), SYN, 0).unwrap();
+        let mappings_before = runtime.mappings.to_vec();
+        let sessions_before = runtime.sessions.to_vec();
+        assert_eq!(
+            out(&mut runtime, (INTERNAL, 1_002), (REMOTE1, 443), SYN, 10).map(|_| ()),
+            Err(Nat44TcpPlanError::HostQuotaExceeded)
+        );
+        assert_eq!(runtime.mappings, &mappings_before[..]);
+        assert_eq!(runtime.sessions, &sessions_before[..]);
+        assert_eq!(runtime.counters().host_quota_exceeded, 1);
+        // A new session of an existing mapping is not a new mapping.
+        let second = out(&mut runtime, (INTERNAL, 1_000), (REMOTE2, 80), SYN, 20).unwrap();
+        assert!(!second.mapping_created && second.session_created);
+        inbound(
+            &mut runtime,
+            first.public_port(),
+            (Ipv4Address::from_octets([192, 0, 2, 99]), 5_000),
+            SYN,
+            20,
+        )
+        .unwrap();
+        assert_eq!(host_count(&runtime, INTERNAL), 2);
+        out(&mut runtime, (INTERNAL2, 1_000), (REMOTE1, 443), SYN, 30).unwrap();
+        assert_eq!(host_count(&runtime, INTERNAL2), 1);
+        assert_eq!(runtime.validate_indexes(), Ok(()));
+    });
+}
+
+/// The host's mappings expire in phase order, not activity order: an
+/// established mapping created first outlives a half-open one created
+/// later. At the limit, the new mapping reclaims the one that expired (the
+/// half-open one, from the host's transitory list), exactly at its expiry.
+#[test]
+fn tcp_host_quota_reclaims_the_hosts_mapping_that_expired_first() {
+    with_config(quota_policy(2), 40_000, 40_063, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 8];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 16];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let established = out(&mut runtime, (INTERNAL, 1_000), (REMOTE1, 443), SYN, 0).unwrap();
+        inbound(
+            &mut runtime,
+            established.public_port(),
+            (REMOTE1, 443),
+            SYN_ACK,
+            0,
+        )
+        .unwrap();
+        out(&mut runtime, (INTERNAL, 1_000), (REMOTE1, 443), ACK, 0).unwrap();
+        let half_open = out(&mut runtime, (INTERNAL, 1_001), (REMOTE1, 443), SYN, 1_000).unwrap();
+        let expiry = 1_000 + TRANSITORY;
+        assert_eq!(
+            out(
+                &mut runtime,
+                (INTERNAL, 1_002),
+                (REMOTE1, 443),
+                SYN,
+                expiry - 1
+            )
+            .map(|_| ()),
+            Err(Nat44TcpPlanError::HostQuotaExceeded)
+        );
+        let reclaimed = out(&mut runtime, (INTERNAL, 1_002), (REMOTE1, 443), SYN, expiry).unwrap();
+        assert!(reclaimed.mapping_created && reclaimed.mapping_expired);
+        assert_eq!(reclaimed.mapping_index(), half_open.mapping_index());
+        assert_eq!(reclaimed.public_port(), half_open.public_port());
+        // The established mapping is untouched and still translates.
+        let kept = runtime.mappings[established.mapping_index()];
+        assert!(kept.port_owned && kept.internal_port == 1_000);
+        out(&mut runtime, (INTERNAL, 1_000), (REMOTE1, 443), ACK, expiry).unwrap();
+        assert_eq!(host_count(&runtime, INTERNAL), 2);
+        assert_eq!(runtime.validate_indexes(), Ok(()));
+        // A reconcile flush forgets every host.
+        runtime
+            .reconcile(config, rotated_test_tcp_hash_key())
+            .unwrap();
+        assert_eq!(runtime.hosts.host_counts(), (0, 0));
+        out(&mut runtime, (INTERNAL, 1_003), (REMOTE1, 443), SYN, expiry).unwrap();
+        assert_eq!(host_count(&runtime, INTERNAL), 1);
+    });
+}
+
+/// With both host lists' heads expired, the new mapping reclaims the one
+/// that expired first (here the established mapping, older by expiry though
+/// it is on the longer-lived list), and a returning endpoint whose own
+/// expired mapping still holds its port recreates it in place at the limit
+/// even when another of the host's mappings expired earlier.
+#[test]
+fn tcp_host_quota_reclaims_the_earliest_expiry_and_exempts_returning_endpoints() {
+    let established_ttl = NAT44_TCP_DEFAULT_IDLE_TTL_MS;
+    with_config(quota_policy(2), 40_000, 40_063, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 8];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 16];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let established = out(&mut runtime, (INTERNAL, 1_000), (REMOTE1, 443), SYN, 0).unwrap();
+        inbound(
+            &mut runtime,
+            established.public_port(),
+            (REMOTE1, 443),
+            SYN_ACK,
+            0,
+        )
+        .unwrap();
+        out(&mut runtime, (INTERNAL, 1_000), (REMOTE1, 443), ACK, 0).unwrap();
+        // Expires at established_ttl - 100_000 + TRANSITORY, after the
+        // established mapping (established_ttl).
+        let start = established_ttl - 100_000;
+        let half_open = out(&mut runtime, (INTERNAL, 1_001), (REMOTE1, 443), SYN, start).unwrap();
+        let now = start + TRANSITORY;
+        assert!(!runtime.mapping_is_live(runtime.mappings[established.mapping_index()], now));
+        assert!(!runtime.mapping_is_live(runtime.mappings[half_open.mapping_index()], now));
+        // The half-open endpoint returns: its own slot and port, not the
+        // established mapping's (which expired first).
+        let back = out(&mut runtime, (INTERNAL, 1_001), (REMOTE2, 80), SYN, now).unwrap();
+        assert!(back.mapping_created);
+        assert_eq!(back.mapping_index(), half_open.mapping_index());
+        assert_eq!(back.public_port(), half_open.public_port());
+        assert!(runtime.mappings[established.mapping_index()].port_owned);
+        assert_eq!(host_count(&runtime, INTERNAL), 2);
+        assert_eq!(runtime.validate_indexes(), Ok(()));
+    });
+    with_config(quota_policy(2), 40_000, 40_063, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 8];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 16];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let established = out(&mut runtime, (INTERNAL, 1_000), (REMOTE1, 443), SYN, 0).unwrap();
+        inbound(
+            &mut runtime,
+            established.public_port(),
+            (REMOTE1, 443),
+            SYN_ACK,
+            0,
+        )
+        .unwrap();
+        out(&mut runtime, (INTERNAL, 1_000), (REMOTE1, 443), ACK, 0).unwrap();
+        let start = established_ttl - 100_000;
+        out(&mut runtime, (INTERNAL, 1_001), (REMOTE1, 443), SYN, start).unwrap();
+        let now = start + TRANSITORY;
+        // A new endpoint takes the mapping that expired first.
+        let reclaimed = out(&mut runtime, (INTERNAL, 1_002), (REMOTE1, 443), SYN, now).unwrap();
+        assert_eq!(reclaimed.mapping_index(), established.mapping_index());
+        assert_eq!(reclaimed.public_port(), established.public_port());
+        assert_eq!(host_count(&runtime, INTERNAL), 2);
+        assert_eq!(runtime.validate_indexes(), Ok(()));
+    });
+}
+
+/// Seeded churn of SYN, SYN-ACK, ACK, FIN, and RST segments of several
+/// hosts' connections against a small pool and table, checked after every
+/// segment against a full scan of the slots (not an independent NAT model):
+/// a new mapping is refused as `HostQuotaExceeded` exactly when the scan
+/// finds `limit` live mappings of its host; every host's count equals its
+/// scanned port-owning mappings and never exceeds the limit; the full index
+/// validation, including the host lists in expiry order, holds.
+#[test]
+fn tcp_host_quota_matches_a_full_scan_of_the_slots_under_seeded_churn() {
+    const LIMIT: u16 = 2;
+    for seed in 1..=16_u64 {
+        let hosts = if seed % 4 == 0 { 12 } else { 4 };
+        let policy = quota_policy(LIMIT).with_port_preservation(seed % 2 == 0);
+        with_config(policy, 40_000, 40_009, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 8];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 16];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            let mut random = seed;
+            let mut now = 0_u64;
+            let mut outcomes = [0_usize; 3];
+            for _ in 0..2_000 {
+                now += next_random(&mut random) % (TRANSITORY / 4);
+                let address =
+                    Ipv4Address::from_octets([10, 0, 1, (next_random(&mut random) % hosts) as u8]);
+                let port = 40_000 + (next_random(&mut random) % 4) as u16;
+                let remote = (REMOTE1, 443 + (next_random(&mut random) % 2) as u16);
+                let flags = [SYN, SYN, ACK, FIN_ACK, RST][(next_random(&mut random) % 5) as usize];
+                let exact_live = runtime
+                    .find_mapping(address, port)
+                    .unwrap()
+                    .is_some_and(|(_, mapping)| runtime.mapping_is_live(mapping, now));
+                let (_, live) = scan(&runtime, address, now);
+                match out(&mut runtime, (address, port), remote, flags, now) {
+                    Err(Nat44TcpPlanError::HostQuotaExceeded) => {
+                        assert!(flags == SYN && !exact_live, "seed {seed}");
+                        assert!(live >= usize::from(LIMIT), "seed {seed}");
+                        outcomes[0] += 1;
+                    }
+                    Err(_) => {
+                        assert!(exact_live || live < usize::from(LIMIT) || flags != SYN);
+                    }
+                    Ok(plan) => {
+                        outcomes[1] += usize::from(plan.mapping_created);
+                        // Some remotes answer, so sessions establish.
+                        if flags == SYN && next_random(&mut random).is_multiple_of(2) {
+                            let _ = inbound(&mut runtime, plan.public_port(), remote, SYN_ACK, now);
+                            outcomes[2] += 1;
+                        }
+                    }
+                }
+                for index in 0..hosts {
+                    let address = Ipv4Address::from_octets([10, 0, 1, index as u8]);
+                    let (counted, live) = scan(&runtime, address, now);
+                    assert_eq!(host_count(&runtime, address), counted, "seed {seed}");
+                    assert!(counted <= usize::from(LIMIT) && live <= counted);
+                }
+                assert_eq!(runtime.validate_indexes(), Ok(()), "seed {seed}");
+            }
+            assert!(outcomes.iter().all(|count| *count > 0), "{outcomes:?}");
+        });
+    }
+}
+
+fn next_random(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// Constant work in a full 65536-slot table: 4095 hosts at a limit of 16
+/// hold every port; a refused SYN costs one host lookup and two head
+/// liveness checks, and after expiry a SYN reclaims the host's own mapping
+/// with one port-owner check.
+#[test]
+fn tcp_host_quota_work_is_constant_in_a_full_65536_slot_table() {
+    const SLOTS: usize = 65_536;
+    const LIMIT: usize = 16;
+    with_config(quota_policy(LIMIT as u16), 1, 65_535, |config| {
+        let mut mappings = vec![Nat44TcpMappingSlot::default(); SLOTS];
+        let mut sessions = vec![Nat44TcpSessionSlot::default(); SLOTS];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let address = |host: usize| {
+            Ipv4Address::from_octets([10, 1 + (host >> 16) as u8, (host >> 8) as u8, host as u8])
+        };
+        for flow in 0..65_535 {
+            let plan = runtime
+                .plan_outbound(
+                    address(flow / LIMIT),
+                    (flow % LIMIT) as u16 + 1,
+                    REMOTE1,
+                    443,
+                    seg(SYN),
+                    0,
+                )
+                .unwrap();
+            runtime.commit_outbound(plan, 0).unwrap();
+        }
+        let mut worst = [0_usize; 3];
+        let mut syn_work = |runtime: &mut Nat44TcpRuntime<'_>, host: usize, now: u64| {
+            runtime.reset_liveness_checks();
+            runtime.reset_index_probe_counts();
+            runtime.hosts.take_lookup_probes();
+            let result = runtime
+                .plan_outbound(address(host), 100, REMOTE2, 80, seg(SYN), now)
+                .map(|plan| runtime.commit_outbound(plan, now).unwrap());
+            let (mapping_checks, _) = runtime.liveness_checks();
+            let (_, _, _, _, owner_probes) = runtime.index_probe_counts();
+            let seen = [
+                mapping_checks,
+                owner_probes,
+                runtime.hosts.take_lookup_probes(),
+            ];
+            for (worst, seen) in worst.iter_mut().zip(seen) {
+                *worst = (*worst).max(seen);
+            }
+            result
+        };
+        for host in (0..4_095).step_by(97) {
+            assert_eq!(
+                syn_work(&mut runtime, host, 1),
+                Err(Nat44TcpPlanError::HostQuotaExceeded)
+            );
+        }
+        for host in (0..4_095).step_by(97) {
+            syn_work(&mut runtime, host, TRANSITORY).unwrap();
+        }
+        assert!(
+            worst[0] <= 4 && worst[1] <= 1 && worst[2] <= 6,
+            "work per new SYN {worst:?}"
+        );
+        assert!(runtime.port_owners.bitmap_matches_slots());
+    });
+}

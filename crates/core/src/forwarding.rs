@@ -201,6 +201,14 @@ pub enum DropReason {
     /// [`ArpPolicy::with_require_on_link_sender`]; the RFC 826 default
     /// learns and answers such a sender. Nothing is learned or answered.
     ArpSenderNotOnLink = 154,
+    /// A new UDP mapping's internal address already holds the per-host
+    /// limit of live mappings (N3, NAT44-092). Nothing was created or
+    /// evicted.
+    Nat44UdpHostQuotaExceeded = 155,
+    /// A new TCP mapping's internal address already holds the per-host
+    /// limit of live mappings (N3, NAT44-092). Nothing was created or
+    /// evicted.
+    Nat44TcpHostQuotaExceeded = 156,
 }
 
 use DropReason::*;
@@ -208,7 +216,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 154] = [
+    pub const ALL: [Self; 156] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -363,6 +371,8 @@ impl DropReason {
         Nat44Icmpv4InsideSourceMismatch,
         Nat44Icmpv4EndHostSourceMismatch,
         ArpSenderNotOnLink,
+        Nat44UdpHostQuotaExceeded,
+        Nat44TcpHostQuotaExceeded,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -534,6 +544,8 @@ impl DropReason {
             Nat44Icmpv4InsideSourceMismatch => "NAT44_ICMPV4_INSIDE_SOURCE_MISMATCH",
             Nat44Icmpv4EndHostSourceMismatch => "NAT44_ICMPV4_END_HOST_SOURCE_MISMATCH",
             ArpSenderNotOnLink => "ARP_SENDER_NOT_ON_LINK",
+            Nat44UdpHostQuotaExceeded => "NAT44_UDP_HOST_QUOTA_EXCEEDED",
+            Nat44TcpHostQuotaExceeded => "NAT44_TCP_HOST_QUOTA_EXCEEDED",
         }
     }
 }
@@ -3227,6 +3239,7 @@ fn nat44_udp_icmpv4_lookup_reason(error: Nat44UdpPlanError) -> DropReason {
         Nat44UdpPlanError::MappingFull
         | Nat44UdpPlanError::PeerFull
         | Nat44UdpPlanError::PortExhausted
+        | Nat44UdpPlanError::HostQuotaExceeded
         | Nat44UdpPlanError::GenerationExhausted
         | Nat44UdpPlanError::StateRevisionExhausted => {
             unreachable!("read-only ICMP lookup cannot exhaust state")
@@ -3244,7 +3257,8 @@ fn nat44_tcp_icmpv4_lookup_reason(error: Nat44TcpPlanError) -> DropReason {
         | Nat44TcpPlanError::MappingFull
         | Nat44TcpPlanError::SessionFull
         | Nat44TcpPlanError::PortExhausted
-        | Nat44TcpPlanError::InboundRemoteQuotaExceeded => {
+        | Nat44TcpPlanError::InboundRemoteQuotaExceeded
+        | Nat44TcpPlanError::HostQuotaExceeded => {
             unreachable!("read-only ICMP lookup cannot create state")
         }
         Nat44TcpPlanError::IndexCorrupt
@@ -5066,6 +5080,10 @@ fn nat44_udp_plan_error(error: Nat44UdpPlanError) -> (DropReason, Nat44UdpDispos
         Nat44UdpPlanError::PortExhausted => {
             (Nat44UdpPortExhausted, Nat44UdpDisposition::PortExhausted)
         }
+        Nat44UdpPlanError::HostQuotaExceeded => (
+            Nat44UdpHostQuotaExceeded,
+            Nat44UdpDisposition::HostQuotaExceeded,
+        ),
         Nat44UdpPlanError::ClockRegression => (
             Nat44UdpClockRegression,
             Nat44UdpDisposition::ClockRegression,
@@ -5197,6 +5215,10 @@ fn nat44_tcp_plan_error(error: Nat44TcpPlanError) -> (DropReason, Nat44TcpDispos
         Nat44TcpPlanError::InboundRemoteQuotaExceeded => (
             Nat44TcpInboundRemoteQuotaExceeded,
             Nat44TcpDisposition::InboundRemoteQuotaExceeded,
+        ),
+        Nat44TcpPlanError::HostQuotaExceeded => (
+            Nat44TcpHostQuotaExceeded,
+            Nat44TcpDisposition::HostQuotaExceeded,
         ),
         Nat44TcpPlanError::IndexCorrupt
         | Nat44TcpPlanError::GenerationExhausted
@@ -6460,6 +6482,7 @@ mod tests {
                 &mut session_address_nodes,
                 &mut owners,
                 &mut owner_bits,
+                crate::nat44_host_quota::leaked_host_storage(1),
             ),
             Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0).unwrap(),
         )
@@ -6624,6 +6647,7 @@ mod tests {
                     &mut session_address_nodes,
                     &mut owners,
                     &mut owner_bits,
+                    crate::nat44_host_quota::leaked_host_storage(1),
                 ),
                 Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0).unwrap(),
             )
@@ -6964,6 +6988,8 @@ mod tests {
             (152, "NAT44_ICMPV4_INSIDE_SOURCE_MISMATCH"),
             (153, "NAT44_ICMPV4_END_HOST_SOURCE_MISMATCH"),
             (154, "ARP_SENDER_NOT_ON_LINK"),
+            (155, "NAT44_UDP_HOST_QUOTA_EXCEEDED"),
+            (156, "NAT44_TCP_HOST_QUOTA_EXCEEDED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -6973,7 +6999,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(155), None);
+        assert_eq!(DropReason::from_code(157), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

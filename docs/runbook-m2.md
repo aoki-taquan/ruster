@@ -209,7 +209,7 @@ whole-document storage, which has no path.
 |---|---|---|---|
 | quote tables (`max_quote_slots_per_table`): `resolution.capacity.failure-holds`, `icmpv4-errors.capacity.actions`, `nat44.tcp.capacity.unsolicited-syn-holds` | 65536 | 4096 | each slot holds a quoted datagram (656, 584, and 592 bytes), so the bound is memory: at 65536 these three alone would need 114.5 MiB. Until H4b this limit (then `max_scanned_slots_per_table`) covered every resolution and ICMPv4 error table because their packet paths scanned |
 | other tables (`max_slots_per_table`): `resolution.capacity.{states,actions,dynamic-neighbors}`, `icmpv4-errors.capacity.states`, `nat44.{udp,tcp}.capacity.*`, `firewall.capacity.states`, each NAT44 directory (next power of two), the NAT44 port owner table (pool size) | 65536 | 65536 | no packet path scans them (table below); home NAT needs many sessions; also the largest port pool (1-65535) |
-| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 54.42 MiB, so the per-table limits bind; the byte limit fails closed only if a slot type grows |
+| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 54.42 MiB (63.17 MiB with `mappings-per-host` set on both NAT44 protocols, N3), so the per-table limits bind; the byte limit fails closed only if a slot type grows |
 | config file | 1 MiB | 1 MiB | parse stage, every backend (CONFIG-001) |
 | `[[interfaces]]` / `[[backend.ports]]` | 256 / 256 | 256 / 256 | parse stage |
 | `[[addresses]]` | 1024 | 1024 | parse stage |
@@ -247,7 +247,7 @@ reload path.
 | resolution `actions` (56 B) | FIFO list; a state removes its own queued action in O(1) | O(1) | — | like `states` |
 | ICMPv4 error `states` (24 B) | every generated error (TTL expiry, unreachable) | only the occupied states, which are a prefix of the table and at most two per egress interface in use (one per limiter class: Port Unreachable has its own) | — | at least the number of interfaces plus one (the WAN's Port Unreachable class; `validate` requires it while delayed Port Unreachable is on) |
 | ICMPv4 error `actions` (584 B) | O(1) ring; one per state | O(1) | — | like `states` (one queued error per state; fewer only means `action_full` refusals while the queue is full) |
-| NAT44 `mappings`/`peers`/`sessions` (UDP 64/48 B, TCP 80/64 B + directories) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (one list per TTL, so its head is the first to expire; TCP since N1 has one session list per phase and two mapping lists) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
+| NAT44 `mappings`/`peers`/`sessions` (UDP 64/48 B, TCP 80/64 B + directories; with `mappings-per-host` also 64/76 B per mapping slot of per-host storage) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (one list per TTL, so its head is the first to expire; TCP since N1 has one session list per phase and two mapping lists) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
 | `nat44.tcp.capacity.unsolicited-syn-holds` (592 B) | an unsolicited inbound TCP SYN (no mapping for its public port, or refused by the filtering) is held for the RFC 5382 REQ-4 delayed ICMP Port Unreachable; a translated outbound SYN cancels the hold of its connection | one keyed chain of at most 16 holds (`NAT44_TCP_SYN_HOLD_CHAIN_LIMIT`, secret NAT key) plus O(1) list heads; a full table or chain drops silently. Matured holds are taken in deadline order by the failure-dispatch phase, at most `tick.failure-dispatch-scans` per tick (the same budget value as the resolution failure dispatch, applied separately, so the phase does up to twice that), never scanning unmatured ones; each matured hold walks the firewall rules once. An inconsistent table is flushed (`unsolicited_syn_index_corrupt`) | — | default 64. The Port Unreachable limiter sends at most 1 per second per egress by default, so a bigger table does not send more ICMP; it only holds more SYNs that the limiter will refuse. 0 frees the 37 KiB when the switch is off |
 | `firewall.capacity.states` (56 B) | keyed SipHash probe with occupancy capped near 75% (`usable_state_capacity`), so a full table cannot occur; only the amortized expiry sweep (`reclaim_one_expired`) is linear | — (amortized) | — | the expected concurrent flows |
 
@@ -1428,12 +1428,39 @@ SYNs nobody completes, such as a scan or a spoofed SYN flood.
   victim-independent keyed search, and an expired port is reused only by
   its own returning endpoint or by a keyed takeover when the pool is
   full. Like every NAT change, the apply flushes the NAT state.
-- An inside host can still fill the pool (it opens mappings from many
-  source ports) and so steer other hosts into takeovers of expired ports
-  or into `PORT_EXHAUSTED`. There is no per-host mapping quota yet
-  (NAT44-092, deferred); size the pool and the mapping capacity for the
-  number of inside hosts, and use the firewall to limit what untrusted
-  hosts may open.
+- Per-host mapping quota (`[nat44.udp]`/`[nat44.tcp]` `mappings-per-host`,
+  N3, NAT44-092; default `0`, no limit). Without it an inside host can
+  fill the pool (it opens mappings from many source ports) and so steer
+  other hosts into takeovers of expired ports or into `PORT_EXHAUSTED`.
+  With a limit, a host that already holds that many live mappings of the
+  protocol gets its next new mapping dropped as
+  `NAT44_UDP_HOST_QUOTA_EXCEEDED` / `NAT44_TCP_HOST_QUOTA_EXCEEDED`
+  (counters `nat44_udp.host_quota_exceeded`,
+  `nat44_tcp.host_quota_exceeded`); nothing is evicted, and its existing
+  mappings, their new peers or sessions, and inbound traffic are
+  unaffected. It recovers by itself: once one of its mappings has expired
+  (UDP idle TTL; TCP the phase TTL of its last session, 4 minutes for a
+  closed or half-open connection), the next new mapping reuses that
+  mapping's slot and public port, never another host's. Sizing: the limit
+  counts public ports per host, so `pool size / expected inside hosts`
+  keeps every host able to get a port (for example 65535 / 64 hosts is
+  about 1024); a limit of a few hundred to a few thousand still serves
+  browsers, games, and P2P clients, while a host that opens tens of
+  thousands of flows is the one refused. Watch the counters: a steadily
+  rising count on a well-behaved host means the limit is too low.
+  Enabling it allocates per-host storage sized from `capacity.mappings`
+  (64 bytes per UDP mapping slot and 76 per TCP slot at a power-of-two
+  capacity, 9175040 bytes for both
+  at 65536 slots; it still fits the 64 MiB production bound), so changing
+  between `0` and a limit is restart-required (`STORAGE_SHAPE`); changing
+  one limit to another is reloadable (`ruster plan` shows
+  `nat44-udp mappings-per-host ~ 64 -> 128`; the apply flushes the NAT
+  state like every NAT change). Limits: the limit is per inside IPv4
+  address, so a host that can spoof source addresses on the LAN gets a
+  quota per spoofed address (there is no inside source-address
+  validation); keep untrusted hosts on a segment you can filter, and still
+  size the pool and the mapping capacity for the inside hosts. No ICMP is
+  sent for a refusal, and there is no per-host usage report (NAT44-096).
 - Debug builds validate every NAT44 index after each UDP commit (O(M+P)
   and more per packet). Use only release builds (`cargo build --release`)
   in production.

@@ -305,6 +305,7 @@ fn with_service_runtimes(
             &mut [],
             &mut udp_owner,
             &mut udp_owner_bits,
+            ruster_core::Nat44HostStorage::disabled(),
         ),
         Nat44UdpHashKey::new(3, 4).unwrap(),
     )
@@ -322,6 +323,7 @@ fn with_service_runtimes(
             &mut [],
             &mut tcp_owner,
             &mut tcp_owner_bits,
+            ruster_core::Nat44HostStorage::disabled(),
         ),
         Nat44TcpHashKey::new(5, 6).unwrap(),
     )
@@ -411,8 +413,8 @@ fn service_counters_render_in_fixed_order(
     for (section, fields) in [
         ("resolution", 13),
         ("icmpv4_errors", 34),
-        ("nat44_udp", 17),
-        ("nat44_tcp", 38),
+        ("nat44_udp", 18),
+        ("nat44_tcp", 39),
         ("firewall", 13),
     ] {
         assert_eq!(sections.iter().filter(|s| **s == section).count(), fields);

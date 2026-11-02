@@ -138,9 +138,10 @@ pub struct NatPortRange {
 }
 
 /// Difference of one NAT44 protocol. The filtering behavior, the
-/// hairpinning switch, the port preservation switch, the TCP per-remote
-/// inbound session limit, the TCP unsolicited-SYN ICMP switch, and the TCP
-/// inbound-RST policy are not secret and are reported as typed deltas. The
+/// hairpinning switch, the port preservation switch, the per-host mapping
+/// limit, the TCP per-remote inbound session limit, the TCP unsolicited-SYN
+/// ICMP switch, and the TCP inbound-RST policy are not secret and are
+/// reported as typed deltas. The
 /// rest of the policy (which includes the allocator seed) is never exposed,
 /// only whether it changed: `policy_changed` ignores changes of only those
 /// values.
@@ -153,6 +154,10 @@ pub struct NatChange {
     pub hairpinning: Option<Delta<bool>>,
     /// The port preservation switch (`port-preservation`, N2).
     pub port_preservation: Option<Delta<bool>>,
+    /// The per-host mapping limit (`mappings-per-host`, N3); `0` means no
+    /// limit. Switching between `0` and a limit also changes the storage
+    /// shape (restart-required); a change between two limits is reloadable.
+    pub mappings_per_host: Option<Delta<u16>>,
     /// TCP only (always `None` for UDP); `0` means no limit.
     pub inbound_sessions_per_remote: Option<Delta<u8>>,
     /// TCP only (always `None` for UDP): the RFC 5382 REQ-4 delayed ICMP
@@ -172,6 +177,7 @@ impl NatChange {
             && self.filtering.is_none()
             && self.hairpinning.is_none()
             && self.port_preservation.is_none()
+            && self.mappings_per_host.is_none()
             && self.inbound_sessions_per_remote.is_none()
             && self.unsolicited_syn_icmp.is_none()
             && self.inbound_rst.is_none()
@@ -601,14 +607,15 @@ fn nat_change(
 ) -> NatChange {
     let (old_realm, old_ports) = nat_parts(old, protocol);
     let (new_realm, new_ports) = nat_parts(new, protocol);
-    // Filtering, hairpinning, port preservation, the TCP inbound limit, the
-    // TCP unsolicited-SYN ICMP switch, and the TCP inbound-RST policy are
-    // reported separately, so compare the rest of the policy with the new
-    // values substituted into the old one.
+    // Filtering, hairpinning, port preservation, the per-host limit, the TCP
+    // inbound limit, the TCP unsolicited-SYN ICMP switch, and the TCP
+    // inbound-RST policy are reported separately, so compare the rest of the
+    // policy with the new values substituted into the old one.
     let (
         filtering,
         hairpinning,
         port_preservation,
+        mappings_per_host,
         inbound_sessions_per_remote,
         unsolicited_syn_icmp,
         inbound_rst,
@@ -620,12 +627,14 @@ fn nat_change(
                 delta(old.filtering(), new.filtering()),
                 delta(old.hairpinning(), new.hairpinning()),
                 delta(old.port_preservation(), new.port_preservation()),
+                delta(old.mappings_per_host(), new.mappings_per_host()),
                 None,
                 None,
                 None,
                 old.with_filtering(new.filtering())
                     .with_hairpinning(new.hairpinning())
                     .with_port_preservation(new.port_preservation())
+                    .with_mappings_per_host(new.mappings_per_host())
                     != new,
             )
         }
@@ -635,6 +644,7 @@ fn nat_change(
                 delta(old.filtering(), new.filtering()),
                 delta(old.hairpinning(), new.hairpinning()),
                 delta(old.port_preservation(), new.port_preservation()),
+                delta(old.mappings_per_host(), new.mappings_per_host()),
                 delta(
                     old.inbound_sessions_per_remote(),
                     new.inbound_sessions_per_remote(),
@@ -644,6 +654,7 @@ fn nat_change(
                 old.with_filtering(new.filtering())
                     .with_hairpinning(new.hairpinning())
                     .with_port_preservation(new.port_preservation())
+                    .with_mappings_per_host(new.mappings_per_host())
                     .with_unsolicited_syn_icmp(new.unsolicited_syn_icmp())
                     .with_inbound_rst(new.inbound_rst())
                     .with_inbound_sessions_per_remote(new.inbound_sessions_per_remote())
@@ -658,6 +669,7 @@ fn nat_change(
         filtering,
         hairpinning,
         port_preservation,
+        mappings_per_host,
         inbound_sessions_per_remote,
         unsolicited_syn_icmp,
         inbound_rst,

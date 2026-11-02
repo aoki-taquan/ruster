@@ -473,6 +473,7 @@ fn runtimes_reject_every_cross_candidate_authority_binding() {
         &mut udp_peer_nodes,
         &mut udp_port_owners,
         &mut udp_port_free_bits,
+        ruster_core::Nat44HostStorage::disabled(),
     );
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
@@ -493,6 +494,7 @@ fn runtimes_reject_every_cross_candidate_authority_binding() {
         &mut tcp_session_address_nodes,
         &mut tcp_port_owners,
         &mut tcp_port_free_bits,
+        ruster_core::Nat44HostStorage::disabled(),
     );
     let mut firewall_states = [FirewallStateSlot::default(); 1];
     let (udp, tcp, firewall) = {

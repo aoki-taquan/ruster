@@ -171,13 +171,14 @@ use ruster_core::{
     port_free_bitmap_words, DirectoryBucket, DirectoryNode, DynamicNeighborSlot,
     FirewallReconcileError, FirewallReconcileReport, FirewallRuntime, FirewallStateSlot,
     Icmpv4ErrorActionSlot, Icmpv4ErrorPublicationError, Icmpv4ErrorPublicationReport,
-    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Nat44TcpIndexStorage, Nat44TcpMappingSlot,
-    Nat44TcpReconcileError, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError,
-    Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot,
-    Nat44UdpPeerSlot, Nat44UdpReconcileError, Nat44UdpReconcileReport, Nat44UdpRuntime,
-    Nat44UdpRuntimeConfigError, PortOwnerSlot, PublicationQuiescence, ResolutionActionSlot,
-    ResolutionFailureHoldSlot, ResolutionPublicationError, ResolutionPublicationReport,
-    ResolutionRuntime, ResolutionStateSlot,
+    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Nat44HostLink, Nat44HostSlot, Nat44HostStorage,
+    Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpReconcileError, Nat44TcpReconcileReport,
+    Nat44TcpRuntime, Nat44TcpRuntimeConfigError, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot,
+    Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpReconcileError,
+    Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError, PortOwnerSlot,
+    PublicationQuiescence, ResolutionActionSlot, ResolutionFailureHoldSlot,
+    ResolutionPublicationError, ResolutionPublicationReport, ResolutionRuntime,
+    ResolutionStateSlot,
 };
 use ruster_core::{
     FirewallReconcilePermit, Icmpv4ErrorPublicationPermit, Nat44TcpReconcilePermit,
@@ -224,7 +225,43 @@ pub struct FullServiceStorage {
     tcp_session_address_nodes: Box<[DirectoryNode]>,
     /// TCP unsolicited-SYN holds (RFC 5382 REQ-4).
     tcp_syn_holds: Box<[Nat44TcpSynHoldSlot]>,
+    /// Per-host mapping accounting (N3); empty without a per-host limit.
+    udp_hosts: HostTables<1>,
+    tcp_hosts: HostTables<2>,
     firewall_states: Box<[FirewallStateSlot]>,
+}
+
+/// Per-host mapping accounting arrays of one NAT runtime (N3): a link per
+/// mapping slot, the host slots, and the host directory.
+struct HostTables<const LISTS: usize> {
+    links: Box<[Nat44HostLink]>,
+    hosts: Box<[Nat44HostSlot<LISTS>]>,
+    buckets: Box<[DirectoryBucket]>,
+    nodes: Box<[DirectoryNode]>,
+}
+
+impl<const LISTS: usize> HostTables<LISTS> {
+    fn new(
+        host_slots: u32,
+        buckets: u32,
+        service: RuntimeService,
+    ) -> Result<Self, StorageAllocationError> {
+        Ok(Self {
+            links: slots(host_slots, Nat44HostLink::EMPTY, service)?,
+            hosts: slots(host_slots, Nat44HostSlot::EMPTY, service)?,
+            buckets: slots(buckets, DirectoryBucket::default(), service)?,
+            nodes: slots(host_slots, DirectoryNode::default(), service)?,
+        })
+    }
+
+    fn storage(&mut self) -> Nat44HostStorage<'_, LISTS> {
+        Nat44HostStorage::new(
+            &mut self.links,
+            &mut self.hosts,
+            &mut self.buckets,
+            &mut self.nodes,
+        )
+    }
 }
 
 /// Mapping, secondary-state, directory, and port-owner arrays of one NAT
@@ -323,6 +360,8 @@ impl FullServiceStorage {
                 Nat44TcpSynHoldSlot::EMPTY,
                 Nat44Tcp,
             )?,
+            udp_hosts: HostTables::new(udp.host_slots(), udp.host_buckets(), Nat44Udp)?,
+            tcp_hosts: HostTables::new(tcp.host_slots(), tcp.host_buckets(), Nat44Tcp)?,
             firewall_states: slots(
                 shape.firewall_state_slots(),
                 FirewallStateSlot::default(),
@@ -668,6 +707,8 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             tcp_session_address_buckets,
             tcp_session_address_nodes,
             tcp_syn_holds,
+            udp_hosts,
+            tcp_hosts,
             firewall_states,
         } = storage;
         let authority = candidate.authority();
@@ -682,6 +723,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
                 &mut udp.secondary_nodes,
                 &mut udp.port_owners,
                 &mut udp.port_free_bits,
+                udp_hosts.storage(),
             ),
             authority.nat44_udp_hash_key(),
         )
@@ -699,6 +741,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
                 tcp_session_address_nodes,
                 &mut tcp.port_owners,
                 &mut tcp.port_free_bits,
+                tcp_hosts.storage(),
             ),
             authority.nat44_tcp_hash_key(),
         )

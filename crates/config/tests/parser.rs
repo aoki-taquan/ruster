@@ -976,6 +976,58 @@ fn nat44_port_preservation_defaults_on_per_protocol_and_is_exact() {
     assert_eq!(misplaced.code(), DiagnosticCode::UnknownField);
 }
 
+/// N3 (RFC 6888 REQ-4): `mappings-per-host` defaults to `0` (no limit) in
+/// both protocol sections, takes exactly a `u16`, and is not accepted in the
+/// realm or a capacity table.
+#[test]
+fn nat44_mappings_per_host_defaults_to_unlimited_per_protocol_and_is_exact() {
+    const UDP: &str = "icmpv4-errors = \"external-only\"\n";
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    let nat = |source: &str| {
+        let VersionedConfig::V1(config) = parse(source.as_bytes()).unwrap() else {
+            panic!("schema version 1");
+        };
+        let nat = config.nat44.unwrap();
+        (
+            nat.udp.unwrap().mappings_per_host,
+            nat.tcp.unwrap().mappings_per_host,
+        )
+    };
+    assert_eq!(nat(VALID_V1), (0, 0));
+    for value in [0_u16, 1, 256, u16::MAX] {
+        let udp = VALID_V1.replacen(UDP, &format!("{UDP}mappings-per-host = {value}\n"), 1);
+        assert_eq!(nat(&udp), (value, 0));
+        let tcp = VALID_V1.replacen(TCP, &format!("{TCP}mappings-per-host = {value}\n"), 1);
+        assert_eq!(nat(&tcp), (0, value));
+    }
+    for (anchor, section, value) in [
+        (UDP, "udp", "-1"),
+        (UDP, "udp", "65536"),
+        (UDP, "udp", "\"8\""),
+        (TCP, "tcp", "1.5"),
+        (TCP, "tcp", "true"),
+    ] {
+        let source =
+            VALID_V1.replacen(anchor, &format!("{anchor}mappings-per-host = {value}\n"), 1);
+        let diagnostic = parse(source.as_bytes()).unwrap_err();
+        assert_eq!(diagnostic.code(), DiagnosticCode::InvalidType, "{value}");
+        let expected: Vec<PathSegment> = ["nat44", section, "mappings-per-host"]
+            .iter()
+            .map(|field| PathSegment::Field((*field).to_owned()))
+            .collect();
+        assert_eq!(diagnostic.path().segments(), expected.as_slice());
+    }
+    for anchor in ["[nat44.realm.ports]", "peers = "] {
+        let misplaced = parse(
+            VALID_V1
+                .replacen(anchor, &format!("mappings-per-host = 4\n{anchor}"), 1)
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(misplaced.code(), DiagnosticCode::UnknownField, "{anchor}");
+    }
+}
+
 /// B3 (RFC 5382 REQ-4): `[nat44.tcp] unsolicited-syn-icmp` defaults to
 /// `true` and `[nat44.tcp.capacity] unsolicited-syn-holds` to
 /// `DEFAULT_UNSOLICITED_SYN_HOLDS` (64); both are exact and TCP-only.

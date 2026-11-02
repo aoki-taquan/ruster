@@ -306,6 +306,14 @@ pub struct Nat44UdpV1 {
     /// a keyed, obfuscated port.
     #[serde(default = "enabled")]
     pub port_preservation: bool,
+    /// Limit on the mappings one internal IPv4 address may hold (N3,
+    /// NAT44-092, RFC 6888 REQ-4); `0` means no limit. Absent means 0: RFC
+    /// 6888 asks a NAT to support a limit, not for a value. A nonzero limit
+    /// adds per-host storage sized from `capacity.mappings`, so switching
+    /// between `0` and a limit is restart-required; changing a nonzero
+    /// limit is reloadable.
+    #[serde(default)]
+    pub mappings_per_host: u16,
     pub capacity: Nat44UdpCapacityV1,
 }
 
@@ -367,6 +375,14 @@ pub struct Nat44TcpV1 {
     /// `closing` (RFC 7857 §2.2). `corroborate` is a local security policy.
     #[serde(default)]
     pub inbound_rst: Nat44TcpInboundRstV1,
+    /// Limit on the mappings one internal IPv4 address may hold (N3,
+    /// NAT44-092, RFC 6888 REQ-4); `0` means no limit. Absent means 0: RFC
+    /// 6888 asks a NAT to support a limit, not for a value. A nonzero limit
+    /// adds per-host storage sized from `capacity.mappings`, so switching
+    /// between `0` and a limit is restart-required; changing a nonzero
+    /// limit is reloadable.
+    #[serde(default)]
+    pub mappings_per_host: u16,
     pub capacity: Nat44TcpCapacityV1,
 }
 

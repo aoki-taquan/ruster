@@ -66,6 +66,10 @@ pub(crate) enum DirectoryHashDomain {
     TcpPortStart = 0x4e41_5434_5450_5354,
     /// Takeover probes of a new TCP mapping when every port has an owner.
     TcpPortTakeover = 0x4e41_5434_5450_544b,
+    /// Internal-host directory of the UDP per-host mapping quota (N3).
+    UdpHost = 0x4e41_5434_5548_4f53,
+    /// Internal-host directory of the TCP per-host mapping quota (N3).
+    TcpHost = 0x4e41_5434_5448_4f53,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -304,11 +308,21 @@ impl<'a> FixedDirectory<'a> {
         domain: DirectoryHashDomain,
         words: &[u64],
     ) -> Result<PreparedDirectoryLink, DirectoryMutationError> {
+        self.prepare_link_hashed(state_index, self.hash_words(domain, words))
+    }
+
+    /// [`Self::prepare_link`] with the key's hash already computed by
+    /// [`Self::hash_words`] (N3: a host assignment carries the hash from
+    /// plan to commit instead of a prepared link).
+    pub(crate) fn prepare_link_hashed(
+        &self,
+        state_index: usize,
+        hash: u64,
+    ) -> Result<PreparedDirectoryLink, DirectoryMutationError> {
         let state = index_to_link(state_index, self.nodes.len())?;
         if self.nodes[state_index].is_linked() {
             return Err(DirectoryMutationError::AlreadyLinked);
         }
-        let hash = self.hash_words(domain, words);
         let bucket_index = self
             .bucket_for_hash(hash)
             .ok_or(DirectoryMutationError::StateIndexOutOfRange)?;
@@ -455,8 +469,16 @@ impl<'a> FixedDirectory<'a> {
         domain: DirectoryHashDomain,
         words: &[u64],
     ) -> Result<PreparedDirectoryRelink, DirectoryMutationError> {
+        self.prepare_relink_hashed(state_index, self.hash_words(domain, words))
+    }
+
+    /// [`Self::prepare_relink`] with the key's hash already computed.
+    pub(crate) fn prepare_relink_hashed(
+        &self,
+        state_index: usize,
+        hash: u64,
+    ) -> Result<PreparedDirectoryRelink, DirectoryMutationError> {
         let unlink = self.prepare_unlink(state_index)?;
-        let hash = self.hash_words(domain, words);
         let bucket_index = self
             .bucket_for_hash(hash)
             .ok_or(DirectoryMutationError::StateIndexOutOfRange)?;

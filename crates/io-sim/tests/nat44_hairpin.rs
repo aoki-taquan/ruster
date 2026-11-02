@@ -174,6 +174,8 @@ struct Shape {
     udp_peers: usize,
     tcp_sessions: usize,
     icmpv4_errors: Nat44Icmpv4ErrorPolicy,
+    /// Per-host mapping limit of both protocols (N3).
+    mappings_per_host: u16,
 }
 
 impl Default for Shape {
@@ -182,6 +184,7 @@ impl Default for Shape {
             udp_peers: 8,
             tcp_sessions: 8,
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Disabled,
+            mappings_per_host: 0,
         }
     }
 }
@@ -208,7 +211,8 @@ impl World {
             Nat44UdpPolicy::default()
                 .with_filtering(filtering)
                 .with_hairpinning(hairpinning)
-                .with_icmpv4_errors(shape.icmpv4_errors),
+                .with_icmpv4_errors(shape.icmpv4_errors)
+                .with_mappings_per_host(shape.mappings_per_host),
         )
         .unwrap();
         let tcp_config = Nat44TcpConfig::new(
@@ -221,7 +225,8 @@ impl World {
             Nat44TcpPolicy::default()
                 .with_filtering(filtering)
                 .with_hairpinning(hairpinning)
-                .with_icmpv4_errors(shape.icmpv4_errors),
+                .with_icmpv4_errors(shape.icmpv4_errors)
+                .with_mappings_per_host(shape.mappings_per_host),
         )
         .unwrap();
         let indexes = leak(UdpTestIndexes::new(udp_config, 4, shape.udp_peers));
@@ -539,6 +544,50 @@ fn udp_hairpin_between_hosts_presents_the_external_source() {
     // The new external mapping is H1's ordinary mapping: an outbound packet
     // to an external host now uses the same public port.
     assert_eq!(world.establish(H1, P1, false), public1);
+}
+
+/// N3: the outbound half of a hairpinned packet that needs a new mapping
+/// counts against the sender's per-host limit. At the limit the packet is
+/// dropped byte-for-byte as `NAT44_{UDP,TCP}_HOST_QUOTA_EXCEEDED` before
+/// anything commits, while the sender's existing mapping still hairpins.
+#[test]
+fn hairpin_outbound_half_respects_the_per_host_mapping_limit() {
+    for tcp in [false, true] {
+        let shape = Shape {
+            mappings_per_host: 1,
+            ..Shape::default()
+        };
+        let mut world = World::shaped(Nat44Filtering::EndpointIndependent, true, None, shape);
+        let public1 = world.establish(H1, P1, tcp);
+        let public2 = world.establish(H2, P2, tcp);
+        let before = world.state();
+        let packet = if tcp {
+            tcp_frame(H1, PUBLIC, P1 + 1, public2, SYN)
+        } else {
+            udp_frame(H1, PUBLIC, P1 + 1, public2)
+        };
+        world.run(LAN, packet.clone());
+        let reason = if tcp {
+            DropReason::Nat44TcpHostQuotaExceeded
+        } else {
+            DropReason::Nat44UdpHostQuotaExceeded
+        };
+        assert_drop(&mut world, reason, &packet);
+        assert_eq!(world.state(), before);
+        let refused = if tcp {
+            world.tcp.counters().host_quota_exceeded
+        } else {
+            world.udp.counters().host_quota_exceeded
+        };
+        assert_eq!(refused, 1);
+        let packet = if tcp {
+            tcp_frame(H1, PUBLIC, P1, public2, SYN)
+        } else {
+            udp_frame(H1, PUBLIC, P1, public2)
+        };
+        world.run(LAN, packet.clone());
+        assert_hairpin(&mut world, &packet, H2_MAC, (PUBLIC, public1), (H2, P2));
+    }
 }
 
 /// UDP hole punching through the same NAT under address-dependent and

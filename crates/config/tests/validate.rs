@@ -255,6 +255,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 peer_buckets: 8,
                 peer_nodes: 5,
                 port_owners: 8,
+                hosts: 0,
             }),
             nat44_tcp: Some(ruster_config::Nat44TcpStorageShapeV1 {
                 mappings: 3,
@@ -265,6 +266,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 session_nodes: 5,
                 port_owners: 8,
                 unsolicited_syn_holds: 7,
+                hosts: 0,
             }),
             firewall_states: Some(6),
             required_bytes: shape.required_bytes,
@@ -1034,6 +1036,89 @@ fn nat44_port_preservation_maps_onto_core_without_changing_storage() {
         nat.tcp().unwrap().policy()
     );
     assert_eq!(off.storage_shape(), on.storage_shape());
+}
+
+/// N3: `mappings-per-host` maps onto both core policies (default `0`, as
+/// the core default). A nonzero limit adds per-host storage sized from the
+/// protocol's mapping capacity (one host link, host slot, and directory
+/// node per mapping slot, and the mapping directory's bucket count), which
+/// `required_bytes` counts exactly; the limit's value does not change the
+/// shape beyond that, and the per-table byte limit still applies.
+#[test]
+fn nat44_mappings_per_host_maps_onto_core_and_sizes_host_storage() {
+    use ruster_core::{
+        DirectoryBucket, DirectoryNode, Nat44HostLink, Nat44TcpHostSlot, Nat44TcpPolicy,
+        Nat44UdpHostSlot, Nat44UdpPolicy, NAT44_DEFAULT_MAPPINGS_PER_HOST,
+    };
+    const UDP: &str = "icmpv4-errors = \"external-only\"\n";
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    let with_limits = |udp: u16, tcp: u16| {
+        VALID
+            .replacen(UDP, &format!("{UDP}mappings-per-host = {udp}\n"), 1)
+            .replacen(TCP, &format!("{TCP}mappings-per-host = {tcp}\n"), 1)
+    };
+    let defaults = validated(VALID);
+    let nat = defaults.nat44().unwrap();
+    assert_eq!(NAT44_DEFAULT_MAPPINGS_PER_HOST, 0);
+    assert_eq!(nat.udp().unwrap().policy().mappings_per_host(), 0);
+    assert_eq!(nat.tcp().unwrap().policy().mappings_per_host(), 0);
+    assert_eq!(Nat44UdpPolicy::default().mappings_per_host(), 0);
+    assert_eq!(Nat44TcpPolicy::default().mappings_per_host(), 0);
+    let shape = defaults.storage_shape();
+    assert_eq!(shape.nat44_udp.unwrap().hosts, 0);
+    assert_eq!(shape.nat44_tcp.unwrap().hosts, 0);
+    // Explicit zero is the default.
+    assert_eq!(validated(&with_limits(0, 0)).storage_shape(), shape);
+
+    let limited = validated(&with_limits(2, 3));
+    let limited_nat = limited.nat44().unwrap();
+    let (udp, tcp) = (
+        limited_nat.udp().unwrap().policy(),
+        limited_nat.tcp().unwrap().policy(),
+    );
+    assert_eq!((udp.mappings_per_host(), tcp.mappings_per_host()), (2, 3));
+    assert_eq!(udp.with_mappings_per_host(0), nat.udp().unwrap().policy());
+    assert_eq!(tcp.with_mappings_per_host(0), nat.tcp().unwrap().policy());
+    let limited_shape = limited.storage_shape();
+    let (udp_shape, tcp_shape) = (
+        limited_shape.nat44_udp.unwrap(),
+        limited_shape.nat44_tcp.unwrap(),
+    );
+    assert_eq!((udp_shape.hosts, tcp_shape.hosts), (3, 3));
+    // UDP and TCP: 3 mapping slots, a 4-bucket mapping directory.
+    let host_bytes = 3 * (2 * size_of::<Nat44HostLink>() + 2 * size_of::<DirectoryNode>())
+        + 3 * (size_of::<Nat44UdpHostSlot>() + size_of::<Nat44TcpHostSlot>())
+        + 2 * 4 * size_of::<DirectoryBucket>();
+    assert_eq!(
+        limited_shape.required_bytes,
+        shape.required_bytes + host_bytes
+    );
+    // Only the switch between zero and a limit changes the shape.
+    assert_eq!(
+        validated(&with_limits(65_535, 1)).storage_shape(),
+        limited_shape
+    );
+    let udp_only = validated(&with_limits(5, 0)).storage_shape();
+    assert_eq!(
+        (
+            udp_only.nat44_udp.unwrap().hosts,
+            udp_only.nat44_tcp.unwrap().hosts
+        ),
+        (3, 0)
+    );
+    // The byte limit counts the host storage (fail closed).
+    let tight = ValidationLimits {
+        max_runtime_bytes: shape.required_bytes,
+        ..GENEROUS
+    };
+    assert!(validated_with(VALID, tight).is_ok());
+    let error = validated_with(&with_limits(2, 3), tight)
+        .err()
+        .expect("host storage exceeds the byte limit");
+    assert_eq!(
+        error.code(),
+        ruster_config::ValidationCode::RuntimeStorageBytesExceeded
+    );
 }
 
 /// B3: the switch maps onto the core TCP policy without changing the

@@ -1,8 +1,8 @@
 use ruster_core::{
-    port_free_bitmap_words, DirectoryBucket, DirectoryNode, Nat44TcpConfig, Nat44TcpHashKey,
-    Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpRuntime, Nat44TcpSessionSlot,
-    Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
-    Nat44UdpRuntime, PortOwnerSlot,
+    port_free_bitmap_words, DirectoryBucket, DirectoryNode, Nat44HostLink, Nat44HostStorage,
+    Nat44TcpConfig, Nat44TcpHashKey, Nat44TcpHostSlot, Nat44TcpIndexStorage, Nat44TcpMappingSlot,
+    Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpHostSlot,
+    Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpRuntime, PortOwnerSlot,
 };
 
 #[allow(dead_code)]
@@ -37,6 +37,13 @@ pub fn tcp_runtime<'a>(
     let port_owners = Box::leak(vec![PortOwnerSlot::default(); port_count].into_boxed_slice());
     let port_free_bits =
         Box::leak(vec![0_u64; port_free_bitmap_words(port_count)].into_boxed_slice());
+    // Per-host accounting storage (N3), so a test can set a per-host limit.
+    let hosts = Nat44HostStorage::new(
+        Box::leak(vec![Nat44HostLink::EMPTY; mappings.len()].into_boxed_slice()),
+        Box::leak(vec![Nat44TcpHostSlot::EMPTY; mappings.len()].into_boxed_slice()),
+        Box::leak(vec![DirectoryBucket::default(); mapping_bucket_count].into_boxed_slice()),
+        Box::leak(vec![DirectoryNode::default(); mappings.len()].into_boxed_slice()),
+    );
     Nat44TcpRuntime::new(
         config,
         mappings,
@@ -50,6 +57,7 @@ pub fn tcp_runtime<'a>(
             session_address_nodes,
             port_owners,
             port_free_bits,
+            hosts,
         ),
         Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0).unwrap(),
     )
@@ -63,6 +71,10 @@ pub struct UdpTestIndexes {
     peer_nodes: Vec<DirectoryNode>,
     port_owners: Vec<PortOwnerSlot>,
     port_free_bits: Vec<u64>,
+    host_links: Vec<Nat44HostLink>,
+    hosts: Vec<Nat44UdpHostSlot>,
+    host_buckets: Vec<DirectoryBucket>,
+    host_nodes: Vec<DirectoryNode>,
 }
 
 impl UdpTestIndexes {
@@ -85,6 +97,10 @@ impl UdpTestIndexes {
             peer_nodes: vec![DirectoryNode::default(); peer_capacity],
             port_owners: vec![PortOwnerSlot::default(); port_count],
             port_free_bits: vec![0; port_free_bitmap_words(port_count)],
+            host_links: vec![Nat44HostLink::EMPTY; mapping_capacity],
+            hosts: vec![Nat44UdpHostSlot::EMPTY; mapping_capacity],
+            host_buckets: vec![DirectoryBucket::default(); mapping_bucket_count],
+            host_nodes: vec![DirectoryNode::default(); mapping_capacity],
         }
     }
 
@@ -101,6 +117,12 @@ impl UdpTestIndexes {
             &mut self.peer_nodes,
             &mut self.port_owners,
             &mut self.port_free_bits,
+            Nat44HostStorage::new(
+                &mut self.host_links,
+                &mut self.hosts,
+                &mut self.host_buckets,
+                &mut self.host_nodes,
+            ),
         );
         Nat44UdpRuntime::new(
             config,
