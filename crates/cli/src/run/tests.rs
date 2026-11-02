@@ -99,6 +99,12 @@ struct State {
     /// one per tick) reaches the first field.
     inject_at: RefCell<VecDeque<(u32, IfId, Vec<u8>)>>,
     io_calls: Cell<u32>,
+    /// `set_clock` calls, the last reading handed over, and whether any
+    /// call went backwards or came after its tick's `io()` call (no
+    /// allocation: the tick allocation test runs through it).
+    clock_sets: Cell<u32>,
+    last_clock: Cell<u64>,
+    clock_out_of_order: Cell<bool>,
     /// Health sample rounds handed out by `sample_ports`, one per call.
     samples: RefCell<VecDeque<Vec<PortSample>>>,
     /// Link query results, consumed in order by the matching port.
@@ -184,6 +190,16 @@ impl Datapath for FakeDatapath<'_> {
             }
         }
         &mut self.io
+    }
+
+    fn set_clock(&mut self, now: MonotonicMillis) {
+        let state = &self.state;
+        let sets = state.clock_sets.get();
+        if (sets != 0 && now.0 <= state.last_clock.get()) || state.io_calls.get() != sets {
+            state.clock_out_of_order.set(true);
+        }
+        state.clock_sets.set(sets + 1);
+        state.last_clock.set(now.0);
     }
 
     fn sample_ports(&self, visit: &mut impl FnMut(PortSample)) {
@@ -697,6 +713,11 @@ fn startup_runs_in_ifid_order_and_shutdown_closes_in_reverse() {
     );
     assert!(outcome.out.contains("\ntick.ticks=3\n"), "{}", outcome.out);
     assert!(outcome.out.contains("\nfake.ports=2\n"));
+    // The loop hands each iteration's clock reading to the datapath
+    // before that iteration's I/O (the adapter's link-down kick retry
+    // rate limit runs on it), once per tick, never going backwards.
+    assert_eq!(host.state.clock_sets.get(), 3);
+    assert!(!host.state.clock_out_of_order.get());
     assert!(outcome.out.ends_with("end\n"));
 }
 

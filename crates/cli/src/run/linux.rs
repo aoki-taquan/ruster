@@ -5,7 +5,7 @@ use std::num::{NonZeroU128, NonZeroU32};
 use std::path::{Path, PathBuf};
 
 use ruster_config::{ValidatedAfXdpPortV1, ValidatedAfXdpV1, XdpAttachModeV1};
-use ruster_core::{BackendStats, IfId};
+use ruster_core::{BackendStats, IfId, MonotonicMillis};
 use ruster_io_xdp_native::{
     NativeSession, RxFillConfig, RxFillEngine, SessionConfig, UmemDomainId, XdpAttachMode,
     XdpCounters, XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort, XdpPortConfig,
@@ -185,6 +185,10 @@ impl<'s> Datapath for XdpDatapath<'s> {
         &mut self.io
     }
 
+    fn set_clock(&mut self, now: MonotonicMillis) {
+        self.io.set_clock(now);
+    }
+
     fn drain(&mut self, rounds: u32) -> Result<DrainProgress, XdpIoError> {
         self.io.drain(rounds).map(|report| DrainProgress {
             completed: report.completed,
@@ -235,9 +239,11 @@ impl<'s> Datapath for XdpDatapath<'s> {
 /// engine's `kick_errors` counts every failed kick, `ENETDOWN` included,
 /// while the adapter counts the `ENETDOWN` ones separately
 /// (`kicks_link_down`). A port whose link is down keeps its TX kick owed
-/// and retries it on every settle, so without the subtraction a down link
-/// with TX in flight would turn into a fatal `KICK_ERRORS` instead of
-/// staying `LINK_DOWN`.
+/// and retries it (rate-limited: 1 ms doubling to 64 ms), so without the
+/// subtraction a down link with TX in flight would turn into a fatal
+/// `KICK_ERRORS` instead of staying `LINK_DOWN`. A retry the adapter
+/// skipped because it was not due (`kick_retries_suppressed`) made no
+/// syscall and is in neither counter.
 fn watched_kick_errors(counters: &XdpCounters) -> u64 {
     counters
         .kick_errors
@@ -255,6 +261,9 @@ mod tests {
         counters.kicks_link_down = 47_307;
         assert_eq!(watched_kick_errors(&counters), 0);
         counters.kick_errors = 47_310;
+        assert_eq!(watched_kick_errors(&counters), 3);
+        // Suppressed link-down retries are not kicks at all.
+        counters.kick_retries_suppressed = 1_000_000;
         assert_eq!(watched_kick_errors(&counters), 3);
         // Never wraps (the adapter counts ENETDOWN only after the engine
         // counted the failed kick, so this cannot happen, but stays 0).

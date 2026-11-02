@@ -22,7 +22,10 @@
 //! Kicks and need-wakeup are the adapter's: every `receive` reaps
 //! completions, refills Fill, answers a Fill need-wakeup with a
 //! non-sleeping `poll` kick, and settles owed TX kicks; `finish` kicks the
-//! ports it published to. The loop adds nothing on top.
+//! ports it published to. The loop adds nothing on top but its clock
+//! reading, handed to the backend once per iteration
+//! ([`Datapath::set_clock`]) so a port whose link is down retries its owed
+//! kick at most every 1 ms doubling to 64 ms instead of at every settle.
 //!
 //! # Idle strategy
 //!
@@ -76,6 +79,11 @@ pub trait Datapath {
     type Io: PacketIo + GeneratedPacketIo + PublicationQuiescence;
 
     fn io(&mut self) -> &mut Self::Io;
+
+    /// Hands the backend the loop's clock reading (cold boundary: once per
+    /// loop iteration, before any I/O of that iteration). The AF_XDP
+    /// adapter rate-limits TX kick retries on a down link with it.
+    fn set_clock(&mut self, now: MonotonicMillis);
 
     /// One bounded shutdown drain call over every port (see
     /// `XdpPacketIo::drain`): stops RX/Fill and new TX for good, reclaims
@@ -363,6 +371,7 @@ where
             return LoopEnd::Signal;
         }
         let now = clock.now();
+        datapath.set_clock(now);
         let generation = active.generation();
         if control.reloader.pending_since().is_none() && stop.take_reload() {
             let _ = writeln!(

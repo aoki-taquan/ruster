@@ -120,9 +120,16 @@
 //! more remain, so a 60-frame batch needs two kicks. A kick that fails
 //! with `ENETDOWN` (link down) is not an error: it marks the port's link
 //! state down in its stats (`kicks_link_down`), leaves the kick owed, and
-//! the next settle retries, so the port recovers when the link returns
-//! without new traffic. Other kick failures are the batch error (not
-//! sticky). `receive` also answers a Fill need-wakeup request with a
+//! a later settle retries, so the port recovers when the link returns
+//! without new traffic. Once the run loop hands the adapter its coarse
+//! clock ([`XdpPacketIo::set_clock`], once per loop iteration), retries on
+//! a down link are rate-limited: the first `ENETDOWN` waits
+//! [`LINK_DOWN_RETRY_MIN_MS`] before the next kick, each further one doubles
+//! the wait up to [`LINK_DOWN_RETRY_MAX_MS`], and a settle before the retry
+//! is due reaps but skips the kick (`kick_retries_suppressed`). The debt is
+//! kept: when the link returns, the held TX is kicked within one retry
+//! interval. Without a clock (tests, tools) every settle retries. Other
+//! kick failures are the batch error (not sticky). `receive` also answers a Fill need-wakeup request with a
 //! non-sleeping `poll` kick.
 //!
 //! # Quiescence
@@ -148,9 +155,9 @@ use std::fmt;
 use ruster_core::{
     BackendMode, BackendStats, BatchCompletion, FieldValue, FieldVisitor, GeneratedAllocationError,
     GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo, GeneratedPacketLease,
-    GeneratedPacketSlot, GeneratedSlotCompletion, IfId, ObservableFields, PacketBatch, PacketIo,
-    PacketLease, PacketSlot, PublicationQuiescence, PublicationQuiescenceDisposition,
-    PublicationQuiescenceGuard, SlotCompletion,
+    GeneratedPacketSlot, GeneratedSlotCompletion, IfId, MonotonicMillis, ObservableFields,
+    PacketBatch, PacketIo, PacketLease, PacketSlot, PublicationQuiescence,
+    PublicationQuiescenceDisposition, PublicationQuiescenceGuard, SlotCompletion,
 };
 use ruster_io_xdp::LedgerError;
 
@@ -166,6 +173,14 @@ use crate::{
 pub const KICK_TX_BATCH: u32 = 32;
 /// Extra kicks one settle may spend beyond `ceil(in_flight / 32)`.
 pub const KICK_SLACK: u32 = 2;
+/// Wait after the first `ENETDOWN` TX kick of a port before the next kick
+/// retry, in clock milliseconds.
+pub const LINK_DOWN_RETRY_MIN_MS: u64 = 1;
+/// Longest wait between TX kick retries on a down link: at most about 16
+/// `sendto` calls per second per down port, and held TX resumes at most
+/// this long after the link returns (well inside the 1 s link watch
+/// interval and below Linux's 200 ms minimum TCP retransmission timeout).
+pub const LINK_DOWN_RETRY_MAX_MS: u64 = 64;
 
 /// Generated-pool frames of a port that cross-port copies never take:
 /// `max(2, pool / 8)`, capped at the pool.
@@ -407,6 +422,9 @@ pub struct XdpAdapterCounters {
     pub kicks_link_down: u64,
     /// Settles that used their whole kick budget with TX still in flight.
     pub kick_budget_exhausted: u64,
+    /// Settles on a down link that skipped the kick because the next retry
+    /// was not due yet (the kick stays owed; no syscall, not a kick error).
+    pub kick_retries_suppressed: u64,
 }
 
 struct PortState<'memory> {
@@ -422,6 +440,12 @@ struct PortState<'memory> {
     kick_owed: bool,
     /// The last TX kick found the link down.
     link_down: bool,
+    /// While `link_down`: the clock millisecond from which the next kick
+    /// retry is due (0: due now).
+    retry_at_ms: u64,
+    /// The wait the last `ENETDOWN` set; reset to 0 by a kick that
+    /// succeeds, so the next down period starts at the minimum.
+    retry_backoff_ms: u64,
     /// The current batch already settled this port after a blocked
     /// submission (at most once per port per batch).
     relieved: bool,
@@ -435,8 +459,9 @@ impl PortState<'_> {
     /// every descriptor is consumed and only completions lag (TX interrupt
     /// coalescing on a NIC, zero-copy), it stops without kicking and keeps
     /// the kick owed, so later settles just reap. A link that is down
-    /// leaves the kick owed without an error.
-    fn settle(&mut self) -> Result<(), XdpIoError> {
+    /// leaves the kick owed without an error; with a clock (`now_ms`) its
+    /// retries are rate-limited (see the module documentation).
+    fn settle(&mut self, now_ms: Option<u64>) -> Result<(), XdpIoError> {
         let interface = self.config.interface;
         let mut kicks = self.engine.tx_inflight().div_ceil(KICK_TX_BATCH) + KICK_SLACK;
         loop {
@@ -447,6 +472,9 @@ impl PortState<'_> {
                 .map_err(|error| XdpIoError::Datapath { interface, error })?;
             if self.engine.tx_inflight() == 0 {
                 self.kick_owed = false;
+                // New TX after this is kicked at once, whatever the link
+                // did meanwhile.
+                self.retry_at_ms = 0;
                 return Ok(());
             }
             self.kick_owed = true;
@@ -461,10 +489,20 @@ impl PortState<'_> {
                 bump(&mut self.counters.kick_budget_exhausted);
                 return Ok(());
             }
+            if self.link_down && !retry_due(now_ms, self.retry_at_ms) {
+                bump(&mut self.counters.kick_retries_suppressed);
+                return Ok(());
+            }
             kicks -= 1;
             match self.engine.wake_tx() {
-                Ok(KickOutcome::Woken | KickOutcome::Deferred(_)) => self.link_down = false,
+                Ok(KickOutcome::Woken | KickOutcome::Deferred(_)) => {
+                    self.link_down = false;
+                    self.retry_backoff_ms = 0;
+                }
                 Err(KickError::NetworkDown) => {
+                    self.retry_backoff_ms = next_retry_backoff(self.retry_backoff_ms);
+                    self.retry_at_ms =
+                        now_ms.map_or(0, |now| now.saturating_add(self.retry_backoff_ms));
                     self.link_down = true;
                     bump(&mut self.counters.kicks_link_down);
                     return Ok(());
@@ -473,6 +511,21 @@ impl PortState<'_> {
             }
         }
     }
+}
+
+/// Whether a kick retry on a down link is due at `now_ms` (always without
+/// a clock).
+fn retry_due(now_ms: Option<u64>, retry_at_ms: u64) -> bool {
+    now_ms.is_none_or(|now| now >= retry_at_ms)
+}
+
+/// The wait after an `ENETDOWN` kick, from the previous one (0 at the
+/// start of a down period): the minimum first, then doubling up to the
+/// maximum.
+fn next_retry_backoff(backoff_ms: u64) -> u64 {
+    backoff_ms
+        .saturating_mul(2)
+        .clamp(LINK_DOWN_RETRY_MIN_MS, LINK_DOWN_RETRY_MAX_MS)
 }
 
 /// Why the adapter stopped for good.
@@ -500,6 +553,9 @@ pub struct XdpPacketIo<'memory> {
     generated_outstanding: Option<(usize, RawLease)>,
     /// Generated allocation attempts for an interface without a port.
     generated_unknown_egress: u64,
+    /// The run loop's coarse clock in milliseconds, if it hands one in
+    /// ([`Self::set_clock`]); rate-limits kick retries on a down link.
+    clock_ms: Option<u64>,
     #[cfg(test)]
     test: test_hooks::TestHooks,
 }
@@ -538,6 +594,8 @@ impl<'memory> XdpPacketIo<'memory> {
                 kick_owed: false,
                 relieved: false,
                 link_down: false,
+                retry_at_ms: 0,
+                retry_backoff_ms: 0,
                 counters: XdpAdapterCounters::default(),
             });
         }
@@ -574,9 +632,21 @@ impl<'memory> XdpPacketIo<'memory> {
             rx_outstanding: None,
             generated_outstanding: None,
             generated_unknown_egress: 0,
+            clock_ms: None,
             #[cfg(test)]
             test: test_hooks::TestHooks::default(),
         })
+    }
+
+    /// Hands the adapter the caller's monotonic clock (cold boundary: once
+    /// per run-loop iteration, never per packet). From the first call on,
+    /// TX kick retries on a port whose link is down are rate-limited
+    /// ([`LINK_DOWN_RETRY_MIN_MS`] doubling to [`LINK_DOWN_RETRY_MAX_MS`]);
+    /// the caller must keep advancing it, or a down port's retries stay
+    /// suppressed. A clock that goes backwards only makes a retry due
+    /// later.
+    pub fn set_clock(&mut self, now: MonotonicMillis) {
+        self.clock_ms = Some(now.0);
     }
 
     /// Number of ports.
@@ -628,7 +698,7 @@ impl<'memory> XdpPacketIo<'memory> {
     /// Settles port `index` (reap, owed kicks). A datapath failure stops
     /// the adapter; it and a genuine kick failure are returned.
     fn settle_port(&mut self, index: usize) -> Result<(), XdpIoError> {
-        match self.ports[index].settle() {
+        match self.ports[index].settle(self.clock_ms) {
             Err(error @ XdpIoError::Datapath { .. }) => Err(self.fault(error)),
             other => other,
         }
@@ -1667,6 +1737,7 @@ pub struct XdpCounters {
     pub cross_port_copy_reserved: u64,
     pub kicks_link_down: u64,
     pub kick_budget_exhausted: u64,
+    pub kick_retries_suppressed: u64,
     // Ring occupancy gauges (one atomic load each, at stats time).
     /// Fill entries published and not yet taken by the kernel.
     pub fill_ring_occupancy: u64,
@@ -1754,6 +1825,7 @@ impl XdpCounters {
             cross_port_copy_reserved: adapter.cross_port_copy_reserved,
             kicks_link_down: adapter.kicks_link_down,
             kick_budget_exhausted: adapter.kick_budget_exhausted,
+            kick_retries_suppressed: adapter.kick_retries_suppressed,
             fill_ring_occupancy: u64::from(engine.fill_occupancy()),
             rx_ring_occupancy: u64::from(engine.rx_occupancy()),
             tx_ring_unconsumed: u64::from(engine.tx_unconsumed()),
@@ -1828,6 +1900,7 @@ impl XdpCounters {
             cross_port_copy_reserved,
             kicks_link_down,
             kick_budget_exhausted,
+            kick_retries_suppressed,
             fill_ring_occupancy,
             rx_ring_occupancy,
             tx_ring_unconsumed,
@@ -1923,6 +1996,7 @@ impl XdpCounters {
         count("cross_port_copy_reserved", self.cross_port_copy_reserved);
         count("kicks_link_down", self.kicks_link_down);
         count("kick_budget_exhausted", self.kick_budget_exhausted);
+        count("kick_retries_suppressed", self.kick_retries_suppressed);
         count("fill_ring_occupancy", self.fill_ring_occupancy);
         count("rx_ring_occupancy", self.rx_ring_occupancy);
         count("tx_ring_unconsumed", self.tx_ring_unconsumed);

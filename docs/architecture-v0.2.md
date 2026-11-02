@@ -2555,7 +2555,10 @@ blockされたsubmitごとにも繰り返して2048 entry ringで一tick約4.3k 
 （link down）はerrorではなくportのlink state（stats `link_down`、`kicks_link_down`）で、kickは負った
 ままなので、linkが戻れば新しいtrafficなしに次のsettleで回復します（以前はlink flap後にportが永久に
 止まり、generated poolもin-flightのままARPが消え、quiescenceが`TxInFlight`のまま全publicationを
-延期した）。それ以外のkick失敗（`EINVAL`等）はbatch errorですがstickyではありません。budgetを使い
+延期した）。callerが`set_clock`でmonotonic clockを渡すと（`ruster run`のloopが一iterationに一回）、
+link downの間の再試行はsettleごとでなく、最初の`ENETDOWN`の1 ms後から待ちを倍にして64 msまでの間隔だけ
+kickし、期限前のsettleはreapだけして`kick_retries_suppressed`を数えます（debtは保持、link upから最大
+64 msで送信。XDP-178）。それ以外のkick失敗（`EINVAL`等）はbatch errorですがstickyではありません。budgetを使い
 切ってin-flightが残れば`kick_budget_exhausted`に数えます。kick数とdeferred数はengineの`tx_kicks`/
 `kicks_deferred`です。
 
@@ -2636,7 +2639,7 @@ TX。各一回のatomic load）、quarantine（両pool合計の`frames_quarantin
 completed/rejected、gauge inflight。cross-port copyを含む）、adapter（forwarded_in_place、
 cross_port_copies、cross_port_copy_unavailable、cross_port_copy_reserved、tx_over_mtu、tx_blocked、
 tx_unknown_egress、generated_over_mtu、generated_tx_blocked、leases_reclaimed、kicks_link_down、
-kick_budget_exhausted）、kernel（rx_dropped、rx_invalid_descs、tx_invalid_descs、rx_ring_full、
+kick_budget_exhausted、kick_retries_suppressed）、kernel（rx_dropped、rx_invalid_descs、tx_invalid_descs、rx_ring_full、
 rx_fill_ring_empty_descs、tx_ring_empty_descs）です。合計はsaturating、high-waterとlagは最大値です。
 
 #299 follow-up: `GeneratedCounters::generated_quarantined_after_tx`を追加し、

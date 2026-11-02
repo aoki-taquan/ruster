@@ -177,7 +177,8 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   `finish`、`receive`、`begin_generated`、`service`、quiescence check、back-pressure直後にreapと
   kickを繰り返す（一回`ceil(in_flight/32)+2` kick以内。copy modeの一`sendto` 32 descriptor上限を
   越えるbatchも`finish`で完了）。`ENETDOWN`はerrorでなくportのlink stateで、linkが戻れば新しい
-  trafficなしに回復する。cross-port copyはrouter生成ARP/ICMP用のgenerated reserve
+  trafficなしに回復する（`ruster run`ではdown中の再試行を1 msから64 msへ倍増するbackoffでrate limitし、
+  見送ったsettleは`kick_retries_suppressed`。XDP-178）。cross-port copyはrouter生成ARP/ICMP用のgenerated reserve
   `max(2, pool/8)`を取らない。portの設定は`XdpPortConfig::from_session`でだけ作れ、別sessionの
   engineとの組は拒否する。`backend_stats()`は全port合計、`port_stats(IfId)`はportごとの
   mode、need-wakeup、link state、Fill/RX/TX/CQ saturationとring占有、completion lag、invalid
@@ -782,7 +783,7 @@ compilerなしで生成）、holder（attachした別processをSIGKILLしlinkが
 
 `.github/workflows/xdp-veth.yml`の`XDP veth` jobは、pull requestとmainへのpushごとに
 `ubuntu-24.04` hosted runner（passwordless sudo）で上の二つのprivileged smokeを実行します
-（30分上限、`permissions: contents: read`、secretなし。required checkにするかはowner決定2eで未決）。
+（30分上限、`permissions: contents: read`、secretなし。owner決定2e「当面は任意のまま」によりrequired checkではない）。
 
 1. `scripts/priv-xdp-probe.sh`: kernel 5.9以上、sudo下の`CapEff`、libbpf付きiproute2、throwaway
    netns（`ruster-probe-<pid>-<random>`）内でのveth作成とsysctl書き込み、`socket(AF_XDP)`、

@@ -369,9 +369,16 @@ port that is down is `LINK_DOWN` only: neither `TX_STALL` nor
 `KICK_ERRORS` is timed, whatever the thresholds (an `ENETDOWN` from the
 shutdown drain's kick or from a Fill kick is counted in `kick_errors` but
 not in `kicks_link_down`; the drain runs after the watch stops, and a Fill
-`poll` kick failing `ENETDOWN` is theoretical). When the link returns,
-the held frames are transmitted (they may be stale by then) and the ring
-drains. With only carrier lost (`IFF_LOWER_UP` clear, for example the
+`poll` kick failing `ENETDOWN` is theoretical). While the port is down
+the owed TX kick is retried with a backoff, not at every settle: the
+first `ENETDOWN` is immediate, the next retry comes 1 ms later, and each
+further wait doubles up to 64 ms, so a port that stays down costs about
+16 `sendto` calls per second (`if<id>.af_xdp_port.kicks_link_down`); a
+settle before the retry is due only reaps and counts
+`kick_retries_suppressed`. When the link returns, the held frames are
+transmitted at the next retry, at most 64 ms later and without new
+traffic (they may be stale by then), and the ring drains; the backoff
+starts again at 1 ms on the next down period. With only carrier lost (`IFF_LOWER_UP` clear, for example the
 peer down), the kernel consumes and drops the frames instead, so the ring
 does not fill. A cross-port forward also needs a free generated frame of
 the egress port, so with `generated-frames` below the TX ring size the
@@ -469,7 +476,7 @@ Sections, in this order:
 | `observer.*`, `tick.*`, `rx.*`, `generated_arp.*`, `generated_icmpv4.*`, `phase_skip.*`, `drop.<REASON>`, `consume.<REASON>`, `apply.*`, `flushed.*`, `occupancy.*` | worker observability: health state (`observer.state`: `healthy`, `degraded`, `stale`, `stopped`, `not_started`), active generation, tick totals, RX totals (`rx.received`, `rx.tx_accepted`, `rx.tx_rejected`, `rx.dropped`, `rx.consumed`, ...), drop/consume reason counts, last apply outcome and flush counts, NAT/FW/ICMP limiter occupancy and high-water |
 | `resolution.*`, `icmpv4_errors.*`, `nat44_udp.*`, `nat44_tcp.*`, `firewall.*` | the five service runtimes' cumulative counters |
 | `af_xdp.*` | all ports: `mode` (`copy`, `zero_copy`, `mixed`), `ports`, `copy_ports`, `zero_copy_ports`, `fill_need_wakeup_ports`, `tx_need_wakeup_ports`, `link_down_ports`, `kick_owed_ports`, `kernel_stats_ports`, `generated_unknown_egress`, `stopped`, and the summed port counters |
-| `if<id>.af_xdp_port.*` | per port: `interface`, `queue`, `mode`, `mtu`, `max_frame`, need-wakeup now, `draining`, `link_down`, `kick_owed`, `copy_reserve`, ring gauges (`fill_ring_occupancy`, `rx_ring_occupancy`, `tx_ring_unconsumed`), `fill_starved`, invalid RX descriptors and quarantines, TX (`tx_completed`, `tx_inflight`, `tx_inflight_highwater`, `tx_blocked`, `tx_over_mtu`, `tx_invalid_completions`), kicks (`tx_kicks`, `fill_kicks`, `kicks_deferred`, `kick_errors`, `kicks_link_down`; `kick_errors` counts every failed kick and so includes `kicks_link_down`, while the `KICK_ERRORS` health code times `kick_errors - kicks_link_down` only), generated frames, `cross_port_copies`, and the kernel `XDP_STATISTICS` (`kernel_rx_dropped`, `kernel_rx_invalid_descs`, `kernel_tx_invalid_descs`, `kernel_rx_ring_full`, `kernel_rx_fill_ring_empty_descs`, `kernel_tx_ring_empty_descs`) |
+| `if<id>.af_xdp_port.*` | per port: `interface`, `queue`, `mode`, `mtu`, `max_frame`, need-wakeup now, `draining`, `link_down`, `kick_owed`, `copy_reserve`, ring gauges (`fill_ring_occupancy`, `rx_ring_occupancy`, `tx_ring_unconsumed`), `fill_starved`, invalid RX descriptors and quarantines, TX (`tx_completed`, `tx_inflight`, `tx_inflight_highwater`, `tx_blocked`, `tx_over_mtu`, `tx_invalid_completions`), kicks (`tx_kicks`, `fill_kicks`, `kicks_deferred`, `kick_errors`, `kicks_link_down`, `kick_retries_suppressed`; `kick_errors` counts every failed kick and so includes `kicks_link_down`, while the `KICK_ERRORS` health code times `kick_errors - kicks_link_down` only; `kick_retries_suppressed` counts settles on a down port that skipped a retry not yet due, which made no syscall), generated frames, `cross_port_copies`, and the kernel `XDP_STATISTICS` (`kernel_rx_dropped`, `kernel_rx_invalid_descs`, `kernel_tx_invalid_descs`, `kernel_rx_ring_full`, `kernel_rx_fill_ring_empty_descs`, `kernel_tx_ring_empty_descs`) |
 | `reload.*` | `requested`, `applied`, `refused`, `failed` |
 | `watch.*` | `state` (`ok`/`warning`), `warnings` (all ports) |
 | `if<id>.watch.*` | `tx_stall`, `tx_stall_ms`, `fill_starved`, `kick_errors_persistent`, `link_up`, `link_down_events`, `link_up_events`, `mtu`, `link_probe_errors`, `kernel_ipv4_addresses`, `kernel_forwarding`, `warnings` |
@@ -540,11 +547,10 @@ CLI-034).
   loop spins 64 ticks, then sleeps 50 µs doubling to 1 ms when idle),
   privilege drop, SIGUSR1 stats, structured logs, systemd notify, opt-in
   "link down / forwarding 0 at exit", state carried across a reload.
-- While a port is down with TX held, the owed kick is retried on every
-  settle without a backoff: about 10k `ENETDOWN` `sendto` calls per second
-  per port (the veth smoke counted about 50k in 5 s). Harmless to the
-  datapath, but CPU and syscall noise; rate-limiting the retry while
-  `link_down` is set is a follow-up (CLI-034).
+- While a port is down with TX held, its owed kick is retried about 16
+  times per second (1 ms doubling to 64 ms, §8), so held TX resumes up to
+  64 ms after the link returns; the run loop's link watch (1 s) does not
+  shortcut the retry.
 - Verified kernels: the development host and the CI runner only
   (XDP-062). A TX stall with the link up (`TX_STALL`) cannot be produced
   on veth and is tested only against a scripted kernel (CLI-050).
@@ -554,7 +560,7 @@ CLI-034).
 The `XDP veth` job (`.github/workflows/xdp-veth.yml`, M2 S11) runs on every
 pull request and push to `main`, on an `ubuntu-24.04` hosted runner with
 passwordless sudo, with a 30-minute limit. It is not a required check
-(owner decision 2e, open).
+(owner decision 2e, 2026-11-02: 「当面は任意のまま」, optional for now).
 
 What it proves, on the runner's kernel only:
 
