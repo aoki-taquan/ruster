@@ -161,7 +161,10 @@
 //! port, the timeout passes, or a signal handler runs. Linux `xsk_poll`
 //! also answers a pending need-wakeup on entry (zero copy: the driver's
 //! wakeup; copy mode: the transmit loop), so the wait is never worse than
-//! the Fill kick `receive` already makes. It watches RX only: TX
+//! the Fill kick `receive` already makes. Before blocking it refills Fill
+//! from every port that has free frames (reaped from TX completions since
+//! the last refill), so a dry Fill cannot keep the waking frame out. It
+//! watches RX only: TX
 //! completions do not end it, so a caller with TX in flight
 //! ([`XdpPacketIo::tx_outstanding`]) keeps its waits short.
 
@@ -678,6 +681,13 @@ impl<'memory> XdpPacketIo<'memory> {
     /// batch open). A stopped adapter returns [`RxWait::Ready`] so the
     /// caller's next tick observes the stop at once.
     ///
+    /// Before blocking it refills Fill from every port's free list (bounded,
+    /// allocation-free; only ports with free frames, so starvation is not
+    /// counted here): frames that the last settle reaped from TX
+    /// completions would otherwise stay off Fill for the whole wait, and a
+    /// port whose Fill ran dry could not receive the frame that ends it. A
+    /// ring fault there stops the adapter and returns [`RxWait::Ready`].
+    ///
     /// # Errors
     ///
     /// [`RxWaitError::Unsupported`] if the ports are not live sockets
@@ -688,6 +698,17 @@ impl<'memory> XdpPacketIo<'memory> {
     pub fn wait_rx(&mut self, timeout_ms: u32) -> Result<RxWait, RxWaitError> {
         if self.stop.is_some() || self.rx_ready() {
             return Ok(RxWait::Ready);
+        }
+        for index in 0..self.ports.len() {
+            let port = &mut self.ports[index];
+            if port.engine.free_frames() == 0 {
+                continue;
+            }
+            let interface = port.config.interface;
+            if let Err(error) = port.engine.refill() {
+                let _ = self.fault(XdpIoError::Datapath { interface, error });
+                return Ok(RxWait::Ready);
+            }
         }
         self.rx_wait.wait(timeout_ms)
     }

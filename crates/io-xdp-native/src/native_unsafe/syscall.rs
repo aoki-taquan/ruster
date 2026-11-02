@@ -969,8 +969,10 @@ impl<S: Syscalls> Drop for OwnedXdpFd<'_, S> {
 /// How one [`PollSet::wait`] ended without an error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PollSetOutcome {
-    /// At least one socket reported an event (`POLLIN`, or a condition
-    /// `poll` always reports: `POLLERR`, `POLLHUP`, `POLLNVAL`).
+    /// At least one socket reported an event. For AF_XDP sockets that is
+    /// `POLLIN` (Linux `xsk_poll` reports only `POLLIN`/`POLLOUT`, and only
+    /// `POLLIN` is requested); a closed fd's `POLLNVAL` would also count,
+    /// but the borrow keeps every fd open.
     Ready,
     /// The timeout passed with no event.
     TimedOut,

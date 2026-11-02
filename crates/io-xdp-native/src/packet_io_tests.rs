@@ -1849,3 +1849,55 @@ fn idle_wait_is_ready_on_rx_work_and_reports_tx_outstanding() {
     assert_eq!(io.wait_rx(10), Ok(RxWait::Ready));
     audit(&io);
 }
+
+/// Frames reaped from TX completions after the last refill go back to
+/// Fill before the wait blocks, so a port whose Fill ran dry can receive
+/// the frame that ends the wait.
+#[test]
+fn idle_wait_refills_fill_from_reaped_frames_before_blocking() {
+    use crate::RxWaitError;
+
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    let fill = |io: &XdpPacketIo<'_>| {
+        io.port_stats(WAN)
+            .expect("WAN")
+            .counters
+            .fill_ring_occupancy
+    };
+    // RING frames received and transmitted in place: the receive refilled
+    // Fill with the rest of the RX pool, so the free list is empty.
+    for _ in 0..RING {
+        deliver(&wan, &ipv4_frame(60, 9));
+    }
+    {
+        let mut batch = io.receive(RING as usize).expect("receive");
+        while let Some(packet) = batch.next_packet() {
+            packet.commit(WAN);
+        }
+        let _ = batch.finish();
+    }
+    let engine = |io: &XdpPacketIo<'_>| io.engine(WAN).expect("WAN").free_frames();
+    assert_eq!(engine(&io), 0);
+    // The kernel takes every Fill frame and completes the TX; a reap
+    // without a refill (the quiescence check) returns the TX frames to the
+    // free list while Fill is empty.
+    while wan.consume_fill().is_some() {}
+    assert_eq!(transmit_all(&wan).len(), RING as usize);
+    assert!(io.try_publication_quiescence().is_ok());
+    assert_eq!(fill(&io), 0, "Fill ran dry");
+    assert_eq!(engine(&io), RING);
+    // The wait (it cannot block here) refilled first.
+    assert_eq!(io.wait_rx(10), Err(RxWaitError::Unsupported));
+    assert_eq!(fill(&io), u64::from(RING));
+    assert_eq!(engine(&io), 0);
+    // A port with no free frame and room in Fill is left alone: the wait
+    // counts no starvation (only RX passes do).
+    while wan.consume_fill().is_some() {}
+    let starved = |io: &XdpPacketIo<'_>| io.port_stats(WAN).expect("WAN").counters.fill_starved;
+    let before = starved(&io);
+    assert_eq!(io.wait_rx(10), Err(RxWaitError::Unsupported));
+    assert_eq!(starved(&io), before);
+    assert_eq!(fill(&io), 0);
+    audit(&io);
+}

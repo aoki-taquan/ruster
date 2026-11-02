@@ -398,7 +398,9 @@ pub struct IdleCounters {
     pub timed_out: u64,
     /// ... ended by a signal handler.
     pub interrupted: u64,
-    /// Waits shortened to [`SHORT_WAIT_MS`] because work was pending.
+    /// Waits that the pending cap ([`Pending`]) made shorter than the
+    /// configured wait and the next deadline would have (not counted when
+    /// a deadline was nearer anyway, or with `--idle-wait-ms 1`).
     pub short: u64,
     /// Plain sleeps instead of a wait: unconsumed readiness or a wait that
     /// could not block.
@@ -458,15 +460,17 @@ pub fn backend_stopped<P, Q, R, G>(report: &TickReport<P, Q, R, G>) -> bool {
 /// handoff that never clears by itself), without a tick in between, before
 /// the loop treats the backend as stopped. Measured on the loop clock
 /// since H9 (the tick rate depends on the idle wait); before, 1024 ticks
-/// made about one second at the 1 ms idle sleep.
+/// made about one second at the 1 ms idle sleep. With [`WEDGED_MIN_TICKS`]
+/// the bound is `max(1 s, 16 × --idle-wait-ms)` (at most 1.6 s at the
+/// 100 ms maximum), plus one wait.
 pub const WEDGED_MS: u64 = 1_000;
 /// ... and at least this many such ticks, so a single tick after a long
 /// stall (a stopped process) never ends the run alone.
 pub const WEDGED_MIN_TICKS: u32 = 16;
 
 /// Ends the loop on a terminal backend stop, or once non-reentrant skips
-/// have lasted [`WEDGED_MS`] over at least [`WEDGED_MIN_TICKS`] ticks;
-/// any other tick resets it.
+/// have lasted [`WEDGED_MS`] over at least [`WEDGED_MIN_TICKS`] ticks
+/// (`max(1 s, 16 × --idle-wait-ms)`); any other tick resets it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BackendWatch {
     skipped: u32,
@@ -758,13 +762,17 @@ where
                     (a, b) => a.or(b),
                 };
                 let timeout = idle_timeout_ms(now, settings.idle_wait_ms, pending, deadline);
+                // Shortened only if the pending cap, not a deadline or the
+                // configured wait, set this timeout.
+                let shortened = timeout
+                    < idle_timeout_ms(now, settings.idle_wait_ms, Pending::default(), deadline);
                 idle_wait(
                     datapath,
                     clock,
                     &mut backoff,
                     action,
                     timeout,
-                    pending.any(),
+                    shortened,
                     &mut control.idle,
                     err,
                 );
@@ -784,7 +792,7 @@ fn idle_wait<D, C, E>(
     backoff: &mut IdleBackoff,
     action: IdleAction,
     timeout_ms: u64,
-    short: bool,
+    shortened: bool,
     counters: &mut IdleCounters,
     err: &mut E,
 ) where
@@ -805,7 +813,7 @@ fn idle_wait<D, C, E>(
     match datapath.wait_rx(timeout) {
         Ok(wake) => {
             bump(&mut counters.waits);
-            if short {
+            if shortened {
                 bump(&mut counters.short);
             }
             bump(match wake {

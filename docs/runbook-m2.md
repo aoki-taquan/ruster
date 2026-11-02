@@ -888,7 +888,8 @@ under a hostile segment matters more, disable flow control
 (`ethtool -A <dev> rx off tx off`) and/or run with `--tx-stall-fatal-secs 0`.
 
 Separately, if the adapter's I/O stays non-reentrant for 1 s on the loop's
-clock with no other tick in between (and at least 16 such ticks; the
+clock with no other tick in between (and at least 16 such ticks, so the
+bound is `max(1 s, 16 × --idle-wait-ms)`; the
 wedged-adapter watchdog, time-based since H9 because the idle tick rate
 depends on the idle wait), or the adapter stops itself after a ring fault,
 the run ends with `stopped after a backend fault` and exit 1.
@@ -925,7 +926,13 @@ flight or an owed kick in the adapter (completions do not end an RX wait;
 the link-down kick retry of section 8 keeps its 1 ms first step); and a
 reload request out on the reload worker (its answer is picked up within
 about 1 ms). NAT44 and firewall state expiry is lazy and needs no tick.
-What the 10 ms costs: a signal that the kernel delivers to another thread
+These caps last as long as their cause: while TX is held on a down link
+(section 8), while resolution states sit in `Failed` (the hold-down),
+or while unsolicited-SYN holds exist, every idle wait stays at 1 ms for
+that whole period, about 1000 wake-ups per second as before H9
+(`idle.short` grows). Before blocking, the wait also puts frames that the
+last tick reaped from TX completions back on Fill, so a port whose Fill ran
+dry can receive the frame that wakes it. What the 10 ms costs: a signal that the kernel delivers to another thread
 (or that arrives between the router's flag check and its `poll`), and a
 link round coming back, are noticed up to one wait later.
 
@@ -941,7 +948,8 @@ CPU and wake-ups: an idle router thread wakes about 100 times per second
 at the default (plus the stats, health and link deadlines), against about
 1000 before H9; with timers pending it is back to about 1000. The
 `idle.*` stats (section 11) count the waits (`waits`, `woken`,
-`timed_out`, `interrupted`, `short`: capped at 1 ms by pending work,
+`timed_out`, `interrupted`, `short`: waits the pending cap made shorter
+than the configured wait and the next deadline would have,
 `sleeps`, `errors`, and the configured `max_wait_ms`); `tick.ticks` grows
 by about the wait count while idle.
 
@@ -1126,7 +1134,7 @@ Sections, in this order:
 | `af_xdp.*` | all ports: `mode` (`copy`, `zero_copy`, `mixed`), `ports`, `copy_ports`, `zero_copy_ports`, `fill_need_wakeup_ports`, `tx_need_wakeup_ports`, `link_down_ports`, `kick_owed_ports`, `kernel_stats_ports`, `generated_unknown_egress`, `stopped`, and the summed port counters |
 | `if<id>.af_xdp_port.*` | per port: `interface`, `queue`, `mode`, `mtu`, `max_frame`, need-wakeup now, `draining`, `link_down`, `kick_owed`, `copy_reserve`, ring gauges (`fill_ring_occupancy`, `rx_ring_occupancy`, `tx_ring_unconsumed`), `fill_starved`, invalid RX descriptors and quarantines, TX (`tx_completed`, `tx_inflight`, `tx_inflight_highwater`, `tx_blocked`, `tx_over_mtu`, `tx_invalid_completions`), kicks (`tx_kicks`, `fill_kicks`, `kicks_deferred`, `kick_errors`, `kicks_link_down`, `kick_retries_suppressed`; `kick_errors` counts every failed kick and so includes `kicks_link_down`, while the `KICK_ERRORS` health code times `kick_errors - kicks_link_down` only; `kick_retries_suppressed` counts settles on a down port that skipped a retry not yet due, which made no syscall), generated frames, `cross_port_copies`, and the kernel `XDP_STATISTICS` (`kernel_rx_dropped`, `kernel_rx_invalid_descs`, `kernel_tx_invalid_descs`, `kernel_rx_ring_full`, `kernel_rx_fill_ring_empty_descs`, `kernel_tx_ring_empty_descs`) |
 | `reload.*` | `requested`, `applied`, `refused`, `failed`, `preparing_ms` (how long the reload being prepared on the worker has run; 0 when none) |
-| `idle.*` | the idle wait (section 7): `max_wait_ms` (`--idle-wait-ms`), `waits` (blocking `poll`s), `woken` (ended by a frame on a port), `timed_out`, `interrupted` (a signal handler ran), `short` (capped at 1 ms because timers, TX, or a reload were pending), `sleeps` (plain sleeps of at most 1 ms after a ready socket that no tick used, or because `poll` failed), `errors` (failed `poll`s; warned once) |
+| `idle.*` | the idle wait (section 7): `max_wait_ms` (`--idle-wait-ms`), `waits` (blocking `poll`s), `woken` (ended by a frame on a port), `timed_out`, `interrupted` (a signal handler ran), `short` (waits the 1 ms pending cap made shorter than `--idle-wait-ms` and the next deadline would have; it grows about 1000 per second for as long as TX is held on a down link, resolution states are `Failed`, or unsolicited-SYN holds exist, as before H9), `sleeps` (plain sleeps of at most 1 ms after a ready socket that no tick used, or because `poll` failed), `errors` (failed `poll`s; warned once) |
 | `watch.*` | `state` (`ok`/`warning`), `warnings` (all ports), `link_rounds` (link rounds that came back from the watcher), `link_rounds_late` (due rounds skipped because one still ran), `link_rounds_stale` (late rounds past `--link-stale-secs`, each a failed link query) |
 | `if<id>.watch.*` | `tx_stall`, `tx_stall_ms`, `fill_starved`, `kick_errors_persistent`, `link_up`, `link_down_events`, `link_up_events`, `mtu`, `link_probe_errors`, `kernel_ipv4_addresses`, `kernel_forwarding`, `kernel_ipv4_routes`, `kernel_ipv6_addresses`, `kernel_ipv6_routes`, `kernel_ipv6_forwarding`, `kernel_ipv6_enabled`, `ipv4_weak_host`, `warnings` |
 | `privileges.*` | `state` (`dropped`, or `kept` under `--keep-privileges`), `bounding_set` (`cleared`/`kept`), `identity` (`switched`/`unchanged`), `threads` (threads verified by the drop; 0 when kept) |

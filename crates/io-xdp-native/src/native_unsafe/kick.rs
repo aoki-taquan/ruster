@@ -234,9 +234,11 @@ impl<'session> SocketKick<'session> {
 /// How an idle wait on the RX rings of every port ended (H9).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RxWait {
-    /// A port has RX work: a descriptor in its RX ring, a frame left
-    /// pending by an earlier batch, or a socket condition `poll` always
-    /// reports (`POLLERR`, `POLLHUP`, `POLLNVAL`). The next RX pass sees it.
+    /// A port has RX work: a descriptor in its RX ring or a frame left
+    /// pending by an earlier batch. Linux `xsk_poll` reports only
+    /// `POLLIN`/`POLLOUT` (and only `POLLIN` is asked for); `POLLNVAL`
+    /// would need a closed fd, which the shared socket borrow excludes, and
+    /// would also read as `Ready`. The next RX pass sees it.
     Ready,
     /// The timeout passed with no RX descriptor on any port.
     TimedOut,
