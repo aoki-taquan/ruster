@@ -12,6 +12,7 @@ const KICK_ERRORS_FATAL_MS: u64 = 5_000;
 const TARGET: LinkTarget = LinkTarget {
     interface: PORT,
     ifindex: 7,
+    name: IfName::literal(b"ra"),
     mtu: 1500,
     frame_capacity: 1792,
 };
@@ -48,6 +49,7 @@ fn sample() -> PortSample {
 
 fn up(mtu: u32) -> Result<LinkFacts, NetlinkError> {
     Ok(LinkFacts {
+        name: TARGET.name,
         mtu,
         rx_queues: Some(1),
         admin_up: true,
@@ -1023,5 +1025,56 @@ fn a_folded_round_has_the_synchronous_outcomes() {
     assert_eq!(
         fold(&mut watch, &round_of(port_round(removed, 0, 0))),
         [fatal(Fatal::DeviceRemoved)]
+    );
+}
+
+/// H10: the index carrying another name than the configured device is
+/// fatal `DEVICE_RENAMED`, and nothing else of that port's round is
+/// folded in (its sysctl paths may name another device now), also for a
+/// removed device; the same name keeps the round as before.
+#[test]
+fn a_renamed_port_is_fatal_and_its_round_is_not_read() {
+    let renamed = || {
+        Ok(LinkFacts {
+            name: IfName::literal(b"rx"),
+            ..up(1500).expect("facts")
+        })
+    };
+    assert_eq!(link(&mut watch(), renamed()), [fatal(Fatal::DeviceRenamed)]);
+    assert_eq!(Fatal::DeviceRenamed.code(), "DEVICE_RENAMED");
+    // A prefix or an extension of the name is another name.
+    for name in [&b"r"[..], b"ra0", b"RA"] {
+        let other = Ok(LinkFacts {
+            name: IfName::literal(name),
+            ..up(1500).expect("facts")
+        });
+        assert_eq!(link(&mut watch(), other), [fatal(Fatal::DeviceRenamed)]);
+    }
+    // Kernel forwarding, an address, a route, and weak-host exposure in
+    // the same round (read through the old name) are not reported.
+    let exposed = |link| PortRound {
+        forwarding: Ok(Forwarding {
+            global: true,
+            ..Forwarding::default()
+        }),
+        weak_host: Some(true),
+        ..port_round(link, 1, 1)
+    };
+    let mut watched = watch();
+    assert_eq!(
+        fold(&mut watched, &round_of(exposed(renamed()))),
+        [fatal(Fatal::DeviceRenamed)]
+    );
+    assert!(!watched.kernel_exposure().forwarding);
+    let removed = Err(NetlinkError::Kernel(crate::run::netlink::KERNEL_ENODEV));
+    assert_eq!(
+        fold(&mut watch(), &round_of(exposed(removed))),
+        [fatal(Fatal::DeviceRemoved)]
+    );
+    // The configured name: every finding is read.
+    assert_eq!(
+        fold(&mut watch(), &round_of(exposed(up(1500)))).len(),
+        4,
+        "addresses, routes, forwarding, weak host"
     );
 }

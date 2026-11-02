@@ -164,6 +164,17 @@
 #             it dies by that signal and both links detach. At the end,
 #             no seccomp kill of the ruster binary was logged during the
 #             whole smoke (same best effort)
+#   systemd   (H10) NOTIFY_SOCKET names a datagram socket in the work
+#             directory (a python receiver stands in for systemd) and
+#             WATCHDOG_USEC=400000; run as the invoking user under the
+#             default --seccomp kill: READY=1 is the first notification,
+#             after readiness; WATCHDOG=1 every 200 ms (6 to 14 in 2 s);
+#             a reloadable SIGHUP sends RELOADING=1 with MONOTONIC_USEC
+#             and then READY=1 with generation 2; SIGUSR1 prints a
+#             kind=on-demand stats block (notify.* fields); SIGTERM sends
+#             STOPPING=1 last; notify.sent equals the datagrams received
+#   rename    (H10) `ip link set ra down` and `name rx` while running:
+#             exit 1 (DEVICE_RENAMED), nothing left attached; renamed back
 #   restart   SIGKILL a running router: the unpinned links auto-detach;
 #             restart (bounded retry of the transient BIND/BUSY or
 #             REGISTER_UMEM/MEMLOCK_LIMIT after teardown, XDP-045, in this
@@ -237,6 +248,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/ruster-priv-run.XXXXXX")
 pidfile="$work/ruster.pid"
 stopfile="$work/sender.stop"
 created=
+ruster_env=
 launcher=
 ruster_pid=
 mroute=
@@ -428,7 +440,8 @@ start_ruster() {
     config=$2
     shift 2
     rm -f "$pidfile"
-    sudo -n sh -c 'echo $$ >"$1"; shift; exec ip netns exec "$@"' sh "$pidfile" \
+    # shellcheck disable=SC2086 # $ruster_env is a list of NAME=value words.
+    sudo -n env $ruster_env sh -c 'echo $$ >"$1"; shift; exec ip netns exec "$@"' sh "$pidfile" \
         "$router" "$binary_path" run --stats-interval 1 "$@" --config "$config" \
         >"$work/$name.out" 2>"$work/$name.err" &
     launcher=$!
@@ -2184,6 +2197,129 @@ phase_seccomp() {
 }
 
 phase_seccomp
+
+# H10 systemd: a path datagram socket in the work directory stands in for
+# systemd's notify socket (no systemd needed). Every datagram is appended
+# to the log file as one line, its newlines written as '|'.
+NOTIFY_RECEIVER='
+import os, socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+s.bind(sys.argv[1])
+os.chmod(sys.argv[1], 0o600)
+out = open(sys.argv[2], "a")
+print("ready", flush=True)
+while True:
+    data = s.recv(4096)
+    out.write(data.decode().replace("\n", "|") + "\n")
+    out.flush()
+'
+
+# Waits (10 s) until the notification log has the line $1 (regex, whole
+# line) at least $2 (default 1) times.
+wait_notify() {
+    tries=0
+    while [ "$(grep -cx -- "$1" "$work/notify.log")" -lt "${2:-1}" ]; do
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "systemd: no notification $1 (x${2:-1}): $(cat "$work/notify.log")"
+        sleep 0.05
+    done
+}
+
+# systemd (H10): sd_notify over NOTIFY_SOCKET, the watchdog, SIGUSR1 stats,
+# all under the default privilege drop (switched to the invoking user, who
+# owns the socket) and the default --seccomp kill filter.
+phase_systemd() {
+    rm -f "$work/notify.sock"
+    : >"$work/notify.log"
+    python3 -I -c "$NOTIFY_RECEIVER" "$work/notify.sock" "$work/notify.log" \
+        >"$work/notify-receiver.out" 2>&1 &
+    notify_receiver=$!
+    tries=0
+    while ! grep -q ready "$work/notify-receiver.out" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "systemd: notify receiver not ready"
+        sleep 0.05
+    done
+    cp "$work/router.toml" "$work/systemd.toml"
+    # WATCHDOG_USEC 0.4 s: a ping every 200 ms.
+    ruster_env="NOTIFY_SOCKET=$work/notify.sock WATCHDOG_USEC=400000"
+    start_ruster systemd "$work/systemd.toml" --user "$smoke_uid" --group "$smoke_gid"
+    ruster_env=
+    wait_ready systemd || fail "systemd: ruster exited during startup"
+    assert_dropped systemd "$smoke_uid $smoke_gid"
+    wait_notify "READY=1|STATUS=running generation 1|"
+    [ "$(sed -n 1p "$work/notify.log")" = "READY=1|STATUS=running generation 1|" ] ||
+        fail "systemd: the first notification is not READY=1: $(cat "$work/notify.log")"
+    forward_once systemd
+    pings_a=$(grep -cx "WATCHDOG=1|" "$work/notify.log")
+    sleep 2
+    pings_b=$(grep -cx "WATCHDOG=1|" "$work/notify.log")
+    [ $((pings_b - pings_a)) -ge 6 ] && [ $((pings_b - pings_a)) -le 14 ] ||
+        fail "systemd: $((pings_b - pings_a)) watchdog pings in 2 s (interval 200 ms)"
+    # A reloadable change (router-v2): RELOADING=1 with MONOTONIC_USEC,
+    # then READY=1 with the new generation.
+    reload_with "$work/router-v2.toml" "$work/systemd.toml"
+    wait_line systemd "reload applied: generation=2 previous=1"
+    wait_notify "RELOADING=1|MONOTONIC_USEC=[1-9][0-9]*|STATUS=reloading (generation 1)|"
+    wait_notify "READY=1|STATUS=running generation 2|"
+    # SIGUSR1: one on-demand block, two coalesced or not, never an exit.
+    signal_ruster USR1
+    tries=0
+    while ! grep -q "^ruster-run-stats kind=on-demand " "$work/systemd.out"; do
+        launcher_alive || fail "systemd: exited after SIGUSR1"
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "systemd: no on-demand stats block within 10 s"
+        sleep 0.05
+    done
+    sleep 0.3
+    awk '/^ruster-run-stats kind=on-demand /{on=1} on{print} on&&/^end$/{exit}' \
+        "$work/systemd.out" >"$work/systemd.ondemand"
+    block_has "$work/systemd.ondemand" observer.generation=2 notify.enabled=true \
+        notify.watchdog_interval_ms=200 notify.failed=0 seccomp.mode=kill
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "systemd: exit status $status after SIGTERM"
+    assert_detached "the systemd phase"
+    sleep 0.2
+    [ "$(tail -n 1 "$work/notify.log")" = "STOPPING=1|STATUS=stopping: stop requested|" ] ||
+        fail "systemd: the last notification is not STOPPING=1: $(tail -n 3 "$work/notify.log")"
+    kill "$notify_receiver" 2>/dev/null || true
+    wait "$notify_receiver" 2>/dev/null || true
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/systemd.out" >"$work/systemd.final"
+    block_has "$work/systemd.final" notify.enabled=true notify.failed=0
+    sent=$(stat_in "$work/systemd.final" notify.sent)
+    lines=$(wc -l <"$work/notify.log")
+    # The final block is captured after STOPPING=1, so it counts it.
+    [ "$sent" -eq "$lines" ] || fail "systemd: notify.sent=$sent but $lines datagrams received"
+    echo "priv_run_systemd: READY=1 after readiness, $((pings_b - pings_a)) watchdog pings in 2 s, RELOADING=1 with MONOTONIC_USEC and READY=1 generation 2 around a reload, a SIGUSR1 on-demand stats block, STOPPING=1 last ($lines datagrams, all counted), under --seccomp kill as the invoking user; exit 0, detached verified"
+}
+
+# rename (H10): renaming a port while the router runs (taken down first,
+# which every kernel accepts; 6.2 and newer also rename an up device) is
+# fatal DEVICE_RENAMED: its sysctl paths would name
+# whatever device takes the old name. Exit 1, nothing left attached; the
+# device gets its name back for the later phases.
+phase_rename() {
+    start_ruster rename "$work/router.toml"
+    wait_ready rename || fail "rename: ruster exited during startup"
+    forward_once rename-before
+    sudo -n ip -n "$router" link set ra down
+    sudo -n ip -n "$router" link set ra name rx
+    wait_exit rename
+    [ "$status" -eq 1 ] || fail "rename: exit status $status after renaming ra"
+    grep -q "fatal: port=if1 health=DEVICE_RENAMED" "$work/rename.err" ||
+        fail "rename: no DEVICE_RENAMED"
+    grep -q "stopped after a fatal health event port=if1 code=DEVICE_RENAMED; .*detached and closed 2 port(s)" \
+        "$work/rename.err" || fail "rename: no fatal summary"
+    test -z "$(xdp_on rx)$(xdp_on rb)" || fail "rename: XDP left attached"
+    sudo -n ip -n "$router" link set rx name ra
+    sudo -n ip -n "$router" link set ra up
+    assert_detached "the rename phase"
+    echo "priv_run_rename: a port renamed while running failed closed with DEVICE_RENAMED, exit 1, nothing left attached verified"
+}
+
+phase_systemd
+phase_rename
 
 # restart: SIGKILL, auto-detach, bounded restart retry, forward again.
 start_ruster killed "$work/router.toml"

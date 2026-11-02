@@ -24,6 +24,16 @@
 //! (`nohup`): for a daemon it is the reload request, never a hang-up.
 //! `run-sim` keeps the inherited SIGHUP disposition.
 //!
+//! `ruster run` alone also installs a SIGUSR1 handler ([`install_stats`],
+//! H10) that stores `true` into a fourth flag; the run loop takes it
+//! ([`take_stats_request`]) at its next cold point and prints one stats
+//! block (`kind=on-demand`, at most one per 100 ms: the loop coalesces
+//! requests within that into one later block). SIGUSR1s before the take
+//! coalesce into one
+//! block. Installed unconditionally (also when inherited as ignored), like
+//! SIGHUP: without the handler the default action of SIGUSR1 would end the
+//! router. `run-sim` keeps the inherited SIGUSR1 disposition.
+//!
 //! On targets other than Linux nothing is installed and the flag never
 //! becomes set; the process then keeps the default signal behaviour.
 
@@ -32,6 +42,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static STOP: AtomicBool = AtomicBool::new(false);
 static FORCE: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
+static STATS: AtomicBool = AtomicBool::new(false);
+
+/// Takes a SIGUSR1 stats request that arrived since the last call.
+pub fn take_stats_request() -> bool {
+    STATS.load(Ordering::Relaxed) && STATS.swap(false, Ordering::Relaxed)
+}
+
+/// Installs the SIGUSR1 stats handler (`ruster run` only).
+pub fn install_stats() -> Result<(), &'static str> {
+    imp::install_stats()
+}
 
 /// Takes a SIGHUP reload request that arrived since the last call.
 pub fn take_reload_request() -> bool {
@@ -69,6 +90,7 @@ mod imp {
     // Linux signal numbers, identical on every Linux architecture.
     const SIGHUP: c_int = 1;
     const SIGINT: c_int = 2;
+    const SIGUSR1: c_int = 10;
     const SIGTERM: c_int = 15;
     // `sighandler_t` special values: SIG_IGN is `(sighandler_t) 1`, SIG_ERR
     // is `(sighandler_t) -1`.
@@ -101,6 +123,12 @@ mod imp {
         super::RELOAD.store(true, Ordering::Relaxed);
     }
 
+    extern "C" fn on_stats(_signum: c_int) {
+        // Async-signal-safe: one lock-free relaxed atomic store, nothing
+        // else (no allocation, lock, errno change, or reentrancy into std).
+        super::STATS.store(true, Ordering::Relaxed);
+    }
+
     // The handlers rely on lock-free byte-sized atomics (load, store, and
     // swap).
     #[cfg(not(target_has_atomic = "8"))]
@@ -110,8 +138,8 @@ mod imp {
     fn set(signum: c_int, handler: usize, name: &'static str) -> Result<usize, &'static str> {
         // SAFETY: `signal` is the C library function with the declared ABI
         // (`int` and a pointer-sized handler in, previous handler out).
-        // `handler` is either SIG_IGN or the address of `on_stop` or
-        // `on_reload`, `extern "C" fn(c_int)`s with static lifetime whose
+        // `handler` is either SIG_IGN or the address of `on_stop`,
+        // `on_reload`, or `on_stats`, `extern "C" fn(c_int)`s with static lifetime whose
         // bodies are async-signal-safe (relaxed swaps and stores on static
         // lock-free `AtomicBool`s only), so they may run at any
         // instruction of any thread, also nested in each other.
@@ -138,6 +166,11 @@ mod imp {
         let handler = on_reload as extern "C" fn(c_int) as usize;
         set(SIGHUP, handler, "SIGHUP").map(drop)
     }
+
+    pub fn install_stats() -> Result<(), &'static str> {
+        let handler = on_stats as extern "C" fn(c_int) as usize;
+        set(SIGUSR1, handler, "SIGUSR1").map(drop)
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -149,6 +182,10 @@ mod imp {
     pub fn install_reload() -> Result<(), &'static str> {
         Ok(())
     }
+
+    pub fn install_stats() -> Result<(), &'static str> {
+        Ok(())
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -158,7 +195,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        force_requested, install, install_reload, stop_requested, take_reload_request, RELOAD,
+        force_requested, install, install_reload, install_stats, stop_requested,
+        take_reload_request, take_stats_request, RELOAD, STATS,
     };
     use std::sync::atomic::Ordering;
 
@@ -177,6 +215,7 @@ mod tests {
     fn first_signal_stops_and_a_second_forces() {
         install().expect("install the handlers");
         install_reload().expect("install the reload handler");
+        install_stats().expect("install the stats handler");
         let pid = std::process::id().to_string();
         let send = |name: &str| {
             let status = Command::new("kill")
@@ -195,6 +234,15 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
         assert!(take_reload_request());
         assert!(!take_reload_request(), "coalesced and taken once");
+        // SIGUSR1 only requests a stats block, coalesced the same way.
+        assert!(!take_stats_request());
+        send("USR1");
+        wait_for(|| STATS.load(Ordering::Relaxed));
+        send("USR1");
+        thread::sleep(Duration::from_millis(50));
+        assert!(take_stats_request());
+        assert!(!take_stats_request(), "coalesced and taken once");
+        assert!(!take_reload_request());
         assert!(!stop_requested() && !force_requested());
         term();
         wait_for(stop_requested);

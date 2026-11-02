@@ -214,6 +214,8 @@ struct FakeHost {
     ipv6: Option<Ipv6Facts>,
     /// IPv4 routes out of every port at startup.
     ipv4_routes: u32,
+    /// The port whose index carries another name at startup (H10).
+    renamed: Option<u16>,
     /// The policy each `preflight` call was given.
     preflight_policies: RefCell<Vec<PrivilegePolicy>>,
 }
@@ -529,6 +531,7 @@ impl LinkMonitor for FakeLinks {
             }
         }
         Ok(LinkFacts {
+            name: target.name,
             mtu: target.mtu,
             rx_queues: Some(1),
             admin_up: true,
@@ -576,6 +579,16 @@ impl LinkMonitor for FakeLinks {
 }
 
 /// Fake interface index of a port.
+/// The configured device of port `id` in [`config`] (router-v1: `sim0`,
+/// `sim1`), which the fake link replies carry as `IFLA_IFNAME`.
+const fn device_name(id: u16) -> super::netlink::IfName {
+    if id == LAN {
+        super::netlink::IfName::literal(b"sim0")
+    } else {
+        super::netlink::IfName::literal(b"sim1")
+    }
+}
+
 const fn fake_ifindex(id: u16) -> u32 {
     100 + id as u32
 }
@@ -691,6 +704,11 @@ impl PortHost for FakeHost {
         }
         Ok(DeviceFacts {
             ifindex: fake_ifindex(id),
+            link_name: if self.renamed == Some(id) {
+                super::netlink::IfName::literal(b"renamed0")
+            } else {
+                super::netlink::IfName::new(port.device().as_bytes()).expect("device name")
+            },
             rx_queues: if self.multi_queue == Some(id) { 4 } else { 1 },
             link_mtu: 1500,
             session_mtu: 1500,
@@ -885,7 +903,16 @@ fn execute_with<S: StopSignal, O: std::io::Write, E: std::io::Write>(
 ) -> u8 {
     let sequencer = ProductionSequencer::new(OsRandomKeySource::open().expect("urandom"));
     execute(
-        host, config, sequencer, source, settings, clock, stop, out, err,
+        host,
+        config,
+        sequencer,
+        source,
+        settings,
+        take_notifier(),
+        clock,
+        stop,
+        out,
+        err,
     )
 }
 
@@ -1239,6 +1266,30 @@ fn multi_queue_device_is_refused_unless_allowed_with_a_warning() {
     assert!(outcome
         .err
         .contains("warning: port=if2 MULTI_QUEUE_ALLOWED rx-queues=4"));
+    host.assert_released();
+}
+
+/// H10: a session whose index no longer carries the configured device
+/// name is refused before attach (the sysctl checks named the device).
+#[test]
+fn a_port_renamed_before_attach_is_refused() {
+    let host = FakeHost {
+        renamed: Some(WAN),
+        ..FakeHost::default()
+    };
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
+    assert_eq!(outcome.status, EXIT_RUNTIME, "{}", outcome.err);
+    assert!(
+        outcome
+            .err
+            .contains("startup failed: stage=checks port=if2 code=UNVERIFIABLE probe=name"),
+        "{}",
+        outcome.err
+    );
+    assert!(!host
+        .events()
+        .iter()
+        .any(|event| matches!(event, Event::Attach(WAN, _))));
     host.assert_released();
 }
 
@@ -1635,7 +1686,15 @@ impl StopSignal for MeasuringStop {
 
 #[test]
 fn ticks_do_not_allocate() {
-    ticks_do_not_allocate_with(false);
+    ticks_do_not_allocate_with(false, false);
+}
+
+/// H10: the systemd watchdog ping (every millisecond here, so the
+/// measured ticks span several) is composed on the stack and sent on the
+/// socket opened at startup.
+#[test]
+fn ticks_with_watchdog_pings_do_not_allocate() {
+    ticks_do_not_allocate_with(false, true);
 }
 
 /// H9: the same with the blocking idle wait (the fake's wait log has its
@@ -1643,10 +1702,14 @@ fn ticks_do_not_allocate() {
 /// array that is allocated once at startup).
 #[test]
 fn ticks_with_idle_waits_do_not_allocate() {
-    ticks_do_not_allocate_with(true);
+    ticks_do_not_allocate_with(true, false);
 }
 
-fn ticks_do_not_allocate_with(waits: bool) {
+fn ticks_do_not_allocate_with(waits: bool, watchdog: bool) {
+    let listener = watchdog.then(super::notify::tests::Listener::bind);
+    if let Some(listener) = &listener {
+        set_notifier(listener.notifier(Some(1)));
+    }
     let host = FakeHost::default();
     host.state.waits.set(waits);
     host.state.wait_log.borrow_mut().reserve(1_000);
@@ -1687,6 +1750,16 @@ fn ticks_do_not_allocate_with(waits: bool) {
     );
     assert_eq!(outcome.status, 0, "{}", outcome.err);
     assert_eq!(counting::count() - before, 0, "allocation in the tick loop");
+    if let Some(listener) = listener {
+        let pings = listener
+            .messages()
+            .iter()
+            .filter(|message| *message == "WATCHDOG=1\n")
+            .count();
+        // About one per millisecond of the fake clock (10 us per reading).
+        assert!(pings >= 3, "{pings} pings");
+        assert!(outcome.out.contains("notify.failed=0\n"), "{}", outcome.out);
+    }
     let waited = host.state.wait_log.borrow().len();
     if waits {
         assert!(waited >= 190, "{waited} waits measured");
@@ -1733,6 +1806,21 @@ fn a_backend_stop_ends_the_run_with_exit_1() {
     );
     let err = String::from_utf8(err).expect("utf-8");
     assert!(err.contains("stopped after a backend fault"), "{err}");
+}
+
+thread_local! {
+    static NOTIFIER: RefCell<Option<super::notify::Notifier>> = const { RefCell::new(None) };
+}
+
+/// The notifier of the next `execute_with` (H10); disabled by default.
+pub(super) fn set_notifier(notifier: super::notify::Notifier) {
+    NOTIFIER.with(|slot| *slot.borrow_mut() = Some(notifier));
+}
+
+fn take_notifier() -> super::notify::Notifier {
+    NOTIFIER
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_else(super::notify::Notifier::disabled)
 }
 
 thread_local! {

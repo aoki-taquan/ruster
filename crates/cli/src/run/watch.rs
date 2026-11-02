@@ -40,6 +40,7 @@
 //! | event | outcome |
 //! |---|---|
 //! | the interface index is gone (`ENODEV`) | fatal `DEVICE_REMOVED` |
+//! | the interface index carries another name than the configured device (`IFLA_IFNAME`, H10) | fatal `DEVICE_RENAMED` |
 //! | MTU below the startup MTU (TX is bounded by the startup MTU, so longer frames than the device now carries could be published and stranded) | fatal `MTU_DECREASED` |
 //! | MTU above what a UMEM frame holds ([`super::checks::mtu_limit`]) | fatal `MTU_ABOVE_FRAME` |
 //! | MTU raised within the frame bound | warning `MTU_RAISED` (TX stays bounded by the startup MTU until a restart); recovered when it returns |
@@ -88,6 +89,29 @@
 //! 7 s ends the run (fail closed: the router does not run on without
 //! observing its ports). A watcher thread that died counts the same way.
 //!
+//! # Device identity (H10)
+//!
+//! The link query asks for the interface index the session opened, but
+//! the per-port sysctl paths (`conf/<dev>/...`) name the configured
+//! device. Every round therefore compares the index's `IFLA_IFNAME` with
+//! the configured name: a renamed port is fatal `DEVICE_RENAMED`, like
+//! `DEVICE_REMOVED`, and the rest of that port's round (its sysctl reads,
+//! which may belong to another device that took the old name, and its
+//! dumps) is not folded in. Why fatal rather than a warning with the paths
+//! re-resolved to the new name: the config names the device, so a run that
+//! followed the new name would no longer be what the config says, and a
+//! supervised restart under the same config would bind whatever device
+//! holds the old name then; and stopping detaches, which the startup
+//! checks then guard (fail closed, consistent with `DEVICE_REMOVED`).
+//! Since Linux 6.2 (commit bd039b5ea2a9) a device may be renamed while it
+//! is up, so the port can still forward when it happens: detection is
+//! bounded by one link round, so up to about 1 s of forwarding (the XDP
+//! attachment follows the index, not the name) and of sysctl reads through
+//! the old name (which may then name another device) can pass before the
+//! fatal. A rename after the link query and before the sysctl reads of the
+//! same round is caught by the next round; the reads in between can only
+//! warn or recover.
+//!
 //! A fatal event ends the run loop; the shutdown then drains, detaches,
 //! closes, and exits 1 (no silent continuation).
 
@@ -96,7 +120,7 @@ use std::fmt;
 use ruster_core::{FieldValue, FieldVisitor, IfId, MonotonicMillis, ObservableFields};
 
 use super::checks::mtu_limit;
-use super::netlink::{LinkFacts, NetlinkError};
+use super::netlink::{IfName, LinkFacts, NetlinkError};
 use super::workers::LinkRound;
 
 /// The kernel IPv6 facts of one port in one link round.
@@ -261,6 +285,8 @@ impl Forwarding {
 pub struct LinkTarget {
     pub interface: IfId,
     pub ifindex: u32,
+    /// The configured device name, which the index must keep (H10).
+    pub name: IfName,
     /// The MTU at startup, which bounds the adapter's TX.
     pub mtu: u32,
     /// The longest frame a UMEM frame holds.
@@ -333,6 +359,8 @@ pub enum Fatal {
     TxStall,
     KickErrors,
     DeviceRemoved,
+    /// The interface index now carries another name (H10).
+    DeviceRenamed,
     MtuDecreased,
     MtuAboveFrame,
     LinkUnverifiable,
@@ -344,6 +372,7 @@ impl Fatal {
             Self::TxStall => "TX_STALL",
             Self::KickErrors => "KICK_ERRORS",
             Self::DeviceRemoved => "DEVICE_REMOVED",
+            Self::DeviceRenamed => "DEVICE_RENAMED",
             Self::MtuDecreased => "MTU_DECREASED",
             Self::MtuAboveFrame => "MTU_ABOVE_FRAME",
             Self::LinkUnverifiable => "LINK_UNVERIFIABLE",
@@ -644,6 +673,15 @@ impl Watch {
                 );
             }
             self.on_link(index, port.link, emit);
+            // A removed or renamed port's sysctl paths may name another
+            // device now: nothing else of this port's round is read.
+            if self
+                .ports
+                .get(index)
+                .is_some_and(|watch| watch.lost(&port.link))
+            {
+                continue;
+            }
             if let Some(addresses) = port.addresses {
                 self.on_addresses(index, addresses, emit);
             }
@@ -951,6 +989,15 @@ impl PortWatch {
         });
     }
 
+    /// Whether `link` says the port is no longer the configured device:
+    /// its index is gone, or carries another name.
+    fn lost(&self, link: &Result<LinkFacts, NetlinkError>) -> bool {
+        match link {
+            Ok(facts) => facts.name != self.target.name,
+            Err(error) => error.is_no_device(),
+        }
+    }
+
     fn fatal(&self, cause: Fatal, emit: &mut impl FnMut(WatchEvent)) {
         emit(WatchEvent::Fatal {
             port: self.target.interface,
@@ -1243,6 +1290,10 @@ impl PortWatch {
                 return;
             }
         };
+        if facts.name != self.target.name {
+            self.fatal(Fatal::DeviceRenamed, emit);
+            return;
+        }
         self.probe_ok(Query::Link, emit);
         self.counters.mtu = facts.mtu;
         if facts.mtu < self.target.mtu {

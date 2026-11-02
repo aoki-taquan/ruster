@@ -488,6 +488,7 @@ fn a_finished_round_is_folded_before_the_next_is_due() {
     let targets = [LAN, WAN].map(|id| LinkTarget {
         interface: IfId(id),
         ifindex: fake_ifindex(id),
+        name: super::device_name(id),
         mtu: 1500,
         frame_capacity: 1792,
     });
@@ -498,6 +499,7 @@ fn a_finished_round_is_folded_before_the_next_is_due() {
         watch: Watch::new(&targets, Thresholds::default()),
         links,
         idle: crate::run::engine::IdleCounters::default(),
+        notify: crate::run::notify::Notifier::disabled(),
     };
     let settings = LoopSettings {
         stats_interval_ms: 0,

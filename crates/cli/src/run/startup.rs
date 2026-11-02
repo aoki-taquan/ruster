@@ -29,10 +29,10 @@ use ruster_io_xdp_native::{
 };
 
 use super::checks::{
-    evaluate_device, CheckFailure, CheckPolicy, DeviceFacts, PrivilegeFailure, Warnings,
+    evaluate_device, CheckFailure, CheckPolicy, DeviceFacts, PrivilegeFailure, Probe, Warnings,
 };
 use super::engine::{port_label, Datapath, LinkMonitor, StopSignal};
-use super::netlink::NetlinkError;
+use super::netlink::{IfName, NetlinkError};
 use super::privileges::{DropFailure, DropReport, Identity, PrivilegePolicy};
 use super::seccomp::{ConfineFailure, ConfineReport, SeccompMode};
 use super::watch::LinkTarget;
@@ -448,6 +448,7 @@ pub const fn link_target(interface: IfId, facts: &DeviceFacts) -> LinkTarget {
     LinkTarget {
         interface,
         ifindex: facts.ifindex,
+        name: facts.link_name,
         mtu: facts.session_mtu,
         frame_capacity: facts.frame_capacity,
     }
@@ -488,6 +489,7 @@ pub fn open_ports<H: PortHost, S: StopSignal>(
             link: LinkTarget {
                 interface,
                 ifindex: 0,
+                name: IfName::DEFAULT,
                 mtu: 0,
                 frame_capacity: 0,
             },
@@ -498,6 +500,15 @@ pub fn open_ports<H: PortHost, S: StopSignal>(
         let facts = host
             .inspect(port, &entry.session)
             .map_err(|failure| fail(Stage::Checks, Failure::Check(failure)))?;
+        // The session's index must still carry the configured name: the
+        // sysctl paths of the checks and of the link watch name the
+        // device (H10; the watch then compares it every round).
+        if IfName::new(port.device().as_bytes()) != Some(facts.link_name) {
+            return Err(fail(
+                Stage::Checks,
+                Failure::Check(CheckFailure::Unverifiable(Probe::Name)),
+            ));
+        }
         let warnings = evaluate_device(&facts, policy)
             .map_err(|failure| fail(Stage::Checks, Failure::Check(failure)))?;
         entry.link = link_target(interface, &facts);

@@ -74,10 +74,10 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
 - `ruster-cli`: binary `ruster`。手書きarg parsingで`validate`/`plan`/`run-sim`と、M2 S10a/S10bの
   `run`（x86_64 LinuxのAF_XDP static router、下の「`ruster run`」）を提供し、SIGINT/SIGTERMは
   private FFIのhandlerがstatic `AtomicBool`へswap/storeするだけです（二回目のsignalはforce
-  flag。`run`のSIGHUPはreload flagへstoreするだけ）。`unsafe`はそのhandler、`run`のrtnetlink
+  flag。`run`のSIGHUPはreload flag、SIGUSR1はstats flagへstoreするだけ）。`unsafe`はそのhandler、`run`のrtnetlink
   query（IPv4/IPv6のaddress dump、全tableのroute dump、link）、起動後のprivilege drop
   （threadごとの`prctl`/`capset`/`setresuid`等のraw syscall）とseccomp filterのinstall
-  （`prctl`/`seccomp`のraw syscall）だけです（下の「使い方」）。
+  （`prctl`/`seccomp`のraw syscall）、systemd reload通知の`clock_gettime(CLOCK_MONOTONIC)`だけです（下の「使い方」）。
   外部crateを直接には追加しません。
 - `ruster-bench`: NIC-freeなsim smoke/datapath benchmarkとhardware benchmark plan/
   measurement protocol/artifact v1のschema検証。sim結果からproduction性能を主張しない。
@@ -850,13 +850,15 @@ sudo kill -HUP <pid>                                               # configをre
   警告行）。各queryの失敗は種類ごとに数え3回連続でfatal（IPv6は`--allow-kernel-ipv6`なら
   `IPV6_UNVERIFIABLE` warning）。
   link downはwarningと計数だけで動き続け、upで`recovered`になりowed kickが再開します。device削除
-  （`DEVICE_REMOVED`）、startup MTU未満へのMTU低下（`MTU_DECREASED`）、frameに収まらないMTU
+  （`DEVICE_REMOVED`）、portのrename（`IFLA_IFNAME`が設定の`device`と違う`DEVICE_RENAMED`、H10。
+  sysctl pathは名前で引くので、旧名を取った別deviceを読まないようfail closed）、startup MTU未満へのMTU低下（`MTU_DECREASED`）、frameに収まらないMTU
   （`MTU_ABOVE_FRAME`）、3回連続のlink query失敗はfatalです。fatalはdrain・detach・closeの後
   exit 1（`stopped after a fatal health event port=if<id> code=...`）。statsは`watch.state`、
   `if<id>.watch.*`。行はすべて`warning:|recovered:|fatal: port=if<id> health=<CODE>`のvalue-free形式。
-- stats: `ruster-run-stats kind=periodic|final uptime-ms=N`の後に`section.key=value`行
+- stats: `ruster-run-stats kind=periodic|on-demand|final uptime-ms=N`（`on-demand`はSIGUSR1、H10。100 msに一つまで、その間のSIGUSR1はまとめて後で一つ。
+  受け取ったものは次のtick間で一つにまとめて出し、periodicの間隔は変えない）の後に`section.key=value`行
   （`observer.*`、`health.*`、`tick.*`、`rx.*`、`drop.*`、`af_xdp.*`、`if<id>.af_xdp_port.*`、
-  `reload.*`、`idle.*`、`watch.*`（`watch.link_rounds`/`link_rounds_late`/`link_rounds_stale`を含む）、
+  `reload.*`、`idle.*`、`notify.*`、`watch.*`（`watch.link_rounds`/`link_rounds_late`/`link_rounds_stale`を含む）、
   `if<id>.watch.*`等）と
   `end`。counterとlabelだけでaddress、MAC、device名、key、seedは出しません。
 - idle時は64 tick spinした後、全portのAF_XDP socketへ`POLLIN`の`poll()`で待ちます（H9。`pollfd`
@@ -875,7 +877,14 @@ sudo kill -HUP <pid>                                               # configをre
   `CAP_SETUID`/`CAP_SETGID`不足、drop後のteardownに権限が要るkernelを含む）。privilege dropの
   失敗は`1`。seccomp filterのinstall失敗も`1`、filterによるkillはSIGSYS（shellでは159）。
   reloadの拒否・失敗では終了しません。
-- multi-queue、systemd notify、SIGUSR1 stats、chroot/mount namespaceはdeferred
+- systemd通知（H10、`sd_notify`）: `NOTIFY_SOCKET`がある時だけ、起動の最初（threadが一つの間）に
+  環境変数を読んで消し、`AF_UNIX` datagram socketを一つ開きます（privilege dropとseccompの前。以後は
+  既存fdへの`sendto`だけでallowlistは不変）。readiness行の後に`READY=1`、SIGHUP reloadの開始で
+  `RELOADING=1`と`MONOTONIC_USEC=`、終わりで`READY=1`、loopの終わりで`STOPPING=1`、`WATCHDOG_USEC`が
+  あればその半分ごとにrouter threadのtick間から`WATCHDOG=1`（止まったrouterはpingしない）。送信は
+  blockせず、失敗は`notify.failed`。不正な`NOTIFY_SOCKET`/`WATCHDOG_*`は`stage=notify`でexit 1。
+  unit例は`Type=notify-reload`と`WatchdogSec=`（runbookの2章）。
+- multi-queue、chroot/mount namespace、structured logはdeferred
   （requirements CLI-034、runbookの「Known limits」）。
 
 ### packet backend（`[backend]`）
@@ -987,6 +996,7 @@ M2 S10bのops phase（一つの稼働中routerでSIGHUP reloadによりUDP rule�
 MTUをframe上限超へ上げるとexit 1でdetach）、kernel forwardingの段（`ip_forward=1`の起動拒否、
 overrideでのwarning、稼働中のwarningとrecovered。M2 S11で`ip_forward=0`のまま
 `conf/ra/forwarding=1`の起動拒否`scope=device`と稼働中のif1だけのwarning/recoveredを追加）、
+H10のsystemd phase（work directoryのdatagram socketをpython受信者がsystemdの代わりに受け、`NOTIFY_SOCKET`と`WATCHDOG_USEC=400000`、実行userへの切り替え、既定の`--seccomp kill`の下で`READY=1`が最初、2 sに6〜14回の`WATCHDOG=1`、reloadで`RELOADING=1`（`MONOTONIC_USEC`付き）と generation 2の`READY=1`、SIGUSR1で`kind=on-demand` block、`STOPPING=1`が最後）とrename phase（稼働中に`ip link set ra down`と`name rx`でexit 1 `DEVICE_RENAMED`、attachが残らない）、
 読まれないFIFOへstdoutを向けたstuck phase（FIFOがcapacityまで埋まり動かないことを`FIONREAD`で
 確かめてからSIGTERM、有界時間でexit 0）、最後にrouter netns内でraのvethを削除するとexit 1
 （`DEVICE_REMOVED`）で何もattachが残らないことを確認し、成否によらず三つのnetnsを削除します。

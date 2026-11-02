@@ -13,12 +13,14 @@ const TARGETS: [LinkTarget; 2] = [
     LinkTarget {
         interface: IfId(1),
         ifindex: 11,
+        name: crate::run::netlink::IfName::literal(b"veth0"),
         mtu: 1500,
         frame_capacity: 1792,
     },
     LinkTarget {
         interface: IfId(2),
         ifindex: 12,
+        name: crate::run::netlink::IfName::literal(b"veth0"),
         mtu: 1500,
         frame_capacity: 1792,
     },
@@ -63,6 +65,7 @@ impl LinkMonitor for Monitor {
             return Err(NetlinkError::Errno(110));
         }
         Ok(LinkFacts {
+            name: target.name,
             mtu: target.mtu + 1,
             rx_queues: Some(1),
             admin_up: true,

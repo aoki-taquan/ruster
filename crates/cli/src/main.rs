@@ -9,7 +9,8 @@
 //!   `ruster-run-sim/v1` JSONL on stdout, human summary on stderr.
 //! - `ruster run --config <config.toml>`: the AF_XDP static router (x86_64
 //!   Linux); stats blocks on stdout, progress and diagnostics on stderr;
-//!   SIGHUP reloads the config.
+//!   SIGHUP reloads the config, SIGUSR1 prints a stats block, and with
+//!   `NOTIFY_SOCKET` it notifies systemd (`sd_notify`).
 //!
 //! Exit status: 0 success (also a restart-required plan, and an ordered
 //! shutdown after SIGINT/SIGTERM), 1 runtime, I/O, invariant, or scenario
@@ -18,12 +19,13 @@
 //! `run` adds 3 (shutdown deadline with TX frames still in the kernel) and
 //! 4 (missing privilege or memlock, or a privilege drop that cannot work).
 //!
-//! The only `unsafe` code is FFI in four private modules: the signal
+//! The only `unsafe` code is FFI in five private modules: the signal
 //! handlers (`signal`), the rtnetlink queries of `ruster run`'s startup
 //! check and link watch (`run::netlink`), the per-thread credential
-//! syscalls of `ruster run`'s privilege drop (`run::privileges`), and the
+//! syscalls of `ruster run`'s privilege drop (`run::privileges`), the
 //! `prctl`/`seccomp` calls that install its syscall filter
-//! (`run::seccomp`).
+//! (`run::seccomp`), and the `clock_gettime(CLOCK_MONOTONIC)` of its
+//! systemd reload notification (`run::notify`).
 
 mod args;
 mod config_cmd;

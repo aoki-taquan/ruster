@@ -28,7 +28,8 @@
 //! replaced, so an aborted dump never leaves a running dump behind that
 //! would make the next request fail with `EBUSY`.
 //! - Link facts of one interface index through one `RTM_GETLINK` request
-//!   ([`LinkProbe`]): MTU, `IFLA_NUM_RX_QUEUES`, and the `IFF_UP` /
+//!   ([`LinkProbe`]): the device name (`IFLA_IFNAME`, H10), MTU,
+//!   `IFLA_NUM_RX_QUEUES`, and the `IFF_UP` /
 //!   `IFF_LOWER_UP` flags, in the caller's network namespace (a netlink
 //!   socket always talks to its own namespace, unlike a sysfs mount). Used
 //!   by the startup check and by the run-time link watch, which reuses one
@@ -86,6 +87,10 @@ const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 /// `sizeof(struct ifinfomsg)`.
 const IFINFOMSG_LEN: usize = 16;
+/// `IFLA_IFNAME` (NUL-terminated string, at most `IFNAMSIZ` bytes).
+const IFLA_IFNAME: u16 = 3;
+/// `IFNAMSIZ`: a device name and its NUL.
+pub const IFNAMSIZ: usize = 16;
 /// `IFLA_MTU` (`u32`).
 const IFLA_MTU: u16 = 4;
 /// `IFLA_NUM_RX_QUEUES` (`u32`, `dev->num_rx_queues`; absent without
@@ -534,9 +539,85 @@ fn multipath_through(nexthops: &[u8], ifindex: u32) -> Result<bool, NetlinkError
     Ok(through)
 }
 
+/// A device name of 1 to `IFNAMSIZ - 1` bytes without NUL, held inline
+/// (`Copy`, no allocation), so the link watch can compare the kernel's
+/// `IFLA_IFNAME` with the configured device on every round.
+///
+/// Not an observable value: names never appear in a stats block or an
+/// event line (redaction, [`super::stats`]).
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub struct IfName {
+    bytes: [u8; IFNAMSIZ],
+    len: u8,
+}
+
+impl IfName {
+    /// No name (all zero; never equal to a valid one).
+    pub const DEFAULT: Self = Self {
+        bytes: [0; IFNAMSIZ],
+        len: 0,
+    };
+
+    /// `name` if it is 1 to `IFNAMSIZ - 1` bytes long and holds no NUL.
+    pub const fn new(name: &[u8]) -> Option<Self> {
+        if name.is_empty() || name.len() >= IFNAMSIZ {
+            return None;
+        }
+        let mut bytes = [0_u8; IFNAMSIZ];
+        let mut at = 0;
+        while at < name.len() {
+            if name[at] == 0 {
+                return None;
+            }
+            bytes[at] = name[at];
+            at += 1;
+        }
+        // Below IFNAMSIZ (16), so the cast is exact.
+        #[allow(clippy::cast_possible_truncation)]
+        let len = name.len() as u8;
+        Some(Self { bytes, len })
+    }
+
+    /// A valid name known at compile time (tests).
+    #[cfg(test)]
+    pub const fn literal(name: &[u8]) -> Self {
+        match Self::new(name) {
+            Some(name) => name,
+            None => panic!("not a device name"),
+        }
+    }
+
+    /// The name's bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+impl fmt::Debug for IfName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Only tests print it (assertions); never a run-time line.
+        write!(formatter, "IfName(\"{}\")", self.as_bytes().escape_ascii())
+    }
+}
+
+/// The `IFLA_IFNAME` payload: the bytes before the first NUL, which the
+/// kernel always sends (`nla_put_string`). No NUL, an empty name, or one
+/// of `IFNAMSIZ` bytes or more fails closed.
+fn ifname_payload(payload: &[u8]) -> Result<IfName, NetlinkError> {
+    let end = payload
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(NetlinkError::Malformed)?;
+    IfName::new(&payload[..end]).ok_or(NetlinkError::Malformed)
+}
+
 /// Link facts of one interface from an `RTM_NEWLINK` reply.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LinkFacts {
+    /// `IFLA_IFNAME`: the device's current name (the per-port sysctl
+    /// paths are built from the configured name, so the watch compares
+    /// them, H10).
+    pub name: IfName,
     /// `IFLA_MTU`.
     pub mtu: u32,
     /// `IFLA_NUM_RX_QUEUES` (`dev->num_rx_queues`, the allocated RX queue
@@ -583,7 +664,8 @@ pub fn link_request(sequence: u32, ifindex: u32) -> [u8; HEADER_LEN + IFINFOMSG_
 /// malformed: a single request has no dump end); any other message type; a
 /// short header, `ifinfomsg`, or attribute; an attribute running past its
 /// message; a duplicated or wrongly sized `IFLA_MTU`/`IFLA_NUM_RX_QUEUES`;
-/// and a reply without `IFLA_MTU`.
+/// a duplicated, unterminated, empty, or too long `IFLA_IFNAME`; and a
+/// reply without `IFLA_MTU` or `IFLA_IFNAME`.
 pub fn parse_link_reply(
     datagram: &[u8],
     sequence: u32,
@@ -648,7 +730,14 @@ fn parse_link(message: &[u8], ifindex: u32) -> Result<LinkFacts, NetlinkError> {
     let flags = u32_at(message, HEADER_LEN + 8).ok_or(NetlinkError::Malformed)?;
     let mut mtu = None;
     let mut rx_queues = None;
+    let mut name = None;
     attributes(message, HEADER_LEN + IFINFOMSG_LEN, |kind, payload| {
+        if kind == IFLA_IFNAME {
+            if name.replace(ifname_payload(payload)?).is_some() {
+                return Err(NetlinkError::Malformed);
+            }
+            return Ok(());
+        }
         let slot = match kind {
             IFLA_MTU => &mut mtu,
             IFLA_NUM_RX_QUEUES => &mut rx_queues,
@@ -660,6 +749,7 @@ fn parse_link(message: &[u8], ifindex: u32) -> Result<LinkFacts, NetlinkError> {
         Ok(())
     })?;
     Ok(LinkFacts {
+        name: name.ok_or(NetlinkError::Malformed)?,
         mtu: mtu.ok_or(NetlinkError::Malformed)?,
         rx_queues,
         admin_up: flags & IFF_UP != 0,
@@ -1620,6 +1710,7 @@ mod tests {
         assert_eq!(
             parse_link_reply(&reply, 7, PORT, 5),
             Ok(Some(LinkFacts {
+                name: IfName::new(b"ra").expect("name"),
                 mtu: 1500,
                 rx_queues: Some(4),
                 admin_up: true,
@@ -1644,6 +1735,57 @@ mod tests {
         late.extend(reply.clone());
         assert!(parse_link_reply(&late, 7, PORT, 5).expect("ok").is_some());
         assert_eq!(parse_link_reply(&[], 7, PORT, 5), Ok(None));
+    }
+
+    /// A link reply without the fixed `IFLA_IFNAME` of [`link`].
+    fn link_named(index: u32, names: &[&[u8]], attributes: &[Vec<u8>]) -> Vec<u8> {
+        let mut payload = ifinfo(index, UP);
+        for name in names {
+            payload.extend(attribute(IFLA_IFNAME, name));
+        }
+        for attribute in attributes {
+            payload.extend_from_slice(attribute);
+        }
+        message(RTM_NEWLINK, 0, 7, &payload)
+    }
+
+    #[test]
+    fn link_replies_carry_the_device_name() {
+        let mtu = attribute(IFLA_MTU, &1500_u32.to_ne_bytes());
+        let parse = |names: &[&[u8]]| {
+            parse_link_reply(
+                &link_named(5, names, std::slice::from_ref(&mtu)),
+                7,
+                PORT,
+                5,
+            )
+            .map(|facts| facts.map(|facts| facts.name))
+        };
+        let name = |bytes: &[u8]| IfName::new(bytes).expect("name");
+        assert_eq!(parse(&[b"rx\0"]), Ok(Some(name(b"rx"))));
+        // The longest name (15 bytes), and padding after the NUL.
+        assert_eq!(
+            parse(&[b"abcdefghijklmno\0"]),
+            Ok(Some(name(b"abcdefghijklmno")))
+        );
+        assert_eq!(parse(&[b"rb\0\0\0"]), Ok(Some(name(b"rb"))));
+        assert_ne!(name(b"ra"), name(b"rb"));
+        assert_ne!(name(b"ra"), name(b"ra0"));
+        // Missing, duplicated (even equal), unterminated, empty, too long.
+        for names in [
+            &[][..],
+            &[&b"ra\0"[..], &b"ra\0"[..]][..],
+            &[&b"ra"[..]][..],
+            &[&b"\0"[..]][..],
+            &[&b""[..]][..],
+            &[&b"abcdefghijklmnop\0"[..]][..],
+        ] {
+            assert_eq!(parse(names), Err(NetlinkError::Malformed), "{names:?}");
+        }
+        assert_eq!(IfName::new(b""), None);
+        assert_eq!(IfName::new(b"a\0b"), None);
+        assert_eq!(IfName::new(&[b'a'; IFNAMSIZ]), None);
+        assert_eq!(name(b"wan0").as_bytes(), b"wan0");
     }
 
     #[test]

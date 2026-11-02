@@ -11,7 +11,9 @@
 //! the [`TickObserver`], samples the O(1) state-table occupancy, and asks
 //! [`IdleBackoff`] whether to pause. Nothing on this path allocates,
 //! formats, or locks; the cold work between ticks is the periodic stats
-//! block (at most once per interval), a SIGHUP reload (only on request; see
+//! block (at most once per interval), an on-demand stats block after a
+//! SIGUSR1 (H10), the systemd watchdog ping when due ([`Notifier`]; a
+//! stack-composed `sendto`, no allocation), a SIGHUP reload (only on request; see
 //! [`super::reload`]), the health sample of [`super::watch`] (at most every
 //! 500 ms), and the link round: requested from the link watcher thread at
 //! most every 1 s and folded in when it came back ([`super::workers`], H7).
@@ -53,7 +55,8 @@
 //!   tick cadence those depend on stays what it was before H9 (about one
 //!   tick per millisecond when idle);
 //! - never past the loop's own next deadline (periodic stats, health
-//!   sample, link round; [`Watch::next_due`]).
+//!   sample, link round, [`Watch::next_due`]; the systemd watchdog ping,
+//!   [`Notifier::watchdog_due`]).
 //!
 //! A wait that reported RX readiness must be followed by a busy tick; if
 //! the next tick is idle anyway (readiness that RX cannot consume), the
@@ -84,10 +87,16 @@ use ruster_runtime::{
 };
 
 use super::netlink::{LinkFacts, NetlinkError};
+use super::notify::{Notifier, NotifyCounters};
 use super::reload::{ReloadCounters, Reloader, TickApply};
+use super::stats::BlockKind;
 use super::watch::{Fatal, Forwarding, Ipv6Sample, LinkTarget, PortSample, Watch, WatchEvent};
 use super::workers::LinkWatcher;
 
+/// Shortest time between two on-demand stats blocks (SIGUSR1, H10):
+/// requests within it coalesce into one block printed once it passed, so
+/// a SIGUSR1 flood cannot keep the router thread formatting stats.
+pub const ON_DEMAND_STATS_MIN_MS: u64 = 100;
 /// Idle ticks before the loop starts to wait.
 pub const SPIN_TICKS: u32 = 64;
 /// Pause of a tick held back by a pending reload's quiescence.
@@ -256,6 +265,11 @@ pub trait StopSignal {
     fn take_reload(&self) -> bool {
         false
     }
+    /// Takes a pending on-demand stats request (SIGUSR1, H10; once per
+    /// request).
+    fn take_stats(&self) -> bool {
+        false
+    }
 }
 
 /// The process signal flags of [`crate::signal`].
@@ -272,6 +286,10 @@ impl StopSignal for ProcessSignals {
 
     fn take_reload(&self) -> bool {
         crate::signal::take_reload_request()
+    }
+
+    fn take_stats(&self) -> bool {
+        crate::signal::take_stats_request()
     }
 }
 
@@ -503,6 +521,42 @@ impl BackendWatch {
     }
 }
 
+/// The SIGUSR1 rate limit: at most one on-demand block per
+/// [`ON_DEMAND_STATS_MIN_MS`]; a request within it stays pending (any
+/// number of them make one block) until the interval passed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OnDemandStats {
+    pending: bool,
+    last: Option<MonotonicMillis>,
+}
+
+impl OnDemandStats {
+    /// Records whether a request was `taken` at `now`; returns whether a
+    /// block is printed now.
+    pub fn due(&mut self, now: MonotonicMillis, taken: bool) -> bool {
+        self.pending |= taken;
+        let ready = self
+            .last
+            .is_none_or(|last| now.0.saturating_sub(last.0) >= ON_DEMAND_STATS_MIN_MS);
+        if self.pending && ready {
+            self.pending = false;
+            self.last = Some(now);
+            return true;
+        }
+        false
+    }
+
+    /// When a pending request may print (the idle wait ends by then).
+    pub fn next_due(&self) -> Option<MonotonicMillis> {
+        self.pending.then(|| {
+            MonotonicMillis(
+                self.last
+                    .map_or(0, |last| last.0.saturating_add(ON_DEMAND_STATS_MIN_MS)),
+            )
+        })
+    }
+}
+
 /// Why the run loop returned.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoopEnd {
@@ -536,19 +590,21 @@ pub struct LoopSettings {
 }
 
 /// The cold-path control of the loop: reload, health, and link watch,
-/// and the idle wait counters.
+/// the idle wait counters, and the service notifier (H10).
 pub struct Control {
     pub reloader: Reloader,
     pub watch: Watch,
     pub links: LinkWatcher,
     pub idle: IdleCounters,
+    pub notify: Notifier,
 }
 
-/// What a periodic stats block reads besides the publication and backend.
+/// What a stats block reads besides the publication and backend.
 pub struct RunStatus<'a> {
     pub reload: ReloadCounters,
     pub watch: &'a Watch,
     pub idle: IdleCounters,
+    pub notify: NotifyCounters,
 }
 
 /// Runs ticks until a stop request, a backend stop, or a fatal watch
@@ -556,7 +612,10 @@ pub struct RunStatus<'a> {
 /// worker; its prepared candidate, once dry-run and once the backend is
 /// quiescent, rides the next tick's publication phase; the health watch
 /// samples and the link watcher is asked for a round at their intervals;
-/// `periodic` is called once per `stats_interval_ms`. Lines go to `err`.
+/// the systemd watchdog is pinged when due ([`Notifier`], H10);
+/// `stats` is called with [`BlockKind::Periodic`] once per
+/// `stats_interval_ms` and with [`BlockKind::OnDemand`] after a SIGUSR1
+/// ([`StopSignal::take_stats`]). Lines go to `err`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_loop<'s, D, C, S, E, F>(
     active: &mut ActivePublication<'s, D::Io>,
@@ -567,18 +626,26 @@ pub fn run_loop<'s, D, C, S, E, F>(
     settings: LoopSettings,
     control: &mut Control,
     err: &mut E,
-    mut periodic: F,
+    mut stats: F,
 ) -> LoopEnd
 where
     D: Datapath,
     C: Clock,
     S: StopSignal,
     E: Write,
-    F: FnMut(&ActivePublication<'s, D::Io>, &D, &TickObserver, &RunStatus<'_>, MonotonicMillis),
+    F: FnMut(
+        BlockKind,
+        &ActivePublication<'s, D::Io>,
+        &D,
+        &TickObserver,
+        &RunStatus<'_>,
+        MonotonicMillis,
+    ),
 {
     let mut backoff = IdleBackoff::default();
     let mut wedge = BackendWatch::default();
     let mut last_stats = clock.now();
+    let mut on_demand_stats = OnDemandStats::default();
     let mut budgets = control.reloader.budgets();
     loop {
         if stop.stop() {
@@ -598,6 +665,7 @@ where
                 err,
                 "ruster run: reload requested (generation {generation})"
             );
+            control.notify.reloading(generation.get());
             if let Some(outcome) = control.reloader.request(generation, now) {
                 let _ = writeln!(err, "ruster run: {outcome}");
             }
@@ -712,6 +780,11 @@ where
                 return LoopEnd::Invariant;
             }
         }
+        // Every way a reload ends (applied, refused, failed, abandoned)
+        // leaves the reloader idle by here.
+        control
+            .notify
+            .reload_settled(control.reloader.busy(), generation.get());
         let occupancy = ServiceOccupancy::capture(
             active.icmpv4_errors(),
             active.nat44_udp(),
@@ -727,16 +800,39 @@ where
         if let Some(end) = watch_step(datapath, control, now, settings, err) {
             return end;
         }
-        if settings.stats_interval_ms != 0
-            && now.0.saturating_sub(last_stats.0) >= settings.stats_interval_ms
-        {
-            last_stats = now;
+        // Here, between ticks, so a router stuck anywhere stops pinging.
+        control.notify.watchdog(now);
+        let periodic = settings.stats_interval_ms != 0
+            && now.0.saturating_sub(last_stats.0) >= settings.stats_interval_ms;
+        let on_demand = on_demand_stats.due(now, stop.take_stats());
+        if periodic || on_demand {
             let status = RunStatus {
                 reload: control.reloader.counters(),
                 watch: &control.watch,
                 idle: control.idle,
+                notify: control.notify.counters(),
             };
-            periodic(active, datapath, observer, &status, now);
+            if periodic {
+                last_stats = now;
+                stats(
+                    BlockKind::Periodic,
+                    active,
+                    datapath,
+                    observer,
+                    &status,
+                    now,
+                );
+            }
+            if on_demand {
+                stats(
+                    BlockKind::OnDemand,
+                    active,
+                    datapath,
+                    observer,
+                    &status,
+                    now,
+                );
+            }
         }
         match backoff.after_tick(busy) {
             IdleAction::Spin => {}
@@ -757,10 +853,15 @@ where
                 let watch_due = control
                     .watch
                     .next_due(settings.health_interval_ms, settings.link_interval_ms);
-                let deadline = match (stats_due, watch_due) {
-                    (Some(a), Some(b)) => Some(a.min(b)),
-                    (a, b) => a.or(b),
-                };
+                let deadline = [
+                    stats_due,
+                    watch_due,
+                    control.notify.watchdog_due(),
+                    on_demand_stats.next_due(),
+                ]
+                .into_iter()
+                .flatten()
+                .min();
                 let timeout = idle_timeout_ms(now, settings.idle_wait_ms, pending, deadline);
                 // Shortened only if the pending cap, not a deadline or the
                 // configured wait, set this timeout.
