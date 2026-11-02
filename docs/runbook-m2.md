@@ -963,7 +963,9 @@ Unsolicited inbound TCP SYNs (B3, RFC 5382 REQ-4). A SYN from the WAN to a
 public port with no mapping (or one the NAT filtering refuses) is still
 dropped silently at once (`drop.NAT44_TCP_MAPPING_MISS` /
 `drop.NAT44_TCP_SESSION_MISS`). By default (`[nat44.tcp]
-unsolicited-syn-icmp = true`) the router also holds a copy for 6 s and then
+unsolicited-syn-icmp = true`) the router also holds a copy for 6 s (plus a
+2 ms clock margin, `NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS`, so the
+millisecond loop clock never shortens the RFC minimum) and then
 sends one ICMP Port Unreachable (Type 3, Code 3) to the sender, unless an
 inside host opened the same connection in the meantime.
 
@@ -1217,7 +1219,8 @@ What it proves, on the runner's kernel only:
   Added by B3, with a rule that admits new WAN -> LAN TCP flows to every
   destination: a raw TCP SYN from host B to an unmapped public port gets
   exactly one ICMP Port Unreachable from 203.0.113.2, no earlier than 6 s
-  after the SYN, quoting it. After a reloadable SIGHUP to
+  after the SYN (measured from after `sendto` returned, the latest
+  send-side reading), quoting it. After a reloadable SIGHUP to
   `unsolicited-syn-icmp = false`, nothing arrives within 9 s. After a SIGHUP
   back to router-v1's default-deny firewall (switch on), nothing arrives
   within 9 s either (`unsolicited_syn_firewall_denied`).

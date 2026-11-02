@@ -688,8 +688,12 @@ NAT planがfirewallより先に走るため、NATが許可しfirewallが拒否�
   =slot数、walk/insertは最大16 node、超過は満杯と同じfail closed）。占有slotはdeadline順FIFO、
   空きはfree list（どちらもO(1)の`slot_list`）。packetはcloneせずquoteを既存slotへcopyするだけで
   allocationしない。満杯はevictせずsilent drop（REQ-4 a）。
-- **Timer.** 期限は受信時刻 + `NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`（6000）。受信時刻はNAT clock
-  watermarkで単調なのでFIFO先頭が最早期限で、満了判定は先頭checkだけ。同じconnectionの再SYNは
+- **Timer.** 期限は受信時刻 + `NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`（6000）+
+  `NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS`（2）。受信時刻はtickのclock読み値（ms切り捨て、
+  RX phaseの前に読む）なので真の受信より最大で切り捨て<1 ms + 読み値からRX ringを読むまで
+  （publication phaseだけ、≤1 ms）早い。2 msのmarginで、満了tick（読み値≥期限、送信はその後）
+  のICMPが真の受信から6秒より前に出ることはない。idle sleepはtick後なので遅く記録されるだけ。
+  受信時刻はNAT clock watermarkで単調なのでFIFO先頭が最早期限で、満了判定は先頭checkだけ。同じconnectionの再SYNは
   holdを増やさず、期限をその受信+6秒に延ばして末尾へ移す（どの受信SYNにも6秒以内に応答しない）。
   TCP sequence numberが同じ再送ならquoteは最初のSYNのまま、違う再接続ならquoteを最新SYNで置き
   換える（引用sequenceを検証する相手が受理できるように）。

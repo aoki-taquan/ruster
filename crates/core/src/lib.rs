@@ -97,7 +97,8 @@ pub use nat44::{
     NAT44_UDP_MIN_IDLE_TTL_MS,
 };
 pub use nat44_syn_hold::{
-    Nat44TcpSynHoldSlot, NAT44_TCP_SYN_HOLD_CHAIN_LIMIT, NAT44_TCP_UNSOLICITED_SYN_HOLD_MS,
+    Nat44TcpSynHoldSlot, NAT44_TCP_SYN_HOLD_CHAIN_LIMIT, NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS,
+    NAT44_TCP_UNSOLICITED_SYN_HOLD_MS,
 };
 pub(crate) use observability::OccupancyCounter;
 pub use observability::{
