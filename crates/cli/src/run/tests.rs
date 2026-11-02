@@ -23,6 +23,7 @@ use super::engine::{
     Clock, ClockedIo, Datapath, DrainProgress, IdleAction, IdleBackoff, IdleWake, LinkMonitor,
     StopSignal, WaitError, DRAIN_DEADLINE_MS, DRAIN_ROUNDS, SHORT_WAIT_MS, SPIN_TICKS,
 };
+use super::fs_confine::{FsConfineMode, FsFailure, FsReport};
 use super::netlink::{LinkFacts, NetlinkError};
 use super::privileges::{Bounding, DropFailure, DropReport, Identity, PrivilegePolicy};
 use super::reload::ConfigSource;
@@ -145,6 +146,9 @@ struct State {
     lockdowns: RefCell<Vec<Lockdown>>,
     /// Each `confine` call: the mode, the lockdowns and ticks before it.
     confines: RefCell<Vec<Confine>>,
+    /// Each `fs_confine` call: the lockdowns, seccomp installs, and ticks
+    /// before it.
+    fs_confines: RefCell<Vec<(usize, usize, u32)>>,
     /// H9: the datapath's idle wait is simulated (otherwise it cannot
     /// block, like the provided default).
     waits: Cell<bool>,
@@ -657,6 +661,22 @@ impl PortHost for FakeHost {
         })
     }
 
+    fn fs_confine(&self) -> Result<FsReport, FsFailure> {
+        self.state.fs_confines.borrow_mut().push((
+            self.state.lockdowns.borrow().len(),
+            self.state.confines.borrow().len(),
+            self.state.io_calls.get(),
+        ));
+        if self.fails(Stage::FsConfine, None) {
+            return Err(FsFailure::Injected);
+        }
+        Ok(FsReport {
+            abi: 6,
+            rules: 4,
+            threads: 3,
+        })
+    }
+
     fn confine(&self, mode: SeccompMode) -> Result<ConfineReport, ConfineFailure> {
         self.state.confines.borrow_mut().push(Confine {
             mode,
@@ -885,6 +905,7 @@ fn settings(policy: CheckPolicy, stats_interval_ms: u64) -> Settings {
         thresholds: super::watch::Thresholds::default(),
         privileges: PrivilegePolicy::default(),
         seccomp: SeccompMode::default(),
+        fs_confine: FsConfineMode::default(),
         idle_wait_ms: crate::args::DEFAULT_IDLE_WAIT_MS,
     }
 }
@@ -1531,6 +1552,10 @@ fn stats_never_carry_secrets_or_addresses() {
         .borrow_mut()
         .push((IfId(LAN), arp_request()));
     let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 2));
+    // The fixed mode label `landlock` (H11) is no interface name.
+    assert!(outcome.out.contains("\nfs.confine=landlock\n"));
+    let out = outcome.out.replace("=landlock", "=");
+    let err = outcome.err.replace("mode=landlock", "mode=");
     for forbidden in [
         "192.168",
         "203.0.113",
@@ -1543,16 +1568,8 @@ fn stats_never_carry_secrets_or_addresses() {
         "lan",
         "wan",
     ] {
-        assert!(
-            !outcome.out.contains(forbidden),
-            "{forbidden} in stats: {}",
-            outcome.out
-        );
-        assert!(
-            !outcome.err.contains(forbidden),
-            "{forbidden}: {}",
-            outcome.err
-        );
+        assert!(!out.contains(forbidden), "{forbidden} in stats: {out}");
+        assert!(!err.contains(forbidden), "{forbidden}: {err}");
     }
 }
 
@@ -2651,6 +2668,143 @@ fn a_failed_install_rolls_back_every_port_and_exits_1_without_a_tick() {
             attached: true
         }
     ]));
+}
+
+/// The `fs.*` lines of the stats output.
+fn fs_lines(out: &str) -> Vec<&str> {
+    out.lines().filter(|line| line.starts_with("fs.")).collect()
+}
+
+#[test]
+fn the_filesystem_is_confined_after_the_drop_and_before_the_filter() {
+    let host = FakeHost::default();
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 3));
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert_eq!(
+        *host.state.fs_confines.borrow(),
+        [(1, 0, 0)],
+        "once, by default, after the drop, before the filter and any tick"
+    );
+    let dropped_at = outcome.err.find("privileges dropped").expect("drop line");
+    let line = "ruster run: filesystem confined: mode=landlock abi=6 rules=4 threads=3\n";
+    let confined_at = outcome.err.find(line).expect("fs line");
+    let filtered_at = outcome
+        .err
+        .find("seccomp filter installed")
+        .expect("filter line");
+    let ready_at = outcome.err.find(READY).expect("ready line");
+    assert!(
+        dropped_at < confined_at && confined_at < filtered_at && filtered_at < ready_at,
+        "{}",
+        outcome.err
+    );
+    assert_eq!(
+        fs_lines(&outcome.out),
+        [
+            "fs.confine=landlock",
+            "fs.abi=6",
+            "fs.rules=4",
+            "fs.threads=3"
+        ]
+    );
+    host.assert_released();
+}
+
+#[test]
+fn the_filesystem_is_confined_also_with_kept_privileges_and_no_filter() {
+    let host = FakeHost::default();
+    let mut settings = settings(CheckPolicy::default(), 0);
+    settings.privileges = PrivilegePolicy::Keep;
+    settings.seccomp = SeccompMode::Off;
+    let outcome = run_full(
+        &host,
+        settings,
+        FakeSource::default(),
+        &FakeStop::after(FIRST_LOOP_CHECK + 3),
+        &mut FakeClock::default(),
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert_eq!(*host.state.fs_confines.borrow(), [(0, 0, 0)]);
+    assert!(outcome
+        .err
+        .contains("ruster run: filesystem confined: mode=landlock abi=6 rules=4 threads=3\n"));
+}
+
+#[test]
+fn fs_confine_off_confines_nothing_and_says_so() {
+    let host = FakeHost::default();
+    let mut settings = settings(CheckPolicy::default(), 0);
+    settings.fs_confine = FsConfineMode::Off;
+    let outcome = run_full(
+        &host,
+        settings,
+        FakeSource::default(),
+        &FakeStop::after(FIRST_LOOP_CHECK + 3),
+        &mut FakeClock::default(),
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(host.state.fs_confines.borrow().is_empty());
+    assert_eq!(
+        host.state.lockdowns.borrow().len(),
+        1,
+        "the drop still runs"
+    );
+    assert_eq!(host.state.confines.borrow().len(), 1, "the filter too");
+    assert!(
+        outcome.err.contains(
+            "ruster run: warning: fs-confine=off (--fs-confine off): no filesystem \
+             confinement; every file the process's user may read stays readable\n"
+        ),
+        "{}",
+        outcome.err
+    );
+    assert!(!outcome.err.contains("filesystem confined"));
+    assert_eq!(
+        fs_lines(&outcome.out),
+        ["fs.confine=off", "fs.abi=0", "fs.rules=0", "fs.threads=0"]
+    );
+}
+
+#[test]
+fn a_failed_confinement_rolls_back_every_port_and_exits_1_without_a_tick() {
+    let host = FakeHost::failing(Stage::FsConfine, None);
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 3));
+    assert_eq!(outcome.status, EXIT_RUNTIME, "{}", outcome.err);
+    assert!(
+        outcome
+            .err
+            .contains("ruster run: startup failed: stage=fs-confine code=INJECTED\n"),
+        "{}",
+        outcome.err
+    );
+    assert!(!outcome.err.contains(READY));
+    assert!(!outcome.err.contains("filesystem confined"));
+    assert!(
+        host.state.confines.borrow().is_empty(),
+        "no filter after it"
+    );
+    assert!(outcome.out.is_empty());
+    assert_eq!(host.state.io_calls.get(), 0, "no tick");
+    host.assert_released();
+    assert!(host.events().ends_with(&[
+        Event::Adapter,
+        Event::Close {
+            port: WAN,
+            attached: true
+        },
+        Event::Close {
+            port: LAN,
+            attached: true
+        }
+    ]));
+}
+
+#[test]
+fn a_worker_whose_confinement_fails_is_stage_fs_confine() {
+    let error = super::prologue_failed(DropFailure::Filesystem(FsFailure::Disabled));
+    assert_eq!(error.to_string(), "stage=fs-confine code=LANDLOCK_DISABLED");
+    let error = super::prologue_failed(DropFailure::Injected);
+    assert_eq!(error.to_string(), "stage=privilege-drop code=INJECTED");
 }
 
 #[path = "ops_tests.rs"]

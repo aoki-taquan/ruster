@@ -20,7 +20,7 @@ usage:
              [--tx-stall-fatal-secs <s>] [--kick-errors-fatal-secs <s>]
              [--link-stale-secs <s>] [--idle-wait-ms <ms>]
              [--keep-privileges | --user <uid> --group <gid>]
-             [--seccomp kill|log|off]
+             [--seccomp kill|log|off] [--fs-confine landlock|off]
              --config <config.toml>
   ruster run [options] -- <config.toml>
   ruster --help | --version
@@ -32,6 +32,10 @@ to that numeric uid/gid); --keep-privileges keeps them for the whole run.
 It then confines every thread to a syscall allowlist (seccomp): a syscall
 outside it kills the process (--seccomp kill, the default), is logged and
 allowed (--seccomp log), or the filter is not installed (--seccomp off).
+Before that every thread is confined to the files the run reads (Landlock:
+the config's directory, its own /proc entries, /proc/sys/net, its binary;
+--fs-confine landlock, the default, refuses to start without Landlock);
+--fs-confine off leaves the filesystem view unchanged.
 When idle, `run` blocks in poll() on the port sockets for at most
 --idle-wait-ms (default 10, 1 to 100; at most 1 while timers or TX are
 pending); an arriving frame ends the wait at once.
@@ -101,6 +105,36 @@ impl SeccompMode {
         match value.to_str()? {
             "kill" => Some(Self::Kill),
             "log" => Some(Self::Log),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
+/// What `ruster run` does to the filesystem view of every thread after
+/// startup (`--fs-confine`, H11).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FsConfineMode {
+    /// `landlock` (the default): every thread is confined by one Landlock
+    /// ruleset to what the run reads; startup fails without Landlock.
+    #[default]
+    Landlock,
+    /// `off`: no filesystem confinement.
+    Off,
+}
+
+impl FsConfineMode {
+    /// The option value (and the stats label).
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Landlock => "landlock",
+            Self::Off => "off",
+        }
+    }
+
+    fn parse(value: &OsStr) -> Option<Self> {
+        match value.to_str()? {
+            "landlock" => Some(Self::Landlock),
             "off" => Some(Self::Off),
             _ => None,
         }
@@ -201,6 +235,9 @@ pub struct RunArgs {
     pub group: Option<u32>,
     /// The syscall filter after startup (`--seccomp`, default kill).
     pub seccomp: SeccompMode,
+    /// The filesystem confinement after startup (`--fs-confine`, default
+    /// landlock).
+    pub fs_confine: FsConfineMode,
     /// The longest idle wait in milliseconds (`--idle-wait-ms`, 1 to
     /// [`MAX_IDLE_WAIT_MS`], H9).
     pub idle_wait_ms: u64,
@@ -249,6 +286,9 @@ impl fmt::Display for UsageError {
             Self::DuplicateOption(option) => write!(formatter, "option {option} given twice"),
             Self::InvalidValue("--seccomp") => {
                 formatter.write_str("option --seccomp needs kill, log, or off")
+            }
+            Self::InvalidValue("--fs-confine") => {
+                formatter.write_str("option --fs-confine needs landlock or off")
             }
             Self::InvalidValue(option @ ("--user" | "--group")) => write!(
                 formatter,
@@ -384,6 +424,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
     let mut keep_privileges = false;
     let mut ids: [Option<u32>; 2] = [None; 2];
     let mut seccomp = None;
+    let mut fs_confine = None;
     let mut numbers: [Option<u64>; NUMERIC.len()] = [None; NUMERIC.len()];
     let mut words = rest.iter();
     'words: while let Some(word) = words.next() {
@@ -404,6 +445,18 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
                 .filter(|value| !is_option(value))
                 .ok_or(UsageError::MissingValue("--seccomp"))?;
             set_seccomp(&mut seccomp, value)?;
+            continue;
+        }
+        if let Some(value) = equals_value(word, "--fs-confine=") {
+            set_fs_confine(&mut fs_confine, &value)?;
+            continue;
+        }
+        if word.to_str() == Some("--fs-confine") {
+            let value = words
+                .next()
+                .filter(|value| !is_option(value))
+                .ok_or(UsageError::MissingValue("--fs-confine"))?;
+            set_fs_confine(&mut fs_confine, value)?;
             continue;
         }
         for (index, &name) in ID_OPTIONS.iter().enumerate() {
@@ -509,6 +562,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
         user,
         group,
         seccomp: seccomp.unwrap_or_default(),
+        fs_confine: fs_confine.unwrap_or_default(),
         idle_wait_ms: idle_wait.unwrap_or(DEFAULT_IDLE_WAIT_MS),
     }))
 }
@@ -518,6 +572,15 @@ fn set_seccomp(slot: &mut Option<SeccompMode>, value: &OsStr) -> Result<(), Usag
     let mode = SeccompMode::parse(value).ok_or(UsageError::InvalidValue("--seccomp"))?;
     if slot.replace(mode).is_some() {
         return Err(UsageError::DuplicateOption("--seccomp"));
+    }
+    Ok(())
+}
+
+/// `--fs-confine landlock|off`, at most once.
+fn set_fs_confine(slot: &mut Option<FsConfineMode>, value: &OsStr) -> Result<(), UsageError> {
+    let mode = FsConfineMode::parse(value).ok_or(UsageError::InvalidValue("--fs-confine"))?;
+    if slot.replace(mode).is_some() {
+        return Err(UsageError::DuplicateOption("--fs-confine"));
     }
     Ok(())
 }
@@ -784,6 +847,7 @@ mod tests {
             user: None,
             group: None,
             seccomp: SeccompMode::Kill,
+            fs_confine: FsConfineMode::Landlock,
             idle_wait_ms: DEFAULT_IDLE_WAIT_MS,
         })
     }
@@ -904,6 +968,68 @@ mod tests {
                 "a"
             ]),
             Err(UsageError::DuplicateOption("--idle-wait-ms"))
+        );
+    }
+
+    #[test]
+    fn run_parses_the_fs_confine_option() {
+        let parsed = |words: &[&str]| match run(words) {
+            Ok(Command::Run(args)) => args.fs_confine,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(parsed(&["run", "--config", "a"]), FsConfineMode::Landlock);
+        assert_eq!(FsConfineMode::default(), FsConfineMode::Landlock);
+        for (value, mode) in [
+            ("landlock", FsConfineMode::Landlock),
+            ("off", FsConfineMode::Off),
+        ] {
+            assert_eq!(
+                parsed(&["run", "--fs-confine", value, "--config", "a"]),
+                mode
+            );
+            assert_eq!(
+                parsed(&["run", &format!("--fs-confine={value}"), "--config", "a"]),
+                mode
+            );
+            assert_eq!(mode.label(), value);
+        }
+        // Independent of the privilege policy and the syscall filter.
+        assert_eq!(
+            parsed(&[
+                "run",
+                "--keep-privileges",
+                "--seccomp=off",
+                "--fs-confine=off",
+                "--config",
+                "a"
+            ]),
+            FsConfineMode::Off
+        );
+        for bad in ["", "on", "Landlock", "mountns", "none"] {
+            assert_eq!(
+                run(&["run", &format!("--fs-confine={bad}"), "--config", "a"]),
+                Err(UsageError::InvalidValue("--fs-confine")),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            run(&["run", "--fs-confine", "--config", "a"]),
+            Err(UsageError::MissingValue("--fs-confine"))
+        );
+        assert_eq!(
+            run(&[
+                "run",
+                "--fs-confine=off",
+                "--fs-confine",
+                "landlock",
+                "--config",
+                "a"
+            ]),
+            Err(UsageError::DuplicateOption("--fs-confine"))
+        );
+        assert_eq!(
+            UsageError::InvalidValue("--fs-confine").to_string(),
+            "option --fs-confine needs landlock or off"
         );
     }
 
@@ -1084,6 +1210,7 @@ mod tests {
                 user: None,
                 group: None,
                 seccomp: SeccompMode::Kill,
+                fs_confine: FsConfineMode::Landlock,
                 idle_wait_ms: DEFAULT_IDLE_WAIT_MS,
             }))
         };

@@ -31,6 +31,12 @@
 //!    `--keep-privileges` skips it; `--user`/`--group` also switch
 //!    to that uid and gid. A failed drop rolls back like any startup
 //!    failure (`stage=privilege-drop`, exit 1).
+//!    Each thread then confines its filesystem view to what the run reads
+//!    with the Landlock ruleset built first thing at startup
+//!    ([`fs_confine`], H11; `--fs-confine landlock`, the default, or
+//!    `off`): the output threads and the workers in the same prologue, the
+//!    router thread right after its drop, which then requires every thread
+//!    to be confined (`stage=fs-confine`, exit 1).
 //! 7. Confine every thread to the syscall allowlist with one TSYNC
 //!    seccomp filter ([`seccomp`], H8; `--seccomp kill`, the default, or
 //!    `log`; `off` skips it), also with `--keep-privileges`. A failed
@@ -107,6 +113,7 @@
 
 mod checks;
 mod engine;
+mod fs_confine;
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
@@ -154,8 +161,9 @@ use engine::{
     port_label, run_loop, shutdown_drain, Clock, Control, Datapath, LoopEnd, LoopSettings,
     RunStatus, ShutdownReport, StopSignal, DRAIN_DEADLINE_MS,
 };
+use fs_confine::{FsConfineMode, FsState};
 use notify::Notifier;
-use privileges::{Identity, PrivilegePolicy, PrivilegeState};
+use privileges::{DropFailure, Identity, PrivilegePolicy, PrivilegeState};
 use reload::{ConfigSource, Preparer, ReloadWorker, Reloader};
 use seccomp::{SeccompMode, SeccompState};
 use startup::{
@@ -202,6 +210,8 @@ pub struct Settings {
     pub privileges: PrivilegePolicy,
     /// The syscall filter after the drop.
     pub seccomp: SeccompMode,
+    /// The filesystem confinement after the drop (H11).
+    pub fs_confine: FsConfineMode,
     /// The longest idle wait (`--idle-wait-ms`, H9).
     pub idle_wait_ms: u64,
 }
@@ -211,6 +221,7 @@ impl Settings {
         Self {
             privileges: privilege_policy(args),
             seccomp: args.seccomp,
+            fs_confine: args.fs_confine,
             idle_wait_ms: args.idle_wait_ms,
             policy: CheckPolicy {
                 allow_multi_queue: args.allow_multi_queue,
@@ -336,25 +347,43 @@ fn live(args: &RunArgs, config: ValidatedConfigV1, err: &mut impl Write) -> u8 {
         let error = StartupError::new(Stage::Privileges, None, Failure::Privileges(error));
         return startup_failed(err, error, &[]);
     }
+    // The filesystem ruleset, while this is the only thread: every thread
+    // confines itself with it after its drop (the output threads below at
+    // spawn, before startup).
+    if settings.fs_confine == FsConfineMode::Landlock {
+        match fs_confine::linux::prepare_process(&args.config) {
+            Ok(None) => {}
+            Ok(Some(directory)) => {
+                let _ = writeln!(err, "ruster run: {}", fs_confine::broad_warning(directory));
+            }
+            Err(failure) => {
+                let _ = writeln!(
+                    err,
+                    "ruster run: startup failed: stage=fs-confine {failure}"
+                );
+                if let Some(hint) = failure.hint() {
+                    let _ = writeln!(err, "ruster run: {hint}");
+                }
+                return EXIT_RUNTIME;
+            }
+        }
+    }
     // From here on nothing on this thread writes to a file descriptor: a
     // stalled stdout/stderr pipe cannot block the datapath or the shutdown.
     // The threads get dups of fd 1/2 as plain files: blocked writes hold
     // no std stdio lock that `main` or the exit path could wait on.
-    let output =
-        match output::ColdOutput::process(move || privileges::linux::drop_thread(policy).map(drop))
-        {
-            Ok(output) => output,
-            Err(output::SpawnError::Prologue(error)) => {
-                let error =
-                    StartupError::new(Stage::PrivilegeDrop, None, Failure::PrivilegeDrop(error));
-                let _ = writeln!(err, "ruster run: startup failed: {error} thread=output");
-                return EXIT_RUNTIME;
-            }
-            Err(output::SpawnError::Io) => {
-                let _ = writeln!(err, "ruster run: cannot start the output thread");
-                return EXIT_RUNTIME;
-            }
-        };
+    let output = match output::ColdOutput::process(move || linux::thread_lockdown(policy)) {
+        Ok(output) => output,
+        Err(output::SpawnError::Prologue(error)) => {
+            let error = prologue_failed(error);
+            let _ = writeln!(err, "ruster run: startup failed: {error} thread=output");
+            return EXIT_RUNTIME;
+        }
+        Err(output::SpawnError::Io) => {
+            let _ = writeln!(err, "ruster run: cannot start the output thread");
+            return EXIT_RUNTIME;
+        }
+    };
     let mut out = output.writer(output::Stream::Out);
     let mut cold_err = output.writer(output::Stream::Err);
     let status = execute(
@@ -670,6 +699,19 @@ where
         }
     };
     let _ = writeln!(err, "ruster run: {}", privileges.line());
+    // Every other thread confined itself in its prologue; the router
+    // thread last, still before the filter (which allows no Landlock call).
+    let fs = match settings.fs_confine {
+        FsConfineMode::Off => FsState::Off,
+        FsConfineMode::Landlock => FsState::Confined(host.fs_confine().map_err(|failure| {
+            Interrupt::Failed(StartupError::new(
+                Stage::FsConfine,
+                None,
+                Failure::FsConfine(failure),
+            ))
+        })?),
+    };
+    let _ = writeln!(err, "ruster run: {}", fs.line());
     // Every thread exists and has dropped: confine them all at once.
     let seccomp = match settings.seccomp {
         SeccompMode::Off => SeccompState::Off,
@@ -687,6 +729,7 @@ where
     let _ = writeln!(err, "ruster run: {}", seccomp.line());
     let hardening = Hardening {
         privileges,
+        fs,
         seccomp,
     };
     let mut observer = TickObserver::new(HealthPolicy::default());
@@ -850,14 +893,23 @@ where
 {
     let prologue = host.thread_prologue();
     let failed = |error| match error {
-        output::SpawnError::Prologue(error) => {
-            StartupError::new(Stage::PrivilegeDrop, None, Failure::PrivilegeDrop(error))
-        }
+        output::SpawnError::Prologue(error) => prologue_failed(error),
         output::SpawnError::Io => StartupError::new(Stage::Workers, None, Failure::Spawn),
     };
     let watcher = LinkWatcher::spawn(links, targets, move || prologue(policy)).map_err(failed)?;
     let reloads = ReloadWorker::spawn(preparer, move || prologue(policy)).map_err(failed)?;
     Ok((watcher, reloads))
+}
+
+/// The startup error of a failed thread prologue: its filesystem
+/// confinement (`stage=fs-confine`) or its privilege drop.
+fn prologue_failed(error: DropFailure) -> StartupError {
+    match error {
+        DropFailure::Filesystem(failure) => {
+            StartupError::new(Stage::FsConfine, None, Failure::FsConfine(failure))
+        }
+        error => StartupError::new(Stage::PrivilegeDrop, None, Failure::PrivilegeDrop(error)),
+    }
 }
 
 /// Waits for the stopped workers until `deadline` and abandons those still
@@ -883,6 +935,7 @@ fn finish_workers(
 #[derive(Clone, Copy)]
 struct Hardening {
     privileges: PrivilegeState,
+    fs: FsState,
     seccomp: SeccompState,
 }
 
@@ -916,6 +969,7 @@ fn render<D: Datapath>(
             stats::write_fields(out, Some(interface), &health);
         }
         stats::write_fields(out, None, &hardening.privileges);
+        stats::write_fields(out, None, &hardening.fs);
         stats::write_fields(out, None, &hardening.seccomp);
     })
 }

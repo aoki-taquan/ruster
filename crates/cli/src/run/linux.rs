@@ -14,6 +14,7 @@ use ruster_io_xdp_native::{
 use super::checks::linux::PortSysctls;
 use super::checks::{self, CheckFailure, DeviceFacts, PrivilegeFailure};
 use super::engine::{ClockedIo, Datapath, DrainProgress, IdleWake, LinkMonitor, WaitError};
+use super::fs_confine::{self, FsFailure, FsReport};
 use super::netlink::{Dump, Family, LinkFacts, LinkProbe, NetlinkError};
 use super::privileges::{self, DropFailure, DropReport, Identity, PrivilegePolicy};
 use super::seccomp::{self, ConfineFailure, ConfineReport, SeccompMode};
@@ -57,7 +58,11 @@ impl PortHost for LinuxHost {
     }
 
     fn thread_prologue(&self) -> fn(PrivilegePolicy) -> Result<(), DropFailure> {
-        drop_worker_thread
+        thread_lockdown
+    }
+
+    fn fs_confine(&self) -> Result<FsReport, FsFailure> {
+        fs_confine::linux::restrict_process()
     }
 
     fn confine(&self, mode: SeccompMode) -> Result<ConfineReport, ConfineFailure> {
@@ -135,10 +140,13 @@ impl PortHost for LinuxHost {
     }
 }
 
-/// The prologue of a worker thread: drops the calling thread's privileges
-/// (nothing with [`PrivilegePolicy::Keep`]).
-fn drop_worker_thread(policy: PrivilegePolicy) -> Result<(), DropFailure> {
-    privileges::linux::drop_thread(policy).map(drop)
+/// The prologue of every thread but the router thread (the output threads
+/// and the workers): drops the calling thread's privileges (nothing with
+/// [`PrivilegePolicy::Keep`]), then confines its filesystem view (nothing
+/// with `--fs-confine off`, which prepares no ruleset).
+pub fn thread_lockdown(policy: PrivilegePolicy) -> Result<(), DropFailure> {
+    privileges::linux::drop_thread(policy)?;
+    fs_confine::linux::restrict_thread().map_err(DropFailure::Filesystem)
 }
 
 /// The interface an adapter setup error names, if any.

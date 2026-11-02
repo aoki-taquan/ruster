@@ -76,8 +76,9 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   private FFIのhandlerがstatic `AtomicBool`へswap/storeするだけです（二回目のsignalはforce
   flag。`run`のSIGHUPはreload flag、SIGUSR1はstats flagへstoreするだけ）。`unsafe`はそのhandler、`run`のrtnetlink
   query（IPv4/IPv6のaddress dump、全tableのroute dump、link）、起動後のprivilege drop
-  （threadごとの`prctl`/`capset`/`setresuid`等のraw syscall）とseccomp filterのinstall
-  （`prctl`/`seccomp`のraw syscall）、systemd reload通知の`clock_gettime(CLOCK_MONOTONIC)`だけです（下の「使い方」）。
+  （threadごとの`prctl`/`capset`/`setresuid`等のraw syscall）、filesystem confinement
+  （`landlock_create_ruleset`/`landlock_add_rule`/`landlock_restrict_self`/`prctl`のraw syscall）と
+  seccomp filterのinstall（`prctl`/`seccomp`のraw syscall）、systemd reload通知の`clock_gettime(CLOCK_MONOTONIC)`だけです（下の「使い方」）。
   外部crateを直接には追加しません。
 - `ruster-bench`: NIC-freeなsim smoke/datapath benchmarkとhardware benchmark plan/
   measurement protocol/artifact v1のschema検証。sim結果からproduction性能を主張しない。
@@ -783,10 +784,12 @@ sudo target/release/ruster run --config router.toml                # 既定: 60�
 sudo target/release/ruster run --stats-interval 0 -- router.toml   # 周期statsなし
 sudo target/release/ruster run --startup-attempts 1 -- router.toml # 起動retryなし
 sudo target/release/ruster run -- router.toml                      # 既定のdrop
-# stderr: ruster run: privileges dropped: threads=3 capabilities=none bounding-set=cleared no-new-privs=1 identity=unchanged
+# stderr: ruster run: privileges dropped: threads=5 capabilities=none bounding-set=cleared no-new-privs=1 identity=unchanged
 sudo target/release/ruster run --user 990 --group 990 -- router.toml # 起動後にuid/gid 990へ切替
-# stderr: ruster run: privileges dropped: threads=3 capabilities=none bounding-set=cleared no-new-privs=1 identity=switched
+# stderr: ruster run: privileges dropped: threads=5 capabilities=none bounding-set=cleared no-new-privs=1 identity=switched
+# stderr: ruster run: filesystem confined: mode=landlock abi=6 rules=4 threads=5
 # stderr: ruster run: seccomp filter installed: mode=kill threads=5 syscalls=43 arch=x86_64
+sudo target/release/ruster run --fs-confine off -- router.toml    # Landlockの無いkernel用（risk付きopt-out）
 sudo target/release/ruster run --seccomp log -- router.toml       # allowlist外のsyscallをkernelがlogして許可（診断用）
 # stderr: ruster run: running generation 1 on 2 port(s); send SIGINT or SIGTERM to stop, SIGHUP to reload
 sudo kill -HUP <pid>                                               # configをreload
@@ -818,6 +821,34 @@ sudo kill -HUP <pid>                                               # configをre
   `root:<group> 0750`、configを`root:<group> 0640`。rootはownerとして、切替後のuserはgroupで読め、
   `--strict-config-perms`も受理）。statsは`privileges.state=dropped|kept`
   等。詳細はrunbookの「Privilege drop」。
+- filesystem confinement（H11、CLI-122〜CLI-127）: drop後もuid 0（`--user`なし）はroot所有の
+  全file（`/etc/shadow`、鍵）をread-onlyで開けたので、既定（`--fs-confine landlock`）でLandlockにより
+  全threadが開けるfileをrunが読むものだけに絞ります: configのdirectory（pathが指すものと、symlinkなら
+  解決先のdirectory。file読み取りだけで一覧は不可。reloadのatomic replaceも読める）、自processの
+  `/proc/<pid>`（drop/seccompの検証と`--strict-config-perms`のeuid）、`/proc/sys/net`（link watchの
+  sysctl）、自binary（panic backtraceのsymbol）。それ以外のopen/一覧/実行/書き込み/作成/削除/rename/
+  （truncateはLandlock ABI 3以上。それ未満はseccompの`openat`の`O_TRUNC`拒否と`truncate`不許可だけが
+  防ぐので`--seccomp log|off`では防げない）はpathでは全て`EACCES`（`/etc`、`/dev`、`/sys`、他processの`/proc/<pid>`、
+  `/proc/<pid>/root/...`経由やconfig directoryから外へのsymlinkも）。既に開いたfd（socket、
+  `/dev/urandom`、stdout/stderr）とmetadata（`stat`、`readlink`）は影響なし。mount namespace+
+  `pivot_root`ではなくLandlockを選んだ理由: 権限不要（startupは`CAP_SYS_ADMIN`を要求しない）、
+  dropと同じthreadごとのprologueで掛けられる（mount namespaceは呼んだthreadだけで、output threadは
+  起動前から居る）、pathもprocfsのnetnsも変わらない。rulesetはthreadが一つの間に作り、各threadは
+  自分のdropの直後に自分を閉じ込め（output threadはspawn時、workerはactivate後のspawn時、router
+  threadはdropの直後・seccompの前）、各threadは`/`の一覧が`EACCES`になることを、router threadは
+  `/proc/self/task`の数だけthreadが閉じ込められたことを確かめます。`landlock_*`/`prctl`はseccompの
+  前だけでallowlistは不変。Landlock ABI 1（Linux 5.13）以上で有効（`/sys/kernel/security/lsm`に
+  `landlock`）が必要で、ABI 5までのfilesystem権利をhandleし後のABIの権利は扱わない。Landlockが無ければ何も開かずに
+  `stage=fs-confine code=LANDLOCK_UNSUPPORTED|LANDLOCK_DISABLED|LANDLOCK_BLOCKED`（`BLOCKED`は
+  supervisorのsyscall filterが`EPERM`で拒否）でexit 1（fail closed。
+  挙動変更）、`--fs-confine off`はrisk付きのopt-out（warning行）。他の失敗も全portをrollbackして
+  `stage=fs-confine`でexit 1。statsは`fs.confine=landlock|off`、`fs.abi`、`fs.rules`、`fs.threads`。
+  ABI 4以上ではTCPの`bind`/`connect`も拒否（portを許すruleなし。runはTCPを使わない）。
+  configは専用directory（`/etc/ruster/`）に置く（そのdirectory内でuserが読めるfileは読める）。
+  directory（名前どおりかsymlink解決後）が`/`なら起動拒否（`code=CONFIG_DIRECTORY_ROOT`）、
+  `/etc`、`/home`、`/root`、`/usr`、`/var`なら`CONFIG_DIRECTORY_BROAD` warning。各threadは
+  自分のthread idを記録し、router threadは`/proc/self/task`のidと完全一致を要求します。
+  詳細はrunbookの「Filesystem confinement (Landlock)」。
 - seccomp filter（H8、CLI-102〜CLI-109）: privilege dropの直後・最初のtickの前に、router threadが
   `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC)`一回で全thread（router、output 2、
   `ruster-watch`、`ruster-reload`）を同じsyscall allowlistへ閉じ込めます（`--keep-privileges`でも。
@@ -965,7 +996,7 @@ sudo kill -HUP <pid>                                               # configをre
   `2` usage/invalid config、`3`停止期限（または二回目のsignal）で
   TX frameがkernelに残った（detach/closeは済み）、`4`権限/memlock不足（`--user`/`--group`の
   `CAP_SETUID`/`CAP_SETGID`不足、drop後のteardownに権限が要るkernelを含む）。privilege dropの
-  失敗は`1`。seccomp filterのinstall失敗も`1`、filterによるkillはSIGSYS（shellでは159）。
+  失敗は`1`。filesystem confinement（Landlockなしを含む）とseccomp filterのinstall失敗も`1`、filterによるkillはSIGSYS（shellでは159）。
   reloadの拒否・失敗では終了しません。
 - systemd通知（H10、`sd_notify`）: `NOTIFY_SOCKET`がある時だけ、起動の最初（threadが一つの間）に
   環境変数を読んで消し、`AF_UNIX` datagram socketを一つ開きます（privilege dropとseccompの前。以後は
@@ -974,8 +1005,9 @@ sudo kill -HUP <pid>                                               # configをre
   あればその半分ごとにrouter threadのtick間から`WATCHDOG=1`（止まったrouterはpingしない）。送信は
   blockせず、失敗は`notify.failed`。不正な`NOTIFY_SOCKET`/`WATCHDOG_*`は`stage=notify`でexit 1。
   unit例は`Type=notify-reload`と`WatchdogSec=`（runbookの2章）。
-- multi-queue、chroot/mount namespace、structured logはdeferred
-  （requirements CLI-034、runbookの「Known limits」）。
+- multi-queue、structured logはdeferred
+  （requirements CLI-034、runbookの「Known limits」）。filesystemの閉じ込め（CLI-034の
+  chroot/mount namespace項目）はH11でLandlockとして実装。
 
 ### packet backend（`[backend]`）
 
@@ -1079,6 +1111,12 @@ H8のseccomp filter（全phaseが既定の`--seccomp kill`で動き、threadを�
 `Seccomp: 2`、`NoNewPrivs: 1`、shellより一つ多い`Seccomp_filters`。seccomp phaseで`--seccomp log`の
 forward・reload・link down/upとdmesgに記録が無いこと、`--seccomp off`で全thread未filter、SIGSYSでの
 group exitで両linkがdetachすること、最後にsmoke全体でruster binaryのseccomp記録が増えないことを確認）、
+H11のfilesystem confinement（全phaseが既定の`--fs-confine landlock`で動き、forward phaseで
+`filesystem confined: mode=landlock ... threads=5`と`fs.*`。fs phaseはreloadをprobeにして、configを
+directory外の読めるfileへのsymlinkにatomicに置き換えると`stage=read code=PERMISSION_DENIED`で転送は継続、
+directory内へ置くとapply。uid 0では`/etc/shadow`、`/etc/passwd`、`/proc/1/status`、
+`/proc/<pid>/root/etc/shadow`へのsymlinkが全て`PERMISSION_DENIED`。対照として`--fs-confine off`では
+同じ`/etc/passwd`がreadを通る）、
 B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、N5のicmp_query phase（`[nat44.icmp]`の無いrouter-v1ではhost Aからhost Bへの`ping`が届かず`NAT44_UDP_UNSUPPORTED_TRANSPORT`、`[nat44.icmp]`と`icmp` firewall ruleを足した構成（planは`nat44-icmp ~ off -> on`でrestart-required）ではhost Bへのpingが3/3返り（host Bには192.168.1.0/24への経路が無いので、replyが返ること自体が変換の証拠）、public addressへのpingはrouter自身が答え、`nat44_icmp.outbound_translated=3`と`inbound_translated=3`、mapping 1つ）、
 M2 S10bのops phase（一つの稼働中routerでSIGHUP reloadによりUDP ruleをdenyにして届かなくなり、
 戻して再び届く。generation 2/3でrestartなし。UMEM shapeを変えたreloadは`RESTART_REQUIRED`で
