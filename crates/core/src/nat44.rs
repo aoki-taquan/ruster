@@ -7,6 +7,16 @@ use std::{
 #[cfg(test)]
 use std::cell::Cell;
 
+mod icmp_query;
+pub use icmp_query::{
+    Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpCounters, Nat44IcmpDisposition,
+    Nat44IcmpHashKey, Nat44IcmpHashKeyError, Nat44IcmpIndexStorage, Nat44IcmpMappingSlot,
+    Nat44IcmpOccupancy, Nat44IcmpPeerSlot, Nat44IcmpPolicy, Nat44IcmpPolicyError,
+    Nat44IcmpReconcileError, Nat44IcmpReconcilePermit, Nat44IcmpReconcileReport, Nat44IcmpRuntime,
+    Nat44IcmpRuntimeConfigError, Nat44IcmpStorageShape, NAT44_ICMP_DEFAULT_IDLE_TTL_MS,
+    NAT44_ICMP_MAX_IDLE_TTL_MS, NAT44_ICMP_MIN_IDLE_TTL_MS,
+};
+
 use crate::{
     fixed_directory::{
         port_free_bitmap_words, DirectoryHashDomain, DirectoryHashKey, DirectorySemanticError,

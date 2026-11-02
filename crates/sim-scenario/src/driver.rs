@@ -561,7 +561,8 @@ impl SimRun<'_> {
             active.nat44_udp(),
             active.nat44_tcp(),
             active.firewall(),
-        );
+        )
+        .with_nat44_icmp(active.nat44_icmp());
         let mut line = Line::event("final");
         line.u64("at_ms", self.now);
         line.u64("generation", self.generation().get());
@@ -631,12 +632,15 @@ impl SimRun<'_> {
         self.observer.observe_tick(now, Some(generation), &report);
         // Sampled after every tick so the lifetime peak survives flushes.
         let active = &self.active;
-        self.observer.record_occupancy(ServiceOccupancy::capture(
-            active.icmpv4_errors(),
-            active.nat44_udp(),
-            active.nat44_tcp(),
-            active.firewall(),
-        ));
+        self.observer.record_occupancy(
+            ServiceOccupancy::capture(
+                active.icmpv4_errors(),
+                active.nat44_udp(),
+                active.nat44_tcp(),
+                active.firewall(),
+            )
+            .with_nat44_icmp(active.nat44_icmp()),
+        );
         let publication = match report.publication {
             PublicationOutcome::Unchanged => TickPublication::Unchanged,
             PublicationOutcome::Applied => {
@@ -651,7 +655,8 @@ impl SimRun<'_> {
                     r.nat44_udp,
                     r.nat44_tcp,
                     r.firewall,
-                );
+                )
+                .with_nat44_icmp(r.nat44_icmp);
                 self.observer.record_apply_flush(generation, flush);
                 TickPublication::Applied(flush)
             }
@@ -978,6 +983,16 @@ impl SimRun<'_> {
             }
             None => line.null("nat44_tcp"),
         }
+        match shape.nat44_icmp {
+            Some(i) => {
+                line.open("nat44_icmp");
+                line.u64("mappings", i.mappings.into());
+                line.u64("peers", i.peers.into());
+                line.u64("identifier_owners", i.identifier_owners.into());
+                line.close();
+            }
+            None => line.null("nat44_icmp"),
+        }
         line.opt_u64("firewall_states", shape.firewall_states.map(u64::from));
         line.usize("required_bytes", shape.required_bytes);
         line.close();
@@ -1013,6 +1028,8 @@ fn write_flush(line: &mut Line, flush: ApplyFlushCounts) {
         nat44_udp_peers,
         nat44_tcp_mappings,
         nat44_tcp_sessions,
+        nat44_icmp_mappings,
+        nat44_icmp_peers,
         firewall_flows,
     } = flush;
     line.open("flush");
@@ -1027,6 +1044,8 @@ fn write_flush(line: &mut Line, flush: ApplyFlushCounts) {
         ("nat44_udp_peers", nat44_udp_peers),
         ("nat44_tcp_mappings", nat44_tcp_mappings),
         ("nat44_tcp_sessions", nat44_tcp_sessions),
+        ("nat44_icmp_mappings", nat44_icmp_mappings),
+        ("nat44_icmp_peers", nat44_icmp_peers),
         ("firewall_flows", firewall_flows),
     ] {
         line.u64(key, value);

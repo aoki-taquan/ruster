@@ -268,6 +268,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 unsolicited_syn_holds: 7,
                 hosts: 0,
             }),
+            nat44_icmp: None,
             firewall_states: Some(6),
             required_bytes: shape.required_bytes,
         }
@@ -1460,4 +1461,199 @@ fn arp_policy_maps_onto_the_core_policy() {
         validated(&with("require-on-link-sender = true\n")).arp(),
         ArpPolicy::RFC826.with_require_on_link_sender(true)
     );
+}
+
+/// N5: `[nat44.icmp]` maps onto the core ICMP query policy with RFC 5508
+/// defaults (60 s, address-dependent, identifier preservation, errors
+/// bidirectional), the identifier pool defaults to the realm ports, and its
+/// storage (engine tables plus one owner slot per identifier) is counted
+/// exactly.
+#[test]
+fn nat44_icmp_section_maps_onto_core_with_rfc5508_defaults_and_exact_storage() {
+    use ruster_config::{Nat44IcmpStorageShapeV1, ValidationCode};
+    use ruster_core::{
+        DirectoryBucket, DirectoryNode, Nat44Filtering, Nat44IcmpConfigError, Nat44IcmpPolicy,
+        Nat44IcmpPolicyError, Nat44Icmpv4ErrorPolicy, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
+        PortOwnerSlot,
+    };
+    const SECTION: &str = "\n[nat44.icmp.capacity]\nmappings = 3\npeers = 5\n";
+    let with = |keys: &str, extra: &str| {
+        VALID.replacen(
+            "[firewall.policy]",
+            &format!("[nat44.icmp]\n{keys}{extra}{SECTION}\n[firewall.policy]"),
+            1,
+        )
+    };
+    let base = validated(VALID);
+    assert!(base.nat44().unwrap().icmp().is_none());
+    assert_eq!(base.storage_shape().nat44_icmp, None);
+
+    let config = validated(&with("", ""));
+    let icmp = config.nat44().unwrap().icmp().unwrap();
+    assert_eq!(icmp.policy(), Nat44IcmpPolicy::default());
+    assert_eq!(icmp.policy().idle_ttl_ms(), 60_000);
+    assert_eq!(icmp.policy().filtering(), Nat44Filtering::AddressDependent);
+    assert!(icmp.policy().identifier_preservation());
+    assert_eq!(
+        icmp.policy().icmpv4_errors(),
+        Nat44Icmpv4ErrorPolicy::Bidirectional
+    );
+    assert_eq!(
+        (icmp.first_identifier(), icmp.last_identifier()),
+        (40_000, 40_007)
+    );
+    assert_eq!((icmp.inside().0, icmp.outside().0), (1, 2));
+    let shape = config.storage_shape();
+    assert_eq!(
+        shape.nat44_icmp,
+        Some(Nat44IcmpStorageShapeV1 {
+            mappings: 3,
+            peers: 5,
+            mapping_buckets: 4,
+            mapping_nodes: 3,
+            peer_buckets: 8,
+            peer_nodes: 5,
+            identifier_owners: 8,
+            hosts: 0,
+        })
+    );
+    let icmp_bytes = 3 * size_of::<Nat44UdpMappingSlot>()
+        + 5 * size_of::<Nat44UdpPeerSlot>()
+        + (4 + 8) * size_of::<DirectoryBucket>()
+        + (3 + 5) * size_of::<DirectoryNode>()
+        + 8 * size_of::<PortOwnerSlot>()
+        + ruster_core::port_free_bitmap_words(8) * size_of::<u64>();
+    assert_eq!(
+        shape.required_bytes,
+        base.storage_shape().required_bytes + icmp_bytes
+    );
+
+    let tuned = validated(&with(
+        "idle-ttl-ms = 90000\nallocator-seed = \"9\"\nfiltering = \"endpoint-independent\"\n\
+         icmpv4-errors = \"external-only\"\nidentifier-preservation = false\n\
+         mappings-per-host = 4\n",
+        "\n[nat44.icmp.identifiers]\nfirst = 1\nlast = 65535\n",
+    ));
+    let icmp = tuned.nat44().unwrap().icmp().unwrap();
+    let policy = icmp.policy();
+    assert_eq!(policy.idle_ttl_ms(), 90_000);
+    assert_eq!(policy.allocator_seed(), 9);
+    assert_eq!(policy.filtering(), Nat44Filtering::EndpointIndependent);
+    assert_eq!(policy.icmpv4_errors(), Nat44Icmpv4ErrorPolicy::ExternalOnly);
+    assert!(!policy.identifier_preservation());
+    assert_eq!(policy.mappings_per_host(), 4);
+    assert_eq!(
+        (icmp.first_identifier(), icmp.last_identifier()),
+        (1, 65_535)
+    );
+    let tuned_shape = tuned.storage_shape().nat44_icmp.unwrap();
+    assert_eq!(
+        (tuned_shape.identifier_owners, tuned_shape.hosts),
+        (65_535, 3)
+    );
+
+    let cases = [
+        (
+            "idle-ttl-ms = 59999\n",
+            "",
+            ValidationCode::Nat44IcmpPolicy(Nat44IcmpPolicyError::IdleTtlTooShort),
+            "nat44.icmp.idle-ttl-ms",
+        ),
+        (
+            "filtering = \"address-and-port-dependent\"\n",
+            "",
+            ValidationCode::Nat44IcmpPolicy(Nat44IcmpPolicyError::FilteringNeedsPorts),
+            "nat44.icmp.filtering",
+        ),
+        (
+            "allocator-seed = \"07\"\n",
+            "",
+            ValidationCode::NonCanonicalAllocatorSeed,
+            "nat44.icmp.allocator-seed",
+        ),
+        (
+            "",
+            "\n[nat44.icmp.identifiers]\nfirst = 0\nlast = 10\n",
+            ValidationCode::Nat44IcmpConfig(Nat44IcmpConfigError::IdentifierPoolIncludesZero),
+            "nat44.icmp.identifiers",
+        ),
+        (
+            "",
+            "\n[nat44.icmp.identifiers]\nfirst = 10\nlast = 9\n",
+            ValidationCode::Nat44IcmpConfig(Nat44IcmpConfigError::IdentifierPoolReversed),
+            "nat44.icmp.identifiers",
+        ),
+    ];
+    for (keys, extra, code, field) in cases {
+        let rejected = error(&with(keys, extra));
+        assert_eq!(rejected.code(), code, "{keys}{extra}");
+        assert_eq!(dotted(rejected.path()), field, "{keys}{extra}");
+    }
+    // The identifier pool is a bounded table.
+    let tight = ValidationLimits {
+        max_slots_per_table: 1_024,
+        ..GENEROUS
+    };
+    let bounded = validated_with(
+        &with("", "\n[nat44.icmp.identifiers]\nfirst = 1\nlast = 2048\n"),
+        tight,
+    )
+    .err()
+    .unwrap();
+    assert_eq!(bounded.code(), ValidationCode::CapacityLimitExceeded);
+    assert_eq!(dotted(bounded.path()), "nat44.icmp.identifiers");
+}
+
+/// N5: `protocol = "icmp"` firewall rules have no ports; TCP and UDP rules
+/// still need both ranges.
+#[test]
+fn firewall_icmp_rules_have_no_ports_and_tcp_udp_rules_need_them() {
+    use ruster_config::ValidationCode;
+    use ruster_core::FirewallProtocol;
+    const ICMP_RULE: &str = "[[firewall.rules]]\nid = 3\ningress = \"lan\"\negress = \"wan\"\n\
+        source = \"192.0.2.0/24\"\ndestination = \"0.0.0.0/0\"\nprotocol = \"icmp\"\n\
+        action = \"allow-stateful\"\n\n";
+    let with_rule = |rule: &str| VALID.replacen("[tick]", &format!("{rule}[tick]"), 1);
+    let config = validated(&with_rule(ICMP_RULE));
+    let rule = config.firewall().unwrap().rules()[2];
+    assert_eq!(rule.protocol(), FirewallProtocol::Icmp);
+    assert_eq!(
+        (rule.source_ports().first(), rule.source_ports().last()),
+        (0, 65_535)
+    );
+    assert_eq!(
+        (
+            rule.destination_ports().first(),
+            rule.destination_ports().last()
+        ),
+        (0, 65_535)
+    );
+    let with_ports = with_rule(&format!(
+        "{ICMP_RULE}[firewall.rules.source-ports]\nfirst = 0\nlast = 65535\n\n"
+    ));
+    let rejected = error(&with_ports);
+    assert_eq!(rejected.code(), ValidationCode::FirewallIcmpRulePorts);
+    assert_eq!(dotted(rejected.path()), "firewall.rules[2].source-ports");
+    let udp_without_ports = with_rule(&ICMP_RULE.replace("\"icmp\"", "\"udp\""));
+    let rejected = error(&udp_without_ports);
+    assert_eq!(rejected.code(), ValidationCode::FirewallRulePortsRequired);
+    assert_eq!(dotted(rejected.path()), "firewall.rules[2].source-ports");
+}
+
+/// `a.b[2].c` spelling of a source path, for compact assertions.
+fn dotted(path: &ruster_config::SourcePath) -> String {
+    let mut text = String::new();
+    for segment in path.segments() {
+        match segment {
+            PathSegment::Field(name) => {
+                if !text.is_empty() {
+                    text.push('.');
+                }
+                text.push_str(name);
+            }
+            PathSegment::Index(index) => text.push_str(&format!("[{index}]")),
+            _ => text.push('?'),
+        }
+    }
+    text
 }

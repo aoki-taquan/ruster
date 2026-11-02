@@ -424,6 +424,8 @@ fn generation_and_apply_outcome_are_reflected_once() {
             nat44_udp_peers: 8,
             nat44_tcp_mappings: 9,
             nat44_tcp_sessions: 10,
+            nat44_icmp_mappings: 0,
+            nat44_icmp_peers: 0,
             firewall_flows: 11,
         }
     );
@@ -582,8 +584,8 @@ fn snapshot_rendering_is_stable_and_ordered() {
     assert_eq!(keys(&idle), keys(&text));
 }
 
-/// `samples` plus four fields for each of the seven tables.
-const OCCUPANCY_FIELDS: usize = 1 + 8 * 4;
+/// `samples` plus four fields for each of the ten tables.
+const OCCUPANCY_FIELDS: usize = 1 + 10 * 4;
 
 fn table(occupied: usize, high_water: usize, capacity: usize) -> TableOccupancy {
     TableOccupancy::new(occupied, high_water, capacity).unwrap()
@@ -673,6 +675,8 @@ fn occupancy_samples_keep_the_last_value_and_a_lifetime_peak() {
             "occupancy.nat44_tcp_sessions",
             "occupancy.nat44_tcp_external_inbound_sessions",
             "occupancy.nat44_tcp_unsolicited_syn_holds",
+            "occupancy.nat44_icmp_mappings",
+            "occupancy.nat44_icmp_peers",
             "occupancy.firewall_states",
             "occupancy.icmpv4_error_states",
         ]

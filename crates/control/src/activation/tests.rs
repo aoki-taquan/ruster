@@ -615,6 +615,9 @@ fn injected(stage: ApplyStage) -> ApplyError {
         }
         ApplyStage::Nat44Udp => ApplyError::Nat44Udp(Nat44UdpReconcileError::RuntimeEpochExhausted),
         ApplyStage::Nat44Tcp => ApplyError::Nat44Tcp(Nat44TcpReconcileError::RuntimeEpochExhausted),
+        ApplyStage::Nat44Icmp => {
+            ApplyError::Nat44Icmp(ruster_core::Nat44IcmpReconcileError::RuntimeEpochExhausted)
+        }
         ApplyStage::Firewall => ApplyError::Firewall(FirewallReconcileError::RuntimeEpochExhausted),
     }
 }
@@ -633,6 +636,7 @@ fn failure_at_every_apply_stage_leaves_live_runtimes_unchanged() {
         ApplyStage::Icmpv4Errors,
         ApplyStage::Nat44Udp,
         ApplyStage::Nat44Tcp,
+        ApplyStage::Nat44Icmp,
         ApplyStage::Firewall,
     ] {
         let before = observe(&active);

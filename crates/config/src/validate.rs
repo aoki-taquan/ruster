@@ -8,12 +8,12 @@ use ruster_core::{
     FirewallStateSlot, ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorKind,
     Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
     Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding, MacAddress, Nat44Filtering,
-    Nat44HostLink, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError,
-    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot,
-    Nat44TcpSynHoldSlot, Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpMappingSlot,
-    Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor, PortOwnerSlot,
-    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy, ResolutionPolicyError,
-    ResolutionStateSlot, Route, RouteError, SnapshotError,
+    Nat44HostLink, Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpPolicy, Nat44IcmpPolicyError,
+    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpMappingSlot,
+    Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig,
+    Nat44UdpConfigError, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
+    Nat44UdpPolicyError, Neighbor, PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot,
+    ResolutionPolicy, ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
 };
 
 use ruster_io_xdp::native_profile::{
@@ -126,6 +126,17 @@ pub enum ValidationCode {
     Nat44UdpConfig(Nat44UdpConfigError),
     Nat44TcpPolicy(Nat44TcpPolicyError),
     Nat44TcpConfig(Nat44TcpConfigError),
+    /// `[nat44.icmp]` (N5): idle timeout below the RFC 5508 REQ-2 floor or
+    /// above the maximum, or `address-and-port-dependent` filtering.
+    Nat44IcmpPolicy(Nat44IcmpPolicyError),
+    /// `[nat44.icmp]` realm or identifier pool (0 in the pool, reversed).
+    Nat44IcmpConfig(Nat44IcmpConfigError),
+    /// A `tcp`/`udp` firewall rule without `source-ports` or
+    /// `destination-ports`.
+    FirewallRulePortsRequired,
+    /// An `icmp` firewall rule with `source-ports` or `destination-ports`
+    /// (a query has no ports).
+    FirewallIcmpRulePorts,
     FirewallPrefix(FirewallIpv4PrefixError),
     FirewallPortRange(FirewallPortRangeError),
     FirewallPolicy(FirewallPolicyError),
@@ -235,6 +246,10 @@ impl ValidationCode {
             Self::Nat44UdpConfig(_) => "NAT44_UDP_CONFIG",
             Self::Nat44TcpPolicy(_) => "NAT44_TCP_POLICY",
             Self::Nat44TcpConfig(_) => "NAT44_TCP_CONFIG",
+            Self::Nat44IcmpPolicy(_) => "NAT44_ICMP_POLICY",
+            Self::Nat44IcmpConfig(_) => "NAT44_ICMP_CONFIG",
+            Self::FirewallRulePortsRequired => "FIREWALL_RULE_PORTS_REQUIRED",
+            Self::FirewallIcmpRulePorts => "FIREWALL_ICMP_RULE_PORTS",
             Self::FirewallPrefix(_) => "FIREWALL_PREFIX",
             Self::FirewallPortRange(_) => "FIREWALL_PORT_RANGE",
             Self::FirewallPolicy(_) => "FIREWALL_POLICY",
@@ -409,6 +424,24 @@ pub struct Nat44TcpStorageShapeV1 {
     pub hosts: u32,
 }
 
+/// Storage of the ICMP query NAT (N5): the datagram mapping engine's
+/// tables, with one owner slot per public identifier.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Nat44IcmpStorageShapeV1 {
+    pub mappings: u32,
+    pub peers: u32,
+    pub mapping_buckets: u32,
+    pub mapping_nodes: u32,
+    pub peer_buckets: u32,
+    pub peer_nodes: u32,
+    /// One owner slot per identifier of the pool (`port_owners` of the
+    /// engine), plus its free bitmap.
+    pub identifier_owners: u32,
+    /// Host slots of the per-host accounting: `mappings` with a nonzero
+    /// `mappings-per-host`, else 0.
+    pub hosts: u32,
+}
+
 /// Complete caller-owned runtime storage requested by one V1 candidate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeStorageShapeV1 {
@@ -416,6 +449,8 @@ pub struct RuntimeStorageShapeV1 {
     pub icmpv4_errors: Option<Icmpv4ErrorStorageShapeV1>,
     pub nat44_udp: Option<Nat44UdpStorageShapeV1>,
     pub nat44_tcp: Option<Nat44TcpStorageShapeV1>,
+    /// `None` without `[nat44.icmp]`.
+    pub nat44_icmp: Option<Nat44IcmpStorageShapeV1>,
     pub firewall_states: Option<u32>,
     pub required_bytes: usize,
 }
@@ -557,12 +592,67 @@ impl ValidatedNat44TcpV1 {
     }
 }
 
+/// Validated `[nat44.icmp]` (N5) on the shared realm.
+pub struct ValidatedNat44IcmpV1 {
+    inside: IfId,
+    outside: IfId,
+    public_address: Ipv4Address,
+    first_identifier: u16,
+    last_identifier: u16,
+    policy: Nat44IcmpPolicy,
+    storage: Nat44IcmpStorageShapeV1,
+}
+
+impl ValidatedNat44IcmpV1 {
+    #[must_use]
+    pub const fn inside(&self) -> IfId {
+        self.inside
+    }
+
+    #[must_use]
+    pub const fn outside(&self) -> IfId {
+        self.outside
+    }
+
+    #[must_use]
+    pub const fn public_address(&self) -> Ipv4Address {
+        self.public_address
+    }
+
+    #[must_use]
+    pub const fn first_identifier(&self) -> u16 {
+        self.first_identifier
+    }
+
+    #[must_use]
+    pub const fn last_identifier(&self) -> u16 {
+        self.last_identifier
+    }
+
+    #[must_use]
+    pub const fn policy(&self) -> Nat44IcmpPolicy {
+        self.policy
+    }
+
+    #[must_use]
+    pub const fn storage(&self) -> Nat44IcmpStorageShapeV1 {
+        self.storage
+    }
+}
+
 pub struct ValidatedNat44V1 {
     udp: Option<ValidatedNat44UdpV1>,
     tcp: Option<ValidatedNat44TcpV1>,
+    icmp: Option<ValidatedNat44IcmpV1>,
 }
 
 impl ValidatedNat44V1 {
+    /// ICMP query NAT (N5); `None` without `[nat44.icmp]`.
+    #[must_use]
+    pub const fn icmp(&self) -> Option<&ValidatedNat44IcmpV1> {
+        self.icmp.as_ref()
+    }
+
     #[must_use]
     pub const fn udp(&self) -> Option<&ValidatedNat44UdpV1> {
         self.udp.as_ref()
@@ -1285,6 +1375,8 @@ fn validate_v1(
     let mut validated_tcp = None;
     let mut udp_capacity = None;
     let mut tcp_capacity = None;
+    let mut validated_icmp = None;
+    let mut icmp_capacity = None;
     if let Some(nat) = nat_source {
         if nat.udp.is_none() && nat.tcp.is_none() {
             return Err(ValidationError::new(
@@ -1418,6 +1510,52 @@ fn validate_v1(
             tcp_capacity = Some(source.capacity);
             validated_tcp = Some((inside, outside, public_address, nat.realm.ports, policy));
         }
+        if let Some(source) = nat.icmp {
+            let seed = source
+                .allocator_seed
+                .as_ref()
+                .map(|seed| parse_seed(seed.expose(), path(&["nat44", "icmp", "allocator-seed"])))
+                .transpose()?
+                .unwrap_or(0);
+            let policy_error = |field: &str| {
+                let field = field.to_owned();
+                move |error| {
+                    ValidationError::new(
+                        ValidationCode::Nat44IcmpPolicy(error),
+                        path(&["nat44", "icmp", &field]),
+                    )
+                }
+            };
+            let policy = Nat44IcmpPolicy::new(source.idle_ttl_ms, seed)
+                .map_err(policy_error("idle-ttl-ms"))?
+                .with_filtering(map_filtering(source.filtering))
+                .map_err(policy_error("filtering"))?
+                .with_icmpv4_errors(map_icmp_policy(source.icmpv4_errors))
+                .with_identifier_preservation(source.identifier_preservation)
+                .with_mappings_per_host(source.mappings_per_host);
+            let identifiers = source.identifiers.unwrap_or(nat.realm.ports);
+            Nat44IcmpConfig::new(
+                &snapshot,
+                inside,
+                outside,
+                public_address,
+                identifiers.first,
+                identifiers.last,
+                policy,
+            )
+            .map_err(|error| {
+                ValidationError::new(
+                    ValidationCode::Nat44IcmpConfig(error),
+                    if source.identifiers.is_some() {
+                        path(&["nat44", "icmp", "identifiers"])
+                    } else {
+                        path(&["nat44", "realm"])
+                    },
+                )
+            })?;
+            icmp_capacity = Some(source.capacity);
+            validated_icmp = Some((inside, outside, public_address, identifiers, policy));
+        }
     }
 
     let firewall_source = config.firewall;
@@ -1488,26 +1626,33 @@ fn validate_v1(
                         child_path(&base, "destination"),
                     )
                 })?;
-            let source_ports = FirewallPortRange::new(
-                source_rule.source_ports.first,
-                source_rule.source_ports.last,
-            )
-            .map_err(|error| {
-                ValidationError::new(
-                    ValidationCode::FirewallPortRange(error),
-                    child_path(&base, "source-ports"),
-                )
-            })?;
-            let destination_ports = FirewallPortRange::new(
-                source_rule.destination_ports.first,
-                source_rule.destination_ports.last,
-            )
-            .map_err(|error| {
-                ValidationError::new(
-                    ValidationCode::FirewallPortRange(error),
-                    child_path(&base, "destination-ports"),
-                )
-            })?;
+            // ICMP rules (N5) have no ports and match every identifier;
+            // TCP and UDP rules must name both ranges.
+            let ports = |range: Option<crate::Nat44PortRangeV1>, field: &str| {
+                let field_path = child_path(&base, field);
+                match (source_rule.protocol, range) {
+                    (FirewallProtocolV1::Icmp, None) => {
+                        Ok(FirewallPortRange::new(0, u16::MAX).expect("the full range is ordered"))
+                    }
+                    (FirewallProtocolV1::Icmp, Some(_)) => Err(ValidationError::new(
+                        ValidationCode::FirewallIcmpRulePorts,
+                        field_path,
+                    )),
+                    (FirewallProtocolV1::Tcp | FirewallProtocolV1::Udp, None) => Err(
+                        ValidationError::new(ValidationCode::FirewallRulePortsRequired, field_path),
+                    ),
+                    (FirewallProtocolV1::Tcp | FirewallProtocolV1::Udp, Some(range)) => {
+                        FirewallPortRange::new(range.first, range.last).map_err(|error| {
+                            ValidationError::new(
+                                ValidationCode::FirewallPortRange(error),
+                                field_path,
+                            )
+                        })
+                    }
+                }
+            };
+            let source_ports = ports(source_rule.source_ports, "source-ports")?;
+            let destination_ports = ports(source_rule.destination_ports, "destination-ports")?;
             rules.push(FirewallRule::new(
                 FirewallRuleId(source_rule.id),
                 ingress,
@@ -1517,6 +1662,7 @@ fn validate_v1(
                 match source_rule.protocol {
                     FirewallProtocolV1::Tcp => FirewallProtocol::Tcp,
                     FirewallProtocolV1::Udp => FirewallProtocol::Udp,
+                    FirewallProtocolV1::Icmp => FirewallProtocol::Icmp,
                 },
                 source_ports,
                 destination_ports,
@@ -1546,6 +1692,9 @@ fn validate_v1(
             })),
             tcp: tcp_capacity.zip(validated_tcp.map(|(_, _, _, ports, policy)| {
                 ((ports.first, ports.last), policy.mappings_per_host() != 0)
+            })),
+            icmp_query: icmp_capacity.zip(validated_icmp.map(|(_, _, _, ids, policy)| {
+                ((ids.first, ids.last), policy.mappings_per_host() != 0)
             })),
             firewall_states: firewall_capacity,
         },
@@ -1577,6 +1726,17 @@ fn validate_v1(
                 public_address,
                 first_port: ports.first,
                 last_port: ports.last,
+                policy,
+                storage,
+            },
+        ),
+        icmp: validated_icmp.zip(storage.nat44_icmp).map(
+            |((inside, outside, public_address, ids, policy), storage)| ValidatedNat44IcmpV1 {
+                inside,
+                outside,
+                public_address,
+                first_identifier: ids.first,
+                last_identifier: ids.last,
                 policy,
                 storage,
             },
@@ -1930,6 +2090,13 @@ fn preflight_public_dto(config: &ConfigV1) -> Result<(), ValidationError> {
                 path(&["nat44", "tcp", "allocator-seed"]),
             )?;
         }
+        if let Some(seed) = nat44
+            .icmp
+            .as_ref()
+            .and_then(|icmp| icmp.allocator_seed.as_ref())
+        {
+            text.add(seed.expose(), path(&["nat44", "icmp", "allocator-seed"]))?;
+        }
     }
     if let Some(firewall) = &config.firewall {
         for (index, rule) in firewall.rules.iter().enumerate() {
@@ -2000,6 +2167,8 @@ struct StorageInputs {
     icmp: Option<crate::Icmpv4ErrorCapacityV1>,
     udp: Option<(crate::Nat44UdpCapacityV1, NatStorageInputs)>,
     tcp: Option<(crate::Nat44TcpCapacityV1, NatStorageInputs)>,
+    /// ICMP query NAT (N5): capacity, identifier pool, per-host limit set.
+    icmp_query: Option<(crate::Nat44IcmpCapacityV1, NatStorageInputs)>,
     firewall_states: Option<u32>,
 }
 
@@ -2130,6 +2299,27 @@ fn build_storage_shape(
             Ok(shape)
         })
         .transpose()?;
+    let nat44_icmp = inputs
+        .icmp_query
+        .map(|(capacity, (identifiers, per_host))| {
+            let shape = icmp_shape(capacity, identifiers, per_host, limits)?;
+            add_bytes::<Nat44UdpMappingSlot>(
+                &mut bytes,
+                shape.mappings,
+                path(&["nat44", "icmp", "capacity", "mappings"]),
+            )?;
+            add_bytes::<Nat44UdpPeerSlot>(
+                &mut bytes,
+                shape.peers,
+                path(&["nat44", "icmp", "capacity", "peers"]),
+            )?;
+            add_directory_bytes(&mut bytes, shape.mapping_buckets, shape.mapping_nodes)?;
+            add_directory_bytes(&mut bytes, shape.peer_buckets, shape.peer_nodes)?;
+            add_port_owner_bytes(&mut bytes, shape.identifier_owners)?;
+            add_host_bytes::<1>(&mut bytes, shape.hosts, shape.mapping_buckets, "icmp")?;
+            Ok(shape)
+        })
+        .transpose()?;
     if let Some(states) = inputs.firewall_states {
         check_slots(states, limits, path(&["firewall", "capacity", "states"]))?;
         add_bytes::<FirewallStateSlot>(
@@ -2151,8 +2341,39 @@ fn build_storage_shape(
         icmpv4_errors,
         nat44_udp,
         nat44_tcp,
+        nat44_icmp,
         firewall_states: inputs.firewall_states,
         required_bytes: bytes,
+    })
+}
+
+fn icmp_shape(
+    capacity: crate::Nat44IcmpCapacityV1,
+    identifiers: (u16, u16),
+    per_host: bool,
+    limits: ValidationLimits,
+) -> Result<Nat44IcmpStorageShapeV1, ValidationError> {
+    let mapping_path = path(&["nat44", "icmp", "capacity", "mappings"]);
+    let peer_path = path(&["nat44", "icmp", "capacity", "peers"]);
+    check_slots(capacity.mappings, limits, mapping_path.clone())?;
+    check_slots(capacity.peers, limits, peer_path.clone())?;
+    let mapping_buckets = directory_buckets(capacity.mappings, limits, mapping_path)?;
+    let peer_buckets = directory_buckets(capacity.peers, limits, peer_path)?;
+    let identifier_owners = port_count(identifiers);
+    check_slots(
+        identifier_owners,
+        limits,
+        path(&["nat44", "icmp", "identifiers"]),
+    )?;
+    Ok(Nat44IcmpStorageShapeV1 {
+        mappings: capacity.mappings,
+        peers: capacity.peers,
+        mapping_buckets,
+        mapping_nodes: capacity.mappings,
+        peer_buckets,
+        peer_nodes: capacity.peers,
+        identifier_owners,
+        hosts: if per_host { capacity.mappings } else { 0 },
     })
 }
 

@@ -74,6 +74,9 @@ pub struct StateFlush {
     pub nat44_udp_peers: FlushCount,
     pub nat44_tcp_mappings: FlushCount,
     pub nat44_tcp_sessions: FlushCount,
+    /// ICMP query NAT (N5); `Exact(0)` from a live publication without it.
+    pub nat44_icmp_mappings: FlushCount,
+    pub nat44_icmp_peers: FlushCount,
     pub firewall_flows: FlushCount,
 }
 
@@ -90,6 +93,8 @@ impl StateFlush {
         nat44_udp_peers: FlushCount::All,
         nat44_tcp_mappings: FlushCount::All,
         nat44_tcp_sessions: FlushCount::All,
+        nat44_icmp_mappings: FlushCount::All,
+        nat44_icmp_peers: FlushCount::All,
         firewall_flows: FlushCount::All,
     };
 }
@@ -292,6 +297,8 @@ pub struct ApplyPlan {
     arp_policy_changed: bool,
     nat44_udp: NatChange,
     nat44_tcp: NatChange,
+    nat44_icmp_presence: Option<Delta<bool>>,
+    nat44_icmp: NatChange,
     backend: BackendChange,
     restart_required: Box<[RestartRequired]>,
     flush: StateFlush,
@@ -354,6 +361,8 @@ impl ApplyPlan {
             arp_policy_changed: current.arp() != next.arp(),
             nat44_udp: nat_change(&old, &new, Protocol::Udp),
             nat44_tcp: nat_change(&old, &new, Protocol::Tcp),
+            nat44_icmp_presence: delta(old.icmp.is_some(), new.icmp.is_some()),
+            nat44_icmp: icmp_change(&old, &new),
             backend,
             restart_required: restart_required.into_boxed_slice(),
             flush: StateFlush::ALL,
@@ -467,6 +476,23 @@ impl ApplyPlan {
     #[must_use]
     pub const fn nat44_tcp(&self) -> NatChange {
         self.nat44_tcp
+    }
+
+    /// Whether ICMP query NAT (N5) is added or removed: a storage-shape
+    /// change, so restart-required.
+    #[must_use]
+    pub const fn nat44_icmp_presence(&self) -> Option<Delta<bool>> {
+        self.nat44_icmp_presence
+    }
+
+    /// Difference of ICMP query NAT (N5) when both documents configure it
+    /// (empty otherwise). `ports` is the identifier pool and
+    /// `port_preservation` the identifier preservation switch; `realm` is
+    /// shared with UDP/TCP and `hairpinning` and the TCP-only fields are
+    /// always `None`.
+    #[must_use]
+    pub const fn nat44_icmp(&self) -> NatChange {
+        self.nat44_icmp
     }
 
     /// Difference of the `[backend]` section; non-empty exactly when
@@ -677,6 +703,57 @@ fn nat_change(
     }
 }
 
+fn icmp_change(old: &RequiredServices<'_>, new: &RequiredServices<'_>) -> NatChange {
+    let empty = NatChange {
+        realm: None,
+        ports: None,
+        filtering: None,
+        hairpinning: None,
+        port_preservation: None,
+        mappings_per_host: None,
+        inbound_sessions_per_remote: None,
+        unsolicited_syn_icmp: None,
+        inbound_rst: None,
+        policy_changed: false,
+    };
+    let (Some(old), Some(new)) = (old.icmp, new.icmp) else {
+        return empty;
+    };
+    let range = |icmp: &ruster_config::ValidatedNat44IcmpV1| NatPortRange {
+        first: icmp.first_identifier(),
+        last: icmp.last_identifier(),
+    };
+    let realm = |icmp: &ruster_config::ValidatedNat44IcmpV1| NatRealm {
+        inside: icmp.inside(),
+        outside: icmp.outside(),
+        public_address: icmp.public_address(),
+    };
+    let (old_policy, new_policy) = (old.policy(), new.policy());
+    // Filtering, identifier preservation, and the per-host limit are
+    // reported separately; the rest of the policy (seed, idle timeout, error
+    // translation) only as changed.
+    let rest = old_policy
+        .with_filtering(new_policy.filtering())
+        .expect("a validated filtering is supported")
+        .with_identifier_preservation(new_policy.identifier_preservation())
+        .with_mappings_per_host(new_policy.mappings_per_host());
+    NatChange {
+        realm: delta(realm(old), realm(new)),
+        ports: delta(range(old), range(new)),
+        filtering: delta(old_policy.filtering(), new_policy.filtering()),
+        port_preservation: delta(
+            old_policy.identifier_preservation(),
+            new_policy.identifier_preservation(),
+        ),
+        mappings_per_host: delta(
+            old_policy.mappings_per_host(),
+            new_policy.mappings_per_host(),
+        ),
+        policy_changed: rest != new_policy,
+        ..empty
+    }
+}
+
 /// Typed, value-free failure to issue a candidate.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -698,6 +775,8 @@ struct IssuedKeys {
     nat44_tcp: Nat44TcpHashKey,
     firewall: FirewallHashKey,
     resolution: ResolutionHashKey,
+    /// `None` for a generation without ICMP query NAT (N5).
+    nat44_icmp: Option<ruster_core::Nat44IcmpHashKey>,
 }
 
 /// Control-owned generation allocator and key-reuse guard.
@@ -787,6 +866,7 @@ impl<S: PublicationKeySource> PublicationSequencer<S> {
             nat44_tcp: authority.nat44_tcp_hash_key(),
             firewall: authority.firewall_config().hash_key(),
             resolution: authority.resolution_hash_key(),
+            nat44_icmp: authority.nat44_icmp_hash_key(),
         };
         for issued in &self.issued {
             let reused = if issued.nat44_udp == keys.nat44_udp {
@@ -797,6 +877,8 @@ impl<S: PublicationKeySource> PublicationSequencer<S> {
                 Some(RuntimeService::Firewall)
             } else if issued.resolution == keys.resolution {
                 Some(RuntimeService::Resolution)
+            } else if issued.nat44_icmp.is_some() && issued.nat44_icmp == keys.nat44_icmp {
+                Some(RuntimeService::Nat44Icmp)
             } else {
                 None
             };

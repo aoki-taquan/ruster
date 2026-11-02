@@ -134,3 +134,49 @@ impl UdpTestIndexes {
         .unwrap()
     }
 }
+
+/// An ICMP query NAT runtime (N5) on leaked storage sized like a UDP
+/// runtime's, with the identifier pool as the port pool.
+#[allow(dead_code)]
+pub fn icmp_runtime(
+    config: ruster_core::Nat44IcmpConfig,
+    mapping_capacity: usize,
+    peer_capacity: usize,
+) -> ruster_core::Nat44IcmpRuntime<'static> {
+    let bucket_count = |capacity: usize| {
+        if capacity == 0 {
+            0
+        } else {
+            capacity.next_power_of_two()
+        }
+    };
+    let leak = |count: usize, value: DirectoryBucket| -> &'static mut [DirectoryBucket] {
+        Box::leak(vec![value; count].into_boxed_slice())
+    };
+    let nodes = |count: usize| -> &'static mut [DirectoryNode] {
+        Box::leak(vec![DirectoryNode::default(); count].into_boxed_slice())
+    };
+    let identifiers = usize::from(config.last_identifier() - config.first_identifier()) + 1;
+    let storage = Nat44UdpIndexStorage::new(
+        leak(bucket_count(mapping_capacity), DirectoryBucket::default()),
+        nodes(mapping_capacity),
+        leak(bucket_count(peer_capacity), DirectoryBucket::default()),
+        nodes(peer_capacity),
+        Box::leak(vec![PortOwnerSlot::default(); identifiers].into_boxed_slice()),
+        Box::leak(vec![0_u64; port_free_bitmap_words(identifiers)].into_boxed_slice()),
+        Nat44HostStorage::new(
+            Box::leak(vec![Nat44HostLink::EMPTY; mapping_capacity].into_boxed_slice()),
+            Box::leak(vec![Nat44UdpHostSlot::EMPTY; mapping_capacity].into_boxed_slice()),
+            leak(bucket_count(mapping_capacity), DirectoryBucket::default()),
+            nodes(mapping_capacity),
+        ),
+    );
+    ruster_core::Nat44IcmpRuntime::new(
+        config,
+        Box::leak(vec![Nat44UdpMappingSlot::default(); mapping_capacity].into_boxed_slice()),
+        Box::leak(vec![Nat44UdpPeerSlot::default(); peer_capacity].into_boxed_slice()),
+        storage,
+        ruster_core::Nat44IcmpHashKey::new(0x5eed_1c3b_0bad_f00d, 0x0fed_cba9_8765_4321).unwrap(),
+    )
+    .unwrap()
+}

@@ -115,18 +115,43 @@ impl FirewallPortRange {
     }
 }
 
+/// Transport of a firewall rule and flow.
+///
+/// [`FirewallProtocol::Icmp`] covers ICMP queries only (Echo and Timestamp,
+/// N5): a query has no ports, so the forwarding path gives the firewall a
+/// pseudo-port tuple in which the reply is the exact reverse of its request.
+/// A request with identifier `id` and type `t` (8 or 13) is
+/// `source_port = id, destination_port = t`; its reply (type 0 or 14) is
+/// `source_port = t, destination_port = id`. A stateful flow created by a
+/// request therefore admits only the matching reply, never a request in the
+/// reverse direction. ICMP rules match any identifier (their port ranges
+/// are the full range), and ICMP flows use the UDP idle TTL. ICMP errors are
+/// never evaluated as ICMP flows: they are admitted only as RELATED to a
+/// live flow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FirewallProtocol {
     Tcp,
     Udp,
+    Icmp,
 }
 
 impl FirewallProtocol {
     pub(crate) const fn from_ipv4(protocol: u8) -> Option<Self> {
         match protocol {
+            1 => Some(Self::Icmp),
             6 => Some(Self::Tcp),
             17 => Some(Self::Udp),
             _ => None,
+        }
+    }
+
+    /// The IPv4 protocol number.
+    #[must_use]
+    pub const fn ipv4_protocol(self) -> u8 {
+        match self {
+            Self::Icmp => 1,
+            Self::Tcp => 6,
+            Self::Udp => 17,
         }
     }
 }
@@ -670,13 +695,7 @@ fn rules_fingerprint(rules: &[FirewallRule]) -> u64 {
             u64::from(u32::from_be_bytes(rule.destination.address.octets())),
         );
         hash = mix(hash, u64::from(rule.destination.prefix_len));
-        hash = mix(
-            hash,
-            match rule.protocol {
-                FirewallProtocol::Tcp => 6,
-                FirewallProtocol::Udp => 17,
-            },
-        );
+        hash = mix(hash, u64::from(rule.protocol.ipv4_protocol()));
         hash = mix(hash, u64::from(rule.source_ports.first));
         hash = mix(hash, u64::from(rule.source_ports.last));
         hash = mix(hash, u64::from(rule.destination_ports.first));
@@ -1110,10 +1129,7 @@ fn canonical_flow_words(packet: FirewallPacket, config_generation: u64) -> [u64;
     }
     [
         config_generation,
-        match packet.protocol {
-            FirewallProtocol::Tcp => 6,
-            FirewallProtocol::Udp => 17,
-        },
+        u64::from(packet.protocol.ipv4_protocol()),
         u64::from(first.0),
         u64::from(first.1),
         u64::from(first.2),
@@ -1960,7 +1976,10 @@ impl<'state> FirewallRuntime<'state> {
 
     fn slot_ttl(&self, slot: FirewallStateSlot) -> u64 {
         match (slot.protocol, slot.tcp_phase) {
-            (FirewallProtocol::Udp, _) => self.binding.policy.udp_idle_ttl_ms,
+            // ICMP query flows (N5) share the datagram idle TTL.
+            (FirewallProtocol::Udp | FirewallProtocol::Icmp, _) => {
+                self.binding.policy.udp_idle_ttl_ms
+            }
             (FirewallProtocol::Tcp, FirewallTcpPhase::Opening) => {
                 self.binding.policy.tcp_opening_idle_ttl_ms
             }

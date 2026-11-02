@@ -3,9 +3,10 @@ use std::num::NonZeroU64;
 use ruster_core::{
     ArpPolicy, FirewallConfig, FirewallConfigError, FirewallHashKey, FirewallPolicy, FirewallRule,
     ForwardingSnapshot, Icmpv4ErrorPolicy, IfId, Interface, Ipv4Address, Ipv4OriginPolicy,
-    LocalIpv4Binding, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpHashKey, Nat44TcpPolicy,
-    Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpHashKey, Nat44UdpPolicy, Neighbor,
-    ResolutionHashKey, ResolutionPolicy, Route, ValidatedFirewallOwner, ValidatedForwardingOwner,
+    LocalIpv4Binding, Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpHashKey, Nat44IcmpPolicy,
+    Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpHashKey, Nat44TcpPolicy, Nat44UdpConfig,
+    Nat44UdpConfigError, Nat44UdpHashKey, Nat44UdpPolicy, Neighbor, ResolutionHashKey,
+    ResolutionPolicy, Route, ValidatedFirewallOwner, ValidatedForwardingOwner,
     ValidatedForwardingOwnerError,
 };
 
@@ -290,12 +291,20 @@ impl Nat44TcpStoragePlan {
     }
 }
 
+/// Storage of the optional ICMP query NAT (N5): the datagram mapping
+/// engine's tables, with one owner slot per public identifier in place of
+/// the port owners.
+pub type Nat44IcmpStoragePlan = Nat44UdpStoragePlan;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FullServiceStorageShape {
     resolution: ResolutionStorageShape,
     icmpv4_errors: Icmpv4ErrorStorageShape,
     nat44_udp: Nat44UdpStoragePlan,
     nat44_tcp: Nat44TcpStoragePlan,
+    /// `None` without ICMP query NAT; adding or removing it changes the
+    /// shape (restart-required).
+    nat44_icmp: Option<Nat44IcmpStoragePlan>,
     firewall_state_slots: u32,
 }
 
@@ -313,8 +322,21 @@ impl FullServiceStorageShape {
             icmpv4_errors,
             nat44_udp,
             nat44_tcp,
+            nat44_icmp: None,
             firewall_state_slots,
         }
+    }
+
+    /// This shape with ICMP query NAT storage (N5).
+    #[must_use]
+    pub const fn with_nat44_icmp(mut self, plan: Nat44IcmpStoragePlan) -> Self {
+        self.nat44_icmp = Some(plan);
+        self
+    }
+
+    #[must_use]
+    pub const fn nat44_icmp(self) -> Option<Nat44IcmpStoragePlan> {
+        self.nat44_icmp
     }
 
     #[must_use]
@@ -419,6 +441,43 @@ impl Nat44TcpPublicationInput {
     }
 }
 
+/// Complete ICMP query NAT publication input (N5).
+///
+/// No `Debug` or `Clone`: it carries a publication hash key.
+pub struct Nat44IcmpPublicationInput {
+    inside: IfId,
+    outside: IfId,
+    public_address: Ipv4Address,
+    first_identifier: u16,
+    last_identifier: u16,
+    policy: Nat44IcmpPolicy,
+    hash_key: Nat44IcmpHashKey,
+}
+
+impl Nat44IcmpPublicationInput {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub const fn new(
+        inside: IfId,
+        outside: IfId,
+        public_address: Ipv4Address,
+        first_identifier: u16,
+        last_identifier: u16,
+        policy: Nat44IcmpPolicy,
+        hash_key: Nat44IcmpHashKey,
+    ) -> Self {
+        Self {
+            inside,
+            outside,
+            public_address,
+            first_identifier,
+            last_identifier,
+            policy,
+            hash_key,
+        }
+    }
+}
+
 /// Owned firewall input. Rules and the hash key are never formatted.
 pub struct FirewallPublicationInput {
     rules: Box<[FirewallRule]>,
@@ -475,6 +534,7 @@ pub struct PublicationPlan {
     resolution_hash_key: Option<ResolutionHashKey>,
     nat44_udp: Option<Nat44UdpPublicationInput>,
     nat44_tcp: Option<Nat44TcpPublicationInput>,
+    nat44_icmp: Option<Nat44IcmpPublicationInput>,
     firewall: Option<FirewallPublicationInput>,
 }
 
@@ -506,8 +566,18 @@ impl PublicationPlan {
             resolution_hash_key: None,
             nat44_udp: None,
             nat44_tcp: None,
+            nat44_icmp: None,
             firewall: None,
         }
+    }
+
+    /// Adds the optional ICMP query NAT (N5). Its storage must be in the
+    /// shape ([`FullServiceStorageShape::with_nat44_icmp`]) and its realm
+    /// must match UDP and TCP.
+    #[must_use]
+    pub fn with_nat44_icmp(mut self, input: Nat44IcmpPublicationInput) -> Self {
+        self.nat44_icmp = Some(input);
+        self
     }
 
     /// Supplies the secret key of the resolution runtime's hashed indexes
@@ -553,11 +623,23 @@ pub enum RuntimeService {
     Nat44Udp,
     Nat44Tcp,
     Firewall,
+    /// The optional ICMP query NAT (N5).
+    Nat44Icmp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum StorageShapeError {
+    /// ICMP query NAT storage (N5) is present without the service or the
+    /// service without its storage.
+    IcmpPresence,
+    IcmpMappingNodeCount,
+    IcmpPeerNodeCount,
+    IcmpMappingDirectory,
+    IcmpPeerDirectory,
+    /// Identifier owner slots differ from the identifier pool size.
+    IcmpIdentifierOwnerCount,
+    IcmpHostSlotCount,
     UdpMappingNodeCount,
     UdpPeerNodeCount,
     UdpMappingDirectory,
@@ -583,6 +665,7 @@ pub enum PublicationCandidateError {
     Forwarding(ValidatedForwardingOwnerError),
     Nat44Udp(Nat44UdpConfigError),
     Nat44Tcp(Nat44TcpConfigError),
+    Nat44Icmp(Nat44IcmpConfigError),
     Nat44RealmMismatch,
     Firewall(FirewallConfigError),
 }
@@ -619,6 +702,7 @@ pub struct ValidatedCandidate {
     nat44_udp_hash_key: Nat44UdpHashKey,
     nat44_tcp: Nat44TcpConfig,
     nat44_tcp_hash_key: Nat44TcpHashKey,
+    nat44_icmp: Option<(Nat44IcmpConfig, Nat44IcmpHashKey)>,
     firewall: ValidatedFirewallOwner,
     forwarding: ValidatedForwardingOwner,
 }
@@ -639,6 +723,7 @@ impl ValidatedCandidate {
             resolution_hash_key,
             nat44_udp,
             nat44_tcp,
+            nat44_icmp,
             firewall,
         } = plan;
         let resolution_hash_key = resolution_hash_key.ok_or(
@@ -692,6 +777,35 @@ impl ValidatedCandidate {
         }
         validate_port_owner_shapes(storage_shape, udp_config, tcp_config)
             .map_err(PublicationCandidateError::StorageShape)?;
+        let nat44_icmp = match (nat44_icmp, storage_shape.nat44_icmp) {
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(PublicationCandidateError::StorageShape(
+                    StorageShapeError::IcmpPresence,
+                ))
+            }
+            (Some(input), Some(plan)) => {
+                let config = Nat44IcmpConfig::new(
+                    &snapshot,
+                    input.inside,
+                    input.outside,
+                    input.public_address,
+                    input.first_identifier,
+                    input.last_identifier,
+                    input.policy,
+                )
+                .map_err(PublicationCandidateError::Nat44Icmp)?;
+                if config.inside() != udp_config.inside()
+                    || config.outside() != udp_config.outside()
+                    || config.public_address() != udp_config.public_address()
+                {
+                    return Err(PublicationCandidateError::Nat44RealmMismatch);
+                }
+                validate_icmp_shape(plan, config)
+                    .map_err(PublicationCandidateError::StorageShape)?;
+                Some((config, input.hash_key))
+            }
+        };
         let firewall_owner = ValidatedFirewallOwner::new(
             &snapshot,
             firewall.rules,
@@ -711,6 +825,7 @@ impl ValidatedCandidate {
             nat44_udp_hash_key: nat44_udp.hash_key,
             nat44_tcp: tcp_config,
             nat44_tcp_hash_key: nat44_tcp.hash_key,
+            nat44_icmp,
             firewall: firewall_owner,
             forwarding,
         })
@@ -748,6 +863,7 @@ impl ValidatedCandidate {
             nat44_udp_hash_key: self.nat44_udp_hash_key,
             nat44_tcp: self.nat44_tcp,
             nat44_tcp_hash_key: self.nat44_tcp_hash_key,
+            nat44_icmp: self.nat44_icmp,
             firewall: self.firewall.config(),
         }
     }
@@ -765,6 +881,11 @@ impl ValidatedCandidate {
         }
         if candidate.nat44_tcp_hash_key == self.nat44_tcp_hash_key {
             return Err(SuccessorError::Nat44TcpHashKeyReused);
+        }
+        if let (Some((_, new)), Some((_, old))) = (candidate.nat44_icmp, self.nat44_icmp) {
+            if new == old {
+                return Err(SuccessorError::Nat44IcmpHashKeyReused);
+            }
         }
         if candidate.firewall.config().hash_key() == self.firewall.config().hash_key() {
             return Err(SuccessorError::FirewallHashKeyReused);
@@ -859,6 +980,7 @@ pub struct ValidatedAuthority<'view> {
     nat44_udp_hash_key: Nat44UdpHashKey,
     nat44_tcp: Nat44TcpConfig,
     nat44_tcp_hash_key: Nat44TcpHashKey,
+    nat44_icmp: Option<(Nat44IcmpConfig, Nat44IcmpHashKey)>,
     firewall: FirewallConfig<'view>,
 }
 
@@ -908,6 +1030,23 @@ impl<'view> ValidatedAuthority<'view> {
         self.nat44_tcp_hash_key
     }
 
+    /// The ICMP query NAT config (N5), if configured.
+    #[must_use]
+    pub const fn nat44_icmp_config(&self) -> Option<Nat44IcmpConfig> {
+        match self.nat44_icmp {
+            Some((config, _)) => Some(config),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn nat44_icmp_hash_key(&self) -> Option<Nat44IcmpHashKey> {
+        match self.nat44_icmp {
+            Some((_, key)) => Some(key),
+            None => None,
+        }
+    }
+
     #[must_use]
     pub const fn firewall_config(&self) -> FirewallConfig<'view> {
         self.firewall
@@ -921,6 +1060,7 @@ pub enum SuccessorError {
     GenerationNotIncreasing,
     Nat44UdpHashKeyReused,
     Nat44TcpHashKeyReused,
+    Nat44IcmpHashKeyReused,
     FirewallHashKeyReused,
     ResolutionHashKeyReused,
     StorageShapeChanged,
@@ -1000,6 +1140,35 @@ fn validate_port_owner_shapes(
         && shape.nat44_tcp.host_slots != shape.nat44_tcp.mapping_slots
     {
         return Err(StorageShapeError::TcpHostSlotCount);
+    }
+    Ok(())
+}
+
+fn validate_icmp_shape(
+    plan: Nat44IcmpStoragePlan,
+    config: Nat44IcmpConfig,
+) -> Result<(), StorageShapeError> {
+    if plan.mapping_nodes != plan.mapping_slots {
+        return Err(StorageShapeError::IcmpMappingNodeCount);
+    }
+    if plan.peer_nodes != plan.peer_slots {
+        return Err(StorageShapeError::IcmpPeerNodeCount);
+    }
+    if !directory_shape_valid(plan.mapping_buckets, plan.mapping_nodes) {
+        return Err(StorageShapeError::IcmpMappingDirectory);
+    }
+    if !directory_shape_valid(plan.peer_buckets, plan.peer_nodes) {
+        return Err(StorageShapeError::IcmpPeerDirectory);
+    }
+    let identifiers =
+        u32::from(config.last_identifier()) - u32::from(config.first_identifier()) + 1;
+    if plan.port_owner_slots != identifiers {
+        return Err(StorageShapeError::IcmpIdentifierOwnerCount);
+    }
+    if (plan.host_slots != 0 && plan.host_slots != plan.mapping_slots)
+        || (config.policy().mappings_per_host() != 0 && plan.host_slots != plan.mapping_slots)
+    {
+        return Err(StorageShapeError::IcmpHostSlotCount);
     }
     Ok(())
 }

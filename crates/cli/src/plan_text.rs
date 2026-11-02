@@ -101,6 +101,9 @@ fn rule(rule: &FirewallRule) -> String {
     let protocol = match rule.protocol() {
         FirewallProtocol::Tcp => "tcp",
         FirewallProtocol::Udp => "udp",
+        // ICMP query rules (N5) match every identifier; the full ranges
+        // are printed as for any rule.
+        FirewallProtocol::Icmp => "icmp",
     };
     let action = match rule.action() {
         FirewallAction::AllowStateful => "allow-stateful",
@@ -155,10 +158,16 @@ fn nat(lines: &mut Vec<String>, kind: &str, change: NatChange) {
         };
         lines.push(format!("{kind} realm ~ {} -> {}", realm(old), realm(new)));
     }
+    // ICMP query NAT (N5) uses the NAT change with identifiers for ports.
+    let icmp = kind == "nat44-icmp";
     if let Some(Delta { old, new }) = change.ports {
         lines.push(format!(
-            "{kind} ports ~ {}-{} -> {}-{}",
-            old.first, old.last, new.first, new.last
+            "{kind} {} ~ {}-{} -> {}-{}",
+            if icmp { "identifiers" } else { "ports" },
+            old.first,
+            old.last,
+            new.first,
+            new.last
         ));
     }
     if let Some(Delta { old, new }) = change.filtering {
@@ -179,7 +188,12 @@ fn nat(lines: &mut Vec<String>, kind: &str, change: NatChange) {
     if let Some(Delta { old, new }) = change.port_preservation {
         let switch = |enabled: bool| if enabled { "on" } else { "off" };
         lines.push(format!(
-            "{kind} port-preservation ~ {} -> {}",
+            "{kind} {} ~ {} -> {}",
+            if icmp {
+                "identifier-preservation"
+            } else {
+                "port-preservation"
+            },
             switch(old),
             switch(new)
         ));
@@ -273,7 +287,7 @@ fn backend(lines: &mut Vec<String>, change: &BackendChange) {
     changes(lines, "backend-port", &change.ports, port);
 }
 
-fn flush_lines(flush: StateFlush) -> [(&'static str, FlushCount); 11] {
+fn flush_lines(flush: StateFlush) -> [(&'static str, FlushCount); 13] {
     [
         ("resolution_states", flush.resolution_states),
         ("resolution_actions", flush.resolution_actions),
@@ -285,6 +299,8 @@ fn flush_lines(flush: StateFlush) -> [(&'static str, FlushCount); 11] {
         ("nat44_udp_peers", flush.nat44_udp_peers),
         ("nat44_tcp_mappings", flush.nat44_tcp_mappings),
         ("nat44_tcp_sessions", flush.nat44_tcp_sessions),
+        ("nat44_icmp_mappings", flush.nat44_icmp_mappings),
+        ("nat44_icmp_peers", flush.nat44_icmp_peers),
         ("firewall_flows", flush.firewall_flows),
     ]
 }
@@ -321,6 +337,11 @@ pub fn render(plan: &ApplyPlan) -> String {
     }
     nat(&mut lines, "nat44-udp", plan.nat44_udp());
     nat(&mut lines, "nat44-tcp", plan.nat44_tcp());
+    if let Some(Delta { old, new }) = plan.nat44_icmp_presence() {
+        let switch = |enabled: bool| if enabled { "on" } else { "off" };
+        lines.push(format!("nat44-icmp ~ {} -> {}", switch(old), switch(new)));
+    }
+    nat(&mut lines, "nat44-icmp", plan.nat44_icmp());
     backend(&mut lines, plan.backend());
 
     let mut text = String::new();
