@@ -37,6 +37,17 @@
 #   holder   attach in a separate process, SIGKILL it, link auto-detaches
 set -eu
 
+# RUSTER_REQUIRE_PRIV=1 (the `XDP veth` CI job) is passed to the privileged
+# tests, which then fail instead of skipping. Empty counts as unset (it is
+# not passed on). Nothing here ever skips.
+case ${RUSTER_REQUIRE_PRIV-} in
+"" | 1) ;;
+*)
+    echo "priv-xdp-smoke: RUSTER_REQUIRE_PRIV must be 1 or unset" >&2
+    exit 1
+    ;;
+esac
+
 for tool in cargo ip sudo python3 od; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "priv-xdp-smoke: missing $tool" >&2
@@ -72,6 +83,23 @@ fwd_b=rx00c6
 fwd_b_peer=rx00c7
 work=$(mktemp -d "${TMPDIR:-/tmp}/ruster-priv-xdp.XXXXXX")
 binary_path=$(readlink -f "$binary")
+
+# Every privileged test must be wired to a phase below: a new `priv_xdp_*`
+# test that is not listed here fails the smoke instead of never running.
+wired='priv_xdp_adapter_forwards_between_two_veth_ports_through_core_and_drains
+priv_xdp_attach_holder_waits_for_sigkill
+priv_xdp_attach_redirects_refuses_second_and_detaches_on_netns_veth
+priv_xdp_attach_refuses_foreign_program_and_leaves_it_untouched
+priv_xdp_engine_validates_and_recycles_peer_frames
+priv_xdp_generated_arp_request_is_learned_by_the_peer_and_drained
+priv_xdp_session_opens_copy_mode_on_netns_veth
+priv_xdp_tx_reflects_peer_frame_completes_and_drains_on_netns_veth'
+listed=$("$binary" --list --format=terse | sed -n 's/^\(priv_xdp_[a-z0-9_]*\): test$/\1/p' | LC_ALL=C sort)
+[ "$listed" = "$(printf '%s\n' "$wired" | LC_ALL=C sort)" ] || {
+    echo "priv-xdp-smoke: privileged tests differ from the wired phases" >&2
+    printf 'listed:\n%s\nwired:\n%s\n' "$listed" "$wired" >&2
+    exit 1
+}
 holder_pid=
 launcher=
 
@@ -116,10 +144,14 @@ in_netns() {
     sudo -n ip netns exec "$netns" "$@"
 }
 
-# Two queues per end: native veth XDP needs RX queues >= the peer's TX
-# queues, and a second socket on queue 1 exercises a second attach.
+# Two queues on the device: a second socket on queue 1 exercises a second
+# attach. The peer has a single TX queue, so every frame it sends lands on
+# the device's RX queue 0 (veth maps the peer's TX queue to the RX queue)
+# instead of on queue 1, where the XDP program drops it; with two peer TX
+# queues the choice follows a per-boot flow hash and the RX phases flaked
+# on CI. Native veth XDP needs RX queues >= the peer's TX queues (2 >= 1).
 sudo -n ip -n "$netns" link add "$device" numtxqueues 2 numrxqueues 2 type veth \
-    peer name "$peer" numtxqueues 2 numrxqueues 2
+    peer name "$peer" numtxqueues 1 numrxqueues 2
 sudo -n ip -n "$netns" link set "$device" up
 sudo -n ip -n "$netns" link set "$peer" up
 # RX 4 / TX 2: queues 2 and 3 have RX but no TX (also only inside netns).
@@ -147,6 +179,7 @@ run_phase() {
     log="$work/$phase.log"
     status=0
     in_netns env \
+        ${RUSTER_REQUIRE_PRIV:+"RUSTER_REQUIRE_PRIV=$RUSTER_REQUIRE_PRIV"} \
         RUSTER_PRIV_XDP=1 \
         RUSTER_PRIV_XDP_PHASE="$phase" \
         RUSTER_PRIV_XDP_NETNS="$netns" \
@@ -240,6 +273,7 @@ test -z "$(xdp_prog)" || {
 
 # Holder: attach in a separate process, then SIGKILL it.
 in_netns env \
+    ${RUSTER_REQUIRE_PRIV:+"RUSTER_REQUIRE_PRIV=$RUSTER_REQUIRE_PRIV"} \
     RUSTER_PRIV_XDP=1 \
     RUSTER_PRIV_XDP_PHASE=holder \
     RUSTER_PRIV_XDP_NETNS="$netns" \

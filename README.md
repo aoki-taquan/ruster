@@ -731,8 +731,8 @@ checkです。musl向けartifactのlink、test実行、実NICでのruntime compa
 MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test -p ruster-io-xdp-native --lib
 ```
 
-AF_XDP native session/XDP attachのprivileged smokeはCIでは実行せず（workflowはX04）、`sudo -n`が
-使えるLinux 5.9以上のhost（`ip`はlibbpf付きiproute2、`python3`が必要）で明示的に実行します。
+AF_XDP native session/XDP attachのprivileged smokeは`sudo -n`が使えるLinux 5.9以上のhost
+（`ip`はlibbpf付きiproute2、`python3`が必要）で明示的に実行します（CIでは下の`XDP veth` job）。
 
 ```bash
 scripts/priv-xdp-smoke.sh
@@ -748,7 +748,11 @@ auto-detachと再起動（transientなBusy/MemlockLimitはrouter自身もretry�
 M2 S10bのops phase（一つの稼働中routerでSIGHUP reloadによりUDP ruleをdenyにして届かなくなり、
 戻して再び届く。generation 2/3でrestartなし。UMEM shapeを変えたreloadは`RESTART_REQUIRED`で
 拒否され転送は継続。router netns内の`ip link set ra down/up`でwarningとrecovered、転送回復。rbの
-MTUをframe上限超へ上げるとexit 1でdetach）、最後にrouter netns内でraのvethを削除するとexit 1
+MTUをframe上限超へ上げるとexit 1でdetach）、kernel forwardingの段（`ip_forward=1`の起動拒否、
+overrideでのwarning、稼働中のwarningとrecovered。M2 S11で`ip_forward=0`のまま
+`conf/ra/forwarding=1`の起動拒否`scope=device`と稼働中のif1だけのwarning/recoveredを追加）、
+読まれないFIFOへstdoutを向けたstuck phase（FIFOがcapacityまで埋まり動かないことを`FIONREAD`で
+確かめてからSIGTERM、有界時間でexit 0）、最後にrouter netns内でraのvethを削除するとexit 1
 （`DEVICE_REMOVED`）で何もattachが残らないことを確認し、成否によらず三つのnetnsを削除します。
 
 ```bash
@@ -769,6 +773,37 @@ ARP requestを生成してcommitし、peerが送信元を`ip neigh`に学習、c
 generated poolへcopyし、Bのpeerが書き換え済みMACとTTLで受信、60 frame burstが一batchで完了、netns内の`ip link set down/up`によるBのlink flapから新しいtrafficなしにquiescenceがreadyへ戻る、両portをdrain、X04a）、foreign（`ip link set ... xdpgeneric obj`で
 付けた外部programを両modeで拒否しprogram id不変。objectは`scripts/priv-xdp-foreign-elf.py`が
 compilerなしで生成）、holder（attachした別processをSIGKILLしlinkが消える）の順です。
+
+### CI: `XDP veth` job（M2 S11）
+
+`.github/workflows/xdp-veth.yml`の`XDP veth` jobは、pull requestとmainへのpushごとに
+`ubuntu-24.04` hosted runner（passwordless sudo）で上の二つのprivileged smokeを実行します
+（30分上限、`permissions: contents: read`、secretなし。required checkにするかはowner決定で未決）。
+
+1. `scripts/priv-xdp-probe.sh`: kernel 5.9以上、sudo下の`CapEff`、libbpf付きiproute2、throwaway
+   netns（`ruster-probe-<pid>-<random>`）内でのveth作成とsysctl書き込み、`socket(AF_XDP)`、
+   generic/native XDP attachを確かめます。どれかができなければ`priv-xdp-probe: FAIL code=PROBE_*`
+   でjobがfailし、skipやvacuousなpassにはなりません。netnsは必ず削除します。
+2. binaryとtest binaryをrunner userでbuildし、skip/fail判定の純粋関数test
+   （`priv_gate_fails_instead_of_skipping_when_required`）を非特権で実行。
+3. `RUSTER_REQUIRE_PRIV=1`で`scripts/priv-xdp-smoke.sh`（`priv_xdp_session`の各phase）と
+   `scripts/priv-run-smoke.sh`。この変数の下ではtestは`RUSTER_PRIV_XDP`が無い・phaseが選ばれて
+   いない場合もskipせずfailします。scriptは`1`か未設定だけを受け、空文字は未設定として扱います
+   （testへ渡さない）。`priv-xdp-smoke.sh`はtest binaryの`priv_xdp_*` testの集合が配線済みphaseと
+   一致しなければfailします。
+4. `ruster-*` netnsが残っていないことを確認し、失敗時はsmoke log（value-free、throwaway netns内）
+   をartifactとして保存します。
+
+localでも同じ順に実行できます（`TMPDIR`は小さい`/tmp`を避けたい場合に指定）。
+
+```bash
+scripts/priv-xdp-probe.sh
+RUSTER_REQUIRE_PRIV=1 scripts/priv-xdp-smoke.sh
+RUSTER_REQUIRE_PRIV=1 scripts/priv-run-smoke.sh
+```
+
+検証するのはhosted runnerのkernel一つとveth copy/native modeだけで、zero-copy NICや5.9〜6.xの
+網羅、性能は対象外です（runbookの「CI and E2E」）。
 
 設計契約と非対象は[architecture v0.2](docs/architecture-v0.2.md)、要件とRFC根拠は
 [requirements](docs/requirements-v0.2.md)、production backendから自宅ラボ運用までの

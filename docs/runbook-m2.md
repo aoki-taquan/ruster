@@ -437,5 +437,56 @@ link down/up on the router's port with recovered forwarding; an MTU above
 the frame bound and a deleted port device, both exit 1 with nothing
 attached; rollback after a second-port failure; the device checks; kernel
 forwarding refused by default and accepted with `--allow-kernel-forwarding`;
-SIGKILL
-and restart). It never touches interfaces outside its namespaces.
+per-port `conf/<dev>/forwarding` refused at startup (`scope=device`) and
+warned then recovered while running with `ip_forward=0`; an undrained
+stdout FIFO proven full before SIGTERM; SIGKILL and restart). It never
+touches interfaces outside its namespaces.
+
+## 8. CI and E2E (M2 S11)
+
+The `XDP veth` job (`.github/workflows/xdp-veth.yml`) runs on every pull
+request and push to `main`, on an `ubuntu-24.04` hosted runner with
+passwordless sudo. It is not a required check yet (owner decision).
+
+What it proves, on the runner's kernel only:
+
+- The environment can do AF_XDP at all. `scripts/priv-xdp-probe.sh` runs
+  first and fails the job with one typed code instead of letting a later
+  step skip: `PROBE_TOOL_MISSING`, `PROBE_SUDO`, `PROBE_KERNEL_TOO_OLD`
+  (< 5.9), `PROBE_CAPABILITIES` (root's `CapEff` lacks NET_ADMIN, NET_RAW,
+  IPC_LOCK, or BPF+PERFMON/SYS_ADMIN), `PROBE_IPROUTE_LIBBPF`,
+  `PROBE_NETNS`, `PROBE_VETH`, `PROBE_SYSCTL`, `PROBE_AF_XDP_SOCKET`,
+  `PROBE_XDP_GENERIC`, `PROBE_XDP_NATIVE`, `PROBE_CLEANUP`. Everything it
+  does happens in a throwaway `ruster-probe-<pid>-<random>` namespace that
+  it always deletes.
+- The native layer on a real kernel: `scripts/priv-xdp-smoke.sh` (the
+  `priv_xdp_session` phases: session, attach, engine, tx, generated,
+  adapter, foreign program, SIGKILL holder).
+- The operator flows of sections 2-5 end to end: `scripts/priv-run-smoke.sh`
+  (section 7).
+- Nothing is left behind: a final step fails if any `ruster-*` namespace
+  survives. Smoke logs are uploaded as an artifact when the job fails.
+
+Both smokes run with `RUSTER_REQUIRE_PRIV=1`: the privileged tests then
+fail (`PRIV_REQUIRED: ...`) rather than skip when `RUSTER_PRIV_XDP` is
+missing or their phase is not selected, and the scripts refuse any value
+but `1`; an empty value counts as unset (the scripts do not pass it on).
+Without the variable a plain `cargo test` keeps skipping them.
+`priv-xdp-smoke.sh` also fails when the test binary's `priv_xdp_*` tests
+differ from the phases it runs, so a new privileged test cannot be left
+out silently.
+
+Not covered: zero-copy NICs, kernels other than the runner's (5.9-6.x,
+XDP-062), multi-queue, and performance (X05).
+
+To run the same sequence locally (Linux 5.9+, passwordless `sudo -n`,
+iproute2 with libbpf, `python3`, `ethtool`):
+
+```bash
+scripts/priv-xdp-probe.sh
+RUSTER_REQUIRE_PRIV=1 scripts/priv-xdp-smoke.sh
+RUSTER_REQUIRE_PRIV=1 scripts/priv-run-smoke.sh
+```
+
+Set `TMPDIR` to a roomy directory if `/tmp` is small. The scripts create
+their veth pairs only inside their own namespaces and delete them on exit.
