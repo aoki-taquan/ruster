@@ -134,6 +134,38 @@ fn udp_port_selection_uses_the_udp_key_and_domains() {
     });
 }
 
+/// Takeover probes depend on every input: the mapping generation (one per
+/// created mapping), the time, the probe number, and the endpoint, so the
+/// same endpoint at the same time gets fresh probes for each new mapping.
+#[test]
+fn takeover_probes_depend_on_generation_time_probe_and_endpoint() {
+    let key = DirectoryHashKey::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210).unwrap();
+    let selection = PortSelectionKey {
+        key,
+        start_domain: DirectoryHashDomain::UdpPortStart,
+        takeover_domain: DirectoryHashDomain::UdpPortTakeover,
+        first_port: 1,
+        last_port: 65_535,
+        inside: INSIDE,
+        public_address: PUBLIC,
+        allocator_seed: 7,
+    };
+    let base = |index: usize| selection.takeover_port(INTERNAL, 1_000, index as u64, 0, 0);
+    let mut same = [0_usize; 4];
+    for index in 1..4_096 {
+        let port = base(index);
+        assert!((1..=65_535).contains(&port));
+        same[0] += usize::from(port == base(index + 1));
+        same[1] +=
+            usize::from(port == selection.takeover_port(INTERNAL, 1_000, index as u64, 1, 0));
+        same[2] +=
+            usize::from(port == selection.takeover_port(INTERNAL, 1_000, index as u64, 0, 1));
+        same[3] +=
+            usize::from(port == selection.takeover_port(INTERNAL2, 1_000, index as u64, 0, 0));
+    }
+    assert!(same.iter().all(|&same| same <= 2), "{same:?}");
+}
+
 /// The UDP and TCP selections use separate hash domains (and the start and
 /// the takeover probes separate domains of their own): with the same key
 /// bits and endpoint they agree only by chance.
