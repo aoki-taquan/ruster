@@ -19,9 +19,9 @@ use ruster_core::{
     FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot, FirewallVerdict,
     ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
     MonotonicMillis, Nat44Filtering, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpMappingSlot,
-    Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot,
-    Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace, ResolutionActionSlot,
-    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
+    Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionPhase, Nat44TcpSessionSlot, Nat44UdpConfig,
+    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace,
+    ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
 };
 use ruster_io_sim::{RecycleCause, SimIo};
 use support::UdpTestIndexes;
@@ -49,6 +49,7 @@ const P2: u16 = 5002;
 const SYN: u8 = 0x02;
 const SYN_ACK: u8 = 0x12;
 const ACK: u8 = 0x10;
+const FIN_ACK: u8 = 0x11;
 const MODES: [Nat44Filtering; 3] = [
     Nat44Filtering::EndpointIndependent,
     Nat44Filtering::AddressDependent,
@@ -642,6 +643,40 @@ fn tcp_hairpin_between_hosts_and_hole_punching() {
         let ack = tcp_frame(H1, PUBLIC, P1, public2, ACK);
         world.run(LAN, ack.clone());
         assert_hairpin(&mut world, &ack, H2_MAC, (PUBLIC, public1), (H2, P2));
+
+        // N1: each half tracks its own session through the handshake and
+        // the close: H1's session toward P:public2 and H2's toward
+        // P:public1 are both established, then closing after a FIN each way.
+        // (In the hole-punching order H2 has sent only a SYN so far: its ACK
+        // completes the handshake in every mode.)
+        let ack2 = tcp_frame(H2, PUBLIC, P2, public1, ACK);
+        world.run(LAN, ack2.clone());
+        assert_hairpin(&mut world, &ack2, H1_MAC, (PUBLIC, public2), (H1, P1));
+        let phases = |world: &World| {
+            [public2, public1].map(|remote_port| {
+                world
+                    .tcp
+                    .sessions()
+                    .iter()
+                    .find(|session| {
+                        session.is_occupied()
+                            && session.remote_address() == PUBLIC
+                            && session.remote_port() == remote_port
+                    })
+                    .unwrap()
+                    .phase()
+            })
+        };
+        assert_eq!(phases(&world), [Nat44TcpSessionPhase::Established; 2]);
+        let fin1 = tcp_frame(H1, PUBLIC, P1, public2, FIN_ACK);
+        world.run(LAN, fin1.clone());
+        assert_hairpin(&mut world, &fin1, H2_MAC, (PUBLIC, public1), (H2, P2));
+        assert_eq!(phases(&world), [Nat44TcpSessionPhase::Established; 2]);
+        let fin2 = tcp_frame(H2, PUBLIC, P2, public1, FIN_ACK);
+        world.run(LAN, fin2.clone());
+        assert_hairpin(&mut world, &fin2, H1_MAC, (PUBLIC, public2), (H1, P1));
+        assert_eq!(phases(&world), [Nat44TcpSessionPhase::Closing; 2]);
+        assert_eq!(world.tcp.counters().sessions_closed, 2);
 
         // Without a session, a non-SYN cannot open the outbound half.
         let stray = tcp_frame(H1, PUBLIC, P1 + 100, public2, ACK);
