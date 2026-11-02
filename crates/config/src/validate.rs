@@ -1301,7 +1301,8 @@ fn validate_v1(
                 })?
                 .with_icmpv4_errors(map_icmp_policy(source.icmpv4_errors))
                 .with_filtering(map_filtering(source.filtering))
-                .with_hairpinning(source.hairpinning);
+                .with_hairpinning(source.hairpinning)
+                .with_port_preservation(source.port_preservation);
             Nat44UdpConfig::new(
                 &snapshot,
                 inside,
@@ -1351,6 +1352,7 @@ fn validate_v1(
                 .with_icmpv4_errors(map_icmp_policy(source.icmpv4_errors))
                 .with_filtering(map_filtering(source.filtering))
                 .with_hairpinning(source.hairpinning)
+                .with_port_preservation(source.port_preservation)
                 .with_unsolicited_syn_icmp(source.unsolicited_syn_icmp)
                 .with_inbound_rst(map_inbound_rst(source.inbound_rst))
                 .with_inbound_sessions_per_remote(source.inbound_sessions_per_remote)

@@ -375,6 +375,60 @@ fn nat_hairpinning_is_a_reloadable_typed_delta_separate_from_the_policy_flag() {
     );
 }
 
+/// N2: `port-preservation` is a non-secret, reloadable typed delta per
+/// protocol (the apply flushes the NAT state like every NAT change), never
+/// restart-required, and does not raise the opaque policy flag alone.
+#[test]
+fn nat_port_preservation_is_a_reloadable_typed_delta_separate_from_the_policy_flag() {
+    const UDP: &str = "icmpv4-errors = \"external-only\"\n";
+    const TCP: &str = "allocator-seed = \"11\"\n";
+    // Spelling out the default (on) is no change.
+    only(
+        &plan(&[
+            (
+                UDP,
+                "icmpv4-errors = \"external-only\"\nport-preservation = true\n",
+            ),
+            (TCP, "allocator-seed = \"11\"\nport-preservation = true\n"),
+        ]),
+        &[],
+    );
+
+    let udp = plan(&[(
+        UDP,
+        "icmpv4-errors = \"external-only\"\nport-preservation = false\n",
+    )]);
+    only(&udp, &["nat44_udp"]);
+    assert_eq!(
+        udp.nat44_udp().port_preservation,
+        Some(Delta {
+            old: true,
+            new: false
+        })
+    );
+    assert_eq!(udp.nat44_udp().hairpinning, None);
+    assert!(!udp.nat44_udp().policy_changed);
+    assert!(udp.restart_required().is_empty());
+    assert_eq!(udp.nat44_tcp().port_preservation, None);
+
+    let tcp = plan(&[(TCP, "allocator-seed = \"11\"\nport-preservation = false\n")]);
+    only(&tcp, &["nat44_tcp"]);
+    assert_eq!(
+        tcp.nat44_tcp().port_preservation,
+        Some(Delta {
+            old: true,
+            new: false
+        })
+    );
+    assert!(!tcp.nat44_tcp().policy_changed);
+    assert!(tcp.restart_required().is_empty());
+    assert_eq!(tcp.nat44_udp().port_preservation, None);
+    assert_eq!(
+        config(&[]).storage_shape(),
+        config(&[(TCP, "allocator-seed = \"11\"\nport-preservation = false\n")]).storage_shape()
+    );
+}
+
 #[test]
 fn tcp_inbound_limit_is_a_reloadable_typed_delta_separate_from_the_policy_flag() {
     const TCP: &str = "allocator-seed = \"11\"\n";

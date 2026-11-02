@@ -748,6 +748,46 @@ fn plan_text_renders_the_hairpinning_switch_as_a_reloadable_typed_delta() {
     }
 }
 
+/// N2: the port preservation switch is a reloadable typed delta rendered as
+/// `on`/`off` per protocol, and only the changed protocol gets a line.
+#[test]
+fn plan_text_renders_the_port_preservation_switch_as_a_reloadable_typed_delta() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let off = dir.join("udp-preservation-off.toml");
+    fs::write(
+        &off,
+        source.replacen(
+            "allocator-seed = \"1\"\n",
+            "allocator-seed = \"1\"\nport-preservation = false\n",
+            1,
+        ),
+    )
+    .unwrap();
+    let current = fixtures().join("router-v1.toml");
+    assert_eq!(status(&ruster(&["validate".as_ref(), off.as_os_str()])), 0);
+    for (from, to, line) in [
+        (
+            &current,
+            &off,
+            "  nat44-udp port-preservation ~ on -> off\n",
+        ),
+        (
+            &off,
+            &current,
+            "  nat44-udp port-preservation ~ off -> on\n",
+        ),
+    ] {
+        let plan = ruster(&["plan".as_ref(), from.as_os_str(), to.as_os_str()]);
+        assert_eq!(status(&plan), 0);
+        let stdout = text(&plan.stdout);
+        assert!(stdout.starts_with("plan: reloadable\n"), "{stdout}");
+        assert!(stdout.contains(line), "{stdout}");
+        assert!(!stdout.contains("nat44-tcp port-preservation"), "{stdout}");
+        assert!(!stdout.contains("policy ~ changed"), "{stdout}");
+    }
+}
+
 /// The TCP per-remote inbound session limit is a reloadable typed delta;
 /// `0` renders as `unlimited`, and out-of-range values are rejected with a
 /// value-free code and path.

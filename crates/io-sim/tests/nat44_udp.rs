@@ -547,6 +547,97 @@ fn allocator_preserves_then_falls_back_without_overload_and_exhausts() {
     assert_drop(&mut io, DropReason::Nat44UdpPortExhausted, &packet);
 }
 
+/// N2 (RFC 6056 §4, RFC 7857 §9): with `port-preservation` off, an
+/// in-pool internal source port is not kept; the translated port is a keyed
+/// pool port, replies to it are translated back to the internal port, and
+/// the internal port itself is not a mapping (a datagram to it is dropped
+/// as a mapping miss).
+#[test]
+fn port_preservation_off_translates_to_a_keyed_port_and_back() {
+    let (routes, interfaces, neighbors, bindings) = base();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let policy = Nat44UdpPolicy::default().with_port_preservation(false);
+    let config = Nat44UdpConfig::new(&snapshot, LAN, WAN, PUBLIC, 40_000, 49_999, policy).unwrap();
+    let mut mappings = [Nat44UdpMappingSlot::default(); 2];
+    let mut peers = [Nat44UdpPeerSlot::default(); 2];
+    let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
+    let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
+    let mut rs = [ResolutionStateSlot::EMPTY; 1];
+    let mut ra = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut rs, &mut ra);
+    let mut io = SimIo::new();
+    let mut run = |io: &mut SimIo, nat: &mut _, now| {
+        io.run_nat44_udp_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(nat),
+            MonotonicMillis(now),
+            &mut NoTrace,
+        )
+        .unwrap();
+    };
+    io.inject(
+        LAN,
+        udp_frame(
+            HOST,
+            REMOTE1,
+            45_000,
+            53,
+            64,
+            0x4000,
+            &[1],
+            &[],
+            UdpChecksum::Valid,
+        ),
+    );
+    run(&mut io, &mut nat, 0);
+    let out = io.pop_tx().unwrap();
+    assert_eq!(out.egress, WAN);
+    assert!(udp_checksum_valid(&out.bytes));
+    let public_port = u16::from_be_bytes(out.bytes[34..36].try_into().unwrap());
+    assert!((40_000..=49_999).contains(&public_port));
+    assert_ne!(public_port, 45_000);
+
+    let reply = udp_frame(
+        REMOTE1,
+        PUBLIC,
+        53,
+        public_port,
+        64,
+        0x4000,
+        &[2],
+        &[],
+        UdpChecksum::Valid,
+    );
+    io.inject(WAN, reply);
+    run(&mut io, &mut nat, 1);
+    let back = io.pop_tx().unwrap();
+    assert_eq!(back.egress, LAN);
+    assert_eq!(&back.bytes[30..34], &HOST.octets());
+    assert_eq!(
+        u16::from_be_bytes(back.bytes[36..38].try_into().unwrap()),
+        45_000
+    );
+    assert!(udp_checksum_valid(&back.bytes));
+
+    let to_internal_port = udp_frame(
+        REMOTE1,
+        PUBLIC,
+        53,
+        45_000,
+        64,
+        0x4000,
+        &[3],
+        &[],
+        UdpChecksum::Valid,
+    );
+    io.inject(WAN, to_internal_port.clone());
+    run(&mut io, &mut nat, 2);
+    assert_drop(&mut io, DropReason::Nat44UdpMappingMiss, &to_internal_port);
+}
+
 #[test]
 fn exact_idle_expiry_outbound_refresh_and_inbound_no_refresh() {
     let (routes, interfaces, neighbors, bindings) = base();

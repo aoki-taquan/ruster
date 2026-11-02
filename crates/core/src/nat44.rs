@@ -205,6 +205,7 @@ pub struct Nat44UdpPolicy {
     icmpv4_errors: Nat44Icmpv4ErrorPolicy,
     filtering: Nat44Filtering,
     hairpinning: bool,
+    port_preservation: bool,
 }
 
 impl std::fmt::Debug for Nat44UdpPolicy {
@@ -216,6 +217,7 @@ impl std::fmt::Debug for Nat44UdpPolicy {
             .field("icmpv4_errors", &self.icmpv4_errors)
             .field("filtering", &self.filtering)
             .field("hairpinning", &self.hairpinning)
+            .field("port_preservation", &self.port_preservation)
             .finish()
     }
 }
@@ -227,6 +229,9 @@ mod tcp_tests {
 
     // `nat44/tcp_tests/timers.rs`: the per-phase timers (N1).
     mod timers;
+
+    // `nat44/tcp_tests/port_selection.rs`: keyed public-port selection (N2).
+    mod port_selection;
 
     const LAN: IfId = IfId(1);
     const WAN: IfId = IfId(2);
@@ -2633,7 +2638,10 @@ mod tcp_tests {
                             reusable_session <= SESSION_CAPACITY,
                             "seed={seed} step={step}"
                         );
-                        assert!(owner <= PORT_CAPACITY, "seed={seed} step={step}");
+                        assert!(
+                            owner <= 3 + NAT44_PORT_TAKEOVER_PROBES,
+                            "seed={seed} step={step}"
+                        );
                     }
                 },
             );
@@ -2667,7 +2675,8 @@ mod tcp_tests {
                     runtime.mapping_is_live(runtime.mappings[owner.state_index()], now_ms)
                 })
             };
-        if (config.first_port..=config.last_port).contains(&internal_port)
+        if config.policy.port_preservation
+            && (config.first_port..=config.last_port).contains(&internal_port)
             && owner_live(internal_port) != Some(true)
         {
             return Ok(Some(internal_port));
@@ -2676,13 +2685,9 @@ mod tcp_tests {
             return Ok(Some(port));
         }
         let pool = usize::from(config.last_port - config.first_port) + 1;
-        let start = seeded_port_offset(
-            config.policy.allocator_seed,
-            config.first_port,
-            config.last_port,
-            internal_address,
-            internal_port,
-        );
+        let start = runtime
+            .port_selection_key()
+            .search_start(internal_address, internal_port);
         if let Some(port) = (0..pool)
             .map(|step| config.first_port + ((start + step) % pool) as u16)
             .find(|port| owner_live(*port).is_none())
@@ -2709,7 +2714,9 @@ mod tcp_tests {
         for seed in 0..32_u64 {
             let policy = Nat44TcpPolicy::new(ttl, seed.wrapping_mul(0x2545_f491_4f6c_dd1d))
                 .unwrap()
-                .with_filtering(Nat44Filtering::EndpointIndependent);
+                .with_filtering(Nat44Filtering::EndpointIndependent)
+                // N2: a quarter of the seeds run without port preservation.
+                .with_port_preservation(seed % 4 != 3);
             with_config(policy, 40_000, 40_003, |config| {
                 // Three mappings fill before the four ports; five exhaust them.
                 let mut mappings =
@@ -2792,6 +2799,17 @@ mod tcp_tests {
                                     Ok(None) => {
                                         let offset = usize::from(plan.mapping.public_port - 40_000);
                                         assert_ne!(owners_before[offset], PortOwnerSlot::default());
+                                        // Any expired owner is correct (N2: keyed takeover
+                                        // probes), never a live one.
+                                        let owner = runtime
+                                            .port_owners
+                                            .owner(plan.mapping.public_port)
+                                            .unwrap()
+                                            .unwrap();
+                                        assert!(!runtime.mapping_is_live(
+                                            runtime.mappings[owner.state_index()],
+                                            now
+                                        ));
                                         outcomes[7] += 1;
                                     }
                                     Err(()) => panic!("allocated past exhaustion"),
@@ -2892,7 +2910,10 @@ mod tcp_tests {
             assert!(runtime.reuse_lists_are_consistent());
             assert!(runtime.port_owners.bitmap_matches_slots());
             assert!(
-                worst[0] <= 4 && worst[1] <= 3 && worst[2] <= 2 && worst[3] <= 34,
+                worst[0] <= 4
+                    && worst[1] <= 3
+                    && worst[2] <= 2 + NAT44_PORT_TAKEOVER_PROBES
+                    && worst[3] <= 34,
                 "work per new flow {worst:?}"
             );
         });
@@ -2966,6 +2987,7 @@ impl Nat44UdpPolicy {
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Bidirectional,
             filtering: Nat44Filtering::AddressDependent,
             hairpinning: true,
+            port_preservation: true,
         })
     }
 
@@ -2977,6 +2999,25 @@ impl Nat44UdpPolicy {
     #[must_use]
     pub const fn allocator_seed(self) -> u64 {
         self.allocator_seed
+    }
+
+    /// Enables or disables port preservation, the first step of the
+    /// public-port selection: a new mapping keeps the internal port when it
+    /// is in the pool and has no live owner (RFC 4787 §4.2.1). The default
+    /// `true` is the port-preserving NAPT of RFC 6056 §4 and RFC 7857 §9,
+    /// which obfuscate the public port only when it must change; `false`
+    /// always selects an obfuscated port (RFC 6056 §4, NAPT without port
+    /// preservation), so the public port does not repeat a host's own,
+    /// possibly predictable, source port.
+    #[must_use]
+    pub const fn with_port_preservation(mut self, enabled: bool) -> Self {
+        self.port_preservation = enabled;
+        self
+    }
+
+    #[must_use]
+    pub const fn port_preservation(self) -> bool {
+        self.port_preservation
     }
 
     #[must_use]
@@ -3030,6 +3071,7 @@ impl Default for Nat44UdpPolicy {
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Bidirectional,
             filtering: Nat44Filtering::AddressDependent,
             hairpinning: true,
+            port_preservation: true,
         }
     }
 }
@@ -4469,6 +4511,14 @@ impl<'a> Nat44UdpRuntime<'a> {
         else {
             return Err(Nat44UdpPlanError::PortExhausted);
         };
+        // A new endpoint that takes the port of an expired mapping (port
+        // preservation or a keyed takeover probe) recreates that mapping's
+        // slot rather than the list head's, so no other port is released
+        // in expiry order for the next new mapping to take (N2, NAT44-020).
+        let mapping_index = match (exact_mapping, port.displaced_mapping_index) {
+            (None, Some(displaced)) => displaced,
+            _ => mapping_index,
+        };
         let generation = self.next_nonzero_generation()?;
         let mapping_expired = self.mappings[mapping_index].occupied;
         self.prepare_outbound_plan(
@@ -5697,22 +5747,38 @@ impl<'a> Nat44UdpRuntime<'a> {
         }))
     }
 
-    /// Public port of a new mapping (NAT44-004, NAT44-068), in O(1):
+    /// Keyed port selection of this runtime ([`PortSelectionKey`]).
+    const fn port_selection_key(&self) -> PortSelectionKey {
+        PortSelectionKey {
+            key: self.hash_key.0,
+            start_domain: DirectoryHashDomain::UdpPortStart,
+            takeover_domain: DirectoryHashDomain::UdpPortTakeover,
+            first_port: self.config.first_port,
+            last_port: self.config.last_port,
+            inside: self.config.inside,
+            public_address: self.config.public_address,
+            allocator_seed: self.config.policy.allocator_seed,
+        }
+    }
+
+    /// Public port of a new mapping (NAT44-004, NAT44-068, NAT44-020), in
+    /// O(1):
     ///
-    /// 1. the internal port, if in the pool and unowned or owned by an
-    ///    expired mapping (port preservation);
+    /// 1. with port preservation on (the default), the internal port, if in
+    ///    the pool and unowned or owned by an expired mapping;
     /// 2. the port the same internal endpoint's expired mapping
     ///    (`previous`, recreated in place) still owns, so a returning
     ///    endpoint keeps its public port;
-    /// 3. the first unowned port from the seeded start (a walk of the pool
-    ///    from that offset, skipping owned ports);
-    /// 4. with every port owned, the port of an expired mapping in expiry
-    ///    order (parked first, then the expired activity head). This
-    ///    choice does not depend on the seed (NAT44-020).
+    /// 3. the first unowned port from a keyed start
+    ///    ([`PortSelectionKey::search_start`], RFC 6056 Algorithm 3 with
+    ///    the secret hash key and without the remote endpoint), found by the
+    ///    free-port bitmap in at most 34 word reads;
+    /// 4. with every port owned, the port of an expired owner among
+    ///    [`NAT44_PORT_TAKEOVER_PROBES`] keyed pseudorandom pool ports
+    ///    ([`PortSelectionKey::takeover_port`]), else the port of the
+    ///    parked mapping or the expired activity head (expiry order).
     ///
-    /// Unlike the walk before H4a, which took the first port from the seeded
-    /// start that was unowned *or* owned by an expired mapping, step 3
-    /// prefers an unowned port over an earlier expired-owned one. `None`
+    /// Step 3 prefers an unowned port over any expired-owned one. `None`
     /// only when every port has a live owner.
     fn allocate_port(
         &self,
@@ -5721,7 +5787,9 @@ impl<'a> Nat44UdpRuntime<'a> {
         previous: Option<Nat44UdpMappingSlot>,
         now_ms: u64,
     ) -> Result<Option<Nat44UdpPortSelection>, Nat44UdpPlanError> {
-        if (self.config.first_port..=self.config.last_port).contains(&internal_port) {
+        if self.config.policy.port_preservation
+            && (self.config.first_port..=self.config.last_port).contains(&internal_port)
+        {
             if let Some(selection) = self.select_port(internal_port, now_ms)? {
                 return Ok(Some(selection));
             }
@@ -5731,20 +5799,29 @@ impl<'a> Nat44UdpRuntime<'a> {
                 return Ok(Some(selection));
             }
         }
-        let start = seeded_port_offset(
-            self.config.policy.allocator_seed,
-            self.config.first_port,
-            self.config.last_port,
-            internal_address,
-            internal_port,
-        );
-        // The first unowned port from the seeded start (the internal port,
-        // if in the pool, was tried above and is owned by a live mapping).
-        if let Some(port) = self.port_owners.first_unowned_port_from(start) {
+        let key = self.port_selection_key();
+        // The first unowned port from the keyed start.
+        if let Some(port) = self
+            .port_owners
+            .first_unowned_port_from(key.search_start(internal_address, internal_port))
+        {
             return self.select_port(port, now_ms);
         }
-        // Every port has an owner: take the port of an expired one, a
-        // parked mapping first, else the expired activity head.
+        // Every port has an owner: keyed probes for an expired owner, then
+        // the port of an expired mapping in expiry order, a parked mapping
+        // first, else the expired activity head.
+        for probe in 0..NAT44_PORT_TAKEOVER_PROBES {
+            let port = key.takeover_port(
+                internal_address,
+                internal_port,
+                self.next_generation,
+                now_ms,
+                probe,
+            );
+            if let Some(selection) = self.select_port(port, now_ms)? {
+                return Ok(Some(selection));
+            }
+        }
         for candidate in [
             self.mapping_lists.parked.head(),
             self.expired_activity_head(now_ms),
@@ -5782,21 +5859,94 @@ impl<'a> Nat44UdpRuntime<'a> {
     }
 }
 
-/// Pool offset where the search for a public port starts when the internal
-/// port cannot be preserved (NAT44-004): keyed by the secret allocator seed
-/// and the internal endpoint, so it is deterministic for the endpoint and
-/// unpredictable without the seed.
-fn seeded_port_offset(
-    allocator_seed: u64,
+/// Keyed pseudorandom pool ports that step 4 of the public-port selection
+/// probes for an expired owner when every pool port has an owner, before
+/// it falls back to the expiry-ordered list heads (N2, NAT44-020). Each
+/// probe is one O(1) owner check.
+pub const NAT44_PORT_TAKEOVER_PROBES: usize = 8;
+
+/// Keyed public-port selection of one NAT44 protocol (N2, NAT44-020): the
+/// secret is the runtime's hash key (fresh from the key source and rotated
+/// by every reconcile), and each protocol uses its own hash domains.
+#[derive(Clone, Copy)]
+struct PortSelectionKey {
+    key: DirectoryHashKey,
+    start_domain: DirectoryHashDomain,
+    takeover_domain: DirectoryHashDomain,
     first_port: u16,
     last_port: u16,
-    internal_address: Ipv4Address,
-    internal_port: u16,
-) -> usize {
-    let pool_size = u64::from(last_port - first_port) + 1;
-    let address = u32::from_be_bytes(internal_address.octets());
-    let mixed = allocator_seed ^ u64::from(address) ^ u64::from(internal_port).rotate_left(17);
-    usize::try_from(mixed % pool_size).expect("a pool offset fits usize")
+    /// Inside interface, public address, and allocator seed; the internal
+    /// endpoint completes [`Self::endpoint_words`].
+    inside: IfId,
+    public_address: Ipv4Address,
+    allocator_seed: u64,
+}
+
+impl PortSelectionKey {
+    /// Hash input of one internal endpoint: RFC 6056 Algorithm 3's `F()`
+    /// with the remote endpoint left out, because an endpoint-independent
+    /// mapping (RFC 4787 REQ-1, RFC 5382 REQ-1) must not depend on it. The
+    /// configured allocator seed is mixed in as an operator salt only; the
+    /// secret is the hash key.
+    const fn endpoint_words(self, internal_address: Ipv4Address, internal_port: u16) -> [u64; 5] {
+        [
+            self.inside.0 as u64,
+            u32::from_be_bytes(self.public_address.octets()) as u64,
+            u32::from_be_bytes(internal_address.octets()) as u64,
+            internal_port as u64,
+            self.allocator_seed,
+        ]
+    }
+
+    /// `hash % pool`. The pool has at most 65535 ports, so the modulo bias
+    /// of the 64-bit hash is below 2^-47.
+    fn pool_offset(self, domain: DirectoryHashDomain, words: &[u64]) -> usize {
+        let pool_size = u64::from(self.last_port - self.first_port) + 1;
+        usize::try_from(self.key.hash_words(domain, words) % pool_size)
+            .expect("a pool offset fits usize")
+    }
+
+    /// Pool offset where the search for an unowned port starts (step 3): a
+    /// keyed SipHash of the internal endpoint, fixed for the endpoint
+    /// within one generation (so a returning endpoint finds its earlier
+    /// port first while it is still free) and unpredictable without the
+    /// key.
+    fn search_start(self, internal_address: Ipv4Address, internal_port: u16) -> usize {
+        self.pool_offset(
+            self.start_domain,
+            &self.endpoint_words(internal_address, internal_port),
+        )
+    }
+
+    /// Pool port of takeover probe `probe` (step 4) for the mapping
+    /// generation `generation` (distinct for every mapping a runtime
+    /// creates between flushes) at `now_ms`, so which expired owner gives
+    /// up its port is not predictable without the key.
+    fn takeover_port(
+        self,
+        internal_address: Ipv4Address,
+        internal_port: u16,
+        generation: u64,
+        now_ms: u64,
+        probe: usize,
+    ) -> u16 {
+        let [inside, public, address, port, seed] =
+            self.endpoint_words(internal_address, internal_port);
+        let offset = self.pool_offset(
+            self.takeover_domain,
+            &[
+                inside,
+                public,
+                address,
+                port,
+                seed,
+                generation,
+                now_ms,
+                probe as u64,
+            ],
+        );
+        self.first_port + u16::try_from(offset).expect("a pool offset fits u16")
+    }
 }
 
 fn address_is_host_unicast(snapshot: &ForwardingSnapshot<'_>, address: Ipv4Address) -> bool {
@@ -5866,6 +6016,7 @@ pub struct Nat44TcpPolicy {
     inbound_sessions_per_remote: u8,
     unsolicited_syn_icmp: bool,
     inbound_rst: Nat44TcpInboundRst,
+    port_preservation: bool,
 }
 
 impl std::fmt::Debug for Nat44TcpPolicy {
@@ -5885,6 +6036,7 @@ impl std::fmt::Debug for Nat44TcpPolicy {
             )
             .field("unsolicited_syn_icmp", &self.unsolicited_syn_icmp)
             .field("inbound_rst", &self.inbound_rst)
+            .field("port_preservation", &self.port_preservation)
             .finish()
     }
 }
@@ -5934,6 +6086,7 @@ impl Nat44TcpPolicy {
             inbound_sessions_per_remote: NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE,
             unsolicited_syn_icmp: true,
             inbound_rst: Nat44TcpInboundRst::Closing,
+            port_preservation: true,
         })
     }
 
@@ -6030,6 +6183,25 @@ impl Nat44TcpPolicy {
     #[must_use]
     pub const fn allocator_seed(self) -> u64 {
         self.allocator_seed
+    }
+
+    /// Enables or disables port preservation, the first step of the
+    /// public-port selection: a new mapping keeps the internal port when it
+    /// is in the pool and has no live owner (RFC 4787 §4.2.1). The default
+    /// `true` is the port-preserving NAPT of RFC 6056 §4 and RFC 7857 §9,
+    /// which obfuscate the public port only when it must change; `false`
+    /// always selects an obfuscated port (RFC 6056 §4, NAPT without port
+    /// preservation), so the public port does not repeat a host's own,
+    /// possibly predictable, source port.
+    #[must_use]
+    pub const fn with_port_preservation(mut self, enabled: bool) -> Self {
+        self.port_preservation = enabled;
+        self
+    }
+
+    #[must_use]
+    pub const fn port_preservation(self) -> bool {
+        self.port_preservation
     }
 
     #[must_use]
@@ -6187,6 +6359,7 @@ impl Default for Nat44TcpPolicy {
             inbound_sessions_per_remote: NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE,
             unsolicited_syn_icmp: true,
             inbound_rst: Nat44TcpInboundRst::Closing,
+            port_preservation: true,
         }
     }
 }
@@ -7737,6 +7910,14 @@ impl<'a> Nat44TcpRuntime<'a> {
         let Some(port) = self.allocate_port(internal_address, internal_port, previous, now_ms)?
         else {
             return Err(Nat44TcpPlanError::PortExhausted);
+        };
+        // A new endpoint that takes the port of an expired mapping (port
+        // preservation or a keyed takeover probe) recreates that mapping's
+        // slot rather than the list head's, so no other port is released
+        // in expiry order for the next new mapping to take (N2, NAT44-020).
+        let mapping_index = match (exact_mapping, port.displaced_mapping_index) {
+            (None, Some(displaced)) => displaced,
+            _ => mapping_index,
         };
         if self.next_generation == 0 || self.next_generation == u64::MAX {
             return Err(Nat44TcpPlanError::GenerationExhausted);
@@ -9686,23 +9867,34 @@ impl<'a> Nat44TcpRuntime<'a> {
         listed == self.sessions.len()
     }
 
-    /// Public port of a new mapping (NAT44-004, NAT44-068), in O(1):
+    /// Keyed port selection of this runtime ([`PortSelectionKey`]).
+    const fn port_selection_key(&self) -> PortSelectionKey {
+        PortSelectionKey {
+            key: self.hash_key.0,
+            start_domain: DirectoryHashDomain::TcpPortStart,
+            takeover_domain: DirectoryHashDomain::TcpPortTakeover,
+            first_port: self.config.first_port,
+            last_port: self.config.last_port,
+            inside: self.config.inside,
+            public_address: self.config.public_address,
+            allocator_seed: self.config.policy.allocator_seed,
+        }
+    }
+
+    /// Public port of a new mapping (NAT44-004, NAT44-068, NAT44-020), in
+    /// O(1), by the steps of the UDP allocator with the TCP hash domains:
     ///
-    /// 1. the internal port, if in the pool and unowned or owned by an
-    ///    expired mapping (port preservation);
+    /// 1. with port preservation on (the default), the internal port, if in
+    ///    the pool and unowned or owned by an expired mapping;
     /// 2. the port the same internal endpoint's expired mapping
-    ///    (`previous`, recreated in place) still owns, so a returning
-    ///    endpoint keeps its public port;
-    /// 3. the first unowned port from the seeded start (a walk of the pool
-    ///    from that offset, skipping owned ports);
-    /// 4. with every port owned, the port of an expired mapping in expiry
-    ///    order (the expired activity head). This
-    ///    choice does not depend on the seed (NAT44-020).
+    ///    (`previous`, recreated in place) still owns;
+    /// 3. the first unowned port from a keyed start
+    ///    ([`PortSelectionKey::search_start`]);
+    /// 4. with every port owned, the port of an expired owner among
+    ///    [`NAT44_PORT_TAKEOVER_PROBES`] keyed pseudorandom pool ports, else
+    ///    the port of the expired activity head.
     ///
-    /// Unlike the walk before H4a, which took the first port from the seeded
-    /// start that was unowned *or* owned by an expired mapping, step 3
-    /// prefers an unowned port over an earlier expired-owned one. `None`
-    /// only when every port has a live owner.
+    /// `None` only when every port has a live owner.
     fn allocate_port(
         &self,
         internal_address: Ipv4Address,
@@ -9710,7 +9902,9 @@ impl<'a> Nat44TcpRuntime<'a> {
         previous: Option<Nat44TcpMappingSlot>,
         now_ms: u64,
     ) -> Result<Option<Nat44TcpPortSelection>, Nat44TcpPlanError> {
-        if (self.config.first_port..=self.config.last_port).contains(&internal_port) {
+        if self.config.policy.port_preservation
+            && (self.config.first_port..=self.config.last_port).contains(&internal_port)
+        {
             if let Some(selection) = self.select_port(internal_port, now_ms)? {
                 return Ok(Some(selection));
             }
@@ -9720,20 +9914,27 @@ impl<'a> Nat44TcpRuntime<'a> {
                 return Ok(Some(selection));
             }
         }
-        let start = seeded_port_offset(
-            self.config.policy.allocator_seed,
-            self.config.first_port,
-            self.config.last_port,
-            internal_address,
-            internal_port,
-        );
-        // The first unowned port from the seeded start (the internal port,
-        // if in the pool, was tried above and is owned by a live mapping).
-        if let Some(port) = self.port_owners.first_unowned_port_from(start) {
+        let key = self.port_selection_key();
+        if let Some(port) = self
+            .port_owners
+            .first_unowned_port_from(key.search_start(internal_address, internal_port))
+        {
             return self.select_port(port, now_ms);
         }
-        // Every port has an owner: take the port of the expired activity
-        // head, if any.
+        // Every port has an owner: keyed probes for an expired owner, then
+        // the port of the expired activity head, if any.
+        for probe in 0..NAT44_PORT_TAKEOVER_PROBES {
+            let port = key.takeover_port(
+                internal_address,
+                internal_port,
+                self.next_generation,
+                now_ms,
+                probe,
+            );
+            if let Some(selection) = self.select_port(port, now_ms)? {
+                return Ok(Some(selection));
+            }
+        }
         let Some(head) = self.expired_mapping_head(now_ms) else {
             return Ok(None);
         };
@@ -9749,6 +9950,9 @@ impl<'a> Nat44TcpRuntime<'a> {
 mod tests {
     use super::*;
     use crate::{Interface, LocalIpv4Binding, MacAddress, Neighbor, Route};
+
+    // `nat44/tests/port_selection.rs`: keyed public-port selection (N2).
+    mod port_selection;
 
     const INSIDE: IfId = IfId(1);
     const OUTSIDE: IfId = IfId(2);
@@ -9842,12 +10046,12 @@ mod tests {
         assert_eq!(
             format!("{udp_policy:?}"),
             "Nat44UdpPolicy { idle_ttl_ms: 120000, allocator_seed: [REDACTED], \
-             icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true }"
+             icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true, port_preservation: true }"
         );
         assert_eq!(
             format!("{udp_policy:#?}"),
             "Nat44UdpPolicy {\n    idle_ttl_ms: 120000,\n    allocator_seed: [REDACTED],\n    \
-             icmpv4_errors: ExternalOnly,\n    filtering: AddressDependent,\n    hairpinning: true,\n}"
+             icmpv4_errors: ExternalOnly,\n    filtering: AddressDependent,\n    hairpinning: true,\n    port_preservation: true,\n}"
         );
         assert_eq!(
             format!("{tcp_policy:?}"),
@@ -9855,13 +10059,13 @@ mod tests {
              closing_idle_ttl_ms: 240000, allocator_seed: [REDACTED], \
              icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true, \
              inbound_sessions_per_remote: 0, unsolicited_syn_icmp: true, \
-             inbound_rst: Closing }"
+             inbound_rst: Closing, port_preservation: true }"
         );
         assert_eq!(
             format!("{tcp_policy:#?}"),
             "Nat44TcpPolicy {\n    idle_ttl_ms: 7440000,\n    opening_idle_ttl_ms: 240000,\n    closing_idle_ttl_ms: 240000,\n    allocator_seed: [REDACTED],\n    \
              icmpv4_errors: ExternalOnly,\n    filtering: AddressDependent,\n    hairpinning: true,\n    \
-             inbound_sessions_per_remote: 0,\n    unsolicited_syn_icmp: true,\n    inbound_rst: Closing,\n}"
+             inbound_sessions_per_remote: 0,\n    unsolicited_syn_icmp: true,\n    inbound_rst: Closing,\n    port_preservation: true,\n}"
         );
 
         with_config(udp_policy, |udp_config| {
@@ -9893,7 +10097,7 @@ mod tests {
                 "Nat44UdpConfig { inside: IfId(1), outside: IfId(2), public_address: \
                  Ipv4Address(3405803786), first_port: 40000, last_port: 40001, policy: \
                  Nat44UdpPolicy { idle_ttl_ms: 120000, allocator_seed: [REDACTED], \
-                 icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true }, authority: \
+                 icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true, port_preservation: true }, authority: \
                  [REDACTED], snapshot_identity: \
                  [REDACTED] }"
             );
@@ -9904,7 +10108,7 @@ mod tests {
                  Nat44TcpPolicy { idle_ttl_ms: 7440000, opening_idle_ttl_ms: 240000, \
                  closing_idle_ttl_ms: 240000, allocator_seed: [REDACTED], \
                  icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true, \
-                 inbound_sessions_per_remote: 0, unsolicited_syn_icmp: true, inbound_rst: Closing }, authority: \
+                 inbound_sessions_per_remote: 0, unsolicited_syn_icmp: true, inbound_rst: Closing, port_preservation: true }, authority: \
                  [REDACTED], snapshot_identity: \
                  [REDACTED] }"
             );
@@ -9916,7 +10120,7 @@ mod tests {
                  2,\n    ),\n    public_address: Ipv4Address(\n        3405803786,\n    ),\n    \
                  first_port: 40000,\n    last_port: 40001,\n    policy: Nat44UdpPolicy {\n        \
                  idle_ttl_ms: 120000,\n        allocator_seed: [REDACTED],\n        icmpv4_errors: \
-                 ExternalOnly,\n        filtering: AddressDependent,\n        hairpinning: true,\n    },\n    authority: \
+                 ExternalOnly,\n        filtering: AddressDependent,\n        hairpinning: true,\n        port_preservation: true,\n    },\n    authority: \
                  [REDACTED],\n    snapshot_identity: \
                  [REDACTED],\n}"
             );
@@ -9927,7 +10131,7 @@ mod tests {
                  first_port: 40000,\n    last_port: 40001,\n    policy: Nat44TcpPolicy {\n        \
                  idle_ttl_ms: 7440000,\n        opening_idle_ttl_ms: 240000,\n        closing_idle_ttl_ms: 240000,\n        allocator_seed: [REDACTED],\n        icmpv4_errors: \
                  ExternalOnly,\n        filtering: AddressDependent,\n        hairpinning: true,\n        \
-                 inbound_sessions_per_remote: 0,\n        unsolicited_syn_icmp: true,\n        inbound_rst: Closing,\n    },\n    authority: \
+                 inbound_sessions_per_remote: 0,\n        unsolicited_syn_icmp: true,\n        inbound_rst: Closing,\n        port_preservation: true,\n    },\n    authority: \
                  [REDACTED],\n    snapshot_identity: \
                  [REDACTED],\n}"
             );
@@ -11509,12 +11713,19 @@ mod tests {
                     NAT44_UDP_MIN_IDLE_TTL_MS,
                 )
                 .unwrap();
-            assert_eq!(replacement.mapping_index, 0);
+            // N2: the new endpoint recreates the slot of the expired mapping
+            // whose port it takes, so the expired head (slot 0) keeps its
+            // port instead of releasing it in expiry order.
+            assert_eq!(replacement.mapping_index, 1);
             assert_eq!(replacement.displaced_port_mapping_index(), Some(1));
             runtime
                 .commit_outbound(replacement, NAT44_UDP_MIN_IDLE_TTL_MS)
                 .unwrap();
-            assert!(!runtime.mappings()[1].port_owned);
+            assert!(runtime.mappings()[0].port_owned);
+            assert_eq!(
+                runtime.mappings()[1].internal_address,
+                Ipv4Address::from_octets([10, 0, 0, 12])
+            );
             assert_eq!(
                 runtime
                     .mappings()
@@ -11522,7 +11733,7 @@ mod tests {
                     .filter(|mapping| mapping.occupied && mapping.port_owned)
                     .map(|mapping| mapping.public_port)
                     .collect::<Vec<_>>(),
-                vec![40_001]
+                vec![40_000, 40_001]
             );
             assert_eq!(runtime.validate_indexes(), Ok(()));
 
@@ -11644,10 +11855,10 @@ mod tests {
                 Err(Nat44UdpPlanError::PortExhausted)
             ));
             // Exhaustion is decided without walking the pool: one owner
-            // check for the preserved port, one bitmap search, and no
-            // expired owner to take.
+            // check for the preserved port, one bitmap search, the keyed
+            // takeover probes, and no expired owner to take.
             let (_, _, owner_probes) = runtime.index_probe_counts();
-            assert_eq!(owner_probes, 1);
+            assert_eq!(owner_probes, 1 + NAT44_PORT_TAKEOVER_PROBES);
             assert!(runtime.port_owners.take_bitmap_word_reads() <= 3);
             assert_eq!(runtime.validate_indexes(), Ok(()));
         });
@@ -11739,7 +11950,8 @@ mod tests {
                     runtime.mapping_is_live(runtime.mappings[owner.state_index()], now_ms)
                 })
             };
-        if (config.first_port..=config.last_port).contains(&internal_port)
+        if config.policy.port_preservation
+            && (config.first_port..=config.last_port).contains(&internal_port)
             && owner_live(internal_port) != Some(true)
         {
             return Ok(Some(internal_port));
@@ -11748,13 +11960,9 @@ mod tests {
             return Ok(Some(port));
         }
         let pool = usize::from(config.last_port - config.first_port) + 1;
-        let start = seeded_port_offset(
-            config.policy.allocator_seed,
-            config.first_port,
-            config.last_port,
-            internal_address,
-            internal_port,
-        );
+        let start = runtime
+            .port_selection_key()
+            .search_start(internal_address, internal_port);
         if let Some(port) = (0..pool)
             .map(|step| config.first_port + ((start + step) % pool) as u16)
             .find(|port| owner_live(*port).is_none())
@@ -11802,7 +12010,9 @@ mod tests {
             ][seed as usize % 3];
             let policy = Nat44UdpPolicy::new(ttl, seed.wrapping_mul(0x2545_f491_4f6c_dd1d))
                 .unwrap()
-                .with_filtering(filtering);
+                .with_filtering(filtering)
+                // N2: a quarter of the seeds run without port preservation.
+                .with_port_preservation(seed % 4 != 3);
             with_port_config(policy, 40_000, 40_003, |config| {
                 // Three mappings fill before the four ports; five exhaust them.
                 let mut mappings =
@@ -11866,6 +12076,17 @@ mod tests {
                                     Ok(None) => {
                                         let offset = usize::from(plan.mapping.public_port - 40_000);
                                         assert_ne!(owners_before[offset], PortOwnerSlot::default());
+                                        // Any expired owner is correct (N2: keyed takeover
+                                        // probes), never a live one.
+                                        let owner = runtime
+                                            .port_owners
+                                            .owner(plan.mapping.public_port)
+                                            .unwrap()
+                                            .unwrap();
+                                        assert!(!runtime.mapping_is_live(
+                                            runtime.mappings[owner.state_index()],
+                                            now
+                                        ));
                                         outcomes[7] += 1;
                                     }
                                     Err(()) => panic!("allocated past exhaustion"),
@@ -11984,7 +12205,7 @@ mod tests {
             assert!(runtime.reuse_lists_are_consistent());
             assert!(runtime.port_owners.bitmap_matches_slots());
             assert!(
-                worst[0] <= 4 && worst[1] <= 2 && worst[2] <= 34,
+                worst[0] <= 4 && worst[1] <= 2 + NAT44_PORT_TAKEOVER_PROBES && worst[2] <= 34,
                 "work per new flow {worst:?}"
             );
         });
@@ -12100,9 +12321,7 @@ mod tests {
             let offset = usize::from(other - 40_000);
             let host = (20..250)
                 .map(|last| Ipv4Address::from_octets([10, 0, 0, last]))
-                .find(|host| {
-                    seeded_port_offset(0x0123_4567, 40_000, 40_003, *host, 1_000) == offset
-                })
+                .find(|host| runtime.port_selection_key().search_start(*host, 1_000) == offset)
                 .unwrap();
             assert!(runtime.port_owners.owner(other).unwrap().is_some());
             let chosen = outbound(&mut runtime, host, 1_000, now);

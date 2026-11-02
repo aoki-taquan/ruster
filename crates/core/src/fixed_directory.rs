@@ -58,6 +58,14 @@ pub(crate) enum DirectoryHashDomain {
     ResolutionHoldForward = 0x5253_4c56_4846_5744,
     ResolutionHoldReverse = 0x5253_4c56_4852_4556,
     TcpSynHold = 0x4e41_5434_5453_5948,
+    /// Start of the public-port search of a new UDP mapping (N2, NAT44-020).
+    UdpPortStart = 0x4e41_5434_5550_5354,
+    /// Takeover probes of a new UDP mapping when every port has an owner.
+    UdpPortTakeover = 0x4e41_5434_5550_544b,
+    /// Start of the public-port search of a new TCP mapping (N2, NAT44-020).
+    TcpPortStart = 0x4e41_5434_5450_5354,
+    /// Takeover probes of a new TCP mapping when every port has an owner.
+    TcpPortTakeover = 0x4e41_5434_5450_544b,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

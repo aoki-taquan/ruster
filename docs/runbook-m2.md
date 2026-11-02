@@ -1321,13 +1321,26 @@ SYNs nobody completes, such as a scan or a spoofed SYN flood.
   endpoint-independent mapping), and a reconcile flush clears the tables
   (control path). An external inbound SYN still probes 16 keyed slots and
   can report the session table full while a reusable slot exists elsewhere
-  (NAT44-037). Port choice differs from before H4a in two ways (NAT44-068):
-  a new endpoint takes the first *unowned* port from its seeded start even
-  when a port of an expired mapping comes first (a returning endpoint
-  still gets its own old port back), and with every pool port owned a new
-  mapping takes the port of the longest-idle expired mapping. That last
-  choice follows expiry order, not the secret seed, so it is predictable
-  (randomization is deferred, NAT44-020).
+  (NAT44-037). Port choice (NAT44-068, N2 NAT44-089 to 091): a new
+  endpoint keeps its internal port if `port-preservation` is on (the
+  default) and the port is free; otherwise it takes the first *unowned*
+  port from a start keyed by the secret per-publication NAT hash key
+  (RFC 6056 Algorithm 3 without the remote endpoint, so the mapping stays
+  endpoint-independent), even when a port of an expired mapping comes
+  first (a returning endpoint still gets its own old port back). With
+  every pool port owned it probes 8 keyed pool ports for an expired owner
+  before falling back to the longest-idle expired mapping. Ports are
+  therefore not predictable without the key, which every reload rotates;
+  `allocator-seed` is only a non-secret salt.
+- Port preservation (`[nat44.udp]`/`[nat44.tcp]` `port-preservation`,
+  default `true`, reloadable; `ruster plan` shows
+  `nat44-udp port-preservation ~ on -> off`). On, the public port of a
+  host whose source port is in the pool and free is that source port, so
+  it is exactly as predictable as the host's own choice (RFC 6056 §4 and
+  RFC 7857 §9 allow this: obfuscate only when the port must change). If
+  inside hosts use predictable source ports (old stacks, embedded
+  devices), set it to `false`: every new mapping then gets a keyed port.
+  Like every NAT change, the apply flushes the NAT state.
 - Debug builds validate every NAT44 index after each UDP commit (O(M+P)
   and more per packet). Use only release builds (`cargo build --release`)
   in production.

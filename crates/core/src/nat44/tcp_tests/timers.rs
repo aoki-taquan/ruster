@@ -785,7 +785,10 @@ fn new_flow_work_stays_constant_with_sessions_in_every_phase() {
         assert!(runtime.reuse_lists_are_consistent());
         assert!(runtime.port_owners.bitmap_matches_slots());
         assert!(
-            worst[0] <= 4 && worst[1] <= 3 && worst[2] <= 2 && worst[3] <= 34,
+            worst[0] <= 4
+                && worst[1] <= 3
+                && worst[2] <= 2 + NAT44_PORT_TAKEOVER_PROBES
+                && worst[3] <= 34,
             "work per new flow {worst:?}"
         );
     });

@@ -176,6 +176,14 @@ fn nat(lines: &mut Vec<String>, kind: &str, change: NatChange) {
             switch(new)
         ));
     }
+    if let Some(Delta { old, new }) = change.port_preservation {
+        let switch = |enabled: bool| if enabled { "on" } else { "off" };
+        lines.push(format!(
+            "{kind} port-preservation ~ {} -> {}",
+            switch(old),
+            switch(new)
+        ));
+    }
     if let Some(Delta { old, new }) = change.inbound_sessions_per_remote {
         let limit = |limit: u8| {
             if limit == 0 {

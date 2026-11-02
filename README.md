@@ -357,6 +357,23 @@ TCPのICMPv4 error変換は、引用public source portと
 exact live remote address/port sessionをread-only参照します。UDP-only/TCP-only wrapperは他方のprotocolがdomainを
 crossするとfail closedにし、combined wrapperはinside/outside/public realm一致を要求します。
 
+public portの選択（N2、NAT44-089〜091）: internal portがpool内で空いていればそれを保ち
+（port preservation）、そうでなければNATのsecret hash key（UDP/TCP別、reloadごとにrotate）で
+internal endpointをSipHashしたstartから最初の空きportを選びます（RFC 6056 §3.3.3 Algorithm 3を
+EIMに合わせてremote endpointを除いたもの。free-port bitmapで最大34 word）。poolの全portに
+ownerがあるときは、keyed probe 8個でexpiredなownerのportを探し、無ければ最も古いexpired
+mappingのportです。`allocator-seed`は非secretのsaltとしてhashに入るだけです。
+RFC 6056 §4とRFC 7857 §9はport-preserving NAPTを認め（portを変えるときだけobfuscate）、
+defaultは`true`です。inside hostのsource portが予測可能なら`false`で常にkeyed portにできます。
+
+```toml
+[nat44.udp]
+port-preservation = true   # 省略時true。false: 常にkeyed port（reloadable、applyでNAT stateをflush）
+
+[nat44.tcp]
+port-preservation = true
+```
+
 NAT44 inbound filteringは`[nat44.udp]`と`[nat44.tcp]`の`filtering`で個別に選びます。
 RFC 4787 REQ-8とRFC 5382 REQ-3は、transparency重視ならEndpoint-Independent、より厳しい
 filtering重視ならAddress-DependentをRECOMMENDEDとし、administrator option化と

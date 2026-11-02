@@ -138,8 +138,8 @@ pub struct NatPortRange {
 }
 
 /// Difference of one NAT44 protocol. The filtering behavior, the
-/// hairpinning switch, the TCP per-remote inbound session limit, the TCP
-/// unsolicited-SYN ICMP switch, and the TCP inbound-RST policy are not
+/// hairpinning switch, the port preservation switch, the TCP per-remote
+/// inbound session limit, the TCP unsolicited-SYN ICMP switch, and the TCP inbound-RST policy are not
 /// secret and are reported as typed deltas. The rest of the policy (which
 /// includes the allocator seed) is never exposed, only whether it changed:
 /// `policy_changed` ignores changes of only those values.
@@ -150,6 +150,8 @@ pub struct NatChange {
     pub ports: Option<Delta<NatPortRange>>,
     pub filtering: Option<Delta<Nat44Filtering>>,
     pub hairpinning: Option<Delta<bool>>,
+    /// The port preservation switch (`port-preservation`, N2).
+    pub port_preservation: Option<Delta<bool>>,
     /// TCP only (always `None` for UDP); `0` means no limit.
     pub inbound_sessions_per_remote: Option<Delta<u8>>,
     /// TCP only (always `None` for UDP): the RFC 5382 REQ-4 delayed ICMP
@@ -168,6 +170,7 @@ impl NatChange {
             && self.ports.is_none()
             && self.filtering.is_none()
             && self.hairpinning.is_none()
+            && self.port_preservation.is_none()
             && self.inbound_sessions_per_remote.is_none()
             && self.unsolicited_syn_icmp.is_none()
             && self.inbound_rst.is_none()
@@ -597,13 +600,14 @@ fn nat_change(
 ) -> NatChange {
     let (old_realm, old_ports) = nat_parts(old, protocol);
     let (new_realm, new_ports) = nat_parts(new, protocol);
-    // Filtering, hairpinning, the TCP inbound limit, the TCP unsolicited-SYN
-    // ICMP switch, and the TCP inbound-RST policy are reported separately, so
-    // compare the rest of the policy with the new values substituted into the
-    // old one.
+    // Filtering, hairpinning, port preservation, the TCP inbound limit, the
+    // TCP unsolicited-SYN ICMP switch, and the TCP inbound-RST policy are
+    // reported separately, so compare the rest of the policy with the new
+    // values substituted into the old one.
     let (
         filtering,
         hairpinning,
+        port_preservation,
         inbound_sessions_per_remote,
         unsolicited_syn_icmp,
         inbound_rst,
@@ -614,11 +618,13 @@ fn nat_change(
             (
                 delta(old.filtering(), new.filtering()),
                 delta(old.hairpinning(), new.hairpinning()),
+                delta(old.port_preservation(), new.port_preservation()),
                 None,
                 None,
                 None,
                 old.with_filtering(new.filtering())
                     .with_hairpinning(new.hairpinning())
+                    .with_port_preservation(new.port_preservation())
                     != new,
             )
         }
@@ -627,6 +633,7 @@ fn nat_change(
             (
                 delta(old.filtering(), new.filtering()),
                 delta(old.hairpinning(), new.hairpinning()),
+                delta(old.port_preservation(), new.port_preservation()),
                 delta(
                     old.inbound_sessions_per_remote(),
                     new.inbound_sessions_per_remote(),
@@ -635,6 +642,7 @@ fn nat_change(
                 delta(old.inbound_rst(), new.inbound_rst()),
                 old.with_filtering(new.filtering())
                     .with_hairpinning(new.hairpinning())
+                    .with_port_preservation(new.port_preservation())
                     .with_unsolicited_syn_icmp(new.unsolicited_syn_icmp())
                     .with_inbound_rst(new.inbound_rst())
                     .with_inbound_sessions_per_remote(new.inbound_sessions_per_remote())
@@ -648,6 +656,7 @@ fn nat_change(
         ports: delta(old_ports, new_ports),
         filtering,
         hairpinning,
+        port_preservation,
         inbound_sessions_per_remote,
         unsolicited_syn_icmp,
         inbound_rst,
