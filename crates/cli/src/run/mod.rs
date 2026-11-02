@@ -56,9 +56,9 @@
 //! Between ticks, on the cold path: the SIGHUP reload ([`reload`],
 //! prepared on the reload worker thread), and the health and link watch
 //! ([`watch`], the link round on the link watcher thread), whose fatal
-//! events end the run like a stop request, with drain and close, but exit
-//! 1. The workers are stopped with the loop and waited for at most 500 ms
-//! ([`workers::WORKER_STOP_MS`]), then abandoned.
+//! events end the run like a stop request, with drain and close, but with
+//! exit status 1. The workers are stopped with the loop and waited for at
+//! most 500 ms ([`workers::WORKER_STOP_MS`]), then abandoned.
 //!
 //! # Shutdown
 //!
