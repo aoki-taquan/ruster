@@ -1807,3 +1807,97 @@ fn ring_corruption_stops_the_adapter_for_good() {
     assert!(matches!(io.receive(8), Err(XdpIoError::Stopped)));
     assert!(matches!(io.service(), Err(XdpIoError::Stopped)));
 }
+
+#[test]
+fn idle_wait_is_ready_on_rx_work_and_reports_tx_outstanding() {
+    use crate::{RxWait, RxWaitError};
+
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    // Scripted kernels are not live sockets: nothing can block, and an
+    // idle adapter says so instead of pretending it waited.
+    assert!(!io.can_wait());
+    assert!(!io.tx_outstanding());
+    assert_eq!(io.wait_rx(10), Err(RxWaitError::Unsupported));
+
+    // A descriptor in an RX ring: ready at once, no syscall.
+    deliver(&wan, &ipv4_frame(60, 9));
+    assert_eq!(io.wait_rx(10), Ok(RxWait::Ready));
+    // A zero budget reaps and refills only: the descriptor stays.
+    drop(io.receive(0).expect("receive"));
+    assert_eq!(io.wait_rx(10), Ok(RxWait::Ready));
+    // Validated but left unlent by a batch: still RX work.
+    drop(io.receive(8).expect("receive"));
+    assert_eq!(io.engine(WAN).expect("WAN").pending_rx(), 1);
+    assert_eq!(io.wait_rx(10), Ok(RxWait::Ready));
+    // Lent and forwarded in place: the RX side is idle again, TX is not.
+    {
+        let mut batch = io.receive(8).expect("receive");
+        let packet = batch.next_packet().expect("lease");
+        packet.commit(WAN);
+        let _ = batch.finish();
+    }
+    assert_eq!(io.wait_rx(10), Err(RxWaitError::Unsupported));
+    assert!(io.tx_outstanding(), "TX in flight");
+    assert_eq!(transmit_all(&wan).len(), 1);
+    assert!(io.tx_outstanding(), "completed but not reaped yet");
+    assert_eq!(io.service().expect("service"), 1);
+    assert!(!io.tx_outstanding());
+
+    // A stopped adapter never blocks: the next tick sees the stop.
+    let _ = io.drain(0).expect("drain");
+    assert_eq!(io.wait_rx(10), Ok(RxWait::Ready));
+    audit(&io);
+}
+
+/// Frames reaped from TX completions after the last refill go back to
+/// Fill before the wait blocks, so a port whose Fill ran dry can receive
+/// the frame that ends the wait.
+#[test]
+fn idle_wait_refills_fill_from_reaped_frames_before_blocking() {
+    use crate::RxWaitError;
+
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    let fill = |io: &XdpPacketIo<'_>| {
+        io.port_stats(WAN)
+            .expect("WAN")
+            .counters
+            .fill_ring_occupancy
+    };
+    // RING frames received and transmitted in place: the receive refilled
+    // Fill with the rest of the RX pool, so the free list is empty.
+    for _ in 0..RING {
+        deliver(&wan, &ipv4_frame(60, 9));
+    }
+    {
+        let mut batch = io.receive(RING as usize).expect("receive");
+        while let Some(packet) = batch.next_packet() {
+            packet.commit(WAN);
+        }
+        let _ = batch.finish();
+    }
+    let engine = |io: &XdpPacketIo<'_>| io.engine(WAN).expect("WAN").free_frames();
+    assert_eq!(engine(&io), 0);
+    // The kernel takes every Fill frame and completes the TX; a reap
+    // without a refill (the quiescence check) returns the TX frames to the
+    // free list while Fill is empty.
+    while wan.consume_fill().is_some() {}
+    assert_eq!(transmit_all(&wan).len(), RING as usize);
+    assert!(io.try_publication_quiescence().is_ok());
+    assert_eq!(fill(&io), 0, "Fill ran dry");
+    assert_eq!(engine(&io), RING);
+    // The wait (it cannot block here) refilled first.
+    assert_eq!(io.wait_rx(10), Err(RxWaitError::Unsupported));
+    assert_eq!(fill(&io), u64::from(RING));
+    assert_eq!(engine(&io), 0);
+    // A port with no free frame and room in Fill is left alone: the wait
+    // counts no starvation (only RX passes do).
+    while wan.consume_fill().is_some() {}
+    let starved = |io: &XdpPacketIo<'_>| io.port_stats(WAN).expect("WAN").counters.fill_starved;
+    let before = starved(&io);
+    assert_eq!(io.wait_rx(10), Err(RxWaitError::Unsupported));
+    assert_eq!(starved(&io), before);
+    assert_eq!(fill(&io), 0);
+    audit(&io);
+}

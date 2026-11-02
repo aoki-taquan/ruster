@@ -77,7 +77,7 @@ pub use error::{
     AbiLayoutError, NativeRingError, NativeSyscallPlatformError, PlatformError, RingField,
     RingMapError,
 };
-pub use native_unsafe::kick::{KickDeferral, KickError, KickOutcome};
+pub use native_unsafe::kick::{KickDeferral, KickError, KickOutcome, RxWait, RxWaitError};
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",

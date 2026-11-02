@@ -856,11 +856,18 @@ sudo kill -HUP <pid>                                               # configをre
   `if<id>.watch.*`。行はすべて`warning:|recovered:|fatal: port=if<id> health=<CODE>`のvalue-free形式。
 - stats: `ruster-run-stats kind=periodic|final uptime-ms=N`の後に`section.key=value`行
   （`observer.*`、`health.*`、`tick.*`、`rx.*`、`drop.*`、`af_xdp.*`、`if<id>.af_xdp_port.*`、
-  `reload.*`、`watch.*`（`watch.link_rounds`/`link_rounds_late`/`link_rounds_stale`を含む）、
+  `reload.*`、`idle.*`、`watch.*`（`watch.link_rounds`/`link_rounds_late`/`link_rounds_stale`を含む）、
   `if<id>.watch.*`等）と
   `end`。counterとlabelだけでaddress、MAC、device名、key、seedは出しません。
-- idle時は64 tick spinした後50 µsから1 msまで倍々でsleepします（idle後最初のframeは最大約1 ms
-  遅れる。負荷中はsleepしない）。
+- idle時は64 tick spinした後、全portのAF_XDP socketへ`POLLIN`の`poll()`で待ちます（H9。`pollfd`
+  配列は起動時に一度だけ確保）。frameが届けば即座に起き（H9前は最大約1 ms遅れた）、signal handlerでも
+  戻り、timeoutは`--idle-wait-ms`（既定10 ms、1〜100）です。runtimeのtimerはtickでしか進まないので、
+  resolutionのpending state/hold/queued request、queued ICMPv4 error、unsolicited-SYN hold（B3）、
+  adapterのTX in flightかowed kick、reload workerへ出ているrequestのどれかがある間は1 ms以下に保ち、
+  periodic stats、health sample、link roundの期限も越えません。idleのrouter threadのwake-upは毎秒
+  約1000回から約100回に減ります。準備完了のままconsumeできないsocketは1 ms sleepと交互になり
+  busy spinしません。`idle.*`（`waits`、`woken`、`timed_out`、`interrupted`、`short`、`sleeps`、
+  `errors`、`max_wait_ms`）をstatsに出します。負荷中は待ちません。
 - exit status: `0` clean shutdown（起動中のsignalでrollbackした場合も）、`1`起動失敗、backend
   fault、fatal health/device event、drain失敗、drain後に残ったTX handoff、close error、
   `2` usage/invalid config、`3`停止期限（または二回目のsignal）で
@@ -868,7 +875,7 @@ sudo kill -HUP <pid>                                               # configをre
   `CAP_SETUID`/`CAP_SETGID`不足、drop後のteardownに権限が要るkernelを含む）。privilege dropの
   失敗は`1`。seccomp filterのinstall失敗も`1`、filterによるkillはSIGSYS（shellでは159）。
   reloadの拒否・失敗では終了しません。
-- socket fdの`poll`待機、multi-queue、systemd notify、SIGUSR1 stats、chroot/mount namespaceはdeferred
+- multi-queue、systemd notify、SIGUSR1 stats、chroot/mount namespaceはdeferred
   （requirements CLI-034、runbookの「Known limits」）。
 
 ### packet backend（`[backend]`）

@@ -710,6 +710,27 @@ impl Watch {
         due(&mut self.last_link, now, interval_ms)
     }
 
+    /// The earlier of the next health sample and the next link round
+    /// (H9: the idle wait never sleeps past it). An interval of 0 (every
+    /// tick) sets no deadline; one never taken yet is due at 0.
+    pub fn next_due(
+        &self,
+        health_interval_ms: u64,
+        link_interval_ms: u64,
+    ) -> Option<MonotonicMillis> {
+        let next = |last: Option<MonotonicMillis>, interval_ms: u64| {
+            (interval_ms != 0)
+                .then(|| MonotonicMillis(last.map_or(0, |last| last.0.saturating_add(interval_ms))))
+        };
+        match (
+            next(self.last_health, health_interval_ms),
+            next(self.last_link, link_interval_ms),
+        ) {
+            (Some(health), Some(link)) => Some(health.min(link)),
+            (health, link) => health.or(link),
+        }
+    }
+
     /// Whether any port currently has a warning condition.
     pub fn warning(&self) -> bool {
         self.ports.iter().any(|port| {

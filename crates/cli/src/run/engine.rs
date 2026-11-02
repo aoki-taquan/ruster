@@ -37,16 +37,36 @@
 //! # Idle strategy
 //!
 //! A tick that received no frame and requested no generated TX is idle.
-//! After [`SPIN_TICKS`] idle ticks in a row the loop sleeps, starting at
-//! [`MIN_PAUSE`] and doubling per further idle tick up to [`MAX_PAUSE`]; any
-//! busy tick resets it to spinning. Trade-off: an idle router costs about
-//! one wake-up per millisecond instead of a full core, and the first frame
-//! after an idle period waits at most [`MAX_PAUSE`] (plus timer slack,
-//! about 50 µs by default) in the RX ring before it is processed; under
-//! load the loop never sleeps. At 1 ms the default 2048-entry RX ring
-//! absorbs a burst of up to about 2 Mpps without loss while the loop
-//! wakes. A blocking `poll` on the socket fds would wake sooner but needs a
-//! new multi-fd syscall in the native crate; that is deferred (CLI-034).
+//! Under load the loop never waits. After [`SPIN_TICKS`] idle ticks in a
+//! row, each further idle tick is followed by one blocking wait
+//! ([`Datapath::wait_rx`], H9): a `poll(2)` with `POLLIN` over the AF_XDP
+//! sockets of every port, which returns as soon as the kernel puts an RX
+//! descriptor on any port, when a signal handler runs on the router
+//! thread (`EINTR`), or at the timeout of [`idle_timeout_ms`]:
+//!
+//! - at most `--idle-wait-ms` ([`crate::args::DEFAULT_IDLE_WAIT_MS`], 1 to
+//!   [`crate::args::MAX_IDLE_WAIT_MS`]);
+//! - at most [`SHORT_WAIT_MS`] while time-driven work is pending
+//!   ([`Pending`]: a resolution state, failure hold, or queued ARP; a
+//!   queued ICMPv4 error; an unsolicited-SYN hold, B3; TX in flight or an
+//!   owed kick in the backend; a reload request out on the worker), so the
+//!   tick cadence those depend on stays what it was before H9 (about one
+//!   tick per millisecond when idle);
+//! - never past the loop's own next deadline (periodic stats, health
+//!   sample, link round; [`Watch::next_due`]).
+//!
+//! A wait that reported RX readiness must be followed by a busy tick; if
+//! the next tick is idle anyway (readiness that RX cannot consume), the
+//! next wait is a plain sleep of at most [`SHORT_WAIT_MS`] instead, so a
+//! socket that stays ready without work cannot turn the loop into a
+//! busy spin. A wait that cannot block ([`WaitError`]) sleeps the same
+//! way. Trade-off: an idle router wakes about 100 times per second (at
+//! the 10 ms default) instead of about 1000, and the first frame after an
+//! idle period is processed as soon as the kernel wakes the router thread
+//! instead of up to 1 ms later; a signal delivered to another thread, a
+//! worker's reply, and anything the runtime only notices at a tick are
+//! seen at most one wait later. Every wait counts in the `idle.*` stats
+//! ([`IdleCounters`]).
 
 use std::io::Write;
 use std::thread;
@@ -68,12 +88,13 @@ use super::reload::{ReloadCounters, Reloader, TickApply};
 use super::watch::{Fatal, Forwarding, Ipv6Sample, LinkTarget, PortSample, Watch, WatchEvent};
 use super::workers::LinkWatcher;
 
-/// Idle ticks before the loop starts to sleep.
+/// Idle ticks before the loop starts to wait.
 pub const SPIN_TICKS: u32 = 64;
-/// First sleep after [`SPIN_TICKS`] idle ticks.
+/// Pause of a tick held back by a pending reload's quiescence.
 pub const MIN_PAUSE: Duration = Duration::from_micros(50);
-/// Longest sleep between idle ticks.
-pub const MAX_PAUSE: Duration = Duration::from_millis(1);
+/// Longest idle wait while time-driven work is pending ([`Pending`]), and
+/// the longest fallback sleep: the pre-H9 idle cadence.
+pub const SHORT_WAIT_MS: u64 = 1;
 /// Kick-and-reap rounds per port per drain call.
 pub const DRAIN_ROUNDS: u32 = 4;
 /// Pause between drain calls.
@@ -113,6 +134,21 @@ pub trait Datapath {
 
     /// Interfaces of the ports, in `IfId` order.
     fn port_count(&self) -> usize;
+
+    /// The idle wait (cold boundary, between ticks): returns at once while
+    /// a port has RX work, otherwise blocks until RX work arrives, a signal
+    /// handler runs, or `timeout_ms` passes. No allocation. The default
+    /// cannot block.
+    fn wait_rx(&mut self, timeout_ms: u32) -> Result<IdleWake, WaitError> {
+        let _ = timeout_ms;
+        Err(WaitError::Unsupported)
+    }
+
+    /// Whether the backend has TX in flight or owes a kick: work that only
+    /// later ticks complete, which an RX wait does not notice.
+    fn tx_outstanding(&self) -> bool {
+        false
+    }
 
     /// Hands each port's health counters to `visit` (cold path, no
     /// allocation).
@@ -239,25 +275,152 @@ impl StopSignal for ProcessSignals {
     }
 }
 
-/// Spin-then-sleep idle policy (see the module documentation).
+/// How an idle wait ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdleWake {
+    /// A port has RX work (or a socket condition to look at).
+    Ready,
+    /// The timeout passed.
+    TimedOut,
+    /// A signal handler ran (`EINTR`).
+    Interrupted,
+}
+
+/// Why an idle wait could not block; the loop sleeps instead.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WaitError {
+    /// No blocking wait for this datapath (scripted tests).
+    Unsupported,
+    /// `poll` failed with this errno.
+    Errno(u16),
+}
+
+/// Spin-then-wait idle policy (see the module documentation): whether a
+/// tick is followed by a wait, and whether that wait must be a plain
+/// sleep because the previous one reported readiness that no tick used.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IdleBackoff {
     idle: u32,
+    /// The last wait said `Ready` and no busy tick followed yet.
+    unconsumed_ready: bool,
+}
+
+/// What the loop does after a tick.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IdleAction {
+    /// Run the next tick at once (busy, or still spinning).
+    Spin,
+    /// Block in the datapath's RX wait.
+    Wait,
+    /// Sleep (at most [`SHORT_WAIT_MS`]): the last wait's readiness was
+    /// not consumed by the tick after it.
+    Sleep,
 }
 
 impl IdleBackoff {
-    /// Records one tick and returns how long to pause after it.
-    pub fn after_tick(&mut self, busy: bool) -> Option<Duration> {
+    /// Records one tick and returns what to do after it.
+    pub fn after_tick(&mut self, busy: bool) -> IdleAction {
         if busy {
             self.idle = 0;
-            return None;
+            self.unconsumed_ready = false;
+            return IdleAction::Spin;
         }
         self.idle = self.idle.saturating_add(1);
-        let beyond = self.idle.checked_sub(SPIN_TICKS + 1)?;
-        let pause = MIN_PAUSE
-            .checked_mul(1_u32.checked_shl(beyond.min(16)).unwrap_or(u32::MAX))
-            .unwrap_or(MAX_PAUSE);
-        Some(pause.min(MAX_PAUSE))
+        if self.idle <= SPIN_TICKS {
+            return IdleAction::Spin;
+        }
+        if std::mem::take(&mut self.unconsumed_ready) {
+            IdleAction::Sleep
+        } else {
+            IdleAction::Wait
+        }
+    }
+
+    /// Records how the wait after the last tick ended.
+    pub fn after_wait(&mut self, wake: IdleWake) {
+        self.unconsumed_ready = wake == IdleWake::Ready;
+    }
+}
+
+/// Time-driven work that progresses only at ticks (see the module
+/// documentation): while any is pending, idle waits stay short.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Pending {
+    /// Resolution states (retries, `Failed`), failure holds, or queued ARP
+    /// requests: the resolution timer and failure dispatch sweep them a
+    /// budget of slots per tick.
+    pub resolution: bool,
+    /// Queued ICMPv4 errors, or unsolicited-SYN holds (B3) whose 6 s
+    /// deadline the failure dispatch releases.
+    pub icmpv4: bool,
+    /// TX in flight or an owed kick (reaps, rate-limited retries on a down
+    /// link).
+    pub tx: bool,
+    /// A reload request out on the reload worker.
+    pub reload: bool,
+}
+
+impl Pending {
+    /// Whether anything is pending.
+    pub const fn any(self) -> bool {
+        self.resolution || self.icmpv4 || self.tx || self.reload
+    }
+}
+
+/// The timeout of the idle wait after a tick at `now`: `max_wait_ms`, or
+/// [`SHORT_WAIT_MS`] (never more than `max_wait_ms`) while work is
+/// `pending`, and never past `next_deadline`. 0 means a deadline is due:
+/// run the next tick without waiting.
+pub fn idle_timeout_ms(
+    now: MonotonicMillis,
+    max_wait_ms: u64,
+    pending: Pending,
+    next_deadline: Option<MonotonicMillis>,
+) -> u64 {
+    let cap = if pending.any() {
+        max_wait_ms.min(SHORT_WAIT_MS)
+    } else {
+        max_wait_ms
+    };
+    next_deadline.map_or(cap, |deadline| cap.min(deadline.0.saturating_sub(now.0)))
+}
+
+/// Counters of the idle waits (`idle.*` in the stats blocks).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IdleCounters {
+    /// The configured longest wait (`--idle-wait-ms`).
+    pub max_wait_ms: u64,
+    /// Blocking waits made.
+    pub waits: u64,
+    /// ... ended by RX work.
+    pub woken: u64,
+    /// ... that reached their timeout.
+    pub timed_out: u64,
+    /// ... ended by a signal handler.
+    pub interrupted: u64,
+    /// Waits that the pending cap ([`Pending`]) made shorter than the
+    /// configured wait and the next deadline would have (not counted when
+    /// a deadline was nearer anyway, or with `--idle-wait-ms 1`).
+    pub short: u64,
+    /// Plain sleeps instead of a wait: unconsumed readiness or a wait that
+    /// could not block.
+    pub sleeps: u64,
+    /// Waits that failed (`poll` errno); each slept instead.
+    pub errors: u64,
+}
+
+impl ruster_core::ObservableFields for IdleCounters {
+    fn visit_fields<V: ruster_core::FieldVisitor>(&self, visitor: &mut V) {
+        use ruster_core::FieldValue::Count;
+        const SECTION: &str = "idle";
+        visitor.field(SECTION, "max_wait_ms", Count(self.max_wait_ms));
+        visitor.field(SECTION, "waits", Count(self.waits));
+        visitor.field(SECTION, "woken", Count(self.woken));
+        visitor.field(SECTION, "timed_out", Count(self.timed_out));
+        visitor.field(SECTION, "interrupted", Count(self.interrupted));
+        visitor.field(SECTION, "short", Count(self.short));
+        visitor.field(SECTION, "sleeps", Count(self.sleeps));
+        visitor.field(SECTION, "errors", Count(self.errors));
     }
 }
 
@@ -292,21 +455,34 @@ pub fn backend_stopped<P, Q, R, G>(report: &TickReport<P, Q, R, G>) -> bool {
     )
 }
 
-/// Consecutive ticks whose I/O was skipped as `BackendIoNotReentrant`
+/// How long ticks may keep skipping their I/O as `BackendIoNotReentrant`
 /// (the adapter's `SkipIo` disposition: an engine-level stranded lease or
-/// handoff that never clears by itself) before the loop treats the backend
-/// as stopped. About one second at the 1 ms idle sleep.
-pub const WEDGED_TICKS: u32 = 1_024;
+/// handoff that never clears by itself), without a tick in between, before
+/// the loop treats the backend as stopped. Measured on the loop clock
+/// since H9 (the tick rate depends on the idle wait); before, 1024 ticks
+/// made about one second at the 1 ms idle sleep. With [`WEDGED_MIN_TICKS`]
+/// the bound is `max(1 s, 16 × --idle-wait-ms)` (at most 1.6 s at the
+/// 100 ms maximum), plus one wait.
+pub const WEDGED_MS: u64 = 1_000;
+/// ... and at least this many such ticks, so a single tick after a long
+/// stall (a stopped process) never ends the run alone.
+pub const WEDGED_MIN_TICKS: u32 = 16;
 
-/// Ends the loop on a terminal backend stop, or on [`WEDGED_TICKS`]
-/// consecutive non-reentrant skips; any other tick resets the count.
+/// Ends the loop on a terminal backend stop, or once non-reentrant skips
+/// have lasted [`WEDGED_MS`] over at least [`WEDGED_MIN_TICKS`] ticks
+/// (`max(1 s, 16 × --idle-wait-ms)`); any other tick resets it.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BackendWatch {
     skipped: u32,
+    since: Option<MonotonicMillis>,
 }
 
 impl BackendWatch {
-    pub fn after_tick<P, Q, R, G>(&mut self, report: &TickReport<P, Q, R, G>) -> Option<LoopEnd> {
+    pub fn after_tick<P, Q, R, G>(
+        &mut self,
+        now: MonotonicMillis,
+        report: &TickReport<P, Q, R, G>,
+    ) -> Option<LoopEnd> {
         if backend_stopped(report) {
             return Some(LoopEnd::BackendStopped);
         }
@@ -315,11 +491,13 @@ impl BackendWatch {
             RxPhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
         ) {
             self.skipped = self.skipped.saturating_add(1);
-            if self.skipped >= WEDGED_TICKS {
+            let since = *self.since.get_or_insert(now);
+            if self.skipped >= WEDGED_MIN_TICKS && now.0.saturating_sub(since.0) >= WEDGED_MS {
                 return Some(LoopEnd::BackendStopped);
             }
         } else {
             self.skipped = 0;
+            self.since = None;
         }
         None
     }
@@ -352,19 +530,25 @@ pub struct LoopSettings {
     pub reload_quiesce_ms: u64,
     /// A reload preparation running this long is warned once.
     pub reload_prepare_warn_ms: u64,
+    /// The longest idle wait (`--idle-wait-ms`, 1 to
+    /// [`crate::args::MAX_IDLE_WAIT_MS`]).
+    pub idle_wait_ms: u64,
 }
 
-/// The cold-path control of the loop: reload, health, and link watch.
+/// The cold-path control of the loop: reload, health, and link watch,
+/// and the idle wait counters.
 pub struct Control {
     pub reloader: Reloader,
     pub watch: Watch,
     pub links: LinkWatcher,
+    pub idle: IdleCounters,
 }
 
 /// What a periodic stats block reads besides the publication and backend.
 pub struct RunStatus<'a> {
     pub reload: ReloadCounters,
     pub watch: &'a Watch,
+    pub idle: IdleCounters,
 }
 
 /// Runs ticks until a stop request, a backend stop, or a fatal watch
@@ -528,13 +712,14 @@ where
                 return LoopEnd::Invariant;
             }
         }
-        observer.record_occupancy(ServiceOccupancy::capture(
+        let occupancy = ServiceOccupancy::capture(
             active.icmpv4_errors(),
             active.nat44_udp(),
             active.nat44_tcp(),
             active.firewall(),
-        ));
-        if let Some(end) = wedge.after_tick(&report) {
+        );
+        observer.record_occupancy(occupancy);
+        if let Some(end) = wedge.after_tick(now, &report) {
             return end;
         }
         let busy = tick_was_busy(&report);
@@ -549,13 +734,114 @@ where
             let status = RunStatus {
                 reload: control.reloader.counters(),
                 watch: &control.watch,
+                idle: control.idle,
             };
             periodic(active, datapath, observer, &status, now);
         }
-        if let Some(pause) = backoff.after_tick(busy) {
-            clock.pause(pause);
+        match backoff.after_tick(busy) {
+            IdleAction::Spin => {}
+            action => {
+                let resolution = active.resolution();
+                let pending = Pending {
+                    resolution: resolution.pending_states() != 0
+                        || resolution.pending_failure_holds() != 0
+                        || resolution.pending_actions() != 0,
+                    icmpv4: active.icmpv4_errors().pending_actions() != 0
+                        || occupancy.nat44_tcp_unsolicited_syn_holds.occupied() != 0,
+                    tx: datapath.tx_outstanding(),
+                    reload: control.reloader.busy(),
+                };
+                let stats_due = (settings.stats_interval_ms != 0).then(|| {
+                    MonotonicMillis(last_stats.0.saturating_add(settings.stats_interval_ms))
+                });
+                let watch_due = control
+                    .watch
+                    .next_due(settings.health_interval_ms, settings.link_interval_ms);
+                let deadline = match (stats_due, watch_due) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                let timeout = idle_timeout_ms(now, settings.idle_wait_ms, pending, deadline);
+                // Shortened only if the pending cap, not a deadline or the
+                // configured wait, set this timeout.
+                let shortened = timeout
+                    < idle_timeout_ms(now, settings.idle_wait_ms, Pending::default(), deadline);
+                idle_wait(
+                    datapath,
+                    clock,
+                    &mut backoff,
+                    action,
+                    timeout,
+                    shortened,
+                    &mut control.idle,
+                    err,
+                );
+            }
         }
     }
+}
+
+/// One idle wait of `timeout_ms` (none at 0: a deadline is due): the
+/// datapath's blocking RX wait, or a plain sleep of at most
+/// [`SHORT_WAIT_MS`] after unconsumed readiness or when the wait cannot
+/// block. The first `poll` failure is warned once.
+#[allow(clippy::too_many_arguments)]
+fn idle_wait<D, C, E>(
+    datapath: &mut D,
+    clock: &mut C,
+    backoff: &mut IdleBackoff,
+    action: IdleAction,
+    timeout_ms: u64,
+    shortened: bool,
+    counters: &mut IdleCounters,
+    err: &mut E,
+) where
+    D: Datapath,
+    C: Clock,
+    E: Write,
+{
+    if timeout_ms == 0 {
+        return;
+    }
+    let sleep = Duration::from_millis(timeout_ms.min(SHORT_WAIT_MS));
+    if action == IdleAction::Sleep {
+        bump(&mut counters.sleeps);
+        clock.pause(sleep);
+        return;
+    }
+    let timeout = u32::try_from(timeout_ms).unwrap_or(u32::MAX);
+    match datapath.wait_rx(timeout) {
+        Ok(wake) => {
+            bump(&mut counters.waits);
+            if shortened {
+                bump(&mut counters.short);
+            }
+            bump(match wake {
+                IdleWake::Ready => &mut counters.woken,
+                IdleWake::TimedOut => &mut counters.timed_out,
+                IdleWake::Interrupted => &mut counters.interrupted,
+            });
+            backoff.after_wait(wake);
+        }
+        Err(error) => {
+            if let WaitError::Errno(errno) = error {
+                if counters.errors == 0 {
+                    let _ = writeln!(
+                        err,
+                        "ruster run: warning: idle poll failed code=ERRNO_{errno}; \
+                         sleeping at most {SHORT_WAIT_MS} ms between idle ticks instead"
+                    );
+                }
+                bump(&mut counters.errors);
+            }
+            bump(&mut counters.sleeps);
+            clock.pause(sleep);
+        }
+    }
+}
+
+fn bump(counter: &mut u64) {
+    *counter = counter.saturating_add(1);
 }
 
 /// The health sample when due, and the link round: a finished round is

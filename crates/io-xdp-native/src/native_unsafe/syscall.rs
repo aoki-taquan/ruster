@@ -966,6 +966,99 @@ impl<S: Syscalls> Drop for OwnedXdpFd<'_, S> {
     }
 }
 
+/// How one [`PollSet::wait`] ended without an error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PollSetOutcome {
+    /// At least one socket reported an event. For AF_XDP sockets that is
+    /// `POLLIN` (Linux `xsk_poll` reports only `POLLIN`/`POLLOUT`, and only
+    /// `POLLIN` is requested); a closed fd's `POLLNVAL` would also count,
+    /// but the borrow keeps every fd open.
+    Ready,
+    /// The timeout passed with no event.
+    TimedOut,
+}
+
+/// A `pollfd` array over the AF_XDP sockets of every port, allocated once
+/// (cold) and reused by every idle wait (H9): `poll(2)` with `POLLIN` on
+/// every socket blocks until one has an RX descriptor or the timeout
+/// passes. The sockets are borrowed shared for `'a`, so none can be closed
+/// (close consumes the owner) while the set exists.
+pub(super) struct PollSet<'a> {
+    descriptors: Box<[ffi::PollFd]>,
+    _sockets: std::marker::PhantomData<&'a OwnedXdpFd<'a, LinuxSyscalls>>,
+}
+
+impl<'a> PollSet<'a> {
+    /// The set over `sockets` with `events` each; `None` if one of them is
+    /// no longer active (unreachable through a shared borrow) or there are
+    /// none. Cold: one allocation.
+    pub(super) fn new(
+        sockets: impl IntoIterator<Item = &'a OwnedXdpFd<'a, LinuxSyscalls>>,
+        events: i16,
+    ) -> Option<Self> {
+        let descriptors = sockets
+            .into_iter()
+            .map(|socket| {
+                socket.fd.filter(|fd| *fd >= 0).map(|fd| ffi::PollFd {
+                    fd,
+                    events,
+                    revents: 0,
+                })
+            })
+            .collect::<Option<Box<[ffi::PollFd]>>>()?;
+        if descriptors.is_empty() {
+            return None;
+        }
+        Some(Self {
+            descriptors,
+            _sockets: std::marker::PhantomData,
+        })
+    }
+
+    /// Number of sockets in the set.
+    pub(super) fn len(&self) -> usize {
+        self.descriptors.len()
+    }
+
+    /// One `poll(2)` over the whole set; `timeout_millis` is clamped to
+    /// `0..=c_int::MAX`. No allocation. `EINTR` (a signal handler ran) is
+    /// returned as the error like every other errno.
+    pub(super) fn wait(&mut self, timeout_millis: u32) -> Result<PollSetOutcome, Errno> {
+        for descriptor in self.descriptors.iter_mut() {
+            descriptor.revents = 0;
+        }
+        let timeout = c_int::try_from(timeout_millis).unwrap_or(c_int::MAX);
+        // SAFETY: `descriptors` is an owned, initialized slice of
+        // `#[repr(C)] struct pollfd` values that stays writable and is not
+        // otherwise borrowed during the call; the count is exactly its
+        // length. Every fd is the nonnegative fd of a socket borrowed shared
+        // for `'a` (it cannot be closed meanwhile); a stale fd could only
+        // make `poll` report `POLLNVAL`, never touch memory.
+        let result = unsafe {
+            ffi::poll(
+                self.descriptors.as_mut_ptr(),
+                self.descriptors.len(),
+                timeout,
+            )
+        };
+        let ready = result_from_minus_one(result)?;
+        Ok(if ready > 0 {
+            PollSetOutcome::Ready
+        } else {
+            PollSetOutcome::TimedOut
+        })
+    }
+}
+
+impl fmt::Debug for PollSet<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PollSet")
+            .field("sockets", &self.descriptors.len())
+            .finish()
+    }
+}
+
 /// Kind of kernel BPF object behind one [`OwnedBpfFd`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BpfObject {

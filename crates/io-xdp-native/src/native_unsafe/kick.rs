@@ -22,7 +22,9 @@ use std::{fmt, marker::PhantomData};
     target_arch = "x86_64",
     target_pointer_width = "64"
 ))]
-use super::syscall::{LinuxSyscalls, OwnedXdpFd, ResourceError, SyscallError};
+use super::syscall::{
+    LinuxSyscalls, OwnedXdpFd, PollSet, PollSetOutcome, ResourceError, SyscallError,
+};
 
 /// Linux v6.8 `include/uapi/asm-generic/errno-base.h` and `errno.h` values
 /// that a kick classifies. They are architecture independent on Linux.
@@ -125,6 +127,7 @@ pub(crate) const fn classify(result: Result<(), Option<u16>>) -> Result<KickOutc
 }
 
 /// What a bundle's kick reaches.
+#[derive(Clone, Copy)]
 pub(super) enum KickTarget<'session> {
     /// The live session's owned socket, borrowed shared: it cannot be
     /// closed (close consumes the owner) while this borrow lives.
@@ -225,6 +228,166 @@ impl<'session> SocketKick<'session> {
             KickTarget::Kernel(kernel) => kernel.scripted_statistics(),
             KickTarget::Never(never, _) => match *never {},
         }
+    }
+}
+
+/// How an idle wait on the RX rings of every port ended (H9).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RxWait {
+    /// A port has RX work: a descriptor in its RX ring or a frame left
+    /// pending by an earlier batch. Linux `xsk_poll` reports only
+    /// `POLLIN`/`POLLOUT` (and only `POLLIN` is asked for); `POLLNVAL`
+    /// would need a closed fd, which the shared socket borrow excludes, and
+    /// would also read as `Ready`. The next RX pass sees it.
+    Ready,
+    /// The timeout passed with no RX descriptor on any port.
+    TimedOut,
+    /// A signal handler ran during the wait (`EINTR`): the caller should
+    /// look at its signal flags. Linux never restarts `poll` after a
+    /// handler, whatever `SA_RESTART` says.
+    Interrupted,
+}
+
+/// Why an idle wait could not block.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RxWaitError {
+    /// `poll` failed with this Linux errno (other than `EINTR`).
+    Errno(u16),
+    /// No blocking wait exists for these ports: a socket was not usable,
+    /// the seam refused the call, or the ports are not live sockets
+    /// (scripted tests).
+    Unsupported,
+}
+
+impl fmt::Display for RxWaitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for RxWaitError {}
+
+/// The blocking idle wait over the sockets of every port (H9): one
+/// preallocated `pollfd` array with `POLLIN` per socket, built once from
+/// the bundles' kick handles. It borrows the sockets like the kick handles
+/// do, so it cannot outlive them, and it exposes nothing but the wait.
+pub(crate) struct RxWaitSet<'session> {
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    ))]
+    live: Option<PollSet<'session>>,
+    _sockets: PhantomData<&'session ()>,
+    /// Worker-local like the engines.
+    _worker_local: PhantomData<*mut ()>,
+}
+
+impl<'session> RxWaitSet<'session> {
+    /// The set over `kicks` (cold: one allocation). Without a live socket
+    /// behind every kick handle (scripted tests) the set cannot block and
+    /// every wait is [`RxWaitError::Unsupported`].
+    pub(crate) fn new<'kick>(kicks: impl IntoIterator<Item = &'kick SocketKick<'session>>) -> Self
+    where
+        'session: 'kick,
+    {
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        ))]
+        let live = {
+            let mut sockets = Vec::new();
+            let mut all_live = true;
+            for kick in kicks {
+                match kick.target {
+                    KickTarget::Live(fd) => sockets.push(fd),
+                    #[allow(unreachable_patterns)]
+                    _ => all_live = false,
+                }
+            }
+            if all_live {
+                PollSet::new(sockets, POLLIN)
+            } else {
+                None
+            }
+        };
+        #[cfg(not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        )))]
+        let _ = kicks.into_iter().count();
+        Self {
+            #[cfg(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                target_pointer_width = "64"
+            ))]
+            live,
+            _sockets: PhantomData,
+            _worker_local: PhantomData,
+        }
+    }
+
+    /// Whether a wait can block (every port is a live socket).
+    pub(crate) fn is_live(&self) -> bool {
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        ))]
+        {
+            self.live.is_some()
+        }
+        #[cfg(not(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        )))]
+        {
+            false
+        }
+    }
+
+    /// Blocks in one `poll(2)` until a socket has an RX descriptor, the
+    /// timeout passes, or a signal handler runs. No allocation.
+    pub(crate) fn wait(&mut self, timeout_millis: u32) -> Result<RxWait, RxWaitError> {
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_pointer_width = "64"
+        ))]
+        if let Some(live) = self.live.as_mut() {
+            return match live.wait(timeout_millis) {
+                Ok(PollSetOutcome::Ready) => Ok(RxWait::Ready),
+                Ok(PollSetOutcome::TimedOut) => Ok(RxWait::TimedOut),
+                Err(errno) => match errno.raw() {
+                    Some(errno::EINTR) => Ok(RxWait::Interrupted),
+                    other => Err(classify_wait_errno(other)),
+                },
+            };
+        }
+        let _ = timeout_millis;
+        Err(RxWaitError::Unsupported)
+    }
+}
+
+/// Maps a failed wait's errno (`None`: refused before the kernel or an
+/// unusable capture).
+const fn classify_wait_errno(errno: Option<u16>) -> RxWaitError {
+    match errno {
+        Some(errno) => RxWaitError::Errno(errno),
+        None => RxWaitError::Unsupported,
+    }
+}
+
+impl fmt::Debug for RxWaitSet<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RxWaitSet")
+            .field("live", &self.is_live())
+            .finish()
     }
 }
 

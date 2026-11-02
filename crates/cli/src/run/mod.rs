@@ -55,7 +55,9 @@
 //! # Run loop
 //!
 //! See [`engine`]: `run_tick` with the configured budgets and an `Instant`
-//! clock, spin-then-sleep idle backoff (at most 1 ms), no allocation per
+//! clock, spin-then-wait idle strategy (a `poll` on every port's socket
+//! that a frame ends at once, at most `--idle-wait-ms`, default 10 ms, and
+//! at most 1 ms while time-driven work is pending; H9), no allocation per
 //! tick, and a stats block on stdout every `--stats-interval` seconds.
 //! Between ticks, on the cold path: the SIGHUP reload ([`reload`],
 //! prepared on the reload worker thread), and the health and link watch
@@ -192,6 +194,8 @@ pub struct Settings {
     pub privileges: PrivilegePolicy,
     /// The syscall filter after the drop.
     pub seccomp: SeccompMode,
+    /// The longest idle wait (`--idle-wait-ms`, H9).
+    pub idle_wait_ms: u64,
 }
 
 impl Settings {
@@ -199,6 +203,7 @@ impl Settings {
         Self {
             privileges: privilege_policy(args),
             seccomp: args.seccomp,
+            idle_wait_ms: args.idle_wait_ms,
             policy: CheckPolicy {
                 allow_multi_queue: args.allow_multi_queue,
                 allow_kernel_forwarding: args.allow_kernel_forwarding,
@@ -669,6 +674,7 @@ where
         link_interval_ms: settings.link_interval_ms,
         reload_quiesce_ms: settings.reload_quiesce_ms,
         reload_prepare_warn_ms: settings.reload_prepare_warn_ms,
+        idle_wait_ms: settings.idle_wait_ms,
     };
     let mut control = Control {
         reloader,
@@ -677,6 +683,10 @@ where
             .allowing_kernel_ipv6(settings.policy.allow_kernel_ipv6)
             .with_link_stale_ms(settings.link_stale_ms),
         links,
+        idle: engine::IdleCounters {
+            max_wait_ms: settings.idle_wait_ms,
+            ..engine::IdleCounters::default()
+        },
     };
     let end = run_loop(
         &mut active,
@@ -769,6 +779,7 @@ where
     let status = RunStatus {
         reload: control.reloader.counters(),
         watch: &control.watch,
+        idle: control.idle,
     };
     let final_block = render(
         BlockKind::Final,
@@ -862,6 +873,7 @@ fn render<D: Datapath>(
         stats::write_fields(out, None, &resolution_index);
         datapath.write_stats(out);
         stats::write_fields(out, None, &status.reload);
+        stats::write_fields(out, None, &status.idle);
         stats::write_fields(out, None, status.watch);
         for (interface, health) in status.watch.health() {
             stats::write_fields(out, Some(interface), &health);

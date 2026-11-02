@@ -847,6 +847,11 @@ impl<'memory> RxFillEngine<'memory> {
         self.origin
     }
 
+    /// The bundle's kick handle, for the adapter's idle wait set (cold).
+    pub(crate) const fn kick_handle(&self) -> &SocketKick<'memory> {
+        &self.kick
+    }
+
     /// TX descriptors published and not yet consumed by the kernel (one
     /// atomic load). A corrupt cursor reads as the full capacity.
     pub(crate) fn tx_unconsumed(&self) -> u32 {

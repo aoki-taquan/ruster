@@ -20,8 +20,8 @@ use super::checks::{
     required_memlock, CheckFailure, CheckPolicy, DeviceFacts, Ipv6Facts, PrivilegeFailure, Probe,
 };
 use super::engine::{
-    Clock, ClockedIo, Datapath, DrainProgress, IdleBackoff, LinkMonitor, StopSignal,
-    DRAIN_DEADLINE_MS, DRAIN_ROUNDS, MAX_PAUSE, MIN_PAUSE, SPIN_TICKS,
+    Clock, ClockedIo, Datapath, DrainProgress, IdleAction, IdleBackoff, IdleWake, LinkMonitor,
+    StopSignal, WaitError, DRAIN_DEADLINE_MS, DRAIN_ROUNDS, SHORT_WAIT_MS, SPIN_TICKS,
 };
 use super::netlink::{LinkFacts, NetlinkError};
 use super::privileges::{Bounding, DropFailure, DropReport, Identity, PrivilegePolicy};
@@ -145,6 +145,27 @@ struct State {
     lockdowns: RefCell<Vec<Lockdown>>,
     /// Each `confine` call: the mode, the lockdowns and ticks before it.
     confines: RefCell<Vec<Confine>>,
+    /// H9: the datapath's idle wait is simulated (otherwise it cannot
+    /// block, like the provided default).
+    waits: Cell<bool>,
+    /// Each simulated wait: the ticks (`io()` calls) before it and its
+    /// timeout in milliseconds.
+    wait_log: RefCell<Vec<(u32, u32)>>,
+    /// Frames that arrive at a clock microsecond (bound clock), ending the
+    /// wait they fall into.
+    arrivals: RefCell<VecDeque<(u64, IfId, Vec<u8>)>>,
+    /// The clock (µs) when an arrival ended a wait, and the reading of the
+    /// first tick whose I/O then had it.
+    arrived_us: Cell<Option<u64>>,
+    served_us: Cell<Option<u64>>,
+    /// Waits still to end `Ready` without any frame.
+    spurious_ready: Cell<u32>,
+    /// The wait with this number (1-based) is interrupted and raises
+    /// [`Self::signal`], as a signal handler would.
+    interrupt_at: Cell<Option<u32>>,
+    signal: Cell<bool>,
+    /// What `tx_outstanding` reports.
+    tx_outstanding: Cell<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -325,6 +346,14 @@ impl Datapath for FakeDatapath<'_> {
     fn io(&mut self) -> &mut SimIo {
         let call = self.state.io_calls.get() + 1;
         self.state.io_calls.set(call);
+        if self.state.served_us.get().is_none()
+            && self.state.arrived_us.get().is_some()
+            && self.io.pending_rx() != 0
+        {
+            self.state
+                .served_us
+                .set(Some(self.state.clock_seen_us.get()));
+        }
         let mut scheduled = self.state.inject_at.borrow_mut();
         while scheduled.front().is_some_and(|(at, _, _)| *at <= call) {
             if let Some((_, ingress, bytes)) = scheduled.pop_front() {
@@ -399,6 +428,60 @@ impl Datapath for FakeDatapath<'_> {
 
     fn port_count(&self) -> usize {
         self.ports.len()
+    }
+
+    /// Simulated when [`State::waits`] is set: ready at once with a frame
+    /// pending; otherwise the first arrival within the timeout (the bound
+    /// clock jumps to it), an interrupt, or the whole timeout.
+    fn wait_rx(&mut self, timeout_ms: u32) -> Result<IdleWake, WaitError> {
+        let state = &self.state;
+        if !state.waits.get() {
+            return Err(WaitError::Unsupported);
+        }
+        state
+            .wait_log
+            .borrow_mut()
+            .push((state.io_calls.get(), timeout_ms));
+        if self.io.pending_rx() != 0 {
+            return Ok(IdleWake::Ready);
+        }
+        let number = u32::try_from(state.wait_log.borrow().len()).expect("few waits");
+        if state.interrupt_at.get() == Some(number) {
+            state.signal.set(true);
+            return Ok(IdleWake::Interrupted);
+        }
+        let spurious = state.spurious_ready.get();
+        if spurious != 0 {
+            state.spurious_ready.set(spurious - 1);
+            return Ok(IdleWake::Ready);
+        }
+        let now = state.clock_seen_us.get();
+        let end = now + u64::from(timeout_ms) * 1_000;
+        let arrival = {
+            let mut arrivals = state.arrivals.borrow_mut();
+            if arrivals.front().is_some_and(|(at, _, _)| *at <= end) {
+                arrivals.pop_front()
+            } else {
+                None
+            }
+        };
+        if let Some((at, ingress, frame)) = arrival {
+            let at = at.max(now);
+            state
+                .clock_extra_us
+                .set(state.clock_extra_us.get() + (at - now));
+            state.arrived_us.set(Some(at));
+            self.io.inject(ingress, frame);
+            return Ok(IdleWake::Ready);
+        }
+        state
+            .clock_extra_us
+            .set(state.clock_extra_us.get() + (end - now));
+        Ok(IdleWake::TimedOut)
+    }
+
+    fn tx_outstanding(&self) -> bool {
+        self.state.tx_outstanding.get()
     }
 }
 
@@ -784,6 +867,7 @@ fn settings(policy: CheckPolicy, stats_interval_ms: u64) -> Settings {
         thresholds: super::watch::Thresholds::default(),
         privileges: PrivilegePolicy::default(),
         seccomp: SeccompMode::default(),
+        idle_wait_ms: crate::args::DEFAULT_IDLE_WAIT_MS,
     }
 }
 
@@ -1301,35 +1385,59 @@ fn the_loop_forwards_and_sleeps_only_when_idle() {
         outcome.out
     );
     // The busy first tick reset the backoff: SPIN_TICKS idle ticks spin,
-    // the remaining ones sleep, doubling up to the cap.
+    // the remaining ones wait; this datapath cannot block, so each wait is
+    // a sleep of at most the short wait.
     let idle_sleeps = ticks - 1 - SPIN_TICKS;
     assert_eq!(clock.pauses, idle_sleeps, "drain pauses are not reached");
-    assert!(clock.longest <= MAX_PAUSE);
+    assert_eq!(clock.longest, Duration::from_millis(SHORT_WAIT_MS));
+    assert!(
+        outcome
+            .out
+            .contains(&format!("\nidle.sleeps={idle_sleeps}\nidle.errors=0\n")),
+        "{}",
+        outcome.out
+    );
+    assert!(outcome.out.contains("\nidle.waits=0\n"), "{}", outcome.out);
 }
 
 #[test]
-fn idle_backoff_spins_then_doubles_to_the_cap() {
+fn idle_backoff_spins_then_waits_and_sleeps_after_unconsumed_readiness() {
     let mut backoff = IdleBackoff::default();
     for _ in 0..SPIN_TICKS {
-        assert_eq!(backoff.after_tick(false), None);
+        assert_eq!(backoff.after_tick(false), IdleAction::Spin);
     }
-    assert_eq!(backoff.after_tick(false), Some(MIN_PAUSE));
-    assert_eq!(backoff.after_tick(false), Some(MIN_PAUSE * 2));
-    let mut last = MIN_PAUSE * 2;
-    for _ in 0..100 {
-        let pause = backoff.after_tick(false).expect("sleeping");
-        assert!(pause >= last && pause <= MAX_PAUSE);
-        last = pause;
+    assert_eq!(backoff.after_tick(false), IdleAction::Wait);
+    backoff.after_wait(IdleWake::TimedOut);
+    assert_eq!(backoff.after_tick(false), IdleAction::Wait);
+    backoff.after_wait(IdleWake::Interrupted);
+    assert_eq!(backoff.after_tick(false), IdleAction::Wait);
+    // Readiness that the next tick used: back to spinning.
+    backoff.after_wait(IdleWake::Ready);
+    assert_eq!(backoff.after_tick(true), IdleAction::Spin);
+    for _ in 0..SPIN_TICKS {
+        assert_eq!(backoff.after_tick(false), IdleAction::Spin);
     }
-    assert_eq!(last, MAX_PAUSE);
-    assert_eq!(backoff.after_tick(true), None);
-    assert_eq!(backoff.after_tick(false), None, "busy resets to spinning");
+    assert_eq!(backoff.after_tick(false), IdleAction::Wait);
+    // Readiness that the next tick did not use: one sleep, then waiting
+    // again (a socket that stays ready alternates, never spins).
+    backoff.after_wait(IdleWake::Ready);
+    assert_eq!(backoff.after_tick(false), IdleAction::Sleep);
+    assert_eq!(backoff.after_tick(false), IdleAction::Wait);
+    backoff.after_wait(IdleWake::Ready);
+    assert_eq!(backoff.after_tick(false), IdleAction::Sleep);
+    // A busy tick forgets unconsumed readiness.
+    backoff.after_wait(IdleWake::Ready);
+    assert_eq!(backoff.after_tick(true), IdleAction::Spin);
+    for _ in 0..SPIN_TICKS {
+        assert_eq!(backoff.after_tick(false), IdleAction::Spin);
+    }
+    assert_eq!(backoff.after_tick(false), IdleAction::Wait);
     // Saturation never panics or overflows.
     let mut long = IdleBackoff::default();
     for _ in 0..100_000 {
         let _ = long.after_tick(false);
     }
-    assert_eq!(long.after_tick(false), Some(MAX_PAUSE));
+    assert_eq!(long.after_tick(false), IdleAction::Wait);
 }
 
 #[test]
@@ -1527,7 +1635,21 @@ impl StopSignal for MeasuringStop {
 
 #[test]
 fn ticks_do_not_allocate() {
+    ticks_do_not_allocate_with(false);
+}
+
+/// H9: the same with the blocking idle wait (the fake's wait log has its
+/// room reserved before the measurement, like the production `pollfd`
+/// array that is allocated once at startup).
+#[test]
+fn ticks_with_idle_waits_do_not_allocate() {
+    ticks_do_not_allocate_with(true);
+}
+
+fn ticks_do_not_allocate_with(waits: bool) {
     let host = FakeHost::default();
+    host.state.waits.set(waits);
+    host.state.wait_log.borrow_mut().reserve(1_000);
     // The health and link watch run every tick here (test settings), with
     // healthy samples that change nothing, so their path is measured too.
     let rounds = (0..1_000_u64).map(|step| {
@@ -1565,6 +1687,12 @@ fn ticks_do_not_allocate() {
     );
     assert_eq!(outcome.status, 0, "{}", outcome.err);
     assert_eq!(counting::count() - before, 0, "allocation in the tick loop");
+    let waited = host.state.wait_log.borrow().len();
+    if waits {
+        assert!(waited >= 190, "{waited} waits measured");
+    } else {
+        assert_eq!(waited, 0);
+    }
 }
 
 #[test]
@@ -1751,7 +1879,7 @@ fn the_last_kick_error_reaches_the_summary_as_a_token() {
 
 #[test]
 fn a_wedged_backend_ends_the_loop_after_bounded_skips() {
-    use super::engine::{BackendWatch, LoopEnd, WEDGED_TICKS};
+    use super::engine::{BackendWatch, LoopEnd, WEDGED_MIN_TICKS, WEDGED_MS};
     use ruster_runtime::{
         PhaseReport, PublicationOutcome, RxPhaseReport, TickPhaseSkip, TickReport,
     };
@@ -1769,18 +1897,49 @@ fn a_wedged_backend_ends_the_loop_after_bounded_skips() {
     };
     let wedged = skipped(TickPhaseSkip::BackendIoNotReentrant);
     let other = skipped(TickPhaseSkip::BackendIoFailure);
+    let at = MonotonicMillis;
+    // Time-based (H9: the idle tick rate is not fixed): one tick per 10 ms
+    // reaches the bound after WEDGED_MS.
     let mut watch = BackendWatch::default();
-    for _ in 0..WEDGED_TICKS - 1 {
-        assert_eq!(watch.after_tick(&wedged), None);
+    let mut now = 1_000;
+    for _ in 0..WEDGED_MS / 10 {
+        assert_eq!(watch.after_tick(at(now), &wedged), None);
+        now += 10;
     }
-    // Any other tick resets the count.
-    assert_eq!(watch.after_tick(&other), None);
-    for _ in 0..WEDGED_TICKS - 1 {
-        assert_eq!(watch.after_tick(&wedged), None);
+    // Any other tick resets it, the clock included.
+    assert_eq!(watch.after_tick(at(now), &other), None);
+    let start = now + 10;
+    for tick in 0..=WEDGED_MS / 10 {
+        let now = start + tick * 10;
+        let end = watch.after_tick(at(now), &wedged);
+        if now - start >= WEDGED_MS {
+            assert_eq!(end, Some(LoopEnd::BackendStopped));
+        } else {
+            assert_eq!(end, None, "{tick}");
+        }
     }
-    assert_eq!(watch.after_tick(&wedged), Some(LoopEnd::BackendStopped));
+    // Fewer than WEDGED_MIN_TICKS skips never end it, however long they
+    // last (a stopped process, then one tick).
+    let mut sparse = BackendWatch::default();
+    for tick in 0..u64::from(WEDGED_MIN_TICKS) - 1 {
+        assert_eq!(sparse.after_tick(at(tick * 60_000), &wedged), None);
+    }
     assert_eq!(
-        BackendWatch::default().after_tick(&skipped(TickPhaseSkip::BackendStopped)),
+        sparse.after_tick(at(u64::from(WEDGED_MIN_TICKS) * 60_000), &wedged),
+        Some(LoopEnd::BackendStopped)
+    );
+    // Many fast skips within the bound do not either.
+    let mut fast = BackendWatch::default();
+    for _ in 0..100_000 {
+        assert_eq!(fast.after_tick(at(5), &wedged), None);
+    }
+    assert_eq!(fast.after_tick(at(5 + WEDGED_MS - 1), &wedged), None);
+    assert_eq!(
+        fast.after_tick(at(5 + WEDGED_MS), &wedged),
+        Some(LoopEnd::BackendStopped)
+    );
+    assert_eq!(
+        BackendWatch::default().after_tick(at(0), &skipped(TickPhaseSkip::BackendStopped)),
         Some(LoopEnd::BackendStopped)
     );
 }
@@ -2414,3 +2573,6 @@ mod asynchronous;
 
 #[path = "reclock_tests.rs"]
 mod reclock;
+
+#[path = "idle_tests.rs"]
+mod idle;

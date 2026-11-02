@@ -33,7 +33,7 @@ last = 65535
 /// The slow work between two readings: far above the 2 ms margin.
 const SLOW_US: u64 = 50_000;
 
-fn document(edit: impl Fn(String) -> String) -> ValidatedConfigV1 {
+pub(super) fn document(edit: impl Fn(String) -> String) -> ValidatedConfigV1 {
     let base = include_str!("../../../../fixtures/m1/router-v1.toml");
     let text = edit(format!("{base}\n{BACKEND}\n{ADMIT_INBOUND_TCP}"));
     match crate::config_cmd::validate_bytes(text.as_bytes()) {
@@ -42,7 +42,7 @@ fn document(edit: impl Fn(String) -> String) -> ValidatedConfigV1 {
     }
 }
 
-fn fold(bytes: &[u8]) -> u16 {
+pub(super) fn fold(bytes: &[u8]) -> u16 {
     let mut sum = 0_u32;
     for pair in bytes.chunks(2) {
         sum += u32::from(u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]));
@@ -55,7 +55,7 @@ fn fold(bytes: &[u8]) -> u16 {
 
 /// An unsolicited SYN from 198.51.100.20:5555 (routed out of the WAN) to
 /// the public port 40003, which has no mapping.
-fn unsolicited_syn() -> Vec<u8> {
+pub(super) fn unsolicited_syn() -> Vec<u8> {
     let (remote, public) = ([198, 51, 100, 20], [203, 0, 113, 2]);
     let mut tcp = vec![0_u8; 20];
     tcp[0..2].copy_from_slice(&5555_u16.to_be_bytes());
@@ -182,7 +182,7 @@ fn run_hooked(
 }
 
 /// The SYN was held once; whether its hold is still pending at the end.
-fn hold_pending(out: &str) -> bool {
+pub(super) fn hold_pending(out: &str) -> bool {
     assert_eq!(
         ops::line_value(out, "nat44_tcp.unsolicited_syn_held"),
         Some("1"),

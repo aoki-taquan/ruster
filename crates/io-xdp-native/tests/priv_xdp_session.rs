@@ -36,15 +36,16 @@ use std::{
 };
 
 use ruster_core::{
-    forward_batch, BackendStats, ForwardingSnapshot, GeneratedPacketBatch, GeneratedPacketIo, IfId,
-    Interface, Ipv4Address, MacAddress, Neighbor, NoTrace, PacketIo, PublicationQuiescence, Route,
+    forward_batch, BackendStats, DropReason, ForwardingSnapshot, GeneratedPacketBatch,
+    GeneratedPacketIo, IfId, Interface, Ipv4Address, MacAddress, Neighbor, NoTrace, PacketBatch,
+    PacketIo, PublicationQuiescence, Route,
 };
 
 use ruster_io_xdp_native::{
     abi::{XDP_COPY, XDP_USE_NEED_WAKEUP},
     AttachFailure, AttachStage, DatapathError, DrainOutcome, GeneratedAllocError,
     GeneratedRejectReason, KickOutcome, NativeRingError, NativeSession, NeedWakeup, NegotiatedMode,
-    RingConfig, RingsError, RxFillConfig, RxFillEngine, SessionConfig, SessionFailure,
+    RingConfig, RingsError, RxFillConfig, RxFillEngine, RxWait, SessionConfig, SessionFailure,
     SessionStage, UmemConfig, UmemDomainId, ValidatedBindFlags, XdpAttachMode, XdpIoError,
     XdpPacketIo, XdpPort, XdpPortConfig, XDP_PACKET_HEADROOM,
 };
@@ -1091,6 +1092,8 @@ fn priv_xdp_adapter_forwards_between_two_veth_ports_through_core_and_drains() {
         let snapshot =
             ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &[]).expect("snapshot");
 
+        idle_wait_blocks_and_wakes_on_a_frame(&mut io, &peer_a, &forward_frame(mac_a));
+
         let mut receiver = Command::new("python3")
             .args(["-I", "-c", RAW_RECEIVE, &peer_b, &hex(FORWARD_MARKER), "8"])
             .stdout(Stdio::piped())
@@ -1266,6 +1269,95 @@ fn priv_xdp_adapter_forwards_between_two_veth_ports_through_core_and_drains() {
          copied into port B's generated pool, transmitted on veth B with the rewritten MACs and \
          TTL, received by B's peer, a 60-frame burst completed without more traffic, a link \
          flap on B recovered to a ready quiescence, and both ports drained verified"
+    );
+}
+
+/// Sends one raw frame (argv[2], hex) on `argv[1]` after `argv[3]` seconds.
+const DELAYED_RAW_SEND: &str = r"
+import socket, sys, time
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+s.bind((sys.argv[1], 0))
+time.sleep(float(sys.argv[3]))
+s.send(bytes.fromhex(sys.argv[2]))
+";
+
+/// Receives and recycles every RX frame; whether one contained `marker`.
+fn recycle_rx(io: &mut XdpPacketIo<'_>, marker: &[u8]) -> bool {
+    let mut seen = false;
+    loop {
+        let mut batch = io.receive(64).expect("receive");
+        let mut any = false;
+        while let Some(mut packet) = batch.next_packet() {
+            any = true;
+            seen |= packet
+                .bytes_mut()
+                .windows(marker.len())
+                .any(|window| window == marker);
+            packet.recycle(DropReason::UnsupportedEtherType);
+        }
+        assert_eq!(batch.finish().error, None);
+        if !any {
+            return seen;
+        }
+    }
+}
+
+/// H9: the adapter's idle wait blocks in `poll` over both live sockets
+/// until its timeout, and a frame arriving on one port while it blocks
+/// ends the wait long before the timeout.
+fn idle_wait_blocks_and_wakes_on_a_frame(io: &mut XdpPacketIo<'_>, peer_a: &str, frame: &[u8]) {
+    assert!(io.can_wait(), "every port is a live socket");
+    recycle_rx(io, FORWARD_MARKER);
+    // The peers' own IPv6 traffic may end a wait early; a quiet one times
+    // out after at least its timeout.
+    let mut quiet = None;
+    for _ in 0..50 {
+        let started = Instant::now();
+        match io.wait_rx(30).expect("poll") {
+            RxWait::TimedOut => {
+                quiet = Some(started.elapsed());
+                break;
+            }
+            RxWait::Ready => {
+                recycle_rx(io, FORWARD_MARKER);
+            }
+            RxWait::Interrupted => {}
+        }
+    }
+    let quiet = quiet.expect("no idle wait timed out in 50 tries");
+    assert!(
+        quiet >= Duration::from_millis(29) && quiet < Duration::from_secs(1),
+        "a 30 ms wait took {quiet:?}"
+    );
+    let mut sender = Command::new("python3")
+        .args(["-I", "-c", DELAYED_RAW_SEND, peer_a, &hex(frame), "0.3"])
+        .spawn()
+        .expect("spawn the delayed peer A sender");
+    let started = Instant::now();
+    let woke = loop {
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "the frame never ended a wait"
+        );
+        match io.wait_rx(10_000).expect("poll") {
+            RxWait::TimedOut => panic!("a 10 s wait timed out with a frame on the way"),
+            RxWait::Ready => {
+                let woke = started.elapsed();
+                if recycle_rx(io, FORWARD_MARKER) {
+                    break woke;
+                }
+            }
+            RxWait::Interrupted => {}
+        }
+    };
+    assert!(sender.wait().expect("sender exit").success());
+    assert!(
+        woke >= Duration::from_millis(250),
+        "woke after {woke:?}, before the frame was sent"
+    );
+    eprintln!(
+        "priv_xdp_idle_wait: a 30 ms idle poll timed out after {quiet:?}; a frame sent 0.3 s into \
+         a 10 s poll ended it after {woke:?}"
     );
 }
 

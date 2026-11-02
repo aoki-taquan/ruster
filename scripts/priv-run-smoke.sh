@@ -182,6 +182,16 @@
 #             overflows within 0.3 s at that rate). Link rounds keep coming
 #             (watch.link_rounds, no stale round); SIGTERM exits 0 with no
 #             abandoned worker and nothing attached
+#   idle      (H9) an idle router blocks in poll() on its port sockets: over
+#             3 s without traffic the router thread (the main thread) wakes
+#             at most 400 times per second (voluntary context switches;
+#             about 100 at the default --idle-wait-ms 10, about 1000 before
+#             H9 with its 1 ms sleeps) and ticks at most 400 times per
+#             second (tick.ticks), most waits time out (idle.timed_out) and
+#             none fails (idle.errors=0); then 5 single pings to the router,
+#             each after 2 s of idle, are answered with a median round trip
+#             of at most 1 ms (the pre-H9 worst-case wait alone) and none
+#             above 10 ms, each waking the wait (idle.woken grows); exit 0
 #   stuck     stdout on a FIFO that is held open but never read: the stats
 #             blocks fill it (checked: queued bytes at capacity and not
 #             moving), yet SIGTERM still drains, detaches, and the process
@@ -856,6 +866,89 @@ phase_workers() {
     echo "priv_run_workers: threads ruster-watch and ruster-reload present and dropped (threads=5); a $big_bytes-byte reload prepared for $prepared_ms ms off the router thread while $got of $sent pings (500 pps) were answered, longest round trip $max_ms ms; three SIGHUPs coalesced into two refused reloads; $rounds link rounds, none stale; exit 0, detached verified"
 }
 
+# Prints "<voluntary context switches> <utime+stime clock ticks>" of the
+# router thread (the main thread: task id = pid) of the running ruster.
+router_thread_usage() {
+    st=$(sudo -n cat "/proc/$ruster_pid/task/$ruster_pid/status") ||
+        fail "idle: cannot read the router thread status"
+    switches=$(status_row "$st" voluntary_ctxt_switches)
+    # Fields 14 and 15 of stat (after the parenthesized comm, which has no
+    # space here: the router thread is named ruster).
+    ticks=$(sudo -n cat "/proc/$ruster_pid/task/$ruster_pid/stat" | sed 's/^.*) //' |
+        awk '{ print $12 + $13 }')
+    echo "$switches $ticks"
+}
+
+phase_idle() {
+    start_ruster idle "$work/router.toml"
+    wait_ready idle || fail "idle: ruster exited during startup"
+    [ "$(sudo -n cat "/proc/$ruster_pid/task/$ruster_pid/comm")" = ruster ] ||
+        fail "idle: the main thread is not the router thread"
+    in_ns "$host_a" ping -n -q -c 3 -i 0.2 -W 2 192.168.1.1 >"$work/idle-warm.txt" 2>&1 ||
+        fail "idle: the router does not answer ping: $(cat "$work/idle-warm.txt")"
+    # Settle, then 3 s without traffic between two stats blocks.
+    sleep 1.5
+    latest_block idle
+    cp "$work/idle.block" "$work/idle-a.block"
+    set -- $(router_thread_usage)
+    switches_a=$1
+    cpu_a=$2
+    started=$(date +%s%N)
+    sleep 3
+    set -- $(router_thread_usage)
+    switches_b=$1
+    cpu_b=$2
+    elapsed_ms=$((($(date +%s%N) - started) / 1000000))
+    sleep 1.2
+    latest_block idle
+    cp "$work/idle.block" "$work/idle-b.block"
+    uptime_a=$(sed -n 's/^ruster-run-stats kind=periodic uptime-ms=//p' "$work/idle-a.block")
+    uptime_b=$(sed -n 's/^ruster-run-stats kind=periodic uptime-ms=//p' "$work/idle-b.block")
+    [ -n "$uptime_a" ] && [ -n "$uptime_b" ] && [ "$uptime_b" -gt "$uptime_a" ] ||
+        fail "idle: no two periodic blocks ($uptime_a, $uptime_b)"
+    span=$((uptime_b - uptime_a))
+    ticks=$(($(stat_in "$work/idle-b.block" tick.ticks) - $(stat_in "$work/idle-a.block" tick.ticks)))
+    waits=$(($(stat_in "$work/idle-b.block" idle.waits) - $(stat_in "$work/idle-a.block" idle.waits)))
+    timed_out=$(($(stat_in "$work/idle-b.block" idle.timed_out) - $(stat_in "$work/idle-a.block" idle.timed_out)))
+    tick_rate=$((ticks * 1000 / span))
+    wake_rate=$(((switches_b - switches_a) * 1000 / elapsed_ms))
+    hz=$(getconf CLK_TCK)
+    cpu_pct_x10=$(((cpu_b - cpu_a) * 1000 * 10 / hz / elapsed_ms))
+    [ "$wake_rate" -le 400 ] ||
+        fail "idle: the router thread woke $wake_rate times per second while idle"
+    [ "$tick_rate" -le 400 ] || fail "idle: $tick_rate ticks per second while idle"
+    [ "$waits" -ge $((span / 20)) ] || fail "idle: only $waits idle waits in $span ms"
+    [ "$timed_out" -ge $((waits / 2)) ] || fail "idle: only $timed_out of $waits waits timed out"
+    block_has "$work/idle-b.block" idle.max_wait_ms=10 idle.errors=0
+    # First packet after idle: single pings, each after 2 s without
+    # traffic, answered at once.
+    woken_before=$(stat_in "$work/idle-b.block" idle.woken)
+    rtts=
+    for n in 1 2 3 4 5; do
+        sleep 2
+        in_ns "$host_a" ping -n -c 1 -W 2 192.168.1.1 >"$work/idle-ping-$n.txt" 2>&1 ||
+            fail "idle: ping $n unanswered: $(cat "$work/idle-ping-$n.txt")"
+        rtt=$(sed -n 's/.* time=\([0-9.]*\) ms.*/\1/p' "$work/idle-ping-$n.txt")
+        [ -n "$rtt" ] || fail "idle: ping $n: $(cat "$work/idle-ping-$n.txt")"
+        rtts="$rtts $rtt"
+    done
+    sorted=$(printf '%s\n' $rtts | sort -n)
+    median=$(printf '%s\n' "$sorted" | sed -n 3p)
+    max=$(printf '%s\n' "$sorted" | tail -n 1)
+    awk -v m="$median" -v x="$max" 'BEGIN { exit !(m <= 1.0 && x < 10.0) }' ||
+        fail "idle: round trips after 2 s idle:$rtts ms (median $median, max $max)"
+    sleep 1.2
+    latest_block idle
+    woken_after=$(stat_in "$work/idle.block" idle.woken)
+    [ "$woken_after" -ge $((woken_before + 5)) ] ||
+        fail "idle: idle.woken $woken_before -> $woken_after over 5 pings"
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "idle: exit status $status after SIGTERM"
+    assert_detached "the idle phase"
+    echo "priv_run_idle: idle for ${elapsed_ms} ms the router thread woke $wake_rate times/s (cpu $((cpu_pct_x10 / 10)).$((cpu_pct_x10 % 10))%), ticked $tick_rate times/s, $waits waits ($timed_out timed out) in $span ms; single pings after 2 s idle round trip$rtts ms (median $median); each woke the wait; exit 0, detached verified"
+}
+
 # Host A's view of router-generated ICMPv4 (argv: mode target ttl marker
 # deadline-seconds). Repeats the probe (an Echo Request on a raw socket, or
 # a UDP datagram to port 9 with the given TTL) every 0.3 s and reads every
@@ -1092,6 +1185,7 @@ cat "$work/forward.err"
 echo "priv_run_shutdown: SIGTERM exit 0, XDP detached, final counters (rx.received=$received) verified"
 
 phase_workers
+phase_idle
 
 # limits (H3): every table at its production limit runs; one slot above a
 # quote table is refused by validate and run, not by the sim limits.
