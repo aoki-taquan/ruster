@@ -1310,7 +1310,10 @@ packet path（`forwarding/nat44_icmp_query.rs`）:
   Identifierの差分だけ、IPv4 header checksumはTTLとaddressの差分をRFC 1624で更新。
 - firewall付きの構成では`FirewallProtocol::Icmp`として評価する。queryにportは無いので
   forwardingが擬似port tuple（Request: `(id, type)`、Reply: `(request type, id)`）を作り、Reply
-  がRequestのexactな逆tupleになるようにする。ruleは`protocol = "icmp"`（port rangeは全域）。
+  がRequestのexactな逆tupleになるようにする。Identifier 8/13ではtupleが別queryのものと数値で
+  一致し得るので、方向はpacketのreply flagで別に運ぶ: Requestだけがflowを作り、Requestはorigin
+  としてだけ、Replyは逆tupleとしてだけ一致する（RELATED lookupも同じ）。flowの無いReplyは
+  `FIREWALL_ICMP_REPLY_WITHOUT_REQUEST`。ruleは`protocol = "icmp"`（port rangeは全域）。
   outboundはpre-SNAT、inboundはpost-DNATのtupleで評価（UDP/TCPと同じ）。ICMP flowのidle TTLは
   `udp-idle-ttl-ms`。
 - ICMP error（`parse_nat44_icmpv4_error`）は引用protocol 1も受け付け、Identifierを

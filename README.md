@@ -406,7 +406,7 @@ mappings-per-host = 1024   # 省略時0（無制限）。u16
 mappings-per-host = 1024
 ```
 
-ICMP query NAT（N5、NAT44-100〜117。RFC 5508 §3）: `[nat44.icmp]`があるとき、insideからの
+ICMP query NAT（N5、NAT44-100〜118。RFC 5508 §3）: `[nat44.icmp]`があるとき、insideからの
 Echo Request（`ping`）とTimestamp Requestをpublic addressとpublic identifierへ変換し、その
 Reply（type 0/14）をinsideへ戻します（REQ-1、REQ-10 a.3/b）。mappingはinternal address・
 Identifierごとのendpoint-independent mapping（REQ-1 a）で、UDP NAT44と同じcaller-backedな
@@ -421,10 +421,17 @@ checkも共有します。public address宛てのEcho Requestはinsideからで�
 RFC 7857 §12）。Information/Address Mask（RFC 6918でdeprecated）とinsideからのReplyは
 変換せず`NAT44_ICMP_TYPE_UNSUPPORTED`です。UDP/TCP（DF=1だけ）と違い、fragmentでない
 queryはDF=0でも変換します（LinuxのEcho ReplyとWindowsのpingはDF=0。NAT44-116）。sectionが無ければ従来どおりinside→
-outsideのICMP queryは`NAT44_UDP_UNSUPPORTED_TRANSPORT`でdrop（local policyとしての無効化）
+outsideのICMP queryは`NAT44_UDP_UNSUPPORTED_TRANSPORT`（UDPが無くTCPだけなら`NAT44_TCP_UNSUPPORTED_TRANSPORT`）でdrop（local policyとしての無効化）
 で、sectionの追加・削除はstorage shapeの変更（restart-required）です。firewallは
 `protocol = "icmp"`のrule（portは書けず全Identifierに一致）でqueryをstatefulに許可し、Reply
-はRequestが作ったflowの逆tupleとしてだけ通ります（ICMP flowのTTLは`udp-idle-ttl-ms`）。
+はRequestが作ったflowの逆tupleとしてだけ通ります。方向（Request/Reply）はtupleと別に運ぶので、
+Identifier 8や13でも逆向きのRequestがReplyとして通ることはなく、flowの無いReplyは
+`FIREWALL_ICMP_REPLY_WITHOUT_REQUEST`です。ICMP flowのTTLは`udp-idle-ttl-ms`（120秒以上）でNATの
+`idle-ttl-ms`とは独立です。firewall付きの構成ではNATを通らないroutedなEcho/Timestampもruleで
+評価されます（以前は`FIREWALL_UNSUPPORTED_PROTOCOL`、今はICMP ruleが無ければ
+`FIREWALL_DEFAULT_DENIED`。default denyは同じでdrop reasonだけが変わる）。`[nat44.icmp]`があると
+public address宛てのEcho ReplyはNATのpathへ入るので、router自身がpublic addressからpingしても
+Replyは`NAT44_ICMP_MAPPING_MISS`で落ちます（routerはpingを送らないので通常は無関係）。
 
 ```toml
 [nat44.icmp]                       # 省略時: ICMP query NATなし
@@ -451,6 +458,10 @@ destination = "0.0.0.0/0"
 protocol = "icmp"                  # source-ports/destination-portsは書かない
 action = "allow-stateful"
 ```
+
+`icmp` ruleは「Replyだけ」や「Echoだけ」を表せません。outsideからinsideへのallow-stateful ruleを
+書くと、その範囲の全てのEcho/Timestamp Requestが通ります（insideからのpingのReplyにはrule不要で、
+flowが通します）。
 
 NAT44 inbound filteringは`[nat44.udp]`と`[nat44.tcp]`の`filtering`で個別に選びます。
 RFC 4787 REQ-8とRFC 5382 REQ-3は、transparency重視ならEndpoint-Independent、より厳しい

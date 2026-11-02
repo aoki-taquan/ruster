@@ -1560,10 +1560,11 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   budget. If inside hosts do not need PMTUD or
   traceroute through the NAT, `icmpv4-errors = "external-only"` or
   `"disabled"` (per protocol) remain the stricter options.
-- ICMP query NAT (`[nat44.icmp]`, N5, NAT44-100..117). Without the
+- ICMP query NAT (`[nat44.icmp]`, N5, NAT44-100..118). Without the
   section, `ping` from the LAN to the Internet does not work through the
   router: ICMP queries crossing the NAT are dropped as
-  `NAT44_UDP_UNSUPPORTED_TRANSPORT`. Add the section (and, with the
+  `NAT44_UDP_UNSUPPORTED_TRANSPORT` (`NAT44_TCP_UNSUPPORTED_TRANSPORT` when
+  only TCP NAT is configured). Add the section (and, with the
   firewall, an `icmp` rule such as `ingress = "lan"`, `egress = "wan"`,
   `protocol = "icmp"`, `action = "allow-stateful"`, without port ranges)
   to translate Echo and Timestamp requests from inside hosts and their
@@ -1590,7 +1591,27 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   - Errors quoting a query (for example Time Exceeded for `traceroute -I`)
     are translated under `[nat44.icmp] icmpv4-errors` and share the
     translated-error limit of NAT44-065.
-  - The firewall's ICMP flows use `udp-idle-ttl-ms`.
+  - The firewall's ICMP flows use `udp-idle-ttl-ms` (at least 120 s,
+    default 300 s), independent of the NAT's `idle-ttl-ms`; replies stop
+    when the shorter of the two runs out.
+  - With the firewall, an `icmp` rule cannot say "replies only" or "Echo
+    only": an outside-to-inside allow rule admits every Echo and Timestamp
+    request it covers. Replies to inside pings need no such rule. A reply
+    never opens a flow (`FIREWALL_ICMP_REPLY_WITHOUT_REQUEST`).
+  - Also with the firewall, routed Echo/Timestamp packets that do not cross
+    the NAT (for example between two inside interfaces) are now evaluated
+    against the rules; without an `icmp` rule they drop as
+    `FIREWALL_DEFAULT_DENIED` instead of `FIREWALL_UNSUPPORTED_PROTOCOL`
+    (still default deny, only the reason changed).
+  - With `[nat44.icmp]`, Echo Replies to the public address take the NAT
+    path, so a ping sent by the router itself from its public address would
+    lose its replies (`NAT44_ICMP_MAPPING_MISS`); ruster never sends one.
+  - Multi-host LANs: like UDP, one inside host can fill the query mapping
+    and peer tables (one mapping per identifier, one peer per pinged
+    address; a ping sweep makes many peers). Set a nonzero
+    `mappings-per-host` (for example `capacity.mappings / expected hosts`)
+    and size `peers` for sweeps; peers per host are not limited (as for
+    UDP, NAT44-096).
   - Counters: `nat44_icmp.*` (for example `outbound_translated`,
     `inbound_translated`, `mapping_misses`, `filter_denied`,
     `identifier_exhausted`, `host_quota_exceeded`) and
