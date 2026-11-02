@@ -771,9 +771,10 @@ phase_workers() {
     summary=$(cat "$work/workers-ping.txt")
     sent=$(printf '%s\n' "$summary" | sed -n 's/^\([0-9]*\) packets transmitted, \([0-9]*\) received.*/\1/p')
     got=$(printf '%s\n' "$summary" | sed -n 's/^\([0-9]*\) packets transmitted, \([0-9]*\) received.*/\2/p')
-    max_us=$(printf '%s\n' "$summary" | sed -n 's|^rtt min/avg/max/mdev = [0-9.]*/[0-9.]*/\([0-9]*\)\.\([0-9]*\)/.*|\1\2|p')
-    [ -n "$sent" ] && [ -n "$got" ] && [ -n "$max_us" ] || fail "workers: ping summary: $summary"
-    max_ms=$((max_us / 1000))
+    # Whole milliseconds of the longest round trip (the integer part, so no
+    # leading-zero arithmetic such as 0907).
+    max_ms=$(printf '%s\n' "$summary" | sed -n 's|^rtt min/avg/max/mdev = [0-9.]*/[0-9.]*/\([0-9]*\)\.[0-9]*/.*|\1|p')
+    [ -n "$sent" ] && [ -n "$got" ] && [ -n "$max_ms" ] || fail "workers: ping summary: $summary"
     [ "$prepared_ms" -ge 200 ] ||
         fail "workers: the reload was prepared in $prepared_ms ms; too fast to show a stall"
     [ "$got" -eq "$sent" ] || fail "workers: $got of $sent echoes answered during the reloads"
