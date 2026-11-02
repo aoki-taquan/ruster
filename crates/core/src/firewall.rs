@@ -124,15 +124,37 @@ impl FirewallPortRange {
 /// `source_port = id, destination_port = t`; its reply (type 0 or 14) is
 /// `source_port = t, destination_port = id`. A stateful flow created by a
 /// request therefore admits only the matching reply, never a request in the
-/// reverse direction. ICMP rules match any identifier (their port ranges
-/// are the full range), and ICMP flows use the UDP idle TTL. ICMP errors are
-/// never evaluated as ICMP flows: they are admitted only as RELATED to a
-/// live flow.
+/// reverse direction. Identifiers 8 and 13 make a request tuple and a reply
+/// tuple equal as numbers, so the direction is carried separately: a reply
+/// packet carries a reply flag. A flow is created only
+/// by a request; a request matches only its flow's origin tuple, and a
+/// reply only the exact reverse tuple. ICMP rules match any identifier
+/// (their port ranges are the full range), and ICMP flows use the UDP idle
+/// TTL. ICMP errors are never evaluated as ICMP flows: they are admitted
+/// only as RELATED to a live flow.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FirewallProtocol {
     Tcp,
     Udp,
     Icmp,
+}
+
+/// Flag of an ICMP query reply in a firewall packet's flags (N5). It is
+/// never a TCP flag value the firewall reads for ICMP.
+pub(crate) const FIREWALL_ICMP_REPLY: u8 = 0x01;
+
+/// Whether a live flow matches `packet` directly (`reverse == false`) or as
+/// its reply, given the ICMP query direction: a request never matches as a
+/// reply and a reply never as an origin.
+const fn icmp_direction_allows(
+    packet_flags: u8,
+    protocol: FirewallProtocol,
+    reverse: bool,
+) -> bool {
+    match protocol {
+        FirewallProtocol::Icmp => (packet_flags & FIREWALL_ICMP_REPLY != 0) == reverse,
+        FirewallProtocol::Tcp | FirewallProtocol::Udp => true,
+    }
 }
 
 impl FirewallProtocol {
@@ -860,6 +882,9 @@ pub enum FirewallPolicySource {
 pub enum FirewallFailure {
     InvalidInitialTcp,
     StateTableFull,
+    /// An ICMP query reply matched an allow-stateful rule but no flow: only
+    /// a request opens an ICMP flow (N5).
+    InvalidInitialIcmp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -962,6 +987,9 @@ pub enum FirewallPlanError {
     InvalidInitialTcp(FirewallRuleId),
     StateFull(FirewallRuleId),
     ClockRegression,
+    /// An ICMP query reply without a flow matched an allow-stateful rule
+    /// (N5): only a request opens a flow.
+    InvalidInitialIcmp(FirewallRuleId),
 }
 
 /// Canonical forward/origin tuple quoted by an ICMPv4 error.
@@ -977,9 +1005,18 @@ pub struct FirewallRelatedIcmpv4Flow {
     protocol: FirewallProtocol,
     source_port: u16,
     destination_port: u16,
+    icmp_reply: bool,
 }
 
 impl FirewallRelatedIcmpv4Flow {
+    /// Marks a quoted ICMP query as a reply (N5), so it can only be RELATED
+    /// as the reverse of a live flow, never as its origin.
+    #[must_use]
+    pub const fn with_icmp_query_reply(mut self) -> Self {
+        self.icmp_reply = true;
+        self
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub const fn new(
         ingress: IfId,
@@ -998,6 +1035,7 @@ impl FirewallRelatedIcmpv4Flow {
             protocol,
             source_port,
             destination_port,
+            icmp_reply: false,
         }
     }
 
@@ -1010,7 +1048,11 @@ impl FirewallRelatedIcmpv4Flow {
             protocol: self.protocol,
             source_port: self.source_port,
             destination_port: self.destination_port,
-            tcp_flags: 0,
+            tcp_flags: if self.icmp_reply {
+                FIREWALL_ICMP_REPLY
+            } else {
+                0
+            },
         }
     }
 }
@@ -1490,7 +1532,7 @@ impl<'state> FirewallRuntime<'state> {
             FirewallPlanError::DefaultDenied => {
                 self.counters.denied_default = self.counters.denied_default.saturating_add(1);
             }
-            FirewallPlanError::InvalidInitialTcp(_) => {
+            FirewallPlanError::InvalidInitialTcp(_) | FirewallPlanError::InvalidInitialIcmp(_) => {
                 self.counters.invalid_packets = self.counters.invalid_packets.saturating_add(1);
             }
             FirewallPlanError::StateFull(_) => {
@@ -1568,6 +1610,10 @@ impl<'state> FirewallRuntime<'state> {
         let rule_id = matched.expect("allow branch requires a matching rule").id;
         if packet.protocol == FirewallProtocol::Tcp && packet.tcp_flags & 0x17 != 0x02 {
             return Err(FirewallPlanError::InvalidInitialTcp(rule_id));
+        }
+        if packet.protocol == FirewallProtocol::Icmp && packet.tcp_flags & FIREWALL_ICMP_REPLY != 0
+        {
+            return Err(FirewallPlanError::InvalidInitialIcmp(rule_id));
         }
         if !self.has_room(probe.reusable) && self.reclaim_one_expired(now_ms) {
             // The sweep deleted and shifted, so the original placement may
@@ -1660,8 +1706,11 @@ impl<'state> FirewallRuntime<'state> {
             match (rule.egress, rule.action) {
                 (FirewallInterface::Interface(_), FirewallAction::AllowStateful) => {}
                 (FirewallInterface::Any, FirewallAction::AllowStateful) => {
-                    let valid_initial =
-                        packet.protocol != FirewallProtocol::Tcp || packet.tcp_flags & 0x17 == 0x02;
+                    let valid_initial = match packet.protocol {
+                        FirewallProtocol::Tcp => packet.tcp_flags & 0x17 == 0x02,
+                        FirewallProtocol::Icmp => packet.tcp_flags & FIREWALL_ICMP_REPLY == 0,
+                        FirewallProtocol::Udp => true,
+                    };
                     return valid_initial.then_some(rule.id);
                 }
                 (_, FirewallAction::Deny) => return None,
@@ -1805,6 +1854,8 @@ impl<'state> FirewallRuntime<'state> {
                 && slot.responder_address == packet.source
                 && slot.initiator_port == packet.destination_port
                 && slot.responder_port == packet.source_port;
+            let direct = direct && icmp_direction_allows(packet.tcp_flags, packet.protocol, false);
+            let reply = reply && icmp_direction_allows(packet.tcp_flags, packet.protocol, true);
             if direct || reply {
                 return Ok(slot.origin_rule_id);
             }
@@ -1900,6 +1951,12 @@ impl<'state> FirewallRuntime<'state> {
                     && slot.responder_address == packet.source
                     && slot.initiator_port == packet.destination_port
                     && slot.responder_port == packet.source_port;
+                // ICMP queries (N5): a request matches only as the origin,
+                // a reply only as the reverse.
+                let direct =
+                    direct && icmp_direction_allows(packet.tcp_flags, packet.protocol, false);
+                let reverse =
+                    reverse && icmp_direction_allows(packet.tcp_flags, packet.protocol, true);
                 if direct || reverse {
                     return FirewallProbe {
                         live: Some((index, reverse)),
@@ -2891,6 +2948,134 @@ mod tests {
                     "{ingress:?} -> {egress:?}"
                 );
             }
+        });
+    }
+
+    /// N5 review M1: ICMP query flows carry their direction. With
+    /// identifier 8 an Echo Request's pseudo-ports `(8, 8)` equal the reverse
+    /// of the remote's Echo Request `(8, 8)`; only the reply flag tells them
+    /// apart, for flow matching and for RELATED lookups alike.
+    #[test]
+    fn icmp_query_flows_match_requests_only_as_origin_and_replies_only_as_reverse() {
+        with_snapshot(|snapshot| {
+            let icmp_rule = FirewallRule::new(
+                FirewallRuleId(9),
+                FirewallInterface::Any,
+                FirewallInterface::Any,
+                any(),
+                any(),
+                FirewallProtocol::Icmp,
+                FirewallPortRange::new(0, u16::MAX).unwrap(),
+                FirewallPortRange::new(0, u16::MAX).unwrap(),
+                FirewallAction::AllowStateful,
+            );
+            let rules = [icmp_rule];
+            let config =
+                FirewallConfig::new(snapshot, &rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 4];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let request = FirewallPacket {
+                source_port: 8,
+                destination_port: 8,
+                ..packet(FirewallProtocol::Icmp, 0)
+            };
+            let reversed = |flags| FirewallPacket {
+                ingress: request.egress,
+                egress: request.ingress,
+                source: request.destination,
+                destination: request.source,
+                tcp_flags: flags,
+                ..request
+            };
+            // A reply cannot open a flow, even under an allow rule.
+            assert_eq!(
+                runtime
+                    .plan_packet(&config, reversed(FIREWALL_ICMP_REPLY), 10)
+                    .err(),
+                Some(FirewallPlanError::InvalidInitialIcmp(FirewallRuleId(9)))
+            );
+            let plan = runtime.plan_packet(&config, request, 10).unwrap();
+            runtime.commit(plan).unwrap();
+            // The real reply is established.
+            let reply = runtime
+                .plan_packet(&config, reversed(FIREWALL_ICMP_REPLY), 11)
+                .unwrap();
+            assert_eq!(
+                reply.disposition().class,
+                FirewallConnectionClass::Established
+            );
+            // The remote's colliding request is a new flow, not the reply.
+            let collision = runtime.plan_packet(&config, reversed(0), 11).unwrap();
+            assert_eq!(collision.disposition().class, FirewallConnectionClass::New);
+            // A repeated request is established as the origin; the same
+            // tuple flagged as a reply in the origin direction is not.
+            let repeat = runtime.plan_packet(&config, request, 11).unwrap();
+            assert_eq!(
+                repeat.disposition().class,
+                FirewallConnectionClass::Established
+            );
+            let forged = FirewallPacket {
+                tcp_flags: FIREWALL_ICMP_REPLY,
+                ..request
+            };
+            assert_eq!(
+                runtime.plan_packet(&config, forged, 11).err(),
+                Some(FirewallPlanError::InvalidInitialIcmp(FirewallRuleId(9)))
+            );
+            // RELATED: the reverse tuple is RELATED only as a reply.
+            let related = |flags: u8| {
+                let flow = FirewallRelatedIcmpv4Flow::new(
+                    request.egress,
+                    request.ingress,
+                    request.destination,
+                    request.source,
+                    FirewallProtocol::Icmp,
+                    8,
+                    8,
+                );
+                if flags == 0 {
+                    flow
+                } else {
+                    flow.with_icmp_query_reply()
+                }
+            };
+            assert_eq!(
+                runtime.inspect_related_icmpv4_either_direction(related(FIREWALL_ICMP_REPLY), 11),
+                Ok(FirewallRuleId(9))
+            );
+            assert_eq!(
+                runtime.inspect_related_icmpv4_either_direction(related(0), 11),
+                Err(FirewallRelatedIcmpv4Error::StateMiss)
+            );
+            // The origin tuple is RELATED only as a request.
+            let origin = FirewallRelatedIcmpv4Flow::new(
+                request.ingress,
+                request.egress,
+                request.source,
+                request.destination,
+                FirewallProtocol::Icmp,
+                8,
+                8,
+            );
+            assert_eq!(
+                runtime.inspect_related_icmpv4(origin, 11),
+                Ok(FirewallRuleId(9))
+            );
+            assert_eq!(
+                runtime.inspect_related_icmpv4(origin.with_icmp_query_reply(), 11),
+                Err(FirewallRelatedIcmpv4Error::StateMiss)
+            );
+            // A route miss is answered only for a packet that could open a
+            // flow: a request, never a reply.
+            assert_eq!(
+                runtime.permits_route_miss(&config, request.without_egress()),
+                Some(FirewallRuleId(9))
+            );
+            assert_eq!(
+                runtime.permits_route_miss(&config, forged.without_egress()),
+                None
+            );
         });
     }
 

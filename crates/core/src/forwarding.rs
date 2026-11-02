@@ -275,6 +275,9 @@ pub enum DropReason {
     /// An ICMP Echo or Timestamp message evaluated by the firewall is truncated, has a nonzero
     /// code, or fails the ICMP checksum.
     FirewallIcmpQueryInvalid = 177,
+    /// An ICMP Echo/Timestamp reply without a firewall flow matched an
+    /// allow-stateful rule: only a request opens an ICMP flow (N5).
+    FirewallIcmpReplyWithoutRequest = 178,
 }
 
 use DropReason::*;
@@ -282,7 +285,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 177] = [
+    pub const ALL: [Self; 178] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -460,6 +463,7 @@ impl DropReason {
         Nat44IcmpWrongIngress,
         Nat44IcmpWrongEgress,
         FirewallIcmpQueryInvalid,
+        FirewallIcmpReplyWithoutRequest,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -654,6 +658,7 @@ impl DropReason {
             Nat44IcmpWrongIngress => "NAT44_ICMP_WRONG_INGRESS",
             Nat44IcmpWrongEgress => "NAT44_ICMP_WRONG_EGRESS",
             FirewallIcmpQueryInvalid => "FIREWALL_ICMP_QUERY_INVALID",
+            FirewallIcmpReplyWithoutRequest => "FIREWALL_ICMP_REPLY_WITHOUT_REQUEST",
         }
     }
 }
@@ -3009,6 +3014,7 @@ fn decide_ipv4<T: TraceSink>(
                     FirewallPlanError::RuleDenied(_)
                     | FirewallPlanError::DefaultDenied
                     | FirewallPlanError::InvalidInitialTcp(_)
+                    | FirewallPlanError::InvalidInitialIcmp(_)
                     | FirewallPlanError::StateFull(_) => {
                         unreachable!("clock observation only reports regression")
                     }
@@ -3694,6 +3700,14 @@ fn inspect_nat44_icmpv4_related<T: TraceSink>(
         packet.source_port,
         packet.destination_port,
     );
+    // A quoted ICMP query reply is RELATED only as the reverse of a flow.
+    let flow = if packet.protocol == FirewallProtocol::Icmp
+        && packet.tcp_flags & crate::firewall::FIREWALL_ICMP_REPLY != 0
+    {
+        flow.with_icmp_query_reply()
+    } else {
+        flow
+    };
     let result = if either_direction {
         runtime.inspect_related_icmpv4_either_direction(flow, now.0)
     } else {
@@ -4521,6 +4535,13 @@ fn plan_firewall(
                     matched_action: Some(FirewallAction::AllowStateful),
                     failure: Some(FirewallFailure::InvalidInitialTcp),
                 },
+                FirewallPlanError::InvalidInitialIcmp(rule_id) => FirewallDisposition {
+                    verdict: FirewallVerdict::Drop,
+                    class: FirewallConnectionClass::New,
+                    source: FirewallPolicySource::Rule(rule_id),
+                    matched_action: Some(FirewallAction::AllowStateful),
+                    failure: Some(FirewallFailure::InvalidInitialIcmp),
+                },
                 FirewallPlanError::StateFull(rule_id) => FirewallDisposition {
                     verdict: FirewallVerdict::Drop,
                     class: FirewallConnectionClass::New,
@@ -4534,6 +4555,7 @@ fn plan_firewall(
                         FirewallPlanError::RuleDenied(_)
                         | FirewallPlanError::DefaultDenied
                         | FirewallPlanError::InvalidInitialTcp(_)
+                        | FirewallPlanError::InvalidInitialIcmp(_)
                         | FirewallPlanError::StateFull(_) => {
                             unreachable!("policy errors were handled above")
                         }
@@ -4547,6 +4569,7 @@ fn plan_firewall(
                 FirewallPlanError::RuleDenied(_) => FirewallRuleDenied,
                 FirewallPlanError::DefaultDenied => FirewallDefaultDenied,
                 FirewallPlanError::InvalidInitialTcp(_) => FirewallTcpInvalidInitialFlags,
+                FirewallPlanError::InvalidInitialIcmp(_) => FirewallIcmpReplyWithoutRequest,
                 FirewallPlanError::StateFull(_) => FirewallStateTableFull,
                 FirewallPlanError::ClockRegression => FirewallClockRegression,
             })
@@ -4666,12 +4689,13 @@ fn validate_firewall_transport(
     let protocol = FirewallProtocol::from_ipv4(ipv4.protocol).ok_or(FirewallUnsupportedProtocol)?;
     let packet = match protocol {
         FirewallProtocol::Icmp => {
-            let (source_port, destination_port) = validate_firewall_icmp_query(frame, ipv4)?;
+            let (source_port, destination_port, tcp_flags) =
+                validate_firewall_icmp_query(frame, ipv4)?;
             ValidatedFirewallTransport {
                 protocol,
                 source_port,
                 destination_port,
-                tcp_flags: 0,
+                tcp_flags,
             }
         }
         FirewallProtocol::Tcp => {
@@ -7607,6 +7631,7 @@ mod tests {
             (175, "NAT44_ICMP_WRONG_INGRESS"),
             (176, "NAT44_ICMP_WRONG_EGRESS"),
             (177, "FIREWALL_ICMP_QUERY_INVALID"),
+            (178, "FIREWALL_ICMP_REPLY_WITHOUT_REQUEST"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -7616,7 +7641,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(178), None);
+        assert_eq!(DropReason::from_code(179), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

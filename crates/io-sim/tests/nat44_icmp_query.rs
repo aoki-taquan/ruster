@@ -157,6 +157,15 @@ struct World {
 
 impl World {
     fn new(firewall: Firewall, policy: Nat44IcmpPolicy) -> Self {
+        Self::with_identifiers(firewall, policy, FIRST, LAST)
+    }
+
+    fn with_identifiers(
+        firewall: Firewall,
+        policy: Nat44IcmpPolicy,
+        first: u16,
+        last: u16,
+    ) -> Self {
         let snapshot = snapshot();
         let udp_config = Nat44UdpConfig::new(
             &snapshot,
@@ -179,7 +188,7 @@ impl World {
         )
         .unwrap();
         let icmp_config =
-            Nat44IcmpConfig::new(&snapshot, LAN, WAN, PUBLIC, FIRST, LAST, policy).unwrap();
+            Nat44IcmpConfig::new(&snapshot, LAN, WAN, PUBLIC, first, last, policy).unwrap();
         let indexes = leak(UdpTestIndexes::new(udp_config, 4, 8));
         let udp = indexes.runtime(
             udp_config,
@@ -664,13 +673,15 @@ fn malformed_and_untranslated_queries_are_refused_without_state() {
         assert_eq!(world.run(LAN, short_timestamp), Err(header));
         assert_eq!(world.run(LAN, information), Err(unsupported));
         assert_eq!(world.run(LAN, fragment), Err(fragmented));
-        // A reply from the inside answers nothing the NAT delivered; with
-        // the firewall it has no rule (the LAN->WAN ICMP rule matches it,
-        // so the NAT refuses it).
-        assert_eq!(
-            world.run(LAN, inside_reply),
-            Err(DropReason::Nat44IcmpTypeUnsupported)
-        );
+        // A reply from the inside answers nothing the NAT delivered. With
+        // the firewall, the LAN->WAN ICMP rule matches it but a reply never
+        // opens a flow; without it, the NAT refuses it.
+        let inside_reply_reason = if firewall == Firewall::None {
+            DropReason::Nat44IcmpTypeUnsupported
+        } else {
+            DropReason::FirewallIcmpReplyWithoutRequest
+        };
+        assert_eq!(world.run(LAN, inside_reply), Err(inside_reply_reason));
         assert_eq!(world.icmp_state(), (0, 0));
     }
 }
@@ -931,5 +942,204 @@ fn unfragmented_queries_with_df_clear_translate_both_ways() {
             .run(WAN, icmp_error(WAN, ROUTER, PUBLIC, 11, 0, &out))
             .unwrap();
         assert_eq!(egress, LAN);
+    }
+}
+
+/// Routed (non-NAT) ICMP queries through the firewall alone, LAN <-> WAN.
+struct Routed {
+    snapshot: ForwardingSnapshot<'static>,
+    config: FirewallConfig<'static>,
+    firewall: FirewallRuntime<'static>,
+    resolution: ResolutionRuntime<'static>,
+    io: SimIo,
+    now: u64,
+}
+
+impl Routed {
+    /// LAN -> WAN ICMP allow-stateful, plus WAN -> LAN when `inbound_rule`.
+    fn new(inbound_rule: bool) -> Self {
+        let snapshot = snapshot();
+        let mut rules = vec![rule(40, LAN, WAN, FirewallProtocol::Icmp)];
+        if inbound_rule {
+            rules.push(rule(41, WAN, LAN, FirewallProtocol::Icmp));
+        }
+        let config = FirewallConfig::new(
+            &snapshot,
+            Vec::leak(rules),
+            FirewallPolicy::default(),
+            1,
+            FirewallHashKey::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210).unwrap(),
+        )
+        .unwrap();
+        Self {
+            snapshot,
+            config,
+            firewall: FirewallRuntime::new(config, leak([FirewallStateSlot::default(); 16])),
+            resolution: ResolutionRuntime::new(
+                ResolutionPolicy::new(1_000, 2_000).unwrap(),
+                leak([ResolutionStateSlot::EMPTY; 2]),
+                leak([ResolutionActionSlot::EMPTY; 2]),
+            ),
+            io: SimIo::new(),
+            now: 1_000,
+        }
+    }
+
+    fn run(&mut self, ingress: IfId, frame: Vec<u8>) -> Result<IfId, DropReason> {
+        self.io.inject(ingress, frame);
+        self.now += 1;
+        self.io
+            .run_firewall_once(
+                1,
+                &self.snapshot,
+                &mut self.resolution,
+                &self.config,
+                Some(&mut self.firewall),
+                MonotonicMillis(self.now),
+                &mut VecTrace::default(),
+            )
+            .unwrap();
+        if let Some(tx) = self.io.pop_tx() {
+            return Ok(tx.egress);
+        }
+        match self.io.pop_recycled().expect("dropped").cause {
+            RecycleCause::Forwarding(reason) => Err(reason),
+            other => panic!("unexpected recycle {other:?}"),
+        }
+    }
+}
+
+/// Review M1: with identifiers 8 and 13 a request's pseudo-port tuple equals
+/// the reverse of another query's tuple as numbers. The direction flag keeps
+/// the three counterexamples out: a remote's request never matches an inside
+/// host's flow as its reply, while the real replies still pass.
+#[test]
+fn routed_queries_with_identifiers_8_and_13_never_admit_a_reverse_request() {
+    // (inside request type, id), (remote request type, id) that collides.
+    for ((host_type, host_id), (remote_type, remote_id), reply_type) in [
+        ((ECHO_REQUEST, 8), (ECHO_REQUEST, 8), ECHO_REPLY),
+        ((TIMESTAMP_REQUEST, 8), (ECHO_REQUEST, 13), TIMESTAMP_REPLY),
+        ((ECHO_REQUEST, 13), (TIMESTAMP_REQUEST, 8), ECHO_REPLY),
+    ] {
+        let mut routed = Routed::new(false);
+        assert_eq!(
+            routed.run(LAN, received(LAN, H1, REMOTE, host_type, host_id)),
+            Ok(WAN)
+        );
+        assert_eq!(
+            routed.run(WAN, received(WAN, REMOTE, H1, remote_type, remote_id)),
+            Err(DropReason::FirewallDefaultDenied),
+            "{host_type}/{host_id} vs {remote_type}/{remote_id}"
+        );
+        assert_eq!(
+            routed.run(WAN, received(WAN, REMOTE, H1, reply_type, host_id)),
+            Ok(LAN)
+        );
+        // A repeated request from the inside is the same flow, not a reply.
+        assert_eq!(
+            routed.run(LAN, received(LAN, H1, REMOTE, host_type, host_id)),
+            Ok(WAN)
+        );
+        assert_eq!(routed.firewall.counters().allowed_new, 1);
+    }
+    // A reply without a request never opens a flow, even under an
+    // allow-stateful rule for the reverse direction.
+    let mut routed = Routed::new(true);
+    assert_eq!(
+        routed.run(WAN, received(WAN, REMOTE, H1, ECHO_REPLY, 8)),
+        Err(DropReason::FirewallIcmpReplyWithoutRequest)
+    );
+    // A request under that rule opens a flow whose reply goes back out.
+    assert_eq!(
+        routed.run(WAN, received(WAN, REMOTE, H1, ECHO_REQUEST, 8)),
+        Ok(LAN)
+    );
+    assert_eq!(
+        routed.run(LAN, received(LAN, H1, REMOTE, ECHO_REPLY, 8)),
+        Ok(WAN)
+    );
+}
+
+/// The same identifiers through the NAT: Echo and Timestamp replies with
+/// public identifiers 8 and 13 return to the host, and an error quoting a
+/// query with those identifiers is still RELATED (identifier pool 1..65535
+/// so the identifiers are preserved).
+#[test]
+fn nat_queries_with_identifiers_8_and_13_keep_their_flows_apart() {
+    let mut world = World::with_identifiers(
+        Firewall::WithIcmpRule,
+        Nat44IcmpPolicy::default(),
+        1,
+        65_535,
+    );
+    let (_, echo) = world
+        .run(LAN, received(LAN, H1, REMOTE, ECHO_REQUEST, 8))
+        .unwrap();
+    assert_eq!(identifier(&echo), 8);
+    let (_, timestamp) = world
+        .run(LAN, received(LAN, H2, REMOTE, TIMESTAMP_REQUEST, 13))
+        .unwrap();
+    assert_eq!(identifier(&timestamp), 13);
+    // A Timestamp Reply with H1's identifier is not the reply of H1's Echo.
+    assert_eq!(
+        world.run(WAN, received(WAN, REMOTE, PUBLIC, TIMESTAMP_REPLY, 8)),
+        Err(DropReason::FirewallDefaultDenied)
+    );
+    assert_eq!(
+        world
+            .run(WAN, received(WAN, REMOTE, PUBLIC, ECHO_REPLY, 8))
+            .map(|(e, _)| e),
+        Ok(LAN)
+    );
+    assert_eq!(
+        world
+            .run(WAN, received(WAN, REMOTE, PUBLIC, TIMESTAMP_REPLY, 13))
+            .map(|(e, _)| e),
+        Ok(LAN)
+    );
+    // REQ-4 error about the Echo, and a REQ-5 error about the delivered
+    // Timestamp Reply, are RELATED to their own flows.
+    assert!(world
+        .run(WAN, icmp_error(WAN, ROUTER, PUBLIC, 11, 0, &echo))
+        .is_ok());
+    let (_, delivered) = world
+        .run(WAN, received(WAN, REMOTE, PUBLIC, TIMESTAMP_REPLY, 13))
+        .unwrap();
+    assert!(world
+        .run(LAN, icmp_error(LAN, H2, REMOTE, 12, 0, &delivered))
+        .is_ok());
+}
+
+/// The reserved flag is handled as for UDP/TCP (NAT44-008, RFC 1812
+/// §4.2.2.3): ignored by both the firewall pre-validation and the NAT's
+/// fragment check, and preserved on the wire.
+#[test]
+fn the_reserved_flag_is_ignored_and_preserved_by_firewall_and_nat_alike() {
+    for firewall in [Firewall::None, Firewall::WithIcmpRule] {
+        let mut world = World::new(firewall, Nat44IcmpPolicy::default());
+        let reserved = |mut frame: Vec<u8>| {
+            frame[20] |= 0x80;
+            refresh(&mut frame);
+            frame
+        };
+        let (_, out) = world
+            .run(
+                LAN,
+                reserved(received(LAN, H1, REMOTE, ECHO_REQUEST, FIRST)),
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            reserved(query_frame(
+                GW_MAC,
+                WAN_MAC,
+                PUBLIC,
+                REMOTE,
+                63,
+                ECHO_REQUEST,
+                FIRST,
+                7
+            ))
+        );
     }
 }

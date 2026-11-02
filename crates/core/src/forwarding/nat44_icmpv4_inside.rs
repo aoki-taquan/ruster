@@ -361,7 +361,10 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
             protocol,
             source_port,
             destination_port,
-            tcp_flags: 0,
+            // A quoted query is a reply here (checked above).
+            tcp_flags: quote
+                .query_type
+                .map_or(0, super::nat44_icmp_query::firewall_flags),
         };
         inspect_nat44_icmpv4_related(runtime, firewall_audit, received, true, ingress, now, trace)?;
         if let Some((sender_address, sender_port)) = authority.sender {

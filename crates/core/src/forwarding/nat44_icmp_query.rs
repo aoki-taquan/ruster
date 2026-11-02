@@ -457,7 +457,7 @@ pub(super) fn decide_nat44_icmp_inbound<T: TraceSink>(
             protocol: FirewallProtocol::Icmp,
             source_port,
             destination_port,
-            tcp_flags: 0,
+            tcp_flags: crate::firewall::FIREWALL_ICMP_REPLY,
         };
         let firewall_runtime = require_firewall_runtime(snapshot, firewall_config, firewall)?;
         *firewall_plan = Some(plan_firewall(
@@ -582,14 +582,32 @@ pub(super) fn apply_nat44_icmp_rewrite(
     Ok(())
 }
 
-/// Firewall view of an ICMP query (see [`FirewallProtocol::Icmp`]).
+/// Firewall flags of a query: the reply flag for a reply (see
+/// [`FirewallProtocol::Icmp`]).
+pub(super) const fn firewall_flags(icmp_type: u8) -> u8 {
+    if is_query_reply(icmp_type) {
+        crate::firewall::FIREWALL_ICMP_REPLY
+    } else {
+        0
+    }
+}
+
+/// Firewall view of an ICMP query (see [`FirewallProtocol::Icmp`]):
+/// pseudo-ports and direction flags.
 pub(super) fn validate_firewall_icmp_query(
     frame: &[u8],
     ipv4: packet::ValidatedIpv4,
-) -> Result<(u16, u16), DropReason> {
+) -> Result<(u16, u16, u8), DropReason> {
     match validate_icmp_query(frame, ipv4) {
-        Ok(query) => Ok(firewall_ports(query.icmp_type, query.identifier)
-            .expect("a validated query has firewall pseudo-ports")),
+        Ok(query) => {
+            let (source_port, destination_port) = firewall_ports(query.icmp_type, query.identifier)
+                .expect("a validated query has firewall pseudo-ports");
+            Ok((
+                source_port,
+                destination_port,
+                firewall_flags(query.icmp_type),
+            ))
+        }
         Err(IcmpQueryError::NotQuery) => Err(FirewallUnsupportedProtocol),
         Err(_) => Err(FirewallIcmpQueryInvalid),
     }
