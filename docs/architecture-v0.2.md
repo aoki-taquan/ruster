@@ -3399,7 +3399,24 @@ dropを早く済ませるoutput threadにもまだstartupが残るためと、at
 `clock_nanosleep`は無条件なのでkernelのaction cache（5.11）でprogramを通らない。unsafeは
 `run::seccomp::linux::sys`（`prctl`と`seccomp`のraw syscall）だけ。失敗は`stage=seccomp`で全port
 rollback、exit 1。H9のidle待機も既存の`poll`（7）だけを使い、`ppoll`/`epoll_*`/`eventfd2`は
-allowlistに入れません（workerの答えはchannelのままで、待っている間は待機を1 msに縮めて拾う）。operator手順は[`runbook-m2.md`](runbook-m2.md)、
+allowlistに入れません（workerの答えはchannelのままで、待っている間は待機を1 msに縮めて拾う）。
+filesystem confinement（H11、CLI-122〜127）: drop後もread-onlyの`openat`はprocessのuserが読める全fileに
+届き、`--user`なしのuid 0ではroot所有の秘密（`/etc/shadow`）も含むので、seccompの前に全threadを
+Landlock rulesetで閉じ込めます（既定`--fs-confine landlock`、`off`でopt-out）。許すのはread-onlyで、
+configのdirectory（pathの親と、symlinkなら解決先の親。reloadのatomic replaceに耐える）、自processの
+`/proc/<pid>`（dropとseccompの検証、`--strict-config-perms`のeuid）、`/proc/sys/net`（link watch）、
+自binary（backtrace）だけ。`/dev/urandom`、socket、stdout/stderrは事前に開いたfdなので要らず、
+`stat`/`readlink`はLandlockの対象外。mount namespace+`pivot_root`を採らないのは、`CAP_SYS_ADMIN`が
+要り（preflightは`CAP_BPF`+`CAP_PERFMON`で足りる）、呼んだthreadだけが移り（output threadは起動前から
+居る）、procfsを正しいnetnsで作り直す必要があるため。Landlockは権限不要で、dropと同じthreadごとの
+prologueに収まります: rulesetは`run::fs_confine::linux::prepare_process`がthreadが一つの間に作り
+（ruleの`O_PATH` fdはprocfsのinodeを保つためrunの間ずっと保持）、output threadはspawn時、workerは
+activate後のspawn時、router threadはdropの直後に`landlock_restrict_self`し、各threadが`/`の一覧が
+`EACCES`になることを確かめて自分のthread idを記録し、router threadが`/proc/self/task`のidと記録したidの完全一致を確かめます。configのdirectoryが`/`なら起動拒否、`/etc`等の広いdirectoryはwarning。ABI 4以上はTCPの`bind`/`connect`もhandleする（portのruleなし。`--seccomp log|off`時の多層防御）。truncateはABI 3以上でだけLandlockが拒否し、それ未満はseccompの`O_TRUNC`拒否が頼り。
+handleする権利はABI 5までの全filesystem権利で、後のABIの権利は扱わない（新kernelで新たに何かを
+拒否しない）。Landlockの無いkernelでは何も開かずexit 1（fail closed）、他の失敗は`stage=fs-confine`で
+全port rollback。`landlock_*`/`prctl`はseccompの前だけなのでallowlistは不変。unsafeは
+`run::fs_confine::linux::sys`（Landlockと`prctl`のraw syscall）だけ。operator手順は[`runbook-m2.md`](runbook-m2.md)、
 privileged E2Eは`scripts/priv-run-smoke.sh`（三つの専用netns、forward、SIGTERM、reload、link
 down/up、MTU超過とdevice削除のfail closed、rollback、XDP-063、SIGKILL後のrestart、drop後の全threadの
 credentialと`--keep-privileges`、大きなconfigのreload準備中もEchoが欠けないこと、全threadの

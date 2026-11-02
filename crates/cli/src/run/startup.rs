@@ -32,6 +32,7 @@ use super::checks::{
     evaluate_device, CheckFailure, CheckPolicy, DeviceFacts, PrivilegeFailure, Probe, Warnings,
 };
 use super::engine::{port_label, Datapath, LinkMonitor, StopSignal};
+use super::fs_confine::{FsFailure, FsReport};
 use super::netlink::{IfName, NetlinkError};
 use super::privileges::{DropFailure, DropReport, Identity, PrivilegePolicy};
 use super::seccomp::{ConfineFailure, ConfineReport, SeccompMode};
@@ -67,6 +68,9 @@ pub enum Stage {
     /// The privilege drop after activation (or of an output thread at
     /// spawn).
     PrivilegeDrop,
+    /// The filesystem confinement after the privilege drop (H11; or of a
+    /// thread in its prologue, or the ruleset before any thread).
+    FsConfine,
     /// The syscall filter after the privilege drop (H8).
     Seccomp,
 }
@@ -87,6 +91,7 @@ impl Stage {
             Self::Activate => "activate",
             Self::Workers => "workers",
             Self::PrivilegeDrop => "privilege-drop",
+            Self::FsConfine => "fs-confine",
             Self::Seccomp => "seccomp",
         }
     }
@@ -110,6 +115,8 @@ pub enum Failure {
     Links(NetlinkError),
     /// The privilege drop after activation failed.
     PrivilegeDrop(DropFailure),
+    /// The filesystem confinement failed.
+    FsConfine(FsFailure),
     /// The syscall filter could not be installed or verified.
     Seccomp(ConfineFailure),
     /// A worker thread could not be spawned.
@@ -197,6 +204,7 @@ impl fmt::Display for Failure {
             Self::Activation(error) => write!(formatter, "code={}", token(error)),
             Self::Links(error) => write!(formatter, "code={}", token(error)),
             Self::PrivilegeDrop(error) => write!(formatter, "{error}"),
+            Self::FsConfine(error) => write!(formatter, "{error}"),
             Self::Seccomp(error) => write!(formatter, "{error}"),
             Self::Spawn => formatter.write_str("code=THREAD_SPAWN"),
             #[cfg(test)]
@@ -352,7 +360,8 @@ pub trait PortHost {
 
     /// The per-thread privilege drop each worker thread runs first (the
     /// live one drops the calling thread's privileges, see
-    /// [`super::privileges::linux::drop_thread`]).
+    /// [`super::privileges::linux::drop_thread`], and then confines its
+    /// filesystem view, see [`super::fs_confine`]).
     fn thread_prologue(&self) -> fn(PrivilegePolicy) -> Result<(), DropFailure>;
 
     /// Capabilities and memlock for `backend`, and the preconditions of
@@ -389,6 +398,12 @@ pub trait PortHost {
     /// Drops every privilege of the process after startup (and switches to
     /// `identity`), irreversibly, and verifies every thread.
     fn lockdown(&self, identity: Option<Identity>) -> Result<DropReport, DropFailure>;
+
+    /// Confines the calling (router) thread's filesystem view after the
+    /// privilege drop and requires every thread of the process to be
+    /// confined (the others confined themselves in their prologue, see
+    /// [`super::fs_confine`]).
+    fn fs_confine(&self) -> Result<FsReport, FsFailure>;
 
     /// Installs the syscall filter of `mode` (never `Off`) on every thread
     /// of the process after the privilege drop, and verifies every thread.
