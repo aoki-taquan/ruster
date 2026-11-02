@@ -84,20 +84,82 @@ fn the_config_directory_is_the_parent_or_the_working_directory() {
     }
 }
 
+fn ids(ids: &[u32]) -> std::collections::BTreeSet<u32> {
+    ids.iter().copied().collect()
+}
+
 #[test]
-fn every_thread_must_be_confined() {
-    assert_eq!(check_threads(5, 5), Ok(()));
-    assert_eq!(check_threads(1, 1), Ok(()));
+fn exactly_the_threads_of_the_process_must_be_confined() {
     assert_eq!(
-        check_threads(4, 5),
-        Err(FsFailure::NotConfined(Unconfined::Threads))
+        check_threads(&ids(&[10, 11, 12]), &ids(&[12, 10, 11])),
+        Ok(())
+    );
+    assert_eq!(check_threads(&ids(&[7]), &ids(&[7])), Ok(()));
+    for (confined, tasks) in [
+        // One thread missing.
+        (&[10, 11][..], &[10, 11, 12][..]),
+        // A thread that is not in the process (or has ended).
+        (&[10, 11, 12, 13][..], &[10, 11, 12][..]),
+        // The same number, but another thread: a counter would pass this.
+        (&[10, 11, 13][..], &[10, 11, 12][..]),
+        (&[][..], &[1][..]),
+    ] {
+        assert_eq!(
+            check_threads(&ids(confined), &ids(tasks)),
+            Err(FsFailure::NotConfined(Unconfined::Threads)),
+            "{confined:?} {tasks:?}"
+        );
+    }
+    assert_eq!(
+        check_threads(&ids(&[]), &ids(&[])),
+        Err(FsFailure::Unreadable)
     );
     assert_eq!(
-        check_threads(6, 5),
-        Err(FsFailure::NotConfined(Unconfined::Threads))
+        check_threads(&ids(&[5]), &ids(&[])),
+        Err(FsFailure::Unreadable)
     );
-    assert_eq!(check_threads(0, 0), Err(FsFailure::Unreadable));
-    assert_eq!(check_threads(5, 0), Err(FsFailure::Unreadable));
+}
+
+#[test]
+fn the_root_directory_is_refused_and_broad_ones_are_named() {
+    assert_eq!(classify_directory(Path::new("/")), DirectoryScope::Root);
+    for broad in ["/etc", "/home", "/root", "/usr", "/var"] {
+        assert_eq!(
+            classify_directory(Path::new(broad)),
+            DirectoryScope::Broad(broad)
+        );
+    }
+    for dedicated in [
+        "/etc/ruster",
+        "/home/router/conf",
+        "/run/ruster-smoke.x",
+        "/srv",
+        "/etcetera",
+        "/var/lib/ruster",
+    ] {
+        assert_eq!(
+            classify_directory(Path::new(dedicated)),
+            DirectoryScope::Dedicated,
+            "{dedicated}"
+        );
+    }
+    assert_eq!(
+        broad_warning("/etc"),
+        "warning: fs-confine code=CONFIG_DIRECTORY_BROAD directory=/etc: every file beneath \
+         it that the process's user may read stays readable; keep the config in a directory \
+         of its own (such as /etc/ruster)"
+    );
+}
+
+#[test]
+fn tcp_is_handled_from_abi_4() {
+    for abi in 0..4 {
+        assert_eq!(handled_net_access(abi), 0, "ABI {abi}");
+    }
+    for abi in [4, 5, 8, 100] {
+        assert_eq!(handled_net_access(abi), 0b11, "ABI {abi}");
+    }
+    assert_eq!(ACCESS_NET_BIND_TCP | ACCESS_NET_CONNECT_TCP, 0b11);
 }
 
 #[test]
@@ -105,6 +167,8 @@ fn failures_are_value_free_codes() {
     for (failure, code) in [
         (FsFailure::Unsupported, "code=LANDLOCK_UNSUPPORTED"),
         (FsFailure::Disabled, "code=LANDLOCK_DISABLED"),
+        (FsFailure::Blocked, "code=LANDLOCK_BLOCKED"),
+        (FsFailure::ConfigDirectoryRoot, "code=CONFIG_DIRECTORY_ROOT"),
         (
             FsFailure::Syscall {
                 step: FsStep::Abi,
@@ -159,11 +223,24 @@ fn failures_are_value_free_codes() {
         (FsFailure::Unreadable, "code=STATUS_UNREADABLE"),
     ] {
         assert_eq!(failure.to_string(), code);
-        assert_eq!(
-            failure.unavailable(),
-            matches!(failure, FsFailure::Unsupported | FsFailure::Disabled)
+        // Every failure the operator can fix with a setting has a hint
+        // naming `--fs-confine off`; the others none.
+        let hinted = matches!(
+            failure,
+            FsFailure::Unsupported
+                | FsFailure::Disabled
+                | FsFailure::Blocked
+                | FsFailure::ConfigDirectoryRoot
         );
+        assert_eq!(failure.hint().is_some(), hinted, "{failure:?}");
+        if let Some(hint) = failure.hint() {
+            assert!(hint.contains("--fs-confine off"), "{hint}");
+        }
     }
+    assert!(FsFailure::Blocked
+        .hint()
+        .unwrap()
+        .contains("landlock_create_ruleset, landlock_add_rule, and landlock_restrict_self"));
 }
 
 #[test]
@@ -431,6 +508,82 @@ mod live {
                 errno: 2,
             }
         );
+    }
+
+    #[test]
+    fn a_config_in_the_root_directory_is_refused() {
+        // Refused before anything else (the file need not exist).
+        assert_eq!(
+            Prepared::new(Path::new("/ruster-h11-no-such-config.toml"))
+                .err()
+                .expect("refused"),
+            FsFailure::ConfigDirectoryRoot
+        );
+        // Also when only the resolved file is in `/`.
+        let scratch = Scratch::new("rootlink");
+        let link = scratch.path("conf/root.toml");
+        let target = fs::read_dir("/")
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| fs::symlink_metadata(path).is_ok_and(|m| m.is_file()))
+            .or_else(|| {
+                // No regular file in `/`: a directory entry resolves the
+                // same way (its parent is `/`).
+                fs::read_dir("/")
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.path())
+                    .find(|path| fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()))
+            })
+            .expect("an entry of /");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(
+            Prepared::new(&link).err().expect("refused"),
+            FsFailure::ConfigDirectoryRoot
+        );
+    }
+
+    #[test]
+    fn a_config_in_a_broad_directory_is_named_for_the_warning() {
+        let prepared = Prepared::new(Path::new("/etc/passwd")).expect("prepared");
+        assert_eq!(prepared.broad(), Some("/etc"));
+        let scratch = Scratch::new("dedicated");
+        let prepared = Prepared::new(&scratch.path("conf/router.toml")).expect("prepared");
+        assert_eq!(prepared.broad(), None);
+        // A dedicated name that resolves into a broad directory is named.
+        let link = scratch.path("conf/passwd.toml");
+        std::os::unix::fs::symlink("/etc/passwd", &link).unwrap();
+        assert_eq!(
+            Prepared::new(&link).expect("prepared").broad(),
+            Some("/etc")
+        );
+    }
+
+    #[test]
+    fn a_confined_thread_cannot_use_tcp_from_abi_4() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+        let address = listener.local_addr().unwrap();
+        let scratch = Scratch::new("tcp");
+        let (abi, connect, bind) = confined(scratch.path("conf/router.toml"), move |prepared| {
+            let connect = std::net::TcpStream::connect(address)
+                .map(drop)
+                .map_err(|e| e.kind());
+            let bind = std::net::TcpListener::bind("127.0.0.1:0")
+                .map(drop)
+                .map_err(|e| e.kind());
+            // UDP is not a Landlock right.
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("udp");
+            (prepared.abi(), connect, bind)
+        });
+        if abi >= 4 {
+            assert_eq!(connect, Err(ErrorKind::PermissionDenied));
+            assert_eq!(bind, Err(ErrorKind::PermissionDenied));
+        } else {
+            assert_eq!(connect, Ok(()));
+        }
+        // This (unconfined) thread still can.
+        std::net::TcpStream::connect(address).expect("unconfined connect");
     }
 
     #[test]

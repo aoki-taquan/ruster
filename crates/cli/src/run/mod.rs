@@ -351,20 +351,21 @@ fn live(args: &RunArgs, config: ValidatedConfigV1, err: &mut impl Write) -> u8 {
     // confines itself with it after its drop (the output threads below at
     // spawn, before startup).
     if settings.fs_confine == FsConfineMode::Landlock {
-        if let Err(failure) = fs_confine::linux::prepare_process(&args.config) {
-            let _ = writeln!(
-                err,
-                "ruster run: startup failed: stage=fs-confine {failure}"
-            );
-            if failure.unavailable() {
+        match fs_confine::linux::prepare_process(&args.config) {
+            Ok(None) => {}
+            Ok(Some(directory)) => {
+                let _ = writeln!(err, "ruster run: {}", fs_confine::broad_warning(directory));
+            }
+            Err(failure) => {
                 let _ = writeln!(
                     err,
-                    "ruster run: --fs-confine landlock needs Landlock (Linux 5.13 or newer with \
-                     landlock in /sys/kernel/security/lsm); --fs-confine off runs without \
-                     filesystem confinement"
+                    "ruster run: startup failed: stage=fs-confine {failure}"
                 );
+                if let Some(hint) = failure.hint() {
+                    let _ = writeln!(err, "ruster run: {hint}");
+                }
+                return EXIT_RUNTIME;
             }
-            return EXIT_RUNTIME;
         }
     }
     // From here on nothing on this thread writes to a file descriptor: a

@@ -490,8 +490,8 @@ ruster run [options] -- <config.toml>
 | `--link-stale-secs <s>` | 5 | 1 to 3600 | age of a link watcher round still running (a `send` waiting for the kernel's RTNL lock) from which every further due round counts as a failed link query on every port (`LINK_WATCH_STALE`, `LINK_PROBE`; `LINK_UNVERIFIABLE` at the third, so about `s + 2` seconds after the stuck round started; section 8). No 0: losing observability of the ports always ends the run eventually. Raise it on hosts where driver resets hold RTNL longer |
 | `--idle-wait-ms <ms>` | 10 | 1 to 100 | longest idle wait (section 7, "Idle wait"): an idle router blocks in `poll()` on its port sockets for at most this long, or at most 1 ms while timers, TX, or a reload are pending; an arriving frame ends the wait at once. Larger: fewer idle wake-ups and less CPU, but a signal delivered to another thread, a worker's answer, and anything the router only notices at a tick are seen up to this much later. 1 keeps the pre-H9 idle cadence (about 1000 wake-ups per second) |
 | `--keep-privileges` | off | flag | do not drop privileges after startup (section 5, "Privilege drop"): the process keeps every capability it started with for its whole life (`warning: privileges kept (--keep-privileges)`, `privileges.state=kept`). Risk: a memory-safety bug or a logic flaw reachable from packets or the config then runs with `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_BPF`/`CAP_SYS_ADMIN` (as root: every capability), so it can reconfigure every interface and route of the namespace, sniff and inject on any device, load BPF programs, and (as root) read and write any file. Use it only to diagnose a drop problem, or on a kernel before 6.5 with `kernel.unprivileged_bpf_disabled` set (where the drop is refused) |
-| `--seccomp kill\|log\|off` (or `--seccomp=<mode>`) | `kill` | one of the three | the syscall filter after startup (section 5, "Syscall filter"). `kill`: a syscall outside the allowlist kills the whole process at once (`SECCOMP_RET_KILL_PROCESS`; the XDP links detach as after SIGKILL). `log`: the kernel logs it and lets it run (`SECCOMP_RET_LOG`; `warning: seccomp=log`), for finding a missing entry without an outage. `off`: no filter (`warning: seccomp=off`, `seccomp.mode=off`). Risk of `log` and `off`: a compromised router can then make every syscall an unprivileged process (after the drop) or a privileged one (with `--keep-privileges`) can: open inet sockets and connect out, write any file its user may write, start programs, `ptrace` its own user's processes, load BPF programs where unprivileged BPF is allowed, and probe kernel interfaces that the filter keeps out of reach. Use `log` to diagnose a kill, `off` only on a platform where the filter cannot be installed. An i386 or x32 syscall kills in every mode but `off`. Independent of `--keep-privileges` and `--user`/`--group` |
-| `--fs-confine landlock\|off` (or `--fs-confine=<mode>`) | `landlock` | one of the two | the filesystem confinement after startup (section 5, "Filesystem confinement", H11). `landlock`: every thread can open only the files the run reads (the config's directory, its own `/proc/<pid>`, `/proc/sys/net`, its binary; read-only), and startup fails without Landlock (`stage=fs-confine code=LANDLOCK_UNSUPPORTED\|LANDLOCK_DISABLED`). `off`: no confinement (`warning: fs-confine=off`, `fs.confine=off`). Risk of `off`: a compromised router can then read every file its user may read, which without `--user`/`--group` is every root-readable file (`/etc/shadow`, private keys, other services' configs), and send it out over the ports or its output. Use `off` only on a kernel without Landlock (before 5.13, or `landlock` missing from the boot `lsm=` list). Independent of `--keep-privileges`, `--user`/`--group`, and `--seccomp` |
+| `--seccomp kill\|log\|off` (or `--seccomp=<mode>`) | `kill` | one of the three | the syscall filter after startup (section 5, "Syscall filter"). `kill`: a syscall outside the allowlist kills the whole process at once (`SECCOMP_RET_KILL_PROCESS`; the XDP links detach as after SIGKILL). `log`: the kernel logs it and lets it run (`SECCOMP_RET_LOG`; `warning: seccomp=log`), for finding a missing entry without an outage. `off`: no filter (`warning: seccomp=off`, `seccomp.mode=off`). Risk of `log` and `off`: a compromised router can then make every syscall an unprivileged process (after the drop) or a privileged one (with `--keep-privileges`) can: open inet sockets and connect out, write any file its user may write, start programs, `ptrace` its own user's processes, load BPF programs where unprivileged BPF is allowed, and probe kernel interfaces that the filter keeps out of reach. Use `log` to diagnose a kill, `off` only on a platform where the filter cannot be installed. On a kernel before Landlock ABI 3 (Linux 6.2) the filter is also what keeps a writable file from being truncated by path (the `O_TRUNC` rule, no `truncate`), so `log`/`off` there loses that too; before ABI 4 (Linux 6.7) it is also the only limit on TCP sockets. An i386 or x32 syscall kills in every mode but `off`. Independent of `--keep-privileges` and `--user`/`--group` |
+| `--fs-confine landlock\|off` (or `--fs-confine=<mode>`) | `landlock` | one of the two | the filesystem confinement after startup (section 5, "Filesystem confinement", H11). `landlock`: every thread can open only the files the run reads (the config's directory, its own `/proc/<pid>`, `/proc/sys/net`, its binary; read-only; a config directory of `/` is refused), and startup fails without Landlock (`stage=fs-confine code=LANDLOCK_UNSUPPORTED\|LANDLOCK_DISABLED\|LANDLOCK_BLOCKED`). `off`: no confinement (`warning: fs-confine=off`, `fs.confine=off`). Risk of `off`: a compromised router can then read every file its user may read, which without `--user`/`--group` is every root-readable file (`/etc/shadow`, private keys, other services' configs), and send it out over the ports or its output. Use `off` only on a kernel without Landlock (before 5.13, or `landlock` missing from the boot `lsm=` list). Independent of `--keep-privileges`, `--user`/`--group`, and `--seccomp` |
 | `--user <uid>` `--group <gid>` | none | numeric ids 1 to 4294967294, both or neither, not with `--keep-privileges` | with the drop, also switch every thread's real, effective, saved and filesystem uid and gid to these ids and clear the supplementary groups. Names are not resolved. Needs `CAP_SETUID` and `CAP_SETGID` at startup (exit 4 otherwise, checked before anything is opened). The config must then be readable by that user for reloads |
 
 Numbers are decimal digits only (at most 6, no sign; ids at most 10).
@@ -730,9 +730,16 @@ the default; `off` opts out):
 | the `ruster` binary | symbolizing a panic backtrace (`RUST_BACKTRACE=1`) |
 
 Everything else is refused (`EACCES`): opening, listing, executing,
-writing, creating, removing, linking, renaming, and truncating by path,
-including `/etc`, `/dev`, `/sys`, other processes' `/proc/<pid>`, and the
-rest of `/proc/sys`. Landlock checks where an open resolves to, so
+writing, creating, removing, linking, and renaming by path, including
+`/etc`, `/dev`, `/sys`, other processes' `/proc/<pid>`, and the rest of
+`/proc/sys`. Truncating by path is a Landlock right only from ABI 3
+(Linux 6.2); before that it is kept out by the syscall filter alone (its
+`openat` rule refuses `O_TRUNC`, and `truncate`/`ftruncate` are not on the
+allowlist), so on such a kernel `--seccomp log|off` lets a compromised
+router truncate a file its user may write. On ABI 4 (Linux 6.7) and newer
+TCP `bind` and `connect` are refused too (no rule grants a port; the run
+uses AF_XDP, rtnetlink, and a Unix datagram socket, never TCP): defence in
+depth for `--seccomp log|off`, under which `socket` is not limited. Landlock checks where an open resolves to, so
 `/proc/<pid>/root/...`, `/proc/self/cwd/...`, and a symlink from the
 config directory to a file outside it are refused too. What stays: the fds
 opened before (port sockets, netlink and notification sockets,
@@ -745,8 +752,13 @@ the plain file permissions still apply on top.
 
 Keep the config in a directory of its own (`/etc/ruster/`, section 2):
 every file the router's user may read beneath that directory stays
-readable. A config directly in `/etc` would keep `/etc/shadow` readable to
-uid 0. A reload through a symlink that now points outside the granted
+readable. A config whose directory (as named, or as resolved through a
+symlink) is `/` is refused at startup (`stage=fs-confine
+code=CONFIG_DIRECTORY_ROOT`, exit 1: it would grant reading the whole
+filesystem). One directly in `/etc`, `/home`, `/root`, `/usr`, or `/var`
+starts with the warning `warning: fs-confine
+code=CONFIG_DIRECTORY_BROAD directory=/etc: ...`: in `/etc` it keeps
+`/etc/shadow` readable to uid 0. A reload through a symlink that now points outside the granted
 directories fails with `reload failed: stage=read code=PERMISSION_DENIED`
 (generation N keeps running); restart to make a new location readable.
 
@@ -755,8 +767,12 @@ When: the ruleset is built first thing (before any thread exists, from the
 drop: the two output threads at spawn, the link watcher and the reload
 worker at spawn after activation, and the router thread right after its
 drop. Each thread then checks itself (listing `/` must fail with
-`EACCES`), and the router thread requires as many confined threads as
-`/proc/self/task` lists (`threads=5`). `PR_SET_NO_NEW_PRIVS` is set on each
+`EACCES`) and records its thread id, and the router thread requires the
+recorded ids to be exactly those `/proc/self/task` lists (`threads=5`).
+On Landlock ABI 7 (Linux 6.15) and newer with audit enabled, that
+self-check makes the kernel log one Landlock denial record per thread at
+startup (`type=1423`, `AUDIT_LANDLOCK_ACCESS`, five in all): expected, not
+a fault. `PR_SET_NO_NEW_PRIVS` is set on each
 thread first (Landlock needs it without `CAP_SYS_ADMIN`; the drop and the
 filter set it anyway). The `landlock_*` and `prctl` calls all happen
 before the syscall filter, which allows none of them: nothing is added to
@@ -772,8 +788,10 @@ truncate from 3, device ioctl from 5) and never a right a later kernel
 defines, so a newer kernel restricts nothing new. The startup line and the
 stats report the ABI (`fs.abi`). Without Landlock startup fails before
 anything is opened (`stage=fs-confine code=LANDLOCK_UNSUPPORTED` before
-5.13 or built without it, `LANDLOCK_DISABLED` when not enabled at boot;
-exit 1); `--fs-confine off` runs without it (`warning: fs-confine=off`).
+5.13 or built without it, `LANDLOCK_DISABLED` when not enabled at boot,
+`LANDLOCK_BLOCKED` when a supervisor's syscall filter refuses the
+`landlock_*` calls with `EPERM`; exit 1); `--fs-confine off` runs without
+it (`warning: fs-confine=off`).
 
 Failure: any other failed step aborts startup with the full rollback
 (`stage=fs-confine code=...`, exit 1, section 14): before any thread
@@ -799,7 +817,9 @@ it on every thread. The router thread then requires every thread
 one filter more than before (`Seccomp_filters`, Linux 5.9). A supervisor's
 own filter (systemd `SystemCallFilter=`, a container runtime) stays
 underneath; the stricter result applies, and that filter must allow
-`seccomp` and `prctl` at startup. The line
+`seccomp` and `prctl` at startup, and with the default `--fs-confine
+landlock` also `landlock_create_ruleset`, `landlock_add_rule`, and
+`landlock_restrict_self` (systemd's `@sandbox` group has them). The line
 `ruster run: seccomp filter installed: mode=kill threads=5 syscalls=N
 arch=x86_64` follows the drop line; the stats show `seccomp.*`
 (section 11).
@@ -1982,7 +2002,9 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `stage=privileges code=MISSING_CAPABILITIES missing=CAP_SETGID,CAP_SETUID` | 4 | `--user`/`--group` without the capabilities to switch | grant `CAP_SETUID` and `CAP_SETGID` (systemd: add them to `AmbientCapabilities`/`CapabilityBoundingSet`), or drop `--user`/`--group` |
 | `stage=privileges code=TEARDOWN_NEEDS_CAPABILITIES` | 4 | kernel before 6.5 with `kernel.unprivileged_bpf_disabled` set (Ubuntu 22.04, RHEL 9 defaults; vendor backports are not detected): the teardown after the drop would fail | use Linux 6.5 or newer, or knowingly `--keep-privileges` (section 2, upgrade note); with `Restart=on-failure` the unit otherwise restarts in a loop |
 | `stage=privilege-drop code=<STEP>/ERRNO_<n>` (`DUMPABLE`, `KEEPCAPS`, `BOUNDING`, `AMBIENT`, `GROUPS`, `GID`, `UID`, `CAPSET`, `NO_NEW_PRIVS`), `code=NOT_DROPPED/CAPABILITIES\|BOUNDING\|NO_NEW_PRIVS\|IDENTITY\|GROUPS\|DUMPABLE`, `code=STATUS_UNREADABLE` [`thread=output`] | 1 | the privilege drop failed (everything was rolled back) | check seccomp/LSM policy on `prctl`/`capset`/set-id calls and procfs; `NOT_DROPPED` names what a thread kept: report it |
-| `stage=fs-confine code=LANDLOCK_UNSUPPORTED\|LANDLOCK_DISABLED` | 1 | the kernel has no Landlock (before 5.13, or built without it) or it is not enabled (`landlock` missing from `/sys/kernel/security/lsm`); nothing was opened | enable Landlock (boot `lsm=` list), use a newer kernel, or knowingly `--fs-confine off` (section 3) |
+| `stage=fs-confine code=LANDLOCK_UNSUPPORTED\|LANDLOCK_DISABLED\|LANDLOCK_BLOCKED` | 1 | the kernel has no Landlock (before 5.13, or built without it), it is not enabled (`landlock` missing from `/sys/kernel/security/lsm`), or a supervisor's syscall filter refuses the `landlock_*` calls (`EPERM`); nothing was opened | enable Landlock (boot `lsm=` list), use a newer kernel, allow `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` in the supervisor's filter, or knowingly `--fs-confine off` (section 3) |
+| `stage=fs-confine code=CONFIG_DIRECTORY_ROOT` | 1 | the config's directory, as named or resolved through a symlink, is `/`: granting it would leave every file readable; nothing was opened | move the config into a directory of its own (`/etc/ruster`), or knowingly `--fs-confine off` |
+| `warning: fs-confine code=CONFIG_DIRECTORY_BROAD directory=/etc\|/home\|/root\|/usr\|/var` | — | the config's directory is a broad shared one: everything the router's user may read beneath it stays readable | move the config into a directory of its own (`/etc/ruster`) |
 | `stage=fs-confine code=OPEN.CONFIG_DIRECTORY\|CONFIG_TARGET\|PROCESS\|NET_SYSCTLS/ERRNO_<n>`, `code=ABI\|RULESET\|ADD_RULE.<GRANT>\|NO_NEW_PRIVS\|RESTRICT\|PROBE/ERRNO_<n>`, `code=NOT_CONFINED/PROBE\|THREADS`, `code=NOT_PREPARED`, `code=STATUS_UNREADABLE` [`thread=output`] | 1 | the filesystem confinement could not be built or verified (everything was rolled back): `OPEN.*` a granted directory cannot be opened (no procfs, a missing config directory), `RESTRICT/ERRNO_1` no `no_new_privs`, `NOT_CONFINED` a thread could still list `/` or not every thread confined itself | mount procfs in the namespace/container; report `NOT_CONFINED`; knowingly `--fs-confine off` |
 | `reload failed: stage=read code=PERMISSION_DENIED` under the default confinement | — | the config path now resolves outside the directories granted at startup (a symlink retargeted elsewhere), or plain file permissions refuse it (section 5, "Privilege drop") | keep the config (and what its path resolves to) in the directory it was started from, or restart |
 | `stage=seccomp code=NO_NEW_PRIVS\|ACTION_AVAIL\|INSTALL/ERRNO_<n>`, `code=ACTION_UNAVAILABLE`, `code=TSYNC_CONFLICT`, `code=PROGRAM_TOO_LONG`, `code=STATUS_UNREADABLE`, `code=NOT_CONFINED/MODE\|FILTERS\|NO_NEW_PRIVS` | 1 | the syscall filter could not be installed or verified (everything was rolled back): `INSTALL/ERRNO_13` no `no_new_privs`, `INSTALL/ERRNO_22` a kernel without seccomp filters, `INSTALL/ERRNO_1` a supervisor's filter refused `seccomp`, `TSYNC_CONFLICT` a thread with a filter of its own, `ACTION_UNAVAILABLE` a kernel before 4.14, `STATUS_UNREADABLE` no procfs or no `Seccomp_filters` row (before 5.9) | allow `seccomp` and `prctl` in the supervisor's filter, use Linux 5.9 or newer, or knowingly `--seccomp off` (section 3) |

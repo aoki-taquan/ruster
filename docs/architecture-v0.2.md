@@ -3412,7 +3412,7 @@ configのdirectory（pathの親と、symlinkなら解決先の親。reloadのato
 prologueに収まります: rulesetは`run::fs_confine::linux::prepare_process`がthreadが一つの間に作り
 （ruleの`O_PATH` fdはprocfsのinodeを保つためrunの間ずっと保持）、output threadはspawn時、workerは
 activate後のspawn時、router threadはdropの直後に`landlock_restrict_self`し、各threadが`/`の一覧が
-`EACCES`になることを、router threadが`/proc/self/task`の数と閉じ込めたthread数の一致を確かめます。
+`EACCES`になることを確かめて自分のthread idを記録し、router threadが`/proc/self/task`のidと記録したidの完全一致を確かめます。configのdirectoryが`/`なら起動拒否、`/etc`等の広いdirectoryはwarning。ABI 4以上はTCPの`bind`/`connect`もhandleする（portのruleなし。`--seccomp log|off`時の多層防御）。truncateはABI 3以上でだけLandlockが拒否し、それ未満はseccompの`O_TRUNC`拒否が頼り。
 handleする権利はABI 5までの全filesystem権利で、後のABIの権利は扱わない（新kernelで新たに何かを
 拒否しない）。Landlockの無いkernelでは何も開かずexit 1（fail closed）、他の失敗は`stage=fs-confine`で
 全port rollback。`landlock_*`/`prctl`はseccompの前だけなのでallowlistは不変。unsafeは

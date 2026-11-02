@@ -770,7 +770,8 @@ sudo kill -HUP <pid>                                               # configをre
   解決先のdirectory。file読み取りだけで一覧は不可。reloadのatomic replaceも読める）、自processの
   `/proc/<pid>`（drop/seccompの検証と`--strict-config-perms`のeuid）、`/proc/sys/net`（link watchの
   sysctl）、自binary（panic backtraceのsymbol）。それ以外のopen/一覧/実行/書き込み/作成/削除/rename/
-  truncateはpathでは全て`EACCES`（`/etc`、`/dev`、`/sys`、他processの`/proc/<pid>`、
+  （truncateはLandlock ABI 3以上。それ未満はseccompの`openat`の`O_TRUNC`拒否と`truncate`不許可だけが
+  防ぐので`--seccomp log|off`では防げない）はpathでは全て`EACCES`（`/etc`、`/dev`、`/sys`、他processの`/proc/<pid>`、
   `/proc/<pid>/root/...`経由やconfig directoryから外へのsymlinkも）。既に開いたfd（socket、
   `/dev/urandom`、stdout/stderr）とmetadata（`stat`、`readlink`）は影響なし。mount namespace+
   `pivot_root`ではなくLandlockを選んだ理由: 権限不要（startupは`CAP_SYS_ADMIN`を要求しない）、
@@ -780,11 +781,16 @@ sudo kill -HUP <pid>                                               # configをre
   threadはdropの直後・seccompの前）、各threadは`/`の一覧が`EACCES`になることを、router threadは
   `/proc/self/task`の数だけthreadが閉じ込められたことを確かめます。`landlock_*`/`prctl`はseccompの
   前だけでallowlistは不変。Landlock ABI 1（Linux 5.13）以上で有効（`/sys/kernel/security/lsm`に
-  `landlock`）が必要で、ABI 5までのfilesystem権利をhandleし後のABIの権利は扱わない。Landlockが無ければ
-  何も開かずに`stage=fs-confine code=LANDLOCK_UNSUPPORTED|LANDLOCK_DISABLED`でexit 1（fail closed。
+  `landlock`）が必要で、ABI 5までのfilesystem権利をhandleし後のABIの権利は扱わない。Landlockが無ければ何も開かずに
+  `stage=fs-confine code=LANDLOCK_UNSUPPORTED|LANDLOCK_DISABLED|LANDLOCK_BLOCKED`（`BLOCKED`は
+  supervisorのsyscall filterが`EPERM`で拒否）でexit 1（fail closed。
   挙動変更）、`--fs-confine off`はrisk付きのopt-out（warning行）。他の失敗も全portをrollbackして
   `stage=fs-confine`でexit 1。statsは`fs.confine=landlock|off`、`fs.abi`、`fs.rules`、`fs.threads`。
+  ABI 4以上ではTCPの`bind`/`connect`も拒否（portを許すruleなし。runはTCPを使わない）。
   configは専用directory（`/etc/ruster/`）に置く（そのdirectory内でuserが読めるfileは読める）。
+  directory（名前どおりかsymlink解決後）が`/`なら起動拒否（`code=CONFIG_DIRECTORY_ROOT`）、
+  `/etc`、`/home`、`/root`、`/usr`、`/var`なら`CONFIG_DIRECTORY_BROAD` warning。各threadは
+  自分のthread idを記録し、router threadは`/proc/self/task`のidと完全一致を要求します。
   詳細はrunbookの「Filesystem confinement (Landlock)」。
 - seccomp filter（H8、CLI-102〜CLI-109）: privilege dropの直後・最初のtickの前に、router threadが
   `seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC)`一回で全thread（router、output 2、

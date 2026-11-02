@@ -17,7 +17,11 @@
 //! | the executable | read files | symbolizing a panic backtrace (skipped when the binary cannot be opened) |
 //!
 //! Nothing else can be opened, listed, executed, written, created,
-//! removed, linked, renamed, or truncated by path. What does not go
+//! removed, linked, or renamed by path (truncation by path is a Landlock
+//! right from ABI 3; before it, the syscall filter's `openat` rule without
+//! `O_TRUNC` and the missing `truncate` keep it out, so not under
+//! `--seccomp log|off`). On ABI 4 and newer TCP `bind` and `connect` are
+//! refused too (no rule grants a port; the run uses no TCP). What does not go
 //! through a path stays: the fds opened before (the ports, the netlink and
 //! notification sockets, `/dev/urandom`, stdout/stderr), and metadata
 //! (`stat`, `readlink`; the `--strict-config-perms` walk to `/` and the
@@ -38,6 +42,10 @@
 //!
 //! # When, per thread
 //!
+//! A config directory of `/` would grant reading the whole filesystem: it
+//! is refused (`code=CONFIG_DIRECTORY_ROOT`), and a broad one (`/etc`,
+//! `/home`, `/root`, `/usr`, `/var`) is warned (see [`classify_directory`]).
+//!
 //! Landlock confines the calling thread (and the threads it starts later).
 //! [`linux::prepare_process`] builds the ruleset first thing, on the only
 //! thread, before any other thread exists; each thread then confines
@@ -45,8 +53,9 @@
 //! watcher and the reload worker at spawn after activation, and the router
 //! thread right after its drop and before the syscall filter
 //! ([`linux::restrict_process`]). Every confinement is checked by the thread
-//! itself: listing `/` must fail with `EACCES`. The router thread finally
-//! requires as many confined threads as `/proc/self/task` lists. Any
+//! itself: listing `/` must fail with `EACCES`, and records its thread id.
+//! The router thread finally requires the recorded ids to be exactly the
+//! ids `/proc/self/task` lists. Any
 //! failure aborts startup with the full rollback (exit 1,
 //! `stage=fs-confine`).
 //!
@@ -66,9 +75,11 @@
 //! later: an unhandled right is allowed, so a later kernel restricts
 //! nothing new (such as connecting to the notification socket by path).
 //! Without Landlock the default refuses to start
-//! (`code=LANDLOCK_UNSUPPORTED` or `LANDLOCK_DISABLED`); `--fs-confine
-//! off` runs without it.
+//! (`code=LANDLOCK_UNSUPPORTED`, `LANDLOCK_DISABLED`, or `LANDLOCK_BLOCKED`
+//! when a supervisor's syscall filter refuses the calls with `EPERM`);
+//! `--fs-confine off` runs without it.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -124,6 +135,63 @@ pub const fn handled_access(abi: u32) -> u64 {
         3 | 4 => ABI1_ACCESS | ACCESS_REFER | ACCESS_TRUNCATE,
         _ => ABI1_ACCESS | ACCESS_REFER | ACCESS_TRUNCATE | ACCESS_IOCTL_DEV,
     }
+}
+
+/// `LANDLOCK_ACCESS_NET_BIND_TCP` (ABI 4, Linux 6.7).
+pub const ACCESS_NET_BIND_TCP: u64 = 1 << 0;
+/// `LANDLOCK_ACCESS_NET_CONNECT_TCP` (ABI 4).
+pub const ACCESS_NET_CONNECT_TCP: u64 = 1 << 1;
+
+/// The network rights the ruleset handles on ABI `abi`: TCP bind and
+/// connect from ABI 4, with no rule granting any port (the run uses
+/// AF_XDP, netlink, and a Unix datagram socket, never TCP). Defence in
+/// depth for `--seccomp log|off`, under which `socket` is not limited.
+pub const fn handled_net_access(abi: u32) -> u64 {
+    if abi >= 4 {
+        ACCESS_NET_BIND_TCP | ACCESS_NET_CONNECT_TCP
+    } else {
+        0
+    }
+}
+
+/// How broad a config directory is (by its canonical path).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectoryScope {
+    /// `/`: granting it would let the router read every file its user may
+    /// read; refused.
+    Root,
+    /// A well-known shared directory: allowed, with a warning naming it.
+    Broad(&'static str),
+    /// Anything else (the recommended `/etc/ruster`).
+    Dedicated,
+}
+
+/// Directories warned as broad: they hold many unrelated files (`/etc`
+/// holds `/etc/shadow`).
+pub const BROAD_DIRECTORIES: [&str; 5] = ["/etc", "/home", "/root", "/usr", "/var"];
+
+/// The scope of a config directory from its canonical (absolute, resolved)
+/// path.
+pub fn classify_directory(canonical: &Path) -> DirectoryScope {
+    if canonical == Path::new("/") {
+        return DirectoryScope::Root;
+    }
+    BROAD_DIRECTORIES
+        .iter()
+        .find(|broad| canonical == Path::new(broad))
+        .map_or(DirectoryScope::Dedicated, |broad| {
+            DirectoryScope::Broad(broad)
+        })
+}
+
+/// The startup warning for a broad config directory (a fixed name of
+/// [`BROAD_DIRECTORIES`]).
+pub fn broad_warning(directory: &str) -> String {
+    format!(
+        "warning: fs-confine code=CONFIG_DIRECTORY_BROAD directory={directory}: every file \
+         beneath it that the process's user may read stays readable; keep the config in a \
+         directory of its own (such as /etc/ruster)"
+    )
 }
 
 /// One rule of the ruleset: what it grants beneath.
@@ -190,7 +258,8 @@ pub enum FsStep {
 pub enum Unconfined {
     /// The thread could list `/` after its confinement.
     Probe,
-    /// Fewer (or more) threads confined themselves than the process has.
+    /// The threads that confined themselves are not exactly the threads
+    /// of the process.
     Threads,
 }
 
@@ -203,6 +272,11 @@ pub enum FsFailure {
     /// Landlock is built in but not enabled (`EOPNOTSUPP`: not in the
     /// boot `lsm=` list).
     Disabled,
+    /// The Landlock calls are refused with `EPERM` (a supervisor's syscall
+    /// filter, a container runtime).
+    Blocked,
+    /// The config directory (as named or as resolved) is `/`.
+    ConfigDirectoryRoot,
     /// A step failed with this errno.
     Syscall { step: FsStep, errno: i32 },
     /// The router thread found no prepared ruleset.
@@ -217,9 +291,26 @@ pub enum FsFailure {
 }
 
 impl FsFailure {
-    /// Whether Landlock itself is missing (the hint to `--fs-confine off`).
-    pub const fn unavailable(self) -> bool {
-        matches!(self, Self::Unsupported | Self::Disabled)
+    /// The advice printed after the failure line, if any.
+    pub const fn hint(self) -> Option<&'static str> {
+        match self {
+            Self::Unsupported | Self::Disabled => Some(
+                "--fs-confine landlock needs Landlock (Linux 5.13 or newer with landlock in \
+                 /sys/kernel/security/lsm); --fs-confine off runs without filesystem \
+                 confinement",
+            ),
+            Self::Blocked => Some(
+                "the Landlock calls were refused (EPERM): allow landlock_create_ruleset, \
+                 landlock_add_rule, and landlock_restrict_self in the supervisor's syscall \
+                 filter, or --fs-confine off runs without filesystem confinement",
+            ),
+            Self::ConfigDirectoryRoot => Some(
+                "the config's directory is /, which would leave every file readable: keep the \
+                 config in a directory of its own (such as /etc/ruster), or --fs-confine off \
+                 runs without filesystem confinement",
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -229,6 +320,8 @@ impl fmt::Display for FsFailure {
         match self {
             Self::Unsupported => formatter.write_str("code=LANDLOCK_UNSUPPORTED"),
             Self::Disabled => formatter.write_str("code=LANDLOCK_DISABLED"),
+            Self::Blocked => formatter.write_str("code=LANDLOCK_BLOCKED"),
+            Self::ConfigDirectoryRoot => formatter.write_str("code=CONFIG_DIRECTORY_ROOT"),
             Self::Syscall { step, errno } => {
                 write!(formatter, "code={}/ERRNO_{errno}", token(step))
             }
@@ -241,11 +334,11 @@ impl fmt::Display for FsFailure {
     }
 }
 
-/// The process-wide check after the router thread confined itself:
-/// `confined` threads confined themselves and `/proc/self/task` lists
-/// `tasks`; they must be the same nonzero number.
-pub const fn check_threads(confined: u32, tasks: u32) -> Result<(), FsFailure> {
-    if tasks == 0 {
+/// The process-wide check after the router thread confined itself: the
+/// ids of the threads that confined themselves (`confined`) must be
+/// exactly the ids `/proc/self/task` lists (`tasks`, not empty).
+pub fn check_threads(confined: &BTreeSet<u32>, tasks: &BTreeSet<u32>) -> Result<(), FsFailure> {
+    if tasks.is_empty() {
         return Err(FsFailure::Unreadable);
     }
     if confined != tasks {
@@ -321,16 +414,16 @@ impl ObservableFields for FsState {
     target_pointer_width = "64"
 ))]
 pub mod linux {
+    use std::collections::BTreeSet;
     use std::fs::{self, File, OpenOptions};
     use std::os::fd::{AsFd, OwnedFd};
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::path::Path;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
 
     use super::{
-        check_threads, config_directory, handled_access, FsFailure, FsReport, FsStep, Grant,
-        Unconfined,
+        check_threads, classify_directory, config_directory, handled_access, handled_net_access,
+        DirectoryScope, FsFailure, FsReport, FsStep, Grant, Unconfined,
     };
 
     /// `O_PATH` (x86_64): a handle on the path only, no read access.
@@ -342,8 +435,9 @@ pub mod linux {
 
     /// The ruleset of the process, built once before any other thread.
     static PREPARED: OnceLock<Prepared> = OnceLock::new();
-    /// Threads that confined themselves with it.
-    static CONFINED: AtomicU32 = AtomicU32::new(0);
+    /// Ids of the threads that confined themselves with it (startup only;
+    /// never touched by the run loop).
+    static CONFINED: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
 
     /// A built ruleset and the `O_PATH` fds of its rules, which stay open
     /// as long as it does (see the module documentation: a held procfs
@@ -353,6 +447,7 @@ pub mod linux {
         _pins: Vec<OwnedFd>,
         abi: u32,
         rules: u32,
+        broad: Option<&'static str>,
     }
 
     fn open_path(grant: Grant, path: &Path, directory: bool) -> Result<OwnedFd, FsFailure> {
@@ -372,6 +467,29 @@ pub mod linux {
             })
     }
 
+    /// The scope of a config directory, refusing `/`. An unresolvable
+    /// directory is the open failure of `grant`.
+    fn scope(grant: Grant, directory: &Path) -> Result<Option<&'static str>, FsFailure> {
+        let canonical = fs::canonicalize(directory).map_err(|error| FsFailure::Syscall {
+            step: FsStep::Open(grant),
+            errno: error.raw_os_error().unwrap_or(0),
+        })?;
+        match classify_directory(&canonical) {
+            DirectoryScope::Root => Err(FsFailure::ConfigDirectoryRoot),
+            DirectoryScope::Broad(name) => Ok(Some(name)),
+            DirectoryScope::Dedicated => Ok(None),
+        }
+    }
+
+    /// The id of the calling thread (`/proc/thread-self` links to
+    /// `<pid>/task/<tid>`; reading a link is not a Landlock access).
+    fn own_tid() -> Result<u32, FsFailure> {
+        fs::read_link("/proc/thread-self")
+            .ok()
+            .and_then(|link| link.file_name()?.to_str()?.parse().ok())
+            .ok_or(FsFailure::Unreadable)
+    }
+
     /// `(device, inode)` of an `O_PATH` fd.
     fn identity(fd: &OwnedFd) -> Option<(u64, u64)> {
         let file = File::from(fd.try_clone().ok()?);
@@ -384,10 +502,18 @@ pub mod linux {
         /// command line). Fails with [`FsFailure::Unsupported`] or
         /// [`FsFailure::Disabled`] without Landlock.
         pub fn new(config: &Path) -> Result<Self, FsFailure> {
+            // `/` first: refused whatever the kernel offers.
+            let named_scope = scope(Grant::ConfigDirectory, &config_directory(config))?;
+            let resolved = fs::canonicalize(config).map_err(|error| FsFailure::Syscall {
+                step: FsStep::Open(Grant::ConfigTarget),
+                errno: error.raw_os_error().unwrap_or(0),
+            })?;
+            let target_scope = scope(Grant::ConfigTarget, &config_directory(&resolved))?;
             let abi = match sys::abi() {
                 Ok(abi) if abi >= 1 => abi,
                 Ok(_) | Err(sys::ENOSYS) => return Err(FsFailure::Unsupported),
                 Err(sys::EOPNOTSUPP) => return Err(FsFailure::Disabled),
+                Err(sys::EPERM) => return Err(FsFailure::Blocked),
                 Err(errno) => {
                     return Err(FsFailure::Syscall {
                         step: FsStep::Abi,
@@ -396,23 +522,23 @@ pub mod linux {
                 }
             };
             let handled = handled_access(abi);
-            let ruleset = sys::create_ruleset(handled).map_err(|errno| FsFailure::Syscall {
-                step: FsStep::Ruleset,
-                errno,
-            })?;
+            let ruleset =
+                sys::create_ruleset(handled, handled_net_access(abi)).map_err(|errno| {
+                    FsFailure::Syscall {
+                        step: FsStep::Ruleset,
+                        errno,
+                    }
+                })?;
             let mut prepared = Self {
                 ruleset,
                 _pins: Vec::new(),
                 abi,
                 rules: 0,
+                broad: named_scope.or(target_scope),
             };
             let directory = open_path(Grant::ConfigDirectory, &config_directory(config), true)?;
             let named = identity(&directory);
             prepared.add(Grant::ConfigDirectory, directory, handled)?;
-            let resolved = fs::canonicalize(config).map_err(|error| FsFailure::Syscall {
-                step: FsStep::Open(Grant::ConfigTarget),
-                errno: error.raw_os_error().unwrap_or(0),
-            })?;
             let target = open_path(Grant::ConfigTarget, &config_directory(&resolved), true)?;
             if named.is_none() || identity(&target) != named {
                 prepared.add(Grant::ConfigTarget, target, handled)?;
@@ -453,6 +579,12 @@ pub mod linux {
             self.rules
         }
 
+        /// The broad config directory ([`DirectoryScope::Broad`]) to warn
+        /// about, if any.
+        pub const fn broad(&self) -> Option<&'static str> {
+            self.broad
+        }
+
         /// Confines the calling thread (only) with the ruleset, then checks
         /// it: listing `/` must now fail with `EACCES`. Sets
         /// `no_new_privs` first (Landlock needs it without
@@ -483,16 +615,28 @@ pub mod linux {
         }
     }
 
-    /// Builds the process's ruleset for the config at `config`. Call it
-    /// once, on the only thread, before any thread runs
-    /// [`restrict_thread`].
-    pub fn prepare_process(config: &Path) -> Result<(), FsFailure> {
+    /// Builds the process's ruleset for the config at `config` and returns
+    /// the broad config directory to warn about, if any. Call it once, on
+    /// the only thread, before any thread runs [`restrict_thread`].
+    pub fn prepare_process(config: &Path) -> Result<Option<&'static str>, FsFailure> {
         let prepared = Prepared::new(config)?;
+        let broad = prepared.broad();
         // A second ruleset would be refused like an existing file.
         PREPARED.set(prepared).map_err(|_| FsFailure::Syscall {
             step: FsStep::Ruleset,
             errno: EEXIST,
-        })
+        })?;
+        Ok(broad)
+    }
+
+    /// Records the calling (confined) thread's id.
+    fn record() -> Result<(), FsFailure> {
+        let tid = own_tid()?;
+        CONFINED
+            .lock()
+            .map_err(|_| FsFailure::Unreadable)?
+            .insert(tid);
+        Ok(())
     }
 
     /// The prologue step of a thread: confines the calling thread with the
@@ -503,8 +647,7 @@ pub mod linux {
             return Ok(());
         };
         prepared.restrict_thread()?;
-        CONFINED.fetch_add(1, Ordering::AcqRel);
-        Ok(())
+        record()
     }
 
     /// The router thread's step after its privilege drop: confines itself,
@@ -513,17 +656,24 @@ pub mod linux {
     pub fn restrict_process() -> Result<FsReport, FsFailure> {
         let prepared = PREPARED.get().ok_or(FsFailure::NotPrepared)?;
         prepared.restrict_thread()?;
-        let confined = CONFINED.fetch_add(1, Ordering::AcqRel).saturating_add(1);
-        let mut tasks = 0_u32;
+        record()?;
+        let mut tasks = BTreeSet::new();
         for task in fs::read_dir("/proc/self/task").map_err(|_| FsFailure::Unreadable)? {
-            task.map_err(|_| FsFailure::Unreadable)?;
-            tasks = tasks.saturating_add(1);
+            let task = task.map_err(|_| FsFailure::Unreadable)?;
+            let tid = task
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse().ok())
+                .ok_or(FsFailure::Unreadable)?;
+            tasks.insert(tid);
         }
-        check_threads(confined, tasks)?;
+        let confined = CONFINED.lock().map_err(|_| FsFailure::Unreadable)?.clone();
+        check_threads(&confined, &tasks)?;
+        let threads = u32::try_from(tasks.len()).unwrap_or(u32::MAX);
         Ok(FsReport {
             abi: prepared.abi(),
             rules: prepared.rules(),
-            threads: tasks,
+            threads,
         })
     }
 
@@ -543,13 +693,15 @@ pub mod linux {
         const LANDLOCK_RULE_PATH_BENEATH: c_long = 1;
         pub const ENOSYS: i32 = 38;
         pub const EOPNOTSUPP: i32 = 95;
+        pub const EPERM: i32 = 1;
 
-        /// `struct landlock_ruleset_attr` up to `handled_access_fs` (the
-        /// kernel accepts a prefix of the struct: nothing network or
-        /// scope related is handled).
+        /// `struct landlock_ruleset_attr` up to `handled_access_net` (the
+        /// kernel accepts a prefix of the struct; nothing scope related is
+        /// handled). Only the first field is passed before ABI 4.
         #[repr(C)]
         struct RulesetAttr {
             handled_access_fs: u64,
+            handled_access_net: u64,
         }
 
         /// `struct landlock_path_beneath_attr` (packed: 12 bytes).
@@ -559,7 +711,7 @@ pub mod linux {
             parent_fd: i32,
         }
 
-        const _: () = assert!(std::mem::size_of::<RulesetAttr>() == 8);
+        const _: () = assert!(std::mem::size_of::<RulesetAttr>() == 16);
         const _: () = assert!(std::mem::size_of::<PathBeneathAttr>() == 12);
 
         extern "C" {
@@ -598,18 +750,28 @@ pub mod linux {
             Ok(u32::try_from(value).unwrap_or(0))
         }
 
-        /// A new ruleset handling `handled` (close-on-exec fd).
-        pub fn create_ruleset(handled: u64) -> Result<OwnedFd, i32> {
+        /// A new ruleset handling `handled` filesystem and `net` network
+        /// rights (close-on-exec fd).
+        pub fn create_ruleset(handled: u64, net: u64) -> Result<OwnedFd, i32> {
             let attr = RulesetAttr {
                 handled_access_fs: handled,
+                handled_access_net: net,
             };
-            // SAFETY: `attr` is a live, initialized `repr(C)` struct of the
-            // size passed; the kernel only reads it during the call.
+            // A kernel before ABI 4 refuses a nonzero byte past the struct
+            // it knows: pass only the filesystem field then.
+            let size = if net == 0 {
+                std::mem::size_of::<u64>()
+            } else {
+                std::mem::size_of::<RulesetAttr>()
+            };
+            // SAFETY: `attr` is a live, initialized `repr(C)` struct at least
+            // `size` bytes long; the kernel only reads those bytes during
+            // the call.
             let fd = checked(unsafe {
                 syscall(
                     SYS_LANDLOCK_CREATE_RULESET,
                     (&raw const attr).cast::<u8>(),
-                    std::mem::size_of::<RulesetAttr>() as c_long,
+                    size as c_long,
                     0_i64,
                 )
             })?;
