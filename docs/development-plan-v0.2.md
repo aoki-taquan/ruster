@@ -71,9 +71,11 @@ workspaceは12 crateからなる。data-planeとI/Oのlibrary crate（`ruster-co
   `spec_git_sha` `5c57f41`）とpin済みdigest/matrix/承認marker test（BENCH-007〜009）
 - real-I/O scaffold（productionではない）
   - `ruster-io-afpacket`: checked TPACKET_V3 mapping、fixed-frame TX engine、persistent
-    RX block engine、core `PacketIo`のcopy backend（AFPKT-001〜007、IO-012）。証跡は
-    scripted syscall上のconformanceだけで、public live constructor、TX completion
-    scheduling、poll、netns/実NIC E2Eは無い
+    RX block engine、core `PacketIo`のcopy backend（AFPKT-001〜007、IO-012）、AP3のpublic
+    live adapter `AfPacketIo`（failure-atomic open、TX completion schedulingと分類済み借りkick
+    retry、TX ringから直接貸すgenerated frame、quiescence、poll idle wait、`BackendStats`
+    （OBS-028）、drain。AFPKT-008〜014）とnetns/veth privileged smoke。debug/fallback backendで、
+    `ruster run`からの選択（AFPKT-015）と実NIC E2Eは無い
   - `ruster-io-xdp`/`ruster-io-xdp-native`: AF_XDP ownership model、safe native profile
     （`ruster-io-xdp::native_profile`、configと共有）、native ABI/ring scaffold、private syscall
     RAII seam（XDP rows）、一socketのnative session（X00C）、XDP program/`bpf_link`
@@ -104,7 +106,7 @@ partially met 3、not met 1（X05）である。M2b（multi-queue S12、zero-cop
 
 ### Partialまたは欠落
 
-- 実NIC（hardware）で検証したproduction backendは無い。AF_PACKETはscripted syscall上のcopy backendまで、AF_XDPは
+- 実NIC（hardware）で検証したproduction backendは無い。AF_PACKETはnetns/veth smokeまでのlive adapter（AP3、`ruster run`未接続のAFPKT-015）、AF_XDPは
   M2aのcopy-mode router（一socketのsession、XDP program attach、RX/Fill engine、same-frame
   TX/Completion、generated frame、複数portのcore `PacketIo` adapter、configからのport構築と
   `ruster run`の起動/停止、reload、health/stall、link event、起動retry）までで、multi-queue worker
@@ -194,7 +196,7 @@ partially met 3、not met 1（X05）である。M2b（multi-queue S12、zero-cop
   operator runbook（[`runbook-m2.md`](runbook-m2.md)）の確定、ledgerのM2a判定。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
-  ringのsaturationはM2 S6でAF_XDPの`BackendStats`へ接続した（OBS-018。AF_PACKETはOBS-028、OBS-017はdeferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
+  ringのsaturationはM2 S6でAF_XDPの`BackendStats`へ接続した（OBS-018。AF_PACKETはAP3でOBS-028、OBS-017はdeferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
 - optional serviceを表すcomposition seamが無く、M1はUDP/TCP NAT44+FWを必須とする。
 - `ruster run-sim`によるfrozen benchmark spec SHAの表示（R12 acceptance）が無い。spec SHA自体は
   M1 release evidenceへ固定済み。
@@ -720,7 +722,10 @@ incremental/full checksum一致、generation/clock/capacityを含む。
 - capability不足は成功扱いのsilent skipにせず、明示されたjob policyに従う
 
 XDP attachをvethで検証するjobはX04が別workflow（`xdp-veth.yml`、M2 S11）として所有し、
-AF_PACKETの`netns.yml`を並列編集しない。`XDP veth` jobは最初のprobe（`scripts/priv-xdp-probe.sh`）が
+AF_PACKETの`netns.yml`を並列編集しない。AP3のAF_PACKET adapter smoke
+（`scripts/priv-afpacket-smoke.sh`、AFPKT-014）は当面専用workflowを作らず、同じhosted runnerの
+`XDP veth` jobの一stepとして実行する（`netns.yml`の分離は`ruster run`のAF_PACKET E2E、AFPKT-015と
+合わせて再検討）。`XDP veth` jobは最初のprobe（`scripts/priv-xdp-probe.sh`）が
 AF_XDP/veth/netnsの不足をtypedなfailureにし、smokeは`RUSTER_REQUIRE_PRIV=1`でskip経路を持たない。
 hosted runnerのkernel一つだけを検証し（5.9〜6.xの網羅はXDP-062）、required checkではない
 （owner決定2e「当面は任意のまま」）。
