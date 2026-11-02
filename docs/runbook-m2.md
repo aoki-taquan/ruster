@@ -1342,6 +1342,51 @@ reclaimed, by the timeout that ended them; they sum to `sessions_expired`).
 Many `sessions_expired_opening` with few `sessions_established` point to
 SYNs nobody completes, such as a scan or a spoofed SYN flood.
 
+Translated ICMPv4 errors (N4, NAT44-065). An ICMPv4 error from outside
+about an inside host's flow (Destination Unreachable, Time Exceeded,
+Parameter Problem; RFC 5508 REQ-4) is translated and forwarded to that host.
+Each path, that is each pair of inside host and quoted remote address, may
+receive at most `burst` of them at once and `rate-per-second` sustained:
+
+```toml
+[icmpv4-errors.translated]   # optional; these are the defaults
+rate-per-second = 100
+burst = 100
+```
+
+The budgets live in 4096 fixed buckets (32 KiB) chosen by a keyed hash of
+the pair, with the secret key of the current publication (it changes on
+every applied reload, which also empties the buckets). So a port sweep or
+a flood of forged errors that names remote R spends only the budget of the
+inside host's flows to R: the same host's Path MTU Discovery and traceroute
+toward other remotes, and every other host, keep theirs (two pairs share a
+bucket only by a 1-in-4096 chance that nobody without the key can aim at).
+The defaults never limit a traceroute (90 Time Exceeded at once), an mtr,
+or Path MTU Discovery. An error over the limit is dropped unchanged as
+`drop.NAT44_ICMPV4_TRANSLATED_RATE_LIMITED`; only errors that passed every
+other check (mapping, session, firewall, route) count, and a limited error
+never starts ARP. With the firewall on, such an error was already recorded
+in the audit as an allowed RELATED packet, like other drops after the
+firewall (an unresolved neighbor, for example). Both keys accept 1 to
+1000000; 0 or a larger value is refused as
+`stage=validate code=ICMPV4_ERROR_POLICY path=icmpv4-errors.translated`.
+There is no unlimited setting; `rate-per-second = 1000000` with
+`burst = 1000000` is effectively off. Errors that share one clock reading
+pass at most `burst` at a time, so keep `burst` at least
+`rate-per-second / 1000`. The table is part of the ICMPv4 error policy, so
+a change is `restart-required: ICMPV4_ERROR_POLICY`. Errors from inside
+hosts toward the outside (REQ-5) are not limited.
+
+A Fragmentation Needed whose Next-Hop MTU is 1 to 67 (below the IPv4
+minimum of 68, so no router sends it) is dropped in both directions as
+`drop.NAT44_ICMPV4_FRAG_NEEDED_MTU_INVALID` (NAT44-098). MTU 0, from routers
+older than RFC 1191, still passes.
+
+A rising `drop.NAT44_ICMPV4_TRANSLATED_RATE_LIMITED` means one inside host
+receives many errors from outside about one remote: a sweep or flood of
+forged errors, a peer that sends errors on every packet, or a very busy
+traceroute. Raise the limit only if a legitimate tool is being cut off.
+
 ## 12. Known limits
 
 - One AF_XDP socket and one RX/TX queue per port; no multi-queue or worker
@@ -1498,6 +1543,22 @@ SYNs nobody completes, such as a scan or a spoofed SYN flood.
   victim-independent keyed search, and an expired port is reused only by
   its own returning endpoint or by a keyed takeover when the pool is
   full. Like every NAT change, the apply flushes the NAT state.
+- Translated ICMPv4 errors (NAT44-065, NAT44-099). The per-path limit
+  bounds how many forged errors reach an inside host about one remote
+  (a host with flows to many remotes can receive that many budgets); it
+  does not slow a
+  sweep looking for live ports, and one forged Fragmentation Needed with a
+  plausible MTU (68 or more) that hits a live flow still reaches the host,
+  which decides whether to lower its path MTU (modern stacks check it,
+  RFC 5927). The router does not track TCP sequence numbers, so it cannot
+  check that a quoted TCP segment is in the window. A flood naming one of a
+  host's flows also uses up that path's budget, so legitimate errors about
+  the same remote can be dropped for the duration. There is no separate
+  budget for Fragmentation Needed: a forged Fragmentation Needed is exactly
+  what a sweep sends, so a priority lane would hand the attack its own
+  budget. If inside hosts do not need PMTUD or
+  traceroute through the NAT, `icmpv4-errors = "external-only"` or
+  `"disabled"` (per protocol) remain the stricter options.
 - Per-host mapping quota (`[nat44.udp]`/`[nat44.tcp]` `mappings-per-host`,
   N3, NAT44-092; default `0`, no limit). Without it an inside host can
   fill the pool (it opens mappings from many source ports) and so steer

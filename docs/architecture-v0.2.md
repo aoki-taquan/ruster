@@ -1111,8 +1111,8 @@ Protocol Unreachable（3/2）とPort Unreachable（3/3）はdestination host自�
 NAT44-066）。これが無いとoff-pathのoutside hostが自分のaddressのまま（BCP38は効かない）public
 port全域をsweepし、inside UDP flowへhard errorを注入できます。中継routerが正当に送る他の
 type（Type 3 code 0/1/4/6/7/9–15、Time Exceeded、Parameter Problem）は同じsweepでlive mappingに
-当たり得ます。これはREQ-4に従う残余riskで、rate limitやvalidationはNAT44-065としてdeferred、
-securityを優先するなら`external-only`/`disabled`を選べます。Type/Codeと引用protocolの
+当たり得ます。これはREQ-4に従う残余riskで、届く数は下の「translated error rate limit」
+（NAT44-065）が(inside host, 引用remote)ごとに抑え、securityを優先するなら`external-only`/`disabled`を選べます。Type/Codeと引用protocolの
 peekはouter IPv4 Total Length内だけで行い、link paddingをcandidate bytesとして扱いません。
 対象はouter IHL=5、nonfragment、TTL>1、valid ICMP checksumと、validなIPv4 headerを含む
 引用です。引用datagramはreserved flagをfragment判定からmaskした上で
@@ -1153,10 +1153,60 @@ translated internal addressを通常LPMし、inside egressと通常neighbor auth
 NAT state commitは無く、backend TX rejectでもstateは不変です。
 
 RFC 1191およびRFC 5508 §7.1.2に関係する受信Type 3/Code 4として、unused 16 bitsとNext-Hop
-MTU 16 bitsは解釈・clampせず32 bitsすべてを保存します。MTU 0、68、1500、65535も同じです。
+MTU 16 bitsはclampせず32 bitsすべてを保存します。MTU 0、68、1500、65535も同じです。例外は
+Next-Hop MTU 1〜67で、IPv4の最小MTU 68（RFC 791）未満はどのrouterも報告し得ない
+（RFC 1191 §4）ので、ICMP checksum検証の直後に両方向で`NAT44_ICMPV4_FRAG_NEEDED_MTU_INVALID`
+としてdropします（NAT44-098）。0はRFC 1191以前のrouter（§5）として有効です。
 local forwarding MTUとの比較、PMTU cache更新、MTU 0のplateau推定、local MTU超過時の
 Type 3/Code 4生成はまだありません。DF=0 packetの必要なfragmentation、ICMP query NAT、
 RFC 4884 full supportもdeferredです。
+
+### translated error rate limit（NAT44-065）
+
+RFC 5508 REQ-10 fはRFC 1812 §4.3.2.8のrate limitをRECOMMENDEDとします。§4.3.2.8は粒度を実装に
+任せ、timer-basedの例として「to a given source host」を挙げます。outsideからのerrorをinside host
+へ変換する経路（REQ-4）は、届け先のpath、つまり(inside host、引用remote address)ごとにtoken
+bucketで制限します。
+
+- 粒度: global（egressごと）ではsweepやfloodが全hostのPMTUD/tracerouteを枯渇させ、outer source
+  ごとではsource詐称（strict uRPFはoutsideへroutableなら通す）で無効になります。inside hostだけ
+  だと、remote Rを名乗るsweepがそのhostの他のremoteへのPMTUD/tracerouteまで止めます。(host,
+  remote)ごとなら、Rを名乗るfloodが使うのはそのhostのRへのflowの予算だけで、他のpathと他のhostは
+  影響を受けません（review L1）。代わりに一つのhostへ届く総数は、そのhostがlive flowを持つremote
+  の数だけ増えます（送れるのはlive flowに一致するerrorだけで、それ以外はlimiterの前に拒否）。
+- state: `Icmpv4ErrorRuntime`内の固定4096 bucket（各`u64`、32 KiB、inline。caller-backed storage
+  やstorage shapeは不変）。bucketは(host, remote)のSipHashで、keyはpublicationのsecret
+  resolution key（`ResolutionHashKey`）を専用domain（`Icmpv4TranslatedLimit`）で使います。どの
+  pairが同じbucketかは予測できず（衝突確率は1/4096）、keyを知らない者は被害者のbucketを共有する
+  pairを選べません。以前のaddress octetのXOR（review M1）は10.0.1.5と10.0.2.6のような/24を越える
+  衝突が公開・決定的でした。keyはactivationで入り、applyされたpublicationごとに
+  `commit_with_translated_limit_key`で入れ替わり、違うkeyなら全bucketを空にします（古い到着時刻が
+  無関係なpairへ移るため）。同じkeyなら保持します。keyを渡さない`Icmpv4ErrorRuntime::new`は公開の
+  固定keyです（testとbench用。production経路は常にsecretを渡す）。
+- bucket: GCRA（virtual scheduling形のtoken bucket）で、時刻を`now_ms × rate`へscaleしerror 1件を
+  1000 unitとするので全て整数です。一つのclock読み値ではburst件まで（実効rate ≤ burst × 1000/s）、
+  時刻の後退はbucketを満杯側に見せるだけ、scaleした時刻や次の到着時刻がoverflowするならerrorを
+  拒否し（review N1、fail closed）、無制限にはなりません。1 errorあたりkeyed hash 1回と1 bucketの
+  read/writeでscanもallocationもありません。
+- 順序: parse（MTU sanityを含む）、source、mapping/peer/session、firewall RELATED、routeの
+  read-only checkを全て通った後、neighbor resolutionの前です。拒否される他のerrorは予算を使わず、
+  制限されたerrorはARPを始めません。超過はbyte不変drop
+  `NAT44_ICMPV4_TRANSLATED_RATE_LIMITED`でNAT/firewall stateは不変です。firewallがあるとき、
+  このerrorはその前にRELATEDとしてauditでAllowと記録済みです（review N2。neighbor未解決など
+  firewall後の他のdropと同じ扱いで、auditはfirewallの判定でありdeliveryではない）。
+- Frag Neededの優先枠は設けません: 偽のFrag Neededこそsweepが使うtypeで、別枠にすると同じ攻撃に
+  別の予算を与えるだけです。PMTUDは(host, remote)の予算をtracerouteとだけ共有し、defaultでは
+  どちらも上限に届きません。
+- policy: `Icmpv4ErrorPolicy::with_translated_limit(rate_per_second, burst)`、default 100/s・
+  burst 100（traceroute、mtr、PMTUDは制限されない）、範囲1〜1000000で0や無制限設定は無し。
+  両方を1000000にするのが実質off（pathあたり同時刻100万件、毎秒100万件）です（review L2）。config
+  `[icmpv4-errors.translated]`で、ICMPv4 error policyの一部としてrestart-requiredです。
+- 範囲: generated-error runtimeを渡す`forward_batch_*_and_icmpv4_errors`系だけで、`ruster run`と
+  run-simのfull compositionは常に渡します。渡さないNAT-only APIは従来どおり無制限です。inside
+  realmからのerror（REQ-5/7）は制限しません。
+- 限界: 制限は届く数の上限で、sweepの探索を遅くはしません。一件の偽Frag NeededがPMTUを下げる
+  攻撃（RFC 5927 §7）は防げず、hostのvalidation（RFC 5927 §7、PLPMTUD）が根本対策です。TCP
+  sequence窓のvalidation等の見送りはNAT44-099です。
 
 ## NAT44 ICMPv4 inside-realm error translation
 
@@ -1200,8 +1250,9 @@ hairpinning offでは`NAT44_*_HAIRPIN_DISABLED`、引用sourceが`P`でなけれ
   （remote `P`）に届くのはREQ-7の経路だけで、外部からは従来どおり届きません（NAT44-047）。
 - 作業はpacketごとに固定です。directory lookupが最大3回（REQ-7）、firewall probeが最大2回、
   RFC 1624の固定数のword updateです。翻訳はforwardであり、routerが送信元となるICMPの生成では
-  ないため、RFC 1812 §4.3.2.8の生成rate limiter（既存のper-egress limiter）は適用しません
-  （NAT44-065）。inside hostは同じrateでUDP/TCPも送れます。
+  ないため、RFC 1812 §4.3.2.8の生成rate limiter（既存のper-egress limiter）は適用せず、
+  outsideからのerror向けのtranslated limit（NAT44-065）もinside realmからのerrorには適用
+  しません。inside hostは同じrateでUDP/TCPも送れます。
 
 **firewall view。** ICMP error自体はrule評価もstate作成もせず、RELATEDとしてだけ扱います。
 REQ-5の引用は送信者が受信したpacketそのもの（post-DNAT、ingress outside/egress inside、
