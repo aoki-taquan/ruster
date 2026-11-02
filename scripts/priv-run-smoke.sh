@@ -214,8 +214,14 @@
 #             second (tick.ticks), most waits time out (idle.timed_out) and
 #             none fails (idle.errors=0); then 5 single pings to the router,
 #             each after 2 s of idle, are answered with a median round trip
-#             of at most 1 ms (the pre-H9 worst-case wait alone) and none
-#             above 10 ms, each waking the wait (idle.woken grows); exit 0
+#             of at most 1 ms (the pre-H9 worst-case wait alone; a router
+#             whose wait a frame does not end answers after half of the
+#             10 ms wait on average) and none above 10 ms, the router
+#             receives them (rx.received grows by at least 5), and most
+#             woke the wait (idle.woken grows by at least 3: a frame that
+#             lands while the thread is between waits, in a tick or a stats
+#             block, is taken by the next tick without a wake, which a
+#             1500-ping run measured at about 0.2% of frames); exit 0
 #   stuck     stdout on a FIFO that is held open but never read: the stats
 #             blocks fill it (checked: queued bytes at capacity and not
 #             moving), yet SIGTERM still drains, detaches, and the process
@@ -949,6 +955,7 @@ phase_idle() {
     # First packet after idle: single pings, each after 2 s without
     # traffic, answered at once.
     woken_before=$(stat_in "$work/idle-b.block" idle.woken)
+    received_before=$(stat_in "$work/idle-b.block" rx.received)
     rtts=
     for n in 1 2 3 4 5; do
         sleep 2
@@ -966,13 +973,23 @@ phase_idle() {
     sleep 1.2
     latest_block idle
     woken_after=$(stat_in "$work/idle.block" idle.woken)
-    [ "$woken_after" -ge $((woken_before + 5)) ] ||
-        fail "idle: idle.woken $woken_before -> $woken_after over 5 pings"
+    received_after=$(stat_in "$work/idle.block" rx.received)
+    # Each Echo Request reaches the router (more frames, such as host A's
+    # ARP probes, may come too). Not each needs to end a wait: one that
+    # arrives while the thread is between waits is taken by the next tick
+    # without a wake. The round trips above are the property (a frame that
+    # did not end the wait would wait out up to 10 ms); a majority of
+    # wakes shows the frames, not the timeouts, ended the waits.
+    [ "$received_after" -ge $((received_before + 5)) ] ||
+        fail "idle: rx.received $received_before -> $received_after over 5 pings"
+    woken=$((woken_after - woken_before))
+    [ "$woken" -ge 3 ] ||
+        fail "idle: idle.woken $woken_before -> $woken_after over 5 pings (rx.received $received_before -> $received_after)"
     signal_ruster TERM
     wait_ruster
     [ "$status" -eq 0 ] || fail "idle: exit status $status after SIGTERM"
     assert_detached "the idle phase"
-    echo "priv_run_idle: idle for ${elapsed_ms} ms the router thread woke $wake_rate times/s (cpu $((cpu_pct_x10 / 10)).$((cpu_pct_x10 % 10))%), ticked $tick_rate times/s, $waits waits ($timed_out timed out) in $span ms; single pings after 2 s idle round trip$rtts ms (median $median); each woke the wait; exit 0, detached verified"
+    echo "priv_run_idle: idle for ${elapsed_ms} ms the router thread woke $wake_rate times/s (cpu $((cpu_pct_x10 / 10)).$((cpu_pct_x10 % 10))%), ticked $tick_rate times/s, $waits waits ($timed_out timed out) in $span ms; single pings after 2 s idle round trip$rtts ms (median $median); the waits woke $woken times (rx.received +$((received_after - received_before))); exit 0, detached verified"
 }
 
 # Host A's view of router-generated ICMPv4 (argv: mode target ttl marker
