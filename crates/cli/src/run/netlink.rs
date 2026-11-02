@@ -1,14 +1,24 @@
-//! Kernel IPv4 address count of one interface through one rtnetlink
-//! `RTM_GETADDR` dump (cold path, startup only).
+//! rtnetlink queries of `ruster run` (cold path only).
+//!
+//! - Kernel IPv4 address count of one interface through one `RTM_GETADDR`
+//!   dump (startup check). Unlike `SIOCGIFADDR`, which matches only
+//!   addresses whose label equals the device name, the dump sees every IPv4
+//!   address of the interface index, labelled or not.
+//! - Link facts of one interface index through one `RTM_GETLINK` request
+//!   ([`LinkProbe`]): MTU, `IFLA_NUM_RX_QUEUES`, and the `IFF_UP` /
+//!   `IFF_LOWER_UP` flags, in the caller's network namespace (a netlink
+//!   socket always talks to its own namespace, unlike a sysfs mount). Used
+//!   by the startup check and by the run-time link watch, which reuses one
+//!   socket and one preallocated buffer so a probe never allocates.
 //!
 //! The FFI is five C library calls (`socket`, `send`, `getsockname`,
 //! `recvfrom`, and `close` through [`std::os::fd::OwnedFd`]) in `sys`;
 //! everything else parses a byte slice and is unit tested. Every datagram
-//! must come from the kernel (`nl_pid == 0` from `recvfrom`), and every
-//! message of the dump must carry this socket's port id (`nlmsg_pid`), so
-//! no other process can answer for the kernel. Unlike `SIOCGIFADDR`, which matches only addresses
-//! whose label equals the device name, the dump sees every IPv4 address of
-//! the interface index, labelled or not.
+//! must come from the kernel (`nl_pid == 0` from `recvfrom`), every
+//! message of this request must carry this socket's port id (`nlmsg_pid`),
+//! so no other process can answer for the kernel, a datagram cut by the
+//! receive buffer (`MSG_TRUNC`) is refused, and an `NLMSG_DONE` with a
+//! negative status fails closed.
 
 use std::fmt;
 
@@ -22,6 +32,26 @@ const NLMSG_DONE: u16 = 3;
 const RTM_NEWADDR: u16 = 20;
 /// `RTM_GETADDR`.
 const RTM_GETADDR: u16 = 22;
+/// `RTM_NEWLINK`.
+const RTM_NEWLINK: u16 = 16;
+/// `RTM_GETLINK`.
+const RTM_GETLINK: u16 = 18;
+/// `sizeof(struct ifinfomsg)`.
+const IFINFOMSG_LEN: usize = 16;
+/// `IFLA_MTU` (`u32`).
+const IFLA_MTU: u16 = 4;
+/// `IFLA_NUM_RX_QUEUES` (`u32`, `dev->num_rx_queues`; absent without
+/// `CONFIG_RPS`).
+const IFLA_NUM_RX_QUEUES: u16 = 32;
+/// Attribute type bits (`NLA_TYPE_MASK`: without `NLA_F_NESTED` and
+/// `NLA_F_NET_BYTEORDER`).
+const NLA_TYPE_MASK: u16 = 0x3fff;
+/// `IFF_UP`: administratively up.
+const IFF_UP: u32 = 0x1;
+/// `IFF_LOWER_UP`: the driver reports carrier.
+const IFF_LOWER_UP: u32 = 0x1_0000;
+/// `ENODEV` as the kernel reports it in `NLMSG_ERROR`.
+pub const KERNEL_ENODEV: i32 = -19;
 /// `NLM_F_REQUEST`.
 const NLM_F_REQUEST: u16 = 0x1;
 /// `NLM_F_DUMP` (`NLM_F_ROOT | NLM_F_MATCH`).
@@ -59,6 +89,16 @@ pub enum NetlinkError {
     NotFromKernel,
     /// A message of the dump named another port id than this socket's.
     UnexpectedPort,
+    /// A link reply described another interface index than requested.
+    UnexpectedLink,
+}
+
+impl NetlinkError {
+    /// Whether the kernel said the interface index does not exist
+    /// (`ENODEV`): the device was removed from this namespace.
+    pub const fn is_no_device(self) -> bool {
+        matches!(self, Self::Kernel(KERNEL_ENODEV))
+    }
 }
 
 impl fmt::Display for NetlinkError {
@@ -173,40 +213,283 @@ pub fn parse_chunk(
     Ok(chunk)
 }
 
+/// Link facts of one interface from an `RTM_NEWLINK` reply.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinkFacts {
+    /// `IFLA_MTU`.
+    pub mtu: u32,
+    /// `IFLA_NUM_RX_QUEUES` (`dev->num_rx_queues`, the allocated RX queue
+    /// count, never below the active one); `None` if the kernel omitted it.
+    pub rx_queues: Option<u32>,
+    /// `IFF_UP`.
+    pub admin_up: bool,
+    /// `IFF_LOWER_UP` (carrier).
+    pub lower_up: bool,
+}
+
+impl LinkFacts {
+    /// Up and with carrier: frames can pass.
+    pub const fn is_up(self) -> bool {
+        self.admin_up && self.lower_up
+    }
+}
+
+/// The 32-byte `RTM_GETLINK` request for one interface index (not a
+/// dump: the kernel answers with exactly one `RTM_NEWLINK` or an
+/// `NLMSG_ERROR`, `ENODEV` if the index does not exist).
+pub fn link_request(sequence: u32, ifindex: u32) -> [u8; HEADER_LEN + IFINFOMSG_LEN] {
+    let mut request = [0_u8; HEADER_LEN + IFINFOMSG_LEN];
+    let len = u32::try_from(request.len()).unwrap_or(u32::MAX);
+    request[0..4].copy_from_slice(&len.to_ne_bytes());
+    request[4..6].copy_from_slice(&RTM_GETLINK.to_ne_bytes());
+    request[6..8].copy_from_slice(&NLM_F_REQUEST.to_ne_bytes());
+    request[8..12].copy_from_slice(&sequence.to_ne_bytes());
+    // nlmsg_pid 0: addressed to the kernel. ifinfomsg: AF_UNSPEC, the
+    // index, no flag filter.
+    request[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&ifindex.to_ne_bytes());
+    request
+}
+
+/// Parses one datagram answering the `RTM_GETLINK` request `sequence` for
+/// `ifindex` on the socket with port id `port`. `Ok(None)` if the datagram
+/// holds no message of this request (a late answer to an earlier one).
+///
+/// Fails closed: a message of this request for another port id
+/// ([`NetlinkError::UnexpectedPort`]) or another index
+/// ([`NetlinkError::UnexpectedLink`]); an `NLMSG_ERROR` (including a bare
+/// acknowledgement, which a request without `NLM_F_ACK` never gets); an
+/// `NLMSG_DONE` (negative status as [`NetlinkError::Kernel`], otherwise
+/// malformed: a single request has no dump end); any other message type; a
+/// short header, `ifinfomsg`, or attribute; an attribute running past its
+/// message; a duplicated or wrongly sized `IFLA_MTU`/`IFLA_NUM_RX_QUEUES`;
+/// and a reply without `IFLA_MTU`.
+pub fn parse_link_reply(
+    datagram: &[u8],
+    sequence: u32,
+    port: u32,
+    ifindex: u32,
+) -> Result<Option<LinkFacts>, NetlinkError> {
+    let mut at = 0;
+    while at < datagram.len() {
+        let rest = &datagram[at..];
+        let len = u32_at(rest, 0).ok_or(NetlinkError::Malformed)? as usize;
+        if len < HEADER_LEN || len > rest.len() {
+            return Err(NetlinkError::Malformed);
+        }
+        let kind = u16_at(rest, 4).ok_or(NetlinkError::Malformed)?;
+        let seq = u32_at(rest, 8).ok_or(NetlinkError::Malformed)?;
+        let pid = u32_at(rest, 12).ok_or(NetlinkError::Malformed)?;
+        let message = &rest[..len];
+        if seq == sequence {
+            if pid != port {
+                return Err(NetlinkError::UnexpectedPort);
+            }
+            return match kind {
+                NLMSG_ERROR => {
+                    let error = u32_at(message, HEADER_LEN).ok_or(NetlinkError::Malformed)?;
+                    let error = i32::from_ne_bytes(error.to_ne_bytes());
+                    Err(if error == 0 {
+                        NetlinkError::Malformed
+                    } else {
+                        NetlinkError::Kernel(error)
+                    })
+                }
+                NLMSG_DONE => {
+                    let status = u32_at(message, HEADER_LEN)
+                        .map(|status| i32::from_ne_bytes(status.to_ne_bytes()));
+                    Err(match status {
+                        Some(status) if status < 0 => NetlinkError::Kernel(status),
+                        _ => NetlinkError::Malformed,
+                    })
+                }
+                RTM_NEWLINK => parse_link(message, ifindex).map(Some),
+                _ => Err(NetlinkError::Malformed),
+            };
+        }
+        let advance = len.div_ceil(4) * 4;
+        if advance >= rest.len() {
+            break;
+        }
+        at += advance;
+    }
+    Ok(None)
+}
+
+/// One `RTM_NEWLINK` message: `ifinfomsg`, then attributes.
+fn parse_link(message: &[u8], ifindex: u32) -> Result<LinkFacts, NetlinkError> {
+    if message.len() < HEADER_LEN + IFINFOMSG_LEN {
+        return Err(NetlinkError::Malformed);
+    }
+    let index = u32_at(message, HEADER_LEN + 4).ok_or(NetlinkError::Malformed)?;
+    if index != ifindex {
+        return Err(NetlinkError::UnexpectedLink);
+    }
+    let flags = u32_at(message, HEADER_LEN + 8).ok_or(NetlinkError::Malformed)?;
+    let mut mtu = None;
+    let mut rx_queues = None;
+    let mut at = HEADER_LEN + IFINFOMSG_LEN;
+    while at < message.len() {
+        let attr_len = usize::from(u16_at(message, at).ok_or(NetlinkError::Malformed)?);
+        let attr_kind = u16_at(message, at + 2).ok_or(NetlinkError::Malformed)? & NLA_TYPE_MASK;
+        if attr_len < 4 || at + attr_len > message.len() {
+            return Err(NetlinkError::Malformed);
+        }
+        let payload = &message[at + 4..at + attr_len];
+        let slot = match attr_kind {
+            IFLA_MTU => Some(&mut mtu),
+            IFLA_NUM_RX_QUEUES => Some(&mut rx_queues),
+            _ => None,
+        };
+        if let Some(slot) = slot {
+            let value: [u8; 4] = payload.try_into().map_err(|_| NetlinkError::Malformed)?;
+            if slot.replace(u32::from_ne_bytes(value)).is_some() {
+                return Err(NetlinkError::Malformed);
+            }
+        }
+        // NLA_ALIGN.
+        at += attr_len.div_ceil(4) * 4;
+    }
+    Ok(LinkFacts {
+        mtu: mtu.ok_or(NetlinkError::Malformed)?,
+        rx_queues,
+        admin_up: flags & IFF_UP != 0,
+        lower_up: flags & IFF_LOWER_UP != 0,
+    })
+}
+
+/// Datagrams read per link query before giving up: earlier queries' late
+/// answers are skipped by sequence, and the kernel answers a request while
+/// handling the `send`, so a few suffice.
+#[cfg(target_os = "linux")]
+const LINK_DATAGRAMS: u32 = 8;
+
+/// One reusable `NETLINK_ROUTE` socket and receive buffer for link
+/// queries. Opening allocates the buffer once; [`Self::query`] performs a
+/// `send` and non-blocking `recvfrom` calls only, never an allocation.
+#[cfg(target_os = "linux")]
+pub struct LinkProbe {
+    socket: sys::RouteSocket,
+    buffer: Vec<u8>,
+    port: Option<u32>,
+    sequence: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl LinkProbe {
+    /// Opens the socket and connects it to the kernel (`nl_pid` 0).
+    pub fn open() -> Result<Self, NetlinkError> {
+        let socket = sys::RouteSocket::open()?;
+        socket.connect_kernel()?;
+        Ok(Self {
+            socket,
+            buffer: vec![0_u8; RECEIVE_BUFFER],
+            port: None,
+            sequence: 0,
+        })
+    }
+
+    fn next_sequence(&mut self) -> u32 {
+        self.sequence = self.sequence.wrapping_add(1).max(1);
+        self.sequence
+    }
+
+    /// Kernel IPv4 addresses of `ifindex`, through one `RTM_GETADDR` dump
+    /// on the reused socket and buffer (no allocation; non-blocking
+    /// receives: the kernel queues each next dump chunk while handing out
+    /// the previous one). A dump that raced a change is retried at most
+    /// [`DUMP_ATTEMPTS`] times.
+    pub fn ipv4_addresses(&mut self, ifindex: u32) -> Result<u32, NetlinkError> {
+        for _ in 0..DUMP_ATTEMPTS {
+            let sequence = self.next_sequence();
+            if let Some(total) = dump_once(&self.socket, &mut self.buffer, sequence, true, ifindex)?
+            {
+                return Ok(total);
+            }
+        }
+        Err(NetlinkError::Interrupted)
+    }
+
+    /// Link facts of `ifindex` in this socket's (the caller's) network
+    /// namespace. `ENODEV` ([`NetlinkError::is_no_device`]) means the index
+    /// is gone. The receive never blocks: the kernel queues its answer
+    /// while handling the `send`, so an empty queue (`EAGAIN`) is an error
+    /// of this query.
+    pub fn query(&mut self, ifindex: u32) -> Result<LinkFacts, NetlinkError> {
+        let sequence = self.next_sequence();
+        self.socket.send(&link_request(sequence, ifindex))?;
+        let port = match self.port {
+            Some(port) => port,
+            None => {
+                let port = self.socket.port_id()?;
+                self.port = Some(port);
+                port
+            }
+        };
+        for _ in 0..LINK_DATAGRAMS {
+            let received = self.socket.receive(&mut self.buffer, true)?;
+            if received == 0 {
+                return Err(NetlinkError::EndOfStream);
+            }
+            if received > self.buffer.len() {
+                return Err(NetlinkError::Truncated);
+            }
+            if let Some(facts) =
+                parse_link_reply(&self.buffer[..received], sequence, port, ifindex)?
+            {
+                return Ok(facts);
+            }
+        }
+        Err(NetlinkError::EndOfStream)
+    }
+}
+
 /// Counts the kernel IPv4 addresses of `ifindex` in the caller's network
 /// namespace, retrying a dump that raced a change at most
 /// [`DUMP_ATTEMPTS`] times.
 #[cfg(target_os = "linux")]
 pub fn ipv4_address_count(ifindex: u32) -> Result<u32, NetlinkError> {
     let mut buffer = vec![0_u8; RECEIVE_BUFFER];
-    for attempt in 0..DUMP_ATTEMPTS {
+    let mut sequence = 0;
+    for _ in 0..DUMP_ATTEMPTS {
         let socket = sys::RouteSocket::open()?;
-        let sequence = attempt + 1;
-        socket.send(&dump_request(sequence))?;
-        // The send auto-bound the socket; its port id names our replies.
-        let port = socket.port_id()?;
-        let mut total = 0_u32;
-        let mut interrupted = false;
-        loop {
-            let received = socket.receive(&mut buffer)?;
-            if received == 0 {
-                return Err(NetlinkError::EndOfStream);
-            }
-            if received > buffer.len() {
-                return Err(NetlinkError::Truncated);
-            }
-            let chunk = parse_chunk(&buffer[..received], sequence, port, ifindex)?;
-            total = total.saturating_add(chunk.addresses);
-            interrupted |= chunk.interrupted;
-            if chunk.done {
-                break;
-            }
-        }
-        if !interrupted {
+        sequence += 1;
+        if let Some(total) = dump_once(&socket, &mut buffer, sequence, false, ifindex)? {
             return Ok(total);
         }
     }
     Err(NetlinkError::Interrupted)
+}
+
+/// One `RTM_GETADDR` dump on `socket`: `Ok(None)` if it raced a change
+/// (`NLM_F_DUMP_INTR`). Messages of other sequences are skipped.
+#[cfg(target_os = "linux")]
+fn dump_once(
+    socket: &sys::RouteSocket,
+    buffer: &mut [u8],
+    sequence: u32,
+    nonblocking: bool,
+    ifindex: u32,
+) -> Result<Option<u32>, NetlinkError> {
+    socket.send(&dump_request(sequence))?;
+    // The send (or connect) bound the socket; its port id names our replies.
+    let port = socket.port_id()?;
+    let mut total = 0_u32;
+    let mut interrupted = false;
+    loop {
+        let received = socket.receive(buffer, nonblocking)?;
+        if received == 0 {
+            return Err(NetlinkError::EndOfStream);
+        }
+        if received > buffer.len() {
+            return Err(NetlinkError::Truncated);
+        }
+        let chunk = parse_chunk(&buffer[..received], sequence, port, ifindex)?;
+        total = total.saturating_add(chunk.addresses);
+        interrupted |= chunk.interrupted;
+        if chunk.done {
+            return Ok((!interrupted).then_some(total));
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -223,6 +506,8 @@ mod sys {
     const NETLINK_ROUTE: c_int = 0;
     /// `MSG_TRUNC` on receive: return the real datagram length.
     const MSG_TRUNC: c_int = 0x20;
+    /// `MSG_DONTWAIT`: fail with `EAGAIN` instead of blocking.
+    const MSG_DONTWAIT: c_int = 0x40;
     const EINTR: i32 = 4;
     const AF_NETLINK_FAMILY: u16 = 16;
 
@@ -249,6 +534,8 @@ mod sys {
         fn socket(domain: c_int, kind: c_int, protocol: c_int) -> c_int;
         fn send(fd: c_int, buffer: *const c_void, len: usize, flags: c_int) -> isize;
         fn getsockname(fd: c_int, address: *mut c_void, len: *mut u32) -> c_int;
+        // `int connect(int, const struct sockaddr *, socklen_t)`.
+        fn connect(fd: c_int, address: *const c_void, len: u32) -> c_int;
         fn recvfrom(
             fd: c_int,
             buffer: *mut c_void,
@@ -284,8 +571,33 @@ mod sys {
             })
         }
 
+        /// Connects the socket to the kernel (`nl_pid` 0, no groups), so
+        /// its default destination is fixed to the kernel for its whole
+        /// life (the long-lived link watch socket).
+        pub fn connect_kernel(&self) -> Result<(), NetlinkError> {
+            let address = SockAddrNl {
+                family: AF_NETLINK_FAMILY,
+                ..SockAddrNl::default()
+            };
+            // SAFETY: `address` is a live, initialized 12-byte `repr(C)`
+            // `sockaddr_nl` that the call only reads, and `SOCKADDR_NL_LEN`
+            // is its size; the fd is open (owned by `self`).
+            let result = unsafe {
+                connect(
+                    self.fd.as_raw_fd(),
+                    (&raw const address).cast(),
+                    SOCKADDR_NL_LEN,
+                )
+            };
+            if result != 0 {
+                return Err(last_errno());
+            }
+            Ok(())
+        }
+
         /// Sends one request datagram (to the kernel: the socket is
-        /// unconnected and unbound, which netlink addresses to pid 0).
+        /// unconnected and unbound, which netlink addresses to pid 0, or
+        /// connected to pid 0).
         pub fn send(&self, request: &[u8]) -> Result<(), NetlinkError> {
             loop {
                 // SAFETY: `request` is a live, initialized slice of
@@ -335,8 +647,14 @@ mod sys {
 
         /// Receives one datagram into `buffer` and returns its full length
         /// (`MSG_TRUNC`), which exceeds `buffer.len()` if it was cut. A
-        /// datagram from anyone but the kernel is refused.
-        pub fn receive(&self, buffer: &mut [u8]) -> Result<usize, NetlinkError> {
+        /// datagram from anyone but the kernel is refused. `nonblocking`
+        /// adds `MSG_DONTWAIT` (an empty queue is `Errno(EAGAIN)`).
+        pub fn receive(&self, buffer: &mut [u8], nonblocking: bool) -> Result<usize, NetlinkError> {
+            let flags = if nonblocking {
+                MSG_TRUNC | MSG_DONTWAIT
+            } else {
+                MSG_TRUNC
+            };
             loop {
                 let mut address = SockAddrNl::default();
                 let mut len = SOCKADDR_NL_LEN;
@@ -350,7 +668,7 @@ mod sys {
                         self.fd.as_raw_fd(),
                         buffer.as_mut_ptr().cast(),
                         buffer.len(),
-                        MSG_TRUNC,
+                        flags,
                         (&raw mut address).cast(),
                         &raw mut len,
                     )
@@ -508,6 +826,201 @@ mod tests {
         // Another sequence is skipped whatever its port id.
         let other = message_for(PORT + 1, RTM_NEWADDR, 0x2, 8, &[2, 0, 0, 0, 5, 0, 0, 0]);
         assert_eq!(parse_chunk(&other, 7, PORT, 5), Ok(Chunk::default()));
+    }
+
+    fn attribute(kind: u16, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&u16::try_from(4 + payload.len()).unwrap().to_ne_bytes());
+        bytes.extend_from_slice(&kind.to_ne_bytes());
+        bytes.extend_from_slice(payload);
+        while bytes.len() % 4 != 0 {
+            bytes.push(0);
+        }
+        bytes
+    }
+
+    fn ifinfo(index: u32, flags: u32) -> Vec<u8> {
+        let mut payload = vec![0, 0, 1, 0];
+        payload.extend_from_slice(&index.to_ne_bytes());
+        payload.extend_from_slice(&flags.to_ne_bytes());
+        payload.extend_from_slice(&0_u32.to_ne_bytes());
+        payload
+    }
+
+    fn link(index: u32, flags: u32, attributes: &[Vec<u8>]) -> Vec<u8> {
+        let mut payload = ifinfo(index, flags);
+        // IFLA_IFNAME and a nested attribute that is skipped.
+        payload.extend(attribute(3, b"ra\0"));
+        payload.extend(attribute(0x8000 | 18, &attribute(1, b"veth\0")));
+        for attribute in attributes {
+            payload.extend_from_slice(attribute);
+        }
+        message(RTM_NEWLINK, 0, 7, &payload)
+    }
+
+    const UP: u32 = IFF_UP | 0x40 | IFF_LOWER_UP;
+
+    #[test]
+    fn link_request_names_one_index() {
+        let request = link_request(9, 0x0102_0304);
+        assert_eq!(&request[0..4], &32_u32.to_ne_bytes());
+        assert_eq!(&request[4..6], &18_u16.to_ne_bytes());
+        assert_eq!(&request[6..8], &1_u16.to_ne_bytes(), "no dump, no ack");
+        assert_eq!(&request[8..12], &9_u32.to_ne_bytes());
+        assert_eq!(&request[12..16], &[0; 4], "to the kernel");
+        assert_eq!(&request[16..20], &[0; 4], "AF_UNSPEC");
+        assert_eq!(&request[20..24], &0x0102_0304_u32.to_ne_bytes());
+        assert_eq!(&request[24..], &[0; 8]);
+    }
+
+    #[test]
+    fn link_replies_parse_mtu_queues_and_state() {
+        let mtu = attribute(IFLA_MTU, &1500_u32.to_ne_bytes());
+        let queues = attribute(IFLA_NUM_RX_QUEUES, &4_u32.to_ne_bytes());
+        let reply = link(5, UP, &[mtu.clone(), queues.clone()]);
+        assert_eq!(
+            parse_link_reply(&reply, 7, PORT, 5),
+            Ok(Some(LinkFacts {
+                mtu: 1500,
+                rx_queues: Some(4),
+                admin_up: true,
+                lower_up: true,
+            }))
+        );
+        // Administratively up without carrier, and down: not up.
+        let no_carrier = parse_link_reply(&link(5, IFF_UP, std::slice::from_ref(&mtu)), 7, PORT, 5)
+            .expect("parsed")
+            .expect("facts");
+        assert!(no_carrier.admin_up && !no_carrier.lower_up && !no_carrier.is_up());
+        assert_eq!(no_carrier.rx_queues, None, "CONFIG_RPS off");
+        let down = parse_link_reply(&link(5, 0, std::slice::from_ref(&mtu)), 7, PORT, 5)
+            .expect("parsed")
+            .expect("facts");
+        assert!(!down.is_up());
+        // A late answer of an earlier request is skipped, also when
+        // followed by this one in the same datagram.
+        let mut late = link(5, UP, std::slice::from_ref(&mtu));
+        late[8..12].copy_from_slice(&6_u32.to_ne_bytes());
+        assert_eq!(parse_link_reply(&late, 7, PORT, 5), Ok(None));
+        late.extend(reply.clone());
+        assert!(parse_link_reply(&late, 7, PORT, 5).expect("ok").is_some());
+        assert_eq!(parse_link_reply(&[], 7, PORT, 5), Ok(None));
+    }
+
+    #[test]
+    fn hostile_link_replies_fail_closed() {
+        let mtu = attribute(IFLA_MTU, &1500_u32.to_ne_bytes());
+        // Removed device.
+        let enodev = message(NLMSG_ERROR, 0, 7, &(-19_i32).to_ne_bytes());
+        let error = parse_link_reply(&enodev, 7, PORT, 5).expect_err("error");
+        assert!(error.is_no_device());
+        assert!(!NetlinkError::Kernel(-1).is_no_device());
+        // A bare ack, a DONE (with and without a negative status), and an
+        // unrelated message type of this request.
+        let ack = message(NLMSG_ERROR, 0, 7, &0_i32.to_ne_bytes());
+        assert_eq!(
+            parse_link_reply(&ack, 7, PORT, 5),
+            Err(NetlinkError::Malformed)
+        );
+        let done = message(NLMSG_DONE, 0x2, 7, &(-4_i32).to_ne_bytes());
+        assert_eq!(
+            parse_link_reply(&done, 7, PORT, 5),
+            Err(NetlinkError::Kernel(-4))
+        );
+        let done = message(NLMSG_DONE, 0x2, 7, &0_i32.to_ne_bytes());
+        assert_eq!(
+            parse_link_reply(&done, 7, PORT, 5),
+            Err(NetlinkError::Malformed)
+        );
+        // Another message type, even one shaped exactly like a valid link
+        // reply, is never read as link facts.
+        let mut address = link(5, UP, std::slice::from_ref(&mtu));
+        address[4..6].copy_from_slice(&RTM_NEWADDR.to_ne_bytes());
+        assert_eq!(
+            parse_link_reply(&address, 7, PORT, 5),
+            Err(NetlinkError::Malformed)
+        );
+        // Another sender's port id, another index.
+        let mut foreign = link(5, UP, std::slice::from_ref(&mtu));
+        foreign[12..16].copy_from_slice(&(PORT + 1).to_ne_bytes());
+        assert_eq!(
+            parse_link_reply(&foreign, 7, PORT, 5),
+            Err(NetlinkError::UnexpectedPort)
+        );
+        assert_eq!(
+            parse_link_reply(&link(6, UP, std::slice::from_ref(&mtu)), 7, PORT, 5),
+            Err(NetlinkError::UnexpectedLink)
+        );
+        // Missing, duplicated, and wrongly sized attributes.
+        for attributes in [
+            vec![],
+            vec![mtu.clone(), mtu.clone()],
+            vec![attribute(IFLA_MTU, &1500_u16.to_ne_bytes())],
+            vec![attribute(IFLA_MTU, &[0; 8])],
+            vec![
+                mtu.clone(),
+                attribute(IFLA_NUM_RX_QUEUES, &1_u32.to_ne_bytes()),
+                attribute(IFLA_NUM_RX_QUEUES, &1_u32.to_ne_bytes()),
+            ],
+        ] {
+            assert_eq!(
+                parse_link_reply(&link(5, UP, &attributes), 7, PORT, 5),
+                Err(NetlinkError::Malformed),
+                "{attributes:?}"
+            );
+        }
+        // An attribute shorter than its header or running past its
+        // message; a message shorter than ifinfomsg; a cut header.
+        let mut short = link(5, UP, std::slice::from_ref(&mtu));
+        let at = short.len() - 8;
+        short[at..at + 2].copy_from_slice(&2_u16.to_ne_bytes());
+        assert_eq!(
+            parse_link_reply(&short, 7, PORT, 5),
+            Err(NetlinkError::Malformed)
+        );
+        let mut long = link(5, UP, std::slice::from_ref(&mtu));
+        let at = long.len() - 8;
+        long[at..at + 2].copy_from_slice(&64_u16.to_ne_bytes());
+        assert_eq!(
+            parse_link_reply(&long, 7, PORT, 5),
+            Err(NetlinkError::Malformed)
+        );
+        let tiny = message(RTM_NEWLINK, 0, 7, &[0; 8]);
+        assert_eq!(
+            parse_link_reply(&tiny, 7, PORT, 5),
+            Err(NetlinkError::Malformed)
+        );
+        let mut overlong = link(5, UP, &[mtu]);
+        overlong[0..4].copy_from_slice(&4096_u32.to_ne_bytes());
+        assert_eq!(
+            parse_link_reply(&overlong, 7, PORT, 5),
+            Err(NetlinkError::Malformed)
+        );
+        assert_eq!(
+            parse_link_reply(&[1, 2, 3], 7, PORT, 5),
+            Err(NetlinkError::Malformed)
+        );
+    }
+
+    /// The live query works unprivileged: loopback is ifindex 1 in every
+    /// network namespace, and a huge index does not exist.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_link_query_answers() {
+        let mut probe = LinkProbe::open().expect("socket");
+        let facts = probe.query(1).expect("loopback");
+        assert!(facts.mtu > 0);
+        assert!(probe
+            .query(i32::MAX as u32)
+            .expect_err("no such index")
+            .is_no_device());
+        // The socket is reused, also for address dumps (connected to the
+        // kernel); loopback's 127.0.0.1 may have been removed, so only
+        // success is asserted, and a missing index has no address.
+        assert_eq!(probe.query(1).map(|facts| facts.mtu), Ok(facts.mtu));
+        assert!(probe.ipv4_addresses(1).is_ok());
+        assert_eq!(probe.ipv4_addresses(i32::MAX as u32), Ok(0));
+        assert_eq!(probe.query(1).map(|facts| facts.mtu), Ok(facts.mtu));
     }
 
     /// The live dump works unprivileged in any network namespace; the

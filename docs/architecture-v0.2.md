@@ -1535,8 +1535,9 @@ quiescenceが崩れていればexit 1です。注入済みで未受信のframe�
 `final`に出ます。signal handlerは`signal(2)`で登録し、static `AtomicBool`へのrelaxed store
 だけを行います（lock-free atomic storeはasync-signal-safe）。handlerは戻しません。SIGTERMは常に登録し、SIGINTは慣習どおり
 起動時にSIG_IGNを継承していれば（job controlなしの`cmd &`など）ignoreのまま残します（SIG_IGNを
-先に設定して旧dispositionを調べるため、調査中のSIGINTはignoreされる）。SIGHUPなど他のsignalは
-扱いません。Linux以外ではhandlerを登録しません。M2 S10aでhandlerは`STOP.swap(true)`が既に`true`
+先に設定して旧dispositionを調べるため、調査中のSIGINTはignoreされる）。M2 S10bから`ruster run`だけが
+SIGHUPを登録し（継承したSIG_IGNでも登録する。daemonではreload要求）、handlerは`RELOAD`へのrelaxed
+storeだけです。`run-sim`はSIGHUPを扱わず、他のsignalも扱いません。Linux以外ではhandlerを登録しません。M2 S10aでhandlerは`STOP.swap(true)`が既に`true`
 なら`FORCE`もstoreするようになり（二回目のsignal、`ruster run`のforced teardown）、`run-sim`は
 `STOP`だけを読むので挙動は変わりません。`unsafe`はprivate `signal` moduleと`ruster run`の
 rtnetlink address dump（`run::netlink`）だけで、crateは`#![deny(unsafe_code)]`です。
@@ -2712,9 +2713,10 @@ publishするまでのframeはXDPがsocketへ送りkernelが`rx_fill_ring_empty`
 XDP programは残りません。errorは`startup failed: stage=<stage> [port=if<id>] code=<typed>`
 （session/attachは`<stage>/<failure>`、verifier logは長さとtruncationだけ）です。
 
-XDP-063 device check（session open後、attach前）: sysfsの`ifindex`がsessionと一致することを確かめて
-（同じnamespaceのsysfsであることまでは証明しないので`ip netns exec`で`/sys`を合わせる。`RTM_GETLINK`
-への移行はdeferred）から、RX queue数（`/sys/class/net/<dev>/queues/rx-*`）が1でなければ拒否します。RSS/ntupleで全
+XDP-063 device check（session open後、attach前）: sessionのifindexをrtnetlink `RTM_GETLINK`で問い合わせ
+（netlink socketは常に呼び出し側のnamespace。M2 S10bでsysfsから移行）、RX queue数（`IFLA_NUM_RX_QUEUES`、
+driverが確保した数）が1でなければ拒否します。同じ返答のMTUがsessionの読んだMTUと違えば
+`UNVERIFIABLE probe=mtu`、MTU + 14がUMEM frameに収まらなければ`MTU_ABOVE_FRAME`です。RSS/ntupleで全
 trafficをbind queueへ寄せたoperatorだけが`--allow-multi-queue`で受理できます（warning）。kernel IPv4
 address（rtnetlink `RTM_GETADDR` dump、labelに依らずifindexで数える）とportを出口にするmain tableの
 IPv4 route（`/proc/net/route`）は拒否、`net.ipv4.ip_forward`と`conf/<dev>/forwarding`はwarningだけです。
@@ -2732,7 +2734,8 @@ settle）と`finish`が扱います。RXも生成TX要求も無いtickが64回�
 sleepを挟み、busyなtickで即spinへ戻ります。idle時のwake-upは約1 kHzでcoreを使い切らず、idle後の
 最初のframeは最大1 ms（+timer slack）RX ringで待ちます。1 msなら2048 entryのRX ringは約2 Mppsまで
 取りこぼさず、負荷中はsleepしません。socket fdの`poll`待ちはnative crateに複数fdのsyscallが要るので
-S10bです。tickごとのallocationは0（counting allocatorのtest）。backendが自らStop（ring破損等）を
+deferred（CLI-034）です。tickごとのallocationは0（counting allocatorのtest。health/link watchを毎tick
+走らせても0）。backendが自らStop（ring破損等）を
 報告するとloopを抜けexit 1です。`--stats-interval`（既定60 s、0で無効）ごとにstdoutへ
 `ruster-run-stats kind=periodic`のblock（worker observability、service counter、`af_xdp.*`、
 `if<id>.af_xdp_port.*`の`section.key=value`、`end`）をcold pathで出します。counter、gauge、flag、
@@ -2744,9 +2747,9 @@ caller保持のleaseも無い）、`XdpPacketIo::drain`を一回4 round、1 ms�
 reapをする）。二回目のsignal（`FORCE`）はdrainを打ち切り、kick round 0の一回だけで停止と計数をします。
 final statsを取り、active publication、adapter、engineをdropしてから全portを逆順にclose（link closeで
 detach、socket/UMEM/ringを解放）し、final statsをstdoutへ、summary（`drain calls`、`completed`、
-`rx-released`、kernelが持つ`tx-in-flight`/`fill-in-kernel`、`forced`、`timed-out`、閉じたport数）を
+`rx-released`、kernelが持つ`tx-in-flight`、`tx-handoffs`、`fill-in-kernel`、`forced`、`timed-out`、閉じたport数）を
 stderrへ出します。exit statusは0（clean。起動中のsignalでrollbackしたときも）、1（起動失敗、backend
-fault、drain失敗、close error）、2（usage、invalid config、sim backend）、3（期限またはforceでTXが
+fault、fatal health/device event、drain失敗、残ったTX handoff、close error）、2（usage、invalid config、sim backend）、3（期限またはforceでTXが
 kernelに残った。detach/closeは済み）、4（capability/memlock不足、何も取得していない）です。
 
 出力: stdout/stderrは`run::output`の別threadが書き、run loop threadは完成した行とstats blockを
@@ -2758,7 +2761,39 @@ variant pathのSCREAMING_SNAKE tokenです。netlink dumpは送信元`nl_pid == 
 `nlmsg_pid`を要求し、`NLMSG_DONE`の負のstatusを失敗とします。memlock見積りは5.11前のBPF object分として
 portごとに64 KiBを加え、それでも下限です。panicはunwindで`OpenedPorts`がportを閉じてからexit 101です。
 
-privilegeのdropはしません（deferred）。SIGHUP reload、health/stall signal、retry policy、`poll`待機は
-S10bです（CLI-034）。operator手順は[`runbook-m2.md`](runbook-m2.md)、privileged E2Eは
-`scripts/priv-run-smoke.sh`（三つの専用netns、forward、SIGTERM、rollback、XDP-063、SIGKILL後の
-restart）です（CLI-008〜043、XDP-063）。
+M2 S10b（run-time operations、cold pathだけ）:
+
+- 起動retry（XDP-045）: port openの`BIND/BUSY`、`REGISTER_UMEM/MEMLOCK_LIMIT`/`OUT_OF_MEMORY`、
+  `ERRNO_11`だけを、開いた全portのrollback後に250 ms〜2 sのbackoffで`--startup-attempts`（既定3）まで
+  やり直します。他の失敗は即終了です。
+- SIGHUP reload: handlerは`RELOAD`へstoreするだけで、loopがtick境界で取り、起動と同じ
+  `load_validated`経路（regular fileだけ、`O_NONBLOCK`）→ `ProductionSequencer`の新candidate →
+  `ApplyPlan::for_active`（restart-requiredは拒否、dry run失敗は失敗）を通します。通ったcandidateは
+  backendのquiescence probe（reapとkickを含むadapterのcheck、guardは即drop）がOKになったtickの
+  publication phaseへ渡し、待つ間はRXを止めて最大200 msです。拒否・失敗は旧generationとstateを変えず、
+  適用はPUB-006どおりNAT/FW/ARP stateをflushします。candidateをDeferredで捨てる`run_tick`の挙動に
+  依存しないため、probeを先に行います。
+- health watch（500 ms）: `XdpPortStats`から最古in-flight frameの提出poll（`polls - oldest_age`）が
+  変わらない時間を計り、link up中に1 sでTX stall warning、10 sでfatal。Fill starvation（kernelの
+  Fill 0、RXなし、free list枯渇）はwarningだけ、ENETDOWN以外のkick errorが5 s続けばfatal。
+  閾値は`--tx-stall-warn-secs`/`--tx-stall-fatal-secs`/`--kick-errors-fatal-secs`（fatal 0でwarnだけ）。
+  TX stallはPAUSE floodでwireから起こせるので設定可能にし、既定のfatalはforwarding既定拒否と
+  kernel L3拒否によりexit後もfail closedであることを前提にしています（#302 sec M1）。
+- link watch（1 s）: 起動時に開きkernel（pid 0）へ`connect()`した一つのrtnetlink socketと事前確保
+  bufferでportのifindexを`RTM_GETLINK`し、続けて`RTM_GETADDR` dumpでkernel IPv4 addressを数えます。
+  ENODEV（device削除）、startup未満のMTU、frame超のMTU、3回連続のquery失敗（address dumpとforwarding readも別々に数える）は
+  fatal、link down/upとframe内のMTU上昇、run中に現れたportのkernel IPv4 addressとkernel forwardingは
+  warning/recoveredだけです（attach中はkernelがportのframeを見ないので無害で、fatal exitのdetachこそが
+  bypassを作るため。exit時は最後のroundで見えていれば警告行を出し、次の起動は拒否）。
+- startup checkはkernel IPv4 forwarding（global/port）を既定で拒否し、`--allow-kernel-forwarding`で
+  warningにします。`--strict-config-perms`は起動時とreload時にconfigの所有者とmodeを`fstat`で確認し、
+  configは常に`O_NONBLOCK|O_NOCTTY`のregular fileとして読みます。reloadの`Applied`は権威的で、
+  commit reportが無ければinvariant違反としてexit 1、停止時の待機中reloadは`STOPPED`として数えます。
+- fatal eventはloopを`LoopEnd::Fatal{port, cause}`で抜け、SIGTERMと同じdrain/detach/closeの後exit 1。
+  drainは誰もcancelできない失われたTX handoffを`tx_handoffs_outstanding`として報告し、0でなければexit 1
+  （XDP-177）。
+
+privilegeのdropと`poll`待機はdeferredです（CLI-034）。operator手順は[`runbook-m2.md`](runbook-m2.md)、
+privileged E2Eは`scripts/priv-run-smoke.sh`（三つの専用netns、forward、SIGTERM、reload、link
+down/up、MTU超過とdevice削除のfail closed、rollback、XDP-063、SIGKILL後のrestart）です（CLI-008〜059、
+XDP-045、XDP-063、XDP-177）。

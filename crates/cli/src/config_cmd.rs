@@ -28,6 +28,23 @@ pub enum LoadError {
     Read(io::ErrorKind),
     /// The content was rejected (exit 2). Value-free.
     Rejected(Rejection),
+    /// The reload path is not a regular file
+    /// ([`load_validated_regular`]).
+    NotAFile,
+    /// `--strict-config-perms` refused the file (exit 1). Value-free code.
+    Insecure(&'static str),
+}
+
+impl LoadError {
+    /// Value-free `stage=... code=...` text of the failure.
+    pub fn render(&self) -> String {
+        match self {
+            Self::Read(kind) => format!("stage=read code={}", io_code(*kind)),
+            Self::Rejected(rejection) => rejection.render(),
+            Self::NotAFile => "stage=read code=NOT_A_FILE".to_owned(),
+            Self::Insecure(code) => format!("stage=permissions code={code}"),
+        }
+    }
 }
 
 pub struct Rejection {
@@ -90,10 +107,150 @@ pub fn load(path: &Path) -> Result<ValidatedConfigV1, LoadError> {
 /// candidate with the production key source, so no simulation key source
 /// is ever constructed on the live path; the bridge errors are the same.
 pub fn load_validated(path: &Path) -> Result<ValidatedConfigV1, LoadError> {
+    let file = File::open(path).map_err(|error| LoadError::Read(error.kind()))?;
+    validate_file(file)
+}
+
+/// [`load_validated`] for `ruster run` (startup and the reload, which runs
+/// on the router thread): the path is opened with `O_NONBLOCK | O_NOCTTY`
+/// and must be a regular file (`NOT_A_FILE` otherwise), so a FIFO or
+/// device node in its place can neither block the datapath nor become
+/// the controlling terminal. A regular file's reads never block on the
+/// writer.
+///
+/// With `strict` (`--strict-config-perms`) the opened file (`fstat`, so
+/// the checked file is the read one) must not be writable by group or
+/// other (`code=WRITABLE_BY_OTHERS`) and must be owned by root or the
+/// effective user (`code=UNTRUSTED_OWNER`; an unreadable effective uid is
+/// `code=OWNER_UNVERIFIABLE`), the path must contain no symbolic link
+/// (`code=SYMLINK_IN_PATH`), and every directory of the opened file's
+/// chain must pass [`check_directory`].
+pub fn load_validated_regular(path: &Path, strict: bool) -> Result<ValidatedConfigV1, LoadError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        /// Linux `O_NONBLOCK` and `O_NOCTTY` (the same values on every
+        /// Linux architecture this binary supports for `run`).
+        const O_NONBLOCK: i32 = 0o4000;
+        const O_NOCTTY: i32 = 0o400;
+        options.custom_flags(O_NONBLOCK | O_NOCTTY);
+    }
+    let file = options
+        .open(path)
+        .map_err(|error| LoadError::Read(error.kind()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| LoadError::Read(error.kind()))?;
+    if !metadata.is_file() {
+        return Err(LoadError::NotAFile);
+    }
+    #[cfg(unix)]
+    if strict {
+        use std::os::unix::fs::MetadataExt;
+        let euid = effective_uid().ok_or(LoadError::Insecure("OWNER_UNVERIFIABLE"))?;
+        check_no_symlinks(path).map_err(LoadError::Insecure)?;
+        check_permissions(metadata.mode(), metadata.uid(), euid).map_err(LoadError::Insecure)?;
+        #[cfg(target_os = "linux")]
+        check_directories(&file, euid).map_err(LoadError::Insecure)?;
+        #[cfg(not(target_os = "linux"))]
+        return Err(LoadError::Insecure("OWNER_UNVERIFIABLE"));
+    }
+    #[cfg(not(unix))]
+    let _ = strict;
+    validate_file(file)
+}
+
+/// The strict-permission rule of [`load_validated_regular`].
+pub fn check_permissions(mode: u32, owner: u32, euid: u32) -> Result<(), &'static str> {
+    if mode & 0o022 != 0 {
+        return Err("WRITABLE_BY_OTHERS");
+    }
+    if owner != 0 && owner != euid {
+        return Err("UNTRUSTED_OWNER");
+    }
+    Ok(())
+}
+
+/// The strict-permission rule for each directory on the way to the file:
+/// owned by root or the effective user, and not writable by group or
+/// other unless it is a root-owned sticky directory (like `/tmp`, where
+/// nobody else may rename or replace an entry they do not own).
+pub fn check_directory(mode: u32, owner: u32, euid: u32) -> Result<(), &'static str> {
+    if owner != 0 && owner != euid {
+        return Err("UNTRUSTED_DIRECTORY");
+    }
+    let sticky_root = mode & 0o1000 != 0 && owner == 0;
+    if mode & 0o022 != 0 && !sticky_root {
+        return Err("WRITABLE_DIRECTORY");
+    }
+    Ok(())
+}
+
+/// Applies [`check_directory`] to every directory from the opened file's
+/// parent up to `/`. The chain comes from the open descriptor
+/// (`readlink /proc/self/fd/<fd>`), so it is the directory chain of the
+/// file actually read, not of whatever the path names now. Any error (a
+/// deleted file's `(deleted)` target, an unreadable directory) fails closed
+/// as `OWNER_UNVERIFIABLE`.
+#[cfg(target_os = "linux")]
+fn check_directories(file: &File, euid: u32) -> Result<(), &'static str> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let opened = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .map_err(|_| "OWNER_UNVERIFIABLE")?;
+    if !opened.is_absolute() {
+        return Err("OWNER_UNVERIFIABLE");
+    }
+    for directory in opened.ancestors().skip(1) {
+        let metadata = std::fs::symlink_metadata(directory).map_err(|_| "OWNER_UNVERIFIABLE")?;
+        if !metadata.is_dir() {
+            return Err("OWNER_UNVERIFIABLE");
+        }
+        check_directory(metadata.mode(), metadata.uid(), euid)?;
+    }
+    Ok(())
+}
+
+/// Refuses a path with a symbolic link in any component (`lstat` of every
+/// lexical prefix, the file itself included), so the strict checks cannot
+/// be pointed elsewhere by a link. Errors fail closed.
+#[cfg(unix)]
+pub fn check_no_symlinks(path: &Path) -> Result<(), &'static str> {
+    let mut prefix = std::path::PathBuf::new();
+    for component in path.components() {
+        prefix.push(component);
+        if matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::CurDir
+        ) {
+            continue;
+        }
+        let metadata = std::fs::symlink_metadata(&prefix).map_err(|_| "OWNER_UNVERIFIABLE")?;
+        if metadata.file_type().is_symlink() {
+            return Err("SYMLINK_IN_PATH");
+        }
+    }
+    Ok(())
+}
+
+/// The effective uid (second field of `Uid:` in `/proc/self/status`).
+fn effective_uid() -> Option<u32> {
+    parse_effective_uid(&std::fs::read_to_string("/proc/self/status").ok()?)
+}
+
+/// `Uid:\t<real>\t<effective>\t<saved>\t<fs>`.
+pub fn parse_effective_uid(status: &str) -> Option<u32> {
+    let row = status.lines().find_map(|line| line.strip_prefix("Uid:"))?;
+    row.split_whitespace().nth(1)?.parse().ok()
+}
+
+fn validate_file(file: File) -> Result<ValidatedConfigV1, LoadError> {
     let mut bytes = Vec::new();
     let take = wide(MAX_CONFIG_BYTES).saturating_add(1);
-    File::open(path)
-        .and_then(|file| file.take(take).read_to_end(&mut bytes))
+    file.take(take)
+        .read_to_end(&mut bytes)
         .map_err(|error| LoadError::Read(error.kind()))?;
     let parsed = parse(&bytes).map_err(|diagnostic| {
         LoadError::Rejected(Rejection {
@@ -162,6 +319,17 @@ pub fn report_load(err: &mut impl Write, label: &str, error: &LoadError) -> u8 {
     match error {
         LoadError::Read(kind) => {
             let _ = writeln!(err, "ruster: cannot read {label}config: {}", io_code(*kind));
+            EXIT_RUNTIME
+        }
+        LoadError::NotAFile => {
+            let _ = writeln!(err, "ruster: cannot read {label}config: NOT_A_FILE");
+            EXIT_RUNTIME
+        }
+        LoadError::Insecure(code) => {
+            let _ = writeln!(
+                err,
+                "ruster: refused {label}config: stage=permissions code={code}"
+            );
             EXIT_RUNTIME
         }
         LoadError::Rejected(rejection) => {
@@ -243,3 +411,7 @@ pub fn run_plan(current: &Path, next: &Path, out: &mut impl Write, err: &mut imp
         }
     }
 }
+
+#[cfg(test)]
+#[path = "config_cmd_tests.rs"]
+mod tests;

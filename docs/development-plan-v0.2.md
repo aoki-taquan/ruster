@@ -163,8 +163,14 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   SIGINT/SIGTERMでtick停止 → 最大2 sのbounded drain（二回目のsignalで打ち切り）→ final stats →
   逆順detach/close、exit 0（TXがkernelに残れば3）。#294（`for_active`のBackend dry runは先頭の理由）と
   #300（relieveのbatchごとのreset、generated batchの一回settle、「0〜2 frame」）のfollow-upを含む。
-  operator手順は[`runbook-m2.md`](runbook-m2.md)（cold start、shutdown、kill/restart）。reload
-  （SIGHUP）、health/stall signal、retry policy、`poll`待機、privilege dropはM2 S10b以降（CLI-034）。
+  operator手順は[`runbook-m2.md`](runbook-m2.md)（cold start、shutdown、kill/restart）。
+- M2 S10b（X04b後半）: `ruster run`のrun-time operations。SIGHUP reload（tick境界、
+  `ApplyPlan::for_active`でrestart-requiredを拒否、quiescenceを最大200 ms待つ、failure atomic）、
+  health watch（TX stall 1 s warning/10 s fatal、Fill starvation、persistent kick error）、link watch
+  （rtnetlink `RTM_GETLINK`で1 sごと。device削除・MTU違反はexit 1、link down/upは継続）、起動retry
+  （`--startup-attempts`、XDP-045）、RX queue数とMTUのrtnetlink化、drainのhandoff報告（XDP-177）。
+  privileged smokeにreload、restart-required拒否、link down/up、MTU超過、veth削除を追加。`poll`待機、
+  privilege drop、multi-queue、systemd notify、SIGUSR1 stats、privileged E2EのCI（S11）は残り（CLI-034）。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
   ringのsaturationはM2 S6でAF_XDPの`BackendStats`へ接続した（OBS-018。AF_PACKETはOBS-028、OBS-017はdeferred）。core `PublicationQuiescenceGuard::new`はsealされていない。

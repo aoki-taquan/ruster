@@ -25,13 +25,15 @@ use ruster_control::{ActivationError, SequencerError, StorageAllocationError};
 use ruster_core::IfId;
 use ruster_io_xdp_native::{
     AttachError, CleanupError, DatapathError, RxFillSetupError, SessionConfigError, SessionError,
-    XdpPacketIoSetupError,
+    SessionFailure, SessionStage, XdpPacketIoSetupError,
 };
 
 use super::checks::{
     evaluate_device, CheckFailure, CheckPolicy, DeviceFacts, PrivilegeFailure, Warnings,
 };
-use super::engine::{port_label, Datapath, StopSignal};
+use super::engine::{port_label, Datapath, LinkMonitor, StopSignal};
+use super::netlink::NetlinkError;
+use super::watch::LinkTarget;
 
 /// Startup stage, in execution order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,6 +50,8 @@ pub enum Stage {
     Checks,
     /// `NativeSession::attach_xdp`.
     Attach,
+    /// The rtnetlink socket of the run-time link watch.
+    Watch,
     /// `NativeSession::take_datapath`.
     Datapath,
     /// `RxFillEngine::new`.
@@ -67,6 +71,7 @@ impl Stage {
             Self::Open => "open",
             Self::Checks => "checks",
             Self::Attach => "attach",
+            Self::Watch => "watch",
             Self::Datapath => "datapath",
             Self::Engine => "engine",
             Self::Adapter => "adapter",
@@ -89,9 +94,49 @@ pub enum Failure {
     Engine(RxFillSetupError),
     Adapter(XdpPacketIoSetupError),
     Activation(ActivationError),
+    /// The link watch's rtnetlink socket could not be opened.
+    Links(NetlinkError),
     /// A failure injected by a test host.
     #[cfg(test)]
     Injected,
+    /// A transient failure injected by a test host (retried like
+    /// `BIND/BUSY`).
+    #[cfg(test)]
+    InjectedTransient,
+}
+
+impl Failure {
+    /// Whether a startup that failed with this may succeed when retried
+    /// after a full rollback (XDP-045): the kernel releases a closed
+    /// socket's queue registration and UMEM accounting from deferred work,
+    /// so right after a previous run (or a crash) a port can be briefly
+    /// `BIND/BUSY` or `REGISTER_UMEM/MEMLOCK_LIMIT` (`ENOMEM` there too),
+    /// and any session stage can report `EAGAIN`. Everything else is a
+    /// configuration, privilege, or device problem and is never retried.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Session(error) => transient_open(error.stage(), error.failure()),
+            #[cfg(test)]
+            Self::InjectedTransient => true,
+            _ => false,
+        }
+    }
+}
+
+/// `EAGAIN`.
+const EAGAIN: u16 = 11;
+
+/// The transient session failures of [`Failure::is_transient`].
+pub const fn transient_open(stage: SessionStage, failure: SessionFailure) -> bool {
+    matches!(
+        (stage, failure),
+        (SessionStage::Bind, SessionFailure::Busy)
+            | (
+                SessionStage::RegisterUmem,
+                SessionFailure::MemlockLimit | SessionFailure::OutOfMemory
+            )
+            | (_, SessionFailure::Errno(EAGAIN))
+    )
 }
 
 impl fmt::Display for Failure {
@@ -132,8 +177,11 @@ impl fmt::Display for Failure {
             Self::Engine(error) => write!(formatter, "code={}", token(error)),
             Self::Adapter(error) => write!(formatter, "code={}", token(error)),
             Self::Activation(error) => write!(formatter, "code={}", token(error)),
+            Self::Links(error) => write!(formatter, "code={}", token(error)),
             #[cfg(test)]
             Self::Injected => formatter.write_str("code=INJECTED"),
+            #[cfg(test)]
+            Self::InjectedTransient => formatter.write_str("code=INJECTED_TRANSIENT"),
         }
     }
 }
@@ -262,6 +310,9 @@ impl fmt::Display for CloseFailure {
 pub struct OpenPort<S> {
     pub interface: IfId,
     pub session: S,
+    /// What the link watch checks this port against (from the checked
+    /// device facts).
+    pub link: LinkTarget,
 }
 
 /// The operations startup and teardown need from the platform.
@@ -270,6 +321,12 @@ pub trait PortHost {
     type Datapath<'s>: Datapath
     where
         Self: 's;
+    type Links: LinkMonitor;
+
+    /// Opens the run-time link watch (before the datapath is built).
+    /// `devices` are the ports' interfaces and kernel device names, in
+    /// `IfId` order (for the forwarding sysctls).
+    fn links(&self, devices: &[(IfId, &str)]) -> Result<Self::Links, Failure>;
 
     /// Capabilities and memlock for `backend`, before any resource.
     fn preflight(&self, backend: &ValidatedAfXdpV1) -> Result<(), PrivilegeFailure>;
@@ -346,6 +403,16 @@ impl<H: PortHost> Drop for OpenedPorts<'_, H> {
     }
 }
 
+/// The link watch target of a port whose device facts passed the checks.
+pub const fn link_target(interface: IfId, facts: &DeviceFacts) -> LinkTarget {
+    LinkTarget {
+        interface,
+        ifindex: facts.ifindex,
+        mtu: facts.session_mtu,
+        frame_capacity: facts.frame_capacity,
+    }
+}
+
 /// Why [`open_ports`] stopped early.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Interrupt {
@@ -375,7 +442,16 @@ pub fn open_ports<H: PortHost, S: StopSignal>(
         let session = host
             .open(port)
             .map_err(|failure| fail(Stage::Open, failure))?;
-        opened.ports.push(OpenPort { interface, session });
+        opened.ports.push(OpenPort {
+            interface,
+            session,
+            link: LinkTarget {
+                interface,
+                ifindex: 0,
+                mtu: 0,
+                frame_capacity: 0,
+            },
+        });
         let Some(entry) = opened.ports.last_mut() else {
             unreachable!("a port was just pushed");
         };
@@ -384,6 +460,7 @@ pub fn open_ports<H: PortHost, S: StopSignal>(
             .map_err(|failure| fail(Stage::Checks, Failure::Check(failure)))?;
         let warnings = evaluate_device(&facts, policy)
             .map_err(|failure| fail(Stage::Checks, Failure::Check(failure)))?;
+        entry.link = link_target(interface, &facts);
         warn(interface, &warnings);
         if stop.stop() {
             return Err(Interrupt::Signalled);
