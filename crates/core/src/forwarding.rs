@@ -1985,6 +1985,25 @@ where
                 trace,
             )
             .and_then(|decision| {
+                // Every NAT commit is checked before the packet is
+                // rewritten, so a plan the runtime would refuse (stale or
+                // corrupt reuse lists or indexes) is a counted drop, never
+                // a worker panic.
+                if let PacketDecision::Nat44Udp(nat) = decision {
+                    let runtime = nat44_udp
+                        .as_deref()
+                        .ok_or(DropReason::Nat44UdpRuntimeUnavailable)?;
+                    match nat.transition {
+                        Nat44UdpTransition::Outbound(plan) => runtime
+                            .prevalidate_outbound_commit(plan, nat_now_ms)
+                            .map_err(|_| DropReason::Nat44UdpConfigMismatch)?,
+                        Nat44UdpTransition::Inbound(plan) | Nat44UdpTransition::Hairpin(plan) => {
+                            runtime
+                                .prevalidate_inbound_commit(plan, nat_now_ms)
+                                .map_err(|_| DropReason::Nat44UdpConfigMismatch)?;
+                        }
+                    }
+                }
                 if let PacketDecision::Nat44Tcp(nat) = decision {
                     let runtime = nat44_tcp
                         .as_deref()

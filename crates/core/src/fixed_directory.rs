@@ -2258,7 +2258,7 @@ mod tests {
     }
 
     /// The first unowned port a walk of the pool from `start` reaches: the
-    /// pre-PERF-001 port search, as the reference.
+    /// walk the bitmap search must reproduce, as the reference.
     fn walk_first_unowned(owners: &PortOwnerTable<'_>, start: usize) -> Option<u16> {
         let count = owners.slot_count();
         (0..count)

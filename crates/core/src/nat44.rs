@@ -2545,14 +2545,16 @@ mod tcp_tests {
         value ^ (value >> 31)
     }
 
-    /// Public port the pre-PERF-001 allocator (a walk of the pool) would
-    /// choose for a new mapping: `Some(port)` when determined, `None` when
-    /// only ports of expired owners remain (any of them is correct), and
-    /// `Err` when every port has a live owner.
-    fn reference_tcp_port(
+    /// Model of the port rule (NAT44-004, NAT44-068), computed by walking
+    /// the pool: `Some(port)` when determined, `None` when only ports of
+    /// expired owners remain (any of them is correct), and `Err` when every
+    /// port has a live owner. `previous` is the public port the endpoint's
+    /// expired mapping still owns, if any.
+    fn model_tcp_port(
         runtime: &Nat44TcpRuntime<'_>,
         internal_address: Ipv4Address,
         internal_port: u16,
+        previous: Option<u16>,
         now_ms: u64,
     ) -> Result<Option<u16>, ()> {
         let config = runtime.config;
@@ -2566,6 +2568,9 @@ mod tcp_tests {
             && owner_live(internal_port) != Some(true)
         {
             return Ok(Some(internal_port));
+        }
+        if let Some(port) = previous {
+            return Ok(Some(port));
         }
         let pool = usize::from(config.last_port - config.first_port) + 1;
         let start = seeded_port_offset(
@@ -2589,10 +2594,10 @@ mod tcp_tests {
     }
 
     /// Random outbound and inbound SYNs, refreshes, and expiry on small
-    /// tables, checked against the pre-PERF-001 full scans: a new mapping
-    /// or session fails as full exactly when no slot is reusable, the port
-    /// is exactly the first unowned port from the seeded start (or a port
-    /// of an expired owner when none is unowned), exhaustion is exact, and
+    /// tables, checked against full scans of the slots: a new mapping
+    /// or session fails as full exactly when no slot is reusable (as the
+    /// scans before PERF-001 decided), the port follows the modelled rule
+    /// (`model_tcp_port`), exhaustion is exact, and
     /// the indexes and reuse lists stay consistent after every commit.
     #[test]
     fn tcp_reuse_matches_a_full_scan_reference_under_seeded_churn() {
@@ -2656,7 +2661,15 @@ mod tcp_tests {
                             .mappings
                             .iter()
                             .any(|mapping| !runtime.mapping_is_live(*mapping, now));
-                        let port = reference_tcp_port(&runtime, host, internal_port, now);
+                        let previous = runtime
+                            .find_mapping(host, internal_port)
+                            .unwrap()
+                            .map(|(_, mapping)| mapping)
+                            .filter(|mapping| {
+                                mapping.port_owned && !runtime.mapping_is_live(*mapping, now)
+                            })
+                            .map(|mapping| mapping.public_port);
+                        let port = model_tcp_port(&runtime, host, internal_port, previous, now);
                         let owners_before = runtime.port_owners.backing_snapshot();
                         let result = runtime.plan_outbound(
                             host,
@@ -2717,7 +2730,7 @@ mod tcp_tests {
     /// PERF-001 cost bound: with 65536-slot tables and the widest pool,
     /// every new flow, even with every public port owned, examines at most
     /// two mapping slots, one session slot, two port owners, and 34 bitmap
-    /// words; the pre-PERF-001 search visited up to every mapping slot,
+    /// words; the search before PERF-001 visited up to every mapping slot,
     /// every session slot, and every pool port.
     #[test]
     fn tcp_new_flow_work_is_constant_in_a_nearly_full_65536_slot_table() {
@@ -2778,6 +2791,52 @@ mod tcp_tests {
                 worst[0] <= 2 && worst[1] <= 1 && worst[2] <= 2 && worst[3] <= 34,
                 "work per new flow {worst:?}"
             );
+        });
+    }
+
+    /// Defense in depth: an outbound or inbound plan whose never-used
+    /// target slot is no longer the lowest never-used slot is refused as
+    /// stale before anything mutates (the forwarding path then drops the
+    /// packet as `NAT44_TCP_CONFIG_MISMATCH`).
+    #[test]
+    fn tcp_commit_rejects_a_target_slot_the_reuse_lists_no_longer_offer() {
+        let policy = Nat44TcpPolicy::default().with_filtering(Nat44Filtering::EndpointIndependent);
+        with_config(policy, 40_000, 40_001, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 2];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 4];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            let plan = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, 443, true, 0)
+                .unwrap();
+            runtime.reuse_lists.next_fresh_mapping += 1;
+            assert_eq!(
+                runtime.prevalidate_outbound_commit(plan, 0),
+                Err(Nat44TcpCommitError::StalePlan)
+            );
+            runtime.reuse_lists.next_fresh_mapping -= 1;
+            runtime.reuse_lists.next_fresh_session += 1;
+            assert_eq!(
+                runtime.prevalidate_outbound_commit(plan, 0),
+                Err(Nat44TcpCommitError::StalePlan)
+            );
+            runtime.reuse_lists.next_fresh_session -= 1;
+            runtime.commit_outbound(plan, 0).unwrap();
+
+            let plan = runtime.plan_inbound(40_000, REMOTE2, 80, true, 1).unwrap();
+            assert!(plan.session_created);
+            let before = (runtime.mappings.to_vec(), runtime.sessions.to_vec());
+            runtime.reuse_lists.next_fresh_session += 1;
+            assert_eq!(
+                runtime.commit_inbound(plan, 1),
+                Err(Nat44TcpCommitError::StalePlan)
+            );
+            assert_eq!(
+                (runtime.mappings.to_vec(), runtime.sessions.to_vec()),
+                before
+            );
+            runtime.reuse_lists.next_fresh_session -= 1;
+            runtime.commit_inbound(plan, 1).unwrap();
+            assert_eq!(runtime.validate_indexes(), Ok(()));
         });
     }
 }
@@ -3851,9 +3910,10 @@ impl Nat44UdpReconcileBinding {
 /// expire), expired mappings whose peers or port were already taken, a
 /// chain of the peers of each mapping and of stale peers, and a fresh-slot
 /// boundary. Ports come from a free-port bitmap: the internal port if
-/// unowned or expired, else the first unowned port from the seeded start,
-/// else the port of an expired mapping. Expiry stays lazy (no timer or
-/// sweep): expired state is reclaimed when a new flow needs it.
+/// unowned or expired, else the port the endpoint's expired mapping still
+/// owns, else the first unowned port from the seeded start, else the port
+/// of an expired mapping (see `allocate_port`). Expiry stays lazy (no timer
+/// or sweep): expired state is reclaimed when a new flow needs it.
 ///
 /// ```compile_fail
 /// use ruster_core::Nat44UdpRuntime;
@@ -3897,6 +3957,9 @@ pub struct Nat44UdpRuntime<'a> {
     /// validation after every commit.
     #[cfg(test)]
     skip_commit_validation: Cell<bool>,
+    /// Peer slots written by the reuse-list bookkeeping (cost tests).
+    #[cfg(test)]
+    peer_link_writes: Cell<usize>,
     #[cfg(test)]
     mapping_lookup_probes: Cell<usize>,
     #[cfg(test)]
@@ -3974,6 +4037,8 @@ impl<'a> Nat44UdpRuntime<'a> {
             reuse_visits: Cell::new(0),
             #[cfg(test)]
             skip_commit_validation: Cell::new(false),
+            #[cfg(test)]
+            peer_link_writes: Cell::new(0),
             #[cfg(test)]
             mapping_lookup_probes: Cell::new(0),
             #[cfg(test)]
@@ -4307,7 +4372,9 @@ impl<'a> Nat44UdpRuntime<'a> {
         let Some((peer_index, _)) = self.find_reusable_peer(now_ms)? else {
             return Err(Nat44UdpPlanError::PeerFull);
         };
-        let Some(port) = self.allocate_port(internal_address, internal_port, now_ms)? else {
+        let previous = exact_mapping.map(|(_, mapping)| mapping);
+        let Some(port) = self.allocate_port(internal_address, internal_port, previous, now_ms)?
+        else {
             return Err(Nat44UdpPlanError::PortExhausted);
         };
         let generation = self.next_nonzero_generation()?;
@@ -4523,11 +4590,24 @@ impl<'a> Nat44UdpRuntime<'a> {
         self.commit_inbound_counted(plan, now_ms, true)
     }
 
-    fn commit_inbound_counted(
-        &mut self,
+    /// Read-only check that an outbound plan (ordinary or hairpin) would
+    /// commit: the forwarding path calls it before rewriting the packet, so
+    /// a stale or corrupt plan is a counted `NAT44_UDP_CONFIG_MISMATCH` drop
+    /// instead of a commit failure.
+    pub(crate) fn prevalidate_outbound_commit(
+        &self,
+        plan: Nat44UdpOutboundPlan,
+        now_ms: u64,
+    ) -> Result<(), Nat44UdpCommitError> {
+        self.revalidate_outbound_commit(plan, now_ms).map(|_| ())
+    }
+
+    /// Read-only check that an inbound plan (ordinary or hairpin) would
+    /// commit; see [`Self::prevalidate_outbound_commit`].
+    pub(crate) fn prevalidate_inbound_commit(
+        &self,
         plan: Nat44UdpInboundPlan,
         now_ms: u64,
-        hairpin: bool,
     ) -> Result<(), Nat44UdpCommitError> {
         if plan.expected_runtime_epoch != self.runtime_epoch {
             return Err(Nat44UdpCommitError::RuntimeEpochChanged);
@@ -4547,6 +4627,19 @@ impl<'a> Nat44UdpRuntime<'a> {
         {
             return Err(Nat44UdpCommitError::MappingSlotChanged);
         }
+        if self.state_revision == u128::MAX {
+            return Err(Nat44UdpCommitError::StateRevisionExhausted);
+        }
+        Ok(())
+    }
+
+    fn commit_inbound_counted(
+        &mut self,
+        plan: Nat44UdpInboundPlan,
+        now_ms: u64,
+        hairpin: bool,
+    ) -> Result<(), Nat44UdpCommitError> {
+        self.prevalidate_inbound_commit(plan, now_ms)?;
         let next_revision = self
             .state_revision
             .checked_add(1)
@@ -4844,6 +4937,16 @@ impl<'a> Nat44UdpRuntime<'a> {
         {
             return Err(Nat44UdpCommitError::IndexCorrupt);
         }
+        // An unoccupied target mapping slot must be the lowest never-used
+        // one; an occupied one must be on a list the commit can unlink from.
+        let Some(target) = self.mappings.get(plan.mapping_index()).copied() else {
+            return Err(Nat44UdpCommitError::IndexCorrupt);
+        };
+        if target.occupied == (target.link.list == UdpMappingList::Free)
+            || (!target.occupied && plan.mapping_index() != self.mapping_lists.next_fresh)
+        {
+            return Err(Nat44UdpCommitError::IndexCorrupt);
+        }
         plan.peer_index()
             .map(|index| {
                 self.planned_peer_source(index, now_ms)
@@ -4867,7 +4970,15 @@ impl<'a> Nat44UdpRuntime<'a> {
         }
     }
 
+    #[cfg(test)]
+    fn count_peer_link_write(&self) {
+        self.peer_link_writes
+            .set(self.peer_link_writes.get().saturating_add(1));
+    }
+
     fn pop_stale_peer(&mut self, index: usize) {
+        #[cfg(test)]
+        self.count_peer_link_write();
         debug_assert!(self.stale_peers as usize == index);
         self.stale_peers = self.peers[index].next;
         self.peers[index].next = LINK_NONE;
@@ -4876,6 +4987,8 @@ impl<'a> Nat44UdpRuntime<'a> {
     /// Splices a whole peer chain onto the stale chain in O(1).
     fn release_peers(&mut self, chain: PeerChain) {
         if chain.head().is_some() {
+            #[cfg(test)]
+            self.count_peer_link_write();
             self.peers[chain.tail as usize].next = self.stale_peers;
             self.stale_peers = chain.head;
         }
@@ -4955,12 +5068,16 @@ impl<'a> Nat44UdpRuntime<'a> {
         };
         let link = encode_udp_index(index);
         let chain = self.mappings[mapping_index].link.peers;
+        #[cfg(test)]
+        self.count_peer_link_write();
         if chain.head().is_none() {
             self.mappings[mapping_index].link.peers = PeerChain {
                 head: link,
                 tail: link,
             };
         } else {
+            #[cfg(test)]
+            self.count_peer_link_write();
             self.peers[chain.tail as usize].next = link;
             self.mappings[mapping_index].link.peers.tail = link;
         }
@@ -5488,14 +5605,37 @@ impl<'a> Nat44UdpRuntime<'a> {
         }))
     }
 
+    /// Public port of a new mapping (NAT44-004, NAT44-068), in O(1):
+    ///
+    /// 1. the internal port, if in the pool and unowned or owned by an
+    ///    expired mapping (port preservation);
+    /// 2. the port the same internal endpoint's expired mapping
+    ///    (`previous`, recreated in place) still owns, so a returning
+    ///    endpoint keeps its public port;
+    /// 3. the first unowned port from the seeded start (a walk of the pool
+    ///    from that offset, skipping owned ports);
+    /// 4. with every port owned, the port of an expired mapping in expiry
+    ///    order (parked first, then the expired activity head). This
+    ///    choice does not depend on the seed (NAT44-020).
+    ///
+    /// Unlike the walk before H4a, which took the first port from the seeded
+    /// start that was unowned *or* owned by an expired mapping, step 3
+    /// prefers an unowned port over an earlier expired-owned one. `None`
+    /// only when every port has a live owner.
     fn allocate_port(
         &self,
         internal_address: Ipv4Address,
         internal_port: u16,
+        previous: Option<Nat44UdpMappingSlot>,
         now_ms: u64,
     ) -> Result<Option<Nat44UdpPortSelection>, Nat44UdpPlanError> {
         if (self.config.first_port..=self.config.last_port).contains(&internal_port) {
             if let Some(selection) = self.select_port(internal_port, now_ms)? {
+                return Ok(Some(selection));
+            }
+        }
+        if let Some(previous) = previous.filter(|mapping| mapping.occupied && mapping.port_owned) {
+            if let Some(selection) = self.select_port(previous.public_port, now_ms)? {
                 return Ok(Some(selection));
             }
         }
@@ -7169,7 +7309,9 @@ impl<'a> Nat44TcpRuntime<'a> {
         let Some(session_index) = self.find_reusable_session(now_ms) else {
             return Err(Nat44TcpPlanError::SessionFull);
         };
-        let Some(port) = self.allocate_port(internal_address, internal_port, now_ms)? else {
+        let previous = exact_mapping.map(|(_, mapping)| mapping);
+        let Some(port) = self.allocate_port(internal_address, internal_port, previous, now_ms)?
+        else {
             return Err(Nat44TcpPlanError::PortExhausted);
         };
         if self.next_generation == 0 || self.next_generation == u64::MAX {
@@ -7627,10 +7769,30 @@ impl<'a> Nat44TcpRuntime<'a> {
             .mapping
             .is_none_or(|mutation| self.mapping_mutation_matches(mutation))
             || !self.session_link_matches(plan.prepared.session)
+            || !self.mapping_target_matches_lists(plan.mapping_index())
+            || !self.session_target_matches_lists(plan.session_index())
         {
             return Err(Nat44TcpCommitError::StalePlan);
         }
         Ok(())
+    }
+
+    /// An unoccupied target mapping slot must be the lowest never-used one,
+    /// and an occupied one must be on the activity or retired list, so the
+    /// infallible commit can move it in O(1).
+    fn mapping_target_matches_lists(&self, index: usize) -> bool {
+        let mapping = self.mappings[index];
+        if mapping.occupied {
+            mapping.link.list != TcpMappingList::Free
+        } else {
+            mapping.link.list == TcpMappingList::Free
+                && index == self.reuse_lists.next_fresh_mapping
+        }
+    }
+
+    /// An unoccupied target session slot must be the lowest never-used one.
+    fn session_target_matches_lists(&self, index: usize) -> bool {
+        self.sessions[index].occupied || index == self.reuse_lists.next_fresh_session
     }
 
     pub(crate) fn commit_prevalidated_outbound(&mut self, plan: Nat44TcpOutboundPlan, now_ms: u64) {
@@ -7722,7 +7884,10 @@ impl<'a> Nat44TcpRuntime<'a> {
             plan.session_index,
             now_ms,
         )?;
-        if !self.session_link_matches(plan.prepared) {
+        if !self.session_link_matches(plan.prepared)
+            || !self.mapping_target_matches_lists(plan.mapping_index)
+            || !self.session_target_matches_lists(plan.session_index)
+        {
             return Err(Nat44TcpCommitError::StalePlan);
         }
         Ok(())
@@ -8704,14 +8869,37 @@ impl<'a> Nat44TcpRuntime<'a> {
         }) && listed == self.sessions.len()
     }
 
+    /// Public port of a new mapping (NAT44-004, NAT44-068), in O(1):
+    ///
+    /// 1. the internal port, if in the pool and unowned or owned by an
+    ///    expired mapping (port preservation);
+    /// 2. the port the same internal endpoint's expired mapping
+    ///    (`previous`, recreated in place) still owns, so a returning
+    ///    endpoint keeps its public port;
+    /// 3. the first unowned port from the seeded start (a walk of the pool
+    ///    from that offset, skipping owned ports);
+    /// 4. with every port owned, the port of an expired mapping in expiry
+    ///    order (the expired activity head). This
+    ///    choice does not depend on the seed (NAT44-020).
+    ///
+    /// Unlike the walk before H4a, which took the first port from the seeded
+    /// start that was unowned *or* owned by an expired mapping, step 3
+    /// prefers an unowned port over an earlier expired-owned one. `None`
+    /// only when every port has a live owner.
     fn allocate_port(
         &self,
         internal_address: Ipv4Address,
         internal_port: u16,
+        previous: Option<Nat44TcpMappingSlot>,
         now_ms: u64,
     ) -> Result<Option<Nat44TcpPortSelection>, Nat44TcpPlanError> {
         if (self.config.first_port..=self.config.last_port).contains(&internal_port) {
             if let Some(selection) = self.select_port(internal_port, now_ms)? {
+                return Ok(Some(selection));
+            }
+        }
+        if let Some(previous) = previous.filter(|mapping| mapping.occupied && mapping.port_owned) {
+            if let Some(selection) = self.select_port(previous.public_port, now_ms)? {
                 return Ok(Some(selection));
             }
         }
@@ -10692,14 +10880,16 @@ mod tests {
         value ^ (value >> 31)
     }
 
-    /// Public port the pre-PERF-001 allocator (a walk of the pool) would
-    /// choose for a new mapping: `Some(port)` when determined, `None` when
-    /// only ports of expired owners remain (any of them is correct), and
-    /// `Err` when every port has a live owner.
-    fn reference_udp_port(
+    /// Model of the port rule (NAT44-004, NAT44-068), computed by walking
+    /// the pool: `Some(port)` when determined, `None` when only ports of
+    /// expired owners remain (any of them is correct), and `Err` when every
+    /// port has a live owner. `previous` is the public port the endpoint's
+    /// expired mapping still owns, if any.
+    fn model_udp_port(
         runtime: &Nat44UdpRuntime<'_>,
         internal_address: Ipv4Address,
         internal_port: u16,
+        previous: Option<u16>,
         now_ms: u64,
     ) -> Result<Option<u16>, ()> {
         let config = runtime.config;
@@ -10713,6 +10903,9 @@ mod tests {
             && owner_live(internal_port) != Some(true)
         {
             return Ok(Some(internal_port));
+        }
+        if let Some(port) = previous {
+            return Ok(Some(port));
         }
         let pool = usize::from(config.last_port - config.first_port) + 1;
         let start = seeded_port_offset(
@@ -10735,7 +10928,8 @@ mod tests {
         }
     }
 
-    /// The pre-PERF-001 reusable-peer predicate, by scanning every slot.
+    /// Whether any peer slot is reusable, by scanning every slot (the
+    /// predicate the search before PERF-001 used).
     fn reference_peer_available(runtime: &Nat44UdpRuntime<'_>, now_ms: u64) -> bool {
         runtime.peers.iter().any(|peer| {
             !peer.occupied
@@ -10751,10 +10945,10 @@ mod tests {
     }
 
     /// Random outbound and inbound UDP, refreshes, and expiry on small
-    /// tables, checked against the pre-PERF-001 full scans: a new mapping
-    /// or peer fails as full exactly when no slot is reusable, the port is
-    /// exactly the first unowned port from the seeded start (or a port of an
-    /// expired owner when none is unowned), exhaustion is exact, and the
+    /// tables, checked against full scans of the slots: a new mapping
+    /// or peer fails as full exactly when no slot is reusable (as the scans
+    /// before PERF-001 decided), the port follows the modelled rule
+    /// (`model_udp_port`), exhaustion is exact, and the
     /// indexes and reuse lists stay consistent after every commit.
     #[test]
     fn udp_reuse_matches_a_full_scan_reference_under_seeded_churn() {
@@ -10812,7 +11006,15 @@ mod tests {
                             .iter()
                             .any(|mapping| !runtime.mapping_is_live(*mapping, now));
                         let peer_available = reference_peer_available(&runtime, now);
-                        let port = reference_udp_port(&runtime, host, internal_port, now);
+                        let previous = runtime
+                            .find_mapping(host, internal_port)
+                            .unwrap()
+                            .map(|(_, mapping)| mapping)
+                            .filter(|mapping| {
+                                mapping.port_owned && !runtime.mapping_is_live(*mapping, now)
+                            })
+                            .map(|mapping| mapping.public_port);
+                        let port = model_udp_port(&runtime, host, internal_port, previous, now);
                         let owners_before = runtime.port_owners.backing_snapshot();
                         match runtime.plan_outbound(host, internal_port, remote, remote_port, now) {
                             Ok(plan) if plan.mapping_created => {
@@ -10866,7 +11068,7 @@ mod tests {
     /// PERF-001 cost bound: with 65536-slot tables and the widest pool,
     /// planning and committing a new flow, even with every public port
     /// owned, makes at most four O(1) list-head checks, two port-owner
-    /// checks, and 34 bitmap word reads; the pre-PERF-001 search visited up
+    /// checks, and 34 bitmap word reads; the search before PERF-001 visited up
     /// to every mapping slot, every peer slot, and every pool port.
     #[test]
     fn udp_new_flow_work_is_constant_in_a_nearly_full_65536_slot_table() {
@@ -10965,6 +11167,13 @@ mod tests {
             let plan = runtime
                 .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0)
                 .unwrap();
+            // A never-used target mapping slot must be the lowest one.
+            runtime.mapping_lists.next_fresh += 1;
+            assert_eq!(
+                runtime.commit_outbound(plan, 0),
+                Err(Nat44UdpCommitError::IndexCorrupt)
+            );
+            runtime.mapping_lists.next_fresh -= 1;
             runtime.commit_outbound(plan, 0).unwrap();
 
             // The plan takes the next never-used peer; moving the fresh
@@ -11009,6 +11218,119 @@ mod tests {
             assert_eq!(plan.mapping.public_port, 40_000);
             runtime.commit_outbound(plan, ttl + 1).unwrap();
             assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+    }
+
+    /// Pins the two port rules that differ from a plain walk of the pool
+    /// (NAT44-068): an endpoint whose mapping expired gets its old public
+    /// port back while that port is still owned only by its expired
+    /// mapping, and a new endpoint takes the first unowned port from its
+    /// seeded start even when a port owned by an expired mapping comes
+    /// first (the walk before H4a took the expired-owned one).
+    #[test]
+    fn returning_endpoint_keeps_its_port_and_unowned_ports_come_first() {
+        let ttl = NAT44_UDP_MIN_IDLE_TTL_MS;
+        let policy = Nat44UdpPolicy::new(ttl, 0x0123_4567).unwrap();
+        with_port_config(policy, 40_000, 40_003, |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 4];
+            let mut peers = [Nat44UdpPeerSlot::default(); 8];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let outbound = |runtime: &mut Nat44UdpRuntime<'_>, host, port, now| {
+                let plan = runtime
+                    .plan_outbound(host, port, REMOTE1, TEST_REMOTE_PORT, now)
+                    .unwrap();
+                runtime.commit_outbound(plan, now).unwrap();
+                plan.mapping.public_port
+            };
+            // Internal ports outside the pool: no port preservation.
+            let first = outbound(&mut runtime, INTERNAL, 1_000, 0);
+            let other = outbound(&mut runtime, INTERNAL2, 1_000, 1);
+            assert_ne!(first, other);
+
+            // INTERNAL's mapping expires; it returns and gets the same port
+            // although an unowned port exists.
+            let returned = outbound(&mut runtime, INTERNAL, 1_000, ttl);
+            assert_eq!(returned, first);
+            assert_eq!(runtime.counters.mappings_expired, 1);
+
+            // INTERNAL2's mapping (`other`) expires. A new endpoint whose
+            // seeded start is `other` gets the next unowned port instead.
+            let now = ttl + 1;
+            let offset = usize::from(other - 40_000);
+            let host = (20..250)
+                .map(|last| Ipv4Address::from_octets([10, 0, 0, last]))
+                .find(|host| {
+                    seeded_port_offset(0x0123_4567, 40_000, 40_003, *host, 1_000) == offset
+                })
+                .unwrap();
+            assert!(runtime.port_owners.owner(other).unwrap().is_some());
+            let chosen = outbound(&mut runtime, host, 1_000, now);
+            assert_ne!(chosen, other);
+            // The new mapping reused INTERNAL2's expired slot (the oldest),
+            // which released `other`.
+            assert_eq!(runtime.port_owners.owner(other), Ok(None));
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+    }
+
+    /// Adversarial peer chain: one mapping with 65535 peers is parked
+    /// (its whole chain released) and recreated, twice, and each new flow
+    /// still does O(1) list work: at most four list-head checks and four
+    /// peer-slot link writes, however long the chain.
+    #[test]
+    fn a_65535_peer_chain_is_parked_and_recreated_in_constant_work() {
+        const PEERS: usize = 65_536;
+        let ttl = NAT44_UDP_MIN_IDLE_TTL_MS;
+        let policy = Nat44UdpPolicy::new(ttl, 3).unwrap();
+        with_port_config(policy, 40_000, 40_001, |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 2];
+            let mut peers = vec![Nat44UdpPeerSlot::default(); PEERS];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), PEERS);
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            runtime.skip_commit_validation.set(true);
+            let remote = |peer: usize| {
+                Ipv4Address::from_octets([100, (peer >> 16) as u8, (peer >> 8) as u8, peer as u8])
+            };
+            let mut worst = [0_usize; 2];
+            let mut flow = |runtime: &mut Nat44UdpRuntime<'_>, host, peer: usize, now| {
+                runtime.reset_index_probe_counts();
+                runtime.peer_link_writes.set(0);
+                let plan = runtime
+                    .plan_outbound(host, 1_000, remote(peer), TEST_REMOTE_PORT, now)
+                    .unwrap();
+                runtime.commit_outbound(plan, now).unwrap();
+                for (worst, seen) in worst
+                    .iter_mut()
+                    .zip([runtime.take_reuse_visits(), runtime.peer_link_writes.get()])
+                {
+                    *worst = (*worst).max(seen);
+                }
+                plan
+            };
+            for peer in 0..PEERS - 1 {
+                flow(&mut runtime, INTERNAL, peer, 0);
+            }
+            assert_eq!(runtime.next_fresh_peer, PEERS - 1);
+            // Expired at the TTL: a new endpoint takes the expired mapping
+            // and the first of its 65535 peers; the rest go to the stale
+            // chain in one splice.
+            let plan = flow(&mut runtime, INTERNAL2, 0, ttl);
+            assert!(plan.mapping_created && plan.mapping_expired);
+            assert_eq!(runtime.mapping_lists.parked.head(), None);
+            // Its next peers come from the stale chain.
+            for peer in 1..4 {
+                assert!(flow(&mut runtime, INTERNAL2, peer, ttl).peer_created);
+            }
+            // Recreated again after another TTL, with 65531 stale peers
+            // still chained.
+            let plan = flow(&mut runtime, INTERNAL, 9, 2 * ttl);
+            assert!(plan.mapping_created);
+            assert!(runtime.reuse_lists_are_consistent());
+            assert!(
+                worst[0] <= 4 && worst[1] <= 4,
+                "work per new flow {worst:?}"
+            );
         });
     }
 }

@@ -342,6 +342,12 @@ pub(super) fn decide_nat44_udp_hairpin<T: TraceSink>(
         )?),
         None => None,
     };
+    if runtime
+        .prevalidate_outbound_commit(outbound, now.0)
+        .is_err()
+    {
+        return nat44_udp_drop(ingress, Nat44UdpConfigMismatch, trace);
+    }
     if let Some(plan) = outbound_firewall {
         firewall
             .as_deref_mut()

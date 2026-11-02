@@ -788,9 +788,16 @@ CLI-034).
   endpoint-independent mapping), and a reconcile flush clears the tables
   (control path). An external inbound SYN still probes 16 keyed slots and
   can report the session table full while a reusable slot exists elsewhere
-  (NAT44-037). With every pool port owned, a new mapping takes the port of
-  the longest-idle expired mapping rather than the first expired owner
-  after the seeded start.
+  (NAT44-037). Port choice differs from before H4a in two ways (NAT44-068):
+  a new endpoint takes the first *unowned* port from its seeded start even
+  when a port of an expired mapping comes first (a returning endpoint
+  still gets its own old port back), and with every pool port owned a new
+  mapping takes the port of the longest-idle expired mapping. That last
+  choice follows expiry order, not the secret seed, so it is predictable
+  (randomization is deferred, NAT44-020).
+- Debug builds validate every NAT44 index after each UDP commit (O(M+P)
+  and more per packet). Use only release builds (`cargo build --release`)
+  in production.
 - Capability diagnostics read `CapEff` in the caller's user namespace; in a
   non-initial user namespace the bits can look sufficient while BPF still
   needs init-namespace capabilities, so the failure appears later as
