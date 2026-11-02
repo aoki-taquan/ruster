@@ -2992,7 +2992,7 @@ XDP link）だけです。run中のkick（`sendto`/`poll`）、`XDP_STATISTICS`�
 変更はrestart-required）、teardownはlink fdのclose（detach）、保持するmap fdへのXSKMAP entry削除
 （Linux 6.5以上は権限不要）、munmap、closeです。そこでgeneration 1のactivate後・最初のtickの前に
 全threadが全capability（inheritable/permitted/effective/ambient、`CAP_SETPCAP`があればbounding）を
-落とし`no_new_privs`を立て、`--user`/`--group`ならuid/gidも切り替えます（既定on、`--keep-privileges`で
+落とし`no_new_privs`を立て、processをdumpable 0にし（最初のidentity変更より前と`setresuid`直後）、`--user`/`--group`ならuid/gidも切り替えます（既定on、`--keep-privileges`で
 opt-out）。credentialはthreadごとで、libcの`setuid`はprocess全体へbroadcastするため、privateな
 FFI module（`run::privileges::linux::sys`）のraw `syscall(2)`でthreadごとに行います。output threadは
 spawn時（何も書く前、spawn側は結果を待つ）、router threadはactivate後に自分を落とし、

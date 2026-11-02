@@ -388,13 +388,36 @@ TimeoutStopSec=10
 ```
 
 `990` stands for a dedicated system account with no login and no other
-use (`useradd --system --no-create-home --shell /usr/sbin/nologin ruster`);
-the config must be readable by it (section 5, "Privilege drop"). Without
+use (`useradd --system --no-create-home --shell /usr/sbin/nologin ruster`,
+which also creates its group). Recommended config layout, readable by the
+router in every mode of section 5 ("Privilege drop") and accepted by
+`--strict-config-perms`:
+
+```bash
+sudo install -d -o root -g ruster -m 0750 /etc/ruster
+sudo install -o root -g ruster -m 0640 router.toml /etc/ruster/router.toml
+```
+
+Root reads it as the owner (also after the drop, without
+`CAP_DAC_OVERRIDE`), the switched user through `--group`, and nobody else
+can read or change it. Replace it on reload with the same owner and mode
+(`install ... router.toml.next` and `mv`). Without
 `--user`/`--group` drop `CAP_SETUID CAP_SETGID` from both lines; without
 `CAP_SETPCAP` the bounding set cannot be cleared and the drop reports
 `bounding-set=kept` (harmless: no capability can come back, see section 5).
 Do not use `NoNewPrivileges=yes` with `ExecStartPre=` helpers that need it
 off; `ruster run` sets no_new_privs itself after startup.
+
+Upgrade note (H6, behaviour change): the drop is on by default. On a kernel
+older than 6.5 with `kernel.unprivileged_bpf_disabled` nonzero (the default
+of, for example, Ubuntu 22.04 and RHEL 9 kernels) an unchanged unit now
+exits 4 at startup with `stage=privileges code=TEARDOWN_NEEDS_CAPABILITIES`
+before touching any port, and `Restart=on-failure` restarts it in a loop.
+There, add `--keep-privileges` (and accept its risk, section 3) or move to
+Linux 6.5 or newer. The check reads the kernel version only: a vendor
+kernel that backported the 6.5 change under an older version is not
+detected and is refused too (fail closed). `--keep-privileges` is needed
+only in that case, or to diagnose a drop failure.
 `Restart=on-failure` restarts after exit 1, 3 and 4 and after a crash;
 exit 2 (usage or invalid config) also restarts under this setting, so fix
 the config first. `TimeoutStopSec` must exceed the 2 s drain plus the 1 s
@@ -530,7 +553,10 @@ Linux credentials are per thread. The two output threads (`ruster-stdout`,
 (the same steps, the same identity) before they write anything; the router
 thread drops its own after activation. Each uses raw per-thread syscalls
 (not the C library's process-wide `setuid`, which would also drop the
-router thread too early). Steps per thread: `PR_SET_KEEPCAPS` 0; with
+router thread too early). Steps per thread: `PR_SET_DUMPABLE` 0 (a flag
+of the whole process, set before the first identity change, set again
+right after `setresuid` because an euid change resets it to
+`fs.suid_dumpable`, and read back at the end); `PR_SET_KEEPCAPS` 0; with
 `CAP_SETPCAP`, `PR_CAPBSET_DROP` of every capability; `PR_CAP_AMBIENT`
 clear; with `--user`/`--group` `setgroups(0)`, `setresgid`, `setresuid`;
 `capset` with empty sets; `PR_SET_NO_NEW_PRIVS` 1. Each thread then checks
@@ -556,17 +582,34 @@ refused there at startup with `TEARDOWN_NEEDS_CAPABILITIES`).
 What changes:
 
 - Root without capabilities has no `CAP_DAC_OVERRIDE`: a reload reads the
-  config with plain file permissions. A root-owned `/etc/ruster/router.toml`
-  is fine; a config in another user's private directory fails with
-  `reload failed: stage=read code=PERMISSION_DENIED` (startup still read
-  it). With `--user`/`--group` the config and every directory above it must
-  be readable by that user, and `--strict-config-perms` then accepts files
-  owned by root or by that user.
+  config with plain file permissions. A config in another user's private
+  directory fails with `reload failed: stage=read code=PERMISSION_DENIED`
+  (startup still read it). With `--user`/`--group` the config and every
+  directory above it must be readable by that user, and
+  `--strict-config-perms` then accepts files owned by root or by that user.
+  The layout of section 2 (`/etc/ruster` `root:<group> 0750`, the config
+  `root:<group> 0640`) works in every mode: root reads it as the owner,
+  the switched user through its group, and `--strict-config-perms` accepts
+  it (the privileged smoke reloads exactly this layout).
 - uid 0 without capabilities still owns every root-owned file. Use
   `--user`/`--group` with a dedicated account to take that away too.
+- The process is not dumpable from the drop on: no core dumps, and
+  `ptrace` or `/proc/<pid>/mem` of it needs `CAP_SYS_PTRACE`, also for the
+  switched user. Its `/proc/<pid>` entries are owned by root.
 - With `--user`/`--group` that user can signal the router (SIGHUP reload,
-  SIGTERM stop) and owns its locked memory accounting from then on; the
-  process is not dumpable (no core dumps, no `ptrace` by that user).
+  SIGTERM stop: the kernel lets a user signal a process whose real or
+  saved uid is theirs) and owns its locked memory accounting from then on.
+  The output threads switch at spawn, before startup, so during startup
+  (usually under a second, longer with startup retries) that user can already send them signals,
+  which are delivered to the process like any other: SIGHUP and SIGTERM
+  are only flags read by the router thread (a stop during startup rolls
+  back and exits 0), and SIGKILL or SIGSTOP end or pause the process like
+  a crash (the unpinned links detach). The user cannot `ptrace` or read
+  the still privileged router thread: the process is made not dumpable
+  before any thread switches. What remains: with `fs.suid_dumpable=1` (not
+  a default) the kernel makes the process dumpable again inside each
+  thread's `setresuid` until the very next `PR_SET_DUMPABLE` call, a
+  window of one syscall per thread; keep `fs.suid_dumpable` at 0 or 2.
 - Nothing can bring a capability back: restart the router to change
   anything restart-required, as before.
 
@@ -1084,9 +1127,17 @@ What it proves, on the runner's kernel only:
   `--user`/`--group` as the invoking user: every uid/gid field switched, no
   supplementary group), `priv_run_privileges_runtime` (after the drop:
   reloads applied and refused, link down/up, the MTU fatal exit, drain and
-  detach), `priv_run_privileges_no_dac_override` (uid 0 after the drop
-  cannot reload a config in another user's 0700 directory, generation 1
-  and forwarding kept) and `priv_run_privileges_kept` (`--keep-privileges`:
+  detach), `priv_run_privileges_reload_dropped` (the recommended layout in
+  a root-owned `/run/ruster-smoke.XXXXXX` directory, `root:<gid> 0750` with
+  the config `root:<gid> 0640`, removed on every exit: a SIGHUP reload that
+  swaps the file applies, generation 2, and the firewall then denies,
+  after the default drop as root, with `--strict-config-perms`, and with
+  `--user`/`--group` plus `--strict-config-perms`, where `/proc/<pid>` is
+  also owned by root because the process is not dumpable),
+  `priv_run_privileges_no_dac_override` (uid 0 after the drop cannot
+  reload a config from the smoke's 0700 work directory owned by the
+  invoking user, generation 1 and forwarding kept) and
+  `priv_run_privileges_kept` (`--keep-privileges`:
   `CAP_NET_ADMIN` in every thread, the same reload applies,
   `privileges.state=kept`).
 - Nothing is left behind: a final step fails if any `ruster-*` namespace
@@ -1135,8 +1186,8 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `stage=privileges code=MEMLOCK_LIMIT limit-bytes=L required-bytes=R` | 4 | soft memlock limit below the UMEM estimate | raise `ulimit -l`/`LimitMEMLOCK` to at least R, or grant `CAP_IPC_LOCK` |
 | `stage=privileges code=UNREADABLE source=/proc/self/status\|/proc/self/limits\|/proc/sys/kernel/osrelease\|/proc/sys/kernel/unprivileged_bpf_disabled` | 4 | procfs not readable | mount procfs in the namespace/container |
 | `stage=privileges code=MISSING_CAPABILITIES missing=CAP_SETGID,CAP_SETUID` | 4 | `--user`/`--group` without the capabilities to switch | grant `CAP_SETUID` and `CAP_SETGID` (systemd: add them to `AmbientCapabilities`/`CapabilityBoundingSet`), or drop `--user`/`--group` |
-| `stage=privileges code=TEARDOWN_NEEDS_CAPABILITIES` | 4 | kernel before 6.5 with `kernel.unprivileged_bpf_disabled` set: the teardown after the drop would fail | use Linux 6.5 or newer, or knowingly `--keep-privileges` |
-| `stage=privilege-drop code=<STEP>/ERRNO_<n>` (`KEEPCAPS`, `BOUNDING`, `AMBIENT`, `GROUPS`, `GID`, `UID`, `CAPSET`, `NO_NEW_PRIVS`), `code=NOT_DROPPED/CAPABILITIES\|BOUNDING\|NO_NEW_PRIVS\|IDENTITY\|GROUPS`, `code=STATUS_UNREADABLE` [`thread=output`] | 1 | the privilege drop failed (everything was rolled back) | check seccomp/LSM policy on `prctl`/`capset`/set-id calls and procfs; `NOT_DROPPED` names what a thread kept: report it |
+| `stage=privileges code=TEARDOWN_NEEDS_CAPABILITIES` | 4 | kernel before 6.5 with `kernel.unprivileged_bpf_disabled` set (Ubuntu 22.04, RHEL 9 defaults; vendor backports are not detected): the teardown after the drop would fail | use Linux 6.5 or newer, or knowingly `--keep-privileges` (section 2, upgrade note); with `Restart=on-failure` the unit otherwise restarts in a loop |
+| `stage=privilege-drop code=<STEP>/ERRNO_<n>` (`DUMPABLE`, `KEEPCAPS`, `BOUNDING`, `AMBIENT`, `GROUPS`, `GID`, `UID`, `CAPSET`, `NO_NEW_PRIVS`), `code=NOT_DROPPED/CAPABILITIES\|BOUNDING\|NO_NEW_PRIVS\|IDENTITY\|GROUPS\|DUMPABLE`, `code=STATUS_UNREADABLE` [`thread=output`] | 1 | the privilege drop failed (everything was rolled back) | check seccomp/LSM policy on `prctl`/`capset`/set-id calls and procfs; `NOT_DROPPED` names what a thread kept: report it |
 | `reload failed: stage=read code=PERMISSION_DENIED` after a clean start | — | after the drop the config is read without `CAP_DAC_OVERRIDE` (section 5) | make the config and its directories readable by the process's user (root: a root-owned path such as `/etc/ruster`) |
 | `stage=open code=INTERFACE_LOOKUP/NO_SUCH_DEVICE` | 1 | the `device` does not exist in this namespace | fix `device`, or run in the right namespace |
 | `stage=open code=TX_QUEUE_CHECK/NO_TX_QUEUE`, `BIND/INVALID_ARGUMENT` | 1 | `queue` is not a queue of the device | use queue 0, or a queue that has RX and TX |

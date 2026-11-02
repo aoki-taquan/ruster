@@ -594,8 +594,10 @@ cargo build --release -p ruster-cli
 sudo target/release/ruster run --config router.toml                # 既定: 60秒ごとにstats
 sudo target/release/ruster run --stats-interval 0 -- router.toml   # 周期statsなし
 sudo target/release/ruster run --startup-attempts 1 -- router.toml # 起動retryなし
-sudo target/release/ruster run --user 990 --group 990 -- router.toml # 起動後にuid/gid 990へ切替
+sudo target/release/ruster run -- router.toml                      # 既定のdrop
 # stderr: ruster run: privileges dropped: threads=3 capabilities=none bounding-set=cleared no-new-privs=1 identity=unchanged
+sudo target/release/ruster run --user 990 --group 990 -- router.toml # 起動後にuid/gid 990へ切替
+# stderr: ruster run: privileges dropped: threads=3 capabilities=none bounding-set=cleared no-new-privs=1 identity=switched
 # stderr: ruster run: running generation 1 on 2 port(s); send SIGINT or SIGTERM to stop, SIGHUP to reload
 sudo kill -HUP <pid>                                               # configをreload
 ```
@@ -618,8 +620,13 @@ sudo kill -HUP <pid>                                               # configをre
   （netlink dump）、SIGHUP reload、health/device eventのfatal、drain、detachは権限なしで動きます
   （privileged smokeで確認）。teardownのXSKMAP entry削除はLinux 6.5以上（または
   `kernel.unprivileged_bpf_disabled=0`）でないと権限が要るため、それ以外では起動前に
-  `TEARDOWN_NEEDS_CAPABILITIES`でexit 4です。drop後のrootは`CAP_DAC_OVERRIDE`を持たないので、
-  reloadするconfigは通常のpermissionで読める必要があります。statsは`privileges.state=dropped|kept`
+  `TEARDOWN_NEEDS_CAPABILITIES`でexit 4です（挙動変更: Ubuntu 22.04やRHEL 9既定のkernelでは
+  変更していないunitがexit 4になり`Restart=on-failure`でloopするので`--keep-privileges`が要る。
+  vendor backportは検出せずfail closed）。processはdrop時からdumpable 0（core dumpなし、
+  `ptrace`には`CAP_SYS_PTRACE`）。drop後のrootは`CAP_DAC_OVERRIDE`を持たないので、
+  reloadするconfigは通常のpermissionで読める必要があります（推奨: `/etc/ruster`を
+  `root:<group> 0750`、configを`root:<group> 0640`。rootはownerとして、切替後のuserはgroupで読め、
+  `--strict-config-perms`も受理）。statsは`privileges.state=dropped|kept`
   等。詳細はrunbookの「Privilege drop」。
 - portの前提（起動時に確認）: deviceのRX queueは1つ（rtnetlinkの`IFLA_NUM_RX_QUEUES`で数えるので
   namespaceに正しいが、driverが確保したqueue数。`ethtool -L <dev> combined 1`しても確保数が多い

@@ -43,14 +43,23 @@
 #             namespace warns and recovers with forwarding; then rb's MTU
 #             raised beyond the 2048-byte frame bound: exit 1 after drain,
 #             nothing left attached
-#   privileges  (H6) after the drop root keeps uid 0 but no capability:
-#             a config in a 0700 directory of the invoking user is read at
-#             startup (still privileged) but a SIGHUP reload of it fails
-#             with stage=read code=PERMISSION_DENIED while forwarding goes
-#             on (no CAP_DAC_OVERRIDE); with --keep-privileges every thread
-#             keeps CAP_NET_ADMIN (NoNewPrivs 0), the same reload applies,
-#             and the stats say privileges.state=kept; both exit 0 on
-#             SIGTERM with nothing attached
+#   privileges  (H6) the recommended config layout (runbook section 5):
+#             a root-owned directory /run/ruster-smoke.XXXXXX (root:<gid>
+#             0750, removed on every exit; a plain directory, nothing
+#             network-related in the initial namespace) with the config
+#             root:<gid> 0640. With the default drop as root (no --user),
+#             again with --strict-config-perms, and with --user/--group
+#             plus --strict-config-perms, a SIGHUP reload that swaps the
+#             file in that directory applies (generation 2) and the
+#             firewall then denies. After the drop root keeps uid 0 but no
+#             capability: the smoke's own work directory (0700, owned by
+#             the invoking user) is read at startup (still privileged) but
+#             a SIGHUP reload from it fails with stage=read
+#             code=PERMISSION_DENIED while forwarding goes on (no
+#             CAP_DAC_OVERRIDE); with --keep-privileges every thread keeps
+#             CAP_NET_ADMIN (NoNewPrivs 0), the same reload applies, and
+#             the stats say privileges.state=kept; all exit 0 on SIGTERM
+#             with nothing attached
 #   validate  (gap fill) `ruster validate` on every config the smoke runs
 #             (exit 0, af-xdp backend with 2 ports) and on an invalid one
 #             (exit 2); `ruster plan` between the configs the smoke reloads
@@ -176,6 +185,7 @@ created=
 launcher=
 ruster_pid=
 mroute=
+etcdir=
 
 # True only if `$1` is a live process running the built ruster binary.
 is_ruster() {
@@ -200,6 +210,10 @@ cleanup() {
         launcher=
     fi
     : >"$stopfile" 2>/dev/null || true
+    case $etcdir in
+    /run/ruster-smoke.*) sudo -n rm -rf -- "$etcdir" 2>/dev/null || true ;;
+    esac
+    etcdir=
     for ns in $created; do
         sudo -n ip netns del "$ns" 2>/dev/null || true
     done
@@ -951,10 +965,54 @@ cat "$work/ops.err"
 echo "priv_run_mtu: MTU above the frame bound failed closed with exit 1 and detached verified"
 echo "priv_run_privileges_runtime: after the drop and identity switch, three SIGHUP reloads applied and one refused, link down/up warned and recovered, the MTU event failed closed, drain and detach completed verified"
 
-# privileges (H6): what the drop takes from root, and --keep-privileges.
-mkdir -m 0700 "$work/private"
-cp "$work/router.toml" "$work/private/router.toml"
-start_ruster drop-root "$work/private/router.toml"
+# privileges (H6): the recommended layout reloads under every drop mode.
+etcdir=$(sudo -n mktemp -d /run/ruster-smoke.XXXXXX)
+case $etcdir in
+/run/ruster-smoke.*) ;;
+*) fail "privileges: unexpected directory $etcdir" ;;
+esac
+sudo -n chown "root:$smoke_gid" "$etcdir"
+sudo -n chmod 0750 "$etcdir"
+# Installs $1 as $etcdir/router.toml (root:<gid> 0640) by an atomic swap.
+install_etc() {
+    sudo -n install -m 0640 -o root -g "$smoke_gid" "$1" "$etcdir/router.toml.next"
+    sudo -n mv -f "$etcdir/router.toml.next" "$etcdir/router.toml"
+}
+for mode in default strict user-strict; do
+    case $mode in
+    default) set -- ;;
+    strict) set -- --strict-config-perms ;;
+    user-strict) set -- --strict-config-perms --user "$smoke_uid" --group "$smoke_gid" ;;
+    esac
+    name="etc-$mode"
+    install_etc "$work/router.toml"
+    start_ruster "$name" "$etcdir/router.toml" "$@"
+    wait_ready "$name" || fail "$name: ruster exited during startup"
+    if [ "$mode" = user-strict ]; then
+        assert_dropped "$name" "$smoke_uid $smoke_gid"
+        # Not dumpable after the switch: procfs reports root as the owner.
+        [ "$(sudo -n stat -c %u "/proc/$ruster_pid/status")" = 0 ] ||
+            fail "$name: the switched process is dumpable"
+    else
+        assert_dropped "$name"
+    fi
+    forward_once "$name-before"
+    install_etc "$work/deny.toml"
+    signal_ruster HUP
+    wait_line "$name" "reload applied: generation=2 previous=1"
+    forward_blocked "$name-denied"
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "$name: exit status $status after SIGTERM"
+    assert_detached "the $name run"
+done
+set --
+sudo -n rm -rf -- "$etcdir"
+etcdir=
+echo "priv_run_privileges_reload_dropped: a config root:<gid> 0640 in a root:<gid> 0750 directory reloaded (generation 2, firewall then denied) after the default drop as root, with --strict-config-perms, and with --user/--group plus --strict-config-perms (process not dumpable), exit 0, detached verified"
+# What the drop takes from root: the work directory is 0700 and owned by
+# the invoking user, so uid 0 without CAP_DAC_OVERRIDE cannot read it.
+start_ruster drop-root "$work/router.toml"
 wait_ready drop-root || fail "drop-root: ruster exited during startup"
 assert_dropped drop-root
 signal_ruster HUP
@@ -964,8 +1022,8 @@ signal_ruster TERM
 wait_ruster
 [ "$status" -eq 0 ] || fail "drop-root: exit status $status after SIGTERM"
 assert_detached "the drop-root run"
-echo "priv_run_privileges_no_dac_override: after the drop uid 0 could not reload a config in a 0700 directory of another user (PERMISSION_DENIED, generation 1 kept, forwarding kept), exit 0, detached verified"
-start_ruster keep "$work/private/router.toml" --keep-privileges
+echo "priv_run_privileges_no_dac_override: after the drop uid 0 could not reload a config in the 0700 work directory of another user (PERMISSION_DENIED, generation 1 kept, forwarding kept), exit 0, detached verified"
+start_ruster keep "$work/router.toml" --keep-privileges
 wait_ready keep || fail "keep: ruster exited during startup"
 grep -qxF "ruster run: warning: privileges kept (--keep-privileges): every capability stays for the whole run" \
     "$work/keep.err" || fail "keep: no warning"

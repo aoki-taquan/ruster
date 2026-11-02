@@ -28,6 +28,10 @@
 //! every thread of the process to hold no capability (fail closed). The
 //! steps per thread, in order:
 //!
+//! 0. `PR_SET_DUMPABLE` 0 (per process; repeated right after `setresuid`,
+//!    which resets it to `fs.suid_dumpable`, and read back at the end), so
+//!    the target user cannot `ptrace` a switched thread while another
+//!    thread is still privileged;
 //! 1. `PR_SET_KEEPCAPS` 0 (an identity switch clears every capability);
 //! 2. with `CAP_SETPCAP` effective, `PR_CAPBSET_DROP` of every capability
 //!    (without it the bounding set stays as it was: reported as `kept`;
@@ -78,6 +82,8 @@ impl Default for PrivilegePolicy {
 /// The step of a per-thread drop that failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DropStep {
+    /// `PR_SET_DUMPABLE` 0 (or reading it back).
+    Dumpable,
     Keepcaps,
     Bounding,
     Ambient,
@@ -101,6 +107,8 @@ pub enum Residue {
     Identity,
     /// A supplementary group after an identity switch.
     Groups,
+    /// The process is still dumpable (`PR_GET_DUMPABLE` is not 0).
+    Dumpable,
 }
 
 /// Why a privilege drop failed. Value-free.
@@ -246,7 +254,9 @@ pub const fn clears_bounding(effective: u64) -> bool {
 /// `CAP_BPF`/`CAP_SYS_ADMIN` while `kernel.unprivileged_bpf_disabled` is
 /// nonzero (the default since 5.16); 6.5 moved that check into map and
 /// program creation. `release` is `/proc/sys/kernel/osrelease`; an
-/// unparsable release counts as old (fail closed).
+/// unparsable release counts as old (fail closed). Vendor kernels that
+/// backported the 6.5 change under an older version number are not
+/// detected and are refused too (fail closed: `--keep-privileges` there).
 pub fn teardown_without_capabilities(release: &str, unprivileged_bpf_disabled: u32) -> bool {
     if unprivileged_bpf_disabled == 0 {
         return true;
@@ -362,7 +372,7 @@ pub mod linux {
 
     use super::{
         check, clears_bounding, parse_status, Bounding, Credentials, DropFailure, DropReport,
-        DropStep, Expected, Identity, PrivilegePolicy,
+        DropStep, Expected, Identity, PrivilegePolicy, Residue,
     };
 
     /// What one thread's drop left: its own credentials and whether it
@@ -379,7 +389,7 @@ pub mod linux {
         parse_status(&text).ok_or(DropFailure::Unreadable)
     }
 
-    fn step(step: DropStep, result: Result<(), i32>) -> Result<(), DropFailure> {
+    fn step<T>(step: DropStep, result: Result<T, i32>) -> Result<T, DropFailure> {
         result.map_err(|errno| DropFailure::Syscall { step, errno })
     }
 
@@ -396,6 +406,10 @@ pub mod linux {
         } else {
             Bounding::Kept
         };
+        // Not dumpable before any identity change: a dumpable process whose
+        // thread already runs as the target uid could be `ptrace`d by that
+        // user while another thread is still privileged.
+        step(DropStep::Dumpable, sys::set_not_dumpable())?;
         step(DropStep::Keepcaps, sys::set_keepcaps_off())?;
         if bounding == Bounding::Cleared {
             step(DropStep::Bounding, sys::clear_bounding_set())?;
@@ -405,9 +419,15 @@ pub mod linux {
             step(DropStep::Groups, sys::clear_supplementary_groups())?;
             step(DropStep::Gid, sys::set_gid(gid))?;
             step(DropStep::Uid, sys::set_uid(uid))?;
+            // An euid change resets the (per-process) dumpable flag to
+            // `fs.suid_dumpable`; clear it again at once.
+            step(DropStep::Dumpable, sys::set_not_dumpable())?;
         }
         step(DropStep::Capset, sys::clear_capabilities())?;
         step(DropStep::NoNewPrivs, sys::set_no_new_privs())?;
+        if step(DropStep::Dumpable, sys::dumpable())? {
+            return Err(DropFailure::NotDropped(Residue::Dumpable));
+        }
         let after = thread_status()?;
         let expected = Expected {
             bounding: match bounding {
@@ -472,6 +492,8 @@ pub mod linux {
         const PR_SET_KEEPCAPS: c_long = 8;
         const PR_CAPBSET_DROP: c_long = 24;
         const PR_SET_NO_NEW_PRIVS: c_long = 38;
+        const PR_GET_DUMPABLE: c_long = 3;
+        const PR_SET_DUMPABLE: c_long = 4;
         const PR_CAP_AMBIENT: c_long = 47;
         const PR_CAP_AMBIENT_CLEAR_ALL: c_long = 4;
         const EINVAL: i32 = 22;
@@ -553,6 +575,23 @@ pub mod linux {
                     0_i64,
                 )
             })
+        }
+
+        /// `PR_SET_DUMPABLE` 0: no core dump, and `ptrace` of any thread
+        /// needs `CAP_SYS_PTRACE` (per process: it is a flag of the mm).
+        pub fn set_not_dumpable() -> Result<(), i32> {
+            prctl(PR_SET_DUMPABLE, 0)
+        }
+
+        /// Whether the process is dumpable (`PR_GET_DUMPABLE` nonzero).
+        pub fn dumpable() -> Result<bool, i32> {
+            // SAFETY: as in `prctl`: integers only, no memory passed; the
+            // result is the flag (0, 1, or 2) or -1 with errno.
+            let value = unsafe { syscall(SYS_PRCTL, PR_GET_DUMPABLE, 0_i64, 0_i64, 0_i64, 0_i64) };
+            if value == -1 {
+                return Err(errno());
+            }
+            Ok(value != 0)
         }
 
         pub fn set_no_new_privs() -> Result<(), i32> {
@@ -825,7 +864,9 @@ mod tests {
 
     /// The identity switch: with `CAP_SETGID` it switches this thread
     /// only; without it the first set-id step fails with `EPERM` (fail
-    /// closed) before any capability is given up.
+    /// closed) before it reaches the uid, `capset`, or no_new_privs steps
+    /// (the earlier dumpable, keepcaps, bounding, and ambient steps have run
+    /// on that thread).
     #[cfg(all(
         target_os = "linux",
         target_arch = "x86_64",
