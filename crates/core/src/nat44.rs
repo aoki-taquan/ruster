@@ -9,12 +9,14 @@ use std::cell::Cell;
 
 use crate::{
     fixed_directory::{
-        DirectoryHashDomain, DirectoryHashKey, DirectorySemanticError, FixedDirectory,
-        PortOwnerError, PortOwnerExpectation, PortOwnerSemanticError, PortOwnerTable,
-        PortOwnerToken, PreparedDirectoryLink, PreparedDirectoryRelink,
+        port_free_bitmap_words, DirectoryHashDomain, DirectoryHashKey, DirectorySemanticError,
+        FixedDirectory, PortOwnerError, PortOwnerExpectation, PortOwnerSemanticError,
+        PortOwnerTable, PortOwnerToken, PreparedDirectoryLink, PreparedDirectoryRelink,
         PreparedPortOwnerMoveTopology,
     },
-    route, DirectoryBucket, DirectoryNode, ForwardingSnapshot, IfId, Ipv4Address, OccupancyCounter,
+    route,
+    slot_list::{Linked, SlotLinks, SlotList, LINK_NONE},
+    DirectoryBucket, DirectoryNode, ForwardingSnapshot, IfId, Ipv4Address, OccupancyCounter,
     PortOwnerSlot, TableOccupancy,
 };
 
@@ -254,6 +256,8 @@ mod tcp_tests {
             Box::leak(vec![DirectoryNode::default(); sessions.len()].into_boxed_slice());
         let port_count = usize::from(config.last_port - config.first_port) + 1;
         let port_owners = Box::leak(vec![PortOwnerSlot::default(); port_count].into_boxed_slice());
+        let port_free_bits =
+            Box::leak(vec![0_u64; crate::port_free_bitmap_words(port_count)].into_boxed_slice());
         Nat44TcpRuntime::new(
             config,
             mappings,
@@ -266,6 +270,7 @@ mod tcp_tests {
                 session_address_buckets,
                 session_address_nodes,
                 port_owners,
+                port_free_bits,
             ),
             test_tcp_hash_key(),
         )
@@ -1009,8 +1014,10 @@ mod tcp_tests {
                     443,
                 ]
             );
-            assert_eq!(std::mem::size_of::<Nat44TcpMappingSlot>(), 48);
-            assert_eq!(std::mem::size_of::<Nat44TcpSessionSlot>(), 48);
+            // 48 bytes of state plus the reuse-list links (PERF-001),
+            // rounded up to the 16-byte alignment of the lifecycle epoch.
+            assert_eq!(std::mem::size_of::<Nat44TcpMappingSlot>(), 64);
+            assert_eq!(std::mem::size_of::<Nat44TcpSessionSlot>(), 64);
             // A new session is keyed into both the exact and the
             // remote-address session directory, so the plan carries two
             // prepared session links (288 bytes on x86_64).
@@ -1795,7 +1802,9 @@ mod tcp_tests {
                     runtime.reusable_session_checks.get()
                 );
             }
-            // The outbound path keeps its exhaustive search.
+            // The outbound path checks only the head of the session
+            // activity list (PERF-001): the least recently active session
+            // is live, so every session is.
             runtime.reusable_session_checks.set(0);
             assert_eq!(
                 runtime
@@ -1803,7 +1812,7 @@ mod tcp_tests {
                     .err(),
                 Some(Nat44TcpPlanError::SessionFull)
             );
-            assert_eq!(runtime.reusable_session_checks.get(), SESSIONS);
+            assert_eq!(runtime.reusable_session_checks.get(), 1);
         });
 
         // Address-dependent: a long chain of expired (mapping, REMOTE1)
@@ -1865,6 +1874,7 @@ mod tcp_tests {
             let mut session_address_buckets = session_buckets;
             let mut session_address_nodes = session_nodes;
             let mut owners = [PortOwnerSlot::default(); 1];
+            let mut owner_bits = vec![0_u64; crate::port_free_bitmap_words(1)];
             let first_binding = {
                 let first = Nat44TcpRuntime::new(
                     config,
@@ -1878,6 +1888,7 @@ mod tcp_tests {
                         &mut session_address_buckets,
                         &mut session_address_nodes,
                         &mut owners,
+                        &mut owner_bits,
                     ),
                     test_tcp_hash_key(),
                 )
@@ -1896,6 +1907,7 @@ mod tcp_tests {
                     &mut session_address_buckets,
                     &mut session_address_nodes,
                     &mut owners,
+                    &mut owner_bits,
                 ),
                 test_tcp_hash_key(),
             )
@@ -1952,6 +1964,7 @@ mod tcp_tests {
                 internal_port: 40_000,
                 public_port: 40_000,
                 last_activity_ms: 3,
+                link: TcpMappingLink::default(),
             };
             let occupied_session = Nat44TcpSessionSlot {
                 occupied: true,
@@ -1962,6 +1975,7 @@ mod tcp_tests {
                 remote_port: 443,
                 last_activity_ms: 3,
                 external_inbound: false,
+                links: SlotLinks::UNLINKED,
             };
             let mut mappings = [occupied_mapping];
             let mut sessions = [occupied_session];
@@ -1972,6 +1986,7 @@ mod tcp_tests {
             let mut session_address_buckets = session_buckets;
             let mut session_address_nodes = session_nodes;
             let mut owners = [PortOwnerSlot::default(); 1];
+            let mut owner_bits = vec![0_u64; crate::port_free_bitmap_words(1)];
             let before_mapping_buckets = mapping_buckets;
             let before_session_buckets = session_buckets;
             let before_session_nodes = session_nodes;
@@ -1984,6 +1999,7 @@ mod tcp_tests {
                 &mut session_address_buckets,
                 &mut session_address_nodes,
                 &mut owners,
+                &mut owner_bits,
             );
             assert!(matches!(
                 Nat44TcpRuntime::new(
@@ -2234,6 +2250,7 @@ mod tcp_tests {
                     let mut session_address_buckets = session_buckets;
                     let mut session_address_nodes = session_nodes;
                     let mut owners = [PortOwnerSlot::default(); PORT_CAPACITY];
+                    let mut owner_bits = vec![0_u64; crate::port_free_bitmap_words(PORT_CAPACITY)];
                     let mut runtime = Nat44TcpRuntime::new(
                         config,
                         &mut mappings,
@@ -2246,6 +2263,7 @@ mod tcp_tests {
                             &mut session_address_buckets,
                             &mut session_address_nodes,
                             &mut owners,
+                            &mut owner_bits,
                         ),
                         test_tcp_hash_key(),
                     )
@@ -2518,6 +2536,250 @@ mod tcp_tests {
             );
         }
     }
+
+    fn next_random(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = *state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    /// Public port the pre-PERF-001 allocator (a walk of the pool) would
+    /// choose for a new mapping: `Some(port)` when determined, `None` when
+    /// only ports of expired owners remain (any of them is correct), and
+    /// `Err` when every port has a live owner.
+    fn reference_tcp_port(
+        runtime: &Nat44TcpRuntime<'_>,
+        internal_address: Ipv4Address,
+        internal_port: u16,
+        now_ms: u64,
+    ) -> Result<Option<u16>, ()> {
+        let config = runtime.config;
+        let owner_live =
+            |port: u16| {
+                runtime.port_owners.owner(port).unwrap().map(|owner| {
+                    runtime.mapping_is_live(runtime.mappings[owner.state_index()], now_ms)
+                })
+            };
+        if (config.first_port..=config.last_port).contains(&internal_port)
+            && owner_live(internal_port) != Some(true)
+        {
+            return Ok(Some(internal_port));
+        }
+        let pool = usize::from(config.last_port - config.first_port) + 1;
+        let start = seeded_port_offset(
+            config.policy.allocator_seed,
+            config.first_port,
+            config.last_port,
+            internal_address,
+            internal_port,
+        );
+        if let Some(port) = (0..pool)
+            .map(|step| config.first_port + ((start + step) % pool) as u16)
+            .find(|port| owner_live(*port).is_none())
+        {
+            return Ok(Some(port));
+        }
+        if (config.first_port..=config.last_port).any(|port| owner_live(port) == Some(false)) {
+            Ok(None)
+        } else {
+            Err(())
+        }
+    }
+
+    /// Random outbound and inbound SYNs, refreshes, and expiry on small
+    /// tables, checked against the pre-PERF-001 full scans: a new mapping
+    /// or session fails as full exactly when no slot is reusable, the port
+    /// is exactly the first unowned port from the seeded start (or a port
+    /// of an expired owner when none is unowned), exhaustion is exact, and
+    /// the indexes and reuse lists stay consistent after every commit.
+    #[test]
+    fn tcp_reuse_matches_a_full_scan_reference_under_seeded_churn() {
+        let ttl = NAT44_TCP_MIN_IDLE_TTL_MS;
+        let mut outcomes = [0_usize; 8];
+        for seed in 0..32_u64 {
+            let policy = Nat44TcpPolicy::new(ttl, seed.wrapping_mul(0x2545_f491_4f6c_dd1d))
+                .unwrap()
+                .with_filtering(Nat44Filtering::EndpointIndependent);
+            with_config(policy, 40_000, 40_003, |config| {
+                // Three mappings fill before the four ports; five exhaust them.
+                let mut mappings =
+                    vec![Nat44TcpMappingSlot::default(); 3 + 2 * (seed as usize % 2)];
+                let mut sessions = [Nat44TcpSessionSlot::default(); 9];
+                let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+                let mut rng = seed ^ 0x0bad_cafe;
+                let mut now = 0;
+                for _ in 0..300 {
+                    now += match next_random(&mut rng) % 10 {
+                        0 => ttl,
+                        1 => ttl / 2,
+                        2..=4 => 1_000,
+                        _ => 0,
+                    };
+                    let remote = [REMOTE1, REMOTE2][(next_random(&mut rng) % 2) as usize];
+                    let remote_port = 1 + (next_random(&mut rng) % 3) as u16;
+                    let session_available = (0..runtime.sessions.len())
+                        .any(|index| runtime.session_slot_reusable(index, now));
+                    if next_random(&mut rng).is_multiple_of(4) {
+                        let public_port = 40_000 + (next_random(&mut rng) % 4) as u16;
+                        let live = runtime
+                            .mapping_for_public_port(public_port, now)
+                            .unwrap()
+                            .is_some();
+                        match runtime.plan_inbound(public_port, remote, remote_port, true, now) {
+                            Ok(plan) => {
+                                assert!(live && (!plan.session_created || session_available));
+                                runtime.commit_inbound(plan, now).unwrap();
+                                outcomes[0] += 1;
+                            }
+                            Err(Nat44TcpPlanError::MappingMiss) => assert!(!live),
+                            Err(Nat44TcpPlanError::SessionFull) => {
+                                assert!(live && !session_available);
+                                outcomes[1] += 1;
+                            }
+                            Err(error) => panic!("unexpected inbound {error:?}"),
+                        }
+                    } else {
+                        let host = Ipv4Address::from_octets([
+                            10,
+                            0,
+                            0,
+                            10 + (next_random(&mut rng) % 7) as u8,
+                        ]);
+                        let internal_port = 39_998 + (next_random(&mut rng) % 9) as u16;
+                        let exact = runtime
+                            .find_mapping(host, internal_port)
+                            .unwrap()
+                            .filter(|(_, mapping)| runtime.mapping_is_live(*mapping, now));
+                        let mapping_available = runtime
+                            .mappings
+                            .iter()
+                            .any(|mapping| !runtime.mapping_is_live(*mapping, now));
+                        let port = reference_tcp_port(&runtime, host, internal_port, now);
+                        let owners_before = runtime.port_owners.backing_snapshot();
+                        let result = runtime.plan_outbound(
+                            host,
+                            internal_port,
+                            remote,
+                            remote_port,
+                            true,
+                            now,
+                        );
+                        match result {
+                            Ok(plan) if plan.mapping_created => {
+                                assert!(exact.is_none() && mapping_available && session_available);
+                                match port {
+                                    Ok(Some(expected)) => {
+                                        assert_eq!(plan.mapping.public_port, expected);
+                                    }
+                                    Ok(None) => {
+                                        let offset = usize::from(plan.mapping.public_port - 40_000);
+                                        assert_ne!(owners_before[offset], PortOwnerSlot::default());
+                                        outcomes[7] += 1;
+                                    }
+                                    Err(()) => panic!("allocated past exhaustion"),
+                                }
+                                runtime.commit_outbound(plan, now).unwrap();
+                                outcomes[2] += 1;
+                            }
+                            Ok(plan) => {
+                                assert!(exact.is_some());
+                                assert!(!plan.session_created || session_available);
+                                runtime.commit_outbound(plan, now).unwrap();
+                                outcomes[3] += 1;
+                            }
+                            Err(Nat44TcpPlanError::MappingFull) => {
+                                assert!(exact.is_none() && !mapping_available);
+                                outcomes[6] += 1;
+                            }
+                            Err(Nat44TcpPlanError::SessionFull) => {
+                                assert!(!session_available);
+                                assert!(exact.is_some() || mapping_available);
+                                outcomes[4] += 1;
+                            }
+                            Err(Nat44TcpPlanError::PortExhausted) => {
+                                assert!(exact.is_none() && mapping_available && session_available);
+                                assert_eq!(port, Err(()));
+                                outcomes[5] += 1;
+                            }
+                            Err(error) => panic!("unexpected outbound {error:?}"),
+                        }
+                    }
+                    assert_eq!(runtime.validate_indexes(), Ok(()));
+                }
+            });
+        }
+        // Every outcome the reference distinguishes was exercised.
+        assert!(outcomes.iter().all(|count| *count > 0), "{outcomes:?}");
+    }
+
+    /// PERF-001 cost bound: with 65536-slot tables and the widest pool,
+    /// every new flow, even with every public port owned, examines at most
+    /// two mapping slots, one session slot, two port owners, and 34 bitmap
+    /// words; the pre-PERF-001 search visited up to every mapping slot,
+    /// every session slot, and every pool port.
+    #[test]
+    fn tcp_new_flow_work_is_constant_in_a_nearly_full_65536_slot_table() {
+        const SLOTS: usize = 65_536;
+        let ttl = NAT44_TCP_MIN_IDLE_TTL_MS;
+        let policy = Nat44TcpPolicy::new(ttl, 0x5eed_1234_5678_9abc).unwrap();
+        with_config(policy, 1, 65_535, |config| {
+            let mut mappings = vec![Nat44TcpMappingSlot::default(); SLOTS];
+            let mut sessions = vec![Nat44TcpSessionSlot::default(); SLOTS];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            let host = |flow: usize| {
+                Ipv4Address::from_octets([
+                    10,
+                    1 + (flow >> 16) as u8,
+                    (flow >> 8) as u8,
+                    flow as u8,
+                ])
+            };
+            // [mapping slots, session slots, port owners, bitmap words]
+            let mut worst = [0_usize; 4];
+            let mut new_flow = |runtime: &mut Nat44TcpRuntime<'_>, flow: usize, now: u64| {
+                runtime.reset_index_probe_counts();
+                let result = runtime.plan_outbound(host(flow), 7, REMOTE1, 443, true, now);
+                let (_, _, mapping_checks, session_checks, owner_probes) =
+                    runtime.index_probe_counts();
+                let words = runtime.port_owners.take_bitmap_word_reads();
+                for (worst, seen) in
+                    worst
+                        .iter_mut()
+                        .zip([mapping_checks, session_checks, owner_probes, words])
+                {
+                    *worst = (*worst).max(seen);
+                }
+                let plan = result?;
+                runtime.commit_outbound(plan, now).unwrap();
+                Ok::<u16, Nat44TcpPlanError>(plan.mapping.public_port)
+            };
+            // Every public port taken, half the flows at 0 and half at 1 s.
+            for flow in 0..65_535 {
+                let now = if flow < 32_768 { 0 } else { 1_000 };
+                new_flow(&mut runtime, flow, now).unwrap();
+            }
+            assert_eq!(
+                new_flow(&mut runtime, 65_535, 1_000),
+                Err(Nat44TcpPlanError::PortExhausted)
+            );
+            // At the TTL the first half has expired: each new flow takes the
+            // oldest expired mapping, its session slot, and its public port.
+            for flow in 65_536..66_536 {
+                let port = new_flow(&mut runtime, flow, ttl).unwrap();
+                assert_ne!(port, 0);
+            }
+            assert_eq!(runtime.counters.mappings_expired, 1_000);
+            assert_eq!(runtime.counters.sessions_expired, 1_000);
+            assert!(runtime.reuse_lists_are_consistent());
+            assert!(runtime.port_owners.bitmap_matches_slots());
+            assert!(
+                worst[0] <= 2 && worst[1] <= 1 && worst[2] <= 2 && worst[3] <= 34,
+                "work per new flow {worst:?}"
+            );
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2772,6 +3034,131 @@ impl Nat44UdpConfig {
     }
 }
 
+/// Which reuse set a UDP mapping slot is in (PERF-001). Every slot is in
+/// exactly one, so a reusable slot, peer, or port is found at a list head in
+/// O(1) instead of by scanning the table.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum UdpMappingList {
+    /// Never used since construction or the last flush: the slots at and
+    /// after the fresh boundary, untouched (equal to the default slot).
+    /// Slots leave this set only in index order, so no links are needed.
+    #[default]
+    Free,
+    /// Occupied, owning its public port and at least one peer, in
+    /// `last_outbound_ms` order (oldest first). Every outbound commit
+    /// stamps the current time and moves the slot to the tail, and time is
+    /// monotonic, so the head is the first to expire: if any slot on this
+    /// list is expired, the head is.
+    Lru,
+    /// Expired, owning its public port, with its peers released to the
+    /// stale-peer chain.
+    Parked,
+    /// Expired, owning neither a public port nor peers.
+    Retired,
+}
+
+/// Head and tail of a singly linked chain of UDP peer slots.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct PeerChain {
+    head: u32,
+    tail: u32,
+}
+
+impl PeerChain {
+    const EMPTY: Self = Self {
+        head: LINK_NONE,
+        tail: LINK_NONE,
+    };
+
+    const fn head(self) -> Option<usize> {
+        if self.head == LINK_NONE {
+            None
+        } else {
+            Some(self.head as usize)
+        }
+    }
+}
+
+impl Default for PeerChain {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+/// Reuse bookkeeping embedded in a UDP mapping slot: its list links and
+/// list, and the chain of the peers of its current generation.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct UdpMappingLink {
+    links: SlotLinks,
+    list: UdpMappingList,
+    peers: PeerChain,
+}
+
+/// The fresh boundary and the three UDP mapping reuse lists.
+#[derive(Clone, Copy)]
+struct UdpMappingLists {
+    /// Slots at and after this index have never been used since the last
+    /// flush; those before it are occupied.
+    next_fresh: usize,
+    lru: SlotList,
+    parked: SlotList,
+    retired: SlotList,
+}
+
+impl UdpMappingLists {
+    /// Every slot fresh (construction and reconcile flush).
+    const FLUSHED: Self = Self {
+        next_fresh: 0,
+        lru: SlotList::EMPTY,
+        parked: SlotList::EMPTY,
+        retired: SlotList::EMPTY,
+    };
+
+    /// The lowest never-used slot, if any.
+    fn fresh(&self, capacity: usize) -> Option<usize> {
+        (self.next_fresh < capacity).then_some(self.next_fresh)
+    }
+
+    /// Takes slot `index` out of `list`: unlinks it, or for a never-used
+    /// slot (always the lowest) advances the fresh boundary past it. O(1).
+    fn detach(&mut self, mappings: &mut [Nat44UdpMappingSlot], index: usize, list: UdpMappingList) {
+        match list {
+            UdpMappingList::Free => {
+                debug_assert!(index == self.next_fresh);
+                self.next_fresh += 1;
+            }
+            UdpMappingList::Lru => self.lru.unlink(mappings, index),
+            UdpMappingList::Parked => self.parked.unlink(mappings, index),
+            UdpMappingList::Retired => self.retired.unlink(mappings, index),
+        }
+    }
+
+    /// Appends the detached slot `index` to `list` (never the free set).
+    fn attach(&mut self, mappings: &mut [Nat44UdpMappingSlot], index: usize, list: UdpMappingList) {
+        mappings[index].link.list = list;
+        match list {
+            UdpMappingList::Free => debug_assert!(false, "slots never return to the free set"),
+            UdpMappingList::Lru => self.lru.push_back(mappings, index),
+            UdpMappingList::Parked => self.parked.push_back(mappings, index),
+            UdpMappingList::Retired => self.retired.push_back(mappings, index),
+        }
+    }
+}
+
+/// Where the peer slot of an outbound plan comes from; derived from the
+/// lists at plan time and checked again before the commit mutates anything.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UdpPeerSource {
+    /// The head of the stale-peer chain.
+    Stale,
+    /// The first peer of the expired head of the activity list, whose
+    /// peers the commit releases to the stale chain first (the mapping is
+    /// parked).
+    ExpiredHead(usize),
+    /// The next never-used peer slot.
+    Fresh,
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Nat44UdpMappingSlot {
     occupied: bool,
@@ -2783,6 +3170,17 @@ pub struct Nat44UdpMappingSlot {
     internal_port: u16,
     public_port: u16,
     last_outbound_ms: u64,
+    link: UdpMappingLink,
+}
+
+impl Linked for Nat44UdpMappingSlot {
+    fn links(&self) -> SlotLinks {
+        self.link.links
+    }
+
+    fn links_mut(&mut self) -> &mut SlotLinks {
+        &mut self.link.links
+    }
 }
 
 impl std::fmt::Debug for Nat44UdpMappingSlot {
@@ -2809,6 +3207,7 @@ impl Default for Nat44UdpMappingSlot {
             internal_port: 0,
             public_port: 0,
             last_outbound_ms: 0,
+            link: UdpMappingLink::default(),
         }
     }
 }
@@ -2850,6 +3249,10 @@ pub struct Nat44UdpPeerSlot {
     /// Filter key port: the remote UDP port under
     /// [`Nat44Filtering::AddressAndPortDependent`], otherwise zero.
     remote_port: u16,
+    /// Next peer on this slot's chain: the peers of one live-ordered
+    /// mapping, or the stale-peer chain (`LINK_NONE` at the end and for
+    /// unoccupied slots).
+    next: u32,
 }
 
 impl std::fmt::Debug for Nat44UdpPeerSlot {
@@ -2870,6 +3273,7 @@ impl Default for Nat44UdpPeerSlot {
             mapping_lifecycle_epoch: 0,
             remote_address: Ipv4Address::from_octets([0; 4]),
             remote_port: 0,
+            next: LINK_NONE,
         }
     }
 }
@@ -3114,6 +3518,7 @@ enum Nat44UdpIndexInvariantError {
     Port(PortOwnerSemanticError),
     DuplicateMappingKey,
     DuplicatePeerKey,
+    ReuseLists,
 }
 
 #[derive(Clone, Copy)]
@@ -3133,12 +3538,17 @@ impl Nat44UdpIcmpv4Lookup {
 }
 
 /// Caller-owned storage for the three UDP NAT hot-path indexes.
+///
+/// `port_free_bits` is the free-port bitmap of the port-owner index and must
+/// have exactly [`port_free_bitmap_words`](crate::port_free_bitmap_words)
+/// of the port-owner count words.
 pub struct Nat44UdpIndexStorage<'a> {
     mapping_buckets: &'a mut [DirectoryBucket],
     mapping_nodes: &'a mut [DirectoryNode],
     peer_buckets: &'a mut [DirectoryBucket],
     peer_nodes: &'a mut [DirectoryNode],
     port_owners: &'a mut [PortOwnerSlot],
+    port_free_bits: &'a mut [u64],
 }
 
 impl<'a> Nat44UdpIndexStorage<'a> {
@@ -3148,6 +3558,7 @@ impl<'a> Nat44UdpIndexStorage<'a> {
         peer_buckets: &'a mut [DirectoryBucket],
         peer_nodes: &'a mut [DirectoryNode],
         port_owners: &'a mut [PortOwnerSlot],
+        port_free_bits: &'a mut [u64],
     ) -> Self {
         Self {
             mapping_buckets,
@@ -3155,6 +3566,7 @@ impl<'a> Nat44UdpIndexStorage<'a> {
             peer_buckets,
             peer_nodes,
             port_owners,
+            port_free_bits,
         }
     }
 }
@@ -3166,6 +3578,7 @@ pub(crate) struct TestNat44UdpIndexes {
     peer_buckets: Vec<DirectoryBucket>,
     peer_nodes: Vec<DirectoryNode>,
     port_owners: Vec<PortOwnerSlot>,
+    port_free_bits: Vec<u64>,
 }
 
 #[cfg(test)]
@@ -3197,6 +3610,7 @@ impl TestNat44UdpIndexes {
             peer_buckets: vec![DirectoryBucket::default(); peer_bucket_count],
             peer_nodes: vec![DirectoryNode::default(); peer_capacity],
             port_owners: vec![PortOwnerSlot::default(); port_count],
+            port_free_bits: vec![0; crate::port_free_bitmap_words(port_count)],
         }
     }
 
@@ -3212,6 +3626,7 @@ impl TestNat44UdpIndexes {
             &mut self.peer_buckets,
             &mut self.peer_nodes,
             &mut self.port_owners,
+            &mut self.port_free_bits,
         );
         Nat44UdpRuntime::new(config, mappings, peers, indexes, test_udp_hash_key()).unwrap()
     }
@@ -3246,6 +3661,7 @@ pub struct Nat44UdpStorageShape {
     peer_buckets: u32,
     peer_nodes: u32,
     port_owner_slots: u32,
+    port_bitmap_words: u32,
 }
 
 impl Nat44UdpStorageShape {
@@ -3282,6 +3698,12 @@ impl Nat44UdpStorageShape {
     #[must_use]
     pub const fn port_owner_slots(self) -> u32 {
         self.port_owner_slots
+    }
+
+    /// Words of the free-port bitmap of the port-owner index.
+    #[must_use]
+    pub const fn port_bitmap_words(self) -> u32 {
+        self.port_bitmap_words
     }
 }
 
@@ -3392,6 +3814,7 @@ struct Nat44UdpReconcileBinding {
     peer_buckets: Nat44UdpBackingIdentity,
     peer_nodes: Nat44UdpBackingIdentity,
     port_owners: Nat44UdpBackingIdentity,
+    port_free_bits: Nat44UdpBackingIdentity,
 }
 
 impl Nat44UdpReconcileBinding {
@@ -3410,6 +3833,7 @@ impl Nat44UdpReconcileBinding {
             peer_buckets: Nat44UdpBackingIdentity::of(indexes.peer_buckets),
             peer_nodes: Nat44UdpBackingIdentity::of(indexes.peer_nodes),
             port_owners: Nat44UdpBackingIdentity::of(indexes.port_owners),
+            port_free_bits: Nat44UdpBackingIdentity::of(indexes.port_free_bits),
         }
     }
 }
@@ -3420,6 +3844,16 @@ impl Nat44UdpReconcileBinding {
 /// Recreating the runtime deliberately clears it. The `Rc` marker makes the
 /// runtime `!Send + !Sync`, so a mapping shard cannot accidentally migrate
 /// between packet workers.
+///
+/// Every per-packet search is bounded (PERF-001). A new mapping, peer, or
+/// public port is found in O(1) from intrusive lists embedded in the slots:
+/// occupied mappings in last-outbound order (the head is the first to
+/// expire), expired mappings whose peers or port were already taken, a
+/// chain of the peers of each mapping and of stale peers, and a fresh-slot
+/// boundary. Ports come from a free-port bitmap: the internal port if
+/// unowned or expired, else the first unowned port from the seeded start,
+/// else the port of an expired mapping. Expiry stays lazy (no timer or
+/// sweep): expired state is reclaimed when a new flow needs it.
 ///
 /// ```compile_fail
 /// use ruster_core::Nat44UdpRuntime;
@@ -3450,6 +3884,19 @@ pub struct Nat44UdpRuntime<'a> {
     /// Allocated mapping and peer slots; see [`Nat44UdpRuntime::occupancy`].
     mapping_occupancy: OccupancyCounter,
     peer_occupancy: OccupancyCounter,
+    /// Mapping reuse lists; see [`UdpMappingList`].
+    mapping_lists: UdpMappingLists,
+    /// Peers of expired or recreated mappings, all reusable.
+    stale_peers: u32,
+    /// Peer slots at and after this index have never been used since the
+    /// last flush; those before it are occupied.
+    next_fresh_peer: usize,
+    #[cfg(test)]
+    reuse_visits: Cell<usize>,
+    /// Lets a test fill a 65536-slot table without the O(N^2) full index
+    /// validation after every commit.
+    #[cfg(test)]
+    skip_commit_validation: Cell<bool>,
     #[cfg(test)]
     mapping_lookup_probes: Cell<usize>,
     #[cfg(test)]
@@ -3479,6 +3926,7 @@ impl<'a> Nat44UdpRuntime<'a> {
             .map_err(|_| Nat44UdpRuntimeConfigError::PeerDirectoryInvalid)?;
         PortOwnerTable::validate_config(
             indexes.port_owners.len(),
+            indexes.port_free_bits.len(),
             config.first_port,
             config.last_port,
             mappings.len(),
@@ -3495,6 +3943,7 @@ impl<'a> Nat44UdpRuntime<'a> {
                 .expect("peer directory dimensions were preflighted");
         let port_owners = PortOwnerTable::new(
             indexes.port_owners,
+            indexes.port_free_bits,
             config.first_port,
             config.last_port,
             mappings.len(),
@@ -3518,6 +3967,13 @@ impl<'a> Nat44UdpRuntime<'a> {
             counters: Nat44UdpCounters::default(),
             mapping_occupancy: OccupancyCounter::default(),
             peer_occupancy: OccupancyCounter::default(),
+            mapping_lists: UdpMappingLists::FLUSHED,
+            stale_peers: LINK_NONE,
+            next_fresh_peer: 0,
+            #[cfg(test)]
+            reuse_visits: Cell::new(0),
+            #[cfg(test)]
+            skip_commit_validation: Cell::new(false),
             #[cfg(test)]
             mapping_lookup_probes: Cell::new(0),
             #[cfg(test)]
@@ -3591,6 +4047,8 @@ impl<'a> Nat44UdpRuntime<'a> {
                 .expect("validated peer node count fits u32"),
             port_owner_slots: u32::try_from(self.port_owners.slot_count())
                 .expect("validated port-owner count fits u32"),
+            port_bitmap_words: u32::try_from(port_free_bitmap_words(self.port_owners.slot_count()))
+                .expect("validated port-owner count fits u32"),
         }
     }
 
@@ -3599,6 +4057,8 @@ impl<'a> Nat44UdpRuntime<'a> {
         self.mapping_lookup_probes.set(0);
         self.peer_lookup_probes.set(0);
         self.port_owner_probes.set(0);
+        self.port_owners.take_bitmap_word_reads();
+        self.take_reuse_visits();
     }
 
     #[cfg(test)]
@@ -3633,6 +4093,7 @@ impl<'a> Nat44UdpRuntime<'a> {
             .ok_or(Nat44UdpReconcileError::RuntimeEpochExhausted)?;
         if PortOwnerTable::validate_config(
             self.port_owners.slot_count(),
+            port_free_bitmap_words(self.port_owners.slot_count()),
             config.first_port,
             config.last_port,
             self.mappings.len(),
@@ -3663,6 +4124,9 @@ impl<'a> Nat44UdpRuntime<'a> {
         let peers_flushed = self.peers.iter().filter(|peer| peer.occupied).count();
         self.mappings.fill(Nat44UdpMappingSlot::default());
         self.peers.fill(Nat44UdpPeerSlot::default());
+        self.mapping_lists = UdpMappingLists::FLUSHED;
+        self.stale_peers = LINK_NONE;
+        self.next_fresh_peer = 0;
         self.mapping_occupancy.flush();
         self.peer_occupancy.flush();
         self.mapping_directory.clear_with_key(hash_key.0);
@@ -3801,7 +4265,7 @@ impl<'a> Nat44UdpRuntime<'a> {
                     None,
                 );
             }
-            let Some(peer_index) = self.find_reusable_peer(now_ms) else {
+            let Some((peer_index, _)) = self.find_reusable_peer(now_ms)? else {
                 return Err(Nat44UdpPlanError::PeerFull);
             };
             let mut refreshed = mapping;
@@ -3818,6 +4282,7 @@ impl<'a> Nat44UdpRuntime<'a> {
                         mapping_lifecycle_epoch: mapping.lifecycle_epoch,
                         remote_address,
                         remote_port,
+                        next: LINK_NONE,
                     }),
                     mapping_created: false,
                     mapping_expired: false,
@@ -3839,7 +4304,7 @@ impl<'a> Nat44UdpRuntime<'a> {
         } else {
             return Err(Nat44UdpPlanError::MappingFull);
         };
-        let Some(peer_index) = self.find_reusable_peer(now_ms) else {
+        let Some((peer_index, _)) = self.find_reusable_peer(now_ms)? else {
             return Err(Nat44UdpPlanError::PeerFull);
         };
         let Some(port) = self.allocate_port(internal_address, internal_port, now_ms)? else {
@@ -3860,6 +4325,7 @@ impl<'a> Nat44UdpRuntime<'a> {
                     internal_port,
                     public_port: port.port,
                     last_outbound_ms: now_ms,
+                    link: UdpMappingLink::default(),
                 },
                 peer_index: encode_udp_index(peer_index),
                 peer: Some(Nat44UdpPeerSlot {
@@ -3869,6 +4335,7 @@ impl<'a> Nat44UdpRuntime<'a> {
                     mapping_lifecycle_epoch: self.runtime_epoch,
                     remote_address,
                     remote_port,
+                    next: LINK_NONE,
                 }),
                 mapping_created: true,
                 mapping_expired,
@@ -3910,7 +4377,7 @@ impl<'a> Nat44UdpRuntime<'a> {
         now_ms: u64,
         hairpin: bool,
     ) -> Result<(), Nat44UdpCommitError> {
-        self.revalidate_outbound_commit(plan, now_ms)?;
+        let peer_source = self.revalidate_outbound_commit(plan, now_ms)?;
         let prepared = plan.prepared;
         if let Some(mutation) = prepared.mapping {
             self.apply_mapping_directory_mutation(mutation);
@@ -3927,19 +4394,26 @@ impl<'a> Nat44UdpRuntime<'a> {
             self.port_owners
                 .apply_prepared_move_topology(owner, replacement);
         }
+        // Reuse lists, each step O(1): take the planned peer slot, retire a
+        // displaced port owner, then move the written mapping to the tail of
+        // the activity list and chain the new peer to it.
+        if let (Some(index), Some(source)) = (plan.peer_index(), peer_source) {
+            self.take_peer_slot(index, source);
+        }
         if let Some(index) = plan
             .displaced_port_mapping_index()
             .filter(|index| *index != plan.mapping_index())
         {
             self.mappings[index].port_owned = false;
+            self.retire_mapping(index);
         }
         let mapping_before = self.mappings[plan.mapping_index()].occupied;
-        self.mappings[plan.mapping_index()] = plan.mapping;
+        self.write_mapping(plan.mapping_index(), plan.mapping);
         self.mapping_occupancy
             .transition(mapping_before, plan.mapping.occupied);
         if let (Some(index), Some(peer)) = (plan.peer_index(), plan.peer) {
             let peer_before = self.peers[index].occupied;
-            self.peers[index] = peer;
+            self.write_peer(plan.mapping_index(), index, peer);
             self.peer_occupancy.transition(peer_before, peer.occupied);
         }
         self.watermark_ms = Some(now_ms);
@@ -3966,7 +4440,7 @@ impl<'a> Nat44UdpRuntime<'a> {
         if !hairpin {
             self.counters.outbound_translated = self.counters.outbound_translated.saturating_add(1);
         }
-        debug_assert!(self.validate_indexes().is_ok());
+        debug_assert!(self.commit_validation_skipped() || self.validate_indexes().is_ok());
         Ok(())
     }
 
@@ -4084,7 +4558,7 @@ impl<'a> Nat44UdpRuntime<'a> {
         } else {
             self.counters.inbound_translated = self.counters.inbound_translated.saturating_add(1);
         }
-        debug_assert!(self.validate_indexes().is_ok());
+        debug_assert!(self.commit_validation_skipped() || self.validate_indexes().is_ok());
         Ok(())
     }
 
@@ -4340,11 +4814,13 @@ impl<'a> Nat44UdpRuntime<'a> {
         })
     }
 
+    /// Checks that `plan` still applies to exactly the current state and
+    /// returns where its new peer slot comes from, before anything mutates.
     fn revalidate_outbound_commit(
         &self,
         plan: Nat44UdpOutboundPlan,
         now_ms: u64,
-    ) -> Result<(), Nat44UdpCommitError> {
+    ) -> Result<Option<UdpPeerSource>, Nat44UdpCommitError> {
         if plan.expected_runtime_epoch != self.runtime_epoch {
             return Err(Nat44UdpCommitError::RuntimeEpochChanged);
         }
@@ -4368,7 +4844,126 @@ impl<'a> Nat44UdpRuntime<'a> {
         {
             return Err(Nat44UdpCommitError::IndexCorrupt);
         }
-        Ok(())
+        plan.peer_index()
+            .map(|index| {
+                self.planned_peer_source(index, now_ms)
+                    .ok_or(Nat44UdpCommitError::IndexCorrupt)
+            })
+            .transpose()
+    }
+
+    /// Takes peer slot `index` off its source; O(1).
+    fn take_peer_slot(&mut self, index: usize, source: UdpPeerSource) {
+        match source {
+            UdpPeerSource::ExpiredHead(head) => {
+                self.park_mapping(head);
+                self.pop_stale_peer(index);
+            }
+            UdpPeerSource::Stale => self.pop_stale_peer(index),
+            UdpPeerSource::Fresh => {
+                debug_assert!(self.next_fresh_peer == index);
+                self.next_fresh_peer += 1;
+            }
+        }
+    }
+
+    fn pop_stale_peer(&mut self, index: usize) {
+        debug_assert!(self.stale_peers as usize == index);
+        self.stale_peers = self.peers[index].next;
+        self.peers[index].next = LINK_NONE;
+    }
+
+    /// Splices a whole peer chain onto the stale chain in O(1).
+    fn release_peers(&mut self, chain: PeerChain) {
+        if chain.head().is_some() {
+            self.peers[chain.tail as usize].next = self.stale_peers;
+            self.stale_peers = chain.head;
+        }
+    }
+
+    fn move_mapping(&mut self, index: usize, to: UdpMappingList) {
+        let from = self.mappings[index].link.list;
+        self.mapping_lists.detach(self.mappings, index, from);
+        self.mapping_lists.attach(self.mappings, index, to);
+    }
+
+    /// Moves the expired activity head to the parked list, releasing its
+    /// peers to the stale chain; it keeps its public port.
+    fn park_mapping(&mut self, index: usize) {
+        debug_assert!(self.mappings[index].link.list == UdpMappingList::Lru);
+        let peers = self.mappings[index].link.peers;
+        self.release_peers(peers);
+        self.mappings[index].link.peers = PeerChain::EMPTY;
+        self.move_mapping(index, UdpMappingList::Parked);
+    }
+
+    /// Moves an expired mapping that just lost its public port to the
+    /// retired list, releasing any peers it still holds.
+    fn retire_mapping(&mut self, index: usize) {
+        let link = self.mappings[index].link;
+        debug_assert!(matches!(
+            link.list,
+            UdpMappingList::Lru | UdpMappingList::Parked
+        ));
+        self.release_peers(link.peers);
+        self.mappings[index].link.peers = PeerChain::EMPTY;
+        self.move_mapping(index, UdpMappingList::Retired);
+    }
+
+    /// Writes `mapping` (just stamped with the current time) into slot
+    /// `index` and moves the slot to the tail of the activity list. A new
+    /// generation releases the old generation's peers and starts an empty
+    /// chain; a refresh keeps the chain.
+    fn write_mapping(&mut self, index: usize, mapping: Nat44UdpMappingSlot) {
+        let before = self.mappings[index];
+        let recreated = !before.occupied
+            || before.generation != mapping.generation
+            || before.lifecycle_epoch != mapping.lifecycle_epoch;
+        debug_assert!(recreated || before.link.list == UdpMappingList::Lru);
+        debug_assert!(self
+            .mapping_lists
+            .lru
+            .tail()
+            .is_none_or(|tail| self.mappings[tail].last_outbound_ms <= mapping.last_outbound_ms));
+        if recreated {
+            self.release_peers(before.link.peers);
+        }
+        self.mapping_lists
+            .detach(self.mappings, index, before.link.list);
+        self.mappings[index] = Nat44UdpMappingSlot {
+            link: UdpMappingLink {
+                links: SlotLinks::UNLINKED,
+                list: UdpMappingList::Free,
+                peers: if recreated {
+                    PeerChain::EMPTY
+                } else {
+                    before.link.peers
+                },
+            },
+            ..mapping
+        };
+        self.mapping_lists
+            .attach(self.mappings, index, UdpMappingList::Lru);
+    }
+
+    /// Writes `peer` into slot `index` (already taken off its source) and
+    /// appends it to the chain of mapping `mapping_index`.
+    fn write_peer(&mut self, mapping_index: usize, index: usize, peer: Nat44UdpPeerSlot) {
+        self.peers[index] = Nat44UdpPeerSlot {
+            next: LINK_NONE,
+            ..peer
+        };
+        let link = encode_udp_index(index);
+        let chain = self.mappings[mapping_index].link.peers;
+        if chain.head().is_none() {
+            self.mappings[mapping_index].link.peers = PeerChain {
+                head: link,
+                tail: link,
+            };
+        } else {
+            self.peers[chain.tail as usize].next = link;
+            self.mappings[mapping_index].link.peers.tail = link;
+        }
     }
 
     fn mapping_mutation_matches(&self, mutation: PreparedUdpDirectoryMutation) -> bool {
@@ -4565,7 +5160,139 @@ impl<'a> Nat44UdpRuntime<'a> {
                 return Err(Nat44UdpIndexInvariantError::DuplicatePeerKey);
             }
         }
+        if !self.reuse_lists_are_consistent() {
+            return Err(Nat44UdpIndexInvariantError::ReuseLists);
+        }
         Ok(())
+    }
+
+    /// Exact O(M + P) check of the reuse sets (validation only, no
+    /// allocation): the fresh slots are exactly the default slots at and
+    /// after the fresh boundary, the three mapping lists hold every other
+    /// slot, each slot's recorded set and state agree, the activity list is
+    /// in `last_outbound_ms` order, parked and retired mappings are expired,
+    /// and every occupied peer is on exactly one chain: its mapping's if
+    /// that mapping is on the activity list with the peer's generation,
+    /// else the stale chain. Chains of different mappings cannot share a
+    /// node (each node matches one mapping key) and the stale chain holds
+    /// no node that matches an active mapping, so with every walk bounded
+    /// and ending at its tail, equal totals mean each occupied peer is
+    /// chained exactly once.
+    fn reuse_lists_are_consistent(&self) -> bool {
+        let lists = self.mapping_lists;
+        let expired_at_watermark = |mapping: Nat44UdpMappingSlot| {
+            self.watermark_ms
+                .is_none_or(|now_ms| !self.mapping_is_live(mapping, now_ms))
+        };
+        let Some(fresh) = self.mappings.get(lists.next_fresh..) else {
+            return false;
+        };
+        if fresh
+            .iter()
+            .any(|mapping| *mapping != Nat44UdpMappingSlot::default())
+            || self.mappings[..lists.next_fresh]
+                .iter()
+                .any(|mapping| !mapping.occupied)
+        {
+            return false;
+        }
+        let mut listed = fresh.len();
+        for (header, list) in [
+            (lists.lru, UdpMappingList::Lru),
+            (lists.parked, UdpMappingList::Parked),
+            (lists.retired, UdpMappingList::Retired),
+        ] {
+            let mut previous_ms = 0;
+            let consistent = header.validate(self.mappings, |index| {
+                listed += 1;
+                let mapping = self.mappings[index];
+                let has_peers = mapping.link.peers.head().is_some();
+                let ordered = previous_ms <= mapping.last_outbound_ms;
+                previous_ms = mapping.last_outbound_ms;
+                mapping.link.list == list
+                    && match list {
+                        UdpMappingList::Free => false,
+                        UdpMappingList::Lru => {
+                            mapping.occupied && mapping.port_owned && has_peers && ordered
+                        }
+                        UdpMappingList::Parked => {
+                            mapping.occupied
+                                && mapping.port_owned
+                                && !has_peers
+                                && expired_at_watermark(mapping)
+                        }
+                        UdpMappingList::Retired => {
+                            mapping.occupied
+                                && !mapping.port_owned
+                                && !has_peers
+                                && expired_at_watermark(mapping)
+                        }
+                    }
+            });
+            if !consistent {
+                return false;
+            }
+        }
+        if listed != self.mappings.len() || self.next_fresh_peer > self.peers.len() {
+            return false;
+        }
+        let occupied_peers = self.peers.iter().filter(|peer| peer.occupied).count();
+        if occupied_peers != self.next_fresh_peer
+            || self.peers[..self.next_fresh_peer]
+                .iter()
+                .any(|peer| !peer.occupied)
+        {
+            return false;
+        }
+        let active_owner = |peer: Nat44UdpPeerSlot| {
+            self.mappings
+                .get(peer.mapping_index)
+                .is_some_and(|mapping| {
+                    mapping.link.list == UdpMappingList::Lru
+                        && mapping.generation == peer.mapping_generation
+                        && mapping.lifecycle_epoch == peer.mapping_lifecycle_epoch
+                })
+        };
+        let mut chained = 0_usize;
+        let mut chains_consistent = true;
+        lists.lru.validate(self.mappings, |index| {
+            let mapping = self.mappings[index];
+            let belongs = |peer: Nat44UdpPeerSlot| {
+                peer.mapping_index == index
+                    && peer.mapping_generation == mapping.generation
+                    && peer.mapping_lifecycle_epoch == mapping.lifecycle_epoch
+            };
+            match self.walk_peer_chain(mapping.link.peers.head, belongs) {
+                Some((length, last)) if last == mapping.link.peers.tail => chained += length,
+                _ => chains_consistent = false,
+            }
+            chains_consistent
+        });
+        let stale = self.walk_peer_chain(self.stale_peers, |peer| !active_owner(peer));
+        chains_consistent && stale.is_some_and(|(length, _)| chained + length == occupied_peers)
+    }
+
+    /// Walks one peer chain from `head` for at most every peer slot and
+    /// returns its length and last node, or `None` on a node that is
+    /// unoccupied, does not `belong`, or past the bound (validation only).
+    fn walk_peer_chain(
+        &self,
+        head: u32,
+        belongs: impl Fn(Nat44UdpPeerSlot) -> bool,
+    ) -> Option<(usize, u32)> {
+        let mut current = head;
+        let mut last = LINK_NONE;
+        let mut length = 0_usize;
+        while current != LINK_NONE {
+            let peer = *self.peers.get(current as usize)?;
+            if length == self.peers.len() || !peer.occupied || !belongs(peer) {
+                return None;
+            }
+            length += 1;
+            last = current;
+            current = peer.next;
+        }
+        Some((length, last))
     }
 
     fn mapping_is_live(&self, mapping: Nat44UdpMappingSlot, now_ms: u64) -> bool {
@@ -4599,10 +5326,48 @@ impl<'a> Nat44UdpRuntime<'a> {
         Ok(probe.state_index.map(|index| (index, self.mappings[index])))
     }
 
+    #[cfg(test)]
+    fn count_reuse_visit(&self) {
+        self.reuse_visits
+            .set(self.reuse_visits.get().saturating_add(1));
+    }
+
+    #[cfg(test)]
+    fn take_reuse_visits(&self) -> usize {
+        self.reuse_visits.replace(0)
+    }
+
+    #[cfg(test)]
+    fn commit_validation_skipped(&self) -> bool {
+        self.skip_commit_validation.get()
+    }
+
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self)]
+    const fn commit_validation_skipped(&self) -> bool {
+        false
+    }
+
+    /// The head of the activity list when it is expired: the oldest mapping
+    /// that still owns its port and peers. One liveness check.
+    fn expired_activity_head(&self, now_ms: u64) -> Option<usize> {
+        #[cfg(test)]
+        self.count_reuse_visit();
+        let head = self.mapping_lists.lru.head()?;
+        (!self.mapping_is_live(self.mappings[head], now_ms)).then_some(head)
+    }
+
+    /// A reusable (unoccupied or expired) mapping slot in O(1), or `None`
+    /// exactly when every slot holds a live mapping. Expired slots are
+    /// preferred over never-used ones, as before, so occupancy keeps
+    /// counting the distinct slots used since the flush.
     fn find_reusable_mapping(&self, now_ms: u64) -> Option<usize> {
-        self.mappings
-            .iter()
-            .position(|mapping| !self.mapping_is_live(*mapping, now_ms))
+        self.mapping_lists
+            .retired
+            .head()
+            .or_else(|| self.mapping_lists.parked.head())
+            .or_else(|| self.expired_activity_head(now_ms))
+            .or_else(|| self.mapping_lists.fresh(self.mappings.len()))
     }
 
     fn peer_exists(
@@ -4645,17 +5410,37 @@ impl<'a> Nat44UdpRuntime<'a> {
         Ok(probe.state_index.is_some())
     }
 
-    fn find_reusable_peer(&self, now_ms: u64) -> Option<usize> {
-        self.peers.iter().position(|peer| {
-            if !peer.occupied {
-                return true;
-            }
-            self.mappings.get(peer.mapping_index).is_none_or(|mapping| {
-                !self.mapping_is_live(*mapping, now_ms)
-                    || mapping.generation != peer.mapping_generation
-                    || mapping.lifecycle_epoch != peer.mapping_lifecycle_epoch
-            })
-        })
+    /// A reusable peer slot in O(1), with where it comes from, or `None`
+    /// exactly when every peer belongs to a live mapping: a peer of an
+    /// expired or recreated mapping (stale chain, then the peers of the
+    /// expired activity head), else a never-used slot.
+    fn find_reusable_peer(
+        &self,
+        now_ms: u64,
+    ) -> Result<Option<(usize, UdpPeerSource)>, Nat44UdpPlanError> {
+        if self.stale_peers != LINK_NONE {
+            return Ok(Some((self.stale_peers as usize, UdpPeerSource::Stale)));
+        }
+        if let Some(head) = self.expired_activity_head(now_ms) {
+            // Every mapping on the activity list has at least one peer.
+            let peer = self.mappings[head]
+                .link
+                .peers
+                .head()
+                .ok_or(Nat44UdpPlanError::IndexCorrupt)?;
+            return Ok(Some((peer, UdpPeerSource::ExpiredHead(head))));
+        }
+        Ok((self.next_fresh_peer < self.peers.len())
+            .then_some((self.next_fresh_peer, UdpPeerSource::Fresh)))
+    }
+
+    /// The source of `peer_index` that [`Self::find_reusable_peer`] reports
+    /// in the current state, if it would choose exactly that slot.
+    fn planned_peer_source(&self, peer_index: usize, now_ms: u64) -> Option<UdpPeerSource> {
+        match self.find_reusable_peer(now_ms) {
+            Ok(Some((index, source))) if index == peer_index => Some(source),
+            _ => None,
+        }
     }
 
     fn select_port(
@@ -4714,21 +5499,32 @@ impl<'a> Nat44UdpRuntime<'a> {
                 return Ok(Some(selection));
             }
         }
-        let pool_size = u32::from(self.config.last_port) - u32::from(self.config.first_port) + 1;
-        let address = u32::from_be_bytes(internal_address.octets());
-        let mixed = self.config.policy.allocator_seed
-            ^ u64::from(address)
-            ^ u64::from(internal_port).rotate_left(17);
-        let start = u32::try_from(mixed % u64::from(pool_size))
-            .map_err(|_| Nat44UdpPlanError::IndexCorrupt)?;
-        for step in 0..pool_size {
-            let offset = (start + step) % pool_size;
-            let candidate = u16::try_from(u32::from(self.config.first_port) + offset)
-                .map_err(|_| Nat44UdpPlanError::IndexCorrupt)?;
-            if candidate == internal_port {
-                continue;
+        let start = seeded_port_offset(
+            self.config.policy.allocator_seed,
+            self.config.first_port,
+            self.config.last_port,
+            internal_address,
+            internal_port,
+        );
+        // The first unowned port from the seeded start (the internal port,
+        // if in the pool, was tried above and is owned by a live mapping).
+        if let Some(port) = self.port_owners.first_unowned_port_from(start) {
+            return self.select_port(port, now_ms);
+        }
+        // Every port has an owner: take the port of an expired one, a
+        // parked mapping first, else the expired activity head.
+        for candidate in [
+            self.mapping_lists.parked.head(),
+            self.expired_activity_head(now_ms),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let mapping = self.mappings[candidate];
+            if !mapping.port_owned {
+                return Err(Nat44UdpPlanError::IndexCorrupt);
             }
-            if let Some(selection) = self.select_port(candidate, now_ms)? {
+            if let Some(selection) = self.select_port(mapping.public_port, now_ms)? {
                 return Ok(Some(selection));
             }
         }
@@ -4752,6 +5548,23 @@ impl<'a> Nat44UdpRuntime<'a> {
             Ok(())
         }
     }
+}
+
+/// Pool offset where the search for a public port starts when the internal
+/// port cannot be preserved (NAT44-004): keyed by the secret allocator seed
+/// and the internal endpoint, so it is deterministic for the endpoint and
+/// unpredictable without the seed.
+fn seeded_port_offset(
+    allocator_seed: u64,
+    first_port: u16,
+    last_port: u16,
+    internal_address: Ipv4Address,
+    internal_port: u16,
+) -> usize {
+    let pool_size = u64::from(last_port - first_port) + 1;
+    let address = u32::from_be_bytes(internal_address.octets());
+    let mixed = allocator_seed ^ u64::from(address) ^ u64::from(internal_port).rotate_left(17);
+    usize::try_from(mixed % pool_size).expect("a pool offset fits usize")
 }
 
 fn address_is_host_unicast(snapshot: &ForwardingSnapshot<'_>, address: Ipv4Address) -> bool {
@@ -5120,6 +5933,72 @@ impl Nat44TcpConfig {
     }
 }
 
+/// Which reuse set a TCP mapping slot is in (PERF-001); every slot is in
+/// exactly one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum TcpMappingList {
+    /// Never used since construction or the last flush: the slots at and
+    /// after the fresh boundary, untouched (equal to the default slot).
+    #[default]
+    Free,
+    /// Occupied and owning its public port, in `last_activity_ms` order
+    /// (oldest first): every commit stamps the current time and moves the
+    /// slot to the tail, so if any slot on this list is expired, the head
+    /// is.
+    Lru,
+    /// Expired, its public port taken by a newer mapping.
+    Retired,
+}
+
+/// Reuse bookkeeping embedded in a TCP mapping slot.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+struct TcpMappingLink {
+    links: SlotLinks,
+    list: TcpMappingList,
+}
+
+/// Fresh boundaries and reuse lists of the TCP mappings and sessions. Slots
+/// at and after a fresh boundary have never been used since the last flush
+/// (they are default slots) and those before it are occupied: slots leave
+/// the fresh set only in index order. An occupied session is on the session
+/// activity list, in `last_activity_ms` order (oldest first).
+#[derive(Clone, Copy)]
+struct TcpReuseLists {
+    next_fresh_mapping: usize,
+    mapping_lru: SlotList,
+    mapping_retired: SlotList,
+    next_fresh_session: usize,
+    session_lru: SlotList,
+}
+
+impl TcpReuseLists {
+    /// Every slot fresh (construction and reconcile flush).
+    const FLUSHED: Self = Self {
+        next_fresh_mapping: 0,
+        mapping_lru: SlotList::EMPTY,
+        mapping_retired: SlotList::EMPTY,
+        next_fresh_session: 0,
+        session_lru: SlotList::EMPTY,
+    };
+
+    /// Takes mapping slot `index` out of `list` in O(1).
+    fn detach_mapping(
+        &mut self,
+        mappings: &mut [Nat44TcpMappingSlot],
+        index: usize,
+        list: TcpMappingList,
+    ) {
+        match list {
+            TcpMappingList::Free => {
+                debug_assert!(index == self.next_fresh_mapping);
+                self.next_fresh_mapping += 1;
+            }
+            TcpMappingList::Lru => self.mapping_lru.unlink(mappings, index),
+            TcpMappingList::Retired => self.mapping_retired.unlink(mappings, index),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Nat44TcpMappingSlot {
     occupied: bool,
@@ -5131,6 +6010,17 @@ pub struct Nat44TcpMappingSlot {
     internal_port: u16,
     public_port: u16,
     last_activity_ms: u64,
+    link: TcpMappingLink,
+}
+
+impl Linked for Nat44TcpMappingSlot {
+    fn links(&self) -> SlotLinks {
+        self.link.links
+    }
+
+    fn links_mut(&mut self) -> &mut SlotLinks {
+        &mut self.link.links
+    }
 }
 
 impl std::fmt::Debug for Nat44TcpMappingSlot {
@@ -5157,6 +6047,7 @@ impl Default for Nat44TcpMappingSlot {
             internal_port: 0,
             public_port: 0,
             last_activity_ms: 0,
+            link: TcpMappingLink::default(),
         }
     }
 }
@@ -5195,6 +6086,19 @@ pub struct Nat44TcpSessionSlot {
     /// Created by an external (non-hairpin) inbound initial SYN; counted
     /// against the per-remote inbound session limit while live.
     external_inbound: bool,
+    /// Free-list links while unoccupied, activity-list links while
+    /// occupied.
+    links: SlotLinks,
+}
+
+impl Linked for Nat44TcpSessionSlot {
+    fn links(&self) -> SlotLinks {
+        self.links
+    }
+
+    fn links_mut(&mut self) -> &mut SlotLinks {
+        &mut self.links
+    }
 }
 
 impl std::fmt::Debug for Nat44TcpSessionSlot {
@@ -5218,6 +6122,7 @@ impl Default for Nat44TcpSessionSlot {
             remote_port: 0,
             last_activity_ms: 0,
             external_inbound: false,
+            links: SlotLinks::UNLINKED,
         }
     }
 }
@@ -5534,6 +6439,7 @@ enum Nat44TcpIndexInvariantError {
     DuplicateSessionKey,
     MappingWithoutCurrentSession,
     MappingSummaryMismatch,
+    ReuseLists,
 }
 
 #[derive(Clone, Copy)]
@@ -5568,9 +6474,11 @@ pub struct Nat44TcpIndexStorage<'a> {
     session_address_buckets: &'a mut [DirectoryBucket],
     session_address_nodes: &'a mut [DirectoryNode],
     port_owners: &'a mut [PortOwnerSlot],
+    port_free_bits: &'a mut [u64],
 }
 
 impl<'a> Nat44TcpIndexStorage<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         mapping_buckets: &'a mut [DirectoryBucket],
         mapping_nodes: &'a mut [DirectoryNode],
@@ -5579,6 +6487,7 @@ impl<'a> Nat44TcpIndexStorage<'a> {
         session_address_buckets: &'a mut [DirectoryBucket],
         session_address_nodes: &'a mut [DirectoryNode],
         port_owners: &'a mut [PortOwnerSlot],
+        port_free_bits: &'a mut [u64],
     ) -> Self {
         Self {
             mapping_buckets,
@@ -5588,6 +6497,7 @@ impl<'a> Nat44TcpIndexStorage<'a> {
             session_address_buckets,
             session_address_nodes,
             port_owners,
+            port_free_bits,
         }
     }
 }
@@ -5624,6 +6534,7 @@ pub struct Nat44TcpStorageShape {
     session_address_buckets: u32,
     session_address_nodes: u32,
     port_owner_slots: u32,
+    port_bitmap_words: u32,
 }
 
 impl Nat44TcpStorageShape {
@@ -5654,6 +6565,10 @@ impl Nat44TcpStorageShape {
     pub const fn port_owner_slots(self) -> u32 {
         self.port_owner_slots
     }
+    /// Words of the free-port bitmap of the port-owner index.
+    pub const fn port_bitmap_words(self) -> u32 {
+        self.port_bitmap_words
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -5668,6 +6583,7 @@ struct Nat44TcpRuntimeBinding {
     session_address_buckets: Nat44UdpBackingIdentity,
     session_address_nodes: Nat44UdpBackingIdentity,
     port_owners: Nat44UdpBackingIdentity,
+    port_free_bits: Nat44UdpBackingIdentity,
 }
 
 impl Nat44TcpRuntimeBinding {
@@ -5688,6 +6604,7 @@ impl Nat44TcpRuntimeBinding {
             session_address_buckets: Nat44UdpBackingIdentity::of(indexes.session_address_buckets),
             session_address_nodes: Nat44UdpBackingIdentity::of(indexes.session_address_nodes),
             port_owners: Nat44UdpBackingIdentity::of(indexes.port_owners),
+            port_free_bits: Nat44UdpBackingIdentity::of(indexes.port_free_bits),
         }
     }
 }
@@ -5773,6 +6690,12 @@ impl Nat44TcpReconcilePermit<'_, '_> {
 /// or window state. FIN and RST are translated like any other packet and do
 /// not shorten the conservative idle lifetime.
 ///
+/// Every per-packet search is bounded (PERF-001): a new mapping, session, or
+/// public port is found in O(1) from activity-ordered intrusive lists (the
+/// head is the first to expire), a retired-mapping list, fresh-slot
+/// boundaries, and a free-port bitmap, as for [`Nat44UdpRuntime`]. An
+/// external inbound SYN keeps its bounded keyed probe window.
+///
 /// ```compile_fail
 /// use ruster_core::Nat44TcpRuntime;
 /// fn assert_send<T: Send>() {}
@@ -5805,6 +6728,8 @@ pub struct Nat44TcpRuntime<'a> {
     mapping_occupancy: OccupancyCounter,
     session_occupancy: OccupancyCounter,
     external_inbound_occupancy: OccupancyCounter,
+    /// Mapping and session reuse lists; see [`TcpReuseLists`].
+    reuse_lists: TcpReuseLists,
     #[cfg(test)]
     mapping_liveness_checks: Cell<usize>,
     #[cfg(test)]
@@ -5852,6 +6777,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         .map_err(|_| Nat44TcpRuntimeConfigError::SessionAddressDirectoryInvalid)?;
         PortOwnerTable::validate_config(
             indexes.port_owners.len(),
+            indexes.port_free_bits.len(),
             config.first_port,
             config.last_port,
             mappings.len(),
@@ -5874,6 +6800,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         .expect("session address directory dimensions were preflighted");
         let port_owners = PortOwnerTable::new(
             indexes.port_owners,
+            indexes.port_free_bits,
             config.first_port,
             config.last_port,
             mappings.len(),
@@ -5899,6 +6826,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             mapping_occupancy: OccupancyCounter::default(),
             session_occupancy: OccupancyCounter::default(),
             external_inbound_occupancy: OccupancyCounter::default(),
+            reuse_lists: TcpReuseLists::FLUSHED,
             #[cfg(test)]
             mapping_liveness_checks: Cell::new(0),
             #[cfg(test)]
@@ -5980,6 +6908,8 @@ impl<'a> Nat44TcpRuntime<'a> {
                 .expect("validated capacity"),
             port_owner_slots: u32::try_from(self.port_owners.slot_count())
                 .expect("validated capacity"),
+            port_bitmap_words: u32::try_from(port_free_bitmap_words(self.port_owners.slot_count()))
+                .expect("validated capacity"),
         }
     }
 
@@ -6014,6 +6944,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             .ok_or(Nat44TcpReconcileError::RuntimeEpochExhausted)?;
         if PortOwnerTable::validate_config(
             self.port_owners.slot_count(),
+            port_free_bitmap_words(self.port_owners.slot_count()),
             config.first_port,
             config.last_port,
             self.mappings.len(),
@@ -6040,6 +6971,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         let sessions_flushed = self.sessions.iter().filter(|slot| slot.occupied).count();
         self.mappings.fill(Nat44TcpMappingSlot::default());
         self.sessions.fill(Nat44TcpSessionSlot::default());
+        self.reuse_lists = TcpReuseLists::FLUSHED;
         self.mapping_occupancy.flush();
         self.session_occupancy.flush();
         self.external_inbound_occupancy.flush();
@@ -6212,6 +7144,7 @@ impl<'a> Nat44TcpRuntime<'a> {
                         remote_port,
                         last_activity_ms: now_ms,
                         external_inbound: false,
+                        links: SlotLinks::UNLINKED,
                     },
                     mapping_created: false,
                     mapping_expired: false,
@@ -6261,6 +7194,7 @@ impl<'a> Nat44TcpRuntime<'a> {
                     internal_port,
                     public_port: port.port,
                     last_activity_ms: now_ms,
+                    link: TcpMappingLink::default(),
                 },
                 session_index: encode_udp_index(session_index),
                 session: Nat44TcpSessionSlot {
@@ -6272,6 +7206,7 @@ impl<'a> Nat44TcpRuntime<'a> {
                     remote_port,
                     last_activity_ms: now_ms,
                     external_inbound: false,
+                    links: SlotLinks::UNLINKED,
                 },
                 mapping_created: true,
                 mapping_expired,
@@ -6425,12 +7360,12 @@ impl<'a> Nat44TcpRuntime<'a> {
         }
         let same_remote_expired =
             self.inbound_admission(mapping_index, mapping, remote_address, origin, now_ms)?;
-        // Externally initiated sessions never run the outbound O(S) slot
-        // scan: this packet is unauthenticated and a bound firewall has not
-        // judged it yet. Reuse the exact expired slot, else an expired slot
-        // of this mapping and remote address seen by the admission walk
-        // (so such slots do not pile up in the remote-address chain), else
-        // probe a bounded keyed window.
+        // Externally initiated sessions keep their own bounded search: this
+        // packet is unauthenticated and a bound firewall has not judged it
+        // yet. Reuse the exact expired slot, else an expired slot of this
+        // mapping and remote address seen by the admission walk (so such
+        // slots do not pile up in the remote-address chain), else probe a
+        // bounded keyed window.
         let session_index = if let Some((session_index, _)) = exact_session {
             session_index
         } else if let Some(session_index) = same_remote_expired {
@@ -6456,6 +7391,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             remote_port,
             last_activity_ms: now_ms,
             external_inbound: origin == Nat44TcpInboundOrigin::External,
+            links: SlotLinks::UNLINKED,
         };
         let prepared = self.prepare_session_link(session_index, session)?;
         mapping.last_activity_ms = now_ms;
@@ -6479,13 +7415,16 @@ impl<'a> Nat44TcpRuntime<'a> {
     /// tuple, the time, and the probe number. An external sender cannot
     /// steer the positions, and a retransmitted SYN probes others. Probes
     /// are independent of where outbound creation clusters live slots (it
-    /// fills from index 0), so with live fraction ρ a miss has probability
+    /// fills never-used slots from index 0 and reuses the least recently
+    /// active session first), so with live fraction ρ a miss has probability
     /// about ρ^16 (well under 10^-4 at ρ = 1/2). The probed positions are
     /// distinct: a drawn position that repeats an earlier probe moves to the
     /// next position not yet probed (at most 15 steps), so every probe checks
     /// a new slot and a small, nearly full table is not missed for repeated
     /// draws. A miss is `SessionFull` even if a reusable slot exists
-    /// elsewhere; the outbound path keeps its full scan.
+    /// elsewhere. A probe that lands on a never-used slot takes the lowest
+    /// never-used slot instead (the same outcome, a fresh slot), so fresh
+    /// slots keep leaving the fresh set in index order (PERF-001).
     fn find_reusable_session_for_inbound(
         &self,
         mapping_index: usize,
@@ -6499,7 +7438,9 @@ impl<'a> Nat44TcpRuntime<'a> {
             return None;
         }
         if capacity <= NAT44_TCP_INBOUND_SLOT_PROBES {
-            return (0..capacity).find(|&index| self.session_slot_reusable(index, now_ms));
+            return (0..capacity)
+                .find(|&index| self.session_slot_reusable(index, now_ms))
+                .map(|index| self.reusable_session_or_fresh(index));
         }
         let mut words = [
             mapping_index as u64,
@@ -6530,10 +7471,22 @@ impl<'a> Nat44TcpRuntime<'a> {
             }
             probed[probe] = index;
             if self.session_slot_reusable(index, now_ms) {
-                return Some(index);
+                return Some(self.reusable_session_or_fresh(index));
             }
         }
         None
+    }
+
+    /// `index` if it is occupied (an expired session to reuse), else the
+    /// lowest never-used slot: every unoccupied slot is at or after the
+    /// fresh boundary, which is then unoccupied too.
+    fn reusable_session_or_fresh(&self, index: usize) -> usize {
+        if self.sessions[index].occupied {
+            index
+        } else {
+            debug_assert!(self.reuse_lists.next_fresh_session <= index);
+            self.reuse_lists.next_fresh_session
+        }
     }
 
     /// Admission of an inbound initial SYN without an exact live session:
@@ -6719,6 +7672,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             .filter(|index| *index != plan.mapping_index())
         {
             self.mappings[displaced].port_owned = false;
+            self.retire_mapping(displaced);
         }
         self.write_mapping_slot(plan.mapping_index(), plan.mapping);
         self.write_session_slot(plan.session_index(), plan.session);
@@ -6817,17 +7771,62 @@ impl<'a> Nat44TcpRuntime<'a> {
         }
     }
 
-    /// Overwrites one mapping slot and its O(1) occupancy counter.
-    fn write_mapping_slot(&mut self, index: usize, mapping: Nat44TcpMappingSlot) {
-        let before = self.mappings[index].occupied;
-        self.mappings[index] = mapping;
-        self.mapping_occupancy.transition(before, mapping.occupied);
+    /// Moves an expired mapping that just lost its public port from the
+    /// activity list to the retired list; O(1).
+    fn retire_mapping(&mut self, index: usize) {
+        debug_assert!(self.mappings[index].link.list == TcpMappingList::Lru);
+        self.reuse_lists.mapping_lru.unlink(self.mappings, index);
+        self.mappings[index].link.list = TcpMappingList::Retired;
+        self.reuse_lists
+            .mapping_retired
+            .push_back(self.mappings, index);
     }
 
-    /// Overwrites one session slot and its O(1) occupancy counters.
+    /// Overwrites one mapping slot (just stamped with the current time) and
+    /// its O(1) occupancy counter, and moves the slot to the tail of the
+    /// mapping activity list.
+    fn write_mapping_slot(&mut self, index: usize, mapping: Nat44TcpMappingSlot) {
+        let before = self.mappings[index];
+        debug_assert!(self
+            .reuse_lists
+            .mapping_lru
+            .tail()
+            .is_none_or(|tail| self.mappings[tail].last_activity_ms <= mapping.last_activity_ms));
+        self.reuse_lists
+            .detach_mapping(self.mappings, index, before.link.list);
+        self.mappings[index] = Nat44TcpMappingSlot {
+            link: TcpMappingLink {
+                links: SlotLinks::UNLINKED,
+                list: TcpMappingList::Lru,
+            },
+            ..mapping
+        };
+        self.reuse_lists.mapping_lru.push_back(self.mappings, index);
+        self.mapping_occupancy
+            .transition(before.occupied, mapping.occupied);
+    }
+
+    /// Overwrites one session slot (just stamped with the current time) and
+    /// its O(1) occupancy counters, and moves the slot from the fresh set or
+    /// its place on the session activity list to that list's tail.
     fn write_session_slot(&mut self, index: usize, session: Nat44TcpSessionSlot) {
         let before = self.sessions[index];
-        self.sessions[index] = session;
+        debug_assert!(self
+            .reuse_lists
+            .session_lru
+            .tail()
+            .is_none_or(|tail| self.sessions[tail].last_activity_ms <= session.last_activity_ms));
+        if before.occupied {
+            self.reuse_lists.session_lru.unlink(self.sessions, index);
+        } else {
+            debug_assert!(index == self.reuse_lists.next_fresh_session);
+            self.reuse_lists.next_fresh_session += 1;
+        }
+        self.sessions[index] = Nat44TcpSessionSlot {
+            links: SlotLinks::UNLINKED,
+            ..session
+        };
+        self.reuse_lists.session_lru.push_back(self.sessions, index);
         self.session_occupancy
             .transition(before.occupied, session.occupied);
         self.external_inbound_occupancy.transition(
@@ -7054,6 +8053,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         self.reusable_mapping_checks.set(0);
         self.reusable_session_checks.set(0);
         self.port_owner_probes.set(0);
+        self.port_owners.take_bitmap_word_reads();
     }
 
     #[cfg(test)]
@@ -7129,17 +8129,52 @@ impl<'a> Nat44TcpRuntime<'a> {
         Ok(probe.state_index.map(|index| (index, self.sessions[index])))
     }
 
-    fn find_reusable_mapping(&self, now_ms: u64) -> Option<usize> {
-        self.mappings.iter().copied().position(|mapping| {
-            #[cfg(test)]
-            self.reusable_mapping_checks
-                .set(self.reusable_mapping_checks.get().saturating_add(1));
-            !self.mapping_is_live(mapping, now_ms)
-        })
+    /// The head of the mapping activity list when it is expired: the oldest
+    /// mapping that still owns its port. One liveness check.
+    fn expired_mapping_head(&self, now_ms: u64) -> Option<usize> {
+        #[cfg(test)]
+        self.reusable_mapping_checks
+            .set(self.reusable_mapping_checks.get().saturating_add(1));
+        let head = self.reuse_lists.mapping_lru.head()?;
+        (!self.mapping_is_live(self.mappings[head], now_ms)).then_some(head)
     }
 
+    /// A reusable (unoccupied or expired) mapping slot in O(1), or `None`
+    /// exactly when every slot holds a live mapping. Expired slots are
+    /// preferred over never-used ones, so occupancy keeps counting the
+    /// distinct slots used since the flush.
+    fn find_reusable_mapping(&self, now_ms: u64) -> Option<usize> {
+        self.reuse_lists
+            .mapping_retired
+            .head()
+            .or_else(|| self.expired_mapping_head(now_ms))
+            .or_else(|| self.fresh_mapping())
+    }
+
+    /// The lowest never-used mapping slot, if any.
+    fn fresh_mapping(&self) -> Option<usize> {
+        let index = self.reuse_lists.next_fresh_mapping;
+        (index < self.mappings.len()).then_some(index)
+    }
+
+    /// The lowest never-used session slot, if any.
+    fn fresh_session(&self) -> Option<usize> {
+        let index = self.reuse_lists.next_fresh_session;
+        (index < self.sessions.len()).then_some(index)
+    }
+
+    /// A reusable session slot in O(1): the head of the session activity
+    /// list (the least recently active session) when it is reusable, else
+    /// the lowest never-used slot. A session's mapping is refreshed with it
+    /// and shares its TTL, so a session whose mapping expired or was
+    /// recreated has itself expired: `None` exactly when every session is
+    /// live.
     fn find_reusable_session(&self, now_ms: u64) -> Option<usize> {
-        (0..self.sessions.len()).find(|&index| self.session_slot_reusable(index, now_ms))
+        self.reuse_lists
+            .session_lru
+            .head()
+            .filter(|&head| self.session_slot_reusable(head, now_ms))
+            .or_else(|| self.fresh_session())
     }
 
     fn session_slot_reusable(&self, index: usize, now_ms: u64) -> bool {
@@ -7592,7 +8627,81 @@ impl<'a> Nat44TcpRuntime<'a> {
                 return Err(Nat44TcpIndexInvariantError::DuplicateSessionKey);
             }
         }
+        if !self.reuse_lists_are_consistent() {
+            return Err(Nat44TcpIndexInvariantError::ReuseLists);
+        }
         Ok(())
+    }
+
+    /// Exact O(M + S) check of the reuse sets (validation only): the fresh
+    /// slots are exactly the default slots at and after each fresh
+    /// boundary, the lists hold every other slot, each slot's list agrees
+    /// with its state, activity lists are in `last_activity_ms` order, and
+    /// retired mappings are expired.
+    #[cfg(test)]
+    fn reuse_lists_are_consistent(&self) -> bool {
+        let lists = self.reuse_lists;
+        let (Some(fresh_mappings), Some(fresh_sessions)) = (
+            self.mappings.get(lists.next_fresh_mapping..),
+            self.sessions.get(lists.next_fresh_session..),
+        ) else {
+            return false;
+        };
+        if fresh_mappings
+            .iter()
+            .any(|slot| *slot != Nat44TcpMappingSlot::default())
+            || fresh_sessions
+                .iter()
+                .any(|slot| *slot != Nat44TcpSessionSlot::default())
+            || self.mappings[..lists.next_fresh_mapping]
+                .iter()
+                .any(|slot| !slot.occupied)
+            || self.sessions[..lists.next_fresh_session]
+                .iter()
+                .any(|slot| !slot.occupied)
+        {
+            return false;
+        }
+        let mut listed = fresh_mappings.len();
+        for (header, list) in [
+            (lists.mapping_lru, TcpMappingList::Lru),
+            (lists.mapping_retired, TcpMappingList::Retired),
+        ] {
+            let mut previous_ms = 0;
+            let consistent = header.validate(self.mappings, |index| {
+                listed += 1;
+                let mapping = self.mappings[index];
+                let ordered = previous_ms <= mapping.last_activity_ms;
+                previous_ms = mapping.last_activity_ms;
+                mapping.link.list == list
+                    && match list {
+                        TcpMappingList::Free => false,
+                        TcpMappingList::Lru => mapping.occupied && mapping.port_owned && ordered,
+                        TcpMappingList::Retired => {
+                            mapping.occupied
+                                && !mapping.port_owned
+                                && self
+                                    .watermark_ms
+                                    .is_none_or(|now_ms| !self.mapping_is_live(mapping, now_ms))
+                        }
+                    }
+            });
+            if !consistent {
+                return false;
+            }
+        }
+        if listed != self.mappings.len() {
+            return false;
+        }
+        let mut listed = fresh_sessions.len();
+        let mut previous_ms = 0;
+        lists.session_lru.validate(self.sessions, |index| {
+            listed += 1;
+            let session = self.sessions[index];
+            let ordered = previous_ms <= session.last_activity_ms;
+            previous_ms = session.last_activity_ms;
+            session.occupied && ordered
+        }) && listed == self.sessions.len()
     }
 
     fn allocate_port(
@@ -7606,25 +8715,28 @@ impl<'a> Nat44TcpRuntime<'a> {
                 return Ok(Some(selection));
             }
         }
-        let pool_size = u32::from(self.config.last_port) - u32::from(self.config.first_port) + 1;
-        let address = u32::from_be_bytes(internal_address.octets());
-        let mixed = self.config.policy.allocator_seed
-            ^ u64::from(address)
-            ^ u64::from(internal_port).rotate_left(17);
-        let start = u32::try_from(mixed % u64::from(pool_size))
-            .map_err(|_| Nat44TcpPlanError::IndexCorrupt)?;
-        for step in 0..pool_size {
-            let offset = (start + step) % pool_size;
-            let candidate = u16::try_from(u32::from(self.config.first_port) + offset)
-                .map_err(|_| Nat44TcpPlanError::IndexCorrupt)?;
-            if candidate == internal_port {
-                continue;
-            }
-            if let Some(selection) = self.select_port(candidate, now_ms)? {
-                return Ok(Some(selection));
-            }
+        let start = seeded_port_offset(
+            self.config.policy.allocator_seed,
+            self.config.first_port,
+            self.config.last_port,
+            internal_address,
+            internal_port,
+        );
+        // The first unowned port from the seeded start (the internal port,
+        // if in the pool, was tried above and is owned by a live mapping).
+        if let Some(port) = self.port_owners.first_unowned_port_from(start) {
+            return self.select_port(port, now_ms);
         }
-        Ok(None)
+        // Every port has an owner: take the port of the expired activity
+        // head, if any.
+        let Some(head) = self.expired_mapping_head(now_ms) else {
+            return Ok(None);
+        };
+        let mapping = self.mappings[head];
+        if !mapping.port_owned {
+            return Err(Nat44TcpPlanError::IndexCorrupt);
+        }
+        self.select_port(mapping.public_port, now_ms)
     }
 }
 
@@ -7891,6 +9003,7 @@ mod tests {
             internal_port: 65_533,
             public_port: 40_001,
             last_outbound_ms: 77,
+            link: UdpMappingLink::default(),
         };
         let mut udp_mapping_hidden = udp_mapping;
         udp_mapping_hidden.generation -= 1;
@@ -7920,6 +9033,7 @@ mod tests {
             mapping_lifecycle_epoch: POISON_U128,
             remote_address: POISON_ADDRESS,
             remote_port: 0xbeef,
+            next: LINK_NONE,
         };
         let mut udp_peer_hidden = udp_peer;
         udp_peer_hidden.remote_port -= 1;
@@ -7947,6 +9061,7 @@ mod tests {
             internal_port: 65_533,
             public_port: 40_001,
             last_activity_ms: 88,
+            link: TcpMappingLink::default(),
         };
         let mut tcp_mapping_hidden = tcp_mapping;
         tcp_mapping_hidden.generation -= 1;
@@ -7978,6 +9093,7 @@ mod tests {
             remote_port: 65_529,
             last_activity_ms: 99,
             external_inbound: true,
+            links: SlotLinks::UNLINKED,
         };
         let mut tcp_session_hidden = tcp_session;
         tcp_session_hidden.mapping_index -= 1;
@@ -8311,6 +9427,7 @@ mod tests {
                 "peer_buckets",
                 "peer_nodes",
                 "port_owner_slots",
+                "port_bitmap_words",
             ]
         );
         assert_eq!(
@@ -8333,6 +9450,7 @@ mod tests {
                 "session_address_buckets",
                 "session_address_nodes",
                 "port_owner_slots",
+                "port_bitmap_words",
             ]
         );
 
@@ -9187,6 +10305,7 @@ mod tests {
                 internal_port: 40_000,
                 public_port: 40_000,
                 last_outbound_ms: 3,
+                link: UdpMappingLink::default(),
             };
             let occupied_peer = Nat44UdpPeerSlot {
                 occupied: true,
@@ -9195,6 +10314,7 @@ mod tests {
                 mapping_lifecycle_epoch: 7,
                 remote_address: REMOTE1,
                 remote_port: 0,
+                next: LINK_NONE,
             };
             let mut mappings = [occupied_mapping];
             let mut peers = [occupied_peer];
@@ -9203,6 +10323,7 @@ mod tests {
             let mut peer_buckets = [DirectoryBucket::default(); 1];
             let mut peer_nodes = [DirectoryNode::default(); 1];
             let mut owners = [PortOwnerSlot::default(); 2];
+            let mut owner_bits = vec![0_u64; crate::port_free_bitmap_words(2)];
             let before_mapping_buckets = mapping_buckets;
             let before_peer_buckets = peer_buckets;
             let before_peer_nodes = peer_nodes;
@@ -9213,6 +10334,7 @@ mod tests {
                 &mut peer_buckets,
                 &mut peer_nodes,
                 &mut owners,
+                &mut owner_bits,
             );
             assert!(matches!(
                 Nat44UdpRuntime::new(
@@ -9442,7 +10564,7 @@ mod tests {
     }
 
     #[test]
-    fn collision_probes_are_capacity_bounded_and_port_search_is_linear_in_pool_only() {
+    fn collision_probes_are_capacity_bounded_and_port_search_is_bounded() {
         with_port_config(Nat44UdpPolicy::default(), 40_000, 40_003, |config| {
             let mut mappings = [Nat44UdpMappingSlot::default(); 5];
             let mut peers = [Nat44UdpPeerSlot::default(); 5];
@@ -9493,8 +10615,12 @@ mod tests {
                 ),
                 Err(Nat44UdpPlanError::PortExhausted)
             ));
+            // Exhaustion is decided without walking the pool: one owner
+            // check for the preserved port, one bitmap search, and no
+            // expired owner to take.
             let (_, _, owner_probes) = runtime.index_probe_counts();
-            assert_eq!(owner_probes, 4);
+            assert_eq!(owner_probes, 1);
+            assert!(runtime.port_owners.take_bitmap_word_reads() <= 3);
             assert_eq!(runtime.validate_indexes(), Ok(()));
         });
 
@@ -9555,6 +10681,334 @@ mod tests {
             assert_eq!(config.policy().idle_ttl_ms(), NAT44_UDP_DEFAULT_IDLE_TTL_MS);
             assert_ne!(config.inside(), config.outside());
             assert_ne!(config.first_port(), 0);
+        });
+    }
+
+    fn next_random(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = *state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    /// Public port the pre-PERF-001 allocator (a walk of the pool) would
+    /// choose for a new mapping: `Some(port)` when determined, `None` when
+    /// only ports of expired owners remain (any of them is correct), and
+    /// `Err` when every port has a live owner.
+    fn reference_udp_port(
+        runtime: &Nat44UdpRuntime<'_>,
+        internal_address: Ipv4Address,
+        internal_port: u16,
+        now_ms: u64,
+    ) -> Result<Option<u16>, ()> {
+        let config = runtime.config;
+        let owner_live =
+            |port: u16| {
+                runtime.port_owners.owner(port).unwrap().map(|owner| {
+                    runtime.mapping_is_live(runtime.mappings[owner.state_index()], now_ms)
+                })
+            };
+        if (config.first_port..=config.last_port).contains(&internal_port)
+            && owner_live(internal_port) != Some(true)
+        {
+            return Ok(Some(internal_port));
+        }
+        let pool = usize::from(config.last_port - config.first_port) + 1;
+        let start = seeded_port_offset(
+            config.policy.allocator_seed,
+            config.first_port,
+            config.last_port,
+            internal_address,
+            internal_port,
+        );
+        if let Some(port) = (0..pool)
+            .map(|step| config.first_port + ((start + step) % pool) as u16)
+            .find(|port| owner_live(*port).is_none())
+        {
+            return Ok(Some(port));
+        }
+        if (config.first_port..=config.last_port).any(|port| owner_live(port) == Some(false)) {
+            Ok(None)
+        } else {
+            Err(())
+        }
+    }
+
+    /// The pre-PERF-001 reusable-peer predicate, by scanning every slot.
+    fn reference_peer_available(runtime: &Nat44UdpRuntime<'_>, now_ms: u64) -> bool {
+        runtime.peers.iter().any(|peer| {
+            !peer.occupied
+                || runtime
+                    .mappings
+                    .get(peer.mapping_index)
+                    .is_none_or(|mapping| {
+                        !runtime.mapping_is_live(*mapping, now_ms)
+                            || mapping.generation != peer.mapping_generation
+                            || mapping.lifecycle_epoch != peer.mapping_lifecycle_epoch
+                    })
+        })
+    }
+
+    /// Random outbound and inbound UDP, refreshes, and expiry on small
+    /// tables, checked against the pre-PERF-001 full scans: a new mapping
+    /// or peer fails as full exactly when no slot is reusable, the port is
+    /// exactly the first unowned port from the seeded start (or a port of an
+    /// expired owner when none is unowned), exhaustion is exact, and the
+    /// indexes and reuse lists stay consistent after every commit.
+    #[test]
+    fn udp_reuse_matches_a_full_scan_reference_under_seeded_churn() {
+        let ttl = NAT44_UDP_MIN_IDLE_TTL_MS;
+        let mut outcomes = [0_usize; 8];
+        for seed in 0..32_u64 {
+            let filtering = [
+                Nat44Filtering::AddressDependent,
+                Nat44Filtering::AddressAndPortDependent,
+                Nat44Filtering::EndpointIndependent,
+            ][seed as usize % 3];
+            let policy = Nat44UdpPolicy::new(ttl, seed.wrapping_mul(0x2545_f491_4f6c_dd1d))
+                .unwrap()
+                .with_filtering(filtering);
+            with_port_config(policy, 40_000, 40_003, |config| {
+                // Three mappings fill before the four ports; five exhaust them.
+                let mut mappings =
+                    vec![Nat44UdpMappingSlot::default(); 3 + 2 * (seed as usize % 2)];
+                let mut peers = [Nat44UdpPeerSlot::default(); 7];
+                let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+                let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+                let mut rng = seed ^ 0x0bad_cafe;
+                let mut now = 0;
+                for _ in 0..300 {
+                    now += match next_random(&mut rng) % 10 {
+                        0 => ttl,
+                        1 => ttl / 2,
+                        2..=4 => 1_000,
+                        _ => 0,
+                    };
+                    let remote = [REMOTE1, REMOTE2][(next_random(&mut rng) % 2) as usize];
+                    let remote_port = 1 + (next_random(&mut rng) % 3) as u16;
+                    if next_random(&mut rng).is_multiple_of(5) {
+                        let public_port = 40_000 + (next_random(&mut rng) % 4) as u16;
+                        if let Ok(plan) =
+                            runtime.plan_inbound(public_port, remote, remote_port, now)
+                        {
+                            runtime.commit_inbound(plan, now).unwrap();
+                            outcomes[0] += 1;
+                        }
+                    } else {
+                        let host = Ipv4Address::from_octets([
+                            10,
+                            0,
+                            0,
+                            10 + (next_random(&mut rng) % 7) as u8,
+                        ]);
+                        let internal_port = 39_998 + (next_random(&mut rng) % 9) as u16;
+                        let exact = runtime
+                            .find_mapping(host, internal_port)
+                            .unwrap()
+                            .filter(|(_, mapping)| runtime.mapping_is_live(*mapping, now));
+                        let mapping_available = runtime
+                            .mappings
+                            .iter()
+                            .any(|mapping| !runtime.mapping_is_live(*mapping, now));
+                        let peer_available = reference_peer_available(&runtime, now);
+                        let port = reference_udp_port(&runtime, host, internal_port, now);
+                        let owners_before = runtime.port_owners.backing_snapshot();
+                        match runtime.plan_outbound(host, internal_port, remote, remote_port, now) {
+                            Ok(plan) if plan.mapping_created => {
+                                assert!(exact.is_none() && mapping_available && peer_available);
+                                match port {
+                                    Ok(Some(expected)) => {
+                                        assert_eq!(plan.mapping.public_port, expected);
+                                    }
+                                    Ok(None) => {
+                                        let offset = usize::from(plan.mapping.public_port - 40_000);
+                                        assert_ne!(owners_before[offset], PortOwnerSlot::default());
+                                        outcomes[7] += 1;
+                                    }
+                                    Err(()) => panic!("allocated past exhaustion"),
+                                }
+                                runtime.commit_outbound(plan, now).unwrap();
+                                outcomes[1] += 1;
+                            }
+                            Ok(plan) => {
+                                assert!(exact.is_some());
+                                assert!(!plan.peer_created || peer_available);
+                                runtime.commit_outbound(plan, now).unwrap();
+                                outcomes[2] += 1;
+                            }
+                            Err(Nat44UdpPlanError::MappingFull) => {
+                                assert!(exact.is_none() && !mapping_available);
+                                outcomes[3] += 1;
+                            }
+                            Err(Nat44UdpPlanError::PeerFull) => {
+                                assert!(!peer_available);
+                                assert!(exact.is_some() || mapping_available);
+                                outcomes[4] += 1;
+                            }
+                            Err(Nat44UdpPlanError::PortExhausted) => {
+                                assert!(exact.is_none() && mapping_available && peer_available);
+                                assert_eq!(port, Err(()));
+                                outcomes[5] += 1;
+                            }
+                            Err(error) => panic!("unexpected outbound {error:?}"),
+                        }
+                    }
+                    assert_eq!(runtime.validate_indexes(), Ok(()));
+                    outcomes[6] += 1;
+                }
+            });
+        }
+        // Every outcome the reference distinguishes was exercised.
+        assert!(outcomes.iter().all(|count| *count > 0), "{outcomes:?}");
+    }
+
+    /// PERF-001 cost bound: with 65536-slot tables and the widest pool,
+    /// planning and committing a new flow, even with every public port
+    /// owned, makes at most four O(1) list-head checks, two port-owner
+    /// checks, and 34 bitmap word reads; the pre-PERF-001 search visited up
+    /// to every mapping slot, every peer slot, and every pool port.
+    #[test]
+    fn udp_new_flow_work_is_constant_in_a_nearly_full_65536_slot_table() {
+        const SLOTS: usize = 65_536;
+        let ttl = NAT44_UDP_MIN_IDLE_TTL_MS;
+        let policy = Nat44UdpPolicy::new(ttl, 0x5eed_1234_5678_9abc).unwrap();
+        with_port_config(policy, 1, 65_535, |config| {
+            let mut mappings = vec![Nat44UdpMappingSlot::default(); SLOTS];
+            let mut peers = vec![Nat44UdpPeerSlot::default(); SLOTS];
+            let mut indexes = TestNat44UdpIndexes::new(config, SLOTS, SLOTS);
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            runtime.skip_commit_validation.set(true);
+            let host = |flow: usize| {
+                Ipv4Address::from_octets([
+                    10,
+                    1 + (flow >> 16) as u8,
+                    (flow >> 8) as u8,
+                    flow as u8,
+                ])
+            };
+            // [list-head checks, port owners, bitmap words]
+            let mut worst = [0_usize; 3];
+            let mut flow_work = |runtime: &mut Nat44UdpRuntime<'_>,
+                                 address: Ipv4Address,
+                                 remote: Ipv4Address,
+                                 now: u64| {
+                runtime.reset_index_probe_counts();
+                let result = runtime
+                    .plan_outbound(address, 7, remote, TEST_REMOTE_PORT, now)
+                    .map(|plan| {
+                        runtime.commit_outbound(plan, now).unwrap();
+                        plan.mapping.public_port
+                    });
+                let (_, _, owner_probes) = runtime.index_probe_counts();
+                let seen = [
+                    runtime.take_reuse_visits(),
+                    owner_probes,
+                    runtime.port_owners.take_bitmap_word_reads(),
+                ];
+                for (worst, seen) in worst.iter_mut().zip(seen) {
+                    *worst = (*worst).max(seen);
+                }
+                result
+            };
+            // Every public port taken, half the flows at 0 and half at 1 s.
+            for flow in 0..65_535 {
+                let now = if flow < 32_768 { 0 } else { 1_000 };
+                flow_work(&mut runtime, host(flow), REMOTE1, now).unwrap();
+            }
+            assert_eq!(
+                flow_work(&mut runtime, host(65_535), REMOTE1, 1_000),
+                Err(Nat44UdpPlanError::PortExhausted)
+            );
+            // The last never-used peer goes to a new peer of a live mapping;
+            // the next one finds the peer table full in O(1).
+            flow_work(&mut runtime, host(65_534), REMOTE2, 1_000).unwrap();
+            assert_eq!(
+                flow_work(
+                    &mut runtime,
+                    host(65_534),
+                    Ipv4Address::from_octets([198, 51, 100, 3]),
+                    1_000
+                ),
+                Err(Nat44UdpPlanError::PeerFull)
+            );
+            // At the TTL the first half has expired: new flows and new peers
+            // reuse the oldest expired mappings, their peers, and their ports.
+            for flow in 65_536..66_536 {
+                flow_work(&mut runtime, host(flow), REMOTE1, ttl).unwrap();
+                flow_work(&mut runtime, host(65_534), host(flow), ttl).unwrap();
+            }
+            assert_eq!(runtime.counters.mappings_expired, 1_000);
+            assert!(runtime.reuse_lists_are_consistent());
+            assert!(runtime.port_owners.bitmap_matches_slots());
+            assert!(
+                worst[0] <= 4 && worst[1] <= 2 && worst[2] <= 34,
+                "work per new flow {worst:?}"
+            );
+        });
+    }
+
+    /// Defense in depth: a commit whose planned peer slot is no longer the
+    /// one the reuse lists offer fails as `IndexCorrupt` before mutating
+    /// anything, and a list head that breaks its invariant (an active
+    /// mapping without peers, an expired owner without its port) fails the
+    /// plan closed instead of being trusted.
+    #[test]
+    fn udp_reuse_list_corruption_fails_closed_without_mutation() {
+        let ttl = NAT44_UDP_MIN_IDLE_TTL_MS;
+        let policy = Nat44UdpPolicy::new(ttl, 7).unwrap();
+        with_port_config(policy, 40_000, 40_000, |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 2];
+            let mut peers = [Nat44UdpPeerSlot::default(); 3];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            let plan = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE1, TEST_REMOTE_PORT, 0)
+                .unwrap();
+            runtime.commit_outbound(plan, 0).unwrap();
+
+            // The plan takes the next never-used peer; moving the fresh
+            // boundary under it (same revision) must refuse the commit.
+            let plan = runtime
+                .plan_outbound(INTERNAL, 40_000, REMOTE2, TEST_REMOTE_PORT, 1)
+                .unwrap();
+            assert!(plan.peer_created);
+            runtime.next_fresh_peer += 1;
+            let before = (runtime.mappings.to_vec(), runtime.peers.to_vec());
+            assert_eq!(
+                runtime.commit_outbound(plan, 1),
+                Err(Nat44UdpCommitError::IndexCorrupt)
+            );
+            assert_eq!((runtime.mappings.to_vec(), runtime.peers.to_vec()), before);
+            runtime.next_fresh_peer -= 1;
+            runtime.commit_outbound(plan, 1).unwrap();
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+
+            // After expiry the activity head offers its peers and its port.
+            let head = runtime.mapping_lists.lru.head().unwrap();
+            let peers = runtime.mappings[head].link.peers;
+            runtime.mappings[head].link.peers = PeerChain::EMPTY;
+            assert_eq!(
+                runtime
+                    .plan_outbound(INTERNAL2, 1, REMOTE1, TEST_REMOTE_PORT, ttl + 1)
+                    .err(),
+                Some(Nat44UdpPlanError::IndexCorrupt)
+            );
+            runtime.mappings[head].link.peers = peers;
+            runtime.mappings[head].port_owned = false;
+            assert_eq!(
+                runtime
+                    .plan_outbound(INTERNAL2, 1, REMOTE1, TEST_REMOTE_PORT, ttl + 1)
+                    .err(),
+                Some(Nat44UdpPlanError::IndexCorrupt)
+            );
+            runtime.mappings[head].port_owned = true;
+            let plan = runtime
+                .plan_outbound(INTERNAL2, 1, REMOTE1, TEST_REMOTE_PORT, ttl + 1)
+                .unwrap();
+            assert_eq!(plan.mapping.public_port, 40_000);
+            runtime.commit_outbound(plan, ttl + 1).unwrap();
+            assert_eq!(runtime.validate_indexes(), Ok(()));
         });
     }
 }

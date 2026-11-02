@@ -6237,6 +6237,7 @@ mod tests {
         let mut session_address_buckets = session_buckets;
         let mut session_address_nodes = session_nodes;
         let mut owners = [PortOwnerSlot::default(); 1];
+        let mut owner_bits = vec![0_u64; crate::port_free_bitmap_words(1)];
         let mut firewall_states = [FirewallStateSlot::default(); 1];
         let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
         let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
@@ -6267,6 +6268,7 @@ mod tests {
                     &mut session_address_buckets,
                     &mut session_address_nodes,
                     &mut owners,
+                    &mut owner_bits,
                 ),
                 Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0).unwrap(),
             )

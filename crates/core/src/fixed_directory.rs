@@ -785,6 +785,162 @@ fn sip_rounds(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64, rounds: us
     }
 }
 
+/// Number of `u64` words of caller-backed free-port bitmap storage for a
+/// NAT44 port pool of `port_count` ports: one leaf bit per port plus one
+/// summary bit per leaf word (1040 words, 8320 bytes, for the widest pool of
+/// 65535 ports). A free port is then found by reading at most two leaf words
+/// and two passes over the summary words (34 words for the widest pool)
+/// instead of walking the pool.
+#[must_use]
+pub const fn port_free_bitmap_words(port_count: usize) -> usize {
+    if port_count == 0 {
+        return 0;
+    }
+    let leaf_words = port_count.div_ceil(64);
+    leaf_words + leaf_words.div_ceil(64)
+}
+
+/// Free-port bitmap over caller-backed words: leaf bit `offset` is set iff
+/// pool offset `offset` has no owner, and summary bit `w` is set iff leaf
+/// word `w` has a set bit. Bits past the pool are always clear.
+struct PortFreeBitmap<'a> {
+    words: &'a mut [u64],
+    port_count: usize,
+    leaf_words: usize,
+    #[cfg(test)]
+    word_reads: std::cell::Cell<usize>,
+}
+
+impl<'a> PortFreeBitmap<'a> {
+    fn new(words: &'a mut [u64], port_count: usize) -> Self {
+        debug_assert!(words.len() == port_free_bitmap_words(port_count));
+        let mut bitmap = Self {
+            words,
+            port_count,
+            leaf_words: port_count.div_ceil(64),
+            #[cfg(test)]
+            word_reads: std::cell::Cell::new(0),
+        };
+        bitmap.reset_all_free();
+        bitmap
+    }
+
+    /// Marks every pool offset free. O(pool / 64), cold path only.
+    fn reset_all_free(&mut self) {
+        self.words.fill(0);
+        let (leaf, summary) = self.words.split_at_mut(self.leaf_words);
+        for (word_index, word) in leaf.iter_mut().enumerate() {
+            let bits = (self.port_count - word_index * 64).min(64);
+            *word = if bits == 64 {
+                u64::MAX
+            } else {
+                (1_u64 << bits) - 1
+            };
+            summary[word_index / 64] |= 1_u64 << (word_index % 64);
+        }
+    }
+
+    fn set(&mut self, offset: usize, free: bool) {
+        debug_assert!(offset < self.port_count);
+        let word_index = offset / 64;
+        let bit = 1_u64 << (offset % 64);
+        if free {
+            self.words[word_index] |= bit;
+        } else {
+            self.words[word_index] &= !bit;
+        }
+        let nonempty = self.words[word_index] != 0;
+        let summary_bit = 1_u64 << (word_index % 64);
+        let summary = &mut self.words[self.leaf_words + word_index / 64];
+        if nonempty {
+            *summary |= summary_bit;
+        } else {
+            *summary &= !summary_bit;
+        }
+    }
+
+    fn read(&self, word_index: usize) -> u64 {
+        #[cfg(test)]
+        self.word_reads.set(self.word_reads.get() + 1);
+        self.words[word_index]
+    }
+
+    /// First leaf word at or after `from` with a free bit, found through the
+    /// summary words (at most one read per summary word).
+    fn next_nonempty_leaf_word(&self, from: usize) -> Option<usize> {
+        if from >= self.leaf_words {
+            return None;
+        }
+        let summary_words = self.words.len() - self.leaf_words;
+        let mut summary_index = from / 64;
+        let mut mask = u64::MAX << (from % 64);
+        while summary_index < summary_words {
+            let bits = self.read(self.leaf_words + summary_index) & mask;
+            if bits != 0 {
+                let word_index = summary_index * 64 + bits.trailing_zeros() as usize;
+                return (word_index < self.leaf_words).then_some(word_index);
+            }
+            summary_index += 1;
+            mask = u64::MAX;
+        }
+        None
+    }
+
+    /// The first free offset at or after `start`, wrapping once around the
+    /// pool: the same port a walk of the pool from `start` would reach first
+    /// among unowned ports. Bounded by two leaf-word reads plus two passes
+    /// over the summary words, independent of how many ports are owned.
+    fn first_free_from(&self, start: usize) -> Option<usize> {
+        if self.port_count == 0 {
+            return None;
+        }
+        let start = start % self.port_count;
+        let start_word = start / 64;
+        let tail = self.read(start_word) & (u64::MAX << (start % 64));
+        if tail != 0 {
+            return Some(start_word * 64 + tail.trailing_zeros() as usize);
+        }
+        // Later words, then wrap to the beginning: the second search may
+        // return `start_word` itself, whose set bits are all below `start`.
+        let word_index = self
+            .next_nonempty_leaf_word(start_word + 1)
+            .or_else(|| self.next_nonempty_leaf_word(0))?;
+        let bits = self.read(word_index);
+        (bits != 0).then(|| word_index * 64 + bits.trailing_zeros() as usize)
+    }
+
+    /// Exact consistency with the owner slots (validation only, O(pool)).
+    fn matches(&self, slots: &[PortOwnerSlot]) -> bool {
+        if slots.len() != self.port_count || self.words.len() != port_free_bitmap_words(slots.len())
+        {
+            return false;
+        }
+        let summary_words = self.words.len() - self.leaf_words;
+        let mut expected_summary = [0_u64; 16];
+        if summary_words > expected_summary.len() {
+            return false;
+        }
+        for word_index in 0..self.leaf_words {
+            let mut expected = 0_u64;
+            for bit in 0..64 {
+                if slots
+                    .get(word_index * 64 + bit)
+                    .is_some_and(|slot| *slot == PortOwnerSlot::default())
+                {
+                    expected |= 1_u64 << bit;
+                }
+            }
+            if self.words[word_index] != expected {
+                return false;
+            }
+            if expected != 0 {
+                expected_summary[word_index / 64] |= 1_u64 << (word_index % 64);
+            }
+        }
+        self.words[self.leaf_words..] == expected_summary[..summary_words]
+    }
+}
+
 #[derive(Clone, Copy, Default, Eq, PartialEq)]
 pub struct PortOwnerSlot {
     state_index_plus_one: u32,
@@ -886,6 +1042,7 @@ pub(crate) enum PortOwnerConfigError {
     InvalidRange,
     SlotCountMismatch,
     StateCapacityTooLarge,
+    BitmapSizeMismatch,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -956,10 +1113,15 @@ pub(crate) enum PortOwnerSemanticError {
     OwnerMismatch { port: u16, state_index: usize },
     ExpectedPortOutOfRange { state_index: usize },
     MissingOwner { state_index: usize },
+    FreeBitmapMismatch,
 }
 
+/// Public-port owner index of one NAT44 protocol: one owner slot per pool
+/// port and a free-port bitmap kept exactly in step with the slots by every
+/// mutation, so a free port is found without walking the pool.
 pub(crate) struct PortOwnerTable<'a> {
     slots: &'a mut [PortOwnerSlot],
+    free: PortFreeBitmap<'a>,
     first_port: u16,
     last_port: u16,
     state_capacity: usize,
@@ -968,23 +1130,37 @@ pub(crate) struct PortOwnerTable<'a> {
 impl<'a> PortOwnerTable<'a> {
     pub(crate) fn validate_config(
         slot_count: usize,
+        bitmap_words: usize,
         first_port: u16,
         last_port: u16,
         state_capacity: usize,
     ) -> Result<(), PortOwnerConfigError> {
-        validate_port_owner_dimensions(slot_count, first_port, last_port, state_capacity)
+        validate_port_owner_dimensions(slot_count, first_port, last_port, state_capacity)?;
+        if bitmap_words != port_free_bitmap_words(slot_count) {
+            return Err(PortOwnerConfigError::BitmapSizeMismatch);
+        }
+        Ok(())
     }
 
     pub(crate) fn new(
         slots: &'a mut [PortOwnerSlot],
+        free_words: &'a mut [u64],
         first_port: u16,
         last_port: u16,
         state_capacity: usize,
     ) -> Result<Self, PortOwnerConfigError> {
-        validate_port_owner_dimensions(slots.len(), first_port, last_port, state_capacity)?;
+        Self::validate_config(
+            slots.len(),
+            free_words.len(),
+            first_port,
+            last_port,
+            state_capacity,
+        )?;
         slots.fill(PortOwnerSlot::default());
+        let free = PortFreeBitmap::new(free_words, slots.len());
         Ok(Self {
             slots,
+            free,
             first_port,
             last_port,
             state_capacity,
@@ -993,6 +1169,38 @@ impl<'a> PortOwnerTable<'a> {
 
     pub(crate) fn clear(&mut self) {
         self.slots.fill(PortOwnerSlot::default());
+        self.free.reset_all_free();
+    }
+
+    /// Writes one owner slot and its free bit together.
+    fn write_slot(&mut self, offset: usize, slot: PortOwnerSlot) {
+        self.slots[offset] = slot;
+        self.free.set(offset, slot == PortOwnerSlot::default());
+    }
+
+    /// The first unowned port at or after `start_offset` (a pool offset,
+    /// reduced modulo the pool size), wrapping once: exactly the first
+    /// unowned port of a walk of the pool from that offset, found in a
+    /// bounded number of bitmap word reads.
+    pub(crate) fn first_unowned_port_from(&self, start_offset: usize) -> Option<u16> {
+        let offset = self.free.first_free_from(start_offset)?;
+        debug_assert!(self.slots[offset] == PortOwnerSlot::default());
+        u16::try_from(offset)
+            .ok()
+            .and_then(|offset| self.first_port.checked_add(offset))
+    }
+
+    /// Bitmap words read by [`Self::first_unowned_port_from`] since the last
+    /// reset (cost tests).
+    #[cfg(test)]
+    pub(crate) fn take_bitmap_word_reads(&self) -> usize {
+        self.free.word_reads.replace(0)
+    }
+
+    /// Whether the free-port bitmap agrees with every owner slot (O(pool),
+    /// validation only).
+    pub(crate) fn bitmap_matches_slots(&self) -> bool {
+        self.free.matches(self.slots)
     }
 
     pub(crate) const fn slot_count(&self) -> usize {
@@ -1035,7 +1243,8 @@ impl<'a> PortOwnerTable<'a> {
         if owner.state_index() >= self.state_capacity {
             return Err(PortOwnerError::StateIndexOutOfRange);
         }
-        self.slots[offset] = PortOwnerSlot::from_token(owner)?;
+        let slot = PortOwnerSlot::from_token(owner)?;
+        self.write_slot(offset, slot);
         Ok(())
     }
 
@@ -1057,7 +1266,8 @@ impl<'a> PortOwnerTable<'a> {
         if current != expected {
             return Ok(false);
         }
-        self.slots[offset] = PortOwnerSlot::from_token(replacement)?;
+        let slot = PortOwnerSlot::from_token(replacement)?;
+        self.write_slot(offset, slot);
         Ok(true)
     }
 
@@ -1094,7 +1304,7 @@ impl<'a> PortOwnerTable<'a> {
     #[allow(dead_code)] // Retained for single-port integrations and fault tests.
     pub(crate) fn apply_prepared_claim(&mut self, prepared: PreparedPortOwnerClaim) {
         debug_assert!(self.prepared_claim_matches(prepared));
-        self.slots[prepared.offset] = prepared.replacement;
+        self.write_slot(prepared.offset, prepared.replacement);
     }
 
     pub(crate) fn prepare_move(
@@ -1158,9 +1368,9 @@ impl<'a> PortOwnerTable<'a> {
     pub(crate) fn apply_prepared_move(&mut self, prepared: PreparedPortOwnerMove) {
         debug_assert!(self.prepared_move_matches(prepared));
         if let Some(offset) = prepared.old_offset {
-            self.slots[offset] = PortOwnerSlot::default();
+            self.write_slot(offset, PortOwnerSlot::default());
         }
-        self.slots[prepared.new_offset] = prepared.replacement;
+        self.write_slot(prepared.new_offset, prepared.replacement);
     }
 
     pub(crate) fn apply_prepared_move_topology(
@@ -1170,10 +1380,12 @@ impl<'a> PortOwnerTable<'a> {
     ) {
         debug_assert!((prepared.new_offset as usize) < self.slots.len());
         if prepared.old_offset != NONE {
-            self.slots[prepared.old_offset as usize] = PortOwnerSlot::default();
+            self.write_slot(prepared.old_offset as usize, PortOwnerSlot::default());
         }
-        self.slots[prepared.new_offset as usize] =
-            PortOwnerSlot::from_token(replacement).expect("prepared owner token fits storage");
+        self.write_slot(
+            prepared.new_offset as usize,
+            PortOwnerSlot::from_token(replacement).expect("prepared owner token fits storage"),
+        );
     }
 
     #[allow(dead_code)] // Compatibility primitive; N3 commits through prepared moves.
@@ -1193,17 +1405,21 @@ impl<'a> PortOwnerTable<'a> {
         if current != Some(expected) {
             return Ok(false);
         }
-        self.slots[offset] = PortOwnerSlot::default();
+        self.write_slot(offset, PortOwnerSlot::default());
         Ok(true)
     }
 
-    /// Verifies that every live state owns exactly its declared port and that
+    /// Verifies that every live state owns exactly its declared port, that
     /// every assigned port points to a live state with the exact lifecycle
-    /// token. The callback must be pure because it can be called twice.
+    /// token, and that the free-port bitmap marks exactly the unowned ports.
+    /// The callback must be pure because it can be called twice.
     pub(crate) fn validate_semantics(
         &self,
         mut expected_owner: impl FnMut(usize) -> Option<PortOwnerExpectation>,
     ) -> Result<PortOwnerConservation, PortOwnerSemanticError> {
+        if !self.bitmap_matches_slots() {
+            return Err(PortOwnerSemanticError::FreeBitmapMismatch);
+        }
         let mut report = PortOwnerConservation::default();
         for (offset, slot) in self.slots.iter().copied().enumerate() {
             let Some(owner) = slot.token().map_err(PortOwnerSemanticError::Structural)? else {
@@ -1867,7 +2083,8 @@ mod tests {
     #[test]
     fn port_owner_range_assignment_conditional_clear_and_validation_are_exact() {
         let mut slots = [PortOwnerSlot::default(); 3];
-        let mut owners = PortOwnerTable::new(&mut slots, 40_000, 40_002, 2).unwrap();
+        let mut words = [0_u64; 2];
+        let mut owners = PortOwnerTable::new(&mut slots, &mut words, 40_000, 40_002, 2).unwrap();
         let owner0 = PortOwnerToken::new(0, 7, 11).unwrap();
         let owner1 = PortOwnerToken::new(1, 8, 11).unwrap();
         assert_eq!(owners.owner(40_000), Ok(None));
@@ -1891,7 +2108,8 @@ mod tests {
     #[test]
     fn stale_port_owner_tokens_cannot_clear_or_claim_reused_state_index() {
         let mut slots = [PortOwnerSlot::default(); 1];
-        let mut owners = PortOwnerTable::new(&mut slots, 40_000, 40_000, 1).unwrap();
+        let mut words = [0_u64; 2];
+        let mut owners = PortOwnerTable::new(&mut slots, &mut words, 40_000, 40_000, 1).unwrap();
         let generation_a = PortOwnerToken::new(0, 1, 100).unwrap();
         let generation_b = PortOwnerToken::new(0, 2, 100).unwrap();
         let epoch_b = PortOwnerToken::new(0, 2, 101).unwrap();
@@ -1912,7 +2130,8 @@ mod tests {
     #[test]
     fn prepared_port_claim_and_move_are_exact_and_nofail_after_recheck() {
         let mut slots = [PortOwnerSlot::default(); 2];
-        let mut owners = PortOwnerTable::new(&mut slots, 40_000, 40_001, 2).unwrap();
+        let mut words = [0_u64; 2];
+        let mut owners = PortOwnerTable::new(&mut slots, &mut words, 40_000, 40_001, 2).unwrap();
         let first = PortOwnerToken::new(0, 1, 10).unwrap();
         let second = PortOwnerToken::new(1, 1, 10).unwrap();
         let replacement = PortOwnerToken::new(0, 2, 10).unwrap();
@@ -1941,7 +2160,8 @@ mod tests {
     #[test]
     fn port_owner_semantics_cover_live_dead_missing_and_mismatched_owners() {
         let mut slots = [PortOwnerSlot::default(); 2];
-        let mut owners = PortOwnerTable::new(&mut slots, 40_000, 40_001, 2).unwrap();
+        let mut words = [0_u64; 2];
+        let mut owners = PortOwnerTable::new(&mut slots, &mut words, 40_000, 40_001, 2).unwrap();
         let owner = PortOwnerToken::new(0, 7, 31).unwrap();
         let expected = PortOwnerExpectation {
             port: 40_000,
@@ -1998,21 +2218,21 @@ mod tests {
         };
         let mut zero = [occupied; 1];
         assert!(matches!(
-            PortOwnerTable::new(&mut zero, 0, 0, 1),
+            PortOwnerTable::new(&mut zero, &mut [0_u64; 2], 0, 0, 1),
             Err(PortOwnerConfigError::ZeroPort)
         ));
         assert_eq!(zero, [occupied; 1]);
 
         let mut reversed = [occupied; 1];
         assert!(matches!(
-            PortOwnerTable::new(&mut reversed, 40_001, 40_000, 1),
+            PortOwnerTable::new(&mut reversed, &mut [0_u64; 2], 40_001, 40_000, 1),
             Err(PortOwnerConfigError::InvalidRange)
         ));
         assert_eq!(reversed, [occupied; 1]);
 
         let mut wrong_len = [occupied; 1];
         assert!(matches!(
-            PortOwnerTable::new(&mut wrong_len, 40_000, 40_001, 1),
+            PortOwnerTable::new(&mut wrong_len, &mut [0_u64; 2], 40_000, 40_001, 1),
             Err(PortOwnerConfigError::SlotCountMismatch)
         ));
         assert_eq!(wrong_len, [occupied; 1]);
@@ -2021,10 +2241,142 @@ mod tests {
     #[test]
     fn corrupt_port_owner_is_reported_without_mutation() {
         let mut slots = [PortOwnerSlot::default(); 1];
-        let owners = PortOwnerTable::new(&mut slots, 40_000, 40_000, 1).unwrap();
+        let mut words = [0_u64; 2];
+        let owners = PortOwnerTable::new(&mut slots, &mut words, 40_000, 40_000, 1).unwrap();
         owners.slots[0].state_index_plus_one = 2;
         let before = owners.slots[0];
         assert_eq!(owners.owner(40_000), Err(PortOwnerError::CorruptOwner));
         assert_eq!(owners.slots[0], before);
+    }
+
+    fn splitmix(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = *state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    /// The first unowned port a walk of the pool from `start` reaches: the
+    /// pre-PERF-001 port search, as the reference.
+    fn walk_first_unowned(owners: &PortOwnerTable<'_>, start: usize) -> Option<u16> {
+        let count = owners.slot_count();
+        (0..count)
+            .map(|step| (start + step) % count)
+            .find(|offset| owners.slots[*offset] == PortOwnerSlot::default())
+            .map(|offset| owners.first_port + offset as u16)
+    }
+
+    #[test]
+    fn bitmap_words_cover_every_pool_size_exactly() {
+        assert_eq!(port_free_bitmap_words(0), 0);
+        assert_eq!(port_free_bitmap_words(1), 2);
+        assert_eq!(port_free_bitmap_words(64), 2);
+        assert_eq!(port_free_bitmap_words(65), 3);
+        assert_eq!(port_free_bitmap_words(4096), 65);
+        assert_eq!(port_free_bitmap_words(4097), 67);
+        // The widest pool (1..=65535): 1024 leaf and 16 summary words.
+        assert_eq!(port_free_bitmap_words(65_535), 1040);
+        let mut slots = [PortOwnerSlot::default(); 2];
+        let mut words = [0_u64; 3];
+        assert!(matches!(
+            PortOwnerTable::new(&mut slots, &mut words, 40_000, 40_001, 2),
+            Err(PortOwnerConfigError::BitmapSizeMismatch)
+        ));
+        assert_eq!(words, [0; 3]);
+    }
+
+    /// Bitmap search returns exactly the port a linear walk would, for
+    /// every start, under random ownership and every mutation primitive,
+    /// with a bounded number of word reads; exhaustion is `None`.
+    #[test]
+    fn bitmap_search_matches_a_pool_walk_with_bounded_reads() {
+        let mut rng = 0x5eed_u64;
+        for (first, last) in [
+            (40_000, 40_000),
+            (40_000, 40_062),
+            (40_000, 40_063),
+            (40_000, 40_064),
+            (1_000, 5_096),
+            (1, 65_535),
+        ] {
+            let count = usize::from(last - first) + 1;
+            let mut slots = vec![PortOwnerSlot::default(); count];
+            let mut words = vec![0_u64; port_free_bitmap_words(count)];
+            let mut owners =
+                PortOwnerTable::new(&mut slots, &mut words, first, last, count).unwrap();
+            let summary_words = port_free_bitmap_words(count) - count.div_ceil(64);
+            let read_bound = 2 + 2 * summary_words;
+            for round in 0..64 {
+                // Own or free a random batch of ports through the public
+                // mutators (assign, conditional clear, and moves).
+                for _ in 0..(1 + count / 8).min(512) {
+                    let offset = (splitmix(&mut rng) as usize) % count;
+                    let port = first + offset as u16;
+                    let token = PortOwnerToken::new(offset, round + 1, 7).unwrap();
+                    match splitmix(&mut rng) % 3 {
+                        0 => owners.assign(port, token).unwrap(),
+                        1 => {
+                            if let Some(owner) = owners.owner(port).unwrap() {
+                                assert!(owners.clear_if(port, owner).unwrap());
+                            }
+                        }
+                        _ => {
+                            let target = first + ((splitmix(&mut rng) as usize) % count) as u16;
+                            let old = owners.owner(port).unwrap().map(|owner| (port, owner));
+                            let expected = owners.owner(target).unwrap();
+                            let replacement = PortOwnerToken::new(offset, round + 2, 7).unwrap();
+                            let movement = owners
+                                .prepare_move(old, target, expected, replacement)
+                                .unwrap();
+                            owners.apply_prepared_move_topology(movement.topology(), replacement);
+                        }
+                    }
+                }
+                if round == 40 {
+                    // Fill the pool: exhaustion is found without a walk.
+                    for offset in 0..count {
+                        let token = PortOwnerToken::new(offset, 99, 7).unwrap();
+                        owners.assign(first + offset as u16, token).unwrap();
+                    }
+                }
+                assert!(owners.bitmap_matches_slots());
+                for _ in 0..32 {
+                    let start = splitmix(&mut rng) as usize;
+                    owners.take_bitmap_word_reads();
+                    assert_eq!(
+                        owners.first_unowned_port_from(start),
+                        walk_first_unowned(&owners, start % count)
+                    );
+                    assert!(owners.take_bitmap_word_reads() <= read_bound);
+                }
+            }
+            owners.clear();
+            assert!(owners.bitmap_matches_slots());
+            assert_eq!(owners.first_unowned_port_from(count - 1), Some(last));
+            assert_eq!(owners.first_unowned_port_from(count), Some(first));
+        }
+    }
+
+    #[test]
+    fn bitmap_mismatch_is_reported_by_semantic_validation() {
+        let mut slots = [PortOwnerSlot::default(); 2];
+        let mut words = [0_u64; 2];
+        let owners = PortOwnerTable::new(&mut slots, &mut words, 40_000, 40_001, 2).unwrap();
+        assert_eq!(
+            owners.validate_semantics(|_| None),
+            Ok(PortOwnerConservation::default())
+        );
+        owners.free.words[0] = 0b01;
+        assert_eq!(
+            owners.validate_semantics(|_| None),
+            Err(PortOwnerSemanticError::FreeBitmapMismatch)
+        );
+        owners.free.words[0] = 0b11;
+        owners.free.words[1] = 0;
+        assert_eq!(
+            owners.validate_semantics(|_| None),
+            Err(PortOwnerSemanticError::FreeBitmapMismatch)
+        );
     }
 }

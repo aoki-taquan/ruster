@@ -433,12 +433,14 @@ fn runtimes_reject_every_cross_candidate_authority_binding() {
     let mut udp_peer_buckets = [DirectoryBucket::default(); 1];
     let mut udp_peer_nodes = [DirectoryNode::default(); 1];
     let mut udp_port_owners = [PortOwnerSlot::default(); 1];
+    let mut udp_port_free_bits = [0_u64; 2];
     let udp_indexes = Nat44UdpIndexStorage::new(
         &mut udp_mapping_buckets,
         &mut udp_mapping_nodes,
         &mut udp_peer_buckets,
         &mut udp_peer_nodes,
         &mut udp_port_owners,
+        &mut udp_port_free_bits,
     );
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
@@ -449,6 +451,7 @@ fn runtimes_reject_every_cross_candidate_authority_binding() {
     let mut tcp_session_address_buckets = [DirectoryBucket::default(); 1];
     let mut tcp_session_address_nodes = [DirectoryNode::default(); 1];
     let mut tcp_port_owners = [PortOwnerSlot::default(); 1];
+    let mut tcp_port_free_bits = [0_u64; 2];
     let tcp_indexes = Nat44TcpIndexStorage::new(
         &mut tcp_mapping_buckets,
         &mut tcp_mapping_nodes,
@@ -457,6 +460,7 @@ fn runtimes_reject_every_cross_candidate_authority_binding() {
         &mut tcp_session_address_buckets,
         &mut tcp_session_address_nodes,
         &mut tcp_port_owners,
+        &mut tcp_port_free_bits,
     );
     let mut firewall_states = [FirewallStateSlot::default(); 1];
     let (udp, tcp, firewall) = {

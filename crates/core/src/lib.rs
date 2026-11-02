@@ -13,6 +13,7 @@ mod observability;
 mod packet;
 mod resolution;
 mod route;
+mod slot_list;
 
 pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
 #[cfg(feature = "validation-test-hooks")]
@@ -32,7 +33,7 @@ pub use firewall::{
     FIREWALL_TCP_OPENING_MIN_IDLE_TTL_MS, FIREWALL_UDP_DEFAULT_IDLE_TTL_MS,
     FIREWALL_UDP_MIN_IDLE_TTL_MS,
 };
-pub use fixed_directory::{DirectoryBucket, DirectoryNode, PortOwnerSlot};
+pub use fixed_directory::{port_free_bitmap_words, DirectoryBucket, DirectoryNode, PortOwnerSlot};
 #[cfg(feature = "validation-test-hooks")]
 #[doc(hidden)]
 pub use forwarding::take_full_forwarding_validation_count;

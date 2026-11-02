@@ -55,7 +55,7 @@ All commands assume a dedicated router host or network namespace. Replace
   limit-bytes=L required-bytes=R`). Root has `CAP_IPC_LOCK`. The estimate is
   a lower bound (section 12).
 - **Memory (RAM)**: the runtime tables are ordinary heap, not memlocked;
-  33.44 MiB for the largest config `ruster run` accepts (64 MiB bound),
+  36.45 MiB for the largest config `ruster run` accepts (64 MiB bound),
   plus the UMEM (see "Validation limits and memory" below).
 - **Dedicated network namespace (recommended)**: run the router in its own
   namespace (`ip netns exec <ns> ruster run ...`) that holds only the port
@@ -194,9 +194,9 @@ whole-document storage, which has no path.
 
 | Limit | `run-sim` (and `validate` of `sim`) | `ruster run` (and `validate` of `af-xdp`) | Why |
 |---|---|---|---|
-| scanned tables (`max_scanned_slots_per_table`): `resolution.capacity.{states,actions,dynamic-neighbors,failure-holds}`, `icmpv4-errors.capacity.{states,actions}` | 65536 | 4096 | a miss scans the whole table on the packet path (table below); interim until indexed (H4, PERF-001) |
+| scanned tables (`max_scanned_slots_per_table`): `resolution.capacity.{states,actions,dynamic-neighbors,failure-holds}`, `icmpv4-errors.capacity.{states,actions}` | 65536 | 4096 | a miss scans the whole table on the packet path (table below); interim until indexed (H4b, PERF-001) |
 | other tables (`max_slots_per_table`): `nat44.{udp,tcp}.capacity.*`, `firewall.capacity.states`, each NAT44 directory (next power of two), the NAT44 port owner table (pool size) | 65536 | 65536 | home NAT needs many sessions; also the largest port pool (1-65535) |
-| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 33.44 MiB, so the per-table limits bind; the byte limit fails closed only if a slot type grows |
+| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 36.45 MiB, so the per-table limits bind; the byte limit fails closed only if a slot type grows |
 | config file | 1 MiB | 1 MiB | parse stage, every backend (CONFIG-001) |
 | `[[interfaces]]` / `[[backend.ports]]` | 256 / 256 | 256 / 256 | parse stage |
 | `[[addresses]]` | 1024 | 1024 | parse stage |
@@ -205,10 +205,11 @@ whole-document storage, which has no path.
 
 All production values are coordinator defaults, not owner decisions.
 
-**Per-packet cost.** Several tables are searched linearly on the packet
-path (PERF-001; the fix is slice H4). The figures below come from the #308
-review. A full scan costs roughly 100 to 500 µs per packet at 65536 slots,
-so a few thousand packets per second can saturate one queue.
+**Per-packet cost.** The resolution and ICMPv4 error tables are still
+searched linearly on the packet path (PERF-001; the fix is slice H4b). The
+figures below come from the #308 review. A full scan costs roughly 100 to
+500 µs per packet at 65536 slots, so a few thousand packets per second can
+saturate one queue. NAT44 is bounded since H4a.
 
 | Table | Linear path, and what triggers it | Read per trigger at 65536 | At the production limit | Recommended size |
 |---|---|---|---|---|
@@ -218,11 +219,12 @@ so a few thousand packets per second can saturate one queue.
 | resolution `actions` (32 B) | O(1) ring per packet; scanned only by the reload preflight | — | — | like `states` |
 | ICMPv4 error `states` (24 B) | scanned on every generated error (TTL expiry, unreachable) | about 1.5 MiB | 96 KiB | at most one per egress interface is ever used (≤ 256); a few |
 | ICMPv4 error `actions` (584 B) | O(1) ring; one per state | — | — | like `states` |
-| NAT44 `mappings`/`peers`/`sessions` (48 B + directories) | lookups are keyed (O(1)); **finding a free slot scans from slot 0 on every new mapping, peer or session, O(live entries)**, and a new mapping walks the port pool for a free port | about 6 MB per TCP SYN with 60k sessions and 60k mappings | same (65536) | the expected concurrent flows; leave headroom |
+| NAT44 `mappings`/`peers`/`sessions` (64/48/64 B + directories) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (the least recently refreshed, so the first to expire) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
 | `firewall.capacity.states` (56 B) | keyed SipHash probe with occupancy capped near 75% (`usable_state_capacity`), so a full table cannot occur; only the amortized expiry sweep (`reclaim_one_expired`) is linear | — (amortized) | — | the expected concurrent flows |
 
-Within the limits, size each table for the expected traffic rather than at
-the maximum: a scan reads the whole table, however few slots are in use.
+Within the limits, size each scanned table for the expected traffic rather
+than at the maximum: a scan reads the whole table, however few slots are in
+use.
 
 **Memory per slot.** These are the x86_64 slot types that
 `FullServiceStorage` allocates; the total is pinned by
@@ -236,21 +238,24 @@ the maximum: a scan reads the whole table, however few slots are in use.
 | `resolution.capacity.failure-holds` (holds a quoted datagram) | 608 | 2.375 MiB (4096) |
 | `icmpv4-errors.capacity.states` | 24 | 96 KiB (4096) |
 | `icmpv4-errors.capacity.actions` (holds a quoted datagram) | 584 | 2.28 MiB (4096) |
-| `nat44.udp.capacity.mappings` / `peers` | 48 + 28 directory each | 4.75 MiB each (65536) |
-| `nat44.tcp.capacity.mappings` | 48 + 28 directory | 4.75 MiB (65536) |
-| `nat44.tcp.capacity.sessions` | 48 + 2 x 28 directories | 6.5 MiB (65536) |
-| NAT44 port owners (`nat44.realm.ports`, per pool port, UDP and TCP each) | 32 | 2 MiB per protocol |
+| `nat44.udp.capacity.mappings` | 64 + 28 directory | 5.75 MiB (65536) |
+| `nat44.udp.capacity.peers` | 48 + 28 directory | 4.75 MiB (65536) |
+| `nat44.tcp.capacity.mappings` | 64 + 28 directory | 5.75 MiB (65536) |
+| `nat44.tcp.capacity.sessions` | 64 + 2 x 28 directories | 7.5 MiB (65536) |
+| NAT44 port owners (`nat44.realm.ports`, per pool port, UDP and TCP each) | 32, plus a free-port bitmap of 8 bytes per 64 ports and per 4096 ports | 2 MiB + 8320 bytes per protocol |
 | `firewall.capacity.states` | 56 | 3.5 MiB (65536) |
 
 A directory has one 4-byte bucket per slot, rounded up to a power of two,
 and one 24-byte node per slot (exact for the powers of two above). `ruster
 validate` prints the total as `storage-bytes=`. The largest config that
 `run` accepts (`fixtures/limits/router-production-max.toml`) needs
-35061696 bytes (33.44 MiB).
+38224064 bytes (36.45 MiB). H4a added 16 bytes per NAT44 mapping and
+session slot (reuse-list links, 48 to 64 bytes with the 16-byte alignment)
+and the free-port bitmaps: 3 MiB more at the limits.
 
 Worst-case resident memory of `ruster run`:
 
-- Runtime storage: at most 64 MiB (33.44 MiB with today's slot sizes).
+- Runtime storage: at most 64 MiB (36.45 MiB with today's slot sizes).
   It is allocated once at startup, before the privilege preflight, and
   filled, so it is resident from the start. If the allocation fails,
   startup reports `stage=storage code=ALLOCATION.<service>` and exits 1.
@@ -768,17 +773,24 @@ CLI-034).
 - The config is validated with the production limits (section 1,
   "Validation limits and memory").
 - Per-packet linear scans (PERF-001, High for availability, pre-existing;
-  fix planned as hardening slice H4): a dynamic-neighbor miss
+  fix planned as hardening slice H4b): a dynamic-neighbor miss
   (`lookup_dynamic`, `merge_dynamic`), resolution scheduling (`schedule`,
-  failure holds), and ICMPv4 error states scan their whole table; NAT44
-  free-slot reuse (`find_reusable_*`) scans from slot 0 on every new
-  mapping, peer or session (O(live entries)) and a new mapping walks the
-  port pool. A LAN host churning outbound flows or flooding ARP, or WAN
-  packets to unused LAN/WAN subnet addresses where routed inbound traffic
-  is allowed, can drive these paths; at 65536 slots one packet can cost
-  100-500 µs. Until H4, production caps the scanned resolution and ICMPv4
-  tables at 4096 slots; NAT44 stays at 65536, so size NAT44 tables for the
-  expected flows (section 1).
+  failure holds), and ICMPv4 error states scan their whole table. A LAN
+  host flooding ARP, or WAN packets to unused LAN/WAN subnet addresses
+  where routed inbound traffic is allowed, can drive these paths; at 65536
+  slots one packet can cost 100-500 µs. Until H4b, production caps these
+  tables at 4096 slots (section 1). NAT44 slot reuse and port selection
+  are O(1) per new flow since H4a (NAT44-035). What NAT44 still does in
+  more than constant time: a keyed directory lookup walks its hash chain
+  (secret per-publication SipHash key and at most one slot per bucket on
+  average, so chains stay short and cannot be aimed at; it is exact, since
+  a bounded lookup that missed an existing key would break
+  endpoint-independent mapping), and a reconcile flush clears the tables
+  (control path). An external inbound SYN still probes 16 keyed slots and
+  can report the session table full while a reusable slot exists elsewhere
+  (NAT44-037). With every pool port owned, a new mapping takes the port of
+  the longest-idle expired mapping rather than the first expired owner
+  after the seeded start.
 - Capability diagnostics read `CapEff` in the caller's user namespace; in a
   non-initial user namespace the bits can look sufficient while BPF still
   needs init-namespace capabilities, so the failure appears later as
@@ -871,7 +883,7 @@ What it proves, on the runner's kernel only:
   frames delivered and the counters adding up; `observer.state` and
   `watch.state` in the stats blocks.
   Added by H3 (marker `priv_run_limits`): a config with every runtime
-  table at its production limit (33.44 MiB of storage) accepted by
+  table at its production limit (36.45 MiB of storage) accepted by
   `validate`; `ruster run` starts it, forwards and translates, and exits 0
   on SIGTERM; one more dynamic neighbor (4097) refused by `validate` and
   `run` (exit 2) although accepted as a sim document.
