@@ -16,6 +16,8 @@ struct StopAfterTicks {
     state: Rc<State>,
     ticks: u32,
     reloads: RefCell<VecDeque<u32>>,
+    /// SIGUSR1 stats requests, by the same rule as `reloads` (H10).
+    stats: RefCell<VecDeque<u32>>,
 }
 
 impl StopAfterTicks {
@@ -24,7 +26,25 @@ impl StopAfterTicks {
             state: Rc::clone(&host.state),
             ticks,
             reloads: RefCell::new(reloads.iter().copied().collect()),
+            stats: RefCell::default(),
         }
+    }
+
+    fn with_stats(self, at: &[u32]) -> Self {
+        self.stats.borrow_mut().extend(at);
+        self
+    }
+
+    fn take_at(&self, queue: &RefCell<VecDeque<u32>>) -> bool {
+        let mut queue = queue.borrow_mut();
+        if queue
+            .front()
+            .is_some_and(|at| self.state.io_calls.get() >= *at)
+        {
+            queue.pop_front();
+            return true;
+        }
+        false
     }
 }
 
@@ -39,15 +59,12 @@ impl StopSignal for StopAfterTicks {
 
     /// A reload request once the datapath served that many ticks.
     fn take_reload(&self) -> bool {
-        let mut reloads = self.reloads.borrow_mut();
-        if reloads
-            .front()
-            .is_some_and(|at| self.state.io_calls.get() >= *at)
-        {
-            reloads.pop_front();
-            return true;
-        }
-        false
+        self.take_at(&self.reloads)
+    }
+
+    /// A stats request once the datapath served that many ticks.
+    fn take_stats(&self) -> bool {
+        self.take_at(&self.stats)
     }
 }
 
@@ -628,14 +645,20 @@ fn assert_fatal(outcome: &Outcome, host: &FakeHost, code: &str) {
 fn device_removal_and_mtu_violations_fail_closed_with_exit_1() {
     let facts = |mtu| {
         Ok(LinkFacts {
+            name: device_name(WAN),
             mtu,
             rx_queues: Some(1),
             admin_up: true,
             lower_up: true,
         })
     };
+    let renamed = Ok(LinkFacts {
+        name: crate::run::netlink::IfName::literal(b"renamed0"),
+        ..facts(1_500).expect("facts")
+    });
     for (result, code) in [
         (Err(NetlinkError::Kernel(-19)), "DEVICE_REMOVED"),
+        (renamed, "DEVICE_RENAMED"),
         (facts(9_000), "MTU_ABOVE_FRAME"),
         (facts(1_400), "MTU_DECREASED"),
     ] {
@@ -651,6 +674,7 @@ fn device_removal_and_mtu_violations_fail_closed_with_exit_1() {
 fn a_link_down_and_up_keeps_running_and_is_counted() {
     let host = FakeHost::default();
     let down = Ok(LinkFacts {
+        name: device_name(LAN),
         mtu: 1500,
         rx_queues: Some(1),
         admin_up: false,
@@ -663,6 +687,7 @@ fn a_link_down_and_up_keeps_running_and_is_counted() {
     }
     // A raised MTU within the frame bound only warns.
     let raised = Ok(LinkFacts {
+        name: device_name(WAN),
         mtu: 1600,
         rx_queues: Some(1),
         admin_up: true,
@@ -1293,4 +1318,111 @@ fn the_preparer_plans_against_the_applied_document() {
     assert!(matches!(preparer.prepare(), Prepared::Failed(_)));
     preparer.applied();
     assert!(!base(&preparer));
+}
+
+/// H10: with `NOTIFY_SOCKET`, readiness, each reload (applied or refused),
+/// the watchdog, and the stop are notified in order; SIGUSR1 prints one
+/// `kind=on-demand` block per request without moving the periodic ones.
+#[test]
+fn systemd_is_notified_of_readiness_reloads_watchdog_and_stop() {
+    let listener = crate::run::notify::tests::Listener::bind();
+    set_notifier(listener.notifier(Some(5)));
+    let host = FakeHost::default();
+    let frames = edited(|text| text.replacen("frame-count = 256", "frame-count = 512", 1));
+    let source = FakeSource::with([Ok(echo_off()), Ok(frames)]);
+    let stop = StopAfterTicks::new(&host, 60, &[10, 30]).with_stats(&[20, 40]);
+    let outcome = ops(&host, source, &stop);
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    let messages = listener.messages();
+    let ping = "WATCHDOG=1\n";
+    let lifecycle: Vec<&String> = messages
+        .iter()
+        .filter(|message| message.as_str() != ping)
+        .collect();
+    let firsts: Vec<&str> = lifecycle
+        .iter()
+        .map(|message| message.lines().next().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        firsts,
+        [
+            "READY=1",
+            "RELOADING=1",
+            "READY=1",
+            "RELOADING=1",
+            "READY=1",
+            "STOPPING=1"
+        ],
+        "{messages:?}"
+    );
+    assert_eq!(lifecycle[0], "READY=1\nSTATUS=running generation 1\n");
+    assert!(
+        lifecycle[1].contains("\nMONOTONIC_USEC="),
+        "{}",
+        lifecycle[1]
+    );
+    assert!(lifecycle[1].ends_with("\nSTATUS=reloading (generation 1)\n"));
+    assert_eq!(lifecycle[2], "READY=1\nSTATUS=running generation 2\n");
+    assert!(lifecycle[3].ends_with("\nSTATUS=reloading (generation 2)\n"));
+    assert_eq!(
+        lifecycle[4], "READY=1\nSTATUS=running generation 2\n",
+        "refused"
+    );
+    assert_eq!(
+        lifecycle[5],
+        "STOPPING=1\nSTATUS=stopping: stop requested\n"
+    );
+    // The first ping comes with the first loop iteration, right after
+    // READY=1; none after STOPPING=1.
+    let pings = messages.iter().filter(|message| *message == ping).count();
+    assert!(pings >= 5, "{messages:?}");
+    assert_eq!(messages[1], ping, "{messages:?}");
+    assert_eq!(messages.last(), Some(lifecycle[5]));
+    let out = &outcome.out;
+    assert_eq!(
+        out.matches("ruster-run-stats kind=on-demand").count(),
+        2,
+        "{out}"
+    );
+    assert_eq!(
+        out.matches("ruster-run-stats kind=periodic").count(),
+        0,
+        "{out}"
+    );
+    assert!(out.contains("notify.enabled=true\n"), "{out}");
+    assert_eq!(line_value(out, "notify.failed"), Some("0"), "{out}");
+    assert_eq!(
+        line_value(out, "notify.watchdog_pings"),
+        Some(pings.to_string().as_str()),
+        "the final block counts every ping"
+    );
+    assert_eq!(line_value(out, "notify.watchdog_interval_ms"), Some("5"));
+}
+
+/// H10: a fatal event is notified as the stop's reason.
+#[test]
+fn a_fatal_event_is_notified_as_stopping() {
+    let listener = crate::run::notify::tests::Listener::bind();
+    set_notifier(listener.notifier(None));
+    let host = FakeHost::default();
+    let renamed = Ok(LinkFacts {
+        name: crate::run::netlink::IfName::literal(b"renamed0"),
+        mtu: 1_500,
+        rx_queues: Some(1),
+        admin_up: true,
+        lower_up: true,
+    });
+    host.state
+        .links
+        .borrow_mut()
+        .push_back((IfId(WAN), renamed));
+    let outcome = fatal_run(&host, 1_000);
+    assert_fatal(&outcome, &host, "DEVICE_RENAMED");
+    assert_eq!(
+        listener.messages(),
+        [
+            "READY=1\nSTATUS=running generation 1\n",
+            "STOPPING=1\nSTATUS=stopping: fatal health event port=if2 code=DEVICE_RENAMED\n",
+        ]
+    );
 }

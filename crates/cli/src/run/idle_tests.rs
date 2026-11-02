@@ -131,6 +131,7 @@ fn the_watch_deadline_is_the_earlier_due_round() {
     let targets = [LAN, WAN].map(|id| LinkTarget {
         interface: IfId(id),
         ifindex: u32::from(id) + 10,
+        name: crate::run::netlink::IfName::literal(b"sim0"),
         mtu: 1500,
         frame_capacity: 1792,
     });

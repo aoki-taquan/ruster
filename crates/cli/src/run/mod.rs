@@ -36,6 +36,11 @@
 //!    `log`; `off` skips it), also with `--keep-privileges`. A failed
 //!    install rolls back the same way (`stage=seccomp`, exit 1).
 //!
+//! 8. Report readiness: the stderr line, and with `NOTIFY_SOCKET` (systemd
+//!    `Type=notify`/`notify-reload`) `READY=1` ([`notify`], H10; the
+//!    notification socket was opened first thing, before any thread, so
+//!    the run only `sendto`s on it).
+//!
 //! A failure at any stage closes every session opened so far, last first
 //! (closing detaches XDP before releasing the socket, UMEM, and rings),
 //! prints a value-free `stage=<stage> [port=if<id>] code=...` line, and
@@ -63,7 +68,8 @@
 //! prepared on the reload worker thread), and the health and link watch
 //! ([`watch`], the link round on the link watcher thread), whose fatal
 //! events end the run like a stop request, with drain and close, but with
-//! exit status 1. The workers are stopped with the loop and waited for at
+//! exit status 1; the systemd watchdog ping when due, and a stats block
+//! (`kind=on-demand`) after a SIGUSR1 (H10). The workers are stopped with the loop and waited for at
 //! most 500 ms ([`workers::WORKER_STOP_MS`]), then abandoned.
 //!
 //! # Shutdown
@@ -116,6 +122,7 @@ mod linux;
     allow(dead_code)
 )]
 mod netlink;
+mod notify;
 mod output;
 mod privileges;
 mod reload;
@@ -147,6 +154,7 @@ use engine::{
     port_label, run_loop, shutdown_drain, Clock, Control, Datapath, LoopEnd, LoopSettings,
     RunStatus, ShutdownReport, StopSignal, DRAIN_DEADLINE_MS,
 };
+use notify::Notifier;
 use privileges::{Identity, PrivilegePolicy, PrivilegeState};
 use reload::{ConfigSource, Preparer, ReloadWorker, Reloader};
 use seccomp::{SeccompMode, SeccompState};
@@ -287,7 +295,24 @@ fn live(_: &RunArgs, _: ValidatedConfigV1, err: &mut impl Write) -> u8 {
 fn live(args: &RunArgs, config: ValidatedConfigV1, err: &mut impl Write) -> u8 {
     use ruster_control::OsRandomKeySource;
 
-    if let Err(name) = crate::signal::install().and_then(|()| crate::signal::install_reload()) {
+    // First, while this is the only thread: the systemd notification
+    // variables are read and removed from the environment, and the socket
+    // is opened before the privilege drop and the syscall filter.
+    let notify = match Notifier::from_process_env() {
+        Ok(notify) => notify,
+        Err(error) => {
+            let _ = writeln!(
+                err,
+                "ruster run: startup failed: stage=notify code={}",
+                error.code()
+            );
+            return EXIT_RUNTIME;
+        }
+    };
+    if let Err(name) = crate::signal::install()
+        .and_then(|()| crate::signal::install_reload())
+        .and_then(|()| crate::signal::install_stats())
+    {
         let _ = writeln!(err, "ruster run: cannot install {name} handler");
         return EXIT_RUNTIME;
     }
@@ -341,6 +366,7 @@ fn live(args: &RunArgs, config: ValidatedConfigV1, err: &mut impl Write) -> u8 {
             strict: args.strict_config_perms,
         },
         settings,
+        notify,
         &mut engine::SystemClock::new(),
         &engine::ProcessSignals,
         &mut out,
@@ -400,6 +426,7 @@ pub fn execute<H, K, R, C, S, O, E>(
     mut sequencer: ProductionSequencer<K>,
     source: R,
     settings: Settings,
+    notify: Notifier,
     clock: &mut C,
     stop: &S,
     out: &mut O,
@@ -500,6 +527,7 @@ where
             &mut storage,
             Preparer::new(sequencer, config, source),
             settings,
+            notify,
             clock,
             stop,
             out,
@@ -561,6 +589,7 @@ fn run_ports<'h, H, K, R, C, S, O, E>(
     storage: &mut FullServiceStorage,
     preparer: Preparer<K, R>,
     settings: Settings,
+    mut notify: Notifier,
     clock: &mut C,
     stop: &S,
     out: &mut O,
@@ -668,6 +697,7 @@ where
         datapath.port_count()
     );
     let _ = err.flush();
+    notify.ready(active.generation().get());
     let loop_settings = LoopSettings {
         stats_interval_ms: settings.stats_interval_ms,
         health_interval_ms: settings.health_interval_ms,
@@ -687,6 +717,7 @@ where
             max_wait_ms: settings.idle_wait_ms,
             ..engine::IdleCounters::default()
         },
+        notify,
     };
     let end = run_loop(
         &mut active,
@@ -697,16 +728,8 @@ where
         loop_settings,
         &mut control,
         err,
-        |active, datapath, observer, status, now| {
-            let text = render(
-                BlockKind::Periodic,
-                now,
-                active,
-                datapath,
-                observer,
-                status,
-                hardening,
-            );
+        |kind, active, datapath, observer, status, now| {
+            let text = render(kind, now, active, datapath, observer, status, hardening);
             let _ = out.write_all(text.as_bytes());
             let _ = out.flush();
         },
@@ -717,6 +740,17 @@ where
     }
     // The workers end once their current request returns; that is waited
     // for after the drain, bounded (see [`workers`]).
+    control.notify.stopping(|text| match end {
+        LoopEnd::Signal => text.write_all(b"stop requested"),
+        LoopEnd::BackendStopped => text.write_all(b"backend stopped after a fault"),
+        LoopEnd::Invariant => text.write_all(b"invariant violation code=APPLY_REPORT_MISSING"),
+        LoopEnd::Fatal { port, cause } => write!(
+            text,
+            "fatal health event port=if{} code={}",
+            port.0,
+            cause.code()
+        ),
+    });
     let workers_deadline = std::time::Instant::now() + Duration::from_millis(WORKER_STOP_MS);
     let workers = [
         ("link watcher", control.links.stop()),
@@ -780,6 +814,7 @@ where
         reload: control.reloader.counters(),
         watch: &control.watch,
         idle: control.idle,
+        notify: control.notify.counters(),
     };
     let final_block = render(
         BlockKind::Final,
@@ -874,6 +909,7 @@ fn render<D: Datapath>(
         datapath.write_stats(out);
         stats::write_fields(out, None, &status.reload);
         stats::write_fields(out, None, &status.idle);
+        stats::write_fields(out, None, &status.notify);
         stats::write_fields(out, None, status.watch);
         for (interface, health) in status.watch.health() {
             stats::write_fields(out, Some(interface), &health);

@@ -1334,3 +1334,88 @@ fn validate_and_run_apply_the_production_limits_to_af_xdp() {
         "{stderr}"
     );
 }
+
+/// H10: a `NOTIFY_SOCKET`/`WATCHDOG_*` environment that `sd_notify` would
+/// not accept is refused first (exit 1 `stage=notify`, before signals,
+/// capabilities, or ports); a valid one gets nothing before readiness, so
+/// a refused startup (here: no capability) sends no `READY=1`.
+#[test]
+fn run_validates_the_systemd_notification_environment() {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+    if holds_net_admin() {
+        eprintln!("skipped: CAP_NET_ADMIN held; refusing a live startup in this namespace");
+        return;
+    }
+    let dir = scratch();
+    let v1 = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let config = dir.join("router-af-xdp.toml");
+    let text_config = format!("{v1}{AF_XDP_BACKEND}")
+        .replace("device = \"sim0\"", "device = \"rusternodev0\"")
+        .replace("device = \"sim1\"", "device = \"rusternodev1\"");
+    fs::write(&config, text_config).unwrap();
+    let start = |env: &[(&str, &str)]| {
+        let mut command = Command::new(BIN);
+        command
+            .args(["run".as_ref(), "--config".as_ref(), config.as_os_str()])
+            .env_remove("NOTIFY_SOCKET")
+            .env_remove("WATCHDOG_USEC")
+            .env_remove("WATCHDOG_PID");
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        command.output().expect("spawn ruster")
+    };
+    for (env, code) in [
+        (
+            &[("NOTIFY_SOCKET", "relative/notify")][..],
+            "NOTIFY_SOCKET_INVALID",
+        ),
+        (&[("NOTIFY_SOCKET", "")][..], "NOTIFY_SOCKET_INVALID"),
+        (
+            &[("NOTIFY_SOCKET", "vsock:2:9")][..],
+            "NOTIFY_SOCKET_INVALID",
+        ),
+        (
+            &[("NOTIFY_SOCKET", "/run/n"), ("WATCHDOG_USEC", "0")][..],
+            "WATCHDOG_USEC_INVALID",
+        ),
+        (
+            &[
+                ("NOTIFY_SOCKET", "/run/n"),
+                ("WATCHDOG_USEC", "5"),
+                ("WATCHDOG_PID", "x"),
+            ][..],
+            "WATCHDOG_PID_INVALID",
+        ),
+    ] {
+        let output = start(env);
+        let stderr = text(&output.stderr);
+        assert_eq!(status(&output), 1, "{env:?}: {stderr}");
+        assert_eq!(
+            stderr,
+            format!("ruster run: startup failed: stage=notify code={code}\n"),
+            "{env:?}"
+        );
+        assert!(output.stdout.is_empty());
+    }
+    // A valid abstract socket: the privilege refusal (exit 4) comes as
+    // before and nothing is notified.
+    let name = format!("ruster-cli-notify-{}", std::process::id());
+    let address = SocketAddr::from_abstract_name(name.as_bytes()).unwrap();
+    let listener = UnixDatagram::bind_addr(&address).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let output = start(&[
+        ("NOTIFY_SOCKET", &format!("@{name}")),
+        ("WATCHDOG_USEC", "1000000"),
+    ]);
+    let stderr = text(&output.stderr);
+    assert_eq!(status(&output), 4, "{stderr}");
+    assert!(stderr.contains("stage=privileges code=MISSING_CAPABILITIES"));
+    let mut buffer = [0_u8; 256];
+    assert!(
+        listener.recv(&mut buffer).is_err(),
+        "notified before readiness"
+    );
+}

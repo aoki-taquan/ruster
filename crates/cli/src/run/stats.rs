@@ -30,6 +30,8 @@ use ruster_runtime::{ObservabilitySnapshot, ServiceCounters};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockKind {
     Periodic,
+    /// Asked for with SIGUSR1 (H10).
+    OnDemand,
     Final,
 }
 
@@ -37,6 +39,7 @@ impl BlockKind {
     const fn label(self) -> &'static str {
         match self {
             Self::Periodic => "periodic",
+            Self::OnDemand => "on-demand",
             Self::Final => "final",
         }
     }

@@ -15,6 +15,7 @@ use std::fmt;
 
 use ruster_config::{AfXdpModeV1, ValidatedAfXdpV1};
 
+use super::netlink::IfName;
 use super::privileges::PrivilegePolicy;
 
 /// Linux capability bits (`include/uapi/linux/capability.h`).
@@ -247,6 +248,9 @@ pub fn parse_memlock(limits: &str) -> Option<MemlockLimit> {
 pub struct DeviceFacts {
     /// The session's interface index (the link watch queries it later).
     pub ifindex: u32,
+    /// `IFLA_IFNAME` of that index (rtnetlink): startup requires the
+    /// configured device name (H10, `probe=name` otherwise).
+    pub link_name: IfName,
     /// `IFLA_NUM_RX_QUEUES` of the session's interface index (rtnetlink
     /// `RTM_GETLINK`, so in the caller's network namespace): the
     /// allocated RX queue count, which is never below the active one; 0
@@ -462,6 +466,10 @@ pub enum Probe {
     /// `conf/all/rp_filter` or `conf/<dev>/rp_filter` could not be read
     /// (refused without `--allow-ipv4-weak-host`).
     RpFilter,
+    /// The session's interface index does not carry the configured
+    /// device name (`IFLA_IFNAME`): renamed after the session resolved
+    /// it, so the device's sysctl paths would name another device (H10).
+    Name,
 }
 
 impl Probe {
@@ -469,6 +477,7 @@ impl Probe {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Link => "link",
+            Self::Name => "name",
             Self::RxQueues => "rx-queues",
             Self::Mtu => "mtu",
             Self::Ipv4Addresses => "ipv4-addresses",
@@ -1186,6 +1195,7 @@ pub mod linux {
         let ipv4 = sysctls.ipv4();
         Ok(DeviceFacts {
             ifindex,
+            link_name: link.name,
             rx_queues,
             link_mtu: link.mtu,
             session_mtu: session.mtu,
@@ -1401,6 +1411,7 @@ mod tests {
     fn device_checks_refuse_or_warn_as_documented() {
         let clean = DeviceFacts {
             ifindex: 7,
+            link_name: IfName::literal(b"ra"),
             rx_queues: 1,
             link_mtu: 1500,
             session_mtu: 1500,
@@ -1510,6 +1521,7 @@ mod tests {
     fn kernel_forwarding_is_refused_unless_allowed() {
         let clean = DeviceFacts {
             ifindex: 7,
+            link_name: IfName::literal(b"ra"),
             rx_queues: 1,
             link_mtu: 1500,
             session_mtu: 1500,
@@ -1583,6 +1595,7 @@ mod tests {
     fn ipv4_weak_host_is_refused_unless_allowed() {
         let clean = DeviceFacts {
             ifindex: 7,
+            link_name: IfName::literal(b"ra"),
             rx_queues: 1,
             link_mtu: 1500,
             session_mtu: 1500,
@@ -2006,6 +2019,7 @@ mod tests {
     fn mtu_must_match_the_session_and_fit_a_frame() {
         let clean = DeviceFacts {
             ifindex: 7,
+            link_name: IfName::literal(b"ra"),
             rx_queues: 1,
             link_mtu: 1778,
             session_mtu: 1778,

@@ -377,13 +377,17 @@ sudo ip netns exec router ruster run --config /etc/ruster/router.toml
 ```
 
 systemd example (the unit must run inside the router's namespace, for
-example with `NetworkNamespacePath=/run/netns/router`):
+example with `NetworkNamespacePath=/run/netns/router`). `ruster run`
+speaks the `sd_notify` protocol (H10, section 5 "Service notification"):
+with `Type=notify-reload` (systemd 253 or newer) systemd itself sends
+SIGHUP for `systemctl reload` and waits for the reload to end:
 
 ```ini
 [Service]
+Type=notify-reload
 NetworkNamespacePath=/run/netns/router
 ExecStart=/usr/local/bin/ruster run --user 990 --group 990 --config /etc/ruster/router.toml
-ExecReload=/bin/kill -HUP $MAINPID
+WatchdogSec=20
 Restart=on-failure
 RestartSec=1
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_PERFMON CAP_SETUID CAP_SETGID CAP_SETPCAP
@@ -392,6 +396,20 @@ LimitMEMLOCK=infinity
 KillSignal=SIGTERM
 TimeoutStopSec=10
 ```
+
+On systemd older than 253 use `Type=notify` and add
+`ExecReload=/bin/kill -HUP $MAINPID` (systemd then reports the reload done
+when the signal is sent, not when it is applied; the outcome is still in
+the log). Without notification support at all, `Type=simple` with that
+`ExecReload=` works as before (and no `WatchdogSec=`). `WatchdogSec=` is
+optional: the router thread pings every half of it between ticks, so a
+router that stops ticking is killed (`WatchdogSignal=`, SIGABRT by default:
+the process dies, the links detach as after SIGKILL) and restarted by
+`Restart=on-failure`. Keep it well above a second (20 s here): it bounds
+how long a wedged router keeps the ports attached, and too small a value
+restarts a router that is only briefly descheduled. The notification
+socket (`/run/systemd/notify`, mode 0777) must be writable by the
+`--user` the router switches to, which systemd's default is.
 
 `990` stands for a dedicated system account with no login and no other
 use (`useradd --system --no-create-home --shell /usr/sbin/nologin ruster`,
@@ -472,7 +490,9 @@ are set at start and are not reloadable. The config file is always opened
 `NOT_A_FILE`).
 
 Signals: SIGINT/SIGTERM stop (a second one forces the drain to end),
-SIGHUP reloads the config. SIGHUP never ends `ruster run`, also not when
+SIGHUP reloads the config, SIGUSR1 prints one stats block at once
+(`kind=on-demand`, section 11; several before it is printed make one
+block, and the periodic blocks keep their schedule). SIGHUP never ends `ruster run`, also not when
 its terminal hangs up or under `nohup`.
 
 ## 4. Exit status
@@ -480,7 +500,7 @@ its terminal hangs up or under `nohup`.
 | status | meaning |
 |---|---|
 | 0 | ordered shutdown after SIGINT/SIGTERM with no TX frame left in the kernel; also a signal during startup or during a retry pause, after a clean rollback |
-| 1 | runtime failure: unreadable or refused config file; a startup failure at any stage after the config (open, checks, attach, watch, datapath, engine, adapter, activate, privilege-drop, seccomp, storage, key source; a transient open failure after the last attempt); a backend fault, a fatal health or device event, or an invariant violation during the run; a drain failure; a stranded TX handoff; a close error; signal handler or output thread setup failure; unsupported platform |
+| 1 | runtime failure: unreadable or refused config file; a startup failure at any stage after the config (notify, open, checks, attach, watch, datapath, engine, adapter, activate, privilege-drop, seccomp, storage, key source; a transient open failure after the last attempt); a backend fault, a fatal health or device event, or an invariant violation during the run; a drain failure; a stranded TX handoff; a close error; signal handler or output thread setup failure; unsupported platform |
 | 2 | usage error, or invalid config (`parse`, `version`, `validate`, the `sim` backend, or `candidate code=MISSING_SERVICE_*`) |
 | 3 | the shutdown drain deadline (or a second signal) left TX frames with the kernel; everything was still detached and closed |
 | 4 | missing capability (also `CAP_SETUID`/`CAP_SETGID` for `--user`/`--group`), too small `RLIMIT_MEMLOCK`, a kernel whose teardown would need `CAP_BPF` after the drop (`TEARDOWN_NEEDS_CAPABILITIES`), or unreadable `/proc/self/status`/`/proc/self/limits`/`/proc/sys/kernel/osrelease`/`/proc/sys/kernel/unprivileged_bpf_disabled`; nothing was acquired |
@@ -493,6 +513,7 @@ A refused or failed reload never ends the run.
 
 1. `ruster validate router.toml`, then `ruster run --config router.toml`.
 2. Startup order: read and validate the config (no service bridge yet),
+   the service notification environment and socket (H10, below),
    signal handlers, `/dev/urandom` key source, output threads,
    generation-1 candidate, runtime storage, privilege and memlock
    preflight, then per port in interface-id order: open the session (TX
@@ -514,6 +535,35 @@ A refused or failed reload never ends the run.
    `IPV6_ROUTES_ALLOWED count=N`, and `IPV6_FORWARDING_ENABLED
    scope=global|device|force|multicast`, and with `--allow-ipv4-weak-host`
    `IPV4_WEAK_HOST_EXPOSURE`.
+
+### Service notification (systemd, H10)
+
+Only when the service manager sets `NOTIFY_SOCKET`. First thing after the
+config is read, while the process has one thread, `ruster run` reads
+`NOTIFY_SOCKET`, `WATCHDOG_USEC` and `WATCHDOG_PID`, removes them from its
+environment, and opens one non-blocking `AF_UNIX` datagram socket; every
+notification afterwards is one `sendto` on it (already on the syscall
+allowlist below: no new socket is created after startup, and the
+allowlist is unchanged). A notification never blocks the router: when the
+manager's queue is full or nobody listens it is dropped and counted
+(`notify.failed`).
+
+| when | message |
+|---|---|
+| ready (the stderr line `running generation 1 on N port(s)`, after the privilege drop and the syscall filter) | `READY=1`, `STATUS=running generation 1` |
+| SIGHUP reload starts | `RELOADING=1`, `MONOTONIC_USEC=<CLOCK_MONOTONIC in µs>`, `STATUS=reloading (generation N)` |
+| the reload ended (applied, refused, failed, or abandoned) | `READY=1`, `STATUS=running generation N` (the new one if applied) |
+| the run loop ends (signal, fatal event, backend fault), before the drain | `STOPPING=1`, `STATUS=stopping: stop requested` or `stopping: fatal health event port=if<id> code=<CODE>` |
+| `WATCHDOG_USEC` set, and `WATCHDOG_PID` unset or this process | `WATCHDOG=1` every half of `WATCHDOG_USEC` (at least 1 ms), from the router thread between ticks |
+
+A startup failure sends nothing (systemd sees the exit). Accepted values:
+`NOTIFY_SOCKET` an absolute path or `@name` (abstract) of at most 107
+bytes, `WATCHDOG_USEC`/`WATCHDOG_PID` positive decimals. Anything else
+(empty, relative, `vsock:`, a malformed number) is refused before anything
+else: `startup failed: stage=notify code=NOTIFY_SOCKET_INVALID`,
+`WATCHDOG_USEC_INVALID` or `WATCHDOG_PID_INVALID` (exit 1), rather than
+silently not notifying. `NOTIFY_SOCKET_OPEN` means the socket could not be
+created.
 
 ### Startup refusals
 
@@ -685,7 +735,7 @@ attached to the running router; the Rust test
 
 | syscall | condition | who needs it after startup |
 |---|---|---|
-| `sendto` (44) | — | router: AF_XDP TX kick; link watcher: netlink requests (`send`) |
+| `sendto` (44) | — | router: AF_XDP TX kick and the systemd notifications (H10, on the socket opened before the filter); link watcher: netlink requests (`send`) |
 | `poll` (7) | — | router: the idle wait on every port socket (section 7, H9) and the Fill-ring wakeup of the need-wakeup profile; glibc's `poll()` is this syscall on x86_64, never `ppoll` |
 | `getsockopt` (55) | — | router: `XDP_STATISTICS` per stats sample |
 | `clock_nanosleep` (230), `nanosleep` (35), `restart_syscall` (219) | — | the 1 ms fallback sleep of the idle wait, the reload quiescence pause, the drain, and every `thread::sleep` (`nanosleep` where the C library's sleep uses it: older glibc, musl); resuming one a signal interrupted |
@@ -976,6 +1026,7 @@ outstanding:
 |---|---|
 | link down (`ip link set lan0 down`, cable out: `IFF_UP` or `IFF_LOWER_UP` clear) | warning `LINK_DOWN`, `if<id>.watch.link_down_events` +1; keeps running; owed TX is kicked again when the link returns (recovered `LINK_DOWN`, `link_up_events` +1) |
 | device removed (`ip link del`, driver unbind, moved to another namespace) | fatal `DEVICE_REMOVED` |
+| device renamed (`ip link set lan0 name x`, which the kernel allows only while it is down; H10) | fatal `DEVICE_RENAMED`: the per-port sysctls are read by name, so they would describe whatever device takes the old name. The rest of that port's round is ignored (also for `DEVICE_REMOVED`). Rename it back (or fix the config) and restart. Startup refuses a port whose interface index does not carry the configured name (`checks code=UNVERIFIABLE probe=name`) |
 | MTU below the startup MTU | fatal `MTU_DECREASED` (TX is bounded by the startup MTU; longer frames could be stranded in the kernel) |
 | MTU above what a frame holds (`frame-size - 256 - headroom - 14`) | fatal `MTU_ABOVE_FRAME` |
 | MTU raised within that bound | warning `MTU_RAISED`, recovered when it returns; TX stays bounded by the startup MTU until a restart |
@@ -1112,13 +1163,15 @@ after SIGKILL.
 
 ## 11. Stats
 
-Every `--stats-interval` seconds stdout carries one block, and the final
+Every `--stats-interval` seconds stdout carries one block, SIGUSR1 adds one
+(`kind=on-demand`, at the next point between ticks: at once if the signal
+reaches the router thread, else within `--idle-wait-ms`), and the final
 block is printed at shutdown. Only counters, gauges, flags, fixed labels,
 generations and interface ids appear: no key, address, MAC, device name,
 packet byte, fd or pointer.
 
 ```text
-ruster-run-stats kind=periodic|final uptime-ms=<ms>
+ruster-run-stats kind=periodic|on-demand|final uptime-ms=<ms>
 <section>.<key>=<value>
 ...
 output.dropped=<n>
@@ -1135,6 +1188,7 @@ Sections, in this order:
 | `if<id>.af_xdp_port.*` | per port: `interface`, `queue`, `mode`, `mtu`, `max_frame`, need-wakeup now, `draining`, `link_down`, `kick_owed`, `copy_reserve`, ring gauges (`fill_ring_occupancy`, `rx_ring_occupancy`, `tx_ring_unconsumed`), `fill_starved`, invalid RX descriptors and quarantines, TX (`tx_completed`, `tx_inflight`, `tx_inflight_highwater`, `tx_blocked`, `tx_over_mtu`, `tx_invalid_completions`), kicks (`tx_kicks`, `fill_kicks`, `kicks_deferred`, `kick_errors`, `kicks_link_down`, `kick_retries_suppressed`; `kick_errors` counts every failed kick and so includes `kicks_link_down`, while the `KICK_ERRORS` health code times `kick_errors - kicks_link_down` only; `kick_retries_suppressed` counts settles on a down port that skipped a retry not yet due, which made no syscall), generated frames, `cross_port_copies`, and the kernel `XDP_STATISTICS` (`kernel_rx_dropped`, `kernel_rx_invalid_descs`, `kernel_tx_invalid_descs`, `kernel_rx_ring_full`, `kernel_rx_fill_ring_empty_descs`, `kernel_tx_ring_empty_descs`) |
 | `reload.*` | `requested`, `applied`, `refused`, `failed`, `preparing_ms` (how long the reload being prepared on the worker has run; 0 when none) |
 | `idle.*` | the idle wait (section 7): `max_wait_ms` (`--idle-wait-ms`), `waits` (blocking `poll`s), `woken` (ended by a frame on a port), `timed_out`, `interrupted` (a signal handler ran), `short` (waits the 1 ms pending cap made shorter than `--idle-wait-ms` and the next deadline would have; it grows about 1000 per second for as long as TX is held on a down link, resolution states are `Failed`, or unsolicited-SYN holds exist, as before H9), `sleeps` (plain sleeps of at most 1 ms after a ready socket that no tick used, or because `poll` failed), `errors` (failed `poll`s; warned once) |
+| `notify.*` | systemd notification (section 5, H10): `enabled` (`NOTIFY_SOCKET` was set), `watchdog_interval_ms` (half of `WATCHDOG_USEC`; 0 without a watchdog), `sent`, `watchdog_pings` (of them), `failed` (not delivered: nobody listening, or the manager's queue full) |
 | `watch.*` | `state` (`ok`/`warning`), `warnings` (all ports), `link_rounds` (link rounds that came back from the watcher), `link_rounds_late` (due rounds skipped because one still ran), `link_rounds_stale` (late rounds past `--link-stale-secs`, each a failed link query) |
 | `if<id>.watch.*` | `tx_stall`, `tx_stall_ms`, `fill_starved`, `kick_errors_persistent`, `link_up`, `link_down_events`, `link_up_events`, `mtu`, `link_probe_errors`, `kernel_ipv4_addresses`, `kernel_forwarding`, `kernel_ipv4_routes`, `kernel_ipv6_addresses`, `kernel_ipv6_routes`, `kernel_ipv6_forwarding`, `kernel_ipv6_enabled`, `ipv4_weak_host`, `warnings` |
 | `privileges.*` | `state` (`dropped`, or `kept` under `--keep-privileges`), `bounding_set` (`cleared`/`kept`), `identity` (`switched`/`unchanged`), `threads` (threads verified by the drop; 0 when kept) |
@@ -1326,14 +1380,19 @@ SYNs nobody completes, such as a scan or a spoofed SYN flood.
   kernel's filter returns it (so a nexthop object used by another
   interface does not affect the router, and one used by a port refuses
   startup or warns at run time). Resolving the ids through
-  `RTM_GETNEXTHOP` to confirm the device in userspace is a follow-up.
+  `RTM_GETNEXTHOP` to confirm the device in userspace is a follow-up
+  (left out by H10: the kernel's filter, confirmed by
+  `NLM_F_DUMP_FILTERED`, already matches nexthop objects against the
+  device, so a counted route really uses the port and nothing is refused
+  wrongly; resolving would add a second request per id after the dump and
+  validation of nexthop groups for defense in depth only).
   `ip rule` policy itself is not inspected: a route out of a port counts
   in whatever table it is, used by a rule or not.
-- The sysctl paths name the port device. If a port is renamed while the
-  router runs, its sysctls become unreadable (a failed query,
-  `LINK_UNVERIFIABLE` after three rounds); if another device then takes
-  the old name, that device's sysctls are read until the next restart. Do
-  not rename ports while the router runs.
+- The sysctl paths name the port device. A port renamed while the router
+  runs ends the run within one link round (`DEVICE_RENAMED`, section 8,
+  H10); a rename that lands between a round's link query and its sysctl
+  reads is caught one round (1 s) later, and the reads in between can only
+  warn or recover. Do not rename ports while the router runs.
 - IPv4 weak host: refused at startup (`KERNEL_IPV4_WEAK_HOST`) unless
   `--allow-ipv4-weak-host`, but only warned while running
   (`IPV4_WEAK_HOST_EXPOSURE`, section 1); like the other kernel exposures
@@ -1456,9 +1515,15 @@ SYNs nobody completes, such as a scan or a spoofed SYN flood.
   other than the router, a link round, and anything not on the "pending"
   list of section 7 are seen up to `--idle-wait-ms` (10 ms) later while
   idle. The wait is level-triggered on RX only.
-- Not implemented (CLI-034):
-  SIGUSR1 stats, structured logs, systemd notify, opt-in
+- Not implemented (CLI-034): structured logs, opt-in
   "link down / forwarding 0 at exit", state carried across a reload.
+  (SIGUSR1 stats and systemd notification are H10.)
+- systemd notification (H10): the watchdog is pinged by the router
+  thread only, so a stuck worker thread does not stop it (the link
+  watcher's own stale rule ends the run then, section 8); the pings pause
+  for up to 200 ms while a reload waits for quiescence. `MONOTONIC_USEC`
+  comes from `CLOCK_MONOTONIC` as systemd expects; `vsock:` notification
+  addresses (systemd in a VM) are refused, not supported.
 - Privilege drop limits (CLI-089 to CLI-095): no chroot or mount
   namespace (the seccomp filter of section 5 still lets a compromised
   process open and read every file its user may read, open rtnetlink
@@ -1620,6 +1685,15 @@ What it proves, on the runner's kernel only:
   `priv-xdp-smoke.sh` the line `priv_xdp_idle_wait` (on two live veth
   ports a 30 ms `poll` times out after at least 30 ms, and a frame sent
   0.3 s into a 10 s `poll` ends it).
+  Added by H10: markers `priv_run_systemd` (a python datagram receiver in
+  the work directory stands in for systemd: with `NOTIFY_SOCKET` and
+  `WATCHDOG_USEC=400000`, as the invoking user under `--seccomp kill`,
+  `READY=1` comes first and after readiness, 6 to 14 `WATCHDOG=1` in 2 s,
+  a reload sends `RELOADING=1` with `MONOTONIC_USEC` and then `READY=1`
+  with generation 2, SIGUSR1 prints a `kind=on-demand` block, `STOPPING=1`
+  is last, and `notify.sent` equals the datagrams received) and
+  `priv_run_rename` (`ip link set ra down` and `name rx` while running:
+  exit 1 `DEVICE_RENAMED`, nothing attached).
 - Nothing is left behind: a final step fails if any `ruster-*` namespace
   survives. Smoke logs are uploaded as an artifact when the job fails.
 
@@ -1700,9 +1774,11 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `health=KICK_ERRORS` | 1 if fatal | kicks keep failing (not `ENETDOWN`) | check the device; `last-kick-error=` in the summary names the errno token |
 | `health=LINK_DOWN` | — | carrier or admin down | fix the link; forwarding resumes by itself |
 | `health=DEVICE_REMOVED` | 1 | the port device is gone | restore the device, then restart |
+| `health=DEVICE_RENAMED`, `checks code=UNVERIFIABLE probe=name` | 1 | the port's interface index carries another name than the config's `device` | rename it back or fix the config, then restart |
+| `stage=notify code=NOTIFY_SOCKET_INVALID\|WATCHDOG_USEC_INVALID\|WATCHDOG_PID_INVALID\|NOTIFY_SOCKET_OPEN` | 1 | the service manager's notification environment is not usable (section 5, "Service notification") | fix the unit's environment (`NOTIFY_SOCKET` must be an absolute path or `@name`) |
 | `health=MTU_DECREASED` / `MTU_ABOVE_FRAME` | 1 | MTU changed below the startup MTU / above the frame bound | restore the MTU, then restart |
 | `health=MTU_RAISED` | — | MTU raised within the frame bound; TX still bounded by the old MTU | restart to use the new MTU |
-| `health=LINK_PROBE` / `LINK_UNVERIFIABLE` | 1 if `LINK_UNVERIFIABLE` | rtnetlink/procfs queries failing (3 in a row is fatal) | check the namespace; a renamed device makes its forwarding sysctl unreadable |
+| `health=LINK_PROBE` / `LINK_UNVERIFIABLE` | 1 if `LINK_UNVERIFIABLE` | rtnetlink/procfs queries failing (3 in a row is fatal) | check the namespace |
 | `health=KERNEL_IPV4_ADDRESSES` / `KERNEL_IPV4_ROUTES` / `KERNEL_FORWARDING_ENABLED` / `FORWARDING_UNVERIFIABLE` | — | kernel L3 or forwarding appeared while attached | remove it while the router runs (section 8) |
 | `IPV4_WEAK_HOST_EXPOSURE` (startup under `--allow-ipv4-weak-host`, or `health=`) | — | effective `rp_filter` 0 (`arp_ignore` does not matter) | `sysctl -w net.ipv4.conf.all.rp_filter=1` (or 2); `arp_ignore=1` as well; without the flag the next start is refused |
 | `health=KERNEL_IPV6_ENABLED` / `KERNEL_IPV6_ADDRESSES` / `KERNEL_IPV6_ROUTES` / `KERNEL_IPV6_FORWARDING_ENABLED` / `IPV6_UNVERIFIABLE` | — | kernel IPv6 on a port with IPv6 on, while attached | `sysctl -w net.ipv6.conf.<dev>.disable_ipv6=1` while the router runs (section 8) |
