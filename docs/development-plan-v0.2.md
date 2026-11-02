@@ -452,7 +452,10 @@ M2に関するownerの発言は次だけである（2026-10-31〜11-01、session
 
 - 2e（`XDP veth`をrequired checkにするか）: 「当面は任意のまま」。`XDP veth`は当面required checkに
   しない（decided）。
-- X05 lab（4-queue zero-copy NIC labを用意するか）: 「まだ未定」（open のまま）。
+- X05 lab（4-queue zero-copy NIC labを用意するか）: 「頑張れば用意できるけど しばらくいらない」「しばらく運用するとしてもvethで運用するから許容よろしく」。当面labは用意せず、運用はvethで行う
+  （decided）。実NIC forwarding、実driverでのnative mode、zero-copyは未検証のままで、ownerはその
+  riskを明示的に受け入れた。exit criterion 4（partially met）と8（not met）の判定は変えず、ownerが
+  deferredとして受け入れた。
 - 次の方向: 「運用の残りを固める」（CLI-034の残り項目のhardening。最初はH1: link down中のTX kick
   retryのrate limit）。
 - B3 / NAT44-038: 「A」。unsolicited inbound TCP SYNへのdelayed ICMP Port Unreachable（RFC 5382 REQ-4）を
@@ -463,9 +466,7 @@ M2に関するownerの発言は次だけである（2026-10-31〜11-01、session
   再検討する。coordinatorの将来設計の希望（queueごとのexternal port range + NIC ntuple steering +
   symmetric RSS）は決定ではない。
 
-owner決定待ち（open）:
-
-- X05 lab: 4-queue zero-copy NICのlabを用意するか。上の「まだ未定」。
+owner決定待ち（open）: なし（2a、2e、X05 lab、B3は上の2026-11-02の決定）。
 
 coordinating agentの既定値（owner決定ではない）:
 
