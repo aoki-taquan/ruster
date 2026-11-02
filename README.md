@@ -13,9 +13,13 @@ run-sim JSONL`をend-to-endで実行できます（下の「使い方」）。ba
 AF_PACKET/AF_XDPはproduction backendではなく、実NICでの動作やthroughputは主張しません。
 M1は2026-11-01にcloseしました（9 exit criterionすべてmet。`R16A Bounded`はrequired checkです）。
 exit criterionごとの証跡は
-[`docs/release-evidence/m1.md`](docs/release-evidence/m1.md)にあります。次のmilestoneは
-[development plan](docs/development-plan-v0.2.md#m2-operable-af_xdp-static-router)のM2
-（Operable AF_XDP static router）で、AF_XDP work packet X00〜X05を順に進めます。
+[`docs/release-evidence/m1.md`](docs/release-evidence/m1.md)にあります。M2
+（[Operable AF_XDP static router](docs/development-plan-v0.2.md#m2-operable-af_xdp-static-router)）は
+openです。そのうちM2a（`ruster run`の下で動くcopy-mode、portごとに1 queueのAF_XDP router、veth
+E2EをCIで実行。coordinatorのscoping提案でowner決定ではない）は完了し、exit criterionごとの判定は
+[`docs/release-evidence/m2.md`](docs/release-evidence/m2.md)、運用手順は
+[`docs/runbook-m2.md`](docs/runbook-m2.md)にあります。multi-queue、zero-copy、X05 hardware
+benchmark（M2b）はowner決定を待っています。
 
 workspaceは12 crateです。data-planeとI/Oのlibrary crateは外部依存を持ちません。cold
 control-planeの`ruster-config`とsim専用の`ruster-sim-scenario`だけが、保守されている
@@ -778,7 +782,7 @@ compilerなしで生成）、holder（attachした別processをSIGKILLしlinkが
 
 `.github/workflows/xdp-veth.yml`の`XDP veth` jobは、pull requestとmainへのpushごとに
 `ubuntu-24.04` hosted runner（passwordless sudo）で上の二つのprivileged smokeを実行します
-（30分上限、`permissions: contents: read`、secretなし。required checkにするかはowner決定で未決）。
+（30分上限、`permissions: contents: read`、secretなし。required checkにするかはowner決定2eで未決）。
 
 1. `scripts/priv-xdp-probe.sh`: kernel 5.9以上、sudo下の`CapEff`、libbpf付きiproute2、throwaway
    netns（`ruster-probe-<pid>-<random>`）内でのveth作成とsysctl書き込み、`socket(AF_XDP)`、

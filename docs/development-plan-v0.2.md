@@ -24,10 +24,10 @@
 
 ## 現在地
 
-2026-11-01時点の`main`（codeは`c256e92`、#285まで。docsは`5fc4663`、#286まで）をcodeと
-repository rulesetから確認した状態である。以下で矛盾する
-場合はcode、[`requirements-v0.2.md`](requirements-v0.2.md)のledger、
-[`release-evidence/m1.md`](release-evidence/m1.md)を正とする。
+2026-11-02時点の`main`（codeは`a51d7de`、#303まで）をcodeとrepository rulesetから確認した
+状態である。以下で矛盾する場合はcode、[`requirements-v0.2.md`](requirements-v0.2.md)のledger、
+[`release-evidence/m1.md`](release-evidence/m1.md)、
+[`release-evidence/m2.md`](release-evidence/m2.md)を正とする。
 
 ### 実装済み
 
@@ -77,12 +77,17 @@ workspaceは12 crateからなる。data-planeとI/Oのlibrary crate（`ruster-co
   - `ruster-io-xdp`/`ruster-io-xdp-native`: AF_XDP ownership model、safe native profile
     （`ruster-io-xdp::native_profile`、configと共有）、native ABI/ring scaffold、private syscall
     RAII seam（XDP rows）、一socketのnative session（X00C）、XDP program/`bpf_link`
-    attach（X00D）。datapath engineと`PacketIo`接続は無い
+    attach（X00D）、RX/Fill・TX/Completion・generated engine（X01〜X03）、複数portのcore
+    `PacketIo` adapter（X04a）、`ruster run`（X04b）。copy-mode、portごとに1 queueのM2a routerとして
+    veth上で動く（[`release-evidence/m2.md`](release-evidence/m2.md)）。zero-copy NIC、multi-queue、
+    hardware測定は無い（M2b）
 - CI: `CI` workflow（Check、Musl、Test、Clippy、Format、Doc。Testはdoctestとrequirements
   gateを含む）、`Security Smoke` workflow（`R16A Bounded`、8 target×4 fixed seed）、
   `Benchmark Smoke` workflow（spec digest、plan v1照合、sim smoke）。
+  `XDP veth` workflow（M2 S11、hosted runnerのnetns/vethでprobeとprivileged smoke）。
   repository rulesetのrequired checkは`Check`、`Test`、`Clippy`、`Format`、`Doc`、
-  `R16A Bounded`で（2026-11-01追加）、`Musl`と`Benchmark Smoke`はrequiredではない
+  `R16A Bounded`で（2026-11-01追加）、`Musl`、`Benchmark Smoke`、`XDP veth`はrequiredではない
+  （`XDP veth`のrequired化はowner決定2e、open）
 
 milestone状態: M0のP0 rowはすべてledger上implementedだが、M0の独立release evidence fileは
 作っていない。M1は2026-11-01にcloseした。[`release-evidence/m1.md`](release-evidence/m1.md)の
@@ -90,18 +95,21 @@ milestone状態: M0のP0 rowはすべてledger上implementedだが、M0の独立
 commitである。route撤去後の既存flowがsilentな点はtracked deviation（FW-025）として残り、
 NAT port pool size明確化とOBS-017/018延期のowner確認は任意でM1 closeを妨げない。
 
-次のmilestoneはM2（Operable AF_XDP static router）である。経路はdependency graphの
-X00 → X01/X02/X03 → X04 attach/config/ops integration → X05 hardware benchmarkで、X04は
-R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまたは欠落」のうち（M2）と
-記したproduction backend、`ruster run`、production key sourceがM2の対象である。
+M2（Operable AF_XDP static router）は**open**である。coordinatorのscoping提案（owner決定では
+ない）でM2をM2aとM2bに分け、M2a（`ruster run`の下のcopy-mode AF_XDP router、veth E2EをCIで実行。
+multi-queue、zero-copy、X05を含まない）はM2 S1〜S11（#292〜#303）とS13で完了した。exit criterion
+ごとの判定は[`release-evidence/m2.md`](release-evidence/m2.md)にあり、9 criterionのうちmet 5、
+partially met 3、not met 1（X05）である。M2b（multi-queue S12、zero-copy、X05 lab evidence）は
+owner決定2aとX05 labの決定を待って次に進める（下の「M2の判断の記録」）。
 
 ### Partialまたは欠落
 
-- production backendが無い。AF_PACKETはscripted syscall上のcopy backendまで、AF_XDPは
-  一socketのsession、XDP program attach、RX/Fill engine、same-frame TX/Completion、generated frame、
-  複数portのcore `PacketIo` adapter（X04a）、configからのport構築と`ruster run`の起動/停止（X04b前半、
-  M2 S10a）までで、reload、health/stall、retry policy、multi-queue worker ownership、実NIC forwarding
-  E2Eは無い（M2）。netns/veth上の`ruster run` E2Eは`scripts/priv-run-smoke.sh`で、M2 S11から
+- 実NIC（hardware）で検証したproduction backendは無い。AF_PACKETはscripted syscall上のcopy backendまで、AF_XDPは
+  M2aのcopy-mode router（一socketのsession、XDP program attach、RX/Fill engine、same-frame
+  TX/Completion、generated frame、複数portのcore `PacketIo` adapter、configからのport構築と
+  `ruster run`の起動/停止、reload、health/stall、link event、起動retry）までで、multi-queue worker
+  ownership（M2b S12、owner決定2a待ち）、zero-copy NICと実NIC forwarding E2E、hardware benchmark
+  （M2b、X05 lab待ち）は無い。netns/veth上の`ruster run` E2Eは`scripts/priv-run-smoke.sh`で、M2 S11から
   hosted runnerの`XDP veth` CI job（`.github/workflows/xdp-veth.yml`）が毎PRで実行する。
 - `run-sim`はrestart-required applyをrejectとして報告し、同一process内でstorageを
   作り直さない（SIM-016 deferred）。process restartをまたぐgeneration/key履歴は無い。
@@ -118,9 +126,9 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
 - XDP program/`bpf_link` lifecycle（手組みredirect program、`queue + 1` slotのXSKMAP、socket挿入、
   `BPF_LINK_CREATE`、既存programの`ExistingProgram` reject、link closeによるdetach、unpinnedで
   crash時auto-detach、typed errno、exact reverse cleanup）はM2 S2（X00D）で追加した（XDP-047〜061）。
-  owner決定: `bpf_link`だけを使いminimum kernelはLinux 5.9、既存XDP programは置換もdetachも
-  しない、linkはpinしない、licenseは`MIT OR Apache-2.0`（使うhelperはGPL-onlyでない）。5.9〜6.xの
-  実機検証とCI workflowはX04（XDP-062）。review決定: socketの無いqueueは`XDP_DROP`（fail closed。
+  coordinator既定値2c（owner決定ではない）: `bpf_link`だけを使いminimum kernelはLinux 5.9、既存XDP
+  programは置換もdetachもしない、linkはpinしない、licenseは`MIT OR Apache-2.0`（使うhelperは
+  GPL-onlyでない）。CI workflowはM2 S11、5.9〜6.xの実機検証はM2b以降（XDP-062）。review決定: socketの無いqueueは`XDP_DROP`（fail closed。
   firewall/NATの迂回を防ぐ代わりにsingle-queue deviceかbind queueへのsteeringが前提、portにkernel L3
   設定を残さない。startup checkはM2 S10aの`ruster run`で実装、XDP-063）。
 - AF_XDP RX/Fill engine（`RxFillEngine`: sessionごとに一回だけ取る`DatapathRings` bundle
@@ -180,7 +188,10 @@ R08/R09/R10/R15、X05はR17 frozen specに依存する。下の「Partialまた�
   `priv-run-smoke.sh`を`sudo -n`で実行する。この変数の下ではtestのskip経路もfailになる
   （CI-001、CI-002）。#302/#301 reviewのsmoke強化: global `ip_forward=0`で`conf/ra/forwarding=1`は
   起動時`scope=device`で拒否、稼働中はif1だけwarningでrecovered（CI-003）、stuck phaseはFIFOが
-  capacityまで埋まり動かないことを確かめる（CI-004）。required check化はowner決定（未決）。
+  capacityまで埋まり動かないことを確かめる（CI-004）。required check化はowner決定2e（open）。
+  `main` `a51d7de`のrunが成功した（[`release-evidence/m2.md`](release-evidence/m2.md)）。
+- M2 S13: M2aのrelease evidence（[`release-evidence/m2.md`](release-evidence/m2.md)）と
+  operator runbook（[`runbook-m2.md`](runbook-m2.md)）の確定、ledgerのM2a判定。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
   ringのsaturationはM2 S6でAF_XDPの`BackendStats`へ接続した（OBS-018。AF_PACKETはOBS-028、OBS-017はdeferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
@@ -417,6 +428,56 @@ exit criteria:
   forced termination後restartをrunbookどおり実行し、期待したhealth/config generation/
   descriptor回収をassertする。
 
+#### M2の判断の記録（2026-11-02時点）
+
+ownerの発言として記録できるのは次だけである（2026-10-31〜11-01、session内。日付は概略）。
+
+- 「基本的な判断基準としてrfc準拠にしてください」（RFC準拠を基準とする）
+- 「セキュリティ観点でoffするべきと考えるものに関しても設定可能なようにしてください」
+- 「ベンチマークは一旦ok」（R17 spec v0.2の承認）
+- 「それで進めていって」（B1 NAT quota → B2 RFC 5508 ICMP translation → M2の順。B3（delayed ICMP、
+  NAT44-038）はM2後に決める）
+
+owner決定待ち（open。ownerの文言は無い）:
+
+- 2a: multi-queue NAT affinity design。決まるまでmulti-queueは現scopeの外（M2b S12）。
+- 2e: `XDP veth`をrequired checkにするか。
+- X05 lab: 4-queue zero-copy NICのlabを用意するか。
+- B3 / NAT44-038: M2後に決める。
+
+coordinating agentの既定値（owner決定ではない）:
+
+- 2b: UMEMはportごとに一つ、port間はcopy（XDP-134。shared UMEMはXDP-136 deferred）。
+- 2c: `bpf_link`だけ、minimum kernel 5.9、既存programを置換しない（XDP-053/057/061/062）。
+- OBS-018をM2で必須とする。
+- M2a/M2bの分割（下）。
+
+#### M2 sliceと実績
+
+| slice | 内容 | PR | 状態 |
+|---|---|---|---|
+| S1 | X00C native session | #295 | merge済み |
+| S2 | X00D XDP program/`bpf_link` | #296 | merge済み |
+| S3 | X01 RX/Fill engine | #297 | merge済み |
+| S4 | X02 TX/Completion、drain | #298 | merge済み |
+| S5 | X03 generated frame | #299 | merge済み |
+| S6 | X04a core `PacketIo` adapter | #300 | merge済み |
+| S7 | production key source | #292 | merge済み |
+| S8 | NAT/FW/ICMP limiter占有（OBS-015） | #293 | merge済み |
+| S9 | `[backend]` config | #294 | merge済み |
+| S10a | X04b前半 `ruster run` startup/shutdown | #301 | merge済み |
+| S10b | X04b後半 reload、health、link、retry | #302 | merge済み |
+| S11 | `XDP veth` CI | #303 | merge済み |
+| S12 | multi-queue | — | M2b、owner決定2a待ち |
+| S13 | M2a release evidenceとrunbook | このPR | — |
+
+M2a（coordinatorのscoping提案）: `ruster run`の下で動くcopy-mode AF_XDP router、veth E2EをCIで
+実行する。multi-queue、zero-copy、X05を含まない。判定は
+[`release-evidence/m2.md`](release-evidence/m2.md)で、criterion 1、2、3、6、7がmet、4（zero-copy
+hardware）、5（TX ring fullのE2E）、9（TX full、`validate`/`plan`のE2E）がpartially met、8（X05
+artifact）がnot met。M2b（multi-queue S12、zero-copy、X05 lab evidence）はowner決定2aとX05 labの
+決定を待って次に進める。M2全体のcloseはM2bの後である。
+
 ### M3: Household/scaled router
 
 家庭回線で必要な機能、容量、長時間運用を満たす。
@@ -623,7 +684,8 @@ incremental/full checksum一致、generation/clock/capacityを含む。
 XDP attachをvethで検証するjobはX04が別workflow（`xdp-veth.yml`、M2 S11）として所有し、
 AF_PACKETの`netns.yml`を並列編集しない。`XDP veth` jobは最初のprobe（`scripts/priv-xdp-probe.sh`）が
 AF_XDP/veth/netnsの不足をtypedなfailureにし、smokeは`RUSTER_REQUIRE_PRIV=1`でskip経路を持たない。
-hosted runnerのkernel一つだけを検証し（5.9〜6.xの網羅はXDP-062）、required check化はowner決定。
+hosted runnerのkernel一つだけを検証し（5.9〜6.xの網羅はXDP-062）、required check化はowner決定2e
+（open）。
 
 ### Hardware CI (`hardware-bench.yml`, X05)
 
