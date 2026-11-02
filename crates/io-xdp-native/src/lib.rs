@@ -88,7 +88,7 @@ pub use packet_io::{
     generated_reserve, XdpAdapterCounters, XdpBackendStats, XdpCounters, XdpDrainReport,
     XdpGeneratedBatch, XdpGeneratedSlot, XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort,
     XdpPortConfig, XdpPortStats, XdpQuiescenceError, XdpRxBatch, XdpRxSlot, KICK_SLACK,
-    KICK_TX_BATCH,
+    KICK_TX_BATCH, LINK_DOWN_RETRY_MAX_MS, LINK_DOWN_RETRY_MIN_MS,
 };
 pub use platform::{ensure_native_syscall_supported, ensure_supported};
 pub use ring::{

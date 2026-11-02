@@ -808,6 +808,7 @@ forward_once txfull-before
 # fails ENETDOWN and the kernel consumes no TX descriptor. (A peer that
 # is down only drops carrier; the kernel then consumes and drops the
 # frames, so the ring never fills.)
+down_at=$(date +%s%N)
 sudo -n ip -n "$router" link set rb down
 wait_line txfull "warning: port=if2 health=LINK_DOWN"
 in_ns "$host_a" python3 -I -c "$BURST" 203.0.113.1 9001 300 "ruster-txfull-$suffix"
@@ -817,6 +818,7 @@ wait_block txfull if2.af_xdp_port.tx_inflight=128
 sleep 4
 launcher_alive || fail "txfull: exited while the TX ring was full"
 latest_block txfull
+held_ms=$((($(date +%s%N) - down_at) / 1000000))
 cp "$work/txfull.block" "$work/txfull.held"
 block_has "$work/txfull.held" observer.state=healthy watch.state=warning \
     if2.af_xdp_port.link_down=true if2.af_xdp_port.tx_inflight=128 \
@@ -829,10 +831,19 @@ link_down_kicks=$(stat_in "$work/txfull.held" if2.af_xdp_port.kicks_link_down)
 [ "${ring_full:-0}" -ge 1 ] && [ "$ring_full" = "$blocked" ] ||
     fail "txfull: tx_ring_full ${ring_full:-missing}, tx_blocked ${blocked:-missing}"
 [ "${link_down_kicks:-0}" -ge 1 ] || fail "txfull: no ENETDOWN kick while held"
+# The adapter retries a down link's owed kick at most every 1 ms doubling
+# to 64 ms: at most 7 + held_ms / 64 ENETDOWN kicks since rb went down
+# (the block predates held_ms, so this over-counts the time). Allow 4x;
+# a retry at every settle was about 10k per second.
+kick_bound=$((4 * (7 + held_ms / 64)))
+[ "$link_down_kicks" -le "$kick_bound" ] ||
+    fail "txfull: $link_down_kicks ENETDOWN kicks in ${held_ms} ms, above $kick_bound"
+suppressed=$(stat_in "$work/txfull.held" if2.af_xdp_port.kick_retries_suppressed)
+[ "${suppressed:-0}" -ge 1 ] || fail "txfull: no suppressed kick retry while held"
 if grep -Eq "fatal:|health=(TX_STALL|KICK_ERRORS)" "$work/txfull.err"; then
     fail "txfull: a TX_STALL/KICK_ERRORS event or a fatal while the link was down"
 fi
-echo "priv_run_txfull: rb down, TX ring full (tx_inflight=128 of 128, tx_ring_full=tx_blocked=$ring_full, $link_down_kicks ENETDOWN kicks), held 4 s past --tx-stall-fatal-secs 2 and --kick-errors-fatal-secs 2 without a fatal, observer.state=healthy watch.state=warning verified"
+echo "priv_run_txfull: rb down, TX ring full (tx_inflight=128 of 128, tx_ring_full=tx_blocked=$ring_full, $link_down_kicks ENETDOWN kicks in ${held_ms} ms, at most $kick_bound, $suppressed retries suppressed), held 4 s past --tx-stall-fatal-secs 2 and --kick-errors-fatal-secs 2 without a fatal, observer.state=healthy watch.state=warning verified"
 rm -f "$work/recv-txfull-backlog.out"
 in_ns "$host_b" python3 -I -c "$COUNT" 9001 "ruster-txfull-$suffix" 3 \
     >"$work/recv-txfull-backlog.out" 2>&1 &

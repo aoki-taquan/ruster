@@ -87,7 +87,7 @@ workspaceは12 crateからなる。data-planeとI/Oのlibrary crate（`ruster-co
   `XDP veth` workflow（M2 S11、hosted runnerのnetns/vethでprobeとprivileged smoke）。
   repository rulesetのrequired checkは`Check`、`Test`、`Clippy`、`Format`、`Doc`、
   `R16A Bounded`で（2026-11-01追加）、`Musl`、`Benchmark Smoke`、`XDP veth`はrequiredではない
-  （`XDP veth`のrequired化はowner決定2e、open）
+  （`XDP veth`はowner決定2e「当面は任意のまま」でrequiredにしない）
 
 milestone状態: M0のP0 rowはすべてledger上implementedだが、M0の独立release evidence fileは
 作っていない。M1は2026-11-01にcloseした。[`release-evidence/m1.md`](release-evidence/m1.md)の
@@ -100,8 +100,7 @@ M2（Operable AF_XDP static router）は**open**である。coordinatorのscopin
 ない）でM2をM2aとM2bに分け、M2a（`ruster run`の下のcopy-mode AF_XDP router、veth E2EをCIで実行。
 multi-queue、zero-copy、X05を含まない）はM2 S1〜S11（#292〜#303）とS13で完了した。exit criterion
 ごとの判定は[`release-evidence/m2.md`](release-evidence/m2.md)にあり、9 criterionのうちmet 5、
-partially met 3、not met 1（X05）である。M2b（multi-queue S12、zero-copy、X05 lab evidence）は
-owner決定2aとX05 labの決定を待って次に進める（下の「M2の判断の記録」）。
+partially met 3、not met 1（X05）である。M2b（multi-queue S12、zero-copy、X05 lab evidence）はowner決定（2026-11-02）でdeferredである: 2a「C」（当面portごとに1 queue、X05のNIC選定と合わせて再検討）、X05 labは当面不要で運用はveth（実NIC forwarding、実driverのnative mode、zero-copyが未検証のriskはownerが受け入れた）。B3/NAT44-038は「A」で、CLI-034 hardeningの後（順序はcoordinator既定）に実装する（下の「M2の判断の記録」）。
 
 ### Partialまたは欠落
 
@@ -109,7 +108,7 @@ owner決定2aとX05 labの決定を待って次に進める（下の「M2の判�
   M2aのcopy-mode router（一socketのsession、XDP program attach、RX/Fill engine、same-frame
   TX/Completion、generated frame、複数portのcore `PacketIo` adapter、configからのport構築と
   `ruster run`の起動/停止、reload、health/stall、link event、起動retry）までで、multi-queue worker
-  ownership（M2b S12、owner決定2a待ち）、zero-copy NICと実NIC forwarding E2E、hardware benchmark
+  ownership（M2b S12、2a: owner決定2026-11-02「C」（当面1 queue、X05と合わせて再検討））、zero-copy NICと実NIC forwarding E2E、hardware benchmark
   （M2b、X05 lab待ち）は無い。netns/veth上の`ruster run` E2Eは`scripts/priv-run-smoke.sh`で、M2 S11から
   hosted runnerの`XDP veth` CI job（`.github/workflows/xdp-veth.yml`）が毎PRで実行する。
 - `run-sim`はrestart-required applyをrejectとして報告し、同一process内でstorageを
@@ -189,7 +188,7 @@ owner決定2aとX05 labの決定を待って次に進める（下の「M2の判�
   `priv-run-smoke.sh`を`sudo -n`で実行する。この変数の下ではtestのskip経路もfailになる
   （CI-001、CI-002）。#302/#301 reviewのsmoke強化: global `ip_forward=0`で`conf/ra/forwarding=1`は
   起動時`scope=device`で拒否、稼働中はif1だけwarningでrecovered（CI-003）、stuck phaseはFIFOが
-  capacityまで埋まり動かないことを確かめる（CI-004）。required check化はowner決定2e（open）。
+  capacityまで埋まり動かないことを確かめる（CI-004）。required checkにはしない（owner決定2e「当面は任意のまま」）。
   `main` `a51d7de`のrunが成功した（[`release-evidence/m2.md`](release-evidence/m2.md)）。
 - M2 S13: M2aのrelease evidence（[`release-evidence/m2.md`](release-evidence/m2.md)）と
   operator runbook（[`runbook-m2.md`](runbook-m2.md)）の確定、ledgerのM2a判定。
@@ -448,12 +447,25 @@ M2に関するownerの発言は次だけである（2026-10-31〜11-01、session
 - 「それで進めていって」（B1 NAT quota → B2 RFC 5508 ICMP translation → M2の順。B3（delayed ICMP、
   NAT44-038）はM2後に決める）
 
-owner決定待ち（open。ownerの文言は無い）:
+2026-11-02（M2a close後、session内）:
 
-- 2a: multi-queue NAT affinity design。決まるまでmulti-queueは現scopeの外（M2b S12）。
-- 2e: `XDP veth`をrequired checkにするか。
-- X05 lab: 4-queue zero-copy NICのlabを用意するか。
-- B3 / NAT44-038: M2後に決める。
+- 2e（`XDP veth`をrequired checkにするか）: 「当面は任意のまま」。`XDP veth`は当面required checkに
+  しない（decided）。
+- X05 lab（4-queue zero-copy NIC labを用意するか）: 「頑張れば用意できるけど しばらくいらない」「しばらく運用するとしてもvethで運用するから許容よろしく」。当面labは用意せず、運用はvethで行う
+  （decided）。実NIC forwarding、実driverでのnative mode、zero-copyは未検証のままで、ownerはその
+  riskを明示的に受け入れた。exit criterion 4（partially met）と8（not met）の判定は変えず、ownerが
+  deferredとして受け入れた。
+- 次の方向: 「運用の残りを固める」（CLI-034の残り項目のhardening。最初はH1: link down中のTX kick
+  retryのrate limit）。
+- B3 / NAT44-038: 「A」。unsolicited inbound TCP SYNへのdelayed ICMP Port Unreachable（RFC 5382 REQ-4）を
+  実装する: bounded な≥6 sのhold、outbound SYNでcancel、それ以外はICMP 3/3、rate limit、operatorが
+  offにできるswitch。coordinatorは既定onを提案し（RFC SHOULD）、ownerはその提案でAを選んだ。現在の
+  CLI-034 hardeningの後（順序はcoordinator既定）に行う。
+- 2a: 「C」。multi-queueはdeferredのまま、M2aはportごとに1 queueのまま。X05のNIC選定と合わせて
+  再検討する。coordinatorの将来設計の希望（queueごとのexternal port range + NIC ntuple steering +
+  symmetric RSS）は決定ではない。
+
+owner決定待ち（open）: なし（2a、2e、X05 lab、B3は上の2026-11-02の決定）。
 
 coordinating agentの既定値（owner決定ではない）:
 
@@ -478,7 +490,7 @@ coordinating agentの既定値（owner決定ではない）:
 | S10a | X04b前半 `ruster run` startup/shutdown | #301 | merge済み |
 | S10b | X04b後半 reload、health、link、retry | #302 | merge済み |
 | S11 | `XDP veth` CI | #303 | merge済み |
-| S12 | multi-queue | — | M2b、owner決定2a待ち |
+| S12 | multi-queue | — | M2b、2a: owner決定2026-11-02「C」（当面1 queue、X05と合わせて再検討） |
 | S13 | M2a release evidenceとrunbook | このPR | — |
 
 M2a（coordinatorのscoping提案）: `ruster run`の下で動くcopy-mode AF_XDP router、veth E2EをCIで
@@ -486,8 +498,8 @@ M2a（coordinatorのscoping提案）: `ruster run`の下で動くcopy-mode AF_XD
 [`release-evidence/m2.md`](release-evidence/m2.md)で、criterion 1、2、3、5、6、7、9がmet、4（zero-copy
 hardware）がpartially met、8（X05 artifact）がnot met。5と9はM2a close時にpartially metで、#305の
 veth gap fill（router生成ICMPv4、TX ring full、`validate`/`plan`、`observer.state`のE2E。CI-005〜007）で
-metにした。同PRでlink down中のTX保持が`KICK_ERRORS`でfatalになるbugを直した（CLI-052A）。M2b（multi-queue S12、zero-copy、X05 lab evidence）はowner決定2aとX05 labの
-決定を待って次に進める。M2全体のcloseはM2bの後である。
+metにした。同PRでlink down中のTX保持が`KICK_ERRORS`でfatalになるbugを直した（CLI-052A）。M2b（multi-queue S12、zero-copy、X05 lab evidence）はowner決定（2026-11-02）でdeferredである: 2a「C」（当面portごとに1 queue、X05のNIC選定と合わせて再検討）、X05 labは当面不要で運用はveth（実NIC forwarding、実driverのnative mode、zero-copyが未検証のriskはownerが受け入れた）。B3/NAT44-038は「A」で、CLI-034 hardeningの後（順序はcoordinator既定）に実装する。いまはownerの「運用の残りを固める」に従いCLI-034の残りをhardening sliceで
+進める（H1: link down中のTX kick retryを1 msから64 msまで倍増するbackoffでrate limit）。M2全体のcloseはM2bの後である。
 
 ### M3: Household/scaled router
 
@@ -695,8 +707,8 @@ incremental/full checksum一致、generation/clock/capacityを含む。
 XDP attachをvethで検証するjobはX04が別workflow（`xdp-veth.yml`、M2 S11）として所有し、
 AF_PACKETの`netns.yml`を並列編集しない。`XDP veth` jobは最初のprobe（`scripts/priv-xdp-probe.sh`）が
 AF_XDP/veth/netnsの不足をtypedなfailureにし、smokeは`RUSTER_REQUIRE_PRIV=1`でskip経路を持たない。
-hosted runnerのkernel一つだけを検証し（5.9〜6.xの網羅はXDP-062）、required check化はowner決定2e
-（open）。
+hosted runnerのkernel一つだけを検証し（5.9〜6.xの網羅はXDP-062）、required checkではない
+（owner決定2e「当面は任意のまま」）。
 
 ### Hardware CI (`hardware-bench.yml`, X05)
 

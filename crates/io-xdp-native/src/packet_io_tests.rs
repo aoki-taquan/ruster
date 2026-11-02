@@ -8,8 +8,8 @@ use std::num::{NonZeroU128, NonZeroU32};
 use ruster_core::{
     forward_batch, ipv4_header_checksum, BackendMode, BackendStats, FieldValue, FieldVisitor,
     ForwardingSnapshot, GeneratedAllocationError, GeneratedPacketBatch, GeneratedPacketIo, IfId,
-    Interface, Ipv4Address, MacAddress, Neighbor, NoTrace, ObservableFields, PacketBatch, PacketIo,
-    PublicationQuiescence, PublicationQuiescenceDisposition, Route,
+    Interface, Ipv4Address, MacAddress, MonotonicMillis, Neighbor, NoTrace, ObservableFields,
+    PacketBatch, PacketIo, PublicationQuiescence, PublicationQuiescenceDisposition, Route,
 };
 
 use crate::{
@@ -19,7 +19,10 @@ use crate::{
         heap_kernel::{allocation_count, ScriptedKernel},
         kick::KickRing,
     },
-    packet_io::{generated_reserve, KICK_SLACK, KICK_TX_BATCH},
+    packet_io::{
+        generated_reserve, KICK_SLACK, KICK_TX_BATCH, LINK_DOWN_RETRY_MAX_MS,
+        LINK_DOWN_RETRY_MIN_MS,
+    },
     KickError, NegotiatedMode, RingEntries, RingName, RxFillConfig, RxFillEngine, TxRejection,
     UmemConfig, UmemDomainId, XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort,
     XdpPortConfig, XdpQuiescenceError, XDP_PACKET_HEADROOM,
@@ -840,6 +843,165 @@ fn link_flap_recovers_without_new_traffic() {
     drop(io.receive(0).expect("idle receive"));
     assert_eq!(wan.transmitted(), 3);
     assert_eq!(io.engine(WAN).expect("WAN").tx_inflight(), 0);
+    audit(&io);
+}
+
+/// One cross-port copy from LAN committed to WAN in a finished batch.
+fn forward_one_to_wan(io: &mut XdpPacketIo<'_>, lan: &ScriptedKernel) {
+    deliver(lan, &ipv4_frame(60, 64));
+    let mut batch = io.receive(8).expect("receive");
+    batch.next_packet().expect("lease").commit(WAN);
+    let completion = batch.finish();
+    assert_eq!(completion.tx_accepted, 1);
+    assert_eq!(completion.error, None, "link down is not an error");
+}
+
+#[test]
+fn link_down_kick_retries_are_rate_limited_and_the_debt_is_kicked_after_up() {
+    const DOWN_MS: u64 = 2_000;
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    for kernel in [&lan, &wan] {
+        kernel.set_copy_transmit(Some(KICK_TX_BATCH));
+        kernel.set_tx_flags(XDP_RING_NEED_WAKEUP);
+    }
+    let start = 10_000;
+    io.set_clock(MonotonicMillis(start));
+    wan.set_link_down(true);
+    // The first kick of a down period is immediate: one ENETDOWN.
+    forward_one_to_wan(&mut io, &lan);
+    assert_eq!(wan.kicks(KickRing::Tx), 1);
+    // Any number of settles within the retry interval kick nothing more:
+    // they reap and keep the debt.
+    for _ in 0..100 {
+        io.service().expect("service");
+    }
+    drop(io.receive(0).expect("idle receive"));
+    assert!(io.try_publication_quiescence().is_err());
+    let stats = io.port_stats(WAN).expect("WAN");
+    assert_eq!(wan.kicks(KickRing::Tx), 1, "{stats:?}");
+    assert!(stats.link_down && stats.kick_owed, "{stats:?}");
+    assert_eq!(stats.counters.kicks_link_down, 1);
+    assert_eq!(
+        stats.counters.kick_retries_suppressed, 103,
+        "receive and its drop settle twice"
+    );
+    // Due again after the minimum wait, then each wait doubles: kicks at
+    // +1, +3, +7, +15, +31, +63, then every 64 ms.
+    let mut expected = 1;
+    let mut due = start + LINK_DOWN_RETRY_MIN_MS;
+    let mut wait = LINK_DOWN_RETRY_MIN_MS;
+    let end = start + DOWN_MS;
+    for now in start + 1..=end {
+        io.set_clock(MonotonicMillis(now));
+        // Three settles per clock millisecond (a busy loop runs far more).
+        for _ in 0..3 {
+            io.service().expect("service");
+        }
+        if now == due {
+            expected += 1;
+            wait = (wait * 2).min(LINK_DOWN_RETRY_MAX_MS);
+            due = now + wait;
+        }
+        assert_eq!(u64::from(wan.kicks(KickRing::Tx)), expected, "at {now}");
+    }
+    assert_eq!(wait, LINK_DOWN_RETRY_MAX_MS);
+    // About 16 per second instead of one per settle (6k here).
+    let kicks = u64::from(wan.kicks(KickRing::Tx));
+    assert!(
+        kicks <= 7 + DOWN_MS / LINK_DOWN_RETRY_MAX_MS + 1,
+        "{kicks} kicks in {DOWN_MS} ms"
+    );
+    let stats = io.port_stats(WAN).expect("WAN");
+    assert_eq!(stats.counters.kicks_link_down, kicks);
+    // Invariant (CLI-052A): every ENETDOWN kick is also an engine kick
+    // error, and a suppressed retry is neither (no syscall).
+    assert_eq!(stats.counters.kick_errors, stats.counters.kicks_link_down);
+    assert_eq!(
+        stats.counters.kick_retries_suppressed,
+        103 + 3 * DOWN_MS - (kicks - 1)
+    );
+    assert_eq!(stats.counters.tx_inflight, 1);
+    assert_eq!(wan.transmitted(), 0);
+    // The link returns: the held frame waits at most one retry interval
+    // (64 ms here), with no new traffic.
+    wan.set_link_down(false);
+    assert!(due > end && due <= end + LINK_DOWN_RETRY_MAX_MS);
+    for now in end..due {
+        io.set_clock(MonotonicMillis(now));
+        io.service().expect("service");
+        assert_eq!(wan.transmitted(), 0, "not due at {now}");
+    }
+    io.set_clock(MonotonicMillis(due));
+    assert!(io.try_publication_quiescence().is_ok(), "kicked when due");
+    assert_eq!(wan.transmitted(), 1);
+    let stats = io.port_stats(WAN).expect("WAN");
+    assert!(!stats.link_down && !stats.kick_owed, "{stats:?}");
+    assert_eq!(stats.counters.kick_errors, stats.counters.kicks_link_down);
+    // Up resets the backoff: the next down period starts at the minimum.
+    let start = due + 100;
+    io.set_clock(MonotonicMillis(start));
+    wan.set_link_down(true);
+    forward_one_to_wan(&mut io, &lan);
+    let before = wan.kicks(KickRing::Tx);
+    io.service().expect("service");
+    assert_eq!(wan.kicks(KickRing::Tx), before, "suppressed");
+    io.set_clock(MonotonicMillis(start + LINK_DOWN_RETRY_MIN_MS));
+    io.service().expect("service");
+    assert_eq!(wan.kicks(KickRing::Tx), before + 1, "1 ms after the first");
+    // Ramp the backoff up, then let the kernel complete the held frame on
+    // its own (nothing in flight): new TX is kicked at once although the
+    // last kick saw the link down.
+    let mut now = start + LINK_DOWN_RETRY_MIN_MS;
+    for _ in 0..200 {
+        now += 1;
+        io.set_clock(MonotonicMillis(now));
+        io.service().expect("service");
+    }
+    assert!(io.port_stats(WAN).expect("WAN").link_down);
+    assert_eq!(transmit_all(&wan).len(), 1);
+    io.service().expect("service");
+    assert!(!io.port_stats(WAN).expect("WAN").kick_owed);
+    wan.set_link_down(false);
+    let before = (wan.kicks(KickRing::Tx), wan.transmitted());
+    forward_one_to_wan(&mut io, &lan);
+    assert_eq!(wan.kicks(KickRing::Tx), before.0 + 1, "kicked at once");
+    assert_eq!(wan.transmitted(), before.1 + 1);
+    let stats = io.port_stats(WAN).expect("WAN");
+    assert!(!stats.link_down && !stats.kick_owed, "{stats:?}");
+    assert_eq!(lan.kicks(KickRing::Tx), 0, "LAN never had TX");
+    audit(&io);
+}
+
+#[test]
+fn link_flap_recovers_with_a_clock_within_one_retry_interval() {
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    wan.set_copy_transmit(Some(KICK_TX_BATCH));
+    wan.set_tx_flags(XDP_RING_NEED_WAKEUP);
+    // A clock that never moved: the first ENETDOWN still kicks.
+    io.set_clock(MonotonicMillis(0));
+    wan.set_link_down(true);
+    {
+        let mut batch = io.begin_generated(WAN);
+        batch.allocate(42).expect("generated").commit();
+        assert_eq!(batch.finish().error, None);
+    }
+    assert_eq!(wan.kicks(KickRing::Tx), 1);
+    wan.set_link_down(false);
+    // Up, but the retry is not due in the same millisecond.
+    drop(io.receive(0).expect("idle receive"));
+    assert_eq!(wan.transmitted(), 0);
+    assert!(io.port_stats(WAN).expect("WAN").kick_owed);
+    io.set_clock(MonotonicMillis(LINK_DOWN_RETRY_MIN_MS));
+    drop(io.receive(0).expect("idle receive"));
+    assert_eq!(wan.transmitted(), 1);
+    assert_eq!(io.engine(WAN).expect("WAN").tx_inflight(), 0);
+    assert!(io.try_publication_quiescence().is_ok());
+    let counters = io.port_stats(WAN).expect("WAN").counters;
+    assert_eq!(counters.kicks_link_down, 1);
+    assert_eq!(counters.kick_retries_suppressed, 2, "receive and its drop");
+    assert_eq!(counters.generated_completed, 1);
     audit(&io);
 }
 

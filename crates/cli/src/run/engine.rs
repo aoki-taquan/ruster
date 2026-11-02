@@ -22,7 +22,10 @@
 //! Kicks and need-wakeup are the adapter's: every `receive` reaps
 //! completions, refills Fill, answers a Fill need-wakeup with a
 //! non-sleeping `poll` kick, and settles owed TX kicks; `finish` kicks the
-//! ports it published to. The loop adds nothing on top.
+//! ports it published to. The loop adds nothing on top but its clock
+//! reading, handed to the backend once per iteration
+//! ([`Datapath::set_clock`]) so a port whose link is down retries its owed
+//! kick at most every 1 ms doubling to 64 ms instead of at every settle.
 //!
 //! # Idle strategy
 //!
@@ -70,12 +73,26 @@ pub const DRAIN_PAUSE: Duration = Duration::from_millis(1);
 /// Wall-clock bound of the whole shutdown drain.
 pub const DRAIN_DEADLINE_MS: u64 = 2_000;
 
+/// Backend I/O that takes the loop's clock reading at a cold boundary.
+/// The AF_XDP adapter rate-limits TX kick retries on a down link with it.
+pub trait ClockedIo {
+    /// Hands the backend the current clock reading (never per packet).
+    fn set_clock(&mut self, now: MonotonicMillis);
+}
+
 /// A datapath the loop drives: the core-facing I/O plus the shutdown and
 /// stats operations of the backend.
 pub trait Datapath {
-    type Io: PacketIo + GeneratedPacketIo + PublicationQuiescence;
+    type Io: PacketIo + GeneratedPacketIo + PublicationQuiescence + ClockedIo;
 
     fn io(&mut self) -> &mut Self::Io;
+
+    /// Hands the backend the loop's clock reading (cold boundary: once per
+    /// loop iteration, before any I/O of that iteration): forwards to
+    /// [`ClockedIo::set_clock`] of the I/O.
+    fn set_clock(&mut self, now: MonotonicMillis) {
+        self.io().set_clock(now);
+    }
 
     /// One bounded shutdown drain call over every port (see
     /// `XdpPacketIo::drain`): stops RX/Fill and new TX for good, reclaims
@@ -363,6 +380,7 @@ where
             return LoopEnd::Signal;
         }
         let now = clock.now();
+        datapath.set_clock(now);
         let generation = active.generation();
         if control.reloader.pending_since().is_none() && stop.take_reload() {
             let _ = writeln!(

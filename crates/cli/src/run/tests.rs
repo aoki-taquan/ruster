@@ -22,8 +22,8 @@ use super::checks::{
     required_memlock, CheckFailure, CheckPolicy, DeviceFacts, PrivilegeFailure, Probe,
 };
 use super::engine::{
-    Clock, Datapath, DrainProgress, IdleBackoff, LinkMonitor, StopSignal, DRAIN_DEADLINE_MS,
-    DRAIN_ROUNDS, MAX_PAUSE, MIN_PAUSE, SPIN_TICKS,
+    Clock, ClockedIo, Datapath, DrainProgress, IdleBackoff, LinkMonitor, StopSignal,
+    DRAIN_DEADLINE_MS, DRAIN_ROUNDS, MAX_PAUSE, MIN_PAUSE, SPIN_TICKS,
 };
 use super::netlink::{LinkFacts, NetlinkError};
 use super::reload::ConfigSource;
@@ -99,6 +99,12 @@ struct State {
     /// one per tick) reaches the first field.
     inject_at: RefCell<VecDeque<(u32, IfId, Vec<u8>)>>,
     io_calls: Cell<u32>,
+    /// `set_clock` calls, the last reading handed over, and whether any
+    /// call went backwards or came after its tick's `io()` call (no
+    /// allocation: the tick allocation test runs through it).
+    clock_sets: Cell<u32>,
+    last_clock: Cell<u64>,
+    clock_out_of_order: Cell<bool>,
     /// Health sample rounds handed out by `sample_ports`, one per call.
     samples: RefCell<VecDeque<Vec<PortSample>>>,
     /// Link query results, consumed in order by the matching port.
@@ -165,6 +171,52 @@ struct FakeSession {
     attached: bool,
 }
 
+thread_local! {
+    /// The last reading `SimIo` received through [`ClockedIo`].
+    static SIM_CLOCK: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+impl ClockedIo for SimIo {
+    fn set_clock(&mut self, now: MonotonicMillis) {
+        SIM_CLOCK.with(|clock| clock.set(Some(now.0)));
+    }
+}
+
+/// A datapath that keeps the provided `Datapath::set_clock`.
+struct ForwardingDatapath {
+    io: SimIo,
+}
+
+impl Datapath for ForwardingDatapath {
+    type Io = SimIo;
+
+    fn io(&mut self) -> &mut SimIo {
+        &mut self.io
+    }
+
+    fn drain(&mut self, _rounds: u32) -> Result<DrainProgress, XdpIoError> {
+        Ok(DrainProgress::default())
+    }
+
+    fn write_stats(&self, _out: &mut String) {}
+
+    fn port_count(&self) -> usize {
+        0
+    }
+
+    fn sample_ports(&self, _visit: &mut impl FnMut(PortSample)) {}
+}
+
+#[test]
+fn the_provided_set_clock_forwards_to_the_io() {
+    let mut datapath = ForwardingDatapath { io: SimIo::new() };
+    SIM_CLOCK.with(|clock| clock.set(None));
+    datapath.set_clock(MonotonicMillis(42));
+    assert_eq!(SIM_CLOCK.with(Cell::get), Some(42));
+    datapath.set_clock(MonotonicMillis(43));
+    assert_eq!(SIM_CLOCK.with(Cell::get), Some(43));
+}
+
 struct FakeDatapath<'s> {
     ports: &'s mut [OpenPort<FakeSession>],
     state: Rc<State>,
@@ -184,6 +236,19 @@ impl Datapath for FakeDatapath<'_> {
             }
         }
         &mut self.io
+    }
+
+    /// Overrides the provided forwarding (which goes through `io()`, the
+    /// fake's tick counter and frame-injection schedule) to record the
+    /// call order instead.
+    fn set_clock(&mut self, now: MonotonicMillis) {
+        let state = &self.state;
+        let sets = state.clock_sets.get();
+        if (sets != 0 && now.0 <= state.last_clock.get()) || state.io_calls.get() != sets {
+            state.clock_out_of_order.set(true);
+        }
+        state.clock_sets.set(sets + 1);
+        state.last_clock.set(now.0);
     }
 
     fn sample_ports(&self, visit: &mut impl FnMut(PortSample)) {
@@ -697,6 +762,11 @@ fn startup_runs_in_ifid_order_and_shutdown_closes_in_reverse() {
     );
     assert!(outcome.out.contains("\ntick.ticks=3\n"), "{}", outcome.out);
     assert!(outcome.out.contains("\nfake.ports=2\n"));
+    // The loop hands each iteration's clock reading to the datapath
+    // before that iteration's I/O (the adapter's link-down kick retry
+    // rate limit runs on it), once per tick, never going backwards.
+    assert_eq!(host.state.clock_sets.get(), 3);
+    assert!(!host.state.clock_out_of_order.get());
     assert!(outcome.out.ends_with("end\n"));
 }
 

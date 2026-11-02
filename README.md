@@ -19,7 +19,9 @@ openです。そのうちM2a（`ruster run`の下で動くcopy-mode、portごと
 E2EをCIで実行。coordinatorのscoping提案でowner決定ではない）は完了し、exit criterionごとの判定は
 [`docs/release-evidence/m2.md`](docs/release-evidence/m2.md)、運用手順は
 [`docs/runbook-m2.md`](docs/runbook-m2.md)にあります。multi-queue、zero-copy、X05 hardware
-benchmark（M2b）はowner決定を待っています。
+benchmark（M2b）はowner決定（2026-11-02）でdeferredです: multi-queueは2a「C」で当面portごとに1 queue
+（X05のNIC選定と合わせて再検討）、X05 labは当面不要で運用はveth（実NIC/native/zero-copy未検証の
+riskはownerが受け入れ）。B3（delayed ICMP、NAT44-038）は「A」で、CLI-034 hardeningの後（順序はcoordinator既定）に実装します。
 
 workspaceは12 crateです。data-planeとI/Oのlibrary crateは外部依存を持ちません。cold
 control-planeの`ruster-config`とsim専用の`ruster-sim-scenario`だけが、保守されている
@@ -177,7 +179,8 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   `finish`、`receive`、`begin_generated`、`service`、quiescence check、back-pressure直後にreapと
   kickを繰り返す（一回`ceil(in_flight/32)+2` kick以内。copy modeの一`sendto` 32 descriptor上限を
   越えるbatchも`finish`で完了）。`ENETDOWN`はerrorでなくportのlink stateで、linkが戻れば新しい
-  trafficなしに回復する。cross-port copyはrouter生成ARP/ICMP用のgenerated reserve
+  trafficなしに回復する（`ruster run`ではdown中の再試行を1 msから64 msへ倍増するbackoffでrate limitし、
+  見送ったsettleは`kick_retries_suppressed`。XDP-178）。cross-port copyはrouter生成ARP/ICMP用のgenerated reserve
   `max(2, pool/8)`を取らない。portの設定は`XdpPortConfig::from_session`でだけ作れ、別sessionの
   engineとの組は拒否する。`backend_stats()`は全port合計、`port_stats(IfId)`はportごとの
   mode、need-wakeup、link state、Fill/RX/TX/CQ saturationとring占有、completion lag、invalid
@@ -782,7 +785,7 @@ compilerなしで生成）、holder（attachした別processをSIGKILLしlinkが
 
 `.github/workflows/xdp-veth.yml`の`XDP veth` jobは、pull requestとmainへのpushごとに
 `ubuntu-24.04` hosted runner（passwordless sudo）で上の二つのprivileged smokeを実行します
-（30分上限、`permissions: contents: read`、secretなし。required checkにするかはowner決定2eで未決）。
+（30分上限、`permissions: contents: read`、secretなし。owner決定2e「当面は任意のまま」によりrequired checkではない）。
 
 1. `scripts/priv-xdp-probe.sh`: kernel 5.9以上、sudo下の`CapEff`、libbpf付きiproute2、throwaway
    netns（`ruster-probe-<pid>-<random>`）内でのveth作成とsysctl書き込み、`socket(AF_XDP)`、
