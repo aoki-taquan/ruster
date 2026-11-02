@@ -77,12 +77,16 @@
 #             Unreachable Network (RFC 1812 5.2.7.1). Every error is checked
 #             for type/code, outer source/TTL/TOS/checksums, and a quote that
 #             is the whole original datagram with a valid header checksum
-#   unsolicited_syn  (B3, RFC 5382 REQ-4) host B sends a TCP SYN to a
-#             public port without a mapping: nothing for 6 s, then exactly
-#             one ICMP Destination Unreachable Port Unreachable (3/3) from
-#             203.0.113.2 quoting the SYN; after a reloadable SIGHUP to
-#             `unsolicited-syn-icmp = false`, nothing within 9 s (run with
-#             --user/--group so the reload can read the work files)
+#   unsolicited_syn  (B3, RFC 5382 REQ-4) with a firewall rule that admits
+#             new WAN -> LAN TCP flows to every destination, host B sends a
+#             TCP SYN to a public port without a mapping: nothing for 6 s,
+#             then exactly one ICMP Destination Unreachable Port Unreachable
+#             (3/3) from 203.0.113.2 quoting the SYN; after a reloadable
+#             SIGHUP to `unsolicited-syn-icmp = false`, nothing within 9 s;
+#             after one back to router-v1's default-deny firewall (switch
+#             on), nothing within 9 s either (REQ-4 a, counted as
+#             unsolicited_syn_firewall_denied). Run with --user/--group so
+#             the reloads can read the work files
 #   txfull    (gap fill) the WAN TX ring (128 entries; 256 generated frames
 #             so the ring, not the copy pool, is the bound) driven full:
 #             `ip link set rb down` in the router namespace makes every TX
@@ -1164,15 +1168,41 @@ unsolicited_syn_probe() {
 }
 
 phase_unsolicited_syn() {
-    # router-v1 keeps the default unsolicited-syn-icmp = true (64 holds);
-    # the off copy only flips the reloadable switch.
-    cp "$work/router.toml" "$work/syn.toml"
+    # router-v1 keeps the default unsolicited-syn-icmp = true (64 holds)
+    # but its firewall denies every new WAN -> LAN flow, so REQ-4 a keeps
+    # unsolicited SYNs silent there (syn-deny). syn-on adds rule 90, which
+    # admits new WAN -> LAN TCP flows to every inside destination; the off
+    # copy of it only flips the reloadable switch.
+    cp "$work/router.toml" "$work/syn-deny.toml"
+    cp "$work/router.toml" "$work/syn-on.toml"
+    cat >>"$work/syn-on.toml" <<'EOF'
+
+[[firewall.rules]]
+id = 90
+ingress = "wan"
+egress = "lan"
+source = "0.0.0.0/0"
+destination = "0.0.0.0/0"
+protocol = "tcp"
+action = "allow-stateful"
+
+[firewall.rules.source-ports]
+first = 1
+last = 65535
+
+[firewall.rules.destination-ports]
+first = 1
+last = 65535
+EOF
+    "$binary_path" validate "$work/syn-on.toml" >"$work/validate-syn-on.txt" 2>&1 ||
+        fail "unsolicited_syn: syn-on.toml invalid: $(cat "$work/validate-syn-on.txt")"
     awk '{print} /^\[nat44\.tcp\]$/{print "unsolicited-syn-icmp = false"}' \
-        "$work/router.toml" >"$work/syn-off.toml"
+        "$work/syn-on.toml" >"$work/syn-off.toml"
     grep -q '^unsolicited-syn-icmp = false$' "$work/syn-off.toml" ||
         fail "unsolicited_syn: off config not written"
-    cp "$work/router.toml" "$work/syn-on.toml"
+    cp "$work/syn-on.toml" "$work/syn.toml"
     expect_plan syn-on syn-off reloadable none
+    expect_plan syn-off syn-deny reloadable none
     grep -qxF '  nat44-tcp unsolicited-syn-icmp ~ on -> off' "$work/plan-syn-on-syn-off.txt" ||
         fail "unsolicited_syn: plan does not show the switch: $(cat "$work/plan-syn-on-syn-off.txt")"
     start_ruster syn "$work/syn.toml" --user "$smoke_uid" --group "$smoke_gid"
@@ -1193,11 +1223,19 @@ phase_unsolicited_syn() {
     latest_block syn
     block_has "$work/syn.block" nat44_tcp.unsolicited_syn_held=1 \
         icmpv4_errors.dequeued_port_unreachable=1
+    echo "priv_run_unsolicited_syn_off: after the reloadable SIGHUP to unsolicited-syn-icmp = false, $(cat "$work/unsolicited-syn-absent.txt") (REQ-4 a silent drop) verified"
+    reload_with "$work/syn-deny.toml" "$work/syn.toml"
+    wait_line syn "reload applied: generation=3 previous=2;"
+    unsolicited_syn_probe absent 40005 33003 9
+    wait_stat_ge syn nat44_tcp.unsolicited_syn_firewall_denied 1
+    latest_block syn
+    block_has "$work/syn.block" nat44_tcp.unsolicited_syn_held=1 \
+        icmpv4_errors.dequeued_port_unreachable=1
     signal_ruster TERM
     wait_ruster
     [ "$status" -eq 0 ] || fail "unsolicited_syn: exit status $status after SIGTERM"
     assert_detached "the unsolicited_syn run"
-    echo "priv_run_unsolicited_syn_off: after the reloadable SIGHUP to unsolicited-syn-icmp = false, $(cat "$work/unsolicited-syn-absent.txt") (REQ-4 a silent drop), exit 0 verified"
+    echo "priv_run_unsolicited_syn_firewall: after the reloadable SIGHUP to router-v1's default-deny firewall (switch on), $(cat "$work/unsolicited-syn-absent.txt") (REQ-4 a, unsolicited_syn_firewall_denied counted), exit 0 verified"
 }
 phase_unsolicited_syn
 

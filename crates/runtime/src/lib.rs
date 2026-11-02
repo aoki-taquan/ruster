@@ -951,7 +951,7 @@ where
     } = nat44_tcp;
     let FirewallServiceView {
         config: firewall_config,
-        runtime: firewall,
+        runtime: mut firewall,
     } = firewall;
 
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::Rx));
@@ -967,7 +967,7 @@ where
                 &tcp_config,
                 nat44_tcp.as_deref_mut(),
                 &firewall_config,
-                firewall,
+                firewall.as_deref_mut(),
                 now,
                 trace,
             );
@@ -1026,9 +1026,12 @@ where
             Err(error) => PhaseReport::Failed(error),
         };
         // Unsolicited inbound TCP SYNs whose 6 s hold has passed (RFC 5382
-        // REQ-4) share this phase and its budget: both turn deferred
-        // failures into generated ICMPv4 errors before the generated
-        // phases run. The outcome is in the TCP NAT counters and trace.
+        // REQ-4) are dispatched in this phase too: both turn deferred
+        // failures into generated ICMPv4 errors before the generated phases
+        // run. They get the same budget value, applied separately, so the
+        // phase handles at most twice `failure-dispatch-scans` per tick. The
+        // firewall is re-checked for each matured hold. The outcome is in
+        // the TCP NAT counters and trace.
         let syn_clock_regressed = nat44_tcp.is_some_and(|nat44_tcp| {
             matches!(
                 dispatch_nat44_tcp_unsolicited_syns(
@@ -1036,6 +1039,8 @@ where
                     icmpv4_errors,
                     resolution,
                     &snapshot,
+                    Some(&firewall_config),
+                    firewall,
                     now,
                     budgets.failure_dispatch_scans,
                     trace,

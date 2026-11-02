@@ -245,10 +245,10 @@ reload path.
 | resolution `states` (96 B) | `schedule` on a dynamic miss, failure capture, ARP learn (cancels the key's state) | one keyed chain of at most 16 slots, plus for a new key the lowest free or elapsed-cooldown slot (bitmap) and the head of the request-order list (amortized O(1) per committed request) | new target with the table full 0.34 µs (250 µs); ARP update of a pending target 0.78 µs (943 µs) | the number of next hops being resolved at once |
 | resolution `failure-holds` (656 B) | capture on a miss, promotion and expiry of a failed resolution, ARP learn | the forward chain of the key (at most 16 holds) and, for holds waiting on a reverse resolution, the reverse chain, which carries one leader per distinct waiting token (the other holds of a token hang off its leader, so thousands of holds behind one spoofed source cost other tokens nothing); clearing a token's holds visits each once, and each was captured once (amortized O(1)) | — | a few times `states` |
 | resolution `actions` (56 B) | FIFO list; a state removes its own queued action in O(1) | O(1) | — | like `states` |
-| ICMPv4 error `states` (24 B) | every generated error (TTL expiry, unreachable) | only the occupied states, which are a prefix of the table and at most one per egress interface in use (≤ 256) | — | at most one per egress interface is ever used; a few |
+| ICMPv4 error `states` (24 B) | every generated error (TTL expiry, unreachable) | only the occupied states, which are a prefix of the table and at most two per egress interface in use (one per limiter class: Port Unreachable has its own) | — | one per egress interface in use, plus one for the WAN's Port Unreachable class; a few |
 | ICMPv4 error `actions` (584 B) | O(1) ring; one per state | O(1) | — | like `states` |
 | NAT44 `mappings`/`peers`/`sessions` (64/48/64 B + directories) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (the least recently refreshed, so the first to expire) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
-| `nat44.tcp.capacity.unsolicited-syn-holds` (592 B) | an unsolicited inbound TCP SYN (no mapping for its public port, or refused by the filtering) is held for the RFC 5382 REQ-4 delayed ICMP Port Unreachable; a translated outbound SYN cancels the hold of its connection | one keyed chain of at most 16 holds (`NAT44_TCP_SYN_HOLD_CHAIN_LIMIT`, secret NAT key) plus O(1) list heads; a full table or chain drops silently. Matured holds are taken in deadline order by the failure-dispatch phase, at most `tick.failure-dispatch-scans` per tick, never scanning unmatured ones | — | default 64: about 6 s of the default ICMP limiter (10 errors per second per egress). A bigger table does not send more ICMP, it only holds more SYNs that the limiter will refuse |
+| `nat44.tcp.capacity.unsolicited-syn-holds` (592 B) | an unsolicited inbound TCP SYN (no mapping for its public port, or refused by the filtering) is held for the RFC 5382 REQ-4 delayed ICMP Port Unreachable; a translated outbound SYN cancels the hold of its connection | one keyed chain of at most 16 holds (`NAT44_TCP_SYN_HOLD_CHAIN_LIMIT`, secret NAT key) plus O(1) list heads; a full table or chain drops silently. Matured holds are taken in deadline order by the failure-dispatch phase, at most `tick.failure-dispatch-scans` per tick (the same budget value as the resolution failure dispatch, applied separately, so the phase does up to twice that), never scanning unmatured ones; each matured hold walks the firewall rules once. An inconsistent table is flushed (`unsolicited_syn_index_corrupt`) | — | default 64. The Port Unreachable limiter sends at most 1 per second per egress by default, so a bigger table does not send more ICMP; it only holds more SYNs that the limiter will refuse. 0 frees the 37 KiB when the switch is off |
 | `firewall.capacity.states` (56 B) | keyed SipHash probe with occupancy capped near 75% (`usable_state_capacity`), so a full table cannot occur; only the amortized expiry sweep (`reclaim_one_expired`) is linear | — (amortized) | — | the expected concurrent flows |
 
 The per-packet work on the runtime tables no longer depends on their
@@ -909,19 +909,59 @@ dropped silently at once (`drop.NAT44_TCP_MAPPING_MISS` /
 `drop.NAT44_TCP_SESSION_MISS`). By default (`[nat44.tcp]
 unsolicited-syn-icmp = true`) the router also holds a copy for 6 s and then
 sends one ICMP Port Unreachable (Type 3, Code 3) to the sender, unless an
-inside host opened the same connection in the meantime. Watch
-`nat44_tcp.unsolicited_syn_held`, `_icmp_queued`, `_cancelled`
-(simultaneous opens), `_superseded`, `_icmp_suppressed` (refused by the
-shared ICMPv4 rate limiter: a SYN flood or scan), `_hold_full` (the table
-`[nat44.tcp.capacity] unsolicited-syn-holds`, default 64, was full: those
-SYNs were only dropped), `_ineligible`, and
-`occupancy.nat44_tcp_unsolicited_syn_holds`. Turning the switch off is a
-reloadable change (`plan` shows `nat44-tcp unsolicited-syn-icmp ~ on ->
-off`); changing the capacity is `STORAGE_SHAPE`. If port scans of the
-public address should see silence instead of Port Unreachable (with
-`endpoint-independent` filtering and a firewall that denies new inbound
-flows, silence vs. ICMP reveals which public ports have a mapping), turn it
-off.
+inside host opened the same connection in the meantime.
+
+The firewall decides first (RFC 5382 REQ-4 a: no answer the security policy
+would not allow). The SYN is held, and answered when the hold ends, only if
+the firewall would admit it as a new connection to *every* inside
+destination. The address and port it would be translated to are unknown, so
+the router walks the rules in order using only what it knows: ingress (the
+WAN), egress (the LAN), source address and port, protocol TCP.
+
+- A matching `allow-stateful` rule decides only if its destination is
+  `0.0.0.0/0` with ports 1-65535. Egress `any` counts.
+- An allow rule with a narrower destination is skipped.
+- A matching `deny` rule silences the SYN, whatever its destination.
+- If no rule decides, the default deny applies.
+
+With the usual firewall that admits no new WAN -> LAN flows, unsolicited SYNs
+therefore stay silent. The answer does not depend on whether a mapping exists.
+The check runs again when the hold ends, so a rule change during the 6 s is
+honoured.
+
+Watch these counters:
+
+- `nat44_tcp.unsolicited_syn_held`, `_icmp_queued`, `_cancelled`
+  (simultaneous opens), `_superseded`
+- `_firewall_denied`: the firewall would not admit the SYN
+- `_icmp_suppressed`: refused by the Port Unreachable rate limiter, which
+  points to a SYN flood or a scan
+- `_hold_full`: the table `[nat44.tcp.capacity] unsolicited-syn-holds`
+  (default 64) was full, so those SYNs were only dropped
+- `_ineligible`
+- `_index_corrupt`: the hold table was inconsistent and was flushed. This
+  should stay 0.
+- `occupancy.nat44_tcp_unsolicited_syn_holds`
+
+Port Unreachable has its own rate limiter per egress, separate from the
+other ICMPv4 errors: `[icmpv4-errors.policy]
+port-unreachable-interval-ms`, default 1000, a restart-required
+`ICMPV4_ERROR_POLICY` change. A SYN flood therefore never delays a Time
+Exceeded or a Net/Host Unreachable. It uses one more limiter state on the
+WAN egress, so keep `icmpv4-errors.capacity.states` at least one above the
+number of interfaces.
+
+Turning the switch off is a reloadable change (`plan` shows `nat44-tcp
+unsolicited-syn-icmp ~ on -> off`). Changing the capacity is
+`STORAGE_SHAPE`; with the switch off, `unsolicited-syn-holds = 0` frees the
+table's roughly 37 KiB.
+
+Hardening: with a rule that admits new inbound TCP to every destination and
+`endpoint-independent` filtering, a SYN to a mapped public port is forwarded
+while one to an unmapped port gets Port Unreachable. Port scans can then
+tell which public ports are in use about as well as forwarding already
+shows. If scans should see only silence, set `unsolicited-syn-icmp = false`,
+which removes this remaining oracle.
 
 ## 12. Known limits
 
@@ -1102,10 +1142,13 @@ What it proves, on the runner's kernel only:
   accepted with `--allow-kernel-forwarding`, and only warned while running;
   per-port `conf/<dev>/forwarding` refused (`scope=device`) and warned; an
   undrained stdout FIFO proven full before SIGTERM; SIGKILL and restart.
-  Added by B3: a raw TCP SYN from host B to an unmapped public port gets
+  Added by B3, with a rule that admits new WAN -> LAN TCP flows to every
+  destination: a raw TCP SYN from host B to an unmapped public port gets
   exactly one ICMP Port Unreachable from 203.0.113.2, no earlier than 6 s
-  after the SYN, quoting it; after a reloadable SIGHUP to
-  `unsolicited-syn-icmp = false`, nothing within 9 s.
+  after the SYN, quoting it. After a reloadable SIGHUP to
+  `unsolicited-syn-icmp = false`, nothing arrives within 9 s. After a SIGHUP
+  back to router-v1's default-deny firewall (switch on), nothing arrives
+  within 9 s either (`unsolicited_syn_firewall_denied`).
   Added by H2 (the router namespace is set up as recommended:
   `disable_ipv6=1` on every port, `all.arp_ignore=1`, `all.rp_filter=1`):
   IPv4 routes in a policy-routing table and a multipath route with one

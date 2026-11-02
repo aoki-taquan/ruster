@@ -342,6 +342,69 @@ mod tcp_tests {
         );
     }
 
+    /// A corrupt hold table is flushed and counted, never retried: the
+    /// next tick and the next SYN start from an empty, working table.
+    #[test]
+    fn a_corrupt_unsolicited_syn_hold_table_is_flushed_and_counted() {
+        with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+            let holds = Box::leak(vec![Nat44TcpSynHoldSlot::EMPTY; 4].into_boxed_slice());
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions)
+                .with_unsolicited_syn_holds(holds)
+                .unwrap();
+            let syn = [0x45_u8; 40];
+            for port in [1000, 1001] {
+                assert_eq!(
+                    runtime.hold_unsolicited_syn(40_000, REMOTE1, port, 0, &syn, 0),
+                    Some(SynHoldInsert::Held)
+                );
+            }
+            runtime.syn_holds.corrupt_fifo_head();
+            assert!(runtime
+                .pop_matured_unsolicited_syn(NAT44_TCP_UNSOLICITED_SYN_HOLD_MS)
+                .is_err());
+            let counters = runtime.counters();
+            assert_eq!(counters.unsolicited_syn_index_corrupt, 1);
+            assert_eq!(counters.config_mismatches, 0);
+            assert_eq!(runtime.unsolicited_syn_holds(), 0);
+            assert!(runtime
+                .pop_matured_unsolicited_syn(u64::MAX)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                runtime.hold_unsolicited_syn(40_000, REMOTE2, 1002, 0, &syn, 1),
+                Some(SynHoldInsert::Held)
+            );
+            // A corrupt index met by a cancel or an insert is flushed too.
+            runtime.syn_holds.corrupt_chain_heads();
+            runtime.cancel_unsolicited_syn_hold(SynHoldKey {
+                public_port: 40_000,
+                remote_address: REMOTE2,
+                remote_port: 1002,
+            });
+            assert_eq!(runtime.counters().unsolicited_syn_index_corrupt, 2);
+            assert_eq!(runtime.unsolicited_syn_holds(), 0);
+            assert_eq!(
+                runtime.hold_unsolicited_syn(40_000, REMOTE2, 1003, 0, &syn, 2),
+                Some(SynHoldInsert::Held)
+            );
+            runtime.syn_holds.corrupt_chain_heads();
+            assert_eq!(
+                runtime.hold_unsolicited_syn(40_000, REMOTE2, 1004, 0, &syn, 3),
+                Some(SynHoldInsert::IndexCorrupt)
+            );
+            let counters = runtime.counters();
+            assert_eq!(counters.unsolicited_syn_index_corrupt, 3);
+            assert_eq!(counters.unsolicited_syn_hold_full, 0);
+            assert_eq!(runtime.unsolicited_syn_holds(), 0);
+            assert_eq!(
+                runtime.hold_unsolicited_syn(40_000, REMOTE2, 1004, 0, &syn, 4),
+                Some(SynHoldInsert::Held)
+            );
+        });
+    }
+
     #[test]
     fn tcp_zero_and_full_capacity_never_evict_live_state() {
         with_config(Nat44TcpPolicy::default(), 40_000, 40_001, |config| {
@@ -5921,11 +5984,14 @@ impl Nat44TcpPolicy {
     /// it is held for at least [`NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`]; if an
     /// outbound SYN for the same connection is translated meanwhile the hold
     /// is dropped silently, otherwise the NAT answers with one ICMP Port
-    /// Unreachable through the shared generated-ICMPv4 limiter. The hold
+    /// Unreachable through the generated-ICMPv4 queue and its Port
+    /// Unreachable limiter class. A bound firewall must admit the SYN as a
+    /// new connection to every inside destination (REQ-4 a). The hold
     /// table is fixed caller-backed storage
     /// ([`Nat44TcpRuntime::with_unsolicited_syn_holds`]); without slots, or
     /// with this switch off, every such SYN is only dropped silently
-    /// (REQ-4 a).
+    /// (REQ-4 a). With the switch off, giving no slots also frees their
+    /// memory.
     #[must_use]
     pub const fn with_unsolicited_syn_icmp(mut self, enabled: bool) -> Self {
         self.unsolicited_syn_icmp = enabled;
@@ -6381,11 +6447,20 @@ pub struct Nat44TcpCounters {
     pub unsolicited_syn_superseded: u64,
     /// Matured holds answered with a queued ICMP Port Unreachable.
     pub unsolicited_syn_icmp_queued: u64,
-    /// Matured holds that queued no ICMP: the generated-ICMPv4 limiter,
-    /// capacity, reverse route, or reverse neighbor refused it, or the NAT
+    /// Matured holds that queued no ICMP: the Port Unreachable limiter, the
+    /// action capacity, reverse route, or reverse neighbor refused it, or the NAT
     /// could not re-check the connection. Each hold yields at most one
     /// ICMP, so a refused one is not retried.
     pub unsolicited_syn_icmp_suppressed: u64,
+    /// Unsolicited SYNs not held, and matured holds dropped silently,
+    /// because the bound firewall would not admit the SYN as a new
+    /// connection to every inside destination (RFC 5382 REQ-4 a: no
+    /// response that the security policy forbids).
+    pub unsolicited_syn_firewall_denied: u64,
+    /// Times the hold table was found inconsistent. Each time the whole
+    /// table is flushed (every hold dropped silently, fail closed), so a
+    /// corrupt entry can never block later holds.
+    pub unsolicited_syn_index_corrupt: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -7958,10 +8033,27 @@ impl<'a> Nat44TcpRuntime<'a> {
     }
 
     fn cancel_unsolicited_syn_hold(&mut self, key: SynHoldKey) {
-        if self.syn_holds.cancel(self.hash_key.0, key) {
-            self.counters.unsolicited_syn_cancelled =
-                self.counters.unsolicited_syn_cancelled.saturating_add(1);
+        match self.syn_holds.cancel(self.hash_key.0, key) {
+            Ok(true) => {
+                self.counters.unsolicited_syn_cancelled =
+                    self.counters.unsolicited_syn_cancelled.saturating_add(1);
+            }
+            Ok(false) => {}
+            Err(_) => self.flush_corrupt_unsolicited_syn_holds(),
         }
+    }
+
+    /// Fail closed on an inconsistent hold table: drop every hold silently
+    /// (no ICMP for any of them) and start over with an empty table, so the
+    /// inconsistency can neither block later holds nor be retried each
+    /// tick. Cold path, O(capacity); it cannot happen without memory
+    /// corruption.
+    fn flush_corrupt_unsolicited_syn_holds(&mut self) {
+        self.syn_holds.flush();
+        self.counters.unsolicited_syn_index_corrupt = self
+            .counters
+            .unsolicited_syn_index_corrupt
+            .saturating_add(1);
     }
 
     /// Offers an unsolicited inbound initial SYN (mapping miss or filter
@@ -7995,8 +8087,10 @@ impl<'a> Nat44TcpRuntime<'a> {
         let counter = match outcome {
             SynHoldInsert::Held => &mut self.counters.unsolicited_syn_held,
             SynHoldInsert::Refreshed => &mut self.counters.unsolicited_syn_refreshed,
-            SynHoldInsert::Full | SynHoldInsert::IndexCorrupt => {
-                &mut self.counters.unsolicited_syn_hold_full
+            SynHoldInsert::Full => &mut self.counters.unsolicited_syn_hold_full,
+            SynHoldInsert::IndexCorrupt => {
+                self.flush_corrupt_unsolicited_syn_holds();
+                return Some(outcome);
             }
         };
         *counter = counter.saturating_add(1);
@@ -8010,20 +8104,31 @@ impl<'a> Nat44TcpRuntime<'a> {
         self.config.policy.unsolicited_syn_icmp && self.syn_holds.capacity() != 0
     }
 
+    pub(crate) fn record_unsolicited_syn_firewall_denied(&mut self) {
+        self.counters.unsolicited_syn_firewall_denied = self
+            .counters
+            .unsolicited_syn_firewall_denied
+            .saturating_add(1);
+    }
+
     pub(crate) fn record_unsolicited_syn_ineligible(&mut self) {
         self.counters.unsolicited_syn_ineligible =
             self.counters.unsolicited_syn_ineligible.saturating_add(1);
     }
 
     /// Removes the earliest held SYN whose hold has ended at `now_ms`, if
-    /// any. O(1); the caller bounds how many it takes per tick.
+    /// any. O(1); the caller bounds how many it takes per tick. An
+    /// inconsistent table is flushed (counted in
+    /// [`Nat44TcpCounters::unsolicited_syn_index_corrupt`]) before the error
+    /// is returned, so the next call starts from an empty table.
     pub(crate) fn pop_matured_unsolicited_syn(
         &mut self,
         now_ms: u64,
     ) -> Result<Option<MaturedSynHold>, Nat44TcpPlanError> {
-        self.syn_holds
-            .pop_matured(now_ms)
-            .map_err(|_| Nat44TcpPlanError::IndexCorrupt)
+        self.syn_holds.pop_matured(now_ms).map_err(|_| {
+            self.flush_corrupt_unsolicited_syn_holds();
+            Nat44TcpPlanError::IndexCorrupt
+        })
     }
 
     pub(crate) fn record_unsolicited_syn_superseded(&mut self) {
@@ -9773,6 +9878,8 @@ mod tests {
                 "unsolicited_syn_superseded",
                 "unsolicited_syn_icmp_queued",
                 "unsolicited_syn_icmp_suppressed",
+                "unsolicited_syn_firewall_denied",
+                "unsolicited_syn_index_corrupt",
             ]
         );
         assert_eq!(

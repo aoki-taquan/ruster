@@ -1220,6 +1220,11 @@ fn validate_v1(
         .map(|source| {
             let generate = source.generate;
             Icmpv4ErrorPolicy::new(source.policy.interval_ms, source.policy.state_ttl_ms)
+                .and_then(|policy| {
+                    policy.with_port_unreachable_interval_ms(
+                        source.policy.port_unreachable_interval_ms,
+                    )
+                })
                 .map(|policy| {
                     policy
                         .with_generation(Icmpv4ErrorKind::TimeExceededTtl, generate.time_exceeded)

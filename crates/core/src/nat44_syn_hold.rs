@@ -22,7 +22,11 @@
 //!   deadline is its capture time plus [`NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`]
 //!   and capture times never decrease (the runtime clock watermark), so the
 //!   head always has the earliest deadline: maturity is a head check, not a
-//!   scan. A retransmitted SYN of a held key restarts the hold at the tail.
+//!   scan. Another SYN of a held key restarts the hold at the tail. A true
+//!   retransmission (same TCP sequence number) keeps the original quote; a
+//!   SYN with a new sequence number (a reconnect from the same remote port)
+//!   replaces it, so the ICMP quotes the newest SYN and a peer that checks
+//!   the quoted sequence number against its connection accepts it.
 //! - **Free list.** Unoccupied slots form a second list; a new hold takes its
 //!   head.
 
@@ -85,6 +89,30 @@ impl Nat44TcpSynHoldSlot {
     pub const fn is_occupied(&self) -> bool {
         self.occupied
     }
+}
+
+impl Nat44TcpSynHoldSlot {
+    fn held_quote(&self) -> &[u8] {
+        &self.quote[..usize::from(self.quote_len)]
+    }
+
+    /// Copies `original_ipv4` (truncated to the quote limit) as the quote,
+    /// zeroing whatever a longer previous quote left behind.
+    fn store_quote(&mut self, original_tos: u8, original_ipv4: &[u8]) {
+        let quote_len = original_ipv4.len().min(ICMPV4_ERROR_MAX_QUOTE_LEN);
+        self.original_tos = original_tos;
+        self.quote_len = u16::try_from(quote_len).expect("quote limit fits u16");
+        self.quote[..quote_len].copy_from_slice(&original_ipv4[..quote_len]);
+        self.quote[quote_len..].fill(0);
+    }
+}
+
+/// The TCP sequence number of an IPv4 datagram carrying a TCP header, if
+/// the bytes are long enough to hold it.
+fn tcp_sequence(ipv4: &[u8]) -> Option<u32> {
+    let ihl = usize::from(*ipv4.first()? & 0x0f) * 4;
+    let bytes = ipv4.get(ihl + 4..ihl + 8)?;
+    Some(u32::from_be_bytes(bytes.try_into().ok()?))
 }
 
 impl Default for Nat44TcpSynHoldSlot {
@@ -275,8 +303,11 @@ impl<'a> SynHoldTable<'a> {
 
     /// Holds a copy of `original_ipv4` (truncated to the quote limit) under
     /// `key` until `deadline_ms`, or restarts the deadline of an existing
-    /// hold of `key` (keeping its original quote). `deadline_ms` must not be
-    /// below any deadline already held (the caller's clock is monotonic).
+    /// hold of `key`. A restart keeps the held quote when the TCP sequence
+    /// number is unchanged (a retransmission) and replaces it otherwise (a
+    /// new connection attempt from the same remote port). `deadline_ms` must
+    /// not be below any deadline already held (the caller's clock is
+    /// monotonic).
     pub(crate) fn insert(
         &mut self,
         hash_key: DirectoryHashKey,
@@ -295,7 +326,11 @@ impl<'a> SynHoldTable<'a> {
                 return SynHoldInsert::IndexCorrupt;
             }
             self.fifo.unlink(self.slots, index);
-            self.slots[index].deadline_ms = deadline_ms;
+            let slot = &mut self.slots[index];
+            slot.deadline_ms = deadline_ms;
+            if tcp_sequence(slot.held_quote()) != tcp_sequence(original_ipv4) {
+                slot.store_quote(original_tos, original_ipv4);
+            }
             self.fifo.push_back(self.slots, index);
             return SynHoldInsert::Refreshed;
         }
@@ -312,16 +347,13 @@ impl<'a> SynHoldTable<'a> {
             return SynHoldInsert::IndexCorrupt;
         }
         self.free.unlink(self.slots, index);
-        let quote_len = original_ipv4.len().min(ICMPV4_ERROR_MAX_QUOTE_LEN);
         let slot = &mut self.slots[index];
         slot.occupied = true;
         slot.public_port = key.public_port;
         slot.remote_address = key.remote_address;
         slot.remote_port = key.remote_port;
         slot.deadline_ms = deadline_ms;
-        slot.original_tos = original_tos;
-        slot.quote_len = u16::try_from(quote_len).expect("quote limit fits u16");
-        slot.quote[..quote_len].copy_from_slice(&original_ipv4[..quote_len]);
+        slot.store_quote(original_tos, original_ipv4);
         self.fifo.push_back(self.slots, index);
         self.occupancy.insert();
         SynHoldInsert::Held
@@ -335,15 +367,18 @@ impl<'a> SynHoldTable<'a> {
             .is_none_or(|tail| self.slots[tail].deadline_ms <= deadline_ms)
     }
 
-    /// Removes the hold of `key`, if any. Returns whether one was removed;
-    /// an inconsistent index removes nothing.
-    pub(crate) fn cancel(&mut self, hash_key: DirectoryHashKey, key: SynHoldKey) -> bool {
+    /// Removes the hold of `key`, if any. Returns whether one was removed.
+    pub(crate) fn cancel(
+        &mut self,
+        hash_key: DirectoryHashKey,
+        key: SynHoldKey,
+    ) -> Result<bool, IndexCorrupt> {
         if self.fifo.len() == 0 {
-            return false;
+            return Ok(false);
         }
-        match self.find(hash_key, key) {
-            Ok(Some((_, Some(index), _))) => self.remove(index).is_ok(),
-            Ok(_) | Err(IndexCorrupt) => false,
+        match self.find(hash_key, key)? {
+            Some((_, Some(index), _)) => self.remove(index).map(|()| true),
+            _ => Ok(false),
         }
     }
 
@@ -434,6 +469,25 @@ impl<'a> SynHoldTable<'a> {
             && self.occupancy.occupied() == self.fifo.len()
     }
 
+    /// Marks the FIFO head unoccupied, an inconsistency only memory
+    /// corruption could cause (tests only).
+    #[cfg(test)]
+    pub(crate) fn corrupt_fifo_head(&mut self) {
+        if let Some(index) = self.fifo.head() {
+            self.slots[index].occupied = false;
+        }
+    }
+
+    /// Points every chain head outside the table (tests only), so every
+    /// lookup fails as corrupt.
+    #[cfg(test)]
+    pub(crate) fn corrupt_chain_heads(&mut self) {
+        let outside = u32::try_from(self.slots.len()).expect("test table") + 7;
+        for slot in self.slots.iter_mut() {
+            slot.bucket_head = outside;
+        }
+    }
+
     /// Chain nodes the lookup of `key` visits (tests only).
     #[cfg(test)]
     pub(crate) fn probe_cost(&self, hash_key: DirectoryHashKey, key: SynHoldKey) -> usize {
@@ -464,13 +518,22 @@ mod tests {
         (0..len).map(|i| n.wrapping_add(i as u8)).collect()
     }
 
+    /// A 40-byte IPv4 + TCP datagram (IHL 5) with sequence number `seq`;
+    /// `fill` varies the other bytes.
+    fn syn_quote(seq: u32, fill: u8) -> Vec<u8> {
+        let mut bytes = quote(fill, 40);
+        bytes[0] = 0x45;
+        bytes[24..28].copy_from_slice(&seq.to_be_bytes());
+        bytes
+    }
+
     #[test]
     fn hold_refresh_cancel_and_maturity_follow_deadline_order() {
         let mut slots = vec![Nat44TcpSynHoldSlot::EMPTY; 4];
         let mut table = SynHoldTable::new(&mut slots);
         let k = hash_key();
         assert_eq!(
-            table.insert(k, key(1), 6_000, 0, &quote(1, 40)),
+            table.insert(k, key(1), 6_000, 0, &syn_quote(100, 1)),
             SynHoldInsert::Held
         );
         assert_eq!(
@@ -482,16 +545,18 @@ mod tests {
             SynHoldInsert::Held
         );
         assert!(table.validate(k));
-        // A retransmission of key 1 restarts its hold at the tail.
+        // A retransmission of key 1 (same sequence number, other bytes may
+        // differ, e.g. the IPv4 identification) restarts its hold at the
+        // tail.
         assert_eq!(
-            table.insert(k, key(1), 9_000, 0, &quote(9, 40)),
+            table.insert(k, key(1), 9_000, 0x10, &syn_quote(100, 9)),
             SynHoldInsert::Refreshed
         );
         assert_eq!(table.len(), 3);
         assert!(table.validate(k));
         assert_eq!(table.next_deadline(), Some(6_010));
-        assert!(table.cancel(k, key(2)));
-        assert!(!table.cancel(k, key(2)));
+        assert!(table.cancel(k, key(2)).unwrap());
+        assert!(!table.cancel(k, key(2)).unwrap());
         assert!(table.validate(k));
         assert!(table.pop_matured(6_019).unwrap().is_none());
         let matured = table.pop_matured(6_020).unwrap().unwrap();
@@ -500,12 +565,42 @@ mod tests {
         assert!(table.pop_matured(8_999).unwrap().is_none());
         let matured = table.pop_matured(9_000).unwrap().unwrap();
         assert_eq!(matured.key, key(1));
-        // The refresh kept the original quote.
-        assert_eq!(matured.quote(), quote(1, 40).as_slice());
+        // The retransmission kept the original quote and TOS.
+        assert_eq!(matured.quote(), syn_quote(100, 1).as_slice());
+        assert_eq!(matured.original_tos, 0);
         assert_eq!(table.len(), 0);
         assert!(table.validate(k));
         assert_eq!(table.occupancy().occupied(), 0);
         assert_eq!(table.occupancy().high_water(), 3);
+    }
+
+    #[test]
+    fn a_new_sequence_number_replaces_the_held_quote() {
+        let mut slots = vec![Nat44TcpSynHoldSlot::EMPTY; 2];
+        let mut table = SynHoldTable::new(&mut slots);
+        let k = hash_key();
+        let first = syn_quote(100, 1);
+        let mut longer = first.clone();
+        longer.extend_from_slice(&[0xaa; 12]);
+        assert_eq!(table.insert(k, key(1), 10, 0, &longer), SynHoldInsert::Held);
+        // A reconnect from the same remote port (new initial sequence
+        // number) replaces the quote, its TOS, and zeroes the old tail.
+        let reconnect = syn_quote(200, 5);
+        assert_eq!(
+            table.insert(k, key(1), 20, 0x20, &reconnect),
+            SynHoldInsert::Refreshed
+        );
+        assert!(table.validate(k));
+        let matured = table.pop_matured(20).unwrap().unwrap();
+        assert_eq!(matured.quote(), reconnect.as_slice());
+        assert_eq!(matured.original_tos, 0x20);
+        assert!(matured.quote[reconnect.len()..]
+            .iter()
+            .all(|byte| *byte == 0));
+        // A quote too short to carry a sequence number is never confused
+        // with one that does.
+        assert_eq!(tcp_sequence(&first[..27]), None);
+        assert_eq!(tcp_sequence(&first), Some(100));
     }
 
     #[test]
@@ -619,7 +714,7 @@ mod tests {
             table.insert(k, key(2), 1, 0, &quote(1, 40)),
             SynHoldInsert::IndexCorrupt
         );
-        assert!(!table.cancel(k, key(1)));
+        assert_eq!(table.cancel(k, key(1)), Err(IndexCorrupt));
         assert_eq!(table.len(), 1);
     }
 

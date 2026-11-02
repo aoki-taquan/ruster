@@ -101,6 +101,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "outside",
     "peers",
     "policy",
+    "port-unreachable-interval-ms",
     "ports",
     "prefix",
     "protocol",

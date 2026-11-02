@@ -780,6 +780,56 @@ fn icmpv4_generation_switches_map_onto_core_policies() {
     );
 }
 
+/// B3: the Port Unreachable limiter interval defaults to 1 s, is a policy
+/// field (restart-required with the rest of the ICMPv4 error policy), and
+/// must not be 0.
+#[test]
+fn icmpv4_port_unreachable_interval_maps_onto_the_core_policy() {
+    use ruster_core::{
+        Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS,
+    };
+    let with = |value: u64| {
+        VALID.replacen(
+            "state-ttl-ms = 60000
+
+[icmpv4-errors.capacity]",
+            &format!(
+                "state-ttl-ms = 60000
+port-unreachable-interval-ms = {value}
+
+\
+                 [icmpv4-errors.capacity]"
+            ),
+            1,
+        )
+    };
+    let defaults = validated(VALID);
+    let policy = defaults.icmpv4_errors().unwrap().policy();
+    assert_eq!(
+        policy.port_unreachable_interval_ms(),
+        ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS
+    );
+    assert_eq!(
+        validated(&with(1_000)).icmpv4_errors().unwrap().policy(),
+        policy
+    );
+    let slower = validated(&with(5_000));
+    let slower = slower.icmpv4_errors().unwrap().policy();
+    assert_eq!(slower.port_unreachable_interval_ms(), 5_000);
+    assert_eq!(
+        slower,
+        Icmpv4ErrorPolicy::new(100, 60_000)
+            .unwrap()
+            .with_port_unreachable_interval_ms(5_000)
+            .unwrap()
+    );
+    assert_eq!(slower.interval_ms(), 100, "the other kinds keep theirs");
+    assert_eq!(
+        error(&with(0)).code(),
+        ValidationCode::Icmpv4ErrorPolicy(Icmpv4ErrorPolicyError::IntervalZero)
+    );
+}
+
 #[test]
 fn nat44_filtering_maps_onto_core_policies_per_protocol() {
     use ruster_core::{Nat44Filtering, Nat44TcpPolicy, Nat44UdpPolicy};

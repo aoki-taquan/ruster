@@ -329,8 +329,8 @@ mapping再生成時は旧sessionを全走査せずgeneration+epochでlazyに無�
 
 TCP session idle TTLはdefault/minimumともに2時間4分です。sequence/window/ACK妥当性は追跡
 せず、FIN/RSTもsessionを削除・短縮せず通常のsuccessful TX requestとしてTTLだけをrefresh
-します。この保守的な単一timer profile、unsolicited SYNへのdelayed ICMP Port Unreachable
-（RFC 5382 REQ-4のSHOULD）を送らずsilent dropすること、fragment未実装を明示し、
+します。この保守的な単一timer profile（unsolicited SYNへのdelayed ICMP Port Unreachable、
+RFC 5382 REQ-4はB3で実装、下記）、fragment未実装を明示し、
 RFC 5382全体への準拠は主張しません。TCPのICMPv4 error変換は、引用public source portと
 exact live remote address/port sessionをread-only参照します。UDP-only/TCP-only wrapperは他方のprotocolがdomainを
 crossするとfail closedにし、combined wrapperはinside/outside/public realm一致を要求します。
@@ -354,6 +354,10 @@ unsolicited-syn-icmp = true      # 省略時true（RFC 5382 REQ-4 SHOULD）。fa
 
 [nat44.tcp.capacity]
 unsolicited-syn-holds = 64       # 省略時64。quote table（本番上限4096、592 bytes/slot）。変更はrestart-required
+                                 # 0でswitch off時の約37 KiBを返せる
+
+[icmpv4-errors.policy]
+port-unreachable-interval-ms = 1000  # 省略時1000。Port Unreachable専用limiter（egressごと）。restart-required
 ```
 
 | `filtering` | UDP inbound（live mapping必須） | TCP inbound（exact live sessionが無い場合） |
@@ -394,14 +398,35 @@ RFC 5382 §5 REQ-4（B3、owner決定「A」）に従い受信IPv4（最大548 b
 します。受信から6秒（`NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`）より前には決して応答せず、その間に同じ
 connection（変換後source `P:p`、destinationがSYNのremote `R:r`）のoutbound SYNを変換したらholdを
 silent dropします（simultaneous open）。それ以外は満了後のtickで、NATがそのSYNの再送をまだ拒否する
-場合に限り、ICMP Destination Unreachable Port Unreachable（Type 3/Code 3）を元SYNを引用して一つ
-だけ送ります。ICMPは他のgenerated ICMPv4と同じqueueとper-egress limiter（default 100 ms）を通り、
-limiterやreverse neighborが拒否したholdは再試行しません（1 SYNに最大1 ICMP、増幅なし）。同じ
-connectionの再送SYNはholdを増やさず期限を延ばします。sourceのreverse routeがoutside interfaceから
-出ない（詐称inside source等）SYN、hairpin、quota超過、firewall拒否はholdしません。表が満杯なら
-silent drop（REQ-4 a）です。`unsolicited-syn-icmp = false`または容量0ならREQ-4 aのsilent dropだけです。
+場合に限り、ICMP Destination Unreachable Port Unreachable（Type 3/Code 3）をholdしたSYNを引用して
+一つだけ送ります。ICMPは他のgenerated ICMPv4と同じqueueを通りますが、limiterはPort Unreachable
+専用のclass（egressごと、`[icmpv4-errors.policy] port-unreachable-interval-ms`、default 1000 ms）で、
+SYN floodがTime ExceededやNet/Host Unreachableのlimiterを使い切ることはありません。limiterや
+reverse neighborが拒否したholdは再試行しません（1 SYNに最大1 ICMP、増幅なし）。同じconnectionの
+再SYNはholdを増やさず期限を延ばし、TCP sequence numberが同じ（再送）なら最初のSYNを、違う
+（再接続）なら最新のSYNを引用します。
+
+firewallがboundのとき（REQ-4 a、security policyに反する応答はしない）、holdと満了時の応答は、
+firewallがそのSYNを**全inside destinationへのnew flowとして許可する**場合だけです。変換先のinside
+address/portは分からないので、ingress（outside）、egress（inside）、source、source port、TCPで
+first-match: destinationが`0.0.0.0/0`かつport 1-65535を含む`allow-stateful`（egress `any`も可）だけが
+許可、destinationが狭いallowは飛ばし、matchした`deny`はdestinationによらず拒否、無ければdefault deny
+です。つまりoutside→insideのnew flowを許可しない通常のfirewall（default deny）や、sourceを`deny`する
+ruleがあれば、unsolicited SYNはsilent dropのままです（`nat44_tcp.unsolicited_syn_firewall_denied`）。
+判定はmappingの有無によらず、満了時にもやり直すのでhold中のfirewall変更も反映されます。NATが許可し
+firewallが拒否したSYN、sourceのreverse routeがoutside interfaceから出ない（詐称inside source等）SYN、
+hairpin、quota超過もholdしません。表が満杯ならsilent drop（REQ-4 a）です。hold表の不整合は表全体を
+flushして`unsolicited_syn_index_corrupt`で数えます（fail closed）。resolution runtime（clock）の無い
+workerはholdしません。`unsolicited-syn-icmp = false`または容量0ならREQ-4 aのsilent dropだけです。
+
+hardening: 全destinationへのinbound allowがあるとき、EIFではmapping済みportへのSYNは転送され
+未mapping portにはICMPが返るので、public portの使用状況は転送の有無と同程度に外から分かります。
+port scanに沈黙だけを返したいなら`unsolicited-syn-icmp = false`（reloadable）で残るoracleも無くなり、
+`unsolicited-syn-holds = 0`（restart-required）でhold表の約37 KiBも返せます。
+
 counterは`nat44_tcp.unsolicited_syn_*`、`icmpv4_errors.*_port_unreachable`、occupancyは
-`occupancy.nat44_tcp_unsolicited_syn_holds`。run_tick経由の例は`fixtures/b3/scenario.toml`。
+`occupancy.nat44_tcp_unsolicited_syn_holds`。run_tick経由の例は`fixtures/b3/scenario.toml`
+（rule 40がWAN→LANのnew TCP flowを全destinationへ許可する）。
 
 NAT44 hairpinning（RFC 4787 §6 REQ-9、RFC 5382 §7.2 REQ-8）はUDP/TCPともdefaultで有効です。
 inside host X1がpublic address `P`のlive mapping `P:x2'`（X2のmapping。X1自身でもよい）へ
@@ -863,7 +888,7 @@ H6のprivilege drop（全phaseが既定のdropで動き、forward phaseで全thr
 全threadのuid/gidとsupplementary groupなしを確認した上でreload・link down/up・MTU fatalを行い、
 privileges phaseでdrop後のrootが他userの0700 directoryのconfigをreloadできない
 （`PERMISSION_DENIED`）こと、`--keep-privileges`ではcapabilityが残り同じreloadが通ることを確認）、
-B3のunsolicited_syn phase（host BのTCP SYNが未mappingのpublic portへ届くと6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らない）、
+B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、
 M2 S10bのops phase（一つの稼働中routerでSIGHUP reloadによりUDP ruleをdenyにして届かなくなり、
 戻して再び届く。generation 2/3でrestartなし。UMEM shapeを変えたreloadは`RESTART_REQUIRED`で
 拒否され転送は継続。router netns内の`ip link set ra down/up`でwarningとrecovered、転送回復。rbの

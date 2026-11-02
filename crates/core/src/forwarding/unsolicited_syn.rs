@@ -8,10 +8,17 @@
 //! connection cancels the hold inside the NAT commit. The tick loop calls
 //! [`dispatch_nat44_tcp_unsolicited_syns`] after the resolution failure
 //! dispatch: each hold whose 6 s have passed is removed and answered at most
-//! once with a Port Unreachable through the generated-ICMPv4 queue and its
-//! per-egress limiter, unless the NAT would now admit a retransmission.
+//! once with a Port Unreachable through the generated-ICMPv4 queue and the
+//! Port Unreachable limiter class, unless the NAT would now admit a
+//! retransmission.
+//!
+//! When a firewall is bound, a SYN is held, and a matured hold answered,
+//! only if the firewall would admit the SYN as a new connection to every
+//! inside destination (`FirewallRuntime::permits_unsolicited_syn`): RFC 5382
+//! REQ-4 a forbids a response that the security policy would not allow.
 
 use super::*;
+use crate::firewall::FirewallUnsolicitedSynPacket;
 use crate::NAT44_TCP_UNSOLICITED_SYN_HOLD_MS;
 
 /// What happened to one unsolicited inbound SYN or one matured hold
@@ -34,6 +41,10 @@ pub enum Nat44TcpUnsolicitedSynDisposition {
     /// A matured hold whose connection the NAT would now admit: dropped
     /// silently.
     Superseded { public_port: u16 },
+    /// The bound firewall would not admit the SYN as a new connection to
+    /// every inside destination: the SYN was not held, or the matured hold
+    /// was dropped silently (RFC 5382 REQ-4 a).
+    FirewallDenied { public_port: u16 },
     /// A matured hold was answered with a queued ICMP Port Unreachable.
     IcmpQueued { public_port: u16, egress: IfId },
     /// A matured hold queued no ICMP; `icmpv4` is the generated-ICMPv4
@@ -50,6 +61,9 @@ pub struct Nat44TcpUnsolicitedSynDispatchReport {
     /// Holds removed because their hold time had passed.
     pub matured: usize,
     pub superseded: usize,
+    /// Matured holds dropped silently because the bound firewall would not
+    /// admit the SYN (RFC 5382 REQ-4 a).
+    pub firewall_denied: usize,
     pub queued: usize,
     pub suppressed: usize,
     /// Holds still in the table after the call.
@@ -64,13 +78,16 @@ pub enum Nat44TcpUnsolicitedSynDispatchError {
     /// The runtime's config does not belong to `snapshot`.
     ConfigMismatch,
     /// The hold table or the runtime state is inconsistent; nothing more was
-    /// dispatched.
+    /// dispatched. An inconsistent hold table has been flushed (fail closed,
+    /// counted in [`crate::Nat44TcpCounters::unsolicited_syn_index_corrupt`]).
     Inconsistent,
 }
 
 /// Packet path: offers an unsolicited inbound initial SYN that the TCP NAT
 /// just refused (mapping miss or filtering refusal) to the hold table. The
-/// caller drops the SYN in every case.
+/// caller drops the SYN in every case, and calls this only when the worker
+/// has a clock (a resolution runtime): without one `now` would be 0 and the
+/// hold could never be timed.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn hold_unsolicited_syn<T: TraceSink>(
     frame: &[u8],
@@ -80,6 +97,8 @@ pub(super) fn hold_unsolicited_syn<T: TraceSink>(
     remote_port: u16,
     config: &Nat44TcpConfig,
     runtime: &mut Nat44TcpRuntime<'_>,
+    firewall_config: Option<&FirewallConfig<'_>>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
     now: MonotonicMillis,
     trace: &mut T,
 ) {
@@ -96,6 +115,20 @@ pub(super) fn hold_unsolicited_syn<T: TraceSink>(
         runtime.record_unsolicited_syn_ineligible();
         trace.record(TraceEvent::Nat44TcpUnsolicitedSyn {
             disposition: Nat44TcpUnsolicitedSynDisposition::Ineligible { public_port },
+        });
+        return;
+    }
+    if !firewall_permits_unsolicited_syn(
+        snapshot,
+        config,
+        firewall_config,
+        firewall,
+        ipv4.source,
+        remote_port,
+    ) {
+        runtime.record_unsolicited_syn_firewall_denied();
+        trace.record(TraceEvent::Nat44TcpUnsolicitedSyn {
+            disposition: Nat44TcpUnsolicitedSynDisposition::FirewallDenied { public_port },
         });
         return;
     }
@@ -123,11 +156,50 @@ pub(super) fn hold_unsolicited_syn<T: TraceSink>(
             }
         }
         crate::nat44_syn_hold::SynHoldInsert::Full
+        // An inconsistent table was flushed (fail closed) and the SYN was
+        // not held.
         | crate::nat44_syn_hold::SynHoldInsert::IndexCorrupt => {
             Nat44TcpUnsolicitedSynDisposition::HoldFull { public_port }
         }
     };
     trace.record(TraceEvent::Nat44TcpUnsolicitedSyn { disposition });
+}
+
+/// Whether the bound firewall, if any, would admit an unsolicited SYN from
+/// `remote:remote_port` as a new connection to every inside destination.
+/// Without a firewall the NAT alone decides (true). A firewall whose config
+/// or runtime does not belong to this publication fails closed (false).
+fn firewall_permits_unsolicited_syn(
+    snapshot: &ForwardingSnapshot<'_>,
+    config: &Nat44TcpConfig,
+    firewall_config: Option<&FirewallConfig<'_>>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
+    remote: crate::Ipv4Address,
+    remote_port: u16,
+) -> bool {
+    let Some(firewall_config) = firewall_config else {
+        return true;
+    };
+    if !firewall_config.authority_matches(snapshot) {
+        return false;
+    }
+    let Some(firewall) = firewall else {
+        return false;
+    };
+    if !firewall.config_matches(firewall_config) {
+        return false;
+    }
+    firewall
+        .permits_unsolicited_syn(
+            firewall_config,
+            FirewallUnsolicitedSynPacket {
+                ingress: config.outside(),
+                egress: config.inside(),
+                source: remote,
+                source_port: remote_port,
+            },
+        )
+        .is_some()
 }
 
 fn remote_routes_outside(
@@ -144,18 +216,24 @@ fn remote_routes_outside(
 /// time ([`NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`]) has passed at `now`, oldest
 /// first. Each matured hold is removed and yields at most one ICMP
 /// Destination Unreachable, Port Unreachable (Type 3, Code 3) quoting the
-/// original SYN (RFC 5382 REQ-4), queued through `icmpv4_errors` and its
-/// per-egress limiter. It is dropped silently instead when the NAT would now
-/// admit a retransmission of the SYN (an outbound SYN for the connection was
-/// translated, or the filtering now admits the remote), when the remote is
-/// no longer an eligible, outside-routed unicast host, or when the limiter,
-/// the action queue, the reverse route, or the reverse neighbor refuses
-/// (an unresolved reverse neighbor queues only an ARP Request). A refused
-/// hold is not retried, so a hold never produces a second ICMP.
+/// held SYN (RFC 5382 REQ-4), queued through `icmpv4_errors` and its Port
+/// Unreachable limiter class. It is dropped silently instead when the NAT
+/// would now admit a retransmission of the SYN (an outbound SYN for the
+/// connection was translated, or the filtering now admits the remote), when
+/// the remote is no longer an eligible, outside-routed unicast host, when
+/// the bound firewall (`firewall_config`, re-checked now so a firewall
+/// change during the hold is honoured) would not admit the SYN as a new
+/// connection to every inside destination, or when the limiter, the action
+/// queue, the reverse route, or the reverse neighbor refuses (an unresolved
+/// reverse neighbor queues only an ARP Request). A refused hold is not
+/// retried, so a hold never produces a second ICMP.
 ///
-/// Work is O(`budget`): holds are kept in deadline order, so this never
-/// scans holds that have not matured. A runtime without held SYNs returns
-/// at once without touching its clock.
+/// Work is O(`budget`) plus, per matured hold, one firewall rule walk:
+/// holds are kept in deadline order, so this never scans holds that have
+/// not matured. A runtime without held SYNs returns at once without
+/// touching its clock. The tick loop passes the failure-dispatch budget
+/// value, applied separately from the resolution failure dispatch, so the
+/// phase does at most twice that much work per tick.
 ///
 /// # Errors
 ///
@@ -165,11 +243,14 @@ fn remote_routes_outside(
 /// does not belong to `snapshot`, and
 /// [`Nat44TcpUnsolicitedSynDispatchError::Inconsistent`] when the hold
 /// table or NAT state is inconsistent.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_nat44_tcp_unsolicited_syns<T: TraceSink>(
     nat44_tcp: &mut Nat44TcpRuntime<'_>,
     icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
     resolution: &mut ResolutionRuntime<'_>,
     snapshot: &ForwardingSnapshot<'_>,
+    firewall_config: Option<&FirewallConfig<'_>>,
+    mut firewall: Option<&mut FirewallRuntime<'_>>,
     now: MonotonicMillis,
     budget: usize,
     trace: &mut T,
@@ -198,10 +279,8 @@ pub fn dispatch_nat44_tcp_unsolicited_syns<T: TraceSink>(
         let hold = match nat44_tcp.pop_matured_unsolicited_syn(now.0) {
             Ok(Some(hold)) => hold,
             Ok(None) => break,
-            Err(_) => {
-                nat44_tcp.record_config_mismatch();
-                return Err(Nat44TcpUnsolicitedSynDispatchError::Inconsistent);
-            }
+            // The runtime flushed the inconsistent table and counted it.
+            Err(_) => return Err(Nat44TcpUnsolicitedSynDispatchError::Inconsistent),
         };
         report.matured += 1;
         let public_port = hold.key.public_port;
@@ -219,10 +298,29 @@ pub fn dispatch_nat44_tcp_unsolicited_syns<T: TraceSink>(
             }
             Err(Nat44TcpPlanError::MappingMiss | Nat44TcpPlanError::SessionMiss) => {
                 let remote = hold.key.remote_address;
-                let icmpv4 = if !icmp_error_source_is_host(snapshot, remote)
-                    || snapshot.is_local_ipv4(remote)
-                    || !remote_routes_outside(snapshot, &config, remote)
+                let eligible = icmp_error_source_is_host(snapshot, remote)
+                    && !snapshot.is_local_ipv4(remote)
+                    && remote_routes_outside(snapshot, &config, remote);
+                if eligible
+                    && !firewall_permits_unsolicited_syn(
+                        snapshot,
+                        &config,
+                        firewall_config,
+                        firewall.as_deref_mut(),
+                        remote,
+                        hold.key.remote_port,
+                    )
                 {
+                    nat44_tcp.record_unsolicited_syn_firewall_denied();
+                    report.firewall_denied += 1;
+                    trace.record(TraceEvent::Nat44TcpUnsolicitedSyn {
+                        disposition: Nat44TcpUnsolicitedSynDisposition::FirewallDenied {
+                            public_port,
+                        },
+                    });
+                    continue;
+                }
+                let icmpv4 = if !eligible {
                     None
                 } else {
                     Some(schedule_reverse_icmpv4_error(

@@ -3,7 +3,9 @@
 //! dropped silently for good if an outbound SYN for the same connection is
 //! translated meanwhile (simultaneous open), and otherwise answered with
 //! exactly one ICMP Destination Unreachable, Port Unreachable (Type 3,
-//! Code 3) quoting the original SYN (NAT44-038, NAT44-069..NAT44-073).
+//! Code 3) quoting the held SYN (NAT44-038, NAT44-069..NAT44-079). With a
+//! firewall bound, only SYNs it would admit as new flows to every inside
+//! destination are held and answered (REQ-4 a).
 
 mod support;
 
@@ -105,17 +107,80 @@ fn prefix(address: Ipv4Address, prefix_len: u8) -> FirewallIpv4Prefix {
 }
 
 fn rule(id: u32, ingress: IfId, egress: IfId, destination: FirewallIpv4Prefix) -> FirewallRule {
+    rule_with(
+        id,
+        ingress,
+        FirewallInterface::Interface(egress),
+        prefix(Ipv4Address::from_octets([0; 4]), 0),
+        destination,
+        FirewallAction::AllowStateful,
+    )
+}
+
+fn rule_with(
+    id: u32,
+    ingress: IfId,
+    egress: FirewallInterface,
+    source: FirewallIpv4Prefix,
+    destination: FirewallIpv4Prefix,
+    action: FirewallAction,
+) -> FirewallRule {
     FirewallRule::new(
         FirewallRuleId(id),
         FirewallInterface::Interface(ingress),
-        FirewallInterface::Interface(egress),
-        prefix(Ipv4Address::from_octets([0; 4]), 0),
+        egress,
+        source,
         destination,
         FirewallProtocol::Tcp,
         FirewallPortRange::new(0, u16::MAX).unwrap(),
         FirewallPortRange::new(1, u16::MAX).unwrap(),
-        FirewallAction::AllowStateful,
+        action,
     )
+}
+
+/// The firewall's policy for new outside -> inside TCP flows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Inbound {
+    /// Default deny: no inbound rule.
+    Denied,
+    /// Allow WAN -> LAN to every inside address and port.
+    AllowAll,
+    /// Allow WAN -> any egress to every inside address and port.
+    AllowAnyEgress,
+    /// Allow WAN -> LAN to `HOST` only (narrower than every destination).
+    AllowHostOnly,
+    /// Deny everything from `REMOTE1`, then allow WAN -> LAN to all.
+    DenyRemote1,
+}
+
+fn firewall_rules(inbound: Inbound) -> &'static [FirewallRule] {
+    let any = prefix(Ipv4Address::from_octets([0; 4]), 0);
+    let mut rules = vec![rule(20, LAN, WAN, any)];
+    match inbound {
+        Inbound::Denied => {}
+        Inbound::AllowAll => rules.push(rule(40, WAN, LAN, any)),
+        Inbound::AllowAnyEgress => rules.push(rule_with(
+            40,
+            WAN,
+            FirewallInterface::Any,
+            any,
+            any,
+            FirewallAction::AllowStateful,
+        )),
+        Inbound::AllowHostOnly => rules.push(rule(40, WAN, LAN, prefix(HOST, 32))),
+        Inbound::DenyRemote1 => {
+            rules.push(rule_with(
+                30,
+                WAN,
+                FirewallInterface::Any,
+                prefix(REMOTE1, 32),
+                any,
+                FirewallAction::Deny,
+            ));
+            rules.push(rule(40, WAN, LAN, any));
+        }
+    }
+    Box::leak(rules.into_boxed_slice())
 }
 
 /// How a test world is built.
@@ -125,8 +190,8 @@ struct Setup {
     unsolicited_syn_icmp: bool,
     holds: usize,
     sessions: usize,
-    /// Whether the firewall admits new outside -> inside TCP flows.
-    firewall_admits_inbound: bool,
+    /// The firewall's policy for new outside -> inside TCP flows.
+    inbound: Inbound,
     static_gateway: bool,
     inbound_sessions_per_remote: u8,
 }
@@ -138,7 +203,7 @@ impl Default for Setup {
             unsolicited_syn_icmp: true,
             holds: 8,
             sessions: 8,
-            firewall_admits_inbound: true,
+            inbound: Inbound::AllowAll,
             static_gateway: true,
             inbound_sessions_per_remote: 0,
         }
@@ -156,6 +221,21 @@ struct World {
     firewall_config: FirewallConfig<'static>,
     firewall: FirewallRuntime<'static>,
     io: SimIo,
+}
+
+fn firewall_config(
+    snapshot: &'static ForwardingSnapshot<'static>,
+    inbound: Inbound,
+    generation: u64,
+) -> FirewallConfig<'static> {
+    FirewallConfig::new(
+        snapshot,
+        firewall_rules(inbound),
+        FirewallPolicy::default(),
+        generation,
+        FirewallHashKey::new(0x0123_4567_89ab_cdef ^ generation, 0xfedc_ba98_7654_3210).unwrap(),
+    )
+    .unwrap()
 }
 
 impl World {
@@ -191,24 +271,7 @@ impl World {
         )
         .with_unsolicited_syn_holds(leak_slice(Nat44TcpSynHoldSlot::EMPTY, setup.holds))
         .unwrap();
-        let mut rules = vec![rule(
-            20,
-            LAN,
-            WAN,
-            prefix(Ipv4Address::from_octets([0; 4]), 0),
-        )];
-        if setup.firewall_admits_inbound {
-            rules.push(rule(40, WAN, LAN, prefix(HOST, 32)));
-        }
-        let rules: &'static [FirewallRule] = Box::leak(rules.into_boxed_slice());
-        let firewall_config = FirewallConfig::new(
-            snapshot,
-            rules,
-            FirewallPolicy::default(),
-            1,
-            FirewallHashKey::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210).unwrap(),
-        )
-        .unwrap();
+        let firewall_config = firewall_config(snapshot, setup.inbound, 1);
         let firewall = FirewallRuntime::new(
             firewall_config,
             leak_slice(FirewallStateSlot::default(), 16),
@@ -235,6 +298,14 @@ impl World {
             firewall,
             io: SimIo::new(),
         }
+    }
+
+    /// Replaces the firewall rules in place (a firewall-only reconcile that
+    /// keeps every TCP NAT hold), as a reload that changed only the rules
+    /// would if holds survived it.
+    fn set_inbound(&mut self, inbound: Inbound, generation: u64) {
+        self.firewall_config = firewall_config(self.snapshot, inbound, generation);
+        self.firewall.reconcile(self.firewall_config).unwrap();
     }
 
     /// One packet through the full worker at `now`.
@@ -285,6 +356,8 @@ impl World {
             &mut self.errors,
             &mut self.resolution,
             self.snapshot,
+            Some(&self.firewall_config),
+            Some(&mut self.firewall),
             MonotonicMillis(now),
             budget,
             trace,
@@ -534,7 +607,10 @@ fn outbound_syn_for_the_connection_cancels_the_hold_and_opens_it() {
 
 /// A retransmitted SYN of a held connection is not held again: it restarts
 /// the hold (REQ-4 forbids answering any unsolicited SYN within 6 s of its
-/// reception), and the one ICMP still quotes the original SYN.
+/// reception), and the one ICMP still quotes the original SYN (same
+/// sequence number). A SYN with a new sequence number from the same remote
+/// port (a reconnect) also restarts the hold but replaces the quote, so the
+/// ICMP quotes the SYN the peer is now waiting on.
 #[test]
 fn retransmissions_restart_the_hold_and_yield_one_icmp_for_the_original() {
     let mut world = World::new(Setup::default());
@@ -557,6 +633,32 @@ fn retransmissions_restart_the_hold_and_yield_one_icmp_for_the_original() {
     let emitted = world.tick(3_000 + HOLD, 16);
     assert_eq!(emitted, [(WAN, port_unreachable(REMOTE1, &original))]);
     assert!(world.tick(100_000, 16).is_empty());
+
+    let mut world = World::new(Setup::default());
+    let first = tcp_with(REMOTE1, PUBLIC, (443, PORT), SYN, 1, 0);
+    let reconnect = with_sequence(
+        tcp_with(REMOTE1, PUBLIC, (443, PORT), SYN, 2, 0x08),
+        0x2000_0000,
+    );
+    world.packet(WAN, first.clone(), 0);
+    world.expect_drop(DropReason::Nat44TcpMappingMiss, &first);
+    world.packet(WAN, reconnect.clone(), 1_000);
+    world.expect_drop(DropReason::Nat44TcpMappingMiss, &reconnect);
+    assert_eq!(world.counters().unsolicited_syn_refreshed, 1);
+    assert!(world.tick(1_000 + HOLD - 1, 16).is_empty());
+    let emitted = world.tick(1_000 + HOLD, 16);
+    assert_eq!(emitted, [(WAN, port_unreachable(REMOTE1, &reconnect))]);
+}
+
+/// `frame` with TCP sequence number `sequence` (checksum recomputed).
+fn with_sequence(mut frame: Vec<u8>, sequence: u32) -> Vec<u8> {
+    frame[38..42].copy_from_slice(&sequence.to_be_bytes());
+    frame[50..52].copy_from_slice(&[0, 0]);
+    let source = Ipv4Address::from_octets(frame[26..30].try_into().unwrap());
+    let destination = Ipv4Address::from_octets(frame[30..34].try_into().unwrap());
+    let checksum = tcp_checksum(source, destination, &frame[34..54]);
+    frame[50..52].copy_from_slice(&checksum.to_be_bytes());
+    frame
 }
 
 /// The hold table is bounded: when it is full, further unsolicited SYNs are
@@ -582,20 +684,21 @@ fn a_full_hold_table_drops_silently_without_eviction() {
     );
     let occupancy = world.tcp.occupancy().unsolicited_syn_holds;
     assert_eq!((occupancy.occupied(), occupancy.capacity()), (2, 2));
-    // The two held SYNs are answered (100 ms apart: the per-egress
+    // The two held SYNs are answered (1 s apart: the Port Unreachable
     // limiter), the refused one never.
     assert_eq!(world.tick(HOLD, 1).len(), 1);
-    assert_eq!(world.tick(HOLD + 100, 1).len(), 1);
+    assert_eq!(world.tick(HOLD + 1_000, 1).len(), 1);
     assert!(world.tick(HOLD + 10_000, 16).is_empty());
     assert_eq!(world.counters().unsolicited_syn_icmp_queued, 2);
 }
 
-/// Rate limit and anti-amplification: SYNs that mature together share the
-/// generated-ICMPv4 per-egress limiter (one queued error per egress, then
-/// 100 ms). A hold the limiter refuses is retired, never retried, so a hold
-/// produces at most one ICMP and a flood of N SYNs at most N.
+/// Rate limit and anti-amplification: matured holds go through the Port
+/// Unreachable limiter class (one queued error per egress, then
+/// `port-unreachable-interval-ms`, default 1 s). A hold the limiter refuses
+/// is retired, never retried, so a hold produces at most one ICMP and a
+/// flood of N SYNs at most N, and at most one per second per egress.
 #[test]
-fn matured_holds_share_the_icmp_limiter_and_are_never_retried() {
+fn matured_holds_are_rate_limited_and_never_retried() {
     let mut world = World::new(Setup {
         holds: 16,
         ..Setup::default()
@@ -617,6 +720,73 @@ fn matured_holds_share_the_icmp_limiter_and_are_never_retried() {
     assert_eq!(world.errors.counters().pending, 9);
     assert_eq!(world.tcp.unsolicited_syn_holds(), 0);
     assert!(world.tick(HOLD + 1_000, 16).is_empty());
+    // The last Port Unreachable left at HOLD: the next ones are refused
+    // until 1 s after the last one that left.
+    for (received, remote_port) in [(7_000, 3000), (7_500, 3001), (8_000, 3002)] {
+        world.packet(WAN, tcp(REMOTE2, PUBLIC, remote_port, PORT, SYN), received);
+        assert!(world.io.pop_recycled().is_some());
+    }
+    for (matured, answered) in [
+        (7_000 + HOLD, true),
+        (7_500 + HOLD, false),
+        (8_000 + HOLD, true),
+    ] {
+        assert_eq!(
+            world.tick(matured, 16).len(),
+            usize::from(answered),
+            "{matured}"
+        );
+    }
+    assert_eq!(world.errors.counters().rate_limited, 1);
+}
+
+/// The Port Unreachable class never uses up the limiter of the other
+/// kinds: right after a Port Unreachable on WAN, a Time Exceeded for a
+/// packet from the WAN still goes out on WAN.
+#[test]
+fn port_unreachable_does_not_starve_other_icmp_errors_on_the_same_egress() {
+    let mut world = World::new(Setup {
+        filtering: Nat44Filtering::EndpointIndependent,
+        inbound: Inbound::AllowAnyEgress,
+        ..Setup::default()
+    });
+    world.packet(LAN, tcp(HOST, REMOTE1, PORT, 443, SYN), 0);
+    world.expect_tx(WAN);
+    let syn = tcp(REMOTE2, PUBLIC, 443, PORT + 1, SYN);
+    world.packet(WAN, syn.clone(), 0);
+    world.expect_drop(DropReason::Nat44TcpMappingMiss, &syn);
+    assert_eq!(
+        world.tick(HOLD, 16),
+        [(WAN, port_unreachable(REMOTE2, &syn))]
+    );
+    // A transit SYN from the WAN back out of the WAN with TTL 1 (the
+    // firewall admits WAN -> any egress) expires at the router: its Time
+    // Exceeded leaves on WAN at once.
+    let transit = Ipv4Address::from_octets([192, 0, 2, 99]);
+    let mut expiring = tcp(REMOTE1, transit, 443, 80, SYN);
+    expiring[22] = 1;
+    expiring[24..26].copy_from_slice(&[0, 0]);
+    let checksum = ipv4_header_checksum(&expiring[14..34]);
+    expiring[24..26].copy_from_slice(&checksum.to_be_bytes());
+    world.packet(WAN, expiring, HOLD);
+    let recycled = world.io.pop_recycled().expect("dropped");
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Forwarding(DropReason::Ipv4TtlExpired)
+    );
+    let emitted = world.tick(HOLD, 16);
+    assert_eq!(emitted.len(), 1);
+    assert_eq!(emitted[0].0, WAN);
+    assert_eq!(emitted[0].1[34], 11, "Time Exceeded");
+    let errors = world.errors.counters();
+    assert_eq!(
+        (
+            errors.dequeued_port_unreachable,
+            errors.dequeued_time_exceeded
+        ),
+        (1, 1)
+    );
+    assert_eq!(errors.rate_limited, 0);
 }
 
 /// The tick budget bounds the work per call: holds mature in deadline
@@ -761,29 +931,162 @@ fn hairpin_and_quota_refusals_are_not_held() {
     assert!(world.tick(HOLD + 2, 16).is_empty());
 }
 
-/// Firewall order: the NAT decides first. A mapping miss is held whatever
-/// the firewall's inbound policy (there is no inside tuple to judge), while
-/// a SYN the NAT filter admits but the firewall denies is the firewall's
-/// silent `FIREWALL_DEFAULT_DENIED` and is not held.
+/// REQ-4 a and the firewall: a NAT refusal is held, and answered, only if
+/// the bound firewall would admit the SYN as a new connection to every
+/// inside destination. Default deny, an explicit deny for the source, and
+/// an allow narrower than every inside destination all keep the silent
+/// drop, so the ICMP never answers what the policy would refuse (and never
+/// depends on whether a mapping exists). An allow to every destination,
+/// toward the inside egress or any egress, admits it.
 #[test]
-fn nat_refusals_are_held_but_firewall_denials_are_not() {
+fn the_firewall_policy_decides_whether_a_nat_refusal_is_answered() {
+    for (inbound, remote, answered) in [
+        (Inbound::Denied, REMOTE1, false),
+        (Inbound::AllowHostOnly, REMOTE1, false),
+        (Inbound::DenyRemote1, REMOTE1, false),
+        (Inbound::DenyRemote1, REMOTE2, true),
+        (Inbound::AllowAll, REMOTE1, true),
+        (Inbound::AllowAnyEgress, REMOTE1, true),
+    ] {
+        // A mapping miss in every filtering mode, and a filter refusal
+        // (the mapping talks to OTHER only) where the filtering refuses: the
+        // outcome never depends on whether a mapping exists.
+        let refusals = MODES
+            .into_iter()
+            .map(|filtering| (filtering, false))
+            .chain([
+                (Nat44Filtering::AddressDependent, true),
+                (Nat44Filtering::AddressAndPortDependent, true),
+            ]);
+        for (filtering, mapped) in refusals {
+            let mut world = World::new(Setup {
+                filtering,
+                inbound,
+                ..Setup::default()
+            });
+            let reason = if mapped {
+                let other = Ipv4Address::from_octets([203, 0, 113, 77]);
+                world.packet(LAN, tcp(HOST, other, PORT, 9, SYN), 0);
+                world.expect_tx(WAN);
+                DropReason::Nat44TcpSessionMiss
+            } else {
+                DropReason::Nat44TcpMappingMiss
+            };
+            let miss = tcp(remote, PUBLIC, 443, PORT, SYN);
+            let mut trace = Recorder::default();
+            world.packet_traced(WAN, miss.clone(), 1, &mut trace);
+            world.expect_drop(reason, &miss);
+            let emitted = world.tick(1 + HOLD, 16);
+            let counters = world.counters();
+            if answered {
+                assert_eq!(
+                    emitted,
+                    [(WAN, port_unreachable(remote, &miss))],
+                    "{inbound:?} {filtering:?}"
+                );
+                assert_eq!(counters.unsolicited_syn_firewall_denied, 0);
+            } else {
+                assert!(emitted.is_empty(), "{inbound:?} {filtering:?}");
+                assert_eq!(
+                    trace.0,
+                    [Nat44TcpUnsolicitedSynDisposition::FirewallDenied { public_port: PORT }]
+                );
+                assert_eq!(counters.unsolicited_syn_held, 0);
+                assert_eq!(counters.unsolicited_syn_firewall_denied, 1);
+                assert_eq!(world.errors.counters().queued, 0);
+            }
+        }
+    }
+}
+
+/// A bound firewall config without its runtime, or with a runtime that
+/// belongs to another config, fails closed at maturity: no ICMP.
+#[test]
+fn an_unusable_firewall_fails_closed_at_maturity() {
+    for runtime_present in [false, true] {
+        let mut world = World::new(Setup::default());
+        let syn = tcp(REMOTE1, PUBLIC, 443, PORT, SYN);
+        world.packet(WAN, syn.clone(), 0);
+        world.expect_drop(DropReason::Nat44TcpMappingMiss, &syn);
+        // A newer config (generation 2) the runtime was never reconciled to.
+        let other = firewall_config(world.snapshot, Inbound::AllowAll, 2);
+        let report = dispatch_nat44_tcp_unsolicited_syns(
+            &mut world.tcp,
+            &mut world.errors,
+            &mut world.resolution,
+            world.snapshot,
+            Some(&other),
+            runtime_present.then_some(&mut world.firewall),
+            MonotonicMillis(HOLD),
+            16,
+            &mut NoTrace,
+        )
+        .unwrap();
+        assert_eq!(report.firewall_denied, 1, "{runtime_present}");
+        assert_eq!(report.queued, 0);
+        assert_eq!(world.errors.pending_actions(), 0);
+        assert_eq!(world.counters().unsolicited_syn_firewall_denied, 1);
+    }
+}
+
+/// Firewall order: the NAT decides first. A SYN the NAT filter admits but
+/// the firewall denies is the firewall's silent `FIREWALL_DEFAULT_DENIED`
+/// and is never held.
+#[test]
+fn firewall_denials_of_admitted_syns_are_not_held() {
     let mut world = World::new(Setup {
         filtering: Nat44Filtering::EndpointIndependent,
-        firewall_admits_inbound: false,
+        inbound: Inbound::Denied,
         ..Setup::default()
     });
-    let miss = tcp(REMOTE1, PUBLIC, 443, PORT, SYN);
-    world.packet(WAN, miss.clone(), 0);
-    world.expect_drop(DropReason::Nat44TcpMappingMiss, &miss);
     world.packet(LAN, tcp(HOST, REMOTE1, PORT, 80, SYN), 1);
     world.expect_tx(WAN);
     let denied = tcp(REMOTE2, PUBLIC, 443, PORT, SYN);
     world.packet(WAN, denied.clone(), 2);
     world.expect_drop(DropReason::FirewallDefaultDenied, &denied);
-    assert_eq!(world.counters().unsolicited_syn_held, 1);
-    // The mapping exists now and EIF admits REMOTE1 again: superseded.
+    let counters = world.counters();
+    assert_eq!(
+        (
+            counters.unsolicited_syn_held,
+            counters.unsolicited_syn_firewall_denied
+        ),
+        (0, 0)
+    );
     assert!(world.tick(HOLD + 2, 16).is_empty());
-    assert_eq!(world.counters().unsolicited_syn_superseded, 1);
+}
+
+/// The firewall is re-checked when a hold matures: rules that deny the SYN
+/// by then silence it, and rules that still admit it let it through.
+#[test]
+fn a_firewall_change_during_the_hold_is_honoured_at_maturity() {
+    for (later, answered) in [
+        (Inbound::Denied, false),
+        (Inbound::DenyRemote1, false),
+        (Inbound::AllowHostOnly, false),
+        (Inbound::AllowAnyEgress, true),
+    ] {
+        let mut world = World::new(Setup::default());
+        let syn = tcp(REMOTE1, PUBLIC, 443, PORT, SYN);
+        world.packet(WAN, syn.clone(), 0);
+        world.expect_drop(DropReason::Nat44TcpMappingMiss, &syn);
+        assert_eq!(world.tcp.unsolicited_syn_holds(), 1);
+        world.set_inbound(later, 2);
+        assert_eq!(world.tcp.unsolicited_syn_holds(), 1, "the NAT keeps it");
+        let mut trace = Recorder::default();
+        let emitted = world.tick_traced(HOLD, 16, &mut trace);
+        if answered {
+            assert_eq!(emitted, [(WAN, port_unreachable(REMOTE1, &syn))]);
+        } else {
+            assert!(emitted.is_empty(), "{later:?}");
+            assert_eq!(
+                trace.0,
+                [Nat44TcpUnsolicitedSynDisposition::FirewallDenied { public_port: PORT }]
+            );
+            assert_eq!(world.counters().unsolicited_syn_firewall_denied, 1);
+            assert_eq!(world.tcp.unsolicited_syn_holds(), 0, "retired, not retried");
+            assert!(world.tick(10 * HOLD, 16).is_empty());
+        }
+    }
 }
 
 /// An unresolved reverse neighbor queues only an ARP Request; the hold is
