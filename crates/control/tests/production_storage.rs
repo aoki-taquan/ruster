@@ -8,7 +8,7 @@ use ruster_config::{parse, validate, ValidatedConfig, PRODUCTION_VALIDATION_LIMI
 use ruster_control::{candidate_from_config, FullServiceStorage, SimDeterministicKeySource};
 use ruster_core::{
     port_free_bitmap_words, DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallStateSlot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Nat44HostLink, Nat44TcpHostSlot,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Nat44HostCounter, Nat44HostLink, Nat44TcpHostSlot,
     Nat44TcpMappingSlot, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpHostSlot,
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot,
     ResolutionFailureHoldSlot, ResolutionStateSlot,
@@ -185,11 +185,14 @@ fn the_maximal_config_with_per_host_limits_still_fits_the_bound() {
     let host_bytes = slots
         * (2 * (size_of::<Nat44HostLink>() + directory)
             + size_of::<Nat44UdpHostSlot>()
-            + size_of::<Nat44TcpHostSlot>());
-    // 12-byte links, 24- and 36-byte host slots (one and two host lists).
-    assert_eq!(host_bytes, 9_175_040);
+            + size_of::<Nat44TcpHostSlot>()
+            + size_of::<u32>()
+            + size_of::<Nat44HostCounter>());
+    // 12-byte links, 24- and 36-byte host slots (one and two host lists),
+    // and the UDP table's 4-byte link word and 8-byte peer counter (N6).
+    assert_eq!(host_bytes, 9_961_472);
     let worst_case = worst_case_bytes() + host_bytes;
-    assert_eq!(worst_case, 66_240_704);
+    assert_eq!(worst_case, 67_027_136);
     assert!(worst_case <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes);
 
     let text = MAXIMAL

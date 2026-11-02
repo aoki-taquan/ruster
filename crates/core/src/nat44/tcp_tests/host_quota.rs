@@ -608,10 +608,25 @@ fn tcp_host_quota_matches_a_full_scan_of_the_slots_under_seeded_churn() {
                     .unwrap()
                     .is_some_and(|(_, mapping)| runtime.mapping_is_live(mapping, now));
                 let (_, live) = scan(&runtime, address, now);
+                // NAT44-096 (3): a returning endpoint whose own mapping was
+                // retired is refused while every counted mapping past its
+                // host-driven expiry is still live (remotes keep it so).
+                let retired_return = runtime
+                    .find_mapping(address, port)
+                    .unwrap()
+                    .is_some_and(|(_, mapping)| !mapping.port_owned);
+                let remote_pinned = runtime.mappings.iter().all(|mapping| {
+                    !(mapping.occupied && mapping.port_owned && mapping.internal_address == address)
+                        || runtime.mapping_is_host_live(*mapping, now)
+                        || runtime.mapping_is_live(*mapping, now)
+                });
                 match out(&mut runtime, (address, port), remote, flags, now) {
                     Err(Nat44TcpPlanError::HostQuotaExceeded) => {
                         assert!(flags == SYN && !exact_live, "seed {seed}");
-                        assert!(live >= usize::from(LIMIT), "seed {seed}");
+                        assert!(
+                            live >= usize::from(LIMIT) || (retired_return && remote_pinned),
+                            "seed {seed}"
+                        );
                         outcomes[0] += 1;
                     }
                     Err(_) => {

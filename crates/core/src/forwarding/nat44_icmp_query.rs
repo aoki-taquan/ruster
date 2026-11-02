@@ -202,6 +202,10 @@ pub(super) fn nat44_icmp_plan_error(
             Nat44IcmpHostQuotaExceeded,
             Nat44IcmpDisposition::HostQuotaExceeded,
         ),
+        Nat44UdpPlanError::HostPeerQuotaExceeded => (
+            Nat44IcmpHostPeerQuotaExceeded,
+            Nat44IcmpDisposition::HostPeerQuotaExceeded,
+        ),
         Nat44UdpPlanError::ClockRegression => (
             Nat44IcmpClockRegression,
             Nat44IcmpDisposition::ClockRegression,
@@ -225,6 +229,7 @@ pub(super) fn nat44_icmp_error_lookup_reason(error: Nat44UdpPlanError) -> DropRe
         | Nat44UdpPlanError::PeerFull
         | Nat44UdpPlanError::PortExhausted
         | Nat44UdpPlanError::HostQuotaExceeded
+        | Nat44UdpPlanError::HostPeerQuotaExceeded
         | Nat44UdpPlanError::GenerationExhausted
         | Nat44UdpPlanError::StateRevisionExhausted => {
             unreachable!("read-only ICMP lookup cannot exhaust state")

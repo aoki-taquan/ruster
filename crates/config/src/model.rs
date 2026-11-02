@@ -358,6 +358,14 @@ pub struct Nat44UdpV1 {
     /// limit is reloadable.
     #[serde(default)]
     pub mappings_per_host: u16,
+    /// Limit on the filter peers the mappings of one internal IPv4 address
+    /// may hold together (N6, NAT44-119, RFC 6888 REQ-5); `0` means no
+    /// limit. Absent means 0. A nonzero limit needs the per-host storage
+    /// (as `mappings-per-host` does), so switching between "neither limit
+    /// set" and "a limit set" is restart-required; other changes are
+    /// reloadable.
+    #[serde(default)]
+    pub peers_per_host: u16,
     pub capacity: Nat44UdpCapacityV1,
 }
 
@@ -403,6 +411,11 @@ pub struct Nat44IcmpV1 {
     /// restart-required.
     #[serde(default)]
     pub mappings_per_host: u16,
+    /// Per-internal-host query peer limit (N6, the UDP `peers-per-host`
+    /// applied to queries); `0` (default) is no limit. It shares the
+    /// per-host storage of `mappings-per-host`.
+    #[serde(default)]
+    pub peers_per_host: u16,
     /// Public identifier pool; absent means the `[nat44.realm.ports]`
     /// numbers. One owner slot per identifier, so the pool sizes storage.
     pub identifiers: Option<Nat44PortRangeV1>,
@@ -475,6 +488,14 @@ pub struct Nat44TcpV1 {
     /// limit is reloadable.
     #[serde(default)]
     pub mappings_per_host: u16,
+    /// Limit on the sessions one internal IPv4 address opens with outbound
+    /// SYNs and keeps alive (N6, NAT44-119, RFC 6888 REQ-5); `0` means no
+    /// limit. Absent means 0. Sessions created by inbound SYNs never count.
+    /// A nonzero limit adds per-session host storage sized from
+    /// `capacity.sessions`, so switching between `0` and a limit is
+    /// restart-required; changing a nonzero limit is reloadable.
+    #[serde(default)]
+    pub sessions_per_host: u16,
     pub capacity: Nat44TcpCapacityV1,
 }
 

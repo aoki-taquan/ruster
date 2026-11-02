@@ -1,4 +1,5 @@
-//! Per-internal-host accounting of NAT44 mappings (N3, NAT44-092).
+//! Per-internal-host accounting of NAT44 mappings (N3, NAT44-092) and of
+//! the state they hold (N6, NAT44-119).
 //!
 //! RFC 6888 REQ-4 asks a NAT to support limiting the external ports assigned
 //! per subscriber. A NAT44 runtime whose per-host mapping limit is set keeps,
@@ -29,6 +30,20 @@
 //! like the other directory mutations. There are as many host slots as
 //! mapping slots, so a slot is always available (see
 //! [`HostTable::plan_assignment`]).
+//!
+//! The same table also serves the per-host state limits of N6 (RFC 6888
+//! REQ-5), with two optional caller-backed arrays. *Link words* give each
+//! link one `u32` of data. In *member-counting* mode (the UDP and ICMP query
+//! runtimes, which also have *host counters*) a link word is the number of
+//! filter peers its mapping contributes to its host, and each host counter
+//! keeps their sum and a *cursor*: the host's list is an *uncounted* prefix
+//! of expired mappings whose peers no longer count, then the counted
+//! mappings from the cursor on, so the host's peer count is read in O(1)
+//! and the least recently used mapping whose peers count is the cursor. The
+//! TCP runtime keeps a second table whose "mappings" are its session slots
+//! (one link per session slot, one list per idle-timeout kind); its link
+//! words are per-session data of the runtime. Neither array exists for the
+//! TCP mapping table, so N3 storage does not grow.
 
 use crate::{
     fixed_directory::{DirectoryHashDomain, DirectoryHashKey, FixedDirectory},
@@ -93,6 +108,10 @@ pub type Nat44UdpHostSlot = Nat44HostSlot<1>;
 /// Host slot of the TCP per-host mapping accounting (established and
 /// transitory lists).
 pub type Nat44TcpHostSlot = Nat44HostSlot<2>;
+/// Host slot of the TCP per-host session accounting (N6): one list per idle
+/// timeout kind (opening, established, closing; the session phase index)
+/// of the sessions' host-driven expiry.
+pub type Nat44TcpSessionHostSlot = Nat44HostSlot<3>;
 
 impl<const LISTS: usize> Nat44HostSlot<LISTS> {
     /// An unused slot.
@@ -129,16 +148,50 @@ impl<const LISTS: usize> Linked for Nat44HostSlot<LISTS> {
     }
 }
 
-/// Caller-owned storage of a NAT44 runtime's per-host mapping accounting
-/// (N3): either all four arrays empty (no accounting; the runtime's per-host
-/// limit must then be `0`), or one [`Nat44HostLink`], one host slot, and one
-/// host directory node per mapping slot, with as many directory buckets as
-/// the mapping directory.
+/// Caller-backed counter of one internal host's filter peers (N6): the sum
+/// of the link words of its counted mappings and the first of them on its
+/// list (the cursor). One per host slot of a member-counting table.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct Nat44HostCounter {
+    members: u32,
+    cursor: u32,
+}
+
+impl Nat44HostCounter {
+    /// No member and no counted mapping.
+    pub const EMPTY: Self = Self {
+        members: 0,
+        cursor: LINK_NONE,
+    };
+}
+
+impl Default for Nat44HostCounter {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+impl std::fmt::Debug for Nat44HostCounter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Nat44HostCounter([REDACTED])")
+    }
+}
+
+/// Caller-owned storage of a NAT44 runtime's per-host accounting (N3, N6):
+/// either every array empty (no accounting; the runtime's per-host limits
+/// must then be `0`), or one [`Nat44HostLink`], one host slot, and one host
+/// directory node per accounted slot, with as many directory buckets as the
+/// accounted table's directory. The UDP and ICMP query runtimes also need
+/// one link word per link and one [`Nat44HostCounter`] per host slot
+/// ([`Self::with_link_words`], [`Self::with_host_counters`]), the TCP
+/// per-host session accounting one link word per link.
 pub struct Nat44HostStorage<'a, const LISTS: usize> {
     pub(crate) links: &'a mut [Nat44HostLink],
     pub(crate) hosts: &'a mut [Nat44HostSlot<LISTS>],
     pub(crate) buckets: &'a mut [DirectoryBucket],
     pub(crate) nodes: &'a mut [DirectoryNode],
+    pub(crate) words: &'a mut [u32],
+    pub(crate) counters: &'a mut [Nat44HostCounter],
 }
 
 impl<'a, const LISTS: usize> Nat44HostStorage<'a, LISTS> {
@@ -153,7 +206,23 @@ impl<'a, const LISTS: usize> Nat44HostStorage<'a, LISTS> {
             hosts,
             buckets,
             nodes,
+            words: &mut [],
+            counters: &mut [],
         }
+    }
+
+    /// This storage with one data word per link (N6).
+    #[must_use]
+    pub fn with_link_words(mut self, words: &'a mut [u32]) -> Self {
+        self.words = words;
+        self
+    }
+
+    /// This storage with one peer counter per host slot (N6).
+    #[must_use]
+    pub fn with_host_counters(mut self, counters: &'a mut [Nat44HostCounter]) -> Self {
+        self.counters = counters;
+        self
     }
 
     /// No per-host accounting: a runtime whose per-host limit is `0`.
@@ -164,8 +233,38 @@ impl<'a, const LISTS: usize> Nat44HostStorage<'a, LISTS> {
             hosts: &mut [],
             buckets: &mut [],
             nodes: &mut [],
+            words: &mut [],
+            counters: &mut [],
         }
     }
+}
+
+/// Which optional arrays a runtime's host table needs (N6).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HostTableKind {
+    /// Lists only (TCP mappings, N3).
+    Lists,
+    /// Link words (TCP sessions, N6).
+    Words,
+    /// Link words that count members, and host counters (UDP and ICMP
+    /// query mappings, N3 and N6).
+    Members,
+}
+
+/// What a full validation expects of one counted slot; see
+/// [`HostTable::validate`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HostExpectation {
+    pub(crate) address: Ipv4Address,
+    pub(crate) list: usize,
+    /// Expiry order key: nondecreasing along each list.
+    pub(crate) order: u64,
+    /// Member-counting tables: the slot's link word while its members count
+    /// (`None`: not checked).
+    pub(crate) members: Option<u32>,
+    /// Member-counting tables: whether its members must count (`Some(true)`)
+    /// or must not (`Some(false)`); `None`: either.
+    pub(crate) counted: Option<bool>,
 }
 
 /// How a new mapping's internal address gets its host slot.
@@ -207,6 +306,10 @@ pub(crate) struct HostTable<'a, const LISTS: usize> {
     next_fresh: usize,
     /// Allocated host slots with no counted mapping, oldest first.
     empty: SlotList,
+    /// One data word per link (N6), or empty.
+    words: &'a mut [u32],
+    /// One peer counter per host slot (member-counting mode, N6), or empty.
+    counters: &'a mut [Nat44HostCounter],
     #[cfg(test)]
     lookup_probes: std::cell::Cell<usize>,
     /// Keyed lookups made (tests: none without accounting).
@@ -217,21 +320,34 @@ pub(crate) struct HostTable<'a, const LISTS: usize> {
 impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
     /// Checks the caller-backed dimensions: no storage at all, or one link,
     /// one host slot, and one directory node per mapping slot and a valid
-    /// directory.
+    /// directory, with exactly the optional arrays `kind` needs.
     pub(crate) fn validate_config(
         storage: &Nat44HostStorage<'_, LISTS>,
         mappings: usize,
+        kind: HostTableKind,
     ) -> Result<(), HostTableCorrupt> {
         let lengths = [
             storage.links.len(),
             storage.hosts.len(),
             storage.buckets.len(),
             storage.nodes.len(),
+            storage.words.len(),
+            storage.counters.len(),
         ];
-        if lengths == [0; 4] {
+        if lengths == [0; 6] {
             return Ok(());
         }
-        if lengths[0] != mappings || lengths[1] != mappings || lengths[3] != mappings {
+        let (words, counters) = match kind {
+            HostTableKind::Lists => (0, 0),
+            HostTableKind::Words => (mappings, 0),
+            HostTableKind::Members => (mappings, mappings),
+        };
+        if lengths[0] != mappings
+            || lengths[1] != mappings
+            || lengths[3] != mappings
+            || lengths[4] != words
+            || lengths[5] != counters
+        {
             return Err(HostTableCorrupt);
         }
         FixedDirectory::validate_config(lengths[2], lengths[3]).map_err(|_| HostTableCorrupt)
@@ -246,6 +362,8 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
             .map_err(|_| HostTableCorrupt)?;
         storage.links.fill(Nat44HostLink::EMPTY);
         storage.hosts.fill(Nat44HostSlot::EMPTY);
+        storage.words.fill(0);
+        storage.counters.fill(Nat44HostCounter::EMPTY);
         Ok(Self {
             links: storage.links,
             hosts: storage.hosts,
@@ -253,6 +371,8 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
             domain,
             next_fresh: 0,
             empty: SlotList::EMPTY,
+            words: storage.words,
+            counters: storage.counters,
             #[cfg(test)]
             lookup_probes: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -269,6 +389,8 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
     pub(crate) fn clear_with_key(&mut self, key: DirectoryHashKey) {
         self.links.fill(Nat44HostLink::EMPTY);
         self.hosts.fill(Nat44HostSlot::EMPTY);
+        self.words.fill(0);
+        self.counters.fill(Nat44HostCounter::EMPTY);
         self.directory.clear_with_key(key);
         self.next_fresh = 0;
         self.empty = SlotList::EMPTY;
@@ -326,6 +448,92 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
         self.hosts[host].count()
     }
 
+    /// Whether this is a member-counting table (N6).
+    fn counts_members(&self) -> bool {
+        !self.counters.is_empty()
+    }
+
+    /// Member-counting tables (N6): the members counted toward host slot
+    /// `host` (O(1)).
+    pub(crate) fn members(&self, host: usize) -> usize {
+        self.counters
+            .get(host)
+            .map_or(0, |counter| counter.members as usize)
+    }
+
+    /// Member-counting tables (N6): the first mapping of host slot `host`
+    /// whose members count, its least recently appended one (O(1)).
+    pub(crate) fn cursor(&self, host: usize) -> Option<usize> {
+        let cursor = self.counters.get(host)?.cursor;
+        (cursor != LINK_NONE).then_some(cursor as usize)
+    }
+
+    /// The data word of slot `index`'s link (`0` while it does not count,
+    /// or without link words).
+    pub(crate) fn word(&self, index: usize) -> u32 {
+        self.words.get(index).copied().unwrap_or(0)
+    }
+
+    /// Tables with link words that do not count members (N6): sets the word
+    /// of the counted slot `index` (no-op for one that does not count).
+    pub(crate) fn set_word(&mut self, index: usize, word: u32) {
+        debug_assert!(!self.counts_members());
+        if self.mapping_host(index).is_some() {
+            if let Some(slot) = self.words.get_mut(index) {
+                *slot = word;
+            }
+        }
+    }
+
+    /// Member-counting tables (N6): one more member of counted mapping
+    /// `index`, which must be at or after its host's cursor (no-op without
+    /// counters or for a mapping that does not count). O(1).
+    pub(crate) fn add_member(&mut self, index: usize) {
+        let Some(host) = self.mapping_host(index) else {
+            return;
+        };
+        if !self.counts_members() {
+            return;
+        }
+        self.words[index] = self.words[index].saturating_add(1);
+        let counter = &mut self.counters[host];
+        counter.members = counter.members.saturating_add(1);
+    }
+
+    /// Member-counting tables (N6): the members of the host's cursor
+    /// mapping `index` stop counting and the cursor moves to the next
+    /// mapping on the list; the list order is unchanged, so the uncounted
+    /// prefix grows by one. A mapping before the cursor (already
+    /// uncounted) is left as it is. O(1).
+    pub(crate) fn uncount(&mut self, index: usize) {
+        let Some(host) = self.mapping_host(index) else {
+            return;
+        };
+        if self.cursor(host) != Some(index) {
+            debug_assert!(self.word(index) == 0);
+            return;
+        }
+        let next = self.links[index].links.next_link();
+        let counter = &mut self.counters[host];
+        counter.members = counter.members.saturating_sub(self.words[index]);
+        counter.cursor = next;
+        self.words[index] = 0;
+    }
+
+    /// Member-counting tables: the cursor of `host` after its mapping
+    /// `index` leaves its place (detached, or moved to the tail).
+    fn advance_cursor_past(&mut self, host: usize, index: usize, moved_to_tail: bool) {
+        if !self.counts_members() || self.counters[host].cursor as usize != index {
+            return;
+        }
+        let next = self.links[index].links.next_link();
+        self.counters[host].cursor = if next == LINK_NONE && moved_to_tail {
+            encode(index).unwrap_or(LINK_NONE)
+        } else {
+            next
+        };
+    }
+
     /// Head of list `list` of host slot `host`: of the host's mappings on
     /// that list, the one that expires first.
     pub(crate) fn head(&self, host: usize, list: usize) -> Option<usize> {
@@ -338,8 +546,13 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
         (tag != LINK_NONE).then_some(tag as usize / LISTS)
     }
 
-    /// The host list mapping `index` is on, if it counts (validation).
+    /// The internal address of allocated host slot `host` (validation).
     #[cfg(test)]
+    pub(crate) fn address(&self, host: usize) -> Ipv4Address {
+        self.hosts[host].address
+    }
+
+    /// The host list mapping `index` is on, if it counts.
     pub(crate) fn mapping_list(&self, index: usize) -> Option<usize> {
         let tag = self.links.get(index)?.tag;
         (tag != LINK_NONE).then_some(tag as usize % LISTS)
@@ -449,6 +662,14 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
             return;
         }
         let (host, list) = (link.tag as usize / LISTS, link.tag as usize % LISTS);
+        if self.counts_members() {
+            let counter = &mut self.counters[host];
+            counter.members = counter.members.saturating_sub(self.words[index]);
+            self.advance_cursor_past(host, index, false);
+        }
+        if let Some(word) = self.words.get_mut(index) {
+            *word = 0;
+        }
         self.hosts[host].mappings[list].unlink(self.links, index);
         self.links[index].tag = LINK_NONE;
         if self.hosts[host].count() == 0 {
@@ -485,6 +706,9 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
                     address,
                     ..Nat44HostSlot::EMPTY
                 };
+                if let Some(counter) = self.counters.get_mut(host) {
+                    *counter = Nat44HostCounter::EMPTY;
+                }
                 // Allocated with no mapping: on the empty list until the
                 // mapping below takes it off.
                 self.empty.push_back(self.hosts, host);
@@ -505,6 +729,13 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
         }
         self.links[index].tag = Self::tag(host, list);
         self.hosts[host].mappings[list].push_back(self.links, index);
+        // A new mapping's members count from the start: appended after
+        // every other mapping, it becomes the cursor only if none counts.
+        if let Some(counter) = self.counters.get_mut(host) {
+            if counter.cursor == LINK_NONE {
+                counter.cursor = encode(index).unwrap_or(LINK_NONE);
+            }
+        }
     }
 
     /// Moves counted mapping `index` to the tail of its host's list `list`
@@ -518,6 +749,7 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
             return;
         }
         let (host, old) = (link.tag as usize / LISTS, link.tag as usize % LISTS);
+        self.advance_cursor_past(host, index, true);
         self.hosts[host].mappings[old].unlink(self.links, index);
         self.links[index].tag = Self::tag(host, list);
         self.hosts[host].mappings[list].push_back(self.links, index);
@@ -533,16 +765,35 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
     /// names of the host slot of its address, each list in nondecreasing
     /// order key; a mapping that does not count is on none; and the empty
     /// list holds exactly the allocated hosts with no counted mapping.
+    /// Link words of slots that do not count are zero. A member-counting
+    /// table's host lists are an uncounted prefix (link word zero, allowed
+    /// by `counted`) then the counted mappings from the cursor on (allowed
+    /// by `counted`, link word as `members` expects), and each host's
+    /// member sum is the sum of its counted link words.
     pub(crate) fn validate(
         &self,
         key: DirectoryHashKey,
         mappings: usize,
-        counted: impl Fn(usize) -> Option<(Ipv4Address, usize, u64)>,
+        counted: impl Fn(usize) -> Option<HostExpectation>,
     ) -> bool {
         if !self.enabled() {
-            return self.links.is_empty() && self.directory.node_capacity() == 0;
+            return self.links.is_empty()
+                && self.directory.node_capacity() == 0
+                && self.words.is_empty()
+                && self.counters.is_empty();
         }
-        if self.links.len() != mappings {
+        if self.links.len() != mappings
+            || !(self.words.is_empty() || self.words.len() == mappings)
+            || !(self.counters.is_empty() || self.counters.len() == self.hosts.len())
+            || (self.counts_members() && self.words.is_empty())
+        {
+            return false;
+        }
+        if self.counters.get(self.next_fresh..).is_some_and(|fresh| {
+            fresh
+                .iter()
+                .any(|counter| *counter != Nat44HostCounter::EMPTY)
+        }) {
             return false;
         }
         let Some(fresh) = self.hosts.get(self.next_fresh..) else {
@@ -572,31 +823,55 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
         }
         let mut listed = 0_usize;
         for (host_index, host) in allocated.iter().enumerate() {
+            let cursor = self.cursor(host_index);
+            let mut members = 0_u64;
             for (list, header) in host.mappings.iter().enumerate() {
                 let mut previous = 0_u64;
+                let mut seen_cursor = false;
                 let consistent = header.validate(self.links, |index| {
                     listed += 1;
-                    let expected = Some((host.address, list));
-                    let Some((address, mapping_list, order)) = counted(index) else {
+                    let Some(expectation) = counted(index) else {
                         return false;
                     };
-                    let ordered = previous <= order;
-                    previous = order;
+                    let ordered = previous <= expectation.order;
+                    previous = expectation.order;
+                    seen_cursor |= cursor == Some(index);
+                    let word = self.word(index);
+                    let members_consistent = if !self.counts_members() {
+                        true
+                    } else if seen_cursor {
+                        members += u64::from(word);
+                        expectation.counted != Some(false)
+                            && expectation.members.is_none_or(|members| members == word)
+                    } else {
+                        expectation.counted != Some(true) && word == 0
+                    };
                     ordered
-                        && Some((address, mapping_list)) == expected
+                        && expectation.address == host.address
+                        && expectation.list == list
                         && self.links[index].tag == Self::tag(host_index, list)
+                        && members_consistent
                 });
-                if !consistent {
+                if !consistent || (self.counts_members() && cursor.is_some() && !seen_cursor) {
                     return false;
                 }
+            }
+            let sum = self
+                .counters
+                .get(host_index)
+                .map_or(0, |counter| counter.members);
+            if u64::from(sum) != members {
+                return false;
             }
         }
         let counted_slots = (0..mappings)
             .filter(|index| counted(*index).is_some())
             .count();
         if listed != counted_slots
-            || (0..mappings)
-                .any(|index| counted(index).is_none() && self.links[index] != Nat44HostLink::EMPTY)
+            || (0..mappings).any(|index| {
+                counted(index).is_none()
+                    && (self.links[index] != Nat44HostLink::EMPTY || self.word(index) != 0)
+            })
         {
             return false;
         }
@@ -621,10 +896,25 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
 pub(crate) fn leaked_host_storage<const LISTS: usize>(
     mappings: usize,
 ) -> Nat44HostStorage<'static, LISTS> {
+    leaked_host_storage_of(mappings, HostTableKind::Lists)
+}
+
+/// Leaked host storage for `mappings` slots with the arrays `kind` needs
+/// (tests).
+#[cfg(test)]
+pub(crate) fn leaked_host_storage_of<const LISTS: usize>(
+    mappings: usize,
+    kind: HostTableKind,
+) -> Nat44HostStorage<'static, LISTS> {
     let buckets = if mappings == 0 {
         0
     } else {
         mappings.next_power_of_two()
+    };
+    let (words, counters) = match kind {
+        HostTableKind::Lists => (0, 0),
+        HostTableKind::Words => (mappings, 0),
+        HostTableKind::Members => (mappings, mappings),
     };
     Nat44HostStorage::new(
         Box::leak(vec![Nat44HostLink::EMPTY; mappings].into_boxed_slice()),
@@ -632,6 +922,10 @@ pub(crate) fn leaked_host_storage<const LISTS: usize>(
         Box::leak(vec![DirectoryBucket::default(); buckets].into_boxed_slice()),
         Box::leak(vec![DirectoryNode::default(); mappings].into_boxed_slice()),
     )
+    .with_link_words(Box::leak(vec![0_u32; words].into_boxed_slice()))
+    .with_host_counters(Box::leak(
+        vec![Nat44HostCounter::EMPTY; counters].into_boxed_slice(),
+    ))
 }
 
 fn encode(index: usize) -> Result<u32, HostTableCorrupt> {

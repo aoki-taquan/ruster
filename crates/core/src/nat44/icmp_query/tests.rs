@@ -148,7 +148,7 @@ fn policy_enforces_the_rfc5508_floor_and_refuses_port_dependent_filtering() {
         format!("{tuned:?}"),
         "Nat44IcmpPolicy { idle_ttl_ms: 60000, allocator_seed: [REDACTED], \
          icmpv4_errors: ExternalOnly, filtering: EndpointIndependent, \
-         identifier_preservation: false, mappings_per_host: 3 }"
+         identifier_preservation: false, mappings_per_host: 3, peers_per_host: 0 }"
     );
     assert_eq!(format!("{:?}", key()), "Nat44IcmpHashKey([REDACTED])");
     assert_eq!(

@@ -278,6 +278,18 @@ pub enum DropReason {
     /// An ICMP Echo/Timestamp reply without a firewall flow matched an
     /// allow-stateful rule: only a request opens an ICMP flow (N5).
     FirewallIcmpReplyWithoutRequest = 178,
+    /// A new UDP filter peer (or the new mapping that would carry it) for an internal address
+    /// that already holds the per-host limit of peers on live mappings (N6, RFC 6888 REQ-5).
+    /// Nothing was created or evicted.
+    Nat44UdpHostPeerQuotaExceeded = 179,
+    /// A new host-initiated TCP session (or the new mapping that would carry it) for an
+    /// internal address that already holds the per-host limit of sessions it keeps alive (N6,
+    /// RFC 6888 REQ-5). Nothing was created or evicted.
+    Nat44TcpHostSessionQuotaExceeded = 180,
+    /// A new ICMP query filter peer (or the new query mapping that would carry it) for an
+    /// internal address that already holds the per-host limit of peers on live query mappings
+    /// (N6). Nothing was created or evicted.
+    Nat44IcmpHostPeerQuotaExceeded = 181,
 }
 
 use DropReason::*;
@@ -285,7 +297,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 178] = [
+    pub const ALL: [Self; 181] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -464,6 +476,9 @@ impl DropReason {
         Nat44IcmpWrongEgress,
         FirewallIcmpQueryInvalid,
         FirewallIcmpReplyWithoutRequest,
+        Nat44UdpHostPeerQuotaExceeded,
+        Nat44TcpHostSessionQuotaExceeded,
+        Nat44IcmpHostPeerQuotaExceeded,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -659,6 +674,9 @@ impl DropReason {
             Nat44IcmpWrongEgress => "NAT44_ICMP_WRONG_EGRESS",
             FirewallIcmpQueryInvalid => "FIREWALL_ICMP_QUERY_INVALID",
             FirewallIcmpReplyWithoutRequest => "FIREWALL_ICMP_REPLY_WITHOUT_REQUEST",
+            Nat44UdpHostPeerQuotaExceeded => "NAT44_UDP_HOST_PEER_QUOTA_EXCEEDED",
+            Nat44TcpHostSessionQuotaExceeded => "NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED",
+            Nat44IcmpHostPeerQuotaExceeded => "NAT44_ICMP_HOST_PEER_QUOTA_EXCEEDED",
         }
     }
 }
@@ -3648,6 +3666,7 @@ fn nat44_udp_icmpv4_lookup_reason(error: Nat44UdpPlanError) -> DropReason {
         | Nat44UdpPlanError::PeerFull
         | Nat44UdpPlanError::PortExhausted
         | Nat44UdpPlanError::HostQuotaExceeded
+        | Nat44UdpPlanError::HostPeerQuotaExceeded
         | Nat44UdpPlanError::GenerationExhausted
         | Nat44UdpPlanError::StateRevisionExhausted => {
             unreachable!("read-only ICMP lookup cannot exhaust state")
@@ -3666,7 +3685,8 @@ fn nat44_tcp_icmpv4_lookup_reason(error: Nat44TcpPlanError) -> DropReason {
         | Nat44TcpPlanError::SessionFull
         | Nat44TcpPlanError::PortExhausted
         | Nat44TcpPlanError::InboundRemoteQuotaExceeded
-        | Nat44TcpPlanError::HostQuotaExceeded => {
+        | Nat44TcpPlanError::HostQuotaExceeded
+        | Nat44TcpPlanError::HostSessionQuotaExceeded => {
             unreachable!("read-only ICMP lookup cannot create state")
         }
         Nat44TcpPlanError::IndexCorrupt
@@ -5697,6 +5717,10 @@ fn nat44_udp_plan_error(error: Nat44UdpPlanError) -> (DropReason, Nat44UdpDispos
             Nat44UdpHostQuotaExceeded,
             Nat44UdpDisposition::HostQuotaExceeded,
         ),
+        Nat44UdpPlanError::HostPeerQuotaExceeded => (
+            Nat44UdpHostPeerQuotaExceeded,
+            Nat44UdpDisposition::HostPeerQuotaExceeded,
+        ),
         Nat44UdpPlanError::ClockRegression => (
             Nat44UdpClockRegression,
             Nat44UdpDisposition::ClockRegression,
@@ -5832,6 +5856,10 @@ fn nat44_tcp_plan_error(error: Nat44TcpPlanError) -> (DropReason, Nat44TcpDispos
         Nat44TcpPlanError::HostQuotaExceeded => (
             Nat44TcpHostQuotaExceeded,
             Nat44TcpDisposition::HostQuotaExceeded,
+        ),
+        Nat44TcpPlanError::HostSessionQuotaExceeded => (
+            Nat44TcpHostSessionQuotaExceeded,
+            Nat44TcpDisposition::HostSessionQuotaExceeded,
         ),
         Nat44TcpPlanError::IndexCorrupt
         | Nat44TcpPlanError::GenerationExhausted
@@ -7632,6 +7660,9 @@ mod tests {
             (176, "NAT44_ICMP_WRONG_EGRESS"),
             (177, "FIREWALL_ICMP_QUERY_INVALID"),
             (178, "FIREWALL_ICMP_REPLY_WITHOUT_REQUEST"),
+            (179, "NAT44_UDP_HOST_PEER_QUOTA_EXCEEDED"),
+            (180, "NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED"),
+            (181, "NAT44_ICMP_HOST_PEER_QUOTA_EXCEEDED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -7641,7 +7672,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(179), None);
+        assert_eq!(DropReason::from_code(182), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

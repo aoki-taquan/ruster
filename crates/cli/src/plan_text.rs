@@ -198,19 +198,25 @@ fn nat(lines: &mut Vec<String>, kind: &str, change: NatChange) {
             switch(new)
         ));
     }
-    if let Some(Delta { old, new }) = change.mappings_per_host {
-        let limit = |limit: u16| {
-            if limit == 0 {
-                "unlimited".to_owned()
-            } else {
-                limit.to_string()
-            }
-        };
-        lines.push(format!(
-            "{kind} mappings-per-host ~ {} -> {}",
-            limit(old),
-            limit(new)
-        ));
+    let host_limit = |limit: u16| {
+        if limit == 0 {
+            "unlimited".to_owned()
+        } else {
+            limit.to_string()
+        }
+    };
+    for (name, delta) in [
+        ("mappings-per-host", change.mappings_per_host),
+        ("peers-per-host", change.peers_per_host),
+        ("sessions-per-host", change.sessions_per_host),
+    ] {
+        if let Some(Delta { old, new }) = delta {
+            lines.push(format!(
+                "{kind} {name} ~ {} -> {}",
+                host_limit(old),
+                host_limit(new)
+            ));
+        }
     }
     if let Some(Delta { old, new }) = change.inbound_sessions_per_remote {
         let limit = |limit: u8| {

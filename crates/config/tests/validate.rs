@@ -267,6 +267,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 port_owners: 8,
                 unsolicited_syn_holds: 7,
                 hosts: 0,
+                session_hosts: 0,
             }),
             nat44_icmp: None,
             firewall_states: Some(6),
@@ -1164,8 +1165,10 @@ fn nat44_mappings_per_host_maps_onto_core_and_sizes_host_storage() {
     );
     assert_eq!((udp_shape.hosts, tcp_shape.hosts), (3, 3));
     // UDP and TCP: 3 mapping slots, a 4-bucket mapping directory.
+    // UDP also has a link word and a peer counter per slot (N6).
     let host_bytes = 3 * (2 * size_of::<Nat44HostLink>() + 2 * size_of::<DirectoryNode>())
         + 3 * (size_of::<Nat44UdpHostSlot>() + size_of::<Nat44TcpHostSlot>())
+        + 3 * (size_of::<u32>() + size_of::<ruster_core::Nat44HostCounter>())
         + 2 * 4 * size_of::<DirectoryBucket>();
     assert_eq!(
         limited_shape.required_bytes,
