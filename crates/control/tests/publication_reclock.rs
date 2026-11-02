@@ -280,4 +280,33 @@ fn a_slow_publication_tick_stamps_its_rx_with_the_post_publication_reading() {
             deadline_ms: 2_000 + HOLD,
         }]
     );
+
+    // A rejected candidate (a generation already served) still did work in
+    // the publication phase: one more reading, and the old generation's
+    // RX runs from it.
+    trace.0.clear();
+    io.inject(WAN, wan_syn(4_000));
+    let report = run_tick_reclocked(
+        &mut active,
+        Some(candidate(3)),
+        &mut io,
+        MonotonicMillis(3_000),
+        clock(3_040),
+        BUDGETS,
+        &mut trace,
+    );
+    assert!(
+        matches!(report.publication, PublicationOutcome::Rejected(_)),
+        "{:?}",
+        report.publication
+    );
+    assert_eq!(active.generation().get(), 3);
+    assert_eq!(
+        trace.0,
+        [Nat44TcpUnsolicitedSynDisposition::Held {
+            public_port: 40_003,
+            deadline_ms: 3_040 + HOLD,
+        }]
+    );
+    assert_eq!(reads.get(), 3);
 }

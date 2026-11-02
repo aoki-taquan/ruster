@@ -99,11 +99,22 @@ struct State {
     inject_at: RefCell<VecDeque<(u32, IfId, Vec<u8>)>>,
     io_calls: Cell<u32>,
     /// `set_clock` calls, the last reading handed over, and whether any
-    /// call went backwards or came after its tick's `io()` call (no
-    /// allocation: the tick allocation test runs through it).
+    /// call went backwards or a tick's `io()` call had no reading before
+    /// it (no allocation: the tick allocation test runs through it).
     clock_sets: Cell<u32>,
     last_clock: Cell<u64>,
     clock_out_of_order: Cell<bool>,
+    /// Microseconds that hooks added to a [`FakeClock`] bound to this
+    /// state (slow work between two readings), and its latest reading in
+    /// microseconds.
+    clock_extra_us: Cell<u64>,
+    clock_seen_us: Cell<u64>,
+    /// Injected, with [`Self::slow_us`] added to the clock, when a
+    /// quiescence probe succeeds (the tick that publishes a pending
+    /// reload); [`Self::hook_mark_ms`] records the clock (ms) then.
+    frame_on_quiesce: RefCell<Option<(IfId, Vec<u8>)>>,
+    slow_us: Cell<u64>,
+    hook_mark_ms: Cell<Option<u64>>,
     /// Health sample rounds handed out by `sample_ports`, one per call.
     samples: RefCell<VecDeque<Vec<PortSample>>>,
     /// Link query results, consumed in order by the matching port (shared
@@ -144,6 +155,15 @@ struct Lockdown {
 impl State {
     fn push(&self, event: Event) {
         self.events.borrow_mut().push(event);
+    }
+
+    /// Marks the clock (ms) now and adds [`Self::slow_us`] to it: slow
+    /// work between this reading and the next.
+    fn slow_down(&self) {
+        self.hook_mark_ms
+            .set(Some(self.clock_seen_us.get() / 1_000));
+        self.clock_extra_us
+            .set(self.clock_extra_us.get() + self.slow_us.get());
     }
 }
 
@@ -310,7 +330,7 @@ impl Datapath for FakeDatapath<'_> {
     fn set_clock(&mut self, now: MonotonicMillis) {
         let state = &self.state;
         let sets = state.clock_sets.get();
-        if (sets != 0 && now.0 <= state.last_clock.get()) || state.io_calls.get() != sets {
+        if (sets != 0 && now.0 < state.last_clock.get()) || sets < state.io_calls.get() {
             state.clock_out_of_order.set(true);
         }
         state.clock_sets.set(sets + 1);
@@ -340,7 +360,13 @@ impl Datapath for FakeDatapath<'_> {
         while self.io.pop_recycled().is_some() {}
         while self.io.pop_generated_recycled().is_some() {}
         match self.io.try_publication_quiescence() {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                if let Some((ingress, frame)) = self.state.frame_on_quiesce.borrow_mut().take() {
+                    self.io.inject(ingress, frame);
+                    self.state.slow_down();
+                }
+                Ok(())
+            }
             Err(error) => Err(SimIo::quiescence_error_disposition(&error)),
         }
     }
@@ -753,18 +779,25 @@ fn execute_with<S: StopSignal, O: std::io::Write, E: std::io::Write>(
     )
 }
 
-/// Microsecond clock advanced by `step_us` per reading and by every pause.
+/// Microsecond clock advanced by `step_us` per reading and by every pause
+/// (and, when bound to a [`State`], by its hooks).
 #[derive(Default)]
 struct FakeClock {
     micros: u64,
     step_us: u64,
     pauses: u32,
     longest: Duration,
+    state: Option<Rc<State>>,
 }
 
 impl Clock for FakeClock {
     fn now(&mut self) -> MonotonicMillis {
-        let now = MonotonicMillis(self.micros / 1_000);
+        let mut micros = self.micros;
+        if let Some(state) = &self.state {
+            micros += state.clock_extra_us.get();
+            state.clock_seen_us.set(micros);
+        }
+        let now = MonotonicMillis(micros / 1_000);
         self.micros += self.step_us;
         now
     }
@@ -935,7 +968,8 @@ fn startup_runs_in_ifid_order_and_shutdown_closes_in_reverse() {
     }
     // The loop hands each iteration's clock reading to the datapath
     // before that iteration's I/O (the adapter's link-down kick retry
-    // rate limit runs on it), once per tick, never going backwards.
+    // rate limit runs on it), never going backwards; an idle tick reads
+    // the clock once.
     assert_eq!(host.state.clock_sets.get(), 3);
     assert!(!host.state.clock_out_of_order.get());
     assert!(outcome.out.ends_with("end\n"));
@@ -2208,3 +2242,6 @@ mod ops;
 
 #[path = "async_tests.rs"]
 mod asynchronous;
+
+#[path = "reclock_tests.rs"]
+mod reclock;

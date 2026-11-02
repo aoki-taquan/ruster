@@ -1229,7 +1229,12 @@ echo "priv_run_icmp: generated_icmpv4.tx_accepted=$accepted, if1 generated commi
 # delay is measured from the latest send-side reading (after sendto
 # returned, when the router has surely been handed the SYN), so it never
 # overstates the hold; the router keeps a 2 ms clock margin
-# (NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS) on top of the 6 s.
+# (NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS) on top of the 6 s. Residual
+# risk on a heavily loaded host: if the router took the SYN from its RX ring
+# while this process was still descheduled inside sendto, a correct router
+# can be measured a little under 6 s here. The error is in the safe
+# direction (the check only ever fails, never passes, wrongly); a failure
+# also prints the delay from before the send for the diagnosis.
 UNSOLICITED_SYN='
 import os, socket, struct, sys, time
 
@@ -1283,7 +1288,7 @@ if mode == "absent":
 check(len(answers) == 1, "%d answers within %s s" % (len(answers), sys.argv[4]))
 delay, pkt, icmp, quote, qihl = answers[0]
 ihl = (pkt[0] & 15) * 4
-check(delay >= 6.0, "answered %.4f s after sendto returned, before the 6 s hold" % delay)
+check(delay >= 6.0, "answered %.4f s after sendto returned (%.4f s after the send started), before the 6 s hold" % (delay, delay + (sent - before)))
 check((icmp[0], icmp[1]) == (3, 3), "type/code %d/%d" % (icmp[0], icmp[1]))
 check(pkt[12:16] == router and pkt[16:20] == me, "outer addresses")
 check(pkt[9] == 1 and fold(pkt[:ihl]) == 0xFFFF, "outer protocol or header checksum")

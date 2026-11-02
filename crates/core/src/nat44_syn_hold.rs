@@ -59,17 +59,22 @@ pub const NAT44_TCP_UNSOLICITED_SYN_HOLD_MS: u64 = 6_000;
 ///   recorded as `n`.
 /// - **Reading-to-RX gap**, bounded by 1 ms: a frame that lands in the
 ///   ring between the reading and the RX phase is received with the
-///   earlier reading. `ruster run` reads the clock at the top of each loop
-///   iteration; until RX it only does non-blocking work (handing the
-///   clock to the backend, `try_recv` of the reload worker, the reload
-///   quiescence probe, and the publication phase's steady disposition
-///   check), microseconds. A tick that publishes a reload candidate,
-///   whose apply has no such bound, reads the clock again after the
-///   publication phase and before RX (`ruster_runtime::run_tick_reclocked`),
-///   so the apply time never widens the gap. An idle pause (at most 1 ms)
-///   runs after the tick, before the next reading, so a frame that arrives
-///   while the loop sleeps is stamped later than its arrival, never
-///   earlier.
+///   earlier reading. `ruster run` keeps that gap free of slow work with
+///   one rule: the reading RX uses is taken after the last step that can
+///   block or take long. An idle iteration (no reload in flight, none
+///   requested) reads the clock once at the top and, until RX, only hands
+///   it to the backend, polls the signal flag and the reload worker
+///   without blocking, and runs the publication phase's steady disposition
+///   check: microseconds. An iteration that requested a reload or had one
+///   in flight (where the worker's answer, the live dry run, a warning, an
+///   abandon, and stderr writes happen) reads the clock again right
+///   before the tick. A tick that publishes a candidate (applied,
+///   rejected, or deferred), whose apply has no time bound, reads it again
+///   after the publication phase and before RX
+///   (`ruster_runtime::run_tick_reclocked`). Every extra reading only
+///   moves the tick clock forward. An idle pause (at most 1 ms) runs after
+///   the tick, before the next reading, so a frame that arrives while the
+///   loop sleeps is stamped later than its arrival, never earlier.
 ///
 /// 1 ms + 1 ms = 2 ms. A later deadline only delays the ICMP (REQ-4 sets
 /// a minimum, not a maximum).

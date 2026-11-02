@@ -400,10 +400,16 @@ where
         if stop.stop() {
             return LoopEnd::Signal;
         }
-        let now = clock.now();
+        let mut now = clock.now();
         datapath.set_clock(now);
         let generation = active.generation();
+        // Whether the work before this tick's RX may have taken a while: a
+        // reload in flight (the worker's answer and the live dry run, a
+        // warning, an abandon, each possibly writing to stderr) or a new
+        // request (which writes). Only idle ticks skip it.
+        let mut cold = control.reloader.busy();
         if !control.reloader.busy() && stop.take_reload() {
+            cold = true;
             let _ = writeln!(
                 err,
                 "ruster run: reload requested (generation {generation})"
@@ -448,11 +454,16 @@ where
             }
         }
         let reloading = candidate.is_some();
-        // A tick that publishes a candidate reads the clock again after
-        // the publication phase, before RX (`run_tick_reclocked`): applying
-        // a successor can take longer than a millisecond, and a frame that
-        // arrives meanwhile must not be stamped with the earlier reading.
-        // Steady ticks read the clock once.
+        // RX must not be stamped with a reading taken before slow work:
+        // after cold pre-tick work, read the clock again right before the
+        // tick; a tick that publishes a candidate reads it again after the
+        // publication phase, before RX (`run_tick_reclocked`), since
+        // applying a successor has no time bound. Idle ticks read the
+        // clock once. Both readings only move `now` forward.
+        if cold && !reloading {
+            now = MonotonicMillis(now.0.max(clock.now().0));
+            datapath.set_clock(now);
+        }
         let mut reclocked = now;
         let report = run_tick_reclocked(
             active,
@@ -467,6 +478,10 @@ where
             observer,
         );
         let now = MonotonicMillis(now.0.max(reclocked.0));
+        if reloading {
+            // The backend paces its kick retries on the latest reading.
+            datapath.set_clock(now);
+        }
         let generation = active.generation();
         observer.observe_tick(now, Some(generation), &report);
         if reloading {
