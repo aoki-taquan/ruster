@@ -1782,8 +1782,8 @@ fn the_maximal_production_config_starts() {
 }
 
 /// H3: one slot above its production limit, for every table (4096 for the
-/// scanned resolution and ICMPv4 error tables, 65536 for NAT44 and the
-/// firewall), is refused by the loader of `ruster run` (startup and
+/// quote tables, resolution failure holds and ICMPv4 error actions, 65536
+/// for every other table), is refused by the loader of `ruster run` (startup and
 /// reload) with exit 2 and a value-free code and schema path, before any
 /// resource, also where the simulator's limits would accept it.
 #[test]

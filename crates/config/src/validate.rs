@@ -32,10 +32,12 @@ pub struct ValidationLimits {
     /// Largest slot count of any one runtime table, directory bucket array,
     /// or NAT44 port owner table (`CAPACITY_LIMIT_EXCEEDED`).
     pub max_slots_per_table: u32,
-    /// Largest slot count of a table that a per-packet path scans linearly
-    /// (`CAPACITY_LIMIT_EXCEEDED`; also bounded by `max_slots_per_table`):
-    /// `resolution.capacity.*` and `icmpv4-errors.capacity.*`.
-    pub max_scanned_slots_per_table: u32,
+    /// Largest slot count of a table whose every slot carries a quoted
+    /// original IPv4 datagram (up to 548 bytes; `CAPACITY_LIMIT_EXCEEDED`;
+    /// also bounded by `max_slots_per_table`):
+    /// `resolution.capacity.failure-holds` and
+    /// `icmpv4-errors.capacity.actions`.
+    pub max_quote_slots_per_table: u32,
     /// Largest preallocated runtime storage in bytes, summed over every
     /// table (`RUNTIME_STORAGE_BYTES_EXCEEDED`).
     pub max_runtime_bytes: usize,
@@ -45,33 +47,34 @@ pub struct ValidationLimits {
 /// validate`/`plan` of a document whose `backend.kind` is `af-xdp`).
 /// Coordinator defaults, not owner decisions (H3).
 ///
-/// - `max_scanned_slots_per_table` = 4096 (2^12) for the resolution
-///   tables (states, actions, dynamic neighbors, failure holds) and the
-///   ICMPv4 error tables (states, actions). Their per-packet paths scan
-///   the whole table on a miss: a dynamic-neighbor miss reads every
-///   dynamic-neighbor slot (24 bytes each: 96 KiB at 4096, 1.5 MiB at
-///   65536), resolution scheduling scans the states (56 bytes: 224 KiB vs
-///   3.5 MiB) and walks the failure holds, an ICMPv4 error scans its states
-///   (keyed by egress interface, so more than [`crate::MAX_INTERFACES`] are
-///   never used). 4096 equals [`crate::MAX_NEIGHBORS`] (a /20 of on-link
-///   hosts) and cuts the worst case per miss 16-fold. The action queues
-///   are O(1) per packet but each queued action comes from a state (an
-///   ICMPv4 state queues at most one), so they get the same bound. Raising
-///   it needs keyed indexes for these tables (H4b).
-/// - `max_slots_per_table` = 2^16 for the NAT44 and firewall tables (home
-///   NAT needs many sessions). NAT44 finds a reusable mapping, peer, or
-///   session and a free public port in O(1) (activity-ordered slot lists
-///   and a free-port bitmap, H4a); the firewall probe is keyed SipHash
-///   with occupancy capped near 75%, so only its amortized expiry sweep is
-///   linear. 2^16 also equals the largest NAT44 port pool (1..=65535).
+/// - `max_slots_per_table` = 2^16 for every table that is not a quote
+///   table: the resolution states, actions, and dynamic neighbors, the
+///   ICMPv4 error states, and the NAT44 and firewall tables. No per-packet
+///   path scans any of them. Resolution states, dynamic neighbors, and
+///   failure holds are found through keyed chains of at most
+///   [`ruster_core::RESOLUTION_INDEX_CHAIN_LIMIT`] slots, and a free or
+///   reusable slot through a bitmap (H4b). The ICMPv4 error states are
+///   searched only up to the occupied prefix, at most one state per egress
+///   interface in use ([`crate::MAX_INTERFACES`]). NAT44 finds a reusable
+///   mapping, peer, or session and a free public port in O(1)
+///   (activity-ordered slot lists and a free-port bitmap, H4a). The
+///   firewall probe is keyed SipHash with occupancy capped near 75%, so
+///   only its amortized expiry sweep is linear. Home NAT needs many
+///   sessions, and 2^16 also equals the largest NAT44 port pool
+///   (1..=65535).
+/// - `max_quote_slots_per_table` = 4096 (2^12) for the two tables whose
+///   slots each hold a quoted datagram: resolution failure holds (648
+///   bytes per slot) and ICMPv4 error actions (584 bytes). The bound is
+///   memory, not cost: at 2^16 these two tables alone would need 80 MiB.
+///   4096 equals [`crate::MAX_NEIGHBORS`].
 /// - `max_runtime_bytes` = 64 MiB, the simulator's value. Every table at its
-///   limit (with the widest port pool) needs 38813888 bytes (37.02 MiB)
+///   limit (with the widest port pool) needs 53559488 bytes (51.08 MiB)
 ///   with the current slot sizes, so the per-table limits bind and this
 ///   bound only fails closed if a slot type grows. The storage is ordinary
 ///   heap (not memlocked), allocated once at startup.
 pub const PRODUCTION_VALIDATION_LIMITS: ValidationLimits = ValidationLimits {
     max_slots_per_table: 1 << 16,
-    max_scanned_slots_per_table: 1 << 12,
+    max_quote_slots_per_table: 1 << 12,
     max_runtime_bytes: 64 << 20,
 };
 
@@ -1913,13 +1916,18 @@ fn build_storage_shape(
     let resolution = inputs
         .resolution
         .map(|capacity| {
-            for (field, value) in [
-                ("states", capacity.states),
-                ("actions", capacity.actions),
-                ("dynamic-neighbors", capacity.dynamic_neighbors),
-                ("failure-holds", capacity.failure_holds),
+            for (field, value, quote) in [
+                ("states", capacity.states, false),
+                ("actions", capacity.actions, false),
+                ("dynamic-neighbors", capacity.dynamic_neighbors, false),
+                ("failure-holds", capacity.failure_holds, true),
             ] {
-                check_scanned_slots(value, limits, path(&["resolution", "capacity", field]))?;
+                let path = path(&["resolution", "capacity", field]);
+                if quote {
+                    check_quote_slots(value, limits, path)?;
+                } else {
+                    check_slots(value, limits, path)?;
+                }
             }
             add_bytes::<ResolutionStateSlot>(
                 &mut bytes,
@@ -1952,9 +1960,16 @@ fn build_storage_shape(
     let icmpv4_errors = inputs
         .icmp
         .map(|capacity| {
-            for (field, value) in [("states", capacity.states), ("actions", capacity.actions)] {
-                check_scanned_slots(value, limits, path(&["icmpv4-errors", "capacity", field]))?;
-            }
+            check_slots(
+                capacity.states,
+                limits,
+                path(&["icmpv4-errors", "capacity", "states"]),
+            )?;
+            check_quote_slots(
+                capacity.actions,
+                limits,
+                path(&["icmpv4-errors", "capacity", "actions"]),
+            )?;
             add_bytes::<Icmpv4ErrorStateSlot>(
                 &mut bytes,
                 capacity.states,
@@ -2121,18 +2136,18 @@ fn check_slots(
         .map_err(|_| ValidationError::new(ValidationCode::CapacityNotRepresentable, path))
 }
 
-/// [`check_slots`], then the bound of a table a per-packet path scans.
-fn check_scanned_slots(
+/// [`check_slots`], then the bound of a table whose slots hold a quote.
+fn check_quote_slots(
     slots: u32,
     limits: ValidationLimits,
     path: SourcePath,
 ) -> Result<(), ValidationError> {
     check_slots(slots, limits, path.clone())?;
-    if slots > limits.max_scanned_slots_per_table {
+    if slots > limits.max_quote_slots_per_table {
         return Err(ValidationError::bounded(
             ValidationCode::CapacityLimitExceeded,
             path,
-            u64::from(limits.max_scanned_slots_per_table),
+            u64::from(limits.max_quote_slots_per_table),
             u64::from(slots),
         ));
     }

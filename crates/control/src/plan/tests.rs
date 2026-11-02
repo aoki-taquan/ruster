@@ -779,6 +779,38 @@ fn sequencer_rejects_key_reuse_even_from_a_misbehaving_source() {
     assert_eq!(first.generation().get(), 1);
 }
 
+/// Fresh NAT44 and firewall keys, but the resolution key of generation 1
+/// every time.
+struct ResolutionReplaying;
+
+impl PublicationKeySource for ResolutionReplaying {
+    const KIND: KeySourceKind = KeySourceKind::DeterministicSimulation;
+
+    fn publication_keys(
+        &mut self,
+        generation: NonZeroU64,
+    ) -> Result<PublicationKeys, KeySourceError> {
+        let fresh = SimDeterministicKeySource::new(SEED).publication_keys(generation)?;
+        let first = SimDeterministicKeySource::new(SEED).publication_keys(NonZeroU64::MIN)?;
+        Ok(PublicationKeys::new(
+            fresh.nat44_udp(),
+            fresh.nat44_tcp(),
+            fresh.firewall(),
+            first.resolution(),
+        ))
+    }
+}
+
+#[test]
+fn sequencer_rejects_a_reused_resolution_key() {
+    let mut sequencer = PublicationSequencer::new(ResolutionReplaying);
+    sequencer.candidate(&config(&[])).unwrap();
+    assert_eq!(
+        sequencer.candidate(&config(&[ROUTE_CHANGE])).err(),
+        Some(SequencerError::KeyReused(RuntimeService::Resolution))
+    );
+}
+
 #[test]
 fn plan_and_sequencer_debug_never_show_keys_or_seeds() {
     let mut sequencer = PublicationSequencer::new(SimDeterministicKeySource::new(SEED));

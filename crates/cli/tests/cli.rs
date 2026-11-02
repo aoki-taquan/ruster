@@ -1009,7 +1009,7 @@ fn run_exits_in_bounded_time_with_an_undrained_stdout() {
 
 /// H3: `validate` and `run` apply the production limits to an af-xdp
 /// document: every table at its production limit is accepted; one slot
-/// above (a scanned resolution table at 4097, which the simulator's limits
+/// above (a quote table, the resolution failure holds, at 4097, which the simulator's limits
 /// still accept as a sim document, and a firewall table at 65537) is exit 2
 /// with a value-free code and path from both. `run` of the maximal document
 /// gets past validation and storage allocation to the privilege preflight
@@ -1025,7 +1025,7 @@ fn validate_and_run_apply_the_production_limits_to_af_xdp() {
     let ok = ruster(&["validate".as_ref(), max.as_os_str()]);
     assert_eq!(status(&ok), 0, "{}", text(&ok.stderr));
     assert!(
-        text(&ok.stdout).contains(" storage-bytes=38813888 backend=af-xdp "),
+        text(&ok.stdout).contains(" storage-bytes=53559488 backend=af-xdp "),
         "{}",
         text(&ok.stdout)
     );
@@ -1036,9 +1036,9 @@ fn validate_and_run_apply_the_production_limits_to_af_xdp() {
     };
     for (from, to, path, limit) in [
         (
-            "dynamic-neighbors = 4096\n",
-            "dynamic-neighbors = 4097\n",
-            "resolution.capacity.dynamic-neighbors",
+            "failure-holds = 4096\n",
+            "failure-holds = 4097\n",
+            "resolution.capacity.failure-holds",
             4096,
         ),
         (

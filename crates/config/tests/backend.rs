@@ -17,7 +17,7 @@ use ruster_io_xdp::native_profile::{
 
 const LIMITS: ValidationLimits = ValidationLimits {
     max_slots_per_table: 1 << 16,
-    max_scanned_slots_per_table: 1 << 16,
+    max_quote_slots_per_table: 1 << 16,
     max_runtime_bytes: 1 << 26,
 };
 

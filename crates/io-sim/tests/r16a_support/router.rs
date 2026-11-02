@@ -27,7 +27,7 @@ pub const UDP_VARIANT_DENIED_PORT: u16 = 53;
 
 pub const LIMITS: ValidationLimits = ValidationLimits {
     max_slots_per_table: 1 << 12,
-    max_scanned_slots_per_table: 1 << 12,
+    max_quote_slots_per_table: 1 << 12,
     max_runtime_bytes: 16 << 20,
 };
 

@@ -194,9 +194,9 @@ whole-document storage, which has no path.
 
 | Limit | `run-sim` (and `validate` of `sim`) | `ruster run` (and `validate` of `af-xdp`) | Why |
 |---|---|---|---|
-| scanned tables (`max_scanned_slots_per_table`): `resolution.capacity.{states,actions,dynamic-neighbors,failure-holds}`, `icmpv4-errors.capacity.{states,actions}` | 65536 | 4096 | a miss scans the whole table on the packet path (table below); interim until indexed (H4b, PERF-001) |
-| other tables (`max_slots_per_table`): `nat44.{udp,tcp}.capacity.*`, `firewall.capacity.states`, each NAT44 directory (next power of two), the NAT44 port owner table (pool size) | 65536 | 65536 | home NAT needs many sessions; also the largest port pool (1-65535) |
-| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 36.45 MiB, so the per-table limits bind; the byte limit fails closed only if a slot type grows |
+| quote tables (`max_quote_slots_per_table`): `resolution.capacity.failure-holds`, `icmpv4-errors.capacity.actions` | 65536 | 4096 | each slot holds a quoted datagram (648 and 584 bytes), so the bound is memory: at 65536 these two alone would need 80 MiB. Until H4b this limit (then `max_scanned_slots_per_table`) covered every resolution and ICMPv4 error table because their packet paths scanned |
+| other tables (`max_slots_per_table`): `resolution.capacity.{states,actions,dynamic-neighbors}`, `icmpv4-errors.capacity.states`, `nat44.{udp,tcp}.capacity.*`, `firewall.capacity.states`, each NAT44 directory (next power of two), the NAT44 port owner table (pool size) | 65536 | 65536 | no packet path scans them (table below); home NAT needs many sessions; also the largest port pool (1-65535) |
+| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 51.08 MiB, so the per-table limits bind; the byte limit fails closed only if a slot type grows |
 | config file | 1 MiB | 1 MiB | parse stage, every backend (CONFIG-001) |
 | `[[interfaces]]` / `[[backend.ports]]` | 256 / 256 | 256 / 256 | parse stage |
 | `[[addresses]]` | 1024 | 1024 | parse stage |
@@ -205,26 +205,35 @@ whole-document storage, which has no path.
 
 All production values are coordinator defaults, not owner decisions.
 
-**Per-packet cost.** The resolution and ICMPv4 error tables are still
-searched linearly on the packet path (PERF-001; the fix is slice H4b). The
-figures below come from the #308 review. A full scan costs roughly 100 to
-500 µs per packet at 65536 slots, so a few thousand packets per second can
-saturate one queue. NAT44 is bounded since H4a.
+**Per-packet cost.** No runtime table is searched linearly on the
+packet path any more (PERF-001: NAT44 since H4a, resolution and ICMPv4
+errors since H4b). Before H4b a dynamic-neighbor miss, resolution
+scheduling, an ARP learn, and failure capture scanned their whole table:
+75 to 940 µs per packet at 65536 slots in a release build, 4.5 to 72 µs
+at the old 4096 cap.
 
-| Table | Linear path, and what triggers it | Read per trigger at 65536 | At the production limit | Recommended size |
+| Table | Packet path, and what drives it | Work per packet | Release time per packet at 65536 (before H4b) | Recommended size |
 |---|---|---|---|---|
-| `dynamic-neighbors` (24 B) | every lookup that misses (forwarding to an unlearnt next hop, ARP merge): a LAN host flooding ARP, or WAN packets to unused LAN addresses where routed inbound traffic is allowed | about 1.5 MiB | 96 KiB (4096) | on-link hosts of the largest LAN plus headroom (for example 256 to 1024) |
-| resolution `states` (56 B) | lookup and free-slot search in `schedule`, failure capture | up to 3.5 MiB | 224 KiB | the number of next hops being resolved at once (64 to 1024) |
-| resolution `failure-holds` (608 B) | walked when scheduling and when matching a failure | one field per slot, scattered over 38 MiB | 2.4 MiB span | a few times `states` |
-| resolution `actions` (32 B) | O(1) ring per packet; scanned only by the reload preflight | — | — | like `states` |
-| ICMPv4 error `states` (24 B) | scanned on every generated error (TTL expiry, unreachable) | about 1.5 MiB | 96 KiB | at most one per egress interface is ever used (≤ 256); a few |
-| ICMPv4 error `actions` (584 B) | O(1) ring; one per state | — | — | like `states` |
+| `dynamic-neighbors` (64 B) | lookup on forwarding to a non-static next hop, ARP merge: a LAN host flooding ARP from many senders, or WAN packets to unused LAN addresses where routed inbound traffic is allowed | one keyed chain of at most 16 slots (`RESOLUTION_INDEX_CHAIN_LIMIT`; secret per-publication SipHash key, one bucket per slot), plus for a new entry the lowest free or expired slot from a bitmap (at most 17 words at 65536) and the head of the refresh-order list; expired entries are taken off that list lazily, amortized O(1) per learned entry | miss 0.28 µs (74 µs); ARP flood into a full cache 0.31 µs (148 µs) | on-link hosts of the largest LAN plus headroom |
+| resolution `states` (96 B) | `schedule` on a dynamic miss, failure capture, ARP learn (cancels the key's state) | one keyed chain of at most 16 slots, plus for a new key the lowest free or elapsed-cooldown slot (bitmap) and the head of the request-order list (amortized O(1) per committed request) | new target with the table full 0.34 µs (250 µs); ARP update of a pending target 0.78 µs (943 µs) | the number of next hops being resolved at once |
+| resolution `failure-holds` (648 B) | capture on a miss, promotion and expiry of a failed resolution, ARP learn | the forward chain of the key (at most 16 holds) and, for holds waiting on a reverse resolution, the chain of that reverse token; every hold that chain walk clears was captured once (amortized O(1)) | — | a few times `states` |
+| resolution `actions` (56 B) | FIFO list; a state removes its own queued action in O(1) | O(1) | — | like `states` |
+| ICMPv4 error `states` (24 B) | every generated error (TTL expiry, unreachable) | only the occupied states, which are a prefix of the table and at most one per egress interface in use (≤ 256) | — | at most one per egress interface is ever used; a few |
+| ICMPv4 error `actions` (584 B) | O(1) ring; one per state | O(1) | — | like `states` |
 | NAT44 `mappings`/`peers`/`sessions` (64/48/64 B + directories) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (the least recently refreshed, so the first to expire) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
 | `firewall.capacity.states` (56 B) | keyed SipHash probe with occupancy capped near 75% (`usable_state_capacity`), so a full table cannot occur; only the amortized expiry sweep (`reclaim_one_expired`) is linear | — (amortized) | — | the expected concurrent flows |
 
-Within the limits, size each scanned table for the expected traffic rather
-than at the maximum: a scan reads the whole table, however few slots are in
-use.
+Per-packet work no longer depends on the capacity, but two tick-budgeted
+round-robin scans do: the resolution timer visits `tick.resolution-timer-scans`
+state slots per tick and the failure dispatch `tick.failure-dispatch-scans`
+hold slots, so an ARP retry, timeout, or Host Unreachable can wait up to
+`capacity / scans` ticks for its slot to come round (with 65536 states and
+16 scans, 4096 ticks, about 4 s when the loop sleeps 1 ms between idle
+ticks). Size `states` for the expected traffic and raise the scan budgets
+with it. An insert whose key chain already holds 16 entries fails closed
+like a full table (`StateFull`, `CacheFull`, `CapacityFull`) and is counted
+in `ResolutionIndexCounters` (`*_probe_exhausted`); with the secret key a
+chain that long does not happen by chance or by aiming.
 
 **Memory per slot.** These are the x86_64 slot types that
 `FullServiceStorage` allocates; the total is pinned by
@@ -232,11 +241,11 @@ use.
 
 | Table (config key) | Bytes per slot | At the production limit |
 |---|---|---|
-| `resolution.capacity.states` | 56 | 224 KiB (4096) |
-| `resolution.capacity.actions` | 32 | 128 KiB (4096) |
-| `resolution.capacity.dynamic-neighbors` | 24 | 96 KiB (4096) |
-| `resolution.capacity.failure-holds` (holds a quoted datagram) | 608 | 2.375 MiB (4096) |
-| `icmpv4-errors.capacity.states` | 24 | 96 KiB (4096) |
+| `resolution.capacity.states` | 96 | 6 MiB (65536) |
+| `resolution.capacity.actions` | 56 | 3.5 MiB (65536) |
+| `resolution.capacity.dynamic-neighbors` | 64 | 4 MiB (65536) |
+| `resolution.capacity.failure-holds` (holds a quoted datagram) | 648 | 2.53 MiB (4096) |
+| `icmpv4-errors.capacity.states` | 24 | 1.5 MiB (65536) |
 | `icmpv4-errors.capacity.actions` (holds a quoted datagram) | 584 | 2.28 MiB (4096) |
 | `nat44.udp.capacity.mappings` | 64 + 28 directory | 5.75 MiB (65536) |
 | `nat44.udp.capacity.peers` | 48 + 28 directory | 4.75 MiB (65536) |
@@ -249,13 +258,18 @@ A directory has one 4-byte bucket per slot, rounded up to a power of two,
 and one 24-byte node per slot (exact for the powers of two above). `ruster
 validate` prints the total as `storage-bytes=`. The largest config that
 `run` accepts (`fixtures/limits/router-production-max.toml`) needs
-38224064 bytes (36.45 MiB). H4a added 16 bytes per NAT44 mapping and
+53559488 bytes (51.08 MiB). H4a added 16 bytes per NAT44 mapping and
 session slot (reuse-list links, 48 to 64 bytes with the 16-byte alignment)
-and the free-port bitmaps: 3 MiB more at the limits.
+and the free-port bitmaps: 3 MiB more at the limits. H4b added the
+resolution indexes inside the slots (state 56 to 96 bytes, action 32 to
+56, dynamic neighbor 24 to 64, failure hold 608 to 648; the chain heads
+and bitmap words live in the slots, so there is no other storage) and
+raised states, actions, dynamic neighbors, and ICMPv4 error states to
+65536: 14.5 MiB more.
 
 Worst-case resident memory of `ruster run`:
 
-- Runtime storage: at most 64 MiB (36.45 MiB with today's slot sizes).
+- Runtime storage: at most 64 MiB (51.08 MiB with today's slot sizes).
   It is allocated once at startup, before the privilege preflight, and
   filled, so it is resident from the start. If the allocation fails,
   startup reports `stage=storage code=ALLOCATION.<service>` and exits 1.
@@ -772,14 +786,23 @@ CLI-034).
   which is listed.
 - The config is validated with the production limits (section 1,
   "Validation limits and memory").
-- Per-packet linear scans (PERF-001, High for availability, pre-existing;
-  fix planned as hardening slice H4b): a dynamic-neighbor miss
-  (`lookup_dynamic`, `merge_dynamic`), resolution scheduling (`schedule`,
-  failure holds), and ICMPv4 error states scan their whole table. A LAN
-  host flooding ARP, or WAN packets to unused LAN/WAN subnet addresses
-  where routed inbound traffic is allowed, can drive these paths; at 65536
-  slots one packet can cost 100-500 µs. Until H4b, production caps these
-  tables at 4096 slots (section 1). NAT44 slot reuse and port selection
+- Per-packet linear scans of runtime tables are gone (PERF-001: NAT44 in
+  H4a, resolution and ICMPv4 errors in H4b). What the resolution runtime
+  still does in more than constant time: the reverse failure-hold chain
+  is not capped (every hold waiting on one reverse resolution shares its
+  token; with the secret key a walk is expected O(1) plus the holds it
+  clears); taking expired dynamic neighbors and elapsed cooldowns off
+  their time-ordered lists is amortized, so the first insert after a quiet
+  period can take every entry that expired meanwhile off at once (one
+  short list step each, under 1 ms at 65536); the publication preflight
+  validates every index (O(capacity), control path); and the timer and
+  failure-dispatch scans are tick-budgeted round robins (section 1).
+  An insert into a key chain that already holds 16 entries fails closed
+  (`*_probe_exhausted`). The static neighbor, route (LPM), interface, and
+  local-address lookups of the forwarding snapshot are still linear in
+  the configured lists (at most 4096 routes, 4096 neighbors, 1024
+  addresses, 256 interfaces); they are not runtime tables and an attacker
+  cannot grow them. NAT44 slot reuse and port selection
   are O(1) per new flow since H4a (NAT44-035). What NAT44 still does in
   more than constant time: a keyed directory lookup walks its hash chain
   (secret per-publication SipHash key and at most one slot per bucket on

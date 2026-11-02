@@ -1,10 +1,10 @@
 # Maximal production config (H3): every runtime table at its production
-# limit (`PRODUCTION_VALIDATION_LIMITS`): the scanned resolution and ICMPv4
-# error tables at 4096, the NAT44 and firewall tables at 65536, and the
-# NAT44 port pool at its widest (1..=65535). Runtime storage is 38813888
-# bytes (37.02 MiB). One slot more in any table is refused by `ruster run`
-# and by `validate`/`plan` of this af-xdp document; the simulator's limits
-# (a sim backend) allow the scanned tables up to 65536. Devices
+# limit (`PRODUCTION_VALIDATION_LIMITS`): the quote tables (resolution
+# failure holds, ICMPv4 error actions) at 4096, every other table at 65536,
+# and the NAT44 port pool at its widest (1..=65535). Runtime storage is
+# 53559488 bytes (51.08 MiB). One slot more in any table is refused by
+# `ruster run` and by `validate`/`plan` of this af-xdp document; the
+# simulator's limits (a sim backend) allow the quote tables up to 65536. Devices
 # `rusternodev0/1` do not exist: tests rewrite them before any live use.
 # Based on fixtures/m1/router-v1.toml.
 schema-version = 1
@@ -52,9 +52,9 @@ dynamic-neighbor-ttl-ms = 60000
 max-attempts = 3
 
 [resolution.capacity]
-states = 4096
-actions = 4096
-dynamic-neighbors = 4096
+states = 65536
+actions = 65536
+dynamic-neighbors = 65536
 failure-holds = 4096
 
 [icmpv4-errors.policy]
@@ -62,7 +62,7 @@ interval-ms = 100
 state-ttl-ms = 60000
 
 [icmpv4-errors.capacity]
-states = 4096
+states = 65536
 actions = 4096
 
 # Per-kind generation switches (RFC 1812 §1.1.3 options whose default is the

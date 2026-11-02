@@ -625,13 +625,14 @@ sudo kill -HUP <pid>                                               # configをre
   （既定off）はgroup/otherが書けるか、root/実効user以外が所有するconfigを起動時とreload時に
   `stage=permissions`で拒否します（configは`O_NONBLOCK|O_NOCTTY`でregular fileだけ）。既存のXDP programが
   あるdeviceは`stage=attach code=CREATE_LINK/EXISTING_PROGRAM`で拒否し、置換しません。
-- validation limit（H3）: configは起動時もreload時も本番limitで検証します。packet pathで全slotを
-  線形scanするtable（`resolution.capacity.*`と`icmpv4-errors.capacity.*`）は一つ4096 slotまで
-  （`run-sim`は65536。index化（H4b、PERF-001）までの暫定。dynamic-neighbor miss 1回の読み込みが
-  65536で約1.5 MiB、4096で96 KiB）、NAT44とfirewallのtable（directory、port poolを含む）は65536
-  slotまで（NAT44の再利用slotとport探索はH4a以降O(1)。想定flow数に合わせて設定する）、
-  runtime storageの合計は64 MiBまで（`run-sim`と同じ）。全tableを
-  上限にしたconfig（`fixtures/limits/router-production-max.toml`）のstorageは36.45 MiBです。storageは
+- validation limit（H3、H4b）: configは起動時もreload時も本番limitで検証します。slotごとに
+  quoted datagramを持つ2 table（`resolution.capacity.failure-holds`と
+  `icmpv4-errors.capacity.actions`）はmemoryのため一つ4096 slotまで（`run-sim`は65536）、他の
+  table（resolution states/actions/dynamic-neighbors、ICMPv4 error states、NAT44とfirewallの
+  directory、port poolを含む）は65536 slotまでです。packet pathでtable全体をscanする処理は
+  ありません（PERF-001。NAT44はH4a、resolution/ICMPv4 errorはH4bでkeyed index化。想定traffic
+  に合わせて設定する）。runtime storageの合計は64 MiBまで（`run-sim`と同じ）。全tableを
+  上限にしたconfig（`fixtures/limits/router-production-max.toml`）のstorageは51.08 MiBです。storageは
   通常のheap（memlockではない）で起動時に一度だけ確保し、`validate`の`storage-bytes=`がその量です。
   最悪のRAMはstorage 64 MiB + UMEM（最大1 GiB、memlock。`auto`のcopy fallback中は2倍で2 GiB）+
   config数MiB。超過は`stage=validate code=CAPACITY_LIMIT_EXCEEDED path=<field> limit=<上限>
