@@ -475,7 +475,7 @@ fn reply_reaches_host(
 #[derive(PartialEq)]
 struct Observed {
     generation: NonZeroU64,
-    bindings: [bool; 3],
+    bindings: [bool; 4],
     policies: (
         ruster_core::ResolutionPolicy,
         ruster_core::Icmpv4ErrorPolicy,
@@ -520,6 +520,9 @@ fn observe(active: &ActivePublication<'_, SimIo>) -> Observed {
             active
                 .firewall()
                 .config_matches(&authority.firewall_config()),
+            active
+                .icmpv4_errors()
+                .translated_limit_key_matches(authority.resolution_hash_key()),
         ],
         policies: (resolution.policy(), active.icmpv4_errors().policy()),
         shapes: (
@@ -845,6 +848,12 @@ fn run_tick_applies_successor_at_tick_boundary_with_reconcile_semantics() {
     assert_eq!(after.dynamic_neighbor_count(), 0);
     assert_eq!(after.pending_actions(), 0);
     assert_eq!(active.icmpv4_errors().pending_actions(), 0);
+    // NAT44-065: the translated error limiter now hashes with the
+    // successor's key, not the first generation's.
+    assert!(observe(&active).bindings.iter().all(|matches| *matches));
+    assert!(!active
+        .icmpv4_errors()
+        .translated_limit_key_matches(candidate(&V1, 1).authority().resolution_hash_key()));
     assert_eq!(occupied(active.nat44_tcp().mappings()), 0);
     assert_eq!(occupied(active.nat44_udp().mappings()), 1, "fresh mapping");
     assert!(active.nat44_udp().counters().reconciliations >= 1);

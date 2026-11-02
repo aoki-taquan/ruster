@@ -163,6 +163,11 @@ impl ResolutionHashKey {
             Err(_) => Err(ResolutionHashKeyError::AllZero),
         }
     }
+
+    /// The secret, for other per-publication uses in their own hash domain.
+    pub(crate) const fn directory_key(self) -> DirectoryHashKey {
+        self.0
+    }
 }
 
 /// Public fixed key of the constructors that take no key (tests and benches).

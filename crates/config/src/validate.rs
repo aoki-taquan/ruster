@@ -1264,6 +1264,19 @@ fn validate_v1(
                         path(&["icmpv4-errors", "policy"]),
                     )
                 })
+                .and_then(|policy| {
+                    policy
+                        .with_translated_limit(
+                            source.translated.rate_per_second,
+                            source.translated.burst,
+                        )
+                        .map_err(|error| {
+                            ValidationError::new(
+                                ValidationCode::Icmpv4ErrorPolicy(error),
+                                path(&["icmpv4-errors", "translated"]),
+                            )
+                        })
+                })
         })
         .transpose()?;
 

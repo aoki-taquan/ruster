@@ -7,6 +7,7 @@ mod fixed_directory;
 mod forwarding;
 mod generated;
 mod icmpv4_error;
+mod icmpv4_translated_limit;
 mod io;
 mod nat44;
 mod nat44_host_quota;
@@ -76,6 +77,10 @@ pub use icmpv4_error::{
     NoGeneratedIcmpv4Trace, ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS,
     ICMPV4_ERROR_MAX_FRAME_LEN, ICMPV4_ERROR_MAX_QUOTE_LEN, ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN,
     ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN,
+};
+pub use icmpv4_translated_limit::{
+    ICMPV4_DEFAULT_TRANSLATED_BURST, ICMPV4_DEFAULT_TRANSLATED_RATE_PER_SECOND,
+    ICMPV4_MAX_TRANSLATED_LIMIT, ICMPV4_TRANSLATED_LIMIT_BUCKETS,
 };
 pub use io::{
     BatchCompletion, ConsumeReason, PacketBatch, PacketIo, PacketLease, PacketSlot,

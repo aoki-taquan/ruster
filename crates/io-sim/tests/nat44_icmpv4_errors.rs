@@ -16,12 +16,13 @@ use ruster_core::{
     FirewallAuditRecord, FirewallConfig, FirewallConnectionClass, FirewallHashKey,
     FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange, FirewallProtocol,
     FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot, FirewallVerdict,
-    ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
+    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
     MonotonicMillis, Nat44Filtering, Nat44Icmpv4Disposition, Nat44Icmpv4ErrorPolicy,
     Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot,
     Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime,
-    Neighbor, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot,
-    Route, TraceEvent,
+    Neighbor, ResolutionActionSlot, ResolutionHashKey, ResolutionPolicy, ResolutionRuntime,
+    ResolutionStateSlot, Route, TraceEvent,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 use support::UdpTestIndexes;
@@ -225,6 +226,9 @@ struct World {
     firewall_config: Option<FirewallConfig<'static>>,
     firewall: Option<FirewallRuntime<'static>>,
     resolution: ResolutionRuntime<'static>,
+    /// The generated-error runtime, which limits translated external
+    /// errors (NAT44-065); `None` runs the NAT-only composition.
+    icmpv4: Option<Icmpv4ErrorRuntime<'static>>,
     io: SimIo,
     trace: VecTrace,
     now: u64,
@@ -318,10 +322,29 @@ impl World {
             firewall_config,
             firewall,
             resolution,
+            icmpv4: None,
             io: SimIo::new(),
             trace: VecTrace::default(),
             now: 0,
         }
+    }
+
+    /// The default world with the generated-error runtime bound under
+    /// `policy` and a publication key (the full composition `ruster run`
+    /// uses).
+    fn limited(firewall: bool, policy: Icmpv4ErrorPolicy) -> Self {
+        let mut world = Self::new(firewall);
+        world.icmpv4 = Some(
+            Icmpv4ErrorRuntime::new(
+                policy,
+                leak([Icmpv4ErrorStateSlot::EMPTY; 4]),
+                leak([Icmpv4ErrorActionSlot::EMPTY; 4]),
+            )
+            .with_translated_limit_key(
+                ResolutionHashKey::new(0x0123_4567_89ab_cdef, 0x0f1e_2d3c_4b5a_6978).unwrap(),
+            ),
+        );
+        world
     }
 
     fn run(&mut self, ingress: IfId, packet: Vec<u8>) {
@@ -329,7 +352,41 @@ impl World {
         let now = MonotonicMillis(self.now);
         self.now += 1;
         self.trace.clear();
-        if let Some(firewall_config) = &self.firewall_config {
+        if let Some(icmpv4) = self.icmpv4.as_mut() {
+            if let Some(firewall_config) = &self.firewall_config {
+                self.io
+                    .run_nat44_udp_and_tcp_with_firewall_and_icmpv4_errors_once(
+                        1,
+                        &self.snapshot,
+                        &mut self.resolution,
+                        icmpv4,
+                        &self.udp_config,
+                        Some(&mut self.udp),
+                        &self.tcp_config,
+                        Some(&mut self.tcp),
+                        firewall_config,
+                        self.firewall.as_mut(),
+                        now,
+                        &mut self.trace,
+                    )
+                    .unwrap();
+            } else {
+                self.io
+                    .run_nat44_udp_and_tcp_with_icmpv4_errors_once(
+                        1,
+                        &self.snapshot,
+                        &mut self.resolution,
+                        icmpv4,
+                        &self.udp_config,
+                        Some(&mut self.udp),
+                        &self.tcp_config,
+                        Some(&mut self.tcp),
+                        now,
+                        &mut self.trace,
+                    )
+                    .unwrap();
+            }
+        } else if let Some(firewall_config) = &self.firewall_config {
             self.io
                 .run_nat44_udp_and_tcp_with_firewall_once(
                     1,
@@ -1351,7 +1408,10 @@ fn inside_translation_has_per_protocol_off_switches() {
 /// `P:port -> REMOTE:53`. Protocol and Port Unreachable get no hit, because
 /// only the quoted destination host may send them. The types an
 /// intermediate router legitimately sends still hit the live mapping: that
-/// is the residual trade-off of REQ-4 (no rate limit, NAT44-065).
+/// is the residual trade-off of REQ-4. This NAT-only composition has no
+/// generated-error runtime, so no NAT44-065 rate limit applies; the full
+/// composition bounds the hits per inside host and quoted remote
+/// (`off_path_sweep_delivers_a_bounded_number_and_does_not_starve_other_hosts`).
 #[test]
 fn off_path_sweep_cannot_inject_end_host_errors() {
     for firewall in [false, true] {
@@ -1473,4 +1533,320 @@ fn inside_udp_error_after_the_mapping_expired_is_a_mapping_miss() {
         icmp_error(H1, REMOTE, 3, 3, &delivered),
         DropReason::Nat44UdpMappingMiss,
     );
+}
+
+/// NAT44-065: runs the external `error` at `now` and returns whether it
+/// was translated toward the inside; otherwise asserts the byte-unchanged
+/// rate-limited drop.
+fn deliver(world: &mut World, now: u64, error: &[u8]) -> bool {
+    world.now = now;
+    world.run(WAN, error.to_vec());
+    if let Some(tx) = world.io.pop_tx() {
+        assert_eq!(tx.egress, LAN);
+        assert!(world.io.pop_recycled().is_none());
+        true
+    } else {
+        world.assert_drop(DropReason::Nat44Icmpv4TranslatedRateLimited, error);
+        assert!(world.trace.events().contains(&TraceEvent::Nat44Icmpv4 {
+            ingress: WAN,
+            disposition: Nat44Icmpv4Disposition::Rejected {
+                reason: DropReason::Nat44Icmpv4TranslatedRateLimited,
+            },
+        }));
+        false
+    }
+}
+
+fn delivered_count(world: &mut World, now: u64, error: &[u8], attempts: usize) -> usize {
+    (0..attempts).filter(|_| deliver(world, now, error)).count()
+}
+
+/// `error` with its rest-of-header word (the Next-Hop MTU of a
+/// Fragmentation Needed) replaced.
+fn with_word(mut error: Vec<u8>, word: [u8; 4]) -> Vec<u8> {
+    error[38..42].copy_from_slice(&word);
+    refresh_icmp(&mut error);
+    error
+}
+
+/// NAT44-065: `burst` errors pass at one instant per path (here one remote
+/// per inside host), then one
+/// each `1000 / rate` ms, never early; a refused error changes no NAT or
+/// firewall state; another inside host has its own budget. UDP and TCP
+/// quotes, with and without the firewall.
+#[test]
+fn translated_errors_are_limited_per_inside_host_at_the_exact_boundary() {
+    let policy = Icmpv4ErrorPolicy::default()
+        .with_translated_limit(10, 3)
+        .unwrap();
+    for firewall in [false, true] {
+        for tcp in [false, true] {
+            let mut world = World::limited(firewall, policy);
+            let h1 = icmp_error(ROUTER, PUBLIC, 3, 4, &world.establish(H1, P1, tcp));
+            let h2 = icmp_error(ROUTER, PUBLIC, 11, 0, &world.establish(H2, P2, tcp));
+            let before = world.state();
+            assert_eq!(delivered_count(&mut world, 1_000, &h1, 5), 3);
+            assert_eq!(world.state(), before, "refusals are read-only");
+            assert_eq!(delivered_count(&mut world, 1_000, &h2, 5), 3, "own budget");
+            assert_eq!(delivered_count(&mut world, 1_099, &h1, 5), 0);
+            assert_eq!(delivered_count(&mut world, 1_100, &h1, 5), 1);
+            assert_eq!(delivered_count(&mut world, 1_199, &h1, 5), 0);
+            assert_eq!(delivered_count(&mut world, 1_200, &h1, 5), 1);
+            // Idle for burst / rate = 300 ms refills the burst, no more.
+            assert_eq!(delivered_count(&mut world, 1_500, &h1, 5), 3);
+            assert_eq!(world.state(), before, "firewall {firewall} tcp {tcp}");
+        }
+    }
+}
+
+/// NAT44-065 sweep: an off-path host sweeps every public port with
+/// forged Fragmentation Needed errors quoting `P:port -> REMOTE:53`, 16
+/// ports per millisecond for 2 s (32000 errors, 4000 of which hit one of
+/// the two live UDP mappings). Under the default limit each victim host
+/// receives exactly its burst plus the rate, and a third host's traceroute
+/// over TCP during the sweep loses nothing.
+#[test]
+fn off_path_sweep_delivers_a_bounded_number_and_does_not_starve_other_hosts() {
+    for firewall in [false, true] {
+        let mut world = World::limited(firewall, Icmpv4ErrorPolicy::default());
+        let p1 = public_source_port(&world.establish(H1, P1, false));
+        let p2 = public_source_port(&world.establish(H2, P2, false));
+        let traced = world.establish(H4, P1, true);
+        let mut delivered = [0_u32; 2];
+        let mut traceroute = 0;
+        for round in 0..2_000_u64 {
+            let now = 10_000 + round;
+            for port in FIRST_PORT..=LAST_PORT {
+                let quoted = udp_frame(PUBLIC, REMOTE, port, 53);
+                let error = icmp_error(ATTACKER, PUBLIC, 3, 4, &quoted);
+                world.now = now;
+                world.run(WAN, error);
+                if let Some(tx) = world.io.pop_tx() {
+                    let host = &tx.bytes[30..34];
+                    if port == p1 {
+                        assert_eq!(host, &H1.octets());
+                        delivered[0] += 1;
+                    } else {
+                        assert_eq!(port, p2);
+                        assert_eq!(host, &H2.octets());
+                        delivered[1] += 1;
+                    }
+                } else {
+                    let reason = world.io.pop_recycled().expect("refused").cause;
+                    if port == p1 || port == p2 {
+                        assert_eq!(
+                            reason,
+                            RecycleCause::Forwarding(DropReason::Nat44Icmpv4TranslatedRateLimited)
+                        );
+                    }
+                }
+            }
+            // A classic traceroute from H4: 3 probes per hop, 30 hops,
+            // answered by 30 different routers during the first rounds.
+            if let Ok(hop) = u8::try_from(round) {
+                if hop < 30 {
+                    let router = Ipv4Address::from_octets([198, 51, 100, 100 + hop]);
+                    let error = icmp_error(router, PUBLIC, 11, 0, &traced);
+                    traceroute += delivered_count(&mut world, now, &error, 3);
+                }
+            }
+        }
+        // 100 at the first instant, then 100 per second over 1999 ms.
+        assert_eq!(delivered, [299, 299], "firewall {firewall}");
+        assert_eq!(traceroute, 90, "firewall {firewall}");
+    }
+}
+
+/// NAT44-065: the default limit never limits a traceroute (90 Time
+/// Exceeded at one instant), an mtr (one per hop per second for 10 s), or
+/// Path MTU Discovery, all toward one inside host.
+#[test]
+fn traceroute_mtr_and_pmtud_pass_the_default_limit() {
+    let mut world = World::limited(false, Icmpv4ErrorPolicy::default());
+    let outbound = world.establish(H1, P1, false);
+    let mut delivered = 0;
+    for hop in 0..30_u8 {
+        let router = Ipv4Address::from_octets([198, 51, 100, 100 + hop]);
+        let error = icmp_error(router, PUBLIC, 11, 0, &outbound);
+        delivered += delivered_count(&mut world, 5_000, &error, 3);
+    }
+    assert_eq!(delivered, 90);
+    let mut mtr = 0;
+    for second in 0..10_u64 {
+        for hop in 0..30_u8 {
+            let router = Ipv4Address::from_octets([198, 51, 100, 100 + hop]);
+            let now = 6_000 + second * 1_000 + u64::from(hop) * 33;
+            let error = icmp_error(router, PUBLIC, 11, 0, &outbound);
+            mtr += usize::from(deliver(&mut world, now, &error));
+        }
+    }
+    assert_eq!(mtr, 300);
+    let frag_needed = with_word(icmp_error(ROUTER, PUBLIC, 3, 4, &outbound), [0, 0, 5, 0x78]);
+    assert!(deliver(&mut world, 16_000, &frag_needed));
+}
+
+/// NAT44-065: only an error that passes every other check spends the
+/// budget. A sweep of mapping misses, an end-host-only error from a
+/// router, and an invalid MTU leave the single token of a burst-1 limit
+/// for the live flow.
+#[test]
+fn refused_errors_never_spend_the_translated_budget() {
+    let policy = Icmpv4ErrorPolicy::default()
+        .with_translated_limit(1, 1)
+        .unwrap();
+    let mut world = World::limited(false, policy);
+    let outbound = world.establish(H1, P1, false);
+    let public = public_source_port(&outbound);
+    for port in (FIRST_PORT..=LAST_PORT).filter(|port| *port != public) {
+        world.now = 1_000;
+        world.assert_refused(
+            WAN,
+            icmp_error(ATTACKER, PUBLIC, 3, 1, &udp_frame(PUBLIC, REMOTE, port, 53)),
+            DropReason::Nat44UdpMappingMiss,
+        );
+    }
+    world.now = 1_000;
+    world.assert_refused(
+        WAN,
+        icmp_error(ROUTER, PUBLIC, 3, 3, &outbound),
+        DropReason::Nat44Icmpv4EndHostSourceMismatch,
+    );
+    world.now = 1_000;
+    world.assert_refused(
+        WAN,
+        with_word(icmp_error(ROUTER, PUBLIC, 3, 4, &outbound), [0, 0, 0, 67]),
+        DropReason::Nat44Icmpv4FragNeededMtuInvalid,
+    );
+    let error = icmp_error(ROUTER, PUBLIC, 3, 1, &outbound);
+    assert!(deliver(&mut world, 1_000, &error));
+    assert!(!deliver(&mut world, 1_000, &error));
+    assert!(!deliver(&mut world, 1_999, &error));
+    assert!(deliver(&mut world, 2_000, &error));
+}
+
+/// NAT44-065: the limit is checked before neighbor resolution, so a
+/// limited error toward an unresolved inside host never schedules ARP.
+#[test]
+fn a_limited_error_never_starts_neighbor_resolution() {
+    const H3: Ipv4Address = Ipv4Address::from_octets([10, 0, 0, 12]);
+    let policy = Icmpv4ErrorPolicy::default()
+        .with_translated_limit(1, 1)
+        .unwrap();
+    let mut world = World::limited(false, policy);
+    let error = icmp_error(ROUTER, PUBLIC, 3, 4, &world.establish(H3, P1, false));
+    world.now = 1_000;
+    world.assert_refused(WAN, error.clone(), DropReason::NeighborUnresolved);
+    let resolution = world.resolution.counters();
+    let pending = world.resolution.pending_actions();
+    assert_eq!(pending, 1, "the admitted error asked for ARP");
+    assert!(!deliver(&mut world, 1_000, &error));
+    assert_eq!(world.resolution.counters(), resolution);
+    assert_eq!(world.resolution.pending_actions(), pending);
+}
+
+/// NAT44-065 scope: only external errors toward the inside are limited.
+/// An inside host's errors toward the external realm (REQ-5) pass at any
+/// rate, like the UDP and TCP it can send anyway.
+#[test]
+fn inside_errors_toward_the_external_realm_are_not_limited() {
+    let policy = Icmpv4ErrorPolicy::default()
+        .with_translated_limit(1, 1)
+        .unwrap();
+    let mut world = World::limited(false, policy);
+    let public = public_source_port(&world.establish(H1, P1, false));
+    let (_, delivered) = world.reply(public, false);
+    for _ in 0..20 {
+        world.now = 1_000;
+        world.run(LAN, icmp_error(H1, REMOTE, 3, 3, &delivered));
+        assert_eq!(world.io.pop_tx().expect("translated").egress, WAN);
+    }
+}
+
+/// RFC 791 / RFC 1191: a Fragmentation Needed Next-Hop MTU of 1..=67 is
+/// below the IPv4 minimum and refused in both directions, with or without
+/// the limiter; 0 (pre-RFC 1191 router) and 68 and up still translate,
+/// and the same word in any other type is not an MTU.
+#[test]
+fn frag_needed_with_a_next_hop_mtu_below_68_is_refused() {
+    for limited in [false, true] {
+        let mut world = if limited {
+            World::limited(false, Icmpv4ErrorPolicy::default())
+        } else {
+            World::new(false)
+        };
+        let outbound = world.establish(H1, P1, false);
+        for mtu in [1_u16, 2, 67] {
+            let [high, low] = mtu.to_be_bytes();
+            let error = icmp_error(ROUTER, PUBLIC, 3, 4, &outbound);
+            world.assert_refused(
+                WAN,
+                with_word(error.clone(), [0, 0, high, low]),
+                DropReason::Nat44Icmpv4FragNeededMtuInvalid,
+            );
+            // Unused bits above the MTU do not hide a small MTU.
+            world.assert_refused(
+                WAN,
+                with_word(error, [0xff, 0xff, high, low]),
+                DropReason::Nat44Icmpv4FragNeededMtuInvalid,
+            );
+            for (icmp_type, code) in [(3, 1), (3, 13), (11, 0), (12, 0)] {
+                let error = icmp_error(ROUTER, PUBLIC, icmp_type, code, &outbound);
+                world.run(WAN, with_word(error, [0, 0, high, low]));
+                assert_eq!(world.io.pop_tx().expect("not an MTU").egress, LAN);
+            }
+        }
+        for mtu in [0_u16, 68, 576, 1_500, u16::MAX] {
+            let [high, low] = mtu.to_be_bytes();
+            let error = with_word(
+                icmp_error(ROUTER, PUBLIC, 3, 4, &outbound),
+                [0, 0, high, low],
+            );
+            world.run(WAN, error.clone());
+            let tx = world.io.pop_tx().expect("valid MTU");
+            assert_eq!(&tx.bytes[38..42], &error[38..42], "preserved");
+        }
+        // REQ-5: the inside direction shares the parser.
+        let public = public_source_port(&outbound);
+        let (_, delivered) = world.reply(public, false);
+        let error = icmp_error(H1, REMOTE, 3, 4, &delivered);
+        world.assert_refused(
+            LAN,
+            with_word(error.clone(), [0, 0, 0, 67]),
+            DropReason::Nat44Icmpv4FragNeededMtuInvalid,
+        );
+        world.run(LAN, with_word(error, [0, 0, 0, 68]));
+        assert_eq!(world.io.pop_tx().expect("valid MTU").egress, WAN);
+    }
+}
+
+/// Review L1: the budget is per (inside host, quoted remote). A flood of
+/// errors quoting H1's flow to REMOTE uses up only that path; errors about
+/// H1's flow to OTHER_REMOTE (its PMTUD toward another server) still pass.
+#[test]
+fn a_flood_naming_one_remote_leaves_the_hosts_other_paths_alone() {
+    let policy = Icmpv4ErrorPolicy::default()
+        .with_translated_limit(10, 3)
+        .unwrap();
+    for tcp in [false, true] {
+        let mut world = World::limited(false, policy);
+        let to_remote = world.establish(H1, P1, tcp);
+        world.run(
+            LAN,
+            if tcp {
+                tcp_frame(H1, OTHER_REMOTE, P1, 443, SYN)
+            } else {
+                udp_frame(H1, OTHER_REMOTE, P1, 53)
+            },
+        );
+        let to_other = world.io.pop_tx().expect("second flow").bytes;
+        let flood = icmp_error(ROUTER, PUBLIC, 3, 4, &to_remote);
+        let other = icmp_error(ROUTER, PUBLIC, 3, 4, &to_other);
+        assert_eq!(delivered_count(&mut world, 1_000, &flood, 50), 3);
+        assert_eq!(
+            delivered_count(&mut world, 1_000, &other, 50),
+            3,
+            "tcp {tcp}"
+        );
+        assert_eq!(delivered_count(&mut world, 1_000, &flood, 5), 0);
+    }
 }

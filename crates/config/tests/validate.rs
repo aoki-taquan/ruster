@@ -832,6 +832,83 @@ port-unreachable-interval-ms = {value}
     );
 }
 
+/// NAT44-065: `[icmpv4-errors.translated]` is optional, defaults to the
+/// core defaults, maps onto the restart-required ICMPv4 error policy, and
+/// rejects 0 and values above the maximum at its own path.
+#[test]
+fn icmpv4_translated_limit_maps_onto_the_core_policy() {
+    use ruster_core::{
+        Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, ICMPV4_DEFAULT_TRANSLATED_BURST,
+        ICMPV4_DEFAULT_TRANSLATED_RATE_PER_SECOND, ICMPV4_MAX_TRANSLATED_LIMIT,
+    };
+    let with = |table: &str| {
+        VALID.replacen(
+            "[icmpv4-errors.capacity]",
+            &format!("[icmpv4-errors.translated]\n{table}\n\n[icmpv4-errors.capacity]"),
+            1,
+        )
+    };
+    let defaults = validated(VALID);
+    let policy = defaults.icmpv4_errors().unwrap().policy();
+    assert_eq!(
+        (
+            policy.translated_rate_per_second(),
+            policy.translated_burst()
+        ),
+        (
+            ICMPV4_DEFAULT_TRANSLATED_RATE_PER_SECOND,
+            ICMPV4_DEFAULT_TRANSLATED_BURST
+        )
+    );
+    assert_eq!(policy, Icmpv4ErrorPolicy::new(100, 60_000).unwrap());
+    // An empty table and the defaults spelled out are the same policy.
+    for table in ["", "rate-per-second = 100\nburst = 100"] {
+        assert_eq!(
+            validated(&with(table)).icmpv4_errors().unwrap().policy(),
+            policy
+        );
+    }
+    let custom = validated(&with("rate-per-second = 7\nburst = 3"));
+    let custom = custom.icmpv4_errors().unwrap().policy();
+    assert_eq!(
+        custom,
+        policy.with_translated_limit(7, 3).unwrap(),
+        "only the translated limit changes"
+    );
+    assert_eq!(custom.interval_ms(), 100);
+    let max = ICMPV4_MAX_TRANSLATED_LIMIT;
+    let at_max = validated(&with(&format!("rate-per-second = {max}\nburst = {max}")));
+    assert_eq!(
+        at_max
+            .icmpv4_errors()
+            .unwrap()
+            .policy()
+            .translated_rate_per_second(),
+        max
+    );
+    for table in [
+        "rate-per-second = 0".to_owned(),
+        "burst = 0".to_owned(),
+        format!("rate-per-second = {}", max + 1),
+        format!("burst = {}", max + 1),
+    ] {
+        let rejected = error(&with(&table));
+        assert_eq!(
+            rejected.code(),
+            ValidationCode::Icmpv4ErrorPolicy(Icmpv4ErrorPolicyError::TranslatedLimitOutOfRange),
+            "{table}"
+        );
+        assert_eq!(
+            rejected.path().segments(),
+            &[
+                PathSegment::Field("icmpv4-errors".to_owned()),
+                PathSegment::Field("translated".to_owned()),
+            ],
+            "{table}"
+        );
+    }
+}
+
 #[test]
 fn nat44_filtering_maps_onto_core_policies_per_protocol() {
     use ruster_core::{Nat44Filtering, Nat44TcpPolicy, Nat44UdpPolicy};

@@ -430,6 +430,10 @@ unsolicited-syn-holds = 64       # 省略時64。quote table（本番上限4096�
 [icmpv4-errors.policy]
 port-unreachable-interval-ms = 1000  # 省略時1000。Port Unreachable専用limiter（egressごと）。restart-required
 
+[icmpv4-errors.translated]  # 省略可。outsideからの変換errorの(inside host, 引用remote)ごとの上限（NAT44-065）。restart-required
+rate-per-second = 100       # 省略時100（1〜1000000、無制限設定なし）
+burst = 100                 # 省略時100（同時刻に届く上限）。両方1000000で実質off
+
 [icmpv4-errors.capacity]
 states = 8   # delayed Port Unreachableがon（switch onかつholds > 0）ならinterface数 + 1以上が必須
 ```
@@ -540,7 +544,11 @@ Time Exceeded code 0、Parameter Problem code 0–2で、type/codeとrest-of-hea
 （architectureの「NAT44 ICMPv4 Fragmentation Needed translation」）。Protocol/Port Unreachable
 （3/2、3/3）はend host自身からだけ受け付けます（outsideでは引用destination、insideでは引用
 internal host）。off-path hostのport sweepによる注入を防ぐlocal policyで、中継routerが送る
-他のtypeについての残余riskはrequirements NAT44-065を参照してください。
+他のtypeはsweepでlive flowに当たり得ます。outsideからinside hostへ変換されるerrorは
+`[icmpv4-errors.translated]`で(inside host, 引用remote)ごと（secret keyのhashで選ぶ4096 bucket）にburst 100、毎秒100までに制限し（N4、
+NAT44-065。超過は`NAT44_ICMPV4_TRANSLATED_RATE_LIMITED`、traceroute/mtr/PMTUDは制限されない）、
+Next-Hop MTU 1〜67のFragmentation Neededは両方向で`NAT44_ICMPV4_FRAG_NEEDED_MTU_INVALID`として
+dropします（NAT44-098）。TCP sequenceのvalidation等の見送りはNAT44-099です。
 
 | 方向 | 変換 | 必要なauthority |
 |---|---|---|

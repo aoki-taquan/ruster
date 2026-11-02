@@ -581,6 +581,54 @@ fn plan_classifies_icmpv4_switches_like_their_policy_tables() {
     );
 }
 
+/// NAT44-065: `[icmpv4-errors.translated]` belongs to the restart-required
+/// ICMPv4 error policy; the defaults spelled out are no change, and 0 is a
+/// value-free validation error at the table's path.
+#[test]
+fn plan_classifies_the_translated_icmpv4_limit_as_restart_required() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let current = fixtures().join("router-v1.toml");
+    let with = |name: &str, table: &str| {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            source.replacen(
+                "[icmpv4-errors.capacity]",
+                &format!("[icmpv4-errors.translated]\n{table}\n\n[icmpv4-errors.capacity]"),
+                1,
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let defaults = with("defaults.toml", "rate-per-second = 100\nburst = 100");
+    let slower = with("slower.toml", "rate-per-second = 10");
+    let zero = with("zero.toml", "burst = 0");
+
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), defaults.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert_eq!(
+        text(&plan.stdout),
+        format!("plan: reloadable\nrestart-required: none\nchanges: 0\n{FLUSH_ALL}")
+    );
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), slower.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert_eq!(
+        text(&plan.stdout),
+        format!(
+            "plan: restart-required\nrestart-required: ICMPV4_ERROR_POLICY\nchanges: 0\n\
+             {FLUSH_ALL}"
+        )
+    );
+    let invalid = ruster(&["validate".as_ref(), zero.as_os_str()]);
+    assert_ne!(status(&invalid), 0);
+    let stderr = text(&invalid.stderr);
+    assert!(stderr.contains("ICMPV4_ERROR_POLICY"), "{stderr}");
+    assert!(stderr.contains("icmpv4-errors.translated"), "{stderr}");
+    assert!(!stderr.contains(" 0"), "value-free: {stderr}");
+}
+
 /// The ARP-031 opt-in (`[arp] require-on-link-sender`) is a reloadable
 /// `arp` change; the RFC 826 default spelled out is no change.
 #[test]
