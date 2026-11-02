@@ -434,6 +434,7 @@ ruster run [--allow-multi-queue] [--allow-kernel-forwarding]
            [--strict-config-perms] [--stats-interval <seconds>]
            [--startup-attempts <n>] [--tx-stall-warn-secs <s>]
            [--tx-stall-fatal-secs <s>] [--kick-errors-fatal-secs <s>]
+           [--link-stale-secs <s>]
            [--keep-privileges | --user <uid> --group <gid>]
            --config <config.toml>
 ruster run [options] -- <config.toml>
@@ -452,6 +453,7 @@ ruster run [options] -- <config.toml>
 | `--tx-stall-warn-secs <s>` | 1 | 1 to 3600 | `TX_STALL` warning delay |
 | `--tx-stall-fatal-secs <s>` | 10 | 0 to 3600 | `TX_STALL` fatal exit; 0 never; otherwise at least `--tx-stall-warn-secs` |
 | `--kick-errors-fatal-secs <s>` | 5 | 0 to 3600 | `KICK_ERRORS` fatal exit; 0 never |
+| `--link-stale-secs <s>` | 5 | 1 to 3600 | age of a link watcher round still running (a `send` waiting for the kernel's RTNL lock) from which every further due round counts as a failed link query on every port (`LINK_WATCH_STALE`, `LINK_PROBE`; `LINK_UNVERIFIABLE` at the third, so about `s + 2` seconds after the stuck round started; section 8). No 0: losing observability of the ports always ends the run eventually. Raise it on hosts where driver resets hold RTNL longer |
 | `--keep-privileges` | off | flag | do not drop privileges after startup (section 5, "Privilege drop"): the process keeps every capability it started with for its whole life (`warning: privileges kept (--keep-privileges)`, `privileges.state=kept`). Risk: a memory-safety bug or a logic flaw reachable from packets or the config then runs with `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_BPF`/`CAP_SYS_ADMIN` (as root: every capability), so it can reconfigure every interface and route of the namespace, sniff and inject on any device, load BPF programs, and (as root) read and write any file. Use it only to diagnose a drop problem, or on a kernel before 6.5 with `kernel.unprivileged_bpf_disabled` set (where the drop is refused) |
 | `--user <uid>` `--group <gid>` | none | numeric ids 1 to 4294967294, both or neither, not with `--keep-privileges` | with the drop, also switch every thread's real, effective, saved and filesystem uid and gid to these ids and clear the supplementary groups. Names are not resolved. Needs `CAP_SETUID` and `CAP_SETGID` at startup (exit 4 otherwise, checked before anything is opened). The config must then be readable by that user for reloads |
 
@@ -553,8 +555,10 @@ When: after every port is open, checked and attached, the datapath and
 adapter are built and generation 1 is active, and before the first tick.
 Linux credentials are per thread. The two output threads (`ruster-stdout`,
 `ruster-stderr`) are started before startup and drop their own privileges
-(the same steps, the same identity) before they write anything; the router
-thread drops its own after activation. Each uses raw per-thread syscalls
+(the same steps, the same identity) before they write anything; the link
+watcher (`ruster-watch`) and the reload worker (`ruster-reload`) are
+started after activation and drop their own before they take any request
+(section 7, "Threads"); the router thread drops its own last. Each uses raw per-thread syscalls
 (not the C library's process-wide `setuid`, which would also drop the
 router thread too early). Steps per thread: `PR_SET_DUMPABLE` 0 (a flag
 of the whole process, set before the first identity change, set again
@@ -565,8 +569,8 @@ clear; with `--user`/`--group` `setgroups(0)`, `setresgid`, `setresuid`;
 `capset` with empty sets; `PR_SET_NO_NEW_PRIVS` 1. Each thread then checks
 its own `/proc/thread-self/status`, and the router thread finally reads
 `/proc/self/task/*/status` and requires every thread of the process to show
-the dropped state. The line reports how many threads were checked
-(`threads=3`).
+the dropped state, the two workers included. The line reports how many
+threads were checked (`threads=5`).
 
 What still works without any capability (verified by the privileged smoke,
 section 13): AF_XDP RX/TX on the open sockets (ring and UMEM memory, the
@@ -619,7 +623,10 @@ What changes:
 Failure: any failed step aborts startup with the full rollback of section 5
 (`startup failed: stage=privilege-drop code=<STEP>/ERRNO_<n>`,
 `code=NOT_DROPPED/<WHAT>` when a thread still holds something, or
-`code=STATUS_UNREADABLE`; exit 1). An output thread that cannot drop fails
+`code=STATUS_UNREADABLE`; exit 1). A worker thread that cannot drop fails startup
+the same way after activation (`stage=privilege-drop code=...`), before the
+router thread's own drop; a worker that cannot be spawned at all is
+`stage=workers code=THREAD_SPAWN`. An output thread that cannot drop fails
 before anything is opened (`stage=privilege-drop code=... thread=output`,
 exit 1). The router never runs half-dropped.
 
@@ -669,13 +676,20 @@ stats block and summary can then be lost (the teardown itself completed).
    reconnect). Cumulative counters are kept. Every reload request consumes
    a generation number, so after a refusal or failure the next applied
    generation skips one.
-6. Timing: the switch happens at a tick boundary once the backend is
-   quiescent (no TX frame of the old generation in flight). While it waits
-   the router reads no RX for at most 200 ms; parsing and planning also
-   run on the router thread (a few milliseconds). Reload when traffic is
-   low: a busy port's RX ring (`rings.rx` entries) can overflow, which shows
-   as rising `if<id>.af_xdp_port.kernel_rx_ring_full` and
-   `kernel_rx_dropped`.
+6. Timing: reading, validating, building the candidate (fresh keys from
+   the production sequencer) and planning run on the reload worker thread
+   (`ruster-reload`, section 7), while the router keeps forwarding; a large
+   config costs no RX time. Only the live dry run (a few comparisons) and
+   the switch run on the router thread. The switch happens at a tick
+   boundary once the backend is quiescent (no TX frame of the old
+   generation in flight); while it waits the router reads no RX for at most
+   200 ms. Reload when traffic is low: during that wait a busy port's RX
+   ring (`rings.rx` entries) can overflow, which shows as rising
+   `if<id>.af_xdp_port.kernel_rx_ring_full` and `kernel_rx_dropped`. One
+   reload is in flight at a time: SIGHUPs that arrive while one is
+   prepared or pending coalesce into one reload after it. A preparation has
+   no time limit of its own; if the run stops during it, it fails as
+   `reload failed: stage=prepare code=STOPPED`.
 7. Counters: `reload.requested`, `reload.applied`, `reload.refused`,
    `reload.failed`; in the final block `requested = applied + refused +
    failed`. If the backend reports a commit without its report
@@ -684,6 +698,26 @@ stats block and summary can then be lost (the teardown itself completed).
    code=APPLY_REPORT_MISSING`) and exits 1.
 
 ## 7. Health and stall signals
+
+### Threads
+
+| thread (`comm`) | does |
+|---|---|
+| `ruster` | the router: ticks (RX, forwarding, TX), the health samples below, every watch decision (warnings, fatal exits), and the reload switch |
+| `ruster-watch` | the link round of section 8 (rtnetlink queries and sysctl reads), one per request of the router |
+| `ruster-reload` | the reload preparation of section 6 (read, validate, candidate with fresh keys, plan); owns the production key sequencer for the whole run |
+| `ruster-stdout`, `ruster-stderr` | the output lines (section 5) |
+
+The router never waits for a worker: it hands a request over and takes the
+answer at a later tick boundary with non-blocking channel operations, and
+nothing on its side allocates or takes an application lock. Every thread
+holds no capability after startup (section 5, `threads=5`). At shutdown the
+workers are told to stop when the loop ends and are waited for at most
+500 ms (overlapping the drain); a worker still busy then (a watcher stuck
+on the RTNL lock, a reload still reading) is abandoned with `warning: the
+link watcher thread did not end within 500 ms after the loop; abandoned`
+(or `reload worker`) and dies with the process: drain, detach and exit are
+never held by it.
 
 The router samples every port's backend counters every 500 ms (cold path)
 and prints a value-free line when a condition starts or ends:
@@ -728,8 +762,13 @@ included) and `rp_filter` (procfs), and then the port's
 (`force_forwarding` and `mc_forwarding` included) and dumps the IPv6
 addresses and routes. The dumps are filtered by the kernel to the port
 (strict checking). A failed query replaces the socket, so an aborted dump
-cannot leave the next query facing `EBUSY`. All of it runs on the
-router thread, on one reused socket and buffer, without allocation:
+cannot leave the next query facing `EBUSY`. All of it runs on the link
+watcher thread (`ruster-watch`, section 7), on one reused socket and
+buffer, without allocation; the router requests a round every second and
+judges the results when the round comes back, so a `send` that waits while
+another process holds the kernel's RTNL lock (seconds during a driver
+reset) stalls the watcher, not forwarding. At most one round is
+outstanding:
 
 | event | outcome |
 |---|---|
@@ -738,6 +777,8 @@ router thread, on one reused socket and buffer, without allocation:
 | MTU below the startup MTU | fatal `MTU_DECREASED` (TX is bounded by the startup MTU; longer frames could be stranded in the kernel) |
 | MTU above what a frame holds (`frame-size - 256 - headroom - 14`) | fatal `MTU_ABOVE_FRAME` |
 | MTU raised within that bound | warning `MTU_RAISED`, recovered when it returns; TX stays bounded by the startup MTU until a restart |
+| a round is still running when the next is due (watcher stuck, usually on the RTNL lock) | `watch.link_rounds_late` +1, nothing else while the round is younger than `--link-stale-secs` (5) |
+| ... the running round is older than `--link-stale-secs` | each due round: warning `LINK_WATCH_STALE` (once, every port) and a failed link query on every port (`watch.link_rounds_stale` +1, warning `LINK_PROBE`, fatal `LINK_UNVERIFIABLE` at the third in a row: with the defaults about 7 s after the stuck round started). When the round comes back its results count as usual and `LINK_WATCH_STALE` recovers |
 | a query fails | warning `LINK_PROBE`; fatal `LINK_UNVERIFIABLE` after 3 failures in a row. The link query, each dump (IPv4 addresses, IPv4 routes, IPv6 addresses, IPv6 routes) and the procfs reads (IPv4 forwarding; `disable_ipv6` with the IPv6 forwarding sysctls) each count their own failures |
 | a kernel IPv4 address appears on a port | warning `KERNEL_IPV4_ADDRESSES` (`if<id>.watch.kernel_ipv4_addresses`), recovered when gone; keeps running |
 | a kernel IPv4 route out of a port appears in any table (policy routing and multipath nexthops included) | warning `KERNEL_IPV4_ROUTES` (`if<id>.watch.kernel_ipv4_routes`), recovered when gone; keeps running |
@@ -891,7 +932,7 @@ Sections, in this order:
 | `af_xdp.*` | all ports: `mode` (`copy`, `zero_copy`, `mixed`), `ports`, `copy_ports`, `zero_copy_ports`, `fill_need_wakeup_ports`, `tx_need_wakeup_ports`, `link_down_ports`, `kick_owed_ports`, `kernel_stats_ports`, `generated_unknown_egress`, `stopped`, and the summed port counters |
 | `if<id>.af_xdp_port.*` | per port: `interface`, `queue`, `mode`, `mtu`, `max_frame`, need-wakeup now, `draining`, `link_down`, `kick_owed`, `copy_reserve`, ring gauges (`fill_ring_occupancy`, `rx_ring_occupancy`, `tx_ring_unconsumed`), `fill_starved`, invalid RX descriptors and quarantines, TX (`tx_completed`, `tx_inflight`, `tx_inflight_highwater`, `tx_blocked`, `tx_over_mtu`, `tx_invalid_completions`), kicks (`tx_kicks`, `fill_kicks`, `kicks_deferred`, `kick_errors`, `kicks_link_down`, `kick_retries_suppressed`; `kick_errors` counts every failed kick and so includes `kicks_link_down`, while the `KICK_ERRORS` health code times `kick_errors - kicks_link_down` only; `kick_retries_suppressed` counts settles on a down port that skipped a retry not yet due, which made no syscall), generated frames, `cross_port_copies`, and the kernel `XDP_STATISTICS` (`kernel_rx_dropped`, `kernel_rx_invalid_descs`, `kernel_tx_invalid_descs`, `kernel_rx_ring_full`, `kernel_rx_fill_ring_empty_descs`, `kernel_tx_ring_empty_descs`) |
 | `reload.*` | `requested`, `applied`, `refused`, `failed` |
-| `watch.*` | `state` (`ok`/`warning`), `warnings` (all ports) |
+| `watch.*` | `state` (`ok`/`warning`), `warnings` (all ports), `link_rounds` (link rounds that came back from the watcher), `link_rounds_late` (due rounds skipped because one still ran), `link_rounds_stale` (late rounds past `--link-stale-secs`, each a failed link query) |
 | `if<id>.watch.*` | `tx_stall`, `tx_stall_ms`, `fill_starved`, `kick_errors_persistent`, `link_up`, `link_down_events`, `link_up_events`, `mtu`, `link_probe_errors`, `kernel_ipv4_addresses`, `kernel_forwarding`, `kernel_ipv4_routes`, `kernel_ipv6_addresses`, `kernel_ipv6_routes`, `kernel_ipv6_forwarding`, `kernel_ipv6_enabled`, `ipv4_weak_host`, `warnings` |
 | `privileges.*` | `state` (`dropped`, or `kept` under `--keep-privileges`), `bounding_set` (`cleared`/`kept`), `identity` (`switched`/`unchanged`), `threads` (threads verified by the drop; 0 when kept) |
 | `output.dropped` | output messages dropped because a stream could not keep up |
@@ -988,26 +1029,32 @@ which removes this remaining oracle.
   from rtnetlink's, which catches a foreign sysfs view with another MTU but
   not one with the same MTU. Run `ruster run` under `ip netns exec <ns>`,
   which remounts `/sys`.
-- The link watch and the reload's parse and plan run synchronously on the
-  router thread: one link query and up to four dumps (IPv4 addresses and
-  routes, and with IPv6 on the port IPv6 addresses and routes) per second
-  per port (the `send` blocks while another process holds the kernel's
-  RTNL lock), and a reload for a few milliseconds; RX queues in the ring
-  meanwhile and can overflow under load. The reload's quiescence wait holds
-  RX back for at most 200 ms. Each dump lists the whole namespace (the
-  route dumps every table), so its cost grows with every address and route
-  the namespace holds: keep the router in a dedicated namespace with a
-  small routing table, and set `disable_ipv6=1` on the ports, which skips
-  both IPv6 dumps.
+- The link watch (one link query and up to four dumps per second per port:
+  IPv4 addresses and routes, and with IPv6 on the port IPv6 addresses and
+  routes) and the reload's read, parse and plan run on worker threads
+  (section 7), so neither an RTNL hold nor a large config stops RX. A
+  watcher stuck for longer than `--link-stale-secs` plus two rounds ends
+  the run (`LINK_UNVERIFIABLE`, fail closed); an RTNL hold longer than that
+  (rare, some driver resets) therefore restarts the router. The reload's
+  quiescence wait still holds RX back for at most 200 ms. Each dump lists
+  the whole namespace (the route dumps every table), so its cost grows
+  with every address and route the namespace holds: keep the router in a
+  dedicated namespace with a small routing table, and set `disable_ipv6=1`
+  on the ports, which skips both IPv6 dumps.
+- A reload preparation cannot be interrupted: one stuck reading the config
+  (for example on a hung network file system) keeps further SIGHUPs
+  waiting until the run stops (`stage=prepare code=STOPPED`). Keep the
+  config on a local file system.
 - A port that is administratively down with TX queued holds those frames
   in the kernel's ring, so a reload while it is down fails with
   `stage=quiesce code=TIMEOUT`; bring the link up first.
 - Every reload rotates the NAT44 and firewall hash keys and flushes their
   state (PUB-006): reloading during busy NAT traffic drops established TCP
   sessions through NAT.
-- The `FILL_STARVED` delay (1 s), the 3 failed queries, and the watch
-  intervals (500 ms health, 1 s link) are fixed; the TX stall and kick
-  error thresholds are flags (section 3), not reloadable.
+- The `FILL_STARVED` delay (1 s), the 3 failed queries, the watch
+  intervals (500 ms health, 1 s link), and the 500 ms worker stop bound are
+  fixed; the TX stall, kick error and stale-round thresholds are flags
+  (section 3), not reloadable.
 - Kernel routes are attributed to a port by the kernel's device filter and
   then by `RTA_OIF` and `RTA_MULTIPATH` nexthops in userspace. With
   `net.ipv4.nexthop_compat_mode=0` (shared by IPv6) a route through a

@@ -4,6 +4,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use ruster_config::{ValidatedAfXdpPortV1, ValidatedAfXdpV1, ValidatedConfigV1, XdpAttachModeV1};
@@ -104,19 +106,22 @@ struct State {
     clock_out_of_order: Cell<bool>,
     /// Health sample rounds handed out by `sample_ports`, one per call.
     samples: RefCell<VecDeque<Vec<PortSample>>>,
-    /// Link query results, consumed in order by the matching port.
-    links: RefCell<VecDeque<(IfId, Result<LinkFacts, NetlinkError>)>>,
-    link_queries: Cell<u32>,
+    /// Link query results, consumed in order by the matching port (shared
+    /// with the link watcher thread, like the other link scripts).
+    links: Shared<VecDeque<(IfId, Result<LinkFacts, NetlinkError>)>>,
+    link_queries: Shared<u32>,
     /// Address dump results, consumed in order by the matching port.
-    addresses: RefCell<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
+    addresses: Shared<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
     /// Forwarding sysctl results, consumed in order by the matching port.
-    forwarding: RefCell<VecDeque<(IfId, Result<Forwarding, ()>)>>,
+    forwarding: Shared<VecDeque<(IfId, Result<Forwarding, ()>)>>,
     /// IPv4 route dump results, consumed in order by the matching port.
-    routes: RefCell<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
+    routes: Shared<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
     /// Weak-host readings, consumed in order by the matching port.
-    weak_host: RefCell<VecDeque<(IfId, Option<bool>)>>,
+    weak_host: Shared<VecDeque<(IfId, Option<bool>)>>,
     /// IPv6 samples, consumed in order by the matching port.
-    ipv6: RefCell<VecDeque<(IfId, Ipv6Sample)>>,
+    ipv6: Shared<VecDeque<(IfId, Ipv6Sample)>>,
+    /// The link watcher's queries block while this gate is closed.
+    link_gate: Shared<Gate>,
     /// Quiescence probes refused before one succeeds.
     quiesce_blocks: Cell<u32>,
     quiesce_probes: Cell<u32>,
@@ -162,8 +167,37 @@ struct FakeHost {
     preflight_policies: RefCell<Vec<PrivilegePolicy>>,
 }
 
+/// State shared with a worker thread (test only).
+struct Shared<T>(Arc<Mutex<T>>);
+
+impl<T: Default> Default for Shared<T> {
+    fn default() -> Self {
+        Self(Arc::default())
+    }
+}
+
+impl<T> Shared<T> {
+    fn borrow_mut(&self) -> MutexGuard<'_, T> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn share(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+/// Holds the link watcher's queries while closed (a watcher stuck on the
+/// RTNL lock); `entered` counts queries that reached it.
+#[derive(Default)]
+struct Gate {
+    closed: bool,
+    entered: u32,
+}
+
 /// Pops the front result of `queue` if it belongs to `port`.
-fn scripted<T>(queue: &RefCell<VecDeque<(IfId, T)>>, port: IfId) -> Option<T> {
+fn scripted<T>(queue: &Shared<VecDeque<(IfId, T)>>, port: IfId) -> Option<T> {
     let mut queue = queue.borrow_mut();
     if queue.front().is_some_and(|(id, _)| *id == port) {
         return queue.pop_front().map(|(_, result)| result);
@@ -332,16 +366,41 @@ impl Datapath for FakeDatapath<'_> {
     }
 }
 
+/// The link script of a [`State`], moved to the link watcher thread.
 struct FakeLinks {
-    state: Rc<State>,
+    links: Shared<VecDeque<(IfId, Result<LinkFacts, NetlinkError>)>>,
+    link_queries: Shared<u32>,
+    addresses: Shared<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
+    forwarding: Shared<VecDeque<(IfId, Result<Forwarding, ()>)>>,
+    routes: Shared<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
+    weak_host: Shared<VecDeque<(IfId, Option<bool>)>>,
+    ipv6: Shared<VecDeque<(IfId, Ipv6Sample)>>,
+    gate: Shared<Gate>,
+}
+
+impl FakeLinks {
+    fn of(state: &State) -> Self {
+        Self {
+            links: state.links.share(),
+            link_queries: state.link_queries.share(),
+            addresses: state.addresses.share(),
+            forwarding: state.forwarding.share(),
+            routes: state.routes.share(),
+            weak_host: state.weak_host.share(),
+            ipv6: state.ipv6.share(),
+            gate: state.link_gate.share(),
+        }
+    }
 }
 
 impl LinkMonitor for FakeLinks {
     fn query(&mut self, target: &LinkTarget) -> Result<LinkFacts, NetlinkError> {
-        self.state
-            .link_queries
-            .set(self.state.link_queries.get() + 1);
-        let mut links = self.state.links.borrow_mut();
+        self.gate.borrow_mut().entered += 1;
+        while self.gate.borrow_mut().closed {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        *self.link_queries.borrow_mut() += 1;
+        let mut links = self.links.borrow_mut();
         if links
             .front()
             .is_some_and(|(port, _)| *port == target.interface)
@@ -359,7 +418,7 @@ impl LinkMonitor for FakeLinks {
     }
 
     fn ipv4_addresses(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError> {
-        let mut addresses = self.state.addresses.borrow_mut();
+        let mut addresses = self.addresses.borrow_mut();
         if addresses
             .front()
             .is_some_and(|(port, _)| *port == target.interface)
@@ -372,7 +431,7 @@ impl LinkMonitor for FakeLinks {
     }
 
     fn forwarding(&mut self, target: &LinkTarget) -> Result<Forwarding, ()> {
-        let mut forwarding = self.state.forwarding.borrow_mut();
+        let mut forwarding = self.forwarding.borrow_mut();
         if forwarding
             .front()
             .is_some_and(|(port, _)| *port == target.interface)
@@ -385,15 +444,15 @@ impl LinkMonitor for FakeLinks {
     }
 
     fn ipv4_weak_host(&mut self, target: &LinkTarget) -> Option<bool> {
-        scripted(&self.state.weak_host, target.interface).unwrap_or(Some(false))
+        scripted(&self.weak_host, target.interface).unwrap_or(Some(false))
     }
 
     fn ipv4_routes(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError> {
-        scripted(&self.state.routes, target.interface).unwrap_or(Ok(0))
+        scripted(&self.routes, target.interface).unwrap_or(Ok(0))
     }
 
     fn ipv6(&mut self, target: &LinkTarget) -> Ipv6Sample {
-        scripted(&self.state.ipv6, target.interface).unwrap_or(Ipv6Sample::DISABLED)
+        scripted(&self.ipv6, target.interface).unwrap_or(Ipv6Sample::DISABLED)
     }
 }
 
@@ -416,9 +475,15 @@ impl PortHost for FakeHost {
         if self.fails(Stage::Watch, None) {
             return Err(Failure::Links(NetlinkError::Errno(24)));
         }
-        Ok(FakeLinks {
-            state: Rc::clone(&self.state),
-        })
+        Ok(FakeLinks::of(&self.state))
+    }
+
+    fn thread_prologue(&self) -> fn(PrivilegePolicy) -> Result<(), DropFailure> {
+        if self.fails(Stage::Workers, None) {
+            |_| Err(DropFailure::Injected)
+        } else {
+            |_| Ok(())
+        }
     }
 
     fn preflight(
@@ -609,26 +674,33 @@ impl StopSignal for FakeStop {
     }
 }
 
-/// Scripted reload documents, shared with the test.
+/// Scripted reload documents, shared with the test (and the reload
+/// worker thread).
 #[derive(Clone, Default)]
 struct FakeSource {
-    documents: Rc<RefCell<VecDeque<Result<ValidatedConfigV1, LoadError>>>>,
-    loads: Rc<Cell<u32>>,
+    documents: Arc<Mutex<VecDeque<Result<ValidatedConfigV1, LoadError>>>>,
+    loads: Arc<AtomicU32>,
+    /// Loads block while this is set (a slow parse).
+    hold: Arc<AtomicBool>,
 }
 
 impl FakeSource {
     fn with(documents: impl IntoIterator<Item = Result<ValidatedConfigV1, LoadError>>) -> Self {
         let source = Self::default();
-        source.documents.borrow_mut().extend(documents);
+        source.documents.lock().unwrap().extend(documents);
         source
     }
 }
 
 impl ConfigSource for FakeSource {
     fn load(&mut self) -> Result<ValidatedConfigV1, LoadError> {
-        self.loads.set(self.loads.get() + 1);
+        self.loads.fetch_add(1, Ordering::SeqCst);
+        while self.hold.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+        }
         self.documents
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .pop_front()
             .unwrap_or(Err(LoadError::Read(std::io::ErrorKind::NotFound)))
     }
@@ -643,6 +715,7 @@ fn settings(policy: CheckPolicy, stats_interval_ms: u64) -> Settings {
         startup_attempts: 3,
         health_interval_ms: 0,
         link_interval_ms: 0,
+        link_stale_ms: super::watch::DEFAULT_LINK_STALE_MS,
         reload_quiesce_ms: super::reload::RELOAD_QUIESCE_MS,
         thresholds: super::watch::Thresholds::default(),
         privileges: PrivilegePolicy::default(),
@@ -1295,7 +1368,7 @@ fn bridge_rejection_is_an_invalid_config() {
 
 /// Counts this thread's allocations while armed (test binary only).
 #[allow(unsafe_code)]
-mod counting {
+pub(super) mod counting {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::Cell;
 
@@ -1468,6 +1541,17 @@ thread_local! {
 /// Consumed by `run_ports` right after `ActivePublication::new`.
 pub(super) fn take_activation_failure() -> bool {
     FAIL_ACTIVATION.with(|flag| flag.replace(false))
+}
+
+thread_local! {
+    static ASYNC_WORKERS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Consumed by `run_ports` when it spawns the workers: `true` runs them
+/// asynchronously as in production; by default each request waits for
+/// its answer (lockstep), so the tests stay deterministic.
+pub(super) fn take_async_workers() -> bool {
+    ASYNC_WORKERS.with(|flag| flag.replace(false))
 }
 
 thread_local! {
@@ -2108,3 +2192,6 @@ fn a_failed_drop_rolls_back_every_port_and_exits_1_without_a_tick() {
 
 #[path = "ops_tests.rs"]
 mod ops;
+
+#[path = "async_tests.rs"]
+mod asynchronous;

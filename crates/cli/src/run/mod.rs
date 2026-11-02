@@ -113,6 +113,7 @@ mod stats;
 #[cfg(test)]
 mod tests;
 mod watch;
+mod workers;
 
 use std::io::Write;
 use std::time::Duration;
@@ -135,12 +136,13 @@ use engine::{
     RunStatus, ShutdownReport, StopSignal, DRAIN_DEADLINE_MS,
 };
 use privileges::{Identity, PrivilegePolicy, PrivilegeState};
-use reload::{ConfigSource, Reloader};
+use reload::{ConfigSource, Preparer, ReloadWorker, Reloader};
 use startup::{
     open_ports, CloseFailure, Failure, Interrupt, OpenedPorts, PortHost, Stage, StartupError,
 };
 use stats::BlockKind;
 use watch::{Thresholds, Watch, HEALTH_INTERVAL_MS, LINK_INTERVAL_MS};
+use workers::{LinkWatcher, Worker, WORKER_STOP_MS};
 
 /// Shutdown deadline passed with TX frames still owned by the kernel.
 pub const EXIT_DRAIN_INCOMPLETE: u8 = 3;
@@ -167,6 +169,9 @@ pub struct Settings {
     pub startup_attempts: u32,
     pub health_interval_ms: u64,
     pub link_interval_ms: u64,
+    /// Age of an outstanding link round from which due rounds are stale
+    /// (`--link-stale-secs`, [`watch`]).
+    pub link_stale_ms: u64,
     pub reload_quiesce_ms: u64,
     /// Health thresholds of the watch.
     pub thresholds: Thresholds,
@@ -189,6 +194,7 @@ impl Settings {
             startup_attempts: args.startup_attempts,
             health_interval_ms: HEALTH_INTERVAL_MS,
             link_interval_ms: LINK_INTERVAL_MS,
+            link_stale_ms: args.link_stale_secs.saturating_mul(1_000),
             reload_quiesce_ms: reload::RELOAD_QUIESCE_MS,
             thresholds: Thresholds::from_secs(
                 args.tx_stall_warn_secs,
@@ -379,8 +385,8 @@ pub fn execute<H, K, R, C, S, O, E>(
 ) -> u8
 where
     H: PortHost,
-    K: ProductionKeySource,
-    R: ConfigSource,
+    K: ProductionKeySource + Send + 'static,
+    R: ConfigSource + Send + 'static,
     C: Clock,
     S: StopSignal,
     O: Write,
@@ -470,7 +476,7 @@ where
             &mut opened,
             candidate,
             &mut storage,
-            Reloader::new(sequencer, config, source),
+            Preparer::new(sequencer, config, source),
             settings,
             clock,
             stop,
@@ -531,7 +537,7 @@ fn run_ports<'h, H, K, R, C, S, O, E>(
     opened: &mut OpenedPorts<'h, H>,
     candidate: ValidatedCandidate,
     storage: &mut FullServiceStorage,
-    reloader: Reloader<K, R>,
+    preparer: Preparer<K, R>,
     settings: Settings,
     clock: &mut C,
     stop: &S,
@@ -540,14 +546,15 @@ fn run_ports<'h, H, K, R, C, S, O, E>(
 ) -> Result<Ran, Interrupt>
 where
     H: PortHost,
-    K: ProductionKeySource,
-    R: ConfigSource,
+    K: ProductionKeySource + Send + 'static,
+    R: ConfigSource + Send + 'static,
     C: Clock,
     S: StopSignal,
     O: Write,
     E: Write,
 {
-    let devices: Vec<(IfId, &str)> = reloader
+    let budgets = budgets(preparer.current());
+    let devices: Vec<(IfId, &str)> = preparer
         .current()
         .backend()
         .af_xdp()
@@ -586,6 +593,16 @@ where
             Failure::Activation(error),
         ))
     })?;
+    // The cold-path workers (H7) start before the drop and drop their own
+    // privileges first, so the process-wide check below covers them.
+    let (links, reloads) = spawn_workers(host, links, &targets, preparer, settings.privileges)
+        .map_err(Interrupt::Failed)?;
+    #[cfg(test)]
+    let (links, reloads) = {
+        let lockstep = !tests::take_async_workers();
+        (links.lockstep(lockstep), reloads.lockstep(lockstep))
+    };
+    let reloader = Reloader::new(reloads, budgets);
     // Nothing after this point needs a privilege (see [`privileges`]).
     let privileges = match settings.privileges {
         PrivilegePolicy::Keep => PrivilegeState::Kept,
@@ -619,7 +636,8 @@ where
         reloader,
         watch: Watch::new(&targets, settings.thresholds)
             .allowing_kernel_forwarding(settings.policy.allow_kernel_forwarding)
-            .allowing_kernel_ipv6(settings.policy.allow_kernel_ipv6),
+            .allowing_kernel_ipv6(settings.policy.allow_kernel_ipv6)
+            .with_link_stale_ms(settings.link_stale_ms),
         links,
     };
     let end = run_loop(
@@ -649,6 +667,13 @@ where
     if let Some(outcome) = control.reloader.abandon("STOPPED", active.generation()) {
         let _ = writeln!(err, "ruster run: {outcome}");
     }
+    // The workers end once their current request returns; that is waited
+    // for after the drain, bounded (see [`workers`]).
+    let workers_deadline = std::time::Instant::now() + Duration::from_millis(WORKER_STOP_MS);
+    let workers = [
+        ("link watcher", control.links.stop()),
+        ("reload worker", control.reloader.stop_worker()),
+    ];
     let _ = writeln!(
         err,
         "ruster run: {}; draining",
@@ -664,6 +689,7 @@ where
         }
     );
     let shutdown = shutdown_drain(&mut datapath, clock, stop, settings.drain_deadline_ms);
+    finish_workers(workers, workers_deadline, err);
     // The ports are about to be detached: whatever the kernel would do
     // with their frames now matters.
     let exposure = control.watch.kernel_exposure();
@@ -722,6 +748,50 @@ where
         shutdown,
         final_block,
     })
+}
+
+/// Spawns the link watcher and the reload worker, each running the host's
+/// per-thread privilege drop of `policy` first.
+fn spawn_workers<H, K, R>(
+    host: &H,
+    links: H::Links,
+    targets: &[watch::LinkTarget],
+    preparer: Preparer<K, R>,
+    policy: PrivilegePolicy,
+) -> Result<(LinkWatcher, ReloadWorker), StartupError>
+where
+    H: PortHost,
+    K: ProductionKeySource + Send + 'static,
+    R: ConfigSource + Send + 'static,
+{
+    let prologue = host.thread_prologue();
+    let failed = |error| match error {
+        output::SpawnError::Prologue(error) => {
+            StartupError::new(Stage::PrivilegeDrop, None, Failure::PrivilegeDrop(error))
+        }
+        output::SpawnError::Io => StartupError::new(Stage::Workers, None, Failure::Spawn),
+    };
+    let watcher = LinkWatcher::spawn(links, targets, move || prologue(policy)).map_err(failed)?;
+    let reloads = ReloadWorker::spawn(preparer, move || prologue(policy)).map_err(failed)?;
+    Ok((watcher, reloads))
+}
+
+/// Waits for the stopped workers until `deadline` and abandons those still
+/// running (a watcher blocked on the RTNL lock), with a warning each.
+fn finish_workers(
+    workers: [(&str, Option<Worker>); 2],
+    deadline: std::time::Instant,
+    err: &mut impl Write,
+) {
+    for (name, worker) in workers {
+        if worker.is_some_and(|worker| !worker.finish(deadline)) {
+            let _ = writeln!(
+                err,
+                "ruster run: warning: the {name} thread did not end within {WORKER_STOP_MS} ms \
+                 after the loop; abandoned"
+            );
+        }
+    }
 }
 
 fn render<D: Datapath>(

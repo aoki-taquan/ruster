@@ -64,7 +64,7 @@ fn checksum(bytes: &[u8]) -> u16 {
 }
 
 /// An ICMPv4 Echo Request from the LAN host to the router's LAN address.
-fn echo_request(sequence: u16) -> Vec<u8> {
+pub(super) fn echo_request(sequence: u16) -> Vec<u8> {
     let mut icmp = vec![8, 0, 0, 0, 0x12, 0x34];
     icmp.extend_from_slice(&sequence.to_be_bytes());
     icmp.extend_from_slice(b"ruster!!");
@@ -94,7 +94,7 @@ fn edited(edit: impl Fn(String) -> String) -> ValidatedConfigV1 {
     }
 }
 
-fn echo_off() -> ValidatedConfigV1 {
+pub(super) fn echo_off() -> ValidatedConfigV1 {
     edited(|text| text.replace("echo-reply = true", "echo-reply = false"))
 }
 
@@ -111,7 +111,7 @@ fn ops(host: &FakeHost, source: FakeSource, stop: &impl StopSignal) -> Outcome {
     )
 }
 
-fn line_value<'a>(out: &'a str, key: &str) -> Option<&'a str> {
+pub(super) fn line_value<'a>(out: &'a str, key: &str) -> Option<&'a str> {
     out.lines()
         .rev()
         .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
@@ -131,7 +131,7 @@ fn a_reload_applies_at_a_tick_boundary_and_changes_the_traffic_outcome() {
         &StopAfterTicks::new(&host, 40, &[10]),
     );
     assert_eq!(outcome.status, 0, "{}", outcome.err);
-    assert_eq!(source.loads.get(), 1);
+    assert_eq!(source.loads.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert!(
         outcome
             .err
@@ -393,10 +393,9 @@ impl StopSignal for ReloadAt {
 #[test]
 fn an_applied_reload_without_its_report_is_not_kept_running() {
     use super::super::reload::{Reloader, TickApply};
-    let sequencer = ProductionSequencer::new(OsRandomKeySource::open().expect("urandom"));
-    let mut reloader = Reloader::new(sequencer, config(), FakeSource::default());
+    let mut reloader = Reloader::without_worker(super::super::budgets(&config()));
     let one_rx = edited(|text| text.replace("[tick]\nrx = 32", "[tick]\nrx = 1"));
-    reloader.set_pending_for_test(one_rx);
+    reloader.set_pending_for_test(super::super::budgets(&one_rx));
     let generation = std::num::NonZeroU64::new(2).expect("nonzero");
     let outcome = reloader
         .finish(generation, TickApply::Applied(None))
@@ -584,7 +583,7 @@ fn reload_requests_are_taken_one_at_a_time() {
         &StopAfterTicks::new(&host, 40, &[5, 5]),
     );
     assert_eq!(outcome.status, 0, "{}", outcome.err);
-    assert_eq!(source.loads.get(), 2);
+    assert_eq!(source.loads.load(std::sync::atomic::Ordering::SeqCst), 2);
     assert!(outcome
         .err
         .contains("reload applied: generation=2 previous=1"));

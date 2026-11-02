@@ -2,8 +2,11 @@
 //!
 //! Between ticks, at most every [`HEALTH_INTERVAL_MS`], the loop samples
 //! each port's backend counters ([`PortSample`]), and at most every
-//! [`LINK_INTERVAL_MS`] it queries each port's link over rtnetlink
-//! ([`super::netlink::LinkProbe`]). Both are pure decisions over those
+//! [`LINK_INTERVAL_MS`] it requests a link round from the link watcher
+//! thread ([`super::workers::LinkWatcher`], H7), which queries each port's
+//! link over rtnetlink ([`super::netlink::LinkProbe`]) and reads its
+//! sysctls; the router thread folds the finished round in here when it
+//! comes back, without waiting for it. Both are pure decisions over those
 //! samples here, so every threshold is tested without a kernel. Nothing in
 //! this module allocates: per-port state is fixed at startup, and events
 //! are handed to a callback (which formats a line only when something
@@ -66,6 +69,25 @@
 //! own consecutive failures, so one query that succeeds every round
 //! cannot keep another that fails every round from becoming fatal.
 //!
+//! # Stale rounds (H7)
+//!
+//! A round runs on the watcher thread, so a `send` that waits while
+//! another process holds the RTNL lock (seconds during a driver reset)
+//! stalls only the watcher; the router keeps forwarding. When a round is
+//! due while the previous one still runs, no new round is requested (at
+//! most one is outstanding) and the due round counts as late
+//! (`watch.link_rounds_late`). Once the outstanding round is older than
+//! the stale threshold ([`DEFAULT_LINK_STALE_MS`], `--link-stale-secs`),
+//! every further due round is a stale round (`watch.link_rounds_stale`):
+//! a failed `Link` query on every port (warning `LINK_PROBE`, fatal
+//! `LINK_UNVERIFIABLE` after [`LINK_PROBE_FAILURES_FATAL`] in a row) plus
+//! a warning `LINK_WATCH_STALE`, which recovers when the round comes back
+//! (its results are then folded in as usual, and a successful link query
+//! resets the failure count). With the defaults a brief RTNL hold (below
+//! 5 s) costs nothing but late rounds, and a watcher stuck for about
+//! 7 s ends the run (fail closed: the router does not run on without
+//! observing its ports). A watcher thread that died counts the same way.
+//!
 //! A fatal event ends the run loop; the shutdown then drains, detaches,
 //! closes, and exits 1 (no silent continuation).
 
@@ -75,6 +97,7 @@ use ruster_core::{FieldValue, FieldVisitor, IfId, MonotonicMillis, ObservableFie
 
 use super::checks::mtu_limit;
 use super::netlink::{LinkFacts, NetlinkError};
+use super::workers::LinkRound;
 
 /// The kernel IPv6 facts of one port in one link round.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,6 +192,9 @@ impl Thresholds {
 }
 /// Link queries failing in a row before the link counts as unverifiable.
 pub const LINK_PROBE_FAILURES_FATAL: u32 = 3;
+/// Default age of an outstanding link round from which every due round
+/// counts as a failed link query (`--link-stale-secs`).
+pub const DEFAULT_LINK_STALE_MS: u64 = 5_000;
 
 /// One port's backend counters at one instant (cold path).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -272,6 +298,9 @@ pub enum Condition {
     /// The address-less port has the effective `rp_filter` 0 (or
     /// unreadable): weak-host exposure once detached.
     Ipv4WeakHost,
+    /// The link watcher's outstanding round is older than the stale
+    /// threshold (H7).
+    LinkWatchStale,
 }
 
 impl Condition {
@@ -293,6 +322,7 @@ impl Condition {
             Self::Ipv6Unverifiable => "IPV6_UNVERIFIABLE",
             Self::KernelIpv6Enabled => "KERNEL_IPV6_ENABLED",
             Self::Ipv4WeakHost => "IPV4_WEAK_HOST_EXPOSURE",
+            Self::LinkWatchStale => "LINK_WATCH_STALE",
         }
     }
 }
@@ -401,6 +431,7 @@ struct PortWatch {
     ipv6_unverifiable_warned: bool,
     ipv6_enabled_warned: bool,
     weak_host_warned: bool,
+    stale_warned: bool,
     counters: PortHealth,
 }
 
@@ -521,6 +552,21 @@ pub struct Watch {
     allow_kernel_ipv6: bool,
     last_health: Option<MonotonicMillis>,
     last_link: Option<MonotonicMillis>,
+    /// Age of an outstanding round from which a due round is stale.
+    link_stale_ms: u64,
+    rounds: RoundCounters,
+}
+
+/// Link round counters of the watch (`watch.link_rounds*`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RoundCounters {
+    /// Rounds that came back from the watcher and were folded in.
+    pub completed: u64,
+    /// Due rounds not requested because the previous one still ran.
+    pub late: u64,
+    /// Late rounds past the stale threshold (each a failed link query of
+    /// every port).
+    pub stale: u64,
 }
 
 impl Watch {
@@ -551,6 +597,7 @@ impl Watch {
                     ipv6_unverifiable_warned: false,
                     ipv6_enabled_warned: false,
                     weak_host_warned: false,
+                    stale_warned: false,
                     counters: PortHealth {
                         link_up: true,
                         mtu: target.mtu,
@@ -563,6 +610,77 @@ impl Watch {
             allow_kernel_ipv6: false,
             last_health: None,
             last_link: None,
+            link_stale_ms: DEFAULT_LINK_STALE_MS,
+            rounds: RoundCounters::default(),
+        }
+    }
+
+    /// The stale threshold of outstanding link rounds
+    /// (`--link-stale-secs`; see the module documentation).
+    #[must_use]
+    pub const fn with_link_stale_ms(mut self, stale_ms: u64) -> Self {
+        self.link_stale_ms = stale_ms;
+        self
+    }
+
+    /// The link round counters.
+    #[cfg(test)]
+    pub const fn rounds(&self) -> RoundCounters {
+        self.rounds
+    }
+
+    /// Folds one finished link round (from the watcher thread) into every
+    /// port, in the order the queries ran, and recovers
+    /// `LINK_WATCH_STALE`.
+    pub fn on_round(&mut self, round: &LinkRound, emit: &mut impl FnMut(WatchEvent)) {
+        self.rounds.completed = self.rounds.completed.saturating_add(1);
+        for (index, port) in round.ports().iter().enumerate() {
+            if let Some(watch) = self.ports.get_mut(index) {
+                watch.exposure(
+                    |port| &mut port.stale_warned,
+                    Condition::LinkWatchStale,
+                    false,
+                    emit,
+                );
+            }
+            self.on_link(index, port.link, emit);
+            if let Some(addresses) = port.addresses {
+                self.on_addresses(index, addresses, emit);
+            }
+            if let Some(routes) = port.routes {
+                self.on_ipv4_routes(index, routes, emit);
+            }
+            self.on_forwarding(index, port.forwarding, emit);
+            self.on_weak_host(index, port.weak_host, emit);
+            if let Some(ipv6) = port.ipv6 {
+                self.on_ipv6(index, ipv6, emit);
+            }
+        }
+    }
+
+    /// A link round became due at `now` while the round requested at
+    /// `since` still runs: late, and stale once `since` is at least the
+    /// stale threshold old (a failed `Link` query and a
+    /// `LINK_WATCH_STALE` warning on every port).
+    pub fn on_late_round(
+        &mut self,
+        now: MonotonicMillis,
+        since: MonotonicMillis,
+        emit: &mut impl FnMut(WatchEvent),
+    ) {
+        self.rounds.late = self.rounds.late.saturating_add(1);
+        if now.0.saturating_sub(since.0) < self.link_stale_ms {
+            return;
+        }
+        self.rounds.stale = self.rounds.stale.saturating_add(1);
+        for port in self.ports.iter_mut() {
+            port.exposure(
+                |port| &mut port.stale_warned,
+                Condition::LinkWatchStale,
+                true,
+                emit,
+            );
+            port.probe_failed(Query::Link, emit);
         }
     }
 
@@ -580,15 +698,6 @@ impl Watch {
     pub const fn allowing_kernel_ipv6(mut self, allowed: bool) -> Self {
         self.allow_kernel_ipv6 = allowed;
         self
-    }
-
-    pub fn port_count(&self) -> usize {
-        self.ports.len()
-    }
-
-    /// The link target of port `index`, in `IfId` order.
-    pub fn target(&self, index: usize) -> Option<LinkTarget> {
-        self.ports.get(index).map(|port| port.target)
     }
 
     /// Whether a health sample is due at `now` (and marks it taken).
@@ -620,6 +729,7 @@ impl Watch {
                 || port.ipv6_unverifiable_warned
                 || port.ipv6_enabled_warned
                 || port.weak_host_warned
+                || port.stale_warned
         })
     }
 
@@ -668,7 +778,7 @@ impl Watch {
         port.sample(now, sample, self.thresholds, emit);
     }
 
-    /// Folds one link query result of port `index` (in [`Self::target`]
+    /// Folds one link query result of port `index` (in `IfId`
     /// order) and reports the resulting events.
     pub fn on_link(
         &mut self,
@@ -778,6 +888,21 @@ impl ObservableFields for Watch {
             sum.saturating_add(port.counters.warnings)
         });
         visitor.field(SECTION, "warnings", FieldValue::Count(warnings));
+        visitor.field(
+            SECTION,
+            "link_rounds",
+            FieldValue::Count(self.rounds.completed),
+        );
+        visitor.field(
+            SECTION,
+            "link_rounds_late",
+            FieldValue::Count(self.rounds.late),
+        );
+        visitor.field(
+            SECTION,
+            "link_rounds_stale",
+            FieldValue::Count(self.rounds.stale),
+        );
     }
 }
 
