@@ -109,7 +109,7 @@ owner決定2aとX05 labの決定を待って次に進める（下の「M2の判�
   M2aのcopy-mode router（一socketのsession、XDP program attach、RX/Fill engine、same-frame
   TX/Completion、generated frame、複数portのcore `PacketIo` adapter、configからのport構築と
   `ruster run`の起動/停止、reload、health/stall、link event、起動retry）までで、multi-queue worker
-  ownership（M2b S12、owner決定2a待ち）、zero-copy NICと実NIC forwarding E2E、hardware benchmark
+  ownership（M2b S12、2a: owner決定2026-11-02「C」（当面1 queue、X05と合わせて再検討））、zero-copy NICと実NIC forwarding E2E、hardware benchmark
   （M2b、X05 lab待ち）は無い。netns/veth上の`ruster run` E2Eは`scripts/priv-run-smoke.sh`で、M2 S11から
   hosted runnerの`XDP veth` CI job（`.github/workflows/xdp-veth.yml`）が毎PRで実行する。
 - `run-sim`はrestart-required applyをrejectとして報告し、同一process内でstorageを
@@ -455,12 +455,17 @@ M2に関するownerの発言は次だけである（2026-10-31〜11-01、session
 - X05 lab（4-queue zero-copy NIC labを用意するか）: 「まだ未定」（open のまま）。
 - 次の方向: 「運用の残りを固める」（CLI-034の残り項目のhardening。最初はH1: link down中のTX kick
   retryのrate limit）。
+- B3 / NAT44-038: 「A」。unsolicited inbound TCP SYNへのdelayed ICMP Port Unreachable（RFC 5382 REQ-4）を
+  実装する: bounded な≥6 sのhold、outbound SYNでcancel、それ以外はICMP 3/3、rate limit、operatorが
+  offにできるswitch。coordinatorは既定onを提案し（RFC SHOULD）、ownerはその提案でAを選んだ。現在の
+  CLI-034 hardeningの後に行う。
+- 2a: 「C」。multi-queueはdeferredのまま、M2aはportごとに1 queueのまま。X05のNIC選定と合わせて
+  再検討する。coordinatorの将来設計の希望（queueごとのexternal port range + NIC ntuple steering +
+  symmetric RSS）は決定ではない。
 
 owner決定待ち（open）:
 
-- 2a: multi-queue NAT affinity design。決まるまでmulti-queueは現scopeの外（M2b S12）。ownerの文言は無い。
 - X05 lab: 4-queue zero-copy NICのlabを用意するか。上の「まだ未定」。
-- B3 / NAT44-038: M2後に決める。ownerの文言は無い。
 
 coordinating agentの既定値（owner決定ではない）:
 
@@ -485,7 +490,7 @@ coordinating agentの既定値（owner決定ではない）:
 | S10a | X04b前半 `ruster run` startup/shutdown | #301 | merge済み |
 | S10b | X04b後半 reload、health、link、retry | #302 | merge済み |
 | S11 | `XDP veth` CI | #303 | merge済み |
-| S12 | multi-queue | — | M2b、owner決定2a待ち |
+| S12 | multi-queue | — | M2b、2a: owner決定2026-11-02「C」（当面1 queue、X05と合わせて再検討） |
 | S13 | M2a release evidenceとrunbook | このPR | — |
 
 M2a（coordinatorのscoping提案）: `ruster run`の下で動くcopy-mode AF_XDP router、veth E2EをCIで
