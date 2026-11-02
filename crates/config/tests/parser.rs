@@ -923,6 +923,59 @@ fn nat44_tcp_transitory_idle_ttls_default_and_are_exact() {
     }
 }
 
+/// N2 (RFC 6056 §4, RFC 7857 §9): `port-preservation` defaults to `true` in
+/// both protocol sections, takes exactly a boolean, and is not accepted in
+/// the realm.
+#[test]
+fn nat44_port_preservation_defaults_on_per_protocol_and_is_exact() {
+    const UDP: &str = "icmpv4-errors = \"external-only\"\n";
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    let nat = |source: &str| {
+        let VersionedConfig::V1(config) = parse(source.as_bytes()).unwrap() else {
+            panic!("schema version 1");
+        };
+        let nat = config.nat44.unwrap();
+        (
+            nat.udp.unwrap().port_preservation,
+            nat.tcp.unwrap().port_preservation,
+        )
+    };
+    assert_eq!(nat(VALID_V1), (true, true));
+    for value in [false, true] {
+        let udp = VALID_V1.replacen(UDP, &format!("{UDP}port-preservation = {value}\n"), 1);
+        assert_eq!(nat(&udp), (value, true));
+        let tcp = VALID_V1.replacen(TCP, &format!("{TCP}port-preservation = {value}\n"), 1);
+        assert_eq!(nat(&tcp), (true, value));
+    }
+    for (anchor, section, value) in [
+        (UDP, "udp", "1"),
+        (UDP, "udp", "\"false\""),
+        (TCP, "tcp", "0"),
+        (TCP, "tcp", "\"true\""),
+    ] {
+        let source =
+            VALID_V1.replacen(anchor, &format!("{anchor}port-preservation = {value}\n"), 1);
+        let diagnostic = parse(source.as_bytes()).unwrap_err();
+        assert_eq!(diagnostic.code(), DiagnosticCode::InvalidType, "{value}");
+        let expected: Vec<PathSegment> = ["nat44", section, "port-preservation"]
+            .iter()
+            .map(|field| PathSegment::Field((*field).to_owned()))
+            .collect();
+        assert_eq!(diagnostic.path().segments(), expected.as_slice());
+    }
+    let misplaced = parse(
+        VALID_V1
+            .replacen(
+                "[nat44.realm.ports]",
+                "port-preservation = true\n[nat44.realm.ports]",
+                1,
+            )
+            .as_bytes(),
+    )
+    .unwrap_err();
+    assert_eq!(misplaced.code(), DiagnosticCode::UnknownField);
+}
+
 /// B3 (RFC 5382 REQ-4): `[nat44.tcp] unsolicited-syn-icmp` defaults to
 /// `true` and `[nat44.tcp.capacity] unsolicited-syn-holds` to
 /// `DEFAULT_UNSOLICITED_SYN_HOLDS` (64); both are exact and TCP-only.

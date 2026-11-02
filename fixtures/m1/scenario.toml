@@ -8,8 +8,11 @@
 #
 # Expected frames are written with the typed builders, so their IPv4, UDP,
 # TCP, and ICMPv4 checksums are computed independently of the router's
-# incremental updates. NAT public ports (40011 UDP, 40008 TCP) are the
-# deterministic allocator choice for this seed and configuration. ICMPv4
+# incremental updates. NAT public ports are the deterministic keyed
+# allocator choice (N2, NAT44-020: SipHash of the internal endpoint under
+# the NAT hash key that the scenario seed derives for each generation):
+# 40014 for H:5000 UDP and 40006 for H:5001 TCP in generation 1, 40000 for
+# H:5004 UDP in generation 2. ICMPv4
 # error payloads were computed separately (RFC 792: type, code, checksum,
 # unused, then the received IPv4 header and payload as quoted bytes).
 schema = "ruster-scenario/v1"
@@ -53,7 +56,7 @@ at-ms = 10
 [[step]]
 kind = "expect"
 tx = [
-  { interface = "wan", frame = { kind = "udp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, ip = { src = "203.0.113.2", dst = "198.51.100.20", id = 2, ttl = 63 }, src-port = 40011, dst-port = 53, payload-ascii = "query-1" } },
+  { interface = "wan", frame = { kind = "udp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, ip = { src = "203.0.113.2", dst = "198.51.100.20", id = 2, ttl = 63 }, src-port = 40014, dst-port = 53, payload-ascii = "query-1" } },
 ]
 consumes = [{ reason = "ARP_CONTROL", count = 1 }]
 
@@ -61,7 +64,7 @@ consumes = [{ reason = "ARP_CONTROL", count = 1 }]
 [[step]]
 kind = "inject"
 interface = "wan"
-frame = { kind = "udp", eth = { src = "02:00:00:00:00:fe", dst = "02:00:00:00:00:02" }, ip = { src = "198.51.100.20", dst = "203.0.113.2", id = 3 }, src-port = 53, dst-port = 40011, payload-ascii = "answer-1" }
+frame = { kind = "udp", eth = { src = "02:00:00:00:00:fe", dst = "02:00:00:00:00:02" }, ip = { src = "198.51.100.20", dst = "203.0.113.2", id = 3 }, src-port = 53, dst-port = 40014, payload-ascii = "answer-1" }
 
 [[step]]
 kind = "tick"
@@ -86,7 +89,7 @@ at-ms = 30
 [[step]]
 kind = "inject"
 interface = "wan"
-frame = { kind = "tcp", eth = { src = "02:00:00:00:00:fe", dst = "02:00:00:00:00:02" }, ip = { src = "198.51.100.20", dst = "203.0.113.2", id = 5 }, src-port = 80, dst-port = 40008, seq = 9000, ack = 1001, flags = ["syn", "ack"], window = 8192 }
+frame = { kind = "tcp", eth = { src = "02:00:00:00:00:fe", dst = "02:00:00:00:00:02" }, ip = { src = "198.51.100.20", dst = "203.0.113.2", id = 5 }, src-port = 80, dst-port = 40006, seq = 9000, ack = 1001, flags = ["syn", "ack"], window = 8192 }
 
 [[step]]
 kind = "tick"
@@ -95,7 +98,7 @@ at-ms = 40
 [[step]]
 kind = "expect"
 tx = [
-  { interface = "wan", frame = { kind = "tcp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, ip = { src = "203.0.113.2", dst = "198.51.100.20", id = 4, ttl = 63 }, src-port = 40008, dst-port = 80, seq = 1000, flags = ["syn"], window = 4096 } },
+  { interface = "wan", frame = { kind = "tcp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, ip = { src = "203.0.113.2", dst = "198.51.100.20", id = 4, ttl = 63 }, src-port = 40006, dst-port = 80, seq = 1000, flags = ["syn"], window = 4096 } },
   { interface = "lan", frame = { kind = "tcp", eth = { src = "02:00:00:00:00:01", dst = "02:00:00:00:00:10" }, ip = { src = "198.51.100.20", dst = "192.168.1.10", id = 5, ttl = 63 }, src-port = 80, dst-port = 5001, seq = 9000, ack = 1001, flags = ["syn", "ack"], window = 8192 } },
 ]
 
@@ -197,7 +200,7 @@ tx = []
 [[step]]
 kind = "inject"
 interface = "wan"
-frame = { kind = "udp", eth = { src = "02:00:00:00:00:fe", dst = "02:00:00:00:00:02" }, ip = { src = "198.51.100.20", dst = "203.0.113.2", id = 11 }, src-port = 53, dst-port = 40011, payload-ascii = "answer-2" }
+frame = { kind = "udp", eth = { src = "02:00:00:00:00:fe", dst = "02:00:00:00:00:02" }, ip = { src = "198.51.100.20", dst = "203.0.113.2", id = 11 }, src-port = 53, dst-port = 40014, payload-ascii = "answer-2" }
 
 [[step]]
 kind = "inject"
@@ -227,7 +230,7 @@ kind = "expect"
 generation = 2
 tx = [
   { interface = "wan", frame = { kind = "arp", eth = { src = "02:00:00:00:00:02", dst = "ff:ff:ff:ff:ff:ff" }, op = "request", sender-mac = "02:00:00:00:00:02", sender-ip = "203.0.113.2", target-ip = "203.0.113.1", pad-to-min = true } },
-  { interface = "wan", frame = { kind = "udp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, ip = { src = "203.0.113.2", dst = "192.0.2.50", id = 13, ttl = 63 }, src-port = 40011, dst-port = 9, payload-ascii = "nowhere" } },
+  { interface = "wan", frame = { kind = "udp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, ip = { src = "203.0.113.2", dst = "192.0.2.50", id = 13, ttl = 63 }, src-port = 40000, dst-port = 9, payload-ascii = "nowhere" } },
 ]
 drops = [
   { reason = "NAT44_UDP_MAPPING_MISS", count = 2 },
@@ -291,7 +294,7 @@ at-ms = 4020
 kind = "expect"
 generation = 2
 tx = [
-  { interface = "wan", frame = { kind = "udp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, ip = { src = "203.0.113.2", dst = "192.0.2.50", id = 14, ttl = 63 }, src-port = 40011, dst-port = 9, payload-ascii = "nowhere" } },
+  { interface = "wan", frame = { kind = "udp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, ip = { src = "203.0.113.2", dst = "192.0.2.50", id = 14, ttl = 63 }, src-port = 40000, dst-port = 9, payload-ascii = "nowhere" } },
 ]
 
 # --- 9. Rollback: re-applying v1 is a new generation (5) with fresh keys;

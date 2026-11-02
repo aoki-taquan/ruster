@@ -1321,13 +1321,53 @@ SYNs nobody completes, such as a scan or a spoofed SYN flood.
   endpoint-independent mapping), and a reconcile flush clears the tables
   (control path). An external inbound SYN still probes 16 keyed slots and
   can report the session table full while a reusable slot exists elsewhere
-  (NAT44-037). Port choice differs from before H4a in two ways (NAT44-068):
-  a new endpoint takes the first *unowned* port from its seeded start even
-  when a port of an expired mapping comes first (a returning endpoint
-  still gets its own old port back), and with every pool port owned a new
-  mapping takes the port of the longest-idle expired mapping. That last
-  choice follows expiry order, not the secret seed, so it is predictable
-  (randomization is deferred, NAT44-020).
+  (NAT44-037). Port choice (NAT44-068, N2 NAT44-089 to 091): a new
+  endpoint keeps its internal port if `port-preservation` is on (the
+  default) and the port is free; otherwise it takes the first *unowned*
+  port from a start keyed by the secret per-publication NAT hash key
+  (RFC 6056 Algorithm 3 without the remote endpoint, so the mapping stays
+  endpoint-independent), even when a port of an expired mapping comes
+  first (a returning endpoint still gets its own old port back). With
+  every pool port owned it probes 8 keyed pool ports for an expired owner
+  before falling back to the longest-idle expired mapping (with a fraction
+  f of owners expired, the fallback happens with probability about
+  (1-f)^8; duplicate probes make it slightly higher). It takes the first
+  expired owner it probes, not the oldest of them. The trade-off: a
+  mapping that expired a moment ago can lose its port before older
+  expired ones, so its returning endpoint (which would otherwise get the
+  same port back) gets a new one sooner; preferring the oldest probed
+  owner would pull the choice back toward the predictable expiry order.
+  Ports are therefore not predictable without the key, which every
+  reconcile (every applied reload) rotates and the sequencer never issues
+  twice; `allocator-seed` is only a non-secret salt.
+- Port preservation (`[nat44.udp]`/`[nat44.tcp]` `port-preservation`,
+  default `true`, reloadable; `ruster plan` shows
+  `nat44-udp port-preservation ~ on -> off`). On, the public port of a
+  host whose source port is in the pool and free is that source port, so
+  it is exactly as predictable as the host's own choice (RFC 6056 §4 and
+  RFC 7857 §9 allow this: obfuscate only when the port must change). If
+  inside hosts use predictable source ports (old stacks, embedded
+  devices), set it to `false`: every new mapping then gets a keyed port,
+  which hides the host's choice. It does not make the public port of an
+  endpoint with a fixed source port change between flows: the keyed
+  start is fixed per endpoint for one key generation, and a returning
+  endpoint keeps its own port, so a resolver must still randomize its
+  own source ports (RFC 5452). Also choose `false` when inside hosts are
+  not trusted: with preservation on, an inside host can learn whether a
+  public port is in use (its own source port comes back unchanged only if
+  the port was free), and a new mapping takes its internal port even
+  when it belongs to another host's just-expired mapping, so an inside
+  host can claim a victim's port the moment it expires (and receive what
+  remotes still send to it). With `false`, the port comes from the
+  victim-independent keyed search, and an expired port is reused only by
+  its own returning endpoint or by a keyed takeover when the pool is
+  full. Like every NAT change, the apply flushes the NAT state.
+- An inside host can still fill the pool (it opens mappings from many
+  source ports) and so steer other hosts into takeovers of expired ports
+  or into `PORT_EXHAUSTED`. There is no per-host mapping quota yet
+  (NAT44-092, deferred); size the pool and the mapping capacity for the
+  number of inside hosts, and use the firewall to limit what untrusted
+  hosts may open.
 - Debug builds validate every NAT44 index after each UDP commit (O(M+P)
   and more per packet). Use only release builds (`cargo build --release`)
   in production.

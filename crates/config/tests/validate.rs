@@ -1001,6 +1001,41 @@ fn nat44_hairpinning_maps_onto_core_policies_per_protocol() {
     assert_eq!(off.storage_shape(), defaults.storage_shape());
 }
 
+/// N2: `port-preservation` maps onto both core policies (default on, as
+/// the core default) and does not change the storage shape.
+#[test]
+fn nat44_port_preservation_maps_onto_core_without_changing_storage() {
+    use ruster_core::{Nat44TcpPolicy, Nat44UdpPolicy};
+    const UDP: &str = "icmpv4-errors = \"external-only\"\n";
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    let on = validated(VALID);
+    let nat = on.nat44().unwrap();
+    assert!(nat.udp().unwrap().policy().port_preservation());
+    assert!(nat.tcp().unwrap().policy().port_preservation());
+    assert!(Nat44UdpPolicy::default().port_preservation());
+    assert!(Nat44TcpPolicy::default().port_preservation());
+    let off = validated(
+        &VALID
+            .replacen(UDP, &format!("{UDP}port-preservation = false\n"), 1)
+            .replacen(TCP, &format!("{TCP}port-preservation = false\n"), 1),
+    );
+    let off_nat = off.nat44().unwrap();
+    let (udp_off, tcp_off) = (
+        off_nat.udp().unwrap().policy(),
+        off_nat.tcp().unwrap().policy(),
+    );
+    assert!(!udp_off.port_preservation() && !tcp_off.port_preservation());
+    assert_eq!(
+        udp_off.with_port_preservation(true),
+        nat.udp().unwrap().policy()
+    );
+    assert_eq!(
+        tcp_off.with_port_preservation(true),
+        nat.tcp().unwrap().policy()
+    );
+    assert_eq!(off.storage_shape(), on.storage_shape());
+}
+
 /// B3: the switch maps onto the core TCP policy without changing the
 /// storage shape; the hold capacity is a quote table (bounded by
 /// `max_quote_slots_per_table`) counted in `required_bytes`.

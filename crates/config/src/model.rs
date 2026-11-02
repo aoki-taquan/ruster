@@ -300,6 +300,12 @@ pub struct Nat44UdpV1 {
     /// `false` is an RFC 1812 §1.1.3 security option.
     #[serde(default = "enabled")]
     pub hairpinning: bool,
+    /// Port preservation (RFC 4787 §4.2.1): a new mapping keeps the internal
+    /// port when it is in the pool and free; absent means `true`, the
+    /// port-preserving NAPT of RFC 6056 §4 / RFC 7857 §9. `false` always selects
+    /// a keyed, obfuscated port.
+    #[serde(default = "enabled")]
+    pub port_preservation: bool,
     pub capacity: Nat44UdpCapacityV1,
 }
 
@@ -338,6 +344,12 @@ pub struct Nat44TcpV1 {
     /// `false` is an RFC 1812 §1.1.3 security option.
     #[serde(default = "enabled")]
     pub hairpinning: bool,
+    /// Port preservation (RFC 4787 §4.2.1): a new mapping keeps the internal
+    /// port when it is in the pool and free; absent means `true`, the
+    /// port-preserving NAPT of RFC 6056 §4 / RFC 7857 §9. `false` always selects
+    /// a keyed, obfuscated port.
+    #[serde(default = "enabled")]
+    pub port_preservation: bool,
     /// Limit on live sessions that external inbound initial SYNs created on
     /// one mapping from one remote IPv4 address; `0` means no limit. Absent
     /// means 0 (no limit): a limit is an opt-in local security policy, and

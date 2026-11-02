@@ -1392,20 +1392,59 @@ O(M+P)以上で検証するため本番に使ってはいけません。
 
 public portはport owner tableと同時に更新されるcaller-backed free-port bitmap（portごとに
 1 bit、64 portごとにsummary 1 bit。pool 65535で1040 words、8320 bytes）から選びます。
-順に、(1) internal portがowner無しかexpired ownerならそれ（RFC 4787 REQ-3のport
-preservation）、(2) 同じinternal endpointのexpired mappingをその場で再生成するとき、その
-mappingがまだ自分のportを持っていればそのport（戻ってきたendpointのpublic portを保つ。O(1)）、
-(3) secret allocator seedとinternal endpointから決まるseeded startから最初のowner無しport
-（bitmapで、owner無しportだけを見るpoolの走査と同じport。読み込みは2 + 2×summary words、最大
-34 words）、(4) owner無しportが無ければparked mapping、次にexpiredなactivity先頭のportを
-引き継ぎます。live ownerだけならfail closedで`PORT_EXHAUSTED`です。
+順に、(1) `port-preservation`（default true）のときinternal portがowner無しかexpired
+ownerならそれ（RFC 4787 §4.2.1のport preservation）、(2) 同じinternal endpointのexpired
+mappingをその場で再生成するとき、そのmappingがまだ自分のportを持っていればそのport（戻って
+きたendpointのpublic portを保つ。O(1)）、(3) keyed start（下の「Keyed port selection」）から
+最初のowner無しport（bitmapで、owner無しportだけを見るpoolの走査と同じport。読み込みは
+2 + 2×summary words、最大34 words）、(4) owner無しportが無ければ、keyed probe 8個のうち
+ownerがexpiredなport、全てliveならparked mapping、次にexpiredなactivity先頭のportを引き継ぎ
+ます。live ownerだけならfail closedで`PORT_EXHAUSTED`です。
 
 H4a前の走査はseeded startから「owner無し**または**expired owner」の最初のportを選んだので、
 (3)はowner無しportより手前にexpired ownerのportがあるときに違うportを選びます（reviewの測定で
 64 seed、8801回中597回）。戻ってきたendpointについては(2)が以前と同じportを保ち、それ以外の
 新しいendpointでは最近expiredしたportの再利用が遅れるだけで、RFC 4787/6056上の要件に差は
-ありません。(4)はexpiry順（FIFO）でseedやendpointに依存せず予測可能です。そこに至るのは
-pool全体にownerがあるときだけで、port randomizationは元々deferred（NAT44-020）です。
+ありません。H4aの(4)はexpiry順（FIFO）で予測可能でしたが、N2でkeyed probeにしました。
+
+#### Keyed port selection (N2)
+
+N2（NAT44-089〜091）はportの予測不能性をRFC 6056（Recommendations for Transport-Protocol
+Port Randomization）に合わせます。根拠: RFC 6056 §4はport preservationをしないNAPTに、
+変換でportを変えるときobfuscateすべき（SHOULD）とし、preservationをするNAPTにはportを変える
+必要があるとき（既に使われているとき）だけobfuscateすべきとします。RFC 7857 §9はNATが
+RFC 6056 §4に従うべき（SHOULD）とし、RFC 6888 REQ-15はCGNのport割り当てを推測しにくくすべき
+（SHOULD）とします。RFC 4787 §4.2.1はport preservationをNATの挙動の一つとして記述し、REQ-3が
+禁止するのはport overloadingだけです。
+
+- **(3)のstart**: RFC 6056 §3.3.3のAlgorithm 3（simple hash-based）を、EIM（RFC 4787 REQ-1、
+  RFC 5382 REQ-1: mappingはdestinationに依存しない）に合わせて変えたもの。`F()`は
+  SipHash-2-4（既存の`DirectoryHashKey`、domain `UdpPortStart`/`TcpPortStart`）of（inside
+  interface、public address、internal address、internal port、`allocator-seed`）で、remote
+  endpointを入力にしません。keyはruntimeのNAT hash key（UDP/TCP別、128 bit。RFC 6056 §3.4は
+  128 bitで十分とする）で、productionは`/dev/urandom`から取り、毎reconcileでrotateされ、
+  sequencerが同じkeyの再発行を拒否します。新しいkey plumbingは無く、domain分離で再利用します。
+  `allocator-seed`はconfig fileにある非secretのsaltとして残ります。Algorithm 3の
+  `next_ephemeral`による線形探索はbitmapの最初のowner無しportに置き換わります。host stackで
+  同じ4-tupleの再利用（TIME-WAIT衝突）を避けるための`next_ephemeral`の増分は使いません。EIMの
+  NATでは同じinternal endpointが同じgeneration内で同じstartを持ち、まだ空いていれば同じportに
+  戻るほうが安定性（REQ-1）に合うからです。異なるendpoint同士、generation同士は無関係です。
+- **port preservation**: default true（RFC 6056 §4とRFC 7857 §9が明示するport-preserving
+  NAPT。従来の挙動）。保存したportの予測不能性はhost自身のsource port選択と同じで、RFC 6056に
+  従うhostはrandomizeします。予測可能なsource portを使うhostを抱える構成のためにprotocolごとの
+  `[nat44.udp]`/`[nat44.tcp]` `port-preservation = false`（reloadable、`NatChange::port_preservation`
+  のtyped delta、applyはNAT stateをflush）で常にkeyed portにできます。(2)はどちらでも保ちます。`false`はhostのport選択を隠しますが、keyed startはkey generation内でendpointごとに固定なので、source port固定のendpoint（DNS resolverなど）のpublic portはflowごとに変わりません（resolverはRFC 5452どおり自分でrandomizeする）。preservation onではinside hostがport使用状況を知れ、他hostの直前にexpiredしたportを(1)で取れるので、信頼できないinside hostがある構成も`false`の理由です（(1)をowner無しportだけにする案はNAT44-093、hostごとのmapping上限はNAT44-092でdeferred）。
+- **(4) takeover**: domain `UdpPortTakeover`/`TcpPortTakeover`で（endpoint、mapping generation、
+  時刻、probe番号）をhashした`NAT44_PORT_TAKEOVER_PROBES`（8）個のpool portをO(1)のowner確認で
+  調べ、ownerがexpiredな最初のportを取ります。全てliveならexpiry順へfallbackします（expiredの
+  割合fでfallback確率はおよそ(1-f)^8で、probeの重複があるのでわずかに高い）。probeしたexpired ownerのうち最も古いものではなく最初のものを取ります（最も古いものを選ぶと予測可能なexpiry順へ寄る。代わりに直前にexpiredしたmappingのportが先に引き継がれ得る）。expiredなmappingのportを取る新しいendpoint（自分のexact
+  mappingが無いとき）はそのmappingのslotを再生成します。list先頭のslotを使うと、その先頭が持つ
+  portがexpiry順に解放されて次の新mappingの(3)に取られ、takeoverの半分がFIFOに戻るためです。
+- **cost**: planあたりowner確認はUDP最大12、TCP最大11、bitmap 34 words以下、keyed hash 1〜9回で、
+  allocationもscanもありません。
+
+run-simはscenario seed由来のsim keyで決定的です。portはkeyに依存するので、N2でM1/B3
+fixtureのNAT portが変わりました（`fixtures/m1/scenario.toml`の冒頭comment）。
 
 slot sizeはUDP/TCP mappingとTCP sessionが48→64 bytes（link 16 bytes、u128のalignment。TCP
 mappingはN1でestablished数と期限を足して80 bytes、TCP sessionは1 byteのstateを足しても64 bytes）、
