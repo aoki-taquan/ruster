@@ -324,7 +324,9 @@ pub trait PortHost {
     type Links: LinkMonitor;
 
     /// Opens the run-time link watch (before the datapath is built).
-    fn links(&self) -> Result<Self::Links, Failure>;
+    /// `devices` are the ports' interfaces and kernel device names, in
+    /// `IfId` order (for the forwarding sysctls).
+    fn links(&self, devices: &[(IfId, &str)]) -> Result<Self::Links, Failure>;
 
     /// Capabilities and memlock for `backend`, before any resource.
     fn preflight(&self, backend: &ValidatedAfXdpV1) -> Result<(), PrivilegeFailure>;

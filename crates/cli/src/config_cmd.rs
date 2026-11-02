@@ -149,6 +149,7 @@ pub fn load_validated_regular(path: &Path, strict: bool) -> Result<ValidatedConf
         use std::os::unix::fs::MetadataExt;
         let euid = effective_uid().ok_or(LoadError::Insecure("OWNER_UNVERIFIABLE"))?;
         check_permissions(metadata.mode(), metadata.uid(), euid).map_err(LoadError::Insecure)?;
+        check_directories(path, euid).map_err(LoadError::Insecure)?;
     }
     #[cfg(not(unix))]
     let _ = strict;
@@ -162,6 +163,36 @@ pub fn check_permissions(mode: u32, owner: u32, euid: u32) -> Result<(), &'stati
     }
     if owner != 0 && owner != euid {
         return Err("UNTRUSTED_OWNER");
+    }
+    Ok(())
+}
+
+/// The strict-permission rule for each directory on the way to the file:
+/// owned by root or the effective user, and not writable by group or
+/// other unless it is a root-owned sticky directory (like `/tmp`, where
+/// nobody else may rename or replace an entry they do not own).
+pub fn check_directory(mode: u32, owner: u32, euid: u32) -> Result<(), &'static str> {
+    if owner != 0 && owner != euid {
+        return Err("UNTRUSTED_DIRECTORY");
+    }
+    let sticky_root = mode & 0o1000 != 0 && owner == 0;
+    if mode & 0o022 != 0 && !sticky_root {
+        return Err("WRITABLE_DIRECTORY");
+    }
+    Ok(())
+}
+
+/// Applies [`check_directory`] to every directory from the canonical
+/// path's parent up to `/` (symlinks resolved, so a link elsewhere is
+/// checked where it points). Cold path; `canonicalize` failing is
+/// `OWNER_UNVERIFIABLE`.
+#[cfg(unix)]
+fn check_directories(path: &Path, euid: u32) -> Result<(), &'static str> {
+    use std::os::unix::fs::MetadataExt;
+    let canonical = std::fs::canonicalize(path).map_err(|_| "OWNER_UNVERIFIABLE")?;
+    for directory in canonical.ancestors().skip(1) {
+        let metadata = std::fs::metadata(directory).map_err(|_| "OWNER_UNVERIFIABLE")?;
+        check_directory(metadata.mode(), metadata.uid(), euid)?;
     }
     Ok(())
 }

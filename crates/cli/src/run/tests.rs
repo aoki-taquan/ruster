@@ -28,7 +28,7 @@ use super::engine::{
 use super::netlink::{LinkFacts, NetlinkError};
 use super::reload::ConfigSource;
 use super::startup::{CloseFailure, Failure, OpenPort, PortHost, Stage, StartupError};
-use super::watch::{LinkTarget, PortSample};
+use super::watch::{Forwarding, LinkTarget, PortSample};
 use super::{execute, Settings, EXIT_DRAIN_INCOMPLETE, EXIT_PRIVILEGE, READY};
 use crate::config_cmd::LoadError;
 use crate::{EXIT_INVALID, EXIT_RUNTIME};
@@ -106,6 +106,8 @@ struct State {
     link_queries: Cell<u32>,
     /// Address dump results, consumed in order by the matching port.
     addresses: RefCell<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
+    /// Forwarding sysctl results, consumed in order by the matching port.
+    forwarding: RefCell<VecDeque<(IfId, Result<Forwarding, ()>)>>,
     /// Quiescence probes refused before one succeeds.
     quiesce_blocks: Cell<u32>,
     quiesce_probes: Cell<u32>,
@@ -271,6 +273,19 @@ impl LinkMonitor for FakeLinks {
         }
         Ok(0)
     }
+
+    fn forwarding(&mut self, target: &LinkTarget) -> Result<Forwarding, ()> {
+        let mut forwarding = self.state.forwarding.borrow_mut();
+        if forwarding
+            .front()
+            .is_some_and(|(port, _)| *port == target.interface)
+        {
+            if let Some((_, result)) = forwarding.pop_front() {
+                return result;
+            }
+        }
+        Ok(Forwarding::default())
+    }
 }
 
 /// Fake interface index of a port.
@@ -283,7 +298,12 @@ impl PortHost for FakeHost {
     type Datapath<'s> = FakeDatapath<'s>;
     type Links = FakeLinks;
 
-    fn links(&self) -> Result<FakeLinks, Failure> {
+    fn links(&self, devices: &[(IfId, &str)]) -> Result<FakeLinks, Failure> {
+        assert_eq!(
+            devices.iter().map(|(id, _)| id.0).collect::<Vec<_>>(),
+            [LAN, WAN],
+            "ports in IfId order"
+        );
         if self.fails(Stage::Watch, None) {
             return Err(Failure::Links(NetlinkError::Errno(24)));
         }
@@ -1293,6 +1313,15 @@ thread_local! {
 /// Consumed by `run_ports` right after `ActivePublication::new`.
 pub(super) fn take_activation_failure() -> bool {
     FAIL_ACTIVATION.with(|flag| flag.replace(false))
+}
+
+thread_local! {
+    static DROP_APPLY_REPORT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Consumed by `run_loop` when a reload tick reports `Applied`.
+pub(super) fn take_apply_report_drop() -> bool {
+    DROP_APPLY_REPORT.with(|flag| flag.replace(false))
 }
 
 #[test]

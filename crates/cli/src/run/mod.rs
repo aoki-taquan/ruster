@@ -499,8 +499,20 @@ where
     O: Write,
     E: Write,
 {
+    let devices: Vec<(IfId, &str)> = reloader
+        .current()
+        .backend()
+        .af_xdp()
+        .map(|backend| {
+            backend
+                .ports()
+                .iter()
+                .map(|port| (port.interface(), port.device()))
+                .collect()
+        })
+        .unwrap_or_default();
     let links = host
-        .links()
+        .links(&devices)
         .map_err(|failure| Interrupt::Failed(StartupError::new(Stage::Watch, None, failure)))?;
     let targets: Vec<_> = opened.ports_mut().iter().map(|port| port.link).collect();
     let mut datapath = host.build(opened.ports_mut()).map_err(Interrupt::Failed)?;
@@ -542,7 +554,8 @@ where
     };
     let mut control = Control {
         reloader,
-        watch: Watch::new(&targets, settings.thresholds),
+        watch: Watch::new(&targets, settings.thresholds)
+            .allowing_kernel_forwarding(settings.policy.allow_kernel_forwarding),
         links,
     };
     let end = run_loop(

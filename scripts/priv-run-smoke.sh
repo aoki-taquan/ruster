@@ -515,7 +515,17 @@ wait_ruster
 [ "$status" -eq 0 ] || fail "forwarding-allowed: exit status $status"
 assert_detached "the forwarding override run"
 in_ns "$router" sysctl -qw net.ipv4.ip_forward=0
-echo "priv_run_forwarding: kernel forwarding refused by default and accepted with the override verified"
+# Turned on while running: fail closed within a link round.
+start_ruster forwarding-runtime "$work/router.toml"
+wait_ready forwarding-runtime || fail "forwarding-runtime: ruster exited during startup"
+in_ns "$router" sysctl -qw net.ipv4.ip_forward=1
+wait_exit forwarding-runtime
+in_ns "$router" sysctl -qw net.ipv4.ip_forward=0
+[ "$status" -eq 1 ] || fail "forwarding-runtime: exit status $status"
+grep -q "fatal: port=if1 health=KERNEL_FORWARDING_ENABLED" "$work/forwarding-runtime.err" ||
+    fail "forwarding-runtime: no KERNEL_FORWARDING_ENABLED"
+assert_detached "the run-time forwarding fail-closed exit"
+echo "priv_run_forwarding: kernel forwarding refused by default, accepted with the override, and fatal when turned on while running verified"
 
 # stuck: an undrained stdout must not keep the process alive.
 mkfifo "$work/stuck.fifo"

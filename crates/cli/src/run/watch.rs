@@ -42,7 +42,13 @@
 //! | MTU raised within the frame bound | warning `MTU_RAISED` (TX stays bounded by the startup MTU until a restart); recovered when it returns |
 //! | link down (`IFF_UP` or `IFF_LOWER_UP` clear) | warning `LINK_DOWN`, counted; the router keeps running and owed TX kicks resume when the link returns (recovered `LINK_DOWN`) |
 //! | the link query fails | warning `LINK_PROBE`; fatal `LINK_UNVERIFIABLE` after [`LINK_PROBE_FAILURES_FATAL`] failures in a row |
-//! | a kernel IPv4 address appears on the port (rtnetlink `RTM_GETADDR`, same round) | fatal `KERNEL_IPV4_ADDRESSES`, as the startup check refuses it; a failed address dump counts as a failed link query |
+//! | a kernel IPv4 address appears on the port (rtnetlink `RTM_GETADDR`, same round) | fatal `KERNEL_IPV4_ADDRESSES`, as the startup check refuses it; a failed address dump counts as a failed query |
+//! | `net.ipv4.ip_forward` or `conf/<dev>/forwarding` turns on (procfs, same round) | fatal `KERNEL_FORWARDING_ENABLED`, as at startup; with `--allow-kernel-forwarding` a warning `KERNEL_FORWARDING` |
+//! | a forwarding sysctl is unreadable | a failed query (fatal after [`LINK_PROBE_FAILURES_FATAL`] in a row); with the override a warning |
+//!
+//! The link query, the address dump, and the forwarding read each count
+//! their own consecutive failures, so one query that succeeds every round
+//! cannot keep another that fails every round from becoming fatal.
 //!
 //! A fatal event ends the run loop; the shutdown then drains, detaches,
 //! closes, and exits 1 (no silent continuation).
@@ -120,6 +126,27 @@ pub struct PortSample {
     pub rx_packets: u64,
 }
 
+/// The queries of one link round, each with its own failure count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Query {
+    Link = 0,
+    Addresses = 1,
+    Forwarding = 2,
+}
+
+impl Query {
+    const COUNT: usize = 3;
+}
+
+/// The two kernel IPv4 forwarding sysctls of one port.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Forwarding {
+    /// `net.ipv4.ip_forward`.
+    pub global: bool,
+    /// `net.ipv4.conf.<dev>.forwarding`.
+    pub device: bool,
+}
+
 /// What the link watch checks one port against (fixed at startup).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LinkTarget {
@@ -140,6 +167,9 @@ pub enum Condition {
     LinkDown,
     MtuRaised,
     LinkProbe,
+    /// Kernel IPv4 forwarding is on (or unreadable) under
+    /// `--allow-kernel-forwarding`.
+    KernelForwarding,
 }
 
 impl Condition {
@@ -151,6 +181,7 @@ impl Condition {
             Self::LinkDown => "LINK_DOWN",
             Self::MtuRaised => "MTU_RAISED",
             Self::LinkProbe => "LINK_PROBE",
+            Self::KernelForwarding => "KERNEL_FORWARDING",
         }
     }
 }
@@ -165,6 +196,7 @@ pub enum Fatal {
     MtuAboveFrame,
     LinkUnverifiable,
     KernelIpv4Addresses,
+    KernelForwardingEnabled,
 }
 
 impl Fatal {
@@ -177,6 +209,7 @@ impl Fatal {
             Self::MtuAboveFrame => "MTU_ABOVE_FRAME",
             Self::LinkUnverifiable => "LINK_UNVERIFIABLE",
             Self::KernelIpv4Addresses => "KERNEL_IPV4_ADDRESSES",
+            Self::KernelForwardingEnabled => "KERNEL_FORWARDING_ENABLED",
         }
     }
 }
@@ -248,8 +281,10 @@ struct PortWatch {
     link_up: bool,
     mtu: u32,
     mtu_warned: bool,
-    probe_failures: u32,
+    /// Consecutive failures per [`Query`] kind.
+    probe_failures: [u32; Query::COUNT],
     probe_warned: bool,
+    forwarding_warned: bool,
     counters: PortHealth,
 }
 
@@ -268,6 +303,8 @@ pub struct PortHealth {
     pub link_probe_errors: u64,
     /// Kernel IPv4 addresses seen on the port by the last nonzero dump.
     pub kernel_ipv4_addresses: u32,
+    /// A kernel forwarding sysctl read 1 in the last round.
+    pub kernel_forwarding: bool,
     pub warnings: u64,
 }
 
@@ -304,6 +341,11 @@ impl ObservableFields for PortHealth {
             "kernel_ipv4_addresses",
             FieldValue::Count(u64::from(self.kernel_ipv4_addresses)),
         );
+        visitor.field(
+            SECTION,
+            "kernel_forwarding",
+            FieldValue::Flag(self.kernel_forwarding),
+        );
         visitor.field(SECTION, "warnings", FieldValue::Count(self.warnings));
     }
 }
@@ -312,6 +354,8 @@ impl ObservableFields for PortHealth {
 pub struct Watch {
     ports: Box<[PortWatch]>,
     thresholds: Thresholds,
+    /// `--allow-kernel-forwarding`: forwarding at run time only warns.
+    allow_kernel_forwarding: bool,
     last_health: Option<MonotonicMillis>,
     last_link: Option<MonotonicMillis>,
 }
@@ -332,8 +376,9 @@ impl Watch {
                     link_up: true,
                     mtu: target.mtu,
                     mtu_warned: false,
-                    probe_failures: 0,
+                    probe_failures: [0; Query::COUNT],
                     probe_warned: false,
+                    forwarding_warned: false,
                     counters: PortHealth {
                         link_up: true,
                         mtu: target.mtu,
@@ -342,9 +387,18 @@ impl Watch {
                 })
                 .collect(),
             thresholds,
+            allow_kernel_forwarding: false,
             last_health: None,
             last_link: None,
         }
+    }
+
+    /// Kernel forwarding found at run time warns instead of being fatal
+    /// (`--allow-kernel-forwarding`).
+    #[must_use]
+    pub const fn allowing_kernel_forwarding(mut self, allowed: bool) -> Self {
+        self.allow_kernel_forwarding = allowed;
+        self
     }
 
     pub fn port_count(&self) -> usize {
@@ -375,6 +429,7 @@ impl Watch {
                 || !port.link_up
                 || port.mtu_warned
                 || port.probe_warned
+                || port.forwarding_warned
         })
     }
 
@@ -427,6 +482,22 @@ impl Watch {
     ) {
         if let Some(port) = self.ports.get_mut(index) {
             port.addresses(result, emit);
+        }
+    }
+
+    /// Folds the kernel forwarding sysctls read for port `index` in this
+    /// round: on is fatal `KERNEL_FORWARDING_ENABLED` unless allowed (then
+    /// a warning); unreadable is a failed query unless allowed (then a
+    /// warning), as at startup.
+    pub fn on_forwarding(
+        &mut self,
+        index: usize,
+        result: Result<Forwarding, ()>,
+        emit: &mut impl FnMut(WatchEvent),
+    ) {
+        let allowed = self.allow_kernel_forwarding;
+        if let Some(port) = self.ports.get_mut(index) {
+            port.forwarding(result, allowed, emit);
         }
     }
 }
@@ -559,11 +630,14 @@ impl PortWatch {
         }
     }
 
-    /// One failed query of this round (link or address dump).
-    fn probe_failed(&mut self, emit: &mut impl FnMut(WatchEvent)) {
+    /// One failed query of this round. Each query kind counts its own
+    /// consecutive failures, so one that always fails cannot be reset by
+    /// another that succeeds in the same round.
+    fn probe_failed(&mut self, query: Query, emit: &mut impl FnMut(WatchEvent)) {
         self.counters.link_probe_errors = self.counters.link_probe_errors.saturating_add(1);
-        self.probe_failures = self.probe_failures.saturating_add(1);
-        if self.probe_failures >= LINK_PROBE_FAILURES_FATAL {
+        let failures = &mut self.probe_failures[query as usize];
+        *failures = failures.saturating_add(1);
+        if *failures >= LINK_PROBE_FAILURES_FATAL {
             self.fatal(Fatal::LinkUnverifiable, emit);
         } else if !self.probe_warned {
             self.probe_warned = true;
@@ -571,14 +645,59 @@ impl PortWatch {
         }
     }
 
+    /// One successful query: its count restarts, and the warning recovers
+    /// once no query kind is failing.
+    fn probe_ok(&mut self, query: Query, emit: &mut impl FnMut(WatchEvent)) {
+        self.probe_failures[query as usize] = 0;
+        if self.probe_failures.iter().all(|failures| *failures == 0)
+            && std::mem::take(&mut self.probe_warned)
+        {
+            self.recover(Condition::LinkProbe, emit);
+        }
+    }
+
     fn addresses(&mut self, result: Result<u32, NetlinkError>, emit: &mut impl FnMut(WatchEvent)) {
         match result {
-            Ok(0) => {}
             Ok(count) => {
-                self.counters.kernel_ipv4_addresses = count;
-                self.fatal(Fatal::KernelIpv4Addresses, emit);
+                self.probe_ok(Query::Addresses, emit);
+                if count != 0 {
+                    self.counters.kernel_ipv4_addresses = count;
+                    self.fatal(Fatal::KernelIpv4Addresses, emit);
+                }
             }
-            Err(_) => self.probe_failed(emit),
+            Err(_) => self.probe_failed(Query::Addresses, emit),
+        }
+    }
+
+    fn forwarding(
+        &mut self,
+        result: Result<Forwarding, ()>,
+        allowed: bool,
+        emit: &mut impl FnMut(WatchEvent),
+    ) {
+        match result {
+            Ok(forwarding) => {
+                self.probe_ok(Query::Forwarding, emit);
+                let on = forwarding.global || forwarding.device;
+                self.counters.kernel_forwarding = on;
+                if on && !allowed {
+                    self.fatal(Fatal::KernelForwardingEnabled, emit);
+                } else if on && !self.forwarding_warned {
+                    self.forwarding_warned = true;
+                    self.warn(Condition::KernelForwarding, emit);
+                } else if !on && std::mem::take(&mut self.forwarding_warned) {
+                    self.recover(Condition::KernelForwarding, emit);
+                }
+            }
+            // With the override an unreadable sysctl only warns, as at
+            // startup.
+            Err(()) if allowed => {
+                if !self.forwarding_warned {
+                    self.forwarding_warned = true;
+                    self.warn(Condition::KernelForwarding, emit);
+                }
+            }
+            Err(()) => self.probe_failed(Query::Forwarding, emit),
         }
     }
 
@@ -590,14 +709,11 @@ impl PortWatch {
                 return;
             }
             Err(_) => {
-                self.probe_failed(emit);
+                self.probe_failed(Query::Link, emit);
                 return;
             }
         };
-        self.probe_failures = 0;
-        if std::mem::take(&mut self.probe_warned) {
-            self.recover(Condition::LinkProbe, emit);
-        }
+        self.probe_ok(Query::Link, emit);
         self.counters.mtu = facts.mtu;
         if facts.mtu < self.target.mtu {
             self.fatal(Fatal::MtuDecreased, emit);

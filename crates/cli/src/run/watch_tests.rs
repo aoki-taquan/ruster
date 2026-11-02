@@ -76,7 +76,7 @@ const fn fatal(cause: Fatal) -> WatchEvent {
 /// free list sometimes dry, no kick error. Nothing trips, for a long time.
 #[test]
 fn a_busy_healthy_link_never_trips_the_thresholds() {
-    let mut watch = watch();
+    let mut watch = fresh();
     let mut current = sample();
     for step in 0..1_000_u64 {
         current.polls += 5_000;
@@ -96,7 +96,7 @@ fn a_busy_healthy_link_never_trips_the_thresholds() {
 
 #[test]
 fn a_tx_stall_warns_then_is_fatal_and_recovers_on_progress() {
-    let mut watch = watch();
+    let mut watch = fresh();
     let mut stalled = PortSample {
         tx_inflight: 3,
         ..sample()
@@ -145,7 +145,7 @@ fn a_tx_stall_warns_then_is_fatal_and_recovers_on_progress() {
 
 #[test]
 fn a_down_link_holds_tx_without_a_stall() {
-    let mut watch = watch();
+    let mut watch = fresh();
     let held = PortSample {
         tx_inflight: 1,
         polls: 50,
@@ -194,7 +194,7 @@ fn a_down_link_holds_tx_without_a_stall() {
 
 #[test]
 fn fill_starvation_warns_and_recovers() {
-    let mut watch = watch();
+    let mut watch = fresh();
     let mut starving = PortSample {
         fill_ring_occupancy: 0,
         ..sample()
@@ -225,7 +225,7 @@ fn fill_starvation_warns_and_recovers() {
 
 #[test]
 fn persistent_kick_errors_warn_then_are_fatal() {
-    let mut watch = watch();
+    let mut watch = fresh();
     let mut failing = sample();
     assert!(run(&mut watch, 0, failing).is_empty());
     failing.kick_errors = 1;
@@ -303,7 +303,7 @@ fn device_events_have_their_documented_outcomes() {
 
 #[test]
 fn link_query_failures_warn_then_are_fatal_in_a_row() {
-    let mut watch = watch();
+    let mut watch = fresh();
     let failure = Err(NetlinkError::Errno(11));
     assert_eq!(link(&mut watch, failure), [warning(Condition::LinkProbe)]);
     assert!(link(&mut watch, failure).is_empty());
@@ -382,38 +382,127 @@ fn health_thresholds_are_configurable_and_fatal_can_be_off() {
     assert_eq!(events, [warning(Condition::KickErrors)]);
 }
 
+/// One link round as the loop runs it: the link query, then (if it
+/// succeeded) the address dump, then the forwarding read.
+fn round(
+    watch: &mut Watch,
+    link_result: Result<LinkFacts, NetlinkError>,
+    addresses: Result<u32, NetlinkError>,
+    forwarding: Result<Forwarding, ()>,
+) -> Vec<WatchEvent> {
+    let mut events = Vec::new();
+    let linked = link_result.is_ok();
+    watch.on_link(0, link_result, &mut |event| events.push(event));
+    if linked {
+        watch.on_addresses(0, addresses, &mut |event| events.push(event));
+    }
+    watch.on_forwarding(0, forwarding, &mut |event| events.push(event));
+    events
+}
+
+const OFF: Result<Forwarding, ()> = Ok(Forwarding {
+    global: false,
+    device: false,
+});
+
 #[test]
-fn a_kernel_ipv4_address_after_startup_is_fatal() {
-    let mut watch = watch();
-    let addresses = |watch: &mut Watch, result| {
-        let mut events = Vec::new();
-        watch.on_addresses(0, result, &mut |event| events.push(event));
-        events
-    };
-    assert!(addresses(&mut watch, Ok(0)).is_empty());
+fn kernel_addresses_on_a_port_are_fatal() {
+    let mut watch = fresh();
+    assert!(round(&mut watch, up(1500), Ok(0), OFF).is_empty());
     assert_eq!(
-        addresses(&mut watch, Ok(2)),
+        round(&mut watch, up(1500), Ok(2), OFF),
         [fatal(Fatal::KernelIpv4Addresses)]
     );
     let (_, health) = watch.health().next().expect("port");
     assert_eq!(health.kernel_ipv4_addresses, 2);
-    // A failed dump is a failed query of the round.
-    let mut watch = Watch::new(&[TARGET], Thresholds::default());
+}
+
+/// A link query that succeeds every round must not reset the failure
+/// count of an address dump that fails every round (fail open otherwise).
+#[test]
+fn an_address_dump_failing_every_round_is_fatal_despite_link_success() {
+    let mut watch = fresh();
     let failure = Err(NetlinkError::Errno(11));
+    let mut events = Vec::new();
+    for _ in 0..LINK_PROBE_FAILURES_FATAL {
+        events.extend(round(&mut watch, up(1500), failure, OFF));
+    }
     assert_eq!(
-        addresses(&mut watch, failure),
+        events,
+        [
+            warning(Condition::LinkProbe),
+            fatal(Fatal::LinkUnverifiable)
+        ]
+    );
+    // The same for an unreadable forwarding sysctl.
+    let mut watch = fresh();
+    let mut events = Vec::new();
+    for _ in 0..LINK_PROBE_FAILURES_FATAL {
+        events.extend(round(&mut watch, up(1500), Ok(0), Err(())));
+    }
+    assert_eq!(
+        events,
+        [
+            warning(Condition::LinkProbe),
+            fatal(Fatal::LinkUnverifiable)
+        ]
+    );
+    // Recovery needs every query kind healthy again.
+    let mut watch = fresh();
+    assert_eq!(
+        round(&mut watch, up(1500), failure, Err(())),
         [warning(Condition::LinkProbe)]
     );
-    let _ = addresses(&mut watch, failure);
+    assert!(round(&mut watch, up(1500), Ok(0), Err(())).is_empty());
     assert_eq!(
-        addresses(&mut watch, failure),
-        [fatal(Fatal::LinkUnverifiable)]
+        round(&mut watch, up(1500), Ok(0), OFF),
+        [recovered(Condition::LinkProbe)]
     );
 }
 
 #[test]
+fn kernel_forwarding_at_run_time_is_fatal_unless_allowed() {
+    for (global, device) in [(true, false), (false, true), (true, true)] {
+        let on = Ok(Forwarding { global, device });
+        let mut watch = watch();
+        assert_eq!(
+            round(&mut watch, up(1500), Ok(0), on),
+            [fatal(Fatal::KernelForwardingEnabled)]
+        );
+        // With the override: a warning, recovered when it is off again.
+        let mut allowed = watch_allowing();
+        assert_eq!(
+            round(&mut allowed, up(1500), Ok(0), on),
+            [warning(Condition::KernelForwarding)]
+        );
+        assert!(round(&mut allowed, up(1500), Ok(0), on).is_empty());
+        let (_, health) = allowed.health().next().expect("port");
+        assert!(health.kernel_forwarding);
+        assert_eq!(
+            round(&mut allowed, up(1500), Ok(0), OFF),
+            [recovered(Condition::KernelForwarding)]
+        );
+    }
+    // With the override an unreadable sysctl only warns, never fatal.
+    let mut allowed = watch_allowing();
+    let mut events = Vec::new();
+    for _ in 0..10 {
+        events.extend(round(&mut allowed, up(1500), Ok(0), Err(())));
+    }
+    assert_eq!(events, [warning(Condition::KernelForwarding)]);
+}
+
+fn fresh() -> Watch {
+    Watch::new(&[TARGET], Thresholds::default())
+}
+
+fn watch_allowing() -> Watch {
+    Watch::new(&[TARGET], Thresholds::default()).allowing_kernel_forwarding(true)
+}
+
+#[test]
 fn intervals_and_lines_are_stable() {
-    let mut watch = watch();
+    let mut watch = fresh();
     assert!(watch.health_due(MonotonicMillis(5), 500), "first is due");
     assert!(!watch.health_due(MonotonicMillis(504), 500));
     assert!(watch.health_due(MonotonicMillis(505), 500));

@@ -420,6 +420,51 @@ fn a_kernel_ipv4_address_on_a_port_while_running_fails_closed() {
     );
 }
 
+/// The loop itself ends a run whose reload tick reports `Applied` without
+/// a matching commit report (exit 1), instead of continuing.
+#[test]
+fn the_loop_ends_on_an_applied_reload_without_its_report() {
+    let host = FakeHost::default();
+    super::DROP_APPLY_REPORT.with(|flag| flag.set(true));
+    let source = FakeSource::with([Ok(echo_off())]);
+    let outcome = ops(&host, source, &StopAfterTicks::new(&host, 40, &[5]));
+    assert_eq!(outcome.status, EXIT_RUNTIME, "{}", outcome.err);
+    assert!(
+        outcome
+            .err
+            .contains("reload applied: generation=2 previous=unknown;"),
+        "{}",
+        outcome.err
+    );
+    assert!(
+        outcome
+            .err
+            .contains("stopped after an invariant violation code=APPLY_REPORT_MISSING"),
+        "{}",
+        outcome.err
+    );
+    assert!(host.state.io_calls.get() < 40, "the loop ended early");
+    host.assert_released();
+}
+
+#[test]
+fn kernel_forwarding_turned_on_while_running_fails_closed() {
+    let host = FakeHost::default();
+    host.state.forwarding.borrow_mut().push_back((
+        IfId(WAN),
+        Ok(Forwarding {
+            global: true,
+            device: false,
+        }),
+    ));
+    let outcome = fatal_run(&host, 1_000);
+    assert_fatal(&outcome, &host, "KERNEL_FORWARDING_ENABLED");
+    assert_eq!(
+        line_value(&outcome.out, "if2.watch.kernel_forwarding"),
+        Some("true")
+    );
+}
+
 #[test]
 fn kernel_forwarding_is_refused_at_startup_unless_allowed() {
     let host = FakeHost {

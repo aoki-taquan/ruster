@@ -55,7 +55,7 @@ use ruster_runtime::{
 
 use super::netlink::{LinkFacts, NetlinkError};
 use super::reload::{ConfigSource, ReloadCounters, Reloader, TickApply};
-use super::watch::{Fatal, LinkTarget, PortSample, Watch, WatchEvent};
+use super::watch::{Fatal, Forwarding, LinkTarget, PortSample, Watch, WatchEvent};
 
 /// Idle ticks before the loop starts to sleep.
 pub const SPIN_TICKS: u32 = 64;
@@ -118,6 +118,10 @@ pub trait LinkMonitor {
 
     /// Kernel IPv4 addresses on `target`'s interface index.
     fn ipv4_addresses(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError>;
+
+    /// The kernel IPv4 forwarding sysctls (global and `target`'s device);
+    /// `Err` if either is unreadable. Cold path, no allocation.
+    fn forwarding(&mut self, target: &LinkTarget) -> Result<Forwarding, ()>;
 }
 
 /// Summed result of one drain call.
@@ -411,6 +415,9 @@ where
                             );
                             (apply.previous_generation, flush)
                         });
+                    // Tests drop the report here to reach the invariant path.
+                    #[cfg(test)]
+                    let applied = applied.filter(|_| !super::tests::take_apply_report_drop());
                     TickApply::Applied(applied)
                 }
                 PublicationOutcome::Rejected(error) => TickApply::Rejected(*error),
@@ -502,6 +509,8 @@ where
                 let addresses = control.links.ipv4_addresses(&target);
                 watch.on_addresses(index, addresses, &mut on_event);
             }
+            let forwarding = control.links.forwarding(&target);
+            watch.on_forwarding(index, forwarding, &mut on_event);
         }
     }
     end

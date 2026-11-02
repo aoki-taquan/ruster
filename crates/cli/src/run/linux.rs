@@ -2,6 +2,7 @@
 //! engines, and the core adapter of `ruster-io-xdp-native`.
 
 use std::num::{NonZeroU128, NonZeroU32};
+use std::path::{Path, PathBuf};
 
 use ruster_config::{ValidatedAfXdpPortV1, ValidatedAfXdpV1, XdpAttachModeV1};
 use ruster_core::{BackendStats, IfId};
@@ -15,7 +16,7 @@ use super::engine::{Datapath, DrainProgress, LinkMonitor};
 use super::netlink::{self, LinkFacts, LinkProbe, NetlinkError};
 use super::startup::{CloseFailure, Failure, OpenPort, PortHost, Stage, StartupError};
 use super::stats::write_fields;
-use super::watch::{LinkTarget, PortSample};
+use super::watch::{Forwarding, LinkTarget, PortSample};
 
 /// High bits of every engine's UMEM domain id (`"rstr"`); the low bits are
 /// the port's `IfId`, so domains are distinct per port.
@@ -29,8 +30,18 @@ impl PortHost for LinuxHost {
     type Datapath<'s> = XdpDatapath<'s>;
     type Links = NetlinkLinks;
 
-    fn links(&self) -> Result<NetlinkLinks, Failure> {
-        LinkProbe::open().map(NetlinkLinks).map_err(Failure::Links)
+    fn links(&self, devices: &[(IfId, &str)]) -> Result<NetlinkLinks, Failure> {
+        let probe = LinkProbe::open().map_err(Failure::Links)?;
+        // Device names were accepted by `SessionConfig::new` (one path
+        // component).
+        let forwarding = devices
+            .iter()
+            .map(|(interface, device)| {
+                let path = format!("/proc/sys/net/ipv4/conf/{device}/forwarding");
+                (*interface, PathBuf::from(path))
+            })
+            .collect();
+        Ok(NetlinkLinks { probe, forwarding })
     }
 
     fn preflight(&self, backend: &ValidatedAfXdpV1) -> Result<(), PrivilegeFailure> {
@@ -129,16 +140,36 @@ fn domain(interface: IfId) -> UmemDomainId {
     UmemDomainId::new(NonZeroU128::new(id).unwrap_or(NonZeroU128::MIN))
 }
 
-/// The run-time link watch: one reused rtnetlink socket and buffer.
-pub struct NetlinkLinks(LinkProbe);
+/// The run-time link watch: one reused rtnetlink socket and buffer, and
+/// the forwarding sysctl paths built once at startup.
+pub struct NetlinkLinks {
+    probe: LinkProbe,
+    /// `conf/<dev>/forwarding` of each port.
+    forwarding: Vec<(IfId, PathBuf)>,
+}
+
+/// `net.ipv4.ip_forward` of this namespace.
+const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
 
 impl LinkMonitor for NetlinkLinks {
     fn query(&mut self, target: &LinkTarget) -> Result<LinkFacts, NetlinkError> {
-        self.0.query(target.ifindex)
+        self.probe.query(target.ifindex)
     }
 
     fn ipv4_addresses(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError> {
-        self.0.ipv4_addresses(target.ifindex)
+        self.probe.ipv4_addresses(target.ifindex)
+    }
+
+    fn forwarding(&mut self, target: &LinkTarget) -> Result<Forwarding, ()> {
+        let device = self
+            .forwarding
+            .iter()
+            .find(|(interface, _)| *interface == target.interface)
+            .ok_or(())?;
+        Ok(Forwarding {
+            global: checks::linux::read_flag(Path::new(IP_FORWARD)).ok_or(())?,
+            device: checks::linux::read_flag(&device.1).ok_or(())?,
+        })
     }
 }
 

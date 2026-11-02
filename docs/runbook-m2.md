@@ -75,7 +75,11 @@ All commands assume a dedicated router host or network namespace. Replace
   code=WRITABLE_BY_OTHERS`) or that is owned by neither root nor the user
   `ruster run` runs as (`code=UNTRUSTED_OWNER`). Off by default; it is a
   flag, not a config key, because it guards the file itself. The config is
-  always opened `O_NONBLOCK | O_NOCTTY` and must be a regular file.
+  always opened `O_NONBLOCK | O_NOCTTY` and must be a regular file. In strict
+  mode every directory from the file's (symlink-resolved) parent up to `/`
+  must also be owned by root or that user and not group/other writable,
+  except a root-owned sticky directory such as `/tmp`
+  (`code=UNTRUSTED_DIRECTORY|WRITABLE_DIRECTORY`).
 
 ## 2. Cold start
 
@@ -277,8 +281,16 @@ Every second the router asks rtnetlink for each port's interface index
 | MTU raised within that bound | warning `MTU_RAISED`; TX stays bounded by the startup MTU until a restart |
 | the rtnetlink query fails | warning `LINK_PROBE`; fatal `LINK_UNVERIFIABLE` after 3 failures in a row |
 | a kernel IPv4 address appears on a port (`ip addr add ... dev lan0`; one `RTM_GETADDR` dump in the same round) | fatal `KERNEL_IPV4_ADDRESSES` (`if<id>.watch.kernel_ipv4_addresses`), like the startup refusal; a failed dump counts as a failed query |
+| `net.ipv4.ip_forward` or `conf/<port>/forwarding` turns on (read from procfs in the same round) | fatal `KERNEL_FORWARDING_ENABLED` (`if<id>.watch.kernel_forwarding`), like the startup refusal; with `--allow-kernel-forwarding` a warning `KERNEL_FORWARDING` |
+| a forwarding sysctl becomes unreadable (for example the port device renamed) | a failed query (fatal `LINK_UNVERIFIABLE` after 3 in a row); with the override a warning |
 
-Kernel routes and forwarding sysctls are checked at startup only.
+The link query, the address dump, and the forwarding read each count their
+own consecutive failures: one that keeps succeeding cannot hide another
+that keeps failing. The address dump lists the addresses of the whole
+namespace and counts those on the port's interface index, so its cost grows
+with every address the namespace holds; that, and keeping other interfaces
+from needing kernel forwarding, is why a dedicated router namespace is
+recommended. Kernel routes are checked at startup only.
 
 A fatal event prints `fatal: port=if<id> health=<CODE>`, then the shutdown
 of section 4 runs and the summary starts with `stopped after a fatal health

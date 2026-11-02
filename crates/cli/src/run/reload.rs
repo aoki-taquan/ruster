@@ -261,6 +261,11 @@ impl<K: ProductionKeySource, C: ConfigSource> Reloader<K, C> {
         self.counters
     }
 
+    /// The active generation's document.
+    pub const fn current(&self) -> &ValidatedConfigV1 {
+        &self.current
+    }
+
     /// Tick budgets of the active generation's document.
     pub fn budgets(&self) -> TickBudgets {
         super::budgets(&self.current)

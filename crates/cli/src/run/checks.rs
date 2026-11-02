@@ -523,6 +523,27 @@ pub mod linux {
         evaluate_privileges(effective, memlock, required)
     }
 
+    /// Reads a `0`/`1` sysctl file into a stack buffer: no allocation (a
+    /// short path is converted on the stack by std), for the run-time link
+    /// round. `None` if unreadable or not exactly `0` or `1`.
+    pub fn read_flag(path: &std::path::Path) -> Option<bool> {
+        use std::io::Read;
+        let mut file = fs::File::open(path).ok()?;
+        let mut buffer = [0_u8; 8];
+        let mut len = 0;
+        loop {
+            let read = file.read(&mut buffer[len..]).ok()?;
+            if read == 0 {
+                break;
+            }
+            len += read;
+            if len == buffer.len() {
+                return None;
+            }
+        }
+        parse_flag(std::str::from_utf8(&buffer[..len]).ok()?)
+    }
+
     /// What [`device_facts`] needs from the opened session and the config.
     #[derive(Clone, Copy, Debug)]
     pub struct SessionFacts {
@@ -740,6 +761,21 @@ mod tests {
                 "IPV4_FORWARDING_UNVERIFIABLE"
             ]
         );
+    }
+
+    /// The run-time sysctl reader: a real procfs flag reads, anything
+    /// that is not exactly `0`/`1` (empty, missing, a directory) is `None`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sysctl_flags_read_without_allocation_or_fail() {
+        use std::path::Path;
+        assert!(linux::read_flag(Path::new("/proc/sys/net/ipv4/ip_forward")).is_some());
+        assert_eq!(linux::read_flag(Path::new("/dev/null")), None);
+        assert_eq!(linux::read_flag(Path::new("/proc/sys/net/ipv4")), None);
+        assert_eq!(linux::read_flag(Path::new("/nonexistent/forwarding")), None);
+        // A longer file than a flag is refused, not truncated.
+        let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        assert_eq!(linux::read_flag(Path::new(manifest)), None);
     }
 
     #[test]
