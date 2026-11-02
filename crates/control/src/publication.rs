@@ -89,6 +89,7 @@ pub struct Nat44UdpStoragePlan {
     peer_buckets: u32,
     peer_nodes: u32,
     port_owner_slots: u32,
+    host_slots: u32,
 }
 
 impl Nat44UdpStoragePlan {
@@ -111,6 +112,33 @@ impl Nat44UdpStoragePlan {
             peer_buckets,
             peer_nodes,
             port_owner_slots,
+            host_slots: 0,
+        }
+    }
+
+    /// This plan with `slots` host slots of the per-host mapping accounting
+    /// (N3; `0` from [`Self::new`]): `0`, or the mapping slot count. Each
+    /// comes with a host link and a host directory node, and the host
+    /// directory has the mapping directory's bucket count.
+    #[must_use]
+    pub const fn with_host_slots(mut self, slots: u32) -> Self {
+        self.host_slots = slots;
+        self
+    }
+
+    #[must_use]
+    pub const fn host_slots(self) -> u32 {
+        self.host_slots
+    }
+
+    /// Buckets of the host directory: the mapping directory's, or `0`
+    /// without host slots.
+    #[must_use]
+    pub const fn host_buckets(self) -> u32 {
+        if self.host_slots == 0 {
+            0
+        } else {
+            self.mapping_buckets
         }
     }
 
@@ -160,6 +188,7 @@ pub struct Nat44TcpStoragePlan {
     session_nodes: u32,
     port_owner_slots: u32,
     unsolicited_syn_hold_slots: u32,
+    host_slots: u32,
 }
 
 impl Nat44TcpStoragePlan {
@@ -183,6 +212,32 @@ impl Nat44TcpStoragePlan {
             session_nodes,
             port_owner_slots,
             unsolicited_syn_hold_slots: 0,
+            host_slots: 0,
+        }
+    }
+
+    /// This plan with `slots` host slots of the per-host mapping accounting
+    /// (N3; `0` from [`Self::new`]); see
+    /// [`Nat44UdpStoragePlan::with_host_slots`].
+    #[must_use]
+    pub const fn with_host_slots(mut self, slots: u32) -> Self {
+        self.host_slots = slots;
+        self
+    }
+
+    #[must_use]
+    pub const fn host_slots(self) -> u32 {
+        self.host_slots
+    }
+
+    /// Buckets of the host directory: the mapping directory's, or `0`
+    /// without host slots.
+    #[must_use]
+    pub const fn host_buckets(self) -> u32 {
+        if self.host_slots == 0 {
+            0
+        } else {
+            self.mapping_buckets
         }
     }
 
@@ -508,11 +563,16 @@ pub enum StorageShapeError {
     UdpMappingDirectory,
     UdpPeerDirectory,
     UdpPortOwnerCount,
+    /// UDP host slots (N3) are neither `0` nor the mapping slot count, or
+    /// are `0` while the policy sets a per-host mapping limit.
+    UdpHostSlotCount,
     TcpMappingNodeCount,
     TcpSessionNodeCount,
     TcpMappingDirectory,
     TcpSessionDirectory,
     TcpPortOwnerCount,
+    /// TCP host slots (N3), as for UDP.
+    TcpHostSlotCount,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -886,6 +946,11 @@ fn validate_structural_shapes(shape: FullServiceStorageShape) -> Result<(), Stor
     if !directory_shape_valid(shape.nat44_udp.peer_buckets, shape.nat44_udp.peer_nodes) {
         return Err(StorageShapeError::UdpPeerDirectory);
     }
+    if shape.nat44_udp.host_slots != 0
+        && shape.nat44_udp.host_slots != shape.nat44_udp.mapping_slots
+    {
+        return Err(StorageShapeError::UdpHostSlotCount);
+    }
     if shape.nat44_tcp.mapping_nodes != shape.nat44_tcp.mapping_slots {
         return Err(StorageShapeError::TcpMappingNodeCount);
     }
@@ -904,6 +969,11 @@ fn validate_structural_shapes(shape: FullServiceStorageShape) -> Result<(), Stor
     ) {
         return Err(StorageShapeError::TcpSessionDirectory);
     }
+    if shape.nat44_tcp.host_slots != 0
+        && shape.nat44_tcp.host_slots != shape.nat44_tcp.mapping_slots
+    {
+        return Err(StorageShapeError::TcpHostSlotCount);
+    }
     Ok(())
 }
 
@@ -919,6 +989,17 @@ fn validate_port_owner_shapes(
     let tcp_ports = u32::from(tcp.last_port()) - u32::from(tcp.first_port()) + 1;
     if shape.nat44_tcp.port_owner_slots != tcp_ports {
         return Err(StorageShapeError::TcpPortOwnerCount);
+    }
+    // A per-host mapping limit (N3) needs the per-host storage.
+    if udp.policy().mappings_per_host() != 0
+        && shape.nat44_udp.host_slots != shape.nat44_udp.mapping_slots
+    {
+        return Err(StorageShapeError::UdpHostSlotCount);
+    }
+    if tcp.policy().mappings_per_host() != 0
+        && shape.nat44_tcp.host_slots != shape.nat44_tcp.mapping_slots
+    {
+        return Err(StorageShapeError::TcpHostSlotCount);
     }
     Ok(())
 }

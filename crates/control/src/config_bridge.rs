@@ -412,7 +412,8 @@ pub(crate) fn required_services(
             udp_shape.peer_buckets,
             udp_shape.peer_nodes,
             udp_shape.port_owners,
-        ),
+        )
+        .with_host_slots(udp_shape.hosts),
         Nat44TcpStoragePlan::new(
             tcp_shape.mappings,
             tcp_shape.sessions,
@@ -422,7 +423,8 @@ pub(crate) fn required_services(
             tcp_shape.session_nodes,
             tcp_shape.port_owners,
         )
-        .with_unsolicited_syn_hold_slots(tcp_shape.unsolicited_syn_holds),
+        .with_unsolicited_syn_hold_slots(tcp_shape.unsolicited_syn_holds)
+        .with_host_slots(tcp_shape.hosts),
         firewall_states,
     );
     Ok(RequiredServices {

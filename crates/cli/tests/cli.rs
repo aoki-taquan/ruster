@@ -788,6 +788,58 @@ fn plan_text_renders_the_port_preservation_switch_as_a_reloadable_typed_delta() 
     }
 }
 
+/// N3: the per-host mapping limit is a typed delta rendered with `0` as
+/// `unlimited`. Switching it on adds per-host storage, so that plan is
+/// restart-required (storage shape); changing one limit to another is
+/// reloadable.
+#[test]
+fn plan_text_renders_the_per_host_mapping_limit_and_its_storage_switch() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let with = |name: &str, value: u16| {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            source.replacen(
+                "allocator-seed = \"1\"\n",
+                &format!("allocator-seed = \"1\"\nmappings-per-host = {value}\n"),
+                1,
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let current = fixtures().join("router-v1.toml");
+    let limited = with("udp-limit-64.toml", 64);
+    let raised = with("udp-limit-128.toml", 128);
+    assert_eq!(
+        status(&ruster(&["validate".as_ref(), limited.as_os_str()])),
+        0
+    );
+    let on = ruster(&["plan".as_ref(), current.as_os_str(), limited.as_os_str()]);
+    assert_eq!(status(&on), 0);
+    let stdout = text(&on.stdout);
+    assert!(stdout.starts_with("plan: restart-required\n"), "{stdout}");
+    assert!(
+        stdout.contains("restart-required: STORAGE_SHAPE\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  nat44-udp mappings-per-host ~ unlimited -> 64\n"),
+        "{stdout}"
+    );
+    let change = ruster(&["plan".as_ref(), limited.as_os_str(), raised.as_os_str()]);
+    assert_eq!(status(&change), 0);
+    let stdout = text(&change.stdout);
+    assert!(stdout.starts_with("plan: reloadable\n"), "{stdout}");
+    assert!(
+        stdout.contains("  nat44-udp mappings-per-host ~ 64 -> 128\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("nat44-tcp mappings-per-host"), "{stdout}");
+    assert!(!stdout.contains("policy ~ changed"), "{stdout}");
+}
+
 /// The TCP per-remote inbound session limit is a reloadable typed delta;
 /// `0` renders as `unlimited`, and out-of-range values are rejected with a
 /// value-free code and path.

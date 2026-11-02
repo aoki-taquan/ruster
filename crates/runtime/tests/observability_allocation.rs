@@ -163,6 +163,7 @@ fn observability_sink_is_allocation_free_in_steady_state() {
             &mut [],
             &mut udp_owner,
             &mut udp_owner_bits,
+            ruster_core::Nat44HostStorage::disabled(),
         ),
         Nat44UdpHashKey::new(3, 4).unwrap(),
     )
@@ -180,6 +181,7 @@ fn observability_sink_is_allocation_free_in_steady_state() {
             &mut [],
             &mut tcp_owner,
             &mut tcp_owner_bits,
+            ruster_core::Nat44HostStorage::disabled(),
         ),
         Nat44TcpHashKey::new(5, 6).unwrap(),
     )

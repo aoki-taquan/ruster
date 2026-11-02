@@ -8,11 +8,12 @@ use ruster_core::{
     FirewallStateSlot, ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorKind,
     Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
     Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding, MacAddress, Nat44Filtering,
-    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpMappingSlot,
-    Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig,
-    Nat44UdpConfigError, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
-    Nat44UdpPolicyError, Neighbor, PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot,
-    ResolutionPolicy, ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
+    Nat44HostLink, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError,
+    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot,
+    Nat44TcpSynHoldSlot, Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpMappingSlot,
+    Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor, PortOwnerSlot,
+    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy, ResolutionPolicyError,
+    ResolutionStateSlot, Route, RouteError, SnapshotError,
 };
 
 use ruster_io_xdp::native_profile::{
@@ -382,6 +383,11 @@ pub struct Nat44UdpStorageShapeV1 {
     pub peer_buckets: u32,
     pub peer_nodes: u32,
     pub port_owners: u32,
+    /// Host slots of the per-host mapping accounting (N3): `mappings` with a
+    /// nonzero `mappings-per-host`, else 0. Each comes with a per-mapping
+    /// link and a host directory node, and the host directory has
+    /// `mapping_buckets` buckets; `required_bytes` counts all of them.
+    pub hosts: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -399,6 +405,8 @@ pub struct Nat44TcpStorageShapeV1 {
     /// Slots of the unsolicited-SYN hold table (RFC 5382 REQ-4), each with
     /// a quoted datagram.
     pub unsolicited_syn_holds: u32,
+    /// Host slots of the per-host mapping accounting (N3), as for UDP.
+    pub hosts: u32,
 }
 
 /// Complete caller-owned runtime storage requested by one V1 candidate.
@@ -1302,7 +1310,8 @@ fn validate_v1(
                 .with_icmpv4_errors(map_icmp_policy(source.icmpv4_errors))
                 .with_filtering(map_filtering(source.filtering))
                 .with_hairpinning(source.hairpinning)
-                .with_port_preservation(source.port_preservation);
+                .with_port_preservation(source.port_preservation)
+                .with_mappings_per_host(source.mappings_per_host);
             Nat44UdpConfig::new(
                 &snapshot,
                 inside,
@@ -1353,6 +1362,7 @@ fn validate_v1(
                 .with_filtering(map_filtering(source.filtering))
                 .with_hairpinning(source.hairpinning)
                 .with_port_preservation(source.port_preservation)
+                .with_mappings_per_host(source.mappings_per_host)
                 .with_unsolicited_syn_icmp(source.unsolicited_syn_icmp)
                 .with_inbound_rst(map_inbound_rst(source.inbound_rst))
                 .with_inbound_sessions_per_remote(source.inbound_sessions_per_remote)
@@ -1518,10 +1528,12 @@ fn validate_v1(
         StorageInputs {
             resolution: resolution_source.map(|source| source.capacity),
             icmp: icmp_source.map(|source| source.capacity),
-            udp: udp_capacity
-                .zip(validated_udp.map(|(_, _, _, ports, _)| (ports.first, ports.last))),
-            tcp: tcp_capacity
-                .zip(validated_tcp.map(|(_, _, _, ports, _)| (ports.first, ports.last))),
+            udp: udp_capacity.zip(validated_udp.map(|(_, _, _, ports, policy)| {
+                ((ports.first, ports.last), policy.mappings_per_host() != 0)
+            })),
+            tcp: tcp_capacity.zip(validated_tcp.map(|(_, _, _, ports, policy)| {
+                ((ports.first, ports.last), policy.mappings_per_host() != 0)
+            })),
             firewall_states: firewall_capacity,
         },
         limits,
@@ -1966,11 +1978,15 @@ impl TextBudget {
     }
 }
 
+/// Port pool of one NAT44 protocol and whether its per-host mapping limit
+/// is set (N3).
+type NatStorageInputs = ((u16, u16), bool);
+
 struct StorageInputs {
     resolution: Option<crate::ResolutionCapacityV1>,
     icmp: Option<crate::Icmpv4ErrorCapacityV1>,
-    udp: Option<(crate::Nat44UdpCapacityV1, (u16, u16))>,
-    tcp: Option<(crate::Nat44TcpCapacityV1, (u16, u16))>,
+    udp: Option<(crate::Nat44UdpCapacityV1, NatStorageInputs)>,
+    tcp: Option<(crate::Nat44TcpCapacityV1, NatStorageInputs)>,
     firewall_states: Option<u32>,
 }
 
@@ -2054,8 +2070,8 @@ fn build_storage_shape(
         .transpose()?;
     let nat44_udp = inputs
         .udp
-        .map(|(capacity, ports)| {
-            let shape = udp_shape(capacity, ports, limits)?;
+        .map(|(capacity, (ports, per_host))| {
+            let shape = udp_shape(capacity, ports, per_host, limits)?;
             add_bytes::<Nat44UdpMappingSlot>(
                 &mut bytes,
                 shape.mappings,
@@ -2069,13 +2085,14 @@ fn build_storage_shape(
             add_directory_bytes(&mut bytes, shape.mapping_buckets, shape.mapping_nodes)?;
             add_directory_bytes(&mut bytes, shape.peer_buckets, shape.peer_nodes)?;
             add_port_owner_bytes(&mut bytes, shape.port_owners)?;
+            add_host_bytes::<1>(&mut bytes, shape.hosts, shape.mapping_buckets, "udp")?;
             Ok(shape)
         })
         .transpose()?;
     let nat44_tcp = inputs
         .tcp
-        .map(|(capacity, ports)| {
-            let shape = tcp_shape(capacity, ports, limits)?;
+        .map(|(capacity, (ports, per_host))| {
+            let shape = tcp_shape(capacity, ports, per_host, limits)?;
             add_bytes::<Nat44TcpMappingSlot>(
                 &mut bytes,
                 shape.mappings,
@@ -2096,6 +2113,7 @@ fn build_storage_shape(
                 shape.unsolicited_syn_holds,
                 path(&["nat44", "tcp", "capacity", "unsolicited-syn-holds"]),
             )?;
+            add_host_bytes::<2>(&mut bytes, shape.hosts, shape.mapping_buckets, "tcp")?;
             Ok(shape)
         })
         .transpose()?;
@@ -2128,6 +2146,7 @@ fn build_storage_shape(
 fn udp_shape(
     capacity: crate::Nat44UdpCapacityV1,
     ports: (u16, u16),
+    per_host: bool,
     limits: ValidationLimits,
 ) -> Result<Nat44UdpStorageShapeV1, ValidationError> {
     let mapping_path = path(&["nat44", "udp", "capacity", "mappings"]);
@@ -2146,12 +2165,14 @@ fn udp_shape(
         peer_buckets,
         peer_nodes: capacity.peers,
         port_owners,
+        hosts: if per_host { capacity.mappings } else { 0 },
     })
 }
 
 fn tcp_shape(
     capacity: crate::Nat44TcpCapacityV1,
     ports: (u16, u16),
+    per_host: bool,
     limits: ValidationLimits,
 ) -> Result<Nat44TcpStorageShapeV1, ValidationError> {
     let mapping_path = path(&["nat44", "tcp", "capacity", "mappings"]);
@@ -2176,6 +2197,7 @@ fn tcp_shape(
         session_nodes: capacity.sessions,
         port_owners,
         unsolicited_syn_holds: capacity.unsolicited_syn_holds,
+        hosts: if per_host { capacity.mappings } else { 0 },
     })
 }
 
@@ -2234,6 +2256,22 @@ fn check_quote_slots(
 fn add_directory_bytes(bytes: &mut usize, buckets: u32, nodes: u32) -> Result<(), ValidationError> {
     add_bytes::<DirectoryBucket>(bytes, buckets, SourcePath::default())?;
     add_bytes::<DirectoryNode>(bytes, nodes, SourcePath::default())
+}
+
+/// Per-host mapping accounting of one NAT44 protocol with `LISTS` host
+/// lists (N3): one link and one host slot per host, and a host directory of
+/// `hosts` nodes and, when there are hosts, the mapping directory's
+/// `mapping_buckets` buckets.
+fn add_host_bytes<const LISTS: usize>(
+    bytes: &mut usize,
+    hosts: u32,
+    mapping_buckets: u32,
+    protocol: &str,
+) -> Result<(), ValidationError> {
+    let path = path(&["nat44", protocol, "mappings-per-host"]);
+    add_bytes::<Nat44HostLink>(bytes, hosts, path.clone())?;
+    add_bytes::<ruster_core::Nat44HostSlot<LISTS>>(bytes, hosts, path)?;
+    add_directory_bytes(bytes, if hosts == 0 { 0 } else { mapping_buckets }, hosts)
 }
 
 /// One port-owner slot per pool port plus the free-port bitmap words

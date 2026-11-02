@@ -66,6 +66,7 @@ impl UdpBenchIndexes {
             &mut self.peer_nodes,
             &mut self.port_owners,
             &mut self.port_free_bits,
+            ruster_core::Nat44HostStorage::disabled(),
         );
         Nat44UdpRuntime::new(
             config,
@@ -107,6 +108,7 @@ impl TcpBenchIndexes {
             &mut self.session_address_nodes,
             &mut self.port_owners,
             &mut self.port_free_bits,
+            ruster_core::Nat44HostStorage::disabled(),
         );
         Nat44TcpRuntime::new(
             config,

@@ -1433,7 +1433,7 @@ RFC 6056 §4に従うべき（SHOULD）とし、RFC 6888 REQ-15はCGNのport割�
   NAPT。従来の挙動）。保存したportの予測不能性はhost自身のsource port選択と同じで、RFC 6056に
   従うhostはrandomizeします。予測可能なsource portを使うhostを抱える構成のためにprotocolごとの
   `[nat44.udp]`/`[nat44.tcp]` `port-preservation = false`（reloadable、`NatChange::port_preservation`
-  のtyped delta、applyはNAT stateをflush）で常にkeyed portにできます。(2)はどちらでも保ちます。`false`はhostのport選択を隠しますが、keyed startはkey generation内でendpointごとに固定なので、source port固定のendpoint（DNS resolverなど）のpublic portはflowごとに変わりません（resolverはRFC 5452どおり自分でrandomizeする）。preservation onではinside hostがport使用状況を知れ、他hostの直前にexpiredしたportを(1)で取れるので、信頼できないinside hostがある構成も`false`の理由です（(1)をowner無しportだけにする案はNAT44-093、hostごとのmapping上限はNAT44-092でdeferred）。
+  のtyped delta、applyはNAT stateをflush）で常にkeyed portにできます。(2)はどちらでも保ちます。`false`はhostのport選択を隠しますが、keyed startはkey generation内でendpointごとに固定なので、source port固定のendpoint（DNS resolverなど）のpublic portはflowごとに変わりません（resolverはRFC 5452どおり自分でrandomizeする）。preservation onではinside hostがport使用状況を知れ、他hostの直前にexpiredしたportを(1)で取れるので、信頼できないinside hostがある構成も`false`の理由です（(1)をowner無しportだけにする案はNAT44-093でdeferred。hostごとのmapping上限はN3のNAT44-092、下の「Per-host mapping quota」）。
 - **(4) takeover**: domain `UdpPortTakeover`/`TcpPortTakeover`で（endpoint、mapping generation、
   時刻、probe番号）をhashした`NAT44_PORT_TAKEOVER_PROBES`（8）個のpool portをO(1)のowner確認で
   調べ、ownerがexpiredな最初のportを取ります。全てliveならexpiry順へfallbackします（expiredの
@@ -1453,6 +1453,71 @@ restart-requiredで、`required_bytes`とcounting allocatorのtestが計上し�
 reconcileのflush（control path）とdebug/testの全体検証だけです。keyed directoryのlookupは
 secret per-publication SipHash keyでchainを狙えず期待O(1)ですが、存在するkeyを見落とすと
 endpoint-independent mappingが壊れるので上限で打ち切りません。
+
+#### Per-host mapping quota (N3)
+
+N3（NAT44-092、094〜096）はRFC 6888 REQ-4（subscriberごとのexternal port数の制限をsupportする:
+MUST）を、internal IPv4 addressごとのmapping上限`[nat44.udp]`/`[nat44.tcp]` `mappings-per-host`
+（u16、default `0`=無制限）として実装します。RFC 6888は値を定めないのでdefaultはRFC baselineの
+無制限で、security policyとしてopt-inです。
+
+- **何を数えるか**: mappingは「occupiedかつ自分のpublic portを持つ」間だけそのinternal addressへ
+  数えます。作成commitで数え始め、そのslotを別mappingへ再利用するcommit、retire（別mappingが
+  portを引き継ぐ）、reconcile flushで外れます。countされるmappingはそれぞれ別のpublic portを
+  持つので、countはhostが持つexternal port数そのものです。peer（UDP）とsession（TCP）は数えず、
+  EIMの既存mappingを別remoteへ使うのも数え直しません。
+- **構造（O(1)、scanなし）**: runtimeごとのcaller-backed host表（`Nat44HostStorage`）。mapping
+  slotと並ぶlink配列（12 bytes、intrusive doubly linked list）、host slot（address、listの
+  head/tail/len、empty listのlink。UDP 24、TCP 36 bytes）、そしてsecret NAT keyをdomain
+  `UdpHost`/`TcpHost`で分離したkeyed host directory（`FixedDirectory`、mapping directoryと同じ
+  bucket数）。hostのlistはruntimeのport所有mappingのreuse listを鏡写しにします（UDPはLRUと
+  parkedを合わせたactivity順の1本、TCPはestablished/transitoryの2本）。reuse listの末尾への
+  追加と削除をhost listでも同時に行うので、host listはreuse listのhostごとの部分列で、同じく
+  expiry順です（UDPのparkは順序を変えないのでhost listには触れません）。
+- **上限での動作**: 新規mappingのplanはhost directoryを一回引き、countが上限未満ならそのまま
+  作ります。上限なら、戻ってきたendpoint自身のexpired mappingがまだportを持つ場合はその場で
+  再生成（countは不変）、それ以外はhost listの先頭（TCPは二つの先頭のうち先にexpiredした方）
+  を見ます。liveならhostの全mappingがliveなので`NAT44_{UDP,TCP}_HOST_QUOTA_EXCEEDED`（stateを
+  何も変えずdrop、evictなし）。expiredならそのslotを新mappingが再生成し、portは通常の選択
+  （N2の(1)、(3)、(4)。どれも無ければそのslotの旧port）で決めます。引き継いだslotの旧portは
+  解放され、他hostのexpired mappingのportを取ればそれはretireします（そのhostのcountが減る
+  だけ）。exact mappingがretire済みならそのslotを再生成し、先頭のmappingはportを渡して
+  retireします（その場合だけ旧portを引き継ぐ）。
+- **TCPのhost-driven liveness（review M1、NAT44-097）**: TCP mappingの`expires_ms`はinbound
+  segmentでも進むので、remoteがSYNを送り続けるとhostが全connectionを閉じてもmappingが
+  liveのままでした。quotaはmappingごとの`host_expires_ms`で数えます。hostが自分の開いた
+  sessionかestablished sessionで送るsegmentだけが`expires_ms`と同じ規則で進め（sessionを遷移後に
+  closing phaseに置くRSTやTIME-WAITのACKは、remoteが古い4-tupleへ送ったものへのstackの応答に
+  すぎないので進めない）、毎commitで
+  `expires_ms`にcapします（`host_expires_ms ≤ expires_ms`）。変わるときは常に`now + TTL`なので、
+  hostのTCP listはestablished TTLとtransitory TTLの2本でhost-driven expiry順です。上限では
+  そのexpiryを過ぎた先頭を引き継ぎ、remoteだけが保っていたsessionはgenerationの不一致で
+  終わります。liveなmappingは決してretireしないので、retire済みendpointが戻る場合だけは
+  outrightにexpiredなmappingが要ります。
+- **不変条件の骨子**: (I1) hostのcount = そのaddressのport所有mapping数（listの長さ）、各
+  mappingは高々一つのlist上。(I2) count ≤ limit: commitはcountを高々+1しか増やさず、上限
+  到達時は同じcommitで同じhostのmappingを一つ外す。limitの変更はapplyのflushを伴う。
+  (I3) 拒否 ⇔ hostのlive mapping数（TCPはhost-live）≥ limit: count = limitで先頭（expiryが
+  最も早い）がliveなら全てlive、expiredなら引き継げる。expiryはlazyでも、hostの全mappingがexpiredになった
+  瞬間から次のmappingは通ります（timerもsweepも要らない）。
+- **host slotの確保**: host slotはmapping slotと同数あるので不足しません（countを持つhost数 ≤
+  port所有mapping数 ≤ mapping slot数）。最後のmappingを失ったhostはdirectoryに残したまま
+  empty listへ入り、新しいaddressには、そのaddressのslotが無ければempty listの先頭、無ければ
+  未使用slot、どちらも無ければこのcommitで最後のmappingを失うhostのslotをrelinkします。commit
+  はdirectoryを高々一回link/relinkしunlinkしないので、planが決めたhost slotをcommit前の再検証
+  とcommitが同じstateから再計算でき（planの大きさは変わらない）、commitはinfallibleです。
+- **storageとclassification**: `mappings-per-host = 0`ならhost storageを確保せずhost処理もしま
+  せん（hot pathのcostもmemoryも従来どおり）。非zeroなら上記をmapping capacity分確保し
+  `required_bytes`が数えます（production最大tableで両protocolなら+9175040 bytes、計66240704
+  bytesで64 MiBの上限内）。したがって0と非zeroの切り替えはstorage shape変更（restart-required）、
+  非zero同士の変更はreloadable（他のNAT変更と同じくapplyでNAT stateをflush）。planは
+  `NatChange::mappings_per_host`のtyped deltaです。
+- **限界**（NAT44-096）: 上限はaddress単位です。reverse-path checkがinside sourceをinside-routed
+  prefixに限りますが、ARP/MACとの結び付けは無いので、LAN上のhostはそのprefix内の詐称address
+  ごとに上限まで作れ、victimのaddressを詐称してそのquotaを使い切ることもできます（inside routeは
+  狭く保つ）。hostごとのpeer/sessionは制限しません（RFC 6888 REQ-5）。RFC 6888 REQ-11の
+  ICMP Host Unreachableは送らず（他のresource拒否と同じsilent drop）、hostごとの使用数の
+  観測もありません。
 
 ### Resolution bounded indexes
 

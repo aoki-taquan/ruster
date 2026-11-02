@@ -93,6 +93,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "last",
     "mac",
     "mappings",
+    "mappings-per-host",
     "max-attempts",
     "mode",
     "name",

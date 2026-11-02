@@ -638,6 +638,138 @@ fn port_preservation_off_translates_to_a_keyed_port_and_back() {
     assert_drop(&mut io, DropReason::Nat44UdpMappingMiss, &to_internal_port);
 }
 
+/// N3 (RFC 6888 REQ-4, NAT44-092): with `mappings-per-host = 2`, host A's
+/// third source port is dropped byte-for-byte as
+/// `NAT44_UDP_HOST_QUOTA_EXCEEDED` while host B still gets mappings and A's
+/// existing mappings keep translating both ways. After A's oldest mapping
+/// expires, A's new flow reuses that mapping's public port without any
+/// operator action.
+#[test]
+fn host_at_its_mapping_limit_is_refused_while_another_host_is_served() {
+    let (routes, interfaces, neighbors, bindings) = base();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let policy = Nat44UdpPolicy::default().with_mappings_per_host(2);
+    let config = Nat44UdpConfig::new(&snapshot, LAN, WAN, PUBLIC, 40_000, 40_063, policy).unwrap();
+    let mut mappings = [Nat44UdpMappingSlot::default(); 8];
+    let mut peers = [Nat44UdpPeerSlot::default(); 8];
+    let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
+    let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
+    let mut rs = [ResolutionStateSlot::EMPTY; 1];
+    let mut ra = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut rs, &mut ra);
+    let mut io = SimIo::new();
+    let mut run = |io: &mut SimIo, nat: &mut _, now| {
+        io.run_nat44_udp_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(nat),
+            MonotonicMillis(now),
+            &mut NoTrace,
+        )
+        .unwrap();
+    };
+    let outbound = |host, port| {
+        udp_frame(
+            host,
+            REMOTE1,
+            port,
+            53,
+            64,
+            0x4000,
+            &[1],
+            &[],
+            UdpChecksum::Valid,
+        )
+    };
+    let public_port = |frame: &[u8]| u16::from_be_bytes(frame[34..36].try_into().unwrap());
+    let mut ports = Vec::new();
+    for port in [50_000, 50_001] {
+        io.inject(LAN, outbound(HOST, port));
+        run(&mut io, &mut nat, 0);
+        let out = io.pop_tx().unwrap();
+        assert_eq!(out.egress, WAN);
+        ports.push(public_port(&out.bytes));
+    }
+    let refused = outbound(HOST, 50_002);
+    io.inject(LAN, refused.clone());
+    run(&mut io, &mut nat, 1);
+    assert_drop(&mut io, DropReason::Nat44UdpHostQuotaExceeded, &refused);
+    assert_eq!(nat.counters().host_quota_exceeded, 1);
+
+    // Host B is served; host A's existing mappings still work both ways.
+    io.inject(LAN, outbound(HOST2, 50_002));
+    run(&mut io, &mut nat, 2);
+    assert_eq!(io.pop_tx().unwrap().egress, WAN);
+    io.inject(LAN, outbound(HOST, 50_000));
+    run(&mut io, &mut nat, 3);
+    assert_eq!(public_port(&io.pop_tx().unwrap().bytes), ports[0]);
+    let reply = udp_frame(
+        REMOTE1,
+        PUBLIC,
+        53,
+        ports[1],
+        64,
+        0x4000,
+        &[2],
+        &[],
+        UdpChecksum::Valid,
+    );
+    io.inject(WAN, reply);
+    run(&mut io, &mut nat, 3);
+    let back = io.pop_tx().unwrap();
+    assert_eq!(back.egress, LAN);
+    assert_eq!(&back.bytes[30..34], &HOST.octets());
+
+    // A's mapping for 50001 was last refreshed at 0 and expires at the
+    // idle TTL; 50000 was refreshed at 3. From then on A has quota again:
+    // the new flow takes over the expired mapping's slot with a newly
+    // selected port, and the expired mapping's old port is gone.
+    let ttl = Nat44UdpPolicy::default().idle_ttl_ms();
+    io.inject(LAN, refused.clone());
+    run(&mut io, &mut nat, ttl - 1);
+    assert_drop(&mut io, DropReason::Nat44UdpHostQuotaExceeded, &refused);
+    io.inject(LAN, refused);
+    run(&mut io, &mut nat, ttl);
+    let out = io.pop_tx().unwrap();
+    assert_eq!(out.egress, WAN);
+    let new_port = public_port(&out.bytes);
+    assert!((40_000..=40_063).contains(&new_port) && new_port != ports[0]);
+    assert_eq!(nat.counters().host_quota_exceeded, 2);
+    let stale = udp_frame(
+        REMOTE1,
+        PUBLIC,
+        53,
+        ports[1],
+        64,
+        0x4000,
+        &[3],
+        &[],
+        UdpChecksum::Valid,
+    );
+    if new_port != ports[1] {
+        io.inject(WAN, stale.clone());
+        run(&mut io, &mut nat, ttl);
+        assert_drop(&mut io, DropReason::Nat44UdpMappingMiss, &stale);
+    }
+    let reply = udp_frame(
+        REMOTE1,
+        PUBLIC,
+        53,
+        new_port,
+        64,
+        0x4000,
+        &[4],
+        &[],
+        UdpChecksum::Valid,
+    );
+    io.inject(WAN, reply);
+    run(&mut io, &mut nat, ttl);
+    let back = io.pop_tx().unwrap();
+    assert_eq!(&back.bytes[36..38], &50_002_u16.to_be_bytes());
+}
+
 #[test]
 fn exact_idle_expiry_outbound_refresh_and_inbound_no_refresh() {
     let (routes, interfaces, neighbors, bindings) = base();

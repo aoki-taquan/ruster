@@ -381,6 +381,31 @@ port-preservation = true   # 省略時true。false: 常にkeyed port（reloadabl
 port-preservation = true
 ```
 
+internal hostごとのmapping上限（N3、NAT44-092。RFC 6888 REQ-4はsubscriberごとのexternal port数の
+制限をsupportすることを求め、値は定めない）: `mappings-per-host`が非zeroなら、同じinternal IPv4
+addressが既にその数のlive mappingを持つとき新規mappingをbyte不変の
+`NAT44_UDP_HOST_QUOTA_EXCEEDED`/`NAT44_TCP_HOST_QUOTA_EXCEEDED`（counter
+`nat44_{udp,tcp}.host_quota_exceeded`）でdropし、何もevictしません。既存mappingのrefresh、
+既存mappingへの新しいpeer/session、inboundは影響を受けません。数えるのはpublic portを持つ
+mappingで（hostごとのexternal port数）、hostのmappingがexpireすれば次の新mappingはそのslotを
+引き継ぎ（portは通常の選択）、手動操作なしに戻ります（他hostのslotは取りません）。TCPのliveは
+hostが保っているもの（自分の開いたconnectionかestablished connectionでhostが送るsegmentだけが
+進める）で、remoteがSYNを送り続けてもhostを上限に留められません。hostごとの
+intrusive listとkeyed host directoryでO(1)、scanもtimerもありません。defaultの`0`は無制限で、
+host storageも確保しません。非zeroにするとmapping capacity分のhost storage（mapping slotごとに
+UDP約64、TCP約76 bytes）を確保するので、`0`と非zeroの切り替えはrestart-required
+（`STORAGE_SHAPE`）、非zero同士の変更はreloadableなので、値は最初から決めておくのが安全です。
+推奨値（pool size ÷ inside host数など）と限界（LAN上のsource address詐称、hostごとのpeer/session
+は無制限）はrunbookの「Known limits」にあります。
+
+```toml
+[nat44.udp]
+mappings-per-host = 1024   # 省略時0（無制限）。u16
+
+[nat44.tcp]
+mappings-per-host = 1024
+```
+
 NAT44 inbound filteringは`[nat44.udp]`と`[nat44.tcp]`の`filtering`で個別に選びます。
 RFC 4787 REQ-8とRFC 5382 REQ-3は、transparency重視ならEndpoint-Independent、より厳しい
 filtering重視ならAddress-DependentをRECOMMENDEDとし、administrator option化と

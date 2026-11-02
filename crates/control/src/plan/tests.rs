@@ -429,6 +429,80 @@ fn nat_port_preservation_is_a_reloadable_typed_delta_separate_from_the_policy_fl
     );
 }
 
+/// N3: `mappings-per-host` is a non-secret typed delta per protocol that
+/// does not raise the opaque policy flag. Switching between `0` and a
+/// limit adds or drops the per-host storage, so it is restart-required as a
+/// storage-shape change; changing one limit to another is reloadable (the
+/// apply flushes the NAT state like every NAT change).
+#[test]
+fn nat_mappings_per_host_is_a_typed_delta_and_only_switching_it_on_or_off_is_a_shape_change() {
+    const UDP: &str = "icmpv4-errors = \"external-only\"\n";
+    const TCP: &str = "allocator-seed = \"11\"\n";
+    let udp_limit = |limit: u16| {
+        (
+            UDP,
+            format!("icmpv4-errors = \"external-only\"\nmappings-per-host = {limit}\n"),
+        )
+    };
+    let tcp_limit = |limit: u16| {
+        (
+            TCP,
+            format!("allocator-seed = \"11\"\nmappings-per-host = {limit}\n"),
+        )
+    };
+    let edits = |edits: &[(&'static str, String)]| -> ValidatedConfigV1 {
+        let borrowed: Vec<(&str, &str)> = edits
+            .iter()
+            .map(|(anchor, text)| (*anchor, text.as_str()))
+            .collect();
+        config(&borrowed)
+    };
+    // Spelling out the default (0, no limit) is no change.
+    only(
+        &ApplyPlan::between(&config(&[]), &edits(&[udp_limit(0), tcp_limit(0)])).unwrap(),
+        &[],
+    );
+
+    let on = ApplyPlan::between(&config(&[]), &edits(&[udp_limit(64)])).unwrap();
+    only(&on, &["nat44_udp", "restart"]);
+    assert_eq!(on.restart_required(), [RestartRequired::StorageShape]);
+    assert_eq!(
+        on.nat44_udp().mappings_per_host,
+        Some(Delta { old: 0, new: 64 })
+    );
+    assert!(!on.nat44_udp().policy_changed);
+    assert_eq!(on.nat44_tcp().mappings_per_host, None);
+
+    let off = ApplyPlan::between(&edits(&[tcp_limit(8)]), &config(&[])).unwrap();
+    only(&off, &["nat44_tcp", "restart"]);
+    assert_eq!(off.restart_required(), [RestartRequired::StorageShape]);
+    assert_eq!(
+        off.nat44_tcp().mappings_per_host,
+        Some(Delta { old: 8, new: 0 })
+    );
+
+    let change = ApplyPlan::between(
+        &edits(&[udp_limit(64), tcp_limit(8)]),
+        &edits(&[udp_limit(128), tcp_limit(16)]),
+    )
+    .unwrap();
+    only(&change, &["nat44_udp", "nat44_tcp"]);
+    assert!(change.restart_required().is_empty());
+    assert_eq!(
+        change.nat44_udp().mappings_per_host,
+        Some(Delta { old: 64, new: 128 })
+    );
+    assert_eq!(
+        change.nat44_tcp().mappings_per_host,
+        Some(Delta { old: 8, new: 16 })
+    );
+    assert!(!change.nat44_udp().policy_changed && !change.nat44_tcp().policy_changed);
+    assert_eq!(
+        edits(&[udp_limit(64), tcp_limit(8)]).storage_shape(),
+        edits(&[udp_limit(1), tcp_limit(65_535)]).storage_shape()
+    );
+}
+
 #[test]
 fn tcp_inbound_limit_is_a_reloadable_typed_delta_separate_from_the_policy_flag() {
     const TCP: &str = "allocator-seed = \"11\"\n";
