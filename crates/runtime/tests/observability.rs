@@ -354,6 +354,8 @@ fn service_occupancy_capture_copies_every_runtime_accessor() {
                 nat44_tcp_sessions: tcp.sessions,
                 nat44_tcp_external_inbound_sessions: tcp.external_inbound_sessions,
                 nat44_tcp_unsolicited_syn_holds: tcp.unsolicited_syn_holds,
+                nat44_icmp_mappings: Default::default(),
+                nat44_icmp_peers: Default::default(),
                 firewall_states: firewall.occupancy(),
                 icmpv4_error_states: icmpv4_errors.state_occupancy(),
             }
@@ -407,6 +409,7 @@ fn service_counters_render_in_fixed_order(
             "icmpv4_errors",
             "nat44_udp",
             "nat44_tcp",
+            "nat44_icmp",
             "firewall"
         ]
     );
@@ -415,6 +418,7 @@ fn service_counters_render_in_fixed_order(
         ("icmpv4_errors", 34),
         ("nat44_udp", 18),
         ("nat44_tcp", 39),
+        ("nat44_icmp", 15),
         ("firewall", 13),
     ] {
         assert_eq!(sections.iter().filter(|s| **s == section).count(), fields);

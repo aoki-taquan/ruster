@@ -47,6 +47,7 @@ use super::*;
 /// supported error from the inside interface of a protocol whose policy
 /// translates inside errors, addressed to the public address (hairpin) or
 /// routed toward the outside.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn is_nat44_icmpv4_inside_candidate(
     frame: &[u8],
     ingress: IfId,
@@ -55,6 +56,7 @@ pub(super) fn is_nat44_icmpv4_inside_candidate(
     selected_route: Option<Route>,
     nat44_udp_config: Option<&Nat44UdpConfig>,
     nat44_tcp_config: Option<&Nat44TcpConfig>,
+    nat44_icmp_config: Option<&Nat44IcmpConfig>,
 ) -> bool {
     if local {
         return false;
@@ -87,10 +89,19 @@ pub(super) fn is_nat44_icmpv4_inside_candidate(
             config.public_address(),
         )
     });
+    let icmp_enabled = nat44_icmp_config.is_some_and(|config| {
+        enabled(
+            config.policy().icmpv4_errors(),
+            config.inside(),
+            config.outside(),
+            config.public_address(),
+        )
+    });
     match quoted_protocol {
         Some(17) => udp_enabled,
         Some(6) => tcp_enabled,
-        Some(_) | None => udp_enabled || tcp_enabled,
+        Some(1) if nat44_icmp_config.is_some() => icmp_enabled,
+        Some(_) | None => udp_enabled || tcp_enabled || icmp_enabled,
     }
 }
 
@@ -126,6 +137,8 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
     nat44_tcp_config: Option<&Nat44TcpConfig>,
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
+    nat44_icmp_config: Option<&Nat44IcmpConfig>,
+    nat44_icmp: &mut Option<&mut Nat44IcmpRuntime<'_>>,
     now: MonotonicMillis,
     combined_realm_mismatch: bool,
     related_firewall: Option<&mut FirewallRuntime<'_>>,
@@ -155,6 +168,17 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
             policy: config.policy().icmpv4_errors(),
             hairpinning: config.policy().hairpinning(),
             hairpin_disabled: Nat44TcpHairpinDisabled,
+        }),
+        // A quoted ICMP query reply the inside host received (N5). No
+        // hairpinned query session exists (see `nat44_icmp_query`), so an
+        // error toward the public address quoting a query is refused.
+        1 => nat44_icmp_config.map(|config| OwnerConfig {
+            inside: config.inside(),
+            outside: config.outside(),
+            public_address: config.public_address(),
+            policy: config.policy().icmpv4_errors(),
+            hairpinning: false,
+            hairpin_disabled: Nat44Icmpv4QuotedProtocolUnsupported,
         }),
         _ => None,
     };
@@ -282,12 +306,51 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
                 sender,
             }
         }
-        _ => unreachable!("the NAT ICMPv4 parser accepts only UDP and TCP quotes"),
+        1 => {
+            // Only a reply can have reached an inside host through the NAT.
+            if !quote
+                .query_type
+                .is_some_and(super::nat44_icmp_query::is_query_reply)
+            {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedProtocolUnsupported, trace);
+            }
+            let config = nat44_icmp_config.expect("ICMP owner has an ICMP configuration");
+            if !config.authority_matches(snapshot) {
+                return nat44_icmpv4_drop(ingress, Nat44IcmpConfigMismatch, trace);
+            }
+            let Some(runtime) = nat44_icmp.as_deref() else {
+                return nat44_icmpv4_drop(ingress, Nat44IcmpRuntimeUnavailable, trace);
+            };
+            if runtime.config() != *config {
+                return nat44_icmpv4_drop(ingress, Nat44IcmpConfigMismatch, trace);
+            }
+            let public_port = runtime
+                .inspect_inbound_quote(
+                    internal,
+                    quote.destination_port,
+                    quote.source_address,
+                    now.0,
+                )
+                .map_err(|error| {
+                    trace_nat44_icmpv4_drop(
+                        ingress,
+                        super::nat44_icmp_query::nat44_icmp_error_lookup_reason(error),
+                        trace,
+                    )
+                })?;
+            InsideErrorAuthority {
+                public_port,
+                sender: None,
+            }
+        }
+        _ => unreachable!("the NAT ICMPv4 parser accepts only ICMP, UDP, and TCP quotes"),
     };
 
     if let Some(runtime) = related_firewall.as_deref() {
         let protocol = FirewallProtocol::from_ipv4(quote.protocol)
-            .expect("the NAT ICMPv4 parser accepts only UDP and TCP quotes");
+            .expect("the NAT ICMPv4 parser accepts only ICMP, UDP, and TCP quotes");
+        let (source_port, destination_port) =
+            quote.firewall_ports(quote.source_port, quote.destination_port);
         // The quoted packet as the error's sender received it: post-DNAT,
         // ingress outside, egress inside.
         let received = FirewallPacket {
@@ -296,9 +359,12 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
             source: quote.source_address,
             destination: internal,
             protocol,
-            source_port: quote.source_port,
-            destination_port: quote.destination_port,
-            tcp_flags: 0,
+            source_port,
+            destination_port,
+            // A quoted query is a reply here (checked above).
+            tcp_flags: quote
+                .query_type
+                .map_or(0, super::nat44_icmp_query::firewall_flags),
         };
         inspect_nat44_icmpv4_related(runtime, firewall_audit, received, true, ingress, now, trace)?;
         if let Some((sender_address, sender_port)) = authority.sender {

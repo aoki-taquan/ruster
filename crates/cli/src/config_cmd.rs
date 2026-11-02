@@ -462,9 +462,15 @@ pub fn validate_loaded(
             af_xdp.umem_bytes()
         ),
     };
+    // ICMP query NAT (N5) is the one optional service.
+    let icmp = if config.nat44().and_then(|nat44| nat44.icmp()).is_some() {
+        "nat44-icmp,"
+    } else {
+        ""
+    };
     let summary = format!(
         "valid: schema-version=1 interfaces={} routes={} neighbors={} local-ipv4={} \
-         firewall-rules={} services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,firewall \
+         firewall-rules={} services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,{icmp}firewall \
          storage-bytes={} {backend}\n",
         config.interfaces().len(),
         config.routes().len(),

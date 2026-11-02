@@ -216,6 +216,7 @@ impl PublicationKeySource for ReusingSource {
             Nat44TcpHashKey::new(3, 4).unwrap(),
             FirewallHashKey::new(5, 6).unwrap(),
             ResolutionHashKey::new(7, 8).unwrap(),
+            ruster_core::Nat44IcmpHashKey::new(9, 10).unwrap(),
         ))
     }
 }

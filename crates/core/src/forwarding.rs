@@ -11,12 +11,19 @@ use crate::{
     FirewallPolicySource, FirewallProtocol, FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow,
     FirewallRuntime, FirewallVerdict, Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind,
     Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface, LocalIpv4Binding,
-    MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition, Nat44TcpRuntime,
-    Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, ResolutionResult,
+    MonotonicMillis, Nat44IcmpConfig, Nat44IcmpDisposition, Nat44IcmpRuntime,
+    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition, Nat44TcpRuntime, Nat44UdpConfig,
+    Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, ResolutionResult,
     ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
 use hairpin::{decide_nat44_tcp_hairpin, decide_nat44_udp_hairpin, Nat44HairpinDestinationRewrite};
 use lookup::{linear, ForwardingIndex};
+use nat44_icmp_query::{
+    apply_nat44_icmp_rewrite, decide_nat44_icmp_inbound, decide_nat44_icmp_outbound,
+    is_query_reply, is_query_request, nat44_icmp_drop, observe_nat44_icmp_security_time,
+    peek_icmp_type, require_nat44_icmp_runtime, validate_firewall_icmp_query,
+    Nat44IcmpRewriteDecision, Nat44IcmpTransition,
+};
 use nat44_icmpv4_inside::{decide_nat44_icmpv4_inside_error, is_nat44_icmpv4_inside_candidate};
 use unsolicited_syn::hold_unsolicited_syn;
 pub use unsolicited_syn::{
@@ -28,6 +35,7 @@ mod hairpin;
 mod lookup;
 #[cfg(test)]
 mod lookup_tests;
+mod nat44_icmp_query;
 mod nat44_icmpv4_inside;
 mod unsolicited_syn;
 
@@ -217,6 +225,59 @@ pub enum DropReason {
     /// MTU of 1 to 67, below the IPv4 minimum of 68 (RFC 791, RFC 1191 §3).
     /// Zero (a router predating RFC 1191) stays valid.
     Nat44Icmpv4FragNeededMtuInvalid = 158,
+    /// ICMP query NAT is configured but the tick has no ICMP query runtime.
+    Nat44IcmpRuntimeUnavailable = 159,
+    /// The ICMP query NAT config or runtime does not match the snapshot, or the runtime's state
+    /// failed a commit check.
+    Nat44IcmpConfigMismatch = 160,
+    /// An ICMPv4 message crossing the NAT from the inside is neither an Echo or Timestamp
+    /// request (translated, RFC 5508 REQ-10) nor a translated error, or an inbound message to
+    /// the public address is a query reply from the wrong realm. Information and Address Mask
+    /// messages (RFC 6918) and inside-originated replies are never translated.
+    Nat44IcmpTypeUnsupported = 161,
+    /// An ICMP query to translate is a fragment (MF set or a nonzero offset). Unfragmented
+    /// queries are translated with DF set or clear (NAT44-116).
+    Nat44IcmpFragmentUnsupported = 162,
+    /// An ICMP query to translate is shorter than its 8-byte header (20 bytes for Timestamp).
+    Nat44IcmpHeaderTruncated = 163,
+    /// An ICMP query to translate has a nonzero code (RFC 792).
+    Nat44IcmpCodeInvalid = 164,
+    /// An ICMP query to translate fails the ICMP checksum.
+    Nat44IcmpChecksumInvalid = 165,
+    /// An ICMP query's source is not an admissible host (a router or the public address, or not
+    /// host-unicast).
+    Nat44IcmpSourceForbidden = 166,
+    /// An outbound ICMP query's source is not routed back through the inside interface, or an
+    /// inbound reply's internal destination has no route.
+    Nat44IcmpReverseAuthorityMismatch = 167,
+    /// An inbound ICMP query reply names no live query mapping.
+    Nat44IcmpMappingMiss = 168,
+    /// An inbound ICMP query reply comes from a remote address the mapping has not queried
+    /// (address-dependent filtering).
+    Nat44IcmpFilterDenied = 169,
+    /// A new ICMP query mapping found no free or expired slot. Nothing was evicted.
+    Nat44IcmpMappingTableFull = 170,
+    /// A new ICMP query filter peer found no free or reusable slot. Nothing was evicted.
+    Nat44IcmpPeerTableFull = 171,
+    /// Every public ICMP query identifier has a live owner.
+    Nat44IcmpIdentifierExhausted = 172,
+    /// A new ICMP query mapping's internal address already holds the per-host limit of live
+    /// query mappings (N3 applied to queries). Nothing was created or evicted.
+    Nat44IcmpHostQuotaExceeded = 173,
+    /// The ICMP query NAT runtime observed time going backwards.
+    Nat44IcmpClockRegression = 174,
+    /// A query reply addressed to the public address arrived on another interface than the
+    /// outside (no inbound query session exists to reach from the inside).
+    Nat44IcmpWrongIngress = 175,
+    /// An inbound query reply's internal destination is not routed through the inside
+    /// interface.
+    Nat44IcmpWrongEgress = 176,
+    /// An ICMP Echo or Timestamp message evaluated by the firewall is truncated, has a nonzero
+    /// code, or fails the ICMP checksum.
+    FirewallIcmpQueryInvalid = 177,
+    /// An ICMP Echo/Timestamp reply without a firewall flow matched an
+    /// allow-stateful rule: only a request opens an ICMP flow (N5).
+    FirewallIcmpReplyWithoutRequest = 178,
 }
 
 use DropReason::*;
@@ -224,7 +285,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 158] = [
+    pub const ALL: [Self; 178] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -383,6 +444,26 @@ impl DropReason {
         Nat44TcpHostQuotaExceeded,
         Nat44Icmpv4TranslatedRateLimited,
         Nat44Icmpv4FragNeededMtuInvalid,
+        Nat44IcmpRuntimeUnavailable,
+        Nat44IcmpConfigMismatch,
+        Nat44IcmpTypeUnsupported,
+        Nat44IcmpFragmentUnsupported,
+        Nat44IcmpHeaderTruncated,
+        Nat44IcmpCodeInvalid,
+        Nat44IcmpChecksumInvalid,
+        Nat44IcmpSourceForbidden,
+        Nat44IcmpReverseAuthorityMismatch,
+        Nat44IcmpMappingMiss,
+        Nat44IcmpFilterDenied,
+        Nat44IcmpMappingTableFull,
+        Nat44IcmpPeerTableFull,
+        Nat44IcmpIdentifierExhausted,
+        Nat44IcmpHostQuotaExceeded,
+        Nat44IcmpClockRegression,
+        Nat44IcmpWrongIngress,
+        Nat44IcmpWrongEgress,
+        FirewallIcmpQueryInvalid,
+        FirewallIcmpReplyWithoutRequest,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -558,6 +639,26 @@ impl DropReason {
             Nat44TcpHostQuotaExceeded => "NAT44_TCP_HOST_QUOTA_EXCEEDED",
             Nat44Icmpv4TranslatedRateLimited => "NAT44_ICMPV4_TRANSLATED_RATE_LIMITED",
             Nat44Icmpv4FragNeededMtuInvalid => "NAT44_ICMPV4_FRAG_NEEDED_MTU_INVALID",
+            Nat44IcmpRuntimeUnavailable => "NAT44_ICMP_RUNTIME_UNAVAILABLE",
+            Nat44IcmpConfigMismatch => "NAT44_ICMP_CONFIG_MISMATCH",
+            Nat44IcmpTypeUnsupported => "NAT44_ICMP_TYPE_UNSUPPORTED",
+            Nat44IcmpFragmentUnsupported => "NAT44_ICMP_FRAGMENT_UNSUPPORTED",
+            Nat44IcmpHeaderTruncated => "NAT44_ICMP_HEADER_TRUNCATED",
+            Nat44IcmpCodeInvalid => "NAT44_ICMP_CODE_INVALID",
+            Nat44IcmpChecksumInvalid => "NAT44_ICMP_CHECKSUM_INVALID",
+            Nat44IcmpSourceForbidden => "NAT44_ICMP_SOURCE_FORBIDDEN",
+            Nat44IcmpReverseAuthorityMismatch => "NAT44_ICMP_REVERSE_AUTHORITY_MISMATCH",
+            Nat44IcmpMappingMiss => "NAT44_ICMP_MAPPING_MISS",
+            Nat44IcmpFilterDenied => "NAT44_ICMP_FILTER_DENIED",
+            Nat44IcmpMappingTableFull => "NAT44_ICMP_MAPPING_TABLE_FULL",
+            Nat44IcmpPeerTableFull => "NAT44_ICMP_PEER_TABLE_FULL",
+            Nat44IcmpIdentifierExhausted => "NAT44_ICMP_IDENTIFIER_EXHAUSTED",
+            Nat44IcmpHostQuotaExceeded => "NAT44_ICMP_HOST_QUOTA_EXCEEDED",
+            Nat44IcmpClockRegression => "NAT44_ICMP_CLOCK_REGRESSION",
+            Nat44IcmpWrongIngress => "NAT44_ICMP_WRONG_INGRESS",
+            Nat44IcmpWrongEgress => "NAT44_ICMP_WRONG_EGRESS",
+            FirewallIcmpQueryInvalid => "FIREWALL_ICMP_QUERY_INVALID",
+            FirewallIcmpReplyWithoutRequest => "FIREWALL_ICMP_REPLY_WITHOUT_REQUEST",
         }
     }
 }
@@ -1368,6 +1469,11 @@ pub enum TraceEvent {
         ingress: IfId,
         disposition: Nat44Icmpv4Disposition,
     },
+    /// ICMP query translation (Echo, Timestamp; RFC 5508 §3, N5).
+    Nat44Icmp {
+        ingress: IfId,
+        disposition: Nat44IcmpDisposition,
+    },
     /// An unsolicited inbound TCP SYN was offered to the hold table, or a
     /// matured hold was resolved (RFC 5382 REQ-4).
     Nat44TcpUnsolicitedSyn {
@@ -1563,6 +1669,9 @@ struct Nat44Icmpv4RewriteDecision {
     inner_destination: [u8; 4],
     inner_source_port: u16,
     inner_destination_port: u16,
+    /// A quoted ICMP query (N5): only the 2-byte identifier at
+    /// `inner_port_offset` is written (`inner_source_port`).
+    inner_identifier_only: bool,
     outer_checksum: u16,
     inner_checksum: u16,
     transport_checksum: Option<u16>,
@@ -1576,6 +1685,7 @@ enum PacketDecision {
     Nat44Udp(Nat44UdpRewriteDecision),
     Nat44Tcp(Nat44TcpRewriteDecision),
     Nat44Icmpv4(Nat44Icmpv4RewriteDecision),
+    Nat44Icmp(Nat44IcmpRewriteDecision),
     ArpReply(ArpReplyDecision),
     Icmpv4EchoReply(Icmpv4EchoReplyDecision),
     ConsumeArp(ControlDisposition),
@@ -1595,6 +1705,7 @@ impl PacketDecision {
             Self::Nat44Udp(decision) => decision.forwarding.egress,
             Self::Nat44Tcp(decision) => decision.forwarding.egress,
             Self::Nat44Icmpv4(decision) => decision.egress,
+            Self::Nat44Icmp(decision) => decision.forwarding.egress,
             Self::ArpReply(decision) => decision.egress,
             Self::Icmpv4EchoReply(decision) => decision.egress,
             Self::ConsumeArp(_) | Self::ConsumeIpv4Local => {
@@ -1623,7 +1734,7 @@ where
     T: TraceSink,
 {
     forward_batch_inner(
-        batch, snapshot, None, None, None, None, None, None, None, None, None, trace,
+        batch, snapshot, None, None, None, None, None, None, None, None, None, None, None, trace,
     )
 }
 
@@ -1646,6 +1757,8 @@ where
         batch,
         snapshot,
         Some((runtime, now)),
+        None,
+        None,
         None,
         None,
         None,
@@ -1681,6 +1794,8 @@ where
         snapshot,
         Some((resolution, now)),
         Some((icmpv4_errors, now)),
+        None,
+        None,
         None,
         None,
         None,
@@ -1726,6 +1841,8 @@ where
         None,
         None,
         None,
+        None,
+        None,
         trace,
     )
 }
@@ -1765,6 +1882,8 @@ where
         None,
         None,
         None,
+        None,
+        None,
         trace,
     )
 }
@@ -1794,6 +1913,8 @@ where
         None,
         Some(config),
         nat44_tcp,
+        None,
+        None,
         None,
         None,
         None,
@@ -1831,6 +1952,8 @@ where
         None,
         None,
         None,
+        None,
+        None,
         trace,
     )
 }
@@ -1863,6 +1986,8 @@ where
         nat44_udp,
         Some(tcp_config),
         nat44_tcp,
+        None,
+        None,
         None,
         None,
         None,
@@ -1902,6 +2027,8 @@ where
         None,
         None,
         None,
+        None,
+        None,
         trace,
     )
 }
@@ -1930,6 +2057,8 @@ where
         batch,
         snapshot,
         Some((resolution, now)),
+        None,
+        None,
         None,
         None,
         None,
@@ -1970,6 +2099,8 @@ where
         None,
         None,
         None,
+        None,
+        None,
         Some(config),
         firewall,
         Some(audit),
@@ -2005,6 +2136,8 @@ where
         None,
         None,
         None,
+        None,
+        None,
         Some(config),
         firewall,
         None,
@@ -2036,6 +2169,8 @@ where
         snapshot,
         Some((resolution, now)),
         Some((icmpv4_errors, now)),
+        None,
+        None,
         None,
         None,
         None,
@@ -2077,6 +2212,8 @@ where
         nat44_udp,
         Some(tcp_config),
         nat44_tcp,
+        None,
+        None,
         Some(firewall_config),
         firewall,
         None,
@@ -2116,6 +2253,8 @@ where
         nat44_udp,
         Some(tcp_config),
         nat44_tcp,
+        None,
+        None,
         Some(firewall_config),
         firewall,
         Some(audit),
@@ -2156,6 +2295,8 @@ where
         nat44_udp,
         Some(tcp_config),
         nat44_tcp,
+        None,
+        None,
         Some(firewall_config),
         firewall,
         None,
@@ -2194,9 +2335,105 @@ where
         nat44_udp,
         Some(tcp_config),
         nat44_tcp,
+        None,
+        None,
         Some(firewall_config),
         firewall,
         Some(audit),
+        trace,
+    )
+}
+
+/// Full UDP/TCP NAPT, ICMP query NAT (RFC 5508 §3, N5), and generated
+/// ICMPv4-error composition, without a firewall.
+///
+/// The ICMP query runtime shares the UDP/TCP realm (a mismatch fails
+/// closed). An absent ICMP runtime fails ICMP queries closed; UDP and TCP
+/// are unaffected. The [`forward_batch`] fresh-batch precondition applies.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_with_nat44_udp_and_tcp_and_icmp_and_icmpv4_errors<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    udp_config: &Nat44UdpConfig,
+    nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+    tcp_config: &Nat44TcpConfig,
+    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    icmp_config: &Nat44IcmpConfig,
+    nat44_icmp: Option<&mut Nat44IcmpRuntime<'_>>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        Some((icmpv4_errors, now)),
+        Some(udp_config),
+        nat44_udp,
+        Some(tcp_config),
+        nat44_tcp,
+        Some(icmp_config),
+        nat44_icmp,
+        None,
+        None,
+        None,
+        trace,
+    )
+}
+
+/// [`forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors`]
+/// with ICMP query NAT (RFC 5508 §3, N5).
+///
+/// `icmp` is `None` when ICMP query NAT is not configured: ICMP queries
+/// crossing the NAT then fail closed exactly as in the UDP/TCP composition.
+/// With a config, queries are translated and the firewall evaluates them as
+/// [`FirewallProtocol::Icmp`] flows. The [`forward_batch`] fresh-batch
+/// precondition applies.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    udp_config: &Nat44UdpConfig,
+    nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+    tcp_config: &Nat44TcpConfig,
+    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    icmp: Option<(&Nat44IcmpConfig, Option<&mut Nat44IcmpRuntime<'_>>)>,
+    firewall_config: &FirewallConfig<'_>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
+    audit: Option<&mut FirewallAuditBuffer<'_>>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    let (icmp_config, nat44_icmp) = match icmp {
+        Some((config, runtime)) => (Some(config), runtime),
+        None => (None, None),
+    };
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        Some((icmpv4_errors, now)),
+        Some(udp_config),
+        nat44_udp,
+        Some(tcp_config),
+        nat44_tcp,
+        icmp_config,
+        nat44_icmp,
+        Some(firewall_config),
+        firewall,
+        audit,
         trace,
     )
 }
@@ -2211,6 +2448,8 @@ fn forward_batch_inner<B, T>(
     mut nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
     nat44_tcp_config: Option<&Nat44TcpConfig>,
     mut nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    nat44_icmp_config: Option<&Nat44IcmpConfig>,
+    mut nat44_icmp: Option<&mut Nat44IcmpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
     mut firewall: Option<&mut FirewallRuntime<'_>>,
     mut firewall_audit: Option<&mut FirewallAuditBuffer<'_>>,
@@ -2241,6 +2480,8 @@ where
                 &mut nat44_udp,
                 nat44_tcp_config,
                 &mut nat44_tcp,
+                nat44_icmp_config,
+                &mut nat44_icmp,
                 firewall_config,
                 &mut firewall,
                 &mut firewall_audit,
@@ -2280,6 +2521,19 @@ where
                                 .prevalidate_inbound_commit(plan, nat_now_ms)
                                 .map_err(|_| DropReason::Nat44TcpConfigMismatch)?;
                         }
+                    }
+                }
+                if let PacketDecision::Nat44Icmp(nat) = decision {
+                    let runtime = nat44_icmp
+                        .as_deref()
+                        .ok_or(DropReason::Nat44IcmpRuntimeUnavailable)?;
+                    match nat.transition {
+                        Nat44IcmpTransition::Outbound(plan) => runtime
+                            .prevalidate_outbound_commit(plan, nat_now_ms)
+                            .map_err(|_| DropReason::Nat44IcmpConfigMismatch)?,
+                        Nat44IcmpTransition::Inbound(plan) => runtime
+                            .prevalidate_inbound_commit(plan, nat_now_ms)
+                            .map_err(|_| DropReason::Nat44IcmpConfigMismatch)?,
                     }
                 }
                 if matches!(
@@ -2368,6 +2622,23 @@ where
                         disposition: nat.disposition,
                     });
                 }
+                if let PacketDecision::Nat44Icmp(nat) = decision {
+                    let runtime = nat44_icmp
+                        .as_deref_mut()
+                        .expect("ICMP query NAT decision requires a bound runtime");
+                    match nat.transition {
+                        Nat44IcmpTransition::Outbound(plan) => runtime
+                            .commit_outbound(plan, nat_now_ms)
+                            .expect("sequential packet path keeps ICMP query NAT plan current"),
+                        Nat44IcmpTransition::Inbound(plan) => runtime
+                            .commit_inbound(plan, nat_now_ms)
+                            .expect("sequential packet path keeps ICMP query NAT plan current"),
+                    }
+                    trace.record(TraceEvent::Nat44Icmp {
+                        ingress,
+                        disposition: nat.disposition,
+                    });
+                }
                 if let PacketDecision::Nat44Icmpv4(nat) = decision {
                     trace.record(TraceEvent::Nat44Icmpv4 {
                         ingress,
@@ -2438,6 +2709,8 @@ fn decide<T: TraceSink>(
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
     nat44_tcp_config: Option<&Nat44TcpConfig>,
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
+    nat44_icmp_config: Option<&Nat44IcmpConfig>,
+    nat44_icmp: &mut Option<&mut Nat44IcmpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
     firewall: &mut Option<&mut FirewallRuntime<'_>>,
     firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
@@ -2457,6 +2730,8 @@ fn decide<T: TraceSink>(
             nat44_udp,
             nat44_tcp_config,
             nat44_tcp,
+            nat44_icmp_config,
+            nat44_icmp,
             firewall_config,
             firewall,
             firewall_audit,
@@ -2597,6 +2872,8 @@ fn decide_ipv4<T: TraceSink>(
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
     nat44_tcp_config: Option<&Nat44TcpConfig>,
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
+    nat44_icmp_config: Option<&Nat44IcmpConfig>,
+    nat44_icmp: &mut Option<&mut Nat44IcmpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
     firewall: &mut Option<&mut FirewallRuntime<'_>>,
     firewall_audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
@@ -2621,7 +2898,14 @@ fn decide_ipv4<T: TraceSink>(
     let nat_now = resolution
         .as_ref()
         .map_or(MonotonicMillis(0), |(_, now)| *now);
-    let combined_realm_mismatch = matches!((nat44_udp_config, nat44_tcp_config), (Some(udp), Some(tcp)) if !tcp.realm_matches_udp(*udp));
+    let combined_realm_mismatch = matches!((nat44_udp_config, nat44_tcp_config), (Some(udp), Some(tcp)) if !tcp.realm_matches_udp(*udp))
+        || nat44_icmp_config.is_some_and(|icmp| {
+            nat44_udp_config.is_some_and(|udp| {
+                !icmp.realm_matches(udp.inside(), udp.outside(), udp.public_address())
+            }) || nat44_tcp_config.is_some_and(|tcp| {
+                !icmp.realm_matches(tcp.inside(), tcp.outside(), tcp.public_address())
+            })
+        });
     // Inside-realm errors (RFC 5508 REQ-5, REQ-7) before the external
     // candidate, which would otherwise claim an inside error addressed to
     // the public address as a wrong-ingress external error.
@@ -2633,6 +2917,7 @@ fn decide_ipv4<T: TraceSink>(
         selected_route,
         nat44_udp_config,
         nat44_tcp_config,
+        nat44_icmp_config,
     ) {
         let related_firewall = firewall_config
             .map(|config| require_firewall_runtime(snapshot, config, firewall))
@@ -2648,6 +2933,8 @@ fn decide_ipv4<T: TraceSink>(
             nat44_udp,
             nat44_tcp_config,
             nat44_tcp,
+            nat44_icmp_config,
+            nat44_icmp,
             nat_now,
             combined_realm_mismatch,
             related_firewall,
@@ -2655,7 +2942,13 @@ fn decide_ipv4<T: TraceSink>(
             trace,
         );
     }
-    if is_nat44_icmpv4_candidate(frame, ipv4, nat44_udp_config, nat44_tcp_config) {
+    if is_nat44_icmpv4_candidate(
+        frame,
+        ipv4,
+        nat44_udp_config,
+        nat44_tcp_config,
+        nat44_icmp_config,
+    ) {
         let related_firewall = firewall_config
             .map(|config| require_firewall_runtime(snapshot, config, firewall))
             .transpose()?;
@@ -2670,6 +2963,8 @@ fn decide_ipv4<T: TraceSink>(
             nat44_udp,
             nat44_tcp_config,
             nat44_tcp,
+            nat44_icmp_config,
+            nat44_icmp,
             nat_now,
             combined_realm_mismatch,
             related_firewall,
@@ -2677,11 +2972,31 @@ fn decide_ipv4<T: TraceSink>(
             trace,
         );
     }
+    // ICMP queries addressed to the public address (N5). A request is for
+    // the router, which owns that address, from either realm; only a reply
+    // arriving from the outside can name a query mapping.
+    let icmp_reply_to_public = nat44_icmp_config.is_some_and(|config| {
+        ipv4.destination == config.public_address()
+            && peek_icmp_type(frame, ipv4).is_some_and(is_query_reply)
+    });
+    if let Some(config) = nat44_icmp_config {
+        if ipv4.destination == config.public_address() {
+            if ingress == config.inside()
+                && peek_icmp_type(frame, ipv4).is_some_and(is_query_request)
+            {
+                return decide_local_ipv4(frame, snapshot, ingress, ipv4, trace);
+            }
+            if icmp_reply_to_public && ingress != config.outside() {
+                return nat44_icmp_drop(ingress, Nat44IcmpWrongIngress, trace);
+            }
+        }
+    }
     let nat_inbound_candidate = nat44_udp_config
         .is_some_and(|config| ipv4.destination == config.public_address() && ipv4.protocol == 17)
         || nat44_tcp_config.is_some_and(|config| {
             ipv4.destination == config.public_address() && ipv4.protocol == 6
-        });
+        })
+        || icmp_reply_to_public;
     let mut firewall_validated = None;
     if let Some(config) = firewall_config {
         if !local || nat_inbound_candidate {
@@ -2699,6 +3014,7 @@ fn decide_ipv4<T: TraceSink>(
                     FirewallPlanError::RuleDenied(_)
                     | FirewallPlanError::DefaultDenied
                     | FirewallPlanError::InvalidInitialTcp(_)
+                    | FirewallPlanError::InvalidInitialIcmp(_)
                     | FirewallPlanError::StateFull(_) => {
                         unreachable!("clock observation only reports regression")
                     }
@@ -2713,6 +3029,8 @@ fn decide_ipv4<T: TraceSink>(
                 nat44_udp,
                 nat44_tcp_config,
                 nat44_tcp,
+                nat44_icmp_config,
+                nat44_icmp,
                 nat_now,
                 trace,
             )?;
@@ -2720,7 +3038,7 @@ fn decide_ipv4<T: TraceSink>(
         }
     }
     if combined_realm_mismatch
-        && matches!(ipv4.protocol, 6 | 17)
+        && (matches!(ipv4.protocol, 6 | 17) || icmp_reply_to_public)
         && (nat44_udp_config.is_some_and(|config| ipv4.destination == config.public_address())
             || nat44_tcp_config.is_some_and(|config| ipv4.destination == config.public_address()))
     {
@@ -2845,6 +3163,25 @@ fn decide_ipv4<T: TraceSink>(
             );
         }
     }
+    if let Some(config) = nat44_icmp_config {
+        if icmp_reply_to_public {
+            return decide_nat44_icmp_inbound(
+                frame,
+                snapshot,
+                ingress,
+                ipv4,
+                resolution,
+                config,
+                nat44_icmp,
+                firewall_config,
+                firewall,
+                firewall_audit,
+                firewall_validated,
+                firewall_plan,
+                trace,
+            );
+        }
+    }
     if local {
         return decide_local_ipv4(frame, snapshot, ingress, ipv4, trace);
     }
@@ -2867,6 +3204,8 @@ fn decide_ipv4<T: TraceSink>(
                 nat44_udp,
                 nat44_tcp_config,
                 nat44_tcp,
+                nat44_icmp_config,
+                nat44_icmp,
             ) {
                 return Err(FirewallRouteUnavailable);
             }
@@ -2904,7 +3243,8 @@ fn decide_ipv4<T: TraceSink>(
         }
         return Err(RouteMiss);
     };
-    if combined_realm_mismatch && matches!(ipv4.protocol, 6 | 17) {
+    let icmp_nat = nat44_icmp_config.is_some() && ipv4.protocol == 1;
+    if combined_realm_mismatch && (matches!(ipv4.protocol, 6 | 17) || icmp_nat) {
         let crosses_mismatched_realm = nat44_udp_config.is_some_and(|config| {
             (ingress == config.inside() && route.egress() == config.outside())
                 || (ingress == config.outside() && route.egress() == config.inside())
@@ -2927,7 +3267,7 @@ fn decide_ipv4<T: TraceSink>(
         .is_some_and(|config| ingress == config.inside() && route.egress() == config.outside())
         || nat44_tcp_config
             .is_some_and(|config| ingress == config.inside() && route.egress() == config.outside());
-    if crosses_internal_to_external && !matches!(ipv4.protocol, 6 | 17) {
+    if crosses_internal_to_external && !matches!(ipv4.protocol, 6 | 17) && !icmp_nat {
         return Err(if nat44_udp_config.is_some() {
             Nat44UdpUnsupportedTransport
         } else {
@@ -2949,6 +3289,15 @@ fn decide_ipv4<T: TraceSink>(
                 && ipv4.protocol == 6
             {
                 let _ = require_nat44_tcp_runtime(snapshot, tcp_config, nat44_tcp, ingress, trace)?;
+            }
+        }
+        if let Some(icmp_config) = nat44_icmp_config {
+            if ingress == icmp_config.inside()
+                && route.egress() == icmp_config.outside()
+                && ipv4.protocol == 1
+            {
+                let _ =
+                    require_nat44_icmp_runtime(snapshot, icmp_config, nat44_icmp, ingress, trace)?;
             }
         }
         let runtime = require_firewall_runtime(snapshot, config, firewall)?;
@@ -3069,6 +3418,22 @@ fn decide_ipv4<T: TraceSink>(
         new_ttl_protocol: u16::from_be_bytes([ipv4.ttl - 1, ipv4.protocol]),
         old_checksum: ipv4.checksum,
     };
+    if let Some(config) = nat44_icmp_config {
+        if ingress == config.inside() && route.egress() == config.outside() && ipv4.protocol == 1 {
+            return decide_nat44_icmp_outbound(
+                frame,
+                snapshot,
+                ingress,
+                ipv4,
+                forwarding,
+                config,
+                nat44_icmp,
+                firewall_config.is_some(),
+                nat_now,
+                trace,
+            );
+        }
+    }
     if let Some(config) = nat44_udp_config {
         if ingress == config.inside()
             && route.egress() == config.outside()
@@ -3195,6 +3560,7 @@ fn is_nat44_icmpv4_candidate(
     ipv4: packet::ValidatedIpv4,
     nat44_udp_config: Option<&Nat44UdpConfig>,
     nat44_tcp_config: Option<&Nat44TcpConfig>,
+    nat44_icmp_config: Option<&Nat44IcmpConfig>,
 ) -> bool {
     let Some((icmp_type, code, quoted_protocol)) = peek_nat44_icmpv4_error(frame, ipv4) else {
         return false;
@@ -3211,10 +3577,15 @@ fn is_nat44_icmpv4_candidate(
         config.policy().icmpv4_errors().translates_external()
             && ipv4.destination == config.public_address()
     });
+    let icmp_enabled = nat44_icmp_config.is_some_and(|config| {
+        config.policy().icmpv4_errors().translates_external()
+            && ipv4.destination == config.public_address()
+    });
     match quoted_protocol {
         Some(17) => udp_enabled,
         Some(6) => tcp_enabled,
-        Some(_) | None => udp_enabled || tcp_enabled,
+        Some(1) if nat44_icmp_config.is_some() => icmp_enabled,
+        Some(_) | None => udp_enabled || tcp_enabled || icmp_enabled,
     }
 }
 
@@ -3235,6 +3606,30 @@ struct ParsedNat44Icmpv4Quote {
     transport_checksum: Option<u16>,
     icmp_checksum_offset: usize,
     icmp_checksum: u16,
+    /// ICMP type of a quoted ICMP query (N5); `None` for UDP and TCP. A
+    /// quoted query's identifier is both `source_port` and
+    /// `destination_port`, at `inner_port_offset`, and its ICMP checksum is
+    /// the transport checksum (no pseudo-header).
+    query_type: Option<u8>,
+}
+
+impl ParsedNat44Icmpv4Quote {
+    /// Firewall pseudo-ports of the quoted packet with the identifier (or
+    /// ports) replaced by `source_port` and `destination_port`.
+    fn firewall_ports(self, source_port: u16, destination_port: u16) -> (u16, u16) {
+        match self.query_type {
+            Some(query_type) => {
+                let identifier = if nat44_icmp_query::is_query_request(query_type) {
+                    source_port
+                } else {
+                    destination_port
+                };
+                nat44_icmp_query::firewall_ports(query_type, identifier)
+                    .expect("only quoted queries are translated")
+            }
+            None => (source_port, destination_port),
+        }
+    }
 }
 
 /// Whether a quoted remote names one of the router's own IPv4 addresses,
@@ -3305,6 +3700,14 @@ fn inspect_nat44_icmpv4_related<T: TraceSink>(
         packet.source_port,
         packet.destination_port,
     );
+    // A quoted ICMP query reply is RELATED only as the reverse of a flow.
+    let flow = if packet.protocol == FirewallProtocol::Icmp
+        && packet.tcp_flags & crate::firewall::FIREWALL_ICMP_REPLY != 0
+    {
+        flow.with_icmp_query_reply()
+    } else {
+        flow
+    };
     let result = if either_direction {
         runtime.inspect_related_icmpv4_either_direction(flow, now.0)
     } else {
@@ -3421,6 +3824,8 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
     nat44_tcp_config: Option<&Nat44TcpConfig>,
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
+    nat44_icmp_config: Option<&Nat44IcmpConfig>,
+    nat44_icmp: &mut Option<&mut Nat44IcmpRuntime<'_>>,
     now: MonotonicMillis,
     combined_realm_mismatch: bool,
     related_firewall: Option<&mut FirewallRuntime<'_>>,
@@ -3547,6 +3952,65 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
                 lookup.internal_port(),
             )
         }
+        // A quoted ICMP query (N5): the request the NAT sent from the public
+        // address with a public identifier (RFC 5508 REQ-4 with the query
+        // identifier as the "port", §3.1).
+        1 => {
+            let Some(config) = nat44_icmp_config else {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedProtocolUnsupported, trace);
+            };
+            if !quote
+                .query_type
+                .is_some_and(nat44_icmp_query::is_query_request)
+            {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedProtocolUnsupported, trace);
+            }
+            if !config.policy().icmpv4_errors().translates_external()
+                || outer.destination != config.public_address()
+                || quote.source_address != config.public_address()
+            {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedPublicSourceMismatch, trace);
+            }
+            if quoted_remote_is_local(snapshot, quote.destination_address) {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedRemoteLocal, trace);
+            }
+            if combined_realm_mismatch {
+                return nat44_icmpv4_drop(ingress, Nat44CombinedRealmMismatch, trace);
+            }
+            if ingress != config.outside() {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongIngress, trace);
+            }
+            if snapshot
+                .route_lookup(outer.source)
+                .is_none_or(|reverse| reverse.egress() != config.outside())
+            {
+                return nat44_icmpv4_drop(ingress, Nat44Icmpv4SourceForbidden, trace);
+            }
+            if !config.authority_matches(snapshot) {
+                return nat44_icmpv4_drop(ingress, Nat44IcmpConfigMismatch, trace);
+            }
+            let Some(runtime) = nat44_icmp.as_deref() else {
+                return nat44_icmpv4_drop(ingress, Nat44IcmpRuntimeUnavailable, trace);
+            };
+            if runtime.config() != *config {
+                return nat44_icmpv4_drop(ingress, Nat44IcmpConfigMismatch, trace);
+            }
+            let lookup = runtime
+                .inspect_error_quote(quote.source_port, quote.destination_address, now.0)
+                .map_err(|error| {
+                    trace_nat44_icmpv4_drop(
+                        ingress,
+                        nat44_icmp_query::nat44_icmp_error_lookup_reason(error),
+                        trace,
+                    )
+                })?;
+            (
+                config.inside(),
+                config.outside(),
+                lookup.internal_address(),
+                lookup.internal_port(),
+            )
+        }
         _ => {
             return nat44_icmpv4_drop(ingress, Nat44Icmpv4QuotedProtocolUnsupported, trace);
         }
@@ -3554,15 +4018,17 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
 
     if let Some(runtime) = related_firewall.as_deref() {
         let protocol = FirewallProtocol::from_ipv4(quote.protocol)
-            .expect("the NAT ICMPv4 parser accepts only UDP and TCP quotes");
+            .expect("the NAT ICMPv4 parser accepts only ICMP, UDP, and TCP quotes");
+        let (source_port, destination_port) =
+            quote.firewall_ports(internal_port, quote.destination_port);
         let packet = FirewallPacket {
             ingress: inside,
             egress: outside,
             source: internal_address,
             destination: quote.destination_address,
             protocol,
-            source_port: internal_port,
-            destination_port: quote.destination_port,
+            source_port,
+            destination_port,
             tcp_flags: 0,
         };
         inspect_nat44_icmpv4_related(runtime, firewall_audit, packet, false, ingress, now, trace)?;
@@ -3673,13 +4139,21 @@ fn parse_nat44_icmpv4_error(
         return Err(Nat44Icmpv4QuotedChecksumInvalid);
     }
     let inner_flags = packet::read_u16(inner_header, 6).ok_or(Nat44Icmpv4QuotedHeaderTruncated)?;
-    if inner_flags & 0x7fff != 0x4000 {
-        return Err(Nat44Icmpv4QuotedFragmentUnsupported);
-    }
     let protocol = *inner_header
         .get(9)
         .ok_or(Nat44Icmpv4QuotedHeaderTruncated)?;
-    if !matches!(protocol, 6 | 17) {
+    // UDP and TCP quotes must be atomic (NAT44-008). A quoted ICMP query
+    // only has to be unfragmented: queries are translated with DF either
+    // way (NAT44-116).
+    let quote_admitted = if protocol == 1 {
+        inner_flags & 0x3fff == 0
+    } else {
+        inner_flags & 0x7fff == 0x4000
+    };
+    if !quote_admitted {
+        return Err(Nat44Icmpv4QuotedFragmentUnsupported);
+    }
+    if !matches!(protocol, 1 | 6 | 17) {
         return Err(Nat44Icmpv4QuotedProtocolUnsupported);
     }
     let source_address = crate::Ipv4Address::from_octets(
@@ -3697,6 +4171,38 @@ fn parse_nat44_icmpv4_error(
     let transport_available = quoted_datagram_end - transport_offset;
     if transport_available < 8 {
         return Err(Nat44Icmpv4QuoteTruncated);
+    }
+    if protocol == 1 {
+        // A quoted ICMP query: type, code, checksum, identifier, sequence.
+        // RFC 792 guarantees these 8 bytes; the checksum is updated
+        // incrementally, so a truncated quote is still corrected exactly.
+        let query_type = *frame
+            .get(transport_offset)
+            .ok_or(Nat44Icmpv4QuoteTruncated)?;
+        let identifier =
+            packet::read_u16(frame, transport_offset + 4).ok_or(Nat44Icmpv4QuoteTruncated)?;
+        return Ok(ParsedNat44Icmpv4Quote {
+            icmp_type: icmp[0],
+            icmp_code: icmp[1],
+            protocol,
+            source_address,
+            source_port: identifier,
+            destination_address,
+            destination_port: identifier,
+            inner_checksum_offset: quote_offset + 10,
+            inner_checksum: packet::read_u16(frame, quote_offset + 10)
+                .ok_or(Nat44Icmpv4QuotedHeaderTruncated)?,
+            inner_source_offset: quote_offset + 12,
+            inner_port_offset: transport_offset + 4,
+            transport_checksum_offset: Some(transport_offset + 2),
+            transport_checksum: Some(
+                packet::read_u16(frame, transport_offset + 2).ok_or(Nat44Icmpv4QuoteTruncated)?,
+            ),
+            icmp_checksum_offset: icmp_offset + 2,
+            icmp_checksum: packet::read_u16(frame, icmp_offset + 2)
+                .ok_or(Nat44Icmpv4HeaderTruncated)?,
+            query_type: Some(query_type),
+        });
     }
     let source_port = packet::read_u16(frame, transport_offset).ok_or(Nat44Icmpv4QuoteTruncated)?;
     let destination_port =
@@ -3737,6 +4243,7 @@ fn parse_nat44_icmpv4_error(
         icmp_checksum_offset: icmp_offset + 2,
         icmp_checksum: packet::read_u16(frame, icmp_offset + 2)
             .ok_or(Nat44Icmpv4HeaderTruncated)?,
+        query_type: None,
     })
 }
 
@@ -3793,6 +4300,16 @@ fn build_nat44_icmpv4_rewrite(
         .unwrap_or((quote.destination_address, quote.destination_port));
     let source_changed = rewrite.quoted_source.is_some();
     let destination_changed = rewrite.quoted_destination.is_some();
+    // A quoted ICMP query has one identifier field, rewritten from the
+    // changed side's "port".
+    let icmp_query = quote.query_type.is_some();
+    let new_identifier = if source_changed {
+        quoted_source_port
+    } else if destination_changed {
+        quoted_destination_port
+    } else {
+        quote.source_port
+    };
 
     let mut inner_checksum = quote.inner_checksum;
     if source_changed {
@@ -3807,6 +4324,10 @@ fn build_nat44_icmpv4_rewrite(
         );
     }
     let transport_checksum = quote.transport_checksum.map(|checksum| {
+        if icmp_query {
+            // ICMP has no pseudo-header: only the identifier is covered.
+            return rfc1624_update(checksum, quote.source_port, new_identifier);
+        }
         if quote.protocol == 17 && checksum == 0 {
             return 0;
         }
@@ -3830,16 +4351,23 @@ fn build_nat44_icmpv4_rewrite(
         rfc1624_update(quote.icmp_checksum, quote.inner_checksum, inner_checksum);
     if source_changed {
         icmp_checksum = rfc1624_update_address(icmp_checksum, quote.source_address, quoted_source);
-        icmp_checksum = rfc1624_update(icmp_checksum, quote.source_port, quoted_source_port);
+        if !icmp_query {
+            icmp_checksum = rfc1624_update(icmp_checksum, quote.source_port, quoted_source_port);
+        }
     }
     if destination_changed {
         icmp_checksum =
             rfc1624_update_address(icmp_checksum, quote.destination_address, quoted_destination);
-        icmp_checksum = rfc1624_update(
-            icmp_checksum,
-            quote.destination_port,
-            quoted_destination_port,
-        );
+        if !icmp_query {
+            icmp_checksum = rfc1624_update(
+                icmp_checksum,
+                quote.destination_port,
+                quoted_destination_port,
+            );
+        }
+    }
+    if icmp_query {
+        icmp_checksum = rfc1624_update(icmp_checksum, quote.source_port, new_identifier);
     }
     if let (Some(old), Some(new)) = (quote.transport_checksum, transport_checksum) {
         icmp_checksum = rfc1624_update(icmp_checksum, old, new);
@@ -3873,8 +4401,13 @@ fn build_nat44_icmpv4_rewrite(
         outer_destination: outer_destination.octets(),
         inner_source: quoted_source.octets(),
         inner_destination: quoted_destination.octets(),
-        inner_source_port: quoted_source_port,
+        inner_source_port: if icmp_query {
+            new_identifier
+        } else {
+            quoted_source_port
+        },
         inner_destination_port: quoted_destination_port,
+        inner_identifier_only: icmp_query,
         outer_checksum,
         inner_checksum,
         transport_checksum,
@@ -3905,10 +4438,21 @@ fn observe_combined_nat_security_time<T: TraceSink>(
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
     nat44_tcp_config: Option<&Nat44TcpConfig>,
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
+    nat44_icmp_config: Option<&Nat44IcmpConfig>,
+    nat44_icmp: &mut Option<&mut Nat44IcmpRuntime<'_>>,
     now: MonotonicMillis,
     trace: &mut T,
 ) -> Result<(), DropReason> {
     match validated.protocol {
+        FirewallProtocol::Icmp => {
+            let Some(config) = nat44_icmp_config else {
+                return Ok(());
+            };
+            if ingress != config.inside() && ipv4.destination != config.public_address() {
+                return Ok(());
+            }
+            observe_nat44_icmp_security_time(snapshot, config, nat44_icmp, ingress, now, trace)?;
+        }
         FirewallProtocol::Udp => {
             let Some(config) = nat44_udp_config else {
                 return Ok(());
@@ -3991,6 +4535,13 @@ fn plan_firewall(
                     matched_action: Some(FirewallAction::AllowStateful),
                     failure: Some(FirewallFailure::InvalidInitialTcp),
                 },
+                FirewallPlanError::InvalidInitialIcmp(rule_id) => FirewallDisposition {
+                    verdict: FirewallVerdict::Drop,
+                    class: FirewallConnectionClass::New,
+                    source: FirewallPolicySource::Rule(rule_id),
+                    matched_action: Some(FirewallAction::AllowStateful),
+                    failure: Some(FirewallFailure::InvalidInitialIcmp),
+                },
                 FirewallPlanError::StateFull(rule_id) => FirewallDisposition {
                     verdict: FirewallVerdict::Drop,
                     class: FirewallConnectionClass::New,
@@ -4004,6 +4555,7 @@ fn plan_firewall(
                         FirewallPlanError::RuleDenied(_)
                         | FirewallPlanError::DefaultDenied
                         | FirewallPlanError::InvalidInitialTcp(_)
+                        | FirewallPlanError::InvalidInitialIcmp(_)
                         | FirewallPlanError::StateFull(_) => {
                             unreachable!("policy errors were handled above")
                         }
@@ -4017,6 +4569,7 @@ fn plan_firewall(
                 FirewallPlanError::RuleDenied(_) => FirewallRuleDenied,
                 FirewallPlanError::DefaultDenied => FirewallDefaultDenied,
                 FirewallPlanError::InvalidInitialTcp(_) => FirewallTcpInvalidInitialFlags,
+                FirewallPlanError::InvalidInitialIcmp(_) => FirewallIcmpReplyWithoutRequest,
                 FirewallPlanError::StateFull(_) => FirewallStateTableFull,
                 FirewallPlanError::ClockRegression => FirewallClockRegression,
             })
@@ -4044,6 +4597,8 @@ fn route_miss_may_hit_nat_reject(
     nat44_udp: &Option<&mut Nat44UdpRuntime<'_>>,
     nat44_tcp_config: Option<&Nat44TcpConfig>,
     nat44_tcp: &Option<&mut Nat44TcpRuntime<'_>>,
+    nat44_icmp_config: Option<&Nat44IcmpConfig>,
+    nat44_icmp: &Option<&mut Nat44IcmpRuntime<'_>>,
 ) -> bool {
     let udp_outside = nat44_udp_config.is_some_and(|config| ingress == config.outside());
     let tcp_outside = nat44_tcp_config.is_some_and(|config| ingress == config.outside());
@@ -4052,8 +4607,22 @@ fn route_miss_may_hit_nat_reject(
     }
     let udp_inside = nat44_udp_config.is_some_and(|config| ingress == config.inside());
     let tcp_inside = nat44_tcp_config.is_some_and(|config| ingress == config.inside());
-    if combined_realm_mismatch && matches!(protocol, 6 | 17) && (udp_inside || tcp_inside) {
+    let icmp_nat = nat44_icmp_config.is_some() && protocol == 1;
+    if combined_realm_mismatch
+        && (matches!(protocol, 6 | 17) || icmp_nat)
+        && (udp_inside || tcp_inside)
+    {
         return true;
+    }
+    if let Some(config) = nat44_icmp_config.filter(|config| icmp_nat && ingress == config.inside())
+    {
+        let usable = config.authority_matches(snapshot)
+            && nat44_icmp
+                .as_deref()
+                .is_some_and(|runtime| runtime.config() == *config);
+        if !usable {
+            return true;
+        }
     }
     if let Some(config) = nat44_udp_config.filter(|_| udp_inside && protocol == 17) {
         let usable = config.authority_matches(snapshot)
@@ -4119,6 +4688,16 @@ fn validate_firewall_transport(
     }
     let protocol = FirewallProtocol::from_ipv4(ipv4.protocol).ok_or(FirewallUnsupportedProtocol)?;
     let packet = match protocol {
+        FirewallProtocol::Icmp => {
+            let (source_port, destination_port, tcp_flags) =
+                validate_firewall_icmp_query(frame, ipv4)?;
+            ValidatedFirewallTransport {
+                protocol,
+                source_port,
+                destination_port,
+                tcp_flags,
+            }
+        }
         FirewallProtocol::Tcp => {
             let tcp = validate_nat44_tcp(frame, ipv4).map_err(|reason| match reason {
                 Nat44TcpHeaderTruncated => FirewallTcpHeaderTruncated,
@@ -5831,6 +6410,7 @@ fn apply_decision(frame: &mut [u8], decision: PacketDecision) -> Result<(), Drop
         PacketDecision::Nat44Udp(nat) => apply_nat44_udp_rewrite(frame, nat),
         PacketDecision::Nat44Tcp(nat) => apply_nat44_tcp_rewrite(frame, nat),
         PacketDecision::Nat44Icmpv4(nat) => apply_nat44_icmpv4_rewrite(frame, nat),
+        PacketDecision::Nat44Icmp(nat) => apply_nat44_icmp_rewrite(frame, nat),
         PacketDecision::ArpReply(arp) => apply_arp_reply(frame, arp),
         PacketDecision::Icmpv4EchoReply(icmp) => apply_icmpv4_echo_reply(frame, icmp),
         PacketDecision::ConsumeArp(_) | PacketDecision::ConsumeIpv4Local => {
@@ -5877,7 +6457,9 @@ fn apply_nat44_icmpv4_rewrite(
     frame[inner + 4..inner + 8].copy_from_slice(&decision.inner_destination);
     let ports = decision.inner_port_offset;
     frame[ports..ports + 2].copy_from_slice(&decision.inner_source_port.to_be_bytes());
-    frame[ports + 2..ports + 4].copy_from_slice(&decision.inner_destination_port.to_be_bytes());
+    if !decision.inner_identifier_only {
+        frame[ports + 2..ports + 4].copy_from_slice(&decision.inner_destination_port.to_be_bytes());
+    }
     if let (Some(offset), Some(checksum)) = (
         decision.transport_checksum_offset,
         decision.transport_checksum,
@@ -6545,6 +7127,8 @@ mod tests {
                 &mut Some(&mut tcp),
                 None,
                 &mut None,
+                None,
+                &mut None,
                 &mut None,
                 &mut None,
                 &mut NoTrace,
@@ -6846,6 +7430,8 @@ mod tests {
             None,
             &mut tcp,
             None,
+            &mut None,
+            None,
             &mut firewall,
             &mut firewall_audit,
             &mut firewall_plan,
@@ -7026,6 +7612,26 @@ mod tests {
             (156, "NAT44_TCP_HOST_QUOTA_EXCEEDED"),
             (157, "NAT44_ICMPV4_TRANSLATED_RATE_LIMITED"),
             (158, "NAT44_ICMPV4_FRAG_NEEDED_MTU_INVALID"),
+            (159, "NAT44_ICMP_RUNTIME_UNAVAILABLE"),
+            (160, "NAT44_ICMP_CONFIG_MISMATCH"),
+            (161, "NAT44_ICMP_TYPE_UNSUPPORTED"),
+            (162, "NAT44_ICMP_FRAGMENT_UNSUPPORTED"),
+            (163, "NAT44_ICMP_HEADER_TRUNCATED"),
+            (164, "NAT44_ICMP_CODE_INVALID"),
+            (165, "NAT44_ICMP_CHECKSUM_INVALID"),
+            (166, "NAT44_ICMP_SOURCE_FORBIDDEN"),
+            (167, "NAT44_ICMP_REVERSE_AUTHORITY_MISMATCH"),
+            (168, "NAT44_ICMP_MAPPING_MISS"),
+            (169, "NAT44_ICMP_FILTER_DENIED"),
+            (170, "NAT44_ICMP_MAPPING_TABLE_FULL"),
+            (171, "NAT44_ICMP_PEER_TABLE_FULL"),
+            (172, "NAT44_ICMP_IDENTIFIER_EXHAUSTED"),
+            (173, "NAT44_ICMP_HOST_QUOTA_EXCEEDED"),
+            (174, "NAT44_ICMP_CLOCK_REGRESSION"),
+            (175, "NAT44_ICMP_WRONG_INGRESS"),
+            (176, "NAT44_ICMP_WRONG_EGRESS"),
+            (177, "FIREWALL_ICMP_QUERY_INVALID"),
+            (178, "FIREWALL_ICMP_REPLY_WITHOUT_REQUEST"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -7035,7 +7641,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(159), None);
+        assert_eq!(DropReason::from_code(179), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

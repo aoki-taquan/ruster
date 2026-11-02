@@ -4,15 +4,16 @@
 use ruster_core::{
     dispatch_host_unreachable_failures, dispatch_nat44_tcp_unsolicited_syns,
     execute_one_arp_request, execute_one_icmpv4_error,
-    forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors, poll_resolution_timers,
-    ArpRequestBuildError, BatchReport, ExecuteArpRequestError, ExecuteIcmpv4Error, FirewallConfig,
-    FirewallRuntime, ForwardingSnapshot, GeneratedAllocationError, GeneratedIcmpv4TraceSink,
-    GeneratedPacketIo, GeneratedTraceSink, Icmpv4ErrorBuildError, Icmpv4ErrorRuntime,
-    MonotonicMillis, Nat44TcpConfig, Nat44TcpRuntime, Nat44TcpUnsolicitedSynDispatchError,
-    Nat44UdpConfig, Nat44UdpRuntime, PacketIo, PublicationQuiescence,
-    PublicationQuiescenceDisposition, ResolutionFailureDispatchError,
-    ResolutionFailureDispatchReport, ResolutionFailureTraceSink, ResolutionRuntime,
-    ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTraceSink, TraceSink,
+    forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors,
+    poll_resolution_timers, ArpRequestBuildError, BatchReport, ExecuteArpRequestError,
+    ExecuteIcmpv4Error, FirewallConfig, FirewallRuntime, ForwardingSnapshot,
+    GeneratedAllocationError, GeneratedIcmpv4TraceSink, GeneratedPacketIo, GeneratedTraceSink,
+    Icmpv4ErrorBuildError, Icmpv4ErrorRuntime, MonotonicMillis, Nat44IcmpConfig, Nat44IcmpRuntime,
+    Nat44TcpConfig, Nat44TcpRuntime, Nat44TcpUnsolicitedSynDispatchError, Nat44UdpConfig,
+    Nat44UdpRuntime, PacketIo, PublicationQuiescence, PublicationQuiescenceDisposition,
+    ResolutionFailureDispatchError, ResolutionFailureDispatchReport, ResolutionFailureTraceSink,
+    ResolutionRuntime, ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTraceSink,
+    TraceSink,
 };
 use std::{marker::PhantomData, num::NonZeroU64};
 
@@ -69,6 +70,34 @@ impl<'view, 'storage> Nat44TcpServiceView<'view, 'storage> {
         runtime: Option<&'view mut Nat44TcpRuntime<'storage>>,
     ) -> Self {
         Self { config, runtime }
+    }
+}
+
+/// Tick-local ICMP query NAT authority (N5) and its optional worker-local
+/// runtime.
+///
+/// ICMP query NAT is optional in a publication: a view without a config
+/// (the [`Default`]) keeps the UDP/TCP behavior, where ICMP queries crossing
+/// the NAT fail closed. A config without a runtime fails ICMP queries
+/// closed.
+#[derive(Default)]
+pub struct Nat44IcmpServiceView<'view, 'storage> {
+    pub config: Option<Nat44IcmpConfig>,
+    runtime: Option<&'view mut Nat44IcmpRuntime<'storage>>,
+}
+
+impl<'view, 'storage> Nat44IcmpServiceView<'view, 'storage> {
+    /// Pairs a config with its optional runtime. The runtime borrow is
+    /// private: only [`run_tick`] can use it.
+    #[must_use]
+    pub fn new(
+        config: Nat44IcmpConfig,
+        runtime: Option<&'view mut Nat44IcmpRuntime<'storage>>,
+    ) -> Self {
+        Self {
+            config: Some(config),
+            runtime,
+        }
     }
 }
 
@@ -206,6 +235,8 @@ pub struct FullServiceView<'view, 'storage> {
     icmpv4_errors: &'view mut Icmpv4ErrorRuntime<'storage>,
     pub nat44_udp: Nat44UdpServiceView<'view, 'storage>,
     pub nat44_tcp: Nat44TcpServiceView<'view, 'storage>,
+    /// Optional ICMP query NAT (N5); see [`FullServiceView::with_nat44_icmp`].
+    pub nat44_icmp: Nat44IcmpServiceView<'view, 'storage>,
     pub firewall: FirewallServiceView<'view, 'storage>,
 }
 
@@ -250,8 +281,17 @@ impl<'view, 'storage> FullServiceView<'view, 'storage> {
             icmpv4_errors,
             nat44_udp,
             nat44_tcp,
+            nat44_icmp: Nat44IcmpServiceView::default(),
             firewall,
         }
+    }
+
+    /// Adds ICMP query NAT (N5) to the view. Without it, the tick runs the
+    /// UDP/TCP composition unchanged.
+    #[must_use]
+    pub fn with_nat44_icmp(mut self, nat44_icmp: Nat44IcmpServiceView<'view, 'storage>) -> Self {
+        self.nat44_icmp = nat44_icmp;
+        self
     }
 }
 
@@ -993,8 +1033,13 @@ where
         icmpv4_errors,
         nat44_udp,
         nat44_tcp,
+        nat44_icmp,
         firewall,
     } = view;
+    let Nat44IcmpServiceView {
+        config: icmp_config,
+        runtime: nat44_icmp,
+    } = nat44_icmp;
     let Nat44UdpServiceView {
         config: udp_config,
         runtime: nat44_udp,
@@ -1011,20 +1056,23 @@ where
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::Rx));
     let rx = match io.receive(budgets.rx) {
         Ok(batch) => {
-            let report = forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors(
-                batch,
-                &snapshot,
-                resolution,
-                icmpv4_errors,
-                &udp_config,
-                nat44_udp,
-                &tcp_config,
-                nat44_tcp.as_deref_mut(),
-                &firewall_config,
-                firewall.as_deref_mut(),
-                now,
-                trace,
-            );
+            let report =
+                forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors(
+                    batch,
+                    &snapshot,
+                    resolution,
+                    icmpv4_errors,
+                    &udp_config,
+                    nat44_udp,
+                    &tcp_config,
+                    nat44_tcp.as_deref_mut(),
+                    icmp_config.as_ref().map(|config| (config, nat44_icmp)),
+                    &firewall_config,
+                    firewall.as_deref_mut(),
+                    None,
+                    now,
+                    trace,
+                );
             if report.invariants_hold() {
                 RxPhaseReport::Completed(report)
             } else {
@@ -1235,6 +1283,7 @@ mod tests {
                     config: self.tcp_config,
                     runtime: None,
                 },
+                nat44_icmp: Nat44IcmpServiceView::default(),
                 firewall: FirewallServiceView {
                     config: self.firewall_config,
                     runtime: None,

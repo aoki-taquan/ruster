@@ -2471,11 +2471,14 @@ fn public_firewall_failure_remains_exhaustive_for_existing_callers() {
         match failure {
             FirewallFailure::InvalidInitialTcp => 1,
             FirewallFailure::StateTableFull => 2,
+            // N5: an ICMP reply cannot open a flow.
+            FirewallFailure::InvalidInitialIcmp => 3,
         }
     }
 
     assert_eq!(stable_code(FirewallFailure::InvalidInitialTcp), 1);
     assert_eq!(stable_code(FirewallFailure::StateTableFull), 2);
+    assert_eq!(stable_code(FirewallFailure::InvalidInitialIcmp), 3);
 }
 
 #[test]

@@ -246,6 +246,10 @@ pub struct Nat44V1 {
     pub realm: Nat44RealmV1,
     pub udp: Option<Nat44UdpV1>,
     pub tcp: Option<Nat44TcpV1>,
+    /// ICMP query NAT (N5, RFC 5508 §3). Absent means ICMP queries
+    /// crossing the NAT are dropped (`NAT44_UDP_UNSUPPORTED_TRANSPORT`), the
+    /// RFC 5508 REQ-1 "unless explicitly overridden by local policy" case.
+    pub icmp: Option<Nat44IcmpV1>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -364,6 +368,54 @@ pub struct Nat44UdpCapacityV1 {
     pub peers: u32,
 }
 
+/// Default `[nat44.icmp] idle-ttl-ms`: the RFC 5508 REQ-2 floor of 60 s.
+const fn default_icmp_idle_ttl_ms() -> u64 {
+    ruster_core::NAT44_ICMP_DEFAULT_IDLE_TTL_MS
+}
+
+/// `[nat44.icmp]`: ICMP query NAT (N5, RFC 5508 §3). Echo and Timestamp
+/// queries from the inside are translated with an endpoint-independent
+/// identifier mapping (REQ-1 a).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Nat44IcmpV1 {
+    /// Query mapping idle timeout; at least 60000 (RFC 5508 REQ-2), absent
+    /// means 60000. Only outbound queries refresh it.
+    #[serde(default = "default_icmp_idle_ttl_ms")]
+    pub idle_ttl_ms: u64,
+    /// Non-secret salt of the keyed identifier selection; absent means "0".
+    pub allocator_seed: Option<AllocatorSeedV1>,
+    /// Translation of ICMP errors quoting a query; absent means
+    /// `bidirectional`.
+    #[serde(default)]
+    pub icmpv4_errors: Nat44Icmpv4ErrorsV1,
+    /// Reply filtering: `address-dependent` (default) or
+    /// `endpoint-independent`. `address-and-port-dependent` is refused (a
+    /// query has no port).
+    #[serde(default)]
+    pub filtering: Nat44FilteringV1,
+    /// Keep the internal identifier when it is in the pool and free; absent
+    /// means `true`. `false` always selects a keyed identifier.
+    #[serde(default = "enabled")]
+    pub identifier_preservation: bool,
+    /// Per-internal-host query mapping limit (N3 applied to queries); `0`
+    /// (default) is no limit. Switching between 0 and a limit is
+    /// restart-required.
+    #[serde(default)]
+    pub mappings_per_host: u16,
+    /// Public identifier pool; absent means the `[nat44.realm.ports]`
+    /// numbers. One owner slot per identifier, so the pool sizes storage.
+    pub identifiers: Option<Nat44PortRangeV1>,
+    pub capacity: Nat44IcmpCapacityV1,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct Nat44IcmpCapacityV1 {
+    pub mappings: u32,
+    pub peers: u32,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Nat44TcpV1 {
@@ -470,8 +522,10 @@ pub struct FirewallRuleV1 {
     pub source: String,
     pub destination: String,
     pub protocol: FirewallProtocolV1,
-    pub source_ports: Nat44PortRangeV1,
-    pub destination_ports: Nat44PortRangeV1,
+    /// Required for `tcp`/`udp`; must be absent for `icmp`.
+    pub source_ports: Option<Nat44PortRangeV1>,
+    /// Required for `tcp`/`udp`; must be absent for `icmp`.
+    pub destination_ports: Option<Nat44PortRangeV1>,
     pub action: FirewallActionV1,
 }
 
@@ -480,6 +534,9 @@ pub struct FirewallRuleV1 {
 pub enum FirewallProtocolV1 {
     Tcp,
     Udp,
+    /// ICMP queries (Echo, Timestamp; N5). The rule has no port ranges and
+    /// matches every identifier.
+    Icmp,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]

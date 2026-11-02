@@ -1695,6 +1695,81 @@ EOF
 }
 phase_unsolicited_syn
 
+# icmp_query (N5, RFC 5508 §3): router-v1 has no [nat44.icmp], so a ping
+# from host A to host B is dropped there (ICMP queries crossing the NAT fail
+# closed). icmp-query adds [nat44.icmp] and an `icmp` firewall rule (a
+# storage-shape change, restart-required): host A's pings to host B then
+# succeed. Host B has no route to 192.168.1.0/24, so a reply reaches host A
+# only if the router translated the request's source to 203.0.113.2 and the
+# reply's destination back. Host A pinging 203.0.113.2 is answered by the
+# router itself. ping runs with its defaults: the request has DF set, and
+# host B's kernel sends the Echo Reply with DF clear, which the NAT
+# translates as long as it is unfragmented (NAT44-116).
+phase_icmp_query() {
+    cp "$work/router.toml" "$work/icmp-query.toml"
+    cat >>"$work/icmp-query.toml" <<'EOF'
+
+[nat44.icmp]
+idle-ttl-ms = 60000
+
+[nat44.icmp.capacity]
+mappings = 8
+peers = 16
+
+[[firewall.rules]]
+id = 95
+ingress = "lan"
+egress = "wan"
+source = "192.168.1.0/24"
+destination = "0.0.0.0/0"
+protocol = "icmp"
+action = "allow-stateful"
+EOF
+    "$binary_path" validate "$work/icmp-query.toml" >"$work/validate-icmp-query.txt" 2>&1 ||
+        fail "icmp_query: icmp-query.toml invalid: $(cat "$work/validate-icmp-query.txt")"
+    grep -q " services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,nat44-icmp,firewall " \
+        "$work/validate-icmp-query.txt" ||
+        fail "icmp_query: validate does not list nat44-icmp: $(cat "$work/validate-icmp-query.txt")"
+    expect_plan router icmp-query restart-required STORAGE_SHAPE
+    grep -qxF '  nat44-icmp ~ off -> on' "$work/plan-router-icmp-query.txt" ||
+        fail "icmp_query: plan does not show the service: $(cat "$work/plan-router-icmp-query.txt")"
+
+    cp "$work/router.toml" "$work/icmp.toml"
+    start_ruster icmpq "$work/icmp.toml" --user "$smoke_uid" --group "$smoke_gid"
+    wait_ready icmpq || fail "icmp_query: ruster exited during startup"
+    forward_once icmpq_resolve
+    if in_ns "$host_a" ping -n -q -c 2 -i 0.2 -W 1 203.0.113.1 >"$work/ping-off.txt" 2>&1; then
+        fail "icmp_query: a ping crossed the NAT without [nat44.icmp]: $(cat "$work/ping-off.txt")"
+    fi
+    wait_stat_ge icmpq drop.NAT44_UDP_UNSUPPORTED_TRANSPORT 2
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "icmp_query: exit status $status after SIGTERM (off)"
+    assert_detached "the icmp_query off run"
+    echo "priv_run_icmp_query_off: without [nat44.icmp] host A's pings to host B are dropped (NAT44_UDP_UNSUPPORTED_TRANSPORT) verified"
+
+    start_ruster icmpq "$work/icmp-query.toml" --user "$smoke_uid" --group "$smoke_gid"
+    wait_ready icmpq || fail "icmp_query: ruster exited during startup"
+    forward_once icmpq_resolve_on
+    in_ns "$host_a" ping -n -c 3 -i 0.2 -W 2 203.0.113.1 >"$work/ping-on.txt" 2>&1 ||
+        fail "icmp_query: ping host A -> host B failed: $(cat "$work/ping-on.txt")"
+    grep -q "3 received" "$work/ping-on.txt" ||
+        fail "icmp_query: not every reply came back: $(cat "$work/ping-on.txt")"
+    in_ns "$host_a" ping -n -c 2 -i 0.2 -W 2 203.0.113.2 >"$work/ping-public.txt" 2>&1 ||
+        fail "icmp_query: ping of the public address failed: $(cat "$work/ping-public.txt")"
+    wait_stat_ge icmpq nat44_icmp.inbound_translated 3
+    latest_block icmpq
+    block_has "$work/icmpq.block" nat44_icmp.outbound_translated=3 \
+        nat44_icmp.inbound_translated=3 nat44_icmp.mappings_created=1 \
+        occupancy.nat44_icmp_mappings.occupied=1
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "icmp_query: exit status $status after SIGTERM"
+    assert_detached "the icmp_query run"
+    echo "priv_run_icmp_query: with [nat44.icmp] host A -> host B ping (3/3 replies translated back, one mapping) and host A -> public address (answered by the router), exit 0 verified"
+}
+phase_icmp_query
+
 # txfull: the WAN TX ring driven full and recovered.
 start_ruster txfull "$work/txfull.toml" --tx-stall-warn-secs 1 --tx-stall-fatal-secs 2 \
     --kick-errors-fatal-secs 2

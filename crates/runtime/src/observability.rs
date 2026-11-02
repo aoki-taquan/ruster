@@ -28,12 +28,13 @@ use ruster_core::{
     ConsumeReason, DropReason, FieldValue, FieldVisitor, FirewallCounters, FirewallReconcileReport,
     FirewallRuntime, GeneratedAllocationError, GeneratedArpTrace, GeneratedIcmpv4Trace,
     GeneratedIcmpv4TraceSink, GeneratedTraceSink, Icmpv4ErrorCounters,
-    Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, MonotonicMillis, Nat44TcpCounters,
-    Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44UdpCounters, Nat44UdpReconcileReport,
-    Nat44UdpRuntime, ObservableFields, PublicationQuiescenceDisposition, ResolutionCounters,
-    ResolutionFailureDispatchError, ResolutionFailureTrace, ResolutionFailureTraceSink,
-    ResolutionPublicationReport, ResolutionRuntime, ResolutionTimerError, ResolutionTimerTrace,
-    ResolutionTimerTraceSink, TableOccupancy, TraceEvent, TraceSink,
+    Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, MonotonicMillis, Nat44IcmpCounters,
+    Nat44IcmpReconcileReport, Nat44IcmpRuntime, Nat44TcpCounters, Nat44TcpReconcileReport,
+    Nat44TcpRuntime, Nat44UdpCounters, Nat44UdpReconcileReport, Nat44UdpRuntime, ObservableFields,
+    PublicationQuiescenceDisposition, ResolutionCounters, ResolutionFailureDispatchError,
+    ResolutionFailureTrace, ResolutionFailureTraceSink, ResolutionPublicationReport,
+    ResolutionRuntime, ResolutionTimerError, ResolutionTimerTrace, ResolutionTimerTraceSink,
+    TableOccupancy, TraceEvent, TraceSink,
 };
 
 use crate::{
@@ -509,6 +510,9 @@ pub struct ApplyFlushCounts {
     pub nat44_udp_peers: u64,
     pub nat44_tcp_mappings: u64,
     pub nat44_tcp_sessions: u64,
+    /// ICMP query NAT (N5); zero when ICMP query NAT is not configured.
+    pub nat44_icmp_mappings: u64,
+    pub nat44_icmp_peers: u64,
     pub firewall_flows: u64,
 }
 
@@ -533,15 +537,28 @@ impl ApplyFlushCounts {
             nat44_udp_peers: s(nat44_udp.peers_flushed),
             nat44_tcp_mappings: s(nat44_tcp.mappings_flushed),
             nat44_tcp_sessions: s(nat44_tcp.sessions_flushed),
+            nat44_icmp_mappings: 0,
+            nat44_icmp_peers: 0,
             firewall_flows: s(firewall.states_flushed),
         }
+    }
+
+    /// Adds the ICMP query NAT flush (N5) of a publication that has one.
+    #[must_use]
+    pub fn with_nat44_icmp(mut self, nat44_icmp: Option<Nat44IcmpReconcileReport>) -> Self {
+        if let Some(report) = nat44_icmp {
+            self.nat44_icmp_mappings = saturating_u64(report.mappings_flushed);
+            self.nat44_icmp_peers = saturating_u64(report.peers_flushed);
+        }
+        self
     }
 
     fn visit<V: FieldVisitor>(&self, section: &'static str, v: &mut V) {
         visit_counts! {v, section, *self, ApplyFlushCounts {
             resolution_states, resolution_actions, dynamic_neighbors, failure_holds,
             icmpv4_error_states, icmpv4_error_actions, nat44_udp_mappings, nat44_udp_peers,
-            nat44_tcp_mappings, nat44_tcp_sessions, firewall_flows,
+            nat44_tcp_mappings, nat44_tcp_sessions, nat44_icmp_mappings, nat44_icmp_peers,
+            firewall_flows,
         }}
     }
 
@@ -549,7 +566,8 @@ impl ApplyFlushCounts {
         add_counts! {self, *other, ApplyFlushCounts {
             resolution_states, resolution_actions, dynamic_neighbors, failure_holds,
             icmpv4_error_states, icmpv4_error_actions, nat44_udp_mappings, nat44_udp_peers,
-            nat44_tcp_mappings, nat44_tcp_sessions, firewall_flows,
+            nat44_tcp_mappings, nat44_tcp_sessions, nat44_icmp_mappings, nat44_icmp_peers,
+            firewall_flows,
         }}
     }
 }
@@ -611,6 +629,9 @@ pub struct ServiceOccupancy {
     pub nat44_tcp_sessions: TableOccupancy,
     pub nat44_tcp_external_inbound_sessions: TableOccupancy,
     pub nat44_tcp_unsolicited_syn_holds: TableOccupancy,
+    /// ICMP query NAT (N5); empty (capacity 0) when not configured.
+    pub nat44_icmp_mappings: TableOccupancy,
+    pub nat44_icmp_peers: TableOccupancy,
     pub firewall_states: TableOccupancy,
     pub icmpv4_error_states: TableOccupancy,
 }
@@ -635,9 +656,22 @@ impl ServiceOccupancy {
             nat44_tcp_sessions: tcp.sessions,
             nat44_tcp_external_inbound_sessions: tcp.external_inbound_sessions,
             nat44_tcp_unsolicited_syn_holds: tcp.unsolicited_syn_holds,
+            nat44_icmp_mappings: TableOccupancy::default(),
+            nat44_icmp_peers: TableOccupancy::default(),
             firewall_states: firewall.occupancy(),
             icmpv4_error_states: icmpv4_errors.state_occupancy(),
         }
+    }
+
+    /// Adds the ICMP query NAT tables (N5) when the runtime exists. O(1).
+    #[must_use]
+    pub fn with_nat44_icmp(mut self, nat44_icmp: Option<&Nat44IcmpRuntime<'_>>) -> Self {
+        if let Some(runtime) = nat44_icmp {
+            let icmp = runtime.occupancy();
+            self.nat44_icmp_mappings = icmp.mappings;
+            self.nat44_icmp_peers = icmp.peers;
+        }
+        self
     }
 }
 
@@ -656,6 +690,8 @@ pub struct OccupancyTotals {
     pub nat44_tcp_sessions: ObservedTable,
     pub nat44_tcp_external_inbound_sessions: ObservedTable,
     pub nat44_tcp_unsolicited_syn_holds: ObservedTable,
+    pub nat44_icmp_mappings: ObservedTable,
+    pub nat44_icmp_peers: ObservedTable,
     pub firewall_states: ObservedTable,
     pub icmpv4_error_states: ObservedTable,
 }
@@ -669,10 +705,14 @@ impl OccupancyTotals {
             nat44_tcp_sessions,
             nat44_tcp_external_inbound_sessions,
             nat44_tcp_unsolicited_syn_holds,
+            nat44_icmp_mappings,
+            nat44_icmp_peers,
             firewall_states,
             icmpv4_error_states,
         } = *occupancy;
         incr(&mut self.samples);
+        self.nat44_icmp_mappings.record(nat44_icmp_mappings);
+        self.nat44_icmp_peers.record(nat44_icmp_peers);
         self.nat44_udp_mappings.record(nat44_udp_mappings);
         self.nat44_udp_peers.record(nat44_udp_peers);
         self.nat44_tcp_mappings.record(nat44_tcp_mappings);
@@ -694,6 +734,8 @@ impl OccupancyTotals {
             nat44_tcp_sessions,
             nat44_tcp_external_inbound_sessions,
             nat44_tcp_unsolicited_syn_holds,
+            nat44_icmp_mappings,
+            nat44_icmp_peers,
             firewall_states,
             icmpv4_error_states,
         } = self;
@@ -705,6 +747,8 @@ impl OccupancyTotals {
         nat44_tcp_external_inbound_sessions
             .visit("occupancy.nat44_tcp_external_inbound_sessions", v);
         nat44_tcp_unsolicited_syn_holds.visit("occupancy.nat44_tcp_unsolicited_syn_holds", v);
+        nat44_icmp_mappings.visit("occupancy.nat44_icmp_mappings", v);
+        nat44_icmp_peers.visit("occupancy.nat44_icmp_peers", v);
         firewall_states.visit("occupancy.firewall_states", v);
         icmpv4_error_states.visit("occupancy.icmpv4_error_states", v);
     }
@@ -1200,6 +1244,8 @@ pub struct ServiceCounters {
     pub icmpv4_errors: Icmpv4ErrorCounters,
     pub nat44_udp: Nat44UdpCounters,
     pub nat44_tcp: Nat44TcpCounters,
+    /// ICMP query NAT (N5); zero when not configured.
+    pub nat44_icmp: Nat44IcmpCounters,
     pub firewall: FirewallCounters,
 }
 
@@ -1219,8 +1265,18 @@ impl ServiceCounters {
             icmpv4_errors: icmpv4_errors.counters(),
             nat44_udp: nat44_udp.counters(),
             nat44_tcp: nat44_tcp.counters(),
+            nat44_icmp: Nat44IcmpCounters::default(),
             firewall: firewall.counters(),
         }
+    }
+
+    /// Adds the ICMP query NAT counters (N5) when the runtime exists.
+    #[must_use]
+    pub fn with_nat44_icmp(mut self, nat44_icmp: Option<&Nat44IcmpRuntime<'_>>) -> Self {
+        if let Some(runtime) = nat44_icmp {
+            self.nat44_icmp = runtime.counters();
+        }
+        self
     }
 }
 
@@ -1267,6 +1323,12 @@ impl ObservableFields for ServiceCounters {
             unsolicited_syn_index_corrupt, sessions_established, sessions_closed, sessions_reset,
             sessions_expired_opening, sessions_expired_established, sessions_expired_closing,
             host_quota_exceeded,
+        }}
+        visit_counts! {v, "nat44_icmp", self.nat44_icmp, Nat44IcmpCounters {
+            mappings_created, mappings_reused, mappings_expired, peers_created,
+            outbound_translated, inbound_translated, mapping_misses, filter_denied,
+            mapping_full, peer_full, identifier_exhausted, clock_regressions,
+            config_mismatches, reconciliations, host_quota_exceeded,
         }}
         visit_counts! {v, "firewall", self.firewall, FirewallCounters {
             allowed_new, allowed_established, denied_by_rule, denied_default, invalid_packets,

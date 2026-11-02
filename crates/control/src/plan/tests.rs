@@ -1052,6 +1052,7 @@ impl PublicationKeySource for ResolutionReplaying {
             fresh.nat44_tcp(),
             fresh.firewall(),
             first.resolution(),
+            fresh.nat44_icmp(),
         ))
     }
 }

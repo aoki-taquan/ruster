@@ -307,7 +307,7 @@ arrayのcapacityを一つのopaque valueとして返します。受信ICMPv4 err
 live UDP mapping/ADF peerをread-only参照し、outer destinationと引用source tupleをinsideへ
 戻します。outer sourceはexternal host-unicastかつoutsideへのreverse LPMを要求する
 local strict-uRPF policyで、asymmetric external pathを意図的に拒否します。中継routerの
-addressは引用remoteと異なっていても保存します。fragment、query NAT、local MTU起因の
+addressは引用remoteと異なっていても保存します。fragment、local MTU起因の
 Type 3/Code 4生成、PMTU cache、static forward、
 multi-public、port randomization/parity、full packet filterはdeferredで、RFC 4787/7857全体への
 準拠は主張しません。
@@ -406,6 +406,63 @@ mappings-per-host = 1024   # 省略時0（無制限）。u16
 [nat44.tcp]
 mappings-per-host = 1024
 ```
+
+ICMP query NAT（N5、NAT44-100〜118。RFC 5508 §3）: `[nat44.icmp]`があるとき、insideからの
+Echo Request（`ping`）とTimestamp Requestをpublic addressとpublic identifierへ変換し、その
+Reply（type 0/14）をinsideへ戻します（REQ-1、REQ-10 a.3/b）。mappingはinternal address・
+Identifierごとのendpoint-independent mapping（REQ-1 a）で、UDP NAT44と同じcaller-backedな
+mapping engine（O(1) slot list、keyed directory、free bitmap、per-host list）を別storage・
+ICMP専用のfresh hash key・別counterで使います。timeoutは60秒以上（REQ-2、default 60秒、
+outbound queryだけがrefresh）、reply filteringはdefault address-dependent（queryにportは
+無いので`address-and-port-dependent`は拒否）、Identifierの選択はN2と同じ（preservation、
+keyed start）です。queryを引用するICMP error（traceroute -IのTime Exceededなど）は
+UDP/TCP引用と同じ経路でread-onlyに変換され（REQ-4/5/6）、N4のlimiterとFrag Needed MTU
+checkも共有します。public address宛てのEcho Requestはinsideからでもoutsideからでもrouter
+自身が答えます（NAPTにはhairpinできるinbound query sessionが無い。REQ-7はBasic NATの要件、
+RFC 7857 §12）。Information/Address Mask（RFC 6918でdeprecated）とinsideからのReplyは
+変換せず`NAT44_ICMP_TYPE_UNSUPPORTED`です。UDP/TCP（DF=1だけ）と違い、fragmentでない
+queryはDF=0でも変換します（LinuxのEcho ReplyとWindowsのpingはDF=0。NAT44-116）。sectionが無ければ従来どおりinside→
+outsideのICMP queryは`NAT44_UDP_UNSUPPORTED_TRANSPORT`（UDPが無くTCPだけなら`NAT44_TCP_UNSUPPORTED_TRANSPORT`）でdrop（local policyとしての無効化）
+で、sectionの追加・削除はstorage shapeの変更（restart-required）です。firewallは
+`protocol = "icmp"`のrule（portは書けず全Identifierに一致）でqueryをstatefulに許可し、Reply
+はRequestが作ったflowの逆tupleとしてだけ通ります。方向（Request/Reply）はtupleと別に運ぶので、
+Identifier 8や13でも逆向きのRequestがReplyとして通ることはなく、flowの無いReplyは
+`FIREWALL_ICMP_REPLY_WITHOUT_REQUEST`です。ICMP flowのTTLは`udp-idle-ttl-ms`（120秒以上）でNATの
+`idle-ttl-ms`とは独立です。firewall付きの構成ではNATを通らないroutedなEcho/Timestampもruleで
+評価されます（以前は`FIREWALL_UNSUPPORTED_PROTOCOL`、今はICMP ruleが無ければ
+`FIREWALL_DEFAULT_DENIED`。default denyは同じでdrop reasonだけが変わる）。`[nat44.icmp]`があると
+public address宛てのEcho ReplyはNATのpathへ入るので、router自身がpublic addressからpingしても
+Replyは`NAT44_ICMP_MAPPING_MISS`で落ちます（routerはpingを送らないので通常は無関係）。
+
+```toml
+[nat44.icmp]                       # 省略時: ICMP query NATなし
+idle-ttl-ms = 60000                # 省略時60000（60000以上、RFC 5508 REQ-2）
+filtering = "address-dependent"    # | "endpoint-independent"（reloadable）
+identifier-preservation = true     # false: 常にkeyed identifier（reloadable）
+icmpv4-errors = "bidirectional"    # queryを引用するerrorの変換（reloadable）
+mappings-per-host = 0              # 0=無制限。0⇔非0はrestart-required
+
+[nat44.icmp.identifiers]           # 省略時[nat44.realm.ports]の数値（identifierごとに32 byte）
+first = 40000
+last = 40015
+
+[nat44.icmp.capacity]              # 必須
+mappings = 8
+peers = 16
+
+[[firewall.rules]]
+id = 50
+ingress = "lan"
+egress = "wan"
+source = "192.168.1.0/24"
+destination = "0.0.0.0/0"
+protocol = "icmp"                  # source-ports/destination-portsは書かない
+action = "allow-stateful"
+```
+
+`icmp` ruleは「Replyだけ」や「Echoだけ」を表せません。outsideからinsideへのallow-stateful ruleを
+書くと、その範囲の全てのEcho/Timestamp Requestが通ります（insideからのpingのReplyにはrule不要で、
+flowが通します）。
 
 NAT44 inbound filteringは`[nat44.udp]`と`[nat44.tcp]`の`filtering`で個別に選びます。
 RFC 4787 REQ-8とRFC 5382 REQ-3は、transparency重視ならEndpoint-Independent、より厳しい
@@ -1060,7 +1117,7 @@ directory外の読めるfileへのsymlinkにatomicに置き換えると`stage=re
 directory内へ置くとapply。uid 0では`/etc/shadow`、`/etc/passwd`、`/proc/1/status`、
 `/proc/<pid>/root/etc/shadow`へのsymlinkが全て`PERMISSION_DENIED`。対照として`--fs-confine off`では
 同じ`/etc/passwd`がreadを通る）、
-B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、
+B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、N5のicmp_query phase（`[nat44.icmp]`の無いrouter-v1ではhost Aからhost Bへの`ping`が届かず`NAT44_UDP_UNSUPPORTED_TRANSPORT`、`[nat44.icmp]`と`icmp` firewall ruleを足した構成（planは`nat44-icmp ~ off -> on`でrestart-required）ではhost Bへのpingが3/3返り（host Bには192.168.1.0/24への経路が無いので、replyが返ること自体が変換の証拠）、public addressへのpingはrouter自身が答え、`nat44_icmp.outbound_translated=3`と`inbound_translated=3`、mapping 1つ）、
 M2 S10bのops phase（一つの稼働中routerでSIGHUP reloadによりUDP ruleをdenyにして届かなくなり、
 戻して再び届く。generation 2/3でrestartなし。UMEM shapeを変えたreloadは`RESTART_REQUIRED`で
 拒否され転送は継続。router netns内の`ip link set ra down/up`でwarningとrecovered、転送回復。rbの

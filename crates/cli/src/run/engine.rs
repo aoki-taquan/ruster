@@ -749,7 +749,8 @@ where
                                 apply.nat44_udp,
                                 apply.nat44_tcp,
                                 apply.firewall,
-                            );
+                            )
+                            .with_nat44_icmp(apply.nat44_icmp);
                             (apply.previous_generation, flush)
                         });
                     // Tests drop the report here to reach the invariant path.
@@ -790,7 +791,8 @@ where
             active.nat44_udp(),
             active.nat44_tcp(),
             active.firewall(),
-        );
+        )
+        .with_nat44_icmp(active.nat44_icmp());
         observer.record_occupancy(occupancy);
         if let Some(end) = wedge.after_tick(now, &report) {
             return end;

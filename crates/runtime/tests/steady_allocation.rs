@@ -275,7 +275,12 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         assert_eq!(size_of::<Nat44UdpServiceView<'static, 'static>>(), 120);
         assert_eq!(size_of::<Nat44TcpServiceView<'static, 'static>>(), 144);
         assert_eq!(size_of::<FirewallServiceView<'static, 'static>>(), 168);
-        assert!(size_of::<FullServiceView<'static, 'static>>() <= 576);
+        // N5 added the optional ICMP query NAT view (config and runtime).
+        assert_eq!(
+            size_of::<ruster_runtime::Nat44IcmpServiceView<'static, 'static>>(),
+            120
+        );
+        assert!(size_of::<FullServiceView<'static, 'static>>() <= 696);
     }
 
     counting::self_check();

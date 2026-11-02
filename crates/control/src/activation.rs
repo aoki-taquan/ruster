@@ -172,11 +172,12 @@ use ruster_core::{
     FirewallReconcileError, FirewallReconcileReport, FirewallRuntime, FirewallStateSlot,
     Icmpv4ErrorActionSlot, Icmpv4ErrorPublicationError, Icmpv4ErrorPublicationReport,
     Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Nat44HostLink, Nat44HostSlot, Nat44HostStorage,
-    Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpReconcileError, Nat44TcpReconcileReport,
-    Nat44TcpRuntime, Nat44TcpRuntimeConfigError, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot,
-    Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpReconcileError,
-    Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError, PortOwnerSlot,
-    PublicationQuiescence, ResolutionActionSlot, ResolutionFailureHoldSlot,
+    Nat44IcmpReconcileError, Nat44IcmpReconcilePermit, Nat44IcmpReconcileReport, Nat44IcmpRuntime,
+    Nat44IcmpRuntimeConfigError, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpReconcileError,
+    Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError, Nat44TcpSessionSlot,
+    Nat44TcpSynHoldSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
+    Nat44UdpReconcileError, Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError,
+    PortOwnerSlot, PublicationQuiescence, ResolutionActionSlot, ResolutionFailureHoldSlot,
     ResolutionPublicationError, ResolutionPublicationReport, ResolutionRuntime,
     ResolutionStateSlot,
 };
@@ -185,8 +186,8 @@ use ruster_core::{
     Nat44UdpReconcilePermit, ResolutionPublicationPermit,
 };
 use ruster_runtime::{
-    FirewallServiceView, FullServicePublication, FullServiceView, Nat44TcpServiceView,
-    Nat44UdpServiceView, PublicationTick,
+    FirewallServiceView, FullServicePublication, FullServiceView, Nat44IcmpServiceView,
+    Nat44TcpServiceView, Nat44UdpServiceView, PublicationTick,
 };
 
 use crate::{
@@ -228,6 +229,12 @@ pub struct FullServiceStorage {
     /// Per-host mapping accounting (N3); empty without a per-host limit.
     udp_hosts: HostTables<1>,
     tcp_hosts: HostTables<2>,
+    /// The optional ICMP query NAT (N5): the datagram engine's tables and
+    /// its per-host accounting.
+    icmp: Option<(
+        NatTables<Nat44UdpMappingSlot, Nat44UdpPeerSlot>,
+        HostTables<1>,
+    )>,
     firewall_states: Box<[FirewallStateSlot]>,
 }
 
@@ -283,7 +290,7 @@ impl FullServiceStorage {
     ///
     /// Allocation failure is reported per service instead of aborting.
     pub fn new(shape: FullServiceStorageShape) -> Result<Self, StorageAllocationError> {
-        use RuntimeService::{Firewall, Icmpv4Errors, Nat44Tcp, Nat44Udp, Resolution};
+        use RuntimeService::{Firewall, Icmpv4Errors, Nat44Icmp, Nat44Tcp, Nat44Udp, Resolution};
         let resolution = shape.resolution();
         let icmpv4 = shape.icmpv4_errors();
         let udp = shape.nat44_udp();
@@ -362,6 +369,26 @@ impl FullServiceStorage {
             )?,
             udp_hosts: HostTables::new(udp.host_slots(), udp.host_buckets(), Nat44Udp)?,
             tcp_hosts: HostTables::new(tcp.host_slots(), tcp.host_buckets(), Nat44Tcp)?,
+            icmp: shape
+                .nat44_icmp()
+                .map(|icmp| {
+                    Ok((
+                        NatTables::new(
+                            [
+                                icmp.mapping_slots(),
+                                icmp.peer_slots(),
+                                icmp.mapping_buckets(),
+                                icmp.mapping_nodes(),
+                                icmp.peer_buckets(),
+                                icmp.peer_nodes(),
+                                icmp.port_owner_slots(),
+                            ],
+                            Nat44Icmp,
+                        )?,
+                        HostTables::new(icmp.host_slots(), icmp.host_buckets(), Nat44Icmp)?,
+                    ))
+                })
+                .transpose()?,
             firewall_states: slots(
                 shape.firewall_state_slots(),
                 FirewallStateSlot::default(),
@@ -429,6 +456,7 @@ pub enum ActivationError {
     GenerationNotAboveFloor,
     Nat44Udp(Nat44UdpRuntimeConfigError),
     Nat44Tcp(Nat44TcpRuntimeConfigError),
+    Nat44Icmp(Nat44IcmpRuntimeConfigError),
 }
 
 /// Successor change that live activation cannot apply in place.
@@ -487,6 +515,7 @@ pub enum ApplyError {
     Icmpv4Errors(Icmpv4ErrorPublicationError),
     Nat44Udp(Nat44UdpReconcileError),
     Nat44Tcp(Nat44TcpReconcileError),
+    Nat44Icmp(Nat44IcmpReconcileError),
     Firewall(FirewallReconcileError),
 }
 
@@ -507,6 +536,7 @@ impl From<SuccessorError> for ApplyError {
             | SuccessorError::GenerationNotIncreasing
             | SuccessorError::Nat44UdpHashKeyReused
             | SuccessorError::Nat44TcpHashKeyReused
+            | SuccessorError::Nat44IcmpHashKeyReused
             | SuccessorError::FirewallHashKeyReused
             | SuccessorError::ResolutionHashKeyReused => Self::Successor(error),
         }
@@ -528,6 +558,8 @@ pub struct ApplyReport {
     pub icmpv4_errors: Icmpv4ErrorPublicationReport,
     pub nat44_udp: Nat44UdpReconcileReport,
     pub nat44_tcp: Nat44TcpReconcileReport,
+    /// `None` without ICMP query NAT (N5).
+    pub nat44_icmp: Option<Nat44IcmpReconcileReport>,
     pub firewall: FirewallReconcileReport,
 }
 
@@ -540,6 +572,7 @@ enum ApplyStage {
     Icmpv4Errors,
     Nat44Udp,
     Nat44Tcp,
+    Nat44Icmp,
     Firewall,
 }
 
@@ -567,15 +600,18 @@ struct LiveRuntimes<'storage> {
     icmpv4_errors: Icmpv4ErrorRuntime<'storage>,
     nat44_udp: Nat44UdpRuntime<'storage>,
     nat44_tcp: Nat44TcpRuntime<'storage>,
+    /// The optional ICMP query NAT (N5).
+    nat44_icmp: Option<Nat44IcmpRuntime<'storage>>,
     firewall: FirewallRuntime<'storage>,
 }
 
-/// All five exclusive permits of one successor, held at once.
+/// All exclusive permits of one successor, held at once.
 struct Permits<'runtime, 'storage> {
     resolution: ResolutionPublicationPermit<'runtime, 'storage>,
     icmpv4_errors: Icmpv4ErrorPublicationPermit<'runtime, 'storage>,
     nat44_udp: Nat44UdpReconcilePermit<'runtime, 'storage>,
     nat44_tcp: Nat44TcpReconcilePermit<'runtime, 'storage>,
+    nat44_icmp: Option<Nat44IcmpReconcilePermit<'runtime, 'storage>>,
     firewall: FirewallReconcilePermit<'runtime, 'storage>,
 }
 
@@ -628,6 +664,28 @@ impl<'storage> LiveRuntimes<'storage> {
         if let Some(error) = fault(ApplyStage::Nat44Tcp) {
             return Err(error);
         }
+        // Successor validation compared the storage shapes, which include
+        // whether ICMP query NAT exists, so both sides agree here; a
+        // disagreement is still refused as a shape change.
+        let nat44_icmp = match (
+            self.nat44_icmp.as_mut(),
+            authority
+                .nat44_icmp_config()
+                .zip(authority.nat44_icmp_hash_key()),
+        ) {
+            (None, None) => None,
+            (Some(runtime), Some((config, key))) => Some(
+                runtime
+                    .preflight_reconcile(config, key)
+                    .map_err(ApplyError::Nat44Icmp)?,
+            ),
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ApplyError::RestartRequired(RestartRequired::StorageShape));
+            }
+        };
+        if let Some(error) = fault(ApplyStage::Nat44Icmp) {
+            return Err(error);
+        }
         let firewall = self
             .firewall
             .preflight_reconcile(authority.firewall_config())
@@ -640,6 +698,7 @@ impl<'storage> LiveRuntimes<'storage> {
             icmpv4_errors,
             nat44_udp,
             nat44_tcp,
+            nat44_icmp,
             firewall,
         })
     }
@@ -665,6 +724,12 @@ impl<'storage> LiveRuntimes<'storage> {
             })),
             nat44_tcp_sessions: count(occupied(self.nat44_tcp.sessions(), |slot| {
                 slot.is_occupied()
+            })),
+            nat44_icmp_mappings: count(self.nat44_icmp.as_ref().map_or(0, |runtime| {
+                occupied(runtime.mappings(), |slot| slot.is_occupied())
+            })),
+            nat44_icmp_peers: count(self.nat44_icmp.as_ref().map_or(0, |runtime| {
+                occupied(runtime.peers(), |slot| slot.is_occupied())
             })),
             firewall_flows: count(occupied(self.firewall.states(), |slot| slot.is_occupied())),
         }
@@ -709,9 +774,39 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             tcp_syn_holds,
             udp_hosts,
             tcp_hosts,
+            icmp,
             firewall_states,
         } = storage;
         let authority = candidate.authority();
+        let nat44_icmp = match (
+            icmp.as_mut(),
+            authority
+                .nat44_icmp_config()
+                .zip(authority.nat44_icmp_hash_key()),
+        ) {
+            (None, None) => None,
+            (Some((tables, hosts)), Some((config, key))) => Some(
+                Nat44IcmpRuntime::new(
+                    config,
+                    &mut tables.mappings,
+                    &mut tables.secondary,
+                    Nat44UdpIndexStorage::new(
+                        &mut tables.mapping_buckets,
+                        &mut tables.mapping_nodes,
+                        &mut tables.secondary_buckets,
+                        &mut tables.secondary_nodes,
+                        &mut tables.port_owners,
+                        &mut tables.port_free_bits,
+                        hosts.storage(),
+                    ),
+                    key,
+                )
+                .map_err(ActivationError::Nat44Icmp)?,
+            ),
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ActivationError::StorageShapeMismatch);
+            }
+        };
         let nat44_udp = Nat44UdpRuntime::new(
             authority.nat44_udp_config(),
             &mut udp.mappings,
@@ -772,6 +867,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
                 icmpv4_errors,
                 nat44_udp,
                 nat44_tcp,
+                nat44_icmp,
                 firewall,
             },
             generation_floor,
@@ -814,6 +910,12 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
     #[must_use]
     pub const fn nat44_tcp(&self) -> &Nat44TcpRuntime<'storage> {
         &self.runtimes.nat44_tcp
+    }
+
+    /// The ICMP query NAT runtime (N5), if configured.
+    #[must_use]
+    pub const fn nat44_icmp(&self) -> Option<&Nat44IcmpRuntime<'storage>> {
+        self.runtimes.nat44_icmp.as_ref()
     }
 
     #[must_use]
@@ -871,6 +973,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             icmpv4_errors,
             nat44_udp,
             nat44_tcp,
+            nat44_icmp,
             firewall,
         } = self
             .runtimes
@@ -889,6 +992,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             icmpv4_errors: icmpv4_errors.commit_with_translated_limit_key(resolution_hash_key),
             nat44_udp: nat44_udp.commit(),
             nat44_tcp: nat44_tcp.commit(),
+            nat44_icmp: nat44_icmp.map(Nat44IcmpReconcilePermit::commit),
             firewall: firewall.commit(),
         };
         // No permit borrows `successor`, so it can move into place.
@@ -917,24 +1021,31 @@ impl<'storage, I: PublicationQuiescence> FullServicePublication<'storage, I>
 
     fn active(&mut self, _tick: &PublicationTick<'_>) -> Option<FullServiceView<'_, 'storage>> {
         let authority = self.candidate.authority();
-        Some(FullServiceView::new(
-            authority.generation(),
-            authority.snapshot(),
-            &mut self.runtimes.resolution,
-            &mut self.runtimes.icmpv4_errors,
-            Nat44UdpServiceView::new(
-                authority.nat44_udp_config(),
-                Some(&mut self.runtimes.nat44_udp),
-            ),
-            Nat44TcpServiceView::new(
-                authority.nat44_tcp_config(),
-                Some(&mut self.runtimes.nat44_tcp),
-            ),
-            FirewallServiceView::new(
-                authority.firewall_config(),
-                Some(&mut self.runtimes.firewall),
-            ),
-        ))
+        let nat44_icmp = match authority.nat44_icmp_config() {
+            Some(config) => Nat44IcmpServiceView::new(config, self.runtimes.nat44_icmp.as_mut()),
+            None => Nat44IcmpServiceView::default(),
+        };
+        Some(
+            FullServiceView::new(
+                authority.generation(),
+                authority.snapshot(),
+                &mut self.runtimes.resolution,
+                &mut self.runtimes.icmpv4_errors,
+                Nat44UdpServiceView::new(
+                    authority.nat44_udp_config(),
+                    Some(&mut self.runtimes.nat44_udp),
+                ),
+                Nat44TcpServiceView::new(
+                    authority.nat44_tcp_config(),
+                    Some(&mut self.runtimes.nat44_tcp),
+                ),
+                FirewallServiceView::new(
+                    authority.firewall_config(),
+                    Some(&mut self.runtimes.firewall),
+                ),
+            )
+            .with_nat44_icmp(nat44_icmp),
+        )
     }
 }
 

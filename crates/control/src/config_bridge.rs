@@ -14,16 +14,18 @@
 use std::{fmt, num::NonZeroU64};
 
 use ruster_config::{
-    ValidatedConfigV1, ValidatedFirewallV1, ValidatedIcmpv4ErrorV1, ValidatedNat44TcpV1,
-    ValidatedNat44UdpV1, ValidatedResolutionV1,
+    ValidatedConfigV1, ValidatedFirewallV1, ValidatedIcmpv4ErrorV1, ValidatedNat44IcmpV1,
+    ValidatedNat44TcpV1, ValidatedNat44UdpV1, ValidatedResolutionV1,
 };
-use ruster_core::{FirewallHashKey, Nat44TcpHashKey, Nat44UdpHashKey, ResolutionHashKey};
+use ruster_core::{
+    FirewallHashKey, Nat44IcmpHashKey, Nat44TcpHashKey, Nat44UdpHashKey, ResolutionHashKey,
+};
 
 use crate::publication::{
     FirewallPublicationInput, FullServiceStorageShape, Icmpv4ErrorStorageShape,
-    Nat44TcpPublicationInput, Nat44TcpStoragePlan, Nat44UdpPublicationInput, Nat44UdpStoragePlan,
-    PublicationCandidateError, PublicationPlan, ResolutionStorageShape, RuntimeService,
-    ValidatedCandidate,
+    Nat44IcmpPublicationInput, Nat44IcmpStoragePlan, Nat44TcpPublicationInput, Nat44TcpStoragePlan,
+    Nat44UdpPublicationInput, Nat44UdpStoragePlan, PublicationCandidateError, PublicationPlan,
+    ResolutionStorageShape, RuntimeService, ValidatedCandidate,
 };
 
 /// How a [`PublicationKeySource`] obtains its keys.
@@ -83,8 +85,10 @@ pub enum KeySourceError {
     EntropyEndOfFile,
 }
 
-/// The four hash keys bound to one publication generation.
+/// The five hash keys bound to one publication generation.
 ///
+/// The ICMP query NAT key (N5) is drawn even when ICMP query NAT is not
+/// configured, so a key set never depends on the configuration.
 /// Formatting is redacted and the type is not `Clone`, so a key set is
 /// consumed by exactly one candidate build.
 #[derive(Eq, PartialEq)]
@@ -93,6 +97,7 @@ pub struct PublicationKeys {
     nat44_tcp: Nat44TcpHashKey,
     firewall: FirewallHashKey,
     resolution: ResolutionHashKey,
+    nat44_icmp: Nat44IcmpHashKey,
 }
 
 impl PublicationKeys {
@@ -102,13 +107,20 @@ impl PublicationKeys {
         nat44_tcp: Nat44TcpHashKey,
         firewall: FirewallHashKey,
         resolution: ResolutionHashKey,
+        nat44_icmp: Nat44IcmpHashKey,
     ) -> Self {
         Self {
             nat44_udp,
             nat44_tcp,
             firewall,
             resolution,
+            nat44_icmp,
         }
+    }
+
+    #[must_use]
+    pub const fn nat44_icmp(&self) -> Nat44IcmpHashKey {
+        self.nat44_icmp
     }
 
     #[must_use]
@@ -226,6 +238,8 @@ const TAG_FIREWALL_FIRST: u64 = 0x7275_7374_6677_6b31;
 const TAG_FIREWALL_SECOND: u64 = 0x7275_7374_6677_6b32;
 const TAG_RESOLUTION_FIRST: u64 = 0x7275_7374_7273_6c31;
 const TAG_RESOLUTION_SECOND: u64 = 0x7275_7374_7273_6c32;
+const TAG_ICMP_FIRST: u64 = 0x7275_7374_6963_7031;
+const TAG_ICMP_SECOND: u64 = 0x7275_7374_6963_7032;
 
 const fn mix(mut value: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -260,7 +274,12 @@ impl PublicationKeySource for SimDeterministicKeySource {
             self.word(generation, TAG_RESOLUTION_SECOND),
         )
         .map_err(|_| KeySourceError::AllZeroKey(RuntimeService::Resolution))?;
-        Ok(PublicationKeys::new(udp, tcp, firewall, resolution))
+        let icmp = Nat44IcmpHashKey::new(
+            self.word(generation, TAG_ICMP_FIRST),
+            self.word(generation, TAG_ICMP_SECOND),
+        )
+        .map_err(|_| KeySourceError::AllZeroKey(RuntimeService::Nat44Icmp))?;
+        Ok(PublicationKeys::new(udp, tcp, firewall, resolution, icmp))
     }
 }
 
@@ -289,6 +308,7 @@ impl ConfigBridgeError {
             Self::MissingService(RuntimeService::Nat44Udp) => "MISSING_SERVICE_NAT44_UDP",
             Self::MissingService(RuntimeService::Nat44Tcp) => "MISSING_SERVICE_NAT44_TCP",
             Self::MissingService(RuntimeService::Firewall) => "MISSING_SERVICE_FIREWALL",
+            Self::MissingService(RuntimeService::Nat44Icmp) => "MISSING_SERVICE_NAT44_ICMP",
             Self::KeySource(_) => "KEY_SOURCE",
             Self::Candidate(_) => "CANDIDATE",
         }
@@ -310,6 +330,7 @@ pub fn candidate_from_config<S: PublicationKeySource>(
         icmpv4_errors,
         udp,
         tcp,
+        icmp,
         firewall,
         shape,
     } = required_services(config).map_err(ConfigBridgeError::MissingService)?;
@@ -354,6 +375,18 @@ pub fn candidate_from_config<S: PublicationKeySource>(
         key_set.firewall,
     ))
     .with_resolution_hash_key(key_set.resolution);
+    let plan = match icmp {
+        Some(icmp) => plan.with_nat44_icmp(Nat44IcmpPublicationInput::new(
+            icmp.inside(),
+            icmp.outside(),
+            icmp.public_address(),
+            icmp.first_identifier(),
+            icmp.last_identifier(),
+            icmp.policy(),
+            key_set.nat44_icmp,
+        )),
+        None => plan,
+    };
     ValidatedCandidate::new(plan).map_err(ConfigBridgeError::Candidate)
 }
 
@@ -364,6 +397,8 @@ pub(crate) struct RequiredServices<'config> {
     pub(crate) icmpv4_errors: &'config ValidatedIcmpv4ErrorV1,
     pub(crate) udp: &'config ValidatedNat44UdpV1,
     pub(crate) tcp: &'config ValidatedNat44TcpV1,
+    /// The optional ICMP query NAT (N5).
+    pub(crate) icmp: Option<&'config ValidatedNat44IcmpV1>,
     pub(crate) firewall: &'config ValidatedFirewallV1,
     pub(crate) shape: FullServiceStorageShape,
 }
@@ -427,11 +462,28 @@ pub(crate) fn required_services(
         .with_host_slots(tcp_shape.hosts),
         firewall_states,
     );
+    let icmp = nat44.and_then(|nat44| nat44.icmp());
+    let shape = match icmp.zip(storage.nat44_icmp) {
+        Some((_, icmp_shape)) => shape.with_nat44_icmp(
+            Nat44IcmpStoragePlan::new(
+                icmp_shape.mappings,
+                icmp_shape.peers,
+                icmp_shape.mapping_buckets,
+                icmp_shape.mapping_nodes,
+                icmp_shape.peer_buckets,
+                icmp_shape.peer_nodes,
+                icmp_shape.identifier_owners,
+            )
+            .with_host_slots(icmp_shape.hosts),
+        ),
+        None => shape,
+    };
     Ok(RequiredServices {
         resolution,
         icmpv4_errors,
         udp,
         tcp,
+        icmp,
         firewall,
         shape,
     })

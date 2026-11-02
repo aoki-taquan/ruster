@@ -187,6 +187,8 @@ const FLUSH_ALL: &str = "expected-flush:
   nat44_udp_peers all
   nat44_tcp_mappings all
   nat44_tcp_sessions all
+  nat44_icmp_mappings all
+  nat44_icmp_peers all
   firewall_flows all
 ";
 
