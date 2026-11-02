@@ -327,11 +327,32 @@ outboundの再利用slotとpublic portの探索はO(1)（UDPと同じslot list�
 inboundとquoted ICMPはdirect owner後にexact sessionだけを調べます。
 mapping再生成時は旧sessionを全走査せずgeneration+epochでlazyに無効化します。
 
-TCP session idle TTLはdefault/minimumともに2時間4分です。sequence/window/ACK妥当性は追跡
-せず、FIN/RSTもsessionを削除・短縮せず通常のsuccessful TX requestとしてTTLだけをrefresh
-します。この保守的な単一timer profile（unsolicited SYNへのdelayed ICMP Port Unreachable、
-RFC 5382 REQ-4はB3で実装、下記）、fragment未実装を明示し、
-RFC 5382全体への準拠は主張しません。TCPのICMPv4 error変換は、引用public source portと
+TCP sessionは変換したsegmentのSYN/ACK/FIN/RSTを方向別に記録し、RFC 5382 §5のphaseごとの
+idle TTL（REQ-5）を使います（N1、RFC 7857 §2の状態機械）: SYNの後ACKが両方向に揃うまでの
+opening（`opening-idle-ttl-ms`、default 4分）、揃った後のestablished（`idle-ttl-ms`、
+default/minimum 2時間4分。片方向のFINではここに留まる）、FINが両方向か最後のsegmentがRSTの
+closing（`closing-idle-ttl-ms`、default 4分）。transitoryの二つは4分未満とestablished超を
+`NAT44_TCP_POLICY`で拒否します。RSTはsessionを削除せず変換してclosing TTLへ移し、続く非RST
+segment（SYNも含む）で元のphaseへ戻します（RFC 7857 §2.2）。FIN両方向で閉じたsessionへの
+insideからのinitial SYNか、remoteの新しいSYNへのinsideのSYN-ACKだけが同じ5-tupleの新connectionとしてやり直します。sequence/windowは
+追跡しないため、RSTはexact 5-tupleのsessionに一致すれば受理しますが、注入されたRSTでもsessionは
+closing TTLより早くは消えません。詐称し得るinbound RST/FINとinsideのSYN-ACKだけでphaseを
+進めないopt-inの`inbound-rst = "corroborate"`もあります（default `"closing"`、reloadable、
+planは`nat44-tcp inbound-rst ~ closing -> corroborate`）。mappingとpublic portは最後のsessionと共にexpireし（establishedが残る間は
+established TTL）、closeしたconnectionのsession slotとportは2時間4分ではなく4分で空きます。
+counterは`nat44_tcp.sessions_established`、`sessions_closed`、`sessions_reset`、
+`sessions_expired_{opening,established,closing}`です。unsolicited SYNへのdelayed ICMP Port
+Unreachable（RFC 5382 REQ-4）はB3で実装（下記）、fragmentは未実装で、
+RFC 5382全体への準拠は主張しません。
+
+```toml
+[nat44.tcp]
+idle-ttl-ms = 7440000          # established（必須、7440000以上）
+opening-idle-ttl-ms = 240000   # 省略時240000。240000以上かつidle-ttl-ms以下（reloadable）
+closing-idle-ttl-ms = 240000   # 同上。FIN両方向とRST後
+inbound-rst = "closing"        # 省略時"closing"（RFC 7857 §2.2）| "corroborate"（reloadable）
+```
+TCPのICMPv4 error変換は、引用public source portと
 exact live remote address/port sessionをread-only参照します。UDP-only/TCP-only wrapperは他方のprotocolがdomainを
 crossするとfail closedにし、combined wrapperはinside/outside/public realm一致を要求します。
 
@@ -377,16 +398,20 @@ inboundはmappingを作りません。firewallを同じworkerへbindした場合
 peerを要求します。TCPのaddress-dependent判定はsession slotを共有するcaller-backed
 remote-address directoryの一回のbounded lookupで、このdirectory分だけTCP storageが増えます
 （M1 fixtureで448 bytes）。`endpoint-independent`とinbound新規flowを許可するfirewall ruleを
-組み合わせると、外部からのSYNがsession slotを2時間4分占有し得ます。defaultの`address-dependent`でも
+組み合わせると、外部からのSYNがsession slotを占有し得ます（N1以降、SYNだけならopening TTLの4分。
+sequenceを見ないのでblindなACKまで送る攻撃者のsessionはdefaultではestablishedになり2時間4分、
+`inbound-rst = "corroborate"`なら4分）。defaultの`address-dependent`でも
 mappingが既に話しているremote address（CDNやDNS serverなど）を詐称したSYNなら同じことができ
 ます（NAT44-041）。これをopt-inの`[nat44.tcp] inbound-sessions-per-remote`（default `0`は無制限、
 推奨8、最大16）が抑えます。外部initial SYNが一つのmappingに一つのremote IPv4から作ったlive sessionが
 上限数あれば、次のSYNはbyte不変の`NAT44_TCP_INBOUND_REMOTE_QUOTA_EXCEEDED`（counter
 `nat44_tcp.inbound_remote_quota_exceeded`）でdropし、stateを作らずevictもしません。outbound開始
 sessionとhairpinのinbound half（remoteがrouter自身の`P`）は数えません。数はstored counterでは
-なくlive slotから導くため、idle expiry、slot再利用、reconcileで自然に戻ります。ただしFIN/RSTを
-追跡しないため、closeしたconnectionもidle TTL（2時間4分）まで数え、上限をdefaultにすると同じremoteから
-の短い再接続を数時間拒否し得ます。このためdefaultは無制限です（transitory/FIN-aware timerはNAT44-058）。
+なくlive slotから導くため、idle expiry、slot再利用、reconcileで自然に戻ります。closeやRSTした
+connectionはclosing TTL（default 4分）、remoteがACKしないSYNはopening TTL（default 4分）まで
+数えます（N1以前はどれも2時間4分で、defaultを無制限にした理由でした）。defaultは`0`（無制限）の
+ままで、8へ変える案はowner判断待ちです（NAT44-086）。上限は詐称で正当なremoteの枠を埋めて
+その本物のinboundを拒否するtargeted denialにも使えるので、両面があります。
 chainの最初の16 nodeにある同じmapping/remoteのoutbound開始session分だけ実効上限は下がり（最大16は
 名目値）、上限が1以上だと16 nodeを超えるchainではADF単独なら許可したSYNも拒否します。どのREQも
 filterを通ったSYNの全受理を求めないため、MUSTに反しないlocal security policyです。
@@ -609,7 +634,7 @@ $B run-sim --scenario fixtures/m1/scenario.toml --hold
   planなので`all`（apply時に全live stateをflush）で、実際のflush数は`run-sim`の`apply` eventに
   出ます。capacityやresolution/ICMP/NAT/firewall policyの変更はrestart理由（`STORAGE_SHAPE`等）
   または`changed` flagとしてだけ出し、fieldごとの値は出しません。例外はsecretでないNAT
-  filtering、hairpinning、TCP inbound limit、TCP unsolicited-SYN ICMP switchで、`nat44-tcp filtering ~ address-dependent -> endpoint-independent`、
+  filtering、hairpinning、TCP inbound limit、TCP unsolicited-SYN ICMP switch、TCP inbound-rst policy（`nat44-tcp inbound-rst ~ closing -> corroborate`）で、`nat44-tcp filtering ~ address-dependent -> endpoint-independent`、
   `nat44-udp hairpinning ~ on -> off`、`nat44-tcp inbound-sessions-per-remote ~ unlimited -> 8`、
   `nat44-tcp unsolicited-syn-icmp ~ on -> off`の
   ように値を出し、`policy ~ changed`はそれ以外のNAT policy変更だけを表します。interface labelは
@@ -724,7 +749,7 @@ sudo kill -HUP <pid>                                               # configをre
   directory、port poolを含む）は65536 slotまでです。packet pathでtable全体をscanする処理は
   ありません（PERF-001。NAT44はH4a、resolution/ICMPv4 errorはH4bでkeyed index化。想定traffic
   に合わせて設定する）。runtime storageの合計は64 MiBまで（`run-sim`と同じ）。全tableを
-  上限にしたconfig（`fixtures/limits/router-production-max.toml`）のstorageは53.42 MiBです。storageは
+  上限にしたconfig（`fixtures/limits/router-production-max.toml`）のstorageは54.42 MiBです。storageは
   通常のheap（memlockではない）で起動時に一度だけ確保し、`validate`の`storage-bytes=`がその量です。
   最悪のRAMはstorage 64 MiB + UMEM（最大1 GiB、memlock。`auto`のcopy fallback中は2倍で2 GiB）+
   config数MiB。超過は`stage=validate code=CAPACITY_LIMIT_EXCEEDED path=<field> limit=<上限>

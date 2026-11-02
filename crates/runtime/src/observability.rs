@@ -1263,7 +1263,8 @@ impl ObservableFields for ServiceCounters {
             unsolicited_syn_hold_full, unsolicited_syn_ineligible, unsolicited_syn_cancelled,
             unsolicited_syn_superseded, unsolicited_syn_icmp_queued,
             unsolicited_syn_icmp_suppressed, unsolicited_syn_firewall_denied,
-            unsolicited_syn_index_corrupt,
+            unsolicited_syn_index_corrupt, sessions_established, sessions_closed, sessions_reset,
+            sessions_expired_opening, sessions_expired_established, sessions_expired_closing,
         }}
         visit_counts! {v, "firewall", self.firewall, FirewallCounters {
             allowed_new, allowed_established, denied_by_rule, denied_default, invalid_packets,

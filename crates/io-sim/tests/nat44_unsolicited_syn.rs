@@ -1149,3 +1149,204 @@ fn delayed_icmp_is_on_by_default_and_needs_caller_storage() {
     });
     assert_eq!(world.tcp.storage_shape().unsolicited_syn_hold_slots(), 0);
 }
+
+// N1: TCP session timers (RFC 5382 REQ-5, RFC 7857 §2) through the full
+// NAT + firewall + ICMPv4 error worker, and their interaction with B3.
+
+const ACK: u8 = 0x10;
+const SYN_ACK: u8 = 0x12;
+const FIN_ACK: u8 = 0x11;
+const RST: u8 = 0x04;
+const TRANSITORY: u64 = ruster_core::NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS;
+const ESTABLISHED: u64 = ruster_core::NAT44_TCP_DEFAULT_IDLE_TTL_MS;
+
+impl World {
+    /// `HOST:sport -> REMOTE1:443` segment at `now`, translated to WAN.
+    fn out(&mut self, sport: u16, flags: u8, now: u64) {
+        self.packet(LAN, tcp(HOST, REMOTE1, sport, 443, flags), now);
+        self.expect_tx(WAN);
+    }
+
+    /// `REMOTE1:443 -> PUBLIC:PORT` segment at `now`, translated to LAN.
+    fn inbound(&mut self, flags: u8, now: u64) {
+        self.packet(WAN, tcp(REMOTE1, PUBLIC, 443, PORT, flags), now);
+        self.expect_tx(LAN);
+    }
+
+    /// Opens `HOST:PORT <-> REMOTE1:443` with a three-way handshake at `now`.
+    fn handshake(&mut self, now: u64) {
+        self.out(PORT, SYN, now);
+        self.inbound(SYN_ACK, now);
+        self.out(PORT, ACK, now);
+        assert_eq!(
+            self.tcp.sessions()[0].phase(),
+            ruster_core::Nat44TcpSessionPhase::Established
+        );
+    }
+}
+
+/// A connection closed with FIN in both directions keeps its session (and
+/// its mapping and public port) for the closing idle timeout after its
+/// last segment, not the 2h4m established timeout: one tick before, a late
+/// segment is still translated; at the boundary the public port has no
+/// mapping and is reused by a new inside endpoint.
+#[test]
+fn a_closed_connection_frees_its_session_and_port_after_the_closing_timeout() {
+    let mut world = World::new(Setup::default());
+    world.handshake(0);
+    world.out(PORT, FIN_ACK, 1_000);
+    world.inbound(FIN_ACK, 1_100);
+    assert_eq!(world.counters().sessions_closed, 1);
+    // The last ACK, then a late retransmission one tick before expiry
+    // (each refreshes the transitory timer).
+    world.out(PORT, ACK, 1_200);
+    let last = 1_200 + TRANSITORY - 1;
+    world.inbound(FIN_ACK, last);
+    let expired = tcp(REMOTE1, PUBLIC, 443, PORT, ACK);
+    world.packet(WAN, expired.clone(), last + TRANSITORY);
+    world.expect_drop(DropReason::Nat44TcpMappingMiss, &expired);
+    // A new endpoint takes the only mapping slot and public port.
+    world.out(PORT + 1, SYN, last + TRANSITORY);
+    let counters = world.counters();
+    assert_eq!(
+        (
+            counters.mappings_expired,
+            counters.sessions_expired_closing,
+            counters.sessions_established,
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(world.tcp.mappings()[0].public_port(), PORT);
+}
+
+/// Review M1 through the full worker: an injected RST and a remote SYN on
+/// an established connection, the inside challenge ACK, the remote ACK.
+/// The connection stays on the established timer (REQ-5): after more than
+/// 240 s idle it is still translated.
+#[test]
+fn a_spoofed_rst_and_syn_do_not_downgrade_an_established_connection() {
+    let mut world = World::new(Setup::default());
+    world.handshake(0);
+    world.inbound(RST, 1_000);
+    world.inbound(SYN, 1_001);
+    world.out(PORT, ACK, 1_002);
+    world.inbound(ACK, 1_003);
+    assert_eq!(
+        world.tcp.sessions()[0].phase(),
+        ruster_core::Nat44TcpSessionPhase::Established
+    );
+    world.inbound(ACK, 1_003 + TRANSITORY + 1_000);
+    world.out(PORT, ACK, 1_003 + TRANSITORY + 1_000 + ESTABLISHED - 1);
+}
+
+/// Review L-new-2 through the full worker: after a FIN close, the remote
+/// reconnects on the same 5-tuple; the inside SYN-ACK restarts the session,
+/// which becomes established and outlives every transitory timer.
+#[test]
+fn a_remote_reconnect_after_a_fin_close_gets_the_established_timer() {
+    let mut world = World::new(Setup::default());
+    world.handshake(0);
+    world.out(PORT, FIN_ACK, 1);
+    world.inbound(FIN_ACK, 2);
+    world.out(PORT, ACK, 3);
+    world.inbound(SYN, 10);
+    world.out(PORT, SYN_ACK, 11);
+    world.inbound(ACK, 12);
+    world.out(PORT, ACK, 13);
+    assert_eq!(
+        world.tcp.sessions()[0].phase(),
+        ruster_core::Nat44TcpSessionPhase::Established
+    );
+    assert!(world.tcp.sessions()[0].is_external_inbound());
+    world.inbound(ACK, 13 + TRANSITORY + 1_000);
+}
+
+/// RFC 7857 §2.2: a RST is translated and the session kept for the closing
+/// timeout; a later non-RST segment returns it to the established phase.
+/// An injected RST therefore never ends a session earlier than the closing
+/// idle timeout, and live traffic undoes it.
+#[test]
+fn a_rst_keeps_the_session_for_the_closing_timeout_and_traffic_restores_it() {
+    let mut world = World::new(Setup::default());
+    world.handshake(0);
+    world.inbound(RST, 10_000);
+    assert_eq!(world.counters().sessions_reset, 1);
+    assert_eq!(
+        world.tcp.sessions()[0].phase(),
+        ruster_core::Nat44TcpSessionPhase::Closing
+    );
+    // Traffic within the closing timeout restores the established phase
+    // and its timer.
+    let resumed = 10_000 + TRANSITORY - 1;
+    world.out(PORT, ACK, resumed);
+    assert_eq!(world.counters().sessions_established, 2);
+    world.inbound(ACK, resumed + ESTABLISHED - 1);
+
+    // Without traffic after the RST the session ends exactly at the closing
+    // timeout, never before.
+    let mut world = World::new(Setup::default());
+    world.handshake(0);
+    world.out(PORT, RST, 10_000);
+    world.inbound(ACK | RST, 10_000 + TRANSITORY - 1);
+    let expired = tcp(REMOTE1, PUBLIC, 443, PORT, ACK);
+    world.packet(WAN, expired.clone(), 10_000 + 2 * TRANSITORY - 1);
+    world.expect_drop(DropReason::Nat44TcpMappingMiss, &expired);
+    assert_eq!(world.counters().sessions_reset, 1);
+}
+
+/// B3 interaction: a closed connection whose session expired is unsolicited
+/// again. The remote's new SYN for the old tuple is dropped, held, and
+/// answered once with ICMP Port Unreachable 6 s later (before N1 the
+/// session stayed for 2h4m and the SYN was translated).
+#[test]
+fn a_syn_after_the_closing_timeout_is_held_and_answered() {
+    let mut world = World::new(Setup::default());
+    world.handshake(0);
+    world.out(PORT, FIN_ACK, 1);
+    world.inbound(FIN_ACK, 2);
+    let at = 2 + TRANSITORY;
+    let syn = tcp(REMOTE1, PUBLIC, 443, PORT, SYN);
+    world.packet(WAN, syn.clone(), at);
+    world.expect_drop(DropReason::Nat44TcpMappingMiss, &syn);
+    assert_eq!(world.counters().unsolicited_syn_held, 1);
+    assert!(world.tick(at + HOLD - 1, 16).is_empty());
+    assert_eq!(
+        world.tick(at + HOLD, 16),
+        [(WAN, port_unreachable(REMOTE1, &syn))]
+    );
+}
+
+/// B3 interaction: a matured hold is superseded (silent) whenever the NAT
+/// would translate a retransmission of the SYN, which a live exact session
+/// in any phase, closing included, means. Address-dependent filtering:
+/// the SYN from `REMOTE1:444` misses the mapping and is held, the inside
+/// host then opens a session to `REMOTE1:443` (no cancel: another
+/// connection), the retransmitted SYN is admitted and creates the exact
+/// session, and an inside RST moves it to closing before the hold matures.
+#[test]
+fn a_hold_is_superseded_by_an_exact_session_even_in_the_closing_phase() {
+    let mut world = World::new(Setup::default());
+    let syn = tcp(REMOTE1, PUBLIC, 444, PORT, SYN);
+    world.packet(WAN, syn.clone(), 0);
+    world.expect_drop(DropReason::Nat44TcpMappingMiss, &syn);
+    assert_eq!(world.tcp.unsolicited_syn_holds(), 1);
+    world.out(PORT, SYN, 1);
+    world.packet(WAN, syn, 2);
+    world.expect_tx(LAN);
+    world.packet(LAN, tcp(HOST, REMOTE1, PORT, 444, RST), 3);
+    world.expect_tx(WAN);
+    assert!(world.tcp.sessions().iter().any(|session| {
+        session.is_occupied()
+            && session.remote_port() == 444
+            && session.phase() == ruster_core::Nat44TcpSessionPhase::Closing
+    }));
+    assert!(world.tick(HOLD, 16).is_empty());
+    let counters = world.counters();
+    assert_eq!(
+        (
+            counters.unsolicited_syn_superseded,
+            counters.unsolicited_syn_icmp_queued
+        ),
+        (1, 0)
+    );
+}

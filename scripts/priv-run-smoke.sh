@@ -361,7 +361,7 @@ write_config "$work/router-v2.toml" ra 0 router-v2
 # a cross-port forward is copied into an egress generated frame, so with
 # more of those than TX entries the 128-entry TX ring is what fills.
 write_config "$work/txfull.toml" ra 0 router-v1 256
-# H3: every runtime table at its production limit (53.42 MiB of storage),
+# H3: every runtime table at its production limit (54.42 MiB of storage),
 # without the fixture's own backend; and one more failure hold (above the
 # production 4096, within the simulator's 65536), as af-xdp and as sim.
 sed -e '/^\[backend\]$/,$d' -e 's/device = "rusternodev0"/device = "sim0"/' \
@@ -1023,7 +1023,7 @@ phase_workers
 status=0
 "$binary_path" validate "$work/production-max.toml" >"$work/validate-production-max.txt" 2>&1 || status=$?
 [ "$status" -eq 0 ] || fail "limits: validate exit status $status: $(cat "$work/validate-production-max.txt")"
-grep -q " storage-bytes=56017088 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
+grep -q " storage-bytes=57065664 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
     fail "limits: validate: $(cat "$work/validate-production-max.txt")"
 above_detail="stage=validate code=CAPACITY_LIMIT_EXCEEDED path=resolution.capacity.failure-holds limit=4096 actual=4097"
 status=0
@@ -1047,7 +1047,7 @@ signal_ruster TERM
 wait_ruster
 [ "$status" -eq 0 ] || fail "limits: exit status $status after SIGTERM"
 assert_detached "the limits phase"
-echo "priv_run_limits: every table at its production limit (storage 56017088 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
+echo "priv_run_limits: every table at its production limit (storage 57065664 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
 
 # ops: SIGHUP reload, a refused restart-required reload, and link down/up,
 # all on one running router (M2 S10b).

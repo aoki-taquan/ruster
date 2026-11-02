@@ -4499,14 +4499,14 @@ fn decide_nat44_tcp_outbound<T: TraceSink>(
     {
         return nat44_tcp_drop(ingress, Nat44TcpReverseAuthorityMismatch, trace);
     }
-    let initial_syn = tcp.flags & 0x17 == 0x02;
+    let segment = crate::nat44_tcp_state::Nat44TcpSegment::from_flags(tcp.flags);
     let planned = if read_only_plan {
         runtime.plan_outbound_read_only(
             ipv4.source,
             tcp.source_port,
             ipv4.destination,
             tcp.destination_port,
-            initial_syn,
+            segment,
             now.0,
         )
     } else {
@@ -4515,7 +4515,7 @@ fn decide_nat44_tcp_outbound<T: TraceSink>(
             tcp.source_port,
             ipv4.destination,
             tcp.destination_port,
-            initial_syn,
+            segment,
             now.0,
         )
     };
@@ -4597,13 +4597,13 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
     // Same initial-SYN predicate as outbound: SYN=1 with ACK/RST/FIN=0.
     // Only such a packet may initiate a session through the NAT filter; a
     // bound firewall still plans the translated packet below.
-    let initial_syn = tcp.flags & 0x17 == 0x02;
+    let segment = crate::nat44_tcp_state::Nat44TcpSegment::from_flags(tcp.flags);
     let planned = if firewall_config.is_some() {
         runtime.plan_inbound_read_only(
             tcp.destination_port,
             ipv4.source,
             tcp.source_port,
-            initial_syn,
+            segment,
             now.0,
         )
     } else {
@@ -4611,7 +4611,7 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
             tcp.destination_port,
             ipv4.source,
             tcp.source_port,
-            initial_syn,
+            segment,
             now.0,
         )
     };
@@ -4631,7 +4631,7 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
             // RFC 5382 REQ-4: the unsolicited SYN is dropped silently now;
             // a copy may be held for a delayed ICMP Port Unreachable. Only a
             // worker with a clock (a resolution runtime) can time a hold.
-            if initial_syn
+            if segment.is_initial_syn()
                 && resolution.is_some()
                 && matches!(
                     error,

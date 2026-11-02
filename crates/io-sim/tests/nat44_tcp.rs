@@ -6,6 +6,7 @@ use ruster_core::{
     Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot,
     Nat44UdpPeerSlot, Nat44UdpPolicy, Neighbor, NoTrace, ResolutionActionSlot, ResolutionPolicy,
     ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent, NAT44_TCP_DEFAULT_IDLE_TTL_MS,
+    NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 use support::UdpTestIndexes;
@@ -1000,6 +1001,46 @@ fn exact_idle_boundary_bidirectional_refresh_and_unmatched_no_refresh() {
     )
     .unwrap();
     io.pop_tx();
+    // Complete the handshake (SYN-ACK in, ACK out) so the session is
+    // established and the established idle TTL applies (N1).
+    for (ingress, frame) in [
+        (
+            WAN,
+            tcp_frame(
+                REMOTE1,
+                PUBLIC,
+                443,
+                40_000,
+                64,
+                0x4000,
+                0x12,
+                &[],
+                &[],
+                &[],
+            ),
+        ),
+        (
+            LAN,
+            tcp_frame(HOST, REMOTE1, 40_000, 443, 64, 0x4000, 0x10, &[], &[], &[]),
+        ),
+    ] {
+        io.inject(ingress, frame);
+        io.run_nat44_tcp_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(&mut nat),
+            MonotonicMillis(0),
+            &mut NoTrace,
+        )
+        .unwrap();
+        assert!(io.pop_tx().is_some());
+    }
+    assert_eq!(
+        nat.sessions()[0].phase(),
+        ruster_core::Nat44TcpSessionPhase::Established
+    );
     let miss = tcp_frame(
         REMOTE2,
         PUBLIC,
@@ -1225,7 +1266,8 @@ fn backend_reject_retains_tx_requested_mapping_and_session() {
         &mut resolution,
         &config,
         Some(&mut nat),
-        MonotonicMillis(refresh_ms + NAT44_TCP_DEFAULT_IDLE_TTL_MS - 1),
+        // The session saw only SYN and ACK outbound: still opening (N1).
+        MonotonicMillis(refresh_ms + NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS - 1),
         &mut NoTrace,
     )
     .unwrap();

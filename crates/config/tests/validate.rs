@@ -1152,6 +1152,92 @@ fn nat44_tcp_inbound_sessions_per_remote_maps_onto_the_core_policy() {
     }
 }
 
+/// N1: the opening and closing idle timeouts map onto the core policy,
+/// default to the RFC 5382 REQ-5 transitory floor, and are refused below it
+/// or above the established timeout with a typed, value-free error at the
+/// key's path. Storage does not depend on them.
+#[test]
+fn nat44_tcp_transitory_idle_ttls_map_onto_the_core_policy() {
+    use ruster_core::{
+        Nat44TcpPolicyError, Nat44TcpSessionPhase, NAT44_TCP_MIN_TRANSITORY_IDLE_TTL_MS,
+    };
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    let with = |key: &str, value: u64| VALID.replacen(TCP, &format!("{TCP}{key} = {value}\n"), 1);
+
+    let defaults = validated(VALID);
+    let policy = defaults.nat44().unwrap().tcp().unwrap().policy();
+    assert_eq!(policy.opening_idle_ttl_ms(), 240_000);
+    assert_eq!(policy.closing_idle_ttl_ms(), 240_000);
+    assert_eq!(
+        policy.session_idle_ttl_ms(Nat44TcpSessionPhase::Established),
+        policy.idle_ttl_ms()
+    );
+    let established = policy.idle_ttl_ms();
+    for key in ["opening-idle-ttl-ms", "closing-idle-ttl-ms"] {
+        for value in [NAT44_TCP_MIN_TRANSITORY_IDLE_TTL_MS, 300_000, established] {
+            let config = validated(&with(key, value));
+            let policy = config.nat44().unwrap().tcp().unwrap().policy();
+            let (set, other) = if key.starts_with("opening") {
+                (policy.opening_idle_ttl_ms(), policy.closing_idle_ttl_ms())
+            } else {
+                (policy.closing_idle_ttl_ms(), policy.opening_idle_ttl_ms())
+            };
+            assert_eq!((set, other), (value, 240_000), "{key}");
+            assert_eq!(config.storage_shape(), defaults.storage_shape());
+        }
+        for (value, refusal) in [
+            (0, Nat44TcpPolicyError::TransitoryIdleTtlTooShort),
+            (
+                NAT44_TCP_MIN_TRANSITORY_IDLE_TTL_MS - 1,
+                Nat44TcpPolicyError::TransitoryIdleTtlTooShort,
+            ),
+            (
+                established + 1,
+                Nat44TcpPolicyError::TransitoryIdleTtlAboveEstablished,
+            ),
+            (
+                i64::MAX as u64,
+                Nat44TcpPolicyError::TransitoryIdleTtlAboveEstablished,
+            ),
+        ] {
+            let error = error(&with(key, value));
+            assert_eq!(
+                error.code(),
+                ValidationCode::Nat44TcpPolicy(refusal),
+                "{key}"
+            );
+            assert_eq!(error.code().code(), "NAT44_TCP_POLICY");
+            assert_eq!(
+                error.path().segments(),
+                &[
+                    PathSegment::Field("nat44".to_owned()),
+                    PathSegment::Field("tcp".to_owned()),
+                    PathSegment::Field(key.to_owned()),
+                ]
+            );
+        }
+    }
+}
+
+/// N1: `inbound-rst` maps onto the core policy and does not change storage.
+#[test]
+fn nat44_tcp_inbound_rst_maps_onto_the_core_policy() {
+    use ruster_core::Nat44TcpInboundRst;
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    let defaults = validated(VALID);
+    let policy = defaults.nat44().unwrap().tcp().unwrap().policy();
+    assert_eq!(policy.inbound_rst(), Nat44TcpInboundRst::Closing);
+    let strict =
+        validated(&VALID.replacen(TCP, &format!("{TCP}inbound-rst = \"corroborate\"\n"), 1));
+    let strict_policy = strict.nat44().unwrap().tcp().unwrap().policy();
+    assert_eq!(strict_policy.inbound_rst(), Nat44TcpInboundRst::Corroborate);
+    assert_eq!(
+        strict_policy.with_inbound_rst(Nat44TcpInboundRst::Closing),
+        policy
+    );
+    assert_eq!(strict.storage_shape(), defaults.storage_shape());
+}
+
 /// `[arp]` maps onto the core ARP policy: absent or empty is RFC 826 (no
 /// on-link condition on the sender), `require-on-link-sender = true` opts
 /// into ARP-031.

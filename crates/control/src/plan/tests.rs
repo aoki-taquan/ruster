@@ -418,6 +418,64 @@ fn tcp_inbound_limit_is_a_reloadable_typed_delta_separate_from_the_policy_flag()
     assert!(both.restart_required().is_empty());
 }
 
+/// N1: the opening and closing idle timeouts are TCP policy, like the
+/// established `idle-ttl-ms`: a change is reloadable (no storage shape
+/// change, so no restart reason) and raises only the opaque policy flag;
+/// apply flushes the NAT state as for every policy change.
+#[test]
+fn tcp_transitory_idle_ttls_are_reloadable_policy_changes() {
+    const TCP: &str = "allocator-seed = \"11\"\n";
+    // Spelling out the defaults is no change.
+    only(
+        &plan(&[(
+            TCP,
+            "allocator-seed = \"11\"\nopening-idle-ttl-ms = 240000\nclosing-idle-ttl-ms = 240000\n",
+        )]),
+        &[],
+    );
+    for key in ["opening-idle-ttl-ms", "closing-idle-ttl-ms"] {
+        let change = format!("allocator-seed = \"11\"\n{key} = 300000\n");
+        let tcp = plan(&[(TCP, change.as_str())]);
+        only(&tcp, &["nat44_tcp"]);
+        assert!(tcp.nat44_tcp().policy_changed, "{key}");
+        assert_eq!(tcp.nat44_tcp().filtering, None);
+        assert_eq!(tcp.nat44_tcp().inbound_sessions_per_remote, None);
+        assert!(tcp.restart_required().is_empty(), "{key}");
+        assert!(!tcp.nat44_udp().policy_changed);
+        assert_eq!(
+            config(&[]).storage_shape(),
+            config(&[(TCP, change.as_str())]).storage_shape()
+        );
+    }
+}
+
+/// N1: `inbound-rst` is a reloadable typed TCP delta outside the opaque
+/// policy flag; spelling out the default is no change.
+#[test]
+fn tcp_inbound_rst_is_a_reloadable_typed_delta() {
+    use ruster_core::Nat44TcpInboundRst;
+    const TCP: &str = "allocator-seed = \"11\"\n";
+    only(
+        &plan(&[(TCP, "allocator-seed = \"11\"\ninbound-rst = \"closing\"\n")]),
+        &[],
+    );
+    let strict = plan(&[(
+        TCP,
+        "allocator-seed = \"11\"\ninbound-rst = \"corroborate\"\n",
+    )]);
+    only(&strict, &["nat44_tcp"]);
+    assert_eq!(
+        strict.nat44_tcp().inbound_rst,
+        Some(Delta {
+            old: Nat44TcpInboundRst::Closing,
+            new: Nat44TcpInboundRst::Corroborate
+        })
+    );
+    assert!(!strict.nat44_tcp().policy_changed);
+    assert!(strict.restart_required().is_empty());
+    assert_eq!(strict.nat44_udp().inbound_rst, None);
+}
+
 /// B3: the RFC 5382 REQ-4 switch is a reloadable typed TCP delta outside
 /// the opaque policy flag; the hold capacity is storage shape.
 #[test]
