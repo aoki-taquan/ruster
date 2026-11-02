@@ -46,7 +46,7 @@ pub const NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS: u64 = NAT44_TCP_MIN_TRANSITO
 pub const NAT44_TCP_INBOUND_SLOT_PROBES: usize = 16;
 /// Default limit on live TCP sessions that external inbound initial SYNs
 /// created on one mapping from one remote IPv4 address: `0`, no limit (the
-/// RFC baseline, kept pending an owner decision, NAT44-081). A closed or
+/// RFC baseline, kept pending an owner decision, NAT44-086). A closed or
 /// reset connection keeps its session, and its quota, for the closing idle
 /// timeout (default 4 minutes), and a SYN the remote never completes for
 /// the opening idle timeout. Operators who admit new inbound flows can opt
@@ -7177,8 +7177,10 @@ impl Nat44TcpReconcilePermit<'_, '_> {
 /// Fixed-capacity, worker-local outbound-initiated TCP NAPT state.
 ///
 /// This intentionally models exact remote endpoint sessions, not TCP sequence
-/// or window state. FIN and RST are translated like any other packet and do
-/// not shorten the conservative idle lifetime.
+/// or window state. Each session follows the SYN, ACK, FIN, and RST flags it
+/// translates (RFC 7857 §2) and uses the idle TTL of its RFC 5382 §5 phase
+/// ([`Nat44TcpSessionPhase`]); a RST moves a session to the closing TTL and
+/// never removes it at once (RFC 7857 §2.2).
 ///
 /// Every per-packet search is bounded (PERF-001): a new mapping, session, or
 /// public port is found in O(1) from activity-ordered intrusive lists (the

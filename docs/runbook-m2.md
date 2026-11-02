@@ -60,7 +60,7 @@ All commands assume a dedicated router host or network namespace. Replace
   limit-bytes=L required-bytes=R`). Root has `CAP_IPC_LOCK`. The estimate is
   a lower bound (section 12).
 - **Memory (RAM)**: the runtime tables are ordinary heap, not memlocked;
-  53.42 MiB for the largest config `ruster run` accepts (64 MiB bound),
+  54.42 MiB for the largest config `ruster run` accepts (64 MiB bound),
   plus the UMEM (see "Validation limits and memory" below).
 - **Dedicated network namespace (recommended)**: run the router in its own
   namespace (`ip netns exec <ns> ruster run ...`) that holds only the port
@@ -209,7 +209,7 @@ whole-document storage, which has no path.
 |---|---|---|---|
 | quote tables (`max_quote_slots_per_table`): `resolution.capacity.failure-holds`, `icmpv4-errors.capacity.actions`, `nat44.tcp.capacity.unsolicited-syn-holds` | 65536 | 4096 | each slot holds a quoted datagram (656, 584, and 592 bytes), so the bound is memory: at 65536 these three alone would need 114.5 MiB. Until H4b this limit (then `max_scanned_slots_per_table`) covered every resolution and ICMPv4 error table because their packet paths scanned |
 | other tables (`max_slots_per_table`): `resolution.capacity.{states,actions,dynamic-neighbors}`, `icmpv4-errors.capacity.states`, `nat44.{udp,tcp}.capacity.*`, `firewall.capacity.states`, each NAT44 directory (next power of two), the NAT44 port owner table (pool size) | 65536 | 65536 | no packet path scans them (table below); home NAT needs many sessions; also the largest port pool (1-65535) |
-| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 53.42 MiB, so the per-table limits bind; the byte limit fails closed only if a slot type grows |
+| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 54.42 MiB, so the per-table limits bind; the byte limit fails closed only if a slot type grows |
 | config file | 1 MiB | 1 MiB | parse stage, every backend (CONFIG-001) |
 | `[[interfaces]]` / `[[backend.ports]]` | 256 / 256 | 256 / 256 | parse stage |
 | `[[addresses]]` | 1024 | 1024 | parse stage |
@@ -247,7 +247,7 @@ reload path.
 | resolution `actions` (56 B) | FIFO list; a state removes its own queued action in O(1) | O(1) | — | like `states` |
 | ICMPv4 error `states` (24 B) | every generated error (TTL expiry, unreachable) | only the occupied states, which are a prefix of the table and at most two per egress interface in use (one per limiter class: Port Unreachable has its own) | — | at least the number of interfaces plus one (the WAN's Port Unreachable class; `validate` requires it while delayed Port Unreachable is on) |
 | ICMPv4 error `actions` (584 B) | O(1) ring; one per state | O(1) | — | like `states` (one queued error per state; fewer only means `action_full` refusals while the queue is full) |
-| NAT44 `mappings`/`peers`/`sessions` (64/48/64 B + directories) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (the least recently refreshed, so the first to expire) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
+| NAT44 `mappings`/`peers`/`sessions` (UDP 64/48 B, TCP 80/64 B + directories) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (one list per TTL, so its head is the first to expire; TCP since N1 has one session list per phase and two mapping lists) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
 | `nat44.tcp.capacity.unsolicited-syn-holds` (592 B) | an unsolicited inbound TCP SYN (no mapping for its public port, or refused by the filtering) is held for the RFC 5382 REQ-4 delayed ICMP Port Unreachable; a translated outbound SYN cancels the hold of its connection | one keyed chain of at most 16 holds (`NAT44_TCP_SYN_HOLD_CHAIN_LIMIT`, secret NAT key) plus O(1) list heads; a full table or chain drops silently. Matured holds are taken in deadline order by the failure-dispatch phase, at most `tick.failure-dispatch-scans` per tick (the same budget value as the resolution failure dispatch, applied separately, so the phase does up to twice that), never scanning unmatured ones; each matured hold walks the firewall rules once. An inconsistent table is flushed (`unsolicited_syn_index_corrupt`) | — | default 64. The Port Unreachable limiter sends at most 1 per second per egress by default, so a bigger table does not send more ICMP; it only holds more SYNs that the limiter will refuse. 0 frees the 37 KiB when the switch is off |
 | `firewall.capacity.states` (56 B) | keyed SipHash probe with occupancy capped near 75% (`usable_state_capacity`), so a full table cannot occur; only the amortized expiry sweep (`reclaim_one_expired`) is linear | — (amortized) | — | the expected concurrent flows |
 
@@ -298,7 +298,7 @@ attacker must first fill the table, one packet per entry.
 | `icmpv4-errors.capacity.actions` (holds a quoted datagram) | 584 | 2.28 MiB (4096) |
 | `nat44.udp.capacity.mappings` | 64 + 28 directory | 5.75 MiB (65536) |
 | `nat44.udp.capacity.peers` | 48 + 28 directory | 4.75 MiB (65536) |
-| `nat44.tcp.capacity.mappings` | 64 + 28 directory | 5.75 MiB (65536) |
+| `nat44.tcp.capacity.mappings` | 80 + 28 directory | 6.75 MiB (65536) |
 | `nat44.tcp.capacity.sessions` | 64 + 2 x 28 directories | 7.5 MiB (65536) |
 | `nat44.tcp.capacity.unsolicited-syn-holds` (holds a quoted datagram) | 592 | 2.31 MiB (4096) |
 | NAT44 port owners (`nat44.realm.ports`, per pool port, UDP and TCP each) | 32, plus a free-port bitmap of 8 bytes per 64 ports and per 4096 ports | 2 MiB + 8320 bytes per protocol |
@@ -308,7 +308,9 @@ A directory has one 4-byte bucket per slot, rounded up to a power of two,
 and one 24-byte node per slot (exact for the powers of two above). `ruster
 validate` prints the total as `storage-bytes=`. The largest config that
 `run` accepts (`fixtures/limits/router-production-max.toml`) needs
-56017088 bytes (53.42 MiB). B3 added the 4096 unsolicited-SYN holds
+57065664 bytes (54.42 MiB). N1 grew the TCP NAT mapping slot from 64 to 80
+bytes (established-session count and expiry, 1 MiB at the limit; 56017088
+bytes, 53.42 MiB, before). B3 added the 4096 unsolicited-SYN holds
 (2.31 MiB; 53592256 bytes, 51.11 MiB, before). H4a added 16 bytes per NAT44 mapping and
 session slot (reuse-list links, 48 to 64 bytes with the 16-byte alignment)
 and the free-port bitmaps: 3 MiB more at the limits. H4b added the
@@ -320,7 +322,7 @@ raised states, actions, dynamic neighbors, and ICMPv4 error states to
 
 Worst-case resident memory of `ruster run`:
 
-- Runtime storage: at most 64 MiB (53.42 MiB with today's slot sizes).
+- Runtime storage: at most 64 MiB (54.42 MiB with today's slot sizes).
   It is allocated once at startup, before the privilege preflight, and
   filled, so it is resident from the start. If the allocation fails,
   startup reports `stage=storage code=ALLOCATION.<service>` and exits 1.
@@ -1030,6 +1032,42 @@ while one to an unmapped port gets Port Unreachable. Port scans can then
 tell which public ports are in use about as well as forwarding already
 shows. If scans should see only silence, set `unsolicited-syn-icmp = false`,
 which removes this remaining oracle.
+
+TCP NAT session timers (N1, RFC 5382 REQ-5, RFC 7857 section 2). Each TCP
+session follows the SYN, ACK, FIN, and RST flags it translates and uses the
+idle timeout of its phase:
+
+| phase | when | timeout (key, default) |
+|---|---|---|
+| opening | SYN and ACK not yet seen in both directions (also an external SYN the remote never completes) | `[nat44.tcp] opening-idle-ttl-ms`, 240000 (4 min) |
+| established | SYN and ACK seen both ways; a FIN in one direction keeps it here | `[nat44.tcp] idle-ttl-ms`, 7440000 (2 h 4 min) |
+| closing | FIN seen both ways, or the last segment was a RST | `[nat44.tcp] closing-idle-ttl-ms`, 240000 (4 min) |
+
+Every translated segment restarts the timer of the session's phase. A RST
+never removes a session: it is translated and the session moves to the
+closing timeout; any later non-RST segment moves it back (RFC 7857 section
+2.2). An injected RST therefore cannot end a session sooner than the closing
+timeout, and live traffic undoes it. The router does not track TCP sequence
+numbers, so it accepts any RST that matches the exact connection (address
+and port pair). A mapping, with its public port, lives as long as its
+latest session: the established timeout while it has an established
+session, otherwise the longer transitory timeout after its last segment.
+After a clean close the port and the session slot are therefore free again
+after 4 minutes instead of 2 h 4 min.
+
+`validate` refuses an opening or closing timeout below 240000 (the RFC
+floor) or above `idle-ttl-ms` as `stage=validate code=NAT44_TCP_POLICY
+path=nat44.tcp.opening-idle-ttl-ms` (or `closing-idle-ttl-ms`). Like
+`idle-ttl-ms`, a change is reloadable (`plan` shows `nat44-tcp policy ~
+changed`) and the apply flushes the NAT state, so established TCP through
+the NAT breaks at that reload.
+
+Watch `nat44_tcp.sessions_established`, `sessions_closed` (FIN both ways),
+`sessions_reset` (RSTs that moved a session to the closing timeout), and
+`sessions_expired_opening`, `_established`, `_closing` (expired sessions
+reclaimed, by the timeout that ended them; they sum to `sessions_expired`).
+Many `sessions_expired_opening` with few `sessions_established` point to
+SYNs nobody completes, such as a scan or a spoofed SYN flood.
 
 ## 12. Known limits
 
