@@ -81,6 +81,9 @@ pub const NAT44_DEFAULT_MAPPINGS_PER_HOST: u16 = 0;
 /// (SHOULD) but sets no value; see [`Nat44UdpPolicy::with_peers_per_host`]
 /// and [`Nat44TcpPolicy::with_sessions_per_host`].
 pub const NAT44_DEFAULT_STATE_PER_HOST: u16 = 0;
+// A TCP session's host-driven expiry offset is a `u32` of milliseconds
+// (N6); a saturated offset reads as expired only if every TTL is below it.
+const _: () = assert!(NAT44_TCP_MAX_IDLE_TTL_MS < u32::MAX as u64);
 const _: () =
     assert!(NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE as usize == NAT44_TCP_INBOUND_SLOT_PROBES);
 const UDP_INDEX_NONE: u32 = u32::MAX;
@@ -2127,6 +2130,7 @@ mod tcp_tests {
                 remote_port: 443,
                 last_activity_ms: 3,
                 external_inbound: false,
+                host_initiated: true,
                 state: 0,
                 links: SlotLinks::UNLINKED,
             };
@@ -3103,7 +3107,13 @@ impl Nat44UdpPolicy {
     /// mappings is refused fail closed (`NAT44_UDP_HOST_PEER_QUOTA_EXCEEDED`,
     /// also for the new mapping that would carry it) without evicting
     /// anything. Peers live and die with their mapping, which only outbound
-    /// packets refresh, so no remote can keep a host at its limit. When the
+    /// packets refresh, so a remote cannot keep a host's peers counting
+    /// once the host stops sending. Every peer the host's own outbound
+    /// packets create counts, including answers to remotes that reached it
+    /// first: under [`Nat44Filtering::EndpointIndependent`] a host that runs
+    /// a UDP responder can have its budget spent by remotes (or spoofed
+    /// sources) it answers, so do not combine endpoint-independent filtering
+    /// with this limit for such hosts (NAT44-125). When the
     /// address holds `limit` peers and its least recently used counted
     /// mapping has expired, that mapping's (dead) peers stop counting and
     /// the new peer is admitted, so a host recovers as soon as one of its
@@ -5584,8 +5594,9 @@ impl<'a> Nat44UdpRuntime<'a> {
         self.release_peers(peers);
         self.mappings[index].link.peers = PeerChain::EMPTY;
         self.move_mapping(index, UdpMappingList::Parked);
-        // Its host's list 1 holds the parked mappings (N6); it is already
-        // there if its peers stopped counting at the host's peer limit.
+        // A parked mapping's peers no longer count toward its host (N6): it
+        // joins the host's uncounted prefix, unless its peers already
+        // stopped counting at the host's peer limit.
         self.uncount_host_peers(index);
     }
 
@@ -6879,7 +6890,11 @@ impl Nat44TcpPolicy {
     /// address holds `limit` sessions and one is past that expiry, that
     /// session stops counting (it is not ended; only remotes can still keep
     /// it alive) and the new one is admitted, so a host recovers as soon as
-    /// it stops driving one of its sessions, in O(1). The default `0` is no
+    /// it stops driving one of its sessions, in O(1). A session that stopped
+    /// counting counts again with the host's next host-driven segment on it,
+    /// within the limit like a new session (refused while every counted
+    /// session is still driven), and a session the remote restarts after a
+    /// FIN close stops counting. The default `0` is no
     /// limit (RFC 6888 asks only that a limit be supported). A nonzero
     /// limit needs per-session host storage
     /// ([`Nat44TcpIndexStorage::with_session_hosts`]); the runtime refuses
@@ -7239,6 +7254,11 @@ pub struct Nat44TcpSessionSlot {
     /// Created by an external (non-hairpin) inbound initial SYN; counted
     /// against the per-remote inbound session limit while live.
     external_inbound: bool,
+    /// Opened by the inside host: created by an outbound initial SYN, or
+    /// restarted by one after a FIN close (N6). Only such a session counts
+    /// toward its host's session limit; a restart the remote initiates
+    /// clears it.
+    host_initiated: bool,
     /// TCP flags seen per direction (`nat44_tcp_state`); selects the phase
     /// and with it the idle TTL and the activity list.
     state: u8,
@@ -7277,6 +7297,7 @@ impl Default for Nat44TcpSessionSlot {
             remote_port: 0,
             last_activity_ms: 0,
             external_inbound: false,
+            host_initiated: false,
             state: 0,
             links: SlotLinks::UNLINKED,
         }
@@ -7311,6 +7332,14 @@ impl Nat44TcpSessionSlot {
         self.external_inbound
     }
 
+    /// Whether the inside host opened this session (an outbound initial
+    /// SYN created or restarted it), so it counts toward the host's
+    /// session limit while the host keeps it alive (N6).
+    #[must_use]
+    pub const fn is_host_initiated(self) -> bool {
+        self.host_initiated
+    }
+
     /// The RFC 5382 §5 phase of the session's connection, which selects its
     /// idle TTL ([`Nat44TcpPolicy::session_idle_ttl_ms`]).
     #[must_use]
@@ -7336,6 +7365,7 @@ impl Nat44TcpSessionSlot {
             remote_port,
             last_activity_ms: 0,
             external_inbound,
+            host_initiated: false,
             state: 0,
             links: SlotLinks::UNLINKED,
         }
@@ -7527,6 +7557,11 @@ pub(crate) struct Nat44TcpOutboundPlan {
     /// counting so this plan's new session fits the per-host session limit
     /// (N6), or `TCP_INDEX_NONE`.
     host_session_reclaim: u32,
+    /// The plan's existing session is one the host initiated that does not
+    /// count (it stopped counting past its host-driven expiry, or a restart
+    /// made it host-initiated) and this host-driven segment counts it again
+    /// (N6), within the limit like a new session.
+    session_recount: bool,
     prepared: PreparedNat44TcpOutboundCommit,
 }
 
@@ -8450,8 +8485,11 @@ impl<'a> Nat44TcpRuntime<'a> {
     /// The reference time and list of counted session `index` (N6): its
     /// host-driven expiry is `reference + session_host_ttl_ms(list)`. The
     /// link stores the reference as an offset below the session's last
-    /// activity (saturated, which can only make an already long expired
-    /// expiry earlier still).
+    /// activity. A saturated offset (more than `u32::MAX` ms) makes the
+    /// computed expiry later than the true one, but it is still before the
+    /// session's last activity, because every TTL is below `u32::MAX` ms,
+    /// so the session reads as past its host-driven expiry either way; the
+    /// list order is by insertion and unaffected.
     fn session_host_reference(&self, index: usize) -> Option<(u64, usize)> {
         let list = self.session_hosts.mapping_list(index)?;
         let reference = self.sessions[index]
@@ -8491,6 +8529,17 @@ impl<'a> Nat44TcpRuntime<'a> {
     /// is past its host-driven expiry too. Every change sets it to `now`
     /// plus the timeout of the list it moves to, so each list stays in
     /// expiry order.
+    /// Whether `direction`'s segment that left the session as `session`
+    /// is host-driven (N3, N6): the host sent it, it does not leave the
+    /// session closing, and the session is one the host opened (not
+    /// externally created) or is established.
+    fn segment_is_host_driven(session: Nat44TcpSessionSlot, direction: Nat44TcpDirection) -> bool {
+        let phase = session.phase();
+        direction == Nat44TcpDirection::Outbound
+            && phase != Nat44TcpSessionPhase::Closing
+            && (!session.external_inbound || phase == Nat44TcpSessionPhase::Established)
+    }
+
     fn next_session_host_reference(
         &self,
         before: Option<(u64, usize)>,
@@ -8501,9 +8550,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         let policy = self.config.policy;
         let phase = session.phase();
         let established = phase == Nat44TcpSessionPhase::Established;
-        let host_driven = direction == Nat44TcpDirection::Outbound
-            && phase != Nat44TcpSessionPhase::Closing
-            && (!session.external_inbound || established);
+        let host_driven = Self::segment_is_host_driven(session, direction);
         let driven_list =
             if established && session.state & crate::nat44_tcp_state::STATE_FIN_OUT == 0 {
                 Nat44TcpSessionPhase::Established.index()
@@ -8530,8 +8577,10 @@ impl<'a> Nat44TcpRuntime<'a> {
     /// Commit-time per-host session accounting of one session slot write
     /// (N6), before the slot is overwritten: a created session ends the
     /// count of the slot's previous session and, when `counted` names its
-    /// internal address and planned host slot, counts toward that host; a
-    /// counted session's host-driven expiry follows the segment. O(1).
+    /// internal address and planned host slot, counts toward that host; an
+    /// existing session stops counting when it is no longer host-initiated,
+    /// starts counting again when `counted` is given (a planned recount),
+    /// and a counted one's host-driven expiry follows the segment. O(1).
     fn commit_session_host(
         &mut self,
         index: usize,
@@ -8544,7 +8593,8 @@ impl<'a> Nat44TcpRuntime<'a> {
         if !self.session_hosts.enabled() {
             return;
         }
-        let lag = |reference: u64| u32::try_from(now_ms - reference).unwrap_or(u32::MAX);
+        let lag =
+            |reference: u64| u32::try_from(now_ms.saturating_sub(reference)).unwrap_or(u32::MAX);
         if created {
             self.session_hosts.detach(index);
             if let Some((address, assignment)) = counted {
@@ -8556,7 +8606,22 @@ impl<'a> Nat44TcpRuntime<'a> {
             }
             return;
         }
+        // A restart the remote initiated (the host answered with a SYN-ACK)
+        // is not the host's session: it stops counting.
+        if !session.host_initiated {
+            self.session_hosts.detach(index);
+            return;
+        }
         let Some(before) = self.session_host_reference(index) else {
+            // An uncounted host-initiated session the planned host-driven
+            // segment counts again.
+            if let Some((address, assignment)) = counted {
+                let (reference, list) =
+                    self.next_session_host_reference(None, session, direction, now_ms);
+                self.session_hosts
+                    .attach_new(index, assignment, address, list);
+                self.session_hosts.set_word(index, lag(reference));
+            }
             return;
         };
         let after = self.next_session_host_reference(Some(before), session, direction, now_ms);
@@ -8730,6 +8795,20 @@ impl<'a> Nat44TcpRuntime<'a> {
                     false,
                     now_ms,
                 )?;
+                // A host-initiated session that no longer counts is counted
+                // again by the host's next host-driven segment, within the
+                // limit like a new session (N6): otherwise a host could let
+                // sessions pass their host-driven expiry, open new ones in
+                // their place, and then resume the old ones uncounted.
+                let session_recount = self.session_hosts.enabled()
+                    && session.host_initiated
+                    && Self::segment_is_host_driven(session, Nat44TcpDirection::Outbound)
+                    && self.session_hosts.mapping_host(session_index).is_none();
+                let host_session_reclaim = if session_recount {
+                    self.host_session_reclaim(internal_address, now_ms)?
+                } else {
+                    None
+                };
                 return self.prepare_outbound_plan(
                     Nat44TcpOutboundPlan {
                         authority: self.plan_authority(now_ms, mapping_before, session_before),
@@ -8742,7 +8821,8 @@ impl<'a> Nat44TcpRuntime<'a> {
                         session_created: false,
                         session_expired: false,
                         displaced_port_mapping_index: TCP_INDEX_NONE,
-                        host_session_reclaim: TCP_INDEX_NONE,
+                        host_session_reclaim: encode_optional_udp_index(host_session_reclaim),
+                        session_recount,
                         prepared: PreparedNat44TcpOutboundCommit::EMPTY,
                     },
                     None,
@@ -8768,6 +8848,7 @@ impl<'a> Nat44TcpRuntime<'a> {
                 remote_port,
                 false,
             );
+            session.host_initiated = true;
             self.stamp_session(
                 &mut mapping,
                 &mut session,
@@ -8789,6 +8870,7 @@ impl<'a> Nat44TcpRuntime<'a> {
                     session_expired,
                     displaced_port_mapping_index: TCP_INDEX_NONE,
                     host_session_reclaim: encode_optional_udp_index(host_session_reclaim),
+                    session_recount: false,
                     prepared: PreparedNat44TcpOutboundCommit::EMPTY,
                 },
                 None,
@@ -8889,6 +8971,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             remote_port,
             false,
         );
+        session.host_initiated = true;
         // A new generation starts with no established session; one the
         // reused session slot held belongs to another mapping (or to the
         // previous generation of this slot) and is released by the commit.
@@ -8915,6 +8998,7 @@ impl<'a> Nat44TcpRuntime<'a> {
                     port.displaced_mapping_index,
                 ),
                 host_session_reclaim: encode_optional_udp_index(host_session_reclaim),
+                session_recount: false,
                 prepared: PreparedNat44TcpOutboundCommit::EMPTY,
             },
             port.expected_owner,
@@ -9430,10 +9514,15 @@ impl<'a> Nat44TcpRuntime<'a> {
         if !plan.host_session_reclaim().is_none_or(|index| {
             self.session_hosts.mapping_host(index).is_some()
                 && !self.session_is_host_live(index, now_ms)
-        }) || (plan.session_created
+        }) || ((plan.session_created || plan.session_recount)
             && self
                 .session_host_assignment(plan.session_index(), plan.mapping.internal_address)
                 .is_err())
+            || (plan.session_recount
+                && self
+                    .session_hosts
+                    .mapping_host(plan.session_index())
+                    .is_some())
         {
             return Err(Nat44TcpCommitError::StalePlan);
         }
@@ -9485,7 +9574,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         } else {
             None
         };
-        let session_host_assignment = if plan.session_created {
+        let session_host_assignment = if plan.session_created || plan.session_recount {
             self.session_host_assignment(plan.session_index(), plan.mapping.internal_address)
                 .expect("prevalidated session host assignment")
         } else {
@@ -9527,7 +9616,8 @@ impl<'a> Nat44TcpRuntime<'a> {
             plan.session_index(),
             plan.session,
             plan.session_created,
-            Some((plan.mapping.internal_address, session_host_assignment)),
+            (plan.session_created || plan.session_recount)
+                .then_some((plan.mapping.internal_address, session_host_assignment)),
             Nat44TcpDirection::Outbound,
             now_ms,
         );
@@ -9932,10 +10022,19 @@ impl<'a> Nat44TcpRuntime<'a> {
         let was_established = session.phase() == Nat44TcpSessionPhase::Established;
         let transition = next_state(session.state, segment, direction, policy.inbound_rst);
         session.state = transition.state;
+        // A restart after a FIN close by the host's initial SYN is a session
+        // the host initiated; one the remote opens (the host answers with a
+        // SYN-ACK) is not, and stops counting toward the host's session
+        // limit in the commit (N6). New outbound sessions are marked by
+        // the plan.
         match transition.restart {
-            Some(Nat44TcpDirection::Outbound) => session.external_inbound = false,
+            Some(Nat44TcpDirection::Outbound) => {
+                session.external_inbound = false;
+                session.host_initiated = true;
+            }
             Some(Nat44TcpDirection::Inbound) => {
                 session.external_inbound = session.remote_address != self.config.public_address;
+                session.host_initiated = false;
             }
             None => {}
         }
@@ -10969,7 +11068,8 @@ impl<'a> Nat44TcpRuntime<'a> {
                 let session = self.sessions[index];
                 let host = self.session_hosts.mapping_host(index)?;
                 let list = self.session_hosts.mapping_list(index)?;
-                if !session.occupied {
+                // Only an occupied session the host initiated counts.
+                if !session.occupied || !session.host_initiated {
                     return None;
                 }
                 let address = current(session).map_or_else(
@@ -11543,6 +11643,7 @@ mod tests {
             remote_port: 65_529,
             last_activity_ms: 99,
             external_inbound: true,
+            host_initiated: false,
             state: 0x7f,
             links: SlotLinks::UNLINKED,
         };

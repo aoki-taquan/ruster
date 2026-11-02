@@ -1807,8 +1807,17 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   counts:
   - UDP/ICMP: the peers of the host's live mappings. Peers live as long as
     their mapping, which only the host's outbound packets refresh, so a
-    host recovers one idle TTL after it stops using a mapping, and no
-    remote can hold the budget.
+    host recovers one idle TTL after it stops using a mapping. Every peer
+    the host's own packets create counts, including its answers to
+    remotes that reached it first. Under `filtering =
+    "endpoint-independent"` any remote (or spoofed source) can reach a
+    host's mapped port, so a host that runs a UDP responder (a game or SIP
+    server, a P2P node) can have its whole budget spent by the remotes it
+    answers, after which its own new peers (its DNS client too) are
+    refused while it keeps answering. Do not combine endpoint-independent
+    filtering with `peers-per-host` for hosts that run UDP services; under
+    the default address-dependent filtering such packets are filtered
+    before the host sees them (NAT44-125).
   - TCP: only sessions the host opened with an outbound SYN (the outbound
     half of a hairpin too). Connections remotes open to the host (inbound
     SYNs, the inbound half of a hairpin) never count, so an attacker cannot
@@ -1820,7 +1829,13 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
     4 minutes after the host's last segment (an opening one after the
     opening timeout, an idle established one after the established
     timeout) even if the remote keeps it alive; it is then left to the
-    remote and is no longer counted.
+    remote and is no longer counted. If the host resumes such a session,
+    its next segment counts it again within the limit like a new session
+    (dropped as `NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED` while every counted
+    session is still driven), so letting sessions lapse and resuming them
+    cannot exceed the limit. A connection the remote reopens after a FIN
+    close (the host answers its SYN) is remote-opened and stops counting;
+    one the host reopens with its own SYN counts.
   - Sizing: like the mapping quota, `capacity.peers` or `capacity.sessions`
     divided by the expected inside hosts keeps every host able to work
     (for example 65536 sessions / 64 hosts = 1024). Browsers open tens to a
@@ -1841,8 +1856,9 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
     `RUNTIME_STORAGE_BYTES_EXCEEDED`; lower a capacity (for example
     `capacity.sessions = 32768`) instead.
   - Limits: no rate limit on state creation (REQ-5 b), no ICMP or
-    notification for a refusal, and a host colluding with a remote can
-    still add inbound-created TCP sessions (NAT44-125).
+    notification for a refusal, a host colluding with a remote can still
+    add inbound-created TCP sessions, and the endpoint-independent UDP
+    responder case above (NAT44-125).
 - Debug builds validate every NAT44 index after each UDP commit (O(M+P)
   and more per packet). Use only release builds (`cargo build --release`)
   in production.

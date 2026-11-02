@@ -434,3 +434,50 @@ fn udp_host_peer_quota_work_is_constant_in_a_full_65536_slot_table() {
         assert!(runtime.reuse_lists_are_consistent());
     });
 }
+
+/// Review sec M1, documented behaviour (NAT44-125): under endpoint-
+/// independent filtering an inside host that runs a UDP responder (a game
+/// or SIP server, a P2P node) answers whatever remote reaches its public
+/// port, and each answer to a new remote is a new filter peer that counts.
+/// Remotes (or spoofed sources) can therefore spend the host's whole peer
+/// budget, after which the host's own new peers, its DNS client included,
+/// are refused while it keeps answering. Under address-dependent filtering
+/// (the default) the same packets are filtered before the host sees them,
+/// so its budget is untouched. The runbook advises against EIF together
+/// with `peers-per-host` for hosts that run UDP services.
+#[test]
+fn zz_sec_eif_responder_lets_remote_spend_peer_budget() {
+    for filtering in [
+        Nat44Filtering::EndpointIndependent,
+        Nat44Filtering::AddressDependent,
+    ] {
+        let policy = peer_policy(4).with_filtering(filtering);
+        with_port_config(policy, 40_000, 40_063, |config| {
+            let mut mappings = [Nat44UdpMappingSlot::default(); 8];
+            let mut peers = [Nat44UdpPeerSlot::default(); 16];
+            let mut indexes = TestNat44UdpIndexes::new(config, mappings.len(), peers.len());
+            let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+            // The responder registers with its server, opening its mapping.
+            let server = outbound(&mut runtime, INTERNAL, 5_060, remote(0), 0).unwrap();
+            // Strangers send to the public port; the host answers each.
+            for index in 1..8 {
+                let stranger = remote(index);
+                if let Ok(plan) =
+                    runtime.plan_inbound(server.public_port(), stranger, TEST_REMOTE_PORT, 1)
+                {
+                    runtime.commit_inbound(plan, 1).unwrap();
+                    let _ = outbound(&mut runtime, INTERNAL, 5_060, stranger, 1);
+                }
+            }
+            let dns = outbound(&mut runtime, INTERNAL, 53_000, remote(99), 2).map(|_| ());
+            if filtering == Nat44Filtering::EndpointIndependent {
+                assert_eq!(host_peers(&runtime, INTERNAL), 4);
+                assert_eq!(dns, Err(Nat44UdpPlanError::HostPeerQuotaExceeded));
+            } else {
+                assert_eq!(dns, Ok(()));
+                assert_eq!(host_peers(&runtime, INTERNAL), 2);
+            }
+            assert_eq!(runtime.validate_indexes(), Ok(()));
+        });
+    }
+}

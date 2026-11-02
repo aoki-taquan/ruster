@@ -1647,7 +1647,9 @@ N3のmapping quota、N6、table満杯です。
   （global LRUの先頭が数えるmappingならそのhostで最も古い数えるmapping）。上限ではcursorだけを
   見て、liveなら拒否、expiredならcursorを進めて（そのmappingのpeerは死んでいる）受理します。
   mappingはportとchainを持ったままN3のmapping数に残り、tableのpark/再利用を待ちます。数える
-  mappingはactivity listにあり1 peer以上持つので、count ≤ limitは保たれます。
+  mappingはactivity listにあり1 peer以上持つので、count ≤ limitは保たれます。hostのoutboundが
+  作るpeerは応答でも数えるので、EIFではUDP responderのhostの予算を応答先のremoteが使い切れます
+  （review sec M1、NAT44-125。runbookはその組み合わせを避けるよう勧める）。
 - **TCP（session単位、host開始だけ）**: 数えるのはoutboundのinitial SYN（hairpinのoutbound半分を
   含む）が作ったsessionだけです。inbound SYNが作るsessionを数えると、remoteがvictimのpublic port
   へSYNを送るだけでvictimの予算を使い切れる（N3 M1と同じtargeted DoS）ので数えません（per-remote
@@ -1660,7 +1662,10 @@ N3のmapping quota、N6、table満杯です。
   expiry順で、link wordにはsessionのlast activityからのoffsetを置きます（saturateしても既に
   過ぎた期限がさらに早くなるだけ）。上限では3つの先頭の最小を見て、host-liveなら全てhost-live
   （capによりlive）で拒否、過ぎていればそのsessionを数えるのをやめて受理します。session自体は
-  消さないので、remoteだけが保つsessionはremoteに任され、REQ-11 dを満たします。
+  消さないので、remoteだけが保つsessionはremoteに任され、REQ-11 dを満たします。数えるのは
+  sessionの`host_initiated`（outbound SYNで作るかrestart）で、数えなくなったhost開始sessionは
+  hostの次のhost-driven segmentで新sessionと同じく上限内で数え直し（上限では拒否）、remoteが
+  restartしたsessionは数えなくなります（review core M、sec L1/L2）。
 - **TCPの不変条件**: (J1) hostのcount = 数えるsession数 ≤ limit（commitは+1と同時に1つ外す）。
   (J2) 数えるsessionのhost-driven expiry ≤ session自身のexpiry（毎commit cap）。(J3) 数える
   sessionのhost-driven expiry ≤ そのmappingの`host_expires_ms`（同じsegmentに同じ規則、両方cap）。

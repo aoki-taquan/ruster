@@ -1700,7 +1700,7 @@ fn validate_v1(
             udp: udp_capacity.zip(validated_udp.map(|(_, _, _, ports, policy)| {
                 (
                     (ports.first, ports.last),
-                    policy.mappings_per_host() != 0 || policy.peers_per_host() != 0,
+                    per_host_key(policy.mappings_per_host(), policy.peers_per_host()),
                 )
             })),
             tcp: tcp_capacity.zip(validated_tcp.map(|(_, _, _, ports, policy)| {
@@ -1715,7 +1715,7 @@ fn validate_v1(
             icmp_query: icmp_capacity.zip(validated_icmp.map(|(_, _, _, ids, policy)| {
                 (
                     (ids.first, ids.last),
-                    policy.mappings_per_host() != 0 || policy.peers_per_host() != 0,
+                    per_host_key(policy.mappings_per_host(), policy.peers_per_host()),
                 )
             })),
             firewall_states: firewall_capacity,
@@ -2182,7 +2182,22 @@ impl TextBudget {
 
 /// Port pool of one NAT44 protocol and whether its per-host mapping limit
 /// is set (N3).
-type NatStorageInputs = ((u16, u16), bool);
+/// Port (or identifier) pool of a datagram NAT44 table and the limit key
+/// that adds its per-host storage, if any (N3, N6).
+type NatStorageInputs = ((u16, u16), Option<&'static str>);
+
+/// The key that adds a datagram NAT44 runtime's per-host storage: the
+/// mapping limit if set, else the peer limit if set (N3, N6), so a byte
+/// budget error names a key the operator actually set.
+fn per_host_key(mappings_per_host: u16, peers_per_host: u16) -> Option<&'static str> {
+    if mappings_per_host != 0 {
+        Some("mappings-per-host")
+    } else if peers_per_host != 0 {
+        Some("peers-per-host")
+    } else {
+        None
+    }
+}
 /// TCP port pool and whether its per-host mapping (N3) and session (N6)
 /// limits are set.
 type TcpStorageInputs = ((u16, u16), (bool, bool));
@@ -2278,7 +2293,7 @@ fn build_storage_shape(
     let nat44_udp = inputs
         .udp
         .map(|(capacity, (ports, per_host))| {
-            let shape = udp_shape(capacity, ports, per_host, limits)?;
+            let shape = udp_shape(capacity, ports, per_host.is_some(), limits)?;
             add_bytes::<Nat44UdpMappingSlot>(
                 &mut bytes,
                 shape.mappings,
@@ -2297,7 +2312,7 @@ fn build_storage_shape(
                 shape.hosts,
                 shape.mapping_buckets,
                 PEER_COUNTING,
-                path(&["nat44", "udp", "mappings-per-host"]),
+                path(&["nat44", "udp", per_host.unwrap_or("mappings-per-host")]),
             )?;
             Ok(shape)
         })
@@ -2346,7 +2361,7 @@ fn build_storage_shape(
     let nat44_icmp = inputs
         .icmp_query
         .map(|(capacity, (identifiers, per_host))| {
-            let shape = icmp_shape(capacity, identifiers, per_host, limits)?;
+            let shape = icmp_shape(capacity, identifiers, per_host.is_some(), limits)?;
             add_bytes::<Nat44UdpMappingSlot>(
                 &mut bytes,
                 shape.mappings,
@@ -2365,7 +2380,7 @@ fn build_storage_shape(
                 shape.hosts,
                 shape.mapping_buckets,
                 PEER_COUNTING,
-                path(&["nat44", "icmp", "mappings-per-host"]),
+                path(&["nat44", "icmp", per_host.unwrap_or("mappings-per-host")]),
             )?;
             Ok(shape)
         })

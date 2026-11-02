@@ -409,8 +409,9 @@ sessionの数を制限します。上限では新しいpeer/session（それを�
 `nat44_tcp.host_session_quota_exceeded`）でdropし、何もevictしません。これで一つのhostが共有の
 `peers`/`sessions` tableを使い切って他hostを`PEER_TABLE_FULL`/`SESSION_TABLE_FULL`にすることを
 防ぎます。inbound SYNが作るsession（remoteが開くconnection、hairpinのinbound半分）は数えないので、
-remoteがvictimの予算を使い切ることはできず、remoteのsegmentやそれへのhostのRST/TIME-WAIT ACKは
-countを延ばしません。hostがFINを送ったconnectionは4分（transitory）で数えなくなります（N3の
+remoteがvictimのTCP予算を使い切ることはできず（UDPはEIFでresponderを動かすhostなら応答先の
+remoteに使い切られうるので、その組み合わせは避ける。runbook）、remoteのsegmentやそれへのhostのRST/TIME-WAIT ACKは
+countを延ばしません。数えなくなったsessionをhostが再び動かすと上限内で数え直します。hostがFINを送ったconnectionは4分（transitory）で数えなくなります（N3の
 mapping quotaも同じ。NAT44-124）。回復はO(1)で、UDPはmappingのexpiry、TCPはhostがsessionを
 4分（opening/閉じたもの）またはestablished timeout動かさなかった時点です。default `0`は無制限。
 UDP/ICMPは`mappings-per-host`と同じhost storageを使い、TCPはsession slotごとに約92 bytesを

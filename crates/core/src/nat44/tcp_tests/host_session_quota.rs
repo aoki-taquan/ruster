@@ -429,9 +429,10 @@ fn reuse_recreation_and_flush_release_a_hosts_sessions() {
 }
 
 /// The per-slot reference of the churn test: for each session slot the
-/// test saw an outbound initial SYN create, the internal address and the
-/// time of the host's last host-driven segment on it.
-type Reference = HashMap<usize, (Ipv4Address, u64)>;
+/// host initiated (an outbound initial SYN created or restarted it), the
+/// internal address, the time of the host's last host-driven segment on it,
+/// and whether it counts.
+type Reference = HashMap<usize, (Ipv4Address, u64, bool)>;
 
 fn next_random(state: &mut u64) -> u64 {
     *state ^= *state << 13;
@@ -462,7 +463,7 @@ fn next_random(state: &mut u64) -> u64 {
 fn tcp_host_session_quota_matches_a_reference_of_host_driven_activity_under_seeded_churn() {
     const LIMIT: u16 = 3;
     const TTL: u64 = NAT44_TCP_MIN_IDLE_TTL_MS;
-    let mut outcomes = [0_usize; 5];
+    let mut outcomes = [0_usize; 6];
     for seed in 1..=16_u64 {
         let hosts = if seed % 4 == 0 { 8 } else { 3 };
         let filtering = if seed % 2 == 0 {
@@ -497,7 +498,9 @@ fn tcp_host_session_quota_matches_a_reference_of_host_driven_activity_under_seed
                 let host_live = |reference: &Reference| {
                     reference
                         .values()
-                        .filter(|(owner, last)| *owner == address && now < last + TTL)
+                        .filter(|(owner, last, counted)| {
+                            *owner == address && *counted && now < last + TTL
+                        })
                         .count()
                 };
                 let live = host_live(&reference);
@@ -511,26 +514,38 @@ fn tcp_host_session_quota_matches_a_reference_of_host_driven_activity_under_seed
                     }
                     Err(_) => outcomes[1] += 1,
                     Ok(plan) => {
-                        if plan.session_created {
+                        if plan.session_created || plan.session_recount {
                             assert!(live < usize::from(LIMIT), "seed {seed}");
                             outcomes[2] += 1;
                         }
+                        if plan.session_recount {
+                            outcomes[5] += 1;
+                        }
                         if let Some(index) = plan.host_session_reclaim() {
-                            let (owner, last) = reference.remove(&index).expect("counted");
-                            assert!(owner == address && now >= last + TTL, "seed {seed}");
+                            let entry = reference.get_mut(&index).expect("host-initiated");
+                            assert!(entry.0 == address && entry.2, "seed {seed}");
+                            assert!(now >= entry.1 + TTL, "seed {seed}");
+                            entry.2 = false;
                             outcomes[3] += 1;
                         }
                         runtime.commit_outbound(plan, now).unwrap();
                         let index = plan.session_index();
+                        let session = runtime.sessions[index];
                         if plan.session_created {
-                            reference.insert(index, (address, now));
-                        } else if let Some(entry) = reference.get_mut(&index) {
-                            let session = runtime.sessions[index];
+                            reference.insert(index, (address, now, true));
+                        } else if !session.is_host_initiated() {
+                            // A restart the remote opened.
+                            reference.remove(&index);
+                        } else {
                             let established = session.phase() == Nat44TcpSessionPhase::Established;
                             if session.phase() != Nat44TcpSessionPhase::Closing
                                 && (!session.is_external_inbound() || established)
                             {
+                                // Host-driven: counted again if it was not.
+                                let entry = reference.entry(index).or_insert((address, now, false));
                                 entry.1 = now;
+                                assert!(entry.2 || plan.session_recount, "seed {seed}");
+                                entry.2 = true;
                             }
                         }
                     }
@@ -561,10 +576,16 @@ fn tcp_host_session_quota_matches_a_reference_of_host_driven_activity_under_seed
                 }
                 for index in 0..hosts {
                     let address = Ipv4Address::from_octets([10, 0, 1, index as u8]);
-                    let counted = reference.values().filter(|(owner, _)| *owner == address);
-                    let counted = counted.count();
+                    let counted = reference
+                        .values()
+                        .filter(|(owner, _, counted)| *owner == address && *counted)
+                        .count();
                     assert_eq!(session_count(&runtime, address), counted, "seed {seed}");
                     assert!(counted <= usize::from(LIMIT), "seed {seed}");
+                }
+                // Every host-initiated session the host drives counts.
+                for (owner, last, counted) in reference.values() {
+                    assert!(*counted || now >= last + TTL, "seed {seed} {owner:?}");
                 }
                 assert_eq!(runtime.validate_indexes(), Ok(()), "seed {seed}");
             }
@@ -575,8 +596,9 @@ fn tcp_host_session_quota_matches_a_reference_of_host_driven_activity_under_seed
 
 /// The same churn with the default (unequal) timeouts, the half-close rule,
 /// and the mapping quota on: the count follows the reference of which slots
-/// outbound SYNs created (less those the runtime stopped counting, each
-/// past its host-driven expiry), never exceeds the limit, and a refusal
+/// outbound SYNs created or counted again (less those the runtime stopped
+/// counting, each past its host-driven expiry, and remote-opened restarts),
+/// never exceeds the limit, and a refusal
 /// means every counted session of the host is live and of its mapping's
 /// generation (host-driven liveness implies liveness).
 #[test]
@@ -621,9 +643,13 @@ fn tcp_host_session_quota_stays_consistent_with_unequal_timeouts() {
                             assert_eq!(counted.remove(&index), Some(address), "seed {seed}");
                             outcomes[1] += 1;
                         }
-                        if plan.session_created {
+                        if plan.session_created || plan.session_recount {
                             counted.insert(plan.session_index(), address);
                             outcomes[2] += 1;
+                        }
+                        // A restart the remote opened stops counting.
+                        if !runtime.sessions[plan.session_index()].is_host_initiated() {
+                            counted.remove(&plan.session_index());
                         }
                     }
                 }
@@ -709,5 +735,122 @@ fn tcp_host_session_quota_work_is_constant_in_a_full_65536_session_table() {
         // The lookups are the plan's, the commit revalidation's, and the
         // commit's (as for the N3 host table).
         assert!(worst[0] <= 3 && worst[1] <= 6, "work per new SYN {worst:?}");
+    });
+}
+
+/// Review core M (N6): a host that lets a session pass its host-driven
+/// expiry (it delays its ACK while the remote keeps the session alive),
+/// opens a new session in its place, and then resumes the old one must not
+/// end up driving more sessions than its limit. The resumed session is
+/// counted again like a new one: within the limit it takes the place of a
+/// session past its host-driven expiry, otherwise its segment is refused.
+/// Over ten rounds the host never drives more than `limit` sessions at the
+/// same time and the count never exceeds the limit (the probe ended with
+/// ten driven sessions counted as one before the fix).
+#[test]
+fn resuming_an_uncounted_session_counts_it_again_within_the_limit() {
+    with_config(session_policy(1), 40_000, 40_063, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 16];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 32];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let mut opened: Vec<(u16, (Ipv4Address, u16), u16)> = Vec::new();
+        let mut refused_resumes = 0;
+        for round in 0..10_u16 {
+            let now = u64::from(round) * TRANSITORY;
+            // Every remote keeps its connection alive by itself.
+            for (_, peer, public) in &opened {
+                inbound(&mut runtime, *public, *peer, SYN_ACK, now).unwrap();
+            }
+            // The host opens a new connection in place of the one past its
+            // host-driven expiry ...
+            let mut driven = 0;
+            let port = 1_000 + round;
+            let peer = remote(round as usize);
+            let new = out(&mut runtime, (INTERNAL, port), peer, SYN, now)
+                .unwrap_or_else(|error| panic!("round {round}: {error:?}"));
+            driven += 1;
+            // ... and resumes every earlier one (its delayed ACK).
+            for (port, peer, _) in &opened {
+                match out(&mut runtime, (INTERNAL, *port), *peer, ACK, now) {
+                    Ok(_) => driven += 1,
+                    Err(Nat44TcpPlanError::HostSessionQuotaExceeded) => refused_resumes += 1,
+                    Err(error) => panic!("round {round}: {error:?}"),
+                }
+            }
+            opened.push((port, peer, new.public_port()));
+            // Midway, the remotes keep their connections alive again.
+            for (_, peer, public) in &opened {
+                inbound(&mut runtime, *public, *peer, SYN_ACK, now + TRANSITORY / 2).unwrap();
+            }
+            assert!(
+                driven <= 1,
+                "round {round}: {driven} sessions driven at once"
+            );
+            assert!(session_count(&runtime, INTERNAL) <= 1, "round {round}");
+            assert_eq!(runtime.validate_indexes(), Ok(()), "round {round}");
+        }
+        assert_eq!(refused_resumes, 45);
+    });
+}
+
+/// Review sec L1: a FIN-closed session the host opened, which the remote
+/// restarts (its SYN on the same tuple, answered by the host's SYN-ACK), is
+/// a remote-opened connection and stops counting. Review sec L2: a
+/// FIN-closed session a remote opened, which the host restarts with its own
+/// SYN, becomes host-initiated and counts (refused at the limit like a new
+/// session).
+#[test]
+fn restarts_follow_who_opened_the_connection() {
+    let peer = remote(0);
+    let close = |runtime: &mut Nat44TcpRuntime<'_>, public: u16, now: u64| {
+        inbound(runtime, public, peer, FIN_ACK, now).unwrap();
+        out(runtime, (INTERNAL, 1_000), peer, FIN_ACK, now).unwrap();
+        inbound(runtime, public, peer, ACK, now).unwrap();
+    };
+    with_config(session_policy(1), 40_000, 40_063, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 8];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 16];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let first = out(&mut runtime, (INTERNAL, 1_000), peer, SYN, 0).unwrap();
+        inbound(&mut runtime, first.public_port(), peer, SYN_ACK, 0).unwrap();
+        out(&mut runtime, (INTERNAL, 1_000), peer, ACK, 0).unwrap();
+        close(&mut runtime, first.public_port(), 0);
+        assert_eq!(session_count(&runtime, INTERNAL), 1);
+        // The remote reconnects on the same tuple; the host accepts.
+        inbound(&mut runtime, first.public_port(), peer, SYN, 10).unwrap();
+        out(&mut runtime, (INTERNAL, 1_000), peer, SYN_ACK, 10).unwrap();
+        let session = runtime.sessions[first.session_index()];
+        assert!(!session.is_host_initiated() && session.is_external_inbound());
+        assert_eq!(session_count(&runtime, INTERNAL), 0);
+        out(&mut runtime, (INTERNAL, 2_000), remote(1), SYN, 20).unwrap();
+        assert_eq!(runtime.validate_indexes(), Ok(()));
+    });
+    with_config(session_policy(1), 40_000, 40_063, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 8];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 16];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let server = out(&mut runtime, (INTERNAL, 1_000), remote(1), SYN, 0).unwrap();
+        // A remote-opened connection on the host's mapping, closed.
+        let at = 100_000;
+        let accepted = inbound(&mut runtime, server.public_port(), peer, SYN, at).unwrap();
+        out(&mut runtime, (INTERNAL, 1_000), peer, SYN_ACK, at).unwrap();
+        inbound(&mut runtime, server.public_port(), peer, ACK, at).unwrap();
+        close(&mut runtime, server.public_port(), at);
+        assert_eq!(session_count(&runtime, INTERNAL), 1);
+        // The host reconnects on the same tuple: a session it opens, over
+        // the limit while its first session is alive.
+        let before = runtime.sessions.to_vec();
+        assert_eq!(
+            out(&mut runtime, (INTERNAL, 1_000), peer, SYN, at + 10).map(|_| ()),
+            Err(Nat44TcpPlanError::HostSessionQuotaExceeded)
+        );
+        assert_eq!(runtime.sessions, &before[..]);
+        // Once the first one is past its host-driven expiry, it counts.
+        let restart = out(&mut runtime, (INTERNAL, 1_000), peer, SYN, TRANSITORY).unwrap();
+        assert!(restart.session_recount && !restart.session_created);
+        assert_eq!(restart.session_index(), accepted.session_index);
+        assert!(runtime.sessions[accepted.session_index].is_host_initiated());
+        assert_eq!(session_count(&runtime, INTERNAL), 1);
+        assert_eq!(runtime.validate_indexes(), Ok(()));
     });
 }
