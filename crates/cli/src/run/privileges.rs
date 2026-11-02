@@ -22,7 +22,9 @@
 //!
 //! - the two output threads at spawn, before they write anything (they
 //!   never need a privilege), and the spawn waits for the outcome;
-//! - the router thread after startup.
+//! - the link watcher and the reload worker (H7, [`super::workers`]) at
+//!   spawn after activation, before they take a request, likewise;
+//! - the router thread after startup, last.
 //!
 //! The router thread then reads `/proc/self/task/*/status` and requires
 //! every thread of the process to hold no capability (fail closed). The

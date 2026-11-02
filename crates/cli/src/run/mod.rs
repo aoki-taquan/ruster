@@ -24,9 +24,11 @@
 //!    datapath, build every engine, build the `XdpPacketIo` adapter, and
 //!    activate generation 1 ([`startup`] explains why the datapath comes
 //!    after all attaches).
-//! 6. Drop every privilege of every thread, irreversibly, before the
-//!    first tick ([`privileges`]; the output threads dropped their own at
-//!    spawn). `--keep-privileges` skips it; `--user`/`--group` also switch
+//! 6. Start the link watcher and the reload worker threads ([`workers`],
+//!    H7), each dropping its own privileges first, then drop every
+//!    privilege of every thread, irreversibly, before the first tick
+//!    ([`privileges`]; the output threads dropped their own at spawn).
+//!    `--keep-privileges` skips it; `--user`/`--group` also switch
 //!    to that uid and gid. A failed drop rolls back like any startup
 //!    failure (`stage=privilege-drop`, exit 1).
 //!
@@ -51,9 +53,12 @@
 //! See [`engine`]: `run_tick` with the configured budgets and an `Instant`
 //! clock, spin-then-sleep idle backoff (at most 1 ms), no allocation per
 //! tick, and a stats block on stdout every `--stats-interval` seconds.
-//! Between ticks, on the cold path: the SIGHUP reload ([`reload`]), and
-//! the health and link watch ([`watch`]), whose fatal events end the run
-//! like a stop request, with drain and close, but exit 1.
+//! Between ticks, on the cold path: the SIGHUP reload ([`reload`],
+//! prepared on the reload worker thread), and the health and link watch
+//! ([`watch`], the link round on the link watcher thread), whose fatal
+//! events end the run like a stop request, with drain and close, but exit
+//! 1. The workers are stopped with the loop and waited for at most 500 ms
+//! ([`workers::WORKER_STOP_MS`]), then abandoned.
 //!
 //! # Shutdown
 //!

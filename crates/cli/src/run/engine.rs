@@ -515,7 +515,7 @@ where
 /// folded in, a due one is requested (or counted late, and stale past the
 /// threshold, while the previous one still runs). Returns the first fatal
 /// event as the loop end.
-fn watch_step<D, E>(
+pub(super) fn watch_step<D, E>(
     datapath: &D,
     control: &mut Control,
     now: MonotonicMillis,

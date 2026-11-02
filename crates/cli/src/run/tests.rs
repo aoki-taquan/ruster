@@ -478,9 +478,21 @@ impl PortHost for FakeHost {
         Ok(FakeLinks::of(&self.state))
     }
 
+    /// `failing(Stage::Workers, Some(1))` fails the link watcher's
+    /// prologue, `Some(2)` the reload worker's (each checked on the thread
+    /// that runs it).
     fn thread_prologue(&self) -> fn(PrivilegePolicy) -> Result<(), DropFailure> {
-        if self.fails(Stage::Workers, None) {
-            |_| Err(DropFailure::Injected)
+        fn fails_on(name: &str) -> Result<(), DropFailure> {
+            if std::thread::current().name() == Some(name) {
+                Err(DropFailure::Injected)
+            } else {
+                Ok(())
+            }
+        }
+        if self.fails(Stage::Workers, Some(1)) {
+            |_| fails_on("ruster-watch")
+        } else if self.fails(Stage::Workers, Some(2)) {
+            |_| fails_on("ruster-reload")
         } else {
             |_| Ok(())
         }

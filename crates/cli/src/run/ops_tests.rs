@@ -1269,3 +1269,28 @@ fn weak_host_appearing_while_running_warns_and_recovers_without_override() {
     );
     host.assert_released();
 }
+
+/// The reload worker's base document advances only when told the last
+/// prepared successor was applied; a failed or unapplied preparation
+/// leaves it.
+#[test]
+fn the_preparer_plans_against_the_applied_document() {
+    use super::super::reload::{Prepared, Preparer};
+    let sequencer = ProductionSequencer::new(OsRandomKeySource::open().expect("urandom"));
+    let source = FakeSource::with([Ok(echo_off()), Ok(config()), Err(LoadError::NotAFile)]);
+    let mut preparer = Preparer::new(sequencer, config(), source);
+    let base = |preparer: &Preparer<_, _>| preparer.current().ipv4_origin().echo_reply();
+    assert!(matches!(preparer.prepare(), Prepared::Ready(_)));
+    assert!(base(&preparer), "not applied yet");
+    preparer.applied();
+    assert!(
+        !base(&preparer),
+        "the applied echo-off document is the base"
+    );
+    // Prepared but never applied (refused at the dry run, timed out):
+    // the base stays.
+    assert!(matches!(preparer.prepare(), Prepared::Ready(_)));
+    assert!(matches!(preparer.prepare(), Prepared::Failed(_)));
+    preparer.applied();
+    assert!(!base(&preparer));
+}

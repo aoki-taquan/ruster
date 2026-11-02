@@ -357,23 +357,86 @@ fn a_brief_link_watcher_stall_costs_only_late_rounds() {
     host.assert_released();
 }
 
-/// A worker thread whose privilege drop (prologue) fails fails startup
-/// before the process-wide drop and before any tick, with a full
-/// rollback.
+/// A worker thread whose privilege drop (its prologue, run on that
+/// thread) fails fails startup before the process-wide drop and before
+/// any tick, with a full rollback: for each of the two workers.
 #[test]
 fn a_worker_whose_drop_fails_rolls_back_before_the_lockdown() {
-    let host = FakeHost::failing(Stage::Workers, None);
-    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 3));
-    assert_eq!(outcome.status, EXIT_RUNTIME, "{}", outcome.err);
-    assert!(
-        outcome
-            .err
-            .contains("ruster run: startup failed: stage=privilege-drop code=INJECTED\n"),
-        "{}",
-        outcome.err
-    );
-    assert!(host.state.lockdowns.borrow().is_empty(), "no lockdown");
-    assert_eq!(host.state.io_calls.get(), 0, "no tick");
-    assert!(!outcome.err.contains(READY));
-    host.assert_released();
+    for worker in [1, 2] {
+        let host = FakeHost::failing(Stage::Workers, Some(worker));
+        let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 3));
+        assert_eq!(outcome.status, EXIT_RUNTIME, "{}", outcome.err);
+        assert!(
+            outcome
+                .err
+                .contains("ruster run: startup failed: stage=privilege-drop code=INJECTED\n"),
+            "{}",
+            outcome.err
+        );
+        assert!(host.state.lockdowns.borrow().is_empty(), "no lockdown");
+        assert_eq!(host.state.io_calls.get(), 0, "no tick");
+        assert!(!outcome.err.contains(READY));
+        host.assert_released();
+    }
+}
+
+/// A round that came back is folded in at the next loop iteration, not
+/// only when the next round is due (which would also count it late).
+#[test]
+fn a_finished_round_is_folded_before_the_next_is_due() {
+    use crate::run::engine::{watch_step, Control, LoopSettings};
+    use crate::run::reload::Reloader;
+    use crate::run::watch::{Thresholds, Watch};
+    use crate::run::workers::LinkWatcher;
+
+    let host = FakeHost::default();
+    let targets = [LAN, WAN].map(|id| LinkTarget {
+        interface: IfId(id),
+        ifindex: fake_ifindex(id),
+        mtu: 1500,
+        frame_capacity: 1792,
+    });
+    let links =
+        LinkWatcher::spawn(FakeLinks::of(&host.state), &targets, || Ok(())).expect("watcher");
+    let mut control = Control {
+        reloader: Reloader::without_worker(crate::run::budgets(&config())),
+        watch: Watch::new(&targets, Thresholds::default()),
+        links,
+    };
+    let settings = LoopSettings {
+        stats_interval_ms: 0,
+        health_interval_ms: 1_000_000,
+        link_interval_ms: 1_000,
+        reload_quiesce_ms: 200,
+    };
+    let datapath = ForwardingDatapath { io: SimIo::new() };
+    let mut err = Vec::new();
+    // Due at 0: requested.
+    assert!(watch_step(
+        &datapath,
+        &mut control,
+        MonotonicMillis(0),
+        settings,
+        &mut err
+    )
+    .is_none());
+    let started = std::time::Instant::now();
+    while control.watch.rounds().completed == 0 {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the round was never folded before the next due time"
+        );
+        assert!(watch_step(
+            &datapath,
+            &mut control,
+            MonotonicMillis(500),
+            settings,
+            &mut err
+        )
+        .is_none());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(control.watch.rounds().late, 0);
+    assert_eq!(*host.state.link_queries.borrow_mut(), 2);
+    assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
 }
