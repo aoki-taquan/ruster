@@ -257,11 +257,12 @@ round-robin scans do: the resolution timer visits `tick.resolution-timer-scans`
 state slots per tick and the failure dispatch `tick.failure-dispatch-scans`
 hold slots, so an ARP retry, timeout, or Host Unreachable can wait up to
 `ceil(capacity / scans)` ticks for its slot to come round (with 65536 states
-and 16 scans, 4096 ticks, about 4 s when the loop sleeps 1 ms between idle
-ticks). Size `states` for the expected traffic and raise the scan budgets
+and 16 scans, 4096 ticks, about 4 s at the idle tick cadence of about 1 ms,
+which the idle wait keeps while any resolution state or hold is pending;
+section 7, "Idle wait"). Size `states` for the expected traffic and raise the scan budgets
 with it. `ruster validate` (of an af-xdp document) and `ruster run` (at
 startup and after each applied reload) print a value-free warning when a
-sweep takes more than 1000 ticks (about 1 s at the idle backoff):
+sweep takes more than 1000 ticks (about 1 s at the 1 ms idle cadence):
 `ruster: warning: RESOLUTION_SWEEP_SLOW table=states ticks=4096` (or
 `table=failure-holds`, `ticks=never` for a zero budget). The maximal
 fixture uses 128 timer scans (512 ticks for 65536 states) and 16 dispatch
@@ -436,7 +437,7 @@ ruster run [--allow-multi-queue] [--allow-kernel-forwarding]
            [--strict-config-perms] [--stats-interval <seconds>]
            [--startup-attempts <n>] [--tx-stall-warn-secs <s>]
            [--tx-stall-fatal-secs <s>] [--kick-errors-fatal-secs <s>]
-           [--link-stale-secs <s>]
+           [--link-stale-secs <s>] [--idle-wait-ms <ms>]
            [--keep-privileges | --user <uid> --group <gid>]
            [--seccomp kill|log|off]
            --config <config.toml>
@@ -457,11 +458,14 @@ ruster run [options] -- <config.toml>
 | `--tx-stall-fatal-secs <s>` | 10 | 0 to 3600 | `TX_STALL` fatal exit; 0 never; otherwise at least `--tx-stall-warn-secs` |
 | `--kick-errors-fatal-secs <s>` | 5 | 0 to 3600 | `KICK_ERRORS` fatal exit; 0 never |
 | `--link-stale-secs <s>` | 5 | 1 to 3600 | age of a link watcher round still running (a `send` waiting for the kernel's RTNL lock) from which every further due round counts as a failed link query on every port (`LINK_WATCH_STALE`, `LINK_PROBE`; `LINK_UNVERIFIABLE` at the third, so about `s + 2` seconds after the stuck round started; section 8). No 0: losing observability of the ports always ends the run eventually. Raise it on hosts where driver resets hold RTNL longer |
+| `--idle-wait-ms <ms>` | 10 | 1 to 100 | longest idle wait (section 7, "Idle wait"): an idle router blocks in `poll()` on its port sockets for at most this long, or at most 1 ms while timers, TX, or a reload are pending; an arriving frame ends the wait at once. Larger: fewer idle wake-ups and less CPU, but a signal delivered to another thread, a worker's answer, and anything the router only notices at a tick are seen up to this much later. 1 keeps the pre-H9 idle cadence (about 1000 wake-ups per second) |
 | `--keep-privileges` | off | flag | do not drop privileges after startup (section 5, "Privilege drop"): the process keeps every capability it started with for its whole life (`warning: privileges kept (--keep-privileges)`, `privileges.state=kept`). Risk: a memory-safety bug or a logic flaw reachable from packets or the config then runs with `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_BPF`/`CAP_SYS_ADMIN` (as root: every capability), so it can reconfigure every interface and route of the namespace, sniff and inject on any device, load BPF programs, and (as root) read and write any file. Use it only to diagnose a drop problem, or on a kernel before 6.5 with `kernel.unprivileged_bpf_disabled` set (where the drop is refused) |
 | `--seccomp kill\|log\|off` (or `--seccomp=<mode>`) | `kill` | one of the three | the syscall filter after startup (section 5, "Syscall filter"). `kill`: a syscall outside the allowlist kills the whole process at once (`SECCOMP_RET_KILL_PROCESS`; the XDP links detach as after SIGKILL). `log`: the kernel logs it and lets it run (`SECCOMP_RET_LOG`; `warning: seccomp=log`), for finding a missing entry without an outage. `off`: no filter (`warning: seccomp=off`, `seccomp.mode=off`). Risk of `log` and `off`: a compromised router can then make every syscall an unprivileged process (after the drop) or a privileged one (with `--keep-privileges`) can: open inet sockets and connect out, write any file its user may write, start programs, `ptrace` its own user's processes, load BPF programs where unprivileged BPF is allowed, and probe kernel interfaces that the filter keeps out of reach. Use `log` to diagnose a kill, `off` only on a platform where the filter cannot be installed. An i386 or x32 syscall kills in every mode but `off`. Independent of `--keep-privileges` and `--user`/`--group` |
 | `--user <uid>` `--group <gid>` | none | numeric ids 1 to 4294967294, both or neither, not with `--keep-privileges` | with the drop, also switch every thread's real, effective, saved and filesystem uid and gid to these ids and clear the supplementary groups. Names are not resolved. Needs `CAP_SETUID` and `CAP_SETGID` at startup (exit 4 otherwise, checked before anything is opened). The config must then be readable by that user for reloads |
 
 Numbers are decimal digits only (at most 6, no sign; ids at most 10).
+`--idle-wait-ms` is in milliseconds, the other numeric options in seconds
+(`--startup-attempts` a count).
 Every option may be given once; `-h`/`--help` prints the usage. The thresholds and intervals
 are set at start and are not reloadable. The config file is always opened
 `O_NONBLOCK | O_NOCTTY` and must be a regular file (a FIFO or device is
@@ -682,9 +686,9 @@ attached to the running router; the Rust test
 | syscall | condition | who needs it after startup |
 |---|---|---|
 | `sendto` (44) | — | router: AF_XDP TX kick; link watcher: netlink requests (`send`) |
-| `poll` (7) | — | router: Fill-ring wakeup of the need-wakeup profile |
+| `poll` (7) | — | router: the idle wait on every port socket (section 7, H9) and the Fill-ring wakeup of the need-wakeup profile; glibc's `poll()` is this syscall on x86_64, never `ppoll` |
 | `getsockopt` (55) | — | router: `XDP_STATISTICS` per stats sample |
-| `clock_nanosleep` (230), `nanosleep` (35), `restart_syscall` (219) | — | idle backoff and every `thread::sleep` (`nanosleep` where the C library's sleep uses it: older glibc, musl); resuming one a signal interrupted |
+| `clock_nanosleep` (230), `nanosleep` (35), `restart_syscall` (219) | — | the 1 ms fallback sleep of the idle wait, the reload quiescence pause, the drain, and every `thread::sleep` (`nanosleep` where the C library's sleep uses it: older glibc, musl); resuming one a signal interrupted |
 | `clock_gettime` (228) | — | the monotonic clock (normally a vDSO call; this syscall without a vDSO) |
 | `futex` (202), `sched_yield` (24) | — | channels between the threads; std's channels back off with `yield_now` in disconnect and preemption races (dropping the worker and output channels) |
 | `write` (1) | — | output threads (stdout, stderr), a panic message |
@@ -883,10 +887,63 @@ the ports) and a stuck TX queue usually needs the restart. If availability
 under a hostile segment matters more, disable flow control
 (`ethtool -A <dev> rx off tx off`) and/or run with `--tx-stall-fatal-secs 0`.
 
-Separately, if the adapter's I/O stays non-reentrant for 1024 ticks in a row
-(about a second, the wedged-adapter watchdog), or the adapter stops itself
-after a ring fault, the run ends with `stopped after a backend fault` and
-exit 1.
+Separately, if the adapter's I/O stays non-reentrant for 1 s on the loop's
+clock with no other tick in between (and at least 16 such ticks; the
+wedged-adapter watchdog, time-based since H9 because the idle tick rate
+depends on the idle wait), or the adapter stops itself after a ring fault,
+the run ends with `stopped after a backend fault` and exit 1.
+
+### Idle wait
+
+Under load the router thread never waits. A tick that received no frame
+and generated no TX is idle; after 64 idle ticks in a row (a few
+microseconds) each further idle tick is followed by one blocking `poll()`
+with `POLLIN` on the AF_XDP sockets of every port (one preallocated
+`pollfd` array, H9). It returns:
+
+- at once, without a syscall, while a port has a descriptor in its RX ring
+  or a frame left over from the previous tick;
+- as soon as the kernel puts a frame on any port's RX ring (the socket
+  wakes the thread; the first frame after an idle period is processed
+  within the kernel's wake-up latency, typically tens of microseconds,
+  instead of up to 1 ms before H9);
+- when a signal handler runs on the router thread (SIGTERM, SIGINT,
+  SIGHUP: `poll` is never restarted after a handler, so the flags are read
+  at once; the kernel prefers the main thread, which is the router, for
+  process-directed signals);
+- at its timeout: `--idle-wait-ms` (10), but at most 1 ms while
+  time-driven work is pending, and never past the next periodic stats
+  block, health sample (500 ms), or link round (1 s).
+
+The router's timers advance only at ticks, so these keep the wait at 1 ms
+(the pre-H9 idle cadence, so every bound stated in terms of ticks still
+holds, such as the resolution sweep warning `RESOLUTION_SWEEP_SLOW` at
+1000 ticks, about 1 s): a resolution state, failure hold or queued ARP
+request; a queued ICMPv4 error; an unsolicited-SYN hold (B3: its 6 s Port
+Unreachable is sent within about a millisecond of the deadline); TX in
+flight or an owed kick in the adapter (completions do not end an RX wait;
+the link-down kick retry of section 8 keeps its 1 ms first step); and a
+reload request out on the reload worker (its answer is picked up within
+about 1 ms). NAT44 and firewall state expiry is lazy and needs no tick.
+What the 10 ms costs: a signal that the kernel delivers to another thread
+(or that arrives between the router's flag check and its `poll`), and a
+link round coming back, are noticed up to one wait later.
+
+A wait that reported a ready socket must be followed by a tick that
+receives something; if it is not (readiness RX cannot consume), the next
+idle wait is a plain sleep of at most 1 ms, so a socket that stays ready
+never turns into a busy spin. If `poll` fails (it should not), the router
+warns once (`warning: idle poll failed code=ERRNO_<n>; sleeping at most
+1 ms between idle ticks instead`) and sleeps 1 ms instead of every wait,
+the pre-H9 behaviour.
+
+CPU and wake-ups: an idle router thread wakes about 100 times per second
+at the default (plus the stats, health and link deadlines), against about
+1000 before H9; with timers pending it is back to about 1000. The
+`idle.*` stats (section 11) count the waits (`waits`, `woken`,
+`timed_out`, `interrupted`, `short`: capped at 1 ms by pending work,
+`sleeps`, `errors`, and the configured `max_wait_ms`); `tick.ticks` grows
+by about the wait count while idle.
 
 ## 8. Link and device events
 
@@ -967,7 +1024,7 @@ further wait doubles up to 64 ms, so a port that stays down costs about
 settle before the retry is due only reaps and counts
 `kick_retries_suppressed`. When the link returns, the held frames are
 transmitted at the next retry, within about 64 ms (plus up to one 1 ms
-idle pause) and without new
+idle wait: TX held in flight keeps the idle wait at 1 ms) and without new
 traffic (they may be stale by then), and the ring drains; the backoff
 starts again at 1 ms on the next down period. With only carrier lost (`IFF_LOWER_UP` clear, for example the
 peer down), the kernel consumes and drops the frames instead, so the ring
@@ -1069,6 +1126,7 @@ Sections, in this order:
 | `af_xdp.*` | all ports: `mode` (`copy`, `zero_copy`, `mixed`), `ports`, `copy_ports`, `zero_copy_ports`, `fill_need_wakeup_ports`, `tx_need_wakeup_ports`, `link_down_ports`, `kick_owed_ports`, `kernel_stats_ports`, `generated_unknown_egress`, `stopped`, and the summed port counters |
 | `if<id>.af_xdp_port.*` | per port: `interface`, `queue`, `mode`, `mtu`, `max_frame`, need-wakeup now, `draining`, `link_down`, `kick_owed`, `copy_reserve`, ring gauges (`fill_ring_occupancy`, `rx_ring_occupancy`, `tx_ring_unconsumed`), `fill_starved`, invalid RX descriptors and quarantines, TX (`tx_completed`, `tx_inflight`, `tx_inflight_highwater`, `tx_blocked`, `tx_over_mtu`, `tx_invalid_completions`), kicks (`tx_kicks`, `fill_kicks`, `kicks_deferred`, `kick_errors`, `kicks_link_down`, `kick_retries_suppressed`; `kick_errors` counts every failed kick and so includes `kicks_link_down`, while the `KICK_ERRORS` health code times `kick_errors - kicks_link_down` only; `kick_retries_suppressed` counts settles on a down port that skipped a retry not yet due, which made no syscall), generated frames, `cross_port_copies`, and the kernel `XDP_STATISTICS` (`kernel_rx_dropped`, `kernel_rx_invalid_descs`, `kernel_tx_invalid_descs`, `kernel_rx_ring_full`, `kernel_rx_fill_ring_empty_descs`, `kernel_tx_ring_empty_descs`) |
 | `reload.*` | `requested`, `applied`, `refused`, `failed`, `preparing_ms` (how long the reload being prepared on the worker has run; 0 when none) |
+| `idle.*` | the idle wait (section 7): `max_wait_ms` (`--idle-wait-ms`), `waits` (blocking `poll`s), `woken` (ended by a frame on a port), `timed_out`, `interrupted` (a signal handler ran), `short` (capped at 1 ms because timers, TX, or a reload were pending), `sleeps` (plain sleeps of at most 1 ms after a ready socket that no tick used, or because `poll` failed), `errors` (failed `poll`s; warned once) |
 | `watch.*` | `state` (`ok`/`warning`), `warnings` (all ports), `link_rounds` (link rounds that came back from the watcher), `link_rounds_late` (due rounds skipped because one still ran), `link_rounds_stale` (late rounds past `--link-stale-secs`, each a failed link query) |
 | `if<id>.watch.*` | `tx_stall`, `tx_stall_ms`, `fill_starved`, `kick_errors_persistent`, `link_up`, `link_down_events`, `link_up_events`, `mtu`, `link_probe_errors`, `kernel_ipv4_addresses`, `kernel_forwarding`, `kernel_ipv4_routes`, `kernel_ipv6_addresses`, `kernel_ipv6_routes`, `kernel_ipv6_forwarding`, `kernel_ipv6_enabled`, `ipv4_weak_host`, `warnings` |
 | `privileges.*` | `state` (`dropped`, or `kept` under `--keep-privileges`), `bounding_set` (`cleared`/`kept`), `identity` (`switched`/`unchanged`), `threads` (threads verified by the drop; 0 when kept) |
@@ -1386,8 +1444,11 @@ SYNs nobody completes, such as a scan or a spoofed SYN flood.
 - `/dev/urandom` is read with `read(2)`: before Linux 5.18 it can return
   output of an unseeded CRNG very early at boot (PUB-010); start the router
   after the system's entropy is initialized.
-- Not implemented (CLI-034): `poll`-based waiting on the socket fds (the
-  loop spins 64 ticks, then sleeps 50 µs doubling to 1 ms when idle),
+- Idle wait (H9, section 7): a signal the kernel delivers to a thread
+  other than the router, a link round, and anything not on the "pending"
+  list of section 7 are seen up to `--idle-wait-ms` (10 ms) later while
+  idle. The wait is level-triggered on RX only.
+- Not implemented (CLI-034):
   SIGUSR1 stats, structured logs, systemd notify, opt-in
   "link down / forwarding 0 at exit", state carried across a reload.
 - Privilege drop limits (CLI-089 to CLI-095): no chroot or mount
@@ -1399,7 +1460,7 @@ SYNs nobody completes, such as a scan or a spoofed SYN flood.
   `--user`/`--group` the process stays uid 0 (owner of every root file).
 - While a port is down with TX held, its owed kick is retried about 16
   times per second (1 ms doubling to 64 ms, §8), so held TX resumes within about
-  64 ms (plus up to one 1 ms idle pause) after the link returns; the run loop's link watch (1 s) does not
+  64 ms (plus up to one 1 ms idle wait) after the link returns; the run loop's link watch (1 s) does not
   shortcut the retry.
 - Syscall filter limits (CLI-102 to CLI-109): x86_64 only (the platform of
   `ruster run`). The allowlist is for glibc builds only. It covers glibc
@@ -1542,6 +1603,15 @@ What it proves, on the runner's kernel only:
   with auditd running the records go to its log instead, and the kernel
   rate-limits them). `--keep-privileges` now shows `NoNewPrivs: 1` (the
   filter sets it).
+  Added by H9: marker `priv_run_idle` (the idle wait of section 7: over 3 s
+  without traffic the router thread wakes at most 400 times per second,
+  measured as its voluntary context switches, and ticks at most 400 times
+  per second, `idle.errors=0`; single pings after 2 s idle have a median
+  round trip of at most 1 ms and none above 10 ms, each waking the wait;
+  the line reports the measured rates, CPU, and round trips), and in
+  `priv-xdp-smoke.sh` the line `priv_xdp_idle_wait` (on two live veth
+  ports a 30 ms `poll` times out after at least 30 ms, and a frame sent
+  0.3 s into a 10 s `poll` ends it).
 - Nothing is left behind: a final step fails if any `ruster-*` namespace
   survives. Smoke logs are uploaded as an artifact when the job fails.
 

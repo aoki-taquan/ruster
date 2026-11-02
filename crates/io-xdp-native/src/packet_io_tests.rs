@@ -1807,3 +1807,45 @@ fn ring_corruption_stops_the_adapter_for_good() {
     assert!(matches!(io.receive(8), Err(XdpIoError::Stopped)));
     assert!(matches!(io.service(), Err(XdpIoError::Stopped)));
 }
+
+#[test]
+fn idle_wait_is_ready_on_rx_work_and_reports_tx_outstanding() {
+    use crate::{RxWait, RxWaitError};
+
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    // Scripted kernels are not live sockets: nothing can block, and an
+    // idle adapter says so instead of pretending it waited.
+    assert!(!io.can_wait());
+    assert!(!io.tx_outstanding());
+    assert_eq!(io.wait_rx(10), Err(RxWaitError::Unsupported));
+
+    // A descriptor in an RX ring: ready at once, no syscall.
+    deliver(&wan, &ipv4_frame(60, 9));
+    assert_eq!(io.wait_rx(10), Ok(RxWait::Ready));
+    // A zero budget reaps and refills only: the descriptor stays.
+    drop(io.receive(0).expect("receive"));
+    assert_eq!(io.wait_rx(10), Ok(RxWait::Ready));
+    // Validated but left unlent by a batch: still RX work.
+    drop(io.receive(8).expect("receive"));
+    assert_eq!(io.engine(WAN).expect("WAN").pending_rx(), 1);
+    assert_eq!(io.wait_rx(10), Ok(RxWait::Ready));
+    // Lent and forwarded in place: the RX side is idle again, TX is not.
+    {
+        let mut batch = io.receive(8).expect("receive");
+        let packet = batch.next_packet().expect("lease");
+        packet.commit(WAN);
+        let _ = batch.finish();
+    }
+    assert_eq!(io.wait_rx(10), Err(RxWaitError::Unsupported));
+    assert!(io.tx_outstanding(), "TX in flight");
+    assert_eq!(transmit_all(&wan).len(), 1);
+    assert!(io.tx_outstanding(), "completed but not reaped yet");
+    assert_eq!(io.service().expect("service"), 1);
+    assert!(!io.tx_outstanding());
+
+    // A stopped adapter never blocks: the next tick sees the stop.
+    let _ = io.drain(0).expect("drain");
+    assert_eq!(io.wait_rx(10), Ok(RxWait::Ready));
+    audit(&io);
+}

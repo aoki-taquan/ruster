@@ -87,6 +87,8 @@ struct HeldReload {
     /// seen applied.
     released_at: Cell<Option<u32>>,
     applied_at: Cell<Option<u32>>,
+    /// Ticks run after the reload was seen applied.
+    after_apply: u32,
 }
 
 impl StopSignal for HeldReload {
@@ -107,7 +109,9 @@ impl StopSignal for HeldReload {
         if self.applied_at.get().is_none() && self.err.text().contains("reload applied") {
             self.applied_at.set(Some(ticks));
         }
-        self.applied_at.get().is_some_and(|at| ticks >= at + 40)
+        self.applied_at
+            .get()
+            .is_some_and(|at| ticks >= at + self.after_apply)
     }
 
     fn force(&self) -> bool {
@@ -143,6 +147,7 @@ fn traffic_flows_while_a_reload_is_prepared_and_it_applies_at_a_boundary() {
         held_until_tick: 200,
         released_at: Cell::new(None),
         applied_at: Cell::new(None),
+        after_apply: 40,
     };
     let (status, out) = run_async(&host, source.clone(), never_stale(), &stop, &mut err);
     let text = err.text();
@@ -163,6 +168,69 @@ fn traffic_flows_while_a_reload_is_prepared_and_it_applies_at_a_boundary() {
     assert_eq!(line_value(&out, "observer.generation"), Some("2"));
     assert_eq!(line_value(&out, "reload.requested"), Some("1"));
     assert_eq!(line_value(&out, "reload.applied"), Some("1"));
+    host.assert_released();
+}
+
+/// H9: while a reload request is out on the worker, every idle wait is
+/// the short wait, so the prepared answer is picked up within about a
+/// millisecond of being ready; once it is applied the waits are full
+/// again.
+#[test]
+fn idle_waits_stay_short_while_a_reload_is_prepared() {
+    let host = FakeHost::default();
+    host.state.waits.set(true);
+    let source = FakeSource::with([Ok(echo_off())]);
+    source.hold.store(true, Ordering::SeqCst);
+    let mut err = SharedText::default();
+    let stop = HeldReload {
+        state: Rc::clone(&host.state),
+        source: source.clone(),
+        err: err.clone(),
+        started: Instant::now(),
+        held_until_tick: 300,
+        released_at: Cell::new(None),
+        applied_at: Cell::new(None),
+        after_apply: 2 * SPIN_TICKS + 100,
+    };
+    let (status, out) = run_async(&host, source.clone(), never_stale(), &stop, &mut err);
+    let text = err.text();
+    assert_eq!(status, 0, "{text}");
+    assert!(text.contains("reload applied: generation=2"), "{text}");
+    let (requested, released, applied) = (
+        5,
+        stop.released_at.get().expect("released"),
+        stop.applied_at.get().expect("applied"),
+    );
+    let log = host.state.wait_log.borrow();
+    let while_out: Vec<u32> = log
+        .iter()
+        .filter(|(ticks, _)| (requested..released).contains(ticks))
+        .map(|(_, timeout)| *timeout)
+        .collect();
+    assert!(
+        while_out.len() > 100,
+        "{} waits while held",
+        while_out.len()
+    );
+    assert!(
+        while_out
+            .iter()
+            .all(|timeout| u64::from(*timeout) == SHORT_WAIT_MS),
+        "{while_out:?}"
+    );
+    let after: Vec<u32> = log
+        .iter()
+        .filter(|(ticks, _)| *ticks > applied)
+        .map(|(_, timeout)| *timeout)
+        .collect();
+    assert!(!after.is_empty(), "no wait after the apply");
+    assert!(
+        after
+            .iter()
+            .all(|timeout| u64::from(*timeout) == crate::args::DEFAULT_IDLE_WAIT_MS),
+        "{after:?}"
+    );
+    assert_eq!(line_value(&out, "observer.generation"), Some("2"));
     host.assert_released();
 }
 
@@ -429,6 +497,7 @@ fn a_finished_round_is_folded_before_the_next_is_due() {
         reloader: Reloader::without_worker(crate::run::budgets(&config())),
         watch: Watch::new(&targets, Thresholds::default()),
         links,
+        idle: crate::run::engine::IdleCounters::default(),
     };
     let settings = LoopSettings {
         stats_interval_ms: 0,
@@ -436,6 +505,7 @@ fn a_finished_round_is_folded_before_the_next_is_due() {
         link_interval_ms: 1_000,
         reload_quiesce_ms: 200,
         reload_prepare_warn_ms: 10_000,
+        idle_wait_ms: crate::args::DEFAULT_IDLE_WAIT_MS,
     };
     let datapath = ForwardingDatapath { io: SimIo::new() };
     let mut err = Vec::new();

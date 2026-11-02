@@ -6,13 +6,14 @@ use std::num::{NonZeroU128, NonZeroU32};
 use ruster_config::{ValidatedAfXdpPortV1, ValidatedAfXdpV1, XdpAttachModeV1};
 use ruster_core::{BackendStats, IfId, MonotonicMillis};
 use ruster_io_xdp_native::{
-    NativeSession, RxFillConfig, RxFillEngine, SessionConfig, UmemDomainId, XdpAttachMode,
-    XdpCounters, XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort, XdpPortConfig,
+    NativeSession, RxFillConfig, RxFillEngine, RxWait, RxWaitError, SessionConfig, UmemDomainId,
+    XdpAttachMode, XdpCounters, XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort,
+    XdpPortConfig,
 };
 
 use super::checks::linux::PortSysctls;
 use super::checks::{self, CheckFailure, DeviceFacts, PrivilegeFailure};
-use super::engine::{ClockedIo, Datapath, DrainProgress, LinkMonitor};
+use super::engine::{ClockedIo, Datapath, DrainProgress, IdleWake, LinkMonitor, WaitError};
 use super::netlink::{Dump, Family, LinkFacts, LinkProbe, NetlinkError};
 use super::privileges::{self, DropFailure, DropReport, Identity, PrivilegePolicy};
 use super::seccomp::{self, ConfineFailure, ConfineReport, SeccompMode};
@@ -300,6 +301,22 @@ impl<'s> Datapath for XdpDatapath<'s> {
 
     fn port_count(&self) -> usize {
         self.io.port_count()
+    }
+
+    /// One `poll(2)` over every port's AF_XDP socket (`POLLIN`), or none
+    /// while a port already has RX work (H9).
+    fn wait_rx(&mut self, timeout_ms: u32) -> Result<IdleWake, WaitError> {
+        match self.io.wait_rx(timeout_ms) {
+            Ok(RxWait::Ready) => Ok(IdleWake::Ready),
+            Ok(RxWait::TimedOut) => Ok(IdleWake::TimedOut),
+            Ok(RxWait::Interrupted) => Ok(IdleWake::Interrupted),
+            Err(RxWaitError::Errno(errno)) => Err(WaitError::Errno(errno)),
+            Err(RxWaitError::Unsupported) => Err(WaitError::Unsupported),
+        }
+    }
+
+    fn tx_outstanding(&self) -> bool {
+        self.io.tx_outstanding()
     }
 }
 

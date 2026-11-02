@@ -3167,11 +3167,21 @@ fail closed（`UNVERIFIABLE probe=...`）です。
 run loop: 一threadが停止flagを読み、`Instant`起点のmonotonic wall clockで`run_tick`をconfigの
 budgetで呼び、reportを`TickObserver`へ畳み、O(1)のstate table占有を記録します。kickとneed-wakeupは
 adapterの`receive`（completion reap、Fill refill、Fill need-wakeupへの`poll`、負っているTX kickの
-settle）と`finish`が扱います。RXも生成TX要求も無いtickが64回続くと50 µsからtickごとに倍、上限1 msの
-sleepを挟み、busyなtickで即spinへ戻ります。idle時のwake-upは約1 kHzでcoreを使い切らず、idle後の
-最初のframeは最大1 ms（+timer slack）RX ringで待ちます。1 msなら2048 entryのRX ringは約2 Mppsまで
-取りこぼさず、負荷中はsleepしません。socket fdの`poll`待ちはnative crateに複数fdのsyscallが要るので
-deferred（CLI-034）です。tickごとのallocationは0（counting allocatorのtest。health/link watchを毎tick
+settle）と`finish`が扱います。RXも生成TX要求も無いtickが64回続くと、以後のidle tickの後ごとに
+`Datapath::wait_rx`で一回待ち、busyなtickで即spinへ戻ります（H9）。AF_XDP datapathでは
+`XdpPacketIo::wait_rx`が、RX ringにdescriptorか前batchの貸し残しがあればsyscallなしで返り、なければ
+`XdpPacketIo::new`で一度だけ確保した全portの`pollfd`配列（`POLLIN`）で`poll(2)`を一回呼びます
+（unsafeは既存の`native_unsafe/syscall.rs`の`PollSet::wait`だけ。socketは`'session`の共有borrow）。
+kernelのRX descriptor（`sk_data_ready`）、router thread上のsignal handler（`EINTR`、`poll`は
+`SA_RESTART`でも再開しない）、timeoutで戻ります。timeoutは`--idle-wait-ms`（既定10 ms）、runtimeの
+tick駆動timer（resolutionのpending state/failure hold/queued request、queued ICMPv4 error、B3の
+unsolicited-SYN hold）、adapterのTX in flightかowed kick、reload workerへのrequestのどれかがある間は
+1 ms（H9前のidle cadenceなので、tick数で書かれた上限はそのまま）、そしてperiodic stats/health sample/
+link roundの次の期限を越えません。`Ready`の後のtickがidleなら次は1 ms以下のsleepにしてbusy spinを
+防ぎ、`poll`が使えない・失敗したときも同じsleepに戻ります（errnoは一回だけwarning）。wedged adapterの
+watchdogはtick数でなく1 s（16 tick以上）の時間基準です。idle時のwake-upは約100 Hz（H9前は約1 kHz）、
+idle後最初のframeはkernelがthreadを起こす遅延だけで処理され（H9前は最大1 ms）、負荷中は待ちません。
+`idle.*` statsが待機を数えます。tickごとのallocationは0（counting allocatorのtest。health/link watchを毎tick
 走らせても0。link roundのrequestと受け取りも含む）。backendが自らStop（ring破損等）を
 報告するとloopを抜けexit 1です。`--stats-interval`（既定60 s、0で無効）ごとにstdoutへ
 `ruster-run-stats kind=periodic`のblock（worker observability、service counter、`af_xdp.*`、
@@ -3272,7 +3282,8 @@ dropを早く済ませるoutput threadにもまだstartupが残るためと、at
 以後threadは作らない（`clone`は不許可）。hot pathの`sendto`/`poll`/`getsockopt`/`futex`/
 `clock_nanosleep`は無条件なのでkernelのaction cache（5.11）でprogramを通らない。unsafeは
 `run::seccomp::linux::sys`（`prctl`と`seccomp`のraw syscall）だけ。失敗は`stage=seccomp`で全port
-rollback、exit 1。`poll`待機はdeferredです（CLI-034）。operator手順は[`runbook-m2.md`](runbook-m2.md)、
+rollback、exit 1。H9のidle待機も既存の`poll`（7）だけを使い、`ppoll`/`epoll_*`/`eventfd2`は
+allowlistに入れません（workerの答えはchannelのままで、待っている間は待機を1 msに縮めて拾う）。operator手順は[`runbook-m2.md`](runbook-m2.md)、
 privileged E2Eは`scripts/priv-run-smoke.sh`（三つの専用netns、forward、SIGTERM、reload、link
 down/up、MTU超過とdevice削除のfail closed、rollback、XDP-063、SIGKILL後のrestart、drop後の全threadの
 credentialと`--keep-privileges`、大きなconfigのreload準備中もEchoが欠けないこと、全threadの

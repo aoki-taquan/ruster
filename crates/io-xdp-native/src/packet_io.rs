@@ -149,6 +149,21 @@
 //! validated but not yet lent carry no publication authority and do not
 //! block. A drained or faulted adapter is
 //! [`PublicationQuiescenceDisposition::Stop`].
+//!
+//! # Idle wait
+//!
+//! [`XdpPacketIo::wait_rx`] is the run loop's blocking idle wait (H9):
+//! one `poll(2)` with `POLLIN` over the AF_XDP sockets of every port,
+//! through a `pollfd` array built once in [`XdpPacketIo::new`]. It returns
+//! at once (without a syscall) while a port has a descriptor in its RX
+//! ring or a validated frame still pending from an earlier batch, and
+//! otherwise blocks until the kernel produces an RX descriptor on any
+//! port, the timeout passes, or a signal handler runs. Linux `xsk_poll`
+//! also answers a pending need-wakeup on entry (zero copy: the driver's
+//! wakeup; copy mode: the transmit loop), so the wait is never worse than
+//! the Fill kick `receive` already makes. It watches RX only: TX
+//! completions do not end it, so a caller with TX in flight
+//! ([`XdpPacketIo::tx_outstanding`]) keeps its waits short.
 
 use std::fmt;
 
@@ -163,6 +178,7 @@ use ruster_io_xdp::LedgerError;
 
 use crate::{
     abi::XdpStatistics,
+    native_unsafe::kick::{RxWait, RxWaitError, RxWaitSet},
     rx_fill::{RawLease, ZeroFill},
     DrainOutcome, GeneratedAllocError, GeneratedRejectReason, KickError, KickOutcome, NeedWakeup,
     NegotiatedMode, RxFillEngine, RxFillError, RxInvalidReason, TxRejection, ETHERNET_HEADER_LEN,
@@ -557,6 +573,8 @@ pub struct XdpPacketIo<'memory> {
     /// The run loop's coarse clock in milliseconds, if it hands one in
     /// ([`Self::set_clock`]); rate-limits kick retries on a down link.
     clock_ms: Option<u64>,
+    /// The idle wait over every port's socket ([`Self::wait_rx`]).
+    rx_wait: RxWaitSet<'memory>,
     #[cfg(test)]
     test: test_hooks::TestHooks,
 }
@@ -626,6 +644,7 @@ impl<'memory> XdpPacketIo<'memory> {
                 pair[0].config.interface,
             ));
         }
+        let rx_wait = RxWaitSet::new(states.iter().map(|port| port.engine.kick_handle()));
         Ok(Self {
             ports: states.into_boxed_slice(),
             rx_start: 0,
@@ -634,6 +653,7 @@ impl<'memory> XdpPacketIo<'memory> {
             generated_outstanding: None,
             generated_unknown_egress: 0,
             clock_ms: None,
+            rx_wait,
             #[cfg(test)]
             test: test_hooks::TestHooks::default(),
         })
@@ -648,6 +668,53 @@ impl<'memory> XdpPacketIo<'memory> {
     /// later.
     pub fn set_clock(&mut self, now: MonotonicMillis) {
         self.clock_ms = Some(now.0);
+    }
+
+    /// The idle wait (see the module documentation): returns
+    /// [`RxWait::Ready`] at once while a port has an RX descriptor or a
+    /// pending validated frame; otherwise one `poll(2)` over every port's
+    /// socket for at most `timeout_ms` milliseconds (0 does not block).
+    /// No allocation; cold boundary only (between ticks, never with a
+    /// batch open). A stopped adapter returns [`RxWait::Ready`] so the
+    /// caller's next tick observes the stop at once.
+    ///
+    /// # Errors
+    ///
+    /// [`RxWaitError::Unsupported`] if the ports are not live sockets
+    /// (scripted tests) or the seam refused the call;
+    /// [`RxWaitError::Errno`] for a `poll` failure other than `EINTR`
+    /// (which is [`RxWait::Interrupted`]). The caller then pauses another
+    /// way.
+    pub fn wait_rx(&mut self, timeout_ms: u32) -> Result<RxWait, RxWaitError> {
+        if self.stop.is_some() || self.rx_ready() {
+            return Ok(RxWait::Ready);
+        }
+        self.rx_wait.wait(timeout_ms)
+    }
+
+    /// Whether a port has an RX descriptor in its ring or a validated
+    /// frame pending from an earlier batch (one atomic load and one length
+    /// per port).
+    fn rx_ready(&self) -> bool {
+        self.ports
+            .iter()
+            .any(|port| port.engine.pending_rx() != 0 || port.engine.rx_occupancy() != 0)
+    }
+
+    /// Whether [`Self::wait_rx`] can block: every port is a live socket.
+    #[must_use]
+    pub fn can_wait(&self) -> bool {
+        self.rx_wait.is_live()
+    }
+
+    /// Whether a port has TX in flight: work that progresses only by
+    /// settles (reaps, kicks, rate-limited kick retries on a down link),
+    /// which an idle wait on RX does not end. An owed kick always comes
+    /// with TX in flight (a settle that finds none clears it), so this
+    /// covers it too.
+    #[must_use]
+    pub fn tx_outstanding(&self) -> bool {
+        self.ports.iter().any(|port| port.engine.tx_inflight() != 0)
     }
 
     /// Number of ports.

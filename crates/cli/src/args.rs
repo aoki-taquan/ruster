@@ -18,7 +18,7 @@ usage:
              [--strict-config-perms] [--stats-interval <seconds>]
              [--startup-attempts <n>] [--tx-stall-warn-secs <s>]
              [--tx-stall-fatal-secs <s>] [--kick-errors-fatal-secs <s>]
-             [--link-stale-secs <s>]
+             [--link-stale-secs <s>] [--idle-wait-ms <ms>]
              [--keep-privileges | --user <uid> --group <gid>]
              [--seccomp kill|log|off]
              --config <config.toml>
@@ -32,6 +32,9 @@ to that numeric uid/gid); --keep-privileges keeps them for the whole run.
 It then confines every thread to a syscall allowlist (seccomp): a syscall
 outside it kills the process (--seccomp kill, the default), is logged and
 allowed (--seccomp log), or the filter is not installed (--seccomp off).
+When idle, `run` blocks in poll() on the port sockets for at most
+--idle-wait-ms (default 10, 1 to 100; at most 1 while timers or TX are
+pending); an arriving frame ends the wait at once.
 
 exit status: 0 success or signal shutdown, 1 runtime/I/O/expectation failure
 (including unreadable files, and `run` stopped by a fatal health or device
@@ -60,6 +63,10 @@ pub const DEFAULT_KICK_ERRORS_FATAL_SECS: u64 = 5;
 pub const DEFAULT_LINK_STALE_SECS: u64 = 5;
 /// Largest accepted health threshold (one hour).
 pub const MAX_HEALTH_SECS: u64 = 3_600;
+/// Default `ruster run --idle-wait-ms` (H9): the longest idle `poll`.
+pub const DEFAULT_IDLE_WAIT_MS: u64 = 10;
+/// Largest accepted `--idle-wait-ms`.
+pub const MAX_IDLE_WAIT_MS: u64 = 100;
 
 /// Largest `--user`/`--group` id (`u32::MAX` means "unchanged" to the
 /// kernel's set-id calls).
@@ -107,7 +114,7 @@ struct Numeric {
     max: u64,
 }
 
-const NUMERIC: [Numeric; 6] = [
+const NUMERIC: [Numeric; 7] = [
     Numeric {
         name: "--stats-interval",
         min: 0,
@@ -137,6 +144,11 @@ const NUMERIC: [Numeric; 6] = [
         name: "--link-stale-secs",
         min: 1,
         max: MAX_HEALTH_SECS,
+    },
+    Numeric {
+        name: "--idle-wait-ms",
+        min: 1,
+        max: MAX_IDLE_WAIT_MS,
     },
 ];
 
@@ -189,6 +201,9 @@ pub struct RunArgs {
     pub group: Option<u32>,
     /// The syscall filter after startup (`--seccomp`, default kill).
     pub seccomp: SeccompMode,
+    /// The longest idle wait in milliseconds (`--idle-wait-ms`, 1 to
+    /// [`MAX_IDLE_WAIT_MS`], H9).
+    pub idle_wait_ms: u64,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -240,6 +255,11 @@ impl fmt::Display for UsageError {
                 "option {option} needs a numeric id from 1 to {MAX_ID}"
             ),
             Self::InvalidValue(option) => match NUMERIC.iter().find(|n| n.name == *option) {
+                Some(n) if n.name == "--idle-wait-ms" => write!(
+                    formatter,
+                    "option {option} needs a whole number of milliseconds from {} to {}",
+                    n.min, n.max
+                ),
                 Some(n) if n.name == "--startup-attempts" => write!(
                     formatter,
                     "option {option} needs a whole number from {} to {}",
@@ -457,7 +477,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
         }
     }
     let config = config.ok_or(UsageError::MissingValue("--config"))?;
-    let [interval, attempts, warn, fatal, kicks, stale] = numbers;
+    let [interval, attempts, warn, fatal, kicks, stale, idle_wait] = numbers;
     let tx_stall_warn_secs = warn.unwrap_or(DEFAULT_TX_STALL_WARN_SECS);
     let tx_stall_fatal_secs = fatal.unwrap_or(DEFAULT_TX_STALL_FATAL_SECS);
     if tx_stall_fatal_secs != 0 && tx_stall_fatal_secs < tx_stall_warn_secs {
@@ -489,6 +509,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
         user,
         group,
         seccomp: seccomp.unwrap_or_default(),
+        idle_wait_ms: idle_wait.unwrap_or(DEFAULT_IDLE_WAIT_MS),
     }))
 }
 
@@ -763,6 +784,7 @@ mod tests {
             user: None,
             group: None,
             seccomp: SeccompMode::Kill,
+            idle_wait_ms: DEFAULT_IDLE_WAIT_MS,
         })
     }
 
@@ -848,6 +870,41 @@ mod tests {
             "option --user needs a numeric id from 1 to 4294967294"
         );
         assert!(USAGE.contains("[--keep-privileges | --user <uid> --group <gid>]"));
+    }
+
+    #[test]
+    fn run_parses_the_idle_wait_option() {
+        let parsed = |words: &[&str]| match run(words) {
+            Ok(Command::Run(args)) => args.idle_wait_ms,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(parsed(&["run", "--config", "a"]), DEFAULT_IDLE_WAIT_MS);
+        assert_eq!(DEFAULT_IDLE_WAIT_MS, 10);
+        assert_eq!(parsed(&["run", "--idle-wait-ms", "1", "--config", "a"]), 1);
+        assert_eq!(parsed(&["run", "--idle-wait-ms=100", "--config", "a"]), 100);
+        for bad in ["0", "101", "-1", "1.5", "", "ten"] {
+            let error = run(&["run", &format!("--idle-wait-ms={bad}"), "--config", "a"]);
+            assert_eq!(
+                error,
+                Err(UsageError::InvalidValue("--idle-wait-ms")),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            UsageError::InvalidValue("--idle-wait-ms").to_string(),
+            "option --idle-wait-ms needs a whole number of milliseconds from 1 to 100"
+        );
+        assert_eq!(
+            run(&[
+                "run",
+                "--idle-wait-ms",
+                "5",
+                "--idle-wait-ms=6",
+                "--config",
+                "a"
+            ]),
+            Err(UsageError::DuplicateOption("--idle-wait-ms"))
+        );
     }
 
     #[test]
@@ -1027,6 +1084,7 @@ mod tests {
                 user: None,
                 group: None,
                 seccomp: SeccompMode::Kill,
+                idle_wait_ms: DEFAULT_IDLE_WAIT_MS,
             }))
         };
         assert_eq!(
