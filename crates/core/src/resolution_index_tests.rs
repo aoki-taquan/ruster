@@ -1111,6 +1111,172 @@ fn a_full_key_chain_fails_closed_and_counts() {
     assert!(runtime.indexes_valid());
 }
 
+/// Targets whose key lands in the same bucket of `bucket_of`, at least
+/// `count` of them.
+fn colliding(count: usize, bucket_of: impl Fn(Ipv4Address) -> Option<usize>) -> Vec<Ipv4Address> {
+    let first = bucket_of(spread(0));
+    let targets: Vec<_> = (0..200_000)
+        .map(spread)
+        .filter(|target| bucket_of(*target) == first)
+        .take(count)
+        .collect();
+    assert_eq!(targets.len(), count);
+    targets
+}
+
+#[test]
+fn a_full_chain_still_admits_a_key_that_reuses_a_slot_of_that_chain() {
+    // States: a full chain whose oldest member is an elapsed cooldown. A
+    // new colliding key reuses that very slot, so the chain does not grow.
+    let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+    let mut tables = Tables::new(
+        RESOLUTION_INDEX_CHAIN_LIMIT,
+        RESOLUTION_INDEX_CHAIN_LIMIT,
+        RESOLUTION_INDEX_CHAIN_LIMIT,
+        1,
+    );
+    let mut runtime = tables.runtime(policy);
+    let targets = colliding(RESOLUTION_INDEX_CHAIN_LIMIT + 1, |target| {
+        runtime.state_bucket(ResolutionKey {
+            egress: WAN,
+            target,
+        })
+    });
+    for target in &targets[..RESOLUTION_INDEX_CHAIN_LIMIT] {
+        assert_eq!(
+            runtime.schedule(arp_action(WAN, *target), MonotonicMillis(0), false),
+            ResolutionResult::Queued
+        );
+        let front = runtime.front().unwrap();
+        runtime.committed(front, MonotonicMillis(0));
+    }
+    runtime.clear_resolution(WAN, targets[0]);
+    assert_eq!(runtime.cooldown_count(), 1);
+    assert_eq!(
+        runtime.schedule(
+            arp_action(WAN, targets[RESOLUTION_INDEX_CHAIN_LIMIT]),
+            MonotonicMillis(1_000),
+            false
+        ),
+        ResolutionResult::Queued
+    );
+    assert_eq!(runtime.index_counters(), ResolutionIndexCounters::default());
+    assert!(runtime.indexes_valid());
+
+    // Dynamic neighbors: a full chain whose oldest member expired.
+    let policy = ResolutionPolicy::with_dynamic_neighbor_ttl(1_000, 1_000, 100).unwrap();
+    let mut tables = Tables::new(1, 1, RESOLUTION_INDEX_CHAIN_LIMIT, 1);
+    let mut runtime = tables.runtime(policy);
+    let targets = colliding(RESOLUTION_INDEX_CHAIN_LIMIT + 1, |target| {
+        runtime.dynamic_bucket(ResolutionKey {
+            egress: LAN,
+            target,
+        })
+    });
+    let mac = MacAddress([2, 6, 6, 6, 6, 6]);
+    for (index, target) in targets[..RESOLUTION_INDEX_CHAIN_LIMIT].iter().enumerate() {
+        assert_eq!(
+            runtime.merge_dynamic(
+                LAN,
+                *target,
+                mac,
+                true,
+                false,
+                MonotonicMillis(index as u64)
+            ),
+            ControlDisposition::Inserted
+        );
+    }
+    assert_eq!(
+        runtime.merge_dynamic(
+            LAN,
+            targets[RESOLUTION_INDEX_CHAIN_LIMIT],
+            mac,
+            true,
+            false,
+            MonotonicMillis(100)
+        ),
+        ControlDisposition::Inserted
+    );
+    assert_eq!(runtime.index_counters(), ResolutionIndexCounters::default());
+    assert!(runtime.indexes_valid());
+}
+
+#[test]
+fn a_full_forward_hold_chain_refuses_capture_and_counts() {
+    let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+    let mut tables = Tables::new(256, 256, 1, 64);
+    let mut runtime = tables.runtime(policy);
+    let targets = colliding(RESOLUTION_INDEX_CHAIN_LIMIT + 1, |target| {
+        runtime.forward_bucket(WAN, target)
+    });
+    let capture = |runtime: &mut ResolutionRuntime<'_>, target| {
+        runtime.capture_failure_candidate(
+            WAN,
+            target,
+            Ipv4Address::from_octets([10, 0, 1, 1]),
+            target,
+            WAN_MAC,
+            local(WAN),
+            Ipv4Address::from_octets([10, 0, 0, 0]),
+            8,
+            0,
+            &[0x45; 28],
+        )
+    };
+    for target in &targets {
+        assert_eq!(
+            runtime.schedule(arp_action(WAN, *target), MonotonicMillis(0), false),
+            ResolutionResult::Queued
+        );
+    }
+    for target in &targets[..RESOLUTION_INDEX_CHAIN_LIMIT] {
+        assert!(matches!(
+            capture(&mut runtime, *target),
+            ResolutionFailureCapture::Captured(_)
+        ));
+    }
+    let full = runtime.failure_counters().capture_full;
+    assert_eq!(
+        capture(&mut runtime, targets[RESOLUTION_INDEX_CHAIN_LIMIT]),
+        ResolutionFailureCapture::CapacityFull
+    );
+    assert_eq!(runtime.failure_counters().capture_full, full + 1);
+    assert_eq!(runtime.index_counters().failure_hold_probe_exhausted, 1);
+    assert!(runtime.indexes_valid());
+}
+
+#[test]
+fn a_new_generation_skips_a_live_reverse_token() {
+    let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+    let mut tables = Tables::new(1, 1, 1, 2);
+    let mut runtime = tables.runtime(policy);
+    runtime.states[0].entry.generation = 5;
+    let key_target = Ipv4Address::from_octets([10, 0, 2, 9]);
+    // A hold elsewhere waits for reverse resolution (WAN, key_target) at
+    // generation 6, the generation the slot would hand out next.
+    runtime.install_hold_for_test(
+        0,
+        ResolutionFailureHoldPhase::WaitingReverse,
+        ResolutionGenerationToken {
+            egress: LAN,
+            target: Ipv4Address::from_octets([10, 0, 1, 9]),
+            generation: 1,
+        },
+        ResolutionGenerationToken {
+            egress: WAN,
+            target: key_target,
+            generation: 6,
+        },
+    );
+    assert_eq!(
+        runtime.schedule(arp_action(WAN, key_target), MonotonicMillis(0), false),
+        ResolutionResult::Queued
+    );
+    assert_eq!(runtime.status(WAN, key_target).unwrap().generation, 7);
+    assert!(runtime.indexes_valid());
+}
+
 #[test]
 fn corrupt_indexes_fail_closed_on_the_packet_path() {
     let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
