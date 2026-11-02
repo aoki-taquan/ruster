@@ -2,12 +2,7 @@
 //! documented memory bound. Its own test binary, so the counting allocator
 //! sees only this test.
 
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    mem::size_of,
-    num::NonZeroU64,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::{mem::size_of, num::NonZeroU64};
 
 use ruster_config::{parse, validate, ValidatedConfig, PRODUCTION_VALIDATION_LIMITS};
 use ruster_control::{candidate_from_config, FullServiceStorage, SimDeterministicKeySource};
@@ -18,51 +13,104 @@ use ruster_core::{
     ResolutionFailureHoldSlot, ResolutionStateSlot,
 };
 
-/// Bytes currently allocated through the global allocator.
-static LIVE: AtomicUsize = AtomicUsize::new(0);
+/// Net bytes the measuring thread allocated while armed.
+///
+/// Process-wide accounting also saw other threads (the libtest harness
+/// thread) allocate or free concurrently, which could break the exact
+/// comparison. Only this thread builds the storage, so only it counts;
+/// [`live::self_check`] proves the counter is live.
+#[allow(unsafe_code)]
+mod live {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
 
-struct CountingAllocator;
-
-// SAFETY: every method forwards to `System` with the caller's arguments and
-// only adjusts a counter.
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: the caller upholds the `GlobalAlloc::alloc` contract.
-        let pointer = unsafe { System.alloc(layout) };
-        if !pointer.is_null() {
-            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
-        }
-        pointer
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static NET: Cell<isize> = const { Cell::new(0) };
     }
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: the caller upholds the `GlobalAlloc::alloc_zeroed` contract.
-        let pointer = unsafe { System.alloc_zeroed(layout) };
-        if !pointer.is_null() {
-            LIVE.fetch_add(layout.size(), Ordering::Relaxed);
+    fn note(delta: isize) {
+        if ARMED.try_with(Cell::get).unwrap_or(false) {
+            let _ = NET.try_with(|net| net.set(net.get().wrapping_add(delta)));
         }
-        pointer
     }
 
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-        // SAFETY: `pointer` and `layout` came from this allocator.
-        unsafe { System.dealloc(pointer, layout) }
+    fn signed(size: usize) -> isize {
+        isize::try_from(size).expect("allocation sizes fit isize")
     }
 
-    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        // SAFETY: the caller upholds the `GlobalAlloc::realloc` contract.
-        let moved = unsafe { System.realloc(pointer, layout, size) };
-        if !moved.is_null() {
-            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-            LIVE.fetch_add(size, Ordering::Relaxed);
+    pub struct Counting;
+
+    // SAFETY: every method forwards the caller's arguments unchanged to
+    // `System` and only adjusts a const thread-local counter.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: the caller upholds the `GlobalAlloc::alloc` contract.
+            let pointer = unsafe { System.alloc(layout) };
+            if !pointer.is_null() {
+                note(signed(layout.size()));
+            }
+            pointer
         }
-        moved
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: the caller upholds the `GlobalAlloc::alloc_zeroed` contract.
+            let pointer = unsafe { System.alloc_zeroed(layout) };
+            if !pointer.is_null() {
+                note(signed(layout.size()));
+            }
+            pointer
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            note(-signed(layout.size()));
+            // SAFETY: `pointer` and `layout` came from this allocator.
+            unsafe { System.dealloc(pointer, layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            // SAFETY: the caller upholds the `GlobalAlloc::realloc` contract.
+            let moved = unsafe { System.realloc(pointer, layout, size) };
+            if !moved.is_null() {
+                note(signed(size) - signed(layout.size()));
+            }
+            moved
+        }
+    }
+
+    /// Resets this thread's net bytes and starts counting.
+    pub fn start() {
+        NET.with(|net| net.set(0));
+        ARMED.with(|armed| armed.set(true));
+    }
+
+    /// This thread's net bytes since `start` (still counting).
+    pub fn net() -> isize {
+        NET.with(Cell::get)
+    }
+
+    pub fn stop() {
+        ARMED.with(|armed| armed.set(false));
+    }
+
+    /// The counter sees this thread's allocation and its release.
+    pub fn self_check() {
+        start();
+        let probe = std::hint::black_box(Vec::<u8>::with_capacity(24));
+        let allocated = net();
+        drop(probe);
+        let released = net();
+        stop();
+        assert_eq!(
+            (allocated, released),
+            (24, 0),
+            "the counting allocator is live"
+        );
     }
 }
 
 #[global_allocator]
-static GLOBAL: CountingAllocator = CountingAllocator;
+static GLOBAL: live::Counting = live::Counting;
 
 const MAXIMAL: &str = include_str!("../../../fixtures/limits/router-production-max.toml");
 
@@ -110,12 +158,14 @@ fn the_maximal_production_config_allocates_within_the_documented_bound() {
     let candidate =
         candidate_from_config(&config, NonZeroU64::MIN, &mut keys).expect("bridge accepts");
 
-    let before = LIVE.load(Ordering::Relaxed);
+    live::self_check();
+    live::start();
     let storage = FullServiceStorage::new(candidate.storage_shape()).expect("allocates");
-    let allocated = LIVE.load(Ordering::Relaxed) - before;
+    let allocated = usize::try_from(live::net()).expect("storage allocates");
     // The arrays exactly; `Box<[T]>` has no spare capacity.
     assert_eq!(allocated, WORST_CASE);
     assert!(allocated <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes);
     drop(storage);
-    assert_eq!(LIVE.load(Ordering::Relaxed), before);
+    assert_eq!(live::net(), 0);
+    live::stop();
 }

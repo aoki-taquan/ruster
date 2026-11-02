@@ -1,10 +1,6 @@
 #![cfg(feature = "validation-test-hooks")]
 
-use std::{
-    alloc::{GlobalAlloc, Layout, System},
-    num::NonZeroU64,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::num::NonZeroU64;
 
 use ruster_control::{
     FirewallPublicationInput, FullServiceStorageShape, Icmpv4ErrorStorageShape,
@@ -18,37 +14,81 @@ use ruster_core::{
     ResolutionPolicy, Route,
 };
 
-struct CountingAllocator;
+/// Counts the allocations of the measuring thread while it is armed.
+///
+/// A process-wide counter also saw allocations of other threads (the
+/// libtest harness thread, which reports results concurrently) and flaked.
+/// Only this thread's work is measured, so only this thread counts;
+/// [`counting::self_check`] proves the counter is live.
+#[allow(unsafe_code)]
+mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: `layout` is supplied by the allocator contract.
-        unsafe { System.alloc(layout) }
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static COUNT: Cell<usize> = const { Cell::new(0) };
     }
 
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-        // SAFETY: `pointer` and `layout` came from this allocator.
-        unsafe { System.dealloc(pointer, layout) }
+    fn note() {
+        if ARMED.try_with(Cell::get).unwrap_or(false) {
+            let _ = COUNT.try_with(|count| count.set(count.get() + 1));
+        }
     }
 
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: `layout` is supplied by the allocator contract.
-        unsafe { System.alloc_zeroed(layout) }
+    pub struct Counting;
+
+    // SAFETY: every method forwards the caller's arguments unchanged to
+    // `System`; the const thread-local counters never allocate.
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            note();
+            // SAFETY: the caller upholds the `GlobalAlloc::alloc` contract.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            // SAFETY: `pointer` and `layout` came from this allocator.
+            unsafe { System.dealloc(pointer, layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            note();
+            // SAFETY: the caller upholds the `GlobalAlloc::alloc_zeroed` contract.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+            note();
+            // SAFETY: `pointer` and `layout` came from this allocator.
+            unsafe { System.realloc(pointer, layout, size) }
+        }
     }
 
-    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        // SAFETY: `pointer` and `layout` came from this allocator.
-        unsafe { System.realloc(pointer, layout, size) }
+    /// Resets this thread's count and starts counting.
+    pub fn start() {
+        COUNT.with(|count| count.set(0));
+        ARMED.with(|armed| armed.set(true));
+    }
+
+    /// Stops counting and returns this thread's allocations since `start`.
+    pub fn stop() -> usize {
+        ARMED.with(|armed| armed.set(false));
+        COUNT.with(Cell::get)
+    }
+
+    /// The counter sees an allocation made on this thread while armed.
+    pub fn self_check() {
+        start();
+        let probe = std::hint::black_box(Vec::<u8>::with_capacity(1));
+        let counted = stop();
+        drop(probe);
+        assert_eq!(counted, 1, "the counting allocator is live");
     }
 }
 
 #[global_allocator]
-static GLOBAL: CountingAllocator = CountingAllocator;
+static GLOBAL: counting::Counting = counting::Counting;
 
 #[test]
 fn validated_candidate_builds_1024_static_authority_views_without_work() {
@@ -132,7 +172,8 @@ fn validated_candidate_builds_1024_static_authority_views_without_work() {
 
     assert_eq!(take_full_forwarding_validation_count(), 1);
     assert_eq!(take_full_firewall_validation_count(), 1);
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    counting::self_check();
+    counting::start();
     for _ in 0..1_024 {
         let authority = candidate.authority();
         assert_eq!(authority.generation(), NonZeroU64::MIN);
@@ -140,8 +181,7 @@ fn validated_candidate_builds_1024_static_authority_views_without_work() {
         assert_eq!(authority.nat44_tcp_config().outside(), WAN);
         assert_eq!(authority.firewall_config().generation(), 1);
     }
-    let after = ALLOCATIONS.load(Ordering::Relaxed);
-    assert_eq!(after, before);
+    assert_eq!(counting::stop(), 0);
     assert_eq!(take_full_forwarding_validation_count(), 0);
     assert_eq!(take_full_firewall_validation_count(), 0);
 }
