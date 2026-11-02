@@ -210,13 +210,20 @@ packet path any more (PERF-001: NAT44 since H4a, resolution and ICMPv4
 errors since H4b). Before H4b a dynamic-neighbor miss, resolution
 scheduling, an ARP learn, and failure capture scanned their whole table:
 75 to 940 µs per packet at 65536 slots in a release build, 4.5 to 72 µs
-at the old 4096 cap. The configured lists still scale the per-packet
-cost (PERF-002, planned for H4c): route lookup (longest prefix match),
-the local-address check, and the static-neighbor lookup each walk their
-whole list for every packet. With 4096 routes a review measured about
-10.9 µs per route lookup and at least 22 µs per forwarded packet, which
-caps one queue at about 45 kpps. Keep `[[routes]]`, `[[addresses]]`, and
-`[[neighbors]]` short (a home router needs a handful) until H4c.
+at the old 4096 cap. Since H4c the configured lists do not scale the
+per-packet cost either (PERF-002): the router builds lookup indexes once
+when it validates a config (startup and every reload) and every packet
+does a bounded binary search instead of walking a list. A route lookup
+(longest prefix match) takes at most 14 comparisons at 4096 routes, a
+static-neighbor, local-address, or interface lookup at most 13. In a
+release build with 4096 `/24` routes one route lookup went from about
+8.8 µs (about 10.9 µs in the review that found it, at least 22 µs per
+forwarded packet, about 45 kpps per queue) to about 49 ns, and a
+static-neighbor plus local-address lookup takes about 67 ns. The indexes
+are snapshot memory, not runtime storage (not in `storage-bytes`): about
+186 KiB with every list at its limit, twice that while a reload holds
+the old and the new config. Building them is a sort, O(n log n), on the
+reload path.
 
 | Table | Packet path, and what drives it | Work per packet | Release time per packet at 65536 (before H4b) | Recommended size |
 |---|---|---|---|---|
@@ -827,20 +834,14 @@ CLI-034).
   failure-dispatch scans are tick-budgeted round robins
   (`RESOLUTION_SWEEP_SLOW`, section 1). An insert into a key chain that
   already holds 16 entries fails closed (`resolution_index.*_probe_exhausted`).
-- Per-packet cost still scales with the configured lists (PERF-002,
-  pre-existing, planned for hardening slice H4c): route lookup (longest
-  prefix match), the local-address check, and the static-neighbor
-  lookup are linear in `[[routes]]` (up to 4096), `[[addresses]]` (1024),
-  and `[[neighbors]]` (4096). A review measured about 10.9 µs per route
-  lookup with 4096 routes and at least 22 µs per forwarded packet, about
-  45 kpps per queue. An attacker cannot grow these lists, but a large
-  config makes every packet slower; keep them short until H4c.
-- ARP learning does not check that the sender is on the link of the
-  ingress interface (PERF-002, Low, pre-existing): `sender_is_host` only
-  excludes reserved, network, and broadcast addresses, so a LAN host can
-  fill the dynamic-neighbor cache with off-link sender addresses (they
-  expire with the TTL and never displace live entries; size
-  `dynamic-neighbors` with headroom). Planned for H4c.
+- ARP from a sender that is not on the link of the ingress interface
+  is dropped (`drop.ARP_SENDER_NOT_ON_LINK`, ARP-031, since H4c): the
+  sender address must be inside a connected (or other direct) route of
+  that interface or be one of its gateways. Such a packet is neither
+  learned nor answered, even a Request for the router's own address, so
+  a LAN host can no longer fill the dynamic-neighbor cache with off-link
+  addresses. A rising counter usually means a host with a wrong prefix
+  or address on that LAN.
 - NAT44 slot reuse and port selection
   are O(1) per new flow since H4a (NAT44-035). What NAT44 still does in
   more than constant time: a keyed directory lookup walks its hash chain

@@ -424,6 +424,16 @@ MAC/refresh時刻やpending resolutionを変更しません。
 - local SPA claimの保護はlink scopedで、`(ingress IfId, SPA)`がlocal bindingと一致する場合
   だけ学習しない。同じIPv4値が別interfaceのlocal bindingでも、ingress上では通常peerとして
   学習できる。
+- SPAはingressのon-linkでなければならない（ARP-031、H4c）: ingressから出るdirect route
+  （next hopなし）のどれかに含まれるか、ingressから出るrouteのgateway next hopであること。
+  これはrouterがそのinterface上で自分でARP解決し得るtargetとちょうど一致し、それ以外の
+  SPAを学習してもforwardingが使うことはありません。条件を満たさないRequest、Reply、
+  Announcementはstatic neighbor、local SPA、上記のnon-host SPA（probeの`0.0.0.0`を含む）の
+  後で判定し、cache、pending、clock watermarkを変えず、replyも返さず
+  `ARP_SENDER_NOT_ON_LINK`（code 154）でbyte不変dropする。RFC 826はmergeとreplyに
+  sender addressの条件を課しませんが、off-linkのsenderへはこのlinkで返す経路が無く、
+  学習はcacheを埋めるだけなので、fail closedのlocal policyとして拒否します（Linuxの
+  strict `rp_filter`下のARP処理と同じ結果）。
 - 学習成功時だけmatching active resolution/actionをcancelし、unrelated FIFOを維持する。
   commit済みRequestのflood cooldown tombstoneは残す。
 
@@ -1256,8 +1266,51 @@ test専用copy）にも適用し、全結果、trace、slot、queue順、counter
 巡回（packet pathではない。`ceil(capacity / scans)` tickでretry/Host Unreachableの遅れが
 決まり、1000 tick（idle backoffで約1 s）を超えると`validate`/`run`が
 `RESOLUTION_SWEEP_SLOW`を警告）、debug/testの全体検証です。forwarding snapshotの
-config由来list（route LPM、local address、static neighbor）は依然packetごとに線形です
-（PERF-002、H4c）。
+config由来listはH4cで線形でなくなりました（次節）。
+
+### Forwarding snapshot lookup indexes
+
+H4c（PERF-002）以前は、forwarding snapshotのconfig由来list（`[[routes]]`最大4096、
+`[[addresses]]`最大1024、`[[neighbors]]`最大4096、interface最大256）をpacketごとに線形
+走査しました。route LPM（`filter(matches).max_by_key(prefix_len)`）だけで転送packetあたり
+二回以上（source admissionとdestination）、ARP miss時のscheduleやresolution action
+authority、failure dispatch（forward/reverse route、connected boundary）でさらに走査し、
+4096 `/24`でLPM一回約9〜11 µsでした。
+
+`ValidatedForwardingOwner::new`は検証と同じcold publication pathで、借用元の同じboxed tableから
+`ForwardingIndex`を一度だけ作ります（allocationはここだけ。以後不変）。`snapshot()`は
+indexへの参照を含むO(1) borrowのままで、packet pathのlookupはすべて
+`ForwardingSnapshot`のmethod（`route_lookup`、`interface`、`local_binding_on`/`_for`、
+`static_neighbor`、`is_connected_boundary`、`is_gateway`、`sender_on_link`）を通ります。
+
+- route LPMはbinary search on ranges: prefixは互いに素か入れ子（laminar）なので、prefix境界
+  （高々`2 × routes + 1`、同じ答えの隣接区間はmerge）の間ではLPMの答えが一定です。区間の
+  開始addressの昇順配列を一回binary searchするだけで、4096 routeで高々14 probe。build は
+  `(prefix, length)`のstable sortと入れ子stackでO(n log n)。
+- exact key（interface id、local addressのaddress/interface、static neighborの
+  `(interface, target)`、connected routeのnetwork/directed broadcast、gateway next hop）は
+  sorted array + binary search（`ceil(log2(n + 1))` probe、4096で13）。keyはpacketでなく
+  検証済みconfig由来なので、hash tableにしても攻撃者に対する利得はなく、上限を保つには
+  secret keyが要ります。sorted arrayはdeterministicでworst caseが無く、publicationごとの
+  keyも不要です。
+- ARP on-link判定（ARP-031）はinterfaceごとのdirect route（next hopなし）を
+  `(interface << 32 | address)`の互いに素な区間へmergeしたものとgateway集合です。
+
+結果は線形版と同一です。線形版`max_by_key`は同じ長さの最大値のうち最後の要素を返しますが、
+snapshot検証は同じ`(prefix, length)`のrouteを拒否し、同じ長さで同じaddressにmatchする二つの
+routeは必ず同じprefix（`address & mask`）なので、検証済みtableにtieはありません。builderは
+未検証入力でもlast-winsを再現します（stable sortで後のrouteがstackの上に来る）。exact keyは
+線形版`find`と同じくslice順で最初の要素を返します。線形版は`lookup.rs`の`linear`
+moduleに残り（route.rsの`lookup_linear`）、`ForwardingSnapshot::new`で借用しただけの
+snapshot（ownerが無くindexを持てない。test、bench以外の本番pathはowner経由）の実装であり、
+differential testのoracleです。
+
+memoryはsnapshot memory（runtime storageの`storage-bytes`には含めない）で、ownerと一緒に
+解放されます。上限config（4096 route、4096 neighbor、interfaceごとに一つのaddress、
+256 interface）で約186 KiB、reload中は旧generationの分と合わせて二つ分です
+（`ValidatedForwardingOwner::index_heap_bytes`）。publication costはO(n log n)の
+sortだけです。snapshotは`identity`（8 word）を保持せず借用sliceから都度作るので
+（O(1)）、index参照を足しても`ForwardingSnapshot`は144→88 bytesです（RT-002）。
 
 common Ethernet ingress admissionはprotocol parserより前にexact ingress MACを検証します。
 続くIPv4 structural/header-checksum検証後のIP admissionだけは、sourceとnonlocal destinationの
